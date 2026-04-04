@@ -74,7 +74,7 @@ impl Engine {
 
     pub fn create_with_capacity(dir: &str, max_entities: u32) -> io::Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let vocab = Vocabulary::create_with_params(&format!("{dir}/_vocab"), max_entities, 256, max_entities / 128)?;
+        let vocab = Vocabulary::create_with_params(&format!("{dir}/_vocab"), max_entities, 256, max_entities)?;
         let himo_reg = Vocabulary::create(&format!("{dir}/_himoreg"))?;
         let entities = EntitySet::create_with(&format!("{dir}/_entities.dat"), max_entities)?;
         let contents = ContentStore::create(&format!("{dir}/_content"))?;
@@ -150,7 +150,7 @@ impl Engine {
     }
 
     pub(crate) fn entities(&self) -> Vec<u32> { self.entities.iter() }
-    pub(crate) fn entity_count(&self) -> usize { self.entities.count() as usize }
+    pub fn entity_count(&self) -> u32 { self.entities.count() }
 
     // ──── tie ────
 

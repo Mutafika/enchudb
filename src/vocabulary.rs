@@ -8,7 +8,7 @@ use memmap2::MmapMut;
 
 const MAGIC: [u8; 4] = [b'V', b'O', b'C', b'1'];
 const HEADER: usize = 16;
-const DEFAULT_DATA_SIZE: usize = 64 * 1024 * 1024;
+const DEFAULT_DATA_SIZE: usize = 512 * 1024 * 1024;
 const INDEX_MAGIC: [u8; 4] = [b'V', b'I', b'X', b'2'];
 const INDEX_HEADER: usize = 16;
 const DEFAULT_INDEX_CAP: u32 = 131072;
