@@ -586,25 +586,25 @@ impl Engine {
             return self.himos[conds[0].0].cylinder().slice_one(conds[0].1).to_vec();
         }
 
-        // 全スライス取得、サイズ順ソート
-        let mut slices: Vec<(usize, &[u32])> = Vec::with_capacity(conds.len());
+        // 最少のスライスを見つけてpull、残りはColumn直読みフィルタ
+        let mut best = 0;
+        let mut best_len = usize::MAX;
         for (i, &(idx, val)) in conds.iter().enumerate() {
-            let s = self.himos[idx].cylinder().slice_one(val);
-            if s.is_empty() { return vec![]; }
-            slices.push((i, s));
+            let len = self.himos[idx].cylinder().slice_one(val).len();
+            if len == 0 { return vec![]; }
+            if len < best_len { best_len = len; best = i; }
         }
-        slices.sort_by_key(|&(_, s)| s.len());
 
-        // 最小2つを galloping intersect
-        let mut result = galloping_intersect(slices[0].1, slices[1].1);
-
-        // 3条件目以降は Column 直読みフィルタ（結果が小さいので高速）
-        for &(ci, _) in &slices[2..] {
-            if result.is_empty() { return vec![]; }
-            let (idx, val) = conds[ci];
-            result.retain(|&eid| {
-                self.himos[idx].get_value(eid) == Some(val)
-            });
+        let (pivot_idx, pivot_val) = conds[best];
+        let candidates = self.himos[pivot_idx].cylinder().slice_one(pivot_val);
+        let mut result = Vec::with_capacity(best_len);
+        for &eid in candidates {
+            let mut pass = true;
+            for (i, &(idx, val)) in conds.iter().enumerate() {
+                if i == best { continue; }
+                if !self.himos[idx].value_eq(eid, val) { pass = false; break; }
+            }
+            if pass { result.push(eid); }
         }
         result
     }

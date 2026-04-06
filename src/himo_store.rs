@@ -93,6 +93,12 @@ impl HimoStore {
         if stored == 0 { None } else { Some(stored - 1) }
     }
 
+    /// Column直読み。Cylinderから来たeidに対して使う（bounds checkなし）。
+    #[inline(always)]
+    pub fn value_eq(&self, eid: u32, value: u32) -> bool {
+        u32::from_le_bytes(self.col().get(eid).try_into().unwrap()) == value + 1
+    }
+
     pub fn get_raw_bytes(&self, eid: u32) -> [u8; 4] {
         if eid >= self.col().count() { return [0u8; 4]; }
         self.col().get(eid).try_into().unwrap()
