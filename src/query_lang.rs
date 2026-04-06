@@ -162,8 +162,8 @@ mod tests {
     use super::*;
 
     fn setup(name: &str) -> Engine {
-        let dir = format!("/tmp/enchu_v23_ql_{name}");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = format!("/tmp/enchu_v24_ql_{name}.db");
+        let _ = std::fs::remove_file(&dir);
         let mut eng = Engine::create(&dir).unwrap();
 
         for i in 0..10u32 {

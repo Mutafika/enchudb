@@ -1,7 +1,7 @@
-//! EnchuDB — 紐ベース円柱エンジン。
+//! EnchuDB — 紐ベース円柱エンジン。単一ファイル。
 //!
 //! ```ignore
-//! let mut db = enchudb::Engine::create("/tmp/mydb").unwrap();
+//! let mut db = enchudb::Engine::create("/tmp/mydb.db").unwrap();
 //! db.define_himo("age", enchudb::HimoType::Value, 100);
 //! let e = db.entity();
 //! db.tie(e, "age", 30);
@@ -10,6 +10,7 @@
 //! let result = db.pull_raw("age", 30); // O(1)
 //! ```
 
+pub(crate) mod region;
 pub mod column;
 pub mod vocabulary;
 pub mod entity_set;

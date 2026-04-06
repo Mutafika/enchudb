@@ -1,4 +1,4 @@
-//! EntitySet — mmap ビットセット + 空きID管理。
+//! EntitySet — ビットセット + 空きID管理。Region経由。
 //!
 //! entity の生存管理。allocate / free / is_live / iter。
 //! AtomicU32 で next_eid を管理。ロック不要。
@@ -8,19 +8,15 @@
 //!   Bitset: ceil(max_entities / 8) bytes — bit=1 で live
 //!   Free stack: [count:4][eid0:4][eid1:4]...
 
-use std::cell::UnsafeCell;
-use std::fs::OpenOptions;
-use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
-use memmap2::MmapMut;
+use crate::region::Region;
 
 const MAGIC: [u8; 4] = [b'E', b'N', b'T', b'1'];
 const HEADER: usize = 16;
-const DEFAULT_MAX: u32 = 16_777_216; // 16M entities
-const FREE_STACK_MAX: u32 = 1_048_576; // 1M free slots
+const FREE_STACK_MAX: u32 = 1_048_576;
 
 pub struct EntitySet {
-    mmap: UnsafeCell<MmapMut>,
+    region: Region,
     max_entities: u32,
     bitset_offset: usize,
     free_offset: usize,
@@ -30,58 +26,50 @@ unsafe impl Sync for EntitySet {}
 unsafe impl Send for EntitySet {}
 
 impl EntitySet {
-    pub fn create(path: &str) -> io::Result<Self> {
-        Self::create_with(path, DEFAULT_MAX)
-    }
-
-    pub fn create_with(path: &str, max_entities: u32) -> io::Result<Self> {
-        let bitset_offset = HEADER;
+    pub fn region_size(max_entities: u32) -> usize {
         let bitset_size = ((max_entities + 7) / 8) as usize;
-        let free_offset = bitset_offset + bitset_size;
         let free_size = 4 + (FREE_STACK_MAX as usize) * 4;
-        let total = free_offset + free_size;
-
-        let file = OpenOptions::new()
-            .read(true).write(true).create(true).truncate(true)
-            .open(path)?;
-        file.set_len(total as u64)?;
-
-        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-        mmap[0..4].copy_from_slice(&MAGIC);
-        // next_eid = 0, live_count = 0
-        mmap.flush()?;
-
-        Ok(Self { mmap: UnsafeCell::new(mmap), max_entities, bitset_offset, free_offset })
+        HEADER + bitset_size + free_size
     }
 
-    pub fn open(path: &str) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
-        if mmap.len() < HEADER || mmap[0..4] != MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad entity set magic"));
-        }
-        let max_entities = DEFAULT_MAX; // TODO: store in header
+    /// 新規領域を初期化。
+    pub fn init(region: Region, max_entities: u32) -> Self {
         let bitset_offset = HEADER;
         let bitset_size = ((max_entities + 7) / 8) as usize;
         let free_offset = bitset_offset + bitset_size;
-        Ok(Self { mmap: UnsafeCell::new(mmap), max_entities, bitset_offset, free_offset })
+
+        let mm = region.slice_mut();
+        mm[0..4].copy_from_slice(&MAGIC);
+        // next_eid = 0, live_count = 0 (already zero from fresh region)
+
+        Self { region, max_entities, bitset_offset, free_offset }
+    }
+
+    /// 既存領域をロード。
+    pub fn load(region: Region, max_entities: u32) -> Self {
+        let mm = region.slice();
+        if mm.len() < HEADER || mm[0..4] != MAGIC {
+            panic!("bad entity set magic");
+        }
+        let bitset_offset = HEADER;
+        let bitset_size = ((max_entities + 7) / 8) as usize;
+        let free_offset = bitset_offset + bitset_size;
+        Self { region, max_entities, bitset_offset, free_offset }
     }
 
     fn next_eid_atomic(&self) -> &AtomicU32 {
-        let mm = unsafe { &*self.mmap.get() };
+        let mm = self.region.slice();
         unsafe { &*(mm.as_ptr().add(4) as *const AtomicU32) }
     }
 
     fn live_count_atomic(&self) -> &AtomicU32 {
-        let mm = unsafe { &*self.mmap.get() };
+        let mm = self.region.slice();
         unsafe { &*(mm.as_ptr().add(8) as *const AtomicU32) }
     }
 
-    /// entity を確保。空きがあれば再利用、なければ新規 ID。
     pub fn allocate(&self) -> u32 {
-        let mm = unsafe { &mut *self.mmap.get() };
+        let mm = self.region.slice_mut();
 
-        // free stack から pop
         let free_count_off = self.free_offset;
         let fc = u32::from_le_bytes(mm[free_count_off..free_count_off + 4].try_into().unwrap());
         if fc > 0 {
@@ -94,21 +82,18 @@ impl EntitySet {
             return eid;
         }
 
-        // 新規 ID
         let eid = self.next_eid_atomic().fetch_add(1, Ordering::Relaxed);
         self.set_bit(eid, true);
         self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
         eid
     }
 
-    /// entity を解放。
     pub fn free(&self, eid: u32) {
         if !self.is_live(eid) { return; }
         self.set_bit(eid, false);
         self.live_count_atomic().fetch_sub(1, Ordering::Relaxed);
 
-        // free stack に push
-        let mm = unsafe { &mut *self.mmap.get() };
+        let mm = self.region.slice_mut();
         let free_count_off = self.free_offset;
         let fc = u32::from_le_bytes(mm[free_count_off..free_count_off + 4].try_into().unwrap());
         if fc < FREE_STACK_MAX {
@@ -118,11 +103,10 @@ impl EntitySet {
         }
     }
 
-    /// entity が生存しているか。
     #[inline]
     pub fn is_live(&self, eid: u32) -> bool {
         if eid >= self.max_entities { return false; }
-        let mm = unsafe { &*self.mmap.get() };
+        let mm = self.region.slice();
         let byte_off = self.bitset_offset + (eid / 8) as usize;
         let bit = 1u8 << (eid % 8);
         (mm[byte_off] & bit) != 0
@@ -130,7 +114,7 @@ impl EntitySet {
 
     fn set_bit(&self, eid: u32, live: bool) {
         if eid >= self.max_entities { return; }
-        let mm = unsafe { &mut *self.mmap.get() };
+        let mm = self.region.slice_mut();
         let byte_off = self.bitset_offset + (eid / 8) as usize;
         let bit = 1u8 << (eid % 8);
         if live {
@@ -140,19 +124,16 @@ impl EntitySet {
         }
     }
 
-    /// live entity 数。
     pub fn count(&self) -> u32 {
         self.live_count_atomic().load(Ordering::Relaxed)
     }
 
-    /// next_eid（最大 ID + 1）。
     pub fn next_eid(&self) -> u32 {
         self.next_eid_atomic().load(Ordering::Relaxed)
     }
 
-    /// 全 live entity を返す。
     pub fn iter(&self) -> Vec<u32> {
-        let mm = unsafe { &*self.mmap.get() };
+        let mm = self.region.slice();
         let next = self.next_eid();
         let mut result = Vec::with_capacity(self.count() as usize);
         for eid in 0..next {
@@ -163,10 +144,5 @@ impl EntitySet {
             }
         }
         result
-    }
-
-    pub fn flush(&self) -> io::Result<()> {
-        let mm = unsafe { &*self.mmap.get() };
-        mm.flush()
     }
 }

@@ -1,4 +1,4 @@
-//! v23 Engine — 量子円柱完成版。Column+Cylinder+Undo。Reverseなし。
+//! v24 Engine — 量子円柱。単一ファイル。全コンポーネントが1つのmmapを共有。
 //!
 //!   entity() → ID 振る
 //!   tie_text → 文字列を紐で張る（Vocabulary 経由）
@@ -11,13 +11,19 @@
 //!   open/flush → 永続化（mmap なので open は即利用可）
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io;
 
+use memmap2::MmapMut;
+
+use crate::region::Region;
 use crate::vocabulary::Vocabulary;
 use crate::entity_set::EntitySet;
 use crate::himo_store::{HimoStore, HimoType};
 use crate::content_store::ContentStore;
 use crate::undo::UndoLog;
+use crate::column::Column;
+use crate::cylinder::Cylinder;
 
 // ════════════════ ギャロッピング交差 ════════════════
 
@@ -48,11 +54,183 @@ fn gallop_ge(big: &[u32], val: u32, lo: usize) -> usize {
     from + big[from..to].partition_point(|&x| x < val)
 }
 
+// ════════════════ ファイルレイアウト ════════════════
+
+const FILE_MAGIC: [u8; 4] = *b"ECDB";
+const FILE_VERSION: u32 = 1;
+const HEADER_SIZE: usize = 4096;
+
+const DEFAULT_MAX_ENTITIES: u32 = 16_777_216;
+const DEFAULT_MAX_HIMOS: u32 = 256;
+const DEFAULT_CYL_MAX_VALUES: u32 = 65536;
+const DEFAULT_VOCAB_DATA_SIZE: usize = 512 * 1024 * 1024;
+
+// ヘッダオフセット
+const H_MAGIC: usize = 0;
+const H_VERSION: usize = 4;
+const H_MAX_ENTITIES: usize = 8;
+const H_MAX_HIMOS: usize = 12;
+const H_HIMO_COUNT: usize = 16;
+const H_VOCAB_MAX_ENTRIES: usize = 20;
+const H_VOCAB_INDEX_CAP: usize = 24;
+const H_VOCAB_DATA_SIZE: usize = 28;  // u64
+const H_HIMOREG_MAX_ENTRIES: usize = 36;
+const H_HIMOREG_INDEX_CAP: usize = 40;
+const H_HIMOREG_DATA_SIZE: usize = 44; // u64
+const H_CONTENT_DATA_SIZE: usize = 52; // u64
+const H_CYL_MAX_VALUES: usize = 60;
+const H_HIMO_TYPES: usize = 256;
+
+fn align8(n: usize) -> usize { (n + 7) & !7 }
+
+fn himo_maxv_base(max_himos: u32) -> usize {
+    (H_HIMO_TYPES + max_himos as usize + 3) & !3
+}
+
+struct Layout {
+    entities_off: usize,
+    entities_size: usize,
+    undo_off: usize,
+    undo_size: usize,
+    vocab_data_off: usize,
+    vocab_data_size: usize,
+    vocab_offsets_off: usize,
+    vocab_offsets_size: usize,
+    vocab_index_off: usize,
+    vocab_index_size: usize,
+    vocab_max_entries: u32,
+    vocab_index_cap: u32,
+    himoreg_data_off: usize,
+    himoreg_data_size: usize,
+    himoreg_offsets_off: usize,
+    himoreg_offsets_size: usize,
+    himoreg_index_off: usize,
+    himoreg_index_size: usize,
+    himoreg_max_entries: u32,
+    himoreg_index_cap: u32,
+    content_index_off: usize,
+    content_index_size: usize,
+    content_data_off: usize,
+    content_data_size: usize,
+    himo_base_off: usize,
+    himo_col_size: usize,
+    himo_cyl_size: usize,
+    himo_slot_size: usize,
+    cyl_max_values: u32,
+    total_size: usize,
+}
+
+impl Layout {
+    fn compute(max_entities: u32, max_himos: u32, vocab_data_size: usize) -> Self {
+        let vocab_max_entries = max_entities.saturating_mul(16).min(256_000_000);
+        let vocab_index_cap = vocab_max_entries.next_power_of_two();
+        let himoreg_max_entries = max_himos.max(256);
+        let himoreg_index_cap = (himoreg_max_entries * 2).next_power_of_two();
+        let himoreg_data_size = 64 * 1024;
+        let content_data_size = ContentStore::data_region_size();
+        let cyl_max_values = DEFAULT_CYL_MAX_VALUES;
+
+        Self::from_params(
+            max_entities, max_himos,
+            vocab_max_entries, vocab_index_cap, vocab_data_size,
+            himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
+            content_data_size, cyl_max_values,
+        )
+    }
+
+    fn from_params(
+        max_entities: u32, max_himos: u32,
+        vocab_max_entries: u32, vocab_index_cap: u32, vocab_data_size: usize,
+        himoreg_max_entries: u32, himoreg_index_cap: u32, himoreg_data_size: usize,
+        content_data_size: usize, cyl_max_values: u32,
+    ) -> Self {
+        let mut off = HEADER_SIZE;
+
+        let entities_off = off;
+        let entities_size = align8(EntitySet::region_size(max_entities));
+        off += entities_size;
+
+        let undo_off = off;
+        let undo_size = align8(UndoLog::region_size());
+        off += undo_size;
+
+        let vocab_data_off = off;
+        let vocab_data_size = align8(Vocabulary::data_region_size(vocab_data_size));
+        off += vocab_data_size;
+
+        let vocab_offsets_off = off;
+        let vocab_offsets_size = align8(Vocabulary::offsets_region_size(vocab_max_entries));
+        off += vocab_offsets_size;
+
+        let vocab_index_off = off;
+        let vocab_index_size = align8(Vocabulary::index_region_size(vocab_index_cap));
+        off += vocab_index_size;
+
+        let himoreg_data_off = off;
+        let himoreg_data_size = align8(Vocabulary::data_region_size(himoreg_data_size));
+        off += himoreg_data_size;
+
+        let himoreg_offsets_off = off;
+        let himoreg_offsets_size = align8(Vocabulary::offsets_region_size(himoreg_max_entries));
+        off += himoreg_offsets_size;
+
+        let himoreg_index_off = off;
+        let himoreg_index_size = align8(Vocabulary::index_region_size(himoreg_index_cap));
+        off += himoreg_index_size;
+
+        let content_index_off = off;
+        let content_index_size = align8(ContentStore::index_region_size());
+        off += content_index_size;
+
+        let content_data_off = off;
+        let content_data_size = align8(content_data_size);
+        off += content_data_size;
+
+        let himo_col_size = align8(Column::region_size(max_entities, 4));
+        let himo_cyl_size = align8(Cylinder::region_size(max_entities, cyl_max_values));
+        let himo_slot_size = himo_col_size + himo_cyl_size * 2;
+
+        let himo_base_off = off;
+        off += himo_slot_size * (max_himos as usize);
+
+        Layout {
+            entities_off, entities_size,
+            undo_off, undo_size,
+            vocab_data_off, vocab_data_size,
+            vocab_offsets_off, vocab_offsets_size,
+            vocab_index_off, vocab_index_size,
+            vocab_max_entries, vocab_index_cap,
+            himoreg_data_off, himoreg_data_size,
+            himoreg_offsets_off, himoreg_offsets_size,
+            himoreg_index_off, himoreg_index_size,
+            himoreg_max_entries, himoreg_index_cap,
+            content_index_off, content_index_size,
+            content_data_off, content_data_size,
+            himo_base_off, himo_col_size, himo_cyl_size, himo_slot_size,
+            cyl_max_values,
+            total_size: off,
+        }
+    }
+
+    fn himo_col_off(&self, hid: usize) -> usize {
+        self.himo_base_off + hid * self.himo_slot_size
+    }
+    fn himo_cyl_a_off(&self, hid: usize) -> usize {
+        self.himo_base_off + hid * self.himo_slot_size + self.himo_col_size
+    }
+    fn himo_cyl_b_off(&self, hid: usize) -> usize {
+        self.himo_base_off + hid * self.himo_slot_size + self.himo_col_size + self.himo_cyl_size
+    }
+}
+
 // ════════════════ Engine ════════════════
 
 pub struct Engine {
-    dir: String,
+    #[allow(dead_code)]
+    path: String,
+    layout: Layout,
     max_entities: u32,
+    max_himos: u32,
     vocab: Vocabulary,
     himo_reg: Vocabulary,
     himo_to_id: HashMap<String, usize>,
@@ -63,35 +241,147 @@ pub struct Engine {
     entities: EntitySet,
     contents: ContentStore,
     undo: UndoLog,
+    mmap: MmapMut, // 最後に drop されるよう最終フィールド
 }
 
-const DEFAULT_MAX_ENTITIES: u32 = 16_777_216; // 16M
-
 impl Engine {
-    pub fn create(dir: &str) -> io::Result<Self> {
-        Self::create_with_capacity(dir, DEFAULT_MAX_ENTITIES)
+    pub fn create(path: &str) -> io::Result<Self> {
+        Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)
     }
 
-    pub fn create_with_capacity(dir: &str, max_entities: u32) -> io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
-        let vocab = Vocabulary::create_with_params(&format!("{dir}/_vocab"), max_entities, 256, max_entities)?;
-        let himo_reg = Vocabulary::create(&format!("{dir}/_himoreg"))?;
-        let entities = EntitySet::create_with(&format!("{dir}/_entities.dat"), max_entities)?;
-        let contents = ContentStore::create(&format!("{dir}/_content"))?;
-        let undo = UndoLog::create(&format!("{dir}/_undo.dat"))?;
+    pub fn create_with_capacity(path: &str, max_entities: u32) -> io::Result<Self> {
+        Self::create_with_options(path, max_entities, None)
+    }
+
+    pub fn create_with_options(path: &str, max_entities: u32, vocab_data_size: Option<usize>) -> io::Result<Self> {
+        let vds = vocab_data_size.unwrap_or(DEFAULT_VOCAB_DATA_SIZE);
+        let max_himos = DEFAULT_MAX_HIMOS;
+        let layout = Layout::compute(max_entities, max_himos, vds);
+
+        // ファイル作成
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let file = OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true)
+            .open(path)?;
+        file.set_len(layout.total_size as u64)?;
+
+        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+
+        // ヘッダ書き込み
+        mmap[H_MAGIC..H_MAGIC + 4].copy_from_slice(&FILE_MAGIC);
+        mmap[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION.to_le_bytes());
+        mmap[H_MAX_ENTITIES..H_MAX_ENTITIES + 4].copy_from_slice(&max_entities.to_le_bytes());
+        mmap[H_MAX_HIMOS..H_MAX_HIMOS + 4].copy_from_slice(&max_himos.to_le_bytes());
+        mmap[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&0u32.to_le_bytes());
+        mmap[H_VOCAB_MAX_ENTRIES..H_VOCAB_MAX_ENTRIES + 4].copy_from_slice(&layout.vocab_max_entries.to_le_bytes());
+        mmap[H_VOCAB_INDEX_CAP..H_VOCAB_INDEX_CAP + 4].copy_from_slice(&layout.vocab_index_cap.to_le_bytes());
+        mmap[H_VOCAB_DATA_SIZE..H_VOCAB_DATA_SIZE + 8].copy_from_slice(&(layout.vocab_data_size as u64).to_le_bytes());
+        mmap[H_HIMOREG_MAX_ENTRIES..H_HIMOREG_MAX_ENTRIES + 4].copy_from_slice(&layout.himoreg_max_entries.to_le_bytes());
+        mmap[H_HIMOREG_INDEX_CAP..H_HIMOREG_INDEX_CAP + 4].copy_from_slice(&layout.himoreg_index_cap.to_le_bytes());
+        mmap[H_HIMOREG_DATA_SIZE..H_HIMOREG_DATA_SIZE + 8].copy_from_slice(&(layout.himoreg_data_size as u64).to_le_bytes());
+        mmap[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].copy_from_slice(&(layout.content_data_size as u64).to_le_bytes());
+        mmap[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].copy_from_slice(&layout.cyl_max_values.to_le_bytes());
+
+        let base = mmap.as_mut_ptr();
+
+        let entities = EntitySet::init(
+            unsafe { Region::new(base.add(layout.entities_off), layout.entities_size) },
+            max_entities,
+        );
+        let undo = UndoLog::init(
+            unsafe { Region::new(base.add(layout.undo_off), layout.undo_size) },
+        );
+        let vocab = Vocabulary::init(
+            unsafe { Region::new(base.add(layout.vocab_data_off), layout.vocab_data_size) },
+            unsafe { Region::new(base.add(layout.vocab_offsets_off), layout.vocab_offsets_size) },
+            unsafe { Region::new(base.add(layout.vocab_index_off), layout.vocab_index_size) },
+            layout.vocab_max_entries, layout.vocab_index_cap,
+        );
+        let himo_reg = Vocabulary::init(
+            unsafe { Region::new(base.add(layout.himoreg_data_off), layout.himoreg_data_size) },
+            unsafe { Region::new(base.add(layout.himoreg_offsets_off), layout.himoreg_offsets_size) },
+            unsafe { Region::new(base.add(layout.himoreg_index_off), layout.himoreg_index_size) },
+            layout.himoreg_max_entries, layout.himoreg_index_cap,
+        );
+        let contents = ContentStore::init(
+            unsafe { Region::new(base.add(layout.content_index_off), layout.content_index_size) },
+            unsafe { Region::new(base.add(layout.content_data_off), layout.content_data_size) },
+        );
+
         Ok(Self {
-            dir: dir.to_string(), max_entities, vocab, himo_reg,
+            path: path.to_string(), layout, max_entities, max_himos,
+            vocab, himo_reg,
             himo_to_id: HashMap::new(), himo_names: Vec::new(),
             himo_types: Vec::new(), himo_max_values: Vec::new(),
             himos: Vec::new(), entities, contents, undo,
+            mmap,
         })
     }
 
-    pub fn open(dir: &str) -> io::Result<Self> {
-        let vocab = Vocabulary::open(&format!("{dir}/_vocab"))?;
-        let himo_reg = Vocabulary::open(&format!("{dir}/_himoreg"))?;
-        let entities = EntitySet::open(&format!("{dir}/_entities.dat"))?;
-        let contents = ContentStore::open(&format!("{dir}/_content"))?;
+    pub fn open(path: &str) -> io::Result<Self> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+
+        // ヘッダ読み出し
+        if mmap.len() < HEADER_SIZE || mmap[H_MAGIC..H_MAGIC + 4] != FILE_MAGIC {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "not an EnchuDB file"));
+        }
+        let max_entities = u32::from_le_bytes(mmap[H_MAX_ENTITIES..H_MAX_ENTITIES + 4].try_into().unwrap());
+        let max_himos = u32::from_le_bytes(mmap[H_MAX_HIMOS..H_MAX_HIMOS + 4].try_into().unwrap());
+        let himo_count = u32::from_le_bytes(mmap[H_HIMO_COUNT..H_HIMO_COUNT + 4].try_into().unwrap());
+        let vocab_max_entries = u32::from_le_bytes(mmap[H_VOCAB_MAX_ENTRIES..H_VOCAB_MAX_ENTRIES + 4].try_into().unwrap());
+        let vocab_index_cap = u32::from_le_bytes(mmap[H_VOCAB_INDEX_CAP..H_VOCAB_INDEX_CAP + 4].try_into().unwrap());
+        let vocab_data_size = u64::from_le_bytes(mmap[H_VOCAB_DATA_SIZE..H_VOCAB_DATA_SIZE + 8].try_into().unwrap()) as usize;
+        let himoreg_max_entries = u32::from_le_bytes(mmap[H_HIMOREG_MAX_ENTRIES..H_HIMOREG_MAX_ENTRIES + 4].try_into().unwrap());
+        let himoreg_index_cap = u32::from_le_bytes(mmap[H_HIMOREG_INDEX_CAP..H_HIMOREG_INDEX_CAP + 4].try_into().unwrap());
+        let himoreg_data_size = u64::from_le_bytes(mmap[H_HIMOREG_DATA_SIZE..H_HIMOREG_DATA_SIZE + 8].try_into().unwrap()) as usize;
+        let content_data_size = u64::from_le_bytes(mmap[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].try_into().unwrap()) as usize;
+        let cyl_max_values = u32::from_le_bytes(mmap[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].try_into().unwrap());
+
+        let layout = Layout::from_params(
+            max_entities, max_himos,
+            vocab_max_entries, vocab_index_cap, vocab_data_size,
+            himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
+            content_data_size, cyl_max_values,
+        );
+
+        // himo メタデータ先読み
+        let maxv_base = himo_maxv_base(max_himos);
+        let mut type_bytes = Vec::with_capacity(himo_count as usize);
+        let mut maxv_values = Vec::with_capacity(himo_count as usize);
+        for hid in 0..himo_count as usize {
+            type_bytes.push(mmap[H_HIMO_TYPES + hid]);
+            let mv_off = maxv_base + hid * 4;
+            maxv_values.push(u32::from_le_bytes(mmap[mv_off..mv_off + 4].try_into().unwrap()));
+        }
+
+        let base = mmap.as_mut_ptr();
+
+        let entities = EntitySet::load(
+            unsafe { Region::new(base.add(layout.entities_off), layout.entities_size) },
+            max_entities,
+        );
+        let undo = UndoLog::load(
+            unsafe { Region::new(base.add(layout.undo_off), layout.undo_size) },
+        );
+        let vocab = Vocabulary::load(
+            unsafe { Region::new(base.add(layout.vocab_data_off), layout.vocab_data_size) },
+            unsafe { Region::new(base.add(layout.vocab_offsets_off), layout.vocab_offsets_size) },
+            unsafe { Region::new(base.add(layout.vocab_index_off), layout.vocab_index_size) },
+        );
+        let himo_reg = Vocabulary::load(
+            unsafe { Region::new(base.add(layout.himoreg_data_off), layout.himoreg_data_size) },
+            unsafe { Region::new(base.add(layout.himoreg_offsets_off), layout.himoreg_offsets_size) },
+            unsafe { Region::new(base.add(layout.himoreg_index_off), layout.himoreg_index_size) },
+        );
+        let contents = ContentStore::load(
+            unsafe { Region::new(base.add(layout.content_index_off), layout.content_index_size) },
+            unsafe { Region::new(base.add(layout.content_data_off), layout.content_data_size) },
+        );
 
         // 紐を復元
         let mut himo_to_id = HashMap::new();
@@ -100,26 +390,20 @@ impl Engine {
         let mut himo_max_values = Vec::new();
         let mut himos = Vec::new();
 
-        let himo_types_path = format!("{dir}/_himotypes.bin");
-        let type_bytes = if std::path::Path::new(&himo_types_path).exists() {
-            std::fs::read(&himo_types_path)?
-        } else { vec![] };
-
-        let maxv_path = format!("{dir}/_himomaxv.bin");
-        let maxv_bytes = if std::path::Path::new(&maxv_path).exists() {
-            std::fs::read(&maxv_path)?
-        } else { vec![] };
-
-        let himo_count = type_bytes.len();
-        for hid in 0..himo_count {
+        for hid in 0..himo_count as usize {
             let ht = HimoType::from_byte(type_bytes[hid]);
-            let mv = if hid * 4 + 4 <= maxv_bytes.len() {
-                u32::from_le_bytes(maxv_bytes[hid * 4..hid * 4 + 4].try_into().unwrap())
-            } else { 0 };
+            let mv = maxv_values[hid];
             let name_bytes = himo_reg.get(hid as u32);
             let name = String::from_utf8_lossy(name_bytes).to_string();
-            let himo_dir = format!("{dir}/_himos/{hid}");
-            let hs = HimoStore::open(&himo_dir, ht)?;
+            let effective_mv = mv.min(cyl_max_values);
+
+            let hs = HimoStore::load(
+                unsafe { Region::new(base.add(layout.himo_col_off(hid)), layout.himo_col_size) },
+                unsafe { Region::new(base.add(layout.himo_cyl_a_off(hid)), layout.himo_cyl_size) },
+                unsafe { Region::new(base.add(layout.himo_cyl_b_off(hid)), layout.himo_cyl_size) },
+                ht, effective_mv,
+            );
+
             himo_to_id.insert(name.clone(), hid);
             himo_names.push(name);
             himo_types.push(ht);
@@ -127,15 +411,14 @@ impl Engine {
             himos.push(hs);
         }
 
-        let undo = UndoLog::open(&format!("{dir}/_undo.dat"))?;
-
         let mut eng = Self {
-            dir: dir.to_string(), max_entities: DEFAULT_MAX_ENTITIES, vocab, himo_reg,
+            path: path.to_string(), layout, max_entities, max_himos,
+            vocab, himo_reg,
             himo_to_id, himo_names, himo_types, himo_max_values,
             himos, entities, contents, undo,
+            mmap,
         };
 
-        // クラッシュ復旧: 未コミットの変更を巻き戻す
         if eng.undo.pending_count() > 0 {
             eng.recover();
         }
@@ -151,15 +434,14 @@ impl Engine {
 
     pub(crate) fn entities(&self) -> Vec<u32> { self.entities.iter() }
     pub fn entity_count(&self) -> u32 { self.entities.count() }
+    pub fn next_eid(&self) -> u32 { self.entities.next_eid() }
 
     // ──── tie ────
 
-    /// 紐を登録。max_values > 0 なら prefix sum O(1)。
     pub fn define_himo(&mut self, himo: &str, ht: HimoType, max_values: u32) {
         self.ensure_himo(himo, ht, max_values);
     }
 
-    /// 紐を張る（未定義なら自動作成、max_values=0）。&mut self。
     pub fn tie_text(&mut self, eid: u32, himo: &str, value: &str) {
         let vid = self.vocab.get_or_insert(value.as_bytes());
         let hid = self.ensure_himo(himo, HimoType::Symbol, 0);
@@ -167,11 +449,16 @@ impl Engine {
         self.himos[hid].set(eid, vid);
     }
 
-    /// 紐を張る（未定義なら自動作成、max_values=0）。&mut self。
     pub fn tie(&mut self, eid: u32, himo: &str, value: u32) {
         let hid = self.ensure_himo(himo, HimoType::Value, 0);
         self.record_undo(eid, hid);
         self.himos[hid].set(eid, value);
+    }
+
+    pub fn tie_ref(&mut self, eid: u32, himo: &str, target_eid: u32) {
+        let hid = self.ensure_himo(himo, HimoType::Ref, 0);
+        self.record_undo(eid, hid);
+        self.himos[hid].set(eid, target_eid);
     }
 
     // ──── untie ────
@@ -195,12 +482,10 @@ impl Engine {
 
     // ──── トランザクション ────
 
-    /// 変更を確定。undo をクリア。
     pub fn commit(&self) {
         self.undo.commit();
     }
 
-    /// 変更を巻き戻す。
     pub fn rollback(&self) {
         for (eid, himo_id, old_value) in self.undo.entries_reverse() {
             let hid = himo_id as usize;
@@ -242,6 +527,7 @@ impl Engine {
 
     pub fn get_text(&self, eid: u32, himo: &str) -> Option<&[u8]> {
         let hid = *self.himo_to_id.get(himo)?;
+        if self.himo_types[hid] != HimoType::Symbol { return None; }
         let vid = self.himos[hid].get_value(eid)?;
         Some(self.vocab.get(vid))
     }
@@ -262,15 +548,16 @@ impl Engine {
     pub(crate) fn vocab(&self) -> &Vocabulary { &self.vocab }
     pub fn himo_names(&self) -> &[String] { &self.himo_names }
 
+    pub fn himo_type(&self, himo: &str) -> Option<HimoType> {
+        self.himo_to_id.get(himo).map(|&idx| self.himo_types[idx])
+    }
+
     // ──── 紐を引く（Cylinder 経由）────
 
-    /// 円柱を最新にする。書き込み後に呼ぶ。
     pub fn rebuild(&self) {
         for ds in &self.himos { ds.rebuild_cylinder(); }
     }
 
-    /// 紐を引く。Cylinder のスナップショットから O(log n)。
-    /// rebuild を呼ぶまで書き込み分は反映されない。
     pub fn pull_raw(&self, himo: &str, value: u32) -> &[u32] {
         match self.himo_to_id.get(himo) {
             Some(&idx) => self.himos[idx].cylinder().slice_one(value),
@@ -314,14 +601,37 @@ impl Engine {
     fn ensure_himo(&mut self, himo: &str, ht: HimoType, max_values: u32) -> usize {
         if let Some(&idx) = self.himo_to_id.get(himo) { return idx; }
         let hid = self.himos.len();
+        assert!((hid as u32) < self.max_himos, "too many himos (max {})", self.max_himos);
+
         self.himo_reg.get_or_insert(himo.as_bytes());
-        let himo_dir = format!("{}/_himos/{hid}", self.dir);
-        let hs = HimoStore::create_with(&himo_dir, ht, max_values, self.max_entities).unwrap();
+
+        let effective_mv = max_values.min(self.layout.cyl_max_values);
+        let base = self.mmap.as_mut_ptr();
+        let col_off = self.layout.himo_col_off(hid);
+        let cyl_a_off = self.layout.himo_cyl_a_off(hid);
+        let cyl_b_off = self.layout.himo_cyl_b_off(hid);
+
+        let hs = HimoStore::init(
+            unsafe { Region::new(base.add(col_off), self.layout.himo_col_size) },
+            unsafe { Region::new(base.add(cyl_a_off), self.layout.himo_cyl_size) },
+            unsafe { Region::new(base.add(cyl_b_off), self.layout.himo_cyl_size) },
+            ht, effective_mv, self.max_entities,
+        );
+
         self.himos.push(hs);
         self.himo_to_id.insert(himo.to_string(), hid);
         self.himo_names.push(himo.to_string());
         self.himo_types.push(ht);
         self.himo_max_values.push(max_values);
+
+        // ヘッダにメタデータ書き込み
+        let maxv_base = himo_maxv_base(self.max_himos);
+        self.mmap[H_HIMO_TYPES + hid] = ht as u8;
+        let mv_off = maxv_base + hid * 4;
+        self.mmap[mv_off..mv_off + 4].copy_from_slice(&max_values.to_le_bytes());
+        let himo_count = (hid + 1) as u32;
+        self.mmap[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&himo_count.to_le_bytes());
+
         hid
     }
 
@@ -329,19 +639,25 @@ impl Engine {
 
     pub fn flush(&mut self) -> io::Result<()> {
         self.commit();
-        for ds in &self.himos { ds.flush()?; }
-        self.vocab.flush()?;
-        self.himo_reg.flush()?;
-        self.entities.flush()?;
-        self.contents.flush()?;
-        self.undo.flush()?;
 
-        let type_bytes: Vec<u8> = self.himo_types.iter().map(|ht| *ht as u8).collect();
-        std::fs::write(format!("{}/_himotypes.bin", self.dir), &type_bytes)?;
+        // コンポーネントの内部状態をRegionに書き戻す
+        for ds in &self.himos { ds.sync(); }
+        self.vocab.sync();
+        self.himo_reg.sync();
+        self.contents.sync();
 
-        let maxv_bytes: Vec<u8> = self.himo_max_values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        std::fs::write(format!("{}/_himomaxv.bin", self.dir), &maxv_bytes)?;
+        // ヘッダにhimoメタデータを最終書き込み
+        let maxv_base = himo_maxv_base(self.max_himos);
+        let hc = self.himo_types.len() as u32;
+        for hid in 0..self.himo_types.len() {
+            self.mmap[H_HIMO_TYPES + hid] = self.himo_types[hid] as u8;
+            let off = maxv_base + hid * 4;
+            self.mmap[off..off + 4].copy_from_slice(&self.himo_max_values[hid].to_le_bytes());
+        }
+        self.mmap[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&hc.to_le_bytes());
 
+        // 単一 mmap を sync
+        self.mmap.flush()?;
         Ok(())
     }
 }
@@ -353,9 +669,9 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> String {
-        let dir = format!("/tmp/enchu_v23_{name}");
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+        let path = format!("/tmp/enchu_v24_{name}.db");
+        let _ = std::fs::remove_file(&path);
+        path
     }
 
     // ──── entity ライフサイクル ────
@@ -369,7 +685,7 @@ mod tests {
         let e1 = eng.entity();
         assert_eq!(eng.entity_count(), 2);
         assert_eq!(eng.entities(), vec![e0, e1]);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -385,8 +701,8 @@ mod tests {
         assert_eq!(eng.entities(), vec![e0, e2]);
 
         let e3 = eng.entity();
-        assert_eq!(e3, e1); // ID 再利用
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(e3, e1);
+        let _ = std::fs::remove_file(&dir);
     }
 
     // ──── tie / get 全型 ────
@@ -398,7 +714,7 @@ mod tests {
         let e = eng.entity();
         eng.tie_text(e, "name", "田中");
         assert_eq!(eng.get_text(e, "name"), Some("田中".as_bytes()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -408,7 +724,7 @@ mod tests {
         let e = eng.entity();
         eng.tie(e, "age", 30);
         assert_eq!(eng.get(e, "age"), Some(30));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -422,7 +738,7 @@ mod tests {
         eng.rebuild();
         let result = eng.pull_raw("company", parent);
         assert_eq!(result, vec![child]);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -435,7 +751,7 @@ mod tests {
         assert_eq!(eng.get(e, "score"), Some(200));
         assert_eq!(eng.query_count(&[("score", 100)]), 0);
         assert_eq!(eng.query_count(&[("score", 200)]), 1);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -446,7 +762,7 @@ mod tests {
         eng.tie(e, "level", 0);
         assert_eq!(eng.get(e, "level"), Some(0));
         assert_eq!(eng.query_count(&[("level", 0)]), 1);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     // ──── untie ────
@@ -463,7 +779,7 @@ mod tests {
         assert_eq!(eng.get(e, "age"), None);
         assert_eq!(eng.query_count(&[("age", 30)]), 0);
         assert_eq!(eng.get_text(e, "name"), Some(b"X".as_ref()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     // ──── delete ────
@@ -480,7 +796,7 @@ mod tests {
         assert_eq!(eng.query_count(&[("age", 30)]), 0);
         assert_eq!(eng.get(e, "age"), None);
         assert_eq!(eng.get_text(e, "name"), None);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     // ──── content ────
@@ -495,7 +811,7 @@ mod tests {
         assert_eq!(eng.get_content(e, "memo"), Some(b"hello".as_ref()));
         assert_eq!(eng.get_content(e, "notes"), Some("日本語".as_bytes()));
         assert_eq!(eng.get_content(e, "none"), None);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     // ──── himos_of / himo_names ────
@@ -511,7 +827,7 @@ mod tests {
         assert!(h.contains(&"age"));
         assert!(h.contains(&"name"));
         assert_eq!(h.len(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -527,7 +843,7 @@ mod tests {
         assert!(names.contains(&"x".to_string()));
         assert!(names.contains(&"y".to_string()));
         assert!(names.contains(&"z".to_string()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     // ──── query ────
@@ -547,7 +863,7 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert!(result.contains(&e0));
         assert!(result.contains(&e2));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -570,7 +886,7 @@ mod tests {
         assert_eq!(eng.query(&[("dept", 1), ("age", 30)]), vec![e0]);
         assert_eq!(eng.query(&[("dept", 1), ("age", 25)]), vec![e1]);
         assert_eq!(eng.query(&[("dept", 2), ("age", 30)]), vec![e2]);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -582,7 +898,7 @@ mod tests {
         assert!(eng.query(&[("age", 99)]).is_empty());
         assert_eq!(eng.query_count(&[("age", 99)]), 0);
         assert!(eng.query(&[("nonexistent", 1)]).is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -598,7 +914,7 @@ mod tests {
             let c = eng.query_count(&[("bucket", b)]);
             assert_eq!(q.len(), c);
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     // ──── LazyCylinder ────
@@ -617,7 +933,7 @@ mod tests {
         eng.tie(e1, "dept", 1);
 
         assert_eq!(eng.query(&[("dept", 1), ("age", 30)]), vec![e0]);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     // ──── range query ────
@@ -636,7 +952,7 @@ mod tests {
             total += eng.pull_raw("age", age).len();
         }
         assert_eq!(total, 6);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -667,7 +983,7 @@ mod tests {
             }
         }
         assert_eq!(count, 6);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     // ──── 永続化 ────
@@ -702,7 +1018,7 @@ mod tests {
         eng.tie(e2, "dept", 1);
         assert_eq!(eng.query_count(&[("dept", 1), ("age", 35)]), 1);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     // ──── vocab ────
@@ -718,7 +1034,7 @@ mod tests {
         assert!(eng.vocab_id("東京").is_some());
         assert!(eng.vocab_id("大阪").is_some());
         assert!(eng.vocab_id("福岡").is_none());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     // ──── 境界値 ────
@@ -736,7 +1052,7 @@ mod tests {
         assert_eq!(eng.get(e, "x"), None);
         eng.tie(e, "x", 0);
         assert_eq!(eng.get(e, "x"), Some(0));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -760,7 +1076,7 @@ mod tests {
         let result2 = eng.pull_raw("huge", big);
         assert_eq!(result2, vec![e2]);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -774,7 +1090,7 @@ mod tests {
         for v in 0..5u32 {
             assert_eq!(eng.query_count(&[("level", v)]), 1);
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -789,7 +1105,7 @@ mod tests {
             assert_eq!(eng.get(e, &format!("dim_{d}")), Some(d * 10));
         }
         assert_eq!(eng.himos_of(e).len(), 20);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     // ──── 大量削除 → query整合性 ────
@@ -819,7 +1135,7 @@ mod tests {
         for s in 0..10u32 {
             assert_eq!(eng.query_count(&[("score", s)]), 80);
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -846,7 +1162,7 @@ mod tests {
         }
         assert_eq!(eng.entity_count(), 50);
         assert_eq!(eng.query_count(&[("val", 42)]), 50);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     // ──── 永続化の堅牢性 ────
@@ -873,7 +1189,7 @@ mod tests {
             assert_eq!(eng.query_count(&[("val", v)]), 10);
         }
         assert_eq!(eng.entity_count(), 90);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     // ──── 多数 entity ────
@@ -887,11 +1203,11 @@ mod tests {
             let e = eng.entity();
             eng.tie(e, "val", i % 10);
         }
-        assert_eq!(eng.entity_count(), n as usize);
+        assert_eq!(eng.entity_count(), n);
         for b in 0..10 {
             assert_eq!(eng.query_count(&[("val", b)]), 100);
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     // ──── 100万 entity スケールテスト ────
@@ -923,8 +1239,8 @@ mod tests {
     fn scale_insert_1m() {
         let dir = tmp("scale_insert");
         let eng = setup_scale(&dir);
-        assert_eq!(eng.entity_count(), SCALE_N as usize);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(eng.entity_count(), SCALE_N);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -934,7 +1250,7 @@ mod tests {
         let mut eng = setup_scale(&dir);
         let expected = (SCALE_PER_CO / SCALE_AGES * SCALE_COMPANIES) as usize;
         assert_eq!(eng.query_count(&[("age", 30)]), expected);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -945,7 +1261,7 @@ mod tests {
         let city0 = eng.vocab_id("city_0").unwrap();
         let expected = (SCALE_COMPANIES / SCALE_CITIES * SCALE_PER_CO / SCALE_AGES) as usize;
         assert_eq!(eng.query_count(&[("city", city0), ("age", 30)]), expected);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -957,7 +1273,7 @@ mod tests {
         let per_co = SCALE_PER_CO / SCALE_AGES / SCALE_DEPTS;
         let expected = (SCALE_COMPANIES / SCALE_CITIES * per_co) as usize;
         assert_eq!(eng.query_count(&[("city", city0), ("age", 30), ("dept", 3)]), expected);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -972,7 +1288,7 @@ mod tests {
             total += eng.pull_raw("age", age).len();
         }
         assert_eq!(total, per_age * 10);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -982,7 +1298,7 @@ mod tests {
         let mut eng = setup_scale(&dir);
         assert_eq!(eng.query_count(&[("age", 99)]), 0);
         assert!(eng.query(&[("age", 99)]).is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1003,7 +1319,7 @@ mod tests {
             eng.tie(e, "age", 30);
         }
         assert_eq!(eng.query_count(&[("age", 30)]), before);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1020,7 +1336,7 @@ mod tests {
         }
         assert_eq!(eng.query_count(&[("age", 30)]), before_30 - 500);
         assert_eq!(eng.query_count(&[("age", 99)]), 500);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1037,10 +1353,10 @@ mod tests {
         }
 
         let mut eng = Engine::open(&dir).unwrap();
-        assert_eq!(eng.entity_count(), SCALE_N as usize);
+        assert_eq!(eng.entity_count(), SCALE_N);
         assert_eq!(eng.query_count(&[("age", 30)]), expected_age30);
         assert_eq!(eng.query_count(&[("city", city0_vid), ("age", 30)]), expected_city_age);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1055,7 +1371,7 @@ mod tests {
         }
         let expected_total = (SCALE_PER_CO / SCALE_AGES * SCALE_COMPANIES) as usize;
         assert_eq!(total, expected_total);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     // ──── トランザクション ────
@@ -1072,7 +1388,7 @@ mod tests {
 
         let mut eng = Engine::open(&dir).unwrap();
         assert_eq!(eng.get(e, "age"), Some(30));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1087,7 +1403,7 @@ mod tests {
         assert_eq!(eng.get(e, "age"), Some(99));
         eng.rollback();
         assert_eq!(eng.get(e, "age"), Some(30));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1101,7 +1417,7 @@ mod tests {
         assert_eq!(eng.query_count(&[("age", 30)]), 1);
         eng.rollback();
         assert_eq!(eng.query_count(&[("age", 30)]), 0);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1115,12 +1431,13 @@ mod tests {
             eng.flush().unwrap();
 
             eng.tie(e, "age", 99);
-            eng.undo.flush().unwrap();
+            // undo だけ flush（クラッシュシミュレーション）
+            eng.mmap.flush().unwrap();
         }
 
         let mut eng = Engine::open(&dir).unwrap();
         assert_eq!(eng.get(0, "age"), Some(30));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     // ──── prefix sum O(1) ────
@@ -1129,7 +1446,7 @@ mod tests {
     fn prefix_sum_point_query() {
         let dir = tmp("ps_point");
         let mut eng = Engine::create(&dir).unwrap();
-        eng.define_himo("age", HimoType::Value, 100); // max_values=100 → prefix sum
+        eng.define_himo("age", HimoType::Value, 100);
         eng.define_himo("dept", HimoType::Value, 20);
 
         for i in 0..1000u32 {
@@ -1137,13 +1454,10 @@ mod tests {
             eng.tie(e, "age", i % 50);
             eng.tie(e, "dept", i % 8);
         }
-        // age=30 → 20件
         assert_eq!(eng.query_count(&[("age", 30)]), 20);
-        // dept=3 → 125件
         assert_eq!(eng.query_count(&[("dept", 3)]), 125);
-        // age=30 AND dept=2 → 5件 (i=130,330,530,730,930)
         assert_eq!(eng.query(&[("age", 30), ("dept", 2)]).len(), 5);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1155,12 +1469,11 @@ mod tests {
         eng.tie(e, "level", 0);
         assert_eq!(eng.get(e, "level"), Some(0));
         assert_eq!(eng.query_count(&[("level", 0)]), 1);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
     fn prefix_sum_mixed_with_bsearch() {
-        // age は prefix sum、name は二分探索（max_values 未指定）
         let dir = tmp("ps_mixed");
         let mut eng = Engine::create(&dir).unwrap();
         eng.define_himo("age", HimoType::Value, 100);
@@ -1171,11 +1484,10 @@ mod tests {
             eng.tie_text(e, "city", if i < 50 { "東京" } else { "大阪" });
         }
         let tokyo = eng.vocab_id("東京").unwrap();
-        // age=5 → 10件, city=東京 → 50件, AND → 5件
         assert_eq!(eng.query_count(&[("age", 5)]), 10);
         assert_eq!(eng.query_count(&[("city", tokyo)]), 50);
         assert_eq!(eng.query_count(&[("age", 5), ("city", tokyo)]), 5);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1194,7 +1506,7 @@ mod tests {
         let mut eng = Engine::open(&dir).unwrap();
         assert_eq!(eng.query_count(&[("score", 5)]), 5);
         assert_eq!(eng.entity_count(), 100);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1208,7 +1520,7 @@ mod tests {
         eng.untie(e, "age");
         assert_eq!(eng.get(e, "age"), None);
         assert_eq!(eng.query_count(&[("age", 30)]), 0);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1222,7 +1534,7 @@ mod tests {
         assert_eq!(eng.get(e, "score"), Some(200));
         assert_eq!(eng.query_count(&[("score", 100)]), 0);
         assert_eq!(eng.query_count(&[("score", 200)]), 1);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1244,7 +1556,7 @@ mod tests {
             assert_eq!(eng.query_count(&[("age", a)]), 10);
         }
         assert_eq!(eng.entity_count(), 90);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1262,22 +1574,19 @@ mod tests {
         assert_eq!(eng.get(e, "val"), Some(10));
         assert_eq!(eng.query_count(&[("val", 10)]), 1);
         assert_eq!(eng.query_count(&[("val", 40)]), 0);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
     fn prefix_sum_boundary_max() {
-        // max_values ちょうどの値を使う
         let dir = tmp("ps_bnd_max");
         let mut eng = Engine::create(&dir).unwrap();
         eng.define_himo("x", HimoType::Value, 10);
         let e = eng.entity();
-        eng.tie(e, "x", 10); // max_values と同値
+        eng.tie(e, "x", 10);
         assert_eq!(eng.get(e, "x"), Some(10));
         assert_eq!(eng.query_count(&[("x", 10)]), 1);
-        // max_values を超える値はアクセスできるが binary search にフォールバック
-        // ただし超えたらCylinderのprefix領域外なのでbsearchになる
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1302,7 +1611,7 @@ mod tests {
         }
         assert_eq!(eng.entity_count(), 200);
         assert_eq!(eng.query_count(&[("val", 42)]), 200);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     // ──── prefix sum スケールテスト（100万 entity）────
@@ -1312,7 +1621,6 @@ mod tests {
         eng.define_himo("age", HimoType::Value, SCALE_AGES);
         eng.define_himo("dept", HimoType::Value, SCALE_DEPTS);
         eng.define_himo("company", HimoType::Value, SCALE_COMPANIES);
-        // city は Symbol → vocab 経由、max_values 未指定（binary search）
 
         for c in 0..SCALE_COMPANIES {
             for e in 0..SCALE_PER_CO {
@@ -1331,8 +1639,8 @@ mod tests {
     fn ps_scale_insert_1m() {
         let dir = tmp("ps_scale_ins");
         let eng = setup_scale_prefix(&dir);
-        assert_eq!(eng.entity_count(), SCALE_N as usize);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(eng.entity_count(), SCALE_N);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1342,7 +1650,7 @@ mod tests {
         let mut eng = setup_scale_prefix(&dir);
         let expected = (SCALE_PER_CO / SCALE_AGES * SCALE_COMPANIES) as usize;
         assert_eq!(eng.query_count(&[("age", 30)]), expected);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1353,7 +1661,7 @@ mod tests {
         let city0 = eng.vocab_id("city_0").unwrap();
         let expected = (SCALE_COMPANIES / SCALE_CITIES * SCALE_PER_CO / SCALE_AGES) as usize;
         assert_eq!(eng.query_count(&[("city", city0), ("age", 30)]), expected);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1365,7 +1673,7 @@ mod tests {
         let per_co = SCALE_PER_CO / SCALE_AGES / SCALE_DEPTS;
         let expected = (SCALE_COMPANIES / SCALE_CITIES * per_co) as usize;
         assert_eq!(eng.query_count(&[("city", city0), ("age", 30), ("dept", 3)]), expected);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1380,7 +1688,7 @@ mod tests {
             total += eng.pull_raw("age", age).len();
         }
         assert_eq!(total, per_age * 10);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1397,7 +1705,7 @@ mod tests {
             eng.tie(e, "age", 30);
         }
         assert_eq!(eng.query_count(&[("age", 30)]), before);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1411,7 +1719,7 @@ mod tests {
         assert_eq!(eng.query_count(&[("age", 30)]), before_30 - 500);
         assert_eq!(eng.query_count(&[("age", 49)]),
             (SCALE_PER_CO / SCALE_AGES * SCALE_COMPANIES) as usize + 500);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1427,10 +1735,10 @@ mod tests {
             eng.flush().unwrap();
         }
         let mut eng = Engine::open(&dir).unwrap();
-        assert_eq!(eng.entity_count(), SCALE_N as usize);
+        assert_eq!(eng.entity_count(), SCALE_N);
         assert_eq!(eng.query_count(&[("age", 30)]), expected_age30);
         assert_eq!(eng.query_count(&[("city", city0_vid), ("age", 30)]), expected_city_age);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -1445,7 +1753,7 @@ mod tests {
         }
         let expected = (SCALE_PER_CO / SCALE_AGES * SCALE_COMPANIES) as usize;
         assert_eq!(total, expected);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     // ──── 1億 entity ────
@@ -1469,39 +1777,25 @@ mod tests {
             eng.tie(e, "age", i % ages);
             eng.tie(e, "dept", i % depts);
             eng.tie(e, "group", i % groups);
-            if i % 1_000_000 == 999_999 { eng.commit(); } // undo バッファ溢れ防止
+            if i % 1_000_000 == 999_999 { eng.commit(); }
         }
-        assert_eq!(eng.entity_count(), n as usize);
+        assert_eq!(eng.entity_count(), n);
 
-        // age=50 → n/100 = 1,000,000
         assert_eq!(eng.query_count(&[("age", 50)]), (n / ages) as usize);
-        // dept=10 → n/20 = 5,000,000
         assert_eq!(eng.query_count(&[("dept", 10)]), (n / depts) as usize);
-        // age=50 AND dept=10 → n/lcm(100,20) = n/100 = 1,000,000
-        // 実際: i%100==50 AND i%20==10 → i%100==50 (50%20==10✓) → n/100
         assert_eq!(eng.query_count(&[("age", 50), ("dept", 10)]), (n / ages) as usize);
-        // age=50 AND group=500 → i%100==50 AND i%1000==500
-        // i=500,1500,...,99999500 → n/1000 ではなく lcm(100,1000)=1000 周期で i%100==50 AND i%1000==500 → 500%100==0≠50...
-        // i%1000==500 の中で i%100==50 → 500%100=0≠50。i%1000 が x で x%100==50 → x=50,150,250,...,950 → 10個/1000周期
-        // n/1000 * 10 = 1,000,000
-        assert_eq!(eng.query_count(&[("age", 50), ("group", 500)]), 0); // 500%100=0≠50
-        assert_eq!(eng.query_count(&[("age", 50), ("group", 50)]), (n / groups) as usize); // 50%100==50✓
-
-        // 3条件: age=30 AND dept=10 AND group=30
-        // i%100==30 AND i%20==10 → 30%20=10✓ → i%100==30
-        // AND i%1000==30 → 30%100=30✓ → i%1000==30 → n/1000 = 100,000
+        assert_eq!(eng.query_count(&[("age", 50), ("group", 500)]), 0);
+        assert_eq!(eng.query_count(&[("age", 50), ("group", 50)]), (n / groups) as usize);
         assert_eq!(eng.query_count(&[("age", 30), ("dept", 10), ("group", 30)]), (n / groups) as usize);
 
-        // get
         assert_eq!(eng.get(50, "age"), Some(50));
         assert_eq!(eng.get(50, "dept"), Some(50 % depts));
 
-        // delete 1000件
         let victims: Vec<u32> = eng.query(&[("age", 99)]).into_iter().take(1000).collect();
         for &eid in &victims { eng.delete(eid); }
         assert_eq!(eng.query_count(&[("age", 99)]), (n / ages) as usize - 1000);
-        assert_eq!(eng.entity_count(), (n - 1000) as usize);
+        assert_eq!(eng.entity_count(), n - 1000);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 }
