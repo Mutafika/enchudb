@@ -54,6 +54,21 @@ fn gallop_ge(big: &[u32], val: u32, lo: usize) -> usize {
     from + big[from..to].partition_point(|&x| x < val)
 }
 
+/// bitmap から set bit の entity ID を抽出。
+#[inline]
+fn extract_bitmap(bitmap: &[u64]) -> Vec<u32> {
+    let mut result = Vec::new();
+    for (i, &word) in bitmap.iter().enumerate() {
+        let mut w = word;
+        while w != 0 {
+            let bit = w.trailing_zeros();
+            result.push((i * 64 + bit as usize) as u32);
+            w &= w - 1;
+        }
+    }
+    result
+}
+
 // ════════════════ ファイルレイアウト ════════════════
 
 const FILE_MAGIC: [u8; 4] = *b"ECDB";
@@ -586,7 +601,45 @@ impl Engine {
             return self.himos[conds[0].0].cylinder().slice_one(conds[0].1).to_vec();
         }
 
-        // 最少のスライスを見つけてpull、残りはColumn直読みフィルタ
+        // 全条件bitmapならAND、それ以外はColumn直読み
+        let all_bitmap = conds.len() >= 2
+            && conds.iter().all(|&(idx, _)| self.himos[idx].has_bitmaps());
+
+        if all_bitmap {
+            return self.query_bitmap_and(&conds);
+        }
+
+        self.query_column_filter(&conds)
+    }
+
+    /// 実entity範囲のbitmap word数（max_entitiesではなく実際のnext_eid基準）。
+    fn effective_bitmap_words(&self) -> usize {
+        (self.entities.next_eid() as usize + 63) / 64
+    }
+
+    /// Case A: 全条件bitmap有 → AND + extract を1パスで。alloc最小。
+    fn query_bitmap_and(&self, conds: &[(usize, u32)]) -> Vec<u32> {
+        let words = self.effective_bitmap_words();
+        let bitmaps: Vec<&[u64]> = conds.iter()
+            .filter_map(|&(idx, val)| self.himos[idx].bitmap(val))
+            .collect();
+        if bitmaps.len() != conds.len() { return vec![]; }
+
+        let mut result = Vec::new();
+        for i in 0..words {
+            let mut w = bitmaps[0][i];
+            for bm in &bitmaps[1..] { w &= bm[i]; }
+            while w != 0 {
+                let bit = w.trailing_zeros();
+                result.push((i * 64 + bit as usize) as u32);
+                w &= w - 1;
+            }
+        }
+        result
+    }
+
+    /// Column直読みフィルタ
+    fn query_column_filter(&self, conds: &[(usize, u32)]) -> Vec<u32> {
         let mut best = 0;
         let mut best_len = usize::MAX;
         for (i, &(idx, val)) in conds.iter().enumerate() {
