@@ -254,8 +254,12 @@ impl Engine {
     }
 
     pub fn create_with_options(path: &str, max_entities: u32, vocab_data_size: Option<usize>) -> io::Result<Self> {
+        Self::create_full(path, max_entities, vocab_data_size, None)
+    }
+
+    pub fn create_full(path: &str, max_entities: u32, vocab_data_size: Option<usize>, max_himos: Option<u32>) -> io::Result<Self> {
         let vds = vocab_data_size.unwrap_or(DEFAULT_VOCAB_DATA_SIZE);
-        let max_himos = DEFAULT_MAX_HIMOS;
+        let max_himos = max_himos.unwrap_or(DEFAULT_MAX_HIMOS);
         let layout = Layout::compute(max_entities, max_himos, vds);
 
         // ファイル作成
@@ -568,26 +572,39 @@ impl Engine {
     pub fn query(&self, strings: &[(&str, u32)]) -> Vec<u32> {
         self.rebuild();
         if strings.is_empty() { return vec![]; }
-        if strings.len() == 1 {
-            return match self.himo_to_id.get(strings[0].0) {
-                Some(&idx) => self.himos[idx].cylinder().slice_one(strings[0].1).to_vec(),
-                None => vec![],
-            };
-        }
-        let mut slices: Vec<&[u32]> = Vec::with_capacity(strings.len());
+
+        // 全条件の himo index と value を解決
+        let mut conds: Vec<(usize, u32)> = Vec::with_capacity(strings.len());
         for &(himo, val) in strings {
-            if let Some(&idx) = self.himo_to_id.get(himo) {
-                let s = self.himos[idx].cylinder().slice_one(val);
-                if s.is_empty() { return vec![]; }
-                slices.push(s);
+            match self.himo_to_id.get(himo) {
+                Some(&idx) => conds.push((idx, val)),
+                None => return vec![],
             }
         }
-        if slices.len() != strings.len() { return vec![]; }
-        slices.sort_by_key(|s| s.len());
-        let mut result = galloping_intersect(slices[0], slices[1]);
-        for s in &slices[2..] {
+
+        if conds.len() == 1 {
+            return self.himos[conds[0].0].cylinder().slice_one(conds[0].1).to_vec();
+        }
+
+        // 全スライス取得、サイズ順ソート
+        let mut slices: Vec<(usize, &[u32])> = Vec::with_capacity(conds.len());
+        for (i, &(idx, val)) in conds.iter().enumerate() {
+            let s = self.himos[idx].cylinder().slice_one(val);
+            if s.is_empty() { return vec![]; }
+            slices.push((i, s));
+        }
+        slices.sort_by_key(|&(_, s)| s.len());
+
+        // 最小2つを galloping intersect
+        let mut result = galloping_intersect(slices[0].1, slices[1].1);
+
+        // 3条件目以降は Column 直読みフィルタ（結果が小さいので高速）
+        for &(ci, _) in &slices[2..] {
             if result.is_empty() { return vec![]; }
-            result = galloping_intersect(&result, s);
+            let (idx, val) = conds[ci];
+            result.retain(|&eid| {
+                self.himos[idx].get_value(eid) == Some(val)
+            });
         }
         result
     }
