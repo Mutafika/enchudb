@@ -442,6 +442,9 @@ impl Engine {
             eng.recover();
         }
 
+        // open後に必ずrebuild — cylinder はどちらが active か不定のため
+        eng.rebuild();
+
         Ok(eng)
     }
 
@@ -469,12 +472,14 @@ impl Engine {
     }
 
     pub fn tie(&mut self, eid: u32, himo: &str, value: u32) {
+        assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = self.ensure_himo(himo, HimoType::Value, 0);
         self.record_undo(eid, hid);
         self.himos[hid].set(eid, value);
     }
 
     pub fn tie_ref(&mut self, eid: u32, himo: &str, target_eid: u32) {
+        assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
         let hid = self.ensure_himo(himo, HimoType::Ref, 0);
         self.record_undo(eid, hid);
         self.himos[hid].set(eid, target_eid);
@@ -1865,6 +1870,88 @@ mod tests {
         for &eid in &victims { eng.delete(eid); }
         assert_eq!(eng.query_count(&[("age", 99)]), (n / ages) as usize - 1000);
         assert_eq!(eng.entity_count(), n - 1000);
+
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn test_late_himo_on_existing_entities() {
+        let dir = tmp("late_himo");
+        // Phase 1: 1000 entity作成、nameだけtie
+        let mut eng = Engine::create(&dir).unwrap();
+        for i in 0..1000u32 {
+            let e = eng.entity();
+            eng.tie_text(e, "name", &format!("company_{i}"));
+        }
+        eng.rebuild();
+        eng.flush().unwrap();
+        drop(eng);
+
+        // Phase 2: 再open、既存entityに新しいhimoをtie
+        let mut eng = Engine::open(&dir).unwrap();
+        eng.rebuild();
+        for eid in 0..1000u32 {
+            eng.tie_text(eid, "has_flag", "1");
+        }
+        eng.rebuild();
+
+        // rebuildの後、全件pull_rawで引けるか
+        let vid = eng.vocab_id("1").expect("vocab_id");
+        let result = eng.pull_raw("has_flag", vid);
+        assert_eq!(result.len(), 1000, "expected 1000, got {}", result.len());
+
+        eng.flush().unwrap();
+        drop(eng);
+
+        // Phase 3: 再open後も全件引けるか
+        let eng = Engine::open(&dir).unwrap();
+        eng.rebuild();
+        let vid = eng.vocab_id("1").expect("vocab_id");
+        let result = eng.pull_raw("has_flag", vid);
+        assert_eq!(result.len(), 1000, "after reopen: expected 1000, got {}", result.len());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_late_himo_sparse_large_eid() {
+        let dir = tmp("late_himo_sparse");
+        // Phase 1: 100 entity、大きなeid空間をシミュレート
+        let mut eng = Engine::create_with_capacity(&dir, 6_000_000).unwrap();
+        // entity 0..99 を作成
+        for i in 0..100u32 {
+            let e = eng.entity();
+            eng.tie_text(e, "name", &format!("company_{i}"));
+        }
+        // entity 100..5_999_999 も作成（名前なし、eid空間を広げる）
+        for _ in 100..1000 {
+            eng.entity();
+        }
+        eng.rebuild();
+        eng.flush().unwrap();
+        drop(eng);
+
+        // Phase 2: 再open、entity 500 と 999 に新himo をtie
+        let mut eng = Engine::open(&dir).unwrap();
+        eng.rebuild();
+        eng.tie_text(500, "has_flag", "1");
+        eng.tie_text(999, "has_flag", "1");
+        eng.tie_text(0, "has_flag", "1");
+        eng.rebuild();
+
+        let vid = eng.vocab_id("1").expect("vocab_id");
+        let result = eng.pull_raw("has_flag", vid);
+        assert_eq!(result.len(), 3, "expected 3, got {}", result.len());
+
+        eng.flush().unwrap();
+        drop(eng);
+
+        // Phase 3: 再open後
+        let eng = Engine::open(&dir).unwrap();
+        eng.rebuild();
+        let vid = eng.vocab_id("1").expect("vocab_id");
+        let result = eng.pull_raw("has_flag", vid);
+        assert_eq!(result.len(), 3, "after reopen: expected 3, got {}", result.len());
 
         let _ = std::fs::remove_file(&dir);
     }

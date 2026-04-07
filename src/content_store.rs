@@ -75,9 +75,12 @@ impl ContentStore {
         let len = content.len() as u32;
         let data_off = self.data_end.fetch_add(len, Ordering::Relaxed);
         let dm = self.data.slice_mut();
-        if (data_off + len) as usize <= dm.len() {
-            dm[data_off as usize..(data_off + len) as usize].copy_from_slice(content);
+        if (data_off + len) as usize > dm.len() {
+            // data領域溢れ — fetch_addを巻き戻してパニック
+            self.data_end.fetch_sub(len, Ordering::Relaxed);
+            panic!("ContentStore data overflow: {} + {} > {}", data_off, len, dm.len());
         }
+        dm[data_off as usize..(data_off + len) as usize].copy_from_slice(content);
 
         let im = self.index.slice_mut();
         if off + 8 <= im.len() {
