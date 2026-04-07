@@ -11,12 +11,51 @@
 //!   open/flush → 永続化（mmap なので open は即利用可）
 
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs::OpenOptions;
+#[cfg(not(target_arch = "wasm32"))]
 use std::io;
 
+#[cfg(not(target_arch = "wasm32"))]
 use memmap2::MmapMut;
 
 use crate::region::Region;
+
+// ════════════════ バッキングストア ════════════════
+
+/// mmap (native) または Vec<u8> (wasm/テスト) のどちらかを保持。
+/// Engine が drop されるまでポインタが安定している。
+enum Backing {
+    #[cfg(not(target_arch = "wasm32"))]
+    Mmap(MmapMut),
+    Memory(Vec<u8>),
+}
+
+impl Backing {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Backing::Mmap(m) => m.as_mut_ptr(),
+            Backing::Memory(v) => v.as_mut_ptr(),
+        }
+    }
+
+    fn as_slice_mut(&mut self) -> &mut [u8] {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Backing::Mmap(m) => &mut m[..],
+            Backing::Memory(v) => &mut v[..],
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn flush_to_disk(&self) -> io::Result<()> {
+        match self {
+            Backing::Mmap(m) => m.flush(),
+            Backing::Memory(_) => Ok(()),
+        }
+    }
+}
 use crate::vocabulary::Vocabulary;
 use crate::entity_set::EntitySet;
 use crate::himo_store::{HimoStore, HimoType};
@@ -136,13 +175,13 @@ struct Layout {
 }
 
 impl Layout {
-    fn compute(max_entities: u32, max_himos: u32, vocab_data_size: usize) -> Self {
+    fn compute(max_entities: u32, max_himos: u32, vocab_data_size: usize, content_data_size: Option<usize>) -> Self {
         let vocab_max_entries = max_entities.saturating_mul(16).min(256_000_000);
         let vocab_index_cap = vocab_max_entries.next_power_of_two();
         let himoreg_max_entries = max_himos.max(256);
         let himoreg_index_cap = (himoreg_max_entries * 2).next_power_of_two();
         let himoreg_data_size = 64 * 1024;
-        let content_data_size = ContentStore::data_region_size();
+        let content_data_size = content_data_size.unwrap_or_else(ContentStore::data_region_size);
         let cyl_max_values = DEFAULT_CYL_MAX_VALUES;
 
         Self::from_params(
@@ -194,7 +233,7 @@ impl Layout {
         off += himoreg_index_size;
 
         let content_index_off = off;
-        let content_index_size = align8(ContentStore::index_region_size());
+        let content_index_size = align8(ContentStore::index_region_size_for(max_entities));
         off += content_index_size;
 
         let content_data_off = off;
@@ -256,28 +295,31 @@ pub struct Engine {
     entities: EntitySet,
     contents: ContentStore,
     undo: UndoLog,
-    mmap: MmapMut, // 最後に drop されるよう最終フィールド
+    backing: Backing, // 最後に drop されるよう最終フィールド
 }
 
 impl Engine {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn create(path: &str) -> io::Result<Self> {
         Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn create_with_capacity(path: &str, max_entities: u32) -> io::Result<Self> {
         Self::create_with_options(path, max_entities, None)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn create_with_options(path: &str, max_entities: u32, vocab_data_size: Option<usize>) -> io::Result<Self> {
-        Self::create_full(path, max_entities, vocab_data_size, None)
+        Self::create_full(path, max_entities, vocab_data_size, None, None)
     }
 
-    pub fn create_full(path: &str, max_entities: u32, vocab_data_size: Option<usize>, max_himos: Option<u32>) -> io::Result<Self> {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn create_full(path: &str, max_entities: u32, vocab_data_size: Option<usize>, max_himos: Option<u32>, content_data_size: Option<usize>) -> io::Result<Self> {
         let vds = vocab_data_size.unwrap_or(DEFAULT_VOCAB_DATA_SIZE);
         let max_himos = max_himos.unwrap_or(DEFAULT_MAX_HIMOS);
-        let layout = Layout::compute(max_entities, max_himos, vds);
+        let layout = Layout::compute(max_entities, max_himos, vds, content_data_size);
 
-        // ファイル作成
         if let Some(parent) = std::path::Path::new(path).parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
@@ -290,7 +332,6 @@ impl Engine {
 
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
 
-        // ヘッダ書き込み
         mmap[H_MAGIC..H_MAGIC + 4].copy_from_slice(&FILE_MAGIC);
         mmap[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION.to_le_bytes());
         mmap[H_MAX_ENTITIES..H_MAX_ENTITIES + 4].copy_from_slice(&max_entities.to_le_bytes());
@@ -337,29 +378,41 @@ impl Engine {
             himo_to_id: HashMap::new(), himo_names: Vec::new(),
             himo_types: Vec::new(), himo_max_values: Vec::new(),
             himos: Vec::new(), entities, contents, undo,
-            mmap,
+            backing: Backing::Mmap(mmap),
         })
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open(path: &str) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+        let mmap = unsafe { MmapMut::map_mut(&file)? };
+        Self::load_from_backing(Backing::Mmap(mmap))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
 
-        // ヘッダ読み出し
-        if mmap.len() < HEADER_SIZE || mmap[H_MAGIC..H_MAGIC + 4] != FILE_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "not an EnchuDB file"));
+    /// Vec<u8> からエンジンを構築。WASM ではこれが唯一のエントリポイント。
+    /// native でも使える（テスト、ファイル丸読みなど）。
+    pub fn from_bytes(data: Vec<u8>) -> Result<Self, String> {
+        Self::load_from_backing(Backing::Memory(data))
+    }
+
+    fn load_from_backing(mut backing: Backing) -> Result<Self, String> {
+        let buf = backing.as_slice_mut();
+
+        if buf.len() < HEADER_SIZE || buf[H_MAGIC..H_MAGIC + 4] != FILE_MAGIC {
+            return Err("not an EnchuDB file".into());
         }
-        let max_entities = u32::from_le_bytes(mmap[H_MAX_ENTITIES..H_MAX_ENTITIES + 4].try_into().unwrap());
-        let max_himos = u32::from_le_bytes(mmap[H_MAX_HIMOS..H_MAX_HIMOS + 4].try_into().unwrap());
-        let himo_count = u32::from_le_bytes(mmap[H_HIMO_COUNT..H_HIMO_COUNT + 4].try_into().unwrap());
-        let vocab_max_entries = u32::from_le_bytes(mmap[H_VOCAB_MAX_ENTRIES..H_VOCAB_MAX_ENTRIES + 4].try_into().unwrap());
-        let vocab_index_cap = u32::from_le_bytes(mmap[H_VOCAB_INDEX_CAP..H_VOCAB_INDEX_CAP + 4].try_into().unwrap());
-        let vocab_data_size = u64::from_le_bytes(mmap[H_VOCAB_DATA_SIZE..H_VOCAB_DATA_SIZE + 8].try_into().unwrap()) as usize;
-        let himoreg_max_entries = u32::from_le_bytes(mmap[H_HIMOREG_MAX_ENTRIES..H_HIMOREG_MAX_ENTRIES + 4].try_into().unwrap());
-        let himoreg_index_cap = u32::from_le_bytes(mmap[H_HIMOREG_INDEX_CAP..H_HIMOREG_INDEX_CAP + 4].try_into().unwrap());
-        let himoreg_data_size = u64::from_le_bytes(mmap[H_HIMOREG_DATA_SIZE..H_HIMOREG_DATA_SIZE + 8].try_into().unwrap()) as usize;
-        let content_data_size = u64::from_le_bytes(mmap[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].try_into().unwrap()) as usize;
-        let cyl_max_values = u32::from_le_bytes(mmap[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].try_into().unwrap());
+        let max_entities = u32::from_le_bytes(buf[H_MAX_ENTITIES..H_MAX_ENTITIES + 4].try_into().unwrap());
+        let max_himos = u32::from_le_bytes(buf[H_MAX_HIMOS..H_MAX_HIMOS + 4].try_into().unwrap());
+        let himo_count = u32::from_le_bytes(buf[H_HIMO_COUNT..H_HIMO_COUNT + 4].try_into().unwrap());
+        let vocab_max_entries = u32::from_le_bytes(buf[H_VOCAB_MAX_ENTRIES..H_VOCAB_MAX_ENTRIES + 4].try_into().unwrap());
+        let vocab_index_cap = u32::from_le_bytes(buf[H_VOCAB_INDEX_CAP..H_VOCAB_INDEX_CAP + 4].try_into().unwrap());
+        let vocab_data_size = u64::from_le_bytes(buf[H_VOCAB_DATA_SIZE..H_VOCAB_DATA_SIZE + 8].try_into().unwrap()) as usize;
+        let himoreg_max_entries = u32::from_le_bytes(buf[H_HIMOREG_MAX_ENTRIES..H_HIMOREG_MAX_ENTRIES + 4].try_into().unwrap());
+        let himoreg_index_cap = u32::from_le_bytes(buf[H_HIMOREG_INDEX_CAP..H_HIMOREG_INDEX_CAP + 4].try_into().unwrap());
+        let himoreg_data_size = u64::from_le_bytes(buf[H_HIMOREG_DATA_SIZE..H_HIMOREG_DATA_SIZE + 8].try_into().unwrap()) as usize;
+        let content_data_size = u64::from_le_bytes(buf[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].try_into().unwrap()) as usize;
+        let cyl_max_values = u32::from_le_bytes(buf[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].try_into().unwrap());
 
         let layout = Layout::from_params(
             max_entities, max_himos,
@@ -368,17 +421,16 @@ impl Engine {
             content_data_size, cyl_max_values,
         );
 
-        // himo メタデータ先読み
         let maxv_base = himo_maxv_base(max_himos);
         let mut type_bytes = Vec::with_capacity(himo_count as usize);
         let mut maxv_values = Vec::with_capacity(himo_count as usize);
         for hid in 0..himo_count as usize {
-            type_bytes.push(mmap[H_HIMO_TYPES + hid]);
+            type_bytes.push(buf[H_HIMO_TYPES + hid]);
             let mv_off = maxv_base + hid * 4;
-            maxv_values.push(u32::from_le_bytes(mmap[mv_off..mv_off + 4].try_into().unwrap()));
+            maxv_values.push(u32::from_le_bytes(buf[mv_off..mv_off + 4].try_into().unwrap()));
         }
 
-        let base = mmap.as_mut_ptr();
+        let base = backing.as_mut_ptr();
 
         let entities = EntitySet::load(
             unsafe { Region::new(base.add(layout.entities_off), layout.entities_size) },
@@ -402,7 +454,6 @@ impl Engine {
             unsafe { Region::new(base.add(layout.content_data_off), layout.content_data_size) },
         );
 
-        // 紐を復元
         let mut himo_to_id = HashMap::new();
         let mut himo_names = Vec::new();
         let mut himo_types = Vec::new();
@@ -431,18 +482,16 @@ impl Engine {
         }
 
         let mut eng = Self {
-            path: path.to_string(), layout, max_entities, max_himos,
+            path: String::new(), layout, max_entities, max_himos,
             vocab, himo_reg,
             himo_to_id, himo_names, himo_types, himo_max_values,
             himos, entities, contents, undo,
-            mmap,
+            backing,
         };
 
         if eng.undo.pending_count() > 0 {
             eng.recover();
         }
-
-        // open後に必ずrebuild — cylinder はどちらが active か不定のため
         eng.rebuild();
 
         Ok(eng)
@@ -693,7 +742,7 @@ impl Engine {
         self.himo_reg.get_or_insert(himo.as_bytes());
 
         let effective_mv = max_values.min(self.layout.cyl_max_values);
-        let base = self.mmap.as_mut_ptr();
+        let base = self.backing.as_mut_ptr();
         let col_off = self.layout.himo_col_off(hid);
         let cyl_a_off = self.layout.himo_cyl_a_off(hid);
         let cyl_b_off = self.layout.himo_cyl_b_off(hid);
@@ -713,38 +762,37 @@ impl Engine {
 
         // ヘッダにメタデータ書き込み
         let maxv_base = himo_maxv_base(self.max_himos);
-        self.mmap[H_HIMO_TYPES + hid] = ht as u8;
+        self.backing.as_slice_mut()[H_HIMO_TYPES + hid] = ht as u8;
         let mv_off = maxv_base + hid * 4;
-        self.mmap[mv_off..mv_off + 4].copy_from_slice(&max_values.to_le_bytes());
+        self.backing.as_slice_mut()[mv_off..mv_off + 4].copy_from_slice(&max_values.to_le_bytes());
         let himo_count = (hid + 1) as u32;
-        self.mmap[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&himo_count.to_le_bytes());
+        self.backing.as_slice_mut()[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&himo_count.to_le_bytes());
 
         hid
     }
 
     // ──── flush ────
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn flush(&mut self) -> io::Result<()> {
         self.commit();
 
-        // コンポーネントの内部状態をRegionに書き戻す
         for ds in &self.himos { ds.sync(); }
         self.vocab.sync();
         self.himo_reg.sync();
         self.contents.sync();
 
-        // ヘッダにhimoメタデータを最終書き込み
         let maxv_base = himo_maxv_base(self.max_himos);
         let hc = self.himo_types.len() as u32;
+        let buf = self.backing.as_slice_mut();
         for hid in 0..self.himo_types.len() {
-            self.mmap[H_HIMO_TYPES + hid] = self.himo_types[hid] as u8;
+            buf[H_HIMO_TYPES + hid] = self.himo_types[hid] as u8;
             let off = maxv_base + hid * 4;
-            self.mmap[off..off + 4].copy_from_slice(&self.himo_max_values[hid].to_le_bytes());
+            buf[off..off + 4].copy_from_slice(&self.himo_max_values[hid].to_le_bytes());
         }
-        self.mmap[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&hc.to_le_bytes());
+        buf[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&hc.to_le_bytes());
 
-        // 単一 mmap を sync
-        self.mmap.flush()?;
+        self.backing.flush_to_disk()?;
         Ok(())
     }
 }
@@ -1532,7 +1580,7 @@ mod tests {
 
             eng.tie(e, "age", 99);
             // undo だけ flush（クラッシュシミュレーション）
-            eng.mmap.flush().unwrap();
+            eng.backing.flush_to_disk().unwrap();
         }
 
         let mut eng = Engine::open(&dir).unwrap();

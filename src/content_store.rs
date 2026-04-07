@@ -12,7 +12,8 @@ use crate::region::Region;
 const MAGIC: [u8; 4] = [b'C', b'N', b'T', b'1'];
 const INDEX_HEADER: usize = 16;
 const MAX_KEYS: u32 = 16;
-const MAX_ENTITIES: u32 = 16_777_216;
+// index_region_size で実際の max_entities を受け取る
+const DEFAULT_MAX_ENTITIES: u32 = 16_777_216;
 const DATA_HEADER: usize = 12;
 
 pub struct ContentStore {
@@ -25,8 +26,12 @@ unsafe impl Sync for ContentStore {}
 unsafe impl Send for ContentStore {}
 
 impl ContentStore {
+    pub fn index_region_size_for(max_entities: u32) -> usize {
+        INDEX_HEADER + (max_entities as usize) * (MAX_KEYS as usize) * 8
+    }
+
     pub fn index_region_size() -> usize {
-        INDEX_HEADER + (MAX_ENTITIES as usize) * (MAX_KEYS as usize) * 8
+        Self::index_region_size_for(DEFAULT_MAX_ENTITIES)
     }
 
     pub fn data_region_size() -> usize {
