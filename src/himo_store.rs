@@ -162,12 +162,7 @@ impl HimoStore {
             }
         }
 
-        // Cylinder rebuild
-        let standby = if self.use_b.load(Ordering::Acquire) { &self.cyl_a } else { &self.cyl_b };
-        standby.rebuild(pairs.clone());
-        self.use_b.fetch_xor(true, Ordering::Release);
-
-        // Bitmap rebuild（メモリ予算内なら）
+        // Bitmap rebuild（メモリ予算内なら、pairs消費前に構築）
         if Self::should_build_bitmaps(self.max_values, self.bitmap_words) {
             let slots = self.max_values as usize + 1;
             let mut bms = vec![vec![0u64; self.bitmap_words]; slots];
@@ -178,6 +173,11 @@ impl HimoStore {
             }
             unsafe { *self.bitmaps.get() = Some(bms); }
         }
+
+        // Cylinder rebuild（pairsを消費、clone不要）
+        let standby = if self.use_b.load(Ordering::Acquire) { &self.cyl_a } else { &self.cyl_b };
+        standby.rebuild(pairs);
+        self.use_b.fetch_xor(true, Ordering::Release);
 
         self.dirty.store(false, Ordering::Release);
     }
