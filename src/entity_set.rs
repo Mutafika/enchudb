@@ -68,24 +68,35 @@ impl EntitySet {
     }
 
     pub fn allocate(&self) -> u32 {
-        let mm = self.region.slice_mut();
-
-        let free_count_off = self.free_offset;
-        let fc = u32::from_le_bytes(mm[free_count_off..free_count_off + 4].try_into().unwrap());
-        if fc > 0 {
-            let new_fc = fc - 1;
-            let eid_off = self.free_offset + 4 + (new_fc as usize) * 4;
-            let eid = u32::from_le_bytes(mm[eid_off..eid_off + 4].try_into().unwrap());
-            mm[free_count_off..free_count_off + 4].copy_from_slice(&new_fc.to_le_bytes());
+        // 高速パス: monotonic increment（欠番方式、ロックフリー）
+        let eid = self.next_eid_atomic().fetch_add(1, Ordering::Relaxed);
+        if eid < self.max_entities {
             self.set_bit(eid, true);
             self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
             return eid;
         }
+        // 上限到達 → fetch_addを巻き戻してfree stackから再利用
+        self.next_eid_atomic().fetch_sub(1, Ordering::Relaxed);
+        self.allocate_from_free_stack()
+    }
 
-        let eid = self.next_eid_atomic().fetch_add(1, Ordering::Relaxed);
-        self.set_bit(eid, true);
-        self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
-        eid
+    /// free stack から CAS で安全に pop。上限到達時のみ呼ばれる。
+    fn allocate_from_free_stack(&self) -> u32 {
+        let mm = self.region.slice_mut();
+        let fc_ptr = unsafe {
+            &*(mm.as_ptr().add(self.free_offset) as *const AtomicU32)
+        };
+        loop {
+            let fc = fc_ptr.load(Ordering::Acquire);
+            assert!(fc > 0, "entity limit reached: max_entities={}, no free slots", self.max_entities);
+            if fc_ptr.compare_exchange(fc, fc - 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                let eid_off = self.free_offset + 4 + ((fc - 1) as usize) * 4;
+                let eid = u32::from_le_bytes(mm[eid_off..eid_off + 4].try_into().unwrap());
+                self.set_bit(eid, true);
+                self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
+                return eid;
+            }
+        }
     }
 
     pub fn free(&self, eid: u32) {

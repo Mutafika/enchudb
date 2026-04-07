@@ -782,8 +782,10 @@ mod tests {
         assert_eq!(eng.entity_count(), 2);
         assert_eq!(eng.entities(), vec![e0, e2]);
 
+        // 上限前は欠番（monotonic）— IDは再利用されない
         let e3 = eng.entity();
-        assert_eq!(e3, e1);
+        assert_eq!(e3, 3); // e1(=1)ではなく新規ID
+        assert_eq!(eng.entity_count(), 3);
         let _ = std::fs::remove_file(&dir);
     }
 
