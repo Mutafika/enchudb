@@ -33,11 +33,12 @@ pub struct HimoStore {
     cyl_a: Cylinder,
     cyl_b: Cylinder,
     use_b: AtomicBool,
+    rebuilding: AtomicBool, // rebuild排他: 1スレッドだけ
     pub himo_type: HimoType,
     pub max_values: u32,
     pub dirty: AtomicBool,
-    bitmaps: UnsafeCell<Option<Vec<Vec<u64>>>>, // bitmaps[value] = entity bitmap
-    bitmap_words: usize,                         // (max_entities + 63) / 64
+    bitmaps: UnsafeCell<Option<Vec<Vec<u64>>>>,
+    bitmap_words: usize,
 }
 
 unsafe impl Sync for HimoStore {}
@@ -63,7 +64,7 @@ impl HimoStore {
         let bitmap_words = Self::compute_bitmap_words(max_entities);
         Self {
             col: UnsafeCell::new(col), cyl_a, cyl_b,
-            use_b: AtomicBool::new(false),
+            use_b: AtomicBool::new(false), rebuilding: AtomicBool::new(false),
             himo_type: ht, max_values, dirty: AtomicBool::new(false),
             bitmaps: UnsafeCell::new(None), bitmap_words,
         }
@@ -79,7 +80,7 @@ impl HimoStore {
         let bitmap_words = Self::compute_bitmap_words(max_entities);
         Self {
             col: UnsafeCell::new(col), cyl_a, cyl_b,
-            use_b: AtomicBool::new(false),
+            use_b: AtomicBool::new(false), rebuilding: AtomicBool::new(false),
             himo_type: ht, max_values, dirty: AtomicBool::new(true),
             bitmaps: UnsafeCell::new(None), bitmap_words,
         }
@@ -153,6 +154,16 @@ impl HimoStore {
 
     pub fn rebuild_cylinder(&self) {
         if !self.dirty.load(Ordering::Acquire) { return; }
+        // 1スレッドだけrebuild。他はスキップ（activeのcylinderはそのまま読める）
+        if self.rebuilding.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            return;
+        }
+        // dirtyを再確認（別スレッドが先に完了した可能性）
+        if !self.dirty.load(Ordering::Acquire) {
+            self.rebuilding.store(false, Ordering::Release);
+            return;
+        }
+
         let count = self.col().count();
         let mut pairs = Vec::new();
         for eid in 0..count {
@@ -174,12 +185,13 @@ impl HimoStore {
             unsafe { *self.bitmaps.get() = Some(bms); }
         }
 
-        // Cylinder rebuild（pairsを消費、clone不要）
+        // standbyに書く（readerはactiveを読み続ける）
         let standby = if self.use_b.load(Ordering::Acquire) { &self.cyl_a } else { &self.cyl_b };
         standby.rebuild(pairs);
+        // atomic swap — readerは次のアクセスから新しいcylinderを読む
         self.use_b.fetch_xor(true, Ordering::Release);
-
         self.dirty.store(false, Ordering::Release);
+        self.rebuilding.store(false, Ordering::Release);
     }
 
     pub fn scan(&self, value: u32) -> Vec<u32> {

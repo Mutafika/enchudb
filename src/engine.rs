@@ -578,9 +578,8 @@ impl Engine {
 
     // ──── 紐を引く（Cylinder 経由）────
 
-    /// 書き込み終了宣言。Cylinder + Bitmap キャッシュを再構築。
-    /// tie/untie/delete の後、query/pull_raw の前に呼ぶ。
-    pub fn rebuild(&mut self) {
+    /// Cylinder + Bitmap キャッシュを再構築。並行read安全。
+    pub fn rebuild(&self) {
         for ds in &self.himos { ds.rebuild_cylinder(); }
     }
 
@@ -592,6 +591,7 @@ impl Engine {
     }
 
     pub fn query(&self, strings: &[(&str, u32)]) -> Vec<u32> {
+        self.rebuild();
         if strings.is_empty() { return vec![]; }
 
         // 全条件の himo index と value を解決
@@ -668,8 +668,7 @@ impl Engine {
         result
     }
 
-    pub(crate) fn query_count(&mut self, strings: &[(&str, u32)]) -> usize {
-        self.rebuild();
+    pub(crate) fn query_count(&self, strings: &[(&str, u32)]) -> usize {
         self.query(strings).len()
     }
 
@@ -752,7 +751,7 @@ mod tests {
     }
 
     /// テスト用: rebuild + query_count を一発で。
-    fn qc(eng: &mut Engine, conds: &[(&str, u32)]) -> usize {
+    fn qc(eng: &Engine, conds: &[(&str, u32)]) -> usize {
         eng.rebuild();
         eng.query(conds).len()
     }
