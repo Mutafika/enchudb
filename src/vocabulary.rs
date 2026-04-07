@@ -147,7 +147,12 @@ impl Vocabulary {
                 continue;
             }
             let slot_hash = u64::from_le_bytes(xm[off + 1..off + 9].try_into().unwrap());
-            if slot_hash == h { return; }
+            if slot_hash == h {
+                // ハッシュ一致 → 実際の値を比較して本当に重複か確認
+                let vid = u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap());
+                if self.get(vid) == value { return; } // 本当の重複
+                // ハッシュ衝突 → linear probe 続行
+            }
             idx = ((idx as u64 + 1) & mask) as usize;
         }
     }

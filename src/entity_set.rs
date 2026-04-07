@@ -36,7 +36,7 @@ impl EntitySet {
     pub fn init(region: Region, max_entities: u32) -> Self {
         let bitset_offset = HEADER;
         let bitset_size = ((max_entities + 7) / 8) as usize;
-        let free_offset = bitset_offset + bitset_size;
+        let free_offset = (bitset_offset + bitset_size + 3) & !3; // AtomicU32 alignment
 
         let mm = region.slice_mut();
         mm[0..4].copy_from_slice(&MAGIC);
@@ -53,7 +53,7 @@ impl EntitySet {
         }
         let bitset_offset = HEADER;
         let bitset_size = ((max_entities + 7) / 8) as usize;
-        let free_offset = bitset_offset + bitset_size;
+        let free_offset = (bitset_offset + bitset_size + 3) & !3; // AtomicU32 alignment
         Self { region, max_entities, bitset_offset, free_offset }
     }
 
