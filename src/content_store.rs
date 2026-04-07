@@ -30,7 +30,7 @@ impl ContentStore {
     }
 
     pub fn data_region_size() -> usize {
-        64 * 1024 * 1024 // 64MB
+        512 * 1024 * 1024 // 512MB
     }
 
     /// 新規領域を初期化。
