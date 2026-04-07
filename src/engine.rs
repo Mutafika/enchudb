@@ -451,7 +451,9 @@ impl Engine {
     // ──── entity ────
 
     pub fn entity(&self) -> u32 {
-        self.entities.allocate()
+        let eid = self.entities.allocate();
+        self.undo.record(eid, 0xFFFF, &[1, 0, 0, 0]); // entity created
+        eid
     }
 
     pub(crate) fn entities(&self) -> Vec<u32> { self.entities.iter() }
@@ -497,6 +499,7 @@ impl Engine {
     // ──── delete ────
 
     pub fn delete(&self, eid: u32) {
+        self.undo.record(eid, 0xFFFF, &[2, 0, 0, 0]); // entity deleted
         for hid in 0..self.himos.len() {
             self.record_undo(eid, hid);
             self.himos[hid].remove(eid);
@@ -511,12 +514,7 @@ impl Engine {
     }
 
     pub fn rollback(&self) {
-        for (eid, himo_id, old_value) in self.undo.entries_reverse() {
-            let hid = himo_id as usize;
-            if hid < self.himos.len() {
-                self.himos[hid].restore(eid, &old_value);
-            }
-        }
+        self.replay_undo();
         self.undo.commit();
     }
 
@@ -528,13 +526,26 @@ impl Engine {
     }
 
     fn recover(&mut self) {
-        for (eid, himo_id, old_value) in self.undo.entries_reverse() {
-            let hid = himo_id as usize;
-            if hid < self.himos.len() {
-                self.himos[hid].restore(eid, &old_value);
+        self.replay_undo();
+        self.undo.commit();
+    }
+
+    fn replay_undo(&self) {
+        for (eid, dim_id, old_value) in self.undo.entries_reverse() {
+            if dim_id == 0xFFFF {
+                // entity lifecycle marker
+                match old_value[0] {
+                    1 => self.entities.free(eid),   // undo create → free
+                    2 => self.entities.revive(eid),  // undo delete → revive
+                    _ => {}
+                }
+            } else {
+                let hid = dim_id as usize;
+                if hid < self.himos.len() {
+                    self.himos[hid].restore(eid, &old_value);
+                }
             }
         }
-        self.undo.commit();
     }
 
     // ──── content ────

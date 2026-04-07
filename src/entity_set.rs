@@ -114,6 +114,13 @@ impl EntitySet {
         }
     }
 
+    /// rollback用: 削除されたentityを復活させる。
+    pub fn revive(&self, eid: u32) {
+        if eid >= self.max_entities || self.is_live(eid) { return; }
+        self.set_bit(eid, true);
+        self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
+    }
+
     #[inline]
     pub fn is_live(&self, eid: u32) -> bool {
         if eid >= self.max_entities { return false; }
