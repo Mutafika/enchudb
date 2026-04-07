@@ -578,7 +578,9 @@ impl Engine {
 
     // ──── 紐を引く（Cylinder 経由）────
 
-    pub fn rebuild(&self) {
+    /// 書き込み終了宣言。Cylinder + Bitmap キャッシュを再構築。
+    /// tie/untie/delete の後、query/pull_raw の前に呼ぶ。
+    pub fn rebuild(&mut self) {
         for ds in &self.himos { ds.rebuild_cylinder(); }
     }
 
@@ -590,7 +592,6 @@ impl Engine {
     }
 
     pub fn query(&self, strings: &[(&str, u32)]) -> Vec<u32> {
-        self.rebuild();
         if strings.is_empty() { return vec![]; }
 
         // 全条件の himo index と value を解決
@@ -667,7 +668,8 @@ impl Engine {
         result
     }
 
-    pub(crate) fn query_count(&self, strings: &[(&str, u32)]) -> usize {
+    pub(crate) fn query_count(&mut self, strings: &[(&str, u32)]) -> usize {
+        self.rebuild();
         self.query(strings).len()
     }
 
@@ -749,6 +751,12 @@ mod tests {
         path
     }
 
+    /// テスト用: rebuild + query_count を一発で。
+    fn qc(eng: &mut Engine, conds: &[(&str, u32)]) -> usize {
+        eng.rebuild();
+        eng.query(conds).len()
+    }
+
     // ──── entity ライフサイクル ────
 
     #[test]
@@ -824,8 +832,8 @@ mod tests {
         eng.tie(e, "score", 100);
         eng.tie(e, "score", 200);
         assert_eq!(eng.get(e, "score"), Some(200));
-        assert_eq!(eng.query_count(&[("score", 100)]), 0);
-        assert_eq!(eng.query_count(&[("score", 200)]), 1);
+        assert_eq!(qc(&mut eng, &[("score", 100)]), 0);
+        assert_eq!(qc(&mut eng, &[("score", 200)]), 1);
         let _ = std::fs::remove_file(&dir);
     }
 
@@ -836,7 +844,7 @@ mod tests {
         let e = eng.entity();
         eng.tie(e, "level", 0);
         assert_eq!(eng.get(e, "level"), Some(0));
-        assert_eq!(eng.query_count(&[("level", 0)]), 1);
+        assert_eq!(qc(&mut eng, &[("level", 0)]), 1);
         let _ = std::fs::remove_file(&dir);
     }
 
@@ -852,7 +860,7 @@ mod tests {
 
         eng.untie(e, "age");
         assert_eq!(eng.get(e, "age"), None);
-        assert_eq!(eng.query_count(&[("age", 30)]), 0);
+        assert_eq!(qc(&mut eng, &[("age", 30)]), 0);
         assert_eq!(eng.get_text(e, "name"), Some(b"X".as_ref()));
         let _ = std::fs::remove_file(&dir);
     }
@@ -868,7 +876,7 @@ mod tests {
         eng.tie_text(e, "name", "田中");
 
         eng.delete(e);
-        assert_eq!(eng.query_count(&[("age", 30)]), 0);
+        assert_eq!(qc(&mut eng, &[("age", 30)]), 0);
         assert_eq!(eng.get(e, "age"), None);
         assert_eq!(eng.get_text(e, "name"), None);
         let _ = std::fs::remove_file(&dir);
@@ -934,6 +942,7 @@ mod tests {
         let e2 = eng.entity();
         eng.tie(e2, "age", 30);
 
+        eng.rebuild();
         let result = eng.query(&[("age", 30)]);
         assert_eq!(result.len(), 2);
         assert!(result.contains(&e0));
@@ -958,6 +967,7 @@ mod tests {
         eng.tie(e2, "age", 30);
         eng.tie(e2, "dept", 2);
 
+        eng.rebuild();
         assert_eq!(eng.query(&[("dept", 1), ("age", 30)]), vec![e0]);
         assert_eq!(eng.query(&[("dept", 1), ("age", 25)]), vec![e1]);
         assert_eq!(eng.query(&[("dept", 2), ("age", 30)]), vec![e2]);
@@ -970,8 +980,9 @@ mod tests {
         let mut eng = Engine::create(&dir).unwrap();
         let e = eng.entity();
         eng.tie(e, "age", 30);
+        eng.rebuild();
         assert!(eng.query(&[("age", 99)]).is_empty());
-        assert_eq!(eng.query_count(&[("age", 99)]), 0);
+        assert_eq!(qc(&mut eng, &[("age", 99)]), 0);
         assert!(eng.query(&[("nonexistent", 1)]).is_empty());
         let _ = std::fs::remove_file(&dir);
     }
@@ -984,9 +995,10 @@ mod tests {
             let e = eng.entity();
             eng.tie(e, "bucket", i % 3);
         }
+        eng.rebuild();
         for b in 0..3 {
             let q = eng.query(&[("bucket", b)]);
-            let c = eng.query_count(&[("bucket", b)]);
+            let c = qc(&mut eng, &[("bucket", b)]);
             assert_eq!(q.len(), c);
         }
         let _ = std::fs::remove_file(&dir);
@@ -1007,6 +1019,7 @@ mod tests {
         eng.tie(e1, "age", 25);
         eng.tie(e1, "dept", 1);
 
+        eng.rebuild();
         assert_eq!(eng.query(&[("dept", 1), ("age", 30)]), vec![e0]);
         let _ = std::fs::remove_file(&dir);
     }
@@ -1086,12 +1099,12 @@ mod tests {
         assert_eq!(eng.get(0, "age"), Some(25));
         assert_eq!(eng.get(1, "age"), Some(30));
         assert_eq!(eng.get_content(1, "memo"), Some(b"hello".as_ref()));
-        assert_eq!(eng.query_count(&[("dept", 1), ("age", 30)]), 1);
+        assert_eq!(qc(&mut eng, &[("dept", 1), ("age", 30)]), 1);
 
         let e2 = eng.entity();
         eng.tie(e2, "age", 35);
         eng.tie(e2, "dept", 1);
-        assert_eq!(eng.query_count(&[("dept", 1), ("age", 35)]), 1);
+        assert_eq!(qc(&mut eng, &[("dept", 1), ("age", 35)]), 1);
 
         let _ = std::fs::remove_file(&dir);
     }
@@ -1121,7 +1134,7 @@ mod tests {
         let e = eng.entity();
         eng.tie(e, "x", 0);
         assert_eq!(eng.get(e, "x"), Some(0));
-        assert_eq!(eng.query_count(&[("x", 0)]), 1);
+        assert_eq!(qc(&mut eng, &[("x", 0)]), 1);
 
         eng.untie(e, "x");
         assert_eq!(eng.get(e, "x"), None);
@@ -1163,7 +1176,7 @@ mod tests {
             eng.tie(e, "level", v);
         }
         for v in 0..5u32 {
-            assert_eq!(eng.query_count(&[("level", v)]), 1);
+            assert_eq!(qc(&mut eng, &[("level", v)]), 1);
         }
         let _ = std::fs::remove_file(&dir);
     }
@@ -1196,13 +1209,12 @@ mod tests {
             eng.tie(e, "score", (i / 5) % 10);
         }
 
+        eng.rebuild();
         let group0: Vec<u32> = eng.query(&[("group", 0)]);
         assert_eq!(group0.len(), 200);
         for &eid in &group0 {
             eng.delete(eid);
         }
-
-        assert_eq!(eng.query_count(&[("group", 0)]), 0);
         for g in 1..5u32 {
             assert_eq!(eng.query_count(&[("group", g)]), 200);
         }
@@ -1251,6 +1263,7 @@ mod tests {
                 let e = eng.entity();
                 eng.tie(e, "val", i % 10);
             }
+            eng.rebuild();
             let del_targets: Vec<u32> = eng.query(&[("val", 0)]);
             for &eid in &del_targets {
                 eng.delete(eid);
@@ -1623,10 +1636,10 @@ mod tests {
             eng.tie(e, "age", i % 10);
             eng.tie(e, "dept", i % 5);
         }
+        eng.rebuild();
         let victims: Vec<u32> = eng.query(&[("age", 0)]);
         assert_eq!(victims.len(), 10);
         for &eid in &victims { eng.delete(eid); }
-        assert_eq!(eng.query_count(&[("age", 0)]), 0);
         for a in 1..10u32 {
             assert_eq!(eng.query_count(&[("age", a)]), 10);
         }
@@ -1904,8 +1917,7 @@ mod tests {
         drop(eng);
 
         // Phase 3: 再open後も全件引けるか
-        let eng = Engine::open(&dir).unwrap();
-        eng.rebuild();
+        let eng = Engine::open(&dir).unwrap(); // open内でrebuild済み
         let vid = eng.vocab_id("1").expect("vocab_id");
         let result = eng.pull_raw("has_flag", vid);
         assert_eq!(result.len(), 1000, "after reopen: expected 1000, got {}", result.len());
@@ -1947,8 +1959,7 @@ mod tests {
         drop(eng);
 
         // Phase 3: 再open後
-        let eng = Engine::open(&dir).unwrap();
-        eng.rebuild();
+        let eng = Engine::open(&dir).unwrap(); // open内でrebuild済み
         let vid = eng.vocab_id("1").expect("vocab_id");
         let result = eng.pull_raw("has_flag", vid);
         assert_eq!(result.len(), 3, "after reopen: expected 3, got {}", result.len());
