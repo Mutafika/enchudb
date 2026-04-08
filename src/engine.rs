@@ -767,9 +767,12 @@ impl Engine {
             return self.apply_delta(idx, val, cyl_result, hs.delta_eids());
         }
 
-        // 全条件bitmapならAND（delta空の時のみ — deltaあればColumn直読みへ）
+        // 全条件bitmapならAND（delta空 + 値がbitmap範囲内の時のみ）
         let all_bitmap = conds.len() >= 2
-            && conds.iter().all(|&(idx, _)| self.himos[idx].has_bitmaps() && self.himos[idx].delta_is_empty());
+            && conds.iter().all(|&(idx, val)| {
+                let hs = &self.himos[idx];
+                hs.has_bitmaps() && val <= hs.max_values && hs.delta_is_empty()
+            });
 
         if all_bitmap {
             return self.query_bitmap_and(&conds);
