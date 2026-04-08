@@ -51,7 +51,7 @@ impl Vocabulary {
         }
     }
 
-    /// 既存領域をロード。
+    /// 既存領域をロード。ハッシュインデックスを再構築する。
     pub fn load(data: Region, offsets: Region, index: Region) -> Self {
         let dm = data.slice();
         let count = u32::from_le_bytes(dm[4..8].try_into().unwrap());
@@ -63,11 +63,29 @@ impl Vocabulary {
         let xm = index.slice();
         let index_cap = u32::from_le_bytes(xm[4..8].try_into().unwrap());
 
-        Self {
+        let v = Self {
             data, offsets, index,
             count: AtomicU32::new(count),
             data_end: AtomicU32::new(data_end),
             max_entries, index_cap,
+        };
+        v.rebuild_index();
+        v
+    }
+
+    /// ハッシュインデックスを data/offsets から再構築する。
+    fn rebuild_index(&self) {
+        let count = self.count.load(Ordering::Relaxed);
+        if count == 0 { return; }
+
+        // インデックス領域をゼロクリア（ヘッダは保持）
+        let xm = self.index.slice_mut();
+        for b in &mut xm[INDEX_HEADER..] { *b = 0; }
+
+        // 全エントリを再挿入
+        for id in 0..count {
+            let value = self.get(id);
+            self.index_insert(value, id);
         }
     }
 

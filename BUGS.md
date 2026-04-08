@@ -108,6 +108,18 @@ entity() と delete() の EntitySet 変更がundo logに記録されず、rollba
 - **症状**: create→rollback でentityが残る。delete→rollback でentityが復活しない
 - **修正**: dim_id=0xFFFF マーカーでentity create/delete をundo log に記録。replay_undo で EntitySet::free/revive
 
+## [修正済み] Vocabulary ハッシュインデックスが open 後に一部エントリを引けない
+**日付**: 2026-04-08
+**箇所**: `vocabulary.rs` — `load()`
+
+`Vocabulary::load()` がmmap上のハッシュテーブルをそのまま信頼するが、一部スロットのflagバイトが永続化後に0（空）として読まれ、`lookup()` がそこで探索を打ち切る。`get_text()` による全entityスキャンでは見つかるが `vocab_id()` では見つからない。
+
+Cylinderは `rebuild()` で再構築されるが、Vocabularyのハッシュインデックスには再構築パスが存在しなかった。
+
+- **症状**: `tie_text` → `flush` → `open` → `rebuild` 後、一部の `vocab_id()` が `None` を返す。29件中2件が詳細表示不可（mkd-nyusatsu P003 世田谷区 2026年度で発覚）
+- **再現**: DB作成 → 数十件 `tie_text` → `flush` → 再open → `vocab_id` で特定キーが見つからない
+- **修正**: `Vocabulary::load()` でハッシュインデックスをゼロクリア後、全エントリ（data/offsets）から `index_insert` で再構築。Cylinderと同様にインデックスをキャッシュとして扱う
+
 ## [機能追加] tie_to / tie_text_to / tie_ref_to（&self 書き込み）
 **日付**: 2026-04-08
 **箇所**: `engine.rs`
