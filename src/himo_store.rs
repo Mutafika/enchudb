@@ -99,7 +99,6 @@ impl HimoStore {
     }
 
     fn col(&self) -> &Column { unsafe { &*self.col.get() } }
-    fn col_mut(&self) -> &mut Column { unsafe { &mut *self.col.get() } }
 
     pub fn cylinder(&self) -> &Cylinder {
         if self.use_b.load(Ordering::Acquire) { &self.cyl_b } else { &self.cyl_a }
@@ -108,9 +107,7 @@ impl HimoStore {
     // ──── ぶら下げる / 外す ────
 
     pub fn set(&self, eid: u32, value: u32) {
-        if self.col().count() <= eid {
-            self.col_mut().write_count(eid + 1);
-        }
+        self.col().ensure_count(eid);
         self.col().set(eid, &(value + 1).to_le_bytes());
         self.delta_push(eid);
         self.dirty.store(true, Ordering::Release);
@@ -155,9 +152,7 @@ impl HimoStore {
     }
 
     pub fn restore(&self, eid: u32, old_bytes: &[u8; 4]) {
-        if self.col().count() <= eid {
-            self.col_mut().write_count(eid + 1);
-        }
+        self.col().ensure_count(eid);
         self.col().set(eid, old_bytes);
         self.delta_push(eid);
         self.dirty.store(true, Ordering::Release);
