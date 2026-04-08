@@ -80,3 +80,36 @@ data領域（64MB→512MBに拡大済み）を超えてcontentを書き込んで
 
 - **症状**: 2条件 query が 60μs（Column直読みなら 14μs、bitmap AND なら 5μs）
 - **修正**: 最小Cylinderスライスをpull + 残りColumn直読み。全条件bitmap有なら AND 1パス
+
+## [修正済み] fxhash 系統的衝突でvocabエントリ消失
+**日付**: 2026-04-07
+**箇所**: `vocabulary.rs` — `index_insert()`
+
+`index_insert` がハッシュ一致で重複と判定し、実際の値を比較せずにreturnしていた。fxhashの系統的衝突（例: "entity_19800" と "entity_24400" が同一ハッシュ）で後発エントリが消失。
+
+- **症状**: 50K unique strings で5000件がvocab_idで引けない
+- **修正**: ハッシュ一致時に実際の値を比較、不一致ならlinear probe続行
+
+## [修正済み] EntitySet free_offset 未アライメント → SIGBUS
+**日付**: 2026-04-07
+**箇所**: `entity_set.rs` — `init()`, `load()`
+
+max_entities が 8 の倍数でない場合、bitset_size が 4 byte 非整列になり、free_offset が奇数アドレスに。AtomicU32 アクセスで SIGBUS（Apple Silicon）。
+
+- **症状**: `create_with_capacity(100)` で entity 上限到達時にSIGBUS (exit 138)
+- **修正**: `free_offset` を 4 byte アライメント
+
+## [修正済み] entity lifecycle がundo logに未記録
+**日付**: 2026-04-07
+**箇所**: `engine.rs` — `entity()`, `delete()`, `rollback()`
+
+entity() と delete() の EntitySet 変更がundo logに記録されず、rollback時にentityの生死が戻らなかった。
+
+- **症状**: create→rollback でentityが残る。delete→rollback でentityが復活しない
+- **修正**: dim_id=0xFFFF マーカーでentity create/delete をundo log に記録。replay_undo で EntitySet::free/revive
+
+## [機能追加] tie_to / tie_text_to / tie_ref_to（&self 書き込み）
+**日付**: 2026-04-08
+**箇所**: `engine.rs`
+
+define_himo 済みの紐に対して &self で書き込み可能なメソッド追加。Arc<Engine> 共有のまま Mutex 不要で並行書き込み。紐が未定義なら panic。

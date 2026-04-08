@@ -80,15 +80,38 @@ let result = db.pull_raw("city", tokyo_id);
 use std::sync::Arc;
 
 let mut db = Engine::create("db.db").unwrap();
-// write phase（&mut self、排他）
-db.tie(e, "age", 30);
-db.rebuild();  // キャッシュ構築
+// スキーマ定義（&mut self、起動時に1回）
+db.define_himo("age", HimoType::Value, 100);
+db.define_himo("city", HimoType::Symbol, 0);
 
-// read phase（&self、Arc共有、並列安全）
+// 初期データ投入（&mut self）
+db.tie(e, "age", 30);
+db.rebuild();
+
+// Arc共有（以降 &self のみ）
 let db = Arc::new(db);
-// 複数スレッドから同時にquery/pull_raw/get OK
-// rebuild()も&selfで並列安全（内部でcompare_exchange排他）
+
+// 読み書き並行（全部 &self）
+db.entity();                          // entity作成
+db.tie_to(e, "age", 30);             // 定義済み紐への書き込み
+db.tie_text_to(e, "city", "東京");    // 定義済み紐へのテキスト書き込み
+db.query(&[("age", 30)]);            // 検索（内部でrebuild）
+db.pull_raw("age", 30);              // Cylinder直引き
+db.get(e, "age");                    // Column直読み
+db.rebuild();                        // ロックフリー（compare_exchange排他）
 ```
+
+### &mut self vs &self
+| メソッド | self | 用途 |
+|----------|------|------|
+| `define_himo` | `&mut` | スキーマ定義（起動時） |
+| `tie` / `tie_text` / `tie_ref` | `&mut` | 書き込み（紐の自動作成あり） |
+| `tie_to` / `tie_text_to` / `tie_ref_to` | `&self` | 書き込み（定義済み紐のみ） |
+| `entity` / `delete` / `untie` | `&self` | entity操作 |
+| `query` / `pull_raw` / `get` | `&self` | 読み取り |
+| `rebuild` | `&self` | キャッシュ構築（ロックフリー排他） |
+| `commit` / `rollback` | `&self` | トランザクション |
+| `flush` | `&mut` | 永続化 |
 
 ## クエリ戦略（自動選択）
 1. **全条件bitmap有** → bitmap AND（非選択的クエリ ~5μs）
