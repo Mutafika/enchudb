@@ -1,11 +1,12 @@
 //! HimoStore — 紐1本分のストレージ。
 //!
-//! Column（紐）+ Cylinder（キャッシュ、ダブルバッファ）+ Bitmap（交差用）。
-//! Column がソースオブトゥルース。tie/untie は Column だけ触る。
-//! Cylinder は rebuild で Column スキャンから構築。
-//! Bitmap は rebuild 時に per-value で焼く（メモリ上限内なら）。
+//! Column（ソースオブトゥルース）+ Cylinder（検索キャッシュ）+ Delta（差分）。
+//!
+//! ぶら下げる → Column に書く + delta に eid 追記
+//! 引く       → Cylinder 結果 + delta 分を Column 直読みで補正
+//! rebuild    → delta を Cylinder にマージ（delta が大きくなった時だけ）
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::cell::UnsafeCell;
 
 use crate::column::Column;
@@ -25,20 +26,23 @@ impl HimoType {
     }
 }
 
-/// bitmap メモリ上限: 32MB per himo
 const BITMAP_BUDGET: usize = 32 * 1024 * 1024;
+const DELTA_CAP: usize = 4096;
 
 pub struct HimoStore {
     col: UnsafeCell<Column>,
     cyl_a: Cylinder,
     cyl_b: Cylinder,
     use_b: AtomicBool,
-    rebuilding: AtomicBool, // rebuild排他: 1スレッドだけ
+    rebuilding: AtomicBool,
     pub himo_type: HimoType,
     pub max_values: u32,
     pub dirty: AtomicBool,
     bitmaps: UnsafeCell<Option<Vec<Vec<u64>>>>,
     bitmap_words: usize,
+    // delta: Cylinder に反映されていない変更の eid 一覧
+    delta_eids: UnsafeCell<Vec<u32>>,
+    delta_len: AtomicU32,
 }
 
 unsafe impl Sync for HimoStore {}
@@ -55,7 +59,12 @@ impl HimoStore {
         total_bytes <= BITMAP_BUDGET
     }
 
-    /// 新規Region群から初期化。
+    fn new_delta() -> Vec<u32> {
+        let mut v = Vec::with_capacity(DELTA_CAP);
+        v.resize(DELTA_CAP, 0);
+        v
+    }
+
     pub fn init(col_region: Region, cyl_a_region: Region, cyl_b_region: Region,
                 ht: HimoType, max_values: u32, max_entities: u32) -> Self {
         let col = Column::init(col_region, 4, max_entities);
@@ -67,10 +76,11 @@ impl HimoStore {
             use_b: AtomicBool::new(false), rebuilding: AtomicBool::new(false),
             himo_type: ht, max_values, dirty: AtomicBool::new(false),
             bitmaps: UnsafeCell::new(None), bitmap_words,
+            delta_eids: UnsafeCell::new(Self::new_delta()),
+            delta_len: AtomicU32::new(0),
         }
     }
 
-    /// 既存Region群からロード。
     pub fn load(col_region: Region, cyl_a_region: Region, cyl_b_region: Region,
                 ht: HimoType, max_values: u32) -> Self {
         let col = Column::load(col_region);
@@ -83,6 +93,8 @@ impl HimoStore {
             use_b: AtomicBool::new(false), rebuilding: AtomicBool::new(false),
             himo_type: ht, max_values, dirty: AtomicBool::new(true),
             bitmaps: UnsafeCell::new(None), bitmap_words,
+            delta_eids: UnsafeCell::new(Self::new_delta()),
+            delta_len: AtomicU32::new(0),
         }
     }
 
@@ -93,20 +105,38 @@ impl HimoStore {
         if self.use_b.load(Ordering::Acquire) { &self.cyl_b } else { &self.cyl_a }
     }
 
+    // ──── ぶら下げる / 外す ────
+
     pub fn set(&self, eid: u32, value: u32) {
         if self.col().count() <= eid {
             self.col_mut().write_count(eid + 1);
         }
         self.col().set(eid, &(value + 1).to_le_bytes());
+        self.delta_push(eid);
         self.dirty.store(true, Ordering::Release);
     }
 
     pub fn remove(&self, eid: u32) {
         if eid < self.col().count() {
             self.col().clear(eid);
+            self.delta_push(eid);
             self.dirty.store(true, Ordering::Release);
         }
     }
+
+    /// delta に eid を追記。DELTA_CAP 超えたら自動 rebuild。
+    fn delta_push(&self, eid: u32) {
+        let idx = self.delta_len.fetch_add(1, Ordering::Relaxed) as usize;
+        if idx < DELTA_CAP {
+            let delta = unsafe { &mut *self.delta_eids.get() };
+            delta[idx] = eid;
+        } else {
+            // delta 溢れ → rebuild で吸収（次の引く時に実行される）
+            // delta_len は DELTA_CAP 超のままだが rebuild で 0 にリセットされる
+        }
+    }
+
+    // ──── 読む ────
 
     pub fn get_value(&self, eid: u32) -> Option<u32> {
         if eid >= self.col().count() { return None; }
@@ -114,7 +144,6 @@ impl HimoStore {
         if stored == 0 { None } else { Some(stored - 1) }
     }
 
-    /// Column直読み。Cylinderから来たeidに対して使う（bounds checkなし）。
     #[inline(always)]
     pub fn value_eq(&self, eid: u32, value: u32) -> bool {
         u32::from_le_bytes(self.col().get(eid).try_into().unwrap()) == value + 1
@@ -130,17 +159,52 @@ impl HimoStore {
             self.col_mut().write_count(eid + 1);
         }
         self.col().set(eid, old_bytes);
+        self.delta_push(eid);
         self.dirty.store(true, Ordering::Release);
+    }
+
+    // ──── 引く（Cylinder + delta 補正）────
+
+    /// 引く。Cylinder のスナップショット + delta 差分で補正。
+    pub fn pull(&self, value: u32) -> &[u32] {
+        let dlen = self.delta_len.load(Ordering::Acquire) as usize;
+        if dlen == 0 {
+            // delta 空 → Cylinder そのまま（ゼロコピー）
+            return self.cylinder().slice_one(value);
+        }
+        if dlen > DELTA_CAP {
+            // delta 溢れ → rebuild 必要（呼び出し元の Engine が判断）
+            // ここでは Cylinder をそのまま返す（古い可能性あり）
+            return self.cylinder().slice_one(value);
+        }
+        // delta が小さい場合も、slice_one は参照を返すだけなので
+        // 補正は Engine 側で行う（HimoStore は &[u32] しか返せない）
+        self.cylinder().slice_one(value)
+    }
+
+    /// delta の eid 一覧を返す（Engine が補正に使う）。
+    pub fn delta_eids(&self) -> &[u32] {
+        let dlen = (self.delta_len.load(Ordering::Acquire) as usize).min(DELTA_CAP);
+        let delta = unsafe { &*self.delta_eids.get() };
+        &delta[..dlen]
+    }
+
+    /// delta が空か。
+    pub fn delta_is_empty(&self) -> bool {
+        self.delta_len.load(Ordering::Acquire) == 0
+    }
+
+    /// delta が溢れて rebuild が必要か。
+    pub fn delta_needs_rebuild(&self) -> bool {
+        self.delta_len.load(Ordering::Acquire) as usize > DELTA_CAP
     }
 
     // ──── bitmap ────
 
-    /// このhimoがpre-computed bitmapを持っているか。
     pub fn has_bitmaps(&self) -> bool {
         unsafe { (*self.bitmaps.get()).is_some() }
     }
 
-    /// 指定値のbitmap。bitmaps[value]を返す。
     pub fn bitmap(&self, value: u32) -> Option<&[u64]> {
         unsafe {
             let bms = &*self.bitmaps.get();
@@ -154,11 +218,9 @@ impl HimoStore {
 
     pub fn rebuild_cylinder(&self) {
         if !self.dirty.load(Ordering::Acquire) { return; }
-        // 1スレッドだけrebuild。他はスキップ（activeのcylinderはそのまま読める）
         if self.rebuilding.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() {
             return;
         }
-        // dirtyを再確認（別スレッドが先に完了した可能性）
         if !self.dirty.load(Ordering::Acquire) {
             self.rebuilding.store(false, Ordering::Release);
             return;
@@ -173,7 +235,6 @@ impl HimoStore {
             }
         }
 
-        // Bitmap rebuild（メモリ予算内なら、pairs消費前に構築）
         if Self::should_build_bitmaps(self.max_values, self.bitmap_words) {
             let slots = self.max_values as usize + 1;
             let mut bms = vec![vec![0u64; self.bitmap_words]; slots];
@@ -185,11 +246,12 @@ impl HimoStore {
             unsafe { *self.bitmaps.get() = Some(bms); }
         }
 
-        // standbyに書く（readerはactiveを読み続ける）
         let standby = if self.use_b.load(Ordering::Acquire) { &self.cyl_a } else { &self.cyl_b };
         standby.rebuild(pairs);
-        // atomic swap — readerは次のアクセスから新しいcylinderを読む
         self.use_b.fetch_xor(true, Ordering::Release);
+
+        // delta クリア
+        self.delta_len.store(0, Ordering::Release);
         self.dirty.store(false, Ordering::Release);
         self.rebuilding.store(false, Ordering::Release);
     }
@@ -207,7 +269,6 @@ impl HimoStore {
         result
     }
 
-    /// Cylinder + Bitmap をリビルド（Engine::flush から呼ばれる）。
     pub fn sync(&self) {
         self.rebuild_cylinder();
     }

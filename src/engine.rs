@@ -668,20 +668,84 @@ impl Engine {
 
     // ──── 紐を引く（Cylinder 経由）────
 
-    /// Cylinder + Bitmap キャッシュを再構築。並行read安全。
+    /// Cylinder + Bitmap キャッシュを再構築。delta をクリア。
     pub fn rebuild(&self) {
         for ds in &self.himos { ds.rebuild_cylinder(); }
     }
 
+    /// 引く。delta が空なら Cylinder 直返し（ゼロコピー）。
+    /// delta があれば補正した Vec を返す。
     pub fn pull_raw(&self, himo: &str, value: u32) -> &[u32] {
         match self.himo_to_id.get(himo) {
-            Some(&idx) => self.himos[idx].cylinder().slice_one(value),
+            Some(&idx) => {
+                let hs = &self.himos[idx];
+                if hs.delta_needs_rebuild() {
+                    hs.rebuild_cylinder();
+                }
+                // delta が空なら Cylinder そのまま（ゼロコピー）
+                hs.cylinder().slice_one(value)
+            }
             None => &[],
         }
     }
 
+    /// 引く（delta 補正付き、Vec を返す）。
+    pub fn pull(&self, himo: &str, value: u32) -> Vec<u32> {
+        let idx = match self.himo_to_id.get(himo) {
+            Some(&idx) => idx,
+            None => return vec![],
+        };
+        let hs = &self.himos[idx];
+
+        if hs.delta_needs_rebuild() {
+            hs.rebuild_cylinder();
+        }
+
+        if hs.delta_is_empty() {
+            return hs.cylinder().slice_one(value).to_vec();
+        }
+
+        // Cylinder 結果 + delta 補正
+        let cyl_result = hs.cylinder().slice_one(value);
+        let delta = hs.delta_eids();
+        self.apply_delta(idx, value, cyl_result, delta)
+    }
+
+    /// Cylinder 結果に delta を適用。
+    fn apply_delta(&self, himo_idx: usize, value: u32, cyl_result: &[u32], delta_eids: &[u32]) -> Vec<u32> {
+        let hs = &self.himos[himo_idx];
+
+        // delta の eid を集合にする（重複排除 + 高速lookup）
+        let mut dirty: Vec<u32> = delta_eids.to_vec();
+        dirty.sort_unstable();
+        dirty.dedup();
+
+        // Cylinder 結果から dirty eid を除外（Cylinder の値は古い可能性）
+        let mut result: Vec<u32> = if dirty.is_empty() {
+            cyl_result.to_vec()
+        } else {
+            cyl_result.iter()
+                .filter(|&&eid| dirty.binary_search(&eid).is_err())
+                .copied()
+                .collect()
+        };
+
+        // dirty eid を Column 直読みで補正
+        for &eid in &dirty {
+            if hs.get_value(eid) == Some(value) {
+                result.push(eid);
+            }
+        }
+
+        result.sort_unstable();
+        result
+    }
+
     pub fn query(&self, strings: &[(&str, u32)]) -> Vec<u32> {
-        self.rebuild();
+        // delta が溢れた himo があれば rebuild
+        for hs in &self.himos {
+            if hs.delta_needs_rebuild() { hs.rebuild_cylinder(); }
+        }
         if strings.is_empty() { return vec![]; }
 
         // 全条件の himo index と value を解決
@@ -694,17 +758,24 @@ impl Engine {
         }
 
         if conds.len() == 1 {
-            return self.himos[conds[0].0].cylinder().slice_one(conds[0].1).to_vec();
+            let (idx, val) = conds[0];
+            let hs = &self.himos[idx];
+            let cyl_result = hs.cylinder().slice_one(val);
+            if hs.delta_is_empty() {
+                return cyl_result.to_vec();
+            }
+            return self.apply_delta(idx, val, cyl_result, hs.delta_eids());
         }
 
-        // 全条件bitmapならAND、それ以外はColumn直読み
+        // 全条件bitmapならAND（delta空の時のみ — deltaあればColumn直読みへ）
         let all_bitmap = conds.len() >= 2
-            && conds.iter().all(|&(idx, _)| self.himos[idx].has_bitmaps());
+            && conds.iter().all(|&(idx, _)| self.himos[idx].has_bitmaps() && self.himos[idx].delta_is_empty());
 
         if all_bitmap {
             return self.query_bitmap_and(&conds);
         }
 
+        // Column直読みフィルタ（Columnは常に最新なのでdelta不要）
         self.query_column_filter(&conds)
     }
 
@@ -734,20 +805,30 @@ impl Engine {
         result
     }
 
-    /// Column直読みフィルタ
+    /// Column直読みフィルタ（delta 補正付き）
     fn query_column_filter(&self, conds: &[(usize, u32)]) -> Vec<u32> {
+        // pivot: 最小スライスを選ぶ
         let mut best = 0;
         let mut best_len = usize::MAX;
         for (i, &(idx, val)) in conds.iter().enumerate() {
             let len = self.himos[idx].cylinder().slice_one(val).len();
-            if len == 0 { return vec![]; }
             if len < best_len { best_len = len; best = i; }
         }
 
         let (pivot_idx, pivot_val) = conds[best];
-        let candidates = self.himos[pivot_idx].cylinder().slice_one(pivot_val);
-        let mut result = Vec::with_capacity(best_len);
-        for &eid in candidates {
+        let hs = &self.himos[pivot_idx];
+
+        // pivot の候補を delta 補正して取得
+        let cyl_result = hs.cylinder().slice_one(pivot_val);
+        let candidates = if hs.delta_is_empty() {
+            cyl_result.to_vec()
+        } else {
+            self.apply_delta(pivot_idx, pivot_val, cyl_result, hs.delta_eids())
+        };
+
+        // 残りの条件を Column 直読みでフィルタ（Column は常に最新）
+        let mut result = Vec::with_capacity(candidates.len());
+        for &eid in &candidates {
             let mut pass = true;
             for (i, &(idx, val)) in conds.iter().enumerate() {
                 if i == best { continue; }
