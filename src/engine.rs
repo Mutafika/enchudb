@@ -536,6 +536,36 @@ impl Engine {
         self.himos[hid].set(eid, target_eid);
     }
 
+    // ──── tie（定義済み紐、&self で並行書き込み可）────
+
+    /// 定義済みの紐に文字列を張る。&selfで呼べる（Arc共有のまま書き込み可）。
+    /// 紐が未定義ならpanic。define_himo を先に呼ぶこと。
+    pub fn tie_text_to(&self, eid: u32, himo: &str, value: &str) {
+        let vid = self.vocab.get_or_insert(value.as_bytes());
+        let hid = *self.himo_to_id.get(himo)
+            .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
+        self.record_undo(eid, hid);
+        self.himos[hid].set(eid, vid);
+    }
+
+    /// 定義済みの紐にu32値を張る。&selfで呼べる。
+    pub fn tie_to(&self, eid: u32, himo: &str, value: u32) {
+        assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
+        let hid = *self.himo_to_id.get(himo)
+            .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
+        self.record_undo(eid, hid);
+        self.himos[hid].set(eid, value);
+    }
+
+    /// 定義済みの紐にentity参照を張る。&selfで呼べる。
+    pub fn tie_ref_to(&self, eid: u32, himo: &str, target_eid: u32) {
+        assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
+        let hid = *self.himo_to_id.get(himo)
+            .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
+        self.record_undo(eid, hid);
+        self.himos[hid].set(eid, target_eid);
+    }
+
     // ──── untie ────
 
     pub fn untie(&self, eid: u32, himo: &str) {
