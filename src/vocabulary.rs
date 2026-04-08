@@ -91,7 +91,12 @@ impl Vocabulary {
 
     pub fn get_or_insert(&self, value: &[u8]) -> u32 {
         if let Some(id) = self.lookup(value) { return id; }
-        self.insert(value)
+        let id = self.insert(value);
+        // 並列挿入の競合チェック: 別スレッドが先に同じ値を挿入した場合、先着のidを使う
+        if let Some(winner) = self.lookup(value) {
+            if winner != id { return winner; }
+        }
+        id
     }
 
     #[inline]
