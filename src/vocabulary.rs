@@ -135,6 +135,11 @@ impl Vocabulary {
         let offset = self.data_end.fetch_add(len, Ordering::Relaxed);
         let dm = self.data.slice_mut();
         dm[offset as usize..offset as usize + len as usize].copy_from_slice(value);
+        // count/data_end を mmap header に即書き戻し（flush なしで drop されても復元可能に）
+        let new_count = id + 1;
+        let new_end = offset + len;
+        dm[4..8].copy_from_slice(&new_count.to_le_bytes());
+        dm[8..12].copy_from_slice(&new_end.to_le_bytes());
         let om = self.offsets.slice_mut();
         let off_pos = (id as usize) * 8;
         om[off_pos..off_pos + 4].copy_from_slice(&offset.to_le_bytes());
