@@ -201,9 +201,9 @@ impl HimoStore {
         self.delta_len.load(Ordering::Acquire) == 0
     }
 
-    /// delta が溢れて rebuild が必要か。
+    /// delta が満杯で rebuild が必要か。
     pub fn delta_needs_rebuild(&self) -> bool {
-        self.delta_len.load(Ordering::Acquire) as usize > DELTA_CAP
+        self.delta_len.load(Ordering::Acquire) as usize >= DELTA_CAP
     }
 
     // ──── bitmap ────
