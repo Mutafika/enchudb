@@ -121,15 +121,26 @@ impl HimoStore {
         }
     }
 
-    /// delta に eid を追記。DELTA_CAP 超えたら自動 rebuild。
+    /// delta に eid を追記。CASでスロット確保→データ書き込み。
     fn delta_push(&self, eid: u32) {
-        let idx = self.delta_len.fetch_add(1, Ordering::Relaxed) as usize;
-        if idx < DELTA_CAP {
-            let delta = unsafe { &mut *self.delta_eids.get() };
-            delta[idx] = eid;
-        } else {
-            // delta 溢れ → rebuild で吸収（次の引く時に実行される）
-            // delta_len は DELTA_CAP 超のままだが rebuild で 0 にリセットされる
+        let delta = unsafe { &mut *self.delta_eids.get() };
+        loop {
+            let idx = self.delta_len.load(Ordering::Relaxed) as usize;
+            if idx >= DELTA_CAP {
+                // delta 溢れ → rebuild で吸収（次の引く時に実行される）
+                return;
+            }
+            // CASでスロット確保
+            if self.delta_len.compare_exchange(
+                idx as u32, (idx + 1) as u32,
+                Ordering::AcqRel, Ordering::Relaxed
+            ).is_ok() {
+                // 確保成功 → データ書き込み
+                delta[idx] = eid;
+                std::sync::atomic::fence(Ordering::Release);
+                return;
+            }
+            // 失敗 → 別スレッドが先にスロット取った → リトライ
         }
     }
 
@@ -180,6 +191,7 @@ impl HimoStore {
     /// delta の eid 一覧を返す（Engine が補正に使う）。
     pub fn delta_eids(&self) -> &[u32] {
         let dlen = (self.delta_len.load(Ordering::Acquire) as usize).min(DELTA_CAP);
+        std::sync::atomic::fence(Ordering::Acquire); // delta_push の Release と対
         let delta = unsafe { &*self.delta_eids.get() };
         &delta[..dlen]
     }

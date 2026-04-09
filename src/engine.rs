@@ -738,6 +738,7 @@ impl Engine {
         }
 
         result.sort_unstable();
+        result.dedup();
         result
     }
 
