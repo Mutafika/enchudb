@@ -26,6 +26,7 @@ use crate::region::Region;
 pub enum EntityValue<'a> {
     Num(u32),
     Text(&'a [u8]),
+    Content(&'a [u8]),
 }
 
 // ════════════════ バッキングストア ════════════════
@@ -182,14 +183,14 @@ struct Layout {
 }
 
 impl Layout {
-    fn compute(max_entities: u32, max_himos: u32, vocab_data_size: usize, content_data_size: Option<usize>) -> Self {
+    fn compute(max_entities: u32, max_himos: u32, vocab_data_size: usize, content_data_size: Option<usize>, cyl_max_values: Option<u32>) -> Self {
         let vocab_max_entries = max_entities.saturating_mul(16).min(256_000_000);
         let vocab_index_cap = vocab_max_entries.next_power_of_two();
         let himoreg_max_entries = max_himos.max(256);
         let himoreg_index_cap = (himoreg_max_entries * 2).next_power_of_two();
         let himoreg_data_size = 64 * 1024;
         let content_data_size = content_data_size.unwrap_or_else(ContentStore::data_region_size);
-        let cyl_max_values = DEFAULT_CYL_MAX_VALUES;
+        let cyl_max_values = cyl_max_values.unwrap_or(DEFAULT_CYL_MAX_VALUES);
 
         Self::from_params(
             max_entities, max_himos,
@@ -311,6 +312,19 @@ impl Engine {
         Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)
     }
 
+    /// CLI/小規模用途向け。ファイルサイズ数MB。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn create_compact(path: &str) -> io::Result<Self> {
+        Self::create_full_with_cyl(
+            path,
+            65_536,                    // max_entities: 64K
+            Some(16 * 1024 * 1024),    // vocab_data: 16MB
+            Some(64),                  // max_himos: 64
+            Some(16 * 1024 * 1024),    // content_data: 16MB
+            Some(256),                 // cyl_max_values: 256
+        )
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create_with_capacity(path: &str, max_entities: u32) -> io::Result<Self> {
         Self::create_with_options(path, max_entities, None)
@@ -323,9 +337,14 @@ impl Engine {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create_full(path: &str, max_entities: u32, vocab_data_size: Option<usize>, max_himos: Option<u32>, content_data_size: Option<usize>) -> io::Result<Self> {
+        Self::create_full_with_cyl(path, max_entities, vocab_data_size, max_himos, content_data_size, None)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn create_full_with_cyl(path: &str, max_entities: u32, vocab_data_size: Option<usize>, max_himos: Option<u32>, content_data_size: Option<usize>, cyl_max_values: Option<u32>) -> io::Result<Self> {
         let vds = vocab_data_size.unwrap_or(DEFAULT_VOCAB_DATA_SIZE);
         let max_himos = max_himos.unwrap_or(DEFAULT_MAX_HIMOS);
-        let layout = Layout::compute(max_entities, max_himos, vds, content_data_size);
+        let layout = Layout::compute(max_entities, max_himos, vds, content_data_size, cyl_max_values);
 
         if let Some(parent) = std::path::Path::new(path).parent() {
             if !parent.as_os_str().is_empty() {
