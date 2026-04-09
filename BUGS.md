@@ -146,3 +146,25 @@ Column.countが非atomicなu32で、複数スレッドが同時にset()すると
 **箇所**: `engine.rs`
 
 define_himo 済みの紐に対して &self で書き込み可能なメソッド追加。Arc<Engine> 共有のまま Mutex 不要で並行書き込み。紐が未定義なら panic。
+
+## [修正済み] delta buffer — 重複・欠損・溢れ検知の3件
+**日付**: 2026-04-09
+**箇所**: `engine.rs` — `apply_delta()`, `himo_store.rs` — `delta_push()`, `delta_needs_rebuild()`
+
+### 重複
+apply_delta の結果に dedup が無く、同一 eid が複数回返る場合があった。
+- **症状**: sinfo で同じモジュールが複数回表示
+- **修正**: `result.sort_unstable(); result.dedup();`
+
+### delta_push 競合
+fetch_add 方式ではスロット確保と書き込みが非原子的で、並列 push で stale データを読む可能性があった。
+- **修正**: CAS方式（compare_exchange でスロット確保→書き込み→Release fence）
+
+### 溢れ検知
+delta_push が CAS 方式で DELTA_CAP ちょうどで停止するが、delta_needs_rebuild が `> DELTA_CAP` でチェックしていたため、delta_len == DELTA_CAP の時に溢れが検知されなかった。新しい eid が delta にも Cylinder にも無い状態になり query 結果が欠損。
+- **症状**: 4096件以上のぶら下げ後にquery結果が正解より少ない（property-based testで460/500エラー検出）
+- **修正**: `> DELTA_CAP` → `>= DELTA_CAP`
+
+### vocab 並列競合
+並列 tie_text_to で同一文字列に異なる vocab_id が振られる TOCTOU。
+- **修正**: get_or_insert で insert 後に lookup で先着確認。負けたスレッドは勝者の id を使う
