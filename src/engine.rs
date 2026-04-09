@@ -21,6 +21,13 @@ use memmap2::MmapMut;
 
 use crate::region::Region;
 
+/// get_entity の戻り値。
+#[derive(Debug, PartialEq)]
+pub enum EntityValue<'a> {
+    Num(u32),
+    Text(&'a [u8]),
+}
+
 // ════════════════ バッキングストア ════════════════
 
 /// mmap (native) または Vec<u8> (wasm/テスト) のどちらかを保持。
@@ -659,6 +666,21 @@ impl Engine {
             .map(|(i, _)| self.himo_names[i].as_str())
             .collect()
     }
+    /// 1 entity の全フィールドを一括取得。HashMap ルックアップ 0 回。
+    pub fn get_entity(&self, eid: u32) -> Vec<(&str, EntityValue)> {
+        let mut fields = Vec::with_capacity(self.himos.len());
+        for (i, hs) in self.himos.iter().enumerate() {
+            if let Some(raw) = hs.get_value(eid) {
+                let val = match self.himo_types[i] {
+                    HimoType::Symbol => EntityValue::Text(self.vocab.get(raw)),
+                    _ => EntityValue::Num(raw),
+                };
+                fields.push((self.himo_names[i].as_str(), val));
+            }
+        }
+        fields
+    }
+
     pub(crate) fn vocab(&self) -> &Vocabulary { &self.vocab }
     pub fn himo_names(&self) -> &[String] { &self.himo_names }
 

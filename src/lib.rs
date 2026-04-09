@@ -21,5 +21,5 @@ pub mod undo;
 pub mod engine;
 pub mod query_lang;
 
-pub use engine::Engine;
+pub use engine::{Engine, EntityValue};
 pub use himo_store::HimoType;
