@@ -168,3 +168,13 @@ delta_push が CAS 方式で DELTA_CAP ちょうどで停止するが、delta_ne
 ### vocab 並列競合
 並列 tie_text_to で同一文字列に異なる vocab_id が振られる TOCTOU。
 - **修正**: get_or_insert で insert 後に lookup で先着確認。負けたスレッドは勝者の id を使う
+
+## [修正済み] open 後に vocab_id が引けず query が空になる
+**日付**: 2026-04-09
+**箇所**: `vocabulary.rs` — `insert()`
+
+Vocabulary の count/data_end は AtomicU32 フィールドに持つが、mmap header への書き戻しは `sync()` (flush経由) でしか行われなかった。flush なしで drop すると header が古いまま残り、reopen 時の `load()` が `count=0` を読んで `rebuild_index` が何も復元しない。
+
+- **症状**: flush なしの drop → reopen で vocab_id() が None
+- **原因**: insert 時に mmap header の count/data_end を更新していなかった
+- **修正**: `insert()` のたびに count/data_end を mmap header に即書き戻し。flush 不要で reopen 可能に
