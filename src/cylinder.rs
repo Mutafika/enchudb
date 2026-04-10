@@ -151,6 +151,25 @@ impl Cylinder {
         self.entities_sub(start, end)
     }
 
+    pub fn total(&self) -> usize {
+        self.total.load(Ordering::Acquire) as usize
+    }
+
+    /// ソート済みvalues配列からユニーク値を返す。
+    pub fn unique_values(&self, n: usize) -> Vec<u32> {
+        if n == 0 { return vec![]; }
+        let vals = self.values_slice(n);
+        let mut result = Vec::new();
+        let mut prev = u32::MAX;
+        for &v in vals {
+            if v != prev {
+                result.push(v);
+                prev = v;
+            }
+        }
+        result
+    }
+
     #[inline(always)]
     fn values_slice(&self, n: usize) -> &[u32] {
         let mm = self.region.slice();

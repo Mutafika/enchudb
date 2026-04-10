@@ -679,6 +679,43 @@ impl Engine {
 
     pub fn vocab_id(&self, text: &str) -> Option<u32> { self.vocab.lookup(text.as_bytes()) }
 
+    /// 紐の文脈で文字列のvocab IDを探す。その紐にぶら下がってる値だけ調べる。
+    pub fn find_value(&self, himo: &str, text: &str) -> Option<u32> {
+        let hid = *self.himo_to_id.get(himo)?;
+        let cyl = self.himos[hid].cylinder();
+        let text_bytes = text.as_bytes();
+        // Cylinderのvalues（ソート済み）からユニーク値を取り出す
+        let n = cyl.total();
+        if n == 0 {
+            // Cylinder空 → delta内をColumn走査で探す
+            let delta = self.himos[hid].delta_eids();
+            for &eid in delta {
+                if let Some(vid) = self.himos[hid].get_value(eid) {
+                    if self.vocab.get(vid) == text_bytes {
+                        return Some(vid);
+                    }
+                }
+            }
+            return None;
+        }
+        let vals = cyl.unique_values(n);
+        for vid in vals {
+            if self.vocab.get(vid) == text_bytes {
+                return Some(vid);
+            }
+        }
+        // Cylinder にない場合 delta を確認
+        let delta = self.himos[hid].delta_eids();
+        for &eid in delta {
+            if let Some(vid) = self.himos[hid].get_value(eid) {
+                if self.vocab.get(vid) == text_bytes {
+                    return Some(vid);
+                }
+            }
+        }
+        None
+    }
+
     pub fn himos_of(&self, eid: u32) -> Vec<&str> {
         self.himos.iter().enumerate()
             .filter(|(_, ds)| ds.get_value(eid).is_some())
