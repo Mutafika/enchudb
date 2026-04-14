@@ -20,6 +20,8 @@ pub mod content_store;
 pub mod undo;
 pub mod engine;
 pub mod query_lang;
+pub mod cas;
 
 pub use engine::{Engine, EntityValue};
 pub use himo_store::HimoType;
+pub use cas::{CASStore, BlockHash};
