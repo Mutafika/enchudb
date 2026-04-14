@@ -10,7 +10,6 @@
 //!   commit/rollback → トランザクション（undo ログ）
 //!   open/flush → 永続化（mmap なので open は即利用可）
 
-use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs::OpenOptions;
 #[cfg(not(target_arch = "wasm32"))]
@@ -287,6 +286,60 @@ impl Layout {
 
 // ════════════════ Engine ════════════════
 
+/// v26 ペアテーブル: 全紐ペアの二次元テーブルを事前構築。
+/// 任意の2条件が O(1)、3条件以上は最小ペアから Column 直読み。
+#[cfg(feature = "v26")]
+struct PairEntry {
+    himo_a: usize,
+    himo_b: usize,
+    card_b: u32,
+    table: Vec<Vec<u32>>,
+}
+
+#[cfg(feature = "v26")]
+struct PairTable {
+    pairs: Vec<PairEntry>,
+}
+
+#[cfg(feature = "v26")]
+impl PairTable {
+    fn new() -> Self {
+        Self { pairs: vec![] }
+    }
+
+    /// 条件リストから最小候補のペアを引く。
+    /// 返り値: (候補 entity リスト, 残り条件)
+    fn best_lookup<'a>(&'a self, conds: &[(usize, u32)]) -> Option<(&'a [u32], Vec<(usize, u32)>)> {
+        if conds.len() < 2 { return None; }
+        let mut best: Option<(&[u32], Vec<(usize, u32)>)> = None;
+        let mut best_len = usize::MAX;
+
+        for pair in &self.pairs {
+            let mut va = None;
+            let mut vb = None;
+            for &(idx, val) in conds {
+                if idx == pair.himo_a { va = Some(val); }
+                if idx == pair.himo_b { vb = Some(val); }
+            }
+            if let (Some(a), Some(b)) = (va, vb) {
+                let cell_id = a as usize * pair.card_b as usize + b as usize;
+                if cell_id < pair.table.len() {
+                    let candidates = &pair.table[cell_id];
+                    if candidates.len() < best_len {
+                        best_len = candidates.len();
+                        let remaining: Vec<(usize, u32)> = conds.iter()
+                            .filter(|&&(idx, _)| idx != pair.himo_a && idx != pair.himo_b)
+                            .copied()
+                            .collect();
+                        best = Some((candidates, remaining));
+                    }
+                }
+            }
+        }
+        best
+    }
+}
+
 pub struct Engine {
     #[allow(dead_code)]
     path: String,
@@ -295,7 +348,6 @@ pub struct Engine {
     max_himos: u32,
     vocab: Vocabulary,
     himo_reg: Vocabulary,
-    himo_to_id: HashMap<String, usize>,
     himo_names: Vec<String>,
     himo_types: Vec<HimoType>,
     himo_max_values: Vec<u32>,
@@ -303,6 +355,8 @@ pub struct Engine {
     entities: EntitySet,
     contents: ContentStore,
     undo: UndoLog,
+    #[cfg(feature = "v26")]
+    pairs: PairTable,
     backing: Backing, // 最後に drop されるよう最終フィールド
 }
 
@@ -401,9 +455,11 @@ impl Engine {
         Ok(Self {
             path: path.to_string(), layout, max_entities, max_himos,
             vocab, himo_reg,
-            himo_to_id: HashMap::new(), himo_names: Vec::new(),
+            himo_names: Vec::new(),
             himo_types: Vec::new(), himo_max_values: Vec::new(),
             himos: Vec::new(), entities, contents, undo,
+            #[cfg(feature = "v26")]
+            pairs: PairTable::new(),
             backing: Backing::Mmap(mmap),
         })
     }
@@ -480,7 +536,6 @@ impl Engine {
             unsafe { Region::new(base.add(layout.content_data_off), layout.content_data_size) },
         );
 
-        let mut himo_to_id = HashMap::new();
         let mut himo_names = Vec::new();
         let mut himo_types = Vec::new();
         let mut himo_max_values = Vec::new();
@@ -500,7 +555,6 @@ impl Engine {
                 ht, effective_mv,
             );
 
-            himo_to_id.insert(name.clone(), hid);
             himo_names.push(name);
             himo_types.push(ht);
             himo_max_values.push(mv);
@@ -510,8 +564,10 @@ impl Engine {
         let mut eng = Self {
             path: String::new(), layout, max_entities, max_himos,
             vocab, himo_reg,
-            himo_to_id, himo_names, himo_types, himo_max_values,
+            himo_names, himo_types, himo_max_values,
             himos, entities, contents, undo,
+            #[cfg(feature = "v26")]
+            pairs: PairTable::new(),
             backing,
         };
 
@@ -568,7 +624,7 @@ impl Engine {
     /// 紐が未定義ならpanic。define_himo を先に呼ぶこと。
     pub fn tie_text_to(&self, eid: u32, himo: &str, value: &str) {
         let vid = self.vocab.get_or_insert(value.as_bytes());
-        let hid = *self.himo_to_id.get(himo)
+        let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
         self.record_undo(eid, hid);
         self.himos[hid].set(eid, vid);
@@ -577,7 +633,7 @@ impl Engine {
     /// 定義済みの紐にu32値を張る。&selfで呼べる。
     pub fn tie_to(&self, eid: u32, himo: &str, value: u32) {
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
-        let hid = *self.himo_to_id.get(himo)
+        let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
         self.record_undo(eid, hid);
         self.himos[hid].set(eid, value);
@@ -586,7 +642,7 @@ impl Engine {
     /// 定義済みの紐にentity参照を張る。&selfで呼べる。
     pub fn tie_ref_to(&self, eid: u32, himo: &str, target_eid: u32) {
         assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
-        let hid = *self.himo_to_id.get(himo)
+        let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
         self.record_undo(eid, hid);
         self.himos[hid].set(eid, target_eid);
@@ -595,7 +651,7 @@ impl Engine {
     // ──── untie ────
 
     pub fn untie(&self, eid: u32, himo: &str) {
-        if let Some(&hid) = self.himo_to_id.get(himo) {
+        if let Some(hid) = self.himo_id(himo) {
             self.record_undo(eid, hid);
             self.himos[hid].remove(eid);
         }
@@ -666,14 +722,14 @@ impl Engine {
     // ──── get ────
 
     pub fn get_text(&self, eid: u32, himo: &str) -> Option<&[u8]> {
-        let hid = *self.himo_to_id.get(himo)?;
+        let hid = self.himo_id(himo)?;
         if self.himo_types[hid] != HimoType::Symbol { return None; }
         let vid = self.himos[hid].get_value(eid)?;
         Some(self.vocab.get(vid))
     }
 
     pub fn get(&self, eid: u32, himo: &str) -> Option<u32> {
-        let hid = *self.himo_to_id.get(himo)?;
+        let hid = self.himo_id(himo)?;
         self.himos[hid].get_value(eid)
     }
 
@@ -681,7 +737,7 @@ impl Engine {
 
     /// 紐の文脈で文字列のvocab IDを探す。その紐にぶら下がってる値だけ調べる。
     pub fn find_value(&self, himo: &str, text: &str) -> Option<u32> {
-        let hid = *self.himo_to_id.get(himo)?;
+        let hid = self.himo_id(himo)?;
         let cyl = self.himos[hid].cylinder();
         let text_bytes = text.as_bytes();
         // Cylinderのvalues（ソート済み）からユニーク値を取り出す
@@ -741,7 +797,7 @@ impl Engine {
     pub fn himo_names(&self) -> &[String] { &self.himo_names }
 
     pub fn himo_type(&self, himo: &str) -> Option<HimoType> {
-        self.himo_to_id.get(himo).map(|&idx| self.himo_types[idx])
+        self.himo_id(himo).map(|idx| self.himo_types[idx])
     }
 
     // ──── 紐を引く（Cylinder 経由）────
@@ -751,11 +807,59 @@ impl Engine {
         for ds in &self.himos { ds.rebuild_cylinder(); }
     }
 
+    /// v26: ペアテーブルを構築。全紐ペアの二次元テーブルを事前計算。
+    /// rebuild() の後に呼ぶ。
+    #[cfg(feature = "v26")]
+    pub fn rebuild_pairs(&mut self) {
+        let n_himos = self.himos.len();
+        let next_eid = self.entities.next_eid();
+        let mut pairs = Vec::new();
+
+        for a in 0..n_himos {
+            let card_a = if self.himo_max_values[a] > 0 {
+                self.himo_max_values[a] + 1
+            } else {
+                continue;
+            };
+            for b in (a + 1)..n_himos {
+                let card_b = if self.himo_max_values[b] > 0 {
+                    self.himo_max_values[b] + 1
+                } else {
+                    continue;
+                };
+
+                // セル数が多すぎるペアはスキップ
+                let cells = card_a as u64 * card_b as u64;
+                if cells > 1_000_000 { continue; }
+
+                let table_size = cells as usize;
+                let mut table: Vec<Vec<u32>> = vec![vec![]; table_size];
+
+                for eid in 0..next_eid {
+                    if !self.entities.is_live(eid) { continue; }
+                    let va = match self.himos[a].get_value(eid) {
+                        Some(v) if v < card_a => v,
+                        _ => continue,
+                    };
+                    let vb = match self.himos[b].get_value(eid) {
+                        Some(v) if v < card_b => v,
+                        _ => continue,
+                    };
+                    table[va as usize * card_b as usize + vb as usize].push(eid);
+                }
+
+                pairs.push(PairEntry { himo_a: a, himo_b: b, card_b, table });
+            }
+        }
+
+        self.pairs = PairTable { pairs };
+    }
+
     /// 引く。delta が空なら Cylinder 直返し（ゼロコピー）。
     /// delta があれば補正した Vec を返す。
     pub fn pull_raw(&self, himo: &str, value: u32) -> &[u32] {
-        match self.himo_to_id.get(himo) {
-            Some(&idx) => {
+        match self.himo_id(himo) {
+            Some(idx) => {
                 let hs = &self.himos[idx];
                 if hs.delta_needs_rebuild() {
                     hs.rebuild_cylinder();
@@ -769,8 +873,8 @@ impl Engine {
 
     /// 引く（delta 補正付き、Vec を返す）。
     pub fn pull(&self, himo: &str, value: u32) -> Vec<u32> {
-        let idx = match self.himo_to_id.get(himo) {
-            Some(&idx) => idx,
+        let idx = match self.himo_id(himo) {
+            Some(idx) => idx,
             None => return vec![],
         };
         let hs = &self.himos[idx];
@@ -830,8 +934,8 @@ impl Engine {
         // 全条件の himo index と value を解決
         let mut conds: Vec<(usize, u32)> = Vec::with_capacity(strings.len());
         for &(himo, val) in strings {
-            match self.himo_to_id.get(himo) {
-                Some(&idx) => conds.push((idx, val)),
+            match self.himo_id(himo) {
+                Some(idx) => conds.push((idx, val)),
                 None => return vec![],
             }
         }
@@ -844,6 +948,39 @@ impl Engine {
                 return cyl_result.to_vec();
             }
             return self.apply_delta(idx, val, cyl_result, hs.delta_eids());
+        }
+
+        // 最小 Cylinder スライスのサイズを調べる
+        let mut min_slice_idx = 0;
+        let mut min_slice_len = usize::MAX;
+        for (i, &(idx, val)) in conds.iter().enumerate() {
+            let len = self.himos[idx].cylinder().slice_one(val).len();
+            if len < min_slice_len { min_slice_len = len; min_slice_idx = i; }
+        }
+
+        // v26: ペアテーブルで最小候補を O(1) ルックアップ
+        #[cfg(feature = "v26")]
+        {
+            if let Some((candidates, remaining)) = self.pairs.best_lookup(&conds) {
+                if candidates.len() <= min_slice_len {
+                    if remaining.is_empty() {
+                        return candidates.to_vec();
+                    }
+                    // 候補に対して残り条件を Column 直読みフィルタ
+                    let mut result = Vec::new();
+                    for &eid in candidates {
+                        let mut pass = true;
+                        for &(idx, val) in &remaining {
+                            if !self.himos[idx].value_eq(eid, val) {
+                                pass = false;
+                                break;
+                            }
+                        }
+                        if pass { result.push(eid); }
+                    }
+                    return result;
+                }
+            }
         }
 
         // 全条件bitmapならAND（delta空 + 値がbitmap範囲内の時のみ）
@@ -927,8 +1064,14 @@ impl Engine {
 
     // ──── himo 管理 ────
 
+    /// 紐名 → インデックス。線形探索（紐数は高々数百）。
+    #[inline]
+    fn himo_id(&self, himo: &str) -> Option<usize> {
+        self.himo_names.iter().position(|n| n == himo)
+    }
+
     fn ensure_himo(&mut self, himo: &str, ht: HimoType, max_values: u32) -> usize {
-        if let Some(&idx) = self.himo_to_id.get(himo) { return idx; }
+        if let Some(idx) = self.himo_id(himo) { return idx; }
         let hid = self.himos.len();
         assert!((hid as u32) < self.max_himos, "too many himos (max {})", self.max_himos);
 
@@ -948,7 +1091,6 @@ impl Engine {
         );
 
         self.himos.push(hs);
-        self.himo_to_id.insert(himo.to_string(), hid);
         self.himo_names.push(himo.to_string());
         self.himo_types.push(ht);
         self.himo_max_values.push(max_values);

@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 description = "EnchuDB — 紐ベース円柱エンジン。prefix sum O(1)。全mmap。"
 
+[features]
+v26 = []
+
 [dependencies]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 memmap2 = "0.9"
-
-
-

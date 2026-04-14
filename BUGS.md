@@ -178,3 +178,16 @@ Vocabulary の count/data_end は AtomicU32 フィールドに持つが、mmap h
 - **症状**: flush なしの drop → reopen で vocab_id() が None
 - **原因**: insert 時に mmap header の count/data_end を更新していなかった
 - **修正**: `insert()` のたびに count/data_end を mmap header に即書き戻し。flush 不要で reopen 可能に
+
+## v25: delete + insert 後の query で古いエンティティが残る
+**日付**: 2026-04-12
+**箇所**: `engine.rs` — delta buffer / query
+
+v25 で同一プロセス内で delete → insert → query すると、削除したはずのエンティティが query 結果に含まれる。旧バージョンでは正常。
+
+- **症状**: sinfo の module insert（同名モジュール上書き: delete → insert）後の list に古いモジュールと新しいモジュールの両方が返る
+- **再現**: sinfo-store-enchu の以下テストが FAILED:
+  - `integrity_duplicate_insert_overwrites` — delete 後に list で1件のはずが2件
+  - `boundary_empty_string_fields` — 同様
+  - `stress_delete_then_reinsert` — 同様
+  - 1000並行テスト 2件 — 同様
