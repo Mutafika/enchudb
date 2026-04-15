@@ -330,14 +330,12 @@ fn reader_sees_consistent_snapshot() {
     let arc = Engine::concurrentize(eng, 8192);
     let stop = Arc::new(AtomicBool::new(false));
     let oor = Arc::new(AtomicUsize::new(0));
-    let dup = Arc::new(AtomicUsize::new(0));
 
     let mut handles = Vec::new();
     for _ in 0..3 {
         let arc = arc.clone();
         let stop = stop.clone();
         let oor = oor.clone();
-        let dup = dup.clone();
         handles.push(thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 for v in 0..16u32 {
@@ -348,14 +346,15 @@ fn reader_sees_consistent_snapshot() {
                             oor.fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    // 重複は v27 で transient に発生し得る → 別カウント
+                    // 重複は発生してはならない(致命)
                     let mut sorted = pulled.clone();
                     sorted.sort_unstable();
                     let len_before = sorted.len();
                     sorted.dedup();
-                    if sorted.len() != len_before {
-                        dup.fetch_add(1, Ordering::Relaxed);
-                    }
+                    assert_eq!(
+                        sorted.len(), len_before,
+                        "pull_raw returned duplicate eids: {:?}", pulled
+                    );
                 }
             }
         }));
@@ -383,13 +382,6 @@ fn reader_sees_consistent_snapshot() {
 
     // out-of-range は決して起こってはならない
     assert_eq!(oor.load(Ordering::Relaxed), 0, "reader saw out-of-range eid");
-    let dups = dup.load(Ordering::Relaxed);
-    if dups > 0 {
-        eprintln!(
-            "[reader_sees_consistent_snapshot] observed {} transient duplicate-eid pull results (known v27 race)",
-            dups
-        );
-    }
 
     arc.flush_writes();
     drop(arc);
@@ -438,33 +430,28 @@ fn long_running_query_during_writes() {
     }
 
     // reader: query を 100 回回して、その都度結果が valid かチェック。
-    //
-    // 注: v27 の query は並行書き込み中に **一時的に重複 eid** を返すことが
-    // 観測されている(同じ entity が pivot pull の delta+cylinder の両方に
-    // 載るレース)。フレーキー化を避けるため、dup は WARN だけ蓄積し、
-    // out-of-range だけを致命的失敗とする。
+    // 重複 eid は発生してはならない(致命)。
     let max_eid = eids.iter().copied().max().unwrap();
-    let dup_count = Arc::new(AtomicUsize::new(0));
     {
         let arc = arc.clone();
-        let dup_count = dup_count.clone();
         handles.push(thread::spawn(move || {
             for _ in 0..100 {
                 for av in 0..5u32 {
                     for bv in 0..5u32 {
                         let r = arc.query(&[("a", av), ("b", bv)]);
-                        // 範囲内チェック(致命的)
+                        // 範囲内チェック
                         for &e in &r {
                             assert!(e <= max_eid, "out-of-range eid {}", e);
                         }
-                        // 重複チェック(警告)
+                        // 重複チェック(致命)
                         let mut s = r.clone();
                         s.sort_unstable();
                         let before = s.len();
                         s.dedup();
-                        if before != s.len() {
-                            dup_count.fetch_add(1, Ordering::Relaxed);
-                        }
+                        assert_eq!(
+                            s.len(), before,
+                            "query returned duplicate eids for a={}, b={}: {:?}", av, bv, r
+                        );
                     }
                 }
             }
@@ -481,13 +468,6 @@ fn long_running_query_during_writes() {
     }
 
     arc.flush_writes();
-    let dups = dup_count.load(Ordering::Relaxed);
-    if dups > 0 {
-        eprintln!(
-            "[long_running_query_during_writes] observed {} transient duplicate-eid query results (known v27 race)",
-            dups
-        );
-    }
     drop(arc);
     cleanup(&path);
 }

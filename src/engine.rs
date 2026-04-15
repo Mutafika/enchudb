@@ -492,11 +492,16 @@ impl NTupleTable {
     fn new() -> Self { Self { views: vec![] } }
 
     /// conds から該当する観測窓を選ぶ。
-    /// 戻り値: (セルの entity スライス, 残りの条件)
+    /// 戻り値: (セルの entity スライス参照, 残りの条件)
     /// 優先: 条件紐をすべて含む view のうち、紐数が最大(残り条件が少ない)のもの。
-    fn best_lookup<'a>(&'a self, conds: &[(usize, u32)]) -> Option<(&'a [u32], Vec<(usize, u32)>)> {
+    ///
+    /// v27: read lock 下で借用したスライスをそのまま返す(ゼロコピー)。
+    fn best_lookup_ref<'a>(
+        &'a self,
+        conds: &[(usize, u32)],
+    ) -> Option<(&'a [u32], Vec<(usize, u32)>)> {
         if conds.len() < 2 { return None; }
-        let mut best: Option<(&[u32], Vec<(usize, u32)>, usize)> = None;
+        let mut best: Option<(&'a [u32], Vec<(usize, u32)>, usize)> = None;
         // best = (cell, remaining, covered_count)
 
         for v in &self.views {
@@ -516,7 +521,7 @@ impl NTupleTable {
                 None => continue,
             };
             if cell_id >= v.cells.len() { continue; }
-            let cell = &v.cells[cell_id];
+            let cell = v.cells[cell_id].as_slice();
             let covered = v.himos.len();
 
             let remaining: Vec<(usize, u32)> = conds.iter()
@@ -529,7 +534,7 @@ impl NTupleTable {
                 Some((_, _, c)) => covered > *c,
             };
             if better {
-                best = Some((cell.as_slice(), remaining, covered));
+                best = Some((cell, remaining, covered));
             }
         }
 
@@ -583,9 +588,15 @@ impl PairTable {
         Self { pairs: vec![] }
     }
 
-    fn best_lookup<'a>(&'a self, conds: &[(usize, u32)]) -> Option<(&'a [u32], Vec<(usize, u32)>)> {
+    /// v27: 最小セルへの参照と残り条件を返す(read lock 下で借用)。
+    /// スライス参照を返すので呼び出し側で read guard を保持すること。
+    /// 内部で Vec を clone しないのでホットパスでもゼロコピー。
+    fn best_lookup_ref<'a>(
+        &'a self,
+        conds: &[(usize, u32)],
+    ) -> Option<(&'a [u32], Vec<(usize, u32)>)> {
         if conds.len() < 2 { return None; }
-        let mut best: Option<(&[u32], Vec<(usize, u32)>)> = None;
+        let mut best: Option<(&'a [u32], Vec<(usize, u32)>)> = None;
         let mut best_len = usize::MAX;
 
         for pair in &self.pairs {
@@ -598,7 +609,7 @@ impl PairTable {
             if let (Some(a), Some(b)) = (va, vb) {
                 let cell_id = a as usize * pair.card_b as usize + b as usize;
                 if cell_id < pair.cells.len() {
-                    let cell = &pair.cells[cell_id];
+                    let cell = pair.cells[cell_id].as_slice();
                     if cell.is_empty() {
                         return Some((&[], conds.to_vec()));
                     }
@@ -687,9 +698,9 @@ pub struct Engine {
     #[cfg(all(feature = "v26", not(feature = "v27")))]
     pairs: PairTable,
     #[cfg(feature = "v27")]
-    pairs: PairTable,
+    pairs: std::sync::RwLock<PairTable>,
     #[cfg(feature = "v27")]
-    tuples: NTupleTable,
+    tuples: std::sync::RwLock<NTupleTable>,
     /// 非同期書き込みキュー。`create_concurrent` で有効化される。
     #[cfg(feature = "v27")]
     write_queue: Option<std::sync::Arc<crate::write_queue::WriteQueue>>,
@@ -809,9 +820,9 @@ impl Engine {
             #[cfg(all(feature = "v26", not(feature = "v27")))]
             pairs: PairTable::new(),
             #[cfg(feature = "v27")]
-            pairs: PairTable::new(),
+            pairs: std::sync::RwLock::new(PairTable::new()),
             #[cfg(feature = "v27")]
-            tuples: NTupleTable::new(),
+            tuples: std::sync::RwLock::new(NTupleTable::new()),
             #[cfg(feature = "v27")]
             write_queue: None,
             #[cfg(feature = "v27")]
@@ -944,9 +955,9 @@ impl Engine {
             #[cfg(all(feature = "v26", not(feature = "v27")))]
             pairs: PairTable::new(),
             #[cfg(feature = "v27")]
-            pairs: PairTable::new(),
+            pairs: std::sync::RwLock::new(PairTable::new()),
             #[cfg(feature = "v27")]
-            tuples: NTupleTable::new(),
+            tuples: std::sync::RwLock::new(NTupleTable::new()),
             #[cfg(feature = "v27")]
             write_queue: None,
             #[cfg(feature = "v27")]
@@ -1343,7 +1354,7 @@ impl Engine {
             }
         }
 
-        self.pairs = PairTable { pairs };
+        *self.pairs.write().unwrap() = PairTable { pairs };
     }
 
     /// v27: delta 伝播 — 紐の値が変わった時にペアテーブルに反映。
@@ -1353,26 +1364,28 @@ impl Engine {
             .filter(|&i| i != himo_idx)
             .filter_map(|i| self.himos[i].get_value(eid).map(|v| (i, v)))
             .collect();
-        self.pairs.apply_delta(eid, himo_idx, old_val, new_val, &other_values);
+        self.pairs.write().unwrap().apply_delta(eid, himo_idx, old_val, new_val, &other_values);
     }
 
     /// v27: ペアテーブルへの即時反映(内部用、&self)。
     /// himos[hid].set の前に呼んで old_val を取得する必要がある。
+    ///
+    /// PairTable と NTupleTable は RwLock で保護。consumer スレッド(単一)と
+    /// 並行 reader の間で、cell(Vec) への insert/remove が torn read にならない
+    /// ように write lock 下で排他する。reader 側 (best_lookup) は read lock で
+    /// cell を clone してから返す。
     #[cfg(feature = "v27")]
     fn apply_pair_delta_internal(&self, eid: u32, himo_idx: usize, old_val: u32, new_val: u32) {
         let other_values: Vec<(usize, u32)> = (0..self.himos.len())
             .filter(|&i| i != himo_idx)
             .filter_map(|i| self.himos[i].get_value(eid).map(|v| (i, v)))
             .collect();
-        // SAFETY: v27 では Engine を Arc 共有しない前提(BucketCylinder 自体が &mut self)。
-        // 単一スレッド。
-        let pairs_ptr = &self.pairs as *const PairTable as *mut PairTable;
-        unsafe { (*pairs_ptr).apply_delta(eid, himo_idx, old_val, new_val, &other_values); }
+        self.pairs.write().unwrap().apply_delta(eid, himo_idx, old_val, new_val, &other_values);
 
         // 観測窓への伝播(登録されている場合のみコスト発生)
-        if !self.tuples.views.is_empty() {
-            let tuples_ptr = &self.tuples as *const NTupleTable as *mut NTupleTable;
-            unsafe { (*tuples_ptr).apply_delta(eid, himo_idx, old_val, new_val, &other_values); }
+        let has_views = !self.tuples.read().unwrap().views.is_empty();
+        if has_views {
+            self.tuples.write().unwrap().apply_delta(eid, himo_idx, old_val, new_val, &other_values);
         }
     }
 
@@ -1389,7 +1402,7 @@ impl Engine {
         if himos.len() > MAX_VIEW_HIMOS {
             return Err(format!("view has too many himos (max {})", MAX_VIEW_HIMOS));
         }
-        if self.tuples.views.len() >= MAX_PERSISTED_VIEWS {
+        if self.tuples.read().unwrap().views.len() >= MAX_PERSISTED_VIEWS {
             return Err(format!("too many views (max {})", MAX_PERSISTED_VIEWS));
         }
 
@@ -1466,7 +1479,7 @@ impl Engine {
             c.sort_unstable();
         }
 
-        self.tuples.views.push(NTupleEntry {
+        self.tuples.write().unwrap().views.push(NTupleEntry {
             himos: idxs.to_vec(),
             cards,
             strides,
@@ -1668,17 +1681,21 @@ impl Engine {
         }
 
         // v27: 観測窓(n-tuple)とペアテーブル、最小 Cylinder スライスを比べて最小候補を選ぶ。
+        // read lock を iterate+filter の間保持して torn read を防ぐ(cell への insert/remove は write lock)。
         #[cfg(feature = "v27")]
         {
-            let tuple = self.tuples.best_lookup(&conds);
-            let pair = self.pairs.best_lookup(&conds);
-
-            // 候補数最小のものを選ぶ。残り条件を Column フィルタ。
-            let tuple_len = tuple.as_ref().map(|(c, _)| c.len()).unwrap_or(usize::MAX);
-            let pair_len = pair.as_ref().map(|(c, _)| c.len()).unwrap_or(usize::MAX);
+            // 先に長さだけ測って最適経路を決定(どのロックも保持しない)。
+            let (tuple_len, pair_len) = {
+                let t = self.tuples.read().unwrap();
+                let p = self.pairs.read().unwrap();
+                let tl = t.best_lookup_ref(&conds).map(|(c, _)| c.len()).unwrap_or(usize::MAX);
+                let pl = p.best_lookup_ref(&conds).map(|(c, _)| c.len()).unwrap_or(usize::MAX);
+                (tl, pl)
+            };
 
             if tuple_len <= pair_len && tuple_len <= min_slice_len {
-                if let Some((candidates, remaining)) = tuple {
+                let guard = self.tuples.read().unwrap();
+                if let Some((candidates, remaining)) = guard.best_lookup_ref(&conds) {
                     if remaining.is_empty() {
                         return candidates.to_vec();
                     }
@@ -1697,7 +1714,8 @@ impl Engine {
                 }
             }
             if pair_len <= min_slice_len {
-                if let Some((candidates, remaining)) = pair {
+                let guard = self.pairs.read().unwrap();
+                if let Some((candidates, remaining)) = guard.best_lookup_ref(&conds) {
                     if remaining.is_empty() {
                         return candidates.to_vec();
                     }
@@ -1882,13 +1900,14 @@ impl Engine {
         {
             if max_values > 0 {
                 let card_b = max_values + 1;
+                let mut pairs_w = self.pairs.write().unwrap();
                 for a in 0..hid {
                     if self.himo_max_values[a] == 0 { continue; }
                     let card_a = self.himo_max_values[a] + 1;
                     let cell_count = card_a as u64 * card_b as u64;
                     if cell_count > 1_000_000 { continue; }
                     let cells: Vec<Vec<u32>> = vec![vec![]; cell_count as usize];
-                    self.pairs.pairs.push(PairEntry {
+                    pairs_w.pairs.push(PairEntry {
                         himo_a: a,
                         himo_b: hid,
                         card_a,
