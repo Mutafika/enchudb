@@ -6,11 +6,15 @@
 //! 引く       → Cylinder 結果 + delta 分を Column 直読みで補正
 //! rebuild    → delta を Cylinder にマージ（delta が大きくなった時だけ）
 
+#[cfg(not(feature = "v27"))]
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::cell::UnsafeCell;
 
 use crate::column::Column;
+#[cfg(not(feature = "v27"))]
 use crate::cylinder::Cylinder;
+#[cfg(feature = "v27")]
+use crate::cylinder_v27::BucketCylinder;
 use crate::region::Region;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -26,9 +30,12 @@ impl HimoType {
     }
 }
 
+#[cfg(not(feature = "v27"))]
 const BITMAP_BUDGET: usize = 32 * 1024 * 1024;
+#[cfg(not(feature = "v27"))]
 const DELTA_CAP: usize = 4096;
 
+#[cfg(not(feature = "v27"))]
 pub struct HimoStore {
     col: UnsafeCell<Column>,
     cyl_a: Cylinder,
@@ -45,9 +52,12 @@ pub struct HimoStore {
     delta_len: AtomicU32,
 }
 
+#[cfg(not(feature = "v27"))]
 unsafe impl Sync for HimoStore {}
+#[cfg(not(feature = "v27"))]
 unsafe impl Send for HimoStore {}
 
+#[cfg(not(feature = "v27"))]
 impl HimoStore {
     fn compute_bitmap_words(max_entities: u32) -> usize {
         (max_entities as usize + 63) / 64
@@ -279,4 +289,133 @@ impl HimoStore {
     pub fn sync(&self) {
         self.rebuild_cylinder();
     }
+}
+
+// ════════════════ v27 実装 ════════════════
+//
+// BucketCylinder を直接積む。ダブルバッファ/delta/bitmap は全廃。
+// 注意: BucketCylinder::insert/remove は &mut self。単一スレッド前提。
+// Engine を Arc 共有する並行書き込みは v27 v1 では未サポート。
+
+#[cfg(feature = "v27")]
+pub struct HimoStore {
+    col: UnsafeCell<Column>,
+    cyl: UnsafeCell<BucketCylinder>,
+    pub himo_type: HimoType,
+    pub max_values: u32,
+}
+
+#[cfg(feature = "v27")]
+unsafe impl Sync for HimoStore {}
+#[cfg(feature = "v27")]
+unsafe impl Send for HimoStore {}
+
+#[cfg(feature = "v27")]
+impl HimoStore {
+    pub fn init(col_region: Region, ht: HimoType, max_values: u32, max_entities: u32) -> Self {
+        let col = Column::init(col_region, 4, max_entities);
+        let effective_max = if max_values == 0 { 65_536 } else { max_values };
+        let cyl = BucketCylinder::new(effective_max, max_entities);
+        Self {
+            col: UnsafeCell::new(col),
+            cyl: UnsafeCell::new(cyl),
+            himo_type: ht,
+            max_values,
+        }
+    }
+
+    pub fn load(col_region: Region, ht: HimoType, max_values: u32) -> Self {
+        let col = Column::load(col_region);
+        let max_entities = col.max_entities;
+        let effective_max = if max_values == 0 { 65_536 } else { max_values };
+        let mut cyl = BucketCylinder::new(effective_max, max_entities);
+        cyl.rebuild_from_column(&col);
+        Self {
+            col: UnsafeCell::new(col),
+            cyl: UnsafeCell::new(cyl),
+            himo_type: ht,
+            max_values,
+        }
+    }
+
+    fn col(&self) -> &Column { unsafe { &*self.col.get() } }
+
+    pub fn cylinder(&self) -> &BucketCylinder { unsafe { &*self.cyl.get() } }
+
+    fn cyl_mut(&self) -> &mut BucketCylinder { unsafe { &mut *self.cyl.get() } }
+
+    // ──── ぶら下げる / 外す ────
+
+    pub fn set(&self, eid: u32, value: u32) {
+        self.col().ensure_count(eid);
+        self.col().set(eid, &(value + 1).to_le_bytes());
+        self.cyl_mut().insert(eid, value);
+    }
+
+    pub fn remove(&self, eid: u32) {
+        if eid < self.col().count() {
+            self.col().clear(eid);
+            self.cyl_mut().remove(eid);
+        }
+    }
+
+    // ──── 読む ────
+
+    pub fn get_value(&self, eid: u32) -> Option<u32> {
+        if eid >= self.col().count() { return None; }
+        let stored = u32::from_le_bytes(self.col().get(eid).try_into().unwrap());
+        if stored == 0 { None } else { Some(stored - 1) }
+    }
+
+    #[inline(always)]
+    pub fn value_eq(&self, eid: u32, value: u32) -> bool {
+        u32::from_le_bytes(self.col().get(eid).try_into().unwrap()) == value + 1
+    }
+
+    pub fn get_raw_bytes(&self, eid: u32) -> [u8; 4] {
+        if eid >= self.col().count() { return [0u8; 4]; }
+        self.col().get(eid).try_into().unwrap()
+    }
+
+    pub fn restore(&self, eid: u32, old_bytes: &[u8; 4]) {
+        self.col().ensure_count(eid);
+        let stored = u32::from_le_bytes(*old_bytes);
+        self.col().set(eid, old_bytes);
+        if stored == 0 {
+            self.cyl_mut().remove(eid);
+        } else {
+            self.cyl_mut().insert(eid, stored - 1);
+        }
+    }
+
+    // ──── 引く ────
+
+    pub fn pull(&self, value: u32) -> &[u32] {
+        self.cylinder().slice_one(value)
+    }
+
+    pub fn delta_eids(&self) -> &[u32] { &[] }
+    pub fn delta_is_empty(&self) -> bool { true }
+    pub fn delta_needs_rebuild(&self) -> bool { false }
+
+    pub fn has_bitmaps(&self) -> bool { false }
+    pub fn bitmap(&self, _value: u32) -> Option<&[u64]> { None }
+    pub fn bitmap_words(&self) -> usize { 0 }
+
+    pub fn rebuild_cylinder(&self) {}
+
+    pub fn scan(&self, value: u32) -> Vec<u32> {
+        let count = self.col().count();
+        let target = value + 1;
+        let mut result = Vec::new();
+        for eid in 0..count {
+            let stored = u32::from_le_bytes(self.col().get(eid).try_into().unwrap());
+            if stored == target {
+                result.push(eid);
+            }
+        }
+        result
+    }
+
+    pub fn sync(&self) {}
 }

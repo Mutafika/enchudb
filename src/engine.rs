@@ -69,6 +69,7 @@ use crate::himo_store::{HimoStore, HimoType};
 use crate::content_store::ContentStore;
 use crate::undo::UndoLog;
 use crate::column::Column;
+#[cfg(not(feature = "v27"))]
 use crate::cylinder::Cylinder;
 
 // ════════════════ ギャロッピング交差 ════════════════
@@ -175,6 +176,7 @@ struct Layout {
     content_data_size: usize,
     himo_base_off: usize,
     himo_col_size: usize,
+    #[allow(dead_code)]
     himo_cyl_size: usize,
     himo_slot_size: usize,
     cyl_max_values: u32,
@@ -248,8 +250,14 @@ impl Layout {
         off += content_data_size;
 
         let himo_col_size = align8(Column::region_size(max_entities, 4));
+        #[cfg(not(feature = "v27"))]
         let himo_cyl_size = align8(Cylinder::region_size(max_entities, cyl_max_values));
+        #[cfg(feature = "v27")]
+        let himo_cyl_size = 0usize;
+        #[cfg(not(feature = "v27"))]
         let himo_slot_size = himo_col_size + himo_cyl_size * 2;
+        #[cfg(feature = "v27")]
+        let himo_slot_size = himo_col_size;
 
         let himo_base_off = off;
         off += himo_slot_size * (max_himos as usize);
@@ -276,9 +284,11 @@ impl Layout {
     fn himo_col_off(&self, hid: usize) -> usize {
         self.himo_base_off + hid * self.himo_slot_size
     }
+    #[allow(dead_code)]
     fn himo_cyl_a_off(&self, hid: usize) -> usize {
         self.himo_base_off + hid * self.himo_slot_size + self.himo_col_size
     }
+    #[allow(dead_code)]
     fn himo_cyl_b_off(&self, hid: usize) -> usize {
         self.himo_base_off + hid * self.himo_slot_size + self.himo_col_size + self.himo_cyl_size
     }
@@ -287,7 +297,7 @@ impl Layout {
 // ════════════════ Engine ════════════════
 
 /// v26 ペアテーブル: ソート済み Vec<u32> セル。delta で直接操作。
-#[cfg(feature = "v26")]
+#[cfg(all(feature = "v26", not(feature = "v27")))]
 struct PairEntry {
     himo_a: usize,
     himo_b: usize,
@@ -296,12 +306,12 @@ struct PairEntry {
     cells: Vec<Vec<u32>>,
 }
 
-#[cfg(feature = "v26")]
+#[cfg(all(feature = "v26", not(feature = "v27")))]
 struct PairTable {
     pairs: Vec<PairEntry>,
 }
 
-#[cfg(feature = "v26")]
+#[cfg(all(feature = "v26", not(feature = "v27")))]
 impl PairTable {
     fn new() -> Self {
         Self { pairs: vec![] }
@@ -397,6 +407,114 @@ impl PairTable {
     }
 }
 
+// ─── v27 PairTable (v26 のコピー) ───
+
+#[cfg(feature = "v27")]
+struct PairEntry {
+    himo_a: usize,
+    himo_b: usize,
+    card_a: u32,
+    card_b: u32,
+    cells: Vec<Vec<u32>>,
+}
+
+#[cfg(feature = "v27")]
+struct PairTable {
+    pairs: Vec<PairEntry>,
+}
+
+#[cfg(feature = "v27")]
+impl PairTable {
+    fn new() -> Self {
+        Self { pairs: vec![] }
+    }
+
+    fn best_lookup<'a>(&'a self, conds: &[(usize, u32)]) -> Option<(&'a [u32], Vec<(usize, u32)>)> {
+        if conds.len() < 2 { return None; }
+        let mut best: Option<(&[u32], Vec<(usize, u32)>)> = None;
+        let mut best_len = usize::MAX;
+
+        for pair in &self.pairs {
+            let mut va = None;
+            let mut vb = None;
+            for &(idx, val) in conds {
+                if idx == pair.himo_a { va = Some(val); }
+                if idx == pair.himo_b { vb = Some(val); }
+            }
+            if let (Some(a), Some(b)) = (va, vb) {
+                let cell_id = a as usize * pair.card_b as usize + b as usize;
+                if cell_id < pair.cells.len() {
+                    let cell = &pair.cells[cell_id];
+                    if cell.is_empty() {
+                        return Some((&[], conds.to_vec()));
+                    }
+                    if cell.len() < best_len {
+                        best_len = cell.len();
+                        let remaining: Vec<(usize, u32)> = conds.iter()
+                            .filter(|&&(idx, _)| idx != pair.himo_a && idx != pair.himo_b)
+                            .copied()
+                            .collect();
+                        best = Some((cell, remaining));
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    fn cell_add(&mut self, pair_idx: usize, cell_id: usize, eid: u32) {
+        let cell = &mut self.pairs[pair_idx].cells[cell_id];
+        match cell.binary_search(&eid) {
+            Ok(_) => {},
+            Err(pos) => cell.insert(pos, eid),
+        }
+    }
+
+    fn cell_remove(&mut self, pair_idx: usize, cell_id: usize, eid: u32) {
+        let cell = &mut self.pairs[pair_idx].cells[cell_id];
+        if let Ok(pos) = cell.binary_search(&eid) {
+            cell.remove(pos);
+        }
+    }
+
+    fn apply_delta(&mut self, eid: u32, himo_idx: usize, old_val: u32, new_val: u32, other_values: &[(usize, u32)]) {
+        for pi in 0..self.pairs.len() {
+            let (is_a, other_himo) = if self.pairs[pi].himo_a == himo_idx {
+                (true, self.pairs[pi].himo_b)
+            } else if self.pairs[pi].himo_b == himo_idx {
+                (false, self.pairs[pi].himo_a)
+            } else {
+                continue;
+            };
+
+            let other_val = match other_values.iter().find(|&&(idx, _)| idx == other_himo) {
+                Some(&(_, v)) => v,
+                None => continue,
+            };
+
+            let card_b = self.pairs[pi].card_b;
+
+            let old_cell_id = if is_a {
+                old_val as usize * card_b as usize + other_val as usize
+            } else {
+                other_val as usize * card_b as usize + old_val as usize
+            };
+            if old_cell_id < self.pairs[pi].cells.len() {
+                self.cell_remove(pi, old_cell_id, eid);
+            }
+
+            let new_cell_id = if is_a {
+                new_val as usize * card_b as usize + other_val as usize
+            } else {
+                other_val as usize * card_b as usize + new_val as usize
+            };
+            if new_cell_id < self.pairs[pi].cells.len() {
+                self.cell_add(pi, new_cell_id, eid);
+            }
+        }
+    }
+}
+
 pub struct Engine {
     #[allow(dead_code)]
     path: String,
@@ -412,7 +530,9 @@ pub struct Engine {
     entities: EntitySet,
     contents: ContentStore,
     undo: UndoLog,
-    #[cfg(feature = "v26")]
+    #[cfg(all(feature = "v26", not(feature = "v27")))]
+    pairs: PairTable,
+    #[cfg(feature = "v27")]
     pairs: PairTable,
     backing: Backing, // 最後に drop されるよう最終フィールド
 }
@@ -515,7 +635,9 @@ impl Engine {
             himo_names: Vec::new(),
             himo_types: Vec::new(), himo_max_values: Vec::new(),
             himos: Vec::new(), entities, contents, undo,
-            #[cfg(feature = "v26")]
+            #[cfg(all(feature = "v26", not(feature = "v27")))]
+            pairs: PairTable::new(),
+            #[cfg(feature = "v27")]
             pairs: PairTable::new(),
             backing: Backing::Mmap(mmap),
         })
@@ -605,10 +727,16 @@ impl Engine {
             let name = String::from_utf8_lossy(name_bytes).to_string();
             let effective_mv = mv.min(cyl_max_values);
 
+            #[cfg(not(feature = "v27"))]
             let hs = HimoStore::load(
                 unsafe { Region::new(base.add(layout.himo_col_off(hid)), layout.himo_col_size) },
                 unsafe { Region::new(base.add(layout.himo_cyl_a_off(hid)), layout.himo_cyl_size) },
                 unsafe { Region::new(base.add(layout.himo_cyl_b_off(hid)), layout.himo_cyl_size) },
+                ht, effective_mv,
+            );
+            #[cfg(feature = "v27")]
+            let hs = HimoStore::load(
+                unsafe { Region::new(base.add(layout.himo_col_off(hid)), layout.himo_col_size) },
                 ht, effective_mv,
             );
 
@@ -623,7 +751,9 @@ impl Engine {
             vocab, himo_reg,
             himo_names, himo_types, himo_max_values,
             himos, entities, contents, undo,
-            #[cfg(feature = "v26")]
+            #[cfg(all(feature = "v26", not(feature = "v27")))]
+            pairs: PairTable::new(),
+            #[cfg(feature = "v27")]
             pairs: PairTable::new(),
             backing,
         };
@@ -632,6 +762,9 @@ impl Engine {
             eng.recover();
         }
         eng.rebuild();
+
+        #[cfg(feature = "v27")]
+        eng.rebuild_pairs();
 
         Ok(eng)
     }
@@ -658,21 +791,33 @@ impl Engine {
         let vid = self.vocab.get_or_insert(value.as_bytes());
         let hid = self.ensure_himo(himo, HimoType::Symbol, 0);
         self.record_undo(eid, hid);
+        #[cfg(feature = "v27")]
+        let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, vid);
+        #[cfg(feature = "v27")]
+        self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), vid);
     }
 
     pub fn tie(&mut self, eid: u32, himo: &str, value: u32) {
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = self.ensure_himo(himo, HimoType::Value, 0);
         self.record_undo(eid, hid);
+        #[cfg(feature = "v27")]
+        let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, value);
+        #[cfg(feature = "v27")]
+        self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), value);
     }
 
     pub fn tie_ref(&mut self, eid: u32, himo: &str, target_eid: u32) {
         assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
         let hid = self.ensure_himo(himo, HimoType::Ref, 0);
         self.record_undo(eid, hid);
+        #[cfg(feature = "v27")]
+        let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, target_eid);
+        #[cfg(feature = "v27")]
+        self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), target_eid);
     }
 
     // ──── tie（定義済み紐、&self で並行書き込み可）────
@@ -684,7 +829,11 @@ impl Engine {
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
         self.record_undo(eid, hid);
+        #[cfg(feature = "v27")]
+        let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, vid);
+        #[cfg(feature = "v27")]
+        self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), vid);
     }
 
     /// 定義済みの紐にu32値を張る。&selfで呼べる。
@@ -693,7 +842,11 @@ impl Engine {
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
         self.record_undo(eid, hid);
+        #[cfg(feature = "v27")]
+        let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, value);
+        #[cfg(feature = "v27")]
+        self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), value);
     }
 
     /// 定義済みの紐にentity参照を張る。&selfで呼べる。
@@ -702,7 +855,11 @@ impl Engine {
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
         self.record_undo(eid, hid);
+        #[cfg(feature = "v27")]
+        let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, target_eid);
+        #[cfg(feature = "v27")]
+        self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), target_eid);
     }
 
     // ──── untie ────
@@ -710,7 +867,13 @@ impl Engine {
     pub fn untie(&self, eid: u32, himo: &str) {
         if let Some(hid) = self.himo_id(himo) {
             self.record_undo(eid, hid);
+            #[cfg(feature = "v27")]
+            let old_val = self.himos[hid].get_value(eid);
             self.himos[hid].remove(eid);
+            #[cfg(feature = "v27")]
+            if let Some(ov) = old_val {
+                self.apply_pair_delta_internal(eid, hid, ov, u32::MAX);
+            }
         }
     }
 
@@ -720,7 +883,13 @@ impl Engine {
         self.undo.record(eid, 0xFFFF, &[2, 0, 0, 0]); // entity deleted
         for hid in 0..self.himos.len() {
             self.record_undo(eid, hid);
+            #[cfg(feature = "v27")]
+            let old_val = self.himos[hid].get_value(eid);
             self.himos[hid].remove(eid);
+            #[cfg(feature = "v27")]
+            if let Some(ov) = old_val {
+                self.apply_pair_delta_internal(eid, hid, ov, u32::MAX);
+            }
         }
         self.entities.free(eid);
     }
@@ -797,32 +966,37 @@ impl Engine {
         let hid = self.himo_id(himo)?;
         let cyl = self.himos[hid].cylinder();
         let text_bytes = text.as_bytes();
-        // Cylinderのvalues（ソート済み）からユニーク値を取り出す
-        let n = cyl.total();
-        if n == 0 {
-            // Cylinder空 → delta内をColumn走査で探す
+        #[cfg(not(feature = "v27"))]
+        let vals = {
+            let n = cyl.total();
+            if n == 0 {
+                let delta = self.himos[hid].delta_eids();
+                for &eid in delta {
+                    if let Some(vid) = self.himos[hid].get_value(eid) {
+                        if self.vocab.get(vid) == text_bytes {
+                            return Some(vid);
+                        }
+                    }
+                }
+                return None;
+            }
+            cyl.unique_values(n)
+        };
+        #[cfg(feature = "v27")]
+        let vals = cyl.unique_values();
+        for vid in vals {
+            if self.vocab.get(vid) == text_bytes {
+                return Some(vid);
+            }
+        }
+        #[cfg(not(feature = "v27"))]
+        {
             let delta = self.himos[hid].delta_eids();
             for &eid in delta {
                 if let Some(vid) = self.himos[hid].get_value(eid) {
                     if self.vocab.get(vid) == text_bytes {
                         return Some(vid);
                     }
-                }
-            }
-            return None;
-        }
-        let vals = cyl.unique_values(n);
-        for vid in vals {
-            if self.vocab.get(vid) == text_bytes {
-                return Some(vid);
-            }
-        }
-        // Cylinder にない場合 delta を確認
-        let delta = self.himos[hid].delta_eids();
-        for &eid in delta {
-            if let Some(vid) = self.himos[hid].get_value(eid) {
-                if self.vocab.get(vid) == text_bytes {
-                    return Some(vid);
                 }
             }
         }
@@ -866,7 +1040,7 @@ impl Engine {
 
     /// v26: ペアテーブルを構築。全紐ペアの二次元テーブルをデルタシンクで事前計算。
     /// rebuild() の後に呼ぶ。
-    #[cfg(feature = "v26")]
+    #[cfg(all(feature = "v26", not(feature = "v27")))]
     pub fn rebuild_pairs(&mut self) {
         let n_himos = self.himos.len();
         let next_eid = self.entities.next_eid();
@@ -912,13 +1086,83 @@ impl Engine {
     }
 
     /// v26: delta 伝播 — 紐の値が変わった時にペアテーブルに反映。
-    #[cfg(feature = "v26")]
+    #[cfg(all(feature = "v26", not(feature = "v27")))]
     pub fn apply_pair_delta(&mut self, eid: u32, himo_idx: usize, old_val: u32, new_val: u32) {
         let other_values: Vec<(usize, u32)> = (0..self.himos.len())
             .filter(|&i| i != himo_idx)
             .filter_map(|i| self.himos[i].get_value(eid).map(|v| (i, v)))
             .collect();
         self.pairs.apply_delta(eid, himo_idx, old_val, new_val, &other_values);
+    }
+
+    /// v27: ペアテーブルを構築。v26 のコピー。
+    #[cfg(feature = "v27")]
+    pub fn rebuild_pairs(&mut self) {
+        let n_himos = self.himos.len();
+        let next_eid = self.entities.next_eid();
+        let mut pairs = Vec::new();
+
+        for a in 0..n_himos {
+            let card_a = if self.himo_max_values[a] > 0 {
+                self.himo_max_values[a] + 1
+            } else {
+                continue;
+            };
+            for b in (a + 1)..n_himos {
+                let card_b = if self.himo_max_values[b] > 0 {
+                    self.himo_max_values[b] + 1
+                } else {
+                    continue;
+                };
+
+                let cell_count = card_a as u64 * card_b as u64;
+                if cell_count > 1_000_000 { continue; }
+
+                let table_size = cell_count as usize;
+                let mut raw: Vec<Vec<u32>> = vec![vec![]; table_size];
+
+                for eid in 0..next_eid {
+                    if !self.entities.is_live(eid) { continue; }
+                    let va = match self.himos[a].get_value(eid) {
+                        Some(v) if v < card_a => v,
+                        _ => continue,
+                    };
+                    let vb = match self.himos[b].get_value(eid) {
+                        Some(v) if v < card_b => v,
+                        _ => continue,
+                    };
+                    raw[va as usize * card_b as usize + vb as usize].push(eid);
+                }
+
+                pairs.push(PairEntry { himo_a: a, himo_b: b, card_a, card_b, cells: raw });
+            }
+        }
+
+        self.pairs = PairTable { pairs };
+    }
+
+    /// v27: delta 伝播 — 紐の値が変わった時にペアテーブルに反映。
+    #[cfg(feature = "v27")]
+    pub fn apply_pair_delta(&mut self, eid: u32, himo_idx: usize, old_val: u32, new_val: u32) {
+        let other_values: Vec<(usize, u32)> = (0..self.himos.len())
+            .filter(|&i| i != himo_idx)
+            .filter_map(|i| self.himos[i].get_value(eid).map(|v| (i, v)))
+            .collect();
+        self.pairs.apply_delta(eid, himo_idx, old_val, new_val, &other_values);
+    }
+
+    /// v27: ペアテーブルへの即時反映(内部用、&self)。
+    /// himos[hid].set の前に呼んで old_val を取得する必要がある。
+    #[cfg(feature = "v27")]
+    fn apply_pair_delta_internal(&self, eid: u32, himo_idx: usize, old_val: u32, new_val: u32) {
+        let other_values: Vec<(usize, u32)> = (0..self.himos.len())
+            .filter(|&i| i != himo_idx)
+            .filter_map(|i| self.himos[i].get_value(eid).map(|v| (i, v)))
+            .collect();
+        // SAFETY: v27 では Engine を Arc 共有しない前提(BucketCylinder 自体が &mut self)。
+        // 単一スレッド。
+        let pairs_ptr = &self.pairs as *const PairTable as *mut PairTable;
+        unsafe { (*pairs_ptr).apply_delta(eid, himo_idx, old_val, new_val, &other_values); }
     }
 
     /// 引く。delta が空なら Cylinder 直返し（ゼロコピー）。
@@ -1024,8 +1268,8 @@ impl Engine {
             if len < min_slice_len { min_slice_len = len; min_slice_idx = i; }
         }
 
-        // v26: ペアテーブルで最小候補を O(1) ルックアップ
-        #[cfg(feature = "v26")]
+        // v26/v27: ペアテーブルで最小候補を O(1) ルックアップ
+        #[cfg(any(all(feature = "v26", not(feature = "v27")), feature = "v27"))]
         {
             if let Some((candidates, remaining)) = self.pairs.best_lookup(&conds) {
                 if candidates.len() <= min_slice_len {
@@ -1145,13 +1389,21 @@ impl Engine {
         let effective_mv = max_values.min(self.layout.cyl_max_values);
         let base = self.backing.as_mut_ptr();
         let col_off = self.layout.himo_col_off(hid);
-        let cyl_a_off = self.layout.himo_cyl_a_off(hid);
-        let cyl_b_off = self.layout.himo_cyl_b_off(hid);
 
+        #[cfg(not(feature = "v27"))]
+        let hs = {
+            let cyl_a_off = self.layout.himo_cyl_a_off(hid);
+            let cyl_b_off = self.layout.himo_cyl_b_off(hid);
+            HimoStore::init(
+                unsafe { Region::new(base.add(col_off), self.layout.himo_col_size) },
+                unsafe { Region::new(base.add(cyl_a_off), self.layout.himo_cyl_size) },
+                unsafe { Region::new(base.add(cyl_b_off), self.layout.himo_cyl_size) },
+                ht, effective_mv, self.max_entities,
+            )
+        };
+        #[cfg(feature = "v27")]
         let hs = HimoStore::init(
             unsafe { Region::new(base.add(col_off), self.layout.himo_col_size) },
-            unsafe { Region::new(base.add(cyl_a_off), self.layout.himo_cyl_size) },
-            unsafe { Region::new(base.add(cyl_b_off), self.layout.himo_cyl_size) },
             ht, effective_mv, self.max_entities,
         );
 
@@ -1167,6 +1419,28 @@ impl Engine {
         self.backing.as_slice_mut()[mv_off..mv_off + 4].copy_from_slice(&max_values.to_le_bytes());
         let himo_count = (hid + 1) as u32;
         self.backing.as_slice_mut()[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&himo_count.to_le_bytes());
+
+        // v27: 新 himo と既存 himo のペアを空セルで登録。以降 tie で自動更新。
+        #[cfg(feature = "v27")]
+        {
+            if max_values > 0 {
+                let card_b = max_values + 1;
+                for a in 0..hid {
+                    if self.himo_max_values[a] == 0 { continue; }
+                    let card_a = self.himo_max_values[a] + 1;
+                    let cell_count = card_a as u64 * card_b as u64;
+                    if cell_count > 1_000_000 { continue; }
+                    let cells: Vec<Vec<u32>> = vec![vec![]; cell_count as usize];
+                    self.pairs.pairs.push(PairEntry {
+                        himo_a: a,
+                        himo_b: hid,
+                        card_a,
+                        card_b,
+                        cells,
+                    });
+                }
+            }
+        }
 
         hid
     }

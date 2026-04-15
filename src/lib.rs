@@ -15,6 +15,8 @@ pub mod column;
 pub mod vocabulary;
 pub mod entity_set;
 pub mod cylinder;
+#[cfg(feature = "v27")]
+pub mod cylinder_v27;
 pub mod himo_store;
 pub mod content_store;
 pub mod undo;
