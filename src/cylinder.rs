@@ -184,4 +184,113 @@ impl Cylinder {
         let ptr = mm[base..].as_ptr() as *const u32;
         unsafe { std::slice::from_raw_parts(ptr, end - start) }
     }
+
+    /// delta 即時反映: entity を value スライスに追加。
+    /// ソート済み配列を維持。prefix sum も更新。
+    pub fn insert_entity(&self, value: u32, eid: u32) {
+        let n = self.total.load(Ordering::Acquire) as usize;
+        if n >= self.max_entities as usize { return; } // 容量超過
+
+        let mm = self.region.slice_mut();
+
+        // values 配列内で挿入位置を見つける（value でソート、同値内は eid でソート）
+        let vals = unsafe {
+            std::slice::from_raw_parts(mm[self.values_offset..].as_ptr() as *const u32, n)
+        };
+        let mut pos = vals.partition_point(|&v| v < value);
+        // 同じ value 内で eid 順にする
+        let eids = unsafe {
+            std::slice::from_raw_parts(mm[self.entities_offset..].as_ptr() as *const u32, n)
+        };
+        while pos < n && vals[pos] == value && eids[pos] < eid {
+            pos += 1;
+        }
+        // 既に存在するならスキップ
+        if pos < n && vals[pos] == value && eids[pos] == eid { return; }
+
+        // pos 以降を右にシフト（values と entities 両方）
+        if pos < n {
+            let v_src = self.values_offset + pos * 4;
+            let v_dst = self.values_offset + (pos + 1) * 4;
+            let shift_bytes = (n - pos) * 4;
+            mm.copy_within(v_src..v_src + shift_bytes, v_dst);
+
+            let e_src = self.entities_offset + pos * 4;
+            let e_dst = self.entities_offset + (pos + 1) * 4;
+            mm.copy_within(e_src..e_src + shift_bytes, e_dst);
+        }
+
+        // 挿入
+        let vo = self.values_offset + pos * 4;
+        let eo = self.entities_offset + pos * 4;
+        mm[vo..vo + 4].copy_from_slice(&value.to_le_bytes());
+        mm[eo..eo + 4].copy_from_slice(&eid.to_le_bytes());
+
+        let new_total = (n + 1) as u32;
+        mm[4..8].copy_from_slice(&new_total.to_le_bytes());
+        self.total.store(new_total, Ordering::Release);
+
+        // prefix sum 更新（value 以降のカウントを +1）
+        if self.max_values > 0 && value <= self.max_values {
+            let slots = self.max_values as usize + 2;
+            for s in (value as usize + 1)..slots {
+                let off = self.prefix_offset + s * 4;
+                let cur = u32::from_le_bytes(mm[off..off + 4].try_into().unwrap());
+                mm[off..off + 4].copy_from_slice(&(cur + 1).to_le_bytes());
+            }
+        }
+    }
+
+    /// delta 即時反映: entity を value スライスから除去。
+    pub fn remove_entity(&self, value: u32, eid: u32) {
+        let n = self.total.load(Ordering::Acquire) as usize;
+        if n == 0 { return; }
+
+        let mm = self.region.slice_mut();
+
+        // entity の位置を見つける
+        let vals = unsafe {
+            std::slice::from_raw_parts(mm[self.values_offset..].as_ptr() as *const u32, n)
+        };
+        let eids = unsafe {
+            std::slice::from_raw_parts(mm[self.entities_offset..].as_ptr() as *const u32, n)
+        };
+
+        let start = vals.partition_point(|&v| v < value);
+        let mut found = None;
+        for i in start..n {
+            if vals[i] != value { break; }
+            if eids[i] == eid { found = Some(i); break; }
+        }
+        let pos = match found {
+            Some(p) => p,
+            None => return, // 見つからない
+        };
+
+        // pos の後を左にシフト
+        if pos + 1 < n {
+            let v_dst = self.values_offset + pos * 4;
+            let v_src = self.values_offset + (pos + 1) * 4;
+            let shift_bytes = (n - pos - 1) * 4;
+            mm.copy_within(v_src..v_src + shift_bytes, v_dst);
+
+            let e_dst = self.entities_offset + pos * 4;
+            let e_src = self.entities_offset + (pos + 1) * 4;
+            mm.copy_within(e_src..e_src + shift_bytes, e_dst);
+        }
+
+        let new_total = (n - 1) as u32;
+        mm[4..8].copy_from_slice(&new_total.to_le_bytes());
+        self.total.store(new_total, Ordering::Release);
+
+        // prefix sum 更新（value 以降のカウントを -1）
+        if self.max_values > 0 && value <= self.max_values {
+            let slots = self.max_values as usize + 2;
+            for s in (value as usize + 1)..slots {
+                let off = self.prefix_offset + s * 4;
+                let cur = u32::from_le_bytes(mm[off..off + 4].try_into().unwrap());
+                mm[off..off + 4].copy_from_slice(&cur.saturating_sub(1).to_le_bytes());
+            }
+        }
+    }
 }

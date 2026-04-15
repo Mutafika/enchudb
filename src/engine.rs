@@ -395,6 +395,34 @@ impl PairTable {
             }
         }
     }
+
+    /// delta 伝播（新規 tie、旧値なし）: 新セルに追加のみ
+    fn apply_delta_add(&mut self, eid: u32, himo_idx: usize, new_val: u32, other_values: &[(usize, u32)]) {
+        for pi in 0..self.pairs.len() {
+            let (is_a, other_himo) = if self.pairs[pi].himo_a == himo_idx {
+                (true, self.pairs[pi].himo_b)
+            } else if self.pairs[pi].himo_b == himo_idx {
+                (false, self.pairs[pi].himo_a)
+            } else {
+                continue;
+            };
+
+            let other_val = match other_values.iter().find(|&&(idx, _)| idx == other_himo) {
+                Some(&(_, v)) => v,
+                None => continue,
+            };
+
+            let card_b = self.pairs[pi].card_b;
+            let new_cell_id = if is_a {
+                new_val as usize * card_b as usize + other_val as usize
+            } else {
+                other_val as usize * card_b as usize + new_val as usize
+            };
+            if new_cell_id < self.pairs[pi].cells.len() {
+                self.cell_add(pi, new_cell_id, eid);
+            }
+        }
+    }
 }
 
 pub struct Engine {
@@ -657,22 +685,73 @@ impl Engine {
     pub fn tie_text(&mut self, eid: u32, himo: &str, value: &str) {
         let vid = self.vocab.get_or_insert(value.as_bytes());
         let hid = self.ensure_himo(himo, HimoType::Symbol, 0);
+        let old_val = self.himos[hid].get_value(eid);
         self.record_undo(eid, hid);
         self.himos[hid].set(eid, vid);
+        {
+            let cyl = self.himos[hid].cylinder();
+            if let Some(old) = old_val { cyl.remove_entity(old, eid); }
+            cyl.insert_entity(vid, eid);
+        }
+        #[cfg(feature = "v26")]
+        {
+            let others = self.collect_other_values(eid, hid);
+            if let Some(old) = old_val {
+                self.pairs.apply_delta(eid, hid, old, vid, &others);
+            } else {
+                self.pairs.apply_delta_add(eid, hid, vid, &others);
+            }
+        }
     }
 
     pub fn tie(&mut self, eid: u32, himo: &str, value: u32) {
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = self.ensure_himo(himo, HimoType::Value, 0);
+        // delta: 旧値を読む
+        let old_val = self.himos[hid].get_value(eid);
+        // Column に書く
         self.record_undo(eid, hid);
         self.himos[hid].set(eid, value);
+        // Cylinder に即時反映
+        {
+            let cyl = self.himos[hid].cylinder();
+            if let Some(old) = old_val {
+                cyl.remove_entity(old, eid);
+            }
+            cyl.insert_entity(value, eid);
+        }
+        // ペアテーブルに伝播
+        #[cfg(feature = "v26")]
+        {
+            let others = self.collect_other_values(eid, hid);
+            if let Some(old) = old_val {
+                self.pairs.apply_delta(eid, hid, old, value, &others);
+            } else {
+                self.pairs.apply_delta_add(eid, hid, value, &others);
+            }
+        }
     }
 
     pub fn tie_ref(&mut self, eid: u32, himo: &str, target_eid: u32) {
         assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
         let hid = self.ensure_himo(himo, HimoType::Ref, 0);
+        let old_val = self.himos[hid].get_value(eid);
         self.record_undo(eid, hid);
         self.himos[hid].set(eid, target_eid);
+        {
+            let cyl = self.himos[hid].cylinder();
+            if let Some(old) = old_val { cyl.remove_entity(old, eid); }
+            cyl.insert_entity(target_eid, eid);
+        }
+        #[cfg(feature = "v26")]
+        {
+            let others = self.collect_other_values(eid, hid);
+            if let Some(old) = old_val {
+                self.pairs.apply_delta(eid, hid, old, target_eid, &others);
+            } else {
+                self.pairs.apply_delta_add(eid, hid, target_eid, &others);
+            }
+        }
     }
 
     // ──── tie（定義済み紐、&self で並行書き込み可）────
@@ -914,11 +993,17 @@ impl Engine {
     /// v26: delta 伝播 — 紐の値が変わった時にペアテーブルに反映。
     #[cfg(feature = "v26")]
     pub fn apply_pair_delta(&mut self, eid: u32, himo_idx: usize, old_val: u32, new_val: u32) {
-        let other_values: Vec<(usize, u32)> = (0..self.himos.len())
-            .filter(|&i| i != himo_idx)
-            .filter_map(|i| self.himos[i].get_value(eid).map(|v| (i, v)))
-            .collect();
+        let other_values = self.collect_other_values(eid, himo_idx);
         self.pairs.apply_delta(eid, himo_idx, old_val, new_val, &other_values);
+    }
+
+    /// v26: 他紐の現在値を収集
+    #[cfg(feature = "v26")]
+    fn collect_other_values(&self, eid: u32, exclude_himo: usize) -> Vec<(usize, u32)> {
+        (0..self.himos.len())
+            .filter(|&i| i != exclude_himo)
+            .filter_map(|i| self.himos[i].get_value(eid).map(|v| (i, v)))
+            .collect()
     }
 
     /// 引く。delta が空なら Cylinder 直返し（ゼロコピー）。
