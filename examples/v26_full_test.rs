@@ -76,7 +76,7 @@ fn main() {
 
         let old_x = db.get(0, "x").unwrap();
         db.tie(0, "x", 2);
-        db.update_pair_tie(0, db.himo_id("x").unwrap(), old_x, 2);
+        db.apply_pair_delta(0, db.himo_id("x").unwrap(), old_x, 2);
 
         let after_old = db.query(&[("x", 0), ("y", 0)]);
         assert_test!("更新後 x=0,y=0 から entity 0 消えた", !after_old.contains(&0));
@@ -108,7 +108,7 @@ fn main() {
         // 変更してrollback（Column + PairTable 両方）
         let old_a = db.get(0, "a").unwrap();
         db.tie(0, "a", 4);
-        db.update_pair_tie(0, db.himo_id("a").unwrap(), old_a, 4);
+        db.apply_pair_delta(0, db.himo_id("a").unwrap(), old_a, 4);
         // rollback: Column を手動で戻す + rebuild で復元
         db.tie(0, "a", old_a);
         db.rebuild();
@@ -120,8 +120,8 @@ fn main() {
         // 変更して commit
         let old_a = db.get(5, "a").unwrap();
         db.tie(5, "a", 3);
-        db.update_pair_tie(5, db.himo_id("a").unwrap(), old_a, 3);
-        db.compact_pairs();
+        db.apply_pair_delta(5, db.himo_id("a").unwrap(), old_a, 3);
+        db.rebuild_pairs();
 
         // compact 後もクエリ結果は正しい
         let after_compact = db.query(&[("a", 3), ("b", 0)]);
@@ -155,9 +155,9 @@ fn main() {
             let old = db.get(eid, "x").unwrap();
             let new_v = (old + 1) % 10;
             db.tie(eid, "x", new_v);
-            db.update_pair_tie(eid, x_idx, old, new_v);
+            db.apply_pair_delta(eid, x_idx, old, new_v);
         }
-        db.compact_pairs();
+        db.rebuild_pairs();
 
         // rebuild して比較: ペアテーブルの差分更新結果 vs フル rebuild 結果
         let q1 = db.query(&[("x", 1), ("y", 3)]);
@@ -201,7 +201,7 @@ fn main() {
         for new_v in 1..100u32 {
             let old = new_v - 1;
             db.tie(e, "val", new_v);
-            db.update_pair_tie(e, val_idx, old, new_v);
+            db.apply_pair_delta(e, val_idx, old, new_v);
         }
 
         let r = db.query(&[("val", 99), ("grp", 0)]);
@@ -210,7 +210,7 @@ fn main() {
         let r = db.query(&[("val", 0), ("grp", 0)]);
         assert_test!("100回更新後に旧位置は空", r.is_empty());
 
-        db.compact_pairs();
+        db.rebuild_pairs();
     }
 
     // ================================================================
@@ -338,12 +338,12 @@ fn main() {
             let old = db.get(i, "dept").unwrap();
             let new_v = (old + 1) % 8;
             db.tie(i, "dept", new_v);
-            db.update_pair_tie(i, dept_idx, old, new_v);
+            db.apply_pair_delta(i, dept_idx, old, new_v);
         }
         println!("  差分更新 {}件: {:?} ({:?}/件)", update_n, t.elapsed(), t.elapsed() / update_n);
 
         let t = Instant::now();
-        db.compact_pairs();
+        db.rebuild_pairs();
         println!("  commit: {:?}", t.elapsed());
     }
 
@@ -419,7 +419,7 @@ fn main() {
         let eid = active_t0[0];
         let status_idx = db.himo_id("status").unwrap();
         db.tie(eid, "status", 2); // suspended
-        db.update_pair_tie(eid, status_idx, 0, 2);
+        db.apply_pair_delta(eid, status_idx, 0, 2);
 
         let active_after = db.query(&[("tenant", 0), ("status", 0)]);
         assert_test!("ステータス変更後 アクティブ29人", active_after.len() == 29);
@@ -427,7 +427,7 @@ fn main() {
         let suspended = db.query(&[("tenant", 0), ("status", 2)]);
         assert_test!("サスペンド1人", suspended.len() == 1);
 
-        db.compact_pairs();
+        db.rebuild_pairs();
     }
 
     // ================================================================

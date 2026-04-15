@@ -114,9 +114,61 @@ db.rebuild();                        // ロックフリー（compare_exchange排
 | `flush` | `&mut` | 永続化 |
 
 ## クエリ戦略（自動選択）
+
+### v24（デフォルト）
 1. **全条件bitmap有** → bitmap AND（非選択的クエリ ~5μs）
 2. **それ以外** → 最小Cylinderスライスpull + Column直読みフィルタ（選択的 ~2-12μs）
 3. **1条件** → Cylinder slice_one 直返し（10ns）
+
+### v26（`--features v26`）
+ペアテーブル + デルタシンクによる高速クエリ。v24 の上に積む。
+
+```toml
+enchudb = { path = "../enchudb", features = ["v26"] }
+```
+
+```rust
+db.rebuild();
+db.rebuild_pairs();  // ペアテーブル構築（rebuild 後に呼ぶ）
+
+// クエリは同じ API。内部でペアテーブルを自動選択
+let result = db.query(&[("tenant", 3), ("dept", 2), ("status", 1)]);
+
+// 差分更新（tie のたびにペアテーブルを即時更新）
+let old_val = db.get(eid, "dept").unwrap();
+db.tie(eid, "dept", new_val);
+db.update_pair_tie(eid, db.himo_id("dept").unwrap(), old_val, new_val);
+
+// compact（デルタをベースに統合）
+db.compact_pairs();
+```
+
+#### 戦略
+1. **2条件以上** → 全紐ペアテーブルから最小セルを O(1) 選択 → 残りは Column 直読みフィルタ
+2. **ペアテーブルより Cylinder スライスが小さい場合** → v24 パスに fallthrough
+3. **1条件** → Cylinder slice_one 直返し（v24 と同じ）
+
+#### 速度（100万 entity, 7紐）
+| クエリ | v24 | v26 | 倍率 |
+|---|---|---|---|
+| 自社+部署+ステータス | 19.8μs | 69ns | 287x |
+| 5条件全部 | 37.2μs | 79ns | 471x |
+| 自社+給与帯 | 1.8μs | 72ns | 25x |
+| 7条件全部 | 1.8μs | 99ns | 18x |
+| ミス | 1.8μs | 50ns | 36x |
+
+#### ペアテーブルの仕組み
+- rebuild_pairs で全紐ペアの二次元テーブルを構築
+- セル = (紐A の値, 紐B の値) → ソート済み entity リスト (Vec<u32>)
+- define_himo で max_values 指定した紐のみ対象
+- セル数 100万超のペアはスキップ
+- デルタシンク: adds/removes リストで差分管理、compact でベースに統合
+- 差分更新: 164ns/件
+
+#### メモリ
+- 100万 entity: 約 60MB（ペアテーブル全体）
+- entity 数とペア数に比例
+- mmap ではなくヒープ上（揮発、open 時に rebuild_pairs で再構築）
 
 ## クエリ言語（REPL用）
 ```rust
@@ -144,10 +196,32 @@ let result = execute(&mut db, "age:30 city:\"東京\" | count");
 概念を説明する時はAPIメソッド名を使わない。「ぶら下げる」「引く」で統一。
 
 ## 設計原則
-- **紐が本質、円柱はキャッシュ。** Column（紐）がソースオブトゥルース。Cylinderはrebuildで構築されるキャッシュ。
+- **紐が本質、円柱はキャッシュ。** Column（紐）がソースオブトゥルース。Cylinderはrebuildで構築されるキャッシュ。ペアテーブルもキャッシュ。
 - **伝播はEnchuの仕事ではない。** JOIN相当の伝播はRavn（クエリ言語）が担当。
 - **単一ファイル、全mmap。** 1つのスパースファイルに全領域配置。仮想サイズ大、実ディスク使用量は書いたページ分だけ。
 - **ロックフリー並行。** ダブルバッファCylinder + AtomicBool swap。rebuild中もreaderは止まらない。
+- **HashMap 不使用。** 紐名の解決は線形探索（himo_id）。紐数は高々数百なので十分速い。
+
+## アーキテクチャ（v26）
+```
+tie(entity, himo, value)
+  ↓
+Column（ソースオブトゥルース）→ mmap 永続化
+  ↓ rebuild
+Cylinder（1次元キャッシュ）→ mmap ダブルバッファ
+  ↓ rebuild_pairs
+PairTable（2次元キャッシュ）→ ヒープ（揮発）
+  ↓ update_pair_tie
+デルタシンク（即時反映）→ adds/removes → compact
+```
+
+### v26 で試して却下したもの
+- CAS（コンテンツアドレッサブル）→ to_vec + hash 再計算で 46μs/件。デルタシンクの 164ns に負け
+- 多次元ビットマップ Cylinder → 24GB メモリ爆発
+- リンクドリスト（v20 Reverse）→ remove O(k) で遅い
+- Z-order 曲線（v6）→ exact match にはペアテーブルが速い
+- ペアセル同士の sorted intersect → Column 直読みの 8 倍遅い
+- フーリエ変換 → 交差（積）を速くする道具ではない
 
 ## 制約
 - `tie()` の value は `< u32::MAX`（u32::MAX は sentinel 予約）

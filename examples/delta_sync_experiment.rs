@@ -310,7 +310,7 @@ fn main() {
         let old = db.get(i, "a").unwrap();
         let new_v = (old + 1) % cardinalities[0];
         db.tie(i, "a", new_v);
-        db.update_pair_tie(i, a_idx, old, new_v);
+        db.apply_pair_delta(i, a_idx, old, new_v);
     }
     let cas_time = t.elapsed();
     println!("CAS更新 {}件: {:?} ({:?}/件)", update_n, cas_time, cas_time / update_n);

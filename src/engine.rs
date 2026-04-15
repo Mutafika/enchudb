@@ -286,70 +286,14 @@ impl Layout {
 
 // ════════════════ Engine ════════════════
 
-/// v26 デルタセル: ベースリスト + adds/removes で差分管理。
-/// 43ns/件のリアルタイム更新。定期 compact でクエリ速度維持。
-#[cfg(feature = "v26")]
-struct DeltaCell {
-    base: Vec<u32>,
-    adds: Vec<u32>,
-    removes: Vec<u32>,
-}
-
-#[cfg(feature = "v26")]
-impl DeltaCell {
-    #[inline]
-    fn add(&mut self, eid: u32) {
-        if let Some(pos) = self.removes.iter().position(|&e| e == eid) {
-            self.removes.swap_remove(pos);
-            return;
-        }
-        self.adds.push(eid);
-    }
-
-    #[inline]
-    fn remove(&mut self, eid: u32) {
-        if let Some(pos) = self.adds.iter().position(|&e| e == eid) {
-            self.adds.swap_remove(pos);
-            return;
-        }
-        self.removes.push(eid);
-    }
-
-    #[inline]
-    fn is_clean(&self) -> bool {
-        self.adds.is_empty() && self.removes.is_empty()
-    }
-
-    #[inline]
-    fn len_approx(&self) -> usize {
-        self.base.len() + self.adds.len() - self.removes.len()
-    }
-
-    fn compact(&mut self) {
-        if self.is_clean() { return; }
-        let mut result: Vec<u32> = self.base.iter()
-            .filter(|e| !self.removes.contains(e))
-            .copied()
-            .collect();
-        for &eid in &self.adds {
-            match result.binary_search(&eid) {
-                Ok(_) => {},
-                Err(pos) => result.insert(pos, eid),
-            }
-        }
-        self.base = result;
-        self.adds.clear();
-        self.removes.clear();
-    }
-}
-
+/// v26 ペアテーブル: ソート済み Vec<u32> セル。delta で直接操作。
 #[cfg(feature = "v26")]
 struct PairEntry {
     himo_a: usize,
     himo_b: usize,
     card_a: u32,
     card_b: u32,
-    cells: Vec<DeltaCell>,
+    cells: Vec<Vec<u32>>,
 }
 
 #[cfg(feature = "v26")]
@@ -364,12 +308,12 @@ impl PairTable {
     }
 
     /// 条件リストから最小候補のペアを引く。
-    fn best_lookup(&self, conds: &[(usize, u32)]) -> Option<(Vec<u32>, Vec<(usize, u32)>)> {
+    fn best_lookup<'a>(&'a self, conds: &[(usize, u32)]) -> Option<(&'a [u32], Vec<(usize, u32)>)> {
         if conds.len() < 2 { return None; }
-        let mut best_idx: Option<(usize, usize)> = None; // (pair_idx, cell_id)
+        let mut best: Option<(&[u32], Vec<(usize, u32)>)> = None;
         let mut best_len = usize::MAX;
 
-        for (pi, pair) in self.pairs.iter().enumerate() {
+        for pair in &self.pairs {
             let mut va = None;
             let mut vb = None;
             for &(idx, val) in conds {
@@ -379,51 +323,48 @@ impl PairTable {
             if let (Some(a), Some(b)) = (va, vb) {
                 let cell_id = a as usize * pair.card_b as usize + b as usize;
                 if cell_id < pair.cells.len() {
-                    let len = pair.cells[cell_id].len_approx();
-                    if len == 0 {
-                        return Some((vec![], conds.to_vec()));
+                    let cell = &pair.cells[cell_id];
+                    if cell.is_empty() {
+                        return Some((&[], conds.to_vec()));
                     }
-                    if len < best_len {
-                        best_len = len;
-                        best_idx = Some((pi, cell_id));
+                    if cell.len() < best_len {
+                        best_len = cell.len();
+                        let remaining: Vec<(usize, u32)> = conds.iter()
+                            .filter(|&&(idx, _)| idx != pair.himo_a && idx != pair.himo_b)
+                            .copied()
+                            .collect();
+                        best = Some((cell, remaining));
                     }
                 }
             }
         }
-
-        let (pi, cell_id) = best_idx?;
-        let pair = &self.pairs[pi];
-        let cell = &pair.cells[cell_id];
-        let candidates = if cell.is_clean() {
-            cell.base.clone()
-        } else {
-            // merged を構築
-            let mut result: Vec<u32> = cell.base.iter()
-                .filter(|e| !cell.removes.contains(e))
-                .copied()
-                .collect();
-            for &eid in &cell.adds {
-                match result.binary_search(&eid) {
-                    Ok(_) => {},
-                    Err(pos) => result.insert(pos, eid),
-                }
-            }
-            result
-        };
-        let remaining: Vec<(usize, u32)> = conds.iter()
-            .filter(|&&(idx, _)| idx != pair.himo_a && idx != pair.himo_b)
-            .copied()
-            .collect();
-        Some((candidates, remaining))
+        best
     }
 
-    /// tie で entity の紐の値が変わった時の差分更新。O(ペア数)。
-    fn update_tie(&mut self, eid: u32, himo_idx: usize, old_val: u32, new_val: u32, other_values: &[(usize, u32)]) {
-        for pair in &mut self.pairs {
-            let (is_a, other_himo) = if pair.himo_a == himo_idx {
-                (true, pair.himo_b)
-            } else if pair.himo_b == himo_idx {
-                (false, pair.himo_a)
+    /// delta 反映: セルに entity を追加
+    fn cell_add(&mut self, pair_idx: usize, cell_id: usize, eid: u32) {
+        let cell = &mut self.pairs[pair_idx].cells[cell_id];
+        match cell.binary_search(&eid) {
+            Ok(_) => {},
+            Err(pos) => cell.insert(pos, eid),
+        }
+    }
+
+    /// delta 反映: セルから entity を除去
+    fn cell_remove(&mut self, pair_idx: usize, cell_id: usize, eid: u32) {
+        let cell = &mut self.pairs[pair_idx].cells[cell_id];
+        if let Ok(pos) = cell.binary_search(&eid) {
+            cell.remove(pos);
+        }
+    }
+
+    /// delta 伝播: 紐の値が変わった時に該当セルを更新
+    fn apply_delta(&mut self, eid: u32, himo_idx: usize, old_val: u32, new_val: u32, other_values: &[(usize, u32)]) {
+        for pi in 0..self.pairs.len() {
+            let (is_a, other_himo) = if self.pairs[pi].himo_a == himo_idx {
+                (true, self.pairs[pi].himo_b)
+            } else if self.pairs[pi].himo_b == himo_idx {
+                (false, self.pairs[pi].himo_a)
             } else {
                 continue;
             };
@@ -433,15 +374,15 @@ impl PairTable {
                 None => continue,
             };
 
-            let card_b = pair.card_b;
+            let card_b = self.pairs[pi].card_b;
 
             let old_cell_id = if is_a {
                 old_val as usize * card_b as usize + other_val as usize
             } else {
                 other_val as usize * card_b as usize + old_val as usize
             };
-            if old_cell_id < pair.cells.len() {
-                pair.cells[old_cell_id].remove(eid);
+            if old_cell_id < self.pairs[pi].cells.len() {
+                self.cell_remove(pi, old_cell_id, eid);
             }
 
             let new_cell_id = if is_a {
@@ -449,17 +390,8 @@ impl PairTable {
             } else {
                 other_val as usize * card_b as usize + new_val as usize
             };
-            if new_cell_id < pair.cells.len() {
-                pair.cells[new_cell_id].add(eid);
-            }
-        }
-    }
-
-    /// 全セルの compact（デルタをベースに統合）
-    fn compact(&mut self) {
-        for pair in &mut self.pairs {
-            for cell in &mut pair.cells {
-                cell.compact();
+            if new_cell_id < self.pairs[pi].cells.len() {
+                self.cell_add(pi, new_cell_id, eid);
             }
         }
     }
@@ -972,31 +904,21 @@ impl Engine {
                     raw[va as usize * card_b as usize + vb as usize].push(eid);
                 }
 
-                let cells: Vec<DeltaCell> = raw.into_iter().map(|list| {
-                    DeltaCell { base: list, adds: vec![], removes: vec![] }
-                }).collect();
-
-                pairs.push(PairEntry { himo_a: a, himo_b: b, card_a, card_b, cells });
+                pairs.push(PairEntry { himo_a: a, himo_b: b, card_a, card_b, cells: raw });
             }
         }
 
         self.pairs = PairTable { pairs };
     }
 
-    /// v26: tie 後にペアテーブルをデルタ差分更新。43ns/件。
+    /// v26: delta 伝播 — 紐の値が変わった時にペアテーブルに反映。
     #[cfg(feature = "v26")]
-    pub fn update_pair_tie(&mut self, eid: u32, himo_idx: usize, old_val: u32, new_val: u32) {
+    pub fn apply_pair_delta(&mut self, eid: u32, himo_idx: usize, old_val: u32, new_val: u32) {
         let other_values: Vec<(usize, u32)> = (0..self.himos.len())
             .filter(|&i| i != himo_idx)
             .filter_map(|i| self.himos[i].get_value(eid).map(|v| (i, v)))
             .collect();
-        self.pairs.update_tie(eid, himo_idx, old_val, new_val, &other_values);
-    }
-
-    /// v26: ペアテーブルの compact（デルタをベースに統合）
-    #[cfg(feature = "v26")]
-    pub fn compact_pairs(&mut self) {
-        self.pairs.compact();
+        self.pairs.apply_delta(eid, himo_idx, old_val, new_val, &other_values);
     }
 
     /// 引く。delta が空なら Cylinder 直返し（ゼロコピー）。
@@ -1108,10 +1030,10 @@ impl Engine {
             if let Some((candidates, remaining)) = self.pairs.best_lookup(&conds) {
                 if candidates.len() <= min_slice_len {
                     if remaining.is_empty() {
-                        return candidates;
+                        return candidates.to_vec();
                     }
                     let mut result = Vec::new();
-                    for &eid in &candidates {
+                    for &eid in candidates {
                         let mut pass = true;
                         for &(idx, val) in &remaining {
                             if !self.himos[idx].value_eq(eid, val) {

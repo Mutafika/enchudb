@@ -41,18 +41,18 @@ fn main() {
         db.tie(i, "a", (old + 10 - 1) % 10);
     }
 
-    // update_pair_tie だけの速度
+    // apply_pair_delta だけの速度
     let a_idx = db.himo_id("a").unwrap();
     let t = Instant::now();
     for i in 0..1000u32 {
         let old = db.get(i, "a").unwrap();
         let new_v = (old + 1) % 10;
-        db.update_pair_tie(i, a_idx, old, new_v);
+        db.apply_pair_delta(i, a_idx, old, new_v);
         // Column も更新しないと次のイテレーションで get が古い値返す
         db.tie(i, "a", new_v);
     }
     let update_time = t.elapsed();
-    println!("update_pair_tie + tie 1000件: {:?} ({:?}/件)", update_time, update_time / 1000);
+    println!("apply_pair_delta + tie 1000件: {:?} ({:?}/件)", update_time, update_time / 1000);
 
     // rebuild_pairs 全体の速度（比較用）
     let t = Instant::now();

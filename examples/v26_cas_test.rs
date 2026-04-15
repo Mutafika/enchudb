@@ -40,7 +40,7 @@ fn main() {
         // Column を更新
         db.tie(eid, "city", new_val);
         // ペアテーブルを差分更新
-        db.update_pair_tie(eid, db.himo_id("city").unwrap(), old_val, new_val);
+        db.apply_pair_delta(eid, db.himo_id("city").unwrap(), old_val, new_val);
 
         let r = db.query(&[("city", 0), ("dept", 0)]);
         println!("city=0, dept=0: {:?} (entity 0 がいなくなったはず)", r);
@@ -57,8 +57,8 @@ fn main() {
 
         // === 再度更新して commit ===
         println!("\n=== 再更新 + commit ===");
-        db.update_pair_tie(eid, db.himo_id("city").unwrap(), old_val, new_val);
-        db.compact_pairs();
+        db.apply_pair_delta(eid, db.himo_id("city").unwrap(), old_val, new_val);
+        db.rebuild_pairs();
         println!("commit 完了");
 
         let r = db.query(&[("city", 0), ("dept", 0)]);
@@ -95,14 +95,14 @@ fn main() {
             let old = db2.get(i, "dept").unwrap();
             let new_v = (old + 1) % 8;
             db2.tie(i, "dept", new_v);
-            db2.update_pair_tie(i, dept_idx, old, new_v);
+            db2.apply_pair_delta(i, dept_idx, old, new_v);
         }
         let elapsed = t.elapsed();
         println!("差分更新 1000件: {:?} ({:?}/件)", elapsed, elapsed / 1000);
 
         // commit
         let t = Instant::now();
-        db2.compact_pairs();
+        db2.rebuild_pairs();
         println!("commit: {:?}", t.elapsed());
 
         // クエリ確認
