@@ -294,13 +294,23 @@ impl HimoStore {
 // ════════════════ v27 実装 ════════════════
 //
 // BucketCylinder を直接積む。ダブルバッファ/delta/bitmap は全廃。
-// 注意: BucketCylinder::insert/remove は &mut self。単一スレッド前提。
-// Engine を Arc 共有する並行書き込みは v27 v1 では未サポート。
+//
+// 並行性:
+//   BucketCylinder は RwLock で保護。
+//   - set/remove/restore は write lock を取る
+//   - pull/slice_one は read lock を取り、Vec<u32> を clone して返す(slice 返しは不可)
+//   Engine を Arc<Engine> で複数 thread から共有可能(tie_async + 並行 reader)。
+//   Column は UnsafeCell のまま(atomic-size = 4byte、Column::set/clear は単一 writer
+//   を仮定しているが、write path が consumer thread 1 本 + 同期 tie が &mut self
+//   なので競合しない)。
+
+#[cfg(feature = "v27")]
+use std::sync::RwLock;
 
 #[cfg(feature = "v27")]
 pub struct HimoStore {
     col: UnsafeCell<Column>,
-    cyl: UnsafeCell<BucketCylinder>,
+    cyl: RwLock<BucketCylinder>,
     pub himo_type: HimoType,
     pub max_values: u32,
 }
@@ -318,7 +328,7 @@ impl HimoStore {
         let cyl = BucketCylinder::new(effective_max, max_entities);
         Self {
             col: UnsafeCell::new(col),
-            cyl: UnsafeCell::new(cyl),
+            cyl: RwLock::new(cyl),
             himo_type: ht,
             max_values,
         }
@@ -332,7 +342,7 @@ impl HimoStore {
         cyl.rebuild_from_column(&col);
         Self {
             col: UnsafeCell::new(col),
-            cyl: UnsafeCell::new(cyl),
+            cyl: RwLock::new(cyl),
             himo_type: ht,
             max_values,
         }
@@ -340,22 +350,18 @@ impl HimoStore {
 
     fn col(&self) -> &Column { unsafe { &*self.col.get() } }
 
-    pub fn cylinder(&self) -> &BucketCylinder { unsafe { &*self.cyl.get() } }
-
-    fn cyl_mut(&self) -> &mut BucketCylinder { unsafe { &mut *self.cyl.get() } }
-
     // ──── ぶら下げる / 外す ────
 
     pub fn set(&self, eid: u32, value: u32) {
         self.col().ensure_count(eid);
         self.col().set(eid, &(value + 1).to_le_bytes());
-        self.cyl_mut().insert(eid, value);
+        self.cyl.write().unwrap().insert(eid, value);
     }
 
     pub fn remove(&self, eid: u32) {
         if eid < self.col().count() {
             self.col().clear(eid);
-            self.cyl_mut().remove(eid);
+            self.cyl.write().unwrap().remove(eid);
         }
     }
 
@@ -381,17 +387,34 @@ impl HimoStore {
         self.col().ensure_count(eid);
         let stored = u32::from_le_bytes(*old_bytes);
         self.col().set(eid, old_bytes);
+        let mut cyl = self.cyl.write().unwrap();
         if stored == 0 {
-            self.cyl_mut().remove(eid);
+            cyl.remove(eid);
         } else {
-            self.cyl_mut().insert(eid, stored - 1);
+            cyl.insert(eid, stored - 1);
         }
     }
 
     // ──── 引く ────
 
-    pub fn pull(&self, value: u32) -> &[u32] {
-        self.cylinder().slice_one(value)
+    /// 値に合致する entity を Vec<u32> で返す(read lock 下でクローン)。
+    pub fn pull(&self, value: u32) -> Vec<u32> {
+        self.cyl.read().unwrap().slice_one(value).to_vec()
+    }
+
+    /// 同上だが長さだけ。プランナー用。
+    pub fn slice_len(&self, value: u32) -> usize {
+        self.cyl.read().unwrap().slice_one(value).len()
+    }
+
+    /// 入っている値を列挙(順序は保証しない)。
+    pub fn unique_values(&self) -> Vec<u32> {
+        self.cyl.read().unwrap().unique_values()
+    }
+
+    /// 総件数。
+    pub fn total(&self) -> usize {
+        self.cyl.read().unwrap().total()
     }
 
     pub fn delta_eids(&self) -> &[u32] { &[] }

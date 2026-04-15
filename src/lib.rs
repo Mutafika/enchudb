@@ -23,6 +23,8 @@ pub mod undo;
 pub mod engine;
 pub mod query_lang;
 pub mod cas;
+#[cfg(feature = "v27")]
+pub mod write_queue;
 
 pub use engine::{Engine, EntityValue};
 pub use himo_store::HimoType;

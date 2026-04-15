@@ -669,6 +669,15 @@ pub struct Engine {
     pairs: PairTable,
     #[cfg(feature = "v27")]
     tuples: NTupleTable,
+    /// 非同期書き込みキュー。`create_concurrent` で有効化される。
+    #[cfg(feature = "v27")]
+    write_queue: Option<std::sync::Arc<crate::write_queue::WriteQueue>>,
+    /// consumer スレッドへの shutdown 通知。`Drop` で true に。
+    #[cfg(feature = "v27")]
+    shutdown_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// consumer スレッドハンドル。Drop で join。
+    #[cfg(feature = "v27")]
+    consumer_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     backing: Backing, // 最後に drop されるよう最終フィールド
 }
 
@@ -776,6 +785,12 @@ impl Engine {
             pairs: PairTable::new(),
             #[cfg(feature = "v27")]
             tuples: NTupleTable::new(),
+            #[cfg(feature = "v27")]
+            write_queue: None,
+            #[cfg(feature = "v27")]
+            shutdown_flag: None,
+            #[cfg(feature = "v27")]
+            consumer_handle: std::sync::Mutex::new(None),
             backing: Backing::Mmap(mmap),
         })
     }
@@ -894,6 +909,12 @@ impl Engine {
             pairs: PairTable::new(),
             #[cfg(feature = "v27")]
             tuples: NTupleTable::new(),
+            #[cfg(feature = "v27")]
+            write_queue: None,
+            #[cfg(feature = "v27")]
+            shutdown_flag: None,
+            #[cfg(feature = "v27")]
+            consumer_handle: std::sync::Mutex::new(None),
             backing,
         };
 
@@ -1103,10 +1124,10 @@ impl Engine {
     /// 紐の文脈で文字列のvocab IDを探す。その紐にぶら下がってる値だけ調べる。
     pub fn find_value(&self, himo: &str, text: &str) -> Option<u32> {
         let hid = self.himo_id(himo)?;
-        let cyl = self.himos[hid].cylinder();
         let text_bytes = text.as_bytes();
         #[cfg(not(feature = "v27"))]
         let vals = {
+            let cyl = self.himos[hid].cylinder();
             let n = cyl.total();
             if n == 0 {
                 let delta = self.himos[hid].delta_eids();
@@ -1122,7 +1143,7 @@ impl Engine {
             cyl.unique_values(n)
         };
         #[cfg(feature = "v27")]
-        let vals = cyl.unique_values();
+        let vals = self.himos[hid].unique_values();
         for vid in vals {
             if self.vocab.get(vid) == text_bytes {
                 return Some(vid);
@@ -1389,6 +1410,10 @@ impl Engine {
 
     /// 引く。delta が空なら Cylinder 直返し（ゼロコピー）。
     /// delta があれば補正した Vec を返す。
+    ///
+    /// v27: `Vec<u32>` を返す(内部 RwLock 下で clone、Arc<Engine> で並行 read 可能)。
+    /// v24/v26: `&[u32]` を返す(ゼロコピー)。
+    #[cfg(not(feature = "v27"))]
     pub fn pull_raw(&self, himo: &str, value: u32) -> &[u32] {
         match self.himo_id(himo) {
             Some(idx) => {
@@ -1403,7 +1428,17 @@ impl Engine {
         }
     }
 
+    /// v27 版: 並行 read 安全のため Vec<u32> を返す。
+    #[cfg(feature = "v27")]
+    pub fn pull_raw(&self, himo: &str, value: u32) -> Vec<u32> {
+        match self.himo_id(himo) {
+            Some(idx) => self.himos[idx].pull(value),
+            None => Vec::new(),
+        }
+    }
+
     /// 引く（delta 補正付き、Vec を返す）。
+    #[cfg(not(feature = "v27"))]
     pub fn pull(&self, himo: &str, value: u32) -> Vec<u32> {
         let idx = match self.himo_id(himo) {
             Some(idx) => idx,
@@ -1423,6 +1458,15 @@ impl Engine {
         let cyl_result = hs.cylinder().slice_one(value);
         let delta = hs.delta_eids();
         self.apply_delta(idx, value, cyl_result, delta)
+    }
+
+    /// v27 版: delta なし。HimoStore::pull (RwLock + clone) 直。
+    #[cfg(feature = "v27")]
+    pub fn pull(&self, himo: &str, value: u32) -> Vec<u32> {
+        match self.himo_id(himo) {
+            Some(idx) => self.himos[idx].pull(value),
+            None => Vec::new(),
+        }
     }
 
     /// Cylinder 結果に delta を適用。
@@ -1475,18 +1519,28 @@ impl Engine {
         if conds.len() == 1 {
             let (idx, val) = conds[0];
             let hs = &self.himos[idx];
-            let cyl_result = hs.cylinder().slice_one(val);
-            if hs.delta_is_empty() {
-                return cyl_result.to_vec();
+            #[cfg(not(feature = "v27"))]
+            {
+                let cyl_result = hs.cylinder().slice_one(val);
+                if hs.delta_is_empty() {
+                    return cyl_result.to_vec();
+                }
+                return self.apply_delta(idx, val, cyl_result, hs.delta_eids());
             }
-            return self.apply_delta(idx, val, cyl_result, hs.delta_eids());
+            #[cfg(feature = "v27")]
+            {
+                return hs.pull(val);
+            }
         }
 
         // 最小 Cylinder スライスのサイズを調べる
         let mut min_slice_idx = 0;
         let mut min_slice_len = usize::MAX;
         for (i, &(idx, val)) in conds.iter().enumerate() {
+            #[cfg(not(feature = "v27"))]
             let len = self.himos[idx].cylinder().slice_one(val).len();
+            #[cfg(feature = "v27")]
+            let len = self.himos[idx].slice_len(val);
             if len < min_slice_len { min_slice_len = len; min_slice_idx = i; }
         }
 
@@ -1611,7 +1665,10 @@ impl Engine {
         let mut best = 0;
         let mut best_len = usize::MAX;
         for (i, &(idx, val)) in conds.iter().enumerate() {
+            #[cfg(not(feature = "v27"))]
             let len = self.himos[idx].cylinder().slice_one(val).len();
+            #[cfg(feature = "v27")]
+            let len = self.himos[idx].slice_len(val);
             if len < best_len { best_len = len; best = i; }
         }
 
@@ -1619,12 +1676,17 @@ impl Engine {
         let hs = &self.himos[pivot_idx];
 
         // pivot の候補を delta 補正して取得
-        let cyl_result = hs.cylinder().slice_one(pivot_val);
-        let candidates = if hs.delta_is_empty() {
-            cyl_result.to_vec()
-        } else {
-            self.apply_delta(pivot_idx, pivot_val, cyl_result, hs.delta_eids())
+        #[cfg(not(feature = "v27"))]
+        let candidates = {
+            let cyl_result = hs.cylinder().slice_one(pivot_val);
+            if hs.delta_is_empty() {
+                cyl_result.to_vec()
+            } else {
+                self.apply_delta(pivot_idx, pivot_val, cyl_result, hs.delta_eids())
+            }
         };
+        #[cfg(feature = "v27")]
+        let candidates = hs.pull(pivot_val);
 
         // 残りの条件を Column 直読みでフィルタ（Column は常に最新）
         let mut result = Vec::with_capacity(candidates.len());
@@ -1717,6 +1779,196 @@ impl Engine {
         hid
     }
 
+    // ──── v27 並行書き込み ────
+
+    /// 並行対応版の create。
+    ///
+    /// writer は `tie_async` で WriteQueue に push(~ns オーダー)、
+    /// 裏で単一 consumer スレッドが pop して HimoStore に適用する。
+    /// reader は Arc<Engine> を複数スレッドで共有し、`pull_raw`/`query` で
+    /// RwLock 越しに安全に読める。
+    ///
+    /// 戻り値は `Arc<Engine>`。define_himo など `&mut self` メソッドは
+    /// `Arc::get_mut` 経由(定義の前に呼ぶ前提)で行う、もしくは本関数の前に
+    /// `create_with_capacity` で定義済み状態を作ってから `concurrentize` する
+    /// パターンを使う。
+    #[cfg(all(feature = "v27", not(target_arch = "wasm32")))]
+    pub fn create_concurrent(path: &str, queue_cap: usize) -> io::Result<std::sync::Arc<Self>> {
+        let eng = Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)?;
+        Ok(Self::spawn_consumer(eng, queue_cap))
+    }
+
+    /// 既存の `Engine`(create や create_with_capacity で作成済み、define_himo も
+    /// 済ませたもの)を Arc 化して consumer スレッドを起動する。
+    ///
+    /// 返り値の `Arc<Engine>` を各 writer/reader スレッドで clone して使う。
+    /// Drop(最後の Arc が落ちた時)で consumer スレッドは join される。
+    #[cfg(feature = "v27")]
+    pub fn concurrentize(eng: Self, queue_cap: usize) -> std::sync::Arc<Self> {
+        Self::spawn_consumer(eng, queue_cap)
+    }
+
+    #[cfg(feature = "v27")]
+    fn spawn_consumer(mut eng: Self, queue_cap: usize) -> std::sync::Arc<Self> {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use crate::write_queue::WriteQueue;
+
+        let queue = Arc::new(WriteQueue::new(queue_cap));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        eng.write_queue = Some(queue.clone());
+        eng.shutdown_flag = Some(shutdown.clone());
+
+        let arc = Arc::new(eng);
+
+        // consumer thread は Engine の raw pointer を持つ。Engine の fields は
+        // Drop::drop の本体実行中(handle.join を待っている間)は生きているので、
+        // consumer は shutdown_flag を見て終了する。flag が立った後は
+        // Engine にアクセスしない。
+        let engine_ptr: *const Engine = Arc::as_ptr(&arc);
+        // 生ポインタを Send させるため usize にキャスト。
+        let engine_addr = engine_ptr as usize;
+        let q_for_thread = queue.clone();
+        let flag_for_thread = shutdown.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("enchudb-consumer".into())
+            .spawn(move || {
+                use std::sync::atomic::Ordering;
+                let engine: &Engine = unsafe { &*(engine_addr as *const Engine) };
+                loop {
+                    let mut drained_any = false;
+                    while let Some(op) = q_for_thread.pop() {
+                        drained_any = true;
+                        engine.apply_op(op);
+                    }
+
+                    if flag_for_thread.load(Ordering::Acquire) {
+                        // shutdown → 最後の drain
+                        while let Some(op) = q_for_thread.pop() {
+                            engine.apply_op(op);
+                        }
+                        return;
+                    }
+
+                    if !drained_any {
+                        std::thread::yield_now();
+                    }
+                }
+            })
+            .expect("failed to spawn consumer thread");
+
+        *arc.consumer_handle.lock().unwrap() = Some(handle);
+        arc
+    }
+
+    /// consumer スレッド内部で呼ぶ。Op 1 個を適用。
+    #[cfg(feature = "v27")]
+    fn apply_op(&self, op: crate::write_queue::Op) {
+        use crate::write_queue::Op;
+        match op {
+            Op::Tie { eid, himo_id, value } => {
+                let hid = himo_id as usize;
+                if hid >= self.himos.len() { return; }
+                let old_val = self.himos[hid].get_value(eid);
+                self.himos[hid].set(eid, value);
+                self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), value);
+            }
+            Op::Untie { eid, himo_id } => {
+                let hid = himo_id as usize;
+                if hid >= self.himos.len() { return; }
+                let old_val = self.himos[hid].get_value(eid);
+                self.himos[hid].remove(eid);
+                if let Some(ov) = old_val {
+                    self.apply_pair_delta_internal(eid, hid, ov, u32::MAX);
+                }
+            }
+            Op::Delete { eid } => {
+                for hid in 0..self.himos.len() {
+                    let old_val = self.himos[hid].get_value(eid);
+                    self.himos[hid].remove(eid);
+                    if let Some(ov) = old_val {
+                        self.apply_pair_delta_internal(eid, hid, ov, u32::MAX);
+                    }
+                }
+                self.entities.free(eid);
+            }
+        }
+    }
+
+    /// 非同期 tie。`create_concurrent`/`concurrentize` で有効化済みの場合のみ使える。
+    /// 紐名は事前に `define_himo` で定義されている必要がある。
+    /// queue 満杯なら spin + yield でリトライ(back-pressure)。
+    #[cfg(feature = "v27")]
+    pub fn tie_async(&self, eid: u32, himo: &str, value: u32) {
+        assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
+        let hid = self.himo_id(himo)
+            .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
+        let q = self.write_queue.as_ref()
+            .expect("tie_async requires create_concurrent or concurrentize");
+        let mut op = crate::write_queue::Op::Tie { eid, himo_id: hid as u16, value };
+        loop {
+            match q.push(op) {
+                Ok(()) => return,
+                Err(returned) => {
+                    op = returned;
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+
+    /// 非同期 untie。
+    #[cfg(feature = "v27")]
+    pub fn untie_async(&self, eid: u32, himo: &str) {
+        let hid = match self.himo_id(himo) { Some(x) => x, None => return };
+        let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
+        let mut op = crate::write_queue::Op::Untie { eid, himo_id: hid as u16 };
+        loop {
+            match q.push(op) {
+                Ok(()) => return,
+                Err(returned) => {
+                    op = returned;
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+
+    /// 非同期 delete。
+    #[cfg(feature = "v27")]
+    pub fn delete_async(&self, eid: u32) {
+        let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
+        let mut op = crate::write_queue::Op::Delete { eid };
+        loop {
+            match q.push(op) {
+                Ok(()) => return,
+                Err(returned) => {
+                    op = returned;
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+
+    /// キューが空になるまで spin 待ち。`tie_async` の同期点。
+    /// consumer スレッドの処理が追いついたら return。
+    #[cfg(feature = "v27")]
+    pub fn flush_writes(&self) {
+        if let Some(q) = self.write_queue.as_ref() {
+            while !q.is_empty() {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// キューに滞留中の件数(デバッグ用)。
+    #[cfg(feature = "v27")]
+    pub fn pending_writes(&self) -> usize {
+        self.write_queue.as_ref().map(|q| q.len()).unwrap_or(0)
+    }
+
     // ──── flush ────
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1740,6 +1992,23 @@ impl Engine {
 
         self.backing.flush_to_disk()?;
         Ok(())
+    }
+}
+
+#[cfg(feature = "v27")]
+impl Drop for Engine {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        if let Some(flag) = &self.shutdown_flag {
+            flag.store(true, Ordering::Release);
+        }
+        // consumer スレッドが weak.upgrade で None を見るまで待つのと
+        // shutdown 経由で exit するのを両方カバー。
+        if let Ok(mut h) = self.consumer_handle.lock() {
+            if let Some(handle) = h.take() {
+                let _ = handle.join();
+            }
+        }
     }
 }
 
@@ -3148,6 +3417,99 @@ mod tests {
             assert!(r.contains(&e));
         }
 
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[cfg(feature = "v27")]
+    #[test]
+    fn concurrent_tie_async_basic() {
+        // tie_async → flush_writes → pull_raw で値が見えること。
+        let dir = tmp("concurrent_basic");
+        let mut eng = Engine::create(&dir).unwrap();
+        eng.define_himo("age", HimoType::Value, 200);
+        let eids: Vec<u32> = (0..100).map(|_| eng.entity()).collect();
+
+        let arc = Engine::concurrentize(eng, 1024);
+        for (i, &e) in eids.iter().enumerate() {
+            arc.tie_async(e, "age", (i as u32) % 50);
+        }
+        arc.flush_writes();
+
+        // 各値ごとに 2 件ずつあるはず
+        for v in 0..50u32 {
+            let pulled = arc.pull_raw("age", v);
+            assert_eq!(pulled.len(), 2, "value {} expected 2 ents", v);
+        }
+        drop(arc);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[cfg(feature = "v27")]
+    #[test]
+    fn concurrent_multi_reader_writer() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = tmp("concurrent_mrw");
+        let mut eng = Engine::create(&dir).unwrap();
+        eng.define_himo("k", HimoType::Value, 16);
+        let eids: Vec<u32> = (0..1_000).map(|_| eng.entity()).collect();
+        for (i, &e) in eids.iter().enumerate() {
+            eng.tie(e, "k", (i as u32) % 16);
+        }
+
+        let arc = Engine::concurrentize(eng, 8192);
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let mut handles = Vec::new();
+        // 4 reader threads
+        for _ in 0..4 {
+            let arc = arc.clone();
+            let stop = stop.clone();
+            handles.push(thread::spawn(move || {
+                let mut ok = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    for v in 0..16u32 {
+                        let _ = arc.pull_raw("k", v);
+                        let _ = arc.query(&[("k", v)]);
+                        ok += 1;
+                    }
+                }
+                ok
+            }));
+        }
+
+        // 1 writer thread (async)
+        {
+            let arc = arc.clone();
+            let stop = stop.clone();
+            let eids = eids.clone();
+            handles.push(thread::spawn(move || {
+                let mut i = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    let e = eids[(i as usize) % eids.len()];
+                    arc.tie_async(e, "k", i % 16);
+                    i = i.wrapping_add(1);
+                }
+                i as u64
+            }));
+        }
+
+        thread::sleep(Duration::from_millis(200));
+        stop.store(true, Ordering::Relaxed);
+        for h in handles { let _ = h.join(); }
+
+        arc.flush_writes();
+        // 最終状態で全 16 値の合計が 1000 に等しいこと(値の分布は分からないが合計は保たれる)
+        let mut total = 0;
+        for v in 0..16u32 {
+            total += arc.pull_raw("k", v).len();
+        }
+        assert_eq!(total, 1000);
+
+        drop(arc);
         let _ = std::fs::remove_file(&dir);
     }
 }
