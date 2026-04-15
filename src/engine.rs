@@ -119,8 +119,15 @@ fn extract_bitmap(bitmap: &[u64]) -> Vec<u32> {
 // ════════════════ ファイルレイアウト ════════════════
 
 const FILE_MAGIC: [u8; 4] = *b"ECDB";
-const FILE_VERSION: u32 = 1;
+const FILE_VERSION: u32 = 2;
 const HEADER_SIZE: usize = 4096;
+
+/// 観測窓(view)の永続化制限。
+#[cfg(feature = "v27")]
+const MAX_PERSISTED_VIEWS: usize = 32;
+/// 1 view あたりの最大紐数(固定長レコード制約)。
+#[cfg(feature = "v27")]
+const MAX_VIEW_HIMOS: usize = 8;
 
 const DEFAULT_MAX_ENTITIES: u32 = 16_777_216;
 const DEFAULT_MAX_HIMOS: u32 = 256;
@@ -142,6 +149,20 @@ const H_HIMOREG_DATA_SIZE: usize = 44; // u64
 const H_CONTENT_DATA_SIZE: usize = 52; // u64
 const H_CYL_MAX_VALUES: usize = 60;
 const H_HIMO_TYPES: usize = 256;
+
+// v27: 観測窓(n-tuple 仮想テーブル定義)領域。
+// ヘッダ 2048.. の後半 2KB を使う。既存の himo_types/max_values 領域(256..1536, max_himos=256 時)と衝突しない。
+// フォーマット:
+//   [H_VIEW_COUNT]    u32    view 数(上限 MAX_PERSISTED_VIEWS)
+//   [H_VIEWS_OFF + i*R..] : 各 view のレコード (R = 1 + MAX_VIEW_HIMOS*2 = 17 bytes)
+//     - length: u8   (紐数、2..=MAX_VIEW_HIMOS)
+//     - himo_ids: u16 × MAX_VIEW_HIMOS  (使われない末尾は 0 埋め、length で切る)
+#[cfg(feature = "v27")]
+const H_VIEW_COUNT: usize = 2048;
+#[cfg(feature = "v27")]
+const H_VIEWS_OFF: usize = 2052;
+#[cfg(feature = "v27")]
+const VIEW_RECORD_SIZE: usize = 1 + MAX_VIEW_HIMOS * 2;
 
 fn align8(n: usize) -> usize { (n + 7) & !7 }
 
@@ -815,6 +836,13 @@ impl Engine {
         if buf.len() < HEADER_SIZE || buf[H_MAGIC..H_MAGIC + 4] != FILE_MAGIC {
             return Err("not an EnchuDB file".into());
         }
+        let version = u32::from_le_bytes(buf[H_VERSION..H_VERSION + 4].try_into().unwrap());
+        if version != FILE_VERSION {
+            return Err(format!(
+                "unsupported EnchuDB file version {} (expected {}). dev phase — recreate the DB.",
+                version, FILE_VERSION
+            ));
+        }
         let max_entities = u32::from_le_bytes(buf[H_MAX_ENTITIES..H_MAX_ENTITIES + 4].try_into().unwrap());
         let max_himos = u32::from_le_bytes(buf[H_MAX_HIMOS..H_MAX_HIMOS + 4].try_into().unwrap());
         let himo_count = u32::from_le_bytes(buf[H_HIMO_COUNT..H_HIMO_COUNT + 4].try_into().unwrap());
@@ -924,7 +952,10 @@ impl Engine {
         eng.rebuild();
 
         #[cfg(feature = "v27")]
-        eng.rebuild_pairs();
+        {
+            eng.rebuild_pairs();
+            eng.restore_persisted_views()?;
+        }
 
         Ok(eng)
     }
@@ -1331,23 +1362,46 @@ impl Engine {
         }
     }
 
-    /// 観測窓を登録。指定紐の直積セルを物化。
+    /// 観測窓(n-tuple 仮想テーブル定義)をスキーマとして永続化登録。
+    /// 以降 tie で自動反映、query で自動利用、open 後も自動復元する。
+    ///
     /// 各紐は define_himo 済み + max_values > 0 必須。セル数が 100万超ならエラー。
+    /// view 数上限 32、1 view あたり紐数上限 8(ヘッダ固定長制約)。
     #[cfg(feature = "v27")]
-    pub fn register_tuple_view(&mut self, himos: &[&str]) -> Result<(), String> {
+    pub fn define_view(&mut self, himos: &[&str]) -> Result<(), String> {
         if himos.len() < 2 {
-            return Err("tuple view requires at least 2 himos".into());
+            return Err("view requires at least 2 himos".into());
         }
+        if himos.len() > MAX_VIEW_HIMOS {
+            return Err(format!("view has too many himos (max {})", MAX_VIEW_HIMOS));
+        }
+        if self.tuples.views.len() >= MAX_PERSISTED_VIEWS {
+            return Err(format!("too many views (max {})", MAX_PERSISTED_VIEWS));
+        }
+
         let mut idxs: Vec<usize> = Vec::with_capacity(himos.len());
-        let mut cards: Vec<u32> = Vec::with_capacity(himos.len());
         for &name in himos {
             let idx = self.himo_id(name)
                 .ok_or_else(|| format!("himo '{}' not defined", name))?;
+            idxs.push(idx);
+        }
+
+        // 内部構築 → 成功したらヘッダに永続化 + 追加
+        self.build_and_push_view(&idxs)?;
+        self.persist_view_record(&idxs);
+        Ok(())
+    }
+
+    /// idxs から NTupleEntry を組み立てて tuples.views に push。永続化は呼び元。
+    #[cfg(feature = "v27")]
+    fn build_and_push_view(&mut self, idxs: &[usize]) -> Result<(), String> {
+        let mut cards: Vec<u32> = Vec::with_capacity(idxs.len());
+        for &idx in idxs {
             let mv = self.himo_max_values[idx];
             if mv == 0 {
+                let name = self.himo_names.get(idx).cloned().unwrap_or_default();
                 return Err(format!("himo '{}' has no max_values (define_himo first)", name));
             }
-            idxs.push(idx);
             cards.push(mv + 1);
         }
 
@@ -1356,7 +1410,7 @@ impl Engine {
         for &c in &cards {
             cell_count = cell_count.saturating_mul(c as u64);
             if cell_count > 1_000_000 {
-                return Err(format!("tuple view cell count exceeds 1M (got card product > 1M)"));
+                return Err("tuple view cell count exceeds 1M (got card product > 1M)".into());
             }
         }
         let cell_count = cell_count as usize;
@@ -1377,7 +1431,7 @@ impl Engine {
             if !self.entities.is_live(eid) { continue; }
             let mut vals: Vec<u32> = Vec::with_capacity(idxs.len());
             let mut all = true;
-            for &hi in &idxs {
+            for &hi in idxs {
                 match self.himos[hi].get_value(eid) {
                     Some(v) if v < self.himo_max_values[hi] + 1 => vals.push(v),
                     _ => { all = false; break; }
@@ -1394,17 +1448,72 @@ impl Engine {
                 cells[id].push(eid);
             }
         }
-        // 各セルはソート済みに保つ(insert が binary_search を使うため)
         for c in &mut cells {
             c.sort_unstable();
         }
 
         self.tuples.views.push(NTupleEntry {
-            himos: idxs,
+            himos: idxs.to_vec(),
             cards,
             strides,
             cells,
         });
+        Ok(())
+    }
+
+    /// ヘッダに 1 view レコードを append(H_VIEW_COUNT を +1)。
+    #[cfg(feature = "v27")]
+    fn persist_view_record(&mut self, idxs: &[usize]) {
+        let buf = self.backing.as_slice_mut();
+        let count = u32::from_le_bytes(buf[H_VIEW_COUNT..H_VIEW_COUNT + 4].try_into().unwrap());
+        let slot = count as usize;
+        let off = H_VIEWS_OFF + slot * VIEW_RECORD_SIZE;
+        buf[off] = idxs.len() as u8;
+        for (i, &idx) in idxs.iter().enumerate() {
+            let o = off + 1 + i * 2;
+            buf[o..o + 2].copy_from_slice(&(idx as u16).to_le_bytes());
+        }
+        // 末尾 padding は 0 のまま
+        for i in idxs.len()..MAX_VIEW_HIMOS {
+            let o = off + 1 + i * 2;
+            buf[o..o + 2].copy_from_slice(&0u16.to_le_bytes());
+        }
+        let new_count = count + 1;
+        buf[H_VIEW_COUNT..H_VIEW_COUNT + 4].copy_from_slice(&new_count.to_le_bytes());
+    }
+
+    /// open 時: ヘッダから view を読み出して NTupleEntry を再構築。
+    #[cfg(feature = "v27")]
+    fn restore_persisted_views(&mut self) -> Result<(), String> {
+        let buf = self.backing.as_slice_mut();
+        let count = u32::from_le_bytes(buf[H_VIEW_COUNT..H_VIEW_COUNT + 4].try_into().unwrap()) as usize;
+        if count == 0 { return Ok(()); }
+        if count > MAX_PERSISTED_VIEWS {
+            return Err(format!("persisted view count {} exceeds max {}", count, MAX_PERSISTED_VIEWS));
+        }
+
+        let mut all_idxs: Vec<Vec<usize>> = Vec::with_capacity(count);
+        for slot in 0..count {
+            let off = H_VIEWS_OFF + slot * VIEW_RECORD_SIZE;
+            let length = buf[off] as usize;
+            if length < 2 || length > MAX_VIEW_HIMOS {
+                return Err(format!("persisted view {} has invalid length {}", slot, length));
+            }
+            let mut idxs: Vec<usize> = Vec::with_capacity(length);
+            for i in 0..length {
+                let o = off + 1 + i * 2;
+                let hid = u16::from_le_bytes(buf[o..o + 2].try_into().unwrap()) as usize;
+                if hid >= self.himos.len() {
+                    return Err(format!("persisted view {} references unknown himo id {}", slot, hid));
+                }
+                idxs.push(hid);
+            }
+            all_idxs.push(idxs);
+        }
+
+        for idxs in all_idxs {
+            self.build_and_push_view(&idxs)?;
+        }
         Ok(())
     }
 
@@ -3259,7 +3368,7 @@ mod tests {
             eng.tie(e, "dept", (i * 3) % 8);
             eng.tie(e, "status", (i * 5) % 4);
         }
-        eng.register_tuple_view(&["tenant", "dept", "status"]).unwrap();
+        eng.define_view(&["tenant", "dept", "status"]).unwrap();
 
         // 登録後も tie で自動更新
         let e = eng.entity();
@@ -3295,7 +3404,7 @@ mod tests {
             eng.tie(e, "d", (i * 7) % 4);
         }
         // 3紐登録、クエリは4条件(1つは残り条件として Column フィルタ)
-        eng.register_tuple_view(&["a", "b", "c"]).unwrap();
+        eng.define_view(&["a", "b", "c"]).unwrap();
 
         let r = eng.query(&[("a", 2), ("b", 6), ("c", 2), ("d", 0)]);
         let expected: Vec<u32> = (0..200u32)
@@ -3321,7 +3430,7 @@ mod tests {
         eng.tie(e1, "x", 2);
         eng.tie(e1, "y", 3);
 
-        eng.register_tuple_view(&["x", "y"]).unwrap();
+        eng.define_view(&["x", "y"]).unwrap();
         assert_eq!(eng.query(&[("x", 2), ("y", 3)]).len(), 2);
 
         eng.untie(e0, "x");
@@ -3351,7 +3460,7 @@ mod tests {
         eng.tie(e1, "x", 1);
         eng.tie(e1, "y", 1);
 
-        eng.register_tuple_view(&["x", "y"]).unwrap();
+        eng.define_view(&["x", "y"]).unwrap();
         assert_eq!(eng.query(&[("x", 1), ("y", 1)]).len(), 2);
 
         eng.delete(e0);
@@ -3370,7 +3479,7 @@ mod tests {
         eng.define_himo("b", HimoType::Value, 1000);
         eng.define_himo("c", HimoType::Value, 100);
         // 1001 * 1001 * 101 = ~101M > 1M
-        let r = eng.register_tuple_view(&["a", "b", "c"]);
+        let r = eng.define_view(&["a", "b", "c"]);
         assert!(r.is_err());
 
         let _ = std::fs::remove_file(&dir);
@@ -3384,7 +3493,7 @@ mod tests {
         let e = eng.entity();
         eng.tie(e, "foo", 1); // max_values=0 のまま自動作成
         eng.tie(e, "bar", 2);
-        let r = eng.register_tuple_view(&["foo", "bar"]);
+        let r = eng.define_view(&["foo", "bar"]);
         assert!(r.is_err());
 
         let _ = std::fs::remove_file(&dir);
@@ -3405,7 +3514,7 @@ mod tests {
             eng.tie(e, "b", (i / 4) % 4);
             eng.tie(e, "c", (i / 16) % 4);
         }
-        eng.register_tuple_view(&["a", "b", "c"]).unwrap();
+        eng.define_view(&["a", "b", "c"]).unwrap();
 
         // 全条件がマッチする観測窓(3紐)を使うケース
         let r = eng.query(&[("a", 1), ("b", 2), ("c", 0)]);
@@ -3416,6 +3525,99 @@ mod tests {
         for &e in &expected {
             assert!(r.contains(&e));
         }
+
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    // ──── v27: 観測窓の永続化 ────
+
+    #[cfg(feature = "v27")]
+    #[test]
+    fn define_view_persists() {
+        let dir = tmp("view_persist");
+        let mut eng = Engine::create(&dir).unwrap();
+        eng.define_himo("tenant", HimoType::Value, 8);
+        eng.define_himo("dept", HimoType::Value, 8);
+        eng.define_himo("status", HimoType::Value, 4);
+
+        for i in 0u32..80 {
+            let e = eng.entity();
+            eng.tie(e, "tenant", i % 8);
+            eng.tie(e, "dept", (i * 3) % 8);
+            eng.tie(e, "status", (i * 5) % 4);
+        }
+        eng.define_view(&["tenant", "dept", "status"]).unwrap();
+        // tenant=3 → dept=(3*3)%8=1, status=(3*5)%4=3。10 件ヒット。
+        let pre = eng.query(&[("tenant", 3), ("dept", 1), ("status", 3)]).len();
+        eng.flush().unwrap();
+        drop(eng);
+
+        // 再 open → define_view なしで query が動くこと
+        let eng2 = Engine::open(&dir).unwrap();
+        let post = eng2.query(&[("tenant", 3), ("dept", 1), ("status", 3)]).len();
+        assert_eq!(pre, post);
+        assert!(pre > 0, "expected matches, got {}", pre);
+
+        // open 後も tie で自動反映される
+        // (新しい entity を追加して、観測窓経由で見えること)
+        // 注: tie は &mut self なので Drop 前にもう一度可変参照が必要
+        drop(eng2);
+        let mut eng3 = Engine::open(&dir).unwrap();
+        let new_e = eng3.entity();
+        eng3.tie(new_e, "tenant", 3);
+        eng3.tie(new_e, "dept", 1);
+        eng3.tie(new_e, "status", 3);
+        let post2 = eng3.query(&[("tenant", 3), ("dept", 1), ("status", 3)]).len();
+        assert_eq!(post2, post + 1);
+
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[cfg(feature = "v27")]
+    #[test]
+    fn define_view_cell_count_error() {
+        let dir = tmp("view_overflow");
+        let mut eng = Engine::create(&dir).unwrap();
+        eng.define_himo("a", HimoType::Value, 1000);
+        eng.define_himo("b", HimoType::Value, 1000);
+        eng.define_himo("c", HimoType::Value, 100);
+        let r = eng.define_view(&["a", "b", "c"]);
+        assert!(r.is_err());
+
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[cfg(feature = "v27")]
+    #[test]
+    fn multiple_views_persist() {
+        let dir = tmp("view_multi");
+        let mut eng = Engine::create(&dir).unwrap();
+        eng.define_himo("a", HimoType::Value, 4);
+        eng.define_himo("b", HimoType::Value, 4);
+        eng.define_himo("c", HimoType::Value, 4);
+        eng.define_himo("d", HimoType::Value, 4);
+
+        for i in 0u32..60 {
+            let e = eng.entity();
+            eng.tie(e, "a", i % 4);
+            eng.tie(e, "b", (i / 4) % 4);
+            eng.tie(e, "c", (i / 16) % 4);
+            eng.tie(e, "d", (i * 7) % 4);
+        }
+        eng.define_view(&["a", "b", "c"]).unwrap();
+        eng.define_view(&["a", "b", "d"]).unwrap();
+        eng.define_view(&["c", "d"]).unwrap();
+
+        let q1_pre = eng.query(&[("a", 1), ("b", 2), ("c", 0)]).len();
+        let q2_pre = eng.query(&[("a", 1), ("b", 2), ("d", 3)]).len();
+        let q3_pre = eng.query(&[("c", 0), ("d", 1)]).len();
+        eng.flush().unwrap();
+        drop(eng);
+
+        let eng2 = Engine::open(&dir).unwrap();
+        assert_eq!(eng2.query(&[("a", 1), ("b", 2), ("c", 0)]).len(), q1_pre);
+        assert_eq!(eng2.query(&[("a", 1), ("b", 2), ("d", 3)]).len(), q2_pre);
+        assert_eq!(eng2.query(&[("c", 0), ("d", 1)]).len(), q3_pre);
 
         let _ = std::fs::remove_file(&dir);
     }

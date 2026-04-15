@@ -1,149 +1,90 @@
-# Ravn 化メモ — 観測窓を Enchu から Ravn に引き上げる
+# Ravn と Enchu の層分離
 
-## 現状の層違反
+## 要旨
 
-v27 の Enchu には **観測窓(仮想テーブル物化)** が埋まってる:
+Ravn は **クエリ言語層**。Enchu のプリミティブ(tie/pull_raw/get)を連鎖させて、パス式や多条件
+クエリ、伝播(JOIN 相当)を組み立てる。Prisma Client や SQL の位置。
 
-- `PairTable`: 全 2-tuple 自動物化 + tie 内自動反映
-- `NTupleTable`: n-tuple 明示宣言物化 + tie 内自動反映
-- `register_tuple_view` API
-- query プランナ(観測窓優先のクエリ戦略)
+Ravn は **物化層ではない**。観測窓(n-tuple 仮想テーブル定義)や PairTable は Enchu の
+**スキーマの一部** として Enchu 側に残る。`define_himo` と同じレベルで `define_view` も
+Enchu のスキーマ API。DB ファイルに永続化され、open 後に自動復元される。
 
-これらは **世界線を物理化するロジック**で、本来は Ravn 層の責務。Enchu は「紐の素材」だけ持つ純粋な層であるべき(CLAUDE.md: 「伝播は Enchu の仕事ではない」)。
-
-## 理想の層分離
+## 層構造
 
 | 層 | 責務 |
 |---|---|
-| **Enchu** | 紐、entity、Column、1-tuple Cylinder(BucketCylinder) |
-| **Ravn** | クエリ = 世界線、観測窓(2-tuple 以上)の選択・物化・伝播 |
-| **Studio** | UI 層。テーブル表示、ビュー定義 |
+| **Enchu** | 紐 + 観測窓(スキーマ) + 物理ストレージ + プリミティブ API |
+| **Ravn** | クエリ言語(文法パーサ + プランナ + 実行エンジン)。パス式、多条件、伝播を組み立てる |
+| **Studio** | UI 層。テーブル表示、ビュー定義の入力 |
 
-## 境界 API(Enchu → Ravn が使う)
+Enchu は「紐と観測窓を持つストレージ」。Ravn は「クエリを組み立てて Enchu に投げる言語」。
 
-Ravn は Enchu の以下プリミティブを叩く:
+## Enchu が持つもの(Ravn はこれを使う)
 
 ```rust
-// Enchu が Ravn に提供するもの
 impl Engine {
-    // 素材
+    // ──── スキーマ ────
     pub fn define_himo(&mut self, name: &str, ht: HimoType, max_values: u32);
-    pub fn tie(&self, eid: u32, himo: &str, value: u32);
+    pub fn define_view(&mut self, himos: &[&str]) -> Result<(), String>;  // 観測窓(永続化)
+
+    // ──── 書き込み(内部で観測窓に自動反映) ────
+    pub fn tie(&mut self, eid: u32, himo: &str, value: u32);
     pub fn untie(&self, eid: u32, himo: &str);
     pub fn delete(&self, eid: u32);
 
-    // 読み取り
+    // ──── 読み取り(観測窓があれば自動利用) ────
     pub fn get(&self, eid: u32, himo: &str) -> Option<u32>;
-    pub fn pull_raw(&self, himo: &str, value: u32) -> &[u32];
-    pub fn iter_entities(&self) -> impl Iterator<Item = u32>;  // 追加想定
-
-    // tie のフック(Ravn が観測窓を更新するため)
-    pub fn on_tie(&self, callback: impl Fn(u32, usize, Option<u32>, u32));  // 追加想定
+    pub fn pull_raw(&self, himo: &str, value: u32) -> Vec<u32>;  // 1 紐
+    pub fn query(&self, conds: &[(&str, u32)]) -> Vec<u32>;      // 多条件(観測窓を自動選択)
 }
 ```
 
-## Ravn 側が持つもの
+観測窓は `define_himo` 同様、スキーマとして DB ファイルに書き込まれる。open 後に
+`define_view` を再実行する必要はない。
+
+## Ravn が担うもの
+
+Ravn は Enchu のプリミティブを叩いて、より高水準のクエリ言語を提供する。
 
 ```rust
-// crates/ravn/src/view.rs など
-pub struct TupleView {
-    himos: Vec<HimoId>,
-    cells: Vec<Vec<EntityId>>,  // flat cell array
-}
-
+// crates/ravn などで
 pub struct Ravn {
-    engine: Arc<Engine>,       // Enchu への参照
-    views: Vec<TupleView>,     // 観測窓の集合
+    engine: Arc<Engine>,
 }
 
 impl Ravn {
-    pub fn register_view(&mut self, himos: &[&str]);
-    pub fn query(&self, conds: &[(&str, u32)]) -> &[u32];  // slice 返し
-    pub fn query_vec(&self, conds: &[(&str, u32)]) -> Vec<u32>;  // fallback
+    // パス式: user.dept.company.name のようなたどり
+    pub fn path(&self, eid: u32, path: &[&str]) -> Vec<EntityValue>;
+
+    // 文法パーサ: "age:30 city:\"東京\" | count" のような DSL
+    pub fn exec(&self, query: &str) -> QueryResult;
+
+    // JOIN 相当の伝播(Enchu の pull_raw/get を連鎖)
+    pub fn follow(&self, start: &[u32], path: &[&str]) -> Vec<u32>;
 }
 ```
 
-Ravn が Engine の tie を直接呼ぶのではなく、**ラップ**する:
+Ravn は Enchu の内部構造(PairTable, NTupleTable)には触れない。Enchu が公開する
+`query/pull_raw/get/tie` だけを使う。
 
-```rust
-impl Ravn {
-    pub fn tie(&mut self, eid: u32, himo: &str, value: u32) {
-        let old = self.engine.get(eid, himo);
-        self.engine.tie(eid, himo, value);
-        self.propagate_to_views(eid, himo, old, value);
-    }
-}
-```
+## なぜ観測窓を Enchu に置くのか
 
-これで Enchu は **紐の即時反映**だけ責任持ち、Ravn が **観測窓の同期**を担う。
+- **スキーマは Enchu の責務**。紐定義(`define_himo`)と観測窓(`define_view`)は同じ粒度。
+  両方とも「データの物理配置の宣言」であり、永続化が必要。
+- **書き込み時の自動反映**。`tie` は Enchu の API。tie 時に観測窓を同期するには Enchu 内で
+  観測窓を持つのが素直。Ravn 側に持たせると Ravn.tie ラッパー必須となり、Enchu.tie を
+  隠蔽することになる(API 分離の目的に反する)。
+- **Ravn は stateless なクエリ言語**。Ravn が観測窓(mutable state)を持つと、Ravn インスタンスに
+  データが紐づき、Ravn を作り直すたびに再構築が必要になる。Enchu に置けば DB ファイルが
+  truth of source。
 
-## 移行段階
+## Ravn の実装メモ(将来)
 
-### 段階 1: crates 分離(物理的に別 crate)
+- Ravn crate を別に切る場合、Enchu の `Engine` を `Arc<Engine>` で持つだけ
+- Ravn 独自の状態は **なし**(あるいはパースキャッシュなど軽いもののみ)
+- 文法は既存の `src/query_lang.rs` をベースに拡張
 
-```
-enchudb/              ← workspace root
-  crates/
-    enchu/            ← 紐だけの純粋エンジン
-    ravn/             ← 観測窓 + クエリ言語
-  examples/
-```
+## 旧メモ(破棄)
 
-enchu crate は `BucketCylinder`, `Column`, `HimoStore`, `Engine` 基本 API のみ。
-ravn crate は `PairTable`, `NTupleTable`, `register_tuple_view` を持つ。
-
-### 段階 2: 観測窓ロジックを ravn に移植
-
-v27 の `src/engine.rs` から:
-
-- `PairEntry`, `PairTable` → `crates/ravn/src/pair_table.rs`
-- `NTupleEntry`, `NTupleTable` → `crates/ravn/src/tuple_view.rs`
-- `apply_pair_delta_internal`, `apply_tuple_delta_internal` → Ravn 側の tie ラッパーに
-- `register_tuple_view` API → Ravn のメソッドに
-- query プランナ → Ravn に引き上げ(Enchu の query は 1 条件のみに)
-
-### 段階 3: Enchu API 簡素化
-
-Enchu の `Engine::query` は **1 紐のみ**をサポート。多条件は Ravn 側で組み立てる。
-
-```rust
-// Enchu(簡素化後)
-impl Engine {
-    pub fn pull_raw(&self, himo: &str, value: u32) -> &[u32];
-    // query は削除 or 単一紐のみ
-}
-
-// Ravn(多条件を担当)
-impl Ravn {
-    pub fn query(&self, conds: &[(&str, u32)]) -> Vec<u32>;
-    pub fn query_slice(&self, conds: &[(&str, u32)]) -> Option<&[u32]>;
-}
-```
-
-### 段階 4: Enchu の tie に hook を追加
-
-Ravn が観測窓を更新するため、Enchu の tie が「old→new の変化」を外部に知らせる必要がある。選択肢:
-
-- **A. Callback 登録**: `engine.on_tie(|eid, himo_id, old, new| { ... })`
-- **B. 値取得 + tie を 2 段に分ける**: Ravn 側で `let old = engine.get(...); engine.tie(...); ravn.propagate(old, new);`(既存の apply_pair_delta パターン)
-- **C. Ravn の Engine ラッパーに tie メソッドを置く**: ユーザーは Ravn.tie を使う、Ravn 内部で Engine.tie + 観測窓更新
-
-C が API 的にクリーン。ユーザーは Ravn 越しに操作、Enchu 直接叩きは避ける。
-
-## 懸念点
-
-- **API 破壊**: 現状 `db.query(&[(...)])` で直接多条件が動くが、Ravn 分離後は Ravn 経由になる。既存コードの書き換え必要
-- **ベンチ互換**: v27_bench は Enchu 直叩き、Ravn 化後は Ravn 経由のベンチが別途必要
-- **永続化**: 観測窓の登録情報を Ravn 側でどう永続化するか。Enchu のファイルに相乗りか、Ravn 専用ファイルか
-- **並行性**: 観測窓の更新と読み取りの排他を Ravn が担う。Enchu は紐レベルの並行性だけ面倒見る
-- **Studio への影響**: Studio はテーブル(紐の整列 + ビュー)を扱うので Ravn と接続。Enchu と直接対話しない
-
-## 移行のタイミング
-
-現時点では Ravn の実体がまだない。v27 は Enchu 内に観測窓を抱えた状態で動かし、以下のいずれかで移行する:
-
-- Ravn を別プロジェクトとして立ち上げるタイミング
-- EnchuDB を multi-crate workspace に再編するタイミング
-- Studio との接続を設計するタイミング(Studio → Ravn → Enchu の層が必要になる)
-
-それまでは Enchu に仮置き、思想的には Ravn 層の責務として扱う。
+以前のバージョンでは「観測窓を Ravn に引き上げる」方向で書かれていたが、上記の理由で
+方針転換。Enchu が観測窓を永続化スキーマとして持ち続ける。

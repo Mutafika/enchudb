@@ -262,7 +262,7 @@ fn main() {
     db_b.define_himo("city", enchudb::HimoType::Value, 10);
     db_b.define_himo("salary_band", enchudb::HimoType::Value, 20);
     db_b.define_himo("age", enchudb::HimoType::Value, 100);
-    db_b.register_tuple_view(&["tenant", "dept", "status"]).unwrap();
+    db_b.define_view(&["tenant", "dept", "status"]).unwrap();
 
     let t = Instant::now();
     for i in 0..n {
@@ -309,9 +309,9 @@ fn main() {
     db_c.define_himo("salary_band", enchudb::HimoType::Value, 20);
     db_c.define_himo("age", enchudb::HimoType::Value, 100);
     // 17*9*5 = 765
-    db_c.register_tuple_view(&["tenant", "dept", "status"]).unwrap();
+    db_c.define_view(&["tenant", "dept", "status"]).unwrap();
     // 17*9*5*6*11 = 50490
-    db_c.register_tuple_view(&["tenant", "dept", "status", "grade", "city"]).unwrap();
+    db_c.define_view(&["tenant", "dept", "status", "grade", "city"]).unwrap();
 
     let t = Instant::now();
     for i in 0..n {
@@ -362,11 +362,105 @@ fn main() {
     println!("  宣言1個(3紐): {:.1} ns/件", tie_ns_1);
     println!("  宣言2個(3+5紐): {:.1} ns/件", tie_ns_2);
 
+    // ════════════════════════════════════════════════════════════════════
+    // 観測窓の永続化シナリオ: define_view → flush → drop → open → query
+    // ════════════════════════════════════════════════════════════════════
+    println!();
+    println!("═══════════════════════════════════════════════════════");
+    println!("  観測窓の永続化シナリオ");
+    println!("═══════════════════════════════════════════════════════");
+
+    let path_p = "/tmp/enchudb_v27_bench_persist.db";
+    let _ = std::fs::remove_file(path_p);
+    let mut db_p = enchudb::Engine::create_with_capacity(path_p, n + 10).unwrap();
+    db_p.define_himo("tenant", enchudb::HimoType::Value, 16);
+    db_p.define_himo("dept", enchudb::HimoType::Value, 8);
+    db_p.define_himo("status", enchudb::HimoType::Value, 4);
+    db_p.define_himo("grade", enchudb::HimoType::Value, 5);
+    db_p.define_himo("city", enchudb::HimoType::Value, 10);
+    db_p.define_himo("salary_band", enchudb::HimoType::Value, 20);
+    db_p.define_himo("age", enchudb::HimoType::Value, 100);
+
+    // 2 view 宣言 → スキーマとして DB ファイルに永続化される
+    db_p.define_view(&["tenant", "dept", "status"]).unwrap();
+    db_p.define_view(&["tenant", "dept", "status", "grade", "city"]).unwrap();
+
+    for i in 0..n {
+        let e = db_p.entity();
+        db_p.tie(e, "tenant", i % 16);
+        db_p.tie(e, "dept", (i * 7) % 8);
+        db_p.tie(e, "status", (i * 3) % 4);
+        db_p.tie(e, "grade", (i * 11) % 5);
+        db_p.tie(e, "city", (i * 13) % 10);
+        db_p.tie(e, "salary_band", (i * 17) % 20);
+        db_p.tie(e, "age", (i * 19) % 100);
+    }
+
+    // open 前の計測
+    println!();
+    println!("─── open 前 ───");
+    let mut pre_ns: Vec<(String, u128, usize)> = Vec::new();
+    for (name, q) in &bench_queries {
+        let refs: Vec<(&str, u32)> = q.iter().map(|&(s, v)| (s, v)).collect();
+        let _ = db_p.query(&refs);
+        let iters = 1000u32;
+        let t = Instant::now();
+        let mut count = 0;
+        for _ in 0..iters {
+            count = db_p.query(&refs).len();
+        }
+        let ns = t.elapsed().as_nanos() / iters as u128;
+        println!("  {}: {} ns ({}件)", name, ns, count);
+        pre_ns.push((name.to_string(), ns, count));
+    }
+
+    db_p.flush().unwrap();
+    drop(db_p);
+
+    // open 後、define_view を 1 回も呼ばずに query が同じ速度で動くこと
+    let t = Instant::now();
+    let db_p2 = enchudb::Engine::open(path_p).unwrap();
+    let open_elapsed = t.elapsed();
+    println!();
+    println!("─── open (view 自動復元込み) ───");
+    println!("  open + view 復元: {:?}", open_elapsed);
+
+    println!();
+    println!("─── open 後(register 再実行なし) ───");
+    let mut post_ns: Vec<(String, u128, usize)> = Vec::new();
+    for (name, q) in &bench_queries {
+        let refs: Vec<(&str, u32)> = q.iter().map(|&(s, v)| (s, v)).collect();
+        let _ = db_p2.query(&refs);
+        let iters = 1000u32;
+        let t = Instant::now();
+        let mut count = 0;
+        for _ in 0..iters {
+            count = db_p2.query(&refs).len();
+        }
+        let ns = t.elapsed().as_nanos() / iters as u128;
+        println!("  {}: {} ns ({}件)", name, ns, count);
+        post_ns.push((name.to_string(), ns, count));
+    }
+
+    // 結果一致検証
+    println!();
+    println!("─── 結果一致 / 速度比較 ───");
+    println!("  {:<8} {:>10} {:>10} {:>8}", "クエリ", "open前", "open後", "比率");
+    for ((n1, pre, c_pre), (_, post, c_post)) in pre_ns.iter().zip(post_ns.iter()) {
+        assert_eq!(c_pre, c_post, "open 前後で件数一致");
+        let ratio = *post as f64 / *pre as f64;
+        println!("  {:<8} {:>8} ns {:>8} ns {:>7.2}x", n1, pre, post, ratio);
+    }
+
+    drop(db_p2);
+    let _ = std::fs::remove_file(path_p);
+
     println!();
     println!("=== 制約 ===");
     println!("  並行性: v27 v1 は単一スレッド前提(BucketCylinder は &mut self)");
     println!("  bitmap/delta: 撤去済み(BucketCylinder で O(1) 即時反映)");
     println!("  range: range_iter は全幅探索のみ、索引最適化なし");
-    println!("  n-tuple 観測窓: max_values > 0 必須、セル数 100万超は register エラー");
-    println!("  観測窓の永続化: 非対応(実行時のみ、open 後に register_tuple_view を再実行)");
+    println!("  n-tuple 観測窓: max_values > 0 必須、セル数 100万超は define_view エラー");
+    println!("  観測窓の永続化: 対応(define_view で DB ファイルに書き、open で自動復元)");
+    println!("  view 数上限: 32、1 view あたり紐数上限: 8、FILE_VERSION=2");
 }
