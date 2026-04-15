@@ -423,6 +423,139 @@ struct PairTable {
     pairs: Vec<PairEntry>,
 }
 
+// ─── v27 NTupleView (任意 n 次元の観測窓) ───
+
+#[cfg(feature = "v27")]
+struct NTupleEntry {
+    himos: Vec<usize>,
+    cards: Vec<u32>,
+    strides: Vec<usize>,
+    cells: Vec<Vec<u32>>,
+}
+
+#[cfg(feature = "v27")]
+impl NTupleEntry {
+    fn cell_id_for(&self, values: &[u32]) -> Option<usize> {
+        let mut id = 0usize;
+        for i in 0..self.himos.len() {
+            let v = values[i];
+            if v >= self.cards[i] { return None; }
+            id += v as usize * self.strides[i];
+        }
+        Some(id)
+    }
+
+    fn cell_add(&mut self, cell_id: usize, eid: u32) {
+        let cell = &mut self.cells[cell_id];
+        match cell.binary_search(&eid) {
+            Ok(_) => {},
+            Err(pos) => cell.insert(pos, eid),
+        }
+    }
+
+    fn cell_remove(&mut self, cell_id: usize, eid: u32) {
+        let cell = &mut self.cells[cell_id];
+        if let Ok(pos) = cell.binary_search(&eid) {
+            cell.remove(pos);
+        }
+    }
+}
+
+#[cfg(feature = "v27")]
+struct NTupleTable {
+    views: Vec<NTupleEntry>,
+}
+
+#[cfg(feature = "v27")]
+impl NTupleTable {
+    fn new() -> Self { Self { views: vec![] } }
+
+    /// conds から該当する観測窓を選ぶ。
+    /// 戻り値: (セルの entity スライス, 残りの条件)
+    /// 優先: 条件紐をすべて含む view のうち、紐数が最大(残り条件が少ない)のもの。
+    fn best_lookup<'a>(&'a self, conds: &[(usize, u32)]) -> Option<(&'a [u32], Vec<(usize, u32)>)> {
+        if conds.len() < 2 { return None; }
+        let mut best: Option<(&[u32], Vec<(usize, u32)>, usize)> = None;
+        // best = (cell, remaining, covered_count)
+
+        for v in &self.views {
+            // view の全紐が conds で指定されているか?
+            let mut vals_for_view: Vec<u32> = Vec::with_capacity(v.himos.len());
+            let mut ok = true;
+            for &h in &v.himos {
+                match conds.iter().find(|&&(idx, _)| idx == h) {
+                    Some(&(_, val)) => vals_for_view.push(val),
+                    None => { ok = false; break; }
+                }
+            }
+            if !ok { continue; }
+
+            let cell_id = match v.cell_id_for(&vals_for_view) {
+                Some(id) => id,
+                None => continue,
+            };
+            if cell_id >= v.cells.len() { continue; }
+            let cell = &v.cells[cell_id];
+            let covered = v.himos.len();
+
+            let remaining: Vec<(usize, u32)> = conds.iter()
+                .filter(|&&(idx, _)| !v.himos.contains(&idx))
+                .copied()
+                .collect();
+
+            let better = match &best {
+                None => true,
+                Some((_, _, c)) => covered > *c,
+            };
+            if better {
+                best = Some((cell.as_slice(), remaining, covered));
+            }
+        }
+
+        best.map(|(c, r, _)| (c, r))
+    }
+
+    fn apply_delta(&mut self, eid: u32, himo_idx: usize, old_val: u32, new_val: u32, all_values: &[(usize, u32)]) {
+        for view in &mut self.views {
+            let pos_in_view = match view.himos.iter().position(|&h| h == himo_idx) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            // view の他紐の値を収集。いずれか未 tie なら skip。
+            let mut old_vals: Vec<u32> = Vec::with_capacity(view.himos.len());
+            let mut new_vals: Vec<u32> = Vec::with_capacity(view.himos.len());
+            let mut missing = false;
+            for (i, &h) in view.himos.iter().enumerate() {
+                if i == pos_in_view {
+                    old_vals.push(old_val);
+                    new_vals.push(new_val);
+                } else {
+                    match all_values.iter().find(|&&(idx, _)| idx == h) {
+                        Some(&(_, v)) => {
+                            old_vals.push(v);
+                            new_vals.push(v);
+                        }
+                        None => { missing = true; break; }
+                    }
+                }
+            }
+            if missing { continue; }
+
+            if old_val != u32::MAX {
+                if let Some(old_id) = view.cell_id_for(&old_vals) {
+                    view.cell_remove(old_id, eid);
+                }
+            }
+            if new_val != u32::MAX {
+                if let Some(new_id) = view.cell_id_for(&new_vals) {
+                    view.cell_add(new_id, eid);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(feature = "v27")]
 impl PairTable {
     fn new() -> Self {
@@ -534,6 +667,8 @@ pub struct Engine {
     pairs: PairTable,
     #[cfg(feature = "v27")]
     pairs: PairTable,
+    #[cfg(feature = "v27")]
+    tuples: NTupleTable,
     backing: Backing, // 最後に drop されるよう最終フィールド
 }
 
@@ -639,6 +774,8 @@ impl Engine {
             pairs: PairTable::new(),
             #[cfg(feature = "v27")]
             pairs: PairTable::new(),
+            #[cfg(feature = "v27")]
+            tuples: NTupleTable::new(),
             backing: Backing::Mmap(mmap),
         })
     }
@@ -755,6 +892,8 @@ impl Engine {
             pairs: PairTable::new(),
             #[cfg(feature = "v27")]
             pairs: PairTable::new(),
+            #[cfg(feature = "v27")]
+            tuples: NTupleTable::new(),
             backing,
         };
 
@@ -1163,6 +1302,89 @@ impl Engine {
         // 単一スレッド。
         let pairs_ptr = &self.pairs as *const PairTable as *mut PairTable;
         unsafe { (*pairs_ptr).apply_delta(eid, himo_idx, old_val, new_val, &other_values); }
+
+        // 観測窓への伝播(登録されている場合のみコスト発生)
+        if !self.tuples.views.is_empty() {
+            let tuples_ptr = &self.tuples as *const NTupleTable as *mut NTupleTable;
+            unsafe { (*tuples_ptr).apply_delta(eid, himo_idx, old_val, new_val, &other_values); }
+        }
+    }
+
+    /// 観測窓を登録。指定紐の直積セルを物化。
+    /// 各紐は define_himo 済み + max_values > 0 必須。セル数が 100万超ならエラー。
+    #[cfg(feature = "v27")]
+    pub fn register_tuple_view(&mut self, himos: &[&str]) -> Result<(), String> {
+        if himos.len() < 2 {
+            return Err("tuple view requires at least 2 himos".into());
+        }
+        let mut idxs: Vec<usize> = Vec::with_capacity(himos.len());
+        let mut cards: Vec<u32> = Vec::with_capacity(himos.len());
+        for &name in himos {
+            let idx = self.himo_id(name)
+                .ok_or_else(|| format!("himo '{}' not defined", name))?;
+            let mv = self.himo_max_values[idx];
+            if mv == 0 {
+                return Err(format!("himo '{}' has no max_values (define_himo first)", name));
+            }
+            idxs.push(idx);
+            cards.push(mv + 1);
+        }
+
+        // セル数チェック(オーバーフロー対策)
+        let mut cell_count: u64 = 1;
+        for &c in &cards {
+            cell_count = cell_count.saturating_mul(c as u64);
+            if cell_count > 1_000_000 {
+                return Err(format!("tuple view cell count exceeds 1M (got card product > 1M)"));
+            }
+        }
+        let cell_count = cell_count as usize;
+
+        // ストライド(row-major): strides[i] = Π_{j>i} cards[j]
+        let mut strides: Vec<usize> = vec![0; idxs.len()];
+        let mut acc: usize = 1;
+        for i in (0..idxs.len()).rev() {
+            strides[i] = acc;
+            acc *= cards[i] as usize;
+        }
+
+        let mut cells: Vec<Vec<u32>> = vec![vec![]; cell_count];
+
+        // 既存データから cell を埋める
+        let next_eid = self.entities.next_eid();
+        for eid in 0..next_eid {
+            if !self.entities.is_live(eid) { continue; }
+            let mut vals: Vec<u32> = Vec::with_capacity(idxs.len());
+            let mut all = true;
+            for &hi in &idxs {
+                match self.himos[hi].get_value(eid) {
+                    Some(v) if v < self.himo_max_values[hi] + 1 => vals.push(v),
+                    _ => { all = false; break; }
+                }
+            }
+            if !all { continue; }
+            let mut id = 0usize;
+            let mut ok = true;
+            for i in 0..idxs.len() {
+                if vals[i] >= cards[i] { ok = false; break; }
+                id += vals[i] as usize * strides[i];
+            }
+            if ok && id < cells.len() {
+                cells[id].push(eid);
+            }
+        }
+        // 各セルはソート済みに保つ(insert が binary_search を使うため)
+        for c in &mut cells {
+            c.sort_unstable();
+        }
+
+        self.tuples.views.push(NTupleEntry {
+            himos: idxs,
+            cards,
+            strides,
+            cells,
+        });
+        Ok(())
     }
 
     /// 引く。delta が空なら Cylinder 直返し（ゼロコピー）。
@@ -1268,8 +1490,58 @@ impl Engine {
             if len < min_slice_len { min_slice_len = len; min_slice_idx = i; }
         }
 
-        // v26/v27: ペアテーブルで最小候補を O(1) ルックアップ
-        #[cfg(any(all(feature = "v26", not(feature = "v27")), feature = "v27"))]
+        // v27: 観測窓(n-tuple)とペアテーブル、最小 Cylinder スライスを比べて最小候補を選ぶ。
+        #[cfg(feature = "v27")]
+        {
+            let tuple = self.tuples.best_lookup(&conds);
+            let pair = self.pairs.best_lookup(&conds);
+
+            // 候補数最小のものを選ぶ。残り条件を Column フィルタ。
+            let tuple_len = tuple.as_ref().map(|(c, _)| c.len()).unwrap_or(usize::MAX);
+            let pair_len = pair.as_ref().map(|(c, _)| c.len()).unwrap_or(usize::MAX);
+
+            if tuple_len <= pair_len && tuple_len <= min_slice_len {
+                if let Some((candidates, remaining)) = tuple {
+                    if remaining.is_empty() {
+                        return candidates.to_vec();
+                    }
+                    let mut result = Vec::new();
+                    for &eid in candidates {
+                        let mut pass = true;
+                        for &(idx, val) in &remaining {
+                            if !self.himos[idx].value_eq(eid, val) {
+                                pass = false;
+                                break;
+                            }
+                        }
+                        if pass { result.push(eid); }
+                    }
+                    return result;
+                }
+            }
+            if pair_len <= min_slice_len {
+                if let Some((candidates, remaining)) = pair {
+                    if remaining.is_empty() {
+                        return candidates.to_vec();
+                    }
+                    let mut result = Vec::new();
+                    for &eid in candidates {
+                        let mut pass = true;
+                        for &(idx, val) in &remaining {
+                            if !self.himos[idx].value_eq(eid, val) {
+                                pass = false;
+                                break;
+                            }
+                        }
+                        if pass { result.push(eid); }
+                    }
+                    return result;
+                }
+            }
+        }
+
+        // v26 のみ: ペアテーブルで最小候補を O(1) ルックアップ
+        #[cfg(all(feature = "v26", not(feature = "v27")))]
         {
             if let Some((candidates, remaining)) = self.pairs.best_lookup(&conds) {
                 if candidates.len() <= min_slice_len {
@@ -2697,6 +2969,184 @@ mod tests {
         let vid = eng.vocab_id("1").expect("vocab_id");
         let result = eng.pull_raw("has_flag", vid);
         assert_eq!(result.len(), 3, "after reopen: expected 3, got {}", result.len());
+
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    // ──── v27: NTupleView (観測窓) ────
+
+    #[cfg(feature = "v27")]
+    #[test]
+    fn ntuple_view_register_and_query() {
+        let dir = tmp("ntuple_basic");
+        let mut eng = Engine::create(&dir).unwrap();
+        eng.define_himo("tenant", HimoType::Value, 8);
+        eng.define_himo("dept", HimoType::Value, 8);
+        eng.define_himo("status", HimoType::Value, 4);
+
+        for i in 0u32..100 {
+            let e = eng.entity();
+            eng.tie(e, "tenant", i % 8);
+            eng.tie(e, "dept", (i * 3) % 8);
+            eng.tie(e, "status", (i * 5) % 4);
+        }
+        eng.register_tuple_view(&["tenant", "dept", "status"]).unwrap();
+
+        // 登録後も tie で自動更新
+        let e = eng.entity();
+        eng.tie(e, "tenant", 3);
+        eng.tie(e, "dept", 5);
+        eng.tie(e, "status", 1);
+
+        let baseline: Vec<u32> = (0..100u32).filter(|i| i % 8 == 3 && (i * 3) % 8 == 5 && (i * 5) % 4 == 1).collect();
+        let expected_count = baseline.len() + 1;
+
+        let r = eng.query(&[("tenant", 3), ("dept", 5), ("status", 1)]);
+        assert_eq!(r.len(), expected_count);
+        assert!(r.contains(&e));
+
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[cfg(feature = "v27")]
+    #[test]
+    fn ntuple_view_partial_match() {
+        let dir = tmp("ntuple_partial");
+        let mut eng = Engine::create(&dir).unwrap();
+        eng.define_himo("a", HimoType::Value, 8);
+        eng.define_himo("b", HimoType::Value, 8);
+        eng.define_himo("c", HimoType::Value, 4);
+        eng.define_himo("d", HimoType::Value, 4);
+
+        for i in 0u32..200 {
+            let e = eng.entity();
+            eng.tie(e, "a", i % 8);
+            eng.tie(e, "b", (i * 3) % 8);
+            eng.tie(e, "c", (i * 5) % 4);
+            eng.tie(e, "d", (i * 7) % 4);
+        }
+        // 3紐登録、クエリは4条件(1つは残り条件として Column フィルタ)
+        eng.register_tuple_view(&["a", "b", "c"]).unwrap();
+
+        let r = eng.query(&[("a", 2), ("b", 6), ("c", 2), ("d", 0)]);
+        let expected: Vec<u32> = (0..200u32)
+            .filter(|i| i % 8 == 2 && (i * 3) % 8 == 6 && (i * 5) % 4 == 2 && (i * 7) % 4 == 0)
+            .collect();
+        assert_eq!(r.len(), expected.len());
+
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[cfg(feature = "v27")]
+    #[test]
+    fn ntuple_view_untie_propagates() {
+        let dir = tmp("ntuple_untie");
+        let mut eng = Engine::create(&dir).unwrap();
+        eng.define_himo("x", HimoType::Value, 8);
+        eng.define_himo("y", HimoType::Value, 8);
+
+        let e0 = eng.entity();
+        eng.tie(e0, "x", 2);
+        eng.tie(e0, "y", 3);
+        let e1 = eng.entity();
+        eng.tie(e1, "x", 2);
+        eng.tie(e1, "y", 3);
+
+        eng.register_tuple_view(&["x", "y"]).unwrap();
+        assert_eq!(eng.query(&[("x", 2), ("y", 3)]).len(), 2);
+
+        eng.untie(e0, "x");
+        let r = eng.query(&[("x", 2), ("y", 3)]);
+        assert_eq!(r, vec![e1]);
+
+        // 再 tie
+        eng.tie(e0, "x", 2);
+        let r = eng.query(&[("x", 2), ("y", 3)]);
+        assert_eq!(r.len(), 2);
+
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[cfg(feature = "v27")]
+    #[test]
+    fn ntuple_view_delete_propagates() {
+        let dir = tmp("ntuple_delete");
+        let mut eng = Engine::create(&dir).unwrap();
+        eng.define_himo("x", HimoType::Value, 8);
+        eng.define_himo("y", HimoType::Value, 8);
+
+        let e0 = eng.entity();
+        eng.tie(e0, "x", 1);
+        eng.tie(e0, "y", 1);
+        let e1 = eng.entity();
+        eng.tie(e1, "x", 1);
+        eng.tie(e1, "y", 1);
+
+        eng.register_tuple_view(&["x", "y"]).unwrap();
+        assert_eq!(eng.query(&[("x", 1), ("y", 1)]).len(), 2);
+
+        eng.delete(e0);
+        let r = eng.query(&[("x", 1), ("y", 1)]);
+        assert_eq!(r, vec![e1]);
+
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[cfg(feature = "v27")]
+    #[test]
+    fn ntuple_view_cell_overflow_rejected() {
+        let dir = tmp("ntuple_overflow");
+        let mut eng = Engine::create(&dir).unwrap();
+        eng.define_himo("a", HimoType::Value, 1000);
+        eng.define_himo("b", HimoType::Value, 1000);
+        eng.define_himo("c", HimoType::Value, 100);
+        // 1001 * 1001 * 101 = ~101M > 1M
+        let r = eng.register_tuple_view(&["a", "b", "c"]);
+        assert!(r.is_err());
+
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[cfg(feature = "v27")]
+    #[test]
+    fn ntuple_view_requires_max_values() {
+        let dir = tmp("ntuple_nomv");
+        let mut eng = Engine::create(&dir).unwrap();
+        let e = eng.entity();
+        eng.tie(e, "foo", 1); // max_values=0 のまま自動作成
+        eng.tie(e, "bar", 2);
+        let r = eng.register_tuple_view(&["foo", "bar"]);
+        assert!(r.is_err());
+
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[cfg(feature = "v27")]
+    #[test]
+    fn ntuple_view_exact_match_vs_pair() {
+        let dir = tmp("ntuple_exact");
+        let mut eng = Engine::create(&dir).unwrap();
+        eng.define_himo("a", HimoType::Value, 4);
+        eng.define_himo("b", HimoType::Value, 4);
+        eng.define_himo("c", HimoType::Value, 4);
+
+        for i in 0u32..50 {
+            let e = eng.entity();
+            eng.tie(e, "a", i % 4);
+            eng.tie(e, "b", (i / 4) % 4);
+            eng.tie(e, "c", (i / 16) % 4);
+        }
+        eng.register_tuple_view(&["a", "b", "c"]).unwrap();
+
+        // 全条件がマッチする観測窓(3紐)を使うケース
+        let r = eng.query(&[("a", 1), ("b", 2), ("c", 0)]);
+        let expected: Vec<u32> = (0..50u32)
+            .filter(|i| i % 4 == 1 && (i / 4) % 4 == 2 && (i / 16) % 4 == 0)
+            .collect();
+        assert_eq!(r.len(), expected.len());
+        for &e in &expected {
+            assert!(r.contains(&e));
+        }
 
         let _ = std::fs::remove_file(&dir);
     }
