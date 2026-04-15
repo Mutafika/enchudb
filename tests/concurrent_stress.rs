@@ -21,20 +21,6 @@ fn cleanup(path: &str) {
     let _ = std::fs::remove_file(path);
 }
 
-/// flush_writes は queue 空判定だけで in-flight Op の適用完了を待たない race が
-/// あるため、ベスト・エフォートで「結果が見えるまで」少し余裕を持って待つ。
-fn settle(arc: &Engine) {
-    arc.flush_writes();
-    // consumer スレッドが最後の pop 直後に apply を終えるまでの猶予
-    for _ in 0..50 {
-        if arc.pending_writes() == 0 {
-            std::thread::sleep(Duration::from_millis(2));
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-}
-
 // ──────────────────────────────────────────────────────────────────
 // 1. 長時間 reader / writer 並走
 // ──────────────────────────────────────────────────────────────────
@@ -129,7 +115,7 @@ fn read_after_flush_sees_writes() {
         arc.tie_async(e, "v", (i as u32) % 100);
     }
 
-    settle(&arc);
+    arc.flush_writes();
 
     // 各値ごとに 100 件あるはず(10000 / 100)
     let mut total = 0usize;
@@ -162,7 +148,7 @@ fn queue_backpressure() {
     for (i, &e) in eids.iter().enumerate() {
         arc.tie_async(e, "k", (i as u32) % 50);
     }
-    settle(&arc);
+    arc.flush_writes();
     let elapsed = started.elapsed();
 
     // 完走する(無限ループしない)。10000 件で 5 秒以内なら OK。
@@ -269,7 +255,7 @@ fn drop_with_pending_writes() {
 
     // arc_for_check はまだ生きてるが、内部 consumer は走り続けてる。
     // 念のため少し待ってから flush して確認。
-    settle(&arc_for_check);
+    arc_for_check.flush_writes();
     let mut total = 0usize;
     for v in 0..50u32 {
         total += arc_for_check.pull_raw("k", v).len();
@@ -312,7 +298,7 @@ fn multiple_async_writers() {
     for h in handles {
         h.join().expect("writer panicked");
     }
-    settle(&arc);
+    arc.flush_writes();
 
     let mut total = 0usize;
     for v in 0..8u32 {
@@ -554,7 +540,7 @@ fn panic_in_reader_doesnt_corrupt() {
     // 書き込みもまだできる
     let new_e = arc.entity();
     arc.tie_async(new_e, "k", 7);
-    settle(&arc);
+    arc.flush_writes();
     let after = arc.pull_raw("k", 7);
     assert!(after.contains(&new_e), "post-panic write not visible");
 

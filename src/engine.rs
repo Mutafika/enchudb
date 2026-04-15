@@ -699,6 +699,12 @@ pub struct Engine {
     /// consumer スレッドハンドル。Drop で join。
     #[cfg(feature = "v27")]
     consumer_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// writer が push した累積件数。tie_async/untie_async/delete_async で +1。
+    #[cfg(feature = "v27")]
+    push_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// consumer が apply 完了した累積件数。apply_count >= push_count が同期点。
+    #[cfg(feature = "v27")]
+    apply_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
     backing: Backing, // 最後に drop されるよう最終フィールド
 }
 
@@ -812,6 +818,10 @@ impl Engine {
             shutdown_flag: None,
             #[cfg(feature = "v27")]
             consumer_handle: std::sync::Mutex::new(None),
+            #[cfg(feature = "v27")]
+            push_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "v27")]
+            apply_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             backing: Backing::Mmap(mmap),
         })
     }
@@ -943,6 +953,10 @@ impl Engine {
             shutdown_flag: None,
             #[cfg(feature = "v27")]
             consumer_handle: std::sync::Mutex::new(None),
+            #[cfg(feature = "v27")]
+            push_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "v27")]
+            apply_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             backing,
         };
 
@@ -1940,6 +1954,7 @@ impl Engine {
         let engine_addr = engine_ptr as usize;
         let q_for_thread = queue.clone();
         let flag_for_thread = shutdown.clone();
+        let apply_count_for_thread = arc.apply_count.clone();
 
         let handle = std::thread::Builder::new()
             .name("enchudb-consumer".into())
@@ -1951,12 +1966,15 @@ impl Engine {
                     while let Some(op) = q_for_thread.pop() {
                         drained_any = true;
                         engine.apply_op(op);
+                        // apply 完了を公開(Release)。flush_writes が Acquire で読む。
+                        apply_count_for_thread.fetch_add(1, Ordering::Release);
                     }
 
                     if flag_for_thread.load(Ordering::Acquire) {
                         // shutdown → 最後の drain
                         while let Some(op) = q_for_thread.pop() {
                             engine.apply_op(op);
+                            apply_count_for_thread.fetch_add(1, Ordering::Release);
                         }
                         return;
                     }
@@ -2011,6 +2029,7 @@ impl Engine {
     /// queue 満杯なら spin + yield でリトライ(back-pressure)。
     #[cfg(feature = "v27")]
     pub fn tie_async(&self, eid: u32, himo: &str, value: u32) {
+        use std::sync::atomic::Ordering;
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
@@ -2019,7 +2038,11 @@ impl Engine {
         let mut op = crate::write_queue::Op::Tie { eid, himo_id: hid as u16, value };
         loop {
             match q.push(op) {
-                Ok(()) => return,
+                Ok(()) => {
+                    // push 成功を公開。flush_writes の同期点。
+                    self.push_count.fetch_add(1, Ordering::Release);
+                    return;
+                }
                 Err(returned) => {
                     op = returned;
                     std::thread::yield_now();
@@ -2031,12 +2054,16 @@ impl Engine {
     /// 非同期 untie。
     #[cfg(feature = "v27")]
     pub fn untie_async(&self, eid: u32, himo: &str) {
+        use std::sync::atomic::Ordering;
         let hid = match self.himo_id(himo) { Some(x) => x, None => return };
         let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
         let mut op = crate::write_queue::Op::Untie { eid, himo_id: hid as u16 };
         loop {
             match q.push(op) {
-                Ok(()) => return,
+                Ok(()) => {
+                    self.push_count.fetch_add(1, Ordering::Release);
+                    return;
+                }
                 Err(returned) => {
                     op = returned;
                     std::thread::yield_now();
@@ -2048,11 +2075,15 @@ impl Engine {
     /// 非同期 delete。
     #[cfg(feature = "v27")]
     pub fn delete_async(&self, eid: u32) {
+        use std::sync::atomic::Ordering;
         let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
         let mut op = crate::write_queue::Op::Delete { eid };
         loop {
             match q.push(op) {
-                Ok(()) => return,
+                Ok(()) => {
+                    self.push_count.fetch_add(1, Ordering::Release);
+                    return;
+                }
                 Err(returned) => {
                     op = returned;
                     std::thread::yield_now();
@@ -2061,14 +2092,18 @@ impl Engine {
         }
     }
 
-    /// キューが空になるまで spin 待ち。`tie_async` の同期点。
-    /// consumer スレッドの処理が追いついたら return。
+    /// push 済みの全 Op が apply 完了するまで spin 待ち。`tie_async` の同期点。
+    /// `queue.is_empty()` は pop 直後 / apply 前のウィンドウで true になる race が
+    /// あるため、push_count と apply_count の累積カウンタで apply 完了を待つ。
     #[cfg(feature = "v27")]
     pub fn flush_writes(&self) {
-        if let Some(q) = self.write_queue.as_ref() {
-            while !q.is_empty() {
-                std::thread::yield_now();
-            }
+        use std::sync::atomic::Ordering;
+        if self.write_queue.is_none() { return; }
+        loop {
+            let pushed = self.push_count.load(Ordering::Acquire);
+            let applied = self.apply_count.load(Ordering::Acquire);
+            if applied >= pushed { return; }
+            std::thread::yield_now();
         }
     }
 
@@ -2108,11 +2143,21 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
+        // 既に push 済みの全 Op が apply 完了するまで待機(best-effort)。
+        // shutdown flag を立てる前に呼ぶことで、writer がまだ活きてる場合でも
+        // ここまでに走った tie_async は consumer が反映済みとなる。
+        if self.write_queue.is_some() {
+            loop {
+                let pushed = self.push_count.load(Ordering::Acquire);
+                let applied = self.apply_count.load(Ordering::Acquire);
+                if applied >= pushed { break; }
+                std::thread::yield_now();
+            }
+        }
         if let Some(flag) = &self.shutdown_flag {
             flag.store(true, Ordering::Release);
         }
-        // consumer スレッドが weak.upgrade で None を見るまで待つのと
-        // shutdown 経由で exit するのを両方カバー。
+        // consumer スレッドは shutdown flag を検知したら最終 drain を行って exit する。
         if let Ok(mut h) = self.consumer_handle.lock() {
             if let Some(handle) = h.take() {
                 let _ = handle.join();
