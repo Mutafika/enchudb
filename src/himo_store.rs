@@ -19,7 +19,7 @@ use crate::cylinder::Cylinder;
 use crate::cylinder_v27::BucketCylinder;
 use crate::region::Region;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum HimoType {
     Symbol = 0,
     Value = 1,

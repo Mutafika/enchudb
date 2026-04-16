@@ -212,18 +212,22 @@ fn duplicate_view_register() {
 fn views_max_count() {
     let path = tmp("views_max_count");
     let mut eng = Engine::create(&path).unwrap();
-    // 紐は 2 本だけ。同じ組合せの view を 32 個登録(重複許容のため)。
-    eng.define_himo("a", HimoType::Value, 2);
-    eng.define_himo("b", HimoType::Value, 2);
-    for _ in 0..32 {
-        let r = eng.define_view(&["a", "b"]);
+    // 紐を 33 ペア分用意(各ペアで異なる view)。紐 0..65 を定義。
+    for i in 0..66 {
+        eng.define_himo(&format!("h{}", i), HimoType::Value, 2);
+    }
+    for i in 0..32 {
+        let r = eng.define_view(&[&format!("h{}", i * 2), &format!("h{}", i * 2 + 1)]);
         assert!(r.is_ok(), "32 個目までは成功: {:?}", r);
     }
-    let r33 = eng.define_view(&["a", "b"]);
+    let r33 = eng.define_view(&["h64", "h65"]);
     assert!(r33.is_err(), "33 個目は Err");
     let msg = r33.unwrap_err();
     assert!(msg.contains("too many") || msg.contains("32"),
             "エラーメッセージに上限の情報: {}", msg);
+    // 冪等: 既存 view の再登録は OK(カウント増えない)
+    let r_dup = eng.define_view(&["h0", "h1"]);
+    assert!(r_dup.is_ok(), "重複 view は冪等で Ok");
     cleanup(&path);
 }
 
@@ -319,6 +323,7 @@ fn delete_unknown_entity() {
 
 /// 同じ紐名で tie と tie_text を混在 → 型は最初の define で確定、
 /// 以降は元の型として扱われる(get_text は型不一致で None)。
+#[cfg(not(debug_assertions))]
 #[test]
 fn value_then_text_same_himo() {
     let path = tmp("type_mix");
@@ -331,7 +336,7 @@ fn value_then_text_same_himo() {
     eng.tie(e1, "x", 42);
     assert!(matches!(eng.himo_type("x"), Some(HimoType::Value)));
 
-    // 同じ紐名で tie_text → 型は変わらず Value のまま、vid が値として格納される
+    // release build: 型混在は silent に通る(debug_assert が発火しない)
     eng.tie_text(e2, "x", "hello");
     assert!(matches!(eng.himo_type("x"), Some(HimoType::Value)));
 

@@ -1006,6 +1006,7 @@ impl Engine {
     pub fn tie_text(&mut self, eid: u32, himo: &str, value: &str) {
         let vid = self.vocab.get_or_insert(value.as_bytes());
         let hid = self.ensure_himo(himo, HimoType::Symbol, 0);
+        debug_assert_eq!(self.himo_types[hid], HimoType::Symbol, "tie_text on non-Symbol himo '{}'", himo);
         self.record_undo(eid, hid);
         #[cfg(feature = "v27")]
         let old_val = self.himos[hid].get_value(eid);
@@ -1017,6 +1018,7 @@ impl Engine {
     pub fn tie(&mut self, eid: u32, himo: &str, value: u32) {
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = self.ensure_himo(himo, HimoType::Value, 0);
+        debug_assert!(self.himo_types[hid] == HimoType::Value || self.himo_types[hid] == HimoType::Ref, "tie on non-Value himo '{}'", himo);
         self.record_undo(eid, hid);
         #[cfg(feature = "v27")]
         let old_val = self.himos[hid].get_value(eid);
@@ -1028,6 +1030,7 @@ impl Engine {
     pub fn tie_ref(&mut self, eid: u32, himo: &str, target_eid: u32) {
         assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
         let hid = self.ensure_himo(himo, HimoType::Ref, 0);
+        debug_assert!(self.himo_types[hid] == HimoType::Ref || self.himo_types[hid] == HimoType::Value, "tie_ref on non-Ref himo '{}'", himo);
         self.record_undo(eid, hid);
         #[cfg(feature = "v27")]
         let old_val = self.himos[hid].get_value(eid);
@@ -1044,6 +1047,7 @@ impl Engine {
         let vid = self.vocab.get_or_insert(value.as_bytes());
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
+        debug_assert_eq!(self.himo_types[hid], HimoType::Symbol, "tie_text_to on non-Symbol himo '{}'", himo);
         self.record_undo(eid, hid);
         #[cfg(feature = "v27")]
         let old_val = self.himos[hid].get_value(eid);
@@ -1057,6 +1061,7 @@ impl Engine {
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
+        debug_assert!(self.himo_types[hid] == HimoType::Value || self.himo_types[hid] == HimoType::Ref, "tie_to on non-Value himo '{}'", himo);
         self.record_undo(eid, hid);
         #[cfg(feature = "v27")]
         let old_val = self.himos[hid].get_value(eid);
@@ -1070,6 +1075,7 @@ impl Engine {
         assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
+        debug_assert!(self.himo_types[hid] == HimoType::Ref || self.himo_types[hid] == HimoType::Value, "tie_ref_to on non-Ref himo '{}'", himo);
         self.record_undo(eid, hid);
         #[cfg(feature = "v27")]
         let old_val = self.himos[hid].get_value(eid);
@@ -1414,15 +1420,29 @@ impl Engine {
         if himos.len() > MAX_VIEW_HIMOS {
             return Err(format!("view has too many himos (max {})", MAX_VIEW_HIMOS));
         }
-        if self.tuples.read().unwrap().views.len() >= MAX_PERSISTED_VIEWS {
-            return Err(format!("too many views (max {})", MAX_PERSISTED_VIEWS));
-        }
 
         let mut idxs: Vec<usize> = Vec::with_capacity(himos.len());
         for &name in himos {
             let idx = self.himo_id(name)
                 .ok_or_else(|| format!("himo '{}' not defined", name))?;
             idxs.push(idx);
+        }
+        idxs.sort();
+
+        // 冪等: ソート正規化後に既存 view と一致すれば no-op
+        {
+            let tuples = self.tuples.read().unwrap();
+            for v in &tuples.views {
+                let mut existing = v.himos.clone();
+                existing.sort();
+                if existing == idxs {
+                    return Ok(());
+                }
+            }
+        }
+
+        if self.tuples.read().unwrap().views.len() >= MAX_PERSISTED_VIEWS {
+            return Err(format!("too many views (max {})", MAX_PERSISTED_VIEWS));
         }
 
         // 内部構築 → 成功したらヘッダに永続化 + 追加
