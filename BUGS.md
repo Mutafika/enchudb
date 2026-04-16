@@ -1,5 +1,18 @@
 # EnchuDB バグ記録
 
+## [修正済み] v27 BucketCylinder の silent value clamp(データ破壊)
+**日付**: 2026-04-15
+**箇所**: `cylinder_v27.rs` — `bucket_index()`、`himo_store.rs` (v27)、`write_queue.rs`、`engine.rs`(`create_concurrent`/`concurrentize`/`tie_async`)
+
+`BucketCylinder::bucket_index` が `value > max_values` の時に最終バケットに silent clamp していた。tie した値と pull できる値が暗黙にズレるためデータ破壊の温床。さらに `max_values` が「値制限」のように誤解されていた。
+
+- **症状**: define_himo("x", Value, 10) のあと tie(e, "x", 100) すると、pull_raw("x", 10) と pull_raw("x", 100) で同じ entity が返る。get(e, "x") は元値 100 を返すので不一致。
+- **修正**:
+  1. `BucketCylinder` を動的拡張(`Vec::resize`)。`bucket_index` から clamp を撤廃、範囲外は空 slice。
+  2. `max_values` は「索引サイズのヒント」と再定義。任意の u32 を tie 可能。
+  3. `unique_count: AtomicU32` を `HimoStore` に追加。`himo_cardinality(name)` API として公開(O(1))。
+  4. `WriteQueue` を `ArrayQueue` → `SegQueue` 化(unbounded)。`create_concurrent`/`concurrentize` の `queue_cap` 引数を削除、`tie_async` の back-pressure 撤廃。
+
 ## [修正済み] Vocabulary ハッシュテーブルの無限ループ
 **日付**: 2026-04-04
 **箇所**: `vocabulary.rs` — `lookup()`, `index_insert()`

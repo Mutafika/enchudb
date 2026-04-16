@@ -1247,6 +1247,18 @@ impl Engine {
         self.himo_id(himo).map(|idx| self.himo_types[idx])
     }
 
+    /// 指定紐の現在の unique 値数(非空バケット数)。O(1)。
+    /// 紐が未定義なら None。
+    ///
+    /// v27 の BucketCylinder は tie/untie/remove 時に AtomicU32 を増減させる。
+    /// `define_himo` の `max_values` はヒントに過ぎないので、ここで返るのは
+    /// 実データ上の cardinality。
+    #[cfg(feature = "v27")]
+    pub fn himo_cardinality(&self, himo: &str) -> Option<u32> {
+        let idx = self.himo_id(himo)?;
+        Some(self.himos[idx].unique_count())
+    }
+
     // ──── 紐を引く（Cylinder 経由）────
 
     /// Cylinder + Bitmap キャッシュを再構築。delta をクリア。
@@ -1934,10 +1946,12 @@ impl Engine {
     /// `Arc::get_mut` 経由(定義の前に呼ぶ前提)で行う、もしくは本関数の前に
     /// `create_with_capacity` で定義済み状態を作ってから `concurrentize` する
     /// パターンを使う。
+    ///
+    /// WriteQueue は `SegQueue`(unbounded)。cap 指定は不要。
     #[cfg(all(feature = "v27", not(target_arch = "wasm32")))]
-    pub fn create_concurrent(path: &str, queue_cap: usize) -> io::Result<std::sync::Arc<Self>> {
+    pub fn create_concurrent(path: &str) -> io::Result<std::sync::Arc<Self>> {
         let eng = Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)?;
-        Ok(Self::spawn_consumer(eng, queue_cap))
+        Ok(Self::spawn_consumer(eng))
     }
 
     /// 既存の `Engine`(create や create_with_capacity で作成済み、define_himo も
@@ -1946,17 +1960,17 @@ impl Engine {
     /// 返り値の `Arc<Engine>` を各 writer/reader スレッドで clone して使う。
     /// Drop(最後の Arc が落ちた時)で consumer スレッドは join される。
     #[cfg(feature = "v27")]
-    pub fn concurrentize(eng: Self, queue_cap: usize) -> std::sync::Arc<Self> {
-        Self::spawn_consumer(eng, queue_cap)
+    pub fn concurrentize(eng: Self) -> std::sync::Arc<Self> {
+        Self::spawn_consumer(eng)
     }
 
     #[cfg(feature = "v27")]
-    fn spawn_consumer(mut eng: Self, queue_cap: usize) -> std::sync::Arc<Self> {
+    fn spawn_consumer(mut eng: Self) -> std::sync::Arc<Self> {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
         use crate::write_queue::WriteQueue;
 
-        let queue = Arc::new(WriteQueue::new(queue_cap));
+        let queue = Arc::new(WriteQueue::new());
         let shutdown = Arc::new(AtomicBool::new(false));
 
         eng.write_queue = Some(queue.clone());
@@ -2045,7 +2059,7 @@ impl Engine {
 
     /// 非同期 tie。`create_concurrent`/`concurrentize` で有効化済みの場合のみ使える。
     /// 紐名は事前に `define_himo` で定義されている必要がある。
-    /// queue 満杯なら spin + yield でリトライ(back-pressure)。
+    /// WriteQueue は SegQueue(unbounded)なので push は必ず成功する。
     #[cfg(feature = "v27")]
     pub fn tie_async(&self, eid: u32, himo: &str, value: u32) {
         use std::sync::atomic::Ordering;
@@ -2054,20 +2068,9 @@ impl Engine {
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
         let q = self.write_queue.as_ref()
             .expect("tie_async requires create_concurrent or concurrentize");
-        let mut op = crate::write_queue::Op::Tie { eid, himo_id: hid as u16, value };
-        loop {
-            match q.push(op) {
-                Ok(()) => {
-                    // push 成功を公開。flush_writes の同期点。
-                    self.push_count.fetch_add(1, Ordering::Release);
-                    return;
-                }
-                Err(returned) => {
-                    op = returned;
-                    std::thread::yield_now();
-                }
-            }
-        }
+        q.push(crate::write_queue::Op::Tie { eid, himo_id: hid as u16, value });
+        // push 成功を公開。flush_writes の同期点。
+        self.push_count.fetch_add(1, Ordering::Release);
     }
 
     /// 非同期 untie。
@@ -2076,19 +2079,8 @@ impl Engine {
         use std::sync::atomic::Ordering;
         let hid = match self.himo_id(himo) { Some(x) => x, None => return };
         let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
-        let mut op = crate::write_queue::Op::Untie { eid, himo_id: hid as u16 };
-        loop {
-            match q.push(op) {
-                Ok(()) => {
-                    self.push_count.fetch_add(1, Ordering::Release);
-                    return;
-                }
-                Err(returned) => {
-                    op = returned;
-                    std::thread::yield_now();
-                }
-            }
-        }
+        q.push(crate::write_queue::Op::Untie { eid, himo_id: hid as u16 });
+        self.push_count.fetch_add(1, Ordering::Release);
     }
 
     /// 非同期 delete。
@@ -2096,19 +2088,8 @@ impl Engine {
     pub fn delete_async(&self, eid: u32) {
         use std::sync::atomic::Ordering;
         let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
-        let mut op = crate::write_queue::Op::Delete { eid };
-        loop {
-            match q.push(op) {
-                Ok(()) => {
-                    self.push_count.fetch_add(1, Ordering::Release);
-                    return;
-                }
-                Err(returned) => {
-                    op = returned;
-                    std::thread::yield_now();
-                }
-            }
-        }
+        q.push(crate::write_queue::Op::Delete { eid });
+        self.push_count.fetch_add(1, Ordering::Release);
     }
 
     /// push 済みの全 Op が apply 完了するまで spin 待ち。`tie_async` の同期点。
@@ -2604,7 +2585,14 @@ mod tests {
         let result = eng.pull_raw("ts", ts);
         assert_eq!(result, vec![e]);
 
+        // v24/v26 は Cylinder が max_values で clamp するため u32::MAX-2 も OK。
+        // v27 は silent clamp を廃止して動的拡張するので、u32::MAX-2 だと
+        // バケット 40 億本分の Vec を確保してしまう。ここでは代わりに
+        // 100 万オーダーの「大きめ値」で検証する。
+        #[cfg(not(feature = "v27"))]
         let big = u32::MAX - 2;
+        #[cfg(feature = "v27")]
+        let big = 1_000_000u32;
         let e2 = eng.entity();
         eng.tie(e2, "huge", big);
         assert_eq!(eng.get(e2, "huge"), Some(big));
@@ -3695,7 +3683,7 @@ mod tests {
         eng.define_himo("age", HimoType::Value, 200);
         let eids: Vec<u32> = (0..100).map(|_| eng.entity()).collect();
 
-        let arc = Engine::concurrentize(eng, 1024);
+        let arc = Engine::concurrentize(eng);
         for (i, &e) in eids.iter().enumerate() {
             arc.tie_async(e, "age", (i as u32) % 50);
         }
@@ -3726,7 +3714,7 @@ mod tests {
             eng.tie(e, "k", (i as u32) % 16);
         }
 
-        let arc = Engine::concurrentize(eng, 8192);
+        let arc = Engine::concurrentize(eng);
         let stop = Arc::new(AtomicBool::new(false));
 
         let mut handles = Vec::new();

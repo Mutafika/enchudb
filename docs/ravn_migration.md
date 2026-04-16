@@ -36,6 +36,10 @@ impl Engine {
     pub fn get(&self, eid: u32, himo: &str) -> Option<u32>;
     pub fn pull_raw(&self, himo: &str, value: u32) -> Vec<u32>;  // 1 紐
     pub fn query(&self, conds: &[(&str, u32)]) -> Vec<u32>;      // 多条件(観測窓を自動選択)
+
+    // ──── スキーマ問い合わせ ────
+    pub fn himo_type(&self, himo: &str) -> Option<HimoType>;
+    pub fn himo_cardinality(&self, himo: &str) -> Option<u32>;   // v27、現在の unique 値数(O(1))
 }
 ```
 

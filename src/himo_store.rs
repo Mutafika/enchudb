@@ -8,6 +8,8 @@
 
 #[cfg(not(feature = "v27"))]
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+#[cfg(feature = "v27")]
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::cell::UnsafeCell;
 
 use crate::column::Column;
@@ -312,7 +314,11 @@ pub struct HimoStore {
     col: UnsafeCell<Column>,
     cyl: RwLock<BucketCylinder>,
     pub himo_type: HimoType,
+    /// 初期 bucket サイズのヒント。0 は「ヒントなし、必要時に拡張」。
+    /// 実際の値制限ではない。value > max_values でも tie 可能(BucketCylinder が動的拡張)。
     pub max_values: u32,
+    /// 現在の unique 値数(非空バケット数)。`himo_cardinality` API が参照する。
+    unique_count: AtomicU32,
 }
 
 #[cfg(feature = "v27")]
@@ -324,27 +330,29 @@ unsafe impl Send for HimoStore {}
 impl HimoStore {
     pub fn init(col_region: Region, ht: HimoType, max_values: u32, max_entities: u32) -> Self {
         let col = Column::init(col_region, 4, max_entities);
-        let effective_max = if max_values == 0 { 65_536 } else { max_values };
-        let cyl = BucketCylinder::new(effective_max, max_entities);
+        // max_values == 0 は「ヒントなし」。bucket を空で作って必要時に拡張。
+        let cyl = BucketCylinder::new(max_values, max_entities);
         Self {
             col: UnsafeCell::new(col),
             cyl: RwLock::new(cyl),
             himo_type: ht,
             max_values,
+            unique_count: AtomicU32::new(0),
         }
     }
 
     pub fn load(col_region: Region, ht: HimoType, max_values: u32) -> Self {
         let col = Column::load(col_region);
         let max_entities = col.max_entities;
-        let effective_max = if max_values == 0 { 65_536 } else { max_values };
-        let mut cyl = BucketCylinder::new(effective_max, max_entities);
+        let mut cyl = BucketCylinder::new(max_values, max_entities);
         cyl.rebuild_from_column(&col);
+        let uniq = cyl.unique_count();
         Self {
             col: UnsafeCell::new(col),
             cyl: RwLock::new(cyl),
             himo_type: ht,
             max_values,
+            unique_count: AtomicU32::new(uniq),
         }
     }
 
@@ -355,14 +363,31 @@ impl HimoStore {
     pub fn set(&self, eid: u32, value: u32) {
         self.col().ensure_count(eid);
         self.col().set(eid, &(value + 1).to_le_bytes());
-        self.cyl.write().unwrap().insert(eid, value);
+        let delta = self.cyl.write().unwrap().insert(eid, value);
+        self.apply_unique_delta(delta);
     }
 
     pub fn remove(&self, eid: u32) {
         if eid < self.col().count() {
             self.col().clear(eid);
-            self.cyl.write().unwrap().remove(eid);
+            let delta = self.cyl.write().unwrap().remove(eid);
+            self.apply_unique_delta(delta);
         }
+    }
+
+    #[inline]
+    fn apply_unique_delta(&self, delta: crate::cylinder_v27::UniqueDelta) {
+        if delta.added > 0 {
+            self.unique_count.fetch_add(delta.added, Ordering::Relaxed);
+        }
+        if delta.removed > 0 {
+            self.unique_count.fetch_sub(delta.removed, Ordering::Relaxed);
+        }
+    }
+
+    /// 現在の unique 値数(非空バケット数)。O(1)。
+    pub fn unique_count(&self) -> u32 {
+        self.unique_count.load(Ordering::Relaxed)
     }
 
     // ──── 読む ────
@@ -387,12 +412,15 @@ impl HimoStore {
         self.col().ensure_count(eid);
         let stored = u32::from_le_bytes(*old_bytes);
         self.col().set(eid, old_bytes);
-        let mut cyl = self.cyl.write().unwrap();
-        if stored == 0 {
-            cyl.remove(eid);
-        } else {
-            cyl.insert(eid, stored - 1);
-        }
+        let delta = {
+            let mut cyl = self.cyl.write().unwrap();
+            if stored == 0 {
+                cyl.remove(eid)
+            } else {
+                cyl.insert(eid, stored - 1)
+            }
+        };
+        self.apply_unique_delta(delta);
     }
 
     // ──── 引く ────

@@ -19,7 +19,6 @@ fn main() {
     let _ = std::fs::remove_file(path);
 
     let n_initial = 500_000u32;
-    let queue_cap = 4_000_000; // 4M 件の queue (~48MB)
 
     // まず define_himo + 初期データ投入は &mut self の世界で完了させる。
     let mut db = enchudb::Engine::create_with_capacity(path, 2_000_000).unwrap();
@@ -39,9 +38,14 @@ fn main() {
     }
     println!("  投入時間: {:?}", t.elapsed());
 
-    // concurrentize で consumer スレッド起動
-    let db = enchudb::Engine::concurrentize(db, queue_cap);
+    // concurrentize で consumer スレッド起動(SegQueue unbounded)
+    let db = enchudb::Engine::concurrentize(db);
     println!("  concurrentize 完了、consumer thread 起動");
+    println!();
+    println!("=== himo_cardinality(初期投入後)===");
+    for h in &["tenant", "dept", "status", "age"] {
+        println!("  {}: {:?}", h, db.himo_cardinality(h));
+    }
 
     // ──── 1. tie_async レイテンシ(push のみ)────
     println!();

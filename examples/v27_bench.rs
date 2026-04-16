@@ -43,6 +43,12 @@ fn main() {
     println!("  総時間: {:?}", elapsed);
     println!("  tie 1件あたり: {:.1} ns", per_tie);
 
+    println!();
+    println!("=== himo_cardinality(投入後)===");
+    for h in &["tenant", "dept", "status", "grade", "city", "salary_band", "age"] {
+        println!("  {}: {:?}", h, db.himo_cardinality(h));
+    }
+
     // ──── rebuild 呼ばずに即クエリが通るか検証 ────
     println!();
     println!("=== rebuild 呼ばず即クエリ ===");

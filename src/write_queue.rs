@@ -3,10 +3,10 @@
 //! 複数 writer スレッドが `push` でオペレーションを投げ、
 //! 単一 consumer スレッドが `pop` で取り出して HimoStore に適用する。
 //!
-//! 満杯なら push は Err(op) を返す(back-pressure)。
-//! 呼び出し側(Engine::tie_async) は spin + yield でリトライする。
+//! SegQueue(crossbeam-queue の unbounded lock-free queue) を採用しているので、
+//! push は常に成功する。back-pressure もない。
 
-use crossbeam_queue::ArrayQueue;
+use crossbeam_queue::SegQueue;
 
 /// 非同期オペレーション。
 #[derive(Clone, Copy, Debug)]
@@ -20,18 +20,18 @@ pub enum Op {
 }
 
 pub struct WriteQueue {
-    queue: ArrayQueue<Op>,
+    queue: SegQueue<Op>,
 }
 
 impl WriteQueue {
-    pub fn new(cap: usize) -> Self {
-        Self { queue: ArrayQueue::new(cap.max(1)) }
+    pub fn new() -> Self {
+        Self { queue: SegQueue::new() }
     }
 
-    /// push。満杯なら Err(op) を返す。
+    /// push。SegQueue は unbounded なので常に成功する。
     #[inline]
-    pub fn push(&self, op: Op) -> Result<(), Op> {
-        self.queue.push(op)
+    pub fn push(&self, op: Op) {
+        self.queue.push(op);
     }
 
     /// pop。空なら None。
@@ -49,10 +49,11 @@ impl WriteQueue {
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
+}
 
-    #[inline]
-    pub fn capacity(&self) -> usize {
-        self.queue.capacity()
+impl Default for WriteQueue {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -62,10 +63,10 @@ mod tests {
 
     #[test]
     fn push_pop_basic() {
-        let q = WriteQueue::new(4);
+        let q = WriteQueue::new();
         assert!(q.is_empty());
-        q.push(Op::Tie { eid: 1, himo_id: 0, value: 10 }).unwrap();
-        q.push(Op::Untie { eid: 2, himo_id: 1 }).unwrap();
+        q.push(Op::Tie { eid: 1, himo_id: 0, value: 10 });
+        q.push(Op::Untie { eid: 2, himo_id: 1 });
         assert_eq!(q.len(), 2);
 
         match q.pop() {
@@ -87,10 +88,18 @@ mod tests {
     }
 
     #[test]
-    fn push_full_returns_err() {
-        let q = WriteQueue::new(2);
-        q.push(Op::Delete { eid: 1 }).unwrap();
-        q.push(Op::Delete { eid: 2 }).unwrap();
-        assert!(q.push(Op::Delete { eid: 3 }).is_err());
+    fn unbounded_push_accepts_many() {
+        let q = WriteQueue::new();
+        for i in 0..100_000u32 {
+            q.push(Op::Delete { eid: i });
+        }
+        assert_eq!(q.len(), 100_000);
+        for i in 0..100_000u32 {
+            match q.pop() {
+                Some(Op::Delete { eid }) => assert_eq!(eid, i),
+                _ => panic!("expected Delete({i})"),
+            }
+        }
+        assert!(q.is_empty());
     }
 }

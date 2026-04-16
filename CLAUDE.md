@@ -19,10 +19,18 @@ use enchudb::{Engine, HimoType};
 let mut db = Engine::create("/path/to/db.db").unwrap();
 // let db = Engine::open("/path/to/db.db").unwrap(); // 既存DBを開く（auto rebuild）
 
-// 紐を定義（max_values指定でprefix sum O(1) + bitmap AND が有効になる）
-db.define_himo("age", HimoType::Value, 100);    // 整数、値域0-100
-db.define_himo("dept", HimoType::Value, 20);     // 整数、値域0-20
-// define_himo しなくても tie 時に自動作成される（その場合 binary search O(log n)）
+// 紐を定義
+//   max_values は「索引カーディナリティのヒント」。値の上限ではない。
+//   v24/v26: prefix sum O(1) + bitmap AND が有効になる目安。
+//   v27: BucketCylinder の初期サイズヒント。超過値は動的拡張(silent clamp なし)。
+//   0 を渡すと「ヒントなし、必要時に拡張」。
+db.define_himo("age", HimoType::Value, 100);    // 整数、ヒント 0..=100
+db.define_himo("dept", HimoType::Value, 20);     // 整数、ヒント 0..=20
+// 100 や 20 を超える値も tie 可能(v27 は動的拡張、v24/v26 は max_values で clamp される注意点あり)。
+// define_himo しなくても tie 時に自動作成される。
+
+// 紐ごとの実カーディナリティ(v27 のみ、O(1))
+db.himo_cardinality("age");  // → Some(現在の unique 値数)
 
 // entity作成 + 紐を張る
 let e = db.entity();

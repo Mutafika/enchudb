@@ -38,8 +38,8 @@ fn max_himos_limit() {
 }
 
 /// `define_himo("x", Value, 10)` に対して value=9 は OK。
-/// value=10 も BucketCylinder のバケット数(max_values+1=11)に収まるので OK、
-/// value=11 も bucket clamp により 10 のバケットに入り、panic にはならない。
+/// max_values は索引サイズのヒント。実際の値制限ではないので、value=10 も
+/// value=11 も、BucketCylinder の動的拡張でそれぞれ独立のバケットに入る。
 #[test]
 fn max_values_boundary() {
     let path = tmp("max_values_boundary");
@@ -48,16 +48,20 @@ fn max_values_boundary() {
 
     let e9 = eng.entity();
     let e10 = eng.entity();
+    let e11 = eng.entity();
     eng.tie(e9, "x", 9);
     eng.tie(e10, "x", 10);
+    eng.tie(e11, "x", 11); // ヒント超え → 動的拡張
 
     assert_eq!(eng.get(e9, "x"), Some(9));
     assert_eq!(eng.get(e10, "x"), Some(10));
+    assert_eq!(eng.get(e11, "x"), Some(11));
 
-    // value=10 で引いても、Cylinder の max_values+1 番目バケットに入っているので
-    // 引ける(BucketCylinder::slice_one(10) → bucket[10])。
-    let pulled = eng.pull_raw("x", 10);
-    assert!(pulled.contains(&e10));
+    // clamp されず、それぞれ独立のバケットから返る。
+    let p10 = eng.pull_raw("x", 10);
+    assert_eq!(p10, vec![e10]);
+    let p11 = eng.pull_raw("x", 11);
+    assert_eq!(p11, vec![e11]);
 
     cleanup(&path);
 }
@@ -103,15 +107,22 @@ fn zero_value_tie() {
     cleanup(&path);
 }
 
-/// `tie(e, "x", u32::MAX - 1)` は成功、`tie(e, "x", u32::MAX)` は panic
-/// (u32::MAX は sentinel として予約)。
+/// 大きめ value(define_himo の max_values ヒント超え)でも tie できる。
+/// BucketCylinder は silent clamp せず動的拡張する。
+/// u32::MAX-1 相当まで詰めるとバケット数が 40 億になるため現実的ではないので、
+/// ここでは 10 万オーダーで動的拡張を確認する。
 #[test]
-fn max_value_minus_one_ok() {
-    let path = tmp("max_minus_one_ok");
+fn tie_large_value_expands_buckets() {
+    let path = tmp("large_value_expand");
     let mut eng = Engine::create(&path).unwrap();
+    eng.define_himo("x", HimoType::Value, 10); // ヒント 10
     let e = eng.entity();
-    eng.tie(e, "x", u32::MAX - 1);
-    assert_eq!(eng.get(e, "x"), Some(u32::MAX - 1));
+    eng.tie(e, "x", 100_000);
+    assert_eq!(eng.get(e, "x"), Some(100_000));
+    let pulled = eng.pull_raw("x", 100_000);
+    assert_eq!(pulled, vec![e]);
+    // 未使用バケットは空。
+    assert!(eng.pull_raw("x", 500).is_empty());
     cleanup(&path);
 }
 
@@ -437,7 +448,7 @@ fn file_version_mismatch() {
 fn concurrentize_with_empty() {
     let path = tmp("concurrent_empty");
     let eng = Engine::create(&path).unwrap();
-    let arc = Engine::concurrentize(eng, 64);
+    let arc = Engine::concurrentize(eng);
 
     // pending は 0
     assert_eq!(arc.pending_writes(), 0);
@@ -460,7 +471,7 @@ fn concurrentize_basic_lifecycle() {
     let path = tmp("concurrent_basic");
     let mut eng = Engine::create(&path).unwrap();
     eng.define_himo("x", HimoType::Value, 16);
-    let arc: Arc<Engine> = Engine::concurrentize(eng, 64);
+    let arc: Arc<Engine> = Engine::concurrentize(eng);
 
     let e = arc.entity();
     arc.tie_async(e, "x", 5);
@@ -468,5 +479,96 @@ fn concurrentize_basic_lifecycle() {
     assert_eq!(arc.get(e, "x"), Some(5));
 
     drop(arc);
+    cleanup(&path);
+}
+
+// ──────────────────────────────────────────────────────────────────
+// 8. 動的拡張 / unique_count / himo_cardinality
+// ──────────────────────────────────────────────────────────────────
+
+/// max_values=10 というヒントで定義しても、value=1000 を tie すれば
+/// BucketCylinder が動的に resize して引ける。clamp されない。
+#[test]
+fn test_dynamic_bucket_expansion() {
+    let path = tmp("dyn_bucket_expand");
+    let mut eng = Engine::create(&path).unwrap();
+    eng.define_himo("x", HimoType::Value, 10);
+    let e = eng.entity();
+    eng.tie(e, "x", 1000);
+    let pulled = eng.pull_raw("x", 1000);
+    assert_eq!(pulled, vec![e]);
+    // clamp で 10 のバケットに落ちてたら bucket[10] に入って、引ける。
+    // 逆に 10 では引けないはず。
+    assert!(eng.pull_raw("x", 10).is_empty(),
+            "value=10 は誰も tie してないので空のはず");
+    cleanup(&path);
+}
+
+/// tie → untie → delete で unique_count が正しく増減する。
+#[test]
+fn test_unique_count_basic() {
+    let path = tmp("uniq_count_basic");
+    let mut eng = Engine::create(&path).unwrap();
+    eng.define_himo("k", HimoType::Value, 100);
+    assert_eq!(eng.himo_cardinality("k"), Some(0));
+
+    let e1 = eng.entity();
+    let e2 = eng.entity();
+    let e3 = eng.entity();
+
+    eng.tie(e1, "k", 3);
+    assert_eq!(eng.himo_cardinality("k"), Some(1));
+    eng.tie(e2, "k", 3); // 同じ値 → カーディナリティ据え置き
+    assert_eq!(eng.himo_cardinality("k"), Some(1));
+    eng.tie(e3, "k", 7);
+    assert_eq!(eng.himo_cardinality("k"), Some(2));
+
+    // untie しても、まだ 3 に 1 件残っている
+    eng.untie(e1, "k");
+    assert_eq!(eng.himo_cardinality("k"), Some(2));
+    // 最後の 1 件を untie → 3 が消える
+    eng.untie(e2, "k");
+    assert_eq!(eng.himo_cardinality("k"), Some(1));
+    // delete で最後の 7 も消える
+    eng.delete(e3);
+    assert_eq!(eng.himo_cardinality("k"), Some(0));
+
+    cleanup(&path);
+}
+
+/// 同じ eid を別値で上書き → unique_count が正しく動く。
+#[test]
+fn test_unique_count_with_replace() {
+    let path = tmp("uniq_count_replace");
+    let mut eng = Engine::create(&path).unwrap();
+    eng.define_himo("k", HimoType::Value, 10);
+    let e1 = eng.entity();
+    let e2 = eng.entity();
+
+    eng.tie(e1, "k", 1);
+    eng.tie(e2, "k", 1);
+    assert_eq!(eng.himo_cardinality("k"), Some(1));
+
+    // e1 を 1 → 2 に上書き。値 1 には e2 が残るので cardinality は +1。
+    eng.tie(e1, "k", 2);
+    assert_eq!(eng.himo_cardinality("k"), Some(2));
+
+    // e2 を 1 → 3。値 1 が消えて、値 3 が生まれる。±0。
+    eng.tie(e2, "k", 3);
+    assert_eq!(eng.himo_cardinality("k"), Some(2));
+    cleanup(&path);
+}
+
+/// himo_cardinality API: 未定義の紐は None、定義済みは 0 から。
+#[test]
+fn test_himo_cardinality_api() {
+    let path = tmp("card_api");
+    let mut eng = Engine::create(&path).unwrap();
+    assert_eq!(eng.himo_cardinality("unknown"), None);
+    eng.define_himo("k", HimoType::Value, 4);
+    assert_eq!(eng.himo_cardinality("k"), Some(0));
+    let e = eng.entity();
+    eng.tie(e, "k", 0);
+    assert_eq!(eng.himo_cardinality("k"), Some(1));
     cleanup(&path);
 }

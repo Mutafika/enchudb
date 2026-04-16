@@ -37,7 +37,7 @@ fn parallel_readers_during_writes() {
         eng.tie(e, "k", (i as u32) % 32);
     }
 
-    let arc = Engine::concurrentize(eng, 4096);
+    let arc = Engine::concurrentize(eng);
     let stop = Arc::new(AtomicBool::new(false));
     let reader_iters = Arc::new(AtomicU64::new(0));
 
@@ -103,7 +103,7 @@ fn read_after_flush_sees_writes() {
     let mut eng = Engine::create(&path).unwrap();
     eng.define_himo("v", HimoType::Value, 100);
 
-    let arc = Engine::concurrentize(eng, 4096);
+    let arc = Engine::concurrentize(eng);
     let n: u32 = 10_000;
 
     // entity を撒きつつ tie_async
@@ -131,18 +131,21 @@ fn read_after_flush_sees_writes() {
 }
 
 // ──────────────────────────────────────────────────────────────────
-// 3. queue が小さい状態で大量 push しても完走
+// 3. 大量 push しても SegQueue が受け付け、consumer が全件消化
 // ──────────────────────────────────────────────────────────────────
+//
+// 旧称 queue_backpressure: ArrayQueue の満杯時スピン挙動を確認していた。
+// SegQueue 化で cap が消え、push は常に成功する。いまは「大量 push でも
+// 完走し、件数が合う」ことを確認する。
 
 #[test]
-fn queue_backpressure() {
-    let path = tmp("backpressure");
+fn unbounded_queue_handles_burst() {
+    let path = tmp("unbounded_burst");
     let mut eng = Engine::create(&path).unwrap();
     eng.define_himo("k", HimoType::Value, 50);
     let eids: Vec<u32> = (0..10_000).map(|_| eng.entity()).collect();
 
-    // capacity 100 → push が頻繁に Err になり yield_now する
-    let arc = Engine::concurrentize(eng, 100);
+    let arc = Engine::concurrentize(eng);
 
     let started = Instant::now();
     for (i, &e) in eids.iter().enumerate() {
@@ -152,7 +155,7 @@ fn queue_backpressure() {
     let elapsed = started.elapsed();
 
     // 完走する(無限ループしない)。10000 件で 5 秒以内なら OK。
-    assert!(elapsed < Duration::from_secs(5), "backpressure too slow: {:?}", elapsed);
+    assert!(elapsed < Duration::from_secs(5), "burst too slow: {:?}", elapsed);
 
     let mut total = 0usize;
     for v in 0..50u32 {
@@ -175,7 +178,7 @@ fn flush_writes_drains_fully() {
     eng.define_himo("a", HimoType::Value, 10);
     let eids: Vec<u32> = (0..5_000).map(|_| eng.entity()).collect();
 
-    let arc = Engine::concurrentize(eng, 8192);
+    let arc = Engine::concurrentize(eng);
 
     for (i, &e) in eids.iter().enumerate() {
         arc.tie_async(e, "a", (i as u32) % 10);
@@ -202,7 +205,7 @@ fn drop_while_reading() {
         eng.tie(e, "k", (i as u32) % 16);
     }
 
-    let arc = Engine::concurrentize(eng, 1024);
+    let arc = Engine::concurrentize(eng);
     let stop = Arc::new(AtomicBool::new(false));
 
     let reader = {
@@ -242,7 +245,7 @@ fn drop_with_pending_writes() {
     eng.define_himo("k", HimoType::Value, 50);
     let eids: Vec<u32> = (0..3_000).map(|_| eng.entity()).collect();
 
-    let arc = Engine::concurrentize(eng, 4096);
+    let arc = Engine::concurrentize(eng);
 
     for (i, &e) in eids.iter().enumerate() {
         arc.tie_async(e, "k", (i as u32) % 50);
@@ -276,7 +279,7 @@ fn multiple_async_writers() {
     let mut eng = Engine::create(&path).unwrap();
     eng.define_himo("g", HimoType::Value, 8);
 
-    let arc = Engine::concurrentize(eng, 8192);
+    let arc = Engine::concurrentize(eng);
 
     let n_writers = 4;
     let per_writer: u32 = 1_000;
@@ -327,7 +330,7 @@ fn reader_sees_consistent_snapshot() {
     }
     let max_eid = eids.iter().copied().max().unwrap();
 
-    let arc = Engine::concurrentize(eng, 8192);
+    let arc = Engine::concurrentize(eng);
     let stop = Arc::new(AtomicBool::new(false));
     let oor = Arc::new(AtomicUsize::new(0));
 
@@ -406,7 +409,7 @@ fn long_running_query_during_writes() {
         eng.tie(e, "b", (i as u32 / 20) % 20);
     }
 
-    let arc = Engine::concurrentize(eng, 8192);
+    let arc = Engine::concurrentize(eng);
     let stop = Arc::new(AtomicBool::new(false));
 
     let mut handles = Vec::new();
@@ -486,7 +489,7 @@ fn panic_in_reader_doesnt_corrupt() {
         eng.tie(e, "k", (i as u32) % 16);
     }
 
-    let arc = Engine::concurrentize(eng, 1024);
+    let arc = Engine::concurrentize(eng);
 
     // panic する reader
     let panicker = {
