@@ -22,6 +22,7 @@ pub mod content_store;
 pub mod undo;
 pub mod engine;
 pub mod query_lang;
+pub mod ravn;
 pub mod cas;
 #[cfg(feature = "v27")]
 pub mod write_queue;
@@ -29,3 +30,4 @@ pub mod write_queue;
 pub use engine::{Engine, EntityValue};
 pub use himo_store::HimoType;
 pub use cas::{CASStore, BlockHash};
+pub use ravn::{Ravn, RavnResult};
