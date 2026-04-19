@@ -726,3 +726,113 @@ fn group_sum_with_query() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+// ─────────────────────────────────────────────────────────
+// 18. pull_range — 範囲クエリ
+// ─────────────────────────────────────────────────────────
+#[test]
+fn pull_range_basic() {
+    let path = db_path("range_basic");
+    let mut db = Engine::create(&path).unwrap();
+    db.define_himo("age", HimoType::Value, 100);
+
+    for age in 20..=40 {
+        let e = db.entity();
+        db.tie(e, "age", age);
+    }
+    db.rebuild();
+
+    let result = db.pull_range("age", 25, 30);
+    assert_eq!(result.len(), 6); // 25,26,27,28,29,30
+
+    let all = db.pull_range("age", 20, 40);
+    assert_eq!(all.len(), 21);
+
+    let empty = db.pull_range("age", 50, 60);
+    assert_eq!(empty.len(), 0);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// ─────────────────────────────────────────────────────────
+// 19. 日付ヘルパー
+// ─────────────────────────────────────────────────────────
+#[test]
+fn date_conversion_roundtrip() {
+    // 基準日
+    let d = Engine::date_to_days(2000, 1, 1);
+    assert_eq!(d, 0);
+    assert_eq!(Engine::days_to_date(0), (2000, 1, 1));
+
+    // 今日
+    let d = Engine::date_to_days(2026, 4, 20);
+    assert_eq!(Engine::days_to_date(d), (2026, 4, 20));
+
+    // うるう年
+    let d = Engine::date_to_days(2024, 2, 29);
+    assert_eq!(Engine::days_to_date(d), (2024, 2, 29));
+
+    // 年末
+    let d = Engine::date_to_days(2025, 12, 31);
+    assert_eq!(Engine::days_to_date(d), (2025, 12, 31));
+}
+
+#[test]
+fn tie_date_and_range() {
+    let path = db_path("date_range");
+    let mut db = Engine::create(&path).unwrap();
+    db.define_himo("created", HimoType::Value, 0);
+
+    // 2026年4月の10日分
+    for day in 1..=10 {
+        let e = db.entity();
+        db.tie_date(e, "created", 2026, 4, day);
+    }
+    db.rebuild();
+
+    // 日付で取得
+    let e0 = db.pull_date_range("created", (2026, 4, 1), (2026, 4, 1));
+    assert_eq!(e0.len(), 1);
+
+    // 4/3〜4/7
+    let week = db.pull_date_range("created", (2026, 4, 3), (2026, 4, 7));
+    assert_eq!(week.len(), 5);
+
+    // 全部
+    let all = db.pull_date_range("created", (2026, 4, 1), (2026, 4, 10));
+    assert_eq!(all.len(), 10);
+
+    // get_date で読み返し
+    let eid = e0[0];
+    assert_eq!(db.get_date(eid, "created"), Some((2026, 4, 1)));
+
+    // 範囲外
+    let none = db.pull_date_range("created", (2026, 5, 1), (2026, 5, 31));
+    assert_eq!(none.len(), 0);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn date_with_sum() {
+    let path = db_path("date_sum");
+    let mut db = Engine::create(&path).unwrap();
+    db.define_himo("date", HimoType::Value, 0);
+    db.define_himo("sales", HimoType::Value, 0);
+
+    // 4/1: 1000, 4/2: 2000, 4/3: 3000
+    for (day, amount) in [(1, 1000), (2, 2000), (3, 3000)] {
+        let e = db.entity();
+        db.tie_date(e, "date", 2026, 4, day);
+        db.tie(e, "sales", amount);
+    }
+    db.rebuild();
+
+    let april = db.pull_date_range("date", (2026, 4, 1), (2026, 4, 3));
+    assert_eq!(db.sum("sales", &april), 6000);
+
+    let first_two = db.pull_date_range("date", (2026, 4, 1), (2026, 4, 2));
+    assert_eq!(db.sum("sales", &first_two), 3000);
+
+    let _ = std::fs::remove_file(&path);
+}

@@ -1213,6 +1213,72 @@ impl Engine {
         map
     }
 
+    // ──── 範囲クエリ ────
+
+    /// 範囲内の全値に合致する entity を返す（min..=max）
+    pub fn pull_range(&self, himo: &str, min: u32, max: u32) -> Vec<u32> {
+        let idx = match self.himo_id(himo) { Some(h) => h, None => return vec![] };
+        let hs = &self.himos[idx];
+        let mut result = Vec::new();
+        for v in min..=max {
+            #[cfg(feature = "v27")]
+            { result.extend_from_slice(&hs.pull(v)); }
+            #[cfg(not(feature = "v27"))]
+            { result.extend_from_slice(hs.pull(v)); }
+        }
+        result
+    }
+
+    // ──── 日付ヘルパー ────
+
+    /// (year, month, day) → epoch 日数（2000-01-01 = 0）
+    pub fn date_to_days(year: u32, month: u32, day: u32) -> u32 {
+        let mut y = year as i64;
+        let mut m = month as i64;
+        if m <= 2 { y -= 1; m += 12; }
+        let days = 365 * y + y / 4 - y / 100 + y / 400 + (153 * (m - 3) + 2) / 5 + day as i64 - 1;
+        let epoch = {
+            let ey: i64 = 2000; let em: i64 = 1;
+            let ey2 = ey - 1; // Jan is <= 2, so y-1, m+12
+            let em2 = 13i64;
+            365 * ey2 + ey2 / 4 - ey2 / 100 + ey2 / 400 + (153 * (em2 - 3) + 2) / 5 + em as i64 - 1
+        };
+        (days - epoch) as u32
+    }
+
+    /// epoch 日数 → (year, month, day)
+    pub fn days_to_date(days: u32) -> (u32, u32, u32) {
+        // 2000-01-01 の Julian Day Number
+        let jdn = days as i64 + 2451545;
+        let a = jdn + 32044;
+        let b = (4 * a + 3) / 146097;
+        let c = a - (146097 * b) / 4;
+        let d = (4 * c + 3) / 1461;
+        let e = c - (1461 * d) / 4;
+        let m = (5 * e + 2) / 153;
+        let day = e - (153 * m + 2) / 5 + 1;
+        let month = m + 3 - 12 * (m / 10);
+        let year = 100 * b + d - 4800 + m / 10;
+        (year as u32, month as u32, day as u32)
+    }
+
+    /// 日付を epoch 日数として tie
+    pub fn tie_date(&mut self, eid: u32, himo: &str, year: u32, month: u32, day: u32) {
+        self.tie(eid, himo, Self::date_to_days(year, month, day));
+    }
+
+    /// epoch 日数から (year, month, day) を返す
+    pub fn get_date(&self, eid: u32, himo: &str) -> Option<(u32, u32, u32)> {
+        self.get(eid, himo).map(Self::days_to_date)
+    }
+
+    /// 日付範囲で pull_range
+    pub fn pull_date_range(&self, himo: &str, from: (u32, u32, u32), to: (u32, u32, u32)) -> Vec<u32> {
+        let min = Self::date_to_days(from.0, from.1, from.2);
+        let max = Self::date_to_days(to.0, to.1, to.2);
+        self.pull_range(himo, min, max)
+    }
+
     pub fn vocab_id(&self, text: &str) -> Option<u32> { self.vocab.lookup(text.as_bytes()) }
 
     /// 紐の文脈で文字列のvocab IDを探す。その紐にぶら下がってる値だけ調べる。
