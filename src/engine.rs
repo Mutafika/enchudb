@@ -1194,6 +1194,58 @@ impl Engine {
         total
     }
 
+    /// 最小値
+    pub fn min(&self, himo: &str, eids: &[u32]) -> Option<u32> {
+        let hid = self.himo_id(himo)?;
+        let hs = &self.himos[hid];
+        let mut result: Option<u32> = None;
+        for &eid in eids {
+            if let Some(v) = hs.get_value(eid) {
+                result = Some(result.map_or(v, |cur: u32| cur.min(v)));
+            }
+        }
+        result
+    }
+
+    /// 最大値
+    pub fn max(&self, himo: &str, eids: &[u32]) -> Option<u32> {
+        let hid = self.himo_id(himo)?;
+        let hs = &self.himos[hid];
+        let mut result: Option<u32> = None;
+        for &eid in eids {
+            if let Some(v) = hs.get_value(eid) {
+                result = Some(result.map_or(v, |cur: u32| cur.max(v)));
+            }
+        }
+        result
+    }
+
+    /// 平均（整数除算）
+    pub fn avg(&self, himo: &str, eids: &[u32]) -> Option<u64> {
+        let hid = self.himo_id(himo)?;
+        let hs = &self.himos[hid];
+        let mut total: u64 = 0;
+        let mut count: u64 = 0;
+        for &eid in eids {
+            if let Some(v) = hs.get_value(eid) {
+                total += v as u64;
+                count += 1;
+            }
+        }
+        if count == 0 { None } else { Some(total / count) }
+    }
+
+    /// 値を持つ entity の数
+    pub fn count(&self, himo: &str, eids: &[u32]) -> u32 {
+        let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
+        let hs = &self.himos[hid];
+        let mut n: u32 = 0;
+        for &eid in eids {
+            if hs.get_value(eid).is_some() { n += 1; }
+        }
+        n
+    }
+
     /// GROUP BY + SUM — group_himo の値でグループ化し、sum_himo の値を合計
     pub fn group_sum(&self, group_himo: &str, sum_himo: &str, eids: &[u32]) -> Vec<(u32, u64)> {
         let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };

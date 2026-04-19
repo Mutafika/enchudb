@@ -836,3 +836,63 @@ fn date_with_sum() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+// ─────────────────────────────────────────────────────────
+// 20. min / max / avg / count
+// ─────────────────────────────────────────────────────────
+#[test]
+fn aggregates() {
+    let path = db_path("aggregates");
+    let mut db = Engine::create(&path).unwrap();
+    db.define_himo("score", HimoType::Value, 0);
+
+    let mut eids = Vec::new();
+    for v in [10, 20, 30, 40, 50] {
+        let e = db.entity();
+        db.tie(e, "score", v);
+        eids.push(e);
+    }
+
+    assert_eq!(db.min("score", &eids), Some(10));
+    assert_eq!(db.max("score", &eids), Some(50));
+    assert_eq!(db.avg("score", &eids), Some(30)); // 150 / 5
+    assert_eq!(db.sum("score", &eids), 150);
+    assert_eq!(db.count("score", &eids), 5);
+
+    // 部分
+    assert_eq!(db.min("score", &eids[0..2]), Some(10));
+    assert_eq!(db.max("score", &eids[3..5]), Some(50));
+    assert_eq!(db.avg("score", &eids[0..2]), Some(15)); // (10+20)/2
+
+    // 空
+    assert_eq!(db.min("score", &[]), None);
+    assert_eq!(db.max("score", &[]), None);
+    assert_eq!(db.avg("score", &[]), None);
+    assert_eq!(db.count("score", &[]), 0);
+
+    // 存在しない紐
+    assert_eq!(db.min("nope", &eids), None);
+    assert_eq!(db.max("nope", &eids), None);
+    assert_eq!(db.avg("nope", &eids), None);
+    assert_eq!(db.count("nope", &eids), 0);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn aggregates_with_missing_values() {
+    let path = db_path("agg_missing");
+    let mut db = Engine::create(&path).unwrap();
+    db.define_himo("price", HimoType::Value, 0);
+
+    let e1 = db.entity(); db.tie(e1, "price", 100);
+    let e2 = db.entity(); // price なし
+    let e3 = db.entity(); db.tie(e3, "price", 300);
+
+    assert_eq!(db.min("price", &[e1, e2, e3]), Some(100));
+    assert_eq!(db.max("price", &[e1, e2, e3]), Some(300));
+    assert_eq!(db.avg("price", &[e1, e2, e3]), Some(200)); // (100+300)/2, e2 スキップ
+    assert_eq!(db.count("price", &[e1, e2, e3]), 2);
+
+    let _ = std::fs::remove_file(&path);
+}
