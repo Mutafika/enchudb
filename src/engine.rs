@@ -1181,6 +1181,38 @@ impl Engine {
         self.himos[hid].get_value(eid)
     }
 
+    /// 指定 entity 群の紐値を合計
+    pub fn sum(&self, himo: &str, eids: &[u32]) -> u64 {
+        let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
+        let hs = &self.himos[hid];
+        let mut total: u64 = 0;
+        for &eid in eids {
+            if let Some(v) = hs.get_value(eid) {
+                total += v as u64;
+            }
+        }
+        total
+    }
+
+    /// GROUP BY + SUM — group_himo の値でグループ化し、sum_himo の値を合計
+    pub fn group_sum(&self, group_himo: &str, sum_himo: &str, eids: &[u32]) -> Vec<(u32, u64)> {
+        let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
+        let sid = match self.himo_id(sum_himo) { Some(h) => h, None => return vec![] };
+        let gs = &self.himos[gid];
+        let ss = &self.himos[sid];
+        let mut map: Vec<(u32, u64)> = Vec::new();
+        for &eid in eids {
+            if let (Some(group), Some(val)) = (gs.get_value(eid), ss.get_value(eid)) {
+                if let Some(entry) = map.iter_mut().find(|(k, _)| *k == group) {
+                    entry.1 += val as u64;
+                } else {
+                    map.push((group, val as u64));
+                }
+            }
+        }
+        map
+    }
+
     pub fn vocab_id(&self, text: &str) -> Option<u32> { self.vocab.lookup(text.as_bytes()) }
 
     /// 紐の文脈で文字列のvocab IDを探す。その紐にぶら下がってる値だけ調べる。

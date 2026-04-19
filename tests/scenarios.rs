@@ -620,3 +620,109 @@ fn text_and_value_mixed() {
     // Symbol 紐に対する get_text と Value 紐に対する get の区別
     assert!(db.get_text(some_e, "age").is_none(), "get_text on Value himo returns None");
 }
+
+// ─────────────────────────────────────────────────────────
+// 16. sum — 指定 entity 群の紐値を合計
+// ─────────────────────────────────────────────────────────
+#[test]
+fn sum_basic() {
+    let path = db_path("sum_basic");
+    let mut db = Engine::create(&path).unwrap();
+    db.define_himo("cost", HimoType::Value, 0);
+
+    let mut eids = Vec::new();
+    for v in [100, 200, 300, 400] {
+        let e = db.entity();
+        db.tie(e, "cost", v);
+        eids.push(e);
+    }
+
+    assert_eq!(db.sum("cost", &eids), 1000);
+    assert_eq!(db.sum("cost", &eids[0..2]), 300);
+    assert_eq!(db.sum("cost", &[]), 0);
+    assert_eq!(db.sum("nonexistent", &eids), 0);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn sum_skips_missing_values() {
+    let path = db_path("sum_skip");
+    let mut db = Engine::create(&path).unwrap();
+    db.define_himo("price", HimoType::Value, 0);
+    db.define_himo("name", HimoType::Symbol, 0);
+
+    let e1 = db.entity(); db.tie(e1, "price", 50);
+    let e2 = db.entity(); // price なし
+    let e3 = db.entity(); db.tie(e3, "price", 30);
+
+    assert_eq!(db.sum("price", &[e1, e2, e3]), 80);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// ─────────────────────────────────────────────────────────
+// 17. group_sum — GROUP BY + SUM
+// ─────────────────────────────────────────────────────────
+#[test]
+fn group_sum_basic() {
+    let path = db_path("gsum_basic");
+    let mut db = Engine::create(&path).unwrap();
+    db.define_himo("project", HimoType::Value, 10);
+    db.define_himo("cost", HimoType::Value, 0);
+
+    // project 0: cost 100, 200
+    // project 1: cost 300, 400, 500
+    let mut eids = Vec::new();
+    for (proj, cost) in [(0, 100), (0, 200), (1, 300), (1, 400), (1, 500)] {
+        let e = db.entity();
+        db.tie(e, "project", proj);
+        db.tie(e, "cost", cost);
+        eids.push(e);
+    }
+
+    let result = db.group_sum("project", "cost", &eids);
+    assert_eq!(result.len(), 2);
+
+    let p0 = result.iter().find(|(k, _)| *k == 0).unwrap().1;
+    let p1 = result.iter().find(|(k, _)| *k == 1).unwrap().1;
+    assert_eq!(p0, 300);  // 100 + 200
+    assert_eq!(p1, 1200); // 300 + 400 + 500
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn group_sum_with_query() {
+    let path = db_path("gsum_query");
+    let mut db = Engine::create(&path).unwrap();
+    db.define_himo("status", HimoType::Value, 5);
+    db.define_himo("project", HimoType::Value, 10);
+    db.define_himo("material_cost", HimoType::Value, 0);
+
+    // status=1 (施工中): project 0 に 1000, 2000 / project 1 に 3000
+    // status=2 (完了): project 0 に 9999
+    for (status, proj, cost) in [(1, 0, 1000), (1, 0, 2000), (1, 1, 3000), (2, 0, 9999)] {
+        let e = db.entity();
+        db.tie(e, "status", status);
+        db.tie(e, "project", proj);
+        db.tie(e, "material_cost", cost);
+    }
+    db.rebuild();
+
+    // 施工中だけ取得
+    let active = db.pull_raw("status", 1);
+    assert_eq!(active.len(), 3);
+
+    // 工事別材料費
+    let result = db.group_sum("project", "material_cost", &active);
+    let p0 = result.iter().find(|(k, _)| *k == 0).unwrap().1;
+    let p1 = result.iter().find(|(k, _)| *k == 1).unwrap().1;
+    assert_eq!(p0, 3000);  // 1000 + 2000
+    assert_eq!(p1, 3000);
+
+    // 合計
+    assert_eq!(db.sum("material_cost", &active), 6000);
+
+    let _ = std::fs::remove_file(&path);
+}
