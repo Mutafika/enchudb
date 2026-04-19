@@ -993,7 +993,7 @@ impl Engine {
         eid
     }
 
-    pub(crate) fn entities(&self) -> Vec<u32> { self.entities.iter() }
+    pub fn entities(&self) -> Vec<u32> { self.entities.iter() }
     pub fn entity_count(&self) -> u32 { self.entities.count() }
     pub fn next_eid(&self) -> u32 { self.entities.next_eid() }
 
