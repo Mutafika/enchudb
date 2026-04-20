@@ -104,7 +104,9 @@ use crate::column::Column;
 use crate::cylinder::Cylinder;
 
 // ════════════════ ギャロッピング交差 ════════════════
+// 旧 v24/v26 経路で使っていた。v27+ でも将来再利用の余地あり。
 
+#[allow(dead_code)]
 #[inline]
 fn galloping_intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
     let (small, big) = if a.len() <= b.len() { (a, b) } else { (b, a) };
@@ -119,6 +121,7 @@ fn galloping_intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
     result
 }
 
+#[allow(dead_code)]
 #[inline]
 fn gallop_ge(big: &[u32], val: u32, lo: usize) -> usize {
     let n = big.len();
@@ -133,6 +136,7 @@ fn gallop_ge(big: &[u32], val: u32, lo: usize) -> usize {
 }
 
 /// bitmap から set bit の entity ID を抽出。
+#[allow(dead_code)]
 #[inline]
 fn extract_bitmap(bitmap: &[u64]) -> Vec<u32> {
     let mut result = Vec::new();
@@ -204,7 +208,6 @@ fn align8(n: usize) -> usize { (n + 7) & !7 }
 /// magic, version, max_entities, max_himos, himo_count,
 /// vocab_*, himoreg_*, content_data_size, cyl_max_values の固定レイアウト部のみ。
 /// himo_types/max_values 領域は runtime で変動するので CRC 範囲外。
-const HEADER_CRC_END: usize = H_CYL_MAX_VALUES + 4; // = 64
 
 #[inline]
 fn compute_header_crc(buf: &[u8]) -> u32 {
@@ -507,6 +510,7 @@ impl PairTable {
 struct PairEntry {
     himo_a: usize,
     himo_b: usize,
+    #[allow(dead_code)]
     card_a: u32,
     card_b: u32,
     cells: Vec<Vec<u32>>,
@@ -1609,7 +1613,7 @@ impl Engine {
             .collect()
     }
     /// 1 entity の全フィールドを一括取得。HashMap ルックアップ 0 回。
-    pub fn get_entity(&self, eid: u32) -> Vec<(&str, EntityValue)> {
+    pub fn get_entity(&self, eid: u32) -> Vec<(&str, EntityValue<'_>)> {
         let mut fields = Vec::with_capacity(self.himos.len());
         for (i, hs) in self.himos.iter().enumerate() {
             if let Some(raw) = hs.get_value(eid) {
@@ -1623,6 +1627,7 @@ impl Engine {
         fields
     }
 
+    #[allow(dead_code)]
     pub(crate) fn vocab(&self) -> &Vocabulary { &self.vocab }
     pub fn himo_names(&self) -> &[String] { &self.himo_names }
 
@@ -2015,6 +2020,7 @@ impl Engine {
     }
 
     /// Cylinder 結果に delta を適用。
+    #[allow(dead_code)]
     fn apply_delta(&self, himo_idx: usize, value: u32, cyl_result: &[u32], delta_eids: &[u32]) -> Vec<u32> {
         let hs = &self.himos[himo_idx];
 
@@ -2078,15 +2084,14 @@ impl Engine {
             }
         }
 
-        // 最小 Cylinder スライスのサイズを調べる
-        let mut min_slice_idx = 0;
+        // 最小 Cylinder スライスのサイズを調べる(実体は下の戦略選択で必要)
         let mut min_slice_len = usize::MAX;
-        for (i, &(idx, val)) in conds.iter().enumerate() {
+        for (_, &(idx, val)) in conds.iter().enumerate() {
             #[cfg(not(feature = "v27"))]
             let len = self.himos[idx].cylinder().slice_one(val).len();
             #[cfg(feature = "v27")]
             let len = self.himos[idx].slice_len(val);
-            if len < min_slice_len { min_slice_len = len; min_slice_idx = i; }
+            if len < min_slice_len { min_slice_len = len; }
         }
 
         // v27: 観測窓(n-tuple)とペアテーブル、最小 Cylinder スライスを比べて最小候補を選ぶ。
@@ -2251,6 +2256,7 @@ impl Engine {
         result
     }
 
+    #[allow(dead_code)]
     pub(crate) fn query_count(&self, strings: &[(&str, u32)]) -> usize {
         self.query(strings).len()
     }

@@ -24,7 +24,7 @@
 //! ```
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 const CRC_MAGIC: &[u8; 4] = b"ECRC";

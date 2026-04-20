@@ -17,6 +17,7 @@ const HEADER: usize = 16;
 
 pub struct Cylinder {
     region: Region,
+    #[allow(dead_code)]
     max_entities: u32,
     max_values: u32,
     total: AtomicU32,

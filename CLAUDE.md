@@ -210,18 +210,33 @@ let result = execute(&mut db, "age:30 city:\"東京\" | count");
 - **ロックフリー並行。** ダブルバッファCylinder + AtomicBool swap。rebuild中もreaderは止まらない。
 - **HashMap 不使用。** 紐名の解決は線形探索（himo_id）。紐数は高々数百なので十分速い。
 
-## アーキテクチャ（v26）
+## アーキテクチャ（v31）
 ```
-tie(entity, himo, value)
+tie_async(entity, himo, value)
   ↓
-Column（ソースオブトゥルース）→ mmap 永続化
-  ↓ rebuild
-Cylinder（1次元キャッシュ）→ mmap ダブルバッファ
-  ↓ rebuild_pairs
-PairTable（2次元キャッシュ）→ ヒープ（揮発）
-  ↓ update_pair_tie
-デルタシンク（即時反映）→ adds/removes → compact
+WAL append (memcpy、100ns)            → *.db.wal 永続化
+  ↓
+WriteQueue push (SegQueue、lock-free)
+  ↓
+consumer スレッドが pop
+  ↓
+BucketCylinder (v27、O(1) insert/remove)  → *.db mmap 永続化
+  ↓ (並行 & 非同期)
+PairTable (2次元キャッシュ、多条件 AND 70ns) → ヒープ
+  ↓ 100ms 毎に consumer が
+WAL fsync → body msync → checkpoint 前進 → WAL try_reset
+
+[読み側]
+pull_raw / query / get / Ravn.follow / reverse_follow / bfs
+  → WAL に一切触れない、hot path は v27 と同速
 ```
+
+**耐久性レイヤ**:
+- WAL(線形 mmap、CRC32 per record、ring buffer reset で長期運用可)
+- header CRC(open 時自動検証)
+- region CRC(`seal_integrity()` で opt-in、コールド検証)
+- file size 検証(truncate → SIGBUS 防止)
+- undo log(WAL commit で自動 clear、plain Engine 用)
 
 ### v26 で試して却下したもの
 - CAS（コンテンツアドレッサブル）→ to_vec + hash 再計算で 46μs/件。デルタシンクの 164ns に負け
