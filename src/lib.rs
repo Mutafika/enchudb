@@ -28,6 +28,12 @@ pub mod cas;
 pub mod write_queue;
 #[cfg(feature = "v27")]
 pub mod wal;
+#[cfg(feature = "v32")]
+pub mod hlc_store;
+#[cfg(feature = "v32")]
+pub mod transport;
+#[cfg(feature = "v32")]
+pub mod sync;
 pub mod integrity;
 
 pub use engine::{Engine, EntityValue};
@@ -78,6 +84,23 @@ impl Hlc {
     #[inline]
     pub fn cmp_key(&self) -> (u64, u32, u32) {
         (self.wall, self.logical, self.peer)
+    }
+
+    /// 受信した HLC をもとに自 peer の次 HLC を計算する(HLC の merge ルール)。
+    /// - wall = max(local_wall, received_wall, now_wall)
+    /// - logical = 新 wall が全部一致なら max(local_logical, received_logical)+1、でなければ 0
+    pub fn merge_recv(local: Hlc, recv: Hlc, now_wall: u64, local_peer: PeerId) -> Hlc {
+        let new_wall = local.wall.max(recv.wall).max(now_wall);
+        let new_logical = if new_wall == local.wall && new_wall == recv.wall {
+            local.logical.max(recv.logical).wrapping_add(1)
+        } else if new_wall == local.wall {
+            local.logical.wrapping_add(1)
+        } else if new_wall == recv.wall {
+            recv.logical.wrapping_add(1)
+        } else {
+            0
+        };
+        Hlc { wall: new_wall, logical: new_logical, peer: local_peer }
     }
 }
 

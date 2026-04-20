@@ -798,6 +798,12 @@ pub struct Engine {
     /// 背景 fsync が最後に completed した LSN。
     #[cfg(feature = "v27")]
     durable_lsn: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// v32: この Engine を所有する peer の id。分散時 eid の上位 32bit。
+    #[cfg(feature = "v32")]
+    peer_id: std::sync::atomic::AtomicU32,
+    /// v32: LWW 用に (eid, himo) → 最後の HLC を記録。
+    #[cfg(feature = "v32")]
+    hlc_store: std::sync::Arc<crate::hlc_store::HlcStore>,
     backing: Backing, // 最後に drop されるよう最終フィールド
 }
 
@@ -922,6 +928,10 @@ impl Engine {
             wal: None,
             #[cfg(feature = "v27")]
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "v32")]
+            peer_id: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "v32")]
+            hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             backing: Backing::Mmap(mmap),
         })
     }
@@ -1199,6 +1209,10 @@ impl Engine {
             wal: None,
             #[cfg(feature = "v27")]
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "v32")]
+            peer_id: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "v32")]
+            hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             backing,
         };
 
@@ -1219,16 +1233,108 @@ impl Engine {
     // ──── entity ────
 
     pub fn entity(&self) -> crate::EntityId {
-        let eid = self.entities.allocate();
-        self.undo.record(eid, 0xFFFF, &[1, 0, 0, 0]); // entity created
-        eid as crate::EntityId
+        let local = self.entities.allocate();
+        self.undo.record(local, 0xFFFF, &[1, 0, 0, 0]); // entity created
+        #[cfg(feature = "v32")]
+        {
+            let peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
+            crate::make_eid(peer, local)
+        }
+        #[cfg(not(feature = "v32"))]
+        {
+            local as crate::EntityId
+        }
     }
 
     pub fn entities(&self) -> Vec<crate::EntityId> {
-        self.entities.iter().into_iter().map(|e| e as crate::EntityId).collect()
+        #[cfg(feature = "v32")]
+        let peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(not(feature = "v32"))]
+        let peer: u32 = 0;
+        self.entities.iter().into_iter()
+            .map(|local| crate::make_eid(peer, local))
+            .collect()
     }
     pub fn entity_count(&self) -> u32 { self.entities.count() }
-    pub fn next_eid(&self) -> crate::EntityId { self.entities.next_eid() as crate::EntityId }
+    pub fn next_eid(&self) -> crate::EntityId {
+        #[cfg(feature = "v32")]
+        let peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(not(feature = "v32"))]
+        let peer: u32 = 0;
+        crate::make_eid(peer, self.entities.next_eid())
+    }
+
+    // ──── v32: peer_id ────
+
+    /// この Engine を所有する peer の id を設定。WAL にも反映される。
+    /// 起動時に 1 回だけ呼ぶ想定。
+    #[cfg(feature = "v32")]
+    pub fn set_peer_id(&self, peer: crate::PeerId) {
+        self.peer_id.store(peer, std::sync::atomic::Ordering::Release);
+        #[cfg(feature = "v27")]
+        if let Some(wal) = self.wal.as_ref() {
+            wal.set_peer_id(peer);
+        }
+    }
+
+    /// 現在の peer id。
+    #[cfg(feature = "v32")]
+    pub fn peer_id(&self) -> crate::PeerId {
+        self.peer_id.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// LWW 用 HlcStore への参照(sync モジュールが使う)。
+    #[cfg(feature = "v32")]
+    pub fn hlc_store(&self) -> &std::sync::Arc<crate::hlc_store::HlcStore> {
+        &self.hlc_store
+    }
+
+    /// WAL への参照(sync モジュールが publish に使う)。
+    #[cfg(all(feature = "v27", feature = "v32"))]
+    pub fn wal_arc(&self) -> Option<std::sync::Arc<crate::wal::Wal>> {
+        self.wal.clone()
+    }
+
+    // ──── v32: リモート peer から pull したレコードを apply する ────
+    // これらは LWW 判定を通った後の無条件 apply。HlcStore は Syncer が先に更新済み。
+
+    /// リモート peer から届いた Tie を apply。WAL には書き戻さない(2 重送信防止)。
+    #[cfg(feature = "v32")]
+    pub fn remote_tie_apply(&self, eid: crate::EntityId, himo_id: u16, value: u32) {
+        let local = crate::eid_local(eid);
+        let hid = himo_id as usize;
+        if hid >= self.himos.len() { return; }
+        // entity 未確保ならローカル側の EntitySet に登録(eid は peer 側が決めた値)
+        self.entities.ensure_live(local);
+        self.himos[hid].set(local, value);
+    }
+
+    /// リモート peer から届いた Untie を apply。
+    #[cfg(feature = "v32")]
+    pub fn remote_untie_apply(&self, eid: crate::EntityId, himo_id: u16) {
+        let local = crate::eid_local(eid);
+        let hid = himo_id as usize;
+        if hid >= self.himos.len() { return; }
+        self.himos[hid].remove(local);
+    }
+
+    /// リモート peer から届いた Delete を apply。
+    #[cfg(feature = "v32")]
+    pub fn remote_delete_apply(&self, eid: crate::EntityId) {
+        let local = crate::eid_local(eid);
+        for hid in 0..self.himos.len() {
+            self.himos[hid].remove(local);
+        }
+        self.entities.free(local);
+    }
+
+    /// リモート peer から届いた Content 書き込みを apply。
+    #[cfg(feature = "v32")]
+    pub fn remote_content_apply(&self, eid: crate::EntityId, key: &str, data: &[u8]) {
+        let local = crate::eid_local(eid);
+        self.entities.ensure_live(local);
+        self.contents.set(local, key, data);
+    }
 
     // ──── tie ────
 
