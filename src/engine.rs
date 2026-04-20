@@ -28,6 +28,11 @@ pub enum EntityValue<'a> {
     Content(&'a [u8]),
 }
 
+#[cfg(feature = "v27")]
+fn wal_path_for(path: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}.wal", path))
+}
+
 // ════════════════ バッキングストア ════════════════
 
 /// mmap (native) または Vec<u8> (wasm/テスト) のどちらかを保持。
@@ -712,6 +717,13 @@ pub struct Engine {
     /// consumer が apply 完了した累積件数。apply_count >= push_count が同期点。
     #[cfg(feature = "v27")]
     apply_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// v28 WAL。`create_concurrent_with_wal` or `open_concurrent_with_wal` で有効化。
+    /// Some なら tie_async/untie_async/delete_async は WAL append を先に実行する。
+    #[cfg(feature = "v27")]
+    wal: Option<std::sync::Arc<crate::wal::Wal>>,
+    /// 背景 fsync が最後に completed した LSN。
+    #[cfg(feature = "v27")]
+    durable_lsn: std::sync::Arc<std::sync::atomic::AtomicU64>,
     backing: Backing, // 最後に drop されるよう最終フィールド
 }
 
@@ -829,6 +841,10 @@ impl Engine {
             push_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "v27")]
             apply_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "v27")]
+            wal: None,
+            #[cfg(feature = "v27")]
+            durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             backing: Backing::Mmap(mmap),
         })
     }
@@ -964,6 +980,10 @@ impl Engine {
             push_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "v27")]
             apply_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "v27")]
+            wal: None,
+            #[cfg(feature = "v27")]
+            durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             backing,
         };
 
@@ -2120,6 +2140,72 @@ impl Engine {
         Ok(Self::spawn_consumer(eng))
     }
 
+    /// v28: WAL 付き create_concurrent。
+    /// `{path}.wal` に Write-Ahead Log を作成。
+    ///
+    /// tie_async / untie_async / delete_async は hot path で WAL append(memcpy)を行い、
+    /// consumer スレッドが背景で 100ms 毎に fsync + checkpoint。
+    ///
+    /// プロセス/OS クラッシュ時は open_concurrent_with_wal で最後の Commit まで復元される。
+    #[cfg(all(feature = "v27", not(target_arch = "wasm32")))]
+    pub fn create_concurrent_with_wal(path: &str, wal_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
+        let eng = Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)?;
+        let wal_path = wal_path_for(path);
+        let wal = std::sync::Arc::new(crate::wal::Wal::create(&wal_path, wal_capacity)?);
+        Ok(Self::spawn_consumer_with_wal(eng, Some(wal)))
+    }
+
+    /// v28: WAL 付き open_concurrent。既存 WAL があればリカバリする。
+    #[cfg(all(feature = "v27", not(target_arch = "wasm32")))]
+    pub fn open_concurrent_with_wal(path: &str, wal_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
+        let mut eng = Self::open(path)?;
+        let wal_path = wal_path_for(path);
+        let wal = if wal_path.exists() {
+            let w = crate::wal::Wal::open(&wal_path)?;
+            // リカバリ: commit されたレコードを本体に適用
+            let records = w.recover();
+            for rec in &records {
+                eng.apply_wal_op(&rec.op);
+            }
+            // 本体に適用し終えたので checkpoint を head まで前進
+            w.advance_checkpoint(w.head());
+            std::sync::Arc::new(w)
+        } else {
+            std::sync::Arc::new(crate::wal::Wal::create(&wal_path, wal_capacity)?)
+        };
+        Ok(Self::spawn_consumer_with_wal(eng, Some(wal)))
+    }
+
+    /// WAL の 1 op を本体に適用(recover 専用)。
+    #[cfg(feature = "v27")]
+    fn apply_wal_op(&mut self, op: &crate::wal::DecodedOp) {
+        use crate::wal::DecodedOp;
+        match op {
+            DecodedOp::Tie { eid, himo_id, value } => {
+                let hid = *himo_id as usize;
+                if hid < self.himos.len() {
+                    self.himos[hid].set(*eid, *value);
+                }
+            }
+            DecodedOp::Untie { eid, himo_id } => {
+                let hid = *himo_id as usize;
+                if hid < self.himos.len() {
+                    self.himos[hid].remove(*eid);
+                }
+            }
+            DecodedOp::Delete { eid } => {
+                for hid in 0..self.himos.len() {
+                    self.himos[hid].remove(*eid);
+                }
+                self.entities.free(*eid);
+            }
+            DecodedOp::Content { eid, key, data } => {
+                self.contents.set(*eid, key, data);
+            }
+            DecodedOp::Commit => {}
+        }
+    }
+
     /// 既存の `Engine`(create や create_with_capacity で作成済み、define_himo も
     /// 済ませたもの)を Arc 化して consumer スレッドを起動する。
     ///
@@ -2131,7 +2217,15 @@ impl Engine {
     }
 
     #[cfg(feature = "v27")]
-    fn spawn_consumer(mut eng: Self) -> std::sync::Arc<Self> {
+    fn spawn_consumer(eng: Self) -> std::sync::Arc<Self> {
+        Self::spawn_consumer_with_wal(eng, None)
+    }
+
+    #[cfg(feature = "v27")]
+    fn spawn_consumer_with_wal(
+        mut eng: Self,
+        wal: Option<std::sync::Arc<crate::wal::Wal>>,
+    ) -> std::sync::Arc<Self> {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
         use crate::write_queue::WriteQueue;
@@ -2141,39 +2235,59 @@ impl Engine {
 
         eng.write_queue = Some(queue.clone());
         eng.shutdown_flag = Some(shutdown.clone());
+        eng.wal = wal.clone();
 
         let arc = Arc::new(eng);
 
-        // consumer thread は Engine の raw pointer を持つ。Engine の fields は
-        // Drop::drop の本体実行中(handle.join を待っている間)は生きているので、
-        // consumer は shutdown_flag を見て終了する。flag が立った後は
-        // Engine にアクセスしない。
         let engine_ptr: *const Engine = Arc::as_ptr(&arc);
-        // 生ポインタを Send させるため usize にキャスト。
         let engine_addr = engine_ptr as usize;
         let q_for_thread = queue.clone();
         let flag_for_thread = shutdown.clone();
         let apply_count_for_thread = arc.apply_count.clone();
+        let wal_for_thread = wal.clone();
+        let durable_lsn_for_thread = arc.durable_lsn.clone();
 
         let handle = std::thread::Builder::new()
             .name("enchudb-consumer".into())
             .spawn(move || {
                 use std::sync::atomic::Ordering;
+                use std::time::{Duration, Instant};
                 let engine: &Engine = unsafe { &*(engine_addr as *const Engine) };
+                let fsync_interval = Duration::from_millis(100);
+                let mut last_fsync = Instant::now();
+
                 loop {
                     let mut drained_any = false;
                     while let Some(op) = q_for_thread.pop() {
                         drained_any = true;
                         engine.apply_op(op);
-                        // apply 完了を公開(Release)。flush_writes が Acquire で読む。
                         apply_count_for_thread.fetch_add(1, Ordering::Release);
                     }
 
+                    // 背景 fsync: WAL が有効で、前回 fsync から fsync_interval 経過 ＆
+                    // head が checkpoint より進んでいる時だけ実行
+                    if let Some(wal) = wal_for_thread.as_ref() {
+                        if last_fsync.elapsed() >= fsync_interval {
+                            let head = wal.head();
+                            if head > wal.checkpoint() {
+                                let _ = wal.fsync();
+                                wal.advance_checkpoint(head);
+                                let lsn = wal.next_lsn().saturating_sub(1);
+                                durable_lsn_for_thread.store(lsn, Ordering::Release);
+                            }
+                            last_fsync = Instant::now();
+                        }
+                    }
+
                     if flag_for_thread.load(Ordering::Acquire) {
-                        // shutdown → 最後の drain
                         while let Some(op) = q_for_thread.pop() {
                             engine.apply_op(op);
                             apply_count_for_thread.fetch_add(1, Ordering::Release);
+                        }
+                        // shutdown 時の最終 fsync
+                        if let Some(wal) = wal_for_thread.as_ref() {
+                            let _ = wal.fsync();
+                            wal.advance_checkpoint(wal.head());
                         }
                         return;
                     }
@@ -2187,6 +2301,28 @@ impl Engine {
 
         *arc.consumer_handle.lock().unwrap() = Some(handle);
         arc
+    }
+
+    /// 強制同期: WAL を fsync + checkpoint 前進。Sync mode 相当の待ち。
+    #[cfg(feature = "v27")]
+    pub fn wal_sync(&self) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        self.flush_writes();
+        if let Some(wal) = self.wal.as_ref() {
+            wal.fsync()?;
+            let head = wal.head();
+            wal.advance_checkpoint(head);
+            let lsn = wal.next_lsn().saturating_sub(1);
+            self.durable_lsn.store(lsn, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// 現在耐久化されている LSN(Commit を含む最後の WAL fsync 到達位置)。
+    #[cfg(feature = "v27")]
+    pub fn durable_lsn(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.durable_lsn.load(Ordering::Acquire)
     }
 
     /// consumer スレッド内部で呼ぶ。Op 1 個を適用。
@@ -2226,16 +2362,21 @@ impl Engine {
     /// 非同期 tie。`create_concurrent`/`concurrentize` で有効化済みの場合のみ使える。
     /// 紐名は事前に `define_himo` で定義されている必要がある。
     /// WriteQueue は SegQueue(unbounded)なので push は必ず成功する。
+    ///
+    /// WAL が有効な場合: tie_async は WAL append (memcpy) → WriteQueue push の順で実行する。
+    /// WAL append は `.wal` ファイルに memcpy 1 回、100ns オーダー。hot path で fsync しない。
     #[cfg(feature = "v27")]
     pub fn tie_async(&self, eid: u32, himo: &str, value: u32) {
         use std::sync::atomic::Ordering;
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
+        if let Some(wal) = self.wal.as_ref() {
+            let _ = wal.append(crate::wal::WalOp::Tie { eid, himo_id: hid as u16, value });
+        }
         let q = self.write_queue.as_ref()
             .expect("tie_async requires create_concurrent or concurrentize");
         q.push(crate::write_queue::Op::Tie { eid, himo_id: hid as u16, value });
-        // push 成功を公開。flush_writes の同期点。
         self.push_count.fetch_add(1, Ordering::Release);
     }
 
@@ -2244,6 +2385,9 @@ impl Engine {
     pub fn untie_async(&self, eid: u32, himo: &str) {
         use std::sync::atomic::Ordering;
         let hid = match self.himo_id(himo) { Some(x) => x, None => return };
+        if let Some(wal) = self.wal.as_ref() {
+            let _ = wal.append(crate::wal::WalOp::Untie { eid, himo_id: hid as u16 });
+        }
         let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
         q.push(crate::write_queue::Op::Untie { eid, himo_id: hid as u16 });
         self.push_count.fetch_add(1, Ordering::Release);
@@ -2253,10 +2397,27 @@ impl Engine {
     #[cfg(feature = "v27")]
     pub fn delete_async(&self, eid: u32) {
         use std::sync::atomic::Ordering;
+        if let Some(wal) = self.wal.as_ref() {
+            let _ = wal.append(crate::wal::WalOp::Delete { eid });
+        }
         let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
         q.push(crate::write_queue::Op::Delete { eid });
         self.push_count.fetch_add(1, Ordering::Release);
     }
+
+    /// 現在のトランザクションを WAL に commit marker で確定する。
+    /// Async モードでは fsync は consumer スレッドが背景で行う。
+    /// Sync モードでは commit 完了まで待つ(Phase 4 で実装)。
+    #[cfg(feature = "v27")]
+    pub fn wal_commit(&self) {
+        if let Some(wal) = self.wal.as_ref() {
+            let _ = wal.append(crate::wal::WalOp::Commit);
+        }
+    }
+
+    /// WAL への参照(テスト / 内部用)。
+    #[cfg(feature = "v27")]
+    pub fn wal(&self) -> Option<&std::sync::Arc<crate::wal::Wal>> { self.wal.as_ref() }
 
     /// push 済みの全 Op が apply 完了するまで spin 待ち。`tie_async` の同期点。
     /// `queue.is_empty()` は pop 直後 / apply 前のウィンドウで true になる race が

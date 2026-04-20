@@ -26,6 +26,8 @@ pub mod ravn;
 pub mod cas;
 #[cfg(feature = "v27")]
 pub mod write_queue;
+#[cfg(feature = "v27")]
+pub mod wal;
 
 pub use engine::{Engine, EntityValue};
 pub use himo_store::HimoType;
