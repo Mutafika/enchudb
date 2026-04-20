@@ -28,8 +28,11 @@ pub mod cas;
 pub mod write_queue;
 #[cfg(feature = "v27")]
 pub mod wal;
+pub mod integrity;
 
 pub use engine::{Engine, EntityValue};
+#[cfg(feature = "v27")]
+pub use engine::EngineStats;
 pub use himo_store::HimoType;
 pub use cas::{CASStore, BlockHash};
 pub use ravn::{Ravn, RavnResult};

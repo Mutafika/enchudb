@@ -140,6 +140,33 @@ fn wal_file_is_created() {
 }
 
 #[test]
+fn stats_snapshot() {
+    let path = tmp("stats");
+    {
+        let mut e = Engine::create_with_capacity(&path, 100).unwrap();
+        e.define_himo("n", HimoType::Value, 10);
+        e.flush().unwrap();
+    }
+    let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
+    for i in 0..50u32 {
+        let ent = eng.entity();
+        eng.tie_async(ent, "n", i);
+    }
+    eng.flush_writes();
+    eng.wal_sync().unwrap();
+
+    let s = eng.stats();
+    assert_eq!(s.entity_count, 50);
+    assert!(s.wal_head > 0);
+    assert_eq!(s.wal_head, s.wal_checkpoint, "after wal_sync, checkpoint == head");
+    assert!(s.durable_lsn > 0);
+    assert_eq!(s.pushed, s.applied);
+
+    drop(eng);
+    cleanup(&path);
+}
+
+#[test]
 fn content_async_roundtrip() {
     let path = tmp("content_async");
     {

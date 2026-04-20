@@ -28,6 +28,32 @@ pub enum EntityValue<'a> {
     Content(&'a [u8]),
 }
 
+/// v29: Engine の実行時状態スナップショット。
+#[cfg(feature = "v27")]
+#[derive(Debug, Clone)]
+pub struct EngineStats {
+    pub entity_count: u32,
+    pub himo_count: u32,
+    /// WAL の次 append 位置(byte offset)
+    pub wal_head: u64,
+    /// 本体へ反映 + fsync 済みの位置
+    pub wal_checkpoint: u64,
+    /// WAL ファイル容量(設定値、sparse)
+    pub wal_capacity: u64,
+    /// head - checkpoint。大きいと未 fsync が溜まっている
+    pub wal_lag_bytes: u64,
+    /// 発行済みの最大 LSN
+    pub wal_next_lsn: u64,
+    /// fsync/msync 完了済みの LSN(背景 fsync が進めた地点)
+    pub durable_lsn: u64,
+    /// WriteQueue に滞留中の op 数
+    pub queue_len: usize,
+    /// writer が push した累計
+    pub pushed: u64,
+    /// consumer が apply した累計
+    pub applied: u64,
+}
+
 #[cfg(feature = "v27")]
 fn wal_path_for(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{}.wal", path))
@@ -898,10 +924,146 @@ impl Engine {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open(path: &str) -> io::Result<Self> {
+        Self::open_internal(path, /*verify_region_crc=*/ true)
+    }
+
+    /// 内部用: region CRC 検証を skip できる open。WAL ルート用。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_internal(path: &str, verify_region_crc: bool) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
+        // v29: ファイルサイズ検証 — truncate で SIGBUS を防ぐ
+        let file_size = file.metadata()?.len();
+        Self::validate_file_size(&file, file_size)?;
         let mmap = unsafe { MmapMut::map_mut(&file)? };
-        Self::load_from_backing(Backing::Mmap(mmap))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        let mut eng = Self::load_from_backing(Backing::Mmap(mmap))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        eng.path = path.to_string();
+        if verify_region_crc {
+            // .crc ファイルがあれば全 region CRC 検証
+            eng.verify_region_crcs()?;
+        }
+        Ok(eng)
+    }
+
+    /// 全 region の CRC テーブルを計算する。
+    fn compute_region_crc_table(&self) -> crate::integrity::CrcTable {
+        use crate::integrity::{CrcTable, RegionKind, fnv1a_region};
+        let file_size = self.layout.total_size as u64;
+        let mut table = CrcTable::new(self.max_himos, file_size);
+        let buf = match &self.backing {
+            Backing::Mmap(m) => &m[..],
+            Backing::Memory(v) => &v[..],
+        };
+        // himo columns
+        for hid in 0..self.himo_types.len() {
+            let off = self.layout.himo_col_off(hid);
+            let end = off + self.layout.himo_col_size;
+            let crc = fnv1a_region(&buf[off..end]);
+            table.set(RegionKind::HimoColumn(hid as u32), crc);
+        }
+        // vocab data
+        let off = self.layout.vocab_data_off;
+        let end = off + self.layout.vocab_data_size;
+        table.set(RegionKind::Vocab, fnv1a_region(&buf[off..end]));
+        // himoreg data
+        let off = self.layout.himoreg_data_off;
+        let end = off + self.layout.himoreg_data_size;
+        table.set(RegionKind::HimoReg, fnv1a_region(&buf[off..end]));
+        // content data
+        let off = self.layout.content_data_off;
+        let end = off + self.layout.content_data_size;
+        table.set(RegionKind::Content, fnv1a_region(&buf[off..end]));
+        // entity set
+        let off = self.layout.entities_off;
+        let end = off + self.layout.entities_size;
+        table.set(RegionKind::EntitySet, fnv1a_region(&buf[off..end]));
+        table
+    }
+
+    /// open 時の region CRC 検証。`.crc` ファイルがなければスキップ。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn verify_region_crcs(&self) -> io::Result<()> {
+        use crate::integrity::{CrcTable, crc_path_for};
+        if self.path.is_empty() { return Ok(()); } // from_bytes 等でパス無い場合スキップ
+        let crc_path = crc_path_for(&self.path);
+        let stored = match CrcTable::load(&crc_path)? {
+            Some(t) => t,
+            None => return Ok(()), // v28 以前の DB 互換
+        };
+        let expected = self.compute_region_crc_table();
+        let mismatches = stored.diff(&expected);
+        if !mismatches.is_empty() {
+            let names: Vec<String> = mismatches.iter().map(|k| k.name()).collect();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("region CRC mismatch in: {} — file may be corrupt", names.join(", ")),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 現在の DB state から region CRC を再計算 → `.crc` ファイルに書き出す。
+    /// flush() から呼ばれる。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn persist_region_crcs(&self) -> io::Result<()> {
+        if self.path.is_empty() { return Ok(()); }
+        let table = self.compute_region_crc_table();
+        let crc_path = crate::integrity::crc_path_for(&self.path);
+        table.save(&crc_path)?;
+        Ok(())
+    }
+
+    /// ヘッダを先読みして、ファイルサイズが layout.total_size 以上かチェックする。
+    /// 以下だったら truncate されている → mmap すると OOB アクセスで SIGBUS 直行。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn validate_file_size(file: &std::fs::File, file_size: u64) -> io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+        if file_size < HEADER_SIZE as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("file too small: {} bytes (need at least {} for header)", file_size, HEADER_SIZE),
+            ));
+        }
+        // ヘッダを同期読みで確認(mmap 前なので普通の read で OK)
+        let mut file_clone = file.try_clone()?;
+        file_clone.seek(SeekFrom::Start(0))?;
+        let mut buf = [0u8; HEADER_SIZE];
+        file_clone.read_exact(&mut buf)?;
+
+        if buf[H_MAGIC..H_MAGIC + 4] != FILE_MAGIC {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "not an EnchuDB file"));
+        }
+        // CRC 検証を先に(fields 改竄で layout 計算が狂うのを防ぐ)
+        verify_header_crc(&buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let max_entities = u32::from_le_bytes(buf[H_MAX_ENTITIES..H_MAX_ENTITIES + 4].try_into().unwrap());
+        let max_himos = u32::from_le_bytes(buf[H_MAX_HIMOS..H_MAX_HIMOS + 4].try_into().unwrap());
+        let vocab_max_entries = u32::from_le_bytes(buf[H_VOCAB_MAX_ENTRIES..H_VOCAB_MAX_ENTRIES + 4].try_into().unwrap());
+        let vocab_index_cap = u32::from_le_bytes(buf[H_VOCAB_INDEX_CAP..H_VOCAB_INDEX_CAP + 4].try_into().unwrap());
+        let vocab_data_size = u64::from_le_bytes(buf[H_VOCAB_DATA_SIZE..H_VOCAB_DATA_SIZE + 8].try_into().unwrap()) as usize;
+        let himoreg_max_entries = u32::from_le_bytes(buf[H_HIMOREG_MAX_ENTRIES..H_HIMOREG_MAX_ENTRIES + 4].try_into().unwrap());
+        let himoreg_index_cap = u32::from_le_bytes(buf[H_HIMOREG_INDEX_CAP..H_HIMOREG_INDEX_CAP + 4].try_into().unwrap());
+        let himoreg_data_size = u64::from_le_bytes(buf[H_HIMOREG_DATA_SIZE..H_HIMOREG_DATA_SIZE + 8].try_into().unwrap()) as usize;
+        let content_data_size = u64::from_le_bytes(buf[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].try_into().unwrap()) as usize;
+        let cyl_max_values = u32::from_le_bytes(buf[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].try_into().unwrap());
+
+        let layout = Layout::from_params(
+            max_entities, max_himos,
+            vocab_max_entries, vocab_index_cap, vocab_data_size,
+            himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
+            content_data_size, cyl_max_values,
+        );
+
+        if file_size < layout.total_size as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "file truncated: {} bytes, expected {} — backup からリストアが必要",
+                    file_size, layout.total_size,
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Vec<u8> からエンジンを構築。WASM ではこれが唯一のエントリポイント。
@@ -2207,9 +2369,14 @@ impl Engine {
     }
 
     /// v28: WAL 付き open_concurrent。既存 WAL があればリカバリする。
+    /// v29: region CRC は WAL ルートでは skip(WAL が source of truth)。
+    /// 代わりに古い `.crc` ファイルは削除して、次回 flush で regenerate させる。
     #[cfg(all(feature = "v27", not(target_arch = "wasm32")))]
     pub fn open_concurrent_with_wal(path: &str, wal_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
-        let mut eng = Self::open(path)?;
+        let mut eng = Self::open_internal(path, /*verify_region_crc=*/ false)?;
+        // 古い .crc は WAL 活動後に stale になるので削除
+        let crc_path = crate::integrity::crc_path_for(path);
+        let _ = std::fs::remove_file(&crc_path);
         let wal_path = wal_path_for(path);
         let wal = if wal_path.exists() {
             let w = crate::wal::Wal::open(&wal_path)?;
@@ -2401,6 +2568,29 @@ impl Engine {
         self.durable_lsn.load(Ordering::Acquire)
     }
 
+    /// v29: エンジン状態の一覧。監視・デバッグ用。
+    #[cfg(feature = "v27")]
+    pub fn stats(&self) -> EngineStats {
+        use std::sync::atomic::Ordering;
+        let (wal_head, wal_checkpoint, wal_capacity, wal_lsn) = match self.wal.as_ref() {
+            Some(w) => (w.head(), w.checkpoint(), w.usage().1, w.next_lsn().saturating_sub(1)),
+            None => (0, 0, 0, 0),
+        };
+        EngineStats {
+            entity_count: self.entities.count(),
+            himo_count: self.himo_types.len() as u32,
+            wal_head,
+            wal_checkpoint,
+            wal_capacity,
+            wal_lag_bytes: wal_head.saturating_sub(wal_checkpoint),
+            wal_next_lsn: wal_lsn,
+            durable_lsn: self.durable_lsn.load(Ordering::Acquire),
+            queue_len: self.write_queue.as_ref().map(|q| q.len()).unwrap_or(0),
+            pushed: self.push_count.load(Ordering::Acquire),
+            applied: self.apply_count.load(Ordering::Acquire),
+        }
+    }
+
     /// consumer スレッド内部で呼ぶ。Op 1 個を適用。
     #[cfg(feature = "v27")]
     fn apply_op(&self, op: crate::write_queue::Op) {
@@ -2565,6 +2755,16 @@ impl Engine {
         write_header_crc(buf);
 
         self.backing.flush_to_disk()?;
+        Ok(())
+    }
+
+    /// v29: region CRC を計算して `.crc` sidecar に永続化する。
+    /// flush() とは別の opt-in API。512MB+ の vocab 走査を含むので秒オーダー。
+    /// コールドバックアップを封緘するユースケース向け。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn seal_integrity(&mut self) -> io::Result<()> {
+        self.flush()?;
+        self.persist_region_crcs()?;
         Ok(())
     }
 }

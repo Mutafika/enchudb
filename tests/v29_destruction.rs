@@ -261,11 +261,8 @@ fn byte_flip_wal_tail_truncated_silently() {
 }
 
 #[test]
-#[ignore = "v29: ファイルサイズ検証未実装 — truncate で mmap OOB → SIGBUS"]
 fn truncate_db_to_half_fails_to_open() {
-    // TODO(v29): open 時に file size が Layout.total_size と一致するか検証する。
-    // 現状 mmap は truncate された領域にアクセスすると SIGBUS になる。
-    // v29 で「file too small」エラーを返すようにする。
+    // v29: 先読みで file size < layout.total_size を検出してエラーにする。
     let path = tmp("truncate_half");
     prepare_db(&path);
 
@@ -273,7 +270,12 @@ fn truncate_db_to_half_fails_to_open() {
     truncate_to(&path, size / 2);
 
     match Engine::open(&path) {
-        Ok(_) | Err(_) => {} // どちらでも OK、SIGBUS だけ NG
+        Err(e) => {
+            let s = format!("{}", e);
+            assert!(s.contains("truncated") || s.contains("too small"),
+                "expected truncation error, got: {}", s);
+        }
+        Ok(_) => panic!("truncated file should not open successfully"),
     }
     cleanup(&path);
 }
@@ -418,31 +420,33 @@ fn fuzz_random_byte_flip_no_silent_corruption() {
 // v29 未実装ギャップ — これらは現状 fail or silent、v29 で直す
 // ═══════════════════════════════════════════════════════════
 
-/// body データ領域の bit flip は v28 では検出できない。
-/// v29 の page checksum で検出するのが目標。
+/// body データ領域の bit flip は v29 で page checksum により検出される。
+/// ワークフロー: create → flush(CRC 保存) → 書き込み → flush(CRC 更新)
+/// → 外部改竄 → open → CRC mismatch エラー。
 #[test]
-#[ignore = "v29 で page checksum 実装後に enable(v28 は通過してしまう)"]
-fn v29_gap_body_bit_flip_should_be_detected() {
-    let path = tmp("gap_body");
-    prepare_db(&path);
-
+fn v29_body_bit_flip_detected() {
+    let path = tmp("body_flip");
     {
-        let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
-        let e = eng.entity();
-        eng.tie_async(e, "n", 42);
-        eng.flush_writes();
-        eng.wal_sync().unwrap();
+        // sync API で書き込み + seal_integrity(flush + region CRC 保存)
+        let mut e = Engine::create_with_capacity(&path, 1000).unwrap();
+        e.define_himo("n", HimoType::Value, 100);
+        let eid = e.entity();
+        e.tie(eid, "n", 42);
+        e.seal_integrity().unwrap();
     }
 
-    // body 後半(himo column 領域)の任意バイトを flip
-    // オフセットは実装依存(Layout を使って正確に特定できる)
+    // body 中盤の任意バイトを flip(himo column / vocab / content のいずれか)
     let size = std::fs::metadata(&path).unwrap().len();
     flip_byte(&path, size / 2);
 
-    // v28: silent に通過するかも。v29: エラーになるべき
-    let r = Engine::open(&path);
-    assert!(r.is_err(),
-        "v29 goal: body corruption should be detected; v28 currently may pass silently");
+    // open は region CRC 不一致で失敗するはず
+    match Engine::open(&path) {
+        Err(e) => {
+            let s = format!("{}", e);
+            assert!(s.contains("region CRC"), "expected region CRC error, got: {}", s);
+        }
+        Ok(_) => panic!("body corruption should be detected by region CRC"),
+    }
     cleanup(&path);
 }
 

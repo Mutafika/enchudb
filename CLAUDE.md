@@ -231,8 +231,58 @@ PairTable（2次元キャッシュ）→ ヒープ（揮発）
 - ペアセル同士の sorted intersect → Column 直読みの 8 倍遅い
 - フーリエ変換 → 交差（積）を速くする道具ではない
 
+## v28: WAL + crash consistency
+
+```rust
+// WAL 付きで作成 / open(concurrent writer 込み)
+let db = Engine::create_concurrent_with_wal("/path/to/db", 256 * 1024 * 1024)?;
+// 既存 DB の open は open_concurrent_with_wal(path, wal_capacity)
+// 既存 WAL があれば commit 済みレコードを自動復旧
+
+// 書き込み(既存 tie_async などそのまま使える、WAL に先に append される)
+let e = db.entity();
+db.tie_async(e, "age", 30);
+db.content_async(e, "memo", b"hello");
+
+// トランザクション境界を明示
+db.wal_commit();       // Commit marker、非同期(consumer 側で fsync)
+db.wal_sync()?;        // 強制 fsync + body msync + checkpoint 前進(Sync 相当)
+
+// 観測
+let s = db.stats();    // EngineStats: wal_head/checkpoint/durable_lsn など
+```
+
+**耐久性モード**(起動時に auto、手動切替は wal_sync で Sync 化):
+- **Async** (default) — 100ms 周期で背景 fsync。最大 100ms 分失う可能性
+- **Sync** — `wal_sync()` を毎回呼ぶと ~1-10ms/commit、損失ゼロ
+
+## v29: 整合性 + 破損検知
+
+```rust
+// ヘッダ CRC(必ず ON、自動)
+// → open 時に [0..64) の FNV-1a で検証。改竄で open エラー。
+
+// region CRC(opt-in、コールドバックアップ封緘用)
+db.seal_integrity()?;  // flush + *.crc sidecar 生成(全 region CRC)
+// 次回 open で *.crc があれば自動検証、不一致でエラー
+
+// file size 検証(自動)
+// → open 時に file サイズ < Layout.total_size なら truncated エラー
+```
+
+**注意**: `.crc` は `open_concurrent_with_wal` で自動削除される(WAL 活動後 stale になるため)。WAL モードで使っている間は `seal_integrity` は無意味。**コールド状態の封緘**にのみ使う。
+
+## ファイル構成
+
+```
+{path}         — メイン DB(mmap)
+{path}.wal     — WAL(v28 有効時のみ、sparse)
+{path}.crc     — region CRC sidecar(seal_integrity 時のみ生成)
+```
+
 ## 制約
 - `tie()` の value は `< u32::MAX`（u32::MAX は sentinel 予約）
 - content data 上限 512MB
 - max_himos デフォルト 256
 - max_entities デフォルト 16M（create_with_capacity で変更可）
+- WAL リングバッファは線形。head が容量を超えたら append エラー(v30 でリング化予定)
