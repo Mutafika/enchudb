@@ -2328,6 +2328,8 @@ impl Engine {
                                 wal.advance_checkpoint(head);
                                 let lsn = wal.next_lsn().saturating_sub(1);
                                 durable_lsn_for_thread.store(lsn, Ordering::Release);
+                                // WAL Commit したので undo も clear
+                                engine.undo.commit();
                             }
                             last_fsync = Instant::now();
                         }
@@ -2344,6 +2346,7 @@ impl Engine {
                             let _ = wal.fsync();
                             let _ = engine.body_msync();
                             wal.advance_checkpoint(wal.head());
+                            engine.undo.commit();
                         }
                         return;
                     }
@@ -2372,13 +2375,12 @@ impl Engine {
     pub fn body_msync(&self) -> io::Result<()> { Ok(()) }
 
     /// 強制同期: Commit marker 挿入 → WAL fsync → body msync → checkpoint 前進。
-    /// Sync mode 相当の待ち。
+    /// Sync mode 相当の待ち。undo も clear される。
     #[cfg(feature = "v27")]
     pub fn wal_sync(&self) -> io::Result<()> {
         use std::sync::atomic::Ordering;
         self.flush_writes();
         if let Some(wal) = self.wal.as_ref() {
-            // 順序厳守: Commit → WAL fsync → body msync → checkpoint
             let _ = wal.append(crate::wal::WalOp::Commit);
             wal.fsync()?;
             self.body_msync()?;
@@ -2387,6 +2389,8 @@ impl Engine {
             let lsn = wal.next_lsn().saturating_sub(1);
             self.durable_lsn.store(lsn, Ordering::Release);
         }
+        // undo も clear(transaction 確定)
+        self.undo.commit();
         Ok(())
     }
 
@@ -2498,13 +2502,18 @@ impl Engine {
     }
 
     /// 現在のトランザクションを WAL に commit marker で確定する。
+    /// 同時に undo ログもクリア(WAL Commit 後は rollback できないため)。
+    ///
     /// Async モードでは fsync は consumer スレッドが背景で行う。
-    /// Sync モードでは commit 完了まで待つ(Phase 4 で実装)。
+    /// Sync モードでは commit 完了まで待つ。
     #[cfg(feature = "v27")]
     pub fn wal_commit(&self) {
         if let Some(wal) = self.wal.as_ref() {
             let _ = wal.append(crate::wal::WalOp::Commit);
         }
+        // WAL Commit = transaction 確定。undo は不要になる。
+        // これを忘れると re-open 時に undo 再生で entity が free される。
+        self.undo.commit();
     }
 
     /// WAL への参照(テスト / 内部用)。
