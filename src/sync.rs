@@ -79,24 +79,25 @@ impl Syncer {
         outcome
     }
 
-    /// 自 peer の最近 commit ops を transport に publish。
-    /// Phase B 用の簡易版: since HLC 以降の自 WAL を publish する。
-    pub fn publish_since(&self, since: Hlc) {
-        // Engine から自 WAL の recover を通じて records を取る。
-        // 既に apply 済みなので WAL 自体を読むだけ。
-        let wal = self.engine.wal_arc();
-        let wal = match wal {
+    /// 自 peer の commit 済み ops を transport に publish。
+    /// `iter_committed` は checkpoint を無視して WAL 全体を列挙するので、
+    /// 既に本体に apply 済みでも WAL ring buffer 内にあれば拾える。
+    /// 戻り値は publish したレコード数。
+    pub fn publish_since(&self, since: Hlc) -> usize {
+        let wal = match self.engine.wal_arc() {
             Some(w) => w,
-            None => return,
+            None => return 0,
         };
-        let recs = wal.recover();
+        let recs = wal.iter_committed();
         let peer = self.engine.peer_id();
         let filtered: Vec<WireRecord> = recs
             .into_iter()
             .filter(|r| r.hlc > since)
             .map(|r| r.into())
             .collect();
+        let count = filtered.len();
         self.transport.publish(peer, filtered);
+        count
     }
 
     /// 受信レコードを LWW で apply する。

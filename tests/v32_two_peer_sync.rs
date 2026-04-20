@@ -34,6 +34,26 @@ fn make_peer(path: &str, peer: u32) -> Arc<Engine> {
     eng
 }
 
+/// WAL 付きで create → define → concurrentize。tie_async + publish_since 統合テスト用。
+fn make_peer_with_wal(path: &str, peer: u32) -> Arc<Engine> {
+    let eng = Engine::create_concurrent_with_wal(path, 16 * 1024 * 1024).unwrap();
+    eng.set_peer_id(peer);
+    // create_concurrent_with_wal は create_with_capacity の内部 eng を concurrent 化するので、
+    // define_himo は concurrent 化後の Engine の &self でできる tie_async には合わない。
+    // ここでは &mut 版が欲しいので、別ルートで作成する。
+    drop(eng);
+    for suffix in ["", ".wal", ".crc"] {
+        let _ = std::fs::remove_file(format!("{}{}", path, suffix));
+    }
+    let mut eng = Engine::create(path).unwrap();
+    eng.define_himo("val", HimoType::Value, 100);
+    eng.flush().unwrap();
+    drop(eng);
+    let eng = Engine::open_concurrent_with_wal(path, 16 * 1024 * 1024).unwrap();
+    eng.set_peer_id(peer);
+    eng
+}
+
 #[test]
 fn peer_a_writes_peer_b_reads_via_pull() {
     let pa = tmp("a_to_b_a");
@@ -190,6 +210,96 @@ fn hlc_tie_broken_by_peer_id() {
 
     cleanup(&pa);
     cleanup(&pb);
+}
+
+#[test]
+fn e2e_write_publish_pull() {
+    // tie_async → WAL → Syncer.publish_since → transport に入る → peer B が pull
+    let pa = tmp("e2e_a");
+    let pb = tmp("e2e_b");
+
+    let eng_a = make_peer_with_wal(&pa, 1);
+    let eng_b = make_peer(&pb, 2);
+    let transport = Arc::new(InMemoryTransport::new());
+
+    let syncer_a = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
+    let syncer_b = Syncer::new(eng_b.clone(), transport.clone() as Arc<dyn Transport>);
+
+    // peer A が tie_async する(consumer thread 経由で本体に apply + WAL 残存)
+    let eid = eng_a.entity();
+    eng_a.tie_async(eid, "val", 42);
+    eng_a.wal_commit();
+    eng_a.flush_writes();
+    eng_a.wal_sync().unwrap();
+
+    // A が WAL 内容を transport に publish
+    let published = syncer_a.publish_since(Hlc::ZERO);
+    assert!(published >= 1, "should publish at least 1 op, got {}", published);
+
+    // peer B が pull → 同じ値が読める
+    let out = syncer_b.pull_once(1);
+    assert!(out.applied >= 1, "peer B should apply peer A's tie");
+    assert_eq!(eng_b.get(eid, "val"), Some(42));
+
+    cleanup(&pa);
+    cleanup(&pb);
+}
+
+#[test]
+fn e2e_multiple_writes_published_and_pulled() {
+    let pa = tmp("multi_a");
+    let pb = tmp("multi_b");
+
+    let eng_a = make_peer_with_wal(&pa, 1);
+    let eng_b = make_peer(&pb, 2);
+    let transport = Arc::new(InMemoryTransport::new());
+
+    let syncer_a = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
+    let syncer_b = Syncer::new(eng_b.clone(), transport.clone() as Arc<dyn Transport>);
+
+    // peer A が 10 件 tie_async
+    let eids: Vec<u64> = (0..10).map(|i| {
+        let eid = eng_a.entity();
+        eng_a.tie_async(eid, "val", i as u32);
+        eid
+    }).collect();
+    eng_a.wal_commit();
+    eng_a.flush_writes();
+    eng_a.wal_sync().unwrap();
+
+    // publish → pull
+    let published = syncer_a.publish_since(Hlc::ZERO);
+    assert!(published >= 10);
+
+    let out = syncer_b.pull_once(1);
+    assert!(out.applied >= 10);
+
+    for (i, &eid) in eids.iter().enumerate() {
+        assert_eq!(eng_b.get(eid, "val"), Some(i as u32));
+    }
+
+    cleanup(&pa);
+    cleanup(&pb);
+}
+
+#[test]
+fn peer_id_persists_across_reopen() {
+    // set_peer_id したあと DB を close → 再 open で peer_id が保たれる。
+    let path = tmp("peer_persist");
+    {
+        let mut eng = Engine::create(&path).unwrap();
+        eng.define_himo("val", HimoType::Value, 10);
+        eng.set_peer_id(42);
+        eng.flush().unwrap();
+    }
+    let mut eng = Engine::open(&path).unwrap();
+    assert_eq!(eng.peer_id(), 42);
+
+    // entity() が peer=42 を合成した eid を返す
+    let e = eng.entity();
+    assert_eq!(enchudb::eid_peer(e), 42);
+
+    cleanup(&path);
 }
 
 #[test]

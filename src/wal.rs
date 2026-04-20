@@ -431,12 +431,25 @@ impl Wal {
         self.mmap_mut_slice()[16..24].copy_from_slice(&new_checkpoint.to_le_bytes());
     }
 
+    /// v32: HEADER_SIZE から head までを読んで、Commit で挟まれた全レコードを返す。
+    /// checkpoint 位置は無視(既に apply 済みの記録もまだ WAL file 上にあれば拾う)。
+    /// Syncer.publish_since で使う。ring buffer reset 済みの記録は取れない。
+    pub fn iter_committed(&self) -> Vec<RecoveredRecord> {
+        self.iter_from_offset(HEADER_SIZE as u64)
+    }
+
     /// リカバリ: checkpoint から head までを読んで、Commit で挟まれたグループだけ返す。
     /// CRC 破損レコードに到達したらそこで打ち切り(uncommitted tail の切り捨て)。
     pub fn recover(&self) -> Vec<RecoveredRecord> {
+        let start = self.checkpoint.load(Ordering::Acquire);
+        self.iter_from_offset(start)
+    }
+
+    /// 指定 offset から head までを Commit グループ単位で読む。共通実装。
+    fn iter_from_offset(&self, start_offset: u64) -> Vec<RecoveredRecord> {
         let mut out = Vec::new();
         let mut batch = Vec::new();
-        let mut offset = self.checkpoint.load(Ordering::Acquire);
+        let mut offset = start_offset;
         let head = self.head.load(Ordering::Acquire);
         let mut max_lsn = 0;
         let mut max_hlc = Hlc::ZERO;

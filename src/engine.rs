@@ -93,6 +93,26 @@ impl Backing {
             Backing::Memory(_) => Ok(()),
         }
     }
+
+    /// v32: &self 経由で header 領域に unsafe で書き込む。
+    /// mmap 経由の並行書き込みは atomic スライス更新でガードされる前提。
+    #[cfg(feature = "v32")]
+    #[allow(clippy::mut_from_ref)]
+    fn header_mut(&self) -> &mut [u8] {
+        unsafe {
+            match self {
+                #[cfg(not(target_arch = "wasm32"))]
+                Backing::Mmap(m) => {
+                    let ptr = m.as_ptr() as *mut u8;
+                    std::slice::from_raw_parts_mut(ptr, HEADER_SIZE)
+                }
+                Backing::Memory(v) => {
+                    let ptr = v.as_ptr() as *mut u8;
+                    std::slice::from_raw_parts_mut(ptr, HEADER_SIZE)
+                }
+            }
+        }
+    }
 }
 use crate::vocabulary::Vocabulary;
 use crate::entity_set::EntitySet;
@@ -186,6 +206,10 @@ const H_CYL_MAX_VALUES: usize = 60;
 /// v28: ヘッダ整合性 CRC。[H_MAGIC..H_HEADER_CRC] の CRC32(FNV-1a)。
 /// create/flush/define_himo 時に更新、open 時に検証。
 const H_HEADER_CRC: usize = 64; // u32
+/// v32: この DB を所有する peer の id。0 は「未設定 / single peer」。
+/// CRC 保護外(後から set_peer_id で上書き可能)。
+#[cfg(feature = "v32")]
+const H_PEER_ID: usize = 68; // u32
 const H_HIMO_TYPES: usize = 256;
 
 // v27: 観測窓(n-tuple 仮想テーブル定義)領域。
@@ -1216,6 +1240,14 @@ impl Engine {
             backing,
         };
 
+        // v32: header から peer_id を復元
+        #[cfg(feature = "v32")]
+        {
+            let hdr = eng.backing.header_mut();
+            let peer = u32::from_le_bytes(hdr[H_PEER_ID..H_PEER_ID + 4].try_into().unwrap());
+            eng.peer_id.store(peer, std::sync::atomic::Ordering::Release);
+        }
+
         if eng.undo.pending_count() > 0 {
             eng.recover();
         }
@@ -1266,11 +1298,14 @@ impl Engine {
 
     // ──── v32: peer_id ────
 
-    /// この Engine を所有する peer の id を設定。WAL にも反映される。
+    /// この Engine を所有する peer の id を設定。WAL / DB header にも反映される。
     /// 起動時に 1 回だけ呼ぶ想定。
     #[cfg(feature = "v32")]
     pub fn set_peer_id(&self, peer: crate::PeerId) {
         self.peer_id.store(peer, std::sync::atomic::Ordering::Release);
+        // mmap の header に即書き込み(CRC 保護外なので再計算不要)
+        self.backing.header_mut()[H_PEER_ID..H_PEER_ID + 4]
+            .copy_from_slice(&peer.to_le_bytes());
         #[cfg(feature = "v27")]
         if let Some(wal) = self.wal.as_ref() {
             wal.set_peer_id(peer);
