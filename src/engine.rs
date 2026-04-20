@@ -2495,9 +2495,12 @@ impl Engine {
                                 wal.advance_checkpoint(head);
                                 let lsn = wal.next_lsn().saturating_sub(1);
                                 durable_lsn_for_thread.store(lsn, Ordering::Release);
-                                // WAL Commit したので undo も clear
                                 engine.undo.commit();
                             }
+                            // v30: ring buffer reset を試みる。head == checkpoint &&
+                            // pending_writes == 0 のときだけ head/checkpoint を HEADER_SIZE に戻す。
+                            // これで WAL 容量を食い切らずに長期運用できる。
+                            wal.try_reset();
                             last_fsync = Instant::now();
                         }
                     }

@@ -163,6 +163,8 @@ pub struct Wal {
     head: AtomicU64,
     checkpoint: AtomicU64,
     next_lsn: AtomicU64,
+    /// v30: append 中の writer 数。try_reset はこれが 0 のときだけ実行できる。
+    pending_writes: std::sync::atomic::AtomicU32,
 }
 
 unsafe impl Send for Wal {}
@@ -194,6 +196,7 @@ impl Wal {
             head: AtomicU64::new(HEADER_SIZE as u64),
             checkpoint: AtomicU64::new(HEADER_SIZE as u64),
             next_lsn: AtomicU64::new(1),
+            pending_writes: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -220,6 +223,7 @@ impl Wal {
             head: AtomicU64::new(head),
             checkpoint: AtomicU64::new(checkpoint),
             next_lsn: AtomicU64::new(1),
+            pending_writes: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -237,26 +241,29 @@ impl Wal {
 
     /// op を append。新しいレコードの LSN を返す。
     ///
-    /// - head は CAS で前進(複数 writer 対応)
-    /// - payload は memcpy 1 回
-    /// - fsync は呼ばない(consumer 側が背景でやる)
+    /// v30: pending_writes カウンタで try_reset との race を防ぐ。
+    /// writer は append 中 +1、完了時 -1。consumer reset は pending==0 時のみ。
     pub fn append(&self, op: WalOp<'_>) -> io::Result<u64> {
         let payload_size = op.payload_size();
         let record_size = REC_HEADER_SIZE + payload_size;
 
-        // head を CAS で前進
+        self.pending_writes.fetch_add(1, Ordering::AcqRel);
+        let result = self.append_inner(op, payload_size, record_size);
+        self.pending_writes.fetch_sub(1, Ordering::AcqRel);
+        result
+    }
+
+    fn append_inner(&self, op: WalOp<'_>, payload_size: usize, record_size: usize) -> io::Result<u64> {
         let offset = loop {
             let cur = self.head.load(Ordering::Acquire);
             let new = cur + record_size as u64;
-            // リングバッファではなく線形。capacity 超過で back pressure。
             if new > self.capacity {
+                // capacity 超過 — consumer が reset してくれるのを待つ
                 return Err(io::Error::new(
                     io::ErrorKind::OutOfMemory,
-                    "WAL full — checkpoint behind",
+                    "WAL full — consumer reset behind",
                 ));
             }
-            // checkpoint より head が十分進んでいたら back pressure(checkpoint を待つ)
-            // ここでは「安全弁のみ、back pressure は上位で」の方針
             match self.head.compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => break cur,
                 Err(_) => continue,
@@ -265,14 +272,12 @@ impl Wal {
 
         let lsn = self.next_lsn.fetch_add(1, Ordering::AcqRel);
 
-        // payload を書く(先に payload 書いて crc 計算、ヘッダは最後に書く → torn write 検出性能向上)
         let op_byte = op.op_byte();
         let payload_offset = offset as usize + REC_HEADER_SIZE;
         let mmap = self.mmap_mut_slice();
         op.write_payload(&mut mmap[payload_offset..payload_offset + payload_size]);
         let crc = fnv1a(&mmap[payload_offset..payload_offset + payload_size]);
 
-        // ヘッダを最後に書く(こうすると crc が正しいレコードだけが「有効」と見なせる)
         let header = &mut mmap[offset as usize..offset as usize + REC_HEADER_SIZE];
         header[0..2].copy_from_slice(REC_MAGIC);
         header[2] = op_byte;
@@ -281,10 +286,34 @@ impl Wal {
         header[8..16].copy_from_slice(&lsn.to_le_bytes());
         header[16..20].copy_from_slice(&crc.to_le_bytes());
 
-        // ファイル内ヘッダの head を更新
         mmap[8..16].copy_from_slice(&(offset + record_size as u64).to_le_bytes());
 
         Ok(lsn)
+    }
+
+    /// v30: ring buffer reset。
+    /// head == checkpoint && pending_writes == 0 のときのみ実行可能。
+    /// 成功したら head と checkpoint を HEADER_SIZE に戻す(全領域再利用可能に)。
+    /// consumer 周期 fsync 内で periodic に呼ばれる想定。
+    pub fn try_reset(&self) -> bool {
+        let head = self.head.load(Ordering::Acquire);
+        let cp = self.checkpoint.load(Ordering::Acquire);
+        if head != cp || head <= HEADER_SIZE as u64 { return false; }
+        if self.pending_writes.load(Ordering::Acquire) > 0 { return false; }
+        // もう一度 head == checkpoint を確認(race でずれた場合の保険)
+        if self.head.compare_exchange(head, HEADER_SIZE as u64, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return false;
+        }
+        self.checkpoint.store(HEADER_SIZE as u64, Ordering::Release);
+        let mmap = self.mmap_mut_slice();
+        mmap[8..16].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
+        mmap[16..24].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
+        true
+    }
+
+    /// pending_writes を返す(テスト/観測用)。
+    pub fn pending_writes(&self) -> u32 {
+        self.pending_writes.load(Ordering::Acquire)
     }
 
     /// fsync(WAL 本体のみ)。consumer スレッドが定期実行。
@@ -422,6 +451,7 @@ impl Wal {
             head: AtomicU64::new(HEADER_SIZE as u64),
             checkpoint: AtomicU64::new(HEADER_SIZE as u64),
             next_lsn: AtomicU64::new(1),
+            pending_writes: std::sync::atomic::AtomicU32::new(0),
         }
     }
 }
@@ -622,6 +652,57 @@ mod tests {
         // 4 * 1000 = 4000 レコード
         // LSN は 4001 まで発行されてる
         assert_eq!(wal.next_lsn(), 4001);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn try_reset_recycles_wal_space() {
+        let p = tmp("ring_reset");
+        let wal = Wal::create(&p, 1024 * 1024).unwrap();
+        // 100 件書く → head 前進
+        for i in 0..100u32 {
+            wal.append(WalOp::Tie { eid: i, himo_id: 0, value: i }).unwrap();
+        }
+        wal.append(WalOp::Commit).unwrap();
+        let head_before = wal.head();
+        assert!(head_before > HEADER_SIZE as u64);
+
+        // checkpoint がまだ追いついてない → reset 失敗
+        assert!(!wal.try_reset(), "should not reset when checkpoint < head");
+
+        // checkpoint を head まで進める
+        wal.advance_checkpoint(head_before);
+        // これで head == checkpoint && pending == 0 → reset 成功
+        assert!(wal.try_reset(), "should reset when head == checkpoint");
+        assert_eq!(wal.head(), HEADER_SIZE as u64);
+        assert_eq!(wal.checkpoint(), HEADER_SIZE as u64);
+
+        // reset 後も append できる
+        let lsn = wal.append(WalOp::Tie { eid: 999, himo_id: 0, value: 99 }).unwrap();
+        assert!(lsn > 100);
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn ring_buffer_long_run_does_not_exhaust() {
+        let p = tmp("ring_longrun");
+        // 容量は小さめ(128KB)にして、何度もリセット必要な状態を作る
+        let wal = Wal::create(&p, 128 * 1024).unwrap();
+
+        // 合計で容量の何十倍も書く(周期的に reset する)
+        for batch in 0..50u32 {
+            // 100 件書く = ~3KB。50 バッチで 150KB 書いて、容量 128KB
+            for i in 0..100u32 {
+                let v = batch * 100 + i;
+                wal.append(WalOp::Tie { eid: v, himo_id: 0, value: v }).unwrap();
+            }
+            wal.append(WalOp::Commit).unwrap();
+            // checkpoint 前進 + reset
+            wal.advance_checkpoint(wal.head());
+            wal.try_reset();
+        }
+        // エラー無しで完走できれば ring 動作 OK
         let _ = std::fs::remove_file(&p);
     }
 

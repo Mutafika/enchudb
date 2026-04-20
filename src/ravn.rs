@@ -73,6 +73,78 @@ impl Ravn {
         current
     }
 
+    /// v31: 逆方向 tie 辿り。
+    /// start の各エンティティ E に対して「`X.himo == E` を満たす X」を集める。
+    /// tie_ref で E を指している entity の集合が返る(セッションから発話者を見ている時の
+    /// 逆: 発話者からセッション一覧を引く、など)。
+    /// 結果は soft-unique(重複除去せず、呼び出し側が必要なら sort+dedup)。
+    pub fn reverse_follow(&self, start: &[u32], himo: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        for &e in start {
+            // pull_raw は "himo に値 e を持つ全 entity" を返す。
+            // tie_ref は target_eid を u32 値として格納するので、これで逆引きが成立。
+            // v27: Vec<u32>、それ以外: &[u32]。どちらも extend で受ける。
+            let pulled = self.engine.pull_raw(himo, e);
+            out.extend(pulled.iter().copied());
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// v31: 深さ制限付き BFS。`himo` を繰り返し forward で辿る。
+    /// 戻り値は (depth, eids) のペア列(深さ別)。depth 0 は start 自身。
+    pub fn bfs(&self, start: &[u32], himo: &str, max_depth: u32) -> Vec<(u32, Vec<u32>)> {
+        use std::collections::HashSet;
+        let mut visited: HashSet<u32> = start.iter().copied().collect();
+        let mut result = vec![(0u32, start.to_vec())];
+        let mut frontier: Vec<u32> = start.to_vec();
+        for d in 1..=max_depth {
+            let next = self.follow(&frontier, &[himo]);
+            let fresh: Vec<u32> = next.into_iter().filter(|e| visited.insert(*e)).collect();
+            if fresh.is_empty() { break; }
+            result.push((d, fresh.clone()));
+            frontier = fresh;
+        }
+        result
+    }
+
+    /// v31: entity 集合を「`himo == value` を満たすもの」だけに絞る。
+    pub fn filter_by(&self, eids: &[u32], himo: &str, value: u32) -> Vec<u32> {
+        eids.iter()
+            .filter(|&&e| self.engine.get(e, himo) == Some(value))
+            .copied()
+            .collect()
+    }
+
+    /// v31: テキスト値でフィルタ(Symbol 型 himo 用)。
+    pub fn filter_by_text(&self, eids: &[u32], himo: &str, text: &str) -> Vec<u32> {
+        let Some(vid) = self.engine.vocab_id(text) else { return Vec::new(); };
+        self.filter_by(eids, himo, vid)
+    }
+
+    /// v31: entity 集合から himo の値(u32)を抽出。
+    /// None は除外。
+    pub fn extract(&self, eids: &[u32], himo: &str) -> Vec<u32> {
+        eids.iter()
+            .filter_map(|&e| self.engine.get(e, himo))
+            .collect()
+    }
+
+    /// v31: テキスト抽出。
+    pub fn extract_text(&self, eids: &[u32], himo: &str) -> Vec<Vec<u8>> {
+        eids.iter()
+            .filter_map(|&e| self.engine.get_text(e, himo).map(|b| b.to_vec()))
+            .collect()
+    }
+
+    /// v31: content 抽出。
+    pub fn extract_content(&self, eids: &[u32], key: &str) -> Vec<Vec<u8>> {
+        eids.iter()
+            .filter_map(|&e| self.engine.get_content(e, key).map(|b| b.to_vec()))
+            .collect()
+    }
+
     pub fn select(&self, conds: &[(&str, u32)], fields: &[&str]) -> Vec<(u32, Vec<Option<u32>>)> {
         let eids = self.engine.query(conds);
         eids.iter().map(|&eid| {
@@ -124,6 +196,37 @@ impl Ravn {
                     }
                     let steps: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
                     eids = self.follow(&eids, &steps);
+                }
+                // v31: 逆方向 tie 辿り。`reverse parent` で parent 指している entity 集合。
+                "reverse" | "rev" => {
+                    if args.is_empty() {
+                        return RavnResult::Error("reverse: no himo specified".into());
+                    }
+                    eids = self.reverse_follow(&eids, &args[0]);
+                }
+                // v31: フィルタ。`where himo:value` で絞り込み。
+                "where" => {
+                    // args 形式: "himo:value" or "himo:\"text\""
+                    let joined = args.join(" ");
+                    let pairs = match parse_pairs(&self.engine, &joined) {
+                        Ok(p) => p,
+                        Err(e) => return RavnResult::Error(format!("where: {}", e)),
+                    };
+                    for (himo, value) in pairs {
+                        eids = self.filter_by(&eids, &himo, value);
+                    }
+                }
+                // v31: 深さ制限 BFS。`bfs <himo> <depth>` で全レベル展開(flat)。
+                "bfs" => {
+                    if args.len() < 2 {
+                        return RavnResult::Error("bfs: usage `bfs <himo> <depth>`".into());
+                    }
+                    let depth: u32 = match args[1].parse() {
+                        Ok(d) => d,
+                        Err(_) => return RavnResult::Error("bfs: invalid depth".into()),
+                    };
+                    let levels = self.bfs(&eids, &args[0], depth);
+                    eids = levels.into_iter().flat_map(|(_, v)| v).collect();
                 }
                 "select" => {
                     if args.is_empty() {
@@ -360,5 +463,93 @@ mod tests {
             RavnResult::Count(2) => {}
             other => panic!("expected Count(2), got {other:?}"),
         }
+    }
+
+    // ──── v31 additions ────
+
+    #[test]
+    fn reverse_follow_finds_children() {
+        let (_eng, ravn) = setup("reverse");
+        // parent に japan(0) を持つ entity を逆引き → kanto(1), kansai(2)
+        let children = ravn.reverse_follow(&[0], "parent");
+        assert_eq!(children, vec![1, 2]);
+    }
+
+    #[test]
+    fn bfs_explores_by_depth() {
+        let (_eng, ravn) = setup("bfs");
+        // dept(4) -> parent -> kanto(1) -> parent -> japan(0)
+        let levels = ravn.bfs(&[4], "parent", 3);
+        assert_eq!(levels[0].0, 0);
+        assert_eq!(levels[0].1, vec![4]);
+        assert_eq!(levels[1].0, 1);
+        assert_eq!(levels[1].1, vec![1]); // kanto
+        assert_eq!(levels[2].0, 2);
+        assert_eq!(levels[2].1, vec![0]); // japan
+    }
+
+    #[test]
+    fn filter_by_value() {
+        let (_eng, ravn) = setup("filter");
+        // entity 0..=4 のうち type=2 のもの
+        let all = vec![0u32, 1, 2, 3, 4];
+        let regions = ravn.filter_by(&all, "type", 2);
+        assert_eq!(regions, vec![1, 2]);
+    }
+
+    #[test]
+    fn filter_by_text_finds_named() {
+        let (_eng, ravn) = setup("filter_text");
+        let all = vec![0u32, 1, 2, 3];
+        let tanaka = ravn.filter_by_text(&all, "name", "Tanaka");
+        assert_eq!(tanaka, vec![3]);
+    }
+
+    #[test]
+    fn extract_values() {
+        let (_eng, ravn) = setup("extract");
+        // kanto(1), kansai(2) の parent を抽出 → [japan, japan]
+        let parents = ravn.extract(&[1, 2], "parent");
+        assert_eq!(parents, vec![0, 0]);
+    }
+
+    #[test]
+    fn exec_reverse_pipe() {
+        let (_eng, ravn) = setup("exec_rev");
+        // type=1 (japan) に parent 指している entity → kanto, kansai
+        match ravn.exec("type:1 | reverse parent | count") {
+            RavnResult::Count(2) => {}
+            other => panic!("expected Count(2), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exec_where_pipe() {
+        let (_eng, ravn) = setup("exec_where");
+        // type=2 (regions) かつ name=Kanto → kanto のみ
+        match ravn.exec(r#"type:2 | where name:"Kanto" | count"#) {
+            RavnResult::Count(1) => {}
+            other => panic!("expected Count(1), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exec_bfs_pipe() {
+        let (_eng, ravn) = setup("exec_bfs");
+        // dept(type=4) から parent を 2 段辿り → kanto, japan
+        match ravn.exec("type:4 | bfs parent 2 | count") {
+            RavnResult::Count(n) => { assert!(n >= 2, "expected >= 2 in bfs, got {}", n); }
+            other => panic!("expected Count, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_text_names() {
+        let (_eng, ravn) = setup("extract_text");
+        let names = ravn.extract_text(&[0, 1, 2, 3], "name");
+        let names_s: Vec<String> = names.iter()
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .collect();
+        assert_eq!(names_s, vec!["Japan", "Kanto", "Kansai", "Tanaka"]);
     }
 }
