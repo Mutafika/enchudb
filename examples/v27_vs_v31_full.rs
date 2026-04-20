@@ -47,7 +47,7 @@ fn main() {
             eng.tie_async(eids[i as usize], "price", (i * 7) % 10_000);
             // parent は前の entity を指す(0 は除く)
             if i > 0 {
-                eng.tie_async(eids[i as usize], "parent", eids[(i - 1) as usize]);
+                eng.tie_async(eids[i as usize], "parent", eids[(i - 1) as usize] as u32);
             }
         }
         eng.flush_writes();
@@ -113,9 +113,9 @@ fn main() {
     let subset_v27 = eng_v27.pull_raw("cls", 42);
     let subset_v31 = eng_v31.pull_raw("cls", 42);
     #[cfg(feature = "v27")]
-    let subset_v27: &[u32] = &subset_v27;
+    let subset_v27: &[u64] = &subset_v27;
     #[cfg(feature = "v27")]
-    let subset_v31: &[u32] = &subset_v31;
+    let subset_v31: &[u64] = &subset_v31;
 
     let r1 = bench("  v27 sum", ITERS, || eng_v27.sum("price", subset_v27));
     let r2 = bench("  v31 sum", ITERS, || eng_v31.sum("price", subset_v31));
@@ -138,7 +138,7 @@ fn main() {
     println!("  diff: {:+.1}%", diff_pct(r2, r1));
 
     println!("\n── AGGREGATE: group_sum (tenant で group して price 合計) ──");
-    let all_v27: Vec<u32> = (0..N).collect();
+    let all_v27: Vec<u64> = (0..N as u64).collect();
     let r1 = bench("  v27 group_sum", 100, || eng_v27.group_sum("tenant", "price", &all_v27));
     let r2 = bench("  v31 group_sum", 100, || eng_v31.group_sum("tenant", "price", &all_v27));
     println!("  diff: {:+.1}%", diff_pct(r2, r1));
@@ -146,7 +146,7 @@ fn main() {
     println!("\n── RAVN GRAPH: forward follow (parent 1 hop) ──");
     let ravn_v27 = Ravn::new(Arc::clone(&eng_v27));
     let ravn_v31 = Ravn::new(Arc::clone(&eng_v31));
-    let starts: Vec<u32> = (100..200).collect();
+    let starts: Vec<u64> = (100..200u64).collect();
     let r1 = bench("  v27 follow parent", 1000, || ravn_v27.follow(&starts, &["parent"]));
     let r2 = bench("  v31 follow parent", 1000, || ravn_v31.follow(&starts, &["parent"]));
     println!("  diff: {:+.1}%", diff_pct(r2, r1));
@@ -157,8 +157,8 @@ fn main() {
     println!("  diff: {:+.1}%", diff_pct(r2, r1));
 
     println!("\n── RAVN GRAPH: bfs depth=3 ──");
-    let r1 = bench("  v27 bfs", 500, || ravn_v27.bfs(&[N - 1], "parent", 3));
-    let r2 = bench("  v31 bfs", 500, || ravn_v31.bfs(&[N - 1], "parent", 3));
+    let r1 = bench("  v27 bfs", 500, || ravn_v27.bfs(&[(N - 1) as u64], "parent", 3));
+    let r2 = bench("  v31 bfs", 500, || ravn_v31.bfs(&[(N - 1) as u64], "parent", 3));
     println!("  diff: {:+.1}%", diff_pct(r2, r1));
 
     println!("\n── DURABILITY: wal_sync / commit ──");

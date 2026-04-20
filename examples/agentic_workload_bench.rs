@@ -71,7 +71,7 @@ fn main() {
     let t0 = Instant::now();
     let mut hits = 0;
     for _ in 0..QUERY_ITERS {
-        let eids = eng.query(&[("speaker", target_speaker), ("topic", target_topic)]);
+        let eids = eng.query(&[("speaker", target_speaker as u32), ("topic", target_topic as u32)]);
         hits = eids.len();
     }
     let enchu_q1 = t0.elapsed();
@@ -81,7 +81,7 @@ fn main() {
     // Query 2: query + decision text 全件抽出
     let t0 = Instant::now();
     for _ in 0..QUERY_ITERS {
-        let eids = eng.query(&[("speaker", target_speaker), ("topic", target_topic)]);
+        let eids = eng.query(&[("speaker", target_speaker as u32), ("topic", target_topic as u32)]);
         for &e in &eids {
             let _ = eng.get_text(e, "decision");
         }
@@ -94,7 +94,7 @@ fn main() {
     let t0 = Instant::now();
     let mut rev_hits = 0;
     for _ in 0..QUERY_ITERS {
-        let sessions = eng.pull_raw("topic", target_topic);
+        let sessions = eng.pull_raw("topic", target_topic as u32);
         rev_hits = sessions.len();
     }
     let enchu_q3 = t0.elapsed();

@@ -141,7 +141,7 @@ fn main() {
             while !stop.load(Ordering::Relaxed) {
                 for _ in 0..100 {
                     // 既存 entity を in-place 更新
-                    let eid = i % n_initial;
+                    let eid = (i % n_initial) as u64;
                     db.tie_async(eid, "tenant", i % 16);
                     i = i.wrapping_add(1);
                 }

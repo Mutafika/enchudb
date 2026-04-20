@@ -307,9 +307,9 @@ fn main() {
     let a_idx = db.himo_id("a").unwrap();
     let t = Instant::now();
     for i in 0..update_n {
-        let old = db.get(i, "a").unwrap();
+        let old = db.get(i as u64, "a").unwrap();
         let new_v = (old + 1) % cardinalities[0];
-        db.tie(i, "a", new_v);
+        db.tie(i as u64, "a", new_v);
         db.apply_pair_delta(i, a_idx, old, new_v);
     }
     let cas_time = t.elapsed();

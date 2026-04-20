@@ -36,28 +36,28 @@ fn main() {
 
     // get
     let t = Instant::now();
-    for eid in 0..n {
+    for eid in 0..n as u64 {
         std::hint::black_box(db.get(eid, "city"));
     }
     println!("get {}件: {:?}", n, t.elapsed());
 
     // tie (overwrite)
     let t = Instant::now();
-    for eid in 0..n {
-        db.tie(eid, "city", (eid + 1) % 10);
+    for eid in 0..n as u64 {
+        db.tie(eid, "city", ((eid + 1) % 10) as u32);
     }
     println!("tie overwrite {}件: {:?}", n, t.elapsed());
 
     // untie
     let t = Instant::now();
-    for eid in 0..1000 {
+    for eid in 0..1000u64 {
         db.untie(eid, "age");
     }
     println!("untie 1000件: {:?}", t.elapsed());
 
     // delete
     let t = Instant::now();
-    for eid in 0..1000 {
+    for eid in 0..1000u64 {
         db.delete(eid);
     }
     println!("delete 1000件: {:?}", t.elapsed());
@@ -98,14 +98,14 @@ fn main() {
 
     // content
     let t = Instant::now();
-    for eid in 0..10_000u32 {
+    for eid in 0..10_000u64 {
         db3.content(eid, "memo", b"hello world");
     }
     println!("content 10000件: {:?}", t.elapsed());
 
     // get_content
     let t = Instant::now();
-    for eid in 0..10_000u32 {
+    for eid in 0..10_000u64 {
         std::hint::black_box(db3.get_content(eid, "memo"));
     }
     println!("get_content 10000件: {:?}", t.elapsed());

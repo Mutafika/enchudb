@@ -37,7 +37,7 @@ fn main() {
 
     // k件の Column 直読みフィルタ
     for k in [10, 100, 1000, 10000] {
-        let candidates: Vec<u32> = salary_500.iter().take(k).copied().collect();
+        let candidates: Vec<u64> = salary_500.iter().take(k).copied().collect();
         let actual_k = candidates.len();
         if actual_k == 0 { continue; }
 

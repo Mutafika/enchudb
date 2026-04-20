@@ -79,8 +79,8 @@ fn main() {
     let total_combos = city_card * dept_card * grade_card;
 
     let t = Instant::now();
-    let mut combo_table: Vec<Vec<u32>> = vec![vec![]; total_combos as usize];
-    for eid in 0..n {
+    let mut combo_table: Vec<Vec<u64>> = vec![vec![]; total_combos as usize];
+    for eid in 0..n as u64 {
         let city = db.get(eid, "city").unwrap_or(u32::MAX);
         let dept = db.get(eid, "dept").unwrap_or(u32::MAX);
         let grade = db.get(eid, "grade").unwrap_or(u32::MAX);
@@ -90,7 +90,7 @@ fn main() {
         }
     }
     let build_combo = t.elapsed();
-    let combo_mem: usize = combo_table.iter().map(|v| v.len() * 4 + 24).sum();
+    let combo_mem: usize = combo_table.iter().map(|v| v.len() * 8 + 24).sum();
     println!("構築: {:?}, 組み合わせ: {}, メモリ: {} KB", build_combo, total_combos, combo_mem / 1024);
 
     println!();
@@ -146,7 +146,7 @@ fn main() {
 
 fn v26_query(
     db: &enchudb::Engine,
-    combo_table: &[Vec<u32>],
+    combo_table: &[Vec<u64>],
     dept_card: u32,
     grade_card: u32,
     city: Option<u32>,
