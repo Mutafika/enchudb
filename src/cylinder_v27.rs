@@ -1,41 +1,56 @@
-//! BucketCylinder (v27) — per-value bucket、ソート不要、rebuild 不要。
+//! BucketCylinder (v27→v32) — per-value bucket、ソート不要、rebuild 不要。
 //!
-//! 設計:
-//!   buckets[value] = entity ids(追加順、未ソート)。slice 直返し可能。
-//!   positions[eid] = (value+1, idx_in_bucket)。0 = 未 tie。
+//! # 設計
 //!
-//! 計算量:
-//!   insert: O(1) push(初見バケットは resize 分だけ O(k))
-//!   remove: O(1) swap_remove(末尾と入れ替えて positions 更新)
-//!   slice_one: O(1) スライス直返し
-//!   rebuild_from_column: open 時の初期構築。O(n)。
+//! - dense 領域: `buckets[value] = entity ids` (value < DENSE_CAP の時)
+//! - sparse 領域: `sparse.get(&value)` (value >= DENSE_CAP の時)
+//! - positions[eid] = (value, idx)。value = u32::MAX なら未 tie。
 //!
-//! max_values の扱い:
-//!   max_values は「初期 bucket サイズのヒント」。値の上限ではない。
-//!   tie に渡された value が現在の buckets.len() を超える場合は
-//!   `ensure_bucket` で動的に resize する(silent clamp なし)。
-//!   0 を渡した場合は「ヒントなし」。最初の tie で必要サイズまで伸びる。
+//! # v32 変更点(sinfo 40GB alloc バグ対策)
 //!
-//! 並行性:
-//!   段階 2 では &mut self 前提(単一スレッド)。HimoStore 段階で排他を被せる。
+//! v27 までは `ensure_bucket(value)` が `buckets.resize(value+1)` していたため、
+//! 巨大な値(例: epoch seconds 1.7e9)で 40GB 確保してハング。v32 では
+//! value >= DENSE_CAP(=2^20 = 1M)を sparse HashMap に逃がす。
+//!
+//! # 計算量
+//!
+//! - insert dense: O(1)
+//! - insert sparse: O(1) amortized(HashMap)
+//! - remove: O(1) swap_remove
+//! - slice_one: O(1) スライス直返し
+//! - rebuild_from_column: open 時の初期構築。O(n)。
+//!
+//! # max_values の扱い
+//!
+//! - 初期 bucket サイズのヒント。値の上限ではない。
+//! - DENSE_CAP(1M)を超えるヒントは無視される(dense メモリ爆発防止)。
+//! - 0 を渡すと「ヒントなし」。最初の tie で必要サイズまで伸びる。
 
+use std::collections::HashMap;
 use crate::column::Column;
+
+/// dense バケット上限。これ以上の value は sparse HashMap に格納。
+/// 2^20 = 1_048_576。dense 領域の最大メモリ: ~24MB (1M 個の空 Vec ヘッダ)。
+pub const DENSE_CAP: u32 = 1 << 20;
+
+/// 「未 tie」を示す value sentinel(tie は value < u32::MAX を assert するので衝突しない)。
+const EMPTY_VALUE: u32 = u32::MAX;
 
 pub struct BucketCylinder {
     max_values: u32,
     buckets: Vec<Vec<u32>>,
-    /// eid → (value+1, idx_in_bucket)。value+1 == 0 なら未 tie。
+    sparse: HashMap<u32, Vec<u32>>,
+    /// eid → (value, idx_in_bucket)。value == EMPTY_VALUE なら未 tie。
     positions: Vec<(u32, u32)>,
     total: u32,
+    /// 現在の unique 値数。UniqueDelta で更新。
+    unique_count_cache: u32,
 }
 
 /// insert / remove が unique 値カウントに与えた影響。
-/// HimoStore が AtomicU32 に反映する。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UniqueDelta {
-    /// 新しい unique 値が増えたバケット数(0 or 1)。
     pub added: u32,
-    /// 空になって消えた unique 値数(0, 1, or 2)。
     pub removed: u32,
 }
 
@@ -46,75 +61,91 @@ impl UniqueDelta {
 impl BucketCylinder {
     pub fn new(max_values: u32, max_entities: u32) -> Self {
         // max_values は初期サイズのヒント。0 なら空で始めて必要時に伸ばす。
-        let bucket_count = if max_values == 0 { 0 } else { max_values as usize + 1 };
+        // DENSE_CAP を超えるヒントは無視(メモリ爆発防止)。
+        let bucket_count = if max_values == 0 {
+            0
+        } else {
+            (max_values as usize + 1).min(DENSE_CAP as usize)
+        };
         Self {
             max_values,
             buckets: (0..bucket_count).map(|_| Vec::new()).collect(),
-            positions: vec![(0, 0); max_entities as usize],
+            sparse: HashMap::new(),
+            positions: vec![(EMPTY_VALUE, 0); max_entities as usize],
             total: 0,
+            unique_count_cache: 0,
         }
     }
 
     /// value を eid に紐づける。既存エントリがあれば置き換え。
-    /// unique 値数の変化を UniqueDelta で返す。
     pub fn insert(&mut self, eid: u32, value: u32) -> UniqueDelta {
+        debug_assert!(value != EMPTY_VALUE, "value == u32::MAX is sentinel");
         self.ensure_positions(eid);
 
         let mut delta = UniqueDelta::NONE;
 
-        let (old_vp1, old_idx) = self.positions[eid as usize];
-        if old_vp1 != 0 {
-            let old_v = old_vp1 - 1;
-            let was_last = self.buckets[old_v as usize].len() == 1;
-            self.swap_remove_at(old_v, old_idx);
+        let (old_value, old_idx) = self.positions[eid as usize];
+        let was_tied = old_value != EMPTY_VALUE;
+        if was_tied {
+            let was_last = self.location_len(old_value) == 1;
+            self.swap_remove_at(old_value, old_idx);
             if was_last {
                 delta.removed += 1;
             }
         }
 
         self.ensure_bucket(value);
-        let bi = value as usize;
-        let was_empty = self.buckets[bi].is_empty();
-        let idx = self.buckets[bi].len() as u32;
-        self.buckets[bi].push(eid);
+        let was_empty = self.location_len(value) == 0;
+        let idx = self.push_to(value, eid);
         if was_empty {
             delta.added += 1;
         }
-        self.positions[eid as usize] = (value + 1, idx);
-        if old_vp1 == 0 {
+
+        self.positions[eid as usize] = (value, idx);
+        if !was_tied {
             self.total += 1;
         }
+
+        self.unique_count_cache = self
+            .unique_count_cache
+            .saturating_add(delta.added)
+            .saturating_sub(delta.removed);
 
         delta
     }
 
-    /// eid の紐を外す。unique 値数の変化を UniqueDelta で返す。
+    /// eid の紐を外す。
     pub fn remove(&mut self, eid: u32) -> UniqueDelta {
         if (eid as usize) >= self.positions.len() {
             return UniqueDelta::NONE;
         }
-        let (vp1, idx) = self.positions[eid as usize];
-        if vp1 == 0 {
+        let (value, idx) = self.positions[eid as usize];
+        if value == EMPTY_VALUE {
             return UniqueDelta::NONE;
         }
-        let v = vp1 - 1;
-        let was_last = self.buckets[v as usize].len() == 1;
-        self.swap_remove_at(v, idx);
-        self.positions[eid as usize] = (0, 0);
+        let was_last = self.location_len(value) == 1;
+        self.swap_remove_at(value, idx);
+        self.positions[eid as usize] = (EMPTY_VALUE, 0);
         self.total -= 1;
-        UniqueDelta {
+        let delta = UniqueDelta {
             added: 0,
             removed: if was_last { 1 } else { 0 },
-        }
+        };
+        self.unique_count_cache = self.unique_count_cache.saturating_sub(delta.removed);
+        delta
     }
 
     /// value ちょうどの entity を返す(slice、ゼロコピー)。
-    /// 範囲外(bucket が未作成)なら空 slice。
     #[inline]
     pub fn slice_one(&self, value: u32) -> &[u32] {
-        match self.bucket_index(value) {
-            Some(bi) => &self.buckets[bi],
-            None => &[],
+        if value < DENSE_CAP {
+            let bi = value as usize;
+            if bi < self.buckets.len() {
+                return &self.buckets[bi];
+            }
+            &[]
+        } else {
+            self.sparse.get(&value).map(|v| v.as_slice()).unwrap_or(&[])
         }
     }
 
@@ -126,32 +157,49 @@ impl BucketCylinder {
         self.max_values
     }
 
-    /// 現在の unique 値数(非空バケット数)。
-    /// 通常は HimoStore の AtomicU32 を使うが、デバッグ/検証用に直接数える。
+    /// 現在の unique 値数(非空バケット + sparse 要素数)。
     pub fn unique_count(&self) -> u32 {
-        self.buckets.iter().filter(|b| !b.is_empty()).count() as u32
+        self.unique_count_cache
     }
 
     /// 入っている値を列挙(順序は保証しない)。
     pub fn unique_values(&self) -> Vec<u32> {
-        self.buckets
+        let mut out: Vec<u32> = self
+            .buckets
             .iter()
             .enumerate()
             .filter_map(|(v, b)| if b.is_empty() { None } else { Some(v as u32) })
-            .collect()
+            .collect();
+        out.extend(self.sparse.keys().copied());
+        out
     }
 
     /// range は全幅探索。low..=high の各バケットを順に iter として返す。
-    /// bucket が未作成の範囲は空としてスキップされる。
-    pub fn range_iter(&self, low: u32, high: u32) -> impl Iterator<Item = &u32> {
-        let lo = low as usize;
-        let hi = (high as usize).min(self.buckets.len().saturating_sub(1));
-        let buckets = if lo >= self.buckets.len() || lo > hi {
+    /// dense と sparse を両方走査する。
+    pub fn range_iter(&self, low: u32, high: u32) -> Box<dyn Iterator<Item = &u32> + '_> {
+        let dense_hi = (high as usize)
+            .min(self.buckets.len().saturating_sub(1))
+            .min(DENSE_CAP as usize - 1);
+        let dense_lo = (low as usize).min(self.buckets.len());
+        let dense_slice: &[Vec<u32>] = if dense_lo >= self.buckets.len() || dense_lo > dense_hi {
             &self.buckets[0..0]
         } else {
-            &self.buckets[lo..=hi]
+            &self.buckets[dense_lo..=dense_hi]
         };
-        buckets.iter().flatten()
+        let dense_iter = dense_slice.iter().flatten();
+
+        // sparse の range — HashMap は順序なしなので走査
+        if high < DENSE_CAP {
+            Box::new(dense_iter)
+        } else {
+            let sparse_lo = low.max(DENSE_CAP);
+            let sparse_iter = self
+                .sparse
+                .iter()
+                .filter(move |(k, _)| **k >= sparse_lo && **k <= high)
+                .flat_map(|(_, v)| v.iter());
+            Box::new(dense_iter.chain(sparse_iter))
+        }
     }
 
     /// Column から全再構築。open 時に呼ぶ。
@@ -159,10 +207,12 @@ impl BucketCylinder {
         for b in &mut self.buckets {
             b.clear();
         }
+        self.sparse.clear();
         for p in &mut self.positions {
-            *p = (0, 0);
+            *p = (EMPTY_VALUE, 0);
         }
         self.total = 0;
+        self.unique_count_cache = 0;
 
         let count = column.count();
         self.ensure_positions(count.saturating_sub(1));
@@ -173,48 +223,91 @@ impl BucketCylinder {
             if stored != 0 {
                 let value = stored - 1;
                 self.ensure_bucket(value);
-                let bi = value as usize;
-                let idx = self.buckets[bi].len() as u32;
-                self.buckets[bi].push(eid);
-                self.positions[eid as usize] = (value + 1, idx);
+                let was_empty = self.location_len(value) == 0;
+                let idx = self.push_to(value, eid);
+                self.positions[eid as usize] = (value, idx);
                 self.total += 1;
+                if was_empty {
+                    self.unique_count_cache += 1;
+                }
             }
         }
     }
 
-    /// 指定 value のバケットが存在するよう buckets を resize。
-    /// 既に存在するならなにもしない。silent clamp の代わり。
+    // ═══════════════ internal helpers ═══════════════
+
+    /// dense 領域 (value < DENSE_CAP の場合) を必要に応じて拡張。
     #[inline]
     fn ensure_bucket(&mut self, value: u32) {
-        if (value as usize) >= self.buckets.len() {
+        if value < DENSE_CAP && (value as usize) >= self.buckets.len() {
             self.buckets.resize(value as usize + 1, Vec::new());
         }
     }
 
-    #[inline]
-    fn bucket_index(&self, value: u32) -> Option<usize> {
-        let bi = value as usize;
-        if bi < self.buckets.len() { Some(bi) } else { None }
+    /// value の場所に eid を push し、idx を返す。
+    fn push_to(&mut self, value: u32, eid: u32) -> u32 {
+        if value < DENSE_CAP {
+            let bi = value as usize;
+            let idx = self.buckets[bi].len() as u32;
+            self.buckets[bi].push(eid);
+            idx
+        } else {
+            let v = self.sparse.entry(value).or_insert_with(Vec::new);
+            let idx = v.len() as u32;
+            v.push(eid);
+            idx
+        }
+    }
+
+    /// value の場所の長さ。存在しない場合 0。
+    fn location_len(&self, value: u32) -> usize {
+        if value < DENSE_CAP {
+            self.buckets.get(value as usize).map(|b| b.len()).unwrap_or(0)
+        } else {
+            self.sparse.get(&value).map(|b| b.len()).unwrap_or(0)
+        }
     }
 
     fn ensure_positions(&mut self, eid: u32) {
         if (eid as usize) >= self.positions.len() {
-            self.positions.resize(eid as usize + 1, (0, 0));
+            self.positions.resize(eid as usize + 1, (EMPTY_VALUE, 0));
         }
     }
 
-    /// bucket[value] の idx 位置を swap_remove。末尾と入れ替えた entity の
-    /// positions を更新。
+    /// value の場所の idx 位置を swap_remove。末尾と入れ替えた entity の
+    /// positions を更新。空になったら sparse からエントリ削除。
     fn swap_remove_at(&mut self, value: u32, idx: u32) {
-        let bi = value as usize;
-        let bucket = &mut self.buckets[bi];
-        let last = bucket.len() - 1;
-        if (idx as usize) != last {
-            let moved_eid = bucket[last];
-            bucket.swap_remove(idx as usize);
-            self.positions[moved_eid as usize].1 = idx;
+        if value < DENSE_CAP {
+            let bi = value as usize;
+            let bucket = &mut self.buckets[bi];
+            let last = bucket.len() - 1;
+            if (idx as usize) != last {
+                let moved_eid = bucket[last];
+                bucket.swap_remove(idx as usize);
+                self.positions[moved_eid as usize].1 = idx;
+            } else {
+                bucket.pop();
+            }
         } else {
-            bucket.pop();
+            let remove_entry;
+            {
+                let bucket = self
+                    .sparse
+                    .get_mut(&value)
+                    .expect("sparse bucket missing");
+                let last = bucket.len() - 1;
+                if (idx as usize) != last {
+                    let moved_eid = bucket[last];
+                    bucket.swap_remove(idx as usize);
+                    self.positions[moved_eid as usize].1 = idx;
+                } else {
+                    bucket.pop();
+                }
+                remove_entry = bucket.is_empty();
+            }
+            if remove_entry {
+                self.sparse.remove(&value);
+            }
         }
     }
 }
@@ -274,13 +367,11 @@ mod tests {
 
     #[test]
     fn dynamic_bucket_expansion() {
-        // max_values=10 で始めても、value=1000 を tie すれば裏で拡張される。
         let mut c = BucketCylinder::new(10, 100);
         c.insert(1, 1000);
         c.insert(2, 10);
         assert_eq!(c.slice_one(1000), &[1]);
         assert_eq!(c.slice_one(10), &[2]);
-        // 未使用バケットは空
         assert_eq!(c.slice_one(500), &[] as &[u32]);
     }
 
@@ -298,15 +389,10 @@ mod tests {
     #[test]
     fn unique_delta_basic() {
         let mut c = BucketCylinder::new(10, 100);
-        // 初回 insert → added=1
         assert_eq!(c.insert(1, 3), UniqueDelta { added: 1, removed: 0 });
-        // 同じ bucket → added=0
         assert_eq!(c.insert(2, 3), UniqueDelta::NONE);
-        // 別 bucket → added=1
         assert_eq!(c.insert(3, 5), UniqueDelta { added: 1, removed: 0 });
-        // remove → bucket はまだ空じゃない
         assert_eq!(c.remove(1), UniqueDelta::NONE);
-        // 最後の eid を remove → bucket 空に
         assert_eq!(c.remove(2), UniqueDelta { added: 0, removed: 1 });
     }
 
@@ -315,18 +401,88 @@ mod tests {
         let mut c = BucketCylinder::new(10, 100);
         c.insert(1, 3);
         c.insert(2, 3);
-        // 値を 3 → 7 に置換。bucket 3 はまだ残る(eid=2)が、bucket 7 は新規。
         assert_eq!(c.insert(1, 7), UniqueDelta { added: 1, removed: 0 });
-        // 最後の bucket 3 も置換。bucket 3 が消えて、bucket 9 が生まれる。
         assert_eq!(c.insert(2, 9), UniqueDelta { added: 1, removed: 1 });
     }
 
     #[test]
     fn zero_max_values_works() {
-        // 初期サイズ 0 でも tie で伸びる。
         let mut c = BucketCylinder::new(0, 100);
         c.insert(1, 42);
         assert_eq!(c.slice_one(42), &[1]);
         assert_eq!(c.slice_one(0), &[] as &[u32]);
     }
+
+    // ═══ v32: sparse fallback ═══
+
+    #[test]
+    fn huge_value_uses_sparse() {
+        // sinfo バグ: epoch seconds を tie → 以前は 40GB 確保してハング。
+        // v32: sparse に逃がすので即座に insert 完了。
+        let mut c = BucketCylinder::new(10, 100);
+        let ts = 1_700_000_000u32; // 2023-11-15 頃
+        c.insert(1, ts);
+        assert_eq!(c.slice_one(ts), &[1]);
+        assert_eq!(c.total(), 1);
+        // dense 領域は膨張していない(max 11 = 10+1)
+        assert!(c.buckets.len() <= 11);
+    }
+
+    #[test]
+    fn sparse_insert_remove_roundtrip() {
+        let mut c = BucketCylinder::new(0, 100);
+        let v1 = 2_000_000_000u32;
+        let v2 = 3_000_000_000u32;
+        c.insert(1, v1);
+        c.insert(2, v1);
+        c.insert(3, v2);
+        assert_eq!(c.slice_one(v1).len(), 2);
+        assert_eq!(c.slice_one(v2).len(), 1);
+
+        c.remove(2);
+        assert_eq!(c.slice_one(v1), &[1]);
+        c.remove(1);
+        assert_eq!(c.slice_one(v1), &[] as &[u32]);
+        c.remove(3);
+        assert_eq!(c.slice_one(v2), &[] as &[u32]);
+    }
+
+    #[test]
+    fn mixed_dense_and_sparse() {
+        let mut c = BucketCylinder::new(100, 1000);
+        c.insert(1, 50);
+        c.insert(2, 50);
+        c.insert(3, 5_000_000);   // sparse
+        c.insert(4, 5_000_000);   // sparse
+        c.insert(5, 42);           // dense
+
+        assert_eq!(c.slice_one(50), &[1, 2]);
+        assert_eq!(c.slice_one(5_000_000).len(), 2);
+        assert_eq!(c.slice_one(42), &[5]);
+        assert_eq!(c.total(), 5);
+        assert_eq!(c.unique_count(), 3);
+    }
+
+    #[test]
+    fn unique_count_tracks_sparse() {
+        let mut c = BucketCylinder::new(0, 100);
+        c.insert(1, 10_000_000);
+        assert_eq!(c.unique_count(), 1);
+        c.insert(2, 10_000_000);
+        assert_eq!(c.unique_count(), 1);
+        c.insert(3, 20_000_000);
+        assert_eq!(c.unique_count(), 2);
+        c.remove(1);
+        assert_eq!(c.unique_count(), 2);
+        c.remove(2);
+        assert_eq!(c.unique_count(), 1);
+    }
+
+    #[test]
+    fn dense_cap_hint_clamped() {
+        // max_values に極端な値を指定しても dense 領域は DENSE_CAP で打ち切り。
+        let c = BucketCylinder::new(u32::MAX - 2, 100);
+        assert!(c.buckets.len() <= DENSE_CAP as usize);
+    }
+
 }

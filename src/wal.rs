@@ -1,4 +1,14 @@
-//! Write-Ahead Log (v28) — crash consistency for v27 op-based writes.
+//! Write-Ahead Log (v28→v32) — crash consistency for op-based writes.
+//!
+//! # v32 変更点(WAL v2)
+//!
+//! - **eid を u64 化**(分散の [peer|local] 合成 ID)
+//! - **HLC スロット**: `(wall:8, logical:4, peer:4)` 全順序用
+//! - **author_peer スロット**: WAL を書いた peer(中継 peer 対応)
+//! - **署名スロット(64B)**: ed25519(Phase C で埋める、現状 zeros)
+//! - **pubkey_fp(8B)**: 署名検証に使う pubkey の先頭 8B(現状 zeros)
+//!
+//! 破壊変更: v1 WAL は開けない。v2 magic で判別しエラー。
 //!
 //! # 設計原則
 //!
@@ -6,23 +16,31 @@
 //! - **書きは WAL append を memcpy 1 回で済ます**(tie_async の ~1μs を維持)
 //! - **fsync は hot path から外す**(非同期、consumer スレッド側で定期実行)
 //!
-//! # レコード形式
+//! # レコード形式(v2)
 //!
 //! ```text
 //! [magic: 2B "WL"]
-//! [op_type: 1B]    0=Tie, 1=Untie, 2=Delete, 3=Content, 4=Commit
-//! [_pad: 1B]
-//! [len: 4B LE]     payload bytes(header + crc は除く)
-//! [lsn: 8B LE]     Log Sequence Number(単調増加)
-//! [crc32: 4B LE]   payload の FNV-1a(v10 互換)
-//! [payload: len B] op 固有
+//! [version: 1B]         = 2
+//! [op_type: 1B]         0=Tie, 1=Untie, 2=Delete, 3=Content, 4=Commit, 5=Schema
+//! [len: 4B LE]          payload bytes
+//! [lsn: 8B LE]          Log Sequence Number(ローカル単調増加、recover 用)
+//! [hlc_wall: 8B LE]     HLC wall clock(ms since epoch)
+//! [hlc_logical: 4B LE]  HLC logical counter
+//! [hlc_peer: 4B LE]     HLC peer id
+//! [author_peer: 4B LE]  WAL を書いた peer の id
+//! [crc32: 4B LE]        payload の FNV-1a
+//! [signature: 64B]      ed25519 over (header fixed ‖ payload)。現状 zeros。
+//! [pubkey_fp: 8B]       署名に使った pubkey の先頭 8B。現状 zeros。
+//! [payload: len B]
 //! ```
 //!
-//! Tie payload: [eid: 4B][himo_id: 2B][_pad: 2B][value: 4B]     = 12B
-//! Untie payload: [eid: 4B][himo_id: 2B][_pad: 2B]              = 8B
-//! Delete payload: [eid: 4B]                                     = 4B
-//! Content payload: [eid: 4B][key_len: 2B][data_len: 4B][key][data]
-//! Commit payload: なし(len = 0)
+//! ヘッダ固定部: 2+1+1+4+8 + 8+4+4 + 4 + 4 + 64 + 8 = **112B / record**
+//!
+//! Tie payload(v2):    [eid: 8B][himo_id: 2B][_pad: 2B][value: 4B]  = 16B
+//! Untie payload(v2):  [eid: 8B][himo_id: 2B][_pad: 6B]             = 16B
+//! Delete payload(v2): [eid: 8B]                                     = 8B
+//! Content payload(v2):[eid: 8B][key_len: 2B][_pad: 2B][data_len: 4B][key][data]
+//! Commit payload:     なし(len = 0)
 //!
 //! # ファイル配置
 //!
@@ -31,15 +49,12 @@
 //! ```text
 //! [File header 32B]
 //!   [magic: 4B "EWAL"]
-//!   [version: 4B LE]  = 1
+//!   [version: 4B LE]  = 2
 //!   [head: 8B LE]     writer が atomic 前進
 //!   [checkpoint: 8B LE] consumer が前進(ここまで本体に適用済み)
 //!   [capacity: 8B LE] buffer size
 //! [Records starting at offset 32]
 //! ```
-//!
-//! head, checkpoint は**ファイル内のオフセット**(byte 単位)。
-//! atomic なのは mmap 経由での読み書き。プロセス内では AtomicU64 でキャッシュ。
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -49,12 +64,35 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
 use memmap2::MmapMut;
 
+use crate::{Hlc, PeerId};
+
 const FILE_MAGIC: &[u8; 4] = b"EWAL";
-const FILE_VERSION: u32 = 1;
+pub const WAL_FILE_VERSION: u32 = 2;
 const HEADER_SIZE: usize = 32;
 
 const REC_MAGIC: &[u8; 2] = b"WL";
-const REC_HEADER_SIZE: usize = 20; // magic(2) + op(1) + pad(1) + len(4) + lsn(8) + crc(4)
+const REC_VERSION: u8 = 2;
+/// v2 レコード固定ヘッダ: 2+1+1+4+8 + 8+4+4 + 4 + 4 + 64 + 8 = 112
+const REC_HEADER_SIZE: usize = 112;
+
+// ヘッダ内オフセット
+const OFF_MAGIC: usize = 0;       // 2
+const OFF_VERSION: usize = 2;     // 1
+const OFF_OP: usize = 3;          // 1
+const OFF_LEN: usize = 4;         // 4
+const OFF_LSN: usize = 8;         // 8
+const OFF_HLC_WALL: usize = 16;   // 8
+const OFF_HLC_LOGICAL: usize = 24;// 4
+const OFF_HLC_PEER: usize = 28;   // 4
+const OFF_AUTHOR_PEER: usize = 32;// 4
+const OFF_CRC: usize = 36;        // 4
+const OFF_SIGNATURE: usize = 40;  // 64
+const OFF_PUBKEY_FP: usize = 104; // 8
+const _: () = assert!(OFF_PUBKEY_FP + 8 == REC_HEADER_SIZE);
+
+/// 署名/pubkey_fp は Phase C で埋める。現状 zeros。
+const ZERO_SIGNATURE: [u8; 64] = [0u8; 64];
+const ZERO_PUBKEY_FP: [u8; 8] = [0u8; 8];
 
 /// WAL 初期サイズ(256MB、sparse なので実ディスク消費は書いた分のみ)。
 pub const DEFAULT_WAL_SIZE: usize = 256 * 1024 * 1024;
@@ -66,27 +104,28 @@ pub mod op_type {
     pub const DELETE: u8 = 2;
     pub const CONTENT: u8 = 3;
     pub const COMMIT: u8 = 4;
+    pub const SCHEMA: u8 = 5; // v32 予約(Phase D 以降で使う)
 }
 
-/// WAL に書く op。
+/// WAL に書く op。eid は u64(v32)。
 #[derive(Debug, Clone)]
 pub enum WalOp<'a> {
-    Tie { eid: u32, himo_id: u16, value: u32 },
-    Untie { eid: u32, himo_id: u16 },
-    Delete { eid: u32 },
-    Content { eid: u32, key: &'a str, data: &'a [u8] },
+    Tie { eid: u64, himo_id: u16, value: u32 },
+    Untie { eid: u64, himo_id: u16 },
+    Delete { eid: u64 },
+    Content { eid: u64, key: &'a str, data: &'a [u8] },
     Commit,
 }
 
 impl<'a> WalOp<'a> {
-    /// payload の byte 数(固定 or 動的)。
+    /// payload の byte 数(固定 or 動的)。v2 layout。
     #[inline]
     fn payload_size(&self) -> usize {
         match self {
-            WalOp::Tie { .. } => 12,
-            WalOp::Untie { .. } => 8,
-            WalOp::Delete { .. } => 4,
-            WalOp::Content { key, data, .. } => 4 + 2 + 4 + key.len() + data.len(),
+            WalOp::Tie { .. } => 16,       // eid(8) + himo_id(2) + pad(2) + value(4)
+            WalOp::Untie { .. } => 16,     // eid(8) + himo_id(2) + pad(6)
+            WalOp::Delete { .. } => 8,     // eid(8)
+            WalOp::Content { key, data, .. } => 8 + 2 + 2 + 4 + key.len() + data.len(),
             WalOp::Commit => 0,
         }
     }
@@ -104,26 +143,27 @@ impl<'a> WalOp<'a> {
     fn write_payload(&self, buf: &mut [u8]) {
         match self {
             WalOp::Tie { eid, himo_id, value } => {
-                buf[0..4].copy_from_slice(&eid.to_le_bytes());
-                buf[4..6].copy_from_slice(&himo_id.to_le_bytes());
-                buf[6..8].copy_from_slice(&[0, 0]);
-                buf[8..12].copy_from_slice(&value.to_le_bytes());
+                buf[0..8].copy_from_slice(&eid.to_le_bytes());
+                buf[8..10].copy_from_slice(&himo_id.to_le_bytes());
+                buf[10..12].copy_from_slice(&[0, 0]);
+                buf[12..16].copy_from_slice(&value.to_le_bytes());
             }
             WalOp::Untie { eid, himo_id } => {
-                buf[0..4].copy_from_slice(&eid.to_le_bytes());
-                buf[4..6].copy_from_slice(&himo_id.to_le_bytes());
-                buf[6..8].copy_from_slice(&[0, 0]);
+                buf[0..8].copy_from_slice(&eid.to_le_bytes());
+                buf[8..10].copy_from_slice(&himo_id.to_le_bytes());
+                buf[10..16].copy_from_slice(&[0u8; 6]);
             }
             WalOp::Delete { eid } => {
-                buf[0..4].copy_from_slice(&eid.to_le_bytes());
+                buf[0..8].copy_from_slice(&eid.to_le_bytes());
             }
             WalOp::Content { eid, key, data } => {
-                buf[0..4].copy_from_slice(&eid.to_le_bytes());
+                buf[0..8].copy_from_slice(&eid.to_le_bytes());
                 let klen = key.len() as u16;
                 let dlen = data.len() as u32;
-                buf[4..6].copy_from_slice(&klen.to_le_bytes());
-                buf[6..10].copy_from_slice(&dlen.to_le_bytes());
-                let ko = 10;
+                buf[8..10].copy_from_slice(&klen.to_le_bytes());
+                buf[10..12].copy_from_slice(&[0, 0]);
+                buf[12..16].copy_from_slice(&dlen.to_le_bytes());
+                let ko = 16;
                 let do_ = ko + key.len();
                 buf[ko..do_].copy_from_slice(key.as_bytes());
                 buf[do_..do_ + data.len()].copy_from_slice(data);
@@ -136,17 +176,19 @@ impl<'a> WalOp<'a> {
 /// デコード後の op(読み戻し用、所有型)。
 #[derive(Debug, Clone)]
 pub enum DecodedOp {
-    Tie { eid: u32, himo_id: u16, value: u32 },
-    Untie { eid: u32, himo_id: u16 },
-    Delete { eid: u32 },
-    Content { eid: u32, key: String, data: Vec<u8> },
+    Tie { eid: u64, himo_id: u16, value: u32 },
+    Untie { eid: u64, himo_id: u16 },
+    Delete { eid: u64 },
+    Content { eid: u64, key: String, data: Vec<u8> },
     Commit,
 }
 
-/// リカバリ結果の 1 レコード。
+/// リカバリ結果の 1 レコード(HLC + author_peer 込み)。
 #[derive(Debug, Clone)]
 pub struct RecoveredRecord {
     pub lsn: u64,
+    pub hlc: Hlc,
+    pub author_peer: PeerId,
     pub op: DecodedOp,
 }
 
@@ -163,6 +205,12 @@ pub struct Wal {
     head: AtomicU64,
     checkpoint: AtomicU64,
     next_lsn: AtomicU64,
+    /// v32: HLC logical counter(wall が進まない時の tiebreaker 単調増加)。
+    hlc_logical: std::sync::atomic::AtomicU32,
+    /// v32: 最後に書いた HLC wall(ms)。
+    hlc_last_wall: AtomicU64,
+    /// v32: この Wal を持つ peer の id(header には書かず Engine から設定)。
+    peer_id: std::sync::atomic::AtomicU32,
     /// v30: append 中の writer 数。try_reset はこれが 0 のときだけ実行できる。
     pending_writes: std::sync::atomic::AtomicU32,
 }
@@ -184,7 +232,7 @@ impl Wal {
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
         // ヘッダ初期化
         mmap[0..4].copy_from_slice(FILE_MAGIC);
-        mmap[4..8].copy_from_slice(&FILE_VERSION.to_le_bytes());
+        mmap[4..8].copy_from_slice(&WAL_FILE_VERSION.to_le_bytes());
         mmap[8..16].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes()); // head
         mmap[16..24].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes()); // checkpoint
         mmap[24..32].copy_from_slice(&(capacity as u64).to_le_bytes()); // capacity
@@ -196,11 +244,14 @@ impl Wal {
             head: AtomicU64::new(HEADER_SIZE as u64),
             checkpoint: AtomicU64::new(HEADER_SIZE as u64),
             next_lsn: AtomicU64::new(1),
+            hlc_logical: std::sync::atomic::AtomicU32::new(0),
+            hlc_last_wall: AtomicU64::new(0),
+            peer_id: std::sync::atomic::AtomicU32::new(0),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
-    /// 既存 WAL を開く。
+    /// 既存 WAL を開く。v2 のみ対応。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
@@ -211,11 +262,17 @@ impl Wal {
         if &mmap[0..4] != FILE_MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "bad WAL magic"));
         }
+        let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
+        if version != WAL_FILE_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("WAL version {} unsupported (expected {})", version, WAL_FILE_VERSION),
+            ));
+        }
         let head = u64::from_le_bytes(mmap[8..16].try_into().unwrap());
         let checkpoint = u64::from_le_bytes(mmap[16..24].try_into().unwrap());
         let capacity = u64::from_le_bytes(mmap[24..32].try_into().unwrap());
 
-        // next_lsn は recover 後に update されるので、暫定 1。
         Ok(Self {
             _file: file,
             mmap,
@@ -223,8 +280,22 @@ impl Wal {
             head: AtomicU64::new(head),
             checkpoint: AtomicU64::new(checkpoint),
             next_lsn: AtomicU64::new(1),
+            hlc_logical: std::sync::atomic::AtomicU32::new(0),
+            hlc_last_wall: AtomicU64::new(0),
+            peer_id: std::sync::atomic::AtomicU32::new(0),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
         })
+    }
+
+    /// この WAL を所有する peer の id を設定(Engine 初期化時に 1 回)。
+    pub fn set_peer_id(&self, peer: PeerId) {
+        self.peer_id.store(peer, Ordering::Release);
+    }
+
+    /// 現在の peer id。
+    #[inline]
+    pub fn peer_id(&self) -> PeerId {
+        self.peer_id.load(Ordering::Acquire)
     }
 
     /// 現在の head(次の append 位置)。
@@ -238,6 +309,28 @@ impl Wal {
     /// 次に発行する LSN。
     #[inline]
     pub fn next_lsn(&self) -> u64 { self.next_lsn.load(Ordering::Acquire) }
+
+    /// 次の HLC を払い出す。
+    /// wall が前回より進んでいれば logical=0 にリセット、同じ/戻っていれば logical+1。
+    fn next_hlc(&self) -> Hlc {
+        let peer = self.peer_id.load(Ordering::Acquire);
+        let now = current_wall_ms();
+        loop {
+            let last = self.hlc_last_wall.load(Ordering::Acquire);
+            let logical = self.hlc_logical.load(Ordering::Acquire);
+            let (new_wall, new_logical) = if now > last {
+                (now, 0u32)
+            } else {
+                (last, logical.wrapping_add(1))
+            };
+            // last_wall, logical を同時更新(CAS 的に)
+            if self.hlc_last_wall.compare_exchange(last, new_wall, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                self.hlc_logical.store(new_logical, Ordering::Release);
+                return Hlc { wall: new_wall, logical: new_logical, peer };
+            }
+            // race したらリトライ
+        }
+    }
 
     /// op を append。新しいレコードの LSN を返す。
     ///
@@ -258,7 +351,6 @@ impl Wal {
             let cur = self.head.load(Ordering::Acquire);
             let new = cur + record_size as u64;
             if new > self.capacity {
-                // capacity 超過 — consumer が reset してくれるのを待つ
                 return Err(io::Error::new(
                     io::ErrorKind::OutOfMemory,
                     "WAL full — consumer reset behind",
@@ -271,6 +363,8 @@ impl Wal {
         };
 
         let lsn = self.next_lsn.fetch_add(1, Ordering::AcqRel);
+        let hlc = self.next_hlc();
+        let author_peer = hlc.peer;
 
         let op_byte = op.op_byte();
         let payload_offset = offset as usize + REC_HEADER_SIZE;
@@ -279,13 +373,20 @@ impl Wal {
         let crc = fnv1a(&mmap[payload_offset..payload_offset + payload_size]);
 
         let header = &mut mmap[offset as usize..offset as usize + REC_HEADER_SIZE];
-        header[0..2].copy_from_slice(REC_MAGIC);
-        header[2] = op_byte;
-        header[3] = 0;
-        header[4..8].copy_from_slice(&(payload_size as u32).to_le_bytes());
-        header[8..16].copy_from_slice(&lsn.to_le_bytes());
-        header[16..20].copy_from_slice(&crc.to_le_bytes());
+        header[OFF_MAGIC..OFF_MAGIC + 2].copy_from_slice(REC_MAGIC);
+        header[OFF_VERSION] = REC_VERSION;
+        header[OFF_OP] = op_byte;
+        header[OFF_LEN..OFF_LEN + 4].copy_from_slice(&(payload_size as u32).to_le_bytes());
+        header[OFF_LSN..OFF_LSN + 8].copy_from_slice(&lsn.to_le_bytes());
+        header[OFF_HLC_WALL..OFF_HLC_WALL + 8].copy_from_slice(&hlc.wall.to_le_bytes());
+        header[OFF_HLC_LOGICAL..OFF_HLC_LOGICAL + 4].copy_from_slice(&hlc.logical.to_le_bytes());
+        header[OFF_HLC_PEER..OFF_HLC_PEER + 4].copy_from_slice(&hlc.peer.to_le_bytes());
+        header[OFF_AUTHOR_PEER..OFF_AUTHOR_PEER + 4].copy_from_slice(&author_peer.to_le_bytes());
+        header[OFF_CRC..OFF_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+        header[OFF_SIGNATURE..OFF_SIGNATURE + 64].copy_from_slice(&ZERO_SIGNATURE);
+        header[OFF_PUBKEY_FP..OFF_PUBKEY_FP + 8].copy_from_slice(&ZERO_PUBKEY_FP);
 
+        // ファイルヘッダの head も更新
         mmap[8..16].copy_from_slice(&(offset + record_size as u64).to_le_bytes());
 
         Ok(lsn)
@@ -293,14 +394,11 @@ impl Wal {
 
     /// v30: ring buffer reset。
     /// head == checkpoint && pending_writes == 0 のときのみ実行可能。
-    /// 成功したら head と checkpoint を HEADER_SIZE に戻す(全領域再利用可能に)。
-    /// consumer 周期 fsync 内で periodic に呼ばれる想定。
     pub fn try_reset(&self) -> bool {
         let head = self.head.load(Ordering::Acquire);
         let cp = self.checkpoint.load(Ordering::Acquire);
         if head != cp || head <= HEADER_SIZE as u64 { return false; }
         if self.pending_writes.load(Ordering::Acquire) > 0 { return false; }
-        // もう一度 head == checkpoint を確認(race でずれた場合の保険)
         if self.head.compare_exchange(head, HEADER_SIZE as u64, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return false;
         }
@@ -326,7 +424,6 @@ impl Wal {
     pub fn fsync(&self) -> io::Result<()> { Ok(()) }
 
     /// checkpoint を前進。本体 mmap に反映済み LSN の位置まで進める。
-    /// 引数は新しい checkpoint offset(bytes)。
     pub fn advance_checkpoint(&self, new_checkpoint: u64) {
         let cur = self.checkpoint.load(Ordering::Acquire);
         if new_checkpoint <= cur { return; }
@@ -342,6 +439,7 @@ impl Wal {
         let mut offset = self.checkpoint.load(Ordering::Acquire);
         let head = self.head.load(Ordering::Acquire);
         let mut max_lsn = 0;
+        let mut max_hlc = Hlc::ZERO;
 
         let mmap = self.mmap_slice();
 
@@ -349,12 +447,18 @@ impl Wal {
             let rec_end = (offset as usize) + REC_HEADER_SIZE;
             if rec_end > mmap.len() { break; }
             let header = &mmap[offset as usize..rec_end];
-            if &header[0..2] != REC_MAGIC { break; }
+            if &header[OFF_MAGIC..OFF_MAGIC + 2] != REC_MAGIC { break; }
+            if header[OFF_VERSION] != REC_VERSION { break; }
 
-            let op_byte = header[2];
-            let payload_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
-            let lsn = u64::from_le_bytes(header[8..16].try_into().unwrap());
-            let stored_crc = u32::from_le_bytes(header[16..20].try_into().unwrap());
+            let op_byte = header[OFF_OP];
+            let payload_len = u32::from_le_bytes(header[OFF_LEN..OFF_LEN + 4].try_into().unwrap()) as usize;
+            let lsn = u64::from_le_bytes(header[OFF_LSN..OFF_LSN + 8].try_into().unwrap());
+            let hlc_wall = u64::from_le_bytes(header[OFF_HLC_WALL..OFF_HLC_WALL + 8].try_into().unwrap());
+            let hlc_logical = u32::from_le_bytes(header[OFF_HLC_LOGICAL..OFF_HLC_LOGICAL + 4].try_into().unwrap());
+            let hlc_peer = u32::from_le_bytes(header[OFF_HLC_PEER..OFF_HLC_PEER + 4].try_into().unwrap());
+            let author_peer = u32::from_le_bytes(header[OFF_AUTHOR_PEER..OFF_AUTHOR_PEER + 4].try_into().unwrap());
+            let stored_crc = u32::from_le_bytes(header[OFF_CRC..OFF_CRC + 4].try_into().unwrap());
+            let hlc = Hlc { wall: hlc_wall, logical: hlc_logical, peer: hlc_peer };
 
             let payload_off = rec_end;
             let payload_end = payload_off + payload_len;
@@ -363,34 +467,36 @@ impl Wal {
             let computed_crc = fnv1a(&mmap[payload_off..payload_end]);
             if stored_crc != computed_crc { break; } // 破損 tail
 
-            // デコード
             let op = decode_op(op_byte, &mmap[payload_off..payload_end]);
             if lsn > max_lsn { max_lsn = lsn; }
+            if hlc > max_hlc { max_hlc = hlc; }
 
             match op {
                 Some(DecodedOp::Commit) => {
                     out.append(&mut batch);
                 }
                 Some(other) => {
-                    batch.push(RecoveredRecord { lsn, op: other });
+                    batch.push(RecoveredRecord { lsn, hlc, author_peer, op: other });
                 }
-                None => break, // 未知 op → 安全側に倒して停止
+                None => break,
             }
 
             offset = (payload_end) as u64;
         }
 
-        // uncommitted batch は破棄(drop)。recover の定義通り。
-        // 次回 append のために next_lsn を更新。
+        // uncommitted batch は破棄。recover の定義通り。
         if max_lsn > 0 {
             self.next_lsn.store(max_lsn + 1, Ordering::Release);
+        }
+        if max_hlc.wall > 0 {
+            self.hlc_last_wall.store(max_hlc.wall, Ordering::Release);
+            self.hlc_logical.store(max_hlc.logical, Ordering::Release);
         }
 
         out
     }
 
     /// head を checkpoint に戻す(WAL truncate 相当、uncommitted も全捨て)。
-    /// チェックポイント完了後、WAL を空に戻す時に使う。
     pub fn reset_to_checkpoint(&self) {
         let cp = self.checkpoint.load(Ordering::Acquire);
         self.head.store(cp, Ordering::Release);
@@ -418,8 +524,6 @@ impl Wal {
     #[inline]
     #[allow(clippy::mut_from_ref)]
     fn mmap_mut_slice(&self) -> &mut [u8] {
-        // mmap 経由の書き込みは CAS + atomic で管理するため、unsafe で可変化。
-        // Engine の設計(concurrent writer)と整合。
         unsafe {
             let ptr = self.mmap.as_ptr() as *mut u8;
             std::slice::from_raw_parts_mut(ptr, self.mmap.len())
@@ -441,7 +545,7 @@ impl Wal {
     pub fn create_in_memory(capacity: usize) -> Self {
         let mut buf = vec![0u8; capacity];
         buf[0..4].copy_from_slice(FILE_MAGIC);
-        buf[4..8].copy_from_slice(&FILE_VERSION.to_le_bytes());
+        buf[4..8].copy_from_slice(&WAL_FILE_VERSION.to_le_bytes());
         buf[8..16].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
         buf[16..24].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
         buf[24..32].copy_from_slice(&(capacity as u64).to_le_bytes());
@@ -451,35 +555,53 @@ impl Wal {
             head: AtomicU64::new(HEADER_SIZE as u64),
             checkpoint: AtomicU64::new(HEADER_SIZE as u64),
             next_lsn: AtomicU64::new(1),
+            hlc_logical: std::sync::atomic::AtomicU32::new(0),
+            hlc_last_wall: AtomicU64::new(0),
+            peer_id: std::sync::atomic::AtomicU32::new(0),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
         }
     }
 }
 
+/// 現在時刻を ms since UNIX epoch で返す。wasm32 では 0。
+#[inline]
+fn current_wall_ms() -> u64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+    #[cfg(target_arch = "wasm32")]
+    { 0 }
+}
+
 fn decode_op(op_byte: u8, payload: &[u8]) -> Option<DecodedOp> {
     match op_byte {
-        op_type::TIE if payload.len() >= 12 => {
-            let eid = u32::from_le_bytes(payload[0..4].try_into().unwrap());
-            let himo_id = u16::from_le_bytes(payload[4..6].try_into().unwrap());
-            let value = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+        op_type::TIE if payload.len() >= 16 => {
+            let eid = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+            let himo_id = u16::from_le_bytes(payload[8..10].try_into().unwrap());
+            let value = u32::from_le_bytes(payload[12..16].try_into().unwrap());
             Some(DecodedOp::Tie { eid, himo_id, value })
         }
-        op_type::UNTIE if payload.len() >= 8 => {
-            let eid = u32::from_le_bytes(payload[0..4].try_into().unwrap());
-            let himo_id = u16::from_le_bytes(payload[4..6].try_into().unwrap());
+        op_type::UNTIE if payload.len() >= 16 => {
+            let eid = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+            let himo_id = u16::from_le_bytes(payload[8..10].try_into().unwrap());
             Some(DecodedOp::Untie { eid, himo_id })
         }
-        op_type::DELETE if payload.len() >= 4 => {
-            let eid = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+        op_type::DELETE if payload.len() >= 8 => {
+            let eid = u64::from_le_bytes(payload[0..8].try_into().unwrap());
             Some(DecodedOp::Delete { eid })
         }
-        op_type::CONTENT if payload.len() >= 10 => {
-            let eid = u32::from_le_bytes(payload[0..4].try_into().unwrap());
-            let klen = u16::from_le_bytes(payload[4..6].try_into().unwrap()) as usize;
-            let dlen = u32::from_le_bytes(payload[6..10].try_into().unwrap()) as usize;
-            if payload.len() < 10 + klen + dlen { return None; }
-            let key = String::from_utf8(payload[10..10 + klen].to_vec()).ok()?;
-            let data = payload[10 + klen..10 + klen + dlen].to_vec();
+        op_type::CONTENT if payload.len() >= 16 => {
+            let eid = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+            let klen = u16::from_le_bytes(payload[8..10].try_into().unwrap()) as usize;
+            let dlen = u32::from_le_bytes(payload[12..16].try_into().unwrap()) as usize;
+            if payload.len() < 16 + klen + dlen { return None; }
+            let key = String::from_utf8(payload[16..16 + klen].to_vec()).ok()?;
+            let data = payload[16 + klen..16 + klen + dlen].to_vec();
             Some(DecodedOp::Content { eid, key, data })
         }
         op_type::COMMIT => Some(DecodedOp::Commit),
@@ -524,6 +646,27 @@ mod tests {
     }
 
     #[test]
+    fn hlc_monotonic() {
+        let p = tmp("hlc");
+        let wal = Wal::create(&p, 1024 * 1024).unwrap();
+        wal.set_peer_id(7);
+        wal.append(WalOp::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
+        wal.append(WalOp::Tie { eid: 2, himo_id: 0, value: 2 }).unwrap();
+        wal.append(WalOp::Commit).unwrap();
+        wal.fsync().unwrap();
+
+        let wal = Wal::open(&p).unwrap();
+        let recs = wal.recover();
+        assert_eq!(recs.len(), 2);
+        // HLC は単調増加
+        assert!(recs[0].hlc <= recs[1].hlc);
+        // peer が 7 で記録されている
+        assert_eq!(recs[0].hlc.peer, 7);
+        assert_eq!(recs[0].author_peer, 7);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
     fn recover_committed_only() {
         let p = tmp("recover");
         {
@@ -538,7 +681,6 @@ mod tests {
 
         let wal = Wal::open(&p).unwrap();
         let recs = wal.recover();
-        // Commit 済みの 2 件のみ。eid=3 は uncommitted で破棄。
         assert_eq!(recs.len(), 2);
         match &recs[0].op {
             DecodedOp::Tie { eid, value, .. } => {
@@ -574,6 +716,26 @@ mod tests {
     }
 
     #[test]
+    fn signature_slot_is_zero() {
+        // Phase A: 署名スロットは確保されるが zeros。
+        let p = tmp("sig_zero");
+        let wal = Wal::create(&p, 1024 * 1024).unwrap();
+        wal.append(WalOp::Tie { eid: 1, himo_id: 0, value: 42 }).unwrap();
+        wal.append(WalOp::Commit).unwrap();
+        wal.fsync().unwrap();
+
+        // WAL の最初のレコード header を直接読む
+        let bytes = std::fs::read(&p).unwrap();
+        // File header 32B + Record header からの signature 位置
+        let sig_off = 32 + OFF_SIGNATURE;
+        let sig = &bytes[sig_off..sig_off + 64];
+        assert_eq!(sig, &[0u8; 64]);
+        let pubkey_fp = &bytes[32 + OFF_PUBKEY_FP..32 + OFF_PUBKEY_FP + 8];
+        assert_eq!(pubkey_fp, &[0u8; 8]);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
     fn checksum_catches_torn_write() {
         let p = tmp("corrupt");
         {
@@ -585,16 +747,17 @@ mod tests {
             wal.fsync().unwrap();
         }
 
-        // 2つ目のレコードの payload を壊す
+        // 2 つ目の Tie payload を壊す。
+        // ファイルレイアウト: File header 32 + Tie record(112+16=128) + Commit(112+0=112) + Tie record...
         {
             use std::io::Seek;
             use std::io::Write;
             use std::io::Read;
             use std::io::SeekFrom;
             let mut f = OpenOptions::new().read(true).write(true).open(&p).unwrap();
-            // 最初のレコード: header(20) + payload(12) = 32B、Commit: 20B = 52
-            // 2つ目 Tie: payload 先頭にオフセット HEADER_SIZE(32) + 52 + 20(header) = 104
-            f.seek(SeekFrom::Start(HEADER_SIZE as u64 + 20 + 12 + 20 + 20 + 5)).unwrap();
+            // 2 つ目の Tie の payload 内の value バイトを破壊
+            // 32 (file hdr) + 128 (Tie1) + 112 (Commit) + 112 (Tie2 header) + 12 (value offset in payload) = 396
+            f.seek(SeekFrom::Start(32 + 128 + 112 + 112 + 12)).unwrap();
             let mut b = [0u8; 1]; f.read_exact(&mut b).unwrap();
             f.seek(SeekFrom::Current(-1)).unwrap();
             f.write_all(&[b[0] ^ 0xFF]).unwrap();
@@ -611,6 +774,26 @@ mod tests {
             }
             _ => panic!(),
         }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn v1_file_rejected() {
+        // v1 WAL file を偽造して、開けないことを確認
+        let p = tmp("v1_reject");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&p).unwrap();
+            let mut hdr = [0u8; 32];
+            hdr[0..4].copy_from_slice(b"EWAL");
+            hdr[4..8].copy_from_slice(&1u32.to_le_bytes()); // v1
+            hdr[8..16].copy_from_slice(&32u64.to_le_bytes());
+            hdr[16..24].copy_from_slice(&32u64.to_le_bytes());
+            hdr[24..32].copy_from_slice(&1024u64.to_le_bytes());
+            f.write_all(&hdr).unwrap();
+            f.set_len(1024).unwrap();
+        }
+        assert!(Wal::open(&p).is_err(), "v1 WAL should be rejected");
         let _ = std::fs::remove_file(&p);
     }
 
@@ -634,14 +817,14 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
         let p = tmp("concurrent");
-        let wal = Arc::new(Wal::create(&p, 16 * 1024 * 1024).unwrap());
+        let wal = Arc::new(Wal::create(&p, 32 * 1024 * 1024).unwrap());
         let mut handles = Vec::new();
         for t in 0..4 {
             let w = wal.clone();
             handles.push(thread::spawn(move || {
-                for i in 0..1000 {
+                for i in 0..1000u64 {
                     w.append(WalOp::Tie {
-                        eid: (t * 10000 + i) as u32,
+                        eid: t * 10000 + i,
                         himo_id: 0,
                         value: i as u32,
                     }).unwrap();
@@ -649,8 +832,6 @@ mod tests {
             }));
         }
         for h in handles { h.join().unwrap(); }
-        // 4 * 1000 = 4000 レコード
-        // LSN は 4001 まで発行されてる
         assert_eq!(wal.next_lsn(), 4001);
         let _ = std::fs::remove_file(&p);
     }
@@ -659,25 +840,20 @@ mod tests {
     fn try_reset_recycles_wal_space() {
         let p = tmp("ring_reset");
         let wal = Wal::create(&p, 1024 * 1024).unwrap();
-        // 100 件書く → head 前進
         for i in 0..100u32 {
-            wal.append(WalOp::Tie { eid: i, himo_id: 0, value: i }).unwrap();
+            wal.append(WalOp::Tie { eid: i as u64, himo_id: 0, value: i }).unwrap();
         }
         wal.append(WalOp::Commit).unwrap();
         let head_before = wal.head();
         assert!(head_before > HEADER_SIZE as u64);
 
-        // checkpoint がまだ追いついてない → reset 失敗
         assert!(!wal.try_reset(), "should not reset when checkpoint < head");
 
-        // checkpoint を head まで進める
         wal.advance_checkpoint(head_before);
-        // これで head == checkpoint && pending == 0 → reset 成功
         assert!(wal.try_reset(), "should reset when head == checkpoint");
         assert_eq!(wal.head(), HEADER_SIZE as u64);
         assert_eq!(wal.checkpoint(), HEADER_SIZE as u64);
 
-        // reset 後も append できる
         let lsn = wal.append(WalOp::Tie { eid: 999, himo_id: 0, value: 99 }).unwrap();
         assert!(lsn > 100);
 
@@ -687,32 +863,28 @@ mod tests {
     #[test]
     fn ring_buffer_long_run_does_not_exhaust() {
         let p = tmp("ring_longrun");
-        // 容量は小さめ(128KB)にして、何度もリセット必要な状態を作る
-        let wal = Wal::create(&p, 128 * 1024).unwrap();
+        // v2 はヘッダ 112B / record なので、v1 より大きい容量が必要。
+        let wal = Wal::create(&p, 512 * 1024).unwrap();
 
-        // 合計で容量の何十倍も書く(周期的に reset する)
         for batch in 0..50u32 {
-            // 100 件書く = ~3KB。50 バッチで 150KB 書いて、容量 128KB
             for i in 0..100u32 {
                 let v = batch * 100 + i;
-                wal.append(WalOp::Tie { eid: v, himo_id: 0, value: v }).unwrap();
+                wal.append(WalOp::Tie { eid: v as u64, himo_id: 0, value: v }).unwrap();
             }
             wal.append(WalOp::Commit).unwrap();
-            // checkpoint 前進 + reset
             wal.advance_checkpoint(wal.head());
             wal.try_reset();
         }
-        // エラー無しで完走できれば ring 動作 OK
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn full_wal_returns_error() {
         let p = tmp("full");
-        let wal = Wal::create(&p, HEADER_SIZE + 50).unwrap(); // 極小
-        // tie 1 つ = 20 + 12 = 32B
+        // v2: Tie 1 つ = REC_HEADER 112 + payload 16 = 128B
+        // File header 32 + 128 + 余白だけ = 200 確保
+        let wal = Wal::create(&p, HEADER_SIZE + 128 + 50).unwrap();
         wal.append(WalOp::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
-        // 次の tie はもう入らない
         let r = wal.append(WalOp::Tie { eid: 2, himo_id: 0, value: 2 });
         assert!(r.is_err());
         let _ = std::fs::remove_file(&p);

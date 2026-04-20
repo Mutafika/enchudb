@@ -2427,30 +2427,35 @@ impl Engine {
     }
 
     /// WAL の 1 op を本体に適用(recover 専用)。
+    /// v32: eid は u64 だが Column は local u32 で保持。eid_local() で剥がす。
     #[cfg(feature = "v27")]
     fn apply_wal_op(&mut self, op: &crate::wal::DecodedOp) {
         use crate::wal::DecodedOp;
         match op {
             DecodedOp::Tie { eid, himo_id, value } => {
                 let hid = *himo_id as usize;
+                let local = crate::eid_local(*eid);
                 if hid < self.himos.len() {
-                    self.himos[hid].set(*eid, *value);
+                    self.himos[hid].set(local, *value);
                 }
             }
             DecodedOp::Untie { eid, himo_id } => {
                 let hid = *himo_id as usize;
+                let local = crate::eid_local(*eid);
                 if hid < self.himos.len() {
-                    self.himos[hid].remove(*eid);
+                    self.himos[hid].remove(local);
                 }
             }
             DecodedOp::Delete { eid } => {
+                let local = crate::eid_local(*eid);
                 for hid in 0..self.himos.len() {
-                    self.himos[hid].remove(*eid);
+                    self.himos[hid].remove(local);
                 }
-                self.entities.free(*eid);
+                self.entities.free(local);
             }
             DecodedOp::Content { eid, key, data } => {
-                self.contents.set(*eid, key, data);
+                let local = crate::eid_local(*eid);
+                self.contents.set(local, key, data);
             }
             DecodedOp::Commit => {}
         }
@@ -2672,16 +2677,17 @@ impl Engine {
     #[cfg(feature = "v27")]
     pub fn tie_async(&self, eid: crate::EntityId, himo: &str, value: u32) {
         use std::sync::atomic::Ordering;
-        let eid = crate::eid_local(eid);
+        let local = crate::eid_local(eid);
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
         if let Some(wal) = self.wal.as_ref() {
-            let _ = wal.append(crate::wal::WalOp::Tie { eid, himo_id: hid as u16, value });
+            let wal_eid = crate::make_eid(wal.peer_id(), local);
+            let _ = wal.append(crate::wal::WalOp::Tie { eid: wal_eid, himo_id: hid as u16, value });
         }
         let q = self.write_queue.as_ref()
             .expect("tie_async requires create_concurrent or concurrentize");
-        q.push(crate::write_queue::Op::Tie { eid, himo_id: hid as u16, value });
+        q.push(crate::write_queue::Op::Tie { eid: local, himo_id: hid as u16, value });
         self.push_count.fetch_add(1, Ordering::Release);
     }
 
@@ -2689,13 +2695,14 @@ impl Engine {
     #[cfg(feature = "v27")]
     pub fn untie_async(&self, eid: crate::EntityId, himo: &str) {
         use std::sync::atomic::Ordering;
-        let eid = crate::eid_local(eid);
+        let local = crate::eid_local(eid);
         let hid = match self.himo_id(himo) { Some(x) => x, None => return };
         if let Some(wal) = self.wal.as_ref() {
-            let _ = wal.append(crate::wal::WalOp::Untie { eid, himo_id: hid as u16 });
+            let wal_eid = crate::make_eid(wal.peer_id(), local);
+            let _ = wal.append(crate::wal::WalOp::Untie { eid: wal_eid, himo_id: hid as u16 });
         }
         let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
-        q.push(crate::write_queue::Op::Untie { eid, himo_id: hid as u16 });
+        q.push(crate::write_queue::Op::Untie { eid: local, himo_id: hid as u16 });
         self.push_count.fetch_add(1, Ordering::Release);
     }
 
@@ -2703,12 +2710,13 @@ impl Engine {
     #[cfg(feature = "v27")]
     pub fn delete_async(&self, eid: crate::EntityId) {
         use std::sync::atomic::Ordering;
-        let eid = crate::eid_local(eid);
+        let local = crate::eid_local(eid);
         if let Some(wal) = self.wal.as_ref() {
-            let _ = wal.append(crate::wal::WalOp::Delete { eid });
+            let wal_eid = crate::make_eid(wal.peer_id(), local);
+            let _ = wal.append(crate::wal::WalOp::Delete { eid: wal_eid });
         }
         let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
-        q.push(crate::write_queue::Op::Delete { eid });
+        q.push(crate::write_queue::Op::Delete { eid: local });
         self.push_count.fetch_add(1, Ordering::Release);
     }
 
@@ -2717,13 +2725,14 @@ impl Engine {
     #[cfg(feature = "v27")]
     pub fn content_async(&self, eid: crate::EntityId, key: &str, data: &[u8]) {
         use std::sync::atomic::Ordering;
-        let eid = crate::eid_local(eid);
+        let local = crate::eid_local(eid);
         if let Some(wal) = self.wal.as_ref() {
-            let _ = wal.append(crate::wal::WalOp::Content { eid, key, data });
+            let wal_eid = crate::make_eid(wal.peer_id(), local);
+            let _ = wal.append(crate::wal::WalOp::Content { eid: wal_eid, key, data });
         }
         let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
         q.push(crate::write_queue::Op::Content {
-            eid,
+            eid: local,
             key: key.to_string().into_boxed_str(),
             data: data.to_vec().into_boxed_slice(),
         });

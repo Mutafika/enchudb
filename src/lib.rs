@@ -61,3 +61,34 @@ pub const fn eid_peer(eid: EntityId) -> PeerId {
 pub const fn eid_local(eid: EntityId) -> u32 {
     eid as u32
 }
+
+/// v32: Hybrid Logical Clock。分散 peer 間で全順序を確立する。
+/// wall: 物理時刻(ms since epoch)、logical: 同時刻内のカウンタ、peer: tiebreaker。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hlc {
+    pub wall: u64,
+    pub logical: u32,
+    pub peer: PeerId,
+}
+
+impl Hlc {
+    pub const ZERO: Hlc = Hlc { wall: 0, logical: 0, peer: 0 };
+
+    /// 比較キー。`(wall, logical, peer)` 辞書順で全順序。
+    #[inline]
+    pub fn cmp_key(&self) -> (u64, u32, u32) {
+        (self.wall, self.logical, self.peer)
+    }
+}
+
+impl PartialOrd for Hlc {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Hlc {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.cmp_key().cmp(&other.cmp_key())
+    }
+}
