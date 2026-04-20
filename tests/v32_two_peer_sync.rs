@@ -68,11 +68,7 @@ fn peer_a_writes_peer_b_reads_via_pull() {
     // このテストでは peer A の WAL を使わず、直接 transport に publish する形で
     // apply 経路だけ検証する。
     transport.publish(1, vec![
-        WireRecord {
-            hlc: Hlc { wall: 100, logical: 0, peer: 1 },
-            author_peer: 1,
-            op: DecodedOp::Tie { eid: eid_a1, himo_id: 0, value: 42 },
-        },
+        WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 1 }, 1, DecodedOp::Tie { eid: eid_a1, himo_id: 0, value: 42 }),
     ]);
 
     let syncer_b = Syncer::new(eng_b.clone(), transport.clone() as Arc<dyn Transport>);
@@ -99,16 +95,8 @@ fn bidirectional_sync_no_conflict() {
     let eid_a = eng_a.entity();
     let eid_b = eng_b.entity();
 
-    transport.publish(1, vec![WireRecord {
-        hlc: Hlc { wall: 100, logical: 0, peer: 1 },
-        author_peer: 1,
-        op: DecodedOp::Tie { eid: eid_a, himo_id: 0, value: 10 },
-    }]);
-    transport.publish(2, vec![WireRecord {
-        hlc: Hlc { wall: 110, logical: 0, peer: 2 },
-        author_peer: 2,
-        op: DecodedOp::Tie { eid: eid_b, himo_id: 0, value: 20 },
-    }]);
+    transport.publish(1, vec![WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 1 }, 1, DecodedOp::Tie { eid: eid_a, himo_id: 0, value: 10 })]);
+    transport.publish(2, vec![WireRecord::unsigned(Hlc { wall: 110, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: eid_b, himo_id: 0, value: 20 })]);
 
     let syncer_a = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
     let syncer_b = Syncer::new(eng_b.clone(), transport.clone() as Arc<dyn Transport>);
@@ -138,18 +126,10 @@ fn lww_concurrent_write_to_same_cell() {
     let shared_eid = enchudb::make_eid(1, 0);
 
     // A が wall=100 で value=10 を書いた
-    transport.publish(1, vec![WireRecord {
-        hlc: Hlc { wall: 100, logical: 0, peer: 1 },
-        author_peer: 1,
-        op: DecodedOp::Tie { eid: shared_eid, himo_id: 0, value: 10 },
-    }]);
+    transport.publish(1, vec![WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 1 }, 1, DecodedOp::Tie { eid: shared_eid, himo_id: 0, value: 10 })]);
 
     // B は wall=200 で value=99 を書いた(concurrent、実時刻では後)
-    transport.publish(2, vec![WireRecord {
-        hlc: Hlc { wall: 200, logical: 0, peer: 2 },
-        author_peer: 2,
-        op: DecodedOp::Tie { eid: shared_eid, himo_id: 0, value: 99 },
-    }]);
+    transport.publish(2, vec![WireRecord::unsigned(Hlc { wall: 200, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: shared_eid, himo_id: 0, value: 99 })]);
 
     let syncer_a = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
     let syncer_b = Syncer::new(eng_b.clone(), transport.clone() as Arc<dyn Transport>);
@@ -183,16 +163,8 @@ fn hlc_tie_broken_by_peer_id() {
     let shared_eid = enchudb::make_eid(9, 0);
 
     // 同じ wall/logical、peer_id だけ違う → 大きい peer が勝つ
-    transport.publish(5, vec![WireRecord {
-        hlc: Hlc { wall: 100, logical: 0, peer: 5 },
-        author_peer: 5,
-        op: DecodedOp::Tie { eid: shared_eid, himo_id: 0, value: 55 },
-    }]);
-    transport.publish(7, vec![WireRecord {
-        hlc: Hlc { wall: 100, logical: 0, peer: 7 },
-        author_peer: 7,
-        op: DecodedOp::Tie { eid: shared_eid, himo_id: 0, value: 77 },
-    }]);
+    transport.publish(5, vec![WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 5 }, 5, DecodedOp::Tie { eid: shared_eid, himo_id: 0, value: 55 })]);
+    transport.publish(7, vec![WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 7 }, 7, DecodedOp::Tie { eid: shared_eid, himo_id: 0, value: 77 })]);
 
     let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
     syncer.pull_once(5);
@@ -303,6 +275,201 @@ fn peer_id_persists_across_reopen() {
 }
 
 #[test]
+fn signed_wal_verifies_between_peers() {
+    // peer A が ed25519 鍵で署名 → peer B が pubkey 登録して verify を通す。
+    use enchudb::keys::Keypair;
+
+    let pa = tmp("signed_a");
+    let pb = tmp("signed_b");
+
+    let eng_a = make_peer_with_wal(&pa, 1);
+    let eng_b = make_peer(&pb, 2);
+
+    // peer A に鍵ペアを与える
+    let kp_a = Arc::new(Keypair::generate());
+    let pk_a = kp_a.public_bytes();
+    eng_a.set_keypair(Some(kp_a.clone()));
+
+    // peer B は A の pubkey を bootstrap で受け取って登録
+    eng_b.pubkeys().force_register(1, &pk_a);
+
+    let transport = Arc::new(InMemoryTransport::new());
+    let syncer_a = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
+    let syncer_b = Syncer::new(eng_b.clone(), transport.clone() as Arc<dyn Transport>);
+    syncer_b.set_require_signature(true);
+
+    let eid = eng_a.entity();
+    eng_a.tie_async(eid, "val", 123);
+    eng_a.wal_commit();
+    eng_a.flush_writes();
+    eng_a.wal_sync().unwrap();
+    syncer_a.publish_since(Hlc::ZERO);
+
+    let out = syncer_b.pull_once(1);
+    assert!(out.applied >= 1, "signed op should be applied, got {:?}", out);
+    assert_eq!(out.rejected_signature, 0);
+    assert_eq!(eng_b.get(eid, "val"), Some(123));
+
+    cleanup(&pa);
+    cleanup(&pb);
+}
+
+#[test]
+fn unsigned_rejected_when_require_signature() {
+    let pa = tmp("unsigned_a");
+    let eng_a = make_peer(&pa, 1);
+    let transport = Arc::new(InMemoryTransport::new());
+
+    // peer 2 が未署名で publish
+    transport.publish(2, vec![
+        WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 2 }, 2,
+            DecodedOp::Tie { eid: enchudb::make_eid(2, 0), himo_id: 0, value: 99 }),
+    ]);
+
+    let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
+    syncer.set_require_signature(true);
+    let out = syncer.pull_once(2);
+    assert_eq!(out.applied, 0);
+    assert_eq!(out.rejected_signature, 1);
+
+    cleanup(&pa);
+}
+
+#[test]
+fn tampered_signature_rejected() {
+    use enchudb::keys::Keypair;
+
+    let pa = tmp("tamper_a");
+    let pb = tmp("tamper_b");
+
+    let eng_a = make_peer_with_wal(&pa, 1);
+    let eng_b = make_peer(&pb, 2);
+
+    let kp_a = Arc::new(Keypair::generate());
+    eng_a.set_keypair(Some(kp_a.clone()));
+    eng_b.pubkeys().force_register(1, &kp_a.public_bytes());
+
+    let transport = Arc::new(InMemoryTransport::new());
+    let syncer_a = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
+    let syncer_b = Syncer::new(eng_b.clone(), transport.clone() as Arc<dyn Transport>);
+    syncer_b.set_require_signature(true);
+
+    let eid = eng_a.entity();
+    eng_a.tie_async(eid, "val", 7);
+    eng_a.wal_commit();
+    eng_a.flush_writes();
+    eng_a.wal_sync().unwrap();
+    syncer_a.publish_since(Hlc::ZERO);
+
+    // transport からレコードを取り、署名を 1bit 反転させて入れ直す
+    let mut records = transport.pull(1, Hlc::ZERO);
+    assert!(!records.is_empty());
+    records[0].signature[0] ^= 0x01;
+    let t2 = Arc::new(InMemoryTransport::new());
+    t2.publish(1, records);
+    let syncer_b2 = Syncer::new(eng_b.clone(), t2.clone() as Arc<dyn Transport>);
+    syncer_b2.set_require_signature(true);
+    let out = syncer_b2.pull_once(1);
+    assert_eq!(out.applied, 0);
+    assert_eq!(out.rejected_signature, 1);
+
+    cleanup(&pa);
+    cleanup(&pb);
+}
+
+#[test]
+fn wrong_peer_pubkey_rejected() {
+    use enchudb::keys::Keypair;
+
+    let pa = tmp("wrong_a");
+    let pb = tmp("wrong_b");
+
+    let eng_a = make_peer_with_wal(&pa, 1);
+    let eng_b = make_peer(&pb, 2);
+
+    // peer A の真の鍵
+    let kp_a = Arc::new(Keypair::generate());
+    eng_a.set_keypair(Some(kp_a.clone()));
+
+    // peer B は「peer 1 の pubkey はこれ」と別の pubkey を登録(なりすまし防止)
+    let kp_fake = Keypair::generate();
+    eng_b.pubkeys().force_register(1, &kp_fake.public_bytes());
+
+    let transport = Arc::new(InMemoryTransport::new());
+    let syncer_a = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
+    let syncer_b = Syncer::new(eng_b.clone(), transport.clone() as Arc<dyn Transport>);
+    syncer_b.set_require_signature(true);
+
+    let eid = eng_a.entity();
+    eng_a.tie_async(eid, "val", 42);
+    eng_a.wal_commit();
+    eng_a.flush_writes();
+    eng_a.wal_sync().unwrap();
+    syncer_a.publish_since(Hlc::ZERO);
+
+    let out = syncer_b.pull_once(1);
+    // fake pubkey では verify 失敗
+    assert_eq!(out.applied, 0);
+    assert_eq!(out.rejected_signature, 1);
+
+    cleanup(&pa);
+    cleanup(&pb);
+}
+
+#[test]
+fn acl_blocks_non_writer_peer() {
+    let pa = tmp("acl_block_a");
+    let eng_a = make_peer(&pa, 1);
+    let transport = Arc::new(InMemoryTransport::new());
+
+    // peer 1 だけ許可、peer 99 は未許可
+    eng_a.acl().add_writer(1);
+    eng_a.acl().add_writer(2);
+
+    // peer 99 から op が届く
+    transport.publish(99, vec![
+        WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 99 }, 99,
+            DecodedOp::Tie { eid: enchudb::make_eid(99, 0), himo_id: 0, value: 42 }),
+    ]);
+
+    let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
+    let out = syncer.pull_once(99);
+    assert_eq!(out.applied, 0);
+    assert_eq!(out.rejected_acl, 1);
+
+    // peer 1 から op が来れば apply される
+    transport.publish(1, vec![
+        WireRecord::unsigned(Hlc { wall: 200, logical: 0, peer: 1 }, 1,
+            DecodedOp::Tie { eid: enchudb::make_eid(1, 0), himo_id: 0, value: 77 }),
+    ]);
+    let out2 = syncer.pull_once(1);
+    assert_eq!(out2.applied, 1);
+    assert_eq!(out2.rejected_acl, 0);
+
+    cleanup(&pa);
+}
+
+#[test]
+fn acl_empty_is_permissive() {
+    // ACL が空のままなら全員許可(bootstrap/single peer 時の挙動)
+    let pa = tmp("acl_empty_a");
+    let eng_a = make_peer(&pa, 1);
+    let transport = Arc::new(InMemoryTransport::new());
+
+    transport.publish(42, vec![
+        WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 42 }, 42,
+            DecodedOp::Tie { eid: enchudb::make_eid(42, 0), himo_id: 0, value: 9 }),
+    ]);
+
+    let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
+    let out = syncer.pull_once(42);
+    assert_eq!(out.applied, 1);
+    assert_eq!(out.rejected_acl, 0);
+
+    cleanup(&pa);
+}
+
+#[test]
 fn delete_remote_removes_all_himos() {
     let pa = tmp("del_a");
     let eng_a = make_peer(&pa, 1);
@@ -312,21 +479,9 @@ fn delete_remote_removes_all_himos() {
 
     // peer 2 が 3 つの himo に値を書いてから delete
     transport.publish(2, vec![
-        WireRecord {
-            hlc: Hlc { wall: 100, logical: 0, peer: 2 },
-            author_peer: 2,
-            op: DecodedOp::Tie { eid, himo_id: 0, value: 1 },
-        },
-        WireRecord {
-            hlc: Hlc { wall: 101, logical: 0, peer: 2 },
-            author_peer: 2,
-            op: DecodedOp::Tie { eid, himo_id: 1, value: 2 },
-        },
-        WireRecord {
-            hlc: Hlc { wall: 200, logical: 0, peer: 2 },
-            author_peer: 2,
-            op: DecodedOp::Delete { eid },
-        },
+        WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid, himo_id: 0, value: 1 }),
+        WireRecord::unsigned(Hlc { wall: 101, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid, himo_id: 1, value: 2 }),
+        WireRecord::unsigned(Hlc { wall: 200, logical: 0, peer: 2 }, 2, DecodedOp::Delete { eid }),
     ]);
 
     let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);

@@ -828,6 +828,15 @@ pub struct Engine {
     /// v32: LWW 用に (eid, himo) → 最後の HLC を記録。
     #[cfg(feature = "v32")]
     hlc_store: std::sync::Arc<crate::hlc_store::HlcStore>,
+    /// v32 Phase C: 自 peer の ed25519 鍵ペア。None なら署名しない/検証もしない。
+    #[cfg(feature = "v32")]
+    keypair: std::sync::RwLock<Option<std::sync::Arc<crate::keys::Keypair>>>,
+    /// v32 Phase C: 他 peer の pubkey TOFU ストア。Syncer が verify に使う。
+    #[cfg(feature = "v32")]
+    pubkeys: std::sync::Arc<crate::keys::PubkeyStore>,
+    /// v32 Phase C: ACL(書き込み許可 peer の集合)。Syncer が enforce する。
+    #[cfg(feature = "v32")]
+    acl: std::sync::Arc<crate::acl::Acl>,
     backing: Backing, // 最後に drop されるよう最終フィールド
 }
 
@@ -956,6 +965,12 @@ impl Engine {
             peer_id: std::sync::atomic::AtomicU32::new(0),
             #[cfg(feature = "v32")]
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
+            #[cfg(feature = "v32")]
+            keypair: std::sync::RwLock::new(None),
+            #[cfg(feature = "v32")]
+            pubkeys: std::sync::Arc::new(crate::keys::PubkeyStore::new()),
+            #[cfg(feature = "v32")]
+            acl: std::sync::Arc::new(crate::acl::Acl::new()),
             backing: Backing::Mmap(mmap),
         })
     }
@@ -1237,6 +1252,12 @@ impl Engine {
             peer_id: std::sync::atomic::AtomicU32::new(0),
             #[cfg(feature = "v32")]
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
+            #[cfg(feature = "v32")]
+            keypair: std::sync::RwLock::new(None),
+            #[cfg(feature = "v32")]
+            pubkeys: std::sync::Arc::new(crate::keys::PubkeyStore::new()),
+            #[cfg(feature = "v32")]
+            acl: std::sync::Arc::new(crate::acl::Acl::new()),
             backing,
         };
 
@@ -1322,6 +1343,38 @@ impl Engine {
     #[cfg(feature = "v32")]
     pub fn hlc_store(&self) -> &std::sync::Arc<crate::hlc_store::HlcStore> {
         &self.hlc_store
+    }
+
+    /// Phase C: 自 peer の鍵ペアを設定。WAL にも反映される。None で署名 off。
+    #[cfg(feature = "v32")]
+    pub fn set_keypair(&self, kp: Option<std::sync::Arc<crate::keys::Keypair>>) {
+        *self.keypair.write().unwrap() = kp.clone();
+        #[cfg(feature = "v27")]
+        if let Some(wal) = self.wal.as_ref() {
+            wal.set_keypair(kp.clone());
+        }
+        if let Some(ref k) = kp {
+            let peer = self.peer_id();
+            self.pubkeys.force_register(peer, &k.public_bytes());
+        }
+    }
+
+    /// Phase C: 他 peer の pubkey ストアへの参照。
+    #[cfg(feature = "v32")]
+    pub fn pubkeys(&self) -> &std::sync::Arc<crate::keys::PubkeyStore> {
+        &self.pubkeys
+    }
+
+    /// Phase C: ACL への参照。Syncer が受信 op の author を enforce する。
+    #[cfg(feature = "v32")]
+    pub fn acl(&self) -> &std::sync::Arc<crate::acl::Acl> {
+        &self.acl
+    }
+
+    /// Phase C: 自 peer の鍵ペアを返す。
+    #[cfg(feature = "v32")]
+    pub fn keypair(&self) -> Option<std::sync::Arc<crate::keys::Keypair>> {
+        self.keypair.read().unwrap().clone()
     }
 
     /// WAL への参照(sync モジュールが publish に使う)。

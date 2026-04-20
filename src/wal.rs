@@ -90,9 +90,31 @@ const OFF_SIGNATURE: usize = 40;  // 64
 const OFF_PUBKEY_FP: usize = 104; // 8
 const _: () = assert!(OFF_PUBKEY_FP + 8 == REC_HEADER_SIZE);
 
-/// 署名/pubkey_fp は Phase C で埋める。現状 zeros。
+/// Phase C で keypair が無い場合のデフォルト署名(zeros)。
 const ZERO_SIGNATURE: [u8; 64] = [0u8; 64];
 const ZERO_PUBKEY_FP: [u8; 8] = [0u8; 8];
+
+/// 署名の対象メッセージを組み立てる。
+/// header の固定フィールド(magic, version, op, len, lsn, hlc, author, crc)+ payload。
+/// signature, pubkey_fp は含めない(署名対象自身を除く)。
+fn signed_payload(
+    op_byte: u8, payload_len: u32, lsn: u64, hlc: Hlc,
+    author_peer: PeerId, crc: u32, payload: &[u8],
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(40 + payload.len());
+    m.extend_from_slice(REC_MAGIC);
+    m.push(REC_VERSION);
+    m.push(op_byte);
+    m.extend_from_slice(&payload_len.to_le_bytes());
+    m.extend_from_slice(&lsn.to_le_bytes());
+    m.extend_from_slice(&hlc.wall.to_le_bytes());
+    m.extend_from_slice(&hlc.logical.to_le_bytes());
+    m.extend_from_slice(&hlc.peer.to_le_bytes());
+    m.extend_from_slice(&author_peer.to_le_bytes());
+    m.extend_from_slice(&crc.to_le_bytes());
+    m.extend_from_slice(payload);
+    m
+}
 
 /// WAL 初期サイズ(256MB、sparse なので実ディスク消費は書いた分のみ)。
 pub const DEFAULT_WAL_SIZE: usize = 256 * 1024 * 1024;
@@ -183,13 +205,19 @@ pub enum DecodedOp {
     Commit,
 }
 
-/// リカバリ結果の 1 レコード(HLC + author_peer 込み)。
+/// リカバリ結果の 1 レコード(HLC + 署名込み)。
+/// v32 Phase C: signature と pubkey_fp も含めて返し、Syncer/PubkeyStore で検証できる。
 #[derive(Debug, Clone)]
 pub struct RecoveredRecord {
     pub lsn: u64,
     pub hlc: Hlc,
     pub author_peer: PeerId,
     pub op: DecodedOp,
+    pub signature: [u8; 64],
+    pub pubkey_fp: [u8; 8],
+    /// 署名検証に使う生データ(header 固定部 + payload、署名フィールドを除いたもの)。
+    /// これを keypair.sign()/verify() にかける。
+    pub signed_bytes: Vec<u8>,
 }
 
 /// WAL 本体。
@@ -211,6 +239,8 @@ pub struct Wal {
     hlc_last_wall: AtomicU64,
     /// v32: この Wal を持つ peer の id(header には書かず Engine から設定)。
     peer_id: std::sync::atomic::AtomicU32,
+    /// v32 Phase C: ed25519 鍵ペア。set_keypair で設定。None なら署名は zeros。
+    keypair: std::sync::RwLock<Option<std::sync::Arc<crate::keys::Keypair>>>,
     /// v30: append 中の writer 数。try_reset はこれが 0 のときだけ実行できる。
     pending_writes: std::sync::atomic::AtomicU32,
 }
@@ -247,6 +277,7 @@ impl Wal {
             hlc_logical: std::sync::atomic::AtomicU32::new(0),
             hlc_last_wall: AtomicU64::new(0),
             peer_id: std::sync::atomic::AtomicU32::new(0),
+            keypair: std::sync::RwLock::new(None),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
         })
     }
@@ -283,6 +314,7 @@ impl Wal {
             hlc_logical: std::sync::atomic::AtomicU32::new(0),
             hlc_last_wall: AtomicU64::new(0),
             peer_id: std::sync::atomic::AtomicU32::new(0),
+            keypair: std::sync::RwLock::new(None),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
         })
     }
@@ -290,6 +322,11 @@ impl Wal {
     /// この WAL を所有する peer の id を設定(Engine 初期化時に 1 回)。
     pub fn set_peer_id(&self, peer: PeerId) {
         self.peer_id.store(peer, Ordering::Release);
+    }
+
+    /// Phase C: 署名鍵を設定。None で署名 off(slot は zeros で埋める)。
+    pub fn set_keypair(&self, kp: Option<std::sync::Arc<crate::keys::Keypair>>) {
+        *self.keypair.write().unwrap() = kp;
     }
 
     /// 現在の peer id。
@@ -372,6 +409,20 @@ impl Wal {
         op.write_payload(&mut mmap[payload_offset..payload_offset + payload_size]);
         let crc = fnv1a(&mmap[payload_offset..payload_offset + payload_size]);
 
+        // Phase C: 鍵があれば署名。無ければ zeros。
+        let keypair = self.keypair.read().unwrap().clone();
+        let (signature, pubkey_fp) = match keypair {
+            Some(kp) => {
+                let msg = signed_payload(
+                    op_byte, payload_size as u32, lsn, hlc,
+                    author_peer, crc,
+                    &mmap[payload_offset..payload_offset + payload_size],
+                );
+                (kp.sign(&msg), kp.pubkey_fp())
+            }
+            None => (ZERO_SIGNATURE, ZERO_PUBKEY_FP),
+        };
+
         let header = &mut mmap[offset as usize..offset as usize + REC_HEADER_SIZE];
         header[OFF_MAGIC..OFF_MAGIC + 2].copy_from_slice(REC_MAGIC);
         header[OFF_VERSION] = REC_VERSION;
@@ -383,8 +434,8 @@ impl Wal {
         header[OFF_HLC_PEER..OFF_HLC_PEER + 4].copy_from_slice(&hlc.peer.to_le_bytes());
         header[OFF_AUTHOR_PEER..OFF_AUTHOR_PEER + 4].copy_from_slice(&author_peer.to_le_bytes());
         header[OFF_CRC..OFF_CRC + 4].copy_from_slice(&crc.to_le_bytes());
-        header[OFF_SIGNATURE..OFF_SIGNATURE + 64].copy_from_slice(&ZERO_SIGNATURE);
-        header[OFF_PUBKEY_FP..OFF_PUBKEY_FP + 8].copy_from_slice(&ZERO_PUBKEY_FP);
+        header[OFF_SIGNATURE..OFF_SIGNATURE + 64].copy_from_slice(&signature);
+        header[OFF_PUBKEY_FP..OFF_PUBKEY_FP + 8].copy_from_slice(&pubkey_fp);
 
         // ファイルヘッダの head も更新
         mmap[8..16].copy_from_slice(&(offset + record_size as u64).to_le_bytes());
@@ -471,6 +522,10 @@ impl Wal {
             let hlc_peer = u32::from_le_bytes(header[OFF_HLC_PEER..OFF_HLC_PEER + 4].try_into().unwrap());
             let author_peer = u32::from_le_bytes(header[OFF_AUTHOR_PEER..OFF_AUTHOR_PEER + 4].try_into().unwrap());
             let stored_crc = u32::from_le_bytes(header[OFF_CRC..OFF_CRC + 4].try_into().unwrap());
+            let mut signature = [0u8; 64];
+            signature.copy_from_slice(&header[OFF_SIGNATURE..OFF_SIGNATURE + 64]);
+            let mut pubkey_fp = [0u8; 8];
+            pubkey_fp.copy_from_slice(&header[OFF_PUBKEY_FP..OFF_PUBKEY_FP + 8]);
             let hlc = Hlc { wall: hlc_wall, logical: hlc_logical, peer: hlc_peer };
 
             let payload_off = rec_end;
@@ -480,16 +535,25 @@ impl Wal {
             let computed_crc = fnv1a(&mmap[payload_off..payload_end]);
             if stored_crc != computed_crc { break; } // 破損 tail
 
-            let op = decode_op(op_byte, &mmap[payload_off..payload_end]);
+            let payload_slice = &mmap[payload_off..payload_end];
+            let op = decode_op(op_byte, payload_slice);
             if lsn > max_lsn { max_lsn = lsn; }
             if hlc > max_hlc { max_hlc = hlc; }
+
+            let signed_bytes = signed_payload(
+                op_byte, payload_len as u32, lsn, hlc,
+                author_peer, stored_crc, payload_slice,
+            );
 
             match op {
                 Some(DecodedOp::Commit) => {
                     out.append(&mut batch);
                 }
                 Some(other) => {
-                    batch.push(RecoveredRecord { lsn, hlc, author_peer, op: other });
+                    batch.push(RecoveredRecord {
+                        lsn, hlc, author_peer, op: other,
+                        signature, pubkey_fp, signed_bytes,
+                    });
                 }
                 None => break,
             }
@@ -571,6 +635,7 @@ impl Wal {
             hlc_logical: std::sync::atomic::AtomicU32::new(0),
             hlc_last_wall: AtomicU64::new(0),
             peer_id: std::sync::atomic::AtomicU32::new(0),
+            keypair: std::sync::RwLock::new(None),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
         }
     }

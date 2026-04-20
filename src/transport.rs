@@ -32,17 +32,44 @@ use crate::{Hlc, PeerId};
 use crate::wal::{DecodedOp, RecoveredRecord};
 
 /// peer 間で交換する 1 件の op。
-/// WAL の RecoveredRecord をそのまま流用(lsn は送信側ローカル)。
+/// Phase C: signature と pubkey_fp + 署名対象 bytes を同梱する。
 #[derive(Debug, Clone)]
 pub struct WireRecord {
     pub hlc: Hlc,
     pub author_peer: PeerId,
     pub op: DecodedOp,
+    /// ed25519 署名(64B)。zeros なら未署名。
+    pub signature: [u8; 64],
+    /// 署名した公開鍵の先頭 8B(TOFU で識別に使う)。
+    pub pubkey_fp: [u8; 8],
+    /// 署名対象の生 bytes(WAL header 固定部 + payload)。
+    /// peer 間通信では wire 上で再生成する設計でもいいが、簡便に同梱。
+    pub signed_bytes: Vec<u8>,
 }
 
 impl From<RecoveredRecord> for WireRecord {
     fn from(r: RecoveredRecord) -> Self {
-        Self { hlc: r.hlc, author_peer: r.author_peer, op: r.op }
+        Self {
+            hlc: r.hlc,
+            author_peer: r.author_peer,
+            op: r.op,
+            signature: r.signature,
+            pubkey_fp: r.pubkey_fp,
+            signed_bytes: r.signed_bytes,
+        }
+    }
+}
+
+impl WireRecord {
+    /// テスト用: 未署名(署名 slot zero)で WireRecord を作る。
+    /// 本番経路では Wal::iter_committed() 経由で signed な record が来るべき。
+    pub fn unsigned(hlc: Hlc, author_peer: PeerId, op: DecodedOp) -> Self {
+        Self {
+            hlc, author_peer, op,
+            signature: [0u8; 64],
+            pubkey_fp: [0u8; 8],
+            signed_bytes: Vec::new(),
+        }
     }
 }
 
@@ -111,6 +138,9 @@ mod tests {
             hlc: Hlc { wall: hlc_wall, logical: 0, peer },
             author_peer: peer,
             op: DecodedOp::Tie { eid, himo_id: 0, value },
+            signature: [0u8; 64],
+            pubkey_fp: [0u8; 8],
+            signed_bytes: Vec::new(),
         }
     }
 

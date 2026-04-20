@@ -34,6 +34,10 @@ pub mod hlc_store;
 pub mod transport;
 #[cfg(feature = "v32")]
 pub mod sync;
+#[cfg(feature = "v32")]
+pub mod keys;
+#[cfg(feature = "v32")]
+pub mod acl;
 pub mod integrity;
 
 pub use engine::{Engine, EntityValue};

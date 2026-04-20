@@ -36,6 +36,8 @@ pub struct Syncer {
     transport: Arc<dyn Transport>,
     /// 各 peer から最後に pull した地点(HLC)。次回はここより後だけ取る。
     last_pulled: std::sync::Mutex<std::collections::HashMap<PeerId, Hlc>>,
+    /// Phase C: true なら署名検証を強制。未署名 or 検証失敗 op は reject。
+    require_signature: std::sync::atomic::AtomicBool,
 }
 
 /// 1 回の pull-apply サイクルの結果。
@@ -47,6 +49,10 @@ pub struct SyncOutcome {
     pub applied: usize,
     /// LWW で古いと判定して skip した op 数。
     pub skipped: usize,
+    /// Phase C: 署名検証で reject した op 数。
+    pub rejected_signature: usize,
+    /// Phase C: ACL で reject した op 数。
+    pub rejected_acl: usize,
 }
 
 impl Syncer {
@@ -55,7 +61,13 @@ impl Syncer {
             engine,
             transport,
             last_pulled: std::sync::Mutex::new(std::collections::HashMap::new()),
+            require_signature: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Phase C: 署名検証を必須にする。未署名 or 検証失敗 op は reject される。
+    pub fn set_require_signature(&self, on: bool) {
+        self.require_signature.store(on, std::sync::atomic::Ordering::Release);
     }
 
     /// 指定 peer から未取得レコードを 1 回 pull して本体に apply。
@@ -100,12 +112,36 @@ impl Syncer {
         count
     }
 
-    /// 受信レコードを LWW で apply する。
+    /// 受信レコードを LWW で apply する。Phase C: 署名検証 + ACL も通す。
     fn apply_records(&self, records: &[WireRecord]) -> SyncOutcome {
         let mut out = SyncOutcome::default();
         let store = self.engine.hlc_store().clone();
+        let require_sig = self.require_signature.load(std::sync::atomic::Ordering::Acquire);
+        let pubkeys = self.engine.pubkeys().clone();
+        let acl = self.engine.acl().clone();
         for rec in records {
             out.received += 1;
+
+            // ACL チェック(未定義なら全員通す)
+            if !acl.is_writer(rec.author_peer) {
+                out.rejected_acl += 1;
+                continue;
+            }
+
+            if require_sig {
+                if rec.signature == [0u8; 64] {
+                    out.rejected_signature += 1;
+                    continue;
+                }
+                if pubkeys.get(rec.author_peer).is_none() {
+                    out.rejected_signature += 1;
+                    continue;
+                }
+                if !pubkeys.verify(rec.author_peer, &rec.signed_bytes, &rec.signature) {
+                    out.rejected_signature += 1;
+                    continue;
+                }
+            }
             if self.apply_one(&store, rec) {
                 out.applied += 1;
             } else {
@@ -190,16 +226,8 @@ mod tests {
 
         // peer 2 からの古い op
         let eid = crate::make_eid(2, 7);
-        let rec_old = WireRecord {
-            hlc: Hlc { wall: 100, logical: 0, peer: 2 },
-            author_peer: 2,
-            op: DecodedOp::Tie { eid, himo_id: 0, value: 10 },
-        };
-        let rec_new = WireRecord {
-            hlc: Hlc { wall: 200, logical: 0, peer: 2 },
-            author_peer: 2,
-            op: DecodedOp::Tie { eid, himo_id: 0, value: 20 },
-        };
+        let rec_old = WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid, himo_id: 0, value: 10 });
+        let rec_new = WireRecord::unsigned(Hlc { wall: 200, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid, himo_id: 0, value: 20 });
         let out = syncer.apply_records(&[rec_new.clone(), rec_old.clone()]);
         assert_eq!(out.applied, 1);
         assert_eq!(out.skipped, 1);
@@ -221,11 +249,7 @@ mod tests {
         // peer 2 が tie した体で transport に直接 publish
         let eid_b = crate::make_eid(2, 3);
         transport.publish(2, vec![
-            WireRecord {
-                hlc: Hlc { wall: 100, logical: 0, peer: 2 },
-                author_peer: 2,
-                op: DecodedOp::Tie { eid: eid_b, himo_id: 0, value: 42 },
-            },
+            WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: eid_b, himo_id: 0, value: 42 }),
         ]);
 
         let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
@@ -247,20 +271,12 @@ mod tests {
         let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
 
         // 1st round
-        transport.publish(2, vec![WireRecord {
-            hlc: Hlc { wall: 100, logical: 0, peer: 2 },
-            author_peer: 2,
-            op: DecodedOp::Tie { eid: crate::make_eid(2, 1), himo_id: 0, value: 10 },
-        }]);
+        transport.publish(2, vec![WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: crate::make_eid(2, 1), himo_id: 0, value: 10 })]);
         let out1 = syncer.pull_once(2);
         assert_eq!(out1.received, 1);
 
         // 2nd pull should see only new records
-        transport.publish(2, vec![WireRecord {
-            hlc: Hlc { wall: 200, logical: 0, peer: 2 },
-            author_peer: 2,
-            op: DecodedOp::Tie { eid: crate::make_eid(2, 2), himo_id: 0, value: 20 },
-        }]);
+        transport.publish(2, vec![WireRecord::unsigned(Hlc { wall: 200, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: crate::make_eid(2, 2), himo_id: 0, value: 20 })]);
         let out2 = syncer.pull_once(2);
         assert_eq!(out2.received, 1);
         assert_eq!(out2.applied, 1);
