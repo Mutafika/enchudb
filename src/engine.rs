@@ -2914,10 +2914,10 @@ mod tests {
         let mut eng = Engine::create(&dir).unwrap();
         let parent = eng.entity();
         let child = eng.entity();
-        eng.tie(child, "company", parent);
-        assert_eq!(eng.get(child, "company"), Some(parent));
+        eng.tie_ref(child, "company", parent);
+        assert_eq!(eng.get(child, "company"), Some(parent as u32));
         eng.rebuild();
-        let result = eng.pull_raw("company", parent);
+        let result = eng.pull_raw("company", parent as u32);
         assert_eq!(result, vec![child]);
         let _ = std::fs::remove_file(&dir);
     }
@@ -3018,7 +3018,7 @@ mod tests {
         let e = eng.entity();
         eng.tie(e, "x", 1);
         eng.tie_text(e, "y", "a");
-        eng.tie(e, "z", e);
+        eng.tie_ref(e, "z", e);
         let names = eng.himo_names();
         assert_eq!(names.len(), 3);
         assert!(names.contains(&"x".to_string()));
@@ -3153,7 +3153,7 @@ mod tests {
         }
 
         eng.rebuild();
-        let mut age_ents: Vec<u32> = Vec::new();
+        let mut age_ents: Vec<u64> = Vec::new();
         for age in 25..=30 {
             age_ents.extend(eng.pull_raw("age", age));
         }
@@ -3315,7 +3315,7 @@ mod tests {
         }
 
         eng.rebuild();
-        let group0: Vec<u32> = eng.query(&[("group", 0)]);
+        let group0: Vec<u64> = eng.query(&[("group", 0)]);
         assert_eq!(group0.len(), 200);
         for &eid in &group0 {
             eng.delete(eid);
@@ -3341,7 +3341,7 @@ mod tests {
         }
         assert_eq!(eng.query_count(&[("val", 42)]), 100);
 
-        let all: Vec<u32> = eng.entities();
+        let all: Vec<u64> = eng.entities();
         for eid in all {
             eng.delete(eid);
         }
@@ -3369,7 +3369,7 @@ mod tests {
                 eng.tie(e, "val", i % 10);
             }
             eng.rebuild();
-            let del_targets: Vec<u32> = eng.query(&[("val", 0)]);
+            let del_targets: Vec<u64> = eng.query(&[("val", 0)]);
             for &eid in &del_targets {
                 eng.delete(eid);
             }
@@ -3501,7 +3501,7 @@ mod tests {
         let mut eng = setup_scale(&dir);
         let before = eng.query_count(&[("age", 30)]);
 
-        let victims: Vec<u32> = eng.query(&[("age", 30)]).into_iter().take(100).collect();
+        let victims: Vec<u64> = eng.query(&[("age", 30)]).into_iter().take(100).collect();
         for eid in &victims {
             eng.delete(*eid);
         }
@@ -3523,7 +3523,7 @@ mod tests {
         let before_30 = eng.query_count(&[("age", 30)]);
         assert_eq!(eng.query_count(&[("age", 99)]), 0);
 
-        let targets: Vec<u32> = eng.query(&[("age", 30)]).into_iter().take(500).collect();
+        let targets: Vec<u64> = eng.query(&[("age", 30)]).into_iter().take(500).collect();
         for eid in &targets {
             eng.tie(*eid, "age", 99);
         }
@@ -3742,7 +3742,7 @@ mod tests {
             eng.tie(e, "dept", i % 5);
         }
         eng.rebuild();
-        let victims: Vec<u32> = eng.query(&[("age", 0)]);
+        let victims: Vec<u64> = eng.query(&[("age", 0)]);
         assert_eq!(victims.len(), 10);
         for &eid in &victims { eng.delete(eid); }
         for a in 1..10u32 {
@@ -3793,7 +3793,7 @@ mod tests {
         }
         assert_eq!(eng.query_count(&[("val", 42)]), 500);
 
-        let all: Vec<u32> = eng.entities();
+        let all: Vec<u64> = eng.entities();
         for eid in all { eng.delete(eid); }
         assert_eq!(eng.entity_count(), 0);
         assert_eq!(eng.query_count(&[("val", 42)]), 0);
@@ -3890,7 +3890,7 @@ mod tests {
         let dir = tmp("ps_scale_delins");
         let mut eng = setup_scale_prefix(&dir);
         let before = eng.query_count(&[("age", 30)]);
-        let victims: Vec<u32> = eng.query(&[("age", 30)]).into_iter().take(100).collect();
+        let victims: Vec<u64> = eng.query(&[("age", 30)]).into_iter().take(100).collect();
         for eid in &victims { eng.delete(*eid); }
         assert_eq!(eng.query_count(&[("age", 30)]), before - 100);
         for _ in 0..100 {
@@ -3907,7 +3907,7 @@ mod tests {
         let dir = tmp("ps_scale_upd");
         let mut eng = setup_scale_prefix(&dir);
         let before_30 = eng.query_count(&[("age", 30)]);
-        let targets: Vec<u32> = eng.query(&[("age", 30)]).into_iter().take(500).collect();
+        let targets: Vec<u64> = eng.query(&[("age", 30)]).into_iter().take(500).collect();
         for eid in &targets { eng.tie(*eid, "age", 49); }
         assert_eq!(eng.query_count(&[("age", 30)]), before_30 - 500);
         assert_eq!(eng.query_count(&[("age", 49)]),
@@ -3984,7 +3984,7 @@ mod tests {
         assert_eq!(eng.get(50, "age"), Some(50));
         assert_eq!(eng.get(50, "dept"), Some(50 % depts));
 
-        let victims: Vec<u32> = eng.query(&[("age", 99)]).into_iter().take(1000).collect();
+        let victims: Vec<u64> = eng.query(&[("age", 99)]).into_iter().take(1000).collect();
         for &eid in &victims { eng.delete(eid); }
         assert_eq!(eng.query_count(&[("age", 99)]), (n / ages) as usize - 1000);
         assert_eq!(eng.entity_count(), n - 1000);
@@ -4008,7 +4008,7 @@ mod tests {
         // Phase 2: 再open、既存entityに新しいhimoをtie
         let mut eng = Engine::open(&dir).unwrap();
         eng.rebuild();
-        for eid in 0..1000u32 {
+        for eid in 0..1000u64 {
             eng.tie_text(eid, "has_flag", "1");
         }
         eng.rebuild();
@@ -4239,7 +4239,7 @@ mod tests {
 
         // 全条件がマッチする観測窓(3紐)を使うケース
         let r = eng.query(&[("a", 1), ("b", 2), ("c", 0)]);
-        let expected: Vec<u32> = (0..50u32)
+        let expected: Vec<u64> = (0..50u64)
             .filter(|i| i % 4 == 1 && (i / 4) % 4 == 2 && (i / 16) % 4 == 0)
             .collect();
         assert_eq!(r.len(), expected.len());
@@ -4350,7 +4350,7 @@ mod tests {
         let dir = tmp("concurrent_basic");
         let mut eng = Engine::create(&dir).unwrap();
         eng.define_himo("age", HimoType::Value, 200);
-        let eids: Vec<u32> = (0..100).map(|_| eng.entity()).collect();
+        let eids: Vec<u64> = (0..100).map(|_| eng.entity()).collect();
 
         let arc = Engine::concurrentize(eng);
         for (i, &e) in eids.iter().enumerate() {
@@ -4378,7 +4378,7 @@ mod tests {
         let dir = tmp("concurrent_mrw");
         let mut eng = Engine::create(&dir).unwrap();
         eng.define_himo("k", HimoType::Value, 16);
-        let eids: Vec<u32> = (0..1_000).map(|_| eng.entity()).collect();
+        let eids: Vec<u64> = (0..1_000).map(|_| eng.entity()).collect();
         for (i, &e) in eids.iter().enumerate() {
             eng.tie(e, "k", (i as u32) % 16);
         }

@@ -366,13 +366,13 @@ mod tests {
         let kanto = eng.entity();
         eng.tie(kanto, "type", 2);
         eng.tie_text(kanto, "name", "Kanto");
-        eng.tie(kanto, "parent", japan);
+        eng.tie_ref(kanto, "parent", japan);
 
         // region: Kansai(eid=2), parent → Japan
         let kansai = eng.entity();
         eng.tie(kansai, "type", 2);
         eng.tie_text(kansai, "name", "Kansai");
-        eng.tie(kansai, "parent", japan);
+        eng.tie_ref(kansai, "parent", japan);
 
         // manager: Tanaka(eid=3)
         let tanaka = eng.entity();
@@ -383,8 +383,8 @@ mod tests {
         // dept(eid=4), manager → Tanaka, parent → Kanto
         let dept = eng.entity();
         eng.tie(dept, "type", 4);
-        eng.tie(dept, "manager", tanaka);
-        eng.tie(dept, "parent", kanto);
+        eng.tie_ref(dept, "manager", tanaka);
+        eng.tie_ref(dept, "parent", kanto);
 
         eng.rebuild();
         let eng = Arc::new(eng);
@@ -486,7 +486,7 @@ mod tests {
     fn filter_by_value() {
         let (_eng, ravn) = setup("filter");
         // entity 0..=4 のうち type=2 のもの
-        let all = vec![0u32, 1, 2, 3, 4];
+        let all = vec![0u64, 1, 2, 3, 4];
         let regions = ravn.filter_by(&all, "type", 2);
         assert_eq!(regions, vec![1, 2]);
     }
@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn filter_by_text_finds_named() {
         let (_eng, ravn) = setup("filter_text");
-        let all = vec![0u32, 1, 2, 3];
+        let all = vec![0u64, 1, 2, 3];
         let tanaka = ravn.filter_by_text(&all, "name", "Tanaka");
         assert_eq!(tanaka, vec![3]);
     }

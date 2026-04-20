@@ -28,8 +28,8 @@ fn tenant_isolation_query() {
 
     // 5 tenant × 200 user = 1000 entity
     let mut by_tenant: Vec<Vec<u64>> = vec![Vec::new(); 5];
-    for t in 0..5u64 {
-        for u in 0..200u64 {
+    for t in 0..5u32 {
+        for u in 0..200u32 {
             let e = db.entity();
             db.tie(e, "tenant", t);
             db.tie(e, "user_no", u);
@@ -38,7 +38,7 @@ fn tenant_isolation_query() {
     }
     db.rebuild();
 
-    for t in 0..5u64 {
+    for t in 0..5u32 {
         let result = db.query(&[("tenant", t)]);
         assert_eq!(result.len(), 200, "tenant {} should have 200 users", t);
         let result_set: HashSet<u64> = result.into_iter().collect();
@@ -79,6 +79,7 @@ fn tenant_with_view() {
     let r_set: HashSet<u64> = r.iter().copied().collect();
     let expected: HashSet<u64> = (0..n)
         .filter(|&i| i % 8 == 3 && (i / 8) % 4 == 2)
+        .map(|i| i as u64)
         .collect();
     assert_eq!(r_set, expected, "tenant=3 status=2 should match brute force");
     assert!(!r.is_empty());
@@ -115,15 +116,15 @@ fn region_hierarchy_navigation() {
 
     // 4段階上に辿る
     let p1 = db.get(shibuya, "parent").unwrap();
-    let p2 = db.get(p1, "parent").unwrap();
-    let p3 = db.get(p2, "parent").unwrap();
-    assert_eq!(p1, tokyo);
-    assert_eq!(p2, kanto);
-    assert_eq!(p3, japan);
+    let p2 = db.get(p1 as u64, "parent").unwrap();
+    let p3 = db.get(p2 as u64, "parent").unwrap();
+    assert_eq!(p1, tokyo as u32);
+    assert_eq!(p2, kanto as u32);
+    assert_eq!(p3, japan as u32);
 
-    assert_eq!(db.get_text(p3, "name").unwrap(), b"Japan");
-    assert_eq!(db.get_text(p2, "name").unwrap(), b"Kanto");
-    assert_eq!(db.get_text(p1, "name").unwrap(), b"Tokyo");
+    assert_eq!(db.get_text(p3 as u64, "name").unwrap(), b"Japan");
+    assert_eq!(db.get_text(p2 as u64, "name").unwrap(), b"Kanto");
+    assert_eq!(db.get_text(p1 as u64, "name").unwrap(), b"Tokyo");
 }
 
 // ─────────────────────────────────────────────────────────
@@ -156,24 +157,24 @@ fn reverse_lookup_children() {
 
     db.rebuild();
 
-    let r = db.pull_raw("parent", kanto);
+    let r = db.pull_raw("parent", kanto as u32);
     let r_set: HashSet<u64> = r.iter().copied().collect();
     let expected: HashSet<u64> = kanto_pref.iter().copied().collect();
     assert_eq!(r_set, expected, "kanto children mismatch");
 
-    let r = db.pull_raw("parent", kansai);
+    let r = db.pull_raw("parent", kansai as u32);
     assert_eq!(r.len(), 6);
 
     // 削除すると逆引きから消える
     db.untie(kanto_pref[0], "parent");
-    let r = db.pull_raw("parent", kanto);
+    let r = db.pull_raw("parent", kanto as u32);
     assert_eq!(r.len(), 6);
     assert!(!r.contains(&kanto_pref[0]));
 
     // 追加で増える
     let new_pref = db.entity();
     db.tie_ref(new_pref, "parent", kanto);
-    let r = db.pull_raw("parent", kanto);
+    let r = db.pull_raw("parent", kanto as u32);
     assert_eq!(r.len(), 7);
     assert!(r.contains(&new_pref));
 }
@@ -194,14 +195,14 @@ fn move_entity_between_parents() {
     db.tie_ref(user, "dept", dept_old);
     db.rebuild();
 
-    assert!(db.pull_raw("dept", dept_old).contains(&user));
-    assert!(!db.pull_raw("dept", dept_new).contains(&user));
+    assert!(db.pull_raw("dept", dept_old as u32).contains(&user));
+    assert!(!db.pull_raw("dept", dept_new as u32).contains(&user));
 
     // 移動
     db.tie_ref(user, "dept", dept_new);
 
-    let in_old = db.pull_raw("dept", dept_old);
-    let in_new = db.pull_raw("dept", dept_new);
+    let in_old = db.pull_raw("dept", dept_old as u32);
+    let in_new = db.pull_raw("dept", dept_new as u32);
     assert!(!in_old.contains(&user), "user should be removed from old dept");
     assert!(in_new.contains(&user), "user should appear in new dept");
 }
@@ -225,11 +226,11 @@ fn delete_parent_dangling_refs() {
     db.delete(parent);
 
     // Enchu は参照整合性を強制しない: 子の参照は残ったまま
-    assert_eq!(db.get(child_a, "parent"), Some(parent));
-    assert_eq!(db.get(child_b, "parent"), Some(parent));
+    assert_eq!(db.get(child_a, "parent"), Some(parent as u32));
+    assert_eq!(db.get(child_b, "parent"), Some(parent as u32));
 
     // 逆引きでも残る(削除された ID 値で引ける)
-    let r = db.pull_raw("parent", parent);
+    let r = db.pull_raw("parent", parent as u32);
     let r_set: HashSet<u64> = r.iter().copied().collect();
     assert!(r_set.contains(&child_a));
     assert!(r_set.contains(&child_b));
@@ -256,13 +257,13 @@ fn bulk_tie_consistency() {
     db.rebuild();
 
     // 各 a 値ちょうど n/100 件
-    for v in 0..100u64 {
+    for v in 0..100u32 {
         let r = db.query(&[("a", v)]);
         assert_eq!(r.len(), (n / 100) as usize, "a={} count", v);
     }
     // 全件合計
     let mut total = 0usize;
-    for v in 0..100u64 {
+    for v in 0..100u32 {
         total += db.query(&[("a", v)]).len();
     }
     assert_eq!(total, n as usize);
@@ -285,7 +286,7 @@ fn repeated_tie_untie() {
     db.define_himo("flag", HimoType::Value, 8);
 
     let e = db.entity();
-    for i in 0..1_000u64 {
+    for i in 0..1_000u32 {
         db.tie(e, "flag", i % 8);
         db.untie(e, "flag");
     }
@@ -302,7 +303,7 @@ fn repeated_tie_untie() {
     assert!(r.contains(&e));
 
     // 別の値に上書き
-    for v in 0..8u64 {
+    for v in 0..8u32 {
         db.tie(e, "flag", v);
         assert_eq!(db.get(e, "flag"), Some(v));
     }
@@ -310,7 +311,7 @@ fn repeated_tie_untie() {
     let r = db.pull_raw("flag", final_v);
     assert!(r.contains(&e));
     // それ以外の値からは消えてる
-    for v in 0..8u64 {
+    for v in 0..8u32 {
         if v == final_v { continue; }
         let r = db.pull_raw("flag", v);
         assert!(!r.contains(&e), "stale eid in flag={}", v);
@@ -329,7 +330,7 @@ fn delete_reuse_id() {
     db.define_himo("val", HimoType::Value, 100);
 
     let mut eids = Vec::new();
-    for i in 0..4u64 {
+    for i in 0..4u32 {
         let e = db.entity();
         eids.push(e);
         db.tie(e, "kind", i % 4);
@@ -378,11 +379,11 @@ fn cascade_delete_effect() {
     }).collect();
 
     db.rebuild();
-    assert_eq!(db.pull_raw("owner", owner).len(), 5);
+    assert_eq!(db.pull_raw("owner", owner as u32).len(), 5);
 
     // child を 1 件削除すると逆引きから消える
     db.delete(docs[0]);
-    let r = db.pull_raw("owner", owner);
+    let r = db.pull_raw("owner", owner as u32);
     assert!(!r.contains(&docs[0]), "deleted child must vanish from reverse lookup");
     assert_eq!(r.len(), 4);
 }
@@ -403,7 +404,7 @@ fn views_after_open() {
         db.define_himo("grade", HimoType::Value, 5);
         db.define_view(&["tenant", "status"]).unwrap();
 
-        for i in 0..1_000u64 {
+        for i in 0..1_000u32 {
             let e = db.entity();
             db.tie(e, "tenant", i % 8);
             db.tie(e, "status", (i / 8) % 4);
@@ -451,6 +452,7 @@ fn view_hit_vs_miss() {
     let r_hit = db.query(&[("tenant", 3), ("status", 2)]);
     let exp_hit: HashSet<u64> = (0..n)
         .filter(|&i| i % 8 == 3 && (i / 8) % 4 == 2)
+        .map(|i| i as u64)
         .collect();
     assert_eq!(r_hit.iter().copied().collect::<HashSet<u64>>(), exp_hit);
 
@@ -458,6 +460,7 @@ fn view_hit_vs_miss() {
     let r_miss = db.query(&[("tenant", 3), ("grade", 1)]);
     let exp_miss: HashSet<u64> = (0..n)
         .filter(|&i| i % 8 == 3 && (i / 32) % 5 == 1)
+        .map(|i| i as u64)
         .collect();
     assert_eq!(r_miss.iter().copied().collect::<HashSet<u64>>(), exp_miss);
 
@@ -465,6 +468,7 @@ fn view_hit_vs_miss() {
     let r_three = db.query(&[("tenant", 3), ("status", 2), ("grade", 1)]);
     let exp_three: HashSet<u64> = (0..n)
         .filter(|&i| i % 8 == 3 && (i / 8) % 4 == 2 && (i / 32) % 5 == 1)
+        .map(|i| i as u64)
         .collect();
     assert_eq!(r_three.iter().copied().collect::<HashSet<u64>>(), exp_three);
 }
@@ -481,7 +485,7 @@ fn mixed_workload() {
 
     // 1万 tie
     let mut all_eids: Vec<u64> = Vec::with_capacity(10_000);
-    for i in 0..10_000u64 {
+    for i in 0..10_000u32 {
         let e = db.entity();
         db.tie(e, "group", i % 10);
         db.tie(e, "score", i % 100);
@@ -520,7 +524,7 @@ fn mixed_workload() {
 
     // group 紐: 削除されてないものだけ残る
     let mut group_total = 0usize;
-    for g in 0..10u64 {
+    for g in 0..10u32 {
         group_total += db.query(&[("group", g)]).len();
     }
     assert_eq!(group_total, alive_count as usize);
@@ -529,7 +533,7 @@ fn mixed_workload() {
     let removed_score: HashSet<u64> = untied.union(&deleted).copied().collect();
     let alive_with_score = 10_000 - removed_score.len();
     let mut score_total = 0usize;
-    for v in 0..100u64 {
+    for v in 0..100u32 {
         score_total += db.pull_raw("score", v).len();
     }
     assert_eq!(score_total, alive_with_score);
@@ -562,7 +566,7 @@ fn many_himos() {
     // 各紐の 1 値クエリは n/8 件前後(8で割れない端数あり)
     for name in &names {
         let mut total = 0usize;
-        for v in 0..8u64 {
+        for v in 0..8u32 {
             total += db.pull_raw(name, v).len();
         }
         assert_eq!(total, n as usize, "himo {} total", name);
@@ -571,7 +575,7 @@ fn many_himos() {
     // 任意 3 紐の AND が動く
     let r = db.query(&[("h00", 0), ("h01", 1), ("h02", 2)]);
     // 全て (i + k) % 8 = 0/1/2 → i % 8 = 0 を満たす entity
-    let exp: HashSet<u64> = (0..n).filter(|&i| i % 8 == 0).collect();
+    let exp: HashSet<u64> = (0..n).filter(|&i| i % 8 == 0).map(|i| i as u64).collect();
     assert_eq!(r.iter().copied().collect::<HashSet<u64>>(), exp);
 }
 
@@ -608,7 +612,7 @@ fn text_and_value_mixed() {
 
     // 値紐は普通に動く
     let r = db.pull_raw("age", 7);
-    let exp: HashSet<u64> = (0..n).filter(|&i| i % 100 == 7).collect();
+    let exp: HashSet<u64> = (0..n).filter(|&i| i % 100 == 7).map(|i| i as u64).collect();
     assert_eq!(r.iter().copied().collect::<HashSet<u64>>(), exp);
 
     // get_text と get
@@ -637,13 +641,13 @@ fn query_pair_empty_cell_fallback() {
     db.rebuild_pairs();
 
     // データ投入（pair table 構築後）
-    for i in 0..100u64 {
+    for i in 0..100u32 {
         let e = db.entity();
         db.tie(e, "type_h", 1);
         db.tie(e, "board", 0);
         db.tie(e, "author", i);
     }
-    for i in 0..500u64 {
+    for i in 0..500u32 {
         let e = db.entity();
         db.tie(e, "type_h", 2);
         db.tie(e, "board", 0);

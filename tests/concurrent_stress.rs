@@ -50,7 +50,7 @@ fn parallel_readers_during_writes() {
         let counter = reader_iters.clone();
         handles.push(thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                for v in 0..32u64 {
+                for v in 0..32u32 {
                     let pulled = arc.pull_raw("k", v);
                     // 結果は常に有効な entity リスト
                     for &eid in &pulled {
@@ -119,7 +119,7 @@ fn read_after_flush_sees_writes() {
 
     // 各値ごとに 100 件あるはず(10000 / 100)
     let mut total = 0usize;
-    for v in 0..100u64 {
+    for v in 0..100u32 {
         let pulled = arc.pull_raw("v", v);
         assert_eq!(pulled.len(), 100, "value {} expected 100, got {}", v, pulled.len());
         total += pulled.len();
@@ -158,7 +158,7 @@ fn unbounded_queue_handles_burst() {
     assert!(elapsed < Duration::from_secs(5), "burst too slow: {:?}", elapsed);
 
     let mut total = 0usize;
-    for v in 0..50u64 {
+    for v in 0..50u32 {
         total += arc.pull_raw("k", v).len();
     }
     assert_eq!(total, 10_000);
@@ -214,7 +214,7 @@ fn drop_while_reading() {
         thread::spawn(move || {
             // 自前で持ってる Arc が main 側 drop 後も Engine を生かす。
             while !stop.load(Ordering::Relaxed) {
-                for v in 0..16u64 {
+                for v in 0..16u32 {
                     let _ = arc.pull_raw("k", v);
                 }
             }
@@ -260,7 +260,7 @@ fn drop_with_pending_writes() {
     // 念のため少し待ってから flush して確認。
     arc_for_check.flush_writes();
     let mut total = 0usize;
-    for v in 0..50u64 {
+    for v in 0..50u32 {
         total += arc_for_check.pull_raw("k", v).len();
     }
     assert_eq!(total, 3_000, "drop should not lose pending writes");
@@ -304,7 +304,7 @@ fn multiple_async_writers() {
     arc.flush_writes();
 
     let mut total = 0usize;
-    for v in 0..8u64 {
+    for v in 0..8u32 {
         total += arc.pull_raw("g", v).len();
     }
     assert_eq!(total, (n_writers as u32 * per_writer) as usize);
@@ -341,7 +341,7 @@ fn reader_sees_consistent_snapshot() {
         let oor = oor.clone();
         handles.push(thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                for v in 0..16u64 {
+                for v in 0..16u32 {
                     let pulled = arc.pull_raw("c", v);
                     // 範囲チェック(致命: 一度でもあったら困る)
                     for &e in &pulled {
@@ -439,8 +439,8 @@ fn long_running_query_during_writes() {
         let arc = arc.clone();
         handles.push(thread::spawn(move || {
             for _ in 0..100 {
-                for av in 0..5u64 {
-                    for bv in 0..5u64 {
+                for av in 0..5u32 {
+                    for bv in 0..5u32 {
                         let r = arc.query(&[("a", av), ("b", bv)]);
                         // 範囲内チェック
                         for &e in &r {
@@ -511,7 +511,7 @@ fn panic_in_reader_doesnt_corrupt() {
         let arc = arc.clone();
         thread::spawn(move || {
             let mut total = 0usize;
-            for v in 0..16u64 {
+            for v in 0..16u32 {
                 total += arc.pull_raw("k", v).len();
             }
             total

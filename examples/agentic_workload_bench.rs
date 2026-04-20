@@ -36,9 +36,9 @@ fn main() {
     eng.define_himo("decision", HimoType::Symbol, 0);
     eng.flush().unwrap();
 
-    let speaker_eids: Vec<u32> = (0..N_SPEAKERS).map(|_| eng.entity()).collect();
-    let topic_eids: Vec<u32> = (0..N_TOPICS).map(|_| eng.entity()).collect();
-    let file_eids: Vec<u32> = (0..N_FILES).map(|_| eng.entity()).collect();
+    let speaker_eids: Vec<u64> = (0..N_SPEAKERS).map(|_| eng.entity()).collect();
+    let topic_eids: Vec<u64> = (0..N_TOPICS).map(|_| eng.entity()).collect();
+    let file_eids: Vec<u64> = (0..N_FILES).map(|_| eng.entity()).collect();
 
     println!("── INSERT ──");
     let t0 = Instant::now();

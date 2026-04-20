@@ -74,21 +74,21 @@ fn apply_ops(
     for op in ops {
         match *op {
             Op::Tie(e, h, v) => {
-                if !deleted.contains(&e) {
-                    db.tie(e, himo_name(h), v);
+                if !deleted.contains(&(e as u64)) {
+                    db.tie(e as u64, himo_name(h), v);
                     shadow.insert((e, h), v);
                 }
             }
             Op::Untie(e, h) => {
-                if !deleted.contains(&e) {
-                    db.untie(e, himo_name(h));
+                if !deleted.contains(&(e as u64)) {
+                    db.untie(e as u64, himo_name(h));
                     shadow.remove(&(e, h));
                 }
             }
             Op::Delete(e) => {
-                if !deleted.contains(&e) {
-                    db.delete(e);
-                    deleted.insert(e);
+                if !deleted.contains(&(e as u64)) {
+                    db.delete(e as u64);
+                    deleted.insert(e as u64);
                     // 全 himo から消える
                     for h in 0..3 {
                         shadow.remove(&(e, h));
@@ -116,14 +116,14 @@ proptest! {
 
         // shadow にある値はすべて db から read できる
         for (&(e, h), &v) in &shadow {
-            prop_assert_eq!(db.get(e, himo_name(h)), Some(v),
+            prop_assert_eq!(db.get(e as u64, himo_name(h)), Some(v),
                 "expected get(eid={}, himo={}) = Some({})", e, himo_name(h), v);
         }
 
         // deleted な eid は全 himo で None
         for &e in &deleted {
             for h in 0..3 {
-                prop_assert_eq!(db.get(e, himo_name(h)), None,
+                prop_assert_eq!(db.get(e as u64, himo_name(h)), None,
                     "expected get(deleted eid={}, himo={}) = None", e, himo_name(h));
             }
         }
@@ -140,10 +140,10 @@ proptest! {
 
         // 各 (himo, value) について pull_raw 結果 == shadow から抽出した eid 集合
         for h in 0..3 {
-            for v in 0..10u64 {
+            for v in 0..10u32 {
                 let expected: HashSet<u64> = shadow.iter()
                     .filter(|&(&(_, hh), &vv)| hh == h && vv == v)
-                    .map(|(&(e, _), _)| e)
+                    .map(|(&(e, _), _)| e as u64)
                     .collect();
 
                 let actual: HashSet<u64> = db.pull_raw(himo_name(h), v).into_iter().collect();
@@ -168,7 +168,7 @@ proptest! {
         // tie だけ適用
         let mut shadow: Shadow = HashMap::new();
         for &(e, h, v) in &ties {
-            db.tie(e, himo_name(h), v);
+            db.tie(e as u64, himo_name(h), v);
             shadow.insert((e, h), v);
         }
 
@@ -176,7 +176,7 @@ proptest! {
         let mut untied: HashSet<(u32, usize)> = HashSet::new();
         for &idx in &untie_indices {
             if let Some(&(e, h, _)) = ties.get(idx % ties.len().max(1)) {
-                db.untie(e, himo_name(h));
+                db.untie(e as u64, himo_name(h));
                 untied.insert((e, h));
                 shadow.remove(&(e, h));
             }
@@ -188,9 +188,9 @@ proptest! {
             if shadow.contains_key(&(e, h)) {
                 continue;
             }
-            for v in 0..5u64 {
+            for v in 0..5u32 {
                 let result: Vec<u64> = db.pull_raw(himo_name(h), v);
-                prop_assert!(!result.contains(&e),
+                prop_assert!(!result.contains(&(e as u64)),
                     "untied eid={} appeared in pull_raw({}, {})", e, himo_name(h), v);
             }
         }
@@ -208,23 +208,23 @@ proptest! {
         let mut db = make_db(&path);
 
         for &(e, h, v) in &ties {
-            db.tie(e, himo_name(h), v);
+            db.tie(e as u64, himo_name(h), v);
         }
 
         let mut deleted: HashSet<u64> = HashSet::new();
         for &e in &delete_eids {
-            if !deleted.contains(&e) {
-                db.delete(e);
-                deleted.insert(e);
+            if !deleted.contains(&(e as u64)) {
+                db.delete(e as u64);
+                deleted.insert(e as u64);
             }
         }
 
         // 削除した eid はどの (himo, value) でも pull_raw に現れない
         for &e in &deleted {
             for h in 0..3 {
-                for v in 0..5u64 {
+                for v in 0..5u32 {
                     let result: Vec<u64> = db.pull_raw(himo_name(h), v);
-                    prop_assert!(!result.contains(&e),
+                    prop_assert!(!result.contains(&(e as u64)),
                         "deleted eid={} appeared in pull_raw({}, {})",
                         e, himo_name(h), v);
                 }

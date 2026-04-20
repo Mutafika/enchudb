@@ -91,7 +91,7 @@ fn process_normal_exit_persists_all_writes() {
     assert!(eng.entity_count() >= 500);
     for i in 0..500u64 {
         let v = eng.get(i, "n");
-        assert_eq!(v, Some(i), "entity {} should have value {}", i, i);
+        assert_eq!(v, Some(i as u32), "entity {} should have value {}", i, i);
     }
     cleanup(&path);
 }
@@ -138,14 +138,14 @@ fn process_abort_mid_write_preserves_first_half() {
     let eng = Engine::open_concurrent_with_wal(&path, 64 * 1024 * 1024).unwrap();
     // 前半 50 件は確実に残る
     for i in 0..50u64 {
-        assert_eq!(eng.get(i, "n"), Some(i), "first half entity {} lost", i);
+        assert_eq!(eng.get(i, "n"), Some(i as u32), "first half entity {} lost", i);
     }
     // 後半は残っても残らなくても OK(どちらも有効な挙動)。
     // ただし「書いた値が化けてる」は絶対 NG。
     for i in 50..100u64 {
         match eng.get(i, "n") {
             None => {}           // 消えた → OK
-            Some(v) if v == i => {} // そのまま → OK
+            Some(v) if v as u64 == i => {} // そのまま → OK
             Some(v) => panic!("entity {} corrupted: got {}", i, v),
         }
     }
@@ -236,7 +236,7 @@ fn byte_flip_wal_tail_truncated_silently() {
     // 正常書き込み + sync
     {
         let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
-        for i in 0..50u64 {
+        for i in 0..50u32 {
             let e = eng.entity();
             eng.tie_async(e, "n", i);
         }
@@ -287,7 +287,7 @@ fn truncate_wal_to_header_loses_uncommitted() {
 
     {
         let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
-        for i in 0..30u64 {
+        for i in 0..30u32 {
             let e = eng.entity();
             eng.tie_async(e, "n", i);
         }
@@ -322,7 +322,7 @@ fn concurrent_writers_with_sync_no_data_loss() {
     for t in 0..4 {
         let e = Arc::clone(&eng);
         handles.push(std::thread::spawn(move || {
-            for i in 0..500u64 {
+            for i in 0..500u32 {
                 let ent = e.entity();
                 e.tie_async(ent, "n", (t * 1000 + i) as u32);
             }
@@ -367,10 +367,10 @@ fn fuzz_random_byte_flip_no_silent_corruption() {
         prepare_db(&path);
 
         // 正常に 20 件書く + 期待値を記録
-        let mut expected: Vec<(u32, u32)> = Vec::new();
+        let mut expected: Vec<(u64, u32)> = Vec::new();
         {
             let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
-            for i in 0..20u64 {
+            for i in 0..20u32 {
                 let e = eng.entity();
                 eng.tie_async(e, "n", i);
                 expected.push((e, i));

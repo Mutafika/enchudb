@@ -26,7 +26,7 @@ fn main() {
     };
 
     // 全 entity 事前生成(entity() のコストを除外)
-    let eids: Vec<u32> = (0..N).map(|_| eng.entity()).collect();
+    let eids: Vec<u64> = (0..N).map(|_| eng.entity()).collect();
 
     let t0 = Instant::now();
     for i in 0..N {
@@ -52,7 +52,7 @@ fn main() {
     }
 
     let eng = Engine::open_concurrent_with_wal(&path_wal, 256 * 1024 * 1024).unwrap();
-    let eids: Vec<u32> = (0..N).map(|_| eng.entity()).collect();
+    let eids: Vec<u64> = (0..N).map(|_| eng.entity()).collect();
 
     let t0 = Instant::now();
     for i in 0..N {

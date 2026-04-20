@@ -37,14 +37,14 @@ fn ec_path_navigation() {
     // order(2)
     let order = eng.entity();
     eng.tie(order, "type", 3);
-    eng.tie(order, "user_ref", user);
+    eng.tie_ref(order, "user_ref", user);
     eng.tie(order, "status", 1);
 
     // order_item(3)
     let item = eng.entity();
     eng.tie(item, "type", 4);
-    eng.tie(item, "order_ref", order);
-    eng.tie(item, "product_ref", product);
+    eng.tie_ref(item, "order_ref", order);
+    eng.tie_ref(item, "product_ref", product);
     eng.tie(item, "qty", 3);
 
     eng.rebuild();
@@ -92,18 +92,18 @@ fn sns_timeline() {
     // posts by Bob
     let post1 = eng.entity(); // 3
     eng.tie(post1, "type", 2);
-    eng.tie(post1, "author", bob);
+    eng.tie_ref(post1, "author", bob);
     eng.tie(post1, "content_id", 10);
 
     let post2 = eng.entity(); // 4
     eng.tie(post2, "type", 2);
-    eng.tie(post2, "author", bob);
+    eng.tie_ref(post2, "author", bob);
     eng.tie(post2, "content_id", 20);
 
     // posts by Carol
     let post3 = eng.entity(); // 5
     eng.tie(post3, "type", 2);
-    eng.tie(post3, "author", carol);
+    eng.tie_ref(post3, "author", carol);
     eng.tie(post3, "content_id", 30);
 
     eng.rebuild();
@@ -114,7 +114,7 @@ fn sns_timeline() {
     // Instead: find posts by author, then follow content
     // post1(3) → author → Bob(1)
     let author = ravn.path(post1, &["author"]);
-    assert_eq!(author, Some(bob));
+    assert_eq!(author, Some(bob as u32));
 
     // follow from multiple posts to author
     let authors = ravn.follow(&[post1, post2, post3], &["author"]);
@@ -157,7 +157,7 @@ fn select_with_text() {
     // select type=1, get age
     let rows = ravn.select(&[("type", 1)], &["age"]);
     assert_eq!(rows.len(), 2);
-    let ages: Vec<u64> = rows.iter().filter_map(|(_, v)| v[0]).collect();
+    let ages: Vec<u32> = rows.iter().filter_map(|(_, v)| v[0]).collect();
     assert!(ages.contains(&30));
     assert!(ages.contains(&25));
 
@@ -190,13 +190,13 @@ fn exec_follow_pipe() {
     let emp1 = eng.entity();
     eng.tie(emp1, "type", 2);
     eng.tie(emp1, "status", 0);
-    eng.tie(emp1, "dept_ref", dept);
+    eng.tie_ref(emp1, "dept_ref", dept);
 
     // employee(2)
     let emp2 = eng.entity();
     eng.tie(emp2, "type", 2);
     eng.tie(emp2, "status", 0);
-    eng.tie(emp2, "dept_ref", dept);
+    eng.tie_ref(emp2, "dept_ref", dept);
 
     eng.rebuild();
     let ravn = Ravn::new(Arc::new(eng));
@@ -234,12 +234,12 @@ fn exec_count() {
     eng.define_himo("type", HimoType::Value, 10);
     eng.define_himo("category", HimoType::Value, 10);
 
-    for i in 0..20u64 {
+    for i in 0..20u32 {
         let e = eng.entity();
         eng.tie(e, "type", 1);
         eng.tie(e, "category", i % 5);
     }
-    for i in 0..10u64 {
+    for i in 0..10u32 {
         let e = eng.entity();
         eng.tie(e, "type", 2);
         eng.tie(e, "category", i % 5);
@@ -281,25 +281,25 @@ fn chained_pipes() {
     // user(1)
     let user1 = eng.entity();
     eng.tie(user1, "type", 2);
-    eng.tie(user1, "region_ref", region);
+    eng.tie_ref(user1, "region_ref", region);
 
     // user(2)
     let user2 = eng.entity();
     eng.tie(user2, "type", 2);
-    eng.tie(user2, "region_ref", region);
+    eng.tie_ref(user2, "region_ref", region);
 
     // posts by user1
     let post1 = eng.entity(); // 3
     eng.tie(post1, "type", 5);
-    eng.tie(post1, "user_ref", user1);
+    eng.tie_ref(post1, "user_ref", user1);
 
     let post2 = eng.entity(); // 4
     eng.tie(post2, "type", 5);
-    eng.tie(post2, "user_ref", user2);
+    eng.tie_ref(post2, "user_ref", user2);
 
     let post3 = eng.entity(); // 5
     eng.tie(post3, "type", 5);
-    eng.tie(post3, "user_ref", user1);
+    eng.tie_ref(post3, "user_ref", user1);
 
     eng.rebuild();
     let ravn = Ravn::new(Arc::new(eng));
@@ -336,7 +336,7 @@ fn exec_get() {
     match ravn.exec("type:1 | get score") {
         RavnResult::Values(rows) => {
             assert_eq!(rows.len(), 2);
-            let scores: Vec<u64> = rows.iter().filter_map(|(_, v)| v[0]).collect();
+            let scores: Vec<u32> = rows.iter().filter_map(|(_, v)| v[0]).collect();
             assert!(scores.contains(&42));
             assert!(scores.contains(&77));
         }

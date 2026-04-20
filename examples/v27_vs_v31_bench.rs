@@ -43,7 +43,7 @@ fn main() {
         let e = Engine::open(&path_v27).unwrap();
         Engine::concurrentize(e)
     };
-    let eids: Vec<u32> = (0..N).map(|_| eng.entity()).collect();
+    let eids: Vec<u64> = (0..N).map(|_| eng.entity()).collect();
 
     let t0 = Instant::now();
     for i in 0..N {
@@ -61,7 +61,7 @@ fn main() {
 
     // v31: WAL enabled
     let eng_v31 = Engine::open_concurrent_with_wal(&path_v31, 512 * 1024 * 1024).unwrap();
-    let eids2: Vec<u32> = (0..N).map(|_| eng_v31.entity()).collect();
+    let eids2: Vec<u64> = (0..N).map(|_| eng_v31.entity()).collect();
 
     let t0 = Instant::now();
     for i in 0..N {

@@ -142,7 +142,7 @@ fn recall_decisions_by_person_and_topic() {
 
     // Alice でフィルタ
     let alice_id = eng.query(&[("name", eng.vocab_id("Alice").unwrap()), ("kind", 1)])[0];
-    let alice_sessions = ravn.filter_by(&sessions, "speaker", alice_id);
+    let alice_sessions = ravn.filter_by(&sessions, "speaker", alice_id as u32);
     assert_eq!(alice_sessions.len(), 2, "Alice has 2 Next.js sessions");
 
     // decision を抽出

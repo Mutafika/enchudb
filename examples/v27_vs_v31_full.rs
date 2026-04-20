@@ -40,7 +40,7 @@ fn main() {
     let eng_v31 = Engine::open_concurrent_with_wal(&path_v31, 512 * 1024 * 1024).unwrap();
 
     fn seed(eng: &Arc<Engine>, n: u32, num_classes: u32, num_tenants: u32) {
-        let eids: Vec<u32> = (0..n).map(|_| eng.entity()).collect();
+        let eids: Vec<u64> = (0..n).map(|_| eng.entity()).collect();
         for i in 0..n {
             eng.tie_async(eids[i as usize], "cls", i % num_classes);
             eng.tie_async(eids[i as usize], "tenant", i % num_tenants);

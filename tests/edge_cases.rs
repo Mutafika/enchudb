@@ -357,8 +357,8 @@ fn ref_self_reference() {
     let mut eng = Engine::create(&path).unwrap();
     let e = eng.entity();
     eng.tie_ref(e, "self", e);
-    assert_eq!(eng.get(e, "self"), Some(e));
-    assert!(eng.pull_raw("self", e).contains(&e));
+    assert_eq!(eng.get(e, "self"), Some(e as u32));
+    assert!(eng.pull_raw("self", e as u32).contains(&e));
     cleanup(&path);
 }
 

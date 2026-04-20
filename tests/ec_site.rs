@@ -50,11 +50,11 @@ const TYPE_ORDER_ITEM: u32 = 4;
 const TYPE_REVIEW: u32 = 5;
 
 struct EcData {
-    products: Vec<u32>,
-    users: Vec<u32>,
-    orders: Vec<u32>,
-    order_items: Vec<u32>,
-    reviews: Vec<u32>,
+    products: Vec<u64>,
+    users: Vec<u64>,
+    orders: Vec<u64>,
+    order_items: Vec<u64>,
+    reviews: Vec<u64>,
 }
 
 fn define_schema(db: &mut Engine) {
@@ -113,7 +113,7 @@ fn populate(db: &mut Engine) -> EcData {
     for _ in 0..N_ORDERS {
         let e = db.entity();
         db.tie(e, "type", TYPE_ORDER);
-        db.tie(e, "user_ref", users[rng.next_range(N_USERS) as usize]);
+        db.tie_ref(e, "user_ref", users[rng.next_range(N_USERS) as usize]);
         db.tie(e, "year", rng.next_range(5));       // 0=2022, 1=2023, ..., 4=2026
         db.tie(e, "month", rng.next_range(12) + 1); // 1..12
         db.tie(e, "order_status", rng.next_range(5));
@@ -125,8 +125,8 @@ fn populate(db: &mut Engine) -> EcData {
     for _ in 0..N_ORDER_ITEMS {
         let e = db.entity();
         db.tie(e, "type", TYPE_ORDER_ITEM);
-        db.tie(e, "order_ref", orders[rng.next_range(N_ORDERS) as usize]);
-        db.tie(e, "product_ref", products[rng.next_range(N_PRODUCTS) as usize]);
+        db.tie_ref(e, "order_ref", orders[rng.next_range(N_ORDERS) as usize]);
+        db.tie_ref(e, "product_ref", products[rng.next_range(N_PRODUCTS) as usize]);
         db.tie(e, "quantity", rng.next_range(10) + 1); // 1..10
         order_items.push(e);
     }
@@ -136,8 +136,8 @@ fn populate(db: &mut Engine) -> EcData {
     for _ in 0..N_REVIEWS {
         let e = db.entity();
         db.tie(e, "type", TYPE_REVIEW);
-        db.tie(e, "product_ref", products[rng.next_range(N_PRODUCTS) as usize]);
-        db.tie(e, "user_ref", users[rng.next_range(N_USERS) as usize]);
+        db.tie_ref(e, "product_ref", products[rng.next_range(N_PRODUCTS) as usize]);
+        db.tie_ref(e, "user_ref", users[rng.next_range(N_USERS) as usize]);
         db.tie(e, "rating", rng.next_range(6)); // 0..5
         reviews.push(e);
     }
@@ -190,7 +190,7 @@ fn category_search() {
     let mut expected = 0u32;
     for eid in 0..db.next_eid() {
         if db.get(eid, "type") == Some(TYPE_PRODUCT)
-            && db.get(eid, "category") == Some(target_cat)
+            && db.get(eid, "category") == Some(target_cat as u32)
         {
             expected += 1;
         }
@@ -218,8 +218,8 @@ fn category_price_search() {
     let mut expected = 0u32;
     for eid in 0..db.next_eid() {
         if db.get(eid, "type") == Some(TYPE_PRODUCT)
-            && db.get(eid, "category") == Some(target_cat)
-            && db.get(eid, "price_band") == Some(target_pb)
+            && db.get(eid, "category") == Some(target_cat as u32)
+            && db.get(eid, "price_band") == Some(target_pb as u32)
         {
             expected += 1;
         }
@@ -246,8 +246,8 @@ fn color_filter() {
     let mut expected = 0u32;
     for eid in 0..db.next_eid() {
         if db.get(eid, "type") == Some(TYPE_PRODUCT)
-            && db.get(eid, "category") == Some(target_cat)
-            && db.get(eid, "color") == Some(target_color)
+            && db.get(eid, "category") == Some(target_cat as u32)
+            && db.get(eid, "color") == Some(target_color as u32)
         {
             expected += 1;
         }
@@ -267,13 +267,13 @@ fn user_orders() {
 
     let target_user = data.users[42]; // 43番目のユーザー
     let t = std::time::Instant::now();
-    let result = db.query(&[("type", TYPE_ORDER), ("user_ref", target_user)]);
+    let result = db.query(&[("type", TYPE_ORDER), ("user_ref", target_user as u32)]);
     let elapsed = t.elapsed();
 
     // 全注文を走査して user_ref が target_user を指すものを数える
     let mut expected = 0u32;
     for &oid in &data.orders {
-        if db.get(oid, "user_ref") == Some(target_user) {
+        if db.get(oid, "user_ref") == Some(target_user as u32) {
             expected += 1;
         }
     }
@@ -292,12 +292,12 @@ fn order_items() {
 
     let target_order = data.orders[100];
     let t = std::time::Instant::now();
-    let result = db.query(&[("type", TYPE_ORDER_ITEM), ("order_ref", target_order)]);
+    let result = db.query(&[("type", TYPE_ORDER_ITEM), ("order_ref", target_order as u32)]);
     let elapsed = t.elapsed();
 
     let mut expected = 0u32;
     for &item in &data.order_items {
-        if db.get(item, "order_ref") == Some(target_order) {
+        if db.get(item, "order_ref") == Some(target_order as u32) {
             expected += 1;
         }
     }
@@ -319,12 +319,12 @@ fn user_order_products() {
     let t = std::time::Instant::now();
 
     // Step 1: ユーザー X の全注文
-    let user_orders = db.query(&[("type", TYPE_ORDER), ("user_ref", target_user)]);
+    let user_orders = db.query(&[("type", TYPE_ORDER), ("user_ref", target_user as u32)]);
 
     // Step 2: 各注文の全明細
-    let mut item_eids: Vec<u32> = Vec::new();
+    let mut item_eids: Vec<u64> = Vec::new();
     for &order_eid in &user_orders {
-        let items = db.query(&[("type", TYPE_ORDER_ITEM), ("order_ref", order_eid)]);
+        let items = db.query(&[("type", TYPE_ORDER_ITEM), ("order_ref", order_eid as u32)]);
         item_eids.extend_from_slice(&items);
     }
 
@@ -341,9 +341,9 @@ fn user_order_products() {
     // 期待値を直接算出
     let mut expected_products = std::collections::HashSet::new();
     for &oid in &data.orders {
-        if db.get(oid, "user_ref") == Some(target_user) {
+        if db.get(oid, "user_ref") == Some(target_user as u32) {
             for &item in &data.order_items {
-                if db.get(item, "order_ref") == Some(oid) {
+                if db.get(item, "order_ref") == Some(oid as u32) {
                     if let Some(pid) = db.get(item, "product_ref") {
                         expected_products.insert(pid);
                     }
@@ -367,12 +367,12 @@ fn product_reviews() {
 
     let target_product = data.products[50];
     let t = std::time::Instant::now();
-    let result = db.query(&[("type", TYPE_REVIEW), ("product_ref", target_product)]);
+    let result = db.query(&[("type", TYPE_REVIEW), ("product_ref", target_product as u32)]);
     let elapsed = t.elapsed();
 
     let mut expected = 0u32;
     for &rev in &data.reviews {
-        if db.get(rev, "product_ref") == Some(target_product) {
+        if db.get(rev, "product_ref") == Some(target_product as u32) {
             expected += 1;
         }
     }
@@ -469,8 +469,8 @@ fn monthly_orders() {
     let mut expected = 0u32;
     for eid in 0..db.next_eid() {
         if db.get(eid, "type") == Some(TYPE_ORDER)
-            && db.get(eid, "year") == Some(target_year)
-            && db.get(eid, "month") == Some(target_month)
+            && db.get(eid, "year") == Some(target_year as u32)
+            && db.get(eid, "month") == Some(target_month as u32)
         {
             expected += 1;
         }
@@ -624,7 +624,7 @@ fn concurrent_order_creation() {
                 let e = arc.entity();
                 arc.tie_to(e, "type", TYPE_ORDER);
                 let user = users[rng.next_range(users.len() as u32) as usize];
-                arc.tie_to(e, "user_ref", user);
+                arc.tie_ref_to(e, "user_ref", user);
                 arc.tie_to(e, "year", rng.next_range(5));
                 arc.tie_to(e, "month", rng.next_range(12) + 1);
                 arc.tie_to(e, "order_status", rng.next_range(5));
@@ -649,7 +649,7 @@ fn concurrent_order_creation() {
     assert_eq!(total_orders.len(), expected, "concurrent order count mismatch");
 
     // 全 order が実在するか
-    let order_set: std::collections::HashSet<u32> = total_orders.into_iter().collect();
+    let order_set: std::collections::HashSet<u64> = total_orders.into_iter().collect();
     for &oid in &all_orders {
         assert!(order_set.contains(&oid), "order {} not found in query results", oid);
     }
@@ -663,21 +663,21 @@ fn concurrent_order_creation() {
 fn referential_check() {
     let (path, db, data) = setup("ref_check");
 
-    let product_set: std::collections::HashSet<u32> = data.products.iter().copied().collect();
-    let user_set: std::collections::HashSet<u32> = data.users.iter().copied().collect();
-    let order_set: std::collections::HashSet<u32> = data.orders.iter().copied().collect();
+    let product_set: std::collections::HashSet<u64> = data.products.iter().copied().collect();
+    let user_set: std::collections::HashSet<u64> = data.users.iter().copied().collect();
+    let order_set: std::collections::HashSet<u64> = data.orders.iter().copied().collect();
 
     // 全 OrderItem の product_ref / order_ref が実在するか
     let mut bad_product_refs = 0u32;
     let mut bad_order_refs = 0u32;
     for &item in &data.order_items {
         if let Some(pid) = db.get(item, "product_ref") {
-            if !product_set.contains(&pid) { bad_product_refs += 1; }
+            if !product_set.contains(&(pid as u64)) { bad_product_refs += 1; }
         } else {
             bad_product_refs += 1;
         }
         if let Some(oid) = db.get(item, "order_ref") {
-            if !order_set.contains(&oid) { bad_order_refs += 1; }
+            if !order_set.contains(&(oid as u64)) { bad_order_refs += 1; }
         } else {
             bad_order_refs += 1;
         }
@@ -688,12 +688,12 @@ fn referential_check() {
     let mut bad_review_urefs = 0u32;
     for &rev in &data.reviews {
         if let Some(pid) = db.get(rev, "product_ref") {
-            if !product_set.contains(&pid) { bad_review_prefs += 1; }
+            if !product_set.contains(&(pid as u64)) { bad_review_prefs += 1; }
         } else {
             bad_review_prefs += 1;
         }
         if let Some(uid) = db.get(rev, "user_ref") {
-            if !user_set.contains(&uid) { bad_review_urefs += 1; }
+            if !user_set.contains(&(uid as u64)) { bad_review_urefs += 1; }
         } else {
             bad_review_urefs += 1;
         }
@@ -703,7 +703,7 @@ fn referential_check() {
     let mut bad_order_urefs = 0u32;
     for &oid in &data.orders {
         if let Some(uid) = db.get(oid, "user_ref") {
-            if !user_set.contains(&uid) { bad_order_urefs += 1; }
+            if !user_set.contains(&(uid as u64)) { bad_order_urefs += 1; }
         } else {
             bad_order_urefs += 1;
         }
