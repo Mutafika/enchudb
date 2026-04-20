@@ -157,7 +157,7 @@ fn select_with_text() {
     // select type=1, get age
     let rows = ravn.select(&[("type", 1)], &["age"]);
     assert_eq!(rows.len(), 2);
-    let ages: Vec<u32> = rows.iter().filter_map(|(_, v)| v[0]).collect();
+    let ages: Vec<u64> = rows.iter().filter_map(|(_, v)| v[0]).collect();
     assert!(ages.contains(&30));
     assert!(ages.contains(&25));
 
@@ -234,12 +234,12 @@ fn exec_count() {
     eng.define_himo("type", HimoType::Value, 10);
     eng.define_himo("category", HimoType::Value, 10);
 
-    for i in 0..20u32 {
+    for i in 0..20u64 {
         let e = eng.entity();
         eng.tie(e, "type", 1);
         eng.tie(e, "category", i % 5);
     }
-    for i in 0..10u32 {
+    for i in 0..10u64 {
         let e = eng.entity();
         eng.tie(e, "type", 2);
         eng.tie(e, "category", i % 5);
@@ -336,7 +336,7 @@ fn exec_get() {
     match ravn.exec("type:1 | get score") {
         RavnResult::Values(rows) => {
             assert_eq!(rows.len(), 2);
-            let scores: Vec<u32> = rows.iter().filter_map(|(_, v)| v[0]).collect();
+            let scores: Vec<u64> = rows.iter().filter_map(|(_, v)| v[0]).collect();
             assert!(scores.contains(&42));
             assert!(scores.contains(&77));
         }

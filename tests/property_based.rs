@@ -67,9 +67,9 @@ type Shadow = HashMap<(u32, usize), u32>;
 fn apply_ops(
     db: &mut Engine,
     ops: &[Op],
-) -> (Shadow, HashSet<u32>) {
+) -> (Shadow, HashSet<u64>) {
     let mut shadow: Shadow = HashMap::new();
-    let mut deleted: HashSet<u32> = HashSet::new();
+    let mut deleted: HashSet<u64> = HashSet::new();
 
     for op in ops {
         match *op {
@@ -140,13 +140,13 @@ proptest! {
 
         // 各 (himo, value) について pull_raw 結果 == shadow から抽出した eid 集合
         for h in 0..3 {
-            for v in 0..10u32 {
-                let expected: HashSet<u32> = shadow.iter()
+            for v in 0..10u64 {
+                let expected: HashSet<u64> = shadow.iter()
                     .filter(|&(&(_, hh), &vv)| hh == h && vv == v)
                     .map(|(&(e, _), _)| e)
                     .collect();
 
-                let actual: HashSet<u32> = db.pull_raw(himo_name(h), v).into_iter().collect();
+                let actual: HashSet<u64> = db.pull_raw(himo_name(h), v).into_iter().collect();
 
                 prop_assert_eq!(&actual, &expected,
                     "pull_raw({}, {}) mismatch", himo_name(h), v);
@@ -188,8 +188,8 @@ proptest! {
             if shadow.contains_key(&(e, h)) {
                 continue;
             }
-            for v in 0..5u32 {
-                let result: Vec<u32> = db.pull_raw(himo_name(h), v);
+            for v in 0..5u64 {
+                let result: Vec<u64> = db.pull_raw(himo_name(h), v);
                 prop_assert!(!result.contains(&e),
                     "untied eid={} appeared in pull_raw({}, {})", e, himo_name(h), v);
             }
@@ -211,7 +211,7 @@ proptest! {
             db.tie(e, himo_name(h), v);
         }
 
-        let mut deleted: HashSet<u32> = HashSet::new();
+        let mut deleted: HashSet<u64> = HashSet::new();
         for &e in &delete_eids {
             if !deleted.contains(&e) {
                 db.delete(e);
@@ -222,8 +222,8 @@ proptest! {
         // 削除した eid はどの (himo, value) でも pull_raw に現れない
         for &e in &deleted {
             for h in 0..3 {
-                for v in 0..5u32 {
-                    let result: Vec<u32> = db.pull_raw(himo_name(h), v);
+                for v in 0..5u64 {
+                    let result: Vec<u64> = db.pull_raw(himo_name(h), v);
                     prop_assert!(!result.contains(&e),
                         "deleted eid={} appeared in pull_raw({}, {})",
                         e, himo_name(h), v);
@@ -245,11 +245,11 @@ proptest! {
         let mut db = make_db(&path);
         apply_ops(&mut db, &ops);
 
-        let pa: HashSet<u32> = db.pull_raw("a", a_val).into_iter().collect();
-        let pb: HashSet<u32> = db.pull_raw("b", b_val).into_iter().collect();
-        let intersection: HashSet<u32> = pa.intersection(&pb).copied().collect();
+        let pa: HashSet<u64> = db.pull_raw("a", a_val).into_iter().collect();
+        let pb: HashSet<u64> = db.pull_raw("b", b_val).into_iter().collect();
+        let intersection: HashSet<u64> = pa.intersection(&pb).copied().collect();
 
-        let q: HashSet<u32> = db
+        let q: HashSet<u64> = db
             .query(&[("a", a_val), ("b", b_val)])
             .into_iter()
             .collect();

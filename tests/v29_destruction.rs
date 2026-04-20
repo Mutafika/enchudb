@@ -89,7 +89,7 @@ fn process_normal_exit_persists_all_writes() {
     let eng = Engine::open(&path).unwrap();
     // 500 entity が tie されている(値 0..=499)
     assert!(eng.entity_count() >= 500);
-    for i in 0..500u32 {
+    for i in 0..500u64 {
         let v = eng.get(i, "n");
         assert_eq!(v, Some(i), "entity {} should have value {}", i, i);
     }
@@ -112,7 +112,7 @@ fn process_no_commit_recovers_via_auto_commit() {
     let eng = Engine::open_concurrent_with_wal(&path, 64 * 1024 * 1024).unwrap();
     // auto-commit が効いてれば 100 件全部残る
     let mut found = 0;
-    for i in 0..100u32 {
+    for i in 0..100u64 {
         if eng.get(i, "n").is_some() { found += 1; }
     }
     assert_eq!(found, 100, "auto-commit should persist all 100 writes");
@@ -137,12 +137,12 @@ fn process_abort_mid_write_preserves_first_half() {
 
     let eng = Engine::open_concurrent_with_wal(&path, 64 * 1024 * 1024).unwrap();
     // 前半 50 件は確実に残る
-    for i in 0..50u32 {
+    for i in 0..50u64 {
         assert_eq!(eng.get(i, "n"), Some(i), "first half entity {} lost", i);
     }
     // 後半は残っても残らなくても OK(どちらも有効な挙動)。
     // ただし「書いた値が化けてる」は絶対 NG。
-    for i in 50..100u32 {
+    for i in 50..100u64 {
         match eng.get(i, "n") {
             None => {}           // 消えた → OK
             Some(v) if v == i => {} // そのまま → OK
@@ -236,7 +236,7 @@ fn byte_flip_wal_tail_truncated_silently() {
     // 正常書き込み + sync
     {
         let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
-        for i in 0..50u32 {
+        for i in 0..50u64 {
             let e = eng.entity();
             eng.tie_async(e, "n", i);
         }
@@ -254,7 +254,7 @@ fn byte_flip_wal_tail_truncated_silently() {
     // reopen — CRC 検出で該当レコード以降は破棄、それ以前は適用
     let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
     // 壊れた箇所以降は失われるが、エラーにはならない
-    let count = (0..50u32).filter(|&i| eng.get(i, "n").is_some()).count();
+    let count = (0..50u64).filter(|&i| eng.get(i, "n").is_some()).count();
     let _ = count; // 件数は破損位置依存、ここでは panic しなければ OK
     drop(eng);
     cleanup(&path);
@@ -287,7 +287,7 @@ fn truncate_wal_to_header_loses_uncommitted() {
 
     {
         let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
-        for i in 0..30u32 {
+        for i in 0..30u64 {
             let e = eng.entity();
             eng.tie_async(e, "n", i);
         }
@@ -302,7 +302,7 @@ fn truncate_wal_to_header_loses_uncommitted() {
     // reopen できる。WAL から何も復旧されない(body は既に msync 済みなので残る)
     let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
     // body 側は wal_sync で msync してるので、書き込みは残ってる
-    let count = (0..30u32).filter(|&i| eng.get(i, "n").is_some()).count();
+    let count = (0..30u64).filter(|&i| eng.get(i, "n").is_some()).count();
     assert!(count > 0, "body msync'd data should survive even with WAL truncation");
     drop(eng);
     cleanup(&path);
@@ -322,7 +322,7 @@ fn concurrent_writers_with_sync_no_data_loss() {
     for t in 0..4 {
         let e = Arc::clone(&eng);
         handles.push(std::thread::spawn(move || {
-            for i in 0..500u32 {
+            for i in 0..500u64 {
                 let ent = e.entity();
                 e.tie_async(ent, "n", (t * 1000 + i) as u32);
             }
@@ -370,7 +370,7 @@ fn fuzz_random_byte_flip_no_silent_corruption() {
         let mut expected: Vec<(u32, u32)> = Vec::new();
         {
             let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
-            for i in 0..20u32 {
+            for i in 0..20u64 {
                 let e = eng.entity();
                 eng.tie_async(e, "n", i);
                 expected.push((e, i));

@@ -32,7 +32,7 @@ fn parallel_readers_during_writes() {
     eng.define_himo("k", HimoType::Value, 32);
 
     // 初期データを撒く
-    let eids: Vec<u32> = (0..2_000).map(|_| eng.entity()).collect();
+    let eids: Vec<u64> = (0..2_000).map(|_| eng.entity()).collect();
     for (i, &e) in eids.iter().enumerate() {
         eng.tie(e, "k", (i as u32) % 32);
     }
@@ -50,7 +50,7 @@ fn parallel_readers_during_writes() {
         let counter = reader_iters.clone();
         handles.push(thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                for v in 0..32u32 {
+                for v in 0..32u64 {
                     let pulled = arc.pull_raw("k", v);
                     // 結果は常に有効な entity リスト
                     for &eid in &pulled {
@@ -119,7 +119,7 @@ fn read_after_flush_sees_writes() {
 
     // 各値ごとに 100 件あるはず(10000 / 100)
     let mut total = 0usize;
-    for v in 0..100u32 {
+    for v in 0..100u64 {
         let pulled = arc.pull_raw("v", v);
         assert_eq!(pulled.len(), 100, "value {} expected 100, got {}", v, pulled.len());
         total += pulled.len();
@@ -143,7 +143,7 @@ fn unbounded_queue_handles_burst() {
     let path = tmp("unbounded_burst");
     let mut eng = Engine::create(&path).unwrap();
     eng.define_himo("k", HimoType::Value, 50);
-    let eids: Vec<u32> = (0..10_000).map(|_| eng.entity()).collect();
+    let eids: Vec<u64> = (0..10_000).map(|_| eng.entity()).collect();
 
     let arc = Engine::concurrentize(eng);
 
@@ -158,7 +158,7 @@ fn unbounded_queue_handles_burst() {
     assert!(elapsed < Duration::from_secs(5), "burst too slow: {:?}", elapsed);
 
     let mut total = 0usize;
-    for v in 0..50u32 {
+    for v in 0..50u64 {
         total += arc.pull_raw("k", v).len();
     }
     assert_eq!(total, 10_000);
@@ -176,7 +176,7 @@ fn flush_writes_drains_fully() {
     let path = tmp("flush_drains");
     let mut eng = Engine::create(&path).unwrap();
     eng.define_himo("a", HimoType::Value, 10);
-    let eids: Vec<u32> = (0..5_000).map(|_| eng.entity()).collect();
+    let eids: Vec<u64> = (0..5_000).map(|_| eng.entity()).collect();
 
     let arc = Engine::concurrentize(eng);
 
@@ -200,7 +200,7 @@ fn drop_while_reading() {
     let path = tmp("drop_reading");
     let mut eng = Engine::create(&path).unwrap();
     eng.define_himo("k", HimoType::Value, 16);
-    let eids: Vec<u32> = (0..500).map(|_| eng.entity()).collect();
+    let eids: Vec<u64> = (0..500).map(|_| eng.entity()).collect();
     for (i, &e) in eids.iter().enumerate() {
         eng.tie(e, "k", (i as u32) % 16);
     }
@@ -214,7 +214,7 @@ fn drop_while_reading() {
         thread::spawn(move || {
             // 自前で持ってる Arc が main 側 drop 後も Engine を生かす。
             while !stop.load(Ordering::Relaxed) {
-                for v in 0..16u32 {
+                for v in 0..16u64 {
                     let _ = arc.pull_raw("k", v);
                 }
             }
@@ -243,7 +243,7 @@ fn drop_with_pending_writes() {
     let path = tmp("drop_pending");
     let mut eng = Engine::create(&path).unwrap();
     eng.define_himo("k", HimoType::Value, 50);
-    let eids: Vec<u32> = (0..3_000).map(|_| eng.entity()).collect();
+    let eids: Vec<u64> = (0..3_000).map(|_| eng.entity()).collect();
 
     let arc = Engine::concurrentize(eng);
 
@@ -260,7 +260,7 @@ fn drop_with_pending_writes() {
     // 念のため少し待ってから flush して確認。
     arc_for_check.flush_writes();
     let mut total = 0usize;
-    for v in 0..50u32 {
+    for v in 0..50u64 {
         total += arc_for_check.pull_raw("k", v).len();
     }
     assert_eq!(total, 3_000, "drop should not lose pending writes");
@@ -304,7 +304,7 @@ fn multiple_async_writers() {
     arc.flush_writes();
 
     let mut total = 0usize;
-    for v in 0..8u32 {
+    for v in 0..8u64 {
         total += arc.pull_raw("g", v).len();
     }
     assert_eq!(total, (n_writers as u32 * per_writer) as usize);
@@ -324,7 +324,7 @@ fn reader_sees_consistent_snapshot() {
     eng.define_himo("c", HimoType::Value, 16);
 
     let n_ent: u32 = 1_000;
-    let eids: Vec<u32> = (0..n_ent).map(|_| eng.entity()).collect();
+    let eids: Vec<u64> = (0..n_ent).map(|_| eng.entity()).collect();
     for (i, &e) in eids.iter().enumerate() {
         eng.tie(e, "c", (i as u32) % 16);
     }
@@ -341,7 +341,7 @@ fn reader_sees_consistent_snapshot() {
         let oor = oor.clone();
         handles.push(thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                for v in 0..16u32 {
+                for v in 0..16u64 {
                     let pulled = arc.pull_raw("c", v);
                     // 範囲チェック(致命: 一度でもあったら困る)
                     for &e in &pulled {
@@ -403,7 +403,7 @@ fn long_running_query_during_writes() {
     eng.define_himo("b", HimoType::Value, 20);
 
     let n_ent: u32 = 2_000;
-    let eids: Vec<u32> = (0..n_ent).map(|_| eng.entity()).collect();
+    let eids: Vec<u64> = (0..n_ent).map(|_| eng.entity()).collect();
     for (i, &e) in eids.iter().enumerate() {
         eng.tie(e, "a", (i as u32) % 20);
         eng.tie(e, "b", (i as u32 / 20) % 20);
@@ -439,8 +439,8 @@ fn long_running_query_during_writes() {
         let arc = arc.clone();
         handles.push(thread::spawn(move || {
             for _ in 0..100 {
-                for av in 0..5u32 {
-                    for bv in 0..5u32 {
+                for av in 0..5u64 {
+                    for bv in 0..5u64 {
                         let r = arc.query(&[("a", av), ("b", bv)]);
                         // 範囲内チェック
                         for &e in &r {
@@ -484,7 +484,7 @@ fn panic_in_reader_doesnt_corrupt() {
     let path = tmp("panic_reader");
     let mut eng = Engine::create(&path).unwrap();
     eng.define_himo("k", HimoType::Value, 16);
-    let eids: Vec<u32> = (0..500).map(|_| eng.entity()).collect();
+    let eids: Vec<u64> = (0..500).map(|_| eng.entity()).collect();
     for (i, &e) in eids.iter().enumerate() {
         eng.tie(e, "k", (i as u32) % 16);
     }
@@ -511,7 +511,7 @@ fn panic_in_reader_doesnt_corrupt() {
         let arc = arc.clone();
         thread::spawn(move || {
             let mut total = 0usize;
-            for v in 0..16u32 {
+            for v in 0..16u64 {
                 total += arc.pull_raw("k", v).len();
             }
             total

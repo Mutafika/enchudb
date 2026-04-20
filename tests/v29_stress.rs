@@ -35,7 +35,7 @@ fn sustained_10k_writes_and_reopen() {
     }
 
     let eng = Engine::open_concurrent_with_wal(&path, 64 * 1024 * 1024).unwrap();
-    for i in 0..10_000u32 {
+    for i in 0..10_000u64 {
         let ent = eng.entity();
         eng.tie_async(ent, "v", i % 100);
     }
@@ -61,10 +61,10 @@ fn parallel_10_writers() {
 
     let eng = Engine::open_concurrent_with_wal(&path, 128 * 1024 * 1024).unwrap();
     let mut handles = Vec::new();
-    for t in 0..10u32 {
+    for t in 0..10u64 {
         let e = Arc::clone(&eng);
         handles.push(std::thread::spawn(move || {
-            for i in 0..1_000u32 {
+            for i in 0..1_000u64 {
                 let ent = e.entity();
                 e.tie_async(ent, "v", t * 1000 + i);
             }
@@ -125,7 +125,7 @@ fn content_heavy_load() {
 
     let eng = Engine::open_concurrent_with_wal(&path, 64 * 1024 * 1024).unwrap();
     let payload: Vec<u8> = (0..1024u16).map(|i| (i & 0xff) as u8).collect();
-    for i in 0..1000u32 {
+    for i in 0..1000u64 {
         let ent = eng.entity();
         eng.tie_async(ent, "id", i);
         eng.content_async(ent, "blob", &payload);
@@ -135,7 +135,7 @@ fn content_heavy_load() {
     drop(eng);
 
     let eng = Engine::open_concurrent_with_wal(&path, 64 * 1024 * 1024).unwrap();
-    for i in 0..1000u32 {
+    for i in 0..1000u64 {
         let c = eng.get_content(i, "blob").expect("content missing");
         assert_eq!(c, payload.as_slice(), "content {} corrupted", i);
     }
@@ -160,7 +160,7 @@ fn heavy_1m_writes() {
 
     let eng = Engine::open_concurrent_with_wal(&path, 512 * 1024 * 1024).unwrap();
     let t0 = Instant::now();
-    for i in 0..1_000_000u32 {
+    for i in 0..1_000_000u64 {
         let ent = eng.entity();
         eng.tie_async(ent, "v", i % 10_000);
     }
@@ -209,7 +209,7 @@ fn random_ops_fuzz_30s() {
         rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
         rng
     };
-    let mut live_eids: Vec<u32> = Vec::new();
+    let mut live_eids: Vec<u64> = Vec::new();
 
     while !stop.load(Ordering::Acquire) {
         let r = next() % 100;

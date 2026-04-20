@@ -27,9 +27,9 @@ fn tenant_isolation_query() {
     db.define_himo("user_no", HimoType::Value, 1_000);
 
     // 5 tenant × 200 user = 1000 entity
-    let mut by_tenant: Vec<Vec<u32>> = vec![Vec::new(); 5];
-    for t in 0..5u32 {
-        for u in 0..200u32 {
+    let mut by_tenant: Vec<Vec<u64>> = vec![Vec::new(); 5];
+    for t in 0..5u64 {
+        for u in 0..200u64 {
             let e = db.entity();
             db.tie(e, "tenant", t);
             db.tie(e, "user_no", u);
@@ -38,11 +38,11 @@ fn tenant_isolation_query() {
     }
     db.rebuild();
 
-    for t in 0..5u32 {
+    for t in 0..5u64 {
         let result = db.query(&[("tenant", t)]);
         assert_eq!(result.len(), 200, "tenant {} should have 200 users", t);
-        let result_set: HashSet<u32> = result.into_iter().collect();
-        let expected: HashSet<u32> = by_tenant[t as usize].iter().copied().collect();
+        let result_set: HashSet<u64> = result.into_iter().collect();
+        let expected: HashSet<u64> = by_tenant[t as usize].iter().copied().collect();
         assert_eq!(result_set, expected, "tenant {} entity set mismatch", t);
 
         // 他テナントの user_no で絞り込んでも自分のテナント内のみ
@@ -76,8 +76,8 @@ fn tenant_with_view() {
 
     // query(tenant + status) は view 経由
     let r = db.query(&[("tenant", 3), ("status", 2)]);
-    let r_set: HashSet<u32> = r.iter().copied().collect();
-    let expected: HashSet<u32> = (0..n)
+    let r_set: HashSet<u64> = r.iter().copied().collect();
+    let expected: HashSet<u64> = (0..n)
         .filter(|&i| i % 8 == 3 && (i / 8) % 4 == 2)
         .collect();
     assert_eq!(r_set, expected, "tenant=3 status=2 should match brute force");
@@ -138,7 +138,7 @@ fn reverse_lookup_children() {
     let kanto = db.entity();
     let kansai = db.entity();
 
-    let kanto_pref: Vec<u32> = (0..7)
+    let kanto_pref: Vec<u64> = (0..7)
         .map(|_| {
             let e = db.entity();
             db.tie_ref(e, "parent", kanto);
@@ -146,7 +146,7 @@ fn reverse_lookup_children() {
         })
         .collect();
 
-    let _kansai_pref: Vec<u32> = (0..6)
+    let _kansai_pref: Vec<u64> = (0..6)
         .map(|_| {
             let e = db.entity();
             db.tie_ref(e, "parent", kansai);
@@ -157,8 +157,8 @@ fn reverse_lookup_children() {
     db.rebuild();
 
     let r = db.pull_raw("parent", kanto);
-    let r_set: HashSet<u32> = r.iter().copied().collect();
-    let expected: HashSet<u32> = kanto_pref.iter().copied().collect();
+    let r_set: HashSet<u64> = r.iter().copied().collect();
+    let expected: HashSet<u64> = kanto_pref.iter().copied().collect();
     assert_eq!(r_set, expected, "kanto children mismatch");
 
     let r = db.pull_raw("parent", kansai);
@@ -230,7 +230,7 @@ fn delete_parent_dangling_refs() {
 
     // 逆引きでも残る(削除された ID 値で引ける)
     let r = db.pull_raw("parent", parent);
-    let r_set: HashSet<u32> = r.iter().copied().collect();
+    let r_set: HashSet<u64> = r.iter().copied().collect();
     assert!(r_set.contains(&child_a));
     assert!(r_set.contains(&child_b));
 }
@@ -256,13 +256,13 @@ fn bulk_tie_consistency() {
     db.rebuild();
 
     // 各 a 値ちょうど n/100 件
-    for v in 0..100u32 {
+    for v in 0..100u64 {
         let r = db.query(&[("a", v)]);
         assert_eq!(r.len(), (n / 100) as usize, "a={} count", v);
     }
     // 全件合計
     let mut total = 0usize;
-    for v in 0..100u32 {
+    for v in 0..100u64 {
         total += db.query(&[("a", v)]).len();
     }
     assert_eq!(total, n as usize);
@@ -285,7 +285,7 @@ fn repeated_tie_untie() {
     db.define_himo("flag", HimoType::Value, 8);
 
     let e = db.entity();
-    for i in 0..1_000u32 {
+    for i in 0..1_000u64 {
         db.tie(e, "flag", i % 8);
         db.untie(e, "flag");
     }
@@ -302,7 +302,7 @@ fn repeated_tie_untie() {
     assert!(r.contains(&e));
 
     // 別の値に上書き
-    for v in 0..8u32 {
+    for v in 0..8u64 {
         db.tie(e, "flag", v);
         assert_eq!(db.get(e, "flag"), Some(v));
     }
@@ -310,7 +310,7 @@ fn repeated_tie_untie() {
     let r = db.pull_raw("flag", final_v);
     assert!(r.contains(&e));
     // それ以外の値からは消えてる
-    for v in 0..8u32 {
+    for v in 0..8u64 {
         if v == final_v { continue; }
         let r = db.pull_raw("flag", v);
         assert!(!r.contains(&e), "stale eid in flag={}", v);
@@ -329,7 +329,7 @@ fn delete_reuse_id() {
     db.define_himo("val", HimoType::Value, 100);
 
     let mut eids = Vec::new();
-    for i in 0..4u32 {
+    for i in 0..4u64 {
         let e = db.entity();
         eids.push(e);
         db.tie(e, "kind", i % 4);
@@ -371,7 +371,7 @@ fn cascade_delete_effect() {
     db.define_himo("owner", HimoType::Ref, 0);
 
     let owner = db.entity();
-    let docs: Vec<u32> = (0..5).map(|_| {
+    let docs: Vec<u64> = (0..5).map(|_| {
         let e = db.entity();
         db.tie_ref(e, "owner", owner);
         e
@@ -395,7 +395,7 @@ fn views_after_open() {
     let path = db_path("view_open");
 
     // 書き込みフェーズ
-    let pre_query: HashSet<u32>;
+    let pre_query: HashSet<u64>;
     {
         let mut db = Engine::create_with_capacity(&path, 2_000).unwrap();
         db.define_himo("tenant", HimoType::Value, 8);
@@ -403,7 +403,7 @@ fn views_after_open() {
         db.define_himo("grade", HimoType::Value, 5);
         db.define_view(&["tenant", "status"]).unwrap();
 
-        for i in 0..1_000u32 {
+        for i in 0..1_000u64 {
             let e = db.entity();
             db.tie(e, "tenant", i % 8);
             db.tie(e, "status", (i / 8) % 4);
@@ -421,7 +421,7 @@ fn views_after_open() {
     // open フェーズ — define_view を呼ばない
     let db = Engine::open(&path).unwrap();
     let r = db.query(&[("tenant", 2), ("status", 1)]);
-    let post_query: HashSet<u32> = r.into_iter().collect();
+    let post_query: HashSet<u64> = r.into_iter().collect();
     assert_eq!(post_query, pre_query, "view query must match before/after reopen");
 }
 
@@ -449,24 +449,24 @@ fn view_hit_vs_miss() {
 
     // ヒット: view と同一組合せ
     let r_hit = db.query(&[("tenant", 3), ("status", 2)]);
-    let exp_hit: HashSet<u32> = (0..n)
+    let exp_hit: HashSet<u64> = (0..n)
         .filter(|&i| i % 8 == 3 && (i / 8) % 4 == 2)
         .collect();
-    assert_eq!(r_hit.iter().copied().collect::<HashSet<u32>>(), exp_hit);
+    assert_eq!(r_hit.iter().copied().collect::<HashSet<u64>>(), exp_hit);
 
     // ミス: view が無い組合せ → ペアテーブル or column フィルタ
     let r_miss = db.query(&[("tenant", 3), ("grade", 1)]);
-    let exp_miss: HashSet<u32> = (0..n)
+    let exp_miss: HashSet<u64> = (0..n)
         .filter(|&i| i % 8 == 3 && (i / 32) % 5 == 1)
         .collect();
-    assert_eq!(r_miss.iter().copied().collect::<HashSet<u32>>(), exp_miss);
+    assert_eq!(r_miss.iter().copied().collect::<HashSet<u64>>(), exp_miss);
 
     // view の上に第 3 条件を足す
     let r_three = db.query(&[("tenant", 3), ("status", 2), ("grade", 1)]);
-    let exp_three: HashSet<u32> = (0..n)
+    let exp_three: HashSet<u64> = (0..n)
         .filter(|&i| i % 8 == 3 && (i / 8) % 4 == 2 && (i / 32) % 5 == 1)
         .collect();
-    assert_eq!(r_three.iter().copied().collect::<HashSet<u32>>(), exp_three);
+    assert_eq!(r_three.iter().copied().collect::<HashSet<u64>>(), exp_three);
 }
 
 // ─────────────────────────────────────────────────────────
@@ -480,8 +480,8 @@ fn mixed_workload() {
     db.define_himo("score", HimoType::Value, 100);
 
     // 1万 tie
-    let mut all_eids: Vec<u32> = Vec::with_capacity(10_000);
-    for i in 0..10_000u32 {
+    let mut all_eids: Vec<u64> = Vec::with_capacity(10_000);
+    for i in 0..10_000u64 {
         let e = db.entity();
         db.tie(e, "group", i % 10);
         db.tie(e, "score", i % 100);
@@ -520,16 +520,16 @@ fn mixed_workload() {
 
     // group 紐: 削除されてないものだけ残る
     let mut group_total = 0usize;
-    for g in 0..10u32 {
+    for g in 0..10u64 {
         group_total += db.query(&[("group", g)]).len();
     }
     assert_eq!(group_total, alive_count as usize);
 
     // score 紐: untie もしくは delete されたものは消える
-    let removed_score: HashSet<u32> = untied.union(&deleted).copied().collect();
+    let removed_score: HashSet<u64> = untied.union(&deleted).copied().collect();
     let alive_with_score = 10_000 - removed_score.len();
     let mut score_total = 0usize;
-    for v in 0..100u32 {
+    for v in 0..100u64 {
         score_total += db.pull_raw("score", v).len();
     }
     assert_eq!(score_total, alive_with_score);
@@ -562,7 +562,7 @@ fn many_himos() {
     // 各紐の 1 値クエリは n/8 件前後(8で割れない端数あり)
     for name in &names {
         let mut total = 0usize;
-        for v in 0..8u32 {
+        for v in 0..8u64 {
             total += db.pull_raw(name, v).len();
         }
         assert_eq!(total, n as usize, "himo {} total", name);
@@ -571,8 +571,8 @@ fn many_himos() {
     // 任意 3 紐の AND が動く
     let r = db.query(&[("h00", 0), ("h01", 1), ("h02", 2)]);
     // 全て (i + k) % 8 = 0/1/2 → i % 8 = 0 を満たす entity
-    let exp: HashSet<u32> = (0..n).filter(|&i| i % 8 == 0).collect();
-    assert_eq!(r.iter().copied().collect::<HashSet<u32>>(), exp);
+    let exp: HashSet<u64> = (0..n).filter(|&i| i % 8 == 0).collect();
+    assert_eq!(r.iter().copied().collect::<HashSet<u64>>(), exp);
 }
 
 // ─────────────────────────────────────────────────────────
@@ -586,7 +586,7 @@ fn text_and_value_mixed() {
     db.define_himo("age", HimoType::Value, 100);
 
     let cities = ["Tokyo", "Osaka", "Kyoto", "Sapporo"];
-    let mut by_city: Vec<Vec<u32>> = vec![Vec::new(); cities.len()];
+    let mut by_city: Vec<Vec<u64>> = vec![Vec::new(); cities.len()];
     let n = 200u32;
     for i in 0..n {
         let e = db.entity();
@@ -601,15 +601,15 @@ fn text_and_value_mixed() {
     for (ci, &name) in cities.iter().enumerate() {
         let vid = db.find_value("city", name).expect("find_value should hit");
         let r = db.pull_raw("city", vid);
-        let r_set: HashSet<u32> = r.into_iter().collect();
-        let exp: HashSet<u32> = by_city[ci].iter().copied().collect();
+        let r_set: HashSet<u64> = r.into_iter().collect();
+        let exp: HashSet<u64> = by_city[ci].iter().copied().collect();
         assert_eq!(r_set, exp, "city {} pull_raw mismatch", name);
     }
 
     // 値紐は普通に動く
     let r = db.pull_raw("age", 7);
-    let exp: HashSet<u32> = (0..n).filter(|&i| i % 100 == 7).collect();
-    assert_eq!(r.iter().copied().collect::<HashSet<u32>>(), exp);
+    let exp: HashSet<u64> = (0..n).filter(|&i| i % 100 == 7).collect();
+    assert_eq!(r.iter().copied().collect::<HashSet<u64>>(), exp);
 
     // get_text と get
     let some_e = by_city[1][0]; // Osaka
@@ -637,13 +637,13 @@ fn query_pair_empty_cell_fallback() {
     db.rebuild_pairs();
 
     // データ投入（pair table 構築後）
-    for i in 0..100u32 {
+    for i in 0..100u64 {
         let e = db.entity();
         db.tie(e, "type_h", 1);
         db.tie(e, "board", 0);
         db.tie(e, "author", i);
     }
-    for i in 0..500u32 {
+    for i in 0..500u64 {
         let e = db.entity();
         db.tie(e, "type_h", 2);
         db.tie(e, "board", 0);
