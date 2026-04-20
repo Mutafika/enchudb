@@ -9,9 +9,9 @@ use crate::engine::Engine;
 
 #[derive(Debug)]
 pub enum QueryResult {
-    Entities(Vec<u32>),
+    Entities(Vec<crate::EntityId>),
     Count(usize),
-    Inserted(u32),
+    Inserted(crate::EntityId),
     Deleted,
     Error(String),
 }
@@ -65,7 +65,7 @@ pub fn execute(eng: &mut Engine, input: &str) -> QueryResult {
 
     match mode {
         "count" => QueryResult::Count(result.len()),
-        _ => QueryResult::Entities(result),
+        _ => QueryResult::Entities(result.into_iter().map(|e| e as crate::EntityId).collect()),
     }
 }
 
@@ -89,7 +89,7 @@ fn exec_insert(eng: &mut Engine, input: &str) -> QueryResult {
 }
 
 fn exec_delete(eng: &mut Engine, input: &str) -> QueryResult {
-    match input.parse::<u32>() {
+    match input.parse::<crate::EntityId>() {
         Ok(eid) => { eng.delete(eid); QueryResult::Deleted }
         Err(_) => QueryResult::Error(format!("invalid id: {input}")),
     }

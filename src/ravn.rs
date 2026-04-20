@@ -6,9 +6,9 @@ pub struct Ravn {
 }
 
 pub enum RavnResult {
-    Entities(Vec<u32>),
+    Entities(Vec<crate::EntityId>),
     Count(usize),
-    Values(Vec<(u32, Vec<Option<u32>>)>),
+    Values(Vec<(crate::EntityId, Vec<Option<u32>>)>),
     Error(String),
 }
 
@@ -32,13 +32,13 @@ impl Ravn {
         &self.engine
     }
 
-    pub fn path(&self, eid: u32, steps: &[&str]) -> Option<u32> {
+    pub fn path(&self, eid: crate::EntityId, steps: &[&str]) -> Option<u32> {
         if steps.is_empty() { return None; }
-        let mut current = eid;
+        let mut current: crate::EntityId = eid;
         for (i, step) in steps.iter().enumerate() {
             let val = self.engine.get(current, step)?;
             if i < steps.len() - 1 {
-                current = val;
+                current = val as crate::EntityId;
             } else {
                 return Some(val);
             }
@@ -46,12 +46,12 @@ impl Ravn {
         None
     }
 
-    pub fn path_text(&self, eid: u32, steps: &[&str]) -> Option<Vec<u8>> {
+    pub fn path_text(&self, eid: crate::EntityId, steps: &[&str]) -> Option<Vec<u8>> {
         if steps.is_empty() { return None; }
-        let mut current = eid;
+        let mut current: crate::EntityId = eid;
         for (i, step) in steps.iter().enumerate() {
             if i < steps.len() - 1 {
-                current = self.engine.get(current, step)?;
+                current = self.engine.get(current, step)? as crate::EntityId;
             } else {
                 return self.engine.get_text(current, step).map(|b| b.to_vec());
             }
@@ -59,13 +59,13 @@ impl Ravn {
         None
     }
 
-    pub fn follow(&self, start: &[u32], steps: &[&str]) -> Vec<u32> {
-        let mut current: Vec<u32> = start.to_vec();
+    pub fn follow(&self, start: &[crate::EntityId], steps: &[&str]) -> Vec<crate::EntityId> {
+        let mut current: Vec<crate::EntityId> = start.to_vec();
         for step in steps {
             let mut next = Vec::new();
             for &eid in &current {
                 if let Some(val) = self.engine.get(eid, step) {
-                    next.push(val);
+                    next.push(val as crate::EntityId);
                 }
             }
             current = next;
@@ -74,18 +74,13 @@ impl Ravn {
     }
 
     /// v31: 逆方向 tie 辿り。
-    /// start の各エンティティ E に対して「`X.himo == E` を満たす X」を集める。
-    /// tie_ref で E を指している entity の集合が返る(セッションから発話者を見ている時の
-    /// 逆: 発話者からセッション一覧を引く、など)。
-    /// 結果は soft-unique(重複除去せず、呼び出し側が必要なら sort+dedup)。
-    pub fn reverse_follow(&self, start: &[u32], himo: &str) -> Vec<u32> {
+    pub fn reverse_follow(&self, start: &[crate::EntityId], himo: &str) -> Vec<crate::EntityId> {
         let mut out = Vec::new();
         for &e in start {
-            // pull_raw は "himo に値 e を持つ全 entity" を返す。
-            // tie_ref は target_eid を u32 値として格納するので、これで逆引きが成立。
-            // v27: Vec<u32>、それ以外: &[u32]。どちらも extend で受ける。
-            let pulled = self.engine.pull_raw(himo, e);
-            out.extend(pulled.iter().copied());
+            // pull_raw は "himo に値 e を持つ全 entity" を返す(EntityId)。
+            // tie_ref は target_eid を u32 値として格納するので、u64 eid の local 部分で引く。
+            let pulled = self.engine.pull_raw(himo, crate::eid_local(e));
+            out.extend(pulled);
         }
         out.sort_unstable();
         out.dedup();
@@ -93,15 +88,14 @@ impl Ravn {
     }
 
     /// v31: 深さ制限付き BFS。`himo` を繰り返し forward で辿る。
-    /// 戻り値は (depth, eids) のペア列(深さ別)。depth 0 は start 自身。
-    pub fn bfs(&self, start: &[u32], himo: &str, max_depth: u32) -> Vec<(u32, Vec<u32>)> {
+    pub fn bfs(&self, start: &[crate::EntityId], himo: &str, max_depth: u32) -> Vec<(u32, Vec<crate::EntityId>)> {
         use std::collections::HashSet;
-        let mut visited: HashSet<u32> = start.iter().copied().collect();
+        let mut visited: HashSet<crate::EntityId> = start.iter().copied().collect();
         let mut result = vec![(0u32, start.to_vec())];
-        let mut frontier: Vec<u32> = start.to_vec();
+        let mut frontier: Vec<crate::EntityId> = start.to_vec();
         for d in 1..=max_depth {
             let next = self.follow(&frontier, &[himo]);
-            let fresh: Vec<u32> = next.into_iter().filter(|e| visited.insert(*e)).collect();
+            let fresh: Vec<crate::EntityId> = next.into_iter().filter(|e| visited.insert(*e)).collect();
             if fresh.is_empty() { break; }
             result.push((d, fresh.clone()));
             frontier = fresh;
@@ -110,7 +104,7 @@ impl Ravn {
     }
 
     /// v31: entity 集合を「`himo == value` を満たすもの」だけに絞る。
-    pub fn filter_by(&self, eids: &[u32], himo: &str, value: u32) -> Vec<u32> {
+    pub fn filter_by(&self, eids: &[crate::EntityId], himo: &str, value: u32) -> Vec<crate::EntityId> {
         eids.iter()
             .filter(|&&e| self.engine.get(e, himo) == Some(value))
             .copied()
@@ -118,34 +112,34 @@ impl Ravn {
     }
 
     /// v31: テキスト値でフィルタ(Symbol 型 himo 用)。
-    pub fn filter_by_text(&self, eids: &[u32], himo: &str, text: &str) -> Vec<u32> {
+    pub fn filter_by_text(&self, eids: &[crate::EntityId], himo: &str, text: &str) -> Vec<crate::EntityId> {
         let Some(vid) = self.engine.vocab_id(text) else { return Vec::new(); };
         self.filter_by(eids, himo, vid)
     }
 
     /// v31: entity 集合から himo の値(u32)を抽出。
     /// None は除外。
-    pub fn extract(&self, eids: &[u32], himo: &str) -> Vec<u32> {
+    pub fn extract(&self, eids: &[crate::EntityId], himo: &str) -> Vec<u32> {
         eids.iter()
             .filter_map(|&e| self.engine.get(e, himo))
             .collect()
     }
 
     /// v31: テキスト抽出。
-    pub fn extract_text(&self, eids: &[u32], himo: &str) -> Vec<Vec<u8>> {
+    pub fn extract_text(&self, eids: &[crate::EntityId], himo: &str) -> Vec<Vec<u8>> {
         eids.iter()
             .filter_map(|&e| self.engine.get_text(e, himo).map(|b| b.to_vec()))
             .collect()
     }
 
     /// v31: content 抽出。
-    pub fn extract_content(&self, eids: &[u32], key: &str) -> Vec<Vec<u8>> {
+    pub fn extract_content(&self, eids: &[crate::EntityId], key: &str) -> Vec<Vec<u8>> {
         eids.iter()
             .filter_map(|&e| self.engine.get_content(e, key).map(|b| b.to_vec()))
             .collect()
     }
 
-    pub fn select(&self, conds: &[(&str, u32)], fields: &[&str]) -> Vec<(u32, Vec<Option<u32>>)> {
+    pub fn select(&self, conds: &[(&str, u32)], fields: &[&str]) -> Vec<(crate::EntityId, Vec<Option<u32>>)> {
         let eids = self.engine.query(conds);
         eids.iter().map(|&eid| {
             let values: Vec<Option<u32>> = fields.iter()
@@ -155,7 +149,7 @@ impl Ravn {
         }).collect()
     }
 
-    pub fn select_text(&self, conds: &[(&str, u32)], fields: &[&str]) -> Vec<(u32, Vec<Option<Vec<u8>>>)> {
+    pub fn select_text(&self, conds: &[(&str, u32)], fields: &[&str]) -> Vec<(crate::EntityId, Vec<Option<Vec<u8>>>)> {
         let eids = self.engine.query(conds);
         eids.iter().map(|&eid| {
             let values: Vec<Option<Vec<u8>>> = fields.iter()
@@ -233,7 +227,7 @@ impl Ravn {
                         return RavnResult::Error("select: no fields specified".into());
                     }
                     let fields: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                    let rows: Vec<(u32, Vec<Option<u32>>)> = eids.iter().map(|&eid| {
+                    let rows: Vec<(crate::EntityId, Vec<Option<u32>>)> = eids.iter().map(|&eid| {
                         let vals: Vec<Option<u32>> = fields.iter()
                             .map(|f| self.engine.get(eid, f))
                             .collect();
@@ -246,7 +240,7 @@ impl Ravn {
                         return RavnResult::Error("get: no himo specified".into());
                     }
                     let himo = args[0].as_str();
-                    let rows: Vec<(u32, Vec<Option<u32>>)> = eids.iter().map(|&eid| {
+                    let rows: Vec<(crate::EntityId, Vec<Option<u32>>)> = eids.iter().map(|&eid| {
                         (eid, vec![self.engine.get(eid, himo)])
                     }).collect();
                     return RavnResult::Values(rows);

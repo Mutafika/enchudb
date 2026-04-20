@@ -1218,15 +1218,17 @@ impl Engine {
 
     // ──── entity ────
 
-    pub fn entity(&self) -> u32 {
+    pub fn entity(&self) -> crate::EntityId {
         let eid = self.entities.allocate();
         self.undo.record(eid, 0xFFFF, &[1, 0, 0, 0]); // entity created
-        eid
+        eid as crate::EntityId
     }
 
-    pub fn entities(&self) -> Vec<u32> { self.entities.iter() }
+    pub fn entities(&self) -> Vec<crate::EntityId> {
+        self.entities.iter().into_iter().map(|e| e as crate::EntityId).collect()
+    }
     pub fn entity_count(&self) -> u32 { self.entities.count() }
-    pub fn next_eid(&self) -> u32 { self.entities.next_eid() }
+    pub fn next_eid(&self) -> crate::EntityId { self.entities.next_eid() as crate::EntityId }
 
     // ──── tie ────
 
@@ -1234,7 +1236,8 @@ impl Engine {
         self.ensure_himo(himo, ht, max_values);
     }
 
-    pub fn tie_text(&mut self, eid: u32, himo: &str, value: &str) {
+    pub fn tie_text(&mut self, eid: crate::EntityId, himo: &str, value: &str) {
+        let eid = crate::eid_local(eid);
         let vid = self.vocab.get_or_insert(value.as_bytes());
         let hid = self.ensure_himo(himo, HimoType::Symbol, 0);
         debug_assert_eq!(self.himo_types[hid], HimoType::Symbol, "tie_text on non-Symbol himo '{}'", himo);
@@ -1246,7 +1249,8 @@ impl Engine {
         self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), vid);
     }
 
-    pub fn tie(&mut self, eid: u32, himo: &str, value: u32) {
+    pub fn tie(&mut self, eid: crate::EntityId, himo: &str, value: u32) {
+        let eid = crate::eid_local(eid);
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = self.ensure_himo(himo, HimoType::Value, 0);
         debug_assert!(self.himo_types[hid] == HimoType::Value || self.himo_types[hid] == HimoType::Ref, "tie on non-Value himo '{}'", himo);
@@ -1258,7 +1262,9 @@ impl Engine {
         self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), value);
     }
 
-    pub fn tie_ref(&mut self, eid: u32, himo: &str, target_eid: u32) {
+    pub fn tie_ref(&mut self, eid: crate::EntityId, himo: &str, target_eid: crate::EntityId) {
+        let eid = crate::eid_local(eid);
+        let target_eid = crate::eid_local(target_eid);
         assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
         let hid = self.ensure_himo(himo, HimoType::Ref, 0);
         debug_assert!(self.himo_types[hid] == HimoType::Ref || self.himo_types[hid] == HimoType::Value, "tie_ref on non-Ref himo '{}'", himo);
@@ -1274,7 +1280,8 @@ impl Engine {
 
     /// 定義済みの紐に文字列を張る。&selfで呼べる（Arc共有のまま書き込み可）。
     /// 紐が未定義ならpanic。define_himo を先に呼ぶこと。
-    pub fn tie_text_to(&self, eid: u32, himo: &str, value: &str) {
+    pub fn tie_text_to(&self, eid: crate::EntityId, himo: &str, value: &str) {
+        let eid = crate::eid_local(eid);
         let vid = self.vocab.get_or_insert(value.as_bytes());
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
@@ -1288,7 +1295,8 @@ impl Engine {
     }
 
     /// 定義済みの紐にu32値を張る。&selfで呼べる。
-    pub fn tie_to(&self, eid: u32, himo: &str, value: u32) {
+    pub fn tie_to(&self, eid: crate::EntityId, himo: &str, value: u32) {
+        let eid = crate::eid_local(eid);
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
@@ -1302,7 +1310,9 @@ impl Engine {
     }
 
     /// 定義済みの紐にentity参照を張る。&selfで呼べる。
-    pub fn tie_ref_to(&self, eid: u32, himo: &str, target_eid: u32) {
+    pub fn tie_ref_to(&self, eid: crate::EntityId, himo: &str, target_eid: crate::EntityId) {
+        let eid = crate::eid_local(eid);
+        let target_eid = crate::eid_local(target_eid);
         assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
@@ -1317,7 +1327,8 @@ impl Engine {
 
     // ──── untie ────
 
-    pub fn untie(&self, eid: u32, himo: &str) {
+    pub fn untie(&self, eid: crate::EntityId, himo: &str) {
+        let eid = crate::eid_local(eid);
         if let Some(hid) = self.himo_id(himo) {
             self.record_undo(eid, hid);
             #[cfg(feature = "v27")]
@@ -1332,7 +1343,8 @@ impl Engine {
 
     // ──── delete ────
 
-    pub fn delete(&self, eid: u32) {
+    pub fn delete(&self, eid: crate::EntityId) {
+        let eid = crate::eid_local(eid);
         self.undo.record(eid, 0xFFFF, &[2, 0, 0, 0]); // entity deleted
         for hid in 0..self.himos.len() {
             self.record_undo(eid, hid);
@@ -1390,35 +1402,37 @@ impl Engine {
 
     // ──── content ────
 
-    pub fn content(&self, eid: u32, key: &str, data: &[u8]) {
-        self.contents.set(eid, key, data);
+    pub fn content(&self, eid: crate::EntityId, key: &str, data: &[u8]) {
+        self.contents.set(crate::eid_local(eid), key, data);
     }
 
-    pub fn get_content(&self, eid: u32, key: &str) -> Option<&[u8]> {
-        self.contents.get(eid, key)
+    pub fn get_content(&self, eid: crate::EntityId, key: &str) -> Option<&[u8]> {
+        self.contents.get(crate::eid_local(eid), key)
     }
 
     // ──── get ────
 
-    pub fn get_text(&self, eid: u32, himo: &str) -> Option<&[u8]> {
+    pub fn get_text(&self, eid: crate::EntityId, himo: &str) -> Option<&[u8]> {
+        let eid = crate::eid_local(eid);
         let hid = self.himo_id(himo)?;
         if self.himo_types[hid] != HimoType::Symbol { return None; }
         let vid = self.himos[hid].get_value(eid)?;
         Some(self.vocab.get(vid))
     }
 
-    pub fn get(&self, eid: u32, himo: &str) -> Option<u32> {
+    pub fn get(&self, eid: crate::EntityId, himo: &str) -> Option<u32> {
+        let eid = crate::eid_local(eid);
         let hid = self.himo_id(himo)?;
         self.himos[hid].get_value(eid)
     }
 
     /// 指定 entity 群の紐値を合計
-    pub fn sum(&self, himo: &str, eids: &[u32]) -> u64 {
+    pub fn sum(&self, himo: &str, eids: &[crate::EntityId]) -> u64 {
         let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
         let hs = &self.himos[hid];
         let mut total: u64 = 0;
         for &eid in eids {
-            if let Some(v) = hs.get_value(eid) {
+            if let Some(v) = hs.get_value(crate::eid_local(eid)) {
                 total += v as u64;
             }
         }
@@ -1426,12 +1440,12 @@ impl Engine {
     }
 
     /// 最小値
-    pub fn min(&self, himo: &str, eids: &[u32]) -> Option<u32> {
+    pub fn min(&self, himo: &str, eids: &[crate::EntityId]) -> Option<u32> {
         let hid = self.himo_id(himo)?;
         let hs = &self.himos[hid];
         let mut result: Option<u32> = None;
         for &eid in eids {
-            if let Some(v) = hs.get_value(eid) {
+            if let Some(v) = hs.get_value(crate::eid_local(eid)) {
                 result = Some(result.map_or(v, |cur: u32| cur.min(v)));
             }
         }
@@ -1439,12 +1453,12 @@ impl Engine {
     }
 
     /// 最大値
-    pub fn max(&self, himo: &str, eids: &[u32]) -> Option<u32> {
+    pub fn max(&self, himo: &str, eids: &[crate::EntityId]) -> Option<u32> {
         let hid = self.himo_id(himo)?;
         let hs = &self.himos[hid];
         let mut result: Option<u32> = None;
         for &eid in eids {
-            if let Some(v) = hs.get_value(eid) {
+            if let Some(v) = hs.get_value(crate::eid_local(eid)) {
                 result = Some(result.map_or(v, |cur: u32| cur.max(v)));
             }
         }
@@ -1452,13 +1466,13 @@ impl Engine {
     }
 
     /// 平均（整数除算）
-    pub fn avg(&self, himo: &str, eids: &[u32]) -> Option<u64> {
+    pub fn avg(&self, himo: &str, eids: &[crate::EntityId]) -> Option<u64> {
         let hid = self.himo_id(himo)?;
         let hs = &self.himos[hid];
         let mut total: u64 = 0;
         let mut count: u64 = 0;
         for &eid in eids {
-            if let Some(v) = hs.get_value(eid) {
+            if let Some(v) = hs.get_value(crate::eid_local(eid)) {
                 total += v as u64;
                 count += 1;
             }
@@ -1467,25 +1481,26 @@ impl Engine {
     }
 
     /// 値を持つ entity の数
-    pub fn count(&self, himo: &str, eids: &[u32]) -> u32 {
+    pub fn count(&self, himo: &str, eids: &[crate::EntityId]) -> u32 {
         let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
         let hs = &self.himos[hid];
         let mut n: u32 = 0;
         for &eid in eids {
-            if hs.get_value(eid).is_some() { n += 1; }
+            if hs.get_value(crate::eid_local(eid)).is_some() { n += 1; }
         }
         n
     }
 
     /// GROUP BY + SUM — group_himo の値でグループ化し、sum_himo の値を合計
-    pub fn group_sum(&self, group_himo: &str, sum_himo: &str, eids: &[u32]) -> Vec<(u32, u64)> {
+    pub fn group_sum(&self, group_himo: &str, sum_himo: &str, eids: &[crate::EntityId]) -> Vec<(u32, u64)> {
         let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
         let sid = match self.himo_id(sum_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
         let ss = &self.himos[sid];
         let mut map: Vec<(u32, u64)> = Vec::new();
         for &eid in eids {
-            if let (Some(group), Some(val)) = (gs.get_value(eid), ss.get_value(eid)) {
+            let local = crate::eid_local(eid);
+            if let (Some(group), Some(val)) = (gs.get_value(local), ss.get_value(local)) {
                 if let Some(entry) = map.iter_mut().find(|(k, _)| *k == group) {
                     entry.1 += val as u64;
                 } else {
@@ -1499,15 +1514,23 @@ impl Engine {
     // ──── 範囲クエリ ────
 
     /// 範囲内の全値に合致する entity を返す（min..=max）
-    pub fn pull_range(&self, himo: &str, min: u32, max: u32) -> Vec<u32> {
+    pub fn pull_range(&self, himo: &str, min: u32, max: u32) -> Vec<crate::EntityId> {
         let idx = match self.himo_id(himo) { Some(h) => h, None => return vec![] };
         let hs = &self.himos[idx];
         let mut result = Vec::new();
         for v in min..=max {
             #[cfg(feature = "v27")]
-            { result.extend_from_slice(&hs.pull(v)); }
+            {
+                for local in &hs.pull(v) {
+                    result.push(*local as crate::EntityId);
+                }
+            }
             #[cfg(not(feature = "v27"))]
-            { result.extend_from_slice(hs.pull(v)); }
+            {
+                for local in hs.pull(v) {
+                    result.push(*local as crate::EntityId);
+                }
+            }
         }
         result
     }
@@ -1546,17 +1569,17 @@ impl Engine {
     }
 
     /// 日付を epoch 日数として tie
-    pub fn tie_date(&mut self, eid: u32, himo: &str, year: u32, month: u32, day: u32) {
+    pub fn tie_date(&mut self, eid: crate::EntityId, himo: &str, year: u32, month: u32, day: u32) {
         self.tie(eid, himo, Self::date_to_days(year, month, day));
     }
 
     /// epoch 日数から (year, month, day) を返す
-    pub fn get_date(&self, eid: u32, himo: &str) -> Option<(u32, u32, u32)> {
+    pub fn get_date(&self, eid: crate::EntityId, himo: &str) -> Option<(u32, u32, u32)> {
         self.get(eid, himo).map(Self::days_to_date)
     }
 
     /// 日付範囲で pull_range
-    pub fn pull_date_range(&self, himo: &str, from: (u32, u32, u32), to: (u32, u32, u32)) -> Vec<u32> {
+    pub fn pull_date_range(&self, himo: &str, from: (u32, u32, u32), to: (u32, u32, u32)) -> Vec<crate::EntityId> {
         let min = Self::date_to_days(from.0, from.1, from.2);
         let max = Self::date_to_days(to.0, to.1, to.2);
         self.pull_range(himo, min, max)
@@ -1606,14 +1629,16 @@ impl Engine {
         None
     }
 
-    pub fn himos_of(&self, eid: u32) -> Vec<&str> {
+    pub fn himos_of(&self, eid: crate::EntityId) -> Vec<&str> {
+        let eid = crate::eid_local(eid);
         self.himos.iter().enumerate()
             .filter(|(_, ds)| ds.get_value(eid).is_some())
             .map(|(i, _)| self.himo_names[i].as_str())
             .collect()
     }
     /// 1 entity の全フィールドを一括取得。HashMap ルックアップ 0 回。
-    pub fn get_entity(&self, eid: u32) -> Vec<(&str, EntityValue<'_>)> {
+    pub fn get_entity(&self, eid: crate::EntityId) -> Vec<(&str, EntityValue<'_>)> {
+        let eid = crate::eid_local(eid);
         let mut fields = Vec::with_capacity(self.himos.len());
         for (i, hs) in self.himos.iter().enumerate() {
             if let Some(raw) = hs.get_value(eid) {
@@ -1958,31 +1983,27 @@ impl Engine {
         Ok(())
     }
 
-    /// 引く。delta が空なら Cylinder 直返し（ゼロコピー）。
-    /// delta があれば補正した Vec を返す。
-    ///
-    /// v27: `Vec<u32>` を返す(内部 RwLock 下で clone、Arc<Engine> で並行 read 可能)。
-    /// v24/v26: `&[u32]` を返す(ゼロコピー)。
+    /// 引く。v32 で EntityId(u64) の Vec を返す形に統一。
+    /// 将来の u64 local eid / peer 跨ぎ対応のため、常にコピー。
     #[cfg(not(feature = "v27"))]
-    pub fn pull_raw(&self, himo: &str, value: u32) -> &[u32] {
+    pub fn pull_raw(&self, himo: &str, value: u32) -> Vec<crate::EntityId> {
         match self.himo_id(himo) {
             Some(idx) => {
                 let hs = &self.himos[idx];
                 if hs.delta_needs_rebuild() {
                     hs.rebuild_cylinder();
                 }
-                // delta が空なら Cylinder そのまま（ゼロコピー）
-                hs.cylinder().slice_one(value)
+                hs.cylinder().slice_one(value).iter().map(|&e| e as crate::EntityId).collect()
             }
-            None => &[],
+            None => Vec::new(),
         }
     }
 
-    /// v27 版: 並行 read 安全のため Vec<u32> を返す。
+    /// v27 版: EntityId の Vec を返す(内部 u32 から u64 に昇格)。
     #[cfg(feature = "v27")]
-    pub fn pull_raw(&self, himo: &str, value: u32) -> Vec<u32> {
+    pub fn pull_raw(&self, himo: &str, value: u32) -> Vec<crate::EntityId> {
         match self.himo_id(himo) {
-            Some(idx) => self.himos[idx].pull(value),
+            Some(idx) => self.himos[idx].pull(value).into_iter().map(|e| e as crate::EntityId).collect(),
             None => Vec::new(),
         }
     }
@@ -2051,7 +2072,12 @@ impl Engine {
         result
     }
 
-    pub fn query(&self, strings: &[(&str, u32)]) -> Vec<u32> {
+    pub fn query(&self, strings: &[(&str, u32)]) -> Vec<crate::EntityId> {
+        self.query_u32(strings).into_iter().map(|e| e as crate::EntityId).collect()
+    }
+
+    /// 内部版: u32 eid の Vec を返す。互換性のため残す。
+    fn query_u32(&self, strings: &[(&str, u32)]) -> Vec<u32> {
         // delta が溢れた himo があれば rebuild
         for hs in &self.himos {
             if hs.delta_needs_rebuild() { hs.rebuild_cylinder(); }
@@ -2644,8 +2670,9 @@ impl Engine {
     /// WAL が有効な場合: tie_async は WAL append (memcpy) → WriteQueue push の順で実行する。
     /// WAL append は `.wal` ファイルに memcpy 1 回、100ns オーダー。hot path で fsync しない。
     #[cfg(feature = "v27")]
-    pub fn tie_async(&self, eid: u32, himo: &str, value: u32) {
+    pub fn tie_async(&self, eid: crate::EntityId, himo: &str, value: u32) {
         use std::sync::atomic::Ordering;
+        let eid = crate::eid_local(eid);
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
@@ -2660,8 +2687,9 @@ impl Engine {
 
     /// 非同期 untie。
     #[cfg(feature = "v27")]
-    pub fn untie_async(&self, eid: u32, himo: &str) {
+    pub fn untie_async(&self, eid: crate::EntityId, himo: &str) {
         use std::sync::atomic::Ordering;
+        let eid = crate::eid_local(eid);
         let hid = match self.himo_id(himo) { Some(x) => x, None => return };
         if let Some(wal) = self.wal.as_ref() {
             let _ = wal.append(crate::wal::WalOp::Untie { eid, himo_id: hid as u16 });
@@ -2673,8 +2701,9 @@ impl Engine {
 
     /// 非同期 delete。
     #[cfg(feature = "v27")]
-    pub fn delete_async(&self, eid: u32) {
+    pub fn delete_async(&self, eid: crate::EntityId) {
         use std::sync::atomic::Ordering;
+        let eid = crate::eid_local(eid);
         if let Some(wal) = self.wal.as_ref() {
             let _ = wal.append(crate::wal::WalOp::Delete { eid });
         }
@@ -2686,8 +2715,9 @@ impl Engine {
     /// 非同期 content 書き込み。WAL 有効時はクラッシュ後も復元される。
     /// key と data は Box に move される(消費される)。
     #[cfg(feature = "v27")]
-    pub fn content_async(&self, eid: u32, key: &str, data: &[u8]) {
+    pub fn content_async(&self, eid: crate::EntityId, key: &str, data: &[u8]) {
         use std::sync::atomic::Ordering;
+        let eid = crate::eid_local(eid);
         if let Some(wal) = self.wal.as_ref() {
             let _ = wal.append(crate::wal::WalOp::Content { eid, key, data });
         }
