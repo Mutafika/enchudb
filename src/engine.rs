@@ -355,9 +355,7 @@ impl PairTable {
                 let cell_id = a as usize * pair.card_b as usize + b as usize;
                 if cell_id < pair.cells.len() {
                     let cell = &pair.cells[cell_id];
-                    if cell.is_empty() {
-                        return Some((&[], conds.to_vec()));
-                    }
+                    if cell.is_empty() { continue; }
                     if cell.len() < best_len {
                         best_len = cell.len();
                         let remaining: Vec<(usize, u32)> = conds.iter()
@@ -610,9 +608,7 @@ impl PairTable {
                 let cell_id = a as usize * pair.card_b as usize + b as usize;
                 if cell_id < pair.cells.len() {
                     let cell = pair.cells[cell_id].as_slice();
-                    if cell.is_empty() {
-                        return Some((&[], conds.to_vec()));
-                    }
+                    if cell.is_empty() { continue; }
                     if cell.len() < best_len {
                         best_len = cell.len();
                         let remaining: Vec<(usize, u32)> = conds.iter()

@@ -622,6 +622,49 @@ fn text_and_value_mixed() {
 }
 
 // ─────────────────────────────────────────────────────────
+// 15b. pair table 空セルで query が silent 0件を返すバグの再現
+// ─────────────────────────────────────────────────────────
+#[test]
+fn query_pair_empty_cell_fallback() {
+    let path = db_path("pair_empty_cell");
+    let mut db = Engine::create(&path).unwrap();
+    db.define_himo("type_h", HimoType::Value, 4);
+    db.define_himo("board", HimoType::Value, 64);
+    db.define_himo("author", HimoType::Value, 1000);
+
+    // pair table を構築（この時点でデータなし → 全セル空）
+    db.rebuild();
+    db.rebuild_pairs();
+
+    // データ投入（pair table 構築後）
+    for i in 0..100u32 {
+        let e = db.entity();
+        db.tie(e, "type_h", 1);
+        db.tie(e, "board", 0);
+        db.tie(e, "author", i);
+    }
+    for i in 0..500u32 {
+        let e = db.entity();
+        db.tie(e, "type_h", 2);
+        db.tie(e, "board", 0);
+        db.tie(e, "author", i % 100);
+    }
+    db.rebuild();
+
+    // pull_raw は正常
+    assert_eq!(db.pull_raw("type_h", 1).len(), 100);
+
+    // query が 0 件を返してはいけない
+    let result = db.query(&[("type_h", 1), ("board", 0)]);
+    assert_eq!(result.len(), 100, "query must not return empty when data exists");
+
+    let result = db.query(&[("type_h", 1), ("board", 0), ("author", 5)]);
+    assert_eq!(result.len(), 1);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// ─────────────────────────────────────────────────────────
 // 16. sum — 指定 entity 群の紐値を合計
 // ─────────────────────────────────────────────────────────
 #[test]
