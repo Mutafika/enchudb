@@ -153,6 +153,9 @@ const H_HIMOREG_INDEX_CAP: usize = 40;
 const H_HIMOREG_DATA_SIZE: usize = 44; // u64
 const H_CONTENT_DATA_SIZE: usize = 52; // u64
 const H_CYL_MAX_VALUES: usize = 60;
+/// v28: ヘッダ整合性 CRC。[H_MAGIC..H_HEADER_CRC] の CRC32(FNV-1a)。
+/// create/flush/define_himo 時に更新、open 時に検証。
+const H_HEADER_CRC: usize = 64; // u32
 const H_HIMO_TYPES: usize = 256;
 
 // v27: 観測窓(n-tuple 仮想テーブル定義)領域。
@@ -170,6 +173,47 @@ const H_VIEWS_OFF: usize = 2052;
 const VIEW_RECORD_SIZE: usize = 1 + MAX_VIEW_HIMOS * 2;
 
 fn align8(n: usize) -> usize { (n + 7) & !7 }
+
+/// ヘッダ整合性 CRC を計算する対象領域。
+/// magic, version, max_entities, max_himos, himo_count,
+/// vocab_*, himoreg_*, content_data_size, cyl_max_values の固定レイアウト部のみ。
+/// himo_types/max_values 領域は runtime で変動するので CRC 範囲外。
+const HEADER_CRC_END: usize = H_CYL_MAX_VALUES + 4; // = 64
+
+#[inline]
+fn compute_header_crc(buf: &[u8]) -> u32 {
+    // [0..H_HEADER_CRC) 範囲を FNV-1a 32bit。
+    // 固定レイアウトメタデータ(magic, version, max_entities, max_himos, himo_count,
+    // vocab_*, himoreg_*, content_data_size, cyl_max_values)のみを対象。
+    // 再現性デバッグ用。
+    let mut h: u32 = 0x811c9dc5;
+    for &b in &buf[0..H_HEADER_CRC] {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x01000193);
+    }
+    let _dbg = (h, &buf[0..H_HEADER_CRC]);
+    h
+}
+
+#[inline]
+fn write_header_crc(buf: &mut [u8]) {
+    let crc = compute_header_crc(buf);
+    buf[H_HEADER_CRC..H_HEADER_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// ヘッダ CRC を検証。不一致なら Err。
+fn verify_header_crc(buf: &[u8]) -> Result<(), String> {
+    let stored = u32::from_le_bytes(buf[H_HEADER_CRC..H_HEADER_CRC + 4].try_into().unwrap());
+    if stored == 0 { return Ok(()); }
+    let computed = compute_header_crc(buf);
+    if stored != computed {
+        return Err(format!(
+            "header CRC mismatch: stored={:08x}, computed={:08x} — file may be corrupt",
+            stored, computed,
+        ));
+    }
+    Ok(())
+}
 
 fn himo_maxv_base(max_himos: u32) -> usize {
     (H_HIMO_TYPES + max_himos as usize + 3) & !3
@@ -793,6 +837,9 @@ impl Engine {
         mmap[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].copy_from_slice(&(layout.content_data_size as u64).to_le_bytes());
         mmap[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].copy_from_slice(&layout.cyl_max_values.to_le_bytes());
 
+        // v28: ヘッダ整合性 CRC
+        write_header_crc(&mut mmap);
+
         let base = mmap.as_mut_ptr();
 
         let entities = EntitySet::init(
@@ -876,6 +923,8 @@ impl Engine {
                 version, FILE_VERSION
             ));
         }
+        // v28: ヘッダ整合性 CRC 検証(stored == 0 は v27 以前の DB として許容)
+        verify_header_crc(buf)?;
         let max_entities = u32::from_le_bytes(buf[H_MAX_ENTITIES..H_MAX_ENTITIES + 4].try_into().unwrap());
         let max_himos = u32::from_le_bytes(buf[H_MAX_HIMOS..H_MAX_HIMOS + 4].try_into().unwrap());
         let himo_count = u32::from_le_bytes(buf[H_HIMO_COUNT..H_HIMO_COUNT + 4].try_into().unwrap());
@@ -2092,6 +2141,8 @@ impl Engine {
         self.backing.as_slice_mut()[mv_off..mv_off + 4].copy_from_slice(&max_values.to_le_bytes());
         let himo_count = (hid + 1) as u32;
         self.backing.as_slice_mut()[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&himo_count.to_le_bytes());
+        // v28: header CRC を再計算(himo_count が変わったため)
+        write_header_crc(self.backing.as_slice_mut());
 
         // v27: 新 himo と既存 himo のペアを空セルで登録。以降 tie で自動更新。
         #[cfg(feature = "v27")]
@@ -2264,13 +2315,16 @@ impl Engine {
                         apply_count_for_thread.fetch_add(1, Ordering::Release);
                     }
 
-                    // 背景 fsync: WAL が有効で、前回 fsync から fsync_interval 経過 ＆
-                    // head が checkpoint より進んでいる時だけ実行
+                    // 背景 fsync: WAL 有効 & 前回から fsync_interval 経過 &
+                    // head が checkpoint より進んでいる時のみ実行。
+                    // 順序厳守: auto-Commit → WAL fsync → body msync → checkpoint 前進。
                     if let Some(wal) = wal_for_thread.as_ref() {
                         if last_fsync.elapsed() >= fsync_interval {
-                            let head = wal.head();
-                            if head > wal.checkpoint() {
+                            if wal.head() > wal.checkpoint() {
+                                let _ = wal.append(crate::wal::WalOp::Commit);
                                 let _ = wal.fsync();
+                                let _ = engine.body_msync();
+                                let head = wal.head();
                                 wal.advance_checkpoint(head);
                                 let lsn = wal.next_lsn().saturating_sub(1);
                                 durable_lsn_for_thread.store(lsn, Ordering::Release);
@@ -2284,9 +2338,11 @@ impl Engine {
                             engine.apply_op(op);
                             apply_count_for_thread.fetch_add(1, Ordering::Release);
                         }
-                        // shutdown 時の最終 fsync
+                        // shutdown 時の最終 Commit + 順序付き同期
                         if let Some(wal) = wal_for_thread.as_ref() {
+                            let _ = wal.append(crate::wal::WalOp::Commit);
                             let _ = wal.fsync();
+                            let _ = engine.body_msync();
                             wal.advance_checkpoint(wal.head());
                         }
                         return;
@@ -2303,13 +2359,29 @@ impl Engine {
         arc
     }
 
-    /// 強制同期: WAL を fsync + checkpoint 前進。Sync mode 相当の待ち。
+    /// body mmap の msync(WAL 順序と絡むので &self で呼び出し可能)。
+    #[cfg(all(feature = "v27", not(target_arch = "wasm32")))]
+    pub fn body_msync(&self) -> io::Result<()> {
+        match &self.backing {
+            Backing::Mmap(m) => m.flush(),
+            Backing::Memory(_) => Ok(()),
+        }
+    }
+
+    #[cfg(all(feature = "v27", target_arch = "wasm32"))]
+    pub fn body_msync(&self) -> io::Result<()> { Ok(()) }
+
+    /// 強制同期: Commit marker 挿入 → WAL fsync → body msync → checkpoint 前進。
+    /// Sync mode 相当の待ち。
     #[cfg(feature = "v27")]
     pub fn wal_sync(&self) -> io::Result<()> {
         use std::sync::atomic::Ordering;
         self.flush_writes();
         if let Some(wal) = self.wal.as_ref() {
+            // 順序厳守: Commit → WAL fsync → body msync → checkpoint
+            let _ = wal.append(crate::wal::WalOp::Commit);
             wal.fsync()?;
+            self.body_msync()?;
             let head = wal.head();
             wal.advance_checkpoint(head);
             let lsn = wal.next_lsn().saturating_sub(1);
@@ -2355,6 +2427,9 @@ impl Engine {
                     }
                 }
                 self.entities.free(eid);
+            }
+            Op::Content { eid, key, data } => {
+                self.contents.set(eid, &key, &data);
             }
         }
     }
@@ -2402,6 +2477,23 @@ impl Engine {
         }
         let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
         q.push(crate::write_queue::Op::Delete { eid });
+        self.push_count.fetch_add(1, Ordering::Release);
+    }
+
+    /// 非同期 content 書き込み。WAL 有効時はクラッシュ後も復元される。
+    /// key と data は Box に move される(消費される)。
+    #[cfg(feature = "v27")]
+    pub fn content_async(&self, eid: u32, key: &str, data: &[u8]) {
+        use std::sync::atomic::Ordering;
+        if let Some(wal) = self.wal.as_ref() {
+            let _ = wal.append(crate::wal::WalOp::Content { eid, key, data });
+        }
+        let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
+        q.push(crate::write_queue::Op::Content {
+            eid,
+            key: key.to_string().into_boxed_str(),
+            data: data.to_vec().into_boxed_slice(),
+        });
         self.push_count.fetch_add(1, Ordering::Release);
     }
 
@@ -2460,6 +2552,8 @@ impl Engine {
             buf[off..off + 4].copy_from_slice(&self.himo_max_values[hid].to_le_bytes());
         }
         buf[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&hc.to_le_bytes());
+        // v28: ヘッダ整合性 CRC(himo_count 含む固定レイアウト部のみを対象)
+        write_header_crc(buf);
 
         self.backing.flush_to_disk()?;
         Ok(())

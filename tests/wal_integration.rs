@@ -140,6 +140,88 @@ fn wal_file_is_created() {
 }
 
 #[test]
+fn content_async_roundtrip() {
+    let path = tmp("content_async");
+    {
+        let mut e = Engine::create_with_capacity(&path, 100).unwrap();
+        e.define_himo("tag", HimoType::Value, 10);
+        e.flush().unwrap();
+    }
+
+    // content_async で書いて、sync して drop
+    {
+        let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
+        let e = eng.entity();
+        eng.tie_async(e, "tag", 3);
+        eng.content_async(e, "memo", b"hello crash");
+        eng.flush_writes();
+        eng.wal_sync().unwrap();
+    }
+
+    // 再 open → content 復元確認
+    let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
+    assert_eq!(eng.get_content(0, "memo"), Some(b"hello crash".as_slice()));
+    drop(eng);
+    cleanup(&path);
+}
+
+#[test]
+fn auto_commit_on_shutdown() {
+    let path = tmp("autocommit");
+    {
+        let mut e = Engine::create_with_capacity(&path, 100).unwrap();
+        e.define_himo("n", HimoType::Value, 100);
+        e.flush().unwrap();
+    }
+
+    // 手動 wal_commit を呼ばずに drop → shutdown path が auto-commit
+    {
+        let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
+        let e = eng.entity();
+        eng.tie_async(e, "n", 42);
+        eng.flush_writes();
+        // ここで wal_commit も wal_sync も呼ばない → drop 時の auto-commit に委ねる
+    }
+
+    // 再 open → n=42 が残っていれば auto-commit が効いた証拠
+    let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
+    assert_eq!(eng.get(0, "n"), Some(42));
+    drop(eng);
+    cleanup(&path);
+}
+
+#[test]
+fn header_crc_detects_corruption() {
+    let path = tmp("crc");
+    {
+        let mut e = Engine::create_with_capacity(&path, 100).unwrap();
+        e.define_himo("x", HimoType::Value, 10);
+        e.flush().unwrap();
+    }
+
+    // ヘッダの H_MAX_ENTITIES を改竄(バイト 8..12)
+    use std::io::{Read, Write, Seek, SeekFrom};
+    use std::fs::OpenOptions;
+    {
+        let mut f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(8)).unwrap();
+        let mut b = [0u8; 1]; f.read_exact(&mut b).unwrap();
+        f.seek(SeekFrom::Current(-1)).unwrap();
+        f.write_all(&[b[0] ^ 0xFF]).unwrap();
+    }
+
+    // open は CRC 不一致で失敗するはず
+    match Engine::open(&path) {
+        Ok(_) => panic!("corrupted header should fail to open"),
+        Err(e) => {
+            let s = format!("{}", e);
+            assert!(s.contains("CRC"), "error should mention CRC: {}", s);
+        }
+    }
+    cleanup(&path);
+}
+
+#[test]
 fn concurrent_writes_with_wal() {
     let path = tmp("concurrent");
     {

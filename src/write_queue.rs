@@ -9,7 +9,7 @@
 use crossbeam_queue::SegQueue;
 
 /// 非同期オペレーション。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Op {
     /// 値の紐づけ。himo_id は事前に解決済み。
     Tie { eid: u32, himo_id: u16, value: u32 },
@@ -17,6 +17,8 @@ pub enum Op {
     Untie { eid: u32, himo_id: u16 },
     /// entity ごと削除。
     Delete { eid: u32 },
+    /// 非索引コンテンツ。WAL に載せるため owned 型で保持。
+    Content { eid: u32, key: Box<str>, data: Box<[u8]> },
 }
 
 pub struct WriteQueue {
