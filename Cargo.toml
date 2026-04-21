@@ -20,3 +20,11 @@ memmap2 = "0.9"
 [dev-dependencies]
 proptest = "1"
 rusqlite = { version = "0.36", features = ["bundled"] }
+sabitori = { path = "../sabitori/crates/sabitori" }
+sabitori-style = { path = "../sabitori/crates/sabitori-style" }
+sabitori-core = { path = "../sabitori/crates/sabitori-core" }
+
+[[example]]
+name = "dist_dashboard"
+path = "examples/dist_dashboard.rs"
+required-features = ["v32"]
