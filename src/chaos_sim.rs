@@ -20,7 +20,8 @@
 
 #![cfg(feature = "chaos")]
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::PeerId;
 
@@ -28,17 +29,36 @@ use crate::PeerId;
 // SimNetwork: メッセージ配送 + 故障注入
 // ─────────────────────────────────────────────────────────────
 
-/// 配送待ち 1 件。
+/// 配送待ち 1 件。BinaryHeap の順序用に seq を持つ。
 struct Envelope<M> {
     from: PeerId,
     to: PeerId,
     msg: M,
     deliver_at: u64,
+    /// 挿入順のタイブレーカー (BinaryHeap で stable に)。
+    seq: u64,
+}
+
+// BinaryHeap は max-heap なので、deliver_at の **小さい方** を優先したい →
+// Ord を逆向きに定義する。seq も同様。
+impl<M> PartialEq for Envelope<M> {
+    fn eq(&self, o: &Self) -> bool { self.deliver_at == o.deliver_at && self.seq == o.seq }
+}
+impl<M> Eq for Envelope<M> {}
+impl<M> PartialOrd for Envelope<M> { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
+impl<M> Ord for Envelope<M> {
+    fn cmp(&self, o: &Self) -> Ordering {
+        // max-heap を min-heap として使うため逆順
+        o.deliver_at.cmp(&self.deliver_at).then_with(|| o.seq.cmp(&self.seq))
+    }
 }
 
 /// 全 peer が共有する transport simulator。
 pub struct SimNetwork<M: Clone> {
-    pending: VecDeque<Envelope<M>>,
+    /// BinaryHeap ベースの priority queue (deliver_at 昇順)。push/pop が O(log n)。
+    pending: BinaryHeap<Envelope<M>>,
+    /// send 順のグローバル seq (BinaryHeap のタイブレーク用)。
+    next_seq: u64,
     tick: u64,
     /// (from, to) で通信不可 (片方向)。heal で除去。
     partitions: HashSet<(PeerId, PeerId)>,
@@ -59,7 +79,8 @@ pub struct SimNetwork<M: Clone> {
 impl<M: Clone> SimNetwork<M> {
     pub fn new(seed: u64) -> Self {
         Self {
-            pending: VecDeque::new(),
+            pending: BinaryHeap::new(),
+            next_seq: 0,
             tick: 0,
             partitions: HashSet::new(),
             crashed: HashSet::new(),
@@ -141,33 +162,33 @@ impl<M: Clone> SimNetwork<M> {
         }
         let effective_max = self.pair_delays.get(&(from, to)).copied().unwrap_or(self.max_delay);
         let delay = if effective_max == 0 { 0 } else { (self.next_rand() * (effective_max as f64 + 1.0)) as u64 };
-        self.pending.push_back(Envelope {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.pending.push(Envelope {
             from, to, msg,
             deliver_at: self.tick + delay,
+            seq,
         });
     }
 
     /// 1 tick 進める。今 tick で配送されるべき msg を返す (peer_to, msg)。
+    /// BinaryHeap から top (最早 deliver_at) を順次 pop、deliver_at > tick で停止。
     pub fn advance(&mut self) -> Vec<(PeerId, M)> {
         self.tick += 1;
         let mut delivered: Vec<(PeerId, M)> = Vec::new();
-        let mut i = 0;
-        while i < self.pending.len() {
-            if self.pending[i].deliver_at <= self.tick {
-                let env = self.pending.remove(i).unwrap();
-                // 配送直前の再チェック: partition installed after send、crash after send
-                if self.partitions.contains(&(env.from, env.to))
-                    || self.crashed.contains(&env.from)
-                    || self.crashed.contains(&env.to)
-                {
-                    self.stat_dropped += 1;
-                    continue;
-                }
-                delivered.push((env.to, env.msg));
-                self.stat_delivered += 1;
-            } else {
-                i += 1;
+        while let Some(top) = self.pending.peek() {
+            if top.deliver_at > self.tick { break; }
+            let env = self.pending.pop().unwrap();
+            // 配送直前の再チェック: partition installed after send、crash after send
+            if self.partitions.contains(&(env.from, env.to))
+                || self.crashed.contains(&env.from)
+                || self.crashed.contains(&env.to)
+            {
+                self.stat_dropped += 1;
+                continue;
             }
+            delivered.push((env.to, env.msg));
+            self.stat_delivered += 1;
         }
         delivered
     }
@@ -724,6 +745,107 @@ mod tests {
         // honest の後続 write も上書きできない (LWW の既知限界)
         a.set("another_honest", 200);
         assert_eq!(a.get(), Some(&"corrupt"), "LWW では Byzantine からのロック解除不可");
+    }
+
+    #[test]
+    fn out_of_order_delivery_preserves_crdt_convergence() {
+        // 同じ (from, to) pair でも delay がランダムなので、後で送った msg が先着する
+        // ケースがある。OR-Set は順序不変なので convergent のはず。
+        let mut net: SimNetwork<OrSet<i32>> = SimNetwork::new(31);
+        net.set_max_delay(10); // 0〜10 tick ランダム遅延
+        let mut peers: Vec<OrSet<i32>> = (1..=2).map(OrSet::new).collect();
+
+        // peer 1 が連続 3 add、各 tick ごとに broadcast
+        for val in 0..3 {
+            peers[0].add(val);
+            let m = peers[0].clone();
+            broadcast(1, m, &mut net, 2);
+        }
+
+        // 20 tick 回す (max_delay=10 なので全 msg 届くはず)
+        for _ in 0..20 {
+            for (to, msg) in net.advance() {
+                peers[(to - 1) as usize].merge(&msg);
+            }
+        }
+
+        // 配送順が時刻順でないことを確認するため、pending 内部が違う順序で発生してるはず
+        // (deliver_at ベース配送で delay ランダムなので前後する)
+        // → それでも peer 2 は peer 1 と同じ集合に収束
+        assert!(all_converged(&peers));
+        assert_eq!(peers[1].len(), 3);
+        for v in 0..3 { assert!(peers[1].contains(&v)); }
+    }
+
+    #[test]
+    fn byzantine_during_partition_does_not_corrupt_honest_majority() {
+        // partition で Byzantine peer (4) が minority 側 (peer 5) と分離、独自に noise を撒く。
+        // majority {1, 2, 3} は影響受けない。heal 後、Byzantine のデータも一応 union に入る
+        // (OR-Set は誰の add でも受け入れる、noise 混じりだが honest data は残る)
+        let mut net: SimNetwork<OrSet<i32>> = SimNetwork::new(41);
+        let mut peers: Vec<OrSet<i32>> = (1..=5).map(OrSet::new).collect();
+
+        // partition: {1,2,3} と {4,5} を分離、peer 4 が Byzantine
+        for a in [1u32, 2, 3] {
+            for b in [4u32, 5] {
+                net.partition(a, b);
+            }
+        }
+
+        // honest majority の write
+        peers[0].add(100);
+        peers[1].add(200);
+        peers[2].add(300);
+
+        // Byzantine (peer 4) が大量 noise
+        for i in 9000..9050 {
+            peers[3].add(i);
+        }
+        // minority honest (peer 5)
+        peers[4].add(500);
+
+        for _ in 0..15 {
+            for i in 0..5 {
+                let m = peers[i as usize].clone();
+                broadcast((i + 1) as u32, m, &mut net, 5);
+            }
+            for (to, msg) in net.advance() {
+                peers[(to - 1) as usize].merge(&msg);
+            }
+        }
+
+        // 分離中: majority は byzantine noise を見てない
+        let maj: HashSet<i32> = peers[0].iter().cloned().collect();
+        assert!(maj.contains(&100));
+        assert!(!maj.contains(&9000));
+        assert_eq!(maj.len(), 3, "majority は 3 つの honest data だけ");
+
+        // heal
+        for a in [1u32, 2, 3] {
+            for b in [4u32, 5] {
+                net.heal(a, b);
+            }
+        }
+        for _ in 0..25 {
+            for i in 0..5 {
+                let m = peers[i as usize].clone();
+                broadcast((i + 1) as u32, m, &mut net, 5);
+            }
+            for (to, msg) in net.advance() {
+                peers[(to - 1) as usize].merge(&msg);
+            }
+        }
+        // heal 後: 全員 convergent、honest data は全部残る、byzantine noise も union で入ってる
+        // (OR-Set は signature 層と分離なので noise を CRDT 層だけじゃ弾けない、上位で検出要)
+        assert!(all_converged(&peers));
+        let fin: HashSet<i32> = peers[0].iter().cloned().collect();
+        assert!(fin.contains(&100));
+        assert!(fin.contains(&200));
+        assert!(fin.contains(&300));
+        assert!(fin.contains(&500));
+        // noise も残る (CRDT は素朴、honest data を消せないのがポイント)
+        assert!(fin.contains(&9000));
+        // 要点: honest data は **絶対に消えない**、noise が混じっても
     }
 
     #[test]
