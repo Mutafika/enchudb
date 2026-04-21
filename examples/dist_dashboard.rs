@@ -180,21 +180,47 @@ mod rqlite {
 #[derive(Clone, Default)]
 struct PeerState {
     label: String,
+    role: String,
     peer_id: u32,
     records: usize,
-    latest_hlc_wall: u64,
-    lag_samples: VecDeque<u64>, // ms、直近 60 秒
-    last_update_at: Option<Instant>,
+    latest_seen: u32,
+    latest_seen_at: Option<Instant>,
+    last_delta_us: u64,     // 直近 1 件の propagation 時間 (マイクロ秒)
+    lag_samples: VecDeque<u64>, // μs で保持
+    is_primary: bool,
+}
+
+#[derive(Clone, Debug)]
+struct EventLine {
+    ts_ms: u64,           // epoch ms
+    kind: EventKind,
+    peer_label: String,
+    write_id: u32,
+    delta_us: Option<u64>, // propagation in μs
+}
+
+#[derive(Clone, Debug)]
+enum EventKind {
+    Publish,   // origin が書いた
+    EnchuSeen, // enchudb replica が見えた
+    RqliteSeen, // rqlite follower が見えた
 }
 
 #[derive(Default)]
 struct ClusterState {
     peers: Vec<PeerState>,          // enchudb peers (origin + 3 replicas)
-    rqlite_peers: Vec<PeerState>,   // rqlite nodes (leader + 2 followers), 空なら未起動
+    rqlite_peers: Vec<PeerState>,   // rqlite nodes (leader + 2 followers)
     rqlite_enabled: bool,
     total_published: usize,
     publish_rate_per_sec: f32,
     started_at: Option<Instant>,
+    events: VecDeque<EventLine>,
+    latest_write_id: u32,
+    // 読み取り QPS 比較 (1 秒毎にバックグラウンドで実測)
+    enchudb_read_qps: u64,
+    enchudb_read_ns_per_op: u64,
+    rqlite_read_qps: u64,
+    rqlite_read_ms_per_op: f64,
 }
 
 // ────────────────────────────────────────────────────────────
@@ -225,58 +251,71 @@ impl DeclarativeApp for Dashboard {
 
         let state = self.state.read().unwrap();
 
+        // origin との遅れ (write 番号 ベース)
+        let latest_write_id = state.latest_write_id;
+
         // ── 各 peer の quadrant 用データ ──
         let mk_quadrant = |ps: &PeerState| -> Element {
-            let role = if ps.peer_id == 1 { "ORIGIN" } else { "REPLICA" };
-            let role_color = if ps.peer_id == 1 { a.bright_green } else { a.bright_cyan };
-            let records_str = format!("{}", ps.records);
-            let hlc_str = format!("{}", ps.latest_hlc_wall);
-            let lag_avg: u64 = if ps.lag_samples.is_empty() {
-                0
+            let role = ps.role.as_str();
+            let role_color = if ps.is_primary { a.bright_green } else { a.bright_cyan };
+            let behind = latest_write_id.saturating_sub(ps.latest_seen);
+            let caught_up = behind == 0 && ps.latest_seen > 0;
+
+            // flash: 直近 400ms 以内に update あったらタイトル色を明るく
+            let flash = ps.latest_seen_at
+                .map(|t| t.elapsed() < Duration::from_millis(400))
+                .unwrap_or(false);
+            let title_color = if flash { a.bright_yellow } else { role_color };
+
+            let seen_str = if ps.latest_seen == 0 { "—".to_string() } else { format!("#{}", ps.latest_seen) };
+            let behind_str = if ps.is_primary {
+                "(origin)".to_string()
+            } else if caught_up {
+                "✓ caught up".to_string()
             } else {
-                ps.lag_samples.iter().sum::<u64>() / ps.lag_samples.len() as u64
+                format!("-{} behind", behind)
             };
-            let lag_str = if ps.peer_id == 1 {
+            let behind_color = if ps.is_primary { t.text_disabled }
+                else if caught_up { a.green }
+                else if behind < 5 { a.yellow }
+                else { a.bright_red };
+
+            let delta_str = if ps.is_primary {
+                "—".to_string()
+            } else if ps.last_delta_us == 0 {
                 "—".to_string()
             } else {
-                format!("{} ms", lag_avg)
+                format!("Δ {}", fmt_duration_us(ps.last_delta_us))
             };
 
-            // sparkline
             let spark = sparkline_string(&ps.lag_samples, 40);
 
             block(&ps.label)
-                .border_color(t.border)
-                .title_color(role_color)
+                .border_color(if flash { a.yellow } else { t.border })
+                .title_color(title_color)
                 .bg(t.surface)
                 .children([
-                    div().flex_col().gap(4.0).children([
+                    div().flex_col().gap(6.0).children([
                         div().flex_row().gap(8.0).children([
-                            text("role").mono().font_size(10.0).color(t.text_disabled).w(Px(64.0)),
-                            text(role).mono().font_size(11.0).color(role_color).bold(),
+                            text(role).mono().font_size(10.0).color(role_color).bold(),
+                            text(&format!("#{}", ps.peer_id)).mono().font_size(10.0).color(t.text_disabled),
                         ]),
-                        div().flex_row().gap(8.0).children([
-                            text("peer_id").mono().font_size(10.0).color(t.text_disabled).w(Px(64.0)),
-                            text(&format!("{}", ps.peer_id)).mono().font_size(11.0).color(t.text_primary),
+                        div().flex_row().gap(8.0).items_center().children([
+                            text("seen").mono().font_size(10.0).color(t.text_disabled),
+                            text(&seen_str).mono().font_size(28.0).bold().color(a.bright_yellow),
                         ]),
+                        text(&behind_str).mono().font_size(11.0).color(behind_color).bold(),
                         div().flex_row().gap(8.0).children([
-                            text("records").mono().font_size(10.0).color(t.text_disabled).w(Px(64.0)),
-                            text(&records_str).mono().font_size(14.0).bold().color(a.bright_yellow),
-                        ]),
-                        div().flex_row().gap(8.0).children([
-                            text("hlc.wall").mono().font_size(10.0).color(t.text_disabled).w(Px(64.0)),
-                            text(&hlc_str).mono().font_size(11.0).color(t.text_secondary),
-                        ]),
-                        div().flex_row().gap(8.0).children([
-                            text("lag").mono().font_size(10.0).color(t.text_disabled).w(Px(64.0)),
-                            text(&lag_str).mono().font_size(11.0).color(
-                                if lag_avg < 20 { a.green }
-                                else if lag_avg < 100 { a.yellow }
+                            text("last propagation").mono().font_size(10.0).color(t.text_disabled),
+                            text(&delta_str).mono().font_size(10.0).color(
+                                if ps.last_delta_us < 1_000 { a.bright_green }
+                                else if ps.last_delta_us < 30_000 { a.green }
+                                else if ps.last_delta_us < 200_000 { a.yellow }
                                 else { a.bright_red }
-                            ),
+                            ).bold(),
                         ]),
                         div().h(Px(4.0)),
-                        text(&spark).mono().font_size(10.0).color(a.cyan.with_alpha(0.8)),
+                        text(&spark).mono().font_size(10.0).color(a.cyan.with_alpha(0.7)),
                     ]),
                 ])
         };
@@ -302,6 +341,14 @@ impl DeclarativeApp for Dashboard {
         let uptime_secs = state.started_at
             .map(|s| s.elapsed().as_secs())
             .unwrap_or(0);
+
+        // event log (最新 40 行)
+        let events: Vec<EventLine> = state.events.iter().rev().take(40).cloned().collect();
+
+        let enchu_qps = state.enchudb_read_qps;
+        let enchu_ns = state.enchudb_read_ns_per_op;
+        let rq_qps = state.rqlite_read_qps;
+        let rq_ms = state.rqlite_read_ms_per_op;
 
         drop(state);
 
@@ -336,46 +383,97 @@ impl DeclarativeApp for Dashboard {
                     ]),
                 hsep(t.border),
 
-                // enchudb section
-                div().flex_col().w_full().shrink(0.0).p_px(8.0).gap(6.0).children([
-                    div().flex_row().items_center().gap(8.0).children([
-                        text("── enchudb cluster").mono().font_size(11.0).color(a.bright_green).bold(),
-                        text("origin + 3 replicas, HTTP pull sync").mono().font_size(10.0).color(t.text_disabled),
-                    ]),
-                    div().flex_col().gap(6.0).children([
-                        div().flex_row().gap(8.0).children([
-                            div().w(Px(enchu_quadrant_w)).h(Px(enchu_quadrant_h)).children([mk_quadrant(&p0)]),
-                            div().w(Px(enchu_quadrant_w)).h(Px(enchu_quadrant_h)).children([mk_quadrant(&p1)]),
-                        ]),
-                        div().flex_row().gap(8.0).children([
-                            div().w(Px(enchu_quadrant_w)).h(Px(enchu_quadrant_h)).children([mk_quadrant(&p2)]),
-                            div().w(Px(enchu_quadrant_w)).h(Px(enchu_quadrant_h)).children([mk_quadrant(&p3)]),
-                        ]),
-                    ]),
-                ]),
+                // READ QPS 比較 bar — 本質的な差 (ns 対 ms) を見せる
+                {
+                    let enchu_qps_str = format_qps(enchu_qps);
+                    let rq_qps_str = format_qps(rq_qps);
+                    let enchu_ns_str = if enchu_ns == 0 { "—".to_string() } else { format!("{} ns/op", enchu_ns) };
+                    let rq_ms_str = if rq_ms == 0.0 { "—".to_string() } else { format!("{:.2} ms/op", rq_ms) };
+                    let ratio_str = if rq_qps > 0 && enchu_qps > rq_qps {
+                        let r = enchu_qps / rq_qps;
+                        if r >= 1_000_000 { format!("{}M×", r / 1_000_000) }
+                        else if r >= 1_000 { format!("{}k×", r / 1_000) }
+                        else { format!("{}×", r) }
+                    } else { "—".to_string() };
+
+                    div().w_full().h(Px(64.0)).shrink(0.0)
+                        .bg(Color::from_hex("#0f0f16"))
+                        .flex_row().items_center()
+                        .px_pad(Px(12.0))
+                        .gap(24.0)
+                        .children([
+                            text("READ QPS (single-node replica / follower)").mono().font_size(10.0).color(t.text_disabled).shrink(0.0).w(Px(170.0)),
+                            div().flex_col().gap(2.0).children([
+                                text("enchudb").mono().font_size(10.0).color(a.bright_green).bold(),
+                                text(&enchu_qps_str).mono().font_size(20.0).bold().color(a.bright_green),
+                                text(&enchu_ns_str).mono().font_size(9.0).color(t.text_disabled),
+                            ]),
+                            text("vs").mono().font_size(14.0).color(t.text_disabled),
+                            div().flex_col().gap(2.0).children([
+                                text("rqlite").mono().font_size(10.0).color(a.bright_yellow).bold(),
+                                text(&rq_qps_str).mono().font_size(20.0).bold().color(a.bright_yellow),
+                                text(&rq_ms_str).mono().font_size(9.0).color(t.text_disabled),
+                            ]),
+                            div().flex_1(),
+                            div().flex_col().gap(2.0).items_end().children([
+                                text("enchudb ahead by").mono().font_size(10.0).color(t.text_disabled),
+                                text(&ratio_str).mono().font_size(24.0).bold().color(a.bright_cyan),
+                            ]),
+                        ])
+                },
                 hsep(t.border),
 
-                // rqlite section (enabled なら表示)
-                if rqlite_on {
-                    div().flex_col().w_full().shrink(0.0).p_px(8.0).gap(6.0).children([
+                // main body: 左=クラスタパネル、右=event log
+                div().flex_row().flex_1().w_full().gap(8.0).p_px(8.0).children([
+                    // 左: cluster panels
+                    div().flex_col().flex_1().gap(6.0).children([
+                        // enchudb section
                         div().flex_row().items_center().gap(8.0).children([
-                            text("── rqlite cluster").mono().font_size(11.0).color(a.bright_yellow).bold(),
-                            text("Raft + SQLite, 3 nodes").mono().font_size(10.0).color(t.text_disabled),
+                            text("── enchudb cluster").mono().font_size(11.0).color(a.bright_green).bold(),
+                            text("origin + 3 replicas, HTTP pull sync").mono().font_size(10.0).color(t.text_disabled),
                         ]),
-                        div().flex_row().gap(8.0).children([
-                            div().w(Px(rqlite_card_w)).h(Px(rqlite_card_h)).children([mk_quadrant(&rq0)]),
-                            div().w(Px(rqlite_card_w)).h(Px(rqlite_card_h)).children([mk_quadrant(&rq1)]),
-                            div().w(Px(rqlite_card_w)).h(Px(rqlite_card_h)).children([mk_quadrant(&rq2)]),
+                        div().flex_col().gap(6.0).children([
+                            div().flex_row().gap(8.0).children([
+                                div().flex_1().h(Px(enchu_quadrant_h)).children([mk_quadrant(&p0)]),
+                                div().flex_1().h(Px(enchu_quadrant_h)).children([mk_quadrant(&p1)]),
+                            ]),
+                            div().flex_row().gap(8.0).children([
+                                div().flex_1().h(Px(enchu_quadrant_h)).children([mk_quadrant(&p2)]),
+                                div().flex_1().h(Px(enchu_quadrant_h)).children([mk_quadrant(&p3)]),
+                            ]),
                         ]),
-                    ])
-                } else {
-                    div().flex_col().w_full().shrink(0.0).p_px(8.0).children([
-                        text("rqlite not available (brew install rqlite to enable vs mode)")
-                            .mono().font_size(10.0).color(t.text_disabled),
-                    ])
-                },
 
-                div().flex_1(),
+                        hsep(t.border),
+
+                        if rqlite_on {
+                            div().flex_col().gap(6.0).children([
+                                div().flex_row().items_center().gap(8.0).children([
+                                    text("── rqlite cluster").mono().font_size(11.0).color(a.bright_yellow).bold(),
+                                    text("Raft + SQLite, 3 nodes").mono().font_size(10.0).color(t.text_disabled),
+                                ]),
+                                div().flex_row().gap(8.0).children([
+                                    div().flex_1().h(Px(rqlite_card_h)).children([mk_quadrant(&rq0)]),
+                                    div().flex_1().h(Px(rqlite_card_h)).children([mk_quadrant(&rq1)]),
+                                    div().flex_1().h(Px(rqlite_card_h)).children([mk_quadrant(&rq2)]),
+                                ]),
+                            ])
+                        } else {
+                            div().flex_col().children([
+                                text("rqlite not available (brew install rqlite to enable vs mode)")
+                                    .mono().font_size(10.0).color(t.text_disabled),
+                            ])
+                        },
+                    ]),
+
+                    // 右: event log
+                    div().w(Px(360.0)).flex_col().gap(6.0).children([
+                        text("── live propagation").mono().font_size(11.0).color(t.primary).bold(),
+                        div().flex_1().flex_col().gap(1.0)
+                            .bg(t.surface)
+                            .p_px(6.0)
+                            .children(event_log_rows(t, &events)),
+                    ]),
+                ]),
 
                 // footer
                 hsep(t.border),
@@ -410,6 +508,28 @@ fn inline_stat(t: &Theme, label: &str, value: &str, color: Color) -> Element {
         text(label).mono().font_size(10.0).color(t.text_disabled),
         text(value).mono().font_size(10.0).color(color).bold(),
     ])
+}
+
+fn event_log_rows(t: &Theme, events: &[EventLine]) -> Vec<Element> {
+    let a = &t.ansi;
+    events.iter().map(|e| {
+        let (prefix, color) = match e.kind {
+            EventKind::Publish => ("WRITE  →", a.bright_green),
+            EventKind::EnchuSeen => ("enchu  ←", a.bright_cyan),
+            EventKind::RqliteSeen => ("rqlite ←", a.bright_yellow),
+        };
+        let ms_frac = e.ts_ms % 1000;
+        let secs = (e.ts_ms / 1000) % 60;
+        let mins = (e.ts_ms / 60_000) % 60;
+        let time_str = format!("{:02}:{:02}.{:03}", mins, secs, ms_frac);
+        let delta_str = e.delta_us.map(|d| format!(" +{}", fmt_duration_us(d))).unwrap_or_default();
+        div().flex_row().gap(4.0).h(Px(14.0)).items_center().children([
+            text(&time_str).mono().font_size(9.0).color(t.text_disabled).w(Px(64.0)).shrink(0.0),
+            text(prefix).mono().font_size(9.0).color(color).w(Px(54.0)).shrink(0.0).bold(),
+            text(&e.peer_label).mono().font_size(9.0).color(t.text_primary).w(Px(80.0)).shrink(0.0),
+            text(&format!("#{}{}", e.write_id, delta_str)).mono().font_size(9.0).color(t.text_secondary),
+        ])
+    }).collect()
 }
 
 // ────────────────────────────────────────────────────────────
@@ -482,7 +602,8 @@ fn spawn_cluster(state: Arc<RwLock<ClusterState>>, shutdown: Arc<AtomicBool>) {
                 let syncer = Syncer::new(eng, transport);
                 while !sh.load(Ordering::Acquire) {
                     let _ = syncer.pull_once(1);
-                    std::thread::sleep(Duration::from_millis(100));
+                    // tight pull で propagation を sub-ms に
+                    std::thread::sleep(Duration::from_millis(2));
                 }
             });
             pull_threads.push(t);
@@ -507,34 +628,121 @@ fn spawn_cluster(state: Arc<RwLock<ClusterState>>, shutdown: Arc<AtomicBool>) {
             let mut s = state.write().unwrap();
             s.started_at = Some(Instant::now());
             s.peers = vec![
-                PeerState { label: "peer 1 · origin".to_string(), peer_id: 1, ..Default::default() },
-                PeerState { label: "peer 11 · replica".to_string(), peer_id: 11, ..Default::default() },
-                PeerState { label: "peer 12 · replica".to_string(), peer_id: 12, ..Default::default() },
-                PeerState { label: "peer 13 · replica".to_string(), peer_id: 13, ..Default::default() },
+                PeerState { label: "peer 1 · origin".to_string(), role: "ORIGIN".into(), peer_id: 1, is_primary: true, ..Default::default() },
+                PeerState { label: "peer 11 · replica".to_string(), role: "REPLICA".into(), peer_id: 11, ..Default::default() },
+                PeerState { label: "peer 12 · replica".to_string(), role: "REPLICA".into(), peer_id: 12, ..Default::default() },
+                PeerState { label: "peer 13 · replica".to_string(), role: "REPLICA".into(), peer_id: 13, ..Default::default() },
             ];
             s.rqlite_enabled = rqlite_cluster.is_some();
             if s.rqlite_enabled {
                 s.rqlite_peers = vec![
-                    PeerState { label: "rqlite 1 · leader".to_string(), peer_id: 1, ..Default::default() },
-                    PeerState { label: "rqlite 2 · follower".to_string(), peer_id: 2, ..Default::default() },
-                    PeerState { label: "rqlite 3 · follower".to_string(), peer_id: 3, ..Default::default() },
+                    PeerState { label: "rqlite 1 · leader".to_string(), role: "LEADER".into(), peer_id: 1, is_primary: true, ..Default::default() },
+                    PeerState { label: "rqlite 2 · follower".to_string(), role: "FOLLOWER".into(), peer_id: 2, ..Default::default() },
+                    PeerState { label: "rqlite 3 · follower".to_string(), role: "FOLLOWER".into(), peer_id: 3, ..Default::default() },
                 ];
             }
         }
 
-        // publish loop — 毎 200ms に 1 record
+        // read QPS 計測用のバックグラウンドスレッド:
+        // enchudb replica に get() を叩きまくる + rqlite に HTTP query を叩きまくる
+        // 1 秒毎に ClusterState を更新
+        {
+            let replica_for_bench = replicas[0].clone();
+            let state_for_bench = state.clone();
+            let sh_bench = shutdown.clone();
+            let url_for_bench = url.clone();
+            let rqlite_ports: Option<Vec<u16>> = rqlite_cluster.as_ref()
+                .map(|rc| rc.http_ports.clone());
+            std::thread::spawn(move || {
+                let _ = url_for_bench;
+                let mut last_run = Instant::now();
+                loop {
+                    if sh_bench.load(Ordering::Acquire) { break; }
+                    std::thread::sleep(Duration::from_millis(100));
+                    if last_run.elapsed() < Duration::from_secs(1) { continue; }
+                    last_run = Instant::now();
+
+                    // enchudb read bench: 100k ops
+                    let iters = 100_000u64;
+                    let t0 = Instant::now();
+                    let mut sink: u64 = 0;
+                    let ec = replica_for_bench.entity_count().max(1);
+                    for i in 0..iters {
+                        let eid = enchudb::make_eid(1, (i as u32 % ec) + 1);
+                        if let Some(v) = replica_for_bench.get(eid, "val") {
+                            sink = sink.wrapping_add(v as u64);
+                        }
+                    }
+                    let enchu_elapsed = t0.elapsed();
+                    let enchu_qps = (iters as f64 / enchu_elapsed.as_secs_f64()) as u64;
+                    let enchu_ns = enchu_elapsed.as_nanos() as u64 / iters;
+                    let _ = sink;
+
+                    // rqlite read bench: 50 ops (HTTP + SQL なので遅い)
+                    let (rq_qps, rq_ms) = if let Some(ports) = &rqlite_ports {
+                        let rq_iters = 50u64;
+                        let host = format!("127.0.0.1:{}", ports[1]); // follower を読む
+                        let t0 = Instant::now();
+                        let mut ok = 0u64;
+                        for _ in 0..rq_iters {
+                            if rqlite_http_query(&host, "SELECT value FROM entities WHERE eid = 1").is_ok() {
+                                ok += 1;
+                            }
+                        }
+                        let el = t0.elapsed();
+                        if ok > 0 {
+                            let qps = (ok as f64 / el.as_secs_f64()) as u64;
+                            let per_ms = el.as_secs_f64() * 1000.0 / ok as f64;
+                            (qps, per_ms)
+                        } else {
+                            (0, 0.0)
+                        }
+                    } else {
+                        (0, 0.0)
+                    };
+
+                    let mut s = state_for_bench.write().unwrap();
+                    s.enchudb_read_qps = enchu_qps;
+                    s.enchudb_read_ns_per_op = enchu_ns;
+                    s.rqlite_read_qps = rq_qps;
+                    s.rqlite_read_ms_per_op = rq_ms;
+                }
+            });
+        }
+
+        // publish loop — 50ms に 1 record
         let pub_t = HttpTransport::new(url.clone());
         let himo_id = origin_eng.himo_id("val").unwrap() as u16;
         let mut counter = 0u32;
-        let publish_tick = Duration::from_millis(200);
+        let publish_tick = Duration::from_millis(50);
         let mut last_pub = Instant::now();
-        let mut pending_writes: Vec<(u32, Instant)> = Vec::new(); // (local_id, publish_time)
+        let mut pending_writes: Vec<(u32, Instant)> = Vec::new();
+
+        // rqlite INSERT 用のチャネル分離 (main loop を block しないため)
+        let (rq_tx, rq_rx) = std::sync::mpsc::channel::<u32>();
+        if let Some(_rc) = &rqlite_cluster {
+            let ports = rqlite_cluster.as_ref().unwrap().http_ports.clone();
+            let sh_rq = shutdown.clone();
+            std::thread::spawn(move || {
+                let host = format!("127.0.0.1:{}", ports[0]); // leader
+                while !sh_rq.load(Ordering::Acquire) {
+                    match rq_rx.recv_timeout(Duration::from_millis(200)) {
+                        Ok(local) => {
+                            let sql = format!("INSERT INTO entities (eid, value) VALUES ({}, {})", local, local);
+                            let body = format!("[\"{}\"]", sql.replace('"', "\\\""));
+                            let _ = rqlite_http_post(&host, "/db/execute", &body);
+                        }
+                        Err(_) => {}
+                    }
+                }
+            });
+        }
 
         // state update ループ
         let mut last_count = 0usize;
         let mut last_rate_sample = Instant::now();
         let mut last_rqlite_poll = Instant::now() - Duration::from_secs(5);
-        let rqlite_poll_interval = Duration::from_millis(500);
+        let rqlite_poll_interval = Duration::from_millis(250);
         loop {
             if shutdown.load(Ordering::Acquire) { break; }
 
@@ -547,17 +755,41 @@ fn spawn_cluster(state: Arc<RwLock<ClusterState>>, shutdown: Arc<AtomicBool>) {
                     Hlc { wall, logical: 0, peer: 1 }, 1,
                     DecodedOp::Tie { eid, himo_id, value: local },
                 );
+
+                // 真の end-to-end latency を測るため、publish "開始前" の時刻を記録
+                let t_start = Instant::now();
+                pending_writes.push((local, t_start));
+
                 pub_t.publish(1, vec![rec]);
 
-                // 同じ record を rqlite にも INSERT (比較用)
-                if let Some(rc) = &rqlite_cluster {
-                    let sql = format!("INSERT INTO entities (eid, value) VALUES ({}, {})", local, local);
-                    let _ = rc.execute(&sql);
+                // rqlite INSERT はチャネル経由で別スレッドに fire-and-forget
+                // (main loop を blocking させない → enchudb の真の replication 時間を測れる)
+                if rqlite_cluster.is_some() {
+                    let _ = rq_tx.send(local);
                 }
 
-                pending_writes.push((local, Instant::now()));
                 counter += 1;
                 last_pub = Instant::now();
+
+                // origin WRITE event
+                {
+                    let mut s = state.write().unwrap();
+                    s.latest_write_id = local;
+                    s.peers[0].latest_seen = local;
+                    s.peers[0].latest_seen_at = Some(Instant::now());
+                    if s.rqlite_enabled {
+                        // rqlite leader も write と同時に見えたとみなす (同期 INSERT 済み)
+                        s.rqlite_peers[0].latest_seen = local;
+                        s.rqlite_peers[0].latest_seen_at = Some(Instant::now());
+                    }
+                    push_event(&mut s.events, EventLine {
+                        ts_ms: now_millis(),
+                        kind: EventKind::Publish,
+                        peer_label: "origin".to_string(),
+                        write_id: local,
+                        delta_us: None,
+                    });
+                }
             }
 
             // state 更新 (16ms ≈ 60fps)
@@ -573,24 +805,18 @@ fn spawn_cluster(state: Arc<RwLock<ClusterState>>, shutdown: Arc<AtomicBool>) {
                     last_rate_sample = Instant::now();
                 }
 
-                // origin
                 s.peers[0].records = counter as usize;
-                s.peers[0].latest_hlc_wall = now_millis();
-                s.peers[0].last_update_at = Some(Instant::now());
 
-                // replicas
+                // replicas: まず情報収集して pid 更新、events 更新は後でまとめて
+                let mut new_events: Vec<EventLine> = Vec::new();
                 for (i, r) in replicas.iter().enumerate() {
-                    let pid = &mut s.peers[i + 1];
+                    let pid_prev_seen = s.peers[i + 1].latest_seen;
+                    let peer_id_for_log = s.peers[i + 1].peer_id;
                     let count = r.entity_count() as usize;
-                    pid.records = count;
 
-                    // lag 計算: pending_writes 内で replica がまだ見てない最古の時刻差
-                    // かんたんに: replica が見てる最大 local_id を用いて
-                    // pending から該当 local_id 以上の最古 write を探す
+                    // visible_local を探す
                     let visible_local = {
                         let mut max_local = 0u32;
-                        // replica は origin の local_id を持ってるので、最新を探す
-                        // 簡易: 最後から逆順に get() して最初に Some になるところを探す (1000 件まで)
                         let limit = count.min(1000) as u32;
                         for back in 0..limit {
                             let try_local = counter.saturating_sub(back);
@@ -603,36 +829,55 @@ fn spawn_cluster(state: Arc<RwLock<ClusterState>>, shutdown: Arc<AtomicBool>) {
                         }
                         max_local
                     };
-                    if visible_local > 0 {
-                        // pending から visible_local 以上の最初の未解決を探して lag 計算は諦め、
-                        // 直近 pending で visible より上がどれくらいあるかを lag 代替にする
-                        let unseen = pending_writes.iter()
-                            .filter(|(l, _)| *l > visible_local)
-                            .collect::<Vec<_>>();
-                        let lag_ms = unseen.first()
-                            .map(|(_, t)| t.elapsed().as_millis() as u64)
-                            .unwrap_or(0);
-                        pid.lag_samples.push_back(lag_ms);
-                        if pid.lag_samples.len() > 300 {
-                            pid.lag_samples.pop_front();
-                        }
-                    }
-                    pid.latest_hlc_wall = now_millis().saturating_sub(
-                        pid.lag_samples.back().copied().unwrap_or(0)
-                    );
-                    pid.last_update_at = Some(Instant::now());
-                }
 
-                // pending 掃除: 全 replica に反映済みは捨てる
-                let min_replica_count = replicas.iter()
+                    let pid = &mut s.peers[i + 1];
+                    pid.records = count;
+
+                    if visible_local > pid_prev_seen {
+                        for new_id in (pid_prev_seen + 1)..=visible_local {
+                            if let Some(delta_us) = pending_writes.iter()
+                                .find(|(l, _)| *l == new_id)
+                                .map(|(_, t)| t.elapsed().as_micros() as u64)
+                            {
+                                pid.last_delta_us = delta_us;
+                                pid.lag_samples.push_back(delta_us);
+                                if pid.lag_samples.len() > 300 { pid.lag_samples.pop_front(); }
+                                if i == 0 {
+                                    new_events.push(EventLine {
+                                        ts_ms: now_millis(),
+                                        kind: EventKind::EnchuSeen,
+                                        peer_label: format!("peer {}", peer_id_for_log),
+                                        write_id: new_id,
+                                        delta_us: Some(delta_us),
+                                    });
+                                }
+                            }
+                        }
+                        pid.latest_seen = visible_local;
+                        pid.latest_seen_at = Some(Instant::now());
+                    }
+                }
+                for e in new_events {
+                    s.events.push_back(e);
+                }
+                while s.events.len() > 200 { s.events.pop_front(); }
+
+                // pending 掃除: 全 replica + rqlite node 全てが反映済みなら捨てる
+                let min_enchu = replicas.iter()
                     .map(|r| r.entity_count() as u32)
                     .min()
                     .unwrap_or(0);
-                pending_writes.retain(|(l, _)| *l > min_replica_count);
+                let min_rqlite = if s.rqlite_enabled {
+                    s.rqlite_peers.iter().map(|p| p.latest_seen).min().unwrap_or(0)
+                } else {
+                    u32::MAX // rqlite 無効なら制約なし
+                };
+                let min_all = min_enchu.min(min_rqlite);
+                pending_writes.retain(|(l, _)| *l > min_all);
 
             }
 
-            // rqlite 各 node の count を取る (500ms 間隔、別ブロックで lock 取り直し)
+            // rqlite 各 node の count を取る (250ms 間隔、変化があればイベント発火)
             if let Some(rc) = &rqlite_cluster {
                 if last_rqlite_poll.elapsed() >= rqlite_poll_interval {
                     let mut counts = [0u64; 3];
@@ -643,20 +888,40 @@ fn spawn_cluster(state: Arc<RwLock<ClusterState>>, shutdown: Arc<AtomicBool>) {
                             ok[i] = true;
                         }
                     }
-                    let cur_counter = counter as u64;
-                    let publish_interval_ms = publish_tick.as_millis() as u64;
                     let mut s = state.write().unwrap();
+                    let mut rq_events: Vec<EventLine> = Vec::new();
                     for i in 0..3 {
                         if !ok[i] { continue; }
+                        let prev_seen = s.rqlite_peers[i].latest_seen;
                         let pid = &mut s.rqlite_peers[i];
+                        let new_count = counts[i] as u32;
                         pid.records = counts[i] as usize;
-                        let behind = cur_counter.saturating_sub(counts[i]);
-                        let lag_ms = behind * publish_interval_ms;
-                        pid.lag_samples.push_back(lag_ms);
-                        if pid.lag_samples.len() > 300 { pid.lag_samples.pop_front(); }
-                        pid.latest_hlc_wall = now_millis();
-                        pid.last_update_at = Some(Instant::now());
+
+                        if new_count > prev_seen {
+                            let newest_id = new_count;
+                            let delta_us = pending_writes.iter()
+                                .find(|(l, _)| *l == newest_id)
+                                .map(|(_, t)| t.elapsed().as_micros() as u64)
+                                .unwrap_or(0);
+                            pid.last_delta_us = delta_us;
+                            pid.lag_samples.push_back(delta_us);
+                            if pid.lag_samples.len() > 300 { pid.lag_samples.pop_front(); }
+                            pid.latest_seen = newest_id;
+                            pid.latest_seen_at = Some(Instant::now());
+
+                            if i > 0 {
+                                rq_events.push(EventLine {
+                                    ts_ms: now_millis(),
+                                    kind: EventKind::RqliteSeen,
+                                    peer_label: format!("rqlite {}", i + 1),
+                                    write_id: newest_id,
+                                    delta_us: Some(delta_us),
+                                });
+                            }
+                        }
                     }
+                    for e in rq_events { s.events.push_back(e); }
+                    while s.events.len() > 200 { s.events.pop_front(); }
                     last_rqlite_poll = Instant::now();
                 }
             }
@@ -673,6 +938,65 @@ fn spawn_cluster(state: Arc<RwLock<ClusterState>>, shutdown: Arc<AtomicBool>) {
             }
         }
     });
+}
+
+fn rqlite_http_post(host_port: &str, path: &str, body: &str) -> std::io::Result<()> {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpStream;
+    let addr = host_port.parse().map_err(|_|
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "addr"))?;
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    s.set_read_timeout(Some(Duration::from_secs(5)))?;
+    write!(s,
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        path, host_port, body.len(), body)?;
+    s.flush()?;
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf)?;
+    Ok(())
+}
+
+/// rqlite node に SELECT POST する超簡易クライアント (QPS bench 用)。
+fn rqlite_http_query(host_port: &str, sql: &str) -> std::io::Result<()> {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpStream;
+    let addr = host_port.parse().map_err(|_|
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "addr"))?;
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    s.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let body = format!("[\"{}\"]", sql.replace('"', "\\\""));
+    write!(s,
+        "POST /db/query HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        host_port, body.len(), body)?;
+    s.flush()?;
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf)?;
+    Ok(())
+}
+
+fn push_event(events: &mut VecDeque<EventLine>, e: EventLine) {
+    events.push_back(e);
+    while events.len() > 200 {
+        events.pop_front();
+    }
+}
+
+/// 数値を読みやすい単位で: 1_234_567 → "1.2M", 12_345 → "12.3k"
+fn format_qps(n: u64) -> String {
+    if n == 0 { return "—".to_string(); }
+    if n >= 1_000_000_000 { return format!("{:.1} G/s", n as f64 / 1_000_000_000.0); }
+    if n >= 1_000_000 { return format!("{:.1} M/s", n as f64 / 1_000_000.0); }
+    if n >= 1_000 { return format!("{:.1} k/s", n as f64 / 1_000.0); }
+    format!("{}/s", n)
+}
+
+/// μs 単位の数値を適応的に表示: "850 ns" / "42 μs" / "3.2 ms"
+fn fmt_duration_us(us: u64) -> String {
+    if us == 0 { return "—".to_string(); }
+    if us < 1 { return format!("{} ns", us * 1000); }  // (実質無いパス)
+    if us < 1_000 { return format!("{} μs", us); }
+    if us < 10_000 { return format!("{:.1} ms", us as f64 / 1000.0); }
+    format!("{} ms", us / 1000)
 }
 
 fn now_millis() -> u64 {
