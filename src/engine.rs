@@ -837,6 +837,9 @@ pub struct Engine {
     /// v32 Phase C: ACL(書き込み許可 peer の集合)。Syncer が enforce する。
     #[cfg(feature = "v32")]
     acl: std::sync::Arc<crate::acl::Acl>,
+    /// v32 エッジ用: true なら書き込み API が panic、sync 経由 (remote_*_apply) のみ受ける。
+    #[cfg(feature = "v32")]
+    is_replica: std::sync::atomic::AtomicBool,
     backing: Backing, // 最後に drop されるよう最終フィールド
 }
 
@@ -971,6 +974,8 @@ impl Engine {
             pubkeys: std::sync::Arc::new(crate::keys::PubkeyStore::new()),
             #[cfg(feature = "v32")]
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
+            #[cfg(feature = "v32")]
+            is_replica: std::sync::atomic::AtomicBool::new(false),
             backing: Backing::Mmap(mmap),
         })
     }
@@ -1258,6 +1263,8 @@ impl Engine {
             pubkeys: std::sync::Arc::new(crate::keys::PubkeyStore::new()),
             #[cfg(feature = "v32")]
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
+            #[cfg(feature = "v32")]
+            is_replica: std::sync::atomic::AtomicBool::new(false),
             backing,
         };
 
@@ -1283,9 +1290,61 @@ impl Engine {
         Ok(eng)
     }
 
+    // ──── v32: エッジ向け read-only replica ────
+
+    /// 既存 DB を read-only replica として開く。
+    /// 書き込み API (tie / untie / delete / content / entity 等) は panic する。
+    /// Syncer 経由 (remote_*_apply) での書き込みのみ受け付ける。
+    /// エッジ node はこちらで起動する。
+    #[cfg(feature = "v32")]
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_replica(path: &str) -> io::Result<Self> {
+        let eng = Self::open(path)?;
+        eng.is_replica.store(true, std::sync::atomic::Ordering::Release);
+        Ok(eng)
+    }
+
+    /// WAL + 並行 write queue 付きで replica open。通常の Engine と同じく Arc 共有可能。
+    #[cfg(feature = "v32")]
+    #[cfg(feature = "v27")]
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_concurrent_replica(path: &str, wal_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
+        let eng = Self::open_concurrent_with_wal(path, wal_capacity)?;
+        eng.is_replica.store(true, std::sync::atomic::Ordering::Release);
+        Ok(eng)
+    }
+
+    /// replica モードの動的切替。true にすると書き込み API が panic する。
+    /// false に戻せば通常 DB として書き込み可能に復帰する。
+    #[cfg(feature = "v32")]
+    pub fn set_replica_mode(&self, on: bool) {
+        self.is_replica.store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    /// 現在 replica モードか。
+    #[cfg(feature = "v32")]
+    pub fn is_replica(&self) -> bool {
+        self.is_replica.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// 書き込み API が呼ばれた時の guard。replica なら panic。
+    #[cfg(feature = "v32")]
+    #[inline(always)]
+    fn check_writable(&self) {
+        if self.is_replica.load(std::sync::atomic::Ordering::Acquire) {
+            panic!("Engine is in replica mode; writes must go through Syncer (remote_*_apply)");
+        }
+    }
+
+    /// v32 無効時は no-op。
+    #[cfg(not(feature = "v32"))]
+    #[inline(always)]
+    fn check_writable(&self) {}
+
     // ──── entity ────
 
     pub fn entity(&self) -> crate::EntityId {
+        self.check_writable();
         let local = self.entities.allocate();
         self.undo.record(local, 0xFFFF, &[1, 0, 0, 0]); // entity created
         #[cfg(feature = "v32")]
@@ -1431,6 +1490,7 @@ impl Engine {
     }
 
     pub fn tie_text(&mut self, eid: crate::EntityId, himo: &str, value: &str) {
+        self.check_writable();
         let eid = crate::eid_local(eid);
         let vid = self.vocab.get_or_insert(value.as_bytes());
         let hid = self.ensure_himo(himo, HimoType::Symbol, 0);
@@ -1444,6 +1504,7 @@ impl Engine {
     }
 
     pub fn tie(&mut self, eid: crate::EntityId, himo: &str, value: u32) {
+        self.check_writable();
         let eid = crate::eid_local(eid);
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = self.ensure_himo(himo, HimoType::Value, 0);
@@ -1457,6 +1518,7 @@ impl Engine {
     }
 
     pub fn tie_ref(&mut self, eid: crate::EntityId, himo: &str, target_eid: crate::EntityId) {
+        self.check_writable();
         let eid = crate::eid_local(eid);
         let target_eid = crate::eid_local(target_eid);
         assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
@@ -1475,6 +1537,7 @@ impl Engine {
     /// 定義済みの紐に文字列を張る。&selfで呼べる（Arc共有のまま書き込み可）。
     /// 紐が未定義ならpanic。define_himo を先に呼ぶこと。
     pub fn tie_text_to(&self, eid: crate::EntityId, himo: &str, value: &str) {
+        self.check_writable();
         let eid = crate::eid_local(eid);
         let vid = self.vocab.get_or_insert(value.as_bytes());
         let hid = self.himo_id(himo)
@@ -1490,6 +1553,7 @@ impl Engine {
 
     /// 定義済みの紐にu32値を張る。&selfで呼べる。
     pub fn tie_to(&self, eid: crate::EntityId, himo: &str, value: u32) {
+        self.check_writable();
         let eid = crate::eid_local(eid);
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = self.himo_id(himo)
@@ -1505,6 +1569,7 @@ impl Engine {
 
     /// 定義済みの紐にentity参照を張る。&selfで呼べる。
     pub fn tie_ref_to(&self, eid: crate::EntityId, himo: &str, target_eid: crate::EntityId) {
+        self.check_writable();
         let eid = crate::eid_local(eid);
         let target_eid = crate::eid_local(target_eid);
         assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
@@ -1522,6 +1587,7 @@ impl Engine {
     // ──── untie ────
 
     pub fn untie(&self, eid: crate::EntityId, himo: &str) {
+        self.check_writable();
         let eid = crate::eid_local(eid);
         if let Some(hid) = self.himo_id(himo) {
             self.record_undo(eid, hid);
@@ -1538,6 +1604,7 @@ impl Engine {
     // ──── delete ────
 
     pub fn delete(&self, eid: crate::EntityId) {
+        self.check_writable();
         let eid = crate::eid_local(eid);
         self.undo.record(eid, 0xFFFF, &[2, 0, 0, 0]); // entity deleted
         for hid in 0..self.himos.len() {
@@ -1597,6 +1664,7 @@ impl Engine {
     // ──── content ────
 
     pub fn content(&self, eid: crate::EntityId, key: &str, data: &[u8]) {
+        self.check_writable();
         self.contents.set(crate::eid_local(eid), key, data);
     }
 
@@ -2871,6 +2939,7 @@ impl Engine {
     #[cfg(feature = "v27")]
     pub fn tie_async(&self, eid: crate::EntityId, himo: &str, value: u32) {
         use std::sync::atomic::Ordering;
+        self.check_writable();
         let local = crate::eid_local(eid);
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = self.himo_id(himo)
@@ -2889,6 +2958,7 @@ impl Engine {
     #[cfg(feature = "v27")]
     pub fn untie_async(&self, eid: crate::EntityId, himo: &str) {
         use std::sync::atomic::Ordering;
+        self.check_writable();
         let local = crate::eid_local(eid);
         let hid = match self.himo_id(himo) { Some(x) => x, None => return };
         if let Some(wal) = self.wal.as_ref() {
@@ -2904,6 +2974,7 @@ impl Engine {
     #[cfg(feature = "v27")]
     pub fn delete_async(&self, eid: crate::EntityId) {
         use std::sync::atomic::Ordering;
+        self.check_writable();
         let local = crate::eid_local(eid);
         if let Some(wal) = self.wal.as_ref() {
             let wal_eid = crate::make_eid(wal.peer_id(), local);
@@ -2919,6 +2990,7 @@ impl Engine {
     #[cfg(feature = "v27")]
     pub fn content_async(&self, eid: crate::EntityId, key: &str, data: &[u8]) {
         use std::sync::atomic::Ordering;
+        self.check_writable();
         let local = crate::eid_local(eid);
         if let Some(wal) = self.wal.as_ref() {
             let wal_eid = crate::make_eid(wal.peer_id(), local);

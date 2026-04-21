@@ -35,6 +35,9 @@ pub mod transport;
 #[cfg(feature = "v32")]
 pub mod sync;
 #[cfg(feature = "v32")]
+#[cfg(not(target_arch = "wasm32"))]
+pub mod http_transport;
+#[cfg(feature = "v32")]
 pub mod keys;
 #[cfg(feature = "v32")]
 pub mod acl;
