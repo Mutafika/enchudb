@@ -240,6 +240,7 @@ pub struct Wal {
     /// v32: この Wal を持つ peer の id(header には書かず Engine から設定)。
     peer_id: std::sync::atomic::AtomicU32,
     /// v32 Phase C: ed25519 鍵ペア。set_keypair で設定。None なら署名は zeros。
+    #[cfg(feature = "v32")]
     keypair: std::sync::RwLock<Option<std::sync::Arc<crate::keys::Keypair>>>,
     /// v30: append 中の writer 数。try_reset はこれが 0 のときだけ実行できる。
     pending_writes: std::sync::atomic::AtomicU32,
@@ -277,6 +278,7 @@ impl Wal {
             hlc_logical: std::sync::atomic::AtomicU32::new(0),
             hlc_last_wall: AtomicU64::new(0),
             peer_id: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "v32")]
             keypair: std::sync::RwLock::new(None),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
         })
@@ -314,6 +316,7 @@ impl Wal {
             hlc_logical: std::sync::atomic::AtomicU32::new(0),
             hlc_last_wall: AtomicU64::new(0),
             peer_id: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "v32")]
             keypair: std::sync::RwLock::new(None),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
         })
@@ -325,6 +328,7 @@ impl Wal {
     }
 
     /// Phase C: 署名鍵を設定。None で署名 off(slot は zeros で埋める)。
+    #[cfg(feature = "v32")]
     pub fn set_keypair(&self, kp: Option<std::sync::Arc<crate::keys::Keypair>>) {
         *self.keypair.write().unwrap() = kp;
     }
@@ -410,18 +414,23 @@ impl Wal {
         let crc = fnv1a(&mmap[payload_offset..payload_offset + payload_size]);
 
         // Phase C: 鍵があれば署名。無ければ zeros。
-        let keypair = self.keypair.read().unwrap().clone();
-        let (signature, pubkey_fp) = match keypair {
-            Some(kp) => {
-                let msg = signed_payload(
-                    op_byte, payload_size as u32, lsn, hlc,
-                    author_peer, crc,
-                    &mmap[payload_offset..payload_offset + payload_size],
-                );
-                (kp.sign(&msg), kp.pubkey_fp())
+        #[cfg(feature = "v32")]
+        let (signature, pubkey_fp) = {
+            let keypair = self.keypair.read().unwrap().clone();
+            match keypair {
+                Some(kp) => {
+                    let msg = signed_payload(
+                        op_byte, payload_size as u32, lsn, hlc,
+                        author_peer, crc,
+                        &mmap[payload_offset..payload_offset + payload_size],
+                    );
+                    (kp.sign(&msg), kp.pubkey_fp())
+                }
+                None => (ZERO_SIGNATURE, ZERO_PUBKEY_FP),
             }
-            None => (ZERO_SIGNATURE, ZERO_PUBKEY_FP),
         };
+        #[cfg(not(feature = "v32"))]
+        let (signature, pubkey_fp) = (ZERO_SIGNATURE, ZERO_PUBKEY_FP);
 
         let header = &mut mmap[offset as usize..offset as usize + REC_HEADER_SIZE];
         header[OFF_MAGIC..OFF_MAGIC + 2].copy_from_slice(REC_MAGIC);
@@ -635,6 +644,7 @@ impl Wal {
             hlc_logical: std::sync::atomic::AtomicU32::new(0),
             hlc_last_wall: AtomicU64::new(0),
             peer_id: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "v32")]
             keypair: std::sync::RwLock::new(None),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
         }

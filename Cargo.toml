@@ -32,3 +32,13 @@ sabitori-core = { path = "../sabitori/crates/sabitori-core" }
 name = "dist_dashboard"
 path = "examples/dist_dashboard.rs"
 required-features = ["v32"]
+
+[[bin]]
+name = "enchu_demo"
+path = "src/bin/enchu_demo.rs"
+required-features = ["v32"]
+
+[[bin]]
+name = "bench_distributed"
+path = "src/bin/bench_distributed.rs"
+required-features = ["v32"]
