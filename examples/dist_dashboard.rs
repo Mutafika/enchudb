@@ -33,6 +33,147 @@ mod parking_lot_like {
 }
 
 // ────────────────────────────────────────────────────────────
+// rqlite client module (std::net のみ、3-node subprocess cluster)
+// ────────────────────────────────────────────────────────────
+mod rqlite {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    pub struct Cluster {
+        pub http_ports: Vec<u16>,
+        children: Vec<Child>,
+        data_dirs: Vec<String>,
+    }
+
+    impl Cluster {
+        /// 3 node rqlited を spawn して voter 3 人揃うまで待つ。
+        /// rqlited が PATH に無ければ Err。
+        pub fn start(base_port: u16) -> std::io::Result<Self> {
+            Command::new("rqlited").arg("-version").output()
+                .map_err(|_| std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "rqlited not in PATH",
+                ))?;
+
+            let pid = std::process::id();
+            let mut http_ports = Vec::new();
+            let mut children = Vec::new();
+            let mut data_dirs = Vec::new();
+            for i in 0u32..3 {
+                let http = base_port + (i as u16) * 2;
+                let raft = base_port + (i as u16) * 2 + 1;
+                let nid = i + 1;
+                let data = format!("/tmp/enchu_rqlite_{}_node{}", pid, nid);
+                let _ = std::fs::remove_dir_all(&data);
+                let mut cmd = Command::new("rqlited");
+                cmd.arg("-node-id").arg(nid.to_string())
+                    .arg("-http-addr").arg(format!("127.0.0.1:{}", http))
+                    .arg("-raft-addr").arg(format!("127.0.0.1:{}", raft));
+                if i > 0 {
+                    cmd.arg("-join").arg(format!("127.0.0.1:{}", base_port + 1));
+                }
+                cmd.arg(&data);
+                cmd.stdout(Stdio::null()).stderr(Stdio::null());
+                children.push(cmd.spawn()?);
+                http_ports.push(http);
+                data_dirs.push(data);
+                std::thread::sleep(Duration::from_millis(if i == 0 { 1500 } else { 800 }));
+            }
+            // 全 node 揃うまで待つ
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < deadline {
+                if let Ok(body) = http_get(&format!("127.0.0.1:{}", base_port), "/nodes") {
+                    if body.contains("\"3\":") { break; }
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            Ok(Self { http_ports, children, data_dirs })
+        }
+
+        pub fn execute(&self, sql: &str) -> std::io::Result<String> {
+            let host = format!("127.0.0.1:{}", self.http_ports[0]);
+            let body = format!("[{}]", json_string(sql));
+            http_post(&host, "/db/execute", &body)
+        }
+
+        /// 各 node の count を並行じゃなく順番に取る (UI thread から叩かれる想定なので単純で OK)
+        pub fn count(&self, node_idx: usize, table: &str) -> std::io::Result<u64> {
+            let host = format!("127.0.0.1:{}", self.http_ports[node_idx]);
+            let sql = format!("SELECT COUNT(*) FROM {}", table);
+            let body = format!("[{}]", json_string(&sql));
+            let resp = http_post(&host, "/db/query", &body)?;
+            parse_count(&resp)
+        }
+    }
+
+    impl Drop for Cluster {
+        fn drop(&mut self) {
+            for c in &mut self.children { let _ = c.kill(); }
+            for c in &mut self.children { let _ = c.wait(); }
+            for d in &self.data_dirs { let _ = std::fs::remove_dir_all(d); }
+        }
+    }
+
+    fn http_get(host_port: &str, path: &str) -> std::io::Result<String> {
+        let addr = host_port.parse().map_err(|_|
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "addr"))?;
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+        s.set_read_timeout(Some(Duration::from_secs(2)))?;
+        write!(s, "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, host_port)?;
+        s.flush()?;
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf)?;
+        split_body(String::from_utf8_lossy(&buf).to_string())
+    }
+
+    fn http_post(host_port: &str, path: &str, body: &str) -> std::io::Result<String> {
+        let addr = host_port.parse().map_err(|_|
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "addr"))?;
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+        s.set_read_timeout(Some(Duration::from_secs(2)))?;
+        write!(s,
+            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            path, host_port, body.len(), body)?;
+        s.flush()?;
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf)?;
+        split_body(String::from_utf8_lossy(&buf).to_string())
+    }
+
+    fn split_body(s: String) -> std::io::Result<String> {
+        if let Some(pos) = s.find("\r\n\r\n") { Ok(s[pos+4..].to_string()) } else { Ok(s) }
+    }
+
+    fn json_string(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    fn parse_count(body: &str) -> std::io::Result<u64> {
+        let key = "\"values\":[[";
+        let idx = body.find(key).ok_or_else(||
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "no values"))?;
+        let rest = &body[idx + key.len()..];
+        let end = rest.find(']').ok_or_else(||
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "no ]"))?;
+        rest[..end].trim().parse().map_err(|_|
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "not int"))
+    }
+}
+
+// ────────────────────────────────────────────────────────────
 // Cluster 共有 state
 // ────────────────────────────────────────────────────────────
 
@@ -48,7 +189,9 @@ struct PeerState {
 
 #[derive(Default)]
 struct ClusterState {
-    peers: Vec<PeerState>,
+    peers: Vec<PeerState>,          // enchudb peers (origin + 3 replicas)
+    rqlite_peers: Vec<PeerState>,   // rqlite nodes (leader + 2 followers), 空なら未起動
+    rqlite_enabled: bool,
     total_published: usize,
     publish_rate_per_sec: f32,
     started_at: Option<Instant>,
@@ -138,8 +281,7 @@ impl DeclarativeApp for Dashboard {
                 ])
         };
 
-        let quadrant_w = (ctx.width - 36.0) / 2.0;
-        let quadrant_h = (ctx.height - 120.0) / 2.0;
+        let rqlite_on = state.rqlite_enabled;
 
         let peers = &state.peers;
         let (p0, p1, p2, p3) = (
@@ -149,6 +291,12 @@ impl DeclarativeApp for Dashboard {
             peers.get(3).cloned().unwrap_or_default(),
         );
 
+        let (rq0, rq1, rq2) = (
+            state.rqlite_peers.get(0).cloned().unwrap_or_default(),
+            state.rqlite_peers.get(1).cloned().unwrap_or_default(),
+            state.rqlite_peers.get(2).cloned().unwrap_or_default(),
+        );
+
         let total_published = state.total_published;
         let rate = state.publish_rate_per_sec;
         let uptime_secs = state.started_at
@@ -156,6 +304,14 @@ impl DeclarativeApp for Dashboard {
             .unwrap_or(0);
 
         drop(state);
+
+        // enchudb: top half 4 分割、rqlite: bottom half 3 分割
+        // rqlite 無効なら enchudb が全画面 4 分割
+        let half_h = if rqlite_on { (ctx.height - 150.0) / 2.0 } else { ctx.height - 120.0 };
+        let enchu_quadrant_w = (ctx.width - 36.0) / 2.0;
+        let enchu_quadrant_h = if rqlite_on { (half_h - 40.0) / 2.0 } else { (half_h - 0.0) / 2.0 };
+        let rqlite_card_w = (ctx.width - 44.0) / 3.0;
+        let rqlite_card_h = half_h - 40.0;
 
         div()
             .w(Px(ctx.width)).h(Px(ctx.height))
@@ -180,21 +336,46 @@ impl DeclarativeApp for Dashboard {
                     ]),
                 hsep(t.border),
 
-                // 4 quadrants
-                div().flex_1().w_full()
-                    .flex_col().gap(8.0).p_px(8.0)
-                    .children([
-                        // row 1
+                // enchudb section
+                div().flex_col().w_full().shrink(0.0).p_px(8.0).gap(6.0).children([
+                    div().flex_row().items_center().gap(8.0).children([
+                        text("── enchudb cluster").mono().font_size(11.0).color(a.bright_green).bold(),
+                        text("origin + 3 replicas, HTTP pull sync").mono().font_size(10.0).color(t.text_disabled),
+                    ]),
+                    div().flex_col().gap(6.0).children([
                         div().flex_row().gap(8.0).children([
-                            div().w(Px(quadrant_w)).h(Px(quadrant_h)).children([mk_quadrant(&p0)]),
-                            div().w(Px(quadrant_w)).h(Px(quadrant_h)).children([mk_quadrant(&p1)]),
+                            div().w(Px(enchu_quadrant_w)).h(Px(enchu_quadrant_h)).children([mk_quadrant(&p0)]),
+                            div().w(Px(enchu_quadrant_w)).h(Px(enchu_quadrant_h)).children([mk_quadrant(&p1)]),
                         ]),
-                        // row 2
                         div().flex_row().gap(8.0).children([
-                            div().w(Px(quadrant_w)).h(Px(quadrant_h)).children([mk_quadrant(&p2)]),
-                            div().w(Px(quadrant_w)).h(Px(quadrant_h)).children([mk_quadrant(&p3)]),
+                            div().w(Px(enchu_quadrant_w)).h(Px(enchu_quadrant_h)).children([mk_quadrant(&p2)]),
+                            div().w(Px(enchu_quadrant_w)).h(Px(enchu_quadrant_h)).children([mk_quadrant(&p3)]),
                         ]),
                     ]),
+                ]),
+                hsep(t.border),
+
+                // rqlite section (enabled なら表示)
+                if rqlite_on {
+                    div().flex_col().w_full().shrink(0.0).p_px(8.0).gap(6.0).children([
+                        div().flex_row().items_center().gap(8.0).children([
+                            text("── rqlite cluster").mono().font_size(11.0).color(a.bright_yellow).bold(),
+                            text("Raft + SQLite, 3 nodes").mono().font_size(10.0).color(t.text_disabled),
+                        ]),
+                        div().flex_row().gap(8.0).children([
+                            div().w(Px(rqlite_card_w)).h(Px(rqlite_card_h)).children([mk_quadrant(&rq0)]),
+                            div().w(Px(rqlite_card_w)).h(Px(rqlite_card_h)).children([mk_quadrant(&rq1)]),
+                            div().w(Px(rqlite_card_w)).h(Px(rqlite_card_h)).children([mk_quadrant(&rq2)]),
+                        ]),
+                    ])
+                } else {
+                    div().flex_col().w_full().shrink(0.0).p_px(8.0).children([
+                        text("rqlite not available (brew install rqlite to enable vs mode)")
+                            .mono().font_size(10.0).color(t.text_disabled),
+                    ])
+                },
+
+                div().flex_1(),
 
                 // footer
                 hsep(t.border),
@@ -307,6 +488,20 @@ fn spawn_cluster(state: Arc<RwLock<ClusterState>>, shutdown: Arc<AtomicBool>) {
             pull_threads.push(t);
         }
 
+        // rqlite cluster 起動試行
+        let rqlite_cluster: Option<rqlite::Cluster> = match rqlite::Cluster::start(14401) {
+            Ok(c) => {
+                eprintln!("[rqlite] 3-node cluster up");
+                // CREATE TABLE を leader に投げる
+                let _ = c.execute("CREATE TABLE IF NOT EXISTS entities (eid INTEGER PRIMARY KEY, value INTEGER)");
+                Some(c)
+            }
+            Err(e) => {
+                eprintln!("[rqlite] not available: {} — enchudb only mode", e);
+                None
+            }
+        };
+
         // 初期 state
         {
             let mut s = state.write().unwrap();
@@ -317,6 +512,14 @@ fn spawn_cluster(state: Arc<RwLock<ClusterState>>, shutdown: Arc<AtomicBool>) {
                 PeerState { label: "peer 12 · replica".to_string(), peer_id: 12, ..Default::default() },
                 PeerState { label: "peer 13 · replica".to_string(), peer_id: 13, ..Default::default() },
             ];
+            s.rqlite_enabled = rqlite_cluster.is_some();
+            if s.rqlite_enabled {
+                s.rqlite_peers = vec![
+                    PeerState { label: "rqlite 1 · leader".to_string(), peer_id: 1, ..Default::default() },
+                    PeerState { label: "rqlite 2 · follower".to_string(), peer_id: 2, ..Default::default() },
+                    PeerState { label: "rqlite 3 · follower".to_string(), peer_id: 3, ..Default::default() },
+                ];
+            }
         }
 
         // publish loop — 毎 200ms に 1 record
@@ -330,6 +533,8 @@ fn spawn_cluster(state: Arc<RwLock<ClusterState>>, shutdown: Arc<AtomicBool>) {
         // state update ループ
         let mut last_count = 0usize;
         let mut last_rate_sample = Instant::now();
+        let mut last_rqlite_poll = Instant::now() - Duration::from_secs(5);
+        let rqlite_poll_interval = Duration::from_millis(500);
         loop {
             if shutdown.load(Ordering::Acquire) { break; }
 
@@ -343,6 +548,13 @@ fn spawn_cluster(state: Arc<RwLock<ClusterState>>, shutdown: Arc<AtomicBool>) {
                     DecodedOp::Tie { eid, himo_id, value: local },
                 );
                 pub_t.publish(1, vec![rec]);
+
+                // 同じ record を rqlite にも INSERT (比較用)
+                if let Some(rc) = &rqlite_cluster {
+                    let sql = format!("INSERT INTO entities (eid, value) VALUES ({}, {})", local, local);
+                    let _ = rc.execute(&sql);
+                }
+
                 pending_writes.push((local, Instant::now()));
                 counter += 1;
                 last_pub = Instant::now();
@@ -417,6 +629,36 @@ fn spawn_cluster(state: Arc<RwLock<ClusterState>>, shutdown: Arc<AtomicBool>) {
                     .min()
                     .unwrap_or(0);
                 pending_writes.retain(|(l, _)| *l > min_replica_count);
+
+            }
+
+            // rqlite 各 node の count を取る (500ms 間隔、別ブロックで lock 取り直し)
+            if let Some(rc) = &rqlite_cluster {
+                if last_rqlite_poll.elapsed() >= rqlite_poll_interval {
+                    let mut counts = [0u64; 3];
+                    let mut ok = [false; 3];
+                    for i in 0..3 {
+                        if let Ok(cnt) = rc.count(i, "entities") {
+                            counts[i] = cnt;
+                            ok[i] = true;
+                        }
+                    }
+                    let cur_counter = counter as u64;
+                    let publish_interval_ms = publish_tick.as_millis() as u64;
+                    let mut s = state.write().unwrap();
+                    for i in 0..3 {
+                        if !ok[i] { continue; }
+                        let pid = &mut s.rqlite_peers[i];
+                        pid.records = counts[i] as usize;
+                        let behind = cur_counter.saturating_sub(counts[i]);
+                        let lag_ms = behind * publish_interval_ms;
+                        pid.lag_samples.push_back(lag_ms);
+                        if pid.lag_samples.len() > 300 { pid.lag_samples.pop_front(); }
+                        pid.latest_hlc_wall = now_millis();
+                        pid.last_update_at = Some(Instant::now());
+                    }
+                    last_rqlite_poll = Instant::now();
+                }
             }
 
             std::thread::sleep(Duration::from_millis(16));
