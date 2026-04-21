@@ -17,8 +17,10 @@
 //! hub.broadcast(peer_id, &records);
 //!
 //! // replica
-//! let _handle = WsPushClient::connect_and_run(
-//!     &format!("ws://{}/push?from=1", hub.addr()),
+//! let _client = WsPushClient::connect_and_run(
+//!     &format!("ws://{}/push", hub.addr()),
+//!     1,                  // from peer
+//!     enchudb::Hlc::ZERO, // since
 //!     |rec| { println!("got record hlc={:?}", rec.hlc); },
 //! )?;
 //! ```

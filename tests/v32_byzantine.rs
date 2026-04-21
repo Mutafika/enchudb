@@ -115,15 +115,9 @@ fn future_hlc_attack_dominates_lww_known_limitation() {
     // 悪意 peer が HLC.wall=u64::MAX を送ると以降 peer 2 から来る正当な write が全部 LWW で棄却される。
     // これは LWW の根本的制約。防御するには HLC の reasonable upper bound check が要る (Phase D+)。
     // このテストは "この攻撃が効く" ことを記録し、将来 defender を入れた時の regression guard にする。
-    let pa = tmp("future_a");
+    // (署名要求は無いシナリオ。署名有りでも、正規 peer の鍵が漏れた場合に同じ攻撃が成立する。)
     let pb = tmp("future_b");
-    let eng_a = make_peer_with_wal(&pa, 1);
     let eng_b = make_peer(&pb, 2);
-
-    let kp_a = Arc::new(Keypair::generate());
-    eng_a.set_keypair(Some(kp_a.clone()));
-    eng_b.pubkeys().force_register(1, &kp_a.public_bytes());
-
     let transport = Arc::new(InMemoryTransport::new());
 
     // 悪意 peer 1 が HLC=MAX で偽書き込み (署名無しで OK — signature 要求無しのシナリオ)
@@ -156,10 +150,7 @@ fn future_hlc_attack_dominates_lww_known_limitation() {
     assert_eq!(out2.applied, 0, "honest write skipped (LWW: wall=100 < MAX) + future-HLC record also already applied");
     assert_eq!(eng_b.get(eid, "val"), Some(999), "malicious value stuck");
 
-    cleanup(&pa);
     cleanup(&pb);
-    // 備考: require_signature = true + ACL で impersonator を弾けば、正規 peer がこの攻撃を
-    // "うっかり自分で" やらない限り発生しない。TOFU 下で peer 1 の鍵を握る attacker だけの問題。
 }
 
 // ─────────────────────────────────────────────────────────────

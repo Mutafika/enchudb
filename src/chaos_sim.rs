@@ -20,7 +20,7 @@
 
 #![cfg(feature = "chaos")]
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
 use crate::PeerId;
 
@@ -132,10 +132,11 @@ impl<M: Clone> SimNetwork<M> {
     /// 配送待ちメッセージ数。
     pub fn pending_count(&self) -> usize { self.pending.len() }
 
-    /// LCG ベースの疑似乱数 (0.0〜1.0)。
+    /// LCG ベースの疑似乱数 (0.0〜1.0)。mantissa 53bit 幅に入れる。
     fn next_rand(&mut self) -> f64 {
         self.rng_state = self.rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        (self.rng_state as f64 / u64::MAX as f64).abs()
+        // top 53bit を使う (f64 mantissa に収まる)
+        ((self.rng_state >> 11) as f64) / ((1u64 << 53) as f64)
     }
 }
 

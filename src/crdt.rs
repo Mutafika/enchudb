@@ -191,19 +191,19 @@ impl<T: Eq + Hash + Clone> OrSet<T> {
     }
 
     pub fn merge(&mut self, other: &OrSet<T>) {
-        // adds: tag 単位で union、ただし tombstone 入りは除外
+        // tombstones: まず union (後の add フィルタでも使う)
+        for t in &other.tombstones { self.tombstones.insert(*t); }
+        // adds: tag 単位で union、tombstoned なものは除外
         for (item, other_tags) in &other.adds {
             let entry = self.adds.entry(item.clone()).or_insert_with(HashSet::new);
             for t in other_tags {
-                if !self.tombstones.contains(t) && !other.tombstones.contains(t) {
+                if !self.tombstones.contains(t) {
                     entry.insert(*t);
                 }
             }
             if entry.is_empty() { self.adds.remove(item); }
         }
-        // tombstones: union
-        for t in &other.tombstones { self.tombstones.insert(*t); }
-        // 既存 adds から tombstoned な tag を除去
+        // 自分側の既存 adds からも tombstoned な tag を除く (other.tombstones が新たに入ったため)
         self.adds.retain(|_, tags| {
             tags.retain(|t| !self.tombstones.contains(t));
             !tags.is_empty()
