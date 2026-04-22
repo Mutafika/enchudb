@@ -232,7 +232,7 @@ pull_raw / query / get / Ravn.follow / reverse_follow / bfs
 ```
 
 **耐久性レイヤ**:
-- WAL(線形 mmap、CRC32 per record、ring buffer reset で長期運用可)
+- WAL(線形 mmap、CRC32 per record。ring buffer reset は v32 で `auto_reset` flag が default off、`Wal::set_auto_reset(true)` で opt-in)
 - header CRC(open 時自動検証)
 - region CRC(`seal_integrity()` で opt-in、コールド検証)
 - file size 検証(truncate → SIGBUS 防止)
@@ -287,17 +287,124 @@ db.seal_integrity()?;  // flush + *.crc sidecar 生成(全 region CRC)
 
 **注意**: `.crc` は `open_concurrent_with_wal` で自動削除される(WAL 活動後 stale になるため)。WAL モードで使っている間は `seal_integrity` は無意味。**コールド状態の封緘**にのみ使う。
 
+## v32: 分散 (HLC + 署名 + LWW)
+
+```rust
+// 1) peer ID + 鍵ペア
+eng.set_peer_id(1);
+let kp = std::sync::Arc::new(enchudb::keys::Keypair::generate());
+eng.set_keypair(Some(kp.clone()));   // WAL append 時に ed25519 署名
+
+// 2) 他 peer の pubkey を TOFU 登録
+eng.pubkeys().force_register(2, &peer2_pub_bytes);
+
+// 3) ACL(オプション、未定義なら全員通す)
+eng.acl().add_writer(1);
+eng.acl().add_writer(2);
+
+// 4) Syncer + Transport で 2 peer 間 sync
+use std::sync::Arc;
+use enchudb::sync::Syncer;
+use enchudb::transport::{InMemoryTransport, Transport};
+let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
+let syncer = Syncer::new(eng_a.clone(), transport.clone());
+syncer.set_require_signature(true);  // 未署名 / verify 失敗 op を reject
+
+// publish: 自 peer の commit 済み op を transport に流す
+syncer.publish_since(enchudb::Hlc::ZERO);
+
+// pull: 他 peer の op を取得 + LWW で apply
+let out = syncer.pull_once(2);
+// out.{received, applied, skipped, rejected_signature, rejected_acl}
+```
+
+**EntityId の構造**: `u64 = [peer_id: 32bit][local_id: 32bit]`。`make_eid(peer, local)` / `eid_peer(eid)` / `eid_local(eid)`。単独 peer 運用は `peer_id = 0`。
+
+**HLC**: `(wall: u64, logical: u32, peer: u32)` 辞書順全順序。`HlcStore` が `(eid, himo_id) -> Hlc` を保持して LWW 判定。
+
+**LWW 規則**: 受信 op の HLC が `HlcStore` 既存より厳密に大きい → apply。等しい/小さい → skip。Delete は entity 全 himo に波及(sentinel `himo_id = u16::MAX`)。
+
+**Transport は別 crate**: HTTP/WS 実装は `enchu-transport` に分離。`Transport` trait と wire format(`encode_batch` / `decode_batch`)は `enchudb::transport` に残る。
+
+```toml
+[dev-dependencies]
+enchu-transport = { path = "../enchu-transport" }
+```
+
+```rust
+use enchu_transport::http::{HttpRelay, HttpTransport};
+let relay = HttpRelay::start("127.0.0.1:0").unwrap();
+let client = HttpTransport::new(format!("http://{}", relay.addr()));
+// client は Transport を実装、Syncer に渡せる
+```
+
+## v32: BlobStore (大 blob 外出し)
+
+`content()` は単一 DB ファイル内に bytes を埋めるので 512MB/blob 上限。
+画像/動画/モデル等は `BlobStore` に逃がして、紐の値 = `BlobId`(sha-256、32B) で参照する。
+
+```rust
+use enchudb::blob_store::{BlobStore, LocalBlobStore};
+let store = std::sync::Arc::new(LocalBlobStore::new("/var/enchu/blobs")?);
+eng.set_blob_store(Some(store.clone()));
+
+// 直接使う
+let id = store.put(image_bytes)?;        // sha-256 で content-addressed
+let bytes = store.get(&id)?;             // Some(Vec<u8>) or None
+assert!(store.exists(&id));
+store.delete(&id)?;
+
+// Engine 経由
+let id = eng.put_blob(image_bytes)?;
+let bytes = eng.get_blob(&id)?;
+
+// id を紐の値として保存(BlobId.to_hex() を Vocabulary に乗せる等、運用次第)
+```
+
+**特性**:
+- content-addressed: 同 hash = 同ファイル、自動 dedup
+- atomic write: tmp + rename
+- 読み取り時に sha-256 再計算で破損検知(`HashMismatch`)
+- レイアウト: `<root>/ab/cd/ef0123...<60 hex>`
+- 並行 r/w 安全(Arc<dyn BlobStore>)
+
+## v32 Phase E/F: snapshot + 監査
+
+```rust
+// snapshot: main DB + .wal + .crc を別パスにコピー(全部 atomic に取れる)
+let files = eng.snapshot_export("/backup/snap.db")?;
+// files.{main, wal: Option<String>, crc: Option<String>}
+
+// snapshot 取得前に必ず flush() or wal_sync() で durable 化すること。
+
+// 監査: WAL の commit 済みレコードを filter
+use enchudb::AuditFilter;
+let recs = eng.audit(&AuditFilter {
+    from_hlc: Some(some_hlc),
+    author_peer: Some(2),
+    pubkey_fp: None,
+    ..Default::default()
+});
+// 各 RecoveredRecord は (lsn, hlc, author_peer, op, signature, pubkey_fp, signed_bytes)
+
+// stats に HLC 情報も載る
+let s = eng.stats();
+// s.{peer_id, hlc_entries, max_hlc, ... 既存 wal_head/checkpoint/durable_lsn など}
+```
+
 ## ファイル構成
 
 ```
 {path}         — メイン DB(mmap)
 {path}.wal     — WAL(v28 有効時のみ、sparse)
 {path}.crc     — region CRC sidecar(seal_integrity 時のみ生成)
+<blob_root>/   — BlobStore(別ディレクトリ、content-addressed)
 ```
 
 ## 制約
 - `tie()` の value は `< u32::MAX`（u32::MAX は sentinel 予約）
-- content data 上限 512MB
+- content data 上限 512MB(超えるなら BlobStore へ)
 - max_himos デフォルト 256
 - max_entities デフォルト 16M（create_with_capacity で変更可）
-- WAL リングバッファは線形。head が容量を超えたら append エラー(v30 でリング化予定)
+- WAL は線形成長(default `auto_reset = false`)。長期運用で容量食いつぶす前に `Wal::set_auto_reset(true)` で ring buffer reset を opt-in する。Sync 系で record を消失させないための既定値変更(v32)。
+- v32 sync は WAL に署名済み record を残す前提。`auto_reset = true` で sync 中の peer がいると未配送 record が消える可能性あり、現状は watermark 未実装
