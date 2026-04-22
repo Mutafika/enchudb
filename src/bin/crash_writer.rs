@@ -7,12 +7,14 @@
 //!   crash_writer <path> <scenario> [count]
 //!
 //! scenarios:
-//!   normal       — 書き込み → wal_sync → 正常終了
-//!   no_commit    — 書き込み → wal_commit せずに exit(0)
-//!   no_sync      — 書き込み → wal_commit → wal_sync せずに exit(0)
-//!   abort_mid    — 半分書いたところで abort()(Drop 走らず)
-//!   loop_writes  — 無限に書き込む(親プロセスが kill する前提)
-//!   sleep_after  — 書き込み + sync → sleep(親が kill する前提、耐久化確認)
+//!   normal              — 書き込み → wal_sync → 正常終了
+//!   no_commit           — 書き込み → wal_commit せずに exit(0)
+//!   no_sync             — 書き込み → wal_commit → wal_sync せずに exit(0)
+//!   abort_mid           — 半分書いたところで abort()(Drop 走らず)
+//!   loop_writes         — 無限に書き込む(親プロセスが kill する前提)
+//!   sleep_after         — 書き込み + sync → sleep(親が kill する前提、耐久化確認)
+//!   v32_signed_loop     — v32 署名付きで無限書き込み(親が kill する前提)。
+//!                         seed 固定の keypair で WAL に署名レコードを残す。
 
 #[cfg(feature = "v27")]
 fn main() {
@@ -105,6 +107,28 @@ fn main() {
             // stdin を閉じるまで sleep(親が kill する)
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+        }
+        #[cfg(feature = "v32")]
+        "v32_signed_loop" => {
+            use enchudb::keys::Keypair;
+            // seed 固定で親が pubkey を事前登録できるようにする
+            let seed = [7u8; 32];
+            let kp = std::sync::Arc::new(Keypair::from_bytes(&seed));
+            eng.set_peer_id(1);
+            eng.set_keypair(Some(kp));
+
+            let mut i = 0u32;
+            loop {
+                let e = eng.entity();
+                eng.tie_async(e, "n", i % 1000);
+                i += 1;
+                if i % 500 == 0 {
+                    eng.flush_writes();
+                    eng.wal_commit();
+                    eng.wal_sync().unwrap();
+                    println!("{}", i);
+                }
             }
         }
         _ => {
