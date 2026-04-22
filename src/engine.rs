@@ -840,6 +840,9 @@ pub struct Engine {
     /// v32 エッジ用: true なら書き込み API が panic、sync 経由 (remote_*_apply) のみ受ける。
     #[cfg(feature = "v32")]
     is_replica: std::sync::atomic::AtomicBool,
+    /// 大容量 blob 用 store(画像/動画/モデル等)。`set_blob_store` で注入。
+    /// 未設定なら `blob_store()` は None を返す。
+    blob_store: std::sync::RwLock<Option<std::sync::Arc<dyn crate::blob_store::BlobStore>>>,
     backing: Backing, // 最後に drop されるよう最終フィールド
 }
 
@@ -976,6 +979,7 @@ impl Engine {
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
             #[cfg(feature = "v32")]
             is_replica: std::sync::atomic::AtomicBool::new(false),
+            blob_store: std::sync::RwLock::new(None),
             backing: Backing::Mmap(mmap),
         })
     }
@@ -1265,6 +1269,7 @@ impl Engine {
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
             #[cfg(feature = "v32")]
             is_replica: std::sync::atomic::AtomicBool::new(false),
+            blob_store: std::sync::RwLock::new(None),
             backing,
         };
 
@@ -1670,6 +1675,40 @@ impl Engine {
 
     pub fn get_content(&self, eid: crate::EntityId, key: &str) -> Option<&[u8]> {
         self.contents.get(crate::eid_local(eid), key)
+    }
+
+    // ──── blob store (大容量バイナリ: 画像/動画/モデル等) ────
+
+    /// 大容量 blob の外部保管を注入する。通常 `LocalBlobStore` を渡す。
+    /// 読み書きは `put_blob`/`get_blob` 経由、または `blob_store()` で直接取得。
+    pub fn set_blob_store(&self, store: std::sync::Arc<dyn crate::blob_store::BlobStore>) {
+        *self.blob_store.write().unwrap() = Some(store);
+    }
+
+    /// 注入済み blob store への Arc を返す。未設定なら None。
+    pub fn blob_store(&self) -> Option<std::sync::Arc<dyn crate::blob_store::BlobStore>> {
+        self.blob_store.read().unwrap().clone()
+    }
+
+    /// blob を書き込んで BlobId(sha-256、32B) を返す。blob store 未設定なら None。
+    pub fn put_blob(
+        &self,
+        data: &[u8],
+    ) -> Option<Result<crate::blob_store::BlobId, crate::blob_store::BlobError>> {
+        self.blob_store().map(|s| s.put(data))
+    }
+
+    /// blob を取得。blob store 未設定なら None、存在しないなら Ok(None)。
+    pub fn get_blob(
+        &self,
+        id: &crate::blob_store::BlobId,
+    ) -> Option<Result<Option<Vec<u8>>, crate::blob_store::BlobError>> {
+        self.blob_store().map(|s| s.get(id))
+    }
+
+    /// blob の存在チェック。blob store 未設定なら false。
+    pub fn blob_exists(&self, id: &crate::blob_store::BlobId) -> bool {
+        self.blob_store().map(|s| s.exists(id)).unwrap_or(false)
     }
 
     // ──── get ────
@@ -4708,6 +4747,107 @@ mod tests {
         assert_eq!(total, 1000);
 
         drop(arc);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    // ──── blob store integration ────
+
+    #[test]
+    fn engine_blob_store_default_none() {
+        let dir = tmp("blob_none");
+        let eng = Engine::create(&dir).unwrap();
+        assert!(eng.blob_store().is_none());
+        assert!(eng.put_blob(b"data").is_none());
+        let fake_id = crate::blob_store::BlobId::from_bytes(b"x");
+        assert!(!eng.blob_exists(&fake_id));
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn engine_blob_store_injected_put_get() {
+        let dir = tmp("blob_inject");
+        let eng = Engine::create(&dir).unwrap();
+        let blob_root = std::env::temp_dir().join(format!(
+            "enchu_blob_inj_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = std::sync::Arc::new(
+            crate::blob_store::LocalBlobStore::new(&blob_root).unwrap(),
+        );
+        eng.set_blob_store(store);
+
+        let data = b"image bytes";
+        let id = eng.put_blob(data).unwrap().unwrap();
+        assert!(eng.blob_exists(&id));
+        let got = eng.get_blob(&id).unwrap().unwrap();
+        assert_eq!(got.as_deref(), Some(&data[..]));
+
+        let _ = std::fs::remove_dir_all(&blob_root);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn engine_blob_store_tie_hash_lookup() {
+        // 実運用パターン: blob の hex を tie_text で紐付けて検索できる
+        let dir = tmp("blob_tie");
+        let mut eng = Engine::create(&dir).unwrap();
+        eng.define_himo("__blob_id", HimoType::Symbol, 0);
+
+        let blob_root = std::env::temp_dir().join(format!(
+            "enchu_blob_tie_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = std::sync::Arc::new(
+            crate::blob_store::LocalBlobStore::new(&blob_root).unwrap(),
+        );
+        eng.set_blob_store(store);
+
+        // 3 entity に 2 種類の blob を配る(1 と 3 が同じ blob)
+        let img_a = b"pixels-A".to_vec();
+        let img_b = b"pixels-B".to_vec();
+        let id_a = eng.put_blob(&img_a).unwrap().unwrap();
+        let id_b = eng.put_blob(&img_b).unwrap().unwrap();
+        assert_ne!(id_a, id_b);
+
+        let e1 = eng.entity();
+        eng.tie_text(e1, "__blob_id", &id_a.to_hex());
+        let e2 = eng.entity();
+        eng.tie_text(e2, "__blob_id", &id_b.to_hex());
+        let e3 = eng.entity();
+        eng.tie_text(e3, "__blob_id", &id_a.to_hex()); // e1 と同じ画像
+
+        eng.rebuild();
+
+        // blob_id で entity 検索
+        let vid = eng.vocab_id(&id_a.to_hex()).unwrap();
+        let mut matches = eng.pull_raw("__blob_id", vid);
+        matches.sort();
+        assert_eq!(matches, vec![e1, e3]);
+
+        // dedup の確認: blob 側のファイル数は 2 個のみ
+        let mut file_count = 0;
+        let mut stack = vec![blob_root.clone()];
+        while let Some(p) = stack.pop() {
+            if let Ok(rd) = std::fs::read_dir(&p) {
+                for ent in rd.flatten() {
+                    let ep = ent.path();
+                    if ep.is_dir() {
+                        stack.push(ep);
+                    } else if ep.is_file() {
+                        file_count += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(file_count, 2);
+
+        let _ = std::fs::remove_dir_all(&blob_root);
         let _ = std::fs::remove_file(&dir);
     }
 }

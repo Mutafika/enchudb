@@ -596,6 +596,7 @@ dependencies = [
  "sabitori",
  "sabitori-core",
  "sabitori-style",
+ "sha2",
  "tungstenite",
 ]
 

@@ -49,6 +49,7 @@ pub mod keys;
 #[cfg(feature = "v32")]
 pub mod acl;
 pub mod integrity;
+pub mod blob_store;
 
 pub use engine::{Engine, EntityValue};
 #[cfg(feature = "v27")]
