@@ -131,7 +131,8 @@ impl Syncer {
     }
 
     /// 受信レコードを LWW で apply する。Phase C: 署名検証 + ACL も通す。
-    fn apply_records(&self, records: &[WireRecord]) -> SyncOutcome {
+    /// WS push client などの外部から呼び出すために public。
+    pub fn apply_records(&self, records: &[WireRecord]) -> SyncOutcome {
         let mut out = SyncOutcome::default();
         let store = self.engine.hlc_store().clone();
         let require_sig = self.require_signature.load(std::sync::atomic::Ordering::Acquire);
