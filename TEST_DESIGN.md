@@ -82,30 +82,47 @@ DB として成立するための **網羅的テスト体系**を設計する。
 
 ---
 
-## 現状カバレッジマトリックス（2026-04-22 時点）
+## 現状カバレッジマトリックス（2026-04-22 P0/P1/P2 完了後）
 
 | カテゴリ | カバー度 | 該当テストファイル |
 |---|---|---|
-| A. 正確性 | 高 | scenarios.rs、edge_cases.rs、lib 内 unit tests |
-| B. 永続性 | 中 | wal_integration.rs、v29_destruction.rs、v29_stress.rs |
-| C. 並行性 | 中 | concurrent_stress.rs、lib 内 `apply_pair_delta` 等 |
-| D. 整合性 | 中 | v29_destruction.rs（CRC / truncate） |
-| E. 分散 | 高（flaky） | v32_two_peer_sync.rs、v32_http_transport.rs、v32_replica_mode.rs、v32_byzantine.rs、crdt_and_chaos.rs |
-| F. 性能 | 低 | examples/ にあるが tests ではない |
-| G. API 網羅 | 中 | ad-hoc、網羅チェック無し |
-| H. セキュリティ | 中 | v32_byzantine.rs |
-| I. プロパティ | 中 | property_based.rs |
-| J. 破壊・回復 | 低 | v29_destruction.rs（破壊のみ、restore 経路弱い）、phase_e_f.rs（snapshot roundtrip） |
+| A. 正確性 | 高 | scenarios.rs、edge_cases.rs、lib 内 unit tests、api_coverage.rs |
+| B. 永続性 | 高 | wal_integration.rs、v29_destruction.rs、v29_stress.rs、v32_crash_recovery.rs |
+| C. 並行性 | 中 | concurrent_stress.rs、blob_store_extended.rs（並行 r/w）、lib 内 `apply_pair_delta` 等 |
+| D. 整合性 | 高 | v29_destruction.rs（CRC / truncate）、blob_store_extended.rs（truncate → HashMismatch） |
+| E. 分散 | 高 | v32_two_peer_sync.rs、v32_http_transport.rs、v32_replica_mode.rs、v32_byzantine.rs（flaky 修正済）、v32_snapshot_restore_sync.rs、crdt_and_chaos.rs |
+| F. 性能 | 中 | benches/core.rs（criterion、baseline 可）、large_scale.rs（#[ignore]、大規模 soak） |
+| G. API 網羅 | 高 | api_coverage.rs（pub fn 95 件 audit 済、漏れ 6 件に最小 test） |
+| H. セキュリティ | 高 | v32_byzantine.rs、v32_crash_recovery.rs（signed WAL 復旧） |
+| I. プロパティ | 高 | property_based.rs、fuzz_like_parsing.rs（WireRecord / WAL の random bytes） |
+| J. 破壊・回復 | 高 | v29_destruction.rs、v32_crash_recovery.rs、v32_snapshot_restore_sync.rs |
+| K. doc | 高 | cargo test --doc で 4 件 pass（lib / acl / blob_store / sync） |
+
+---
+
+## 完了した追加テスト（2026-04-22）
+
+| 項目 | Commit | 成果物 |
+|---|---|---|
+| P0-1 flaky 修正 | 3ba12a2 | src/wal.rs auto_reset flag、Syncer で off、30/30 pass |
+| P0-2 API 網羅 audit | a5f7231 | tests/api_coverage.rs(6 tests)、pub fn 95 件 audit |
+| P0-3 crash/recovery E2E | a38f798 | tests/v32_crash_recovery.rs(2 tests)、crash_writer v32_signed_loop |
+| P1-4 性能 regression | e5e4e53 | benches/core.rs(6 bench)、criterion、baseline 化 |
+| P1-5 BlobStore 拡張 | 35f61ab | tests/blob_store_extended.rs(4 tests)、並行 r/w、readonly、truncate |
+| P1-6 snapshot→restore→sync | 7c44fd5 | tests/v32_snapshot_restore_sync.rs(2 tests)、incremental sync |
+| P2-7 doctest 実行可能化 | ae3a6b1 | 4 doctest 全て runnable、--doc で pass |
+| P2-8 fuzz ライク | 3c5a889 | tests/fuzz_like_parsing.rs(5 tests)、proptest で decode 系 robustness |
+| P2-9 大量データ | 860bc0c | tests/large_scale.rs(3 tests #[ignore])、10M/1M/100k |
 
 ---
 
 ## 既知の問題
 
-### 1. v32_byzantine.rs 並行 flaky（2026-04-22 記録）
-- `cargo test` デフォルト並行で不定失敗
-- `--test-threads=1` / 単独実行で通る
-- 原因未特定。HLC wall-clock 衝突 or InMemoryTransport の状態干渉を疑う
-- 修正は本テスト整備フェーズで対処
+### ~~1. v32_byzantine.rs 並行 flaky~~ → **解決(3ba12a2)**
+根本原因は consumer の `try_reset` が `wal_sync` 直後(head==checkpoint)で
+発火し、`publish_since` 前に WAL を reset していた race。`Wal::auto_reset`
+フラグを default off にし、`Syncer::new` で attach 先を明示的に off に。
+keypair_rotation 単独 30/30、cargo test 全体 10/10 緑。
 
 ### 2. ファイル命名が feature / phase 軸
 - カテゴリ軸でない → 「この種類のテスト全部」を見つけづらい
@@ -113,84 +130,45 @@ DB として成立するための **網羅的テスト体系**を設計する。
 
 ---
 
-## 追加すべきテスト（優先度順）
+## 残タスク（P3）
 
-### P0（必須、次セッション）
-1. **flaky 修正**: v32_byzantine.rs
-   - 失敗レース原因の特定（HLC / tmp / transport state のどれか）
-   - 各テストで真に独立な state を確保
-   - 並行実行で 100 回連続 pass を確認
+優先度低。実案件で必要性が出てから着手。
 
-2. **crash / recovery E2E**: 実プロセス kill 系を強化
-   - SIGKILL 中の tie_async 連続、再起動後 checkpoint 超えを読む
-   - 現状 v29_destruction.rs にあるが v27 限定、v32（WAL + 署名）下での再現が不足
-
-3. **API 網羅 audit**: 公開 API を列挙してテスト有無チェック
-   - `grep -n "pub fn" src/engine.rs | wc -l` と `grep "fn test_" tests/**/*.rs` をクロス照合
-   - 漏れのある API に最小テスト追加
-
-### P1（高、今後 2〜3 セッション）
-4. **性能 regression 検出**
-   - `benches/` を `criterion` で回す（今は examples/）
-   - 主要 op（tie、pull_raw、query、snapshot、audit）の baseline を記録
-   - CI で ±10% 以上の劣化を検出
-
-5. **BlobStore 拡張テスト**
-   - 並行 reader + writer
-   - ディスクフル時の error propagation
-   - 破損検知（HashMismatch）が意図通り
-
-6. **snapshot → restore → sync の全経路**
-   - snapshot_export（origin）→ 別プロセスで open → peer として sync 続行
-   - WAL 位置の整合
-
-### P2（中、余裕あれば）
-7. **ドキュメント例ビルド確認**
-   - `cargo test --doc` を CI で回す
-   - `lib.rs` / `README.md` のコードブロックが全て compile / run 可
-
-8. **fuzz テスト追加**
-   - cargo-fuzz で WAL record parsing を fuzz
-   - content blob の edge size
-
-9. **大量データ tests**
-   - `#[ignore]` 付きで 1 千万 entity のインサート / 検索
-   - 手動実行で回帰検知
+1. **CI gating**: `.github/workflows/test.yml` で criterion の ±10%、
+   `--test --release`、`--doc` を pipeline 化
+2. **真 fuzz**: cargo-fuzz (libFuzzer、nightly 必須) で coverage-guided
+   — 現状は proptest の random bytes で代替
+3. **S3BlobStore**: サーバー配置時に必要。今は Local で十分
+4. **細粒度 ACL**: entity 単位 / himo 単位。Phase D 以降
+5. **多次元距離クエリ**: 範囲 / nearest neighbor、Ravn 側で検討
 
 ---
 
-## CI の推奨設定（未整備、P0 と並行着手可能）
+## CI の推奨設定（P3 で整備）
 
 ```yaml
 # .github/workflows/test.yml (例)
 - name: default build tests
   run: cargo test --lib
 
-- name: v32 tests (single thread)
-  run: cargo test --features v32 -- --test-threads=1
+- name: v32 tests (並行 OK、flaky 修正済)
+  run: cargo test --features v32
 
 - name: doctests
-  run: cargo test --doc
+  run: cargo test --features v32 --doc
 
 - name: integration tests
-  run: cargo test --features v32 --test '*' -- --test-threads=1
+  run: cargo test --features v32 --test '*'
+
+- name: bench regression
+  run: cargo bench --features v32 --bench core -- --baseline main
 ```
 
-`--test-threads=1` は v32_byzantine flaky の暫定対応。flaky 修正後は 4〜8 に戻す。
+`--test-threads=1` は不要(flaky 修正済)。
 
 ---
 
-## 実行計画
+## 次セッション以降の方針
 
-**次セッション着手（この TEST_DESIGN.md を参照しながら）:**
-
-1. v32_byzantine.rs flaky 修正（最優先、CI 信頼性の土台）
-2. API 網羅 audit → 漏れに最小テスト追加
-3. crash / recovery E2E を v32（WAL + 署名付き）で 1〜2 本
-
-P1 以降はそれらが片付いてから。
-
-**想定工数:**
-- P0 1 + 2 + 3: 3〜5 時間
-- P1 全体: 10〜15 時間
-- P2: 余裕時
+本体機能を作り込むフェーズへ。テスト土台は十分整った。
+P0/P1/P2 で加えた harness を壊さずに機能追加していく。
