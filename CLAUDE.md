@@ -368,6 +368,51 @@ let bytes = eng.get_blob(&id)?;
 - レイアウト: `<root>/ab/cd/ef0123...<60 hex>`
 - 並行 r/w 安全(Arc<dyn BlobStore>)
 
+## v32: changefeed (リアルタイム push sync)
+
+WAL に commit が durable 化したタイミングで listener に WireRecord を渡す。
+pull polling 抜きで「engine 触るだけで全 subscriber に流れる」構成が組める。
+
+```rust
+use std::sync::Arc;
+use enchudb::changefeed::ChangeListener;
+use enchudb::transport::WireRecord;
+
+struct MyListener;
+impl ChangeListener for MyListener {
+    fn on_changes(&self, records: &[WireRecord]) {
+        // commit 1 batch 分。HLC 昇順。consumer / wal_sync 呼出スレッドから。
+        // 重い処理はここでブロックせず別スレッドへ forward すること。
+    }
+}
+
+eng.add_change_listener(Arc::new(MyListener));
+// 以降 wal_sync() / consumer の 100ms tick 後に on_changes が呼ばれる
+```
+
+**発火タイミング**:
+- caller の `wal_sync()` 完了時(即時、caller スレッドから)
+- consumer の背景 fsync 完了時(100ms 周期、consumer スレッドから)
+- shutdown(Drop)時の最終 sync
+
+**semantics**:
+- 初回 `add_change_listener` 時に cursor を `wal.head()` に揃える → 過去 commit は流れない
+- HLC 昇順保証
+- at-least-once(crash → restart 跨ぎは `audit(AuditFilter { from_hlc, .. })` で resume)
+
+**典型用途**:
+- WS push hub: `enchu_transport::ws::WsPushHubAdapter` が listener を実装、broadcast に流す
+- metrics: commit 数 / size を集計
+- external replication: 別ストア (PostgreSQL / S3) に shadow
+
+```rust
+// WS push hub に流す例
+use enchu_transport::ws::{WsPushHub, WsPushHubAdapter};
+let hub = Arc::new(WsPushHub::start("0.0.0.0:8080")?);
+eng.add_change_listener(Arc::new(WsPushHubAdapter::new(hub.clone(), 1)));
+// あとは tie_async + wal_commit + wal_sync で全 subscriber に届く
+```
+
 ## v32 Phase E/F: snapshot + 監査
 
 ```rust
