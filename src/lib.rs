@@ -47,7 +47,7 @@ pub mod acl;
 pub mod integrity;
 pub mod blob_store;
 
-pub use engine::{Engine, EntityValue};
+pub use engine::{Engine, EntityValue, SnapshotFiles, AuditFilter};
 #[cfg(feature = "v27")]
 pub use engine::EngineStats;
 pub use himo_store::HimoType;

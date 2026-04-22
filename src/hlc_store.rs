@@ -88,6 +88,13 @@ impl HlcStore {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// 保管中の HLC の最大値(どの peer の write でも可)。空なら None。
+    /// O(n) scan(エントリ数分)。監査・監視用途、hot path では呼ばない。
+    pub fn max_hlc(&self) -> Option<Hlc> {
+        let guard = self.inner.read().unwrap();
+        guard.values().max_by_key(|h| h.cmp_key()).copied()
+    }
 }
 
 #[cfg(test)]

@@ -52,11 +52,38 @@ pub struct EngineStats {
     pub pushed: u64,
     /// consumer が apply した累計
     pub applied: u64,
+    /// v32: 自 peer の peer_id(非 v32 では 0)
+    pub peer_id: u32,
+    /// v32: HlcStore の総エントリ数((eid, himo) で区別、非 v32 では 0)
+    pub hlc_entries: usize,
+    /// v32: HlcStore 内の最大 HLC(LWW 基準の最新書き込み時刻、非 v32 では None)
+    pub max_hlc: Option<crate::Hlc>,
 }
 
 #[cfg(feature = "v27")]
 fn wal_path_for(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{}.wal", path))
+}
+
+/// `snapshot_export` の結果。どのファイルを書き出したか。
+#[derive(Debug, Clone)]
+pub struct SnapshotFiles {
+    pub main: String,
+    pub wal: Option<String>,
+    pub crc: Option<String>,
+}
+
+/// `audit()` に渡すフィルタ条件。None は「そのフィールドで絞らない」。
+#[derive(Debug, Clone, Default)]
+pub struct AuditFilter {
+    /// HLC 下限(inclusive)。これより古い record は除外。
+    pub from_hlc: Option<crate::Hlc>,
+    /// HLC 上限(inclusive)。これより新しい record は除外。
+    pub to_hlc: Option<crate::Hlc>,
+    /// 書き手 peer_id。これ以外の author を除外。
+    pub author_peer: Option<crate::PeerId>,
+    /// 署名者 pubkey の指紋(8B)。一致しない record は除外。
+    pub pubkey_fp: Option<[u8; 8]>,
 }
 
 // ════════════════ バッキングストア ════════════════
@@ -2910,6 +2937,91 @@ impl Engine {
     }
 
     /// v29: エンジン状態の一覧。監視・デバッグ用。
+    // ──── Phase F: 監査 ────
+
+    /// WAL 監査: commit 済みレコードを filter して返す。
+    ///
+    /// WAL が有効でない(`create_concurrent_with_wal` 未使用等)なら空 Vec。
+    /// `AuditFilter::default()` = 全件。
+    ///
+    /// 返る各 `RecoveredRecord` には lsn, hlc, author_peer, op, signature, pubkey_fp が入り、
+    /// 「誰がいつ何を書いたか」をそのまま監査できる。
+    #[cfg(feature = "v27")]
+    pub fn audit(&self, filter: &AuditFilter) -> Vec<crate::wal::RecoveredRecord> {
+        let recs = match self.wal.as_ref() {
+            Some(w) => w.iter_committed(),
+            None => return Vec::new(),
+        };
+        recs.into_iter()
+            .filter(|r| {
+                if let Some(ref from) = filter.from_hlc {
+                    if &r.hlc < from {
+                        return false;
+                    }
+                }
+                if let Some(ref to) = filter.to_hlc {
+                    if &r.hlc > to {
+                        return false;
+                    }
+                }
+                if let Some(author) = filter.author_peer {
+                    if r.author_peer != author {
+                        return false;
+                    }
+                }
+                if let Some(fp) = filter.pubkey_fp {
+                    if r.pubkey_fp != fp {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect()
+    }
+
+    // ──── Phase E: snapshot export ────
+
+    /// 現在の DB を target パスへ snapshot としてコピーする。
+    ///
+    /// コピーする:
+    /// - main DB(`self.path` → `target`)
+    /// - WAL(`self.path.wal` → `target.wal`)(存在時のみ)
+    /// - region CRC sidecar(`self.path.crc` → `target.crc`)(存在時のみ)
+    ///
+    /// **呼び出し前に必ず `wal_sync()` or `flush()` で durable 化すること**。
+    /// mmap 非同期ページが残っていると snapshot に反映されない。
+    ///
+    /// 返り値: コピーしたパス一覧。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn snapshot_export(&self, target: &str) -> io::Result<SnapshotFiles> {
+        // mmap ページを物理ディスクに確実に書き出す(v27 のみ)
+        #[cfg(feature = "v27")]
+        self.body_msync()?;
+
+        let mut files = SnapshotFiles {
+            main: target.to_string(),
+            wal: None,
+            crc: None,
+        };
+        std::fs::copy(&self.path, target)?;
+
+        let wal_src = format!("{}.wal", self.path);
+        if std::path::Path::new(&wal_src).exists() {
+            let wal_dst = format!("{}.wal", target);
+            std::fs::copy(&wal_src, &wal_dst)?;
+            files.wal = Some(wal_dst);
+        }
+
+        let crc_src = format!("{}.crc", self.path);
+        if std::path::Path::new(&crc_src).exists() {
+            let crc_dst = format!("{}.crc", target);
+            std::fs::copy(&crc_src, &crc_dst)?;
+            files.crc = Some(crc_dst);
+        }
+
+        Ok(files)
+    }
+
     #[cfg(feature = "v27")]
     pub fn stats(&self) -> EngineStats {
         use std::sync::atomic::Ordering;
@@ -2917,6 +3029,15 @@ impl Engine {
             Some(w) => (w.head(), w.checkpoint(), w.usage().1, w.next_lsn().saturating_sub(1)),
             None => (0, 0, 0, 0),
         };
+        #[cfg(feature = "v32")]
+        let (peer_id, hlc_entries, max_hlc) = (
+            self.peer_id.load(Ordering::Acquire),
+            self.hlc_store.len(),
+            self.hlc_store.max_hlc(),
+        );
+        #[cfg(not(feature = "v32"))]
+        let (peer_id, hlc_entries, max_hlc) = (0u32, 0usize, None);
+
         EngineStats {
             entity_count: self.entities.count(),
             himo_count: self.himo_types.len() as u32,
@@ -2929,6 +3050,9 @@ impl Engine {
             queue_len: self.write_queue.as_ref().map(|q| q.len()).unwrap_or(0),
             pushed: self.push_count.load(Ordering::Acquire),
             applied: self.apply_count.load(Ordering::Acquire),
+            peer_id,
+            hlc_entries,
+            max_hlc,
         }
     }
 
