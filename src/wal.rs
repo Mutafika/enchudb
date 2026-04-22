@@ -68,7 +68,7 @@ use crate::{Hlc, PeerId};
 
 const FILE_MAGIC: &[u8; 4] = b"EWAL";
 pub const WAL_FILE_VERSION: u32 = 2;
-const HEADER_SIZE: usize = 32;
+pub const HEADER_SIZE: usize = 32;
 
 const REC_MAGIC: &[u8; 2] = b"WL";
 const REC_VERSION: u8 = 2;
@@ -517,6 +517,12 @@ impl Wal {
     /// Syncer.publish_since で使う。ring buffer reset 済みの記録は取れない。
     pub fn iter_committed(&self) -> Vec<RecoveredRecord> {
         self.iter_from_offset(HEADER_SIZE as u64)
+    }
+
+    /// 指定 offset 以降の commit 済みレコードを返す。changefeed の差分発火用。
+    /// `start_offset` は前回 emit 時の `wal.checkpoint()` を渡す想定。
+    pub fn iter_committed_from(&self, start_offset: u64) -> Vec<RecoveredRecord> {
+        self.iter_from_offset(start_offset)
     }
 
     /// リカバリ: checkpoint から head までを読んで、Commit で挟まれたグループだけ返す。

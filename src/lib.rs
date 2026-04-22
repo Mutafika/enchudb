@@ -38,6 +38,8 @@ pub mod hlc_store;
 pub mod transport;
 #[cfg(feature = "v32")]
 pub mod sync;
+#[cfg(feature = "v32")]
+pub mod changefeed;
 // Transport implementations moved to `enchu-transport` crate.
 #[cfg(feature = "v32")]
 pub mod keys;

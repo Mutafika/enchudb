@@ -870,6 +870,14 @@ pub struct Engine {
     /// 大容量 blob 用 store(画像/動画/モデル等)。`set_blob_store` で注入。
     /// 未設定なら `blob_store()` は None を返す。
     blob_store: std::sync::RwLock<Option<std::sync::Arc<dyn crate::blob_store::BlobStore>>>,
+    /// changefeed: WAL に durable 化した record を listener に push する。
+    /// consumer スレッドが背景 fsync 完了後に発火。
+    #[cfg(feature = "v32")]
+    change_listeners: std::sync::Arc<std::sync::RwLock<Vec<std::sync::Arc<dyn crate::changefeed::ChangeListener>>>>,
+    /// changefeed: 次に listener へ emit すべき WAL offset。
+    /// add_change_listener 時に wal.head() に同期され、それ以降の commit のみが流れる。
+    #[cfg(feature = "v32")]
+    change_emit_offset: std::sync::Arc<std::sync::atomic::AtomicU64>,
     backing: Backing, // 最後に drop されるよう最終フィールド
 }
 
@@ -1007,6 +1015,12 @@ impl Engine {
             #[cfg(feature = "v32")]
             is_replica: std::sync::atomic::AtomicBool::new(false),
             blob_store: std::sync::RwLock::new(None),
+            #[cfg(feature = "v32")]
+            change_listeners: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+            #[cfg(feature = "v32")]
+            change_emit_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::wal::HEADER_SIZE as u64,
+            )),
             backing: Backing::Mmap(mmap),
         })
     }
@@ -1297,6 +1311,12 @@ impl Engine {
             #[cfg(feature = "v32")]
             is_replica: std::sync::atomic::AtomicBool::new(false),
             blob_store: std::sync::RwLock::new(None),
+            #[cfg(feature = "v32")]
+            change_listeners: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+            #[cfg(feature = "v32")]
+            change_emit_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::wal::HEADER_SIZE as u64,
+            )),
             backing,
         };
 
@@ -1702,6 +1722,41 @@ impl Engine {
 
     pub fn get_content(&self, eid: crate::EntityId, key: &str) -> Option<&[u8]> {
         self.contents.get(crate::eid_local(eid), key)
+    }
+
+    // ──── changefeed (WAL 変更通知) ────
+
+    /// WAL に durable 化した record を listener に push する。
+    /// consumer スレッドが背景 fsync 完了後に発火、HLC 昇順で渡す。
+    /// 詳細は [`crate::changefeed`] のドキュメント参照。
+    ///
+    /// 初回 listener 追加時に emit cursor を現在の `wal.head()` に揃えるので、
+    /// 過去の commit は流れない(必要なら `audit()` で取得して resume すること)。
+    #[cfg(feature = "v32")]
+    pub fn add_change_listener(
+        &self,
+        listener: std::sync::Arc<dyn crate::changefeed::ChangeListener>,
+    ) {
+        let was_empty = {
+            let mut guard = self.change_listeners.write().unwrap();
+            let was_empty = guard.is_empty();
+            guard.push(listener);
+            was_empty
+        };
+        // 初回登録時は cursor を現在の wal.head() に揃える(過去 record を流さない)
+        if was_empty {
+            #[cfg(feature = "v27")]
+            if let Some(wal) = self.wal.as_ref() {
+                self.change_emit_offset
+                    .store(wal.head(), std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+
+    /// 登録済み listener 数(テスト/監視用)。
+    #[cfg(feature = "v32")]
+    pub fn change_listener_count(&self) -> usize {
+        self.change_listeners.read().unwrap().len()
     }
 
     // ──── blob store (大容量バイナリ: 画像/動画/モデル等) ────
@@ -2804,6 +2859,36 @@ impl Engine {
         Self::spawn_consumer_with_wal(eng, None)
     }
 
+    /// changefeed 内部ヘルパ: WAL から emit_offset 以降の record を取り出して
+    /// 全 listener に渡し、cursor を進める。
+    #[cfg(feature = "v32")]
+    fn fire_change_listeners(
+        wal: &std::sync::Arc<crate::wal::Wal>,
+        listeners: &std::sync::RwLock<
+            Vec<std::sync::Arc<dyn crate::changefeed::ChangeListener>>,
+        >,
+        emit_offset: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        use std::sync::atomic::Ordering;
+        // listener 登録ゼロなら何もしない(cursor は進めない:listener 加入時に
+        // wal.head() に同期する設計なので、ここで進めると先行 record が漏れる)
+        let guard = listeners.read().unwrap();
+        if guard.is_empty() {
+            return;
+        }
+        let start = emit_offset.load(Ordering::Acquire);
+        let recs = wal.iter_committed_from(start);
+        if recs.is_empty() {
+            return;
+        }
+        let wires: Vec<crate::transport::WireRecord> =
+            recs.into_iter().map(|r| r.into()).collect();
+        for listener in guard.iter() {
+            listener.on_changes(&wires);
+        }
+        emit_offset.store(wal.head(), Ordering::Release);
+    }
+
     #[cfg(feature = "v27")]
     fn spawn_consumer_with_wal(
         mut eng: Self,
@@ -2829,6 +2914,10 @@ impl Engine {
         let apply_count_for_thread = arc.apply_count.clone();
         let wal_for_thread = wal.clone();
         let durable_lsn_for_thread = arc.durable_lsn.clone();
+        #[cfg(feature = "v32")]
+        let listeners_for_thread = arc.change_listeners.clone();
+        #[cfg(feature = "v32")]
+        let emit_offset_for_thread = arc.change_emit_offset.clone();
 
         let handle = std::thread::Builder::new()
             .name("enchudb-consumer".into())
@@ -2861,11 +2950,32 @@ impl Engine {
                                 let lsn = wal.next_lsn().saturating_sub(1);
                                 durable_lsn_for_thread.store(lsn, Ordering::Release);
                                 engine.undo.commit();
+
+                                // changefeed: durable 化した record を listener に push
+                                #[cfg(feature = "v32")]
+                                Self::fire_change_listeners(
+                                    wal,
+                                    &listeners_for_thread,
+                                    &emit_offset_for_thread,
+                                );
                             }
                             // v30: ring buffer reset を試みる。head == checkpoint &&
                             // pending_writes == 0 のときだけ head/checkpoint を HEADER_SIZE に戻す。
                             // これで WAL 容量を食い切らずに長期運用できる。
-                            wal.try_reset();
+                            // ※ auto_reset が発動して offset が後退したら listener cursor もリセット。
+                            #[cfg(feature = "v32")]
+                            {
+                                if wal.try_reset() {
+                                    emit_offset_for_thread.store(
+                                        crate::wal::HEADER_SIZE as u64,
+                                        Ordering::Release,
+                                    );
+                                }
+                            }
+                            #[cfg(not(feature = "v32"))]
+                            {
+                                wal.try_reset();
+                            }
                             last_fsync = Instant::now();
                         }
                     }
@@ -2882,6 +2992,13 @@ impl Engine {
                             let _ = engine.body_msync();
                             wal.advance_checkpoint(wal.head());
                             engine.undo.commit();
+                            // shutdown 時の最終 emit
+                            #[cfg(feature = "v32")]
+                            Self::fire_change_listeners(
+                                wal,
+                                &listeners_for_thread,
+                                &emit_offset_for_thread,
+                            );
                         }
                         return;
                     }
@@ -2923,6 +3040,10 @@ impl Engine {
             wal.advance_checkpoint(head);
             let lsn = wal.next_lsn().saturating_sub(1);
             self.durable_lsn.store(lsn, Ordering::Release);
+            // changefeed: durable 化したので listener へ即時 push
+            // (consumer の 100ms tick を待たず caller スレッドで発火)
+            #[cfg(feature = "v32")]
+            Self::fire_change_listeners(wal, &self.change_listeners, &self.change_emit_offset);
         }
         // undo も clear(transaction 確定)
         self.undo.commit();

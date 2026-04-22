@@ -244,14 +244,21 @@ impl BlobStore for LocalBlobStore {
 mod tests {
     use super::*;
 
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     fn tmp_root() -> PathBuf {
+        // pid + nanos + atomic counter で並列実行内でも完全 unique
+        // (nanos が threads で被ると collision して別テストの blob を walk で拾い、
+        //  「ファイル数 1 のはず」系 assert が壊れる)
+        let n = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "enchu-blob-test-{}-{}",
+            "enchu-blob-test-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            n,
         ))
     }
 
