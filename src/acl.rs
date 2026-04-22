@@ -5,10 +5,16 @@
 //! Project 自体を 1 つの entity として扱い、`acl_writer` 紐で
 //! 許可 peer を複数張る。
 //!
-//! ```ignore
+//! ```
+//! # use enchudb::{Engine, HimoType};
+//! let path = format!("/tmp/enchudb-acl-doc-{}.db", std::process::id());
+//! # let _ = std::fs::remove_file(&path);
+//! let mut eng = Engine::create(&path).unwrap();
+//! eng.define_himo("acl_writer", HimoType::Value, 4);
 //! let project = eng.entity();
 //! eng.tie(project, "acl_writer", 1);  // peer 1 に書き込み許可
 //! eng.tie(project, "acl_writer", 2);  // peer 2 にも
+//! # let _ = std::fs::remove_file(&path);
 //! ```
 //!
 //! Syncer は受信 op の `author_peer` が project の `acl_writer` に入っているか

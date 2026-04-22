@@ -2,15 +2,25 @@
 //!
 //! # 使い方
 //!
-//! ```ignore
-//! use enchudb::{Engine, sync::Syncer, transport::InMemoryTransport};
+//! ```
+//! # #[cfg(feature = "v32")] {
+//! use std::sync::Arc;
+//! use enchudb::{Engine, HimoType};
+//! use enchudb::sync::Syncer;
+//! use enchudb::transport::{InMemoryTransport, Transport};
 //!
-//! let transport = InMemoryTransport::new();
-//! let syncer = Syncer::new(eng_a.clone(), transport.clone());
+//! let path = format!("/tmp/enchudb-sync-doc-{}.db", std::process::id());
+//! let _ = std::fs::remove_file(&path);
+//! let mut eng = Engine::create(&path).unwrap();
+//! eng.define_himo("val", HimoType::Value, 100);
+//! let eng_a = Arc::new(eng);
 //!
-//! // 他 peer の ops を pull して apply
-//! let applied = syncer.pull_once(peer_b_id);
-//! println!("applied {} ops from peer {}", applied, peer_b_id);
+//! let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
+//! let syncer = Syncer::new(eng_a.clone(), transport);
+//! let out = syncer.pull_once(2); // 未知の peer から pull、0 件
+//! assert_eq!(out.received, 0);
+//! # let _ = std::fs::remove_file(&path);
+//! # }
 //! ```
 //!
 //! # LWW 規則

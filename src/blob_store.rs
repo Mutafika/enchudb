@@ -21,11 +21,13 @@
 //!
 //! # 使い方
 //!
-//! ```ignore
+//! ```
 //! use enchudb::blob_store::{BlobStore, LocalBlobStore};
-//! let store = LocalBlobStore::new("/tmp/blobs")?;
-//! let id = store.put(b"hello")?;
-//! assert_eq!(store.get(&id)?.as_deref(), Some(&b"hello"[..]));
+//! let root = format!("/tmp/enchudb-blob-doc-{}", std::process::id());
+//! let store = LocalBlobStore::new(&root).unwrap();
+//! let id = store.put(b"hello").unwrap();
+//! assert_eq!(store.get(&id).unwrap().as_deref(), Some(&b"hello"[..]));
+//! # let _ = std::fs::remove_dir_all(&root);
 //! ```
 
 use sha2::{Digest, Sha256};

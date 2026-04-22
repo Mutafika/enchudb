@@ -1,13 +1,17 @@
 //! EnchuDB — 紐ベース円柱エンジン。単一ファイル。
 //!
-//! ```ignore
-//! let mut db = enchudb::Engine::create("/tmp/mydb.db").unwrap();
+//! ```
+//! let path = format!("/tmp/enchudb-doc-{}.db", std::process::id());
+//! let _ = std::fs::remove_file(&path);
+//! let mut db = enchudb::Engine::create(&path).unwrap();
 //! db.define_himo("age", enchudb::HimoType::Value, 100);
 //! let e = db.entity();
 //! db.tie(e, "age", 30);
 //! db.tie_text(e, "city", "東京");
 //! db.rebuild();
 //! let result = db.pull_raw("age", 30); // O(1)
+//! assert_eq!(result, vec![0]);
+//! # let _ = std::fs::remove_file(&path);
 //! ```
 
 pub(crate) mod region;
