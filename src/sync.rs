@@ -57,6 +57,14 @@ pub struct SyncOutcome {
 
 impl Syncer {
     pub fn new(engine: Arc<Engine>, transport: Arc<dyn Transport>) -> Self {
+        // Syncer が attach された engine の WAL は auto_reset を off にする。
+        // publish_since は iter_committed で WAL を読むので、consumer が
+        // try_reset で WAL を空にすると sync 記録が消える race がある。
+        // 正式には「全 peer が replicate 済みの地点まで reset」する watermark が要るが、
+        // 未実装なので一旦 auto_reset off で記録を残す方針。
+        if let Some(wal) = engine.wal_arc() {
+            wal.set_auto_reset(false);
+        }
         Self {
             engine,
             transport,

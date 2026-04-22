@@ -244,6 +244,11 @@ pub struct Wal {
     keypair: std::sync::RwLock<Option<std::sync::Arc<crate::keys::Keypair>>>,
     /// v30: append 中の writer 数。try_reset はこれが 0 のときだけ実行できる。
     pending_writes: std::sync::atomic::AtomicU32,
+    /// v32: auto reset を許可するか。default false。
+    /// true にすると consumer が head==checkpoint の tick で ring buffer を空に戻し
+    /// 長期運用で WAL 容量を食い切らない動きになるが、audit/iter_committed/publish_since
+    /// で読む前に消える race があるので opt-in。
+    auto_reset: std::sync::atomic::AtomicBool,
 }
 
 unsafe impl Send for Wal {}
@@ -281,6 +286,7 @@ impl Wal {
             #[cfg(feature = "v32")]
             keypair: std::sync::RwLock::new(None),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
+            auto_reset: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -319,6 +325,7 @@ impl Wal {
             #[cfg(feature = "v32")]
             keypair: std::sync::RwLock::new(None),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
+            auto_reset: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -454,7 +461,9 @@ impl Wal {
 
     /// v30: ring buffer reset。
     /// head == checkpoint && pending_writes == 0 のときのみ実行可能。
+    /// v32: auto_reset が false なら常に skip(Syncer attached の engine で使う)。
     pub fn try_reset(&self) -> bool {
+        if !self.auto_reset.load(Ordering::Acquire) { return false; }
         let head = self.head.load(Ordering::Acquire);
         let cp = self.checkpoint.load(Ordering::Acquire);
         if head != cp || head <= HEADER_SIZE as u64 { return false; }
@@ -472,6 +481,18 @@ impl Wal {
     /// pending_writes を返す(テスト/観測用)。
     pub fn pending_writes(&self) -> u32 {
         self.pending_writes.load(Ordering::Acquire)
+    }
+
+    /// auto_reset を切り替え(Syncer attached の engine では false にする)。
+    /// false にすると ring buffer reset が発火しなくなり、WAL は使い切るまで線形成長する。
+    /// v32 の sync 前に消える race を防ぐ用途。
+    pub fn set_auto_reset(&self, enabled: bool) {
+        self.auto_reset.store(enabled, Ordering::Release);
+    }
+
+    /// auto_reset の現在値。
+    pub fn auto_reset_enabled(&self) -> bool {
+        self.auto_reset.load(Ordering::Acquire)
     }
 
     /// fsync(WAL 本体のみ)。consumer スレッドが定期実行。
@@ -647,6 +668,7 @@ impl Wal {
             #[cfg(feature = "v32")]
             keypair: std::sync::RwLock::new(None),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
+            auto_reset: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -928,6 +950,7 @@ mod tests {
     fn try_reset_recycles_wal_space() {
         let p = tmp("ring_reset");
         let wal = Wal::create(&p, 1024 * 1024).unwrap();
+        wal.set_auto_reset(true);
         for i in 0..100u32 {
             wal.append(WalOp::Tie { eid: i as u64, himo_id: 0, value: i }).unwrap();
         }
@@ -953,6 +976,7 @@ mod tests {
         let p = tmp("ring_longrun");
         // v2 はヘッダ 112B / record なので、v1 より大きい容量が必要。
         let wal = Wal::create(&p, 512 * 1024).unwrap();
+        wal.set_auto_reset(true);
 
         for batch in 0..50u32 {
             for i in 0..100u32 {

@@ -80,8 +80,11 @@ fn origin_publishes_replica_pulls_over_http() {
     ];
     origin_transport.publish(1, records);
 
-    // relay が受け取るまで少し待つ
-    std::thread::sleep(Duration::from_millis(100));
+    // relay が受け取るまで最大 2s 待つ (fixed sleep は CI/loaded machine で足りない)
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while relay.record_count() < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(relay.record_count(), 2, "relay should hold 2 records");
 
     // replica 側 Syncer で pull
@@ -146,7 +149,10 @@ fn multiple_replicas_sync_from_same_origin() {
         ),
     ]);
 
-    std::thread::sleep(Duration::from_millis(100));
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while relay.record_count() < 1 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     // 両 replica が同じ relay から pull
     let ta: Arc<dyn Transport> = Arc::new(HttpTransport::new(url.clone()));
@@ -223,7 +229,10 @@ fn fresh_replica_bootstraps_then_syncs() {
             DecodedOp::Tie { eid: new_eid, himo_id, value: 999 },
         ),
     ]);
-    std::thread::sleep(Duration::from_millis(50));
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while relay.record_count() < 1 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     // step 5: replica が incremental sync
     let client_t: Arc<dyn Transport> = Arc::new(HttpTransport::new(url));
@@ -265,7 +274,10 @@ fn incremental_pull_advances_cursor() {
             DecodedOp::Tie { eid: enchudb::make_eid(1, 1), himo_id, value: 1 },
         ),
     ]);
-    std::thread::sleep(Duration::from_millis(50));
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while relay.record_count() < 1 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     let client_t: Arc<dyn Transport> = Arc::new(HttpTransport::new(url.clone()));
     let syncer = Syncer::new(replica.clone(), client_t);
@@ -286,7 +298,10 @@ fn incremental_pull_advances_cursor() {
             DecodedOp::Tie { eid: enchudb::make_eid(1, 2), himo_id, value: 2 },
         ),
     ]);
-    std::thread::sleep(Duration::from_millis(50));
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while relay.record_count() < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     let r3 = syncer.pull_once(1);
     assert_eq!(r3.received, 1);
