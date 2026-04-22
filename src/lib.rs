@@ -34,12 +34,7 @@ pub mod hlc_store;
 pub mod transport;
 #[cfg(feature = "v32")]
 pub mod sync;
-#[cfg(feature = "v32")]
-#[cfg(not(target_arch = "wasm32"))]
-pub mod http_transport;
-#[cfg(feature = "v32")]
-#[cfg(not(target_arch = "wasm32"))]
-pub mod ws_transport;
+// Transport implementations moved to `enchu-transport` crate.
 #[cfg(feature = "v32")]
 pub mod keys;
 #[cfg(feature = "v32")]

@@ -628,11 +628,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
+name = "enchu-transport"
+version = "0.1.0"
+dependencies = [
+ "enchudb",
+ "tungstenite",
+]
+
+[[package]]
 name = "enchudb"
 version = "0.1.0"
 dependencies = [
  "crossbeam-queue",
  "ed25519-dalek",
+ "enchu-transport",
  "memmap2",
  "proptest",
  "rand_core 0.6.4",
@@ -641,7 +650,6 @@ dependencies = [
  "sabitori-core",
  "sabitori-style",
  "sha2",
- "tungstenite",
 ]
 
 [[package]]
