@@ -18,12 +18,12 @@
 //!
 //! 非同期/並行性は扱わないが、分散アルゴリズムの検証には十分。
 
-#![cfg(feature = "chaos")]
+#![allow(dead_code)]
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use crate::PeerId;
+use enchudb::PeerId;
 
 // ─────────────────────────────────────────────────────────────
 // SimNetwork: メッセージ配送 + 故障注入
@@ -214,7 +214,7 @@ impl<M: Clone> SimNetwork<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crdt::{OrSet, GCounter, LwwRegister};
+    use super::super::crdt::{OrSet, GCounter, LwwRegister};
 
     /// OrSet<i32> の broadcast message は「現 state 丸ごとコピー」で簡易化
     /// (state-based CRDT の素朴実装、 op-based じゃなく)

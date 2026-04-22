@@ -37,13 +37,9 @@ pub mod sync;
 #[cfg(feature = "v32")]
 #[cfg(not(target_arch = "wasm32"))]
 pub mod http_transport;
-#[cfg(feature = "ws")]
+#[cfg(feature = "v32")]
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ws_transport;
-#[cfg(feature = "crdt")]
-pub mod crdt;
-#[cfg(feature = "chaos")]
-pub mod chaos_sim;
 #[cfg(feature = "v32")]
 pub mod keys;
 #[cfg(feature = "v32")]

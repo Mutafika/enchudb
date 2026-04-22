@@ -22,12 +22,12 @@
 //!
 //! Shapiro et al. "A comprehensive study of Convergent and Commutative Replicated Data Types" (2011).
 
-#![cfg(feature = "crdt")]
+#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
-use crate::PeerId;
+use enchudb::PeerId;
 
 // ─────────────────────────────────────────────────────────────
 // G-Counter (Grow-only Counter)
