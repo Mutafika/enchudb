@@ -127,6 +127,12 @@ impl WireRecord {
             DecodedOp::Commit => {
                 out.push(4);
             }
+            DecodedOp::Vocab { vid, bytes } => {
+                out.push(5);
+                out.extend_from_slice(&vid.to_le_bytes());
+                out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                out.extend_from_slice(bytes);
+            }
         }
         out
     }
@@ -200,6 +206,14 @@ impl WireRecord {
                 DecodedOp::Content { eid, key, data }
             }
             4 => DecodedOp::Commit,
+            5 => {
+                need(p, 8, buf)?;
+                let vid = u32::from_le_bytes(buf[p..p+4].try_into().unwrap()); p += 4;
+                let blen = u32::from_le_bytes(buf[p..p+4].try_into().unwrap()) as usize; p += 4;
+                need(p, blen, buf)?;
+                let bytes = buf[p..p+blen].to_vec(); p += blen;
+                DecodedOp::Vocab { vid, bytes }
+            }
             other => return Err(WireDecodeError::UnknownOpTag(other)),
         };
 

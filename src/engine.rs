@@ -878,6 +878,11 @@ pub struct Engine {
     /// add_change_listener 時に wal.head() に同期され、それ以降の commit のみが流れる。
     #[cfg(feature = "v32")]
     change_emit_offset: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// v33: 受信した Vocab op の `(author_peer, remote_vid) → local_vid` mapping。
+    /// Symbol 型 himo の Tie を受信した時に remote_vid を local_vid に変換して apply する。
+    /// peer-local に保持(replica でも独立、open 時は空、受信で徐々に埋まる)。
+    #[cfg(feature = "v33")]
+    peer_vocab_map: std::sync::RwLock<std::collections::HashMap<(crate::PeerId, u32), u32>>,
     backing: Backing, // 最後に drop されるよう最終フィールド
 }
 
@@ -1037,6 +1042,8 @@ impl Engine {
             change_emit_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::wal::HEADER_SIZE as u64,
             )),
+            #[cfg(feature = "v33")]
+            peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             backing: Backing::Mmap(mmap),
         })
     }
@@ -1349,6 +1356,8 @@ impl Engine {
             change_emit_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::wal::HEADER_SIZE as u64,
             )),
+            #[cfg(feature = "v33")]
+            peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             backing,
         };
 
@@ -1565,6 +1574,28 @@ impl Engine {
         let local = crate::eid_local(eid);
         self.entities.ensure_live(local);
         self.contents.set(local, key, data);
+    }
+
+    /// v33: リモート peer から届いた Vocab op を apply。
+    /// `bytes` を local vocab に insert し、local_vid を取得して
+    /// `(author_peer, remote_vid) → local_vid` の mapping を記録する。
+    /// 後続の Tie { value: remote_vid } を受信したら `translate_remote_vid` で local_vid に変換。
+    #[cfg(feature = "v33")]
+    pub fn remote_vocab_apply(&self, author_peer: crate::PeerId, remote_vid: u32, bytes: &[u8]) {
+        let local_vid = self.vocab.get_or_insert(bytes);
+        let mut map = self.peer_vocab_map.write().unwrap();
+        map.insert((author_peer, remote_vid), local_vid);
+    }
+
+    /// v33: Symbol 型 himo の Tie を受信した際、remote vid を local vid に変換する。
+    /// Symbol 以外の himo、または mapping 未登録なら元値をそのまま返す。
+    #[cfg(feature = "v33")]
+    pub fn translate_remote_vid(&self, author_peer: crate::PeerId, himo_id: u16, value: u32) -> u32 {
+        let hid = himo_id as usize;
+        if hid >= self.himo_types.len() { return value; }
+        if self.himo_types[hid] != HimoType::Symbol { return value; }
+        let map = self.peer_vocab_map.read().unwrap();
+        *map.get(&(author_peer, value)).unwrap_or(&value)
     }
 
     // ──── tie ────
@@ -2873,6 +2904,11 @@ impl Engine {
                 self.contents.set(local, key, data);
             }
             DecodedOp::Commit => {}
+            DecodedOp::Vocab { .. } => {
+                // v33: 自プロセスの recover 時は Vocab 個別の apply 不要
+                // (author_peer == self の場合は既に local vocab にある)。
+                // Sync 経由で他 peer から受信する場合のみ apply_one 側で処理。
+            }
         }
     }
 

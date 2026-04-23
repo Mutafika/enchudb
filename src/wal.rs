@@ -127,6 +127,7 @@ pub mod op_type {
     pub const CONTENT: u8 = 3;
     pub const COMMIT: u8 = 4;
     pub const SCHEMA: u8 = 5; // v32 予約(Phase D 以降で使う)
+    pub const VOCAB: u8 = 6;  // v33: text vid → bytes 対応を peer 間で運ぶ
 }
 
 /// WAL に書く op。eid は u64(v32)。
@@ -137,6 +138,10 @@ pub enum WalOp<'a> {
     Delete { eid: u64 },
     Content { eid: u64, key: &'a str, data: &'a [u8] },
     Commit,
+    /// v33: text 文字列を peer 間で運ぶ。`vid` は author_peer ローカルの vocab ID。
+    /// receiver 側は `(author_peer, vid) → local_vid` の mapping を持ち、
+    /// 後続の Tie { value: vid } を受けたら local_vid に変換して適用する。
+    Vocab { vid: u32, bytes: &'a [u8] },
 }
 
 impl<'a> WalOp<'a> {
@@ -149,6 +154,7 @@ impl<'a> WalOp<'a> {
             WalOp::Delete { .. } => 8,     // eid(8)
             WalOp::Content { key, data, .. } => 8 + 2 + 2 + 4 + key.len() + data.len(),
             WalOp::Commit => 0,
+            WalOp::Vocab { bytes, .. } => 4 + 4 + bytes.len(), // vid(4) + len(4) + bytes
         }
     }
 
@@ -159,6 +165,7 @@ impl<'a> WalOp<'a> {
             WalOp::Delete { .. } => op_type::DELETE,
             WalOp::Content { .. } => op_type::CONTENT,
             WalOp::Commit => op_type::COMMIT,
+            WalOp::Vocab { .. } => op_type::VOCAB,
         }
     }
 
@@ -191,6 +198,12 @@ impl<'a> WalOp<'a> {
                 buf[do_..do_ + data.len()].copy_from_slice(data);
             }
             WalOp::Commit => {}
+            WalOp::Vocab { vid, bytes } => {
+                buf[0..4].copy_from_slice(&vid.to_le_bytes());
+                let blen = bytes.len() as u32;
+                buf[4..8].copy_from_slice(&blen.to_le_bytes());
+                buf[8..8 + bytes.len()].copy_from_slice(bytes);
+            }
         }
     }
 }
@@ -203,6 +216,8 @@ pub enum DecodedOp {
     Delete { eid: u64 },
     Content { eid: u64, key: String, data: Vec<u8> },
     Commit,
+    /// v33: peer 間で vocab の (vid, bytes) を運ぶ。`vid` は record の author_peer ローカル。
+    Vocab { vid: u32, bytes: Vec<u8> },
 }
 
 /// リカバリ結果の 1 レコード(HLC + 署名込み)。
@@ -721,6 +736,13 @@ fn decode_op(op_byte: u8, payload: &[u8]) -> Option<DecodedOp> {
             Some(DecodedOp::Content { eid, key, data })
         }
         op_type::COMMIT => Some(DecodedOp::Commit),
+        op_type::VOCAB if payload.len() >= 8 => {
+            let vid = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+            let blen = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
+            if payload.len() < 8 + blen { return None; }
+            let bytes = payload[8..8 + blen].to_vec();
+            Some(DecodedOp::Vocab { vid, bytes })
+        }
         _ => None,
     }
 }

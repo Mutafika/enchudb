@@ -191,7 +191,12 @@ impl Syncer {
                 if !store.try_set(*eid, *himo_id, rec.hlc) {
                     return false;
                 }
-                self.engine.remote_tie_apply(*eid, *himo_id, *value);
+                // v33: Symbol 型 himo の場合、remote vocab の vid を local vid に変換
+                #[cfg(feature = "v33")]
+                let value = self.engine.translate_remote_vid(rec.author_peer, *himo_id, *value);
+                #[cfg(not(feature = "v33"))]
+                let value = *value;
+                self.engine.remote_tie_apply(*eid, *himo_id, value);
                 true
             }
             DecodedOp::Untie { eid, himo_id } => {
@@ -220,6 +225,20 @@ impl Syncer {
                 true
             }
             DecodedOp::Commit => true, // boundary marker、apply は不要
+            DecodedOp::Vocab { vid, bytes } => {
+                // v33: author_peer の (vid, bytes) を受信。
+                // Engine 側の remote_vocab_apply に委譲 (peer 別 vid mapping を構築)。
+                #[cfg(feature = "v33")]
+                {
+                    self.engine.remote_vocab_apply(rec.author_peer, *vid, bytes);
+                    true
+                }
+                #[cfg(not(feature = "v33"))]
+                {
+                    let _ = (vid, bytes);
+                    false
+                }
+            }
         }
     }
 }
