@@ -43,7 +43,7 @@ fn max_himos_limit() {
 #[test]
 fn max_values_boundary() {
     let path = tmp("max_values_boundary");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("x", HimoType::Value, 10);
 
     let e9 = eng.entity();
@@ -71,7 +71,7 @@ fn max_values_boundary() {
 #[test]
 fn empty_db_query() {
     let path = tmp("empty_db_query");
-    let eng = Engine::create(&path).unwrap();
+    let eng = Engine::create_standalone(&path).unwrap();
 
     // 紐未定義 → 空結果
     let r1 = eng.pull_raw("nothing", 0);
@@ -94,7 +94,7 @@ fn empty_db_query() {
 #[test]
 fn zero_value_tie() {
     let path = tmp("zero_value_tie");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("x", HimoType::Value, 4);
 
     let e = eng.entity();
@@ -114,7 +114,7 @@ fn zero_value_tie() {
 #[test]
 fn tie_large_value_expands_buckets() {
     let path = tmp("large_value_expand");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("x", HimoType::Value, 10); // ヒント 10
     let e = eng.entity();
     eng.tie(e, "x", 100_000);
@@ -130,7 +130,7 @@ fn tie_large_value_expands_buckets() {
 #[should_panic(expected = "u32::MAX")]
 fn max_value_panics() {
     let path = tmp("max_value_panics");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     let e = eng.entity();
     eng.tie(e, "x", u32::MAX);
     cleanup(&path);
@@ -144,7 +144,7 @@ fn max_value_panics() {
 #[test]
 fn view_unknown_himo() {
     let path = tmp("view_unknown");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("a", HimoType::Value, 4);
     // "b" は未定義
     let r = eng.define_view(&["a", "b"]);
@@ -159,7 +159,7 @@ fn view_unknown_himo() {
 #[test]
 fn view_max_himos() {
     let path = tmp("view_max_himos");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     // 9 本定義(各 max_values=1 にしてセル数を抑える: 2^8=256 / 2^9=512)
     for i in 0..9 {
         eng.define_himo(&format!("h{}", i), HimoType::Value, 1);
@@ -180,7 +180,7 @@ fn view_max_himos() {
 #[test]
 fn view_cell_count_overflow() {
     let path = tmp("view_cell_overflow");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     // (1000+1) × (1000+1) = 1_002_001 > 1M
     eng.define_himo("a", HimoType::Value, 1000);
     eng.define_himo("b", HimoType::Value, 1000);
@@ -196,7 +196,7 @@ fn view_cell_count_overflow() {
 #[test]
 fn duplicate_view_register() {
     let path = tmp("dup_view");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("a", HimoType::Value, 4);
     eng.define_himo("b", HimoType::Value, 4);
     let r1 = eng.define_view(&["a", "b"]);
@@ -211,7 +211,7 @@ fn duplicate_view_register() {
 #[test]
 fn views_max_count() {
     let path = tmp("views_max_count");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     // 紐を 33 ペア分用意(各ペアで異なる view)。紐 0..65 を定義。
     for i in 0..66 {
         eng.define_himo(&format!("h{}", i), HimoType::Value, 2);
@@ -241,7 +241,7 @@ fn views_max_count() {
 #[test]
 fn delete_then_recreate_entity() {
     let path = tmp("del_recreate");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("x", HimoType::Value, 4);
 
     let e0 = eng.entity();
@@ -265,7 +265,7 @@ fn delete_then_recreate_entity() {
 #[test]
 fn untie_all_himos_from_entity() {
     let path = tmp("untie_all");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("a", HimoType::Value, 4);
     eng.define_himo("b", HimoType::Value, 4);
 
@@ -288,7 +288,7 @@ fn untie_all_himos_from_entity() {
 #[test]
 fn double_delete() {
     let path = tmp("double_delete");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("x", HimoType::Value, 4);
     let e = eng.entity();
     eng.tie(e, "x", 1);
@@ -305,7 +305,7 @@ fn double_delete() {
 #[test]
 fn delete_unknown_entity() {
     let path = tmp("delete_unknown");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("x", HimoType::Value, 4);
 
     // 一度も entity() を呼んでないので 999 は未作成
@@ -327,7 +327,7 @@ fn delete_unknown_entity() {
 #[test]
 fn value_then_text_same_himo() {
     let path = tmp("type_mix");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
 
     let e1 = eng.entity();
     let e2 = eng.entity();
@@ -354,7 +354,7 @@ fn value_then_text_same_himo() {
 #[test]
 fn ref_self_reference() {
     let path = tmp("ref_self");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     let e = eng.entity();
     eng.tie_ref(e, "self", e);
     assert_eq!(eng.get(e, "self"), Some(e as u32));
@@ -371,10 +371,10 @@ fn ref_self_reference() {
 fn empty_db_persistence() {
     let path = tmp("empty_persist");
     {
-        let mut eng = Engine::create(&path).unwrap();
+        let mut eng = Engine::create_standalone(&path).unwrap();
         eng.flush().unwrap();
     }
-    let eng = Engine::open(&path).unwrap();
+    let eng = Engine::open_standalone(&path).unwrap();
     assert_eq!(eng.entity_count(), 0);
     cleanup(&path);
 }
@@ -386,7 +386,7 @@ fn persist_then_modify() {
 
     // フェーズ 1: 初期データ
     {
-        let mut eng = Engine::create(&path).unwrap();
+        let mut eng = Engine::create_standalone(&path).unwrap();
         eng.define_himo("x", HimoType::Value, 100);
         let e0 = eng.entity();
         eng.tie(e0, "x", 10);
@@ -396,7 +396,7 @@ fn persist_then_modify() {
 
     // フェーズ 2: open → 追加データ
     {
-        let mut eng = Engine::open(&path).unwrap();
+        let mut eng = Engine::open_standalone(&path).unwrap();
         assert_eq!(eng.get(0, "x"), Some(10));
         let e1 = eng.entity();
         eng.tie(e1, "x", 20);
@@ -406,7 +406,7 @@ fn persist_then_modify() {
 
     // フェーズ 3: open → 全件見える
     {
-        let eng = Engine::open(&path).unwrap();
+        let eng = Engine::open_standalone(&path).unwrap();
         assert_eq!(eng.get(0, "x"), Some(10));
         assert_eq!(eng.get(1, "x"), Some(20));
         assert_eq!(eng.entity_count(), 2);
@@ -425,7 +425,7 @@ fn persist_then_modify() {
 fn file_version_mismatch() {
     let path = tmp("magic_corrupt");
     {
-        let eng = Engine::create(&path).unwrap();
+        let eng = Engine::create_standalone(&path).unwrap();
         drop(eng);
     }
 
@@ -439,7 +439,7 @@ fn file_version_mismatch() {
         f.sync_all().unwrap();
     }
 
-    let r = Engine::open(&path);
+    let r = Engine::open_standalone(&path);
     assert!(r.is_err(), "magic 破壊 → open は Err");
     cleanup(&path);
 }
@@ -452,7 +452,7 @@ fn file_version_mismatch() {
 #[test]
 fn concurrentize_with_empty() {
     let path = tmp("concurrent_empty");
-    let eng = Engine::create(&path).unwrap();
+    let eng = Engine::create_standalone(&path).unwrap();
     let arc = Engine::concurrentize(eng);
 
     // pending は 0
@@ -474,7 +474,7 @@ fn concurrentize_with_empty() {
 #[test]
 fn concurrentize_basic_lifecycle() {
     let path = tmp("concurrent_basic");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("x", HimoType::Value, 16);
     let arc: Arc<Engine> = Engine::concurrentize(eng);
 
@@ -496,7 +496,7 @@ fn concurrentize_basic_lifecycle() {
 #[test]
 fn test_dynamic_bucket_expansion() {
     let path = tmp("dyn_bucket_expand");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("x", HimoType::Value, 10);
     let e = eng.entity();
     eng.tie(e, "x", 1000);
@@ -513,7 +513,7 @@ fn test_dynamic_bucket_expansion() {
 #[test]
 fn test_unique_count_basic() {
     let path = tmp("uniq_count_basic");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("k", HimoType::Value, 100);
     assert_eq!(eng.himo_cardinality("k"), Some(0));
 
@@ -545,7 +545,7 @@ fn test_unique_count_basic() {
 #[test]
 fn test_unique_count_with_replace() {
     let path = tmp("uniq_count_replace");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("k", HimoType::Value, 10);
     let e1 = eng.entity();
     let e2 = eng.entity();
@@ -568,7 +568,7 @@ fn test_unique_count_with_replace() {
 #[test]
 fn test_himo_cardinality_api() {
     let path = tmp("card_api");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     assert_eq!(eng.himo_cardinality("unknown"), None);
     eng.define_himo("k", HimoType::Value, 4);
     assert_eq!(eng.himo_cardinality("k"), Some(0));

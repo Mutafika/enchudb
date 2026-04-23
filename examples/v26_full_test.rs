@@ -21,7 +21,7 @@ fn main() {
     {
         let dir = "/tmp/v26_test_basic.db";
         let _ = std::fs::remove_file(dir);
-        let mut db = enchudb::Engine::create(dir).unwrap();
+        let mut db = enchudb::Engine::create_standalone(dir).unwrap();
         db.define_himo("city", enchudb::HimoType::Value, 5);
         db.define_himo("dept", enchudb::HimoType::Value, 4);
         db.define_himo("age", enchudb::HimoType::Value, 100);
@@ -58,7 +58,7 @@ fn main() {
     {
         let dir = "/tmp/v26_test_update.db";
         let _ = std::fs::remove_file(dir);
-        let mut db = enchudb::Engine::create(dir).unwrap();
+        let mut db = enchudb::Engine::create_standalone(dir).unwrap();
         db.define_himo("x", enchudb::HimoType::Value, 3);
         db.define_himo("y", enchudb::HimoType::Value, 3);
 
@@ -91,7 +91,7 @@ fn main() {
     {
         let dir = "/tmp/v26_test_txn.db";
         let _ = std::fs::remove_file(dir);
-        let mut db = enchudb::Engine::create(dir).unwrap();
+        let mut db = enchudb::Engine::create_standalone(dir).unwrap();
         db.define_himo("a", enchudb::HimoType::Value, 5);
         db.define_himo("b", enchudb::HimoType::Value, 5);
 
@@ -134,7 +134,7 @@ fn main() {
     {
         let dir = "/tmp/v26_test_stress.db";
         let _ = std::fs::remove_file(dir);
-        let mut db = enchudb::Engine::create(dir).unwrap();
+        let mut db = enchudb::Engine::create_standalone(dir).unwrap();
         db.define_himo("x", enchudb::HimoType::Value, 10);
         db.define_himo("y", enchudb::HimoType::Value, 10);
         db.define_himo("z", enchudb::HimoType::Value, 10);
@@ -186,7 +186,7 @@ fn main() {
     {
         let dir = "/tmp/v26_test_repeated.db";
         let _ = std::fs::remove_file(dir);
-        let mut db = enchudb::Engine::create(dir).unwrap();
+        let mut db = enchudb::Engine::create_standalone(dir).unwrap();
         db.define_himo("val", enchudb::HimoType::Value, 100);
         db.define_himo("grp", enchudb::HimoType::Value, 5);
 
@@ -219,7 +219,7 @@ fn main() {
     {
         let dir = "/tmp/v26_test_boundary.db";
         let _ = std::fs::remove_file(dir);
-        let mut db = enchudb::Engine::create(dir).unwrap();
+        let mut db = enchudb::Engine::create_standalone(dir).unwrap();
         db.define_himo("x", enchudb::HimoType::Value, 2); // 0, 1, 2
         db.define_himo("y", enchudb::HimoType::Value, 2);
 
@@ -252,7 +252,7 @@ fn main() {
     {
         let dir = "/tmp/v26_test_delete.db";
         let _ = std::fs::remove_file(dir);
-        let mut db = enchudb::Engine::create(dir).unwrap();
+        let mut db = enchudb::Engine::create_standalone(dir).unwrap();
         db.define_himo("x", enchudb::HimoType::Value, 3);
         db.define_himo("y", enchudb::HimoType::Value, 3);
 
@@ -353,7 +353,7 @@ fn main() {
     {
         let dir = "/tmp/v26_test_persist.db";
         let _ = std::fs::remove_file(dir);
-        let mut db = enchudb::Engine::create(dir).unwrap();
+        let mut db = enchudb::Engine::create_standalone(dir).unwrap();
         db.define_himo("a", enchudb::HimoType::Value, 5);
         db.define_himo("b", enchudb::HimoType::Value, 5);
 
@@ -366,7 +366,7 @@ fn main() {
         db.flush().unwrap();
 
         // reopen — open 内で rebuild 済み
-        let mut db2 = enchudb::Engine::open(dir).unwrap();
+        let mut db2 = enchudb::Engine::open_standalone(dir).unwrap();
         // v24 クエリで件数確認
         let r_v24 = db2.query(&[("a", 0), ("b", 0)]);
         // rebuild_pairs してペアテーブル有効化
@@ -381,7 +381,7 @@ fn main() {
     {
         let dir = "/tmp/v26_test_saas.db";
         let _ = std::fs::remove_file(dir);
-        let mut db = enchudb::Engine::create(dir).unwrap();
+        let mut db = enchudb::Engine::create_standalone(dir).unwrap();
         db.define_himo("tenant", enchudb::HimoType::Value, 3);
         db.define_himo("dept", enchudb::HimoType::Value, 4);
         db.define_himo("status", enchudb::HimoType::Value, 3); // active, inactive, suspended

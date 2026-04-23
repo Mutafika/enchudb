@@ -21,7 +21,7 @@ fn main() {
     }
 
     let eng = {
-        let e = Engine::open(&path_no).unwrap();
+        let e = Engine::open_standalone(&path_no).unwrap();
         Engine::concurrentize(e)
     };
 

@@ -135,7 +135,7 @@ fn main() {
 
     // open
     let t = Instant::now();
-    let db2 = enchudb::Engine::open(path).unwrap();
+    let db2 = enchudb::Engine::open_standalone(path).unwrap();
     let open_elapsed = t.elapsed();
     println!("  open + BucketCylinder 再構築: {:?} ({} entity × 7 紐)", open_elapsed, n);
 
@@ -425,7 +425,7 @@ fn main() {
 
     // open 後、define_view を 1 回も呼ばずに query が同じ速度で動くこと
     let t = Instant::now();
-    let db_p2 = enchudb::Engine::open(path_p).unwrap();
+    let db_p2 = enchudb::Engine::open_standalone(path_p).unwrap();
     let open_elapsed = t.elapsed();
     println!();
     println!("─── open (view 自動復元込み) ───");

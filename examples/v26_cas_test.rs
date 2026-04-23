@@ -4,7 +4,7 @@ fn main() {
     let dir = "/tmp/enchudb_v26_cas_test.db";
     let _ = std::fs::remove_file(dir);
 
-    let mut db = enchudb::Engine::create(dir).unwrap();
+    let mut db = enchudb::Engine::create_standalone(dir).unwrap();
     db.define_himo("city", enchudb::HimoType::Value, 3);   // 0,1,2
     db.define_himo("dept", enchudb::HimoType::Value, 4);    // 0,1,2,3
     db.define_himo("status", enchudb::HimoType::Value, 2);  // 0,1
@@ -71,7 +71,7 @@ fn main() {
         // 大きめのデータで
         let dir2 = "/tmp/enchudb_v26_cas_bench.db";
         let _ = std::fs::remove_file(dir2);
-        let mut db2 = enchudb::Engine::create(dir2).unwrap();
+        let mut db2 = enchudb::Engine::create_standalone(dir2).unwrap();
         db2.define_himo("tenant", enchudb::HimoType::Value, 10);
         db2.define_himo("dept", enchudb::HimoType::Value, 8);
         db2.define_himo("role", enchudb::HimoType::Value, 4);

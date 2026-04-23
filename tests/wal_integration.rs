@@ -238,7 +238,7 @@ fn header_crc_detects_corruption() {
     }
 
     // open は CRC 不一致で失敗するはず
-    match Engine::open(&path) {
+    match Engine::open_standalone(&path) {
         Ok(_) => panic!("corrupted header should fail to open"),
         Err(e) => {
             let s = format!("{}", e);

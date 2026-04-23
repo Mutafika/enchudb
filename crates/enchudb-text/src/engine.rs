@@ -291,7 +291,7 @@ mod tests {
         eng.save(path).unwrap();
 
         // mmap で開く → 検索
-        let eng2 = TextEngine::open(path).unwrap();
+        let eng2 = TextEngine::open_standalone(path).unwrap();
         assert_eq!(eng2.doc_count(), 3);
 
         let r = eng2.search("国民");
@@ -310,6 +310,6 @@ mod tests {
 
     #[test]
     fn open_nonexistent() {
-        assert!(TextEngine::open("/tmp/does_not_exist.etxt").is_err());
+        assert!(TextEngine::open_standalone("/tmp/does_not_exist.etxt").is_err());
     }
 }

@@ -64,7 +64,7 @@ fn bench_tie(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let path = tmp("tie_plain");
-                let mut eng = Engine::create(&path).unwrap();
+                let mut eng = Engine::create_standalone(&path).unwrap();
                 eng.define_himo("v", HimoType::Value, 100);
                 let e = eng.entity();
                 (path, eng, e, 0u32)
@@ -165,7 +165,7 @@ fn bench_snapshot_export(c: &mut Criterion) {
         }
         eng.flush().unwrap();
     }
-    let eng = Engine::open(&path).unwrap();
+    let eng = Engine::open_standalone(&path).unwrap();
 
     let mut group = c.benchmark_group("snapshot_export");
     group.sample_size(20); // ファイルコピー系は count 減らす
@@ -201,7 +201,7 @@ fn bench_audit(c: &mut Criterion) {
     // WAL 付き engine に 1k record 入れる
     let path = tmp("audit");
     {
-        let mut eng = Engine::create(&path).unwrap();
+        let mut eng = Engine::create_standalone(&path).unwrap();
         eng.define_himo("v", HimoType::Value, 100);
         eng.flush().unwrap();
     }
@@ -236,7 +236,7 @@ fn bench_audit(c: &mut Criterion) {
 fn bench_tie_async(c: &mut Criterion) {
     let path = tmp("tie_async");
     {
-        let mut eng = Engine::create(&path).unwrap();
+        let mut eng = Engine::create_standalone(&path).unwrap();
         eng.define_himo("v", HimoType::Value, 100);
         eng.flush().unwrap();
     }

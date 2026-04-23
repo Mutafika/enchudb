@@ -3,7 +3,7 @@
 //! ```
 //! let path = format!("/tmp/enchudb-doc-{}.db", std::process::id());
 //! let _ = std::fs::remove_file(&path);
-//! let mut db = enchudb::Engine::create(&path).unwrap();
+//! let mut db = enchudb::Engine::create_standalone(&path).unwrap();
 //! db.define_himo("age", enchudb::HimoType::Value, 100);
 //! let e = db.entity();
 //! db.tie(e, "age", 30);

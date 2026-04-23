@@ -1,72 +1,127 @@
 # EnchuDB バグ記録
 
-## [未修正] `Engine::open` 経路で Sync が silent に壊れる (v32 API 設計バグ)
-**日付**: 2026-04-23
-**箇所**: `engine.rs` — `open` / `create` / `open_internal`、`sync.rs` — `Syncer::publish_since`
+## [未修正] v32 Sync が text フィールドで根本的に機能しない (API 設計バグ + 機能穴)
+**日付**: 2026-04-23 (初版) / 2026-04-23 追記 (深掘り後)
+**箇所**: `engine.rs` — `open` / `create` / `tie_text_to` / `tie_async`、`sync.rs` — `Syncer::publish_since`、`wal.rs` — `WalOp`
 
-v32 で Sync サポートが入って以降、Engine の open 系 API が **2 系統** 存在:
+v32 で Sync サポートが入ったが、以下 **3 層** の問題が重なり、**text を含む schema の peer 間 sync は現状動かない**。
+
+---
+
+### 層 1: `Engine::open` 経路は WAL 無しでも Syncer を受け付ける
+
+Engine の open 系 API は 2 系統:
 
 | API | WAL | mutation 呼び方 | 返り値 | Sync |
 |---|---|---|---|---|
-| `Engine::open(path)` / `Engine::create(path)` | **無効** (write_queue=None) | `&mut self` (tie_text 等) | `Engine` | **機能しない** |
-| `Engine::open_concurrent_with_wal(path, cap)` / `create_concurrent_with_wal` | 有効 | `&self` (tie_text_to 等) | `Arc<Engine>` | 機能する |
+| `Engine::open(path)` / `Engine::create(path)` | **無効** | `&mut self` (tie_text 等) | `Engine` | **機能しない** |
+| `Engine::open_concurrent_with_wal(path, cap)` / `create_concurrent_with_wal` | 有効 | `&self` (tie_text_to / tie_async 等) | `Arc<Engine>` | 部分的に機能 (下記参照) |
 
-前者で開いた Engine は mutation が直接 `himo_store` に反映されるだけで、WAL ring buffer には 1 バイトも書かれない。結果:
+前者で開くと `write_queue=None` / `wal=None`。mutation は `himo_store` 直書き、WAL には 1 バイトも書かれない。`Syncer::publish_since` が `wal.iter_committed()` を読むが常に空 → transport.publish に 0 件 → peer 間 sync 不成立。
 
-- `Syncer::new(engine, transport)` を渡しても compile error も runtime 警告も出ない
-- `Syncer::publish_since(since)` が呼ばれても `wal.iter_committed()` が常に空 Vec → transport.publish に 0 件渡る → peer 間 sync が成立しない
-- ローカル単体での tie/get/query は正常に動くため、**単体テストでは気づかず、実際に 2 peer を繋いだ瞬間に破綻が発覚する**
+**現状 `sync.rs:80-86` に `Syncer::new` の panic guard が入っており (`engine.wal_arc().unwrap_or_else(|| panic!(...))`)、少なくとも silent には壊れない。ただし下流は `Engine::open` ではなく `open_concurrent_with_wal` への切り替えが必須。**
+
+---
+
+### 層 2: `tie_text_to` / `tie_to` / `tie_ref_to` は **&self だが WAL に書かない**
+
+名前から「concurrent (Arc<Engine> から呼べる) 版 = WAL 経由」と誤解しやすいが、実際は:
+
+```rust
+pub fn tie_text_to(&self, eid, himo, value: &str) {
+    let vid = self.vocab.get_or_insert(value.as_bytes());  // vocab 直接
+    self.himos[hid].set(eid, vid);                          // himo 直書き
+    self.record_undo(eid, hid);                             // undo のみ
+    // WAL append は無い
+}
+```
+
+同様に `tie_to` / `tie_ref_to` / `entity()` も WAL 無書き込み。`commit()` (行 1677) も `self.undo.commit()` だけで WAL は触らない。
+
+WAL に書くのは以下 4 つのみ (すべて u32 / bytes 指向で &self):
+- `tie_async(eid, himo, value: u32)` — 行 3224
+- `untie_async(eid, himo)` — 行 3243
+- `delete_async(eid)` — 行 3259
+- `content_async(eid, key, data: &[u8])` — 行 3275
+
+そして WAL の Commit marker を打つのは `wal_commit()` (行 3298) のみ。`commit()` と `wal_commit()` が別物で、片方だけ呼ぶと状態が割れる。
+
+**下流が `Engine::open` → `open_concurrent_with_wal` に切り替えても、`tie_text_to` を使う限り publish_since は依然空。**
+
+---
+
+### 層 3: `tie_text_async` が存在しない + vocab は peer 間 sync されない
+
+WAL に text を流す API が無い。`tie_async` は u32 のみ。`vocab.get_or_insert` は pub ではない (`engine.rs:815` で private field)。
+
+仮に `tie_text_async` を実装しても、次の壁:
+
+- text は vocab (peer-local ハッシュテーブル) を介して u32 `vid` に変換される
+- WAL の `WalOp::Tie { eid, himo_id, value: u32 }` が運ぶのは vid のみ (`wal.rs:134-194`)
+- `WalOp` に `Vocab { vid, bytes }` 的な op は無い (列挙: Tie / Untie / Delete / Content / Commit のみ)
+- 結果、peer A の `vid=5 = "hello"` は peer B で何の意味も持たない。`apply_wal_op` の `Tie { value }` は `himos[hid].set(local, value)` で vid を直書きする (`engine.rs:3194-3199`) が、peer B の vocab にその vid は未登録
+
+**text を含む schema は `tie_text` (& mut self, WAL 無し) しか書く手段がなく、かつそれは sync されない。**
+
+---
 
 ### opyula での発症事例 (2026-04-23)
 
-opyula (`/Users/kubo/Desktop/mutafika/opyula`) は peer.rs / store.rs / room.rs / daemon.rs 全てで `Engine::open` / `Engine::create` を使っていた。Phase 1-6 の開発中は動作確認が単一プロセスで完結していたため顕在化せず、Phase 7 MVP 後の 2 peer smoke test (`HOME=/tmp/opytest-a / opytest-b` で `room create` → `room join`) で「room not found after pull (received=0, applied=0)」を踏んで判明。
+opyula (`/Users/kubo/Desktop/mutafika/opyula`) は peer entity (`pk_text=peer_id`, `name`, `pubkey_hex`, `endpoint`), room entity (`pk_text=uuid`, `name`), membership entity (`pk_text=<room>:<peer>`, `role`) すべて text フィールドに依存。Phase 7 の 2 peer smoke test で `room not found after pull (received=0)` を踏んで判明。
 
-診断のため `wal.iter_committed().len()` を print したところ常に `0` → 同一インスタンスでも空 → WAL 経路が通っていないことが確認された。
+`opyula-core/src/room.rs:185-188` に FIXME コメント: 「opyula-core 全体を Arc<Engine> + tie_*_to API に refactor する必要あり」と書かれているが、上記 層 2・3 の事実に照らして **tie_*_to への移行だけでは解決しない**。
+
+---
 
 ### 症状の顕在化条件
 
-- `Engine::open` / `Engine::create` で開く (docs / README のサンプルコードが大半これ)
-- mutation 後 `commit()` + `flush()` する
-- `Syncer::new(arc_engine, transport)` で sync 構築
-- `publish_since(Hlc::ZERO)` を呼ぶ → 常に 0 件、transport は空配信
-- ローカル側は普通に get/query できるため、tie は確実に入ってる「ように見える」
-- 相手側は何も受け取れない
+- `Engine::open` / `Engine::create` で開く (docs / README のサンプルコードが大半これ) → 層 1
+- `open_concurrent_with_wal` に切り替え + `tie_*_to` で text を書く → 層 2
+- Text 以外 (u32 value のみ) を `tie_async` で書く → 部分的に動く (peer B に届く)
+- Text を WAL に載せる手段が存在しない → 層 3
 
-### 根本原因
+層 1 の guard は入ったが、層 2・3 は対応なし。**ローカル単体では全て動いて見え、2 peer 繋いだ瞬間に text データが届かない現象として発覚する**。
 
-API 設計の silent footgun:
-
-1. **デフォルトが罠**: `Engine::open` が名前上「標準」に見えるのに、v32 で追加された Sync 機能と非互換な旧 API の名残。新規ユーザは迷わずこれを呼ぶ。
-2. **Syncer が WAL の有無を検査しない**: `wal_arc()` が None を返すケースで Syncer::publish_since が `return 0` で静かに素通りする (行 117-120 `sync.rs`)。bug というか「WAL 無しで sync しろと言われたら 0 件配る」仕様になってる。
-3. **`tie_text` (&mut self) と `tie_text_to` (&self) の二本立て**: 前者は write_queue バイパスで himo 直書き、後者は queue 経由で WAL に載る。命名が「定義済み紐向け」を示唆するだけで、WAL/非 WAL の違いを表してない。
-4. **ドキュメント不在**: `lib.rs` doctest や README サンプルは `Engine::create` + `Engine::open` を使う。これらがサイレントに Sync を壊すことが明記されてない。
+---
 
 ### 修正方針 (案)
 
-**Option A (破壊的 / v33):** API 整理
-- `Engine::open` を WAL 有効 + `Arc<Engine>` 返す現 `open_concurrent_with_wal` の挙動に統合
-- 旧 `Engine::open` の挙動は `Engine::open_standalone(path)` にリネーム (テスト / embedded 専用)
-- `tie_text` 族は &self + queue 経路に一本化、`tie_text_to` 族は削除 (別名 → 同一実装)
-- `Syncer::new` に where bound `Engine: HasWal` 的な制約で compile 時に弾く
+**Option A (API 整理、v33 破壊的):**
+1. `Engine::open` を WAL 有効 + `Arc<Engine>` 返す現 `open_concurrent_with_wal` の挙動に統合。旧挙動は `open_standalone` にリネーム
+2. `tie_text` / `tie_text_to` 両方を削除。代わりに単一の `tie_text(&self, ...)` が内部で vocab 登録 + WAL Tie + write_queue push を行う実装に
+3. `tie_text` が `WalOp::Vocab { vid, bytes }` を先に append してから `WalOp::Tie { eid, himo_id, value: vid }` を append するように拡張
+4. WAL recovery / apply_wal_op で `Vocab` op を受けたら peer B 側の vocab に `force_insert(vid, bytes)` する経路を追加 (vid は peer-local でなく、WAL 送信者側の vid をそのまま受け入れる → 衝突回避のため peer A の vid と peer B の vid は名前空間を分ける設計に)
+5. 同様に `tie_ref_async` を追加 (target_eid を u64 で運ぶ)
+6. `commit()` と `wal_commit()` を統合 (片方だけ呼ぶと壊れる現状を解消)
+7. `Syncer::new` の WAL guard は既に有るので維持
 
-**Option B (非破壊的):** 最低限のガード
-- `Syncer::new(engine, _)` 内で `engine.wal_arc().is_none()` なら `panic!("Syncer requires WAL-enabled Engine; use Engine::open_concurrent_with_wal")`
-- doctest 全て `open_concurrent_with_wal` に書き換え
-- README / V32_PLAN.md に「Sync を使うなら必ず `open_concurrent_with_wal`」と明記
-- `Engine::open` / `Engine::create` に `#[deprecated]` は早計なので、doc コメントだけ警告追加
+**Option B (穴を塞がず記録のみ、短期):**
+- 下流に「v32 は text sync 未サポート」と明記
+- `tie_text_to` / `tie_text` のドキュメントに「sync 対象外」と追記
+- 層 1 の guard が入ったので `Engine::open` 経路の silent 破綻は既に解消
+
+**Option C (schema 側で回避):**
+- 下流 (opyula) 側で text フィールドを撤廃、全て u32 の fingerprint に置き換え (例: `pk_text=uuid` → `pk_hi=u32, pk_lo=u32` の 2 himo 分割、human-readable name は content blob へ)
+- content blob は `content_async` で WAL に載るため sync 可
+- ただし schema 大改定 + query 側の書き換え大
+
+---
 
 ### 影響範囲 (修正時に波及する下流 crate)
 
-- opyula (`opyula-core/src/{peer,store,room}.rs` + `opyula-mcp/src/daemon.rs`)
-- oboro (`oboro/src/recorder.rs`)
-- syncretic (`syncretic/src/main.rs` 他)
+- opyula (`opyula-core/src/{peer,store,room}.rs` + `opyula-mcp/src/daemon.rs`, `crates/oboro/src/{registry,recorder}.rs`) — peer / room / membership entity すべて text 依存
+- syncretic (`syncretic/src/main.rs` 他) — memory / task entity が text 依存
 - sinfo (`sinfo-store-enchu` 等)
 
-下流は全て「`Engine::open` → `open_concurrent_with_wal`」「`tie_*` → `tie_*_to`」の書き換えが必要。
+下流は「Option A が入るまで 2 peer sync は実装不能」と見做すべき。単独 peer 機能だけ先行実装する選択肢はある。
+
+---
 
 ### 推奨
 
-Option A (破壊的 refactor) を取って v33 でリリース。下流 crate はいずれも機械的な書き換えで済む。sync を silent に壊す API を残す方が長期的損失が大きい。
+Option A を v33 で実装する。層 3 (vocab sync) が最難関 — WAL op に `Vocab` を足す + 全 peer が同じ vid 空間を共有するか、peer ごとに vocab namespace を分けて remote vid ↔ local vid mapping を持つかの設計判断が要る。
+
+短期 (今 sprint) は Option B で silent 破綻だけ防ぎ、下流には「text sync は v33 まで待つ」と伝達。
 
 ---
 

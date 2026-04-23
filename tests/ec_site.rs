@@ -511,7 +511,7 @@ fn ec_persistence() {
     }
 
     // reopen
-    let db = Engine::open(&path).unwrap();
+    let db = Engine::open_standalone(&path).unwrap();
 
     let reopened_results = vec![
         db.query(&[("type", TYPE_PRODUCT), ("category", 1)]),
@@ -557,7 +557,7 @@ fn view_persistence() {
     }
 
     // open 後、define_view を呼ばずにクエリ
-    let db = Engine::open(&path).unwrap();
+    let db = Engine::open_standalone(&path).unwrap();
 
     // 3紐 view (type, category, price_band) でヒットするはず
     let t = std::time::Instant::now();

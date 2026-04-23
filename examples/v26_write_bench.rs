@@ -7,7 +7,7 @@ fn main() {
     let dir = "/tmp/enchudb_v26_write.db";
     let _ = std::fs::remove_file(dir);
 
-    let mut db = enchudb::Engine::create(dir).unwrap();
+    let mut db = enchudb::Engine::create_standalone(dir).unwrap();
     db.define_himo("city", enchudb::HimoType::Value, 10);
     db.define_himo("dept", enchudb::HimoType::Value, 8);
     db.define_himo("age", enchudb::HimoType::Value, 100);
@@ -83,12 +83,12 @@ fn main() {
 
     // open
     let t = Instant::now();
-    let _db2 = enchudb::Engine::open(dir).unwrap();
+    let _db2 = enchudb::Engine::open_standalone(dir).unwrap();
     println!("open: {:?}", t.elapsed());
 
     // tie_text
     let _ = std::fs::remove_file("/tmp/enchudb_v26_text.db");
-    let mut db3 = enchudb::Engine::create("/tmp/enchudb_v26_text.db").unwrap();
+    let mut db3 = enchudb::Engine::create_standalone("/tmp/enchudb_v26_text.db").unwrap();
     let t = Instant::now();
     for i in 0..10_000 {
         let e = db3.entity();

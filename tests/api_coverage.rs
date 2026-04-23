@@ -66,7 +66,7 @@ fn create_full_with_cyl_all_options() {
 #[test]
 fn get_entity_returns_all_himos() {
     let path = tmp("get_entity");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("age", HimoType::Value, 100);
     eng.define_himo("city", HimoType::Symbol, 0);
     let e = eng.entity();
@@ -108,7 +108,7 @@ fn create_concurrent_without_wal_accepts_tie_async() {
 #[test]
 fn tie_text_to_on_shared_arc() {
     let path = tmp("ttto");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("name", HimoType::Symbol, 0);
     let eng = Arc::new(eng);
 
@@ -128,7 +128,7 @@ fn tie_text_to_on_shared_arc() {
 fn open_concurrent_replica_rejects_writes_and_syncs_via_remote() {
     let path = tmp("repl");
     {
-        let mut eng = Engine::create(&path).unwrap();
+        let mut eng = Engine::create_standalone(&path).unwrap();
         eng.define_himo("v", HimoType::Value, 100);
         eng.flush().unwrap();
     }

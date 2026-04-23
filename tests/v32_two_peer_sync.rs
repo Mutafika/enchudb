@@ -30,7 +30,7 @@ fn cleanup(path: &str) {
 /// 直に呼べない。一旦 plain create で define + flush → reopen で WAL 付き Arc を取る。
 fn make_peer(path: &str, peer: u32) -> Arc<Engine> {
     {
-        let mut eng = Engine::create(path).unwrap();
+        let mut eng = Engine::create_standalone(path).unwrap();
         eng.define_himo("val", HimoType::Value, 100);
         eng.define_himo("name", HimoType::Symbol, 0);
         eng.flush().unwrap();
@@ -249,12 +249,12 @@ fn peer_id_persists_across_reopen() {
     // set_peer_id したあと DB を close → 再 open で peer_id が保たれる。
     let path = tmp("peer_persist");
     {
-        let mut eng = Engine::create(&path).unwrap();
+        let mut eng = Engine::create_standalone(&path).unwrap();
         eng.define_himo("val", HimoType::Value, 10);
         eng.set_peer_id(42);
         eng.flush().unwrap();
     }
-    let mut eng = Engine::open(&path).unwrap();
+    let mut eng = Engine::open_standalone(&path).unwrap();
     assert_eq!(eng.peer_id(), 42);
 
     // entity() が peer=42 を合成した eid を返す

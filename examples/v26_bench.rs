@@ -13,7 +13,7 @@ fn main() {
     let dir24 = "/tmp/enchudb_v26_bench_v24.db";
     let _ = std::fs::remove_file(dir24);
 
-    let mut db = enchudb::Engine::create(dir24).unwrap();
+    let mut db = enchudb::Engine::create_standalone(dir24).unwrap();
 
     // 少ユニーク紐を define_himo で prefix sum 有効化
     db.define_himo("city", enchudb::HimoType::Value, 3);

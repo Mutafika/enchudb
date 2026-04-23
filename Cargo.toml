@@ -15,6 +15,9 @@ repository = "https://github.com/mutafika/enchudb"
 v26 = []
 v27 = ["dep:crossbeam-queue"]
 v32 = ["v27", "dep:ed25519-dalek", "dep:rand_core"]
+# v33: Engine::open/create を Arc<Self>+WAL 返しに統合、mutation API を &self に、
+# text / ref / himo 定義を WAL 経由 sync 対象に。v32 は並存したまま(default では無効)。
+v33 = ["v32"]
 
 [dependencies]
 crossbeam-queue = { version = "0.3", optional = true }

@@ -48,7 +48,7 @@ fn cleanup(path: &str) {
 /// シナリオ用のデータを仕込む。
 /// 戻り値は (engine, person_ids: HashMap<&str, u32>, topic_ids: HashMap<&str, u32>)
 fn seed(path: &str) -> Arc<Engine> {
-    let mut eng = Engine::create(path).unwrap();
+    let mut eng = Engine::create_standalone(path).unwrap();
 
     // スキーマ
     eng.define_himo("kind", HimoType::Value, 10);     // 1=Person, 2=Topic, 3=File, 4=Session
@@ -220,7 +220,7 @@ fn exec_dsl_alice_nextjs_decisions() {
 fn graph_traversal_depth_limit() {
     // (親 -> 子) 階層を作って BFS で深さ制限確認
     let path = tmp("bfs");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("parent", HimoType::Ref, 0);
 
     // root -> a -> b -> c -> d

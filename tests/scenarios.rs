@@ -91,7 +91,7 @@ fn tenant_with_view() {
 #[test]
 fn region_hierarchy_navigation() {
     let path = db_path("region_hier");
-    let mut db = Engine::create(&path).unwrap();
+    let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("name", HimoType::Symbol, 0);
     db.define_himo("parent", HimoType::Ref, 0);
 
@@ -133,7 +133,7 @@ fn region_hierarchy_navigation() {
 #[test]
 fn reverse_lookup_children() {
     let path = db_path("reverse_children");
-    let mut db = Engine::create(&path).unwrap();
+    let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("parent", HimoType::Ref, 0);
 
     let kanto = db.entity();
@@ -185,7 +185,7 @@ fn reverse_lookup_children() {
 #[test]
 fn move_entity_between_parents() {
     let path = db_path("move_parent");
-    let mut db = Engine::create(&path).unwrap();
+    let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("dept", HimoType::Ref, 0);
 
     let dept_old = db.entity();
@@ -213,7 +213,7 @@ fn move_entity_between_parents() {
 #[test]
 fn delete_parent_dangling_refs() {
     let path = db_path("dangling");
-    let mut db = Engine::create(&path).unwrap();
+    let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("parent", HimoType::Ref, 0);
 
     let parent = db.entity();
@@ -282,7 +282,7 @@ fn bulk_tie_consistency() {
 #[test]
 fn repeated_tie_untie() {
     let path = db_path("repeat");
-    let mut db = Engine::create(&path).unwrap();
+    let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("flag", HimoType::Value, 8);
 
     let e = db.entity();
@@ -368,7 +368,7 @@ fn delete_reuse_id() {
 #[test]
 fn cascade_delete_effect() {
     let path = db_path("cascade");
-    let mut db = Engine::create(&path).unwrap();
+    let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("owner", HimoType::Ref, 0);
 
     let owner = db.entity();
@@ -420,7 +420,7 @@ fn views_after_open() {
     } // drop
 
     // open フェーズ — define_view を呼ばない
-    let db = Engine::open(&path).unwrap();
+    let db = Engine::open_standalone(&path).unwrap();
     let r = db.query(&[("tenant", 2), ("status", 1)]);
     let post_query: HashSet<u64> = r.into_iter().collect();
     assert_eq!(post_query, pre_query, "view query must match before/after reopen");
@@ -585,7 +585,7 @@ fn many_himos() {
 #[test]
 fn text_and_value_mixed() {
     let path = db_path("text_value");
-    let mut db = Engine::create(&path).unwrap();
+    let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("city", HimoType::Symbol, 0);
     db.define_himo("age", HimoType::Value, 100);
 
@@ -631,7 +631,7 @@ fn text_and_value_mixed() {
 #[test]
 fn query_pair_empty_cell_fallback() {
     let path = db_path("pair_empty_cell");
-    let mut db = Engine::create(&path).unwrap();
+    let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("type_h", HimoType::Value, 4);
     db.define_himo("board", HimoType::Value, 64);
     db.define_himo("author", HimoType::Value, 1000);
@@ -674,7 +674,7 @@ fn query_pair_empty_cell_fallback() {
 #[test]
 fn sum_basic() {
     let path = db_path("sum_basic");
-    let mut db = Engine::create(&path).unwrap();
+    let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("cost", HimoType::Value, 0);
 
     let mut eids = Vec::new();
@@ -695,7 +695,7 @@ fn sum_basic() {
 #[test]
 fn sum_skips_missing_values() {
     let path = db_path("sum_skip");
-    let mut db = Engine::create(&path).unwrap();
+    let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("price", HimoType::Value, 0);
     db.define_himo("name", HimoType::Symbol, 0);
 
@@ -714,7 +714,7 @@ fn sum_skips_missing_values() {
 #[test]
 fn group_sum_basic() {
     let path = db_path("gsum_basic");
-    let mut db = Engine::create(&path).unwrap();
+    let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("project", HimoType::Value, 10);
     db.define_himo("cost", HimoType::Value, 0);
 
@@ -742,7 +742,7 @@ fn group_sum_basic() {
 #[test]
 fn group_sum_with_query() {
     let path = db_path("gsum_query");
-    let mut db = Engine::create(&path).unwrap();
+    let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("status", HimoType::Value, 5);
     db.define_himo("project", HimoType::Value, 10);
     db.define_himo("material_cost", HimoType::Value, 0);
@@ -780,7 +780,7 @@ fn group_sum_with_query() {
 #[test]
 fn pull_range_basic() {
     let path = db_path("range_basic");
-    let mut db = Engine::create(&path).unwrap();
+    let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("age", HimoType::Value, 100);
 
     for age in 20..=40 {
@@ -827,7 +827,7 @@ fn date_conversion_roundtrip() {
 #[test]
 fn tie_date_and_range() {
     let path = db_path("date_range");
-    let mut db = Engine::create(&path).unwrap();
+    let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("created", HimoType::Value, 0);
 
     // 2026年4月の10日分
@@ -863,7 +863,7 @@ fn tie_date_and_range() {
 #[test]
 fn date_with_sum() {
     let path = db_path("date_sum");
-    let mut db = Engine::create(&path).unwrap();
+    let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("date", HimoType::Value, 0);
     db.define_himo("sales", HimoType::Value, 0);
 
@@ -890,7 +890,7 @@ fn date_with_sum() {
 #[test]
 fn aggregates() {
     let path = db_path("aggregates");
-    let mut db = Engine::create(&path).unwrap();
+    let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("score", HimoType::Value, 0);
 
     let mut eids = Vec::new();
@@ -929,7 +929,7 @@ fn aggregates() {
 #[test]
 fn aggregates_with_missing_values() {
     let path = db_path("agg_missing");
-    let mut db = Engine::create(&path).unwrap();
+    let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("price", HimoType::Value, 0);
 
     let e1 = db.entity(); db.tie(e1, "price", 100);

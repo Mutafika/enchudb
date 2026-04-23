@@ -28,7 +28,7 @@ fn cleanup(path: &str) {
 #[test]
 fn parallel_readers_during_writes() {
     let path = tmp("parallel_rw");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("k", HimoType::Value, 32);
 
     // 初期データを撒く
@@ -100,7 +100,7 @@ fn parallel_readers_during_writes() {
 #[test]
 fn read_after_flush_sees_writes() {
     let path = tmp("flush_visible");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("v", HimoType::Value, 100);
 
     let arc = Engine::concurrentize(eng);
@@ -141,7 +141,7 @@ fn read_after_flush_sees_writes() {
 #[test]
 fn unbounded_queue_handles_burst() {
     let path = tmp("unbounded_burst");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("k", HimoType::Value, 50);
     let eids: Vec<u64> = (0..10_000).map(|_| eng.entity()).collect();
 
@@ -174,7 +174,7 @@ fn unbounded_queue_handles_burst() {
 #[test]
 fn flush_writes_drains_fully() {
     let path = tmp("flush_drains");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("a", HimoType::Value, 10);
     let eids: Vec<u64> = (0..5_000).map(|_| eng.entity()).collect();
 
@@ -198,7 +198,7 @@ fn flush_writes_drains_fully() {
 #[test]
 fn drop_while_reading() {
     let path = tmp("drop_reading");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("k", HimoType::Value, 16);
     let eids: Vec<u64> = (0..500).map(|_| eng.entity()).collect();
     for (i, &e) in eids.iter().enumerate() {
@@ -241,7 +241,7 @@ fn drop_while_reading() {
 #[test]
 fn drop_with_pending_writes() {
     let path = tmp("drop_pending");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("k", HimoType::Value, 50);
     let eids: Vec<u64> = (0..3_000).map(|_| eng.entity()).collect();
 
@@ -276,7 +276,7 @@ fn drop_with_pending_writes() {
 #[test]
 fn multiple_async_writers() {
     let path = tmp("multi_writers");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("g", HimoType::Value, 8);
 
     let arc = Engine::concurrentize(eng);
@@ -320,7 +320,7 @@ fn multiple_async_writers() {
 #[test]
 fn reader_sees_consistent_snapshot() {
     let path = tmp("consistent_snapshot");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("c", HimoType::Value, 16);
 
     let n_ent: u32 = 1_000;
@@ -398,7 +398,7 @@ fn reader_sees_consistent_snapshot() {
 #[test]
 fn long_running_query_during_writes() {
     let path = tmp("long_query");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("a", HimoType::Value, 20);
     eng.define_himo("b", HimoType::Value, 20);
 
@@ -482,7 +482,7 @@ fn long_running_query_during_writes() {
 #[test]
 fn panic_in_reader_doesnt_corrupt() {
     let path = tmp("panic_reader");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("k", HimoType::Value, 16);
     let eids: Vec<u64> = (0..500).map(|_| eng.entity()).collect();
     for (i, &e) in eids.iter().enumerate() {

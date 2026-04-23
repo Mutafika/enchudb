@@ -9,7 +9,7 @@ fn main() {
 
     let dir = "/tmp/v26_update_prof.db";
     let _ = std::fs::remove_file(dir);
-    let mut db = enchudb::Engine::create(dir).unwrap();
+    let mut db = enchudb::Engine::create_standalone(dir).unwrap();
     db.define_himo("a", enchudb::HimoType::Value, 10);
     db.define_himo("b", enchudb::HimoType::Value, 8);
     db.define_himo("c", enchudb::HimoType::Value, 5);

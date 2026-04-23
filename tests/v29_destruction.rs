@@ -86,7 +86,7 @@ fn process_normal_exit_persists_all_writes() {
         .unwrap();
     assert!(status.success(), "crash_writer normal failed: {:?}", status);
 
-    let eng = Engine::open(&path).unwrap();
+    let eng = Engine::open_standalone(&path).unwrap();
     // 500 entity が tie されている(値 0..=499)
     assert!(eng.entity_count() >= 500);
     for i in 0..500u64 {
@@ -204,7 +204,7 @@ fn byte_flip_header_magic_detected() {
     flip_byte(&path, 0);
 
     // open はエラー("not an EnchuDB file")
-    let r = Engine::open(&path);
+    let r = Engine::open_standalone(&path);
     assert!(r.is_err());
     cleanup(&path);
 }
@@ -217,7 +217,7 @@ fn byte_flip_header_metadata_detected_by_crc() {
     // max_entities(offset 8) を改竄 → CRC で検出
     flip_byte(&path, 8);
 
-    let r = Engine::open(&path);
+    let r = Engine::open_standalone(&path);
     match r {
         Err(e) => {
             let s = format!("{}", e);
@@ -269,7 +269,7 @@ fn truncate_db_to_half_fails_to_open() {
     let size = std::fs::metadata(&path).unwrap().len();
     truncate_to(&path, size / 2);
 
-    match Engine::open(&path) {
+    match Engine::open_standalone(&path) {
         Err(e) => {
             let s = format!("{}", e);
             assert!(s.contains("truncated") || s.contains("too small"),
@@ -440,7 +440,7 @@ fn v29_body_bit_flip_detected() {
     flip_byte(&path, size / 2);
 
     // open は region CRC 不一致で失敗するはず
-    match Engine::open(&path) {
+    match Engine::open_standalone(&path) {
         Err(e) => {
             let s = format!("{}", e);
             assert!(s.contains("region CRC"), "expected region CRC error, got: {}", s);

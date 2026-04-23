@@ -882,9 +882,25 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// 現行の単独 Engine を作る(WAL 無し、&mut self で mutation)。
+    /// v32 以前: `Engine::create` の別名。
+    /// v33 以降: `Engine::create` が WAL 付き `Arc<Self>` を返すようになるため、
+    /// 明示的に単独 Engine が欲しい場合はこちらを使う。
     #[cfg(not(target_arch = "wasm32"))]
+    pub fn create_standalone(path: &str) -> io::Result<Self> {
+        Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "v33")))]
     pub fn create(path: &str) -> io::Result<Self> {
         Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)
+    }
+
+    /// v33: `create` は WAL 有効 + `Arc<Self>` 返しに統合。
+    /// 旧挙動は `create_standalone` で取れる。
+    #[cfg(all(not(target_arch = "wasm32"), feature = "v33"))]
+    pub fn create(path: &str) -> io::Result<std::sync::Arc<Self>> {
+        Self::create_concurrent_with_wal(path, 16 * 1024 * 1024)
     }
 
     /// CLI/小規模用途向け。ファイルサイズ数MB。
@@ -1025,9 +1041,25 @@ impl Engine {
         })
     }
 
+    /// 現行の単独 Engine を開く(WAL 無し、&mut self で mutation)。
+    /// v32 以前: `Engine::open` の別名。
+    /// v33 以降: `Engine::open` が WAL 付き `Arc<Self>` を返すようになるため、
+    /// 明示的に単独 Engine が欲しい場合はこちらを使う。
     #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_standalone(path: &str) -> io::Result<Self> {
+        Self::open_internal(path, /*verify_region_crc=*/ true)
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "v33")))]
     pub fn open(path: &str) -> io::Result<Self> {
         Self::open_internal(path, /*verify_region_crc=*/ true)
+    }
+
+    /// v33: `open` は WAL 有効 + `Arc<Self>` 返しに統合。
+    /// 旧挙動は `open_standalone` で取れる。
+    #[cfg(all(not(target_arch = "wasm32"), feature = "v33"))]
+    pub fn open(path: &str) -> io::Result<std::sync::Arc<Self>> {
+        Self::open_concurrent_with_wal(path, 16 * 1024 * 1024)
     }
 
     /// 内部用: region CRC 検証を skip できる open。WAL ルート用。
@@ -1351,7 +1383,7 @@ impl Engine {
     #[cfg(feature = "v32")]
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_replica(path: &str) -> io::Result<Self> {
-        let eng = Self::open(path)?;
+        let eng = Self::open_standalone(path)?;
         eng.is_replica.store(true, std::sync::atomic::Ordering::Release);
         Ok(eng)
     }
@@ -3417,7 +3449,7 @@ mod tests {
     #[test]
     fn entity_create_and_count() {
         let dir = tmp("ent_create");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         assert_eq!(eng.entity_count(), 0);
         let e0 = eng.entity();
         let e1 = eng.entity();
@@ -3429,7 +3461,7 @@ mod tests {
     #[test]
     fn entity_delete_and_reuse() {
         let dir = tmp("ent_del");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let e0 = eng.entity();
         let e1 = eng.entity();
         let e2 = eng.entity();
@@ -3450,7 +3482,7 @@ mod tests {
     #[test]
     fn tie_text_roundtrip() {
         let dir = tmp("tie_text");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let e = eng.entity();
         eng.tie_text(e, "name", "田中");
         assert_eq!(eng.get_text(e, "name"), Some("田中".as_bytes()));
@@ -3460,7 +3492,7 @@ mod tests {
     #[test]
     fn tie_value_roundtrip() {
         let dir = tmp("tie_val");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let e = eng.entity();
         eng.tie(e, "age", 30);
         assert_eq!(eng.get(e, "age"), Some(30));
@@ -3470,7 +3502,7 @@ mod tests {
     #[test]
     fn tie_entity_ref() {
         let dir = tmp("tie_eref");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let parent = eng.entity();
         let child = eng.entity();
         eng.tie_ref(child, "company", parent);
@@ -3484,7 +3516,7 @@ mod tests {
     #[test]
     fn tie_overwrite() {
         let dir = tmp("tie_ow");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let e = eng.entity();
         eng.tie(e, "score", 100);
         eng.tie(e, "score", 200);
@@ -3497,7 +3529,7 @@ mod tests {
     #[test]
     fn tie_value_zero() {
         let dir = tmp("tie_zero");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let e = eng.entity();
         eng.tie(e, "level", 0);
         assert_eq!(eng.get(e, "level"), Some(0));
@@ -3510,7 +3542,7 @@ mod tests {
     #[test]
     fn untie_removes_value() {
         let dir = tmp("untie");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let e = eng.entity();
         eng.tie(e, "age", 30);
         eng.tie_text(e, "name", "X");
@@ -3527,7 +3559,7 @@ mod tests {
     #[test]
     fn delete_removes_all_ties() {
         let dir = tmp("del_ties");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let e = eng.entity();
         eng.tie(e, "age", 30);
         eng.tie_text(e, "name", "田中");
@@ -3544,7 +3576,7 @@ mod tests {
     #[test]
     fn content_set_get() {
         let dir = tmp("content");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let e = eng.entity();
         eng.content(e, "memo", b"hello");
         eng.content(e, "notes", "日本語".as_bytes());
@@ -3559,7 +3591,7 @@ mod tests {
     #[test]
     fn himos_of_entity() {
         let dir = tmp("himos_of");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let e = eng.entity();
         eng.tie(e, "age", 30);
         eng.tie_text(e, "name", "X");
@@ -3573,7 +3605,7 @@ mod tests {
     #[test]
     fn himo_names_all() {
         let dir = tmp("himo_names");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let e = eng.entity();
         eng.tie(e, "x", 1);
         eng.tie_text(e, "y", "a");
@@ -3591,7 +3623,7 @@ mod tests {
     #[test]
     fn query_single_condition() {
         let dir = tmp("q_single");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let e0 = eng.entity();
         eng.tie(e0, "age", 30);
         let e1 = eng.entity();
@@ -3610,7 +3642,7 @@ mod tests {
     #[test]
     fn query_multi_condition() {
         let dir = tmp("q_multi");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
 
         let e0 = eng.entity();
         eng.tie(e0, "age", 30);
@@ -3634,7 +3666,7 @@ mod tests {
     #[test]
     fn query_empty_result() {
         let dir = tmp("q_empty");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let e = eng.entity();
         eng.tie(e, "age", 30);
         eng.rebuild();
@@ -3647,7 +3679,7 @@ mod tests {
     #[test]
     fn query_count_matches_len() {
         let dir = tmp("q_count");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         for i in 0..10 {
             let e = eng.entity();
             eng.tie(e, "bucket", i % 3);
@@ -3666,7 +3698,7 @@ mod tests {
     #[test]
     fn lazy_cylinder_pull_observe() {
         let dir = tmp("lazy_cyl");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
 
         let e0 = eng.entity();
         eng.tie(e0, "age", 30);
@@ -3686,7 +3718,7 @@ mod tests {
     #[test]
     fn pull_range() {
         let dir = tmp("range");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         for age in 20..=40 {
             let e = eng.entity();
             eng.tie(e, "age", age);
@@ -3703,7 +3735,7 @@ mod tests {
     #[test]
     fn lazy_cylinder_pull_range() {
         let dir = tmp("lc_range");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
 
         for age in 20..=40 {
             let e = eng.entity();
@@ -3738,7 +3770,7 @@ mod tests {
         let dir = tmp("persist");
 
         {
-            let mut eng = Engine::create(&dir).unwrap();
+            let mut eng = Engine::create_standalone(&dir).unwrap();
             let e0 = eng.entity();
             eng.tie(e0, "age", 25);
             eng.tie(e0, "dept", 1);
@@ -3751,7 +3783,7 @@ mod tests {
             eng.flush().unwrap();
         }
 
-        let mut eng = Engine::open(&dir).unwrap();
+        let mut eng = Engine::open_standalone(&dir).unwrap();
         assert_eq!(eng.entity_count(), 2);
         assert_eq!(eng.get(0, "age"), Some(25));
         assert_eq!(eng.get(1, "age"), Some(30));
@@ -3771,7 +3803,7 @@ mod tests {
     #[test]
     fn vocab_id_lookup() {
         let dir = tmp("vocab");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let e = eng.entity();
         eng.tie_text(e, "city", "東京");
         eng.tie_text(e, "city2", "大阪");
@@ -3787,7 +3819,7 @@ mod tests {
     #[test]
     fn boundary_value_zero() {
         let dir = tmp("bnd_zero");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let e = eng.entity();
         eng.tie(e, "x", 0);
         assert_eq!(eng.get(e, "x"), Some(0));
@@ -3803,7 +3835,7 @@ mod tests {
     #[test]
     fn boundary_value_large() {
         let dir = tmp("bnd_large");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
 
         let ts = 1_743_552_000u32;
         let e = eng.entity();
@@ -3834,7 +3866,7 @@ mod tests {
     #[test]
     fn boundary_consecutive_values() {
         let dir = tmp("bnd_consec");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         for v in 0..5u32 {
             let e = eng.entity();
             eng.tie(e, "level", v);
@@ -3848,7 +3880,7 @@ mod tests {
     #[test]
     fn boundary_many_dims() {
         let dir = tmp("bnd_dims");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let e = eng.entity();
         for d in 0..20u32 {
             eng.tie(e, &format!("dim_{d}"), d * 10);
@@ -3865,7 +3897,7 @@ mod tests {
     #[test]
     fn bulk_delete_query_consistency() {
         let dir = tmp("bulk_del");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let n = 1000u32;
         for i in 0..n {
             let e = eng.entity();
@@ -3892,7 +3924,7 @@ mod tests {
     #[test]
     fn delete_all_then_reinsert() {
         let dir = tmp("del_all");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let n = 100u32;
         for _ in 0..n {
             let e = eng.entity();
@@ -3922,7 +3954,7 @@ mod tests {
     fn persistence_after_delete() {
         let dir = tmp("persist_del");
         {
-            let mut eng = Engine::create(&dir).unwrap();
+            let mut eng = Engine::create_standalone(&dir).unwrap();
             for i in 0..100u32 {
                 let e = eng.entity();
                 eng.tie(e, "val", i % 10);
@@ -3935,7 +3967,7 @@ mod tests {
             eng.flush().unwrap();
         }
 
-        let mut eng = Engine::open(&dir).unwrap();
+        let mut eng = Engine::open_standalone(&dir).unwrap();
         assert_eq!(eng.query_count(&[("val", 0)]), 0);
         for v in 1..10u32 {
             assert_eq!(eng.query_count(&[("val", v)]), 10);
@@ -3949,7 +3981,7 @@ mod tests {
     #[test]
     fn many_entities_1k() {
         let dir = tmp("many_1k");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let n = 1000u32;
         for i in 0..n {
             let e = eng.entity();
@@ -3972,7 +4004,7 @@ mod tests {
     const SCALE_PER_CO: u32 = SCALE_N / SCALE_COMPANIES;
 
     fn setup_scale(dir: &str) -> Engine {
-        let mut eng = Engine::create(dir).unwrap();
+        let mut eng = Engine::create_standalone(dir).unwrap();
 
         for c in 0..SCALE_COMPANIES {
             for e in 0..SCALE_PER_CO {
@@ -4104,7 +4136,7 @@ mod tests {
             eng.flush().unwrap();
         }
 
-        let mut eng = Engine::open(&dir).unwrap();
+        let mut eng = Engine::open_standalone(&dir).unwrap();
         assert_eq!(eng.entity_count(), SCALE_N);
         assert_eq!(eng.query_count(&[("age", 30)]), expected_age30);
         assert_eq!(eng.query_count(&[("city", city0_vid), ("age", 30)]), expected_city_age);
@@ -4131,14 +4163,14 @@ mod tests {
     #[test]
     fn commit_persists() {
         let dir = tmp("tx_commit");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let e = eng.entity();
         eng.tie(e, "age", 30);
         eng.commit();
         eng.flush().unwrap();
         drop(eng);
 
-        let mut eng = Engine::open(&dir).unwrap();
+        let mut eng = Engine::open_standalone(&dir).unwrap();
         assert_eq!(eng.get(e, "age"), Some(30));
         let _ = std::fs::remove_file(&dir);
     }
@@ -4146,7 +4178,7 @@ mod tests {
     #[test]
     fn rollback_reverts() {
         let dir = tmp("tx_rollback");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let e = eng.entity();
         eng.tie(e, "age", 30);
         eng.commit();
@@ -4161,7 +4193,7 @@ mod tests {
     #[test]
     fn rollback_insert() {
         let dir = tmp("tx_rb_ins");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.commit();
 
         let e = eng.entity();
@@ -4176,7 +4208,7 @@ mod tests {
     fn crash_recovery_rollback() {
         let dir = tmp("tx_crash");
         {
-            let mut eng = Engine::create(&dir).unwrap();
+            let mut eng = Engine::create_standalone(&dir).unwrap();
             let e = eng.entity();
             eng.tie(e, "age", 30);
             eng.commit();
@@ -4187,7 +4219,7 @@ mod tests {
             eng.backing.flush_to_disk().unwrap();
         }
 
-        let mut eng = Engine::open(&dir).unwrap();
+        let mut eng = Engine::open_standalone(&dir).unwrap();
         assert_eq!(eng.get(0, "age"), Some(30));
         let _ = std::fs::remove_file(&dir);
     }
@@ -4197,7 +4229,7 @@ mod tests {
     #[test]
     fn prefix_sum_point_query() {
         let dir = tmp("ps_point");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("age", HimoType::Value, 100);
         eng.define_himo("dept", HimoType::Value, 20);
 
@@ -4215,7 +4247,7 @@ mod tests {
     #[test]
     fn prefix_sum_value_zero() {
         let dir = tmp("ps_zero");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("level", HimoType::Value, 10);
         let e = eng.entity();
         eng.tie(e, "level", 0);
@@ -4227,7 +4259,7 @@ mod tests {
     #[test]
     fn prefix_sum_mixed_with_bsearch() {
         let dir = tmp("ps_mixed");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("age", HimoType::Value, 100);
 
         for i in 0..100u32 {
@@ -4246,7 +4278,7 @@ mod tests {
     fn prefix_sum_persistence() {
         let dir = tmp("ps_persist");
         {
-            let mut eng = Engine::create(&dir).unwrap();
+            let mut eng = Engine::create_standalone(&dir).unwrap();
             eng.define_himo("score", HimoType::Value, 200);
             for i in 0..100u32 {
                 let e = eng.entity();
@@ -4255,7 +4287,7 @@ mod tests {
             assert_eq!(eng.query_count(&[("score", 5)]), 5);
             eng.flush().unwrap();
         }
-        let mut eng = Engine::open(&dir).unwrap();
+        let mut eng = Engine::open_standalone(&dir).unwrap();
         assert_eq!(eng.query_count(&[("score", 5)]), 5);
         assert_eq!(eng.entity_count(), 100);
         let _ = std::fs::remove_file(&dir);
@@ -4264,7 +4296,7 @@ mod tests {
     #[test]
     fn prefix_sum_untie() {
         let dir = tmp("ps_untie");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("age", HimoType::Value, 100);
         let e = eng.entity();
         eng.tie(e, "age", 30);
@@ -4278,7 +4310,7 @@ mod tests {
     #[test]
     fn prefix_sum_overwrite() {
         let dir = tmp("ps_ow");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("score", HimoType::Value, 1000);
         let e = eng.entity();
         eng.tie(e, "score", 100);
@@ -4292,7 +4324,7 @@ mod tests {
     #[test]
     fn prefix_sum_delete() {
         let dir = tmp("ps_del");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("age", HimoType::Value, 100);
         eng.define_himo("dept", HimoType::Value, 20);
         for i in 0..100u32 {
@@ -4314,7 +4346,7 @@ mod tests {
     #[test]
     fn prefix_sum_rollback() {
         let dir = tmp("ps_rollback");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("val", HimoType::Value, 50);
         let e = eng.entity();
         eng.tie(e, "val", 10);
@@ -4332,7 +4364,7 @@ mod tests {
     #[test]
     fn prefix_sum_boundary_max() {
         let dir = tmp("ps_bnd_max");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("x", HimoType::Value, 10);
         let e = eng.entity();
         eng.tie(e, "x", 10);
@@ -4344,7 +4376,7 @@ mod tests {
     #[test]
     fn prefix_sum_bulk_delete_reinsert() {
         let dir = tmp("ps_bulk");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("val", HimoType::Value, 100);
         for _ in 0..500u32 {
             let e = eng.entity();
@@ -4369,7 +4401,7 @@ mod tests {
     // ──── prefix sum スケールテスト（100万 entity）────
 
     fn setup_scale_prefix(dir: &str) -> Engine {
-        let mut eng = Engine::create(dir).unwrap();
+        let mut eng = Engine::create_standalone(dir).unwrap();
         eng.define_himo("age", HimoType::Value, SCALE_AGES);
         eng.define_himo("dept", HimoType::Value, SCALE_DEPTS);
         eng.define_himo("company", HimoType::Value, SCALE_COMPANIES);
@@ -4486,7 +4518,7 @@ mod tests {
             city0_vid = eng.vocab_id("city_0").unwrap();
             eng.flush().unwrap();
         }
-        let mut eng = Engine::open(&dir).unwrap();
+        let mut eng = Engine::open_standalone(&dir).unwrap();
         assert_eq!(eng.entity_count(), SCALE_N);
         assert_eq!(eng.query_count(&[("age", 30)]), expected_age30);
         assert_eq!(eng.query_count(&[("city", city0_vid), ("age", 30)]), expected_city_age);
@@ -4555,7 +4587,7 @@ mod tests {
     fn test_late_himo_on_existing_entities() {
         let dir = tmp("late_himo");
         // Phase 1: 1000 entity作成、nameだけtie
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         for i in 0..1000u32 {
             let e = eng.entity();
             eng.tie_text(e, "name", &format!("company_{i}"));
@@ -4565,7 +4597,7 @@ mod tests {
         drop(eng);
 
         // Phase 2: 再open、既存entityに新しいhimoをtie
-        let mut eng = Engine::open(&dir).unwrap();
+        let mut eng = Engine::open_standalone(&dir).unwrap();
         eng.rebuild();
         for eid in 0..1000u64 {
             eng.tie_text(eid, "has_flag", "1");
@@ -4581,7 +4613,7 @@ mod tests {
         drop(eng);
 
         // Phase 3: 再open後も全件引けるか
-        let eng = Engine::open(&dir).unwrap(); // open内でrebuild済み
+        let eng = Engine::open_standalone(&dir).unwrap(); // open内でrebuild済み
         let vid = eng.vocab_id("1").expect("vocab_id");
         let result = eng.pull_raw("has_flag", vid);
         assert_eq!(result.len(), 1000, "after reopen: expected 1000, got {}", result.len());
@@ -4608,7 +4640,7 @@ mod tests {
         drop(eng);
 
         // Phase 2: 再open、entity 500 と 999 に新himo をtie
-        let mut eng = Engine::open(&dir).unwrap();
+        let mut eng = Engine::open_standalone(&dir).unwrap();
         eng.rebuild();
         eng.tie_text(500, "has_flag", "1");
         eng.tie_text(999, "has_flag", "1");
@@ -4623,7 +4655,7 @@ mod tests {
         drop(eng);
 
         // Phase 3: 再open後
-        let eng = Engine::open(&dir).unwrap(); // open内でrebuild済み
+        let eng = Engine::open_standalone(&dir).unwrap(); // open内でrebuild済み
         let vid = eng.vocab_id("1").expect("vocab_id");
         let result = eng.pull_raw("has_flag", vid);
         assert_eq!(result.len(), 3, "after reopen: expected 3, got {}", result.len());
@@ -4637,7 +4669,7 @@ mod tests {
     #[test]
     fn ntuple_view_register_and_query() {
         let dir = tmp("ntuple_basic");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("tenant", HimoType::Value, 8);
         eng.define_himo("dept", HimoType::Value, 8);
         eng.define_himo("status", HimoType::Value, 4);
@@ -4670,7 +4702,7 @@ mod tests {
     #[test]
     fn ntuple_view_partial_match() {
         let dir = tmp("ntuple_partial");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("a", HimoType::Value, 8);
         eng.define_himo("b", HimoType::Value, 8);
         eng.define_himo("c", HimoType::Value, 4);
@@ -4699,7 +4731,7 @@ mod tests {
     #[test]
     fn ntuple_view_untie_propagates() {
         let dir = tmp("ntuple_untie");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("x", HimoType::Value, 8);
         eng.define_himo("y", HimoType::Value, 8);
 
@@ -4729,7 +4761,7 @@ mod tests {
     #[test]
     fn ntuple_view_delete_propagates() {
         let dir = tmp("ntuple_delete");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("x", HimoType::Value, 8);
         eng.define_himo("y", HimoType::Value, 8);
 
@@ -4754,7 +4786,7 @@ mod tests {
     #[test]
     fn ntuple_view_cell_overflow_rejected() {
         let dir = tmp("ntuple_overflow");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("a", HimoType::Value, 1000);
         eng.define_himo("b", HimoType::Value, 1000);
         eng.define_himo("c", HimoType::Value, 100);
@@ -4769,7 +4801,7 @@ mod tests {
     #[test]
     fn ntuple_view_requires_max_values() {
         let dir = tmp("ntuple_nomv");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         let e = eng.entity();
         eng.tie(e, "foo", 1); // max_values=0 のまま自動作成
         eng.tie(e, "bar", 2);
@@ -4783,7 +4815,7 @@ mod tests {
     #[test]
     fn ntuple_view_exact_match_vs_pair() {
         let dir = tmp("ntuple_exact");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("a", HimoType::Value, 4);
         eng.define_himo("b", HimoType::Value, 4);
         eng.define_himo("c", HimoType::Value, 4);
@@ -4815,7 +4847,7 @@ mod tests {
     #[test]
     fn define_view_persists() {
         let dir = tmp("view_persist");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("tenant", HimoType::Value, 8);
         eng.define_himo("dept", HimoType::Value, 8);
         eng.define_himo("status", HimoType::Value, 4);
@@ -4833,7 +4865,7 @@ mod tests {
         drop(eng);
 
         // 再 open → define_view なしで query が動くこと
-        let eng2 = Engine::open(&dir).unwrap();
+        let eng2 = Engine::open_standalone(&dir).unwrap();
         let post = eng2.query(&[("tenant", 3), ("dept", 1), ("status", 3)]).len();
         assert_eq!(pre, post);
         assert!(pre > 0, "expected matches, got {}", pre);
@@ -4842,7 +4874,7 @@ mod tests {
         // (新しい entity を追加して、観測窓経由で見えること)
         // 注: tie は &mut self なので Drop 前にもう一度可変参照が必要
         drop(eng2);
-        let mut eng3 = Engine::open(&dir).unwrap();
+        let mut eng3 = Engine::open_standalone(&dir).unwrap();
         let new_e = eng3.entity();
         eng3.tie(new_e, "tenant", 3);
         eng3.tie(new_e, "dept", 1);
@@ -4857,7 +4889,7 @@ mod tests {
     #[test]
     fn define_view_cell_count_error() {
         let dir = tmp("view_overflow");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("a", HimoType::Value, 1000);
         eng.define_himo("b", HimoType::Value, 1000);
         eng.define_himo("c", HimoType::Value, 100);
@@ -4871,7 +4903,7 @@ mod tests {
     #[test]
     fn multiple_views_persist() {
         let dir = tmp("view_multi");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("a", HimoType::Value, 4);
         eng.define_himo("b", HimoType::Value, 4);
         eng.define_himo("c", HimoType::Value, 4);
@@ -4894,7 +4926,7 @@ mod tests {
         eng.flush().unwrap();
         drop(eng);
 
-        let eng2 = Engine::open(&dir).unwrap();
+        let eng2 = Engine::open_standalone(&dir).unwrap();
         assert_eq!(eng2.query(&[("a", 1), ("b", 2), ("c", 0)]).len(), q1_pre);
         assert_eq!(eng2.query(&[("a", 1), ("b", 2), ("d", 3)]).len(), q2_pre);
         assert_eq!(eng2.query(&[("c", 0), ("d", 1)]).len(), q3_pre);
@@ -4907,7 +4939,7 @@ mod tests {
     fn concurrent_tie_async_basic() {
         // tie_async → flush_writes → pull_raw で値が見えること。
         let dir = tmp("concurrent_basic");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("age", HimoType::Value, 200);
         let eids: Vec<u64> = (0..100).map(|_| eng.entity()).collect();
 
@@ -4935,7 +4967,7 @@ mod tests {
         use std::time::Duration;
 
         let dir = tmp("concurrent_mrw");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("k", HimoType::Value, 16);
         let eids: Vec<u64> = (0..1_000).map(|_| eng.entity()).collect();
         for (i, &e) in eids.iter().enumerate() {
@@ -5000,7 +5032,7 @@ mod tests {
     #[test]
     fn engine_blob_store_default_none() {
         let dir = tmp("blob_none");
-        let eng = Engine::create(&dir).unwrap();
+        let eng = Engine::create_standalone(&dir).unwrap();
         assert!(eng.blob_store().is_none());
         assert!(eng.put_blob(b"data").is_none());
         let fake_id = crate::blob_store::BlobId::from_bytes(b"x");
@@ -5011,7 +5043,7 @@ mod tests {
     #[test]
     fn engine_blob_store_injected_put_get() {
         let dir = tmp("blob_inject");
-        let eng = Engine::create(&dir).unwrap();
+        let eng = Engine::create_standalone(&dir).unwrap();
         let blob_root = std::env::temp_dir().join(format!(
             "enchu_blob_inj_{}",
             std::time::SystemTime::now()
@@ -5038,7 +5070,7 @@ mod tests {
     fn engine_blob_store_tie_hash_lookup() {
         // 実運用パターン: blob の hex を tie_text で紐付けて検索できる
         let dir = tmp("blob_tie");
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("__blob_id", HimoType::Symbol, 0);
 
         let blob_root = std::env::temp_dir().join(format!(

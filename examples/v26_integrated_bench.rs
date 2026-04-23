@@ -11,7 +11,7 @@ fn main() {
     let dir = "/tmp/enchudb_v26_integrated.db";
     let _ = std::fs::remove_file(dir);
 
-    let mut db = enchudb::Engine::create(dir).unwrap();
+    let mut db = enchudb::Engine::create_standalone(dir).unwrap();
 
     // 少ユニーク紐
     db.define_himo("city", enchudb::HimoType::Value, 3);

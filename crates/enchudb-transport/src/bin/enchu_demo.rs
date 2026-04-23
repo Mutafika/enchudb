@@ -268,7 +268,7 @@ fn cmd_schema(opts: &HashMap<String, String>) {
     };
 
     let mut eng = if std::path::Path::new(&db).exists() {
-        Engine::open(&db).expect("open")
+        Engine::open_standalone(&db).expect("open")
     } else {
         Engine::create_compact(&db).expect("create_compact")
     };

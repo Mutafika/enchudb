@@ -29,7 +29,7 @@ fn replica_rejects_tie() {
     let path = tmp("rejects_tie");
     // origin で schema 定義 + flush
     {
-        let mut eng = Engine::create(&path).unwrap();
+        let mut eng = Engine::create_standalone(&path).unwrap();
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
@@ -51,7 +51,7 @@ fn replica_rejects_tie() {
 fn replica_rejects_entity_and_delete() {
     let path = tmp("rejects_entity");
     {
-        let mut eng = Engine::create(&path).unwrap();
+        let mut eng = Engine::create_standalone(&path).unwrap();
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
@@ -79,7 +79,7 @@ fn replica_rejects_entity_and_delete() {
 fn replica_rejects_content() {
     let path = tmp("rejects_content");
     {
-        let mut eng = Engine::create(&path).unwrap();
+        let mut eng = Engine::create_standalone(&path).unwrap();
         eng.flush().unwrap();
     }
     let eng = Arc::new(Engine::open_replica(&path).unwrap());
@@ -97,7 +97,7 @@ fn replica_allows_remote_apply_and_read() {
     // origin 側に書いた値を replica が remote_tie_apply で受け取って get で読める
     let path = tmp("remote_apply");
     {
-        let mut eng = Engine::create(&path).unwrap();
+        let mut eng = Engine::create_standalone(&path).unwrap();
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
@@ -123,7 +123,7 @@ fn replica_syncs_from_origin_via_syncer() {
 
     // origin 準備 (通常の書き込み DB)
     {
-        let mut eng = Engine::create(&path_origin).unwrap();
+        let mut eng = Engine::create_standalone(&path_origin).unwrap();
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
@@ -132,7 +132,7 @@ fn replica_syncs_from_origin_via_syncer() {
 
     // replica 準備 (同じ schema で作った後、replica として open)
     {
-        let mut eng = Engine::create(&path_replica).unwrap();
+        let mut eng = Engine::create_standalone(&path_replica).unwrap();
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
@@ -182,7 +182,7 @@ fn replica_syncs_from_origin_via_syncer() {
 fn set_replica_mode_toggle() {
     // runtime で replica on/off できる
     let path = tmp("toggle");
-    let mut eng = Engine::create(&path).unwrap();
+    let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("val", HimoType::Value, 100);
     let eng = Arc::new(eng);
     eng.set_peer_id(1);

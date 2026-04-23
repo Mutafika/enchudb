@@ -27,7 +27,7 @@ fn fresh_db_path(tag: &str) -> String {
 }
 
 fn make_db(path: &str) -> Engine {
-    let mut db = Engine::create(path).unwrap();
+    let mut db = Engine::create_standalone(path).unwrap();
     db.define_himo("a", HimoType::Value, 10);
     db.define_himo("b", HimoType::Value, 10);
     db.define_himo("c", HimoType::Value, 10);

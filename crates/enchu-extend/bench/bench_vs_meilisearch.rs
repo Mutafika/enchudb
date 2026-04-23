@@ -64,7 +64,7 @@ async fn run() {
             ("price", FieldType::Int),
         ]),
     );
-    let mut enchu = Engine::create(enchu_dir, schema).unwrap();
+    let mut enchu = Engine::create_standalone(enchu_dir, schema).unwrap();
 
     for tenant in 0..TENANTS {
         for p in 0..PRODUCTS_PER_TENANT {

@@ -38,7 +38,7 @@ fn cleanup(path: &str) {
 
 fn make_peer(path: &str, peer: u32) -> Arc<Engine> {
     {
-        let mut eng = Engine::create(path).unwrap();
+        let mut eng = Engine::create_standalone(path).unwrap();
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
@@ -48,7 +48,7 @@ fn make_peer(path: &str, peer: u32) -> Arc<Engine> {
 }
 
 fn make_peer_with_wal(path: &str, peer: u32) -> Arc<Engine> {
-    let mut eng = Engine::create(path).unwrap();
+    let mut eng = Engine::create_standalone(path).unwrap();
     eng.define_himo("val", HimoType::Value, 100);
     eng.flush().unwrap();
     drop(eng);

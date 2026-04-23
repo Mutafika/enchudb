@@ -245,7 +245,7 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}.wal", path));
         let _ = std::fs::remove_file(format!("{}.crc", path));
         {
-            let mut eng = Engine::create(path).unwrap();
+            let mut eng = Engine::create_standalone(path).unwrap();
             eng.define_himo("val", HimoType::Value, 100);
             eng.flush().unwrap();
         }

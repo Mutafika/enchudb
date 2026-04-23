@@ -348,7 +348,7 @@ mod tests {
     fn setup(name: &str) -> (Arc<Engine>, Ravn) {
         let path = format!("/tmp/enchu_ravn_{name}.db");
         let _ = std::fs::remove_file(&path);
-        let mut eng = Engine::create(&path).unwrap();
+        let mut eng = Engine::create_standalone(&path).unwrap();
 
         eng.define_himo("type", HimoType::Value, 10);
         eng.define_himo("region", HimoType::Value, 10);

@@ -292,7 +292,7 @@ impl Drop for WsPushClient {
 /// # let _ = std::fs::remove_file(&path);
 /// # let _ = std::fs::remove_file(format!("{}.wal", path));
 /// {
-///     let mut eng = Engine::create(&path).unwrap();
+///     let mut eng = Engine::create_standalone(&path).unwrap();
 ///     eng.define_himo("v", HimoType::Value, 100);
 ///     eng.flush().unwrap();
 /// }
@@ -480,7 +480,7 @@ mod tests {
             let _ = std::fs::remove_file(format!("{}{}", path, suffix));
         }
         {
-            let mut eng = Engine::create(&path).unwrap();
+            let mut eng = Engine::create_standalone(&path).unwrap();
             eng.define_himo("v", HimoType::Value, 100);
             eng.flush().unwrap();
         }

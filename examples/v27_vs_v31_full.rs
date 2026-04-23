@@ -34,7 +34,7 @@ fn main() {
     // ──────── データ投入 ────────
 
     let eng_v27 = {
-        let e = Engine::open(&path_v27).unwrap();
+        let e = Engine::open_standalone(&path_v27).unwrap();
         Engine::concurrentize(e)
     };
     let eng_v31 = Engine::open_concurrent_with_wal(&path_v31, 512 * 1024 * 1024).unwrap();
@@ -173,13 +173,13 @@ fn main() {
     drop(eng_v27); drop(eng_v31);
 
     let t0 = Instant::now();
-    let e = Engine::open(&path_v27).unwrap();
+    let e = Engine::open_standalone(&path_v27).unwrap();
     let open_v27 = t0.elapsed();
     let cnt_v27 = e.entity_count();
     drop(e);
 
     let t0 = Instant::now();
-    let e = Engine::open(&path_v31).unwrap();
+    let e = Engine::open_standalone(&path_v31).unwrap();
     let open_v31 = t0.elapsed();
     let cnt_v31 = e.entity_count();
     drop(e);

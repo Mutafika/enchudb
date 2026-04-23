@@ -107,7 +107,7 @@ fn one_million_flush_reopen_cycle() {
     println!("[1m_reopen] create+flush: {} ms", t0.elapsed().as_millis());
 
     let t1 = Instant::now();
-    let eng = Engine::open(&path).unwrap();
+    let eng = Engine::open_standalone(&path).unwrap();
     println!("[1m_reopen] open: {} ms", t1.elapsed().as_millis());
     assert_eq!(eng.entity_count(), 1_000_000);
 

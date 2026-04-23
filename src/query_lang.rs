@@ -164,7 +164,7 @@ mod tests {
     fn setup(name: &str) -> Engine {
         let dir = format!("/tmp/enchu_v24_ql_{name}.db");
         let _ = std::fs::remove_file(&dir);
-        let mut eng = Engine::create(&dir).unwrap();
+        let mut eng = Engine::create_standalone(&dir).unwrap();
 
         for i in 0..10u32 {
             let e = eng.entity();

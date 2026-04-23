@@ -38,7 +38,7 @@ fn snapshot_export_plain_engine_roundtrip() {
 
     // データ投入
     {
-        let mut eng = Engine::create(&src_path).unwrap();
+        let mut eng = Engine::create_standalone(&src_path).unwrap();
         eng.define_himo("age", HimoType::Value, 100);
         let e = eng.entity();
         eng.tie(e, "age", 30);
@@ -52,7 +52,7 @@ fn snapshot_export_plain_engine_roundtrip() {
     }
 
     // dst を open して同じデータが読めるか
-    let eng2 = Engine::open(&dst_path).unwrap();
+    let eng2 = Engine::open_standalone(&dst_path).unwrap();
     assert_eq!(eng2.entity_count(), 1);
     assert_eq!(eng2.get(0, "age"), Some(30));
     let name = eng2.get_text(0, "name").unwrap();
@@ -69,7 +69,7 @@ fn snapshot_export_with_wal_includes_wal_file() {
 
     // スキーマ定義
     {
-        let mut eng = Engine::create(&src_path).unwrap();
+        let mut eng = Engine::create_standalone(&src_path).unwrap();
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
@@ -110,7 +110,7 @@ fn snapshot_export_with_wal_includes_wal_file() {
 fn stats_includes_hlc_info() {
     let src_path = tmp("stats_hlc");
     {
-        let mut eng = Engine::create(&src_path).unwrap();
+        let mut eng = Engine::create_standalone(&src_path).unwrap();
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
@@ -150,7 +150,7 @@ fn stats_includes_hlc_info() {
 fn audit_returns_wal_records() {
     let src_path = tmp("audit_all");
     {
-        let mut eng = Engine::create(&src_path).unwrap();
+        let mut eng = Engine::create_standalone(&src_path).unwrap();
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
@@ -187,7 +187,7 @@ fn audit_returns_wal_records() {
 fn audit_filter_by_author_excludes_others() {
     let src_path = tmp("audit_auth");
     {
-        let mut eng = Engine::create(&src_path).unwrap();
+        let mut eng = Engine::create_standalone(&src_path).unwrap();
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
@@ -225,7 +225,7 @@ fn audit_filter_by_author_excludes_others() {
 fn audit_filter_by_hlc_range() {
     let src_path = tmp("audit_hlc");
     {
-        let mut eng = Engine::create(&src_path).unwrap();
+        let mut eng = Engine::create_standalone(&src_path).unwrap();
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
@@ -273,7 +273,7 @@ fn audit_filter_by_hlc_range() {
 #[test]
 fn audit_on_engine_without_wal_returns_empty() {
     let src_path = tmp("audit_no_wal");
-    let eng = Arc::new(Engine::create(&src_path).unwrap());
+    let eng = Arc::new(Engine::create_standalone(&src_path).unwrap());
     // WAL 付きで open してないので audit は空
     let recs = eng.audit(&AuditFilter::default());
     assert!(recs.is_empty());

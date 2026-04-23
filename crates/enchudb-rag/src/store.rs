@@ -107,7 +107,7 @@ impl RagStoreBuilder {
 
         // enchudb を open or create
         let mut db = if db_path.exists() {
-            Engine::open(db_path.to_str().unwrap()).map_err(io_err)?
+            Engine::open_standalone(db_path.to_str().unwrap()).map_err(io_err)?
         } else {
             Engine::create_with_capacity(db_path.to_str().unwrap(), max_entities).map_err(io_err)?
         };

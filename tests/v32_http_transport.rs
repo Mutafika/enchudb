@@ -37,7 +37,7 @@ fn origin_publishes_replica_pulls_over_http() {
     // origin: 通常の書き込み DB
     let origin_path = tmp("origin");
     {
-        let mut eng = Engine::create(&origin_path).unwrap();
+        let mut eng = Engine::create_standalone(&origin_path).unwrap();
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
@@ -47,7 +47,7 @@ fn origin_publishes_replica_pulls_over_http() {
     // replica: read-only
     let replica_path = tmp("replica");
     {
-        let mut eng = Engine::create(&replica_path).unwrap();
+        let mut eng = Engine::create_standalone(&replica_path).unwrap();
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
@@ -110,7 +110,7 @@ fn multiple_replicas_sync_from_same_origin() {
     // origin
     let origin_path = tmp("multi_origin");
     {
-        let mut eng = Engine::create(&origin_path).unwrap();
+        let mut eng = Engine::create_standalone(&origin_path).unwrap();
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
@@ -120,7 +120,7 @@ fn multiple_replicas_sync_from_same_origin() {
     // replica A
     let replica_a_path = tmp("multi_replica_a");
     {
-        let mut eng = Engine::create(&replica_a_path).unwrap();
+        let mut eng = Engine::create_standalone(&replica_a_path).unwrap();
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
@@ -130,7 +130,7 @@ fn multiple_replicas_sync_from_same_origin() {
     // replica B
     let replica_b_path = tmp("multi_replica_b");
     {
-        let mut eng = Engine::create(&replica_b_path).unwrap();
+        let mut eng = Engine::create_standalone(&replica_b_path).unwrap();
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
@@ -257,7 +257,7 @@ fn incremental_pull_advances_cursor() {
 
     let path = tmp("cursor_replica");
     {
-        let mut eng = Engine::create(&path).unwrap();
+        let mut eng = Engine::create_standalone(&path).unwrap();
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }

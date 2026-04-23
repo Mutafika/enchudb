@@ -291,7 +291,7 @@ fn main() {
 
     let dir = "/tmp/v26_delta_cmp.db";
     let _ = std::fs::remove_file(dir);
-    let mut db = enchudb::Engine::create(dir).unwrap();
+    let mut db = enchudb::Engine::create_standalone(dir).unwrap();
     for &(name, max_v) in &himos {
         db.define_himo(name, enchudb::HimoType::Value, max_v);
     }

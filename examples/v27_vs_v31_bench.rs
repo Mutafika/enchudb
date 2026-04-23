@@ -40,7 +40,7 @@ fn main() {
 
     // v27: concurrent, no WAL
     let eng = {
-        let e = Engine::open(&path_v27).unwrap();
+        let e = Engine::open_standalone(&path_v27).unwrap();
         Engine::concurrentize(e)
     };
     let eids: Vec<u64> = (0..N).map(|_| eng.entity()).collect();
@@ -142,14 +142,14 @@ fn main() {
     println!("\nOPEN (fresh DB、mmap + layout + load + CRC 検証)");
 
     let t0 = Instant::now();
-    let e = Engine::open(&path_v27).unwrap();
+    let e = Engine::open_standalone(&path_v27).unwrap();
     let el_v27_o = t0.elapsed();
     println!("  v27 (no CRC):  {:>8} μs ({} entities)",
         el_v27_o.as_micros(), e.entity_count());
     drop(e);
 
     let t0 = Instant::now();
-    let e = Engine::open(&path_v31).unwrap();
+    let e = Engine::open_standalone(&path_v31).unwrap();
     let el_v31_o = t0.elapsed();
     println!("  v31 (no .crc): {:>8} μs ({} entities)",
         el_v31_o.as_micros(), e.entity_count());

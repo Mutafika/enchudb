@@ -6,7 +6,7 @@ fn main() {
     let dir = "/tmp/enchu_bench_v24.db";
     let _ = std::fs::remove_file(dir);
 
-    let mut eng = Engine::create(dir).unwrap();
+    let mut eng = Engine::create_standalone(dir).unwrap();
     eng.define_himo("age", HimoType::Value, 50);
     eng.define_himo("dept", HimoType::Value, 8);
     eng.define_himo("company", HimoType::Value, 100);
