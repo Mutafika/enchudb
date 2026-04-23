@@ -5,21 +5,22 @@
 //! ```
 //! # #[cfg(feature = "v32")] {
 //! use std::sync::Arc;
-//! use enchudb::{Engine, HimoType};
+//! use enchudb::Engine;
 //! use enchudb::sync::Syncer;
 //! use enchudb::transport::{InMemoryTransport, Transport};
 //!
 //! let path = format!("/tmp/enchudb-sync-doc-{}.db", std::process::id());
 //! let _ = std::fs::remove_file(&path);
-//! let mut eng = Engine::create(&path).unwrap();
-//! eng.define_himo("val", HimoType::Value, 100);
-//! let eng_a = Arc::new(eng);
+//! let _ = std::fs::remove_file(format!("{}.wal", path));
+//! // Sync を使う場合は必ず WAL 有効な Engine を使う。
+//! let eng_a = Engine::create_concurrent_with_wal(&path, 4 * 1024 * 1024).unwrap();
 //!
 //! let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
 //! let syncer = Syncer::new(eng_a.clone(), transport);
 //! let out = syncer.pull_once(2); // 未知の peer から pull、0 件
 //! assert_eq!(out.received, 0);
 //! # let _ = std::fs::remove_file(&path);
+//! # let _ = std::fs::remove_file(format!("{}.wal", path));
 //! # }
 //! ```
 //!
@@ -66,15 +67,29 @@ pub struct SyncOutcome {
 }
 
 impl Syncer {
+    /// WAL 無しの Engine で Syncer を作ると panic する。
+    ///
+    /// Sync は WAL に commit 済みレコードを追記し、`publish_since` でそれを
+    /// 他 peer に流す設計。`Engine::open` / `Engine::create` で開いた
+    /// 旧来の WAL 無し Engine を渡すと `publish_since` は常に 0 件配送する
+    /// silent footgun を作るので、ここで loud に止める。
+    ///
+    /// WAL 有効な Engine を作るには `Engine::open_concurrent_with_wal` /
+    /// `Engine::create_concurrent_with_wal` を使うこと。
     pub fn new(engine: Arc<Engine>, transport: Arc<dyn Transport>) -> Self {
+        let wal = engine.wal_arc().unwrap_or_else(|| {
+            panic!(
+                "Syncer requires a WAL-enabled Engine. \
+                 Use Engine::open_concurrent_with_wal / create_concurrent_with_wal \
+                 instead of Engine::open / create."
+            )
+        });
         // Syncer が attach された engine の WAL は auto_reset を off にする。
         // publish_since は iter_committed で WAL を読むので、consumer が
         // try_reset で WAL を空にすると sync 記録が消える race がある。
         // 正式には「全 peer が replicate 済みの地点まで reset」する watermark が要るが、
         // 未実装なので一旦 auto_reset off で記録を残す方針。
-        if let Some(wal) = engine.wal_arc() {
-            wal.set_auto_reset(false);
-        }
+        wal.set_auto_reset(false);
         Self {
             engine,
             transport,
@@ -229,9 +244,12 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(format!("{}.wal", path));
         let _ = std::fs::remove_file(format!("{}.crc", path));
-        let mut eng = Engine::create(path).unwrap();
-        eng.define_himo("val", HimoType::Value, 100);
-        let eng = Arc::new(eng);
+        {
+            let mut eng = Engine::create(path).unwrap();
+            eng.define_himo("val", HimoType::Value, 100);
+            eng.flush().unwrap();
+        }
+        let eng = Engine::open_concurrent_with_wal(path, 4 * 1024 * 1024).unwrap();
         eng.set_peer_id(peer);
         eng
     }

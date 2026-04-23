@@ -41,7 +41,7 @@ fn origin_publishes_replica_pulls_over_http() {
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
-    let origin = Arc::new(Engine::open(&origin_path).unwrap());
+    let origin = Engine::open_concurrent_with_wal(&origin_path, 16 * 1024 * 1024).unwrap();
     origin.set_peer_id(1);
 
     // replica: read-only
@@ -51,7 +51,7 @@ fn origin_publishes_replica_pulls_over_http() {
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
-    let replica = Arc::new(Engine::open_replica(&replica_path).unwrap());
+    let replica = Engine::open_concurrent_replica(&replica_path, 16 * 1024 * 1024).unwrap();
     replica.set_peer_id(9);
 
     // origin 側 transport = HTTP client、publish 用
@@ -114,7 +114,7 @@ fn multiple_replicas_sync_from_same_origin() {
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
-    let origin = Arc::new(Engine::open(&origin_path).unwrap());
+    let origin = Engine::open_concurrent_with_wal(&origin_path, 16 * 1024 * 1024).unwrap();
     origin.set_peer_id(1);
 
     // replica A
@@ -124,7 +124,7 @@ fn multiple_replicas_sync_from_same_origin() {
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
-    let replica_a = Arc::new(Engine::open_replica(&replica_a_path).unwrap());
+    let replica_a = Engine::open_concurrent_replica(&replica_a_path, 16 * 1024 * 1024).unwrap();
     replica_a.set_peer_id(101);
 
     // replica B
@@ -134,7 +134,7 @@ fn multiple_replicas_sync_from_same_origin() {
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
-    let replica_b = Arc::new(Engine::open_replica(&replica_b_path).unwrap());
+    let replica_b = Engine::open_concurrent_replica(&replica_b_path, 16 * 1024 * 1024).unwrap();
     replica_b.set_peer_id(102);
 
     // origin が publish
@@ -198,7 +198,7 @@ fn fresh_replica_bootstraps_then_syncs() {
     }
 
     // step 2: origin re-open + relay 起動
-    let origin = Arc::new(Engine::open(&origin_path).unwrap());
+    let origin = Engine::open_concurrent_with_wal(&origin_path, 16 * 1024 * 1024).unwrap();
     origin.set_peer_id(1);
     let relay = HttpRelay::start_with_bootstrap("127.0.0.1:0", &origin_path).unwrap();
     let url = format!("http://{}", relay.addr());
@@ -209,7 +209,7 @@ fn fresh_replica_bootstraps_then_syncs() {
     assert_eq!(snapshot_hlc, Hlc::ZERO, "no records published yet, HLC=0");
 
     // replica を open
-    let replica = Arc::new(Engine::open_replica(&replica_path).unwrap());
+    let replica = Engine::open_concurrent_replica(&replica_path, 16 * 1024 * 1024).unwrap();
     replica.set_peer_id(9);
 
     // replica で初期データが読める (bootstrap で DB ごとコピーされた)
@@ -261,7 +261,7 @@ fn incremental_pull_advances_cursor() {
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
-    let replica = Arc::new(Engine::open_replica(&path).unwrap());
+    let replica = Engine::open_concurrent_replica(&path, 16 * 1024 * 1024).unwrap();
     replica.set_peer_id(9);
 
     let himo_id = replica.himo_id("val").unwrap() as u16;

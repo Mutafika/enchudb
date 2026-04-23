@@ -25,33 +25,23 @@ fn cleanup(path: &str) {
     }
 }
 
+/// Syncer には WAL が必須(B guard で panic するので)、全 peer を WAL 付きで作る。
+/// `Engine::create_concurrent_with_wal` は Arc<Engine> を返すので define_himo が
+/// 直に呼べない。一旦 plain create で define + flush → reopen で WAL 付き Arc を取る。
 fn make_peer(path: &str, peer: u32) -> Arc<Engine> {
-    let mut eng = Engine::create(path).unwrap();
-    eng.define_himo("val", HimoType::Value, 100);
-    eng.define_himo("name", HimoType::Symbol, 0);
-    let eng = Arc::new(eng);
+    {
+        let mut eng = Engine::create(path).unwrap();
+        eng.define_himo("val", HimoType::Value, 100);
+        eng.define_himo("name", HimoType::Symbol, 0);
+        eng.flush().unwrap();
+    }
+    let eng = Engine::open_concurrent_with_wal(path, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(peer);
     eng
 }
 
-/// WAL 付きで create → define → concurrentize。tie_async + publish_since 統合テスト用。
 fn make_peer_with_wal(path: &str, peer: u32) -> Arc<Engine> {
-    let eng = Engine::create_concurrent_with_wal(path, 16 * 1024 * 1024).unwrap();
-    eng.set_peer_id(peer);
-    // create_concurrent_with_wal は create_with_capacity の内部 eng を concurrent 化するので、
-    // define_himo は concurrent 化後の Engine の &self でできる tie_async には合わない。
-    // ここでは &mut 版が欲しいので、別ルートで作成する。
-    drop(eng);
-    for suffix in ["", ".wal", ".crc"] {
-        let _ = std::fs::remove_file(format!("{}{}", path, suffix));
-    }
-    let mut eng = Engine::create(path).unwrap();
-    eng.define_himo("val", HimoType::Value, 100);
-    eng.flush().unwrap();
-    drop(eng);
-    let eng = Engine::open_concurrent_with_wal(path, 16 * 1024 * 1024).unwrap();
-    eng.set_peer_id(peer);
-    eng
+    make_peer(path, peer)
 }
 
 #[test]

@@ -127,7 +127,7 @@ fn replica_syncs_from_origin_via_syncer() {
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
-    let origin = Arc::new(Engine::open(&path_origin).unwrap());
+    let origin = Engine::open_concurrent_with_wal(&path_origin, 16 * 1024 * 1024).unwrap();
     origin.set_peer_id(1);
 
     // replica 準備 (同じ schema で作った後、replica として open)
@@ -136,7 +136,7 @@ fn replica_syncs_from_origin_via_syncer() {
         eng.define_himo("val", HimoType::Value, 100);
         eng.flush().unwrap();
     }
-    let replica = Arc::new(Engine::open_replica(&path_replica).unwrap());
+    let replica = Engine::open_concurrent_replica(&path_replica, 16 * 1024 * 1024).unwrap();
     replica.set_peer_id(9);
 
     // transport
