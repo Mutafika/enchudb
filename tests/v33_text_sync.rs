@@ -139,6 +139,68 @@ fn repeated_same_text_is_deduped_on_receiver() {
 }
 
 #[test]
+fn tie_ref_async_propagates_between_peers() {
+    // Ref himo で entity 参照 (同一 peer 内の ref) が sync されることを確認
+    let pa = tmp("ref_a");
+    let pb = tmp("ref_b");
+    {
+        let mut eng = Engine::create_standalone(&pa).unwrap();
+        eng.define_himo("parent", enchudb::HimoType::Ref, 0);
+        eng.flush().unwrap();
+    }
+    {
+        let mut eng = Engine::create_standalone(&pb).unwrap();
+        eng.define_himo("parent", enchudb::HimoType::Ref, 0);
+        eng.flush().unwrap();
+    }
+    let eng_a = Engine::open_concurrent_with_wal(&pa, 16 * 1024 * 1024).unwrap();
+    eng_a.set_peer_id(1);
+    let eng_b = Engine::open_concurrent_with_wal(&pb, 16 * 1024 * 1024).unwrap();
+    eng_b.set_peer_id(2);
+
+    let parent = eng_a.entity();
+    let child = eng_a.entity();
+    eng_a.tie_ref_async(child, "parent", parent);
+    eng_a.commit();  // v33: commit が WAL Commit marker も打つ
+    eng_a.flush_writes();
+    eng_a.wal_sync().unwrap();
+
+    let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
+    let syncer_a = Syncer::new(eng_a.clone(), transport.clone());
+    let syncer_b = Syncer::new(eng_b.clone(), transport.clone());
+    syncer_a.publish_since(Hlc::ZERO);
+    syncer_b.pull_once(1);
+
+    // B 側の child entity の parent himo 値が parent の local と一致(同一 peer 内 ref なので)
+    let parent_local = enchudb::eid_local(parent) as u32;
+    assert_eq!(eng_b.get(child, "parent"), Some(parent_local));
+
+    cleanup(&pa);
+    cleanup(&pb);
+}
+
+#[test]
+fn commit_also_writes_wal_marker_under_v33() {
+    // v33 で commit() が WAL Commit marker を打つ → publish_since が非ゼロを返す
+    let pa = tmp("commit_a");
+    let eng_a = make_peer(&pa, 1);
+
+    let e = eng_a.entity();
+    eng_a.tie_text_async(e, "name", "Zed");
+    eng_a.commit();  // v33: wal_commit 相当も行うはず
+    eng_a.flush_writes();
+    eng_a.wal_sync().unwrap();
+
+    let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
+    let syncer = Syncer::new(eng_a.clone(), transport.clone());
+    let published = syncer.publish_since(Hlc::ZERO);
+    // Vocab + Tie + Commit >= 3
+    assert!(published >= 2, "commit() should flush WAL records, got {}", published);
+
+    cleanup(&pa);
+}
+
+#[test]
 fn peer_a_and_b_share_text_even_if_each_coined_local_vid_first() {
     // 両 peer が「先に」ローカルで別 entity に同じ text を tie_text_async した場合、
     // それぞれ local vid は別物 (A で "Zed" が vid=3、B で "Zed" が vid=5 になる等)。

@@ -1737,8 +1737,15 @@ impl Engine {
 
     // ──── トランザクション ────
 
+    /// v32 以前: undo ログを clear(WAL には触らない)。
+    /// v33 以降: undo clear + WAL Commit marker append を同時に行う。
+    /// 片方だけ呼ぶと状態が割れる現状 (BUGS.md 層 2) を解消。
     pub fn commit(&self) {
         self.undo.commit();
+        #[cfg(all(feature = "v33", feature = "v27"))]
+        if let Some(wal) = self.wal.as_ref() {
+            let _ = wal.append(crate::wal::WalOp::Commit);
+        }
     }
 
     pub fn rollback(&self) {
@@ -3334,6 +3341,34 @@ impl Engine {
         let q = self.write_queue.as_ref()
             .expect("tie_text_async requires create_concurrent or concurrentize");
         q.push(crate::write_queue::Op::Tie { eid: local, himo_id: hid as u16, value: vid });
+        self.push_count.fetch_add(1, Ordering::Release);
+    }
+
+    /// v33: 非同期 tie_ref。target_eid の local 部(u32)を WAL / 本体に運ぶ。
+    /// target_eid は u64 [peer|local] だが、現行 WAL は value: u32 しか運べないため
+    /// peer_id 部は捨てる。すなわち receiver 側では「author_peer と同一 peer 上の entity」を
+    /// 指す ref として再構成される。cross-peer ref (peer A が peer B の entity を指す)は
+    /// 現状未対応 (Ref 用 WAL op を別途用意する必要あり、v34 以降)。
+    #[cfg(feature = "v33")]
+    pub fn tie_ref_async(&self, eid: crate::EntityId, himo: &str, target_eid: crate::EntityId) {
+        use std::sync::atomic::Ordering;
+        self.check_writable();
+        let local = crate::eid_local(eid);
+        let target_local = crate::eid_local(target_eid);
+        assert!(target_local < u32::MAX, "target_local must be < u32::MAX");
+        let hid = self.himo_id(himo)
+            .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
+        if let Some(wal) = self.wal.as_ref() {
+            let wal_eid = crate::make_eid(wal.peer_id(), local);
+            let _ = wal.append(crate::wal::WalOp::Tie {
+                eid: wal_eid, himo_id: hid as u16, value: target_local,
+            });
+        }
+        let q = self.write_queue.as_ref()
+            .expect("tie_ref_async requires create_concurrent or concurrentize");
+        q.push(crate::write_queue::Op::Tie {
+            eid: local, himo_id: hid as u16, value: target_local,
+        });
         self.push_count.fetch_add(1, Ordering::Release);
     }
 
