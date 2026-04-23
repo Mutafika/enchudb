@@ -338,6 +338,46 @@ let client = HttpTransport::new(format!("http://{}", relay.addr()));
 // client は Transport を実装、Syncer に渡せる
 ```
 
+## v33: text sync + API 整理 (feature flag で opt-in)
+
+v32 で発覚した「text フィールドの peer 間 sync が動かない」 footgun (BUGS.md 参照) の根本対処。
+`features = ["v33"]` で opt-in、v32 は並存したまま。
+
+### API 変更
+
+```rust
+// v33 feature off (デフォルト = v32 API):
+let mut eng = Engine::open(path)?;           // Self 返し、WAL 無し
+eng.tie_text(eid, "name", "Alice");           // &mut self、WAL 無書き込み
+// → Sync するには open_concurrent_with_wal + tie_text_to を自分で組む必要あり
+
+// v33 feature on:
+let eng = Engine::open(path)?;                // Arc<Self> 返し、WAL 有効
+eng.tie_text_async(eid, "name", "Alice");     // &self、WAL 経由で自動 sync
+eng.commit();                                 // undo clear + WAL Commit marker
+
+// v33 で旧 standalone 挙動が欲しい時:
+let mut eng = Engine::open_standalone(path)?; // Self 返し、WAL 無し
+```
+
+### 追加 API (v33 only)
+
+- `Engine::open_standalone(path) -> io::Result<Self>` — 旧 `Engine::open` 相当
+- `Engine::create_standalone(path) -> io::Result<Self>` — 旧 `Engine::create` 相当
+- `Engine::tie_text_async(&self, eid, himo, value: &str)` — text を WAL に載せる
+- `Engine::tie_ref_async(&self, eid, himo, target: EntityId)` — ref を WAL に載せる
+- `Engine::remote_vocab_apply(author_peer, remote_vid, bytes)` — sync 時の vocab mapping 構築
+- `Engine::translate_remote_vid(author_peer, himo_id, value)` — Tie 受信時の vid 変換
+
+### WAL の変更
+
+`WalOp::Vocab { vid, bytes }` を新設 (op_type = 6)。tie_text_async は Vocab + Tie の 2 op を連続 append する。receiver は `(author_peer, remote_vid) → local_vid` mapping を `peer_vocab_map` に張り、後続 Tie で Symbol 型 himo の value を translate する。
+
+### 未対応 (v34 以降)
+
+- cross-peer ref (peer A が peer B の entity を指す tie_ref)。現状は target_eid の local 部のみ WAL に載せるので、同一 peer 内 ref のみ sync される
+- 下流 crate (opyula / syncretic / sinfo) の移行
+
 ## v32: BlobStore (大 blob 外出し)
 
 `content()` は単一 DB ファイル内に bytes を埋めるので 512MB/blob 上限。

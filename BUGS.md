@@ -1,6 +1,29 @@
 # EnchuDB バグ記録
 
-## [未修正] v32 Sync が text フィールドで根本的に機能しない (API 設計バグ + 機能穴)
+## [v33 で修正] v32 Sync が text フィールドで根本的に機能しない (API 設計バグ + 機能穴)
+**日付**: 2026-04-23 (初版) / 2026-04-23 追記 (深掘り後) / 2026-04-23 v33 対処
+
+**状態**: v33 feature flag で修正完了 (v32 は並存、opt-out 可能)。下流 crate の移行は別セッション。
+
+### v33 での対処まとめ
+
+| 層 | v32 | v33 |
+|---|---|---|
+| 1: `Engine::open/create` が WAL 無しでも Syncer を受け付ける | panic guard 追加 (decc781) | `Engine::open/create` 自体を Arc<Self>+WAL に統合 (f2a9e20)。旧挙動は `open_standalone/create_standalone` |
+| 2: `tie_*_to` が &self だが WAL に書かない | そのまま (v32 API 温存) | `tie_text_async` / `tie_ref_async` を追加、WAL Vocab + Tie op を流す (e18fd5f, 84772ca) |
+| 3: WAL に text op 無し、vocab peer-local | そのまま | `WalOp::Vocab { vid, bytes }` 追加 (332826f)、receiver が (author_peer, remote_vid) → local_vid mapping を持つ |
+| — | commit/wal_commit 分離 | v33 で commit() が両方やる (84772ca) |
+
+検証: `tests/v33_text_sync.rs` 6 ケース全緑。peer A の `tie_text_async` が peer B で正しい text として読める。vocab 衝突 (両 peer が先にローカルで別 vid を振った場合) も解決。
+
+### 下流 crate (未移行、別セッション)
+
+- opyula: `Engine::open` + `tie_text` を使用。v33 feature に切り替え + `tie_text_async` へ書き換えで動くはず。
+- syncretic / sinfo: 同様。
+
+---
+
+## [v32 で silent → loud 化] v32 Sync が text フィールドで根本的に機能しない (旧記述、保存用)
 **日付**: 2026-04-23 (初版) / 2026-04-23 追記 (深掘り後)
 **箇所**: `engine.rs` — `open` / `create` / `tie_text_to` / `tie_async`、`sync.rs` — `Syncer::publish_since`、`wal.rs` — `WalOp`
 
