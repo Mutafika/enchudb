@@ -1,5 +1,75 @@
 # EnchuDB バグ記録
 
+## [未修正] `Engine::open` 経路で Sync が silent に壊れる (v32 API 設計バグ)
+**日付**: 2026-04-23
+**箇所**: `engine.rs` — `open` / `create` / `open_internal`、`sync.rs` — `Syncer::publish_since`
+
+v32 で Sync サポートが入って以降、Engine の open 系 API が **2 系統** 存在:
+
+| API | WAL | mutation 呼び方 | 返り値 | Sync |
+|---|---|---|---|---|
+| `Engine::open(path)` / `Engine::create(path)` | **無効** (write_queue=None) | `&mut self` (tie_text 等) | `Engine` | **機能しない** |
+| `Engine::open_concurrent_with_wal(path, cap)` / `create_concurrent_with_wal` | 有効 | `&self` (tie_text_to 等) | `Arc<Engine>` | 機能する |
+
+前者で開いた Engine は mutation が直接 `himo_store` に反映されるだけで、WAL ring buffer には 1 バイトも書かれない。結果:
+
+- `Syncer::new(engine, transport)` を渡しても compile error も runtime 警告も出ない
+- `Syncer::publish_since(since)` が呼ばれても `wal.iter_committed()` が常に空 Vec → transport.publish に 0 件渡る → peer 間 sync が成立しない
+- ローカル単体での tie/get/query は正常に動くため、**単体テストでは気づかず、実際に 2 peer を繋いだ瞬間に破綻が発覚する**
+
+### opyula での発症事例 (2026-04-23)
+
+opyula (`/Users/kubo/Desktop/mutafika/opyula`) は peer.rs / store.rs / room.rs / daemon.rs 全てで `Engine::open` / `Engine::create` を使っていた。Phase 1-6 の開発中は動作確認が単一プロセスで完結していたため顕在化せず、Phase 7 MVP 後の 2 peer smoke test (`HOME=/tmp/opytest-a / opytest-b` で `room create` → `room join`) で「room not found after pull (received=0, applied=0)」を踏んで判明。
+
+診断のため `wal.iter_committed().len()` を print したところ常に `0` → 同一インスタンスでも空 → WAL 経路が通っていないことが確認された。
+
+### 症状の顕在化条件
+
+- `Engine::open` / `Engine::create` で開く (docs / README のサンプルコードが大半これ)
+- mutation 後 `commit()` + `flush()` する
+- `Syncer::new(arc_engine, transport)` で sync 構築
+- `publish_since(Hlc::ZERO)` を呼ぶ → 常に 0 件、transport は空配信
+- ローカル側は普通に get/query できるため、tie は確実に入ってる「ように見える」
+- 相手側は何も受け取れない
+
+### 根本原因
+
+API 設計の silent footgun:
+
+1. **デフォルトが罠**: `Engine::open` が名前上「標準」に見えるのに、v32 で追加された Sync 機能と非互換な旧 API の名残。新規ユーザは迷わずこれを呼ぶ。
+2. **Syncer が WAL の有無を検査しない**: `wal_arc()` が None を返すケースで Syncer::publish_since が `return 0` で静かに素通りする (行 117-120 `sync.rs`)。bug というか「WAL 無しで sync しろと言われたら 0 件配る」仕様になってる。
+3. **`tie_text` (&mut self) と `tie_text_to` (&self) の二本立て**: 前者は write_queue バイパスで himo 直書き、後者は queue 経由で WAL に載る。命名が「定義済み紐向け」を示唆するだけで、WAL/非 WAL の違いを表してない。
+4. **ドキュメント不在**: `lib.rs` doctest や README サンプルは `Engine::create` + `Engine::open` を使う。これらがサイレントに Sync を壊すことが明記されてない。
+
+### 修正方針 (案)
+
+**Option A (破壊的 / v33):** API 整理
+- `Engine::open` を WAL 有効 + `Arc<Engine>` 返す現 `open_concurrent_with_wal` の挙動に統合
+- 旧 `Engine::open` の挙動は `Engine::open_standalone(path)` にリネーム (テスト / embedded 専用)
+- `tie_text` 族は &self + queue 経路に一本化、`tie_text_to` 族は削除 (別名 → 同一実装)
+- `Syncer::new` に where bound `Engine: HasWal` 的な制約で compile 時に弾く
+
+**Option B (非破壊的):** 最低限のガード
+- `Syncer::new(engine, _)` 内で `engine.wal_arc().is_none()` なら `panic!("Syncer requires WAL-enabled Engine; use Engine::open_concurrent_with_wal")`
+- doctest 全て `open_concurrent_with_wal` に書き換え
+- README / V32_PLAN.md に「Sync を使うなら必ず `open_concurrent_with_wal`」と明記
+- `Engine::open` / `Engine::create` に `#[deprecated]` は早計なので、doc コメントだけ警告追加
+
+### 影響範囲 (修正時に波及する下流 crate)
+
+- opyula (`opyula-core/src/{peer,store,room}.rs` + `opyula-mcp/src/daemon.rs`)
+- oboro (`oboro/src/recorder.rs`)
+- syncretic (`syncretic/src/main.rs` 他)
+- sinfo (`sinfo-store-enchu` 等)
+
+下流は全て「`Engine::open` → `open_concurrent_with_wal`」「`tie_*` → `tie_*_to`」の書き換えが必要。
+
+### 推奨
+
+Option A (破壊的 refactor) を取って v33 でリリース。下流 crate はいずれも機械的な書き換えで済む。sync を silent に壊す API を残す方が長期的損失が大きい。
+
+---
+
 ## [修正済み] v27 BucketCylinder の silent value clamp(データ破壊)
 **日付**: 2026-04-15
 **箇所**: `cylinder_v27.rs` — `bucket_index()`、`himo_store.rs` (v27)、`write_queue.rs`、`engine.rs`(`create_concurrent`/`concurrentize`/`tie_async`)
