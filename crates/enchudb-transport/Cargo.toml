@@ -1,0 +1,33 @@
+[package]
+name = "enchudb-transport"
+version = "0.1.0"
+edition = "2024"
+description = "Transport implementations for enchudb — HTTP (std-only) and WebSocket (tungstenite)."
+license = "MIT OR Apache-2.0"
+authors = ["mutafika"]
+repository = "https://github.com/mutafika/enchudb"
+
+[features]
+default = ["ws"]
+ws = ["dep:tungstenite"]
+
+[dependencies]
+enchudb = { path = "../..", features = ["v32"] }
+tungstenite = { version = "0.24", optional = true, default-features = false, features = ["handshake"] }
+
+[dev-dependencies]
+sabitori = { path = "../../../sabitori/crates/sabitori" }
+sabitori-style = { path = "../../../sabitori/crates/sabitori-style" }
+sabitori-core = { path = "../../../sabitori/crates/sabitori-core" }
+
+[[bin]]
+name = "enchu_demo"
+path = "src/bin/enchu_demo.rs"
+
+[[bin]]
+name = "bench_distributed"
+path = "src/bin/bench_distributed.rs"
+
+[[example]]
+name = "dist_dashboard"
+path = "examples/dist_dashboard.rs"

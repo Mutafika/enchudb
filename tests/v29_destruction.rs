@@ -450,12 +450,3 @@ fn v29_body_bit_flip_detected() {
     cleanup(&path);
 }
 
-/// 電源断で WAL fsync 前に body msync が disk に先着した場合。
-/// v28 は順序保証を "行儀のよい OS" に依存。v29 で fsync barrier を強化。
-#[test]
-#[ignore = "v29 で fsync barrier 実装後に enable"]
-fn v29_gap_out_of_order_sync() {
-    // この再現は非常に難しい。通常 mmap + msync では順序が保証されるが、
-    // ハードウェア write cache の順序逆転は OS 側でも検出できないことがある。
-    // v29 で sync_data barrier を明示するかの検討メモとして残す。
-}

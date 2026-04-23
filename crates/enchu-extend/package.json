@@ -1,0 +1,24 @@
+{
+  "name": "enchu-extend",
+  "version": "0.4.0",
+  "description": "PG transparent cache — 27x faster than Elasticsearch",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "files": [
+    "dist/",
+    "native.js",
+    "enchu-extend.node",
+    "enchu-extend-linux.node"
+  ],
+  "dependencies": {
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "@types/pg": "^8.20.0",
+    "typescript": "^6.0.2"
+  }
+}

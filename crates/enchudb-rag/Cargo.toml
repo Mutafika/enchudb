@@ -1,0 +1,23 @@
+[package]
+name = "enchudb-rag"
+version = "0.1.0"
+edition = "2024"
+description = "EnchuDB の上に積む RAG ストア。メタフィルタ ns オーダー + brute force cosine。"
+license = "MIT OR Apache-2.0"
+authors = ["mutafika"]
+repository = "https://github.com/mutafika/enchudb"
+
+[features]
+default = []
+simd = []
+# 実エンベッダ: fastembed (BGE-small-en 384dim / multilingual-e5 等、ONNX 経由)。
+# モデルは hf-hub 経由で初回 DL、以後はローカルキャッシュ。
+fastembed = ["dep:fastembed"]
+
+[dependencies]
+enchudb = { path = "../..", features = ["v27"] }
+memmap2 = "0.9"
+fastembed = { version = "5", optional = true, default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
+
+[dev-dependencies]
+rand = "0.8"

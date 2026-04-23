@@ -1,0 +1,11 @@
+[package]
+name = "enchudb-text"
+version = "0.1.0"
+edition = "2021"
+description = "bigram 転置インデックスによる全文検索エンジン。mmap 永続化対応。"
+license = "MIT OR Apache-2.0"
+authors = ["mutafika"]
+repository = "https://github.com/mutafika/enchudb"
+
+[dependencies]
+memmap2 = "0.9"

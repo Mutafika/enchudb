@@ -1,2 +1,8 @@
 /target
 .DS_Store
+.claude/
+crates/*/target/
+crates/enchu-extend/node_modules/
+crates/enchu-extend/dist/
+crates/enchudb-rag/.fastembed_cache/
+**/.fastembed_cache/

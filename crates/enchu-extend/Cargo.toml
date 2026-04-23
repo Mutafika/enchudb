@@ -1,0 +1,27 @@
+[package]
+name = "enchu-extend"
+version = "0.3.0"
+edition = "2024"
+description = "Enchu v20 Node.js binding — Cylinder O(1) slice + TypedArray"
+license = "MIT OR Apache-2.0"
+authors = ["mutafika"]
+repository = "https://github.com/mutafika/enchudb"
+
+[features]
+default = ["v26", "v27"]
+v26 = []
+v27 = ["dep:crossbeam-queue"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "2", features = ["full"] }
+napi-derive = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+memmap2 = "0.9"
+crossbeam-queue = { version = "0.3", optional = true }
+
+[build-dependencies]
+napi-build = "2"

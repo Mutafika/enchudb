@@ -1,16 +1,20 @@
 # EnchuDB
 
-紐ベース円柱エンジン。組み込み DB。単一ファイル、全 mmap、ロックフリー並行 read。
+紐ベース円柱エンジンを中核に据えた組み込み DB と、その上に積む検索 / RAG / トランスポート層。
 
-## 特徴
+単一ファイル mmap、prefix-sum O(1) lookup、ロックフリー並行 read。多条件 AND 検索が ns オーダーで返る。
 
-- **多条件 AND 検索が ns オーダー**（100万件で SQLite の 25,830 倍）
-- **WAL + crash consistency**（書き込み +16% のみ、読み無影響）
-- **グラフ辿り対応**（tie_ref + Ravn で Cypher 相当の多段クエリ）
-- **単一ファイル mmap**（+ WAL sidecar、+ optional CRC sidecar）
-- **Rust ピュア**（`memmap2`, `crossbeam-queue` 以外なし）
+## Workspace
 
-## 最小例
+| Crate | 役割 |
+|---|---|
+| [`enchudb`](./src) | コアストレージエンジン。Cylinder + PairTable + WAL + Ravn |
+| [`enchudb-rag`](./crates/enchudb-rag) | RAG ストア。メタフィルタ先行 + brute force cosine、ANN 不要 |
+| [`enchudb-text`](./crates/enchudb-text) | bigram 転置インデックスによる全文検索 |
+| [`enchudb-transport`](./crates/enchudb-transport) | HTTP / WebSocket 分散トランスポート |
+| [`enchu-extend`](./crates/enchu-extend) | Node.js バインディング (napi-rs)。PostgreSQL 透過キャッシュ |
+
+## Quick start
 
 ```rust
 use enchudb::{Engine, HimoType};
@@ -26,19 +30,18 @@ db.rebuild();
 let result = db.query(&[("age", 30)]);
 ```
 
-## 耐久性（v28+）
+### 耐久性（WAL、v28+）
 
 ```rust
-// WAL 有効で作成
 let db = Engine::create_concurrent_with_wal("/tmp/my.db", 256 * 1024 * 1024)?;
 
 let e = db.entity();
 db.tie_async(e, "age", 30);
-db.wal_sync()?;  // fsync + msync(Sync モード、148μs)
-// または wal_commit() で非同期(Async モード、100ns)
+db.wal_sync()?;      // fsync + msync、Sync モード 148μs
+// または wal_commit() で Async モード 100ns
 ```
 
-## グラフ辿り（v31 Ravn）
+### グラフ辿り（Ravn、v31+）
 
 ```rust
 use enchudb::Ravn;
@@ -52,52 +55,101 @@ let decisions = ravn.extract_text(&alice_sessions, "decision");
 ```
 
 DSL:
+
 ```
 kind:2 name:"Next.js" | reverse topic | where speaker:<alice_eid> | get decision
 ```
 
-## ベンチ vs v27
+### RAG（`enchudb-rag`）
 
-200k entities、tie_async + WAL vs v27 純粋書き：
+```rust
+use enchudb_rag::{RagStore, Chunk, Meta, Query, Filter, Embedder};
+
+let mut store = RagStore::builder()
+    .path("./rag")
+    .dim(384)
+    .meta_symbol("lang")
+    .build()?;
+
+let hits = store.search(
+    Query::new(&query_vec)
+        .filter(Filter::symbol("lang", "en").and(Filter::value("tenant", 3)))
+        .top_k(10)
+)?;
+```
+
+100k chunks / dim=384 で `tenant=1 AND lang=en` フィルタ付き類似検索が **0.49ms**。
+
+## ベンチマーク
+
+### コアエンジン（vs v27 → v31、200k entities）
 
 | 操作 | v27 | v31 | 差 |
 |---|---:|---:|---:|
 | tie_async | 73 ns | 85 ns | +16% |
 | pull_raw | 105 ns | 105 ns | 0% |
-| query (多条件) | 197 ns | 187 ns | -5% |
-| sum/avg/min/max/count | 全て ±5% 以内 | | |
-| follow/reverse_follow/bfs | 全て ±5% 以内 | | |
-| open | 5780 μs | 5847 μs | +1.2% |
+| query（多条件 AND） | 197 ns | 187 ns | −5% |
+| sum / avg / min / max / count | ±5% 以内 | | |
+| follow / reverse_follow / bfs | ±5% 以内 | | |
 | wal_sync | — | 148 μs | 新規 |
+
+### vs SQLite（100万件、多条件フィルタ）
+
+25,830 倍。
+
+### vs Elasticsearch 8.17（profile API 純クエリ時間、マルチテナント 100万件）
+
+| クエリ | EnchuDB | Elasticsearch | 倍率 |
+|---|---:|---:|---:|
+| 単条件 | 2.3µs | 95µs | 41x |
+| 2条件 | 760ns | 320µs | **421x** |
+| 4条件 | 19.7µs | 196µs | 10x |
 
 ## アーキテクチャ要点
 
 - **紐（himo）**: entity に張る属性 = 索引の単位
 - **Column**: source of truth、mmap 永続化
 - **BucketCylinder**（v27）: O(1) insert/remove、未ソートバケット
-- **PairTable**（v26）: 2次元ペアの dense cell、多条件 AND 用
+- **PairTable**（v26）: 2 次元ペアの dense cell、多条件 AND 用
 - **WAL**（v28+）: crash consistency、背景 fsync、リングバッファ再利用
+- **Ravn**（v31+）: グラフ辿り DSL、多段 reverse_follow + filter_by
 
-紐の哲学は CLAUDE.md 参照。
+哲学詳細は [`CLAUDE.md`](./CLAUDE.md) 参照。
 
-## ファイル
+## Testing
+
+```bash
+# コア unit + integration（約 450 件、20 秒程度）
+cargo test --workspace
+
+# 重いスケーリング・ストレステスト（25 件、手動実行）
+cargo test --workspace -- --ignored
+
+# ベンチ
+cargo run --release --features v32 --example v27_vs_v31_full
+```
+
+## ファイル構成
 
 ```
 {path}        メイン DB
-{path}.wal    WAL(v28 有効時)
-{path}.crc    region CRC(seal_integrity 時のみ)
+{path}.wal    WAL（v28+、有効時）
+{path}.crc    region CRC（seal_integrity 時のみ）
 ```
 
 ## 開発状況
 
-0.x 段階。SemVer 1.0 未到達、API 破壊的変更あり得る。
-v1 → v31 を約 1 ヶ月（v28→v31 は 2 時間弱）で駆け抜けた。
+0.x 段階。SemVer 1.0 未到達、破壊的変更あり得る。v1 → v31 を約 1 ヶ月（v28 → v31 は 2 時間弱）で駆け抜けた実験的プロジェクト。
 
-## テスト
+## License
 
-```
-cargo test --features v27 --lib                # unit 110
-cargo test --features v27 --test '*'           # integration 29
-cargo test --features v27 --test v29_stress -- --ignored  # heavy(重い)
-cargo run --release --features v27 --example v27_vs_v31_full  # bench
-```
+Licensed under either of
+
+ * Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+ * MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.

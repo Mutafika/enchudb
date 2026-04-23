@@ -11,7 +11,7 @@ use std::time::Duration;
 use enchudb::{Engine, HimoType, Hlc};
 use enchudb::sync::Syncer;
 use enchudb::transport::{Transport, WireRecord};
-use enchu_transport::http::{HttpRelay, HttpTransport};
+use enchudb_transport::http::{HttpRelay, HttpTransport};
 use enchudb::wal::DecodedOp;
 
 fn tmp(tag: &str) -> String {
