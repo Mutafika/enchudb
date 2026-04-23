@@ -3306,6 +3306,37 @@ impl Engine {
         self.push_count.fetch_add(1, Ordering::Release);
     }
 
+    /// v33: 非同期 tie_text。text 値を vocab に挿入し、WAL に Vocab + Tie の 2 op を流す。
+    ///
+    /// 流れ:
+    /// 1. local vocab に bytes を get_or_insert → `local_vid`
+    /// 2. WAL に `Vocab { vid: local_vid, bytes }` を append
+    ///    - receiver 側でこれを受けると `(author_peer, vid) → receiver_local_vid` の mapping が張られる
+    /// 3. WAL に `Tie { eid, himo_id, value: local_vid }` を append
+    /// 4. write_queue に Tie push で本体に apply
+    ///
+    /// `Engine::tie_text` の &self 版。`tie_async` と異なり text を sync 対象に乗せる。
+    #[cfg(feature = "v33")]
+    pub fn tie_text_async(&self, eid: crate::EntityId, himo: &str, value: &str) {
+        use std::sync::atomic::Ordering;
+        self.check_writable();
+        let local = crate::eid_local(eid);
+        let vid = self.vocab.get_or_insert(value.as_bytes());
+        assert!(vid < u32::MAX, "vocab vid must be < u32::MAX (sentinel reserved)");
+        let hid = self.himo_id(himo)
+            .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
+        if let Some(wal) = self.wal.as_ref() {
+            // Vocab op を先に(sync の receiver 側で Tie より先に mapping が張られるよう)
+            let _ = wal.append(crate::wal::WalOp::Vocab { vid, bytes: value.as_bytes() });
+            let wal_eid = crate::make_eid(wal.peer_id(), local);
+            let _ = wal.append(crate::wal::WalOp::Tie { eid: wal_eid, himo_id: hid as u16, value: vid });
+        }
+        let q = self.write_queue.as_ref()
+            .expect("tie_text_async requires create_concurrent or concurrentize");
+        q.push(crate::write_queue::Op::Tie { eid: local, himo_id: hid as u16, value: vid });
+        self.push_count.fetch_add(1, Ordering::Release);
+    }
+
     /// 非同期 untie。
     #[cfg(feature = "v27")]
     pub fn untie_async(&self, eid: crate::EntityId, himo: &str) {
