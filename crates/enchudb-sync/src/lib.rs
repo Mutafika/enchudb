@@ -25,5 +25,7 @@
 //! ```
 
 pub mod sync;
+pub mod shard;
 
 pub use sync::{Syncer, SyncOutcome};
+pub use shard::{ShardRouter, ShardTransport, ShardQuery, HashRouter, ExplicitRouter, InMemoryShardTransport};
