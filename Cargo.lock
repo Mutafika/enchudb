@@ -971,6 +971,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "enchudb-engine",
+ "enchudb-sync",
  "enchudb-transport",
  "proptest",
  "rusqlite",

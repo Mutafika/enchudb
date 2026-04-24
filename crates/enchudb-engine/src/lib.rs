@@ -36,8 +36,8 @@ pub mod wal;
 pub mod hlc_store;
 #[cfg(feature = "v32")]
 pub mod transport;
-#[cfg(feature = "v32")]
-pub mod sync;
+// `sync::Syncer` は `enchudb-sync` crate に分離済。
+// engine は single-peer でも動くので sync を直接持たない。
 #[cfg(feature = "v32")]
 pub mod changefeed;
 // Transport implementations moved to `enchu-transport` crate.

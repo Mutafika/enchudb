@@ -1,7 +1,8 @@
 //! EnchuDB — 紐ベース円柱エンジン。
 //!
-//! この `enchudb` crate は `enchudb-engine` を便利に再エクスポートする meta crate。
-//! 実装の本体は `enchudb-engine`、p2p sync 層は将来 `enchudb-sync` に切り出される。
+//! この `enchudb` crate は meta crate。
+//! 単独 DB 本体は `enchudb-engine`、p2p sync 層は `enchudb-sync` に分離されている。
+//! 互換性のために主要 API をここから再エクスポートする:
 //!
 //! ```
 //! let path = format!("/tmp/enchudb-doc-{}.db", std::process::id());
@@ -18,3 +19,9 @@
 //! ```
 
 pub use enchudb_engine::*;
+
+/// v32: p2p sync 層(`enchudb-sync`)。`features = ["v32"]` で有効。
+#[cfg(feature = "v32")]
+pub mod sync {
+    pub use enchudb_sync::*;
+}

@@ -15,11 +15,12 @@ repository = "https://github.com/mutafika/enchudb"
 default = []
 v26 = ["enchudb-engine/v26"]
 v27 = ["enchudb-engine/v27"]
-v32 = ["enchudb-engine/v32"]
-v33 = ["enchudb-engine/v33"]
+v32 = ["enchudb-engine/v32", "dep:enchudb-sync"]
+v33 = ["enchudb-engine/v33", "dep:enchudb-sync", "enchudb-sync/v33"]
 
 [dependencies]
 enchudb-engine = { path = "crates/enchudb-engine" }
+enchudb-sync = { path = "crates/enchudb-sync", optional = true }
 
 [dev-dependencies]
 proptest = "1"

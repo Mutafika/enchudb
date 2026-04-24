@@ -2,10 +2,15 @@
 name = "enchudb-sync"
 version = "0.1.0"
 edition = "2024"
-description = "EnchuDB p2p sync — HLC store / Syncer / Transport trait。`enchudb-engine` に積む層。"
+description = "EnchuDB p2p sync — HLC-LWW Syncer。`enchudb-engine` に積む層。"
 license = "MIT OR Apache-2.0"
 authors = ["mutafika"]
 repository = "https://github.com/mutafika/enchudb"
+
+[features]
+default = []
+# v33 で tie_text の remote vocab 翻訳パスが有効になる
+v33 = ["enchudb-engine/v33"]
 
 [dependencies]
 enchudb-engine = { path = "../enchudb-engine", features = ["v32"] }
