@@ -18,7 +18,7 @@
 
 #[cfg(feature = "v27")]
 fn main() {
-    use enchudb::Engine;
+    use enchudb_engine::Engine;
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("usage: crash_writer <path> <scenario> [count]");
@@ -111,7 +111,7 @@ fn main() {
         }
         #[cfg(feature = "v32")]
         "v32_signed_loop" => {
-            use enchudb::keys::Keypair;
+            use enchudb_engine::keys::Keypair;
             // seed 固定で親が pubkey を事前登録できるようにする
             let seed = [7u8; 32];
             let kp = std::sync::Arc::new(Keypair::from_bytes(&seed));

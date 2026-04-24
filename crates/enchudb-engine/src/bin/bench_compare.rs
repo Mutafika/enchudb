@@ -1,4 +1,4 @@
-use enchudb::{Engine, HimoType};
+use enchudb_engine::{Engine, HimoType};
 use std::time::Instant;
 
 fn main() {

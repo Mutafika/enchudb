@@ -6,27 +6,20 @@ resolver = "2"
 name = "enchudb"
 version = "0.1.0"
 edition = "2024"
-description = "EnchuDB — 紐ベース円柱エンジン。prefix sum O(1)。全mmap。"
+description = "EnchuDB — 紐ベース円柱エンジン。`enchudb-engine` を便利に再エクスポートする meta crate。"
 license = "MIT OR Apache-2.0"
 authors = ["mutafika"]
 repository = "https://github.com/mutafika/enchudb"
 
 [features]
-v26 = []
-v27 = ["dep:crossbeam-queue"]
-v32 = ["v27", "dep:ed25519-dalek", "dep:rand_core"]
-# v33: Engine::open/create を Arc<Self>+WAL 返しに統合、mutation API を &self に、
-# text / ref / himo 定義を WAL 経由 sync 対象に。v32 は並存したまま(default では無効)。
-v33 = ["v32"]
+default = []
+v26 = ["enchudb-engine/v26"]
+v27 = ["enchudb-engine/v27"]
+v32 = ["enchudb-engine/v32"]
+v33 = ["enchudb-engine/v33"]
 
 [dependencies]
-crossbeam-queue = { version = "0.3", optional = true }
-ed25519-dalek = { version = "2", optional = true, features = ["rand_core"] }
-rand_core = { version = "0.6", optional = true, features = ["getrandom"] }
-sha2 = "0.10"
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-memmap2 = "0.9"
+enchudb-engine = { path = "crates/enchudb-engine" }
 
 [dev-dependencies]
 proptest = "1"
@@ -41,4 +34,3 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 name = "core"
 harness = false
 required-features = ["v32"]
-

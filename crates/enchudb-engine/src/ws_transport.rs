@@ -20,7 +20,7 @@
 //! let _client = WsPushClient::connect_and_run(
 //!     &format!("ws://{}/push", hub.addr()),
 //!     1,                  // from peer
-//!     enchudb::Hlc::ZERO, // since
+//!     enchudb_engine::Hlc::ZERO, // since
 //!     |rec| { println!("got record hlc={:?}", rec.hlc); },
 //! )?;
 //! ```

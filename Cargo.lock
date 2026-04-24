@@ -970,16 +970,23 @@ name = "enchudb"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "crossbeam-queue",
- "ed25519-dalek",
+ "enchudb-engine",
  "enchudb-transport",
- "memmap2",
  "proptest",
- "rand_core 0.6.4",
  "rusqlite",
  "sabitori",
  "sabitori-core",
  "sabitori-style",
+]
+
+[[package]]
+name = "enchudb-engine"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-queue",
+ "ed25519-dalek",
+ "memmap2",
+ "rand_core 0.6.4",
  "sha2",
 ]
 
@@ -991,6 +998,13 @@ dependencies = [
  "fastembed",
  "memmap2",
  "rand 0.8.6",
+]
+
+[[package]]
+name = "enchudb-sync"
+version = "0.1.0"
+dependencies = [
+ "enchudb-engine",
 ]
 
 [[package]]

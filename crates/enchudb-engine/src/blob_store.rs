@@ -22,7 +22,7 @@
 //! # 使い方
 //!
 //! ```
-//! use enchudb::blob_store::{BlobStore, LocalBlobStore};
+//! use enchudb_engine::blob_store::{BlobStore, LocalBlobStore};
 //! let root = format!("/tmp/enchudb-blob-doc-{}", std::process::id());
 //! let store = LocalBlobStore::new(&root).unwrap();
 //! let id = store.put(b"hello").unwrap();

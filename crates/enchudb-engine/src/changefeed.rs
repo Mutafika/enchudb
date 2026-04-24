@@ -28,9 +28,9 @@
 //! ```
 //! # #[cfg(feature = "v27")] {
 //! use std::sync::{Arc, Mutex};
-//! use enchudb::{Engine, HimoType};
-//! use enchudb::changefeed::ChangeListener;
-//! use enchudb::transport::WireRecord;
+//! use enchudb_engine::{Engine, HimoType};
+//! use enchudb_engine::changefeed::ChangeListener;
+//! use enchudb_engine::transport::WireRecord;
 //!
 //! struct CountSink(Arc<Mutex<usize>>);
 //! impl ChangeListener for CountSink {

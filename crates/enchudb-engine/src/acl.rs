@@ -6,7 +6,7 @@
 //! 許可 peer を複数張る。
 //!
 //! ```
-//! # use enchudb::{Engine, HimoType};
+//! # use enchudb_engine::{Engine, HimoType};
 //! let path = format!("/tmp/enchudb-acl-doc-{}.db", std::process::id());
 //! # let _ = std::fs::remove_file(&path);
 //! let mut eng = Engine::create_standalone(&path).unwrap();

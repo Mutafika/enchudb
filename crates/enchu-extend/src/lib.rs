@@ -39,7 +39,7 @@ where
 pub fn init(path: String, _pg_conn: String, max_entities: Option<u32>) -> Result<()> {
     let engine = match max_entities {
         Some(max) => Engine::create_with_capacity(&path, max),
-        None => Engine::create_standalone(&path),
+        None => Engine::create(&path),
     }.map_err(|e| Error::from_reason(format!("engine create: {e}")))?;
     let mut guard = STATE.lock().map_err(|e| Error::from_reason(format!("lock: {e}")))?;
     *guard = Some(ExtendState { engine });
@@ -48,7 +48,7 @@ pub fn init(path: String, _pg_conn: String, max_entities: Option<u32>) -> Result
 
 #[napi]
 pub fn open(path: String, _pg_conn: String) -> Result<()> {
-    let engine = Engine::open_standalone(&path)
+    let engine = Engine::open(&path)
         .map_err(|e| Error::from_reason(format!("engine open: {e}")))?;
     let mut guard = STATE.lock().map_err(|e| Error::from_reason(format!("lock: {e}")))?;
     *guard = Some(ExtendState { engine });

@@ -5,9 +5,9 @@
 //! ```
 //! # #[cfg(feature = "v32")] {
 //! use std::sync::Arc;
-//! use enchudb::Engine;
-//! use enchudb::sync::Syncer;
-//! use enchudb::transport::{InMemoryTransport, Transport};
+//! use enchudb_engine::Engine;
+//! use enchudb_engine::sync::Syncer;
+//! use enchudb_engine::transport::{InMemoryTransport, Transport};
 //!
 //! let path = format!("/tmp/enchudb-sync-doc-{}.db", std::process::id());
 //! let _ = std::fs::remove_file(&path);
