@@ -4,9 +4,14 @@
 //!
 //! Layout:
 //!   index Region: (eid * MAX_KEYS + key_hash) × 8B → [offset:u32, len:u32]
-//!   data Region:  append-only blob store
+//!   data Region:  [MAGIC: 4B][data_end: AtomicU32 LE][pad: 4B][content bytes...]
+//!
+//! data_end は **mmap 上の AtomicU32** (region byte 4..8)。
+//! MAP_SHARED で map された region を複数プロセスが同時に開いても、
+//! fetch_add が atomic に動くので offset 衝突 / data 上書き が起きない。
+//! (BUGS.md の cross-process content overwrite bug の修正。)
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 use crate::region::Region;
 
 const MAGIC: [u8; 4] = [b'C', b'N', b'T', b'1'];
@@ -15,11 +20,12 @@ const MAX_KEYS: u32 = 16;
 // index_region_size で実際の max_entities を受け取る
 const DEFAULT_MAX_ENTITIES: u32 = 16_777_216;
 const DATA_HEADER: usize = 12;
+/// data region 内の data_end フィールド offset (AtomicU32)。
+const DATA_END_OFFSET: usize = 4;
 
 pub struct ContentStore {
     index: Region,
     data: Region,
-    data_end: AtomicU32,
 }
 
 unsafe impl Sync for ContentStore {}
@@ -38,29 +44,28 @@ impl ContentStore {
         512 * 1024 * 1024 // 512MB
     }
 
-    /// 新規領域を初期化。
+    /// 新規領域を初期化。data_end は mmap 内 AtomicU32 に DATA_HEADER を書く。
     pub fn init(index: Region, data: Region) -> Self {
         let im = index.slice_mut();
         im[0..4].copy_from_slice(&MAGIC);
 
         let dm = data.slice_mut();
         dm[0..4].copy_from_slice(&MAGIC);
-        dm[4..8].copy_from_slice(&(DATA_HEADER as u32).to_le_bytes());
+        // data_end は region 上の atomic として初期化
+        data.as_atomic_u32(DATA_END_OFFSET).store(DATA_HEADER as u32, Ordering::Relaxed);
 
-        Self {
-            index, data,
-            data_end: AtomicU32::new(DATA_HEADER as u32),
-        }
+        Self { index, data }
     }
 
-    /// 既存領域をロード。
+    /// 既存領域をロード。data_end は region 上の atomic をそのまま使う(持ち出さない)。
     pub fn load(index: Region, data: Region) -> Self {
-        let dm = data.slice();
-        let data_end = u32::from_le_bytes(dm[4..8].try_into().unwrap());
-        Self {
-            index, data,
-            data_end: AtomicU32::new(data_end),
-        }
+        Self { index, data }
+    }
+
+    /// data_end atomic への参照 (mmap 上の同一場所、cross-process 整合)。
+    #[inline]
+    fn data_end(&self) -> &std::sync::atomic::AtomicU32 {
+        self.data.as_atomic_u32(DATA_END_OFFSET)
     }
 
     fn key_hash(key: &str) -> u32 {
@@ -78,11 +83,12 @@ impl ContentStore {
         let off = Self::index_offset(eid, kh);
 
         let len = content.len() as u32;
-        let data_off = self.data_end.fetch_add(len, Ordering::Relaxed);
+        // cross-process atomic fetch_add。mmap shared page なので別プロセスと整合。
+        let data_off = self.data_end().fetch_add(len, Ordering::Relaxed);
         let dm = self.data.slice_mut();
         if (data_off + len) as usize > dm.len() {
             // data領域溢れ — fetch_addを巻き戻してパニック
-            self.data_end.fetch_sub(len, Ordering::Relaxed);
+            self.data_end().fetch_sub(len, Ordering::Relaxed);
             panic!("ContentStore data overflow: {} + {} > {}", data_off, len, dm.len());
         }
         dm[data_off as usize..(data_off + len) as usize].copy_from_slice(content);
@@ -119,10 +125,9 @@ impl ContentStore {
         }
     }
 
-    /// 内部状態をRegionヘッダに書き戻す。
+    /// data_end は mmap 上 AtomicU32 で常時永続化されているので、sync は no-op。
+    /// 互換性のため残す(flush 経路が呼んでる)。
     pub fn sync(&self) {
-        let end = self.data_end.load(Ordering::Relaxed);
-        let dm = self.data.slice_mut();
-        dm[4..8].copy_from_slice(&end.to_le_bytes());
+        // no-op: data_end lives in the mapped region directly
     }
 }

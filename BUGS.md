@@ -1,5 +1,124 @@
 # EnchuDB バグ記録
 
+## [修正済み] `ContentStore` の `data_end` が cross-process で persist されず content が上書きされる
+**日付**: 2026-04-24
+**箇所**: `crates/enchudb-engine/src/content_store.rs` — `ContentStore::set` / `load` / `sync`、`crates/enchudb-engine/src/region.rs`
+
+### 修正 (Option A 採用)
+
+- `Region::as_atomic_u32(offset)` を追加: mmap 領域の 4 byte を `AtomicU32` として参照(MAP_SHARED なので cross-process 整合)
+- `ContentStore::data_end: AtomicU32` field を削除、代わりに `self.data.as_atomic_u32(4)` で region 上の atomic を直接参照
+- `fetch_add` / `fetch_sub` がプロセス跨ぎで atomic に動く(別プロセス同士の書き込みで offset 衝突しない)
+- `sync()` は no-op 化(互換のため signature は残す)
+- `load()` が header から data_end を読んで in-memory にコピーしていた挙動も撤廃
+
+tests: `tests/content_store_cross_process.rs` 2 ケース
+- `drop_without_sync_persists_data_end`: Engine を 3 回 open/drop しても別 entity の content が保存される
+- `many_short_lived_writes_do_not_corrupt`: 20 回連続で short-lived open/write/drop した後、全 entity が正しい content を返す
+
+opyula の oboro hook (UserPromptSubmit / PostToolUse 毎に `oboro hook` 短命プロセス起動) でも content 上書きが発生しなくなる。
+
+---
+
+## [元の記録]
+**日付**: 2026-04-24
+**箇所**: `crates/enchudb-engine/src/content_store.rs` — `ContentStore::set` / `load` / `sync`、`engine.rs` — `content()`
+
+### 症状
+
+複数プロセスが短命に同じ `.ecdb` を開いて `content()` で書き込む usecase で、**古い entity の content を読むと最新 write の内容が返る**。
+
+opyula の oboro hook が典型例: Claude Code の UserPromptSubmit / PostToolUse / Stop 等のイベントごとに `oboro hook <event>` が起動 → `Engine::open` → `db.content(entity, "body", payload)` → exit、を数秒ごとに繰り返す。
+
+`oboro stream <session>` で過去 chunk を表示すると、本来各 chunk に別々の body が入っているはずが、**全 chunk の body が最新 hook の content で上書きされた値を返す**。
+
+```
+--- [e3] user_message ts:1777004730 ---
+eigo word-add \
+  -                    # ← 本来は「I will go eat mikan」などの古い prompt
+--- [e8] notification ts:1777004814 ---
+eigo word-add \
+  -                    # ← 本来は "Claude is waiting for your input"
+--- [e9] user_message ts:1777006076 ---
+eigo word-add \
+  -                    # ← これだけが本物
+```
+
+### 根本原因
+
+`ContentStore` の構造:
+
+```rust
+pub struct ContentStore {
+    index: Region,       // mmap 領域
+    data: Region,        // mmap 領域 (append-only blob)
+    data_end: AtomicU32, // process-local カウンタ
+}
+
+pub fn set(&self, eid, key, content) {
+    let data_off = self.data_end.fetch_add(len, Relaxed);   // append 位置決定
+    dm[data_off..data_off+len].copy_from_slice(content);    // data 領域へ write
+    // index[eid][key_hash] = (data_off, len) を書き込み
+}
+
+pub fn sync(&self) {
+    let end = self.data_end.load(Relaxed);
+    dm[4..8].copy_from_slice(&end.to_le_bytes());           // header に書き戻し
+}
+
+pub fn load(index, data) -> Self {
+    let data_end = u32::from_le_bytes(dm[4..8].try_into().unwrap());
+    Self { ..., data_end: AtomicU32::new(data_end) }        // header から復元
+}
+```
+
+**`data_end` は process-local AtomicU32**。`sync()` を呼ばないと region header に書き戻されない。
+
+`engine.rs` の `content()` は `self.contents.set(...)` を呼ぶだけで `sync()` は呼ばない。v32 以前の `flush(&mut self)` 内で全 store を sync していたが、v33 で Engine が `Arc<Self>` 返しになり、`flush` は `&mut self` で Arc 経由だと呼べない。`commit()` は undo + WAL Commit だけで ContentStore には触らない。
+
+結果、cross-process で次が起こる:
+
+1. プロセス A が open → load() で header の data_end=12 を読む
+2. A が `content(e3, "body", data_A)` → data_end atomically 12→12+len_A、data[12..12+len_A] に書き込み、index[e3][body] = (12, len_A)
+3. A が sync なしで exit。header data_end は依然 12
+4. プロセス B が open → load() で header 古い値 12 を読む
+5. B が `content(e9, "body", data_B)` → data_off=12 → **data[12..] を上書き**、index[e9][body] = (12, len_B)
+6. あとから `get(e3, "body")` を呼ぶと、index[e3][body] は (12, len_A) を指すので data[12..12+len_A] を返すが、中身は B が上書きした data_B の先頭 len_A バイト
+
+index は正しく各 entity の offset を保持しているが、data 領域の backing bytes が上書きされている。
+
+### 修正方針 (案)
+
+**A. `data_end` を mmap region 内の AtomicU32 として持つ**
+- `Region` に `as_atomic_u32(offset) -> &AtomicU32` を追加 (mmap は複数プロセスで同じ物理ページを共有するので、そこに AtomicU32 を置けば fetch_add が cross-process 整合)
+- `ContentStore::data_end: AtomicU32` を捨てて、毎回 region header を参照
+- `sync()` は no-op 化、`load` は単に既存の header を使う
+- 複数プロセスが並行 fetch_add しても atomically 別々の offset を取る
+- 推奨
+
+**B. `content()` 呼ばれる度に `sync()`**
+- 簡単だが、毎回 4 byte header 書き戻しのコスト (mmap msync 不要なので実質 cheap かも、ただし書き込み直列化される race は残る — sync と fetch_add が別タイミングなので)
+
+**C. `content_async()` 経由で WAL に載せ、consumer thread が persist 責任を持つ**
+- `WalOp::Content { eid, key, data }` は既に存在
+- cmd_hook が `content_async` を使えば WAL append → consumer が fsync + ContentStore に apply + sync
+- ただし cmd_hook のプロセスが短命なので、WAL consumer thread が drain する前に exit する可能性
+- A と組み合わせるのが良さそう
+
+### 影響範囲
+
+- opyula oboro (PTY chunk 記録)
+- opyula store (memory の content body)
+- 全 `content()` call site (cross-process usage のみ)
+
+単一長命プロセス (opyula daemon 常駐) は `flush` が呼ばれるタイミングで sync されるので発症しづらい。短命プロセスが繰り返し write する usecase (hook / CLI) で発症。
+
+### 推奨
+
+A 案。`Region::as_atomic_u32` 追加 + `ContentStore::data_end` を region 参照に変更。テスト: 2 プロセスから content を交互に書き、最後に第 3 プロセスが両方 read できることを確認。
+
+---
+
 ## [v33 で修正] v32 Sync が text フィールドで根本的に機能しない (API 設計バグ + 機能穴)
 **日付**: 2026-04-23 (初版) / 2026-04-23 追記 (深掘り後) / 2026-04-23 v33 対処
 
