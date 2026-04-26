@@ -3079,7 +3079,11 @@ impl Engine {
                     }
 
                     if !drained_any {
-                        std::thread::yield_now();
+                        // yield_now alone is effectively a busy-spin on multi-core
+                        // (OS reschedules immediately). Sleep briefly so the consumer
+                        // doesn't peg a core when the queue is idle. fsync runs every
+                        // 100ms so 1ms tick is plenty fine-grained.
+                        std::thread::sleep(Duration::from_millis(1));
                     }
                 }
             })
