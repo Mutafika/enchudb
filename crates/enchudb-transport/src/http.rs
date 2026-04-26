@@ -16,6 +16,16 @@
 //!   → 200 OK, body = empty
 //! ```
 //!
+//! # Room scoping (v33+)
+//!
+//! 上記 path を `/rooms/<room_id>/pull` / `/rooms/<room_id>/publish` 形式にすると、
+//! 同じ relay 上で複数 room の record log を独立に扱える。room_id は URL 上の
+//! 論理識別子で、DB ファイル配置とは無関係。legacy `/pull` / `/publish` は
+//! room_id = "" (default bucket) を使う。
+//!
+//! クライアントは `HttpTransport::new_for_room(url, room_id)` で room prefix
+//! 付き transport を作る。
+//!
 //! # 使い方
 //!
 //! ```
@@ -56,7 +66,11 @@ use enchudb::{Hlc, PeerId};
 // ─────────────────────────────────────────────────────────────
 
 /// peer → 昇順 HLC のレコード log。InMemoryTransport と同じ中身。
-type Storage = Arc<Mutex<HashMap<PeerId, Vec<WireRecord>>>>;
+type PeerLog = HashMap<PeerId, Vec<WireRecord>>;
+
+/// room_id ("" = default/legacy bucket) → peer → records。
+/// Record は room 単位で独立に保持 — pull/publish は必ず room を指定する。
+type Storage = Arc<Mutex<HashMap<String, PeerLog>>>;
 
 /// Bootstrap の送信元情報。HttpRelay::start_with_bootstrap で設定する。
 #[derive(Clone)]
@@ -144,15 +158,38 @@ impl HttpRelay {
         }
     }
 
-    /// テスト用: 保持レコード総数。
+    /// テスト用: 保持レコード総数 (全 room 合算)。
     pub fn record_count(&self) -> usize {
-        self.storage.lock().unwrap().values().map(|v| v.len()).sum()
+        self.storage
+            .lock()
+            .unwrap()
+            .values()
+            .flat_map(|peers| peers.values())
+            .map(|v| v.len())
+            .sum()
     }
 
-    /// この relay がレコードを保持している peer_id の一覧。
-    /// daemon が「自 relay に溜まった他 peer のレコード」を drain するのに使う。
+    /// legacy ("" = default) room で保持している peer_id 一覧。
+    /// room 指定版は `known_peer_ids_in(room_id)` を使う。
     pub fn known_peer_ids(&self) -> Vec<PeerId> {
-        self.storage.lock().unwrap().keys().copied().collect()
+        self.known_peer_ids_in("")
+    }
+
+    /// 指定 room bucket で保持している peer_id 一覧。
+    /// daemon が「自 relay に溜まった他 peer の room record」を drain するのに使う。
+    pub fn known_peer_ids_in(&self, room_id: &str) -> Vec<PeerId> {
+        self.storage
+            .lock()
+            .unwrap()
+            .get(room_id)
+            .map(|peers| peers.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// 現在 record を保持している全 room_id を返す。
+    /// "" (default / legacy) も含まれうる。
+    pub fn known_room_ids(&self) -> Vec<String> {
+        self.storage.lock().unwrap().keys().cloned().collect()
     }
 }
 
@@ -221,14 +258,59 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Resu
         body.extend_from_slice(&chunk);
     }
 
-    // path を splits: "/pull?from=1&wall=..."
+    // path を splits: "/pull?from=1&wall=..." または "/rooms/<id>/pull?..."
     let (route, query) = match path.split_once('?') {
         Some((r, q)) => (r, q),
         None => (path, ""),
     };
 
-    match (method, route) {
-        ("GET", "/pull") => {
+    // bootstrap は room_id 無し。先に処理。
+    if method == "GET" && route == "/bootstrap" {
+        let src = match &state.bootstrap {
+            Some(s) => s,
+            None => return send_response(&mut stream, 404, b"bootstrap not enabled"),
+        };
+        let snapshot_hlc = {
+            let guard = storage.lock().unwrap();
+            guard
+                .values()
+                .flat_map(|peers| peers.values())
+                .flat_map(|log| log.iter())
+                .map(|r| r.hlc)
+                .max()
+                .unwrap_or(Hlc::ZERO)
+        };
+        let mut file = match std::fs::File::open(&src.db_path) {
+            Ok(f) => f,
+            Err(_) => return send_response(&mut stream, 500, b"db file not readable"),
+        };
+        let metadata = match file.metadata() {
+            Ok(m) => m,
+            Err(_) => return send_response(&mut stream, 500, b"metadata failed"),
+        };
+        let size = metadata.len();
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\
+             X-Enchu-Bootstrap-Format: sparse-v1\r\n\
+             X-Enchu-Bootstrap-Size: {}\r\n\
+             X-Enchu-Hlc-Wall: {}\r\nX-Enchu-Hlc-Logical: {}\r\nX-Enchu-Hlc-Peer: {}\r\n\r\n",
+            size, snapshot_hlc.wall, snapshot_hlc.logical, snapshot_hlc.peer
+        );
+        stream.write_all(header.as_bytes())?;
+        stream_sparse_file(&mut file, &mut stream, size)?;
+        stream.flush()?;
+        let _ = stream.shutdown(Shutdown::Write);
+        return Ok(());
+    }
+
+    // room-scoped route を分解。
+    // - "/pull" / "/publish"                       → room_id = "" (legacy)
+    // - "/rooms/<id>/pull" / "/rooms/<id>/publish" → room_id = <id>
+    // - それ以外                                   → 404
+    let parsed = parse_route(route);
+
+    match (method, parsed.as_ref().map(|p| (p.0.as_str(), p.1))) {
+        ("GET", Some((room_id, "pull"))) => {
             let params = parse_query(query);
             let from: PeerId = params.get("from").and_then(|s| s.parse().ok()).unwrap_or(0);
             let wall: u64 = params.get("wall").and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -236,14 +318,16 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Resu
             let peer: u32 = params.get("peer").and_then(|s| s.parse().ok()).unwrap_or(0);
             let since = Hlc { wall, logical, peer };
             let guard = storage.lock().unwrap();
-            let recs: Vec<WireRecord> = guard.get(&from)
+            let recs: Vec<WireRecord> = guard
+                .get(room_id)
+                .and_then(|peers| peers.get(&from))
                 .map(|log| log.iter().filter(|r| r.hlc > since).cloned().collect())
                 .unwrap_or_default();
             drop(guard);
             let body_out = encode_batch(&recs);
             send_response_with_body(&mut stream, 200, &body_out)
         }
-        ("POST", "/publish") => {
+        ("POST", Some((room_id, "publish"))) => {
             let params = parse_query(query);
             let peer: PeerId = params.get("peer").and_then(|s| s.parse().ok()).unwrap_or(0);
             match decode_batch(&body) {
@@ -253,7 +337,8 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Resu
                     }
                     records.sort_by_key(|r| r.hlc);
                     let mut guard = storage.lock().unwrap();
-                    let log = guard.entry(peer).or_insert_with(Vec::new);
+                    let room_log = guard.entry(room_id.to_string()).or_insert_with(HashMap::new);
+                    let log = room_log.entry(peer).or_insert_with(Vec::new);
                     log.extend(records);
                     log.sort_by_key(|r| r.hlc);
                     send_response(&mut stream, 200, b"")
@@ -263,51 +348,30 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Resu
                 }
             }
         }
-        ("GET", "/bootstrap") => {
-            let src = match &state.bootstrap {
-                Some(s) => s,
-                None => return send_response(&mut stream, 404, b"bootstrap not enabled"),
-            };
-            // snapshot 時点の max HLC を記録 (replica はここから sync 再開)
-            let snapshot_hlc = {
-                let guard = storage.lock().unwrap();
-                guard.values()
-                    .flat_map(|log| log.iter())
-                    .map(|r| r.hlc)
-                    .max()
-                    .unwrap_or(Hlc::ZERO)
-            };
-            // DB ファイルを open して sparse 形式で stream 送信
-            // enchudb のファイルは mmap 前提で巨大 sparse ファイル (論理 GB、実質 MB)
-            // 生バイト送ると何 GB も流れるため、ゼロラン圧縮必須
-            let mut file = match std::fs::File::open(&src.db_path) {
-                Ok(f) => f,
-                Err(_) => return send_response(&mut stream, 500, b"db file not readable"),
-            };
-            let metadata = match file.metadata() {
-                Ok(m) => m,
-                Err(_) => return send_response(&mut stream, 500, b"metadata failed"),
-            };
-            let size = metadata.len();
-
-            // Content-Length 不明 (圧縮後サイズ) なので Connection: close + EOF で終端
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nConnection: close\r\n\
-                 X-Enchu-Bootstrap-Format: sparse-v1\r\n\
-                 X-Enchu-Bootstrap-Size: {}\r\n\
-                 X-Enchu-Hlc-Wall: {}\r\nX-Enchu-Hlc-Logical: {}\r\nX-Enchu-Hlc-Peer: {}\r\n\r\n",
-                size, snapshot_hlc.wall, snapshot_hlc.logical, snapshot_hlc.peer
-            );
-            stream.write_all(header.as_bytes())?;
-            stream_sparse_file(&mut file, &mut stream, size)?;
-            stream.flush()?;
-            // FIN を送って send 完了を通知。close (drop) だけだとカーネルバッファに残ったデータが
-            // 未送信のまま破棄される可能性あるので明示的に shutdown。
-            let _ = stream.shutdown(Shutdown::Write);
-            Ok(())
-        }
         _ => send_response(&mut stream, 404, b"not found"),
     }
+}
+
+/// route string を (room_id, op) に分解。
+/// - "/pull"                → Some(("", "pull"))
+/// - "/publish"             → Some(("", "publish"))
+/// - "/rooms/<id>/pull"     → Some((<id>, "pull"))
+/// - "/rooms/<id>/publish"  → Some((<id>, "publish"))
+/// - その他                 → None
+fn parse_route(route: &str) -> Option<(String, &'static str)> {
+    if route == "/pull" { return Some((String::new(), "pull")); }
+    if route == "/publish" { return Some((String::new(), "publish")); }
+    let rest = route.strip_prefix("/rooms/")?;
+    let (room_id, tail) = rest.rsplit_once('/')?;
+    if room_id.is_empty() || room_id.contains('/') {
+        return None;
+    }
+    let op = match tail {
+        "pull" => "pull",
+        "publish" => "publish",
+        _ => return None,
+    };
+    Some((room_id.to_string(), op))
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -447,13 +511,26 @@ fn send_response_with_body(stream: &mut TcpStream, status: u16, body: &[u8]) -> 
 /// HTTP client として Transport を実装。同期ブロッキング。
 pub struct HttpTransport {
     base_url: String,
+    /// "" (legacy) または "/rooms/<room_id>"。pull/publish の path 先頭に付く。
+    path_prefix: String,
 }
 
 impl HttpTransport {
-    /// `base_url` = "http://host:port" (path 無し、末尾 / 不要)
+    /// `base_url` = "http://host:port" (path 無し、末尾 / 不要)。
+    /// room 指定無し (legacy `/pull` / `/publish`) の transport を作る。
     pub fn new(base_url: String) -> Self {
         let base = base_url.trim_end_matches('/').to_string();
-        Self { base_url: base }
+        Self { base_url: base, path_prefix: String::new() }
+    }
+
+    /// room_id にスコープされた transport を作る。pull/publish は
+    /// `http://host:port/rooms/<room_id>/pull` 等を叩く。
+    pub fn new_for_room(base_url: String, room_id: &str) -> Self {
+        let base = base_url.trim_end_matches('/').to_string();
+        Self {
+            base_url: base,
+            path_prefix: format!("/rooms/{}", room_id),
+        }
     }
 
     fn host_port(&self) -> io::Result<(String, u16)> {
@@ -620,8 +697,8 @@ impl HttpTransport {
 impl Transport for HttpTransport {
     fn pull(&self, from: PeerId, since: Hlc) -> Vec<WireRecord> {
         let path = format!(
-            "/pull?from={}&wall={}&logical={}&peer={}",
-            from, since.wall, since.logical, since.peer
+            "{}/pull?from={}&wall={}&logical={}&peer={}",
+            self.path_prefix, from, since.wall, since.logical, since.peer
         );
         match self.request("GET", &path, &[]) {
             Ok((200, body)) => decode_batch(&body).unwrap_or_default(),
@@ -632,7 +709,7 @@ impl Transport for HttpTransport {
     fn publish(&self, peer: PeerId, records: Vec<WireRecord>) {
         if records.is_empty() { return; }
         let body = encode_batch(&records);
-        let path = format!("/publish?peer={}", peer);
+        let path = format!("{}/publish?peer={}", self.path_prefix, peer);
         let _ = self.request("POST", &path, &body);
     }
 }
@@ -656,6 +733,60 @@ mod tests {
         let addr = relay.addr();
         assert!(addr.port() != 0);
         drop(relay);
+    }
+
+    #[test]
+    fn rooms_are_isolated_and_legacy_untouched() {
+        let relay = HttpRelay::start("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", relay.addr());
+
+        let legacy = HttpTransport::new(url.clone());
+        let room_a = HttpTransport::new_for_room(url.clone(), "room-a");
+        let room_b = HttpTransport::new_for_room(url, "room-b");
+
+        legacy.publish(1, vec![rec(10, 1, 1, 100)]);
+        room_a.publish(1, vec![rec(20, 1, 2, 200), rec(30, 1, 3, 300)]);
+        room_b.publish(1, vec![rec(40, 1, 4, 400)]);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while relay.record_count() < 4 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(relay.record_count(), 4);
+
+        // 各 transport は自分の room だけ見える。
+        assert_eq!(legacy.pull(1, Hlc::ZERO).len(), 1);
+        assert_eq!(room_a.pull(1, Hlc::ZERO).len(), 2);
+        assert_eq!(room_b.pull(1, Hlc::ZERO).len(), 1);
+
+        // relay 側の room 列挙 API。
+        let mut rooms = relay.known_room_ids();
+        rooms.sort();
+        assert_eq!(rooms, vec!["", "room-a", "room-b"]);
+
+        assert_eq!(relay.known_peer_ids(), vec![1]); // legacy ("") の peer
+        assert_eq!(relay.known_peer_ids_in("room-a"), vec![1]);
+        assert!(relay.known_peer_ids_in("room-nonexistent").is_empty());
+    }
+
+    #[test]
+    fn room_and_legacy_paths_do_not_collide() {
+        let relay = HttpRelay::start("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", relay.addr());
+
+        let legacy = HttpTransport::new(url.clone());
+        let room = HttpTransport::new_for_room(url, "abc");
+
+        legacy.publish(42, vec![rec(1, 42, 1, 1)]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while relay.record_count() < 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // room は何も publish してないので空
+        assert!(room.pull(42, Hlc::ZERO).is_empty());
+        // legacy は 1 件見える
+        assert_eq!(legacy.pull(42, Hlc::ZERO).len(), 1);
     }
 
     #[test]
