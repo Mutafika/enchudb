@@ -513,6 +513,9 @@ pub struct HttpTransport {
     base_url: String,
     /// "" (legacy) または "/rooms/<room_id>"。pull/publish の path 先頭に付く。
     path_prefix: String,
+    /// 任意の追加ヘッダ ("HeaderName: value\r\n" の連結)。
+    /// opyula が monban cert を `Authorization: SSHCert <openssh>` で乗せる用。
+    extra_headers: String,
 }
 
 impl HttpTransport {
@@ -520,7 +523,11 @@ impl HttpTransport {
     /// room 指定無し (legacy `/pull` / `/publish`) の transport を作る。
     pub fn new(base_url: String) -> Self {
         let base = base_url.trim_end_matches('/').to_string();
-        Self { base_url: base, path_prefix: String::new() }
+        Self {
+            base_url: base,
+            path_prefix: String::new(),
+            extra_headers: String::new(),
+        }
     }
 
     /// room_id にスコープされた transport を作る。pull/publish は
@@ -530,7 +537,19 @@ impl HttpTransport {
         Self {
             base_url: base,
             path_prefix: format!("/rooms/{}", room_id),
+            extra_headers: String::new(),
         }
+    }
+
+    /// 追加ヘッダを 1 行設定 (例: "Authorization: SSHCert ssh-ed25519-cert-v01@...")。
+    /// `\r\n` は要らない (内部で付与)。複数回呼ぶと累積。
+    pub fn with_header(mut self, header_line: impl Into<String>) -> Self {
+        let line: String = header_line.into();
+        if !line.is_empty() {
+            self.extra_headers.push_str(&line);
+            self.extra_headers.push_str("\r\n");
+        }
+        self
     }
 
     fn host_port(&self) -> io::Result<(String, u16)> {
@@ -658,8 +677,8 @@ impl HttpTransport {
         let mut stream = self.connect()?;
         let (host, _) = self.host_port()?;
         let req_head = format!(
-            "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            method, path, host, body.len()
+            "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",
+            method, path, host, body.len(), self.extra_headers
         );
         stream.write_all(req_head.as_bytes())?;
         if !body.is_empty() {
