@@ -230,7 +230,10 @@ fn extract_bitmap(bitmap: &[u64]) -> Vec<u32> {
 // ════════════════ ファイルレイアウト ════════════════
 
 const FILE_MAGIC: [u8; 4] = *b"ECDB";
-const FILE_VERSION: u32 = 2;
+/// v3: Layout reorg — variable region (vocab_data / himoreg_data /
+/// content_data) を末尾 cluster に集約。 sparse hole に頼らない apparent
+/// size 縮小の前提 (Phase B Step 1)。 v2 DB は recreate / migrate 必要。
+const FILE_VERSION: u32 = 3;
 const HEADER_SIZE: usize = 4096;
 
 /// 観測窓(view)の永続化制限。
@@ -436,8 +439,14 @@ impl Layout {
         content_data_size: usize, cyl_max_values: u32,
         undo_max_entries: u32,
     ) -> Self {
+        // v3 layout: 固定上限の region 群を前に、 append-only な
+        // variable region 群 (vocab_data / himoreg_data / content_data)
+        // を末尾に集める。 これで「ファイル末尾のみ伸びる」 monotonic
+        // grow が実現でき、 sparse hole に頼らずに apparent size を
+        // 実 usage に追従させられる (Phase B Step 1)。
         let mut off = HEADER_SIZE;
 
+        // ── 固定 cluster: 上限が max_entities / max_himos / *_cap で決まる ──
         let entities_off = off;
         let entities_size = align8(EntitySet::region_size(max_entities));
         off += entities_size;
@@ -446,10 +455,6 @@ impl Layout {
         let undo_size = align8(UndoLog::region_size_with(undo_max_entries));
         off += undo_size;
 
-        let vocab_data_off = off;
-        let vocab_data_size = align8(Vocabulary::data_region_size(vocab_data_size));
-        off += vocab_data_size;
-
         let vocab_offsets_off = off;
         let vocab_offsets_size = align8(Vocabulary::offsets_region_size(vocab_max_entries));
         off += vocab_offsets_size;
@@ -457,10 +462,6 @@ impl Layout {
         let vocab_index_off = off;
         let vocab_index_size = align8(Vocabulary::index_region_size(vocab_index_cap));
         off += vocab_index_size;
-
-        let himoreg_data_off = off;
-        let himoreg_data_size = align8(Vocabulary::data_region_size(himoreg_data_size));
-        off += himoreg_data_size;
 
         let himoreg_offsets_off = off;
         let himoreg_offsets_size = align8(Vocabulary::offsets_region_size(himoreg_max_entries));
@@ -474,10 +475,6 @@ impl Layout {
         let content_index_size = align8(ContentStore::index_region_size_for(max_entities));
         off += content_index_size;
 
-        let content_data_off = off;
-        let content_data_size = align8(content_data_size);
-        off += content_data_size;
-
         let himo_col_size = align8(Column::region_size(max_entities, 4));
         #[cfg(not(feature = "v27"))]
         let himo_cyl_size = align8(Cylinder::region_size(max_entities, cyl_max_values));
@@ -490,6 +487,19 @@ impl Layout {
 
         let himo_base_off = off;
         off += himo_slot_size * (max_himos as usize);
+
+        // ── Variable cluster (tail): append-only で伸びる region 群 ──
+        let vocab_data_off = off;
+        let vocab_data_size = align8(Vocabulary::data_region_size(vocab_data_size));
+        off += vocab_data_size;
+
+        let himoreg_data_off = off;
+        let himoreg_data_size = align8(Vocabulary::data_region_size(himoreg_data_size));
+        off += himoreg_data_size;
+
+        let content_data_off = off;
+        let content_data_size = align8(content_data_size);
+        off += content_data_size;
 
         Layout {
             entities_off, entities_size,
