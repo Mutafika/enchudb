@@ -332,6 +332,11 @@ impl Database {
     // ────── SELECT ──────
 
     fn exec_select(&mut self, q: Query) -> Result<Output, SqlError> {
+        // ORDER BY / LIMIT は Query 直下の field、 select 本体じゃない。
+        // Query を分解してから select 内へ降りる。
+        let order_by = q.order_by.as_ref().cloned();
+        let limit_expr = q.limit.as_ref().cloned();
+
         let select = match *q.body {
             SetExpr::Select(s) => s,
             other => return Err(SqlError::Unsupported(format!("SELECT body: {other:?}"))),
@@ -348,16 +353,78 @@ impl Database {
 
         let projection = resolve_projection(&select.projection, &table)?;
 
+        // ORDER BY 解析: 単一カラム ASC/DESC のみ (複合 / NULLS / WITH FILL は無視)
+        let order_spec: Option<(ColDef, bool)> = match &order_by {
+            None => None,
+            Some(ob) => {
+                if ob.exprs.is_empty() {
+                    None
+                } else {
+                    if ob.exprs.len() > 1 {
+                        return Err(SqlError::Unsupported(
+                            "ORDER BY with multiple columns".into(),
+                        ));
+                    }
+                    let oexpr = &ob.exprs[0];
+                    let col_name = match &oexpr.expr {
+                        Expr::Identifier(id) => id.value.clone(),
+                        other => {
+                            return Err(SqlError::Unsupported(format!(
+                                "ORDER BY expr: {other}"
+                            )));
+                        }
+                    };
+                    let cd = table
+                        .col(&col_name)
+                        .ok_or_else(|| SqlError::UnknownColumn(col_name.clone()))?;
+                    // sqlparser: asc=Some(true)=ASC, Some(false)=DESC, None=デフォ ASC
+                    let asc = oexpr.asc.unwrap_or(true);
+                    Some((cd.clone(), asc))
+                }
+            }
+        };
+
+        // LIMIT 解析: リテラル整数のみ。 LIMIT ALL は Number で表現されないので
+        // 単に「LIMIT 句なし」と区別なく動く (上限なし)。
+        let limit: Option<usize> = match limit_expr {
+            None => None,
+            Some(e) => match eval_literal(&e)? {
+                Value::Integer(n) if n >= 0 => Some(n as usize),
+                other => {
+                    return Err(SqlError::BadValue(format!("LIMIT: {other:?}")));
+                }
+            },
+        };
+
         let eids = self.eval_where(&table, select.selection.as_ref())?;
 
-        let mut rows = Vec::with_capacity(eids.len());
+        // ORDER BY のソートキーを別 vec に out-of-band で持たせる。
+        // projection に order 列が含まれていない場合でも比較できるよう、
+        // 各 eid について order_cd の値を別途読む。
+        let mut indexed: Vec<(EntityId, Vec<Value>, Option<Value>)> =
+            Vec::with_capacity(eids.len());
         for eid in eids {
             let mut row = Vec::with_capacity(projection.len());
             for cd in &projection {
                 row.push(read_value(&self.eng, eid, cd));
             }
-            rows.push(row);
+            let sort_key = order_spec
+                .as_ref()
+                .map(|(cd, _)| read_value(&self.eng, eid, cd));
+            indexed.push((eid, row, sort_key));
         }
+
+        if let Some((_, asc)) = &order_spec {
+            indexed.sort_by(|a, b| {
+                let ord = compare_sort_values(a.2.as_ref(), b.2.as_ref());
+                if *asc { ord } else { ord.reverse() }
+            });
+        }
+        if let Some(n) = limit {
+            indexed.truncate(n);
+        }
+
+        let rows: Vec<Vec<Value>> = indexed.into_iter().map(|(_, r, _)| r).collect();
         let columns = projection.iter().map(|c| c.name.clone()).collect();
         Ok(Output::Rows { columns, rows })
     }
@@ -431,13 +498,27 @@ impl Database {
 
         let preds = match sel {
             None => Vec::new(),
-            Some(e) => collect_eq_preds(table, e)?,
+            Some(e) => collect_preds(table, e)?,
         };
 
-        // build query: __sql_table = <table_vid> AND <preds>
-        let mut q: Vec<(String, u32)> = Vec::with_capacity(preds.len() + 1);
+        // 等値 pred は engine 側 query に折り込める。 範囲 / IS NULL は
+        // engine が等値 query しか持たないので、 fetch 後に Rust で filter。
+        let mut eq_preds: Vec<(&ColDef, Value)> = Vec::new();
+        let mut range_preds: Vec<(&ColDef, RangeOp, Value)> = Vec::new();
+        let mut null_preds: Vec<(&ColDef, bool)> = Vec::new(); // (col, want_null)
+        for p in preds {
+            match p {
+                Pred::Eq(cd, v) => eq_preds.push((cd, v)),
+                Pred::Range(cd, op, v) => range_preds.push((cd, op, v)),
+                Pred::IsNull(cd) => null_preds.push((cd, true)),
+                Pred::IsNotNull(cd) => null_preds.push((cd, false)),
+            }
+        }
+
+        // build query: __sql_table = <table_vid> AND <eq_preds>
+        let mut q: Vec<(String, u32)> = Vec::with_capacity(eq_preds.len() + 1);
         q.push((TABLE_MARKER_HIMO.to_string(), table_vid));
-        for (cd, v) in &preds {
+        for (cd, v) in &eq_preds {
             let raw = match (cd.ty, v) {
                 (SqlType::Integer, Value::Integer(n)) => {
                     if *n < 0 || *n >= u32::MAX as i64 {
@@ -455,7 +536,30 @@ impl Database {
             q.push((cd.himo.clone(), raw));
         }
         let refs: Vec<(&str, u32)> = q.iter().map(|(h, v)| (h.as_str(), *v)).collect();
-        Ok(self.eng.query(&refs))
+        let candidates = self.eng.query(&refs);
+
+        if range_preds.is_empty() && null_preds.is_empty() {
+            return Ok(candidates);
+        }
+        // 範囲 / NULL filter: 各候補について該当列を読み出して比較
+        let kept: Vec<EntityId> = candidates
+            .into_iter()
+            .filter(|eid| {
+                let range_ok = range_preds.iter().all(|(cd, op, target)| {
+                    let actual = read_value(&self.eng, *eid, cd);
+                    cmp_with_op(&actual, *op, target)
+                });
+                if !range_ok {
+                    return false;
+                }
+                null_preds.iter().all(|(cd, want_null)| {
+                    let actual = read_value(&self.eng, *eid, cd);
+                    let is_null = matches!(actual, Value::Null);
+                    is_null == *want_null
+                })
+            })
+            .collect();
+        Ok(kept)
     }
 
     fn find_by_pk(&self, table: &TableDef, pk_name: &str, val: &Value) -> Result<Option<EntityId>, SqlError> {
@@ -507,31 +611,136 @@ fn resolve_projection(items: &[SelectItem], table: &TableDef) -> Result<Vec<ColD
     Ok(out)
 }
 
-fn collect_eq_preds<'a>(table: &'a TableDef, expr: &Expr) -> Result<Vec<(&'a ColDef, Value)>, SqlError> {
+/// 1 個の WHERE 述語。 等値 (engine 側 query にマージ) と範囲比較 /
+/// NULL 判定 (どちらも fetch 後に Rust 側 filter) の 3 種。 `BETWEEN`
+/// は 2 つの Range pred に展開して扱う。
+enum Pred<'a> {
+    Eq(&'a ColDef, Value),
+    Range(&'a ColDef, RangeOp, Value),
+    IsNull(&'a ColDef),
+    IsNotNull(&'a ColDef),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RangeOp { Lt, Le, Gt, Ge }
+
+fn collect_preds<'a>(table: &'a TableDef, expr: &Expr) -> Result<Vec<Pred<'a>>, SqlError> {
     let mut out = Vec::new();
     walk_and(table, expr, &mut out)?;
     Ok(out)
 }
 
-fn walk_and<'a>(table: &'a TableDef, expr: &Expr, out: &mut Vec<(&'a ColDef, Value)>) -> Result<(), SqlError> {
+fn walk_and<'a>(table: &'a TableDef, expr: &Expr, out: &mut Vec<Pred<'a>>) -> Result<(), SqlError> {
     match expr {
         Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
             walk_and(table, left, out)?;
             walk_and(table, right, out)?;
             Ok(())
         }
-        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
-            let (col, val) = match (left.as_ref(), right.as_ref()) {
-                (Expr::Identifier(id), v) => (&id.value, v),
-                (v, Expr::Identifier(id)) => (&id.value, v),
+        Expr::BinaryOp { left, op, right } => {
+            // 識別子 op リテラル | リテラル op 識別子 のどちらかで、
+            // op が =, <, <=, >, >=
+            let (col_name, val_expr, op) = match (left.as_ref(), right.as_ref()) {
+                (Expr::Identifier(id), v) => (id.value.clone(), v, op.clone()),
+                (v, Expr::Identifier(id)) => (id.value.clone(), v, flip_op(op.clone())),
                 _ => return Err(SqlError::Unsupported(format!("WHERE: {expr}"))),
             };
-            let cd = table.col(col).ok_or_else(|| SqlError::UnknownColumn(col.clone()))?;
-            out.push((cd, eval_literal(val)?));
+            let cd = table
+                .col(&col_name)
+                .ok_or_else(|| SqlError::UnknownColumn(col_name.clone()))?;
+            let v = eval_literal(val_expr)?;
+            match op {
+                BinaryOperator::Eq => out.push(Pred::Eq(cd, v)),
+                BinaryOperator::Lt => out.push(Pred::Range(cd, RangeOp::Lt, v)),
+                BinaryOperator::LtEq => out.push(Pred::Range(cd, RangeOp::Le, v)),
+                BinaryOperator::Gt => out.push(Pred::Range(cd, RangeOp::Gt, v)),
+                BinaryOperator::GtEq => out.push(Pred::Range(cd, RangeOp::Ge, v)),
+                other => {
+                    return Err(SqlError::Unsupported(format!("WHERE op: {other:?}")));
+                }
+            }
+            Ok(())
+        }
+        Expr::IsNull(inner) => {
+            let col_name = match inner.as_ref() {
+                Expr::Identifier(id) => id.value.clone(),
+                _ => return Err(SqlError::Unsupported(format!("IS NULL target: {inner}"))),
+            };
+            let cd = table
+                .col(&col_name)
+                .ok_or_else(|| SqlError::UnknownColumn(col_name.clone()))?;
+            out.push(Pred::IsNull(cd));
+            Ok(())
+        }
+        Expr::IsNotNull(inner) => {
+            let col_name = match inner.as_ref() {
+                Expr::Identifier(id) => id.value.clone(),
+                _ => return Err(SqlError::Unsupported(format!("IS NOT NULL target: {inner}"))),
+            };
+            let cd = table
+                .col(&col_name)
+                .ok_or_else(|| SqlError::UnknownColumn(col_name.clone()))?;
+            out.push(Pred::IsNotNull(cd));
+            Ok(())
+        }
+        Expr::Between { expr: inner, negated: false, low, high } => {
+            // col BETWEEN a AND b → col >= a AND col <= b
+            let col_name = match inner.as_ref() {
+                Expr::Identifier(id) => id.value.clone(),
+                _ => return Err(SqlError::Unsupported(format!("BETWEEN target: {inner}"))),
+            };
+            let cd = table
+                .col(&col_name)
+                .ok_or_else(|| SqlError::UnknownColumn(col_name.clone()))?;
+            out.push(Pred::Range(cd, RangeOp::Ge, eval_literal(low)?));
+            out.push(Pred::Range(cd, RangeOp::Le, eval_literal(high)?));
             Ok(())
         }
         Expr::Nested(inner) => walk_and(table, inner, out),
         other => Err(SqlError::Unsupported(format!("WHERE shape: {other}"))),
+    }
+}
+
+/// `b OP a` を `a flip(OP) b` に正規化する: `5 < x` → `x > 5`。
+fn flip_op(op: BinaryOperator) -> BinaryOperator {
+    match op {
+        BinaryOperator::Eq => BinaryOperator::Eq,
+        BinaryOperator::Lt => BinaryOperator::Gt,
+        BinaryOperator::LtEq => BinaryOperator::GtEq,
+        BinaryOperator::Gt => BinaryOperator::Lt,
+        BinaryOperator::GtEq => BinaryOperator::LtEq,
+        other => other, // 等値以外は呼ばれないはず
+    }
+}
+
+/// ORDER BY 用の Value 比較。 NULL は SQL 標準では `NULLS LAST` (ASC) /
+/// `NULLS FIRST` (DESC) が一般的だが、 v0 では NULLS LAST 固定で扱う
+/// (= ASC でも DESC でも非 NULL より後ろ)。 型不一致は arbitrary に等価。
+fn compare_sort_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
+    let av = a.unwrap_or(&Value::Null);
+    let bv = b.unwrap_or(&Value::Null);
+    match (av, bv) {
+        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+        (Value::Null, _) => std::cmp::Ordering::Greater, // NULL を末尾へ
+        (_, Value::Null) => std::cmp::Ordering::Less,
+        (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
+        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+fn cmp_with_op(actual: &Value, op: RangeOp, target: &Value) -> bool {
+    let ord = match (actual, target) {
+        (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
+        (Value::Text(a), Value::Text(b)) => a.cmp(b),
+        // NULL は範囲比較で常に false (SQL の NULL 三値論理に概ね沿う)
+        _ => return false,
+    };
+    match op {
+        RangeOp::Lt => ord == std::cmp::Ordering::Less,
+        RangeOp::Le => ord != std::cmp::Ordering::Greater,
+        RangeOp::Gt => ord == std::cmp::Ordering::Greater,
+        RangeOp::Ge => ord != std::cmp::Ordering::Less,
     }
 }
 
@@ -711,6 +920,192 @@ mod tests {
         db.execute("CREATE TABLE t (id INTEGER)").unwrap();
         let err = db.execute("SELECT nope FROM t").unwrap_err();
         assert!(matches!(err, SqlError::UnknownColumn(_)));
+    }
+
+    #[test]
+    fn order_by_asc_desc() {
+        let mut db = fresh("order_by");
+        db.execute("CREATE TABLE log (id INTEGER PRIMARY KEY, ts INTEGER)").unwrap();
+        db.execute("INSERT INTO log VALUES (1, 30), (2, 10), (3, 20)").unwrap();
+        match db.execute("SELECT id FROM log ORDER BY ts").unwrap() {
+            Output::Rows { rows, .. } => {
+                let ids: Vec<i64> = rows
+                    .iter()
+                    .map(|r| match r[0] {
+                        Value::Integer(n) => n,
+                        _ => -1,
+                    })
+                    .collect();
+                assert_eq!(ids, vec![2, 3, 1]); // ts asc: 10, 20, 30 → ids 2,3,1
+            }
+            _ => panic!(),
+        }
+        match db.execute("SELECT id FROM log ORDER BY ts DESC").unwrap() {
+            Output::Rows { rows, .. } => {
+                let ids: Vec<i64> = rows
+                    .iter()
+                    .map(|r| match r[0] {
+                        Value::Integer(n) => n,
+                        _ => -1,
+                    })
+                    .collect();
+                assert_eq!(ids, vec![1, 3, 2]); // ts desc: 30, 20, 10
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn limit_truncates() {
+        let mut db = fresh("limit");
+        db.execute("CREATE TABLE log (id INTEGER PRIMARY KEY, ts INTEGER)").unwrap();
+        db.execute("INSERT INTO log VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)").unwrap();
+        match db.execute("SELECT id FROM log ORDER BY ts DESC LIMIT 2").unwrap() {
+            Output::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+                let ids: Vec<i64> = rows.iter().map(|r| match r[0] { Value::Integer(n) => n, _ => -1 }).collect();
+                assert_eq!(ids, vec![5, 4]); // top-2 by ts desc
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn range_where_lt_gt() {
+        let mut db = fresh("range");
+        db.execute("CREATE TABLE log (id INTEGER PRIMARY KEY, ts INTEGER)").unwrap();
+        for (i, ts) in [(1, 100), (2, 200), (3, 300), (4, 400), (5, 500)] {
+            db.execute(&format!("INSERT INTO log VALUES ({i}, {ts})")).unwrap();
+        }
+        match db.execute("SELECT id FROM log WHERE ts > 200 AND ts < 500 ORDER BY ts").unwrap() {
+            Output::Rows { rows, .. } => {
+                let ids: Vec<i64> = rows.iter().map(|r| match r[0] { Value::Integer(n) => n, _ => -1 }).collect();
+                assert_eq!(ids, vec![3, 4]);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn range_where_le_ge() {
+        let mut db = fresh("range_le_ge");
+        db.execute("CREATE TABLE log (id INTEGER PRIMARY KEY, ts INTEGER)").unwrap();
+        for (i, ts) in [(1, 100), (2, 200), (3, 300)] {
+            db.execute(&format!("INSERT INTO log VALUES ({i}, {ts})")).unwrap();
+        }
+        match db.execute("SELECT id FROM log WHERE ts >= 200 AND ts <= 300 ORDER BY ts").unwrap() {
+            Output::Rows { rows, .. } => {
+                let ids: Vec<i64> = rows.iter().map(|r| match r[0] { Value::Integer(n) => n, _ => -1 }).collect();
+                assert_eq!(ids, vec![2, 3]);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn between_expands() {
+        let mut db = fresh("between");
+        db.execute("CREATE TABLE log (id INTEGER PRIMARY KEY, ts INTEGER)").unwrap();
+        for (i, ts) in [(1, 10), (2, 20), (3, 30), (4, 40)] {
+            db.execute(&format!("INSERT INTO log VALUES ({i}, {ts})")).unwrap();
+        }
+        match db.execute("SELECT id FROM log WHERE ts BETWEEN 20 AND 30 ORDER BY ts").unwrap() {
+            Output::Rows { rows, .. } => {
+                let ids: Vec<i64> = rows.iter().map(|r| match r[0] { Value::Integer(n) => n, _ => -1 }).collect();
+                assert_eq!(ids, vec![2, 3]);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn delete_with_range() {
+        let mut db = fresh("delete_range");
+        db.execute("CREATE TABLE log (id INTEGER PRIMARY KEY, ts INTEGER)").unwrap();
+        for (i, ts) in [(1, 10), (2, 20), (3, 30), (4, 40)] {
+            db.execute(&format!("INSERT INTO log VALUES ({i}, {ts})")).unwrap();
+        }
+        // 古い行 (ts < 30) を pruning
+        let out = db.execute("DELETE FROM log WHERE ts < 30").unwrap();
+        match out {
+            Output::Deleted(n) => assert_eq!(n, 2),
+            _ => panic!(),
+        }
+        match db.execute("SELECT id FROM log ORDER BY ts").unwrap() {
+            Output::Rows { rows, .. } => {
+                let ids: Vec<i64> = rows.iter().map(|r| match r[0] { Value::Integer(n) => n, _ => -1 }).collect();
+                assert_eq!(ids, vec![3, 4]);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn is_null_filter() {
+        let mut db = fresh("is_null");
+        db.execute("CREATE TABLE notif (key TEXT PRIMARY KEY, dismissed_at INTEGER)").unwrap();
+        db.execute("INSERT INTO notif VALUES ('a', 100)").unwrap();
+        db.execute("INSERT INTO notif VALUES ('b', NULL)").unwrap();
+        db.execute("INSERT INTO notif VALUES ('c', 200)").unwrap();
+        match db.execute("SELECT key FROM notif WHERE dismissed_at IS NULL").unwrap() {
+            Output::Rows { rows, .. } => {
+                let keys: Vec<String> = rows.iter().map(|r| match &r[0] {
+                    Value::Text(s) => s.clone(),
+                    _ => String::new(),
+                }).collect();
+                assert_eq!(keys, vec!["b"]);
+            }
+            _ => panic!(),
+        }
+        match db.execute("SELECT key FROM notif WHERE dismissed_at IS NOT NULL ORDER BY key").unwrap() {
+            Output::Rows { rows, .. } => {
+                let keys: Vec<String> = rows.iter().map(|r| match &r[0] {
+                    Value::Text(s) => s.clone(),
+                    _ => String::new(),
+                }).collect();
+                assert_eq!(keys, vec!["a", "c"]);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn matcha_history_query() {
+        // matcha の本番ユース: 通知履歴を delivered_at desc で limit、
+        // retention は古い行を delete。
+        let mut db = fresh("matcha_history");
+        db.execute(
+            "CREATE TABLE notif_log (\
+                key TEXT PRIMARY KEY, \
+                title TEXT, \
+                delivered_at INTEGER\
+            )",
+        ).unwrap();
+        for i in 0..50i64 {
+            db.execute(&format!(
+                "INSERT INTO notif_log VALUES ('k-{i:02}', 'title-{i}', {ts})",
+                ts = 1_715_000_000 + i,
+            ))
+            .unwrap();
+        }
+        match db.execute("SELECT key FROM notif_log ORDER BY delivered_at DESC LIMIT 5").unwrap() {
+            Output::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 5);
+                // 最新 5 件 = i=49..=45
+                let keys: Vec<String> = rows.iter().map(|r| match &r[0] {
+                    Value::Text(s) => s.clone(),
+                    _ => String::new(),
+                }).collect();
+                assert_eq!(keys, vec!["k-49", "k-48", "k-47", "k-46", "k-45"]);
+            }
+            _ => panic!(),
+        }
+        // 30 日 retention 相当 (古い 10 件 pruning)
+        let out = db.execute("DELETE FROM notif_log WHERE delivered_at < 1715000010").unwrap();
+        match out {
+            Output::Deleted(n) => assert_eq!(n, 10),
+            _ => panic!(),
+        }
     }
 
     #[test]
