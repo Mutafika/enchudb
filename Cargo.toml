@@ -17,10 +17,14 @@ v26 = ["enchudb-engine/v26"]
 v27 = ["enchudb-engine/v27"]
 v32 = ["enchudb-engine/v32", "dep:enchudb-sync"]
 v33 = ["enchudb-engine/v33", "dep:enchudb-sync", "enchudb-sync/v33"]
+sql = ["dep:enchudb-sql"]
+ffi = ["dep:enchudb-ffi", "sql"]
 
 [dependencies]
 enchudb-engine = { path = "crates/enchudb-engine" }
 enchudb-sync = { path = "crates/enchudb-sync", optional = true }
+enchudb-sql = { path = "crates/enchudb-sql", optional = true }
+enchudb-ffi = { path = "crates/enchudb-ffi", optional = true }
 
 [dev-dependencies]
 proptest = "1"
