@@ -210,12 +210,21 @@ impl GrowableMap {
         if needed_aligned <= cur {
             return Ok(());
         }
-        // Doubling target. Start from a sane minimum so a tiny
-        // initial commit doesn't cause a flurry of micro-grows on the
-        // first few inserts.
-        let min_growth = (64 * 1024).max(cur);
-        let doubled = cur.saturating_mul(2).max(min_growth);
-        let target = doubled.max(needed_aligned).min(self.reserved);
+        // Hybrid 戦略: 小 cur では doubling (KB→MB の急成長を amortize)、
+        // 大 cur では一律 chunk linear (反復 insert で over-allocate しない)。
+        // 5 MB のデータベースが 1 KB 書いただけで 10 MB に膨らむのを防ぐ。
+        const SMALL_THRESHOLD: usize = 1024 * 1024; // 1 MB
+        const LINEAR_CHUNK: usize = 1024 * 1024;     // 1 MB chunks above threshold
+        let target = if cur < SMALL_THRESHOLD {
+            // doubling、 ただし最低 64 KB は伸ばす
+            let min_growth = 64 * 1024;
+            let doubled = cur.saturating_mul(2).max(cur + min_growth);
+            doubled.max(needed_aligned)
+        } else {
+            // 1 MB chunks。 needed が遥かに大きければそちら優先。
+            (cur + LINEAR_CHUNK).max(needed_aligned)
+        }
+        .min(self.reserved);
         if target < needed_aligned {
             return Err(io::Error::new(
                 io::ErrorKind::OutOfMemory,

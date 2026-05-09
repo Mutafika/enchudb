@@ -145,6 +145,17 @@ impl Backing {
         }
     }
 
+    /// Growable backing なら GrowableMap への Arc を返す。 `Region::with_grower`
+    /// で region を作り直したい後付けの init path 用 (例: `ensure_himo` で
+    /// himo_slots 領域を lazy commit する)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn grower(&self) -> Option<std::sync::Arc<crate::growable_map::GrowableMap>> {
+        match self {
+            Backing::Growable(g) => Some(g.clone()),
+            _ => None,
+        }
+    }
+
     /// v32: &self 経由で header 領域に unsafe で書き込む。
     /// mmap 経由の並行書き込みは atomic スライス更新でガードされる前提。
     #[cfg(feature = "v32")]
@@ -401,6 +412,25 @@ impl Layout {
         undo_max_entries: u32,
     ) -> Self {
         let vocab_max_entries = max_entities.saturating_mul(16).min(256_000_000);
+        Self::compute_with_caps(
+            max_entities, max_himos,
+            vocab_max_entries, vocab_data_size,
+            content_data_size, cyl_max_values,
+            undo_max_entries,
+        )
+    }
+
+    /// `compute_with_undo` のフル版 — vocab_max_entries も override できる。
+    /// tiny preset で multiplier ×16 が過剰な場合に ×1 程度に絞る用。
+    fn compute_with_caps(
+        max_entities: u32,
+        max_himos: u32,
+        vocab_max_entries: u32,
+        vocab_data_size: usize,
+        content_data_size: Option<usize>,
+        cyl_max_values: Option<u32>,
+        undo_max_entries: u32,
+    ) -> Self {
         let vocab_index_cap = vocab_max_entries.next_power_of_two();
         let himoreg_max_entries = max_himos.max(256);
         let himoreg_index_cap = (himoreg_max_entries * 2).next_power_of_two();
@@ -1181,9 +1211,15 @@ impl Engine {
     pub fn create_growable_tiny(path: &str) -> io::Result<Self> {
         let max_entities = 1024_u32;
         let max_himos = 16_u32;
-        let layout = Layout::compute_with_undo(
+        // tiny preset では vocab_max_entries の default ×16 multiplier
+        // が過剰 (16384 entries → vocab_offsets 128KB + index 213KB)。
+        // matcha のような数百エントリ用途では ×2 で十分 — 2048 entries
+        // で offsets 16KB + index ~26KB に収まる。
+        let vocab_max_entries = max_entities.saturating_mul(2);
+        let layout = Layout::compute_with_caps(
             max_entities,
             max_himos,
+            vocab_max_entries,
             64 * 1024,        // vocab_data: 64 KB
             Some(64 * 1024),  // content_data: 64 KB
             Some(64),         // cyl_max_values: small per-himo cylinders
@@ -1543,14 +1579,15 @@ impl Engine {
             undo_max_entries,
         );
 
+        // v3 (Phase B 以降): growable backing で作った DB は variable
+        // cluster の末尾が未書き込みのことがあり、 file_size <
+        // layout.total_size でも正常。 そのまま mmap するとアクセス可能
+        // 範囲が file_size までになるので、 ftruncate で sparse 拡張して
+        // 期待サイズに合わせる (実 disk usage はゼロ、 apparent のみ拡大)。
+        // 拡張側は zero-fill 保証 (POSIX) で、 各 store の load() は
+        // "MAGIC missing → fresh" の lazy 認識をするので問題ない。
         if file_size < layout.total_size as u64 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "file truncated: {} bytes, expected {} — backup からリストアが必要",
-                    file_size, layout.total_size,
-                ),
-            ));
+            file.set_len(layout.total_size as u64)?;
         }
         Ok(())
     }
@@ -3208,23 +3245,37 @@ impl Engine {
         self.himo_reg.get_or_insert(himo.as_bytes());
 
         let effective_mv = max_values.min(self.layout.cyl_max_values);
-        let base = self.backing.as_mut_ptr();
         let col_off = self.layout.himo_col_off(hid);
+        // himo_slots 領域は固定 cluster 内 (vocab_data_off の手前) にある。
+        // Growable backing で initial_commit が縮んだ場合、 ensure_himo が
+        // 呼ばれた時点で this slot がまだ uncommitted な可能性がある。
+        // grower 経由の Region を作って各 init で ensure_committed が
+        // 効くようにする。 static backing の場合は Region::new 経路。
+        #[cfg(not(target_arch = "wasm32"))]
+        let grower = self.backing.grower();
+        let base = self.backing.as_mut_ptr();
+        let make_region = |off: usize, size: usize| -> Region {
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(g) = &grower {
+                return unsafe { Region::with_grower(g.clone(), off, size) };
+            }
+            unsafe { Region::new(base.add(off), size) }
+        };
 
         #[cfg(not(feature = "v27"))]
         let hs = {
             let cyl_a_off = self.layout.himo_cyl_a_off(hid);
             let cyl_b_off = self.layout.himo_cyl_b_off(hid);
             HimoStore::init(
-                unsafe { Region::new(base.add(col_off), self.layout.himo_col_size) },
-                unsafe { Region::new(base.add(cyl_a_off), self.layout.himo_cyl_size) },
-                unsafe { Region::new(base.add(cyl_b_off), self.layout.himo_cyl_size) },
+                make_region(col_off, self.layout.himo_col_size),
+                make_region(cyl_a_off, self.layout.himo_cyl_size),
+                make_region(cyl_b_off, self.layout.himo_cyl_size),
                 ht, effective_mv, self.max_entities,
             )
         };
         #[cfg(feature = "v27")]
         let hs = HimoStore::init(
-            unsafe { Region::new(base.add(col_off), self.layout.himo_col_size) },
+            make_region(col_off, self.layout.himo_col_size),
             ht, effective_mv, self.max_entities,
         );
 

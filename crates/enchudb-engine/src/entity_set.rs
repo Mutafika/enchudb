@@ -28,16 +28,28 @@ unsafe impl Send for EntitySet {}
 impl EntitySet {
     pub fn region_size(max_entities: u32) -> usize {
         let bitset_size = ((max_entities + 7) / 8) as usize;
-        let free_size = 4 + (FREE_STACK_MAX as usize) * 4;
+        // free_stack に積めるのは「これまで allocate された eid」 だけなので、
+        // 論理上限は max_entities。 FREE_STACK_MAX (= 1 M) は default preset
+        // (max_entities = 16 M) 想定の上限で、 tiny preset (max_entities =
+        // 1024) では 4 MB の無駄。 min を取ることで tiny で 4 KB まで縮む。
+        let free_cap = (FREE_STACK_MAX as usize).min(max_entities as usize);
+        let free_size = 4 + free_cap * 4;
         HEADER + bitset_size + free_size
     }
 
     /// 新規領域を初期化。
+    ///
+    /// growable backing で initial_commit が region の手前で打ち切られて
+    /// いる可能性があるため、 region 全体 (header + bitset + free stack)
+    /// を init 時点で commit する。 EntitySet 全体は max_entities が
+    /// 制限されてれば十分小さい (tiny preset で ~4 KB)。
     pub fn init(region: Region, max_entities: u32) -> Self {
         let bitset_offset = HEADER;
         let bitset_size = ((max_entities + 7) / 8) as usize;
-        let free_offset = (bitset_offset + bitset_size + 3) & !3; // AtomicU32 alignment
+        let free_offset = (bitset_offset + bitset_size + 3) & !3;
+        let region_total = Self::region_size(max_entities);
 
+        let _ = region.ensure_committed(region_total);
         let mm = region.slice_mut();
         mm[0..4].copy_from_slice(&MAGIC);
         // next_eid = 0, live_count = 0 (already zero from fresh region)
@@ -107,7 +119,11 @@ impl EntitySet {
         let mm = self.region.slice_mut();
         let free_count_off = self.free_offset;
         let fc = u32::from_le_bytes(mm[free_count_off..free_count_off + 4].try_into().unwrap());
-        if fc < FREE_STACK_MAX {
+        // free_cap は region_size() と同じ式 — 「論理上限 = 確保された
+        // エントリ数 = max_entities」 で region サイズを縮めているので、
+        // ここも同じ cap で打ち切る (超えたら静かに drop する旧仕様を踏襲)。
+        let free_cap = (FREE_STACK_MAX as usize).min(self.max_entities as usize) as u32;
+        if fc < free_cap {
             let eid_off = self.free_offset + 4 + (fc as usize) * 4;
             mm[eid_off..eid_off + 4].copy_from_slice(&eid.to_le_bytes());
             mm[free_count_off..free_count_off + 4].copy_from_slice(&(fc + 1).to_le_bytes());
