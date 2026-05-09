@@ -1,5 +1,82 @@
 # EnchuDB バグ記録
 
+## [修正済み] `wasm32` で `growable_map` モジュールがコンパイル不能
+**日付**: 2026-05-09 (報告) / 2026-05-09 (修正)
+**箇所**: `crates/enchudb-engine/src/growable_map.rs`、`crates/enchudb-engine/src/lib.rs`
+**導入コミット**: `d9962b9` (engine: growable mmap backing — 仮想予約 + on-demand commit)
+
+### 症状
+
+`enchudb` を `target = wasm32-unknown-unknown` でビルドすると `growable_map.rs` 内で 27 個の解決失敗エラーが出る:
+
+- `use std::os::fd::{IntoRawFd, RawFd};` — `std::os::fd` は wasm32 で利用不可
+- `libc::close(self.fd)` × 数箇所 — `libc` クレートは依存に含まれていない (POSIX 前提)
+- `MAP_FIXED|MAP_SHARED` 等の生 syscall 構造、wasm32 で不在
+
+`growable_map` 自体が POSIX `mmap(2)` の挙動 (`PROT_NONE` 仮想予約 → `MAP_FIXED` で重ね張り) に直接依存しているので、wasm に移植する道筋は無い。
+
+### 修正案
+
+`pub mod growable_map;` を `lib.rs` で gate するのが最小修正:
+
+```rust
+// lib.rs
+-pub mod growable_map;
++#[cfg(not(target_arch = "wasm32"))]
++pub mod growable_map;
+```
+
+`growable_map` を呼び出す上位コードが既に `target_arch = "wasm32"` で別経路を持っている前提。もし呼び出し側にも cfg gate が無ければ、そっちも合わせる必要あり (`engine.rs` 等で `growable_map::GrowableMap` を直接使っている箇所は要チェック)。
+
+### 踏まれていなかった理由
+
+- `growable_map` が入る前は `engine.rs` の `MmapMut::map_mut` が wasm32 で gate 済みだった (`#[cfg(not(target_arch = "wasm32"))]`)
+- `growable_map` モジュールは新規追加で、初回から gate 無し
+- mutafika 内の他 wasm 利用先 (sabitori 等) は `enchudb` を depend してないので踏まなかった
+- 今回 `naruhodo/web` (wasm) を v33 化して始めて顕在化
+
+### 発見経緯
+
+`naruhodo` で 24GB sparse file 問題を別アプローチ (custom `naruhodo-shrink` バイナリで右サイズ再構築) で解決した直後に `web/` 側を `trunk build --release` した時に発覚。**奇しくも `growable_map` が解決しようとしている問題と同じ問題**を別レイヤで踏んだ形。
+
+---
+
+## [修正済み] `wasm32 + feature = "v33"` で `engine.rs` がコンパイル不能
+**日付**: 2026-05-08 (報告) / 2026-05-08 (修正)
+**箇所**: `crates/enchudb-engine/src/engine.rs`
+
+### 症状
+
+`enchudb = { features = ["v33"] }` を `target = wasm32-unknown-unknown` でビルドすると 2 種類のエラーで死んでいた:
+
+1. **`Backing::Mmap` バリアントが scope に存在しない** — `engine.rs:1095` の `compute_region_crc_table` 内 match の `Mmap` arm に cfg gate が無かった
+2. **`io` モジュールが解決不能** — `engine.rs:13-16` で `use std::io;` が `#[cfg(not(target_arch = "wasm32"))]` で gate されていたが、`body_msync` (L3201) / `wal_sync` (L3206) の wasm 側 stub が `io::Result<()>` を返すので import が必要だった
+
+### 修正
+
+#1 は事前に別コミットで cfg gate 追加済みだったため、本セッションでは #2 のみ修正:
+
+```rust
+// L13-16
+-#[cfg(not(target_arch = "wasm32"))]
+-use std::io;
++use std::io;
+```
+
+`std::io` は wasm32-unknown-unknown でも普通に使えるので gate 不要。
+
+### 踏まれていなかった理由
+
+- 単独 mutafika リポ内では `./web/` が `features = ["v27"]` のままで、v32+ コードパスを wasm でコンパイルしていなかった
+- 外部利用者の例: `kitamitechnica/mkd-nyusatsu/enchudb/` (vendored) は `[features] v26 = []`, `v27 = []`, `v32 = []`, `v33 = []` と全 feature を空 stub に書き換えていて、v32+ のコードがそもそもコンパイルされない
+- 結果、誰も「正規版 enchudb + v33 feature + wasm32」の組合せをビルドしていなかった
+
+### 発見経緯
+
+`naruhodo/web` (wasm crate) を v27 → v33 に上げる過程で踏んだ。`naruhodo` (server/ingest 側) を先に v33 化して動作確認できていたので、wasm 側だけで露呈する問題と判明。
+
+---
+
 ## [修正済み] `ContentStore` の `data_end` が cross-process で persist されず content が上書きされる
 **日付**: 2026-04-24
 **箇所**: `crates/enchudb-engine/src/content_store.rs` — `ContentStore::set` / `load` / `sync`、`crates/enchudb-engine/src/region.rs`

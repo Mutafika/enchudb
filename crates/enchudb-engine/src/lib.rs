@@ -15,6 +15,7 @@
 //! ```
 
 pub(crate) mod region;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod growable_map;
 pub mod column;
 pub mod vocabulary;

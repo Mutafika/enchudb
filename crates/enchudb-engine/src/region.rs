@@ -7,8 +7,10 @@
 //! が data_end を進める前に呼ぶのが期待されるパターン。
 
 use std::sync::atomic::AtomicU32;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::growable_map::GrowableMap;
 
 pub struct Region {
@@ -18,10 +20,13 @@ pub struct Region {
     /// a `Backing::Growable` and may need to extend the file-backed
     /// commit. `None` for static `MmapMut` / `Memory` backings (in
     /// those, the whole reservation is already committed).
+    /// Not present on wasm32 (no `GrowableMap` there).
+    #[cfg(not(target_arch = "wasm32"))]
     grower: Option<Arc<GrowableMap>>,
     /// Offset of this region's start within the underlying file.
     /// Required to translate "end within region" → "end within file"
     /// before calling `GrowableMap::grow_amortized`.
+    #[cfg(not(target_arch = "wasm32"))]
     file_offset: usize,
 }
 
@@ -36,7 +41,9 @@ impl Region {
         Self {
             ptr,
             len,
+            #[cfg(not(target_arch = "wasm32"))]
             grower: None,
+            #[cfg(not(target_arch = "wasm32"))]
             file_offset: 0,
         }
     }
@@ -51,6 +58,7 @@ impl Region {
     /// # Safety
     /// `grower.base() + file_offset` から `len` バイトが reservation 内に
     /// 収まっていること (caller responsibility)。
+    #[cfg(not(target_arch = "wasm32"))]
     pub unsafe fn with_grower(
         grower: Arc<GrowableMap>,
         file_offset: usize,
@@ -88,9 +96,11 @@ impl Region {
     /// `grow_amortized` の doubling で次回以降の小さい advance では
     /// 何もせず帰る。
     pub fn ensure_committed(&self, end_in_region: usize) -> std::io::Result<()> {
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(g) = &self.grower {
             g.grow_amortized(self.file_offset + end_in_region)?;
         }
+        let _ = end_in_region;
         Ok(())
     }
 
