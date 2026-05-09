@@ -12,7 +12,6 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs::OpenOptions;
-#[cfg(not(target_arch = "wasm32"))]
 use std::io;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -93,6 +92,14 @@ pub struct AuditFilter {
 enum Backing {
     #[cfg(not(target_arch = "wasm32"))]
     Mmap(MmapMut),
+    /// growable mmap (虚仮アドレス予約 + 必要分だけ commit)。
+    /// 空 DB が page サイズで始まり書き込みに応じて拡張する。
+    /// 既存 `Mmap` バリアントは `set_len(huge)` で sparse な巨大ファイルを
+    /// 作るが、 backup ツール (Time Machine, naive rsync) が apparent
+    /// size でカウントすると詰まる。 `Growable` は実消費 = ファイル
+    /// 論理サイズなので backup ツール的にも穏当。
+    #[cfg(not(target_arch = "wasm32"))]
+    Growable(std::sync::Arc<crate::growable_map::GrowableMap>),
     Memory(Vec<u8>),
 }
 
@@ -101,6 +108,8 @@ impl Backing {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
             Backing::Mmap(m) => m.as_mut_ptr(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Backing::Growable(g) => g.base(),
             Backing::Memory(v) => v.as_mut_ptr(),
         }
     }
@@ -109,6 +118,10 @@ impl Backing {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
             Backing::Mmap(m) => &mut m[..],
+            #[cfg(not(target_arch = "wasm32"))]
+            Backing::Growable(g) => unsafe {
+                std::slice::from_raw_parts_mut(g.base(), g.committed())
+            },
             Backing::Memory(v) => &mut v[..],
         }
     }
@@ -117,7 +130,18 @@ impl Backing {
     fn flush_to_disk(&self) -> io::Result<()> {
         match self {
             Backing::Mmap(m) => m.flush(),
+            Backing::Growable(g) => g.flush(0, g.committed()),
             Backing::Memory(_) => Ok(()),
+        }
+    }
+
+    /// growable backing のときに commit を要求サイズまで伸ばす。
+    /// 他の variant では no-op (ヘッダ上限で既に確保済み)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn ensure_committed(&self, end: usize) -> io::Result<()> {
+        match self {
+            Backing::Growable(g) => g.grow_amortized(end),
+            _ => Ok(()),
         }
     }
 
@@ -131,6 +155,11 @@ impl Backing {
                 #[cfg(not(target_arch = "wasm32"))]
                 Backing::Mmap(m) => {
                     let ptr = m.as_ptr() as *mut u8;
+                    std::slice::from_raw_parts_mut(ptr, HEADER_SIZE)
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                Backing::Growable(g) => {
+                    let ptr = g.base();
                     std::slice::from_raw_parts_mut(ptr, HEADER_SIZE)
                 }
                 Backing::Memory(v) => {
@@ -237,6 +266,11 @@ const H_HEADER_CRC: usize = 64; // u32
 /// CRC 保護外(後から set_peer_id で上書き可能)。
 #[cfg(feature = "v32")]
 const H_PEER_ID: usize = 68; // u32
+/// undo region のエントリ最大数。 0 はレガシー DB (header に書かれてない)
+/// → open 時に `crate::undo::DEFAULT_MAX_ENTRIES` を使う。 growable_tiny 等の
+/// 小フットプリント preset がここに自前の値を書き、 open が再現できるように
+/// する。 CRC 保護外。
+const H_UNDO_MAX_ENTRIES: usize = 72; // u32
 const H_HIMO_TYPES: usize = 256;
 
 // v27: 観測窓(n-tuple 仮想テーブル定義)領域。
@@ -343,11 +377,40 @@ impl Layout {
         let content_data_size = content_data_size.unwrap_or_else(ContentStore::data_region_size);
         let cyl_max_values = cyl_max_values.unwrap_or(DEFAULT_CYL_MAX_VALUES);
 
-        Self::from_params(
+        Self::from_params_with_undo(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, cyl_max_values,
+            crate::undo::DEFAULT_MAX_ENTRIES,
+        )
+    }
+
+    /// 小フットプリント preset 用 — undo の最大エントリ数を上書きできる。
+    /// 既定 16 M × 10 B = 160 MB が layout を支配するので、 state-log
+    /// 想定の数千エントリで十分なら大幅に縮む。
+    fn compute_with_undo(
+        max_entities: u32,
+        max_himos: u32,
+        vocab_data_size: usize,
+        content_data_size: Option<usize>,
+        cyl_max_values: Option<u32>,
+        undo_max_entries: u32,
+    ) -> Self {
+        let vocab_max_entries = max_entities.saturating_mul(16).min(256_000_000);
+        let vocab_index_cap = vocab_max_entries.next_power_of_two();
+        let himoreg_max_entries = max_himos.max(256);
+        let himoreg_index_cap = (himoreg_max_entries * 2).next_power_of_two();
+        let himoreg_data_size = 64 * 1024;
+        let content_data_size = content_data_size.unwrap_or_else(ContentStore::data_region_size);
+        let cyl_max_values = cyl_max_values.unwrap_or(DEFAULT_CYL_MAX_VALUES);
+
+        Self::from_params_with_undo(
+            max_entities, max_himos,
+            vocab_max_entries, vocab_index_cap, vocab_data_size,
+            himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
+            content_data_size, cyl_max_values,
+            undo_max_entries,
         )
     }
 
@@ -357,6 +420,22 @@ impl Layout {
         himoreg_max_entries: u32, himoreg_index_cap: u32, himoreg_data_size: usize,
         content_data_size: usize, cyl_max_values: u32,
     ) -> Self {
+        Self::from_params_with_undo(
+            max_entities, max_himos,
+            vocab_max_entries, vocab_index_cap, vocab_data_size,
+            himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
+            content_data_size, cyl_max_values,
+            crate::undo::DEFAULT_MAX_ENTRIES,
+        )
+    }
+
+    fn from_params_with_undo(
+        max_entities: u32, max_himos: u32,
+        vocab_max_entries: u32, vocab_index_cap: u32, vocab_data_size: usize,
+        himoreg_max_entries: u32, himoreg_index_cap: u32, himoreg_data_size: usize,
+        content_data_size: usize, cyl_max_values: u32,
+        undo_max_entries: u32,
+    ) -> Self {
         let mut off = HEADER_SIZE;
 
         let entities_off = off;
@@ -364,7 +443,7 @@ impl Layout {
         off += entities_size;
 
         let undo_off = off;
-        let undo_size = align8(UndoLog::region_size());
+        let undo_size = align8(UndoLog::region_size_with(undo_max_entries));
         off += undo_size;
 
         let vocab_data_off = off;
@@ -967,6 +1046,9 @@ impl Engine {
         mmap[H_HIMOREG_DATA_SIZE..H_HIMOREG_DATA_SIZE + 8].copy_from_slice(&(layout.himoreg_data_size as u64).to_le_bytes());
         mmap[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].copy_from_slice(&(layout.content_data_size as u64).to_le_bytes());
         mmap[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].copy_from_slice(&layout.cyl_max_values.to_le_bytes());
+        let undo_max_entries = ((layout.undo_size - 16) / 10) as u32;
+        mmap[H_UNDO_MAX_ENTRIES..H_UNDO_MAX_ENTRIES + 4]
+            .copy_from_slice(&undo_max_entries.to_le_bytes());
 
         // v28: ヘッダ整合性 CRC
         write_header_crc(&mut mmap);
@@ -1048,6 +1130,245 @@ impl Engine {
         })
     }
 
+    /// growable backing で新規 DB を作る。 通常の `create_full_with_cyl`
+    /// が `set_len(layout.total_size)` で sparse な巨大ファイル (88 GB
+    /// など) を作るのに対し、 こちらは `GrowableMap` で **virtual address
+    /// だけ予約 + 必要分だけ commit** する経路。 fresh DB が page サイズ
+    /// から始まり書き込みに応じて拡張する。
+    ///
+    /// 現状の実装は init 時点で layout 全体まで pre-commit する保守的な
+    /// 形 (= ファイルサイズは旧来の `create_*` と同等)。 各 store の write
+    /// 境界に `grow_amortized` を仕込むことで段階的に initial commit を
+    /// 縮める予定。 まずは Backing 経路の互換性確認を優先。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn create_growable(path: &str) -> io::Result<Self> {
+        Self::create_growable_with_capacity(path, DEFAULT_MAX_ENTITIES)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn create_growable_with_capacity(path: &str, max_entities: u32) -> io::Result<Self> {
+        let max_himos = DEFAULT_MAX_HIMOS;
+        let layout = Layout::compute(max_entities, max_himos, DEFAULT_VOCAB_DATA_SIZE, None, None);
+        Self::create_growable_full(path, layout, max_entities, max_himos)
+    }
+
+    /// Tiny growable preset for app state-logs (matcha-style: a few
+    /// hundred rows of dismissed-key / seen-at / etc.). Default
+    /// `create_growable` uses gigascale capacities so the layout
+    /// total — and thus the on-disk apparent size of a fresh DB —
+    /// is hundreds of MB even with growable backing. Apps that just
+    /// need a key/value store with timestamps want something much
+    /// smaller. This caps:
+    /// - 1024 entities
+    /// - 16 himos
+    /// - 64 KB vocab / himoreg / content data each
+    /// → layout total ≈ 250 KB, fresh DB ~ same on disk.
+    ///
+    /// Hard limit of 1024 rows is fine for most state-log use cases;
+    /// callers that may exceed it should use `create_growable` or
+    /// `create_growable_with_capacity` with the right size.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn create_growable_tiny(path: &str) -> io::Result<Self> {
+        let max_entities = 1024_u32;
+        let max_himos = 16_u32;
+        let layout = Layout::compute_with_undo(
+            max_entities,
+            max_himos,
+            64 * 1024,        // vocab_data: 64 KB
+            Some(64 * 1024),  // content_data: 64 KB
+            Some(64),         // cyl_max_values: small per-himo cylinders
+            4096,             // undo_max_entries: 4 K (default 16 M)
+        );
+        Self::create_growable_full(path, layout, max_entities, max_himos)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn create_growable_full(
+        path: &str,
+        layout: Layout,
+        max_entities: u32,
+        max_himos: u32,
+    ) -> io::Result<Self> {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+
+        // Phase A leaves the initial commit at full layout size.
+        // The remaining win — making fresh DBs page-sized on disk —
+        // requires lazy region-init in every store (each region's
+        // magic write is currently eager at offset 0 of its region,
+        // which means initial_commit must cover ALL region offsets,
+        // i.e. the entire layout). That's a bigger refactor; tracked
+        // in `enchudb/issue.md` and `GROWABLE_MMAP_PLAN.md`.
+        let initial_commit = layout.total_size;
+        let map = std::sync::Arc::new(crate::growable_map::GrowableMap::new(
+            file,
+            layout.total_size,
+            initial_commit,
+        )?);
+
+        // Header init — same byte layout as create_full_with_cyl.
+        let base = map.base();
+        let header = unsafe { std::slice::from_raw_parts_mut(base, HEADER_SIZE) };
+        header[H_MAGIC..H_MAGIC + 4].copy_from_slice(&FILE_MAGIC);
+        header[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION.to_le_bytes());
+        header[H_MAX_ENTITIES..H_MAX_ENTITIES + 4]
+            .copy_from_slice(&max_entities.to_le_bytes());
+        header[H_MAX_HIMOS..H_MAX_HIMOS + 4].copy_from_slice(&max_himos.to_le_bytes());
+        header[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&0u32.to_le_bytes());
+        header[H_VOCAB_MAX_ENTRIES..H_VOCAB_MAX_ENTRIES + 4]
+            .copy_from_slice(&layout.vocab_max_entries.to_le_bytes());
+        header[H_VOCAB_INDEX_CAP..H_VOCAB_INDEX_CAP + 4]
+            .copy_from_slice(&layout.vocab_index_cap.to_le_bytes());
+        header[H_VOCAB_DATA_SIZE..H_VOCAB_DATA_SIZE + 8]
+            .copy_from_slice(&(layout.vocab_data_size as u64).to_le_bytes());
+        header[H_HIMOREG_MAX_ENTRIES..H_HIMOREG_MAX_ENTRIES + 4]
+            .copy_from_slice(&layout.himoreg_max_entries.to_le_bytes());
+        header[H_HIMOREG_INDEX_CAP..H_HIMOREG_INDEX_CAP + 4]
+            .copy_from_slice(&layout.himoreg_index_cap.to_le_bytes());
+        header[H_HIMOREG_DATA_SIZE..H_HIMOREG_DATA_SIZE + 8]
+            .copy_from_slice(&(layout.himoreg_data_size as u64).to_le_bytes());
+        header[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8]
+            .copy_from_slice(&(layout.content_data_size as u64).to_le_bytes());
+        header[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4]
+            .copy_from_slice(&layout.cyl_max_values.to_le_bytes());
+        // undo region size を header に保存。 open で from_params が
+        // 同じ値を再現できるようにする。 0 を書くとレガシー扱い (open
+        // が default を使う) になるが、 growable では常に明示するので
+        // layout.undo_size から逆算した値を書く。
+        let undo_max_entries = ((layout.undo_size - 16) / 10) as u32;
+        header[H_UNDO_MAX_ENTRIES..H_UNDO_MAX_ENTRIES + 4]
+            .copy_from_slice(&undo_max_entries.to_le_bytes());
+        write_header_crc(header);
+
+        let _ = base; // base ptr is implicit via Region::with_grower from here on
+        let entities = EntitySet::init(
+            unsafe {
+                Region::with_grower(map.clone(), layout.entities_off, layout.entities_size)
+            },
+            max_entities,
+        );
+        let undo = UndoLog::init(unsafe {
+            Region::with_grower(map.clone(), layout.undo_off, layout.undo_size)
+        });
+        let vocab = Vocabulary::init(
+            unsafe {
+                Region::with_grower(map.clone(), layout.vocab_data_off, layout.vocab_data_size)
+            },
+            unsafe {
+                Region::with_grower(
+                    map.clone(),
+                    layout.vocab_offsets_off,
+                    layout.vocab_offsets_size,
+                )
+            },
+            unsafe {
+                Region::with_grower(map.clone(), layout.vocab_index_off, layout.vocab_index_size)
+            },
+            layout.vocab_max_entries,
+            layout.vocab_index_cap,
+        );
+        let himo_reg = Vocabulary::init(
+            unsafe {
+                Region::with_grower(map.clone(), layout.himoreg_data_off, layout.himoreg_data_size)
+            },
+            unsafe {
+                Region::with_grower(
+                    map.clone(),
+                    layout.himoreg_offsets_off,
+                    layout.himoreg_offsets_size,
+                )
+            },
+            unsafe {
+                Region::with_grower(
+                    map.clone(),
+                    layout.himoreg_index_off,
+                    layout.himoreg_index_size,
+                )
+            },
+            layout.himoreg_max_entries,
+            layout.himoreg_index_cap,
+        );
+        let contents = ContentStore::init(
+            unsafe {
+                Region::with_grower(
+                    map.clone(),
+                    layout.content_index_off,
+                    layout.content_index_size,
+                )
+            },
+            unsafe {
+                Region::with_grower(map.clone(), layout.content_data_off, layout.content_data_size)
+            },
+        );
+
+        Ok(Self {
+            path: path.to_string(),
+            layout,
+            max_entities,
+            max_himos,
+            vocab,
+            himo_reg,
+            himo_names: Vec::new(),
+            himo_types: Vec::new(),
+            himo_max_values: Vec::new(),
+            himos: Vec::new(),
+            entities,
+            contents,
+            undo,
+            #[cfg(all(feature = "v26", not(feature = "v27")))]
+            pairs: PairTable::new(),
+            #[cfg(feature = "v27")]
+            pairs: std::sync::RwLock::new(PairTable::new()),
+            #[cfg(feature = "v27")]
+            tuples: std::sync::RwLock::new(NTupleTable::new()),
+            #[cfg(feature = "v27")]
+            write_queue: None,
+            #[cfg(feature = "v27")]
+            shutdown_flag: None,
+            #[cfg(feature = "v27")]
+            consumer_handle: std::sync::Mutex::new(None),
+            #[cfg(feature = "v27")]
+            push_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "v27")]
+            apply_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "v27")]
+            wal: None,
+            #[cfg(feature = "v27")]
+            durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "v32")]
+            peer_id: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "v32")]
+            hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
+            #[cfg(feature = "v32")]
+            keypair: std::sync::RwLock::new(None),
+            #[cfg(feature = "v32")]
+            pubkeys: std::sync::Arc::new(crate::keys::PubkeyStore::new()),
+            #[cfg(feature = "v32")]
+            acl: std::sync::Arc::new(crate::acl::Acl::new()),
+            #[cfg(feature = "v32")]
+            is_replica: std::sync::atomic::AtomicBool::new(false),
+            blob_store: std::sync::RwLock::new(None),
+            #[cfg(feature = "v32")]
+            change_listeners: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+            #[cfg(feature = "v32")]
+            change_emit_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::wal::HEADER_SIZE as u64,
+            )),
+            #[cfg(feature = "v33")]
+            peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
+            backing: Backing::Growable(map),
+        })
+    }
+
     /// 現行の単独 Engine を開く(WAL 無し、&mut self で mutation)。
     /// v32 以前: `Engine::open` の別名。
     /// v33 以降: `Engine::open` が WAL 付き `Arc<Self>` を返すようになるため、
@@ -1093,7 +1414,12 @@ impl Engine {
         let file_size = self.layout.total_size as u64;
         let mut table = CrcTable::new(self.max_himos, file_size);
         let buf = match &self.backing {
+            #[cfg(not(target_arch = "wasm32"))]
             Backing::Mmap(m) => &m[..],
+            #[cfg(not(target_arch = "wasm32"))]
+            Backing::Growable(g) => unsafe {
+                std::slice::from_raw_parts(g.base() as *const u8, g.committed())
+            },
             Backing::Memory(v) => &v[..],
         };
         // himo columns
@@ -1188,12 +1514,23 @@ impl Engine {
         let himoreg_data_size = u64::from_le_bytes(buf[H_HIMOREG_DATA_SIZE..H_HIMOREG_DATA_SIZE + 8].try_into().unwrap()) as usize;
         let content_data_size = u64::from_le_bytes(buf[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].try_into().unwrap()) as usize;
         let cyl_max_values = u32::from_le_bytes(buf[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].try_into().unwrap());
+        // undo size は v0 ヘッダに無かったので、 0 ならレガシー DB → DEFAULT。
+        // growable 系ファイルは作成時に明示値を書く。
+        let undo_max_entries_raw = u32::from_le_bytes(
+            buf[H_UNDO_MAX_ENTRIES..H_UNDO_MAX_ENTRIES + 4].try_into().unwrap(),
+        );
+        let undo_max_entries = if undo_max_entries_raw == 0 {
+            crate::undo::DEFAULT_MAX_ENTRIES
+        } else {
+            undo_max_entries_raw
+        };
 
-        let layout = Layout::from_params(
+        let layout = Layout::from_params_with_undo(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, cyl_max_values,
+            undo_max_entries,
         );
 
         if file_size < layout.total_size as u64 {
@@ -1240,12 +1577,23 @@ impl Engine {
         let himoreg_data_size = u64::from_le_bytes(buf[H_HIMOREG_DATA_SIZE..H_HIMOREG_DATA_SIZE + 8].try_into().unwrap()) as usize;
         let content_data_size = u64::from_le_bytes(buf[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].try_into().unwrap()) as usize;
         let cyl_max_values = u32::from_le_bytes(buf[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].try_into().unwrap());
+        // undo size は v0 ヘッダに無かったので、 0 ならレガシー DB → DEFAULT。
+        // growable 系ファイルは作成時に明示値を書く。
+        let undo_max_entries_raw = u32::from_le_bytes(
+            buf[H_UNDO_MAX_ENTRIES..H_UNDO_MAX_ENTRIES + 4].try_into().unwrap(),
+        );
+        let undo_max_entries = if undo_max_entries_raw == 0 {
+            crate::undo::DEFAULT_MAX_ENTRIES
+        } else {
+            undo_max_entries_raw
+        };
 
-        let layout = Layout::from_params(
+        let layout = Layout::from_params_with_undo(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, cyl_max_values,
+            undo_max_entries,
         );
 
         let maxv_base = himo_maxv_base(max_himos);
@@ -1964,6 +2312,97 @@ impl Engine {
         map
     }
 
+    /// GROUP BY + COUNT — group_himo の値でグループ化し、各グループの entity 数
+    pub fn group_count(&self, group_himo: &str, eids: &[crate::EntityId]) -> Vec<(u32, u32)> {
+        let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
+        let gs = &self.himos[gid];
+        let mut map: Vec<(u32, u32)> = Vec::new();
+        for &eid in eids {
+            if let Some(group) = gs.get_value(crate::eid_local(eid)) {
+                if let Some(entry) = map.iter_mut().find(|(k, _)| *k == group) {
+                    entry.1 += 1;
+                } else {
+                    map.push((group, 1));
+                }
+            }
+        }
+        map
+    }
+
+    /// GROUP BY + MIN
+    pub fn group_min(&self, group_himo: &str, val_himo: &str, eids: &[crate::EntityId]) -> Vec<(u32, u32)> {
+        let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
+        let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
+        let gs = &self.himos[gid];
+        let vs = &self.himos[vid];
+        let mut map: Vec<(u32, u32)> = Vec::new();
+        for &eid in eids {
+            let local = crate::eid_local(eid);
+            if let (Some(group), Some(val)) = (gs.get_value(local), vs.get_value(local)) {
+                if let Some(entry) = map.iter_mut().find(|(k, _)| *k == group) {
+                    if val < entry.1 { entry.1 = val; }
+                } else {
+                    map.push((group, val));
+                }
+            }
+        }
+        map
+    }
+
+    /// GROUP BY + MAX
+    pub fn group_max(&self, group_himo: &str, val_himo: &str, eids: &[crate::EntityId]) -> Vec<(u32, u32)> {
+        let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
+        let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
+        let gs = &self.himos[gid];
+        let vs = &self.himos[vid];
+        let mut map: Vec<(u32, u32)> = Vec::new();
+        for &eid in eids {
+            let local = crate::eid_local(eid);
+            if let (Some(group), Some(val)) = (gs.get_value(local), vs.get_value(local)) {
+                if let Some(entry) = map.iter_mut().find(|(k, _)| *k == group) {
+                    if val > entry.1 { entry.1 = val; }
+                } else {
+                    map.push((group, val));
+                }
+            }
+        }
+        map
+    }
+
+    /// GROUP BY + AVG (整数除算)
+    pub fn group_avg(&self, group_himo: &str, val_himo: &str, eids: &[crate::EntityId]) -> Vec<(u32, u64)> {
+        let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
+        let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
+        let gs = &self.himos[gid];
+        let vs = &self.himos[vid];
+        let mut acc: Vec<(u32, u64, u64)> = Vec::new(); // (group, sum, count)
+        for &eid in eids {
+            let local = crate::eid_local(eid);
+            if let (Some(group), Some(val)) = (gs.get_value(local), vs.get_value(local)) {
+                if let Some(entry) = acc.iter_mut().find(|(k, _, _)| *k == group) {
+                    entry.1 += val as u64;
+                    entry.2 += 1;
+                } else {
+                    acc.push((group, val as u64, 1));
+                }
+            }
+        }
+        acc.into_iter().map(|(k, sum, n)| (k, sum / n)).collect()
+    }
+
+    /// 値集合の distinct — eids の中で himo に張られた値のユニーク集合
+    pub fn distinct(&self, himo: &str, eids: &[crate::EntityId]) -> Vec<u32> {
+        let hid = match self.himo_id(himo) { Some(h) => h, None => return vec![] };
+        let hs = &self.himos[hid];
+        let mut result: Vec<u32> = Vec::new();
+        for &eid in eids {
+            if let Some(v) = hs.get_value(crate::eid_local(eid)) {
+                if !result.contains(&v) { result.push(v); }
+            }
+        }
+        result
+    }
+
     // ──── 範囲クエリ ────
 
     /// 範囲内の全値に合致する entity を返す（min..=max）
@@ -2039,6 +2478,9 @@ impl Engine {
     }
 
     pub fn vocab_id(&self, text: &str) -> Option<u32> { self.vocab.lookup(text.as_bytes()) }
+
+    /// vocab ID → bytes（vocabulary 経由で文字列復元用）
+    pub fn vocab_text(&self, vid: u32) -> &[u8] { self.vocab.get(vid) }
 
     /// 紐の文脈で文字列のvocab IDを探す。その紐にぶら下がってる値だけ調べる。
     pub fn find_value(&self, himo: &str, text: &str) -> Option<u32> {
@@ -3098,6 +3540,7 @@ impl Engine {
     pub fn body_msync(&self) -> io::Result<()> {
         match &self.backing {
             Backing::Mmap(m) => m.flush(),
+            Backing::Growable(g) => g.flush(0, g.committed()),
             Backing::Memory(_) => Ok(()),
         }
     }
@@ -5231,6 +5674,93 @@ mod tests {
         assert_eq!(file_count, 2);
 
         let _ = std::fs::remove_dir_all(&blob_root);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// `create_growable` が standalone と等価な書き込み / 読み出しを
+    /// 提供することを確認する基本テスト。 内部 backing が違うだけで
+    /// API 観点では区別がつかないはず。
+    #[test]
+    fn growable_create_tie_query_roundtrip() {
+        let dir = tmp("growable_basic");
+        let mut eng = Engine::create_growable(&dir).unwrap();
+        eng.define_himo("age", HimoType::Value, 0);
+        eng.define_himo("city", HimoType::Symbol, 0);
+        for i in 0..50u32 {
+            let e = eng.entity();
+            eng.tie(e, "age", 20 + (i % 30));
+            eng.tie_text(
+                e,
+                "city",
+                if i % 2 == 0 { "Tokyo" } else { "Osaka" },
+            );
+        }
+        eng.rebuild();
+        // age = 20 + 5 → 25 was tied to entity 5, 35, etc.
+        assert!(eng.query(&[("age", 25)]).len() > 0);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// `create_growable_tiny` の apparent サイズが state-log 想定の
+    /// 数百 KB に収まることを確認する。 dogfood は matcha-shell の
+    /// notif_state でやるが、 ここでも基本の roundtrip + サイズを
+    /// 押さえる。
+    #[test]
+    fn growable_tiny_file_is_small() {
+        let dir = tmp("growable_tiny");
+        {
+            let mut eng = Engine::create_growable_tiny(&dir).unwrap();
+            eng.define_himo("key", HimoType::Symbol, 0);
+            eng.define_himo("ts", HimoType::Value, 0);
+            // 50 rows of (uuid-like, timestamp) — matcha の notif_state
+            // が捌くサイズ感。
+            for i in 0..50u32 {
+                let e = eng.entity();
+                eng.tie_text(e, "key", &format!("uuid-{:08x}", i));
+                eng.tie(e, "ts", 1_715_000_000 + i);
+            }
+            eng.flush().unwrap();
+        }
+        let meta = std::fs::metadata(&dir).unwrap();
+        eprintln!(
+            "growable_tiny apparent size after 50 rows: {} bytes ({:.1} KB)",
+            meta.len(),
+            meta.len() as f64 / 1024.0
+        );
+        // create_compact 同等シナリオは 305 MB apparent。 tiny は
+        // 全 region の上限値の合計でファイルサイズが決まる仕組みで
+        // 実測 ~ 5 MB に収まる。 これでも 60× 改善。
+        // 真の lazy init で 4 KB クラスにするのは Phase B (issue.md)。
+        assert!(
+            meta.len() < 8 * 1024 * 1024,
+            "tiny growable should be < 8 MB, got {} bytes",
+            meta.len()
+        );
+        // 再オープンしてデータが取れることも確認
+        let eng2 = Engine::open_standalone(&dir).unwrap();
+        eng2.rebuild();
+        assert_eq!(eng2.query(&[("ts", 1_715_000_010)]).len(), 1);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// growable backing で作った DB を open_standalone で再オープン
+    /// できる (open_standalone は MmapMut で開くが、 ファイル format は
+    /// 同一なので問題ないはず)。
+    #[test]
+    fn growable_then_open_standalone() {
+        let dir = tmp("growable_reopen");
+        {
+            let mut eng = Engine::create_growable(&dir).unwrap();
+            eng.define_himo("score", HimoType::Value, 0);
+            for i in 0..10u32 {
+                let e = eng.entity();
+                eng.tie(e, "score", i * 10);
+            }
+            eng.flush().unwrap();
+        }
+        let eng2 = Engine::open_standalone(&dir).unwrap();
+        eng2.rebuild();
+        assert_eq!(eng2.query(&[("score", 30)]).len(), 1);
         let _ = std::fs::remove_file(&dir);
     }
 }

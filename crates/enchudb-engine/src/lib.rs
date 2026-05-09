@@ -15,6 +15,7 @@
 //! ```
 
 pub(crate) mod region;
+pub mod growable_map;
 pub mod column;
 pub mod vocabulary;
 pub mod entity_set;

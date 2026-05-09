@@ -22,7 +22,16 @@ unsafe impl Send for UndoLog {}
 
 impl UndoLog {
     pub fn region_size() -> usize {
-        HEADER + DEFAULT_MAX_ENTRIES as usize * ENTRY_SIZE
+        Self::region_size_with(DEFAULT_MAX_ENTRIES)
+    }
+
+    /// Tunable variant — small-footprint engines (state-log presets,
+    /// embedded apps) pass a much smaller `max_entries` so the undo
+    /// region doesn't dominate the layout. The default 16 M entries
+    /// × 10 bytes = 160 MB which is the bulk of `create_compact`'s
+    /// 305 MB apparent size.
+    pub fn region_size_with(max_entries: u32) -> usize {
+        HEADER + max_entries as usize * ENTRY_SIZE
     }
 
     /// 新規領域を初期化。

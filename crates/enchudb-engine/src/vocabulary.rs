@@ -133,6 +133,16 @@ impl Vocabulary {
         assert!(id < self.max_entries, "vocabulary full");
         let len = value.len() as u32;
         let offset = self.data_end.fetch_add(len, Ordering::Relaxed);
+        // Growable backing: extend the file-backed window before
+        // writing past the current commit. No-op for static backings.
+        // We also grow the offsets region in case `id` advanced
+        // past its committed footprint (offsets have id × 8 layout).
+        let _ = self
+            .data
+            .ensure_committed((offset + len) as usize);
+        let _ = self
+            .offsets
+            .ensure_committed(((id as usize) + 1) * 8);
         let dm = self.data.slice_mut();
         dm[offset as usize..offset as usize + len as usize].copy_from_slice(value);
         // count/data_end を mmap header に即書き戻し（flush なしで drop されても復元可能に）

@@ -85,6 +85,12 @@ impl ContentStore {
         let len = content.len() as u32;
         // cross-process atomic fetch_add。mmap shared page なので別プロセスと整合。
         let data_off = self.data_end().fetch_add(len, Ordering::Relaxed);
+        // Extend the file-backed commit before writing — no-op on
+        // static backings, real grow on Backing::Growable.
+        let _ = self
+            .data
+            .ensure_committed((data_off + len) as usize);
+        let _ = self.index.ensure_committed(off + 8);
         let dm = self.data.slice_mut();
         if (data_off + len) as usize > dm.len() {
             // data領域溢れ — fetch_addを巻き戻してパニック
