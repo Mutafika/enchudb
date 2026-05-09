@@ -44,16 +44,15 @@ impl ContentStore {
         512 * 1024 * 1024 // 512MB
     }
 
-    /// 新規領域を初期化。data_end は mmap 内 AtomicU32 に DATA_HEADER を書く。
+    /// 新規領域を初期化。
+    ///
+    /// `index` 領域 (固定 cluster) は eager init。 `data` 領域 (variable
+    /// cluster、 v3 layout で末尾) は **何も書かない** — `set` の初回呼び
+    /// 出しで lazy 初期化する (Phase B Step 2)。 これで growable backing
+    /// の `initial_commit` が data 領域を含まなくて済む。
     pub fn init(index: Region, data: Region) -> Self {
         let im = index.slice_mut();
         im[0..4].copy_from_slice(&MAGIC);
-
-        let dm = data.slice_mut();
-        dm[0..4].copy_from_slice(&MAGIC);
-        // data_end は region 上の atomic として初期化
-        data.as_atomic_u32(DATA_END_OFFSET).store(DATA_HEADER as u32, Ordering::Relaxed);
-
         Self { index, data }
     }
 
@@ -83,6 +82,17 @@ impl ContentStore {
         let off = Self::index_offset(eid, kh);
 
         let len = content.len() as u32;
+        // Lazy init guard: `init` は data 領域に何も書かないので、 fresh
+        // region の data_end は 0 のまま。 この CAS で「最初の writer」が
+        // DATA_HEADER に bump する。 idempotent — 既に non-zero なら
+        // CAS は失敗してそのまま (race も MAGIC 書きで吸収される)。
+        let _ = self.data.ensure_committed(DATA_HEADER);
+        let _ = self.data_end().compare_exchange(
+            0,
+            DATA_HEADER as u32,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
         // cross-process atomic fetch_add。mmap shared page なので別プロセスと整合。
         let data_off = self.data_end().fetch_add(len, Ordering::Relaxed);
         // Extend the file-backed commit before writing — no-op on
@@ -97,6 +107,8 @@ impl ContentStore {
             self.data_end().fetch_sub(len, Ordering::Relaxed);
             panic!("ContentStore data overflow: {} + {} > {}", data_off, len, dm.len());
         }
+        // MAGIC は lazy — ここで毎回書く (idempotent、 4 byte copy)。
+        dm[0..4].copy_from_slice(&MAGIC);
         dm[data_off as usize..(data_off + len) as usize].copy_from_slice(content);
 
         let im = self.index.slice_mut();

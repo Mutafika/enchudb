@@ -29,16 +29,17 @@ impl Vocabulary {
     pub fn index_region_size(index_cap: u32) -> usize { INDEX_HEADER + (index_cap as usize) * INDEX_SLOT_SIZE }
 
     /// 新規領域を初期化。
+    ///
+    /// `data` 領域 (variable cluster、 v3 layout で末尾) の MAGIC + count
+    /// + data_end は **書かない** — `insert` の初回 append で初めて書く
+    /// (lazy init)。 これで growable backing の `initial_commit` が
+    /// data 領域の末尾までコミットしなくて済むようになる (Phase B Step 2)。
+    /// `index` 領域 (固定 cluster) は eager init のまま — 固定上限なので
+    /// initial_commit に含めるオーバーヘッドが小さい。
     pub fn init(data: Region, offsets: Region, index: Region, max_entries: u32, index_cap: u32) -> Self {
         let index_cap = index_cap.next_power_of_two();
 
-        // data header
-        let dm = data.slice_mut();
-        dm[0..4].copy_from_slice(&MAGIC);
-        dm[4..8].copy_from_slice(&0u32.to_le_bytes());
-        dm[8..12].copy_from_slice(&(HEADER as u32).to_le_bytes());
-
-        // index header
+        // index header — eager init は固定 cluster なのでコスト低
         let xm = index.slice_mut();
         xm[0..4].copy_from_slice(&INDEX_MAGIC);
         xm[4..8].copy_from_slice(&index_cap.to_le_bytes());
@@ -52,10 +53,22 @@ impl Vocabulary {
     }
 
     /// 既存領域をロード。ハッシュインデックスを再構築する。
+    ///
+    /// data の先頭 4 バイトが MAGIC でない (= 全 0 = lazy fresh、 一度も
+    /// insert されてない) 場合は count=0 / data_end=HEADER の fresh
+    /// state を返す。 これで `insert` が遅延書き込みする MAGIC を待たずに
+    /// open できる。
     pub fn load(data: Region, offsets: Region, index: Region) -> Self {
         let dm = data.slice();
-        let count = u32::from_le_bytes(dm[4..8].try_into().unwrap());
-        let data_end = u32::from_le_bytes(dm[8..12].try_into().unwrap());
+        let is_fresh = dm[0..4] != MAGIC;
+        let (count, data_end) = if is_fresh {
+            (0u32, HEADER as u32)
+        } else {
+            (
+                u32::from_le_bytes(dm[4..8].try_into().unwrap()),
+                u32::from_le_bytes(dm[8..12].try_into().unwrap()),
+            )
+        };
 
         let om = offsets.slice();
         let max_entries = (om.len() / 8) as u32;
@@ -69,7 +82,9 @@ impl Vocabulary {
             data_end: AtomicU32::new(data_end),
             max_entries, index_cap,
         };
-        v.rebuild_index();
+        if !is_fresh {
+            v.rebuild_index();
+        }
         v
     }
 
@@ -145,6 +160,11 @@ impl Vocabulary {
             .ensure_committed(((id as usize) + 1) * 8);
         let dm = self.data.slice_mut();
         dm[offset as usize..offset as usize + len as usize].copy_from_slice(value);
+        // MAGIC は lazy init — `init` は data 領域に書かないので、 ここで
+        // 毎回書く (idempotent、 4 byte copy なのでコスト微小)。 MAGIC が
+        // 全 0 のままなら `load` は fresh と判定するので、 一度でも insert
+        // が走れば `load` 後の rebuild_index が動くようになる。
+        dm[0..4].copy_from_slice(&MAGIC);
         // count/data_end を mmap header に即書き戻し（flush なしで drop されても復元可能に）
         let new_count = id + 1;
         let new_end = offset + len;

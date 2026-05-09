@@ -1211,14 +1211,14 @@ impl Engine {
             .truncate(true)
             .open(path)?;
 
-        // Phase A leaves the initial commit at full layout size.
-        // The remaining win — making fresh DBs page-sized on disk —
-        // requires lazy region-init in every store (each region's
-        // magic write is currently eager at offset 0 of its region,
-        // which means initial_commit must cover ALL region offsets,
-        // i.e. the entire layout). That's a bigger refactor; tracked
-        // in `enchudb/issue.md` and `GROWABLE_MMAP_PLAN.md`.
-        let initial_commit = layout.total_size;
+        // Phase B Step 3: initial_commit は variable cluster の手前 (=
+        // 末尾の vocab_data の開始 offset) で打ち切る。 fixed cluster
+        // (entities / undo / *_offsets / *_index / content_index /
+        // himo_slots) のみコミット、 vocab_data / himoreg_data /
+        // content_data は append まで未コミット。 lazy init された
+        // Vocabulary / ContentStore が初回 append 時に必要なだけ
+        // ensure_committed で伸ばす。
+        let initial_commit = layout.vocab_data_off;
         let map = std::sync::Arc::new(crate::growable_map::GrowableMap::new(
             file,
             layout.total_size,
