@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
 use crate::bigram;
@@ -30,15 +31,17 @@ impl TextEngine {
         }
     }
 
-    /// mmap モードで開く（読み取り専用、即起動）
+    /// mmap モードで開く（読み取り専用、即起動）。native のみ。
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open(path: &str) -> io::Result<Self> {
         let mapped = MappedIndex::open(Path::new(path))?;
         Ok(Self { backend: Backend::Mapped(mapped) })
     }
 
-    /// 既存の .etxt を読み込んで in-memory mutable engine に再構築する。
+    /// 既存の .etxt を読み込んで in-memory mutable engine に再構築する。native のみ。
     /// `open()` と違って後から `index()` / `remove()` できる。
     /// コストは「全 doc を読んで再 index」する分。
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open_mut(path: &str) -> io::Result<Self> {
         let mapped = MappedIndex::open(Path::new(path))?;
         let mut eng = TextEngine::new();
@@ -47,12 +50,41 @@ impl TextEngine {
         Ok(eng)
     }
 
-    /// ファイルに書き出し
+    /// バイト列から読み取り専用 engine を作る。wasm で fetch したレスポンスを直接渡せる。
+    pub fn from_bytes(bytes: Vec<u8>) -> io::Result<Self> {
+        let mapped = MappedIndex::from_bytes(bytes)?;
+        Ok(Self { backend: Backend::Mapped(mapped) })
+    }
+
+    /// バイト列から in-memory mutable engine を作る（`open_mut` の wasm 版）。
+    pub fn from_bytes_mut(bytes: Vec<u8>) -> io::Result<Self> {
+        let mapped = MappedIndex::from_bytes(bytes)?;
+        let mut eng = TextEngine::new();
+        mapped.for_each_doc(|eid, text| eng.index(eid, text));
+        eng.compact();
+        Ok(eng)
+    }
+
+    /// ファイルに書き出し。native のみ。
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn save(&mut self, path: &str) -> io::Result<()> {
         self.compact();
         match &self.backend {
             Backend::Memory { postings, originals } => {
                 crate::storage::save(Path::new(path), postings.raw(), originals)
+            }
+            Backend::Mapped(_) => {
+                Err(io::Error::new(io::ErrorKind::Unsupported, "mapped engine is read-only"))
+            }
+        }
+    }
+
+    /// 任意の Writer に書き出す（wasm でも動くが、wasm に index 構築のニーズは普通ない）。
+    pub fn write_to<W: std::io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+        self.compact();
+        match &self.backend {
+            Backend::Memory { postings, originals } => {
+                crate::storage::write_to(w, postings.raw(), originals)
             }
             Backend::Mapped(_) => {
                 Err(io::Error::new(io::ErrorKind::Unsupported, "mapped engine is read-only"))
@@ -334,6 +366,24 @@ mod tests {
     #[test]
     fn open_nonexistent() {
         assert!(TextEngine::open("/tmp/does_not_exist.etxt").is_err());
+    }
+
+    #[test]
+    fn from_bytes_round_trip() {
+        // Build → write to Vec<u8> → read back via from_bytes
+        let mut eng = TextEngine::new();
+        eng.index(0, "国民は法の下に");
+        eng.index((1u64 << 32) | 5, "個人として尊重");
+        eng.compact();
+
+        let mut buf: Vec<u8> = Vec::new();
+        eng.write_to(&mut buf).unwrap();
+
+        let eng2 = TextEngine::from_bytes(buf).unwrap();
+        assert_eq!(eng2.doc_count(), 2);
+        assert_eq!(eng2.search("国民"), vec![0u64]);
+        assert_eq!(eng2.search("個人"), vec![(1u64 << 32) | 5]);
+        assert_eq!(eng2.get_text((1u64 << 32) | 5), Some("個人として尊重"));
     }
 
     #[test]

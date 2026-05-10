@@ -15,11 +15,12 @@
 ///   offset/len は Posting Data 内のエントリ単位（byte 単位ではない）
 ///
 /// [Padding] — 0..=7 bytes
-///   Posting Data の先頭を 8-byte 境界に揃えるための詰め物
-///   (Bigram Index は 12 bytes/entry でアライメントが揃わないため)
+///   Posting Data の先頭を 8-byte 境界に揃えるための詰め物。
+///   現状の reader は from_le_bytes でアライメント非依存に読むので必須ではないが、
+///   将来 mmap 上で u64 slice cast に戻す余地を残すため format として保持する。
 ///
 /// [Posting Data] — posting_total × 8 bytes
-///   flat array of u64 entity IDs
+///   flat array of u64 entity IDs (little-endian)
 ///
 /// [Doc Index] — doc_count × 16 bytes
 ///   eid: u64, offset: u32, len: u32
@@ -27,10 +28,15 @@
 ///
 /// [Text Data] — text_total bytes
 
-use std::fs::File;
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::fs::File;
+#[cfg(not(target_arch = "wasm32"))]
 use memmap2::Mmap;
+
+use std::io::Write;
 
 const MAGIC: &[u8; 4] = b"ETXT";
 const VERSION: u32 = 2;
@@ -46,36 +52,67 @@ fn posting_padding(bigram_count: u32) -> usize {
     (8 - (after_bigrams % 8)) % 8
 }
 
-/// mmap された読み取り専用インデックス
+/// 永続化バックエンド。native は mmap、wasm は Vec<u8>（fetch 結果を所有）。
+enum Backing {
+    #[cfg(not(target_arch = "wasm32"))]
+    Mmap(Mmap),
+    Bytes(Vec<u8>),
+}
+
+impl Backing {
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Backing::Mmap(m) => m,
+            Backing::Bytes(v) => v.as_slice(),
+        }
+    }
+}
+
+/// 読み取り専用インデックス。
 pub struct MappedIndex {
-    mmap: Mmap,
+    backing: Backing,
     bigram_count: u32,
     posting_total: u32,
     doc_count: u32,
 }
 
 impl MappedIndex {
+    /// ファイルを mmap で開く（native のみ）。
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
-        if mmap.len() < HEADER_SIZE || &mmap[0..4] != MAGIC {
+        Self::from_backing(Backing::Mmap(mmap))
+    }
+
+    /// 既存のバイト列から開く。wasm でも動く（fetch 後のレスポンスを直接渡す）。
+    pub fn from_bytes(bytes: Vec<u8>) -> io::Result<Self> {
+        Self::from_backing(Backing::Bytes(bytes))
+    }
+
+    fn from_backing(backing: Backing) -> io::Result<Self> {
+        let buf = backing.as_slice();
+        if buf.len() < HEADER_SIZE || &buf[0..4] != MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "not an ETXT file"));
         }
-        let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
+        let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
         if version != VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported ETXT version {version} (expected {VERSION})"),
             ));
         }
-        let bigram_count = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
-        let posting_total = u32::from_le_bytes(mmap[12..16].try_into().unwrap());
-        let doc_count = u32::from_le_bytes(mmap[16..20].try_into().unwrap());
-        Ok(Self { mmap, bigram_count, posting_total, doc_count })
+        let bigram_count = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        let posting_total = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+        let doc_count = u32::from_le_bytes(buf[16..20].try_into().unwrap());
+        Ok(Self { backing, bigram_count, posting_total, doc_count })
     }
 
-    /// bigram key → posting list (entity IDs)
-    pub fn get_posting(&self, key: u32) -> &[u64] {
+    /// bigram key → posting list (entity IDs)。
+    /// アライメント非依存の読み出しで Vec<u64> を返す（slice cast を使わない）。
+    pub fn get_posting(&self, key: u32) -> Vec<u64> {
         let idx = self.bigram_index();
         // 二分探索
         let mut lo = 0usize;
@@ -90,41 +127,36 @@ impl MappedIndex {
                 let offset = u32::from_le_bytes(entry[4..8].try_into().unwrap()) as usize;
                 let len = u32::from_le_bytes(entry[8..12].try_into().unwrap()) as usize;
                 let data = self.posting_data();
-                let byte_start = offset * POSTING_ENTRY;
-                let byte_end = (offset + len) * POSTING_ENTRY;
-                let slice = &data[byte_start..byte_end];
-                // Posting Data は 8-byte 境界に揃えてあるので、u64 として安全にキャスト可能。
-                debug_assert_eq!(slice.as_ptr() as usize % 8, 0);
-                let ptr = slice.as_ptr() as *const u64;
-                return unsafe { std::slice::from_raw_parts(ptr, len) };
+                let mut out = Vec::with_capacity(len);
+                for i in 0..len {
+                    let start = (offset + i) * POSTING_ENTRY;
+                    let bytes: [u8; 8] = data[start..start + POSTING_ENTRY].try_into().unwrap();
+                    out.push(u64::from_le_bytes(bytes));
+                }
+                return out;
             }
         }
-        &[]
+        Vec::new()
     }
 
     /// 複数 key の AND
     pub fn intersect(&self, keys: &[u32]) -> Vec<u64> {
         if keys.is_empty() { return vec![]; }
 
-        let mut shortest_idx = 0;
-        let mut shortest_len = usize::MAX;
-        for (i, &key) in keys.iter().enumerate() {
-            let len = self.get_posting(key).len();
-            if len == 0 { return vec![]; }
-            if len < shortest_len {
-                shortest_len = len;
-                shortest_idx = i;
-            }
-        }
+        let postings: Vec<Vec<u64>> = keys.iter().map(|&k| self.get_posting(k)).collect();
+        if postings.iter().any(|p| p.is_empty()) { return vec![]; }
 
-        let mut result: Vec<u64> = self.get_posting(keys[shortest_idx]).to_vec();
+        let (shortest_idx, _) = postings.iter().enumerate()
+            .min_by_key(|(_, p)| p.len())
+            .unwrap();
+
+        let mut result = postings[shortest_idx].clone();
         result.sort_unstable();
         result.dedup();
 
-        for (i, &key) in keys.iter().enumerate() {
+        for (i, posting) in postings.iter().enumerate() {
             if i == shortest_idx { continue; }
-            let posting = self.get_posting(key);
-            let mut set: Vec<u64> = posting.to_vec();
+            let mut set = posting.clone();
             set.sort_unstable();
             set.dedup();
             result.retain(|eid| set.binary_search(eid).is_ok());
@@ -172,7 +204,7 @@ impl MappedIndex {
     }
 
     /// 全 doc を (eid, text) で順に callback に渡す。
-    /// `TextEngine::open_mut` で in-memory 再構築するのに使う。
+    /// `TextEngine::open_mut` / `TextEngine::from_bytes_mut` で in-memory 再構築するのに使う。
     pub fn for_each_doc<F: FnMut(u64, &str)>(&self, mut f: F) {
         let idx = self.doc_index();
         let data = self.text_data();
@@ -193,47 +225,60 @@ impl MappedIndex {
     // ── レイアウト ──
 
     fn bigram_index(&self) -> &[u8] {
+        let buf = self.backing.as_slice();
         let start = HEADER_SIZE;
         let end = start + self.bigram_count as usize * BIGRAM_ENTRY;
-        &self.mmap[start..end]
+        &buf[start..end]
     }
 
     fn posting_data(&self) -> &[u8] {
+        let buf = self.backing.as_slice();
         let start = HEADER_SIZE
             + self.bigram_count as usize * BIGRAM_ENTRY
             + posting_padding(self.bigram_count);
         let end = start + self.posting_total as usize * POSTING_ENTRY;
-        &self.mmap[start..end]
+        &buf[start..end]
     }
 
     fn doc_index(&self) -> &[u8] {
+        let buf = self.backing.as_slice();
         let posting_end = HEADER_SIZE
             + self.bigram_count as usize * BIGRAM_ENTRY
             + posting_padding(self.bigram_count)
             + self.posting_total as usize * POSTING_ENTRY;
         let start = posting_end;
         let end = start + self.doc_count as usize * DOC_ENTRY;
-        &self.mmap[start..end]
+        &buf[start..end]
     }
 
     fn text_data(&self) -> &[u8] {
+        let buf = self.backing.as_slice();
         let start = HEADER_SIZE
             + self.bigram_count as usize * BIGRAM_ENTRY
             + posting_padding(self.bigram_count)
             + self.posting_total as usize * POSTING_ENTRY
             + self.doc_count as usize * DOC_ENTRY;
-        &self.mmap[start..]
+        &buf[start..]
     }
 }
 
 /// インメモリの TextEngine データをファイルに書き出す
+#[cfg(not(target_arch = "wasm32"))]
 pub fn save(
     path: &Path,
     postings: &std::collections::HashMap<u32, Vec<u64>>,
     originals: &std::collections::HashMap<u64, String>,
 ) -> io::Result<()> {
     let mut file = File::create(path)?;
+    write_to(&mut file, postings, originals)
+}
 
+/// 任意の Writer に書き出す。テストや tar/zst パイプラインから使う。
+pub fn write_to<W: Write>(
+    w: &mut W,
+    postings: &std::collections::HashMap<u32, Vec<u64>>,
+    originals: &std::collections::HashMap<u64, String>,
+) -> io::Result<()> {
     // bigram index をキー順にソート
     let mut bigram_entries: Vec<(u32, &Vec<u64>)> = postings.iter().map(|(&k, v)| (k, v)).collect();
     bigram_entries.sort_by_key(|(k, _)| *k);
@@ -249,34 +294,34 @@ pub fn save(
     let text_total: u32 = doc_entries.iter().map(|(_, v)| v.len() as u32).sum();
 
     // Header
-    file.write_all(MAGIC)?;
-    file.write_all(&VERSION.to_le_bytes())?;
-    file.write_all(&bigram_count.to_le_bytes())?;
-    file.write_all(&posting_total.to_le_bytes())?;
-    file.write_all(&doc_count.to_le_bytes())?;
-    file.write_all(&text_total.to_le_bytes())?;
-    file.write_all(&[0u8; 8])?; // reserved
+    w.write_all(MAGIC)?;
+    w.write_all(&VERSION.to_le_bytes())?;
+    w.write_all(&bigram_count.to_le_bytes())?;
+    w.write_all(&posting_total.to_le_bytes())?;
+    w.write_all(&doc_count.to_le_bytes())?;
+    w.write_all(&text_total.to_le_bytes())?;
+    w.write_all(&[0u8; 8])?; // reserved
 
     // Bigram Index
     let mut offset: u32 = 0;
     for (key, eids) in &bigram_entries {
         let len = eids.len() as u32;
-        file.write_all(&key.to_le_bytes())?;
-        file.write_all(&offset.to_le_bytes())?;
-        file.write_all(&len.to_le_bytes())?;
+        w.write_all(&key.to_le_bytes())?;
+        w.write_all(&offset.to_le_bytes())?;
+        w.write_all(&len.to_le_bytes())?;
         offset += len;
     }
 
     // Padding to 8-byte align Posting Data
     let pad = posting_padding(bigram_count);
     if pad > 0 {
-        file.write_all(&[0u8; 8][..pad])?;
+        w.write_all(&[0u8; 8][..pad])?;
     }
 
     // Posting Data (u64 each)
     for (_, eids) in &bigram_entries {
         for &eid in eids.iter() {
-            file.write_all(&eid.to_le_bytes())?;
+            w.write_all(&eid.to_le_bytes())?;
         }
     }
 
@@ -284,17 +329,17 @@ pub fn save(
     let mut text_offset: u32 = 0;
     for (eid, text) in &doc_entries {
         let len = text.len() as u32;
-        file.write_all(&eid.to_le_bytes())?;
-        file.write_all(&text_offset.to_le_bytes())?;
-        file.write_all(&len.to_le_bytes())?;
+        w.write_all(&eid.to_le_bytes())?;
+        w.write_all(&text_offset.to_le_bytes())?;
+        w.write_all(&len.to_le_bytes())?;
         text_offset += len;
     }
 
     // Text Data
     for (_, text) in &doc_entries {
-        file.write_all(text.as_bytes())?;
+        w.write_all(text.as_bytes())?;
     }
 
-    file.flush()?;
+    w.flush()?;
     Ok(())
 }
