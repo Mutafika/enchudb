@@ -9,7 +9,7 @@ use crate::storage::MappedIndex;
 enum Backend {
     Memory {
         postings: PostingList,
-        originals: HashMap<u32, String>,
+        originals: HashMap<u64, String>,
     },
     Mapped(MappedIndex),
 }
@@ -36,6 +36,17 @@ impl TextEngine {
         Ok(Self { backend: Backend::Mapped(mapped) })
     }
 
+    /// 既存の .etxt を読み込んで in-memory mutable engine に再構築する。
+    /// `open()` と違って後から `index()` / `remove()` できる。
+    /// コストは「全 doc を読んで再 index」する分。
+    pub fn open_mut(path: &str) -> io::Result<Self> {
+        let mapped = MappedIndex::open(Path::new(path))?;
+        let mut eng = TextEngine::new();
+        mapped.for_each_doc(|eid, text| eng.index(eid, text));
+        eng.compact();
+        Ok(eng)
+    }
+
     /// ファイルに書き出し
     pub fn save(&mut self, path: &str) -> io::Result<()> {
         self.compact();
@@ -50,7 +61,7 @@ impl TextEngine {
     }
 
     /// entity にテキストを登録
-    pub fn index(&mut self, eid: u32, text: &str) {
+    pub fn index(&mut self, eid: u64, text: &str) {
         let (postings, originals) = self.memory_mut();
         // 既存を削除
         if let Some(old) = originals.remove(&eid) {
@@ -65,7 +76,7 @@ impl TextEngine {
     }
 
     /// entity のテキストを削除
-    pub fn remove(&mut self, eid: u32) {
+    pub fn remove(&mut self, eid: u64) {
         let (postings, originals) = self.memory_mut();
         if let Some(old) = originals.remove(&eid) {
             for bg in bigram::extract(&old) {
@@ -75,7 +86,7 @@ impl TextEngine {
     }
 
     /// 部分一致検索
-    pub fn search(&self, query: &str) -> Vec<u32> {
+    pub fn search(&self, query: &str) -> Vec<u64> {
         let bgs = bigram::extract(query);
 
         if bgs.is_empty() {
@@ -99,7 +110,7 @@ impl TextEngine {
     }
 
     /// 原文を取得
-    pub fn get_text(&self, eid: u32) -> Option<&str> {
+    pub fn get_text(&self, eid: u64) -> Option<&str> {
         match &self.backend {
             Backend::Memory { originals, .. } => originals.get(&eid).map(|s| s.as_str()),
             Backend::Mapped(m) => m.get_text(eid),
@@ -130,14 +141,16 @@ impl TextEngine {
 
     // ── internal ──
 
-    fn memory_mut(&mut self) -> (&mut PostingList, &mut HashMap<u32, String>) {
+    fn memory_mut(&mut self) -> (&mut PostingList, &mut HashMap<u64, String>) {
         match &mut self.backend {
             Backend::Memory { postings, originals } => (postings, originals),
             Backend::Mapped(_) => panic!("mapped engine is read-only"),
         }
     }
 
-    fn search_single_char(&self, query: &str) -> Vec<u32> {
+    fn search_single_char(&self, query: &str) -> Vec<u64> {
+        // 1 文字クエリは bigram で絞れないので doc_index を全走査する。
+        // 稀なケースなので O(N) で許容。
         match &self.backend {
             Backend::Memory { originals, .. } => {
                 originals.iter()
@@ -146,20 +159,6 @@ impl TextEngine {
                     .collect()
             }
             Backend::Mapped(m) => {
-                // mmap の全 doc を走査（1文字検索は稀なので許容）
-                let mut result = Vec::new();
-                for eid in 0..u32::MAX {
-                    match m.get_text(eid) {
-                        Some(text) if text.contains(query) => result.push(eid),
-                        Some(_) => {}
-                        None => {
-                            // doc_index はソート済みなので、存在しない eid が来たら
-                            // 全部チェック済みかは分からない。全 doc 走査に切り替え。
-                            break;
-                        }
-                    }
-                }
-                // フォールバック: doc_index を直接走査
                 m.search_all(|text| text.contains(query))
             }
         }
@@ -188,7 +187,7 @@ mod tests {
         assert!(r.contains(&2));
 
         let r = eng.search("法の下");
-        assert_eq!(r, vec![0]);
+        assert_eq!(r, vec![0u64]);
     }
 
     #[test]
@@ -196,7 +195,7 @@ mod tests {
         let mut eng = TextEngine::new();
         eng.index(0, "テスト文字列");
         eng.compact();
-        assert_eq!(eng.search("存在しない"), vec![]);
+        assert_eq!(eng.search("存在しない"), Vec::<u64>::new());
     }
 
     #[test]
@@ -207,7 +206,7 @@ mod tests {
         eng.compact();
 
         let r = eng.search("猫");
-        assert_eq!(r, vec![0]);
+        assert_eq!(r, vec![0u64]);
     }
 
     #[test]
@@ -218,7 +217,7 @@ mod tests {
         eng.compact();
 
         let r = eng.search("法の下");
-        assert_eq!(r, vec![1]);
+        assert_eq!(r, vec![1u64]);
     }
 
     #[test]
@@ -300,7 +299,7 @@ mod tests {
         assert!(!r.contains(&2));
 
         let r = eng2.search("法の下");
-        assert_eq!(r, vec![0]);
+        assert_eq!(r, vec![0u64]);
 
         assert_eq!(eng2.get_text(0), Some("国民は法の下に平等であって"));
         assert_eq!(eng2.get_text(99), None);
@@ -309,7 +308,54 @@ mod tests {
     }
 
     #[test]
+    fn save_and_open_wide_eid() {
+        // v32 の peer_id を含む u64 eid でも round-trip する
+        let path = "/tmp/enchu_text_test_wide_eid.etxt";
+        let _ = std::fs::remove_file(path);
+
+        let mut eng = TextEngine::new();
+        let peer1_local0 = 1u64 << 32;
+        let peer2_local5 = (2u64 << 32) | 5;
+        eng.index(peer1_local0, "国民は法の下に平等");
+        eng.index(peer2_local5, "個人として尊重される");
+        eng.save(path).unwrap();
+
+        let eng2 = TextEngine::open(path).unwrap();
+        assert_eq!(eng2.doc_count(), 2);
+        assert_eq!(eng2.get_text(peer1_local0), Some("国民は法の下に平等"));
+        assert_eq!(eng2.get_text(peer2_local5), Some("個人として尊重される"));
+
+        let r = eng2.search("国民");
+        assert_eq!(r, vec![peer1_local0]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn open_nonexistent() {
         assert!(TextEngine::open("/tmp/does_not_exist.etxt").is_err());
+    }
+
+    #[test]
+    fn open_mut_round_trip() {
+        let path = "/tmp/enchu_text_test_open_mut.etxt";
+        let _ = std::fs::remove_file(path);
+
+        let mut eng = TextEngine::new();
+        eng.index(10, "国民は法の下に");
+        eng.index(20, "個人として尊重");
+        eng.save(path).unwrap();
+
+        let mut eng2 = TextEngine::open_mut(path).unwrap();
+        assert_eq!(eng2.doc_count(), 2);
+        assert!(eng2.search("国民").contains(&10));
+
+        // 開いた後でも mutate できる
+        eng2.index(30, "民主主義の基盤");
+        eng2.compact();
+        assert_eq!(eng2.doc_count(), 3);
+        assert!(eng2.search("民主").contains(&30));
+
+        let _ = std::fs::remove_file(path);
     }
 }

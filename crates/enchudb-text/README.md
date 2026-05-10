@@ -1,11 +1,11 @@
-# enchu-text
+# enchudb-text
 
-bigram 転置インデックスによる全文検索エンジン。mmap 永続化対応。
+bigram 転置インデックスによる全文検索エンジン。mmap 永続化対応。entity ID は **u64**（EnchuDB v32 以降の eid 幅）。
 
 ## 使い方
 
 ```rust
-use enchu_text::TextEngine;
+use enchudb_text::TextEngine;
 
 // 構築
 let mut eng = TextEngine::new();
@@ -34,14 +34,14 @@ eng.search("法の下") // → [0]
 
 ```rust
 use enchudb::Engine;
-use enchu_text::TextEngine;
+use enchudb_text::TextEngine;
 
 let db = Engine::open("app.db").unwrap();
 let text = TextEngine::open("app.etxt").unwrap();
 
 // テキスト検索 → 構造化フィルタ → 集計
-let hits = text.search("平等");
-let active: Vec<u32> = hits.iter()
+let hits = text.search("平等");   // Vec<u64>
+let active: Vec<u64> = hits.iter()
     .filter(|&&eid| db.get(eid, "status") == Some(1))
     .copied().collect();
 let total = db.sum("score", &active);
@@ -64,24 +64,27 @@ TextEngine::new() -> TextEngine
 TextEngine::open(path: &str) -> io::Result<TextEngine>
 
 // 書き込み（インメモリのみ）
-eng.index(eid: u32, text: &str)
-eng.remove(eid: u32)
+eng.index(eid: u64, text: &str)
+eng.remove(eid: u64)
 eng.save(path: &str) -> io::Result<()>
 eng.compact()
 
 // 読み取り（両モード）
-eng.search(query: &str) -> Vec<u32>
-eng.get_text(eid: u32) -> Option<&str>
+eng.search(query: &str) -> Vec<u64>
+eng.get_text(eid: u64) -> Option<&str>
 eng.doc_count() -> usize
 eng.bigram_count() -> usize
 ```
 
-## ファイル形式 (.etxt)
+## ファイル形式 (.etxt, version 2)
 
 ```
-[Header 32B] magic "ETXT" + メタデータ
-[Bigram Index] key → (offset, len) のソート済み配列
-[Posting Data] entity ID の flat 配列
-[Doc Index] eid → (offset, len) のソート済み配列
-[Text Data] 原文バイト列
+[Header 32B] magic "ETXT" + version=2 + メタデータ
+[Bigram Index]  bigram_count × 12B    key u32 + offset u32 + len u32
+[Padding]       0..=7B                Posting Data を 8-byte 境界に揃える
+[Posting Data]  posting_total × 8B    flat array of u64 entity IDs
+[Doc Index]     doc_count × 16B       eid u64 + offset u32 + len u32
+[Text Data]     text_total B          UTF-8 bytes
 ```
+
+**互換性:** version 1（eid u32 時代）の `.etxt` は読めない。アプリ側で再生成する必要がある。
