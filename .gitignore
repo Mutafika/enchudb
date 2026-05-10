@@ -6,3 +6,15 @@ crates/enchu-extend/node_modules/
 crates/enchu-extend/dist/
 crates/enchudb-rag/.fastembed_cache/
 **/.fastembed_cache/
+
+# Dev / process docs — kept locally, not part of the public release.
+# Public users see README + sub-crate READMEs + SPEC (when published) + LICENSE.
+/BUGS.md
+/CHANGELOG.md
+/CLAUDE.md
+/SPEC.md
+/issue.md
+/*_PLAN.md
+/TEST_DESIGN.md
+/MOLIBOOK_TEST_PLAN.md
+/docs/
