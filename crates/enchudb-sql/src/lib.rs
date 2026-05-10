@@ -6,24 +6,33 @@
 //! - SQLite のエッジケース挙動は完全模倣しない。意味的に同じ or より良い結果が返ればよい。
 //! - DSL (`query_lang`) は残して "advanced query" として共存。集計は DSL を使う。
 //!
-//! ## v0 サポート
+//! ## v0.1 サポート
 //!
 //! ```sql
-//! CREATE TABLE t (col TYPE [PRIMARY KEY], ...)
+//! CREATE TABLE t (col TYPE [PRIMARY KEY], ...)         -- INTEGER / TEXT
 //! INSERT INTO t [(col, ...)] VALUES (...) [, (...)]
-//! INSERT OR REPLACE INTO t [(col, ...)] VALUES (...)
-//! SELECT [* | col, ...] FROM t [WHERE col = val [AND col = val]*]
-//! UPDATE t SET col = val [, col = val]* WHERE col = val
-//! DELETE FROM t WHERE col = val
+//! INSERT OR REPLACE INTO t VALUES (...)
+//!
+//! SELECT [* | col, ...] FROM t
+//!   [WHERE <cond> [AND <cond>]*]
+//!   [ORDER BY col [ASC|DESC]]
+//!   [LIMIT n]
+//!
+//! UPDATE t SET col = val [, col = val]* WHERE <cond> [AND <cond>]*
+//! DELETE FROM t WHERE <cond> [AND <cond>]*
 //! ```
+//!
+//! `<cond>` で使える比較:
+//! - 等値: `col = val`
+//! - 範囲: `col >`, `>=`, `<`, `<=` `val`
+//! - BETWEEN: `col BETWEEN lo AND hi` (両端 inclusive)
+//! - NULL 判定: `col IS NULL` / `col IS NOT NULL`
 //!
 //! TYPE は `INTEGER` / `TEXT` のみ。INTEGER は u32、TEXT は Symbol himo。
 //!
 //! ## 未対応 (今後)
 //! - JOIN / subquery
-//! - 集計 (`SUM`, `COUNT`, `GROUP BY`) — `query_lang` DSL を使う
-//! - `ORDER BY` / `LIMIT`
-//! - 範囲比較 (`>`, `<`, `BETWEEN`)
+//! - 集計 (`SUM`, `COUNT`, `GROUP BY` の SQL 経由) — `query_lang` DSL を使う
 //! - 複数カラム PK
 //! - `DEFAULT` / `NOT NULL` / `CHECK` 制約
 //! - スキーマ永続化 (現状は in-memory、reopen 時に CREATE TABLE 再呼び出しが必要、`define_himo` は idempotent)

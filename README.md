@@ -6,13 +6,17 @@
 
 ## Workspace
 
-| Crate | 役割 |
-|---|---|
-| [`enchudb`](./src) | コアストレージエンジン。Cylinder + PairTable + WAL + Ravn |
-| [`enchudb-rag`](./crates/enchudb-rag) | RAG ストア。メタフィルタ先行 + brute force cosine、ANN 不要 |
-| [`enchudb-text`](./crates/enchudb-text) | bigram 転置インデックスによる全文検索 |
-| [`enchudb-transport`](./crates/enchudb-transport) | HTTP / WebSocket 分散トランスポート |
-| [`enchu-extend`](./crates/enchu-extend) | Node.js バインディング (napi-rs)。PostgreSQL 透過キャッシュ |
+| Crate | 役割 | meta crate での opt-in |
+|---|---|---|
+| [`enchudb-engine`](./crates/enchudb-engine) | コアストレージエンジン。Cylinder + PairTable + WAL + Ravn | always |
+| [`enchudb-sync`](./crates/enchudb-sync) | HLC-LWW Syncer、ShardRouter | `features = ["v32"]` |
+| [`enchudb-transport`](./crates/enchudb-transport) | HTTP relay / WebSocket push hub | runtime 直接依存 |
+| [`enchudb-text`](./crates/enchudb-text) | bigram 転置インデックスによる全文検索 | 直接依存 |
+| [`enchudb-rag`](./crates/enchudb-rag) | RAG ストア。メタフィルタ先行 + brute force cosine、ANN 不要 | 直接依存 |
+| [`enchudb-sql`](./crates/enchudb-sql) | SQLite 上位互換の SQL frontend (CRUD + ORDER BY / LIMIT / 範囲 / IS NULL / INSERT OR REPLACE) | `features = ["sql"]` |
+| [`enchudb-ffi`](./crates/enchudb-ffi) | SQLite 風 C ABI 12 関数、`cdylib + staticlib`、Python / Node / Swift から叩ける土台 | `features = ["ffi"]` |
+
+各 sub-crate の `README.md` に詳細あり。Node.js バインディングは独立 repo [`mutafika/enchu-extend`](https://github.com/mutafika/enchu-extend) (v33 で sibling として fork)。
 
 ## Quick start
 
@@ -29,6 +33,53 @@ db.tie_text(alice, "city", "東京");
 db.rebuild();
 let result = db.query(&[("age", 30)]);
 ```
+
+### SQL frontend (`features = ["sql"]`)
+
+```rust
+use enchudb_sql::{Database, Output, Value};
+
+// state-log preset (apparent ~0.7 MB / 実消費 ~0.7 MB、Time Machine 互換)
+let mut db = Database::create_growable_tiny("/tmp/notif.db")?;
+
+db.execute("CREATE TABLE notif (key TEXT PRIMARY KEY, dismissed_at INTEGER)")?;
+db.execute("INSERT OR REPLACE INTO notif VALUES ('uuid-abc', 1715174400)")?;
+
+match db.execute("
+    SELECT key, dismissed_at FROM notif
+    WHERE dismissed_at > 1715000000 AND dismissed_at IS NOT NULL
+    ORDER BY dismissed_at DESC
+    LIMIT 10
+")? {
+    Output::Rows { rows, columns } => { /* rows[i][j] = Value::Integer | Text | Null */ }
+    _ => {}
+}
+```
+
+### C ABI (`features = ["ffi"]`)
+
+```bash
+cargo build --release -p enchudb-ffi
+# → target/release/libenchudb_ffi.{dylib,so,a}
+```
+
+```c
+#include "enchudb.h"
+enchudb_db* db;
+enchudb_open("/tmp/x.db", &db);
+enchudb_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
+
+enchudb_result* r;
+enchudb_query(db, "SELECT * FROM t", &r);
+for (size_t i = 0; i < enchudb_result_rows(r); i++) {
+    int64_t id = enchudb_result_int(r, i, 0);
+    const char* name = enchudb_result_text(r, i, 1);
+}
+enchudb_result_free(r);
+enchudb_close(db);
+```
+
+ヘッダ: `crates/enchudb-ffi/include/enchudb.h`、デモ: `crates/enchudb-ffi/examples/demo.c`。
 
 ### 耐久性（WAL、v28+）
 
@@ -114,7 +165,7 @@ let hits = store.search(
 - **WAL**（v28+）: crash consistency、背景 fsync、リングバッファ再利用
 - **Ravn**（v31+）: グラフ辿り DSL、多段 reverse_follow + filter_by
 
-哲学詳細は [`CLAUDE.md`](./CLAUDE.md) 参照。
+各 sub-crate の `README.md` に詳細あり。
 
 ## Testing
 
