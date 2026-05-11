@@ -3525,6 +3525,33 @@ impl Engine {
         Self::spawn_consumer(eng)
     }
 
+    /// `concurrentize` + WAL 後付け版。 `define_himo` などの build phase を `Engine`
+    /// 値所有で終えた後、 既存 schema 状態を保ったまま consumer + WAL を起動して
+    /// `Arc<Engine>` に遷移する。 sinfo / enchudb-schema の build → runtime 移行に使う。
+    ///
+    /// 既存 `.wal` ファイルがあれば recover してから consumer 起動。
+    /// (build phase で flush 済みなら本体は最新、 WAL は空のまま start)
+    #[cfg(all(feature = "v27", not(target_arch = "wasm32")))]
+    pub fn concurrentize_with_wal(mut eng: Self, wal_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
+        let path = eng.path.clone();
+        let wal_path = wal_path_for(&path);
+        // 古い .crc は WAL 活動後に stale になるので削除 (open_concurrent_with_wal と同じ扱い)
+        let crc_path = crate::integrity::crc_path_for(&path);
+        let _ = std::fs::remove_file(&crc_path);
+        let wal = if wal_path.exists() {
+            let w = crate::wal::Wal::open(&wal_path)?;
+            let records = w.recover();
+            for rec in &records {
+                eng.apply_wal_op(&rec.op);
+            }
+            w.advance_checkpoint(w.head());
+            std::sync::Arc::new(w)
+        } else {
+            std::sync::Arc::new(crate::wal::Wal::create(&wal_path, wal_capacity)?)
+        };
+        Ok(Self::spawn_consumer_with_wal(eng, Some(wal)))
+    }
+
     #[cfg(feature = "v27")]
     fn spawn_consumer(eng: Self) -> std::sync::Arc<Self> {
         Self::spawn_consumer_with_wal(eng, None)

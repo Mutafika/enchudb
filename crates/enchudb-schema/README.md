@@ -132,6 +132,64 @@ assert_eq!(rows.len(), 1);
 
 schema は engine の content blob に serialize して保存。 178 列の prisma schema レベルでも 512 MB 上限内に収まる。
 
+## concurrent / WAL モード
+
+`Database` は内部で `Arc<Engine>` を持ち、 2 phase で運用する:
+
+| phase | 状態 | 何ができる |
+|---|---|---|
+| build | Arc count = 1、 consumer thread なし | `db.table(...).build()` で schema 拡張、 `db.engine_mut()` で `&mut Engine` 取得可 |
+| concurrent | `Arc<Database>` 経由で共有可能、 consumer thread 起動 | 全 write は WAL に append (有効時)、 background fsync、 `&Database` のみで操作 |
+
+```rust
+use std::sync::Arc;
+use enchudb_schema::Database;
+
+// 1. build phase で schema declare
+let mut db = Database::create_growable_tiny("/tmp/store.db")?;
+db.table("notes").integer("id").text("body").primary_key("id").build()?;
+db.table("kv").text("key").integer("ts").primary_key("key").build()?;
+
+// 2. concurrent + WAL モードに遷移、 `Arc<Database>` を取得
+let db: Arc<Database> = db.finish_with_wal(256 * 1024 * 1024)?;
+
+// 3. 各 thread / sub-store で clone 共有、 全部 `&Database` 経由
+let db_clone = db.clone();
+std::thread::spawn(move || {
+    let kv = db_clone.get_table("kv").unwrap();
+    kv.insert().set("key", "alpha").set("ts", 1000i64).commit().unwrap();
+});
+
+// 4. 同期書き出しが必要なら wal_sync (~148µs)
+db.engine().wal_sync()?;
+```
+
+| API | 戻り値 | 用途 |
+|---|---|---|
+| `Database::create*(path)` | `Database` | build phase 開始 (single-thread) |
+| `Database::open(path)` | `Database` | reopen、 standalone (consumer なし) |
+| `db.finish_with_wal(cap)` | `Arc<Database>` | build phase → concurrent + WAL |
+| `db.finish_concurrent()` | `Arc<Database>` | build phase → concurrent (WAL なし) |
+| `Database::open_with_wal(path, cap)` | `Arc<Database>` | reopen を直接 concurrent + WAL、 schema は自動復元 |
+
+`finish_*` は `self` を consume するので呼んだ後の元 `db` は無効。 失敗条件は Arc 共有後の呼び出し (build phase で既に `Arc::new(db)` した後など)。
+
+### sinfo / multi-store パターン
+
+```rust
+// 1 個の Database を 18 個の sub-store で Arc 共有
+let db = Database::create("/var/sinfo/store.db")?;
+// ... build phase で 70+ himo を含む全 table を declare ...
+let db = db.finish_with_wal(256 * 1024 * 1024)?;
+
+// 各 sub-store に Arc<Database> を clone して渡す
+let store1 = SubStore::new(db.clone());
+let store2 = SubStore::new(db.clone());
+// ...
+```
+
+crash 時は次回 `open_with_wal` で WAL から recover、 commit 済み write は durable。
+
 ## column 型
 
 | `ColumnType` | tie 経路 | 値の Rust 型 |

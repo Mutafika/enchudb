@@ -181,17 +181,28 @@ impl TableInner {
 }
 
 /// EnchuDB 上の virtual-table database。 schema 定義 + 永続化を担う。
+///
+/// 内部表現は `Arc<Engine>`。 build phase (Arc 共有前) は `Arc::get_mut` 経由で
+/// `&mut Engine` を取り、 `define_himo` 等の schema 拡張ができる。 `finish_with_wal`
+/// 等で consumer thread を spawn して runtime phase に遷移すると、 以降は
+/// `&Engine` 経由の API (tie_to / tie_text_to / query / wal_sync) のみ。
 pub struct Database {
-    eng: Engine,
+    eng: Arc<Engine>,
     tables: Vec<Arc<TableInner>>,
     marker_himo_id: u16,
+    /// true なら consumer thread が走ってる (concurrent モード、 &mut 不可)。
+    is_concurrent: bool,
 }
 
 impl Drop for Database {
     fn drop(&mut self) {
-        // INSERT 系は flush しないので、 drop で 1 回 sync。
-        // best effort: tmp DB の unlink 後などで失敗するのは想定内。
-        let _ = self.eng.flush();
+        // single-thread モード (Arc 単一所有 + consumer なし) のみ自前で flush。
+        // concurrent モードは consumer thread の shutdown sync に委ねる。
+        if !self.is_concurrent {
+            if let Some(eng) = Arc::get_mut(&mut self.eng) {
+                let _ = eng.flush();
+            }
+        }
     }
 }
 
@@ -218,23 +229,134 @@ impl Database {
         eng.define_himo(SCHEMA_BLOB_HIMO, HimoType::Symbol, 0);
         let marker_himo_id = eng.himo_id(TABLE_MARKER_HIMO)
             .ok_or_else(|| SchemaError::Internal("marker himo id".into()))? as u16;
-        Ok(Self { eng, tables: Vec::new(), marker_himo_id })
+        Ok(Self {
+            eng: Arc::new(eng),
+            tables: Vec::new(),
+            marker_himo_id,
+            is_concurrent: false,
+        })
     }
 
     pub fn open(path: &str) -> Result<Self, SchemaError> {
         let mut eng = Engine::open_standalone(path).map_err(|e| SchemaError::Io(e.to_string()))?;
-        // marker は idempotent 再定義 (新規 DB だった場合に備える)
         eng.define_himo(TABLE_MARKER_HIMO, HimoType::Symbol, 0);
         eng.define_himo(SCHEMA_BLOB_HIMO, HimoType::Symbol, 0);
         let marker_himo_id = eng.himo_id(TABLE_MARKER_HIMO)
             .ok_or_else(|| SchemaError::Internal("marker himo id".into()))? as u16;
-        let mut db = Self { eng, tables: Vec::new(), marker_himo_id };
+        let mut db = Self {
+            eng: Arc::new(eng),
+            tables: Vec::new(),
+            marker_himo_id,
+            is_concurrent: false,
+        };
         db.load_schema()?;
         Ok(db)
     }
 
+    /// 既存 DB を WAL 有効な concurrent モードで開く。 WAL があれば自動 recover。
+    /// schema は blob から復元 + himo は engine 自体に保存済みなので追加 define 不要。
+    /// 返り値は `Arc<Database>` — 全 thread / sub-store で clone 共有する用。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_with_wal(path: &str, wal_capacity: usize) -> Result<Arc<Self>, SchemaError> {
+        let arc_eng = Engine::open_concurrent_with_wal(path, wal_capacity)
+            .map_err(|e| SchemaError::Io(e.to_string()))?;
+        Self::wrap_concurrent(arc_eng)
+    }
+
+    fn wrap_concurrent(arc_eng: Arc<Engine>) -> Result<Arc<Self>, SchemaError> {
+        // marker / schema blob himo は再 open 時に engine が既に保持 (recover 済み)。
+        // ただし新規 DB なら未定義の可能性があるので、 Arc::get_mut で初回だけ define。
+        // open_concurrent_with_wal 後の Arc count = 1 (consumer は raw ptr で保持)。
+        let marker_himo_id = match arc_eng.himo_id(TABLE_MARKER_HIMO) {
+            Some(idx) => idx as u16,
+            None => {
+                return Err(SchemaError::Internal(
+                    "marker himo not present — open_with_wal expects a DB built via Database::create / finish_with_wal".into()
+                ));
+            }
+        };
+        let mut db = Self {
+            eng: arc_eng,
+            tables: Vec::new(),
+            marker_himo_id,
+            is_concurrent: true,
+        };
+        db.load_schema()?;
+        Ok(Arc::new(db))
+    }
+
+    /// build phase 終了 + concurrent + WAL モードに遷移。 consumer thread を spawn し、
+    /// `Arc<Database>` を返す。 sinfo のように複数の sub-store で `Arc<Database>` を
+    /// clone 共有する用途向け。
+    ///
+    /// 失敗条件: `self` が既に `Arc<Database>` 経由で共有されている (= Arc count > 1)、
+    /// もしくは WAL ファイル作成 / consumer 起動が失敗。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn finish_with_wal(self, wal_capacity: usize) -> Result<Arc<Self>, SchemaError> {
+        let (eng, tables, marker_himo_id) = self.into_parts()?;
+        let arc_eng = Engine::concurrentize_with_wal(eng, wal_capacity)
+            .map_err(|e| SchemaError::Io(e.to_string()))?;
+        Ok(Arc::new(Self {
+            eng: arc_eng,
+            tables,
+            marker_himo_id,
+            is_concurrent: true,
+        }))
+    }
+
+    /// build phase 終了 + consumer thread spawn (concurrent)、 WAL なし。
+    /// crash consistency 不要 (cache / 揮発 store) なケース向け。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn finish_concurrent(self) -> Result<Arc<Self>, SchemaError> {
+        let (eng, tables, marker_himo_id) = self.into_parts()?;
+        let arc_eng = Engine::concurrentize(eng);
+        Ok(Arc::new(Self {
+            eng: arc_eng,
+            tables,
+            marker_himo_id,
+            is_concurrent: true,
+        }))
+    }
+
+    /// `self.eng` から `Engine` を取り出す helper (Arc count = 1 が前提)。
+    /// `ManuallyDrop` 経由でフィールドを steal、 Database の Drop は走らない。
+    fn into_parts(self) -> Result<(Engine, Vec<Arc<TableInner>>, u16), SchemaError> {
+        use std::mem::ManuallyDrop;
+        let mut me = ManuallyDrop::new(self);
+        // 1 度 flush して mmap を sync (concurrent 化前の最終状態を確定)
+        if let Some(eng_mut) = Arc::get_mut(&mut me.eng) {
+            eng_mut.flush().map_err(|e| SchemaError::Io(e.to_string()))?;
+        } else {
+            return Err(SchemaError::Internal(
+                "Database already shared via Arc — call finish_* before Arc-clone".into()
+            ));
+        }
+        // SAFETY: ManuallyDrop 化したので元のフィールドは drop されない。
+        // 各フィールドは ptr::read で moveout、 me 自体は ManuallyDrop なので
+        // 後で drop されず leak しない (フィールドは個別に管理)。
+        let eng_arc = unsafe { std::ptr::read(&me.eng) };
+        let tables = unsafe { std::ptr::read(&me.tables) };
+        let marker_himo_id = me.marker_himo_id;
+        let eng = Arc::try_unwrap(eng_arc).map_err(|_| {
+            SchemaError::Internal("unexpected Arc strong_count > 1 after get_mut succeeded".into())
+        })?;
+        Ok((eng, tables, marker_himo_id))
+    }
+
     pub fn engine(&self) -> &Engine { &self.eng }
-    pub fn engine_mut(&mut self) -> &mut Engine { &mut self.eng }
+
+    /// `Arc<Engine>` を clone して返す。 engine 直接アクセス / 他 component との共有用。
+    pub fn arc_engine(&self) -> Arc<Engine> { self.eng.clone() }
+
+    /// build phase 用、 `Arc<Engine>` が他に共有されていない (count = 1) 時のみ
+    /// `&mut Engine` を返す。 concurrent モード遷移後は常に None。
+    pub fn engine_mut(&mut self) -> Option<&mut Engine> {
+        if self.is_concurrent { return None; }
+        Arc::get_mut(&mut self.eng)
+    }
+
+    /// 現在 concurrent モードか (consumer thread が走ってるか)。
+    pub fn is_concurrent(&self) -> bool { self.is_concurrent }
 
     /// 新規 table 定義 builder。
     pub fn table<'a>(&'a mut self, name: &str) -> TableBuilder<'a> {
@@ -278,18 +400,24 @@ impl Database {
         let eid = self.ensure_schema_entity();
         let blob = serialize_schema(&self.tables);
         self.eng.content(eid, SCHEMA_BLOB_HIMO, blob.as_bytes());
-        self.eng.flush().map_err(|e| SchemaError::Io(e.to_string()))?;
+        // flush は build phase (Arc 単一所有) でのみ可能。 concurrent 後は
+        // consumer thread が背景 fsync するので skip。
+        if let Some(eng_mut) = Arc::get_mut(&mut self.eng) {
+            eng_mut.flush().map_err(|e| SchemaError::Io(e.to_string()))?;
+        }
         Ok(())
     }
 
-    fn ensure_schema_entity(&mut self) -> EntityId {
+    fn ensure_schema_entity(&self) -> EntityId {
         self.eng.rebuild();
         if let Some(vid) = self.eng.vocab_id(SCHEMA_MARKER) {
             let eids = self.eng.pull_raw(TABLE_MARKER_HIMO, vid);
             if let Some(&eid) = eids.first() { return eid; }
         }
         let eid = self.eng.entity();
-        self.eng.tie_text(eid, TABLE_MARKER_HIMO, SCHEMA_MARKER);
+        // marker himo は wrap_new / open / open_with_wal で必ず define 済み。
+        // tie_text_to は &self なので Arc<Engine> でも呼べる。
+        self.eng.tie_text_to(eid, TABLE_MARKER_HIMO, SCHEMA_MARKER);
         eid
     }
 
@@ -311,9 +439,14 @@ impl Database {
             let mut cols = Vec::with_capacity(raw.cols.len());
             for (name, ty) in raw.cols {
                 let himo_name = format!("{}.{}", raw.name, name);
-                self.eng.define_himo(&himo_name, ty.himo_type(), 0);
+                // define_himo は &mut Engine 要求、 load_schema は build phase で呼ばれる前提
+                // (Arc 単一所有)。 concurrent 後は himo は engine が既に保持してるはずなので
+                // define 不要、 himo_id だけ resolve すれば OK。
+                if let Some(eng_mut) = Arc::get_mut(&mut self.eng) {
+                    eng_mut.define_himo(&himo_name, ty.himo_type(), 0);
+                }
                 let hid = self.eng.himo_id(&himo_name)
-                    .ok_or_else(|| SchemaError::Internal(format!("himo {himo_name} after define")))?;
+                    .ok_or_else(|| SchemaError::Internal(format!("himo {himo_name} after define / open")))?;
                 cols.push(ColumnInner { name, ty, himo_name, himo_id: hid as u16 });
             }
             let pk = raw.pk.and_then(|n| cols.iter().position(|c| c.name == n));
@@ -333,17 +466,14 @@ impl Database {
         Ok(())
     }
 
-    fn intern_table_name(&mut self, name: &str) -> u32 {
-        // 既存ならそれを返す、 なければ marker himo 経由で vocab に入れる。
+    fn intern_table_name(&self, name: &str) -> u32 {
+        // 既存ならそれを返す、 なければ dummy entity 経由で vocab に登録 → 即削除。
         if let Some(vid) = self.eng.vocab_id(name) { return vid; }
-        // ダミー entity に tie して vocab を作る。 build の最後で本物の row を tie するので
-        // この dummy は table の最初の row として永続。 ただし schema 永続化用の特別 row
-        // (schema entity) とは別。 ここでは vocab を populate するためだけに登録した
-        // 後で消す temp entity を使う。
         let tmp = self.eng.entity();
-        self.eng.tie_text(tmp, TABLE_MARKER_HIMO, name);
+        // tie_text_to は &Engine、 Arc<Engine> でも呼べる。 marker himo は事前 define 済み。
+        self.eng.tie_text_to(tmp, TABLE_MARKER_HIMO, name);
         let vid = self.eng.vocab_id(name)
-            .expect("vocab_id should exist after tie_text");
+            .expect("vocab_id should exist after tie_text_to");
         self.eng.delete(tmp);
         vid
     }
@@ -415,12 +545,17 @@ impl<'a> TableBuilder<'a> {
             }
         }
 
-        // himo を define
+        // himo を define (build phase = Arc 単一所有の前提)
+        let eng_mut = Arc::get_mut(&mut db.eng).ok_or_else(|| {
+            SchemaError::Internal(
+                "Database already shared via Arc — call db.table() before finish_*".into()
+            )
+        })?;
         let mut cols = Vec::with_capacity(col_specs.len());
         for (col_name, ty) in &col_specs {
             let himo_name = format!("{}.{}", name, col_name);
-            db.eng.define_himo(&himo_name, ty.himo_type(), 0);
-            let hid = db.eng.himo_id(&himo_name)
+            eng_mut.define_himo(&himo_name, ty.himo_type(), 0);
+            let hid = eng_mut.himo_id(&himo_name)
                 .ok_or_else(|| SchemaError::Internal(format!("himo {himo_name} after define")))?;
             cols.push(ColumnInner {
                 name: col_name.clone(),
@@ -1112,5 +1247,75 @@ mod tests {
             assert_eq!(staff.len(), 2);
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn finish_with_wal_transitions_to_concurrent() {
+        let path = tmp("finish_wal");
+        let wal_path = format!("{}.wal", path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&wal_path);
+
+        let db_arc: Arc<Database> = {
+            let mut db = Database::create_growable_tiny(&path).unwrap();
+            db.table("kv").text("key").integer("ts").primary_key("key").build().unwrap();
+            assert!(!db.is_concurrent());
+            db.finish_with_wal(64 * 1024).unwrap()
+        };
+        assert!(db_arc.is_concurrent());
+        assert_eq!(db_arc.list_tables().len(), 1);
+
+        // concurrent モード下で insert + 確認
+        let kv = db_arc.get_table("kv").unwrap();
+        kv.insert().set("key", "k1").set("ts", 100i64).commit().unwrap();
+        kv.insert().set("key", "k2").set("ts", 200i64).commit().unwrap();
+        let rows = kv.where_eq("key", "k1").find().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(kv.entity(rows[0]).get("ts"), Some(Value::Integer(100)));
+
+        // Arc clone して別 thread からも見えるか
+        let db_clone = db_arc.clone();
+        let h = std::thread::spawn(move || {
+            let kv = db_clone.get_table("kv").unwrap();
+            kv.where_eq("key", "k2").find().unwrap().len()
+        });
+        assert_eq!(h.join().unwrap(), 1);
+
+        drop(db_arc);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[test]
+    fn open_with_wal_recovers_writes() {
+        let path = tmp("open_wal");
+        let wal_path = format!("{}.wal", path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&wal_path);
+
+        // 1: build → finish_with_wal → 書き込み → wal_sync で durable
+        {
+            let mut db = Database::create_growable_tiny(&path).unwrap();
+            db.table("kv").text("key").integer("ts").primary_key("key").build().unwrap();
+            let arc = db.finish_with_wal(64 * 1024).unwrap();
+            let kv = arc.get_table("kv").unwrap();
+            kv.insert().set("key", "alpha").set("ts", 1000i64).commit().unwrap();
+            kv.insert().set("key", "beta").set("ts", 2000i64).commit().unwrap();
+            arc.engine().wal_sync().unwrap();
+            // Drop は最後の Arc が落ちる時 → consumer thread shutdown で sync
+        }
+
+        // 2: open_with_wal で recover、 schema + data 両方見える
+        {
+            let arc = Database::open_with_wal(&path, 64 * 1024).unwrap();
+            assert_eq!(arc.list_tables().len(), 1);
+            let kv = arc.get_table("kv").unwrap();
+            let alpha = kv.where_eq("key", "alpha").find_one().unwrap();
+            assert!(alpha.is_some());
+            assert_eq!(kv.entity(alpha.unwrap()).get("ts"), Some(Value::Integer(1000)));
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&wal_path);
     }
 }
