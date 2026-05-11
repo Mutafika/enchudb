@@ -60,6 +60,15 @@ use sqlparser::parser::Parser;
 
 const TABLE_MARKER_HIMO: &str = "__sql_table";
 
+/// 内部 schema metadata を載せる 1 個の特別 entity に張る marker。
+/// この値で `__sql_table` を検索すると schema entity が引ける。
+/// user の table 名と衝突しないよう長くて変な名前にしてある。
+const SCHEMA_TABLE_MARKER: &str = "__enchu_schema_v1__";
+
+/// schema blob を保存する非索引 content key。 `content() / get_content()` の
+/// (entity, himo) ペアで使う。
+const SCHEMA_BLOB_HIMO: &str = "__enchu_schema_blob";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SqlType {
     Integer,
@@ -136,10 +145,23 @@ pub struct Database {
     tables: Vec<TableDef>,
 }
 
+impl Drop for Database {
+    fn drop(&mut self) {
+        // INSERT / UPDATE / DELETE は flush を呼ばないので、 Database が drop される
+        // タイミングで一度 sync する。 これがないと reopen 後にデータが見えない
+        // (vocab の count や header の himo_count が disk 未反映)。
+        // best effort: エラーは無視 (Drop で panic できないし、 開発時 tmp DB の
+        // unlink 後とかで失敗するのは想定内)。
+        let _ = self.eng.flush();
+    }
+}
+
 impl Database {
     pub fn create(path: &str) -> Result<Self, SqlError> {
         let eng = Engine::create_standalone(path).map_err(|e| SqlError::Io(e.to_string()))?;
-        Ok(Self { eng, tables: Vec::new() })
+        let mut db = Self { eng, tables: Vec::new() };
+        db.init_schema_storage();
+        Ok(db)
     }
 
     /// Smaller mmap footprint variant for state-log style use cases.
@@ -151,7 +173,9 @@ impl Database {
     /// warehouses.
     pub fn create_compact(path: &str) -> Result<Self, SqlError> {
         let eng = Engine::create_compact(path).map_err(|e| SqlError::Io(e.to_string()))?;
-        Ok(Self { eng, tables: Vec::new() })
+        let mut db = Self { eng, tables: Vec::new() };
+        db.init_schema_storage();
+        Ok(db)
     }
 
     /// Growable backing variant. Pre-commits the whole layout at create
@@ -162,7 +186,9 @@ impl Database {
     /// will eventually want the lazy file-size behaviour.
     pub fn create_growable(path: &str) -> Result<Self, SqlError> {
         let eng = Engine::create_growable(path).map_err(|e| SqlError::Io(e.to_string()))?;
-        Ok(Self { eng, tables: Vec::new() })
+        let mut db = Self { eng, tables: Vec::new() };
+        db.init_schema_storage();
+        Ok(db)
     }
 
     /// Tiny growable preset for app state-logs. Caps at 1024 rows /
@@ -173,16 +199,93 @@ impl Database {
     /// regular `create_compact` produces.
     pub fn create_growable_tiny(path: &str) -> Result<Self, SqlError> {
         let eng = Engine::create_growable_tiny(path).map_err(|e| SqlError::Io(e.to_string()))?;
-        Ok(Self { eng, tables: Vec::new() })
+        let mut db = Self { eng, tables: Vec::new() };
+        db.init_schema_storage();
+        Ok(db)
     }
 
     pub fn open(path: &str) -> Result<Self, SqlError> {
         let eng = Engine::open_standalone(path).map_err(|e| SqlError::Io(e.to_string()))?;
-        Ok(Self { eng, tables: Vec::new() })
+        let mut db = Self { eng, tables: Vec::new() };
+        db.load_schema()?;
+        Ok(db)
     }
 
     pub fn engine(&self) -> &Engine { &self.eng }
     pub fn engine_mut(&mut self) -> &mut Engine { &mut self.eng }
+
+    /// 登録済み table の一覧を返す (enchu studio / 非 SQL consumer 用)。
+    pub fn list_tables(&self) -> Vec<(String, Vec<(String, SqlType, bool)>)> {
+        self.tables.iter().map(|t| {
+            let cols = t.cols.iter().map(|c| {
+                (c.name.clone(), c.ty, t.pk.as_deref() == Some(c.name.as_str()))
+            }).collect();
+            (t.name.clone(), cols)
+        }).collect()
+    }
+
+    // ────── schema 永続化 ──────
+
+    /// create 系の path で marker/blob himo を事前 define しておく。
+    /// open() 経由は既存 himo を読むだけなので不要。
+    fn init_schema_storage(&mut self) {
+        self.eng.define_himo(TABLE_MARKER_HIMO, HimoType::Symbol, 0);
+        self.eng.define_himo(SCHEMA_BLOB_HIMO, HimoType::Symbol, 0);
+    }
+
+    /// schema metadata を `content()` blob に書き出す。
+    /// CREATE TABLE のたびに呼ぶ (毎回上書き、 sky big でもないので OK)。
+    fn persist_schema(&mut self) -> Result<(), SqlError> {
+        let eid = self.ensure_schema_entity();
+        let blob = serialize_schema(&self.tables);
+        self.eng.content(eid, SCHEMA_BLOB_HIMO, blob.as_bytes());
+        self.eng.flush().map_err(|e| SqlError::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    /// schema 専用 entity を引く or 新規作成。 marker himo に
+    /// `SCHEMA_TABLE_MARKER` を tie してある entity が 1 個だけ存在する想定。
+    fn ensure_schema_entity(&mut self) -> EntityId {
+        self.eng.rebuild();
+        if let Some(vid) = self.eng.vocab_id(SCHEMA_TABLE_MARKER) {
+            let eids = self.eng.pull_raw(TABLE_MARKER_HIMO, vid);
+            if let Some(&eid) = eids.first() { return eid; }
+        }
+        // 無ければ新規作成。
+        let eid = self.eng.entity();
+        self.eng.tie_text(eid, TABLE_MARKER_HIMO, SCHEMA_TABLE_MARKER);
+        eid
+    }
+
+    /// open() 時に DB ファイルから schema を読み戻す。
+    /// blob が無ければ `tables` は空のまま (新規 DB or v0.1 で作った schema 無し DB)。
+    fn load_schema(&mut self) -> Result<(), SqlError> {
+        // marker himo 自体が無い (DB が enchudb-sql で作られてない) なら schema 無しで return。
+        let Some(vid) = self.eng.vocab_id(SCHEMA_TABLE_MARKER) else { return Ok(()); };
+        self.eng.rebuild();
+        let eids = self.eng.pull_raw(TABLE_MARKER_HIMO, vid);
+        let Some(&eid) = eids.first() else { return Ok(()); };
+        let blob = match self.eng.get_content(eid, SCHEMA_BLOB_HIMO) {
+            Some(b) => b.to_vec(),
+            None => return Ok(()),
+        };
+        let s = std::str::from_utf8(&blob)
+            .map_err(|_| SqlError::Parse("schema blob not utf8".into()))?;
+        self.tables = deserialize_schema(s)?;
+
+        // engine に himo が登録されてないと get/query が失敗するので再 define。
+        // define_himo は idempotent。
+        for t in &self.tables {
+            for c in &t.cols {
+                let ht = match c.ty {
+                    SqlType::Integer => HimoType::Value,
+                    SqlType::Text => HimoType::Symbol,
+                };
+                self.eng.define_himo(&c.himo, ht, 0);
+            }
+        }
+        Ok(())
+    }
 
     pub fn execute(&mut self, sql: &str) -> Result<Output, SqlError> {
         let dialect = SQLiteDialect {};
@@ -271,6 +374,8 @@ impl Database {
         }
 
         self.tables.push(TableDef { name, cols, pk });
+        // schema を blob に persist (reopen で復元できるように)
+        self.persist_schema()?;
         Ok(Output::Created)
     }
 
@@ -804,6 +909,81 @@ fn read_value(eng: &Engine, eid: EntityId, cd: &ColDef) -> Value {
     }
 }
 
+// ────── schema (de)serialize ──────
+//
+// 簡易テキスト format。 v1:
+//   v1
+//   <table_name>|<col_name>:<TYPE>[:pk];<col_name>:<TYPE>[:pk];...
+//   <table_name>|...
+//
+// TYPE は INTEGER / TEXT のみ (v0.1)。 後で UUID / DateTime / Decimal を
+// 足すときは v2 に bump。 deserialize は version line で分岐すれば良い。
+// JSON/bincode を避けるのは dep を増やさないため + 人間が file dump で
+// 読めるため (debugging に強い)。
+
+fn serialize_schema(tables: &[TableDef]) -> String {
+    let mut out = String::from("v1\n");
+    for t in tables {
+        out.push_str(&t.name);
+        out.push('|');
+        for (i, c) in t.cols.iter().enumerate() {
+            if i > 0 { out.push(';'); }
+            out.push_str(&c.name);
+            out.push(':');
+            out.push_str(match c.ty {
+                SqlType::Integer => "INTEGER",
+                SqlType::Text => "TEXT",
+            });
+            if t.pk.as_deref() == Some(c.name.as_str()) {
+                out.push_str(":pk");
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn deserialize_schema(s: &str) -> Result<Vec<TableDef>, SqlError> {
+    let mut lines = s.lines();
+    let header = lines.next().ok_or_else(|| SqlError::Parse("empty schema blob".into()))?;
+    if header != "v1" {
+        return Err(SqlError::Parse(format!("unknown schema version: {header}")));
+    }
+    let mut tables = Vec::new();
+    for line in lines {
+        if line.is_empty() { continue; }
+        let mut parts = line.splitn(2, '|');
+        let name = parts.next()
+            .ok_or_else(|| SqlError::Parse(format!("missing table name in: {line}")))?
+            .to_string();
+        let cols_str = parts.next()
+            .ok_or_else(|| SqlError::Parse(format!("missing cols in: {line}")))?;
+        let mut cols = Vec::new();
+        let mut pk: Option<String> = None;
+        for col_str in cols_str.split(';') {
+            if col_str.is_empty() { continue; }
+            let mut col_parts = col_str.split(':');
+            let col_name = col_parts.next()
+                .ok_or_else(|| SqlError::Parse(format!("missing col name in: {col_str}")))?
+                .to_string();
+            let ty_str = col_parts.next()
+                .ok_or_else(|| SqlError::Parse(format!("missing col type in: {col_str}")))?;
+            let ty = match ty_str {
+                "INTEGER" => SqlType::Integer,
+                "TEXT" => SqlType::Text,
+                other => return Err(SqlError::Parse(format!("unknown column type: {other}"))),
+            };
+            if col_parts.next() == Some("pk") {
+                pk = Some(col_name.clone());
+            }
+            let himo = format!("{}.{}", name, col_name);
+            cols.push(ColDef { name: col_name, ty, himo });
+        }
+        tables.push(TableDef { name, cols, pk });
+    }
+    Ok(tables)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1139,5 +1319,135 @@ mod tests {
             Output::Rows { rows, .. } => assert_eq!(rows.len(), 1),
             _ => panic!(),
         }
+    }
+
+    // ────── schema 永続化 ──────
+
+    #[test]
+    fn schema_persists_across_reopen() {
+        let path = "/tmp/enchudb_sql_persist_basic.db";
+        let _ = std::fs::remove_file(path);
+        {
+            let mut db = Database::create(path).unwrap();
+            db.execute("CREATE TABLE notif (key TEXT PRIMARY KEY, dismissed_at INTEGER)").unwrap();
+            db.execute("INSERT INTO notif VALUES ('uuid-abc', 1715174400)").unwrap();
+            // Database を drop (close) — flush は execute 内で呼ばれる
+        }
+        // 再 open: CREATE TABLE 再呼出なしで SELECT が成立すること
+        let mut db = Database::open(path).unwrap();
+        let tables = db.list_tables();
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].0, "notif");
+        assert_eq!(tables[0].1.len(), 2);
+        match db.execute("SELECT key, dismissed_at FROM notif WHERE key = 'uuid-abc'").unwrap() {
+            Output::Rows { rows, columns } => {
+                assert_eq!(columns, vec!["key", "dismissed_at"]);
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Text("uuid-abc".into()));
+                assert_eq!(rows[0][1], Value::Integer(1715174400));
+            }
+            _ => panic!(),
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn multi_table_schema_persists() {
+        let path = "/tmp/enchudb_sql_persist_multi.db";
+        let _ = std::fs::remove_file(path);
+        {
+            let mut db = Database::create(path).unwrap();
+            db.execute("CREATE TABLE company (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+            db.execute("CREATE TABLE employee (id INTEGER PRIMARY KEY, name TEXT, company_id INTEGER)").unwrap();
+            db.execute("CREATE TABLE hometown (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+            db.execute("INSERT INTO company VALUES (1, 'Acme')").unwrap();
+            db.execute("INSERT INTO employee VALUES (1, 'Alice', 1)").unwrap();
+            db.execute("INSERT INTO employee VALUES (2, 'Bob', 1)").unwrap();
+            db.execute("INSERT INTO hometown VALUES (1, '東京')").unwrap();
+        }
+        let mut db = Database::open(path).unwrap();
+        let tables = db.list_tables();
+        assert_eq!(tables.len(), 3);
+        let names: std::collections::HashSet<_> = tables.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains("company"));
+        assert!(names.contains("employee"));
+        assert!(names.contains("hometown"));
+
+        // データも正しく引ける
+        match db.execute("SELECT name FROM company WHERE id = 1").unwrap() {
+            Output::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Text("Acme".into()));
+            }
+            _ => panic!(),
+        }
+        match db.execute("SELECT name FROM employee WHERE company_id = 1").unwrap() {
+            Output::Rows { rows, .. } => assert_eq!(rows.len(), 2),
+            _ => panic!(),
+        }
+        match db.execute("SELECT name FROM hometown WHERE id = 1").unwrap() {
+            Output::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Text("東京".into()));
+            }
+            _ => panic!(),
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn schema_round_trip_serialize_deserialize() {
+        let tables = vec![
+            TableDef {
+                name: "notif".into(),
+                cols: vec![
+                    ColDef { name: "key".into(), ty: SqlType::Text, himo: "notif.key".into() },
+                    ColDef { name: "dismissed_at".into(), ty: SqlType::Integer, himo: "notif.dismissed_at".into() },
+                ],
+                pk: Some("key".into()),
+            },
+            TableDef {
+                name: "employee".into(),
+                cols: vec![
+                    ColDef { name: "id".into(), ty: SqlType::Integer, himo: "employee.id".into() },
+                    ColDef { name: "name".into(), ty: SqlType::Text, himo: "employee.name".into() },
+                ],
+                pk: Some("id".into()),
+            },
+        ];
+        let s = serialize_schema(&tables);
+        let parsed = deserialize_schema(&s).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "notif");
+        assert_eq!(parsed[0].pk.as_deref(), Some("key"));
+        assert_eq!(parsed[0].cols[0].name, "key");
+        assert_eq!(parsed[0].cols[0].ty, SqlType::Text);
+        assert_eq!(parsed[1].cols[1].name, "name");
+        assert_eq!(parsed[1].cols[1].ty, SqlType::Text);
+    }
+
+    #[test]
+    fn open_existing_schema_data_visible_without_create_table() {
+        // matcha 起動時のパターン: open するだけで既存 schema + データが見える
+        let path = "/tmp/enchudb_sql_persist_no_create.db";
+        let _ = std::fs::remove_file(path);
+        {
+            let mut db = Database::create(path).unwrap();
+            db.execute("CREATE TABLE notif (key TEXT PRIMARY KEY, dismissed_at INTEGER)").unwrap();
+            db.execute("INSERT INTO notif VALUES ('a', 100), ('b', 200), ('c', 300)").unwrap();
+        }
+        // 再 open、 CREATE TABLE を打たずにいきなり SELECT
+        let mut db = Database::open(path).unwrap();
+        match db.execute("SELECT key, dismissed_at FROM notif").unwrap() {
+            Output::Rows { rows, .. } => assert_eq!(rows.len(), 3),
+            _ => panic!(),
+        }
+        // UPDATE / DELETE も問題なく
+        db.execute("INSERT OR REPLACE INTO notif VALUES ('a', 999)").unwrap();
+        match db.execute("SELECT dismissed_at FROM notif WHERE key = 'a'").unwrap() {
+            Output::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Integer(999));
+            }
+            _ => panic!(),
+        }
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -19,6 +19,7 @@ v32 = ["enchudb-engine/v32", "dep:enchudb-sync"]
 v33 = ["enchudb-engine/v33", "dep:enchudb-sync", "enchudb-sync/v33"]
 sql = ["dep:enchudb-sql"]
 ffi = ["dep:enchudb-ffi", "sql"]
+async-blob = ["enchudb-engine/async-blob"]
 
 [dependencies]
 enchudb-engine = { path = "crates/enchudb-engine" }
