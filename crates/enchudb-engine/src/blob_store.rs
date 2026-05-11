@@ -142,6 +142,7 @@ pub trait BlobStore: Send + Sync {
 /// - content-addressable: 同じ hash は同じファイル、dedup 自動
 /// - atomic write: `<name>.tmp.<pid>.<counter>` に書いて rename
 /// - 読み取り時に sha-256 を再計算して検証(破損検知)
+#[derive(Clone)]
 pub struct LocalBlobStore {
     root: PathBuf,
 }
@@ -237,6 +238,119 @@ impl BlobStore for LocalBlobStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+// ─── AsyncBlobStore (async-blob feature) ──────────────────────────────
+//
+// 動機:
+//   sinfo / sinfohub-server のような async ランタイム上で動くサーバ実装は、
+//   S3 / R2 / HTTP リモートへ blob を流す必要がある。これらは原理的に async
+//   I/O のほうが効率的なので、enchudb 本体の sync `BlobStore` とは別軸の
+//   `AsyncBlobStore` trait を併設する。
+//
+// 設計判断:
+//   - Engine 本体は sync の `BlobStore` のままにする。Engine の hot path は
+//     ns オーダーであり、async ランタイムのトランポリンを混ぜたくない。
+//   - サーバ側のロジック（push 受信 → S3 アップロード等）が AsyncBlobStore を
+//     直接使う。すなわち「sinfo の保存層 = sync BlobStore (engine 経由)」と
+//     「サーバの転送層 = AsyncBlobStore (S3 等)」は分離する。
+//   - 既存の sync 実装 (LocalBlobStore) は blanket impl で自動的に
+//     AsyncBlobStore を満たす (`spawn_blocking` 経由)。専用実装は不要。
+//   - 真の async 実装 (S3 等) はこの trait を直接 impl して spawn_blocking を
+//     避け、AWS SDK の async I/O をそのまま使う。
+//
+// 機能フラグ `async-blob` を有効にしない限り tokio / async-trait に依存しない。
+
+/// 非同期版 BlobStore。`async-blob` feature 必須。
+///
+/// `BlobStore` (sync) との関係:
+/// - 既存の任意の `BlobStore` 実装は `spawn_blocking` 経由で自動的に
+///   `AsyncBlobStore` を満たす (このファイルの blanket impl)。明示的な
+///   ラッパー型は不要。
+/// - 真の非同期 I/O を活かす遠隔ストア (S3 / HTTP) は本 trait を直接 impl し、
+///   `BlobStore` (sync) は impl しなくてよい。
+#[cfg(feature = "async-blob")]
+#[async_trait::async_trait]
+pub trait AsyncBlobStore: Send + Sync {
+    /// `BlobStore::put` の async 版。
+    async fn put(&self, data: &[u8]) -> Result<BlobId, BlobError>;
+
+    /// `BlobStore::get` の async 版。
+    async fn get(&self, id: &BlobId) -> Result<Option<Vec<u8>>, BlobError>;
+
+    /// `BlobStore::exists` の async 版。
+    async fn exists(&self, id: &BlobId) -> bool;
+
+    /// `BlobStore::delete` の async 版。
+    async fn delete(&self, id: &BlobId) -> Result<bool, BlobError>;
+}
+
+/// 同期 `BlobStore` 実装を `AsyncBlobStore` として見せかけるアダプタ。
+///
+/// `tokio::task::spawn_blocking` で sync コードを blocking thread pool にオフロードし、
+/// async ランタイムの実行スレッドをブロックしない。spawn コスト (~10-15µs) が乗るので、
+/// 本当に非同期 I/O が欲しい遠隔ストア (S3 等) は `AsyncBlobStore` を直接 impl すべき。
+///
+/// 同名メソッド (`put` / `get` / `exists` / `delete`) のトレイト衝突を避けるため、
+/// blanket impl ではなく明示ラッパとしている: 呼び出し側は
+/// `BlockingAsyncBlobStore::new(local_store)` を介して `AsyncBlobStore` 型に持ち上げる。
+#[cfg(feature = "async-blob")]
+pub struct BlockingAsyncBlobStore<T: BlobStore> {
+    inner: T,
+}
+
+#[cfg(feature = "async-blob")]
+impl<T: BlobStore> BlockingAsyncBlobStore<T> {
+    pub fn new(inner: T) -> Self {
+        Self { inner }
+    }
+
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+}
+
+#[cfg(feature = "async-blob")]
+#[async_trait::async_trait]
+impl<T> AsyncBlobStore for BlockingAsyncBlobStore<T>
+where
+    T: BlobStore + Clone + Send + Sync + 'static,
+{
+    async fn put(&self, data: &[u8]) -> Result<BlobId, BlobError> {
+        let store = self.inner.clone();
+        let data = data.to_vec();
+        tokio::task::spawn_blocking(move || store.put(&data))
+            .await
+            .map_err(|e| BlobError::Io(io::Error::other(format!("join error: {e}"))))?
+    }
+
+    async fn get(&self, id: &BlobId) -> Result<Option<Vec<u8>>, BlobError> {
+        let store = self.inner.clone();
+        let id = *id;
+        tokio::task::spawn_blocking(move || store.get(&id))
+            .await
+            .map_err(|e| BlobError::Io(io::Error::other(format!("join error: {e}"))))?
+    }
+
+    async fn exists(&self, id: &BlobId) -> bool {
+        let store = self.inner.clone();
+        let id = *id;
+        tokio::task::spawn_blocking(move || store.exists(&id))
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn delete(&self, id: &BlobId) -> Result<bool, BlobError> {
+        let store = self.inner.clone();
+        let id = *id;
+        tokio::task::spawn_blocking(move || store.delete(&id))
+            .await
+            .map_err(|e| BlobError::Io(io::Error::other(format!("join error: {e}"))))?
     }
 }
 
@@ -411,5 +525,86 @@ mod tests {
             }
         }
         out
+    }
+}
+
+#[cfg(all(test, feature = "async-blob"))]
+mod async_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn tmp_root() -> PathBuf {
+        let n = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "enchu-blob-async-test-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            n,
+        ))
+    }
+
+    /// BlockingAsyncBlobStore 経由で LocalBlobStore が AsyncBlobStore を満たすことの確認。
+    #[tokio::test]
+    async fn local_via_blocking_adapter_put_get_roundtrip() {
+        let root = tmp_root();
+        let store: Arc<dyn AsyncBlobStore> = Arc::new(BlockingAsyncBlobStore::new(
+            LocalBlobStore::new(&root).unwrap(),
+        ));
+        let id = store.put(b"hello async blob").await.unwrap();
+        let got = store.get(&id).await.unwrap();
+        assert_eq!(got.as_deref(), Some(&b"hello async blob"[..]));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn local_async_exists_and_delete() {
+        let root = tmp_root();
+        let inner = LocalBlobStore::new(&root).unwrap();
+        let id = inner.put(b"transient").unwrap(); // sync put で書く
+        let store = BlockingAsyncBlobStore::new(inner);
+        assert!(store.exists(&id).await);
+        assert!(store.delete(&id).await.unwrap());
+        assert!(!store.exists(&id).await);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn local_async_get_missing_returns_none() {
+        let root = tmp_root();
+        let store = BlockingAsyncBlobStore::new(LocalBlobStore::new(&root).unwrap());
+        let id = BlobId::from_bytes(b"never written async");
+        assert_eq!(store.get(&id).await.unwrap(), None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 並列 spawn から AsyncBlobStore を叩く: spawn_blocking 経由でも race なし。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn local_async_concurrent_put_dedup() {
+        let root = tmp_root();
+        let store: Arc<dyn AsyncBlobStore> = Arc::new(BlockingAsyncBlobStore::new(
+            LocalBlobStore::new(&root).unwrap(),
+        ));
+        let data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 256) as u8).collect();
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let s = store.clone();
+            let d = data.clone();
+            handles.push(tokio::spawn(async move { s.put(&d).await.unwrap() }));
+        }
+        let mut ids = Vec::with_capacity(handles.len());
+        for h in handles {
+            ids.push(h.await.unwrap());
+        }
+        for id in &ids[1..] {
+            assert_eq!(*id, ids[0]);
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 }

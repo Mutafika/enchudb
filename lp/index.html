@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EnchuDB — embedded graph engine, multi-condition AND in nanoseconds</title>
+  <style>@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');</style>
+  <style>
+    :root {
+      --bg: #15171e;
+      --bg2: #1d2029;
+      --bg3: #2a2e3b;
+      --text: #d8dee9;
+      --text2: #767c9d;
+      --primary: #add7ff;
+      --primary-hover: #c5e1ff;
+      --border: #2a2e3b;
+      --success: #5de4c7;
+      --warning: #fffac2;
+      --error: #d0679d;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: "Inter", -apple-system, system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+    a { color: var(--primary); text-decoration: none; }
+    a:hover { color: var(--primary-hover); }
+    .mono { font-family: 'JetBrains Mono', 'SF Mono', Consolas, monospace; }
+
+    /* film grain */
+    .noise-overlay { position: fixed; inset: 0; pointer-events: none; z-index: 1000;
+      opacity: 0.03; mix-blend-mode: overlay;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    }
+
+    /* terminal-y dot grid background pattern */
+    .grid-bg { position: absolute; inset: 0; pointer-events: none;
+      background-image: radial-gradient(circle, rgba(173,215,255,0.12) 1px, transparent 1px);
+      background-size: 32px 32px;
+      mask-image: radial-gradient(ellipse 60% 80% at 50% 0%, #000 30%, transparent 75%);
+      -webkit-mask-image: radial-gradient(ellipse 60% 80% at 50% 0%, #000 30%, transparent 75%);
+    }
+
+    /* glow orbs (subtle) */
+    .glow-orb { position: absolute; pointer-events: none; filter: blur(90px); border-radius: 50%; }
+    .glow-1 { top: -100px; right: -100px; width: 500px; height: 500px;
+      background: radial-gradient(circle, rgba(173,215,255,0.18), transparent 70%);
+      animation: drift-1 20s ease-in-out infinite alternate; }
+    .glow-2 { top: 200px; left: -200px; width: 600px; height: 600px;
+      background: radial-gradient(circle, rgba(93,228,199,0.12), transparent 70%);
+      animation: drift-2 24s ease-in-out infinite alternate; }
+    @keyframes drift-1 { from { transform: translate(0,0); } to { transform: translate(-80px,60px); } }
+    @keyframes drift-2 { from { transform: translate(0,0); } to { transform: translate(60px,80px); } }
+
+    /* nav */
+    nav { position: sticky; top: 0; z-index: 100; background: rgba(21,23,30,0.7); backdrop-filter: blur(20px) saturate(180%); -webkit-backdrop-filter: blur(20px) saturate(180%); border-bottom: 1px solid var(--border); }
+    .nav-inner { max-width: 1100px; margin: 0 auto; padding: 0 24px; height: 56px; display: flex; align-items: center; justify-content: space-between; }
+    .logo { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 15px; color: var(--text); text-decoration: none; letter-spacing: -0.01em; font-family: 'JetBrains Mono', monospace; }
+    .logo-icon { width: 18px; height: 18px; background: linear-gradient(135deg, var(--primary), var(--success)); border-radius: 4px; box-shadow: 0 0 16px rgba(173,215,255,0.45); animation: logo-pulse 3s ease-in-out infinite; }
+    @keyframes logo-pulse { 0%,100% { box-shadow: 0 0 16px rgba(173,215,255,0.45); } 50% { box-shadow: 0 0 26px rgba(93,228,199,0.7); } }
+    .nav-links { display: flex; gap: 28px; }
+    .nav-links a { color: var(--text2); text-decoration: none; font-size: 13px; transition: color .2s; position: relative; font-family: 'JetBrains Mono', monospace; }
+    .nav-links a::after { content: ''; position: absolute; bottom: -4px; left: 0; right: 0; height: 1px; background: var(--primary); transform: scaleX(0); transform-origin: left; transition: transform .25s ease; }
+    .nav-links a:hover { color: var(--text); }
+    .nav-links a:hover::after { transform: scaleX(1); }
+    .nav-right { display: flex; align-items: center; gap: 14px; }
+    .btn-github { background: var(--bg2); border: 1px solid var(--border); color: var(--text); padding: 6px 14px; border-radius: 6px; font-size: 13px; text-decoration: none; transition: all .2s; display: inline-flex; align-items: center; gap: 6px; font-family: 'JetBrains Mono', monospace; }
+    .btn-github:hover { background: var(--bg3); border-color: var(--primary); }
+    @media (max-width: 768px) { .nav-links { display: none; } }
+
+    /* hero */
+    .hero { padding: 120px 24px 80px; position: relative; overflow: hidden; }
+    .hero-grid { max-width: 1100px; margin: 0 auto; position: relative; z-index: 2; }
+    .hero-eyebrow { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border: 1px solid var(--border); border-radius: 999px; font-size: 12px; color: var(--text2); margin-bottom: 36px; background: rgba(255,255,255,0.03); backdrop-filter: blur(8px); font-family: 'JetBrains Mono', monospace; }
+    .hero-eyebrow .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--success); position: relative; }
+    .hero-eyebrow .dot::after { content: ''; position: absolute; inset: -4px; border-radius: 50%; background: var(--success); opacity: 0.5; animation: ping 1.6s cubic-bezier(0,0,0.2,1) infinite; }
+    @keyframes ping { 0% { transform: scale(0.8); opacity: 0.5; } 80%,100% { transform: scale(2); opacity: 0; } }
+    .hero h1 { font-size: 68px; font-weight: 600; line-height: 1.0; letter-spacing: -0.035em; margin-bottom: 28px; max-width: 920px; }
+    .hero h1 .accent { font-family: 'JetBrains Mono', monospace; background: linear-gradient(135deg, var(--primary) 0%, var(--success) 100%); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; background-size: 200% 200%; animation: gradient-flow 6s ease infinite; letter-spacing: -0.04em; }
+    @keyframes gradient-flow { 0%,100% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } }
+    .hero p.lead { font-size: 19px; color: var(--text2); line-height: 1.55; max-width: 700px; margin-bottom: 44px; }
+    .cta-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 88px; }
+    .btn-primary { background: var(--primary); color: var(--bg); padding: 12px 22px; border-radius: 8px; font-size: 14px; font-weight: 600; text-decoration: none; transition: all .2s; font-family: 'JetBrains Mono', monospace; }
+    .btn-primary:hover { box-shadow: 0 0 24px rgba(173,215,255,0.4), 0 0 48px rgba(173,215,255,0.2); color: var(--bg); }
+    .btn-outline { background: rgba(29,32,41,0.6); backdrop-filter: blur(8px); border: 1px solid var(--border); color: var(--text); padding: 11px 20px; border-radius: 8px; font-size: 14px; font-weight: 500; text-decoration: none; transition: all .2s; display: inline-flex; align-items: center; gap: 6px; font-family: 'JetBrains Mono', monospace; }
+    .btn-outline:hover { background: var(--bg3); border-color: var(--primary); color: var(--text); }
+    .btn-link { color: var(--text2); text-decoration: none; font-size: 14px; padding-left: 12px; transition: color .2s; font-family: 'JetBrains Mono', monospace; }
+    .btn-link:hover { color: var(--primary); }
+    .hero-numbers { display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px; padding: 36px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+    .hero-num { display: flex; flex-direction: column; gap: 6px; }
+    .hero-num .v { font-family: 'JetBrains Mono', monospace; font-size: 36px; font-weight: 500; color: var(--primary); letter-spacing: -0.02em; line-height: 1; font-variant-numeric: tabular-nums; }
+    .hero-num .l { font-size: 12px; color: var(--text2); font-family: 'JetBrains Mono', monospace; }
+    @media (max-width: 768px) {
+      .hero h1 { font-size: 42px; }
+      .hero-numbers { grid-template-columns: repeat(2, 1fr); }
+    }
+
+    /* scroll reveal */
+    .reveal { opacity: 0; transform: translateY(20px); transition: opacity .8s cubic-bezier(0.22,1,0.36,1), transform .8s cubic-bezier(0.22,1,0.36,1); }
+    .reveal.visible { opacity: 1; transform: translateY(0); }
+    .reveal-stagger > * { opacity: 0; transform: translateY(16px); transition: opacity .5s ease, transform .5s ease; }
+    .reveal-stagger.visible > * { opacity: 1; transform: translateY(0); }
+    .reveal-stagger.visible > *:nth-child(1) { transition-delay: 0.04s; }
+    .reveal-stagger.visible > *:nth-child(2) { transition-delay: 0.08s; }
+    .reveal-stagger.visible > *:nth-child(3) { transition-delay: 0.12s; }
+    .reveal-stagger.visible > *:nth-child(4) { transition-delay: 0.16s; }
+    .reveal-stagger.visible > *:nth-child(5) { transition-delay: 0.20s; }
+    .reveal-stagger.visible > *:nth-child(6) { transition-delay: 0.24s; }
+    .reveal-stagger.visible > *:nth-child(7) { transition-delay: 0.28s; }
+    .reveal-stagger.visible > *:nth-child(8) { transition-delay: 0.32s; }
+    .reveal-stagger.visible > *:nth-child(9) { transition-delay: 0.36s; }
+    .reveal-stagger.visible > *:nth-child(10) { transition-delay: 0.40s; }
+    .reveal-stagger.visible > *:nth-child(11) { transition-delay: 0.44s; }
+
+    /* bench */
+    #bench { padding: 100px 24px; border-top: 1px solid var(--border); position: relative; }
+    #bench .head { max-width: 1100px; margin: 0 auto 40px; }
+    #bench h2 { font-size: 44px; font-weight: 600; letter-spacing: -0.025em; margin-bottom: 14px; line-height: 1.1; }
+    #bench h2 .accent { background: linear-gradient(135deg, var(--primary), var(--success)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+    #bench p.sub { color: var(--text2); font-size: 15px; max-width: 720px; line-height: 1.55; }
+    .bench-section-label { max-width: 1100px; margin: 36px auto 14px; font-size: 11px; color: var(--text2); text-transform: uppercase; letter-spacing: 0.1em; font-family: 'JetBrains Mono', monospace; }
+    .bench-section-label::before { content: '◆ '; color: var(--success); margin-right: 4px; }
+    .bench-table { max-width: 1100px; margin: 0 auto; background: rgba(29,32,41,0.6); backdrop-filter: blur(8px); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; }
+    .bench-row { display: grid; grid-template-columns: 1.6fr 1fr 1fr 1fr; padding: 16px 28px; border-bottom: 1px solid var(--border); align-items: center; font-size: 14px; transition: background .2s; }
+    .bench-row:last-child { border-bottom: none; }
+    .bench-row:not(.head):hover { background: rgba(173,215,255,0.04); }
+    .bench-row.head { background: var(--bg3); font-size: 11px; color: var(--text2); text-transform: uppercase; letter-spacing: 0.08em; padding: 14px 28px; font-family: 'JetBrains Mono', monospace; }
+    .bench-row .op { font-family: 'JetBrains Mono', monospace; font-size: 13px; color: var(--text); }
+    .bench-row .num { font-family: 'JetBrains Mono', monospace; color: var(--text); font-variant-numeric: tabular-nums; }
+    .bench-row .other { color: var(--text2); }
+    .bench-row .ratio { color: var(--success); font-weight: 600; font-family: 'JetBrains Mono', monospace; font-variant-numeric: tabular-nums; }
+    .bench-callout { max-width: 1100px; margin: 0 auto; background: rgba(29,32,41,0.6); backdrop-filter: blur(8px); border: 1px solid var(--border); border-radius: 14px; padding: 32px 36px; display: flex; align-items: baseline; gap: 28px; flex-wrap: wrap; position: relative; overflow: hidden; }
+    .bench-callout::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: linear-gradient(180deg, var(--primary), var(--success)); }
+    .bench-callout .num { font-family: 'JetBrains Mono', monospace; font-size: 56px; font-weight: 500; background: linear-gradient(135deg, var(--primary), var(--success)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; letter-spacing: -0.03em; line-height: 1; font-variant-numeric: tabular-nums; }
+    .bench-callout .text { color: var(--text); font-size: 15px; }
+    .bench-callout .text strong { color: var(--text); }
+    .bench-callout .text span { color: var(--text2); display: block; margin-top: 4px; font-size: 13px; }
+    .bench-foot { max-width: 1100px; margin: 28px auto 0; color: var(--text2); font-size: 12px; text-align: center; line-height: 1.6; }
+    @media (max-width: 768px) {
+      .bench-row { grid-template-columns: 1.2fr 1fr 1fr; padding: 12px 16px; font-size: 13px; }
+      .bench-row .other { display: none; }
+      #bench h2 { font-size: 32px; }
+    }
+
+    /* architecture — gradient border on hover */
+    #arch { padding: 100px 24px; border-top: 1px solid var(--border); }
+    #arch .head { max-width: 1100px; margin: 0 auto 56px; }
+    #arch h2 { font-size: 44px; font-weight: 600; letter-spacing: -0.025em; margin-bottom: 14px; line-height: 1.1; }
+    #arch p.sub { color: var(--text2); font-size: 15px; max-width: 720px; line-height: 1.55; }
+    .arch-grid { max-width: 1100px; margin: 0 auto; display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+    .arch-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 14px; padding: 28px; transition: transform .25s; position: relative; overflow: hidden; }
+    .arch-card::before { content: ''; position: absolute; inset: 0; padding: 1px; border-radius: 14px;
+      background: linear-gradient(135deg, var(--primary), var(--success), var(--warning), var(--primary));
+      background-size: 300% 300%;
+      -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+      -webkit-mask-composite: xor; mask-composite: exclude;
+      opacity: 0; transition: opacity .35s; pointer-events: none;
+      animation: arch-grad 4s linear infinite;
+    }
+    @keyframes arch-grad { 0% { background-position: 0% 50%; } 100% { background-position: 300% 50%; } }
+    .arch-card:hover { transform: translateY(-4px); }
+    .arch-card:hover::before { opacity: 1; }
+    .arch-card .tag { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--success); padding: 3px 9px; background: rgba(93,228,199,0.08); border: 1px solid rgba(93,228,199,0.22); border-radius: 4px; display: inline-block; margin-bottom: 18px; letter-spacing: 0.04em; }
+    .arch-card h3 { font-size: 17px; font-weight: 600; margin-bottom: 10px; letter-spacing: -0.01em; color: var(--text); }
+    .arch-card p { font-size: 14px; color: var(--text2); line-height: 1.65; }
+    .arch-card code { font-family: 'JetBrains Mono', monospace; color: var(--primary); font-size: 13px; }
+    @media (max-width: 900px) { .arch-grid { grid-template-columns: 1fr; } #arch h2 { font-size: 32px; } }
+
+    /* install / code */
+    #install { padding: 100px 24px; border-top: 1px solid var(--border); }
+    .install-grid { max-width: 1100px; margin: 0 auto; display: grid; grid-template-columns: 1fr 1.3fr; gap: 64px; align-items: start; }
+    .install-text h2 { font-size: 44px; font-weight: 600; letter-spacing: -0.025em; margin-bottom: 18px; line-height: 1.1; }
+    .install-text p { color: var(--text2); font-size: 15px; line-height: 1.6; margin-bottom: 28px; }
+    .install-step { display: flex; gap: 16px; margin-bottom: 20px; }
+    .install-step .n { font-family: 'JetBrains Mono', monospace; color: var(--primary); font-size: 13px; padding-top: 1px; min-width: 28px; }
+    .install-step .body { font-size: 14px; color: var(--text); }
+    .install-step .body span { color: var(--text2); display: block; margin-top: 3px; font-size: 13px; }
+    .code-block { background: rgba(29,32,41,0.7); backdrop-filter: blur(10px); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; box-shadow: 0 20px 60px -20px rgba(0,0,0,0.6); }
+    .code-tab { display: flex; gap: 4px; padding: 12px 20px 0; border-bottom: 1px solid var(--border); align-items: center; }
+    .code-tab .dots { display: flex; gap: 6px; margin-right: 12px; }
+    .code-tab .dots span { width: 10px; height: 10px; border-radius: 50%; background: var(--bg3); }
+    .code-tab .dots span:first-child { background: rgba(208,103,157,0.6); }
+    .code-tab .dots span:nth-child(2) { background: rgba(255,250,194,0.5); }
+    .code-tab .dots span:last-child { background: rgba(93,228,199,0.5); }
+    .code-tab .name { font-size: 12px; padding: 6px 12px; border-radius: 6px 6px 0 0; color: var(--text); background: var(--bg3); font-family: 'JetBrains Mono', monospace; }
+    .code-block pre { font-family: 'JetBrains Mono', monospace; font-size: 13px; line-height: 1.75; padding: 22px 26px; color: var(--text); overflow-x: auto; }
+    .code-block .k { color: #d0679d; }
+    .code-block .s { color: var(--success); }
+    .code-block .c { color: var(--text2); font-style: italic; }
+    .code-block .v { color: var(--warning); }
+    .code-block .f { color: var(--primary); }
+    .code-block .ty { color: #fcc5e9; }
+    @media (max-width: 900px) { .install-grid { grid-template-columns: 1fr; gap: 36px; } .install-text h2 { font-size: 32px; } }
+
+    /* cta */
+    .cta-section { padding: 120px 24px; border-top: 1px solid var(--border); text-align: center; position: relative; overflow: hidden; }
+    .cta-section::before { content: ''; position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); width: 800px; height: 600px; background: radial-gradient(ellipse, rgba(173,215,255,0.1), rgba(93,228,199,0.05) 50%, transparent 70%); filter: blur(40px); pointer-events: none; }
+    .cta-section .inner { position: relative; z-index: 1; }
+    .cta-section h2 { font-size: 56px; font-weight: 600; letter-spacing: -0.03em; margin: 0 auto 18px; max-width: 760px; line-height: 1.05; }
+    .cta-section h2 .accent { background: linear-gradient(135deg, var(--primary), var(--success)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; font-family: 'JetBrains Mono', monospace; letter-spacing: -0.04em; }
+    .cta-section p { color: var(--text2); font-size: 16px; margin-bottom: 36px; max-width: 580px; margin-left: auto; margin-right: auto; line-height: 1.5; }
+    .cta-buttons { display: inline-flex; gap: 12px; flex-wrap: wrap; justify-content: center; }
+    .btn-primary-lg { background: var(--primary); color: var(--bg); padding: 14px 26px; border-radius: 10px; font-size: 15px; font-weight: 600; text-decoration: none; transition: all .25s; font-family: 'JetBrains Mono', monospace; }
+    .btn-primary-lg:hover { transform: translateY(-2px); box-shadow: 0 0 36px rgba(173,215,255,0.5), 0 0 64px rgba(93,228,199,0.25); color: var(--bg); }
+    .btn-outline-lg { background: rgba(29,32,41,0.6); backdrop-filter: blur(10px); border: 1px solid var(--border); color: var(--text); padding: 13px 24px; border-radius: 10px; font-size: 15px; font-weight: 500; text-decoration: none; transition: all .25s; font-family: 'JetBrains Mono', monospace; }
+    .btn-outline-lg:hover { background: var(--bg3); border-color: var(--primary); color: var(--text); }
+    @media (max-width: 768px) { .cta-section h2 { font-size: 36px; } }
+
+    /* footer */
+    footer.site-foot { border-top: 1px solid var(--border); padding: 44px 24px; }
+    .foot-inner { max-width: 1100px; margin: 0 auto; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; }
+    .foot-inner .copy { font-size: 12px; color: var(--text2); display: flex; align-items: center; gap: 10px; font-family: 'JetBrains Mono', monospace; }
+    .foot-inner .copy .logo-icon { width: 14px; height: 14px; background: linear-gradient(135deg, var(--primary), var(--success)); border-radius: 3px; opacity: 0.7; }
+    .foot-inner .links { display: flex; gap: 24px; }
+    .foot-inner .links a { font-size: 12px; color: var(--text2); text-decoration: none; transition: color .2s; font-family: 'JetBrains Mono', monospace; }
+    .foot-inner .links a:hover { color: var(--text); }
+  </style>
+</head>
+<body>
+
+<div class="noise-overlay"></div>
+
+<nav>
+  <div class="nav-inner">
+    <a href="#" class="logo"><span class="logo-icon"></span>enchudb</a>
+    <div class="nav-links">
+      <a href="#bench">Benchmarks</a>
+      <a href="#arch">Architecture</a>
+      <a href="#install">Get started</a>
+      <a href="https://github.com/mutafika/enchudb">Docs</a>
+    </div>
+    <div class="nav-right">
+      <a href="https://github.com/mutafika/enchudb" class="btn-github">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .3a12 12 0 0 0-3.79 23.4c.6.1.82-.26.82-.58v-2.03c-3.34.73-4.04-1.6-4.04-1.6-.55-1.4-1.34-1.77-1.34-1.77-1.09-.74.08-.73.08-.73 1.21.08 1.85 1.24 1.85 1.24 1.07 1.85 2.81 1.31 3.5 1 .1-.78.42-1.31.76-1.61-2.66-.3-5.47-1.34-5.47-5.93 0-1.31.46-2.38 1.23-3.22-.13-.3-.54-1.52.12-3.18 0 0 1-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.66 1.66.25 2.88.12 3.18a4.65 4.65 0 0 1 1.23 3.22c0 4.6-2.81 5.62-5.48 5.92.43.37.81 1.1.81 2.22v3.29c0 .32.21.7.82.58A12 12 0 0 0 12 .3z"/></svg>
+        GitHub
+      </a>
+    </div>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="grid-bg"></div>
+  <div class="glow-orb glow-1"></div>
+  <div class="glow-orb glow-2"></div>
+  <div class="hero-grid">
+    <div class="hero-eyebrow"><span class="dot"></span>v32 — embedded graph engine in Rust</div>
+    <h1>Multi-condition AND<br>in <span class="accent" id="scrambleTarget">187 nanoseconds</span>.</h1>
+    <p class="lead">Single-file mmap, prefix-sum O(1) lookup, lock-free concurrent reads. A graph storage engine where filtering, joining, and traversing are the same primitive — and all return before your CPU finishes prefetching.</p>
+    <div class="cta-row">
+      <a href="#install" class="btn-primary">Get started</a>
+      <a href="https://github.com/mutafika/enchudb" class="btn-outline">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .3a12 12 0 0 0-3.79 23.4c.6.1.82-.26.82-.58v-2.03c-3.34.73-4.04-1.6-4.04-1.6-.55-1.4-1.34-1.77-1.34-1.77-1.09-.74.08-.73.08-.73 1.21.08 1.85 1.24 1.85 1.24 1.07 1.85 2.81 1.31 3.5 1 .1-.78.42-1.31.76-1.61-2.66-.3-5.47-1.34-5.47-5.93 0-1.31.46-2.38 1.23-3.22-.13-.3-.54-1.52.12-3.18 0 0 1-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.66 1.66.25 2.88.12 3.18a4.65 4.65 0 0 1 1.23 3.22c0 4.6-2.81 5.62-5.48 5.92.43.37.81 1.1.81 2.22v3.29c0 .32.21.7.82.58A12 12 0 0 0 12 .3z"/></svg>
+        Source on GitHub
+      </a>
+      <a href="#bench" class="btn-link">View benchmarks →</a>
+    </div>
+    <div class="hero-numbers reveal-stagger">
+      <div class="hero-num"><div class="v" data-counter data-target="187" data-suffix="ns">0ns</div><div class="l">multi-condition AND query</div></div>
+      <div class="hero-num"><div class="v" data-counter data-target="85" data-suffix="ns">0ns</div><div class="l">tie_async (write a 紐)</div></div>
+      <div class="hero-num"><div class="v" data-counter data-target="421" data-suffix="×">0×</div><div class="l">vs Elasticsearch (2-cond)</div></div>
+      <div class="hero-num"><div class="v" data-counter data-target="25830" data-suffix="×">0×</div><div class="l">vs SQLite (multi-filter)</div></div>
+    </div>
+  </div>
+</section>
+
+<section id="bench">
+  <div class="head reveal">
+    <h2>Designed to be <span class="accent">embarrassingly fast</span> on filter workloads.</h2>
+    <p class="sub">Multi-tenant search backends, RAG metadata filters, graph traversals, real-time analytics — anywhere "narrow this set down by 3 conditions" is the hot path. EnchuDB collapses that into a single PairTable lookup.</p>
+  </div>
+
+  <div class="bench-section-label reveal">vs Elasticsearch 8.17 — multi-tenant 1M docs, profile API pure query time</div>
+  <div class="bench-table reveal-stagger">
+    <div class="bench-row head">
+      <div>Query</div><div>EnchuDB</div><div class="other">Elasticsearch</div><div>Speedup</div>
+    </div>
+    <div class="bench-row"><div class="op">single condition</div><div class="num">2.3µs</div><div class="num other">95µs</div><div class="ratio">41×</div></div>
+    <div class="bench-row"><div class="op">2-condition AND</div><div class="num">760ns</div><div class="num other">320µs</div><div class="ratio">421×</div></div>
+    <div class="bench-row"><div class="op">4-condition AND</div><div class="num">19.7µs</div><div class="num other">196µs</div><div class="ratio">10×</div></div>
+  </div>
+
+  <div class="bench-section-label reveal">vs SQLite — 1M rows, multi-condition filter</div>
+  <div class="bench-callout reveal">
+    <div class="num">25,830×</div>
+    <div class="text">
+      <strong>EnchuDB returns where SQLite is still planning.</strong>
+      <span>Indexes don't help when the query shape is "filter by N attributes" — SQLite's planner picks one index, scans rest. EnchuDB's PairTable cells are dense, AND is intersection in O(1).</span>
+    </div>
+  </div>
+
+  <div class="bench-section-label reveal">RAG search — 100k chunks, dim=384</div>
+  <div class="bench-callout reveal">
+    <div class="num">0.49ms</div>
+    <div class="text">
+      <strong>Brute-force cosine + meta filter, no ANN.</strong>
+      <span><code class="mono" style="color:var(--primary)">tenant=1 AND lang=en</code> filter pre-applied via PairTable, then exact cosine on the survivors. No index drift, no recall loss, deterministic.</span>
+    </div>
+  </div>
+
+  <p class="bench-foot reveal">Reproduce: <code class="mono" style="color: var(--primary)">cargo run --release --features v32 --example v27_vs_v31_full</code></p>
+</section>
+
+<section id="arch">
+  <div class="head reveal">
+    <h2>Six primitives. <span style="color: var(--text2)">That's the whole engine.</span></h2>
+    <p class="sub">Everything else (SQL frontend, RAG, transport, sync) builds on these. Read the engine source in an afternoon.</p>
+  </div>
+  <div class="arch-grid reveal-stagger">
+    <div class="arch-card">
+      <span class="tag">core</span>
+      <h3>紐 (himo) — attribute as index</h3>
+      <p>An entity has himos. A himo is a typed attribute (Symbol / Value / Text) that's indexed by construction. There is no "should I add an index" question — every himo is one.</p>
+    </div>
+    <div class="arch-card">
+      <span class="tag">v27</span>
+      <h3>BucketCylinder</h3>
+      <p>O(1) insert and remove on unsorted buckets. Replaces v26's sorted lists. The data structure that makes <code>tie</code> 85ns and <code>pull_raw</code> 105ns regardless of cardinality.</p>
+    </div>
+    <div class="arch-card">
+      <span class="tag">v26</span>
+      <h3>PairTable</h3>
+      <p>2D dense cells indexed by (himo_a × himo_b). 2-condition AND becomes a single cell read instead of intersect-of-sets. This is the 421× lever.</p>
+    </div>
+    <div class="arch-card">
+      <span class="tag">v28+</span>
+      <h3>WAL with ring buffer</h3>
+      <p>Crash consistency without a separate log file growing forever. Background fsync, ring-buffer reuse. Sync mode 148µs, Async mode 100ns. Crash-safe by default.</p>
+    </div>
+    <div class="arch-card">
+      <span class="tag">v31+</span>
+      <h3>Ravn — graph traversal DSL</h3>
+      <p>Multi-step <code>follow → filter → reverse_follow</code> over himos as edges. "Decisions made by Alice in Next.js sessions" reads like a path expression, runs like a join.</p>
+    </div>
+    <div class="arch-card">
+      <span class="tag">add-on</span>
+      <h3>RAG store on top</h3>
+      <p>Brute-force cosine + meta filter via PairTable. No ANN, no recall loss. Filter narrows N before vectors do — that's why 0.49ms holds at 100k chunks.</p>
+    </div>
+  </div>
+</section>
+
+<section id="install">
+  <div class="install-grid">
+    <div class="install-text reveal">
+      <h2>Three lines to a query.</h2>
+      <p>Add to <code class="mono" style="color: var(--primary)">Cargo.toml</code>, define your himos, start tieing. The engine is one mmap file plus a WAL — no daemon, no migration.</p>
+      <div class="install-step"><div class="n">01</div><div class="body">Add the dep<span class="mono">enchudb = { git = "https://github.com/mutafika/enchudb" }</span></div></div>
+      <div class="install-step"><div class="n">02</div><div class="body">Open or create<span><code class="mono" style="color: var(--primary)">Engine::create(path)</code> for a fresh DB, <code class="mono" style="color: var(--primary)">Engine::open</code> for existing.</span></div></div>
+      <div class="install-step"><div class="n">03</div><div class="body">Define himos, tie, query<span>Tie attributes to entities, call <code class="mono" style="color: var(--primary)">rebuild()</code>, query with AND clauses.</span></div></div>
+      <a href="https://github.com/mutafika/enchudb" style="color: var(--primary); font-size: 14px; text-decoration: none; font-weight: 500">Read SPEC.md →</a>
+    </div>
+    <div class="code-block reveal">
+      <div class="code-tab">
+        <div class="dots"><span></span><span></span><span></span></div>
+        <span class="name">main.rs</span>
+      </div>
+      <pre><span class="k">use</span> enchudb::{<span class="ty">Engine</span>, <span class="ty">HimoType</span>, <span class="ty">Ravn</span>};
+
+<span class="k">let mut</span> db = <span class="ty">Engine</span>::<span class="f">create</span>(<span class="s">"/tmp/my.db"</span>)?;
+db.<span class="f">define_himo</span>(<span class="s">"age"</span>, <span class="ty">HimoType</span>::Value, <span class="v">100</span>);
+db.<span class="f">define_himo</span>(<span class="s">"city"</span>, <span class="ty">HimoType</span>::Text, <span class="v">10_000</span>);
+
+<span class="c">// tie attributes to an entity</span>
+<span class="k">let</span> alice = db.<span class="f">entity</span>();
+db.<span class="f">tie</span>(alice, <span class="s">"age"</span>, <span class="v">30</span>);
+db.<span class="f">tie_text</span>(alice, <span class="s">"city"</span>, <span class="s">"東京"</span>);
+
+db.<span class="f">rebuild</span>();
+
+<span class="c">// 187ns multi-condition AND</span>
+<span class="k">let</span> hits = db.<span class="f">query</span>(&[(<span class="s">"age"</span>, <span class="v">30</span>), (<span class="s">"city"</span>, <span class="f">vocab</span>(<span class="s">"東京"</span>))]);
+
+<span class="c">// graph traversal: "decisions made by Alice"</span>
+<span class="k">let</span> ravn = <span class="ty">Ravn</span>::<span class="f">new</span>(db.<span class="f">clone</span>());
+<span class="k">let</span> sessions  = ravn.<span class="f">reverse_follow</span>(&hits, <span class="s">"speaker"</span>);
+<span class="k">let</span> decisions = ravn.<span class="f">extract_text</span>(&sessions, <span class="s">"decision"</span>);</pre>
+    </div>
+  </div>
+</section>
+
+<section class="cta-section">
+  <div class="inner reveal">
+    <h2>Stop indexing. <span class="accent">Just tie it.</span></h2>
+    <p>If filtering by attributes is your hot path, the indexing question is wasting your time. EnchuDB makes attributes the index — no plans, no ANALYZE, no recall loss.</p>
+    <div class="cta-buttons">
+      <a href="https://github.com/mutafika/enchudb" class="btn-primary-lg">Get started on GitHub</a>
+      <a href="#bench" class="btn-outline-lg">See the numbers</a>
+    </div>
+  </div>
+</section>
+
+<footer class="site-foot">
+  <div class="foot-inner">
+    <div class="copy"><span class="logo-icon"></span>enchudb · MIT / Apache-2.0 · 0.x · 2026</div>
+    <div class="links">
+      <a href="https://github.com/mutafika/enchudb">SPEC</a>
+      <a href="https://github.com/mutafika/enchudb">GitHub</a>
+      <a href="https://github.com/mutafika/enchu-extend">Node binding (enchu-extend)</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+  // scroll reveal
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach(e => { if (e.isIntersecting) { e.target.classList.add('visible'); io.unobserve(e.target); } });
+  }, { threshold: 0.12, rootMargin: '0px 0px -60px 0px' });
+  document.querySelectorAll('.reveal, .reveal-stagger').forEach(el => io.observe(el));
+
+  // counter-up — supports large numbers and decimals
+  const counters = document.querySelectorAll('[data-counter]');
+  const counterIO = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (!e.isIntersecting) return;
+      const el = e.target;
+      const target = parseFloat(el.dataset.target);
+      const suffix = el.dataset.suffix || '';
+      const dur = 1600;
+      const t0 = performance.now();
+      const isInt = Number.isInteger(target);
+      const tick = (now) => {
+        const p = Math.min((now - t0) / dur, 1);
+        const eased = 1 - Math.pow(1 - p, 3);
+        const v = eased * target;
+        const formatted = isInt ? Math.floor(v).toLocaleString('en-US') : v.toFixed(1);
+        el.textContent = formatted + suffix;
+        if (p < 1) requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+      counterIO.unobserve(el);
+    });
+  }, { threshold: 0.5 });
+  counters.forEach(c => counterIO.observe(c));
+
+  // text-scramble for headline accent on load
+  (() => {
+    const el = document.getElementById('scrambleTarget');
+    if (!el) return;
+    const finalText = el.textContent;
+    const chars = '0123456789NSANOSECONDSμμns#@*';
+    let iter = 0;
+    el.textContent = chars.repeat(Math.ceil(finalText.length/chars.length)).slice(0, finalText.length);
+    const interval = setInterval(() => {
+      el.textContent = finalText.split('').map((c, i) => {
+        if (i < iter) return finalText[i];
+        if (c === ' ') return ' ';
+        return chars[Math.floor(Math.random() * chars.length)];
+      }).join('');
+      iter += 0.5;
+      if (iter >= finalText.length) {
+        el.textContent = finalText;
+        clearInterval(interval);
+      }
+    }, 40);
+  })();
+</script>
+
+</body>
+</html>

@@ -13,11 +13,16 @@ v26 = []
 v27 = ["dep:crossbeam-queue"]
 v32 = ["v27", "dep:ed25519-dalek", "dep:rand_core"]
 v33 = ["v32"]
+# AsyncBlobStore trait + tokio-based default adapter。
+# S3 / HTTP / 遠隔ストア向け。引かない限り tokio / async-trait は依存に入らない。
+async-blob = ["dep:async-trait", "dep:tokio"]
 
 [dependencies]
 crossbeam-queue = { version = "0.3", optional = true }
 ed25519-dalek = { version = "2", optional = true, features = ["rand_core"] }
 rand_core = { version = "0.6", optional = true, features = ["getrandom"] }
+async-trait = { version = "0.1", optional = true }
+tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread", "macros"] }
 sha2 = "0.10"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
