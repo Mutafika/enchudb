@@ -9,6 +9,7 @@
 | Crate | 役割 | meta crate での opt-in |
 |---|---|---|
 | [`enchudb-engine`](./crates/enchudb-engine) | コアストレージエンジン。Cylinder + PairTable + WAL + Ravn | always |
+| [`enchudb-schema`](./crates/enchudb-schema) | **native API**。 仮想 2D テーブル + himo_id pre-resolve + schema 永続化 | always |
 | [`enchudb-sync`](./crates/enchudb-sync) | HLC-LWW Syncer、ShardRouter | `features = ["v32"]` |
 | [`enchudb-transport`](./crates/enchudb-transport) | HTTP relay / WebSocket push hub | runtime 直接依存 |
 | [`enchudb-text`](./crates/enchudb-text) | bigram 転置インデックスによる全文検索 | 直接依存 |
@@ -19,6 +20,40 @@
 各 sub-crate の `README.md` に詳細あり。Node.js バインディングは独立 repo [`mutafika/enchu-extend`](https://github.com/mutafika/enchu-extend) (v33 で sibling として fork)。
 
 ## Quick start
+
+### native API (推奨、 app 開発の primary path)
+
+```rust
+use enchudb::schema::{Database, ColumnType};
+
+let mut db = Database::create("/tmp/app.db")?;
+
+// 仮想 2D テーブルを宣言、 build() で col → himo_id を pre-resolve
+let users = db.table("users")
+    .integer("id")
+    .text("name")
+    .integer("age")
+    .primary_key("id")
+    .build()?;
+
+// insert (row-shaped、 内部では N 本の tie)
+let alice = users.insert()
+    .set("id", 1i64).set("name", "Alice").set("age", 30i64)
+    .commit()?;
+
+// query — col → himo_id は build 時解決済み、 名前 lookup なし
+let young = users.where_eq("age", 30i64).find()?;
+let multi = users.where_eq("age", 30i64).where_eq("name", "Alice").find()?;
+
+// reopen で schema 自動復元
+drop(db);
+let db = Database::open("/tmp/app.db")?;
+let users = db.get_table("users").unwrap();  // CREATE 再呼出 不要
+```
+
+詳細は [`crates/enchudb-schema/README.md`](./crates/enchudb-schema/README.md)。
+
+### engine 層 (REPL / power user)
 
 ```rust
 use enchudb::{Engine, HimoType};
@@ -152,7 +187,7 @@ let hits = store.search(
 - **PairTable**（v26、 opt-in）: 紐 2 本のペア cell、 v27 で多くを吸収済み、 現在 dormant
 - **WAL**（v28+）: crash consistency、 背景 fsync、 リングバッファ再利用
 - **Ravn**（v31+）: グラフ辿り DSL、 多段 reverse_follow + filter_by
-- **仮想 2D テーブル層** (`enchudb-sql`): N 個の紐を 1 つの table 名で束ねる、 schema は DB ファイル内に永続化
+- **仮想 2D テーブル層** (`enchudb-schema`): N 個の紐を 1 つの table 名で束ねる、 col → himo_id を pre-resolve、 schema は DB ファイル内に永続化。 SQL crate と FFI もこの上に乗る
 
 メンタルモデル: engine 全体は **モンジャラ** (蔓 = 紐、 entity = 蔓の交差点に隠れた本体)。 1 つの紐の中身は **2D table** (値 × eid バケット)。
 
