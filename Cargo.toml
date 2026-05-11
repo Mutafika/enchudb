@@ -23,6 +23,7 @@ async-blob = ["enchudb-engine/async-blob"]
 
 [dependencies]
 enchudb-engine = { path = "crates/enchudb-engine" }
+enchudb-schema = { path = "crates/enchudb-schema" }
 enchudb-sync = { path = "crates/enchudb-sync", optional = true }
 enchudb-sql = { path = "crates/enchudb-sql", optional = true }
 enchudb-ffi = { path = "crates/enchudb-ffi", optional = true }

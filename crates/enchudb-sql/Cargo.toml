@@ -9,4 +9,5 @@ repository = "https://github.com/mutafika/enchudb"
 
 [dependencies]
 enchudb-engine = { path = "../enchudb-engine" }
+enchudb-schema = { path = "../enchudb-schema" }
 sqlparser = "0.52"

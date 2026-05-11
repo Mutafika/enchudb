@@ -1,8 +1,31 @@
 //! EnchuDB — 紐ベース円柱エンジン。
 //!
-//! この `enchudb` crate は meta crate。
-//! 単独 DB 本体は `enchudb-engine`、p2p sync 層は `enchudb-sync` に分離されている。
-//! 互換性のために主要 API をここから再エクスポートする:
+//! この `enchudb` crate は meta crate。 主要 layer をここから再エクスポートする:
+//!
+//! - `enchudb::Engine` 等 — engine 層 (`enchudb-engine`)、 naked 紐 + 円柱
+//! - `enchudb::schema::*` — **native API** (`enchudb-schema`)、 仮想 2D テーブル + 永続化
+//! - `enchudb::sync::*` — p2p sync 層 (`enchudb-sync`、 `features = ["v32"]`)
+//! - `enchudb-sql` crate — SQLite-compat parser (`features = ["sql"]`、 別 crate として直接 dep)
+//!
+//! ## native API (推奨)
+//!
+//! ```no_run
+//! use enchudb::schema::{Database, ColumnType};
+//!
+//! let mut db = Database::create("/tmp/app.db")?;
+//! let users = db.table("users")
+//!     .integer("id")
+//!     .text("name")
+//!     .integer("age")
+//!     .primary_key("id")
+//!     .build()?;
+//!
+//! let alice = users.insert().set("id", 1i64).set("name", "Alice").set("age", 30i64).commit()?;
+//! let r = users.where_eq("age", 30i64).find()?;
+//! # Ok::<(), enchudb::schema::SchemaError>(())
+//! ```
+//!
+//! ## engine 層 (REPL / power user)
 //!
 //! ```
 //! let path = format!("/tmp/enchudb-doc-{}.db", std::process::id());
@@ -11,16 +34,19 @@
 //! db.define_himo("age", enchudb::HimoType::Value, 100);
 //! let e = db.entity();
 //! db.tie(e, "age", 30);
-//! db.tie_text(e, "city", "東京");
 //! db.rebuild();
-//! let result = db.pull_raw("age", 30);
-//! assert_eq!(result, vec![0]);
+//! assert_eq!(db.pull_raw("age", 30), vec![0]);
 //! # let _ = std::fs::remove_file(&path);
 //! ```
 
 pub use enchudb_engine::*;
 
-/// v32: p2p sync 層(`enchudb-sync`)。`features = ["v32"]` で有効。
+/// Native API (仮想 2D テーブル + 永続化)。 app 開発向けの primary path。
+pub mod schema {
+    pub use enchudb_schema::*;
+}
+
+/// v32: p2p sync 層 (`enchudb-sync`)。 `features = ["v32"]` で有効。
 #[cfg(feature = "v32")]
 pub mod sync {
     pub use enchudb_sync::*;

@@ -3013,6 +3013,49 @@ impl Engine {
         }
     }
 
+    /// 複数値の bucket を union する。 `WHERE col IN (v1, v2, ...)` / Ravn follow 後の union 用。
+    /// 結果は sort + dedup 済み。
+    pub fn pull_in(&self, himo: &str, values: &[u32]) -> Vec<crate::EntityId> {
+        match self.himo_id(himo) {
+            Some(idx) => self.pull_in_by_idx(idx, values),
+            None => Vec::new(),
+        }
+    }
+
+    /// schema 層用: himo_id pre-resolve 済みの `pull_in`。
+    pub fn pull_in_by_id(&self, himo_id: u16, values: &[u32]) -> Vec<crate::EntityId> {
+        let idx = himo_id as usize;
+        if idx >= self.himos.len() { return Vec::new(); }
+        self.pull_in_by_idx(idx, values)
+    }
+
+    fn pull_in_by_idx(&self, idx: usize, values: &[u32]) -> Vec<crate::EntityId> {
+        if values.is_empty() { return Vec::new(); }
+        let mut out: Vec<u32> = Vec::new();
+        #[cfg(feature = "v27")]
+        {
+            for &v in values {
+                out.extend(self.himos[idx].pull(v));
+            }
+        }
+        #[cfg(not(feature = "v27"))]
+        {
+            let hs = &self.himos[idx];
+            if hs.delta_needs_rebuild() { hs.rebuild_cylinder(); }
+            for &v in values {
+                let cyl = hs.cylinder().slice_one(v);
+                if hs.delta_is_empty() {
+                    out.extend(cyl.iter().copied());
+                } else {
+                    out.extend(self.apply_delta(idx, v, cyl, hs.delta_eids()));
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out.into_iter().map(|e| e as crate::EntityId).collect()
+    }
+
     /// Cylinder 結果に delta を適用。
     #[allow(dead_code)]
     fn apply_delta(&self, himo_idx: usize, value: u32, cyl_result: &[u32], delta_eids: &[u32]) -> Vec<u32> {
@@ -3049,14 +3092,23 @@ impl Engine {
         self.query_u32(strings).into_iter().map(|e| e as crate::EntityId).collect()
     }
 
+    /// schema 層用: himo_id を pre-resolve 済みの場合の高速 path。 名前 lookup を完全に skip。
+    /// 同一 entity の AND 条件として扱う。 himo_id が範囲外なら空 Vec。
+    pub fn query_by_id(&self, conds: &[(u16, u32)]) -> Vec<crate::EntityId> {
+        if conds.is_empty() { return Vec::new(); }
+        let himo_count = self.himos.len();
+        let mut idx_conds: Vec<(usize, u32)> = Vec::with_capacity(conds.len());
+        for &(hid, val) in conds {
+            let idx = hid as usize;
+            if idx >= himo_count { return Vec::new(); }
+            idx_conds.push((idx, val));
+        }
+        self.query_resolved(&idx_conds).into_iter().map(|e| e as crate::EntityId).collect()
+    }
+
     /// 内部版: u32 eid の Vec を返す。互換性のため残す。
     fn query_u32(&self, strings: &[(&str, u32)]) -> Vec<u32> {
-        // delta が溢れた himo があれば rebuild
-        for hs in &self.himos {
-            if hs.delta_needs_rebuild() { hs.rebuild_cylinder(); }
-        }
         if strings.is_empty() { return vec![]; }
-
         // 全条件の himo index と value を解決
         let mut conds: Vec<(usize, u32)> = Vec::with_capacity(strings.len());
         for &(himo, val) in strings {
@@ -3065,6 +3117,16 @@ impl Engine {
                 None => return vec![],
             }
         }
+        self.query_resolved(&conds)
+    }
+
+    /// resolved conds (himo_index, value) に対する query 本体。 strategy 自動選択。
+    fn query_resolved(&self, conds: &[(usize, u32)]) -> Vec<u32> {
+        // delta が溢れた himo があれば rebuild
+        for hs in &self.himos {
+            if hs.delta_needs_rebuild() { hs.rebuild_cylinder(); }
+        }
+        if conds.is_empty() { return vec![]; }
 
         if conds.len() == 1 {
             let (idx, val) = conds[0];
