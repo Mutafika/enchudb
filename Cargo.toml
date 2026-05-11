@@ -12,7 +12,7 @@ authors = ["mutafika"]
 repository = "https://github.com/mutafika/enchudb"
 
 [features]
-default = []
+default = ["v33"]
 v26 = ["enchudb-engine/v26"]
 v27 = ["enchudb-engine/v27"]
 v32 = ["enchudb-engine/v32", "dep:enchudb-sync"]

@@ -285,6 +285,13 @@ const H_PEER_ID: usize = 68; // u32
 /// 小フットプリント preset がここに自前の値を書き、 open が再現できるように
 /// する。 CRC 保護外。
 const H_UNDO_MAX_ENTRIES: usize = 72; // u32
+/// Backing kind flag (u32). 0 = EAGER (default, also legacy zero-fill), 1 = GROWABLE.
+/// 用途: `validate_file_size` で auto-extend を許すか strict check するかの分岐のみ。
+/// CRC 保護外。 accidental truncation 検出が目的、 adversarial tampering は対象外。
+const H_BACKING_KIND: usize = 76; // u32
+
+const BACKING_KIND_EAGER: u32 = 0;
+const BACKING_KIND_GROWABLE: u32 = 1;
 const H_HIMO_TYPES: usize = 256;
 
 // v27: 観測窓(n-tuple 仮想テーブル定義)領域。
@@ -1293,6 +1300,10 @@ impl Engine {
         let undo_max_entries = ((layout.undo_size - 16) / 10) as u32;
         header[H_UNDO_MAX_ENTRIES..H_UNDO_MAX_ENTRIES + 4]
             .copy_from_slice(&undo_max_entries.to_le_bytes());
+        // Phase B: growable backing は file_size < layout.total_size を許容するため、
+        // open 側の validate_file_size でこのフラグを見て分岐する。
+        header[H_BACKING_KIND..H_BACKING_KIND + 4]
+            .copy_from_slice(&BACKING_KIND_GROWABLE.to_le_bytes());
         write_header_crc(header);
 
         let _ = base; // base ptr is implicit via Region::with_grower from here on
@@ -1579,15 +1590,35 @@ impl Engine {
             undo_max_entries,
         );
 
-        // v3 (Phase B 以降): growable backing で作った DB は variable
-        // cluster の末尾が未書き込みのことがあり、 file_size <
-        // layout.total_size でも正常。 そのまま mmap するとアクセス可能
-        // 範囲が file_size までになるので、 ftruncate で sparse 拡張して
-        // 期待サイズに合わせる (実 disk usage はゼロ、 apparent のみ拡大)。
-        // 拡張側は zero-fill 保証 (POSIX) で、 各 store の load() は
-        // "MAGIC missing → fresh" の lazy 認識をするので問題ない。
+        // Phase B 以降: backing_kind フラグで「growable 由来で file_size <
+        // total_size が正常」 か 「eager 由来で file_size 不足は truncation」 か
+        // を分岐する。
+        //
+        // - EAGER (0、 default、 legacy zero-fill 含む): file_size は
+        //   layout.total_size と一致が必須。 不足は accidental truncation /
+        //   ファイル破損 → エラーで弾く (v29 crash safety)。
+        // - GROWABLE (1): file_size < total_size でも正常 (variable cluster
+        //   未コミット)。 ftruncate で sparse 拡張して mmap 用に揃える
+        //   (実 disk usage はゼロ、 各 store の load() は MAGIC missing で
+        //   lazy fresh 認識)。
+        let backing_kind = u32::from_le_bytes(
+            buf[H_BACKING_KIND..H_BACKING_KIND + 4].try_into().unwrap(),
+        );
         if file_size < layout.total_size as u64 {
-            file.set_len(layout.total_size as u64)?;
+            match backing_kind {
+                BACKING_KIND_GROWABLE => {
+                    file.set_len(layout.total_size as u64)?;
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "file truncated: {} bytes (expected at least {}, layout.total_size)",
+                            file_size, layout.total_size,
+                        ),
+                    ));
+                }
+            }
         }
         Ok(())
     }

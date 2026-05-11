@@ -8,6 +8,7 @@ authors = ["mutafika"]
 repository = "https://github.com/mutafika/enchudb"
 
 [features]
+default = ["v33"]
 v26 = []
 v27 = ["dep:crossbeam-queue"]
 v32 = ["v27", "dep:ed25519-dalek", "dep:rand_core"]
