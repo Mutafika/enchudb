@@ -133,28 +133,8 @@ let hits = store.search(
 
 ## ベンチマーク
 
-### コアエンジン（vs v27 → v31、200k entities）
-
-| 操作 | v27 | v31 | 差 |
-|---|---:|---:|---:|
-| tie_async | 73 ns | 85 ns | +16% |
-| pull_raw | 105 ns | 105 ns | 0% |
-| query（多条件 AND） | 197 ns | 187 ns | −5% |
-| sum / avg / min / max / count | ±5% 以内 | | |
-| follow / reverse_follow / bfs | ±5% 以内 | | |
-| wal_sync | — | 148 μs | 新規 |
-
-### vs SQLite（100万件、多条件フィルタ）
-
-25,830 倍。
-
-### vs Elasticsearch 8.17（profile API 純クエリ時間、マルチテナント 100万件）
-
-| クエリ | EnchuDB | Elasticsearch | 倍率 |
-|---|---:|---:|---:|
-| 単条件 | 2.3µs | 95µs | 41x |
-| 2条件 | 760ns | 320µs | **421x** |
-| 4条件 | 19.7µs | 196µs | 10x |
+再現コマンド・実測値・ハードウェア記述は [`benches/README.md`](./benches/README.md) に集約。
+誇大な数字を README に書かない方針 — 興味ある人は自分で走らせて検証できる。
 
 ## アーキテクチャ要点
 
@@ -176,8 +156,10 @@ cargo test --workspace
 # 重いスケーリング・ストレステスト（25 件、手動実行）
 cargo test --workspace -- --ignored
 
-# ベンチ
-cargo run --release --features v32 --example v27_vs_v31_full
+# ベンチ — 詳細は benches/README.md
+cargo run --release --features "v27 v32" --example vs_sqlite
+cargo run --release --features "v27 v32" --example v27_vs_v31_full
+cargo bench --features v32 --bench core
 ```
 
 ## ファイル構成
