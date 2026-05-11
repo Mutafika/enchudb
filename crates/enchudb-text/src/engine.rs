@@ -133,7 +133,14 @@ impl TextEngine {
             Backend::Mapped(m) => m.intersect(&keys),
         };
 
-        // 原文照合で偽陽性を除外
+        // 1 bigram クエリ (2 文字) は bigram == query なので、bigram が doc に
+        // 存在する ⟺ query が substring として存在する。filter は無駄なのでスキップ。
+        if bgs.len() == 1 {
+            return candidates;
+        }
+
+        // 多 bigram クエリは原文照合で偽陽性を除外（"ABXYBC" は "AB" "BC" の bigram を
+        // 両方持つが、連続した "ABBC" は含まない）。
         candidates.into_iter()
             .filter(|&eid| {
                 self.get_text(eid).is_some_and(|text| text.contains(query))
@@ -366,6 +373,24 @@ mod tests {
     #[test]
     fn open_nonexistent() {
         assert!(TextEngine::open("/tmp/does_not_exist.etxt").is_err());
+    }
+
+    #[test]
+    fn two_char_query_skips_filter() {
+        // 2 文字クエリは bigram == query なので filter は不要。
+        // この test は出力の正しさを保証するだけで、性能は別途確認。
+        let mut eng = TextEngine::new();
+        eng.index(0, "国民は法の下");
+        eng.index(1, "個人として尊重");
+        eng.index(2, "民主主義の基盤");
+        eng.compact();
+
+        // "国民" は 0 だけにマッチ
+        assert_eq!(eng.search("国民"), vec![0u64]);
+        // "民主" は 2 だけにマッチ
+        assert_eq!(eng.search("民主"), vec![2u64]);
+        // 存在しない 2 文字
+        assert_eq!(eng.search("青空"), Vec::<u64>::new());
     }
 
     #[test]
