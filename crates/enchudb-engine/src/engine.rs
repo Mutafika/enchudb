@@ -28,7 +28,6 @@ pub enum EntityValue<'a> {
 }
 
 /// v29: Engine の実行時状態スナップショット。
-#[cfg(feature = "v27")]
 #[derive(Debug, Clone)]
 pub struct EngineStats {
     pub entity_count: u32,
@@ -59,7 +58,6 @@ pub struct EngineStats {
     pub max_hlc: Option<crate::Hlc>,
 }
 
-#[cfg(feature = "v27")]
 fn wal_path_for(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{}.wal", path))
 }
@@ -158,7 +156,6 @@ impl Backing {
 
     /// v32: &self 経由で header 領域に unsafe で書き込む。
     /// mmap 経由の並行書き込みは atomic スライス更新でガードされる前提。
-    #[cfg(feature = "v32")]
     #[allow(clippy::mut_from_ref)]
     fn header_mut(&self) -> &mut [u8] {
         unsafe {
@@ -187,8 +184,6 @@ use crate::himo_store::{HimoStore, HimoType};
 use crate::content_store::ContentStore;
 use crate::undo::UndoLog;
 use crate::column::Column;
-#[cfg(not(feature = "v27"))]
-use crate::cylinder::Cylinder;
 
 // ════════════════ ギャロッピング交差 ════════════════
 // 旧 v24/v26 経路で使っていた。v27+ でも将来再利用の余地あり。
@@ -248,10 +243,8 @@ const FILE_VERSION: u32 = 3;
 const HEADER_SIZE: usize = 4096;
 
 /// 観測窓(view)の永続化制限。
-#[cfg(feature = "v27")]
 const MAX_PERSISTED_VIEWS: usize = 32;
 /// 1 view あたりの最大紐数(固定長レコード制約)。
-#[cfg(feature = "v27")]
 const MAX_VIEW_HIMOS: usize = 8;
 
 const DEFAULT_MAX_ENTITIES: u32 = 16_777_216;
@@ -278,7 +271,6 @@ const H_CYL_MAX_VALUES: usize = 60;
 const H_HEADER_CRC: usize = 64; // u32
 /// v32: この DB を所有する peer の id。0 は「未設定 / single peer」。
 /// CRC 保護外(後から set_peer_id で上書き可能)。
-#[cfg(feature = "v32")]
 const H_PEER_ID: usize = 68; // u32
 /// undo region のエントリ最大数。 0 はレガシー DB (header に書かれてない)
 /// → open 時に `crate::undo::DEFAULT_MAX_ENTRIES` を使う。 growable_tiny 等の
@@ -301,11 +293,8 @@ const H_HIMO_TYPES: usize = 256;
 //   [H_VIEWS_OFF + i*R..] : 各 view のレコード (R = 1 + MAX_VIEW_HIMOS*2 = 17 bytes)
 //     - length: u8   (紐数、2..=MAX_VIEW_HIMOS)
 //     - himo_ids: u16 × MAX_VIEW_HIMOS  (使われない末尾は 0 埋め、length で切る)
-#[cfg(feature = "v27")]
 const H_VIEW_COUNT: usize = 2048;
-#[cfg(feature = "v27")]
 const H_VIEWS_OFF: usize = 2052;
-#[cfg(feature = "v27")]
 const VIEW_RECORD_SIZE: usize = 1 + MAX_VIEW_HIMOS * 2;
 
 fn align8(n: usize) -> usize { (n + 7) & !7 }
@@ -513,13 +502,7 @@ impl Layout {
         off += content_index_size;
 
         let himo_col_size = align8(Column::region_size(max_entities, 4));
-        #[cfg(not(feature = "v27"))]
-        let himo_cyl_size = align8(Cylinder::region_size(max_entities, cyl_max_values));
-        #[cfg(feature = "v27")]
         let himo_cyl_size = 0usize;
-        #[cfg(not(feature = "v27"))]
-        let himo_slot_size = himo_col_size + himo_cyl_size * 2;
-        #[cfg(feature = "v27")]
         let himo_slot_size = himo_col_size;
 
         let himo_base_off = off;
@@ -572,118 +555,6 @@ impl Layout {
 
 // ════════════════ Engine ════════════════
 
-/// v26 ペアテーブル: ソート済み Vec<u32> セル。delta で直接操作。
-#[cfg(all(feature = "v26", not(feature = "v27")))]
-struct PairEntry {
-    himo_a: usize,
-    himo_b: usize,
-    card_a: u32,
-    card_b: u32,
-    cells: Vec<Vec<u32>>,
-}
-
-#[cfg(all(feature = "v26", not(feature = "v27")))]
-struct PairTable {
-    pairs: Vec<PairEntry>,
-}
-
-#[cfg(all(feature = "v26", not(feature = "v27")))]
-impl PairTable {
-    fn new() -> Self {
-        Self { pairs: vec![] }
-    }
-
-    /// 条件リストから最小候補のペアを引く。
-    fn best_lookup<'a>(&'a self, conds: &[(usize, u32)]) -> Option<(&'a [u32], Vec<(usize, u32)>)> {
-        if conds.len() < 2 { return None; }
-        let mut best: Option<(&[u32], Vec<(usize, u32)>)> = None;
-        let mut best_len = usize::MAX;
-
-        for pair in &self.pairs {
-            let mut va = None;
-            let mut vb = None;
-            for &(idx, val) in conds {
-                if idx == pair.himo_a { va = Some(val); }
-                if idx == pair.himo_b { vb = Some(val); }
-            }
-            if let (Some(a), Some(b)) = (va, vb) {
-                let cell_id = a as usize * pair.card_b as usize + b as usize;
-                if cell_id < pair.cells.len() {
-                    let cell = &pair.cells[cell_id];
-                    if cell.is_empty() { continue; }
-                    if cell.len() < best_len {
-                        best_len = cell.len();
-                        let remaining: Vec<(usize, u32)> = conds.iter()
-                            .filter(|&&(idx, _)| idx != pair.himo_a && idx != pair.himo_b)
-                            .copied()
-                            .collect();
-                        best = Some((cell, remaining));
-                    }
-                }
-            }
-        }
-        best
-    }
-
-    /// delta 反映: セルに entity を追加
-    fn cell_add(&mut self, pair_idx: usize, cell_id: usize, eid: u32) {
-        let cell = &mut self.pairs[pair_idx].cells[cell_id];
-        match cell.binary_search(&eid) {
-            Ok(_) => {},
-            Err(pos) => cell.insert(pos, eid),
-        }
-    }
-
-    /// delta 反映: セルから entity を除去
-    fn cell_remove(&mut self, pair_idx: usize, cell_id: usize, eid: u32) {
-        let cell = &mut self.pairs[pair_idx].cells[cell_id];
-        if let Ok(pos) = cell.binary_search(&eid) {
-            cell.remove(pos);
-        }
-    }
-
-    /// delta 伝播: 紐の値が変わった時に該当セルを更新
-    fn apply_delta(&mut self, eid: u32, himo_idx: usize, old_val: u32, new_val: u32, other_values: &[(usize, u32)]) {
-        for pi in 0..self.pairs.len() {
-            let (is_a, other_himo) = if self.pairs[pi].himo_a == himo_idx {
-                (true, self.pairs[pi].himo_b)
-            } else if self.pairs[pi].himo_b == himo_idx {
-                (false, self.pairs[pi].himo_a)
-            } else {
-                continue;
-            };
-
-            let other_val = match other_values.iter().find(|&&(idx, _)| idx == other_himo) {
-                Some(&(_, v)) => v,
-                None => continue,
-            };
-
-            let card_b = self.pairs[pi].card_b;
-
-            let old_cell_id = if is_a {
-                old_val as usize * card_b as usize + other_val as usize
-            } else {
-                other_val as usize * card_b as usize + old_val as usize
-            };
-            if old_cell_id < self.pairs[pi].cells.len() {
-                self.cell_remove(pi, old_cell_id, eid);
-            }
-
-            let new_cell_id = if is_a {
-                new_val as usize * card_b as usize + other_val as usize
-            } else {
-                other_val as usize * card_b as usize + new_val as usize
-            };
-            if new_cell_id < self.pairs[pi].cells.len() {
-                self.cell_add(pi, new_cell_id, eid);
-            }
-        }
-    }
-}
-
-// ─── v27 PairTable (v26 のコピー) ───
-
-#[cfg(feature = "v27")]
 struct PairEntry {
     himo_a: usize,
     himo_b: usize,
@@ -693,14 +564,12 @@ struct PairEntry {
     cells: Vec<Vec<u32>>,
 }
 
-#[cfg(feature = "v27")]
 struct PairTable {
     pairs: Vec<PairEntry>,
 }
 
 // ─── v27 NTupleView (任意 n 次元の観測窓) ───
 
-#[cfg(feature = "v27")]
 struct NTupleEntry {
     himos: Vec<usize>,
     cards: Vec<u32>,
@@ -708,7 +577,6 @@ struct NTupleEntry {
     cells: Vec<Vec<u32>>,
 }
 
-#[cfg(feature = "v27")]
 impl NTupleEntry {
     fn cell_id_for(&self, values: &[u32]) -> Option<usize> {
         let mut id = 0usize;
@@ -736,12 +604,10 @@ impl NTupleEntry {
     }
 }
 
-#[cfg(feature = "v27")]
 struct NTupleTable {
     views: Vec<NTupleEntry>,
 }
 
-#[cfg(feature = "v27")]
 impl NTupleTable {
     fn new() -> Self { Self { views: vec![] } }
 
@@ -836,7 +702,6 @@ impl NTupleTable {
     }
 }
 
-#[cfg(feature = "v27")]
 impl PairTable {
     fn new() -> Self {
         Self { pairs: vec![] }
@@ -947,67 +812,47 @@ pub struct Engine {
     entities: EntitySet,
     contents: ContentStore,
     undo: UndoLog,
-    #[cfg(all(feature = "v26", not(feature = "v27")))]
-    pairs: PairTable,
-    #[cfg(feature = "v27")]
     pairs: std::sync::RwLock<PairTable>,
-    #[cfg(feature = "v27")]
     tuples: std::sync::RwLock<NTupleTable>,
     /// 非同期書き込みキュー。`create_concurrent` で有効化される。
-    #[cfg(feature = "v27")]
     write_queue: Option<std::sync::Arc<crate::write_queue::WriteQueue>>,
     /// consumer スレッドへの shutdown 通知。`Drop` で true に。
-    #[cfg(feature = "v27")]
     shutdown_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// consumer スレッドハンドル。Drop で join。
-    #[cfg(feature = "v27")]
     consumer_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     /// writer が push した累積件数。tie_async/untie_async/delete_async で +1。
-    #[cfg(feature = "v27")]
     push_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// consumer が apply 完了した累積件数。apply_count >= push_count が同期点。
-    #[cfg(feature = "v27")]
     apply_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// v28 WAL。`create_concurrent_with_wal` or `open_concurrent_with_wal` で有効化。
     /// Some なら tie_async/untie_async/delete_async は WAL append を先に実行する。
-    #[cfg(feature = "v27")]
     wal: Option<std::sync::Arc<crate::wal::Wal>>,
     /// 背景 fsync が最後に completed した LSN。
-    #[cfg(feature = "v27")]
     durable_lsn: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// v32: この Engine を所有する peer の id。分散時 eid の上位 32bit。
-    #[cfg(feature = "v32")]
     peer_id: std::sync::atomic::AtomicU32,
     /// v32: LWW 用に (eid, himo) → 最後の HLC を記録。
-    #[cfg(feature = "v32")]
     hlc_store: std::sync::Arc<crate::hlc_store::HlcStore>,
     /// v32 Phase C: 自 peer の ed25519 鍵ペア。None なら署名しない/検証もしない。
-    #[cfg(feature = "v32")]
     keypair: std::sync::RwLock<Option<std::sync::Arc<crate::keys::Keypair>>>,
     /// v32 Phase C: 他 peer の pubkey TOFU ストア。Syncer が verify に使う。
-    #[cfg(feature = "v32")]
     pubkeys: std::sync::Arc<crate::keys::PubkeyStore>,
     /// v32 Phase C: ACL(書き込み許可 peer の集合)。Syncer が enforce する。
-    #[cfg(feature = "v32")]
     acl: std::sync::Arc<crate::acl::Acl>,
     /// v32 エッジ用: true なら書き込み API が panic、sync 経由 (remote_*_apply) のみ受ける。
-    #[cfg(feature = "v32")]
     is_replica: std::sync::atomic::AtomicBool,
     /// 大容量 blob 用 store(画像/動画/モデル等)。`set_blob_store` で注入。
     /// 未設定なら `blob_store()` は None を返す。
     blob_store: std::sync::RwLock<Option<std::sync::Arc<dyn crate::blob_store::BlobStore>>>,
     /// changefeed: WAL に durable 化した record を listener に push する。
     /// consumer スレッドが背景 fsync 完了後に発火。
-    #[cfg(feature = "v32")]
     change_listeners: std::sync::Arc<std::sync::RwLock<Vec<std::sync::Arc<dyn crate::changefeed::ChangeListener>>>>,
     /// changefeed: 次に listener へ emit すべき WAL offset。
     /// add_change_listener 時に wal.head() に同期され、それ以降の commit のみが流れる。
-    #[cfg(feature = "v32")]
     change_emit_offset: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// v33: 受信した Vocab op の `(author_peer, remote_vid) → local_vid` mapping。
     /// Symbol 型 himo の Tie を受信した時に remote_vid を local_vid に変換して apply する。
     /// peer-local に保持(replica でも独立、open 時は空、受信で徐々に埋まる)。
-    #[cfg(feature = "v33")]
     peer_vocab_map: std::sync::RwLock<std::collections::HashMap<(crate::PeerId, u32), u32>>,
     backing: Backing, // 最後に drop されるよう最終フィールド
 }
@@ -1022,14 +867,9 @@ impl Engine {
         Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)
     }
 
-    #[cfg(all(not(target_arch = "wasm32"), not(feature = "v33")))]
-    pub fn create(path: &str) -> io::Result<Self> {
-        Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)
-    }
-
-    /// v33: `create` は WAL 有効 + `Arc<Self>` 返しに統合。
+    /// `create` は WAL 有効 + `Arc<Self>` 返し。
     /// 旧挙動は `create_standalone` で取れる。
-    #[cfg(all(not(target_arch = "wasm32"), feature = "v33"))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn create(path: &str) -> io::Result<std::sync::Arc<Self>> {
         Self::create_concurrent_with_wal(path, 16 * 1024 * 1024)
     }
@@ -1132,46 +972,26 @@ impl Engine {
             himo_names: Vec::new(),
             himo_types: Vec::new(), himo_max_values: Vec::new(),
             himos: Vec::new(), entities, contents, undo,
-            #[cfg(all(feature = "v26", not(feature = "v27")))]
-            pairs: PairTable::new(),
-            #[cfg(feature = "v27")]
             pairs: std::sync::RwLock::new(PairTable::new()),
-            #[cfg(feature = "v27")]
             tuples: std::sync::RwLock::new(NTupleTable::new()),
-            #[cfg(feature = "v27")]
             write_queue: None,
-            #[cfg(feature = "v27")]
             shutdown_flag: None,
-            #[cfg(feature = "v27")]
             consumer_handle: std::sync::Mutex::new(None),
-            #[cfg(feature = "v27")]
             push_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            #[cfg(feature = "v27")]
             apply_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            #[cfg(feature = "v27")]
             wal: None,
-            #[cfg(feature = "v27")]
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            #[cfg(feature = "v32")]
             peer_id: std::sync::atomic::AtomicU32::new(0),
-            #[cfg(feature = "v32")]
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
-            #[cfg(feature = "v32")]
             keypair: std::sync::RwLock::new(None),
-            #[cfg(feature = "v32")]
             pubkeys: std::sync::Arc::new(crate::keys::PubkeyStore::new()),
-            #[cfg(feature = "v32")]
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
-            #[cfg(feature = "v32")]
             is_replica: std::sync::atomic::AtomicBool::new(false),
             blob_store: std::sync::RwLock::new(None),
-            #[cfg(feature = "v32")]
             change_listeners: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
-            #[cfg(feature = "v32")]
             change_emit_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::wal::HEADER_SIZE as u64,
             )),
-            #[cfg(feature = "v33")]
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             backing: Backing::Mmap(mmap),
         })
@@ -1381,46 +1201,26 @@ impl Engine {
             entities,
             contents,
             undo,
-            #[cfg(all(feature = "v26", not(feature = "v27")))]
-            pairs: PairTable::new(),
-            #[cfg(feature = "v27")]
             pairs: std::sync::RwLock::new(PairTable::new()),
-            #[cfg(feature = "v27")]
             tuples: std::sync::RwLock::new(NTupleTable::new()),
-            #[cfg(feature = "v27")]
             write_queue: None,
-            #[cfg(feature = "v27")]
             shutdown_flag: None,
-            #[cfg(feature = "v27")]
             consumer_handle: std::sync::Mutex::new(None),
-            #[cfg(feature = "v27")]
             push_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            #[cfg(feature = "v27")]
             apply_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            #[cfg(feature = "v27")]
             wal: None,
-            #[cfg(feature = "v27")]
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            #[cfg(feature = "v32")]
             peer_id: std::sync::atomic::AtomicU32::new(0),
-            #[cfg(feature = "v32")]
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
-            #[cfg(feature = "v32")]
             keypair: std::sync::RwLock::new(None),
-            #[cfg(feature = "v32")]
             pubkeys: std::sync::Arc::new(crate::keys::PubkeyStore::new()),
-            #[cfg(feature = "v32")]
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
-            #[cfg(feature = "v32")]
             is_replica: std::sync::atomic::AtomicBool::new(false),
             blob_store: std::sync::RwLock::new(None),
-            #[cfg(feature = "v32")]
             change_listeners: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
-            #[cfg(feature = "v32")]
             change_emit_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::wal::HEADER_SIZE as u64,
             )),
-            #[cfg(feature = "v33")]
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             backing: Backing::Growable(map),
         })
@@ -1435,14 +1235,9 @@ impl Engine {
         Self::open_internal(path, /*verify_region_crc=*/ true)
     }
 
-    #[cfg(all(not(target_arch = "wasm32"), not(feature = "v33")))]
-    pub fn open(path: &str) -> io::Result<Self> {
-        Self::open_internal(path, /*verify_region_crc=*/ true)
-    }
-
-    /// v33: `open` は WAL 有効 + `Arc<Self>` 返しに統合。
+    /// `open` は WAL 有効 + `Arc<Self>` 返し。
     /// 旧挙動は `open_standalone` で取れる。
-    #[cfg(all(not(target_arch = "wasm32"), feature = "v33"))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open(path: &str) -> io::Result<std::sync::Arc<Self>> {
         Self::open_concurrent_with_wal(path, 16 * 1024 * 1024)
     }
@@ -1719,14 +1514,6 @@ impl Engine {
             let name = String::from_utf8_lossy(name_bytes).to_string();
             let effective_mv = mv.min(cyl_max_values);
 
-            #[cfg(not(feature = "v27"))]
-            let hs = HimoStore::load(
-                unsafe { Region::new(base.add(layout.himo_col_off(hid)), layout.himo_col_size) },
-                unsafe { Region::new(base.add(layout.himo_cyl_a_off(hid)), layout.himo_cyl_size) },
-                unsafe { Region::new(base.add(layout.himo_cyl_b_off(hid)), layout.himo_cyl_size) },
-                ht, effective_mv,
-            );
-            #[cfg(feature = "v27")]
             let hs = HimoStore::load(
                 unsafe { Region::new(base.add(layout.himo_col_off(hid)), layout.himo_col_size) },
                 ht, effective_mv,
@@ -1743,52 +1530,31 @@ impl Engine {
             vocab, himo_reg,
             himo_names, himo_types, himo_max_values,
             himos, entities, contents, undo,
-            #[cfg(all(feature = "v26", not(feature = "v27")))]
-            pairs: PairTable::new(),
-            #[cfg(feature = "v27")]
             pairs: std::sync::RwLock::new(PairTable::new()),
-            #[cfg(feature = "v27")]
             tuples: std::sync::RwLock::new(NTupleTable::new()),
-            #[cfg(feature = "v27")]
             write_queue: None,
-            #[cfg(feature = "v27")]
             shutdown_flag: None,
-            #[cfg(feature = "v27")]
             consumer_handle: std::sync::Mutex::new(None),
-            #[cfg(feature = "v27")]
             push_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            #[cfg(feature = "v27")]
             apply_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            #[cfg(feature = "v27")]
             wal: None,
-            #[cfg(feature = "v27")]
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            #[cfg(feature = "v32")]
             peer_id: std::sync::atomic::AtomicU32::new(0),
-            #[cfg(feature = "v32")]
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
-            #[cfg(feature = "v32")]
             keypair: std::sync::RwLock::new(None),
-            #[cfg(feature = "v32")]
             pubkeys: std::sync::Arc::new(crate::keys::PubkeyStore::new()),
-            #[cfg(feature = "v32")]
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
-            #[cfg(feature = "v32")]
             is_replica: std::sync::atomic::AtomicBool::new(false),
             blob_store: std::sync::RwLock::new(None),
-            #[cfg(feature = "v32")]
             change_listeners: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
-            #[cfg(feature = "v32")]
             change_emit_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::wal::HEADER_SIZE as u64,
             )),
-            #[cfg(feature = "v33")]
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             backing,
         };
 
         // v32: header から peer_id を復元
-        #[cfg(feature = "v32")]
         {
             let hdr = eng.backing.header_mut();
             let peer = u32::from_le_bytes(hdr[H_PEER_ID..H_PEER_ID + 4].try_into().unwrap());
@@ -1800,7 +1566,6 @@ impl Engine {
         }
         eng.rebuild();
 
-        #[cfg(feature = "v27")]
         {
             eng.rebuild_pairs();
             eng.restore_persisted_views()?;
@@ -1815,7 +1580,6 @@ impl Engine {
     /// 書き込み API (tie / untie / delete / content / entity 等) は panic する。
     /// Syncer 経由 (remote_*_apply) での書き込みのみ受け付ける。
     /// エッジ node はこちらで起動する。
-    #[cfg(feature = "v32")]
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_replica(path: &str) -> io::Result<Self> {
         let eng = Self::open_standalone(path)?;
@@ -1824,8 +1588,6 @@ impl Engine {
     }
 
     /// WAL + 並行 write queue 付きで replica open。通常の Engine と同じく Arc 共有可能。
-    #[cfg(feature = "v32")]
-    #[cfg(feature = "v27")]
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_concurrent_replica(path: &str, wal_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
         let eng = Self::open_concurrent_with_wal(path, wal_capacity)?;
@@ -1835,19 +1597,16 @@ impl Engine {
 
     /// replica モードの動的切替。true にすると書き込み API が panic する。
     /// false に戻せば通常 DB として書き込み可能に復帰する。
-    #[cfg(feature = "v32")]
     pub fn set_replica_mode(&self, on: bool) {
         self.is_replica.store(on, std::sync::atomic::Ordering::Release);
     }
 
     /// 現在 replica モードか。
-    #[cfg(feature = "v32")]
     pub fn is_replica(&self) -> bool {
         self.is_replica.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// 書き込み API が呼ばれた時の guard。replica なら panic。
-    #[cfg(feature = "v32")]
     #[inline(always)]
     fn check_writable(&self) {
         if self.is_replica.load(std::sync::atomic::Ordering::Acquire) {
@@ -1855,43 +1614,25 @@ impl Engine {
         }
     }
 
-    /// v32 無効時は no-op。
-    #[cfg(not(feature = "v32"))]
-    #[inline(always)]
-    fn check_writable(&self) {}
-
     // ──── entity ────
 
     pub fn entity(&self) -> crate::EntityId {
         self.check_writable();
         let local = self.entities.allocate();
         self.undo.record(local, 0xFFFF, &[1, 0, 0, 0]); // entity created
-        #[cfg(feature = "v32")]
-        {
-            let peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
-            crate::make_eid(peer, local)
-        }
-        #[cfg(not(feature = "v32"))]
-        {
-            local as crate::EntityId
-        }
+        let peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
+        crate::make_eid(peer, local)
     }
 
     pub fn entities(&self) -> Vec<crate::EntityId> {
-        #[cfg(feature = "v32")]
         let peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
-        #[cfg(not(feature = "v32"))]
-        let peer: u32 = 0;
         self.entities.iter().into_iter()
             .map(|local| crate::make_eid(peer, local))
             .collect()
     }
     pub fn entity_count(&self) -> u32 { self.entities.count() }
     pub fn next_eid(&self) -> crate::EntityId {
-        #[cfg(feature = "v32")]
         let peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
-        #[cfg(not(feature = "v32"))]
-        let peer: u32 = 0;
         crate::make_eid(peer, self.entities.next_eid())
     }
 
@@ -1899,35 +1640,29 @@ impl Engine {
 
     /// この Engine を所有する peer の id を設定。WAL / DB header にも反映される。
     /// 起動時に 1 回だけ呼ぶ想定。
-    #[cfg(feature = "v32")]
     pub fn set_peer_id(&self, peer: crate::PeerId) {
         self.peer_id.store(peer, std::sync::atomic::Ordering::Release);
         // mmap の header に即書き込み(CRC 保護外なので再計算不要)
         self.backing.header_mut()[H_PEER_ID..H_PEER_ID + 4]
             .copy_from_slice(&peer.to_le_bytes());
-        #[cfg(feature = "v27")]
         if let Some(wal) = self.wal.as_ref() {
             wal.set_peer_id(peer);
         }
     }
 
     /// 現在の peer id。
-    #[cfg(feature = "v32")]
     pub fn peer_id(&self) -> crate::PeerId {
         self.peer_id.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// LWW 用 HlcStore への参照(sync モジュールが使う)。
-    #[cfg(feature = "v32")]
     pub fn hlc_store(&self) -> &std::sync::Arc<crate::hlc_store::HlcStore> {
         &self.hlc_store
     }
 
     /// Phase C: 自 peer の鍵ペアを設定。WAL にも反映される。None で署名 off。
-    #[cfg(feature = "v32")]
     pub fn set_keypair(&self, kp: Option<std::sync::Arc<crate::keys::Keypair>>) {
         *self.keypair.write().unwrap() = kp.clone();
-        #[cfg(feature = "v27")]
         if let Some(wal) = self.wal.as_ref() {
             wal.set_keypair(kp.clone());
         }
@@ -1938,25 +1673,21 @@ impl Engine {
     }
 
     /// Phase C: 他 peer の pubkey ストアへの参照。
-    #[cfg(feature = "v32")]
     pub fn pubkeys(&self) -> &std::sync::Arc<crate::keys::PubkeyStore> {
         &self.pubkeys
     }
 
     /// Phase C: ACL への参照。Syncer が受信 op の author を enforce する。
-    #[cfg(feature = "v32")]
     pub fn acl(&self) -> &std::sync::Arc<crate::acl::Acl> {
         &self.acl
     }
 
     /// Phase C: 自 peer の鍵ペアを返す。
-    #[cfg(feature = "v32")]
     pub fn keypair(&self) -> Option<std::sync::Arc<crate::keys::Keypair>> {
         self.keypair.read().unwrap().clone()
     }
 
     /// WAL への参照(sync モジュールが publish に使う)。
-    #[cfg(all(feature = "v27", feature = "v32"))]
     pub fn wal_arc(&self) -> Option<std::sync::Arc<crate::wal::Wal>> {
         self.wal.clone()
     }
@@ -1965,7 +1696,6 @@ impl Engine {
     // これらは LWW 判定を通った後の無条件 apply。HlcStore は Syncer が先に更新済み。
 
     /// リモート peer から届いた Tie を apply。WAL には書き戻さない(2 重送信防止)。
-    #[cfg(feature = "v32")]
     pub fn remote_tie_apply(&self, eid: crate::EntityId, himo_id: u16, value: u32) {
         let local = crate::eid_local(eid);
         let hid = himo_id as usize;
@@ -1976,7 +1706,6 @@ impl Engine {
     }
 
     /// リモート peer から届いた Untie を apply。
-    #[cfg(feature = "v32")]
     pub fn remote_untie_apply(&self, eid: crate::EntityId, himo_id: u16) {
         let local = crate::eid_local(eid);
         let hid = himo_id as usize;
@@ -1985,7 +1714,6 @@ impl Engine {
     }
 
     /// リモート peer から届いた Delete を apply。
-    #[cfg(feature = "v32")]
     pub fn remote_delete_apply(&self, eid: crate::EntityId) {
         let local = crate::eid_local(eid);
         for hid in 0..self.himos.len() {
@@ -1995,7 +1723,6 @@ impl Engine {
     }
 
     /// リモート peer から届いた Content 書き込みを apply。
-    #[cfg(feature = "v32")]
     pub fn remote_content_apply(&self, eid: crate::EntityId, key: &str, data: &[u8]) {
         let local = crate::eid_local(eid);
         self.entities.ensure_live(local);
@@ -2006,7 +1733,6 @@ impl Engine {
     /// `bytes` を local vocab に insert し、local_vid を取得して
     /// `(author_peer, remote_vid) → local_vid` の mapping を記録する。
     /// 後続の Tie { value: remote_vid } を受信したら `translate_remote_vid` で local_vid に変換。
-    #[cfg(feature = "v33")]
     pub fn remote_vocab_apply(&self, author_peer: crate::PeerId, remote_vid: u32, bytes: &[u8]) {
         let local_vid = self.vocab.get_or_insert(bytes);
         let mut map = self.peer_vocab_map.write().unwrap();
@@ -2015,7 +1741,6 @@ impl Engine {
 
     /// v33: Symbol 型 himo の Tie を受信した際、remote vid を local vid に変換する。
     /// Symbol 以外の himo、または mapping 未登録なら元値をそのまま返す。
-    #[cfg(feature = "v33")]
     pub fn translate_remote_vid(&self, author_peer: crate::PeerId, himo_id: u16, value: u32) -> u32 {
         let hid = himo_id as usize;
         if hid >= self.himo_types.len() { return value; }
@@ -2037,10 +1762,8 @@ impl Engine {
         let hid = self.ensure_himo(himo, HimoType::Symbol, 0);
         debug_assert_eq!(self.himo_types[hid], HimoType::Symbol, "tie_text on non-Symbol himo '{}'", himo);
         self.record_undo(eid, hid);
-        #[cfg(feature = "v27")]
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, vid);
-        #[cfg(feature = "v27")]
         self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), vid);
     }
 
@@ -2051,10 +1774,8 @@ impl Engine {
         let hid = self.ensure_himo(himo, HimoType::Value, 0);
         debug_assert!(self.himo_types[hid] == HimoType::Value || self.himo_types[hid] == HimoType::Ref, "tie on non-Value himo '{}'", himo);
         self.record_undo(eid, hid);
-        #[cfg(feature = "v27")]
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, value);
-        #[cfg(feature = "v27")]
         self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), value);
     }
 
@@ -2066,10 +1787,8 @@ impl Engine {
         let hid = self.ensure_himo(himo, HimoType::Ref, 0);
         debug_assert!(self.himo_types[hid] == HimoType::Ref || self.himo_types[hid] == HimoType::Value, "tie_ref on non-Ref himo '{}'", himo);
         self.record_undo(eid, hid);
-        #[cfg(feature = "v27")]
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, target_eid);
-        #[cfg(feature = "v27")]
         self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), target_eid);
     }
 
@@ -2085,10 +1804,8 @@ impl Engine {
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
         debug_assert_eq!(self.himo_types[hid], HimoType::Symbol, "tie_text_to on non-Symbol himo '{}'", himo);
         self.record_undo(eid, hid);
-        #[cfg(feature = "v27")]
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, vid);
-        #[cfg(feature = "v27")]
         self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), vid);
     }
 
@@ -2101,10 +1818,8 @@ impl Engine {
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
         debug_assert!(self.himo_types[hid] == HimoType::Value || self.himo_types[hid] == HimoType::Ref, "tie_to on non-Value himo '{}'", himo);
         self.record_undo(eid, hid);
-        #[cfg(feature = "v27")]
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, value);
-        #[cfg(feature = "v27")]
         self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), value);
     }
 
@@ -2118,10 +1833,8 @@ impl Engine {
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
         debug_assert!(self.himo_types[hid] == HimoType::Ref || self.himo_types[hid] == HimoType::Value, "tie_ref_to on non-Ref himo '{}'", himo);
         self.record_undo(eid, hid);
-        #[cfg(feature = "v27")]
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, target_eid);
-        #[cfg(feature = "v27")]
         self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), target_eid);
     }
 
@@ -2132,10 +1845,8 @@ impl Engine {
         let eid = crate::eid_local(eid);
         if let Some(hid) = self.himo_id(himo) {
             self.record_undo(eid, hid);
-            #[cfg(feature = "v27")]
             let old_val = self.himos[hid].get_value(eid);
             self.himos[hid].remove(eid);
-            #[cfg(feature = "v27")]
             if let Some(ov) = old_val {
                 self.apply_pair_delta_internal(eid, hid, ov, u32::MAX);
             }
@@ -2150,10 +1861,8 @@ impl Engine {
         self.undo.record(eid, 0xFFFF, &[2, 0, 0, 0]); // entity deleted
         for hid in 0..self.himos.len() {
             self.record_undo(eid, hid);
-            #[cfg(feature = "v27")]
             let old_val = self.himos[hid].get_value(eid);
             self.himos[hid].remove(eid);
-            #[cfg(feature = "v27")]
             if let Some(ov) = old_val {
                 self.apply_pair_delta_internal(eid, hid, ov, u32::MAX);
             }
@@ -2168,7 +1877,6 @@ impl Engine {
     /// 片方だけ呼ぶと状態が割れる現状 (BUGS.md 層 2) を解消。
     pub fn commit(&self) {
         self.undo.commit();
-        #[cfg(all(feature = "v33", feature = "v27"))]
         if let Some(wal) = self.wal.as_ref() {
             let _ = wal.append(crate::wal::WalOp::Commit);
         }
@@ -2228,7 +1936,6 @@ impl Engine {
     ///
     /// 初回 listener 追加時に emit cursor を現在の `wal.head()` に揃えるので、
     /// 過去の commit は流れない(必要なら `audit()` で取得して resume すること)。
-    #[cfg(feature = "v32")]
     pub fn add_change_listener(
         &self,
         listener: std::sync::Arc<dyn crate::changefeed::ChangeListener>,
@@ -2241,7 +1948,6 @@ impl Engine {
         };
         // 初回登録時は cursor を現在の wal.head() に揃える(過去 record を流さない)
         if was_empty {
-            #[cfg(feature = "v27")]
             if let Some(wal) = self.wal.as_ref() {
                 self.change_emit_offset
                     .store(wal.head(), std::sync::atomic::Ordering::Release);
@@ -2250,7 +1956,6 @@ impl Engine {
     }
 
     /// 登録済み listener 数(テスト/監視用)。
-    #[cfg(feature = "v32")]
     pub fn change_listener_count(&self) -> usize {
         self.change_listeners.read().unwrap().len()
     }
@@ -2489,17 +2194,8 @@ impl Engine {
         let hs = &self.himos[idx];
         let mut result = Vec::new();
         for v in min..=max {
-            #[cfg(feature = "v27")]
-            {
-                for local in &hs.pull(v) {
-                    result.push(*local as crate::EntityId);
-                }
-            }
-            #[cfg(not(feature = "v27"))]
-            {
-                for local in hs.pull(v) {
-                    result.push(*local as crate::EntityId);
-                }
+            for local in &hs.pull(v) {
+                result.push(*local as crate::EntityId);
             }
         }
         result
@@ -2564,39 +2260,10 @@ impl Engine {
     pub fn find_value(&self, himo: &str, text: &str) -> Option<u32> {
         let hid = self.himo_id(himo)?;
         let text_bytes = text.as_bytes();
-        #[cfg(not(feature = "v27"))]
-        let vals = {
-            let cyl = self.himos[hid].cylinder();
-            let n = cyl.total();
-            if n == 0 {
-                let delta = self.himos[hid].delta_eids();
-                for &eid in delta {
-                    if let Some(vid) = self.himos[hid].get_value(eid) {
-                        if self.vocab.get(vid) == text_bytes {
-                            return Some(vid);
-                        }
-                    }
-                }
-                return None;
-            }
-            cyl.unique_values(n)
-        };
-        #[cfg(feature = "v27")]
         let vals = self.himos[hid].unique_values();
         for vid in vals {
             if self.vocab.get(vid) == text_bytes {
                 return Some(vid);
-            }
-        }
-        #[cfg(not(feature = "v27"))]
-        {
-            let delta = self.himos[hid].delta_eids();
-            for &eid in delta {
-                if let Some(vid) = self.himos[hid].get_value(eid) {
-                    if self.vocab.get(vid) == text_bytes {
-                        return Some(vid);
-                    }
-                }
             }
         }
         None
@@ -2639,7 +2306,6 @@ impl Engine {
     /// v27 の BucketCylinder は tie/untie/remove 時に AtomicU32 を増減させる。
     /// `define_himo` の `max_values` はヒントに過ぎないので、ここで返るのは
     /// 実データ上の cardinality。
-    #[cfg(feature = "v27")]
     pub fn himo_cardinality(&self, himo: &str) -> Option<u32> {
         let idx = self.himo_id(himo)?;
         Some(self.himos[idx].unique_count())
@@ -2652,65 +2318,8 @@ impl Engine {
         for ds in &self.himos { ds.rebuild_cylinder(); }
     }
 
-    /// v26: ペアテーブルを構築。全紐ペアの二次元テーブルをデルタシンクで事前計算。
+    /// ペアテーブルを構築。 全紐ペアの二次元テーブルをデルタシンクで事前計算。
     /// rebuild() の後に呼ぶ。
-    #[cfg(all(feature = "v26", not(feature = "v27")))]
-    pub fn rebuild_pairs(&mut self) {
-        let n_himos = self.himos.len();
-        let next_eid = self.entities.next_eid();
-        let mut pairs = Vec::new();
-
-        for a in 0..n_himos {
-            let card_a = if self.himo_max_values[a] > 0 {
-                self.himo_max_values[a] + 1
-            } else {
-                continue;
-            };
-            for b in (a + 1)..n_himos {
-                let card_b = if self.himo_max_values[b] > 0 {
-                    self.himo_max_values[b] + 1
-                } else {
-                    continue;
-                };
-
-                let cell_count = card_a as u64 * card_b as u64;
-                if cell_count > 1_000_000 { continue; }
-
-                let table_size = cell_count as usize;
-                let mut raw: Vec<Vec<u32>> = vec![vec![]; table_size];
-
-                for eid in 0..next_eid {
-                    if !self.entities.is_live(eid) { continue; }
-                    let va = match self.himos[a].get_value(eid) {
-                        Some(v) if v < card_a => v,
-                        _ => continue,
-                    };
-                    let vb = match self.himos[b].get_value(eid) {
-                        Some(v) if v < card_b => v,
-                        _ => continue,
-                    };
-                    raw[va as usize * card_b as usize + vb as usize].push(eid);
-                }
-
-                pairs.push(PairEntry { himo_a: a, himo_b: b, card_a, card_b, cells: raw });
-            }
-        }
-
-        self.pairs = PairTable { pairs };
-    }
-
-    /// v26: delta 伝播 — 紐の値が変わった時にペアテーブルに反映。
-    #[cfg(all(feature = "v26", not(feature = "v27")))]
-    pub fn apply_pair_delta(&mut self, eid: u32, himo_idx: usize, old_val: u32, new_val: u32) {
-        let other_values: Vec<(usize, u32)> = (0..self.himos.len())
-            .filter(|&i| i != himo_idx)
-            .filter_map(|i| self.himos[i].get_value(eid).map(|v| (i, v)))
-            .collect();
-        self.pairs.apply_delta(eid, himo_idx, old_val, new_val, &other_values);
-    }
-
-    /// v27: ペアテーブルを構築。v26 のコピー。
-    #[cfg(feature = "v27")]
     pub fn rebuild_pairs(&mut self) {
         let n_himos = self.himos.len();
         let next_eid = self.entities.next_eid();
@@ -2756,7 +2365,6 @@ impl Engine {
     }
 
     /// v27: delta 伝播 — 紐の値が変わった時にペアテーブルに反映。
-    #[cfg(feature = "v27")]
     pub fn apply_pair_delta(&mut self, eid: u32, himo_idx: usize, old_val: u32, new_val: u32) {
         let other_values: Vec<(usize, u32)> = (0..self.himos.len())
             .filter(|&i| i != himo_idx)
@@ -2772,7 +2380,6 @@ impl Engine {
     /// 並行 reader の間で、cell(Vec) への insert/remove が torn read にならない
     /// ように write lock 下で排他する。reader 側 (best_lookup) は read lock で
     /// cell を clone してから返す。
-    #[cfg(feature = "v27")]
     fn apply_pair_delta_internal(&self, eid: u32, himo_idx: usize, old_val: u32, new_val: u32) {
         let other_values: Vec<(usize, u32)> = (0..self.himos.len())
             .filter(|&i| i != himo_idx)
@@ -2792,7 +2399,6 @@ impl Engine {
     ///
     /// 各紐は define_himo 済み + max_values > 0 必須。セル数が 100万超ならエラー。
     /// view 数上限 32、1 view あたり紐数上限 8(ヘッダ固定長制約)。
-    #[cfg(feature = "v27")]
     pub fn define_view(&mut self, himos: &[&str]) -> Result<(), String> {
         if himos.len() < 2 {
             return Err("view requires at least 2 himos".into());
@@ -2832,7 +2438,6 @@ impl Engine {
     }
 
     /// idxs から NTupleEntry を組み立てて tuples.views に push。永続化は呼び元。
-    #[cfg(feature = "v27")]
     fn build_and_push_view(&mut self, idxs: &[usize]) -> Result<(), String> {
         let mut cards: Vec<u32> = Vec::with_capacity(idxs.len());
         for &idx in idxs {
@@ -2901,7 +2506,6 @@ impl Engine {
     }
 
     /// ヘッダに 1 view レコードを append(H_VIEW_COUNT を +1)。
-    #[cfg(feature = "v27")]
     fn persist_view_record(&mut self, idxs: &[usize]) {
         let buf = self.backing.as_slice_mut();
         let count = u32::from_le_bytes(buf[H_VIEW_COUNT..H_VIEW_COUNT + 4].try_into().unwrap());
@@ -2922,7 +2526,6 @@ impl Engine {
     }
 
     /// open 時: ヘッダから view を読み出して NTupleEntry を再構築。
-    #[cfg(feature = "v27")]
     fn restore_persisted_views(&mut self) -> Result<(), String> {
         let buf = self.backing.as_slice_mut();
         let count = u32::from_le_bytes(buf[H_VIEW_COUNT..H_VIEW_COUNT + 4].try_into().unwrap()) as usize;
@@ -2956,24 +2559,7 @@ impl Engine {
         Ok(())
     }
 
-    /// 引く。v32 で EntityId(u64) の Vec を返す形に統一。
-    /// 将来の u64 local eid / peer 跨ぎ対応のため、常にコピー。
-    #[cfg(not(feature = "v27"))]
-    pub fn pull_raw(&self, himo: &str, value: u32) -> Vec<crate::EntityId> {
-        match self.himo_id(himo) {
-            Some(idx) => {
-                let hs = &self.himos[idx];
-                if hs.delta_needs_rebuild() {
-                    hs.rebuild_cylinder();
-                }
-                hs.cylinder().slice_one(value).iter().map(|&e| e as crate::EntityId).collect()
-            }
-            None => Vec::new(),
-        }
-    }
-
-    /// v27 版: EntityId の Vec を返す(内部 u32 から u64 に昇格)。
-    #[cfg(feature = "v27")]
+    /// 引く。 EntityId(u64) の Vec を返す。
     pub fn pull_raw(&self, himo: &str, value: u32) -> Vec<crate::EntityId> {
         match self.himo_id(himo) {
             Some(idx) => self.himos[idx].pull(value).into_iter().map(|e| e as crate::EntityId).collect(),
@@ -2981,31 +2567,7 @@ impl Engine {
         }
     }
 
-    /// 引く（delta 補正付き、Vec を返す）。
-    #[cfg(not(feature = "v27"))]
-    pub fn pull(&self, himo: &str, value: u32) -> Vec<u32> {
-        let idx = match self.himo_id(himo) {
-            Some(idx) => idx,
-            None => return vec![],
-        };
-        let hs = &self.himos[idx];
-
-        if hs.delta_needs_rebuild() {
-            hs.rebuild_cylinder();
-        }
-
-        if hs.delta_is_empty() {
-            return hs.cylinder().slice_one(value).to_vec();
-        }
-
-        // Cylinder 結果 + delta 補正
-        let cyl_result = hs.cylinder().slice_one(value);
-        let delta = hs.delta_eids();
-        self.apply_delta(idx, value, cyl_result, delta)
-    }
-
-    /// v27 版: delta なし。HimoStore::pull (RwLock + clone) 直。
-    #[cfg(feature = "v27")]
+    /// 引く。 HimoStore::pull (RwLock + clone) 直。
     pub fn pull(&self, himo: &str, value: u32) -> Vec<u32> {
         match self.himo_id(himo) {
             Some(idx) => self.himos[idx].pull(value),
@@ -3032,24 +2594,8 @@ impl Engine {
     fn pull_in_by_idx(&self, idx: usize, values: &[u32]) -> Vec<crate::EntityId> {
         if values.is_empty() { return Vec::new(); }
         let mut out: Vec<u32> = Vec::new();
-        #[cfg(feature = "v27")]
-        {
-            for &v in values {
-                out.extend(self.himos[idx].pull(v));
-            }
-        }
-        #[cfg(not(feature = "v27"))]
-        {
-            let hs = &self.himos[idx];
-            if hs.delta_needs_rebuild() { hs.rebuild_cylinder(); }
-            for &v in values {
-                let cyl = hs.cylinder().slice_one(v);
-                if hs.delta_is_empty() {
-                    out.extend(cyl.iter().copied());
-                } else {
-                    out.extend(self.apply_delta(idx, v, cyl, hs.delta_eids()));
-                }
-            }
+        for &v in values {
+            out.extend(self.himos[idx].pull(v));
         }
         out.sort_unstable();
         out.dedup();
@@ -3130,34 +2676,18 @@ impl Engine {
 
         if conds.len() == 1 {
             let (idx, val) = conds[0];
-            let hs = &self.himos[idx];
-            #[cfg(not(feature = "v27"))]
-            {
-                let cyl_result = hs.cylinder().slice_one(val);
-                if hs.delta_is_empty() {
-                    return cyl_result.to_vec();
-                }
-                return self.apply_delta(idx, val, cyl_result, hs.delta_eids());
-            }
-            #[cfg(feature = "v27")]
-            {
-                return hs.pull(val);
-            }
+            return self.himos[idx].pull(val);
         }
 
         // 最小 Cylinder スライスのサイズを調べる(実体は下の戦略選択で必要)
         let mut min_slice_len = usize::MAX;
-        for (_, &(idx, val)) in conds.iter().enumerate() {
-            #[cfg(not(feature = "v27"))]
-            let len = self.himos[idx].cylinder().slice_one(val).len();
-            #[cfg(feature = "v27")]
+        for &(idx, val) in conds.iter() {
             let len = self.himos[idx].slice_len(val);
             if len < min_slice_len { min_slice_len = len; }
         }
 
         // v27: 観測窓(n-tuple)とペアテーブル、最小 Cylinder スライスを比べて最小候補を選ぶ。
         // read lock を iterate+filter の間保持して torn read を防ぐ(cell への insert/remove は write lock)。
-        #[cfg(feature = "v27")]
         {
             // 先に長さだけ測って最適経路を決定(どのロックも保持しない)。
             let (tuple_len, pair_len) = {
@@ -3191,30 +2721,6 @@ impl Engine {
             if pair_len <= min_slice_len {
                 let guard = self.pairs.read().unwrap();
                 if let Some((candidates, remaining)) = guard.best_lookup_ref(&conds) {
-                    if remaining.is_empty() {
-                        return candidates.to_vec();
-                    }
-                    let mut result = Vec::new();
-                    for &eid in candidates {
-                        let mut pass = true;
-                        for &(idx, val) in &remaining {
-                            if !self.himos[idx].value_eq(eid, val) {
-                                pass = false;
-                                break;
-                            }
-                        }
-                        if pass { result.push(eid); }
-                    }
-                    return result;
-                }
-            }
-        }
-
-        // v26 のみ: ペアテーブルで最小候補を O(1) ルックアップ
-        #[cfg(all(feature = "v26", not(feature = "v27")))]
-        {
-            if let Some((candidates, remaining)) = self.pairs.best_lookup(&conds) {
-                if candidates.len() <= min_slice_len {
                     if remaining.is_empty() {
                         return candidates.to_vec();
                     }
@@ -3281,9 +2787,6 @@ impl Engine {
         let mut best = 0;
         let mut best_len = usize::MAX;
         for (i, &(idx, val)) in conds.iter().enumerate() {
-            #[cfg(not(feature = "v27"))]
-            let len = self.himos[idx].cylinder().slice_one(val).len();
-            #[cfg(feature = "v27")]
             let len = self.himos[idx].slice_len(val);
             if len < best_len { best_len = len; best = i; }
         }
@@ -3291,17 +2794,6 @@ impl Engine {
         let (pivot_idx, pivot_val) = conds[best];
         let hs = &self.himos[pivot_idx];
 
-        // pivot の候補を delta 補正して取得
-        #[cfg(not(feature = "v27"))]
-        let candidates = {
-            let cyl_result = hs.cylinder().slice_one(pivot_val);
-            if hs.delta_is_empty() {
-                cyl_result.to_vec()
-            } else {
-                self.apply_delta(pivot_idx, pivot_val, cyl_result, hs.delta_eids())
-            }
-        };
-        #[cfg(feature = "v27")]
         let candidates = hs.pull(pivot_val);
 
         // 残りの条件を Column 直読みでフィルタ（Column は常に最新）
@@ -3355,18 +2847,6 @@ impl Engine {
             unsafe { Region::new(base.add(off), size) }
         };
 
-        #[cfg(not(feature = "v27"))]
-        let hs = {
-            let cyl_a_off = self.layout.himo_cyl_a_off(hid);
-            let cyl_b_off = self.layout.himo_cyl_b_off(hid);
-            HimoStore::init(
-                make_region(col_off, self.layout.himo_col_size),
-                make_region(cyl_a_off, self.layout.himo_cyl_size),
-                make_region(cyl_b_off, self.layout.himo_cyl_size),
-                ht, effective_mv, self.max_entities,
-            )
-        };
-        #[cfg(feature = "v27")]
         let hs = HimoStore::init(
             make_region(col_off, self.layout.himo_col_size),
             ht, effective_mv, self.max_entities,
@@ -3388,7 +2868,6 @@ impl Engine {
         write_header_crc(self.backing.as_slice_mut());
 
         // v27: 新 himo と既存 himo のペアを空セルで登録。以降 tie で自動更新。
-        #[cfg(feature = "v27")]
         {
             if max_values > 0 {
                 let card_b = max_values + 1;
@@ -3428,7 +2907,7 @@ impl Engine {
     /// パターンを使う。
     ///
     /// WriteQueue は `SegQueue`(unbounded)。cap 指定は不要。
-    #[cfg(all(feature = "v27", not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn create_concurrent(path: &str) -> io::Result<std::sync::Arc<Self>> {
         let eng = Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)?;
         Ok(Self::spawn_consumer(eng))
@@ -3441,7 +2920,7 @@ impl Engine {
     /// consumer スレッドが背景で 100ms 毎に fsync + checkpoint。
     ///
     /// プロセス/OS クラッシュ時は open_concurrent_with_wal で最後の Commit まで復元される。
-    #[cfg(all(feature = "v27", not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn create_concurrent_with_wal(path: &str, wal_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
         let eng = Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)?;
         let wal_path = wal_path_for(path);
@@ -3452,7 +2931,7 @@ impl Engine {
     /// v28: WAL 付き open_concurrent。既存 WAL があればリカバリする。
     /// v29: region CRC は WAL ルートでは skip(WAL が source of truth)。
     /// 代わりに古い `.crc` ファイルは削除して、次回 flush で regenerate させる。
-    #[cfg(all(feature = "v27", not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open_concurrent_with_wal(path: &str, wal_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
         let mut eng = Self::open_internal(path, /*verify_region_crc=*/ false)?;
         // 古い .crc は WAL 活動後に stale になるので削除
@@ -3477,7 +2956,6 @@ impl Engine {
 
     /// WAL の 1 op を本体に適用(recover 専用)。
     /// v32: eid は u64 だが Column は local u32 で保持。eid_local() で剥がす。
-    #[cfg(feature = "v27")]
     fn apply_wal_op(&mut self, op: &crate::wal::DecodedOp) {
         use crate::wal::DecodedOp;
         match op {
@@ -3520,7 +2998,6 @@ impl Engine {
     ///
     /// 返り値の `Arc<Engine>` を各 writer/reader スレッドで clone して使う。
     /// Drop(最後の Arc が落ちた時)で consumer スレッドは join される。
-    #[cfg(feature = "v27")]
     pub fn concurrentize(eng: Self) -> std::sync::Arc<Self> {
         Self::spawn_consumer(eng)
     }
@@ -3531,7 +3008,7 @@ impl Engine {
     ///
     /// 既存 `.wal` ファイルがあれば recover してから consumer 起動。
     /// (build phase で flush 済みなら本体は最新、 WAL は空のまま start)
-    #[cfg(all(feature = "v27", not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn concurrentize_with_wal(mut eng: Self, wal_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
         let path = eng.path.clone();
         let wal_path = wal_path_for(&path);
@@ -3552,14 +3029,12 @@ impl Engine {
         Ok(Self::spawn_consumer_with_wal(eng, Some(wal)))
     }
 
-    #[cfg(feature = "v27")]
     fn spawn_consumer(eng: Self) -> std::sync::Arc<Self> {
         Self::spawn_consumer_with_wal(eng, None)
     }
 
     /// changefeed 内部ヘルパ: WAL から emit_offset 以降の record を取り出して
     /// 全 listener に渡し、cursor を進める。
-    #[cfg(feature = "v32")]
     fn fire_change_listeners(
         wal: &std::sync::Arc<crate::wal::Wal>,
         listeners: &std::sync::RwLock<
@@ -3587,7 +3062,6 @@ impl Engine {
         emit_offset.store(wal.head(), Ordering::Release);
     }
 
-    #[cfg(feature = "v27")]
     fn spawn_consumer_with_wal(
         mut eng: Self,
         wal: Option<std::sync::Arc<crate::wal::Wal>>,
@@ -3612,9 +3086,7 @@ impl Engine {
         let apply_count_for_thread = arc.apply_count.clone();
         let wal_for_thread = wal.clone();
         let durable_lsn_for_thread = arc.durable_lsn.clone();
-        #[cfg(feature = "v32")]
         let listeners_for_thread = arc.change_listeners.clone();
-        #[cfg(feature = "v32")]
         let emit_offset_for_thread = arc.change_emit_offset.clone();
 
         let handle = std::thread::Builder::new()
@@ -3650,7 +3122,6 @@ impl Engine {
                                 engine.undo.commit();
 
                                 // changefeed: durable 化した record を listener に push
-                                #[cfg(feature = "v32")]
                                 Self::fire_change_listeners(
                                     wal,
                                     &listeners_for_thread,
@@ -3661,18 +3132,11 @@ impl Engine {
                             // pending_writes == 0 のときだけ head/checkpoint を HEADER_SIZE に戻す。
                             // これで WAL 容量を食い切らずに長期運用できる。
                             // ※ auto_reset が発動して offset が後退したら listener cursor もリセット。
-                            #[cfg(feature = "v32")]
-                            {
-                                if wal.try_reset() {
-                                    emit_offset_for_thread.store(
-                                        crate::wal::HEADER_SIZE as u64,
-                                        Ordering::Release,
-                                    );
-                                }
-                            }
-                            #[cfg(not(feature = "v32"))]
-                            {
-                                wal.try_reset();
+                            if wal.try_reset() {
+                                emit_offset_for_thread.store(
+                                    crate::wal::HEADER_SIZE as u64,
+                                    Ordering::Release,
+                                );
                             }
                             last_fsync = Instant::now();
                         }
@@ -3691,7 +3155,6 @@ impl Engine {
                             wal.advance_checkpoint(wal.head());
                             engine.undo.commit();
                             // shutdown 時の最終 emit
-                            #[cfg(feature = "v32")]
                             Self::fire_change_listeners(
                                 wal,
                                 &listeners_for_thread,
@@ -3717,7 +3180,7 @@ impl Engine {
     }
 
     /// body mmap の msync(WAL 順序と絡むので &self で呼び出し可能)。
-    #[cfg(all(feature = "v27", not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn body_msync(&self) -> io::Result<()> {
         match &self.backing {
             Backing::Mmap(m) => m.flush(),
@@ -3726,12 +3189,11 @@ impl Engine {
         }
     }
 
-    #[cfg(all(feature = "v27", target_arch = "wasm32"))]
+    #[cfg(target_arch = "wasm32")]
     pub fn body_msync(&self) -> io::Result<()> { Ok(()) }
 
     /// 強制同期: Commit marker 挿入 → WAL fsync → body msync → checkpoint 前進。
     /// Sync mode 相当の待ち。undo も clear される。
-    #[cfg(feature = "v27")]
     pub fn wal_sync(&self) -> io::Result<()> {
         use std::sync::atomic::Ordering;
         self.flush_writes();
@@ -3745,7 +3207,6 @@ impl Engine {
             self.durable_lsn.store(lsn, Ordering::Release);
             // changefeed: durable 化したので listener へ即時 push
             // (consumer の 100ms tick を待たず caller スレッドで発火)
-            #[cfg(feature = "v32")]
             Self::fire_change_listeners(wal, &self.change_listeners, &self.change_emit_offset);
         }
         // undo も clear(transaction 確定)
@@ -3754,7 +3215,6 @@ impl Engine {
     }
 
     /// 現在耐久化されている LSN(Commit を含む最後の WAL fsync 到達位置)。
-    #[cfg(feature = "v27")]
     pub fn durable_lsn(&self) -> u64 {
         use std::sync::atomic::Ordering;
         self.durable_lsn.load(Ordering::Acquire)
@@ -3770,7 +3230,6 @@ impl Engine {
     ///
     /// 返る各 `RecoveredRecord` には lsn, hlc, author_peer, op, signature, pubkey_fp が入り、
     /// 「誰がいつ何を書いたか」をそのまま監査できる。
-    #[cfg(feature = "v27")]
     pub fn audit(&self, filter: &AuditFilter) -> Vec<crate::wal::RecoveredRecord> {
         let recs = match self.wal.as_ref() {
             Some(w) => w.iter_committed(),
@@ -3819,7 +3278,6 @@ impl Engine {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn snapshot_export(&self, target: &str) -> io::Result<SnapshotFiles> {
         // mmap ページを物理ディスクに確実に書き出す(v27 のみ)
-        #[cfg(feature = "v27")]
         self.body_msync()?;
 
         let mut files = SnapshotFiles {
@@ -3846,21 +3304,17 @@ impl Engine {
         Ok(files)
     }
 
-    #[cfg(feature = "v27")]
     pub fn stats(&self) -> EngineStats {
         use std::sync::atomic::Ordering;
         let (wal_head, wal_checkpoint, wal_capacity, wal_lsn) = match self.wal.as_ref() {
             Some(w) => (w.head(), w.checkpoint(), w.usage().1, w.next_lsn().saturating_sub(1)),
             None => (0, 0, 0, 0),
         };
-        #[cfg(feature = "v32")]
         let (peer_id, hlc_entries, max_hlc) = (
             self.peer_id.load(Ordering::Acquire),
             self.hlc_store.len(),
             self.hlc_store.max_hlc(),
         );
-        #[cfg(not(feature = "v32"))]
-        let (peer_id, hlc_entries, max_hlc) = (0u32, 0usize, None);
 
         EngineStats {
             entity_count: self.entities.count(),
@@ -3881,7 +3335,6 @@ impl Engine {
     }
 
     /// consumer スレッド内部で呼ぶ。Op 1 個を適用。
-    #[cfg(feature = "v27")]
     fn apply_op(&self, op: crate::write_queue::Op) {
         use crate::write_queue::Op;
         match op {
@@ -3923,7 +3376,6 @@ impl Engine {
     ///
     /// WAL が有効な場合: tie_async は WAL append (memcpy) → WriteQueue push の順で実行する。
     /// WAL append は `.wal` ファイルに memcpy 1 回、100ns オーダー。hot path で fsync しない。
-    #[cfg(feature = "v27")]
     pub fn tie_async(&self, eid: crate::EntityId, himo: &str, value: u32) {
         use std::sync::atomic::Ordering;
         self.check_writable();
@@ -3951,7 +3403,6 @@ impl Engine {
     /// 4. write_queue に Tie push で本体に apply
     ///
     /// `Engine::tie_text` の &self 版。`tie_async` と異なり text を sync 対象に乗せる。
-    #[cfg(feature = "v33")]
     pub fn tie_text_async(&self, eid: crate::EntityId, himo: &str, value: &str) {
         use std::sync::atomic::Ordering;
         self.check_writable();
@@ -3977,7 +3428,6 @@ impl Engine {
     /// peer_id 部は捨てる。すなわち receiver 側では「author_peer と同一 peer 上の entity」を
     /// 指す ref として再構成される。cross-peer ref (peer A が peer B の entity を指す)は
     /// 現状未対応 (Ref 用 WAL op を別途用意する必要あり、v34 以降)。
-    #[cfg(feature = "v33")]
     pub fn tie_ref_async(&self, eid: crate::EntityId, himo: &str, target_eid: crate::EntityId) {
         use std::sync::atomic::Ordering;
         self.check_writable();
@@ -4001,7 +3451,6 @@ impl Engine {
     }
 
     /// 非同期 untie。
-    #[cfg(feature = "v27")]
     pub fn untie_async(&self, eid: crate::EntityId, himo: &str) {
         use std::sync::atomic::Ordering;
         self.check_writable();
@@ -4017,7 +3466,6 @@ impl Engine {
     }
 
     /// 非同期 delete。
-    #[cfg(feature = "v27")]
     pub fn delete_async(&self, eid: crate::EntityId) {
         use std::sync::atomic::Ordering;
         self.check_writable();
@@ -4033,7 +3481,6 @@ impl Engine {
 
     /// 非同期 content 書き込み。WAL 有効時はクラッシュ後も復元される。
     /// key と data は Box に move される(消費される)。
-    #[cfg(feature = "v27")]
     pub fn content_async(&self, eid: crate::EntityId, key: &str, data: &[u8]) {
         use std::sync::atomic::Ordering;
         self.check_writable();
@@ -4056,7 +3503,6 @@ impl Engine {
     ///
     /// Async モードでは fsync は consumer スレッドが背景で行う。
     /// Sync モードでは commit 完了まで待つ。
-    #[cfg(feature = "v27")]
     pub fn wal_commit(&self) {
         if let Some(wal) = self.wal.as_ref() {
             let _ = wal.append(crate::wal::WalOp::Commit);
@@ -4067,13 +3513,11 @@ impl Engine {
     }
 
     /// WAL への参照(テスト / 内部用)。
-    #[cfg(feature = "v27")]
     pub fn wal(&self) -> Option<&std::sync::Arc<crate::wal::Wal>> { self.wal.as_ref() }
 
     /// push 済みの全 Op が apply 完了するまで spin 待ち。`tie_async` の同期点。
     /// `queue.is_empty()` は pop 直後 / apply 前のウィンドウで true になる race が
     /// あるため、push_count と apply_count の累積カウンタで apply 完了を待つ。
-    #[cfg(feature = "v27")]
     pub fn flush_writes(&self) {
         use std::sync::atomic::Ordering;
         if self.write_queue.is_none() { return; }
@@ -4086,7 +3530,6 @@ impl Engine {
     }
 
     /// キューに滞留中の件数(デバッグ用)。
-    #[cfg(feature = "v27")]
     pub fn pending_writes(&self) -> usize {
         self.write_queue.as_ref().map(|q| q.len()).unwrap_or(0)
     }
@@ -4129,7 +3572,6 @@ impl Engine {
     }
 }
 
-#[cfg(feature = "v27")]
 impl Drop for Engine {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
@@ -4575,13 +4017,9 @@ mod tests {
         let result = eng.pull_raw("ts", ts);
         assert_eq!(result, vec![e]);
 
-        // v24/v26 は Cylinder が max_values で clamp するため u32::MAX-2 も OK。
-        // v27 は silent clamp を廃止して動的拡張するので、u32::MAX-2 だと
-        // バケット 40 億本分の Vec を確保してしまう。ここでは代わりに
+        // v27 BucketCylinder は動的拡張するので、 u32::MAX-2 だと
+        // バケット 40 億本分の Vec を確保してしまう。 ここでは代わりに
         // 100 万オーダーの「大きめ値」で検証する。
-        #[cfg(not(feature = "v27"))]
-        let big = u32::MAX - 2;
-        #[cfg(feature = "v27")]
         let big = 1_000_000u32;
         let e2 = eng.entity();
         eng.tie(e2, "huge", big);
@@ -5395,7 +4833,6 @@ mod tests {
 
     // ──── v27: NTupleView (観測窓) ────
 
-    #[cfg(feature = "v27")]
     #[test]
     fn ntuple_view_register_and_query() {
         let dir = tmp("ntuple_basic");
@@ -5428,7 +4865,6 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
     }
 
-    #[cfg(feature = "v27")]
     #[test]
     fn ntuple_view_partial_match() {
         let dir = tmp("ntuple_partial");
@@ -5457,7 +4893,6 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
     }
 
-    #[cfg(feature = "v27")]
     #[test]
     fn ntuple_view_untie_propagates() {
         let dir = tmp("ntuple_untie");
@@ -5487,7 +4922,6 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
     }
 
-    #[cfg(feature = "v27")]
     #[test]
     fn ntuple_view_delete_propagates() {
         let dir = tmp("ntuple_delete");
@@ -5512,7 +4946,6 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
     }
 
-    #[cfg(feature = "v27")]
     #[test]
     fn ntuple_view_cell_overflow_rejected() {
         let dir = tmp("ntuple_overflow");
@@ -5527,7 +4960,6 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
     }
 
-    #[cfg(feature = "v27")]
     #[test]
     fn ntuple_view_requires_max_values() {
         let dir = tmp("ntuple_nomv");
@@ -5541,7 +4973,6 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
     }
 
-    #[cfg(feature = "v27")]
     #[test]
     fn ntuple_view_exact_match_vs_pair() {
         let dir = tmp("ntuple_exact");
@@ -5573,7 +5004,6 @@ mod tests {
 
     // ──── v27: 観測窓の永続化 ────
 
-    #[cfg(feature = "v27")]
     #[test]
     fn define_view_persists() {
         let dir = tmp("view_persist");
@@ -5615,7 +5045,6 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
     }
 
-    #[cfg(feature = "v27")]
     #[test]
     fn define_view_cell_count_error() {
         let dir = tmp("view_overflow");
@@ -5629,7 +5058,6 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
     }
 
-    #[cfg(feature = "v27")]
     #[test]
     fn multiple_views_persist() {
         let dir = tmp("view_multi");
@@ -5664,7 +5092,6 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
     }
 
-    #[cfg(feature = "v27")]
     #[test]
     fn concurrent_tie_async_basic() {
         // tie_async → flush_writes → pull_raw で値が見えること。
@@ -5688,7 +5115,6 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
     }
 
-    #[cfg(feature = "v27")]
     #[test]
     fn concurrent_multi_reader_writer() {
         use std::sync::atomic::{AtomicBool, Ordering};

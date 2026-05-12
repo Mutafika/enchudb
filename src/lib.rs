@@ -4,7 +4,7 @@
 //!
 //! - `enchudb::Engine` 等 — engine 層 (`enchudb-engine`)、 naked 紐 + 円柱
 //! - `enchudb::schema::*` — **native API** (`enchudb-schema`)、 仮想 2D テーブル + 永続化
-//! - `enchudb::sync::*` — p2p sync 層 (`enchudb-sync`、 `features = ["v32"]`)
+//! - `enchudb::sync::*` — p2p sync 層 (`enchudb-sync`)
 //! - `enchudb-sql` crate — SQLite-compat parser (`features = ["sql"]`、 別 crate として直接 dep)
 //!
 //! ## native API (推奨)
@@ -42,12 +42,13 @@
 pub use enchudb_engine::*;
 
 /// Native API (仮想 2D テーブル + 永続化)。 app 開発向けの primary path。
+/// disk-backed なので wasm32 では提供されない (engine API を直接使うこと)。
+#[cfg(not(target_arch = "wasm32"))]
 pub mod schema {
     pub use enchudb_schema::*;
 }
 
-/// v32: p2p sync 層 (`enchudb-sync`)。 `features = ["v32"]` で有効。
-#[cfg(feature = "v32")]
+/// p2p sync 層 (`enchudb-sync`)。
 pub mod sync {
     pub use enchudb_sync::*;
 }

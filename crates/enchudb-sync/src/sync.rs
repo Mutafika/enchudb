@@ -3,11 +3,10 @@
 //! # 使い方
 //!
 //! ```
-//! # #[cfg(feature = "v32")] {
 //! use std::sync::Arc;
 //! use enchudb_engine::Engine;
-//! use enchudb_engine::sync::Syncer;
 //! use enchudb_engine::transport::{InMemoryTransport, Transport};
+//! use enchudb_sync::Syncer;
 //!
 //! let path = format!("/tmp/enchudb-sync-doc-{}.db", std::process::id());
 //! let _ = std::fs::remove_file(&path);
@@ -21,7 +20,6 @@
 //! assert_eq!(out.received, 0);
 //! # let _ = std::fs::remove_file(&path);
 //! # let _ = std::fs::remove_file(format!("{}.wal", path));
-//! # }
 //! ```
 //!
 //! # LWW 規則
@@ -191,11 +189,8 @@ impl Syncer {
                 if !store.try_set(*eid, *himo_id, rec.hlc) {
                     return false;
                 }
-                // v33: Symbol 型 himo の場合、remote vocab の vid を local vid に変換
-                #[cfg(feature = "v33")]
+                // Symbol 型 himo の場合、remote vocab の vid を local vid に変換
                 let value = self.engine.translate_remote_vid(rec.author_peer, *himo_id, *value);
-                #[cfg(not(feature = "v33"))]
-                let value = *value;
                 self.engine.remote_tie_apply(*eid, *himo_id, value);
                 true
             }
@@ -226,18 +221,10 @@ impl Syncer {
             }
             DecodedOp::Commit => true, // boundary marker、apply は不要
             DecodedOp::Vocab { vid, bytes } => {
-                // v33: author_peer の (vid, bytes) を受信。
+                // author_peer の (vid, bytes) を受信。
                 // Engine 側の remote_vocab_apply に委譲 (peer 別 vid mapping を構築)。
-                #[cfg(feature = "v33")]
-                {
-                    self.engine.remote_vocab_apply(rec.author_peer, *vid, bytes);
-                    true
-                }
-                #[cfg(not(feature = "v33"))]
-                {
-                    let _ = (vid, bytes);
-                    false
-                }
+                self.engine.remote_vocab_apply(rec.author_peer, *vid, bytes);
+                true
             }
         }
     }

@@ -16,7 +16,6 @@
 //!   v32_signed_loop     — v32 署名付きで無限書き込み(親が kill する前提)。
 //!                         seed 固定の keypair で WAL に署名レコードを残す。
 
-#[cfg(feature = "v27")]
 fn main() {
     use enchudb_engine::Engine;
     let args: Vec<String> = std::env::args().collect();
@@ -109,7 +108,6 @@ fn main() {
                 std::thread::sleep(std::time::Duration::from_secs(60));
             }
         }
-        #[cfg(feature = "v32")]
         "v32_signed_loop" => {
             use enchudb_engine::keys::Keypair;
             // seed 固定で親が pubkey を事前登録できるようにする
@@ -138,8 +136,3 @@ fn main() {
     }
 }
 
-#[cfg(not(feature = "v27"))]
-fn main() {
-    eprintln!("build with --features v27");
-    std::process::exit(1);
-}

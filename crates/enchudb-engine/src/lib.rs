@@ -21,7 +21,6 @@ pub mod column;
 pub mod vocabulary;
 pub mod entity_set;
 pub mod cylinder;
-#[cfg(feature = "v27")]
 pub mod cylinder_v27;
 pub mod himo_store;
 pub mod content_store;
@@ -30,28 +29,20 @@ pub mod engine;
 pub mod query_lang;
 pub mod ravn;
 pub mod cas;
-#[cfg(feature = "v27")]
 pub mod write_queue;
-#[cfg(feature = "v27")]
 pub mod wal;
-#[cfg(feature = "v32")]
 pub mod hlc_store;
-#[cfg(feature = "v32")]
 pub mod transport;
 // `sync::Syncer` は `enchudb-sync` crate に分離済。
 // engine は single-peer でも動くので sync を直接持たない。
-#[cfg(feature = "v32")]
 pub mod changefeed;
 // Transport implementations moved to `enchu-transport` crate.
-#[cfg(feature = "v32")]
 pub mod keys;
-#[cfg(feature = "v32")]
 pub mod acl;
 pub mod integrity;
 pub mod blob_store;
 
 pub use engine::{Engine, EntityValue, SnapshotFiles, AuditFilter};
-#[cfg(feature = "v27")]
 pub use engine::EngineStats;
 pub use himo_store::HimoType;
 pub use cas::{CASStore, BlockHash};

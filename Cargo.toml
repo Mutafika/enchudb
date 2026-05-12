@@ -12,19 +12,17 @@ authors = ["mutafika"]
 repository = "https://github.com/mutafika/enchudb"
 
 [features]
-default = ["v33"]
-v26 = ["enchudb-engine/v26"]
-v27 = ["enchudb-engine/v27"]
-v32 = ["enchudb-engine/v32", "dep:enchudb-sync"]
-v33 = ["enchudb-engine/v33", "dep:enchudb-sync", "enchudb-sync/v33"]
 sql = ["dep:enchudb-sql"]
 ffi = ["dep:enchudb-ffi", "sql"]
 async-blob = ["enchudb-engine/async-blob"]
 
 [dependencies]
 enchudb-engine = { path = "crates/enchudb-engine" }
+enchudb-sync = { path = "crates/enchudb-sync" }
+
+# native 専用 (disk-backed schema 永続化 / C ABI / SQL frontend は wasm に意味なし)
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 enchudb-schema = { path = "crates/enchudb-schema" }
-enchudb-sync = { path = "crates/enchudb-sync", optional = true }
 enchudb-sql = { path = "crates/enchudb-sql", optional = true }
 enchudb-ffi = { path = "crates/enchudb-ffi", optional = true }
 
@@ -40,4 +38,3 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 [[bench]]
 name = "core"
 harness = false
-required-features = ["v32"]

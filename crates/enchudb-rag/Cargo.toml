@@ -15,7 +15,7 @@ simd = []
 fastembed = ["dep:fastembed"]
 
 [dependencies]
-enchudb = { path = "../..", features = ["v27"] }
+enchudb = { path = "../.." }
 memmap2 = "0.9"
 fastembed = { version = "5", optional = true, default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
 

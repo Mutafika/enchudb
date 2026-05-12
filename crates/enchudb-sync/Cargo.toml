@@ -7,10 +7,5 @@ license = "MIT OR Apache-2.0"
 authors = ["mutafika"]
 repository = "https://github.com/mutafika/enchudb"
 
-[features]
-default = []
-# v33 で tie_text の remote vocab 翻訳パスが有効になる
-v33 = ["enchudb-engine/v33"]
-
 [dependencies]
-enchudb-engine = { path = "../enchudb-engine", features = ["v32"] }
+enchudb-engine = { path = "../enchudb-engine" }

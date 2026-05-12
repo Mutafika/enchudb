@@ -26,7 +26,6 @@
 //! # 使い方
 //!
 //! ```
-//! # #[cfg(feature = "v27")] {
 //! use std::sync::{Arc, Mutex};
 //! use enchudb_engine::{Engine, HimoType};
 //! use enchudb_engine::changefeed::ChangeListener;
@@ -61,7 +60,6 @@
 //! drop(eng);
 //! # let _ = std::fs::remove_file(&path);
 //! # let _ = std::fs::remove_file(format!("{}.wal", path));
-//! # }
 //! ```
 
 use crate::transport::WireRecord;
