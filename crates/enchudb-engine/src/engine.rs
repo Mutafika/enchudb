@@ -841,6 +841,10 @@ pub struct Engine {
     acl: std::sync::Arc<crate::acl::Acl>,
     /// v32 エッジ用: true なら書き込み API が panic、sync 経由 (remote_*_apply) のみ受ける。
     is_replica: std::sync::atomic::AtomicBool,
+    /// CRDT mesh mode: true なら `remote_*_apply` で受け取った op を自分の WAL にも
+    /// 書き戻し、次の publish で他 peer に gossip する。 ホスト/クライアント構成では
+    /// false のまま (ホストだけが gossip する/しない)。 default = false で旧挙動互換。
+    gossip_remote_apply: std::sync::atomic::AtomicBool,
     /// 大容量 blob 用 store(画像/動画/モデル等)。`set_blob_store` で注入。
     /// 未設定なら `blob_store()` は None を返す。
     blob_store: std::sync::RwLock<Option<std::sync::Arc<dyn crate::blob_store::BlobStore>>>,
@@ -987,6 +991,7 @@ impl Engine {
             pubkeys: std::sync::Arc::new(enchudb_wal::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
             is_replica: std::sync::atomic::AtomicBool::new(false),
+            gossip_remote_apply: std::sync::atomic::AtomicBool::new(false),
             blob_store: std::sync::RwLock::new(None),
             change_listeners: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
             change_emit_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
@@ -1216,6 +1221,7 @@ impl Engine {
             pubkeys: std::sync::Arc::new(enchudb_wal::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
             is_replica: std::sync::atomic::AtomicBool::new(false),
+            gossip_remote_apply: std::sync::atomic::AtomicBool::new(false),
             blob_store: std::sync::RwLock::new(None),
             change_listeners: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
             change_emit_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
@@ -1545,6 +1551,7 @@ impl Engine {
             pubkeys: std::sync::Arc::new(enchudb_wal::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
             is_replica: std::sync::atomic::AtomicBool::new(false),
+            gossip_remote_apply: std::sync::atomic::AtomicBool::new(false),
             blob_store: std::sync::RwLock::new(None),
             change_listeners: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
             change_emit_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
@@ -1655,6 +1662,20 @@ impl Engine {
         self.peer_id.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// CRDT mesh mode の有効化。 true にすると `remote_*_apply` 経路で
+    /// 受信した op を自分の WAL にも書き戻し、 publish で他 peer へ gossip する。
+    /// ホスト/クライアント構成 (ホストが集約役) では false のまま使う。
+    pub fn set_gossip_remote_apply(&self, on: bool) {
+        self.gossip_remote_apply
+            .store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    /// `set_gossip_remote_apply` の現在値。
+    pub fn gossip_remote_apply(&self) -> bool {
+        self.gossip_remote_apply
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// LWW 用 HlcStore への参照(sync モジュールが使う)。
     pub fn hlc_store(&self) -> &std::sync::Arc<crate::hlc_store::HlcStore> {
         &self.hlc_store
@@ -1695,7 +1716,8 @@ impl Engine {
     // ──── v32: リモート peer から pull したレコードを apply する ────
     // これらは LWW 判定を通った後の無条件 apply。HlcStore は Syncer が先に更新済み。
 
-    /// リモート peer から届いた Tie を apply。WAL には書き戻さない(2 重送信防止)。
+    /// リモート peer から届いた Tie を apply。
+    /// `gossip_remote_apply` 有効時は自分の WAL にも書き戻し、 publish で他 peer に伝播。
     pub fn remote_tie_apply(&self, eid: enchudb_wal::EntityId, himo_id: u16, value: u32) {
         let local = enchudb_wal::eid_local(eid);
         let hid = himo_id as usize;
@@ -1703,6 +1725,12 @@ impl Engine {
         // entity 未確保ならローカル側の EntitySet に登録(eid は peer 側が決めた値)
         self.entities.ensure_live(local);
         self.himos[hid].set(local, value);
+        if self.gossip_remote_apply() {
+            if let Some(wal) = self.wal.as_ref() {
+                let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
+                let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id, value });
+            }
+        }
     }
 
     /// リモート peer から届いた Untie を apply。
@@ -1711,15 +1739,33 @@ impl Engine {
         let hid = himo_id as usize;
         if hid >= self.himos.len() { return; }
         self.himos[hid].remove(local);
+        if self.gossip_remote_apply() {
+            if let Some(wal) = self.wal.as_ref() {
+                let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
+                let _ = wal.append(enchudb_wal::wal::WalOp::Untie { eid: wal_eid, himo_id });
+            }
+        }
     }
 
     /// リモート peer から届いた Delete を apply。
+    ///
+    /// CRDT: ホスト無しの P2P において、削除は各 peer の WAL に
+    /// gossip される必要がある。 受信した Delete を自分の peer_id +
+    /// 新 HLC で WAL にも append し、次の publish で他 peer にも
+    /// 伝播させる。 無限ループは `Syncer::apply_one` の `try_set` が
+    /// 2 回目以降の同一 (eid, sentinel_himo) を false で skip するため発生しない。
     pub fn remote_delete_apply(&self, eid: enchudb_wal::EntityId) {
         let local = enchudb_wal::eid_local(eid);
         for hid in 0..self.himos.len() {
             self.himos[hid].remove(local);
         }
         self.entities.free(local);
+        if self.gossip_remote_apply() {
+            if let Some(wal) = self.wal.as_ref() {
+                let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
+                let _ = wal.append(enchudb_wal::wal::WalOp::Delete { eid: wal_eid });
+            }
+        }
     }
 
     /// リモート peer から届いた Content 書き込みを apply。
@@ -1727,16 +1773,30 @@ impl Engine {
         let local = enchudb_wal::eid_local(eid);
         self.entities.ensure_live(local);
         self.contents.set(local, key, data);
+        if self.gossip_remote_apply() {
+            if let Some(wal) = self.wal.as_ref() {
+                let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
+                let _ = wal.append(enchudb_wal::wal::WalOp::Content { eid: wal_eid, key, data });
+            }
+        }
     }
 
     /// v33: リモート peer から届いた Vocab op を apply。
     /// `bytes` を local vocab に insert し、local_vid を取得して
     /// `(author_peer, remote_vid) → local_vid` の mapping を記録する。
     /// 後続の Tie { value: remote_vid } を受信したら `translate_remote_vid` で local_vid に変換。
+    /// gossip 有効かつ自 vocab に新規追加された場合のみ Vocab op を自分の WAL にも書き、
+    /// publish で他 peer にも伝播させる (重複 append による relay 容量肥大を避ける)。
     pub fn remote_vocab_apply(&self, author_peer: enchudb_wal::PeerId, remote_vid: u32, bytes: &[u8]) {
+        let was_new = self.vocab.lookup(bytes).is_none();
         let local_vid = self.vocab.get_or_insert(bytes);
         let mut map = self.peer_vocab_map.write().unwrap();
         map.insert((author_peer, remote_vid), local_vid);
+        if was_new && self.gossip_remote_apply() {
+            if let Some(wal) = self.wal.as_ref() {
+                let _ = wal.append(enchudb_wal::wal::WalOp::Vocab { vid: local_vid, bytes });
+            }
+        }
     }
 
     /// v33: Symbol 型 himo の Tie を受信した際、remote vid を local vid に変換する。

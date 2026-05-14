@@ -3537,6 +3537,7 @@ version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
  "console_log",
+ "image",
  "log",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
