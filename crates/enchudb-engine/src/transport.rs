@@ -339,7 +339,15 @@ impl Transport for InMemoryTransport {
         records.sort_by_key(|r| r.hlc);
         let mut guard = self.inner.lock().unwrap();
         let log = guard.entry(peer).or_insert_with(Vec::new);
-        log.extend(records);
+        // CRDT 不変式: (peer, hlc) で record は一意。 gossip 経路で同 hlc を
+        // 重複受信するため dedupe しないと publish のたびに log が増殖する。
+        let existing: std::collections::HashSet<Hlc> =
+            log.iter().map(|r| r.hlc).collect();
+        for r in records {
+            if !existing.contains(&r.hlc) {
+                log.push(r);
+            }
+        }
         log.sort_by_key(|r| r.hlc);
     }
 }

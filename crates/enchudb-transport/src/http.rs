@@ -339,7 +339,15 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Resu
                     let mut guard = storage.lock().unwrap();
                     let room_log = guard.entry(room_id.to_string()).or_insert_with(HashMap::new);
                     let log = room_log.entry(peer).or_insert_with(Vec::new);
-                    log.extend(records);
+                    // CRDT 不変式: (peer, hlc) で record は一意。 gossip 経由で同 hlc が
+                    // 二度送られる事があるため dedupe しないと relay の log が無限増殖する。
+                    let existing: std::collections::HashSet<enchudb_wal::Hlc> =
+                        log.iter().map(|r| r.hlc).collect();
+                    for r in records {
+                        if !existing.contains(&r.hlc) {
+                            log.push(r);
+                        }
+                    }
                     log.sort_by_key(|r| r.hlc);
                     send_response(&mut stream, 200, b"")
                 }
