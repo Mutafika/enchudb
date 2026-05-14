@@ -259,11 +259,16 @@ fn cmd_schema(opts: &HashMap<String, String>) {
     let max: u32 = opt(opts, "max").unwrap_or(100);
 
     let ht = match type_str.as_str() {
+        // 新名 (推奨)
+        "number" => HimoType::Number,
+        "tag" => HimoType::Tag,
+        "leaf" => HimoType::Leaf,
+        "ref" => HimoType::Ref,
+        // 旧名エイリアス (後方互換)
         "value" => HimoType::Number,
         "symbol" => HimoType::Tag,
-        "ref" => HimoType::Ref,
         other => {
-            eprintln!("invalid --type={}, expected value|symbol|ref", other);
+            eprintln!("invalid --type={}, expected number|tag|leaf|ref (legacy: value|symbol)", other);
             std::process::exit(1);
         }
     };

@@ -71,9 +71,15 @@ const SCHEMA_TABLE_MARKER: &str = "__enchu_schema_v1__";
 const SCHEMA_BLOB_HIMO: &str = "__enchu_schema_blob";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// SQL 上の列型。`enchudb_engine::HimoType` への dispatch 用。
+///
+/// - `Integer` — `INTEGER` / `INT` 系。HimoType::Number。
+/// - `Text` — `TEXT` / `VARCHAR` 系。HimoType::Tag (vocab で dedupe)。
+/// - `Leaf` — 拡張型 `LEAF`。HimoType::Leaf (vocab に乗るが dedupe なし、自由記述用)。
 pub enum SqlType {
     Integer,
     Text,
+    Leaf,
 }
 
 #[derive(Debug, Clone)]
@@ -281,6 +287,7 @@ impl Database {
                 let ht = match c.ty {
                     SqlType::Integer => HimoType::Number,
                     SqlType::Text => HimoType::Tag,
+                    SqlType::Leaf => HimoType::Leaf,
                 };
                 self.eng.define_himo(&c.himo, ht, 0);
             }
@@ -332,6 +339,8 @@ impl Database {
                 | DataType::UnsignedBigInt(_) | DataType::UnsignedInteger(_) => SqlType::Integer,
                 DataType::Text | DataType::String(_) | DataType::Varchar(_)
                 | DataType::Char(_) | DataType::CharacterVarying(_) => SqlType::Text,
+                // 拡張型: `LEAF` は dedupe しない自由記述テキスト用。
+                DataType::Custom(name, _) if name.to_string().eq_ignore_ascii_case("LEAF") => SqlType::Leaf,
                 other => return Err(SqlError::Unsupported(format!("type: {other:?}"))),
             };
 
@@ -370,6 +379,7 @@ impl Database {
             let ht = match col.ty {
                 SqlType::Integer => HimoType::Number,
                 SqlType::Text => HimoType::Tag,
+                SqlType::Leaf => HimoType::Leaf,
             };
             self.eng.define_himo(&col.himo, ht, 0);
         }
@@ -645,6 +655,9 @@ impl Database {
                     Some(id) => id,
                     None => return Ok(Vec::new()), // 未知 vocab はマッチなし
                 },
+                // Leaf は dedupe しないので等値検索は原理的に成立しない (毎回別 vid)。
+                // マッチなしとして 0 件返す。
+                (SqlType::Leaf, Value::Text(_)) => return Ok(Vec::new()),
                 (_, Value::Null) => return Ok(Vec::new()),
                 (t, v) => return Err(SqlError::TypeMismatch(format!("{:?} vs {:?}", t, v))),
             };
@@ -692,6 +705,8 @@ impl Database {
                 Some(id) => id,
                 None => return Ok(None),
             },
+            // Leaf を PK にするのは意味的に変だが、ここでは「マッチなし」として扱う。
+            (SqlType::Leaf, Value::Text(_)) => return Ok(None),
             (_, Value::Null) => return Ok(None),
             (t, v) => return Err(SqlError::TypeMismatch(format!("{:?} vs {:?}", t, v))),
         };
@@ -887,7 +902,10 @@ fn tie_value(eng: &mut Engine, eid: EntityId, cd: &ColDef, v: &Value) -> Result<
             }
             eng.tie(eid, &cd.himo, *n as u32);
         }
-        (SqlType::Text, Value::Text(s)) => eng.tie_text(eid, &cd.himo, s),
+        (SqlType::Text, Value::Text(s)) | (SqlType::Leaf, Value::Text(s)) => {
+            // engine の tie_text は himo の HimoType (Tag / Leaf) で内部 dispatch する。
+            eng.tie_text(eid, &cd.himo, s);
+        }
         (_, Value::Null) => { /* untie でも良いが v0 は no-op */ }
         (t, v) => return Err(SqlError::TypeMismatch(format!("col {} expects {:?}, got {:?}", cd.name, t, v))),
     }
@@ -900,7 +918,7 @@ fn read_value(eng: &Engine, eid: EntityId, cd: &ColDef) -> Value {
             Some(n) => Value::Integer(n as i64),
             None => Value::Null,
         },
-        SqlType::Text => match eng.get_text(eid, &cd.himo) {
+        SqlType::Text | SqlType::Leaf => match eng.get_text(eid, &cd.himo) {
             Some(b) => match std::str::from_utf8(b) {
                 Ok(s) => Value::Text(s.to_string()),
                 Err(_) => Value::Null,
@@ -934,6 +952,7 @@ fn serialize_schema(tables: &[TableDef]) -> String {
             out.push_str(match c.ty {
                 SqlType::Integer => "INTEGER",
                 SqlType::Text => "TEXT",
+                SqlType::Leaf => "LEAF",
             });
             if t.pk.as_deref() == Some(c.name.as_str()) {
                 out.push_str(":pk");
@@ -972,6 +991,7 @@ fn deserialize_schema(s: &str) -> Result<Vec<TableDef>, SqlError> {
             let ty = match ty_str {
                 "INTEGER" => SqlType::Integer,
                 "TEXT" => SqlType::Text,
+                "LEAF" => SqlType::Leaf,
                 other => return Err(SqlError::Parse(format!("unknown column type: {other}"))),
             };
             if col_parts.next() == Some("pk") {
@@ -1446,6 +1466,59 @@ mod tests {
         match db.execute("SELECT dismissed_at FROM notif WHERE key = 'a'").unwrap() {
             Output::Rows { rows, .. } => {
                 assert_eq!(rows[0][0], Value::Integer(999));
+            }
+            _ => panic!(),
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn leaf_column_basic() {
+        // LEAF 拡張型: vocab 経由・dedupe なし。CREATE / INSERT / SELECT * が成立。
+        let mut db = fresh("leaf_basic");
+        db.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT, body LEAF)").unwrap();
+        db.execute("INSERT INTO posts VALUES (1, 'hello', 'today was a good day')").unwrap();
+        db.execute("INSERT INTO posts VALUES (2, 'world', 'today was a good day')").unwrap();
+        match db.execute("SELECT * FROM posts").unwrap() {
+            Output::Rows { rows, columns } => {
+                assert_eq!(columns, vec!["id", "title", "body"]);
+                assert_eq!(rows.len(), 2);
+                // 同一文字列の body を 2 entity に書き込んでも両方読み戻せる
+                assert_eq!(rows[0][2], Value::Text("today was a good day".into()));
+                assert_eq!(rows[1][2], Value::Text("today was a good day".into()));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn leaf_eq_query_returns_empty() {
+        // LEAF 列の等値検索は原理的に成立しない (dedupe なしで毎回別 vid)。
+        // SQL 層では「マッチなし = 0 件」として扱う。
+        let mut db = fresh("leaf_eq");
+        db.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, memo LEAF)").unwrap();
+        db.execute("INSERT INTO notes VALUES (1, 'find me')").unwrap();
+        match db.execute("SELECT * FROM notes WHERE memo = 'find me'").unwrap() {
+            Output::Rows { rows, .. } => assert_eq!(rows.len(), 0, "LEAF への等値検索は 0 件"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn leaf_persists_across_reopen() {
+        // LEAF 列もスキーマ blob に含まれて永続化される。
+        let path = "/tmp/enchudb-sql-test-leaf-persist.db";
+        let _ = std::fs::remove_file(path);
+        {
+            let mut db = Database::create(path).unwrap();
+            db.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body LEAF)").unwrap();
+            db.execute("INSERT INTO notes VALUES (1, 'persisted')").unwrap();
+        }
+        let mut db = Database::open(path).unwrap();
+        match db.execute("SELECT body FROM notes WHERE id = 1").unwrap() {
+            Output::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Text("persisted".into()));
             }
             _ => panic!(),
         }
