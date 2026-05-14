@@ -49,7 +49,7 @@ fn main() {
     // origin 準備 (schema + flush)
     {
         let mut eng = Engine::create_compact(&origin_path).unwrap();
-        eng.define_himo("val", HimoType::Value, 100);
+        eng.define_himo("val", HimoType::Number, 100);
         eng.flush().unwrap();
     }
 

@@ -8,9 +8,9 @@ fn main() {
     let _ = std::fs::remove_file(dir);
 
     let mut db = enchudb::Engine::create_with_capacity(dir, n).unwrap();
-    db.define_himo("salary", enchudb::HimoType::Value, 1000);
-    db.define_himo("age", enchudb::HimoType::Value, 60);
-    db.define_himo("dept", enchudb::HimoType::Value, 8);
+    db.define_himo("salary", enchudb::HimoType::Number, 1000);
+    db.define_himo("age", enchudb::HimoType::Number, 60);
+    db.define_himo("dept", enchudb::HimoType::Number, 8);
 
     for i in 0..n {
         let e = db.entity();

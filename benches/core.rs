@@ -65,7 +65,7 @@ fn bench_tie(c: &mut Criterion) {
             || {
                 let path = tmp("tie_plain");
                 let mut eng = Engine::create_standalone(&path).unwrap();
-                eng.define_himo("v", HimoType::Value, 100);
+                eng.define_himo("v", HimoType::Number, 100);
                 let e = eng.entity();
                 (path, eng, e, 0u32)
             },
@@ -89,7 +89,7 @@ fn bench_pull_raw(c: &mut Criterion) {
     // 事前に 10k entity を書いて rebuild、pull_raw 自体だけ計測
     let path = tmp("pull_raw");
     let mut eng = Engine::create_with_capacity(&path, 100_000).unwrap();
-    eng.define_himo("age", HimoType::Value, 100);
+    eng.define_himo("age", HimoType::Number, 100);
     for i in 0..10_000u32 {
         let e = eng.entity();
         eng.tie(e, "age", i % 100);
@@ -119,8 +119,8 @@ fn bench_pull_raw(c: &mut Criterion) {
 fn bench_query(c: &mut Criterion) {
     let path = tmp("query");
     let mut eng = Engine::create_with_capacity(&path, 100_000).unwrap();
-    eng.define_himo("age", HimoType::Value, 100);
-    eng.define_himo("dept", HimoType::Value, 20);
+    eng.define_himo("age", HimoType::Number, 100);
+    eng.define_himo("dept", HimoType::Number, 20);
     for i in 0..10_000u32 {
         let e = eng.entity();
         eng.tie(e, "age", i % 100);
@@ -158,7 +158,7 @@ fn bench_snapshot_export(c: &mut Criterion) {
     let path = tmp("snap_src");
     {
         let mut eng = Engine::create_with_capacity(&path, 2_000).unwrap();
-        eng.define_himo("v", HimoType::Value, 100);
+        eng.define_himo("v", HimoType::Number, 100);
         for i in 0..1_000u32 {
             let e = eng.entity();
             eng.tie(e, "v", i % 100);
@@ -202,7 +202,7 @@ fn bench_audit(c: &mut Criterion) {
     let path = tmp("audit");
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
-        eng.define_himo("v", HimoType::Value, 100);
+        eng.define_himo("v", HimoType::Number, 100);
         eng.flush().unwrap();
     }
     let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
@@ -237,7 +237,7 @@ fn bench_tie_async(c: &mut Criterion) {
     let path = tmp("tie_async");
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
-        eng.define_himo("v", HimoType::Value, 100);
+        eng.define_himo("v", HimoType::Number, 100);
         eng.flush().unwrap();
     }
     let eng: Arc<Engine> =

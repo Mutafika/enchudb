@@ -58,18 +58,18 @@ struct EcData {
 }
 
 fn define_schema(db: &mut Engine) {
-    db.define_himo("type", HimoType::Value, 8);
-    db.define_himo("category", HimoType::Value, 20);
-    db.define_himo("price_band", HimoType::Value, 10);
-    db.define_himo("color", HimoType::Value, 12);
-    db.define_himo("brand", HimoType::Value, 50);
-    db.define_himo("region", HimoType::Value, 10);
-    db.define_himo("membership", HimoType::Value, 4);
-    db.define_himo("year", HimoType::Value, 5);
-    db.define_himo("month", HimoType::Value, 13);
-    db.define_himo("order_status", HimoType::Value, 5);
-    db.define_himo("rating", HimoType::Value, 6);
-    db.define_himo("quantity", HimoType::Value, 100);
+    db.define_himo("type", HimoType::Number, 8);
+    db.define_himo("category", HimoType::Number, 20);
+    db.define_himo("price_band", HimoType::Number, 10);
+    db.define_himo("color", HimoType::Number, 12);
+    db.define_himo("brand", HimoType::Number, 50);
+    db.define_himo("region", HimoType::Number, 10);
+    db.define_himo("membership", HimoType::Number, 4);
+    db.define_himo("year", HimoType::Number, 5);
+    db.define_himo("month", HimoType::Number, 13);
+    db.define_himo("order_status", HimoType::Number, 5);
+    db.define_himo("rating", HimoType::Number, 6);
+    db.define_himo("quantity", HimoType::Number, 100);
     // 参照紐 (max_values=0)
     db.define_himo("user_ref", HimoType::Ref, 0);
     db.define_himo("order_ref", HimoType::Ref, 0);

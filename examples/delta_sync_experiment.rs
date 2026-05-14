@@ -293,7 +293,7 @@ fn main() {
     let _ = std::fs::remove_file(dir);
     let mut db = enchudb::Engine::create_standalone(dir).unwrap();
     for &(name, max_v) in &himos {
-        db.define_himo(name, enchudb::HimoType::Value, max_v);
+        db.define_himo(name, enchudb::HimoType::Number, max_v);
     }
     for i in 0..n {
         let e = db.entity();

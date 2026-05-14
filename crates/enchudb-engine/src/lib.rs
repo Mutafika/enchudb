@@ -4,7 +4,7 @@
 //! let path = format!("/tmp/enchudb-doc-{}.db", std::process::id());
 //! let _ = std::fs::remove_file(&path);
 //! let mut db = enchudb_engine::Engine::create_standalone(&path).unwrap();
-//! db.define_himo("age", enchudb_engine::HimoType::Value, 100);
+//! db.define_himo("age", enchudb_engine::HimoType::Number, 100);
 //! let e = db.entity();
 //! db.tie(e, "age", 30);
 //! db.tie_text(e, "city", "東京");

@@ -17,7 +17,7 @@ fn main() {
         ("h5", 7), ("h6", 3), ("h7", 9), ("h8", 11), ("h9", 12),
     ];
     for &(name, max_v) in &himos {
-        db.define_himo(name, enchudb::HimoType::Value, max_v);
+        db.define_himo(name, enchudb::HimoType::Number, max_v);
     }
 
     let n = 500_000u32;

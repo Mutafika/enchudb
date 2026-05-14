@@ -10,7 +10,7 @@
 //! let path = format!("/tmp/enchudb-acl-doc-{}.db", std::process::id());
 //! # let _ = std::fs::remove_file(&path);
 //! let mut eng = Engine::create_standalone(&path).unwrap();
-//! eng.define_himo("acl_writer", HimoType::Value, 4);
+//! eng.define_himo("acl_writer", HimoType::Number, 4);
 //! let project = eng.entity();
 //! eng.tie(project, "acl_writer", 1);  // peer 1 に書き込み許可
 //! eng.tie(project, "acl_writer", 2);  // peer 2 にも

@@ -8,9 +8,9 @@ fn main() {
     let _ = std::fs::remove_file(dir);
 
     let mut db = enchudb::Engine::create_standalone(dir).unwrap();
-    db.define_himo("city", enchudb::HimoType::Value, 10);
-    db.define_himo("dept", enchudb::HimoType::Value, 8);
-    db.define_himo("age", enchudb::HimoType::Value, 100);
+    db.define_himo("city", enchudb::HimoType::Number, 10);
+    db.define_himo("dept", enchudb::HimoType::Number, 8);
+    db.define_himo("age", enchudb::HimoType::Number, 100);
 
     // insert
     let t = Instant::now();

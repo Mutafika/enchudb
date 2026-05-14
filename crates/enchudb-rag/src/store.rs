@@ -45,8 +45,8 @@ pub enum MetaType {
 impl MetaType {
     fn to_himo(self) -> HimoType {
         match self {
-            MetaType::Value => HimoType::Value,
-            MetaType::Symbol => HimoType::Symbol,
+            MetaType::Value => HimoType::Number,
+            MetaType::Symbol => HimoType::Tag,
             MetaType::Ref => HimoType::Ref,
         }
     }

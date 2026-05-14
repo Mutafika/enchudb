@@ -14,14 +14,14 @@ fn main() {
     let mut db = enchudb::Engine::create_with_capacity(dir, n).unwrap();
 
     // 少ユニーク紐（combo 対象）
-    db.define_himo("tenant", enchudb::HimoType::Value, 10);
-    db.define_himo("dept", enchudb::HimoType::Value, 8);
-    db.define_himo("role", enchudb::HimoType::Value, 4);
-    db.define_himo("status", enchudb::HimoType::Value, 5);
-    db.define_himo("year", enchudb::HimoType::Value, 5);
+    db.define_himo("tenant", enchudb::HimoType::Number, 10);
+    db.define_himo("dept", enchudb::HimoType::Number, 8);
+    db.define_himo("role", enchudb::HimoType::Number, 4);
+    db.define_himo("status", enchudb::HimoType::Number, 5);
+    db.define_himo("year", enchudb::HimoType::Number, 5);
     // 多ユニーク紐
-    db.define_himo("salary", enchudb::HimoType::Value, 1000);
-    db.define_himo("age", enchudb::HimoType::Value, 60);
+    db.define_himo("salary", enchudb::HimoType::Number, 1000);
+    db.define_himo("age", enchudb::HimoType::Number, 60);
 
     println!("=== データ投入 ===");
     let t = Instant::now();

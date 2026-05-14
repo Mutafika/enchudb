@@ -17,13 +17,13 @@ fn main() {
     let mut db = enchudb::Engine::create_with_capacity(path, n + 10).unwrap();
 
     // 7 紐。tenant/dept/status/grade/city/salary_band/age
-    db.define_himo("tenant", enchudb::HimoType::Value, 16);
-    db.define_himo("dept", enchudb::HimoType::Value, 8);
-    db.define_himo("status", enchudb::HimoType::Value, 4);
-    db.define_himo("grade", enchudb::HimoType::Value, 5);
-    db.define_himo("city", enchudb::HimoType::Value, 10);
-    db.define_himo("salary_band", enchudb::HimoType::Value, 20);
-    db.define_himo("age", enchudb::HimoType::Value, 100);
+    db.define_himo("tenant", enchudb::HimoType::Number, 16);
+    db.define_himo("dept", enchudb::HimoType::Number, 8);
+    db.define_himo("status", enchudb::HimoType::Number, 4);
+    db.define_himo("grade", enchudb::HimoType::Number, 5);
+    db.define_himo("city", enchudb::HimoType::Number, 10);
+    db.define_himo("salary_band", enchudb::HimoType::Number, 20);
+    db.define_himo("age", enchudb::HimoType::Number, 100);
 
     // ──── write ────
     println!("=== 書き込み ({} entity × 7 紐) ===", n);
@@ -210,13 +210,13 @@ fn main() {
     let path_a = "/tmp/enchudb_v27_bench_nov.db";
     let _ = std::fs::remove_file(path_a);
     let mut db_a = enchudb::Engine::create_with_capacity(path_a, n + 10).unwrap();
-    db_a.define_himo("tenant", enchudb::HimoType::Value, 16);
-    db_a.define_himo("dept", enchudb::HimoType::Value, 8);
-    db_a.define_himo("status", enchudb::HimoType::Value, 4);
-    db_a.define_himo("grade", enchudb::HimoType::Value, 5);
-    db_a.define_himo("city", enchudb::HimoType::Value, 10);
-    db_a.define_himo("salary_band", enchudb::HimoType::Value, 20);
-    db_a.define_himo("age", enchudb::HimoType::Value, 100);
+    db_a.define_himo("tenant", enchudb::HimoType::Number, 16);
+    db_a.define_himo("dept", enchudb::HimoType::Number, 8);
+    db_a.define_himo("status", enchudb::HimoType::Number, 4);
+    db_a.define_himo("grade", enchudb::HimoType::Number, 5);
+    db_a.define_himo("city", enchudb::HimoType::Number, 10);
+    db_a.define_himo("salary_band", enchudb::HimoType::Number, 20);
+    db_a.define_himo("age", enchudb::HimoType::Number, 100);
 
     let t = Instant::now();
     for i in 0..n {
@@ -261,13 +261,13 @@ fn main() {
     let path_b = "/tmp/enchudb_v27_bench_v1.db";
     let _ = std::fs::remove_file(path_b);
     let mut db_b = enchudb::Engine::create_with_capacity(path_b, n + 10).unwrap();
-    db_b.define_himo("tenant", enchudb::HimoType::Value, 16);
-    db_b.define_himo("dept", enchudb::HimoType::Value, 8);
-    db_b.define_himo("status", enchudb::HimoType::Value, 4);
-    db_b.define_himo("grade", enchudb::HimoType::Value, 5);
-    db_b.define_himo("city", enchudb::HimoType::Value, 10);
-    db_b.define_himo("salary_band", enchudb::HimoType::Value, 20);
-    db_b.define_himo("age", enchudb::HimoType::Value, 100);
+    db_b.define_himo("tenant", enchudb::HimoType::Number, 16);
+    db_b.define_himo("dept", enchudb::HimoType::Number, 8);
+    db_b.define_himo("status", enchudb::HimoType::Number, 4);
+    db_b.define_himo("grade", enchudb::HimoType::Number, 5);
+    db_b.define_himo("city", enchudb::HimoType::Number, 10);
+    db_b.define_himo("salary_band", enchudb::HimoType::Number, 20);
+    db_b.define_himo("age", enchudb::HimoType::Number, 100);
     db_b.define_view(&["tenant", "dept", "status"]).unwrap();
 
     let t = Instant::now();
@@ -307,13 +307,13 @@ fn main() {
     let path_c = "/tmp/enchudb_v27_bench_v2.db";
     let _ = std::fs::remove_file(path_c);
     let mut db_c = enchudb::Engine::create_with_capacity(path_c, n + 10).unwrap();
-    db_c.define_himo("tenant", enchudb::HimoType::Value, 16);
-    db_c.define_himo("dept", enchudb::HimoType::Value, 8);
-    db_c.define_himo("status", enchudb::HimoType::Value, 4);
-    db_c.define_himo("grade", enchudb::HimoType::Value, 5);
-    db_c.define_himo("city", enchudb::HimoType::Value, 10);
-    db_c.define_himo("salary_band", enchudb::HimoType::Value, 20);
-    db_c.define_himo("age", enchudb::HimoType::Value, 100);
+    db_c.define_himo("tenant", enchudb::HimoType::Number, 16);
+    db_c.define_himo("dept", enchudb::HimoType::Number, 8);
+    db_c.define_himo("status", enchudb::HimoType::Number, 4);
+    db_c.define_himo("grade", enchudb::HimoType::Number, 5);
+    db_c.define_himo("city", enchudb::HimoType::Number, 10);
+    db_c.define_himo("salary_band", enchudb::HimoType::Number, 20);
+    db_c.define_himo("age", enchudb::HimoType::Number, 100);
     // 17*9*5 = 765
     db_c.define_view(&["tenant", "dept", "status"]).unwrap();
     // 17*9*5*6*11 = 50490
@@ -379,13 +379,13 @@ fn main() {
     let path_p = "/tmp/enchudb_v27_bench_persist.db";
     let _ = std::fs::remove_file(path_p);
     let mut db_p = enchudb::Engine::create_with_capacity(path_p, n + 10).unwrap();
-    db_p.define_himo("tenant", enchudb::HimoType::Value, 16);
-    db_p.define_himo("dept", enchudb::HimoType::Value, 8);
-    db_p.define_himo("status", enchudb::HimoType::Value, 4);
-    db_p.define_himo("grade", enchudb::HimoType::Value, 5);
-    db_p.define_himo("city", enchudb::HimoType::Value, 10);
-    db_p.define_himo("salary_band", enchudb::HimoType::Value, 20);
-    db_p.define_himo("age", enchudb::HimoType::Value, 100);
+    db_p.define_himo("tenant", enchudb::HimoType::Number, 16);
+    db_p.define_himo("dept", enchudb::HimoType::Number, 8);
+    db_p.define_himo("status", enchudb::HimoType::Number, 4);
+    db_p.define_himo("grade", enchudb::HimoType::Number, 5);
+    db_p.define_himo("city", enchudb::HimoType::Number, 10);
+    db_p.define_himo("salary_band", enchudb::HimoType::Number, 20);
+    db_p.define_himo("age", enchudb::HimoType::Number, 100);
 
     // 2 view 宣言 → スキーマとして DB ファイルに永続化される
     db_p.define_view(&["tenant", "dept", "status"]).unwrap();

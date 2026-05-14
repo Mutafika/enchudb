@@ -33,7 +33,7 @@ fn main() {
     eng.define_himo("speaker", HimoType::Ref, N_SPEAKERS);
     eng.define_himo("topic", HimoType::Ref, N_TOPICS);
     eng.define_himo("file", HimoType::Ref, N_FILES);
-    eng.define_himo("decision", HimoType::Symbol, 0);
+    eng.define_himo("decision", HimoType::Tag, 0);
     eng.flush().unwrap();
 
     let speaker_eids: Vec<u64> = (0..N_SPEAKERS).map(|_| eng.entity()).collect();

@@ -31,7 +31,7 @@ fn replica_rejects_tie() {
     // origin で schema 定義 + flush
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
-        eng.define_himo("val", HimoType::Value, 100);
+        eng.define_himo("val", HimoType::Number, 100);
         eng.flush().unwrap();
     }
     // replica として open
@@ -53,7 +53,7 @@ fn replica_rejects_entity_and_delete() {
     let path = tmp("rejects_entity");
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
-        eng.define_himo("val", HimoType::Value, 100);
+        eng.define_himo("val", HimoType::Number, 100);
         eng.flush().unwrap();
     }
     let eng = Arc::new(Engine::open_replica(&path).unwrap());
@@ -99,7 +99,7 @@ fn replica_allows_remote_apply_and_read() {
     let path = tmp("remote_apply");
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
-        eng.define_himo("val", HimoType::Value, 100);
+        eng.define_himo("val", HimoType::Number, 100);
         eng.flush().unwrap();
     }
     let eng = Arc::new(Engine::open_replica(&path).unwrap());
@@ -125,7 +125,7 @@ fn replica_syncs_from_origin_via_syncer() {
     // origin 準備 (通常の書き込み DB)
     {
         let mut eng = Engine::create_standalone(&path_origin).unwrap();
-        eng.define_himo("val", HimoType::Value, 100);
+        eng.define_himo("val", HimoType::Number, 100);
         eng.flush().unwrap();
     }
     let origin = Engine::open_concurrent_with_wal(&path_origin, 16 * 1024 * 1024).unwrap();
@@ -134,7 +134,7 @@ fn replica_syncs_from_origin_via_syncer() {
     // replica 準備 (同じ schema で作った後、replica として open)
     {
         let mut eng = Engine::create_standalone(&path_replica).unwrap();
-        eng.define_himo("val", HimoType::Value, 100);
+        eng.define_himo("val", HimoType::Number, 100);
         eng.flush().unwrap();
     }
     let replica = Engine::open_concurrent_replica(&path_replica, 16 * 1024 * 1024).unwrap();
@@ -184,7 +184,7 @@ fn set_replica_mode_toggle() {
     // runtime で replica on/off できる
     let path = tmp("toggle");
     let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("val", HimoType::Value, 100);
+    eng.define_himo("val", HimoType::Number, 100);
     let eng = Arc::new(eng);
     eng.set_peer_id(1);
 

@@ -293,7 +293,7 @@ impl Drop for WsPushClient {
 /// # let _ = std::fs::remove_file(format!("{}.wal", path));
 /// {
 ///     let mut eng = Engine::create_standalone(&path).unwrap();
-///     eng.define_himo("v", HimoType::Value, 100);
+///     eng.define_himo("v", HimoType::Number, 100);
 ///     eng.flush().unwrap();
 /// }
 /// let eng = Engine::open_concurrent_with_wal(&path, 4 * 1024 * 1024).unwrap();
@@ -481,7 +481,7 @@ mod tests {
         }
         {
             let mut eng = Engine::create_standalone(&path).unwrap();
-            eng.define_himo("v", HimoType::Value, 100);
+            eng.define_himo("v", HimoType::Number, 100);
             eng.flush().unwrap();
         }
         let eng = Engine::open_concurrent_with_wal(&path, 4 * 1024 * 1024).unwrap();

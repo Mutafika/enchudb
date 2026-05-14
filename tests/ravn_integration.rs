@@ -14,14 +14,14 @@ fn ec_path_navigation() {
     let path = db_path("ec_path");
     let mut eng = Engine::create_standalone(&path).unwrap();
 
-    eng.define_himo("type", HimoType::Value, 10);
-    eng.define_himo("price", HimoType::Value, 1000);
-    eng.define_himo("status", HimoType::Value, 5);
-    eng.define_himo("qty", HimoType::Value, 100);
+    eng.define_himo("type", HimoType::Number, 10);
+    eng.define_himo("price", HimoType::Number, 1000);
+    eng.define_himo("status", HimoType::Number, 5);
+    eng.define_himo("qty", HimoType::Number, 100);
     eng.define_himo("user_ref", HimoType::Ref, 0);
     eng.define_himo("order_ref", HimoType::Ref, 0);
     eng.define_himo("product_ref", HimoType::Ref, 0);
-    eng.define_himo("name", HimoType::Symbol, 0);
+    eng.define_himo("name", HimoType::Tag, 0);
 
     // product(0)
     let product = eng.entity();
@@ -70,11 +70,11 @@ fn sns_timeline() {
     let path = db_path("sns_timeline");
     let mut eng = Engine::create_standalone(&path).unwrap();
 
-    eng.define_himo("type", HimoType::Value, 10);
+    eng.define_himo("type", HimoType::Number, 10);
     eng.define_himo("author", HimoType::Ref, 0);
     eng.define_himo("follows", HimoType::Ref, 0);
-    eng.define_himo("name", HimoType::Symbol, 0);
-    eng.define_himo("content_id", HimoType::Value, 100);
+    eng.define_himo("name", HimoType::Tag, 0);
+    eng.define_himo("content_id", HimoType::Number, 100);
 
     // users
     let alice = eng.entity(); // 0
@@ -128,10 +128,10 @@ fn select_with_text() {
     let path = db_path("select_text");
     let mut eng = Engine::create_standalone(&path).unwrap();
 
-    eng.define_himo("type", HimoType::Value, 10);
-    eng.define_himo("age", HimoType::Value, 100);
-    eng.define_himo("name", HimoType::Symbol, 0);
-    eng.define_himo("city", HimoType::Symbol, 0);
+    eng.define_himo("type", HimoType::Number, 10);
+    eng.define_himo("age", HimoType::Number, 100);
+    eng.define_himo("name", HimoType::Tag, 0);
+    eng.define_himo("city", HimoType::Tag, 0);
 
     let e1 = eng.entity();
     eng.tie(e1, "type", 1);
@@ -176,10 +176,10 @@ fn exec_follow_pipe() {
     let path = db_path("exec_follow");
     let mut eng = Engine::create_standalone(&path).unwrap();
 
-    eng.define_himo("type", HimoType::Value, 10);
+    eng.define_himo("type", HimoType::Number, 10);
     eng.define_himo("dept_ref", HimoType::Ref, 0);
-    eng.define_himo("name", HimoType::Symbol, 0);
-    eng.define_himo("status", HimoType::Value, 5);
+    eng.define_himo("name", HimoType::Tag, 0);
+    eng.define_himo("status", HimoType::Number, 5);
 
     // dept(0)
     let dept = eng.entity();
@@ -231,8 +231,8 @@ fn exec_count() {
     let path = db_path("exec_count");
     let mut eng = Engine::create_standalone(&path).unwrap();
 
-    eng.define_himo("type", HimoType::Value, 10);
-    eng.define_himo("category", HimoType::Value, 10);
+    eng.define_himo("type", HimoType::Number, 10);
+    eng.define_himo("category", HimoType::Number, 10);
 
     for i in 0..20u32 {
         let e = eng.entity();
@@ -268,10 +268,10 @@ fn chained_pipes() {
     let path = db_path("chained");
     let mut eng = Engine::create_standalone(&path).unwrap();
 
-    eng.define_himo("type", HimoType::Value, 10);
+    eng.define_himo("type", HimoType::Number, 10);
     eng.define_himo("user_ref", HimoType::Ref, 0);
     eng.define_himo("region_ref", HimoType::Ref, 0);
-    eng.define_himo("name", HimoType::Symbol, 0);
+    eng.define_himo("name", HimoType::Tag, 0);
 
     // region(0)
     let region = eng.entity();
@@ -319,8 +319,8 @@ fn exec_get() {
     let path = db_path("exec_get");
     let mut eng = Engine::create_standalone(&path).unwrap();
 
-    eng.define_himo("type", HimoType::Value, 10);
-    eng.define_himo("score", HimoType::Value, 100);
+    eng.define_himo("type", HimoType::Number, 10);
+    eng.define_himo("score", HimoType::Number, 100);
 
     let e1 = eng.entity();
     eng.tie(e1, "type", 1);
@@ -350,7 +350,7 @@ fn exec_get() {
 fn exec_errors() {
     let path = db_path("exec_errors");
     let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("type", HimoType::Value, 10);
+    eng.define_himo("type", HimoType::Number, 10);
     let e = eng.entity();
     eng.tie(e, "type", 1);
     eng.rebuild();
@@ -369,7 +369,7 @@ fn exec_errors() {
 fn exec_empty_result() {
     let path = db_path("exec_empty");
     let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("type", HimoType::Value, 10);
+    eng.define_himo("type", HimoType::Number, 10);
     let e = eng.entity();
     eng.tie(e, "type", 1);
     eng.rebuild();

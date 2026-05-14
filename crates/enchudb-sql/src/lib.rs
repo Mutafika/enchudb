@@ -230,8 +230,8 @@ impl Database {
     /// create 系の path で marker/blob himo を事前 define しておく。
     /// open() 経由は既存 himo を読むだけなので不要。
     fn init_schema_storage(&mut self) {
-        self.eng.define_himo(TABLE_MARKER_HIMO, HimoType::Symbol, 0);
-        self.eng.define_himo(SCHEMA_BLOB_HIMO, HimoType::Symbol, 0);
+        self.eng.define_himo(TABLE_MARKER_HIMO, HimoType::Tag, 0);
+        self.eng.define_himo(SCHEMA_BLOB_HIMO, HimoType::Tag, 0);
     }
 
     /// schema metadata を `content()` blob に書き出す。
@@ -279,8 +279,8 @@ impl Database {
         for t in &self.tables {
             for c in &t.cols {
                 let ht = match c.ty {
-                    SqlType::Integer => HimoType::Value,
-                    SqlType::Text => HimoType::Symbol,
+                    SqlType::Integer => HimoType::Number,
+                    SqlType::Text => HimoType::Tag,
                 };
                 self.eng.define_himo(&c.himo, ht, 0);
             }
@@ -365,11 +365,11 @@ impl Database {
         }
 
         // himo を define
-        self.eng.define_himo(TABLE_MARKER_HIMO, HimoType::Symbol, 0);
+        self.eng.define_himo(TABLE_MARKER_HIMO, HimoType::Tag, 0);
         for col in &cols {
             let ht = match col.ty {
-                SqlType::Integer => HimoType::Value,
-                SqlType::Text => HimoType::Symbol,
+                SqlType::Integer => HimoType::Number,
+                SqlType::Text => HimoType::Tag,
             };
             self.eng.define_himo(&col.himo, ht, 0);
         }

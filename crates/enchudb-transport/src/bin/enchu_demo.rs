@@ -259,8 +259,8 @@ fn cmd_schema(opts: &HashMap<String, String>) {
     let max: u32 = opt(opts, "max").unwrap_or(100);
 
     let ht = match type_str.as_str() {
-        "value" => HimoType::Value,
-        "symbol" => HimoType::Symbol,
+        "value" => HimoType::Number,
+        "symbol" => HimoType::Tag,
         "ref" => HimoType::Ref,
         other => {
             eprintln!("invalid --type={}, expected value|symbol|ref", other);

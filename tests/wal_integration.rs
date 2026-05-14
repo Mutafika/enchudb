@@ -25,7 +25,7 @@ fn create_open_with_wal_roundtrip() {
     // create + 書き込み + commit + sync
     {
         let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
-        eng.define_himo("age", HimoType::Value, 100);
+        eng.define_himo("age", HimoType::Number, 100);
         drop(eng);
 
         // create_concurrent_with_wal は define 済み DB を対象にするパターンが必要
@@ -59,7 +59,7 @@ fn recover_after_drop_without_flush() {
     // define 済みの DB を準備
     {
         let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
-        eng.define_himo("tag", HimoType::Value, 50);
+        eng.define_himo("tag", HimoType::Number, 50);
         eng.flush().unwrap();
     }
 
@@ -89,7 +89,7 @@ fn uncommitted_writes_discarded_on_recovery() {
 
     {
         let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
-        eng.define_himo("score", HimoType::Value, 1000);
+        eng.define_himo("score", HimoType::Number, 1000);
         eng.flush().unwrap();
     }
 
@@ -129,7 +129,7 @@ fn wal_file_is_created() {
     let path = tmp("filecheck");
     {
         let mut eng = Engine::create_with_capacity(&path, 64).unwrap();
-        eng.define_himo("x", HimoType::Value, 10);
+        eng.define_himo("x", HimoType::Number, 10);
         eng.flush().unwrap();
     }
     {
@@ -144,7 +144,7 @@ fn stats_snapshot() {
     let path = tmp("stats");
     {
         let mut e = Engine::create_with_capacity(&path, 100).unwrap();
-        e.define_himo("n", HimoType::Value, 10);
+        e.define_himo("n", HimoType::Number, 10);
         e.flush().unwrap();
     }
     let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
@@ -171,7 +171,7 @@ fn content_async_roundtrip() {
     let path = tmp("content_async");
     {
         let mut e = Engine::create_with_capacity(&path, 100).unwrap();
-        e.define_himo("tag", HimoType::Value, 10);
+        e.define_himo("tag", HimoType::Number, 10);
         e.flush().unwrap();
     }
 
@@ -197,7 +197,7 @@ fn auto_commit_on_shutdown() {
     let path = tmp("autocommit");
     {
         let mut e = Engine::create_with_capacity(&path, 100).unwrap();
-        e.define_himo("n", HimoType::Value, 100);
+        e.define_himo("n", HimoType::Number, 100);
         e.flush().unwrap();
     }
 
@@ -222,7 +222,7 @@ fn header_crc_detects_corruption() {
     let path = tmp("crc");
     {
         let mut e = Engine::create_with_capacity(&path, 100).unwrap();
-        e.define_himo("x", HimoType::Value, 10);
+        e.define_himo("x", HimoType::Number, 10);
         e.flush().unwrap();
     }
 
@@ -253,7 +253,7 @@ fn concurrent_writes_with_wal() {
     let path = tmp("concurrent");
     {
         let mut eng = Engine::create_with_capacity(&path, 10_000).unwrap();
-        eng.define_himo("n", HimoType::Value, 10_000);
+        eng.define_himo("n", HimoType::Number, 10_000);
         eng.flush().unwrap();
     }
 

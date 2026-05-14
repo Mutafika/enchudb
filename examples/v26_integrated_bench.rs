@@ -14,9 +14,9 @@ fn main() {
     let mut db = enchudb::Engine::create_standalone(dir).unwrap();
 
     // 少ユニーク紐
-    db.define_himo("city", enchudb::HimoType::Value, 3);
-    db.define_himo("dept", enchudb::HimoType::Value, 4);
-    db.define_himo("grade", enchudb::HimoType::Value, 5);
+    db.define_himo("city", enchudb::HimoType::Number, 3);
+    db.define_himo("dept", enchudb::HimoType::Number, 4);
+    db.define_himo("grade", enchudb::HimoType::Number, 5);
 
     let t = Instant::now();
     for i in 0..n {

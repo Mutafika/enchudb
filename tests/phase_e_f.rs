@@ -40,7 +40,7 @@ fn snapshot_export_plain_engine_roundtrip() {
     // データ投入
     {
         let mut eng = Engine::create_standalone(&src_path).unwrap();
-        eng.define_himo("age", HimoType::Value, 100);
+        eng.define_himo("age", HimoType::Number, 100);
         let e = eng.entity();
         eng.tie(e, "age", 30);
         eng.tie_text(e, "name", "alice");
@@ -71,7 +71,7 @@ fn snapshot_export_with_wal_includes_wal_file() {
     // スキーマ定義
     {
         let mut eng = Engine::create_standalone(&src_path).unwrap();
-        eng.define_himo("val", HimoType::Value, 100);
+        eng.define_himo("val", HimoType::Number, 100);
         eng.flush().unwrap();
     }
 
@@ -112,7 +112,7 @@ fn stats_includes_hlc_info() {
     let src_path = tmp("stats_hlc");
     {
         let mut eng = Engine::create_standalone(&src_path).unwrap();
-        eng.define_himo("val", HimoType::Value, 100);
+        eng.define_himo("val", HimoType::Number, 100);
         eng.flush().unwrap();
     }
 
@@ -152,7 +152,7 @@ fn audit_returns_wal_records() {
     let src_path = tmp("audit_all");
     {
         let mut eng = Engine::create_standalone(&src_path).unwrap();
-        eng.define_himo("val", HimoType::Value, 100);
+        eng.define_himo("val", HimoType::Number, 100);
         eng.flush().unwrap();
     }
 
@@ -189,7 +189,7 @@ fn audit_filter_by_author_excludes_others() {
     let src_path = tmp("audit_auth");
     {
         let mut eng = Engine::create_standalone(&src_path).unwrap();
-        eng.define_himo("val", HimoType::Value, 100);
+        eng.define_himo("val", HimoType::Number, 100);
         eng.flush().unwrap();
     }
 
@@ -227,7 +227,7 @@ fn audit_filter_by_hlc_range() {
     let src_path = tmp("audit_hlc");
     {
         let mut eng = Engine::create_standalone(&src_path).unwrap();
-        eng.define_himo("val", HimoType::Value, 100);
+        eng.define_himo("val", HimoType::Number, 100);
         eng.flush().unwrap();
     }
 

@@ -51,13 +51,13 @@ fn seed(path: &str) -> Arc<Engine> {
     let mut eng = Engine::create_standalone(path).unwrap();
 
     // スキーマ
-    eng.define_himo("kind", HimoType::Value, 10);     // 1=Person, 2=Topic, 3=File, 4=Session
-    eng.define_himo("name", HimoType::Symbol, 0);
+    eng.define_himo("kind", HimoType::Number, 10);     // 1=Person, 2=Topic, 3=File, 4=Session
+    eng.define_himo("name", HimoType::Tag, 0);
     eng.define_himo("speaker", HimoType::Ref, 0);
     eng.define_himo("topic", HimoType::Ref, 0);
     eng.define_himo("related_file", HimoType::Ref, 0);
-    eng.define_himo("decision", HimoType::Symbol, 0);
-    eng.define_himo("date", HimoType::Value, 0);
+    eng.define_himo("decision", HimoType::Tag, 0);
+    eng.define_himo("date", HimoType::Number, 0);
 
     // 人物
     let alice = eng.entity();

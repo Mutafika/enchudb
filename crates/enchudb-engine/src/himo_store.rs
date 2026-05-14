@@ -15,14 +15,24 @@ use crate::region::Region;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum HimoType {
-    Symbol = 0,
-    Value = 1,
+    /// 共有タグ — Vocabulary を引く (dedupe あり)。複数 entity が同じ tag を共有する hub。
+    Tag = 0,
+    /// タグなし — u32 をそのまま値として扱う。inline 数値・eid 等。
+    Number = 1,
+    /// 他 entity への参照 — u32 を eid として扱う。engine は素通しするだけ、FK 制約は schema 層。
     Ref = 2,
+    /// 終端タグ — FreeStore を引く (dedupe なし)。1 entity しか繋がらない葉ノード。
+    Leaf = 3,
 }
 
 impl HimoType {
     pub fn from_byte(b: u8) -> Self {
-        match b { 0 => Self::Symbol, 2 => Self::Ref, _ => Self::Value }
+        match b {
+            0 => Self::Tag,
+            2 => Self::Ref,
+            3 => Self::Leaf,
+            _ => Self::Number,
+        }
     }
 }
 

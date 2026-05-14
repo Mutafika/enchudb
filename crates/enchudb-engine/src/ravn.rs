@@ -350,10 +350,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mut eng = Engine::create_standalone(&path).unwrap();
 
-        eng.define_himo("type", HimoType::Value, 10);
-        eng.define_himo("region", HimoType::Value, 10);
-        eng.define_himo("country", HimoType::Value, 10);
-        eng.define_himo("name", HimoType::Symbol, 0);
+        eng.define_himo("type", HimoType::Number, 10);
+        eng.define_himo("region", HimoType::Number, 10);
+        eng.define_himo("country", HimoType::Number, 10);
+        eng.define_himo("name", HimoType::Tag, 0);
         eng.define_himo("parent", HimoType::Ref, 0);
         eng.define_himo("manager", HimoType::Ref, 0);
 

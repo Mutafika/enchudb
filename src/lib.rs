@@ -14,9 +14,9 @@
 //!
 //! let mut db = Database::create("/tmp/app.db")?;
 //! let users = db.table("users")
-//!     .integer("id")
-//!     .text("name")
-//!     .integer("age")
+//!     .number("id")
+//!     .tag("name")
+//!     .number("age")
 //!     .primary_key("id")
 //!     .build()?;
 //!
@@ -31,7 +31,7 @@
 //! let path = format!("/tmp/enchudb-doc-{}.db", std::process::id());
 //! let _ = std::fs::remove_file(&path);
 //! let mut db = enchudb::Engine::create_standalone(&path).unwrap();
-//! db.define_himo("age", enchudb::HimoType::Value, 100);
+//! db.define_himo("age", enchudb::HimoType::Number, 100);
 //! let e = db.entity();
 //! db.tie(e, "age", 30);
 //! db.rebuild();

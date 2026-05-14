@@ -44,8 +44,8 @@ fn cleanup(path: &str) {
 fn ten_million_insert_and_lookup() {
     let path = tmp("10m");
     let mut eng = Engine::create_with_capacity(&path, 10_000_000).unwrap();
-    eng.define_himo("bucket", HimoType::Value, 1000);
-    eng.define_himo("flag", HimoType::Value, 4);
+    eng.define_himo("bucket", HimoType::Number, 1000);
+    eng.define_himo("flag", HimoType::Number, 4);
 
     let t0 = Instant::now();
     for i in 0..10_000_000u32 {
@@ -96,7 +96,7 @@ fn one_million_flush_reopen_cycle() {
     let t0 = Instant::now();
     {
         let mut eng = Engine::create_with_capacity(&path, 1_000_000).unwrap();
-        eng.define_himo("v", HimoType::Value, 100);
+        eng.define_himo("v", HimoType::Number, 100);
         for i in 0..1_000_000u32 {
             let e = eng.entity();
             eng.tie(e, "v", i % 100);
@@ -133,7 +133,7 @@ fn one_million_flush_reopen_cycle() {
 fn high_cardinality_100k_unique_values() {
     let path = tmp("100k_uniq");
     let mut eng = Engine::create_with_capacity(&path, 200_000).unwrap();
-    eng.define_himo("uid", HimoType::Value, 100_000);
+    eng.define_himo("uid", HimoType::Number, 100_000);
 
     let t0 = Instant::now();
     for i in 0..100_000u32 {

@@ -43,14 +43,14 @@ fn main() {
 
     let mut db = Engine::create_with_capacity(&path, N + 100).unwrap();
     // 少ユニーク紐(combo / pair の対象になりやすい)
-    db.define_himo("tenant", HimoType::Value, 10);
-    db.define_himo("dept",   HimoType::Value, 8);
-    db.define_himo("role",   HimoType::Value, 4);
-    db.define_himo("status", HimoType::Value, 5);
-    db.define_himo("year",   HimoType::Value, 5);
+    db.define_himo("tenant", HimoType::Number, 10);
+    db.define_himo("dept",   HimoType::Number, 8);
+    db.define_himo("role",   HimoType::Number, 4);
+    db.define_himo("status", HimoType::Number, 5);
+    db.define_himo("year",   HimoType::Number, 5);
     // 多ユニーク紐
-    db.define_himo("salary", HimoType::Value, 1000);
-    db.define_himo("age",    HimoType::Value, 60);
+    db.define_himo("salary", HimoType::Number, 1000);
+    db.define_himo("age",    HimoType::Number, 60);
 
     println!("=== v33 vs v33+v26 ペアテーブル ベンチ ===");
     println!("entities: {}, 7 紐(5 少ユニーク + 2 多ユニーク)\n", N);

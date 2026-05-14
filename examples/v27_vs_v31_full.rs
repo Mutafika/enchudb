@@ -19,9 +19,9 @@ fn main() {
         let _ = std::fs::remove_file(format!("{}.wal", path));
         let _ = std::fs::remove_file(format!("{}.crc", path));
         let mut e = Engine::create_with_capacity(path, n + 1000).unwrap();
-        e.define_himo("cls", HimoType::Value, 1000);
-        e.define_himo("tenant", HimoType::Value, 100);
-        e.define_himo("price", HimoType::Value, 10_000);
+        e.define_himo("cls", HimoType::Number, 1000);
+        e.define_himo("tenant", HimoType::Number, 100);
+        e.define_himo("price", HimoType::Number, 10_000);
         e.define_himo("parent", HimoType::Ref, 0);
         e.flush().unwrap();
     }

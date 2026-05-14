@@ -22,10 +22,10 @@ fn main() {
 
     // まず define_himo + 初期データ投入は &mut self の世界で完了させる。
     let mut db = enchudb::Engine::create_with_capacity(path, 2_000_000).unwrap();
-    db.define_himo("tenant", enchudb::HimoType::Value, 16);
-    db.define_himo("dept", enchudb::HimoType::Value, 8);
-    db.define_himo("status", enchudb::HimoType::Value, 4);
-    db.define_himo("age", enchudb::HimoType::Value, 100);
+    db.define_himo("tenant", enchudb::HimoType::Number, 16);
+    db.define_himo("dept", enchudb::HimoType::Number, 8);
+    db.define_himo("status", enchudb::HimoType::Number, 4);
+    db.define_himo("age", enchudb::HimoType::Number, 100);
 
     println!("=== 初期データ投入({}件 × 4 紐)===", n_initial);
     let t = Instant::now();

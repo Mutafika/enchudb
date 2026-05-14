@@ -27,8 +27,8 @@ fn main() {
         let dir = "/tmp/v26_dest_1.db";
         let _ = std::fs::remove_file(dir);
         let mut db = enchudb::Engine::create_standalone(dir).unwrap();
-        db.define_himo("x", enchudb::HimoType::Value, 5);
-        db.define_himo("y", enchudb::HimoType::Value, 5);
+        db.define_himo("x", enchudb::HimoType::Number, 5);
+        db.define_himo("y", enchudb::HimoType::Number, 5);
 
         // 100件投入
         for i in 0..100u32 {
@@ -65,8 +65,8 @@ fn main() {
         let dir = "/tmp/v26_dest_2.db";
         let _ = std::fs::remove_file(dir);
         let mut db = enchudb::Engine::create_standalone(dir).unwrap();
-        db.define_himo("a", enchudb::HimoType::Value, 3);
-        db.define_himo("b", enchudb::HimoType::Value, 3);
+        db.define_himo("a", enchudb::HimoType::Number, 3);
+        db.define_himo("b", enchudb::HimoType::Number, 3);
 
         for i in 0..50u32 {
             let e = db.entity();
@@ -97,7 +97,7 @@ fn main() {
         let dir = "/tmp/v26_dest_3.db";
         let _ = std::fs::remove_file(dir);
         let mut db = enchudb::Engine::create_standalone(dir).unwrap();
-        db.define_himo("x", enchudb::HimoType::Value, 5);
+        db.define_himo("x", enchudb::HimoType::Number, 5);
 
         let e = db.entity();
         for _ in 0..1000 {
@@ -120,7 +120,7 @@ fn main() {
 
         // 50紐定義
         for i in 0..50u32 {
-            db.define_himo(&format!("h{}", i), enchudb::HimoType::Value, 3);
+            db.define_himo(&format!("h{}", i), enchudb::HimoType::Number, 3);
         }
         let e = db.entity();
         for i in 0..50u32 {
@@ -140,8 +140,8 @@ fn main() {
         let dir = "/tmp/v26_dest_5.db";
         let _ = std::fs::remove_file(dir);
         let mut db = enchudb::Engine::create_standalone(dir).unwrap();
-        db.define_himo("round", enchudb::HimoType::Value, 10);
-        db.define_himo("val", enchudb::HimoType::Value, 100);
+        db.define_himo("round", enchudb::HimoType::Number, 10);
+        db.define_himo("val", enchudb::HimoType::Number, 100);
 
         let mut all_ok = true;
         for round in 0..10u32 {
@@ -172,9 +172,9 @@ fn main() {
         let dir = "/tmp/v26_dest_6.db";
         let _ = std::fs::remove_file(dir);
         let mut db = enchudb::Engine::create_standalone(dir).unwrap();
-        db.define_himo("a", enchudb::HimoType::Value, 5);
-        db.define_himo("b", enchudb::HimoType::Value, 4);
-        db.define_himo("c", enchudb::HimoType::Value, 3);
+        db.define_himo("a", enchudb::HimoType::Number, 5);
+        db.define_himo("b", enchudb::HimoType::Number, 4);
+        db.define_himo("c", enchudb::HimoType::Number, 3);
 
         let n = 10_000u32;
         for i in 0..n {
@@ -232,8 +232,8 @@ fn main() {
         let dir = "/tmp/v26_dest_7.db";
         let _ = std::fs::remove_file(dir);
         let mut db = enchudb::Engine::create_standalone(dir).unwrap();
-        db.define_himo("x", enchudb::HimoType::Value, 10);
-        db.define_himo("y", enchudb::HimoType::Value, 10);
+        db.define_himo("x", enchudb::HimoType::Number, 10);
+        db.define_himo("y", enchudb::HimoType::Number, 10);
 
         let e = db.entity();
         for i in 0..100u32 {
@@ -254,8 +254,8 @@ fn main() {
         let dir = "/tmp/v26_dest_8.db";
         let _ = std::fs::remove_file(dir);
         let mut db = enchudb::Engine::create_standalone(dir).unwrap();
-        db.define_himo("x", enchudb::HimoType::Value, 10);
-        db.define_himo("y", enchudb::HimoType::Value, 10);
+        db.define_himo("x", enchudb::HimoType::Number, 10);
+        db.define_himo("y", enchudb::HimoType::Number, 10);
 
         let e = db.entity();
         db.tie(e, "x", 0);
@@ -274,8 +274,8 @@ fn main() {
         let dir = "/tmp/v26_dest_9.db";
         let _ = std::fs::remove_file(dir);
         let mut db = enchudb::Engine::create_standalone(dir).unwrap();
-        db.define_himo("x", enchudb::HimoType::Value, 5);
-        db.define_himo("y", enchudb::HimoType::Value, 5);
+        db.define_himo("x", enchudb::HimoType::Number, 5);
+        db.define_himo("y", enchudb::HimoType::Number, 5);
 
         // 100件作って偶数番を削除
         for i in 0..100u32 {
@@ -305,7 +305,7 @@ fn main() {
         let dir = "/tmp/v26_dest_10.db";
         let _ = std::fs::remove_file(dir);
         let mut db = enchudb::Engine::create_standalone(dir).unwrap();
-        db.define_himo("dept", enchudb::HimoType::Value, 5);
+        db.define_himo("dept", enchudb::HimoType::Number, 5);
 
         for i in 0..100u32 {
             let e = db.entity();
@@ -329,8 +329,8 @@ fn main() {
         let dir = "/tmp/v26_dest_11.db";
         let _ = std::fs::remove_file(dir);
         let mut db = enchudb::Engine::create_with_capacity(dir, 500_000).unwrap();
-        db.define_himo("x", enchudb::HimoType::Value, 10);
-        db.define_himo("y", enchudb::HimoType::Value, 8);
+        db.define_himo("x", enchudb::HimoType::Number, 10);
+        db.define_himo("y", enchudb::HimoType::Number, 8);
 
         for i in 0..500_000u32 {
             let e = db.entity();
@@ -353,7 +353,7 @@ fn main() {
         let dir = "/tmp/v26_dest_12.db";
         let _ = std::fs::remove_file(dir);
         let mut db = enchudb::Engine::create_standalone(dir).unwrap();
-        db.define_himo("x", enchudb::HimoType::Value, 5);
+        db.define_himo("x", enchudb::HimoType::Number, 5);
 
         for i in 0..10u32 {
             let e = db.entity();

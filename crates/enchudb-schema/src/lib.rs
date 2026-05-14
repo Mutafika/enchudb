@@ -12,10 +12,10 @@
 //! let mut db = Database::create("/tmp/app.db")?;
 //!
 //! let users = db.table("users")
-//!     .integer("id")
-//!     .text("name")
-//!     .integer("age")
-//!     .text("city")
+//!     .number("id")
+//!     .tag("name")
+//!     .number("age")
+//!     .tag("city")
 //!     .primary_key("id")
 //!     .build()?;
 //!
@@ -44,11 +44,11 @@
 //! # use enchudb_schema::{Database, ColumnType};
 //! # let mut db = Database::create("/tmp/x.db")?;
 //! // 先に referenced 側 table を build
-//! db.table("companies").integer("id").text("name").primary_key("id").build()?;
+//! db.table("companies").number("id").tag("name").primary_key("id").build()?;
 //!
 //! let users = db.table("users")
-//!     .integer("id")
-//!     .text("name")
+//!     .number("id")
+//!     .tag("name")
 //!     .ref_to("company", "companies")  // users.company : Ref → companies.eid
 //!     .primary_key("id")
 //!     .build()?;
@@ -69,32 +69,44 @@ const TABLE_MARKER_HIMO: &str = "__enchu_table";
 const SCHEMA_MARKER: &str = "__enchu_schema_v1__";
 const SCHEMA_BLOB_HIMO: &str = "__enchu_schema_blob";
 
+/// 列の型。
+///
+/// - `Number` — inline 数値 (HimoType::Number)
+/// - `Tag` — 共有タグ、vocab 経由 (HimoType::Tag)。enum / カテゴリ / 名前など引かれる値向き
+/// - `Leaf` — 終端タグ、FreeStore 経由 (HimoType::Leaf)。備考 / 本文など引かれない自由記述向き
+/// - `Ref` — 他テーブル entity への参照 (HimoType::Ref)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnType {
-    Integer,
-    Text,
+    Number,
+    Tag,
+    Leaf,
     Ref,
 }
 
 impl ColumnType {
     fn himo_type(self) -> HimoType {
         match self {
-            ColumnType::Integer => HimoType::Value,
-            ColumnType::Text => HimoType::Symbol,
+            ColumnType::Number => HimoType::Number,
+            ColumnType::Tag => HimoType::Tag,
+            ColumnType::Leaf => HimoType::Leaf,
             ColumnType::Ref => HimoType::Ref,
         }
     }
     fn tag(self) -> &'static str {
+        // 永続化 tag — 既存 DB 互換のため Number="I", Tag="T", Ref="R" は据え置き。
+        // 新規 Leaf="L"。
         match self {
-            ColumnType::Integer => "I",
-            ColumnType::Text => "T",
+            ColumnType::Number => "I",
+            ColumnType::Tag => "T",
+            ColumnType::Leaf => "L",
             ColumnType::Ref => "R",
         }
     }
     fn from_tag(s: &str) -> Option<Self> {
         match s {
-            "I" => Some(ColumnType::Integer),
-            "T" => Some(ColumnType::Text),
+            "I" => Some(ColumnType::Number),
+            "T" => Some(ColumnType::Tag),
+            "L" => Some(ColumnType::Leaf),
             "R" => Some(ColumnType::Ref),
             _ => None,
         }
@@ -104,14 +116,14 @@ impl ColumnType {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
-    Integer(i64),
+    Number(i64),
     Text(String),
     Ref(EntityId),
 }
 
-impl From<i64> for Value { fn from(v: i64) -> Self { Value::Integer(v) } }
-impl From<i32> for Value { fn from(v: i32) -> Self { Value::Integer(v as i64) } }
-impl From<u32> for Value { fn from(v: u32) -> Self { Value::Integer(v as i64) } }
+impl From<i64> for Value { fn from(v: i64) -> Self { Value::Number(v) } }
+impl From<i32> for Value { fn from(v: i32) -> Self { Value::Number(v as i64) } }
+impl From<u32> for Value { fn from(v: u32) -> Self { Value::Number(v as i64) } }
 impl From<&str> for Value { fn from(v: &str) -> Self { Value::Text(v.to_string()) } }
 impl From<String> for Value { fn from(v: String) -> Self { Value::Text(v) } }
 impl From<&String> for Value { fn from(v: &String) -> Self { Value::Text(v.clone()) } }
@@ -226,8 +238,8 @@ impl Database {
     }
 
     fn wrap_new(mut eng: Engine) -> Result<Self, SchemaError> {
-        eng.define_himo(TABLE_MARKER_HIMO, HimoType::Symbol, 0);
-        eng.define_himo(SCHEMA_BLOB_HIMO, HimoType::Symbol, 0);
+        eng.define_himo(TABLE_MARKER_HIMO, HimoType::Tag, 0);
+        eng.define_himo(SCHEMA_BLOB_HIMO, HimoType::Tag, 0);
         let marker_himo_id = eng.himo_id(TABLE_MARKER_HIMO)
             .ok_or_else(|| SchemaError::Internal("marker himo id".into()))? as u16;
         Ok(Self {
@@ -240,8 +252,8 @@ impl Database {
 
     pub fn open(path: &str) -> Result<Self, SchemaError> {
         let mut eng = Engine::open_standalone(path).map_err(|e| SchemaError::Io(e.to_string()))?;
-        eng.define_himo(TABLE_MARKER_HIMO, HimoType::Symbol, 0);
-        eng.define_himo(SCHEMA_BLOB_HIMO, HimoType::Symbol, 0);
+        eng.define_himo(TABLE_MARKER_HIMO, HimoType::Tag, 0);
+        eng.define_himo(SCHEMA_BLOB_HIMO, HimoType::Tag, 0);
         let marker_himo_id = eng.himo_id(TABLE_MARKER_HIMO)
             .ok_or_else(|| SchemaError::Internal("marker himo id".into()))? as u16;
         let mut db = Self {
@@ -511,8 +523,14 @@ impl<'a> TableBuilder<'a> {
         self.cols.push((name.into(), ty));
         self
     }
-    pub fn integer(self, name: &str) -> Self { self.column(name, ColumnType::Integer) }
-    pub fn text(self, name: &str) -> Self { self.column(name, ColumnType::Text) }
+    /// inline 数値列 (HimoType::Number)。
+    pub fn number(self, name: &str) -> Self { self.column(name, ColumnType::Number) }
+    /// 共有タグ列 (HimoType::Tag、vocab 経由 / dedupe あり)。
+    /// enum / カテゴリ / 名前など、引かれる値に向く。
+    pub fn tag(self, name: &str) -> Self { self.column(name, ColumnType::Tag) }
+    /// 終端タグ列 (HimoType::Leaf、FreeStore 経由 / dedupe なし)。
+    /// 備考・メモ・本文など、引かれない自由記述に向く。
+    pub fn leaf(self, name: &str) -> Self { self.column(name, ColumnType::Leaf) }
 
     /// Ref 型カラムを宣言。 値は他テーブルの EntityId を保持する。
     /// `Table::where_ref` で逆引きできる。 `to_table` 名は build 時に存在チェック。
@@ -753,8 +771,8 @@ impl<'a> Query<'a> {
         match self.table.col(col) {
             None => self.preds.push(Predicate::Eq(u16::MAX, u32::MAX)), // unknown col → empty
             Some(cd) => match (cd.ty, v) {
-                (ColumnType::Text, Value::Text(s)) => self.preds.push(Predicate::EqText(cd.himo_id, s)),
-                (ColumnType::Integer, Value::Integer(n)) if n >= 0 && (n as u64) < u32::MAX as u64 => {
+                (ColumnType::Tag, Value::Text(s)) => self.preds.push(Predicate::EqText(cd.himo_id, s)),
+                (ColumnType::Number, Value::Number(n)) if n >= 0 && (n as u64) < u32::MAX as u64 => {
                     self.preds.push(Predicate::Eq(cd.himo_id, n as u32));
                 }
                 (ColumnType::Ref, Value::Ref(eid)) => {
@@ -906,9 +924,9 @@ impl<'a> EntityRef<'a> {
         let cd = self.table.col(col)?;
         let eng = self.db.engine();
         match cd.ty {
-            ColumnType::Integer => eng.get(self.eid, &cd.himo_name).map(|v| Value::Integer(v as i64)),
+            ColumnType::Number => eng.get(self.eid, &cd.himo_name).map(|v| Value::Number(v as i64)),
             ColumnType::Ref => eng.get(self.eid, &cd.himo_name).map(|v| Value::Ref(v as EntityId)),
-            ColumnType::Text => eng.get_text(self.eid, &cd.himo_name)
+            ColumnType::Tag | ColumnType::Leaf => eng.get_text(self.eid, &cd.himo_name)
                 .and_then(|b| std::str::from_utf8(b).ok().map(|s| Value::Text(s.to_string()))),
         }
     }
@@ -967,13 +985,16 @@ impl<'a> EntityUpdate<'a> {
 fn value_to_raw_for_query(eng: &Engine, cd: &ColumnInner, v: &Value) -> Result<u32, SchemaError> {
     match (cd.ty, v) {
         (_, Value::Null) => Err(SchemaError::BadValue("Null is not a queryable value".into())),
-        (ColumnType::Integer, Value::Integer(n)) => {
+        (ColumnType::Number, Value::Number(n)) => {
             if *n < 0 || (*n as u64) >= u32::MAX as u64 {
                 return Err(SchemaError::BadValue(format!("integer out of u32 range: {n}")));
             }
             Ok(*n as u32)
         }
-        (ColumnType::Text, Value::Text(s)) => Ok(eng.vocab_id(s).unwrap_or(u32::MAX)),
+        (ColumnType::Tag, Value::Text(s)) => Ok(eng.vocab_id(s).unwrap_or(u32::MAX)),
+        // Leaf は dedupe しないので等値クエリは原理的に成立しない (毎回別 vid)。
+        // 念のため `u32::MAX` を返してクエリ結果 0 件にする。
+        (ColumnType::Leaf, Value::Text(_)) => Ok(u32::MAX),
         (ColumnType::Ref, Value::Ref(eid)) => Ok(*eid as u32),
         (t, v) => Err(SchemaError::TypeMismatch(format!("{t:?} vs {v:?}"))),
     }
@@ -983,14 +1004,16 @@ fn value_to_raw_for_query(eng: &Engine, cd: &ColumnInner, v: &Value) -> Result<u
 fn tie_value(eng: &Engine, eid: EntityId, cd: &ColumnInner, v: &Value) -> Result<(), SchemaError> {
     match (cd.ty, v) {
         (_, Value::Null) => Err(SchemaError::BadValue("Null tie not supported (use entity.delete or untie)".into())),
-        (ColumnType::Integer, Value::Integer(n)) => {
+        (ColumnType::Number, Value::Number(n)) => {
             if *n < 0 || (*n as u64) >= u32::MAX as u64 {
                 return Err(SchemaError::BadValue(format!("integer out of u32 range: {n}")));
             }
             eng.tie_to(eid, &cd.himo_name, *n as u32);
             Ok(())
         }
-        (ColumnType::Text, Value::Text(s)) => {
+        (ColumnType::Tag, Value::Text(s)) | (ColumnType::Leaf, Value::Text(s)) => {
+            // engine の tie_text_to は himo の HimoType (Tag / Leaf) を見て
+            // vocab.get_or_insert (dedupe) vs vocab.insert (新規 id) を dispatch する。
             eng.tie_text_to(eid, &cd.himo_name, s);
             Ok(())
         }
@@ -1098,9 +1121,9 @@ mod tests {
         {
             let mut db = Database::create(&path).unwrap();
             let users = db.table("users")
-                .integer("id")
-                .text("name")
-                .integer("age")
+                .number("id")
+                .tag("name")
+                .number("age")
                 .primary_key("id")
                 .build()
                 .unwrap();
@@ -1113,7 +1136,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(users.entity(alice).get("name"), Some(Value::Text("Alice".into())));
-            assert_eq!(users.entity(alice).get("age"), Some(Value::Integer(30)));
+            assert_eq!(users.entity(alice).get("age"), Some(Value::Number(30)));
         }
         let _ = std::fs::remove_file(&path);
     }
@@ -1125,10 +1148,10 @@ mod tests {
         {
             let mut db = Database::create(&path).unwrap();
             let users = db.table("users")
-                .integer("id")
-                .text("name")
-                .integer("age")
-                .text("city")
+                .number("id")
+                .tag("name")
+                .number("age")
+                .tag("city")
                 .primary_key("id")
                 .build()
                 .unwrap();
@@ -1153,8 +1176,8 @@ mod tests {
         {
             let mut db = Database::create(&path).unwrap();
             let t = db.table("kv")
-                .text("key")
-                .integer("ts")
+                .tag("key")
+                .number("ts")
                 .primary_key("key")
                 .build()
                 .unwrap();
@@ -1163,7 +1186,7 @@ mod tests {
             let rows = t.where_eq("key", "k1").find().unwrap();
             assert_eq!(rows.len(), 1);
             let ts = t.entity(rows[0]).get("ts");
-            assert_eq!(ts, Some(Value::Integer(200)));
+            assert_eq!(ts, Some(Value::Number(200)));
         }
         let _ = std::fs::remove_file(&path);
     }
@@ -1174,7 +1197,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         {
             let mut db = Database::create(&path).unwrap();
-            let users = db.table("users").integer("id").text("name").primary_key("id").build().unwrap();
+            let users = db.table("users").number("id").tag("name").primary_key("id").build().unwrap();
             users.insert().set("id", 1i64).set("name", "Alice").commit().unwrap();
             users.insert().set("id", 2i64).set("name", "Bob").commit().unwrap();
         }
@@ -1202,16 +1225,16 @@ mod tests {
         {
             let mut db = Database::create(&path).unwrap();
             let t = db.table("notes")
-                .integer("id")
-                .text("body")
-                .integer("ts")
+                .number("id")
+                .tag("body")
+                .number("ts")
                 .primary_key("id")
                 .build().unwrap();
             let n1 = t.insert().set("id", 1i64).set("body", "hi").set("ts", 100i64).commit().unwrap();
             let _n2 = t.insert().set("id", 2i64).set("body", "yo").set("ts", 200i64).commit().unwrap();
 
             t.entity(n1).set("ts", 150i64).commit().unwrap();
-            assert_eq!(t.entity(n1).get("ts"), Some(Value::Integer(150)));
+            assert_eq!(t.entity(n1).get("ts"), Some(Value::Number(150)));
 
             t.entity(n1).delete().unwrap();
             // entity 削除後は all() からも消える。
@@ -1231,15 +1254,15 @@ mod tests {
 
             // companies を build (TableBuilder は &mut db、 build 後 handle は &db 借用)。
             let (ant_id, goo_id) = {
-                let companies = db.table("companies").integer("id").text("name").primary_key("id").build().unwrap();
+                let companies = db.table("companies").number("id").tag("name").primary_key("id").build().unwrap();
                 let a = companies.insert().set("id", 1i64).set("name", "Anthropic").commit().unwrap();
                 let g = companies.insert().set("id", 2i64).set("name", "Google").commit().unwrap();
                 (a, g)
             }; // companies の借用がここで終わる
 
             let users = db.table("users")
-                .integer("id")
-                .text("name")
+                .number("id")
+                .tag("name")
                 .ref_to("company", "companies")
                 .primary_key("id")
                 .build().unwrap();
@@ -1263,7 +1286,7 @@ mod tests {
 
         let db_arc: Arc<Database> = {
             let mut db = Database::create_growable_tiny(&path).unwrap();
-            db.table("kv").text("key").integer("ts").primary_key("key").build().unwrap();
+            db.table("kv").tag("key").number("ts").primary_key("key").build().unwrap();
             assert!(!db.is_concurrent());
             db.finish_with_wal(64 * 1024).unwrap()
         };
@@ -1276,7 +1299,7 @@ mod tests {
         kv.insert().set("key", "k2").set("ts", 200i64).commit().unwrap();
         let rows = kv.where_eq("key", "k1").find().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(kv.entity(rows[0]).get("ts"), Some(Value::Integer(100)));
+        assert_eq!(kv.entity(rows[0]).get("ts"), Some(Value::Number(100)));
 
         // Arc clone して別 thread からも見えるか
         let db_clone = db_arc.clone();
@@ -1301,7 +1324,7 @@ mod tests {
         // 1: build → finish_with_wal → 書き込み → wal_sync で durable
         {
             let mut db = Database::create_growable_tiny(&path).unwrap();
-            db.table("kv").text("key").integer("ts").primary_key("key").build().unwrap();
+            db.table("kv").tag("key").number("ts").primary_key("key").build().unwrap();
             let arc = db.finish_with_wal(64 * 1024).unwrap();
             let kv = arc.get_table("kv").unwrap();
             kv.insert().set("key", "alpha").set("ts", 1000i64).commit().unwrap();
@@ -1317,10 +1340,133 @@ mod tests {
             let kv = arc.get_table("kv").unwrap();
             let alpha = kv.where_eq("key", "alpha").find_one().unwrap();
             assert!(alpha.is_some());
-            assert_eq!(kv.entity(alpha.unwrap()).get("ts"), Some(Value::Integer(1000)));
+            assert_eq!(kv.entity(alpha.unwrap()).get("ts"), Some(Value::Number(1000)));
         }
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[test]
+    fn leaf_column_basic_write_read() {
+        let path = tmp("leaf_basic");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut db = Database::create(&path).unwrap();
+            let posts = db.table("posts")
+                .number("id")
+                .tag("title")
+                .leaf("body")
+                .primary_key("id")
+                .build()
+                .unwrap();
+
+            let e = posts.insert()
+                .set("id", 1i64)
+                .set("title", "hello")
+                .set("body", "今日の天気は晴れ。良い一日だった。")
+                .commit()
+                .unwrap();
+
+            // Leaf 列も get で読める (engine 内部では vocab 経由だが API は同じ)
+            assert_eq!(
+                posts.entity(e).get("body"),
+                Some(Value::Text("今日の天気は晴れ。良い一日だった。".into()))
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn leaf_does_not_dedupe() {
+        // 同じ文字列を複数 entity の Leaf 列に書いた時、vocab_id が別であることを確認。
+        // Tag なら同じ vocab_id を共有するが、Leaf は dedupe しない。
+        let path = tmp("leaf_no_dedupe");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut db = Database::create(&path).unwrap();
+            let notes = db.table("notes")
+                .number("id")
+                .leaf("memo")
+                .primary_key("id")
+                .build()
+                .unwrap();
+
+            let e1 = notes.insert().set("id", 1i64).set("memo", "same").commit().unwrap();
+            let e2 = notes.insert().set("id", 2i64).set("memo", "same").commit().unwrap();
+
+            // 両方読めて値は同じ
+            assert_eq!(notes.entity(e1).get("memo"), Some(Value::Text("same".into())));
+            assert_eq!(notes.entity(e2).get("memo"), Some(Value::Text("same".into())));
+
+            // engine 直叩きで vocab_id が違うことを確認 (himo 名は "notes.memo")
+            let eng = db.engine();
+            let v1 = eng.get(e1, "notes.memo").unwrap();
+            let v2 = eng.get(e2, "notes.memo").unwrap();
+            assert_ne!(v1, v2, "Leaf は同じ文字列でも別 vocab_id を発行するべき");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tag_dedupes_but_leaf_does_not_in_same_db() {
+        // 同じ DB で Tag と Leaf を比較。Tag は dedupe、Leaf は dedupe しない。
+        let path = tmp("tag_vs_leaf");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut db = Database::create(&path).unwrap();
+            let items = db.table("items")
+                .number("id")
+                .tag("category")
+                .leaf("memo")
+                .primary_key("id")
+                .build()
+                .unwrap();
+
+            let e1 = items.insert().set("id", 1i64).set("category", "food").set("memo", "fresh").commit().unwrap();
+            let e2 = items.insert().set("id", 2i64).set("category", "food").set("memo", "fresh").commit().unwrap();
+
+            let eng = db.engine();
+            // category (Tag) は dedupe → 同 vocab_id
+            let cat1 = eng.get(e1, "items.category").unwrap();
+            let cat2 = eng.get(e2, "items.category").unwrap();
+            assert_eq!(cat1, cat2, "Tag は同じ文字列を dedupe するべき");
+
+            // memo (Leaf) は dedupe しない → 別 vocab_id
+            let m1 = eng.get(e1, "items.memo").unwrap();
+            let m2 = eng.get(e2, "items.memo").unwrap();
+            assert_ne!(m1, m2, "Leaf は dedupe しないべき");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn leaf_column_persists_across_reopen() {
+        let path = tmp("leaf_persist");
+        let _ = std::fs::remove_file(&path);
+        let e = {
+            let mut db = Database::create(&path).unwrap();
+            let notes = db.table("notes")
+                .number("id")
+                .leaf("body")
+                .primary_key("id")
+                .build()
+                .unwrap();
+            notes.insert()
+                .set("id", 1i64)
+                .set("body", "to be persisted")
+                .commit()
+                .unwrap()
+        };
+        // reopen
+        {
+            let db = Database::open(&path).unwrap();
+            let notes = db.get_table("notes").unwrap();
+            assert_eq!(
+                notes.entity(e).get("body"),
+                Some(Value::Text("to be persisted".into()))
+            );
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

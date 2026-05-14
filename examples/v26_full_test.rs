@@ -22,9 +22,9 @@ fn main() {
         let dir = "/tmp/v26_test_basic.db";
         let _ = std::fs::remove_file(dir);
         let mut db = enchudb::Engine::create_standalone(dir).unwrap();
-        db.define_himo("city", enchudb::HimoType::Value, 5);
-        db.define_himo("dept", enchudb::HimoType::Value, 4);
-        db.define_himo("age", enchudb::HimoType::Value, 100);
+        db.define_himo("city", enchudb::HimoType::Number, 5);
+        db.define_himo("dept", enchudb::HimoType::Number, 4);
+        db.define_himo("age", enchudb::HimoType::Number, 100);
 
         for i in 0..100u32 {
             let e = db.entity();
@@ -59,8 +59,8 @@ fn main() {
         let dir = "/tmp/v26_test_update.db";
         let _ = std::fs::remove_file(dir);
         let mut db = enchudb::Engine::create_standalone(dir).unwrap();
-        db.define_himo("x", enchudb::HimoType::Value, 3);
-        db.define_himo("y", enchudb::HimoType::Value, 3);
+        db.define_himo("x", enchudb::HimoType::Number, 3);
+        db.define_himo("y", enchudb::HimoType::Number, 3);
 
         for i in 0..9u32 {
             let e = db.entity();
@@ -92,8 +92,8 @@ fn main() {
         let dir = "/tmp/v26_test_txn.db";
         let _ = std::fs::remove_file(dir);
         let mut db = enchudb::Engine::create_standalone(dir).unwrap();
-        db.define_himo("a", enchudb::HimoType::Value, 5);
-        db.define_himo("b", enchudb::HimoType::Value, 5);
+        db.define_himo("a", enchudb::HimoType::Number, 5);
+        db.define_himo("b", enchudb::HimoType::Number, 5);
 
         for i in 0..20u32 {
             let e = db.entity();
@@ -135,9 +135,9 @@ fn main() {
         let dir = "/tmp/v26_test_stress.db";
         let _ = std::fs::remove_file(dir);
         let mut db = enchudb::Engine::create_standalone(dir).unwrap();
-        db.define_himo("x", enchudb::HimoType::Value, 10);
-        db.define_himo("y", enchudb::HimoType::Value, 10);
-        db.define_himo("z", enchudb::HimoType::Value, 10);
+        db.define_himo("x", enchudb::HimoType::Number, 10);
+        db.define_himo("y", enchudb::HimoType::Number, 10);
+        db.define_himo("z", enchudb::HimoType::Number, 10);
 
         let n = 10_000u32;
         for i in 0..n {
@@ -187,8 +187,8 @@ fn main() {
         let dir = "/tmp/v26_test_repeated.db";
         let _ = std::fs::remove_file(dir);
         let mut db = enchudb::Engine::create_standalone(dir).unwrap();
-        db.define_himo("val", enchudb::HimoType::Value, 100);
-        db.define_himo("grp", enchudb::HimoType::Value, 5);
+        db.define_himo("val", enchudb::HimoType::Number, 100);
+        db.define_himo("grp", enchudb::HimoType::Number, 5);
 
         let e = db.entity();
         db.tie(e, "val", 0);
@@ -220,8 +220,8 @@ fn main() {
         let dir = "/tmp/v26_test_boundary.db";
         let _ = std::fs::remove_file(dir);
         let mut db = enchudb::Engine::create_standalone(dir).unwrap();
-        db.define_himo("x", enchudb::HimoType::Value, 2); // 0, 1, 2
-        db.define_himo("y", enchudb::HimoType::Value, 2);
+        db.define_himo("x", enchudb::HimoType::Number, 2); // 0, 1, 2
+        db.define_himo("y", enchudb::HimoType::Number, 2);
 
         // entity なしで rebuild
         db.rebuild();
@@ -253,8 +253,8 @@ fn main() {
         let dir = "/tmp/v26_test_delete.db";
         let _ = std::fs::remove_file(dir);
         let mut db = enchudb::Engine::create_standalone(dir).unwrap();
-        db.define_himo("x", enchudb::HimoType::Value, 3);
-        db.define_himo("y", enchudb::HimoType::Value, 3);
+        db.define_himo("x", enchudb::HimoType::Number, 3);
+        db.define_himo("y", enchudb::HimoType::Number, 3);
 
         for i in 0..9u32 {
             let e = db.entity();
@@ -281,11 +281,11 @@ fn main() {
         let dir = "/tmp/v26_test_speed.db";
         let _ = std::fs::remove_file(dir);
         let mut db = enchudb::Engine::create_with_capacity(dir, 1_000_000).unwrap();
-        db.define_himo("tenant", enchudb::HimoType::Value, 10);
-        db.define_himo("dept", enchudb::HimoType::Value, 8);
-        db.define_himo("role", enchudb::HimoType::Value, 4);
-        db.define_himo("status", enchudb::HimoType::Value, 5);
-        db.define_himo("salary", enchudb::HimoType::Value, 1000);
+        db.define_himo("tenant", enchudb::HimoType::Number, 10);
+        db.define_himo("dept", enchudb::HimoType::Number, 8);
+        db.define_himo("role", enchudb::HimoType::Number, 4);
+        db.define_himo("status", enchudb::HimoType::Number, 5);
+        db.define_himo("salary", enchudb::HimoType::Number, 1000);
 
         let n = 500_000u32;
         let t = Instant::now();
@@ -354,8 +354,8 @@ fn main() {
         let dir = "/tmp/v26_test_persist.db";
         let _ = std::fs::remove_file(dir);
         let mut db = enchudb::Engine::create_standalone(dir).unwrap();
-        db.define_himo("a", enchudb::HimoType::Value, 5);
-        db.define_himo("b", enchudb::HimoType::Value, 5);
+        db.define_himo("a", enchudb::HimoType::Number, 5);
+        db.define_himo("b", enchudb::HimoType::Number, 5);
 
         for i in 0..50u32 {
             let e = db.entity();
@@ -382,9 +382,9 @@ fn main() {
         let dir = "/tmp/v26_test_saas.db";
         let _ = std::fs::remove_file(dir);
         let mut db = enchudb::Engine::create_standalone(dir).unwrap();
-        db.define_himo("tenant", enchudb::HimoType::Value, 3);
-        db.define_himo("dept", enchudb::HimoType::Value, 4);
-        db.define_himo("status", enchudb::HimoType::Value, 3); // active, inactive, suspended
+        db.define_himo("tenant", enchudb::HimoType::Number, 3);
+        db.define_himo("dept", enchudb::HimoType::Number, 4);
+        db.define_himo("status", enchudb::HimoType::Number, 3); // active, inactive, suspended
 
         // テナント0: 社員30人
         for i in 0..30u32 {

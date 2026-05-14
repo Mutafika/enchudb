@@ -25,10 +25,10 @@ fn main() {
     // EnchuDB
     let t = Instant::now();
     let mut edb = Engine::create_with_capacity(enchu_path, ENTITY_COUNT + 100).unwrap();
-    edb.define_himo("dept", HimoType::Value, DEPT_COUNT);
-    edb.define_himo("status", HimoType::Value, STATUS_COUNT);
-    edb.define_himo("salary", HimoType::Value, SALARY_MAX);
-    edb.define_himo("age", HimoType::Value, 100);
+    edb.define_himo("dept", HimoType::Number, DEPT_COUNT);
+    edb.define_himo("status", HimoType::Number, STATUS_COUNT);
+    edb.define_himo("salary", HimoType::Number, SALARY_MAX);
+    edb.define_himo("age", HimoType::Number, 100);
 
     for i in 0..ENTITY_COUNT {
         let e = edb.entity();

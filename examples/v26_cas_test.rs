@@ -5,9 +5,9 @@ fn main() {
     let _ = std::fs::remove_file(dir);
 
     let mut db = enchudb::Engine::create_standalone(dir).unwrap();
-    db.define_himo("city", enchudb::HimoType::Value, 3);   // 0,1,2
-    db.define_himo("dept", enchudb::HimoType::Value, 4);    // 0,1,2,3
-    db.define_himo("status", enchudb::HimoType::Value, 2);  // 0,1
+    db.define_himo("city", enchudb::HimoType::Number, 3);   // 0,1,2
+    db.define_himo("dept", enchudb::HimoType::Number, 4);    // 0,1,2,3
+    db.define_himo("status", enchudb::HimoType::Number, 2);  // 0,1
 
     // 10 entities
     for i in 0..10u32 {
@@ -72,10 +72,10 @@ fn main() {
         let dir2 = "/tmp/enchudb_v26_cas_bench.db";
         let _ = std::fs::remove_file(dir2);
         let mut db2 = enchudb::Engine::create_standalone(dir2).unwrap();
-        db2.define_himo("tenant", enchudb::HimoType::Value, 10);
-        db2.define_himo("dept", enchudb::HimoType::Value, 8);
-        db2.define_himo("role", enchudb::HimoType::Value, 4);
-        db2.define_himo("status", enchudb::HimoType::Value, 5);
+        db2.define_himo("tenant", enchudb::HimoType::Number, 10);
+        db2.define_himo("dept", enchudb::HimoType::Number, 8);
+        db2.define_himo("role", enchudb::HimoType::Number, 4);
+        db2.define_himo("status", enchudb::HimoType::Number, 5);
 
         let n = 100_000u32;
         for i in 0..n {

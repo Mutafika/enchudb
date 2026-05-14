@@ -16,7 +16,7 @@ fn main() {
 
     {
         let mut e = Engine::create_with_capacity(&path_no, N + 100).unwrap();
-        e.define_himo("v", HimoType::Value, 10_000);
+        e.define_himo("v", HimoType::Number, 10_000);
         e.flush().unwrap();
     }
 
@@ -47,7 +47,7 @@ fn main() {
 
     {
         let mut e = Engine::create_with_capacity(&path_wal, N + 100).unwrap();
-        e.define_himo("v", HimoType::Value, 10_000);
+        e.define_himo("v", HimoType::Number, 10_000);
         e.flush().unwrap();
     }
 

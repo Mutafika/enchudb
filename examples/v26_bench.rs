@@ -16,9 +16,9 @@ fn main() {
     let mut db = enchudb::Engine::create_standalone(dir24).unwrap();
 
     // 少ユニーク紐を define_himo で prefix sum 有効化
-    db.define_himo("city", enchudb::HimoType::Value, 3);
-    db.define_himo("dept", enchudb::HimoType::Value, 4);
-    db.define_himo("grade", enchudb::HimoType::Value, 5);
+    db.define_himo("city", enchudb::HimoType::Number, 3);
+    db.define_himo("dept", enchudb::HimoType::Number, 4);
+    db.define_himo("grade", enchudb::HimoType::Number, 5);
     // 多ユニーク紐は define なし（binary search）
     // price: 0..10000, age: 0..100
 

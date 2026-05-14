@@ -30,7 +30,7 @@ fn sustained_10k_writes_and_reopen() {
     let path = tmp("sustained10k");
     {
         let mut e = Engine::create_with_capacity(&path, 20_000).unwrap();
-        e.define_himo("v", HimoType::Value, 100);
+        e.define_himo("v", HimoType::Number, 100);
         e.flush().unwrap();
     }
 
@@ -55,7 +55,7 @@ fn parallel_10_writers() {
     let path = tmp("par10");
     {
         let mut e = Engine::create_with_capacity(&path, 100_000).unwrap();
-        e.define_himo("v", HimoType::Value, 10_000);
+        e.define_himo("v", HimoType::Number, 10_000);
         e.flush().unwrap();
     }
 
@@ -90,7 +90,7 @@ fn repeated_drop_recover_cycles() {
     let path = tmp("cycles");
     {
         let mut e = Engine::create_with_capacity(&path, 50_000).unwrap();
-        e.define_himo("v", HimoType::Value, 1000);
+        e.define_himo("v", HimoType::Number, 1000);
         e.flush().unwrap();
     }
 
@@ -119,7 +119,7 @@ fn content_heavy_load() {
     let path = tmp("content");
     {
         let mut e = Engine::create_with_capacity(&path, 2000).unwrap();
-        e.define_himo("id", HimoType::Value, 100);
+        e.define_himo("id", HimoType::Number, 100);
         e.flush().unwrap();
     }
 
@@ -154,7 +154,7 @@ fn heavy_1m_writes() {
     let path = tmp("heavy1m");
     {
         let mut e = Engine::create_with_capacity(&path, 1_100_000).unwrap();
-        e.define_himo("v", HimoType::Value, 10_000);
+        e.define_himo("v", HimoType::Number, 10_000);
         e.flush().unwrap();
     }
 
@@ -188,8 +188,8 @@ fn random_ops_fuzz_30s() {
     let path = tmp("fuzz30s");
     {
         let mut e = Engine::create_with_capacity(&path, 100_000).unwrap();
-        e.define_himo("k", HimoType::Value, 1000);
-        e.define_himo("tag", HimoType::Symbol, 0);
+        e.define_himo("k", HimoType::Number, 1000);
+        e.define_himo("tag", HimoType::Tag, 0);
         e.flush().unwrap();
     }
 

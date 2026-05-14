@@ -41,7 +41,7 @@ fn cleanup(path: &str) {
 
 fn prepare_db(path: &str) {
     let mut eng = Engine::create_standalone(path).unwrap();
-    eng.define_himo("val", HimoType::Value, 100);
+    eng.define_himo("val", HimoType::Number, 100);
     eng.flush().unwrap();
 }
 

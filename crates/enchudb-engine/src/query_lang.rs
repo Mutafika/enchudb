@@ -285,7 +285,8 @@ fn apply_simple(eng: &Engine, eids: &[enchudb_wal::EntityId], op: &str, arg: Opt
         "distinct" => match arg {
             Some(h) => {
                 let vals = eng.distinct(h, eids);
-                let is_text = eng.himo_type(h) == Some(HimoType::Symbol);
+                let ht = eng.himo_type(h);
+                let is_text = ht == Some(HimoType::Tag) || ht == Some(HimoType::Leaf);
                 let keys = vals.into_iter().map(|v| make_key(eng, v, is_text)).collect();
                 QueryResult::Distinct(keys)
             }
@@ -303,7 +304,8 @@ fn apply_group(
     agg_op: &str,
     agg_arg: Option<&str>,
 ) -> QueryResult {
-    let is_text = eng.himo_type(group_himo) == Some(HimoType::Symbol);
+    let ht = eng.himo_type(group_himo);
+    let is_text = ht == Some(HimoType::Tag) || ht == Some(HimoType::Leaf);
     let to_key = |v: u32| make_key(eng, v, is_text);
 
     match agg_op {
