@@ -236,6 +236,17 @@ pub struct RecoveredRecord {
 }
 
 /// WAL 本体。
+/// `append_relayed` で受信レコードの header フィールド (HLC/author/署名) を
+/// 引き継ぐためのバンドル。 LSN と payload は自分で発行/再計算する。
+/// 受信 record (WireRecord) からそのまま埋めて渡す想定。
+#[derive(Clone, Copy)]
+pub struct RelayedHeader {
+    pub hlc: Hlc,
+    pub author: PeerId,
+    pub signature: [u8; 64],
+    pub pubkey_fp: [u8; 8],
+}
+
 pub struct Wal {
     #[cfg(not(target_arch = "wasm32"))]
     _file: File,
@@ -400,12 +411,57 @@ impl Wal {
         let record_size = REC_HEADER_SIZE + payload_size;
 
         self.pending_writes.fetch_add(1, Ordering::AcqRel);
-        let result = self.append_inner(op, payload_size, record_size);
+        let result = self.append_inner(op, payload_size, record_size, None);
         self.pending_writes.fetch_sub(1, Ordering::AcqRel);
         result
     }
 
-    fn append_inner(&self, op: WalOp<'_>, payload_size: usize, record_size: usize) -> io::Result<u64> {
+    /// 受信した他 peer 由来の WAL op を **元の HLC / author / 署名のまま** 自分の WAL に
+    /// 記録する gossip 用 API。 通常の `append` が `next_hlc()` で新規 HLC を発行する
+    /// のに対し、 こちらは引数の `origin_hlc` / `origin_author` をそのまま乗せる。
+    /// LSN だけは自分で発行 (local-monotonic に保つため)。 CRC は payload から再計算。
+    ///
+    /// これで「Mac が Android Delete を受信 → 自分の WAL に Android author/HLC のまま
+    /// Delete record を記録 → 次の publish で他 peer も pull できる」 hop が成立し、
+    /// relay 側の (peer, hlc) dedupe が同じ record の二度送りをカットする (= ループ防止)。
+    ///
+    /// 自プロセスで HLC が後退しないよう、 受信 HLC でローカル HLC clock も merge する。
+    pub fn append_relayed(&self, op: WalOp<'_>, header: RelayedHeader) -> io::Result<u64> {
+        let payload_size = op.payload_size();
+        let record_size = REC_HEADER_SIZE + payload_size;
+        self.pending_writes.fetch_add(1, Ordering::AcqRel);
+        let result = self.append_inner(op, payload_size, record_size, Some(header));
+        self.pending_writes.fetch_sub(1, Ordering::AcqRel);
+        // ローカル HLC clock を受信 HLC で merge (後退防止)
+        self.merge_external_hlc(header.hlc);
+        result
+    }
+
+    fn merge_external_hlc(&self, recv: Hlc) {
+        loop {
+            let last_wall = self.hlc_last_wall.load(Ordering::Acquire);
+            let last_logical = self.hlc_logical.load(Ordering::Acquire);
+            if recv.wall < last_wall || (recv.wall == last_wall && recv.logical <= last_logical) {
+                return;
+            }
+            if self
+                .hlc_last_wall
+                .compare_exchange(last_wall, recv.wall, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.hlc_logical.store(recv.logical, Ordering::Release);
+                return;
+            }
+        }
+    }
+
+    fn append_inner(
+        &self,
+        op: WalOp<'_>,
+        payload_size: usize,
+        record_size: usize,
+        relay: Option<RelayedHeader>,
+    ) -> io::Result<u64> {
         let offset = loop {
             let cur = self.head.load(Ordering::Acquire);
             let new = cur + record_size as u64;
@@ -422,8 +478,16 @@ impl Wal {
         };
 
         let lsn = self.next_lsn.fetch_add(1, Ordering::AcqRel);
-        let hlc = self.next_hlc();
-        let author_peer = hlc.peer;
+        // relay 経路では受信 HLC/author/署名をそのまま乗せる (gossip 用)。
+        // 通常経路では next_hlc + 自鍵で署名。
+        let (hlc, author_peer) = match &relay {
+            Some(o) => (o.hlc, o.author),
+            None => {
+                let h = self.next_hlc();
+                let a = h.peer;
+                (h, a)
+            }
+        };
 
         let op_byte = op.op_byte();
         let payload_offset = offset as usize + REC_HEADER_SIZE;
@@ -431,19 +495,22 @@ impl Wal {
         op.write_payload(&mut mmap[payload_offset..payload_offset + payload_size]);
         let crc = fnv1a(&mmap[payload_offset..payload_offset + payload_size]);
 
-        // Phase C: 鍵があれば署名。無ければ zeros。
-        let (signature, pubkey_fp) = {
-            let keypair = self.keypair.read().unwrap().clone();
-            match keypair {
-                Some(kp) => {
-                    let msg = signed_payload(
-                        op_byte, payload_size as u32, lsn, hlc,
-                        author_peer, crc,
-                        &mmap[payload_offset..payload_offset + payload_size],
-                    );
-                    (kp.sign(&msg), kp.pubkey_fp())
+        // Phase C: 鍵があれば署名。無ければ zeros。 relay 経路では元の署名を保持。
+        let (signature, pubkey_fp) = match &relay {
+            Some(o) => (o.signature, o.pubkey_fp),
+            None => {
+                let keypair = self.keypair.read().unwrap().clone();
+                match keypair {
+                    Some(kp) => {
+                        let msg = signed_payload(
+                            op_byte, payload_size as u32, lsn, hlc,
+                            author_peer, crc,
+                            &mmap[payload_offset..payload_offset + payload_size],
+                        );
+                        (kp.sign(&msg), kp.pubkey_fp())
+                    }
+                    None => (ZERO_SIGNATURE, ZERO_PUBKEY_FP),
                 }
-                None => (ZERO_SIGNATURE, ZERO_PUBKEY_FP),
             }
         };
 

@@ -13,6 +13,19 @@
 pub mod keys;
 pub mod wal;
 
+/// Content key 用の簡易 hash → 15bit。MSB は LWW key namespace で占有。
+/// engine 側の recover hydrate と sync 側の apply_one で同じハッシュを使うため
+/// wal crate に共通化してある。 変更すると HlcStore キーが分岐するので注意。
+#[inline]
+pub fn content_key_hash15(s: &str) -> u16 {
+    let mut h: u32 = 0x811c9dc5;
+    for &b in s.as_bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x01000193);
+    }
+    (h as u16) & 0x7fff
+}
+
 /// v32: Entity ID。u64 = `[peer_id: 32bit][local_id: 32bit]`。
 /// 単独 peer 運用時は peer_id = 0、実質 local_id のみ使われる。
 pub type EntityId = u64;
@@ -40,7 +53,7 @@ pub const fn eid_local(eid: EntityId) -> u32 {
 
 /// v32: Hybrid Logical Clock。分散 peer 間で全順序を確立する。
 /// wall: 物理時刻(ms since epoch)、logical: 同時刻内のカウンタ、peer: tiebreaker。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Hlc {
     pub wall: u64,
     pub logical: u32,
