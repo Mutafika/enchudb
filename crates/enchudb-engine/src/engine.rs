@@ -841,9 +841,10 @@ pub struct Engine {
     acl: std::sync::Arc<crate::acl::Acl>,
     /// v32 エッジ用: true なら書き込み API が panic、sync 経由 (remote_*_apply) のみ受ける。
     is_replica: std::sync::atomic::AtomicBool,
-    /// CRDT mesh mode: true なら `remote_*_apply` で受け取った op を自分の WAL にも
-    /// 書き戻し、次の publish で他 peer に gossip する。 ホスト/クライアント構成では
-    /// false のまま (ホストだけが gossip する/しない)。 default = false で旧挙動互換。
+    /// CRDT mesh mode: true なら `remote_*_apply` で受信した op を **元 HLC/author/署名のまま**
+    /// 自分の WAL にも `append_relayed` で記録し、 次の publish で他 peer に gossip する。
+    /// relay 側の (peer, hlc) dedupe で同じ record の二度送りはカットされるためループしない。
+    /// ホスト/クライアント構成 (= ホストが唯一の集約点) では false のまま使う。
     gossip_remote_apply: std::sync::atomic::AtomicBool,
     /// 大容量 blob 用 store(画像/動画/モデル等)。`set_blob_store` で注入。
     /// 未設定なら `blob_store()` は None を返す。
@@ -1662,15 +1663,14 @@ impl Engine {
         self.peer_id.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// CRDT mesh mode の有効化。 true にすると `remote_*_apply` 経路で
-    /// 受信した op を自分の WAL にも書き戻し、 publish で他 peer へ gossip する。
-    /// ホスト/クライアント構成 (ホストが集約役) では false のまま使う。
+    /// CRDT mesh mode の有効化。 true にすると `remote_*_apply` で受信した op を
+    /// `append_relayed` で自分の WAL にも記録し、 次の publish で他 peer に gossip する。
+    /// ホスト/クライアント構成では false のまま (= ホストの WAL に届いた時点で完結)。
     pub fn set_gossip_remote_apply(&self, on: bool) {
         self.gossip_remote_apply
             .store(on, std::sync::atomic::Ordering::Release);
     }
 
-    /// `set_gossip_remote_apply` の現在値。
     pub fn gossip_remote_apply(&self) -> bool {
         self.gossip_remote_apply
             .load(std::sync::atomic::Ordering::Acquire)
@@ -1717,8 +1717,16 @@ impl Engine {
     // これらは LWW 判定を通った後の無条件 apply。HlcStore は Syncer が先に更新済み。
 
     /// リモート peer から届いた Tie を apply。
-    /// `gossip_remote_apply` 有効時は自分の WAL にも書き戻し、 publish で他 peer に伝播。
-    pub fn remote_tie_apply(&self, eid: enchudb_wal::EntityId, himo_id: u16, value: u32) {
+    /// `gossip_remote_apply` 有効かつ `relayed` が `Some` なら、 同じ op を
+    /// `append_relayed` で自分の WAL にも記録 (HLC/author/署名は元のまま)。
+    /// `relayed` は WAL 受信時の元 header (sync 側で WireRecord から作って渡す)。
+    pub fn remote_tie_apply(
+        &self,
+        eid: enchudb_wal::EntityId,
+        himo_id: u16,
+        value: u32,
+        relayed: Option<enchudb_wal::wal::RelayedHeader>,
+    ) {
         let local = enchudb_wal::eid_local(eid);
         let hid = himo_id as usize;
         if hid >= self.himos.len() { return; }
@@ -1726,57 +1734,71 @@ impl Engine {
         self.entities.ensure_live(local);
         self.himos[hid].set(local, value);
         if self.gossip_remote_apply() {
-            if let Some(wal) = self.wal.as_ref() {
-                let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
-                let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id, value });
+            if let (Some(wal), Some(h)) = (self.wal.as_ref(), relayed) {
+                let _ = wal.append_relayed(
+                    enchudb_wal::wal::WalOp::Tie { eid, himo_id, value },
+                    h,
+                );
             }
         }
     }
 
     /// リモート peer から届いた Untie を apply。
-    pub fn remote_untie_apply(&self, eid: enchudb_wal::EntityId, himo_id: u16) {
+    pub fn remote_untie_apply(
+        &self,
+        eid: enchudb_wal::EntityId,
+        himo_id: u16,
+        relayed: Option<enchudb_wal::wal::RelayedHeader>,
+    ) {
         let local = enchudb_wal::eid_local(eid);
         let hid = himo_id as usize;
         if hid >= self.himos.len() { return; }
         self.himos[hid].remove(local);
         if self.gossip_remote_apply() {
-            if let Some(wal) = self.wal.as_ref() {
-                let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
-                let _ = wal.append(enchudb_wal::wal::WalOp::Untie { eid: wal_eid, himo_id });
+            if let (Some(wal), Some(h)) = (self.wal.as_ref(), relayed) {
+                let _ = wal.append_relayed(
+                    enchudb_wal::wal::WalOp::Untie { eid, himo_id },
+                    h,
+                );
             }
         }
     }
 
     /// リモート peer から届いた Delete を apply。
-    ///
-    /// CRDT: ホスト無しの P2P において、削除は各 peer の WAL に
-    /// gossip される必要がある。 受信した Delete を自分の peer_id +
-    /// 新 HLC で WAL にも append し、次の publish で他 peer にも
-    /// 伝播させる。 無限ループは `Syncer::apply_one` の `try_set` が
-    /// 2 回目以降の同一 (eid, sentinel_himo) を false で skip するため発生しない。
-    pub fn remote_delete_apply(&self, eid: enchudb_wal::EntityId) {
+    pub fn remote_delete_apply(
+        &self,
+        eid: enchudb_wal::EntityId,
+        relayed: Option<enchudb_wal::wal::RelayedHeader>,
+    ) {
         let local = enchudb_wal::eid_local(eid);
         for hid in 0..self.himos.len() {
             self.himos[hid].remove(local);
         }
         self.entities.free(local);
         if self.gossip_remote_apply() {
-            if let Some(wal) = self.wal.as_ref() {
-                let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
-                let _ = wal.append(enchudb_wal::wal::WalOp::Delete { eid: wal_eid });
+            if let (Some(wal), Some(h)) = (self.wal.as_ref(), relayed) {
+                let _ = wal.append_relayed(enchudb_wal::wal::WalOp::Delete { eid }, h);
             }
         }
     }
 
     /// リモート peer から届いた Content 書き込みを apply。
-    pub fn remote_content_apply(&self, eid: enchudb_wal::EntityId, key: &str, data: &[u8]) {
+    pub fn remote_content_apply(
+        &self,
+        eid: enchudb_wal::EntityId,
+        key: &str,
+        data: &[u8],
+        relayed: Option<enchudb_wal::wal::RelayedHeader>,
+    ) {
         let local = enchudb_wal::eid_local(eid);
         self.entities.ensure_live(local);
         self.contents.set(local, key, data);
         if self.gossip_remote_apply() {
-            if let Some(wal) = self.wal.as_ref() {
-                let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
-                let _ = wal.append(enchudb_wal::wal::WalOp::Content { eid: wal_eid, key, data });
+            if let (Some(wal), Some(h)) = (self.wal.as_ref(), relayed) {
+                let _ = wal.append_relayed(
+                    enchudb_wal::wal::WalOp::Content { eid, key, data },
+                    h,
+                );
             }
         }
     }
@@ -1785,16 +1807,26 @@ impl Engine {
     /// `bytes` を local vocab に insert し、local_vid を取得して
     /// `(author_peer, remote_vid) → local_vid` の mapping を記録する。
     /// 後続の Tie { value: remote_vid } を受信したら `translate_remote_vid` で local_vid に変換。
-    /// gossip 有効かつ自 vocab に新規追加された場合のみ Vocab op を自分の WAL にも書き、
-    /// publish で他 peer にも伝播させる (重複 append による relay 容量肥大を避ける)。
-    pub fn remote_vocab_apply(&self, author_peer: enchudb_wal::PeerId, remote_vid: u32, bytes: &[u8]) {
+    /// gossip 有効かつ自 vocab に新規追加された場合のみ Vocab op を `append_relayed` で WAL に
+    /// 流す (HLC/author/署名は元のまま)。 既存 vocab に当たれば relay しない (重複防止)。
+    pub fn remote_vocab_apply(
+        &self,
+        author_peer: enchudb_wal::PeerId,
+        remote_vid: u32,
+        bytes: &[u8],
+        relayed: Option<enchudb_wal::wal::RelayedHeader>,
+    ) {
         let was_new = self.vocab.lookup(bytes).is_none();
         let local_vid = self.vocab.get_or_insert(bytes);
         let mut map = self.peer_vocab_map.write().unwrap();
         map.insert((author_peer, remote_vid), local_vid);
         if was_new && self.gossip_remote_apply() {
-            if let Some(wal) = self.wal.as_ref() {
-                let _ = wal.append(enchudb_wal::wal::WalOp::Vocab { vid: local_vid, bytes });
+            if let (Some(wal), Some(h)) = (self.wal.as_ref(), relayed) {
+                // 自 vocab の vid を貼り直し (Tie 受信側が translate_remote_vid で再翻訳)。
+                let _ = wal.append_relayed(
+                    enchudb_wal::wal::WalOp::Vocab { vid: local_vid, bytes },
+                    h,
+                );
             }
         }
     }

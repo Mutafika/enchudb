@@ -32,6 +32,7 @@
 //! Delete は特殊: entity ごとすべての himo HLC を比較せず、
 //! 「Delete の HLC が、その entity の全 himo 最大 HLC 以上」なら apply。
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use enchudb_engine::engine::Engine;
@@ -44,7 +45,11 @@ pub struct Syncer {
     engine: Arc<Engine>,
     transport: Arc<dyn Transport>,
     /// 各 peer から最後に pull した地点(HLC)。次回はここより後だけ取る。
+    /// `cursor_path` が設定されていれば update のたびにディスクに保存し、
+    /// `Syncer::new` 時にロードして差分同期を継続する。
     last_pulled: std::sync::Mutex<std::collections::HashMap<PeerId, Hlc>>,
+    /// `last_pulled` の永続化先。 `None` ならメモリのみ。
+    cursor_path: std::sync::RwLock<Option<PathBuf>>,
     /// Phase C: true なら署名検証を強制。未署名 or 検証失敗 op は reject。
     require_signature: std::sync::atomic::AtomicBool,
 }
@@ -88,11 +93,88 @@ impl Syncer {
         // 正式には「全 peer が replicate 済みの地点まで reset」する watermark が要るが、
         // 未実装なので一旦 auto_reset off で記録を残す方針。
         wal.set_auto_reset(false);
-        Self {
-            engine,
+        let syncer = Self {
+            engine: engine.clone(),
             transport,
             last_pulled: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cursor_path: std::sync::RwLock::new(None),
             require_signature: std::sync::atomic::AtomicBool::new(false),
+        };
+        // HlcStore は engine 内部のメモリ構造で永続化されない。 engine reopen 後は
+        // 空状態なので、 attach 時に WAL を walk して LWW state を再構築する。
+        // これがないと sync で過去レコードを未知扱いして再 apply してしまい、
+        // 削除済み entity が復活する (= ① のバグの根本)。
+        syncer.hydrate_hlc_store(&engine);
+        syncer
+    }
+
+    /// `last_pulled` の永続化先を設定し、 既存ファイルから cursor をロードする。
+    /// `pull_once` で cursor が前進すると自動的にこのパスへ atomic write する。
+    /// `None` に戻したい場合は `Syncer::new` で作り直す。
+    pub fn with_cursor_path(self, path: PathBuf) -> Self {
+        self.load_cursors(&path);
+        *self.cursor_path.write().unwrap() = Some(path);
+        self
+    }
+
+    fn load_cursors(&self, path: &Path) {
+        let Ok(s) = std::fs::read_to_string(path) else { return };
+        let mut guard = self.last_pulled.lock().unwrap();
+        for line in s.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() != 4 {
+                continue;
+            }
+            let Ok(p) = parts[0].parse::<PeerId>() else { continue };
+            let Ok(wall) = parts[1].parse::<u64>() else { continue };
+            let Ok(logical) = parts[2].parse::<u32>() else { continue };
+            let Ok(peer) = parts[3].parse::<PeerId>() else { continue };
+            guard.insert(p, Hlc { wall, logical, peer });
+        }
+    }
+
+    /// `last_pulled` を atomic write でディスクに保存。 `cursor_path` 未設定なら no-op。
+    /// 書式: 1 行 1 エントリ、 `peer_id wall logical hlc_peer` (空白区切り)。
+    /// 失敗しても sync は続行 (cursor は次回ロードで古いまま、 multi-apply は LWW で吸収)。
+    fn save_cursors(&self) {
+        let path = match self.cursor_path.read().unwrap().clone() {
+            Some(p) => p,
+            None => return,
+        };
+        let guard = self.last_pulled.lock().unwrap();
+        let mut buf = String::new();
+        for (p, h) in guard.iter() {
+            buf.push_str(&format!("{} {} {} {}\n", p, h.wall, h.logical, h.peer));
+        }
+        drop(guard);
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, buf).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    /// engine の WAL を読んで HlcStore に LWW entry を再構築する。
+    /// `Syncer::new` 内から呼ばれる。 Delete は sentinel (`u16::MAX`) で残す
+    /// (= tombstone) ので、 後で来る古い HLC の Tie/Untie/Content が `apply_one`
+    /// 内の tombstone check で skip される。
+    fn hydrate_hlc_store(&self, engine: &Engine) {
+        let Some(wal) = engine.wal_arc() else { return };
+        let store = engine.hlc_store();
+        for rec in wal.iter_committed() {
+            match &rec.op {
+                DecodedOp::Tie { eid, himo_id, .. }
+                | DecodedOp::Untie { eid, himo_id } => {
+                    store.force_set(*eid, *himo_id, rec.hlc);
+                }
+                DecodedOp::Delete { eid } => {
+                    store.force_set(*eid, u16::MAX, rec.hlc);
+                }
+                DecodedOp::Content { eid, key, .. } => {
+                    let key_hash = enchudb_wal::content_key_hash15(key);
+                    store.force_set(*eid, key_hash | 0x8000, rec.hlc);
+                }
+                DecodedOp::Commit | DecodedOp::Vocab { .. } => {}
+            }
         }
     }
 
@@ -110,13 +192,21 @@ impl Syncer {
         let records = self.transport.pull(from, since);
         let outcome = self.apply_records(&records);
 
-        // last_pulled を進める(空 pull でも既存のままで OK)
-        if let Some(last) = records.iter().map(|r| r.hlc).max() {
+        // last_pulled を進める(空 pull でも既存のままで OK)。 進んだら disk に保存。
+        let advanced = if let Some(last) = records.iter().map(|r| r.hlc).max() {
             let mut guard = self.last_pulled.lock().unwrap();
             let cur = guard.get(&from).copied().unwrap_or(Hlc::ZERO);
             if last > cur {
                 guard.insert(from, last);
+                true
+            } else {
+                false
             }
+        } else {
+            false
+        };
+        if advanced {
+            self.save_cursors();
         }
 
         outcome
@@ -184,60 +274,82 @@ impl Syncer {
     }
 
     fn apply_one(&self, store: &HlcStore, rec: &WireRecord) -> bool {
+        // 受信した WireRecord の header フィールドを Engine::remote_*_apply の relayed 引数に
+        // そのまま渡す (gossip 経路で `Wal::append_relayed` が元 HLC/author/署名を保持するため)。
+        #[inline]
+        fn relayed_header(rec: &WireRecord) -> enchudb_wal::wal::RelayedHeader {
+            enchudb_wal::wal::RelayedHeader {
+                hlc: rec.hlc,
+                author: rec.author_peer,
+                signature: rec.signature,
+                pubkey_fp: rec.pubkey_fp,
+            }
+        }
         match &rec.op {
             DecodedOp::Tie { eid, himo_id, value } => {
+                // Tombstone check: 同 entity に tombstone (sentinel HLC) が記録済みで
+                // それより古い Tie は復活させない。 「同 eid の再 save」は schema 層で
+                // 別 eid として扱う設計なので、 tombstone 以後の新 Tie が同 eid に
+                // 来ることは無く、 一律 skip で安全。
+                if let Some(tomb) = store.get(*eid, u16::MAX) {
+                    if rec.hlc < tomb {
+                        return false;
+                    }
+                }
                 if !store.try_set(*eid, *himo_id, rec.hlc) {
                     return false;
                 }
                 // Symbol 型 himo の場合、remote vocab の vid を local vid に変換
                 let value = self.engine.translate_remote_vid(rec.author_peer, *himo_id, *value);
-                self.engine.remote_tie_apply(*eid, *himo_id, value);
+                self.engine.remote_tie_apply(*eid, *himo_id, value, Some(relayed_header(rec)));
                 true
             }
             DecodedOp::Untie { eid, himo_id } => {
+                if let Some(tomb) = store.get(*eid, u16::MAX) {
+                    if rec.hlc < tomb {
+                        return false;
+                    }
+                }
                 if !store.try_set(*eid, *himo_id, rec.hlc) {
                     return false;
                 }
-                self.engine.remote_untie_apply(*eid, *himo_id);
+                self.engine.remote_untie_apply(*eid, *himo_id, Some(relayed_header(rec)));
                 true
             }
             DecodedOp::Delete { eid } => {
                 // Delete は全 himo に波及。sentinel himo_id = 0xFFFF で HLC を記録。
+                // remove_entity は呼ばず tombstone を残す。 後続の古い HLC の
+                // Tie/Untie/Content は上の tombstone check で skip され、 削除済み
+                // entity が復活しない。
                 if !store.try_set(*eid, u16::MAX, rec.hlc) {
                     return false;
                 }
-                store.remove_entity(*eid);
-                self.engine.remote_delete_apply(*eid);
+                self.engine.remote_delete_apply(*eid, Some(relayed_header(rec)));
                 true
             }
             DecodedOp::Content { eid, key, data } => {
                 // Content は key 単位で LWW。himo_id を使えないので hash で代用。
-                let key_hash = fnv_hash_u16(key);
+                if let Some(tomb) = store.get(*eid, u16::MAX) {
+                    if rec.hlc < tomb {
+                        return false;
+                    }
+                }
+                let key_hash = enchudb_wal::content_key_hash15(key);
                 if !store.try_set(*eid, key_hash | 0x8000, rec.hlc) {
                     return false;
                 }
-                self.engine.remote_content_apply(*eid, key, data);
+                self.engine.remote_content_apply(*eid, key, data, Some(relayed_header(rec)));
                 true
             }
             DecodedOp::Commit => true, // boundary marker、apply は不要
             DecodedOp::Vocab { vid, bytes } => {
                 // author_peer の (vid, bytes) を受信。
                 // Engine 側の remote_vocab_apply に委譲 (peer 別 vid mapping を構築)。
-                self.engine.remote_vocab_apply(rec.author_peer, *vid, bytes);
+                self.engine.remote_vocab_apply(rec.author_peer, *vid, bytes, Some(relayed_header(rec)));
                 true
             }
         }
     }
-}
-
-/// Content key 用の簡易 hash → 15bit。MSB は LWW key namespace で占有。
-fn fnv_hash_u16(s: &str) -> u16 {
-    let mut h: u32 = 0x811c9dc5;
-    for &b in s.as_bytes() {
-        h ^= b as u32;
-        h = h.wrapping_mul(0x01000193);
-    }
-    (h as u16) & 0x7fff
 }
 
 #[cfg(test)]
