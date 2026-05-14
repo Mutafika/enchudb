@@ -137,8 +137,8 @@ fn open_concurrent_replica_rejects_writes_and_syncs_via_remote() {
 
     // replica mode は書き込み API で panic するので、remote_*_apply を直接叩く
     let himo_id = eng.himo_id("v").unwrap() as u16;
-    eng.remote_tie_apply(enchudb::make_eid(1, 5), himo_id, 42);
-    assert_eq!(eng.get(enchudb::make_eid(1, 5), "v"), Some(42));
+    eng.remote_tie_apply(enchudb_wal::make_eid(1, 5), himo_id, 42);
+    assert_eq!(eng.get(enchudb_wal::make_eid(1, 5), "v"), Some(42));
 
     // set_replica_mode(false) で書き込み解放
     eng.set_replica_mode(false);

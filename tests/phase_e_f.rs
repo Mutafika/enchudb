@@ -2,7 +2,8 @@
 
 #![cfg(feature = "v32")]
 
-use enchudb::{AuditFilter, Engine, HimoType, Hlc};
+use enchudb::{AuditFilter, Engine, HimoType};
+use enchudb_wal::Hlc;
 use std::sync::Arc;
 
 fn tmp(tag: &str) -> String {

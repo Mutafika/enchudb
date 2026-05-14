@@ -17,6 +17,7 @@ ffi = ["dep:enchudb-ffi", "sql"]
 async-blob = ["enchudb-engine/async-blob"]
 
 [dependencies]
+enchudb-wal = { path = "crates/enchudb-wal" }
 enchudb-engine = { path = "crates/enchudb-engine" }
 enchudb-sync = { path = "crates/enchudb-sync" }
 

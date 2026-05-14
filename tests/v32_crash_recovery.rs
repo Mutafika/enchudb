@@ -9,7 +9,7 @@
 #![cfg(feature = "v32")]
 
 use enchudb::{AuditFilter, Engine, HimoType};
-use enchudb::keys::Keypair;
+use enchudb_wal::keys::Keypair;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;

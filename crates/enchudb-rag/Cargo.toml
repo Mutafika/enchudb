@@ -16,6 +16,7 @@ fastembed = ["dep:fastembed"]
 
 [dependencies]
 enchudb = { path = "../.." }
+enchudb-wal = { path = "../enchudb-wal" }
 memmap2 = "0.9"
 fastembed = { version = "5", optional = true, default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
 

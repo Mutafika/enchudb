@@ -13,11 +13,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use enchudb::{Engine, HimoType, Hlc};
+use enchudb::{Engine, HimoType};
+use enchudb_wal::Hlc;
 use enchudb::sync::Syncer;
 use enchudb::transport::{Transport, WireRecord, encode_batch};
 use enchudb_transport::http::{HttpRelay, HttpTransport};
-use enchudb::wal::DecodedOp;
+use enchudb_wal::wal::DecodedOp;
 
 fn tmp(tag: &str) -> String {
     let p = format!("/tmp/enchu_bench_dist_{}_{}", tag, std::process::id());
@@ -113,7 +114,7 @@ fn main() {
     println!("  note: poll-limited by pull loop interval. Push (SSE/WS) model would be sub-ms.");
     let mut prop_samples: Vec<u128> = Vec::with_capacity(100);
     for i in 0..100u64 {
-        let eid = enchudb::make_eid(1, (10_000 + i) as u32);
+        let eid = enchudb_wal::make_eid(1, (10_000 + i) as u32);
         let wall = 1_000 + i * 10; // HLC は単調増、seen の取り違えを防ぐ
         let rec = WireRecord::unsigned(
             Hlc { wall, logical: 0, peer: 1 }, 1,
@@ -160,7 +161,7 @@ fn main() {
             let end = (batch_start + BATCH_SIZE).min(WARMUP_COUNT);
             let mut batch = Vec::with_capacity((end - batch_start) as usize);
             for i in batch_start..end {
-                let eid = enchudb::make_eid(1, WARMUP_BASE + i);
+                let eid = enchudb_wal::make_eid(1, WARMUP_BASE + i);
                 let wall = 100_000 + (i as u64) * 10;
                 batch.push(WireRecord::unsigned(
                     Hlc { wall, logical: 0, peer: 1 }, 1,
@@ -173,7 +174,7 @@ fn main() {
         println!("  published {} records in {} batches of {} in {:?}", WARMUP_COUNT, WARMUP_COUNT / BATCH_SIZE, BATCH_SIZE, publish_time);
         // replica が追いつくまで待つ
         let t1 = Instant::now();
-        while replica.get(enchudb::make_eid(1, WARMUP_BASE + WARMUP_COUNT - 1), "val").is_none() {
+        while replica.get(enchudb_wal::make_eid(1, WARMUP_BASE + WARMUP_COUNT - 1), "val").is_none() {
             if t1.elapsed() > Duration::from_secs(30) { break; }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -189,7 +190,7 @@ fn main() {
     let t = Instant::now();
     let mut checksum: u64 = 0;
     for i in 0..iters {
-        let eid = enchudb::make_eid(1, WARMUP_BASE + (i as u32 % WARMUP_COUNT));
+        let eid = enchudb_wal::make_eid(1, WARMUP_BASE + (i as u32 % WARMUP_COUNT));
         if let Some(v) = replica.get(eid, "val") {
             checksum = checksum.wrapping_add(v as u64);
         }
@@ -214,7 +215,7 @@ fn main() {
     let t = Instant::now();
     let mut _sum: u64 = 0;
     for i in 0..iters {
-        let eid = enchudb::make_eid(1, WARMUP_BASE + (i as u32 % WARMUP_COUNT));
+        let eid = enchudb_wal::make_eid(1, WARMUP_BASE + (i as u32 % WARMUP_COUNT));
         if let Some(v) = origin_ro.get(eid, "val") {
             _sum = _sum.wrapping_add(v as u64);
         }

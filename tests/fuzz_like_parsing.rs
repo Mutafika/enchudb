@@ -50,8 +50,8 @@ proptest! {
 // encode/decode roundtrip は破綻しない
 // ─────────────────────────────────────────────────────────────
 
-use enchudb::wal::DecodedOp;
-use enchudb::Hlc;
+use enchudb_wal::wal::DecodedOp;
+use enchudb_wal::Hlc;
 
 proptest! {
     #[test]
@@ -85,7 +85,7 @@ proptest! {
 // WAL ファイルをランダム bytes で作って iter_committed を呼ぶ。
 // panic 無し、empty Vec を返すか、途中で切って返るかのいずれか。
 
-use enchudb::wal::Wal;
+use enchudb_wal::wal::Wal;
 
 fn write_wal_with_body(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
     use std::io::Write;

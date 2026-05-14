@@ -6,10 +6,11 @@
 #![cfg(feature = "v32")]
 
 use std::sync::Arc;
-use enchudb::{Engine, HimoType, Hlc};
+use enchudb::{Engine, HimoType};
+use enchudb_wal::Hlc;
 use enchudb::sync::Syncer;
 use enchudb::transport::{InMemoryTransport, Transport, WireRecord};
-use enchudb::wal::DecodedOp;
+use enchudb_wal::wal::DecodedOp;
 
 fn tmp(tag: &str) -> String {
     let p = format!("/tmp/enchudb-v32-2peer-{}-{}", tag, std::process::id());
@@ -113,7 +114,7 @@ fn lww_concurrent_write_to_same_cell() {
     let transport = Arc::new(InMemoryTransport::new());
 
     // 共有 eid を peer A が作る想定(peer 1 の local=0)
-    let shared_eid = enchudb::make_eid(1, 0);
+    let shared_eid = enchudb_wal::make_eid(1, 0);
 
     // A が wall=100 で value=10 を書いた
     transport.publish(1, vec![WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 1 }, 1, DecodedOp::Tie { eid: shared_eid, himo_id: 0, value: 10 })]);
@@ -150,7 +151,7 @@ fn hlc_tie_broken_by_peer_id() {
     let eng_a = make_peer(&pa, 1);
     let transport = Arc::new(InMemoryTransport::new());
 
-    let shared_eid = enchudb::make_eid(9, 0);
+    let shared_eid = enchudb_wal::make_eid(9, 0);
 
     // 同じ wall/logical、peer_id だけ違う → 大きい peer が勝つ
     transport.publish(5, vec![WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 5 }, 5, DecodedOp::Tie { eid: shared_eid, himo_id: 0, value: 55 })]);
@@ -259,7 +260,7 @@ fn peer_id_persists_across_reopen() {
 
     // entity() が peer=42 を合成した eid を返す
     let e = eng.entity();
-    assert_eq!(enchudb::eid_peer(e), 42);
+    assert_eq!(enchudb_wal::eid_peer(e), 42);
 
     cleanup(&path);
 }
@@ -267,7 +268,7 @@ fn peer_id_persists_across_reopen() {
 #[test]
 fn signed_wal_verifies_between_peers() {
     // peer A が ed25519 鍵で署名 → peer B が pubkey 登録して verify を通す。
-    use enchudb::keys::Keypair;
+    use enchudb_wal::keys::Keypair;
 
     let pa = tmp("signed_a");
     let pb = tmp("signed_b");
@@ -313,7 +314,7 @@ fn unsigned_rejected_when_require_signature() {
     // peer 2 が未署名で publish
     transport.publish(2, vec![
         WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 2 }, 2,
-            DecodedOp::Tie { eid: enchudb::make_eid(2, 0), himo_id: 0, value: 99 }),
+            DecodedOp::Tie { eid: enchudb_wal::make_eid(2, 0), himo_id: 0, value: 99 }),
     ]);
 
     let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
@@ -327,7 +328,7 @@ fn unsigned_rejected_when_require_signature() {
 
 #[test]
 fn tampered_signature_rejected() {
-    use enchudb::keys::Keypair;
+    use enchudb_wal::keys::Keypair;
 
     let pa = tmp("tamper_a");
     let pb = tmp("tamper_b");
@@ -369,7 +370,7 @@ fn tampered_signature_rejected() {
 
 #[test]
 fn wrong_peer_pubkey_rejected() {
-    use enchudb::keys::Keypair;
+    use enchudb_wal::keys::Keypair;
 
     let pa = tmp("wrong_a");
     let pb = tmp("wrong_b");
@@ -419,7 +420,7 @@ fn acl_blocks_non_writer_peer() {
     // peer 99 から op が届く
     transport.publish(99, vec![
         WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 99 }, 99,
-            DecodedOp::Tie { eid: enchudb::make_eid(99, 0), himo_id: 0, value: 42 }),
+            DecodedOp::Tie { eid: enchudb_wal::make_eid(99, 0), himo_id: 0, value: 42 }),
     ]);
 
     let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
@@ -430,7 +431,7 @@ fn acl_blocks_non_writer_peer() {
     // peer 1 から op が来れば apply される
     transport.publish(1, vec![
         WireRecord::unsigned(Hlc { wall: 200, logical: 0, peer: 1 }, 1,
-            DecodedOp::Tie { eid: enchudb::make_eid(1, 0), himo_id: 0, value: 77 }),
+            DecodedOp::Tie { eid: enchudb_wal::make_eid(1, 0), himo_id: 0, value: 77 }),
     ]);
     let out2 = syncer.pull_once(1);
     assert_eq!(out2.applied, 1);
@@ -448,7 +449,7 @@ fn acl_empty_is_permissive() {
 
     transport.publish(42, vec![
         WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 42 }, 42,
-            DecodedOp::Tie { eid: enchudb::make_eid(42, 0), himo_id: 0, value: 9 }),
+            DecodedOp::Tie { eid: enchudb_wal::make_eid(42, 0), himo_id: 0, value: 9 }),
     ]);
 
     let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
@@ -465,7 +466,7 @@ fn delete_remote_removes_all_himos() {
     let eng_a = make_peer(&pa, 1);
     let transport = Arc::new(InMemoryTransport::new());
 
-    let eid = enchudb::make_eid(2, 0);
+    let eid = enchudb_wal::make_eid(2, 0);
 
     // peer 2 が 3 つの himo に値を書いてから delete
     transport.publish(2, vec![

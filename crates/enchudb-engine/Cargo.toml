@@ -13,6 +13,7 @@ repository = "https://github.com/mutafika/enchudb"
 async-blob = ["dep:async-trait", "dep:tokio"]
 
 [dependencies]
+enchudb-wal = { path = "../enchudb-wal" }
 crossbeam-queue = "0.3"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }

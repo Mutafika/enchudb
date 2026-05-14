@@ -16,7 +16,8 @@
 //! OR: 和集合。
 //! 評価結果は**ソート済み EntityId (u64) の Vec**として返す（後段の集合演算をしやすくするため）。
 
-use enchudb::{Engine, EntityId};
+use enchudb::{Engine};
+use enchudb_wal::EntityId;
 use std::ops::RangeInclusive;
 
 #[derive(Clone, Debug)]

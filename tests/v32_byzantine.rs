@@ -16,11 +16,12 @@
 #![cfg(feature = "v32")]
 
 use std::sync::Arc;
-use enchudb::{Engine, HimoType, Hlc};
+use enchudb::{Engine, HimoType};
+use enchudb_wal::Hlc;
 use enchudb::sync::Syncer;
 use enchudb::transport::{InMemoryTransport, Transport, WireRecord};
-use enchudb::wal::DecodedOp;
-use enchudb::keys::Keypair;
+use enchudb_wal::wal::DecodedOp;
+use enchudb_wal::keys::Keypair;
 
 fn tmp(tag: &str) -> String {
     let p = format!("/tmp/enchudb-v32-byz-{}-{}", tag, std::process::id());
@@ -124,7 +125,7 @@ fn future_hlc_attack_dominates_lww_known_limitation() {
     let transport = Arc::new(InMemoryTransport::new());
 
     // 悪意 peer 1 が HLC=MAX で偽書き込み (署名無しで OK — signature 要求無しのシナリオ)
-    let eid = enchudb::make_eid(1, 7);
+    let eid = enchudb_wal::make_eid(1, 7);
     let himo_id = eng_b.himo_id("val").unwrap() as u16;
     transport.publish(1, vec![
         WireRecord::unsigned(
@@ -186,7 +187,7 @@ fn mixed_batch_signed_kept_unsigned_dropped() {
 
     // 同じ transport に悪意の unsigned record を混ぜ込む
     let himo_id = eng_b.himo_id("val").unwrap() as u16;
-    let eid_bad = enchudb::make_eid(1, 999);
+    let eid_bad = enchudb_wal::make_eid(1, 999);
     transport.publish(1, vec![
         WireRecord::unsigned(
             Hlc { wall: 9999, logical: 0, peer: 1 }, 1,

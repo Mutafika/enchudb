@@ -73,14 +73,14 @@ fn single_condition_routes_to_owner_peer() {
     // color=5 は local
     let r = q_a.pull_raw("color", 5);
     assert_eq!(r.len(), 1, "A's own color entity");
-    assert_eq!(enchudb::eid_peer(r[0]), 1);
-    assert_eq!(enchudb::eid_local(r[0]), enchudb::eid_local(e1));
+    assert_eq!(enchudb_wal::eid_peer(r[0]), 1);
+    assert_eq!(enchudb_wal::eid_local(r[0]), enchudb_wal::eid_local(e1));
 
     // size=10 は remote (B)
     let r = q_a.pull_raw("size", 10);
     assert_eq!(r.len(), 1, "remote B's size entity");
-    assert_eq!(enchudb::eid_peer(r[0]), 2, "should be peer 2");
-    assert_eq!(enchudb::eid_local(r[0]), enchudb::eid_local(e2));
+    assert_eq!(enchudb_wal::eid_peer(r[0]), 2, "should be peer 2");
+    assert_eq!(enchudb_wal::eid_local(r[0]), enchudb_wal::eid_local(e2));
 
     cleanup(&pa);
     cleanup(&pb);
@@ -100,7 +100,7 @@ fn explicit_router_falls_back_for_unknown_himo() {
     let q = ShardQuery::new(eng_a.clone(), router, transport);
     // 未定義 himo は peer 1 (自分) に行き、engine.pull_raw は空 Vec
     let r = q.pull_raw("nonexistent", 42);
-    assert_eq!(r, Vec::<enchudb::EntityId>::new());
+    assert_eq!(r, Vec::<enchudb_wal::EntityId>::new());
 
     cleanup(&pa);
 }
@@ -177,11 +177,11 @@ fn two_condition_query_crosses_shards() {
     // 片方だけの query は結果あり
     let r = q.query(&[("color", 3)]);
     assert_eq!(r.len(), 1);
-    assert_eq!(enchudb::eid_peer(r[0]), 1);
+    assert_eq!(enchudb_wal::eid_peer(r[0]), 1);
 
     let r = q.query(&[("size", 5)]);
     assert_eq!(r.len(), 1);
-    assert_eq!(enchudb::eid_peer(r[0]), 2);
+    assert_eq!(enchudb_wal::eid_peer(r[0]), 2);
 
     cleanup(&pa);
     cleanup(&pb);
@@ -204,7 +204,7 @@ fn replicated_entity_matches_across_shards_via_sync() {
 
     // 共有 eid: peer 0 が「論理的に」作った entity とする (あるいは root peer 扱い)
     let shared_local = 42u32;
-    let shared_eid = enchudb::make_eid(0, shared_local);
+    let shared_eid = enchudb_wal::make_eid(0, shared_local);
 
     // peer A の color column に entry
     let color_himo = eng_a.himo_id("color").unwrap() as u16;

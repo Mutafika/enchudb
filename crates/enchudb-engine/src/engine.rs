@@ -55,7 +55,7 @@ pub struct EngineStats {
     /// v32: HlcStore の総エントリ数((eid, himo) で区別、非 v32 では 0)
     pub hlc_entries: usize,
     /// v32: HlcStore 内の最大 HLC(LWW 基準の最新書き込み時刻、非 v32 では None)
-    pub max_hlc: Option<crate::Hlc>,
+    pub max_hlc: Option<enchudb_wal::Hlc>,
 }
 
 fn wal_path_for(path: &str) -> std::path::PathBuf {
@@ -74,11 +74,11 @@ pub struct SnapshotFiles {
 #[derive(Debug, Clone, Default)]
 pub struct AuditFilter {
     /// HLC 下限(inclusive)。これより古い record は除外。
-    pub from_hlc: Option<crate::Hlc>,
+    pub from_hlc: Option<enchudb_wal::Hlc>,
     /// HLC 上限(inclusive)。これより新しい record は除外。
-    pub to_hlc: Option<crate::Hlc>,
+    pub to_hlc: Option<enchudb_wal::Hlc>,
     /// 書き手 peer_id。これ以外の author を除外。
-    pub author_peer: Option<crate::PeerId>,
+    pub author_peer: Option<enchudb_wal::PeerId>,
     /// 署名者 pubkey の指紋(8B)。一致しない record は除外。
     pub pubkey_fp: Option<[u8; 8]>,
 }
@@ -826,7 +826,7 @@ pub struct Engine {
     apply_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// v28 WAL。`create_concurrent_with_wal` or `open_concurrent_with_wal` で有効化。
     /// Some なら tie_async/untie_async/delete_async は WAL append を先に実行する。
-    wal: Option<std::sync::Arc<crate::wal::Wal>>,
+    wal: Option<std::sync::Arc<enchudb_wal::wal::Wal>>,
     /// 背景 fsync が最後に completed した LSN。
     durable_lsn: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// v32: この Engine を所有する peer の id。分散時 eid の上位 32bit。
@@ -834,9 +834,9 @@ pub struct Engine {
     /// v32: LWW 用に (eid, himo) → 最後の HLC を記録。
     hlc_store: std::sync::Arc<crate::hlc_store::HlcStore>,
     /// v32 Phase C: 自 peer の ed25519 鍵ペア。None なら署名しない/検証もしない。
-    keypair: std::sync::RwLock<Option<std::sync::Arc<crate::keys::Keypair>>>,
+    keypair: std::sync::RwLock<Option<std::sync::Arc<enchudb_wal::keys::Keypair>>>,
     /// v32 Phase C: 他 peer の pubkey TOFU ストア。Syncer が verify に使う。
-    pubkeys: std::sync::Arc<crate::keys::PubkeyStore>,
+    pubkeys: std::sync::Arc<enchudb_wal::keys::PubkeyStore>,
     /// v32 Phase C: ACL(書き込み許可 peer の集合)。Syncer が enforce する。
     acl: std::sync::Arc<crate::acl::Acl>,
     /// v32 エッジ用: true なら書き込み API が panic、sync 経由 (remote_*_apply) のみ受ける。
@@ -853,7 +853,7 @@ pub struct Engine {
     /// v33: 受信した Vocab op の `(author_peer, remote_vid) → local_vid` mapping。
     /// Symbol 型 himo の Tie を受信した時に remote_vid を local_vid に変換して apply する。
     /// peer-local に保持(replica でも独立、open 時は空、受信で徐々に埋まる)。
-    peer_vocab_map: std::sync::RwLock<std::collections::HashMap<(crate::PeerId, u32), u32>>,
+    peer_vocab_map: std::sync::RwLock<std::collections::HashMap<(enchudb_wal::PeerId, u32), u32>>,
     backing: Backing, // 最後に drop されるよう最終フィールド
 }
 
@@ -984,13 +984,13 @@ impl Engine {
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             keypair: std::sync::RwLock::new(None),
-            pubkeys: std::sync::Arc::new(crate::keys::PubkeyStore::new()),
+            pubkeys: std::sync::Arc::new(enchudb_wal::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
             is_replica: std::sync::atomic::AtomicBool::new(false),
             blob_store: std::sync::RwLock::new(None),
             change_listeners: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
             change_emit_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-                crate::wal::HEADER_SIZE as u64,
+                enchudb_wal::wal::HEADER_SIZE as u64,
             )),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             backing: Backing::Mmap(mmap),
@@ -1213,13 +1213,13 @@ impl Engine {
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             keypair: std::sync::RwLock::new(None),
-            pubkeys: std::sync::Arc::new(crate::keys::PubkeyStore::new()),
+            pubkeys: std::sync::Arc::new(enchudb_wal::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
             is_replica: std::sync::atomic::AtomicBool::new(false),
             blob_store: std::sync::RwLock::new(None),
             change_listeners: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
             change_emit_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-                crate::wal::HEADER_SIZE as u64,
+                enchudb_wal::wal::HEADER_SIZE as u64,
             )),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             backing: Backing::Growable(map),
@@ -1542,13 +1542,13 @@ impl Engine {
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             keypair: std::sync::RwLock::new(None),
-            pubkeys: std::sync::Arc::new(crate::keys::PubkeyStore::new()),
+            pubkeys: std::sync::Arc::new(enchudb_wal::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
             is_replica: std::sync::atomic::AtomicBool::new(false),
             blob_store: std::sync::RwLock::new(None),
             change_listeners: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
             change_emit_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-                crate::wal::HEADER_SIZE as u64,
+                enchudb_wal::wal::HEADER_SIZE as u64,
             )),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             backing,
@@ -1616,31 +1616,31 @@ impl Engine {
 
     // ──── entity ────
 
-    pub fn entity(&self) -> crate::EntityId {
+    pub fn entity(&self) -> enchudb_wal::EntityId {
         self.check_writable();
         let local = self.entities.allocate();
         self.undo.record(local, 0xFFFF, &[1, 0, 0, 0]); // entity created
         let peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
-        crate::make_eid(peer, local)
+        enchudb_wal::make_eid(peer, local)
     }
 
-    pub fn entities(&self) -> Vec<crate::EntityId> {
+    pub fn entities(&self) -> Vec<enchudb_wal::EntityId> {
         let peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
         self.entities.iter().into_iter()
-            .map(|local| crate::make_eid(peer, local))
+            .map(|local| enchudb_wal::make_eid(peer, local))
             .collect()
     }
     pub fn entity_count(&self) -> u32 { self.entities.count() }
-    pub fn next_eid(&self) -> crate::EntityId {
+    pub fn next_eid(&self) -> enchudb_wal::EntityId {
         let peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
-        crate::make_eid(peer, self.entities.next_eid())
+        enchudb_wal::make_eid(peer, self.entities.next_eid())
     }
 
     // ──── v32: peer_id ────
 
     /// この Engine を所有する peer の id を設定。WAL / DB header にも反映される。
     /// 起動時に 1 回だけ呼ぶ想定。
-    pub fn set_peer_id(&self, peer: crate::PeerId) {
+    pub fn set_peer_id(&self, peer: enchudb_wal::PeerId) {
         self.peer_id.store(peer, std::sync::atomic::Ordering::Release);
         // mmap の header に即書き込み(CRC 保護外なので再計算不要)
         self.backing.header_mut()[H_PEER_ID..H_PEER_ID + 4]
@@ -1651,7 +1651,7 @@ impl Engine {
     }
 
     /// 現在の peer id。
-    pub fn peer_id(&self) -> crate::PeerId {
+    pub fn peer_id(&self) -> enchudb_wal::PeerId {
         self.peer_id.load(std::sync::atomic::Ordering::Acquire)
     }
 
@@ -1661,7 +1661,7 @@ impl Engine {
     }
 
     /// Phase C: 自 peer の鍵ペアを設定。WAL にも反映される。None で署名 off。
-    pub fn set_keypair(&self, kp: Option<std::sync::Arc<crate::keys::Keypair>>) {
+    pub fn set_keypair(&self, kp: Option<std::sync::Arc<enchudb_wal::keys::Keypair>>) {
         *self.keypair.write().unwrap() = kp.clone();
         if let Some(wal) = self.wal.as_ref() {
             wal.set_keypair(kp.clone());
@@ -1673,7 +1673,7 @@ impl Engine {
     }
 
     /// Phase C: 他 peer の pubkey ストアへの参照。
-    pub fn pubkeys(&self) -> &std::sync::Arc<crate::keys::PubkeyStore> {
+    pub fn pubkeys(&self) -> &std::sync::Arc<enchudb_wal::keys::PubkeyStore> {
         &self.pubkeys
     }
 
@@ -1683,12 +1683,12 @@ impl Engine {
     }
 
     /// Phase C: 自 peer の鍵ペアを返す。
-    pub fn keypair(&self) -> Option<std::sync::Arc<crate::keys::Keypair>> {
+    pub fn keypair(&self) -> Option<std::sync::Arc<enchudb_wal::keys::Keypair>> {
         self.keypair.read().unwrap().clone()
     }
 
     /// WAL への参照(sync モジュールが publish に使う)。
-    pub fn wal_arc(&self) -> Option<std::sync::Arc<crate::wal::Wal>> {
+    pub fn wal_arc(&self) -> Option<std::sync::Arc<enchudb_wal::wal::Wal>> {
         self.wal.clone()
     }
 
@@ -1696,8 +1696,8 @@ impl Engine {
     // これらは LWW 判定を通った後の無条件 apply。HlcStore は Syncer が先に更新済み。
 
     /// リモート peer から届いた Tie を apply。WAL には書き戻さない(2 重送信防止)。
-    pub fn remote_tie_apply(&self, eid: crate::EntityId, himo_id: u16, value: u32) {
-        let local = crate::eid_local(eid);
+    pub fn remote_tie_apply(&self, eid: enchudb_wal::EntityId, himo_id: u16, value: u32) {
+        let local = enchudb_wal::eid_local(eid);
         let hid = himo_id as usize;
         if hid >= self.himos.len() { return; }
         // entity 未確保ならローカル側の EntitySet に登録(eid は peer 側が決めた値)
@@ -1706,16 +1706,16 @@ impl Engine {
     }
 
     /// リモート peer から届いた Untie を apply。
-    pub fn remote_untie_apply(&self, eid: crate::EntityId, himo_id: u16) {
-        let local = crate::eid_local(eid);
+    pub fn remote_untie_apply(&self, eid: enchudb_wal::EntityId, himo_id: u16) {
+        let local = enchudb_wal::eid_local(eid);
         let hid = himo_id as usize;
         if hid >= self.himos.len() { return; }
         self.himos[hid].remove(local);
     }
 
     /// リモート peer から届いた Delete を apply。
-    pub fn remote_delete_apply(&self, eid: crate::EntityId) {
-        let local = crate::eid_local(eid);
+    pub fn remote_delete_apply(&self, eid: enchudb_wal::EntityId) {
+        let local = enchudb_wal::eid_local(eid);
         for hid in 0..self.himos.len() {
             self.himos[hid].remove(local);
         }
@@ -1723,8 +1723,8 @@ impl Engine {
     }
 
     /// リモート peer から届いた Content 書き込みを apply。
-    pub fn remote_content_apply(&self, eid: crate::EntityId, key: &str, data: &[u8]) {
-        let local = crate::eid_local(eid);
+    pub fn remote_content_apply(&self, eid: enchudb_wal::EntityId, key: &str, data: &[u8]) {
+        let local = enchudb_wal::eid_local(eid);
         self.entities.ensure_live(local);
         self.contents.set(local, key, data);
     }
@@ -1733,7 +1733,7 @@ impl Engine {
     /// `bytes` を local vocab に insert し、local_vid を取得して
     /// `(author_peer, remote_vid) → local_vid` の mapping を記録する。
     /// 後続の Tie { value: remote_vid } を受信したら `translate_remote_vid` で local_vid に変換。
-    pub fn remote_vocab_apply(&self, author_peer: crate::PeerId, remote_vid: u32, bytes: &[u8]) {
+    pub fn remote_vocab_apply(&self, author_peer: enchudb_wal::PeerId, remote_vid: u32, bytes: &[u8]) {
         let local_vid = self.vocab.get_or_insert(bytes);
         let mut map = self.peer_vocab_map.write().unwrap();
         map.insert((author_peer, remote_vid), local_vid);
@@ -1741,7 +1741,7 @@ impl Engine {
 
     /// v33: Symbol 型 himo の Tie を受信した際、remote vid を local vid に変換する。
     /// Symbol 以外の himo、または mapping 未登録なら元値をそのまま返す。
-    pub fn translate_remote_vid(&self, author_peer: crate::PeerId, himo_id: u16, value: u32) -> u32 {
+    pub fn translate_remote_vid(&self, author_peer: enchudb_wal::PeerId, himo_id: u16, value: u32) -> u32 {
         let hid = himo_id as usize;
         if hid >= self.himo_types.len() { return value; }
         if self.himo_types[hid] != HimoType::Symbol { return value; }
@@ -1755,9 +1755,9 @@ impl Engine {
         self.ensure_himo(himo, ht, max_values);
     }
 
-    pub fn tie_text(&mut self, eid: crate::EntityId, himo: &str, value: &str) {
+    pub fn tie_text(&mut self, eid: enchudb_wal::EntityId, himo: &str, value: &str) {
         self.check_writable();
-        let eid = crate::eid_local(eid);
+        let eid = enchudb_wal::eid_local(eid);
         let vid = self.vocab.get_or_insert(value.as_bytes());
         let hid = self.ensure_himo(himo, HimoType::Symbol, 0);
         debug_assert_eq!(self.himo_types[hid], HimoType::Symbol, "tie_text on non-Symbol himo '{}'", himo);
@@ -1767,9 +1767,9 @@ impl Engine {
         self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), vid);
     }
 
-    pub fn tie(&mut self, eid: crate::EntityId, himo: &str, value: u32) {
+    pub fn tie(&mut self, eid: enchudb_wal::EntityId, himo: &str, value: u32) {
         self.check_writable();
-        let eid = crate::eid_local(eid);
+        let eid = enchudb_wal::eid_local(eid);
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = self.ensure_himo(himo, HimoType::Value, 0);
         debug_assert!(self.himo_types[hid] == HimoType::Value || self.himo_types[hid] == HimoType::Ref, "tie on non-Value himo '{}'", himo);
@@ -1779,10 +1779,10 @@ impl Engine {
         self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), value);
     }
 
-    pub fn tie_ref(&mut self, eid: crate::EntityId, himo: &str, target_eid: crate::EntityId) {
+    pub fn tie_ref(&mut self, eid: enchudb_wal::EntityId, himo: &str, target_eid: enchudb_wal::EntityId) {
         self.check_writable();
-        let eid = crate::eid_local(eid);
-        let target_eid = crate::eid_local(target_eid);
+        let eid = enchudb_wal::eid_local(eid);
+        let target_eid = enchudb_wal::eid_local(target_eid);
         assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
         let hid = self.ensure_himo(himo, HimoType::Ref, 0);
         debug_assert!(self.himo_types[hid] == HimoType::Ref || self.himo_types[hid] == HimoType::Value, "tie_ref on non-Ref himo '{}'", himo);
@@ -1796,9 +1796,9 @@ impl Engine {
 
     /// 定義済みの紐に文字列を張る。&selfで呼べる（Arc共有のまま書き込み可）。
     /// 紐が未定義ならpanic。define_himo を先に呼ぶこと。
-    pub fn tie_text_to(&self, eid: crate::EntityId, himo: &str, value: &str) {
+    pub fn tie_text_to(&self, eid: enchudb_wal::EntityId, himo: &str, value: &str) {
         self.check_writable();
-        let eid = crate::eid_local(eid);
+        let eid = enchudb_wal::eid_local(eid);
         let vid = self.vocab.get_or_insert(value.as_bytes());
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
@@ -1807,12 +1807,20 @@ impl Engine {
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, vid);
         self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), vid);
+        // WAL に Vocab + Tie を流す。 schema layer (enchudb-schema) は同期版の
+        // tie_text_to を経由するため、 ここで append しないと WAL が空のままで
+        // peer 同期が成立しない (publish 側が iter_committed で 0 件を見る).
+        if let Some(wal) = self.wal.as_ref() {
+            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), eid);
+            let _ = wal.append(enchudb_wal::wal::WalOp::Vocab { vid, bytes: value.as_bytes() });
+            let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id: hid as u16, value: vid });
+        }
     }
 
     /// 定義済みの紐にu32値を張る。&selfで呼べる。
-    pub fn tie_to(&self, eid: crate::EntityId, himo: &str, value: u32) {
+    pub fn tie_to(&self, eid: enchudb_wal::EntityId, himo: &str, value: u32) {
         self.check_writable();
-        let eid = crate::eid_local(eid);
+        let eid = enchudb_wal::eid_local(eid);
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
@@ -1821,13 +1829,17 @@ impl Engine {
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, value);
         self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), value);
+        if let Some(wal) = self.wal.as_ref() {
+            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), eid);
+            let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id: hid as u16, value });
+        }
     }
 
     /// 定義済みの紐にentity参照を張る。&selfで呼べる。
-    pub fn tie_ref_to(&self, eid: crate::EntityId, himo: &str, target_eid: crate::EntityId) {
+    pub fn tie_ref_to(&self, eid: enchudb_wal::EntityId, himo: &str, target_eid: enchudb_wal::EntityId) {
         self.check_writable();
-        let eid = crate::eid_local(eid);
-        let target_eid = crate::eid_local(target_eid);
+        let eid = enchudb_wal::eid_local(eid);
+        let target_eid = enchudb_wal::eid_local(target_eid);
         assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
@@ -1836,13 +1848,17 @@ impl Engine {
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, target_eid);
         self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), target_eid);
+        if let Some(wal) = self.wal.as_ref() {
+            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), eid);
+            let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id: hid as u16, value: target_eid });
+        }
     }
 
     // ──── untie ────
 
-    pub fn untie(&self, eid: crate::EntityId, himo: &str) {
+    pub fn untie(&self, eid: enchudb_wal::EntityId, himo: &str) {
         self.check_writable();
-        let eid = crate::eid_local(eid);
+        let eid = enchudb_wal::eid_local(eid);
         if let Some(hid) = self.himo_id(himo) {
             self.record_undo(eid, hid);
             let old_val = self.himos[hid].get_value(eid);
@@ -1850,14 +1866,18 @@ impl Engine {
             if let Some(ov) = old_val {
                 self.apply_pair_delta_internal(eid, hid, ov, u32::MAX);
             }
+            if let Some(wal) = self.wal.as_ref() {
+                let wal_eid = enchudb_wal::make_eid(wal.peer_id(), eid);
+                let _ = wal.append(enchudb_wal::wal::WalOp::Untie { eid: wal_eid, himo_id: hid as u16 });
+            }
         }
     }
 
     // ──── delete ────
 
-    pub fn delete(&self, eid: crate::EntityId) {
+    pub fn delete(&self, eid: enchudb_wal::EntityId) {
         self.check_writable();
-        let eid = crate::eid_local(eid);
+        let eid = enchudb_wal::eid_local(eid);
         self.undo.record(eid, 0xFFFF, &[2, 0, 0, 0]); // entity deleted
         for hid in 0..self.himos.len() {
             self.record_undo(eid, hid);
@@ -1868,6 +1888,10 @@ impl Engine {
             }
         }
         self.entities.free(eid);
+        if let Some(wal) = self.wal.as_ref() {
+            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), eid);
+            let _ = wal.append(enchudb_wal::wal::WalOp::Delete { eid: wal_eid });
+        }
     }
 
     // ──── トランザクション ────
@@ -1878,7 +1902,7 @@ impl Engine {
     pub fn commit(&self) {
         self.undo.commit();
         if let Some(wal) = self.wal.as_ref() {
-            let _ = wal.append(crate::wal::WalOp::Commit);
+            let _ = wal.append(enchudb_wal::wal::WalOp::Commit);
         }
     }
 
@@ -1919,13 +1943,13 @@ impl Engine {
 
     // ──── content ────
 
-    pub fn content(&self, eid: crate::EntityId, key: &str, data: &[u8]) {
+    pub fn content(&self, eid: enchudb_wal::EntityId, key: &str, data: &[u8]) {
         self.check_writable();
-        self.contents.set(crate::eid_local(eid), key, data);
+        self.contents.set(enchudb_wal::eid_local(eid), key, data);
     }
 
-    pub fn get_content(&self, eid: crate::EntityId, key: &str) -> Option<&[u8]> {
-        self.contents.get(crate::eid_local(eid), key)
+    pub fn get_content(&self, eid: enchudb_wal::EntityId, key: &str) -> Option<&[u8]> {
+        self.contents.get(enchudb_wal::eid_local(eid), key)
     }
 
     // ──── changefeed (WAL 変更通知) ────
@@ -1996,27 +2020,27 @@ impl Engine {
 
     // ──── get ────
 
-    pub fn get_text(&self, eid: crate::EntityId, himo: &str) -> Option<&[u8]> {
-        let eid = crate::eid_local(eid);
+    pub fn get_text(&self, eid: enchudb_wal::EntityId, himo: &str) -> Option<&[u8]> {
+        let eid = enchudb_wal::eid_local(eid);
         let hid = self.himo_id(himo)?;
         if self.himo_types[hid] != HimoType::Symbol { return None; }
         let vid = self.himos[hid].get_value(eid)?;
         Some(self.vocab.get(vid))
     }
 
-    pub fn get(&self, eid: crate::EntityId, himo: &str) -> Option<u32> {
-        let eid = crate::eid_local(eid);
+    pub fn get(&self, eid: enchudb_wal::EntityId, himo: &str) -> Option<u32> {
+        let eid = enchudb_wal::eid_local(eid);
         let hid = self.himo_id(himo)?;
         self.himos[hid].get_value(eid)
     }
 
     /// 指定 entity 群の紐値を合計
-    pub fn sum(&self, himo: &str, eids: &[crate::EntityId]) -> u64 {
+    pub fn sum(&self, himo: &str, eids: &[enchudb_wal::EntityId]) -> u64 {
         let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
         let hs = &self.himos[hid];
         let mut total: u64 = 0;
         for &eid in eids {
-            if let Some(v) = hs.get_value(crate::eid_local(eid)) {
+            if let Some(v) = hs.get_value(enchudb_wal::eid_local(eid)) {
                 total += v as u64;
             }
         }
@@ -2024,12 +2048,12 @@ impl Engine {
     }
 
     /// 最小値
-    pub fn min(&self, himo: &str, eids: &[crate::EntityId]) -> Option<u32> {
+    pub fn min(&self, himo: &str, eids: &[enchudb_wal::EntityId]) -> Option<u32> {
         let hid = self.himo_id(himo)?;
         let hs = &self.himos[hid];
         let mut result: Option<u32> = None;
         for &eid in eids {
-            if let Some(v) = hs.get_value(crate::eid_local(eid)) {
+            if let Some(v) = hs.get_value(enchudb_wal::eid_local(eid)) {
                 result = Some(result.map_or(v, |cur: u32| cur.min(v)));
             }
         }
@@ -2037,12 +2061,12 @@ impl Engine {
     }
 
     /// 最大値
-    pub fn max(&self, himo: &str, eids: &[crate::EntityId]) -> Option<u32> {
+    pub fn max(&self, himo: &str, eids: &[enchudb_wal::EntityId]) -> Option<u32> {
         let hid = self.himo_id(himo)?;
         let hs = &self.himos[hid];
         let mut result: Option<u32> = None;
         for &eid in eids {
-            if let Some(v) = hs.get_value(crate::eid_local(eid)) {
+            if let Some(v) = hs.get_value(enchudb_wal::eid_local(eid)) {
                 result = Some(result.map_or(v, |cur: u32| cur.max(v)));
             }
         }
@@ -2050,13 +2074,13 @@ impl Engine {
     }
 
     /// 平均（整数除算）
-    pub fn avg(&self, himo: &str, eids: &[crate::EntityId]) -> Option<u64> {
+    pub fn avg(&self, himo: &str, eids: &[enchudb_wal::EntityId]) -> Option<u64> {
         let hid = self.himo_id(himo)?;
         let hs = &self.himos[hid];
         let mut total: u64 = 0;
         let mut count: u64 = 0;
         for &eid in eids {
-            if let Some(v) = hs.get_value(crate::eid_local(eid)) {
+            if let Some(v) = hs.get_value(enchudb_wal::eid_local(eid)) {
                 total += v as u64;
                 count += 1;
             }
@@ -2065,25 +2089,25 @@ impl Engine {
     }
 
     /// 値を持つ entity の数
-    pub fn count(&self, himo: &str, eids: &[crate::EntityId]) -> u32 {
+    pub fn count(&self, himo: &str, eids: &[enchudb_wal::EntityId]) -> u32 {
         let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
         let hs = &self.himos[hid];
         let mut n: u32 = 0;
         for &eid in eids {
-            if hs.get_value(crate::eid_local(eid)).is_some() { n += 1; }
+            if hs.get_value(enchudb_wal::eid_local(eid)).is_some() { n += 1; }
         }
         n
     }
 
     /// GROUP BY + SUM — group_himo の値でグループ化し、sum_himo の値を合計
-    pub fn group_sum(&self, group_himo: &str, sum_himo: &str, eids: &[crate::EntityId]) -> Vec<(u32, u64)> {
+    pub fn group_sum(&self, group_himo: &str, sum_himo: &str, eids: &[enchudb_wal::EntityId]) -> Vec<(u32, u64)> {
         let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
         let sid = match self.himo_id(sum_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
         let ss = &self.himos[sid];
         let mut map: Vec<(u32, u64)> = Vec::new();
         for &eid in eids {
-            let local = crate::eid_local(eid);
+            let local = enchudb_wal::eid_local(eid);
             if let (Some(group), Some(val)) = (gs.get_value(local), ss.get_value(local)) {
                 if let Some(entry) = map.iter_mut().find(|(k, _)| *k == group) {
                     entry.1 += val as u64;
@@ -2096,12 +2120,12 @@ impl Engine {
     }
 
     /// GROUP BY + COUNT — group_himo の値でグループ化し、各グループの entity 数
-    pub fn group_count(&self, group_himo: &str, eids: &[crate::EntityId]) -> Vec<(u32, u32)> {
+    pub fn group_count(&self, group_himo: &str, eids: &[enchudb_wal::EntityId]) -> Vec<(u32, u32)> {
         let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
         let mut map: Vec<(u32, u32)> = Vec::new();
         for &eid in eids {
-            if let Some(group) = gs.get_value(crate::eid_local(eid)) {
+            if let Some(group) = gs.get_value(enchudb_wal::eid_local(eid)) {
                 if let Some(entry) = map.iter_mut().find(|(k, _)| *k == group) {
                     entry.1 += 1;
                 } else {
@@ -2113,14 +2137,14 @@ impl Engine {
     }
 
     /// GROUP BY + MIN
-    pub fn group_min(&self, group_himo: &str, val_himo: &str, eids: &[crate::EntityId]) -> Vec<(u32, u32)> {
+    pub fn group_min(&self, group_himo: &str, val_himo: &str, eids: &[enchudb_wal::EntityId]) -> Vec<(u32, u32)> {
         let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
         let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
         let vs = &self.himos[vid];
         let mut map: Vec<(u32, u32)> = Vec::new();
         for &eid in eids {
-            let local = crate::eid_local(eid);
+            let local = enchudb_wal::eid_local(eid);
             if let (Some(group), Some(val)) = (gs.get_value(local), vs.get_value(local)) {
                 if let Some(entry) = map.iter_mut().find(|(k, _)| *k == group) {
                     if val < entry.1 { entry.1 = val; }
@@ -2133,14 +2157,14 @@ impl Engine {
     }
 
     /// GROUP BY + MAX
-    pub fn group_max(&self, group_himo: &str, val_himo: &str, eids: &[crate::EntityId]) -> Vec<(u32, u32)> {
+    pub fn group_max(&self, group_himo: &str, val_himo: &str, eids: &[enchudb_wal::EntityId]) -> Vec<(u32, u32)> {
         let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
         let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
         let vs = &self.himos[vid];
         let mut map: Vec<(u32, u32)> = Vec::new();
         for &eid in eids {
-            let local = crate::eid_local(eid);
+            let local = enchudb_wal::eid_local(eid);
             if let (Some(group), Some(val)) = (gs.get_value(local), vs.get_value(local)) {
                 if let Some(entry) = map.iter_mut().find(|(k, _)| *k == group) {
                     if val > entry.1 { entry.1 = val; }
@@ -2153,14 +2177,14 @@ impl Engine {
     }
 
     /// GROUP BY + AVG (整数除算)
-    pub fn group_avg(&self, group_himo: &str, val_himo: &str, eids: &[crate::EntityId]) -> Vec<(u32, u64)> {
+    pub fn group_avg(&self, group_himo: &str, val_himo: &str, eids: &[enchudb_wal::EntityId]) -> Vec<(u32, u64)> {
         let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
         let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
         let vs = &self.himos[vid];
         let mut acc: Vec<(u32, u64, u64)> = Vec::new(); // (group, sum, count)
         for &eid in eids {
-            let local = crate::eid_local(eid);
+            let local = enchudb_wal::eid_local(eid);
             if let (Some(group), Some(val)) = (gs.get_value(local), vs.get_value(local)) {
                 if let Some(entry) = acc.iter_mut().find(|(k, _, _)| *k == group) {
                     entry.1 += val as u64;
@@ -2174,12 +2198,12 @@ impl Engine {
     }
 
     /// 値集合の distinct — eids の中で himo に張られた値のユニーク集合
-    pub fn distinct(&self, himo: &str, eids: &[crate::EntityId]) -> Vec<u32> {
+    pub fn distinct(&self, himo: &str, eids: &[enchudb_wal::EntityId]) -> Vec<u32> {
         let hid = match self.himo_id(himo) { Some(h) => h, None => return vec![] };
         let hs = &self.himos[hid];
         let mut result: Vec<u32> = Vec::new();
         for &eid in eids {
-            if let Some(v) = hs.get_value(crate::eid_local(eid)) {
+            if let Some(v) = hs.get_value(enchudb_wal::eid_local(eid)) {
                 if !result.contains(&v) { result.push(v); }
             }
         }
@@ -2189,13 +2213,13 @@ impl Engine {
     // ──── 範囲クエリ ────
 
     /// 範囲内の全値に合致する entity を返す（min..=max）
-    pub fn pull_range(&self, himo: &str, min: u32, max: u32) -> Vec<crate::EntityId> {
+    pub fn pull_range(&self, himo: &str, min: u32, max: u32) -> Vec<enchudb_wal::EntityId> {
         let idx = match self.himo_id(himo) { Some(h) => h, None => return vec![] };
         let hs = &self.himos[idx];
         let mut result = Vec::new();
         for v in min..=max {
             for local in &hs.pull(v) {
-                result.push(*local as crate::EntityId);
+                result.push(*local as enchudb_wal::EntityId);
             }
         }
         result
@@ -2235,17 +2259,17 @@ impl Engine {
     }
 
     /// 日付を epoch 日数として tie
-    pub fn tie_date(&mut self, eid: crate::EntityId, himo: &str, year: u32, month: u32, day: u32) {
+    pub fn tie_date(&mut self, eid: enchudb_wal::EntityId, himo: &str, year: u32, month: u32, day: u32) {
         self.tie(eid, himo, Self::date_to_days(year, month, day));
     }
 
     /// epoch 日数から (year, month, day) を返す
-    pub fn get_date(&self, eid: crate::EntityId, himo: &str) -> Option<(u32, u32, u32)> {
+    pub fn get_date(&self, eid: enchudb_wal::EntityId, himo: &str) -> Option<(u32, u32, u32)> {
         self.get(eid, himo).map(Self::days_to_date)
     }
 
     /// 日付範囲で pull_range
-    pub fn pull_date_range(&self, himo: &str, from: (u32, u32, u32), to: (u32, u32, u32)) -> Vec<crate::EntityId> {
+    pub fn pull_date_range(&self, himo: &str, from: (u32, u32, u32), to: (u32, u32, u32)) -> Vec<enchudb_wal::EntityId> {
         let min = Self::date_to_days(from.0, from.1, from.2);
         let max = Self::date_to_days(to.0, to.1, to.2);
         self.pull_range(himo, min, max)
@@ -2269,16 +2293,16 @@ impl Engine {
         None
     }
 
-    pub fn himos_of(&self, eid: crate::EntityId) -> Vec<&str> {
-        let eid = crate::eid_local(eid);
+    pub fn himos_of(&self, eid: enchudb_wal::EntityId) -> Vec<&str> {
+        let eid = enchudb_wal::eid_local(eid);
         self.himos.iter().enumerate()
             .filter(|(_, ds)| ds.get_value(eid).is_some())
             .map(|(i, _)| self.himo_names[i].as_str())
             .collect()
     }
     /// 1 entity の全フィールドを一括取得。HashMap ルックアップ 0 回。
-    pub fn get_entity(&self, eid: crate::EntityId) -> Vec<(&str, EntityValue<'_>)> {
-        let eid = crate::eid_local(eid);
+    pub fn get_entity(&self, eid: enchudb_wal::EntityId) -> Vec<(&str, EntityValue<'_>)> {
+        let eid = enchudb_wal::eid_local(eid);
         let mut fields = Vec::with_capacity(self.himos.len());
         for (i, hs) in self.himos.iter().enumerate() {
             if let Some(raw) = hs.get_value(eid) {
@@ -2560,9 +2584,9 @@ impl Engine {
     }
 
     /// 引く。 EntityId(u64) の Vec を返す。
-    pub fn pull_raw(&self, himo: &str, value: u32) -> Vec<crate::EntityId> {
+    pub fn pull_raw(&self, himo: &str, value: u32) -> Vec<enchudb_wal::EntityId> {
         match self.himo_id(himo) {
-            Some(idx) => self.himos[idx].pull(value).into_iter().map(|e| e as crate::EntityId).collect(),
+            Some(idx) => self.himos[idx].pull(value).into_iter().map(|e| e as enchudb_wal::EntityId).collect(),
             None => Vec::new(),
         }
     }
@@ -2577,7 +2601,7 @@ impl Engine {
 
     /// 複数値の bucket を union する。 `WHERE col IN (v1, v2, ...)` / Ravn follow 後の union 用。
     /// 結果は sort + dedup 済み。
-    pub fn pull_in(&self, himo: &str, values: &[u32]) -> Vec<crate::EntityId> {
+    pub fn pull_in(&self, himo: &str, values: &[u32]) -> Vec<enchudb_wal::EntityId> {
         match self.himo_id(himo) {
             Some(idx) => self.pull_in_by_idx(idx, values),
             None => Vec::new(),
@@ -2585,13 +2609,13 @@ impl Engine {
     }
 
     /// schema 層用: himo_id pre-resolve 済みの `pull_in`。
-    pub fn pull_in_by_id(&self, himo_id: u16, values: &[u32]) -> Vec<crate::EntityId> {
+    pub fn pull_in_by_id(&self, himo_id: u16, values: &[u32]) -> Vec<enchudb_wal::EntityId> {
         let idx = himo_id as usize;
         if idx >= self.himos.len() { return Vec::new(); }
         self.pull_in_by_idx(idx, values)
     }
 
-    fn pull_in_by_idx(&self, idx: usize, values: &[u32]) -> Vec<crate::EntityId> {
+    fn pull_in_by_idx(&self, idx: usize, values: &[u32]) -> Vec<enchudb_wal::EntityId> {
         if values.is_empty() { return Vec::new(); }
         let mut out: Vec<u32> = Vec::new();
         for &v in values {
@@ -2599,7 +2623,7 @@ impl Engine {
         }
         out.sort_unstable();
         out.dedup();
-        out.into_iter().map(|e| e as crate::EntityId).collect()
+        out.into_iter().map(|e| e as enchudb_wal::EntityId).collect()
     }
 
     /// Cylinder 結果に delta を適用。
@@ -2634,13 +2658,13 @@ impl Engine {
         result
     }
 
-    pub fn query(&self, strings: &[(&str, u32)]) -> Vec<crate::EntityId> {
-        self.query_u32(strings).into_iter().map(|e| e as crate::EntityId).collect()
+    pub fn query(&self, strings: &[(&str, u32)]) -> Vec<enchudb_wal::EntityId> {
+        self.query_u32(strings).into_iter().map(|e| e as enchudb_wal::EntityId).collect()
     }
 
     /// schema 層用: himo_id を pre-resolve 済みの場合の高速 path。 名前 lookup を完全に skip。
     /// 同一 entity の AND 条件として扱う。 himo_id が範囲外なら空 Vec。
-    pub fn query_by_id(&self, conds: &[(u16, u32)]) -> Vec<crate::EntityId> {
+    pub fn query_by_id(&self, conds: &[(u16, u32)]) -> Vec<enchudb_wal::EntityId> {
         if conds.is_empty() { return Vec::new(); }
         let himo_count = self.himos.len();
         let mut idx_conds: Vec<(usize, u32)> = Vec::with_capacity(conds.len());
@@ -2649,7 +2673,7 @@ impl Engine {
             if idx >= himo_count { return Vec::new(); }
             idx_conds.push((idx, val));
         }
-        self.query_resolved(&idx_conds).into_iter().map(|e| e as crate::EntityId).collect()
+        self.query_resolved(&idx_conds).into_iter().map(|e| e as enchudb_wal::EntityId).collect()
     }
 
     /// 内部版: u32 eid の Vec を返す。互換性のため残す。
@@ -2924,7 +2948,7 @@ impl Engine {
     pub fn create_concurrent_with_wal(path: &str, wal_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
         let eng = Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)?;
         let wal_path = wal_path_for(path);
-        let wal = std::sync::Arc::new(crate::wal::Wal::create(&wal_path, wal_capacity)?);
+        let wal = std::sync::Arc::new(enchudb_wal::wal::Wal::create(&wal_path, wal_capacity)?);
         Ok(Self::spawn_consumer_with_wal(eng, Some(wal)))
     }
 
@@ -2939,7 +2963,7 @@ impl Engine {
         let _ = std::fs::remove_file(&crc_path);
         let wal_path = wal_path_for(path);
         let wal = if wal_path.exists() {
-            let w = crate::wal::Wal::open(&wal_path)?;
+            let w = enchudb_wal::wal::Wal::open(&wal_path)?;
             // リカバリ: commit されたレコードを本体に適用
             let records = w.recover();
             for rec in &records {
@@ -2949,39 +2973,39 @@ impl Engine {
             w.advance_checkpoint(w.head());
             std::sync::Arc::new(w)
         } else {
-            std::sync::Arc::new(crate::wal::Wal::create(&wal_path, wal_capacity)?)
+            std::sync::Arc::new(enchudb_wal::wal::Wal::create(&wal_path, wal_capacity)?)
         };
         Ok(Self::spawn_consumer_with_wal(eng, Some(wal)))
     }
 
     /// WAL の 1 op を本体に適用(recover 専用)。
     /// v32: eid は u64 だが Column は local u32 で保持。eid_local() で剥がす。
-    fn apply_wal_op(&mut self, op: &crate::wal::DecodedOp) {
-        use crate::wal::DecodedOp;
+    fn apply_wal_op(&mut self, op: &enchudb_wal::wal::DecodedOp) {
+        use enchudb_wal::wal::DecodedOp;
         match op {
             DecodedOp::Tie { eid, himo_id, value } => {
                 let hid = *himo_id as usize;
-                let local = crate::eid_local(*eid);
+                let local = enchudb_wal::eid_local(*eid);
                 if hid < self.himos.len() {
                     self.himos[hid].set(local, *value);
                 }
             }
             DecodedOp::Untie { eid, himo_id } => {
                 let hid = *himo_id as usize;
-                let local = crate::eid_local(*eid);
+                let local = enchudb_wal::eid_local(*eid);
                 if hid < self.himos.len() {
                     self.himos[hid].remove(local);
                 }
             }
             DecodedOp::Delete { eid } => {
-                let local = crate::eid_local(*eid);
+                let local = enchudb_wal::eid_local(*eid);
                 for hid in 0..self.himos.len() {
                     self.himos[hid].remove(local);
                 }
                 self.entities.free(local);
             }
             DecodedOp::Content { eid, key, data } => {
-                let local = crate::eid_local(*eid);
+                let local = enchudb_wal::eid_local(*eid);
                 self.contents.set(local, key, data);
             }
             DecodedOp::Commit => {}
@@ -3016,7 +3040,7 @@ impl Engine {
         let crc_path = crate::integrity::crc_path_for(&path);
         let _ = std::fs::remove_file(&crc_path);
         let wal = if wal_path.exists() {
-            let w = crate::wal::Wal::open(&wal_path)?;
+            let w = enchudb_wal::wal::Wal::open(&wal_path)?;
             let records = w.recover();
             for rec in &records {
                 eng.apply_wal_op(&rec.op);
@@ -3024,7 +3048,7 @@ impl Engine {
             w.advance_checkpoint(w.head());
             std::sync::Arc::new(w)
         } else {
-            std::sync::Arc::new(crate::wal::Wal::create(&wal_path, wal_capacity)?)
+            std::sync::Arc::new(enchudb_wal::wal::Wal::create(&wal_path, wal_capacity)?)
         };
         Ok(Self::spawn_consumer_with_wal(eng, Some(wal)))
     }
@@ -3036,7 +3060,7 @@ impl Engine {
     /// changefeed 内部ヘルパ: WAL から emit_offset 以降の record を取り出して
     /// 全 listener に渡し、cursor を進める。
     fn fire_change_listeners(
-        wal: &std::sync::Arc<crate::wal::Wal>,
+        wal: &std::sync::Arc<enchudb_wal::wal::Wal>,
         listeners: &std::sync::RwLock<
             Vec<std::sync::Arc<dyn crate::changefeed::ChangeListener>>,
         >,
@@ -3064,7 +3088,7 @@ impl Engine {
 
     fn spawn_consumer_with_wal(
         mut eng: Self,
-        wal: Option<std::sync::Arc<crate::wal::Wal>>,
+        wal: Option<std::sync::Arc<enchudb_wal::wal::Wal>>,
     ) -> std::sync::Arc<Self> {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
@@ -3112,7 +3136,7 @@ impl Engine {
                     if let Some(wal) = wal_for_thread.as_ref() {
                         if last_fsync.elapsed() >= fsync_interval {
                             if wal.head() > wal.checkpoint() {
-                                let _ = wal.append(crate::wal::WalOp::Commit);
+                                let _ = wal.append(enchudb_wal::wal::WalOp::Commit);
                                 let _ = wal.fsync();
                                 let _ = engine.body_msync();
                                 let head = wal.head();
@@ -3134,7 +3158,7 @@ impl Engine {
                             // ※ auto_reset が発動して offset が後退したら listener cursor もリセット。
                             if wal.try_reset() {
                                 emit_offset_for_thread.store(
-                                    crate::wal::HEADER_SIZE as u64,
+                                    enchudb_wal::wal::HEADER_SIZE as u64,
                                     Ordering::Release,
                                 );
                             }
@@ -3149,7 +3173,7 @@ impl Engine {
                         }
                         // shutdown 時の最終 Commit + 順序付き同期
                         if let Some(wal) = wal_for_thread.as_ref() {
-                            let _ = wal.append(crate::wal::WalOp::Commit);
+                            let _ = wal.append(enchudb_wal::wal::WalOp::Commit);
                             let _ = wal.fsync();
                             let _ = engine.body_msync();
                             wal.advance_checkpoint(wal.head());
@@ -3198,7 +3222,7 @@ impl Engine {
         use std::sync::atomic::Ordering;
         self.flush_writes();
         if let Some(wal) = self.wal.as_ref() {
-            let _ = wal.append(crate::wal::WalOp::Commit);
+            let _ = wal.append(enchudb_wal::wal::WalOp::Commit);
             wal.fsync()?;
             self.body_msync()?;
             let head = wal.head();
@@ -3230,7 +3254,7 @@ impl Engine {
     ///
     /// 返る各 `RecoveredRecord` には lsn, hlc, author_peer, op, signature, pubkey_fp が入り、
     /// 「誰がいつ何を書いたか」をそのまま監査できる。
-    pub fn audit(&self, filter: &AuditFilter) -> Vec<crate::wal::RecoveredRecord> {
+    pub fn audit(&self, filter: &AuditFilter) -> Vec<enchudb_wal::wal::RecoveredRecord> {
         let recs = match self.wal.as_ref() {
             Some(w) => w.iter_committed(),
             None => return Vec::new(),
@@ -3376,16 +3400,16 @@ impl Engine {
     ///
     /// WAL が有効な場合: tie_async は WAL append (memcpy) → WriteQueue push の順で実行する。
     /// WAL append は `.wal` ファイルに memcpy 1 回、100ns オーダー。hot path で fsync しない。
-    pub fn tie_async(&self, eid: crate::EntityId, himo: &str, value: u32) {
+    pub fn tie_async(&self, eid: enchudb_wal::EntityId, himo: &str, value: u32) {
         use std::sync::atomic::Ordering;
         self.check_writable();
-        let local = crate::eid_local(eid);
+        let local = enchudb_wal::eid_local(eid);
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
         if let Some(wal) = self.wal.as_ref() {
-            let wal_eid = crate::make_eid(wal.peer_id(), local);
-            let _ = wal.append(crate::wal::WalOp::Tie { eid: wal_eid, himo_id: hid as u16, value });
+            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
+            let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id: hid as u16, value });
         }
         let q = self.write_queue.as_ref()
             .expect("tie_async requires create_concurrent or concurrentize");
@@ -3403,19 +3427,19 @@ impl Engine {
     /// 4. write_queue に Tie push で本体に apply
     ///
     /// `Engine::tie_text` の &self 版。`tie_async` と異なり text を sync 対象に乗せる。
-    pub fn tie_text_async(&self, eid: crate::EntityId, himo: &str, value: &str) {
+    pub fn tie_text_async(&self, eid: enchudb_wal::EntityId, himo: &str, value: &str) {
         use std::sync::atomic::Ordering;
         self.check_writable();
-        let local = crate::eid_local(eid);
+        let local = enchudb_wal::eid_local(eid);
         let vid = self.vocab.get_or_insert(value.as_bytes());
         assert!(vid < u32::MAX, "vocab vid must be < u32::MAX (sentinel reserved)");
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
         if let Some(wal) = self.wal.as_ref() {
             // Vocab op を先に(sync の receiver 側で Tie より先に mapping が張られるよう)
-            let _ = wal.append(crate::wal::WalOp::Vocab { vid, bytes: value.as_bytes() });
-            let wal_eid = crate::make_eid(wal.peer_id(), local);
-            let _ = wal.append(crate::wal::WalOp::Tie { eid: wal_eid, himo_id: hid as u16, value: vid });
+            let _ = wal.append(enchudb_wal::wal::WalOp::Vocab { vid, bytes: value.as_bytes() });
+            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
+            let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id: hid as u16, value: vid });
         }
         let q = self.write_queue.as_ref()
             .expect("tie_text_async requires create_concurrent or concurrentize");
@@ -3428,17 +3452,17 @@ impl Engine {
     /// peer_id 部は捨てる。すなわち receiver 側では「author_peer と同一 peer 上の entity」を
     /// 指す ref として再構成される。cross-peer ref (peer A が peer B の entity を指す)は
     /// 現状未対応 (Ref 用 WAL op を別途用意する必要あり、v34 以降)。
-    pub fn tie_ref_async(&self, eid: crate::EntityId, himo: &str, target_eid: crate::EntityId) {
+    pub fn tie_ref_async(&self, eid: enchudb_wal::EntityId, himo: &str, target_eid: enchudb_wal::EntityId) {
         use std::sync::atomic::Ordering;
         self.check_writable();
-        let local = crate::eid_local(eid);
-        let target_local = crate::eid_local(target_eid);
+        let local = enchudb_wal::eid_local(eid);
+        let target_local = enchudb_wal::eid_local(target_eid);
         assert!(target_local < u32::MAX, "target_local must be < u32::MAX");
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
         if let Some(wal) = self.wal.as_ref() {
-            let wal_eid = crate::make_eid(wal.peer_id(), local);
-            let _ = wal.append(crate::wal::WalOp::Tie {
+            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
+            let _ = wal.append(enchudb_wal::wal::WalOp::Tie {
                 eid: wal_eid, himo_id: hid as u16, value: target_local,
             });
         }
@@ -3451,14 +3475,14 @@ impl Engine {
     }
 
     /// 非同期 untie。
-    pub fn untie_async(&self, eid: crate::EntityId, himo: &str) {
+    pub fn untie_async(&self, eid: enchudb_wal::EntityId, himo: &str) {
         use std::sync::atomic::Ordering;
         self.check_writable();
-        let local = crate::eid_local(eid);
+        let local = enchudb_wal::eid_local(eid);
         let hid = match self.himo_id(himo) { Some(x) => x, None => return };
         if let Some(wal) = self.wal.as_ref() {
-            let wal_eid = crate::make_eid(wal.peer_id(), local);
-            let _ = wal.append(crate::wal::WalOp::Untie { eid: wal_eid, himo_id: hid as u16 });
+            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
+            let _ = wal.append(enchudb_wal::wal::WalOp::Untie { eid: wal_eid, himo_id: hid as u16 });
         }
         let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
         q.push(crate::write_queue::Op::Untie { eid: local, himo_id: hid as u16 });
@@ -3466,13 +3490,13 @@ impl Engine {
     }
 
     /// 非同期 delete。
-    pub fn delete_async(&self, eid: crate::EntityId) {
+    pub fn delete_async(&self, eid: enchudb_wal::EntityId) {
         use std::sync::atomic::Ordering;
         self.check_writable();
-        let local = crate::eid_local(eid);
+        let local = enchudb_wal::eid_local(eid);
         if let Some(wal) = self.wal.as_ref() {
-            let wal_eid = crate::make_eid(wal.peer_id(), local);
-            let _ = wal.append(crate::wal::WalOp::Delete { eid: wal_eid });
+            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
+            let _ = wal.append(enchudb_wal::wal::WalOp::Delete { eid: wal_eid });
         }
         let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
         q.push(crate::write_queue::Op::Delete { eid: local });
@@ -3481,13 +3505,13 @@ impl Engine {
 
     /// 非同期 content 書き込み。WAL 有効時はクラッシュ後も復元される。
     /// key と data は Box に move される(消費される)。
-    pub fn content_async(&self, eid: crate::EntityId, key: &str, data: &[u8]) {
+    pub fn content_async(&self, eid: enchudb_wal::EntityId, key: &str, data: &[u8]) {
         use std::sync::atomic::Ordering;
         self.check_writable();
-        let local = crate::eid_local(eid);
+        let local = enchudb_wal::eid_local(eid);
         if let Some(wal) = self.wal.as_ref() {
-            let wal_eid = crate::make_eid(wal.peer_id(), local);
-            let _ = wal.append(crate::wal::WalOp::Content { eid: wal_eid, key, data });
+            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
+            let _ = wal.append(enchudb_wal::wal::WalOp::Content { eid: wal_eid, key, data });
         }
         let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
         q.push(crate::write_queue::Op::Content {
@@ -3505,7 +3529,7 @@ impl Engine {
     /// Sync モードでは commit 完了まで待つ。
     pub fn wal_commit(&self) {
         if let Some(wal) = self.wal.as_ref() {
-            let _ = wal.append(crate::wal::WalOp::Commit);
+            let _ = wal.append(enchudb_wal::wal::WalOp::Commit);
         }
         // WAL Commit = transaction 確定。undo は不要になる。
         // これを忘れると re-open 時に undo 再生で entity が free される。
@@ -3513,7 +3537,7 @@ impl Engine {
     }
 
     /// WAL への参照(テスト / 内部用)。
-    pub fn wal(&self) -> Option<&std::sync::Arc<crate::wal::Wal>> { self.wal.as_ref() }
+    pub fn wal(&self) -> Option<&std::sync::Arc<enchudb_wal::wal::Wal>> { self.wal.as_ref() }
 
     /// push 済みの全 Op が apply 完了するまで spin 待ち。`tie_async` の同期点。
     /// `queue.is_empty()` は pop 直後 / apply 前のウィンドウで true になる race が

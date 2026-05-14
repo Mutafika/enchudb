@@ -109,7 +109,7 @@ fn main() {
             }
         }
         "v32_signed_loop" => {
-            use enchudb_engine::keys::Keypair;
+            use enchudb_wal::keys::Keypair;
             // seed 固定で親が pubkey を事前登録できるようにする
             let seed = [7u8; 32];
             let kp = std::sync::Arc::new(Keypair::from_bytes(&seed));

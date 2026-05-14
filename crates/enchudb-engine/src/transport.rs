@@ -28,8 +28,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::{Hlc, PeerId};
-use crate::wal::{DecodedOp, RecoveredRecord};
+use enchudb_wal::wal::{DecodedOp, RecoveredRecord};
+use enchudb_wal::{Hlc, PeerId};
 
 /// peer 間で交換する 1 件の op。
 /// Phase C: signature と pubkey_fp + 署名対象 bytes を同梱する。
@@ -347,7 +347,7 @@ impl Transport for InMemoryTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wal::DecodedOp;
+    use enchudb_wal::wal::DecodedOp;
 
     fn rec(hlc_wall: u64, peer: PeerId, eid: u64, value: u32) -> WireRecord {
         WireRecord {

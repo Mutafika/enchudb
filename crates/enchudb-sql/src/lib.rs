@@ -50,7 +50,8 @@
 //! }
 //! ```
 
-use enchudb_engine::{Engine, EntityId, HimoType};
+use enchudb_engine::{Engine, HimoType};
+use enchudb_wal::EntityId;
 use sqlparser::ast::{
     self, BinaryOperator, ColumnOption, DataType, Expr, ObjectName, Query, SelectItem, SetExpr,
     Statement, TableFactor, Value as SqlValue,

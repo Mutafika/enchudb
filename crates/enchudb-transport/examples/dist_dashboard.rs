@@ -20,11 +20,12 @@ use sabitori::*;
 use sabitori_core::tui::{block, hsep};
 use sabitori_style::Theme;
 
-use enchudb::{Engine, HimoType, Hlc};
+use enchudb::{Engine, HimoType};
+use enchudb_wal::Hlc;
 use enchudb::sync::Syncer;
 use enchudb::transport::{Transport, WireRecord};
 use enchudb_transport::http::{HttpRelay, HttpTransport};
-use enchudb::wal::DecodedOp;
+use enchudb_wal::wal::DecodedOp;
 
 // std::sync::RwLock でも十分だが、UI thread で短い read lock を多数取るので alias に。
 mod parking_lot_like {
@@ -667,7 +668,7 @@ fn spawn_cluster(state: Arc<RwLock<ClusterState>>, shutdown: Arc<AtomicBool>) {
                     let mut sink: u64 = 0;
                     let ec = replica_for_bench.entity_count().max(1);
                     for i in 0..iters {
-                        let eid = enchudb::make_eid(1, (i as u32 % ec) + 1);
+                        let eid = enchudb_wal::make_eid(1, (i as u32 % ec) + 1);
                         if let Some(v) = replica_for_bench.get(eid, "val") {
                             sink = sink.wrapping_add(v as u64);
                         }
@@ -748,7 +749,7 @@ fn spawn_cluster(state: Arc<RwLock<ClusterState>>, shutdown: Arc<AtomicBool>) {
             // publish 1 record
             if last_pub.elapsed() >= publish_tick && counter < 60_000 {
                 let local = counter + 1;
-                let eid = enchudb::make_eid(1, local);
+                let eid = enchudb_wal::make_eid(1, local);
                 let wall = now_millis();
                 let rec = WireRecord::unsigned(
                     Hlc { wall, logical: 0, peer: 1 }, 1,
@@ -820,7 +821,7 @@ fn spawn_cluster(state: Arc<RwLock<ClusterState>>, shutdown: Arc<AtomicBool>) {
                         for back in 0..limit {
                             let try_local = counter.saturating_sub(back);
                             if try_local == 0 { break; }
-                            let eid = enchudb::make_eid(1, try_local);
+                            let eid = enchudb_wal::make_eid(1, try_local);
                             if r.get(eid, "val").is_some() {
                                 max_local = try_local;
                                 break;

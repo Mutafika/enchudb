@@ -61,7 +61,8 @@
 //! 時に自動で復元、 himo_id も再 resolve される。 `Drop` で flush が呼ばれるので
 //! 手動 flush は不要 (明示的に呼びたい場合は `db.engine_mut().flush()`)。
 
-use enchudb_engine::{Engine, EntityId, HimoType};
+use enchudb_engine::{Engine, HimoType};
+use enchudb_wal::EntityId;
 use std::sync::Arc;
 
 const TABLE_MARKER_HIMO: &str = "__enchu_table";
@@ -384,6 +385,7 @@ impl Database {
                 name: c.name.clone(),
                 ty: c.ty,
                 is_pk: t.pk.map(|i| t.cols[i].name == c.name).unwrap_or(false),
+                ref_to: t.relations.iter().find(|r| r.from_col == c.name).map(|r| r.to_table.clone()),
             }).collect(),
         }).collect()
     }
@@ -490,6 +492,8 @@ pub struct ColumnInfo {
     pub name: String,
     pub ty: ColumnType,
     pub is_pk: bool,
+    /// `ColumnType::Ref` で `ref_to(col, table)` で declare された場合のみ Some。
+    pub ref_to: Option<String>,
 }
 
 // ─────────────────────────── TableBuilder ───────────────────────────
@@ -600,6 +604,7 @@ impl<'a> Table<'a> {
             name: c.name.clone(),
             ty: c.ty,
             is_pk: self.inner.pk.map(|i| self.inner.cols[i].name == c.name).unwrap_or(false),
+            ref_to: self.inner.relations.iter().find(|r| r.from_col == c.name).map(|r| r.to_table.clone()),
         }).collect()
     }
 

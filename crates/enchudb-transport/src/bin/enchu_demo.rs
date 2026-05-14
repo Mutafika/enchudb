@@ -26,11 +26,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use enchudb::{Engine, HimoType, Hlc};
+use enchudb::{Engine, HimoType};
+use enchudb_wal::Hlc;
 use enchudb::sync::Syncer;
 use enchudb::transport::{Transport, WireRecord};
 use enchudb_transport::http::{HttpRelay, HttpTransport};
-use enchudb::wal::DecodedOp;
+use enchudb_wal::wal::DecodedOp;
 
 fn main() {
     let mut args: Vec<String> = std::env::args().collect();

@@ -10,10 +10,11 @@
 
 #![cfg(feature = "v32")]
 
-use enchudb::keys::Keypair;
+use enchudb_wal::keys::Keypair;
 use enchudb::sync::Syncer;
 use enchudb::transport::{InMemoryTransport, Transport};
-use enchudb::{AuditFilter, Engine, HimoType, Hlc};
+use enchudb::{AuditFilter, Engine, HimoType};
+use enchudb_wal::Hlc;
 use std::sync::Arc;
 
 fn tmp(tag: &str) -> String {

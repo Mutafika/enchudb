@@ -942,6 +942,7 @@ dependencies = [
  "enchudb-sql",
  "enchudb-sync",
  "enchudb-transport",
+ "enchudb-wal",
  "proptest",
  "rusqlite",
  "sabitori",
@@ -956,6 +957,7 @@ dependencies = [
  "async-trait",
  "crossbeam-queue",
  "ed25519-dalek",
+ "enchudb-wal",
  "libc",
  "memmap2",
  "rand_core 0.6.4",
@@ -975,6 +977,7 @@ name = "enchudb-rag"
 version = "0.1.0"
 dependencies = [
  "enchudb",
+ "enchudb-wal",
  "fastembed",
  "memmap2",
  "rand 0.8.6",
@@ -985,6 +988,7 @@ name = "enchudb-schema"
 version = "0.1.0"
 dependencies = [
  "enchudb-engine",
+ "enchudb-wal",
 ]
 
 [[package]]
@@ -993,6 +997,7 @@ version = "0.1.0"
 dependencies = [
  "enchudb-engine",
  "enchudb-schema",
+ "enchudb-wal",
  "sqlparser",
 ]
 
@@ -1001,6 +1006,7 @@ name = "enchudb-sync"
 version = "0.1.0"
 dependencies = [
  "enchudb-engine",
+ "enchudb-wal",
 ]
 
 [[package]]
@@ -1015,10 +1021,22 @@ name = "enchudb-transport"
 version = "0.1.0"
 dependencies = [
  "enchudb",
+ "enchudb-wal",
  "sabitori",
  "sabitori-core",
  "sabitori-style",
  "tungstenite",
+]
+
+[[package]]
+name = "enchudb-wal"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "libc",
+ "memmap2",
+ "rand_core 0.6.4",
+ "sha2",
 ]
 
 [[package]]

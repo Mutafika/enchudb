@@ -13,6 +13,7 @@ ws = ["dep:tungstenite"]
 
 [dependencies]
 enchudb = { path = "../.." }
+enchudb-wal = { path = "../enchudb-wal" }
 tungstenite = { version = "0.24", optional = true, default-features = false, features = ["handshake"] }
 
 [dev-dependencies]

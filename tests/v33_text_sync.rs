@@ -8,7 +8,8 @@
 #![cfg(feature = "v33")]
 
 use std::sync::Arc;
-use enchudb::{Engine, HimoType, Hlc};
+use enchudb::{Engine, HimoType};
+use enchudb_wal::Hlc;
 use enchudb::sync::Syncer;
 use enchudb::transport::{InMemoryTransport, Transport};
 
@@ -172,7 +173,7 @@ fn tie_ref_async_propagates_between_peers() {
     syncer_b.pull_once(1);
 
     // B 側の child entity の parent himo 値が parent の local と一致(同一 peer 内 ref なので)
-    let parent_local = enchudb::eid_local(parent) as u32;
+    let parent_local = enchudb_wal::eid_local(parent) as u32;
     assert_eq!(eng_b.get(child, "parent"), Some(parent_local));
 
     cleanup(&pa);

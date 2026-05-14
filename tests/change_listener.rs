@@ -11,7 +11,7 @@
 
 use enchudb::changefeed::ChangeListener;
 use enchudb::transport::WireRecord;
-use enchudb::wal::DecodedOp;
+use enchudb_wal::wal::DecodedOp;
 use enchudb::{Engine, HimoType};
 use std::sync::{Arc, Mutex};
 

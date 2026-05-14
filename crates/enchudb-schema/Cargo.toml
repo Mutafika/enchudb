@@ -8,4 +8,5 @@ authors = ["mutafika"]
 repository = "https://github.com/mutafika/enchudb"
 
 [dependencies]
+enchudb-wal = { path = "../enchudb-wal" }
 enchudb-engine = { path = "../enchudb-engine" }

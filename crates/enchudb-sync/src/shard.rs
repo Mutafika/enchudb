@@ -35,7 +35,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use enchudb_engine::{Engine, EntityId, PeerId};
+use enchudb_engine::{Engine};
+use enchudb_wal::{EntityId, PeerId};
 
 /// himo 名からその himo の owner peer を決める。
 pub trait ShardRouter: Send + Sync {
@@ -142,7 +143,7 @@ impl ShardTransport for InMemoryShardTransport {
         // 上位 32bit は 0。sharded では from peer を上位に乗せる。
         eng.pull_raw(himo, value)
             .into_iter()
-            .map(|e| enchudb_engine::make_eid(from, e as u32))
+            .map(|e| enchudb_wal::make_eid(from, e as u32))
             .collect()
     }
 }
@@ -173,7 +174,7 @@ impl ShardQuery {
             // 自 peer が owner、ローカル column から
             self.engine.pull_raw(himo, value)
                 .into_iter()
-                .map(|e| enchudb_engine::make_eid(self.self_peer, e as u32))
+                .map(|e| enchudb_wal::make_eid(self.self_peer, e as u32))
                 .collect()
         } else {
             // remote

@@ -37,8 +37,8 @@ use std::sync::Arc;
 use enchudb_engine::engine::Engine;
 use enchudb_engine::hlc_store::HlcStore;
 use enchudb_engine::transport::{Transport, WireRecord};
-use enchudb_engine::wal::DecodedOp;
-use enchudb_engine::{Hlc, PeerId};
+use enchudb_wal::wal::DecodedOp;
+use enchudb_wal::{Hlc, PeerId};
 
 pub struct Syncer {
     engine: Arc<Engine>,
@@ -243,7 +243,8 @@ fn fnv_hash_u16(s: &str) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use enchudb_engine::{HimoType, PeerId};
+    use enchudb_engine::{HimoType};
+    use enchudb_wal::PeerId;
     use enchudb_engine::transport::InMemoryTransport;
 
     fn new_eng(path: &str, peer: PeerId) -> Arc<Engine> {
@@ -268,7 +269,7 @@ mod tests {
         let syncer = Syncer::new(eng_a.clone(), transport.clone());
 
         // peer 2 からの古い op
-        let eid = enchudb_engine::make_eid(2, 7);
+        let eid = enchudb_wal::make_eid(2, 7);
         let rec_old = WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid, himo_id: 0, value: 10 });
         let rec_new = WireRecord::unsigned(Hlc { wall: 200, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid, himo_id: 0, value: 20 });
         let out = syncer.apply_records(&[rec_new.clone(), rec_old.clone()]);
@@ -290,7 +291,7 @@ mod tests {
         let transport = Arc::new(InMemoryTransport::new());
 
         // peer 2 が tie した体で transport に直接 publish
-        let eid_b = enchudb_engine::make_eid(2, 3);
+        let eid_b = enchudb_wal::make_eid(2, 3);
         transport.publish(2, vec![
             WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: eid_b, himo_id: 0, value: 42 }),
         ]);
@@ -314,12 +315,12 @@ mod tests {
         let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
 
         // 1st round
-        transport.publish(2, vec![WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: enchudb_engine::make_eid(2, 1), himo_id: 0, value: 10 })]);
+        transport.publish(2, vec![WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: enchudb_wal::make_eid(2, 1), himo_id: 0, value: 10 })]);
         let out1 = syncer.pull_once(2);
         assert_eq!(out1.received, 1);
 
         // 2nd pull should see only new records
-        transport.publish(2, vec![WireRecord::unsigned(Hlc { wall: 200, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: enchudb_engine::make_eid(2, 2), himo_id: 0, value: 20 })]);
+        transport.publish(2, vec![WireRecord::unsigned(Hlc { wall: 200, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: enchudb_wal::make_eid(2, 2), himo_id: 0, value: 20 })]);
         let out2 = syncer.pull_once(2);
         assert_eq!(out2.received, 1);
         assert_eq!(out2.applied, 1);

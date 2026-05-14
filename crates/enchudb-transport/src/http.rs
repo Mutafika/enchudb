@@ -32,7 +32,7 @@
 //! use std::sync::Arc;
 //! use enchudb_transport::http::{HttpRelay, HttpTransport};
 //! use enchudb::transport::Transport;
-//! use enchudb::Hlc;
+//! use enchudb_wal::Hlc;
 //!
 //! // サーバー側 (origin) — ephemeral port で listen
 //! let relay = HttpRelay::start("127.0.0.1:0").unwrap();
@@ -59,7 +59,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use enchudb::transport::{decode_batch, encode_batch, Transport, WireRecord};
-use enchudb::{Hlc, PeerId};
+use enchudb_wal::{Hlc, PeerId};
 
 // ─────────────────────────────────────────────────────────────
 // Server: HttpRelay
@@ -736,7 +736,7 @@ impl Transport for HttpTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use enchudb::wal::DecodedOp;
+    use enchudb_wal::wal::DecodedOp;
 
     fn rec(hlc_wall: u64, peer: PeerId, eid: u64, value: u32) -> WireRecord {
         WireRecord::unsigned(

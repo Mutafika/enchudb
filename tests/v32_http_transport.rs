@@ -8,11 +8,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use enchudb::{Engine, HimoType, Hlc};
+use enchudb::{Engine, HimoType};
+use enchudb_wal::Hlc;
 use enchudb::sync::Syncer;
 use enchudb::transport::{Transport, WireRecord};
 use enchudb_transport::http::{HttpRelay, HttpTransport};
-use enchudb::wal::DecodedOp;
+use enchudb_wal::wal::DecodedOp;
 
 fn tmp(tag: &str) -> String {
     let p = format!("/tmp/enchudb-v32-http-{}-{}", tag, std::process::id());
@@ -60,7 +61,7 @@ fn origin_publishes_replica_pulls_over_http() {
     let replica_transport: Arc<dyn Transport> = Arc::new(HttpTransport::new(url.clone()));
 
     // origin 側で publish (直接 transport に流す、WAL 経由じゃなく手動 WireRecord)
-    let eid = enchudb::make_eid(1, 7);
+    let eid = enchudb_wal::make_eid(1, 7);
     let himo_id = origin.himo_id("val").unwrap() as u16;
     let records = vec![
         WireRecord::unsigned(
@@ -72,7 +73,7 @@ fn origin_publishes_replica_pulls_over_http() {
             Hlc { wall: 200, logical: 0, peer: 1 },
             1,
             DecodedOp::Tie {
-                eid: enchudb::make_eid(1, 8),
+                eid: enchudb_wal::make_eid(1, 8),
                 himo_id,
                 value: 88,
             },
@@ -96,7 +97,7 @@ fn origin_publishes_replica_pulls_over_http() {
 
     // replica 側に反映
     assert_eq!(replica.get(eid, "val"), Some(42));
-    assert_eq!(replica.get(enchudb::make_eid(1, 8), "val"), Some(88));
+    assert_eq!(replica.get(enchudb_wal::make_eid(1, 8), "val"), Some(88));
 
     cleanup(&origin_path);
     cleanup(&replica_path);
@@ -139,7 +140,7 @@ fn multiple_replicas_sync_from_same_origin() {
 
     // origin が publish
     let himo_id = origin.himo_id("val").unwrap() as u16;
-    let eid = enchudb::make_eid(1, 1);
+    let eid = enchudb_wal::make_eid(1, 1);
     let origin_t: Arc<dyn Transport> = Arc::new(HttpTransport::new(url.clone()));
     origin_t.publish(1, vec![
         WireRecord::unsigned(
@@ -220,7 +221,7 @@ fn fresh_replica_bootstraps_then_syncs() {
 
     // step 4: origin が新データを publish
     let origin_t = HttpTransport::new(url.clone());
-    let new_eid = enchudb::make_eid(1, 2);
+    let new_eid = enchudb_wal::make_eid(1, 2);
     let himo_id = origin.himo_id("val").unwrap() as u16;
     origin_t.publish(1, vec![
         WireRecord::unsigned(
@@ -271,7 +272,7 @@ fn incremental_pull_advances_cursor() {
         WireRecord::unsigned(
             Hlc { wall: 100, logical: 0, peer: 1 },
             1,
-            DecodedOp::Tie { eid: enchudb::make_eid(1, 1), himo_id, value: 1 },
+            DecodedOp::Tie { eid: enchudb_wal::make_eid(1, 1), himo_id, value: 1 },
         ),
     ]);
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -295,7 +296,7 @@ fn incremental_pull_advances_cursor() {
         WireRecord::unsigned(
             Hlc { wall: 200, logical: 0, peer: 1 },
             1,
-            DecodedOp::Tie { eid: enchudb::make_eid(1, 2), himo_id, value: 2 },
+            DecodedOp::Tie { eid: enchudb_wal::make_eid(1, 2), himo_id, value: 2 },
         ),
     ]);
     let deadline = std::time::Instant::now() + Duration::from_secs(2);

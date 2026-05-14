@@ -37,7 +37,7 @@ use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::protocol::{Message, WebSocket};
 
 use enchudb::transport::{decode_batch, encode_batch, WireRecord};
-use enchudb::{Hlc, PeerId};
+use enchudb_wal::{Hlc, PeerId};
 
 // ─────────────────────────────────────────────────────────────
 // Server side: WsPushHub
@@ -317,13 +317,13 @@ impl Drop for WsPushClient {
 /// ```
 pub struct WsPushHubAdapter {
     hub: std::sync::Arc<WsPushHub>,
-    peer_id: enchudb::PeerId,
+    peer_id: enchudb_wal::PeerId,
 }
 
 impl WsPushHubAdapter {
     /// `peer_id` は publish 時に subscriber の `from_peer` フィルタで照合されるので、
     /// engine が attach されている自 peer の id を渡すこと。
-    pub fn new(hub: std::sync::Arc<WsPushHub>, peer_id: enchudb::PeerId) -> Self {
+    pub fn new(hub: std::sync::Arc<WsPushHub>, peer_id: enchudb_wal::PeerId) -> Self {
         Self { hub, peer_id }
     }
 }
@@ -341,7 +341,7 @@ impl ChangeListener for WsPushHubAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use enchudb::wal::DecodedOp;
+    use enchudb_wal::wal::DecodedOp;
     use std::sync::mpsc;
 
     fn rec(wall: u64, peer: PeerId, eid: u64, value: u32) -> WireRecord {
