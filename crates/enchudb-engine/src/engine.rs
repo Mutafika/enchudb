@@ -763,8 +763,13 @@ pub struct Engine {
     /// consumer が apply 完了した累積件数。apply_count >= push_count が同期点。
     apply_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// v28 WAL。`create_concurrent_with_wal` or `open_concurrent_with_wal` で有効化。
-    /// Some なら tie_async/untie_async/delete_async は WAL append を先に実行する。
+    /// Some なら tie_async/untie_async/delete_async は wal_record_queue 経由で
+    /// consumer thread 側に batch flush を委ねる。
     wal: Option<std::sync::Arc<enchudb_wal::wal::Wal>>,
+    /// async path 専用の WAL record queue。 writer は WAL に直接書かず、 ここに
+    /// owned record を push。 consumer thread が drain して `wal.append_many` で
+    /// 1 flock サイクル N records にまとめる (per-record flock コスト償却)。
+    wal_record_queue: Option<std::sync::Arc<crossbeam_queue::SegQueue<enchudb_wal::wal::WalRecord>>>,
     /// 背景 fsync が最後に completed した LSN。
     durable_lsn: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// v32: この Engine を所有する peer の id。分散時 eid の上位 32bit。
@@ -932,6 +937,7 @@ impl Engine {
             push_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             apply_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             wal: None,
+            wal_record_queue: None,
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -1165,6 +1171,7 @@ impl Engine {
             push_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             apply_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             wal: None,
+            wal_record_queue: None,
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -1547,6 +1554,7 @@ impl Engine {
             push_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             apply_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             wal: None,
+            wal_record_queue: None,
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -3119,10 +3127,15 @@ impl Engine {
 
         let queue = Arc::new(WriteQueue::new());
         let shutdown = Arc::new(AtomicBool::new(false));
+        // WAL 有効時のみ wal_record_queue を生やす。 writer は直接 wal.append せず
+        // ここに owned record を push する → consumer thread が drain して append_many。
+        let wal_record_queue = wal.as_ref()
+            .map(|_| Arc::new(crossbeam_queue::SegQueue::<enchudb_wal::wal::WalRecord>::new()));
 
         eng.write_queue = Some(queue.clone());
         eng.shutdown_flag = Some(shutdown.clone());
         eng.wal = wal.clone();
+        eng.wal_record_queue = wal_record_queue.clone();
 
         let arc = Arc::new(eng);
 
@@ -3132,6 +3145,7 @@ impl Engine {
         let flag_for_thread = shutdown.clone();
         let apply_count_for_thread = arc.apply_count.clone();
         let wal_for_thread = wal.clone();
+        let wal_record_queue_for_thread = wal_record_queue.clone();
         let durable_lsn_for_thread = arc.durable_lsn.clone();
         let listeners_for_thread = arc.change_listeners.clone();
         let emit_offset_for_thread = arc.change_emit_offset.clone();
@@ -3147,6 +3161,18 @@ impl Engine {
 
                 loop {
                     let mut drained_any = false;
+                    // WAL record queue を batch drain (per-record flock を償却)
+                    if let (Some(wq), Some(wal)) = (
+                        wal_record_queue_for_thread.as_ref(),
+                        wal_for_thread.as_ref(),
+                    ) {
+                        let mut batch: Vec<enchudb_wal::wal::WalRecord> = Vec::new();
+                        while let Some(rec) = wq.pop() { batch.push(rec); }
+                        if !batch.is_empty() {
+                            let _ = wal.append_many(&batch);
+                            drained_any = true;
+                        }
+                    }
                     while let Some(op) = q_for_thread.pop() {
                         drained_any = true;
                         engine.apply_op(op);
@@ -3190,6 +3216,17 @@ impl Engine {
                     }
 
                     if flag_for_thread.load(Ordering::Acquire) {
+                        // 最終 WAL drain
+                        if let (Some(wq), Some(wal)) = (
+                            wal_record_queue_for_thread.as_ref(),
+                            wal_for_thread.as_ref(),
+                        ) {
+                            let mut batch: Vec<enchudb_wal::wal::WalRecord> = Vec::new();
+                            while let Some(rec) = wq.pop() { batch.push(rec); }
+                            if !batch.is_empty() {
+                                let _ = wal.append_many(&batch);
+                            }
+                        }
                         while let Some(op) = q_for_thread.pop() {
                             engine.apply_op(op);
                             apply_count_for_thread.fetch_add(1, Ordering::Release);
@@ -3432,7 +3469,12 @@ impl Engine {
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
         if let Some(wal) = self.wal.as_ref() {
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
-            let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id: hid as u16, value });
+            let rec = enchudb_wal::wal::WalRecord::Tie { eid: wal_eid, himo_id: hid as u16, value };
+            if let Some(wq) = self.wal_record_queue.as_ref() {
+                wq.push(rec);
+            } else {
+                let _ = wal.append(rec.as_op());
+            }
         }
         let q = self.write_queue.as_ref()
             .expect("tie_async requires create_concurrent or concurrentize");
@@ -3465,9 +3507,17 @@ impl Engine {
         assert!(vid < u32::MAX, "vocab vid must be < u32::MAX (sentinel reserved)");
         if let Some(wal) = self.wal.as_ref() {
             // Vocab op を先に(sync の receiver 側で Tie より先に mapping が張られるよう)
-            let _ = wal.append(enchudb_wal::wal::WalOp::Vocab { vid, bytes: value.as_bytes() });
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
-            let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id: hid as u16, value: vid });
+            let vocab_rec = enchudb_wal::wal::WalRecord::Vocab { vid, bytes: value.as_bytes().to_vec() };
+            let tie_rec = enchudb_wal::wal::WalRecord::Tie { eid: wal_eid, himo_id: hid as u16, value: vid };
+            if let Some(wq) = self.wal_record_queue.as_ref() {
+                // Vocab → Tie の順を保つため同一 thread から連続 push
+                wq.push(vocab_rec);
+                wq.push(tie_rec);
+            } else {
+                let _ = wal.append(vocab_rec.as_op());
+                let _ = wal.append(tie_rec.as_op());
+            }
         }
         let q = self.write_queue.as_ref()
             .expect("tie_text_async requires create_concurrent or concurrentize");
@@ -3490,9 +3540,14 @@ impl Engine {
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
         if let Some(wal) = self.wal.as_ref() {
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
-            let _ = wal.append(enchudb_wal::wal::WalOp::Tie {
+            let rec = enchudb_wal::wal::WalRecord::Tie {
                 eid: wal_eid, himo_id: hid as u16, value: target_local,
-            });
+            };
+            if let Some(wq) = self.wal_record_queue.as_ref() {
+                wq.push(rec);
+            } else {
+                let _ = wal.append(rec.as_op());
+            }
         }
         let q = self.write_queue.as_ref()
             .expect("tie_ref_async requires create_concurrent or concurrentize");
@@ -3510,7 +3565,12 @@ impl Engine {
         let hid = match self.himo_id(himo) { Some(x) => x, None => return };
         if let Some(wal) = self.wal.as_ref() {
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
-            let _ = wal.append(enchudb_wal::wal::WalOp::Untie { eid: wal_eid, himo_id: hid as u16 });
+            let rec = enchudb_wal::wal::WalRecord::Untie { eid: wal_eid, himo_id: hid as u16 };
+            if let Some(wq) = self.wal_record_queue.as_ref() {
+                wq.push(rec);
+            } else {
+                let _ = wal.append(rec.as_op());
+            }
         }
         let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
         q.push(crate::write_queue::Op::Untie { eid: local, himo_id: hid as u16 });
@@ -3524,7 +3584,12 @@ impl Engine {
         let local = enchudb_wal::eid_local(eid);
         if let Some(wal) = self.wal.as_ref() {
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
-            let _ = wal.append(enchudb_wal::wal::WalOp::Delete { eid: wal_eid });
+            let rec = enchudb_wal::wal::WalRecord::Delete { eid: wal_eid };
+            if let Some(wq) = self.wal_record_queue.as_ref() {
+                wq.push(rec);
+            } else {
+                let _ = wal.append(rec.as_op());
+            }
         }
         let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
         q.push(crate::write_queue::Op::Delete { eid: local });
@@ -3539,7 +3604,14 @@ impl Engine {
         let local = enchudb_wal::eid_local(eid);
         if let Some(wal) = self.wal.as_ref() {
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
-            let _ = wal.append(enchudb_wal::wal::WalOp::Content { eid: wal_eid, key, data });
+            let rec = enchudb_wal::wal::WalRecord::Content {
+                eid: wal_eid, key: key.to_string(), data: data.to_vec(),
+            };
+            if let Some(wq) = self.wal_record_queue.as_ref() {
+                wq.push(rec);
+            } else {
+                let _ = wal.append(rec.as_op());
+            }
         }
         let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
         q.push(crate::write_queue::Op::Content {

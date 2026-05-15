@@ -130,6 +130,36 @@ pub mod op_type {
     pub const VOCAB: u8 = 6;  // v33: text vid → bytes 対応を peer 間で運ぶ
 }
 
+/// WAL に書く所有型 op。 `WalOp` の owned 版で、 queue 渡し用 (consumer 側で
+/// batch して `append_many` に流す経路で使う)。
+#[derive(Debug, Clone)]
+pub enum WalRecord {
+    Tie { eid: u64, himo_id: u16, value: u32 },
+    Untie { eid: u64, himo_id: u16 },
+    Delete { eid: u64 },
+    Content { eid: u64, key: String, data: Vec<u8> },
+    Commit,
+    Vocab { vid: u32, bytes: Vec<u8> },
+}
+
+impl WalRecord {
+    /// borrow 版 `WalOp` への変換 (append 用)。
+    pub fn as_op(&self) -> WalOp<'_> {
+        match self {
+            WalRecord::Tie { eid, himo_id, value } =>
+                WalOp::Tie { eid: *eid, himo_id: *himo_id, value: *value },
+            WalRecord::Untie { eid, himo_id } =>
+                WalOp::Untie { eid: *eid, himo_id: *himo_id },
+            WalRecord::Delete { eid } => WalOp::Delete { eid: *eid },
+            WalRecord::Content { eid, key, data } =>
+                WalOp::Content { eid: *eid, key, data },
+            WalRecord::Commit => WalOp::Commit,
+            WalRecord::Vocab { vid, bytes } =>
+                WalOp::Vocab { vid: *vid, bytes },
+        }
+    }
+}
+
 /// WAL に書く op。eid は u64(v32)。
 #[derive(Debug, Clone)]
 pub enum WalOp<'a> {
@@ -430,6 +460,117 @@ impl Wal {
         let result = self.append_inner(op, payload_size, record_size, None);
         self.pending_writes.fetch_sub(1, Ordering::AcqRel);
         result
+    }
+
+    /// 複数 record を **1 回の flock サイクル** で連続 append。
+    /// per-record で `append` を回すと flock(LOCK_EX) syscall が record 数ぶん走るので、
+    /// consumer thread が queue を drain して呼ぶことで flock コストを償却できる。
+    /// 戻り値は各 record の LSN (順序対応)。
+    pub fn append_many(&self, records: &[WalRecord]) -> io::Result<Vec<u64>> {
+        if records.is_empty() { return Ok(Vec::new()); }
+        let sizes: Vec<usize> = records.iter()
+            .map(|r| REC_HEADER_SIZE + r.as_op().payload_size())
+            .collect();
+        let total: usize = sizes.iter().sum();
+
+        self.pending_writes.fetch_add(records.len() as u32, Ordering::AcqRel);
+        let result = self.append_many_inner(records, &sizes, total);
+        self.pending_writes.fetch_sub(records.len() as u32, Ordering::AcqRel);
+        result
+    }
+
+    fn append_many_inner(
+        &self,
+        records: &[WalRecord],
+        sizes: &[usize],
+        total: usize,
+    ) -> io::Result<Vec<u64>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _lock = self.flock_exclusive()?;
+
+        // 一括 allocate
+        let start_offset = {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let mm = self.mmap_slice();
+                let on_disk = u64::from_le_bytes(mm[8..16].try_into().unwrap());
+                let cur = on_disk.max(self.head.load(Ordering::Acquire));
+                let new = cur + total as u64;
+                if new > self.capacity {
+                    return Err(io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        "WAL full — consumer reset behind",
+                    ));
+                }
+                self.head.store(new, Ordering::Release);
+                cur
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let cur = self.head.load(Ordering::Acquire);
+                let new = cur + total as u64;
+                if new > self.capacity {
+                    return Err(io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        "WAL full — consumer reset behind",
+                    ));
+                }
+                self.head.store(new, Ordering::Release);
+                cur
+            }
+        };
+
+        let mut lsns = Vec::with_capacity(records.len());
+        let keypair = self.keypair.read().unwrap().clone();
+        let mut offset = start_offset;
+        let mmap = self.mmap_mut_slice();
+
+        for (rec, &record_size) in records.iter().zip(sizes.iter()) {
+            let op = rec.as_op();
+            let payload_size = record_size - REC_HEADER_SIZE;
+            let lsn = self.next_lsn.fetch_add(1, Ordering::AcqRel);
+            let hlc = self.next_hlc();
+            let author_peer = hlc.peer;
+
+            let op_byte = op.op_byte();
+            let payload_offset = offset as usize + REC_HEADER_SIZE;
+            op.write_payload(&mut mmap[payload_offset..payload_offset + payload_size]);
+            let crc = fnv1a(&mmap[payload_offset..payload_offset + payload_size]);
+
+            let (signature, pubkey_fp) = match &keypair {
+                Some(kp) => {
+                    let msg = signed_payload(
+                        op_byte, payload_size as u32, lsn, hlc,
+                        author_peer, crc,
+                        &mmap[payload_offset..payload_offset + payload_size],
+                    );
+                    (kp.sign(&msg), kp.pubkey_fp())
+                }
+                None => (ZERO_SIGNATURE, ZERO_PUBKEY_FP),
+            };
+
+            let header = &mut mmap[offset as usize..offset as usize + REC_HEADER_SIZE];
+            header[OFF_MAGIC..OFF_MAGIC + 2].copy_from_slice(REC_MAGIC);
+            header[OFF_VERSION] = REC_VERSION;
+            header[OFF_OP] = op_byte;
+            header[OFF_LEN..OFF_LEN + 4].copy_from_slice(&(payload_size as u32).to_le_bytes());
+            header[OFF_LSN..OFF_LSN + 8].copy_from_slice(&lsn.to_le_bytes());
+            header[OFF_HLC_WALL..OFF_HLC_WALL + 8].copy_from_slice(&hlc.wall.to_le_bytes());
+            header[OFF_HLC_LOGICAL..OFF_HLC_LOGICAL + 4].copy_from_slice(&hlc.logical.to_le_bytes());
+            header[OFF_HLC_PEER..OFF_HLC_PEER + 4].copy_from_slice(&hlc.peer.to_le_bytes());
+            header[OFF_AUTHOR_PEER..OFF_AUTHOR_PEER + 4].copy_from_slice(&author_peer.to_le_bytes());
+            header[OFF_CRC..OFF_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+            header[OFF_SIGNATURE..OFF_SIGNATURE + 64].copy_from_slice(&signature);
+            header[OFF_PUBKEY_FP..OFF_PUBKEY_FP + 8].copy_from_slice(&pubkey_fp);
+
+            lsns.push(lsn);
+            offset += record_size as u64;
+        }
+
+        // ファイルヘッダの head を一括更新 (batch 全体が書き終わったあと)
+        mmap[8..16].copy_from_slice(&(start_offset + total as u64).to_le_bytes());
+
+        Ok(lsns)
     }
 
     /// 受信した他 peer 由来の WAL op を **元の HLC / author / 署名のまま** 自分の WAL に
