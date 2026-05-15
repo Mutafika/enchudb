@@ -133,6 +133,23 @@ impl Backing {
         }
     }
 
+    /// 限定 byte range だけ msync。 clean-flag のような 16 byte 程度のメタ更新で
+    /// 25 GB 全体を msync すると 70 ms 級になるので、 該当 page だけに絞る。
+    /// offset / len は内部で page (4 KB) 境界に丸める。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn flush_range(&self, offset: usize, len: usize) -> io::Result<()> {
+        const PAGE: usize = 4096;
+        let aligned_off = offset & !(PAGE - 1);
+        let end = offset + len;
+        let aligned_end = (end + PAGE - 1) & !(PAGE - 1);
+        let aligned_len = aligned_end - aligned_off;
+        match self {
+            Backing::Mmap(m) => m.flush_range(aligned_off, aligned_len),
+            Backing::Growable(g) => g.flush(aligned_off, aligned_len),
+            Backing::Memory(_) => Ok(()),
+        }
+    }
+
     /// growable backing のときに commit を要求サイズまで伸ばす。
     /// 他の variant では no-op (ヘッダ上限で既に確保済み)。
     #[cfg(not(target_arch = "wasm32"))]
@@ -1376,27 +1393,59 @@ impl Engine {
 
         let base = backing.as_mut_ptr();
 
+        // ── page-reclaim instrumentation (issue2 調査) ──
+        // ENCHU_OPEN_PROFILE=1 で env 有効。 解析後、 削除する一時的計装。
+        let profile = std::env::var("ENCHU_OPEN_PROFILE").is_ok();
+        let pr = || -> u64 {
+            #[cfg(target_os = "macos")]
+            unsafe {
+                let mut ru: libc::rusage = std::mem::zeroed();
+                if libc::getrusage(libc::RUSAGE_SELF, &mut ru) == 0 {
+                    return ru.ru_minflt as u64;
+                }
+                0
+            }
+            #[cfg(not(target_os = "macos"))]
+            { 0 }
+        };
+        let mut t = std::time::Instant::now();
+        let mut p = pr();
+        let mut report = |label: &str, t: &mut std::time::Instant, p: &mut u64| {
+            if profile {
+                let np = pr();
+                let dp = np - *p;
+                eprintln!("[open_profile] {:>22}  Δreclaim={:>7}  Δt={:>5} ms", label, dp, t.elapsed().as_millis());
+                *p = np;
+                *t = std::time::Instant::now();
+            }
+        };
+
         let entities = EntitySet::load(
             unsafe { Region::new(base.add(layout.entities_off), layout.entities_size) },
             max_entities,
         );
+        report("EntitySet::load", &mut t, &mut p);
         let undo = UndoLog::load(
             unsafe { Region::new(base.add(layout.undo_off), layout.undo_size) },
         );
+        report("UndoLog::load", &mut t, &mut p);
         let vocab = Vocabulary::load(
             unsafe { Region::new(base.add(layout.vocab_data_off), layout.vocab_data_size) },
             unsafe { Region::new(base.add(layout.vocab_offsets_off), layout.vocab_offsets_size) },
             unsafe { Region::new(base.add(layout.vocab_index_off), layout.vocab_index_size) },
         );
+        report("Vocabulary::load", &mut t, &mut p);
         let himo_reg = Vocabulary::load(
             unsafe { Region::new(base.add(layout.himoreg_data_off), layout.himoreg_data_size) },
             unsafe { Region::new(base.add(layout.himoreg_offsets_off), layout.himoreg_offsets_size) },
             unsafe { Region::new(base.add(layout.himoreg_index_off), layout.himoreg_index_size) },
         );
+        report("himo_reg(Vocabulary)", &mut t, &mut p);
         let contents = ContentStore::load(
             unsafe { Region::new(base.add(layout.content_index_off), layout.content_index_size) },
             unsafe { Region::new(base.add(layout.content_data_off), layout.content_data_size) },
         );
+        report("ContentStore::load", &mut t, &mut p);
 
         let mut himo_names = Vec::new();
         let mut himo_types = Vec::new();
@@ -1420,6 +1469,7 @@ impl Engine {
             himo_max_values.push(mv);
             himos.push(hs);
         }
+        report("HimoStore::load × N", &mut t, &mut p);
 
         let mut eng = Self {
             path: String::new(), layout, max_entities, max_himos,
@@ -1463,6 +1513,18 @@ impl Engine {
         eng.rebuild();
 
         eng.restore_persisted_views()?;
+
+        // clean flag を 0 に倒し、 即 msync で永続化する。 こうしないと、 この後
+        // insert で index 書き換え → crash → 次 open で flag=1 のまま skip → 不整合、
+        // という穴が空く。 該当 page (vocab/himo_reg の data header) だけ msync する
+        // ことで、 default 25 GB layout でも 1 ms 以下で済む。
+        eng.vocab.mark_index_clean(false);
+        eng.himo_reg.mark_index_clean(false);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = eng.backing.flush_range(eng.layout.vocab_data_off, 16);
+            let _ = eng.backing.flush_range(eng.layout.himoreg_data_off, 16);
+        }
 
         Ok(eng)
     }
@@ -3478,6 +3540,11 @@ impl Engine {
         // v28: ヘッダ整合性 CRC(himo_count 含む固定レイアウト部のみを対象)
         write_header_crc(buf);
 
+        // 全 region を disk に同期した後、 vocab/himo_reg の index 整合性 OK
+        // マークを書いてもう一度 msync。 次 open で rebuild_index を skip できる。
+        self.backing.flush_to_disk()?;
+        self.vocab.mark_index_clean(true);
+        self.himo_reg.mark_index_clean(true);
         self.backing.flush_to_disk()?;
         Ok(())
     }

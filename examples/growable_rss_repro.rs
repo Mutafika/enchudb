@@ -1,7 +1,16 @@
-//! create_growable の起動 RSS を実測する最小 repro。
+//! create_growable の起動 RSS / VSZ と process teardown 時間を実測する repro。
 //!
 //! Usage:
-//!   cargo run --release --example growable_rss_repro
+//!   cargo run --release --example growable_rss_repro [-- (default|cap16k|cap65k|cap1M|tiny)]
+//!
+//! issue2 の主訴は process exit 時の munmap teardown が 1.2 sec 食う件。 これは
+//! GrowableMap が `reserve = layout.total_size` の anonymous PROT_NONE 範囲を
+//! 取って、 exit でその範囲全部の VM map teardown が走るため。
+//!
+//! このスクリプトは:
+//! 1. baseline / after-create / after-define の RSS / VSZ を出す
+//! 2. drop(eng) の wall-clock を計測 (= munmap teardown のコスト)
+//! 3. layout.total_size との比較で 「VSZ 増分 ≒ layout」 が成立してるか確認
 
 use std::time::Instant;
 
@@ -82,25 +91,61 @@ fn snap(label: &str, t0: Instant) {
 }
 
 fn main() {
+    let mode = std::env::args().nth(1).unwrap_or_else(|| "default".to_string());
+
     let path = "/tmp/enchudb_growable_rss_repro.db";
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{}.crc", path));
     let _ = std::fs::remove_file(format!("{}.wal", path));
 
     let t0 = Instant::now();
+    let baseline_vsz = vsz_mb();
     snap("baseline", t0);
 
-    let mut eng = enchudb::Engine::create_growable(path).expect("create_growable failed");
-    snap("after create_growable", t0);
+    let eng = match mode.as_str() {
+        "default" => enchudb::Engine::create_growable(path).unwrap(),
+        "cap16k" => enchudb::Engine::create_growable_with_capacity(path, 16_384).unwrap(),
+        "cap65k" => enchudb::Engine::create_growable_with_capacity(path, 65_536).unwrap(),
+        "cap1M" => enchudb::Engine::create_growable_with_capacity(path, 1_048_576).unwrap(),
+        "tiny" => enchudb::Engine::create_growable_tiny(path).unwrap(),
+        other => {
+            eprintln!("unknown mode: {}", other);
+            std::process::exit(2);
+        }
+    };
+    let after_create_vsz = vsz_mb();
+    snap(&format!("after create_growable [mode={}]", mode), t0);
 
-    // sinfo 相当の負荷: 200 himos を define する。
-    // 修正前: 200 × 128 MB = 25 GB heap (BucketCylinder::positions)
-    // 修正後: 各 himo の positions = Vec::new() → 数十 KB
-    for i in 0..200 {
-        eng.define_himo(&format!("h{}", i), enchudb::HimoType::Number, 100);
+    {
+        let mut eng = eng;
+        for i in 0..50 {
+            eng.define_himo(&format!("h{}", i), enchudb::HimoType::Number, 100);
+        }
+        snap("after define_himo × 50", t0);
+
+        let meta = std::fs::metadata(path).unwrap();
+        println!(
+            "file on-disk apparent size: {} bytes ({:.1} MB)",
+            meta.len(),
+            meta.len() as f64 / 1024.0 / 1024.0
+        );
+        println!(
+            "VSZ delta from baseline (= GrowableMap reserve): {} MB",
+            after_create_vsz.saturating_sub(baseline_vsz),
+        );
+
+        // teardown 計測: ここで drop が走る (Engine → GrowableMap → munmap)
+        let t_drop = Instant::now();
+        drop(eng);
+        let drop_ms = t_drop.elapsed().as_millis();
+        println!(
+            "[teardown] drop(Engine) wall-clock: {} ms (= GrowableMap munmap)",
+            drop_ms
+        );
     }
-    snap("after define_himo × 200", t0);
 
-    let meta = std::fs::metadata(path).unwrap();
-    println!("file on-disk size: {} bytes ({:.1} MB apparent)", meta.len(), meta.len() as f64 / 1024.0 / 1024.0);
+    // file 削除
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(format!("{}.crc", path));
+    let _ = std::fs::remove_file(format!("{}.wal", path));
 }

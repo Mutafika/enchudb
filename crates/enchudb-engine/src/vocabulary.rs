@@ -6,6 +6,10 @@ use crate::region::Region;
 
 const MAGIC: [u8; 4] = [b'V', b'O', b'C', b'1'];
 const HEADER: usize = 16;
+/// data header byte 12 に書く「index は data と consistent」 マーカー。
+/// 0 = dirty (rebuild 要)、 1 = clean (rebuild skip 可)。
+/// 残り 13-15 byte は reserved。
+const CLEAN_FLAG_OFF: usize = 12;
 const INDEX_MAGIC: [u8; 4] = [b'V', b'I', b'X', b'2'];
 const INDEX_HEADER: usize = 16;
 const INDEX_SLOT_SIZE: usize = 13;
@@ -61,12 +65,13 @@ impl Vocabulary {
     pub fn load(data: Region, offsets: Region, index: Region) -> Self {
         let dm = data.slice();
         let is_fresh = dm[0..4] != MAGIC;
-        let (count, data_end) = if is_fresh {
-            (0u32, HEADER as u32)
+        let (count, data_end, clean_flag) = if is_fresh {
+            (0u32, HEADER as u32, 0u32)
         } else {
             (
                 u32::from_le_bytes(dm[4..8].try_into().unwrap()),
                 u32::from_le_bytes(dm[8..12].try_into().unwrap()),
+                u32::from_le_bytes(dm[CLEAN_FLAG_OFF..CLEAN_FLAG_OFF + 4].try_into().unwrap()),
             )
         };
 
@@ -82,7 +87,10 @@ impl Vocabulary {
             data_end: AtomicU32::new(data_end),
             max_entries, index_cap,
         };
-        if !is_fresh {
+        // clean_flag == 1 なら前回 graceful close で「index と data は consistent」と
+        // 保証されているので rebuild skip。 それ以外 (= 初期 / crash 後 / 未対応の旧 DB) は
+        // 従来通り全部 rebuild。
+        if !is_fresh && clean_flag != 1 {
             v.rebuild_index();
         }
         v
@@ -227,6 +235,21 @@ impl Vocabulary {
         let dm = self.data.slice_mut();
         dm[4..8].copy_from_slice(&self.count.load(Ordering::Relaxed).to_le_bytes());
         dm[8..12].copy_from_slice(&self.data_end.load(Ordering::Relaxed).to_le_bytes());
+    }
+
+    /// index と data の整合性マーカーを書く。
+    ///
+    /// `clean = true`: 直前に全 msync が完了 → 次回 open で rebuild skip 可
+    /// `clean = false`: insert が走った／crash 検知用 → 次回 open で rebuild 強制
+    ///
+    /// 自身では msync しない。 caller (Engine) が body_msync で永続化する責任を負う。
+    pub fn mark_index_clean(&self, clean: bool) {
+        // data 領域は variable cluster (lazy commit) なので、 先頭 header を
+        // 確実に commit してから書く。
+        let _ = self.data.ensure_committed(HEADER);
+        let dm = self.data.slice_mut();
+        let val: u32 = if clean { 1 } else { 0 };
+        dm[CLEAN_FLAG_OFF..CLEAN_FLAG_OFF + 4].copy_from_slice(&val.to_le_bytes());
     }
 }
 

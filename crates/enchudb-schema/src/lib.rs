@@ -232,6 +232,18 @@ impl Database {
         let eng = Engine::create_growable(path).map_err(|e| SchemaError::Io(e.to_string()))?;
         Self::wrap_new(eng)
     }
+    /// `create_growable` の max_entities を絞る版。 default の 16 M は
+    /// layout.total_size ~25 GB の PROT_NONE 予約を発生させ、 process exit 時の
+    /// munmap teardown を重くする (issue2)。 想定 row 数が判ってる app は
+    /// ここで絞ると VSZ も apparent file size も大幅に縮む。
+    ///
+    /// 目安: max_entities=65_536 で layout ~1.3 GB、 max_entities=1_048_576 で
+    /// layout ~2.6 GB。 default は 16_777_216 = 25 GB。
+    pub fn create_growable_with_capacity(path: &str, max_entities: u32) -> Result<Self, SchemaError> {
+        let eng = Engine::create_growable_with_capacity(path, max_entities)
+            .map_err(|e| SchemaError::Io(e.to_string()))?;
+        Self::wrap_new(eng)
+    }
     pub fn create_growable_tiny(path: &str) -> Result<Self, SchemaError> {
         let eng = Engine::create_growable_tiny(path).map_err(|e| SchemaError::Io(e.to_string()))?;
         Self::wrap_new(eng)
@@ -1275,6 +1287,35 @@ mod tests {
             assert_eq!(staff.len(), 2);
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn create_growable_with_capacity_apparent_size_scales_down() {
+        // issue2: default の 16 M max_entities では layout total ~25 GB で、
+        // 空 DB の apparent size も 24 GB の sparse file になる。 cap を絞れば
+        // apparent も layout も比例して縮むことを確認する。
+        let path_default = tmp("growable_cap_default");
+        let path_capped = tmp("growable_cap_65k");
+        let _ = std::fs::remove_file(&path_default);
+        let _ = std::fs::remove_file(&path_capped);
+
+        {
+            let _db = Database::create_growable(&path_default).unwrap();
+        }
+        {
+            let _db = Database::create_growable_with_capacity(&path_capped, 65_536).unwrap();
+        }
+
+        let size_default = std::fs::metadata(&path_default).unwrap().len();
+        let size_capped = std::fs::metadata(&path_capped).unwrap().len();
+
+        // default は 20 GB 以上、 cap=65k は 2 GB 未満 (=10× 以上の差)
+        assert!(size_default > 20 * 1024 * 1024 * 1024, "default apparent = {}", size_default);
+        assert!(size_capped < 2 * 1024 * 1024 * 1024, "capped apparent = {}", size_capped);
+        assert!(size_default / size_capped > 10);
+
+        let _ = std::fs::remove_file(&path_default);
+        let _ = std::fs::remove_file(&path_capped);
     }
 
     #[test]
