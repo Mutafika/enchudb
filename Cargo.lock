@@ -943,6 +943,7 @@ dependencies = [
  "enchudb-sync",
  "enchudb-transport",
  "enchudb-wal",
+ "libc",
  "proptest",
  "rusqlite",
  "sabitori",

@@ -555,19 +555,6 @@ impl Layout {
 
 // ════════════════ Engine ════════════════
 
-struct PairEntry {
-    himo_a: usize,
-    himo_b: usize,
-    #[allow(dead_code)]
-    card_a: u32,
-    card_b: u32,
-    cells: Vec<Vec<u32>>,
-}
-
-struct PairTable {
-    pairs: Vec<PairEntry>,
-}
-
 // ─── v27 NTupleView (任意 n 次元の観測窓) ───
 
 struct NTupleEntry {
@@ -702,101 +689,6 @@ impl NTupleTable {
     }
 }
 
-impl PairTable {
-    fn new() -> Self {
-        Self { pairs: vec![] }
-    }
-
-    /// v27: 最小セルへの参照と残り条件を返す(read lock 下で借用)。
-    /// スライス参照を返すので呼び出し側で read guard を保持すること。
-    /// 内部で Vec を clone しないのでホットパスでもゼロコピー。
-    fn best_lookup_ref<'a>(
-        &'a self,
-        conds: &[(usize, u32)],
-    ) -> Option<(&'a [u32], Vec<(usize, u32)>)> {
-        if conds.len() < 2 { return None; }
-        let mut best: Option<(&'a [u32], Vec<(usize, u32)>)> = None;
-        let mut best_len = usize::MAX;
-
-        for pair in &self.pairs {
-            let mut va = None;
-            let mut vb = None;
-            for &(idx, val) in conds {
-                if idx == pair.himo_a { va = Some(val); }
-                if idx == pair.himo_b { vb = Some(val); }
-            }
-            if let (Some(a), Some(b)) = (va, vb) {
-                let cell_id = a as usize * pair.card_b as usize + b as usize;
-                if cell_id < pair.cells.len() {
-                    let cell = pair.cells[cell_id].as_slice();
-                    if cell.is_empty() { continue; }
-                    if cell.len() < best_len {
-                        best_len = cell.len();
-                        let remaining: Vec<(usize, u32)> = conds.iter()
-                            .filter(|&&(idx, _)| idx != pair.himo_a && idx != pair.himo_b)
-                            .copied()
-                            .collect();
-                        best = Some((cell, remaining));
-                    }
-                }
-            }
-        }
-        best
-    }
-
-    fn cell_add(&mut self, pair_idx: usize, cell_id: usize, eid: u32) {
-        let cell = &mut self.pairs[pair_idx].cells[cell_id];
-        match cell.binary_search(&eid) {
-            Ok(_) => {},
-            Err(pos) => cell.insert(pos, eid),
-        }
-    }
-
-    fn cell_remove(&mut self, pair_idx: usize, cell_id: usize, eid: u32) {
-        let cell = &mut self.pairs[pair_idx].cells[cell_id];
-        if let Ok(pos) = cell.binary_search(&eid) {
-            cell.remove(pos);
-        }
-    }
-
-    fn apply_delta(&mut self, eid: u32, himo_idx: usize, old_val: u32, new_val: u32, other_values: &[(usize, u32)]) {
-        for pi in 0..self.pairs.len() {
-            let (is_a, other_himo) = if self.pairs[pi].himo_a == himo_idx {
-                (true, self.pairs[pi].himo_b)
-            } else if self.pairs[pi].himo_b == himo_idx {
-                (false, self.pairs[pi].himo_a)
-            } else {
-                continue;
-            };
-
-            let other_val = match other_values.iter().find(|&&(idx, _)| idx == other_himo) {
-                Some(&(_, v)) => v,
-                None => continue,
-            };
-
-            let card_b = self.pairs[pi].card_b;
-
-            let old_cell_id = if is_a {
-                old_val as usize * card_b as usize + other_val as usize
-            } else {
-                other_val as usize * card_b as usize + old_val as usize
-            };
-            if old_cell_id < self.pairs[pi].cells.len() {
-                self.cell_remove(pi, old_cell_id, eid);
-            }
-
-            let new_cell_id = if is_a {
-                new_val as usize * card_b as usize + other_val as usize
-            } else {
-                other_val as usize * card_b as usize + new_val as usize
-            };
-            if new_cell_id < self.pairs[pi].cells.len() {
-                self.cell_add(pi, new_cell_id, eid);
-            }
-        }
-    }
-}
-
 pub struct Engine {
     #[allow(dead_code)]
     path: String,
@@ -812,7 +704,6 @@ pub struct Engine {
     entities: EntitySet,
     contents: ContentStore,
     undo: UndoLog,
-    pairs: std::sync::RwLock<PairTable>,
     tuples: std::sync::RwLock<NTupleTable>,
     /// 非同期書き込みキュー。`create_concurrent` で有効化される。
     write_queue: Option<std::sync::Arc<crate::write_queue::WriteQueue>>,
@@ -977,7 +868,6 @@ impl Engine {
             himo_names: Vec::new(),
             himo_types: Vec::new(), himo_max_values: Vec::new(),
             himos: Vec::new(), entities, contents, undo,
-            pairs: std::sync::RwLock::new(PairTable::new()),
             tuples: std::sync::RwLock::new(NTupleTable::new()),
             write_queue: None,
             shutdown_flag: None,
@@ -1207,7 +1097,6 @@ impl Engine {
             entities,
             contents,
             undo,
-            pairs: std::sync::RwLock::new(PairTable::new()),
             tuples: std::sync::RwLock::new(NTupleTable::new()),
             write_queue: None,
             shutdown_flag: None,
@@ -1537,7 +1426,6 @@ impl Engine {
             vocab, himo_reg,
             himo_names, himo_types, himo_max_values,
             himos, entities, contents, undo,
-            pairs: std::sync::RwLock::new(PairTable::new()),
             tuples: std::sync::RwLock::new(NTupleTable::new()),
             write_queue: None,
             shutdown_flag: None,
@@ -1574,10 +1462,7 @@ impl Engine {
         }
         eng.rebuild();
 
-        {
-            eng.rebuild_pairs();
-            eng.restore_persisted_views()?;
-        }
+        eng.restore_persisted_views()?;
 
         Ok(eng)
     }
@@ -1865,7 +1750,7 @@ impl Engine {
         self.record_undo(eid, hid);
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, vid);
-        self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), vid);
+        self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), vid);
     }
 
     pub fn tie(&mut self, eid: enchudb_wal::EntityId, himo: &str, value: u32) {
@@ -1877,7 +1762,7 @@ impl Engine {
         self.record_undo(eid, hid);
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, value);
-        self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), value);
+        self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), value);
     }
 
     pub fn tie_ref(&mut self, eid: enchudb_wal::EntityId, himo: &str, target_eid: enchudb_wal::EntityId) {
@@ -1890,7 +1775,7 @@ impl Engine {
         self.record_undo(eid, hid);
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, target_eid);
-        self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), target_eid);
+        self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), target_eid);
     }
 
     // ──── tie（定義済み紐、&self で並行書き込み可）────
@@ -1911,7 +1796,7 @@ impl Engine {
         self.record_undo(eid, hid);
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, vid);
-        self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), vid);
+        self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), vid);
         // WAL に Vocab + Tie を流す。 schema layer (enchudb-schema) は同期版の
         // tie_text_to を経由するため、 ここで append しないと WAL が空のままで
         // peer 同期が成立しない (publish 側が iter_committed で 0 件を見る).
@@ -1933,7 +1818,7 @@ impl Engine {
         self.record_undo(eid, hid);
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, value);
-        self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), value);
+        self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), value);
         if let Some(wal) = self.wal.as_ref() {
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), eid);
             let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id: hid as u16, value });
@@ -1952,7 +1837,7 @@ impl Engine {
         self.record_undo(eid, hid);
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, target_eid);
-        self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), target_eid);
+        self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), target_eid);
         if let Some(wal) = self.wal.as_ref() {
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), eid);
             let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id: hid as u16, value: target_eid });
@@ -1969,7 +1854,7 @@ impl Engine {
             let old_val = self.himos[hid].get_value(eid);
             self.himos[hid].remove(eid);
             if let Some(ov) = old_val {
-                self.apply_pair_delta_internal(eid, hid, ov, u32::MAX);
+                self.apply_view_delta_internal(eid, hid, ov, u32::MAX);
             }
             if let Some(wal) = self.wal.as_ref() {
                 let wal_eid = enchudb_wal::make_eid(wal.peer_id(), eid);
@@ -1989,7 +1874,7 @@ impl Engine {
             let old_val = self.himos[hid].get_value(eid);
             self.himos[hid].remove(eid);
             if let Some(ov) = old_val {
-                self.apply_pair_delta_internal(eid, hid, ov, u32::MAX);
+                self.apply_view_delta_internal(eid, hid, ov, u32::MAX);
             }
         }
         self.entities.free(eid);
@@ -2452,80 +2337,23 @@ impl Engine {
         for ds in &self.himos { ds.rebuild_cylinder(); }
     }
 
-    /// ペアテーブルを構築。 全紐ペアの二次元テーブルをデルタシンクで事前計算。
-    /// rebuild() の後に呼ぶ。
-    pub fn rebuild_pairs(&mut self) {
-        let n_himos = self.himos.len();
-        let next_eid = self.entities.next_eid();
-        let mut pairs = Vec::new();
-
-        for a in 0..n_himos {
-            let card_a = if self.himo_max_values[a] > 0 {
-                self.himo_max_values[a] + 1
-            } else {
-                continue;
-            };
-            for b in (a + 1)..n_himos {
-                let card_b = if self.himo_max_values[b] > 0 {
-                    self.himo_max_values[b] + 1
-                } else {
-                    continue;
-                };
-
-                let cell_count = card_a as u64 * card_b as u64;
-                if cell_count > 1_000_000 { continue; }
-
-                let table_size = cell_count as usize;
-                let mut raw: Vec<Vec<u32>> = vec![vec![]; table_size];
-
-                for eid in 0..next_eid {
-                    if !self.entities.is_live(eid) { continue; }
-                    let va = match self.himos[a].get_value(eid) {
-                        Some(v) if v < card_a => v,
-                        _ => continue,
-                    };
-                    let vb = match self.himos[b].get_value(eid) {
-                        Some(v) if v < card_b => v,
-                        _ => continue,
-                    };
-                    raw[va as usize * card_b as usize + vb as usize].push(eid);
-                }
-
-                pairs.push(PairEntry { himo_a: a, himo_b: b, card_a, card_b, cells: raw });
-            }
-        }
-
-        *self.pairs.write().unwrap() = PairTable { pairs };
-    }
-
-    /// v27: delta 伝播 — 紐の値が変わった時にペアテーブルに反映。
-    pub fn apply_pair_delta(&mut self, eid: u32, himo_idx: usize, old_val: u32, new_val: u32) {
-        let other_values: Vec<(usize, u32)> = (0..self.himos.len())
-            .filter(|&i| i != himo_idx)
-            .filter_map(|i| self.himos[i].get_value(eid).map(|v| (i, v)))
-            .collect();
-        self.pairs.write().unwrap().apply_delta(eid, himo_idx, old_val, new_val, &other_values);
-    }
-
-    /// v27: ペアテーブルへの即時反映(内部用、&self)。
+    /// v27: NTuple 観測窓への delta 伝播(内部用、&self)。
     /// himos[hid].set の前に呼んで old_val を取得する必要がある。
     ///
-    /// PairTable と NTupleTable は RwLock で保護。consumer スレッド(単一)と
-    /// 並行 reader の間で、cell(Vec) への insert/remove が torn read にならない
-    /// ように write lock 下で排他する。reader 側 (best_lookup) は read lock で
-    /// cell を clone してから返す。
-    fn apply_pair_delta_internal(&self, eid: u32, himo_idx: usize, old_val: u32, new_val: u32) {
+    /// NTupleTable は RwLock で保護。consumer スレッド(単一)と並行 reader の
+    /// 間で、cell(Vec) への insert/remove が torn read にならないように write
+    /// lock 下で排他する。reader 側 (best_lookup) は read lock 下で borrow。
+    /// view が登録されていなければ何もしない (cost 0)。
+    fn apply_view_delta_internal(&self, eid: u32, himo_idx: usize, old_val: u32, new_val: u32) {
+        let has_views = !self.tuples.read().unwrap().views.is_empty();
+        if !has_views {
+            return;
+        }
         let other_values: Vec<(usize, u32)> = (0..self.himos.len())
             .filter(|&i| i != himo_idx)
             .filter_map(|i| self.himos[i].get_value(eid).map(|v| (i, v)))
             .collect();
-        self.pairs.write().unwrap().apply_delta(eid, himo_idx, old_val, new_val, &other_values);
-
-        // 観測窓への伝播(登録されている場合のみコスト発生)
-        let has_views = !self.tuples.read().unwrap().views.is_empty();
-        if has_views {
-            self.tuples.write().unwrap().apply_delta(eid, himo_idx, old_val, new_val, &other_values);
-        }
+        self.tuples.write().unwrap().apply_delta(eid, himo_idx, old_val, new_val, &other_values);
     }
 
     /// 観測窓(n-tuple 仮想テーブル定義)をスキーマとして永続化登録。
@@ -2820,40 +2648,16 @@ impl Engine {
             if len < min_slice_len { min_slice_len = len; }
         }
 
-        // v27: 観測窓(n-tuple)とペアテーブル、最小 Cylinder スライスを比べて最小候補を選ぶ。
+        // v27: 観測窓(n-tuple)と最小 Cylinder スライスを比べて最小候補を選ぶ。
         // read lock を iterate+filter の間保持して torn read を防ぐ(cell への insert/remove は write lock)。
         {
-            // 先に長さだけ測って最適経路を決定(どのロックも保持しない)。
-            let (tuple_len, pair_len) = {
+            let tuple_len = {
                 let t = self.tuples.read().unwrap();
-                let p = self.pairs.read().unwrap();
-                let tl = t.best_lookup_ref(&conds).map(|(c, _)| c.len()).unwrap_or(usize::MAX);
-                let pl = p.best_lookup_ref(&conds).map(|(c, _)| c.len()).unwrap_or(usize::MAX);
-                (tl, pl)
+                t.best_lookup_ref(&conds).map(|(c, _)| c.len()).unwrap_or(usize::MAX)
             };
 
-            if tuple_len <= pair_len && tuple_len <= min_slice_len {
+            if tuple_len <= min_slice_len {
                 let guard = self.tuples.read().unwrap();
-                if let Some((candidates, remaining)) = guard.best_lookup_ref(&conds) {
-                    if remaining.is_empty() {
-                        return candidates.to_vec();
-                    }
-                    let mut result = Vec::new();
-                    for &eid in candidates {
-                        let mut pass = true;
-                        for &(idx, val) in &remaining {
-                            if !self.himos[idx].value_eq(eid, val) {
-                                pass = false;
-                                break;
-                            }
-                        }
-                        if pass { result.push(eid); }
-                    }
-                    return result;
-                }
-            }
-            if pair_len <= min_slice_len {
-                let guard = self.pairs.read().unwrap();
                 if let Some((candidates, remaining)) = guard.best_lookup_ref(&conds) {
                     if remaining.is_empty() {
                         return candidates.to_vec();
@@ -3000,28 +2804,6 @@ impl Engine {
         self.backing.as_slice_mut()[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&himo_count.to_le_bytes());
         // v28: header CRC を再計算(himo_count が変わったため)
         write_header_crc(self.backing.as_slice_mut());
-
-        // v27: 新 himo と既存 himo のペアを空セルで登録。以降 tie で自動更新。
-        {
-            if max_values > 0 {
-                let card_b = max_values + 1;
-                let mut pairs_w = self.pairs.write().unwrap();
-                for a in 0..hid {
-                    if self.himo_max_values[a] == 0 { continue; }
-                    let card_a = self.himo_max_values[a] + 1;
-                    let cell_count = card_a as u64 * card_b as u64;
-                    if cell_count > 1_000_000 { continue; }
-                    let cells: Vec<Vec<u32>> = vec![vec![]; cell_count as usize];
-                    pairs_w.pairs.push(PairEntry {
-                        himo_a: a,
-                        himo_b: hid,
-                        card_a,
-                        card_b,
-                        cells,
-                    });
-                }
-            }
-        }
 
         hid
     }
@@ -3477,7 +3259,7 @@ impl Engine {
                 if hid >= self.himos.len() { return; }
                 let old_val = self.himos[hid].get_value(eid);
                 self.himos[hid].set(eid, value);
-                self.apply_pair_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), value);
+                self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), value);
             }
             Op::Untie { eid, himo_id } => {
                 let hid = himo_id as usize;
@@ -3485,7 +3267,7 @@ impl Engine {
                 let old_val = self.himos[hid].get_value(eid);
                 self.himos[hid].remove(eid);
                 if let Some(ov) = old_val {
-                    self.apply_pair_delta_internal(eid, hid, ov, u32::MAX);
+                    self.apply_view_delta_internal(eid, hid, ov, u32::MAX);
                 }
             }
             Op::Delete { eid } => {
@@ -3493,7 +3275,7 @@ impl Engine {
                     let old_val = self.himos[hid].get_value(eid);
                     self.himos[hid].remove(eid);
                     if let Some(ov) = old_val {
-                        self.apply_pair_delta_internal(eid, hid, ov, u32::MAX);
+                        self.apply_view_delta_internal(eid, hid, ov, u32::MAX);
                     }
                 }
                 self.entities.free(eid);

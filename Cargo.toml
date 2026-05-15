@@ -29,6 +29,7 @@ enchudb-ffi = { path = "crates/enchudb-ffi", optional = true }
 
 [dev-dependencies]
 proptest = "1"
+libc = "0.2"
 rusqlite = { version = "0.36", features = ["bundled"] }
 enchudb-transport = { path = "crates/enchudb-transport" }
 sabitori = { path = "../sabitori/crates/sabitori" }

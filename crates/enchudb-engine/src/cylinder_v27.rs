@@ -59,9 +59,13 @@ impl UniqueDelta {
 }
 
 impl BucketCylinder {
-    pub fn new(max_values: u32, max_entities: u32) -> Self {
+    pub fn new(max_values: u32, _max_entities: u32) -> Self {
         // max_values は初期サイズのヒント。0 なら空で始めて必要時に伸ばす。
         // DENSE_CAP を超えるヒントは無視(メモリ爆発防止)。
+        // positions は空で start し、`ensure_positions` で on-demand 伸長する。
+        // max_entities ヒントを尊重して 16M × 8 byte = 128 MB / himo を pre-alloc
+        // すると、 数百 himo を抱える consumer (sinfohub-server 等) が schema
+        // declare 段階で 20+ GB heap 消費して OOM kill される。
         let bucket_count = if max_values == 0 {
             0
         } else {
@@ -71,7 +75,7 @@ impl BucketCylinder {
             max_values,
             buckets: (0..bucket_count).map(|_| Vec::new()).collect(),
             sparse: HashMap::new(),
-            positions: vec![(EMPTY_VALUE, 0); max_entities as usize],
+            positions: Vec::new(),
             total: 0,
             unique_count_cache: 0,
         }
@@ -483,6 +487,37 @@ mod tests {
         // max_values に極端な値を指定しても dense 領域は DENSE_CAP で打ち切り。
         let c = BucketCylinder::new(u32::MAX - 2, 100);
         assert!(c.buckets.len() <= DENSE_CAP as usize);
+    }
+
+    // ═══ positions の lazy alloc ═══
+
+    #[test]
+    fn positions_start_empty_regardless_of_hint() {
+        // max_entities ヒントを無視して positions を空で start する。
+        // (sinfohub-server の OOM kill 修正の本筋。)
+        let c = BucketCylinder::new(10, 16_000_000);
+        assert_eq!(c.positions.len(), 0);
+    }
+
+    #[test]
+    fn remove_on_empty_positions_no_panic() {
+        let mut c = BucketCylinder::new(10, 0);
+        assert_eq!(c.remove(0), UniqueDelta::NONE);
+        assert_eq!(c.remove(999_999), UniqueDelta::NONE);
+        assert_eq!(c.total(), 0);
+        assert_eq!(c.unique_count(), 0);
+    }
+
+    #[test]
+    fn insert_at_large_eid_with_no_hint() {
+        // max_entities = 0 ヒントでも、 大きい eid で insert すると
+        // ensure_positions が伸ばして安全に書ける。
+        let mut c = BucketCylinder::new(10, 0);
+        c.insert(1_000_000, 3);
+        assert_eq!(c.slice_one(3), &[1_000_000]);
+        assert_eq!(c.total(), 1);
+        // 中間 eid (insert されてない) を remove しても no panic。
+        assert_eq!(c.remove(500_000), UniqueDelta::NONE);
     }
 
 }

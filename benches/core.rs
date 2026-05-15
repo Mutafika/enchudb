@@ -24,8 +24,6 @@
 //! regression 検出が目的なので sample 数は最低限。数値そのものより
 //! ΔTime% に注目すること。
 
-#![cfg(feature = "v32")]
-
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use enchudb::{AuditFilter, Engine, HimoType};
 use std::hint::black_box;
@@ -127,8 +125,6 @@ fn bench_query(c: &mut Criterion) {
         eng.tie(e, "dept", i % 20);
     }
     eng.rebuild();
-    #[cfg(feature = "v26")]
-    eng.rebuild_pairs();
 
     let mut group = c.benchmark_group("query");
     group.throughput(Throughput::Elements(1));

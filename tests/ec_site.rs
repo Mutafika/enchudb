@@ -168,7 +168,6 @@ fn setup(tag: &str) -> (String, Engine, EcData) {
     define_views(&mut db);
     let data = populate(&mut db);
     db.rebuild();
-    db.rebuild_pairs();
     (path, db, data)
 }
 
@@ -495,7 +494,6 @@ fn ec_persistence() {
         define_views(&mut db);
         let _data = populate(&mut db);
         db.rebuild();
-        db.rebuild_pairs();
 
         // 5つのクエリ結果を保存
         query_results = vec![
@@ -552,7 +550,6 @@ fn view_persistence() {
         define_views(&mut db);
         let _data = populate(&mut db);
         db.rebuild();
-        db.rebuild_pairs();
         db.flush().unwrap();
     }
 

@@ -636,9 +636,7 @@ fn query_pair_empty_cell_fallback() {
     db.define_himo("board", HimoType::Number, 64);
     db.define_himo("author", HimoType::Number, 1000);
 
-    // pair table を構築（この時点でデータなし → 全セル空）
     db.rebuild();
-    db.rebuild_pairs();
 
     // データ投入（pair table 構築後）
     for i in 0..100u32 {
