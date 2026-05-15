@@ -21,29 +21,29 @@
 
 ## Quick start
 
-### native API (推奨、 app 開発の primary path)
+EnchuDB の API は 2 層構造で、 用途に応じて使い分ける:
+
+| 層 | 用途 | hot path での perf |
+|---|---|---|
+| **schema 層** (`enchudb-schema`) | DDL 宣言、 schema 永続化、 declarative な CRUD (低頻度 / REPL / 試作) | string lookup + dispatch あり、 raw の ~50 % |
+| **engine 層** (`enchudb-engine`) | runtime hot path (高頻度 writer / reader)、 `_by_id` API で string lookup ゼロ | ns 級 lookup、 raw 上限 |
+
+「最初は schema で宣言してから、 高頻度 path だけ engine に降りる」 がベストプラクティス。
+
+### 起動時: schema で declaration + 永続化
 
 ```rust
-use enchudb::schema::{Database, ColumnType};
+use enchudb::schema::Database;
 
 let mut db = Database::create("/tmp/app.db")?;
 
 // 仮想 2D テーブルを宣言、 build() で col → himo_id を pre-resolve
-let users = db.table("users")
+let _ = db.table("users")
     .integer("id")
     .text("name")
     .integer("age")
     .primary_key("id")
     .build()?;
-
-// insert (row-shaped、 内部では N 本の tie)
-let alice = users.insert()
-    .set("id", 1i64).set("name", "Alice").set("age", 30i64)
-    .commit()?;
-
-// query — col → himo_id は build 時解決済み、 名前 lookup なし
-let young = users.where_eq("age", 30i64).find()?;
-let multi = users.where_eq("age", 30i64).where_eq("name", "Alice").find()?;
 
 // reopen で schema 自動復元
 drop(db);
@@ -51,15 +51,52 @@ let db = Database::open("/tmp/app.db")?;
 let users = db.get_table("users").unwrap();  // CREATE 再呼出 不要
 ```
 
+### convenience API (低頻度 / REPL / 試作)
+
+declarative で書き味重視。 perf は engine 直叩きより劣る (string lookup あり、 marker tie が rowbuilder 内で auto inject)。
+
+```rust
+let alice = users.insert()
+    .set("id", 1i64).set("name", "Alice").set("age", 30i64)
+    .commit()?;
+
+let young = users.where_eq("age", 30i64).find()?;
+let multi = users.where_eq("age", 30i64).where_eq("name", "Alice").find()?;
+```
+
+### runtime hot path: bindings + engine 直叩き
+
+行数 KO/sec 級の writer / reader は **bindings を起動時に取り出して engine 直叩き**。 string lookup と dispatch が消える。
+
+```rust
+// bindings 取り出し (起動時 1 回)
+let users = db.get_table("users").unwrap();
+let marker_hid = db.marker_himo_id();
+let table_vid  = users.table_vid();
+let name_hid   = users.himo_id("name").unwrap();
+let age_hid    = users.himo_id("age").unwrap();
+drop(users);
+
+// runtime: bindings + engine 直叩き
+let eng = db.arc_engine();
+let e = eng.entity();
+eng.tie_to_by_id(e, marker_hid, table_vid);
+eng.tie_text_to_by_id(e, name_hid, "Alice");
+eng.tie_to_by_id(e, age_hid, 30);
+
+// 多条件 query も query_by_id 直叩き
+let rows = eng.query_by_id(&[(marker_hid, table_vid), (age_hid, 30)]);
+```
+
 詳細は [`crates/enchudb-schema/README.md`](./crates/enchudb-schema/README.md)。
 
-### engine 層 (REPL / power user)
+### engine 層 単独 (schema なし)
 
 ```rust
 use enchudb::{Engine, HimoType};
 
 let mut db = Engine::create("/tmp/my.db")?;
-db.define_himo("age", HimoType::Value, 100);
+db.define_himo("age", HimoType::Number, 100);
 
 let alice = db.entity();
 db.tie(alice, "age", 30);

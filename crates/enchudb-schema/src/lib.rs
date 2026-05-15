@@ -425,6 +425,68 @@ impl Database {
             .map(|t| Table { db: self, inner: t.clone() })
     }
 
+    /// 既存 table に column を追加。 standalone (non-concurrent) モードでのみ可能。
+    /// 同名 column が既にあれば idempotent に成功で返る。 himo を新規 define して
+    /// schema blob を書き戻すので、 以降の再 open で復元される。
+    ///
+    /// 典型用途: `Database::open` で開いた直後にスキーマ差分を当てて、
+    /// `finish_with_wal` で concurrent に flip するマイグレーション pattern。
+    pub fn add_column(
+        &mut self,
+        table_name: &str,
+        col_name: &str,
+        ty: ColumnType,
+    ) -> Result<(), SchemaError> {
+        if self.is_concurrent {
+            return Err(SchemaError::Internal(
+                "add_column requires standalone Database — open via Database::open, not open_with_wal".into()
+            ));
+        }
+        let table_inner = self.find_table_inner(table_name)
+            .ok_or_else(|| SchemaError::UnknownTable(table_name.to_string()))?;
+        if table_inner.col(col_name).is_some() {
+            return Ok(());
+        }
+        let himo_name = format!("{}.{}", table_inner.name, col_name);
+        let eng_mut = Arc::get_mut(&mut self.eng).ok_or_else(|| {
+            SchemaError::Internal("engine Arc shared — cannot mutate".into())
+        })?;
+        eng_mut.define_himo(&himo_name, ty.himo_type(), 0);
+        let hid = eng_mut.himo_id(&himo_name)
+            .ok_or_else(|| SchemaError::Internal(format!("himo {himo_name} after define")))?;
+
+        let mut new_cols = table_inner.cols.clone();
+        new_cols.push(ColumnInner {
+            name: col_name.to_string(),
+            ty,
+            himo_name,
+            himo_id: hid as u16,
+        });
+        let new_inner = Arc::new(TableInner {
+            name: table_inner.name.clone(),
+            table_vid: table_inner.table_vid,
+            cols: new_cols,
+            pk: table_inner.pk,
+            relations: table_inner.relations.iter().map(|r| RelationInner {
+                from_col: r.from_col.clone(),
+                to_table: r.to_table.clone(),
+            }).collect(),
+        });
+        let pos = self.tables.iter().position(|t| t.name.eq_ignore_ascii_case(table_name))
+            .expect("table_inner found above");
+        self.tables[pos] = new_inner;
+
+        self.persist_schema()?;
+        Ok(())
+    }
+
+    /// schema 全体の table marker himo_id (`__enchu_table` 用)。 全 table 共有で、
+    /// `query_by_id` で「ある table に属する entity」 を絞る最初の条件項に使う:
+    /// `engine.query_by_id(&[(db.marker_himo_id(), posts.table_vid()), ...])`
+    pub fn marker_himo_id(&self) -> u16 {
+        self.marker_himo_id
+    }
+
     /// 全 table を列挙。
     pub fn list_tables(&self) -> Vec<TableInfo> {
         self.tables.iter().map(|t| TableInfo {
@@ -709,6 +771,26 @@ impl<'a> Table<'a> {
     /// 既存 entity への accessor。 存在チェックはしない、 get で None が返れば未 tie。
     pub fn entity(&self, eid: EntityId) -> EntityRef<'a> {
         EntityRef { db: self.db, table: self.inner.clone(), eid }
+    }
+
+    // ──── bindings: 列名 / table 識別子から build 時 pre-resolve 済みの ID を引く ────
+    //
+    // hot path (高頻度 writer / reader) では、 起動時にここで u16 / u32 を抜き取って
+    // 自前の struct に詰め、 runtime は `engine.tie_*_by_id` / `query_by_id` で直叩き
+    // する。 schema layer の `commit` / `find` は declarative DSL であって、 per-row
+    // で経由するのは想定外。 詳細は README "schema 層の位置付け" 節を参照。
+
+    /// 列名から build 時に pre-resolve 済みの himo_id を取り出す。 大文字小文字無視。
+    /// 未定義列は None。
+    pub fn himo_id(&self, col: &str) -> Option<u16> {
+        self.inner.col(col).map(|c| c.himo_id)
+    }
+
+    /// 本 table の table_vid。 `__enchu_table` himo に張る値で、 「この entity は
+    /// 本 table 所属」 を判定する超高速 path に使う。 `query_by_id` の最初の条件項
+    /// `(marker_hid, table_vid)` で使う。
+    pub fn table_vid(&self) -> u32 {
+        self.inner.table_vid
     }
 }
 
@@ -1313,6 +1395,57 @@ mod tests {
             let staff = users.where_ref("company", ant_id).find().unwrap();
             assert_eq!(staff.len(), 2);
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bindings_extract_table_vid_and_himo_id() {
+        // build 時に解決された himo_id / table_vid を bindings 公式 helper 経由で
+        // 取り出せること、 取り出した id で engine 直叩きが動くことを確認。
+        let path = tmp("bindings");
+        let _ = std::fs::remove_file(&path);
+        let mut db = Database::create(&path).unwrap();
+        let _ = db.table("posts")
+            .tag("author")
+            .number("year")
+            .leaf("body")
+            .primary_key("author")
+            .build()
+            .unwrap();
+
+        // bindings 取り出し (build と別 borrow scope に分けて借用エラー回避)
+        let marker_hid = db.marker_himo_id();
+        let (author_hid, year_hid, body_hid, table_vid) = {
+            let posts = db.get_table("posts").unwrap();
+            (
+                posts.himo_id("author").expect("author hid"),
+                posts.himo_id("year").expect("year hid"),
+                posts.himo_id("body").expect("body hid"),
+                posts.table_vid(),
+            )
+        };
+        assert_ne!(author_hid, year_hid);
+        assert_ne!(author_hid, body_hid);
+        // unknown col は None
+        assert!(db.get_table("posts").unwrap().himo_id("nope").is_none());
+
+        // engine 直叩き経路で 1 row 書く
+        let e = {
+            let eng = db.engine();
+            let e = eng.entity();
+            eng.tie_to_by_id(e, marker_hid, table_vid);
+            eng.tie_text_to_by_id(e, author_hid, "alice");
+            eng.tie_to_by_id(e, year_hid, 2026);
+            eng.tie_text_to_by_id(e, body_hid, "hello");
+            e
+        };
+
+        // schema find 経由で見える
+        let posts = db.get_table("posts").unwrap();
+        let rows = posts.where_eq("author", "alice").find().unwrap();
+        assert_eq!(rows.len(), 1, "alice row should be visible via schema find");
+        assert_eq!(rows[0], e);
+
         let _ = std::fs::remove_file(&path);
     }
 

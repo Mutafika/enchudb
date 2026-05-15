@@ -1,49 +1,87 @@
 # enchudb-schema
 
-EnchuDB の **native API** 層。 仮想 2D テーブル (= N 個の紐の束) を declare すると、 query / insert は col 名 → himo_id を pre-resolve した path で engine に直 dispatch される。
+EnchuDB の **declarator + bindings** 層。 仮想 2D テーブル (= N 個の紐の束) を declare して `build()` すると、 col 名 → himo_id / table 名 → table_vid が pre-resolve され、 schema は DB ファイル内に永続化される。
 
-SQL crate (`enchudb-sql`) はこの上に乗る parser。 普通のアプリは schema 層を直接使うのが正解。
+runtime hot path (高頻度 writer / reader) は schema 層を経由せず、 **build 時に取り出した bindings (`himo_id` u16 + `table_vid` u32) を engine 直叩き** (`tie_*_by_id` / `query_by_id`) する設計。 schema の `commit` / `find` は declarative DSL で convenience 用途 (REPL / 低頻度 / 試作)。
+
+SQL crate (`enchudb-sql`) はこの schema 層の上に乗る parser。
 
 ## なにこれ
 
 - `Database::table(...).column(...).primary_key(...).build()` で **仮想 2D テーブル** を宣言
-- `build()` 時に column → himo_id を pre-resolve、 以降の query は engine の id-keyed fast path
-- fluent な insert / where / find / entity().set() / delete API
+- `build()` 時に column → himo_id / table → table_vid を pre-resolve
+- bindings 取り出し: `Table::himo_id(col)`, `Table::table_vid()`, `Database::marker_himo_id()`
+- convenience API: fluent な insert / where / find / entity().set() / delete (declarative、 低頻度向け)
 - relation (Ref 型 col) を `ref_to(col, "to_table")` で declare → 逆引き O(1)
 - schema は DB ファイル内に永続化 (reopen で自動復元、 himo_id も再 resolve)
 - `Drop` で自動 flush — 手動 flush 不要
 
-## なぜ独立 layer なのか
+## 役割分担
 
-「全 himo は何かの table に所属する」 という app modeling は **100% のケース** で正しい (matcha / t5ug3 / sinfo / enchu studio すべて)。 raw `Engine::query(&[("name", val)])` の string lookup は app 用途では原理的に毎回無駄。
+```
+[起動時]    schema       declarator + 永続化 + bindings 抽出
+            ↓
+[runtime]   engine        bindings + tie_*_by_id / query_by_id 直叩き
+```
 
-そこで:
-
-| Layer | crate | 役割 |
+| Layer | crate | 用途 |
 |---|---|---|
 | SQL parser | `enchudb-sql` | SQLite 互換、 初心者 / migration 向け |
-| **native API** | **`enchudb-schema`** | **app 開発の primary path** |
-| engine | `enchudb-engine` | naked 紐 + 円柱、 REPL / power user |
+| schema (declarator) | `enchudb-schema` | DDL 宣言、 schema 永続化、 declarative CRUD (低頻度) |
+| **engine (runtime)** | **`enchudb-engine`** | **hot path、 ns 級 lookup、 `_by_id` API** |
 
-SQL は schema の **上に乗る薄い parser**、 schema は engine の **上に乗る薄い metadata**。 dispatch overhead は ns 規模、 storage layout は変えない。
+「全 himo は何かの table に所属する」 という app modeling は **100% のケース** で正しい (matcha / t5ug3 / sinfo / enchu studio すべて) ので、 declarator + bindings として schema 層を持つ価値はある。 ただし runtime path で経由する必要はない (perf を犠牲にするだけ)。
 
-## 使い方
+## 起動時: schema で declare + 永続化
 
 ```rust
 use enchudb_schema::{Database, ColumnType};
 
 let mut db = Database::create("/tmp/app.db")?;
 
-// schema declare — build() 時に himo_id 全部 pre-resolve
-let users = db.table("users")
+// schema declare — build() 時に himo_id / table_vid 全部 pre-resolve
+let _ = db.table("users")
     .integer("id")
     .text("name")
     .integer("age")
     .text("city")
     .primary_key("id")
     .build()?;
+```
 
-// insert (row-shaped、 内部では N 本の tie)
+## runtime hot path: bindings + engine 直叩き (推奨)
+
+行数 KO/sec 級の writer / reader は **bindings を起動時に取り出して engine 直叩き**。 string lookup / dispatch ゼロ、 raw async 上限近くまで出る。
+
+```rust
+let users = db.get_table("users").unwrap();
+// bindings 抽出 (起動時 1 回)
+let marker_hid = db.marker_himo_id();
+let table_vid  = users.table_vid();
+let name_hid   = users.himo_id("name").unwrap();
+let age_hid    = users.himo_id("age").unwrap();
+let city_hid   = users.himo_id("city").unwrap();
+drop(users);
+
+// runtime: bindings + engine 直叩き
+let eng = db.arc_engine();
+let e = eng.entity();
+eng.tie_to_by_id(e, marker_hid, table_vid);        // 「user 所属」 marker
+eng.tie_text_to_by_id(e, name_hid, "Alice");
+eng.tie_to_by_id(e, age_hid, 30);
+eng.tie_text_to_by_id(e, city_hid, "Tokyo");
+
+// query も engine 直叩き
+let tokyo_30 = eng.query_by_id(&[(marker_hid, table_vid), (age_hid, 30), (city_hid, eng.vocab_id("Tokyo").unwrap())]);
+```
+
+## convenience API: declarative CRUD (低頻度 / REPL / 試作)
+
+書き味重視。 内部で _by_id 経路に切替えてあるので極端に遅くはないが、 hot path で経由する想定ではない。
+
+```rust
+let users = db.get_table("users").unwrap();
+
 let alice = users.insert()
     .set("id", 1i64)
     .set("name", "Alice")
@@ -51,19 +89,16 @@ let alice = users.insert()
     .set("city", "Tokyo")
     .commit()?;
 
-// query — col → himo_id は build 時解決済み、 名前 lookup なし
 let young  = users.where_eq("age", 30i64).find()?;
 let multi  = users.where_eq("age", 30i64).where_eq("city", "Tokyo").find()?;
 let count  = users.where_eq("city", "Tokyo").count()?;
 let one    = users.where_eq("id", 1i64).find_one()?;
 
-// range / cmp (engine の Column 直読み post-filter)
 let prime  = users.where_range("age", 25, 35).find()?;
 let adults = users.where_ge("age", 18).find()?;
 
-// get / update / delete
-let age = users.entity(alice).get("age");           // Option<Value>
-users.entity(alice).set("age", 31i64).commit()?;    // 単発 set
+let age = users.entity(alice).get("age");
+users.entity(alice).set("age", 31i64).commit()?;
 users.entity(alice).update()
     .set("city", "Osaka")
     .set("age", 32i64)
