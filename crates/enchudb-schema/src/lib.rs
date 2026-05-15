@@ -262,6 +262,30 @@ impl Database {
         })
     }
 
+    /// 読み取り専用で開く。 writer lock を取らないので、 別 process が
+    /// writer として開いていても並行 open 可能。 書き込み API は panic する。
+    /// GUI の表示専用 process、 監視ツール等の用途。
+    ///
+    /// 既存 DB (= marker himo が登録済み) が前提。 新規 DB に対して
+    /// open_readonly を呼ぶと marker himo が見つからず error になる。
+    pub fn open_readonly(path: &str) -> Result<Self, SchemaError> {
+        let eng = Engine::open_readonly(path).map_err(|e| SchemaError::Io(e.to_string()))?;
+        // readonly では define_himo (= 書き込み) を呼ばない。 既存 DB なら
+        // marker himo は create 時に登録済みのはず。
+        let marker_himo_id = eng.himo_id(TABLE_MARKER_HIMO)
+            .ok_or_else(|| SchemaError::Internal(
+                "marker himo not present — open_readonly requires a DB built via Database::create".into()
+            ))? as u16;
+        let mut db = Self {
+            eng: Arc::new(eng),
+            tables: Vec::new(),
+            marker_himo_id,
+            is_concurrent: false,
+        };
+        db.load_schema()?;
+        Ok(db)
+    }
+
     pub fn open(path: &str) -> Result<Self, SchemaError> {
         let mut eng = Engine::open_standalone(path).map_err(|e| SchemaError::Io(e.to_string()))?;
         eng.define_himo(TABLE_MARKER_HIMO, HimoType::Tag, 0);
@@ -1287,6 +1311,44 @@ mod tests {
             assert_eq!(staff.len(), 2);
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_readonly_coexists_with_writer() {
+        // writer (sf 風) と reader (Studio 風) が同 DB に並行 open できることを確認。
+        // 既存 DB を 1 つ作って閉じ、 その後:
+        //   - writer (open_with_wal) で 1 つ open (writer lock 取る)
+        //   - reader (open_readonly) を 3 つ並行 open (lock 取らない)
+        // 全部 同じ schema が見えること。
+        let path = tmp("readonly_coexist");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.wal", path));
+        let _ = std::fs::remove_file(format!("{}.lock", path));
+
+        // create + 1 row insert + close
+        {
+            let mut db = Database::create(&path).unwrap();
+            db.table("kv").tag("k").number("v").primary_key("k").build().unwrap();
+            let kv = db.get_table("kv").unwrap();
+            kv.insert().set("k", "x").set("v", 42i64).commit().unwrap();
+        }
+
+        // writer + 3 reader 同時 open
+        let writer = Database::open(&path).unwrap();
+        let r1 = Database::open_readonly(&path).unwrap();
+        let r2 = Database::open_readonly(&path).unwrap();
+        let r3 = Database::open_readonly(&path).unwrap();
+
+        for db in [&writer, &r1, &r2, &r3] {
+            let kv = db.get_table("kv").unwrap();
+            let rows = kv.where_eq("k", "x").find().unwrap();
+            assert_eq!(rows.len(), 1);
+        }
+
+        drop((writer, r1, r2, r3));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.wal", path));
+        let _ = std::fs::remove_file(format!("{}.lock", path));
     }
 
     #[test]

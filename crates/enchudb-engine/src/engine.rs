@@ -62,6 +62,36 @@ fn wal_path_for(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{}.wal", path))
 }
 
+/// writer 排他用 sidecar の path。 `.db.lock`。
+#[cfg(not(target_arch = "wasm32"))]
+fn writer_lock_path_for(path: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}.lock", path))
+}
+
+/// `.db.lock` に flock(LOCK_EX) を取り、 fd を返す。 fd が drop されると lock も解放。
+/// 取得できないと **block する** (= sqlite と同様、 取れるまで待つ)。
+/// readonly open は呼ばない。 writer 系の open / create だけ呼ぶ。
+#[cfg(not(target_arch = "wasm32"))]
+fn acquire_writer_lock(path: &str) -> io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let lock_path = writer_lock_path_for(path);
+    if let Some(parent) = lock_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(f)
+}
+
 /// `snapshot_export` の結果。どのファイルを書き出したか。
 #[derive(Debug, Clone)]
 pub struct SnapshotFiles {
@@ -767,6 +797,14 @@ pub struct Engine {
     /// Symbol 型 himo の Tie を受信した時に remote_vid を local_vid に変換して apply する。
     /// peer-local に保持(replica でも独立、open 時は空、受信で徐々に埋まる)。
     peer_vocab_map: std::sync::RwLock<std::collections::HashMap<(enchudb_wal::PeerId, u32), u32>>,
+    /// v34: read-only モード。 true なら書き込み API は error/panic。 open_readonly で立つ。
+    /// `is_replica` は「直 write 拒否、 Syncer 経由は受ける」、 こちらは「一切 write 不可」。
+    is_readonly: std::sync::atomic::AtomicBool,
+    /// v34: writer lock の保持 fd。 open_writer / create_* で `.db.lock` sidecar を
+    /// flock(LOCK_EX)、 Engine drop で fd close = lock release。 readonly では None。
+    /// 多 process write の同 .db 競合を防ぐ (sqlite WAL モード相当)。
+    #[cfg(not(target_arch = "wasm32"))]
+    _writer_lock: Option<std::fs::File>,
     backing: Backing, // 最後に drop されるよう最終フィールド
 }
 
@@ -826,6 +864,8 @@ impl Engine {
                 std::fs::create_dir_all(parent)?;
             }
         }
+        // writer lock を先に取る (= 他 writer が居れば block)。 create も書き込みなので必須。
+        let writer_lock = acquire_writer_lock(path)?;
         let file = OpenOptions::new()
             .read(true).write(true).create(true).truncate(true)
             .open(path)?;
@@ -906,6 +946,8 @@ impl Engine {
                 enchudb_wal::wal::HEADER_SIZE as u64,
             )),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
+            is_readonly: std::sync::atomic::AtomicBool::new(false),
+            _writer_lock: Some(writer_lock),
             backing: Backing::Mmap(mmap),
         })
     }
@@ -980,6 +1022,8 @@ impl Engine {
                 std::fs::create_dir_all(parent)?;
             }
         }
+        // writer lock を先に取る (= 他 writer が居れば block)
+        let writer_lock = acquire_writer_lock(path)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1135,6 +1179,8 @@ impl Engine {
                 enchudb_wal::wal::HEADER_SIZE as u64,
             )),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
+            is_readonly: std::sync::atomic::AtomicBool::new(false),
+            _writer_lock: Some(writer_lock),
             backing: Backing::Growable(map),
         })
     }
@@ -1145,7 +1191,17 @@ impl Engine {
     /// 明示的に単独 Engine が欲しい場合はこちらを使う。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_standalone(path: &str) -> io::Result<Self> {
-        Self::open_internal(path, /*verify_region_crc=*/ true)
+        Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ true)
+    }
+
+    /// read-only open: writer lock を取らず、 書き込み API は error。
+    /// 複数 process で同時に呼んで OK (writer と共存可能、 reader 同士も無制限)。
+    /// 用途: GUI の表示専用 process、 監視ツール、 backup-reader 等。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_readonly(path: &str) -> io::Result<Self> {
+        let mut eng = Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ false)?;
+        eng.is_readonly.store(true, std::sync::atomic::Ordering::Release);
+        Ok(eng)
     }
 
     /// `open` は WAL 有効 + `Arc<Self>` 返し。
@@ -1156,8 +1212,15 @@ impl Engine {
     }
 
     /// 内部用: region CRC 検証を skip できる open。WAL ルート用。
+    /// `take_lock = true` で `.db.lock` の flock(LOCK_EX) を取得し、 Engine 寿命中保持。
     #[cfg(not(target_arch = "wasm32"))]
-    fn open_internal(path: &str, verify_region_crc: bool) -> io::Result<Self> {
+    fn open_internal(path: &str, verify_region_crc: bool, take_lock: bool) -> io::Result<Self> {
+        // open path: writer lock を mmap 前に取る (= 他 writer 居れば block)
+        let writer_lock = if take_lock {
+            Some(acquire_writer_lock(path)?)
+        } else {
+            None
+        };
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         // v29: ファイルサイズ検証 — truncate で SIGBUS を防ぐ
         let file_size = file.metadata()?.len();
@@ -1166,6 +1229,7 @@ impl Engine {
         let mut eng = Self::load_from_backing(Backing::Mmap(mmap))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         eng.path = path.to_string();
+        eng._writer_lock = writer_lock;
         if verify_region_crc {
             // .crc ファイルがあれば全 region CRC 検証
             eng.verify_region_crcs()?;
@@ -1497,6 +1561,8 @@ impl Engine {
                 enchudb_wal::wal::HEADER_SIZE as u64,
             )),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
+            is_readonly: std::sync::atomic::AtomicBool::new(false),
+            _writer_lock: None, // caller (open_internal) が後から差し替える
             backing,
         };
 
@@ -1561,9 +1627,12 @@ impl Engine {
         self.is_replica.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// 書き込み API が呼ばれた時の guard。replica なら panic。
+    /// 書き込み API が呼ばれた時の guard。replica なら panic、 readonly でも panic。
     #[inline(always)]
     fn check_writable(&self) {
+        if self.is_readonly.load(std::sync::atomic::Ordering::Acquire) {
+            panic!("Engine is opened read-only (open_readonly); writes are not allowed");
+        }
         if self.is_replica.load(std::sync::atomic::Ordering::Acquire) {
             panic!("Engine is in replica mode; writes must go through Syncer (remote_*_apply)");
         }
@@ -2911,7 +2980,7 @@ impl Engine {
     /// 代わりに古い `.crc` ファイルは削除して、次回 flush で regenerate させる。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_concurrent_with_wal(path: &str, wal_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
-        let mut eng = Self::open_internal(path, /*verify_region_crc=*/ false)?;
+        let mut eng = Self::open_internal(path, /*verify_region_crc=*/ false, /*take_lock=*/ true)?;
         // 古い .crc は WAL 活動後に stale になるので削除
         let crc_path = crate::integrity::crc_path_for(path);
         let _ = std::fs::remove_file(&crc_path);
@@ -5336,6 +5405,89 @@ mod tests {
         eng2.rebuild();
         assert_eq!(eng2.query(&[("ts", 1_715_000_010)]).len(), 1);
         let _ = std::fs::remove_file(&dir);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // β: writer lock + open_readonly tests
+    // ─────────────────────────────────────────────────────────────
+
+    /// readonly で開いた DB は writer lock を取らないので、 writer の存在に関わらず
+    /// 開ける + 複数 readonly 同時 open も衝突しない。
+    #[test]
+    fn readonly_does_not_block_other_opens() {
+        let p = tmp("readonly_no_block");
+        {
+            let mut eng = Engine::create_standalone(&p).unwrap();
+            eng.define_himo("v", HimoType::Number, 100);
+            let e = eng.entity();
+            eng.tie(e, "v", 42);
+            eng.flush().unwrap();
+        }
+        // writer 開きっぱなしのまま readonly 多重 open
+        let writer = Engine::open_standalone(&p).unwrap();
+        let r1 = Engine::open_readonly(&p).unwrap();
+        let r2 = Engine::open_readonly(&p).unwrap();
+        let r3 = Engine::open_readonly(&p).unwrap();
+        // 全 reader が同じ値を見る
+        for r in [&r1, &r2, &r3] {
+            assert_eq!(r.pull_raw("v", 42).len(), 1);
+        }
+        drop((writer, r1, r2, r3));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// readonly で開いた engine の書き込み API は panic する。
+    #[test]
+    #[should_panic(expected = "read-only")]
+    fn readonly_write_panics() {
+        let p = tmp("readonly_panic");
+        {
+            let mut eng = Engine::create_standalone(&p).unwrap();
+            eng.define_himo("v", HimoType::Number, 100);
+            eng.flush().unwrap();
+        }
+        let mut eng = Engine::open_readonly(&p).unwrap();
+        let e = eng.entity(); // ← ここで panic
+        eng.tie(e, "v", 1);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 2 process emulation: 1 writer が live な間、 もう一つの open_standalone は
+    /// 別 thread から呼ぶと block する。 100 ms 待っても 2nd が returnしないことで
+    /// 排他を確認、 1st を drop すると 2nd が unblock。
+    #[test]
+    fn writer_blocks_concurrent_writer() {
+        use std::sync::mpsc;
+        let p = tmp("writer_block");
+        {
+            let mut eng = Engine::create_standalone(&p).unwrap();
+            eng.define_himo("v", HimoType::Number, 100);
+            eng.flush().unwrap();
+        }
+        let eng_a = Engine::open_standalone(&p).unwrap();
+
+        // 別 thread で 2 nd open_standalone を試みる。 block するはず。
+        let (tx, rx) = mpsc::channel::<()>();
+        let p_clone = p.clone();
+        let h = std::thread::spawn(move || {
+            let _eng_b = Engine::open_standalone(&p_clone).unwrap();
+            tx.send(()).unwrap();
+        });
+
+        // 200 ms 以内に取れちゃったら lock が効いてない
+        match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(_) => panic!("2nd open_standalone should have been blocked"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {} // expected
+            Err(e) => panic!("unexpected: {:?}", e),
+        }
+
+        // 1 st を drop → 2 nd が unblock
+        drop(eng_a);
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("2nd open should succeed after 1st drop");
+        h.join().unwrap();
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(format!("{}.lock", p));
     }
 
     /// growable backing で作った DB を open_standalone で再オープン

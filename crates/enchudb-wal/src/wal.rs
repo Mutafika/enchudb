@@ -247,6 +247,22 @@ pub struct RelayedHeader {
     pub pubkey_fp: [u8; 8],
 }
 
+/// `flock(LOCK_EX)` 解放用 RAII guard。 drop で `LOCK_UN` を呼ぶ。
+#[cfg(not(target_arch = "wasm32"))]
+struct WalLockGuard<'a> {
+    fd: std::os::fd::RawFd,
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for WalLockGuard<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = libc::flock(self.fd, libc::LOCK_UN);
+        }
+    }
+}
+
 pub struct Wal {
     #[cfg(not(target_arch = "wasm32"))]
     _file: File,
@@ -462,18 +478,46 @@ impl Wal {
         record_size: usize,
         relay: Option<RelayedHeader>,
     ) -> io::Result<u64> {
-        let offset = loop {
-            let cur = self.head.load(Ordering::Acquire);
-            let new = cur + record_size as u64;
-            if new > self.capacity {
-                return Err(io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "WAL full — consumer reset behind",
-                ));
+        // multi-process safety: flock(LOCK_EX) で同じ .wal に対する append を直列化。
+        // 単一 process 内では既に `head` の CAS で並列 OK だが、 別 process の Wal は
+        // 別の process-local AtomicU64 を持つので同 offset に書き込む race がある。
+        // git の .git/index.lock 相当。 read 側は lock を取らない。
+        #[cfg(not(target_arch = "wasm32"))]
+        let _lock = self.flock_exclusive()?;
+
+        // ── head を mmap 上の値から読み直して採番 ──
+        // 別 process が直前に append した場合、 self.head (process-local atomic) は
+        // 古い値を持ってるので、 lock 中に mmap 上の永続値を真実とする。 単一 process
+        // のときは既存 CAS と同じく無コスト。
+        let offset = {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let mm = self.mmap_slice();
+                let on_disk = u64::from_le_bytes(mm[8..16].try_into().unwrap());
+                let cur = on_disk.max(self.head.load(Ordering::Acquire));
+                let new = cur + record_size as u64;
+                if new > self.capacity {
+                    return Err(io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        "WAL full — consumer reset behind",
+                    ));
+                }
+                // lock を保持しているので CAS ではなく単純 store で OK
+                self.head.store(new, Ordering::Release);
+                cur
             }
-            match self.head.compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => break cur,
-                Err(_) => continue,
+            #[cfg(target_arch = "wasm32")]
+            {
+                let cur = self.head.load(Ordering::Acquire);
+                let new = cur + record_size as u64;
+                if new > self.capacity {
+                    return Err(io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        "WAL full — consumer reset behind",
+                    ));
+                }
+                self.head.store(new, Ordering::Release);
+                cur
             }
         };
 
@@ -696,6 +740,22 @@ impl Wal {
         let head = self.head.load(Ordering::Acquire);
         let cp = self.checkpoint.load(Ordering::Acquire);
         (head.saturating_sub(cp), self.capacity)
+    }
+
+    // ---- flock (multi-process write 排他) ----
+
+    /// WAL ファイルに対する LOCK_EX を取る。 戻り値の guard が drop された時点で
+    /// 解放される。 同じ .wal を別 process が同時に append しようとした場合、 lock
+    /// 取得まで block する (典型的に数 µs〜ms)。 read 経路は lock 取らない。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn flock_exclusive(&self) -> io::Result<WalLockGuard<'_>> {
+        use std::os::fd::AsRawFd;
+        let fd = self._file.as_raw_fd();
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(WalLockGuard { fd, _marker: std::marker::PhantomData })
     }
 
     // ---- internal mmap helpers ----
@@ -1030,6 +1090,40 @@ mod tests {
         }
         for h in handles { h.join().unwrap(); }
         assert_eq!(wal.next_lsn(), 4001);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn multi_process_append_no_offset_collision() {
+        // 2 つの Wal インスタンスを **同じ** .wal ファイルに対して開き、
+        // それぞれから append する。 flock 排他が効いていれば、 record の
+        // 物理 offset は衝突せず重ならない。 1 process 内の 2 Wal インスタンスは
+        // 別 process と同じく別 process-local atomic を持つので、 flock なしだと
+        // 同じ offset を奪い合って record が破壊される。
+        let p = tmp("multi_proc");
+        let cap = 4 * 1024 * 1024;
+        let wal_a = Wal::create(&p, cap).unwrap();
+        // 同じ path を別 Wal で再 open (= 別 process emulation)
+        let wal_b = Wal::open(&p).unwrap();
+
+        // 交互に append、 lock が無いと head が両 instance で衝突
+        for i in 0..200u32 {
+            if i % 2 == 0 {
+                wal_a.append(WalOp::Tie { eid: i as u64, himo_id: 0, value: i }).unwrap();
+            } else {
+                wal_b.append(WalOp::Tie { eid: i as u64, himo_id: 1, value: i }).unwrap();
+            }
+        }
+        wal_a.append(WalOp::Commit).unwrap();
+        wal_b.append(WalOp::Commit).unwrap();
+
+        // どちらか経由で recover、 record が 202 個全部見える事を確認
+        let wal_c = Wal::open(&p).unwrap();
+        let recs = wal_c.recover();
+        let tie_count = recs.iter().filter(|r| matches!(r.op, DecodedOp::Tie { .. })).count();
+        assert_eq!(tie_count, 200, "all Tie records should survive flock-serialized append, got {}", tie_count);
+        // record header magic がどれも正常であることを暗黙検証 (recover 自身が壊れた
+        // record を見つけたら panic / 早期 break する)
         let _ = std::fs::remove_file(&p);
     }
 
