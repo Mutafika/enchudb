@@ -214,9 +214,27 @@ cargo bench --features v32 --bench core
 ```
 {path}         メイン DB (mmap、 layout v3、 FILE_VERSION 3)
 {path}.wal     WAL (v28+、 有効時、 sparse file)
+{path}.lock    writer 排他 sidecar (writer open 時に flock、 close で release)
 {path}.crc    region CRC (seal_integrity 時のみ)
 <blob_root>/   BlobStore (別ディレクトリ、 content-addressed、 大 blob 外出し用)
 ```
+
+## 並行アクセス
+
+「**writer 1 process + reader 無制限**」 の SQLite WAL 相当モデル。
+
+| やりたい事 | API | lock | 同時 process |
+|---|---|---|---|
+| 書く + 読む | `Engine::open_concurrent_with_wal` / `open_standalone` | exclusive | 1 |
+| 読むだけ | `Engine::open_readonly` / `Database::open_readonly` | なし | 無制限 |
+
+writer は `.db.lock` sidecar に `flock(LOCK_EX)` を engine 寿命中保持。 2 つ目の
+writer は drop されるまで block (sqlite default 動作と同じ)。 readonly は lock を
+取らないので writer と共存可、 write API を呼ぶと panic で即気付く。
+
+GUI app + CLI を同 DB で共存する場合は **GUI が `open_readonly`、 CLI が
+subprocess として writer で開く**のが推奨パターン。 詳細は
+[`docs/concurrency.md`](./docs/concurrency.md)。
 
 ## 開発状況
 
