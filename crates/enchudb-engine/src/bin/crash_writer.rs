@@ -13,6 +13,9 @@
 //!   abort_mid           — 半分書いたところで abort()(Drop 走らず)
 //!   loop_writes         — 無限に書き込む(親プロセスが kill する前提)
 //!   sleep_after         — 書き込み + sync → sleep(親が kill する前提、耐久化確認)
+//!   mmap_ahead          — 1 件書き込み + body_msync(mmap 強制 disk) → wal fsync
+//!                         せずに abort。 mmap > WAL の race を deterministic に
+//!                         再現する。 sync 整合性の known issue 検証用。
 //!   v32_signed_loop     — v32 署名付きで無限書き込み(親が kill する前提)。
 //!                         seed 固定の keypair で WAL に署名レコードを残す。
 
@@ -107,6 +110,22 @@ fn main() {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(60));
             }
+        }
+        "mmap_ahead" => {
+            // race を deterministic に再現:
+            // 1. tie_async で 1 件書き込み
+            // 2. flush_writes で consumer queue を drain (= mmap に反映、 WAL buffer に append)
+            // 3. body_msync で mmap dirty page を強制的に disk へ
+            // 4. wal_sync / wal_commit は呼ばない (= WAL は buffer のまま disk に行かない)
+            // 5. abort で Drop を skip (= consumer thread の周期 fsync も走らず)
+            //
+            // 結果: mmap disk = 新値、 WAL disk = 空。 再起動時に mmap だけ進んでる状態。
+            let e = eng.entity();
+            eng.tie_async(e, "n", 42);
+            eng.flush_writes();
+            eng.body_msync().unwrap();
+            // ❗ wal.fsync 呼ばない。 consumer の auto-fsync を待たずに即 abort。
+            std::process::abort();
         }
         "v32_signed_loop" => {
             use enchudb_wal::keys::Keypair;
