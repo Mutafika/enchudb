@@ -1037,6 +1037,9 @@ fn value_to_raw_for_query(eng: &Engine, cd: &ColumnInner, v: &Value) -> Result<u
 }
 
 /// 書き込み (tie) 用の型 dispatch。 Text は str をそのまま vocab に流す。
+///
+/// `cd.himo_id` は build 時に pre-resolve 済みなので、 hot path で `_by_id` 経路を
+/// 使って string lookup を避ける。
 fn tie_value(eng: &Engine, eid: EntityId, cd: &ColumnInner, v: &Value) -> Result<(), SchemaError> {
     match (cd.ty, v) {
         (_, Value::Null) => Err(SchemaError::BadValue("Null tie not supported (use entity.delete or untie)".into())),
@@ -1044,17 +1047,17 @@ fn tie_value(eng: &Engine, eid: EntityId, cd: &ColumnInner, v: &Value) -> Result
             if *n < 0 || (*n as u64) >= u32::MAX as u64 {
                 return Err(SchemaError::BadValue(format!("integer out of u32 range: {n}")));
             }
-            eng.tie_to(eid, &cd.himo_name, *n as u32);
+            eng.tie_to_by_id(eid, cd.himo_id, *n as u32);
             Ok(())
         }
         (ColumnType::Tag, Value::Text(s)) | (ColumnType::Leaf, Value::Text(s)) => {
-            // engine の tie_text_to は himo の HimoType (Tag / Leaf) を見て
+            // engine の tie_text_to_by_id は himo の HimoType (Tag / Leaf) を見て
             // vocab.get_or_insert (dedupe) vs vocab.insert (新規 id) を dispatch する。
-            eng.tie_text_to(eid, &cd.himo_name, s);
+            eng.tie_text_to_by_id(eid, cd.himo_id, s);
             Ok(())
         }
         (ColumnType::Ref, Value::Ref(t)) => {
-            eng.tie_ref_to(eid, &cd.himo_name, *t);
+            eng.tie_ref_to_by_id(eid, cd.himo_id, *t);
             Ok(())
         }
         (t, v) => Err(SchemaError::TypeMismatch(format!("{t:?} vs {v:?}"))),

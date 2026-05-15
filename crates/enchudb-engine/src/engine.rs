@@ -1922,15 +1922,24 @@ impl Engine {
     /// 定義済みの紐に文字列を張る。&selfで呼べる（Arc共有のまま書き込み可）。
     /// 紐が未定義ならpanic。define_himo を先に呼ぶこと。
     pub fn tie_text_to(&self, eid: enchudb_wal::EntityId, himo: &str, value: &str) {
+        let hid = self.himo_id(himo)
+            .unwrap_or_else(|| panic!("himo '{}' not defined", himo)) as u16;
+        self.tie_text_to_by_id(eid, hid, value);
+    }
+
+    /// `tie_text_to` の himo_id 直指定版。 hot path で per-call の HashMap lookup を
+    /// 避けたい時に。 起動時に `himo_id(&str)` で解決して u16 を cache しておく。
+    pub fn tie_text_to_by_id(&self, eid: enchudb_wal::EntityId, himo_id: u16, value: &str) {
         self.check_writable();
         let eid = enchudb_wal::eid_local(eid);
-        let hid = self.himo_id(himo)
-            .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
+        let hid = himo_id as usize;
+        debug_assert!(hid < self.himos.len(),
+            "himo_id {} out of range (max {})", himo_id, self.himos.len());
         // Tag は dedupe、Leaf は常に新規 id。
         let vid = match self.himo_types[hid] {
             HimoType::Tag => self.vocab.get_or_insert(value.as_bytes()),
             HimoType::Leaf => self.vocab.insert(value.as_bytes()),
-            ht => panic!("tie_text_to on non-text himo '{}': {:?}", himo, ht),
+            ht => panic!("tie_text_to_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
         self.record_undo(eid, hid);
         let old_val = self.himos[hid].get_value(eid);
@@ -1942,63 +1951,96 @@ impl Engine {
         if let Some(wal) = self.wal.as_ref() {
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), eid);
             let _ = wal.append(enchudb_wal::wal::WalOp::Vocab { vid, bytes: value.as_bytes() });
-            let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id: hid as u16, value: vid });
+            let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id, value: vid });
         }
     }
 
     /// 定義済みの紐にu32値を張る。&selfで呼べる。
     pub fn tie_to(&self, eid: enchudb_wal::EntityId, himo: &str, value: u32) {
+        let hid = self.himo_id(himo)
+            .unwrap_or_else(|| panic!("himo '{}' not defined", himo)) as u16;
+        self.tie_to_by_id(eid, hid, value);
+    }
+
+    /// `tie_to` の himo_id 直指定版。 hot path 用 (string lookup を避ける)。
+    pub fn tie_to_by_id(&self, eid: enchudb_wal::EntityId, himo_id: u16, value: u32) {
         self.check_writable();
         let eid = enchudb_wal::eid_local(eid);
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
-        let hid = self.himo_id(himo)
-            .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
-        debug_assert!(self.himo_types[hid] == HimoType::Number || self.himo_types[hid] == HimoType::Ref, "tie_to on non-Value himo '{}'", himo);
+        let hid = himo_id as usize;
+        debug_assert!(hid < self.himos.len(),
+            "himo_id {} out of range (max {})", himo_id, self.himos.len());
+        debug_assert!(
+            self.himo_types[hid] == HimoType::Number || self.himo_types[hid] == HimoType::Ref,
+            "tie_to_by_id on non-Value himo_id {}", himo_id,
+        );
         self.record_undo(eid, hid);
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, value);
         self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), value);
         if let Some(wal) = self.wal.as_ref() {
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), eid);
-            let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id: hid as u16, value });
+            let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id, value });
         }
     }
 
     /// 定義済みの紐にentity参照を張る。&selfで呼べる。
     pub fn tie_ref_to(&self, eid: enchudb_wal::EntityId, himo: &str, target_eid: enchudb_wal::EntityId) {
+        let hid = self.himo_id(himo)
+            .unwrap_or_else(|| panic!("himo '{}' not defined", himo)) as u16;
+        self.tie_ref_to_by_id(eid, hid, target_eid);
+    }
+
+    /// `tie_ref_to` の himo_id 直指定版。 hot path 用。
+    pub fn tie_ref_to_by_id(&self, eid: enchudb_wal::EntityId, himo_id: u16, target_eid: enchudb_wal::EntityId) {
         self.check_writable();
         let eid = enchudb_wal::eid_local(eid);
         let target_eid = enchudb_wal::eid_local(target_eid);
         assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
-        let hid = self.himo_id(himo)
-            .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
-        debug_assert!(self.himo_types[hid] == HimoType::Ref || self.himo_types[hid] == HimoType::Number, "tie_ref_to on non-Ref himo '{}'", himo);
+        let hid = himo_id as usize;
+        debug_assert!(hid < self.himos.len(),
+            "himo_id {} out of range (max {})", himo_id, self.himos.len());
+        debug_assert!(
+            self.himo_types[hid] == HimoType::Ref || self.himo_types[hid] == HimoType::Number,
+            "tie_ref_to_by_id on non-Ref himo_id {}", himo_id,
+        );
         self.record_undo(eid, hid);
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, target_eid);
         self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), target_eid);
         if let Some(wal) = self.wal.as_ref() {
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), eid);
-            let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id: hid as u16, value: target_eid });
+            let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id, value: target_eid });
         }
     }
 
     // ──── untie ────
 
     pub fn untie(&self, eid: enchudb_wal::EntityId, himo: &str) {
+        if let Some(hid) = self.himo_id(himo) {
+            self.untie_by_id(eid, hid as u16);
+        }
+    }
+
+    /// `untie` の himo_id 直指定版。 未定義の himo_id (= range 外) は debug_assert で
+    /// panic、 release では silently no-op (string 版が未定義 himo を no-op 扱いするのと
+    /// 整合)。
+    pub fn untie_by_id(&self, eid: enchudb_wal::EntityId, himo_id: u16) {
         self.check_writable();
         let eid = enchudb_wal::eid_local(eid);
-        if let Some(hid) = self.himo_id(himo) {
-            self.record_undo(eid, hid);
-            let old_val = self.himos[hid].get_value(eid);
-            self.himos[hid].remove(eid);
-            if let Some(ov) = old_val {
-                self.apply_view_delta_internal(eid, hid, ov, u32::MAX);
-            }
-            if let Some(wal) = self.wal.as_ref() {
-                let wal_eid = enchudb_wal::make_eid(wal.peer_id(), eid);
-                let _ = wal.append(enchudb_wal::wal::WalOp::Untie { eid: wal_eid, himo_id: hid as u16 });
-            }
+        let hid = himo_id as usize;
+        debug_assert!(hid < self.himos.len(),
+            "himo_id {} out of range (max {})", himo_id, self.himos.len());
+        if hid >= self.himos.len() { return; }
+        self.record_undo(eid, hid);
+        let old_val = self.himos[hid].get_value(eid);
+        self.himos[hid].remove(eid);
+        if let Some(ov) = old_val {
+            self.apply_view_delta_internal(eid, hid, ov, u32::MAX);
+        }
+        if let Some(wal) = self.wal.as_ref() {
+            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), eid);
+            let _ = wal.append(enchudb_wal::wal::WalOp::Untie { eid: wal_eid, himo_id });
         }
     }
 
@@ -3461,15 +3503,24 @@ impl Engine {
     /// WAL が有効な場合: tie_async は WAL append (memcpy) → WriteQueue push の順で実行する。
     /// WAL append は `.wal` ファイルに memcpy 1 回、100ns オーダー。hot path で fsync しない。
     pub fn tie_async(&self, eid: enchudb_wal::EntityId, himo: &str, value: u32) {
+        let hid = self.himo_id(himo)
+            .unwrap_or_else(|| panic!("himo '{}' not defined", himo)) as u16;
+        self.tie_async_by_id(eid, hid, value);
+    }
+
+    /// `tie_async` の himo_id 直指定版。 SNS の post / like 投入のように row/sec が KO
+    /// 単位の hot path 用 (per-call の `himo_id(&str)` HashMap lookup を消す)。
+    /// 起動時に `himo_id(&str)` で u16 を 1 回引いて cache し、 hot loop で繰り返し使う想定。
+    pub fn tie_async_by_id(&self, eid: enchudb_wal::EntityId, himo_id: u16, value: u32) {
         use std::sync::atomic::Ordering;
         self.check_writable();
         let local = enchudb_wal::eid_local(eid);
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
-        let hid = self.himo_id(himo)
-            .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
+        debug_assert!((himo_id as usize) < self.himos.len(),
+            "himo_id {} out of range (max {})", himo_id, self.himos.len());
         if let Some(wal) = self.wal.as_ref() {
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
-            let rec = enchudb_wal::wal::WalRecord::Tie { eid: wal_eid, himo_id: hid as u16, value };
+            let rec = enchudb_wal::wal::WalRecord::Tie { eid: wal_eid, himo_id, value };
             if let Some(wq) = self.wal_record_queue.as_ref() {
                 wq.push(rec);
             } else {
@@ -3478,7 +3529,7 @@ impl Engine {
         }
         let q = self.write_queue.as_ref()
             .expect("tie_async requires create_concurrent or concurrentize");
-        q.push(crate::write_queue::Op::Tie { eid: local, himo_id: hid as u16, value });
+        q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value });
         self.push_count.fetch_add(1, Ordering::Release);
     }
 
@@ -3493,23 +3544,31 @@ impl Engine {
     ///
     /// `Engine::tie_text` の &self 版。`tie_async` と異なり text を sync 対象に乗せる。
     pub fn tie_text_async(&self, eid: enchudb_wal::EntityId, himo: &str, value: &str) {
+        let hid = self.himo_id(himo)
+            .unwrap_or_else(|| panic!("himo '{}' not defined", himo)) as u16;
+        self.tie_text_async_by_id(eid, hid, value);
+    }
+
+    /// `tie_text_async` の himo_id 直指定版。 text 本体は vocab 経由なので value はそのまま。
+    pub fn tie_text_async_by_id(&self, eid: enchudb_wal::EntityId, himo_id: u16, value: &str) {
         use std::sync::atomic::Ordering;
         self.check_writable();
         let local = enchudb_wal::eid_local(eid);
-        let hid = self.himo_id(himo)
-            .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
+        let hid = himo_id as usize;
+        debug_assert!(hid < self.himos.len(),
+            "himo_id {} out of range (max {})", himo_id, self.himos.len());
         // Tag は dedupe、Leaf は常に新規 id。
         let vid = match self.himo_types[hid] {
             HimoType::Tag => self.vocab.get_or_insert(value.as_bytes()),
             HimoType::Leaf => self.vocab.insert(value.as_bytes()),
-            ht => panic!("tie_text_async on non-text himo '{}': {:?}", himo, ht),
+            ht => panic!("tie_text_async_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
         assert!(vid < u32::MAX, "vocab vid must be < u32::MAX (sentinel reserved)");
         if let Some(wal) = self.wal.as_ref() {
             // Vocab op を先に(sync の receiver 側で Tie より先に mapping が張られるよう)
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
             let vocab_rec = enchudb_wal::wal::WalRecord::Vocab { vid, bytes: value.as_bytes().to_vec() };
-            let tie_rec = enchudb_wal::wal::WalRecord::Tie { eid: wal_eid, himo_id: hid as u16, value: vid };
+            let tie_rec = enchudb_wal::wal::WalRecord::Tie { eid: wal_eid, himo_id, value: vid };
             if let Some(wq) = self.wal_record_queue.as_ref() {
                 // Vocab → Tie の順を保つため同一 thread から連続 push
                 wq.push(vocab_rec);
@@ -3521,7 +3580,7 @@ impl Engine {
         }
         let q = self.write_queue.as_ref()
             .expect("tie_text_async requires create_concurrent or concurrentize");
-        q.push(crate::write_queue::Op::Tie { eid: local, himo_id: hid as u16, value: vid });
+        q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value: vid });
         self.push_count.fetch_add(1, Ordering::Release);
     }
 
@@ -3531,17 +3590,24 @@ impl Engine {
     /// 指す ref として再構成される。cross-peer ref (peer A が peer B の entity を指す)は
     /// 現状未対応 (Ref 用 WAL op を別途用意する必要あり、v34 以降)。
     pub fn tie_ref_async(&self, eid: enchudb_wal::EntityId, himo: &str, target_eid: enchudb_wal::EntityId) {
+        let hid = self.himo_id(himo)
+            .unwrap_or_else(|| panic!("himo '{}' not defined", himo)) as u16;
+        self.tie_ref_async_by_id(eid, hid, target_eid);
+    }
+
+    /// `tie_ref_async` の himo_id 直指定版。
+    pub fn tie_ref_async_by_id(&self, eid: enchudb_wal::EntityId, himo_id: u16, target_eid: enchudb_wal::EntityId) {
         use std::sync::atomic::Ordering;
         self.check_writable();
         let local = enchudb_wal::eid_local(eid);
         let target_local = enchudb_wal::eid_local(target_eid);
         assert!(target_local < u32::MAX, "target_local must be < u32::MAX");
-        let hid = self.himo_id(himo)
-            .unwrap_or_else(|| panic!("himo '{}' not defined", himo));
+        debug_assert!((himo_id as usize) < self.himos.len(),
+            "himo_id {} out of range (max {})", himo_id, self.himos.len());
         if let Some(wal) = self.wal.as_ref() {
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
             let rec = enchudb_wal::wal::WalRecord::Tie {
-                eid: wal_eid, himo_id: hid as u16, value: target_local,
+                eid: wal_eid, himo_id, value: target_local,
             };
             if let Some(wq) = self.wal_record_queue.as_ref() {
                 wq.push(rec);
@@ -3552,20 +3618,28 @@ impl Engine {
         let q = self.write_queue.as_ref()
             .expect("tie_ref_async requires create_concurrent or concurrentize");
         q.push(crate::write_queue::Op::Tie {
-            eid: local, himo_id: hid as u16, value: target_local,
+            eid: local, himo_id, value: target_local,
         });
         self.push_count.fetch_add(1, Ordering::Release);
     }
 
     /// 非同期 untie。
     pub fn untie_async(&self, eid: enchudb_wal::EntityId, himo: &str) {
+        let hid = match self.himo_id(himo) { Some(x) => x as u16, None => return };
+        self.untie_async_by_id(eid, hid);
+    }
+
+    /// `untie_async` の himo_id 直指定版。
+    pub fn untie_async_by_id(&self, eid: enchudb_wal::EntityId, himo_id: u16) {
         use std::sync::atomic::Ordering;
         self.check_writable();
         let local = enchudb_wal::eid_local(eid);
-        let hid = match self.himo_id(himo) { Some(x) => x, None => return };
+        debug_assert!((himo_id as usize) < self.himos.len(),
+            "himo_id {} out of range (max {})", himo_id, self.himos.len());
+        if (himo_id as usize) >= self.himos.len() { return; }
         if let Some(wal) = self.wal.as_ref() {
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
-            let rec = enchudb_wal::wal::WalRecord::Untie { eid: wal_eid, himo_id: hid as u16 };
+            let rec = enchudb_wal::wal::WalRecord::Untie { eid: wal_eid, himo_id };
             if let Some(wq) = self.wal_record_queue.as_ref() {
                 wq.push(rec);
             } else {
@@ -3573,7 +3647,7 @@ impl Engine {
             }
         }
         let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
-        q.push(crate::write_queue::Op::Untie { eid: local, himo_id: hid as u16 });
+        q.push(crate::write_queue::Op::Untie { eid: local, himo_id });
         self.push_count.fetch_add(1, Ordering::Release);
     }
 
@@ -5560,6 +5634,87 @@ mod tests {
         h.join().unwrap();
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(format!("{}.lock", p));
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // _by_id API: string 版と等価な結果を返す
+    // ─────────────────────────────────────────────────────────────
+
+    /// `tie_to_by_id` / `tie_text_to_by_id` / `tie_ref_to_by_id` / `untie_by_id`
+    /// が、 同等の string 版と同じ Column/vocab 状態を残すことを確認。
+    #[test]
+    fn by_id_tie_equivalence_sync() {
+        let p_str = tmp("by_id_str");
+        let p_id = tmp("by_id_id");
+        {
+            let eng = Engine::create_standalone(&p_str).unwrap();
+            // string 版経路
+            let mut eng = eng;
+            eng.define_himo("year", HimoType::Number, 100);
+            eng.define_himo("name", HimoType::Tag, 0);
+            eng.define_himo("self_ref", HimoType::Ref, 0);
+            let e = eng.entity();
+            eng.tie_to(e, "year", 2026);
+            eng.tie_text_to(e, "name", "alice");
+            eng.tie_ref_to(e, "self_ref", e);
+            eng.flush().unwrap();
+        }
+        {
+            let eng = Engine::create_standalone(&p_id).unwrap();
+            let mut eng = eng;
+            eng.define_himo("year", HimoType::Number, 100);
+            eng.define_himo("name", HimoType::Tag, 0);
+            eng.define_himo("self_ref", HimoType::Ref, 0);
+            let year_id = eng.himo_id("year").unwrap() as u16;
+            let name_id = eng.himo_id("name").unwrap() as u16;
+            let ref_id = eng.himo_id("self_ref").unwrap() as u16;
+            let e = eng.entity();
+            eng.tie_to_by_id(e, year_id, 2026);
+            eng.tie_text_to_by_id(e, name_id, "alice");
+            eng.tie_ref_to_by_id(e, ref_id, e);
+            eng.flush().unwrap();
+        }
+        // 同じ size、 query 結果も同じ
+        let m_str = std::fs::metadata(&p_str).unwrap().len();
+        let m_id = std::fs::metadata(&p_id).unwrap().len();
+        assert_eq!(m_str, m_id, "file size diverges: str={}, id={}", m_str, m_id);
+
+        let eng_str = Engine::open_standalone(&p_str).unwrap();
+        let eng_id = Engine::open_standalone(&p_id).unwrap();
+        assert_eq!(eng_str.query(&[("year", 2026)]).len(), eng_id.query(&[("year", 2026)]).len());
+        let alice = eng_str.vocab_id("alice").unwrap();
+        assert_eq!(eng_str.pull_raw("name", alice).len(), eng_id.pull_raw("name", alice).len());
+
+        let _ = std::fs::remove_file(&p_str);
+        let _ = std::fs::remove_file(&p_id);
+    }
+
+    #[test]
+    fn by_id_untie_equivalence_sync() {
+        let p = tmp("by_id_untie");
+        let mut eng = Engine::create_standalone(&p).unwrap();
+        eng.define_himo("year", HimoType::Number, 100);
+        let year_id = eng.himo_id("year").unwrap() as u16;
+        let e = eng.entity();
+        eng.tie_to_by_id(e, year_id, 2026);
+        assert_eq!(eng.query(&[("year", 2026)]).len(), 1);
+        eng.untie_by_id(e, year_id);
+        assert_eq!(eng.query(&[("year", 2026)]).len(), 0);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    #[should_panic]
+    fn by_id_out_of_range_panics() {
+        let p = tmp("by_id_oor");
+        let mut eng = Engine::create_standalone(&p).unwrap();
+        eng.define_himo("year", HimoType::Number, 100);
+        let e = eng.entity();
+        // himo_id = 99 だが define されたのは 1 つだけ (id=0)。
+        // debug build では debug_assert! のメッセージ、 release では array indexing の
+        // out-of-bounds panic で落ちる。 どちらでも panic することだけ確認。
+        eng.tie_to_by_id(e, 99, 0);
+        let _ = std::fs::remove_file(&p);
     }
 
     /// growable backing で作った DB を open_standalone で再オープン
