@@ -166,6 +166,19 @@ impl HimoStore {
         self.cyl.read().unwrap().slice_one(value).to_vec()
     }
 
+    /// 値が tie された全 entity を Vec<u32> で返す (= column 非ゼロ走査)。
+    /// O(next_eid) で重い。 schema の `all()` 経由など、 「table の任意 column を持つ
+    /// 全 row」 を取りたい時に使う想定。
+    pub fn entities_with_value(&self) -> Vec<u32> {
+        let count = self.col().count();
+        let mut result = Vec::new();
+        for eid in 0..count {
+            let stored = u32::from_le_bytes(self.col().get(eid).try_into().unwrap());
+            if stored != 0 { result.push(eid); }
+        }
+        result
+    }
+
     /// 同上だが長さだけ。プランナー用。
     pub fn slice_len(&self, value: u32) -> usize {
         self.cyl.read().unwrap().slice_one(value).len()

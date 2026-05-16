@@ -2262,6 +2262,25 @@ impl Engine {
         self.himos[hid].get_value(eid)
     }
 
+    /// `get` の bindings 版。 schema 等で `himo_id` を起動時に pre-resolve した hot path 用。
+    /// 名前 lookup (= himo_names の線形検索) が無くなるので point lookup が最速。
+    pub fn get_by_id(&self, eid: enchudb_wal::EntityId, hid: u16) -> Option<u32> {
+        let eid = enchudb_wal::eid_local(eid);
+        self.himos.get(hid as usize)?.get_value(eid)
+    }
+
+    /// 指定 himo に値が tie された **全** entity を列挙。 O(next_eid) で重い。
+    /// schema layer の `Query::all()` のように「table の任意 column を持つ row」 を
+    /// 列挙するための代表 column 経由で使う想定。
+    pub fn entities_with_himo(&self, hid: u16) -> Vec<enchudb_wal::EntityId> {
+        let Some(hs) = self.himos.get(hid as usize) else { return Vec::new(); };
+        let peer = self.peer_id();
+        hs.entities_with_value()
+            .into_iter()
+            .map(|e| enchudb_wal::make_eid(peer, e))
+            .collect()
+    }
+
     /// 指定 entity 群の紐値を合計
     pub fn sum(&self, himo: &str, eids: &[enchudb_wal::EntityId]) -> u64 {
         let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
@@ -2979,8 +2998,15 @@ impl Engine {
                 hs.has_bitmaps() && val <= hs.max_values && hs.delta_is_empty()
             });
 
+        // bitmap AND は N 全件 word AND なので O(entities/64)。
+        // cardinality 不均衡 (= 最小 slice が全体に対して十分小さい) な場合は
+        // column_filter (pivot + filter) の方が速い。 目安: 最小 slice が
+        // entity 全体の 1/8 未満なら column_filter。
         if all_bitmap {
-            return self.query_bitmap_and(&conds);
+            let total = self.entities.next_eid() as usize;
+            if total == 0 || min_slice_len * 8 >= total {
+                return self.query_bitmap_and(&conds);
+            }
         }
 
         // Column直読みフィルタ（Columnは常に最新なのでdelta不要）
@@ -3015,11 +3041,16 @@ impl Engine {
 
     /// Column直読みフィルタ（delta 補正付き）
     fn query_column_filter(&self, conds: &[(usize, u32)]) -> Vec<u32> {
+        let total = self.entities.next_eid() as usize;
+        // 各 cond の slice_len を事前計算 (per-eid 呼ばないように外出し)
+        let slice_lens: Vec<usize> = conds.iter()
+            .map(|&(idx, val)| self.himos[idx].slice_len(val))
+            .collect();
+
         // pivot: 最小スライスを選ぶ
         let mut best = 0;
         let mut best_len = usize::MAX;
-        for (i, &(idx, val)) in conds.iter().enumerate() {
-            let len = self.himos[idx].slice_len(val);
+        for (i, &len) in slice_lens.iter().enumerate() {
             if len < best_len { best_len = len; best = i; }
         }
 
@@ -3028,12 +3059,14 @@ impl Engine {
 
         let candidates = hs.pull(pivot_val);
 
-        // 残りの条件を Column 直読みでフィルタ（Column は常に最新）
+        // 残りの条件を Column 直読みでフィルタ（Column は常に最新）。
+        // 全件相当の cond (e.g. schema layer の table marker) は always-true として skip。
         let mut result = Vec::with_capacity(candidates.len());
         for &eid in &candidates {
             let mut pass = true;
             for (i, &(idx, val)) in conds.iter().enumerate() {
                 if i == best { continue; }
+                if slice_lens[i] >= total { continue; } // 全件 → 確実に true
                 if !self.himos[idx].value_eq(eid, val) { pass = false; break; }
             }
             if pass { result.push(eid); }

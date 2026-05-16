@@ -1,16 +1,16 @@
 # enchudb-schema
 
-EnchuDB の **declarator + bindings** 層。 仮想 2D テーブル (= N 個の紐の束) を declare して `build()` すると、 col 名 → himo_id / table 名 → table_vid が pre-resolve され、 schema は DB ファイル内に永続化される。
+EnchuDB の **declarator + bindings** 層。 「table = 紐の束 declaration」 を `build()` すると、 col 名 → himo_id が pre-resolve され、 schema は DB ファイル内に永続化される。 column 名は `{table}.{col}` で内部 prefix されるので、 table 間の column 名衝突は自然に分離される。 row 識別用の marker convention は **存在しない** — 「table の row」 = 「その table が declare した column を 1 つ以上 tie してる entity」、 それだけ。
 
-runtime hot path (高頻度 writer / reader) は schema 層を経由せず、 **build 時に取り出した bindings (`himo_id` u16 + `table_vid` u32) を engine 直叩き** (`tie_*_by_id` / `query_by_id`) する設計。 schema の `commit` / `find` は declarative DSL で convenience 用途 (REPL / 低頻度 / 試作)。
+runtime hot path (高頻度 writer / reader) は schema 層を経由せず、 **build 時に取り出した bindings (`himo_id` u16) を engine 直叩き** (`tie_*_by_id` / `query_by_id`) する設計。 schema の `commit` / `find` は declarative DSL で convenience 用途 (REPL / 低頻度 / 試作)。
 
 SQL crate (`enchudb-sql`) はこの schema 層の上に乗る parser。
 
 ## なにこれ
 
-- `Database::table(...).column(...).primary_key(...).build()` で **仮想 2D テーブル** を宣言
-- `build()` 時に column → himo_id / table → table_vid を pre-resolve
-- bindings 取り出し: `Table::himo_id(col)`, `Table::table_vid()`, `Database::marker_himo_id()`
+- `Database::table(...).column(...).primary_key(...).build()` で **紐の束** を宣言
+- `build()` 時に col 名 → himo_id を pre-resolve (内部 himo 名は `{table}.{col}` で衝突回避)
+- bindings 取り出し: `Table::himo_id(col)` のみ。 row 識別 marker は存在しない
 - convenience API: fluent な insert / where / find / entity().set() / delete (declarative、 低頻度向け)
 - relation (Ref 型 col) を `ref_to(col, "to_table")` で declare → 逆引き O(1)
 - schema は DB ファイル内に永続化 (reopen で自動復元、 himo_id も再 resolve)
@@ -39,7 +39,7 @@ use enchudb_schema::{Database, ColumnType};
 
 let mut db = Database::create("/tmp/app.db")?;
 
-// schema declare — build() 時に himo_id / table_vid 全部 pre-resolve
+// schema declare — build() 時に col 名 → himo_id を pre-resolve
 let _ = db.table("users")
     .integer("id")
     .text("name")
@@ -55,9 +55,7 @@ let _ = db.table("users")
 
 ```rust
 let users = db.get_table("users").unwrap();
-// bindings 抽出 (起動時 1 回)
-let marker_hid = db.marker_himo_id();
-let table_vid  = users.table_vid();
+// bindings 抽出 (起動時 1 回): column 名 → himo_id だけで足りる
 let name_hid   = users.himo_id("name").unwrap();
 let age_hid    = users.himo_id("age").unwrap();
 let city_hid   = users.himo_id("city").unwrap();
@@ -66,13 +64,16 @@ drop(users);
 // runtime: bindings + engine 直叩き
 let eng = db.arc_engine();
 let e = eng.entity();
-eng.tie_to_by_id(e, marker_hid, table_vid);        // 「user 所属」 marker
 eng.tie_text_to_by_id(e, name_hid, "Alice");
 eng.tie_to_by_id(e, age_hid, 30);
 eng.tie_text_to_by_id(e, city_hid, "Tokyo");
 
-// query も engine 直叩き
-let tokyo_30 = eng.query_by_id(&[(marker_hid, table_vid), (age_hid, 30), (city_hid, eng.vocab_id("Tokyo").unwrap())]);
+// query も engine 直叩き — table を絞る marker cond は存在しない
+// (column 名 prefix で他 table と分離されてるので、 該当 himo を持つ entity = この table の row)
+let tokyo_30 = eng.query_by_id(&[
+    (age_hid, 30),
+    (city_hid, eng.vocab_id("Tokyo").unwrap()),
+]);
 ```
 
 ## convenience API: declarative CRUD (低頻度 / REPL / 試作)
@@ -239,12 +240,11 @@ crash 時は次回 `open_with_wal` で WAL から recover、 commit 済み write
 
 | 項目 | 解決タイミング |
 |---|---|
-| col 名 → himo_id (u16) | `build()` で 1 回、 以降 cache hit |
-| table 名 → vocab_id (u32) | `build()` で intern |
+| col 名 → himo_id (u16) | `build()` で 1 回、 以降 cache hit (内部 himo 名は `{table}.{col}`) |
 | himo の type 検証 | `build()` (型不一致は build 時 error) |
 | relation 先 table の存在 | `build()` |
 
-これにより、 query 時の string lookup は **完全に skip**。 engine 側で `query_by_id(&[(u16, u32)])` を直で呼ぶ。
+これにより、 query 時の string lookup は **完全に skip**。 engine 側で `query_by_id(&[(u16, u32)])` を直で呼ぶ。 table を絞る marker cond は不要 (column 名 prefix で他 table と分離済み)。
 
 ## 速度
 

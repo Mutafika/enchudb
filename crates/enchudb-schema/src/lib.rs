@@ -65,7 +65,11 @@ use enchudb_engine::{Engine, HimoType};
 use enchudb_wal::EntityId;
 use std::sync::Arc;
 
-const TABLE_MARKER_HIMO: &str = "__enchu_table";
+// 内部 marker: schema 自身の persistence entity を識別するためだけに使う。
+// row 識別とは無関係 (= row tie / query cond には一切登場しない)。
+// table = 紐の束 declaration、 row 識別は column 名 prefix (`{table}.{col}` himo)
+// だけで足りる、 という設計が前提。
+const SCHEMA_META_HIMO: &str = "__enchu_schema_meta__";
 const SCHEMA_MARKER: &str = "__enchu_schema_v1__";
 const SCHEMA_BLOB_HIMO: &str = "__enchu_schema_blob";
 
@@ -250,9 +254,9 @@ impl Database {
     }
 
     fn wrap_new(mut eng: Engine) -> Result<Self, SchemaError> {
-        eng.define_himo(TABLE_MARKER_HIMO, HimoType::Tag, 0);
+        eng.define_himo(SCHEMA_META_HIMO, HimoType::Tag, 0);
         eng.define_himo(SCHEMA_BLOB_HIMO, HimoType::Tag, 0);
-        let marker_himo_id = eng.himo_id(TABLE_MARKER_HIMO)
+        let marker_himo_id = eng.himo_id(SCHEMA_META_HIMO)
             .ok_or_else(|| SchemaError::Internal("marker himo id".into()))? as u16;
         Ok(Self {
             eng: Arc::new(eng),
@@ -272,7 +276,7 @@ impl Database {
         let eng = Engine::open_readonly(path).map_err(|e| SchemaError::Io(e.to_string()))?;
         // readonly では define_himo (= 書き込み) を呼ばない。 既存 DB なら
         // marker himo は create 時に登録済みのはず。
-        let marker_himo_id = eng.himo_id(TABLE_MARKER_HIMO)
+        let marker_himo_id = eng.himo_id(SCHEMA_META_HIMO)
             .ok_or_else(|| SchemaError::Internal(
                 "marker himo not present — open_readonly requires a DB built via Database::create".into()
             ))? as u16;
@@ -288,9 +292,9 @@ impl Database {
 
     pub fn open(path: &str) -> Result<Self, SchemaError> {
         let mut eng = Engine::open_standalone(path).map_err(|e| SchemaError::Io(e.to_string()))?;
-        eng.define_himo(TABLE_MARKER_HIMO, HimoType::Tag, 0);
+        eng.define_himo(SCHEMA_META_HIMO, HimoType::Tag, 0);
         eng.define_himo(SCHEMA_BLOB_HIMO, HimoType::Tag, 0);
-        let marker_himo_id = eng.himo_id(TABLE_MARKER_HIMO)
+        let marker_himo_id = eng.himo_id(SCHEMA_META_HIMO)
             .ok_or_else(|| SchemaError::Internal("marker himo id".into()))? as u16;
         let mut db = Self {
             eng: Arc::new(eng),
@@ -316,7 +320,7 @@ impl Database {
         // marker / schema blob himo は再 open 時に engine が既に保持 (recover 済み)。
         // ただし新規 DB なら未定義の可能性があるので、 Arc::get_mut で初回だけ define。
         // open_concurrent_with_wal 後の Arc count = 1 (consumer は raw ptr で保持)。
-        let marker_himo_id = match arc_eng.himo_id(TABLE_MARKER_HIMO) {
+        let marker_himo_id = match arc_eng.himo_id(SCHEMA_META_HIMO) {
             Some(idx) => idx as u16,
             None => {
                 return Err(SchemaError::Internal(
@@ -480,13 +484,6 @@ impl Database {
         Ok(())
     }
 
-    /// schema 全体の table marker himo_id (`__enchu_table` 用)。 全 table 共有で、
-    /// `query_by_id` で「ある table に属する entity」 を絞る最初の条件項に使う:
-    /// `engine.query_by_id(&[(db.marker_himo_id(), posts.table_vid()), ...])`
-    pub fn marker_himo_id(&self) -> u16 {
-        self.marker_himo_id
-    }
-
     /// 全 table を列挙。
     pub fn list_tables(&self) -> Vec<TableInfo> {
         self.tables.iter().map(|t| TableInfo {
@@ -523,20 +520,20 @@ impl Database {
     fn ensure_schema_entity(&self) -> EntityId {
         self.eng.rebuild();
         if let Some(vid) = self.eng.vocab_id(SCHEMA_MARKER) {
-            let eids = self.eng.pull_raw(TABLE_MARKER_HIMO, vid);
+            let eids = self.eng.pull_raw(SCHEMA_META_HIMO, vid);
             if let Some(&eid) = eids.first() { return eid; }
         }
         let eid = self.eng.entity();
         // marker himo は wrap_new / open / open_with_wal で必ず define 済み。
         // tie_text_to は &self なので Arc<Engine> でも呼べる。
-        self.eng.tie_text_to(eid, TABLE_MARKER_HIMO, SCHEMA_MARKER);
+        self.eng.tie_text_to(eid, SCHEMA_META_HIMO, SCHEMA_MARKER);
         eid
     }
 
     fn load_schema(&mut self) -> Result<(), SchemaError> {
         let Some(vid) = self.eng.vocab_id(SCHEMA_MARKER) else { return Ok(()); };
         self.eng.rebuild();
-        let eids = self.eng.pull_raw(TABLE_MARKER_HIMO, vid);
+        let eids = self.eng.pull_raw(SCHEMA_META_HIMO, vid);
         let Some(&eid) = eids.first() else { return Ok(()); };
         let blob = match self.eng.get_content(eid, SCHEMA_BLOB_HIMO) {
             Some(b) => b.to_vec(),
@@ -583,7 +580,7 @@ impl Database {
         if let Some(vid) = self.eng.vocab_id(name) { return vid; }
         let tmp = self.eng.entity();
         // tie_text_to は &Engine、 Arc<Engine> でも呼べる。 marker himo は事前 define 済み。
-        self.eng.tie_text_to(tmp, TABLE_MARKER_HIMO, name);
+        self.eng.tie_text_to(tmp, SCHEMA_META_HIMO, name);
         let vid = self.eng.vocab_id(name)
             .expect("vocab_id should exist after tie_text_to");
         self.eng.delete(tmp);
@@ -729,7 +726,6 @@ impl<'a> Table<'a> {
         RowBuilder {
             db: self.db,
             table: self.inner.clone(),
-            marker_himo_id: self.db.marker_himo_id,
             values: Vec::new(),
             replace_on_pk: false,
         }
@@ -786,12 +782,6 @@ impl<'a> Table<'a> {
         self.inner.col(col).map(|c| c.himo_id)
     }
 
-    /// 本 table の table_vid。 `__enchu_table` himo に張る値で、 「この entity は
-    /// 本 table 所属」 を判定する超高速 path に使う。 `query_by_id` の最初の条件項
-    /// `(marker_hid, table_vid)` で使う。
-    pub fn table_vid(&self) -> u32 {
-        self.inner.table_vid
-    }
 }
 
 // ─────────────────────────── RowBuilder ───────────────────────────
@@ -799,7 +789,6 @@ impl<'a> Table<'a> {
 pub struct RowBuilder<'a> {
     db: &'a Database,
     table: Arc<TableInner>,
-    marker_himo_id: u16,
     values: Vec<(String, Value)>,
     replace_on_pk: bool,
 }
@@ -832,8 +821,9 @@ impl<'a> RowBuilder<'a> {
                     let pk_raw = value_to_raw_for_query(eng, pk_col, pk_v)?;
                     if pk_raw != u32::MAX {
                         eng.rebuild();
+                        // pk_col.himo_id は table 名 prefix 済み (`emp.pk_col`) なので
+                        // 他テーブルと衝突しない → marker cond は不要。
                         let found = eng.query_by_id(&[
-                            (self.marker_himo_id, self.table.table_vid),
                             (pk_col.himo_id, pk_raw),
                         ]);
                         target_eid = found.into_iter().next();
@@ -844,12 +834,11 @@ impl<'a> RowBuilder<'a> {
 
         let eid = match target_eid {
             Some(e) => e,
-            None => {
-                let e = eng.entity();
-                eng.tie_text_to(e, TABLE_MARKER_HIMO, &self.table.name);
-                e
-            }
+            None => eng.entity(),
         };
+        // table 識別は column 名 prefix (`emp.foo` himo) で行うので、
+        // 個別 row への marker tie は不要。 query 側も marker cond なしで
+        // 当該 table の column を持つ entity のみ取れる。
 
         for (cd, v) in &resolved {
             tie_value(eng, eid, cd, v)?;
@@ -961,8 +950,9 @@ impl<'a> Query<'a> {
         eng.rebuild();
 
         // 1. Eq / EqText / In を engine 側 query に折り込む。 Range / Cmp は post-filter。
-        let mut eq_conds: Vec<(u16, u32)> = Vec::with_capacity(self.preds.len() + 1);
-        eq_conds.push((self.db.marker_himo_id, self.table.table_vid));
+        // column 名は `{table}.{col}` で prefix されてて他テーブルと共有しない設計
+        // (case 1: column 名空間分離)。 marker cond は不要。
+        let mut eq_conds: Vec<(u16, u32)> = Vec::with_capacity(self.preds.len());
 
         let mut in_pred: Option<(u16, Vec<u32>)> = None;
         let mut range_preds: Vec<(String, u32, u32)> = Vec::new();
@@ -989,8 +979,21 @@ impl<'a> Query<'a> {
         }
         if empty { return Ok(Vec::new()); }
 
-        // 2. base candidates: AND of eq_conds (always includes the table marker)
-        let mut candidates = eng.query_by_id(&eq_conds);
+        // 2. base candidates。 eq_conds が空 = `.all()` 系 → table 所属を表す
+        //    代表 column (PK or first col) で「値が tie された全 entity」 を取る。
+        //    case 1 設計では「table の row」 = 「table の column を 1 つ以上 tie してる entity」、
+        //    厳密には全 column union だが、 代表 column slice で実用上十分。
+        let mut candidates = if eq_conds.is_empty() && in_pred.is_none() {
+            let representative_hid = self.table.pk
+                .or_else(|| if self.table.cols.is_empty() { None } else { Some(0) })
+                .map(|i| self.table.cols[i].himo_id);
+            match representative_hid {
+                Some(hid) => eng.entities_with_himo(hid),
+                None => Vec::new(),
+            }
+        } else {
+            eng.query_by_id(&eq_conds)
+        };
 
         // 3. apply IN as a set-membership filter
         if let Some((h, vs)) = in_pred {
@@ -1399,9 +1402,10 @@ mod tests {
     }
 
     #[test]
-    fn bindings_extract_table_vid_and_himo_id() {
-        // build 時に解決された himo_id / table_vid を bindings 公式 helper 経由で
-        // 取り出せること、 取り出した id で engine 直叩きが動くことを確認。
+    fn bindings_extract_himo_id_and_engine_direct_write() {
+        // build 時に column 名 → himo_id が pre-resolve されてる。
+        // table = 紐の束 declaration なので、 row 識別 marker は存在せず、
+        // 抽出した himo_id だけで engine 直叩き write/read が schema find に揃う。
         let path = tmp("bindings");
         let _ = std::fs::remove_file(&path);
         let mut db = Database::create(&path).unwrap();
@@ -1413,15 +1417,13 @@ mod tests {
             .build()
             .unwrap();
 
-        // bindings 取り出し (build と別 borrow scope に分けて借用エラー回避)
-        let marker_hid = db.marker_himo_id();
-        let (author_hid, year_hid, body_hid, table_vid) = {
+        // bindings 取り出し: column 名 → himo_id だけ
+        let (author_hid, year_hid, body_hid) = {
             let posts = db.get_table("posts").unwrap();
             (
                 posts.himo_id("author").expect("author hid"),
                 posts.himo_id("year").expect("year hid"),
                 posts.himo_id("body").expect("body hid"),
-                posts.table_vid(),
             )
         };
         assert_ne!(author_hid, year_hid);
@@ -1429,11 +1431,10 @@ mod tests {
         // unknown col は None
         assert!(db.get_table("posts").unwrap().himo_id("nope").is_none());
 
-        // engine 直叩き経路で 1 row 書く
+        // engine 直叩き経路で 1 row 書く (marker tie は不要)
         let e = {
             let eng = db.engine();
             let e = eng.entity();
-            eng.tie_to_by_id(e, marker_hid, table_vid);
             eng.tie_text_to_by_id(e, author_hid, "alice");
             eng.tie_to_by_id(e, year_hid, 2026);
             eng.tie_text_to_by_id(e, body_hid, "hello");
