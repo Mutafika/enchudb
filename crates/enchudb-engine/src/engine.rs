@@ -2328,40 +2328,60 @@ impl Engine {
     }
 
     /// GROUP BY + SUM — group_himo の値でグループ化し、sum_himo の値を合計
+    ///
+    /// group 値の cardinality を見て、 dense (= max_values 小) なら Vec 直 index、
+    /// sparse なら HashMap で集計。
     pub fn group_sum(&self, group_himo: &str, sum_himo: &str, eids: &[enchudb_wal::EntityId]) -> Vec<(u32, u64)> {
         let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
         let sid = match self.himo_id(sum_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
         let ss = &self.himos[sid];
-        let mut map: Vec<(u32, u64)> = Vec::new();
-        for &eid in eids {
-            let local = enchudb_wal::eid_local(eid);
-            if let (Some(group), Some(val)) = (gs.get_value(local), ss.get_value(local)) {
-                if let Some(entry) = map.iter_mut().find(|(k, _)| *k == group) {
-                    entry.1 += val as u64;
-                } else {
-                    map.push((group, val as u64));
+        let cap = self.group_dense_cap(gid);
+        if let Some(cap) = cap {
+            let mut sums: Vec<u64> = vec![0; cap];
+            let mut seen: Vec<bool> = vec![false; cap];
+            for &eid in eids {
+                let local = enchudb_wal::eid_local(eid);
+                if let (Some(group), Some(val)) = (gs.get_value(local), ss.get_value(local)) {
+                    let i = group as usize;
+                    sums[i] += val as u64;
+                    seen[i] = true;
                 }
             }
+            (0..cap).filter(|&i| seen[i]).map(|i| (i as u32, sums[i])).collect()
+        } else {
+            let mut map: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+            for &eid in eids {
+                let local = enchudb_wal::eid_local(eid);
+                if let (Some(group), Some(val)) = (gs.get_value(local), ss.get_value(local)) {
+                    *map.entry(group).or_insert(0) += val as u64;
+                }
+            }
+            map.into_iter().collect()
         }
-        map
     }
 
     /// GROUP BY + COUNT — group_himo の値でグループ化し、各グループの entity 数
     pub fn group_count(&self, group_himo: &str, eids: &[enchudb_wal::EntityId]) -> Vec<(u32, u32)> {
         let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
-        let mut map: Vec<(u32, u32)> = Vec::new();
-        for &eid in eids {
-            if let Some(group) = gs.get_value(enchudb_wal::eid_local(eid)) {
-                if let Some(entry) = map.iter_mut().find(|(k, _)| *k == group) {
-                    entry.1 += 1;
-                } else {
-                    map.push((group, 1));
+        if let Some(cap) = self.group_dense_cap(gid) {
+            let mut counts: Vec<u32> = vec![0; cap];
+            for &eid in eids {
+                if let Some(group) = gs.get_value(enchudb_wal::eid_local(eid)) {
+                    counts[group as usize] += 1;
                 }
             }
+            (0..cap).filter(|&i| counts[i] > 0).map(|i| (i as u32, counts[i])).collect()
+        } else {
+            let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+            for &eid in eids {
+                if let Some(group) = gs.get_value(enchudb_wal::eid_local(eid)) {
+                    *map.entry(group).or_insert(0) += 1;
+                }
+            }
+            map.into_iter().collect()
         }
-        map
     }
 
     /// GROUP BY + MIN
@@ -2370,18 +2390,29 @@ impl Engine {
         let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
         let vs = &self.himos[vid];
-        let mut map: Vec<(u32, u32)> = Vec::new();
-        for &eid in eids {
-            let local = enchudb_wal::eid_local(eid);
-            if let (Some(group), Some(val)) = (gs.get_value(local), vs.get_value(local)) {
-                if let Some(entry) = map.iter_mut().find(|(k, _)| *k == group) {
-                    if val < entry.1 { entry.1 = val; }
-                } else {
-                    map.push((group, val));
+        if let Some(cap) = self.group_dense_cap(gid) {
+            let mut mins: Vec<u32> = vec![u32::MAX; cap];
+            let mut seen: Vec<bool> = vec![false; cap];
+            for &eid in eids {
+                let local = enchudb_wal::eid_local(eid);
+                if let (Some(group), Some(val)) = (gs.get_value(local), vs.get_value(local)) {
+                    let i = group as usize;
+                    if val < mins[i] { mins[i] = val; }
+                    seen[i] = true;
                 }
             }
+            (0..cap).filter(|&i| seen[i]).map(|i| (i as u32, mins[i])).collect()
+        } else {
+            let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+            for &eid in eids {
+                let local = enchudb_wal::eid_local(eid);
+                if let (Some(group), Some(val)) = (gs.get_value(local), vs.get_value(local)) {
+                    let entry = map.entry(group).or_insert(u32::MAX);
+                    if val < *entry { *entry = val; }
+                }
+            }
+            map.into_iter().collect()
         }
-        map
     }
 
     /// GROUP BY + MAX
@@ -2390,18 +2421,29 @@ impl Engine {
         let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
         let vs = &self.himos[vid];
-        let mut map: Vec<(u32, u32)> = Vec::new();
-        for &eid in eids {
-            let local = enchudb_wal::eid_local(eid);
-            if let (Some(group), Some(val)) = (gs.get_value(local), vs.get_value(local)) {
-                if let Some(entry) = map.iter_mut().find(|(k, _)| *k == group) {
-                    if val > entry.1 { entry.1 = val; }
-                } else {
-                    map.push((group, val));
+        if let Some(cap) = self.group_dense_cap(gid) {
+            let mut maxs: Vec<u32> = vec![0; cap];
+            let mut seen: Vec<bool> = vec![false; cap];
+            for &eid in eids {
+                let local = enchudb_wal::eid_local(eid);
+                if let (Some(group), Some(val)) = (gs.get_value(local), vs.get_value(local)) {
+                    let i = group as usize;
+                    if val > maxs[i] { maxs[i] = val; }
+                    seen[i] = true;
                 }
             }
+            (0..cap).filter(|&i| seen[i]).map(|i| (i as u32, maxs[i])).collect()
+        } else {
+            let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+            for &eid in eids {
+                let local = enchudb_wal::eid_local(eid);
+                if let (Some(group), Some(val)) = (gs.get_value(local), vs.get_value(local)) {
+                    let entry = map.entry(group).or_insert(0);
+                    if val > *entry { *entry = val; }
+                }
+            }
+            map.into_iter().collect()
         }
-        map
     }
 
     /// GROUP BY + AVG (整数除算)
@@ -2410,19 +2452,38 @@ impl Engine {
         let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
         let vs = &self.himos[vid];
-        let mut acc: Vec<(u32, u64, u64)> = Vec::new(); // (group, sum, count)
-        for &eid in eids {
-            let local = enchudb_wal::eid_local(eid);
-            if let (Some(group), Some(val)) = (gs.get_value(local), vs.get_value(local)) {
-                if let Some(entry) = acc.iter_mut().find(|(k, _, _)| *k == group) {
-                    entry.1 += val as u64;
-                    entry.2 += 1;
-                } else {
-                    acc.push((group, val as u64, 1));
+        if let Some(cap) = self.group_dense_cap(gid) {
+            let mut sums: Vec<u64> = vec![0; cap];
+            let mut cnts: Vec<u64> = vec![0; cap];
+            for &eid in eids {
+                let local = enchudb_wal::eid_local(eid);
+                if let (Some(group), Some(val)) = (gs.get_value(local), vs.get_value(local)) {
+                    let i = group as usize;
+                    sums[i] += val as u64;
+                    cnts[i] += 1;
                 }
             }
+            (0..cap).filter(|&i| cnts[i] > 0).map(|i| (i as u32, sums[i] / cnts[i])).collect()
+        } else {
+            let mut acc: std::collections::HashMap<u32, (u64, u64)> = std::collections::HashMap::new();
+            for &eid in eids {
+                let local = enchudb_wal::eid_local(eid);
+                if let (Some(group), Some(val)) = (gs.get_value(local), vs.get_value(local)) {
+                    let e = acc.entry(group).or_insert((0, 0));
+                    e.0 += val as u64;
+                    e.1 += 1;
+                }
+            }
+            acc.into_iter().map(|(k, (s, n))| (k, s / n)).collect()
         }
-        acc.into_iter().map(|(k, sum, n)| (k, sum / n)).collect()
+    }
+
+    /// group 系の dense path 適用判定。 himo の max_values が小さく定義されていれば
+    /// その値範囲を Vec 直接 index で集計できる。 閾値は 64K (Vec 確保 256KB 以下) まで。
+    fn group_dense_cap(&self, hid: usize) -> Option<usize> {
+        let hs = &self.himos[hid];
+        let cap = hs.max_values as usize;
+        if cap == 0 || cap > 65_536 { None } else { Some(cap) }
     }
 
     /// 値集合の distinct — eids の中で himo に張られた値のユニーク集合
