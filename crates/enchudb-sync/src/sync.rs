@@ -41,6 +41,8 @@ use enchudb_engine::transport::{Transport, WireRecord};
 use enchudb_wal::wal::DecodedOp;
 use enchudb_wal::{Hlc, PeerId};
 
+use crate::subscription::{AllRecords, SubscriptionFilter};
+
 pub struct Syncer {
     engine: Arc<Engine>,
     transport: Arc<dyn Transport>,
@@ -52,6 +54,9 @@ pub struct Syncer {
     cursor_path: std::sync::RwLock<Option<PathBuf>>,
     /// Phase C: true なら署名検証を強制。未署名 or 検証失敗 op は reject。
     require_signature: std::sync::atomic::AtomicBool,
+    /// request4: per-peer subscription filter。 default は `AllRecords` (全送り、
+    /// 旧 `publish_since` の挙動)。 `set_subscription_filter` で差し替え可。
+    subscription_filter: std::sync::RwLock<Arc<dyn SubscriptionFilter>>,
 }
 
 /// 1 回の pull-apply サイクルの結果。
@@ -99,6 +104,7 @@ impl Syncer {
             last_pulled: std::sync::Mutex::new(std::collections::HashMap::new()),
             cursor_path: std::sync::RwLock::new(None),
             require_signature: std::sync::atomic::AtomicBool::new(false),
+            subscription_filter: std::sync::RwLock::new(Arc::new(AllRecords)),
         };
         // HlcStore は engine 内部のメモリ構造で永続化されない。 engine reopen 後は
         // 空状態なので、 attach 時に WAL を walk して LWW state を再構築する。
@@ -184,12 +190,16 @@ impl Syncer {
     }
 
     /// 指定 peer から未取得レコードを 1 回 pull して本体に apply。
+    /// request4: `pull_as(self_peer, from, since)` 経由で broadcast log +
+    /// (from, self_peer) targeted log を両方拾う。 partial sync 対応 transport
+    /// (InMemoryTransport 等) では targeted 経由の per-peer record も受信できる。
     pub fn pull_once(&self, from: PeerId) -> SyncOutcome {
         let since = {
             let guard = self.last_pulled.lock().unwrap();
             guard.get(&from).copied().unwrap_or(Hlc::ZERO)
         };
-        let records = self.transport.pull(from, since);
+        let self_peer = self.engine.peer_id();
+        let records = self.transport.pull_as(self_peer, from, since);
         let outcome = self.apply_records(&records);
 
         // last_pulled を進める(空 pull でも既存のままで OK)。 進んだら disk に保存。
@@ -212,24 +222,77 @@ impl Syncer {
         outcome
     }
 
+    /// request4: subscription filter を差し替える (起動時 1 度設定する想定)。
+    /// default は `AllRecords` (全送り、 旧 `publish_since` の挙動 = SaaS 用)。
+    /// SNS partial sync の caller は自前 struct で `impl SubscriptionFilter` する。
+    pub fn set_subscription_filter(&self, filter: Arc<dyn SubscriptionFilter>) {
+        *self.subscription_filter.write().unwrap() = filter;
+    }
+
     /// 自 peer の commit 済み ops を transport に publish。
     /// `iter_committed` は checkpoint を無視して WAL 全体を列挙するので、
     /// 既に本体に apply 済みでも WAL ring buffer 内にあれば拾える。
-    /// 戻り値は publish したレコード数。
+    /// 戻り値は publish したレコード数 (重複カウントしない、 最終 broadcast/peer 別
+    /// のいずれか単一経路で配信した数)。
+    ///
+    /// request4: transport が `known_peers()` を返すなら **per-peer 経路** (=
+    /// `publish_since_for_peer` を全 peer に対して呼ぶ) で配信。 known_peers が
+    /// 空なら **broadcast 経路** (= 旧 `publish_since` の挙動) にフォールバック。
+    /// = 既存 caller (broadcast 前提) は API 不変で動く。
     pub fn publish_since(&self, since: Hlc) -> usize {
+        let peers = self.transport.known_peers();
+        if peers.is_empty() {
+            // backward compat: known_peers 未実装 transport (HTTP/WS push 等) は
+            // 旧 broadcast 経路。 filter は無視される (broadcast に per-target
+            // filter は意味が無いため、 default `AllRecords` のときと等価)。
+            let wal = match self.engine.wal_arc() {
+                Some(w) => w,
+                None => return 0,
+            };
+            let recs = wal.iter_committed();
+            let self_peer = self.engine.peer_id();
+            let filtered: Vec<WireRecord> = recs
+                .into_iter()
+                .filter(|r| r.hlc > since)
+                .map(|r| r.into())
+                .collect();
+            let count = filtered.len();
+            self.transport.publish(self_peer, filtered);
+            return count;
+        }
+        let self_peer = self.engine.peer_id();
+        let mut total = 0usize;
+        for p in peers {
+            if p == self_peer { continue; } // 自分には送らない
+            total += self.publish_since_for_peer(p, since);
+        }
+        total
+    }
+
+    /// request4: `target_peer` 限定で publish。 `SubscriptionFilter::should_send`
+    /// で per-peer に絞った record のみを `transport.publish_to(self_peer,
+    /// target_peer, ...)` で送る。 戻り値は実際に送った record 数。
+    ///
+    /// SaaS の full sync (= AllRecords filter) では `since` フィルタ後の全 record
+    /// を target に送る (= 旧 broadcast 経路の挙動を per-peer 化したもの)。
+    /// SNS partial sync では `SubscriptionFilter::should_send` で「target が
+    /// 関心ある record か」 を判定してから送る。
+    pub fn publish_since_for_peer(&self, target_peer: PeerId, since: Hlc) -> usize {
         let wal = match self.engine.wal_arc() {
             Some(w) => w,
             None => return 0,
         };
         let recs = wal.iter_committed();
-        let peer = self.engine.peer_id();
+        let self_peer = self.engine.peer_id();
+        let filter = self.subscription_filter.read().unwrap().clone();
         let filtered: Vec<WireRecord> = recs
             .into_iter()
             .filter(|r| r.hlc > since)
-            .map(|r| r.into())
+            .map(WireRecord::from)
+            .filter(|r| filter.should_send(target_peer, r))
             .collect();
         let count = filtered.len();
-        self.transport.publish(peer, filtered);
+        self.transport.publish_to(self_peer, target_peer, filtered);
         count
     }
 
@@ -436,6 +499,101 @@ mod tests {
         let out2 = syncer.pull_once(2);
         assert_eq!(out2.received, 1);
         assert_eq!(out2.applied, 1);
+
+        let _ = std::fs::remove_file(path_a);
+    }
+
+    // ──────────────── request4: SubscriptionFilter / per-peer publish ────────────────
+
+    /// SubscriptionFilter 未設定 (= default AllRecords) で、 publish_since が
+    /// 旧 broadcast 経路と等価に動く事を確認。
+    #[test]
+    fn default_filter_is_backward_compatible() {
+        let path_a = "/tmp/enchudb_sync_default_filter.db";
+        let eng_a = new_eng(path_a, 1);
+        let transport = Arc::new(InMemoryTransport::new());
+        let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
+
+        // peer 2/3 を transport に register (known_peers 経由で per-peer publish される)
+        transport.register_peer(2);
+        transport.register_peer(3);
+
+        // peer 1 で書き込み → publish_since で他 peer に配信
+        let e = eng_a.entity();
+        eng_a.tie_async(e, "val", 42);
+        eng_a.flush_writes();
+        eng_a.wal_sync().unwrap();
+        let count = syncer.publish_since(Hlc::ZERO);
+        assert!(count > 0, "should publish at least the tie record");
+
+        // peer 2 と peer 3 が pull_as すると同じ records を受信できる (default filter)
+        let recs_2 = transport.pull_as(2, 1, Hlc::ZERO);
+        let recs_3 = transport.pull_as(3, 1, Hlc::ZERO);
+        assert_eq!(recs_2.len(), recs_3.len(), "default filter should send same set to all peers");
+        assert!(recs_2.iter().any(|r| matches!(r.op, DecodedOp::Tie { value: 42, .. })));
+
+        let _ = std::fs::remove_file(path_a);
+    }
+
+    /// 自前 SubscriptionFilter で peer 別に絞った配信ができる事を確認。
+    #[test]
+    fn custom_filter_can_partition_records_per_peer() {
+        use crate::subscription::SubscriptionFilter;
+
+        let path_a = "/tmp/enchudb_sync_partition_filter.db";
+        let eng_a = new_eng(path_a, 1);
+        let transport = Arc::new(InMemoryTransport::new());
+        let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
+
+        transport.register_peer(2);
+        transport.register_peer(3);
+
+        // 「peer 2 にだけ送る」 filter
+        struct OnlyToPeer2;
+        impl SubscriptionFilter for OnlyToPeer2 {
+            fn should_send(&self, target: PeerId, _r: &WireRecord) -> bool {
+                target == 2
+            }
+        }
+        syncer.set_subscription_filter(Arc::new(OnlyToPeer2));
+
+        let e = eng_a.entity();
+        eng_a.tie_async(e, "val", 77);
+        eng_a.flush_writes();
+        eng_a.wal_sync().unwrap();
+        syncer.publish_since(Hlc::ZERO);
+
+        let recs_2 = transport.pull_as(2, 1, Hlc::ZERO);
+        let recs_3 = transport.pull_as(3, 1, Hlc::ZERO);
+        // peer 2 は受信、 peer 3 は 0 件
+        assert!(recs_2.iter().any(|r| matches!(r.op, DecodedOp::Tie { value: 77, .. })));
+        assert!(recs_3.iter().all(|r| !matches!(r.op, DecodedOp::Tie { value: 77, .. })),
+            "peer 3 should not see value=77 (filter excludes)");
+
+        let _ = std::fs::remove_file(path_a);
+    }
+
+    /// publish_since_for_peer を直接呼んだ場合の動作確認。
+    #[test]
+    fn publish_since_for_peer_targets_one_peer_only() {
+        let path_a = "/tmp/enchudb_sync_pubsincefor.db";
+        let eng_a = new_eng(path_a, 1);
+        let transport = Arc::new(InMemoryTransport::new());
+        let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
+
+        let e = eng_a.entity();
+        eng_a.tie_async(e, "val", 99);
+        eng_a.flush_writes();
+        eng_a.wal_sync().unwrap();
+
+        // peer 5 のみに publish (filter default AllRecords)
+        let n = syncer.publish_since_for_peer(5, Hlc::ZERO);
+        assert!(n > 0);
+
+        let recs_5 = transport.pull_as(5, 1, Hlc::ZERO);
+        let recs_6 = transport.pull_as(6, 1, Hlc::ZERO);
+        assert!(recs_5.iter().any(|r| matches!(r.op, DecodedOp::Tie { value: 99, .. })));
+        assert!(recs_6.iter().all(|r| !matches!(r.op, DecodedOp::Tie { value: 99, .. })));
 
         let _ = std::fs::remove_file(path_a);
     }

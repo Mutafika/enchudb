@@ -300,24 +300,69 @@ pub trait Transport: Send + Sync {
     /// 自 peer の commit 済みレコードを broadcast(publish 相当)。
     /// Phase B InMemoryTransport では「共有 log に append する」だけ。
     fn publish(&self, peer: PeerId, records: Vec<WireRecord>);
+
+    /// `from` peer から **指定 `to` peer のみ** に publish (request4 partial sync 用)。
+    /// `SubscriptionFilter` で peer 別に絞った record を届けるための single-target
+    /// 経路。 default 実装は `publish` (broadcast) にフォールバック — 既存 transport
+    /// は何もしなくても backward compatible に動くが、 partial sync を機能させたい
+    /// transport (HTTP/WS push) は **必ず override** すること (broadcast fallback だと
+    /// per-peer filter が無視される)。
+    fn publish_to(&self, from: PeerId, _to: PeerId, records: Vec<WireRecord>) {
+        self.publish(from, records);
+    }
+
+    /// `to` peer 視点で `from` peer から HLC `since` 以降の records を pull
+    /// (request4 partial sync 用)。 broadcast log + (from, to) targeted log を
+    /// merge して返す想定。 default は `pull(from, since)` フォールバック (=
+    /// partial sync 非対応 transport では broadcast log のみ)。
+    fn pull_as(&self, _to: PeerId, from: PeerId, since: Hlc) -> Vec<WireRecord> {
+        self.pull(from, since)
+    }
+
+    /// 現在この transport が観測している peer 一覧 (request4 partial sync 用)。
+    /// `Syncer::publish_since` から「全 peer に per-peer publish する」 ために
+    /// 使う。 default 実装は空 — `Syncer::publish_since` 側は空が返ったら
+    /// broadcast 経路 (`publish`) にフォールバックする (= 旧挙動 backward compat)。
+    fn known_peers(&self) -> Vec<PeerId> {
+        Vec::new()
+    }
 }
 
 /// テスト用: プロセス内で peer 間の WAL を共有する。
 ///
 /// peer ごとに `(ordered log of WireRecord)` を持つ。HLC 昇順で入れる想定。
+///
+/// request4: partial sync 対応 — 「from peer → to peer」 で per-target log を
+/// 持つ場合のために `targeted` field を別途持つ。 `publish_to(from, to, recs)`
+/// は `targeted[(from, to)]` に追記 (broadcast の `inner[from]` とは独立)。
+/// `pull(from, since)` は両方の log を merge して返す (= subscriber は broadcast
+/// も targeted も両方受信できる)。
 #[derive(Default, Clone)]
 pub struct InMemoryTransport {
     inner: Arc<Mutex<HashMap<PeerId, Vec<WireRecord>>>>,
+    /// (from, to) → records — partial sync 用 targeted log
+    targeted: Arc<Mutex<HashMap<(PeerId, PeerId), Vec<WireRecord>>>>,
 }
 
 impl InMemoryTransport {
     pub fn new() -> Self {
-        Self { inner: Arc::new(Mutex::new(HashMap::new())) }
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            targeted: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// 現在 `from` peer が持っている全レコード数(テスト用)。
     pub fn len_of(&self, from: PeerId) -> usize {
         self.inner.lock().unwrap().get(&from).map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// テスト用に peer を登録 (= `known_peers()` に出すため)。
+    /// publish 経由でも自動登録されるが、 まだ 1 度も publish してない peer を
+    /// `Syncer::publish_since` の per-peer 経路に含めたい場合に使う。
+    pub fn register_peer(&self, peer: PeerId) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.entry(peer).or_insert_with(Vec::new);
     }
 }
 
@@ -349,6 +394,55 @@ impl Transport for InMemoryTransport {
             }
         }
         log.sort_by_key(|r| r.hlc);
+    }
+
+    /// request4: `from` → `to` 専用 log に append。 broadcast 用 `inner` とは
+    /// 別の領域なので、 `to` 以外の peer は pull で見えない。
+    fn publish_to(&self, from: PeerId, to: PeerId, mut records: Vec<WireRecord>) {
+        if records.is_empty() { return; }
+        records.sort_by_key(|r| r.hlc);
+        // peer 一覧に to を register (= known_peers() で出るように)
+        {
+            let mut guard = self.inner.lock().unwrap();
+            guard.entry(from).or_insert_with(Vec::new);
+            guard.entry(to).or_insert_with(Vec::new);
+        }
+        let mut guard = self.targeted.lock().unwrap();
+        let log = guard.entry((from, to)).or_insert_with(Vec::new);
+        let existing: std::collections::HashSet<Hlc> =
+            log.iter().map(|r| r.hlc).collect();
+        for r in records {
+            if !existing.contains(&r.hlc) {
+                log.push(r);
+            }
+        }
+        log.sort_by_key(|r| r.hlc);
+    }
+
+    /// request4: `to` peer 視点での pull。 broadcast log + (from, to) targeted log
+    /// を merge し、 HLC > since で filter、 HLC 昇順で返す。
+    fn pull_as(&self, to: PeerId, from: PeerId, since: Hlc) -> Vec<WireRecord> {
+        let bcast: Vec<WireRecord> = {
+            let guard = self.inner.lock().unwrap();
+            guard.get(&from).cloned().unwrap_or_default()
+        };
+        let targeted: Vec<WireRecord> = {
+            let guard = self.targeted.lock().unwrap();
+            guard.get(&(from, to)).cloned().unwrap_or_default()
+        };
+        let mut merged: Vec<WireRecord> = bcast.into_iter()
+            .chain(targeted)
+            .filter(|r| r.hlc > since)
+            .collect();
+        merged.sort_by_key(|r| r.hlc);
+        // dedupe by HLC (broadcast と targeted に同 record があった場合)
+        merged.dedup_by_key(|r| r.hlc);
+        merged
+    }
+
+    fn known_peers(&self) -> Vec<PeerId> {
+        let guard = self.inner.lock().unwrap();
+        guard.keys().copied().collect()
     }
 }
 
