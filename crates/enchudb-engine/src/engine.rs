@@ -68,6 +68,25 @@ fn writer_lock_path_for(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{}.lock", path))
 }
 
+/// `wal_record_queue` (= bounded ArrayQueue) への blocking push。
+/// queue 満杯時は `yield_now` で consumer の進捗を待つ (issue4 backpressure)。
+#[inline]
+fn push_wal_record_blocking(
+    wq: &crossbeam_queue::ArrayQueue<enchudb_wal::wal::WalRecord>,
+    rec: enchudb_wal::wal::WalRecord,
+) {
+    let mut rec = rec;
+    loop {
+        match wq.push(rec) {
+            Ok(()) => return,
+            Err(returned) => {
+                rec = returned;
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
 /// `.db.lock` に flock(LOCK_EX) を取り、 fd を返す。 fd が drop されると lock も解放。
 /// 取得できないと **block する** (= sqlite と同様、 取れるまで待つ)。
 /// readonly open は呼ばない。 writer 系の open / create だけ呼ぶ。
@@ -769,7 +788,7 @@ pub struct Engine {
     /// async path 専用の WAL record queue。 writer は WAL に直接書かず、 ここに
     /// owned record を push。 consumer thread が drain して `wal.append_many` で
     /// 1 flock サイクル N records にまとめる (per-record flock コスト償却)。
-    wal_record_queue: Option<std::sync::Arc<crossbeam_queue::SegQueue<enchudb_wal::wal::WalRecord>>>,
+    wal_record_queue: Option<std::sync::Arc<crossbeam_queue::ArrayQueue<enchudb_wal::wal::WalRecord>>>,
     /// 背景 fsync が最後に completed した LSN。
     durable_lsn: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// v32: この Engine を所有する peer の id。分散時 eid の上位 32bit。
@@ -3071,6 +3090,31 @@ impl Engine {
         Ok(Self::spawn_consumer_with_wal(eng, Some(wal)))
     }
 
+    /// `create_concurrent_with_wal` + `undo_max_entries` + `queue_capacity` override
+    /// (issue3 + issue4)。
+    /// - `undo_max_entries`: undo region のエントリ数上限 (default 16 M)
+    /// - `queue_capacity`: WriteQueue / wal_record_queue の bounded cap (default 1 M)
+    ///
+    /// sustained writer (sunsu Docker scenario 03 等) で writer >> consumer rate に
+    /// なると、 旧 unbounded queue では RSS 線形成長 → OOM。 bounded 化 + producer
+    /// block でこれを cap する。 capacity の選び方:
+    /// - 小さい (例: 10 K) → RSS 低い、 latency 不安定
+    /// - 大きい (例: 10 M) → latency 安定、 RSS は queue 内 record サイズ × cap
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn create_concurrent_with_wal_queue_cap(
+        path: &str,
+        wal_capacity: usize,
+        undo_max_entries: u32,
+        queue_capacity: usize,
+    ) -> io::Result<std::sync::Arc<Self>> {
+        let eng = Self::create_full_with_cyl_undo(
+            path, DEFAULT_MAX_ENTITIES, None, None, None, None, Some(undo_max_entries),
+        )?;
+        let wal_path = wal_path_for(path);
+        let wal = std::sync::Arc::new(enchudb_wal::wal::Wal::create(&wal_path, wal_capacity)?);
+        Ok(Self::spawn_consumer_with_wal_queue_cap(eng, Some(wal), Some(queue_capacity)))
+    }
+
     /// v28: WAL 付き open_concurrent。既存 WAL があればリカバリする。
     /// v29: region CRC は WAL ルートでは skip(WAL が source of truth)。
     /// 代わりに古い `.crc` ファイルは削除して、次回 flush で regenerate させる。
@@ -3176,6 +3220,12 @@ impl Engine {
         Self::spawn_consumer_with_wal(eng, None)
     }
 
+    /// `wal_record_queue` capacity の default (= write_queue と同じ 1 M)。
+    /// issue4: 旧 unbounded SegQueue では sustained writer で RSS 線形成長 → OOM。
+    /// caller は `create_concurrent_with_wal_queue_cap` で上書きできる。
+    pub(crate) const DEFAULT_WAL_RECORD_QUEUE_CAP: usize =
+        crate::write_queue::DEFAULT_WRITE_QUEUE_CAP;
+
     /// changefeed 内部ヘルパ: WAL から emit_offset 以降の record を取り出して
     /// 全 listener に渡し、cursor を進める。
     fn fire_change_listeners(
@@ -3206,19 +3256,32 @@ impl Engine {
     }
 
     fn spawn_consumer_with_wal(
+        eng: Self,
+        wal: Option<std::sync::Arc<enchudb_wal::wal::Wal>>,
+    ) -> std::sync::Arc<Self> {
+        Self::spawn_consumer_with_wal_queue_cap(eng, wal, None)
+    }
+
+    /// `spawn_consumer_with_wal` + queue capacity 上書き。 None = default。
+    /// issue4 backpressure 用 — capacity 大きいほど push 側 latency 安定、
+    /// 小さいほど RSS 安定 (writer rate >> consumer rate の差を queue で吸収しない)。
+    fn spawn_consumer_with_wal_queue_cap(
         mut eng: Self,
         wal: Option<std::sync::Arc<enchudb_wal::wal::Wal>>,
+        queue_cap: Option<usize>,
     ) -> std::sync::Arc<Self> {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
         use crate::write_queue::WriteQueue;
 
-        let queue = Arc::new(WriteQueue::new());
+        let qc = queue_cap.unwrap_or(crate::write_queue::DEFAULT_WRITE_QUEUE_CAP);
+        let queue = Arc::new(WriteQueue::with_capacity(qc));
         let shutdown = Arc::new(AtomicBool::new(false));
         // WAL 有効時のみ wal_record_queue を生やす。 writer は直接 wal.append せず
         // ここに owned record を push する → consumer thread が drain して append_many。
+        // issue4: bounded `ArrayQueue` で sustained writer の RSS を cap する。
         let wal_record_queue = wal.as_ref()
-            .map(|_| Arc::new(crossbeam_queue::SegQueue::<enchudb_wal::wal::WalRecord>::new()));
+            .map(|_| Arc::new(crossbeam_queue::ArrayQueue::<enchudb_wal::wal::WalRecord>::new(qc)));
 
         eng.write_queue = Some(queue.clone());
         eng.shutdown_flag = Some(shutdown.clone());
@@ -3590,7 +3653,7 @@ impl Engine {
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
             let rec = enchudb_wal::wal::WalRecord::Tie { eid: wal_eid, himo_id, value };
             if let Some(wq) = self.wal_record_queue.as_ref() {
-                wq.push(rec);
+                push_wal_record_blocking(wq, rec);
             } else {
                 let _ = wal.append(rec.as_op());
             }
@@ -3639,8 +3702,8 @@ impl Engine {
             let tie_rec = enchudb_wal::wal::WalRecord::Tie { eid: wal_eid, himo_id, value: vid };
             if let Some(wq) = self.wal_record_queue.as_ref() {
                 // Vocab → Tie の順を保つため同一 thread から連続 push
-                wq.push(vocab_rec);
-                wq.push(tie_rec);
+                push_wal_record_blocking(wq, vocab_rec);
+                push_wal_record_blocking(wq, tie_rec);
             } else {
                 let _ = wal.append(vocab_rec.as_op());
                 let _ = wal.append(tie_rec.as_op());
@@ -3678,7 +3741,7 @@ impl Engine {
                 eid: wal_eid, himo_id, value: target_local,
             };
             if let Some(wq) = self.wal_record_queue.as_ref() {
-                wq.push(rec);
+                push_wal_record_blocking(wq, rec);
             } else {
                 let _ = wal.append(rec.as_op());
             }
@@ -3709,7 +3772,7 @@ impl Engine {
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
             let rec = enchudb_wal::wal::WalRecord::Untie { eid: wal_eid, himo_id };
             if let Some(wq) = self.wal_record_queue.as_ref() {
-                wq.push(rec);
+                push_wal_record_blocking(wq, rec);
             } else {
                 let _ = wal.append(rec.as_op());
             }
@@ -3728,7 +3791,7 @@ impl Engine {
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
             let rec = enchudb_wal::wal::WalRecord::Delete { eid: wal_eid };
             if let Some(wq) = self.wal_record_queue.as_ref() {
-                wq.push(rec);
+                push_wal_record_blocking(wq, rec);
             } else {
                 let _ = wal.append(rec.as_op());
             }
@@ -3750,7 +3813,7 @@ impl Engine {
                 eid: wal_eid, key: key.to_string(), data: data.to_vec(),
             };
             if let Some(wq) = self.wal_record_queue.as_ref() {
-                wq.push(rec);
+                push_wal_record_blocking(wq, rec);
             } else {
                 let _ = wal.append(rec.as_op());
             }

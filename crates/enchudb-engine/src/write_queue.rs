@@ -1,12 +1,25 @@
-//! WriteQueue — v27 並行書き込み用の lock-free キュー。
+//! WriteQueue — 並行書き込み用 bounded MPSC キュー (issue4 対応)。
 //!
-//! 複数 writer スレッドが `push` でオペレーションを投げ、
-//! 単一 consumer スレッドが `pop` で取り出して HimoStore に適用する。
+//! 複数 writer スレッドが `push` でオペレーションを投げ、 単一 consumer
+//! スレッドが `pop` で取り出して HimoStore に適用する。
 //!
-//! SegQueue(crossbeam-queue の unbounded lock-free queue) を採用しているので、
-//! push は常に成功する。back-pressure もない。
+//! v0.2.3 以前は `crossbeam_queue::SegQueue` (unbounded) を使っていた。
+//! consumer が drain しきれない rate で writer が push し続けると、 queue
+//! 内 record が線形成長 → RSS 線形成長 → OOM kill (sunsu Docker scenario
+//! 03 で 14s / 8M posts / 3.38 GB → 4 GB cap 突破)。
+//!
+//! v0.2.4 から `crossbeam_queue::ArrayQueue` (bounded、 lock-free) に変更。
+//! push が満杯なら `yield_now` ループで consumer の進捗を待つ (自然な
+//! backpressure)。 capacity は `Engine::create_concurrent_with_wal_queue_cap`
+//! で指定可能 (default は緩めの値で latency への影響を抑える)。
 
-use crossbeam_queue::SegQueue;
+use crossbeam_queue::ArrayQueue;
+
+/// queue capacity の default。 既存 caller 互換のため、 sustained writer の
+/// peak rate を捌ける程度の余裕を持たせる。 SNS 系 hot path (sunsu の
+/// concurrent_posts 等、 1 M posts/sec 級) でも、 consumer 進捗との rate 差が
+/// 数百 ms 程度なら飲み込める。
+pub(crate) const DEFAULT_WRITE_QUEUE_CAP: usize = 1_048_576; // 1 M ops
 
 /// 非同期オペレーション。
 #[derive(Clone, Debug)]
@@ -26,18 +39,36 @@ pub enum Op {
 }
 
 pub struct WriteQueue {
-    queue: SegQueue<Op>,
+    queue: ArrayQueue<Op>,
 }
 
 impl WriteQueue {
+    /// default capacity (= 1 M ops) で生成。
     pub fn new() -> Self {
-        Self { queue: SegQueue::new() }
+        Self::with_capacity(DEFAULT_WRITE_QUEUE_CAP)
     }
 
-    /// push。SegQueue は unbounded なので常に成功する。
+    /// capacity 指定。 0 は無効 (panic)。
+    pub fn with_capacity(cap: usize) -> Self {
+        assert!(cap > 0, "WriteQueue capacity must be > 0");
+        Self { queue: ArrayQueue::new(cap) }
+    }
+
+    /// blocking push。 queue が満杯なら consumer の進捗を yield ループで待つ。
+    /// producer のここでの待ち時間が backpressure として throughput を
+    /// consumer 上限に張り付かせる。
     #[inline]
     pub fn push(&self, op: Op) {
-        self.queue.push(op);
+        let mut op = op;
+        loop {
+            match self.queue.push(op) {
+                Ok(()) => return,
+                Err(returned) => {
+                    op = returned;
+                    std::thread::yield_now();
+                }
+            }
+        }
     }
 
     /// pop。空なら None。
@@ -54,6 +85,12 @@ impl WriteQueue {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
+    }
+
+    /// queue の cap (= 受け入れ可能な最大 pending op 数)。
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.queue.capacity()
     }
 }
 
@@ -94,8 +131,9 @@ mod tests {
     }
 
     #[test]
-    fn unbounded_push_accepts_many() {
+    fn capacity_default_accepts_many() {
         let q = WriteQueue::new();
+        // default 1 M cap、 そこまでは block せず push できる
         for i in 0..100_000u32 {
             q.push(Op::Delete { eid: i });
         }
@@ -107,5 +145,30 @@ mod tests {
             }
         }
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn bounded_push_blocks_until_drained() {
+        // cap=4 の queue を満杯にして、 別 thread が drain したら push 成功する事を確認
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let q = Arc::new(WriteQueue::with_capacity(4));
+        for i in 0..4 {
+            q.push(Op::Delete { eid: i });
+        }
+        assert_eq!(q.len(), 4);
+        // drainer thread を起動して 50 ms 後に 1 個 pop
+        let q2 = q.clone();
+        let drained = Arc::new(AtomicBool::new(false));
+        let drained2 = drained.clone();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let _ = q2.pop();
+            drained2.store(true, Ordering::Release);
+        });
+        // この push は block するはず、 drainer が動くまで返らない
+        q.push(Op::Delete { eid: 99 });
+        assert!(drained.load(Ordering::Acquire), "push should have waited for drainer");
+        h.join().unwrap();
     }
 }
