@@ -110,11 +110,15 @@ impl ContentStore {
         // MAGIC は lazy — ここで毎回書く (idempotent、 4 byte copy)。
         dm[0..4].copy_from_slice(&MAGIC);
         dm[data_off as usize..(data_off + len) as usize].copy_from_slice(content);
+        // request3: MAGIC + content 範囲を dirty
+        self.data.mark_dirty(0, 4);
+        self.data.mark_dirty(data_off as usize, len as usize);
 
         let im = self.index.slice_mut();
         if off + 8 <= im.len() {
             im[off..off + 4].copy_from_slice(&data_off.to_le_bytes());
             im[off + 4..off + 8].copy_from_slice(&len.to_le_bytes());
+            self.index.mark_dirty(off, 8);
         }
     }
 
@@ -140,6 +144,7 @@ impl ContentStore {
         let im = self.index.slice_mut();
         if off + 8 <= im.len() {
             im[off..off + 8].fill(0);
+            self.index.mark_dirty(off, 8);
         }
     }
 

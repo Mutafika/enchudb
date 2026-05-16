@@ -46,6 +46,7 @@ impl Column {
         let len = value.len().min(vs);
         let mm = self.region.slice_mut();
         mm[off..off + len].copy_from_slice(&value[..len]);
+        self.region.mark_dirty(off, len);
     }
 
     #[inline]
@@ -62,6 +63,7 @@ impl Column {
         let off = HEADER + (entity_id as usize) * vs;
         let mm = self.region.slice_mut();
         for b in &mut mm[off..off + vs] { *b = 0; }
+        self.region.mark_dirty(off, vs);
     }
 
     pub fn count(&self) -> u32 { self.count.load(Ordering::Relaxed) }

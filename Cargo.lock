@@ -933,7 +933,7 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "enchudb"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "criterion",
  "enchudb-engine",
@@ -953,7 +953,7 @@ dependencies = [
 
 [[package]]
 name = "enchudb-engine"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "async-trait",
  "crossbeam-queue",
@@ -968,14 +968,14 @@ dependencies = [
 
 [[package]]
 name = "enchudb-ffi"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "enchudb-sql",
 ]
 
 [[package]]
 name = "enchudb-rag"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "enchudb",
  "enchudb-wal",
@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "enchudb-schema"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "enchudb-engine",
  "enchudb-wal",
@@ -994,7 +994,7 @@ dependencies = [
 
 [[package]]
 name = "enchudb-sql"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "enchudb-engine",
  "enchudb-schema",
@@ -1004,7 +1004,7 @@ dependencies = [
 
 [[package]]
 name = "enchudb-sync"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "enchudb-engine",
  "enchudb-wal",
@@ -1012,14 +1012,14 @@ dependencies = [
 
 [[package]]
 name = "enchudb-text"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "memmap2",
 ]
 
 [[package]]
 name = "enchudb-transport"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "enchudb",
  "enchudb-wal",
@@ -1031,7 +1031,7 @@ dependencies = [
 
 [[package]]
 name = "enchudb-wal"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "ed25519-dalek",
  "libc",

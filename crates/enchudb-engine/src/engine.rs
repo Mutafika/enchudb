@@ -3441,7 +3441,12 @@ impl Engine {
     pub fn body_msync(&self) -> io::Result<()> {
         match &self.backing {
             Backing::Mmap(m) => m.flush(),
-            Backing::Growable(g) => g.flush(0, g.committed()),
+            // request3: dirty range tracking。 旧実装は flush(0, committed) で
+            // 全 committed 範囲を msync していたが、 sustained workload で
+            // committed が伸びるたびに線形に遅くなる (10K user × 100KB で
+            // body_msync 6 ms → 3.6 s)。 hot write 経路から `mark_dirty` で
+            // 記録された range だけを msync。
+            Backing::Growable(g) => g.flush_dirty(),
             Backing::Memory(_) => Ok(()),
         }
     }

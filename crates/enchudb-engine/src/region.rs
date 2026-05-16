@@ -88,6 +88,23 @@ impl Region {
         self.len
     }
 
+    /// region 内 [off_in_region, off_in_region+len) に書き込んだ事を grower に
+    /// 通知 (= dirty range 記録)。 grower が無い場合は no-op。
+    ///
+    /// request3 dirty range tracking: `flush_dirty` の msync 範囲を絞る hint。
+    /// 呼び忘れても correctness には影響しない (= OS の遅延 flush に任せる)
+    /// が、 hot write 経路 (HimoStore::set / Vocabulary::insert /
+    /// UndoLog::record / EntitySet::allocate / ContentStore::set) からは呼ぶこと。
+    #[inline]
+    pub fn mark_dirty(&self, off_in_region: usize, len: usize) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(g) = &self.grower {
+            g.mark_dirty(self.file_offset + off_in_region, len);
+        }
+        let _ = off_in_region;
+        let _ = len;
+    }
+
     /// Region 内の `end_in_region` byte までを書き込み可能にする (= ファイル
     /// 内 commit を `file_offset + end_in_region` まで進める)。 grower が
     /// 設定されていなければ no-op (静的 backing は既に全コミット済み)。

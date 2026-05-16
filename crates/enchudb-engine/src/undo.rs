@@ -129,6 +129,10 @@ impl UndoLog {
         mm[off + 4..off + 6].copy_from_slice(&dim_id.to_le_bytes());
         mm[off + 6..off + 10].copy_from_slice(old_value);
         mm[4..8].copy_from_slice(&(idx + 1).to_le_bytes());
+        // request3: header (count 更新) + entry の両方を dirty として記録。
+        // header 4 byte + entry 10 byte の union range をマーク (一括で記録)。
+        self.region.mark_dirty(4, 4);
+        self.region.mark_dirty(off, ENTRY_SIZE);
     }
 
     /// backpressure 閾値を超えてるか (consumer ループの自発 commit 用)。
@@ -142,6 +146,7 @@ impl UndoLog {
         self.count.store(0, Ordering::Release);
         let mm = self.region.slice_mut();
         mm[4..8].copy_from_slice(&0u32.to_le_bytes());
+        self.region.mark_dirty(4, 4);
         self.force_commit.store(false, Ordering::Release);
     }
 

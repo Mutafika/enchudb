@@ -34,10 +34,26 @@ use std::os::fd::{IntoRawFd, RawFd};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// 4 KB page granularity. Both macOS and Linux on x86_64 / arm64 use
-/// 4 KB pages today; if a future platform raises this we'll need to
-/// query `sysconf(_SC_PAGESIZE)` at runtime.
+/// Conservative compile-time page size used for layout-side alignment
+/// (`grow_to` / `set_len` 等)。 file の論理 size を扱う場面はこれで十分。
 const PAGE_SIZE: usize = 4096;
+
+/// 実行時の hardware page size。 macOS Apple Silicon は **16 KB**、 Linux /
+/// macOS x86_64 は 4 KB。 msync の `addr` 引数はこれで page-aligned である
+/// 必要があり、 4096 で揃えると Apple Silicon で EINVAL が出る (request3
+/// 実装時に踏んだ)。 起動時に sysconf で取って cache。
+fn runtime_page_size() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CACHED: AtomicUsize = AtomicUsize::new(0);
+    let cur = CACHED.load(Ordering::Relaxed);
+    if cur != 0 {
+        return cur;
+    }
+    let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let ps = if v > 0 { v as usize } else { 4096 };
+    CACHED.store(ps, Ordering::Relaxed);
+    ps
+}
 
 pub struct GrowableMap {
     fd: RawFd,
@@ -49,6 +65,15 @@ pub struct GrowableMap {
     /// can read it on the hot path without locking; growth itself is
     /// serialized (caller must hold whatever store-side lock applies).
     committed: AtomicUsize,
+    /// 直近 `flush_dirty` 以降に書き込まれた byte 範囲の lo (inclusive)。
+    /// usize::MAX = clean (writes 無し)。 writer は `mark_dirty(off, len)`
+    /// で fetch_min、 consumer は `flush_dirty` で snapshot + reset。
+    /// request3: sustained 書き込み中 body_msync が committed 全体を msync
+    /// していて線形に遅くなる問題への対策。
+    dirty_lo: AtomicUsize,
+    /// 直近 `flush_dirty` 以降に書き込まれた byte 範囲の hi (exclusive)。
+    /// 0 = clean。 writer は `mark_dirty` で fetch_max。
+    dirty_hi: AtomicUsize,
 }
 
 unsafe impl Send for GrowableMap {}
@@ -127,6 +152,8 @@ impl GrowableMap {
             base: base as *mut u8,
             reserved: reserve,
             committed: AtomicUsize::new(initial),
+            dirty_lo: AtomicUsize::new(usize::MAX),
+            dirty_hi: AtomicUsize::new(0),
         })
     }
 
@@ -257,6 +284,9 @@ impl GrowableMap {
                 "flush past committed",
             ));
         }
+        if len == 0 {
+            return Ok(());
+        }
         let rc = unsafe {
             libc::msync(
                 self.base.add(offset) as *mut _,
@@ -268,6 +298,70 @@ impl GrowableMap {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// 書き込みが起きた byte 範囲を [offset, offset+len) で記録 (writer 用)。
+    /// request3 dirty range tracking: `flush_dirty` で msync 範囲を絞るための
+    /// hint。 多 writer から fetch_min/fetch_max で union され、 consumer の
+    /// `flush_dirty` で snapshot + reset。
+    ///
+    /// 呼ばなくても correctness は保たれる (msync しないと OS が遅延で flush
+    /// する分が遅れるだけ) — performance hint。 だが pattern 上 hot write 経路
+    /// (HimoStore::set / Vocabulary::insert / UndoLog::record / EntitySet::allocate
+    /// / ContentStore::set) からは呼ぶこと。
+    #[inline]
+    pub fn mark_dirty(&self, offset: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let end = offset + len;
+        // fetch_min on dirty_lo
+        let mut cur_lo = self.dirty_lo.load(Ordering::Relaxed);
+        while cur_lo > offset {
+            match self.dirty_lo.compare_exchange_weak(
+                cur_lo, offset, Ordering::Release, Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur_lo = observed,
+            }
+        }
+        // fetch_max on dirty_hi
+        let mut cur_hi = self.dirty_hi.load(Ordering::Relaxed);
+        while cur_hi < end {
+            match self.dirty_hi.compare_exchange_weak(
+                cur_hi, end, Ordering::Release, Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur_hi = observed,
+            }
+        }
+    }
+
+    /// 直近 `mark_dirty` で記録された range だけを msync して reset。
+    /// dirty range が空 (= clean) なら no-op。 これで body_msync が committed
+    /// 全体ではなく直近 write 範囲だけになり、 sustained workload で線形に
+    /// 遅くなる問題が解消する (request3)。
+    ///
+    /// msync(2) は addr が page-aligned である必要があるため、 dirty range の
+    /// 両端を page 境界に拡げる (lo を page 下方丸め、 hi を page 上方丸め)。
+    pub fn flush_dirty(&self) -> io::Result<()> {
+        // snapshot + reset (atomic swap)
+        let lo = self.dirty_lo.swap(usize::MAX, Ordering::AcqRel);
+        let hi = self.dirty_hi.swap(0, Ordering::AcqRel);
+        if hi <= lo {
+            return Ok(()); // clean、 何もすることが無い
+        }
+        // msync の addr は **hardware page** で aligned 必須。 Apple Silicon は
+        // 16 KB、 x86_64 / Linux arm64 は 4 KB。 runtime_page_size 経由で取る。
+        let ps = runtime_page_size();
+        let lo_aligned = lo & !(ps - 1);
+        let hi_aligned = (hi + ps - 1) & !(ps - 1);
+        let cur = self.committed();
+        let hi_clamped = hi_aligned.min(cur);
+        if hi_clamped <= lo_aligned {
+            return Ok(());
+        }
+        self.flush(lo_aligned, hi_clamped - lo_aligned)
     }
 }
 

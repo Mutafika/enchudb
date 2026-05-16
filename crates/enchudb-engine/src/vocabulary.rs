@@ -173,20 +173,19 @@ impl Vocabulary {
             .ensure_committed(((id as usize) + 1) * 8);
         let dm = self.data.slice_mut();
         dm[offset as usize..offset as usize + len as usize].copy_from_slice(value);
-        // MAGIC は lazy init — `init` は data 領域に書かないので、 ここで
-        // 毎回書く (idempotent、 4 byte copy なのでコスト微小)。 MAGIC が
-        // 全 0 のままなら `load` は fresh と判定するので、 一度でも insert
-        // が走れば `load` 後の rebuild_index が動くようになる。
         dm[0..4].copy_from_slice(&MAGIC);
-        // count/data_end を mmap header に即書き戻し（flush なしで drop されても復元可能に）
         let new_count = id + 1;
         let new_end = offset + len;
         dm[4..8].copy_from_slice(&new_count.to_le_bytes());
         dm[8..12].copy_from_slice(&new_end.to_le_bytes());
+        // request3: data 領域 header (0..12) + insert したバイト範囲を dirty
+        self.data.mark_dirty(0, 12);
+        self.data.mark_dirty(offset as usize, len as usize);
         let om = self.offsets.slice_mut();
         let off_pos = (id as usize) * 8;
         om[off_pos..off_pos + 4].copy_from_slice(&offset.to_le_bytes());
         om[off_pos + 4..off_pos + 8].copy_from_slice(&len.to_le_bytes());
+        self.offsets.mark_dirty(off_pos, 8);
         self.index_insert(value, id);
         id
     }
@@ -208,6 +207,8 @@ impl Vocabulary {
                         xm[off + 1..off + 9].copy_from_slice(&h.to_le_bytes());
                         xm[off + 9..off + 13].copy_from_slice(&id.to_le_bytes());
                         flag.store(1, Ordering::Release);
+                        // request3: slot 全体 (13 byte) を dirty
+                        self.index.mark_dirty(off, INDEX_SLOT_SIZE);
                         return;
                     }
                     Err(_) => continue,
