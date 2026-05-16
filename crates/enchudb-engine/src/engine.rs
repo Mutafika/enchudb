@@ -1690,6 +1690,7 @@ impl Engine {
     // ──── entity ────
 
     pub fn entity(&self) -> enchudb_wal::EntityId {
+        use std::sync::atomic::Ordering;
         self.check_writable();
         let local = self.entities.allocate();
         // consumer thread が稼働してる場合 (= concurrent mode) は undo を queue 経由で
@@ -1697,10 +1698,14 @@ impl Engine {
         // panic していたのを回避)。 standalone (consumer なし) は従来通り直接 record。
         if let Some(q) = self.write_queue.as_ref() {
             q.push(crate::write_queue::Op::EntityCreated { local });
+            // issue5: push_count と apply_count を対称に保つため、 EntityCreated も
+            // counter 対象に入れる。 入れないと flush_writes が ties drain 前に
+            // early return して live query が pending Tie を見落とす。
+            self.push_count.fetch_add(1, Ordering::Release);
         } else {
             self.undo.record(local, 0xFFFF, &[1, 0, 0, 0]);
         }
-        let peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
+        let peer = self.peer_id.load(Ordering::Acquire);
         enchudb_wal::make_eid(peer, local)
     }
 
