@@ -300,41 +300,30 @@ impl GrowableMap {
         Ok(())
     }
 
-    /// 書き込みが起きた byte 範囲を [offset, offset+len) で記録 (writer 用)。
-    /// request3 dirty range tracking: `flush_dirty` で msync 範囲を絞るための
-    /// hint。 多 writer から fetch_min/fetch_max で union され、 consumer の
-    /// `flush_dirty` で snapshot + reset。
+    /// 書き込みが起きた byte 範囲を [offset, offset+len) で記録 (consumer 用)。
+    /// 主に consumer thread (apply_op 経由の Column::set / UndoLog::record_unchecked /
+    /// ContentStore::set) から呼ぶ。 writer thread からは呼ばない (cache line
+    /// contention で perf 退化するため、 別経路で msync する)。
     ///
-    /// 呼ばなくても correctness は保たれる (msync しないと OS が遅延で flush
-    /// する分が遅れるだけ) — performance hint。 だが pattern 上 hot write 経路
-    /// (HimoStore::set / Vocabulary::insert / UndoLog::record / EntitySet::allocate
-    /// / ContentStore::set) からは呼ぶこと。
+    /// Release ordering で書く: writer の mmap 書き込みが consumer の `flush_dirty`
+    /// (AcqRel swap) より happens-before になることを保証する。 `fetch_min` /
+    /// `fetch_max` は CAS 1 命令で済むので CAS loop より cache line 開放が速い。
     #[inline]
     pub fn mark_dirty(&self, offset: usize, len: usize) {
         if len == 0 {
             return;
         }
         let end = offset + len;
-        // fetch_min on dirty_lo
-        let mut cur_lo = self.dirty_lo.load(Ordering::Relaxed);
-        while cur_lo > offset {
-            match self.dirty_lo.compare_exchange_weak(
-                cur_lo, offset, Ordering::Release, Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(observed) => cur_lo = observed,
-            }
+        // fast path: 既に dirty_lo <= offset かつ dirty_hi >= end なら何もしない。
+        // この check で同一範囲を繰り返し叩く caller (= 同じ column への連続書き込み)
+        // の atomic op を skip できる。
+        if self.dirty_lo.load(Ordering::Relaxed) <= offset
+            && self.dirty_hi.load(Ordering::Relaxed) >= end
+        {
+            return;
         }
-        // fetch_max on dirty_hi
-        let mut cur_hi = self.dirty_hi.load(Ordering::Relaxed);
-        while cur_hi < end {
-            match self.dirty_hi.compare_exchange_weak(
-                cur_hi, end, Ordering::Release, Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(observed) => cur_hi = observed,
-            }
-        }
+        self.dirty_lo.fetch_min(offset, Ordering::Release);
+        self.dirty_hi.fetch_max(end, Ordering::Release);
     }
 
     /// 直近 `mark_dirty` で記録された range だけを msync して reset。
@@ -344,6 +333,25 @@ impl GrowableMap {
     ///
     /// msync(2) は addr が page-aligned である必要があるため、 dirty range の
     /// 両端を page 境界に拡げる (lo を page 下方丸め、 hi を page 上方丸め)。
+    /// `flush` の page-aware ラッパ。 offset/len を hardware page 境界に拡げて
+    /// msync する。 entity_set 等の小さな固定 region を `body_msync` で常時
+    /// flush するときに使う (= mark_dirty を介さない経路)。
+    pub fn flush_aligned(&self, offset: usize, len: usize) -> io::Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let ps = runtime_page_size();
+        let lo_aligned = offset & !(ps - 1);
+        let hi = offset + len;
+        let hi_aligned = (hi + ps - 1) & !(ps - 1);
+        let cur = self.committed();
+        let hi_clamped = hi_aligned.min(cur);
+        if hi_clamped <= lo_aligned {
+            return Ok(());
+        }
+        self.flush(lo_aligned, hi_clamped - lo_aligned)
+    }
+
     pub fn flush_dirty(&self) -> io::Result<()> {
         // snapshot + reset (atomic swap)
         let lo = self.dirty_lo.swap(usize::MAX, Ordering::AcqRel);

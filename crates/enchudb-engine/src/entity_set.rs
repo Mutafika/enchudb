@@ -85,9 +85,9 @@ impl EntitySet {
         if eid < self.max_entities {
             self.set_bit(eid, true);
             self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
-            // request3: next_eid (offset 4) + live_count (offset 8) を dirty。
-            // bitset 側は set_bit が自前で mark_dirty 済み。
-            self.region.mark_dirty(4, 8);
+            // issue6 (perf 退化対策): writer hot path から mark_dirty を撤廃。
+            // EntitySet 全領域は body_msync 内で常時 msync される (固定サイズ
+            // で cheap な小領域)。
             return eid;
         }
         // 上限到達 → fetch_addを巻き戻してfree stackから再利用
@@ -109,8 +109,7 @@ impl EntitySet {
                 let eid = u32::from_le_bytes(mm[eid_off..eid_off + 4].try_into().unwrap());
                 self.set_bit(eid, true);
                 self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
-                self.region.mark_dirty(self.free_offset, 4); // free count
-                self.region.mark_dirty(8, 4); // live count
+                // EntitySet 全領域は body_msync 内で常時 msync (issue6 perf 対策)。
                 return eid;
             }
         }
@@ -120,7 +119,6 @@ impl EntitySet {
         if !self.is_live(eid) { return; }
         self.set_bit(eid, false);
         self.live_count_atomic().fetch_sub(1, Ordering::Relaxed);
-        self.region.mark_dirty(8, 4); // live_count
 
         let mm = self.region.slice_mut();
         let free_count_off = self.free_offset;
@@ -130,9 +128,8 @@ impl EntitySet {
             let eid_off = self.free_offset + 4 + (fc as usize) * 4;
             mm[eid_off..eid_off + 4].copy_from_slice(&eid.to_le_bytes());
             mm[free_count_off..free_count_off + 4].copy_from_slice(&(fc + 1).to_le_bytes());
-            self.region.mark_dirty(eid_off, 4);
-            self.region.mark_dirty(free_count_off, 4);
         }
+        // EntitySet 全領域は body_msync 内で常時 msync (issue6 perf 対策)。
     }
 
     /// rollback用: 削除されたentityを復活させる。
@@ -175,7 +172,7 @@ impl EntitySet {
         } else {
             mm[byte_off] &= !bit;
         }
-        self.region.mark_dirty(byte_off, 1);
+        // EntitySet 全領域は body_msync 内で常時 msync (issue6 perf 対策)。
     }
 
     pub fn count(&self) -> u32 {

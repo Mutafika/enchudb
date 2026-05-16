@@ -3446,7 +3446,19 @@ impl Engine {
             // committed が伸びるたびに線形に遅くなる (10K user × 100KB で
             // body_msync 6 ms → 3.6 s)。 hot write 経路から `mark_dirty` で
             // 記録された range だけを msync。
-            Backing::Growable(g) => g.flush_dirty(),
+            //
+            // issue6: writer hot path (`EntitySet::allocate` 等) は `mark_dirty`
+            // 経由の atomic union が cache line contention を引き起こすため、
+            // 撤廃して entity_set 領域は常時 msync する (= 小サイズ固定領域なので
+            // 無条件 msync しても安価)。
+            Backing::Growable(g) => {
+                // 1. consumer-tracked dirty range (Column::set / UndoLog 等)
+                g.flush_dirty()?;
+                // 2. entity_set 領域は writer hot path で書かれるので無条件 msync
+                //    (small fixed region、 page-aligned で expand)
+                g.flush_aligned(self.layout.entities_off, self.layout.entities_size)?;
+                Ok(())
+            }
             Backing::Memory(_) => Ok(()),
         }
     }

@@ -178,7 +178,6 @@ impl Vocabulary {
         let new_end = offset + len;
         dm[4..8].copy_from_slice(&new_count.to_le_bytes());
         dm[8..12].copy_from_slice(&new_end.to_le_bytes());
-        // request3: data 領域 header (0..12) + insert したバイト範囲を dirty
         self.data.mark_dirty(0, 12);
         self.data.mark_dirty(offset as usize, len as usize);
         let om = self.offsets.slice_mut();
@@ -207,7 +206,6 @@ impl Vocabulary {
                         xm[off + 1..off + 9].copy_from_slice(&h.to_le_bytes());
                         xm[off + 9..off + 13].copy_from_slice(&id.to_le_bytes());
                         flag.store(1, Ordering::Release);
-                        // request3: slot 全体 (13 byte) を dirty
                         self.index.mark_dirty(off, INDEX_SLOT_SIZE);
                         return;
                     }
