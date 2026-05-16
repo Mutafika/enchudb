@@ -1,6 +1,6 @@
 [package]
 name = "enchudb-rag"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 description = "EnchuDB の上に積む RAG ストア。メタフィルタ ns オーダー + brute force cosine。"
 license = "MIT OR Apache-2.0"

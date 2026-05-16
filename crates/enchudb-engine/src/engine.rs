@@ -860,9 +860,28 @@ impl Engine {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create_full_with_cyl(path: &str, max_entities: u32, vocab_data_size: Option<usize>, max_himos: Option<u32>, content_data_size: Option<usize>, cyl_max_values: Option<u32>) -> io::Result<Self> {
+        Self::create_full_with_cyl_undo(path, max_entities, vocab_data_size, max_himos, content_data_size, cyl_max_values, None)
+    }
+
+    /// `create_full_with_cyl` + `undo_max_entries` override。 None = default 16 M。
+    /// sustained 並列 sync writer (sinfohub-server 等) で 16 M cap 不足を踏む場合に
+    /// 64 M / 128 M 等を渡せる (1 entry = 10 B、 64 M で 640 MB)。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn create_full_with_cyl_undo(
+        path: &str,
+        max_entities: u32,
+        vocab_data_size: Option<usize>,
+        max_himos: Option<u32>,
+        content_data_size: Option<usize>,
+        cyl_max_values: Option<u32>,
+        undo_max_entries: Option<u32>,
+    ) -> io::Result<Self> {
         let vds = vocab_data_size.unwrap_or(DEFAULT_VOCAB_DATA_SIZE);
         let max_himos = max_himos.unwrap_or(DEFAULT_MAX_HIMOS);
-        let layout = Layout::compute(max_entities, max_himos, vds, content_data_size, cyl_max_values);
+        let layout = match undo_max_entries {
+            Some(uc) => Layout::compute_with_undo(max_entities, max_himos, vds, content_data_size, cyl_max_values, uc),
+            None => Layout::compute(max_entities, max_himos, vds, content_data_size, cyl_max_values),
+        };
 
         if let Some(parent) = std::path::Path::new(path).parent() {
             if !parent.as_os_str().is_empty() {
@@ -906,6 +925,7 @@ impl Engine {
         );
         let undo = UndoLog::init(
             unsafe { Region::new(base.add(layout.undo_off), layout.undo_size) },
+            undo_max_entries,
         );
         let vocab = Vocabulary::init(
             unsafe { Region::new(base.add(layout.vocab_data_off), layout.vocab_data_size) },
@@ -1096,9 +1116,10 @@ impl Engine {
             },
             max_entities,
         );
-        let undo = UndoLog::init(unsafe {
-            Region::with_grower(map.clone(), layout.undo_off, layout.undo_size)
-        });
+        let undo = UndoLog::init(
+            unsafe { Region::with_grower(map.clone(), layout.undo_off, layout.undo_size) },
+            undo_max_entries,
+        );
         let vocab = Vocabulary::init(
             unsafe {
                 Region::with_grower(map.clone(), layout.vocab_data_off, layout.vocab_data_size)
@@ -1498,6 +1519,7 @@ impl Engine {
         report("EntitySet::load", &mut t, &mut p);
         let undo = UndoLog::load(
             unsafe { Region::new(base.add(layout.undo_off), layout.undo_size) },
+            undo_max_entries,
         );
         report("UndoLog::load", &mut t, &mut p);
         let vocab = Vocabulary::load(
@@ -1651,7 +1673,14 @@ impl Engine {
     pub fn entity(&self) -> enchudb_wal::EntityId {
         self.check_writable();
         let local = self.entities.allocate();
-        self.undo.record(local, 0xFFFF, &[1, 0, 0, 0]); // entity created
+        // consumer thread が稼働してる場合 (= concurrent mode) は undo を queue 経由で
+        // 委譲 (issue3: 256 並列 writer の sustained で undo.record() が 16M cap 突破して
+        // panic していたのを回避)。 standalone (consumer なし) は従来通り直接 record。
+        if let Some(q) = self.write_queue.as_ref() {
+            q.push(crate::write_queue::Op::EntityCreated { local });
+        } else {
+            self.undo.record(local, 0xFFFF, &[1, 0, 0, 0]);
+        }
         let peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
         enchudb_wal::make_eid(peer, local)
     }
@@ -1970,10 +1999,9 @@ impl Engine {
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
-        debug_assert!(
-            self.himo_types[hid] == HimoType::Number || self.himo_types[hid] == HimoType::Ref,
-            "tie_to_by_id on non-Value himo_id {}", himo_id,
-        );
+        // Tag / Leaf 型 (vocab_id を value として持つ) も許可。 schema 層が
+        // 起動時に解決済みの table_vid を marker himo に張る hot path 用途で
+        // 必要 (request2.md 提案)。 caller 責任で vocab に既に居る id を渡すこと。
         self.record_undo(eid, hid);
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, value);
@@ -3025,6 +3053,24 @@ impl Engine {
         Ok(Self::spawn_consumer_with_wal(eng, Some(wal)))
     }
 
+    /// `create_concurrent_with_wal` + `undo_max_entries` override (issue3)。
+    /// default 16 M で sustained workload に足りないとき (sinfohub-server の
+    /// 100K user load test 等) に 64 M / 128 M 等を渡す。
+    /// 1 entry = 10 B、 64 M で undo region 640 MB (apparent size に積まれる)。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn create_concurrent_with_wal_undo_cap(
+        path: &str,
+        wal_capacity: usize,
+        undo_max_entries: u32,
+    ) -> io::Result<std::sync::Arc<Self>> {
+        let eng = Self::create_full_with_cyl_undo(
+            path, DEFAULT_MAX_ENTITIES, None, None, None, None, Some(undo_max_entries),
+        )?;
+        let wal_path = wal_path_for(path);
+        let wal = std::sync::Arc::new(enchudb_wal::wal::Wal::create(&wal_path, wal_capacity)?);
+        Ok(Self::spawn_consumer_with_wal(eng, Some(wal)))
+    }
+
     /// v28: WAL 付き open_concurrent。既存 WAL があればリカバリする。
     /// v29: region CRC は WAL ルートでは skip(WAL が source of truth)。
     /// 代わりに古い `.crc` ファイルは削除して、次回 flush で regenerate させる。
@@ -3191,6 +3237,7 @@ impl Engine {
         let durable_lsn_for_thread = arc.durable_lsn.clone();
         let listeners_for_thread = arc.change_listeners.clone();
         let emit_offset_for_thread = arc.change_emit_offset.clone();
+        let force_commit_for_thread = arc.undo.force_commit_signal();
 
         let handle = std::thread::Builder::new()
             .name("enchudb-consumer".into())
@@ -3219,13 +3266,22 @@ impl Engine {
                         drained_any = true;
                         engine.apply_op(op);
                         apply_count_for_thread.fetch_add(1, Ordering::Release);
+                        // apply_op 内で `Op::EntityCreated` は undo.record_unchecked を
+                        // 呼ぶ。 連続 drain で undo を cap 超まで詰めると OOB panic する
+                        // ので、 threshold を超えたら drain を中断して下の fsync 節で
+                        // undo.commit する。 次の loop iteration で drain 再開。
+                        if engine.undo.over_threshold() { break; }
                     }
 
-                    // 背景 fsync: WAL 有効 & 前回から fsync_interval 経過 &
+                    // 背景 fsync: WAL 有効 & (前回から fsync_interval 経過 OR
+                    // writer thread が backpressure で force_commit 要求 OR
+                    // consumer 自身の apply_op で undo が cap 近接) &
                     // head が checkpoint より進んでいる時のみ実行。
                     // 順序厳守: auto-Commit → WAL fsync → body msync → checkpoint 前進。
+                    let force_commit_now = force_commit_for_thread.load(Ordering::Acquire)
+                        || engine.undo.over_threshold();
                     if let Some(wal) = wal_for_thread.as_ref() {
-                        if last_fsync.elapsed() >= fsync_interval {
+                        if force_commit_now || last_fsync.elapsed() >= fsync_interval {
                             if wal.head() > wal.checkpoint() {
                                 let _ = wal.append(enchudb_wal::wal::WalOp::Commit);
                                 let _ = wal.fsync();
@@ -3242,6 +3298,13 @@ impl Engine {
                                     &listeners_for_thread,
                                     &emit_offset_for_thread,
                                 );
+                            } else if engine.undo.pending_count() > 0 {
+                                // WAL は動いてないが undo に entry がある (entity() 多発で
+                                // EntityCreated だけ積まれた case)。 body_msync で entity
+                                // slot 割り当てを durable 化してから undo.commit、 これで
+                                // 次回 over_threshold 解除。
+                                let _ = engine.body_msync();
+                                engine.undo.commit();
                             }
                             // v30: ring buffer reset を試みる。head == checkpoint &&
                             // pending_writes == 0 のときだけ head/checkpoint を HEADER_SIZE に戻す。
@@ -3492,6 +3555,11 @@ impl Engine {
             }
             Op::Content { eid, key, data } => {
                 self.contents.set(eid, &key, &data);
+            }
+            Op::EntityCreated { local } => {
+                // consumer thread 内なので backpressure spin に入ると self-deadlock。
+                // 代わりに record_unchecked、 consumer ループ側で over_threshold 監視。
+                self.undo.record_unchecked(local, 0xFFFF, &[1, 0, 0, 0]);
             }
         }
     }

@@ -19,6 +19,10 @@ pub enum Op {
     Delete { eid: u32 },
     /// 非索引コンテンツ。WAL に載せるため owned 型で保持。
     Content { eid: u32, key: Box<str>, data: Box<[u8]> },
+    /// entity 作成 marker。 writer thread の `entity()` は slot allocation のみで戻り、
+    /// 「entity created」 undo entry の record は consumer thread にこの op 経由で
+    /// 委譲する (issue3 / undo overflow 対策)。
+    EntityCreated { local: u32 },
 }
 
 pub struct WriteQueue {
