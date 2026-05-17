@@ -3,7 +3,7 @@ name = "enchudb-ffi"
 version = "0.3.0"
 edition = "2024"
 description = "EnchuDB C ABI — 全言語から叩けるよう SQLite 風の C 関数を露出する凍結 layer。cdylib / staticlib ビルド対応。"
-license = "MIT OR Apache-2.0"
+license-file = "LICENSE.md"
 authors = ["mutafika"]
 repository = "https://github.com/mutafika/enchudb"
 

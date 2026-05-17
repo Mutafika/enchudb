@@ -7,7 +7,7 @@ name = "enchudb"
 version = "0.3.0"
 edition = "2024"
 description = "EnchuDB — 紐ベース円柱エンジン。`enchudb-engine` を便利に再エクスポートする meta crate。"
-license = "MIT OR Apache-2.0"
+license-file = "LICENSE.md"
 authors = ["mutafika"]
 repository = "https://github.com/mutafika/enchudb"
 

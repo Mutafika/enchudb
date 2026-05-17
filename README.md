@@ -279,13 +279,15 @@ subprocess として writer で開く**のが推奨パターン。 詳細は
 
 ## License
 
-Licensed under either of
+Licensed under the [Functional Source License, Version 1.1, Apache 2.0 Future License](LICENSE.md) (FSL-1.1-Apache-2.0).
 
- * Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
- * MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+In short:
 
-at your option.
+- You may **use, modify, and redistribute** EnchuDB for any purpose **other than offering it as a competing product or service**.
+- On **2028-05-17** (the second anniversary of the initial release), each released version automatically converts to the **Apache License, Version 2.0**.
+
+See [`LICENSE.md`](LICENSE.md) for the full text, and <https://fsl.software/> for background on the FSL.
 
 ### Contribution
 
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you shall be licensed under FSL-1.1-Apache-2.0 as above, without any additional terms or conditions.
