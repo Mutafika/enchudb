@@ -2998,13 +2998,20 @@ impl Engine {
                 hs.has_bitmaps() && val <= hs.max_values && hs.delta_is_empty()
             });
 
-        // bitmap AND は N 全件 word AND なので O(entities/64)。
-        // cardinality 不均衡 (= 最小 slice が全体に対して十分小さい) な場合は
-        // column_filter (pivot + filter) の方が速い。 目安: 最小 slice が
-        // entity 全体の 1/8 未満なら column_filter。
+        // bitmap AND は N 全件 word AND なので O(entities/64)、 結果サイズに依存しない定数時間。
+        // column_filter は pivot bucket pull + per-eid Column 直読み (~7 ns/op)。
+        //
+        // 両者の breakeven:
+        //   column_filter:   pivot × (cond - 1) × 7 ns
+        //   bitmap_and:      (N / 64) × 0.5 ns + result_size × bit_extract
+        //   → pivot ≈ N / 1000 付近 (Column が word AND の ~14x 重いので)
+        //
+        // 旧閾値 `* 8` (pivot ≥ N/8) は 100x 緩く、 中規模 cardinality (50K-100K hit、 N=1M) で
+        // column_filter に降りて per-hit 7 ns が乗ってた。 `* 1000` で 1K pivot 以上は bitmap、
+        // 極端に絞り込めた時 (pivot < N/1000) だけ column_filter。
         if all_bitmap {
             let total = self.entities.next_eid() as usize;
-            if total == 0 || min_slice_len * 8 >= total {
+            if total == 0 || min_slice_len * 1000 >= total {
                 return self.query_bitmap_and(&conds);
             }
         }
