@@ -23,39 +23,38 @@
 
 ## メインベンチ
 
-### 1. vs SQLite (1M entities)
+### 1. vs SQLite (1M entities) — schema 層
 
 組込 DB として SQLite と直接比較。 `examples/vs_sqlite.rs`。
+**schema 層** (`Database::create` + `table.where_eq` 等) で計測 — 公開 README が推奨するパス。
+aggregates (SUM / MIN / MAX / GROUP BY) は schema 層に未提供なので `db.engine()` に降りる
+(「declarative で書きつつ hot loop だけ engine 直叩き」の典型例)。
 
 ```bash
 cargo run --release --example vs_sqlite
 ```
 
-測定軸 (1,000,000 entities、 4 himo: dept / status / salary / age):
+実測 (1,000,000 entities、 4 列: dept / status / salary / age、 全列に index):
 
-- 1 / 2 / 3 条件 AND の point query
-- 範囲 (BETWEEN)
-- COUNT / SUM / MIN / MAX
-- GROUP BY SUM
-- get (単一 entity)
-- insert スループット
-
-走らせて出た数字を以下の表に随時更新する。
-
-| クエリ | EnchuDB (M2 Max) | SQLite (M2 Max) | 倍率 |
+| クエリ | EnchuDB (schema, M2 Max) | SQLite (M2 Max) | 倍率 |
 |---|---:|---:|---:|
-| 1 条件 (dept=3) | — | — | — |
-| 2 条件 (dept=0 AND status=1) | — | — | — |
-| 3 条件 (dept=0 AND status=1 AND age=20) | — | — | — |
-| 範囲 (age 30..40) | — | — | — |
-| COUNT (status=2) | — | — | — |
-| SUM (dept=3) | — | — | — |
-| GROUP BY dept SUM salary (全件) | — | — | — |
-| get (単一 entity) | — | — | — |
-| insert 1M | — | — | — |
+| 1 条件 (dept=3) | 25.3 µs | 4.39 ms | **174x** |
+| 2 条件 (dept=0 AND status=1) | 453.6 µs | 90.30 ms | **199x** |
+| 3 条件 (dept=0 AND status=1 AND age=20) | 210.9 µs | 21.19 ms | **100x** |
+| 範囲 (age 30..40) | 18.87 ms | 22.38 ms | 1.2x |
+| COUNT (status=2) | 88.1 µs | 7.03 ms | **80x** |
+| SUM salary (dept=3) | 145.4 µs | 27.33 ms | **188x** |
+| SUM salary (全件) | 3.62 ms | 53.72 ms | 15x |
+| GROUP BY dept SUM salary (全件) | 27.73 ms | 637.81 ms | **23x** |
+| MIN/MAX salary (dept=5) | 273.2 µs | 26.70 ms | **98x** |
 
-想定特性: cylinder の AND は **条件数が増えるほど絞り込みが効く**ので、
-3 条件以上では SQLite との差が桁単位で開く (RDB と挙動が逆)。
+挙動メモ:
+- **条件 AND は絞り込みが進むほど速い** (cylinder 交差): 3 条件は 2 条件より速い。 RDB と逆。
+- **範囲 (BETWEEN) は SQLite と互角**: cylinder は等値 AND が得意、 連続 range は pull_range
+  で min..=max を線形走査するので幅が広いと負ける。 README で公平に明記。
+- **GROUP BY や全件 SUM は差が縮む**: 全件走査 dominant なワークロードでは差が 10-20x。
+- **`insert 1M`**: enchudb 1083ms / SQLite 10709ms (約 10x、 cylinder の incremental insert が
+  index 化込みで十分速い)。 単発計測なので表からは除外、 setup 行で表示。
 
 ### 2. RAG vs naive baseline (`enchudb-rag`)
 
