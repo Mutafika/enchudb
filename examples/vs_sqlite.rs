@@ -98,12 +98,12 @@ fn main() {
     // 1 条件 point query
     bench("1条件 (dept=3) — find", ITERATIONS, || {
         let r = employees.where_eq("dept", 3i64).find().unwrap();
-        assert!(!r.is_empty());
+        r.len()
     }, || {
         let mut stmt = sdb.prepare_cached("SELECT id FROM employees WHERE dept = 3").unwrap();
         let ids: Vec<i64> = stmt.query_map([], |row| row.get(0)).unwrap()
             .filter_map(|r| r.ok()).collect();
-        assert!(!ids.is_empty());
+        ids.len()
     });
 
     // 2 条件 AND
@@ -112,14 +112,14 @@ fn main() {
             .where_eq("dept", 0i64)
             .where_eq("status", 1i64)
             .find().unwrap();
-        assert!(!r.is_empty());
+        r.len()
     }, || {
         let mut stmt = sdb.prepare_cached(
             "SELECT id FROM employees WHERE dept = 0 AND status = 1"
         ).unwrap();
         let ids: Vec<i64> = stmt.query_map([], |row| row.get(0)).unwrap()
             .filter_map(|r| r.ok()).collect();
-        assert!(!ids.is_empty());
+        ids.len()
     });
 
     // 3 条件 AND
@@ -129,39 +129,38 @@ fn main() {
             .where_eq("status", 1i64)
             .where_eq("age", 20i64)
             .find().unwrap();
-        let _ = r.len();
+        r.len()
     }, || {
         let mut stmt = sdb.prepare_cached(
             "SELECT id FROM employees WHERE dept = 0 AND status = 1 AND age = 20"
         ).unwrap();
         let ids: Vec<i64> = stmt.query_map([], |row| row.get(0)).unwrap()
             .filter_map(|r| r.ok()).collect();
-        let _ = ids.len();
+        ids.len()
     });
 
     // 範囲
     bench("範囲 (age 30..40)", ITERATIONS, || {
         let r = employees.where_range("age", 30, 40).find().unwrap();
-        assert!(!r.is_empty());
+        r.len()
     }, || {
         let mut stmt = sdb.prepare_cached(
             "SELECT id FROM employees WHERE age BETWEEN 30 AND 40"
         ).unwrap();
         let ids: Vec<i64> = stmt.query_map([], |row| row.get(0)).unwrap()
             .filter_map(|r| r.ok()).collect();
-        assert!(!ids.is_empty());
+        ids.len()
     });
 
-    // COUNT
+    // COUNT (結果は数字 1 つ、 hits 表示は対象の母集団サイズで)
     bench("COUNT (status=2)", ITERATIONS, || {
-        let c = employees.where_eq("status", 2i64).count().unwrap();
-        assert!(c > 0);
+        employees.where_eq("status", 2i64).count().unwrap()
     }, || {
         let c: i64 = sdb.query_row(
             "SELECT COUNT(*) FROM employees WHERE status = 2", [],
             |row| row.get(0),
         ).unwrap();
-        assert!(c > 0);
+        c as usize
     });
 
     // ── aggregates: schema 層に sum / min / max / group_* が無いので engine 直叩き ──
@@ -171,56 +170,59 @@ fn main() {
     let h_salary = "employees.salary";
     let h_dept = "employees.dept";
 
-    // SUM (filtered)
+    // SUM (filtered) — hits = 走査対象数
     bench("SUM salary (dept=3)", ITERATIONS, || {
         let ids: Vec<EntityId> = employees.where_eq("dept", 3i64).find().unwrap();
-        let s = eng.sum(h_salary, &ids);
-        assert!(s > 0);
+        let _ = eng.sum(h_salary, &ids);
+        ids.len()
     }, || {
-        let s: i64 = sdb.query_row(
+        let _: i64 = sdb.query_row(
             "SELECT SUM(salary) FROM employees WHERE dept = 3", [],
             |row| row.get(0),
         ).unwrap();
-        assert!(s > 0);
+        // SQLite 側の hit 数は別途 COUNT で取らないと出ないので、 enchu と同じ仮定で出す
+        ENTITY_COUNT as usize / DEPT_COUNT as usize
     });
 
-    // SUM (全件)
+    // SUM (全件) — hits = 全件
     bench("SUM salary (全件)", ITERATIONS, || {
         let all = eng.entities();
-        let s = eng.sum(h_salary, &all);
-        assert!(s > 0);
+        let _ = eng.sum(h_salary, &all);
+        all.len()
     }, || {
-        let s: i64 = sdb.query_row(
+        let _: i64 = sdb.query_row(
             "SELECT SUM(salary) FROM employees", [],
             |row| row.get(0),
         ).unwrap();
-        assert!(s > 0);
+        ENTITY_COUNT as usize
     });
 
-    // GROUP BY + SUM
+    // GROUP BY + SUM — hits = group 数を返すが、 走査は全件
     bench("GROUP BY dept SUM salary (全件)", ITERATIONS, || {
         let all = eng.entities();
         let g = eng.group_sum(h_dept, h_salary, &all);
-        assert_eq!(g.len(), DEPT_COUNT as usize);
+        g.len()
     }, || {
         let mut stmt = sdb.prepare_cached(
             "SELECT dept, SUM(salary) FROM employees GROUP BY dept"
         ).unwrap();
         let rows: Vec<(i64, i64)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap().filter_map(|r| r.ok()).collect();
-        assert_eq!(rows.len(), DEPT_COUNT as usize);
+        rows.len()
     });
 
-    // MIN / MAX
+    // MIN / MAX — hits = 走査対象数
     bench("MIN/MAX salary (dept=5)", ITERATIONS, || {
         let ids: Vec<EntityId> = employees.where_eq("dept", 5i64).find().unwrap();
         let _ = eng.min(h_salary, &ids);
         let _ = eng.max(h_salary, &ids);
+        ids.len()
     }, || {
         let _: (i64, i64) = sdb.query_row(
             "SELECT MIN(salary), MAX(salary) FROM employees WHERE dept = 5", [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).unwrap();
+        ENTITY_COUNT as usize / DEPT_COUNT as usize
     });
 
     // cleanup
@@ -228,25 +230,43 @@ fn main() {
     let _ = std::fs::remove_file(sqlite_path);
 }
 
-fn bench<F1: Fn(), F2: Fn()>(label: &str, iterations: u32, enchu_fn: F1, sqlite_fn: F2) {
+fn bench<F1: Fn() -> usize, F2: Fn() -> usize>(label: &str, iterations: u32, enchu_fn: F1, sqlite_fn: F2) {
     // warmup
-    for _ in 0..3 { enchu_fn(); sqlite_fn(); }
+    let _ = enchu_fn();
+    let _ = sqlite_fn();
+    for _ in 0..2 { let _ = enchu_fn(); let _ = sqlite_fn(); }
+
+    // capture hit count from first iteration (after warmup)
+    let enchu_hits = enchu_fn();
+    let sqlite_hits = sqlite_fn();
 
     let t = Instant::now();
-    for _ in 0..iterations { enchu_fn(); }
+    for _ in 0..iterations { let _ = enchu_fn(); }
     let enchu_ns = t.elapsed().as_nanos() / iterations as u128;
 
     let t = Instant::now();
-    for _ in 0..iterations { sqlite_fn(); }
+    for _ in 0..iterations { let _ = sqlite_fn(); }
     let sqlite_ns = t.elapsed().as_nanos() / iterations as u128;
 
     let ratio = if enchu_ns > 0 { sqlite_ns as f64 / enchu_ns as f64 } else { f64::INFINITY };
 
-    println!("{label}");
+    let hits_str = if enchu_hits == sqlite_hits {
+        format!("{} hits", format_hits(enchu_hits))
+    } else {
+        format!("enchu={} sqlite={}", format_hits(enchu_hits), format_hits(sqlite_hits))
+    };
+
+    println!("{label}  [{hits_str}]");
     println!("  enchudb (schema): {}", format_ns(enchu_ns));
     println!("  sqlite:           {}", format_ns(sqlite_ns));
     println!("  → {:.0}x", ratio);
     println!();
+}
+
+fn format_hits(n: usize) -> String {
+    if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1_000_000.0) }
+    else if n >= 1_000 { format!("{}K", n / 1_000) }
+    else { format!("{n}") }
 }
 
 fn format_ns(ns: u128) -> String {

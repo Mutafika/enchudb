@@ -36,24 +36,30 @@ cargo run --release --example vs_sqlite
 
 実測 (1,000,000 entities、 4 列: dept / status / salary / age、 全列に index):
 
-| クエリ | EnchuDB (schema, M2 Max) | SQLite (M2 Max) | 倍率 |
-|---|---:|---:|---:|
-| 1 条件 (dept=3) | 25.3 µs | 4.39 ms | **174x** |
-| 2 条件 (dept=0 AND status=1) | 453.6 µs | 90.30 ms | **199x** |
-| 3 条件 (dept=0 AND status=1 AND age=20) | 210.9 µs | 21.19 ms | **100x** |
-| 範囲 (age 30..40) | 18.87 ms | 22.38 ms | 1.2x |
-| COUNT (status=2) | 88.1 µs | 7.03 ms | **80x** |
-| SUM salary (dept=3) | 145.4 µs | 27.33 ms | **188x** |
-| SUM salary (全件) | 3.62 ms | 53.72 ms | 15x |
-| GROUP BY dept SUM salary (全件) | 27.73 ms | 637.81 ms | **23x** |
-| MIN/MAX salary (dept=5) | 273.2 µs | 26.70 ms | **98x** |
+| クエリ | hits | EnchuDB (schema) | SQLite | 倍率 | per hit |
+|---|---:|---:|---:|---:|---:|
+| 1 条件 (dept=3) | 50K | 21.3 µs | 4.25 ms | **200x** | 0.4 ns |
+| 2 条件 (dept=0 AND status=1) | 50K | 385.0 µs | 82.80 ms | **215x** | 7.7 ns |
+| 3 条件 (dept=0 AND status=1 AND age=20) | 10K | 144.0 µs | 16.15 ms | **112x** | 14.4 ns |
+| 範囲 (age 30..40) | 220K | 16.33 ms | 18.87 ms | 1.2x | 74 ns |
+| COUNT (status=2) | 200K | 88.6 µs | 9.59 ms | **108x** | — |
+| SUM salary (dept=3) | 50K | 148.4 µs | 32.63 ms | **220x** | 3.0 ns |
+| SUM salary (全件) | 1M | 3.60 ms | 66.64 ms | **19x** | 3.6 ns |
+| GROUP BY dept SUM salary (全件 → 20 groups) | 1M scan | 32.00 ms | 726.46 ms | **23x** | 32 ns |
+| MIN/MAX salary (dept=5) | 50K | 394.7 µs | 34.38 ms | **87x** | 7.9 ns |
+
+`per hit` は **結果サイズに対する latency**。 単純 `find` は 0.4 ns/hit
+(メモリ帯域に張り付いた memcpy 速度) — 「結果返却は memcpy 律速」の実証。 cylinder 交差や
+集計が入ると per-hit cost が増える。
 
 挙動メモ:
-- **条件 AND は絞り込みが進むほど速い** (cylinder 交差): 3 条件は 2 条件より速い。 RDB と逆。
+- **条件 AND は絞り込みが進むほど速い** (cylinder 交差): 3 条件 (10K hits, 144µs) は
+  2 条件 (50K hits, 385µs) より絶対時間が短い。 RDB と挙動が逆。
 - **範囲 (BETWEEN) は SQLite と互角**: cylinder は等値 AND が得意、 連続 range は pull_range
-  で min..=max を線形走査するので幅が広いと負ける。 README で公平に明記。
-- **GROUP BY や全件 SUM は差が縮む**: 全件走査 dominant なワークロードでは差が 10-20x。
-- **`insert 1M`**: enchudb 1083ms / SQLite 10709ms (約 10x、 cylinder の incremental insert が
+  で min..=max を線形走査するので幅が広いと負ける。 220K hits を 16ms (74 ns/hit) で出すのが限界。
+- **GROUP BY / 全件 SUM は差が縮む** が、 それでも 19-23x: 全件走査でも cylinder バケット
+  読みが SQLite の B-tree leaf walk より速い。
+- **`insert 1M`**: enchudb 999 ms / SQLite 11.5 s (約 11x、 cylinder の incremental insert が
   index 化込みで十分速い)。 単発計測なので表からは除外、 setup 行で表示。
 
 ### 2. RAG vs naive baseline (`enchudb-rag`)
