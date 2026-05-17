@@ -89,7 +89,46 @@ cargo run --release --example rag_compare -p enchudb-rag
 
 ns lookup の優位が見えるのは RAG ではなく **構造クエリ / KV / counter / token validation** 系。
 
-### 3. criterion regression suite
+### 3. 多条件 AND の cond 数スケーリング
+
+`examples/multi_cond_scaling.rs`。 7 himo (値域 5/20/10/8/40/50/1000) のテーブルで
+cond 数を 1→7 と増やして latency を測る。 「複合条件で速くなるのか」 の検証。
+
+```bash
+cargo run --release --example multi_cond_scaling
+```
+
+実測 (M2 Max、 1M rows、 deterministic xorshift で独立サンプリング):
+
+| cond | hits | time | per hit |
+|---:|---:|---:|---:|
+| 1 | 199K | 58.7 µs | 0.29 ns |
+| 2 | 9K | 285.2 µs | 28.7 ns |
+| 3 | 956 | 312.0 µs | 326 ns |
+| 4 | 128 | 359.7 µs | 2,810 ns |
+| 5 | 3 | 192.2 µs | 64,051 ns |
+| 6 | 0 | 135.0 µs | — |
+| 7 | 0 | 4.0 µs | — |
+
+挙動:
+- **cond=1**: pull 直叩き fast path (`query_resolved` の `conds.len() == 1`)、 memcpy 律速 (0.29 ns/hit)
+- **cond=2..4**: bitmap_and 経路。 cond 追加で word AND コスト +30 µs くらい乗る (理論値 7.5 µs より大きい — メモリアクセスがキャッシュにフィットしない)。 結果サイズが減っても extract コスト節約で大きく相殺できない
+- **cond=5..6**: 結果がほぼ 0 hits、 extract が誤差、 base bitmap AND だけ残って ~150 µs に落ちる
+- **cond=7**: g (1000 値域) は schema が max_values=0 で define_himo するので bitmap 非生成 →
+  `all_bitmap` 判定が false、 **column_filter 経路に降りて** pivot (~1000 hits) × 6 cond で 4 µs。
+  別アルゴリズムなので比較対象外
+
+**「条件追加で常に速くなる」 は錯覚**: bitmap_and では cond 追加に対して word AND コストが線形に
+乗る (M2 Max では実測 ~30 µs/cond)。 結果サイズ減による extract 節約は ~4 ns/hit なので、
+**結果が 7500+ hits 減らないと cond 追加は net で遅くなる**。 RDB 的に「絞り込めば速い」 の
+直感とは違う。
+
+将来の改善余地:
+- bitmap word AND の SIMD 化 (AVX-512 / NEON) で 4-8x 速くなる → 谷曲線が浅くなる
+- bit extract の bulk extraction (一度に 64 bit popcount + scan)
+- 大値域 himo (1000+) でも bitmap を許容するオプション (今は column_filter 経由)
+
+### 4. criterion regression suite
 
 `benches/core.rs`。 主要 op の **退行検出** が目的、 数字そのものではなく
 ΔTime% に注目する。
