@@ -8,10 +8,11 @@
 
 | Crate | 役割 | meta crate での opt-in |
 |---|---|---|
+| [`enchudb-wal`](./crates/enchudb-wal) | append-only WAL、HLC、peer keys。engine / sync / transport の共通 primitive | always |
 | [`enchudb-engine`](./crates/enchudb-engine) | コアストレージエンジン。Cylinder + PairTable + WAL + Ravn | always |
 | [`enchudb-schema`](./crates/enchudb-schema) | **native API**。 仮想 2D テーブル + himo_id pre-resolve + schema 永続化 | always |
-| [`enchudb-sync`](./crates/enchudb-sync) | HLC-LWW Syncer、ShardRouter | `features = ["v32"]` |
-| [`enchudb-transport`](./crates/enchudb-transport) | HTTP relay / WebSocket push hub | runtime 直接依存 |
+| [`enchudb-sync`](./crates/enchudb-sync) | HLC-LWW Syncer、ShardRouter、SubscriptionFilter | always |
+| [`enchudb-transport`](./crates/enchudb-transport) | HTTP relay / WebSocket push hub | 直接依存 |
 | [`enchudb-text`](./crates/enchudb-text) | bigram 転置インデックスによる全文検索 | 直接依存 |
 | [`enchudb-rag`](./crates/enchudb-rag) | RAG ストア。メタフィルタ先行 + brute force cosine、ANN 不要 | 直接依存 |
 | [`enchudb-sql`](./crates/enchudb-sql) | SQLite 上位互換の SQL frontend (CRUD + ORDER BY / LIMIT / 範囲 / IS NULL / INSERT OR REPLACE)、 **schema 永続化** | `features = ["sql"]` |
@@ -209,7 +210,7 @@ let hits = store.search(
 )?;
 ```
 
-100k chunks / dim=384 で `tenant=1 AND lang=en` フィルタ付き類似検索が **0.49ms**。
+個人スケール（〜1M chunks）+ メタフィルタ先行で sub-ms RAG。実数値は [`benches/README.md`](./benches/README.md) と [`crates/enchudb-rag/examples/`](./crates/enchudb-rag/examples) を参照。
 
 ## ベンチマーク
 
@@ -240,10 +241,8 @@ cargo test --workspace
 cargo test --workspace -- --ignored
 
 # ベンチ — 詳細は benches/README.md
-cargo run --release --features "v27 v32" --example vs_sqlite
-cargo run --release --features "v27 v32" --example v27_vs_v31_full
-cargo run --release --features "v33 v26" --example v33_vs_pairs
-cargo bench --features v32 --bench core
+cargo bench --bench core
+cargo run --release --example vs_sqlite
 ```
 
 ## ファイル構成
@@ -275,7 +274,7 @@ subprocess として writer で開く**のが推奨パターン。 詳細は
 
 ## 開発状況
 
-0.x 段階。SemVer 1.0 未到達、破壊的変更あり得る。v1 → v31 を約 1 ヶ月（v28 → v31 は 2 時間弱）で駆け抜けた実験的プロジェクト。
+0.x 段階。SemVer 1.0 未到達、API / on-disk format に破壊的変更が入る可能性あり。プロダクション利用は自己責任で。
 
 ## License
 
