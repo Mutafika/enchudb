@@ -1,8 +1,17 @@
 # EnchuDB
 
-紐ベース円柱エンジンを中核に据えた組み込み DB と、その上に積む SQL / FFI / 検索 / RAG / トランスポート層。
+**Embedded graph engine with multi-condition AND in nanoseconds.**
 
-単一ファイル mmap、BucketCylinder (値 → eid バケット) で **lookup decision が ns 級**、 ロックフリー並行 read。 結果の返却は memcpy 律速で結果サイズに比例 (µs スケール、 物理限界)。
+紐 (himo) ベースの円柱エンジンを中核に据えた組み込み DB。単一ファイル mmap、BucketCylinder (値 → eid バケット) で **lookup decision が ns 級**、ロックフリー並行 read。結果の返却は memcpy 律速で結果サイズに比例 (µs スケール、物理限界)。
+
+その上に **schema / SQL / FFI / 全文検索 / RAG / P2P sync / transport** を積めるワークスペース。
+
+## なぜ
+
+- **SQLite より速い lookup**: BucketCylinder で値 → eid が ns、多条件 AND がバケット交差で爆速
+- **Rocks / Lmdb と違って relations 持てる**: 紐 + 円柱で graph 的 traversal (Ravn)
+- **Append-only WAL + HLC**: P2P sync (`enchudb-sync`) が built-in、partial sync (`SubscriptionFilter`) も
+- **メモリフットプリント小**: mmap 単一ファイル、ページキャッシュ依存
 
 ## Workspace
 
@@ -18,85 +27,50 @@
 | [`enchudb-sql`](./crates/enchudb-sql) | SQLite 上位互換の SQL frontend (CRUD + ORDER BY / LIMIT / 範囲 / IS NULL / INSERT OR REPLACE)、 **schema 永続化** | `features = ["sql"]` |
 | [`enchudb-ffi`](./crates/enchudb-ffi) | SQLite 風 C ABI 12 関数、`cdylib + staticlib`、Python / Node / Swift から叩ける土台 | `features = ["ffi"]` |
 
-各 sub-crate の `README.md` に詳細あり。Node.js バインディングは独立 repo [`mutafika/enchu-extend`](https://github.com/mutafika/enchu-extend) (v33 で sibling として fork)。
+各 sub-crate の `README.md` に詳細あり。Node.js バインディングは独立 repo [`mutafika/enchu-extend`](https://github.com/mutafika/enchu-extend)。
 
 ## Quick start
 
-EnchuDB の API は 2 層構造で、 用途に応じて使い分ける:
-
-| 層 | 用途 | hot path での perf |
-|---|---|---|
-| **schema 層** (`enchudb-schema`) | DDL 宣言、 schema 永続化、 declarative な CRUD (低頻度 / REPL / 試作) | string lookup + dispatch あり、 raw の ~50 % |
-| **engine 層** (`enchudb-engine`) | runtime hot path (高頻度 writer / reader)、 `_by_id` API で string lookup ゼロ | ns 級 lookup、 raw 上限 |
-
-「最初は schema で宣言してから、 高頻度 path だけ engine に降りる」 がベストプラクティス。
-
-### 起動時: schema で declaration + 永続化
+推奨は **schema 層**。 仮想 2D テーブルを宣言して CRUD、 schema は DB ファイル内に永続化されるので reopen 時に CREATE 不要。
 
 ```rust
 use enchudb::schema::Database;
 
 let mut db = Database::create("/tmp/app.db")?;
 
-// 仮想 2D テーブルを宣言、 build() で col → himo_id を pre-resolve
-let _ = db.table("users")
-    .integer("id")
-    .text("name")
-    .integer("age")
+let users = db.table("users")
+    .number("id")
+    .tag("name")
+    .number("age")
     .primary_key("id")
     .build()?;
 
-// reopen で schema 自動復元
-drop(db);
-let db = Database::open("/tmp/app.db")?;
-let users = db.get_table("users").unwrap();  // CREATE 再呼出 不要
-```
-
-### convenience API (低頻度 / REPL / 試作)
-
-declarative で書き味重視。 perf は engine 直叩きより劣る (string lookup あり、 marker tie が rowbuilder 内で auto inject)。
-
-```rust
 let alice = users.insert()
     .set("id", 1i64).set("name", "Alice").set("age", 30i64)
     .commit()?;
 
-let young = users.where_eq("age", 30i64).find()?;
-let multi = users.where_eq("age", 30i64).where_eq("name", "Alice").find()?;
+let hits = users.where_eq("age", 30i64)
+    .where_eq("name", "Alice")
+    .find()?;
 ```
 
-### runtime hot path: bindings + engine 直叩き
+`build()` で col → himo_id が pre-resolve されるので、 hot path の string lookup は内部で消える。 「最適化したいから engine 直叩き」は通常不要 (v0.3.0 で schema 層を zero-cost 化済み)。
 
-行数 KO/sec 級の writer / reader は **bindings を起動時に取り出して engine 直叩き**。 string lookup と dispatch が消える。
+reopen:
 
 ```rust
-// bindings 取り出し (起動時 1 回)
-let users = db.get_table("users").unwrap();
-let marker_hid = db.marker_himo_id();
-let table_vid  = users.table_vid();
-let name_hid   = users.himo_id("name").unwrap();
-let age_hid    = users.himo_id("age").unwrap();
-drop(users);
-
-// runtime: bindings + engine 直叩き
-let eng = db.arc_engine();
-let e = eng.entity();
-eng.tie_to_by_id(e, marker_hid, table_vid);
-eng.tie_text_to_by_id(e, name_hid, "Alice");
-eng.tie_to_by_id(e, age_hid, 30);
-
-// 多条件 query も query_by_id 直叩き
-let rows = eng.query_by_id(&[(marker_hid, table_vid), (age_hid, 30)]);
+let db = Database::open("/tmp/app.db")?;
+let users = db.get_table("users").unwrap();   // CREATE 不要、schema 復元済み
 ```
 
 詳細は [`crates/enchudb-schema/README.md`](./crates/enchudb-schema/README.md)。
 
-### engine 層 単独 (schema なし)
+### Engine 層直叩き (graph 操作 / 自前 dispatch がしたい時)
 
 ```rust
 use enchudb::{Engine, HimoType};
 
-let mut db = Engine::create("/tmp/my.db")?;
+let db = Engine::create_standalone("/tmp/my.db")?;
 db.define_himo("age", HimoType::Number, 100);
 
 let alice = db.entity();
@@ -110,32 +84,28 @@ let result = db.query(&[("age", 30)]);
 ### SQL frontend (`features = ["sql"]`)
 
 ```rust
-use enchudb_sql::{Database, Output, Value};
+use enchudb_sql::{Database, Output};
 
-// state-log preset (apparent ~0.7 MB、Time Machine / rsync 互換サイズ)
 let mut db = Database::create_growable_tiny("/tmp/notif.db")?;
 
 db.execute("CREATE TABLE notif (key TEXT PRIMARY KEY, dismissed_at INTEGER)")?;
 db.execute("INSERT OR REPLACE INTO notif VALUES ('uuid-abc', 1715174400)")?;
 
-match db.execute("
+if let Output::Rows { rows, columns } = db.execute("
     SELECT key, dismissed_at FROM notif
     WHERE dismissed_at > 1715000000 AND dismissed_at IS NOT NULL
     ORDER BY dismissed_at DESC
     LIMIT 10
 ")? {
-    Output::Rows { rows, columns } => { /* rows[i][j] = Value::Integer | Text | Null */ }
-    _ => {}
+    // rows[i][j] = Value::Integer | Text | Null
 }
-drop(db);  // close (Drop で自動 flush)
+drop(db);
 
-// 再 open — CREATE TABLE 再呼出は不要、 schema は DB ファイルに永続化されてる
 let mut db = Database::open("/tmp/notif.db")?;
-assert_eq!(db.list_tables().len(), 1);
-db.execute("SELECT key FROM notif")?;  // そのまま使える
+assert_eq!(db.list_tables().len(), 1);    // schema 復元済み
 ```
 
-非 SQL コンシューマ (enchu studio など) は `Database::list_tables()` で schema を直接読める。
+非 SQL コンシューマは `Database::list_tables()` で schema を読める。
 
 ### C ABI (`features = ["ffi"]`)
 
@@ -162,44 +132,46 @@ enchudb_close(db);
 
 ヘッダ: `crates/enchudb-ffi/include/enchudb.h`、デモ: `crates/enchudb-ffi/examples/demo.c`。
 
-### 耐久性（WAL、v28+）
+### 耐久性 (WAL)
 
 ```rust
 let db = Engine::create_concurrent_with_wal("/tmp/my.db", 256 * 1024 * 1024)?;
 
 let e = db.entity();
 db.tie_async(e, "age", 30);
-db.wal_sync()?;      // fsync + msync、Sync モード 148μs
-// または wal_commit() で Async モード 100ns
+db.wal_sync()?;       // fsync + msync
+// または wal_commit() で背景 fsync (Async モード)
 ```
 
-### グラフ辿り（Ravn、v31+）
+### グラフ辿り (Ravn)
 
 ```rust
 use enchudb::Ravn;
+
 let ravn = Ravn::new(db.clone());
 
-// 「Alice が Next.js で話したセッションの決定事項」
-let nextjs = db.query(&[("name", vocab("Next.js")), ("kind", 2)]);
-let sessions = ravn.reverse_follow(&nextjs, "topic");
-let alice_sessions = ravn.filter_by(&sessions, "speaker", alice_id);
-let decisions = ravn.extract_text(&alice_sessions, "decision");
+// 「Alice が Next.js について話したセッションの決定事項」
+let nextjs       = db.query(&[("name", vocab_id_for("Next.js")), ("kind", 2)]);
+let sessions     = ravn.reverse_follow(&nextjs, "topic");
+let by_alice     = ravn.filter_by(&sessions, "speaker", alice_id);
+let decisions    = ravn.extract_text(&by_alice, "decision");
 ```
 
-DSL:
+DSL も使える:
 
 ```
 kind:2 name:"Next.js" | reverse topic | where speaker:<alice_eid> | get decision
 ```
 
-### RAG（`enchudb-rag`）
+### RAG (`enchudb-rag`)
 
 ```rust
-use enchudb_rag::{RagStore, Chunk, Meta, Query, Filter, Embedder};
+use enchudb_rag::{RagStore, Chunk, Meta, Query, Filter};
 
 let mut store = RagStore::builder()
     .path("./rag")
     .dim(384)
+    .meta_value("tenant", 100)
     .meta_symbol("lang")
     .build()?;
 
@@ -210,48 +182,37 @@ let hits = store.search(
 )?;
 ```
 
-個人スケール（〜1M chunks）+ メタフィルタ先行で sub-ms RAG。実数値は [`benches/README.md`](./benches/README.md) と [`crates/enchudb-rag/examples/`](./crates/enchudb-rag/examples) を参照。
+個人スケール (〜1M chunks) + メタフィルタ先行で sub-ms RAG。実測は [`crates/enchudb-rag/examples/`](./crates/enchudb-rag/examples) を参照。
 
 ## ベンチマーク
 
-再現コマンド・実測値・ハードウェア記述は [`benches/README.md`](./benches/README.md) に集約。
-誇大な数字を README に書かない方針 — 興味ある人は自分で走らせて検証できる。
-
-## アーキテクチャ要点
-
-- **紐（himo）**: entity に張る属性 = 索引の単位、 任意の文字列名 (UTF-8)
-- **Column**: source of truth、 mmap 永続化、 `Column[himo][eid] = value`
-- **BucketCylinder**（v27、 default）: 値ごとの eid バケット、 値 → バケット O(1)、 cylinder slice + Column filter で多条件 AND
-- **PairTable**（v26、 opt-in）: 紐 2 本のペア cell、 v27 で多くを吸収済み、 現在 dormant
-- **WAL**（v28+）: crash consistency、 背景 fsync、 リングバッファ再利用
-- **Ravn**（v31+）: グラフ辿り DSL、 多段 reverse_follow + filter_by
-- **仮想 2D テーブル層** (`enchudb-schema`): N 個の紐を 1 つの table 名で束ねる、 col → himo_id を pre-resolve、 schema は DB ファイル内に永続化。 SQL crate と FFI もこの上に乗る
-
-メンタルモデル: engine 全体は **モンジャラ** (蔓 = 紐、 entity = 蔓の交差点に隠れた本体)。 1 つの紐の中身は **2D table** (値 × eid バケット)。
-
-各 sub-crate の `README.md` に詳細あり。
-
-## Testing
+再現コマンド・実測値・ハードウェア記述は [`benches/README.md`](./benches/README.md) に集約。誇大な数字を README に書かない方針 — 興味ある人は自分で走らせて検証できる。
 
 ```bash
-# コア unit + integration (~400 件、 1 分程度)
-cargo test --workspace
-
-# 重いスケーリング・ストレステスト (25 件、 手動実行)
-cargo test --workspace -- --ignored
-
-# ベンチ — 詳細は benches/README.md
 cargo bench --bench core
 cargo run --release --example vs_sqlite
 ```
+
+## アーキテクチャ要点
+
+- **紐 (himo)**: entity に張る属性 = 索引の単位、 任意の文字列名 (UTF-8)
+- **Column**: source of truth、 mmap 永続化、 `Column[himo][eid] = value`
+- **BucketCylinder**: 値ごとの eid バケット、 値 → バケット O(1)、 cylinder slice + Column filter で多条件 AND
+- **WAL**: crash consistency、 背景 fsync、 リングバッファ再利用
+- **Ravn**: グラフ辿り DSL、 多段 reverse_follow + filter_by
+- **仮想 2D テーブル層** (`enchudb-schema`): N 個の紐を 1 つの table 名で束ねる、 col → himo_id を pre-resolve、 schema は DB ファイル内に永続化。 SQL frontend と FFI もこの上に乗る。
+
+メンタルモデル: engine 全体は **モンジャラ** (蔓 = 紐、 entity = 蔓の交差点に隠れた本体)。 1 つの紐の中身は **2D table** (値 × eid バケット)。
+
+各 sub-crate の `README.md` に詳細あり。`docs/` に architecture / concurrency / migration 各種ノートも。
 
 ## ファイル構成
 
 ```
 {path}         メイン DB (mmap、 layout v3、 FILE_VERSION 3)
-{path}.wal     WAL (v28+、 有効時、 sparse file)
+{path}.wal     WAL (有効時、 sparse file)
 {path}.lock    writer 排他 sidecar (writer open 時に flock、 close で release)
-{path}.crc    region CRC (seal_integrity 時のみ)
+{path}.crc     region CRC (seal_integrity 時のみ)
 <blob_root>/   BlobStore (別ディレクトリ、 content-addressed、 大 blob 外出し用)
 ```
 
@@ -261,20 +222,29 @@ cargo run --release --example vs_sqlite
 
 | やりたい事 | API | lock | 同時 process |
 |---|---|---|---|
-| 書く + 読む | `Engine::open_concurrent_with_wal` / `open_standalone` | exclusive | 1 |
+| 書く + 読む | `Engine::open_concurrent_with_wal` / `Engine::open_standalone` | exclusive | 1 |
 | 読むだけ | `Engine::open_readonly` / `Database::open_readonly` | なし | 無制限 |
 
-writer は `.db.lock` sidecar に `flock(LOCK_EX)` を engine 寿命中保持。 2 つ目の
-writer は drop されるまで block (sqlite default 動作と同じ)。 readonly は lock を
-取らないので writer と共存可、 write API を呼ぶと panic で即気付く。
+writer は `.db.lock` sidecar に `flock(LOCK_EX)` を engine 寿命中保持。 2 つ目の writer は drop されるまで block (sqlite default 動作と同じ)。 readonly は lock を取らないので writer と共存可、 write API を呼ぶと panic で即気付く。
 
-GUI app + CLI を同 DB で共存する場合は **GUI が `open_readonly`、 CLI が
-subprocess として writer で開く**のが推奨パターン。 詳細は
-[`docs/concurrency.md`](./docs/concurrency.md)。
+GUI app + CLI を同 DB で共存する場合は **GUI が `open_readonly`、 CLI が subprocess として writer で開く**のが推奨パターン。 詳細は [`docs/concurrency.md`](./docs/concurrency.md)。
+
+## Testing
+
+```bash
+# unit + integration (~400 件、 1 分程度)
+cargo test --workspace
+
+# 重いスケーリング・ストレステスト (手動実行)
+cargo test --workspace -- --ignored
+
+# bench
+cargo bench --bench core
+```
 
 ## 開発状況
 
-0.x 段階。SemVer 1.0 未到達、API / on-disk format に破壊的変更が入る可能性あり。プロダクション利用は自己責任で。
+0.x 段階。SemVer 1.0 未到達、 API / on-disk format に破壊的変更が入る可能性あり。 プロダクション利用は自己責任で。
 
 ## License
 
@@ -283,7 +253,7 @@ Licensed under the [Functional Source License, Version 1.1, Apache 2.0 Future Li
 In short:
 
 - You may **use, modify, and redistribute** EnchuDB for any purpose **other than offering it as a competing product or service**.
-- On **2028-05-17** (the second anniversary of the initial release), each released version automatically converts to the **Apache License, Version 2.0**.
+- **Each released version converts to Apache 2.0 two years after that version's release.** The project as a whole stays under FSL while continuously updated; only the specific past releases roll into Apache 2.0.
 
 See [`LICENSE.md`](LICENSE.md) for the full text, and <https://fsl.software/> for background on the FSL.
 
