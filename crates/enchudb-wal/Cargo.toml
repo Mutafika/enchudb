@@ -1,6 +1,6 @@
 [package]
 name = "enchudb-wal"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "EnchuDB WAL — append-only operation log, HLC, peer keys. Wire-level primitives shared by engine / sync / transport."
 license-file = "LICENSE.md"

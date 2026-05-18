@@ -1,6 +1,6 @@
 [package]
 name = "enchudb-text"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "bigram 転置インデックスによる全文検索エンジン。native は mmap、wasm は from_bytes 経由で起動。"
 license-file = "LICENSE.md"
