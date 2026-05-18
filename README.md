@@ -248,7 +248,7 @@ cargo run --release --example vs_sqlite
 ## ファイル構成
 
 ```
-{path}         メイン DB (mmap、 layout v3、 FILE_VERSION 3)
+{path}         メイン DB (mmap、 layout v4、 FILE_VERSION 4)
 {path}.wal     WAL (有効時、 sparse file)
 {path}.lock    writer 排他 sidecar (writer open 時に flock、 close で release)
 {path}.crc     region CRC (seal_integrity 時のみ)
