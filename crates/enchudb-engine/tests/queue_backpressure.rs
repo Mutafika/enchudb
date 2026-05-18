@@ -18,7 +18,6 @@ fn small_queue_cap_does_not_hang() {
     let eng: Arc<Engine> = Engine::create_concurrent_with_wal_queue_cap(
         path,
         4 * 1024 * 1024, // wal_capacity 4 MB
-        4096,            // undo_max_entries
         64,              // queue_capacity (tiny — 強制的に backpressure 発動)
     ).expect("create");
 

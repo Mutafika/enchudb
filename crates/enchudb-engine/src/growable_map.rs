@@ -301,9 +301,9 @@ impl GrowableMap {
     }
 
     /// 書き込みが起きた byte 範囲を [offset, offset+len) で記録 (consumer 用)。
-    /// 主に consumer thread (apply_op 経由の Column::set / UndoLog::record_unchecked /
-    /// ContentStore::set) から呼ぶ。 writer thread からは呼ばない (cache line
-    /// contention で perf 退化するため、 別経路で msync する)。
+    /// 主に consumer thread (apply_op 経由の Column::set / ContentStore::set) から
+    /// 呼ぶ。 writer thread からは呼ばない (cache line contention で perf 退化する
+    /// ため、 別経路で msync する)。
     ///
     /// Release ordering で書く: writer の mmap 書き込みが consumer の `flush_dirty`
     /// (AcqRel swap) より happens-before になることを保証する。 `fetch_min` /

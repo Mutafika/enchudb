@@ -7,7 +7,7 @@
 //!   content/get_content → 非索引テキスト
 //!   query → 円柱の重なりを一発で返す
 //!   delete → entity 削除
-//!   commit/rollback → トランザクション（undo ログ）
+//!   commit → WAL Commit marker append (WAL 有効時のみ意味あり)
 //!   open/flush → 永続化（mmap なので open は即利用可）
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -248,7 +248,6 @@ use crate::vocabulary::Vocabulary;
 use crate::entity_set::EntitySet;
 use crate::himo_store::{HimoStore, HimoType};
 use crate::content_store::ContentStore;
-use crate::undo::UndoLog;
 use crate::column::Column;
 
 // ════════════════ ギャロッピング交差 ════════════════
@@ -302,10 +301,11 @@ fn extract_bitmap(bitmap: &[u64]) -> Vec<u32> {
 // ════════════════ ファイルレイアウト ════════════════
 
 const FILE_MAGIC: [u8; 4] = *b"ECDB";
-/// v3: Layout reorg — variable region (vocab_data / himoreg_data /
-/// content_data) を末尾 cluster に集約。 sparse hole に頼らない apparent
-/// size 縮小の前提 (Phase B Step 1)。 v2 DB は recreate / migrate 必要。
-const FILE_VERSION: u32 = 3;
+/// v4: undo region 廃止 — `UndoLog` を撤去し、 `rollback()` API を削除。
+/// undo は WAL 有効時には Commit で自動 clear される redundant な層であり、
+/// standalone mode では `record()` 内の spin-wait が consumer 不在で
+/// permanent hang を起こしていた (GitHub issue #1)。 v3 DB は再作成必要。
+const FILE_VERSION: u32 = 4;
 const HEADER_SIZE: usize = 4096;
 
 /// 観測窓(view)の永続化制限。
@@ -338,11 +338,9 @@ const H_HEADER_CRC: usize = 64; // u32
 /// v32: この DB を所有する peer の id。0 は「未設定 / single peer」。
 /// CRC 保護外(後から set_peer_id で上書き可能)。
 const H_PEER_ID: usize = 68; // u32
-/// undo region のエントリ最大数。 0 はレガシー DB (header に書かれてない)
-/// → open 時に `crate::undo::DEFAULT_MAX_ENTRIES` を使う。 growable_tiny 等の
-/// 小フットプリント preset がここに自前の値を書き、 open が再現できるように
-/// する。 CRC 保護外。
-const H_UNDO_MAX_ENTRIES: usize = 72; // u32
+/// 72..76 は予約済み (v3 まで `H_UNDO_MAX_ENTRIES` が居た跡地)。 v4 で undo 全廃に
+/// 伴って read/write 共に廃止、 オフセット安定のためスロットは空のまま (= 0)
+/// を保つ。 後続フィールドを追加するなら 80.. を使うこと。
 /// Backing kind flag (u32). 0 = EAGER (default, also legacy zero-fill), 1 = GROWABLE.
 /// 用途: `validate_file_size` で auto-extend を許すか strict check するかの分岐のみ。
 /// CRC 保護外。 accidental truncation 検出が目的、 adversarial tampering は対象外。
@@ -412,8 +410,6 @@ fn himo_maxv_base(max_himos: u32) -> usize {
 struct Layout {
     entities_off: usize,
     entities_size: usize,
-    undo_off: usize,
-    undo_size: usize,
     vocab_data_off: usize,
     vocab_data_size: usize,
     vocab_offsets_off: usize,
@@ -446,43 +442,14 @@ struct Layout {
 impl Layout {
     fn compute(max_entities: u32, max_himos: u32, vocab_data_size: usize, content_data_size: Option<usize>, cyl_max_values: Option<u32>) -> Self {
         let vocab_max_entries = max_entities.saturating_mul(16).min(256_000_000);
-        let vocab_index_cap = vocab_max_entries.next_power_of_two();
-        let himoreg_max_entries = max_himos.max(256);
-        let himoreg_index_cap = (himoreg_max_entries * 2).next_power_of_two();
-        let himoreg_data_size = 64 * 1024;
-        let content_data_size = content_data_size.unwrap_or_else(ContentStore::data_region_size);
-        let cyl_max_values = cyl_max_values.unwrap_or(DEFAULT_CYL_MAX_VALUES);
-
-        Self::from_params_with_undo(
-            max_entities, max_himos,
-            vocab_max_entries, vocab_index_cap, vocab_data_size,
-            himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
-            content_data_size, cyl_max_values,
-            crate::undo::DEFAULT_MAX_ENTRIES,
-        )
-    }
-
-    /// 小フットプリント preset 用 — undo の最大エントリ数を上書きできる。
-    /// 既定 16 M × 10 B = 160 MB が layout を支配するので、 state-log
-    /// 想定の数千エントリで十分なら大幅に縮む。
-    fn compute_with_undo(
-        max_entities: u32,
-        max_himos: u32,
-        vocab_data_size: usize,
-        content_data_size: Option<usize>,
-        cyl_max_values: Option<u32>,
-        undo_max_entries: u32,
-    ) -> Self {
-        let vocab_max_entries = max_entities.saturating_mul(16).min(256_000_000);
         Self::compute_with_caps(
             max_entities, max_himos,
             vocab_max_entries, vocab_data_size,
             content_data_size, cyl_max_values,
-            undo_max_entries,
         )
     }
 
-    /// `compute_with_undo` のフル版 — vocab_max_entries も override できる。
+    /// `compute` のフル版 — vocab_max_entries も override できる。
     /// tiny preset で multiplier ×16 が過剰な場合に ×1 程度に絞る用。
     fn compute_with_caps(
         max_entities: u32,
@@ -491,7 +458,6 @@ impl Layout {
         vocab_data_size: usize,
         content_data_size: Option<usize>,
         cyl_max_values: Option<u32>,
-        undo_max_entries: u32,
     ) -> Self {
         let vocab_index_cap = vocab_max_entries.next_power_of_two();
         let himoreg_max_entries = max_himos.max(256);
@@ -500,12 +466,11 @@ impl Layout {
         let content_data_size = content_data_size.unwrap_or_else(ContentStore::data_region_size);
         let cyl_max_values = cyl_max_values.unwrap_or(DEFAULT_CYL_MAX_VALUES);
 
-        Self::from_params_with_undo(
+        Self::from_params(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, cyl_max_values,
-            undo_max_entries,
         )
     }
 
@@ -514,22 +479,6 @@ impl Layout {
         vocab_max_entries: u32, vocab_index_cap: u32, vocab_data_size: usize,
         himoreg_max_entries: u32, himoreg_index_cap: u32, himoreg_data_size: usize,
         content_data_size: usize, cyl_max_values: u32,
-    ) -> Self {
-        Self::from_params_with_undo(
-            max_entities, max_himos,
-            vocab_max_entries, vocab_index_cap, vocab_data_size,
-            himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
-            content_data_size, cyl_max_values,
-            crate::undo::DEFAULT_MAX_ENTRIES,
-        )
-    }
-
-    fn from_params_with_undo(
-        max_entities: u32, max_himos: u32,
-        vocab_max_entries: u32, vocab_index_cap: u32, vocab_data_size: usize,
-        himoreg_max_entries: u32, himoreg_index_cap: u32, himoreg_data_size: usize,
-        content_data_size: usize, cyl_max_values: u32,
-        undo_max_entries: u32,
     ) -> Self {
         // v3 layout: 固定上限の region 群を前に、 append-only な
         // variable region 群 (vocab_data / himoreg_data / content_data)
@@ -542,10 +491,6 @@ impl Layout {
         let entities_off = off;
         let entities_size = align8(EntitySet::region_size(max_entities));
         off += entities_size;
-
-        let undo_off = off;
-        let undo_size = align8(UndoLog::region_size_with(undo_max_entries));
-        off += undo_size;
 
         let vocab_offsets_off = off;
         let vocab_offsets_size = align8(Vocabulary::offsets_region_size(vocab_max_entries));
@@ -589,7 +534,6 @@ impl Layout {
 
         Layout {
             entities_off, entities_size,
-            undo_off, undo_size,
             vocab_data_off, vocab_data_size,
             vocab_offsets_off, vocab_offsets_size,
             vocab_index_off, vocab_index_size,
@@ -769,7 +713,6 @@ pub struct Engine {
     himos: Vec<HimoStore>,
     entities: EntitySet,
     contents: ContentStore,
-    undo: UndoLog,
     tuples: std::sync::RwLock<NTupleTable>,
     /// 非同期書き込みキュー。`create_concurrent` で有効化される。
     write_queue: Option<std::sync::Arc<crate::write_queue::WriteQueue>>,
@@ -878,29 +821,17 @@ impl Engine {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn create_full_with_cyl(path: &str, max_entities: u32, vocab_data_size: Option<usize>, max_himos: Option<u32>, content_data_size: Option<usize>, cyl_max_values: Option<u32>) -> io::Result<Self> {
-        Self::create_full_with_cyl_undo(path, max_entities, vocab_data_size, max_himos, content_data_size, cyl_max_values, None)
-    }
-
-    /// `create_full_with_cyl` + `undo_max_entries` override。 None = default 16 M。
-    /// sustained 並列 sync writer (sinfohub-server 等) で 16 M cap 不足を踏む場合に
-    /// 64 M / 128 M 等を渡せる (1 entry = 10 B、 64 M で 640 MB)。
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn create_full_with_cyl_undo(
+    pub fn create_full_with_cyl(
         path: &str,
         max_entities: u32,
         vocab_data_size: Option<usize>,
         max_himos: Option<u32>,
         content_data_size: Option<usize>,
         cyl_max_values: Option<u32>,
-        undo_max_entries: Option<u32>,
     ) -> io::Result<Self> {
         let vds = vocab_data_size.unwrap_or(DEFAULT_VOCAB_DATA_SIZE);
         let max_himos = max_himos.unwrap_or(DEFAULT_MAX_HIMOS);
-        let layout = match undo_max_entries {
-            Some(uc) => Layout::compute_with_undo(max_entities, max_himos, vds, content_data_size, cyl_max_values, uc),
-            None => Layout::compute(max_entities, max_himos, vds, content_data_size, cyl_max_values),
-        };
+        let layout = Layout::compute(max_entities, max_himos, vds, content_data_size, cyl_max_values);
 
         if let Some(parent) = std::path::Path::new(path).parent() {
             if !parent.as_os_str().is_empty() {
@@ -929,9 +860,6 @@ impl Engine {
         mmap[H_HIMOREG_DATA_SIZE..H_HIMOREG_DATA_SIZE + 8].copy_from_slice(&(layout.himoreg_data_size as u64).to_le_bytes());
         mmap[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].copy_from_slice(&(layout.content_data_size as u64).to_le_bytes());
         mmap[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].copy_from_slice(&layout.cyl_max_values.to_le_bytes());
-        let undo_max_entries = ((layout.undo_size - 16) / 10) as u32;
-        mmap[H_UNDO_MAX_ENTRIES..H_UNDO_MAX_ENTRIES + 4]
-            .copy_from_slice(&undo_max_entries.to_le_bytes());
 
         // v28: ヘッダ整合性 CRC
         write_header_crc(&mut mmap);
@@ -941,10 +869,6 @@ impl Engine {
         let entities = EntitySet::init(
             unsafe { Region::new(base.add(layout.entities_off), layout.entities_size) },
             max_entities,
-        );
-        let undo = UndoLog::init(
-            unsafe { Region::new(base.add(layout.undo_off), layout.undo_size) },
-            undo_max_entries,
         );
         let vocab = Vocabulary::init(
             unsafe { Region::new(base.add(layout.vocab_data_off), layout.vocab_data_size) },
@@ -968,7 +892,7 @@ impl Engine {
             vocab, himo_reg,
             himo_names: Vec::new(),
             himo_types: Vec::new(), himo_max_values: Vec::new(),
-            himos: Vec::new(), entities, contents, undo,
+            himos: Vec::new(), entities, contents,
             tuples: std::sync::RwLock::new(NTupleTable::new()),
             write_queue: None,
             shutdown_flag: None,
@@ -1050,7 +974,6 @@ impl Engine {
             64 * 1024,        // vocab_data: 64 KB
             Some(64 * 1024),  // content_data: 64 KB
             Some(64),         // cyl_max_values: small per-himo cylinders
-            4096,             // undo_max_entries: 4 K (default 16 M)
         );
         Self::create_growable_full(path, layout, max_entities, max_himos)
     }
@@ -1078,11 +1001,11 @@ impl Engine {
 
         // Phase B Step 3: initial_commit は variable cluster の手前 (=
         // 末尾の vocab_data の開始 offset) で打ち切る。 fixed cluster
-        // (entities / undo / *_offsets / *_index / content_index /
-        // himo_slots) のみコミット、 vocab_data / himoreg_data /
-        // content_data は append まで未コミット。 lazy init された
-        // Vocabulary / ContentStore が初回 append 時に必要なだけ
-        // ensure_committed で伸ばす。
+        // (entities / *_offsets / *_index / content_index / himo_slots)
+        // のみコミット、 vocab_data / himoreg_data / content_data は
+        // append まで未コミット。 lazy init された Vocabulary /
+        // ContentStore が初回 append 時に必要なだけ ensure_committed
+        // で伸ばす。
         let initial_commit = layout.vocab_data_off;
         let map = std::sync::Arc::new(crate::growable_map::GrowableMap::new(
             file,
@@ -1115,13 +1038,6 @@ impl Engine {
             .copy_from_slice(&(layout.content_data_size as u64).to_le_bytes());
         header[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4]
             .copy_from_slice(&layout.cyl_max_values.to_le_bytes());
-        // undo region size を header に保存。 open で from_params が
-        // 同じ値を再現できるようにする。 0 を書くとレガシー扱い (open
-        // が default を使う) になるが、 growable では常に明示するので
-        // layout.undo_size から逆算した値を書く。
-        let undo_max_entries = ((layout.undo_size - 16) / 10) as u32;
-        header[H_UNDO_MAX_ENTRIES..H_UNDO_MAX_ENTRIES + 4]
-            .copy_from_slice(&undo_max_entries.to_le_bytes());
         // Phase B: growable backing は file_size < layout.total_size を許容するため、
         // open 側の validate_file_size でこのフラグを見て分岐する。
         header[H_BACKING_KIND..H_BACKING_KIND + 4]
@@ -1134,10 +1050,6 @@ impl Engine {
                 Region::with_grower(map.clone(), layout.entities_off, layout.entities_size)
             },
             max_entities,
-        );
-        let undo = UndoLog::init(
-            unsafe { Region::with_grower(map.clone(), layout.undo_off, layout.undo_size) },
-            undo_max_entries,
         );
         let vocab = Vocabulary::init(
             unsafe {
@@ -1203,7 +1115,6 @@ impl Engine {
             himos: Vec::new(),
             entities,
             contents,
-            undo,
             tuples: std::sync::RwLock::new(NTupleTable::new()),
             write_queue: None,
             shutdown_flag: None,
@@ -1390,23 +1301,12 @@ impl Engine {
         let himoreg_data_size = u64::from_le_bytes(buf[H_HIMOREG_DATA_SIZE..H_HIMOREG_DATA_SIZE + 8].try_into().unwrap()) as usize;
         let content_data_size = u64::from_le_bytes(buf[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].try_into().unwrap()) as usize;
         let cyl_max_values = u32::from_le_bytes(buf[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].try_into().unwrap());
-        // undo size は v0 ヘッダに無かったので、 0 ならレガシー DB → DEFAULT。
-        // growable 系ファイルは作成時に明示値を書く。
-        let undo_max_entries_raw = u32::from_le_bytes(
-            buf[H_UNDO_MAX_ENTRIES..H_UNDO_MAX_ENTRIES + 4].try_into().unwrap(),
-        );
-        let undo_max_entries = if undo_max_entries_raw == 0 {
-            crate::undo::DEFAULT_MAX_ENTRIES
-        } else {
-            undo_max_entries_raw
-        };
 
-        let layout = Layout::from_params_with_undo(
+        let layout = Layout::from_params(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, cyl_max_values,
-            undo_max_entries,
         );
 
         // Phase B 以降: backing_kind フラグで「growable 由来で file_size <
@@ -1474,23 +1374,12 @@ impl Engine {
         let himoreg_data_size = u64::from_le_bytes(buf[H_HIMOREG_DATA_SIZE..H_HIMOREG_DATA_SIZE + 8].try_into().unwrap()) as usize;
         let content_data_size = u64::from_le_bytes(buf[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].try_into().unwrap()) as usize;
         let cyl_max_values = u32::from_le_bytes(buf[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].try_into().unwrap());
-        // undo size は v0 ヘッダに無かったので、 0 ならレガシー DB → DEFAULT。
-        // growable 系ファイルは作成時に明示値を書く。
-        let undo_max_entries_raw = u32::from_le_bytes(
-            buf[H_UNDO_MAX_ENTRIES..H_UNDO_MAX_ENTRIES + 4].try_into().unwrap(),
-        );
-        let undo_max_entries = if undo_max_entries_raw == 0 {
-            crate::undo::DEFAULT_MAX_ENTRIES
-        } else {
-            undo_max_entries_raw
-        };
 
-        let layout = Layout::from_params_with_undo(
+        let layout = Layout::from_params(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, cyl_max_values,
-            undo_max_entries,
         );
 
         let maxv_base = himo_maxv_base(max_himos);
@@ -1536,11 +1425,6 @@ impl Engine {
             max_entities,
         );
         report("EntitySet::load", &mut t, &mut p);
-        let undo = UndoLog::load(
-            unsafe { Region::new(base.add(layout.undo_off), layout.undo_size) },
-            undo_max_entries,
-        );
-        report("UndoLog::load", &mut t, &mut p);
         let vocab = Vocabulary::load(
             unsafe { Region::new(base.add(layout.vocab_data_off), layout.vocab_data_size) },
             unsafe { Region::new(base.add(layout.vocab_offsets_off), layout.vocab_offsets_size) },
@@ -1587,7 +1471,7 @@ impl Engine {
             path: String::new(), layout, max_entities, max_himos,
             vocab, himo_reg,
             himo_names, himo_types, himo_max_values,
-            himos, entities, contents, undo,
+            himos, entities, contents,
             tuples: std::sync::RwLock::new(NTupleTable::new()),
             write_queue: None,
             shutdown_flag: None,
@@ -1622,9 +1506,6 @@ impl Engine {
             eng.peer_id.store(peer, std::sync::atomic::Ordering::Release);
         }
 
-        if eng.undo.pending_count() > 0 {
-            eng.recover();
-        }
         eng.rebuild();
 
         eng.restore_persisted_views()?;
@@ -1693,17 +1574,14 @@ impl Engine {
         use std::sync::atomic::Ordering;
         self.check_writable();
         let local = self.entities.allocate();
-        // consumer thread が稼働してる場合 (= concurrent mode) は undo を queue 経由で
-        // 委譲 (issue3: 256 並列 writer の sustained で undo.record() が 16M cap 突破して
-        // panic していたのを回避)。 standalone (consumer なし) は従来通り直接 record。
+        // concurrent mode (= consumer thread 稼働) なら barrier 用に空 op を
+        // 流す。 issue5: push_count と apply_count を対称に保たないと
+        // `flush_writes` が ties drain 前に early return して live query が
+        // pending Tie を見落とす。 undo 廃止 (v4) 後は payload なしで
+        // counter increment のみが起こる。
         if let Some(q) = self.write_queue.as_ref() {
             q.push(crate::write_queue::Op::EntityCreated { local });
-            // issue5: push_count と apply_count を対称に保つため、 EntityCreated も
-            // counter 対象に入れる。 入れないと flush_writes が ties drain 前に
-            // early return して live query が pending Tie を見落とす。
             self.push_count.fetch_add(1, Ordering::Release);
-        } else {
-            self.undo.record(local, 0xFFFF, &[1, 0, 0, 0]);
         }
         let peer = self.peer_id.load(Ordering::Acquire);
         enchudb_wal::make_eid(peer, local)
@@ -1939,7 +1817,6 @@ impl Engine {
             HimoType::Leaf => self.vocab.insert(value.as_bytes()),
             ht => panic!("tie_text on non-text himo '{}': {:?}", himo, ht),
         };
-        self.record_undo(eid, hid);
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, vid);
         self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), vid);
@@ -1951,7 +1828,6 @@ impl Engine {
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = self.ensure_himo(himo, HimoType::Number, 0);
         debug_assert!(self.himo_types[hid] == HimoType::Number || self.himo_types[hid] == HimoType::Ref, "tie on non-Value himo '{}'", himo);
-        self.record_undo(eid, hid);
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, value);
         self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), value);
@@ -1964,7 +1840,6 @@ impl Engine {
         assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
         let hid = self.ensure_himo(himo, HimoType::Ref, 0);
         debug_assert!(self.himo_types[hid] == HimoType::Ref || self.himo_types[hid] == HimoType::Number, "tie_ref on non-Ref himo '{}'", himo);
-        self.record_undo(eid, hid);
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, target_eid);
         self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), target_eid);
@@ -1994,7 +1869,6 @@ impl Engine {
             HimoType::Leaf => self.vocab.insert(value.as_bytes()),
             ht => panic!("tie_text_to_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
-        self.record_undo(eid, hid);
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, vid);
         self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), vid);
@@ -2026,7 +1900,6 @@ impl Engine {
         // Tag / Leaf 型 (vocab_id を value として持つ) も許可。 schema 層が
         // 起動時に解決済みの table_vid を marker himo に張る hot path 用途で
         // 必要 (request2.md 提案)。 caller 責任で vocab に既に居る id を渡すこと。
-        self.record_undo(eid, hid);
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, value);
         self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), value);
@@ -2056,7 +1929,6 @@ impl Engine {
             self.himo_types[hid] == HimoType::Ref || self.himo_types[hid] == HimoType::Number,
             "tie_ref_to_by_id on non-Ref himo_id {}", himo_id,
         );
-        self.record_undo(eid, hid);
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, target_eid);
         self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), target_eid);
@@ -2084,7 +1956,6 @@ impl Engine {
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         if hid >= self.himos.len() { return; }
-        self.record_undo(eid, hid);
         let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].remove(eid);
         if let Some(ov) = old_val {
@@ -2101,9 +1972,7 @@ impl Engine {
     pub fn delete(&self, eid: enchudb_wal::EntityId) {
         self.check_writable();
         let eid = enchudb_wal::eid_local(eid);
-        self.undo.record(eid, 0xFFFF, &[2, 0, 0, 0]); // entity deleted
         for hid in 0..self.himos.len() {
-            self.record_undo(eid, hid);
             let old_val = self.himos[hid].get_value(eid);
             self.himos[hid].remove(eid);
             if let Some(ov) = old_val {
@@ -2119,48 +1988,11 @@ impl Engine {
 
     // ──── トランザクション ────
 
-    /// v32 以前: undo ログを clear(WAL には触らない)。
-    /// v33 以降: undo clear + WAL Commit marker append を同時に行う。
-    /// 片方だけ呼ぶと状態が割れる現状 (BUGS.md 層 2) を解消。
+    /// WAL 有効時のみ意味あり: Commit marker を WAL に append する。
+    /// v4: undo ログ廃止に伴い、 rollback API も廃止 (詳細は CLAUDE.md / lib.rs)。
     pub fn commit(&self) {
-        self.undo.commit();
         if let Some(wal) = self.wal.as_ref() {
             let _ = wal.append(enchudb_wal::wal::WalOp::Commit);
-        }
-    }
-
-    pub fn rollback(&self) {
-        self.replay_undo();
-        self.undo.commit();
-    }
-
-    fn record_undo(&self, eid: u32, hid: usize) {
-        if hid < self.himos.len() {
-            let old = self.himos[hid].get_raw_bytes(eid);
-            self.undo.record(eid, hid as u16, &old);
-        }
-    }
-
-    fn recover(&mut self) {
-        self.replay_undo();
-        self.undo.commit();
-    }
-
-    fn replay_undo(&self) {
-        for (eid, dim_id, old_value) in self.undo.entries_reverse() {
-            if dim_id == 0xFFFF {
-                // entity lifecycle marker
-                match old_value[0] {
-                    1 => self.entities.free(eid),   // undo create → free
-                    2 => self.entities.revive(eid),  // undo delete → revive
-                    _ => {}
-                }
-            } else {
-                let hid = dim_id as usize;
-                if hid < self.himos.len() {
-                    self.himos[hid].restore(eid, &old_value);
-                }
-            }
         }
     }
 
@@ -3178,27 +3010,7 @@ impl Engine {
         Ok(Self::spawn_consumer_with_wal(eng, Some(wal)))
     }
 
-    /// `create_concurrent_with_wal` + `undo_max_entries` override (issue3)。
-    /// default 16 M で sustained workload に足りないとき (sinfohub-server の
-    /// 100K user load test 等) に 64 M / 128 M 等を渡す。
-    /// 1 entry = 10 B、 64 M で undo region 640 MB (apparent size に積まれる)。
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn create_concurrent_with_wal_undo_cap(
-        path: &str,
-        wal_capacity: usize,
-        undo_max_entries: u32,
-    ) -> io::Result<std::sync::Arc<Self>> {
-        let eng = Self::create_full_with_cyl_undo(
-            path, DEFAULT_MAX_ENTITIES, None, None, None, None, Some(undo_max_entries),
-        )?;
-        let wal_path = wal_path_for(path);
-        let wal = std::sync::Arc::new(enchudb_wal::wal::Wal::create(&wal_path, wal_capacity)?);
-        Ok(Self::spawn_consumer_with_wal(eng, Some(wal)))
-    }
-
-    /// `create_concurrent_with_wal` + `undo_max_entries` + `queue_capacity` override
-    /// (issue3 + issue4)。
-    /// - `undo_max_entries`: undo region のエントリ数上限 (default 16 M)
+    /// `create_concurrent_with_wal` + `queue_capacity` override (issue4)。
     /// - `queue_capacity`: WriteQueue / wal_record_queue の bounded cap (default 1 M)
     ///
     /// sustained writer (sunsu Docker scenario 03 等) で writer >> consumer rate に
@@ -3210,12 +3022,9 @@ impl Engine {
     pub fn create_concurrent_with_wal_queue_cap(
         path: &str,
         wal_capacity: usize,
-        undo_max_entries: u32,
         queue_capacity: usize,
     ) -> io::Result<std::sync::Arc<Self>> {
-        let eng = Self::create_full_with_cyl_undo(
-            path, DEFAULT_MAX_ENTITIES, None, None, None, None, Some(undo_max_entries),
-        )?;
+        let eng = Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)?;
         let wal_path = wal_path_for(path);
         let wal = std::sync::Arc::new(enchudb_wal::wal::Wal::create(&wal_path, wal_capacity)?);
         Ok(Self::spawn_consumer_with_wal_queue_cap(eng, Some(wal), Some(queue_capacity)))
@@ -3406,7 +3215,6 @@ impl Engine {
         let durable_lsn_for_thread = arc.durable_lsn.clone();
         let listeners_for_thread = arc.change_listeners.clone();
         let emit_offset_for_thread = arc.change_emit_offset.clone();
-        let force_commit_for_thread = arc.undo.force_commit_signal();
 
         let handle = std::thread::Builder::new()
             .name("enchudb-consumer".into())
@@ -3435,22 +3243,13 @@ impl Engine {
                         drained_any = true;
                         engine.apply_op(op);
                         apply_count_for_thread.fetch_add(1, Ordering::Release);
-                        // apply_op 内で `Op::EntityCreated` は undo.record_unchecked を
-                        // 呼ぶ。 連続 drain で undo を cap 超まで詰めると OOB panic する
-                        // ので、 threshold を超えたら drain を中断して下の fsync 節で
-                        // undo.commit する。 次の loop iteration で drain 再開。
-                        if engine.undo.over_threshold() { break; }
                     }
 
-                    // 背景 fsync: WAL 有効 & (前回から fsync_interval 経過 OR
-                    // writer thread が backpressure で force_commit 要求 OR
-                    // consumer 自身の apply_op で undo が cap 近接) &
+                    // 背景 fsync: WAL 有効 & 前回から fsync_interval 経過 &
                     // head が checkpoint より進んでいる時のみ実行。
                     // 順序厳守: auto-Commit → WAL fsync → body msync → checkpoint 前進。
-                    let force_commit_now = force_commit_for_thread.load(Ordering::Acquire)
-                        || engine.undo.over_threshold();
                     if let Some(wal) = wal_for_thread.as_ref() {
-                        if force_commit_now || last_fsync.elapsed() >= fsync_interval {
+                        if last_fsync.elapsed() >= fsync_interval {
                             if wal.head() > wal.checkpoint() {
                                 let _ = wal.append(enchudb_wal::wal::WalOp::Commit);
                                 let _ = wal.fsync();
@@ -3459,7 +3258,6 @@ impl Engine {
                                 wal.advance_checkpoint(head);
                                 let lsn = wal.next_lsn().saturating_sub(1);
                                 durable_lsn_for_thread.store(lsn, Ordering::Release);
-                                engine.undo.commit();
 
                                 // changefeed: durable 化した record を listener に push
                                 Self::fire_change_listeners(
@@ -3467,13 +3265,6 @@ impl Engine {
                                     &listeners_for_thread,
                                     &emit_offset_for_thread,
                                 );
-                            } else if engine.undo.pending_count() > 0 {
-                                // WAL は動いてないが undo に entry がある (entity() 多発で
-                                // EntityCreated だけ積まれた case)。 body_msync で entity
-                                // slot 割り当てを durable 化してから undo.commit、 これで
-                                // 次回 over_threshold 解除。
-                                let _ = engine.body_msync();
-                                engine.undo.commit();
                             }
                             // v30: ring buffer reset を試みる。head == checkpoint &&
                             // pending_writes == 0 のときだけ head/checkpoint を HEADER_SIZE に戻す。
@@ -3511,7 +3302,6 @@ impl Engine {
                             let _ = wal.fsync();
                             let _ = engine.body_msync();
                             wal.advance_checkpoint(wal.head());
-                            engine.undo.commit();
                             // shutdown 時の最終 emit
                             Self::fire_change_listeners(
                                 wal,
@@ -3553,7 +3343,7 @@ impl Engine {
             // 撤廃して entity_set 領域は常時 msync する (= 小サイズ固定領域なので
             // 無条件 msync しても安価)。
             Backing::Growable(g) => {
-                // 1. consumer-tracked dirty range (Column::set / UndoLog 等)
+                // 1. consumer-tracked dirty range (Column::set 等)
                 g.flush_dirty()?;
                 // 2. entity_set 領域は writer hot path で書かれるので無条件 msync
                 //    (small fixed region、 page-aligned で expand)
@@ -3568,7 +3358,7 @@ impl Engine {
     pub fn body_msync(&self) -> io::Result<()> { Ok(()) }
 
     /// 強制同期: Commit marker 挿入 → WAL fsync → body msync → checkpoint 前進。
-    /// Sync mode 相当の待ち。undo も clear される。
+    /// Sync mode 相当の待ち。
     pub fn wal_sync(&self) -> io::Result<()> {
         use std::sync::atomic::Ordering;
         self.flush_writes();
@@ -3584,8 +3374,6 @@ impl Engine {
             // (consumer の 100ms tick を待たず caller スレッドで発火)
             Self::fire_change_listeners(wal, &self.change_listeners, &self.change_emit_offset);
         }
-        // undo も clear(transaction 確定)
-        self.undo.commit();
         Ok(())
     }
 
@@ -3742,10 +3530,10 @@ impl Engine {
             Op::Content { eid, key, data } => {
                 self.contents.set(eid, &key, &data);
             }
-            Op::EntityCreated { local } => {
-                // consumer thread 内なので backpressure spin に入ると self-deadlock。
-                // 代わりに record_unchecked、 consumer ループ側で over_threshold 監視。
-                self.undo.record_unchecked(local, 0xFFFF, &[1, 0, 0, 0]);
+            Op::EntityCreated { local: _ } => {
+                // v4 (undo 廃止) 以降は no-op。 `entity()` で local slot は writer
+                // thread 側で既に allocate 済み。 ここに来るのは `flush_writes` の
+                // push_count / apply_count counter を対称に進めるためだけ (issue5)。
             }
         }
     }
@@ -3951,7 +3739,6 @@ impl Engine {
     }
 
     /// 現在のトランザクションを WAL に commit marker で確定する。
-    /// 同時に undo ログもクリア(WAL Commit 後は rollback できないため)。
     ///
     /// Async モードでは fsync は consumer スレッドが背景で行う。
     /// Sync モードでは commit 完了まで待つ。
@@ -3959,9 +3746,6 @@ impl Engine {
         if let Some(wal) = self.wal.as_ref() {
             let _ = wal.append(enchudb_wal::wal::WalOp::Commit);
         }
-        // WAL Commit = transaction 確定。undo は不要になる。
-        // これを忘れると re-open 時に undo 再生で entity が free される。
-        self.undo.commit();
     }
 
     /// WAL への参照(テスト / 内部用)。
@@ -4800,54 +4584,11 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
     }
 
-    #[test]
-    fn rollback_reverts() {
-        let dir = tmp("tx_rollback");
-        let mut eng = Engine::create_standalone(&dir).unwrap();
-        let e = eng.entity();
-        eng.tie(e, "age", 30);
-        eng.commit();
-
-        eng.tie(e, "age", 99);
-        assert_eq!(eng.get(e, "age"), Some(99));
-        eng.rollback();
-        assert_eq!(eng.get(e, "age"), Some(30));
-        let _ = std::fs::remove_file(&dir);
-    }
-
-    #[test]
-    fn rollback_insert() {
-        let dir = tmp("tx_rb_ins");
-        let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.commit();
-
-        let e = eng.entity();
-        eng.tie(e, "age", 30);
-        assert_eq!(eng.query_count(&[("age", 30)]), 1);
-        eng.rollback();
-        assert_eq!(eng.query_count(&[("age", 30)]), 0);
-        let _ = std::fs::remove_file(&dir);
-    }
-
-    #[test]
-    fn crash_recovery_rollback() {
-        let dir = tmp("tx_crash");
-        {
-            let mut eng = Engine::create_standalone(&dir).unwrap();
-            let e = eng.entity();
-            eng.tie(e, "age", 30);
-            eng.commit();
-            eng.flush().unwrap();
-
-            eng.tie(e, "age", 99);
-            // undo だけ flush（クラッシュシミュレーション）
-            eng.backing.flush_to_disk().unwrap();
-        }
-
-        let mut eng = Engine::open_standalone(&dir).unwrap();
-        assert_eq!(eng.get(0, "age"), Some(30));
-        let _ = std::fs::remove_file(&dir);
-    }
+    // v4: rollback / undo log を削除したため `rollback_reverts` /
+    //     `rollback_insert` / `crash_recovery_rollback` テストも撤去。 旧 undo
+    //     replay 経路の保証 (= flush 済み未 commit 書き込みを open 時に巻き戻す)
+    //     はもう存在しない。 crash 中の途中状態を巻き戻したいケースは WAL
+    //     (Commit marker 未到達なら recover 時に drop) で代替する。
 
     // ──── prefix sum O(1) ────
 
@@ -4968,23 +4709,6 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
     }
 
-    #[test]
-    fn prefix_sum_rollback() {
-        let dir = tmp("ps_rollback");
-        let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.define_himo("val", HimoType::Number, 50);
-        let e = eng.entity();
-        eng.tie(e, "val", 10);
-        eng.commit();
-
-        eng.tie(e, "val", 40);
-        assert_eq!(eng.get(e, "val"), Some(40));
-        eng.rollback();
-        assert_eq!(eng.get(e, "val"), Some(10));
-        assert_eq!(eng.query_count(&[("val", 10)]), 1);
-        assert_eq!(eng.query_count(&[("val", 40)]), 0);
-        let _ = std::fs::remove_file(&dir);
-    }
 
     #[test]
     fn prefix_sum_boundary_max() {

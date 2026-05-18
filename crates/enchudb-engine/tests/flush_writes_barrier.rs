@@ -22,7 +22,6 @@ fn flush_writes_waits_for_all_ties_including_entity_created_path() {
     let eng: Arc<Engine> = Engine::create_concurrent_with_wal_queue_cap(
         path,
         16 * 1024 * 1024,
-        65_536,
         1024,
     ).expect("create");
 
