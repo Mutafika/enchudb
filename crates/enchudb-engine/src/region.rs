@@ -94,7 +94,7 @@ impl Region {
     /// request3 dirty range tracking: `flush_dirty` の msync 範囲を絞る hint。
     /// 呼び忘れても correctness には影響しない (= OS の遅延 flush に任せる)
     /// が、 hot write 経路 (HimoStore::set / Vocabulary::insert /
-    /// UndoLog::record / EntitySet::allocate / ContentStore::set) からは呼ぶこと。
+    /// EntitySet::allocate / ContentStore::set) からは呼ぶこと。
     #[inline]
     pub fn mark_dirty(&self, off_in_region: usize, len: usize) {
         #[cfg(not(target_arch = "wasm32"))]

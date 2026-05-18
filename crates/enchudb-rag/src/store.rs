@@ -331,11 +331,8 @@ impl RagStore {
         for b in &mut self.vec_mmap[off..off + self.dim * 4] { *b = 0; }
     }
 
-    /// トランザクション確定。
+    /// トランザクション確定 (WAL 有効時は Commit marker append)。
     pub fn commit(&self) { self.db.commit(); }
-
-    /// 巻き戻し。ベクトルは巻き戻さない（content/tie の enchudb 側のみ）。
-    pub fn rollback(&self) { self.db.rollback(); }
 
     /// mmap 同期。
     pub fn flush(&mut self) -> Result<()> {

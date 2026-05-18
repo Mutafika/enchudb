@@ -40,8 +40,14 @@ pub struct BucketCylinder {
     max_values: u32,
     buckets: Vec<Vec<u32>>,
     sparse: HashMap<u32, Vec<u32>>,
-    /// eid → (value, idx_in_bucket)。value == EMPTY_VALUE なら未 tie。
+    /// `positions[i]` が eid `(i + eid_offset)` の (value, idx_in_bucket) を保持。
+    /// value == EMPTY_VALUE なら 「その eid は未 tie」 (offset 範囲内の穴埋め用 sentinel)。
     positions: Vec<(u32, u32)>,
+    /// positions が cover している eid 範囲の起点。 u32::MAX なら 「まだ何も tie されてない」。
+    /// 第一回 `ensure_positions(eid)` で `eid` に set される。 以降より小さい eid の tie が
+    /// 来たら prepend で更新。 table-segmented workload (各 himo が連続 eid range で tie
+    /// される) では offset 以前の prefix を確保しなくて済むのが主目的。
+    eid_offset: u32,
     total: u32,
     /// 現在の unique 値数。UniqueDelta で更新。
     unique_count_cache: u32,
@@ -76,9 +82,23 @@ impl BucketCylinder {
             buckets: (0..bucket_count).map(|_| Vec::new()).collect(),
             sparse: HashMap::new(),
             positions: Vec::new(),
+            eid_offset: u32::MAX,
             total: 0,
             unique_count_cache: 0,
         }
+    }
+
+    /// `eid` を positions の index に変換。 範囲外なら None。
+    #[inline]
+    fn pos_idx(&self, eid: u32) -> Option<usize> {
+        if self.eid_offset == u32::MAX || eid < self.eid_offset {
+            return None;
+        }
+        let idx = (eid - self.eid_offset) as usize;
+        if idx >= self.positions.len() {
+            return None;
+        }
+        Some(idx)
     }
 
     /// value を eid に紐づける。既存エントリがあれば置き換え。
@@ -88,7 +108,8 @@ impl BucketCylinder {
 
         let mut delta = UniqueDelta::NONE;
 
-        let (old_value, old_idx) = self.positions[eid as usize];
+        let pos = (eid - self.eid_offset) as usize;
+        let (old_value, old_idx) = self.positions[pos];
         let was_tied = old_value != EMPTY_VALUE;
         if was_tied {
             let was_last = self.location_len(old_value) == 1;
@@ -105,7 +126,7 @@ impl BucketCylinder {
             delta.added += 1;
         }
 
-        self.positions[eid as usize] = (value, idx);
+        self.positions[pos] = (value, idx);
         if !was_tied {
             self.total += 1;
         }
@@ -120,16 +141,17 @@ impl BucketCylinder {
 
     /// eid の紐を外す。
     pub fn remove(&mut self, eid: u32) -> UniqueDelta {
-        if (eid as usize) >= self.positions.len() {
-            return UniqueDelta::NONE;
-        }
-        let (value, idx) = self.positions[eid as usize];
+        let pos = match self.pos_idx(eid) {
+            Some(p) => p,
+            None => return UniqueDelta::NONE,
+        };
+        let (value, idx) = self.positions[pos];
         if value == EMPTY_VALUE {
             return UniqueDelta::NONE;
         }
         let was_last = self.location_len(value) == 1;
         self.swap_remove_at(value, idx);
-        self.positions[eid as usize] = (EMPTY_VALUE, 0);
+        self.positions[pos] = (EMPTY_VALUE, 0);
         self.total -= 1;
         let delta = UniqueDelta {
             added: 0,
@@ -212,16 +234,38 @@ impl BucketCylinder {
             b.clear();
         }
         self.sparse.clear();
-        for p in &mut self.positions {
-            *p = (EMPTY_VALUE, 0);
-        }
+        self.positions.clear();
+        self.eid_offset = u32::MAX;
         self.total = 0;
         self.unique_count_cache = 0;
 
         let count = column.count();
-        self.ensure_positions(count.saturating_sub(1));
+        if count == 0 {
+            return;
+        }
 
+        // pass 1: 実際に tie された min / max eid を特定
+        let mut min_eid: u32 = u32::MAX;
+        let mut max_eid: u32 = 0;
         for eid in 0..count {
+            let bytes: [u8; 4] = column.get(eid).try_into().unwrap();
+            if u32::from_le_bytes(bytes) != 0 {
+                if min_eid == u32::MAX {
+                    min_eid = eid;
+                }
+                max_eid = eid;
+            }
+        }
+        if min_eid == u32::MAX {
+            // 一度も tie されてない column → positions 空のまま
+            return;
+        }
+
+        // pass 2: positions を tied range だけ確保して populate
+        self.eid_offset = min_eid;
+        self.positions
+            .resize((max_eid - min_eid + 1) as usize, (EMPTY_VALUE, 0));
+        for eid in min_eid..=max_eid {
             let bytes: [u8; 4] = column.get(eid).try_into().unwrap();
             let stored = u32::from_le_bytes(bytes);
             if stored != 0 {
@@ -229,7 +273,7 @@ impl BucketCylinder {
                 self.ensure_bucket(value);
                 let was_empty = self.location_len(value) == 0;
                 let idx = self.push_to(value, eid);
-                self.positions[eid as usize] = (value, idx);
+                self.positions[(eid - min_eid) as usize] = (value, idx);
                 self.total += 1;
                 if was_empty {
                     self.unique_count_cache += 1;
@@ -273,14 +317,33 @@ impl BucketCylinder {
     }
 
     fn ensure_positions(&mut self, eid: u32) {
-        if (eid as usize) >= self.positions.len() {
-            self.positions.resize(eid as usize + 1, (EMPTY_VALUE, 0));
+        if self.eid_offset == u32::MAX {
+            // 初回 tie: offset を eid に固定、 size 1 で開始
+            self.eid_offset = eid;
+            self.positions.push((EMPTY_VALUE, 0));
+            return;
+        }
+        if eid < self.eid_offset {
+            // prepend: offset を eid まで下げる、 差分を空 entry で埋める
+            let prepend_count = (self.eid_offset - eid) as usize;
+            let mut new_positions = Vec::with_capacity(prepend_count + self.positions.len());
+            new_positions.resize(prepend_count, (EMPTY_VALUE, 0));
+            new_positions.extend_from_slice(&self.positions);
+            self.positions = new_positions;
+            self.eid_offset = eid;
+        } else {
+            // extend: offset 以降の dense allocation
+            let idx = (eid - self.eid_offset) as usize;
+            if idx >= self.positions.len() {
+                self.positions.resize(idx + 1, (EMPTY_VALUE, 0));
+            }
         }
     }
 
     /// value の場所の idx 位置を swap_remove。末尾と入れ替えた entity の
     /// positions を更新。空になったら sparse からエントリ削除。
     fn swap_remove_at(&mut self, value: u32, idx: u32) {
+        let offset = self.eid_offset;
         if value < DENSE_CAP {
             let bi = value as usize;
             let bucket = &mut self.buckets[bi];
@@ -288,7 +351,7 @@ impl BucketCylinder {
             if (idx as usize) != last {
                 let moved_eid = bucket[last];
                 bucket.swap_remove(idx as usize);
-                self.positions[moved_eid as usize].1 = idx;
+                self.positions[(moved_eid - offset) as usize].1 = idx;
             } else {
                 bucket.pop();
             }
@@ -303,7 +366,7 @@ impl BucketCylinder {
                 if (idx as usize) != last {
                     let moved_eid = bucket[last];
                     bucket.swap_remove(idx as usize);
-                    self.positions[moved_eid as usize].1 = idx;
+                    self.positions[(moved_eid - offset) as usize].1 = idx;
                 } else {
                     bucket.pop();
                 }
