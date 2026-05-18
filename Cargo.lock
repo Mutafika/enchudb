@@ -952,6 +952,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "enchudb-cli"
+version = "0.3.0"
+dependencies = [
+ "enchudb-engine",
+ "enchudb-wal",
+]
+
+[[package]]
 name = "enchudb-engine"
 version = "0.3.0"
 dependencies = [

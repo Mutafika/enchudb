@@ -26,6 +26,7 @@
 | [`enchudb-rag`](./crates/enchudb-rag) | RAG ストア。メタフィルタ先行 + brute force cosine、ANN 不要 | 直接依存 |
 | [`enchudb-sql`](./crates/enchudb-sql) | SQLite 上位互換の SQL frontend (CRUD + ORDER BY / LIMIT / 範囲 / IS NULL / INSERT OR REPLACE)、 **schema 永続化** | `features = ["sql"]` |
 | [`enchudb-ffi`](./crates/enchudb-ffi) | SQLite 風 C ABI 12 関数、`cdylib + staticlib`、Python / Node / Swift から叩ける土台 | `features = ["ffi"]` |
+| [`enchudb-cli`](./crates/enchudb-cli) | `enchu` REPL。 `query_lang` 構文 + dot command で engine を直接叩く (SQL 経由しない) | `cargo install --path crates/enchudb-cli` |
 
 各 sub-crate の `README.md` に詳細あり。Node.js バインディングは独立 repo [`mutafika/enchu-extend`](https://github.com/mutafika/enchu-extend)。
 
@@ -131,6 +132,44 @@ enchudb_close(db);
 ```
 
 ヘッダ: `crates/enchudb-ffi/include/enchudb.h`、デモ: `crates/enchudb-ffi/examples/demo.c`。
+
+### CLI (`enchu`)
+
+`sqlite3` 風 REPL で engine を直接叩く。 `query_lang` 構文 (`age:30 city:"東京" | group dept | sum salary`) と dot command (`.himos` / `.entity <eid>` / `.dump` …)。 **SQL は経由しない**。
+
+```bash
+cargo install --path crates/enchudb-cli
+# binary 名は `enchu`
+
+enchu --create --tiny /tmp/state.db          # 新規 DB (1024 行 preset)
+enchu /tmp/state.db                          # REPL に入る
+enchu /tmp/state.db -e 'age:30 | count'      # one-shot
+enchu --readonly /tmp/state.db               # read-only open
+```
+
+REPL の例:
+
+```
+enchu> .define name tag
+defined name (tag, max_values=0)
+enchu> .define age num
+defined age (num, max_values=0)
+enchu> + name:"alice" age:30
++0
+enchu> + name:"bob" age:25
++1
+enchu> age:30
+0
+enchu> age:30 | count
+1
+enchu> .entity 0
+eid=0
+  name: "alice"
+  age: 30
+enchu> .quit
+```
+
+create preset: `--default` / `--compact` / `--growable` (default) / `--tiny`。
 
 ### 耐久性 (WAL)
 
