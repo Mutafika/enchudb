@@ -6,7 +6,7 @@
 //! 引く       → Cylinder 結果 + delta 分を Column 直読みで補正
 //! rebuild    → delta を Cylinder にマージ（delta が大きくなった時だけ）
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::cell::UnsafeCell;
 
 use crate::column::Column;
@@ -58,6 +58,10 @@ pub struct HimoStore {
     pub max_values: u32,
     /// 現在の unique 値数(非空バケット数)。`himo_cardinality` API が参照する。
     unique_count: AtomicU32,
+    /// issue #3: cylinder が column から populate 済みか。 lazy rebuild 用。
+    /// `init` (新規 DB) では即 true (column 空)、 `load` (既存 DB) では false で
+    /// 開始し、 最初の cyl 読み書きで `ensure_cylinder_built` 経由で rebuild する。
+    cyl_built: AtomicBool,
 }
 
 unsafe impl Sync for HimoStore {}
@@ -74,29 +78,56 @@ impl HimoStore {
             himo_type: ht,
             max_values,
             unique_count: AtomicU32::new(0),
+            // 新規 column は空なので rebuild 不要、 即 built 状態。
+            cyl_built: AtomicBool::new(true),
         }
     }
 
+    /// open 時の load。 issue #3: 旧版は `cyl.rebuild_from_column` を eager に呼んで
+    /// per-himo に column 全 eid を走査していた。 himo 数 × entity 数で reopen latency
+    /// が膨らむのを避けるため、 cylinder は空のまま返し、 最初の cyl 触りで
+    /// `ensure_cylinder_built` 経由で rebuild する。
     pub fn load(col_region: Region, ht: HimoType, max_values: u32) -> Self {
         let col = Column::load(col_region);
         let max_entities = col.max_entities;
-        let mut cyl = BucketCylinder::new(max_values, max_entities);
-        cyl.rebuild_from_column(&col);
-        let uniq = cyl.unique_count();
+        let cyl = BucketCylinder::new(max_values, max_entities);
         Self {
             col: UnsafeCell::new(col),
             cyl: RwLock::new(cyl),
             himo_type: ht,
             max_values,
-            unique_count: AtomicU32::new(uniq),
+            // unique_count は cyl built 後に正しい値が入る。 build 前に
+            // `unique_count()` を呼ばれる経路があったら ensure_cylinder_built 経由で
+            // build がトリガされ、 正しい値が同期される。
+            unique_count: AtomicU32::new(0),
+            cyl_built: AtomicBool::new(false),
         }
     }
 
     fn col(&self) -> &Column { unsafe { &*self.col.get() } }
 
+    /// cylinder が未 build なら column から rebuild する。 lazy rebuild の入口。
+    /// fast path は AtomicBool::load (cyl_built == true) で即 return、 cache 1 hit
+    /// 程度のコスト。 build path は per-himo 1 回だけ走る。
+    ///
+    /// 並行性: write lock を取って rebuild 中に double-check する standard な
+    /// double-checked locking。 RwLock の write lock は exclusive なので
+    /// rebuild 中の他 reader は待たされる (= 旧 eager rebuild と同じ semantics)。
+    #[inline]
+    fn ensure_cylinder_built(&self) {
+        if self.cyl_built.load(Ordering::Acquire) { return; }
+        let mut cyl = self.cyl.write().unwrap();
+        // double-check (build 中に競合した別 thread が先に置いた可能性)
+        if self.cyl_built.load(Ordering::Acquire) { return; }
+        cyl.rebuild_from_column(self.col());
+        self.unique_count.store(cyl.unique_count(), Ordering::Relaxed);
+        self.cyl_built.store(true, Ordering::Release);
+    }
+
     // ──── ぶら下げる / 外す ────
 
     pub fn set(&self, eid: u32, value: u32) {
+        self.ensure_cylinder_built();
         self.col().ensure_count(eid);
         self.col().set(eid, &(value + 1).to_le_bytes());
         let delta = self.cyl.write().unwrap().insert(eid, value);
@@ -105,6 +136,7 @@ impl HimoStore {
 
     pub fn remove(&self, eid: u32) {
         if eid < self.col().count() {
+            self.ensure_cylinder_built();
             self.col().clear(eid);
             let delta = self.cyl.write().unwrap().remove(eid);
             self.apply_unique_delta(delta);
@@ -122,7 +154,9 @@ impl HimoStore {
     }
 
     /// 現在の unique 値数(非空バケット数)。O(1)。
+    /// lazy rebuild 未完了なら build をトリガしてから返す。
     pub fn unique_count(&self) -> u32 {
+        self.ensure_cylinder_built();
         self.unique_count.load(Ordering::Relaxed)
     }
 
@@ -145,6 +179,7 @@ impl HimoStore {
     }
 
     pub fn restore(&self, eid: u32, old_bytes: &[u8; 4]) {
+        self.ensure_cylinder_built();
         self.col().ensure_count(eid);
         let stored = u32::from_le_bytes(*old_bytes);
         self.col().set(eid, old_bytes);
@@ -163,6 +198,7 @@ impl HimoStore {
 
     /// 値に合致する entity を Vec<u32> で返す(read lock 下でクローン)。
     pub fn pull(&self, value: u32) -> Vec<u32> {
+        self.ensure_cylinder_built();
         self.cyl.read().unwrap().slice_one(value).to_vec()
     }
 
@@ -181,16 +217,19 @@ impl HimoStore {
 
     /// 同上だが長さだけ。プランナー用。
     pub fn slice_len(&self, value: u32) -> usize {
+        self.ensure_cylinder_built();
         self.cyl.read().unwrap().slice_one(value).len()
     }
 
     /// 入っている値を列挙(順序は保証しない)。
     pub fn unique_values(&self) -> Vec<u32> {
+        self.ensure_cylinder_built();
         self.cyl.read().unwrap().unique_values()
     }
 
     /// 総件数。
     pub fn total(&self) -> usize {
+        self.ensure_cylinder_built();
         self.cyl.read().unwrap().total()
     }
 
