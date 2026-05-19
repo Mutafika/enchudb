@@ -12,6 +12,16 @@
 //! 巨大な値(例: epoch seconds 1.7e9)で 40GB 確保してハング。v32 では
 //! value >= DENSE_CAP(=2^20 = 1M)を sparse HashMap に逃がす。
 //!
+//! # β-heavy phase 1: positions を BucketPositions enum で抽象化
+//!
+//! 旧 `Vec<(u32, u32)> + eid_offset` を `BucketPositions` enum に置換。
+//! - `Heap`: 従来通り heap-backed Vec、 prepend / extend 自由。 default。
+//! - `Region`: PositionsRegion (mmap-back 可)、 prepend 不可だが OOM 耐性大。
+//!
+//! BucketCylinder 自身は両 variant を見分けず get/set/update_idx/clear だけ
+//! 呼ぶ。 HimoStore 側が backing 選択。 phase 1 step 2 では default は Heap
+//! のまま (behavior 不変)。 step 3 で HimoStore が Region 側を使い始める。
+//!
 //! # 計算量
 //!
 //! - insert dense: O(1)
@@ -28,6 +38,7 @@
 
 use std::collections::HashMap;
 use crate::column::Column;
+use crate::positions_region::PositionsRegion;
 
 /// dense バケット上限。これ以上の value は sparse HashMap に格納。
 /// 2^20 = 1_048_576。dense 領域の最大メモリ: ~24MB (1M 個の空 Vec ヘッダ)。
@@ -36,18 +47,158 @@ pub const DENSE_CAP: u32 = 1 << 20;
 /// 「未 tie」を示す value sentinel(tie は value < u32::MAX を assert するので衝突しない)。
 const EMPTY_VALUE: u32 = u32::MAX;
 
+/// BucketCylinder の positions 部 — eid → (value, idx_in_bucket) の dense map。
+///
+/// Heap variant は旧 `Vec<(u32, u32)> + eid_offset` を internalize。 Region
+/// variant は PositionsRegion (mmap-back 可) を呼ぶだけ。
+pub(crate) enum BucketPositions {
+    Heap {
+        entries: Vec<(u32, u32)>,
+        /// `u32::MAX` の間は 「まだ何も tie されてない」。 最初の `set` で eid に確定。
+        eid_offset: u32,
+    },
+    Region(PositionsRegion),
+}
+
+impl BucketPositions {
+    fn heap() -> Self {
+        Self::Heap { entries: Vec::new(), eid_offset: u32::MAX }
+    }
+
+    /// eid_offset を返す。 空 (まだ何も set されてない) なら `u32::MAX`。
+    #[inline]
+    fn eid_offset(&self) -> u32 {
+        match self {
+            Self::Heap { eid_offset, .. } => *eid_offset,
+            Self::Region(r) => r.eid_offset(),
+        }
+    }
+
+    /// eid の (value, idx) を取得。 範囲外 / sentinel なら None。
+    #[inline]
+    fn get(&self, eid: u32) -> Option<(u32, u32)> {
+        match self {
+            Self::Heap { entries, eid_offset } => {
+                if *eid_offset == u32::MAX || eid < *eid_offset {
+                    return None;
+                }
+                let idx = (eid - *eid_offset) as usize;
+                if idx >= entries.len() {
+                    return None;
+                }
+                let (v, i) = entries[idx];
+                if v == EMPTY_VALUE { None } else { Some((v, i)) }
+            }
+            Self::Region(r) => r.get(eid),
+        }
+    }
+
+    /// eid に (value, idx) を書き込む。 必要なら range を伸ばす。
+    /// Region mode で eid < eid_offset の場合は panic (PositionsRegion 仕様)。
+    #[inline]
+    fn set(&mut self, eid: u32, value: u32, idx: u32) {
+        match self {
+            Self::Heap { entries, eid_offset } => {
+                Self::heap_ensure(entries, eid_offset, eid);
+                let pos = (eid - *eid_offset) as usize;
+                entries[pos] = (value, idx);
+            }
+            Self::Region(r) => {
+                r.set(eid, value, idx);
+            }
+        }
+    }
+
+    /// 既存 entry の idx だけ更新 (swap_remove で末尾と入れ替わった entity 用)。
+    #[inline]
+    fn update_idx(&mut self, eid: u32, new_idx: u32) {
+        match self {
+            Self::Heap { entries, eid_offset } => {
+                if *eid_offset == u32::MAX || eid < *eid_offset {
+                    return;
+                }
+                let pos = (eid - *eid_offset) as usize;
+                if pos >= entries.len() {
+                    return;
+                }
+                entries[pos].1 = new_idx;
+            }
+            Self::Region(r) => {
+                r.update_idx(eid, new_idx);
+            }
+        }
+    }
+
+    /// eid の entry を空にする (sentinel に戻す)。
+    #[inline]
+    fn clear(&mut self, eid: u32) {
+        match self {
+            Self::Heap { entries, eid_offset } => {
+                if *eid_offset == u32::MAX || eid < *eid_offset {
+                    return;
+                }
+                let pos = (eid - *eid_offset) as usize;
+                if pos < entries.len() {
+                    entries[pos] = (EMPTY_VALUE, 0);
+                }
+            }
+            Self::Region(r) => {
+                r.clear(eid);
+            }
+        }
+    }
+
+    /// 全体をリセット (rebuild の最初に呼ぶ)。
+    fn clear_all(&mut self) {
+        match self {
+            Self::Heap { entries, eid_offset } => {
+                entries.clear();
+                *eid_offset = u32::MAX;
+            }
+            Self::Region(r) => {
+                r.clear_all();
+            }
+        }
+    }
+
+    /// heap mode: positions Vec を eid 範囲まで伸ばす (prepend / extend)。
+    fn heap_ensure(entries: &mut Vec<(u32, u32)>, eid_offset: &mut u32, eid: u32) {
+        if *eid_offset == u32::MAX {
+            *eid_offset = eid;
+            entries.push((EMPTY_VALUE, 0));
+            return;
+        }
+        if eid < *eid_offset {
+            // prepend: offset を eid まで下げる、 差分を空 entry で埋める
+            let prepend_count = (*eid_offset - eid) as usize;
+            let mut new_entries = Vec::with_capacity(prepend_count + entries.len());
+            new_entries.resize(prepend_count, (EMPTY_VALUE, 0));
+            new_entries.extend_from_slice(entries);
+            *entries = new_entries;
+            *eid_offset = eid;
+        } else {
+            let idx = (eid - *eid_offset) as usize;
+            if idx >= entries.len() {
+                entries.resize(idx + 1, (EMPTY_VALUE, 0));
+            }
+        }
+    }
+
+    /// rebuild_from_column の高速初期化用 — heap mode のみ。 eid 範囲を一括 resize する。
+    /// Region mode では何もしない (Region は内部で incremental に伸びる)。
+    fn rebuild_prepare(&mut self, min_eid: u32, max_eid: u32) {
+        if let Self::Heap { entries, eid_offset } = self {
+            *eid_offset = min_eid;
+            entries.resize((max_eid - min_eid + 1) as usize, (EMPTY_VALUE, 0));
+        }
+    }
+}
+
 pub struct BucketCylinder {
     max_values: u32,
     buckets: Vec<Vec<u32>>,
     sparse: HashMap<u32, Vec<u32>>,
-    /// `positions[i]` が eid `(i + eid_offset)` の (value, idx_in_bucket) を保持。
-    /// value == EMPTY_VALUE なら 「その eid は未 tie」 (offset 範囲内の穴埋め用 sentinel)。
-    positions: Vec<(u32, u32)>,
-    /// positions が cover している eid 範囲の起点。 u32::MAX なら 「まだ何も tie されてない」。
-    /// 第一回 `ensure_positions(eid)` で `eid` に set される。 以降より小さい eid の tie が
-    /// 来たら prepend で更新。 table-segmented workload (各 himo が連続 eid range で tie
-    /// される) では offset 以前の prefix を確保しなくて済むのが主目的。
-    eid_offset: u32,
+    positions: BucketPositions,
     total: u32,
     /// 現在の unique 値数。UniqueDelta で更新。
     unique_count_cache: u32,
@@ -68,7 +219,7 @@ impl BucketCylinder {
     pub fn new(max_values: u32, _max_entities: u32) -> Self {
         // max_values は初期サイズのヒント。0 なら空で始めて必要時に伸ばす。
         // DENSE_CAP を超えるヒントは無視(メモリ爆発防止)。
-        // positions は空で start し、`ensure_positions` で on-demand 伸長する。
+        // positions は空 Heap で start し、`set` で on-demand 伸長する。
         // max_entities ヒントを尊重して 16M × 8 byte = 128 MB / himo を pre-alloc
         // すると、 数百 himo を抱える consumer (sinfohub-server 等) が schema
         // declare 段階で 20+ GB heap 消費して OOM kill される。
@@ -81,37 +232,20 @@ impl BucketCylinder {
             max_values,
             buckets: (0..bucket_count).map(|_| Vec::new()).collect(),
             sparse: HashMap::new(),
-            positions: Vec::new(),
-            eid_offset: u32::MAX,
+            positions: BucketPositions::heap(),
             total: 0,
             unique_count_cache: 0,
         }
     }
 
-    /// `eid` を positions の index に変換。 範囲外なら None。
-    #[inline]
-    fn pos_idx(&self, eid: u32) -> Option<usize> {
-        if self.eid_offset == u32::MAX || eid < self.eid_offset {
-            return None;
-        }
-        let idx = (eid - self.eid_offset) as usize;
-        if idx >= self.positions.len() {
-            return None;
-        }
-        Some(idx)
-    }
-
     /// value を eid に紐づける。既存エントリがあれば置き換え。
     pub fn insert(&mut self, eid: u32, value: u32) -> UniqueDelta {
         debug_assert!(value != EMPTY_VALUE, "value == u32::MAX is sentinel");
-        self.ensure_positions(eid);
 
         let mut delta = UniqueDelta::NONE;
 
-        let pos = (eid - self.eid_offset) as usize;
-        let (old_value, old_idx) = self.positions[pos];
-        let was_tied = old_value != EMPTY_VALUE;
-        if was_tied {
+        // 既存 entry を取り出す (positions には触らずに get だけ)。
+        if let Some((old_value, old_idx)) = self.positions.get(eid) {
             let was_last = self.location_len(old_value) == 1;
             self.swap_remove_at(old_value, old_idx);
             if was_last {
@@ -126,8 +260,10 @@ impl BucketCylinder {
             delta.added += 1;
         }
 
-        self.positions[pos] = (value, idx);
-        if !was_tied {
+        // 新しい (value, idx) を書き込み (set が range 伸長を担う)
+        let prev = self.positions.get(eid).is_some();
+        self.positions.set(eid, value, idx);
+        if !prev {
             self.total += 1;
         }
 
@@ -141,17 +277,13 @@ impl BucketCylinder {
 
     /// eid の紐を外す。
     pub fn remove(&mut self, eid: u32) -> UniqueDelta {
-        let pos = match self.pos_idx(eid) {
+        let (value, idx) = match self.positions.get(eid) {
             Some(p) => p,
             None => return UniqueDelta::NONE,
         };
-        let (value, idx) = self.positions[pos];
-        if value == EMPTY_VALUE {
-            return UniqueDelta::NONE;
-        }
         let was_last = self.location_len(value) == 1;
         self.swap_remove_at(value, idx);
-        self.positions[pos] = (EMPTY_VALUE, 0);
+        self.positions.clear(eid);
         self.total -= 1;
         let delta = UniqueDelta {
             added: 0,
@@ -234,8 +366,7 @@ impl BucketCylinder {
             b.clear();
         }
         self.sparse.clear();
-        self.positions.clear();
-        self.eid_offset = u32::MAX;
+        self.positions.clear_all();
         self.total = 0;
         self.unique_count_cache = 0;
 
@@ -262,9 +393,7 @@ impl BucketCylinder {
         }
 
         // pass 2: positions を tied range だけ確保して populate
-        self.eid_offset = min_eid;
-        self.positions
-            .resize((max_eid - min_eid + 1) as usize, (EMPTY_VALUE, 0));
+        self.positions.rebuild_prepare(min_eid, max_eid);
         for eid in min_eid..=max_eid {
             let bytes: [u8; 4] = column.get(eid).try_into().unwrap();
             let stored = u32::from_le_bytes(bytes);
@@ -273,7 +402,7 @@ impl BucketCylinder {
                 self.ensure_bucket(value);
                 let was_empty = self.location_len(value) == 0;
                 let idx = self.push_to(value, eid);
-                self.positions[(eid - min_eid) as usize] = (value, idx);
+                self.positions.set(eid, value, idx);
                 self.total += 1;
                 if was_empty {
                     self.unique_count_cache += 1;
@@ -316,34 +445,9 @@ impl BucketCylinder {
         }
     }
 
-    fn ensure_positions(&mut self, eid: u32) {
-        if self.eid_offset == u32::MAX {
-            // 初回 tie: offset を eid に固定、 size 1 で開始
-            self.eid_offset = eid;
-            self.positions.push((EMPTY_VALUE, 0));
-            return;
-        }
-        if eid < self.eid_offset {
-            // prepend: offset を eid まで下げる、 差分を空 entry で埋める
-            let prepend_count = (self.eid_offset - eid) as usize;
-            let mut new_positions = Vec::with_capacity(prepend_count + self.positions.len());
-            new_positions.resize(prepend_count, (EMPTY_VALUE, 0));
-            new_positions.extend_from_slice(&self.positions);
-            self.positions = new_positions;
-            self.eid_offset = eid;
-        } else {
-            // extend: offset 以降の dense allocation
-            let idx = (eid - self.eid_offset) as usize;
-            if idx >= self.positions.len() {
-                self.positions.resize(idx + 1, (EMPTY_VALUE, 0));
-            }
-        }
-    }
-
     /// value の場所の idx 位置を swap_remove。末尾と入れ替えた entity の
     /// positions を更新。空になったら sparse からエントリ削除。
     fn swap_remove_at(&mut self, value: u32, idx: u32) {
-        let offset = self.eid_offset;
         if value < DENSE_CAP {
             let bi = value as usize;
             let bucket = &mut self.buckets[bi];
@@ -351,12 +455,14 @@ impl BucketCylinder {
             if (idx as usize) != last {
                 let moved_eid = bucket[last];
                 bucket.swap_remove(idx as usize);
-                self.positions[(moved_eid - offset) as usize].1 = idx;
+                self.positions.update_idx(moved_eid, idx);
             } else {
                 bucket.pop();
             }
         } else {
             let remove_entry;
+            let moved_eid_opt;
+            let new_idx;
             {
                 let bucket = self
                     .sparse
@@ -364,13 +470,18 @@ impl BucketCylinder {
                     .expect("sparse bucket missing");
                 let last = bucket.len() - 1;
                 if (idx as usize) != last {
-                    let moved_eid = bucket[last];
+                    moved_eid_opt = Some(bucket[last]);
+                    new_idx = idx;
                     bucket.swap_remove(idx as usize);
-                    self.positions[(moved_eid - offset) as usize].1 = idx;
                 } else {
+                    moved_eid_opt = None;
+                    new_idx = 0;
                     bucket.pop();
                 }
                 remove_entry = bucket.is_empty();
+            }
+            if let Some(moved_eid) = moved_eid_opt {
+                self.positions.update_idx(moved_eid, new_idx);
             }
             if remove_entry {
                 self.sparse.remove(&value);
@@ -559,7 +670,11 @@ mod tests {
         // max_entities ヒントを無視して positions を空で start する。
         // (sinfohub-server の OOM kill 修正の本筋。)
         let c = BucketCylinder::new(10, 16_000_000);
-        assert_eq!(c.positions.len(), 0);
+        if let BucketPositions::Heap { entries, .. } = &c.positions {
+            assert_eq!(entries.len(), 0);
+        } else {
+            panic!("default ctor は Heap mode");
+        }
     }
 
     #[test]
