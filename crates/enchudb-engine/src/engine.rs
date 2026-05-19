@@ -602,10 +602,17 @@ pub(crate) struct TableDef {
     /// Ref himo の target table 一覧 (himo_id, target_table_id)。
     /// step 5 で validation に使う。
     pub fk_refs: Vec<(u32, TableId)>,
+    /// 次に entity_in で割り当てる eid の table 内 local offset。
+    /// global eid = eid_range_lo + next_local。 anonymous table は
+    /// `entities.next_eid()` (= EntitySet 直) を使うのでこの field は不参照。
+    pub next_local: u32,
 }
 
 impl TableDef {
     /// 起動時の anonymous table。 全 himo / entity の default 受け皿。
+    /// `eid_range_hi == u32::MAX` の間は open-ended (旧 API で `entity()` が
+    /// 呼べる)、 `define_table` で初めて非 anon table が切られた瞬間に
+    /// 現 `next_eid` で閉じる。
     pub fn anonymous() -> Self {
         Self {
             name: String::new(),
@@ -613,9 +620,14 @@ impl TableDef {
             eid_range_lo: 0,
             eid_range_hi: u32::MAX,
             fk_refs: Vec::new(),
+            next_local: 0,
         }
     }
 }
+
+/// `define_table` で size_hint=0 を渡した時の default。 SNS scale (10M+) では
+/// 明示指定推奨、 embedded scale (10k-1M) では default で足りる。
+pub const DEFAULT_TABLE_RESERVED: u32 = 1_000_000;
 
 pub struct Engine {
     #[allow(dead_code)]
@@ -1506,11 +1518,132 @@ impl Engine {
         }
     }
 
+    // ──── table (β-light step 3) ────
+
+    /// 新規 table を定義し、 eid 範囲を予約する。 `size_hint=0` なら
+    /// `DEFAULT_TABLE_RESERVED` を採用。
+    ///
+    /// 振る舞い:
+    ///   - 初回の `define_table` 呼び出し時に anonymous table が現 `next_eid`
+    ///     で close される。 以降 `entity()` (anonymous 用) は panic する。
+    ///   - 新 table の eid 範囲は `[max(全 table の eid_range_hi), +size_hint)`。
+    ///   - 範囲が `max_entities` を超えるなら error。
+    ///
+    /// 戻り値は確保された TableId。 step 4+ で himo を namespacing して attach
+    /// する経路と組み合わせて使う。 step 3 段階では table の column 列は空。
+    pub fn define_table(&mut self, name: &str, size_hint: u32) -> Result<TableId, String> {
+        self.check_writable();
+        if name.is_empty() {
+            return Err("table name must be non-empty".into());
+        }
+        if self.tables.iter().any(|t| t.name == name) {
+            return Err(format!("table '{}' already exists", name));
+        }
+        if self.tables.len() >= TableId::MAX as usize {
+            return Err(format!("table count exceeds max ({})", TableId::MAX));
+        }
+        let size = if size_hint == 0 { DEFAULT_TABLE_RESERVED } else { size_hint };
+
+        // 1) anonymous を現 next_eid で close (まだ open なら)
+        let cur_next_eid = self.entities.next_eid();
+        let anon = &mut self.tables[ANONYMOUS_TABLE as usize];
+        if anon.eid_range_hi == u32::MAX {
+            anon.eid_range_hi = cur_next_eid;
+        }
+
+        // 2) 新 table の eid 範囲を確保 (= 既存 table 群の hi の max から開始)
+        let new_lo = self
+            .tables
+            .iter()
+            .map(|t| t.eid_range_hi)
+            .max()
+            .unwrap_or(0);
+        let new_hi = new_lo
+            .checked_add(size)
+            .ok_or_else(|| "eid space overflow (u32::MAX)".to_string())?;
+        if new_hi > self.max_entities {
+            return Err(format!(
+                "table '{}' eid range [{}, {}) exceeds max_entities {}",
+                name, new_lo, new_hi, self.max_entities,
+            ));
+        }
+
+        let tid = self.tables.len() as TableId;
+        self.tables.push(TableDef {
+            name: name.to_string(),
+            himo_ids: Vec::new(),
+            eid_range_lo: new_lo,
+            eid_range_hi: new_hi,
+            fk_refs: Vec::new(),
+            next_local: 0,
+        });
+        Ok(tid)
+    }
+
+    /// 指定 table 内に entity を割り当てる。 anonymous table 名は受け付けず、
+    /// 旧来の `entity()` を使う必要がある (互換維持)。
+    ///
+    /// 並行性: `&mut self` なので writer は単一。 同時に走る `tie_async` 等
+    /// concurrent reader/writer 経路とは EntitySet の CAS で安全に共存する。
+    pub fn entity_in(&mut self, table_name: &str) -> Result<enchudb_wal::EntityId, String> {
+        use std::sync::atomic::Ordering;
+        self.check_writable();
+        if table_name.is_empty() {
+            return Err("entity_in: table name must be non-empty (use entity() for anonymous)".into());
+        }
+        let tid = self
+            .tables
+            .iter()
+            .position(|t| t.name == table_name)
+            .ok_or_else(|| format!("table '{}' not found", table_name))?;
+        let table = &mut self.tables[tid];
+
+        // capacity check
+        let table_size = table.eid_range_hi - table.eid_range_lo;
+        if table.next_local >= table_size {
+            return Err(format!(
+                "table '{}' eid range exhausted ({} eids reserved)",
+                table_name, table_size,
+            ));
+        }
+        let global = table.eid_range_lo + table.next_local;
+        table.next_local += 1;
+
+        // EntitySet で live mark + next_eid 前進 (CAS safe)
+        self.entities.allocate_at(global);
+
+        // concurrent mode barrier (entity() と同じ)
+        if let Some(q) = self.write_queue.as_ref() {
+            q.push(crate::write_queue::Op::EntityCreated { local: global });
+            self.push_count.fetch_add(1, Ordering::Release);
+        }
+        let peer = self.peer_id.load(Ordering::Acquire);
+        Ok(enchudb_wal::make_eid(peer, global))
+    }
+
+    /// 既知 table を `(id, name, eid_range)` で列挙する。 試験用 / debug 用 API。
+    pub fn list_tables(&self) -> Vec<(TableId, String, u32, u32)> {
+        self.tables
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (i as TableId, t.name.clone(), t.eid_range_lo, t.eid_range_hi))
+            .collect()
+    }
+
     // ──── entity ────
 
     pub fn entity(&self) -> enchudb_wal::EntityId {
         use std::sync::atomic::Ordering;
         self.check_writable();
+        // β-light step 3: anonymous table が closed (= 既に define_table が
+        // 呼ばれた) なら entity() は panic。 entity_in を使うこと。
+        let anon_hi = self.tables[ANONYMOUS_TABLE as usize].eid_range_hi;
+        if anon_hi != u32::MAX {
+            panic!(
+                "anonymous table is closed (define_table was called); \
+                 use entity_in('<table>') instead of entity()"
+            );
+        }
         let local = self.entities.allocate();
         // concurrent mode (= consumer thread 稼働) なら barrier 用に空 op を
         // 流す。 issue5: push_count と apply_count を対称に保たないと

@@ -183,6 +183,36 @@ impl EntitySet {
         self.next_eid_atomic().load(Ordering::Relaxed)
     }
 
+    /// 指定 eid を live としてマークし、 必要なら global next_eid を `eid + 1`
+    /// まで進める。 β-light の table-aware allocation 用 (`entity_in`)。
+    ///
+    /// 並行性: CAS で next_eid を進めるため、 同時に走る `allocate()` とは
+    /// 安全に共存できる (重複 eid を返さない)。 ただし呼び出し側で eid 範囲を
+    /// 分離する責務を持つ — 例えば table A の range が [0, 1M), B の range が
+    /// [1M, 2M) のように互いに disjoint であれば、 並行 allocate_at は安全。
+    pub fn allocate_at(&self, eid: u32) {
+        assert!(
+            eid < self.max_entities,
+            "allocate_at: eid {} exceeds max_entities {}",
+            eid, self.max_entities,
+        );
+        self.set_bit(eid, true);
+        self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
+        // next_eid を max(current, eid + 1) まで進める (CAS で torn write 防止)
+        let mut cur = self.next_eid_atomic().load(Ordering::Relaxed);
+        while cur <= eid {
+            match self.next_eid_atomic().compare_exchange_weak(
+                cur,
+                eid + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(v) => cur = v,
+            }
+        }
+    }
+
     pub fn iter(&self) -> Vec<u32> {
         let mm = self.region.slice();
         let next = self.next_eid();
