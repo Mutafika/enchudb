@@ -137,99 +137,12 @@ fn max_value_panics() {
 }
 
 // ──────────────────────────────────────────────────────────────────
-// 2. 観測窓 (define_view) のエッジ
+// 2. 観測窓 (define_view) のエッジ ─ issue #4 で API ごと撤去済み (0.4.x+)
 // ──────────────────────────────────────────────────────────────────
-
-/// 未定義の紐名を define_view → Err。
-#[test]
-fn view_unknown_himo() {
-    let path = tmp("view_unknown");
-    let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("a", HimoType::Number, 4);
-    // "b" は未定義
-    let r = eng.define_view(&["a", "b"]);
-    assert!(r.is_err(), "unknown himo を含む view は Err になるべき");
-    let msg = r.unwrap_err();
-    assert!(msg.contains("'b'") || msg.contains("not defined"),
-            "エラーメッセージに 'b' か 'not defined' が含まれる: {}", msg);
-    cleanup(&path);
-}
-
-/// 8 紐 view は OK、9 紐で Err(MAX_VIEW_HIMOS=8 制約)。
-#[test]
-fn view_max_himos() {
-    let path = tmp("view_max_himos");
-    let mut eng = Engine::create_standalone(&path).unwrap();
-    // 9 本定義(各 max_values=1 にしてセル数を抑える: 2^8=256 / 2^9=512)
-    for i in 0..9 {
-        eng.define_himo(&format!("h{}", i), HimoType::Number, 1);
-    }
-    let names8: Vec<String> = (0..8).map(|i| format!("h{}", i)).collect();
-    let refs8: Vec<&str> = names8.iter().map(|s| s.as_str()).collect();
-    let ok = eng.define_view(&refs8);
-    assert!(ok.is_ok(), "8 紐 view は成功するべき: {:?}", ok);
-
-    let names9: Vec<String> = (0..9).map(|i| format!("h{}", i)).collect();
-    let refs9: Vec<&str> = names9.iter().map(|s| s.as_str()).collect();
-    let err = eng.define_view(&refs9);
-    assert!(err.is_err(), "9 紐 view は Err");
-    cleanup(&path);
-}
-
-/// セル数(card 積)が 100 万超で Err。
-#[test]
-fn view_cell_count_overflow() {
-    let path = tmp("view_cell_overflow");
-    let mut eng = Engine::create_standalone(&path).unwrap();
-    // (1000+1) × (1000+1) = 1_002_001 > 1M
-    eng.define_himo("a", HimoType::Number, 1000);
-    eng.define_himo("b", HimoType::Number, 1000);
-    let r = eng.define_view(&["a", "b"]);
-    assert!(r.is_err(), "セル数 100 万超は Err");
-    let msg = r.unwrap_err();
-    assert!(msg.contains("1M") || msg.contains("cell"),
-            "エラーメッセージに cell 数の情報: {}", msg);
-    cleanup(&path);
-}
-
-/// 同じ組合せの view を 2 回 define_view → 重複許容(現状の実装は重複チェック無し)。
-#[test]
-fn duplicate_view_register() {
-    let path = tmp("dup_view");
-    let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("a", HimoType::Number, 4);
-    eng.define_himo("b", HimoType::Number, 4);
-    let r1 = eng.define_view(&["a", "b"]);
-    assert!(r1.is_ok());
-    let r2 = eng.define_view(&["a", "b"]);
-    // 実装は重複を許容(エラー無し)。挙動が変わったらここで気付く。
-    assert!(r2.is_ok(), "現実装は重複 view を許容: {:?}", r2);
-    cleanup(&path);
-}
-
-/// 32 views 登録成功、33 個目で Err(MAX_PERSISTED_VIEWS=32)。
-#[test]
-fn views_max_count() {
-    let path = tmp("views_max_count");
-    let mut eng = Engine::create_standalone(&path).unwrap();
-    // 紐を 33 ペア分用意(各ペアで異なる view)。紐 0..65 を定義。
-    for i in 0..66 {
-        eng.define_himo(&format!("h{}", i), HimoType::Number, 2);
-    }
-    for i in 0..32 {
-        let r = eng.define_view(&[&format!("h{}", i * 2), &format!("h{}", i * 2 + 1)]);
-        assert!(r.is_ok(), "32 個目までは成功: {:?}", r);
-    }
-    let r33 = eng.define_view(&["h64", "h65"]);
-    assert!(r33.is_err(), "33 個目は Err");
-    let msg = r33.unwrap_err();
-    assert!(msg.contains("too many") || msg.contains("32"),
-            "エラーメッセージに上限の情報: {}", msg);
-    // 冪等: 既存 view の再登録は OK(カウント増えない)
-    let r_dup = eng.define_view(&["h0", "h1"]);
-    assert!(r_dup.is_ok(), "重複 view は冪等で Ok");
-    cleanup(&path);
-}
+// 旧 5 件: view_unknown_himo / view_max_himos / view_cell_count_overflow /
+//          duplicate_view_register / views_max_count
+// NTupleTable / Engine::define_view が dead weight だった (外部 caller ゼロ)
+// ため削除、 これらの test も同時撤去。
 
 // ──────────────────────────────────────────────────────────────────
 // 3. entity lifecycle

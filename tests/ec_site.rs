@@ -76,11 +76,10 @@ fn define_schema(db: &mut Engine) {
     db.define_himo("product_ref", HimoType::Ref, 0);
 }
 
-fn define_views(db: &mut Engine) {
-    db.define_view(&["type", "category"]).unwrap();
-    db.define_view(&["type", "category", "price_band"]).unwrap();
-    db.define_view(&["type", "order_status"]).unwrap();
-    db.define_view(&["type", "rating"]).unwrap();
+fn define_views(_db: &mut Engine) {
+    // issue #4 で `Engine::define_view` 削除済み。 NTupleTable は外部 caller
+    // ゼロの dead weight だった。 helper は他テストから呼ばれてるので shape
+    // だけ残す (内部 no-op)、 query 経路は column_filter で十分速い。
 }
 
 fn populate(db: &mut Engine) -> EcData {

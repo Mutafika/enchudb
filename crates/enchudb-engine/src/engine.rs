@@ -308,11 +308,6 @@ const FILE_MAGIC: [u8; 4] = *b"ECDB";
 const FILE_VERSION: u32 = 4;
 const HEADER_SIZE: usize = 4096;
 
-/// 観測窓(view)の永続化制限。
-const MAX_PERSISTED_VIEWS: usize = 32;
-/// 1 view あたりの最大紐数(固定長レコード制約)。
-const MAX_VIEW_HIMOS: usize = 8;
-
 const DEFAULT_MAX_ENTITIES: u32 = 16_777_216;
 const DEFAULT_MAX_HIMOS: u32 = 256;
 const DEFAULT_CYL_MAX_VALUES: u32 = 65536;
@@ -350,16 +345,10 @@ const BACKING_KIND_EAGER: u32 = 0;
 const BACKING_KIND_GROWABLE: u32 = 1;
 const H_HIMO_TYPES: usize = 256;
 
-// v27: 観測窓(n-tuple 仮想テーブル定義)領域。
-// ヘッダ 2048.. の後半 2KB を使う。既存の himo_types/max_values 領域(256..1536, max_himos=256 時)と衝突しない。
-// フォーマット:
-//   [H_VIEW_COUNT]    u32    view 数(上限 MAX_PERSISTED_VIEWS)
-//   [H_VIEWS_OFF + i*R..] : 各 view のレコード (R = 1 + MAX_VIEW_HIMOS*2 = 17 bytes)
-//     - length: u8   (紐数、2..=MAX_VIEW_HIMOS)
-//     - himo_ids: u16 × MAX_VIEW_HIMOS  (使われない末尾は 0 埋め、length で切る)
-const H_VIEW_COUNT: usize = 2048;
-const H_VIEWS_OFF: usize = 2052;
-const VIEW_RECORD_SIZE: usize = 1 + MAX_VIEW_HIMOS * 2;
+// header 2048.. は旧 v0.4.0 までの NTupleView 永続化スロット (H_VIEW_COUNT /
+// H_VIEWS_OFF + N × 17 bytes) の跡地。 issue #4 で NTupleTable / define_view を
+// 撤去したのに伴い read / write 共に廃止。 file format は v4 のまま (header bytes
+// は 0 で残置)、 既存 DB は何もせず読める。
 
 fn align8(n: usize) -> usize { (n + 7) & !7 }
 
@@ -565,139 +554,12 @@ impl Layout {
 
 // ════════════════ Engine ════════════════
 
-// ─── v27 NTupleView (任意 n 次元の観測窓) ───
-
-struct NTupleEntry {
-    himos: Vec<usize>,
-    cards: Vec<u32>,
-    strides: Vec<usize>,
-    cells: Vec<Vec<u32>>,
-}
-
-impl NTupleEntry {
-    fn cell_id_for(&self, values: &[u32]) -> Option<usize> {
-        let mut id = 0usize;
-        for i in 0..self.himos.len() {
-            let v = values[i];
-            if v >= self.cards[i] { return None; }
-            id += v as usize * self.strides[i];
-        }
-        Some(id)
-    }
-
-    fn cell_add(&mut self, cell_id: usize, eid: u32) {
-        let cell = &mut self.cells[cell_id];
-        match cell.binary_search(&eid) {
-            Ok(_) => {},
-            Err(pos) => cell.insert(pos, eid),
-        }
-    }
-
-    fn cell_remove(&mut self, cell_id: usize, eid: u32) {
-        let cell = &mut self.cells[cell_id];
-        if let Ok(pos) = cell.binary_search(&eid) {
-            cell.remove(pos);
-        }
-    }
-}
-
-struct NTupleTable {
-    views: Vec<NTupleEntry>,
-}
-
-impl NTupleTable {
-    fn new() -> Self { Self { views: vec![] } }
-
-    /// conds から該当する観測窓を選ぶ。
-    /// 戻り値: (セルの entity スライス参照, 残りの条件)
-    /// 優先: 条件紐をすべて含む view のうち、紐数が最大(残り条件が少ない)のもの。
-    ///
-    /// v27: read lock 下で借用したスライスをそのまま返す(ゼロコピー)。
-    fn best_lookup_ref<'a>(
-        &'a self,
-        conds: &[(usize, u32)],
-    ) -> Option<(&'a [u32], Vec<(usize, u32)>)> {
-        if conds.len() < 2 { return None; }
-        let mut best: Option<(&'a [u32], Vec<(usize, u32)>, usize)> = None;
-        // best = (cell, remaining, covered_count)
-
-        for v in &self.views {
-            // view の全紐が conds で指定されているか?
-            let mut vals_for_view: Vec<u32> = Vec::with_capacity(v.himos.len());
-            let mut ok = true;
-            for &h in &v.himos {
-                match conds.iter().find(|&&(idx, _)| idx == h) {
-                    Some(&(_, val)) => vals_for_view.push(val),
-                    None => { ok = false; break; }
-                }
-            }
-            if !ok { continue; }
-
-            let cell_id = match v.cell_id_for(&vals_for_view) {
-                Some(id) => id,
-                None => continue,
-            };
-            if cell_id >= v.cells.len() { continue; }
-            let cell = v.cells[cell_id].as_slice();
-            let covered = v.himos.len();
-
-            let remaining: Vec<(usize, u32)> = conds.iter()
-                .filter(|&&(idx, _)| !v.himos.contains(&idx))
-                .copied()
-                .collect();
-
-            let better = match &best {
-                None => true,
-                Some((_, _, c)) => covered > *c,
-            };
-            if better {
-                best = Some((cell, remaining, covered));
-            }
-        }
-
-        best.map(|(c, r, _)| (c, r))
-    }
-
-    fn apply_delta(&mut self, eid: u32, himo_idx: usize, old_val: u32, new_val: u32, all_values: &[(usize, u32)]) {
-        for view in &mut self.views {
-            let pos_in_view = match view.himos.iter().position(|&h| h == himo_idx) {
-                Some(p) => p,
-                None => continue,
-            };
-
-            // view の他紐の値を収集。いずれか未 tie なら skip。
-            let mut old_vals: Vec<u32> = Vec::with_capacity(view.himos.len());
-            let mut new_vals: Vec<u32> = Vec::with_capacity(view.himos.len());
-            let mut missing = false;
-            for (i, &h) in view.himos.iter().enumerate() {
-                if i == pos_in_view {
-                    old_vals.push(old_val);
-                    new_vals.push(new_val);
-                } else {
-                    match all_values.iter().find(|&&(idx, _)| idx == h) {
-                        Some(&(_, v)) => {
-                            old_vals.push(v);
-                            new_vals.push(v);
-                        }
-                        None => { missing = true; break; }
-                    }
-                }
-            }
-            if missing { continue; }
-
-            if old_val != u32::MAX {
-                if let Some(old_id) = view.cell_id_for(&old_vals) {
-                    view.cell_remove(old_id, eid);
-                }
-            }
-            if new_val != u32::MAX {
-                if let Some(new_id) = view.cell_id_for(&new_vals) {
-                    view.cell_add(new_id, eid);
-                }
-            }
-        }
-    }
-}
+// 旧 v0.4.0 まで居た `NTupleEntry` / `NTupleTable` (n-tuple 観測窓) は issue #4 で
+// 撤去。 schema / SQL / RAG / sync / transport いずれの crate からも参照されておらず
+// (engine 内テストだけが叩いていた)、 query 経路の \"best_lookup_ref\" branch と
+// tie / untie / apply_op / open の hook と合わせて約 350 行の dead weight だった。
+// 過去の API は `Engine::define_view` で、 0.4.0 までの DB で永続化された
+// header H_VIEW_COUNT は今は無視される (zero 残置で害なし)。
 
 pub struct Engine {
     #[allow(dead_code)]
@@ -713,7 +575,6 @@ pub struct Engine {
     himos: Vec<HimoStore>,
     entities: EntitySet,
     contents: ContentStore,
-    tuples: std::sync::RwLock<NTupleTable>,
     /// 非同期書き込みキュー。`create_concurrent` で有効化される。
     write_queue: Option<std::sync::Arc<crate::write_queue::WriteQueue>>,
     /// consumer スレッドへの shutdown 通知。`Drop` で true に。
@@ -893,7 +754,6 @@ impl Engine {
             himo_names: Vec::new(),
             himo_types: Vec::new(), himo_max_values: Vec::new(),
             himos: Vec::new(), entities, contents,
-            tuples: std::sync::RwLock::new(NTupleTable::new()),
             write_queue: None,
             shutdown_flag: None,
             consumer_handle: std::sync::Mutex::new(None),
@@ -1115,7 +975,6 @@ impl Engine {
             himos: Vec::new(),
             entities,
             contents,
-            tuples: std::sync::RwLock::new(NTupleTable::new()),
             write_queue: None,
             shutdown_flag: None,
             consumer_handle: std::sync::Mutex::new(None),
@@ -1472,7 +1331,6 @@ impl Engine {
             vocab, himo_reg,
             himo_names, himo_types, himo_max_values,
             himos, entities, contents,
-            tuples: std::sync::RwLock::new(NTupleTable::new()),
             write_queue: None,
             shutdown_flag: None,
             consumer_handle: std::sync::Mutex::new(None),
@@ -1507,8 +1365,6 @@ impl Engine {
         }
 
         eng.rebuild();
-
-        eng.restore_persisted_views()?;
 
         // clean flag を 0 に倒し、 即 msync で永続化する。 こうしないと、 この後
         // insert で index 書き換え → crash → 次 open で flag=1 のまま skip → 不整合、
@@ -1817,9 +1673,7 @@ impl Engine {
             HimoType::Leaf => self.vocab.insert(value.as_bytes()),
             ht => panic!("tie_text on non-text himo '{}': {:?}", himo, ht),
         };
-        let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, vid);
-        self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), vid);
     }
 
     pub fn tie(&mut self, eid: enchudb_wal::EntityId, himo: &str, value: u32) {
@@ -1828,9 +1682,7 @@ impl Engine {
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = self.ensure_himo(himo, HimoType::Number, 0);
         debug_assert!(self.himo_types[hid] == HimoType::Number || self.himo_types[hid] == HimoType::Ref, "tie on non-Value himo '{}'", himo);
-        let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, value);
-        self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), value);
     }
 
     pub fn tie_ref(&mut self, eid: enchudb_wal::EntityId, himo: &str, target_eid: enchudb_wal::EntityId) {
@@ -1840,9 +1692,7 @@ impl Engine {
         assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
         let hid = self.ensure_himo(himo, HimoType::Ref, 0);
         debug_assert!(self.himo_types[hid] == HimoType::Ref || self.himo_types[hid] == HimoType::Number, "tie_ref on non-Ref himo '{}'", himo);
-        let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, target_eid);
-        self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), target_eid);
     }
 
     // ──── tie（定義済み紐、&self で並行書き込み可）────
@@ -1869,9 +1719,7 @@ impl Engine {
             HimoType::Leaf => self.vocab.insert(value.as_bytes()),
             ht => panic!("tie_text_to_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
-        let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, vid);
-        self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), vid);
         // WAL に Vocab + Tie を流す。 schema layer (enchudb-schema) は同期版の
         // tie_text_to を経由するため、 ここで append しないと WAL が空のままで
         // peer 同期が成立しない (publish 側が iter_committed で 0 件を見る).
@@ -1900,9 +1748,7 @@ impl Engine {
         // Tag / Leaf 型 (vocab_id を value として持つ) も許可。 schema 層が
         // 起動時に解決済みの table_vid を marker himo に張る hot path 用途で
         // 必要 (request2.md 提案)。 caller 責任で vocab に既に居る id を渡すこと。
-        let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, value);
-        self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), value);
         if let Some(wal) = self.wal.as_ref() {
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), eid);
             let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id, value });
@@ -1929,9 +1775,7 @@ impl Engine {
             self.himo_types[hid] == HimoType::Ref || self.himo_types[hid] == HimoType::Number,
             "tie_ref_to_by_id on non-Ref himo_id {}", himo_id,
         );
-        let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].set(eid, target_eid);
-        self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), target_eid);
         if let Some(wal) = self.wal.as_ref() {
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), eid);
             let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id, value: target_eid });
@@ -1956,11 +1800,7 @@ impl Engine {
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         if hid >= self.himos.len() { return; }
-        let old_val = self.himos[hid].get_value(eid);
         self.himos[hid].remove(eid);
-        if let Some(ov) = old_val {
-            self.apply_view_delta_internal(eid, hid, ov, u32::MAX);
-        }
         if let Some(wal) = self.wal.as_ref() {
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), eid);
             let _ = wal.append(enchudb_wal::wal::WalOp::Untie { eid: wal_eid, himo_id });
@@ -1973,11 +1813,7 @@ impl Engine {
         self.check_writable();
         let eid = enchudb_wal::eid_local(eid);
         for hid in 0..self.himos.len() {
-            let old_val = self.himos[hid].get_value(eid);
             self.himos[hid].remove(eid);
-            if let Some(ov) = old_val {
-                self.apply_view_delta_internal(eid, hid, ov, u32::MAX);
-            }
         }
         self.entities.free(eid);
         if let Some(wal) = self.wal.as_ref() {
@@ -2482,190 +2318,6 @@ impl Engine {
         for ds in &self.himos { ds.rebuild_cylinder(); }
     }
 
-    /// v27: NTuple 観測窓への delta 伝播(内部用、&self)。
-    /// himos[hid].set の前に呼んで old_val を取得する必要がある。
-    ///
-    /// NTupleTable は RwLock で保護。consumer スレッド(単一)と並行 reader の
-    /// 間で、cell(Vec) への insert/remove が torn read にならないように write
-    /// lock 下で排他する。reader 側 (best_lookup) は read lock 下で borrow。
-    /// view が登録されていなければ何もしない (cost 0)。
-    fn apply_view_delta_internal(&self, eid: u32, himo_idx: usize, old_val: u32, new_val: u32) {
-        let has_views = !self.tuples.read().unwrap().views.is_empty();
-        if !has_views {
-            return;
-        }
-        let other_values: Vec<(usize, u32)> = (0..self.himos.len())
-            .filter(|&i| i != himo_idx)
-            .filter_map(|i| self.himos[i].get_value(eid).map(|v| (i, v)))
-            .collect();
-        self.tuples.write().unwrap().apply_delta(eid, himo_idx, old_val, new_val, &other_values);
-    }
-
-    /// 観測窓(n-tuple 仮想テーブル定義)をスキーマとして永続化登録。
-    /// 以降 tie で自動反映、query で自動利用、open 後も自動復元する。
-    ///
-    /// 各紐は define_himo 済み + max_values > 0 必須。セル数が 100万超ならエラー。
-    /// view 数上限 32、1 view あたり紐数上限 8(ヘッダ固定長制約)。
-    pub fn define_view(&mut self, himos: &[&str]) -> Result<(), String> {
-        if himos.len() < 2 {
-            return Err("view requires at least 2 himos".into());
-        }
-        if himos.len() > MAX_VIEW_HIMOS {
-            return Err(format!("view has too many himos (max {})", MAX_VIEW_HIMOS));
-        }
-
-        let mut idxs: Vec<usize> = Vec::with_capacity(himos.len());
-        for &name in himos {
-            let idx = self.himo_id(name)
-                .ok_or_else(|| format!("himo '{}' not defined", name))?;
-            idxs.push(idx);
-        }
-        idxs.sort();
-
-        // 冪等: ソート正規化後に既存 view と一致すれば no-op
-        {
-            let tuples = self.tuples.read().unwrap();
-            for v in &tuples.views {
-                let mut existing = v.himos.clone();
-                existing.sort();
-                if existing == idxs {
-                    return Ok(());
-                }
-            }
-        }
-
-        if self.tuples.read().unwrap().views.len() >= MAX_PERSISTED_VIEWS {
-            return Err(format!("too many views (max {})", MAX_PERSISTED_VIEWS));
-        }
-
-        // 内部構築 → 成功したらヘッダに永続化 + 追加
-        self.build_and_push_view(&idxs)?;
-        self.persist_view_record(&idxs);
-        Ok(())
-    }
-
-    /// idxs から NTupleEntry を組み立てて tuples.views に push。永続化は呼び元。
-    fn build_and_push_view(&mut self, idxs: &[usize]) -> Result<(), String> {
-        let mut cards: Vec<u32> = Vec::with_capacity(idxs.len());
-        for &idx in idxs {
-            let mv = self.himo_max_values[idx];
-            if mv == 0 {
-                let name = self.himo_names.get(idx).cloned().unwrap_or_default();
-                return Err(format!("himo '{}' has no max_values (define_himo first)", name));
-            }
-            cards.push(mv + 1);
-        }
-
-        // セル数チェック(オーバーフロー対策)
-        let mut cell_count: u64 = 1;
-        for &c in &cards {
-            cell_count = cell_count.saturating_mul(c as u64);
-            if cell_count > 1_000_000 {
-                return Err("tuple view cell count exceeds 1M (got card product > 1M)".into());
-            }
-        }
-        let cell_count = cell_count as usize;
-
-        // ストライド(row-major): strides[i] = Π_{j>i} cards[j]
-        let mut strides: Vec<usize> = vec![0; idxs.len()];
-        let mut acc: usize = 1;
-        for i in (0..idxs.len()).rev() {
-            strides[i] = acc;
-            acc *= cards[i] as usize;
-        }
-
-        let mut cells: Vec<Vec<u32>> = vec![vec![]; cell_count];
-
-        // 既存データから cell を埋める
-        let next_eid = self.entities.next_eid();
-        for eid in 0..next_eid {
-            if !self.entities.is_live(eid) { continue; }
-            let mut vals: Vec<u32> = Vec::with_capacity(idxs.len());
-            let mut all = true;
-            for &hi in idxs {
-                match self.himos[hi].get_value(eid) {
-                    Some(v) if v < self.himo_max_values[hi] + 1 => vals.push(v),
-                    _ => { all = false; break; }
-                }
-            }
-            if !all { continue; }
-            let mut id = 0usize;
-            let mut ok = true;
-            for i in 0..idxs.len() {
-                if vals[i] >= cards[i] { ok = false; break; }
-                id += vals[i] as usize * strides[i];
-            }
-            if ok && id < cells.len() {
-                cells[id].push(eid);
-            }
-        }
-        for c in &mut cells {
-            c.sort_unstable();
-        }
-
-        self.tuples.write().unwrap().views.push(NTupleEntry {
-            himos: idxs.to_vec(),
-            cards,
-            strides,
-            cells,
-        });
-        Ok(())
-    }
-
-    /// ヘッダに 1 view レコードを append(H_VIEW_COUNT を +1)。
-    fn persist_view_record(&mut self, idxs: &[usize]) {
-        let buf = self.backing.as_slice_mut();
-        let count = u32::from_le_bytes(buf[H_VIEW_COUNT..H_VIEW_COUNT + 4].try_into().unwrap());
-        let slot = count as usize;
-        let off = H_VIEWS_OFF + slot * VIEW_RECORD_SIZE;
-        buf[off] = idxs.len() as u8;
-        for (i, &idx) in idxs.iter().enumerate() {
-            let o = off + 1 + i * 2;
-            buf[o..o + 2].copy_from_slice(&(idx as u16).to_le_bytes());
-        }
-        // 末尾 padding は 0 のまま
-        for i in idxs.len()..MAX_VIEW_HIMOS {
-            let o = off + 1 + i * 2;
-            buf[o..o + 2].copy_from_slice(&0u16.to_le_bytes());
-        }
-        let new_count = count + 1;
-        buf[H_VIEW_COUNT..H_VIEW_COUNT + 4].copy_from_slice(&new_count.to_le_bytes());
-    }
-
-    /// open 時: ヘッダから view を読み出して NTupleEntry を再構築。
-    fn restore_persisted_views(&mut self) -> Result<(), String> {
-        let buf = self.backing.as_slice_mut();
-        let count = u32::from_le_bytes(buf[H_VIEW_COUNT..H_VIEW_COUNT + 4].try_into().unwrap()) as usize;
-        if count == 0 { return Ok(()); }
-        if count > MAX_PERSISTED_VIEWS {
-            return Err(format!("persisted view count {} exceeds max {}", count, MAX_PERSISTED_VIEWS));
-        }
-
-        let mut all_idxs: Vec<Vec<usize>> = Vec::with_capacity(count);
-        for slot in 0..count {
-            let off = H_VIEWS_OFF + slot * VIEW_RECORD_SIZE;
-            let length = buf[off] as usize;
-            if length < 2 || length > MAX_VIEW_HIMOS {
-                return Err(format!("persisted view {} has invalid length {}", slot, length));
-            }
-            let mut idxs: Vec<usize> = Vec::with_capacity(length);
-            for i in 0..length {
-                let o = off + 1 + i * 2;
-                let hid = u16::from_le_bytes(buf[o..o + 2].try_into().unwrap()) as usize;
-                if hid >= self.himos.len() {
-                    return Err(format!("persisted view {} references unknown himo id {}", slot, hid));
-                }
-                idxs.push(hid);
-            }
-            all_idxs.push(idxs);
-        }
-
-        for idxs in all_idxs {
-            self.build_and_push_view(&idxs)?;
-        }
-        Ok(())
-    }
-
     /// 引く。 EntityId(u64) の Vec を返す。
     pub fn pull_raw(&self, himo: &str, value: u32) -> Vec<enchudb_wal::EntityId> {
         match self.himo_id(himo) {
@@ -2786,96 +2438,11 @@ impl Engine {
             return self.himos[idx].pull(val);
         }
 
-        // 最小 Cylinder スライスのサイズを調べる(実体は下の戦略選択で必要)
-        let mut min_slice_len = usize::MAX;
-        for &(idx, val) in conds.iter() {
-            let len = self.himos[idx].slice_len(val);
-            if len < min_slice_len { min_slice_len = len; }
-        }
-
-        // v27: 観測窓(n-tuple)と最小 Cylinder スライスを比べて最小候補を選ぶ。
-        // read lock を iterate+filter の間保持して torn read を防ぐ(cell への insert/remove は write lock)。
-        {
-            let tuple_len = {
-                let t = self.tuples.read().unwrap();
-                t.best_lookup_ref(&conds).map(|(c, _)| c.len()).unwrap_or(usize::MAX)
-            };
-
-            if tuple_len <= min_slice_len {
-                let guard = self.tuples.read().unwrap();
-                if let Some((candidates, remaining)) = guard.best_lookup_ref(&conds) {
-                    if remaining.is_empty() {
-                        return candidates.to_vec();
-                    }
-                    let mut result = Vec::new();
-                    for &eid in candidates {
-                        let mut pass = true;
-                        for &(idx, val) in &remaining {
-                            if !self.himos[idx].value_eq(eid, val) {
-                                pass = false;
-                                break;
-                            }
-                        }
-                        if pass { result.push(eid); }
-                    }
-                    return result;
-                }
-            }
-        }
-
-        // 全条件bitmapならAND（delta空 + 値がbitmap範囲内の時のみ）
-        let all_bitmap = conds.len() >= 2
-            && conds.iter().all(|&(idx, val)| {
-                let hs = &self.himos[idx];
-                hs.has_bitmaps() && val <= hs.max_values && hs.delta_is_empty()
-            });
-
-        // bitmap AND は N 全件 word AND なので O(entities/64)、 結果サイズに依存しない定数時間。
-        // column_filter は pivot bucket pull + per-eid Column 直読み (~7 ns/op)。
-        //
-        // 両者の breakeven:
-        //   column_filter:   pivot × (cond - 1) × 7 ns
-        //   bitmap_and:      (N / 64) × 0.5 ns + result_size × bit_extract
-        //   → pivot ≈ N / 1000 付近 (Column が word AND の ~14x 重いので)
-        //
-        // 旧閾値 `* 8` (pivot ≥ N/8) は 100x 緩く、 中規模 cardinality (50K-100K hit、 N=1M) で
-        // column_filter に降りて per-hit 7 ns が乗ってた。 `* 1000` で 1K pivot 以上は bitmap、
-        // 極端に絞り込めた時 (pivot < N/1000) だけ column_filter。
-        if all_bitmap {
-            let total = self.entities.next_eid() as usize;
-            if total == 0 || min_slice_len * 1000 >= total {
-                return self.query_bitmap_and(&conds);
-            }
-        }
-
-        // Column直読みフィルタ（Columnは常に最新なのでdelta不要）
+        // Column直読みフィルタ。 `delta` は常に空なので Column が最新で OK。
+        // 旧版は 「全条件 bitmap なら AND」 fast path を持っていたが、
+        // `HimoStore::has_bitmaps()` が常に false で到達不能だったため issue #5
+        // で撤去した。 0.5+ 系で bitmap を本気で持つなら、 ここで戦略選択を復活させる。
         self.query_column_filter(&conds)
-    }
-
-    /// 実entity範囲のbitmap word数（max_entitiesではなく実際のnext_eid基準）。
-    fn effective_bitmap_words(&self) -> usize {
-        (self.entities.next_eid() as usize + 63) / 64
-    }
-
-    /// Case A: 全条件bitmap有 → AND + extract を1パスで。alloc最小。
-    fn query_bitmap_and(&self, conds: &[(usize, u32)]) -> Vec<u32> {
-        let words = self.effective_bitmap_words();
-        let bitmaps: Vec<&[u64]> = conds.iter()
-            .filter_map(|&(idx, val)| self.himos[idx].bitmap(val))
-            .collect();
-        if bitmaps.len() != conds.len() { return vec![]; }
-
-        let mut result = Vec::new();
-        for i in 0..words {
-            let mut w = bitmaps[0][i];
-            for bm in &bitmaps[1..] { w &= bm[i]; }
-            while w != 0 {
-                let bit = w.trailing_zeros();
-                result.push((i * 64 + bit as usize) as u32);
-                w &= w - 1;
-            }
-        }
-        result
     }
 
     /// Column直読みフィルタ（delta 補正付き）
@@ -3504,26 +3071,16 @@ impl Engine {
             Op::Tie { eid, himo_id, value } => {
                 let hid = himo_id as usize;
                 if hid >= self.himos.len() { return; }
-                let old_val = self.himos[hid].get_value(eid);
                 self.himos[hid].set(eid, value);
-                self.apply_view_delta_internal(eid, hid, old_val.unwrap_or(u32::MAX), value);
             }
             Op::Untie { eid, himo_id } => {
                 let hid = himo_id as usize;
                 if hid >= self.himos.len() { return; }
-                let old_val = self.himos[hid].get_value(eid);
                 self.himos[hid].remove(eid);
-                if let Some(ov) = old_val {
-                    self.apply_view_delta_internal(eid, hid, ov, u32::MAX);
-                }
             }
             Op::Delete { eid } => {
                 for hid in 0..self.himos.len() {
-                    let old_val = self.himos[hid].get_value(eid);
                     self.himos[hid].remove(eid);
-                    if let Some(ov) = old_val {
-                        self.apply_view_delta_internal(eid, hid, ov, u32::MAX);
-                    }
                 }
                 self.entities.free(eid);
             }
@@ -5012,266 +4569,6 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
     }
 
-    // ──── v27: NTupleView (観測窓) ────
-
-    #[test]
-    fn ntuple_view_register_and_query() {
-        let dir = tmp("ntuple_basic");
-        let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.define_himo("tenant", HimoType::Number, 8);
-        eng.define_himo("dept", HimoType::Number, 8);
-        eng.define_himo("status", HimoType::Number, 4);
-
-        for i in 0u32..100 {
-            let e = eng.entity();
-            eng.tie(e, "tenant", i % 8);
-            eng.tie(e, "dept", (i * 3) % 8);
-            eng.tie(e, "status", (i * 5) % 4);
-        }
-        eng.define_view(&["tenant", "dept", "status"]).unwrap();
-
-        // 登録後も tie で自動更新
-        let e = eng.entity();
-        eng.tie(e, "tenant", 3);
-        eng.tie(e, "dept", 5);
-        eng.tie(e, "status", 1);
-
-        let baseline: Vec<u32> = (0..100u32).filter(|i| i % 8 == 3 && (i * 3) % 8 == 5 && (i * 5) % 4 == 1).collect();
-        let expected_count = baseline.len() + 1;
-
-        let r = eng.query(&[("tenant", 3), ("dept", 5), ("status", 1)]);
-        assert_eq!(r.len(), expected_count);
-        assert!(r.contains(&e));
-
-        let _ = std::fs::remove_file(&dir);
-    }
-
-    #[test]
-    fn ntuple_view_partial_match() {
-        let dir = tmp("ntuple_partial");
-        let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.define_himo("a", HimoType::Number, 8);
-        eng.define_himo("b", HimoType::Number, 8);
-        eng.define_himo("c", HimoType::Number, 4);
-        eng.define_himo("d", HimoType::Number, 4);
-
-        for i in 0u32..200 {
-            let e = eng.entity();
-            eng.tie(e, "a", i % 8);
-            eng.tie(e, "b", (i * 3) % 8);
-            eng.tie(e, "c", (i * 5) % 4);
-            eng.tie(e, "d", (i * 7) % 4);
-        }
-        // 3紐登録、クエリは4条件(1つは残り条件として Column フィルタ)
-        eng.define_view(&["a", "b", "c"]).unwrap();
-
-        let r = eng.query(&[("a", 2), ("b", 6), ("c", 2), ("d", 0)]);
-        let expected: Vec<u32> = (0..200u32)
-            .filter(|i| i % 8 == 2 && (i * 3) % 8 == 6 && (i * 5) % 4 == 2 && (i * 7) % 4 == 0)
-            .collect();
-        assert_eq!(r.len(), expected.len());
-
-        let _ = std::fs::remove_file(&dir);
-    }
-
-    #[test]
-    fn ntuple_view_untie_propagates() {
-        let dir = tmp("ntuple_untie");
-        let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.define_himo("x", HimoType::Number, 8);
-        eng.define_himo("y", HimoType::Number, 8);
-
-        let e0 = eng.entity();
-        eng.tie(e0, "x", 2);
-        eng.tie(e0, "y", 3);
-        let e1 = eng.entity();
-        eng.tie(e1, "x", 2);
-        eng.tie(e1, "y", 3);
-
-        eng.define_view(&["x", "y"]).unwrap();
-        assert_eq!(eng.query(&[("x", 2), ("y", 3)]).len(), 2);
-
-        eng.untie(e0, "x");
-        let r = eng.query(&[("x", 2), ("y", 3)]);
-        assert_eq!(r, vec![e1]);
-
-        // 再 tie
-        eng.tie(e0, "x", 2);
-        let r = eng.query(&[("x", 2), ("y", 3)]);
-        assert_eq!(r.len(), 2);
-
-        let _ = std::fs::remove_file(&dir);
-    }
-
-    #[test]
-    fn ntuple_view_delete_propagates() {
-        let dir = tmp("ntuple_delete");
-        let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.define_himo("x", HimoType::Number, 8);
-        eng.define_himo("y", HimoType::Number, 8);
-
-        let e0 = eng.entity();
-        eng.tie(e0, "x", 1);
-        eng.tie(e0, "y", 1);
-        let e1 = eng.entity();
-        eng.tie(e1, "x", 1);
-        eng.tie(e1, "y", 1);
-
-        eng.define_view(&["x", "y"]).unwrap();
-        assert_eq!(eng.query(&[("x", 1), ("y", 1)]).len(), 2);
-
-        eng.delete(e0);
-        let r = eng.query(&[("x", 1), ("y", 1)]);
-        assert_eq!(r, vec![e1]);
-
-        let _ = std::fs::remove_file(&dir);
-    }
-
-    #[test]
-    fn ntuple_view_cell_overflow_rejected() {
-        let dir = tmp("ntuple_overflow");
-        let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.define_himo("a", HimoType::Number, 1000);
-        eng.define_himo("b", HimoType::Number, 1000);
-        eng.define_himo("c", HimoType::Number, 100);
-        // 1001 * 1001 * 101 = ~101M > 1M
-        let r = eng.define_view(&["a", "b", "c"]);
-        assert!(r.is_err());
-
-        let _ = std::fs::remove_file(&dir);
-    }
-
-    #[test]
-    fn ntuple_view_requires_max_values() {
-        let dir = tmp("ntuple_nomv");
-        let mut eng = Engine::create_standalone(&dir).unwrap();
-        let e = eng.entity();
-        eng.tie(e, "foo", 1); // max_values=0 のまま自動作成
-        eng.tie(e, "bar", 2);
-        let r = eng.define_view(&["foo", "bar"]);
-        assert!(r.is_err());
-
-        let _ = std::fs::remove_file(&dir);
-    }
-
-    #[test]
-    fn ntuple_view_exact_match_vs_pair() {
-        let dir = tmp("ntuple_exact");
-        let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.define_himo("a", HimoType::Number, 4);
-        eng.define_himo("b", HimoType::Number, 4);
-        eng.define_himo("c", HimoType::Number, 4);
-
-        for i in 0u32..50 {
-            let e = eng.entity();
-            eng.tie(e, "a", i % 4);
-            eng.tie(e, "b", (i / 4) % 4);
-            eng.tie(e, "c", (i / 16) % 4);
-        }
-        eng.define_view(&["a", "b", "c"]).unwrap();
-
-        // 全条件がマッチする観測窓(3紐)を使うケース
-        let r = eng.query(&[("a", 1), ("b", 2), ("c", 0)]);
-        let expected: Vec<u64> = (0..50u64)
-            .filter(|i| i % 4 == 1 && (i / 4) % 4 == 2 && (i / 16) % 4 == 0)
-            .collect();
-        assert_eq!(r.len(), expected.len());
-        for &e in &expected {
-            assert!(r.contains(&e));
-        }
-
-        let _ = std::fs::remove_file(&dir);
-    }
-
-    // ──── v27: 観測窓の永続化 ────
-
-    #[test]
-    fn define_view_persists() {
-        let dir = tmp("view_persist");
-        let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.define_himo("tenant", HimoType::Number, 8);
-        eng.define_himo("dept", HimoType::Number, 8);
-        eng.define_himo("status", HimoType::Number, 4);
-
-        for i in 0u32..80 {
-            let e = eng.entity();
-            eng.tie(e, "tenant", i % 8);
-            eng.tie(e, "dept", (i * 3) % 8);
-            eng.tie(e, "status", (i * 5) % 4);
-        }
-        eng.define_view(&["tenant", "dept", "status"]).unwrap();
-        // tenant=3 → dept=(3*3)%8=1, status=(3*5)%4=3。10 件ヒット。
-        let pre = eng.query(&[("tenant", 3), ("dept", 1), ("status", 3)]).len();
-        eng.flush().unwrap();
-        drop(eng);
-
-        // 再 open → define_view なしで query が動くこと
-        let eng2 = Engine::open_standalone(&dir).unwrap();
-        let post = eng2.query(&[("tenant", 3), ("dept", 1), ("status", 3)]).len();
-        assert_eq!(pre, post);
-        assert!(pre > 0, "expected matches, got {}", pre);
-
-        // open 後も tie で自動反映される
-        // (新しい entity を追加して、観測窓経由で見えること)
-        // 注: tie は &mut self なので Drop 前にもう一度可変参照が必要
-        drop(eng2);
-        let mut eng3 = Engine::open_standalone(&dir).unwrap();
-        let new_e = eng3.entity();
-        eng3.tie(new_e, "tenant", 3);
-        eng3.tie(new_e, "dept", 1);
-        eng3.tie(new_e, "status", 3);
-        let post2 = eng3.query(&[("tenant", 3), ("dept", 1), ("status", 3)]).len();
-        assert_eq!(post2, post + 1);
-
-        let _ = std::fs::remove_file(&dir);
-    }
-
-    #[test]
-    fn define_view_cell_count_error() {
-        let dir = tmp("view_overflow");
-        let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.define_himo("a", HimoType::Number, 1000);
-        eng.define_himo("b", HimoType::Number, 1000);
-        eng.define_himo("c", HimoType::Number, 100);
-        let r = eng.define_view(&["a", "b", "c"]);
-        assert!(r.is_err());
-
-        let _ = std::fs::remove_file(&dir);
-    }
-
-    #[test]
-    fn multiple_views_persist() {
-        let dir = tmp("view_multi");
-        let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.define_himo("a", HimoType::Number, 4);
-        eng.define_himo("b", HimoType::Number, 4);
-        eng.define_himo("c", HimoType::Number, 4);
-        eng.define_himo("d", HimoType::Number, 4);
-
-        for i in 0u32..60 {
-            let e = eng.entity();
-            eng.tie(e, "a", i % 4);
-            eng.tie(e, "b", (i / 4) % 4);
-            eng.tie(e, "c", (i / 16) % 4);
-            eng.tie(e, "d", (i * 7) % 4);
-        }
-        eng.define_view(&["a", "b", "c"]).unwrap();
-        eng.define_view(&["a", "b", "d"]).unwrap();
-        eng.define_view(&["c", "d"]).unwrap();
-
-        let q1_pre = eng.query(&[("a", 1), ("b", 2), ("c", 0)]).len();
-        let q2_pre = eng.query(&[("a", 1), ("b", 2), ("d", 3)]).len();
-        let q3_pre = eng.query(&[("c", 0), ("d", 1)]).len();
-        eng.flush().unwrap();
-        drop(eng);
-
-        let eng2 = Engine::open_standalone(&dir).unwrap();
-        assert_eq!(eng2.query(&[("a", 1), ("b", 2), ("c", 0)]).len(), q1_pre);
-        assert_eq!(eng2.query(&[("a", 1), ("b", 2), ("d", 3)]).len(), q2_pre);
-        assert_eq!(eng2.query(&[("c", 0), ("d", 1)]).len(), q3_pre);
-
-        let _ = std::fs::remove_file(&dir);
-    }
 
     #[test]
     fn concurrent_tie_async_basic() {

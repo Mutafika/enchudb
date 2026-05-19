@@ -55,35 +55,8 @@ fn tenant_isolation_query() {
 // ─────────────────────────────────────────────────────────
 // 2. tenant_with_view
 // ─────────────────────────────────────────────────────────
-#[test]
-fn tenant_with_view() {
-    let path = db_path("tenant_view");
-    let mut db = Engine::create_with_capacity(&path, 2_000).unwrap();
-    db.define_himo("tenant", HimoType::Number, 8);
-    db.define_himo("status", HimoType::Number, 4);
-    db.define_himo("noise", HimoType::Number, 50);
-
-    db.define_view(&["tenant", "status"]).unwrap();
-
-    let n = 800u32;
-    for i in 0..n {
-        let e = db.entity();
-        db.tie(e, "tenant", i % 8);
-        db.tie(e, "status", (i / 8) % 4);
-        db.tie(e, "noise", i % 50);
-    }
-    db.rebuild();
-
-    // query(tenant + status) は view 経由
-    let r = db.query(&[("tenant", 3), ("status", 2)]);
-    let r_set: HashSet<u64> = r.iter().copied().collect();
-    let expected: HashSet<u64> = (0..n)
-        .filter(|&i| i % 8 == 3 && (i / 8) % 4 == 2)
-        .map(|i| i as u64)
-        .collect();
-    assert_eq!(r_set, expected, "tenant=3 status=2 should match brute force");
-    assert!(!r.is_empty());
-}
+// `tenant_with_view` は issue #4 で `Engine::define_view` 撤去に伴い削除。
+// 同等の AND query は `tenant_isolation_query` (前) でカバー済み。
 
 // ─────────────────────────────────────────────────────────
 // 3. region_hierarchy_navigation
@@ -391,87 +364,9 @@ fn cascade_delete_effect() {
 // ─────────────────────────────────────────────────────────
 // 11. views_after_open
 // ─────────────────────────────────────────────────────────
-#[test]
-fn views_after_open() {
-    let path = db_path("view_open");
-
-    // 書き込みフェーズ
-    let pre_query: HashSet<u64>;
-    {
-        let mut db = Engine::create_with_capacity(&path, 2_000).unwrap();
-        db.define_himo("tenant", HimoType::Number, 8);
-        db.define_himo("status", HimoType::Number, 4);
-        db.define_himo("grade", HimoType::Number, 5);
-        db.define_view(&["tenant", "status"]).unwrap();
-
-        for i in 0..1_000u32 {
-            let e = db.entity();
-            db.tie(e, "tenant", i % 8);
-            db.tie(e, "status", (i / 8) % 4);
-            db.tie(e, "grade", (i / 32) % 5);
-        }
-        db.rebuild();
-
-        let r = db.query(&[("tenant", 2), ("status", 1)]);
-        pre_query = r.into_iter().collect();
-        assert!(!pre_query.is_empty());
-
-        db.flush().unwrap();
-    } // drop
-
-    // open フェーズ — define_view を呼ばない
-    let db = Engine::open_standalone(&path).unwrap();
-    let r = db.query(&[("tenant", 2), ("status", 1)]);
-    let post_query: HashSet<u64> = r.into_iter().collect();
-    assert_eq!(post_query, pre_query, "view query must match before/after reopen");
-}
-
-// ─────────────────────────────────────────────────────────
-// 12. view_hit_vs_miss
-// ─────────────────────────────────────────────────────────
-#[test]
-fn view_hit_vs_miss() {
-    let path = db_path("view_hitmiss");
-    let mut db = Engine::create_with_capacity(&path, 2_000).unwrap();
-    db.define_himo("tenant", HimoType::Number, 8);
-    db.define_himo("status", HimoType::Number, 4);
-    db.define_himo("grade", HimoType::Number, 5);
-
-    db.define_view(&["tenant", "status"]).unwrap();
-
-    let n = 1_000u32;
-    for i in 0..n {
-        let e = db.entity();
-        db.tie(e, "tenant", i % 8);
-        db.tie(e, "status", (i / 8) % 4);
-        db.tie(e, "grade", (i / 32) % 5);
-    }
-    db.rebuild();
-
-    // ヒット: view と同一組合せ
-    let r_hit = db.query(&[("tenant", 3), ("status", 2)]);
-    let exp_hit: HashSet<u64> = (0..n)
-        .filter(|&i| i % 8 == 3 && (i / 8) % 4 == 2)
-        .map(|i| i as u64)
-        .collect();
-    assert_eq!(r_hit.iter().copied().collect::<HashSet<u64>>(), exp_hit);
-
-    // ミス: view が無い組合せ → ペアテーブル or column フィルタ
-    let r_miss = db.query(&[("tenant", 3), ("grade", 1)]);
-    let exp_miss: HashSet<u64> = (0..n)
-        .filter(|&i| i % 8 == 3 && (i / 32) % 5 == 1)
-        .map(|i| i as u64)
-        .collect();
-    assert_eq!(r_miss.iter().copied().collect::<HashSet<u64>>(), exp_miss);
-
-    // view の上に第 3 条件を足す
-    let r_three = db.query(&[("tenant", 3), ("status", 2), ("grade", 1)]);
-    let exp_three: HashSet<u64> = (0..n)
-        .filter(|&i| i % 8 == 3 && (i / 8) % 4 == 2 && (i / 32) % 5 == 1)
-        .map(|i| i as u64)
-        .collect();
-    assert_eq!(r_three.iter().copied().collect::<HashSet<u64>>(), exp_three);
-}
+// `views_after_open` / `view_hit_vs_miss` は issue #4 で `Engine::define_view`
+// 撤去に伴い削除。 AND query 自体は他 test (`tenant_isolation_query` 等) でカバー
+// 済み。 reopen の整合性は新規の `reopen_eager_rebuild_bench` で測定。
 
 // ─────────────────────────────────────────────────────────
 // 13. mixed_workload

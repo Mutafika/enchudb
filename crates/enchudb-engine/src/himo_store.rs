@@ -237,10 +237,6 @@ impl HimoStore {
     pub fn delta_is_empty(&self) -> bool { true }
     pub fn delta_needs_rebuild(&self) -> bool { false }
 
-    pub fn has_bitmaps(&self) -> bool { false }
-    pub fn bitmap(&self, _value: u32) -> Option<&[u64]> { None }
-    pub fn bitmap_words(&self) -> usize { 0 }
-
     pub fn rebuild_cylinder(&self) {}
 
     pub fn scan(&self, value: u32) -> Vec<u32> {
