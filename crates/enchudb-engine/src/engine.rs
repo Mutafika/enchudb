@@ -1878,6 +1878,64 @@ impl Engine {
         self.ensure_himo(himo, ht, max_values);
     }
 
+    /// β-light step 4: 指定 table 配下の column として himo を定義する。
+    /// 内部 storage 上は `"table.himo"` (例: `"users.age"`) という完全修飾名で
+    /// 1 エントリ。 tie 経路は既存のまま (`himo_id` の vocab 検索で full name
+    /// を引く)、 namespacing は単純な命名規約として扱う。
+    ///
+    /// 旧 API `define_himo` は引き続き bare 名で anonymous table に attach
+    /// される。 同名 collision は engine では check しない (step 5+ で
+    /// 必要なら追加)。
+    pub fn define_himo_in(
+        &mut self,
+        table_name: &str,
+        himo_name: &str,
+        ht: HimoType,
+        max_values: u32,
+    ) -> Result<u32, String> {
+        self.check_writable();
+        if table_name.is_empty() {
+            return Err("table name must be non-empty (use define_himo for anonymous)".into());
+        }
+        if himo_name.is_empty() {
+            return Err("himo name must be non-empty".into());
+        }
+        if himo_name.contains('.') {
+            return Err(format!(
+                "himo name '{}' must not contain '.' (it is reserved as table separator)",
+                himo_name,
+            ));
+        }
+        let tid = self
+            .tables
+            .iter()
+            .position(|t| t.name == table_name)
+            .ok_or_else(|| format!("table '{}' not found", table_name))?;
+
+        let full_name = format!("{}.{}", table_name, himo_name);
+
+        // ensure_himo は既に存在ならそのまま、 新規なら anonymous へ attach する。
+        // 後者なら anonymous の himo_ids から外して target table へ移す。
+        let hid = self.ensure_himo(&full_name, ht, max_values);
+        let hid_u32 = hid as u32;
+
+        // 既に target table に attach 済みなら何もしない (重複 define_himo_in)
+        if self.himo_to_table[hid] == tid as TableId {
+            return Ok(hid_u32);
+        }
+
+        // ensure_himo は新規時に ANONYMOUS_TABLE へ attach するので、 別 table
+        // 既属の場合は migrate する形 (実用上は新規時のみ通る)。
+        let cur_tid = self.himo_to_table[hid];
+        self.tables[cur_tid as usize]
+            .himo_ids
+            .retain(|&h| h != hid_u32);
+        self.tables[tid].himo_ids.push(hid_u32);
+        self.himo_to_table[hid] = tid as TableId;
+
+        Ok(hid_u32)
+    }
+
     pub fn tie_text(&mut self, eid: enchudb_wal::EntityId, himo: &str, value: &str) {
         self.check_writable();
         let eid = enchudb_wal::eid_local(eid);

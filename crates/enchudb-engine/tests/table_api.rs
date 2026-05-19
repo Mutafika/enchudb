@@ -187,6 +187,81 @@ fn two_tables_have_disjoint_eid_ranges() {
 }
 
 #[test]
+fn define_himo_in_namespaces_full_name() {
+    let path = tmp_path("define_himo_in");
+    cleanup(&path);
+
+    let mut eng = Engine::create_standalone(&path).unwrap();
+    eng.define_table("users", 100).unwrap();
+    let hid = eng
+        .define_himo_in("users", "age", HimoType::Number, 100)
+        .expect("define users.age");
+    assert_eq!(hid, 0, "first himo should be id 0");
+
+    let e1 = eng.entity_in("users").unwrap();
+    eng.tie(e1, "users.age", 30);
+    let rows = eng.pull_raw("users.age", 30);
+    assert_eq!(rows.len(), 1);
+
+    // bare 名は別 himo として扱われる (storage が full name で分離)
+    let bare = eng.pull_raw("age", 30);
+    assert!(bare.is_empty(), "bare 'age' is a different himo");
+
+    cleanup(&path);
+}
+
+#[test]
+fn define_himo_in_separates_two_tables() {
+    let path = tmp_path("two_table_himo");
+    cleanup(&path);
+
+    let mut eng = Engine::create_standalone(&path).unwrap();
+    eng.define_table("users", 100).unwrap();
+    eng.define_table("orders", 100).unwrap();
+    eng.define_himo_in("users", "age", HimoType::Number, 100).unwrap();
+    eng.define_himo_in("orders", "total", HimoType::Number, 100).unwrap();
+
+    let u = eng.entity_in("users").unwrap();
+    let o = eng.entity_in("orders").unwrap();
+    eng.tie(u, "users.age", 30);
+    eng.tie(o, "orders.total", 999);
+
+    assert_eq!(eng.pull_raw("users.age", 30).len(), 1);
+    assert_eq!(eng.pull_raw("orders.total", 999).len(), 1);
+    // namespace 衝突なし: users.age に "999" は乗ってない
+    assert_eq!(eng.pull_raw("users.age", 999).len(), 0);
+
+    cleanup(&path);
+}
+
+#[test]
+fn define_himo_in_rejects_dot_in_name() {
+    let path = tmp_path("dot_name");
+    cleanup(&path);
+
+    let mut eng = Engine::create_standalone(&path).unwrap();
+    eng.define_table("users", 100).unwrap();
+    let result = eng.define_himo_in("users", "a.b", HimoType::Number, 100);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("must not contain '.'"));
+
+    cleanup(&path);
+}
+
+#[test]
+fn define_himo_in_unknown_table_errors() {
+    let path = tmp_path("missing_tbl");
+    cleanup(&path);
+
+    let mut eng = Engine::create_standalone(&path).unwrap();
+    let result = eng.define_himo_in("missing", "age", HimoType::Number, 100);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("not found"));
+
+    cleanup(&path);
+}
+
+#[test]
 fn anonymous_keeps_open_until_first_define_table() {
     let path = tmp_path("anon_open");
     cleanup(&path);
