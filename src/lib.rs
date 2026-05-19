@@ -41,6 +41,14 @@
 
 pub use enchudb_engine::*;
 
+// Convenience re-exports for downstream crates that previously imported these
+// from the root (opyula など)。 EntityId / Hlc / PeerId / keys は本来
+// `enchudb_wal` 配下だが、 meta crate として薄く再露出する。
+pub use enchudb_wal::{EntityId, Hlc, PeerId};
+pub mod keys {
+    pub use enchudb_wal::keys::*;
+}
+
 /// Native API (仮想 2D テーブル + 永続化)。 app 開発向けの primary path。
 /// disk-backed なので wasm32 では提供されない (engine API を直接使うこと)。
 #[cfg(not(target_arch = "wasm32"))]
