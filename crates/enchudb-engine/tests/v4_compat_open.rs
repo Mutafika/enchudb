@@ -108,6 +108,55 @@ fn v4_db_opens_via_legacy_path() {
 }
 
 #[test]
+fn v4_db_gradual_migration_to_tables() {
+    // β-light step 8: v4 DB を open → 旧 data 読める + 新 table を追加して
+    // reopen → 旧 legacy + 新 tables が共存する。 段階移行のシナリオ。
+    let path = tmp_path("v4_migrate");
+    cleanup(&path);
+
+    // 1. v5 で作って data 入れる
+    {
+        let mut eng = Engine::create_standalone(&path).unwrap();
+        eng.define_himo("legacy_age", HimoType::Number, 100);
+        let e = eng.entity();
+        eng.tie(e, "legacy_age", 42);
+        eng.flush().unwrap();
+    }
+
+    // 2. header を v4 に書き換え (= v4 DB simulation) + sidecar 削除
+    rewrite_header_as_v4(&path);
+    let _ = std::fs::remove_file(format!("{}.tables", path));
+
+    // 3. v0.5.x で open → legacy data 読める + tables 追加
+    {
+        let mut eng = Engine::open_standalone(&path).expect("v4 compat open");
+        // 旧 data
+        assert_eq!(eng.pull_raw("legacy_age", 42).len(), 1);
+
+        // 新 table を追加
+        eng.define_table("users", 100).unwrap();
+        eng.define_himo_in("users", "age", HimoType::Number, 100).unwrap();
+        let alice = eng.entity_in("users").unwrap();
+        eng.tie(alice, "users.age", 30);
+        eng.flush().unwrap();
+    }
+
+    // 4. reopen → legacy + 新 table 共存
+    {
+        let eng = Engine::open_standalone(&path).unwrap();
+        // 旧 himo 残ってる
+        assert_eq!(eng.pull_raw("legacy_age", 42).len(), 1);
+        // 新 himo も復元
+        assert_eq!(eng.pull_raw("users.age", 30).len(), 1);
+        // tables 復元
+        let tables = eng.list_tables();
+        assert!(tables.iter().any(|(_, n, _, _)| n == "users"));
+    }
+
+    cleanup(&path);
+}
+
+#[test]
 fn unknown_version_is_rejected() {
     let path = tmp_path("unknown_version");
     cleanup(&path);

@@ -383,6 +383,95 @@ fn bench_scale(c: &mut Criterion) {
     cleanup(&path);
 }
 
+// ─────────────────────────────────────────────────────────────
+// scale_tables (β-light: 10 table × 5 himo × 10k entity を table-aware で)
+//
+// 同等 workload を `bench_scale` (anonymous flat) と比較する。 β-light で
+// positions が table-local (10k 範囲) に収まるため、 同 op が hot path で
+// 動く速度自体は変わらないが、 positions の絶対サイズ / reopen 時の
+// rebuild 走査範囲は小さくなる。
+// ─────────────────────────────────────────────────────────────
+
+fn bench_scale_tables(c: &mut Criterion) {
+    let path = tmp("scale_tables");
+    let mut eng = Engine::create_with_capacity(&path, 200_000).unwrap();
+
+    // 10 table × 5 himo を table-aware で構築
+    for t in 0..10 {
+        let tname = format!("t{}", t);
+        eng.define_table(&tname, 10_000).unwrap();
+        for h in 0..5 {
+            let hname = format!("h{}", h);
+            eng.define_himo_in(&tname, &hname, HimoType::Number, 100).unwrap();
+        }
+    }
+    for t in 0..10 {
+        let tname = format!("t{}", t);
+        let himo_full: Vec<String> = (0..5).map(|h| format!("t{}.h{}", t, h)).collect();
+        for i in 0..10_000 {
+            let e = eng.entity_in(&tname).unwrap();
+            let v = (i % 100) as u32;
+            for hn in &himo_full {
+                eng.tie(e, hn, v);
+            }
+        }
+    }
+    eng.rebuild();
+
+    let mut group = c.benchmark_group("scale_tables");
+    group.throughput(Throughput::Elements(1));
+    group.measurement_time(MEASUREMENT_TIME);
+    group.sample_size(SAMPLE_SIZE);
+
+    group.bench_function("pull_in_dense_himo", |b| {
+        let mut i = 0u32;
+        b.iter(|| {
+            i = i.wrapping_add(1);
+            let r = eng.pull_raw("t5.h0", black_box(i % 100));
+            black_box(r);
+        });
+    });
+
+    group.bench_function("query_within_table", |b| {
+        let mut i = 0u32;
+        b.iter(|| {
+            i = i.wrapping_add(1);
+            let r = eng.query(black_box(&[
+                ("t3.h0", (i % 100) as u32),
+                ("t3.h1", (i % 100) as u32),
+            ]));
+            black_box(r);
+        });
+    });
+
+    group.finish();
+
+    // open + 即 query — β-light で positions sparse 化の効果が出る場所
+    drop(eng);
+    let mut group2 = c.benchmark_group("scale_tables_open");
+    group2.sample_size(30);
+    group2.measurement_time(Duration::from_secs(20));
+    group2.bench_function("open_then_query", |b| {
+        b.iter_batched(
+            || (),
+            |_| {
+                let eng = Engine::open_standalone(&path).unwrap();
+                let r = eng.query(&[
+                    ("t3.h0", 50),
+                    ("t3.h1", 50),
+                ]);
+                black_box(r);
+                drop(eng);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group2.finish();
+
+    cleanup(&path);
+    let _ = std::fs::remove_file(format!("{}.tables", path));
+}
+
 criterion_group!(
     benches,
     bench_tie,
@@ -392,5 +481,6 @@ criterion_group!(
     bench_snapshot_export,
     bench_audit,
     bench_scale,
+    bench_scale_tables,
 );
 criterion_main!(benches);

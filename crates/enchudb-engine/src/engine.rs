@@ -2166,7 +2166,7 @@ impl Engine {
     /// hot path: define_table が未呼び出しなら `tables.len() == 1` で 1 load で
     /// 抜ける。 これにより legacy 経路の tie_async hot path は ~1 ns コストに収まる。
     /// 一度でも user table を定義したら full validation 経路に入る。
-    #[inline]
+    #[inline(always)]
     fn validate_eid_for_himo(&self, hid: usize, eid_local: u32) {
         // fast path: anonymous のみ存在 (= define_table 未) → 全 eid 受け入れ
         if self.tables.len() <= 1 {
@@ -2198,7 +2198,7 @@ impl Engine {
     /// hot path 性能:
     ///   - 非 Ref himo は最初の `himo_types[hid] != Ref` で即 return (~1 ns)
     ///   - Ref himo は fk_refs (typically 1-5 件) の線形検索 (~5-10 ns)
-    #[inline]
+    #[inline(always)]
     fn validate_ref_tie(&self, hid: usize, target_eid: u32) {
         if hid >= self.himo_types.len() {
             return;
