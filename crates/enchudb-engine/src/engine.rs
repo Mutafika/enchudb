@@ -1968,6 +1968,45 @@ impl Engine {
         Ok(hid)
     }
 
+    /// β-light step 6: tie 対象 eid が himo の所属 table eid_range に収まるか
+    /// validate。 これが β-light の win の本体: 「table-local positions」 を
+    /// BucketCylinder の eid_offset 機構で自然に実現する。
+    ///
+    /// 動作:
+    ///   - anonymous (id=0) かつ open-ended (eid_range_hi == u32::MAX) は
+    ///     validation スキップ (= 旧 API 完全互換)
+    ///   - それ以外 (= define_table 後 / 非 anonymous table) は eid が
+    ///     [eid_range_lo, eid_range_hi) に収まらないと panic
+    ///
+    /// hot path: define_table が未呼び出しなら `tables.len() == 1` で 1 load で
+    /// 抜ける。 これにより legacy 経路の tie_async hot path は ~1 ns コストに収まる。
+    /// 一度でも user table を定義したら full validation 経路に入る。
+    #[inline]
+    fn validate_eid_for_himo(&self, hid: usize, eid_local: u32) {
+        // fast path: anonymous のみ存在 (= define_table 未) → 全 eid 受け入れ
+        if self.tables.len() <= 1 {
+            return;
+        }
+        if hid >= self.himo_to_table.len() {
+            return;
+        }
+        let tid = self.himo_to_table[hid] as usize;
+        if tid >= self.tables.len() {
+            return;
+        }
+        let table = &self.tables[tid];
+        // anonymous は close されてれば eid_range_hi != u32::MAX、 closed 後も
+        // tie が来たら validate される
+        if table.eid_range_hi == u32::MAX {
+            return;
+        }
+        assert!(
+            eid_local >= table.eid_range_lo && eid_local < table.eid_range_hi,
+            "tie eid {} not in himo's table '{}' eid_range [{}, {})",
+            eid_local, table.name, table.eid_range_lo, table.eid_range_hi,
+        );
+    }
+
     /// β-light step 5: Ref tie の FK validation。 himo が Ref 型で fk_refs
     /// entry を持つ場合、 target_eid が target_table の eid 範囲内かを assert。
     ///
@@ -2010,6 +2049,8 @@ impl Engine {
         self.check_writable();
         let eid = enchudb_wal::eid_local(eid);
         let hid = self.ensure_himo(himo, HimoType::Tag, 0);
+        // β-light step 6: eid が himo の所属 table eid_range 内か
+        self.validate_eid_for_himo(hid, eid);
         // Tag は dedupe (get_or_insert)、Leaf は新規 id 発行 (insert)。
         let vid = match self.himo_types[hid] {
             HimoType::Tag => self.vocab.get_or_insert(value.as_bytes()),
@@ -2025,6 +2066,8 @@ impl Engine {
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = self.ensure_himo(himo, HimoType::Number, 0);
         debug_assert!(self.himo_types[hid] == HimoType::Number || self.himo_types[hid] == HimoType::Ref, "tie on non-Value himo '{}'", himo);
+        // β-light step 6: eid が himo の所属 table eid_range 内か
+        self.validate_eid_for_himo(hid, eid);
         // β-light step 5: Ref himo は target_table の eid range を validate
         self.validate_ref_tie(hid, value);
         self.himos[hid].set(eid, value);
@@ -2037,6 +2080,8 @@ impl Engine {
         assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
         let hid = self.ensure_himo(himo, HimoType::Ref, 0);
         debug_assert!(self.himo_types[hid] == HimoType::Ref || self.himo_types[hid] == HimoType::Number, "tie_ref on non-Ref himo '{}'", himo);
+        // β-light step 6: eid が himo の所属 table eid_range 内か
+        self.validate_eid_for_himo(hid, eid);
         // β-light step 5: target_eid が target_table の eid range 内か
         self.validate_ref_tie(hid, target_eid);
         self.himos[hid].set(eid, target_eid);
@@ -3471,6 +3516,9 @@ impl Engine {
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         debug_assert!((himo_id as usize) < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
+        // β-light step 6: eid が himo の所属 table eid_range 内か (anonymous
+        // open-ended なら即 return)
+        self.validate_eid_for_himo(himo_id as usize, local);
         // β-light step 5: Ref himo の FK validation (非 Ref は即 return で
         // ~1 ns、 Ref で fk_refs entry なしも同じ)
         self.validate_ref_tie(himo_id as usize, value);
@@ -3513,6 +3561,8 @@ impl Engine {
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
+        // β-light step 6: eid が himo の所属 table eid_range 内か
+        self.validate_eid_for_himo(hid, local);
         // Tag は dedupe、Leaf は常に新規 id。
         let vid = match self.himo_types[hid] {
             HimoType::Tag => self.vocab.get_or_insert(value.as_bytes()),
@@ -3560,6 +3610,8 @@ impl Engine {
         assert!(target_local < u32::MAX, "target_local must be < u32::MAX");
         debug_assert!((himo_id as usize) < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
+        // β-light step 6: eid が himo の所属 table eid_range 内か
+        self.validate_eid_for_himo(himo_id as usize, local);
         // β-light step 5: target_eid が target_table の eid range 内か
         self.validate_ref_tie(himo_id as usize, target_local);
         if let Some(wal) = self.wal.as_ref() {

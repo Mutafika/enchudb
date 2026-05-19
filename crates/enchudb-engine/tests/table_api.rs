@@ -75,7 +75,7 @@ fn entity_in_allocates_within_range() {
 
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_table("users", 100).unwrap();
-    eng.define_himo("age", HimoType::Number, 100);
+    eng.define_himo_in("users", "age", HimoType::Number, 100).unwrap();
 
     let e1 = eng.entity_in("users").unwrap();
     let e2 = eng.entity_in("users").unwrap();
@@ -85,8 +85,8 @@ fn entity_in_allocates_within_range() {
     assert!(local1 < 100, "in users range");
     assert!(local2 < 100, "in users range");
 
-    eng.tie(e1, "age", 30);
-    let rows = eng.pull_raw("age", 30);
+    eng.tie(e1, "users.age", 30);
+    let rows = eng.pull_raw("users.age", 30);
     assert_eq!(rows.len(), 1);
 
     drop(eng);
@@ -334,6 +334,116 @@ fn ref_without_fk_link_skips_validation() {
     // 何でも tie 可能 (validation skip)
     eng.tie(post, "posts.author", 9_999_999);
     assert_eq!(eng.pull_raw("posts.author", 9_999_999).len(), 1);
+
+    cleanup(&path);
+}
+
+#[test]
+fn tie_out_of_table_range_panics() {
+    let path = tmp_path("range_violate");
+    cleanup(&path);
+
+    let mut eng = Engine::create_standalone(&path).unwrap();
+    eng.define_table("users", 100).unwrap();
+    eng.define_table("posts", 100).unwrap();
+    eng.define_himo_in("users", "age", HimoType::Number, 100).unwrap();
+
+    let _ = eng.entity_in("users").unwrap();
+    let post = eng.entity_in("posts").unwrap();
+    let post_local = enchudb_wal::eid_local(post);
+
+    // post の eid を users.age に tie しようとする → eid_range 外で panic
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        eng.tie(post, "users.age", 30);
+    }));
+    assert!(result.is_err(), "tie out-of-table-range should panic");
+    let _ = post_local;
+
+    cleanup(&path);
+}
+
+#[test]
+fn anonymous_open_skips_eid_range_validation() {
+    // anonymous (open-ended) は legacy 互換のため validate しない
+    let path = tmp_path("anon_no_validate");
+    cleanup(&path);
+
+    let mut eng = Engine::create_standalone(&path).unwrap();
+    eng.define_himo("age", HimoType::Number, 100);
+    let e = eng.entity();
+    eng.tie(e, "age", 30); // OK
+    assert_eq!(eng.pull_raw("age", 30).len(), 1);
+
+    cleanup(&path);
+}
+
+#[test]
+fn anonymous_closed_validates_eid_range() {
+    // anonymous が closed なら validate kick-in
+    let path = tmp_path("anon_closed");
+    cleanup(&path);
+
+    let mut eng = Engine::create_standalone(&path).unwrap();
+    eng.define_himo("age", HimoType::Number, 100);
+    let e1 = eng.entity(); // anonymous に 1 個確保 (eid=0)
+    eng.tie(e1, "age", 30); // anonymous open なので OK
+
+    eng.define_table("users", 100).unwrap(); // anonymous を [0, 1) で close
+    let user = eng.entity_in("users").unwrap();
+    let user_local = enchudb_wal::eid_local(user);
+
+    // anonymous の age に user eid (= 1, 外) を tie → panic
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        eng.tie(user, "age", 99);
+    }));
+    assert!(result.is_err(), "should panic: anonymous closed at [0,1), user_local={}", user_local);
+
+    cleanup(&path);
+}
+
+#[test]
+fn positions_isolated_per_table() {
+    // β-light の core win 検証: 2 つの table に大きく離れた eid 範囲を
+    // 取らせ、 各 himo の query が正しく動くこと。
+    let path = tmp_path("isolated");
+    cleanup(&path);
+
+    let mut eng = Engine::create_standalone(&path).unwrap();
+    eng.define_table("a", 1000).unwrap();
+    eng.define_table("b", 1000).unwrap();
+    eng.define_himo_in("a", "v", HimoType::Number, 100).unwrap();
+    eng.define_himo_in("b", "v", HimoType::Number, 100).unwrap();
+
+    // a に 10 個、 b に 10 個 entity 作って tie
+    let mut a_eids = Vec::new();
+    for _ in 0..10 {
+        a_eids.push(eng.entity_in("a").unwrap());
+    }
+    let mut b_eids = Vec::new();
+    for _ in 0..10 {
+        b_eids.push(eng.entity_in("b").unwrap());
+    }
+    for (i, &e) in a_eids.iter().enumerate() {
+        eng.tie(e, "a.v", (i % 5) as u32);
+    }
+    for (i, &e) in b_eids.iter().enumerate() {
+        eng.tie(e, "b.v", (i % 5) as u32);
+    }
+
+    // a.v と b.v は独立: 同じ value=2 で引いてもそれぞれ 2 件ずつ
+    assert_eq!(eng.pull_raw("a.v", 2).len(), 2);
+    assert_eq!(eng.pull_raw("b.v", 2).len(), 2);
+    // 結果 eid が混ざってない
+    let a_results = eng.pull_raw("a.v", 2);
+    for &e in &a_results {
+        let local = enchudb_wal::eid_local(e);
+        assert!(local < 1000, "a.v result eid {} should be in a range", local);
+    }
+    let b_results = eng.pull_raw("b.v", 2);
+    for &e in &b_results {
+        let local = enchudb_wal::eid_local(e);
+        assert!(local >= 1000 && local < 2000, "b.v result eid {} should be in b range", local);
+    }
 
     cleanup(&path);
 }
