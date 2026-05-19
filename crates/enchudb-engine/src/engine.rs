@@ -566,6 +566,57 @@ impl Layout {
 // 過去の API は `Engine::define_view` で、 0.4.0 までの DB で永続化された
 // header H_VIEW_COUNT は今は無視される (zero 残置で害なし)。
 
+// ════════════════ Table (β-light step 2: 内部 data のみ) ════════════════
+//
+// 「entity に tie する」 = 「行に値を入れる」 ことの自己認識を engine に
+// 与えるための table 概念。 各 table は himo set (列) + eid_range (行範囲)
+// を持つ。 step 2 では anonymous table (id=0) 1 個だけが存在し、 全 himo /
+// 全 entity が自動でここに属する (旧 API 完全互換)。
+//
+// step 3+ で define_table / entity_in API を公開し、 非 anonymous table の
+// 切り出し + Ref validation + table-local positions へ進む。
+
+/// Table 識別子。 u16 で 65536 table までを表現 (実用上十分)。
+/// `ANONYMOUS_TABLE` (= 0) は engine 起動時に必ず存在する default table。
+pub type TableId = u16;
+pub const ANONYMOUS_TABLE: TableId = 0;
+
+/// 1 つの table の定義。 名前 (anonymous は空文字)、 所属 himo の id 列、
+/// eid_range (anonymous は open-ended)、 FK 参照 (Ref himo の target table)。
+///
+/// step 2 段階では engine 内部にしか露出せず、 一部 field は step 3+ で
+/// 使われる。 dead code 警告は段階実装の意図的な姿。
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct TableDef {
+    /// table 名 (anonymous は ""、 user 定義 table は固有名)。
+    pub name: String,
+    /// この table の column 軸を成す himo の id 列 (engine.himos の index)。
+    pub himo_ids: Vec<u32>,
+    /// この table が占有する eid 範囲の下限 (inclusive)。
+    pub eid_range_lo: u32,
+    /// 上限 (exclusive)。 `u32::MAX` は open-ended (= まだ後続 table が
+    /// 切られていない、 次の entity 確保で伸びる)。 後続 table が定義された
+    /// 瞬間に現在の next_eid に固定される。
+    pub eid_range_hi: u32,
+    /// Ref himo の target table 一覧 (himo_id, target_table_id)。
+    /// step 5 で validation に使う。
+    pub fk_refs: Vec<(u32, TableId)>,
+}
+
+impl TableDef {
+    /// 起動時の anonymous table。 全 himo / entity の default 受け皿。
+    pub fn anonymous() -> Self {
+        Self {
+            name: String::new(),
+            himo_ids: Vec::new(),
+            eid_range_lo: 0,
+            eid_range_hi: u32::MAX,
+            fk_refs: Vec::new(),
+        }
+    }
+}
+
 pub struct Engine {
     #[allow(dead_code)]
     path: String,
@@ -578,6 +629,13 @@ pub struct Engine {
     himo_types: Vec<HimoType>,
     himo_max_values: Vec<u32>,
     himos: Vec<HimoStore>,
+    /// β-light step 2: engine が認知する table 一覧。 index 0 は常に
+    /// anonymous table (旧 API は全部ここに dispatch)。 step 3+ で
+    /// define_table 時に push される。
+    tables: Vec<TableDef>,
+    /// β-light step 2: himo_id → 所属 table_id の逆引き (himos と同じ index)。
+    /// 旧 API (`define_himo`) で追加された himo は全部 ANONYMOUS_TABLE。
+    himo_to_table: Vec<TableId>,
     entities: EntitySet,
     contents: ContentStore,
     /// 非同期書き込みキュー。`create_concurrent` で有効化される。
@@ -759,6 +817,8 @@ impl Engine {
             himo_names: Vec::new(),
             himo_types: Vec::new(), himo_max_values: Vec::new(),
             himos: Vec::new(), entities, contents,
+            tables: vec![TableDef::anonymous()],
+            himo_to_table: Vec::new(),
             write_queue: None,
             shutdown_flag: None,
             consumer_handle: std::sync::Mutex::new(None),
@@ -980,6 +1040,8 @@ impl Engine {
             himos: Vec::new(),
             entities,
             contents,
+            tables: vec![TableDef::anonymous()],
+            himo_to_table: Vec::new(),
             write_queue: None,
             shutdown_flag: None,
             consumer_handle: std::sync::Mutex::new(None),
@@ -1334,11 +1396,23 @@ impl Engine {
         }
         report("HimoStore::load × N", &mut t, &mut p);
 
+        // β-light step 2: load 時は全 himo を anonymous table に attach する。
+        // step 3+ で v5 DB の table descriptor 読み出しに置き換える、 v4 DB は
+        // 引き続きこの compat 経路で anonymous-only として open される。
+        let initial_tables = vec![{
+            let mut anon = TableDef::anonymous();
+            anon.himo_ids = (0..himos.len() as u32).collect();
+            anon
+        }];
+        let initial_himo_to_table = vec![ANONYMOUS_TABLE; himos.len()];
+
         let mut eng = Self {
             path: String::new(), layout, max_entities, max_himos,
             vocab, himo_reg,
             himo_names, himo_types, himo_max_values,
             himos, entities, contents,
+            tables: initial_tables,
+            himo_to_table: initial_himo_to_table,
             write_queue: None,
             shutdown_flag: None,
             consumer_handle: std::sync::Mutex::new(None),
@@ -2535,6 +2609,13 @@ impl Engine {
         self.himo_names.push(himo.to_string());
         self.himo_types.push(ht);
         self.himo_max_values.push(max_values);
+
+        // β-light step 2: 旧 API (define_himo) で追加された himo は anonymous
+        // table に attach する。 step 3+ で define_table 経由なら target table
+        // を指定して attach する形に拡張。
+        let hid_u32 = hid as u32;
+        self.tables[ANONYMOUS_TABLE as usize].himo_ids.push(hid_u32);
+        self.himo_to_table.push(ANONYMOUS_TABLE);
 
         // ヘッダにメタデータ書き込み
         let maxv_base = himo_maxv_base(self.max_himos);
