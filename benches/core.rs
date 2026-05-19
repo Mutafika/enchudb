@@ -1,33 +1,46 @@
 //! 主要 op の性能 regression 検出用 bench。
 //!
-//! TEST_DESIGN.md P1-4。対象:
-//! - tie(writer 1 thread、Column 直書き)
+//! TEST_DESIGN.md P1-4 + scale 軸。対象:
+//! - tie(writer 1 thread、Column 直書き、 hot loop で reuse)
 //! - pull_raw(O(1) 点引き)
 //! - query(多条件 AND、v26 の pair table パス)
 //! - snapshot_export(WAL + body のファイルコピー)
 //! - audit(WAL commit 済みレコードの走査)
+//! - scale (10 "table" × 5 himo × 10k entity の global flat workload、
+//!   β-light の table-aware 化前後で RSS / query 比較する用)
 //!
 //! # 使い方
 //!
 //! 初回(baseline 記録):
 //! ```text
-//! cargo bench --features v32 --bench core -- --save-baseline main
+//! cargo bench --bench core -- --save-baseline pre_table_aware
 //! ```
 //!
 //! 変更後(比較):
 //! ```text
-//! cargo bench --features v32 --bench core -- --baseline main
+//! cargo bench --bench core -- --baseline pre_table_aware
 //! ```
 //! criterion が ±10% 以上の劣化を自動で flag する。
 //!
-//! # 注意
-//! regression 検出が目的なので sample 数は最低限。数値そのものより
-//! ΔTime% に注目すること。
+//! # noise floor 対策
+//! - 各 bench で `iter_batched` の setup を hot loop 外に追い出す (engine
+//!   create / cleanup を per-iter で繰り返さない)。 これで tie_plain が
+//!   engine init コスト支配で 4x 揺れていた問題を抑える。
+//! - sample_size と measurement_time を default より厚めに取り、 system
+//!   load の山を均して median を安定化。
+//! - bench 中は他重い process を回さないこと。 cargo build や git op が
+//!   並行で走ると数字が壊れる。
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use enchudb::{AuditFilter, Engine, HimoType};
 use std::hint::black_box;
 use std::sync::Arc;
+use std::time::Duration;
+
+// 全 group 共通の感度設定。 system noise を均すため default (5s / 100 samples)
+// より厚め。 ±10% 程度の真の regression は確実に拾い、 ±2-5% の noise には鈍感に。
+const MEASUREMENT_TIME: Duration = Duration::from_secs(10);
+const SAMPLE_SIZE: usize = 200;
 
 fn tmp(tag: &str) -> String {
     let p = format!(
@@ -56,27 +69,29 @@ fn cleanup(path: &str) {
 // ─────────────────────────────────────────────────────────────
 
 fn bench_tie(c: &mut Criterion) {
+    // pre-setup を hot loop 外に: 旧版は iter_batched で毎回 engine create + drop
+    // + cleanup していたため、 measurement が tie 自体ではなく init コスト支配で
+    // ±4x の system 揺れを受けていた。 1 eid を pre-allocate して reuse する。
+    let path = tmp("tie_plain");
+    let mut eng = Engine::create_standalone(&path).unwrap();
+    eng.define_himo("v", HimoType::Number, 100);
+    let eid = eng.entity();
+
     let mut group = c.benchmark_group("tie");
     group.throughput(Throughput::Elements(1));
+    group.measurement_time(MEASUREMENT_TIME);
+    group.sample_size(SAMPLE_SIZE);
     group.bench_function("plain_value", |b| {
-        b.iter_batched(
-            || {
-                let path = tmp("tie_plain");
-                let mut eng = Engine::create_standalone(&path).unwrap();
-                eng.define_himo("v", HimoType::Number, 100);
-                let e = eng.entity();
-                (path, eng, e, 0u32)
-            },
-            |(path, mut eng, e, mut counter)| {
-                counter = counter.wrapping_add(1);
-                eng.tie(black_box(e), "v", black_box(counter % 100));
-                drop(eng);
-                cleanup(&path);
-            },
-            BatchSize::SmallInput,
-        );
+        let mut i = 0u32;
+        b.iter(|| {
+            i = i.wrapping_add(1);
+            eng.tie(black_box(eid), "v", black_box(i % 100));
+        });
     });
     group.finish();
+
+    drop(eng);
+    cleanup(&path);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -96,6 +111,8 @@ fn bench_pull_raw(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("pull_raw");
     group.throughput(Throughput::Elements(1));
+    group.measurement_time(MEASUREMENT_TIME);
+    group.sample_size(SAMPLE_SIZE);
     group.bench_function("single_value", |b| {
         let mut counter = 0u32;
         b.iter(|| {
@@ -128,6 +145,8 @@ fn bench_query(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("query");
     group.throughput(Throughput::Elements(1));
+    group.measurement_time(MEASUREMENT_TIME);
+    group.sample_size(SAMPLE_SIZE);
     group.bench_function("two_cond_and", |b| {
         let mut i = 0u32;
         b.iter(|| {
@@ -164,7 +183,10 @@ fn bench_snapshot_export(c: &mut Criterion) {
     let eng = Engine::open_standalone(&path).unwrap();
 
     let mut group = c.benchmark_group("snapshot_export");
-    group.sample_size(20); // ファイルコピー系は count 減らす
+    // ファイルコピー系は inherently 重い、 sample_size は 50 まで増やす (旧 20)、
+    // measurement_time も 15s に延ばして noise を均す。
+    group.sample_size(50);
+    group.measurement_time(Duration::from_secs(15));
     group.bench_function("small_db", |b| {
         let mut counter = 0u64;
         b.iter_batched(
@@ -213,6 +235,8 @@ fn bench_audit(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("audit");
     group.throughput(Throughput::Elements(1_000));
+    group.measurement_time(MEASUREMENT_TIME);
+    group.sample_size(SAMPLE_SIZE);
     group.bench_function("all_1k_records", |b| {
         b.iter(|| {
             let recs = eng.audit(black_box(&AuditFilter::default()));
@@ -248,6 +272,8 @@ fn bench_tie_async(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("tie_async");
     group.throughput(Throughput::Elements(1));
+    group.measurement_time(MEASUREMENT_TIME);
+    group.sample_size(SAMPLE_SIZE);
     group.bench_function("wal_signed_off", |b| {
         let mut i = 0u32;
         b.iter(|| {
@@ -261,6 +287,102 @@ fn bench_tie_async(c: &mut Criterion) {
     cleanup(&path);
 }
 
+// ─────────────────────────────────────────────────────────────
+// scale (10 "table" × 5 himo × 10k entity の anonymous flat)
+//
+// β-light の table-aware 化前後で:
+//   - 各 himo の positions size が 100k → 10k 範囲に縮む
+//   - RSS / open / table 内 query が改善する想定
+// 同じ workload を表現する bench を 0.4.x master 側で先に立てておき、
+// 0.5.x で同 bench を再実行して A/B 比較する。
+// ─────────────────────────────────────────────────────────────
+
+fn bench_scale(c: &mut Criterion) {
+    let path = tmp("scale");
+    let mut eng = Engine::create_with_capacity(&path, 200_000).unwrap();
+
+    // 10 table 相当 × 5 himo
+    for t in 0..10 {
+        for h in 0..5 {
+            eng.define_himo(&format!("t{}_h{}", t, h), HimoType::Number, 100);
+        }
+    }
+
+    // 各 table が 10k entity を確保 + 自分の 5 himo にだけ tie
+    let mut table_eids: Vec<Vec<enchudb::EntityId>> = (0..10)
+        .map(|_| Vec::with_capacity(10_000))
+        .collect();
+    for t in 0..10 {
+        for _ in 0..10_000 {
+            table_eids[t].push(eng.entity());
+        }
+    }
+    for t in 0..10 {
+        let himo_names: Vec<String> = (0..5).map(|h| format!("t{}_h{}", t, h)).collect();
+        for (i, &e) in table_eids[t].iter().enumerate() {
+            let v = (i % 100) as u32;
+            for hn in &himo_names {
+                eng.tie(e, hn, v);
+            }
+        }
+    }
+    eng.rebuild();
+
+    let mut group = c.benchmark_group("scale");
+    group.throughput(Throughput::Elements(1));
+    group.measurement_time(MEASUREMENT_TIME);
+    group.sample_size(SAMPLE_SIZE);
+
+    // 単 himo の dense pull (100 値、 各 100 entity)
+    group.bench_function("pull_in_dense_himo", |b| {
+        let mut i = 0u32;
+        b.iter(|| {
+            i = i.wrapping_add(1);
+            let r = eng.pull_raw("t5_h0", black_box(i % 100));
+            black_box(r);
+        });
+    });
+
+    // table 内 2-cond AND query (post β-light で table-local positions が効くはず)
+    group.bench_function("query_within_table", |b| {
+        let mut i = 0u32;
+        b.iter(|| {
+            i = i.wrapping_add(1);
+            let r = eng.query(black_box(&[
+                ("t3_h0", (i % 100) as u32),
+                ("t3_h1", (i % 100) as u32),
+            ]));
+            black_box(r);
+        });
+    });
+
+    group.finish();
+
+    // open + 即 query — 0.4.x lazy rebuild penalty 含む
+    drop(eng);
+    let mut group2 = c.benchmark_group("scale_open");
+    group2.sample_size(30);
+    group2.measurement_time(Duration::from_secs(20));
+    group2.bench_function("open_then_query", |b| {
+        b.iter_batched(
+            || (),
+            |_| {
+                let eng = Engine::open_standalone(&path).unwrap();
+                let r = eng.query(&[
+                    ("t3_h0", 50),
+                    ("t3_h1", 50),
+                ]);
+                black_box(r);
+                drop(eng);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group2.finish();
+
+    cleanup(&path);
+}
+
 criterion_group!(
     benches,
     bench_tie,
@@ -269,5 +391,6 @@ criterion_group!(
     bench_query,
     bench_snapshot_export,
     bench_audit,
+    bench_scale,
 );
 criterion_main!(benches);
