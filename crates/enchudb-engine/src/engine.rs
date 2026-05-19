@@ -301,11 +301,16 @@ fn extract_bitmap(bitmap: &[u64]) -> Vec<u32> {
 // ════════════════ ファイルレイアウト ════════════════
 
 const FILE_MAGIC: [u8; 4] = *b"ECDB";
+/// v5 (進行中): engine が table (行型) を認知する。 v4 DB は anonymous table
+/// 1 個に migrate されて open 可能 (= 旧 flat 空間と同じ動作)。
+///
 /// v4: undo region 廃止 — `UndoLog` を撤去し、 `rollback()` API を削除。
 /// undo は WAL 有効時には Commit で自動 clear される redundant な層であり、
 /// standalone mode では `record()` 内の spin-wait が consumer 不在で
 /// permanent hang を起こしていた (GitHub issue #1)。 v3 DB は再作成必要。
-const FILE_VERSION: u32 = 4;
+const FILE_VERSION: u32 = 5;
+/// v4 DB を後方互換で open する識別子。 v4 → v5 migrate は open 時透過。
+const FILE_VERSION_LEGACY_V4: u32 = 4;
 const HEADER_SIZE: usize = 4096;
 
 const DEFAULT_MAX_ENTITIES: u32 = 16_777_216;
@@ -1214,10 +1219,13 @@ impl Engine {
             return Err("not an EnchuDB file".into());
         }
         let version = u32::from_le_bytes(buf[H_VERSION..H_VERSION + 4].try_into().unwrap());
-        if version != FILE_VERSION {
+        // v5 が現行、 v4 は後方互換で受け付ける (= anonymous table 1 個に migrate)。
+        // v4 DB を v5 として open しても、 引き続き flat anonymous モードで動作する
+        // (table 概念は step 2 以降の実装に伴って活性化)。
+        if version != FILE_VERSION && version != FILE_VERSION_LEGACY_V4 {
             return Err(format!(
-                "unsupported EnchuDB file version {} (expected {}). dev phase — recreate the DB.",
-                version, FILE_VERSION
+                "unsupported EnchuDB file version {} (supported: {}, {} compat). dev phase — recreate the DB.",
+                version, FILE_VERSION, FILE_VERSION_LEGACY_V4
             ));
         }
         // v28: ヘッダ整合性 CRC 検証(stored == 0 は v27 以前の DB として許容)
