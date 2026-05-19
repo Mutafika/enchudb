@@ -22,6 +22,7 @@ pub mod vocabulary;
 pub mod entity_set;
 pub mod cylinder;
 pub mod cylinder_v27;
+pub mod positions_region;
 pub mod himo_store;
 pub mod content_store;
 pub mod engine;
