@@ -62,6 +62,148 @@ fn wal_path_for(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{}.wal", path))
 }
 
+/// β-light step 7: table 定義 metadata の sidecar path。 `.tables`。
+/// 中身は binary encoded `TableDef` 配列、 atomic 書き換え (`.tables.tmp` →
+/// rename) で更新。 v4 DB は sidecar なし、 open 時は anonymous fallback。
+#[cfg(not(target_arch = "wasm32"))]
+fn tables_path_for(path: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}.tables", path))
+}
+
+/// β-light step 7: tables Vec を binary encode。
+///
+/// layout:
+///   magic: "TBL1" (4)
+///   version: u32 = 1
+///   table_count: u32
+///   per table:
+///     name_len: u32
+///     name: u8[name_len]
+///     eid_range_lo: u32
+///     eid_range_hi: u32
+///     next_local: u32
+///     himo_count: u32
+///     himo_ids: u32[himo_count]
+///     fk_count: u32
+///     fk_refs: [(u32 himo_id, u32 (target_table as u32))] × fk_count
+fn serialize_tables(tables: &[TableDef]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64 + tables.len() * 128);
+    out.extend_from_slice(b"TBL1");
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&(tables.len() as u32).to_le_bytes());
+    for t in tables {
+        let name_bytes = t.name.as_bytes();
+        out.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(name_bytes);
+        out.extend_from_slice(&t.eid_range_lo.to_le_bytes());
+        out.extend_from_slice(&t.eid_range_hi.to_le_bytes());
+        out.extend_from_slice(&t.next_local.to_le_bytes());
+        out.extend_from_slice(&(t.himo_ids.len() as u32).to_le_bytes());
+        for &h in &t.himo_ids {
+            out.extend_from_slice(&h.to_le_bytes());
+        }
+        out.extend_from_slice(&(t.fk_refs.len() as u32).to_le_bytes());
+        for &(hid, tid) in &t.fk_refs {
+            out.extend_from_slice(&hid.to_le_bytes());
+            out.extend_from_slice(&(tid as u32).to_le_bytes());
+        }
+    }
+    out
+}
+
+/// β-light step 7: tables sidecar を decode。 magic 不一致 / 短すぎる buffer
+/// は Err。 部分破損は次の field 読みで失敗 → Err として扱う。
+fn deserialize_tables(buf: &[u8]) -> Result<Vec<TableDef>, String> {
+    if buf.len() < 12 || &buf[0..4] != b"TBL1" {
+        return Err("tables sidecar: bad magic".into());
+    }
+    let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+    if version != 1 {
+        return Err(format!("tables sidecar: unsupported version {}", version));
+    }
+    let table_count = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
+    let mut tables = Vec::with_capacity(table_count);
+    let mut off = 12usize;
+
+    macro_rules! read_u32 {
+        ($buf:expr, $off:expr) => {{
+            if $off + 4 > $buf.len() {
+                return Err("tables sidecar: truncated".into());
+            }
+            let v = u32::from_le_bytes($buf[$off..$off + 4].try_into().unwrap());
+            $off += 4;
+            v
+        }};
+    }
+
+    for _ in 0..table_count {
+        let name_len = read_u32!(buf, off) as usize;
+        if off + name_len > buf.len() {
+            return Err("tables sidecar: truncated (name)".into());
+        }
+        let name = String::from_utf8_lossy(&buf[off..off + name_len]).to_string();
+        off += name_len;
+        let eid_range_lo = read_u32!(buf, off);
+        let eid_range_hi = read_u32!(buf, off);
+        let next_local = read_u32!(buf, off);
+        let himo_count = read_u32!(buf, off) as usize;
+        let mut himo_ids = Vec::with_capacity(himo_count);
+        for _ in 0..himo_count {
+            himo_ids.push(read_u32!(buf, off));
+        }
+        let fk_count = read_u32!(buf, off) as usize;
+        let mut fk_refs = Vec::with_capacity(fk_count);
+        for _ in 0..fk_count {
+            let hid = read_u32!(buf, off);
+            let tid = read_u32!(buf, off);
+            fk_refs.push((hid, tid as TableId));
+        }
+        tables.push(TableDef {
+            name,
+            himo_ids,
+            eid_range_lo,
+            eid_range_hi,
+            fk_refs,
+            next_local,
+        });
+    }
+    Ok(tables)
+}
+
+/// β-light step 7: tables を sidecar に atomic 書き換え。 fsync まで含む。
+#[cfg(not(target_arch = "wasm32"))]
+fn persist_tables_to_sidecar(db_path: &str, tables: &[TableDef]) -> io::Result<()> {
+    use std::io::Write;
+    let sidecar = tables_path_for(db_path);
+    let tmp_path = sidecar.with_extension("tables.tmp");
+    let bytes = serialize_tables(tables);
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, &sidecar)?;
+    Ok(())
+}
+
+/// β-light step 7: 既存 sidecar を読む。 不在 (v4 DB) なら Ok(None)。
+#[cfg(not(target_arch = "wasm32"))]
+fn load_tables_from_sidecar(db_path: &str) -> io::Result<Option<Vec<TableDef>>> {
+    let sidecar = tables_path_for(db_path);
+    match std::fs::read(&sidecar) {
+        Ok(buf) => match deserialize_tables(&buf) {
+            Ok(tables) => Ok(Some(tables)),
+            Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// writer 排他用 sidecar の path。 `.db.lock`。
 #[cfg(not(target_arch = "wasm32"))]
 fn writer_lock_path_for(path: &str) -> std::path::PathBuf {
@@ -1126,6 +1268,13 @@ impl Engine {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         eng.path = path.to_string();
         eng._writer_lock = writer_lock;
+
+        // β-light step 7: tables sidecar の読み込み。 不在なら anonymous fallback
+        // (= load_from_backing が既に行った形のまま) で v4 DB 互換。
+        if let Ok(Some(persisted)) = load_tables_from_sidecar(path) {
+            eng.adopt_persisted_tables(persisted);
+        }
+
         if verify_region_crc {
             // .crc ファイルがあれば全 region CRC 検証
             eng.verify_region_crcs()?;
@@ -1577,6 +1726,7 @@ impl Engine {
             fk_refs: Vec::new(),
             next_local: 0,
         });
+        self.try_persist_tables();
         Ok(tid)
     }
 
@@ -1619,6 +1769,39 @@ impl Engine {
         }
         let peer = self.peer_id.load(Ordering::Acquire);
         Ok(enchudb_wal::make_eid(peer, global))
+    }
+
+    /// β-light step 7: 現 tables Vec を sidecar に保存する (best effort)。
+    /// memory-only (from_bytes) や wasm では no-op。 path が空なら skip。
+    fn try_persist_tables(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if !self.path.is_empty() {
+                if let Err(e) = persist_tables_to_sidecar(&self.path, &self.tables) {
+                    // best effort: panic せずログだけ。 user table の定義は
+                    // メモリには反映されてる、 次回 reopen で失われるだけ。
+                    eprintln!("warning: failed to persist tables sidecar: {}", e);
+                }
+            }
+        }
+    }
+
+    /// β-light step 7: sidecar から復元した tables を採用、 himo_to_table も
+    /// それに合わせて再構築する。 load_from_backing 後 caller で path 設定後に呼ぶ。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn adopt_persisted_tables(&mut self, tables: Vec<TableDef>) {
+        let himo_count = self.himos.len();
+        // 全 himo を一旦 anonymous default に戻し、 sidecar に書かれてる
+        // attach を上書きする (= sidecar が source of truth)
+        self.himo_to_table = vec![ANONYMOUS_TABLE; himo_count];
+        for (tid, table) in tables.iter().enumerate() {
+            for &hid in &table.himo_ids {
+                if (hid as usize) < himo_count {
+                    self.himo_to_table[hid as usize] = tid as TableId;
+                }
+            }
+        }
+        self.tables = tables;
     }
 
     /// 既知 table を `(id, name, eid_range)` で列挙する。 試験用 / debug 用 API。
@@ -1933,6 +2116,7 @@ impl Engine {
         self.tables[tid].himo_ids.push(hid_u32);
         self.himo_to_table[hid] = tid as TableId;
 
+        self.try_persist_tables();
         Ok(hid_u32)
     }
 
@@ -1965,6 +2149,7 @@ impl Engine {
         if !owner.fk_refs.iter().any(|e| *e == entry) {
             owner.fk_refs.push(entry);
         }
+        self.try_persist_tables();
         Ok(hid)
     }
 
@@ -3743,6 +3928,11 @@ impl Engine {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn flush(&mut self) -> io::Result<()> {
         self.commit();
+
+        // β-light step 7: tables sidecar の最新化 (next_local 含む)。
+        // schema 変更 (define_*) でも persist してるが、 entity_in による
+        // next_local 増加は persist してないので flush 時にまとめて persist する。
+        self.try_persist_tables();
 
         for ds in &self.himos { ds.sync(); }
         self.vocab.sync();

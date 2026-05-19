@@ -22,7 +22,7 @@ fn tmp_path(tag: &str) -> String {
 }
 
 fn cleanup(path: &str) {
-    for suffix in ["", ".wal", ".crc", ".db.lock"] {
+    for suffix in ["", ".wal", ".crc", ".db.lock", ".tables", ".tables.tmp"] {
         let _ = std::fs::remove_file(format!("{}{}", path, suffix));
     }
 }
@@ -443,6 +443,107 @@ fn positions_isolated_per_table() {
     for &e in &b_results {
         let local = enchudb_wal::eid_local(e);
         assert!(local >= 1000 && local < 2000, "b.v result eid {} should be in b range", local);
+    }
+
+    cleanup(&path);
+}
+
+#[test]
+fn tables_persist_across_reopen() {
+    // β-light step 7: schema 定義が sidecar file 経由で reopen に持ち越される
+    let path = tmp_path("reopen");
+    cleanup(&path);
+
+    // 1. table + himo + entity を作って flush
+    {
+        let mut eng = Engine::create_standalone(&path).unwrap();
+        eng.define_table("users", 100).unwrap();
+        eng.define_table("posts", 100).unwrap();
+        eng.define_himo_in("users", "age", HimoType::Number, 100).unwrap();
+        eng.define_ref_in("posts", "author", "users").unwrap();
+
+        let alice = eng.entity_in("users").unwrap();
+        let post = eng.entity_in("posts").unwrap();
+        eng.tie(alice, "users.age", 30);
+        eng.tie(post, "posts.author", enchudb_wal::eid_local(alice));
+        eng.flush().unwrap();
+    }
+
+    // 2. reopen して schema が復元されてること、 query が動くことを確認
+    {
+        let eng = Engine::open_standalone(&path).unwrap();
+        let tables = eng.list_tables();
+        let user_table = tables.iter().find(|(_, n, _, _)| n == "users").unwrap();
+        let post_table = tables.iter().find(|(_, n, _, _)| n == "posts").unwrap();
+        assert_eq!(user_table.2, 0);
+        assert_eq!(user_table.3, 100);
+        assert_eq!(post_table.2, 100);
+        assert_eq!(post_table.3, 200);
+
+        // himo の table 帰属が復元されてる → users.age が users.eid_range で query
+        let rows = eng.pull_raw("users.age", 30);
+        assert_eq!(rows.len(), 1);
+        let posts = eng.pull_raw("posts.author", 0);
+        assert_eq!(posts.len(), 1);
+    }
+
+    cleanup(&path);
+}
+
+#[test]
+fn entity_in_continues_after_reopen() {
+    // β-light step 7: reopen 後の entity_in が次の eid を正しく割り当てる
+    let path = tmp_path("reopen_entity");
+    cleanup(&path);
+
+    let alice_eid;
+    {
+        let mut eng = Engine::create_standalone(&path).unwrap();
+        eng.define_table("users", 100).unwrap();
+        eng.define_himo_in("users", "name", HimoType::Number, 10).unwrap();
+        let alice = eng.entity_in("users").unwrap();
+        alice_eid = enchudb_wal::eid_local(alice);
+        eng.tie(alice, "users.name", 1);
+        eng.flush().unwrap();
+    }
+
+    {
+        let mut eng = Engine::open_standalone(&path).unwrap();
+        // alice の data は引ける
+        assert_eq!(eng.pull_raw("users.name", 1).len(), 1);
+
+        // 次の entity は alice と衝突しない eid
+        let bob = eng.entity_in("users").unwrap();
+        let bob_local = enchudb_wal::eid_local(bob);
+        assert_ne!(bob_local, alice_eid, "bob shouldn't reuse alice's eid");
+        assert!(bob_local < 100, "bob in users range");
+    }
+
+    cleanup(&path);
+}
+
+#[test]
+fn legacy_v4_db_opens_as_anonymous_only() {
+    // β-light step 7: tables sidecar 不在 (v4-style) → anonymous fallback
+    let path = tmp_path("v4_no_sidecar");
+    cleanup(&path);
+
+    {
+        let mut eng = Engine::create_standalone(&path).unwrap();
+        eng.define_himo("legacy_himo", HimoType::Number, 10);
+        let e = eng.entity();
+        eng.tie(e, "legacy_himo", 7);
+        eng.flush().unwrap();
+    }
+
+    // sidecar 削除 = v4 DB 状態を模倣
+    let _ = std::fs::remove_file(format!("{}.tables", path));
+
+    {
+        let eng = Engine::open_standalone(&path).unwrap();
+        let tables = eng.list_tables();
+        assert_eq!(tables.len(), 1, "anonymous only");
+        assert_eq!(eng.pull_raw("legacy_himo", 7).len(), 1);
     }
 
     cleanup(&path);
