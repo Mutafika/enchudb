@@ -23,6 +23,8 @@ pub mod entity_set;
 pub mod cylinder;
 pub mod cylinder_v27;
 pub mod positions_region;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod positions_sidecar;
 pub mod himo_store;
 pub mod content_store;
 pub mod engine;
