@@ -262,6 +262,83 @@ fn define_himo_in_unknown_table_errors() {
 }
 
 #[test]
+fn define_ref_in_creates_fk_link() {
+    let path = tmp_path("ref_link");
+    cleanup(&path);
+
+    let mut eng = Engine::create_standalone(&path).unwrap();
+    eng.define_table("users", 100).unwrap();
+    eng.define_table("posts", 100).unwrap();
+    let hid = eng
+        .define_ref_in("posts", "author", "users")
+        .expect("define posts.author -> users");
+    assert_eq!(hid, 0);
+
+    let alice = eng.entity_in("users").unwrap();
+    let post = eng.entity_in("posts").unwrap();
+    let alice_local = enchudb_wal::eid_local(alice);
+    eng.tie(post, "posts.author", alice_local); // OK: alice in users range
+    let posts_by_alice = eng.pull_raw("posts.author", alice_local);
+    assert_eq!(posts_by_alice.len(), 1);
+
+    cleanup(&path);
+}
+
+#[test]
+fn ref_tie_out_of_range_panics() {
+    let path = tmp_path("ref_violate");
+    cleanup(&path);
+
+    let mut eng = Engine::create_standalone(&path).unwrap();
+    eng.define_table("users", 100).unwrap();
+    eng.define_table("posts", 100).unwrap();
+    eng.define_ref_in("posts", "author", "users").unwrap();
+
+    let post = eng.entity_in("posts").unwrap();
+    // post の eid (>=100) を author に渡すと users range 外 → panic
+    let bad_target = enchudb_wal::eid_local(post);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        eng.tie(post, "posts.author", bad_target);
+    }));
+    assert!(result.is_err(), "Ref to out-of-range eid should panic");
+
+    cleanup(&path);
+}
+
+#[test]
+fn define_ref_in_unknown_target_errors() {
+    let path = tmp_path("ref_unknown");
+    cleanup(&path);
+
+    let mut eng = Engine::create_standalone(&path).unwrap();
+    eng.define_table("posts", 100).unwrap();
+    let result = eng.define_ref_in("posts", "author", "missing");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("target table 'missing' not found"));
+
+    cleanup(&path);
+}
+
+#[test]
+fn ref_without_fk_link_skips_validation() {
+    // 旧 API 経路: HimoType::Ref で define_himo_in 経由 (define_ref_in を
+    // 呼ばない場合) は fk_refs entry なし → validation skip。 後方互換性。
+    let path = tmp_path("ref_no_fk");
+    cleanup(&path);
+
+    let mut eng = Engine::create_standalone(&path).unwrap();
+    eng.define_table("posts", 100).unwrap();
+    eng.define_himo_in("posts", "author", HimoType::Ref, 0).unwrap();
+
+    let post = eng.entity_in("posts").unwrap();
+    // 何でも tie 可能 (validation skip)
+    eng.tie(post, "posts.author", 9_999_999);
+    assert_eq!(eng.pull_raw("posts.author", 9_999_999).len(), 1);
+
+    cleanup(&path);
+}
+
+#[test]
 fn anonymous_keeps_open_until_first_define_table() {
     let path = tmp_path("anon_open");
     cleanup(&path);

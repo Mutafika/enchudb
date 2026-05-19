@@ -1936,6 +1936,76 @@ impl Engine {
         Ok(hid_u32)
     }
 
+    /// β-light step 5: `Ref` 型 himo を target_table と紐付けて定義する。
+    /// 以降の `tie` / `tie_ref` / `tie_async` で target_eid が target_table の
+    /// eid 範囲に収まっているか engine が validate する。
+    pub fn define_ref_in(
+        &mut self,
+        table_name: &str,
+        himo_name: &str,
+        target_table: &str,
+    ) -> Result<u32, String> {
+        self.check_writable();
+        // target_table 存在チェック
+        let target_tid = self
+            .tables
+            .iter()
+            .position(|t| t.name == target_table)
+            .ok_or_else(|| format!("target table '{}' not found", target_table))?
+            as TableId;
+
+        // Ref として himo 登録 (define_himo_in が table_name / himo_name の
+        // 各種チェックを行う)
+        let hid = self.define_himo_in(table_name, himo_name, HimoType::Ref, 0)?;
+
+        // 所属 table の fk_refs に entry を追加 (idempotent)
+        let owner_tid = self.himo_to_table[hid as usize];
+        let entry = (hid, target_tid);
+        let owner = &mut self.tables[owner_tid as usize];
+        if !owner.fk_refs.iter().any(|e| *e == entry) {
+            owner.fk_refs.push(entry);
+        }
+        Ok(hid)
+    }
+
+    /// β-light step 5: Ref tie の FK validation。 himo が Ref 型で fk_refs
+    /// entry を持つ場合、 target_eid が target_table の eid 範囲内かを assert。
+    ///
+    /// hot path 性能:
+    ///   - 非 Ref himo は最初の `himo_types[hid] != Ref` で即 return (~1 ns)
+    ///   - Ref himo は fk_refs (typically 1-5 件) の線形検索 (~5-10 ns)
+    #[inline]
+    fn validate_ref_tie(&self, hid: usize, target_eid: u32) {
+        if hid >= self.himo_types.len() {
+            return;
+        }
+        if self.himo_types[hid] != HimoType::Ref {
+            return;
+        }
+        if hid >= self.himo_to_table.len() {
+            return;
+        }
+        let owner_tid = self.himo_to_table[hid] as usize;
+        if owner_tid >= self.tables.len() {
+            return;
+        }
+        let owner = &self.tables[owner_tid];
+        let target_tid = match owner.fk_refs.iter().find(|(h, _)| *h == hid as u32) {
+            Some(&(_, t)) => t as usize,
+            // fk_refs に entry なし: Ref 型だが target 不明 (旧 API 経路)、 validation スキップ
+            None => return,
+        };
+        if target_tid >= self.tables.len() {
+            return;
+        }
+        let target = &self.tables[target_tid];
+        assert!(
+            target_eid >= target.eid_range_lo && target_eid < target.eid_range_hi,
+            "FK violation: Ref himo (id {}) points to eid {} outside target table '{}' range [{}, {})",
+            hid, target_eid, target.name, target.eid_range_lo, target.eid_range_hi,
+        );
+    }
+
     pub fn tie_text(&mut self, eid: enchudb_wal::EntityId, himo: &str, value: &str) {
         self.check_writable();
         let eid = enchudb_wal::eid_local(eid);
@@ -1955,6 +2025,8 @@ impl Engine {
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = self.ensure_himo(himo, HimoType::Number, 0);
         debug_assert!(self.himo_types[hid] == HimoType::Number || self.himo_types[hid] == HimoType::Ref, "tie on non-Value himo '{}'", himo);
+        // β-light step 5: Ref himo は target_table の eid range を validate
+        self.validate_ref_tie(hid, value);
         self.himos[hid].set(eid, value);
     }
 
@@ -1965,6 +2037,8 @@ impl Engine {
         assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
         let hid = self.ensure_himo(himo, HimoType::Ref, 0);
         debug_assert!(self.himo_types[hid] == HimoType::Ref || self.himo_types[hid] == HimoType::Number, "tie_ref on non-Ref himo '{}'", himo);
+        // β-light step 5: target_eid が target_table の eid range 内か
+        self.validate_ref_tie(hid, target_eid);
         self.himos[hid].set(eid, target_eid);
     }
 
@@ -3397,6 +3471,9 @@ impl Engine {
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         debug_assert!((himo_id as usize) < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
+        // β-light step 5: Ref himo の FK validation (非 Ref は即 return で
+        // ~1 ns、 Ref で fk_refs entry なしも同じ)
+        self.validate_ref_tie(himo_id as usize, value);
         if let Some(wal) = self.wal.as_ref() {
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
             let rec = enchudb_wal::wal::WalRecord::Tie { eid: wal_eid, himo_id, value };
@@ -3483,6 +3560,8 @@ impl Engine {
         assert!(target_local < u32::MAX, "target_local must be < u32::MAX");
         debug_assert!((himo_id as usize) < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
+        // β-light step 5: target_eid が target_table の eid range 内か
+        self.validate_ref_tie(himo_id as usize, target_local);
         if let Some(wal) = self.wal.as_ref() {
             let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
             let rec = enchudb_wal::wal::WalRecord::Tie {
