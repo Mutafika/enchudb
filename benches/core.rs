@@ -240,14 +240,19 @@ fn bench_tie_async(c: &mut Criterion) {
         Engine::open_concurrent_with_wal(&path, 64 * 1024 * 1024).unwrap();
     eng.set_peer_id(1);
 
+    // 1 entity を事前確保して reuse する。 `b.iter` は warmup + 100 samples で
+    // 数千万 iteration になるため、 毎回 `eng.entity()` で slot を取ると
+    // `DEFAULT_MAX_ENTITIES = 16M` に当たって panic する (#tie_async bench
+    // fragility)。 ここでは tie 自体の cost を測りたいので eid は固定。
+    let eid = eng.entity();
+
     let mut group = c.benchmark_group("tie_async");
     group.throughput(Throughput::Elements(1));
     group.bench_function("wal_signed_off", |b| {
         let mut i = 0u32;
         b.iter(|| {
             i = i.wrapping_add(1);
-            let e = eng.entity();
-            eng.tie_async(black_box(e), "v", black_box(i % 100));
+            eng.tie_async(black_box(eid), "v", black_box(i % 100));
         });
     });
     group.finish();
