@@ -55,6 +55,10 @@ const H_EID_OFFSET: usize = 4;
 const H_MAX_OFFSET: usize = 8;
 
 const EMPTY_EID_OFFSET: u32 = u32::MAX;
+/// max_offset がこの値なら 「まだ何も `set` されてない」。 eid_offset は
+/// 別途 pre-set されている場合もある (init_with_offset) ので、 is_empty
+/// 判定は max_offset 側で行う。
+const EMPTY_MAX_OFFSET: u32 = u32::MAX;
 pub const EMPTY_VALUE: u32 = u32::MAX;
 
 const ENTRY_SIZE: usize = 8;
@@ -74,14 +78,27 @@ impl PositionsRegion {
     }
 
     /// 新規領域を初期化。 region.len() は 16 byte 以上必須。
+    /// eid_offset は最初の `set` で確定する。
     pub fn init(region: Region) -> Self {
+        Self::init_inner(region, EMPTY_EID_OFFSET)
+    }
+
+    /// `init` の eid_offset 指定版。 table-aware allocation で table の
+    /// eid_range_lo を pre-set すると、 「あとから来た小さい eid」 panic を
+    /// 避けられる (=  eid_offset を初期化時に決め打ちすれば、 以降
+    /// `eid >= eid_offset` が常に成り立つ table 内 workload で安全)。
+    pub fn init_with_offset(region: Region, eid_offset: u32) -> Self {
+        Self::init_inner(region, eid_offset)
+    }
+
+    fn init_inner(region: Region, eid_offset: u32) -> Self {
         assert!(region.len() >= HEADER, "PositionsRegion init: region too small");
         let _ = region.ensure_committed(HEADER);
         let mm = region.slice_mut();
         mm[0..4].copy_from_slice(&MAGIC);
-        mm[H_EID_OFFSET..H_EID_OFFSET + 4]
-            .copy_from_slice(&EMPTY_EID_OFFSET.to_le_bytes());
-        mm[H_MAX_OFFSET..H_MAX_OFFSET + 4].copy_from_slice(&0u32.to_le_bytes());
+        mm[H_EID_OFFSET..H_EID_OFFSET + 4].copy_from_slice(&eid_offset.to_le_bytes());
+        // max_offset = u32::MAX → 「まだ何も set されてない」 (empty)
+        mm[H_MAX_OFFSET..H_MAX_OFFSET + 4].copy_from_slice(&EMPTY_MAX_OFFSET.to_le_bytes());
         mm[12..16].copy_from_slice(&0u32.to_le_bytes());
         Self { region }
     }
@@ -103,9 +120,11 @@ impl PositionsRegion {
         mm[0..4] == MAGIC
     }
 
-    /// 「初期化されていない / 空」 状態か。 lazy migration の判定用。
+    /// 「初期化されていない / 空」 状態か (= まだ `set` が呼ばれていない)。
+    /// lazy migration の判定用。 eid_offset が pre-set 済みでも、 まだ
+    /// 中身が無ければ true。
     pub fn is_empty(&self) -> bool {
-        self.eid_offset() == EMPTY_EID_OFFSET
+        self.max_offset() == EMPTY_MAX_OFFSET
     }
 
     #[inline]
@@ -149,8 +168,12 @@ impl PositionsRegion {
         if off == EMPTY_EID_OFFSET || eid < off {
             return None;
         }
+        let max = self.max_offset();
+        if max == EMPTY_MAX_OFFSET {
+            return None; // まだ何も set されてない
+        }
         let idx_in_arr = eid - off;
-        if idx_in_arr > self.max_offset() {
+        if idx_in_arr > max {
             return None;
         }
         let (val, idx) = self.read_entry(idx_in_arr);
@@ -166,26 +189,24 @@ impl PositionsRegion {
     pub fn set(&self, eid: u32, value: u32, idx: u32) {
         debug_assert!(value != EMPTY_VALUE, "set: value must be < EMPTY_VALUE");
         let off = self.eid_offset();
-        let (idx_in_arr, off) = if off == EMPTY_EID_OFFSET {
+        let idx_in_arr = if off == EMPTY_EID_OFFSET {
             self.set_eid_offset(eid);
-            (0u32, eid)
+            0u32
         } else if eid < off {
             panic!(
                 "PositionsRegion::set: eid {} < eid_offset {} (prepend not supported)",
                 eid, off
             );
         } else {
-            (eid - off, off)
+            eid - off
         };
 
         self.ensure_offset_in_range(idx_in_arr);
         self.write_entry(idx_in_arr, value, idx);
 
-        if idx_in_arr > self.max_offset() || (idx_in_arr == 0 && off == eid && self.max_offset() == 0) {
-            // max_offset が小さければ伸ばす (= 0 のままなら 0 として残す)
-            if idx_in_arr > self.max_offset() {
-                self.set_max_offset(idx_in_arr);
-            }
+        let cur_max = self.max_offset();
+        if cur_max == EMPTY_MAX_OFFSET || idx_in_arr > cur_max {
+            self.set_max_offset(idx_in_arr);
         }
     }
 
@@ -196,8 +217,12 @@ impl PositionsRegion {
         if off == EMPTY_EID_OFFSET || eid < off {
             return;
         }
+        let max = self.max_offset();
+        if max == EMPTY_MAX_OFFSET {
+            return;
+        }
         let idx_in_arr = eid - off;
-        if idx_in_arr > self.max_offset() {
+        if idx_in_arr > max {
             return;
         }
         let (val, _) = self.read_entry(idx_in_arr);
@@ -213,18 +238,24 @@ impl PositionsRegion {
         if off == EMPTY_EID_OFFSET || eid < off {
             return;
         }
+        let max = self.max_offset();
+        if max == EMPTY_MAX_OFFSET {
+            return;
+        }
         let idx_in_arr = eid - off;
-        if idx_in_arr > self.max_offset() {
+        if idx_in_arr > max {
             return;
         }
         self.write_entry(idx_in_arr, EMPTY_VALUE, 0);
     }
 
-    /// 全体を空にリセット。 rebuild の最初に呼ぶ。
+    /// 全体を空にリセット。 rebuild の最初に呼ぶ。 eid_offset は維持
+    /// (= 既に table 範囲が決まっている場合は再 set される)、 max_offset を
+    /// EMPTY_MAX_OFFSET に戻して論理的に到達不能にする。
     pub fn clear_all(&self) {
         self.set_eid_offset(EMPTY_EID_OFFSET);
-        self.set_max_offset(0);
-        // entries は触らない (lazy clear)。 eid_offset reset で論理的に到達不能。
+        self.set_max_offset(EMPTY_MAX_OFFSET);
+        // entries は触らない (lazy clear)。
     }
 
     // ──── internal ────
@@ -258,25 +289,18 @@ impl PositionsRegion {
         );
         let _ = self.region.ensure_committed(need_bytes);
 
-        // 既存 max_offset + 1 .. idx_in_arr の間を sentinel で埋める。
-        // (commit したばかりの page は zero-init なので value=0 になっている →
-        // valid な value 0 と区別がつかないので sentinel に書き換える必要あり。)
-        let cur_max = if self.is_empty() {
-            // 初期化直後: idx 0 含めて埋める対象は idx_in_arr 以下全部 (新規 region)。
-            // ただし set 側で entry[idx_in_arr] を直後に上書きするので、
-            // [0..idx_in_arr) の範囲を埋める。 idx_in_arr 自身は呼び出し側が書く。
-            if idx_in_arr == 0 {
-                return;
-            }
+        // 新しく出現した index 範囲を sentinel で埋める。
+        // (commit したばかりの page は zero-init で value=0 となり、 これは
+        // valid な value 0 と区別がつかない → 明示的に sentinel を書く必要あり。)
+        let fill_lo = if self.is_empty() {
+            // まだ何も set されてない: [0..idx_in_arr) を埋める (idx_in_arr 自身は
+            // set が書く)。
             0u32
         } else {
-            self.max_offset() + 1
+            self.max_offset().saturating_add(1)
         };
-        if cur_max <= idx_in_arr {
-            // [cur_max..idx_in_arr) (※ idx_in_arr 自身は除く: set 側で書く) を埋める
-            // ただし、 max_offset = 0 で is_empty=false (= idx 0 が valid) のとき、
-            // cur_max = 1。 idx_in_arr=1 なら range は空。 idx_in_arr=5 なら 1..5 を埋める。
-            for i in cur_max..idx_in_arr {
+        if fill_lo <= idx_in_arr {
+            for i in fill_lo..idx_in_arr {
                 self.write_entry(i, EMPTY_VALUE, 0);
             }
         }

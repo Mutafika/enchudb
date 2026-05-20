@@ -850,6 +850,11 @@ pub struct Engine {
     /// 多 process write の同 .db 競合を防ぐ (sqlite WAL モード相当)。
     #[cfg(not(target_arch = "wasm32"))]
     _writer_lock: Option<std::fs::File>,
+    /// β-heavy phase 1: 各 himo の PositionsRegion を mmap-back する sidecar。
+    /// Some なら HimoStore::init_with_positions / load_with_positions を使う
+    /// Region mode、 None なら旧来の Heap mode (from_bytes / wasm 等)。
+    #[cfg(not(target_arch = "wasm32"))]
+    positions_sidecar: Option<std::sync::Arc<crate::positions_sidecar::PositionsSidecar>>,
     backing: Backing, // 最後に drop されるよう最終フィールド
 }
 
@@ -942,6 +947,11 @@ impl Engine {
         // v28: ヘッダ整合性 CRC
         write_header_crc(&mut mmap);
 
+        // β-heavy phase 1: positions sidecar も同時に新規作成。
+        let positions_sidecar = std::sync::Arc::new(
+            crate::positions_sidecar::PositionsSidecar::create(path, max_entities, max_himos)?,
+        );
+
         let base = mmap.as_mut_ptr();
 
         let entities = EntitySet::init(
@@ -996,6 +1006,7 @@ impl Engine {
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             _writer_lock: Some(writer_lock),
+            positions_sidecar: Some(positions_sidecar),
             backing: Backing::Mmap(mmap),
         })
     }
@@ -1123,6 +1134,11 @@ impl Engine {
             .copy_from_slice(&BACKING_KIND_GROWABLE.to_le_bytes());
         write_header_crc(header);
 
+        // β-heavy phase 1: positions sidecar も同時に新規作成。
+        let positions_sidecar = std::sync::Arc::new(
+            crate::positions_sidecar::PositionsSidecar::create(path, max_entities, max_himos)?,
+        );
+
         let _ = base; // base ptr is implicit via Region::with_grower from here on
         let entities = EntitySet::init(
             unsafe {
@@ -1219,6 +1235,7 @@ impl Engine {
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             _writer_lock: Some(writer_lock),
+            positions_sidecar: Some(positions_sidecar),
             backing: Backing::Growable(map),
         })
     }
@@ -1275,11 +1292,68 @@ impl Engine {
             eng.adopt_persisted_tables(persisted);
         }
 
+        // β-heavy phase 1: positions sidecar を attach。 既存 HimoStore は
+        // Heap mode で load された (cyl_built=false) ので、 ここで Region mode
+        // に置き換える。 column scan による lazy rebuild は次の cyl 触りで起きる。
+        eng.attach_positions_sidecar()?;
+
         if verify_region_crc {
             // .crc ファイルがあれば全 region CRC 検証
             eng.verify_region_crcs()?;
         }
         Ok(eng)
+    }
+
+    /// β-heavy phase 1: positions sidecar を open_or_create して、 既存
+    /// HimoStore (Heap mode で load されたもの) を Region mode に置き換える。
+    /// 各 slot は magic check で 「既に valid」 / 「fresh」 を判定し、 fresh なら
+    /// PositionsRegion::init() を呼ぶ。 lazy rebuild は次の cyl 触りで走る。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn attach_positions_sidecar(&mut self) -> io::Result<()> {
+        if self.path.is_empty() {
+            return Ok(());
+        }
+        let sidecar = std::sync::Arc::new(
+            crate::positions_sidecar::PositionsSidecar::open_or_create(
+                &self.path,
+                self.max_entities,
+                self.max_himos,
+            )?,
+        );
+
+        // 既存の HimoStore を Region mode で再構築。 col_region は backing から
+        // 切り直す (同じ memory を指す)。 type / max_values は self に保存済み。
+        #[cfg(not(target_arch = "wasm32"))]
+        let grower = self.backing.grower();
+        let base = self.backing.as_mut_ptr();
+        let cyl_max_values = self.layout.cyl_max_values;
+
+        for hid in 0..self.himos.len() {
+            let col_off = self.layout.himo_col_off(hid);
+            let col_size = self.layout.himo_col_size;
+            let col_region = {
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(g) = &grower {
+                    unsafe { Region::with_grower(g.clone(), col_off, col_size) }
+                } else {
+                    unsafe { Region::new(base.add(col_off), col_size) }
+                }
+                #[cfg(target_arch = "wasm32")]
+                unsafe { Region::new(base.add(col_off), col_size) }
+            };
+            let pos_region = sidecar.region_for(hid as u32);
+            let positions =
+                if crate::positions_region::PositionsRegion::has_valid_magic(&pos_region) {
+                    crate::positions_region::PositionsRegion::load(pos_region)
+                } else {
+                    crate::positions_region::PositionsRegion::init_with_offset(pos_region, 0)
+                };
+            let ht = self.himo_types[hid];
+            let mv = self.himo_max_values[hid].min(cyl_max_values);
+            self.himos[hid] = HimoStore::load_with_positions(col_region, ht, mv, positions);
+        }
+        self.positions_sidecar = Some(sidecar);
+        Ok(())
     }
 
     /// 全 region の CRC テーブルを計算する。
@@ -1597,6 +1671,10 @@ impl Engine {
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             _writer_lock: None, // caller (open_internal) が後から差し替える
+            // β-heavy phase 1: 後から open_internal が attach する。 from_bytes /
+            // wasm のような path 無し経路は None のまま (Heap mode で動く)。
+            #[cfg(not(target_arch = "wasm32"))]
+            positions_sidecar: None,
             backing,
         };
 
@@ -3095,6 +3173,27 @@ impl Engine {
             unsafe { Region::new(base.add(off), size) }
         };
 
+        // β-heavy phase 1: sidecar が attached なら Region mode で init、
+        // そうでなければ旧来の Heap mode。
+        #[cfg(not(target_arch = "wasm32"))]
+        let hs = if let Some(sidecar) = &self.positions_sidecar {
+            let pos_region = sidecar.region_for(hid as u32);
+            // β-heavy phase 1: eid_offset=0 で init すると、 任意の eid 順での
+                    // tie (= 大→小 順含む) を panic 無しで扱える。 commit
+                    // 空間は max_eid_seen × 8 byte に限定されるので、 大半が
+                    // 0 近辺で tie されるワークロードでは waste 少。
+                    let positions = crate::positions_region::PositionsRegion::init_with_offset(pos_region, 0);
+            HimoStore::init_with_positions(
+                make_region(col_off, self.layout.himo_col_size),
+                ht, effective_mv, self.max_entities, positions,
+            )
+        } else {
+            HimoStore::init(
+                make_region(col_off, self.layout.himo_col_size),
+                ht, effective_mv, self.max_entities,
+            )
+        };
+        #[cfg(target_arch = "wasm32")]
         let hs = HimoStore::init(
             make_region(col_off, self.layout.himo_col_size),
             ht, effective_mv, self.max_entities,

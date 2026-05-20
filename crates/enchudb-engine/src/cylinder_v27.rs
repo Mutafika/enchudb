@@ -223,6 +223,17 @@ impl BucketCylinder {
         // max_entities ヒントを尊重して 16M × 8 byte = 128 MB / himo を pre-alloc
         // すると、 数百 himo を抱える consumer (sinfohub-server 等) が schema
         // declare 段階で 20+ GB heap 消費して OOM kill される。
+        Self::with_positions(max_values, BucketPositions::heap())
+    }
+
+    /// β-heavy phase 1: positions を外部 (sidecar mmap region) で受け取る ctor。
+    /// engine が PositionsSidecar から払い出す。 既存テスト経路は `new` のまま
+    /// Heap mode で動く。
+    pub fn with_positions_region(max_values: u32, positions: PositionsRegion) -> Self {
+        Self::with_positions(max_values, BucketPositions::Region(positions))
+    }
+
+    fn with_positions(max_values: u32, positions: BucketPositions) -> Self {
         let bucket_count = if max_values == 0 {
             0
         } else {
@@ -232,7 +243,7 @@ impl BucketCylinder {
             max_values,
             buckets: (0..bucket_count).map(|_| Vec::new()).collect(),
             sparse: HashMap::new(),
-            positions: BucketPositions::heap(),
+            positions,
             total: 0,
             unique_count_cache: 0,
         }

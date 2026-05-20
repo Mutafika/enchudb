@@ -11,6 +11,7 @@ use std::cell::UnsafeCell;
 
 use crate::column::Column;
 use crate::cylinder_v27::BucketCylinder;
+use crate::positions_region::PositionsRegion;
 use crate::region::Region;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -83,6 +84,28 @@ impl HimoStore {
         }
     }
 
+    /// β-heavy phase 1: positions を mmap-back する HimoStore ctor。
+    /// PositionsRegion (sidecar から払い出された slot) を受け取り、
+    /// BucketCylinder を Region mode で構築する。
+    pub fn init_with_positions(
+        col_region: Region,
+        ht: HimoType,
+        max_values: u32,
+        max_entities: u32,
+        positions: PositionsRegion,
+    ) -> Self {
+        let col = Column::init(col_region, 4, max_entities);
+        let cyl = BucketCylinder::with_positions_region(max_values, positions);
+        Self {
+            col: UnsafeCell::new(col),
+            cyl: RwLock::new(cyl),
+            himo_type: ht,
+            max_values,
+            unique_count: AtomicU32::new(0),
+            cyl_built: AtomicBool::new(true),
+        }
+    }
+
     /// open 時の load。 issue #3: 旧版は `cyl.rebuild_from_column` を eager に呼んで
     /// per-himo に column 全 eid を走査していた。 himo 数 × entity 数で reopen latency
     /// が膨らむのを避けるため、 cylinder は空のまま返し、 最初の cyl 触りで
@@ -100,6 +123,29 @@ impl HimoStore {
             // `unique_count()` を呼ばれる経路があったら ensure_cylinder_built 経由で
             // build がトリガされ、 正しい値が同期される。
             unique_count: AtomicU32::new(0),
+            cyl_built: AtomicBool::new(false),
+        }
+    }
+
+    /// β-heavy phase 1: 既存 DB を open する経路、 positions sidecar slot を受け取る版。
+    /// positions が `is_empty` (= sidecar 未初期化) なら lazy rebuild で populate される。
+    pub fn load_with_positions(
+        col_region: Region,
+        ht: HimoType,
+        max_values: u32,
+        positions: PositionsRegion,
+    ) -> Self {
+        let col = Column::load(col_region);
+        let cyl = BucketCylinder::with_positions_region(max_values, positions);
+        Self {
+            col: UnsafeCell::new(col),
+            cyl: RwLock::new(cyl),
+            himo_type: ht,
+            max_values,
+            unique_count: AtomicU32::new(0),
+            // phase 1 step 3 では positions の有効性に関係なく column scan で
+            // rebuild する (= 旧 path と同じ correctness)。 step 5 (v5.5 marker)
+            // で sidecar が trusted な場合に skip する最適化を入れる。
             cyl_built: AtomicBool::new(false),
         }
     }
