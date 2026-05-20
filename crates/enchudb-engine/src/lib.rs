@@ -25,6 +25,8 @@ pub mod cylinder_v27;
 pub mod positions_region;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod positions_sidecar;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod table_column_store;
 pub mod himo_store;
 pub mod content_store;
 pub mod engine;
