@@ -8,9 +8,9 @@ crates/enchudb-rag/.fastembed_cache/
 **/.fastembed_cache/
 
 # Dev / process docs — kept locally, not part of the public release.
-# Public users see README + sub-crate READMEs + SPEC (when published) + LICENSE.
+# Public users see README + sub-crate READMEs + SPEC (when published) +
+# CHANGELOG (= release notes) + LICENSE.
 /BUGS.md
-/CHANGELOG.md
 /CLAUDE.md
 /SPEC.md
 /notes/
