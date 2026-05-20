@@ -450,8 +450,13 @@ const FILE_MAGIC: [u8; 4] = *b"ECDB";
 /// undo は WAL 有効時には Commit で自動 clear される redundant な層であり、
 /// standalone mode では `record()` 内の spin-wait が consumer 不在で
 /// permanent hang を起こしていた (GitHub issue #1)。 v3 DB は再作成必要。
-const FILE_VERSION: u32 = 5;
-/// v4 DB を後方互換で open する識別子。 v4 → v5 migrate は open 時透過。
+/// β-heavy phase 2: column file split + positions sidecar 標準。
+/// new で書き出し、 open は 4 / 5 / 6 全部受け付ける (lazy migration)。
+const FILE_VERSION: u32 = 6;
+/// β-light (engine table awareness 完了) で生成された DB。 v6 engine から
+/// open すると table column file が存在しないので main file fallback。
+const FILE_VERSION_LEGACY_V5: u32 = 5;
+/// v4 DB を後方互換で open する識別子。 v4 → v6 migrate は open 時透過。
 const FILE_VERSION_LEGACY_V4: u32 = 4;
 const HEADER_SIZE: usize = 4096;
 
@@ -1589,10 +1594,13 @@ impl Engine {
         // v5 が現行、 v4 は後方互換で受け付ける (= anonymous table 1 個に migrate)。
         // v4 DB を v5 として open しても、 引き続き flat anonymous モードで動作する
         // (table 概念は step 2 以降の実装に伴って活性化)。
-        if version != FILE_VERSION && version != FILE_VERSION_LEGACY_V4 {
+        if version != FILE_VERSION
+            && version != FILE_VERSION_LEGACY_V5
+            && version != FILE_VERSION_LEGACY_V4
+        {
             return Err(format!(
-                "unsupported EnchuDB file version {} (supported: {}, {} compat). dev phase — recreate the DB.",
-                version, FILE_VERSION, FILE_VERSION_LEGACY_V4
+                "unsupported EnchuDB file version {} (supported: {}, {}/{} compat). dev phase — recreate the DB.",
+                version, FILE_VERSION, FILE_VERSION_LEGACY_V5, FILE_VERSION_LEGACY_V4
             ));
         }
         // v28: ヘッダ整合性 CRC 検証(stored == 0 は v27 以前の DB として許容)
