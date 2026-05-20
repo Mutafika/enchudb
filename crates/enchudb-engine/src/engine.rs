@@ -1946,7 +1946,12 @@ impl Engine {
             self.push_count.fetch_add(1, Ordering::Release);
         }
         let peer = self.peer_id.load(Ordering::Acquire);
-        Ok(enchudb_wal::make_eid(peer, global))
+        // β-heavy phase 3: EntityId に table_id を埋め込む。 engine 内部は引き続き
+        // global local (= eid_range_lo + next_local) で indexing するため、
+        // `table_local` フィールドにも global を入れる (= 24 bit に収まる前提、
+        // DEFAULT_MAX_ENTITIES = 16M = 2^24 ジャストフィット)。 API consumer は
+        // `enchudb_wal::eid_table_id(eid)` で所属 table を取れる。
+        Ok(enchudb_wal::make_eid_in_table(peer, tid as enchudb_wal::TableId, global))
     }
 
     /// β-light step 7: 現 tables Vec を sidecar に保存する (best effort)。
