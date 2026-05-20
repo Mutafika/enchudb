@@ -4056,6 +4056,12 @@ impl Engine {
         self.vocab.mark_index_clean(true);
         self.himo_reg.mark_index_clean(true);
         self.backing.flush_to_disk()?;
+
+        // β-heavy phase 1: positions sidecar の msync (dirty range のみ)。
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(sidecar) = &self.positions_sidecar {
+            sidecar.flush()?;
+        }
         Ok(())
     }
 
