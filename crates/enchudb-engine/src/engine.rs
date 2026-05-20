@@ -272,6 +272,11 @@ pub struct AuditFilter {
     pub author_peer: Option<enchudb_wal::PeerId>,
     /// 署名者 pubkey の指紋(8B)。一致しない record は除外。
     pub pubkey_fp: Option<[u8; 8]>,
+    /// β-heavy phase 3: table_id フィルタ。 record の eid bit から
+    /// `eid_table_id(eid)` を取り、 指定 table_id 以外を除外。 None なら
+    /// 全 table。 0 を指定すれば anonymous table のみ。 partial sync の
+    /// 「table 単位で feed」 で使う。
+    pub table_id: Option<enchudb_wal::TableId>,
 }
 
 // ════════════════ バッキングストア ════════════════
@@ -2559,6 +2564,7 @@ impl Engine {
     /// 避けたい時に。 起動時に `himo_id(&str)` で解決して u16 を cache しておく。
     pub fn tie_text_to_by_id(&self, eid: enchudb_wal::EntityId, himo_id: u16, value: &str) {
         self.check_writable();
+        let table_id = enchudb_wal::eid_table_id(eid);
         let eid = enchudb_wal::eid_local(eid);
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
@@ -2574,7 +2580,7 @@ impl Engine {
         // tie_text_to を経由するため、 ここで append しないと WAL が空のままで
         // peer 同期が成立しない (publish 側が iter_committed で 0 件を見る).
         if let Some(wal) = self.wal.as_ref() {
-            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), eid);
+            let wal_eid = enchudb_wal::make_eid_in_table(wal.peer_id(), table_id, eid);
             let _ = wal.append(enchudb_wal::wal::WalOp::Vocab { vid, bytes: value.as_bytes() });
             let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id, value: vid });
         }
@@ -2590,6 +2596,7 @@ impl Engine {
     /// `tie_to` の himo_id 直指定版。 hot path 用 (string lookup を避ける)。
     pub fn tie_to_by_id(&self, eid: enchudb_wal::EntityId, himo_id: u16, value: u32) {
         self.check_writable();
+        let table_id = enchudb_wal::eid_table_id(eid);
         let eid = enchudb_wal::eid_local(eid);
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
         let hid = himo_id as usize;
@@ -2600,7 +2607,7 @@ impl Engine {
         // 必要 (request2.md 提案)。 caller 責任で vocab に既に居る id を渡すこと。
         self.himos[hid].set(eid, value);
         if let Some(wal) = self.wal.as_ref() {
-            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), eid);
+            let wal_eid = enchudb_wal::make_eid_in_table(wal.peer_id(), table_id, eid);
             let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id, value });
         }
     }
@@ -2615,6 +2622,7 @@ impl Engine {
     /// `tie_ref_to` の himo_id 直指定版。 hot path 用。
     pub fn tie_ref_to_by_id(&self, eid: enchudb_wal::EntityId, himo_id: u16, target_eid: enchudb_wal::EntityId) {
         self.check_writable();
+        let table_id = enchudb_wal::eid_table_id(eid);
         let eid = enchudb_wal::eid_local(eid);
         let target_eid = enchudb_wal::eid_local(target_eid);
         assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
@@ -2627,7 +2635,7 @@ impl Engine {
         );
         self.himos[hid].set(eid, target_eid);
         if let Some(wal) = self.wal.as_ref() {
-            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), eid);
+            let wal_eid = enchudb_wal::make_eid_in_table(wal.peer_id(), table_id, eid);
             let _ = wal.append(enchudb_wal::wal::WalOp::Tie { eid: wal_eid, himo_id, value: target_eid });
         }
     }
@@ -2645,6 +2653,7 @@ impl Engine {
     /// 整合)。
     pub fn untie_by_id(&self, eid: enchudb_wal::EntityId, himo_id: u16) {
         self.check_writable();
+        let table_id = enchudb_wal::eid_table_id(eid);
         let eid = enchudb_wal::eid_local(eid);
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
@@ -2652,7 +2661,7 @@ impl Engine {
         if hid >= self.himos.len() { return; }
         self.himos[hid].remove(eid);
         if let Some(wal) = self.wal.as_ref() {
-            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), eid);
+            let wal_eid = enchudb_wal::make_eid_in_table(wal.peer_id(), table_id, eid);
             let _ = wal.append(enchudb_wal::wal::WalOp::Untie { eid: wal_eid, himo_id });
         }
     }
@@ -2661,13 +2670,14 @@ impl Engine {
 
     pub fn delete(&self, eid: enchudb_wal::EntityId) {
         self.check_writable();
+        let table_id = enchudb_wal::eid_table_id(eid);
         let eid = enchudb_wal::eid_local(eid);
         for hid in 0..self.himos.len() {
             self.himos[hid].remove(eid);
         }
         self.entities.free(eid);
         if let Some(wal) = self.wal.as_ref() {
-            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), eid);
+            let wal_eid = enchudb_wal::make_eid_in_table(wal.peer_id(), table_id, eid);
             let _ = wal.append(enchudb_wal::wal::WalOp::Delete { eid: wal_eid });
         }
     }
@@ -3892,6 +3902,31 @@ impl Engine {
                         return false;
                     }
                 }
+                // β-heavy phase 3: record の op の eid bit から table_id を抽出し
+                // フィルタ。 record の種類で eid 取り出し方が違う。 eid を持た
+                // ない op (Commit / Vocab) は table 対象外として常に除外。
+                if let Some(target_tid) = filter.table_id {
+                    let record_tid = match &r.op {
+                        enchudb_wal::wal::DecodedOp::Tie { eid, .. } => {
+                            Some(enchudb_wal::eid_table_id(*eid))
+                        }
+                        enchudb_wal::wal::DecodedOp::Untie { eid, .. } => {
+                            Some(enchudb_wal::eid_table_id(*eid))
+                        }
+                        enchudb_wal::wal::DecodedOp::Delete { eid } => {
+                            Some(enchudb_wal::eid_table_id(*eid))
+                        }
+                        enchudb_wal::wal::DecodedOp::Content { eid, .. } => {
+                            Some(enchudb_wal::eid_table_id(*eid))
+                        }
+                        enchudb_wal::wal::DecodedOp::Commit
+                        | enchudb_wal::wal::DecodedOp::Vocab { .. } => None,
+                    };
+                    match record_tid {
+                        Some(tid) if tid == target_tid => {}
+                        _ => return false,
+                    }
+                }
                 true
             })
             .collect()
@@ -4029,7 +4064,7 @@ impl Engine {
         // ~1 ns、 Ref で fk_refs entry なしも同じ)
         self.validate_ref_tie(himo_id as usize, value);
         if let Some(wal) = self.wal.as_ref() {
-            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
+            let wal_eid = enchudb_wal::make_eid_in_table(wal.peer_id(), enchudb_wal::eid_table_id(eid), local);
             let rec = enchudb_wal::wal::WalRecord::Tie { eid: wal_eid, himo_id, value };
             if let Some(wq) = self.wal_record_queue.as_ref() {
                 push_wal_record_blocking(wq, rec);
@@ -4078,7 +4113,7 @@ impl Engine {
         assert!(vid < u32::MAX, "vocab vid must be < u32::MAX (sentinel reserved)");
         if let Some(wal) = self.wal.as_ref() {
             // Vocab op を先に(sync の receiver 側で Tie より先に mapping が張られるよう)
-            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
+            let wal_eid = enchudb_wal::make_eid_in_table(wal.peer_id(), enchudb_wal::eid_table_id(eid), local);
             let vocab_rec = enchudb_wal::wal::WalRecord::Vocab { vid, bytes: value.as_bytes().to_vec() };
             let tie_rec = enchudb_wal::wal::WalRecord::Tie { eid: wal_eid, himo_id, value: vid };
             if let Some(wq) = self.wal_record_queue.as_ref() {
@@ -4121,7 +4156,7 @@ impl Engine {
         // β-light step 5: target_eid が target_table の eid range 内か
         self.validate_ref_tie(himo_id as usize, target_local);
         if let Some(wal) = self.wal.as_ref() {
-            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
+            let wal_eid = enchudb_wal::make_eid_in_table(wal.peer_id(), enchudb_wal::eid_table_id(eid), local);
             let rec = enchudb_wal::wal::WalRecord::Tie {
                 eid: wal_eid, himo_id, value: target_local,
             };
@@ -4154,7 +4189,7 @@ impl Engine {
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         if (himo_id as usize) >= self.himos.len() { return; }
         if let Some(wal) = self.wal.as_ref() {
-            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
+            let wal_eid = enchudb_wal::make_eid_in_table(wal.peer_id(), enchudb_wal::eid_table_id(eid), local);
             let rec = enchudb_wal::wal::WalRecord::Untie { eid: wal_eid, himo_id };
             if let Some(wq) = self.wal_record_queue.as_ref() {
                 push_wal_record_blocking(wq, rec);
@@ -4173,7 +4208,7 @@ impl Engine {
         self.check_writable();
         let local = enchudb_wal::eid_local(eid);
         if let Some(wal) = self.wal.as_ref() {
-            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
+            let wal_eid = enchudb_wal::make_eid_in_table(wal.peer_id(), enchudb_wal::eid_table_id(eid), local);
             let rec = enchudb_wal::wal::WalRecord::Delete { eid: wal_eid };
             if let Some(wq) = self.wal_record_queue.as_ref() {
                 push_wal_record_blocking(wq, rec);
@@ -4193,7 +4228,7 @@ impl Engine {
         self.check_writable();
         let local = enchudb_wal::eid_local(eid);
         if let Some(wal) = self.wal.as_ref() {
-            let wal_eid = enchudb_wal::make_eid(wal.peer_id(), local);
+            let wal_eid = enchudb_wal::make_eid_in_table(wal.peer_id(), enchudb_wal::eid_table_id(eid), local);
             let rec = enchudb_wal::wal::WalRecord::Content {
                 eid: wal_eid, key: key.to_string(), data: data.to_vec(),
             };
