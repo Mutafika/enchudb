@@ -1983,6 +1983,92 @@ impl Engine {
             .collect()
     }
 
+    /// β-heavy phase 2: named table の column file path を返す (backup / inspection 用)。
+    /// table が存在しない or anonymous なら None。 sidecar 系 file (.positions /
+    /// .tables) は table 横断なので含めない。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn table_column_file(&self, table_name: &str) -> Option<String> {
+        if table_name.is_empty() {
+            return None;
+        }
+        self.tables.iter().find(|t| t.name == table_name)?;
+        Some(crate::table_column_store::TableColumnStore::file_path(
+            &self.path,
+            table_name,
+        ))
+    }
+
+    /// β-heavy phase 2: named table を drop (= 物理削除)。
+    ///   - tables sidecar から該当 entry を除く
+    ///   - 該当 table 所属の himo の column data を消す (table file unlink)
+    ///   - himo を anonymous へ移して論理的に 「孤立」 させる
+    ///   - eid range は再利用しない (= 跡地として残る)
+    ///   - positions slot は cleanup しない (将来の課題、 lazy reuse)
+    ///   - vocab / content / himo_reg は触らない (= 共用 → 個別 table から
+    ///     drop することは出来ない)
+    ///
+    /// anonymous table (= TableId 0) は drop 不可。
+    pub fn drop_table(&mut self, table_name: &str) -> Result<(), String> {
+        self.check_writable();
+        if table_name.is_empty() {
+            return Err("drop_table: table name must be non-empty".into());
+        }
+        let tid = self
+            .tables
+            .iter()
+            .position(|t| t.name == table_name)
+            .ok_or_else(|| format!("table '{}' not found", table_name))?;
+        if tid == ANONYMOUS_TABLE as usize {
+            return Err("cannot drop anonymous table".into());
+        }
+        let tid = tid as TableId;
+
+        // 1. 該当 himo を anonymous に移す (himo 自体は engine 上残る、 column
+        //    data は table file から失われるが、 main file slot は元々空なので
+        //    pull は空、 tie は新しく main file に書き始める形)。
+        let orphan_hids: Vec<u32> = self.tables[tid as usize].himo_ids.clone();
+        for &hid in &orphan_hids {
+            self.himo_to_table[hid as usize] = ANONYMOUS_TABLE;
+            self.tables[ANONYMOUS_TABLE as usize].himo_ids.push(hid);
+        }
+        // 2. tables vec から remove (= index ずらし)。 ただし TableId は
+        //    persistent な意味を持つので 「tombstone」 化が望ましい... が、
+        //    現状は単純 remove で OK (himo_to_table の値も更新)。
+        self.tables.remove(tid as usize);
+        for slot in &mut self.himo_to_table {
+            if *slot > tid {
+                *slot -= 1;
+            }
+        }
+
+        // 3. table column file を unlink
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.table_column_stores.remove(&tid);
+            // 残り table の id も shift する (tid+1 以降が 1 つずつ前に)
+            let mut shifted: std::collections::HashMap<
+                TableId,
+                std::sync::Arc<crate::table_column_store::TableColumnStore>,
+            > = std::collections::HashMap::new();
+            for (k, v) in self.table_column_stores.drain() {
+                let new_k = if k > tid { k - 1 } else { k };
+                shifted.insert(new_k, v);
+            }
+            self.table_column_stores = shifted;
+
+            if !self.path.is_empty() {
+                let path = crate::table_column_store::TableColumnStore::file_path(
+                    &self.path,
+                    table_name,
+                );
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+
+        self.try_persist_tables();
+        Ok(())
+    }
+
     // ──── entity ────
 
     pub fn entity(&self) -> enchudb_wal::EntityId {
