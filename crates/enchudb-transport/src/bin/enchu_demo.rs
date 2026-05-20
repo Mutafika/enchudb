@@ -27,11 +27,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use enchudb::{Engine, HimoType};
-use enchudb_wal::Hlc;
+use enchudb_oplog::Hlc;
 use enchudb::sync::Syncer;
 use enchudb::transport::{Transport, WireRecord};
 use enchudb_transport::http::{HttpRelay, HttpTransport};
-use enchudb_wal::wal::DecodedOp;
+use enchudb_oplog::oplog::DecodedOp;
 
 fn main() {
     let mut args: Vec<String> = std::env::args().collect();
@@ -162,7 +162,7 @@ fn cmd_replica(opts: &HashMap<String, String>) {
     if std::path::Path::new(&db).exists() {
         println!("[replica] removing existing {}", db);
         let _ = std::fs::remove_file(&db);
-        let _ = std::fs::remove_file(format!("{}.wal", db));
+        let _ = std::fs::remove_file(format!("{}.oplog", db));
         let _ = std::fs::remove_file(format!("{}.crc", db));
     }
 

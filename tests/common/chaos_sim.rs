@@ -23,7 +23,7 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use enchudb_wal::PeerId;
+use enchudb_oplog::PeerId;
 
 // ─────────────────────────────────────────────────────────────
 // SimNetwork: メッセージ配送 + 故障注入

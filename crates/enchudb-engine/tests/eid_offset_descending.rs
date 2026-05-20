@@ -23,7 +23,7 @@ fn tmp(name: &str) -> String {
 
 fn cleanup(path: &str) {
     let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{path}.wal"));
+    let _ = std::fs::remove_file(format!("{path}.oplog"));
     let _ = std::fs::remove_file(format!("{path}.lock"));
     let _ = std::fs::remove_file(format!("{path}.crc"));
 }
@@ -52,7 +52,7 @@ fn descending_eid_tie_does_not_explode() {
     // 単純実装だと O(N^2) で 100k なら 10G iter → 数分単位の hang を起こす。
     let t = Instant::now();
     for &eid in eids.iter().rev() {
-        eng.tie(eid, "v", (enchudb_wal::eid_local(eid) % 10) as u32);
+        eng.tie(eid, "v", (enchudb_oplog::eid_local(eid) % 10) as u32);
     }
     let elapsed = t.elapsed();
     eng.rebuild();
@@ -75,7 +75,7 @@ fn descending_eid_tie_does_not_explode() {
 
     // 個別 get も正しい
     for &eid in eids.iter().step_by(1000) {
-        let want = (enchudb_wal::eid_local(eid) % 10) as u32;
+        let want = (enchudb_oplog::eid_local(eid) % 10) as u32;
         assert_eq!(eng.get(eid, "v"), Some(want), "eid={eid}");
     }
 
@@ -100,11 +100,11 @@ fn mixed_high_then_low_eid_tie() {
 
     // 後半 (eid N/2..N) を先に昇順で tie → offset が N/2 で固定
     for &eid in eids[(N / 2) as usize..].iter() {
-        eng.tie(eid, "v", (enchudb_wal::eid_local(eid) % 10) as u32);
+        eng.tie(eid, "v", (enchudb_oplog::eid_local(eid) % 10) as u32);
     }
     // 前半 (eid 0..N/2) を後から逆順で tie → 1 回の prepend で offset 0 まで下がる
     for &eid in eids[..(N / 2) as usize].iter().rev() {
-        eng.tie(eid, "v", (enchudb_wal::eid_local(eid) % 10) as u32);
+        eng.tie(eid, "v", (enchudb_oplog::eid_local(eid) % 10) as u32);
     }
     eng.rebuild();
 

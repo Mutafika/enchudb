@@ -13,15 +13,15 @@
 //!
 //! let path = format!("/tmp/enchudb-sync-doc-{}.db", std::process::id());
 //! let _ = std::fs::remove_file(&path);
-//! let _ = std::fs::remove_file(format!("{}.wal", path));
-//! let eng_a = Engine::create_concurrent_with_wal(&path, 4 * 1024 * 1024).unwrap();
+//! let _ = std::fs::remove_file(format!("{}.oplog", path));
+//! let eng_a = Engine::create_concurrent_with_oplog(&path, 4 * 1024 * 1024).unwrap();
 //!
 //! let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
 //! let syncer = Syncer::new(eng_a.clone(), transport);
 //! let out = syncer.pull_once(2);
 //! assert_eq!(out.received, 0);
 //! # let _ = std::fs::remove_file(&path);
-//! # let _ = std::fs::remove_file(format!("{}.wal", path));
+//! # let _ = std::fs::remove_file(format!("{}.oplog", path));
 //! ```
 
 pub mod sync;

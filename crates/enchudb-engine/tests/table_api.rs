@@ -22,7 +22,7 @@ fn tmp_path(tag: &str) -> String {
 }
 
 fn cleanup(path: &str) {
-    for suffix in ["", ".wal", ".crc", ".db.lock", ".tables", ".tables.tmp"] {
+    for suffix in ["", ".oplog", ".crc", ".db.lock", ".tables", ".tables.tmp"] {
         let _ = std::fs::remove_file(format!("{}{}", path, suffix));
     }
 }
@@ -79,8 +79,8 @@ fn entity_in_allocates_within_range() {
 
     let e1 = eng.entity_in("users").unwrap();
     let e2 = eng.entity_in("users").unwrap();
-    let local1 = enchudb_wal::eid_local(e1);
-    let local2 = enchudb_wal::eid_local(e2);
+    let local1 = enchudb_oplog::eid_local(e1);
+    let local2 = enchudb_oplog::eid_local(e2);
     assert!(local1 < local2, "monotonic alloc");
     assert!(local1 < 100, "in users range");
     assert!(local2 < 100, "in users range");
@@ -178,8 +178,8 @@ fn two_tables_have_disjoint_eid_ranges() {
 
     let ea = eng.entity_in("a").unwrap();
     let eb = eng.entity_in("b").unwrap();
-    let la = enchudb_wal::eid_local(ea);
-    let lb = enchudb_wal::eid_local(eb);
+    let la = enchudb_oplog::eid_local(ea);
+    let lb = enchudb_oplog::eid_local(eb);
     assert!(la < 100, "a in [0, 100)");
     assert!(lb >= 100 && lb < 200, "b in [100, 200)");
 
@@ -276,7 +276,7 @@ fn define_ref_in_creates_fk_link() {
 
     let alice = eng.entity_in("users").unwrap();
     let post = eng.entity_in("posts").unwrap();
-    let alice_local = enchudb_wal::eid_local(alice);
+    let alice_local = enchudb_oplog::eid_local(alice);
     eng.tie(post, "posts.author", alice_local); // OK: alice in users range
     let posts_by_alice = eng.pull_raw("posts.author", alice_local);
     assert_eq!(posts_by_alice.len(), 1);
@@ -296,7 +296,7 @@ fn ref_tie_out_of_range_panics() {
 
     let post = eng.entity_in("posts").unwrap();
     // post の eid (>=100) を author に渡すと users range 外 → panic
-    let bad_target = enchudb_wal::eid_local(post);
+    let bad_target = enchudb_oplog::eid_local(post);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         eng.tie(post, "posts.author", bad_target);
     }));
@@ -350,7 +350,7 @@ fn tie_out_of_table_range_panics() {
 
     let _ = eng.entity_in("users").unwrap();
     let post = eng.entity_in("posts").unwrap();
-    let post_local = enchudb_wal::eid_local(post);
+    let post_local = enchudb_oplog::eid_local(post);
 
     // post の eid を users.age に tie しようとする → eid_range 外で panic
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -390,7 +390,7 @@ fn anonymous_closed_validates_eid_range() {
 
     eng.define_table("users", 100).unwrap(); // anonymous を [0, 1) で close
     let user = eng.entity_in("users").unwrap();
-    let user_local = enchudb_wal::eid_local(user);
+    let user_local = enchudb_oplog::eid_local(user);
 
     // anonymous の age に user eid (= 1, 外) を tie → panic
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -436,12 +436,12 @@ fn positions_isolated_per_table() {
     // 結果 eid が混ざってない
     let a_results = eng.pull_raw("a.v", 2);
     for &e in &a_results {
-        let local = enchudb_wal::eid_local(e);
+        let local = enchudb_oplog::eid_local(e);
         assert!(local < 1000, "a.v result eid {} should be in a range", local);
     }
     let b_results = eng.pull_raw("b.v", 2);
     for &e in &b_results {
-        let local = enchudb_wal::eid_local(e);
+        let local = enchudb_oplog::eid_local(e);
         assert!(local >= 1000 && local < 2000, "b.v result eid {} should be in b range", local);
     }
 
@@ -465,7 +465,7 @@ fn tables_persist_across_reopen() {
         let alice = eng.entity_in("users").unwrap();
         let post = eng.entity_in("posts").unwrap();
         eng.tie(alice, "users.age", 30);
-        eng.tie(post, "posts.author", enchudb_wal::eid_local(alice));
+        eng.tie(post, "posts.author", enchudb_oplog::eid_local(alice));
         eng.flush().unwrap();
     }
 
@@ -502,7 +502,7 @@ fn entity_in_continues_after_reopen() {
         eng.define_table("users", 100).unwrap();
         eng.define_himo_in("users", "name", HimoType::Number, 10).unwrap();
         let alice = eng.entity_in("users").unwrap();
-        alice_eid = enchudb_wal::eid_local(alice);
+        alice_eid = enchudb_oplog::eid_local(alice);
         eng.tie(alice, "users.name", 1);
         eng.flush().unwrap();
     }
@@ -514,7 +514,7 @@ fn entity_in_continues_after_reopen() {
 
         // 次の entity は alice と衝突しない eid
         let bob = eng.entity_in("users").unwrap();
-        let bob_local = enchudb_wal::eid_local(bob);
+        let bob_local = enchudb_oplog::eid_local(bob);
         assert_ne!(bob_local, alice_eid, "bob shouldn't reuse alice's eid");
         assert!(bob_local < 100, "bob in users range");
     }

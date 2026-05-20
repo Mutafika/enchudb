@@ -9,20 +9,20 @@
 
 use std::sync::Arc;
 use enchudb::{Engine, HimoType};
-use enchudb_wal::Hlc;
+use enchudb_oplog::Hlc;
 use enchudb::sync::Syncer;
 use enchudb::transport::{InMemoryTransport, Transport};
 
 fn tmp(tag: &str) -> String {
     let p = format!("/tmp/enchudb-v33-text-{}-{}", tag, std::process::id());
-    for suffix in ["", ".wal", ".crc"] {
+    for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", p, suffix));
     }
     p
 }
 
 fn cleanup(path: &str) {
-    for suffix in ["", ".wal", ".crc"] {
+    for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", path, suffix));
     }
 }
@@ -35,7 +35,7 @@ fn make_peer(path: &str, peer: u32) -> Arc<Engine> {
         eng.define_himo("age", HimoType::Number, 100);
         eng.flush().unwrap();
     }
-    let eng = Engine::open_concurrent_with_wal(path, 16 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(path, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(peer);
     eng
 }
@@ -51,9 +51,9 @@ fn single_text_tie_propagates_to_peer_b() {
     // peer A: Alice を書く
     let eid_alice = eng_a.entity();
     eng_a.tie_text_async(eid_alice, "name", "Alice");
-    eng_a.wal_commit();
+    eng_a.oplog_commit();
     eng_a.flush_writes();
-    eng_a.wal_sync().unwrap();
+    eng_a.oplog_sync().unwrap();
 
     // A が publish → B が pull
     let syncer_a = Syncer::new(eng_a.clone(), transport.clone());
@@ -87,9 +87,9 @@ fn multiple_text_values_preserve_distinct_vids() {
     eng_a.tie_text_async(e1, "name", "Alice");
     eng_a.tie_text_async(e2, "name", "Bob");
     eng_a.tie_text_async(e3, "name", "Carol");
-    eng_a.wal_commit();
+    eng_a.oplog_commit();
     eng_a.flush_writes();
-    eng_a.wal_sync().unwrap();
+    eng_a.oplog_sync().unwrap();
 
     let syncer_a = Syncer::new(eng_a.clone(), transport.clone());
     let syncer_b = Syncer::new(eng_b.clone(), transport.clone());
@@ -121,9 +121,9 @@ fn repeated_same_text_is_deduped_on_receiver() {
     eng_a.tie_text_async(e1, "name", "Alice");
     eng_a.tie_text_async(e2, "name", "Alice");
     eng_a.tie_text_async(e3, "name", "Alice");
-    eng_a.wal_commit();
+    eng_a.oplog_commit();
     eng_a.flush_writes();
-    eng_a.wal_sync().unwrap();
+    eng_a.oplog_sync().unwrap();
 
     let syncer_a = Syncer::new(eng_a.clone(), transport.clone());
     let syncer_b = Syncer::new(eng_b.clone(), transport.clone());
@@ -154,9 +154,9 @@ fn tie_ref_async_propagates_between_peers() {
         eng.define_himo("parent", enchudb::HimoType::Ref, 0);
         eng.flush().unwrap();
     }
-    let eng_a = Engine::open_concurrent_with_wal(&pa, 16 * 1024 * 1024).unwrap();
+    let eng_a = Engine::open_concurrent_with_oplog(&pa, 16 * 1024 * 1024).unwrap();
     eng_a.set_peer_id(1);
-    let eng_b = Engine::open_concurrent_with_wal(&pb, 16 * 1024 * 1024).unwrap();
+    let eng_b = Engine::open_concurrent_with_oplog(&pb, 16 * 1024 * 1024).unwrap();
     eng_b.set_peer_id(2);
 
     let parent = eng_a.entity();
@@ -164,7 +164,7 @@ fn tie_ref_async_propagates_between_peers() {
     eng_a.tie_ref_async(child, "parent", parent);
     eng_a.commit();  // v33: commit が WAL Commit marker も打つ
     eng_a.flush_writes();
-    eng_a.wal_sync().unwrap();
+    eng_a.oplog_sync().unwrap();
 
     let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
     let syncer_a = Syncer::new(eng_a.clone(), transport.clone());
@@ -173,7 +173,7 @@ fn tie_ref_async_propagates_between_peers() {
     syncer_b.pull_once(1);
 
     // B 側の child entity の parent himo 値が parent の local と一致(同一 peer 内 ref なので)
-    let parent_local = enchudb_wal::eid_local(parent) as u32;
+    let parent_local = enchudb_oplog::eid_local(parent) as u32;
     assert_eq!(eng_b.get(child, "parent"), Some(parent_local));
 
     cleanup(&pa);
@@ -188,9 +188,9 @@ fn commit_also_writes_wal_marker_under_v33() {
 
     let e = eng_a.entity();
     eng_a.tie_text_async(e, "name", "Zed");
-    eng_a.commit();  // v33: wal_commit 相当も行うはず
+    eng_a.commit();  // v33: oplog_commit 相当も行うはず
     eng_a.flush_writes();
-    eng_a.wal_sync().unwrap();
+    eng_a.oplog_sync().unwrap();
 
     let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
     let syncer = Syncer::new(eng_a.clone(), transport.clone());
@@ -215,16 +215,16 @@ fn peer_a_and_b_share_text_even_if_each_coined_local_vid_first() {
     // B が先に "Zed" を別 eid で使う(B 側 local_vid が A とズレる可能性)
     let e_b_local = eng_b.entity();
     eng_b.tie_text_async(e_b_local, "name", "Zed");
-    eng_b.wal_commit();
+    eng_b.oplog_commit();
     eng_b.flush_writes();
-    eng_b.wal_sync().unwrap();
+    eng_b.oplog_sync().unwrap();
 
     // A が自分の eid に "Zed" を tie
     let e_a = eng_a.entity();
     eng_a.tie_text_async(e_a, "name", "Zed");
-    eng_a.wal_commit();
+    eng_a.oplog_commit();
     eng_a.flush_writes();
-    eng_a.wal_sync().unwrap();
+    eng_a.oplog_sync().unwrap();
 
     let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
     let syncer_a = Syncer::new(eng_a.clone(), transport.clone());

@@ -11,7 +11,7 @@
 
 use enchudb::changefeed::ChangeListener;
 use enchudb::transport::WireRecord;
-use enchudb_wal::wal::DecodedOp;
+use enchudb_oplog::oplog::DecodedOp;
 use enchudb::{Engine, HimoType};
 use std::sync::{Arc, Mutex};
 
@@ -25,14 +25,14 @@ fn tmp(tag: &str) -> String {
             .unwrap()
             .as_nanos()
     );
-    for suffix in ["", ".wal", ".crc"] {
+    for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", p, suffix));
     }
     p
 }
 
 fn cleanup(path: &str) {
-    for suffix in ["", ".wal", ".crc"] {
+    for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", path, suffix));
     }
 }
@@ -44,7 +44,7 @@ fn prepare_wal_engine(tag: &str) -> (String, Arc<Engine>) {
         eng.define_himo("v", HimoType::Number, 100);
         eng.flush().unwrap();
     }
-    let eng = Engine::open_concurrent_with_wal(&path, 8 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&path, 8 * 1024 * 1024).unwrap();
     eng.set_peer_id(1);
     (path, eng)
 }
@@ -69,9 +69,9 @@ fn single_listener_receives_after_wal_sync() {
 
     let e = eng.entity();
     eng.tie_async(e, "v", 42);
-    eng.wal_commit();
+    eng.oplog_commit();
     eng.flush_writes();
-    eng.wal_sync().unwrap();
+    eng.oplog_sync().unwrap();
 
     // shutdown 時 emit を確実に走らせる
     drop(eng);
@@ -102,9 +102,9 @@ fn multiple_listeners_all_fire() {
         let e = eng.entity();
         eng.tie_async(e, "v", i);
     }
-    eng.wal_commit();
+    eng.oplog_commit();
     eng.flush_writes();
-    eng.wal_sync().unwrap();
+    eng.oplog_sync().unwrap();
     drop(eng);
 
     let a = sink_a.records.lock().unwrap();
@@ -124,9 +124,9 @@ fn records_are_hlc_ascending() {
         let e = eng.entity();
         eng.tie_async(e, "v", i);
     }
-    eng.wal_commit();
+    eng.oplog_commit();
     eng.flush_writes();
-    eng.wal_sync().unwrap();
+    eng.oplog_sync().unwrap();
     drop(eng);
 
     let recs = sink.records.lock().unwrap();
@@ -151,9 +151,9 @@ fn listener_added_after_first_commit_only_sees_subsequent() {
     // 1 回目 commit (listener 無し)
     let e0 = eng.entity();
     eng.tie_async(e0, "v", 100);
-    eng.wal_commit();
+    eng.oplog_commit();
     eng.flush_writes();
-    eng.wal_sync().unwrap();
+    eng.oplog_sync().unwrap();
 
     // ここで listener 追加
     let sink = Arc::new(CollectSink::default());
@@ -162,9 +162,9 @@ fn listener_added_after_first_commit_only_sees_subsequent() {
     // 2 回目 commit
     let e1 = eng.entity();
     eng.tie_async(e1, "v", 200);
-    eng.wal_commit();
+    eng.oplog_commit();
     eng.flush_writes();
-    eng.wal_sync().unwrap();
+    eng.oplog_sync().unwrap();
 
     drop(eng);
 
@@ -183,7 +183,7 @@ fn listener_added_after_first_commit_only_sees_subsequent() {
 }
 
 #[test]
-fn listener_does_not_fire_on_engine_without_wal() {
+fn listener_does_not_fire_on_engine_without_oplog() {
     // WAL 無し engine では fire しない(create 直 + add で何も起きないこと)
     let path = tmp("no_wal");
     let mut eng = Engine::create_standalone(&path).unwrap();

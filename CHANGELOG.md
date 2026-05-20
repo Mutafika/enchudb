@@ -3,6 +3,42 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.6.0 — 2026-05-20
+
+`enchudb-wal` crate を `enchudb-oplog` にリネーム ([issue #8](https://github.com/Mutafika/enchudb/issues/8))。
+実態が write-ahead log ではなく oplog (MongoDB oplog と同パターン: mmap が primary state、
+oplog は peer sync 配信 + audit + crash recovery 用の append-only op stream) なので、
+命名と実装の乖離を解消。 wire format / record encoding / file magic は不変、
+file 拡張子と API 名のみ変更。
+
+### Breaking
+
+- **crate rename**: `enchudb-wal` → `enchudb-oplog` (`Cargo.toml` の dep 名 + import 全置換)
+- **API rename** (主要):
+  - `Wal` → `OpLog`、 `WalOp` → `Op`、 `WalRecord` → `OwnedOp`、 `RecoveredRecord` → `Record`
+  - `wal_sync()` → `oplog_sync()`、 `wal_commit()` → `oplog_commit()`、 `wal()` → `oplog()`、 `wal_arc()` → `oplog_arc()`
+  - `create_concurrent_with_wal*` / `open_concurrent_with_wal*` / `concurrentize_with_wal` → `*_with_oplog*`
+  - schema 層 `Database::open_with_wal` / `finish_with_wal` → `open_with_oplog` / `finish_with_oplog`
+  - 公開フィールド `Stats { wal_head, wal_checkpoint, ... }` → `oplog_head, oplog_checkpoint, ...`
+  - 詳細マッピングは [`docs/migration-wal-to-oplog.md`](docs/migration-wal-to-oplog.md)
+- **file 拡張子**: `{db_path}.wal` → `{db_path}.oplog`、 fallback open なし (clean break)
+  - 既存 `.wal` ファイルが居る場合は手動 rename (`mv x.wal x.oplog`) で OK、 中身 binary は不変
+- **semver**: 0.5.0 → 0.6.0
+
+### Unchanged
+
+- wire record format (v2 layout) 不変
+- file magic `EWAL` (歴史的経緯で binary-compat、 0.5.0 で書いた `.wal` を `.oplog` に rename すればそのまま読める)
+- HLC / EntityId / PeerId / keys / 署名 layout 不変
+- sync 経路 / publish_since / pull_since 等の wire protocol 不変
+
+### Migration
+
+[`docs/migration-wal-to-oplog.md`](docs/migration-wal-to-oplog.md) に consumer crate
+向けの完全 import 置換 sed + ファイル拡張子 rename 手順あり。 enchudb meta crate の
+re-export (`enchudb::{EntityId, Hlc, PeerId}` / `enchudb::keys::*`) は path 不変なので、
+これらだけ使う consumer は import 修正不要。
+
 ## 0.5.0 — 2026-05-20
 
 β-light: engine 自身が **table 概念** を持つ。 旧 flat な eid 空間 + himo 群の上に、

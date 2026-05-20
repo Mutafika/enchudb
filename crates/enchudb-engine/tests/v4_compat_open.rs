@@ -32,7 +32,7 @@ fn tmp_path(tag: &str) -> String {
 }
 
 fn cleanup(path: &str) {
-    for suffix in ["", ".wal", ".crc", ".db.lock"] {
+    for suffix in ["", ".oplog", ".crc", ".db.lock"] {
         let _ = std::fs::remove_file(format!("{}{}", path, suffix));
     }
 }

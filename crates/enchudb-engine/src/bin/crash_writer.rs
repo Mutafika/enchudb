@@ -7,9 +7,9 @@
 //!   crash_writer <path> <scenario> [count]
 //!
 //! scenarios:
-//!   normal              — 書き込み → wal_sync → 正常終了
-//!   no_commit           — 書き込み → wal_commit せずに exit(0)
-//!   no_sync             — 書き込み → wal_commit → wal_sync せずに exit(0)
+//!   normal              — 書き込み → oplog_sync → 正常終了
+//!   no_commit           — 書き込み → oplog_commit せずに exit(0)
+//!   no_sync             — 書き込み → oplog_commit → oplog_sync せずに exit(0)
 //!   abort_mid           — 半分書いたところで abort()(Drop 走らず)
 //!   loop_writes         — 無限に書き込む(親プロセスが kill する前提)
 //!   sleep_after         — 書き込み + sync → sleep(親が kill する前提、耐久化確認)
@@ -31,7 +31,7 @@ fn main() {
     let count: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(100);
 
     // DB はすでに定義済み(呼び出し側が準備している前提)
-    let eng = Engine::open_concurrent_with_wal(path, 64 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(path, 64 * 1024 * 1024).unwrap();
 
     match scenario {
         "normal" => {
@@ -40,7 +40,7 @@ fn main() {
                 eng.tie_async(e, "n", i);
             }
             eng.flush_writes();
-            eng.wal_sync().unwrap();
+            eng.oplog_sync().unwrap();
         }
         "no_commit" => {
             for i in 0..count {
@@ -48,7 +48,7 @@ fn main() {
                 eng.tie_async(e, "n", i);
             }
             eng.flush_writes();
-            // wal_commit 呼ばずに終了 — auto-commit が効くかのテスト
+            // oplog_commit 呼ばずに終了 — auto-commit が効くかのテスト
             std::process::exit(0);
         }
         "no_sync" => {
@@ -57,8 +57,8 @@ fn main() {
                 eng.tie_async(e, "n", i);
             }
             eng.flush_writes();
-            eng.wal_commit();
-            // wal_sync 呼ばずに終了 — Drop の shutdown fsync に頼る
+            eng.oplog_commit();
+            // oplog_sync 呼ばずに終了 — Drop の shutdown fsync に頼る
             std::process::exit(0);
         }
         "abort_mid" => {
@@ -68,8 +68,8 @@ fn main() {
                 eng.tie_async(e, "n", i);
             }
             eng.flush_writes();
-            eng.wal_commit();
-            eng.wal_sync().unwrap();
+            eng.oplog_commit();
+            eng.oplog_sync().unwrap();
 
             // 前半は確実に耐久化されている
             // ここから後半を書いて、fsync せずに abort
@@ -88,8 +88,8 @@ fn main() {
                 i += 1;
                 if i % 1000 == 0 {
                     eng.flush_writes();
-                    eng.wal_commit();
-                    eng.wal_sync().unwrap();
+                    eng.oplog_commit();
+                    eng.oplog_sync().unwrap();
                 }
                 if i % 100 == 0 {
                     // 親に読ませるため stdout に進捗
@@ -103,8 +103,8 @@ fn main() {
                 eng.tie_async(e, "n", i);
             }
             eng.flush_writes();
-            eng.wal_commit();
-            eng.wal_sync().unwrap();
+            eng.oplog_commit();
+            eng.oplog_sync().unwrap();
             println!("SYNCED {}", count);
             // stdin を閉じるまで sleep(親が kill する)
             loop {
@@ -116,7 +116,7 @@ fn main() {
             // 1. tie_async で 1 件書き込み
             // 2. flush_writes で consumer queue を drain (= mmap に反映、 WAL buffer に append)
             // 3. body_msync で mmap dirty page を強制的に disk へ
-            // 4. wal_sync / wal_commit は呼ばない (= WAL は buffer のまま disk に行かない)
+            // 4. oplog_sync / oplog_commit は呼ばない (= WAL は buffer のまま disk に行かない)
             // 5. abort で Drop を skip (= consumer thread の周期 fsync も走らず)
             //
             // 結果: mmap disk = 新値、 WAL disk = 空。 再起動時に mmap だけ進んでる状態。
@@ -128,7 +128,7 @@ fn main() {
             std::process::abort();
         }
         "v32_signed_loop" => {
-            use enchudb_wal::keys::Keypair;
+            use enchudb_oplog::keys::Keypair;
             // seed 固定で親が pubkey を事前登録できるようにする
             let seed = [7u8; 32];
             let kp = std::sync::Arc::new(Keypair::from_bytes(&seed));
@@ -142,8 +142,8 @@ fn main() {
                 i += 1;
                 if i % 500 == 0 {
                     eng.flush_writes();
-                    eng.wal_commit();
-                    eng.wal_sync().unwrap();
+                    eng.oplog_commit();
+                    eng.oplog_sync().unwrap();
                     println!("{}", i);
                 }
             }

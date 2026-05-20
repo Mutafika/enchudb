@@ -7,20 +7,20 @@
 
 use std::sync::Arc;
 use enchudb::{Engine, HimoType};
-use enchudb_wal::Hlc;
+use enchudb_oplog::Hlc;
 use enchudb::sync::Syncer;
 use enchudb::transport::{InMemoryTransport, Transport};
 
 fn tmp(tag: &str) -> String {
     let p = format!("/tmp/enchudb-v32-replica-{}-{}", tag, std::process::id());
-    for suffix in ["", ".wal", ".crc"] {
+    for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", p, suffix));
     }
     p
 }
 
 fn cleanup(path: &str) {
-    for suffix in ["", ".wal", ".crc"] {
+    for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", path, suffix));
     }
 }
@@ -41,7 +41,7 @@ fn replica_rejects_tie() {
     let eng = Arc::new(eng);
     eng.set_peer_id(9); // replica 側の peer id
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        eng.tie_to(enchudb_wal::make_eid(9, 1), "val", 42);
+        eng.tie_to(enchudb_oplog::make_eid(9, 1), "val", 42);
     }));
     assert!(result.is_err(), "tie_to on replica must panic");
 
@@ -64,12 +64,12 @@ fn replica_rejects_entity_and_delete() {
     assert!(entity_panic.is_err(), "entity() must panic on replica");
 
     let delete_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        eng.delete(enchudb_wal::make_eid(1, 0));
+        eng.delete(enchudb_oplog::make_eid(1, 0));
     }));
     assert!(delete_panic.is_err(), "delete() must panic on replica");
 
     let untie_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        eng.untie(enchudb_wal::make_eid(1, 0), "val");
+        eng.untie(enchudb_oplog::make_eid(1, 0), "val");
     }));
     assert!(untie_panic.is_err(), "untie() must panic on replica");
 
@@ -86,7 +86,7 @@ fn replica_rejects_content() {
     let eng = Arc::new(Engine::open_replica(&path).unwrap());
 
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        eng.content(enchudb_wal::make_eid(1, 0), "memo", b"hello");
+        eng.content(enchudb_oplog::make_eid(1, 0), "memo", b"hello");
     }));
     assert!(r.is_err(), "content() must panic on replica");
 
@@ -105,7 +105,7 @@ fn replica_allows_remote_apply_and_read() {
     let eng = Arc::new(Engine::open_replica(&path).unwrap());
 
     // replica として「リモートから Tie が届いた」シミュレーション
-    let eid = enchudb_wal::make_eid(1, 7);
+    let eid = enchudb_oplog::make_eid(1, 7);
     let himo_id = eng.himo_id("val").unwrap();
     eng.remote_tie_apply(eid, himo_id as u16, 42);
 
@@ -128,7 +128,7 @@ fn replica_syncs_from_origin_via_syncer() {
         eng.define_himo("val", HimoType::Number, 100);
         eng.flush().unwrap();
     }
-    let origin = Engine::open_concurrent_with_wal(&path_origin, 16 * 1024 * 1024).unwrap();
+    let origin = Engine::open_concurrent_with_oplog(&path_origin, 16 * 1024 * 1024).unwrap();
     origin.set_peer_id(1);
 
     // replica 準備 (同じ schema で作った後、replica として open)
@@ -150,12 +150,12 @@ fn replica_syncs_from_origin_via_syncer() {
     let replica_syncer = Syncer::new(replica.clone(), transport.clone());
 
     // origin が直接 transport に push して publish 代用 (WAL 無しルート)
-    let eid = enchudb_wal::make_eid(1, 3);
+    let eid = enchudb_oplog::make_eid(1, 3);
     transport.publish(1, vec![
         enchudb::transport::WireRecord::unsigned(
             Hlc { wall: 100, logical: 0, peer: 1 },
             1,
-            enchudb_wal::wal::DecodedOp::Tie { eid, himo_id: origin.himo_id("val").unwrap() as u16, value: 77 },
+            enchudb_oplog::oplog::DecodedOp::Tie { eid, himo_id: origin.himo_id("val").unwrap() as u16, value: 77 },
         ),
     ]);
 

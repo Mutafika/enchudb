@@ -43,10 +43,10 @@ pub use enchudb_engine::*;
 
 // Convenience re-exports for downstream crates that previously imported these
 // from the root (opyula など)。 EntityId / Hlc / PeerId / keys は本来
-// `enchudb_wal` 配下だが、 meta crate として薄く再露出する。
-pub use enchudb_wal::{EntityId, Hlc, PeerId};
+// `enchudb_oplog` 配下だが、 meta crate として薄く再露出する。
+pub use enchudb_oplog::{EntityId, Hlc, PeerId};
 pub mod keys {
-    pub use enchudb_wal::keys::*;
+    pub use enchudb_oplog::keys::*;
 }
 
 /// Native API (仮想 2D テーブル + 永続化)。 app 開発向けの primary path。

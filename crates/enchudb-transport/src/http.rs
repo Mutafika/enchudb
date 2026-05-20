@@ -32,7 +32,7 @@
 //! use std::sync::Arc;
 //! use enchudb_transport::http::{HttpRelay, HttpTransport};
 //! use enchudb::transport::Transport;
-//! use enchudb_wal::Hlc;
+//! use enchudb_oplog::Hlc;
 //!
 //! // サーバー側 (origin) — ephemeral port で listen
 //! let relay = HttpRelay::start("127.0.0.1:0").unwrap();
@@ -59,7 +59,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use enchudb::transport::{decode_batch, encode_batch, Transport, WireRecord};
-use enchudb_wal::{Hlc, PeerId};
+use enchudb_oplog::{Hlc, PeerId};
 
 // ─────────────────────────────────────────────────────────────
 // Server: HttpRelay
@@ -341,7 +341,7 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Resu
                     let log = room_log.entry(peer).or_insert_with(Vec::new);
                     // CRDT 不変式: (peer, hlc) で record は一意。 gossip 経由で同 hlc が
                     // 二度送られる事があるため dedupe しないと relay の log が無限増殖する。
-                    let existing: std::collections::HashSet<enchudb_wal::Hlc> =
+                    let existing: std::collections::HashSet<enchudb_oplog::Hlc> =
                         log.iter().map(|r| r.hlc).collect();
                     for r in records {
                         if !existing.contains(&r.hlc) {
@@ -744,7 +744,7 @@ impl Transport for HttpTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use enchudb_wal::wal::DecodedOp;
+    use enchudb_oplog::oplog::DecodedOp;
 
     fn rec(hlc_wall: u64, peer: PeerId, eid: u64, value: u32) -> WireRecord {
         WireRecord::unsigned(

@@ -28,7 +28,7 @@ fn main() {
     let sch_path = "/tmp/sch_bench_sch.db";
     for p in [raw_path, sch_path] {
         let _ = std::fs::remove_file(p);
-        let _ = std::fs::remove_file(format!("{}.wal", p));
+        let _ = std::fs::remove_file(format!("{}.oplog", p));
     }
 
     // ──── raw 構築 ────
@@ -40,7 +40,7 @@ fn main() {
     let dept_hid_r = eng.himo_id("dept_id").unwrap() as u16;
     let _sal_hid_r = eng.himo_id("salary").unwrap() as u16;
 
-    let mut eids_raw: Vec<enchudb_wal::EntityId> = Vec::with_capacity(N as usize);
+    let mut eids_raw: Vec<enchudb_oplog::EntityId> = Vec::with_capacity(N as usize);
     let mut rng = 0x9E3779B97F4A7C15u64;
     for i in 0..N {
         rng = xorshift(rng);
@@ -62,7 +62,7 @@ fn main() {
         .build().unwrap();
     let emp_owned = {
         let emp = db.get_table("emp").unwrap();
-        let mut eids: Vec<enchudb_wal::EntityId> = Vec::with_capacity(N as usize);
+        let mut eids: Vec<enchudb_oplog::EntityId> = Vec::with_capacity(N as usize);
         let mut rng = 0x9E3779B97F4A7C15u64;
         for i in 0..N {
             rng = xorshift(rng);
@@ -186,7 +186,7 @@ fn main() {
         s, s2, s3, s4, l, l2, l3, l4);
 
     let _ = std::fs::remove_file(raw_path);
-    let _ = std::fs::remove_file(format!("{}.wal", raw_path));
+    let _ = std::fs::remove_file(format!("{}.oplog", raw_path));
     let _ = std::fs::remove_file(sch_path);
-    let _ = std::fs::remove_file(format!("{}.wal", sch_path));
+    let _ = std::fs::remove_file(format!("{}.oplog", sch_path));
 }

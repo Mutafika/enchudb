@@ -99,7 +99,7 @@ fn main() {
     let path = "/tmp/enchudb_segmented_rss.db";
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{}.crc", path));
-    let _ = std::fs::remove_file(format!("{}.wal", path));
+    let _ = std::fs::remove_file(format!("{}.oplog", path));
 
     let tbls = tables();
     let total_himos: usize = tbls.iter().map(|(_, h)| h.len()).sum();
@@ -178,5 +178,5 @@ fn main() {
 
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{}.crc", path));
-    let _ = std::fs::remove_file(format!("{}.wal", path));
+    let _ = std::fs::remove_file(format!("{}.oplog", path));
 }

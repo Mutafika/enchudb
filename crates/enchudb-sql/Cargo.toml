@@ -1,6 +1,6 @@
 [package]
 name = "enchudb-sql"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "EnchuDB SQL frontend — sqlparser でパースして engine メソッドに直 dispatch する薄い syntactic sugar 層。SQLite の上位互換 (superset) を狙う。"
 license-file = "LICENSE.md"
@@ -8,7 +8,7 @@ authors = ["mutafika"]
 repository = "https://github.com/mutafika/enchudb"
 
 [dependencies]
-enchudb-wal = { path = "../enchudb-wal" }
+enchudb-oplog = { path = "../enchudb-oplog" }
 enchudb-engine = { path = "../enchudb-engine" }
 enchudb-schema = { path = "../enchudb-schema" }
 sqlparser = "0.52"

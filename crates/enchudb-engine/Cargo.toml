@@ -1,6 +1,6 @@
 [package]
 name = "enchudb-engine"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "EnchuDB engine — 紐ベース円柱エンジン本体。WAL / BlobStore / HLC primitive / keys / ACL まで含む、単独 DB として動く層。"
 license-file = "LICENSE.md"
@@ -13,7 +13,7 @@ repository = "https://github.com/mutafika/enchudb"
 async-blob = ["dep:async-trait", "dep:tokio"]
 
 [dependencies]
-enchudb-wal = { path = "../enchudb-wal" }
+enchudb-oplog = { path = "../enchudb-oplog" }
 crossbeam-queue = "0.3"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }

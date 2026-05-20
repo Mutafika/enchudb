@@ -37,7 +37,7 @@ use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::protocol::{Message, WebSocket};
 
 use enchudb::transport::{decode_batch, encode_batch, WireRecord};
-use enchudb_wal::{Hlc, PeerId};
+use enchudb_oplog::{Hlc, PeerId};
 
 // ─────────────────────────────────────────────────────────────
 // Server side: WsPushHub
@@ -290,13 +290,13 @@ impl Drop for WsPushClient {
 ///
 /// let path = format!("/tmp/enchudb-ws-adapter-doc-{}.db", std::process::id());
 /// # let _ = std::fs::remove_file(&path);
-/// # let _ = std::fs::remove_file(format!("{}.wal", path));
+/// # let _ = std::fs::remove_file(format!("{}.oplog", path));
 /// {
 ///     let mut eng = Engine::create_standalone(&path).unwrap();
 ///     eng.define_himo("v", HimoType::Number, 100);
 ///     eng.flush().unwrap();
 /// }
-/// let eng = Engine::open_concurrent_with_wal(&path, 4 * 1024 * 1024).unwrap();
+/// let eng = Engine::open_concurrent_with_oplog(&path, 4 * 1024 * 1024).unwrap();
 /// eng.set_peer_id(1);
 ///
 /// // hub 起動 + adapter attach
@@ -307,23 +307,23 @@ impl Drop for WsPushClient {
 /// // (このテストでは subscriber 居ないので broadcast は no-op)
 /// let e = eng.entity();
 /// eng.tie_async(e, "v", 42);
-/// eng.wal_commit();
+/// eng.oplog_commit();
 /// eng.flush_writes();
-/// eng.wal_sync().unwrap();
+/// eng.oplog_sync().unwrap();
 ///
 /// drop(eng);
 /// # let _ = std::fs::remove_file(&path);
-/// # let _ = std::fs::remove_file(format!("{}.wal", path));
+/// # let _ = std::fs::remove_file(format!("{}.oplog", path));
 /// ```
 pub struct WsPushHubAdapter {
     hub: std::sync::Arc<WsPushHub>,
-    peer_id: enchudb_wal::PeerId,
+    peer_id: enchudb_oplog::PeerId,
 }
 
 impl WsPushHubAdapter {
     /// `peer_id` は publish 時に subscriber の `from_peer` フィルタで照合されるので、
     /// engine が attach されている自 peer の id を渡すこと。
-    pub fn new(hub: std::sync::Arc<WsPushHub>, peer_id: enchudb_wal::PeerId) -> Self {
+    pub fn new(hub: std::sync::Arc<WsPushHub>, peer_id: enchudb_oplog::PeerId) -> Self {
         Self { hub, peer_id }
     }
 }
@@ -341,7 +341,7 @@ impl ChangeListener for WsPushHubAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use enchudb_wal::wal::DecodedOp;
+    use enchudb_oplog::oplog::DecodedOp;
     use std::sync::mpsc;
 
     fn rec(wall: u64, peer: PeerId, eid: u64, value: u32) -> WireRecord {
@@ -476,7 +476,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         );
-        for suffix in ["", ".wal", ".crc"] {
+        for suffix in ["", ".oplog", ".crc"] {
             let _ = std::fs::remove_file(format!("{}{}", path, suffix));
         }
         {
@@ -484,7 +484,7 @@ mod tests {
             eng.define_himo("v", HimoType::Number, 100);
             eng.flush().unwrap();
         }
-        let eng = Engine::open_concurrent_with_wal(&path, 4 * 1024 * 1024).unwrap();
+        let eng = Engine::open_concurrent_with_oplog(&path, 4 * 1024 * 1024).unwrap();
         eng.set_peer_id(1);
 
         // hub + subscriber
@@ -512,9 +512,9 @@ mod tests {
         // commit
         let e = eng.entity();
         eng.tie_async(e, "v", 777);
-        eng.wal_commit();
+        eng.oplog_commit();
         eng.flush_writes();
-        eng.wal_sync().unwrap();
+        eng.oplog_sync().unwrap();
 
         // subscriber に届く
         let mut got_tie = false;
@@ -533,7 +533,7 @@ mod tests {
         assert!(got_tie, "subscriber should receive Tie value=777 via adapter");
 
         drop(eng);
-        for suffix in ["", ".wal", ".crc"] {
+        for suffix in ["", ".oplog", ".crc"] {
             let _ = std::fs::remove_file(format!("{}{}", path, suffix));
         }
     }

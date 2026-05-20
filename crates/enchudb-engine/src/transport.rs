@@ -28,8 +28,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use enchudb_wal::wal::{DecodedOp, RecoveredRecord};
-use enchudb_wal::{Hlc, PeerId};
+use enchudb_oplog::oplog::{DecodedOp, Record};
+use enchudb_oplog::{Hlc, PeerId};
 
 /// peer 間で交換する 1 件の op。
 /// Phase C: signature と pubkey_fp + 署名対象 bytes を同梱する。
@@ -47,8 +47,8 @@ pub struct WireRecord {
     pub signed_bytes: Vec<u8>,
 }
 
-impl From<RecoveredRecord> for WireRecord {
-    fn from(r: RecoveredRecord) -> Self {
+impl From<Record> for WireRecord {
+    fn from(r: Record) -> Self {
         Self {
             hlc: r.hlc,
             author_peer: r.author_peer,
@@ -62,7 +62,7 @@ impl From<RecoveredRecord> for WireRecord {
 
 impl WireRecord {
     /// テスト用: 未署名(署名 slot zero)で WireRecord を作る。
-    /// 本番経路では Wal::iter_committed() 経由で signed な record が来るべき。
+    /// 本番経路では OpLog::iter_committed() 経由で signed な record が来るべき。
     pub fn unsigned(hlc: Hlc, author_peer: PeerId, op: DecodedOp) -> Self {
         Self {
             hlc, author_peer, op,
@@ -449,7 +449,7 @@ impl Transport for InMemoryTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use enchudb_wal::wal::DecodedOp;
+    use enchudb_oplog::oplog::DecodedOp;
 
     fn rec(hlc_wall: u64, peer: PeerId, eid: u64, value: u32) -> WireRecord {
         WireRecord {

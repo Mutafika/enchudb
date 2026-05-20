@@ -8,7 +8,7 @@
 //! cargo run --release --example vs_sqlite
 
 use enchudb::schema::Database;
-use enchudb_wal::EntityId;
+use enchudb_oplog::EntityId;
 use rusqlite::Connection;
 use std::time::Instant;
 

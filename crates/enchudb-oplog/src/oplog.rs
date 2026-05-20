@@ -1,19 +1,24 @@
-//! Write-Ahead Log (v28→v32) — crash consistency for op-based writes.
+//! Operation log (v28→v32) — append-only op stream for peer sync + audit + recovery.
 //!
-//! # v32 変更点(WAL v2)
+//! 0.6.0 で `enchudb-wal` から rename (issue #8)。 実態は write-ahead log では
+//! なく oplog (MongoDB oplog と同パターン): mmap が primary state、 oplog は
+//! 「何が起きたか」 の正準ストリーム。 wire format は v2 で不変、 在野の
+//! file magic は歴史的経緯で `EWAL` のまま (= 既存 file binary 互換のため)。
+//!
+//! # v32 レイアウト (oplog v2)
 //!
 //! - **eid を u64 化**(分散の [peer|local] 合成 ID)
 //! - **HLC スロット**: `(wall:8, logical:4, peer:4)` 全順序用
-//! - **author_peer スロット**: WAL を書いた peer(中継 peer 対応)
+//! - **author_peer スロット**: record を書いた peer(中継 peer 対応)
 //! - **署名スロット(64B)**: ed25519(Phase C で埋める、現状 zeros)
 //! - **pubkey_fp(8B)**: 署名検証に使う pubkey の先頭 8B(現状 zeros)
 //!
-//! 破壊変更: v1 WAL は開けない。v2 magic で判別しエラー。
+//! 破壊変更: v1 record は開けない。v2 magic で判別しエラー。
 //!
 //! # 設計原則
 //!
-//! - **読みは WAL に触らない**(pull_raw / query の 10〜70ns は影響ゼロ)
-//! - **書きは WAL append を memcpy 1 回で済ます**(tie_async の ~1μs を維持)
+//! - **読みは oplog に触らない**(pull_raw / query の 10〜70ns は影響ゼロ)
+//! - **書きは oplog append を memcpy 1 回で済ます**(tie_async の ~1μs を維持)
 //! - **fsync は hot path から外す**(非同期、consumer スレッド側で定期実行)
 //!
 //! # レコード形式(v2)
@@ -27,7 +32,7 @@
 //! [hlc_wall: 8B LE]     HLC wall clock(ms since epoch)
 //! [hlc_logical: 4B LE]  HLC logical counter
 //! [hlc_peer: 4B LE]     HLC peer id
-//! [author_peer: 4B LE]  WAL を書いた peer の id
+//! [author_peer: 4B LE]  record を書いた peer の id
 //! [crc32: 4B LE]        payload の FNV-1a
 //! [signature: 64B]      ed25519 over (header fixed ‖ payload)。現状 zeros。
 //! [pubkey_fp: 8B]       署名に使った pubkey の先頭 8B。現状 zeros。
@@ -44,15 +49,15 @@
 //!
 //! # ファイル配置
 //!
-//! 別ファイル `{db_path}.wal`。sparse mmap、初期 256MB。
+//! 別ファイル `{db_path}.oplog` (0.5.0 までは `.wal`)。 sparse mmap、 初期 256MB。
 //!
 //! ```text
 //! [File header 32B]
-//!   [magic: 4B "EWAL"]
-//!   [version: 4B LE]  = 2
-//!   [head: 8B LE]     writer が atomic 前進
-//!   [checkpoint: 8B LE] consumer が前進(ここまで本体に適用済み)
-//!   [capacity: 8B LE] buffer size
+//!   [magic: 4B "EWAL"]   = 歴史的経緯で wire 不変。
+//!   [version: 4B LE]     = 2
+//!   [head: 8B LE]        writer が atomic 前進
+//!   [checkpoint: 8B LE]  consumer が前進(ここまで本体に適用済み)
+//!   [capacity: 8B LE]    buffer size
 //! [Records starting at offset 32]
 //! ```
 
@@ -67,7 +72,7 @@ use memmap2::MmapMut;
 use crate::{Hlc, PeerId};
 
 const FILE_MAGIC: &[u8; 4] = b"EWAL";
-pub const WAL_FILE_VERSION: u32 = 2;
+pub const OPLOG_FILE_VERSION: u32 = 2;
 pub const HEADER_SIZE: usize = 32;
 
 const REC_MAGIC: &[u8; 2] = b"WL";
@@ -117,7 +122,7 @@ fn signed_payload(
 }
 
 /// WAL 初期サイズ(256MB、sparse なので実ディスク消費は書いた分のみ)。
-pub const DEFAULT_WAL_SIZE: usize = 256 * 1024 * 1024;
+pub const DEFAULT_OPLOG_SIZE: usize = 256 * 1024 * 1024;
 
 /// op_type バイト値。
 pub mod op_type {
@@ -130,10 +135,10 @@ pub mod op_type {
     pub const VOCAB: u8 = 6;  // v33: text vid → bytes 対応を peer 間で運ぶ
 }
 
-/// WAL に書く所有型 op。 `WalOp` の owned 版で、 queue 渡し用 (consumer 側で
+/// WAL に書く所有型 op。 `Op` の owned 版で、 queue 渡し用 (consumer 側で
 /// batch して `append_many` に流す経路で使う)。
 #[derive(Debug, Clone)]
-pub enum WalRecord {
+pub enum OwnedOp {
     Tie { eid: u64, himo_id: u16, value: u32 },
     Untie { eid: u64, himo_id: u16 },
     Delete { eid: u64 },
@@ -142,27 +147,27 @@ pub enum WalRecord {
     Vocab { vid: u32, bytes: Vec<u8> },
 }
 
-impl WalRecord {
-    /// borrow 版 `WalOp` への変換 (append 用)。
-    pub fn as_op(&self) -> WalOp<'_> {
+impl OwnedOp {
+    /// borrow 版 `Op` への変換 (append 用)。
+    pub fn as_op(&self) -> Op<'_> {
         match self {
-            WalRecord::Tie { eid, himo_id, value } =>
-                WalOp::Tie { eid: *eid, himo_id: *himo_id, value: *value },
-            WalRecord::Untie { eid, himo_id } =>
-                WalOp::Untie { eid: *eid, himo_id: *himo_id },
-            WalRecord::Delete { eid } => WalOp::Delete { eid: *eid },
-            WalRecord::Content { eid, key, data } =>
-                WalOp::Content { eid: *eid, key, data },
-            WalRecord::Commit => WalOp::Commit,
-            WalRecord::Vocab { vid, bytes } =>
-                WalOp::Vocab { vid: *vid, bytes },
+            OwnedOp::Tie { eid, himo_id, value } =>
+                Op::Tie { eid: *eid, himo_id: *himo_id, value: *value },
+            OwnedOp::Untie { eid, himo_id } =>
+                Op::Untie { eid: *eid, himo_id: *himo_id },
+            OwnedOp::Delete { eid } => Op::Delete { eid: *eid },
+            OwnedOp::Content { eid, key, data } =>
+                Op::Content { eid: *eid, key, data },
+            OwnedOp::Commit => Op::Commit,
+            OwnedOp::Vocab { vid, bytes } =>
+                Op::Vocab { vid: *vid, bytes },
         }
     }
 }
 
 /// WAL に書く op。eid は u64(v32)。
 #[derive(Debug, Clone)]
-pub enum WalOp<'a> {
+pub enum Op<'a> {
     Tie { eid: u64, himo_id: u16, value: u32 },
     Untie { eid: u64, himo_id: u16 },
     Delete { eid: u64 },
@@ -174,48 +179,48 @@ pub enum WalOp<'a> {
     Vocab { vid: u32, bytes: &'a [u8] },
 }
 
-impl<'a> WalOp<'a> {
+impl<'a> Op<'a> {
     /// payload の byte 数(固定 or 動的)。v2 layout。
     #[inline]
     fn payload_size(&self) -> usize {
         match self {
-            WalOp::Tie { .. } => 16,       // eid(8) + himo_id(2) + pad(2) + value(4)
-            WalOp::Untie { .. } => 16,     // eid(8) + himo_id(2) + pad(6)
-            WalOp::Delete { .. } => 8,     // eid(8)
-            WalOp::Content { key, data, .. } => 8 + 2 + 2 + 4 + key.len() + data.len(),
-            WalOp::Commit => 0,
-            WalOp::Vocab { bytes, .. } => 4 + 4 + bytes.len(), // vid(4) + len(4) + bytes
+            Op::Tie { .. } => 16,       // eid(8) + himo_id(2) + pad(2) + value(4)
+            Op::Untie { .. } => 16,     // eid(8) + himo_id(2) + pad(6)
+            Op::Delete { .. } => 8,     // eid(8)
+            Op::Content { key, data, .. } => 8 + 2 + 2 + 4 + key.len() + data.len(),
+            Op::Commit => 0,
+            Op::Vocab { bytes, .. } => 4 + 4 + bytes.len(), // vid(4) + len(4) + bytes
         }
     }
 
     fn op_byte(&self) -> u8 {
         match self {
-            WalOp::Tie { .. } => op_type::TIE,
-            WalOp::Untie { .. } => op_type::UNTIE,
-            WalOp::Delete { .. } => op_type::DELETE,
-            WalOp::Content { .. } => op_type::CONTENT,
-            WalOp::Commit => op_type::COMMIT,
-            WalOp::Vocab { .. } => op_type::VOCAB,
+            Op::Tie { .. } => op_type::TIE,
+            Op::Untie { .. } => op_type::UNTIE,
+            Op::Delete { .. } => op_type::DELETE,
+            Op::Content { .. } => op_type::CONTENT,
+            Op::Commit => op_type::COMMIT,
+            Op::Vocab { .. } => op_type::VOCAB,
         }
     }
 
     fn write_payload(&self, buf: &mut [u8]) {
         match self {
-            WalOp::Tie { eid, himo_id, value } => {
+            Op::Tie { eid, himo_id, value } => {
                 buf[0..8].copy_from_slice(&eid.to_le_bytes());
                 buf[8..10].copy_from_slice(&himo_id.to_le_bytes());
                 buf[10..12].copy_from_slice(&[0, 0]);
                 buf[12..16].copy_from_slice(&value.to_le_bytes());
             }
-            WalOp::Untie { eid, himo_id } => {
+            Op::Untie { eid, himo_id } => {
                 buf[0..8].copy_from_slice(&eid.to_le_bytes());
                 buf[8..10].copy_from_slice(&himo_id.to_le_bytes());
                 buf[10..16].copy_from_slice(&[0u8; 6]);
             }
-            WalOp::Delete { eid } => {
+            Op::Delete { eid } => {
                 buf[0..8].copy_from_slice(&eid.to_le_bytes());
             }
-            WalOp::Content { eid, key, data } => {
+            Op::Content { eid, key, data } => {
                 buf[0..8].copy_from_slice(&eid.to_le_bytes());
                 let klen = key.len() as u16;
                 let dlen = data.len() as u32;
@@ -227,8 +232,8 @@ impl<'a> WalOp<'a> {
                 buf[ko..do_].copy_from_slice(key.as_bytes());
                 buf[do_..do_ + data.len()].copy_from_slice(data);
             }
-            WalOp::Commit => {}
-            WalOp::Vocab { vid, bytes } => {
+            Op::Commit => {}
+            Op::Vocab { vid, bytes } => {
                 buf[0..4].copy_from_slice(&vid.to_le_bytes());
                 let blen = bytes.len() as u32;
                 buf[4..8].copy_from_slice(&blen.to_le_bytes());
@@ -253,7 +258,7 @@ pub enum DecodedOp {
 /// リカバリ結果の 1 レコード(HLC + 署名込み)。
 /// v32 Phase C: signature と pubkey_fp も含めて返し、Syncer/PubkeyStore で検証できる。
 #[derive(Debug, Clone)]
-pub struct RecoveredRecord {
+pub struct Record {
     pub lsn: u64,
     pub hlc: Hlc,
     pub author_peer: PeerId,
@@ -279,13 +284,13 @@ pub struct RelayedHeader {
 
 /// `flock(LOCK_EX)` 解放用 RAII guard。 drop で `LOCK_UN` を呼ぶ。
 #[cfg(not(target_arch = "wasm32"))]
-struct WalLockGuard<'a> {
+struct OpLogLockGuard<'a> {
     fd: std::os::fd::RawFd,
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-impl Drop for WalLockGuard<'_> {
+impl Drop for OpLogLockGuard<'_> {
     fn drop(&mut self) {
         unsafe {
             let _ = libc::flock(self.fd, libc::LOCK_UN);
@@ -293,7 +298,7 @@ impl Drop for WalLockGuard<'_> {
     }
 }
 
-pub struct Wal {
+pub struct OpLog {
     #[cfg(not(target_arch = "wasm32"))]
     _file: File,
     #[cfg(not(target_arch = "wasm32"))]
@@ -309,7 +314,7 @@ pub struct Wal {
     hlc_logical: std::sync::atomic::AtomicU32,
     /// v32: 最後に書いた HLC wall(ms)。
     hlc_last_wall: AtomicU64,
-    /// v32: この Wal を持つ peer の id(header には書かず Engine から設定)。
+    /// v32: この OpLog を持つ peer の id(header には書かず Engine から設定)。
     peer_id: std::sync::atomic::AtomicU32,
     /// v32 Phase C: ed25519 鍵ペア。set_keypair で設定。None なら署名は zeros。
     keypair: std::sync::RwLock<Option<std::sync::Arc<crate::keys::Keypair>>>,
@@ -322,10 +327,10 @@ pub struct Wal {
     auto_reset: std::sync::atomic::AtomicBool,
 }
 
-unsafe impl Send for Wal {}
-unsafe impl Sync for Wal {}
+unsafe impl Send for OpLog {}
+unsafe impl Sync for OpLog {}
 
-impl Wal {
+impl OpLog {
     /// 新規 WAL ファイル作成。capacity は初期サイズ(bytes)。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create(path: &Path, capacity: usize) -> io::Result<Self> {
@@ -339,7 +344,7 @@ impl Wal {
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
         // ヘッダ初期化
         mmap[0..4].copy_from_slice(FILE_MAGIC);
-        mmap[4..8].copy_from_slice(&WAL_FILE_VERSION.to_le_bytes());
+        mmap[4..8].copy_from_slice(&OPLOG_FILE_VERSION.to_le_bytes());
         mmap[8..16].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes()); // head
         mmap[16..24].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes()); // checkpoint
         mmap[24..32].copy_from_slice(&(capacity as u64).to_le_bytes()); // capacity
@@ -372,10 +377,10 @@ impl Wal {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "bad WAL magic"));
         }
         let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
-        if version != WAL_FILE_VERSION {
+        if version != OPLOG_FILE_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("WAL version {} unsupported (expected {})", version, WAL_FILE_VERSION),
+                format!("WAL version {} unsupported (expected {})", version, OPLOG_FILE_VERSION),
             ));
         }
         let head = u64::from_le_bytes(mmap[8..16].try_into().unwrap());
@@ -452,7 +457,7 @@ impl Wal {
     ///
     /// v30: pending_writes カウンタで try_reset との race を防ぐ。
     /// writer は append 中 +1、完了時 -1。consumer reset は pending==0 時のみ。
-    pub fn append(&self, op: WalOp<'_>) -> io::Result<u64> {
+    pub fn append(&self, op: Op<'_>) -> io::Result<u64> {
         let payload_size = op.payload_size();
         let record_size = REC_HEADER_SIZE + payload_size;
 
@@ -466,7 +471,7 @@ impl Wal {
     /// per-record で `append` を回すと flock(LOCK_EX) syscall が record 数ぶん走るので、
     /// consumer thread が queue を drain して呼ぶことで flock コストを償却できる。
     /// 戻り値は各 record の LSN (順序対応)。
-    pub fn append_many(&self, records: &[WalRecord]) -> io::Result<Vec<u64>> {
+    pub fn append_many(&self, records: &[OwnedOp]) -> io::Result<Vec<u64>> {
         if records.is_empty() { return Ok(Vec::new()); }
         let sizes: Vec<usize> = records.iter()
             .map(|r| REC_HEADER_SIZE + r.as_op().payload_size())
@@ -481,7 +486,7 @@ impl Wal {
 
     fn append_many_inner(
         &self,
-        records: &[WalRecord],
+        records: &[OwnedOp],
         sizes: &[usize],
         total: usize,
     ) -> io::Result<Vec<u64>> {
@@ -583,7 +588,7 @@ impl Wal {
     /// relay 側の (peer, hlc) dedupe が同じ record の二度送りをカットする (= ループ防止)。
     ///
     /// 自プロセスで HLC が後退しないよう、 受信 HLC でローカル HLC clock も merge する。
-    pub fn append_relayed(&self, op: WalOp<'_>, header: RelayedHeader) -> io::Result<u64> {
+    pub fn append_relayed(&self, op: Op<'_>, header: RelayedHeader) -> io::Result<u64> {
         let payload_size = op.payload_size();
         let record_size = REC_HEADER_SIZE + payload_size;
         self.pending_writes.fetch_add(1, Ordering::AcqRel);
@@ -614,13 +619,13 @@ impl Wal {
 
     fn append_inner(
         &self,
-        op: WalOp<'_>,
+        op: Op<'_>,
         payload_size: usize,
         record_size: usize,
         relay: Option<RelayedHeader>,
     ) -> io::Result<u64> {
         // multi-process safety: flock(LOCK_EX) で同じ .wal に対する append を直列化。
-        // 単一 process 内では既に `head` の CAS で並列 OK だが、 別 process の Wal は
+        // 単一 process 内では既に `head` の CAS で並列 OK だが、 別 process の OpLog は
         // 別の process-local AtomicU64 を持つので同 offset に書き込む race がある。
         // git の .git/index.lock 相当。 read 側は lock を取らない。
         #[cfg(not(target_arch = "wasm32"))]
@@ -775,25 +780,25 @@ impl Wal {
     /// v32: HEADER_SIZE から head までを読んで、Commit で挟まれた全レコードを返す。
     /// checkpoint 位置は無視(既に apply 済みの記録もまだ WAL file 上にあれば拾う)。
     /// Syncer.publish_since で使う。ring buffer reset 済みの記録は取れない。
-    pub fn iter_committed(&self) -> Vec<RecoveredRecord> {
+    pub fn iter_committed(&self) -> Vec<Record> {
         self.iter_from_offset(HEADER_SIZE as u64)
     }
 
     /// 指定 offset 以降の commit 済みレコードを返す。changefeed の差分発火用。
     /// `start_offset` は前回 emit 時の `wal.checkpoint()` を渡す想定。
-    pub fn iter_committed_from(&self, start_offset: u64) -> Vec<RecoveredRecord> {
+    pub fn iter_committed_from(&self, start_offset: u64) -> Vec<Record> {
         self.iter_from_offset(start_offset)
     }
 
     /// リカバリ: checkpoint から head までを読んで、Commit で挟まれたグループだけ返す。
     /// CRC 破損レコードに到達したらそこで打ち切り(uncommitted tail の切り捨て)。
-    pub fn recover(&self) -> Vec<RecoveredRecord> {
+    pub fn recover(&self) -> Vec<Record> {
         let start = self.checkpoint.load(Ordering::Acquire);
         self.iter_from_offset(start)
     }
 
     /// 指定 offset から head までを Commit グループ単位で読む。共通実装。
-    fn iter_from_offset(&self, start_offset: u64) -> Vec<RecoveredRecord> {
+    fn iter_from_offset(&self, start_offset: u64) -> Vec<Record> {
         let mut out = Vec::new();
         let mut batch = Vec::new();
         let mut offset = start_offset;
@@ -846,7 +851,7 @@ impl Wal {
                     out.append(&mut batch);
                 }
                 Some(other) => {
-                    batch.push(RecoveredRecord {
+                    batch.push(Record {
                         lsn, hlc, author_peer, op: other,
                         signature, pubkey_fp, signed_bytes,
                     });
@@ -889,14 +894,14 @@ impl Wal {
     /// 解放される。 同じ .wal を別 process が同時に append しようとした場合、 lock
     /// 取得まで block する (典型的に数 µs〜ms)。 read 経路は lock 取らない。
     #[cfg(not(target_arch = "wasm32"))]
-    fn flock_exclusive(&self) -> io::Result<WalLockGuard<'_>> {
+    fn flock_exclusive(&self) -> io::Result<OpLogLockGuard<'_>> {
         use std::os::fd::AsRawFd;
         let fd = self._file.as_raw_fd();
         let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(WalLockGuard { fd, _marker: std::marker::PhantomData })
+        Ok(OpLogLockGuard { fd, _marker: std::marker::PhantomData })
     }
 
     // ---- internal mmap helpers ----
@@ -934,7 +939,7 @@ impl Wal {
     pub fn create_in_memory(capacity: usize) -> Self {
         let mut buf = vec![0u8; capacity];
         buf[0..4].copy_from_slice(FILE_MAGIC);
-        buf[4..8].copy_from_slice(&WAL_FILE_VERSION.to_le_bytes());
+        buf[4..8].copy_from_slice(&OPLOG_FILE_VERSION.to_le_bytes());
         buf[8..16].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
         buf[16..24].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
         buf[24..32].copy_from_slice(&(capacity as u64).to_le_bytes());
@@ -1033,10 +1038,10 @@ mod tests {
     #[test]
     fn create_and_append() {
         let p = tmp("basic");
-        let wal = Wal::create(&p, 1024 * 1024).unwrap();
-        let lsn1 = wal.append(WalOp::Tie { eid: 1, himo_id: 0, value: 42 }).unwrap();
-        let lsn2 = wal.append(WalOp::Untie { eid: 2, himo_id: 1 }).unwrap();
-        let lsn3 = wal.append(WalOp::Commit).unwrap();
+        let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+        let lsn1 = wal.append(Op::Tie { eid: 1, himo_id: 0, value: 42 }).unwrap();
+        let lsn2 = wal.append(Op::Untie { eid: 2, himo_id: 1 }).unwrap();
+        let lsn3 = wal.append(Op::Commit).unwrap();
         assert_eq!(lsn1, 1);
         assert_eq!(lsn2, 2);
         assert_eq!(lsn3, 3);
@@ -1046,14 +1051,14 @@ mod tests {
     #[test]
     fn hlc_monotonic() {
         let p = tmp("hlc");
-        let wal = Wal::create(&p, 1024 * 1024).unwrap();
+        let wal = OpLog::create(&p, 1024 * 1024).unwrap();
         wal.set_peer_id(7);
-        wal.append(WalOp::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
-        wal.append(WalOp::Tie { eid: 2, himo_id: 0, value: 2 }).unwrap();
-        wal.append(WalOp::Commit).unwrap();
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
+        wal.append(Op::Tie { eid: 2, himo_id: 0, value: 2 }).unwrap();
+        wal.append(Op::Commit).unwrap();
         wal.fsync().unwrap();
 
-        let wal = Wal::open(&p).unwrap();
+        let wal = OpLog::open(&p).unwrap();
         let recs = wal.recover();
         assert_eq!(recs.len(), 2);
         // HLC は単調増加
@@ -1068,16 +1073,16 @@ mod tests {
     fn recover_committed_only() {
         let p = tmp("recover");
         {
-            let wal = Wal::create(&p, 1024 * 1024).unwrap();
-            wal.append(WalOp::Tie { eid: 1, himo_id: 0, value: 100 }).unwrap();
-            wal.append(WalOp::Tie { eid: 2, himo_id: 0, value: 200 }).unwrap();
-            wal.append(WalOp::Commit).unwrap();
+            let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+            wal.append(Op::Tie { eid: 1, himo_id: 0, value: 100 }).unwrap();
+            wal.append(Op::Tie { eid: 2, himo_id: 0, value: 200 }).unwrap();
+            wal.append(Op::Commit).unwrap();
             // uncommitted batch
-            wal.append(WalOp::Tie { eid: 3, himo_id: 0, value: 300 }).unwrap();
+            wal.append(Op::Tie { eid: 3, himo_id: 0, value: 300 }).unwrap();
             wal.fsync().unwrap();
         }
 
-        let wal = Wal::open(&p).unwrap();
+        let wal = OpLog::open(&p).unwrap();
         let recs = wal.recover();
         assert_eq!(recs.len(), 2);
         match &recs[0].op {
@@ -1094,12 +1099,12 @@ mod tests {
     fn recover_content() {
         let p = tmp("content");
         {
-            let wal = Wal::create(&p, 1024 * 1024).unwrap();
-            wal.append(WalOp::Content { eid: 7, key: "memo", data: b"hello world" }).unwrap();
-            wal.append(WalOp::Commit).unwrap();
+            let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+            wal.append(Op::Content { eid: 7, key: "memo", data: b"hello world" }).unwrap();
+            wal.append(Op::Commit).unwrap();
             wal.fsync().unwrap();
         }
-        let wal = Wal::open(&p).unwrap();
+        let wal = OpLog::open(&p).unwrap();
         let recs = wal.recover();
         assert_eq!(recs.len(), 1);
         match &recs[0].op {
@@ -1117,9 +1122,9 @@ mod tests {
     fn signature_slot_is_zero() {
         // Phase A: 署名スロットは確保されるが zeros。
         let p = tmp("sig_zero");
-        let wal = Wal::create(&p, 1024 * 1024).unwrap();
-        wal.append(WalOp::Tie { eid: 1, himo_id: 0, value: 42 }).unwrap();
-        wal.append(WalOp::Commit).unwrap();
+        let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 42 }).unwrap();
+        wal.append(Op::Commit).unwrap();
         wal.fsync().unwrap();
 
         // WAL の最初のレコード header を直接読む
@@ -1137,11 +1142,11 @@ mod tests {
     fn checksum_catches_torn_write() {
         let p = tmp("corrupt");
         {
-            let wal = Wal::create(&p, 1024 * 1024).unwrap();
-            wal.append(WalOp::Tie { eid: 1, himo_id: 0, value: 100 }).unwrap();
-            wal.append(WalOp::Commit).unwrap();
-            wal.append(WalOp::Tie { eid: 2, himo_id: 0, value: 999 }).unwrap();
-            wal.append(WalOp::Commit).unwrap();
+            let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+            wal.append(Op::Tie { eid: 1, himo_id: 0, value: 100 }).unwrap();
+            wal.append(Op::Commit).unwrap();
+            wal.append(Op::Tie { eid: 2, himo_id: 0, value: 999 }).unwrap();
+            wal.append(Op::Commit).unwrap();
             wal.fsync().unwrap();
         }
 
@@ -1161,7 +1166,7 @@ mod tests {
             f.write_all(&[b[0] ^ 0xFF]).unwrap();
         }
 
-        let wal = Wal::open(&p).unwrap();
+        let wal = OpLog::open(&p).unwrap();
         let recs = wal.recover();
         // 壊れた地点で打ち切るので、最初の Tie (commit 済み) だけ返る
         assert_eq!(recs.len(), 1);
@@ -1191,16 +1196,16 @@ mod tests {
             f.write_all(&hdr).unwrap();
             f.set_len(1024).unwrap();
         }
-        assert!(Wal::open(&p).is_err(), "v1 WAL should be rejected");
+        assert!(OpLog::open(&p).is_err(), "v1 WAL should be rejected");
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn advance_and_reset_checkpoint() {
         let p = tmp("checkpoint");
-        let wal = Wal::create(&p, 1024 * 1024).unwrap();
-        wal.append(WalOp::Tie { eid: 1, himo_id: 0, value: 50 }).unwrap();
-        wal.append(WalOp::Commit).unwrap();
+        let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 50 }).unwrap();
+        wal.append(Op::Commit).unwrap();
         let head_after = wal.head();
         wal.advance_checkpoint(head_after);
         assert_eq!(wal.checkpoint(), head_after);
@@ -1215,13 +1220,13 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
         let p = tmp("concurrent");
-        let wal = Arc::new(Wal::create(&p, 32 * 1024 * 1024).unwrap());
+        let wal = Arc::new(OpLog::create(&p, 32 * 1024 * 1024).unwrap());
         let mut handles = Vec::new();
         for t in 0..4 {
             let w = wal.clone();
             handles.push(thread::spawn(move || {
                 for i in 0..1000u64 {
-                    w.append(WalOp::Tie {
+                    w.append(Op::Tie {
                         eid: t * 10000 + i,
                         himo_id: 0,
                         value: i as u32,
@@ -1236,30 +1241,30 @@ mod tests {
 
     #[test]
     fn multi_process_append_no_offset_collision() {
-        // 2 つの Wal インスタンスを **同じ** .wal ファイルに対して開き、
+        // 2 つの OpLog インスタンスを **同じ** .wal ファイルに対して開き、
         // それぞれから append する。 flock 排他が効いていれば、 record の
-        // 物理 offset は衝突せず重ならない。 1 process 内の 2 Wal インスタンスは
+        // 物理 offset は衝突せず重ならない。 1 process 内の 2 OpLog インスタンスは
         // 別 process と同じく別 process-local atomic を持つので、 flock なしだと
         // 同じ offset を奪い合って record が破壊される。
         let p = tmp("multi_proc");
         let cap = 4 * 1024 * 1024;
-        let wal_a = Wal::create(&p, cap).unwrap();
-        // 同じ path を別 Wal で再 open (= 別 process emulation)
-        let wal_b = Wal::open(&p).unwrap();
+        let wal_a = OpLog::create(&p, cap).unwrap();
+        // 同じ path を別 OpLog で再 open (= 別 process emulation)
+        let wal_b = OpLog::open(&p).unwrap();
 
         // 交互に append、 lock が無いと head が両 instance で衝突
         for i in 0..200u32 {
             if i % 2 == 0 {
-                wal_a.append(WalOp::Tie { eid: i as u64, himo_id: 0, value: i }).unwrap();
+                wal_a.append(Op::Tie { eid: i as u64, himo_id: 0, value: i }).unwrap();
             } else {
-                wal_b.append(WalOp::Tie { eid: i as u64, himo_id: 1, value: i }).unwrap();
+                wal_b.append(Op::Tie { eid: i as u64, himo_id: 1, value: i }).unwrap();
             }
         }
-        wal_a.append(WalOp::Commit).unwrap();
-        wal_b.append(WalOp::Commit).unwrap();
+        wal_a.append(Op::Commit).unwrap();
+        wal_b.append(Op::Commit).unwrap();
 
         // どちらか経由で recover、 record が 202 個全部見える事を確認
-        let wal_c = Wal::open(&p).unwrap();
+        let wal_c = OpLog::open(&p).unwrap();
         let recs = wal_c.recover();
         let tie_count = recs.iter().filter(|r| matches!(r.op, DecodedOp::Tie { .. })).count();
         assert_eq!(tie_count, 200, "all Tie records should survive flock-serialized append, got {}", tie_count);
@@ -1271,12 +1276,12 @@ mod tests {
     #[test]
     fn try_reset_recycles_wal_space() {
         let p = tmp("ring_reset");
-        let wal = Wal::create(&p, 1024 * 1024).unwrap();
+        let wal = OpLog::create(&p, 1024 * 1024).unwrap();
         wal.set_auto_reset(true);
         for i in 0..100u32 {
-            wal.append(WalOp::Tie { eid: i as u64, himo_id: 0, value: i }).unwrap();
+            wal.append(Op::Tie { eid: i as u64, himo_id: 0, value: i }).unwrap();
         }
-        wal.append(WalOp::Commit).unwrap();
+        wal.append(Op::Commit).unwrap();
         let head_before = wal.head();
         assert!(head_before > HEADER_SIZE as u64);
 
@@ -1287,7 +1292,7 @@ mod tests {
         assert_eq!(wal.head(), HEADER_SIZE as u64);
         assert_eq!(wal.checkpoint(), HEADER_SIZE as u64);
 
-        let lsn = wal.append(WalOp::Tie { eid: 999, himo_id: 0, value: 99 }).unwrap();
+        let lsn = wal.append(Op::Tie { eid: 999, himo_id: 0, value: 99 }).unwrap();
         assert!(lsn > 100);
 
         let _ = std::fs::remove_file(&p);
@@ -1297,15 +1302,15 @@ mod tests {
     fn ring_buffer_long_run_does_not_exhaust() {
         let p = tmp("ring_longrun");
         // v2 はヘッダ 112B / record なので、v1 より大きい容量が必要。
-        let wal = Wal::create(&p, 512 * 1024).unwrap();
+        let wal = OpLog::create(&p, 512 * 1024).unwrap();
         wal.set_auto_reset(true);
 
         for batch in 0..50u32 {
             for i in 0..100u32 {
                 let v = batch * 100 + i;
-                wal.append(WalOp::Tie { eid: v as u64, himo_id: 0, value: v }).unwrap();
+                wal.append(Op::Tie { eid: v as u64, himo_id: 0, value: v }).unwrap();
             }
-            wal.append(WalOp::Commit).unwrap();
+            wal.append(Op::Commit).unwrap();
             wal.advance_checkpoint(wal.head());
             wal.try_reset();
         }
@@ -1317,9 +1322,9 @@ mod tests {
         let p = tmp("full");
         // v2: Tie 1 つ = REC_HEADER 112 + payload 16 = 128B
         // File header 32 + 128 + 余白だけ = 200 確保
-        let wal = Wal::create(&p, HEADER_SIZE + 128 + 50).unwrap();
-        wal.append(WalOp::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
-        let r = wal.append(WalOp::Tie { eid: 2, himo_id: 0, value: 2 });
+        let wal = OpLog::create(&p, HEADER_SIZE + 128 + 50).unwrap();
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
+        let r = wal.append(Op::Tie { eid: 2, himo_id: 0, value: 2 });
         assert!(r.is_err());
         let _ = std::fs::remove_file(&p);
     }

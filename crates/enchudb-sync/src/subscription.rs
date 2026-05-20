@@ -17,7 +17,7 @@
 //! 実現できる。
 
 use enchudb_engine::transport::WireRecord;
-use enchudb_wal::PeerId;
+use enchudb_oplog::PeerId;
 
 /// 「どの peer にどの record を送るか」 の policy。
 ///
@@ -44,13 +44,13 @@ impl SubscriptionFilter for AllRecords {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use enchudb_wal::{wal::DecodedOp, Hlc};
+    use enchudb_oplog::{oplog::DecodedOp, Hlc};
 
     fn rec(hlc_wall: u64, peer: PeerId) -> WireRecord {
         WireRecord {
             hlc: Hlc { wall: hlc_wall, logical: 0, peer },
             author_peer: peer,
-            op: DecodedOp::Tie { eid: enchudb_wal::make_eid(peer, 1), himo_id: 0, value: 1 },
+            op: DecodedOp::Tie { eid: enchudb_oplog::make_eid(peer, 1), himo_id: 0, value: 1 },
             signature: [0u8; 64],
             pubkey_fp: [0u8; 8],
             signed_bytes: Vec::new(),

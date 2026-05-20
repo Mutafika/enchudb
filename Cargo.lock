@@ -933,16 +933,16 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "enchudb"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "criterion",
  "enchudb-engine",
  "enchudb-ffi",
+ "enchudb-oplog",
  "enchudb-schema",
  "enchudb-sql",
  "enchudb-sync",
  "enchudb-transport",
- "enchudb-wal",
  "libc",
  "proptest",
  "rusqlite",
@@ -953,20 +953,20 @@ dependencies = [
 
 [[package]]
 name = "enchudb-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "enchudb-engine",
- "enchudb-wal",
+ "enchudb-oplog",
 ]
 
 [[package]]
 name = "enchudb-engine"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "crossbeam-queue",
  "ed25519-dalek",
- "enchudb-wal",
+ "enchudb-oplog",
  "libc",
  "memmap2",
  "rand_core 0.6.4",
@@ -976,17 +976,28 @@ dependencies = [
 
 [[package]]
 name = "enchudb-ffi"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "enchudb-sql",
 ]
 
 [[package]]
+name = "enchudb-oplog"
+version = "0.6.0"
+dependencies = [
+ "ed25519-dalek",
+ "libc",
+ "memmap2",
+ "rand_core 0.6.4",
+ "sha2",
+]
+
+[[package]]
 name = "enchudb-rag"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "enchudb",
- "enchudb-wal",
+ "enchudb-oplog",
  "fastembed",
  "memmap2",
  "rand 0.8.6",
@@ -994,58 +1005,47 @@ dependencies = [
 
 [[package]]
 name = "enchudb-schema"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "enchudb-engine",
- "enchudb-wal",
+ "enchudb-oplog",
 ]
 
 [[package]]
 name = "enchudb-sql"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "enchudb-engine",
+ "enchudb-oplog",
  "enchudb-schema",
- "enchudb-wal",
  "sqlparser",
 ]
 
 [[package]]
 name = "enchudb-sync"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "enchudb-engine",
- "enchudb-wal",
+ "enchudb-oplog",
 ]
 
 [[package]]
 name = "enchudb-text"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "memmap2",
 ]
 
 [[package]]
 name = "enchudb-transport"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "enchudb",
- "enchudb-wal",
+ "enchudb-oplog",
  "sabitori",
  "sabitori-core",
  "sabitori-style",
  "tungstenite",
-]
-
-[[package]]
-name = "enchudb-wal"
-version = "0.5.0"
-dependencies = [
- "ed25519-dalek",
- "libc",
- "memmap2",
- "rand_core 0.6.4",
- "sha2",
 ]
 
 [[package]]

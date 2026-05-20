@@ -52,14 +52,14 @@ fn tmp(tag: &str) -> String {
             .unwrap()
             .as_nanos()
     );
-    for suffix in ["", ".wal", ".crc"] {
+    for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", p, suffix));
     }
     p
 }
 
 fn cleanup(path: &str) {
-    for suffix in ["", ".wal", ".crc"] {
+    for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", path, suffix));
     }
 }
@@ -198,7 +198,7 @@ fn bench_snapshot_export(c: &mut Criterion) {
                 let files = eng.snapshot_export(black_box(&target)).unwrap();
                 black_box(&files);
                 // cleanup
-                for suffix in ["", ".wal", ".crc"] {
+                for suffix in ["", ".oplog", ".crc"] {
                     let _ = std::fs::remove_file(format!("{}{}", target, suffix));
                 }
             },
@@ -223,15 +223,15 @@ fn bench_audit(c: &mut Criterion) {
         eng.define_himo("v", HimoType::Number, 100);
         eng.flush().unwrap();
     }
-    let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(1);
     for i in 0..1_000u32 {
         let e = eng.entity();
         eng.tie_async(e, "v", i % 100);
     }
-    eng.wal_commit();
+    eng.oplog_commit();
     eng.flush_writes();
-    eng.wal_sync().unwrap();
+    eng.oplog_sync().unwrap();
 
     let mut group = c.benchmark_group("audit");
     group.throughput(Throughput::Elements(1_000));
@@ -261,7 +261,7 @@ fn bench_tie_async(c: &mut Criterion) {
         eng.flush().unwrap();
     }
     let eng: Arc<Engine> =
-        Engine::open_concurrent_with_wal(&path, 64 * 1024 * 1024).unwrap();
+        Engine::open_concurrent_with_oplog(&path, 64 * 1024 * 1024).unwrap();
     eng.set_peer_id(1);
 
     // 1 entity を事前確保して reuse する。 `b.iter` は warmup + 100 samples で

@@ -23,7 +23,7 @@ fn tmp_path(tag: &str) -> String {
 }
 
 fn cleanup(path: &str) {
-    for suffix in ["", ".wal", ".crc", ".db.lock", ".tables", ".tables.tmp"] {
+    for suffix in ["", ".oplog", ".crc", ".db.lock", ".tables", ".tables.tmp"] {
         let _ = std::fs::remove_file(format!("{}{}", path, suffix));
     }
 }
@@ -69,12 +69,12 @@ fn sns_workload_10_tables_5_himos_each() {
     // table 間の隔離: t0.h0 に t3 の eid は混ざってない
     let rows = eng.pull_raw("t0.h0", 50);
     for &e in &rows {
-        let local = enchudb_wal::eid_local(e);
+        let local = enchudb_oplog::eid_local(e);
         assert!(local < 10_000, "t0 eid {} should be in [0, 10k)", local);
     }
     let rows = eng.pull_raw("t3.h0", 50);
     for &e in &rows {
-        let local = enchudb_wal::eid_local(e);
+        let local = enchudb_oplog::eid_local(e);
         assert!(
             local >= 30_000 && local < 40_000,
             "t3 eid {} should be in [30k, 40k)",
@@ -116,7 +116,7 @@ fn sns_workload_with_fk_refs() {
         let p = eng.entity_in("post").unwrap();
         let author = users[i as usize % users.len()];
         eng.tie(p, "post.body", i);
-        eng.tie(p, "post.author", enchudb_wal::eid_local(author));
+        eng.tie(p, "post.author", enchudb_oplog::eid_local(author));
         p
     }).collect();
 
@@ -125,21 +125,21 @@ fn sns_workload_with_fk_refs() {
         let l = eng.entity_in("like").unwrap();
         let from = users[i % users.len()];
         let to = posts[i % posts.len()];
-        eng.tie(l, "like.from", enchudb_wal::eid_local(from));
-        eng.tie(l, "like.to", enchudb_wal::eid_local(to));
+        eng.tie(l, "like.from", enchudb_oplog::eid_local(from));
+        eng.tie(l, "like.to", enchudb_oplog::eid_local(to));
     }
 
     eng.flush().unwrap();
 
     // FK 経由の query: alice の post 一覧
     let alice = users[0];
-    let alice_local = enchudb_wal::eid_local(alice);
+    let alice_local = enchudb_oplog::eid_local(alice);
     let alice_posts = eng.pull_raw("post.author", alice_local);
     assert_eq!(alice_posts.len(), 5, "alice should have 5 posts");
 
     // FK violation: post の eid (= user range 外) を author に渡す → panic
     let some_post = posts[0];
-    let some_post_local = enchudb_wal::eid_local(some_post);
+    let some_post_local = enchudb_oplog::eid_local(some_post);
     let new_post = eng.entity_in("post").unwrap();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         eng.tie(new_post, "post.author", some_post_local);

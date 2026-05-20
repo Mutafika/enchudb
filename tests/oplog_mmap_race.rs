@@ -13,7 +13,7 @@
 //!
 //! 走らせ方:
 //!   cargo build --bin crash_writer -p enchudb-engine
-//!   cargo test --test wal_mmap_race -- --ignored
+//!   cargo test --test oplog_mmap_race -- --ignored
 //!
 //! `#[ignore]` で default skip。 fix 未着手の間は CI に流さない。
 
@@ -34,7 +34,7 @@ fn tmp(name: &str) -> String {
 
 fn cleanup(path: &str) {
     let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{}.wal", path));
+    let _ = std::fs::remove_file(format!("{}.oplog", path));
     let _ = std::fs::remove_file(format!("{}.crc", path));
 }
 
@@ -102,16 +102,16 @@ fn mmap_ahead_of_wal_silent_sync_loss() {
 
     // WAL audit: 当該 op (Tie) は記録されてない (fsync 前に abort、 buffer のみ)
     // open_standalone は WAL を見ないので、 raw fs で WAL ファイル size 確認
-    let wal_path = format!("{}.wal", path);
-    if let Ok(meta) = std::fs::metadata(&wal_path) {
+    let oplog_path = format!("{}.oplog", path);
+    if let Ok(meta) = std::fs::metadata(&oplog_path) {
         // WAL ヘッダ分 + checkpoint marker (前 phase の flush 由来) は載っているが、
         // mmap_ahead での Tie op は載ってないことを確認するため、 WAL を open して
         // recover() で record 数を見る。
-        let wal = enchudb_wal::wal::Wal::open(std::path::Path::new(&wal_path)).unwrap();
+        let wal = enchudb_oplog::oplog::OpLog::open(std::path::Path::new(&oplog_path)).unwrap();
         let records = wal.recover();
         // Tie op が含まれているか (=race が「閉じてる」= 期待外)
         let has_tie = records.iter().any(|r| {
-            matches!(&r.op, enchudb_wal::wal::DecodedOp::Tie { .. })
+            matches!(&r.op, enchudb_oplog::oplog::DecodedOp::Tie { .. })
         });
         assert!(
             !has_tie,
@@ -130,12 +130,12 @@ fn mmap_ahead_of_wal_silent_sync_loss() {
     cleanup(&path);
 }
 
-/// 比較対象: `wal_sync()` を呼んだ後の abort なら mmap も WAL も整合的に残る。
+/// 比較対象: `oplog_sync()` を呼んだ後の abort なら mmap も WAL も整合的に残る。
 /// (race は閉じる、 = explicit sync が機能している証明)
 #[test]
 #[ignore]
-fn wal_sync_closes_race_window() {
-    let path = tmp("wal_sync");
+fn oplog_sync_closes_race_window() {
+    let path = tmp("oplog_sync");
 
     {
         let mut eng = enchudb::Engine::create_with_capacity(&path, 1024).unwrap();
@@ -143,7 +143,7 @@ fn wal_sync_closes_race_window() {
         eng.flush().unwrap();
     }
 
-    // crash_writer の "normal" scenario は wal_sync を呼ぶ
+    // crash_writer の "normal" scenario は oplog_sync を呼ぶ
     let status = Command::new(crash_writer_bin())
         .args([&path, "normal", "1"])
         .stdout(Stdio::null())
@@ -156,16 +156,16 @@ fn wal_sync_closes_race_window() {
     let eids = eng.pull_raw("n", 0);
     assert!(!eids.is_empty(), "mmap should have value");
 
-    let wal_path = format!("{}.wal", path);
-    let wal = enchudb_wal::wal::Wal::open(std::path::Path::new(&wal_path)).unwrap();
+    let oplog_path = format!("{}.oplog", path);
+    let wal = enchudb_oplog::oplog::OpLog::open(std::path::Path::new(&oplog_path)).unwrap();
     let records = wal.recover();
     let has_tie = records
         .iter()
-        .any(|r| matches!(&r.op, enchudb_wal::wal::DecodedOp::Tie { .. }));
-    // wal_sync 経由なら durable に Tie が記録される
+        .any(|r| matches!(&r.op, enchudb_oplog::oplog::DecodedOp::Tie { .. }));
+    // oplog_sync 経由なら durable に Tie が記録される
     assert!(
         has_tie || records.is_empty(),
-        "wal_sync path should be consistent (Tie in WAL or checkpoint already advanced)"
+        "oplog_sync path should be consistent (Tie in WAL or checkpoint already advanced)"
     );
 
     cleanup(&path);

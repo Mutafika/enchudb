@@ -14,12 +14,12 @@ use std::sync::Arc;
 fn flush_writes_waits_for_all_ties_including_entity_created_path() {
     let path = "/tmp/test_flush_barrier.db";
     let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{path}.wal"));
+    let _ = std::fs::remove_file(format!("{path}.oplog"));
     let _ = std::fs::remove_file(format!("{path}.lock"));
 
     // queue_cap を小さめに絞って consumer の drain が writer に追いつかない
     // 状況を作る。
-    let eng: Arc<Engine> = Engine::create_concurrent_with_wal_queue_cap(
+    let eng: Arc<Engine> = Engine::create_concurrent_with_oplog_queue_cap(
         path,
         16 * 1024 * 1024,
         1024,
