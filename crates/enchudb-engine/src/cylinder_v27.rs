@@ -66,7 +66,8 @@ impl BucketPositions {
     }
 
     /// eid_offset を返す。 空 (まだ何も set されてない) なら `u32::MAX`。
-    #[inline]
+    #[allow(dead_code)]
+    #[inline(always)]
     fn eid_offset(&self) -> u32 {
         match self {
             Self::Heap { eid_offset, .. } => *eid_offset,
@@ -75,7 +76,7 @@ impl BucketPositions {
     }
 
     /// eid の (value, idx) を取得。 範囲外 / sentinel なら None。
-    #[inline]
+    #[inline(always)]
     fn get(&self, eid: u32) -> Option<(u32, u32)> {
         match self {
             Self::Heap { entries, eid_offset } => {
@@ -95,7 +96,7 @@ impl BucketPositions {
 
     /// eid に (value, idx) を書き込む。 必要なら range を伸ばす。
     /// Region mode で eid < eid_offset の場合は panic (PositionsRegion 仕様)。
-    #[inline]
+    #[inline(always)]
     fn set(&mut self, eid: u32, value: u32, idx: u32) {
         match self {
             Self::Heap { entries, eid_offset } => {
@@ -110,7 +111,7 @@ impl BucketPositions {
     }
 
     /// 既存 entry の idx だけ更新 (swap_remove で末尾と入れ替わった entity 用)。
-    #[inline]
+    #[inline(always)]
     fn update_idx(&mut self, eid: u32, new_idx: u32) {
         match self {
             Self::Heap { entries, eid_offset } => {
@@ -130,7 +131,7 @@ impl BucketPositions {
     }
 
     /// eid の entry を空にする (sentinel に戻す)。
-    #[inline]
+    #[inline(always)]
     fn clear(&mut self, eid: u32) {
         match self {
             Self::Heap { entries, eid_offset } => {
@@ -255,14 +256,17 @@ impl BucketCylinder {
 
         let mut delta = UniqueDelta::NONE;
 
-        // 既存 entry を取り出す (positions には触らずに get だけ)。
-        if let Some((old_value, old_idx)) = self.positions.get(eid) {
+        // 既存 entry を 1 回だけ調べる (= 2 回 get していたのを潰す)
+        let was_tied = if let Some((old_value, old_idx)) = self.positions.get(eid) {
             let was_last = self.location_len(old_value) == 1;
             self.swap_remove_at(old_value, old_idx);
             if was_last {
                 delta.removed += 1;
             }
-        }
+            true
+        } else {
+            false
+        };
 
         self.ensure_bucket(value);
         let was_empty = self.location_len(value) == 0;
@@ -271,10 +275,8 @@ impl BucketCylinder {
             delta.added += 1;
         }
 
-        // 新しい (value, idx) を書き込み (set が range 伸長を担う)
-        let prev = self.positions.get(eid).is_some();
         self.positions.set(eid, value, idx);
-        if !prev {
+        if !was_tied {
             self.total += 1;
         }
 

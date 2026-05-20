@@ -139,16 +139,20 @@ impl PositionsRegion {
         u32::from_le_bytes(mm[H_MAX_OFFSET..H_MAX_OFFSET + 4].try_into().unwrap())
     }
 
+    #[inline(always)]
     fn set_eid_offset(&self, v: u32) {
         let mm = self.region.slice_mut();
         mm[H_EID_OFFSET..H_EID_OFFSET + 4].copy_from_slice(&v.to_le_bytes());
-        self.region.mark_dirty(H_EID_OFFSET, 4);
+        // mark_dirty は hot path コスト (2 atomic ops/call) なので、 PositionsRegion
+        // は per-write 通知をしない。 positions は column から再構築可能な derived
+        // state なので、 crash 後の不整合は次 open の lazy rebuild が直す。
+        // 永続性が必要な flush() 時は PositionsSidecar が full-file msync する。
     }
 
+    #[inline(always)]
     fn set_max_offset(&self, v: u32) {
         let mm = self.region.slice_mut();
         mm[H_MAX_OFFSET..H_MAX_OFFSET + 4].copy_from_slice(&v.to_le_bytes());
-        self.region.mark_dirty(H_MAX_OFFSET, 4);
     }
 
     /// 論理長 (= 既知の eid range の幅)。 entries[0..len()] が valid index 範囲。
@@ -162,7 +166,7 @@ impl PositionsRegion {
     }
 
     /// eid に対応する (value, idx) を返す。 範囲外 / 空 / sentinel なら None。
-    #[inline]
+    #[inline(always)]
     pub fn get(&self, eid: u32) -> Option<(u32, u32)> {
         let off = self.eid_offset();
         if off == EMPTY_EID_OFFSET || eid < off {
@@ -186,6 +190,7 @@ impl PositionsRegion {
 
     /// (value, idx) を書き込む。 eid_offset 未設定なら eid に確定。
     /// eid < eid_offset の場合は panic (旧 prepend は許容しない)。
+    #[inline(always)]
     pub fn set(&self, eid: u32, value: u32, idx: u32) {
         debug_assert!(value != EMPTY_VALUE, "set: value must be < EMPTY_VALUE");
         let off = self.eid_offset();
@@ -212,6 +217,7 @@ impl PositionsRegion {
 
     /// 既存 entry の idx だけ更新 (swap_remove で末尾と入れ替わった entity 用)。
     /// 範囲外なら no-op。
+    #[inline(always)]
     pub fn update_idx(&self, eid: u32, new_idx: u32) {
         let off = self.eid_offset();
         if off == EMPTY_EID_OFFSET || eid < off {
@@ -233,6 +239,7 @@ impl PositionsRegion {
     }
 
     /// eid の entry を空にする (sentinel に戻す)。 範囲外なら no-op。
+    #[inline(always)]
     pub fn clear(&self, eid: u32) {
         let off = self.eid_offset();
         if off == EMPTY_EID_OFFSET || eid < off {
@@ -269,13 +276,13 @@ impl PositionsRegion {
         (val, idx)
     }
 
-    #[inline]
+    #[inline(always)]
     fn write_entry(&self, idx_in_arr: u32, value: u32, idx: u32) {
         let off = HEADER + (idx_in_arr as usize) * ENTRY_SIZE;
         let mm = self.region.slice_mut();
         mm[off..off + 4].copy_from_slice(&value.to_le_bytes());
         mm[off + 4..off + 8].copy_from_slice(&idx.to_le_bytes());
-        self.region.mark_dirty(off, ENTRY_SIZE);
+        // mark_dirty 省略 (rationale: set_eid_offset コメント参照)
     }
 
     /// idx_in_arr が region 範囲内で書き込めるよう、 必要なら commit を伸ばす +

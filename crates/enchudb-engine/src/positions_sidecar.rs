@@ -145,9 +145,19 @@ impl PositionsSidecar {
         PositionsRegion::has_valid_magic(&region)
     }
 
-    /// flush_dirty を呼んで sidecar を msync。 main file の flush と一緒に呼ぶ。
+    /// 全 committed 範囲を msync。 main file の flush と一緒に呼ぶ。
+    ///
+    /// PositionsRegion 側は hot path 短縮のため per-write `mark_dirty` を省く設計
+    /// (positions は column から rebuild 可能な derived state なので crash 後の
+    /// 不整合は次 open で直る)。 flush は dirty range 不明なので committed 全域
+    /// を msync する。 sidecar は max_himos × slot_size × 8 byte/eid を予約するが、
+    /// 実 commit は触った range だけ伸びるので、 msync 範囲はワーキング set 比例。
     pub fn flush(&self) -> io::Result<()> {
-        self.grower.flush_dirty()
+        let committed = self.grower.committed();
+        if committed == 0 {
+            return Ok(());
+        }
+        self.grower.flush(0, committed)
     }
 
     pub fn slot_size(&self) -> usize {
