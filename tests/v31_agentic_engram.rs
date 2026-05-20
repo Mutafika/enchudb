@@ -34,14 +34,14 @@ use std::sync::Arc;
 fn tmp(name: &str) -> String {
     let p = format!("/tmp/enchudb-v31-engram-{}-{}", name, std::process::id());
     let _ = std::fs::remove_file(&p);
-    let _ = std::fs::remove_file(format!("{}.wal", p));
+    let _ = std::fs::remove_file(format!("{}.oplog", p));
     let _ = std::fs::remove_file(format!("{}.crc", p));
     p
 }
 
 fn cleanup(path: &str) {
     let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{}.wal", path));
+    let _ = std::fs::remove_file(format!("{}.oplog", path));
     let _ = std::fs::remove_file(format!("{}.crc", path));
 }
 

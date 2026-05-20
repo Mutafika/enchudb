@@ -14,7 +14,7 @@ fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "default".to_string());
     let path = format!("/tmp/enchudb_open_profile_{}.db", mode);
     let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(format!("{}.wal", path));
+    let _ = std::fs::remove_file(format!("{}.oplog", path));
     let _ = std::fs::remove_file(format!("{}.crc", path));
 
     // Phase 1: build a non-empty DB (count > 0 になるよう tag を insert)
@@ -64,6 +64,6 @@ fn main() {
     eprintln!("[open_profile] total open wall-clock: {} ms", t0.elapsed().as_millis());
 
     let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(format!("{}.wal", path));
+    let _ = std::fs::remove_file(format!("{}.oplog", path));
     let _ = std::fs::remove_file(format!("{}.crc", path));
 }

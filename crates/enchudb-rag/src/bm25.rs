@@ -15,7 +15,7 @@
 //!
 //!   rrf_score(d) = Σ_l 1 / (k + rank_l(d))
 
-use enchudb_wal::EntityId;
+use enchudb_oplog::EntityId;
 use std::collections::HashMap;
 
 const BM25_K1: f32 = 1.2;

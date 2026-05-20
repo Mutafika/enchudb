@@ -47,7 +47,7 @@ impl std::fmt::Display for GroupKey {
 
 #[derive(Debug)]
 pub enum QueryResult {
-    Entities(Vec<enchudb_wal::EntityId>),
+    Entities(Vec<enchudb_oplog::EntityId>),
     Count(usize),
     Sum(u64),
     Avg(Option<u64>),
@@ -59,8 +59,8 @@ pub enum QueryResult {
     GroupAvg(Vec<(GroupKey, u64)>),
     GroupMin(Vec<(GroupKey, u32)>),
     GroupMax(Vec<(GroupKey, u32)>),
-    Inserted(enchudb_wal::EntityId),
-    Updated(enchudb_wal::EntityId),
+    Inserted(enchudb_oplog::EntityId),
+    Updated(enchudb_oplog::EntityId),
     Deleted,
     Error(String),
 }
@@ -180,14 +180,14 @@ fn parse_cond(eng: &Engine, himo: &str, val: &str) -> Result<Cond, String> {
     Ok(Cond::Eq(himo.to_string(), v))
 }
 
-fn eval_conds(eng: &Engine, conds: &[Cond]) -> Vec<enchudb_wal::EntityId> {
+fn eval_conds(eng: &Engine, conds: &[Cond]) -> Vec<enchudb_oplog::EntityId> {
     // Eq だけ集めて query() に流す。Range は post-filter。
     let eq_pairs: Vec<(&str, u32)> = conds.iter().filter_map(|c| match c {
         Cond::Eq(h, v) => Some((h.as_str(), *v)),
         _ => None,
     }).collect();
 
-    let mut eids: Vec<enchudb_wal::EntityId> = if !eq_pairs.is_empty() {
+    let mut eids: Vec<enchudb_oplog::EntityId> = if !eq_pairs.is_empty() {
         eng.query(&eq_pairs)
     } else {
         // 全部 Range のとき、最初の Range で起点
@@ -217,7 +217,7 @@ fn eval_conds(eng: &Engine, conds: &[Cond]) -> Vec<enchudb_wal::EntityId> {
 
 // ────────────── ステージ適用 ──────────────
 
-fn apply_stages(eng: &Engine, eids: Vec<enchudb_wal::EntityId>, stages: &[&str]) -> QueryResult {
+fn apply_stages(eng: &Engine, eids: Vec<enchudb_oplog::EntityId>, stages: &[&str]) -> QueryResult {
     if stages.is_empty() {
         return QueryResult::Entities(eids);
     }
@@ -263,7 +263,7 @@ fn split_stage(stage: &str) -> (&str, Option<&str>) {
     (op, arg)
 }
 
-fn apply_simple(eng: &Engine, eids: &[enchudb_wal::EntityId], op: &str, arg: Option<&str>) -> QueryResult {
+fn apply_simple(eng: &Engine, eids: &[enchudb_oplog::EntityId], op: &str, arg: Option<&str>) -> QueryResult {
     match op {
         "count" => QueryResult::Count(eids.len()),
         "sum" => match arg {
@@ -299,7 +299,7 @@ fn apply_simple(eng: &Engine, eids: &[enchudb_wal::EntityId], op: &str, arg: Opt
 
 fn apply_group(
     eng: &Engine,
-    eids: &[enchudb_wal::EntityId],
+    eids: &[enchudb_oplog::EntityId],
     group_himo: &str,
     agg_op: &str,
     agg_arg: Option<&str>,
@@ -383,7 +383,7 @@ fn exec_update(eng: &mut Engine, input: &str) -> QueryResult {
     let mut it = input.splitn(2, char::is_whitespace);
     let eid_str = match it.next() { Some(s) if !s.is_empty() => s, _ => return QueryResult::Error("update: missing eid".into()) };
     let rest = it.next().unwrap_or("").trim();
-    let eid: enchudb_wal::EntityId = match eid_str.parse() {
+    let eid: enchudb_oplog::EntityId = match eid_str.parse() {
         Ok(e) => e,
         Err(_) => return QueryResult::Error(format!("update: invalid eid: {eid_str}")),
     };
@@ -405,7 +405,7 @@ fn exec_update(eng: &mut Engine, input: &str) -> QueryResult {
 }
 
 fn exec_delete(eng: &mut Engine, input: &str) -> QueryResult {
-    match input.parse::<enchudb_wal::EntityId>() {
+    match input.parse::<enchudb_oplog::EntityId>() {
         Ok(eid) => { eng.delete(eid); QueryResult::Deleted }
         Err(_) => QueryResult::Error(format!("invalid id: {input}")),
     }

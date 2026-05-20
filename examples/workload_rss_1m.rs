@@ -117,7 +117,7 @@ fn main() {
     let path = "/tmp/enchudb_workload_rss_1m.db";
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{}.crc", path));
-    let _ = std::fs::remove_file(format!("{}.wal", path));
+    let _ = std::fs::remove_file(format!("{}.oplog", path));
 
     let t0 = Instant::now();
     snap("baseline", t0);
@@ -181,5 +181,5 @@ fn main() {
 
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{}.crc", path));
-    let _ = std::fs::remove_file(format!("{}.wal", path));
+    let _ = std::fs::remove_file(format!("{}.oplog", path));
 }

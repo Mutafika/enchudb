@@ -1,6 +1,6 @@
 [package]
 name = "enchudb-transport"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "Transport implementations for enchudb — HTTP (std-only) and WebSocket (tungstenite)."
 license-file = "LICENSE.md"
@@ -13,7 +13,7 @@ ws = ["dep:tungstenite"]
 
 [dependencies]
 enchudb = { path = "../.." }
-enchudb-wal = { path = "../enchudb-wal" }
+enchudb-oplog = { path = "../enchudb-oplog" }
 tungstenite = { version = "0.24", optional = true, default-features = false, features = ["handshake"] }
 
 [dev-dependencies]

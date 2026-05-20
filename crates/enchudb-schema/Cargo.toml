@@ -1,6 +1,6 @@
 [package]
 name = "enchudb-schema"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "EnchuDB 仮想 2D テーブル層 — native API。 schema を declare すると himo_id が pre-resolve されて、 query / insert は名前 lookup なしで engine に直 dispatch される。"
 license-file = "LICENSE.md"
@@ -8,5 +8,5 @@ authors = ["mutafika"]
 repository = "https://github.com/mutafika/enchudb"
 
 [dependencies]
-enchudb-wal = { path = "../enchudb-wal" }
+enchudb-oplog = { path = "../enchudb-oplog" }
 enchudb-engine = { path = "../enchudb-engine" }

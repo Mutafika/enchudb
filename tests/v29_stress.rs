@@ -13,14 +13,14 @@ use std::time::{Duration, Instant};
 fn tmp(name: &str) -> String {
     let p = format!("/tmp/enchudb-v29-stress-{}-{}", name, std::process::id());
     let _ = std::fs::remove_file(&p);
-    let _ = std::fs::remove_file(format!("{}.wal", p));
+    let _ = std::fs::remove_file(format!("{}.oplog", p));
     let _ = std::fs::remove_file(format!("{}.crc", p));
     p
 }
 
 fn cleanup(path: &str) {
     let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{}.wal", path));
+    let _ = std::fs::remove_file(format!("{}.oplog", path));
     let _ = std::fs::remove_file(format!("{}.crc", path));
 }
 
@@ -34,16 +34,16 @@ fn sustained_10k_writes_and_reopen() {
         e.flush().unwrap();
     }
 
-    let eng = Engine::open_concurrent_with_wal(&path, 64 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&path, 64 * 1024 * 1024).unwrap();
     for i in 0..10_000u32 {
         let ent = eng.entity();
         eng.tie_async(ent, "v", i % 100);
     }
     eng.flush_writes();
-    eng.wal_sync().unwrap();
+    eng.oplog_sync().unwrap();
     drop(eng);
 
-    let eng = Engine::open_concurrent_with_wal(&path, 64 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&path, 64 * 1024 * 1024).unwrap();
     assert_eq!(eng.entity_count(), 10_000);
     drop(eng);
     cleanup(&path);
@@ -59,7 +59,7 @@ fn parallel_10_writers() {
         e.flush().unwrap();
     }
 
-    let eng = Engine::open_concurrent_with_wal(&path, 128 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&path, 128 * 1024 * 1024).unwrap();
     let mut handles = Vec::new();
     for t in 0..10u32 {
         let e = Arc::clone(&eng);
@@ -72,11 +72,11 @@ fn parallel_10_writers() {
     }
     for h in handles { h.join().unwrap(); }
     eng.flush_writes();
-    eng.wal_sync().unwrap();
+    eng.oplog_sync().unwrap();
     let total = eng.entity_count();
     drop(eng);
 
-    let eng = Engine::open_concurrent_with_wal(&path, 128 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&path, 128 * 1024 * 1024).unwrap();
     assert_eq!(eng.entity_count(), total, "parallel writes should survive reopen");
     assert_eq!(total, 10_000);
     drop(eng);
@@ -84,7 +84,7 @@ fn parallel_10_writers() {
 }
 
 /// tie / untie / delete 混在 + 繰り返し kill-recover サイクル。
-/// 各サイクル: 1000 書き込み + wal_sync + drop + reopen + 次のサイクル。
+/// 各サイクル: 1000 書き込み + oplog_sync + drop + reopen + 次のサイクル。
 #[test]
 fn repeated_drop_recover_cycles() {
     let path = tmp("cycles");
@@ -97,17 +97,17 @@ fn repeated_drop_recover_cycles() {
     let cycles = 20;
     let per_cycle = 500;
     for cycle in 0..cycles {
-        let eng = Engine::open_concurrent_with_wal(&path, 64 * 1024 * 1024).unwrap();
+        let eng = Engine::open_concurrent_with_oplog(&path, 64 * 1024 * 1024).unwrap();
         for i in 0..per_cycle {
             let ent = eng.entity();
             eng.tie_async(ent, "v", (cycle * 1000 + i) as u32);
         }
         eng.flush_writes();
-        eng.wal_sync().unwrap();
+        eng.oplog_sync().unwrap();
         drop(eng);
     }
 
-    let eng = Engine::open_concurrent_with_wal(&path, 64 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&path, 64 * 1024 * 1024).unwrap();
     assert_eq!(eng.entity_count(), (cycles * per_cycle) as u32);
     drop(eng);
     cleanup(&path);
@@ -123,7 +123,7 @@ fn content_heavy_load() {
         e.flush().unwrap();
     }
 
-    let eng = Engine::open_concurrent_with_wal(&path, 64 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&path, 64 * 1024 * 1024).unwrap();
     let payload: Vec<u8> = (0..1024u16).map(|i| (i & 0xff) as u8).collect();
     for i in 0..1000u32 {
         let ent = eng.entity();
@@ -131,10 +131,10 @@ fn content_heavy_load() {
         eng.content_async(ent, "blob", &payload);
     }
     eng.flush_writes();
-    eng.wal_sync().unwrap();
+    eng.oplog_sync().unwrap();
     drop(eng);
 
-    let eng = Engine::open_concurrent_with_wal(&path, 64 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&path, 64 * 1024 * 1024).unwrap();
     for i in 0..1000u64 {
         let c = eng.get_content(i, "blob").expect("content missing");
         assert_eq!(c, payload.as_slice(), "content {} corrupted", i);
@@ -158,14 +158,14 @@ fn heavy_1m_writes() {
         e.flush().unwrap();
     }
 
-    let eng = Engine::open_concurrent_with_wal(&path, 512 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&path, 512 * 1024 * 1024).unwrap();
     let t0 = Instant::now();
     for i in 0..1_000_000u32 {
         let ent = eng.entity();
         eng.tie_async(ent, "v", i % 10_000);
     }
     eng.flush_writes();
-    eng.wal_sync().unwrap();
+    eng.oplog_sync().unwrap();
     let el = t0.elapsed();
     println!("1M writes: {:?} ({:.0} ops/s)", el, 1e6 / el.as_secs_f64());
 
@@ -174,7 +174,7 @@ fn heavy_1m_writes() {
     drop(eng);
 
     let t0 = Instant::now();
-    let eng = Engine::open_concurrent_with_wal(&path, 512 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&path, 512 * 1024 * 1024).unwrap();
     println!("reopen 1M: {:?}", t0.elapsed());
     assert_eq!(eng.entity_count(), 1_000_000);
     drop(eng);
@@ -193,7 +193,7 @@ fn random_ops_fuzz_30s() {
         e.flush().unwrap();
     }
 
-    let eng = Engine::open_concurrent_with_wal(&path, 128 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&path, 128 * 1024 * 1024).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();
 
@@ -249,16 +249,16 @@ fn random_ops_fuzz_30s() {
         ops += 1;
         if ops % 10_000 == 0 {
             eng.flush_writes();
-            eng.wal_sync().unwrap();
+            eng.oplog_sync().unwrap();
         }
     }
     eng.flush_writes();
-    eng.wal_sync().unwrap();
+    eng.oplog_sync().unwrap();
     println!("30s fuzz: {} ops ({:.0} ops/s)", ops, ops as f64 / 30.0);
     drop(eng);
 
     // 再 open で panic しなければ OK
-    let eng = Engine::open_concurrent_with_wal(&path, 128 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&path, 128 * 1024 * 1024).unwrap();
     let _ = eng.entity_count();
     drop(eng);
     cleanup(&path);

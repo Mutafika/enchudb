@@ -17,22 +17,22 @@
 
 use std::sync::Arc;
 use enchudb::{Engine, HimoType};
-use enchudb_wal::Hlc;
+use enchudb_oplog::Hlc;
 use enchudb::sync::Syncer;
 use enchudb::transport::{InMemoryTransport, Transport, WireRecord};
-use enchudb_wal::wal::DecodedOp;
-use enchudb_wal::keys::Keypair;
+use enchudb_oplog::oplog::DecodedOp;
+use enchudb_oplog::keys::Keypair;
 
 fn tmp(tag: &str) -> String {
     let p = format!("/tmp/enchudb-v32-byz-{}-{}", tag, std::process::id());
-    for suffix in ["", ".wal", ".crc"] {
+    for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", p, suffix));
     }
     p
 }
 
 fn cleanup(path: &str) {
-    for suffix in ["", ".wal", ".crc"] {
+    for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", path, suffix));
     }
 }
@@ -43,17 +43,17 @@ fn make_peer(path: &str, peer: u32) -> Arc<Engine> {
         eng.define_himo("val", HimoType::Number, 100);
         eng.flush().unwrap();
     }
-    let eng = Engine::open_concurrent_with_wal(path, 16 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(path, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(peer);
     eng
 }
 
-fn make_peer_with_wal(path: &str, peer: u32) -> Arc<Engine> {
+fn make_peer_with_oplog(path: &str, peer: u32) -> Arc<Engine> {
     let mut eng = Engine::create_standalone(path).unwrap();
     eng.define_himo("val", HimoType::Number, 100);
     eng.flush().unwrap();
     drop(eng);
-    let eng = Engine::open_concurrent_with_wal(path, 16 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(path, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(peer);
     eng
 }
@@ -67,7 +67,7 @@ fn replay_of_signed_op_is_idempotent() {
     // 悪意 peer が同じ signed op を何度も送りつけても LWW で 1 回しか apply されない
     let pa = tmp("replay_a");
     let pb = tmp("replay_b");
-    let eng_a = make_peer_with_wal(&pa, 1);
+    let eng_a = make_peer_with_oplog(&pa, 1);
     let eng_b = make_peer(&pb, 2);
 
     let kp_a = Arc::new(Keypair::generate());
@@ -81,9 +81,9 @@ fn replay_of_signed_op_is_idempotent() {
 
     let eid = eng_a.entity();
     eng_a.tie_async(eid, "val", 99);
-    eng_a.wal_commit();
+    eng_a.oplog_commit();
     eng_a.flush_writes();
-    eng_a.wal_sync().unwrap();
+    eng_a.oplog_sync().unwrap();
     syncer_a.publish_since(Hlc::ZERO);
 
     // 1 回目 apply
@@ -125,7 +125,7 @@ fn future_hlc_attack_dominates_lww_known_limitation() {
     let transport = Arc::new(InMemoryTransport::new());
 
     // 悪意 peer 1 が HLC=MAX で偽書き込み (署名無しで OK — signature 要求無しのシナリオ)
-    let eid = enchudb_wal::make_eid(1, 7);
+    let eid = enchudb_oplog::make_eid(1, 7);
     let himo_id = eng_b.himo_id("val").unwrap() as u16;
     transport.publish(1, vec![
         WireRecord::unsigned(
@@ -165,7 +165,7 @@ fn future_hlc_attack_dominates_lww_known_limitation() {
 fn mixed_batch_signed_kept_unsigned_dropped() {
     let pa = tmp("mixed_a");
     let pb = tmp("mixed_b");
-    let eng_a = make_peer_with_wal(&pa, 1);
+    let eng_a = make_peer_with_oplog(&pa, 1);
     let eng_b = make_peer(&pb, 2);
 
     let kp_a = Arc::new(Keypair::generate());
@@ -180,14 +180,14 @@ fn mixed_batch_signed_kept_unsigned_dropped() {
     // peer A が署名付きで 1 件
     let eid_good = eng_a.entity();
     eng_a.tie_async(eid_good, "val", 42);
-    eng_a.wal_commit();
+    eng_a.oplog_commit();
     eng_a.flush_writes();
-    eng_a.wal_sync().unwrap();
+    eng_a.oplog_sync().unwrap();
     syncer_a.publish_since(Hlc::ZERO);
 
     // 同じ transport に悪意の unsigned record を混ぜ込む
     let himo_id = eng_b.himo_id("val").unwrap() as u16;
-    let eid_bad = enchudb_wal::make_eid(1, 999);
+    let eid_bad = enchudb_oplog::make_eid(1, 999);
     transport.publish(1, vec![
         WireRecord::unsigned(
             Hlc { wall: 9999, logical: 0, peer: 1 }, 1,
@@ -247,7 +247,7 @@ fn stuck_peer_does_not_block_sync_from_others() {
 fn keypair_rotation_rejected_under_tofu() {
     let pa = tmp("rotate_a");
     let pb = tmp("rotate_b");
-    let eng_a = make_peer_with_wal(&pa, 1);
+    let eng_a = make_peer_with_oplog(&pa, 1);
     let eng_b = make_peer(&pb, 2);
 
     // 初期鍵で署名した op を 1 件受け入れる
@@ -262,9 +262,9 @@ fn keypair_rotation_rejected_under_tofu() {
 
     let eid1 = eng_a.entity();
     eng_a.tie_async(eid1, "val", 1);
-    eng_a.wal_commit();
+    eng_a.oplog_commit();
     eng_a.flush_writes();
-    eng_a.wal_sync().unwrap();
+    eng_a.oplog_sync().unwrap();
     syncer_a.publish_since(Hlc::ZERO);
     let out1 = syncer_b.pull_once(1);
     assert!(out1.applied >= 1);
@@ -275,9 +275,9 @@ fn keypair_rotation_rejected_under_tofu() {
 
     let eid2 = eng_a.entity();
     eng_a.tie_async(eid2, "val", 2);
-    eng_a.wal_commit();
+    eng_a.oplog_commit();
     eng_a.flush_writes();
-    eng_a.wal_sync().unwrap();
+    eng_a.oplog_sync().unwrap();
     syncer_a.publish_since(Hlc::ZERO);
 
     // peer B は TOFU で kp1 の pubkey しか持ってない → kp2 署名は verify 失敗 → reject

@@ -33,7 +33,7 @@
 use std::collections::HashSet;
 use std::sync::RwLock;
 
-use enchudb_wal::PeerId;
+use enchudb_oplog::PeerId;
 
 /// 現在 apply 可能な writer peer の集合。
 ///

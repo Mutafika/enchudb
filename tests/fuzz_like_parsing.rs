@@ -50,8 +50,8 @@ proptest! {
 // encode/decode roundtrip は破綻しない
 // ─────────────────────────────────────────────────────────────
 
-use enchudb_wal::wal::DecodedOp;
-use enchudb_wal::Hlc;
+use enchudb_oplog::oplog::DecodedOp;
+use enchudb_oplog::Hlc;
 
 proptest! {
     #[test]
@@ -85,7 +85,7 @@ proptest! {
 // WAL ファイルをランダム bytes で作って iter_committed を呼ぶ。
 // panic 無し、empty Vec を返すか、途中で切って返るかのいずれか。
 
-use enchudb_wal::wal::Wal;
+use enchudb_oplog::oplog::OpLog;
 
 fn write_wal_with_body(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
@@ -103,7 +103,7 @@ fn write_wal_with_body(path: &std::path::Path, body: &[u8]) -> std::io::Result<(
     Ok(())
 }
 
-fn tmp_wal(tag: &str) -> std::path::PathBuf {
+fn tmp_oplog(tag: &str) -> std::path::PathBuf {
     let p = format!(
         "/tmp/enchudb-fuzz-wal-{}-{}-{}",
         tag,
@@ -120,14 +120,14 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: 256, .. ProptestConfig::default() })]
 
     #[test]
-    fn wal_iter_committed_on_random_body_does_not_panic(
+    fn oplog_iter_committed_on_random_body_does_not_panic(
         body in prop::collection::vec(any::<u8>(), 0..2048)
     ) {
-        let path = tmp_wal("random_body");
+        let path = tmp_oplog("random_body");
         write_wal_with_body(&path, &body).unwrap();
-        // Wal::open は header を validate。破損してなければ iter_committed で panic なく
+        // OpLog::open は header を validate。破損してなければ iter_committed で panic なく
         // (空 or 途中切り) 帰ってくること。
-        if let Ok(wal) = Wal::open(&path) {
+        if let Ok(wal) = OpLog::open(&path) {
             let _ = wal.iter_committed();
         }
         let _ = std::fs::remove_file(&path);

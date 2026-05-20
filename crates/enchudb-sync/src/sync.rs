@@ -10,16 +10,16 @@
 //!
 //! let path = format!("/tmp/enchudb-sync-doc-{}.db", std::process::id());
 //! let _ = std::fs::remove_file(&path);
-//! let _ = std::fs::remove_file(format!("{}.wal", path));
+//! let _ = std::fs::remove_file(format!("{}.oplog", path));
 //! // Sync を使う場合は必ず WAL 有効な Engine を使う。
-//! let eng_a = Engine::create_concurrent_with_wal(&path, 4 * 1024 * 1024).unwrap();
+//! let eng_a = Engine::create_concurrent_with_oplog(&path, 4 * 1024 * 1024).unwrap();
 //!
 //! let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
 //! let syncer = Syncer::new(eng_a.clone(), transport);
 //! let out = syncer.pull_once(2); // 未知の peer から pull、0 件
 //! assert_eq!(out.received, 0);
 //! # let _ = std::fs::remove_file(&path);
-//! # let _ = std::fs::remove_file(format!("{}.wal", path));
+//! # let _ = std::fs::remove_file(format!("{}.oplog", path));
 //! ```
 //!
 //! # LWW 規則
@@ -38,8 +38,8 @@ use std::sync::Arc;
 use enchudb_engine::engine::Engine;
 use enchudb_engine::hlc_store::HlcStore;
 use enchudb_engine::transport::{Transport, WireRecord};
-use enchudb_wal::wal::DecodedOp;
-use enchudb_wal::{Hlc, PeerId};
+use enchudb_oplog::oplog::DecodedOp;
+use enchudb_oplog::{Hlc, PeerId};
 
 use crate::subscription::{AllRecords, SubscriptionFilter};
 
@@ -82,13 +82,13 @@ impl Syncer {
     /// 旧来の WAL 無し Engine を渡すと `publish_since` は常に 0 件配送する
     /// silent footgun を作るので、ここで loud に止める。
     ///
-    /// WAL 有効な Engine を作るには `Engine::open_concurrent_with_wal` /
-    /// `Engine::create_concurrent_with_wal` を使うこと。
+    /// WAL 有効な Engine を作るには `Engine::open_concurrent_with_oplog` /
+    /// `Engine::create_concurrent_with_oplog` を使うこと。
     pub fn new(engine: Arc<Engine>, transport: Arc<dyn Transport>) -> Self {
-        let wal = engine.wal_arc().unwrap_or_else(|| {
+        let wal = engine.oplog_arc().unwrap_or_else(|| {
             panic!(
                 "Syncer requires a WAL-enabled Engine. \
-                 Use Engine::open_concurrent_with_wal / create_concurrent_with_wal \
+                 Use Engine::open_concurrent_with_oplog / create_concurrent_with_oplog \
                  instead of Engine::open / create."
             )
         });
@@ -164,7 +164,7 @@ impl Syncer {
     /// (= tombstone) ので、 後で来る古い HLC の Tie/Untie/Content が `apply_one`
     /// 内の tombstone check で skip される。
     fn hydrate_hlc_store(&self, engine: &Engine) {
-        let Some(wal) = engine.wal_arc() else { return };
+        let Some(wal) = engine.oplog_arc() else { return };
         let store = engine.hlc_store();
         for rec in wal.iter_committed() {
             match &rec.op {
@@ -176,7 +176,7 @@ impl Syncer {
                     store.force_set(*eid, u16::MAX, rec.hlc);
                 }
                 DecodedOp::Content { eid, key, .. } => {
-                    let key_hash = enchudb_wal::content_key_hash15(key);
+                    let key_hash = enchudb_oplog::content_key_hash15(key);
                     store.force_set(*eid, key_hash | 0x8000, rec.hlc);
                 }
                 DecodedOp::Commit | DecodedOp::Vocab { .. } => {}
@@ -245,7 +245,7 @@ impl Syncer {
             // backward compat: known_peers 未実装 transport (HTTP/WS push 等) は
             // 旧 broadcast 経路。 filter は無視される (broadcast に per-target
             // filter は意味が無いため、 default `AllRecords` のときと等価)。
-            let wal = match self.engine.wal_arc() {
+            let wal = match self.engine.oplog_arc() {
                 Some(w) => w,
                 None => return 0,
             };
@@ -278,7 +278,7 @@ impl Syncer {
     /// SNS partial sync では `SubscriptionFilter::should_send` で「target が
     /// 関心ある record か」 を判定してから送る。
     pub fn publish_since_for_peer(&self, target_peer: PeerId, since: Hlc) -> usize {
-        let wal = match self.engine.wal_arc() {
+        let wal = match self.engine.oplog_arc() {
             Some(w) => w,
             None => return 0,
         };
@@ -338,10 +338,10 @@ impl Syncer {
 
     fn apply_one(&self, store: &HlcStore, rec: &WireRecord) -> bool {
         // 受信した WireRecord の header フィールドを Engine::remote_*_apply の relayed 引数に
-        // そのまま渡す (gossip 経路で `Wal::append_relayed` が元 HLC/author/署名を保持するため)。
+        // そのまま渡す (gossip 経路で `OpLog::append_relayed` が元 HLC/author/署名を保持するため)。
         #[inline]
-        fn relayed_header(rec: &WireRecord) -> enchudb_wal::wal::RelayedHeader {
-            enchudb_wal::wal::RelayedHeader {
+        fn relayed_header(rec: &WireRecord) -> enchudb_oplog::oplog::RelayedHeader {
+            enchudb_oplog::oplog::RelayedHeader {
                 hlc: rec.hlc,
                 author: rec.author_peer,
                 signature: rec.signature,
@@ -397,7 +397,7 @@ impl Syncer {
                         return false;
                     }
                 }
-                let key_hash = enchudb_wal::content_key_hash15(key);
+                let key_hash = enchudb_oplog::content_key_hash15(key);
                 if !store.try_set(*eid, key_hash | 0x8000, rec.hlc) {
                     return false;
                 }
@@ -419,19 +419,19 @@ impl Syncer {
 mod tests {
     use super::*;
     use enchudb_engine::{HimoType};
-    use enchudb_wal::PeerId;
+    use enchudb_oplog::PeerId;
     use enchudb_engine::transport::InMemoryTransport;
 
     fn new_eng(path: &str, peer: PeerId) -> Arc<Engine> {
         let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(format!("{}.wal", path));
+        let _ = std::fs::remove_file(format!("{}.oplog", path));
         let _ = std::fs::remove_file(format!("{}.crc", path));
         {
             let mut eng = Engine::create_standalone(path).unwrap();
             eng.define_himo("val", HimoType::Number, 100);
             eng.flush().unwrap();
         }
-        let eng = Engine::open_concurrent_with_wal(path, 4 * 1024 * 1024).unwrap();
+        let eng = Engine::open_concurrent_with_oplog(path, 4 * 1024 * 1024).unwrap();
         eng.set_peer_id(peer);
         eng
     }
@@ -444,7 +444,7 @@ mod tests {
         let syncer = Syncer::new(eng_a.clone(), transport.clone());
 
         // peer 2 からの古い op
-        let eid = enchudb_wal::make_eid(2, 7);
+        let eid = enchudb_oplog::make_eid(2, 7);
         let rec_old = WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid, himo_id: 0, value: 10 });
         let rec_new = WireRecord::unsigned(Hlc { wall: 200, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid, himo_id: 0, value: 20 });
         let out = syncer.apply_records(&[rec_new.clone(), rec_old.clone()]);
@@ -466,7 +466,7 @@ mod tests {
         let transport = Arc::new(InMemoryTransport::new());
 
         // peer 2 が tie した体で transport に直接 publish
-        let eid_b = enchudb_wal::make_eid(2, 3);
+        let eid_b = enchudb_oplog::make_eid(2, 3);
         transport.publish(2, vec![
             WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: eid_b, himo_id: 0, value: 42 }),
         ]);
@@ -490,12 +490,12 @@ mod tests {
         let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
 
         // 1st round
-        transport.publish(2, vec![WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: enchudb_wal::make_eid(2, 1), himo_id: 0, value: 10 })]);
+        transport.publish(2, vec![WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: enchudb_oplog::make_eid(2, 1), himo_id: 0, value: 10 })]);
         let out1 = syncer.pull_once(2);
         assert_eq!(out1.received, 1);
 
         // 2nd pull should see only new records
-        transport.publish(2, vec![WireRecord::unsigned(Hlc { wall: 200, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: enchudb_wal::make_eid(2, 2), himo_id: 0, value: 20 })]);
+        transport.publish(2, vec![WireRecord::unsigned(Hlc { wall: 200, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: enchudb_oplog::make_eid(2, 2), himo_id: 0, value: 20 })]);
         let out2 = syncer.pull_once(2);
         assert_eq!(out2.received, 1);
         assert_eq!(out2.applied, 1);
@@ -522,7 +522,7 @@ mod tests {
         let e = eng_a.entity();
         eng_a.tie_async(e, "val", 42);
         eng_a.flush_writes();
-        eng_a.wal_sync().unwrap();
+        eng_a.oplog_sync().unwrap();
         let count = syncer.publish_since(Hlc::ZERO);
         assert!(count > 0, "should publish at least the tie record");
 
@@ -560,7 +560,7 @@ mod tests {
         let e = eng_a.entity();
         eng_a.tie_async(e, "val", 77);
         eng_a.flush_writes();
-        eng_a.wal_sync().unwrap();
+        eng_a.oplog_sync().unwrap();
         syncer.publish_since(Hlc::ZERO);
 
         let recs_2 = transport.pull_as(2, 1, Hlc::ZERO);
@@ -584,7 +584,7 @@ mod tests {
         let e = eng_a.entity();
         eng_a.tie_async(e, "val", 99);
         eng_a.flush_writes();
-        eng_a.wal_sync().unwrap();
+        eng_a.oplog_sync().unwrap();
 
         // peer 5 のみに publish (filter default AllRecords)
         let n = syncer.publish_since_for_peer(5, Hlc::ZERO);

@@ -27,7 +27,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
-use enchudb_wal::PeerId;
+use enchudb_oplog::PeerId;
 
 // ─────────────────────────────────────────────────────────────
 // G-Counter (Grow-only Counter)

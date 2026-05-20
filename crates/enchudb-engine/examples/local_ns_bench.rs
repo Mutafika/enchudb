@@ -35,7 +35,7 @@ fn main() {
     let t = Instant::now();
     let mut sum = 0u64;
     for i in 0..iters {
-        let eid = enchudb_wal::make_eid(eng.peer_id(), (i % n) as u32);
+        let eid = enchudb_oplog::make_eid(eng.peer_id(), (i % n) as u32);
         if let Some(v) = eng.get(eid, "user_id") {
             sum = sum.wrapping_add(v as u64);
         }

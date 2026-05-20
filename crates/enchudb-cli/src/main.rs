@@ -321,11 +321,11 @@ fn cmd_stats(eng: &Engine) {
     let s = eng.stats();
     println!("entity_count   {}", s.entity_count);
     println!("himo_count     {}", s.himo_count);
-    println!("wal_head       {}", s.wal_head);
-    println!("wal_checkpoint {}", s.wal_checkpoint);
-    println!("wal_lag_bytes  {}", s.wal_lag_bytes);
-    println!("wal_capacity   {}", s.wal_capacity);
-    println!("next_lsn       {}", s.wal_next_lsn);
+    println!("oplog_head       {}", s.oplog_head);
+    println!("oplog_checkpoint {}", s.oplog_checkpoint);
+    println!("oplog_lag_bytes  {}", s.oplog_lag_bytes);
+    println!("oplog_capacity   {}", s.oplog_capacity);
+    println!("next_lsn       {}", s.oplog_next_lsn);
     println!("durable_lsn    {}", s.durable_lsn);
     println!("queue_len      {}", s.queue_len);
     println!("pushed/applied {}/{}", s.pushed, s.applied);

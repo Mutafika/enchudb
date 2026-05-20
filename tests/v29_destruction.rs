@@ -34,7 +34,7 @@ static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 
 fn cleanup(path: &str) {
     let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{}.wal", path));
+    let _ = std::fs::remove_file(format!("{}.oplog", path));
 }
 
 fn prepare_db(path: &str) {
@@ -101,7 +101,7 @@ fn process_no_commit_recovers_via_auto_commit() {
     let path = tmp("pnocommit");
     prepare_db(&path);
 
-    // wal_commit を呼ばずに exit(0) — Drop の shutdown path で auto-commit されるはず
+    // oplog_commit を呼ばずに exit(0) — Drop の shutdown path で auto-commit されるはず
     let status = Command::new(crash_writer_bin())
         .args([&path, "no_commit", "100"])
         .stdout(Stdio::null())
@@ -109,7 +109,7 @@ fn process_no_commit_recovers_via_auto_commit() {
         .unwrap();
     assert!(status.success());
 
-    let eng = Engine::open_concurrent_with_wal(&path, 64 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&path, 64 * 1024 * 1024).unwrap();
     // auto-commit が効いてれば 100 件全部残る
     let mut found = 0;
     for i in 0..100u64 {
@@ -125,7 +125,7 @@ fn process_abort_mid_write_preserves_first_half() {
     let path = tmp("pabort");
     prepare_db(&path);
 
-    // 前半(0..50) は wal_sync 済み、後半(50..100) は sync 無しで abort
+    // 前半(0..50) は oplog_sync 済み、後半(50..100) は sync 無しで abort
     let status = Command::new(crash_writer_bin())
         .args([&path, "abort_mid", "100"])
         .stdout(Stdio::null())
@@ -135,7 +135,7 @@ fn process_abort_mid_write_preserves_first_half() {
     // abort() は SIGABRT で死ぬので success ではない
     assert!(!status.success(), "abort_mid should not succeed");
 
-    let eng = Engine::open_concurrent_with_wal(&path, 64 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&path, 64 * 1024 * 1024).unwrap();
     // 前半 50 件は確実に残る
     for i in 0..50u64 {
         assert_eq!(eng.get(i, "n"), Some(i as u32), "first half entity {} lost", i);
@@ -164,7 +164,7 @@ fn process_sigkill_during_loop_no_corruption() {
         .spawn()
         .unwrap();
 
-    // 2000 writes まで待つ(crash_writer は 1000 毎に wal_sync)
+    // 2000 writes まで待つ(crash_writer は 1000 毎に oplog_sync)
     {
         use std::io::BufRead;
         let stdout = child.stdout.take().unwrap();
@@ -181,9 +181,9 @@ fn process_sigkill_during_loop_no_corruption() {
     child.kill().unwrap();
     let _ = child.wait();
 
-    // 復旧できる(エラー無し) + 1 回以上 wal_sync した分は残る
-    let eng = Engine::open_concurrent_with_wal(&path, 64 * 1024 * 1024).unwrap();
-    // wal_sync は 1000 毎なので、最低 1000 件は残ってるはず
+    // 復旧できる(エラー無し) + 1 回以上 oplog_sync した分は残る
+    let eng = Engine::open_concurrent_with_oplog(&path, 64 * 1024 * 1024).unwrap();
+    // oplog_sync は 1000 毎なので、最低 1000 件は残ってるはず
     assert!(eng.entity_count() >= 1000,
         "SIGKILL should preserve synced batches, got {} entities",
         eng.entity_count());
@@ -235,24 +235,24 @@ fn byte_flip_wal_tail_truncated_silently() {
 
     // 正常書き込み + sync
     {
-        let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
+        let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
         for i in 0..50u32 {
             let e = eng.entity();
             eng.tie_async(e, "n", i);
         }
         eng.flush_writes();
-        eng.wal_sync().unwrap();
+        eng.oplog_sync().unwrap();
     }
 
     // WAL の末尾付近(最後のレコード周辺)を改竄
-    let wal_path = format!("{}.wal", path);
-    let wal_size = std::fs::metadata(&wal_path).unwrap().len();
+    let oplog_path = format!("{}.oplog", path);
+    let wal_size = std::fs::metadata(&oplog_path).unwrap().len();
     // head の手前 32 バイト付近(実際の WAL 末尾付近)を狙う
     // 厳密位置は wal.head() を読むのが正しいが、ざっくり最後の 1KB を狙う
-    flip_byte(&wal_path, wal_size.saturating_sub(512));
+    flip_byte(&oplog_path, wal_size.saturating_sub(512));
 
     // reopen — CRC 検出で該当レコード以降は破棄、それ以前は適用
-    let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
     // 壊れた箇所以降は失われるが、エラーにはならない
     let count = (0..50u64).filter(|&i| eng.get(i, "n").is_some()).count();
     let _ = count; // 件数は破損位置依存、ここでは panic しなければ OK
@@ -286,22 +286,22 @@ fn truncate_wal_to_header_loses_uncommitted() {
     prepare_db(&path);
 
     {
-        let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
+        let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
         for i in 0..30u32 {
             let e = eng.entity();
             eng.tie_async(e, "n", i);
         }
         eng.flush_writes();
-        eng.wal_sync().unwrap();
+        eng.oplog_sync().unwrap();
     }
 
     // WAL を header サイズ(32B) にまで削る = 全レコード破棄
-    let wal_path = format!("{}.wal", path);
-    truncate_to(&wal_path, 32);
+    let oplog_path = format!("{}.oplog", path);
+    truncate_to(&oplog_path, 32);
 
     // reopen できる。WAL から何も復旧されない(body は既に msync 済みなので残る)
-    let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
-    // body 側は wal_sync で msync してるので、書き込みは残ってる
+    let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
+    // body 側は oplog_sync で msync してるので、書き込みは残ってる
     let count = (0..30u64).filter(|&i| eng.get(i, "n").is_some()).count();
     assert!(count > 0, "body msync'd data should survive even with WAL truncation");
     drop(eng);
@@ -317,7 +317,7 @@ fn concurrent_writers_with_sync_no_data_loss() {
     let path = tmp("concurrent");
     prepare_db(&path);
 
-    let eng = Engine::open_concurrent_with_wal(&path, 128 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&path, 128 * 1024 * 1024).unwrap();
     let mut handles = Vec::new();
     for t in 0..4 {
         let e = Arc::clone(&eng);
@@ -331,11 +331,11 @@ fn concurrent_writers_with_sync_no_data_loss() {
     for h in handles { h.join().unwrap(); }
 
     eng.flush_writes();
-    eng.wal_sync().unwrap();
+    eng.oplog_sync().unwrap();
     let total_before = eng.entity_count();
     drop(eng);
 
-    let eng = Engine::open_concurrent_with_wal(&path, 128 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&path, 128 * 1024 * 1024).unwrap();
     assert_eq!(eng.entity_count(), total_before,
         "all concurrent writes should survive (expected {}, got {})",
         total_before, eng.entity_count());
@@ -369,19 +369,19 @@ fn fuzz_random_byte_flip_no_silent_corruption() {
         // 正常に 20 件書く + 期待値を記録
         let mut expected: Vec<(u64, u32)> = Vec::new();
         {
-            let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
+            let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
             for i in 0..20u32 {
                 let e = eng.entity();
                 eng.tie_async(e, "n", i);
                 expected.push((e, i));
             }
             eng.flush_writes();
-            eng.wal_sync().unwrap();
+            eng.oplog_sync().unwrap();
         }
 
         // どのファイル? どのオフセット?
         let which = next() % 2;
-        let target_path = if which == 0 { path.clone() } else { format!("{}.wal", path) };
+        let target_path = if which == 0 { path.clone() } else { format!("{}.oplog", path) };
         let size = std::fs::metadata(&target_path).map(|m| m.len()).unwrap_or(0);
         if size == 0 { cleanup(&path); continue; }
         let offset = next() % size;
@@ -390,7 +390,7 @@ fn fuzz_random_byte_flip_no_silent_corruption() {
         let _ = std::panic::catch_unwind(|| flip_byte(&target_path, offset));
 
         // 再 open → 3 つの許容結果
-        let outcome = match Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024) {
+        let outcome = match Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024) {
             Err(_) => "error_ok",      // 検出 ✓
             Ok(eng) => {
                 // 値が残っていて正しいか、消えたか

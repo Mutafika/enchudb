@@ -1,6 +1,6 @@
 [package]
 name = "enchudb-sync"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "EnchuDB p2p sync — HLC-LWW Syncer。`enchudb-engine` に積む層。"
 license-file = "LICENSE.md"
@@ -8,5 +8,5 @@ authors = ["mutafika"]
 repository = "https://github.com/mutafika/enchudb"
 
 [dependencies]
-enchudb-wal = { path = "../enchudb-wal" }
+enchudb-oplog = { path = "../enchudb-oplog" }
 enchudb-engine = { path = "../enchudb-engine" }

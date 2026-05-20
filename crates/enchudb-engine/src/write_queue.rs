@@ -10,7 +10,7 @@
 //!
 //! v0.2.4 から `crossbeam_queue::ArrayQueue` (bounded、 lock-free) に変更。
 //! push が満杯なら `yield_now` ループで consumer の進捗を待つ (自然な
-//! backpressure)。 capacity は `Engine::create_concurrent_with_wal_queue_cap`
+//! backpressure)。 capacity は `Engine::create_concurrent_with_oplog_queue_cap`
 //! で指定可能 (default は緩めの値で latency への影響を抑える)。
 
 use crossbeam_queue::ArrayQueue;

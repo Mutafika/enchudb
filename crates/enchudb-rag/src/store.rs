@@ -22,7 +22,7 @@ use crate::{Chunk, Error, Hit, Meta, MetaValue, Query, HybridQuery, Result};
 use crate::bm25::{Bm25Index, rrf_fuse};
 use crate::distance::Metric;
 use enchudb::{Engine, HimoType};
-use enchudb_wal::EntityId;
+use enchudb_oplog::EntityId;
 use memmap2::MmapMut;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -305,7 +305,7 @@ impl RagStore {
     /// eid の下位 32bit を vector スロット index として使う。
     /// 単一 peer 前提（RagStore は v32 分散を使わない）。
     fn vector_offset(&self, eid: EntityId) -> usize {
-        let local = enchudb_wal::eid_local(eid) as usize;
+        let local = enchudb_oplog::eid_local(eid) as usize;
         VEC_HEADER_SIZE + local * self.dim * 4
     }
 

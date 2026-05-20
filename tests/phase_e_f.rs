@@ -3,7 +3,7 @@
 #![cfg(feature = "v32")]
 
 use enchudb::{AuditFilter, Engine, HimoType};
-use enchudb_wal::Hlc;
+use enchudb_oplog::Hlc;
 use std::sync::Arc;
 
 fn tmp(tag: &str) -> String {
@@ -16,14 +16,14 @@ fn tmp(tag: &str) -> String {
             .unwrap()
             .as_nanos()
     );
-    for suffix in ["", ".wal", ".crc"] {
+    for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", p, suffix));
     }
     p
 }
 
 fn cleanup(path: &str) {
-    for suffix in ["", ".wal", ".crc"] {
+    for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", path, suffix));
     }
 }
@@ -76,26 +76,26 @@ fn snapshot_export_with_wal_includes_wal_file() {
     }
 
     // WAL 経由で書き込み
-    let eng = Engine::open_concurrent_with_wal(&src_path, 16 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&src_path, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(1);
     let e = eng.entity();
     eng.tie_async(e, "val", 42);
-    eng.wal_commit();
+    eng.oplog_commit();
     eng.flush_writes();
-    eng.wal_sync().unwrap();
+    eng.oplog_sync().unwrap();
 
     let files = eng.snapshot_export(&dst_path).unwrap();
     assert_eq!(files.main, dst_path);
     assert!(
-        files.wal.is_some(),
+        files.oplog.is_some(),
         "WAL を作ったので snapshot に含まれるべき"
     );
-    assert!(std::path::Path::new(&format!("{}.wal", dst_path)).exists());
+    assert!(std::path::Path::new(&format!("{}.oplog", dst_path)).exists());
 
     drop(eng);
 
     // dst を wal 込みで open
-    let eng2 = Engine::open_concurrent_with_wal(&dst_path, 16 * 1024 * 1024).unwrap();
+    let eng2 = Engine::open_concurrent_with_oplog(&dst_path, 16 * 1024 * 1024).unwrap();
     assert_eq!(eng2.get(e, "val"), Some(42));
 
     drop(eng2);
@@ -116,7 +116,7 @@ fn stats_includes_hlc_info() {
         eng.flush().unwrap();
     }
 
-    let eng = Engine::open_concurrent_with_wal(&src_path, 16 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&src_path, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(7);
 
     let stats_before = eng.stats();
@@ -128,9 +128,9 @@ fn stats_includes_hlc_info() {
     // だが hlc_store の len は常に監視できる
     let e = eng.entity();
     eng.tie_async(e, "val", 1);
-    eng.wal_commit();
+    eng.oplog_commit();
     eng.flush_writes();
-    eng.wal_sync().unwrap();
+    eng.oplog_sync().unwrap();
 
     let stats_after = eng.stats();
     assert_eq!(stats_after.peer_id, 7);
@@ -156,16 +156,16 @@ fn audit_returns_wal_records() {
         eng.flush().unwrap();
     }
 
-    let eng = Engine::open_concurrent_with_wal(&src_path, 16 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&src_path, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(3);
 
     let e1 = eng.entity();
     eng.tie_async(e1, "val", 10);
     let e2 = eng.entity();
     eng.tie_async(e2, "val", 20);
-    eng.wal_commit();
+    eng.oplog_commit();
     eng.flush_writes();
-    eng.wal_sync().unwrap();
+    eng.oplog_sync().unwrap();
 
     let recs = eng.audit(&AuditFilter::default());
     // 2 Tie ops + entity create が入るが、最低 2 件の write op は見えるはず
@@ -193,14 +193,14 @@ fn audit_filter_by_author_excludes_others() {
         eng.flush().unwrap();
     }
 
-    let eng = Engine::open_concurrent_with_wal(&src_path, 16 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&src_path, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(5);
 
     let e = eng.entity();
     eng.tie_async(e, "val", 1);
-    eng.wal_commit();
+    eng.oplog_commit();
     eng.flush_writes();
-    eng.wal_sync().unwrap();
+    eng.oplog_sync().unwrap();
 
     // author=5(自分)で fetch
     let filter = AuditFilter {
@@ -231,14 +231,14 @@ fn audit_filter_by_hlc_range() {
         eng.flush().unwrap();
     }
 
-    let eng = Engine::open_concurrent_with_wal(&src_path, 16 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&src_path, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(1);
 
     let e = eng.entity();
     eng.tie_async(e, "val", 42);
-    eng.wal_commit();
+    eng.oplog_commit();
     eng.flush_writes();
-    eng.wal_sync().unwrap();
+    eng.oplog_sync().unwrap();
 
     let all = eng.audit(&AuditFilter::default());
     assert!(!all.is_empty());

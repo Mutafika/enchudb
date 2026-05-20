@@ -14,10 +14,10 @@ use std::sync::Arc;
 fn body_msync_handles_dirty_range_correctly() {
     let path = "/tmp/test_dirty_range_msync.db";
     let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{path}.wal"));
+    let _ = std::fs::remove_file(format!("{path}.oplog"));
     let _ = std::fs::remove_file(format!("{path}.lock"));
 
-    let eng: Arc<Engine> = Engine::create_concurrent_with_wal(
+    let eng: Arc<Engine> = Engine::create_concurrent_with_oplog(
         path, 16 * 1024 * 1024,
     ).expect("create");
 
@@ -44,16 +44,16 @@ fn body_msync_handles_dirty_range_correctly() {
     }
 }
 
-/// `wal_sync` 経由でも dirty range path が正しく動くこと。 schema 層の
-/// `flush_with_wal` 系で実際にこのパスを通る。
+/// `oplog_sync` 経由でも dirty range path が正しく動くこと。 schema 層の
+/// `flush_with_oplog` 系で実際にこのパスを通る。
 #[test]
-fn wal_sync_with_dirty_range() {
+fn oplog_sync_with_dirty_range() {
     let path = "/tmp/test_wal_sync_dirty.db";
     let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{path}.wal"));
+    let _ = std::fs::remove_file(format!("{path}.oplog"));
     let _ = std::fs::remove_file(format!("{path}.lock"));
 
-    let eng: Arc<Engine> = Engine::create_concurrent_with_wal(
+    let eng: Arc<Engine> = Engine::create_concurrent_with_oplog(
         path, 4 * 1024 * 1024,
     ).expect("create");
 
@@ -67,6 +67,6 @@ fn wal_sync_with_dirty_range() {
         let e = eng.entity();
         eng.tie_async_by_id(e, k_hid, i);
     }
-    eng.wal_sync().expect("wal_sync");
-    eng.wal_sync().expect("wal_sync idempotent");
+    eng.oplog_sync().expect("oplog_sync");
+    eng.oplog_sync().expect("oplog_sync idempotent");
 }

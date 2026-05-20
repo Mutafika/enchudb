@@ -1,20 +1,20 @@
 //! snapshot → restore → sync の E2E。
 //!
 //! シナリオ:
-//! 1. origin engine で署名付き書き込み、flush + wal_sync
+//! 1. origin engine で署名付き書き込み、flush + oplog_sync
 //! 2. snapshot_export で `{main, .wal, .crc}` を別パスにコピー
-//! 3. restored engine を open_concurrent_with_wal で開く(同 path)
+//! 3. restored engine を open_concurrent_with_oplog で開く(同 path)
 //! 4. restored は snapshot 時点の全データを持つ(entity_count / get 一致)
 //! 5. origin がさらに書き込んで publish、restored が pull で incremental sync
 //!    できる(HLC 位置の整合、新規 record だけ apply)
 
 #![cfg(feature = "v32")]
 
-use enchudb_wal::keys::Keypair;
+use enchudb_oplog::keys::Keypair;
 use enchudb::sync::Syncer;
 use enchudb::transport::{InMemoryTransport, Transport};
 use enchudb::{AuditFilter, Engine, HimoType};
-use enchudb_wal::Hlc;
+use enchudb_oplog::Hlc;
 use std::sync::Arc;
 
 fn tmp(tag: &str) -> String {
@@ -27,14 +27,14 @@ fn tmp(tag: &str) -> String {
             .unwrap()
             .as_nanos()
     );
-    for suffix in ["", ".wal", ".crc"] {
+    for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", p, suffix));
     }
     p
 }
 
 fn cleanup(path: &str) {
-    for suffix in ["", ".wal", ".crc"] {
+    for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", path, suffix));
     }
 }
@@ -58,25 +58,25 @@ fn snapshot_restore_recovers_signed_wal_state() {
 
     // origin: 書き込み + snapshot
     {
-        let eng = Engine::open_concurrent_with_wal(&origin_path, 16 * 1024 * 1024).unwrap();
+        let eng = Engine::open_concurrent_with_oplog(&origin_path, 16 * 1024 * 1024).unwrap();
         eng.set_peer_id(1);
         eng.set_keypair(Some(kp.clone()));
         for i in 0..10u32 {
             let e = eng.entity();
             eng.tie_async(e, "val", i);
         }
-        eng.wal_commit();
+        eng.oplog_commit();
         eng.flush_writes();
-        eng.wal_sync().unwrap();
+        eng.oplog_sync().unwrap();
 
         let files = eng.snapshot_export(&restored_path).unwrap();
         assert_eq!(files.main, restored_path);
-        assert!(files.wal.is_some(), "snapshot should include WAL");
+        assert!(files.oplog.is_some(), "snapshot should include WAL");
         drop(eng);
     }
 
     // restored: 同 snapshot を開く
-    let restored = Engine::open_concurrent_with_wal(&restored_path, 16 * 1024 * 1024).unwrap();
+    let restored = Engine::open_concurrent_with_oplog(&restored_path, 16 * 1024 * 1024).unwrap();
     restored.set_peer_id(1);
     restored.pubkeys().force_register(1, &pub_bytes);
 
@@ -115,7 +115,7 @@ fn restored_replica_syncs_incremental_from_origin_after_snapshot() {
     // origin: 初期書き込み + snapshot
     let snap_hlc: Hlc;
     {
-        let eng = Engine::open_concurrent_with_wal(&origin_path, 16 * 1024 * 1024).unwrap();
+        let eng = Engine::open_concurrent_with_oplog(&origin_path, 16 * 1024 * 1024).unwrap();
         eng.set_peer_id(1);
         eng.set_keypair(Some(kp.clone()));
 
@@ -123,13 +123,13 @@ fn restored_replica_syncs_incremental_from_origin_after_snapshot() {
             let e = eng.entity();
             eng.tie_async(e, "val", i * 10);
         }
-        eng.wal_commit();
+        eng.oplog_commit();
         eng.flush_writes();
-        eng.wal_sync().unwrap();
+        eng.oplog_sync().unwrap();
 
         // snapshot(restored_path を上書き)
         let _ = std::fs::remove_file(&restored_path);
-        let _ = std::fs::remove_file(format!("{}.wal", restored_path));
+        let _ = std::fs::remove_file(format!("{}.oplog", restored_path));
         eng.snapshot_export(&restored_path).unwrap();
 
         // snapshot 時点の max HLC を控える(Syncer::pull の since に使う)
@@ -141,12 +141,12 @@ fn restored_replica_syncs_incremental_from_origin_after_snapshot() {
 
     // origin を再 open(consumer スレッド生きたまま sync するなら再 open しなくても良いが
     // snapshot_export で engine を drop した形なのでもう一度開ける)
-    let origin = Engine::open_concurrent_with_wal(&origin_path, 16 * 1024 * 1024).unwrap();
+    let origin = Engine::open_concurrent_with_oplog(&origin_path, 16 * 1024 * 1024).unwrap();
     origin.set_peer_id(1);
     origin.set_keypair(Some(kp.clone()));
 
     // restored を open
-    let restored = Engine::open_concurrent_with_wal(&restored_path, 16 * 1024 * 1024).unwrap();
+    let restored = Engine::open_concurrent_with_oplog(&restored_path, 16 * 1024 * 1024).unwrap();
     restored.set_peer_id(9);
     restored.pubkeys().force_register(1, &pub_bytes);
 
@@ -161,9 +161,9 @@ fn restored_replica_syncs_incremental_from_origin_after_snapshot() {
         let e = origin.entity();
         origin.tie_async(e, "val", 1000 + i);
     }
-    origin.wal_commit();
+    origin.oplog_commit();
     origin.flush_writes();
-    origin.wal_sync().unwrap();
+    origin.oplog_sync().unwrap();
 
     // transport 経由で origin → restored へ sync
     let transport = Arc::new(InMemoryTransport::new());

@@ -12,7 +12,7 @@
 //! use enchudb_engine::Engine;
 //! use enchudb_sync::shard::{HashRouter, InMemoryShardTransport, ShardQuery};
 //!
-//! let eng_a = Engine::create_concurrent_with_wal("/tmp/a.db", 4 * 1024 * 1024).unwrap();
+//! let eng_a = Engine::create_concurrent_with_oplog("/tmp/a.db", 4 * 1024 * 1024).unwrap();
 //! eng_a.set_peer_id(1);
 //!
 //! // 3 peer で 分散
@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use enchudb_engine::{Engine};
-use enchudb_wal::{EntityId, PeerId};
+use enchudb_oplog::{EntityId, PeerId};
 
 /// himo 名からその himo の owner peer を決める。
 pub trait ShardRouter: Send + Sync {
@@ -143,7 +143,7 @@ impl ShardTransport for InMemoryShardTransport {
         // 上位 32bit は 0。sharded では from peer を上位に乗せる。
         eng.pull_raw(himo, value)
             .into_iter()
-            .map(|e| enchudb_wal::make_eid(from, e as u32))
+            .map(|e| enchudb_oplog::make_eid(from, e as u32))
             .collect()
     }
 }
@@ -174,7 +174,7 @@ impl ShardQuery {
             // 自 peer が owner、ローカル column から
             self.engine.pull_raw(himo, value)
                 .into_iter()
-                .map(|e| enchudb_wal::make_eid(self.self_peer, e as u32))
+                .map(|e| enchudb_oplog::make_eid(self.self_peer, e as u32))
                 .collect()
         } else {
             // remote

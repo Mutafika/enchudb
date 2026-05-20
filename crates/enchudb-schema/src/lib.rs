@@ -62,7 +62,7 @@
 //! 手動 flush は不要 (明示的に呼びたい場合は `db.engine_mut().flush()`)。
 
 use enchudb_engine::{Engine, HimoType};
-use enchudb_wal::EntityId;
+use enchudb_oplog::EntityId;
 use std::sync::Arc;
 
 // 内部 marker: schema 自身の persistence entity を識別するためだけに使う。
@@ -200,9 +200,9 @@ impl TableInner {
 /// EnchuDB 上の virtual-table database。 schema 定義 + 永続化を担う。
 ///
 /// 内部表現は `Arc<Engine>`。 build phase (Arc 共有前) は `Arc::get_mut` 経由で
-/// `&mut Engine` を取り、 `define_himo` 等の schema 拡張ができる。 `finish_with_wal`
+/// `&mut Engine` を取り、 `define_himo` 等の schema 拡張ができる。 `finish_with_oplog`
 /// 等で consumer thread を spawn して runtime phase に遷移すると、 以降は
-/// `&Engine` 経由の API (tie_to / tie_text_to / query / wal_sync) のみ。
+/// `&Engine` 経由の API (tie_to / tie_text_to / query / oplog_sync) のみ。
 pub struct Database {
     eng: Arc<Engine>,
     tables: Vec<Arc<TableInner>>,
@@ -310,8 +310,8 @@ impl Database {
     /// schema は blob から復元 + himo は engine 自体に保存済みなので追加 define 不要。
     /// 返り値は `Arc<Database>` — 全 thread / sub-store で clone 共有する用。
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn open_with_wal(path: &str, wal_capacity: usize) -> Result<Arc<Self>, SchemaError> {
-        let arc_eng = Engine::open_concurrent_with_wal(path, wal_capacity)
+    pub fn open_with_oplog(path: &str, oplog_capacity: usize) -> Result<Arc<Self>, SchemaError> {
+        let arc_eng = Engine::open_concurrent_with_oplog(path, oplog_capacity)
             .map_err(|e| SchemaError::Io(e.to_string()))?;
         Self::wrap_concurrent(arc_eng)
     }
@@ -319,12 +319,12 @@ impl Database {
     fn wrap_concurrent(arc_eng: Arc<Engine>) -> Result<Arc<Self>, SchemaError> {
         // marker / schema blob himo は再 open 時に engine が既に保持 (recover 済み)。
         // ただし新規 DB なら未定義の可能性があるので、 Arc::get_mut で初回だけ define。
-        // open_concurrent_with_wal 後の Arc count = 1 (consumer は raw ptr で保持)。
+        // open_concurrent_with_oplog 後の Arc count = 1 (consumer は raw ptr で保持)。
         let marker_himo_id = match arc_eng.himo_id(SCHEMA_META_HIMO) {
             Some(idx) => idx as u16,
             None => {
                 return Err(SchemaError::Internal(
-                    "marker himo not present — open_with_wal expects a DB built via Database::create / finish_with_wal".into()
+                    "marker himo not present — open_with_oplog expects a DB built via Database::create / finish_with_oplog".into()
                 ));
             }
         };
@@ -345,9 +345,9 @@ impl Database {
     /// 失敗条件: `self` が既に `Arc<Database>` 経由で共有されている (= Arc count > 1)、
     /// もしくは WAL ファイル作成 / consumer 起動が失敗。
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn finish_with_wal(self, wal_capacity: usize) -> Result<Arc<Self>, SchemaError> {
+    pub fn finish_with_oplog(self, oplog_capacity: usize) -> Result<Arc<Self>, SchemaError> {
         let (eng, tables, marker_himo_id) = self.into_parts()?;
-        let arc_eng = Engine::concurrentize_with_wal(eng, wal_capacity)
+        let arc_eng = Engine::concurrentize_with_oplog(eng, oplog_capacity)
             .map_err(|e| SchemaError::Io(e.to_string()))?;
         Ok(Arc::new(Self {
             eng: arc_eng,
@@ -434,7 +434,7 @@ impl Database {
     /// schema blob を書き戻すので、 以降の再 open で復元される。
     ///
     /// 典型用途: `Database::open` で開いた直後にスキーマ差分を当てて、
-    /// `finish_with_wal` で concurrent に flip するマイグレーション pattern。
+    /// `finish_with_oplog` で concurrent に flip するマイグレーション pattern。
     pub fn add_column(
         &mut self,
         table_name: &str,
@@ -443,7 +443,7 @@ impl Database {
     ) -> Result<(), SchemaError> {
         if self.is_concurrent {
             return Err(SchemaError::Internal(
-                "add_column requires standalone Database — open via Database::open, not open_with_wal".into()
+                "add_column requires standalone Database — open via Database::open, not open_with_oplog".into()
             ));
         }
         let table_inner = self.find_table_inner(table_name)
@@ -524,7 +524,7 @@ impl Database {
             if let Some(&eid) = eids.first() { return eid; }
         }
         let eid = self.eng.entity();
-        // marker himo は wrap_new / open / open_with_wal で必ず define 済み。
+        // marker himo は wrap_new / open / open_with_oplog で必ず define 済み。
         // tie_text_to は &self なので Arc<Engine> でも呼べる。
         self.eng.tie_text_to(eid, SCHEMA_META_HIMO, SCHEMA_MARKER);
         eid
@@ -1454,12 +1454,12 @@ mod tests {
     fn open_readonly_coexists_with_writer() {
         // writer (sf 風) と reader (Studio 風) が同 DB に並行 open できることを確認。
         // 既存 DB を 1 つ作って閉じ、 その後:
-        //   - writer (open_with_wal) で 1 つ open (writer lock 取る)
+        //   - writer (open_with_oplog) で 1 つ open (writer lock 取る)
         //   - reader (open_readonly) を 3 つ並行 open (lock 取らない)
         // 全部 同じ schema が見えること。
         let path = tmp("readonly_coexist");
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(format!("{}.wal", path));
+        let _ = std::fs::remove_file(format!("{}.oplog", path));
         let _ = std::fs::remove_file(format!("{}.lock", path));
 
         // create + 1 row insert + close
@@ -1484,7 +1484,7 @@ mod tests {
 
         drop((writer, r1, r2, r3));
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(format!("{}.wal", path));
+        let _ = std::fs::remove_file(format!("{}.oplog", path));
         let _ = std::fs::remove_file(format!("{}.lock", path));
     }
 
@@ -1520,15 +1520,15 @@ mod tests {
     #[test]
     fn finish_with_wal_transitions_to_concurrent() {
         let path = tmp("finish_wal");
-        let wal_path = format!("{}.wal", path);
+        let oplog_path = format!("{}.oplog", path);
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&wal_path);
+        let _ = std::fs::remove_file(&oplog_path);
 
         let db_arc: Arc<Database> = {
             let mut db = Database::create_growable_tiny(&path).unwrap();
             db.table("kv").tag("key").number("ts").primary_key("key").build().unwrap();
             assert!(!db.is_concurrent());
-            db.finish_with_wal(64 * 1024).unwrap()
+            db.finish_with_oplog(64 * 1024).unwrap()
         };
         assert!(db_arc.is_concurrent());
         assert_eq!(db_arc.list_tables().len(), 1);
@@ -1551,31 +1551,31 @@ mod tests {
 
         drop(db_arc);
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&wal_path);
+        let _ = std::fs::remove_file(&oplog_path);
     }
 
     #[test]
     fn open_with_wal_recovers_writes() {
         let path = tmp("open_wal");
-        let wal_path = format!("{}.wal", path);
+        let oplog_path = format!("{}.oplog", path);
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&wal_path);
+        let _ = std::fs::remove_file(&oplog_path);
 
-        // 1: build → finish_with_wal → 書き込み → wal_sync で durable
+        // 1: build → finish_with_oplog → 書き込み → oplog_sync で durable
         {
             let mut db = Database::create_growable_tiny(&path).unwrap();
             db.table("kv").tag("key").number("ts").primary_key("key").build().unwrap();
-            let arc = db.finish_with_wal(64 * 1024).unwrap();
+            let arc = db.finish_with_oplog(64 * 1024).unwrap();
             let kv = arc.get_table("kv").unwrap();
             kv.insert().set("key", "alpha").set("ts", 1000i64).commit().unwrap();
             kv.insert().set("key", "beta").set("ts", 2000i64).commit().unwrap();
-            arc.engine().wal_sync().unwrap();
+            arc.engine().oplog_sync().unwrap();
             // Drop は最後の Arc が落ちる時 → consumer thread shutdown で sync
         }
 
-        // 2: open_with_wal で recover、 schema + data 両方見える
+        // 2: open_with_oplog で recover、 schema + data 両方見える
         {
-            let arc = Database::open_with_wal(&path, 64 * 1024).unwrap();
+            let arc = Database::open_with_oplog(&path, 64 * 1024).unwrap();
             assert_eq!(arc.list_tables().len(), 1);
             let kv = arc.get_table("kv").unwrap();
             let alpha = kv.where_eq("key", "alpha").find_one().unwrap();
@@ -1584,7 +1584,7 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&wal_path);
+        let _ = std::fs::remove_file(&oplog_path);
     }
 
     #[test]

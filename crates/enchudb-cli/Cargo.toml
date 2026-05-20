@@ -1,6 +1,6 @@
 [package]
 name = "enchudb-cli"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "EnchuDB CLI — sqlite3 風 REPL で engine を直接叩く。 query_lang 構文 (`age:30 | count` 等) と dot command (`.himos`, `.dump`) のみ、 SQL を経由しない。"
 license-file = "LICENSE.md"
@@ -13,4 +13,4 @@ path = "src/main.rs"
 
 [dependencies]
 enchudb-engine = { path = "../enchudb-engine" }
-enchudb-wal = { path = "../enchudb-wal" }
+enchudb-oplog = { path = "../enchudb-oplog" }

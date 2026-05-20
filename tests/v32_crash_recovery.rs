@@ -9,7 +9,7 @@
 #![cfg(feature = "v32")]
 
 use enchudb::{AuditFilter, Engine, HimoType};
-use enchudb_wal::keys::Keypair;
+use enchudb_oplog::keys::Keypair;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -26,7 +26,7 @@ fn tmp(tag: &str) -> String {
 }
 
 fn cleanup(path: &str) {
-    for suffix in ["", ".wal", ".crc"] {
+    for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", path, suffix));
     }
 }
@@ -63,7 +63,7 @@ fn signed_wal_records_survive_reopen() {
     let pub_bytes = kp.public_bytes();
 
     let initial_count = {
-        let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
+        let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
         eng.set_peer_id(3);
         eng.set_keypair(Some(kp.clone()));
 
@@ -71,9 +71,9 @@ fn signed_wal_records_survive_reopen() {
             let e = eng.entity();
             eng.tie_async(e, "n", i);
         }
-        eng.wal_commit();
+        eng.oplog_commit();
         eng.flush_writes();
-        eng.wal_sync().unwrap();
+        eng.oplog_sync().unwrap();
 
         let recs = eng.audit(&AuditFilter::default());
         assert!(recs.len() >= 50, "pre-drop audit should see 50 ties");
@@ -85,7 +85,7 @@ fn signed_wal_records_survive_reopen() {
     };
 
     // reopen し、recover 後にも audit で全件見え、署名保持されてる。
-    let eng = Engine::open_concurrent_with_wal(&path, 16 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(3);
     eng.pubkeys().force_register(3, &pub_bytes);
     let recs = eng.audit(&AuditFilter::default());
@@ -120,7 +120,7 @@ fn signed_wal_records_survive_reopen() {
 
 #[test]
 fn sigkill_during_v32_signed_loop_preserves_synced_and_signatures() {
-    // v32_signed_loop は 500 件毎に wal_sync。SIGKILL 後の復旧で
+    // v32_signed_loop は 500 件毎に oplog_sync。SIGKILL 後の復旧で
     //   1) 1 回以上同期した分(>=500)は entity として残る
     //   2) WAL レコードの署名は消えない(reopen 後の audit で verify 通る)
     // を確認する。
@@ -156,12 +156,12 @@ fn sigkill_during_v32_signed_loop_preserves_synced_and_signatures() {
     let _ = child.wait();
 
     // recover
-    let eng = Engine::open_concurrent_with_wal(&path, 64 * 1024 * 1024).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(&path, 64 * 1024 * 1024).unwrap();
     eng.set_peer_id(1);
     // child 側と同じ pubkey を TOFU 登録
     eng.pubkeys().force_register(1, &pub_bytes);
 
-    // 最低 500 件(=child が 1 回 wal_sync 到達)は残ってる
+    // 最低 500 件(=child が 1 回 oplog_sync 到達)は残ってる
     let ec = eng.entity_count();
     assert!(
         ec >= 500,

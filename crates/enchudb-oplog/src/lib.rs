@@ -1,21 +1,23 @@
-//! EnchuDB WAL crate — wire-level primitives shared across engine / sync / transport.
+//! EnchuDB oplog crate — wire-level primitives shared across engine / sync / transport.
 //!
 //! このクレートは以下を提供する:
 //! - **Hlc / PeerId / EntityId**: 分散 op に必要な全順序・peer 識別の primitive 型
-//! - **Wal**: append-only operation log (v2 format)
-//! - **Keypair / PubkeyStore**: WAL 署名検証用の ed25519 鍵管理
+//! - **OpLog**: append-only operation log (v2 format)
+//! - **Keypair / PubkeyStore**: oplog 署名検証用の ed25519 鍵管理
 //!
-//! `enchudb-engine` から切り出すことで「WAL は engine の内部詳細」ではなく
+//! `enchudb-engine` から切り出すことで「oplog は engine の内部詳細」ではなく
 //! 「分散 DB の正準パケットフォーマット」として独立リリース可能にする。
-//! 既存の `enchudb_engine::wal::*` / `enchudb_engine::keys::*` / `enchudb_engine::Hlc`
-//! などのパスは engine 側で re-export して後方互換を保つ。
+//!
+//! 命名: 旧 `enchudb-wal` から rename (issue #8、 0.6.0 で実施)。 実態が
+//! write-ahead log ではなく oplog (operation log、 MongoDB oplog と同パターン)
+//! なため。 wire format は不変、 file 拡張子は `.wal` → `.oplog` (clean break)。
 
 pub mod keys;
-pub mod wal;
+pub mod oplog;
 
 /// Content key 用の簡易 hash → 15bit。MSB は LWW key namespace で占有。
 /// engine 側の recover hydrate と sync 側の apply_one で同じハッシュを使うため
-/// wal crate に共通化してある。 変更すると HlcStore キーが分岐するので注意。
+/// oplog crate に共通化してある。 変更すると HlcStore キーが分岐するので注意。
 #[inline]
 pub fn content_key_hash15(s: &str) -> u16 {
     let mut h: u32 = 0x811c9dc5;

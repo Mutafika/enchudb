@@ -40,26 +40,26 @@
 //!
 //! let path = format!("/tmp/enchudb-cf-doc-{}.db", std::process::id());
 //! # let _ = std::fs::remove_file(&path);
-//! # let _ = std::fs::remove_file(format!("{}.wal", path));
+//! # let _ = std::fs::remove_file(format!("{}.oplog", path));
 //! {
 //!     let mut eng = Engine::create_standalone(&path).unwrap();
 //!     eng.define_himo("v", HimoType::Number, 100);
 //!     eng.flush().unwrap();
 //! }
-//! let eng = Engine::open_concurrent_with_wal(&path, 4 * 1024 * 1024).unwrap();
+//! let eng = Engine::open_concurrent_with_oplog(&path, 4 * 1024 * 1024).unwrap();
 //! let counter = Arc::new(Mutex::new(0usize));
 //! eng.add_change_listener(Arc::new(CountSink(counter.clone())));
 //!
 //! let e = eng.entity();
 //! eng.tie_async(e, "v", 1);
-//! eng.wal_commit();
+//! eng.oplog_commit();
 //! eng.flush_writes();
-//! eng.wal_sync().unwrap();
+//! eng.oplog_sync().unwrap();
 //! // この時点で counter には少なくとも 1 件入る
 //! assert!(*counter.lock().unwrap() >= 1);
 //! drop(eng);
 //! # let _ = std::fs::remove_file(&path);
-//! # let _ = std::fs::remove_file(format!("{}.wal", path));
+//! # let _ = std::fs::remove_file(format!("{}.oplog", path));
 //! ```
 
 use crate::transport::WireRecord;

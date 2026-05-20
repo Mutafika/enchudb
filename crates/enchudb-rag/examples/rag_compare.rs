@@ -235,7 +235,7 @@ fn measure_enchu(ds: &Dataset, k: usize) -> Vec<Row> {
             let truth_set: std::collections::HashSet<u32> =
                 truth.iter().map(|(i, _)| *i).collect();
             let hit_local: Vec<u32> = hits.iter()
-                .map(|h| enchudb_wal::eid_local(h.eid))
+                .map(|h| enchudb_oplog::eid_local(h.eid))
                 .collect();
             let intersect = hit_local.iter().filter(|i| truth_set.contains(i)).count();
             recall_acc += intersect as f64 / k.max(1) as f64;

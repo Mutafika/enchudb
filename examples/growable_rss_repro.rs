@@ -96,7 +96,7 @@ fn main() {
     let path = "/tmp/enchudb_growable_rss_repro.db";
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{}.crc", path));
-    let _ = std::fs::remove_file(format!("{}.wal", path));
+    let _ = std::fs::remove_file(format!("{}.oplog", path));
 
     let t0 = Instant::now();
     let baseline_vsz = vsz_mb();
@@ -147,5 +147,5 @@ fn main() {
     // file 削除
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{}.crc", path));
-    let _ = std::fs::remove_file(format!("{}.wal", path));
+    let _ = std::fs::remove_file(format!("{}.oplog", path));
 }

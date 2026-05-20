@@ -29,7 +29,7 @@ fn main() {
     let duck_path = "/tmp/battle_duck.db";
     let sqlite_path = "/tmp/battle_sqlite.db";
     let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}.wal", db_path));
+    let _ = std::fs::remove_file(format!("{}.oplog", db_path));
     let _ = std::fs::remove_file(csv_path);
     let _ = std::fs::remove_file(duck_path);
     let _ = std::fs::remove_file(sqlite_path);
@@ -47,7 +47,7 @@ fn main() {
     let mut csv = std::fs::File::create(csv_path).unwrap();
     writeln!(csv, "user_id,dept_id,salary,year").unwrap();
 
-    let mut eids: Vec<enchudb_wal::EntityId> = Vec::with_capacity(N as usize);
+    let mut eids: Vec<enchudb_oplog::EntityId> = Vec::with_capacity(N as usize);
     let mut rng = 0x9E3779B97F4A7C15u64;
     for i in 0..N {
         rng = xorshift(rng);
@@ -180,7 +180,7 @@ fn main() {
         s, len_acc, sum_acc, full_acc, g_acc);
 
     let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}.wal", db_path));
+    let _ = std::fs::remove_file(format!("{}.oplog", db_path));
     let _ = std::fs::remove_file(csv_path);
     let _ = std::fs::remove_file(duck_path);
     let _ = std::fs::remove_file(sqlite_path);

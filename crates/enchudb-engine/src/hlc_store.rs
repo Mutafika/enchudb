@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use enchudb_wal::Hlc;
+use enchudb_oplog::Hlc;
 
 type Key = (u64, u16);
 

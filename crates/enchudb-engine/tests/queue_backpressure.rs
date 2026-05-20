@@ -1,4 +1,4 @@
-//! issue4 regression: write_queue / wal_record_queue を bounded ArrayQueue 化、
+//! issue4 regression: write_queue / oplog_record_queue を bounded ArrayQueue 化、
 //! producer は queue 満杯時に yield-spin で block する。 small cap で writer 数 >>
 //! consumer rate な状況を作って、 hang せず全 push が完走する事を確認。
 
@@ -12,12 +12,12 @@ use std::sync::Arc;
 fn small_queue_cap_does_not_hang() {
     let path = "/tmp/test_queue_backpressure.db";
     let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{path}.wal"));
+    let _ = std::fs::remove_file(format!("{path}.oplog"));
     let _ = std::fs::remove_file(format!("{path}.lock"));
 
-    let eng: Arc<Engine> = Engine::create_concurrent_with_wal_queue_cap(
+    let eng: Arc<Engine> = Engine::create_concurrent_with_oplog_queue_cap(
         path,
-        4 * 1024 * 1024, // wal_capacity 4 MB
+        4 * 1024 * 1024, // oplog_capacity 4 MB
         64,              // queue_capacity (tiny — 強制的に backpressure 発動)
     ).expect("create");
 

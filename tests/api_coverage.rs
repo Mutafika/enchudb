@@ -20,14 +20,14 @@ fn tmp(tag: &str) -> String {
             .unwrap()
             .as_nanos()
     );
-    for suffix in ["", ".wal", ".crc"] {
+    for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", p, suffix));
     }
     p
 }
 
 fn cleanup(path: &str) {
-    for suffix in ["", ".wal", ".crc"] {
+    for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", path, suffix));
     }
 }
@@ -137,17 +137,17 @@ fn open_concurrent_replica_rejects_writes_and_syncs_via_remote() {
 
     // replica mode は書き込み API で panic するので、remote_*_apply を直接叩く
     let himo_id = eng.himo_id("v").unwrap() as u16;
-    eng.remote_tie_apply(enchudb_wal::make_eid(1, 5), himo_id, 42);
-    assert_eq!(eng.get(enchudb_wal::make_eid(1, 5), "v"), Some(42));
+    eng.remote_tie_apply(enchudb_oplog::make_eid(1, 5), himo_id, 42);
+    assert_eq!(eng.get(enchudb_oplog::make_eid(1, 5), "v"), Some(42));
 
     // set_replica_mode(false) で書き込み解放
     eng.set_replica_mode(false);
     assert!(!eng.is_replica());
     let e = eng.entity();
     eng.tie_async(e, "v", 99);
-    eng.wal_commit();
+    eng.oplog_commit();
     eng.flush_writes();
-    eng.wal_sync().unwrap();
+    eng.oplog_sync().unwrap();
     assert_eq!(eng.get(e, "v"), Some(99));
 
     drop(eng);
