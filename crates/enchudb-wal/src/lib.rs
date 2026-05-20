@@ -26,29 +26,89 @@ pub fn content_key_hash15(s: &str) -> u16 {
     (h as u16) & 0x7fff
 }
 
-/// v32: Entity ID。u64 = `[peer_id: 32bit][local_id: 32bit]`。
-/// 単独 peer 運用時は peer_id = 0、実質 local_id のみ使われる。
+/// v32 → v3 phase 3: Entity ID は u64。
+///
+/// **bit layout (β-heavy phase 3 以降)**:
+/// ```text
+/// [63..40]  peer_id        (24 bit、 1600万 peer)
+/// [39..24]  table_id       (16 bit、 65k tables、 0 = anonymous)
+/// [23..0]   table_local    (24 bit、 1600万 row/table)
+/// ```
+///
+/// 旧 layout は `[peer: 32][local: 32]`。 互換性: `peer < 2^24` かつ
+/// `table_id = 0` (= anonymous-only DB) かつ `local < 2^24` の範囲なら、
+/// 旧/新 で numerical value が一致するため、 0.5.0 (file format v6) で
+/// 作った single-peer DB はそのまま decode 可能。 multi-peer (peer >= 2^24)
+/// または table_id != 0 の DB は新 layout を前提とする (v7 file format)。
 pub type EntityId = u64;
 
-/// v32: Peer ID。各 peer が固有 u32 ID を持ち、上位 32bit を EntityId に埋め込む。
+/// v32: Peer ID。 phase 3 以降は実質 24 bit のみ使用 (上位 8 bit は予約)。
 pub type PeerId = u32;
 
-/// local_id と peer_id から EntityId を合成。
+/// Table ID。 0 = anonymous table、 1.. が named table の sequential id。
+/// engine の `TableId` (= u16) と同 alias。
+pub type TableId = u16;
+
+/// PeerId の最大値 (24 bit = 16M)。 これを超える peer 番号は EntityId に
+/// 詰めて返した時に上位 bit が欠ける。
+pub const MAX_PEER_ID: PeerId = (1 << 24) - 1;
+/// Table 内 local id の最大値 (24 bit = 16M)。
+pub const MAX_TABLE_LOCAL: u32 = (1 << 24) - 1;
+
+const TABLE_LOCAL_BITS: u32 = 24;
+const TABLE_ID_BITS: u32 = 16;
+const TABLE_LOCAL_MASK: u64 = (1u64 << TABLE_LOCAL_BITS) - 1;
+const TABLE_ID_MASK: u64 = (1u64 << TABLE_ID_BITS) - 1;
+
+/// (peer, table_id, table_local) から EntityId を合成 (phase 3 新 API)。
+///
+/// debug_assert で各フィールドの上限超過を検出。 release では high bits が
+/// 黙って捨てられる (= mod 2^N で truncate)。
+#[inline]
+pub const fn make_eid_in_table(peer: PeerId, table_id: TableId, table_local: u32) -> EntityId {
+    debug_assert!(peer <= MAX_PEER_ID, "peer id exceeds 24 bit");
+    debug_assert!(table_local <= MAX_TABLE_LOCAL, "table_local exceeds 24 bit");
+    ((peer as u64 & ((1u64 << 24) - 1)) << (TABLE_LOCAL_BITS + TABLE_ID_BITS))
+        | ((table_id as u64 & TABLE_ID_MASK) << TABLE_LOCAL_BITS)
+        | (table_local as u64 & TABLE_LOCAL_MASK)
+}
+
+/// 旧 `(peer, local)` 互換 API。 `local` を anonymous table の table_local
+/// として扱う (= table_id = 0)。
+///
+/// **互換性**: peer < 2^24 かつ local < 2^24 の範囲では、 旧 layout の
+/// `((peer << 32) | local)` と一致する 「ように見える」 が、 厳密には
+/// 異なる (= peer ≥ 2^24 で differ)。 旧 layout に依存するコードは
+/// `make_eid_in_table` を直接使うこと。
 #[inline]
 pub const fn make_eid(peer: PeerId, local: u32) -> EntityId {
-    ((peer as u64) << 32) | (local as u64)
+    make_eid_in_table(peer, 0, local)
 }
 
-/// EntityId から peer 部分を取得。
+/// EntityId から peer 部分を取得 (24 bit)。 旧 32 bit peer の上位 8 bit は捨てる。
 #[inline]
 pub const fn eid_peer(eid: EntityId) -> PeerId {
-    (eid >> 32) as u32
+    (eid >> (TABLE_LOCAL_BITS + TABLE_ID_BITS)) as u32 & MAX_PEER_ID
 }
 
-/// EntityId から local 部分を取得。
+/// EntityId から table_id 部分を取得 (16 bit)。 0 = anonymous。
+#[inline]
+pub const fn eid_table_id(eid: EntityId) -> TableId {
+    ((eid >> TABLE_LOCAL_BITS) & TABLE_ID_MASK) as u16
+}
+
+/// EntityId から table_local 部分を取得 (24 bit)。 engine の column / positions
+/// index として使う。
+#[inline]
+pub const fn eid_table_local(eid: EntityId) -> u32 {
+    (eid & TABLE_LOCAL_MASK) as u32
+}
+
+/// 旧 `eid_local` 互換: anonymous table 想定で table_local 部分を返す。
+/// 新コードは `eid_table_local` を直接呼ぶ方が intent が明確。
 #[inline]
 pub const fn eid_local(eid: EntityId) -> u32 {
-    eid as u32
+    eid_table_local(eid)
 }
 
 /// v32: Hybrid Logical Clock。分散 peer 間で全順序を確立する。
