@@ -20,6 +20,10 @@ unsafe impl Send for Column {}
 
 impl Column {
     pub fn init(region: Region, value_size: u32, max_entities: u32) -> Self {
+        // β-heavy phase 2: TableColumnStore 経由の growable backing でも安全に
+        // header を書けるよう ensure_committed を呼ぶ (main file 系の static
+        // backing では no-op)。
+        let _ = region.ensure_committed(HEADER);
         let mm = region.slice_mut();
         mm[0..4].copy_from_slice(&0u32.to_le_bytes());
         mm[4..8].copy_from_slice(&value_size.to_le_bytes());
@@ -44,6 +48,9 @@ impl Column {
         let vs = self.value_size as usize;
         let off = HEADER + (entity_id as usize) * vs;
         let len = value.len().min(vs);
+        // β-heavy phase 2: growable backing で off + len が未 commit な場合に
+        // page fault を防ぐ。 static backing では no-op (fast path)。
+        let _ = self.region.ensure_committed(off + len);
         let mm = self.region.slice_mut();
         mm[off..off + len].copy_from_slice(&value[..len]);
         self.region.mark_dirty(off, len);
@@ -61,6 +68,7 @@ impl Column {
     pub fn clear(&self, entity_id: u32) {
         let vs = self.value_size as usize;
         let off = HEADER + (entity_id as usize) * vs;
+        let _ = self.region.ensure_committed(off + vs);
         let mm = self.region.slice_mut();
         for b in &mut mm[off..off + vs] { *b = 0; }
         self.region.mark_dirty(off, vs);
@@ -72,6 +80,9 @@ impl Column {
     pub fn ensure_count(&self, eid: u32) {
         let needed = eid + 1;
         self.count.fetch_max(needed, Ordering::Relaxed);
+        // growable backing で eid 末尾までの slot が未 commit な場合に対応
+        let vs = self.value_size as usize;
+        let _ = self.region.ensure_committed(HEADER + (needed as usize) * vs);
         // mmapヘッダにも書く
         let mm = self.region.slice_mut();
         // ヘッダの count は rebuild/flush 時に確定するので、ここでは最大値を書く

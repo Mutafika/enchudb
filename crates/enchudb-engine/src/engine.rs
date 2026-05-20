@@ -855,6 +855,15 @@ pub struct Engine {
     /// Region mode、 None なら旧来の Heap mode (from_bytes / wasm 等)。
     #[cfg(not(target_arch = "wasm32"))]
     positions_sidecar: Option<std::sync::Arc<crate::positions_sidecar::PositionsSidecar>>,
+    /// β-heavy phase 2: named table 毎の独立 column file。 `define_table` で
+    /// 作られ、 `define_himo_in` 経由で追加された新規 himo の column はここに
+    /// 入る。 anonymous table の himo は引き続き main file 内 slot を使うので
+    /// このマップには登録しない。 key は table_id。
+    #[cfg(not(target_arch = "wasm32"))]
+    table_column_stores: std::collections::HashMap<
+        TableId,
+        std::sync::Arc<crate::table_column_store::TableColumnStore>,
+    >,
     backing: Backing, // 最後に drop されるよう最終フィールド
 }
 
@@ -1007,6 +1016,7 @@ impl Engine {
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             _writer_lock: Some(writer_lock),
             positions_sidecar: Some(positions_sidecar),
+            table_column_stores: std::collections::HashMap::new(),
             backing: Backing::Mmap(mmap),
         })
     }
@@ -1236,6 +1246,7 @@ impl Engine {
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             _writer_lock: Some(writer_lock),
             positions_sidecar: Some(positions_sidecar),
+            table_column_stores: std::collections::HashMap::new(),
             backing: Backing::Growable(map),
         })
     }
@@ -1304,10 +1315,13 @@ impl Engine {
         Ok(eng)
     }
 
-    /// β-heavy phase 1: positions sidecar を open_or_create して、 既存
-    /// HimoStore (Heap mode で load されたもの) を Region mode に置き換える。
-    /// 各 slot は magic check で 「既に valid」 / 「fresh」 を判定し、 fresh なら
-    /// PositionsRegion::init() を呼ぶ。 lazy rebuild は次の cyl 触りで走る。
+    /// β-heavy phase 1+2: positions sidecar を open_or_create + named table の
+    /// TableColumnStore を open_or_create し、 各 HimoStore を Region mode に
+    /// 置き換える。 himo の column source は所属 table に応じて選択:
+    ///   - anonymous table の himo → main file 内の slot
+    ///   - named table の himo → `{path}.t.{name}.col` 内の slot
+    /// 各 slot は magic check で 「既に valid」 / 「fresh」 を判定。 lazy rebuild
+    /// は次の cyl 触りで走る。
     #[cfg(not(target_arch = "wasm32"))]
     fn attach_positions_sidecar(&mut self) -> io::Result<()> {
         if self.path.is_empty() {
@@ -1321,25 +1335,80 @@ impl Engine {
             )?,
         );
 
-        // 既存の HimoStore を Region mode で再構築。 col_region は backing から
-        // 切り直す (同じ memory を指す)。 type / max_values は self に保存済み。
+        // β-heavy phase 2: anonymous でない table 群について TableColumnStore を
+        // open。 file が無ければ create (v5/v5.5 → v6 lazy migration)。
+        // 既存 himo の column が main file 側にあるか table file 側にあるかは
+        // 「table file の slot magic を見て」 判定する形が理想だが、 Column が
+        // magic を持たない (header は count/value_size/max_entities のみ) ので
+        // 区別困難。 phase 2 では 「freshly-created table column file」 = empty
+        // と見なし、 既存 column data は main file 側にあるものとして load する
+        // (v5 DB の compat 確保)。 新規 table 経由で create された場合のみ
+        // table file 側を使う。
+        let mut table_column_stores: std::collections::HashMap<
+            TableId,
+            std::sync::Arc<crate::table_column_store::TableColumnStore>,
+        > = std::collections::HashMap::new();
+        for (tid, t) in self.tables.iter().enumerate().skip(1) {
+            let tcs = crate::table_column_store::TableColumnStore::open_or_create(
+                &self.path,
+                &t.name,
+                self.max_entities,
+                self.max_himos,
+            )?;
+            table_column_stores.insert(tid as TableId, std::sync::Arc::new(tcs));
+        }
+
+        // 既存の HimoStore を Region mode で再構築。 col_region は himo の所属
+        // table に応じて main file or table file から取る。
         #[cfg(not(target_arch = "wasm32"))]
         let grower = self.backing.grower();
         let base = self.backing.as_mut_ptr();
         let cyl_max_values = self.layout.cyl_max_values;
 
         for hid in 0..self.himos.len() {
-            let col_off = self.layout.himo_col_off(hid);
-            let col_size = self.layout.himo_col_size;
-            let col_region = {
-                #[cfg(not(target_arch = "wasm32"))]
+            let tid = self.himo_to_table[hid];
+            let col_region = if tid != ANONYMOUS_TABLE {
+                if let Some(tcs) = table_column_stores.get(&tid) {
+                    // table file の slot を試す。 既存 column data が main file
+                    // 側にある可能性 (v5/v5.5 DB の lazy migration) があるので、
+                    // table file slot に valid な Column header があれば table
+                    // file 採用、 無ければ main file fallback。
+                    let region = tcs.region_for(hid as u32);
+                    // header の magic は無いが、 max_entities フィールドが期待
+                    // 値と一致するかで識別。 max_entities は self.max_entities
+                    // 固定 (Layout で決まる) なので、 一致しなければ未初期化。
+                    let mm = region.slice();
+                    let max_ent =
+                        u32::from_le_bytes(mm[8..12].try_into().unwrap_or([0; 4]));
+                    if max_ent == self.max_entities {
+                        region
+                    } else {
+                        // main file fallback
+                        let col_off = self.layout.himo_col_off(hid);
+                        let col_size = self.layout.himo_col_size;
+                        if let Some(g) = &grower {
+                            unsafe { Region::with_grower(g.clone(), col_off, col_size) }
+                        } else {
+                            unsafe { Region::new(base.add(col_off), col_size) }
+                        }
+                    }
+                } else {
+                    let col_off = self.layout.himo_col_off(hid);
+                    let col_size = self.layout.himo_col_size;
+                    if let Some(g) = &grower {
+                        unsafe { Region::with_grower(g.clone(), col_off, col_size) }
+                    } else {
+                        unsafe { Region::new(base.add(col_off), col_size) }
+                    }
+                }
+            } else {
+                let col_off = self.layout.himo_col_off(hid);
+                let col_size = self.layout.himo_col_size;
                 if let Some(g) = &grower {
                     unsafe { Region::with_grower(g.clone(), col_off, col_size) }
                 } else {
                     unsafe { Region::new(base.add(col_off), col_size) }
                 }
-                #[cfg(target_arch = "wasm32")]
-                unsafe { Region::new(base.add(col_off), col_size) }
             };
             let pos_region = sidecar.region_for(hid as u32);
             let positions =
@@ -1353,6 +1422,7 @@ impl Engine {
             self.himos[hid] = HimoStore::load_with_positions(col_region, ht, mv, positions);
         }
         self.positions_sidecar = Some(sidecar);
+        self.table_column_stores = table_column_stores;
         Ok(())
     }
 
@@ -1675,6 +1745,8 @@ impl Engine {
             // wasm のような path 無し経路は None のまま (Heap mode で動く)。
             #[cfg(not(target_arch = "wasm32"))]
             positions_sidecar: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            table_column_stores: std::collections::HashMap::new(),
             backing,
         };
 
@@ -1805,6 +1877,26 @@ impl Engine {
             next_local: 0,
         });
         self.try_persist_tables();
+
+        // β-heavy phase 2: named table 用の独立 column file を作る。
+        // wasm 経路や path 無し経路はスキップ (HashMap に登録しない → ensure_himo 側で
+        // main file fallback)。
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.path.is_empty() {
+            match crate::table_column_store::TableColumnStore::create(
+                &self.path,
+                name,
+                self.max_entities,
+                self.max_himos,
+            ) {
+                Ok(tcs) => {
+                    self.table_column_stores.insert(tid, std::sync::Arc::new(tcs));
+                }
+                Err(e) => {
+                    return Err(format!("table column store init failed: {}", e));
+                }
+            }
+        }
         Ok(tid)
     }
 
@@ -2175,18 +2267,22 @@ impl Engine {
 
         let full_name = format!("{}.{}", table_name, himo_name);
 
-        // ensure_himo は既に存在ならそのまま、 新規なら anonymous へ attach する。
-        // 後者なら anonymous の himo_ids から外して target table へ移す。
-        let hid = self.ensure_himo(&full_name, ht, max_values);
+        // β-heavy phase 2: 新規 himo なら target table id を渡して
+        // ensure_himo_in を呼ぶ。 こうすると column が table file の slot に
+        // 入る。 既存 himo は ensure_himo_in が return するだけ (= 移動なし)。
+        let hid = self.ensure_himo_in(&full_name, ht, max_values, tid as TableId);
         let hid_u32 = hid as u32;
 
-        // 既に target table に attach 済みなら何もしない (重複 define_himo_in)
+        // 既に target table に attach 済みなら何もしない (重複 define_himo_in or
+        // 上の ensure_himo_in で新規 attach 済み)
         if self.himo_to_table[hid] == tid as TableId {
+            self.try_persist_tables();
             return Ok(hid_u32);
         }
 
-        // ensure_himo は新規時に ANONYMOUS_TABLE へ attach するので、 別 table
-        // 既属の場合は migrate する形 (実用上は新規時のみ通る)。
+        // ensure_himo (旧 API 経由) で既に anonymous へ attach されていた既存
+        // himo は migrate する。 column data は main file に残るが、 table 帰属
+        // のみ更新 (lazy migration、 column の物理移動は将来の課題)。
         let cur_tid = self.himo_to_table[hid];
         self.tables[cur_tid as usize]
             .himo_ids
@@ -3149,6 +3245,19 @@ impl Engine {
     }
 
     fn ensure_himo(&mut self, himo: &str, ht: HimoType, max_values: u32) -> usize {
+        self.ensure_himo_in(himo, ht, max_values, ANONYMOUS_TABLE)
+    }
+
+    /// β-heavy phase 2: target_table 指定版。 anonymous なら main file slot を、
+    /// named なら `table_column_stores[target_table]` の slot を使う。 既存 himo
+    /// は target に関わらず column 移動しない (caller が再 attach する形)。
+    fn ensure_himo_in(
+        &mut self,
+        himo: &str,
+        ht: HimoType,
+        max_values: u32,
+        target_table: TableId,
+    ) -> usize {
         if let Some(idx) = self.himo_id(himo) { return idx; }
         let hid = self.himos.len();
         assert!((hid as u32) < self.max_himos, "too many himos (max {})", self.max_himos);
@@ -3165,12 +3274,33 @@ impl Engine {
         #[cfg(not(target_arch = "wasm32"))]
         let grower = self.backing.grower();
         let base = self.backing.as_mut_ptr();
-        let make_region = |off: usize, size: usize| -> Region {
+        let make_main_region = |off: usize, size: usize| -> Region {
             #[cfg(not(target_arch = "wasm32"))]
             if let Some(g) = &grower {
                 return unsafe { Region::with_grower(g.clone(), off, size) };
             }
             unsafe { Region::new(base.add(off), size) }
+        };
+
+        // β-heavy phase 2: target table が named (= ANONYMOUS_TABLE 以外) なら
+        // TableColumnStore の slot を使う。 anonymous なら main file 内 slot。
+        // table_column_stores 未配線 (path 無し engine / wasm / open path で table
+        // file 消失等) は main file fallback。
+        let col_region: Region = {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                if target_table != ANONYMOUS_TABLE {
+                    if let Some(tcs) = self.table_column_stores.get(&target_table) {
+                        tcs.region_for(hid as u32)
+                    } else {
+                        make_main_region(col_off, self.layout.himo_col_size)
+                    }
+                } else {
+                    make_main_region(col_off, self.layout.himo_col_size)
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            { make_main_region(col_off, self.layout.himo_col_size) }
         };
 
         // β-heavy phase 1: sidecar が attached なら Region mode で init、
@@ -3179,37 +3309,30 @@ impl Engine {
         let hs = if let Some(sidecar) = &self.positions_sidecar {
             let pos_region = sidecar.region_for(hid as u32);
             // β-heavy phase 1: eid_offset=0 で init すると、 任意の eid 順での
-                    // tie (= 大→小 順含む) を panic 無しで扱える。 commit
-                    // 空間は max_eid_seen × 8 byte に限定されるので、 大半が
-                    // 0 近辺で tie されるワークロードでは waste 少。
-                    let positions = crate::positions_region::PositionsRegion::init_with_offset(pos_region, 0);
+            // tie (= 大→小 順含む) を panic 無しで扱える。
+            let positions = crate::positions_region::PositionsRegion::init_with_offset(pos_region, 0);
             HimoStore::init_with_positions(
-                make_region(col_off, self.layout.himo_col_size),
+                col_region,
                 ht, effective_mv, self.max_entities, positions,
             )
         } else {
-            HimoStore::init(
-                make_region(col_off, self.layout.himo_col_size),
-                ht, effective_mv, self.max_entities,
-            )
+            HimoStore::init(col_region, ht, effective_mv, self.max_entities)
         };
         #[cfg(target_arch = "wasm32")]
-        let hs = HimoStore::init(
-            make_region(col_off, self.layout.himo_col_size),
-            ht, effective_mv, self.max_entities,
-        );
+        let hs = HimoStore::init(col_region, ht, effective_mv, self.max_entities);
 
         self.himos.push(hs);
         self.himo_names.push(himo.to_string());
         self.himo_types.push(ht);
         self.himo_max_values.push(max_values);
 
-        // β-light step 2: 旧 API (define_himo) で追加された himo は anonymous
-        // table に attach する。 step 3+ で define_table 経由なら target table
-        // を指定して attach する形に拡張。
+        // β-light step 2 / β-heavy phase 2: target_table が指定されていれば
+        // そちらへ、 anonymous なら ANONYMOUS_TABLE へ attach。 define_himo_in
+        // 経由の旧 「anonymous attach → migrate」 path も維持される
+        // (target_table=ANONYMOUS で attach、 caller 側が migrate)。
         let hid_u32 = hid as u32;
-        self.tables[ANONYMOUS_TABLE as usize].himo_ids.push(hid_u32);
-        self.himo_to_table.push(ANONYMOUS_TABLE);
+        self.tables[target_table as usize].himo_ids.push(hid_u32);
+        self.himo_to_table.push(target_table);
 
         // ヘッダにメタデータ書き込み
         let maxv_base = himo_maxv_base(self.max_himos);
