@@ -198,6 +198,19 @@ impl Syncer {
         self.require_signature.store(on, std::sync::atomic::Ordering::Release);
     }
 
+    /// 0.7.0 (Phase 5): peer に対する initial sync 完了マーク。 user code が
+    /// (1) transport.bootstrap_to 等で peer の snapshot を local に copy
+    /// (2) その時点での peer の `current_sync_lsn()` を別 RPC / shake-hands で取得
+    /// (3) 本 API で「ここまで配信済み」 を engine の `_sync_peers` に記録
+    /// (4) 以降は通常の pull_once / publish_since で incremental sync
+    ///
+    /// 0.7.0 では transport wire の bootstrap response に lsn を入れる拡張は
+    /// 入れていない (= example で「user が別経路で lsn を取る」 pattern を提示)。
+    /// 0.8.0 で transport API を拡張して 1 行に纏める想定。
+    pub fn mark_initial_sync_complete(&self, peer: PeerId, snapshot_lsn: u32) -> Result<(), String> {
+        self.engine.ack_sync(peer, snapshot_lsn)
+    }
+
     /// 指定 peer から未取得レコードを 1 回 pull して本体に apply。
     /// request4: `pull_as(self_peer, from, since)` 経由で broadcast log +
     /// (from, self_peer) targeted log を両方拾う。 partial sync 対応 transport

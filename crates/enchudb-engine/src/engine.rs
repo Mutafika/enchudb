@@ -1959,6 +1959,13 @@ impl Engine {
         purged
     }
 
+    /// 0.7.0 (Phase 5): 現時点の sync lsn (= 次に転送される record の lsn - 1)。
+    /// `transfer_oplog_to_sync_ops` で割当て済みの max lsn。 snapshot 取得時に
+    /// 「snapshot 時点でここまで配信済み」 を表すマーカーとして使う。
+    pub fn current_sync_lsn(&self) -> u32 {
+        self.next_sync_lsn.load(std::sync::atomic::Ordering::Acquire).saturating_sub(1)
+    }
+
     /// 0.7.0 (Phase 4): `_sync_ops` の `lsn > since_lsn` row を全 himo set で
     /// 返す。 Syncer の publish_since が「peer.consumed_lsn より新しい op を
     /// 流す」 用途で呼ぶ。 返り値の各 entry は payload (= 完全 wire bytes)。
@@ -4055,6 +4062,14 @@ impl Engine {
             let crc_dst = format!("{}.crc", target);
             std::fs::copy(&crc_src, &crc_dst)?;
             files.crc = Some(crc_dst);
+        }
+
+        // 0.7.0: .tables sidecar も snapshot に含める (= receiver が table 構造を
+        // 復元できる、 reserved table `_sync_ops` / `_sync_peers` も含む)。
+        let tables_src = format!("{}.tables", self.path);
+        if std::path::Path::new(&tables_src).exists() {
+            let tables_dst = format!("{}.tables", target);
+            std::fs::copy(&tables_src, &tables_dst)?;
         }
 
         Ok(files)
