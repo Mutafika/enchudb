@@ -97,7 +97,7 @@ fn serialize_tables(tables: &[TableDef]) -> Vec<u8> {
         out.extend_from_slice(name_bytes);
         out.extend_from_slice(&t.eid_range_lo.to_le_bytes());
         out.extend_from_slice(&t.eid_range_hi.to_le_bytes());
-        out.extend_from_slice(&t.next_local.to_le_bytes());
+        out.extend_from_slice(&t.next_local.load(std::sync::atomic::Ordering::Relaxed).to_le_bytes());
         out.extend_from_slice(&(t.himo_ids.len() as u32).to_le_bytes());
         for &h in &t.himo_ids {
             out.extend_from_slice(&h.to_le_bytes());
@@ -145,7 +145,8 @@ fn deserialize_tables(buf: &[u8]) -> Result<Vec<TableDef>, String> {
         off += name_len;
         let eid_range_lo = read_u32!(buf, off);
         let eid_range_hi = read_u32!(buf, off);
-        let next_local = read_u32!(buf, off);
+        let next_local_u32 = read_u32!(buf, off);
+        let next_local = std::sync::atomic::AtomicU32::new(next_local_u32);
         let himo_count = read_u32!(buf, off) as usize;
         let mut himo_ids = Vec::with_capacity(himo_count);
         for _ in 0..himo_count {
@@ -729,7 +730,7 @@ pub const ANONYMOUS_TABLE: TableId = 0;
 /// step 2 段階では engine 内部にしか露出せず、 一部 field は step 3+ で
 /// 使われる。 dead code 警告は段階実装の意図的な姿。
 #[allow(dead_code)]
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct TableDef {
     /// table 名 (anonymous は ""、 user 定義 table は固有名)。
     pub name: String,
@@ -747,7 +748,26 @@ pub(crate) struct TableDef {
     /// 次に entity_in で割り当てる eid の table 内 local offset。
     /// global eid = eid_range_lo + next_local。 anonymous table は
     /// `entities.next_eid()` (= EntitySet 直) を使うのでこの field は不参照。
-    pub next_local: u32,
+    ///
+    /// 0.7.0: `&self entity_in` を支えるため AtomicU32 化。 schema crate
+    /// (= Arc<Engine> 経由の concurrent mode) で row insert する path が
+    /// CAS で並行 safe に払出できる。
+    pub next_local: std::sync::atomic::AtomicU32,
+}
+
+impl Clone for TableDef {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            himo_ids: self.himo_ids.clone(),
+            eid_range_lo: self.eid_range_lo,
+            eid_range_hi: self.eid_range_hi,
+            fk_refs: self.fk_refs.clone(),
+            next_local: std::sync::atomic::AtomicU32::new(
+                self.next_local.load(std::sync::atomic::Ordering::Relaxed)
+            ),
+        }
+    }
 }
 
 impl TableDef {
@@ -762,9 +782,27 @@ impl TableDef {
             eid_range_lo: 0,
             eid_range_hi: u32::MAX,
             fk_refs: Vec::new(),
-            next_local: 0,
+            next_local: std::sync::atomic::AtomicU32::new(0),
         }
     }
+
+    /// 0.7.0: 「reserved table」 = engine / schema 層の internal 用 table。
+    /// 命名規約: `_` で始まる名前 (例: `_schema_meta` / `_sync_ops` / `_sync_peers`)。
+    /// user 視点では不可視 (= `list_user_tables` から除外、 schema crate も
+    /// 公開 API では reject)。 sidecar / wire format に flag は持たず、 名前
+    /// だけで判定するので 0.5.0 / 0.6.0 sidecar との forward-compat を維持。
+    #[inline]
+    pub fn is_reserved(&self) -> bool {
+        self.name.starts_with('_')
+    }
+}
+
+/// 0.7.0: reserved table 命名規約 (= `_` で始まる) を確認する helper。
+/// `define_reserved_table` で公開 API に出すバリデーション、 schema crate からも
+/// reject 用に呼ばれる。
+#[inline]
+pub fn is_reserved_table_name(name: &str) -> bool {
+    name.starts_with('_')
 }
 
 /// `define_table` で size_hint=0 を渡した時の default。 SNS scale (10M+) では
@@ -1669,6 +1707,13 @@ impl Engine {
         self.is_replica.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// 0.7.0: 「writable か」 を panic せず bool で返す。 schema crate の
+    /// load_schema 等、 readonly でも続行したい path で使う。
+    #[inline]
+    pub fn is_readonly(&self) -> bool {
+        self.is_readonly.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// 書き込み API が呼ばれた時の guard。replica なら panic、 readonly でも panic。
     #[inline(always)]
     fn check_writable(&self) {
@@ -1694,6 +1739,36 @@ impl Engine {
     /// 戻り値は確保された TableId。 step 4+ で himo を namespacing して attach
     /// する経路と組み合わせて使う。 step 3 段階では table の column 列は空。
     pub fn define_table(&mut self, name: &str, size_hint: u32) -> Result<TableId, String> {
+        // 0.7.0: 公開 API。 `_` 始まりは reserved 命名空間、 user 経路では拒否。
+        if is_reserved_table_name(name) {
+            return Err(format!(
+                "table name '{}' starts with '_' (reserved namespace); use define_reserved_table for internal tables",
+                name,
+            ));
+        }
+        self.define_table_inner(name, size_hint)
+    }
+
+    /// 0.7.0: engine / schema 層 internal 用の reserved table を作る。
+    /// 名前は必ず `_` で始まること (`_schema_meta` / `_sync_ops` / `_sync_peers` 等)。
+    /// `list_user_tables()` から除外される、 schema crate も公開 API では非露出。
+    ///
+    /// 用途:
+    /// - schema crate: `_schema_meta` (schema blob / table 名 intern の置き場)
+    /// - sync 経路 (issue #11): `_sync_ops` / `_sync_peers` (watermark + reclaim)
+    pub fn define_reserved_table(&mut self, name: &str, size_hint: u32) -> Result<TableId, String> {
+        if !is_reserved_table_name(name) {
+            return Err(format!(
+                "reserved table name '{}' must start with '_'",
+                name,
+            ));
+        }
+        self.define_table_inner(name, size_hint)
+    }
+
+    /// `define_table` / `define_reserved_table` の共通 path。 命名規約 check は
+    /// 呼び元 (public API) で済ませる。
+    fn define_table_inner(&mut self, name: &str, size_hint: u32) -> Result<TableId, String> {
         self.check_writable();
         if name.is_empty() {
             return Err("table name must be non-empty".into());
@@ -1737,7 +1812,7 @@ impl Engine {
             eid_range_lo: new_lo,
             eid_range_hi: new_hi,
             fk_refs: Vec::new(),
-            next_local: 0,
+            next_local: std::sync::atomic::AtomicU32::new(0),
         });
         self.try_persist_tables();
         Ok(tid)
@@ -1746,9 +1821,11 @@ impl Engine {
     /// 指定 table 内に entity を割り当てる。 anonymous table 名は受け付けず、
     /// 旧来の `entity()` を使う必要がある (互換維持)。
     ///
-    /// 並行性: `&mut self` なので writer は単一。 同時に走る `tie_async` 等
-    /// concurrent reader/writer 経路とは EntitySet の CAS で安全に共存する。
-    pub fn entity_in(&mut self, table_name: &str) -> Result<enchudb_oplog::EntityId, String> {
+    /// 0.7.0: `&self` 化。 `next_local` は AtomicU32 で CAS-safe に払出される
+    /// ので、 schema crate / SQL 層の hot path (Arc<Engine> 経由の concurrent
+    /// mode) からも呼べる。 capacity check は load → fetch_add の seq の
+    /// rollback 不要 (= 1 ずつ進む単調払出、 overflow は次回 check で弾く)。
+    pub fn entity_in(&self, table_name: &str) -> Result<enchudb_oplog::EntityId, String> {
         use std::sync::atomic::Ordering;
         self.check_writable();
         if table_name.is_empty() {
@@ -1759,18 +1836,21 @@ impl Engine {
             .iter()
             .position(|t| t.name == table_name)
             .ok_or_else(|| format!("table '{}' not found", table_name))?;
-        let table = &mut self.tables[tid];
+        let table = &self.tables[tid];
 
-        // capacity check
+        // capacity check (= fetch_add 後の load で再 check して overflow 検出)
         let table_size = table.eid_range_hi - table.eid_range_lo;
-        if table.next_local >= table_size {
+        let cur = table.next_local.fetch_add(1, Ordering::AcqRel);
+        if cur >= table_size {
+            // 払出した分を rollback (= overflow 状態を維持しないため厳密には
+            // 必要だが、 単調 monotone な next_local なので少々超過しても
+            // 次回以降の check で確実に弾ける。 ここは error を返すのみ)。
             return Err(format!(
                 "table '{}' eid range exhausted ({} eids reserved)",
                 table_name, table_size,
             ));
         }
-        let global = table.eid_range_lo + table.next_local;
-        table.next_local += 1;
+        let global = table.eid_range_lo + cur;
 
         // EntitySet で live mark + next_eid 前進 (CAS safe)
         self.entities.allocate_at(global);
@@ -1818,12 +1898,33 @@ impl Engine {
     }
 
     /// 既知 table を `(id, name, eid_range)` で列挙する。 試験用 / debug 用 API。
+    /// 0.7.0 以降は **reserved table も含む** (= sync 経路 / schema crate 内部用)。
+    /// user code に見せる場合は `list_user_tables` を使うこと。
     pub fn list_tables(&self) -> Vec<(TableId, String, u32, u32)> {
         self.tables
             .iter()
             .enumerate()
             .map(|(i, t)| (i as TableId, t.name.clone(), t.eid_range_lo, t.eid_range_hi))
             .collect()
+    }
+
+    /// 0.7.0: user table のみを列挙 (= anonymous と reserved `_*` を除外)。
+    /// schema crate `list_tables()` / SQL `SHOW TABLES` 等の user 向け API で
+    /// これを使う。
+    pub fn list_user_tables(&self) -> Vec<(TableId, String, u32, u32)> {
+        self.tables
+            .iter()
+            .enumerate()
+            .filter(|(i, t)| *i != ANONYMOUS_TABLE as usize && !t.is_reserved())
+            .map(|(i, t)| (i as TableId, t.name.clone(), t.eid_range_lo, t.eid_range_hi))
+            .collect()
+    }
+
+    /// 0.7.0: 指定 table 名が reserved table として既に存在するか。 schema crate
+    /// が `_schema_meta` を auto-define する idempotent path で使う。
+    pub fn has_reserved_table(&self, name: &str) -> bool {
+        is_reserved_table_name(name)
+            && self.tables.iter().any(|t| t.name == name)
     }
 
     // ──── entity ────
@@ -1865,6 +1966,22 @@ impl Engine {
         let peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
         enchudb_oplog::make_eid(peer, self.entities.next_eid())
     }
+    /// 0.7.0: 残り eid 空間 (= max_entities - 既存 table の eid_range_hi の max)。
+    /// schema crate が `define_table` を呼ぶ前に「table 1 個分にどれだけ割けるか」
+    /// 判断する用。
+    pub fn remaining_eid_space(&self) -> u32 {
+        let used = self.tables.iter().map(|t| {
+            if t.eid_range_hi == u32::MAX {
+                self.entities.next_eid()  // anonymous open-ended
+            } else {
+                t.eid_range_hi
+            }
+        }).max().unwrap_or(0);
+        self.max_entities.saturating_sub(used)
+    }
+    /// 0.7.0: 最大 entity 数 (= layout 確保時の上限)。 schema crate が
+    /// size_hint を自動算出する用。
+    pub fn max_entities(&self) -> u32 { self.max_entities }
 
     // ──── v32: peer_id ────
 
@@ -2842,6 +2959,14 @@ impl Engine {
     }
 
     pub fn vocab_id(&self, text: &str) -> Option<u32> { self.vocab.lookup(text.as_bytes()) }
+
+    /// 0.7.0: text を vocab に inject して vocab_id を返す (idempotent)。
+    /// 既存の `intern_table_name` 系で entity → tie_text → delete の dummy roundtrip
+    /// をしていた path を、 vocab 直接 inject に置換するための公開 API。
+    /// entity / table 経路を一切触らないので、 anonymous closed 後でも安全に呼べる。
+    pub fn vocab_intern_text(&self, text: &str) -> u32 {
+        self.vocab.get_or_insert(text.as_bytes())
+    }
 
     /// vocab ID → bytes（vocabulary 経由で文字列復元用）
     pub fn vocab_text(&self, vid: u32) -> &[u8] { self.vocab.get(vid) }
