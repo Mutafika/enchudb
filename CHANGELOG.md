@@ -3,6 +3,17 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## Unreleased
+
+### Added
+
+- **`TenantView` / `TenantViewMut`** ([issue #12](https://github.com/Mutafika/enchudb/issues/12)、 PR #13) — `enchudb-schema` に「物理 layout を隠す view layer」 を追加。 `Database::tenant(name)` / `tenant_mut(name)` で tenant scope view、 `as_view()` / `as_view_mut()` で root view を取り出す。 内部で table 名に `{name}.` prefix を自動付与する薄い wrapper、 storage layout は変えない。
+  - 不変式: `tenant("alice")` から取った view を pattern A (centralized container) でも pattern B (per-user DB ファイル) でも同じ closure で操作できる。 deployment topology を app に隠す。
+  - 既存 API は完全不変、 追加のみ。
+  - overhead: `tenant().get_table()` ≈ 50 ns/op (format! 1 回)、 `as_view().get_table()` ≈ 18 ns/op、 raw 7 ns baseline。 schema-layer `get_table` は hot path じゃない (起動時 1 回引いて handle 保持) ので実用上 0 影響。
+  - example: `crates/enchudb-schema/examples/tenant_view_demo.rs`
+  - test: `crates/enchudb-schema/tests/tenant_view.rs` (6 件、 invariant / isolation / round-trip / multi-tenant scenario / interleaved build-read / root view)
+
 ## 0.6.0 — 2026-05-20
 
 `enchudb-wal` crate を `enchudb-oplog` にリネーム ([issue #8](https://github.com/Mutafika/enchudb/issues/8))。

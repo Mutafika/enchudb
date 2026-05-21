@@ -167,6 +167,155 @@ fn build_via_tenant_mut_round_trip() {
     cleanup(&path);
 }
 
+/// 現実的な multi-tenant scenario:
+/// container DB に 3 tenant、 各 tenant に 100 row、 query が tenant scope に
+/// 閉じる + cross-tenant の data 漏れが無いことを確認。
+#[test]
+fn realistic_multi_tenant_scenario() {
+    let path = tmp_path("multi_tenant_realistic");
+    cleanup(&path);
+
+    let mut db = Database::create(&path).unwrap();
+
+    let tenants = ["alice", "bob", "carol"];
+    for tenant in &tenants {
+        db.tenant_mut(tenant)
+            .table("users")
+            .number("id")
+            .tag("name")
+            .number("age")
+            .primary_key("id")
+            .build()
+            .unwrap();
+    }
+
+    // 各 tenant に 100 row insert、 age は tenant 内 0..100
+    for tenant in &tenants {
+        let view = db.tenant(tenant);
+        let users = view.get_table("users").unwrap();
+        for i in 0..100u32 {
+            users
+                .insert()
+                .set("id", i)
+                .set("name", format!("{}-{}", tenant, i))
+                .set("age", 20 + (i % 60))
+                .commit()
+                .unwrap();
+        }
+    }
+
+    // 各 tenant 単独で count、 自分の row しか見えない
+    for tenant in &tenants {
+        let view = db.tenant(tenant);
+        let users = view.get_table("users").unwrap();
+
+        // age == 30 の row 数 (= (30-20)%60 == 10 で割れる id) — それぞれ ceil(100/60) 個
+        let count_30 = users.where_eq("age", 30u32).find().unwrap().len();
+        assert!(count_30 > 0, "{}: age==30 が居る", tenant);
+
+        // id == 42 の row、 name は tenant prefix で識別可能
+        let r = users.where_eq("id", 42u32).find().unwrap();
+        assert_eq!(r.len(), 1, "{}: id=42 が 1 件", tenant);
+        let name_val = users.entity(r[0]).get("name").unwrap();
+        match name_val {
+            Value::Text(s) => {
+                assert!(
+                    s.starts_with(&format!("{}-", tenant)),
+                    "{}: name が tenant-prefix で始まる: {}",
+                    tenant,
+                    s
+                );
+            }
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    // root view (= raw container) で全 table と全 row が見える (cross-tenant aggregator 想定)
+    let root_tables: Vec<String> = db
+        .as_view()
+        .list_tables()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    let expected = tenants.iter().map(|t| format!("{}.users", t)).collect::<Vec<_>>();
+    for e in &expected {
+        assert!(root_tables.contains(e), "root sees {}", e);
+    }
+
+    // alice の view から bob のデータが name 経由で漏れないかチェック (= isolation 完全性)
+    let alice_view = db.tenant("alice");
+    let alice_users = alice_view.get_table("users").unwrap();
+    let bob_42_name = format!("bob-42");
+    // tag query は他 tenant の name とは独立な vocab なので、 bob-42 は alice のテーブルには存在しない
+    // でも vocab は engine global なので、 alice.users で where_eq する場合、
+    // alice のテーブル内に bob-42 がない事を確認する経路で見る
+    let bob42_in_alice = alice_users
+        .all()
+        .find()
+        .unwrap()
+        .iter()
+        .filter_map(|&eid| match alice_users.entity(eid).get("name") {
+            Some(Value::Text(s)) if s == bob_42_name => Some(()),
+            _ => None,
+        })
+        .count();
+    assert_eq!(bob42_in_alice, 0, "alice view に bob-42 が無い (cross-tenant 漏れ無し)");
+
+    cleanup(&path);
+}
+
+/// pattern A の build view と read view を交互に使うパターン (build → read → build →
+/// read) の正しさ。 実 app では migration や lazy schema 拡張で出てくる。
+#[test]
+fn interleaved_build_and_read_via_tenant_view() {
+    let path = tmp_path("interleaved");
+    cleanup(&path);
+
+    let mut db = Database::create(&path).unwrap();
+
+    // 1) tenant_mut で users 定義
+    db.tenant_mut("alice")
+        .table("users")
+        .number("id")
+        .tag("name")
+        .primary_key("id")
+        .build()
+        .unwrap();
+
+    // 2) tenant() で users に insert
+    {
+        let alice = db.tenant("alice");
+        alice
+            .get_table("users")
+            .unwrap()
+            .insert()
+            .set("id", 1)
+            .set("name", "Alice")
+            .commit()
+            .unwrap();
+    }
+
+    // 3) tenant_mut でさらに posts 定義
+    db.tenant_mut("alice")
+        .table("posts")
+        .number("id")
+        .leaf("body")
+        .primary_key("id")
+        .build()
+        .unwrap();
+
+    // 4) tenant() から両方見える
+    {
+        let alice = db.tenant("alice");
+        let tables: Vec<String> = alice.list_tables().into_iter().map(|t| t.name).collect();
+        assert!(tables.contains(&"users".to_string()));
+        assert!(tables.contains(&"posts".to_string()));
+        assert_eq!(tables.len(), 2);
+    }
+
+    cleanup(&path);
+}
+
 /// `as_view()` (root view) が単独 DB の全 table を見せる (= pattern B のための
 /// fallback、 prefix なし)。
 #[test]
