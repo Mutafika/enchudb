@@ -876,6 +876,13 @@ pub struct Engine {
     /// changefeed: 次に listener へ emit すべき WAL offset。
     /// add_change_listener 時に wal.head() に同期され、それ以降の commit のみが流れる。
     change_emit_offset: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// 0.7.0 Phase 4: 既に `_sync_ops` table に転送済みの WAL offset。
+    /// consumer thread が背景 fsync 後に新規 commit を `_sync_ops` へ転送する。
+    /// `enable_sync_tables` 有効化前は使われない (= 0)、 後は単調前進。
+    sync_ops_offset: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// 0.7.0 Phase 4: `_sync_ops` row に振る単調 lsn (= u32 の publish_since cursor)。
+    /// `entity_in` の eid とは別、 reclaim で row が消えても lsn は単調維持される。
+    next_sync_lsn: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// v33: 受信した Vocab op の `(author_peer, remote_vid) → local_vid` mapping。
     /// Symbol 型 himo の Tie を受信した時に remote_vid を local_vid に変換して apply する。
     /// peer-local に保持(replica でも独立、open 時は空、受信で徐々に埋まる)。
@@ -1031,6 +1038,10 @@ impl Engine {
             change_emit_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 enchudb_oplog::oplog::HEADER_SIZE as u64,
             )),
+            sync_ops_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                enchudb_oplog::oplog::HEADER_SIZE as u64,
+            )),
+            next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             _writer_lock: Some(writer_lock),
@@ -1254,6 +1265,10 @@ impl Engine {
             change_emit_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 enchudb_oplog::oplog::HEADER_SIZE as u64,
             )),
+            sync_ops_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                enchudb_oplog::oplog::HEADER_SIZE as u64,
+            )),
+            next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             _writer_lock: Some(writer_lock),
@@ -1645,6 +1660,10 @@ impl Engine {
             change_emit_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 enchudb_oplog::oplog::HEADER_SIZE as u64,
             )),
+            sync_ops_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                enchudb_oplog::oplog::HEADER_SIZE as u64,
+            )),
+            next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             _writer_lock: None, // caller (open_internal) が後から差し替える
@@ -1754,34 +1773,44 @@ impl Engine {
     pub fn enable_sync_tables(&mut self) -> Result<(), String> {
         self.check_writable();
 
-        // _sync_ops: 未配送 op の tail。 max row 数 = eid_range の size、
-        // 平常時は ack-driven reclaim で数 K rows 程度。 burst margin として 1 M。
+        // _sync_ops: 未配送 op の tail。 1 row = 1 oplog record、 metadata は
+        // 数値 himo (= u32 limit) で query 可、 完全 wire bytes は payload (Leaf)
+        // に保存する。 hlc は (wall, logical, peer) で 16 byte なので Number 1 個
+        // には収まらない → query 用は lsn (= u32 単調) で代替、 完全な
+        // hlc は payload の中に居る。 publish_since の cursor は lsn ベース。
+        //
+        // size_hint: 平常時は ack-driven reclaim で数 K rows 程度に保たれる想定。
+        // 0.7.0 では lazy purge (= 古い row を delete のみ、 eid 空間は再利用せず)、
+        // 0.8.0 で ring buffer 化を検討。 max_entities が小さい (= tiny preset)
+        // 環境でも overflow しないよう remaining の 1/2 を `_sync_ops` に、
+        // 1/16 を `_sync_peers` に割り当てる (= 最大は 1 M / 1 K で cap)。
+        let remaining = self.remaining_eid_space();
+        let sync_ops_size = (remaining / 2).min(1_048_576).max(64);
+        let sync_peers_size = (remaining / 16).min(1024).max(8);
         if !self.has_reserved_table("_sync_ops") {
-            self.define_reserved_table("_sync_ops", 1_048_576)?;
-            for (col, ty) in &[
-                ("hlc", HimoType::Number),
-                ("peer_id", HimoType::Number),
-                ("op_type", HimoType::Number),
-                ("eid", HimoType::Number),
-                ("himo_id", HimoType::Number),
-                ("value", HimoType::Tag),
-                ("signature", HimoType::Tag),
-                ("pubkey_fp", HimoType::Number),
-            ] {
-                self.define_himo_in("_sync_ops", col, *ty, 0)?;
-            }
+            self.define_reserved_table("_sync_ops", sync_ops_size)?;
+            // lsn: u32 単調 (= publish_since cursor)
+            self.define_himo_in("_sync_ops", "lsn", HimoType::Number, 0)?;
+            // peer_id: record の author_peer (= filter 用)
+            self.define_himo_in("_sync_ops", "peer_id", HimoType::Number, 0)?;
+            // op_type: 0=Tie, 1=Untie, 2=Delete, 3=Content, 4=Commit, 5=Schema, 6=Vocab
+            self.define_himo_in("_sync_ops", "op_type", HimoType::Number, 0)?;
+            // hlc_wall_lo: hlc.wall (u64 ms-since-epoch) の下位 32bit
+            // 完全な hlc は payload の中、 これは粗 filter / debug 用。
+            self.define_himo_in("_sync_ops", "hlc_wall_lo", HimoType::Number, 0)?;
+            // payload: 完全な oplog record wire bytes (header 含む)、 Leaf で dedupe なし
+            self.define_himo_in("_sync_ops", "payload", HimoType::Leaf, 0)?;
         }
 
-        // _sync_peers: peer ごと watermark。 100 peer 想定で 1 K の枠。
+        // _sync_peers: peer ごと watermark。 100 peer 想定で 1 K の枠 (上で計算済み)。
         if !self.has_reserved_table("_sync_peers") {
-            self.define_reserved_table("_sync_peers", 1024)?;
-            for (col, ty) in &[
-                ("peer_id", HimoType::Number),
-                ("consumed_hlc", HimoType::Number),
-                ("last_seen_at", HimoType::Number),
-            ] {
-                self.define_himo_in("_sync_peers", col, *ty, 0)?;
-            }
+            self.define_reserved_table("_sync_peers", sync_peers_size)?;
+            // peer_id: PK
+            self.define_himo_in("_sync_peers", "peer_id", HimoType::Number, 0)?;
+            // consumed_lsn: 当該 peer が ack した最後の _sync_ops.lsn
+            self.define_himo_in("_sync_peers", "consumed_lsn", HimoType::Number, 0)?;
+            // last_seen_at: 最後の活動時刻 (= 観測用、 unix ms / 2^16 等で u32 に収める想定)
+            self.define_himo_in("_sync_peers", "last_seen_at", HimoType::Number, 0)?;
         }
 
         Ok(())
@@ -1792,6 +1821,172 @@ impl Engine {
     #[inline]
     pub fn sync_tables_enabled(&self) -> bool {
         self.has_reserved_table("_sync_ops") && self.has_reserved_table("_sync_peers")
+    }
+
+    /// 0.7.0 (Phase 4): oplog の `sync_ops_offset` 以降の record を `_sync_ops`
+    /// table へ転送する。 consumer thread が背景 fsync 後に呼ぶ。
+    ///
+    /// 返り値: 転送した record 数。 enable_sync 未呼出 / oplog 未有効化なら 0。
+    pub fn transfer_oplog_to_sync_ops(&self) -> usize {
+        use std::sync::atomic::Ordering;
+        if !self.sync_tables_enabled() { return 0; }
+        let Some(wal) = self.oplog.as_ref() else { return 0; };
+
+        let from = self.sync_ops_offset.load(Ordering::Acquire);
+        let records = wal.iter_committed_from(from);
+        if records.is_empty() {
+            return 0;
+        }
+
+        // himo_id を 1 度 lookup (= hot path での文字列引きを避ける)
+        let lsn_hid = match self.himo_id("_sync_ops.lsn") { Some(h) => h as u16, None => return 0 };
+        let peer_id_hid = self.himo_id("_sync_ops.peer_id").unwrap() as u16;
+        let op_type_hid = self.himo_id("_sync_ops.op_type").unwrap() as u16;
+        let hlc_wall_lo_hid = self.himo_id("_sync_ops.hlc_wall_lo").unwrap() as u16;
+        let payload_hid = self.himo_id("_sync_ops.payload").unwrap() as u16;
+
+        let count = records.len();
+        for rec in &records {
+            let row_eid = match self.entity_in("_sync_ops") {
+                Ok(e) => e,
+                Err(_) => {
+                    // eid_range exhausted: 0.7.0 では追加 row insert を諦める
+                    // (= 0.8.0 で ring buffer 化)。 ここまでの転送は維持。
+                    let last_offset = wal.head(); // 部分転送、 次回は head から再開
+                    self.sync_ops_offset.store(last_offset, Ordering::Release);
+                    return count;
+                }
+            };
+            let lsn = self.next_sync_lsn.fetch_add(1, Ordering::AcqRel);
+            self.tie_to_by_id(row_eid, lsn_hid, lsn);
+            self.tie_to_by_id(row_eid, peer_id_hid, rec.author_peer);
+            // DecodedOp variant を tag (Tie=0, Untie=1, Delete=2, Content=3, Commit=4, Vocab=5)
+            let op_type = match &rec.op {
+                enchudb_oplog::oplog::DecodedOp::Tie { .. } => 0,
+                enchudb_oplog::oplog::DecodedOp::Untie { .. } => 1,
+                enchudb_oplog::oplog::DecodedOp::Delete { .. } => 2,
+                enchudb_oplog::oplog::DecodedOp::Content { .. } => 3,
+                enchudb_oplog::oplog::DecodedOp::Commit => 4,
+                enchudb_oplog::oplog::DecodedOp::Vocab { .. } => 5,
+            };
+            self.tie_to_by_id(row_eid, op_type_hid, op_type);
+            // hlc.wall は u64 ms-since-epoch、 下位 32bit のみ保持 (= ~50 日サイクル
+            // で wrap するが、 lsn 順序で query するので debug/filter 程度の用途)
+            self.tie_to_by_id(row_eid, hlc_wall_lo_hid, rec.hlc.wall as u32);
+            // payload: 完全な signed_bytes (= 署名対象 = header + payload)
+            self.tie_bytes_to_by_id(row_eid, payload_hid, &rec.signed_bytes);
+        }
+
+        // 全部転送できた、 offset を head に進める
+        self.sync_ops_offset.store(wal.head(), Ordering::Release);
+        count
+    }
+
+    /// 0.7.0 (Phase 4): peer の watermark を更新する。 Syncer が peer から ack を
+    /// 受け取ったタイミングで呼ぶ。 既存 row があれば update、 無ければ insert。
+    /// `_sync_peers.consumed_lsn` を idempotent に更新。
+    pub fn ack_sync(&self, peer: enchudb_oplog::PeerId, consumed_lsn: u32) -> Result<(), String> {
+        if !self.sync_tables_enabled() {
+            return Err("sync tables not enabled (call enable_sync first)".into());
+        }
+        let peer_id_hid = self.himo_id("_sync_peers.peer_id")
+            .ok_or("missing _sync_peers.peer_id himo")? as u16;
+        let consumed_lsn_hid = self.himo_id("_sync_peers.consumed_lsn")
+            .ok_or("missing _sync_peers.consumed_lsn himo")? as u16;
+        let last_seen_hid = self.himo_id("_sync_peers.last_seen_at")
+            .ok_or("missing _sync_peers.last_seen_at himo")? as u16;
+
+        // 既存 peer row を探す: peer_id 値で query
+        let existing = self.query_by_id(&[(peer_id_hid, peer)]);
+        let row_eid = match existing.into_iter().next() {
+            Some(e) => e,
+            None => self.entity_in("_sync_peers")
+                .map_err(|e| format!("entity_in(_sync_peers): {e}"))?,
+        };
+
+        self.tie_to_by_id(row_eid, peer_id_hid, peer);
+        self.tie_to_by_id(row_eid, consumed_lsn_hid, consumed_lsn);
+        // last_seen_at: 現在時刻 (ms / 65536 で u32 に収める = ~3000 年サイクル)
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.tie_to_by_id(row_eid, last_seen_hid, (now_ms / 65536) as u32);
+        Ok(())
+    }
+
+    /// 0.7.0 (Phase 4): 全 peer の最小 consumed_lsn (= reclaim 安全点)。
+    /// peer 0 件なら 0 を返す (= 「まだ誰も ack してない、 reclaim 不可」)。
+    pub fn sync_watermark(&self) -> u32 {
+        if !self.sync_tables_enabled() { return 0; }
+        let Some(peer_id_hid) = self.himo_id("_sync_peers.peer_id") else { return 0; };
+        let Some(consumed_lsn_hid) = self.himo_id("_sync_peers.consumed_lsn") else { return 0; };
+
+        let peer_rows = self.entities_with_himo(peer_id_hid as u16);
+        if peer_rows.is_empty() { return 0; }
+
+        let mut min_lsn = u32::MAX;
+        for eid in peer_rows {
+            if let Some(v) = self.get_by_id(eid, consumed_lsn_hid as u16) {
+                if v < min_lsn { min_lsn = v; }
+            }
+        }
+        if min_lsn == u32::MAX { 0 } else { min_lsn }
+    }
+
+    /// 0.7.0 (Phase 4): `_sync_ops` の `lsn < watermark` row を削除する。
+    /// 0.7.0 lazy purge 方針: entity delete のみ、 eid 空間は再利用しない
+    /// (= 0.8.0 で ring buffer 化検討)。 返り値: 削除した row 数。
+    pub fn reclaim_sync_ops(&self) -> usize {
+        if !self.sync_tables_enabled() { return 0; }
+        let watermark = self.sync_watermark();
+        if watermark == 0 { return 0; }
+
+        let Some(lsn_hid) = self.himo_id("_sync_ops.lsn") else { return 0; };
+        let lsn_hid_u16 = lsn_hid as u16;
+
+        // _sync_ops 全 row を走査して lsn < watermark を delete
+        let rows = self.entities_with_himo(lsn_hid_u16);
+        let mut purged = 0;
+        for eid in rows {
+            if let Some(lsn) = self.get_by_id(eid, lsn_hid_u16) {
+                if lsn < watermark {
+                    self.delete(eid);
+                    purged += 1;
+                }
+            }
+        }
+        purged
+    }
+
+    /// 0.7.0 (Phase 4): `_sync_ops` の `lsn > since_lsn` row を全 himo set で
+    /// 返す。 Syncer の publish_since が「peer.consumed_lsn より新しい op を
+    /// 流す」 用途で呼ぶ。 返り値の各 entry は payload (= 完全 wire bytes)。
+    pub fn pending_sync_ops(&self, since_lsn: u32) -> Vec<Vec<u8>> {
+        if !self.sync_tables_enabled() { return Vec::new(); }
+        let Some(lsn_hid) = self.himo_id("_sync_ops.lsn") else { return Vec::new(); };
+        let Some(payload_hid) = self.himo_id("_sync_ops.payload") else { return Vec::new(); };
+        let lsn_hid_u16 = lsn_hid as u16;
+        let payload_hid_u16 = payload_hid as u16;
+
+        let rows = self.entities_with_himo(lsn_hid_u16);
+        let mut pairs: Vec<(u32, Vec<u8>)> = Vec::new();
+        for eid in rows {
+            let lsn = match self.get_by_id(eid, lsn_hid_u16) {
+                Some(l) => l,
+                None => continue,
+            };
+            if lsn <= since_lsn { continue; }
+            let payload_vid = match self.get_by_id(eid, payload_hid_u16) {
+                Some(v) => v,
+                None => continue,
+            };
+            let bytes = self.vocab.get(payload_vid).to_vec();
+            pairs.push((lsn, bytes));
+        }
+        // lsn 順
+        pairs.sort_by_key(|(lsn, _)| *lsn);
+        pairs.into_iter().map(|(_, b)| b).collect()
     }
 
     pub fn define_table(&mut self, name: &str, size_hint: u32) -> Result<TableId, String> {
@@ -2486,10 +2681,51 @@ impl Engine {
         // WAL に Vocab + Tie を流す。 schema layer (enchudb-schema) は同期版の
         // tie_text_to を経由するため、 ここで append しないと WAL が空のままで
         // peer 同期が成立しない (publish 側が iter_committed で 0 件を見る).
-        if let Some(wal) = self.oplog.as_ref() {
-            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
-            let _ = wal.append(enchudb_oplog::oplog::Op::Vocab { vid, bytes: value.as_bytes() });
-            let _ = wal.append(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid });
+        // 0.7.0: reserved table (`_sync_ops` 等) への write は oplog skip。
+        if !self.himo_is_in_reserved_table(hid) {
+            if let Some(wal) = self.oplog.as_ref() {
+                let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
+                let _ = wal.append(enchudb_oplog::oplog::Op::Vocab { vid, bytes: value.as_bytes() });
+                let _ = wal.append(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid });
+            }
+        }
+    }
+
+    /// 0.7.0: 当該 himo が reserved table 配下か (= `_*` 表)。
+    /// reserved table への tie は oplog に再 append しない (= 2 重書き防止)。
+    /// hot path で `tie_*_to_by_id` から呼ばれる、 inline で軽量化。
+    #[inline]
+    fn himo_is_in_reserved_table(&self, himo_id: usize) -> bool {
+        match self.himo_to_table.get(himo_id) {
+            Some(tid) => self.tables.get(*tid as usize)
+                .map(|td| td.is_reserved())
+                .unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// 0.7.0: `tie_text_to_by_id` の binary 版。 任意 byte slice を vocab に
+    /// insert (Leaf なら dedupe なし) し、 himo に紐付ける。 `_sync_ops.payload`
+    /// (= oplog record の生 wire bytes) 等、 UTF-8 制約を持たない data を書く用。
+    pub fn tie_bytes_to_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: &[u8]) {
+        self.check_writable();
+        let eid = enchudb_oplog::eid_local(eid);
+        let hid = himo_id as usize;
+        debug_assert!(hid < self.himos.len(),
+            "himo_id {} out of range (max {})", himo_id, self.himos.len());
+        let vid = match self.himo_types[hid] {
+            HimoType::Tag => self.vocab.get_or_insert(value),
+            HimoType::Leaf => self.vocab.insert(value),
+            ht => panic!("tie_bytes_to_by_id on non-text himo_id {}: {:?}", himo_id, ht),
+        };
+        self.himos[hid].set(eid, vid);
+        // reserved table への write は oplog 再 append を skip (= 2 重書き防止)。
+        if !self.himo_is_in_reserved_table(hid) {
+            if let Some(wal) = self.oplog.as_ref() {
+                let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
+                let _ = wal.append(enchudb_oplog::oplog::Op::Vocab { vid, bytes: value });
+                let _ = wal.append(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid });
+            }
         }
     }
 
@@ -2512,9 +2748,12 @@ impl Engine {
         // 起動時に解決済みの table_vid を marker himo に張る hot path 用途で
         // 必要 (request2.md 提案)。 caller 責任で vocab に既に居る id を渡すこと。
         self.himos[hid].set(eid, value);
-        if let Some(wal) = self.oplog.as_ref() {
-            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
-            let _ = wal.append(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value });
+        // 0.7.0: reserved table への write は oplog skip。
+        if !self.himo_is_in_reserved_table(hid) {
+            if let Some(wal) = self.oplog.as_ref() {
+                let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
+                let _ = wal.append(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value });
+            }
         }
     }
 
