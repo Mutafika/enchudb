@@ -423,6 +423,28 @@ impl Database {
     /// 現在 concurrent モードか (consumer thread が走ってるか)。
     pub fn is_concurrent(&self) -> bool { self.is_concurrent }
 
+    /// 0.7.0 (Phase 3): sync 用 reserved table (`_sync_ops` / `_sync_peers`) を
+    /// engine に追加する。 build phase で呼ぶこと (= Arc 単一所有のうち)、
+    /// `finish_with_oplog` 後は Arc 共有なので呼べない (= `SchemaError::Internal`)。
+    ///
+    /// idempotent: 既に有効化済みなら何もしない。 sync が要らない単独 DB は
+    /// 呼ばなくて OK (= reserved table が物理的に存在しない、 eid 空間も浪費しない)。
+    /// 一度有効化すると無効化は不可。
+    pub fn enable_sync(&mut self) -> Result<(), SchemaError> {
+        let eng_mut = Arc::get_mut(&mut self.eng).ok_or_else(|| {
+            SchemaError::Internal(
+                "Database already shared via Arc — call enable_sync before finish_*".into()
+            )
+        })?;
+        eng_mut.enable_sync_tables()
+            .map_err(|e| SchemaError::Internal(format!("enable_sync_tables: {e}")))
+    }
+
+    /// 0.7.0: sync table が有効化済みか (`enable_sync` 後 / open 時に既存)。
+    pub fn sync_enabled(&self) -> bool {
+        self.eng.sync_tables_enabled()
+    }
+
     /// 新規 table 定義 builder。
     pub fn table<'a>(&'a mut self, name: &str) -> TableBuilder<'a> {
         TableBuilder {
@@ -1808,6 +1830,68 @@ mod tests {
                 Some(Value::Text("to be persisted".into()))
             );
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn enable_sync_creates_reserved_tables() {
+        // 0.7.0 Phase 3: enable_sync で _sync_ops / _sync_peers が engine に
+        // 登録されること、 user-facing list_tables からは見えないことを確認。
+        let path = tmp("sync_enable");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.tables", path));
+
+        let mut db = Database::create(&path).unwrap();
+        // build phase でいくつか user table を作る
+        let _ = db.table("posts").number("id").tag("body").primary_key("id").build().unwrap();
+        let _ = db.table("users").number("id").tag("name").primary_key("id").build().unwrap();
+
+        // 有効化前は sync_enabled = false
+        assert!(!db.sync_enabled());
+
+        // sync を有効化
+        db.enable_sync().unwrap();
+        assert!(db.sync_enabled());
+
+        // user-facing list_tables には _sync_ops / _sync_peers は出ない
+        let info = db.list_tables();
+        let user_tables: Vec<&str> = info.iter().map(|t| t.name.as_str()).collect();
+        assert!(user_tables.contains(&"posts"));
+        assert!(user_tables.contains(&"users"));
+        assert!(!user_tables.iter().any(|n| n.starts_with('_')),
+                "user list_tables should hide reserved tables, got: {user_tables:?}");
+
+        // engine の list_user_tables (内部 raw) でも reserved は除外される
+        let raw = db.engine().list_user_tables();
+        assert!(!raw.iter().any(|(_, n, _, _)| n.starts_with('_')));
+
+        // engine 内部 list_tables (= reserved 含む全件) には _sync_* が居る
+        let raw_all = db.engine().list_tables();
+        assert!(raw_all.iter().any(|(_, n, _, _)| n == "_sync_ops"));
+        assert!(raw_all.iter().any(|(_, n, _, _)| n == "_sync_peers"));
+
+        // 2 度目の enable_sync は idempotent
+        db.enable_sync().unwrap();
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn user_table_starting_with_underscore_rejected() {
+        // 0.7.0 Phase 3: `_` 始まり名前は reserved 命名空間、 user 経路は弾く。
+        let path = tmp("reserved_reject");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.tables", path));
+
+        let mut db = Database::create(&path).unwrap();
+        let result = db.table("_my_table").number("id").build();
+        let err = match result {
+            Err(e) => format!("{:?}", e),
+            Ok(_) => panic!("user table starting with '_' should be rejected"),
+        };
+        assert!(err.contains("reserved") || err.contains("_"),
+                "error message should mention reserved namespace, got: {err}");
+
         let _ = std::fs::remove_file(&path);
     }
 }

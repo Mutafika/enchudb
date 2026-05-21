@@ -1738,6 +1738,62 @@ impl Engine {
     ///
     /// 戻り値は確保された TableId。 step 4+ で himo を namespacing して attach
     /// する経路と組み合わせて使う。 step 3 段階では table の column 列は空。
+    /// 0.7.0 (Phase 3): sync 経路の reserved table を一括定義する。
+    ///
+    /// - `_sync_ops`: op stream (per-row HLC ordered)、 watermark + reclaim で
+    ///   未配送 tail のみが残る。 hlc / peer_id / op_type / eid / himo_id /
+    ///   value / signature / pubkey_fp の 8 himo を持つ
+    /// - `_sync_peers`: peer ごとの consumed_hlc (= watermark) と last_seen_at
+    ///
+    /// idempotent (既に存在すれば何もしない)。 Syncer attach 時 / schema crate
+    /// `enable_sync` 経由で呼ばれる想定。 sync 不要な単独 DB は呼ばなくて OK
+    /// (= reserved table を持たない、 eid 空間も浪費しない)。
+    ///
+    /// 0.7.0 では opt-in 方針。 一度有効化すると無効化は不可 (= reserved table
+    /// は close できない、 ただし himo は最小)。
+    pub fn enable_sync_tables(&mut self) -> Result<(), String> {
+        self.check_writable();
+
+        // _sync_ops: 未配送 op の tail。 max row 数 = eid_range の size、
+        // 平常時は ack-driven reclaim で数 K rows 程度。 burst margin として 1 M。
+        if !self.has_reserved_table("_sync_ops") {
+            self.define_reserved_table("_sync_ops", 1_048_576)?;
+            for (col, ty) in &[
+                ("hlc", HimoType::Number),
+                ("peer_id", HimoType::Number),
+                ("op_type", HimoType::Number),
+                ("eid", HimoType::Number),
+                ("himo_id", HimoType::Number),
+                ("value", HimoType::Tag),
+                ("signature", HimoType::Tag),
+                ("pubkey_fp", HimoType::Number),
+            ] {
+                self.define_himo_in("_sync_ops", col, *ty, 0)?;
+            }
+        }
+
+        // _sync_peers: peer ごと watermark。 100 peer 想定で 1 K の枠。
+        if !self.has_reserved_table("_sync_peers") {
+            self.define_reserved_table("_sync_peers", 1024)?;
+            for (col, ty) in &[
+                ("peer_id", HimoType::Number),
+                ("consumed_hlc", HimoType::Number),
+                ("last_seen_at", HimoType::Number),
+            ] {
+                self.define_himo_in("_sync_peers", col, *ty, 0)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 0.7.0 (Phase 3): sync tables が有効化済みか。 schema crate / Syncer が
+    /// 「`_sync_ops` に insert すべきか」 判断する fast path。
+    #[inline]
+    pub fn sync_tables_enabled(&self) -> bool {
+        self.has_reserved_table("_sync_ops") && self.has_reserved_table("_sync_peers")
+    }
+
     pub fn define_table(&mut self, name: &str, size_hint: u32) -> Result<TableId, String> {
         // 0.7.0: 公開 API。 `_` 始まりは reserved 命名空間、 user 経路では拒否。
         if is_reserved_table_name(name) {

@@ -92,11 +92,20 @@ impl Syncer {
                  instead of Engine::open / create."
             )
         });
+        // 0.7.0 (Phase 3): sync table が未有効化なら legacy oplog 経路で動作 (= 既存挙動)。
+        // 推奨は `Database::enable_sync()` で `_sync_ops` / `_sync_peers` を有効化、
+        // Phase 4+ で watermark-driven reclaim が効くようになる。
+        if !engine.sync_tables_enabled() {
+            eprintln!(
+                "warning: Syncer attached but engine has no _sync_ops / _sync_peers tables; \
+                 sync will use legacy oplog path (line-growing). \
+                 Enable via Database::enable_sync() for watermark-driven reclaim."
+            );
+        }
         // Syncer が attach された engine の WAL は auto_reset を off にする。
         // publish_since は iter_committed で WAL を読むので、consumer が
         // try_reset で WAL を空にすると sync 記録が消える race がある。
-        // 正式には「全 peer が replicate 済みの地点まで reset」する watermark が要るが、
-        // 未実装なので一旦 auto_reset off で記録を残す方針。
+        // 0.7.0 Phase 4+ で `_sync_ops` 経路に switch すれば watermark で reclaim できる。
         wal.set_auto_reset(false);
         let syncer = Self {
             engine: engine.clone(),
