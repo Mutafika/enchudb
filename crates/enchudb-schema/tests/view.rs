@@ -4,8 +4,9 @@
 //! の table cluster か 単独 DB ファイルか) に関係なく同じ schema / 同じ data /
 //! 同じ query が見える」 という不変式を test で担保する。
 //!
-//! 「tenant」 は caller の解釈名で、 view 自体は scope-agnostic。 DB は view の
-//! 用途を「知らない」。
+//! 「tenant」 は caller の解釈名 (= use case のラベル)、 view 自体は scope の
+//! 意味を知らない。 DB も view の用途を知らない、 ただ prefix を貼って table を
+//! 解決するだけ。
 
 use enchudb_schema::{Database, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -170,9 +171,11 @@ fn build_via_view_mut_round_trip() {
     cleanup(&path);
 }
 
-/// 現実的な multi-tenant scenario:
-/// container DB に 3 scope (= tenant)、 各 scope に 100 row、 query が view scope
-/// に閉じる + cross-scope の data 漏れが無いことを確認。
+/// 現実的な multi-tenant scenario (= view を tenant 用途で使う代表 case):
+/// container DB に 3 tenant、 各 tenant に 100 row、 query が view scope に
+/// 閉じる + cross-tenant の data 漏れが無いことを確認。
+///
+/// (API は中立な view、 ここで「tenant」 と呼ぶのは use case のラベル。)
 #[test]
 fn realistic_multi_tenant_scenario() {
     let path = tmp_path("multi_tenant_realistic");
@@ -180,9 +183,9 @@ fn realistic_multi_tenant_scenario() {
 
     let mut db = Database::create(&path).unwrap();
 
-    let scopes = ["alice", "bob", "carol"];
-    for scope in &scopes {
-        db.view_mut(scope)
+    let tenants = ["alice", "bob", "carol"];
+    for tenant in &tenants {
+        db.view_mut(tenant)
             .table("users")
             .number("id")
             .tag("name")
@@ -192,40 +195,40 @@ fn realistic_multi_tenant_scenario() {
             .unwrap();
     }
 
-    // 各 scope に 100 row insert、 age は scope 内 0..100
-    for scope in &scopes {
-        let view = db.view(scope);
+    // 各 tenant に 100 row insert、 age は tenant 内 0..100
+    for tenant in &tenants {
+        let view = db.view(tenant);
         let users = view.get_table("users").unwrap();
         for i in 0..100u32 {
             users
                 .insert()
                 .set("id", i)
-                .set("name", format!("{}-{}", scope, i))
+                .set("name", format!("{}-{}", tenant, i))
                 .set("age", 20 + (i % 60))
                 .commit()
                 .unwrap();
         }
     }
 
-    // 各 scope 単独で count、 自分の row しか見えない
-    for scope in &scopes {
-        let view = db.view(scope);
+    // 各 tenant 単独で count、 自分の row しか見えない
+    for tenant in &tenants {
+        let view = db.view(tenant);
         let users = view.get_table("users").unwrap();
 
         // age == 30 の row 数 (= (30-20)%60 == 10 で割れる id) — それぞれ ceil(100/60) 個
         let count_30 = users.where_eq("age", 30u32).find().unwrap().len();
-        assert!(count_30 > 0, "{}: age==30 が居る", scope);
+        assert!(count_30 > 0, "{}: age==30 が居る", tenant);
 
-        // id == 42 の row、 name は scope prefix で識別可能
+        // id == 42 の row、 name は tenant prefix で識別可能
         let r = users.where_eq("id", 42u32).find().unwrap();
-        assert_eq!(r.len(), 1, "{}: id=42 が 1 件", scope);
+        assert_eq!(r.len(), 1, "{}: id=42 が 1 件", tenant);
         let name_val = users.entity(r[0]).get("name").unwrap();
         match name_val {
             Value::Text(s) => {
                 assert!(
-                    s.starts_with(&format!("{}-", scope)),
-                    "{}: name が scope-prefix で始まる: {}",
-                    scope,
+                    s.starts_with(&format!("{}-", tenant)),
+                    "{}: name が tenant-prefix で始まる: {}",
+                    tenant,
                     s
                 );
             }
@@ -233,14 +236,14 @@ fn realistic_multi_tenant_scenario() {
         }
     }
 
-    // root view (= raw container) で全 table と全 row が見える (cross-scope aggregator 想定)
+    // root view (= raw container) で全 table と全 row が見える (cross-tenant aggregator 想定)
     let root_tables: Vec<String> = db
         .as_view()
         .list_tables()
         .into_iter()
         .map(|t| t.name)
         .collect();
-    let expected = scopes.iter().map(|t| format!("{}.users", t)).collect::<Vec<_>>();
+    let expected = tenants.iter().map(|t| format!("{}.users", t)).collect::<Vec<_>>();
     for e in &expected {
         assert!(root_tables.contains(e), "root sees {}", e);
     }
@@ -249,7 +252,7 @@ fn realistic_multi_tenant_scenario() {
     let alice_view = db.view("alice");
     let alice_users = alice_view.get_table("users").unwrap();
     let bob_42_name = format!("bob-42");
-    // tag query は他 scope の name とは独立な vocab なので、 bob-42 は alice の
+    // tag query は他 tenant の name とは独立な vocab なので、 bob-42 は alice の
     // テーブルには存在しない。 でも vocab は engine global なので、 alice.users で
     // where_eq する場合、 alice のテーブル内に bob-42 がない事を確認する経路で見る
     let bob42_in_alice = alice_users
@@ -262,7 +265,7 @@ fn realistic_multi_tenant_scenario() {
             _ => None,
         })
         .count();
-    assert_eq!(bob42_in_alice, 0, "alice view に bob-42 が無い (cross-scope 漏れ無し)");
+    assert_eq!(bob42_in_alice, 0, "alice view に bob-42 が無い (cross-tenant 漏れ無し)");
 
     cleanup(&path);
 }
