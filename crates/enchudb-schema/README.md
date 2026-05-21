@@ -147,30 +147,32 @@ let rows = kv.where_eq("key", "k1").find()?;
 assert_eq!(rows.len(), 1);
 ```
 
-## TenantView — physical layout を隠す view layer
+## View — physical layout を隠す view layer
 
-`Database::tenant(name)` で取り出す **tenant scope view**。 内部で table 名に `{name}.` prefix を被せるだけで、 storage layout は変えない。 deployment が centralized (1 DB に複数 tenant) か distributed (per-user DB ファイル) かに関係なく **同じ app code が動く** ようにする抽象。
+`Database::view(name)` で取り出す **scope-prefixed view**。 内部で table 名に `{name}.` prefix を被せるだけで、 storage layout は変えない。 deployment が centralized (1 DB に複数 scope) か distributed (per-user DB ファイル) かに関係なく **同じ app code が動く** ようにする抽象。
+
+`view` を作るのは **observer (= caller) の責務**、 DB は scope の意味を「知らない」 — ただ prefix を貼った view を生成する factory を提供するだけ。 「tenant」 と呼ぶか「namespace」 と呼ぶかは caller の解釈。
 
 ```rust
 use enchudb_schema::Database;
 
-// Pattern A: 1 container DB に複数 tenant
+// Pattern A: 1 container DB に複数 scope
 let mut container = Database::create("/srv/all.db")?;
-container.tenant_mut("alice").table("users")
+container.view_mut("alice").table("users")
     .number("id").tag("name").primary_key("id").build()?;
-container.tenant_mut("bob").table("users")
+container.view_mut("bob").table("users")
     .number("id").tag("name").primary_key("id").build()?;
 
-// Pattern B: tenant ごとに別 DB ファイル
+// Pattern B: scope ごとに別 DB ファイル
 let mut alice_db = Database::create("/edge/alice.db")?;
 alice_db.as_view_mut().table("users")
     .number("id").tag("name").primary_key("id").build()?;
 
 // この時点から app code は同じ — pattern A でも B でも:
-fn count_users(view: &enchudb_schema::TenantView<'_>) -> usize {
+fn count_users(view: &enchudb_schema::View<'_>) -> usize {
     view.get_table("users").unwrap().all().count().unwrap()
 }
-count_users(&container.tenant("alice"));   // → alice の users
+count_users(&container.view("alice"));     // → alice の users
 count_users(&alice_db.as_view());          // → alice の users (per-user DB)
 ```
 
@@ -178,28 +180,28 @@ count_users(&alice_db.as_view());          // → alice の users (per-user DB)
 
 | Method | self | 用途 |
 |---|---|---|
-| `tenant(name)` | `&self` | tenant scope read view (pattern A 用) |
-| `tenant_mut(name)` | `&mut self` | tenant scope build view (table 定義時に prefix 自動付与) |
+| `view(name)` | `&self` | scope-prefixed read view (pattern A 用) |
+| `view_mut(name)` | `&mut self` | scope-prefixed build view (table 定義時に prefix 自動付与) |
 | `as_view()` | `&self` | root read view (pattern B 用、 prefix なし) |
 | `as_view_mut()` | `&mut self` | root build view |
 
-- `TenantView::list_tables()` は scope 内の table のみ返す、 prefix は剥がして short name で返す (= view の中では `users`、 raw 名 `alice.users` は不可視)
-- `TenantView::get_table("users")` は `alice.users` に解決される
+- `View::list_tables()` は scope 内の table のみ返す、 prefix は剥がして short name で返す (= view の中では `users`、 raw 名 `alice.users` は不可視)
+- `View::get_table("users")` は `alice.users` に解決される
 - root view (`as_view`) では prefix 無しの table をそのまま見る
 
 ### isolation
 
-`tenant("alice").list_tables()` は `bob.*` を見せない、 `get_table("users")` も alice scope のもののみ。 cross-tenant read は raw Database (= `as_view()`) 経由でのみ可能。
+`view("alice").list_tables()` は `bob.*` を見せない、 `get_table("users")` も alice scope のもののみ。 cross-scope read は raw Database (= `as_view()`) 経由でのみ可能。
 
 ### overhead
 
-- `tenant().get_table()` = ~50 ns/op (`format!` で prefix 連結が 1 回)
-- `as_view().get_table()` = ~18 ns/op (`to_string` のみ)
-- raw `db.get_table("alice.users")` = ~7 ns/op (baseline)
+- `view().get_table()` ≈ 50 ns/op (`format!` で prefix 連結が 1 回)
+- `as_view().get_table()` ≈ 18 ns/op (`to_string` のみ)
+- raw `db.get_table("alice.users")` ≈ 7 ns/op (baseline)
 
-schema layer の `get_table` は **hot path じゃない** (起動時に 1 回引いて handle 保持) ので実用上問題なし。 runtime hot path は \`Table::himo_id\` で u16 を抜いてから engine 直叩きに降りる、 TenantView は通らない。
+schema layer の `get_table` は **hot path じゃない** (起動時に 1 回引いて handle 保持) ので実用上問題なし。 runtime hot path は `Table::himo_id` で u16 を抜いてから engine 直叩きに降りる、 View は通らない。
 
-詳細 example: \`crates/enchudb-schema/examples/tenant_view_demo.rs\`、 設計動機: [issue #12](https://github.com/Mutafika/enchudb/issues/12)。
+詳細 example: `crates/enchudb-schema/examples/view_demo.rs`、 設計動機: [issue #12](https://github.com/Mutafika/enchudb/issues/12)。
 
 ## 永続化 + reopen
 
