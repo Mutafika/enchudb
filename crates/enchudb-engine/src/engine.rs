@@ -167,6 +167,7 @@ fn deserialize_tables(buf: &[u8]) -> Result<Vec<TableDef>, String> {
             fk_refs,
             next_local,
             free_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            free_locals_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
     }
     Ok(tables)
@@ -760,6 +761,12 @@ pub(crate) struct TableDef {
     /// eid 空間飽和を防ぐ (= ring buffer 化の本体)。 user table は今のところ
     /// 自動 reclaim path がないので free list は空のまま。
     pub free_locals: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+    /// 0.8.0: `free_locals` が non-empty かどうかの fast path flag。 user table
+    /// (= 自動 reclaim なし) では常に false、 `entity_in` の hot path で mutex を
+    /// 取らずに済む。 reclaim が push したら true に上げる、 entity_in が pop
+    /// で空になったら false に戻す。 厳密な race は entity_in 内で mutex 取った
+    /// あと再 check するので OK (= AtomicBool は fast path の hint)。
+    pub free_locals_nonempty: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Clone for TableDef {
@@ -778,6 +785,7 @@ impl Clone for TableDef {
             // 使う既存 caller の semantic と整合 (= 並列 race しないように caller
             // 側で coordinate する想定)。
             free_locals: self.free_locals.clone(),
+            free_locals_nonempty: self.free_locals_nonempty.clone(),
         }
     }
 }
@@ -796,6 +804,7 @@ impl TableDef {
             fk_refs: Vec::new(),
             next_local: std::sync::atomic::AtomicU32::new(0),
             free_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            free_locals_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1968,9 +1977,9 @@ impl Engine {
 
         // 0.8.0: _sync_ops table の eid_range_lo を取り、 reclaim 後 free list に
         // local id を push する (= ring buffer 化)。
-        let sync_ops_lo = self.tables.iter()
+        let sync_ops_meta = self.tables.iter()
             .find(|t| t.name == "_sync_ops")
-            .map(|t| (t.eid_range_lo, t.free_locals.clone()));
+            .map(|t| (t.eid_range_lo, t.free_locals.clone(), t.free_locals_nonempty.clone()));
 
         // _sync_ops 全 row を走査して lsn < watermark を delete
         let rows = self.entities_with_himo(lsn_hid_u16);
@@ -1981,9 +1990,10 @@ impl Engine {
                     let local = enchudb_oplog::eid_local(eid);
                     self.delete(eid);
                     // 0.8.0: free list に追加 (= 次回 entity_in("_sync_ops") で再利用)
-                    if let Some((lo, ref free_list)) = sync_ops_lo {
+                    if let Some((lo, ref free_list, ref nonempty)) = sync_ops_meta {
                         if local >= lo {
                             free_list.lock().unwrap().push(local - lo);
+                            nonempty.store(true, std::sync::atomic::Ordering::Release);
                         }
                     }
                     purged += 1;
@@ -2106,6 +2116,7 @@ impl Engine {
             fk_refs: Vec::new(),
             next_local: std::sync::atomic::AtomicU32::new(0),
             free_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            free_locals_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         self.try_persist_tables();
         Ok(tid)
@@ -2135,9 +2146,19 @@ impl Engine {
         // (= ring buffer 化、 `_sync_ops` の長期運用で eid 飽和を防ぐ)。
         // 再利用時は entities.allocate_at で live mark を戻す + concurrent
         // barrier も走らせる (= 新規 alloc path と同じ orchestration)。
-        let reused_global = {
+        //
+        // fast path: free_locals_nonempty が false (= user table の常態) なら
+        // mutex を取らずに通常 alloc に進む。 1M insert hot path で mutex
+        // overhead (= 約 50 ns/op) を消す最適化。
+        let reused_global = if table.free_locals_nonempty.load(Ordering::Acquire) {
             let mut fl = table.free_locals.lock().unwrap();
-            fl.pop().map(|local| table.eid_range_lo + local)
+            let popped = fl.pop();
+            if fl.is_empty() {
+                table.free_locals_nonempty.store(false, Ordering::Release);
+            }
+            popped.map(|local| table.eid_range_lo + local)
+        } else {
+            None
         };
         if let Some(global) = reused_global {
             self.entities.allocate_at(global);
