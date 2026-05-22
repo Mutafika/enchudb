@@ -532,6 +532,35 @@ impl Database {
         }).collect()
     }
 
+    // ───── TenantView ─────
+    //
+    // physical layout (table cluster vs DB ファイル) を隠して、 deployment が
+    // centralized (pattern A) でも distributed (pattern B / C) でも同一 app code
+    // で「ある tenant の view」 を扱えるようにする抽象。 詳細は issue #12。
+
+    /// tenant scope の read view を取り出す。 prefix は `{name}.` (例: `alice`)。
+    /// view 内で `get_table("users")` は実 table `alice.users` に解決される。
+    pub fn tenant<'a>(&'a self, name: &str) -> TenantView<'a> {
+        TenantView { db: self, prefix: Some(name.to_string()) }
+    }
+
+    /// tenant scope の build view を取り出す。 `table(...)` で建てる table は
+    /// 自動で `{name}.` prefix が付与される。
+    pub fn tenant_mut<'a>(&'a mut self, name: &str) -> TenantViewMut<'a> {
+        TenantViewMut { db: self, prefix: Some(name.to_string()) }
+    }
+
+    /// root read view (= prefix 無し)。 pattern B の `Database::open` 直後に
+    /// view 化したい時に使う、 全 table が見える。
+    pub fn as_view<'a>(&'a self) -> TenantView<'a> {
+        TenantView { db: self, prefix: None }
+    }
+
+    /// root build view。 prefix 無しで table を建てる、 pattern B の builder。
+    pub fn as_view_mut<'a>(&'a mut self) -> TenantViewMut<'a> {
+        TenantViewMut { db: self, prefix: None }
+    }
+
     fn find_table_inner(&self, name: &str) -> Option<Arc<TableInner>> {
         self.tables.iter()
             .find(|t| t.name.eq_ignore_ascii_case(name))
@@ -672,6 +701,89 @@ impl Database {
     /// `entity()` が panic するので使えない。 engine の直接 vocab API に置換。
     fn intern_table_name(&self, name: &str) -> u32 {
         self.eng.vocab_intern_text(name)
+    }
+}
+
+// ─────────────────────────── TenantView / TenantViewMut ───────────────────────────
+
+/// 読み取り専用の tenant view。 `Database::tenant(name)` で取り出す、
+/// あるいは pattern B (per-DB-file 単一 tenant) 用に `Database::as_view()` で
+/// prefix 無しの root view を取り出す。 内部表現は薄い ref + prefix のみ、
+/// storage layout は変えない。 詳細は issue #12。
+pub struct TenantView<'a> {
+    db: &'a Database,
+    prefix: Option<String>,
+}
+
+/// build phase 用 tenant view。 `table(...)` で建てる table 名に prefix が
+/// 自動付与される。 root build view は `Database::as_view_mut()` から。
+pub struct TenantViewMut<'a> {
+    db: &'a mut Database,
+    prefix: Option<String>,
+}
+
+fn resolve_prefixed(prefix: Option<&str>, name: &str) -> String {
+    match prefix {
+        Some(p) => format!("{}.{}", p, name),
+        None => name.to_string(),
+    }
+}
+
+fn filter_tables_by_prefix(all: Vec<TableInfo>, prefix: Option<&str>) -> Vec<TableInfo> {
+    match prefix {
+        None => all,
+        Some(p) => {
+            let needle = format!("{}.", p);
+            all.into_iter()
+                .filter_map(|mut t| {
+                    let new_name = t.name.strip_prefix(&needle).map(|s| s.to_string())?;
+                    t.name = new_name;
+                    Some(t)
+                })
+                .collect()
+        }
+    }
+}
+
+impl<'a> TenantView<'a> {
+    /// この view の prefix (= tenant 名)。 root view なら None。
+    pub fn prefix(&self) -> Option<&str> {
+        self.prefix.as_deref()
+    }
+
+    /// 既存 table を引く。 prefix 自動付与。
+    pub fn get_table(&self, name: &str) -> Option<Table<'a>> {
+        self.db.get_table(&resolve_prefixed(self.prefix.as_deref(), name))
+    }
+
+    /// この view から見える table の一覧。 tenant scope なら `{prefix}.` で始まる
+    /// table のみ、 prefix は剥がして「view 内の short name」 で返す。 root view は
+    /// 全 table をそのまま返す。
+    pub fn list_tables(&self) -> Vec<TableInfo> {
+        filter_tables_by_prefix(self.db.list_tables(), self.prefix.as_deref())
+    }
+}
+
+impl<'a> TenantViewMut<'a> {
+    /// この view の prefix。
+    pub fn prefix(&self) -> Option<&str> {
+        self.prefix.as_deref()
+    }
+
+    /// 新規 table を定義。 prefix が自動付与される (root view なら付与なし)。
+    pub fn table<'b>(&'b mut self, name: &str) -> TableBuilder<'b> {
+        let full = resolve_prefixed(self.prefix.as_deref(), name);
+        self.db.table(&full)
+    }
+
+    /// 既存 table を引く (read 系)。 prefix 自動付与。
+    pub fn get_table<'b>(&'b self, name: &str) -> Option<Table<'b>> {
+        self.db.get_table(&resolve_prefixed(self.prefix.as_deref(), name))
+    }
+
+    /// この view scope の table 一覧。
+    pub fn list_tables(&self) -> Vec<TableInfo> {
+        filter_tables_by_prefix(self.db.list_tables(), self.prefix.as_deref())
     }
 }
 
