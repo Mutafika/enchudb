@@ -3,6 +3,23 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## Unreleased (0.8.0-dev)
+
+sync 並走の解消 — oplog publish path 撤去 + `_sync_ops` 一本化 + ring buffer
+化。 0.7.0 で導入した `_sync_ops` reserved table を sync 配信の唯一の primary
+source にし、 oplog は local crash recovery 専用に役割を絞る。 詳細計画書:
+`notes/requests/request8.md`。
+
+### 開発中 (= phase 駆動)
+
+- phase 1: engine 側に sync direct-write path を整備 (= tie 時に `_sync_ops`
+  に直接 append、 transfer 不要に)
+- phase 2: `enchudb-sync` を `_sync_ops` 経由に切替 (= oplog 直読み撤去)
+- phase 3: `enchudb-transport` の wire protocol を `_sync_ops` 形式に
+- phase 4: ring buffer 化 (= free list で eid 再利用、 sync primary 化の前提)
+- phase 5: 破壊テスト + bench (publish throughput) + 互換切り確認
+- phase 6: CHANGELOG + migration-0.7.0-to-0.8.0.md + 0.8.0 release prep
+
 ## 0.7.0 — 2026-05-22
 
 mini-RDB semantics の **actually 確立** ([issue #11](https://github.com/Mutafika/enchudb/issues/11) +
