@@ -197,34 +197,46 @@ crate 名も `enchudb-wal` → `enchudb-oplog` に rename ([issue #8](https://gi
 
 ring buffer 構造 (= 固定容量、 checkpoint 済みの後ろを再利用)。
 
-### 0.7.0 で導入された sync 二系統 (opt-in)
+### sync 経路 (0.8.0+ で primary 一本化)
 
 旧 oplog は「local 耐久 + peer 配信 + audit」 兼任で、 **全 peer が ack 済みの
 地点 (watermark) を engine が知らない** ため `.oplog` が線形成長する課題が
 あった ([issue #11](https://github.com/Mutafika/enchudb/issues/11))。 0.7.0 で
-engine 直下に reserved table を導入:
+並走可能化、 0.8.0 で **publish path を `_sync_ops` 一本に primary 切替**。
 
 ```
-旧 (0.6.0 まで):  consumer ─ publish_since ─→ oplog ring buffer (linear grow)
-新 (0.7.0+):     consumer ─ transfer ─→ _sync_ops table ─ ack/reclaim ─→ purge
-                                            ↑ watermark = min(peer.consumed_lsn)
+0.6.0 まで:  consumer ─ publish_since ─→ oplog ring buffer (= 線形成長)
+
+0.7.0 (並走): consumer ─ publish_since ─→ oplog (legacy)
+              consumer ─ transfer ─→ _sync_ops ─→ pending_sync_ops (新、 opt-in)
+
+0.8.0 (一本):  consumer thread が fsync 後に _sync_ops へ自動 transfer
+              publish_since の内部実装が _sync_ops 経由 (= primary)
+              ack 駆動 reclaim + ring buffer 化で _sync_ops 容量制限なし
+              oplog は local crash recovery 専用に shrink
 ```
 
 `Database::enable_sync()` で opt-in:
-- `_sync_ops`: lsn / peer_id / op_type / hlc_wall_lo / payload (= peer 配信用)
+- `_sync_ops`: lsn / peer_id / op_type / hlc_wall_lo / payload (= peer 配信用、
+  payload = `signature + pubkey_fp + signed_bytes` の concat)
 - `_sync_peers`: peer_id / consumed_lsn / last_seen_at (= watermark)
-- engine API: `transfer_oplog_to_sync_ops` / `ack_sync` / `sync_watermark` / `reclaim_sync_ops` / `pending_sync_ops`
+- engine API: `ack_sync` / `sync_watermark` / `reclaim_sync_ops` / `pending_sync_ops`
+- ring buffer: `TableDef.free_locals` で reclaim 解放 eid を再利用 (= 長期運用
+  でも `_sync_ops` table が容量飽和しない)
 
 呼ばない consumer は何も変わらない (= reserved table 自体作られない、 eid 空間も
-食わない)。 0.8.0 で `_sync_ops` を primary publish に切替え、 oplog 役割を
-crash recovery 専用に shrink する予定。 詳細: [`migration-0.6.0-to-0.7.0.md`](migration-0.6.0-to-0.7.0.md)。
+食わない)。 詳細: [`migration-0.7.0-to-0.8.0.md`](migration-0.7.0-to-0.8.0.md)
+ / [`migration-0.6.0-to-0.7.0.md`](migration-0.6.0-to-0.7.0.md)。
 
 ### peer-to-peer sync
 
-`enchudb-sync` crate が oplog (or `_sync_ops`) を peer 間で relay。 受信側は
-HLC で LWW (Last Writer Wins) で merge。 mesh (gossip) と client-server
-(集約) 両 topology に対応。 transport は `enchudb-transport` (HTTP / WebSocket /
-HttpRelay / push hub) を切り替えて使う。
+`enchudb-sync` crate が `_sync_ops` を peer 間で relay (= 0.8.0 で oplog 直読み
+撤去)。 受信側は HLC で LWW (Last Writer Wins) で merge。 mesh (gossip) と
+client-server (集約) 両 topology に対応。 transport は `enchudb-transport`
+(HTTP / WebSocket / HttpRelay / push hub) を切り替えて使う。
+
+0.8.0 で wire format は変更 (`_sync_ops.payload` に signature + pubkey_fp 込み
+の concat)、 **0.7.x peer との互換は失う** (= 同時 upgrade 必須)。
 
 ## 7. concurrency
 
@@ -284,9 +296,12 @@ SQLite は同期手段を持たず litestream 等を別途要する。 LMDB / Ro
   の遡及 fill は user code 側でやる
 - **oplog は local filesystem 前提**: NFS / CIFS は flock semantics 不安定
   (= SQLite と同じ)
-- **bitmap word AND path は撤去済**: 0.4.x までの dead path。 0.8.0 で per-value
+- **bitmap word AND path は撤去済**: 0.4.x までの dead path。 0.9.0+ で per-value
   bitmap を本気で持つなら query 戦略選択を復活させる ([commit 4c28c29](
   https://github.com/Mutafika/enchudb/commit/4c28c29) 参照)
+- **user table の free list / ring buffer は未対応**: 0.8.0 で `_sync_ops` のみ
+  ring buffer 化。 user table の自動 reclaim 機構 (= delete 後 eid 再利用) は
+  0.9.0+ で展開検討、 現状は monotonic に next_local が増える
 
 ## さらに
 
