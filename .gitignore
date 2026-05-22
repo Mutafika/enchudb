@@ -17,4 +17,6 @@ crates/enchudb-rag/.fastembed_cache/
 /*_PLAN.md
 /TEST_DESIGN.md
 /MOLIBOOK_TEST_PLAN.md
-/docs/
+/docs/*
+/docs/proposals/
+!/docs/architecture.md

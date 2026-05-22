@@ -207,6 +207,12 @@ pub struct Database {
     eng: Arc<Engine>,
     tables: Vec<Arc<TableInner>>,
     marker_himo_id: u16,
+    /// 0.7.0: schema blob を載せる anchor entity の cache。 「`define_table`
+    /// が呼ばれると anonymous が close → `entity()` が panic」 という engine
+    /// の挙動を避けるため、 Database 作成時に eager 予約 → 以降は cache を返す。
+    /// 既存 DB (anonymous 配下に schema_meta entity がある) も、 新規 DB も
+    /// 同じ path。 OnceLock で `&self` 経由でも 1 度だけ populate 可能。
+    schema_meta_entity: std::sync::OnceLock<EntityId>,
     /// true なら consumer thread が走ってる (concurrent モード、 &mut 不可)。
     is_concurrent: bool,
 }
@@ -262,6 +268,7 @@ impl Database {
             eng: Arc::new(eng),
             tables: Vec::new(),
             marker_himo_id,
+            schema_meta_entity: std::sync::OnceLock::new(),
             is_concurrent: false,
         })
     }
@@ -284,6 +291,7 @@ impl Database {
             eng: Arc::new(eng),
             tables: Vec::new(),
             marker_himo_id,
+            schema_meta_entity: std::sync::OnceLock::new(),
             is_concurrent: false,
         };
         db.load_schema()?;
@@ -300,6 +308,7 @@ impl Database {
             eng: Arc::new(eng),
             tables: Vec::new(),
             marker_himo_id,
+            schema_meta_entity: std::sync::OnceLock::new(),
             is_concurrent: false,
         };
         db.load_schema()?;
@@ -332,6 +341,7 @@ impl Database {
             eng: arc_eng,
             tables: Vec::new(),
             marker_himo_id,
+            schema_meta_entity: std::sync::OnceLock::new(),
             is_concurrent: true,
         };
         db.load_schema()?;
@@ -353,6 +363,7 @@ impl Database {
             eng: arc_eng,
             tables,
             marker_himo_id,
+            schema_meta_entity: std::sync::OnceLock::new(),
             is_concurrent: true,
         }))
     }
@@ -367,6 +378,7 @@ impl Database {
             eng: arc_eng,
             tables,
             marker_himo_id,
+            schema_meta_entity: std::sync::OnceLock::new(),
             is_concurrent: true,
         }))
     }
@@ -411,6 +423,28 @@ impl Database {
     /// 現在 concurrent モードか (consumer thread が走ってるか)。
     pub fn is_concurrent(&self) -> bool { self.is_concurrent }
 
+    /// 0.7.0 (Phase 3): sync 用 reserved table (`_sync_ops` / `_sync_peers`) を
+    /// engine に追加する。 build phase で呼ぶこと (= Arc 単一所有のうち)、
+    /// `finish_with_oplog` 後は Arc 共有なので呼べない (= `SchemaError::Internal`)。
+    ///
+    /// idempotent: 既に有効化済みなら何もしない。 sync が要らない単独 DB は
+    /// 呼ばなくて OK (= reserved table が物理的に存在しない、 eid 空間も浪費しない)。
+    /// 一度有効化すると無効化は不可。
+    pub fn enable_sync(&mut self) -> Result<(), SchemaError> {
+        let eng_mut = Arc::get_mut(&mut self.eng).ok_or_else(|| {
+            SchemaError::Internal(
+                "Database already shared via Arc — call enable_sync before finish_*".into()
+            )
+        })?;
+        eng_mut.enable_sync_tables()
+            .map_err(|e| SchemaError::Internal(format!("enable_sync_tables: {e}")))
+    }
+
+    /// 0.7.0: sync table が有効化済みか (`enable_sync` 後 / open 時に既存)。
+    pub fn sync_enabled(&self) -> bool {
+        self.eng.sync_tables_enabled()
+    }
+
     /// 新規 table 定義 builder。
     pub fn table<'a>(&'a mut self, name: &str) -> TableBuilder<'a> {
         TableBuilder {
@@ -419,6 +453,7 @@ impl Database {
             cols: Vec::new(),
             pk: None,
             relations: Vec::new(),
+            capacity: None,
         }
     }
 
@@ -546,16 +581,30 @@ impl Database {
         Ok(())
     }
 
+    /// schema blob を保存する anchor entity を返す。 cache hit が普通の path、
+    /// cache miss は (1) wrap_new 直後の初回 (= 既存 marker なし、 entity 新規払出)、
+    /// (2) open 直後 (= 既存 marker あり、 既存 entity を検出して cache)。
+    ///
+    /// 0.7.0: `define_table` 後に呼ばれても entity() を呼ばないので panic しない。
+    /// (= define_table 前に persist_schema / load_schema 経路で 1 度走って cache 済み)
     fn ensure_schema_entity(&self) -> EntityId {
+        if let Some(&eid) = self.schema_meta_entity.get() {
+            return eid;
+        }
         self.eng.rebuild();
         if let Some(vid) = self.eng.vocab_id(SCHEMA_MARKER) {
             let eids = self.eng.pull_raw(SCHEMA_META_HIMO, vid);
-            if let Some(&eid) = eids.first() { return eid; }
+            if let Some(&eid) = eids.first() {
+                let _ = self.schema_meta_entity.set(eid);
+                return eid;
+            }
         }
-        let eid = self.eng.entity();
+        // 新規 (anonymous 開いてる前提、 = TableBuilder::build より前)。
         // marker himo は wrap_new / open / open_with_oplog で必ず define 済み。
         // tie_text_to は &self なので Arc<Engine> でも呼べる。
+        let eid = self.eng.entity();
         self.eng.tie_text_to(eid, SCHEMA_META_HIMO, SCHEMA_MARKER);
+        let _ = self.schema_meta_entity.set(eid);
         eid
     }
 
@@ -564,6 +613,8 @@ impl Database {
         self.eng.rebuild();
         let eids = self.eng.pull_raw(SCHEMA_META_HIMO, vid);
         let Some(&eid) = eids.first() else { return Ok(()); };
+        // schema_meta_entity を cache (= ensure_schema_entity を後で呼んでも entity() しない)
+        let _ = self.schema_meta_entity.set(eid);
         let blob = match self.eng.get_content(eid, SCHEMA_BLOB_HIMO) {
             Some(b) => b.to_vec(),
             None => return Ok(()),
@@ -572,23 +623,64 @@ impl Database {
             .map_err(|_| SchemaError::Parse("schema blob not utf8".into()))?;
         let parsed = deserialize_schema(s)?;
 
+        // 0.7.0: 各 table を engine table API で再 define。 既存 `.tables` sidecar
+        // に存在すれば idempotent (= define_table が "already exists" を返す)、
+        // legacy DB (0.5.0/0.6.0 で書いたやつ、 sidecar 空 / anonymous-only) では
+        // 新規 define されて anonymous が close される。 既存 anonymous 配下の
+        // legacy row は eid 不変で読める。
+        // 0.7.0: readonly mode では engine 側の write API は panic するので、
+        // load_schema は himo_id resolve だけして table register は skip。
+        let is_readonly = self.eng.is_readonly();
+
         for raw in parsed {
-            // himo を再 define + himo_id を解決
-            let mut cols = Vec::with_capacity(raw.cols.len());
-            for (name, ty) in raw.cols {
-                let himo_name = format!("{}.{}", raw.name, name);
-                // define_himo は &mut Engine 要求、 load_schema は build phase で呼ばれる前提
-                // (Arc 単一所有)。 concurrent 後は himo は engine が既に保持してるはずなので
-                // define 不要、 himo_id だけ resolve すれば OK。
+            // table 自体を engine に再 register (idempotent、 readonly は skip)
+            if !is_readonly {
                 if let Some(eng_mut) = Arc::get_mut(&mut self.eng) {
-                    eng_mut.define_himo(&himo_name, ty.himo_type(), 0);
+                    let remaining = eng_mut.remaining_eid_space();
+                    let size_hint = (remaining / 4).max(16).min(1_000_000);
+                    match eng_mut.define_table(&raw.name, size_hint) {
+                        Ok(_) => {} // 新規 register (legacy DB か新規 DB の初回 load)
+                        Err(e) if e.contains("already exists") => {} // 既に sidecar から復元済み
+                        Err(e) => {
+                            return Err(SchemaError::Internal(format!(
+                                "define_table({}) failed during load_schema: {}", raw.name, e
+                            )));
+                        }
+                    }
+                }
+            }
+
+            let mut cols = Vec::with_capacity(raw.cols.len());
+            for (col_name, ty) in &raw.cols {
+                let himo_name = format!("{}.{}", raw.name, col_name);
+                // himo を table-attached で再 define (idempotent、 readonly は skip)。
+                // relation あり col は後段で fk_refs を再 register。
+                if !is_readonly {
+                    if let Some(eng_mut) = Arc::get_mut(&mut self.eng) {
+                        let _ = eng_mut.define_himo_in(&raw.name, col_name, ty.himo_type(), 0);
+                    }
                 }
                 let hid = self.eng.himo_id(&himo_name)
                     .ok_or_else(|| SchemaError::Internal(format!("himo {himo_name} after define / open")))?;
-                cols.push(ColumnInner { name, ty, himo_name, himo_id: hid as u16 });
+                cols.push(ColumnInner {
+                    name: col_name.clone(),
+                    ty: *ty,
+                    himo_name,
+                    himo_id: hid as u16,
+                });
             }
+
+            // ref relation を engine 側に再 register (readonly は skip)
+            if !is_readonly {
+                for (from_col, to_table) in &raw.relations {
+                    if let Some(eng_mut) = Arc::get_mut(&mut self.eng) {
+                        // define_ref_in は idempotent
+                        let _ = eng_mut.define_ref_in(&raw.name, from_col, to_table);
+                    }
+                }
+            }
+
             let pk = raw.pk.and_then(|n| cols.iter().position(|c| c.name == n));
-            // table_vid: 名前を Vocabulary に注入する (新規 vocab insert)
             let table_vid = self.intern_table_name(&raw.name);
             let relations = raw.relations.into_iter().map(|(from_col, to_table)| {
                 RelationInner { from_col, to_table }
@@ -604,16 +696,11 @@ impl Database {
         Ok(())
     }
 
+    /// 0.7.0: 旧実装は dummy entity 作成 → tie_text → delete の roundtrip で
+    /// vocab に inject していたが、 `define_table` 後は anonymous closed で
+    /// `entity()` が panic するので使えない。 engine の直接 vocab API に置換。
     fn intern_table_name(&self, name: &str) -> u32 {
-        // 既存ならそれを返す、 なければ dummy entity 経由で vocab に登録 → 即削除。
-        if let Some(vid) = self.eng.vocab_id(name) { return vid; }
-        let tmp = self.eng.entity();
-        // tie_text_to は &Engine、 Arc<Engine> でも呼べる。 marker himo は事前 define 済み。
-        self.eng.tie_text_to(tmp, SCHEMA_META_HIMO, name);
-        let vid = self.eng.vocab_id(name)
-            .expect("vocab_id should exist after tie_text_to");
-        self.eng.delete(tmp);
-        vid
+        self.eng.vocab_intern_text(name)
     }
 }
 
@@ -723,6 +810,7 @@ pub struct TableBuilder<'a> {
     cols: Vec<(String, ColumnType)>,
     pk: Option<String>,
     relations: Vec<(String, String)>, // (from_col, to_table)
+    capacity: Option<u32>,
 }
 
 impl<'a> TableBuilder<'a> {
@@ -752,8 +840,16 @@ impl<'a> TableBuilder<'a> {
         self
     }
 
+    /// 0.7.0: table の eid 空間を明示確保。 1 table に大量 (= 1M+) row を入れる
+    /// workload で `entity_in() failed: eid range exhausted` を防ぐ用。
+    /// 省略時は engine の remaining 空間を 4 等分した default (= 4 table 分の余地)。
+    pub fn with_capacity(mut self, capacity: u32) -> Self {
+        self.capacity = Some(capacity);
+        self
+    }
+
     pub fn build(self) -> Result<Table<'a>, SchemaError> {
-        let TableBuilder { db, name, cols: col_specs, pk, relations } = self;
+        let TableBuilder { db, name, cols: col_specs, pk, relations, capacity: capacity_hint } = self;
 
         // 既存 table と同名なら handle を返す (idempotent)
         if let Some(existing) = db.find_table_inner(&name) {
@@ -774,18 +870,54 @@ impl<'a> TableBuilder<'a> {
             }
         }
 
-        // himo を define (build phase = Arc 単一所有の前提)
+        // 0.7.0: schema_meta_entity を eager 予約 (= 後で persist_schema が
+        // entity() を呼ばないように)。 define_table 前に anonymous で確保。
+        let _ = db.ensure_schema_entity();
+        // table_vid (= 名前を vocab に inject) も define_table 前に。 これは
+        // entity 経路を一切触らないので順序自由だが、 ここで一括済ませる。
+        let table_vid = db.intern_table_name(&name);
+
+        // engine table を define + columns を define_himo_in (+ ref は define_ref_in) 経由
+        // で attach。 build phase = Arc 単一所有の前提。
         let eng_mut = Arc::get_mut(&mut db.eng).ok_or_else(|| {
             SchemaError::Internal(
                 "Database already shared via Arc — call db.table() before finish_*".into()
             )
         })?;
+        // 0.7.0: TableBuilder::with_capacity が呼ばれていれば explicit な size_hint
+        // を使う。 そうでなければ remaining 空間を 4 等分した default (= 4 table 分残す
+        // 妥協)、 最低 16、 最大 1M に clamp。 大量 row を入れる use case (= 1 table に
+        // 1M+) は明示的に `.with_capacity(n)` を呼ぶ。
+        let size_hint = if let Some(cap) = capacity_hint {
+            cap
+        } else {
+            let remaining = eng_mut.remaining_eid_space();
+            (remaining / 4).max(16).min(1_000_000)
+        };
+        eng_mut.define_table(&name, size_hint)
+            .map_err(|e| SchemaError::Internal(format!("define_table({name}) failed: {e}")))?;
+
         let mut cols = Vec::with_capacity(col_specs.len());
         for (col_name, ty) in &col_specs {
+            // ref column は define_ref_in、 それ以外は define_himo_in。
+            let ref_target = relations.iter().find(|(c, _)| c == col_name).map(|(_, t)| t.clone());
+            match ref_target {
+                Some(to_table) => {
+                    eng_mut.define_ref_in(&name, col_name, &to_table)
+                        .map_err(|e| SchemaError::Internal(format!(
+                            "define_ref_in({name}.{col_name} -> {to_table}) failed: {e}"
+                        )))?;
+                }
+                None => {
+                    eng_mut.define_himo_in(&name, col_name, ty.himo_type(), 0)
+                        .map_err(|e| SchemaError::Internal(format!(
+                            "define_himo_in({name}.{col_name}) failed: {e}"
+                        )))?;
+                }
+            }
             let himo_name = format!("{}.{}", name, col_name);
-            eng_mut.define_himo(&himo_name, ty.himo_type(), 0);
             let hid = eng_mut.himo_id(&himo_name)
-                .ok_or_else(|| SchemaError::Internal(format!("himo {himo_name} after define")))?;
+                .ok_or_else(|| SchemaError::Internal(format!("himo {himo_name} after define_himo_in")))?;
             cols.push(ColumnInner {
                 name: col_name.clone(),
                 ty: *ty,
@@ -794,9 +926,6 @@ impl<'a> TableBuilder<'a> {
             });
         }
         let pk_idx = pk.as_ref().and_then(|n| cols.iter().position(|c| &c.name == n));
-
-        // table_vid を intern
-        let table_vid = db.intern_table_name(&name);
 
         let inner = Arc::new(TableInner {
             name: name.clone(),
@@ -946,7 +1075,14 @@ impl<'a> RowBuilder<'a> {
 
         let eid = match target_eid {
             Some(e) => e,
-            None => eng.entity(),
+            None => {
+                // 0.7.0: 各 table 内の eid_range から払出。 entity_in は &self で
+                // 動く (next_local は AtomicU32、 CAS で並行 safe)。
+                eng.entity_in(&self.table.name)
+                    .map_err(|e| SchemaError::Internal(format!(
+                        "entity_in({}) failed: {e}", self.table.name
+                    )))?
+            }
         };
         // table 識別は column 名 prefix (`emp.foo` himo) で行うので、
         // 個別 row への marker tie は不要。 query 側も marker cond なしで
@@ -1543,10 +1679,12 @@ mod tests {
         // unknown col は None
         assert!(db.get_table("posts").unwrap().himo_id("nope").is_none());
 
-        // engine 直叩き経路で 1 row 書く (marker tie は不要)
+        // engine 直叩き経路で 1 row 書く (marker tie は不要)。
+        // 0.7.0: TableBuilder::build が define_table を呼ぶようになったので、
+        // 既存 entity() ではなく entity_in("posts") で table 内 eid を払出。
         let e = {
             let eng = db.engine();
-            let e = eng.entity();
+            let e = eng.entity_in("posts").expect("entity_in posts");
             eng.tie_text_to_by_id(e, author_hid, "alice");
             eng.tie_to_by_id(e, year_hid, 2026);
             eng.tie_text_to_by_id(e, body_hid, "hello");
@@ -1819,6 +1957,68 @@ mod tests {
                 Some(Value::Text("to be persisted".into()))
             );
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn enable_sync_creates_reserved_tables() {
+        // 0.7.0 Phase 3: enable_sync で _sync_ops / _sync_peers が engine に
+        // 登録されること、 user-facing list_tables からは見えないことを確認。
+        let path = tmp("sync_enable");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.tables", path));
+
+        let mut db = Database::create(&path).unwrap();
+        // build phase でいくつか user table を作る
+        let _ = db.table("posts").number("id").tag("body").primary_key("id").build().unwrap();
+        let _ = db.table("users").number("id").tag("name").primary_key("id").build().unwrap();
+
+        // 有効化前は sync_enabled = false
+        assert!(!db.sync_enabled());
+
+        // sync を有効化
+        db.enable_sync().unwrap();
+        assert!(db.sync_enabled());
+
+        // user-facing list_tables には _sync_ops / _sync_peers は出ない
+        let info = db.list_tables();
+        let user_tables: Vec<&str> = info.iter().map(|t| t.name.as_str()).collect();
+        assert!(user_tables.contains(&"posts"));
+        assert!(user_tables.contains(&"users"));
+        assert!(!user_tables.iter().any(|n| n.starts_with('_')),
+                "user list_tables should hide reserved tables, got: {user_tables:?}");
+
+        // engine の list_user_tables (内部 raw) でも reserved は除外される
+        let raw = db.engine().list_user_tables();
+        assert!(!raw.iter().any(|(_, n, _, _)| n.starts_with('_')));
+
+        // engine 内部 list_tables (= reserved 含む全件) には _sync_* が居る
+        let raw_all = db.engine().list_tables();
+        assert!(raw_all.iter().any(|(_, n, _, _)| n == "_sync_ops"));
+        assert!(raw_all.iter().any(|(_, n, _, _)| n == "_sync_peers"));
+
+        // 2 度目の enable_sync は idempotent
+        db.enable_sync().unwrap();
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn user_table_starting_with_underscore_rejected() {
+        // 0.7.0 Phase 3: `_` 始まり名前は reserved 命名空間、 user 経路は弾く。
+        let path = tmp("reserved_reject");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.tables", path));
+
+        let mut db = Database::create(&path).unwrap();
+        let result = db.table("_my_table").number("id").build();
+        let err = match result {
+            Err(e) => format!("{:?}", e),
+            Ok(_) => panic!("user table starting with '_' should be rejected"),
+        };
+        assert!(err.contains("reserved") || err.contains("_"),
+                "error message should mention reserved namespace, got: {err}");
+
         let _ = std::fs::remove_file(&path);
     }
 }

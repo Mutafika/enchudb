@@ -92,11 +92,20 @@ impl Syncer {
                  instead of Engine::open / create."
             )
         });
+        // 0.7.0 (Phase 3): sync table が未有効化なら legacy oplog 経路で動作 (= 既存挙動)。
+        // 推奨は `Database::enable_sync()` で `_sync_ops` / `_sync_peers` を有効化、
+        // Phase 4+ で watermark-driven reclaim が効くようになる。
+        if !engine.sync_tables_enabled() {
+            eprintln!(
+                "warning: Syncer attached but engine has no _sync_ops / _sync_peers tables; \
+                 sync will use legacy oplog path (line-growing). \
+                 Enable via Database::enable_sync() for watermark-driven reclaim."
+            );
+        }
         // Syncer が attach された engine の WAL は auto_reset を off にする。
         // publish_since は iter_committed で WAL を読むので、consumer が
         // try_reset で WAL を空にすると sync 記録が消える race がある。
-        // 正式には「全 peer が replicate 済みの地点まで reset」する watermark が要るが、
-        // 未実装なので一旦 auto_reset off で記録を残す方針。
+        // 0.7.0 Phase 4+ で `_sync_ops` 経路に switch すれば watermark で reclaim できる。
         wal.set_auto_reset(false);
         let syncer = Self {
             engine: engine.clone(),
@@ -187,6 +196,19 @@ impl Syncer {
     /// Phase C: 署名検証を必須にする。未署名 or 検証失敗 op は reject される。
     pub fn set_require_signature(&self, on: bool) {
         self.require_signature.store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    /// 0.7.0 (Phase 5): peer に対する initial sync 完了マーク。 user code が
+    /// (1) transport.bootstrap_to 等で peer の snapshot を local に copy
+    /// (2) その時点での peer の `current_sync_lsn()` を別 RPC / shake-hands で取得
+    /// (3) 本 API で「ここまで配信済み」 を engine の `_sync_peers` に記録
+    /// (4) 以降は通常の pull_once / publish_since で incremental sync
+    ///
+    /// 0.7.0 では transport wire の bootstrap response に lsn を入れる拡張は
+    /// 入れていない (= example で「user が別経路で lsn を取る」 pattern を提示)。
+    /// 0.8.0 で transport API を拡張して 1 行に纏める想定。
+    pub fn mark_initial_sync_complete(&self, peer: PeerId, snapshot_lsn: u32) -> Result<(), String> {
+        self.engine.ack_sync(peer, snapshot_lsn)
     }
 
     /// 指定 peer から未取得レコードを 1 回 pull して本体に apply。

@@ -11,6 +11,24 @@
 //! 命名: 旧 `enchudb-wal` から rename (issue #8、 0.6.0 で実施)。 実態が
 //! write-ahead log ではなく oplog (operation log、 MongoDB oplog と同パターン)
 //! なため。 wire format は不変、 file 拡張子は `.wal` → `.oplog` (clean break)。
+//!
+//! # 0.7.0 以降の役割 (issue #11 / request7)
+//!
+//! 0.7.0 で engine 直下に `_sync_ops` / `_sync_peers` reserved table を導入し、
+//! 「peer 配信 stream」 の役割を table 側に移すための土台が出来た。 ただし
+//! 0.7.0 時点では並走 (= 既存 oplog 経路と新 `_sync_ops` 経路の両方が動く):
+//!
+//! - **本 crate (`enchudb-oplog`)**: local crash recovery + peer 配信 (legacy)
+//! - **`Engine::transfer_oplog_to_sync_ops`**: oplog から `_sync_ops` への転送
+//! - **`Engine::pending_sync_ops`**: SQL から見える新 publish 経路 (将来主体)
+//!
+//! 0.8.0 以降で:
+//! - `_sync_ops` 経路を sync の primary publish source に
+//! - oplog crate は local crash recovery 専用に shrink (= file 拡張子 / wire
+//!   format / record encoding は維持、 peer publish は移行)
+//! - もしくは `_sync_ops` で local recovery も兼任する deprecate 路線
+//!
+//! 詳細: `notes/requests/request7.md` (Phase 7 discussion)。
 
 pub mod keys;
 pub mod oplog;
