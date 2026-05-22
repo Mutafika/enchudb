@@ -863,9 +863,9 @@ impl<'a> TableBuilder<'a> {
             }
         }
 
-        // relation 先 table の存在チェック
+        // relation 先 table の存在チェック (self-ref は to_table == name で許可)
         for (_, to_table) in &relations {
-            if db.find_table_inner(to_table).is_none() {
+            if to_table != &name && db.find_table_inner(to_table).is_none() {
                 return Err(SchemaError::UnknownTable(to_table.clone()));
             }
         }

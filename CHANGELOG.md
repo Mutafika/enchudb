@@ -3,6 +3,48 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.8.1 — 2026-05-22
+
+short-lived CLI consumer 連携で表面化した recover 不完全の patch release。 sinfo
+の sf CLI (= open → 1 write → drop) で entity 状態 (`next_local` + `entities`
+live bitmap) が次 open に持ち越せず eid 衝突が出ていた。 file format / wire
+format / API 変更なし、 **0.8.0 から再 build のみで上がれる**。
+
+### Fixed
+
+- **`apply_oplog_op` の recover 不完全**: Tie / Content op で `entities.ensure_live`
+  + table `next_local` の max 推進が呼ばれていなかった (= 0.8.0 以前から続く
+  defect)。 crash recovery (= consumer shutdown 前に kill された場合) で oplog
+  replay は走るが、 entity 状態が body の himo data と整合せず、 次 `entity_in`
+  が重複 eid を払い出す問題を fix
+- **graceful shutdown で tables sidecar 未 persist**: 0.8.0 consumer thread の
+  shutdown path は `body_msync` のみで `tables` sidecar (= `next_local` の永続化先)
+  を更新していなかった。 short-lived CLI で flush(&mut) を呼ばずに drop すると
+  次 open で `next_local=0` のまま戻り、 既存 eid と衝突する root cause。 shutdown
+  + 周期 fsync (= 100ms) の両方で `try_persist_tables()` を呼ぶように変更
+
+### Added
+
+- **`Engine::persist_tables(&self) -> io::Result<()>`** public API: `Arc<Engine>`
+  (= concurrent mode) でも tables sidecar を強制 persist できる。 既存 `flush(&mut)`
+  が取れない context (= sinfo 等の embed consumer で long-lived process が任意
+  tick で固めたい場合) 用、 wasm / memory-only では Ok(()) no-op
+- **`apply_oplog_op` 内で `advance_table_next_local_for`**: recover 中に与えられた
+  global eid を含む table の `next_local` を `(eid - lo) + 1` まで前進させる
+  private helper、 上記 fix の実装本体
+
+### Unchanged
+
+- file format / wire format / 公開 API 完全不変、 0.7.0 ↔ 0.8.1 wire 互換は
+  0.8.0 と同条件 (= 非互換)
+- 0.7.x consumer 経路 (`pending_sync_ops` etc) は前 release 通り
+- HLC / signature / pubkey_fp layout 不変
+
+### 0.8.0 consumer 向け migration
+
+なし。 `cargo build` で 0.8.1 binary になる。 sinfo / opyula 等の schema 経由
+consumer も再 build のみ。
+
 ## 0.8.0 — 2026-05-22
 
 sync 並走の解消 — oplog publish path 撤去 + `_sync_ops` 一本化 + ring buffer
