@@ -11,15 +11,25 @@
 //! let path = format!("/tmp/enchudb-sync-doc-{}.db", std::process::id());
 //! let _ = std::fs::remove_file(&path);
 //! let _ = std::fs::remove_file(format!("{}.oplog", path));
-//! // Sync を使う場合は必ず WAL 有効な Engine を使う。
-//! let eng_a = Engine::create_concurrent_with_oplog(&path, 4 * 1024 * 1024).unwrap();
+//! let _ = std::fs::remove_file(format!("{}.tables", path));
+//! let _ = std::fs::remove_file(format!("{}.db.lock", path));
+//! // Sync を使う場合は必ず WAL + sync tables 有効な Engine を使う。
+//! {
+//!     let mut eng_init = Engine::create_standalone(&path).unwrap();
+//!     eng_init.enable_sync_tables().unwrap();
+//!     eng_init.flush().unwrap();
+//! }
+//! let eng_a = Engine::open_concurrent_with_oplog(&path, 4 * 1024 * 1024).unwrap();
 //!
 //! let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
 //! let syncer = Syncer::new(eng_a.clone(), transport);
 //! let out = syncer.pull_once(2); // 未知の peer から pull、0 件
 //! assert_eq!(out.received, 0);
+//! # drop(eng_a);
 //! # let _ = std::fs::remove_file(&path);
 //! # let _ = std::fs::remove_file(format!("{}.oplog", path));
+//! # let _ = std::fs::remove_file(format!("{}.tables", path));
+//! # let _ = std::fs::remove_file(format!("{}.db.lock", path));
 //! ```
 //!
 //! # LWW 規則
@@ -57,6 +67,10 @@ pub struct Syncer {
     /// request4: per-peer subscription filter。 default は `AllRecords` (全送り、
     /// 旧 `publish_since` の挙動)。 `set_subscription_filter` で差し替え可。
     subscription_filter: std::sync::RwLock<Arc<dyn SubscriptionFilter>>,
+    /// 0.8.0: `_sync_ops` 経由 publish の進行点 (= 最後に publish した lsn)。
+    /// 次回 `publish_pending` は `pending_sync_ops(this)` で取得、 done で進める。
+    /// sync_tables_enabled な engine で初期化、 そうでなければ 0 のまま (= legacy path)。
+    published_lsn: std::sync::atomic::AtomicU32,
 }
 
 /// 1 回の pull-apply サイクルの結果。
@@ -92,21 +106,21 @@ impl Syncer {
                  instead of Engine::open / create."
             )
         });
-        // 0.7.0 (Phase 3): sync table が未有効化なら legacy oplog 経路で動作 (= 既存挙動)。
-        // 推奨は `Database::enable_sync()` で `_sync_ops` / `_sync_peers` を有効化、
-        // Phase 4+ で watermark-driven reclaim が効くようになる。
+        // 0.8.0: sync 配信の primary は `_sync_ops` 一本、 legacy oplog iter
+        // fallback は撤去。 `Database::enable_sync()` (= `enable_sync_tables`) を
+        // 呼んでない engine で Syncer を attach するのは fatal。
         if !engine.sync_tables_enabled() {
-            eprintln!(
-                "warning: Syncer attached but engine has no _sync_ops / _sync_peers tables; \
-                 sync will use legacy oplog path (line-growing). \
-                 Enable via Database::enable_sync() for watermark-driven reclaim."
+            panic!(
+                "Syncer requires sync tables (_sync_ops / _sync_peers). \
+                 Call Database::enable_sync() / Engine::enable_sync_tables() before \
+                 attaching Syncer."
             );
         }
-        // Syncer が attach された engine の WAL は auto_reset を off にする。
-        // publish_since は iter_committed で WAL を読むので、consumer が
-        // try_reset で WAL を空にすると sync 記録が消える race がある。
-        // 0.7.0 Phase 4+ で `_sync_ops` 経路に switch すれば watermark で reclaim できる。
-        wal.set_auto_reset(false);
+        // 0.8.0: oplog auto_reset を OFF にする hack は撤去。 publish path が
+        // `_sync_ops` 経由になったので、 oplog ring buffer は通常通り自然 reset
+        // して構わない (= transfer 自動化で `_sync_ops` に bridge 済の record
+        // だけが oplog に残る、 全 peer ack 後の reclaim は `_sync_ops` 側で行う)。
+        let _ = wal; // unused after 0.8.0 fallback removal
         let syncer = Self {
             engine: engine.clone(),
             transport,
@@ -114,6 +128,7 @@ impl Syncer {
             cursor_path: std::sync::RwLock::new(None),
             require_signature: std::sync::atomic::AtomicBool::new(false),
             subscription_filter: std::sync::RwLock::new(Arc::new(AllRecords)),
+            published_lsn: std::sync::atomic::AtomicU32::new(0),
         };
         // HlcStore は engine 内部のメモリ構造で永続化されない。 engine reopen 後は
         // 空状態なので、 attach 時に WAL を walk して LWW state を再構築する。
@@ -265,20 +280,10 @@ impl Syncer {
         let peers = self.transport.known_peers();
         if peers.is_empty() {
             // backward compat: known_peers 未実装 transport (HTTP/WS push 等) は
-            // 旧 broadcast 経路。 filter は無視される (broadcast に per-target
-            // filter は意味が無いため、 default `AllRecords` のときと等価)。
-            let wal = match self.engine.oplog_arc() {
-                Some(w) => w,
-                None => return 0,
-            };
-            let recs = wal.iter_committed();
-            let self_peer = self.engine.peer_id();
-            let filtered: Vec<WireRecord> = recs
-                .into_iter()
-                .filter(|r| r.hlc > since)
-                .map(|r| r.into())
-                .collect();
+            // 旧 broadcast 経路。 filter は無視される。
+            let filtered = self.collect_records_since(since);
             let count = filtered.len();
+            let self_peer = self.engine.peer_id();
             self.transport.publish(self_peer, filtered);
             return count;
         }
@@ -291,6 +296,23 @@ impl Syncer {
         total
     }
 
+    /// 0.8.0: `since` HLC より新しい WireRecord を集める。 `_sync_ops` 経由
+    /// (= publish の primary source、 legacy oplog iter fallback は 0.8.0 で
+    /// 撤去、 `Syncer::new` で `sync_tables_enabled` チェック済み)。
+    fn collect_records_since(&self, since: Hlc) -> Vec<WireRecord> {
+        let payloads = self.engine.pending_sync_ops(0);
+        let mut out = Vec::with_capacity(payloads.len());
+        for p in &payloads {
+            let Some(rec) = enchudb_oplog::oplog::decode_sync_ops_payload(p) else {
+                continue;
+            };
+            if rec.hlc > since {
+                out.push(WireRecord::from(rec));
+            }
+        }
+        out
+    }
+
     /// request4: `target_peer` 限定で publish。 `SubscriptionFilter::should_send`
     /// で per-peer に絞った record のみを `transport.publish_to(self_peer,
     /// target_peer, ...)` で送る。 戻り値は実際に送った record 数。
@@ -300,17 +322,10 @@ impl Syncer {
     /// SNS partial sync では `SubscriptionFilter::should_send` で「target が
     /// 関心ある record か」 を判定してから送る。
     pub fn publish_since_for_peer(&self, target_peer: PeerId, since: Hlc) -> usize {
-        let wal = match self.engine.oplog_arc() {
-            Some(w) => w,
-            None => return 0,
-        };
-        let recs = wal.iter_committed();
         let self_peer = self.engine.peer_id();
         let filter = self.subscription_filter.read().unwrap().clone();
-        let filtered: Vec<WireRecord> = recs
+        let filtered: Vec<WireRecord> = self.collect_records_since(since)
             .into_iter()
-            .filter(|r| r.hlc > since)
-            .map(WireRecord::from)
             .filter(|r| filter.should_send(target_peer, r))
             .collect();
         let count = filtered.len();
@@ -447,10 +462,16 @@ mod tests {
     fn new_eng(path: &str, peer: PeerId) -> Arc<Engine> {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(format!("{}.oplog", path));
+        let _ = std::fs::remove_file(format!("{}.tables", path));
         let _ = std::fs::remove_file(format!("{}.crc", path));
+        let _ = std::fs::remove_file(format!("{}.db.lock", path));
         {
             let mut eng = Engine::create_standalone(path).unwrap();
-            eng.define_himo("val", HimoType::Number, 100);
+            // 0.8.0: user table 経路で使う (= anonymous は enable_sync_tables で
+            // 閉じるため)。 既存 test の "rows.val" himo は "rows.val" 名前空間に。
+            eng.define_table("rows", 1000).unwrap();
+            eng.define_himo_in("rows", "val", HimoType::Number, 100).unwrap();
+            eng.enable_sync_tables().unwrap();
             eng.flush().unwrap();
         }
         let eng = Engine::open_concurrent_with_oplog(path, 4 * 1024 * 1024).unwrap();
@@ -498,7 +519,7 @@ mod tests {
         assert_eq!(out.applied, 1);
 
         // peer A 側から peer 2 の eid を get できる(local=3 で引く)
-        let v = eng_a.get(eid_b, "val");
+        let v = eng_a.get(eid_b, "rows.val");
         assert_eq!(v, Some(42));
 
         let _ = std::fs::remove_file(path_a);
@@ -541,10 +562,14 @@ mod tests {
         transport.register_peer(3);
 
         // peer 1 で書き込み → publish_since で他 peer に配信
-        let e = eng_a.entity();
-        eng_a.tie_async(e, "val", 42);
+        let e = eng_a.entity_in("rows").unwrap();
+        eng_a.tie_async(e, "rows.val", 42);
         eng_a.flush_writes();
         eng_a.oplog_sync().unwrap();
+        // 0.8.0: publish path が _sync_ops 経由になったので transfer を明示発火
+        // (= 通常運用では consumer thread の fsync interval で自動だが、 test
+        // では同期的に進める)
+        eng_a.transfer_oplog_to_sync_ops();
         let count = syncer.publish_since(Hlc::ZERO);
         assert!(count > 0, "should publish at least the tie record");
 
@@ -579,10 +604,11 @@ mod tests {
         }
         syncer.set_subscription_filter(Arc::new(OnlyToPeer2));
 
-        let e = eng_a.entity();
-        eng_a.tie_async(e, "val", 77);
+        let e = eng_a.entity_in("rows").unwrap();
+        eng_a.tie_async(e, "rows.val", 77);
         eng_a.flush_writes();
         eng_a.oplog_sync().unwrap();
+        eng_a.transfer_oplog_to_sync_ops();
         syncer.publish_since(Hlc::ZERO);
 
         let recs_2 = transport.pull_as(2, 1, Hlc::ZERO);
@@ -603,10 +629,11 @@ mod tests {
         let transport = Arc::new(InMemoryTransport::new());
         let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
 
-        let e = eng_a.entity();
-        eng_a.tie_async(e, "val", 99);
+        let e = eng_a.entity_in("rows").unwrap();
+        eng_a.tie_async(e, "rows.val", 99);
         eng_a.flush_writes();
         eng_a.oplog_sync().unwrap();
+        eng_a.transfer_oplog_to_sync_ops();
 
         // peer 5 のみに publish (filter default AllRecords)
         let n = syncer.publish_since_for_peer(5, Hlc::ZERO);

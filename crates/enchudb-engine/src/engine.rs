@@ -166,6 +166,8 @@ fn deserialize_tables(buf: &[u8]) -> Result<Vec<TableDef>, String> {
             eid_range_hi,
             fk_refs,
             next_local,
+            free_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            free_locals_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
     }
     Ok(tables)
@@ -753,6 +755,18 @@ pub(crate) struct TableDef {
     /// (= Arc<Engine> 経由の concurrent mode) で row insert する path が
     /// CAS で並行 safe に払出できる。
     pub next_local: std::sync::atomic::AtomicU32,
+    /// 0.8.0: free list = reclaim で解放された local id の reservoir。
+    /// `entity_in(table)` は free list が non-empty なら pop で再利用、
+    /// 空なら通常通り `next_local.fetch_add(1)`。 `_sync_ops` の長期運用で
+    /// eid 空間飽和を防ぐ (= ring buffer 化の本体)。 user table は今のところ
+    /// 自動 reclaim path がないので free list は空のまま。
+    pub free_locals: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+    /// 0.8.0: `free_locals` が non-empty かどうかの fast path flag。 user table
+    /// (= 自動 reclaim なし) では常に false、 `entity_in` の hot path で mutex を
+    /// 取らずに済む。 reclaim が push したら true に上げる、 entity_in が pop
+    /// で空になったら false に戻す。 厳密な race は entity_in 内で mutex 取った
+    /// あと再 check するので OK (= AtomicBool は fast path の hint)。
+    pub free_locals_nonempty: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Clone for TableDef {
@@ -766,6 +780,12 @@ impl Clone for TableDef {
             next_local: std::sync::atomic::AtomicU32::new(
                 self.next_local.load(std::sync::atomic::Ordering::Relaxed)
             ),
+            // free_locals は Arc なので share される (= clone は same reservoir を
+            // 指す)。 これは TableDef::clone を「meta read 用 snapshot」 として
+            // 使う既存 caller の semantic と整合 (= 並列 race しないように caller
+            // 側で coordinate する想定)。
+            free_locals: self.free_locals.clone(),
+            free_locals_nonempty: self.free_locals_nonempty.clone(),
         }
     }
 }
@@ -783,6 +803,8 @@ impl TableDef {
             eid_range_hi: u32::MAX,
             fk_refs: Vec::new(),
             next_local: std::sync::atomic::AtomicU32::new(0),
+            free_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            free_locals_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1873,8 +1895,16 @@ impl Engine {
             // hlc.wall は u64 ms-since-epoch、 下位 32bit のみ保持 (= ~50 日サイクル
             // で wrap するが、 lsn 順序で query するので debug/filter 程度の用途)
             self.tie_to_by_id(row_eid, hlc_wall_lo_hid, rec.hlc.wall as u32);
-            // payload: 完全な signed_bytes (= 署名対象 = header + payload)
-            self.tie_bytes_to_by_id(row_eid, payload_hid, &rec.signed_bytes);
+            // 0.8.0 phase 2: payload は signature(64) + pubkey_fp(8) + signed_bytes(rest)
+            // の concat 形式。 0.7.0 では signed_bytes のみだったが、 publish path を
+            // _sync_ops 経由にするため signature 込みで保存し、 sync crate で完全な
+            // WireRecord に復元できるよう拡張した。 wire format breaking、 0.7.x との
+            // 並走 sync は不可。
+            let mut wire_payload = Vec::with_capacity(72 + rec.signed_bytes.len());
+            wire_payload.extend_from_slice(&rec.signature);
+            wire_payload.extend_from_slice(&rec.pubkey_fp);
+            wire_payload.extend_from_slice(&rec.signed_bytes);
+            self.tie_bytes_to_by_id(row_eid, payload_hid, &wire_payload);
         }
 
         // 全部転送できた、 offset を head に進める
@@ -1945,13 +1975,27 @@ impl Engine {
         let Some(lsn_hid) = self.himo_id("_sync_ops.lsn") else { return 0; };
         let lsn_hid_u16 = lsn_hid as u16;
 
+        // 0.8.0: _sync_ops table の eid_range_lo を取り、 reclaim 後 free list に
+        // local id を push する (= ring buffer 化)。
+        let sync_ops_meta = self.tables.iter()
+            .find(|t| t.name == "_sync_ops")
+            .map(|t| (t.eid_range_lo, t.free_locals.clone(), t.free_locals_nonempty.clone()));
+
         // _sync_ops 全 row を走査して lsn < watermark を delete
         let rows = self.entities_with_himo(lsn_hid_u16);
         let mut purged = 0;
         for eid in rows {
             if let Some(lsn) = self.get_by_id(eid, lsn_hid_u16) {
                 if lsn < watermark {
+                    let local = enchudb_oplog::eid_local(eid);
                     self.delete(eid);
+                    // 0.8.0: free list に追加 (= 次回 entity_in("_sync_ops") で再利用)
+                    if let Some((lo, ref free_list, ref nonempty)) = sync_ops_meta {
+                        if local >= lo {
+                            free_list.lock().unwrap().push(local - lo);
+                            nonempty.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                    }
                     purged += 1;
                 }
             }
@@ -2071,6 +2115,8 @@ impl Engine {
             eid_range_hi: new_hi,
             fk_refs: Vec::new(),
             next_local: std::sync::atomic::AtomicU32::new(0),
+            free_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            free_locals_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         self.try_persist_tables();
         Ok(tid)
@@ -2095,6 +2141,34 @@ impl Engine {
             .position(|t| t.name == table_name)
             .ok_or_else(|| format!("table '{}' not found", table_name))?;
         let table = &self.tables[tid];
+
+        // 0.8.0: free list 優先 — reclaim で解放された local id があれば再利用
+        // (= ring buffer 化、 `_sync_ops` の長期運用で eid 飽和を防ぐ)。
+        // 再利用時は entities.allocate_at で live mark を戻す + concurrent
+        // barrier も走らせる (= 新規 alloc path と同じ orchestration)。
+        //
+        // fast path: free_locals_nonempty が false (= user table の常態) なら
+        // mutex を取らずに通常 alloc に進む。 1M insert hot path で mutex
+        // overhead (= 約 50 ns/op) を消す最適化。
+        let reused_global = if table.free_locals_nonempty.load(Ordering::Acquire) {
+            let mut fl = table.free_locals.lock().unwrap();
+            let popped = fl.pop();
+            if fl.is_empty() {
+                table.free_locals_nonempty.store(false, Ordering::Release);
+            }
+            popped.map(|local| table.eid_range_lo + local)
+        } else {
+            None
+        };
+        if let Some(global) = reused_global {
+            self.entities.allocate_at(global);
+            if let Some(q) = self.write_queue.as_ref() {
+                q.push(crate::write_queue::Op::EntityCreated { local: global });
+                self.push_count.fetch_add(1, Ordering::Release);
+            }
+            let peer = self.peer_id.load(Ordering::Acquire);
+            return Ok(enchudb_oplog::make_eid(peer, global));
+        }
 
         // capacity check (= fetch_add 後の load で再 check して overflow 検出)
         let table_size = table.eid_range_hi - table.eid_range_lo;
@@ -3859,6 +3933,15 @@ impl Engine {
                                 let lsn = wal.next_lsn().saturating_sub(1);
                                 durable_lsn_for_thread.store(lsn, Ordering::Release);
 
+                                // 0.8.0: sync 並走の解消 — durable 化した record を
+                                // _sync_ops に自動転送する (= 0.7.0 では user が手動で
+                                // transfer_oplog_to_sync_ops() を呼ぶ必要があったが、
+                                // 0.8.0 で primary 切替につき自動化)。
+                                // enable_sync 未呼出なら no-op、 副作用ゼロ。
+                                if engine.sync_tables_enabled() {
+                                    engine.transfer_oplog_to_sync_ops();
+                                }
+
                                 // changefeed: durable 化した record を listener に push
                                 Self::fire_change_listeners(
                                     wal,
@@ -3902,6 +3985,11 @@ impl Engine {
                             let _ = wal.fsync();
                             let _ = engine.body_msync();
                             wal.advance_checkpoint(wal.head());
+                            // 0.8.0: shutdown 時も最終 sync 転送 (drop で残った record も
+                            // _sync_ops に bridge し切ってから抜ける)
+                            if engine.sync_tables_enabled() {
+                                engine.transfer_oplog_to_sync_ops();
+                            }
                             // shutdown 時の最終 emit
                             Self::fire_change_listeners(
                                 wal,

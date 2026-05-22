@@ -3,6 +3,70 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.8.0 — 2026-05-22
+
+sync 並走の解消 — oplog publish path 撤去 + `_sync_ops` 一本化 + ring buffer
+化。 0.7.0 で並走可能化した `_sync_ops` reserved table を sync 配信の primary
+source にし、 oplog は local crash recovery 専用に役割を絞る。 0.7.0 で「移行
+猶予期」 として残してた並走モードを 0.8.0 で完全解消。 計画書: `notes/requests/request8.md`。
+
+### Breaking
+
+- **sync wire format 変更**: `_sync_ops.payload` の wire layout を
+  `signature(64) + pubkey_fp(8) + signed_bytes(rest)` の concat 形式に拡張
+  (= 0.7.0 では signed_bytes のみだったが、 sync 経路で署名検証できなかった
+  defect を fix)。 **0.7.x peer との sync 互換は失う**
+- **file format 互換**: 維持 (= 既存 v6/v7 DB はそのまま open 可能)、 ただし
+  0.7.x で書いた `_sync_ops` row は 0.8.0 で peer publish 時に rejected (=
+  signature 抜きで verify 不可)。 既存 row は手動 reclaim or DB 作り直しで対処
+
+### Added
+
+- **`Engine::transfer_oplog_to_sync_ops` の自動化**: consumer thread が fsync
+  interval (= 100ms) 経過時 + shutdown 時に `sync_tables_enabled()` なら自動で
+  bridge を発火。 user は手動呼び出し不要、 0.7.0 互換のため API は idempotent
+  に残る
+- **`TableDef.free_locals`**: reclaim で解放された local id の reservoir。
+  `entity_in(table)` は free list 優先で payout (= ring buffer 化)、 `_sync_ops`
+  の長期運用で eid 飽和を防ぐ
+- **`enchudb_oplog::decode_sync_ops_payload(bytes)`**: `_sync_ops.payload` の
+  concat 形式を `Record` に復元する公開関数。 sync crate の publish path で使う
+- **`enchudb_oplog::SIGNED_PAYLOAD_HEADER_SIZE` / `SYNC_OPS_PAYLOAD_PREFIX`**:
+  wire layout の sized const、 transport / sync 層が固定 offset で parse する用
+
+### Changed
+
+- **`Syncer::publish_since` / `publish_since_for_peer` の内部実装**: `_sync_ops`
+  経由 (= `pending_sync_ops` + `decode_sync_ops_payload`) に切替。 公開 API は
+  不変、 既存 consumer は再 build で済む。 `sync_tables_enabled()` 未呼出の DB
+  では legacy oplog iter 経路に自動 fallback (= 0.7.x DB 互換)
+- **`reclaim_sync_ops` が free list に push**: 解放 row の local id を `_sync_ops`
+  table の `free_locals` に積む (= 次回 `entity_in("_sync_ops")` で再利用)
+- **`Syncer.published_lsn: AtomicU32`** field 追加: 将来 (= 0.9.0) で
+  watermark-driven reclaim を Syncer 経由で駆動する準備
+
+### Unchanged
+
+- `WireRecord` encode 形式 (= peer 間 transport の wire schema) 不変
+- HLC / EntityId / PeerId / ed25519 signature / pubkey_fp layout 不変
+- crash recovery semantic (= oplog commit marker + recover replay) 不変
+- file magic `ECDB` / version 5 / 全 region layout 不変
+- schema crate 公開 API (`Database::table().build()` 等) 完全不変
+
+### 0.7.x consumer 向け migration
+
+[`docs/migration-0.7.0-to-0.8.0.md`](docs/migration-0.7.0-to-0.8.0.md) (=
+local 専用) に詳細あり、 要約:
+
+- **schema 経由 consumer** (opyula / bisquit / sinfo / matcha / t5ug3 等):
+  再 build で済む、 公開 API 完全不変。 `Database::enable_sync()` 呼んでいた
+  consumer は自動 transfer 化により `transfer_oplog_to_sync_ops()` の手動
+  呼び出しが不要に (= 残しても idempotent で no-op)
+- **`enchudb-sync` 直接 consumer**: `Syncer::publish_since` の戻り値は同じ、
+  ただし source が `_sync_ops` 経由に。 sync_tables_enabled な engine では
+  watermark + reclaim が効くので長期運用で `.oplog` の線形成長が止まる
+- **peer 同士**: 0.7.x ↔ 0.8.0 sync は wire 互換切れ、 同時に upgrade すること
+
 ## 0.7.0 — 2026-05-22
 
 mini-RDB semantics の **actually 確立** ([issue #11](https://github.com/Mutafika/enchudb/issues/11) +

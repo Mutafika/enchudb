@@ -1,6 +1,6 @@
 [package]
 name = "enchudb-oplog"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 description = "EnchuDB oplog — append-only operation log, HLC, peer keys. Wire-level primitives shared by engine / sync / transport."
 license-file = "LICENSE.md"
