@@ -3859,6 +3859,15 @@ impl Engine {
                                 let lsn = wal.next_lsn().saturating_sub(1);
                                 durable_lsn_for_thread.store(lsn, Ordering::Release);
 
+                                // 0.8.0: sync 並走の解消 — durable 化した record を
+                                // _sync_ops に自動転送する (= 0.7.0 では user が手動で
+                                // transfer_oplog_to_sync_ops() を呼ぶ必要があったが、
+                                // 0.8.0 で primary 切替につき自動化)。
+                                // enable_sync 未呼出なら no-op、 副作用ゼロ。
+                                if engine.sync_tables_enabled() {
+                                    engine.transfer_oplog_to_sync_ops();
+                                }
+
                                 // changefeed: durable 化した record を listener に push
                                 Self::fire_change_listeners(
                                     wal,
@@ -3902,6 +3911,11 @@ impl Engine {
                             let _ = wal.fsync();
                             let _ = engine.body_msync();
                             wal.advance_checkpoint(wal.head());
+                            // 0.8.0: shutdown 時も最終 sync 転送 (drop で残った record も
+                            // _sync_ops に bridge し切ってから抜ける)
+                            if engine.sync_tables_enabled() {
+                                engine.transfer_oplog_to_sync_ops();
+                            }
                             // shutdown 時の最終 emit
                             Self::fire_change_listeners(
                                 wal,
