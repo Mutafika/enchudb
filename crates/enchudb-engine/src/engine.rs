@@ -2196,6 +2196,22 @@ impl Engine {
         Ok(enchudb_oplog::make_eid(peer, global))
     }
 
+    /// 0.8.1: `&self` で tables sidecar を強制 persist する public API。
+    /// `Arc<Engine>` (= concurrent mode) でも `flush(&mut)` を取れない状況で
+    /// `next_local` を含む tables 状態を disk に固める用途。
+    ///
+    /// short-lived CLI (= 1 write → drop) で sinfo 等の embed consumer が
+    /// 明示的に呼ぶ想定。 wasm / memory-only (= path 空) では Ok(()) no-op。
+    /// persist 失敗時は呼び出し側に io::Error を返す (= `try_persist_tables`
+    /// と違って best-effort ではない、 fail-fast)。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn persist_tables(&self) -> io::Result<()> {
+        if self.path.is_empty() {
+            return Ok(());
+        }
+        persist_tables_to_sidecar(&self.path, &self.tables)
+    }
+
     /// β-light step 7: 現 tables Vec を sidecar に保存する (best effort)。
     /// memory-only (from_bytes) や wasm では no-op。 path が空なら skip。
     fn try_persist_tables(&self) {
@@ -3732,6 +3748,13 @@ impl Engine {
 
     /// WAL の 1 op を本体に適用(recover 専用)。
     /// v32: eid は u64 だが Column は local u32 で保持。eid_local() で剥がす。
+    ///
+    /// 0.8.1: Tie/Content で `entities.ensure_live` + table `next_local` の
+    /// max 推進を入れた。 これが無いと short-lived CLI (= sidecar persist
+    /// 機会無く drop → 次 open で oplog recover) のとき:
+    ///   - entity_set の live bitmap が stale → 次 entity_in が eid 重複払出し
+    ///   - table.next_local が 0 のまま → 次 alloc が既存 eid と衝突
+    /// になる。 sinfo 連携で表面化したので 0.8.1 patch で根治。
     fn apply_oplog_op(&mut self, op: &enchudb_oplog::oplog::DecodedOp) {
         use enchudb_oplog::oplog::DecodedOp;
         match op {
@@ -3741,6 +3764,8 @@ impl Engine {
                 if hid < self.himos.len() {
                     self.himos[hid].set(local, *value);
                 }
+                self.entities.ensure_live(local);
+                Self::advance_table_next_local_for(&self.tables, local);
             }
             DecodedOp::Untie { eid, himo_id } => {
                 let hid = *himo_id as usize;
@@ -3759,12 +3784,40 @@ impl Engine {
             DecodedOp::Content { eid, key, data } => {
                 let local = enchudb_oplog::eid_local(*eid);
                 self.contents.set(local, key, data);
+                self.entities.ensure_live(local);
+                Self::advance_table_next_local_for(&self.tables, local);
             }
             DecodedOp::Commit => {}
             DecodedOp::Vocab { .. } => {
                 // v33: 自プロセスの recover 時は Vocab 個別の apply 不要
                 // (author_peer == self の場合は既に local vocab にある)。
                 // Sync 経由で他 peer から受信する場合のみ apply_one 側で処理。
+            }
+        }
+    }
+
+    /// recover 中、 与えられた global eid を含む table の next_local を
+    /// `(eid - lo) + 1` まで進める (= 次 alloc が衝突しないように)。
+    /// global が未登録 table の range なら no-op (= reserved table 等で
+    /// recover 順序的に table 定義が先に存在することを期待)。
+    fn advance_table_next_local_for(tables: &[TableDef], global: u32) {
+        use std::sync::atomic::Ordering;
+        for table in tables {
+            if global >= table.eid_range_lo && global < table.eid_range_hi {
+                let target = global - table.eid_range_lo + 1;
+                let mut cur = table.next_local.load(Ordering::Relaxed);
+                while cur < target {
+                    match table.next_local.compare_exchange_weak(
+                        cur,
+                        target,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(v) => cur = v,
+                    }
+                }
+                return;
             }
         }
     }
@@ -3928,6 +3981,11 @@ impl Engine {
                                 let _ = wal.append(enchudb_oplog::oplog::Op::Commit);
                                 let _ = wal.fsync();
                                 let _ = engine.body_msync();
+                                // 0.8.1: 周期 fsync でも tables sidecar を persist。
+                                // checkpoint を前進させる前に必ず sidecar を固める
+                                // (= 直後に process kill されても次 open で sidecar
+                                // の next_local が oplog の進行と整合する)。
+                                engine.try_persist_tables();
                                 let head = wal.head();
                                 wal.advance_checkpoint(head);
                                 let lsn = wal.next_lsn().saturating_sub(1);
@@ -3984,6 +4042,13 @@ impl Engine {
                             let _ = wal.append(enchudb_oplog::oplog::Op::Commit);
                             let _ = wal.fsync();
                             let _ = engine.body_msync();
+                            // 0.8.1: shutdown 時に tables sidecar を強制 persist。
+                            // 旧 behavior では body_msync のみで `next_local` が
+                            // sidecar に書かれず、 short-lived CLI (sinfo の sf 等)
+                            // で次 open 時に eid 衝突が出ていた。 graceful shutdown
+                            // 経路では oplog checkpoint も進めてしまうので、 ここで
+                            // sidecar を確実に固める必要がある。
+                            engine.try_persist_tables();
                             wal.advance_checkpoint(wal.head());
                             // 0.8.0: shutdown 時も最終 sync 転送 (drop で残った record も
                             // _sync_ops に bridge し切ってから抜ける)
