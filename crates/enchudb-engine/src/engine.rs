@@ -1873,8 +1873,16 @@ impl Engine {
             // hlc.wall は u64 ms-since-epoch、 下位 32bit のみ保持 (= ~50 日サイクル
             // で wrap するが、 lsn 順序で query するので debug/filter 程度の用途)
             self.tie_to_by_id(row_eid, hlc_wall_lo_hid, rec.hlc.wall as u32);
-            // payload: 完全な signed_bytes (= 署名対象 = header + payload)
-            self.tie_bytes_to_by_id(row_eid, payload_hid, &rec.signed_bytes);
+            // 0.8.0 phase 2: payload は signature(64) + pubkey_fp(8) + signed_bytes(rest)
+            // の concat 形式。 0.7.0 では signed_bytes のみだったが、 publish path を
+            // _sync_ops 経由にするため signature 込みで保存し、 sync crate で完全な
+            // WireRecord に復元できるよう拡張した。 wire format breaking、 0.7.x との
+            // 並走 sync は不可。
+            let mut wire_payload = Vec::with_capacity(72 + rec.signed_bytes.len());
+            wire_payload.extend_from_slice(&rec.signature);
+            wire_payload.extend_from_slice(&rec.pubkey_fp);
+            wire_payload.extend_from_slice(&rec.signed_bytes);
+            self.tie_bytes_to_by_id(row_eid, payload_hid, &wire_payload);
         }
 
         // 全部転送できた、 offset を head に進める

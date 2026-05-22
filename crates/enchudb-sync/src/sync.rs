@@ -57,6 +57,10 @@ pub struct Syncer {
     /// request4: per-peer subscription filter。 default は `AllRecords` (全送り、
     /// 旧 `publish_since` の挙動)。 `set_subscription_filter` で差し替え可。
     subscription_filter: std::sync::RwLock<Arc<dyn SubscriptionFilter>>,
+    /// 0.8.0: `_sync_ops` 経由 publish の進行点 (= 最後に publish した lsn)。
+    /// 次回 `publish_pending` は `pending_sync_ops(this)` で取得、 done で進める。
+    /// sync_tables_enabled な engine で初期化、 そうでなければ 0 のまま (= legacy path)。
+    published_lsn: std::sync::atomic::AtomicU32,
 }
 
 /// 1 回の pull-apply サイクルの結果。
@@ -114,6 +118,7 @@ impl Syncer {
             cursor_path: std::sync::RwLock::new(None),
             require_signature: std::sync::atomic::AtomicBool::new(false),
             subscription_filter: std::sync::RwLock::new(Arc::new(AllRecords)),
+            published_lsn: std::sync::atomic::AtomicU32::new(0),
         };
         // HlcStore は engine 内部のメモリ構造で永続化されない。 engine reopen 後は
         // 空状態なので、 attach 時に WAL を walk して LWW state を再構築する。
@@ -265,20 +270,10 @@ impl Syncer {
         let peers = self.transport.known_peers();
         if peers.is_empty() {
             // backward compat: known_peers 未実装 transport (HTTP/WS push 等) は
-            // 旧 broadcast 経路。 filter は無視される (broadcast に per-target
-            // filter は意味が無いため、 default `AllRecords` のときと等価)。
-            let wal = match self.engine.oplog_arc() {
-                Some(w) => w,
-                None => return 0,
-            };
-            let recs = wal.iter_committed();
-            let self_peer = self.engine.peer_id();
-            let filtered: Vec<WireRecord> = recs
-                .into_iter()
-                .filter(|r| r.hlc > since)
-                .map(|r| r.into())
-                .collect();
+            // 旧 broadcast 経路。 filter は無視される。
+            let filtered = self.collect_records_since(since);
             let count = filtered.len();
+            let self_peer = self.engine.peer_id();
             self.transport.publish(self_peer, filtered);
             return count;
         }
@@ -291,6 +286,43 @@ impl Syncer {
         total
     }
 
+    /// 0.8.0: `since` HLC より新しい WireRecord を集める。 `sync_tables_enabled`
+    /// なら `_sync_ops` 経由 (= publish の primary source)、 そうでなければ
+    /// legacy oplog iter (= 0.7.x DB 互換、 sync 未 enable な consumer 向け)。
+    fn collect_records_since(&self, since: Hlc) -> Vec<WireRecord> {
+        if self.engine.sync_tables_enabled() {
+            self.collect_from_sync_ops(since)
+        } else {
+            let wal = match self.engine.oplog_arc() {
+                Some(w) => w,
+                None => return Vec::new(),
+            };
+            wal.iter_committed()
+                .into_iter()
+                .filter(|r| r.hlc > since)
+                .map(WireRecord::from)
+                .collect()
+        }
+    }
+
+    /// 0.8.0: `_sync_ops` table の payload を decode して WireRecord 列に。
+    /// `since: Hlc` で HLC 比較 filter する (= 0.7.x publish_since と同じ semantic、
+    /// ただし source が table 経由)。 published_lsn は publish 後に caller が
+    /// 進める。 ここでは「読むだけ」、 watermark 更新 (= ack_sync) は別経路。
+    fn collect_from_sync_ops(&self, since: Hlc) -> Vec<WireRecord> {
+        let payloads = self.engine.pending_sync_ops(0);
+        let mut out = Vec::with_capacity(payloads.len());
+        for p in &payloads {
+            let Some(rec) = enchudb_oplog::oplog::decode_sync_ops_payload(p) else {
+                continue;
+            };
+            if rec.hlc > since {
+                out.push(WireRecord::from(rec));
+            }
+        }
+        out
+    }
+
     /// request4: `target_peer` 限定で publish。 `SubscriptionFilter::should_send`
     /// で per-peer に絞った record のみを `transport.publish_to(self_peer,
     /// target_peer, ...)` で送る。 戻り値は実際に送った record 数。
@@ -300,17 +332,10 @@ impl Syncer {
     /// SNS partial sync では `SubscriptionFilter::should_send` で「target が
     /// 関心ある record か」 を判定してから送る。
     pub fn publish_since_for_peer(&self, target_peer: PeerId, since: Hlc) -> usize {
-        let wal = match self.engine.oplog_arc() {
-            Some(w) => w,
-            None => return 0,
-        };
-        let recs = wal.iter_committed();
         let self_peer = self.engine.peer_id();
         let filter = self.subscription_filter.read().unwrap().clone();
-        let filtered: Vec<WireRecord> = recs
+        let filtered: Vec<WireRecord> = self.collect_records_since(since)
             .into_iter()
-            .filter(|r| r.hlc > since)
-            .map(WireRecord::from)
             .filter(|r| filter.should_send(target_peer, r))
             .collect();
         let count = filtered.len();

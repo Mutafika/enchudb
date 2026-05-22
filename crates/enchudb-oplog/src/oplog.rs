@@ -121,6 +121,57 @@ fn signed_payload(
     m
 }
 
+/// signed_payload の固定 header 長 (= magic 2 + version 1 + op_byte 1 +
+/// payload_len 4 + lsn 8 + hlc 16 + author_peer 4 + crc 4)。
+pub const SIGNED_PAYLOAD_HEADER_SIZE: usize = 40;
+
+/// 0.8.0: `_sync_ops.payload` の wire layout — signature + pubkey_fp + signed_bytes。
+/// signed_bytes 単独だと署名検証ができないので、 publish path で復元できるよう
+/// 全 metadata を concat 形式で持つ。
+pub const SYNC_OPS_PAYLOAD_PREFIX: usize = 64 + 8; // signature(64) + pubkey_fp(8)
+
+/// `_sync_ops.payload` (= signature + pubkey_fp + signed_bytes concat) から
+/// `Record` を復元する。 0.8.0 で sync publish path が `_sync_ops` 経由になった
+/// ことで、 signed_bytes だけでは足りない (= 署名検証用の signature/pubkey_fp が
+/// 必要)、 wire payload に concat 形式で格納してある前提。
+///
+/// 戻り値の `Record.lsn` は `_sync_ops.lsn` ではなく oplog 元 record の lsn
+/// (= signed_bytes header に埋め込まれてた値)。 caller は必要なら別途
+/// `_sync_ops.lsn` を取る。
+pub fn decode_sync_ops_payload(payload: &[u8]) -> Option<Record> {
+    if payload.len() < SYNC_OPS_PAYLOAD_PREFIX + SIGNED_PAYLOAD_HEADER_SIZE {
+        return None;
+    }
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(&payload[0..64]);
+    let mut pubkey_fp = [0u8; 8];
+    pubkey_fp.copy_from_slice(&payload[64..72]);
+    let signed_bytes = &payload[SYNC_OPS_PAYLOAD_PREFIX..];
+
+    // signed_bytes header parse
+    if &signed_bytes[0..2] != REC_MAGIC { return None; }
+    if signed_bytes[2] != REC_VERSION { return None; }
+    let op_byte = signed_bytes[3];
+    let payload_len = u32::from_le_bytes(signed_bytes[4..8].try_into().ok()?) as usize;
+    let lsn = u64::from_le_bytes(signed_bytes[8..16].try_into().ok()?);
+    let hlc_wall = u64::from_le_bytes(signed_bytes[16..24].try_into().ok()?);
+    let hlc_logical = u32::from_le_bytes(signed_bytes[24..28].try_into().ok()?);
+    let hlc_peer = u32::from_le_bytes(signed_bytes[28..32].try_into().ok()?);
+    let author_peer = u32::from_le_bytes(signed_bytes[32..36].try_into().ok()?);
+    let _stored_crc = u32::from_le_bytes(signed_bytes[36..40].try_into().ok()?);
+    let payload_off = SIGNED_PAYLOAD_HEADER_SIZE;
+    let payload_end = payload_off + payload_len;
+    if payload_end > signed_bytes.len() { return None; }
+    let op_payload = &signed_bytes[payload_off..payload_end];
+    let op = decode_op(op_byte, op_payload)?;
+    let hlc = Hlc { wall: hlc_wall, logical: hlc_logical, peer: hlc_peer };
+
+    Some(Record {
+        lsn, hlc, author_peer, op, signature, pubkey_fp,
+        signed_bytes: signed_bytes.to_vec(),
+    })
+}
+
 /// WAL 初期サイズ(256MB、sparse なので実ディスク消費は書いた分のみ)。
 pub const DEFAULT_OPLOG_SIZE: usize = 256 * 1024 * 1024;
 
