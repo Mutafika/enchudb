@@ -453,6 +453,7 @@ impl Database {
             cols: Vec::new(),
             pk: None,
             relations: Vec::new(),
+            capacity: None,
         }
     }
 
@@ -697,6 +698,7 @@ pub struct TableBuilder<'a> {
     cols: Vec<(String, ColumnType)>,
     pk: Option<String>,
     relations: Vec<(String, String)>, // (from_col, to_table)
+    capacity: Option<u32>,
 }
 
 impl<'a> TableBuilder<'a> {
@@ -726,8 +728,16 @@ impl<'a> TableBuilder<'a> {
         self
     }
 
+    /// 0.7.0: table の eid 空間を明示確保。 1 table に大量 (= 1M+) row を入れる
+    /// workload で `entity_in() failed: eid range exhausted` を防ぐ用。
+    /// 省略時は engine の remaining 空間を 4 等分した default (= 4 table 分の余地)。
+    pub fn with_capacity(mut self, capacity: u32) -> Self {
+        self.capacity = Some(capacity);
+        self
+    }
+
     pub fn build(self) -> Result<Table<'a>, SchemaError> {
-        let TableBuilder { db, name, cols: col_specs, pk, relations } = self;
+        let TableBuilder { db, name, cols: col_specs, pk, relations, capacity: capacity_hint } = self;
 
         // 既存 table と同名なら handle を返す (idempotent)
         if let Some(existing) = db.find_table_inner(&name) {
@@ -762,11 +772,16 @@ impl<'a> TableBuilder<'a> {
                 "Database already shared via Arc — call db.table() before finish_*".into()
             )
         })?;
-        // 0.7.0: size_hint=0 だと engine が DEFAULT_TABLE_RESERVED (1M) を使う。
-        // max_entities が小さい (= create_growable_tiny の 1024 等) 場合 overflow するので、
-        // 残り eid 空間の 1/4 を limit (= 4 table 分の余裕)、 最低 16、 最大 1M に clamp。
-        let remaining = eng_mut.remaining_eid_space();
-        let size_hint = (remaining / 4).max(16).min(1_000_000);
+        // 0.7.0: TableBuilder::with_capacity が呼ばれていれば explicit な size_hint
+        // を使う。 そうでなければ remaining 空間を 4 等分した default (= 4 table 分残す
+        // 妥協)、 最低 16、 最大 1M に clamp。 大量 row を入れる use case (= 1 table に
+        // 1M+) は明示的に `.with_capacity(n)` を呼ぶ。
+        let size_hint = if let Some(cap) = capacity_hint {
+            cap
+        } else {
+            let remaining = eng_mut.remaining_eid_space();
+            (remaining / 4).max(16).min(1_000_000)
+        };
         eng_mut.define_table(&name, size_hint)
             .map_err(|e| SchemaError::Internal(format!("define_table({name}) failed: {e}")))?;
 

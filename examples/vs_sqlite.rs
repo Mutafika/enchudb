@@ -30,7 +30,7 @@ fn main() {
 
     // ── EnchuDB セットアップ (schema 層) ──
     let t = Instant::now();
-    let mut edb = Database::create_growable_with_capacity(enchu_path, ENTITY_COUNT + 100).unwrap();
+    let mut edb = Database::create_growable_with_capacity(enchu_path, ENTITY_COUNT + 1000).unwrap();
     {
         let _ = edb.table("employees")
             .number("id")
@@ -39,6 +39,7 @@ fn main() {
             .number("salary")
             .number("age")
             .primary_key("id")
+            .with_capacity(ENTITY_COUNT as u32 + 100)
             .build().unwrap();
     }
     let employees = edb.get_table("employees").unwrap();

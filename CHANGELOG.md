@@ -28,6 +28,10 @@ mini-RDB semantics の **actually 確立** ([issue #11](https://github.com/Mutaf
 
 ### Added
 
+- **`TableBuilder::with_capacity(n)`**: 1 table に大量 row (= 1M+) を入れる workload で
+  eid 空間を明示確保。 省略時の default は `remaining / 4` で 4 table 分残す妥協値
+  (= multi-table workload 向け)。 1M entity を 1 table に入れる bench 系で
+  `entity_in() failed: eid range exhausted` を防ぐため必須
 - **`_sync_ops` / `_sync_peers` reserved table** ([issue #11](https://github.com/Mutafika/enchudb/issues/11)):
   - `Engine::enable_sync_tables()` / `Database::enable_sync()`: opt-in で sync 経路の
     reserved table を auto-define (= sync 不要な単独 DB は eid 空間も浪費しない)

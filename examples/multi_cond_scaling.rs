@@ -19,7 +19,7 @@ fn main() {
     let path = "/tmp/multi_cond_scaling.db";
     let _ = std::fs::remove_file(path);
 
-    let mut db = Database::create_growable_with_capacity(path, N + 100).unwrap();
+    let mut db = Database::create_growable_with_capacity(path, N + 1000).unwrap();
     {
         let _ = db.table("t")
             .number("id")
@@ -31,6 +31,7 @@ fn main() {
             .number("f")   // 40 values, ~25K hits each
             .number("g")   // 1000 values, ~1K hits each
             .primary_key("id")
+            .with_capacity(N as u32 + 100)
             .build().unwrap();
     }
     let tbl = db.get_table("t").unwrap();
