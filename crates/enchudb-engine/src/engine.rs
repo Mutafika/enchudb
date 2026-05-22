@@ -166,6 +166,7 @@ fn deserialize_tables(buf: &[u8]) -> Result<Vec<TableDef>, String> {
             eid_range_hi,
             fk_refs,
             next_local,
+            free_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         });
     }
     Ok(tables)
@@ -753,6 +754,12 @@ pub(crate) struct TableDef {
     /// (= Arc<Engine> 経由の concurrent mode) で row insert する path が
     /// CAS で並行 safe に払出できる。
     pub next_local: std::sync::atomic::AtomicU32,
+    /// 0.8.0: free list = reclaim で解放された local id の reservoir。
+    /// `entity_in(table)` は free list が non-empty なら pop で再利用、
+    /// 空なら通常通り `next_local.fetch_add(1)`。 `_sync_ops` の長期運用で
+    /// eid 空間飽和を防ぐ (= ring buffer 化の本体)。 user table は今のところ
+    /// 自動 reclaim path がないので free list は空のまま。
+    pub free_locals: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
 }
 
 impl Clone for TableDef {
@@ -766,6 +773,11 @@ impl Clone for TableDef {
             next_local: std::sync::atomic::AtomicU32::new(
                 self.next_local.load(std::sync::atomic::Ordering::Relaxed)
             ),
+            // free_locals は Arc なので share される (= clone は same reservoir を
+            // 指す)。 これは TableDef::clone を「meta read 用 snapshot」 として
+            // 使う既存 caller の semantic と整合 (= 並列 race しないように caller
+            // 側で coordinate する想定)。
+            free_locals: self.free_locals.clone(),
         }
     }
 }
@@ -783,6 +795,7 @@ impl TableDef {
             eid_range_hi: u32::MAX,
             fk_refs: Vec::new(),
             next_local: std::sync::atomic::AtomicU32::new(0),
+            free_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -1953,13 +1966,26 @@ impl Engine {
         let Some(lsn_hid) = self.himo_id("_sync_ops.lsn") else { return 0; };
         let lsn_hid_u16 = lsn_hid as u16;
 
+        // 0.8.0: _sync_ops table の eid_range_lo を取り、 reclaim 後 free list に
+        // local id を push する (= ring buffer 化)。
+        let sync_ops_lo = self.tables.iter()
+            .find(|t| t.name == "_sync_ops")
+            .map(|t| (t.eid_range_lo, t.free_locals.clone()));
+
         // _sync_ops 全 row を走査して lsn < watermark を delete
         let rows = self.entities_with_himo(lsn_hid_u16);
         let mut purged = 0;
         for eid in rows {
             if let Some(lsn) = self.get_by_id(eid, lsn_hid_u16) {
                 if lsn < watermark {
+                    let local = enchudb_oplog::eid_local(eid);
                     self.delete(eid);
+                    // 0.8.0: free list に追加 (= 次回 entity_in("_sync_ops") で再利用)
+                    if let Some((lo, ref free_list)) = sync_ops_lo {
+                        if local >= lo {
+                            free_list.lock().unwrap().push(local - lo);
+                        }
+                    }
                     purged += 1;
                 }
             }
@@ -2079,6 +2105,7 @@ impl Engine {
             eid_range_hi: new_hi,
             fk_refs: Vec::new(),
             next_local: std::sync::atomic::AtomicU32::new(0),
+            free_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         });
         self.try_persist_tables();
         Ok(tid)
@@ -2103,6 +2130,24 @@ impl Engine {
             .position(|t| t.name == table_name)
             .ok_or_else(|| format!("table '{}' not found", table_name))?;
         let table = &self.tables[tid];
+
+        // 0.8.0: free list 優先 — reclaim で解放された local id があれば再利用
+        // (= ring buffer 化、 `_sync_ops` の長期運用で eid 飽和を防ぐ)。
+        // 再利用時は entities.allocate_at で live mark を戻す + concurrent
+        // barrier も走らせる (= 新規 alloc path と同じ orchestration)。
+        let reused_global = {
+            let mut fl = table.free_locals.lock().unwrap();
+            fl.pop().map(|local| table.eid_range_lo + local)
+        };
+        if let Some(global) = reused_global {
+            self.entities.allocate_at(global);
+            if let Some(q) = self.write_queue.as_ref() {
+                q.push(crate::write_queue::Op::EntityCreated { local: global });
+                self.push_count.fetch_add(1, Ordering::Release);
+            }
+            let peer = self.peer_id.load(Ordering::Acquire);
+            return Ok(enchudb_oplog::make_eid(peer, global));
+        }
 
         // capacity check (= fetch_add 後の load で再 check して overflow 検出)
         let table_size = table.eid_range_hi - table.eid_range_lo;
