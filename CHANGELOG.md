@@ -3,6 +3,87 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.7.0 — 2026-05-22
+
+mini-RDB semantics の **actually 確立** ([issue #11](https://github.com/Mutafika/enchudb/issues/11) +
+[issue #15](https://github.com/Mutafika/enchudb/issues/15))。 0.5.0 で engine に
+追加した table API を `enchudb-schema` crate / consumer 層が **1 度も使ってなかった**
+(= 死荷物)、 同時に `enchudb-oplog` が 「local 耐久 log」 と 「sync 配信 stream」 を
+兼任していた構造問題を一括解消。 計画書: `notes/requests/request7.md`。
+
+### Breaking
+
+- **schema crate の hot path が engine table API 経由に**: 新規 `Database::table().build()`
+  は `define_table` + `define_himo_in` + `define_ref_in` を engine に発火、
+  `RowBuilder::commit` は `entity_in(table_name)` で eid_range 内払出。 既存 v5/v6 DB
+  は透過 open + lazy migrate (= 過去 anonymous entity は eid 不変で読める、 新規 row は
+  table 内 eid_range から払出)
+- **`TableDef.next_local` が `AtomicU32` 化、 `Engine::entity_in` が `&self` 化**:
+  schema crate / Arc<Engine> 経由の concurrent mode から row insert で CAS-safe 払出
+- **`define_table("_*")` を reject**: `_` 始まり名前は reserved namespace、 user 経路は
+  `String` Err を返す
+- **既存 `Engine::list_tables()` は reserved table も含む**: user code は 0.7.0 から
+  `list_user_tables()` を使うべき (= reserved を除外)
+- **semver**: 0.6.0 → 0.7.0
+
+### Added
+
+- **`_sync_ops` / `_sync_peers` reserved table** ([issue #11](https://github.com/Mutafika/enchudb/issues/11)):
+  - `Engine::enable_sync_tables()` / `Database::enable_sync()`: opt-in で sync 経路の
+    reserved table を auto-define (= sync 不要な単独 DB は eid 空間も浪費しない)
+  - `Engine::transfer_oplog_to_sync_ops()`: oplog の commit 済み record を `_sync_ops`
+    table へ転送 (consumer thread から定期実行する想定)
+  - `Engine::ack_sync(peer, lsn)`: peer の watermark を `_sync_peers` に upsert
+  - `Engine::sync_watermark()`: 全 peer min(consumed_lsn) (= reclaim 安全点)
+  - `Engine::reclaim_sync_ops()`: `lsn < watermark` の row を lazy purge
+    (0.7.0 では entity delete のみ、 eid 空間は再利用せず — 0.8.0 で ring buffer 化検討)
+  - `Engine::pending_sync_ops(since_lsn)`: peer publish 用、 (since, current] の payload bytes
+  - `Engine::current_sync_lsn()`: snapshot 取得時の 「ここまで配信済み」 マーカー
+  - `Syncer::mark_initial_sync_complete(peer, lsn)`: snapshot 後の watermark 初期化
+- **engine table API 拡張**:
+  - `define_reserved_table(name, size_hint)`: `_` 始まり強制の internal table API
+  - `list_user_tables()`: anonymous + reserved を除外する user 向け列挙
+  - `has_reserved_table(name)`: 状態判定
+  - `vocab_intern_text(text)`: entity 経路を一切触らずに vocab inject (= schema crate
+    の `intern_table_name` で dummy entity → delete の roundtrip を排除)
+  - `remaining_eid_space()` / `max_entities()`: schema crate が `define_table` size_hint
+    を auto-clamp する用
+  - `is_readonly()`: panic せず bool で返す getter
+  - `tie_bytes_to_by_id(eid, himo_id, &[u8])`: Leaf himo に任意 binary を tie
+    (= UTF-8 制約のない wire bytes 用、 `_sync_ops.payload` で使用)
+- **`snapshot_export` が `.tables` sidecar も含める**: receiver で table 構造 +
+  reserved table を復元可能
+- **3 deployment pattern reference example** ([issue #11](https://github.com/Mutafika/enchudb/issues/11)):
+  `examples/sync_centralized.rs` (中央集権) / `sync_per_user.rs` (per-user DB) /
+  `sync_local_first.rs` (privacy-first + blob offload)
+
+### Changed
+
+- **0.5.0 / 0.6.0 CHANGELOG 文言の訂正**: 「mini-RDB semantics の確立」 →
+  「engine 基盤の確立」 (= consumer 層への配線は 0.7.0 で完成、 という事実を反映)
+- **`tie_to_by_id` / `tie_text_to_by_id` / `tie_bytes_to_by_id` の reserved table skip**:
+  `_*` table への write は oplog 再 append を skip (= `_sync_ops` への内部 mirror が
+  oplog → `_sync_ops` → oplog の無限ループにならない設計)
+- **`enable_sync_tables` の reserved table サイズを auto-clamp**: `remaining_eid_space`
+  ベース、 tiny preset でも overflow しない
+
+### Migration
+
+[`docs/migration-0.6.0-to-0.7.0.md`](docs/migration-0.6.0-to-0.7.0.md) に既存 v6 DB の
+透過 open / consumer code への影響 / sync 経路の opt-in 化手順あり。
+
+API 不変 (= schema crate 公開 API は 0.6.0 から変わらない) なので、 schema crate
+経由の consumer (opyula / bisquit / sinfo / matcha / t5ug3 / sinfohub-server 等) は
+**再 build で済む**。 sync 経路を活用する consumer は `Database::enable_sync()` を
+build phase で呼ぶ opt-in 切替で `_sync_ops` table 機構の恩恵を受けられる。
+
+### Unchanged
+
+- wire record format (v2 layout) 不変
+- file magic `EWAL` 不変 (= 0.6.0 と binary-compat)
+- HLC / EntityId / PeerId / keys / 署名 layout 不変
+- sync 経路 (publish_since / pull_since) の wire protocol 不変 (oplog 経路で並走)
+
 ## 0.6.0 — 2026-05-20
 
 `enchudb-wal` crate を `enchudb-oplog` にリネーム ([issue #8](https://github.com/Mutafika/enchudb/issues/8))。
@@ -42,7 +123,9 @@ re-export (`enchudb::{EntityId, Hlc, PeerId}` / `enchudb::keys::*`) は path 不
 ## 0.5.0 — 2026-05-20
 
 β-light: engine 自身が **table 概念** を持つ。 旧 flat な eid 空間 + himo 群の上に、
-名前付き table の `eid_range`、 table-namespaced himo、 FK validation を engine 直下に降ろした。 mini-RDB semantics の確立。
+名前付き table の `eid_range`、 table-namespaced himo、 FK validation を engine 直下に降ろした。
+mini-RDB semantics の **engine 基盤**。 consumer layer (`enchudb-schema` / SQL / FFI /
+RAG) への配線は 0.7.0 で完成 ([request7](https://github.com/Mutafika/enchudb/issues/15))。
 
 ### Breaking
 
