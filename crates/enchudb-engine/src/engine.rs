@@ -912,6 +912,11 @@ pub struct Engine {
     /// v34: read-only モード。 true なら書き込み API は error/panic。 open_readonly で立つ。
     /// `is_replica` は「直 write 拒否、 Syncer 経由は受ける」、 こちらは「一切 write 不可」。
     is_readonly: std::sync::atomic::AtomicBool,
+    /// 0.8.2: build phase の sidecar fsync 抑止。 schema crate が
+    /// `Database::create → build×N` 中 true にして、 `finish_*` / Drop で
+    /// false に戻して 1 度だけ explicit に `persist_tables()` を呼ぶ。
+    /// macOS APFS で N table 宣言時の N×fsync (= 1 fsync 5-7ms) を 1 回に圧縮。
+    defer_tables_persist: std::sync::atomic::AtomicBool,
     /// v34: writer lock の保持 fd。 open_writer / create_* で `.db.lock` sidecar を
     /// flock(LOCK_EX)、 Engine drop で fd close = lock release。 readonly では None。
     /// 多 process write の同 .db 競合を防ぐ (sqlite WAL モード相当)。
@@ -1066,6 +1071,7 @@ impl Engine {
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
+            defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             _writer_lock: Some(writer_lock),
             backing: Backing::Mmap(mmap),
         })
@@ -1293,6 +1299,7 @@ impl Engine {
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
+            defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             _writer_lock: Some(writer_lock),
             backing: Backing::Growable(map),
         })
@@ -1688,6 +1695,7 @@ impl Engine {
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
+            defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             _writer_lock: None, // caller (open_internal) が後から差し替える
             backing,
         };
@@ -2214,9 +2222,14 @@ impl Engine {
 
     /// β-light step 7: 現 tables Vec を sidecar に保存する (best effort)。
     /// memory-only (from_bytes) や wasm では no-op。 path が空なら skip。
+    /// 0.8.2: `defer_tables_persist` が立ってる時 (schema crate の build phase)
+    /// は no-op。 finish 時に explicit `persist_tables()` で 1 回 fsync する。
     fn try_persist_tables(&self) {
         #[cfg(not(target_arch = "wasm32"))]
         {
+            if self.defer_tables_persist.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
             if !self.path.is_empty() {
                 if let Err(e) = persist_tables_to_sidecar(&self.path, &self.tables) {
                     // best effort: panic せずログだけ。 user table の定義は
@@ -2225,6 +2238,15 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// 0.8.2: build phase の sidecar fsync 抑止 toggle。 schema crate の
+    /// `Database::create → build×N → finish_*` で N×fsync を 1 回に圧縮する
+    /// 内部 hook。 true 中は `try_persist_tables` が no-op、 false に
+    /// 戻すタイミングで explicit に `persist_tables()` を呼ぶこと。
+    /// 普通の Engine 直利用 (= schema 層なし) で叩く必要は無い。
+    pub fn set_defer_tables_persist(&self, defer: bool) {
+        self.defer_tables_persist.store(defer, std::sync::atomic::Ordering::Release);
     }
 
     /// β-light step 7: sidecar から復元した tables を採用、 himo_to_table も
