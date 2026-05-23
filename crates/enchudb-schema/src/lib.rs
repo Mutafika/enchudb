@@ -221,10 +221,16 @@ impl Drop for Database {
     fn drop(&mut self) {
         // single-thread モード (Arc 単一所有 + consumer なし) のみ自前で flush。
         // concurrent モードは consumer thread の shutdown sync に委ねる。
-        if !self.is_concurrent {
-            if let Some(eng) = Arc::get_mut(&mut self.eng) {
-                let _ = eng.flush();
-            }
+        //
+        // 0.8.2: schema blob の persist は build phase で coalesce してるので、
+        // finish_* を呼ばずに drop された path でも schema が disk に残るよう、
+        // ここで persist_schema を呼ぶ (= 内部で eng.flush も走る)。 finish_*
+        // 経由は ManuallyDrop で Drop が走らないので二重 persist にはならない。
+        // sidecar fsync 抑止も解除してから persist (= 通常モードで 1 回 fsync)。
+        // open_readonly Database は engine が read-only なので persist 不要 / 不可。
+        if !self.is_concurrent && !self.eng.is_readonly() {
+            self.eng.set_defer_tables_persist(false);
+            let _ = self.persist_schema();
         }
     }
 }
@@ -264,6 +270,10 @@ impl Database {
         eng.define_himo(SCHEMA_BLOB_HIMO, HimoType::Tag, 0);
         let marker_himo_id = eng.himo_id(SCHEMA_META_HIMO)
             .ok_or_else(|| SchemaError::Internal("marker himo id".into()))? as u16;
+        // 0.8.2: build phase の sidecar fsync を coalesce (= define_table /
+        // define_himo_in が毎回呼ぶ try_persist_tables を no-op 化)。
+        // finish_* / Drop で false に戻して 1 回 explicit fsync。
+        eng.set_defer_tables_persist(true);
         Ok(Self {
             eng: Arc::new(eng),
             tables: Vec::new(),
@@ -355,7 +365,13 @@ impl Database {
     /// 失敗条件: `self` が既に `Arc<Database>` 経由で共有されている (= Arc count > 1)、
     /// もしくは WAL ファイル作成 / consumer 起動が失敗。
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn finish_with_oplog(self, oplog_capacity: usize) -> Result<Arc<Self>, SchemaError> {
+    pub fn finish_with_oplog(mut self, oplog_capacity: usize) -> Result<Arc<Self>, SchemaError> {
+        // 0.8.2: schema blob を build phase で coalesce してるので、 ここで
+        // 1 度だけ persist する (= N table 分の fsync を 1 回に圧縮)。
+        // sidecar fsync 抑止も解除して persist_schema -> eng.flush 経由で
+        // try_persist_tables が走るようにする。
+        self.eng.set_defer_tables_persist(false);
+        self.persist_schema()?;
         let (eng, tables, marker_himo_id) = self.into_parts()?;
         let arc_eng = Engine::concurrentize_with_oplog(eng, oplog_capacity)
             .map_err(|e| SchemaError::Io(e.to_string()))?;
@@ -371,7 +387,10 @@ impl Database {
     /// build phase 終了 + consumer thread spawn (concurrent)、 WAL なし。
     /// crash consistency 不要 (cache / 揮発 store) なケース向け。
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn finish_concurrent(self) -> Result<Arc<Self>, SchemaError> {
+    pub fn finish_concurrent(mut self) -> Result<Arc<Self>, SchemaError> {
+        // 0.8.2: build phase で coalesce した schema blob を 1 度 persist。
+        self.eng.set_defer_tables_persist(false);
+        self.persist_schema()?;
         let (eng, tables, marker_himo_id) = self.into_parts()?;
         let arc_eng = Engine::concurrentize(eng);
         Ok(Arc::new(Self {
@@ -935,7 +954,11 @@ impl<'a> TableBuilder<'a> {
             relations: relations.into_iter().map(|(from_col, to_table)| RelationInner { from_col, to_table }).collect(),
         });
         db.tables.push(inner.clone());
-        db.persist_schema()?;
+        // 0.8.2: build phase 中の persist_schema は finish_* に coalesce
+        // (= 1 build = 1 fsync ≒ 47ms の linear scaling を解消、 issue #19)。
+        // build 中の schema blob は誰も読まないので中間 persist は無駄。
+        // finish_with_oplog / finish_concurrent の冒頭で 1 度 persist する、
+        // finish 経由しない drop path は Drop impl が safety net で persist。
 
         Ok(Table { db, inner })
     }

@@ -3,6 +3,59 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.8.2 — 2026-05-23
+
+`Database::create → build×N → finish_with_oplog` の cold-open perf を
+N table 数 linear から定数時間に圧縮。 sinfo (sinfohub-server) の multi-tenant
+scope DB cold-open がボトルネックで、 60 user 同時 push の bench で 5+ 秒
+latency 出てた issue #19 を fix。 file format / wire format / 公開 API
+変更なし、 0.8.1 から **再 build のみで上がれる**。
+
+### Fixed
+
+- **`Database::create → build×N` の N×fsync 問題**: `TableBuilder::build()` の
+  末尾で呼んでた `persist_schema()` (= `eng.flush()` = body msync ≒ 47ms on
+  APFS) が N 回走ってた。 build 中の schema blob は誰も読まない (= `load_schema()`
+  は open path でのみ) ので中間 persist は無駄。 `finish_with_oplog` /
+  `finish_concurrent` / Drop の 1 箇所に coalesce
+- **`define_table` / `define_himo_in` の per-call sidecar fsync**: engine 側
+  `try_persist_tables()` が毎回 `f.sync_all()` を呼んでた (= 各 ~5ms × 105 call
+  for N=15 × 7 col = ~600ms)。 build phase 中は `defer_tables_persist` flag で
+  skip、 finish 時に 1 度 explicit に persist
+
+### Added
+
+- **`Engine::set_defer_tables_persist(&self, bool)` API**: build phase の
+  sidecar fsync を抑止する toggle。 schema crate が `wrap_new` で立てて、
+  `finish_*` / Drop で解除して explicit fsync を 1 度走らせる。 Engine 直利用
+  (= schema 層なし) で叩く必要は無い、 default は false (= 既存 behavior 維持)
+- 回帰防止 test `cold_open_coalesce.rs` 3 件: declare phase が 200ms 以下、
+  finish 経由で schema が disk に persist、 Drop safety net が機能
+
+### perf 確認 (M2 Max / APFS, declare phase / N=15 table × 7 col)
+
+| | 0.8.1 | 0.8.2 | 改善 |
+|---|---:|---:|---|
+| declare phase | 663.9 ms | 1.1 ms | **600x** |
+| per-table | 44.3 ms | 0.07 ms | 600x |
+| finish | 13.6 ms | 37.6 ms | -2.8x (= 1 回に集約された fsync 分) |
+| **total cold-open** | **677 ms** | **39 ms** | **17x** |
+
+issue #19 の予測値 (~720ms → ~70ms, 10x) を更に上回る改善。 sinfo の 60 user
+同時 push bench は scope DB cold-open がボトルネックだったので、 これで unblock。
+
+### Unchanged
+
+- file format / wire format / 公開 API 完全不変、 0.7.x / 0.8.x DB は全て open 可
+- `add_column` (= alter path) は引き続き per-call で persist_schema (post-build
+  なので fsync 1 回が正しい挙動)
+- HLC / signature / pubkey_fp layout 不変
+
+### 0.8.1 consumer 向け migration
+
+なし。 `cargo build` で 0.8.2 binary になる。 sinfo / opyula 等の schema 経由
+consumer も再 build のみ。
+
 ## 0.8.1 — 2026-05-22
 
 short-lived CLI consumer 連携で表面化した recover 不完全の patch release。 sinfo
