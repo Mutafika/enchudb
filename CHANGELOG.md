@@ -3,6 +3,21 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.8.3 — 2026-05-25
+
+`wasm32-unknown-unknown` build が 0.8.2 で壊れていた問題を 1 行修正。 native
+build / 公開 API / file format / wire format は完全不変、 wasm consumer
+(naruhodo/web 等) は再 build のみで上がれる。
+
+### Fixed
+
+- **wasm32 build E0560**: `Engine::load_from_backing` 内の `_writer_lock: None`
+  初期化に `#[cfg(not(target_arch = "wasm32"))]` が漏れていた。 field 定義
+  (`engine.rs:923`) は wasm32 で除外されているが、 `load_from_backing`
+  (`engine.rs:1699`) の初期化は無条件で field 代入していたため、 wasm32 target
+  では `struct \`Engine\` has no field named \`_writer_lock\`` で fail
+  (issue #22)。 closes #22
+
 ## 0.8.2 — 2026-05-23
 
 `Database::create → build×N → finish_with_oplog` の cold-open perf を

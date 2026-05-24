@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "enchudb"
-version = "0.8.2"
+version = "0.8.3"
 edition = "2024"
 description = "EnchuDB — 紐ベース円柱エンジン。`enchudb-engine` を便利に再エクスポートする meta crate。"
 license-file = "LICENSE.md"
