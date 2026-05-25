@@ -1099,6 +1099,23 @@ impl Engine {
         Self::create_growable_full(path, layout, max_entities, max_himos)
     }
 
+    /// growable backing で開く。`max_entities` と `vocab_data_size` を明示。
+    ///
+    /// 大規模 Leaf text を持つアプリ (議事録 / 論文 / 全文 archive) で default
+    /// 512 MiB の vocab cap に当たる場合に使う。`Leaf` 列も `vocab.insert`
+    /// 経由で vocab data に積まれるため、`Tag` 数だけでなく本文の総バイト数
+    /// が cap を決める。目安: 1 KB / row × 1 M rows ≒ 1 GiB を見込む。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn create_growable_with_options(
+        path: &str,
+        max_entities: u32,
+        vocab_data_size: usize,
+    ) -> io::Result<Self> {
+        let max_himos = DEFAULT_MAX_HIMOS;
+        let layout = Layout::compute(max_entities, max_himos, vocab_data_size, None, None);
+        Self::create_growable_full(path, layout, max_entities, max_himos)
+    }
+
     /// Tiny growable preset for app state-logs (matcha-style: a few
     /// hundred rows of dismissed-key / seen-at / etc.). Default
     /// `create_growable` uses gigascale capacities so the layout
