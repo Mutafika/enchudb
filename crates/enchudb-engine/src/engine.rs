@@ -1696,6 +1696,7 @@ impl Engine {
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(not(target_arch = "wasm32"))]
             _writer_lock: None, // caller (open_internal) が後から差し替える
             backing,
         };
