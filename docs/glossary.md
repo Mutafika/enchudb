@@ -19,9 +19,9 @@ EnchuDB の用語集 (2026-05-25 / 0.8.3 時点)。 各 entry は **layer タグ
 | **tie / 紐 (動詞)** | engine | `(eid, himo, value)` の事実 1 個を engine に立てる操作。 Column と Cylinder を同期的に両方 update する |
 | **untie** | engine | 既存の tie を 1 個外す。 Column[eid] = `u32::MAX` (= sentinel)、 Cylinder bucket からも remove |
 | **Column** | engine | `Column[eid] = value` の forward 配列 (mmap、 4 byte/eid 固定)。 「この eid の値?」 を O(1) で返す |
-| **Cylinder (= BucketCylinder)** | engine | `Cylinder[value] = Vec<eid>` の inverse bucket (mmap)。 「この値の eid は誰?」 を O(1) で返す。 全 column が index 等価 = `CREATE INDEX` 不要の原理。 メンタルモデルとしては「モンジャラ」 (= 蔓の交差点に隠れた本体)、 詳細は CLAUDE.md |
+| **Cylinder (= BucketCylinder)** | engine | `Cylinder[value] = Vec<eid>` の inverse bucket (mmap)。 「この値の eid は誰?」 を O(1) で返す。 全 column が index 等価 = `CREATE INDEX` 不要の原理。 メンタルモデルとしては「モンジャラ」 (= 蔓の交差点に隠れた本体)、 詳細は §11.5 |
 | **HimoStore** | engine | 1 himo = 1 Column + 1 Cylinder のペア。 全 himo 分が `himo_slots[himo_id]` として layout される |
-| **HimoRegistry** | engine | `himo_name (String) ↔ himo_id (u16)` の双方向 mapping。 hash table 不使用 ([feedback-no-hash])、 線形探索で十分速い (himo 数は数百が上限) |
+| **HimoRegistry** | engine | `himo_name (String) ↔ himo_id (u16)` の双方向 mapping。 hash table 不使用、 線形探索で十分速い (himo 数は数百が上限) |
 | **Vocabulary (vocab)** | engine | 文字列 → `vid (u32)` の dedupe 辞書。 Tag himo の値はここを経由 |
 | **vid** | engine | Vocabulary の id。 同じ string は同じ vid (Tag 系)、 Leaf は dedupe しないので別 vid |
 | **FreeStore** | engine | Leaf himo 用の dedupe しない文字列領域。 同じ string でも tie ごとに別 vid |
@@ -40,8 +40,7 @@ EnchuDB の用語集 (2026-05-25 / 0.8.3 時点)。 各 entry は **layer タグ
 ## 2. table layer (engine, 0.5.0+)
 
 `define_table` で engine が table を一級市民として持つ層。 0.5.0 β-light で
-導入、 0.7.0 で schema crate も engine table API 経由になった
-([engine-knows-tables])。
+導入、 0.7.0 で schema crate も engine table API 経由になった。
 
 | 用語 | layer | 定義 |
 |---|---|---|
@@ -65,7 +64,7 @@ EnchuDB の用語集 (2026-05-25 / 0.8.3 時点)。 各 entry は **layer タグ
 
 `enchudb-schema` crate。 engine の table API 上に「2D mini-RDB」 を被せる
 declarative API 層。 0.7.0 で内部実装が engine table API 経由に切り替わった
-(= [engine-knows-tables] の app 統合)。
+(= engine table API への app 層統合)。
 
 | 用語 | layer | 定義 |
 |---|---|---|
@@ -86,7 +85,7 @@ declarative API 層。 0.7.0 で内部実装が engine table API 経由に切り
 
 | 用語 | layer | 定義 |
 |---|---|---|
-| **oplog (旧 WAL)** | oplog | `{path}.oplog` の append-only log。 命名は WAL だが実態は MongoDB の oplog (= mmap が primary state、 log は配信 + audit + recovery)。 0.6.0 で crate 名 `enchudb-wal` → `enchudb-oplog` ([project-wal-renamed-to-oplog]) |
+| **oplog (旧 WAL)** | oplog | `{path}.oplog` の append-only log。 命名は WAL だが実態は MongoDB の oplog (= mmap が primary state、 log は配信 + audit + recovery)。 0.6.0 で crate 名 `enchudb-wal` → `enchudb-oplog` ([issue #8](https://github.com/Mutafika/enchudb/issues/8)) |
 | **LSN** | oplog | process 内 monotonic な log sequence number (u64)。 record 順序の物理 anchor |
 | **HLC** | oplog | Hybrid Logical Clock = `(wall_ms, logical, peer_id)`、 record の真の identity。 LWW (Last Writer Wins) merge の判断軸 |
 | **Commit marker** | oplog | transaction 境界。 commit 済み record のみ recovery で replay される、 未 commit 末尾は drop |
@@ -232,8 +231,8 @@ issue #24)。
 | 文脈 | 意味 |
 |---|---|
 | engine 内部 (`BucketCylinder`) | `Cylinder[value] = Vec<eid>` の inverse bucket index (per himo) |
-| mental model (CLAUDE.md) | 「1 entity からぶら下がる全紐の束」 (= 暗記カードの束)。 内部実装とは見方が異なる |
-| メタファ (モンジャラ) | engine 全体の 3D 空間 (= himo, value, eid) を「絡まる蔓 + 交差点に隠れた本体」 で表現、 [project-cylinder-is-tangela] |
+| mental model (暗記カードの束) | 「1 entity からぶら下がる全紐の束」。 1 枚のカード = 1 本の紐 (表 = 紐名、 裏 = 値)、 束 = 円柱。 内部実装とは見方が異なる |
+| メタファ (モンジャラ) | engine 全体の 3D 空間 (= himo, value, eid) を「絡まる蔓 + 交差点に隠れた本体」 で表現。 entity = 蔓の交差点に隠れた本体、 紐 = 全身の蔓 |
 
 型名は `Cylinder` で固定 (= 0.x dev tree でも rename しない、 stability lock-in 前まで寝かせる)、 説明用に「モンジャラ」 / 「カードの束」 を補助的に使う。
 
@@ -244,7 +243,7 @@ issue #24)。
 | 0.5.x までの code 内 | `enchudb-wal` crate、 `Wal` 型 |
 | 0.6.0+ | **`enchudb-oplog` crate に rename**、 `OpLog` 型のみ。 file 拡張子も `.wal` → `.oplog`、 wire format / magic `EWAL` は binary 互換のため不変 |
 
-[project-wal-renamed-to-oplog] 参照。 「WAL」 は historical reference として残るが、 新規 doc / API は **oplog** で統一。
+「WAL」 は historical reference として残るが、 新規 doc / API は **oplog** で統一。 詳細は [issue #8](https://github.com/Mutafika/enchudb/issues/8)。
 
 ### 11.7. peer vs root
 
@@ -260,7 +259,5 @@ issue #24)。
 ## 参照
 
 - doc 全体図: [architecture.md](architecture.md)
-- mental model + 設計原則: [`CLAUDE.md`](../CLAUDE.md)
 - API detail: 各 crate の `README.md`
-- migration: `docs/migration-*.md`
 - release notes: [`CHANGELOG.md`](../CHANGELOG.md)
