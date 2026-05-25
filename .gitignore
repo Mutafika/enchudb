@@ -20,3 +20,4 @@ crates/enchudb-rag/.fastembed_cache/
 /docs/*
 /docs/proposals/
 !/docs/architecture.md
+!/docs/glossary.md

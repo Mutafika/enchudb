@@ -305,6 +305,7 @@ SQLite は同期手段を持たず litestream 等を別途要する。 LMDB / Ro
 
 ## さらに
 
+- **用語集 (glossary)**: [`docs/glossary.md`](glossary.md) — layer 別の用語索引 (§1-§10) + §11 メンタルモデル (= card / deck / pile / table の物理メタファ階層) + §12 混同しやすい同形語 (table / tenant / view / schema / cylinder 等) の disambiguation
 - **API 詳細**: 各 crate の `README.md` (`enchudb-engine` / `enchudb-schema` /
   `enchudb-sync` / `enchudb-sql` / `enchudb-rag` / `enchudb-transport` / `enchudb-ffi`)
 - **ベンチ**: [`benches/README.md`](../benches/README.md)
