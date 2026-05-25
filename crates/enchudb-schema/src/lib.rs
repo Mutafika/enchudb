@@ -265,6 +265,21 @@ impl Database {
         Self::wrap_new(eng)
     }
 
+    /// growable backing で開く。`max_entities` と `vocab_data_size` を明示。
+    ///
+    /// 大規模 Leaf text を持つアプリで `create_growable*` 系の default 512 MiB
+    /// vocab cap に当たる場合に使う。目安: 1 KB / row × 1 M rows ≒ 1 GiB
+    /// (Leaf 列の値も vocab に積まれるため本文総量で見積もる)。
+    pub fn create_growable_with_options(
+        path: &str,
+        max_entities: u32,
+        vocab_data_size: usize,
+    ) -> Result<Self, SchemaError> {
+        let eng = Engine::create_growable_with_options(path, max_entities, vocab_data_size)
+            .map_err(|e| SchemaError::Io(e.to_string()))?;
+        Self::wrap_new(eng)
+    }
+
     fn wrap_new(mut eng: Engine) -> Result<Self, SchemaError> {
         eng.define_himo(SCHEMA_META_HIMO, HimoType::Tag, 0);
         eng.define_himo(SCHEMA_BLOB_HIMO, HimoType::Tag, 0);
