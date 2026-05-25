@@ -3,6 +3,26 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.8.4 — 2026-05-25
+
+`Database` / `Engine` から `vocab_data_size` を明示できる
+`create_growable_with_options` を公開。`Leaf` 列の値も `vocab.insert`
+経由で vocab data に積まれる仕様のため、大規模 text を持つアプリ
+(議事録 / 論文 / 全文 archive 系) で `create_growable*` 系の default
+512 MiB cap に当たって `vocabulary.rs:175` で panic していたが、
+明示指定で回避可能になった。新規 method の追加のみで既存 API には
+触らない (後方互換 100%、再 build のみで上がれる)。
+
+### Added
+
+- `Engine::create_growable_with_options(path, max_entities, vocab_data_size)`
+- `Database::create_growable_with_options(path, max_entities, vocab_data_size)`
+
+setagaya-pwa の世田谷区議会議事録 archive (4,844 会議 / 554,092 発言 /
+466,383 theme、本文 vocab ~531 MB) で検証。`vocab_data_size = 2 GiB`
+で全量 import 2.4 秒 (230K rows/sec) 完走、search レスポンス 0.8 秒。
+closes #26
+
 ## 0.8.3 — 2026-05-25
 
 `wasm32-unknown-unknown` build が 0.8.2 で壊れていた問題を 1 行修正。 native
