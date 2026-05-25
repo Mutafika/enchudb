@@ -243,7 +243,7 @@ cargo run --release --example vs_sqlite
 
 メンタルモデル: engine 全体は **モンジャラ** (蔓 = 紐、 entity = 蔓の交差点に隠れた本体)。 1 つの紐の中身は **2D table** (値 × eid バケット)。
 
-各 sub-crate の `README.md` に詳細あり。`docs/` に architecture / concurrency / migration 各種ノートも。
+各 sub-crate の `README.md` に詳細あり。`docs/` に architecture / concurrency / migration 各種ノートも。 用語を素早く引きたい場合は [`docs/glossary.md`](docs/glossary.md) (layer 別 索引 + 混同しやすい同形語の disambiguation)。
 
 ## ファイル構成
 
