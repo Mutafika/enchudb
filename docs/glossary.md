@@ -1,11 +1,14 @@
 # Glossary
 
 EnchuDB の用語集 (2026-05-25 / 0.8.3 時点)。 各 entry は **layer タグ** +
-**短い定義** + **see-also** の 3 要素。 末尾 §11 に「混同しやすい用語」 を集約
-(= layer をまたいで同形語が衝突するケース、 reading 事故の常連)。
+**短い定義** + **see-also** の 3 要素。
+
+- **§1〜§10** は **layer 別の用語索引** (= 単語の意味を素早く引く)
+- **§11** は **メンタルモデル** (= 物理メタファ階層、 card / deck / pile / table の picture)
+- **§12** は **混同しやすい用語** (= layer をまたいで同形語が衝突する reading 事故対策)
 
 文脈 doc は [architecture.md](architecture.md)、 個別 detail は各 crate の
-`README.md`。 ここは「単語の意味だけ素早く引く」 ための索引。
+`README.md`。
 
 ---
 
@@ -16,24 +19,30 @@ EnchuDB の用語集 (2026-05-25 / 0.8.3 時点)。 各 entry は **layer タグ
 | **entity_id (eid, u32)** | engine | row id 相当の primary 識別子。 `0..max_entities` の固定空間に bitmap で生存管理。 EntityId 全体は `(peer_id:32, local_id:32)` の u64 だが、 engine 内 hot path は local 部分の u32 だけ扱うことが多い |
 | **himo (紐, u16)** | engine | column 相当の属性軸。 「entity に値をぶら下げる ひも」 のメタファ。 文字列名 → u16 id を `HimoRegistry` で解決 |
 | **value (u32)** | engine | tie 1 個の右辺。 解釈は `HimoType` 依存 (Number は値そのまま、 Tag/Leaf は vid、 Ref は target eid) |
-| **tie / 紐 (動詞)** | engine | `(eid, himo, value)` の事実 1 個を engine に立てる操作。 Column と Cylinder を同期的に両方 update する |
+| **tie / 紐 (動詞)** | engine | `(eid, himo, value)` の事実 1 個を engine に立てる操作。 Column と Cylinder を同期的に両方 update する。 metaphor では「1 枚のカードを置く」 (§11.2) |
 | **untie** | engine | 既存の tie を 1 個外す。 Column[eid] = `u32::MAX` (= sentinel)、 Cylinder bucket からも remove |
 | **Column** | engine | `Column[eid] = value` の forward 配列 (mmap、 4 byte/eid 固定)。 「この eid の値?」 を O(1) で返す |
-| **Cylinder (= BucketCylinder)** | engine | `Cylinder[value] = Vec<eid>` の inverse bucket (mmap)。 「この値の eid は誰?」 を O(1) で返す。 全 column が index 等価 = `CREATE INDEX` 不要の原理。 メンタルモデルとしては「モンジャラ」 (= 蔓の交差点に隠れた本体)、 詳細は §11.5 |
+| **Cylinder (= BucketCylinder)** | engine | `Cylinder[value] = Vec<eid>` の inverse bucket (mmap)。 「この値の eid は誰?」 を O(1) で返す。 全 column が index 等価 = `CREATE INDEX` 不要の原理。 mental model 詳細は §11、 「cylinder」 が指す異なる軸 slice の disambig は §12.5 |
 | **HimoStore** | engine | 1 himo = 1 Column + 1 Cylinder のペア。 全 himo 分が `himo_slots[himo_id]` として layout される |
 | **HimoRegistry** | engine | `himo_name (String) ↔ himo_id (u16)` の双方向 mapping。 hash table 不使用、 線形探索で十分速い (himo 数は数百が上限) |
 | **Vocabulary (vocab)** | engine | 文字列 → `vid (u32)` の dedupe 辞書。 Tag himo の値はここを経由 |
 | **vid** | engine | Vocabulary の id。 同じ string は同じ vid (Tag 系)、 Leaf は dedupe しないので別 vid |
 | **FreeStore** | engine | Leaf himo 用の dedupe しない文字列領域。 同じ string でも tie ごとに別 vid |
 
-### HimoType (= value の意味付け)
+### HimoType (= value の格納方式、 0.9.0 で `ValueType` rename 候補)
 
-| HimoType | 用途 | dedupe | 典型 |
+現 `HimoType` は名前と実態が乖離してる (= 「Himo の型」 を declare してるように見えるが、 実は「value の格納方式」 を選んでる)。 0.9.0 で **`ValueType` rename 候補** + 各 variant の見直しあり (§12.10)。
+
+直交 2 軸を 1D enum に conflate した構造:
+
+| variant | 値の表現 | storage 戦略 | 典型 |
 |---|---|---|---|
-| `Number` | u32 そのまま | — | id / age / flag |
-| `Tag` | vocab id (dedupe あり) | あり | enum / category / name |
-| `Leaf` | vocab id (dedupe なし) | なし | 本文 / メモ / 自由記述 |
-| `Ref` | target entity_id | — | relation / FK |
+| `Number` | 生 u32 (= 直値) | inline | id / age / flag / enum index |
+| `Tag` | vid (= 文字列経由) | **dedupe あり** (= vocab 共有、 hub 紐) | 分類 / city / shared label |
+| `Leaf` | vid (= 文字列経由) | **dedupe なし** (= per-tie 個別、 終端紐) | 本文 / メモ / 自由記述 |
+| `Ref` | target eid | inline | relation / FK |
+
+graph-role 視点では `Tag` (= 多 entity を連結する hub) と `Leaf` (= 1 entity 固有の terminal) が graph-position pair (§12.10 参照)。
 
 ---
 
@@ -44,7 +53,7 @@ EnchuDB の用語集 (2026-05-25 / 0.8.3 時点)。 各 entry は **layer タグ
 
 | 用語 | layer | 定義 |
 |---|---|---|
-| **table** | engine | 名前付きの eid 範囲予約 + 所属 himo のメタ集合。 storage は 1 mmap で共有、 table は eid_range で論理 partition するだけ |
+| **table** | engine | 名前付きの eid 範囲予約 + 所属 himo のメタ集合。 storage は 1 mmap で共有、 table は eid_range で論理 partition するだけ。 metaphor では「同型 deck を unroll + column 整列した jagged sparse 2D」 (§11.6) |
 | **TableDef** | engine | `(name, eid_range_lo..hi, himo_ids, fk_refs, next_local)` の内部構造体 |
 | **eid_range_lo / eid_range_hi** | engine | table の eid 払出範囲 (u32 partition)。 row が table 内部に閉じる |
 | **next_local: AtomicU32** | engine | table 内で次に払出す local id。 `&self` で CAS 払出可能 (0.7.0+) |
@@ -57,6 +66,8 @@ EnchuDB の用語集 (2026-05-25 / 0.8.3 時点)。 各 entry は **layer タグ
 | **reserved table** | engine | `_` で始まる名前の internal 専用 table。 user の `define_table` は弾く、 `define_reserved_table` のみ作れる。 `_sync_ops` / `_sync_peers` 等 |
 | **.tables sidecar** | engine | `{path}.tables` に "TBL1" magic + 全 table 定義を binary persist (= 0.5.0+) |
 | **list_tables / list_user_tables** | engine | 前者は reserved 含む全 table、 後者は user 向け (= reserved 除外) |
+| **declared schema** | engine | table に `define_himo_in` で declare された紐 namespace (= 静的 candidate 紐 list)、 §12.4 参照 |
+| **actual schema** | engine | その table 内の entity が実際に tie してる紐の union (= 動的 派生、 sparse model 由来)、 §12.4 参照 |
 
 ---
 
@@ -72,12 +83,13 @@ declarative API 層。 0.7.0 で内部実装が engine table API 経由に切り
 | **Table** | schema | `db.table(name)...build()` で declarative に作る 2D table 抽象。 column → himo_id を build 時に pre-resolve |
 | **TableBuilder** | schema | `.integer("id").text("name").primary_key("id")` の chain API、 `.build()` で engine に commit |
 | **insert / upsert / where_eq / where_range** | schema | row-shaped CRUD API。 内部で engine の id-keyed primitives (`query_by_id` / `pull_in_by_id`) を直叩き |
-| **TenantView** | schema | curated, named subset of tables の handle。 `db.tenant(name)` で取得、 `{name}.` prefix で table 名を filter する string-prefix 抽象。 ⚠ 名前 leak で誤読される (= engine 内に tenant 概念があるように見える、 [issue #24])、 **`DeckView` に rename 予定** |
-| **TenantViewMut** | schema | build phase 用 (= prefix 付きで table を建てる)。 → `DeckViewMut` 予定 |
+| **TenantView** | schema | curated, named subset of tables の handle。 `db.tenant(name)` で取得、 `{name}.` prefix で table 名を filter する string-prefix 抽象。 ⚠ 名前 leak で誤読される (= engine 内に tenant 概念があるように見える、 §12.2)、 **rename 議論中** ([issue #24]、 「DeckView」 案は撤回 — §11.3 で deck が entity-cylinder 専用に確定したため。 候補は `Drawer` / `Scope` / `Namespace` 系で再検討中) |
+| **TenantViewMut** | schema | build phase 用 (= prefix 付きで table を建てる)。 rename 連動予定 |
 | **as_view / as_view_mut** | schema | root scope の view (= prefix なし、 全 table 見える)。 名称は rename 後も不変予定 |
-| **DeckView (proposed)** | schema | `TenantView` の rename 先 (issue #24)。 「単語カードリング」 メタファ — 名前付き portable subset of tables、 use-case neutral |
 | **finish_with_oplog / finish_concurrent** | schema | build phase → runtime phase 遷移。 前者は oplog + concurrent writer、 後者は concurrent のみ |
 | **open_with_oplog** | schema | 既存 DB を直接 concurrent + oplog で reopen、 recovery 込み |
+
+[issue #24]: https://github.com/Mutafika/enchudb/issues/24
 
 ---
 
@@ -122,7 +134,7 @@ declarative API 層。 0.7.0 で内部実装が engine table API 経由に切り
 
 | 用語 | layer | 定義 |
 |---|---|---|
-| **Pattern A (centralized)** | dist | 1 中央 DB に全 user / tenant を multi-tenant で集約。 schema 層 TenantView (= 将来 DeckView) で scope 分離。 SNS / メールサーバー 等 |
+| **Pattern A (centralized)** | dist | 1 中央 DB に全 user / tenant を multi-tenant で集約。 schema 層 TenantView (rename 議論中、 §3) で scope 分離。 SNS / メールサーバー 等 |
 | **Pattern B (per-user DB)** | dist | user ごとに別 DB file、 1:1 で sync。 SaaS 等。 `Database::open_with_oplog` を user 数分 instance 化 |
 | **Pattern C (local-first)** | dist | user の手元に全 data、 sync は optional。 client は通常 local read/write、 接続時に peer と LWW merge |
 
@@ -180,13 +192,168 @@ make_eid(peer, local) / eid_peer(eid) / eid_local(eid)
 
 ---
 
-## 11. 混同しやすい用語 (= reading 事故の常連)
+## 11. メンタルモデル (= 物理メタファ階層)
+
+enchudb の中身を物理的に思い描くための統一 metaphor。 全 layer は同じ
+3D 空間 (= `himo × value × eid`) を異なる軸 / scale で切ったもので、 矛盾しない。
+
+### 11.0. 全体俯瞰 — 3D 空間としての engine
+
+engine の本質は `(himo, value, eid)` 3 軸からなる **3D 空間**。 `tie(eid, himo, value)` は 1 つの 3D 点を立てる操作。 各種データ構造 (Column / Cylinder / 各種 view) は、 この 3D 空間を異なる軸で slice した index に過ぎない。
+
+全体像のメタファは **モンジャラ** (= 蔓 = 紐、 entity = 蔓の交差点に隠れた本体)。
+
+### 11.1. 4 階層 metaphor
+
+| 階層 | metaphor | enchudb 実体 | pivot 軸 |
+|---|---|---|---|
+| **card** | 1 枚の暗記カード (表 = 紐名、 裏 = 値) | 1 tie = `(himo, value)` ペア 1 個 | (1 点) |
+| **deck** | 1 軸を pivot にした card の束 (= ring 構造) | 後述 (entity-deck と pile の dual) | 1 軸固定 |
+| **table** | 同型 deck を unroll + column 整列した jagged 2D | engine の named table の物理表現 | eid + himo の 2D |
+| **モンジャラ** | 全 3D 空間 (slice しない) | engine 全体 | — |
+
+### 11.2. card の構造
+
+```
+            表 (front)              裏 (back)
+          ┌──────────┐           ┌──────────┐
+          │   himo   │           │  value   │
+          │   "足"   │           │   "4"    │
+          └──────────┘           └──────────┘
+
+           card = 1 tie = (himo, value) ペア
+```
+
+「表 = 紐名、 裏 = 値」 は全 ValueType (Number / Tag / Leaf / Ref) で共通の構造。 ValueType は「裏 (= value) の格納方式」 の type tag、 card 構造自体には影響しない。
+
+### 11.3. deck の dual (entity-deck と pile / value-deck)
+
+deck は「**ある軸を pivot にして card を束ねたもの**」 の総称。 pivot 軸の取り方で 2 種類:
+
+#### entity-deck (= mental「円柱」)
+
+pivot = eid (= 1 entity)、 cards = (himo, value) ペア群
+
+```
+       cat の entity-deck (= 「猫の円柱」):
+       ┌─────────┐
+       │ 足: 4   │
+       │ 読み:ネコ│
+       │ 分類:哺 │
+       │ ...     │
+       └─────────┘
+       「猫はどんな属性持ってる?」 への答え (= 全 himo を eid 軸で集めたもの)
+```
+
+#### pile / value-deck (= code `BucketCylinder` bucket)
+
+pivot = (himo, value) ペア (= 1 軸の 1 値)、 cards = eid 名札群
+
+```
+       「分類=哺乳類」 pile (= 哺乳類山):
+       ┌──────────┐
+       │ "cat"    │   ← eid 名札のみ、 deck 本体は別場所
+       │ "dog"    │
+       │ "wolf"   │
+       │ ...      │
+       └──────────┘
+       「(分類, 哺乳類) を tie してる entity は誰?」 への答え
+```
+
+### 11.4. duality の本質 — Column / Cylinder の物理表現
+
+entity-deck と pile は **Column / Cylinder duality を metaphor で直接表現**:
+
+| | entity-deck | pile (value-deck) |
+|---|---|---|
+| pivot | eid | (himo, value) |
+| card | (himo, value) | eid 名札 |
+| 質問 | 「この entity の cards?」 | 「この値を持つ entity は誰?」 |
+| storage | Column[himo][eid] の集合 | Cylinder[himo][value] の bucket |
+| 操作 | `get(eid, himo)` を全 himo 分 | `pull_raw(himo, value)` 1 発 |
+
+両方とも **「1 軸固定 + 軸周りに card 群」 構造の dual**。 enchudb の中核 Column / Cylinder 双対が物理 metaphor にそのまま現れる。
+
+### 11.5. 退化 case で duality が収束
+
+pile に **1 件しか入ってない** (= `pull_raw(himo, value)` 結果が 1 件) と、 その pile は **物理的に 1 entity-deck を指す** ことになる。 ここで 2 つの「cylinder」 解釈が同じ object に収束:
+
+```
+両生類山 (= rare な値):
+┌──────────┐
+│ "frog"   │   ← 1 件
+└──────────┘
+   = frog の entity-deck そのものを指す (1 件 pile → 1 deck の参照)
+```
+
+「最小の cylinder = 1-deck pile」 で 2 つの解釈が一致。 §12.5 cylinder disambig の根拠。
+
+### 11.6. table = jagged sparse 2D
+
+table は **同型 entity-deck を unroll + column 整列したもの**。 ただし enchudb は **sparse data model** (= 各 entity が紐 subset 自由) なので、 strict RDB の rectangular table と違って **jagged (= 行ごとに card 数違う)**:
+
+```
+table "animals" を column 整列で展開:
+
+       足   読み      体重   分類    犬種    尻尾長  猫種  ...
+cat:    4   ネコ       5      哺乳類    —      15      三毛   ← cat の deck unrolled
+dog:    4   イヌ       20     哺乳類    柴犬    30      —     ← dog の deck unrolled
+wolf:   4   オオカミ    40     哺乳類    —      50      —
+bird:   2   トリ       0.3    鳥類      —      —       —
+                                         ↑      ↑       ↑
+                                  dog 専用  共通   cat 専用
+```
+
+- 各 row = 1 entity-deck の unrolled 表示
+- 各 column = 1 himo の値の縦並び (himo の Column 直読み)
+- **「持ってない」 cell = card そのものが存在しない** (= NULL 値じゃない、 §12.8)
+
+### 11.7. card 表示枚数 = query 紐数 (SQL projection と等価)
+
+table 全体は jagged だが、 **query で「どの紐を見るか」 を指定**すると、 各 deck から **その紐の card だけ** が unroll されて返る:
+
+```
+[query: name のみ] (= 1 紐 projection)
+  cat の deck:    [name:ネコ]              ← 1 card 表示
+  dog の deck:    [name:イヌ]              ← 1 card
+  wolf の deck:   [name:オオカミ]          ← 1 card
+
+[query: name + 足] (= 2 紐 projection)
+  cat の deck:    [name:ネコ] [足:4]      ← 2 cards
+  dog の deck:    [name:イヌ] [足:4]      ← 2 cards
+  wolf の deck:   [name:オオカミ] [足:4]   ← 2 cards
+
+[query: name + 犬種] (= 2 紐 projection、 cat/wolf に 犬種 なし)
+  cat の deck:    [name:ネコ]              ← 1 card だけ (犬種 card 不在)
+  dog の deck:    [name:イヌ] [犬種:柴犬]  ← 2 cards
+  wolf の deck:   [name:オオカミ]          ← 1 card だけ
+```
+
+= **「deck の表示枚数 = query 紐数 ∩ entity が tie してる紐数」**。 SQL projection (`SELECT name, legs FROM ...`) と同じ semantics、 ただし「持ってない」 場合の挙動が違う (= card 不在 vs NULL 値、 §12.8)。
+
+### 11.8. クエリ視点での「mammals 横断」
+
+「全 mammals を出して」 のような cross-entity query も card metaphor で自然:
+
+```rust
+let mammals = eng.pull_raw("分類", 哺乳類_vid);   // ns、 pile を grab
+for eid in mammals {
+    let weight = eng.get(eid, "体重");           // ns、 deck から 1 card 引く
+    // ...
+}
+```
+
+= **1 pile pull (= ns) + 各 deck から指定 card 引く (= ns × N)**。 table 跨ぎ union とか親子 relation とか **不要** (= RDB の JOIN 直感は持ち込まなくていい、 §12.9 参照)。
+
+---
+
+## 12. 混同しやすい用語 (= reading 事故の常連)
 
 複数 layer で同形語が出てきて誤読される事例の disambiguation。 **本 glossary 新設の
 直接の動機** (= 2026-05-25 に「TenantView」 を engine 概念と誤読された事案、
-issue #24)。
+[issue #24])。
 
-### 11.1. table
+### 12.1. table
 
 | 文脈 | 意味 |
 |---|---|
@@ -196,7 +363,7 @@ issue #24)。
 
 3 つは **layer 違いだが同じ実体を指す**。 「table」 と言えば engine の named partition、 と読んで大体合う。
 
-### 11.2. tenant
+### 12.2. tenant
 
 | 文脈 | 意味 |
 |---|---|
@@ -204,39 +371,43 @@ issue #24)。
 | schema 層 (`TenantView`) | string-prefix-based table 名 filter の use-case 名。 「tenant」 という engine 概念があるわけではない |
 | deployment (Pattern A) | 1 中央 DB に複数 user / org を host する運用パターン |
 
-⚠ **engine に tenant 概念は無い**。 「per-table eid_range が multi-tenant の基盤になってる」 という設計動機の話は true だが、 「engine の中に tenant という名前の concept がある」 は **false**。 issue #24 で `TenantView` → `DeckView` rename 予定 (= 名前 leak 解消)。
+⚠ **engine に tenant 概念は無い**。 「per-table eid_range が multi-tenant の基盤になってる」 という設計動機の話は true だが、 「engine の中に tenant という名前の concept がある」 は **false**。 [issue #24] で `TenantView` rename 検討中 (= 名前 leak 解消)。
 
-### 11.3. view
+### 12.3. view
 
 | 文脈 | 意味 |
 |---|---|
 | SQL VIEW | `CREATE VIEW v AS SELECT ...`、 保存された query (= 仮想 row 集合)。 enchudb-sql では **未実装** |
-| schema 層 `TenantView` / `DeckView` | curated subset of tables の handle (= table 集合への lens)。 row レベルの filter は持たない |
+| schema 層 `TenantView` | curated subset of tables の handle (= table 集合への lens)。 row レベルの filter は持たない |
 | UI / mental | 「table 一覧の見え方」 みたいな緩い「view」 (= 日本語の「ビュー」 はこれが多い) |
 
 ⚠ enchudb で「view」 と言ったら **table 集合の lens**、 SQL VIEW (row 集合) ではない。
 
-### 11.4. schema
+### 12.4. schema
+
+「schema」 は 4 義 — SQL canon と enchudb 独自で乖離する:
 
 | 文脈 | 意味 |
 |---|---|
 | SQL SCHEMA | namespace (= `CREATE SCHEMA alice` で `alice.notes` の `alice` 部分) |
-| `enchudb-schema` crate | mini-RDB layer の crate 名 (= declarative table builder + tenant scope) |
-| schema declaration | CREATE TABLE / define_himo の type / column 宣言群 (= 構造定義) |
+| `enchudb-schema` crate | mini-RDB layer の crate 名 (= declarative table builder + view layer) |
+| **declared schema** | table に `define_himo_in` で declare された紐 namespace (= 静的 candidate 紐 list) |
+| **actual schema** | その table 内の entity が実際に tie してる紐の union (= 動的 派生、 sparse model 由来) |
 
-3 義あり、 文脈で判断。 「schema crate」 = crate 名、 「DB の schema」 = declaration、 「SQL SCHEMA」 = namespace。
+enchudb は sparse data model なので **declared と actual が乖離**する余地あり (= 多くの entity が一部の declared 紐を skip)。 **良い modeling では table 単位で declared ≈ actual** に保つのが目安、 declared ≫ actual な状況は table 分割 / 親子関係への refactor signal (関連 §12.9)。
 
-### 11.5. cylinder
+### 12.5. cylinder
 
-| 文脈 | 意味 |
-|---|---|
-| engine 内部 (`BucketCylinder`) | `Cylinder[value] = Vec<eid>` の inverse bucket index (per himo) |
-| mental model (暗記カードの束) | 「1 entity からぶら下がる全紐の束」。 1 枚のカード = 1 本の紐 (表 = 紐名、 裏 = 値)、 束 = 円柱。 内部実装とは見方が異なる |
-| メタファ (モンジャラ) | engine 全体の 3D 空間 (= himo, value, eid) を「絡まる蔓 + 交差点に隠れた本体」 で表現。 entity = 蔓の交差点に隠れた本体、 紐 = 全身の蔓 |
+「cylinder」 は **2 つの異なる軸 slice** を指す同名語、 §11 のメンタルモデル参照:
 
-型名は `Cylinder` で固定 (= 0.x dev tree でも rename しない、 stability lock-in 前まで寝かせる)、 説明用に「モンジャラ」 / 「カードの束」 を補助的に使う。
+| 文脈 | 中身 | pivot 軸 |
+|---|---|---|
+| mental「円柱」 (= entity-deck) | 1 entity の card 束 | eid 軸 |
+| code `BucketCylinder` (= pile / value-deck) | 1 (himo, value) の eid 名札 bucket | himo + value 軸 |
 
-### 11.6. WAL vs oplog
+両者は dual で、 **最小 case (= pile に 1 件) で物理的に同じ object に収束**する (§11.5)。 型名は `Cylinder` で固定 (= 0.x dev tree でも rename しない、 stability lock-in 前まで寝かせる)、 mental model 上は entity-deck と pile を区別して使う。
+
+### 12.6. WAL vs oplog
 
 | 文脈 | 意味 |
 |---|---|
@@ -245,14 +416,61 @@ issue #24)。
 
 「WAL」 は historical reference として残るが、 新規 doc / API は **oplog** で統一。 詳細は [issue #8](https://github.com/Mutafika/enchudb/issues/8)。
 
-### 11.7. peer vs root
+### 12.7. peer vs root
 
 | 文脈 | 意味 |
 |---|---|
 | peer | sync 参加する独立 DB instance (= 1 process / 1 file)。 peer_id で識別 |
-| root | 文脈による。 (a) `BlobStore` の `<blob_root>/` ディレクトリ、 (b) `DeckView` の root scope (= prefix なし)、 (c) HLC の `peer_id=0` (= 単独運用) |
+| root | 文脈による。 (a) `BlobStore` の `<blob_root>/` ディレクトリ、 (b) schema 層 view の root scope (= TenantView の prefix なし状態 = `as_view`)、 (c) HLC の `peer_id=0` (= 単独運用) |
 
-「root」 単独では曖昧、 必ず文脈付き ("root deck" / "blob root" / "root peer") で使う。
+「root」 単独では曖昧、 必ず文脈付き ("root view" / "blob root" / "root peer") で使う。
+
+### 12.8. NULL — 値じゃなく state で表現
+
+SQL は `NULL` を column 内に格納する value とするが、 enchudb は **NULL value そのものを持たない**。 代わりに「**tie の有無**」 で同じ semantic を表現:
+
+| | SQL | enchudb |
+|---|---|---|
+| 格納方式 | row 内に NULL 値が居る | tie 自体が存在しない |
+| schema 上の field 存在性 | column 必ず存在、 NULL 値で空表現 | himo が declare されてれば「存在」、 entity 個別に tie 有無 |
+| 「未入力 field」 (SaaS form 等) | `WHERE col IS NULL` | `get(eid, col)` が `None` 返す |
+| 3-valued logic | あり (TRUE / FALSE / NULL)、 NULL 伝搬 | 無い (2-valued)、 absence は absence、 app 側で policy 決める |
+| metaphor | row に NULL カード | **card そのものが存在しない** (§11.7) |
+
+⚠ **「enchudb に NULL は無い」 は正確には「NULL value は無い」**。 SaaS form の「未入力 field」 等の **NULL semantic** は「declare 済み himo の untie 状態」 で機能的に充足できる、 表現が違うだけ。
+
+### 12.9. sparse single-table の落とし穴 (RDB 直感)
+
+RDB は「NULL 多発 = 悪手」 ルールがあるが、 enchudb はそれを **そのまま当てはめてはいけない**:
+
+| 観点 | sparse single-table (= 全部入り animals) | split (= dogs/cats/wolves 別 table) |
+|---|---|---|
+| query 速度 | **ns (= 影響ほぼ無し)** | ns (= 同等) |
+| storage | Column の未 tie cell も sentinel で確保 (= 4 byte × N) | table 内に閉じる |
+| declared schema 見通し | 全種属性が膨らむ | table 名で species 明示、 clean |
+| cross-species query (= mammals 横断) | **1 pull で済む** (§11.8) | table 跨ぎ必要 |
+| species 増えた時 | `define_himo_in` 追加 | 新 table 作成 + relation 整理 |
+
+= **enchudb では sparse single-table が perf-neutral、 むしろ cross-species query が trivial**。 table 分割は **perf のためじゃなく、 名前空間 / concept 明示のため** にやる。 RDB の「NULL 多発悪手」 directive は enchudb には当てはまらない (= NULL value 持たない設計のおかげ、 §12.8 参照)。
+
+「全部入り single-table も valid choice、 cross-axis query が頻発するなら single-table が筋」 が enchudb design principle。
+
+### 12.10. Tag / Leaf の命名 awkward さ
+
+`HimoType::Tag` / `HimoType::Leaf` は実態と名前が乖離してる:
+
+| 現名 | 期待される意味 | 実態 |
+|---|---|---|
+| **`Tag`** | 「categorical label」 「hashtag」 のイメージ | **dedupe 済み文字列値** (= vocab 共有、 hub 紐) |
+| **`Leaf`** | 「tree leaf」 「terminal node」 (graph 用語) | **dedupe なし文字列値** (= per-tie 個別、 終端紐) |
+
+graph-role 視点では命名は半分正しい (= Leaf は graph terminal、 Tag は categorical hub) が、 「Tag」 という単語自体が dedupe semantics を伝えないので reading 事故源。
+
+0.9.0 候補の rename direction (= breaking change で issue 別途検討):
+- `HimoType` → **`ValueType`** (= 名前と実態の乖離解消、 「value の格納方式」 を直接表現)
+- `Tag` → **`Himo`** (= 「canonical な紐 / hub 連結」、 原 enchudb metaphor の 紐 直承) または **`Symbol`** (= CS canonical な interned string)
+- `Leaf` → 現状維持 (= graph leaf として OK、 `Himo` と pair で graph-role 対称)
+- `Number` / `Ref` → 現状維持
 
 ---
 
