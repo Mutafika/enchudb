@@ -24,3 +24,8 @@ sha2 = "0.10"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 memmap2 = "0.9"
 libc = "0.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# std::time panics on wasm32-unknown-unknown ("time not implemented"); web-time
+# shims Instant/SystemTime for the browser.
+web-time = "1"

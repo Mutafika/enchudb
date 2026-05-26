@@ -17,6 +17,14 @@ use std::io;
 #[cfg(not(target_arch = "wasm32"))]
 use memmap2::MmapMut;
 
+// std::time::Instant panics on wasm32-unknown-unknown ("time not implemented").
+// load_from_backing's [open_profile] timer is on the wasm read path, so alias
+// Instant to the web-time shim there.
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
+
 use crate::region::Region;
 
 /// get_entity の戻り値。
@@ -1593,15 +1601,15 @@ impl Engine {
             #[cfg(not(target_os = "macos"))]
             { 0 }
         };
-        let mut t = std::time::Instant::now();
+        let mut t = Instant::now();
         let mut p = pr();
-        let mut report = |label: &str, t: &mut std::time::Instant, p: &mut u64| {
+        let mut report = |label: &str, t: &mut Instant, p: &mut u64| {
             if profile {
                 let np = pr();
                 let dp = np - *p;
                 eprintln!("[open_profile] {:>22}  Δreclaim={:>7}  Δt={:>5} ms", label, dp, t.elapsed().as_millis());
                 *p = np;
-                *t = std::time::Instant::now();
+                *t = Instant::now();
             }
         };
 
