@@ -972,6 +972,7 @@ dependencies = [
  "rand_core 0.6.4",
  "sha2",
  "tokio",
+ "web-time",
 ]
 
 [[package]]
