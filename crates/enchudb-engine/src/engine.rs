@@ -2558,6 +2558,27 @@ impl Engine {
         }
     }
 
+    /// 0.8.4 issue #30: 受信 Vocab record の dedupe 用。 `(author_peer, remote_vid)`
+    /// が既に `peer_vocab_map` に登録済みで、 かつ map 先 local_vid の bytes が
+    /// 受信 bytes と一致するなら true (= 同じ record の再受信、 skip すべき)。
+    ///
+    /// 旧 behavior: sync apply_one は Vocab を **HLC dedupe せず常に applied 扱い**
+    /// していた。 gossip_remote_apply ON 構成で同じ vocab record が無限に往復し、
+    /// `entities_live` が膨れる amplification loop が出た (bisquit dogfood 実例)。
+    /// 本 method を sync 側で先に叩いて、 既登録なら apply_one が false を返す。
+    pub fn has_remote_vocab(
+        &self,
+        author_peer: enchudb_oplog::PeerId,
+        remote_vid: u32,
+        bytes: &[u8],
+    ) -> bool {
+        let map = self.peer_vocab_map.read().unwrap();
+        if let Some(&local_vid) = map.get(&(author_peer, remote_vid)) {
+            return self.vocab.get(local_vid) == bytes;
+        }
+        false
+    }
+
     /// v33: Symbol 型 himo の Tie を受信した際、remote vid を local vid に変換する。
     /// Symbol 以外の himo、または mapping 未登録なら元値をそのまま返す。
     pub fn translate_remote_vid(&self, author_peer: enchudb_oplog::PeerId, himo_id: u16, value: u32) -> u32 {
@@ -3572,7 +3593,14 @@ impl Engine {
             if idx >= himo_count { return Vec::new(); }
             idx_conds.push((idx, val));
         }
-        self.query_resolved(&idx_conds).into_iter().map(|e| e as enchudb_oplog::EntityId).collect()
+        // 0.8.4 issue #32: 旧 `e as EntityId` は u32 → u64 widen で peer prefix が
+        // 0 のまま残り、 schema 層の `where_eq().find_one()` 等が壊れた eid を返してた。
+        // `entities_with_himo` と同じ make_eid(peer, e) で peer prefix を付ける。
+        let peer = self.peer_id();
+        self.query_resolved(&idx_conds)
+            .into_iter()
+            .map(|e| enchudb_oplog::make_eid(peer, e))
+            .collect()
     }
 
     /// 内部版: u32 eid の Vec を返す。互換性のため残す。

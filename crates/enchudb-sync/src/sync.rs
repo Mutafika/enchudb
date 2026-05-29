@@ -443,6 +443,13 @@ impl Syncer {
             }
             DecodedOp::Commit => true, // boundary marker、apply は不要
             DecodedOp::Vocab { vid, bytes } => {
+                // 0.8.4 issue #30: 既に同 (author_peer, vid, bytes) を登録済みなら
+                // skip。 これが無いと gossip_remote_apply ON で同じ vocab record が
+                // 再 apply され続け、 caller (Syncer) の applied counter が永久に
+                // 0 に戻らず amplification loop の見かけになる。
+                if self.engine.has_remote_vocab(rec.author_peer, *vid, bytes) {
+                    return false;
+                }
                 // author_peer の (vid, bytes) を受信。
                 // Engine 側の remote_vocab_apply に委譲 (peer 別 vid mapping を構築)。
                 self.engine.remote_vocab_apply(rec.author_peer, *vid, bytes, Some(relayed_header(rec)));

@@ -3,6 +3,52 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.8.5 — 2026-05-30
+
+sync 経路の 2 件の bug fix patch release。 bisquit (dogfood) の Mac ↔ Android
+mesh sync で表面化した amplification loop と、 schema 層の `where_eq().find_one()`
+が壊れた eid を返してた cast bug を fix。 file format / wire format / 公開 API
+変更なし、 **0.8.4 から再 build のみで上がれる**。
+
+### Fixed
+
+- **#30 `apply_one::DecodedOp::Vocab` の HLC dedupe 欠落** (= bisquit dogfood で
+  amplification loop): 旧 behavior では同じ vocab record の再受信を毎回
+  `applied++` 扱いし、 `gossip_remote_apply` ON 構成で WAL 再追記 → 再 publish
+  → 再受信 の cycle に見える状態だった。 受信前に `Engine::has_remote_vocab`
+  で `(author_peer, vid, bytes)` 一致を check、 既登録なら `skipped++` に振り分け
+- **#32 `Engine::query_by_id` の peer prefix 落ち** (= schema 層 `where_eq` 系の
+  PK lookup が壊れた eid 返却): 旧 behavior は `query_resolved -> Vec<u32>` を
+  `as EntityId` (= u32→u64 widen) で変換、 高 32bit (= peer_id) が 0 のままで
+  `engine.get(eid, ...)` 等が dangling になる。 `entities_with_himo` と同じ
+  `make_eid(self.peer_id(), e)` で peer prefix を付与
+
+### Added
+
+- **`Engine::has_remote_vocab(author_peer, remote_vid, bytes) -> bool`** public
+  API: 受信 vocab record の dedupe 判定用 (= sync crate が呼ぶ)。 `(author_peer,
+  remote_vid)` が `peer_vocab_map` に登録済みかつ map 先 local_vid の bytes が
+  受信 bytes と一致するなら true
+
+### test
+
+- workspace 全体: **437 passed / 0 failed / 26 ignored** (= 0.8.4 比 +4)
+- `enchudb-engine/tests/query_by_id_peer_prefix.rs` 2 件 (= #32 検証)
+- `enchudb-sync/tests/vocab_dedupe.rs` 2 件 (= #30 検証)
+
+### Unchanged
+
+- file format / wire format / `WireRecord` encode 形式 不変
+- 0.8.4 で追加された `create_growable_with_options` / 同一 himo bulk column
+  scan API は無触
+- HLC / signature / pubkey_fp layout 不変
+
+### 0.8.4 consumer 向け migration
+
+なし。 `cargo build` で 0.8.5 binary になる。 bisquit / sinfo / suzukapulse /
+mlbpulse 等の consumer は再 build のみで上がれる。 `gossip_remote_apply(true)`
+構成は 0.8.5 以降で amplification loop 解消。
+
 ## 0.8.4 — 2026-05-25
 
 `Database` / `Engine` から `vocab_data_size` を明示できる
