@@ -168,6 +168,22 @@ impl HimoStore {
         if stored == 0 { None } else { Some(stored - 1) }
     }
 
+    /// bulk get-value (= stored 形式、 0 = missing、 >=1 のとき値は stored-1)。
+    /// callsite が `out` を持つ buffer reuse 設計。 Option enum を avoid して、
+    /// 同 himo の N entity を 1 関数呼び出しで column scan する。
+    #[inline]
+    pub fn get_stored_into(&self, eids: &[enchudb_oplog::EntityId], out: &mut Vec<u32>) {
+        let col = self.col();
+        let count = col.count();
+        out.clear();
+        out.reserve(eids.len());
+        for &eid in eids {
+            let lid = enchudb_oplog::eid_local(eid);
+            if lid >= count { out.push(0); continue; }
+            out.push(u32::from_le_bytes(col.get(lid).try_into().unwrap()));
+        }
+    }
+
     #[inline(always)]
     pub fn value_eq(&self, eid: u32, value: u32) -> bool {
         u32::from_le_bytes(self.col().get(eid).try_into().unwrap()) == value + 1

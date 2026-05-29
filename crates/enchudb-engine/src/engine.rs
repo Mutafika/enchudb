@@ -3076,6 +3076,23 @@ impl Engine {
         self.himos.get(hid as usize)?.get_value(eid)
     }
 
+    /// `get_by_id` の bulk 版。 同 himo の N entity を 1 関数呼び出しで column scan。
+    /// stored 値 (= 内部表現の値+1、 0 = missing) を `out` に append (= callsite で
+    /// buffer reuse 可能、 alloc 削減)。 集計ヘビーな hot loop で使う。
+    #[inline]
+    pub fn pull_himo_stored_many_into(
+        &self, hid: u16,
+        eids: &[enchudb_oplog::EntityId],
+        out: &mut Vec<u32>,
+    ) {
+        let Some(hs) = self.himos.get(hid as usize) else {
+            out.clear();
+            out.resize(eids.len(), 0);
+            return;
+        };
+        hs.get_stored_into(eids, out);
+    }
+
     /// 指定 himo に値が tie された **全** entity を列挙。 O(next_eid) で重い。
     /// schema layer の `Query::all()` のように「table の任意 column を持つ row」 を
     /// 列挙するための代表 column 経由で使う想定。
