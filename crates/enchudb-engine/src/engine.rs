@@ -2316,6 +2316,14 @@ impl Engine {
             .collect()
     }
 
+    /// 0.8.6: 指定 table 名の `(eid_range_lo, eid_range_hi)` を引く。 schema
+    /// crate の `Table::sum/count/group_sum` が table-scoped 集計を
+    /// `sum_range` / `count_range` / `group_sum_range` に bind するのに使う。
+    /// 未定義 table は None。
+    pub fn table_eid_range(&self, name: &str) -> Option<(u32, u32)> {
+        self.tables.iter().find(|t| t.name == name).map(|t| (t.eid_range_lo, t.eid_range_hi))
+    }
+
     /// 0.7.0: 指定 table 名が reserved table として既に存在するか。 schema crate
     /// が `_schema_meta` を auto-define する idempotent path で使う。
     pub fn has_reserved_table(&self, name: &str) -> bool {
@@ -3105,9 +3113,13 @@ impl Engine {
         self.himos.get(hid as usize)?.get_value(eid)
     }
 
-    /// `get_by_id` の bulk 版。 同 himo の N entity を 1 関数呼び出しで column scan。
-    /// stored 値 (= 内部表現の値+1、 0 = missing) を `out` に append (= callsite で
-    /// buffer reuse 可能、 alloc 削減)。 集計ヘビーな hot loop で使う。
+    /// `get_by_id` の bulk 版。 同 himo の N entity を一括 column scan で `out` に append。
+    /// stored 値 (= 内部表現の値+1、 0 = missing) を返す。 呼び出し側で
+    /// `s.checked_sub(1)` すると `Option<u32>` に戻せる。
+    ///
+    /// alloc を呼ぶ側に任せて buffer reuse を可能に (= 集計ヘビーな loop で毎回 Vec を
+    /// 作ると alloc が支配する)。 dominance loop は外で 4 buffer 確保 → 毎 lap で clear
+    /// + 再 fill するだけ。
     #[inline]
     pub fn pull_himo_stored_many_into(
         &self, hid: u16,
@@ -3120,6 +3132,13 @@ impl Engine {
             return;
         };
         hs.get_stored_into(eids, out);
+    }
+
+    /// alloc 込みの便利版 (= 軽量 callsite 向け)。 hot loop では使わない。
+    pub fn pull_himo_stored_many(&self, hid: u16, eids: &[enchudb_oplog::EntityId]) -> Vec<u32> {
+        let mut out = Vec::new();
+        self.pull_himo_stored_many_into(hid, eids, &mut out);
+        out
     }
 
     /// 指定 himo に値が tie された **全** entity を列挙。 O(next_eid) で重い。
@@ -3176,23 +3195,46 @@ impl Engine {
         hits
     }
 
-    /// 0.8.6: himo 全 entity を column 直 scan で sum。 `entities()` + `sum()`
-    /// の 2 段構成より高速 (= eids 配列の構築 / 走査オーバーヘッドなし、
-    /// branchless tight loop で auto-vectorize が効く)。
+    /// 0.8.6: himo の `[lo, hi)` eid 範囲を column 直 scan で sum。
+    /// schema 層の `Table::sum(col)` の internal primitive — table の eid
+    /// 範囲 (= `eid_range_lo..eid_range_hi`) を渡すと、 その table の
+    /// その column の合計が出る。
     ///
-    /// `sum(himo, &entities())` は 1M rows / M2 Max で ~1.65ms 掛かるが、
-    /// 本 path は ~200-400µs (= duckdb の `SELECT SUM(col)` と同 オーダー)。
-    /// DB 全件集計の素直な path として使う。
-    pub fn sum_all(&self, himo: &str) -> u64 {
+    /// 1M rows / M2 Max で ~100µs (= DuckDB `SELECT SUM(col) FROM tbl` の
+    /// 5-6x 速い)。 eids 配列を経由しない、 mmap u32 slice を sequential に
+    /// 舐めるだけの branchless tight loop が auto-vectorize する。
+    pub fn sum_range(&self, himo: &str, lo: u32, hi: u32) -> u64 {
         let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
         let hs = &self.himos[hid];
+        let values = hs.stored_slice();
+        let lo = lo as usize;
+        let hi = (hi as usize).min(values.len());
+        if lo >= hi { return 0; }
         let mut total: u64 = 0;
         // stored == 0 が missing、 stored > 0 のとき値は stored - 1。
         // saturating_sub(1) で missing を 0 扱いにできて branchless になる。
-        for &stored in hs.stored_slice() {
+        for &stored in &values[lo..hi] {
             total += stored.saturating_sub(1) as u64;
         }
         total
+    }
+
+    /// 0.8.6: himo の `[lo, hi)` eid 範囲に値が tie されてる entity 数を返す
+    /// (= `COUNT(col)` 相当、 missing を除いた数)。 schema 層の
+    /// `Table::count(col)` の internal primitive。
+    pub fn count_range(&self, himo: &str, lo: u32, hi: u32) -> u32 {
+        let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
+        let hs = &self.himos[hid];
+        let values = hs.stored_slice();
+        let lo = lo as usize;
+        let hi = (hi as usize).min(values.len());
+        if lo >= hi { return 0; }
+        let mut n: u32 = 0;
+        for &stored in &values[lo..hi] {
+            // stored > 0 のとき 1、 0 のとき 0 を加算 (= branchless cast)
+            n += (stored != 0) as u32;
+        }
+        n
     }
 
     /// 最小値
@@ -3281,29 +3323,36 @@ impl Engine {
         }
     }
 
-    /// 0.8.6: himo 全 entity を column 直 scan で group_sum。 `entities()` +
-    /// `group_sum()` の 2 段構成より高速 (= eids 配列の構築 + per-eid bounds
-    /// check + Option wrap を一切 skip、 stored_slice 2 本を index で並走 scan)。
+    /// 0.8.6: `[lo, hi)` eid 範囲の 2 column を lockstep scan して group_sum。
+    /// schema 層の `Table::group_sum(group, sum)` の internal primitive。
     ///
-    /// `group_sum(group, sum, &entities())` は 1M rows / M2 Max で ~9.7ms 掛かるが、
-    /// 本 path は ~1-2ms (= DuckDB の `SELECT group, SUM(col) GROUP BY group` と
-    /// 同オーダーの目標)。 DB 全件 group 集計の素直な path。
-    pub fn group_sum_all(&self, group_himo: &str, sum_himo: &str) -> Vec<(u32, u64)> {
+    /// 1M rows / M2 Max で ~10ms (= 残念ながら DuckDB ~1.5ms には及ばない、
+    /// NEON で native scatter が無く、 acc[g] += v が ILP/vector 化困難な
+    /// scatter write のため。 algorithmic 工夫は別 work)。
+    pub fn group_sum_range(
+        &self,
+        group_himo: &str,
+        sum_himo: &str,
+        lo: u32,
+        hi: u32,
+    ) -> Vec<(u32, u64)> {
         let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
         let sid = match self.himo_id(sum_himo) { Some(h) => h, None => return vec![] };
         let gs = &self.himos[gid];
         let ss = &self.himos[sid];
         let groups = gs.stored_slice();
         let sums = ss.stored_slice();
-        let n = groups.len().min(sums.len());
+        let lo = lo as usize;
+        let hi = (hi as usize).min(groups.len()).min(sums.len());
+        if lo >= hi { return vec![]; }
 
         if let Some(cap) = self.group_dense_cap(gid) {
-            // dense cap での 全件 group_sum: seen[] tracking を廃止して
-            // hot loop の per-iter store を 1 → 2 から 1 に圧縮 (= 1M iter で
-            // ~1ms 削減見込み)。 「acc[g] == 0」 が non-empty 判定の代用、
-            // 値 0 と「データ無し」 を区別したい時は別 API を使うこと。
+            // dense cap での group_sum: seen[] tracking を廃止して
+            // hot loop の per-iter store を 2 → 1 に圧縮。
+            // 「acc[g] == 0」 が non-empty 判定の代用、 値 0 と「データ無し」を
+            // 区別したい時は別 API を使うこと。
             let mut acc: Vec<u64> = vec![0; cap];
-            for i in 0..n {
+            for i in lo..hi {
                 let g_stored = groups[i];
                 let s_stored = sums[i];
                 if g_stored == 0 || s_stored == 0 { continue; }
@@ -3315,7 +3364,7 @@ impl Engine {
             (0..cap).filter(|&i| acc[i] > 0).map(|i| (i as u32, acc[i])).collect()
         } else {
             let mut map: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
-            for i in 0..n {
+            for i in lo..hi {
                 let g_stored = groups[i];
                 let s_stored = sums[i];
                 if g_stored == 0 || s_stored == 0 { continue; }

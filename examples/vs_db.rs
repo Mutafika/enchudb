@@ -268,7 +268,6 @@ fn main() {
     //     engine 直叩き時は table prefix が必要。
     let eng = edb.engine();
     let h_salary = "employees.salary";
-    let h_dept = "employees.dept";
 
     // SUM (filtered) — hits = 走査対象数
     bench("SUM salary (dept=3)", ITERATIONS,
@@ -293,11 +292,13 @@ fn main() {
         },
     );
 
-    // SUM (全件) — hits = 全件。 全件集計は eids 配列を作らない fast path
-    // (= `sum_all`) を使う、 これが DuckDB の `SELECT SUM(col)` 相当。
-    bench("SUM salary (全件)", ITERATIONS,
+    // SUM (table 全体) — schema 層の Table::sum で 1 行 API。 内部で table の
+    // [eid_range_lo, hi) を engine sum_range に bind、 column 直 scan で
+    // auto-vectorize。 これが README 推奨 path (= 「テーブルが出てきて、
+    // そこにある金額をsum」)。
+    bench("SUM salary (table)", ITERATIONS,
         || {
-            let _ = eng.sum_all(h_salary);
+            let _ = employees.sum("salary");
             ENTITY_COUNT as usize
         },
         || {
@@ -316,12 +317,11 @@ fn main() {
         },
     );
 
-    // GROUP BY + SUM — hits = group 数を返すが、 走査は全件。 0.8.6 の
-    // `group_sum_all` は eids 配列を作らない fast path (= DuckDB の
-    // `SELECT g, SUM(c) GROUP BY g` 相当)。
-    bench("GROUP BY dept SUM salary (全件)", ITERATIONS,
+    // GROUP BY + SUM (table 全体) — Table::group_sum。 内部は engine
+    // group_sum_range、 dense cap で acc[g] += v の scatter accumulate。
+    bench("GROUP BY dept SUM salary (table)", ITERATIONS,
         || {
-            let g = eng.group_sum_all(h_dept, h_salary);
+            let g = employees.group_sum("dept", "salary");
             g.len()
         },
         || {
