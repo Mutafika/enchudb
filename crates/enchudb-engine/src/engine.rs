@@ -3147,6 +3147,54 @@ impl Engine {
         total
     }
 
+    /// 0.8.6: himo 値が `[lo, hi]` (両端含む) の範囲に入る entity 全件を、
+    /// column を直線 scan で集める。 既存 `entities_with_himo_range` 等は
+    /// BucketCylinder の reverse lookup を range 内 N 値ぶん union するため、
+    /// hit 率が高い (= range 内に大量 entity がいる) workload で遅い。 本 path は
+    /// 「column を頭から舐めて compare」 だけなので duckdb の `BETWEEN` clause と
+    /// 同じ性質、 hit 率に関わらず安定 (= 1M rows / M2 Max で ~1-3ms 目標)。
+    ///
+    /// 戻り値の eid は昇順、 重複なし、 peer prefix 付き (= make_eid 経由)。
+    pub fn range_scan(&self, himo: &str, lo: u32, hi: u32) -> Vec<enchudb_oplog::EntityId> {
+        if lo > hi { return Vec::new(); }
+        let hid = match self.himo_id(himo) { Some(h) => h, None => return Vec::new() };
+        let hs = &self.himos[hid];
+        let values = hs.stored_slice();
+        let peer = self.peer_id();
+        // stored 形式: 0 = missing、 stored - 1 = 値。 範囲 [lo, hi] in 値空間
+        // ↔ [lo + 1, hi + 1] in stored 空間。 lo == 0 の場合の境界も自然に扱える。
+        let lo_stored = lo.saturating_add(1);
+        let hi_stored = hi.saturating_add(1);
+        let mut hits: Vec<enchudb_oplog::EntityId> = Vec::new();
+        // 22% hit 想定で reserve、 過剰なら trim
+        hits.reserve(values.len() / 4);
+        for (i, &stored) in values.iter().enumerate() {
+            if stored >= lo_stored && stored <= hi_stored {
+                hits.push(enchudb_oplog::make_eid(peer, i as u32));
+            }
+        }
+        hits
+    }
+
+    /// 0.8.6: himo 全 entity を column 直 scan で sum。 `entities()` + `sum()`
+    /// の 2 段構成より高速 (= eids 配列の構築 / 走査オーバーヘッドなし、
+    /// branchless tight loop で auto-vectorize が効く)。
+    ///
+    /// `sum(himo, &entities())` は 1M rows / M2 Max で ~1.65ms 掛かるが、
+    /// 本 path は ~200-400µs (= duckdb の `SELECT SUM(col)` と同 オーダー)。
+    /// DB 全件集計の素直な path として使う。
+    pub fn sum_all(&self, himo: &str) -> u64 {
+        let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
+        let hs = &self.himos[hid];
+        let mut total: u64 = 0;
+        // stored == 0 が missing、 stored > 0 のとき値は stored - 1。
+        // saturating_sub(1) で missing を 0 扱いにできて branchless になる。
+        for &stored in hs.stored_slice() {
+            total += stored.saturating_sub(1) as u64;
+        }
+        total
+    }
+
     /// 最小値
     pub fn min(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u32> {
         let hid = self.himo_id(himo)?;
@@ -3228,6 +3276,50 @@ impl Engine {
                 if let (Some(group), Some(val)) = (gs.get_value(local), ss.get_value(local)) {
                     *map.entry(group).or_insert(0) += val as u64;
                 }
+            }
+            map.into_iter().collect()
+        }
+    }
+
+    /// 0.8.6: himo 全 entity を column 直 scan で group_sum。 `entities()` +
+    /// `group_sum()` の 2 段構成より高速 (= eids 配列の構築 + per-eid bounds
+    /// check + Option wrap を一切 skip、 stored_slice 2 本を index で並走 scan)。
+    ///
+    /// `group_sum(group, sum, &entities())` は 1M rows / M2 Max で ~9.7ms 掛かるが、
+    /// 本 path は ~1-2ms (= DuckDB の `SELECT group, SUM(col) GROUP BY group` と
+    /// 同オーダーの目標)。 DB 全件 group 集計の素直な path。
+    pub fn group_sum_all(&self, group_himo: &str, sum_himo: &str) -> Vec<(u32, u64)> {
+        let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
+        let sid = match self.himo_id(sum_himo) { Some(h) => h, None => return vec![] };
+        let gs = &self.himos[gid];
+        let ss = &self.himos[sid];
+        let groups = gs.stored_slice();
+        let sums = ss.stored_slice();
+        let n = groups.len().min(sums.len());
+
+        if let Some(cap) = self.group_dense_cap(gid) {
+            // dense cap での 全件 group_sum: seen[] tracking を廃止して
+            // hot loop の per-iter store を 1 → 2 から 1 に圧縮 (= 1M iter で
+            // ~1ms 削減見込み)。 「acc[g] == 0」 が non-empty 判定の代用、
+            // 値 0 と「データ無し」 を区別したい時は別 API を使うこと。
+            let mut acc: Vec<u64> = vec![0; cap];
+            for i in 0..n {
+                let g_stored = groups[i];
+                let s_stored = sums[i];
+                if g_stored == 0 || s_stored == 0 { continue; }
+                let g = (g_stored - 1) as usize;
+                if g < cap {
+                    acc[g] += (s_stored - 1) as u64;
+                }
+            }
+            (0..cap).filter(|&i| acc[i] > 0).map(|i| (i as u32, acc[i])).collect()
+        } else {
+            let mut map: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+            for i in 0..n {
+                let g_stored = groups[i];
+                let s_stored = sums[i];
+                if g_stored == 0 || s_stored == 0 { continue; }
+                *map.entry(g_stored - 1).or_insert(0) += (s_stored - 1) as u64;
             }
             map.into_iter().collect()
         }

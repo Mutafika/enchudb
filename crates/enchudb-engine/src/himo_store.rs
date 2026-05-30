@@ -168,6 +168,14 @@ impl HimoStore {
         if stored == 0 { None } else { Some(stored - 1) }
     }
 
+    /// 0.8.6: SIMD 集計向け raw stored values への view。 length = count()、
+    /// stored 形式 (= 0 = 未設定、 N = 値 N-1) のまま。 caller が
+    /// `saturating_sub(1)` 等で missing を treat-as-zero できる。
+    #[inline]
+    pub fn stored_slice(&self) -> &[u32] {
+        self.col().values_u32()
+    }
+
     /// bulk get-value (= stored 形式、 0 = missing、 >=1 のとき値は stored-1)。
     /// callsite が `out` を持つ buffer reuse 設計。 Option enum を avoid して、
     /// 同 himo の N entity を 1 関数呼び出しで column scan する。

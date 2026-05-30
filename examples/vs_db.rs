@@ -214,10 +214,14 @@ fn main() {
         },
     );
 
-    // 範囲
+    // 範囲 — 0.8.6 で hit 率が高い range を engine 直線 scan に切替 (= DuckDB の
+    // BETWEEN 相当)。 schema 層 where_range は BucketCylinder reverse union で
+    // 高 hit 率では遅いので、 engine の range_scan を直接叩く。
+    let eng_for_range = edb.engine();
+    let h_age = "employees.age";
     bench("範囲 (age 30..40)", ITERATIONS,
         || {
-            let r = employees.where_range("age", 30, 40).find().unwrap();
+            let r = eng_for_range.range_scan(h_age, 30, 40);
             r.len()
         },
         || {
@@ -289,12 +293,12 @@ fn main() {
         },
     );
 
-    // SUM (全件) — hits = 全件
+    // SUM (全件) — hits = 全件。 全件集計は eids 配列を作らない fast path
+    // (= `sum_all`) を使う、 これが DuckDB の `SELECT SUM(col)` 相当。
     bench("SUM salary (全件)", ITERATIONS,
         || {
-            let all = eng.entities();
-            let _ = eng.sum(h_salary, &all);
-            all.len()
+            let _ = eng.sum_all(h_salary);
+            ENTITY_COUNT as usize
         },
         || {
             let _: i64 = sdb.query_row(
@@ -312,11 +316,12 @@ fn main() {
         },
     );
 
-    // GROUP BY + SUM — hits = group 数を返すが、 走査は全件
+    // GROUP BY + SUM — hits = group 数を返すが、 走査は全件。 0.8.6 の
+    // `group_sum_all` は eids 配列を作らない fast path (= DuckDB の
+    // `SELECT g, SUM(c) GROUP BY g` 相当)。
     bench("GROUP BY dept SUM salary (全件)", ITERATIONS,
         || {
-            let all = eng.entities();
-            let g = eng.group_sum(h_dept, h_salary, &all);
+            let g = eng.group_sum_all(h_dept, h_salary);
             g.len()
         },
         || {

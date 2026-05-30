@@ -57,6 +57,24 @@ impl Column {
         &mm[off..off + vs]
     }
 
+    /// 0.8.6: u32 packed value slice。 SIMD 集計 / 全件 scan 用の fast path。
+    /// `value_size == 4` (= Number / Tag / Leaf 等の通常 himo) でのみ意味あり。
+    /// 戻り値の長さは `count()`、 stored 形式 (= 0 = 未設定、 N = 値 N-1)。
+    ///
+    /// HEADER (= 16 bytes) は u32 alignment、 mmap region は page-aligned なので
+    /// アライン安全。 LE 前提 (aarch64 / x86_64 等の supported target で OK)。
+    #[inline]
+    pub fn values_u32(&self) -> &[u32] {
+        debug_assert_eq!(self.value_size, 4, "values_u32 requires value_size == 4");
+        let n = self.count() as usize;
+        let mm = self.region.slice();
+        // SAFETY: HEADER (16) は u32 アラインで、 mmap region は page-aligned。
+        // n * 4 <= max_entities * 4 (= region 内 packed 領域の上限)。
+        // u32 LE は aarch64 / x86_64 で native u32 と一致。
+        let base = unsafe { mm.as_ptr().add(HEADER) as *const u32 };
+        unsafe { std::slice::from_raw_parts(base, n) }
+    }
+
     #[inline]
     pub fn clear(&self, entity_id: u32) {
         let vs = self.value_size as usize;
