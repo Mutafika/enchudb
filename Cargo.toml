@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "enchudb"
-version = "0.8.5"
+version = "0.8.6"
 edition = "2024"
 description = "EnchuDB — 紐ベース円柱エンジン。`enchudb-engine` を便利に再エクスポートする meta crate。"
 license-file = "LICENSE.md"
@@ -31,6 +31,9 @@ enchudb-ffi = { path = "crates/enchudb-ffi", optional = true }
 proptest = "1"
 libc = "0.2"
 rusqlite = { version = "0.36", features = ["bundled"] }
+# in-process DuckDB binding for vs_db bench (= subprocess CLI overhead を排除して
+# columnar OLAP の真の比較を取る)。 bundled で system に依存しない build。
+duckdb = { version = "1", features = ["bundled"] }
 enchudb-transport = { path = "crates/enchudb-transport" }
 sabitori = { path = "../sabitori/crates/sabitori" }
 sabitori-style = { path = "../sabitori/crates/sabitori-style" }

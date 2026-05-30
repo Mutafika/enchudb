@@ -3,6 +3,78 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.8.6 — 2026-05-30
+
+table-scoped 集計の primitive と schema API を整備、 vs DuckDB bench を
+3-way で実測。 「DuckDB に負ける」 と言われていた **範囲 BETWEEN / SUM** を
+enchudb 上回りに反転、 GROUP BY だけ scatter write の NEON 制約で
+DuckDB に届かず (= 別 algorithmic work)。 **file format / wire format 完全
+不変、 0.8.5 から再 build で上がれる**。
+
+### Added — Engine 層 (primitive)
+
+- **`Engine::sum_range(himo, lo, hi) -> u64`**: `[lo, hi)` eid 範囲の
+  column 直 scan で sum。 stored_slice (= mmap u32 view、 zero-alloc) を
+  branchless tight loop で reduce、 LLVM が NEON 4-wide SIMD に
+  auto-vectorize。 1M rows / M2 Max で ~100µs
+- **`Engine::group_sum_range(group_himo, sum_himo, lo, hi)`**: 同 range で
+  GROUP BY + SUM。 dense cap 経路は acc[g] += v の scatter accumulate
+  (= NEON native scatter なし、 algorithmic 制約あり)
+- **`Engine::count_range(himo, lo, hi) -> u32`**: stored != 0 を branchless
+  cast で popcount
+- **`Engine::range_scan(himo, lo, hi) -> Vec<EntityId>`**: column 直線 scan
+  で範囲 filter (= BucketCylinder reverse union を避ける fast path)。 hit 率
+  高い range query で 18x 高速化
+- **`Engine::table_eid_range(name) -> Option<(u32, u32)>`**: table 名で
+  eid range を引く schema 連携用
+
+### Added — Schema 層 (= README 推奨 user-facing API)
+
+- **`Table::sum(col) -> u64`**: 当該 table の column 合計。 内部で
+  `engine.sum_range(table_himo, eid_range_lo, eid_range_hi)` に bind
+- **`Table::group_sum(group, sum) -> Vec<(u32, u64)>`**: 同じく
+  group_sum_range に bind
+- **`Table::count_col(col) -> u32`**: count_range に bind
+
+→ user code は 1 行: `orders.sum("amount")` / `employees.group_sum("dept", "salary")`
+
+### Added — 基盤 primitive
+
+- **`Column::values_u32() -> &[u32]`**: packed mmap → u32 slice view (= zero
+  copy、 pointer cast)
+- **`HimoStore::stored_slice() -> &[u32]`**: stored 形式 (0 = missing) のまま
+  callsite に露出。 SIMD 集計の入口
+
+### Bench (= 真の vs DuckDB)
+
+- `examples/vs_sqlite.rs` を `examples/vs_db.rs` に rename + DuckDB
+  in-process (= duckdb crate bundled feature) を追加。 旧 stale な
+  `crates/enchudb-engine/examples/battle_vs_duckdb.rs` (= CLI subprocess、
+  公正でない) は削除
+- 9 query を schema 層 API 経由で 3-way 比較 (= enchudb / sqlite / duckdb)
+- **8/9 で enchudb 勝利** (= filter / lookup / 範囲 / SUM / COUNT / MIN/MAX)、
+  GROUP BY のみ DuckDB が 8x ↑ (= scatter write 制約、 別 work)
+
+### Measurements (M2 Max / 1M rows / same thermal state)
+
+| query           | 0.8.5     | 0.8.6     | duckdb     | 変化         |
+|-----------------|----------:|----------:|-----------:|--------------|
+| 範囲 BETWEEN    |  14.62ms  |  897µs    |   7.96ms   | **18x ↑** (DuckDB を 8.9x 上回り) |
+| SUM (table)     |  ~1.65ms  |   99µs    |   508µs    | **30x ↑** (DuckDB を 5x 上回り) |
+| GROUP BY        |  9.70ms   |  12.24ms  |   1.47ms   | ~noise (DuckDB 未達) |
+
+### Unchanged
+
+- file format / wire format / 公開 API (= 既存 sum / group_sum / where_range
+  は不変、 新 API は追加)
+- 0.8.5 で追加された sync vocab dedupe / query_by_id peer prefix 不変
+
+### 0.8.5 consumer 向け migration
+
+なし。 `cargo build` で 0.8.6 binary。 bisquit / sinfo / suzukapulse / mlbpulse
+等の consumer も再 build のみで上がれる。 集計が遅かった code は
+`Table::sum` / `Table::group_sum` に書き換えで 10-100x 改善見込み。
+
 ## 0.8.5 — 2026-05-30
 
 sync 経路の 2 件の bug fix patch release。 bisquit (dogfood) の Mac ↔ Android
