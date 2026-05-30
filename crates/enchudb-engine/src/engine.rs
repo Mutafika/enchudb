@@ -2246,6 +2246,13 @@ impl Engine {
         persist_tables_to_sidecar(&self.path, &self.tables)
     }
 
+    /// 0.8.7: DB ファイルパスを返す。 schema crate が schema sidecar
+    /// (`{path}.schema`) を atomic write するために必要。 memory-only
+    /// (= from_bytes) では空文字列。
+    pub fn db_path(&self) -> &str {
+        &self.path
+    }
+
     /// β-light step 7: 現 tables Vec を sidecar に保存する (best effort)。
     /// memory-only (from_bytes) や wasm では no-op。 path が空なら skip。
     /// 0.8.2: `defer_tables_persist` が立ってる時 (schema crate の build phase)
@@ -2322,6 +2329,40 @@ impl Engine {
     /// 未定義 table は None。
     pub fn table_eid_range(&self, name: &str) -> Option<(u32, u32)> {
         self.tables.iter().find(|t| t.name == name).map(|t| (t.eid_range_lo, t.eid_range_hi))
+    }
+
+    /// 0.8.7: 登録済 himo の総数。 schema crate の synthesize fallback (= engine 直
+    /// DB を `Database::open` した時の schema 復元) で iterate するために使う。
+    pub fn himo_count(&self) -> usize {
+        self.himo_names.len()
+    }
+
+    /// 0.8.7: index 直で himo の full name (= `{table}.{col}` or anonymous) を返す。
+    pub fn himo_name_at(&self, idx: usize) -> Option<&str> {
+        self.himo_names.get(idx).map(|s| s.as_str())
+    }
+
+    /// 0.8.7: index 直で himo の type (Tag/Number/Leaf/Ref) を返す。
+    pub fn himo_type_at(&self, idx: usize) -> Option<HimoType> {
+        self.himo_types.get(idx).copied()
+    }
+
+    /// 0.8.7: 指定 table の fk_refs を `(from_col_name, to_table_name)` ペアで返す
+    /// (= schema synthesize fallback で relation を復元する用)。 himo id → 名前、
+    /// table id → 名前を解決する。 未定義 table or fk_refs 空なら Vec::new()。
+    pub fn fk_refs_for_table_named(&self, table_name: &str) -> Vec<(String, String)> {
+        let Some(table) = self.tables.iter().find(|t| t.name == table_name) else {
+            return Vec::new();
+        };
+        let prefix = format!("{}.", table_name);
+        let mut out = Vec::with_capacity(table.fk_refs.len());
+        for &(hid, tid) in &table.fk_refs {
+            let Some(himo_full) = self.himo_names.get(hid as usize) else { continue; };
+            let from_col = himo_full.strip_prefix(&prefix).unwrap_or(himo_full).to_string();
+            let Some(target) = self.tables.get(tid as usize) else { continue; };
+            out.push((from_col, target.name.clone()));
+        }
+        out
     }
 
     /// 0.7.0: 指定 table 名が reserved table として既に存在するか。 schema crate

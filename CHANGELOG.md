@@ -3,6 +3,71 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.8.7 — 2026-05-30
+
+schema 永続化を **`.schema` sidecar に移行**、 0.6.x 以来の `schema_meta_entity`
+(= anonymous entity に blob を載せる方式) を撤去。 mlbpulse 等の engine 直構築
+DB を `Database::open` した時の panic を根治。 file format / wire format 完全
+不変、 **0.8.6 から再 build のみで上がれる**。
+
+### Fixed
+
+- **engine 直構築 DB を `Database::open` で開くと panic** (= mlbpulse の 4.5M
+  pitch DB で表面化): 旧実装は `__enchu_schema_meta__` marker himo の存在を
+  前提に `ensure_schema_entity` で `eng.entity()` (= anonymous) を呼んでいたが、
+  `define_table` 後 anonymous は close されており panic していた。
+  `.schema` sidecar に永続化方式を切替えることで marker 依存を撤廃、
+  engine 直 DB でも `.tables` + himo_types から fallback 復元できる
+- **schema 永続化が anonymous entity 経由だった構造問題**: 0.7.0 で table API
+  が engine 層に降り `.tables` sidecar 化された時点で本来撤去すべき残骸 (=
+  issue note "schema_meta_entity は 0.7.0 の名残") を解消
+
+### Added
+
+- **`.schema` sidecar** (= `{db_path}.schema`): schema 情報を tmp file → fsync →
+  rename で atomic write、 `Database::create` / `finish_*` / Drop で書き出し、
+  `Database::open` で読み込み。 PK / column type / relations を完全に持つ
+- **`Engine::db_path() -> &str`**: schema crate が sidecar path を組み立てる用
+- **`Engine::himo_count() / himo_name_at(idx) / himo_type_at(idx)`**: engine 直
+  DB からの schema synthesize fallback で iterate するための accessor
+- **`Engine::fk_refs_for_table_named(name)`**: relation 復元用 accessor
+
+### Changed (= 旧 API 全部内部撤去、 公開 API 不変)
+
+- `Database` struct から `marker_himo_id` / `schema_meta_entity` field 削除
+- `SCHEMA_META_HIMO` / `SCHEMA_BLOB_HIMO` / `SCHEMA_MARKER` 定数を `LEGACY_*`
+  にリネーム (= 0.8.6 以前で書かれた DB 読み込み path 専用)
+- `ensure_schema_entity` 削除 (= panic source 撤去)
+- `Database::create*` / `open*` / `wrap_concurrent` の `define_himo(SCHEMA_META_HIMO, ...)`
+  撤去
+- `TableBuilder::build` の eager `ensure_schema_entity()` 呼出撤去
+
+### Migration (= 自動)
+
+| 経路 | 動作 |
+|---|---|
+| 0.8.7 で新規作成 | `.schema` sidecar に保存 |
+| 0.8.6 以前で作成 → 0.8.7 で open | legacy blob 読み込み → 次 persist で `.schema` sidecar に migrate |
+| engine 直構築 → 0.8.7 で open | engine `.tables` + himo_types から fallback 復元 (= **PK は不明扱い**、 schema rebuild で upsert 可) |
+
+### Unchanged
+
+- file format / wire format / `WireRecord` encode / HLC / signature 完全不変
+- 0.8.6 で追加された Table::sum / group_sum / count_col API 不変
+- sidecar fsync coalesce (= 0.8.2) の挙動も不変
+
+### test
+
+- workspace 全体: **439 passed / 0 failed / 26 ignored** (= 0.8.6 比 +2)
+- 新規 `engine_built_db_open.rs` 2 件: engine 直 DB の Database::open / 新規 DB
+  の `.schema` sidecar 書き出し検証
+
+### 0.8.6 consumer 向け migration
+
+なし。 `cargo build` で 0.8.7 binary。 既存 DB は自動 migrate (= legacy blob
+読み込み → `.schema` sidecar 書き出し)。 mlbpulse のような engine 直 DB は
+fallback 復元で開けるようになる。
+
 ## 0.8.6 — 2026-05-30
 
 table-scoped 集計の primitive と schema API を整備、 vs DuckDB bench を

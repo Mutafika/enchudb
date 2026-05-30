@@ -65,13 +65,17 @@ use enchudb_engine::{Engine, HimoType};
 use enchudb_oplog::EntityId;
 use std::sync::Arc;
 
-// 内部 marker: schema 自身の persistence entity を識別するためだけに使う。
-// row 識別とは無関係 (= row tie / query cond には一切登場しない)。
-// table = 紐の束 declaration、 row 識別は column 名 prefix (`{table}.{col}` himo)
-// だけで足りる、 という設計が前提。
-const SCHEMA_META_HIMO: &str = "__enchu_schema_meta__";
-const SCHEMA_MARKER: &str = "__enchu_schema_v1__";
-const SCHEMA_BLOB_HIMO: &str = "__enchu_schema_blob";
+// 0.8.7: schema sidecar 拡張子。 `{db_path}.schema` で永続化。
+// 0.6.x までの schema_meta_entity (= anonymous entity に blob を載せる方式) は
+// `define_table` 後に anonymous が close されると panic する vestigial path
+// だったため撤去、 `.schema` sidecar に置き換えた (issue note: schema_meta_entity
+// は 0.7.0 の名残、 削除すべき)。 旧 DB 互換のため legacy blob 読み込み path も
+// 残してあり、 初回 open で `.schema` sidecar に migrate されて以降は新 path のみ。
+const SCHEMA_SIDECAR_EXT: &str = "schema";
+// legacy (= 0.6.x の blob entity) 互換読み込み path 用、 新規書き出しでは使わない。
+const LEGACY_SCHEMA_META_HIMO: &str = "__enchu_schema_meta__";
+const LEGACY_SCHEMA_MARKER: &str = "__enchu_schema_v1__";
+const LEGACY_SCHEMA_BLOB_HIMO: &str = "__enchu_schema_blob";
 
 /// 列の型。
 ///
@@ -206,13 +210,6 @@ impl TableInner {
 pub struct Database {
     eng: Arc<Engine>,
     tables: Vec<Arc<TableInner>>,
-    marker_himo_id: u16,
-    /// 0.7.0: schema blob を載せる anchor entity の cache。 「`define_table`
-    /// が呼ばれると anonymous が close → `entity()` が panic」 という engine
-    /// の挙動を避けるため、 Database 作成時に eager 予約 → 以降は cache を返す。
-    /// 既存 DB (anonymous 配下に schema_meta entity がある) も、 新規 DB も
-    /// 同じ path。 OnceLock で `&self` 経由でも 1 度だけ populate 可能。
-    schema_meta_entity: std::sync::OnceLock<EntityId>,
     /// true なら consumer thread が走ってる (concurrent モード、 &mut 不可)。
     is_concurrent: bool,
 }
@@ -222,13 +219,15 @@ impl Drop for Database {
         // single-thread モード (Arc 単一所有 + consumer なし) のみ自前で flush。
         // concurrent モードは consumer thread の shutdown sync に委ねる。
         //
-        // 0.8.2: schema blob の persist は build phase で coalesce してるので、
+        // 0.8.2: schema sidecar の persist は build phase で coalesce してるので、
         // finish_* を呼ばずに drop された path でも schema が disk に残るよう、
-        // ここで persist_schema を呼ぶ (= 内部で eng.flush も走る)。 finish_*
-        // 経由は ManuallyDrop で Drop が走らないので二重 persist にはならない。
-        // sidecar fsync 抑止も解除してから persist (= 通常モードで 1 回 fsync)。
+        // ここで persist_schema を呼ぶ。 finish_* 経由は ManuallyDrop で Drop が
+        // 走らないので二重 persist にはならない。
         // open_readonly Database は engine が read-only なので persist 不要 / 不可。
-        if !self.is_concurrent && !self.eng.is_readonly() {
+        // 0.8.7: tables 0 (= 空 Database が即 drop) の場合は sidecar 書き出しは
+        // skip (= 不必要な I/O を回避、 引いては growable backing で msync が
+        // SIGBUS する可能性も避ける)。
+        if !self.is_concurrent && !self.eng.is_readonly() && !self.tables.is_empty() {
             self.eng.set_defer_tables_persist(false);
             let _ = self.persist_schema();
         }
@@ -281,10 +280,6 @@ impl Database {
     }
 
     fn wrap_new(mut eng: Engine) -> Result<Self, SchemaError> {
-        eng.define_himo(SCHEMA_META_HIMO, HimoType::Tag, 0);
-        eng.define_himo(SCHEMA_BLOB_HIMO, HimoType::Tag, 0);
-        let marker_himo_id = eng.himo_id(SCHEMA_META_HIMO)
-            .ok_or_else(|| SchemaError::Internal("marker himo id".into()))? as u16;
         // 0.8.2: build phase の sidecar fsync を coalesce (= define_table /
         // define_himo_in が毎回呼ぶ try_persist_tables を no-op 化)。
         // finish_* / Drop で false に戻して 1 回 explicit fsync。
@@ -292,8 +287,6 @@ impl Database {
         Ok(Self {
             eng: Arc::new(eng),
             tables: Vec::new(),
-            marker_himo_id,
-            schema_meta_entity: std::sync::OnceLock::new(),
             is_concurrent: false,
         })
     }
@@ -302,21 +295,15 @@ impl Database {
     /// writer として開いていても並行 open 可能。 書き込み API は panic する。
     /// GUI の表示専用 process、 監視ツール等の用途。
     ///
-    /// 既存 DB (= marker himo が登録済み) が前提。 新規 DB に対して
-    /// open_readonly を呼ぶと marker himo が見つからず error になる。
+    /// 0.8.7: schema sidecar (`{path}.schema`) があれば PK / column type 含む
+    /// 完全な schema を復元。 sidecar が無い engine 直 DB (= mlbpulse のような
+    /// `Engine::define_table` 構築) でも、 engine の `.tables` sidecar + himo_types
+    /// から fallback 復元 (= PK は不明扱い、 column type は himo_type から推定)。
     pub fn open_readonly(path: &str) -> Result<Self, SchemaError> {
         let eng = Engine::open_readonly(path).map_err(|e| SchemaError::Io(e.to_string()))?;
-        // readonly では define_himo (= 書き込み) を呼ばない。 既存 DB なら
-        // marker himo は create 時に登録済みのはず。
-        let marker_himo_id = eng.himo_id(SCHEMA_META_HIMO)
-            .ok_or_else(|| SchemaError::Internal(
-                "marker himo not present — open_readonly requires a DB built via Database::create".into()
-            ))? as u16;
         let mut db = Self {
             eng: Arc::new(eng),
             tables: Vec::new(),
-            marker_himo_id,
-            schema_meta_entity: std::sync::OnceLock::new(),
             is_concurrent: false,
         };
         db.load_schema()?;
@@ -324,16 +311,10 @@ impl Database {
     }
 
     pub fn open(path: &str) -> Result<Self, SchemaError> {
-        let mut eng = Engine::open_standalone(path).map_err(|e| SchemaError::Io(e.to_string()))?;
-        eng.define_himo(SCHEMA_META_HIMO, HimoType::Tag, 0);
-        eng.define_himo(SCHEMA_BLOB_HIMO, HimoType::Tag, 0);
-        let marker_himo_id = eng.himo_id(SCHEMA_META_HIMO)
-            .ok_or_else(|| SchemaError::Internal("marker himo id".into()))? as u16;
+        let eng = Engine::open_standalone(path).map_err(|e| SchemaError::Io(e.to_string()))?;
         let mut db = Self {
             eng: Arc::new(eng),
             tables: Vec::new(),
-            marker_himo_id,
-            schema_meta_entity: std::sync::OnceLock::new(),
             is_concurrent: false,
         };
         db.load_schema()?;
@@ -351,22 +332,11 @@ impl Database {
     }
 
     fn wrap_concurrent(arc_eng: Arc<Engine>) -> Result<Arc<Self>, SchemaError> {
-        // marker / schema blob himo は再 open 時に engine が既に保持 (recover 済み)。
-        // ただし新規 DB なら未定義の可能性があるので、 Arc::get_mut で初回だけ define。
-        // open_concurrent_with_oplog 後の Arc count = 1 (consumer は raw ptr で保持)。
-        let marker_himo_id = match arc_eng.himo_id(SCHEMA_META_HIMO) {
-            Some(idx) => idx as u16,
-            None => {
-                return Err(SchemaError::Internal(
-                    "marker himo not present — open_with_oplog expects a DB built via Database::create / finish_with_oplog".into()
-                ));
-            }
-        };
+        // 0.8.7: schema sidecar / engine `.tables` から復元 (= marker himo は不要)。
+        // mlbpulse のような engine 直構築 DB でも fallback 復元できる。
         let mut db = Self {
             eng: arc_eng,
             tables: Vec::new(),
-            marker_himo_id,
-            schema_meta_entity: std::sync::OnceLock::new(),
             is_concurrent: true,
         };
         db.load_schema()?;
@@ -381,20 +351,18 @@ impl Database {
     /// もしくは WAL ファイル作成 / consumer 起動が失敗。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn finish_with_oplog(mut self, oplog_capacity: usize) -> Result<Arc<Self>, SchemaError> {
-        // 0.8.2: schema blob を build phase で coalesce してるので、 ここで
+        // 0.8.2: schema sidecar を build phase で coalesce してるので、 ここで
         // 1 度だけ persist する (= N table 分の fsync を 1 回に圧縮)。
-        // sidecar fsync 抑止も解除して persist_schema -> eng.flush 経由で
-        // try_persist_tables が走るようにする。
+        // engine 側の sidecar fsync 抑止も解除して persist_schema -> eng.flush
+        // 経由で try_persist_tables が走るようにする。
         self.eng.set_defer_tables_persist(false);
         self.persist_schema()?;
-        let (eng, tables, marker_himo_id) = self.into_parts()?;
+        let (eng, tables) = self.into_parts()?;
         let arc_eng = Engine::concurrentize_with_oplog(eng, oplog_capacity)
             .map_err(|e| SchemaError::Io(e.to_string()))?;
         Ok(Arc::new(Self {
             eng: arc_eng,
             tables,
-            marker_himo_id,
-            schema_meta_entity: std::sync::OnceLock::new(),
             is_concurrent: true,
         }))
     }
@@ -403,23 +371,21 @@ impl Database {
     /// crash consistency 不要 (cache / 揮発 store) なケース向け。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn finish_concurrent(mut self) -> Result<Arc<Self>, SchemaError> {
-        // 0.8.2: build phase で coalesce した schema blob を 1 度 persist。
+        // 0.8.2: build phase で coalesce した schema sidecar を 1 度 persist。
         self.eng.set_defer_tables_persist(false);
         self.persist_schema()?;
-        let (eng, tables, marker_himo_id) = self.into_parts()?;
+        let (eng, tables) = self.into_parts()?;
         let arc_eng = Engine::concurrentize(eng);
         Ok(Arc::new(Self {
             eng: arc_eng,
             tables,
-            marker_himo_id,
-            schema_meta_entity: std::sync::OnceLock::new(),
             is_concurrent: true,
         }))
     }
 
     /// `self.eng` から `Engine` を取り出す helper (Arc count = 1 が前提)。
     /// `ManuallyDrop` 経由でフィールドを steal、 Database の Drop は走らない。
-    fn into_parts(self) -> Result<(Engine, Vec<Arc<TableInner>>, u16), SchemaError> {
+    fn into_parts(self) -> Result<(Engine, Vec<Arc<TableInner>>), SchemaError> {
         use std::mem::ManuallyDrop;
         let mut me = ManuallyDrop::new(self);
         // 1 度 flush して mmap を sync (concurrent 化前の最終状態を確定)
@@ -435,11 +401,10 @@ impl Database {
         // 後で drop されず leak しない (フィールドは個別に管理)。
         let eng_arc = unsafe { std::ptr::read(&me.eng) };
         let tables = unsafe { std::ptr::read(&me.tables) };
-        let marker_himo_id = me.marker_himo_id;
         let eng = Arc::try_unwrap(eng_arc).map_err(|_| {
             SchemaError::Internal("unexpected Arc strong_count > 1 after get_mut succeeded".into())
         })?;
-        Ok((eng, tables, marker_himo_id))
+        Ok((eng, tables))
     }
 
     pub fn engine(&self) -> &Engine { &self.eng }
@@ -601,12 +566,18 @@ impl Database {
             .cloned()
     }
 
-    // ────── schema 永続化 ──────
+    // ────── schema 永続化 (0.8.7: `.schema` sidecar file) ──────
 
+    /// schema 情報 (= table 名 + column 型 + PK + relations) を `{path}.schema`
+    /// sidecar に atomic write。 旧 blob entity 経路は撤去済 (= anonymous closed
+    /// panic 問題の根治、 issue note "schema_meta_entity は 0.7.0 の名残")。
     fn persist_schema(&mut self) -> Result<(), SchemaError> {
-        let eid = self.ensure_schema_entity();
-        let blob = serialize_schema(&self.tables);
-        self.eng.content(eid, SCHEMA_BLOB_HIMO, blob.as_bytes());
+        let path = self.eng.db_path().to_string();
+        if !path.is_empty() {
+            persist_schema_to_sidecar(&path, &self.tables)
+                .map_err(|e| SchemaError::Io(e.to_string()))?;
+        }
+        // engine 本体 (= body + `.tables` sidecar) も flush。
         // flush は build phase (Arc 単一所有) でのみ可能。 concurrent 後は
         // consumer thread が背景 fsync するので skip。
         if let Some(eng_mut) = Arc::get_mut(&mut self.eng) {
@@ -615,47 +586,23 @@ impl Database {
         Ok(())
     }
 
-    /// schema blob を保存する anchor entity を返す。 cache hit が普通の path、
-    /// cache miss は (1) wrap_new 直後の初回 (= 既存 marker なし、 entity 新規払出)、
-    /// (2) open 直後 (= 既存 marker あり、 既存 entity を検出して cache)。
-    ///
-    /// 0.7.0: `define_table` 後に呼ばれても entity() を呼ばないので panic しない。
-    /// (= define_table 前に persist_schema / load_schema 経路で 1 度走って cache 済み)
-    fn ensure_schema_entity(&self) -> EntityId {
-        if let Some(&eid) = self.schema_meta_entity.get() {
-            return eid;
-        }
-        self.eng.rebuild();
-        if let Some(vid) = self.eng.vocab_id(SCHEMA_MARKER) {
-            let eids = self.eng.pull_raw(SCHEMA_META_HIMO, vid);
-            if let Some(&eid) = eids.first() {
-                let _ = self.schema_meta_entity.set(eid);
-                return eid;
-            }
-        }
-        // 新規 (anonymous 開いてる前提、 = TableBuilder::build より前)。
-        // marker himo は wrap_new / open / open_with_oplog で必ず define 済み。
-        // tie_text_to は &self なので Arc<Engine> でも呼べる。
-        let eid = self.eng.entity();
-        self.eng.tie_text_to(eid, SCHEMA_META_HIMO, SCHEMA_MARKER);
-        let _ = self.schema_meta_entity.set(eid);
-        eid
-    }
-
     fn load_schema(&mut self) -> Result<(), SchemaError> {
-        let Some(vid) = self.eng.vocab_id(SCHEMA_MARKER) else { return Ok(()); };
-        self.eng.rebuild();
-        let eids = self.eng.pull_raw(SCHEMA_META_HIMO, vid);
-        let Some(&eid) = eids.first() else { return Ok(()); };
-        // schema_meta_entity を cache (= ensure_schema_entity を後で呼んでも entity() しない)
-        let _ = self.schema_meta_entity.set(eid);
-        let blob = match self.eng.get_content(eid, SCHEMA_BLOB_HIMO) {
-            Some(b) => b.to_vec(),
-            None => return Ok(()),
+        let path = self.eng.db_path().to_string();
+        // 1. `.schema` sidecar (= 0.8.7 以降の正規 path) を試す
+        let mut parsed_opt: Option<Vec<RawTableDef>> = if !path.is_empty() {
+            load_schema_from_sidecar(&path).map_err(|e| SchemaError::Io(e.to_string()))?
+        } else {
+            None
         };
-        let s = std::str::from_utf8(&blob)
-            .map_err(|_| SchemaError::Parse("schema blob not utf8".into()))?;
-        let parsed = deserialize_schema(s)?;
+        // 2. fallback: 旧 blob entity (= 0.6.x ~ 0.8.6 で書かれた DB)
+        if parsed_opt.is_none() {
+            parsed_opt = self.load_schema_from_legacy_blob()?;
+        }
+        // 3. fallback: engine `.tables` + himo_types (= mlbpulse 等の engine 直 DB)
+        if parsed_opt.is_none() {
+            parsed_opt = self.synthesize_schema_from_engine()?;
+        }
+        let parsed = parsed_opt.unwrap_or_default();
 
         // 0.7.0: 各 table を engine table API で再 define。 既存 `.tables` sidecar
         // に存在すれば idempotent (= define_table が "already exists" を返す)、
@@ -735,6 +682,133 @@ impl Database {
     /// `entity()` が panic するので使えない。 engine の直接 vocab API に置換。
     fn intern_table_name(&self, name: &str) -> u32 {
         self.eng.vocab_intern_text(name)
+    }
+
+    /// 0.8.7: legacy blob entity 経路 (= 0.6.x ~ 0.8.6 で書かれた DB の互換読み)。
+    /// 旧 marker himo (`__enchu_schema_meta__` / `__enchu_schema_v1__`) を engine から
+    /// 探して blob を読む。 見つかれば parsed schema を返す、 marker / blob いずれか
+    /// 欠落していれば None。 新規 DB の初回 open は marker himo 自体が無いので即 None。
+    /// 0.8.7 以降の DB は `.schema` sidecar に移行済なので本 path は使わない。
+    fn load_schema_from_legacy_blob(&self) -> Result<Option<Vec<RawTableDef>>, SchemaError> {
+        // 旧 marker himo は engine の himo register に居ないと vocab_id も解決できない。
+        if self.eng.himo_id(LEGACY_SCHEMA_META_HIMO).is_none() {
+            return Ok(None);
+        }
+        let Some(vid) = self.eng.vocab_id(LEGACY_SCHEMA_MARKER) else { return Ok(None); };
+        self.eng.rebuild();
+        let eids = self.eng.pull_raw(LEGACY_SCHEMA_META_HIMO, vid);
+        let Some(&eid) = eids.first() else { return Ok(None); };
+        let Some(blob) = self.eng.get_content(eid, LEGACY_SCHEMA_BLOB_HIMO) else { return Ok(None); };
+        let s = std::str::from_utf8(blob)
+            .map_err(|_| SchemaError::Parse("legacy schema blob not utf8".into()))?;
+        let parsed = deserialize_schema(s)?;
+        Ok(Some(parsed))
+    }
+
+    /// 0.8.7: engine `.tables` sidecar + himo_types から synthetic な RawTableDef を
+    /// 組み立てる fallback。 schema sidecar も legacy blob も無い engine 直構築 DB
+    /// (= mlbpulse の 4.5M pitch DB 等) を query 可能にするための path。
+    ///
+    /// 復元できる情報: table 名、 column 名 (= himo full name の `.` 後)、 column type
+    /// (= engine の himo_type)、 relations (= engine の fk_refs)。
+    /// 復元できない: PK (= sidecar に持たないので None 扱い)。 upsert したい場合は
+    /// 0.9 で sidecar 拡張 or schema rebuild が要る。
+    fn synthesize_schema_from_engine(&self) -> Result<Option<Vec<RawTableDef>>, SchemaError> {
+        let tables_info = self.eng.list_user_tables();
+        if tables_info.is_empty() {
+            return Ok(None);
+        }
+        let himo_count = self.eng.himo_count();
+        let mut out: Vec<RawTableDef> = Vec::with_capacity(tables_info.len());
+        for (_tid, name, _lo, _hi) in tables_info {
+            let prefix = format!("{}.", name);
+            // engine 側の全 himo を walk して、 prefix が一致するものを column として拾う
+            let mut cols: Vec<(String, ColumnType)> = Vec::new();
+            for hid_idx in 0..himo_count {
+                let Some(himo_name) = self.eng.himo_name_at(hid_idx) else { continue; };
+                let Some(col_name) = himo_name.strip_prefix(&prefix) else { continue; };
+                let Some(htype) = self.eng.himo_type_at(hid_idx) else { continue; };
+                let ty = match htype {
+                    HimoType::Number => ColumnType::Number,
+                    HimoType::Tag => ColumnType::Tag,
+                    HimoType::Leaf => ColumnType::Leaf,
+                    HimoType::Ref => ColumnType::Ref,
+                };
+                cols.push((col_name.to_string(), ty));
+            }
+            // relations は engine の fk_refs (= (child_himo_id, parent_table_id)) から復元
+            let relations = self.eng.fk_refs_for_table_named(&name);
+            out.push(RawTableDef {
+                name,
+                cols,
+                pk: None,
+                relations,
+            });
+        }
+        Ok(Some(out))
+    }
+}
+
+/// 0.8.7: `.schema` sidecar の path を返す。
+#[cfg(not(target_arch = "wasm32"))]
+fn schema_sidecar_path_for(db_path: &str) -> std::path::PathBuf {
+    let mut p = std::path::PathBuf::from(db_path);
+    let ext = match p.extension() {
+        Some(e) => format!("{}.{}", e.to_string_lossy(), SCHEMA_SIDECAR_EXT),
+        None => SCHEMA_SIDECAR_EXT.to_string(),
+    };
+    p.set_extension(ext);
+    p
+}
+
+/// 0.8.7: tables の serialize_schema 出力を `.schema` sidecar に atomic write。
+/// tmp file → fsync → rename で crash-safe。
+#[cfg(not(target_arch = "wasm32"))]
+fn persist_schema_to_sidecar(
+    db_path: &str,
+    tables: &[Arc<TableInner>],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let sidecar = schema_sidecar_path_for(db_path);
+    let tmp = sidecar.with_extension(format!(
+        "{}.tmp",
+        sidecar
+            .extension()
+            .map(|e| e.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
+    let bytes = serialize_schema(tables);
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(bytes.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &sidecar)?;
+    Ok(())
+}
+
+/// 0.8.7: `.schema` sidecar を読む。 不在は Ok(None)、 parse 失敗は Err。
+#[cfg(not(target_arch = "wasm32"))]
+fn load_schema_from_sidecar(db_path: &str) -> std::io::Result<Option<Vec<RawTableDef>>> {
+    let sidecar = schema_sidecar_path_for(db_path);
+    match std::fs::read(&sidecar) {
+        Ok(bytes) => {
+            let s = std::str::from_utf8(&bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let parsed = deserialize_schema(s).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("schema sidecar parse: {:?}", e),
+                )
+            })?;
+            Ok(Some(parsed))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -904,10 +978,9 @@ impl<'a> TableBuilder<'a> {
             }
         }
 
-        // 0.7.0: schema_meta_entity を eager 予約 (= 後で persist_schema が
-        // entity() を呼ばないように)。 define_table 前に anonymous で確保。
-        let _ = db.ensure_schema_entity();
-        // table_vid (= 名前を vocab に inject) も define_table 前に。 これは
+        // 0.8.7: schema_meta_entity の eager 予約は撤去 (= `.schema` sidecar に
+        // 移行したので anonymous entity を確保する必要が無くなった)。
+        // table_vid (= 名前を vocab に inject) は define_table 前に。 これは
         // entity 経路を一切触らないので順序自由だが、 ここで一括済ませる。
         let table_vid = db.intern_table_name(&name);
 
