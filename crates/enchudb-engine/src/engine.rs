@@ -3278,6 +3278,186 @@ impl Engine {
         n
     }
 
+    /// 0.8.8: himo の `[lo, hi)` eid 範囲の最小値を column 直 scan で求める。
+    /// stored 形式: 0 = missing → skip、 stored > 0 のとき値 = stored - 1。
+    /// 全 missing なら None。 schema 層の `Table::min(col)` の internal primitive。
+    pub fn min_range(&self, himo: &str, lo: u32, hi: u32) -> Option<u32> {
+        let hid = self.himo_id(himo)?;
+        let hs = &self.himos[hid];
+        let values = hs.stored_slice();
+        let lo = lo as usize;
+        let hi = (hi as usize).min(values.len());
+        if lo >= hi { return None; }
+        // 最小 stored (1 以上) を探す。 0 (missing) は無視。
+        let mut best: u32 = u32::MAX;
+        let mut hit: bool = false;
+        for &stored in &values[lo..hi] {
+            if stored != 0 {
+                hit = true;
+                if stored < best { best = stored; }
+            }
+        }
+        if hit { Some(best - 1) } else { None }
+    }
+
+    /// 0.8.8: himo の `[lo, hi)` eid 範囲の最大値を column 直 scan で求める。
+    /// 全 missing なら None。 schema 層の `Table::max(col)` の internal primitive。
+    pub fn max_range(&self, himo: &str, lo: u32, hi: u32) -> Option<u32> {
+        let hid = self.himo_id(himo)?;
+        let hs = &self.himos[hid];
+        let values = hs.stored_slice();
+        let lo = lo as usize;
+        let hi = (hi as usize).min(values.len());
+        if lo >= hi { return None; }
+        let mut best: u32 = 0;
+        let mut hit: bool = false;
+        for &stored in &values[lo..hi] {
+            // stored > 0 のとき必ず best (== 0 含む) より大きくなりうる、 単純比較で OK。
+            if stored > best { best = stored; hit = true; }
+        }
+        if hit { Some(best - 1) } else { None }
+    }
+
+    /// 0.8.8: `[lo, hi)` eid 範囲を 2 column lockstep scan して group_min。
+    /// schema 層の `Table::group_min(group, val)` の internal primitive。
+    /// `group_sum_range` と同じ dense / sparse 切替。
+    pub fn group_min_range(
+        &self,
+        group_himo: &str,
+        val_himo: &str,
+        lo: u32,
+        hi: u32,
+    ) -> Vec<(u32, u32)> {
+        let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
+        let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
+        let gs = &self.himos[gid];
+        let vs = &self.himos[vid];
+        let groups = gs.stored_slice();
+        let vals = vs.stored_slice();
+        let lo = lo as usize;
+        let hi = (hi as usize).min(groups.len()).min(vals.len());
+        if lo >= hi { return vec![]; }
+
+        if let Some(cap) = self.group_dense_cap(gid) {
+            // 値 0 は valid (stored=1 を引いた値) なので、 mins[g] != u32::MAX を
+            // 「データ有り」の代用にする。 stored で持ったまま比較すれば mins init=u32::MAX
+            // のときは必ず上書きされる (= seen tracking 不要)。
+            let mut mins_stored: Vec<u32> = vec![u32::MAX; cap];
+            for i in lo..hi {
+                let g_stored = groups[i];
+                let v_stored = vals[i];
+                if g_stored == 0 || v_stored == 0 { continue; }
+                let g = (g_stored - 1) as usize;
+                if g < cap && v_stored < mins_stored[g] {
+                    mins_stored[g] = v_stored;
+                }
+            }
+            (0..cap).filter(|&i| mins_stored[i] != u32::MAX)
+                .map(|i| (i as u32, mins_stored[i] - 1)).collect()
+        } else {
+            let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+            for i in lo..hi {
+                let g_stored = groups[i];
+                let v_stored = vals[i];
+                if g_stored == 0 || v_stored == 0 { continue; }
+                let g = g_stored - 1;
+                let entry = map.entry(g).or_insert(u32::MAX);
+                if v_stored < *entry { *entry = v_stored; }
+            }
+            map.into_iter().map(|(g, v_stored)| (g, v_stored - 1)).collect()
+        }
+    }
+
+    /// 0.8.8: `[lo, hi)` eid 範囲を 2 column lockstep scan して group_max。
+    /// schema 層の `Table::group_max(group, val)` の internal primitive。
+    pub fn group_max_range(
+        &self,
+        group_himo: &str,
+        val_himo: &str,
+        lo: u32,
+        hi: u32,
+    ) -> Vec<(u32, u32)> {
+        let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
+        let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
+        let gs = &self.himos[gid];
+        let vs = &self.himos[vid];
+        let groups = gs.stored_slice();
+        let vals = vs.stored_slice();
+        let lo = lo as usize;
+        let hi = (hi as usize).min(groups.len()).min(vals.len());
+        if lo >= hi { return vec![]; }
+
+        if let Some(cap) = self.group_dense_cap(gid) {
+            // maxs_stored の init = 0 (== missing 扱い)。 stored > 0 を見たら必ず
+            // 上書きされるので、 結果 filter で maxs_stored > 0 を有効データ判定。
+            let mut maxs_stored: Vec<u32> = vec![0; cap];
+            for i in lo..hi {
+                let g_stored = groups[i];
+                let v_stored = vals[i];
+                if g_stored == 0 || v_stored == 0 { continue; }
+                let g = (g_stored - 1) as usize;
+                if g < cap && v_stored > maxs_stored[g] {
+                    maxs_stored[g] = v_stored;
+                }
+            }
+            (0..cap).filter(|&i| maxs_stored[i] != 0)
+                .map(|i| (i as u32, maxs_stored[i] - 1)).collect()
+        } else {
+            let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+            for i in lo..hi {
+                let g_stored = groups[i];
+                let v_stored = vals[i];
+                if g_stored == 0 || v_stored == 0 { continue; }
+                let g = g_stored - 1;
+                let entry = map.entry(g).or_insert(0);
+                if v_stored > *entry { *entry = v_stored; }
+            }
+            map.into_iter().map(|(g, v_stored)| (g, v_stored - 1)).collect()
+        }
+    }
+
+    /// 0.8.8: `[lo, hi)` eid 範囲を column 直 scan して、 値域 `[vmin, vmax]` を
+    /// `n_buckets` 等分した頻度ヒストグラムを返す。 値が `[vmin, vmax]` 外の
+    /// entity はカウントされない (= clipping ではなく drop)。
+    ///
+    /// `n_buckets == 0` または `vmin > vmax` の場合は空 Vec。 戻り値長は
+    /// `n_buckets` で固定 (= bucket 0 件でも 0 で埋める)。
+    ///
+    /// bucket index は `((val - vmin) * n_buckets) / (vmax - vmin + 1)`
+    /// (= floor division で 0..n_buckets に均等割当)。
+    pub fn histogram_range(
+        &self,
+        himo: &str,
+        lo: u32,
+        hi: u32,
+        vmin: u32,
+        vmax: u32,
+        n_buckets: u32,
+    ) -> Vec<u32> {
+        if n_buckets == 0 || vmin > vmax { return vec![]; }
+        let hid = match self.himo_id(himo) { Some(h) => h, None => return vec![0; n_buckets as usize] };
+        let hs = &self.himos[hid];
+        let values = hs.stored_slice();
+        let lo = lo as usize;
+        let hi = (hi as usize).min(values.len());
+        let n = n_buckets as usize;
+        let mut hist: Vec<u32> = vec![0; n];
+        if lo >= hi { return hist; }
+        // 値空間幅 (両端含む、 vmin == vmax のときは 1)
+        let span = (vmax as u64 - vmin as u64) + 1;
+        let n_u64 = n_buckets as u64;
+        for &stored in &values[lo..hi] {
+            if stored == 0 { continue; }
+            let val = stored - 1;
+            if val < vmin || val > vmax { continue; }
+            // (val - vmin) * n / span。 span >= 1、 val - vmin < span を保証してる
+            // ので idx < n は厳密に成り立つ (= bound check 不要だが safety で min)。
+            let idx = (((val - vmin) as u64) * n_u64 / span) as usize;
+            hist[idx.min(n - 1)] += 1;
+        }
+        hist
+    }
+
     /// 最小値
     pub fn min(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u32> {
         let hid = self.himo_id(himo)?;
