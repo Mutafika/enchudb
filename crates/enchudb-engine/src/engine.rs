@@ -3458,6 +3458,388 @@ impl Engine {
         hist
     }
 
+    // ──── 0.8.9 (#39): bulk column scan の rayon 並列化 ────
+    //
+    // 既存 `_range` 系を **`_par` suffix で並列版** として複製。 callsite で
+    // 「並列で OK (= 大規模 read-only scan)」 と分かってる場面に明示利用させる。
+    // 閾値 `PAR_RANGE_THRESHOLD` (= 64k 要素) 以下では seq fallback、
+    // thread overhead が利益を上回らないため。
+    //
+    // 並列化は `par_chunks(CHUNK_SIZE)` 経由で値 slice を区切り、 各 chunk で
+    // 局所 accumulator を計算 → `reduce` で合算。 HimoStore は内部に
+    // `RwLock<BucketCylinder>` を持つが、 ここで触る `stored_slice` は
+    // immutable な mmap view (= read 中は lock 不要) なので thread-safe。
+
+    /// 並列化閾値。 これ未満の `[lo, hi)` 幅では seq fallback (= thread spawn
+    /// overhead が利益を上回らない、 実測ベースで 64k 程度が境界)。
+    const PAR_RANGE_THRESHOLD: usize = 64_000;
+
+    /// chunk 粒度。 16k 要素 = 64KB (u32 として)、 L2 cache friendly。
+    const PAR_RANGE_CHUNK: usize = 16_384;
+
+    /// 0.8.9: `sum_range` の並列版。 chunk ごとに local sum を計算 → reduce。
+    /// 閾値以下は seq fallback。 12M row scan で seq 1.95s → par ~600ms 程度
+    /// (= 4 thread / M2 Max 想定)。
+    pub fn sum_range_par(&self, himo: &str, lo: u32, hi: u32) -> u64 {
+        use rayon::prelude::*;
+        let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
+        let hs = &self.himos[hid];
+        let values = hs.stored_slice();
+        let lo_u = lo as usize;
+        let hi_u = (hi as usize).min(values.len());
+        if lo_u >= hi_u { return 0; }
+        if hi_u - lo_u < Self::PAR_RANGE_THRESHOLD {
+            return self.sum_range(himo, lo, hi);
+        }
+        values[lo_u..hi_u]
+            .par_chunks(Self::PAR_RANGE_CHUNK)
+            .map(|chunk| {
+                let mut total: u64 = 0;
+                for &stored in chunk {
+                    total += stored.saturating_sub(1) as u64;
+                }
+                total
+            })
+            .sum()
+    }
+
+    /// 0.8.9: `count_range` の並列版。
+    pub fn count_range_par(&self, himo: &str, lo: u32, hi: u32) -> u32 {
+        use rayon::prelude::*;
+        let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
+        let hs = &self.himos[hid];
+        let values = hs.stored_slice();
+        let lo_u = lo as usize;
+        let hi_u = (hi as usize).min(values.len());
+        if lo_u >= hi_u { return 0; }
+        if hi_u - lo_u < Self::PAR_RANGE_THRESHOLD {
+            return self.count_range(himo, lo, hi);
+        }
+        values[lo_u..hi_u]
+            .par_chunks(Self::PAR_RANGE_CHUNK)
+            .map(|chunk| {
+                let mut n: u32 = 0;
+                for &stored in chunk {
+                    n += (stored != 0) as u32;
+                }
+                n
+            })
+            .sum()
+    }
+
+    /// 0.8.9: `min_range` の並列版。 各 chunk で local min を取り、 全 chunk を
+    /// reduce で min 結合。 全 missing なら None。
+    pub fn min_range_par(&self, himo: &str, lo: u32, hi: u32) -> Option<u32> {
+        use rayon::prelude::*;
+        let hid = self.himo_id(himo)?;
+        let hs = &self.himos[hid];
+        let values = hs.stored_slice();
+        let lo_u = lo as usize;
+        let hi_u = (hi as usize).min(values.len());
+        if lo_u >= hi_u { return None; }
+        if hi_u - lo_u < Self::PAR_RANGE_THRESHOLD {
+            return self.min_range(himo, lo, hi);
+        }
+        // chunk 内で None / Some(best_stored) を返し、 reduce で min 結合。
+        let result = values[lo_u..hi_u]
+            .par_chunks(Self::PAR_RANGE_CHUNK)
+            .map(|chunk| {
+                let mut best: u32 = u32::MAX;
+                let mut hit = false;
+                for &stored in chunk {
+                    if stored != 0 {
+                        hit = true;
+                        if stored < best { best = stored; }
+                    }
+                }
+                if hit { Some(best) } else { None }
+            })
+            .reduce(|| None, |a, b| match (a, b) {
+                (None, x) | (x, None) => x,
+                (Some(x), Some(y)) => Some(x.min(y)),
+            });
+        result.map(|stored| stored - 1)
+    }
+
+    /// 0.8.9: `max_range` の並列版。
+    pub fn max_range_par(&self, himo: &str, lo: u32, hi: u32) -> Option<u32> {
+        use rayon::prelude::*;
+        let hid = self.himo_id(himo)?;
+        let hs = &self.himos[hid];
+        let values = hs.stored_slice();
+        let lo_u = lo as usize;
+        let hi_u = (hi as usize).min(values.len());
+        if lo_u >= hi_u { return None; }
+        if hi_u - lo_u < Self::PAR_RANGE_THRESHOLD {
+            return self.max_range(himo, lo, hi);
+        }
+        let result = values[lo_u..hi_u]
+            .par_chunks(Self::PAR_RANGE_CHUNK)
+            .map(|chunk| {
+                let mut best: u32 = 0;
+                for &stored in chunk {
+                    if stored > best { best = stored; }
+                }
+                if best > 0 { Some(best) } else { None }
+            })
+            .reduce(|| None, |a, b| match (a, b) {
+                (None, x) | (x, None) => x,
+                (Some(x), Some(y)) => Some(x.max(y)),
+            });
+        result.map(|stored| stored - 1)
+    }
+
+    /// 0.8.9: `group_sum_range` の並列版。 dense path のみ並列化、 sparse
+    /// (= HashMap merge コスト高) は seq fallback。 chunk ごとに thread-local
+    /// `Vec<u64>` を持って scatter add → reduce で要素ごと加算。
+    pub fn group_sum_range_par(
+        &self,
+        group_himo: &str,
+        sum_himo: &str,
+        lo: u32,
+        hi: u32,
+    ) -> Vec<(u32, u64)> {
+        use rayon::prelude::*;
+        let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
+        let sid = match self.himo_id(sum_himo) { Some(h) => h, None => return vec![] };
+        let gs = &self.himos[gid];
+        let ss = &self.himos[sid];
+        let groups = gs.stored_slice();
+        let sums = ss.stored_slice();
+        let lo_u = lo as usize;
+        let hi_u = (hi as usize).min(groups.len()).min(sums.len());
+        if lo_u >= hi_u { return vec![]; }
+        if hi_u - lo_u < Self::PAR_RANGE_THRESHOLD {
+            return self.group_sum_range(group_himo, sum_himo, lo, hi);
+        }
+        let Some(cap) = self.group_dense_cap(gid) else {
+            // sparse は HashMap merge が重いので seq に fallback
+            return self.group_sum_range(group_himo, sum_himo, lo, hi);
+        };
+        // chunk 範囲は groups / sums の lo..hi を index 同期で zip するため、
+        // index 列を slice しないと indexes が ずれる。 zip 後の slice を chunk する。
+        // ただし par_chunks_exact は zip slice を受け付けないので、 chunked range
+        // を loop してから内部で indexing する形に。
+        let chunk = Self::PAR_RANGE_CHUNK;
+        let n = hi_u - lo_u;
+        let n_chunks = (n + chunk - 1) / chunk;
+        let result: Vec<u64> = (0..n_chunks)
+            .into_par_iter()
+            .map(|ci| {
+                let s = lo_u + ci * chunk;
+                let e = (s + chunk).min(hi_u);
+                let mut acc: Vec<u64> = vec![0; cap];
+                for i in s..e {
+                    let g_stored = groups[i];
+                    let v_stored = sums[i];
+                    if g_stored == 0 || v_stored == 0 { continue; }
+                    let g = (g_stored - 1) as usize;
+                    if g < cap {
+                        acc[g] += (v_stored - 1) as u64;
+                    }
+                }
+                acc
+            })
+            .reduce(|| vec![0u64; cap], |mut a, b| {
+                for (i, &v) in b.iter().enumerate() { a[i] += v; }
+                a
+            });
+        (0..cap).filter(|&i| result[i] > 0).map(|i| (i as u32, result[i])).collect()
+    }
+
+    /// 0.8.9: `group_min_range` の並列版。 dense path のみ。
+    pub fn group_min_range_par(
+        &self,
+        group_himo: &str,
+        val_himo: &str,
+        lo: u32,
+        hi: u32,
+    ) -> Vec<(u32, u32)> {
+        use rayon::prelude::*;
+        let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
+        let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
+        let gs = &self.himos[gid];
+        let vs = &self.himos[vid];
+        let groups = gs.stored_slice();
+        let vals = vs.stored_slice();
+        let lo_u = lo as usize;
+        let hi_u = (hi as usize).min(groups.len()).min(vals.len());
+        if lo_u >= hi_u { return vec![]; }
+        if hi_u - lo_u < Self::PAR_RANGE_THRESHOLD {
+            return self.group_min_range(group_himo, val_himo, lo, hi);
+        }
+        let Some(cap) = self.group_dense_cap(gid) else {
+            return self.group_min_range(group_himo, val_himo, lo, hi);
+        };
+        let chunk = Self::PAR_RANGE_CHUNK;
+        let n = hi_u - lo_u;
+        let n_chunks = (n + chunk - 1) / chunk;
+        let result: Vec<u32> = (0..n_chunks)
+            .into_par_iter()
+            .map(|ci| {
+                let s = lo_u + ci * chunk;
+                let e = (s + chunk).min(hi_u);
+                let mut mins: Vec<u32> = vec![u32::MAX; cap];
+                for i in s..e {
+                    let g_stored = groups[i];
+                    let v_stored = vals[i];
+                    if g_stored == 0 || v_stored == 0 { continue; }
+                    let g = (g_stored - 1) as usize;
+                    if g < cap && v_stored < mins[g] {
+                        mins[g] = v_stored;
+                    }
+                }
+                mins
+            })
+            .reduce(|| vec![u32::MAX; cap], |mut a, b| {
+                for (i, &v) in b.iter().enumerate() {
+                    if v < a[i] { a[i] = v; }
+                }
+                a
+            });
+        (0..cap).filter(|&i| result[i] != u32::MAX)
+            .map(|i| (i as u32, result[i] - 1)).collect()
+    }
+
+    /// 0.8.9: `group_max_range` の並列版。 dense path のみ。
+    pub fn group_max_range_par(
+        &self,
+        group_himo: &str,
+        val_himo: &str,
+        lo: u32,
+        hi: u32,
+    ) -> Vec<(u32, u32)> {
+        use rayon::prelude::*;
+        let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
+        let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
+        let gs = &self.himos[gid];
+        let vs = &self.himos[vid];
+        let groups = gs.stored_slice();
+        let vals = vs.stored_slice();
+        let lo_u = lo as usize;
+        let hi_u = (hi as usize).min(groups.len()).min(vals.len());
+        if lo_u >= hi_u { return vec![]; }
+        if hi_u - lo_u < Self::PAR_RANGE_THRESHOLD {
+            return self.group_max_range(group_himo, val_himo, lo, hi);
+        }
+        let Some(cap) = self.group_dense_cap(gid) else {
+            return self.group_max_range(group_himo, val_himo, lo, hi);
+        };
+        let chunk = Self::PAR_RANGE_CHUNK;
+        let n = hi_u - lo_u;
+        let n_chunks = (n + chunk - 1) / chunk;
+        let result: Vec<u32> = (0..n_chunks)
+            .into_par_iter()
+            .map(|ci| {
+                let s = lo_u + ci * chunk;
+                let e = (s + chunk).min(hi_u);
+                let mut maxs: Vec<u32> = vec![0; cap];
+                for i in s..e {
+                    let g_stored = groups[i];
+                    let v_stored = vals[i];
+                    if g_stored == 0 || v_stored == 0 { continue; }
+                    let g = (g_stored - 1) as usize;
+                    if g < cap && v_stored > maxs[g] {
+                        maxs[g] = v_stored;
+                    }
+                }
+                maxs
+            })
+            .reduce(|| vec![0u32; cap], |mut a, b| {
+                for (i, &v) in b.iter().enumerate() {
+                    if v > a[i] { a[i] = v; }
+                }
+                a
+            });
+        (0..cap).filter(|&i| result[i] != 0)
+            .map(|i| (i as u32, result[i] - 1)).collect()
+    }
+
+    /// 0.8.9: `range_scan` の並列版。 chunk ごとに local hits → flat_map で連結。
+    /// 結果順序は eid 昇順 (= chunk が lo→hi の順で並列実行されて、 各 chunk 内も
+    /// 昇順なので、 flat 連結後も全体として昇順を保つ)。
+    pub fn range_scan_par(&self, himo: &str, lo: u32, hi: u32) -> Vec<enchudb_oplog::EntityId> {
+        use rayon::prelude::*;
+        if lo > hi { return Vec::new(); }
+        let hid = match self.himo_id(himo) { Some(h) => h, None => return Vec::new() };
+        let hs = &self.himos[hid];
+        let values = hs.stored_slice();
+        if values.len() < Self::PAR_RANGE_THRESHOLD {
+            return self.range_scan(himo, lo, hi);
+        }
+        let peer = self.peer_id();
+        let lo_stored = lo.saturating_add(1);
+        let hi_stored = hi.saturating_add(1);
+        let chunk = Self::PAR_RANGE_CHUNK;
+        let n_chunks = (values.len() + chunk - 1) / chunk;
+        // chunk 単位で local Vec を作って flat_map で連結。 chunk 番号順に
+        // 結果が並ぶので、 各 chunk 内が昇順なら全体も昇順。
+        (0..n_chunks)
+            .into_par_iter()
+            .map(|ci| {
+                let s = ci * chunk;
+                let e = (s + chunk).min(values.len());
+                let mut local: Vec<enchudb_oplog::EntityId> = Vec::new();
+                for i in s..e {
+                    let stored = values[i];
+                    if stored >= lo_stored && stored <= hi_stored {
+                        local.push(enchudb_oplog::make_eid(peer, i as u32));
+                    }
+                }
+                local
+            })
+            .reduce(Vec::new, |mut a, b| { a.extend(b); a })
+    }
+
+    /// 0.8.9: `histogram_range` の並列版。 chunk ごとに thread-local
+    /// `Vec<u32>` で scatter add → reduce で要素加算。
+    pub fn histogram_range_par(
+        &self,
+        himo: &str,
+        lo: u32,
+        hi: u32,
+        vmin: u32,
+        vmax: u32,
+        n_buckets: u32,
+    ) -> Vec<u32> {
+        use rayon::prelude::*;
+        if n_buckets == 0 || vmin > vmax { return vec![]; }
+        let hid = match self.himo_id(himo) { Some(h) => h, None => return vec![0; n_buckets as usize] };
+        let hs = &self.himos[hid];
+        let values = hs.stored_slice();
+        let lo_u = lo as usize;
+        let hi_u = (hi as usize).min(values.len());
+        let n = n_buckets as usize;
+        if lo_u >= hi_u { return vec![0; n]; }
+        if hi_u - lo_u < Self::PAR_RANGE_THRESHOLD {
+            return self.histogram_range(himo, lo, hi, vmin, vmax, n_buckets);
+        }
+        let span = (vmax as u64 - vmin as u64) + 1;
+        let n_u64 = n_buckets as u64;
+        let chunk = Self::PAR_RANGE_CHUNK;
+        let n_chunks = (hi_u - lo_u + chunk - 1) / chunk;
+        (0..n_chunks)
+            .into_par_iter()
+            .map(|ci| {
+                let s = lo_u + ci * chunk;
+                let e = (s + chunk).min(hi_u);
+                let mut hist: Vec<u32> = vec![0; n];
+                for i in s..e {
+                    let stored = values[i];
+                    if stored == 0 { continue; }
+                    let val = stored - 1;
+                    if val < vmin || val > vmax { continue; }
+                    let idx = (((val - vmin) as u64) * n_u64 / span) as usize;
+                    hist[idx.min(n - 1)] += 1;
+                }
+                hist
+            })
+            .reduce(|| vec![0u32; n], |mut a, b| {
+                for (i, &v) in b.iter().enumerate() { a[i] += v; }
+                a
+            })
+    }
+
     /// 最小値
     pub fn min(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u32> {
         let hid = self.himo_id(himo)?;

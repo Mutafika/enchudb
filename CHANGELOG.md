@@ -3,6 +3,80 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.8.9 — 2026-05-31
+
+#39 対応。 bulk column scan の **rayon 並列化** 系 API を `_par` suffix で追加。
+12M row scan で `min_range` / `max_range` が **9-15x** 高速化、 `histogram_range`
+が **6.2x**、 reduce 系 (`sum` / `count`) が 2x。 callsite が並列で OK と分かって
+る場面 (= 大規模 read-only scan、 suzukapulse / mlbpulse の analytical hot path)
+向け。 file format / wire format 完全不変、 **0.8.8 から再 build のみで上がれる**。
+
+### Added (Engine、 9 API)
+
+- `Engine::sum_range_par(himo, lo, hi) -> u64`
+- `Engine::count_range_par(himo, lo, hi) -> u32`
+- `Engine::min_range_par(himo, lo, hi) -> Option<u32>`
+- `Engine::max_range_par(himo, lo, hi) -> Option<u32>`
+- `Engine::group_sum_range_par(group, sum, lo, hi) -> Vec<(u32, u64)>`
+- `Engine::group_min_range_par(group, val, lo, hi) -> Vec<(u32, u32)>`
+- `Engine::group_max_range_par(group, val, lo, hi) -> Vec<(u32, u32)>`
+- `Engine::range_scan_par(himo, lo, hi) -> Vec<EntityId>`
+- `Engine::histogram_range_par(himo, lo, hi, vmin, vmax, n_buckets) -> Vec<u32>`
+
+### 実装方針
+
+- 閾値 `PAR_RANGE_THRESHOLD = 64_000` 要素未満では **seq fallback** (= 既存
+  `_range` API を呼ぶ)。 thread spawn overhead が利益を上回らないため、 callsite
+  は規模を意識せず `_par` を呼んで良い (= API として透明)。
+- chunk 粒度は `16_384` 要素 (= 64KB、 L2 cache friendly)。 `par_chunks` または
+  `chunk index` の `par_iter` 経由で並列。
+- HimoStore は内部に `RwLock<BucketCylinder>` を持つが、 `stored_slice` は
+  immutable な mmap view (= read 中 lock 不要) なので thread-safe。
+- group 系の sparse path (= HashMap merge コストが重い) は seq fallback。
+  dense path のみ並列化 (= thread-local `Vec<u64>` で scatter add → reduce で
+  要素ごと加算)。
+
+### 実測 (12M row、 M2 Max、 12 hardware thread)
+
+| query | seq | par | speedup |
+|---|---|---|---|
+| `sum_range` | 1.3 ms | 0.7 ms | 1.96x |
+| `count_range` | 1.2 ms | 0.7 ms | 1.68x |
+| `min_range` | 16.6 ms | 1.8 ms | **9.33x** |
+| `max_range` | 8.5 ms | 0.6 ms | **14.79x** |
+| `group_sum_range` (8 group) | 193.8 ms | 184.9 ms | 1.05x |
+| `group_min_range` (8 group) | 198.7 ms | 188.3 ms | 1.06x |
+| `group_max_range` (8 group) | 162.1 ms | 157.4 ms | 1.03x |
+| `range_scan` (hit ~10%) | 9.3 ms | 4.9 ms | 1.90x |
+| `histogram_range` (10 bucket) | 38.6 ms | 6.3 ms | **6.17x** |
+
+`group_*` 系は cap = 8 で per-chunk acc 構築 + reduce merge の orchestration cost
+が支配的、 並列メリットが小さい (regress していないので OK 扱い)。 `min`/`max`
+は branch ありで NEON auto-vec が効かないため seq が遅く、 並列化で局所 reduce
+ができて大爆速。 `sum`/`count` は 12M row を 1ms で完走するほど NEON が効いて
+おり、 並列化の orchestration が 50% 食う。
+
+### Tests
+
+- `crates/enchudb-engine/tests/range_par.rs` (8 件): par 結果が seq と一致、
+  閾値以下で seq fallback、 空範囲 / 大規模での動作確認。
+
+### bench
+
+- `examples/par_scan_bench.rs`: 12M row で 9 query の seq / par 比較を一発実行。
+  `cargo run --release --example par_scan_bench` で再現可能。
+
+### 期待 impact (= suzukapulse / mlbpulse)
+
+- suzukapulse dominance: lap 別 column scan の min/max 系が dominant cost
+  だったので、 9-15x の improvement で全体 1.95s → 数百 ms 級になる見込み。
+- mlbpulse 球種別 max velo / 投手別 min ERA: 同様に大幅改善。
+
+### Reference
+
+- [#39] perf: bulk column scan の rayon 並列化
+
+
 ## 0.8.8 — 2026-05-31
 
 #38 対応。 0.8.6 の `sum_range` / `group_sum_range` pattern を **min / max /
