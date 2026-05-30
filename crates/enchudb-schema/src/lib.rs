@@ -1166,6 +1166,52 @@ impl<'a> Table<'a> {
         let Some((lo, hi)) = self.db.eng.table_eid_range(&self.inner.name) else { return vec![]; };
         self.db.eng.group_sum_range(&group_himo, &sum_himo, lo, hi)
     }
+
+    // ──── 0.8.8 (#38): min / max / group_min / group_max / histogram ────
+    //
+    // `sum` と同じ pattern (= table の eid_range を auto-bind して engine の
+    // `_range` primitive を呼ぶ)。 stored_slice 直 scan で auto-vectorize する。
+
+    /// table 内の `col` の最小値 (= MIN(col))。 全 missing なら None。
+    pub fn min(&self, col: &str) -> Option<u32> {
+        let himo = format!("{}.{}", self.inner.name, col);
+        let (lo, hi) = self.db.eng.table_eid_range(&self.inner.name)?;
+        self.db.eng.min_range(&himo, lo, hi)
+    }
+
+    /// table 内の `col` の最大値 (= MAX(col))。 全 missing なら None。
+    pub fn max(&self, col: &str) -> Option<u32> {
+        let himo = format!("{}.{}", self.inner.name, col);
+        let (lo, hi) = self.db.eng.table_eid_range(&self.inner.name)?;
+        self.db.eng.max_range(&himo, lo, hi)
+    }
+
+    /// `group` でグループ化した上での `val` 最小値 (= MIN(val) GROUP BY group)。
+    pub fn group_min(&self, group: &str, val: &str) -> Vec<(u32, u32)> {
+        let group_himo = format!("{}.{}", self.inner.name, group);
+        let val_himo = format!("{}.{}", self.inner.name, val);
+        let Some((lo, hi)) = self.db.eng.table_eid_range(&self.inner.name) else { return vec![]; };
+        self.db.eng.group_min_range(&group_himo, &val_himo, lo, hi)
+    }
+
+    /// `group` でグループ化した上での `val` 最大値 (= MAX(val) GROUP BY group)。
+    pub fn group_max(&self, group: &str, val: &str) -> Vec<(u32, u32)> {
+        let group_himo = format!("{}.{}", self.inner.name, group);
+        let val_himo = format!("{}.{}", self.inner.name, val);
+        let Some((lo, hi)) = self.db.eng.table_eid_range(&self.inner.name) else { return vec![]; };
+        self.db.eng.group_max_range(&group_himo, &val_himo, lo, hi)
+    }
+
+    /// table 内の `col` の値域 `[vmin, vmax]` を `n_buckets` 等分した頻度
+    /// ヒストグラム。 値域外の row はカウント外、 戻り値長は常に `n_buckets`。
+    /// `n_buckets == 0` または `vmin > vmax` のときは空 Vec。
+    pub fn histogram(&self, col: &str, vmin: u32, vmax: u32, n_buckets: u32) -> Vec<u32> {
+        let himo = format!("{}.{}", self.inner.name, col);
+        let Some((lo, hi)) = self.db.eng.table_eid_range(&self.inner.name) else {
+            return if n_buckets == 0 || vmin > vmax { vec![] } else { vec![0; n_buckets as usize] };
+        };
+        self.db.eng.histogram_range(&himo, lo, hi, vmin, vmax, n_buckets)
+    }
 }
 
 // ─────────────────────────── RowBuilder ───────────────────────────

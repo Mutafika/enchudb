@@ -3,6 +3,61 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.8.8 — 2026-05-31
+
+#38 対応。 0.8.6 の `sum_range` / `group_sum_range` pattern を **min / max /
+group_min / group_max / histogram** に拡張。 suzukapulse / mlbpulse で callsite
+に散在していた手書き min/max loop を engine primitive に集約できる。 file
+format / wire format 完全不変、 **0.8.7 から再 build のみで上がれる**。
+
+### Added
+
+- `Engine::min_range(himo, lo, hi) -> Option<u32>` — `[lo, hi)` eid 範囲の
+  column 直 scan で最小値を求める。 全 missing なら None。 stored 形式の
+  `0 = missing` を skip する以外は branchless tight loop。
+- `Engine::max_range(himo, lo, hi) -> Option<u32>` — 同様に最大値。
+- `Engine::group_min_range(group, val, lo, hi) -> Vec<(u32, u32)>` — 2 column
+  lockstep scan で group 別 min。 `group_sum_range` と同じ dense / sparse
+  切替 (= `group_dense_cap` 経由)。 dense path では `mins_stored[g] != u32::MAX`
+  を「データ有り」判定に使い、 seen tracking を省略。
+- `Engine::group_max_range(group, val, lo, hi) -> Vec<(u32, u32)>` — 同様に max。
+  dense path は `maxs_stored[g] != 0` を判定に使用。
+- `Engine::histogram_range(himo, lo, hi, vmin, vmax, n_buckets) -> Vec<u32>` —
+  値域 `[vmin, vmax]` を `n_buckets` 等分した頻度ヒストグラム。 範囲外の値は
+  drop (clip ではない)、 戻り値長は常に `n_buckets`。 `n_buckets == 0` /
+  `vmin > vmax` のときは空 Vec。
+- Schema `Table` API:
+  - `Table::min(col) -> Option<u32>`
+  - `Table::max(col) -> Option<u32>`
+  - `Table::group_min(group, val) -> Vec<(u32, u32)>`
+  - `Table::group_max(group, val) -> Vec<(u32, u32)>`
+  - `Table::histogram(col, vmin, vmax, n_buckets) -> Vec<u32>`
+
+  いずれも `sum` / `group_sum` と同じく、 `table_eid_range` を auto-bind して
+  engine の `_range` primitive を呼ぶだけの薄い wrapper。
+
+### Tests
+
+- `crates/enchudb-engine/tests/range_min_max_histogram.rs` (8 test): 基本動作、
+  値 0 を含むケース、 dense path、 部分範囲、 histogram edge case
+  (`n_buckets == 0` / `vmin > vmax` / 値域外 drop / `vmin == vmax`)、
+  eids 版 `min` / `max` との整合性。
+- `crates/enchudb-schema/tests/aggregations_min_max_histogram.rs` (5 test):
+  Table API wrapper の基本動作、 空 table、 group_min / group_max、 histogram
+  基本、 histogram edge case、 sum / count_col との整合性。
+
+### Performance impact
+
+- suzukapulse dominance (lap 別 segment min / corner max): callsite の per-lap
+  手書き loop が 1 関数呼び出しに圧縮可能。 30〜50% の追加短縮見込み (= [#38])。
+- mlbpulse (球種別 max velo / 投手別 min ERA 等): 同様に手書き loop 撲滅。
+- 詳細 bench は次 patch で計測予定。
+
+### Reference
+
+- [#38] feat: group_min / group_max / histogram の column scan primitive 追加
+
+
 ## 0.8.7 — 2026-05-30
 
 schema 永続化を **`.schema` sidecar に移行**、 0.6.x 以来の `schema_meta_entity`

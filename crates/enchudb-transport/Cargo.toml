@@ -1,6 +1,6 @@
 [package]
 name = "enchudb-transport"
-version = "0.8.7"
+version = "0.8.8"
 edition = "2024"
 description = "Transport implementations for enchudb — HTTP (std-only) and WebSocket (tungstenite)."
 license-file = "LICENSE.md"
