@@ -340,9 +340,16 @@ fn stress_10k_cycle() {
     eng.flush_writes();
     eng.oplog_sync().unwrap();
 
-    let transferred = eng.transfer_oplog_to_sync_ops();
-    assert!(transferred >= 10_000,
-            "should transfer at least 10k records, got {transferred}");
+    // 0.8.0 以降、 `concurrentize_with_oplog` の background consumer thread が
+    // fsync 後に自動で `transfer_oplog_to_sync_ops` を呼ぶ (= engine.rs:4093)。
+    // 手動呼び出しは idempotent な insurance としてのみ意味を持ち、 戻り値は
+    // background との race で 0 になりうる (= 旧 0.7.0 期 test の `transferred >=
+    // 10_000` assert は 0.8.0 以降 flaky)。 真の確認は `pending_sync_ops` か
+    // `current_sync_lsn` で行う (= どちらも race の影響を受けない)。
+    eng.transfer_oplog_to_sync_ops(); // idempotent insurance
+    let pending_before_reclaim = eng.pending_sync_ops(0).len();
+    assert!(pending_before_reclaim >= 10_000,
+            "10k+ records should be in sync queue, got {pending_before_reclaim}");
 
     let lsn_full = eng.current_sync_lsn();
     assert!(lsn_full >= 10_000);

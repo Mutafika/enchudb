@@ -3,6 +3,62 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.8.11 — 2026-05-31
+
+`transfer_oplog_to_sync_ops` の **lock 不在** と **自己再帰 sync 循環** の
+2 件の sync bug を fix。 stress_10k_cycle test の flaky 化 (= 0.8.0 以降ずっと
+潜在化) を根治。 production sync running で `_sync_peers` / `_sync_ops` 自身の
+write が peer に飛ばないよう正しく除外される。 file format / wire format
+完全不変、 **0.8.10 から再 build のみで上がれる**。
+
+### Fixed
+
+- **`transfer_oplog_to_sync_ops` の race condition** (= 重複転送): 0.8.0 で
+  `concurrentize_with_oplog` の background consumer thread が自動 transfer を
+  呼ぶようになったが、 手動呼び出しと並列実行すると `from = sync_ops_offset.load`
+  → records pull → row insert → `offset.store` の 4 step が race し、 同じ
+  records が複数回 row insert される (= reclaim 後の残骸として残る) bug。
+  `Engine` に `transfer_lock: Arc<Mutex<()>>` を追加し、 transfer 全期間を排他化。
+  lock 競合は per-fsync 頻度 (= 100ms 周期) で hot path 影響なし。
+
+- **自己再帰 sync 循環** (= `_sync_peers` / `_sync_ops` 自身の write が queue に
+  入る): `ack_sync` の watermark update が `_sync_peers` table への row write、
+  および `transfer_oplog_to_sync_ops` 自体が `_sync_ops` table への row write
+  を生み、 これらが WAL に積まれて次の自動 transfer で `_sync_ops` queue に
+  入る循環構造だった。 結果として:
+  - `_sync_peers` 残骸が peer に sync record として配信される (= local-only
+    state なのに transmit、 設計上意味なし)
+  - `_sync_ops` 自身が無限ループ的に self-transfer される可能性
+  - reclaim 後の残骸蓄積 (= stress_10k_cycle の `final_pending` が ~2500 に
+    膨れる根本原因)
+
+  fix: transfer 内の records loop で `_sync_ops` / `_sync_peers` の eid_range に
+  入る `Tie` / `Untie` / `Delete` / `Content` op を skip。 `Commit` (= barrier)
+  と `Vocab` (= global sync 必須) はそのまま通す。
+
+### Tests
+
+- `crates/enchudb-engine/tests/destructive_0_7_0.rs` の `stress_10k_cycle`:
+  手動 transfer の `transferred >= 10_000` assert を `pending_sync_ops().len()`
+  ベースに書き換え (= 0.8.0+ semantics で 手動 transfer の return value は race
+  で 0 になりうるため)。 10/10 連続実行で安定 pass。
+
+### 互換性
+
+- **file format / wire format 完全不変**
+- **0.8.10 から再 build のみで上がれる**
+- 既存の `transfer_oplog_to_sync_ops` 公開 API は不変、 内部実装のみ変更
+- ack の `_sync_peers` write は変わらず local 永続化される (= 復旧用)、
+  ただ peer に sync record として配信されない (= 正しい挙動)
+
+### sync 経路への影響 (= positive)
+
+- production sync running で peer 間 traffic から無駄な `_sync_peers` /
+  `_sync_ops` records が消える (= sync queue の純度向上)
+- reclaim path の残骸蓄積が解消、 long-running sync で 安定的に sync queue
+  size が抑えられる
+
+
 ## 0.8.10 — 2026-05-31
 
 #43 対応。 **Schema `Query` の終端に集計 chain API を追加**。 `where_*` で絞った
