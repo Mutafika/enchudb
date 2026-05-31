@@ -4115,6 +4115,344 @@ impl Engine {
         result
     }
 
+    // ──── 0.8.10 (#43): 不連続 eids 群への集計 (par 版 + histogram_eids) ────
+    //
+    // 既存 `sum(himo, eids)` / `count` / `min` / `max` / `group_*` は seq 版のみ
+    // だった。 sub-set (= `Query::where_*` で絞った eid 群) は連続 range と違って
+    // `_range_par` が呼べない (= 不連続)。 そこで eids 版の並列版を追加して、
+    // schema の `Query` 終端 method (= 集計 chain) の中で大規模 sub-set 集計を
+    // 走らせられるようにする。
+    //
+    // 並列化方針:
+    //   - `eids.par_chunks(PAR_RANGE_CHUNK)` で並列、 各 chunk で `stored_slice`
+    //     を indirect access (= `col[eid_local(e)]`) で scatter read
+    //   - `_range_par` (= sequential SIMD) と違って cache-unfriendly だが
+    //     thread 並列度で稼ぐ
+    //   - `eids.len() < PAR_RANGE_THRESHOLD` では seq fallback
+    //
+    // `histogram_eids` は seq 版が無かったので 0.8.10 で新規追加。
+
+    /// 0.8.10: `sum(himo, eids)` の並列版。 stored_slice の indirect access。
+    pub fn sum_eids_par(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> u64 {
+        use rayon::prelude::*;
+        let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
+        let hs = &self.himos[hid];
+        if eids.len() < Self::PAR_RANGE_THRESHOLD {
+            return self.sum(himo, eids);
+        }
+        let values = hs.stored_slice();
+        eids.par_chunks(Self::PAR_RANGE_CHUNK)
+            .map(|chunk| {
+                let mut total: u64 = 0;
+                for &eid in chunk {
+                    let local = enchudb_oplog::eid_local(eid) as usize;
+                    if local < values.len() {
+                        total += values[local].saturating_sub(1) as u64;
+                    }
+                }
+                total
+            })
+            .sum()
+    }
+
+    /// 0.8.10: `count(himo, eids)` の並列版。
+    pub fn count_eids_par(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> u32 {
+        use rayon::prelude::*;
+        let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
+        let hs = &self.himos[hid];
+        if eids.len() < Self::PAR_RANGE_THRESHOLD {
+            return self.count(himo, eids);
+        }
+        let values = hs.stored_slice();
+        eids.par_chunks(Self::PAR_RANGE_CHUNK)
+            .map(|chunk| {
+                let mut n: u32 = 0;
+                for &eid in chunk {
+                    let local = enchudb_oplog::eid_local(eid) as usize;
+                    if local < values.len() && values[local] != 0 {
+                        n += 1;
+                    }
+                }
+                n
+            })
+            .sum()
+    }
+
+    /// 0.8.10: `min(himo, eids)` の並列版。
+    pub fn min_eids_par(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u32> {
+        use rayon::prelude::*;
+        let hid = self.himo_id(himo)?;
+        let hs = &self.himos[hid];
+        if eids.len() < Self::PAR_RANGE_THRESHOLD {
+            return self.min(himo, eids);
+        }
+        let values = hs.stored_slice();
+        let result = eids
+            .par_chunks(Self::PAR_RANGE_CHUNK)
+            .map(|chunk| {
+                let mut best: u32 = u32::MAX;
+                let mut hit = false;
+                for &eid in chunk {
+                    let local = enchudb_oplog::eid_local(eid) as usize;
+                    if local < values.len() {
+                        let stored = values[local];
+                        if stored != 0 {
+                            hit = true;
+                            if stored < best { best = stored; }
+                        }
+                    }
+                }
+                if hit { Some(best) } else { None }
+            })
+            .reduce(|| None, |a, b| match (a, b) {
+                (None, x) | (x, None) => x,
+                (Some(x), Some(y)) => Some(x.min(y)),
+            });
+        result.map(|stored| stored - 1)
+    }
+
+    /// 0.8.10: `max(himo, eids)` の並列版。
+    pub fn max_eids_par(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u32> {
+        use rayon::prelude::*;
+        let hid = self.himo_id(himo)?;
+        let hs = &self.himos[hid];
+        if eids.len() < Self::PAR_RANGE_THRESHOLD {
+            return self.max(himo, eids);
+        }
+        let values = hs.stored_slice();
+        let result = eids
+            .par_chunks(Self::PAR_RANGE_CHUNK)
+            .map(|chunk| {
+                let mut best: u32 = 0;
+                for &eid in chunk {
+                    let local = enchudb_oplog::eid_local(eid) as usize;
+                    if local < values.len() {
+                        let stored = values[local];
+                        if stored > best { best = stored; }
+                    }
+                }
+                if best > 0 { Some(best) } else { None }
+            })
+            .reduce(|| None, |a, b| match (a, b) {
+                (None, x) | (x, None) => x,
+                (Some(x), Some(y)) => Some(x.max(y)),
+            });
+        result.map(|stored| stored - 1)
+    }
+
+    /// 0.8.10: `group_sum(group, sum, eids)` の並列版。 dense path のみ並列、
+    /// sparse (= max_values 0 or > 64K) は seq fallback。
+    pub fn group_sum_eids_par(
+        &self,
+        group_himo: &str,
+        sum_himo: &str,
+        eids: &[enchudb_oplog::EntityId],
+    ) -> Vec<(u32, u64)> {
+        use rayon::prelude::*;
+        let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
+        let sid = match self.himo_id(sum_himo) { Some(h) => h, None => return vec![] };
+        if eids.len() < Self::PAR_RANGE_THRESHOLD {
+            return self.group_sum(group_himo, sum_himo, eids);
+        }
+        let Some(cap) = self.group_dense_cap(gid) else {
+            return self.group_sum(group_himo, sum_himo, eids);
+        };
+        let gs = &self.himos[gid];
+        let ss = &self.himos[sid];
+        let groups = gs.stored_slice();
+        let sums = ss.stored_slice();
+        let result: Vec<u64> = eids
+            .par_chunks(Self::PAR_RANGE_CHUNK)
+            .map(|chunk| {
+                let mut acc: Vec<u64> = vec![0; cap];
+                for &eid in chunk {
+                    let local = enchudb_oplog::eid_local(eid) as usize;
+                    if local >= groups.len() || local >= sums.len() { continue; }
+                    let g_stored = groups[local];
+                    let s_stored = sums[local];
+                    if g_stored == 0 || s_stored == 0 { continue; }
+                    let g = (g_stored - 1) as usize;
+                    if g < cap {
+                        acc[g] += (s_stored - 1) as u64;
+                    }
+                }
+                acc
+            })
+            .reduce(|| vec![0u64; cap], |mut a, b| {
+                for (i, &v) in b.iter().enumerate() { a[i] += v; }
+                a
+            });
+        (0..cap).filter(|&i| result[i] > 0).map(|i| (i as u32, result[i])).collect()
+    }
+
+    /// 0.8.10: `group_min(group, val, eids)` の並列版。 dense path のみ。
+    pub fn group_min_eids_par(
+        &self,
+        group_himo: &str,
+        val_himo: &str,
+        eids: &[enchudb_oplog::EntityId],
+    ) -> Vec<(u32, u32)> {
+        use rayon::prelude::*;
+        let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
+        let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
+        if eids.len() < Self::PAR_RANGE_THRESHOLD {
+            return self.group_min(group_himo, val_himo, eids);
+        }
+        let Some(cap) = self.group_dense_cap(gid) else {
+            return self.group_min(group_himo, val_himo, eids);
+        };
+        let gs = &self.himos[gid];
+        let vs = &self.himos[vid];
+        let groups = gs.stored_slice();
+        let vals = vs.stored_slice();
+        let result: Vec<u32> = eids
+            .par_chunks(Self::PAR_RANGE_CHUNK)
+            .map(|chunk| {
+                let mut mins: Vec<u32> = vec![u32::MAX; cap];
+                for &eid in chunk {
+                    let local = enchudb_oplog::eid_local(eid) as usize;
+                    if local >= groups.len() || local >= vals.len() { continue; }
+                    let g_stored = groups[local];
+                    let v_stored = vals[local];
+                    if g_stored == 0 || v_stored == 0 { continue; }
+                    let g = (g_stored - 1) as usize;
+                    if g < cap && v_stored < mins[g] {
+                        mins[g] = v_stored;
+                    }
+                }
+                mins
+            })
+            .reduce(|| vec![u32::MAX; cap], |mut a, b| {
+                for (i, &v) in b.iter().enumerate() {
+                    if v < a[i] { a[i] = v; }
+                }
+                a
+            });
+        (0..cap).filter(|&i| result[i] != u32::MAX)
+            .map(|i| (i as u32, result[i] - 1)).collect()
+    }
+
+    /// 0.8.10: `group_max(group, val, eids)` の並列版。 dense path のみ。
+    pub fn group_max_eids_par(
+        &self,
+        group_himo: &str,
+        val_himo: &str,
+        eids: &[enchudb_oplog::EntityId],
+    ) -> Vec<(u32, u32)> {
+        use rayon::prelude::*;
+        let gid = match self.himo_id(group_himo) { Some(h) => h, None => return vec![] };
+        let vid = match self.himo_id(val_himo) { Some(h) => h, None => return vec![] };
+        if eids.len() < Self::PAR_RANGE_THRESHOLD {
+            return self.group_max(group_himo, val_himo, eids);
+        }
+        let Some(cap) = self.group_dense_cap(gid) else {
+            return self.group_max(group_himo, val_himo, eids);
+        };
+        let gs = &self.himos[gid];
+        let vs = &self.himos[vid];
+        let groups = gs.stored_slice();
+        let vals = vs.stored_slice();
+        let result: Vec<u32> = eids
+            .par_chunks(Self::PAR_RANGE_CHUNK)
+            .map(|chunk| {
+                let mut maxs: Vec<u32> = vec![0; cap];
+                for &eid in chunk {
+                    let local = enchudb_oplog::eid_local(eid) as usize;
+                    if local >= groups.len() || local >= vals.len() { continue; }
+                    let g_stored = groups[local];
+                    let v_stored = vals[local];
+                    if g_stored == 0 || v_stored == 0 { continue; }
+                    let g = (g_stored - 1) as usize;
+                    if g < cap && v_stored > maxs[g] {
+                        maxs[g] = v_stored;
+                    }
+                }
+                maxs
+            })
+            .reduce(|| vec![0u32; cap], |mut a, b| {
+                for (i, &v) in b.iter().enumerate() {
+                    if v > a[i] { a[i] = v; }
+                }
+                a
+            });
+        (0..cap).filter(|&i| result[i] != 0)
+            .map(|i| (i as u32, result[i] - 1)).collect()
+    }
+
+    /// 0.8.10: 不連続 eids への histogram (= range scan できない sub-set 向け、
+    /// schema `Query::histogram` の bind 先)。 `histogram_range` と同じ semantics
+    /// (= 値域外 drop、 戻り値長は常に `n_buckets`)。
+    pub fn histogram_eids(
+        &self,
+        himo: &str,
+        eids: &[enchudb_oplog::EntityId],
+        vmin: u32,
+        vmax: u32,
+        n_buckets: u32,
+    ) -> Vec<u32> {
+        if n_buckets == 0 || vmin > vmax { return vec![]; }
+        let hid = match self.himo_id(himo) { Some(h) => h, None => return vec![0; n_buckets as usize] };
+        let hs = &self.himos[hid];
+        let values = hs.stored_slice();
+        let n = n_buckets as usize;
+        let mut hist: Vec<u32> = vec![0; n];
+        if eids.is_empty() { return hist; }
+        let span = (vmax as u64 - vmin as u64) + 1;
+        let n_u64 = n_buckets as u64;
+        for &eid in eids {
+            let local = enchudb_oplog::eid_local(eid) as usize;
+            if local >= values.len() { continue; }
+            let stored = values[local];
+            if stored == 0 { continue; }
+            let val = stored - 1;
+            if val < vmin || val > vmax { continue; }
+            let idx = (((val - vmin) as u64) * n_u64 / span) as usize;
+            hist[idx.min(n - 1)] += 1;
+        }
+        hist
+    }
+
+    /// 0.8.10: `histogram_eids` の並列版。
+    pub fn histogram_eids_par(
+        &self,
+        himo: &str,
+        eids: &[enchudb_oplog::EntityId],
+        vmin: u32,
+        vmax: u32,
+        n_buckets: u32,
+    ) -> Vec<u32> {
+        use rayon::prelude::*;
+        if n_buckets == 0 || vmin > vmax { return vec![]; }
+        let hid = match self.himo_id(himo) { Some(h) => h, None => return vec![0; n_buckets as usize] };
+        let hs = &self.himos[hid];
+        let n = n_buckets as usize;
+        if eids.len() < Self::PAR_RANGE_THRESHOLD {
+            return self.histogram_eids(himo, eids, vmin, vmax, n_buckets);
+        }
+        let values = hs.stored_slice();
+        let span = (vmax as u64 - vmin as u64) + 1;
+        let n_u64 = n_buckets as u64;
+        eids.par_chunks(Self::PAR_RANGE_CHUNK)
+            .map(|chunk| {
+                let mut hist: Vec<u32> = vec![0; n];
+                for &eid in chunk {
+                    let local = enchudb_oplog::eid_local(eid) as usize;
+                    if local >= values.len() { continue; }
+                    let stored = values[local];
+                    if stored == 0 { continue; }
+                    let val = stored - 1;
+                    if val < vmin || val > vmax { continue; }
+                    let idx = (((val - vmin) as u64) * n_u64 / span) as usize;
+                    hist[idx.min(n - 1)] += 1;
+                }
+                hist
+            })
+            .reduce(|| vec![0u32; n], |mut a, b| {
+                for (i, &v) in b.iter().enumerate() { a[i] += v; }
+                a
+            })
+    }
+
     // ──── 範囲クエリ ────
 
     /// 範囲内の全値に合致する entity を返す（min..=max）

@@ -3,6 +3,86 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.8.10 — 2026-05-31
+
+#43 対応。 **Schema `Query` の終端に集計 chain API を追加**。 `where_*` で絞った
+sub-set に対する scalar 集計 (`min` / `max` / `sum` / `count_col`) と GROUP BY
+集計 (`group_sum` / `group_min` / `group_max`) と `histogram` が、 schema 層の
+fluent chain として完結できるようになった。 これまで sub-set 集計をしたいアプリは
+engine 直叩き (= cylinder + `pull_himo_stored_many_into` + 手書き loop) に堕ちて
+いたが、 schema が責務として持つ layout / 並列化を吸収できる。 file format / wire
+format 完全不変、 **0.8.9 から再 build のみで上がれる**。
+
+### Added (Engine、 9 API)
+
+既存 eids 版 (`sum` / `count` / `min` / `max` / `group_*`) は seq のみだったので、
+0.8.10 で並列版を追加 + histogram_eids 系を新規追加:
+
+- `Engine::sum_eids_par(himo, eids) -> u64`
+- `Engine::count_eids_par(himo, eids) -> u32`
+- `Engine::min_eids_par(himo, eids) -> Option<u32>`
+- `Engine::max_eids_par(himo, eids) -> Option<u32>`
+- `Engine::group_sum_eids_par(group, sum, eids) -> Vec<(u32, u64)>`
+- `Engine::group_min_eids_par(group, val, eids) -> Vec<(u32, u32)>`
+- `Engine::group_max_eids_par(group, val, eids) -> Vec<(u32, u32)>`
+- `Engine::histogram_eids(himo, eids, vmin, vmax, n_buckets) -> Vec<u32>` (seq)
+- `Engine::histogram_eids_par(himo, eids, vmin, vmax, n_buckets) -> Vec<u32>`
+
+### Added (Schema `Query` 終端、 8 API)
+
+`where_*` chain の終端として:
+
+- `Query::count_col(col) -> Result<u32>` — sub-set 内で col が tie された数
+- `Query::sum(col) -> Result<u64>`
+- `Query::min(col) -> Result<Option<u32>>`
+- `Query::max(col) -> Result<Option<u32>>`
+- `Query::group_sum(group, sum) -> Result<Vec<(u32, u64)>>`
+- `Query::group_min(group, val) -> Result<Vec<(u32, u32)>>`
+- `Query::group_max(group, val) -> Result<Vec<(u32, u32)>>`
+- `Query::histogram(col, vmin, vmax, n_buckets) -> Result<Vec<u32>>`
+
+使用例 (= suzukapulse dominance v3 の書き換え想定):
+
+```rust
+// 0.8.9 までは engine 直叩きが必要だった (= schema 層を素通り)
+// 0.8.10:
+tel.where_eq("session", sess).min("speed")?
+tel.where_eq("session", sess).group_min("driver", "speed")?
+tel.where_eq("session", sess).histogram("speed", 0, 360, 30)?
+tel.where_range("speed", 100, 300).group_max("lap_no", "elapsed_ms")?
+```
+
+### 実装方針
+
+- 並列化は `eids.par_chunks(16k)` で chunk 並列、 stored_slice 直 view を
+  indirect access (= `col[eid_local(e)]`) で scatter read
+- `_range_par` (= sequential SIMD) と違い cache-unfriendly な scatter access に
+  なるが、 thread 並列度で稼ぐ
+- 閾値 `PAR_RANGE_THRESHOLD = 64_000` 未満では seq fallback (= API 透明)
+- Schema `Query` 終端は `find()` で eids を取得 → engine `_eids_par` に bind の
+  薄い wrapper、 col 名は `{table}.{col}` の himo 名に解決
+
+### Tests
+
+- `crates/enchudb-engine/tests/eids_par_aggregations.rs` (7 件): par == seq、
+  連続 eid 集合では `_range_par` と一致、 飛び飛び (= 不連続) 動作、
+  histogram edge case、 閾値以下で seq fallback。
+- `crates/enchudb-schema/tests/query_aggregations.rs` (6 件): scalar /
+  GROUP BY / histogram の各終端、 空 sub-set、 unknown col の Err、
+  `where_range` との組み合わせ。
+
+### 互換性
+
+- **file format / wire format 完全不変**
+- **0.8.9 から再 build のみで上がれる**
+- 既存 `Query::find` / `find_one` / `count` / `limit` は変更なし
+- 既存 eids 版 `Engine::sum/min/max/group_*` は引き続き seq 版として使える
+
+### Reference
+
+- [#43] design: enchudb-schema の Query 層に集計 chain API を追加
+
+
 ## 0.8.9 — 2026-05-31
 
 #39 対応。 bulk column scan の **rayon 並列化** 系 API を `_par` suffix で追加。

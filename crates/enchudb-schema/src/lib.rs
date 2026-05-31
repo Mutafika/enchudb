@@ -1465,6 +1465,93 @@ impl<'a> Query<'a> {
         if let Some(n) = self.limit { candidates.truncate(n); }
         Ok(candidates)
     }
+
+    // ──── 0.8.10 (#43): Query 終端の集計 chain API ────
+    //
+    // 既存 `find()` / `count()` の終端に加えて、 sub-set (= where_*) への
+    // scalar / GROUP BY 集計を直接吐く method を追加。 callsite が engine
+    // 直叩き (= cylinder + 手書き loop) に堕ちずに schema chain で完結できる。
+    //
+    // 実装は全て `self.find()` で eid 集合を取り、 engine の `_eids_par`
+    // (= 64k 閾値で seq fallback) を呼ぶだけの薄い wrapper。 col 名は
+    // `{table}.{col}` で prefix された himo 名に解決。
+
+    fn resolve_himo(&self, col: &str) -> Result<String, SchemaError> {
+        self.table.col(col)
+            .map(|cd| cd.himo_name.clone())
+            .ok_or_else(|| SchemaError::BadValue(format!("unknown col: {}", col)))
+    }
+
+    /// sub-set 内で `col` が tie された entity 数 (= `SELECT COUNT(col) WHERE ...`)。
+    /// 既存 `count()` は entity 数、 こちらは特定 column の non-missing 数。
+    pub fn count_col(self, col: &str) -> Result<u32, SchemaError> {
+        let himo = self.resolve_himo(col)?;
+        let db = self.db;
+        let eids = self.find()?;
+        Ok(db.eng.count_eids_par(&himo, &eids))
+    }
+
+    /// sub-set 内の `col` の合計 (= `SELECT SUM(col) WHERE ...`)。
+    pub fn sum(self, col: &str) -> Result<u64, SchemaError> {
+        let himo = self.resolve_himo(col)?;
+        let db = self.db;
+        let eids = self.find()?;
+        Ok(db.eng.sum_eids_par(&himo, &eids))
+    }
+
+    /// sub-set 内の `col` の最小値 (= `SELECT MIN(col) WHERE ...`)。
+    pub fn min(self, col: &str) -> Result<Option<u32>, SchemaError> {
+        let himo = self.resolve_himo(col)?;
+        let db = self.db;
+        let eids = self.find()?;
+        Ok(db.eng.min_eids_par(&himo, &eids))
+    }
+
+    /// sub-set 内の `col` の最大値 (= `SELECT MAX(col) WHERE ...`)。
+    pub fn max(self, col: &str) -> Result<Option<u32>, SchemaError> {
+        let himo = self.resolve_himo(col)?;
+        let db = self.db;
+        let eids = self.find()?;
+        Ok(db.eng.max_eids_par(&himo, &eids))
+    }
+
+    /// sub-set 内で `group` × `sum` の GROUP BY 集計 (= `SUM(sum) GROUP BY group WHERE ...`)。
+    pub fn group_sum(self, group: &str, sum: &str) -> Result<Vec<(u32, u64)>, SchemaError> {
+        let group_himo = self.resolve_himo(group)?;
+        let sum_himo = self.resolve_himo(sum)?;
+        let db = self.db;
+        let eids = self.find()?;
+        Ok(db.eng.group_sum_eids_par(&group_himo, &sum_himo, &eids))
+    }
+
+    /// sub-set 内で `group` × `val` の MIN 集計 (= `MIN(val) GROUP BY group WHERE ...`)。
+    pub fn group_min(self, group: &str, val: &str) -> Result<Vec<(u32, u32)>, SchemaError> {
+        let group_himo = self.resolve_himo(group)?;
+        let val_himo = self.resolve_himo(val)?;
+        let db = self.db;
+        let eids = self.find()?;
+        Ok(db.eng.group_min_eids_par(&group_himo, &val_himo, &eids))
+    }
+
+    /// sub-set 内で `group` × `val` の MAX 集計 (= `MAX(val) GROUP BY group WHERE ...`)。
+    pub fn group_max(self, group: &str, val: &str) -> Result<Vec<(u32, u32)>, SchemaError> {
+        let group_himo = self.resolve_himo(group)?;
+        let val_himo = self.resolve_himo(val)?;
+        let db = self.db;
+        let eids = self.find()?;
+        Ok(db.eng.group_max_eids_par(&group_himo, &val_himo, &eids))
+    }
+
+    /// sub-set 内の `col` 値域 `[vmin, vmax]` を `n_buckets` 等分した頻度
+    /// ヒストグラム。 値域外 drop、 戻り値長は常に `n_buckets`。
+    pub fn histogram(self, col: &str, vmin: u32, vmax: u32, n_buckets: u32)
+        -> Result<Vec<u32>, SchemaError>
+    {
+        let himo = self.resolve_himo(col)?;
+        let db = self.db;
+        let eids = self.find()?;
+        Ok(db.eng.histogram_eids_par(&himo, &eids, vmin, vmax, n_buckets))
+    }
 }
 
 // ─────────────────────────── EntityRef ───────────────────────────
