@@ -1001,8 +1001,15 @@ impl<'a> TableBuilder<'a> {
             let remaining = eng_mut.remaining_eid_space();
             (remaining / 4).max(16).min(1_000_000)
         };
-        eng_mut.define_table(&name, size_hint)
-            .map_err(|e| SchemaError::Internal(format!("define_table({name}) failed: {e}")))?;
+        // 0.8.2-flush-patch: migration path (= 既存 DB に新 table を後付け) では
+        // 前回 run の engine sidecar が table を持ってるが、 schema blob は未更新
+        // (Drop が concurrent skip 仕様)。 ここで "already exists" は recoverable
+        // として扱い、 db.tables だけ追加して engine 状態を流用する。
+        let already_in_engine = match eng_mut.define_table(&name, size_hint) {
+            Ok(_) => false,
+            Err(e) if e.contains("already exists") => true,
+            Err(e) => return Err(SchemaError::Internal(format!("define_table({name}) failed: {e}"))),
+        };
 
         let mut cols = Vec::with_capacity(col_specs.len());
         for (col_name, ty) in &col_specs {
@@ -1010,16 +1017,24 @@ impl<'a> TableBuilder<'a> {
             let ref_target = relations.iter().find(|(c, _)| c == col_name).map(|(_, t)| t.clone());
             match ref_target {
                 Some(to_table) => {
-                    eng_mut.define_ref_in(&name, col_name, &to_table)
-                        .map_err(|e| SchemaError::Internal(format!(
+                    let r = eng_mut.define_ref_in(&name, col_name, &to_table);
+                    match r {
+                        Ok(_) => {}
+                        Err(e) if already_in_engine && e.contains("already") => {}
+                        Err(e) => return Err(SchemaError::Internal(format!(
                             "define_ref_in({name}.{col_name} -> {to_table}) failed: {e}"
-                        )))?;
+                        ))),
+                    }
                 }
                 None => {
-                    eng_mut.define_himo_in(&name, col_name, ty.himo_type(), 0)
-                        .map_err(|e| SchemaError::Internal(format!(
+                    let r = eng_mut.define_himo_in(&name, col_name, ty.himo_type(), 0);
+                    match r {
+                        Ok(_) => {}
+                        Err(e) if already_in_engine && e.contains("already") => {}
+                        Err(e) => return Err(SchemaError::Internal(format!(
                             "define_himo_in({name}.{col_name}) failed: {e}"
-                        )))?;
+                        ))),
+                    }
                 }
             }
             let himo_name = format!("{}.{}", name, col_name);
