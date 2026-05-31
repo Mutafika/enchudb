@@ -910,6 +910,15 @@ pub struct Engine {
     /// consumer thread が背景 fsync 後に新規 commit を `_sync_ops` へ転送する。
     /// `enable_sync_tables` 有効化前は使われない (= 0)、 後は単調前進。
     sync_ops_offset: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// 0.8.11 (issue: stress_10k_cycle flaky): `transfer_oplog_to_sync_ops` の
+    /// 排他 lock。 0.8.0 で `concurrentize_with_oplog` の background consumer thread
+    /// が自動 transfer を呼ぶようになったが、 手動 transfer との並列実行で
+    /// `from = sync_ops_offset.load()` → records pull → row insert → offset.store()
+    /// の 4 step が race し、 同じ records が複数回 row insert される
+    /// (= reclaim 後に残骸が残る) bug。 本 mutex で transfer の全期間を排他化、
+    /// 重複転送を根本解消。 lock 競合は per-fsync 頻度 (= 100ms 周期) で頻度低、
+    /// hot path 影響は無視できる。
+    transfer_lock: std::sync::Arc<std::sync::Mutex<()>>,
     /// 0.7.0 Phase 4: `_sync_ops` row に振る単調 lsn (= u32 の publish_since cursor)。
     /// `entity_in` の eid とは別、 reclaim で row が消えても lsn は単調維持される。
     next_sync_lsn: std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -1077,6 +1086,7 @@ impl Engine {
                 enchudb_oplog::oplog::HEADER_SIZE as u64,
             )),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
+            transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
@@ -1322,6 +1332,7 @@ impl Engine {
                 enchudb_oplog::oplog::HEADER_SIZE as u64,
             )),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
+            transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
@@ -1718,6 +1729,7 @@ impl Engine {
                 enchudb_oplog::oplog::HEADER_SIZE as u64,
             )),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
+            transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
@@ -1888,6 +1900,12 @@ impl Engine {
         if !self.sync_tables_enabled() { return 0; }
         let Some(wal) = self.oplog.as_ref() else { return 0; };
 
+        // 0.8.11: background consumer thread と手動呼び出しの race で
+        // 同じ records が重複転送される bug fix。 from load → records pull →
+        // row insert → offset store の 4 step を排他化。 per-fsync 頻度 (= 100ms
+        // 周期) なので lock 競合の hot path 影響なし。
+        let _guard = self.transfer_lock.lock().unwrap();
+
         let from = self.sync_ops_offset.load(Ordering::Acquire);
         let records = wal.iter_committed_from(from);
         if records.is_empty() {
@@ -1901,8 +1919,39 @@ impl Engine {
         let hlc_wall_lo_hid = self.himo_id("_sync_ops.hlc_wall_lo").unwrap() as u16;
         let payload_hid = self.himo_id("_sync_ops.payload").unwrap() as u16;
 
-        let count = records.len();
+        // 0.8.11: 自己再帰 sync の循環を断つ filter。
+        // `_sync_ops` / `_sync_peers` 配下の write (= ack_sync の watermark
+        // update、 transfer 自体の row insert) を queue に積むと、 reclaim 後も
+        // lsn が新しくて消えない残骸として蓄積、 stress_10k_cycle の
+        // `final_pending < 100` 期待を壊す (= 実測 ~25%)。 これらは local-only
+        // state で他 peer に sync 不要なので、 transfer 対象から除外。
+        let sync_ops_range = self.table_eid_range("_sync_ops");
+        let sync_peers_range = self.table_eid_range("_sync_peers");
+        let is_internal_eid = |eid: u64| -> bool {
+            let local = enchudb_oplog::eid_local(eid);
+            if let Some((lo, hi)) = sync_ops_range {
+                if local >= lo && local < hi { return true; }
+            }
+            if let Some((lo, hi)) = sync_peers_range {
+                if local >= lo && local < hi { return true; }
+            }
+            false
+        };
+
+        let mut count = 0usize;
         for rec in &records {
+            // 自己再帰 op は skip。 Commit (= barrier marker) / Vocab (= global
+            // sync 必須) は eid 持たないのでそのまま通す。
+            let skip = match &rec.op {
+                enchudb_oplog::oplog::DecodedOp::Tie { eid, .. }
+                | enchudb_oplog::oplog::DecodedOp::Untie { eid, .. }
+                | enchudb_oplog::oplog::DecodedOp::Delete { eid }
+                | enchudb_oplog::oplog::DecodedOp::Content { eid, .. } => is_internal_eid(*eid),
+                enchudb_oplog::oplog::DecodedOp::Commit => false,
+                enchudb_oplog::oplog::DecodedOp::Vocab { .. } => false,
+            };
+            if skip { continue; }
+            count += 1;
             let row_eid = match self.entity_in("_sync_ops") {
                 Ok(e) => e,
                 Err(_) => {
