@@ -57,6 +57,17 @@ let hits = users.where_eq("age", 30i64)
 
 `build()` で col → himo_id が pre-resolve されるので、 hot path の string lookup は内部で消える。 「最適化したいから engine 直叩き」は通常不要 (v0.3.0 で schema 層を zero-cost 化済み)。
 
+group / filter される low-cardinality 列 (`dept` / `status` / カテゴリ等) には `.cardinality(n)` で distinct 値数の hint を渡せる。 その列を group key にした集計 (`group_sum` / `group_min` / `group_max` / `histogram`) が dense + 並列 fast path に乗る (未指定だと HashMap fallback、 [#46](https://github.com/Mutafika/enchudb/issues/46))。 値の上限ではなく hint なので超過しても tie 可能。
+
+```rust
+db.table("events")
+    .number("id")
+    .number("kind").cardinality(16)   // group / filter される低カーディナリティ列
+    .number("ts")
+    .primary_key("id")
+    .build()?;
+```
+
 reopen:
 
 ```rust
@@ -229,7 +240,7 @@ let hits = store.search(
 
 ```bash
 cargo bench --bench core
-cargo run --release --example vs_sqlite
+cargo run --release --example vs_db
 ```
 
 ## アーキテクチャ要点
