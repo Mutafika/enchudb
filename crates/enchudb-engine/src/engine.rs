@@ -2566,6 +2566,11 @@ impl Engine {
         // entity 未確保ならローカル側の EntitySet に登録(eid は peer 側が決めた値)
         self.entities.ensure_live(local);
         self.himos[hid].set(local, value);
+        // issue #47 fix: foreign local が我々の table eid_range 内に落ちた場合、
+        // 次の `entity_in` が同 local を払出して live entity を上書きしないよう
+        // `next_local` を `local + 1` まで前進させる。 これは `apply_oplog_op`
+        // (WAL recover 経路、 engine.rs:3790) と対称の処理。
+        Self::advance_table_next_local_for(&self.tables, local);
         if self.gossip_remote_apply() {
             if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
                 let _ = wal.append_relayed(
@@ -2626,6 +2631,8 @@ impl Engine {
         let local = enchudb_oplog::eid_local(eid);
         self.entities.ensure_live(local);
         self.contents.set(local, key, data);
+        // issue #47 fix: Tie 経路と同じ理由で next_local を前進させる。
+        Self::advance_table_next_local_for(&self.tables, local);
         if self.gossip_remote_apply() {
             if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
                 let _ = wal.append_relayed(
