@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "enchudb"
-version = "0.8.13"
+version = "0.8.14"
 edition = "2024"
 description = "EnchuDB — 紐ベース円柱エンジン。`enchudb-engine` を便利に再エクスポートする meta crate。"
 license-file = "LICENSE.md"
@@ -34,6 +34,9 @@ rusqlite = { version = "0.36", features = ["bundled"] }
 # in-process DuckDB binding for vs_db bench (= subprocess CLI overhead を排除して
 # columnar OLAP の真の比較を取る)。 bundled で system に依存しない build。
 duckdb = { version = "1", features = ["bundled"] }
+# in-process LMDB binding for vs_db bench — mmap KV baseline。secondary index は
+# composite key (value‖id) で手張りして「index 付き query store」として公平に戦わせる。
+heed = "0.20"
 enchudb-transport = { path = "crates/enchudb-transport" }
 sabitori = { path = "../sabitori/crates/sabitori" }
 sabitori-style = { path = "../sabitori/crates/sabitori-style" }

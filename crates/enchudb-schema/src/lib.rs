@@ -915,7 +915,7 @@ pub struct ColumnInfo {
 pub struct TableBuilder<'a> {
     db: &'a mut Database,
     name: String,
-    cols: Vec<(String, ColumnType)>,
+    cols: Vec<(String, ColumnType, u32)>, // (name, type, cardinality hint; 0 = none)
     pk: Option<String>,
     relations: Vec<(String, String)>, // (from_col, to_table)
     capacity: Option<u32>,
@@ -923,7 +923,7 @@ pub struct TableBuilder<'a> {
 
 impl<'a> TableBuilder<'a> {
     pub fn column(mut self, name: impl Into<String>, ty: ColumnType) -> Self {
-        self.cols.push((name.into(), ty));
+        self.cols.push((name.into(), ty, 0));
         self
     }
     /// inline 数値列 (HimoType::Number)。
@@ -935,10 +935,31 @@ impl<'a> TableBuilder<'a> {
     /// 備考・メモ・本文など、引かれない自由記述に向く。
     pub fn leaf(self, name: &str) -> Self { self.column(name, ColumnType::Leaf) }
 
+    /// 直前に宣言した列の cardinality hint (= distinct 値数の目安) を設定する。
+    /// `BucketCylinder` の初期 size hint になると同時に、 **この列を group key に
+    /// した集計 (`group_sum` / `group_min` / `group_max` / `histogram`) の
+    /// dense + 並列 fast path を有効化**する (hint が `1..=65536` のとき)。
+    ///
+    /// 未指定 (= 0) だと engine の `group_dense_cap` が `None` を返し、 HashMap
+    /// fallback + 並列無効に落ちる ([#46])。 `dept` / `status` / `category` など、
+    /// group / filter される low-cardinality 列に付けると効く。 値の上限ではなく
+    /// hint なので、 超過しても tie は可能 (`BucketCylinder` が動的拡張する)。
+    ///
+    /// 列宣言メソッド (`number` / `tag` / `leaf` / `column` / `ref_to`) の直後に
+    /// chain する。 列が一つも宣言されていなければ no-op。
+    ///
+    /// [#46]: https://github.com/Mutafika/enchudb/issues/46
+    pub fn cardinality(mut self, n: u32) -> Self {
+        if let Some(last) = self.cols.last_mut() {
+            last.2 = n;
+        }
+        self
+    }
+
     /// Ref 型カラムを宣言。 値は他テーブルの EntityId を保持する。
     /// `Table::where_ref` で逆引きできる。 `to_table` 名は build 時に存在チェック。
     pub fn ref_to(mut self, col: &str, to_table: &str) -> Self {
-        self.cols.push((col.to_string(), ColumnType::Ref));
+        self.cols.push((col.to_string(), ColumnType::Ref, 0));
         self.relations.push((col.to_string(), to_table.to_string()));
         self
     }
@@ -966,7 +987,7 @@ impl<'a> TableBuilder<'a> {
 
         // PK 検証
         if let Some(pk_name) = &pk {
-            if !col_specs.iter().any(|(n, _)| n == pk_name) {
+            if !col_specs.iter().any(|(n, _, _)| n == pk_name) {
                 return Err(SchemaError::UnknownColumn(pk_name.clone()));
             }
         }
@@ -1012,7 +1033,7 @@ impl<'a> TableBuilder<'a> {
         };
 
         let mut cols = Vec::with_capacity(col_specs.len());
-        for (col_name, ty) in &col_specs {
+        for (col_name, ty, card) in &col_specs {
             // ref column は define_ref_in、 それ以外は define_himo_in。
             let ref_target = relations.iter().find(|(c, _)| c == col_name).map(|(_, t)| t.clone());
             match ref_target {
@@ -1027,7 +1048,7 @@ impl<'a> TableBuilder<'a> {
                     }
                 }
                 None => {
-                    let r = eng_mut.define_himo_in(&name, col_name, ty.himo_type(), 0);
+                    let r = eng_mut.define_himo_in(&name, col_name, ty.himo_type(), *card);
                     match r {
                         Ok(_) => {}
                         Err(e) if already_in_engine && e.contains("already") => {}

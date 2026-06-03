@@ -3,6 +3,44 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.8.14 — 2026-06-03
+
+`TableBuilder::cardinality(n)` を追加。 schema 列に distinct 値数の hint を渡せる
+ようになり、 **その列を group key にした集計 (`group_sum` / `group_min` /
+`group_max` / `histogram`) が dense + 並列 fast path に乗る** ([#46])。
+
+これまで `Database::build()` は全列を `define_himo(.., 0)` で定義していたため、
+engine の `group_dense_cap` が常に `None` を返し、 table 層の group 集計が HashMap
+fallback + 並列無効に固定されていた (= 1M 行の全件 GROUP BY で ~5.2ms)。
+`.cardinality(20)` で hint を渡すと dense `acc[g] += v` path に乗り、 同 workload で
+**~443µs (seq dense) / ~152µs (par dense)** に短縮、 in-process DuckDB
+(~580µs–1.6ms) を上回る。 `examples/vs_db.rs` の 4-way bench (enchudb / sqlite /
+duckdb / lmdb) で GROUP BY を含む全 10 項目を enchudb が制覇。
+
+cap=0 (= hint 未指定) の挙動は不変で **後方互換 100%、 既存コードは影響なし**。
+reopen でも `max_values` は engine metadata に persist + restore されるため、 build
+時に `.cardinality()` を渡せば hint は保持される。
+
+file format / wire format 完全不変、 **0.8.13 から再 build のみで上がれる**。
+
+### Added
+
+- `enchudb_schema::TableBuilder::cardinality(n)` — 直前に宣言した列の cardinality
+  hint。 `BucketCylinder` の size hint になり、 `n ≤ 65536` のとき group dense path
+  を有効化する。
+- `examples/vs_db.rs` に LMDB (heed, in-process mmap KV) を追加して 4-way 化
+  (enchudb / sqlite / duckdb / lmdb)。
+- `examples/group_sum_cap_probe.rs` — cap 有無での `group_sum` 速度差の probe。
+
+### 既知の制約
+
+- dense path は `n ≤ 65536` (= `cyl_max_values`) の low-cardinality group key 限定。
+  高 cardinality group key では HashMap path のまま ([#46] で議論)。
+- `Table::add_column` / reopen 経路は依然 cap=0 で define するが、 build 時に
+  `.cardinality()` を渡せば reopen は engine 側 persist で hint を保持する。
+
+[#46]: https://github.com/Mutafika/enchudb/issues/46
+
 ## 0.8.13 — 2026-06-03
 
 `TableBuilder::build()` を reopen 時 idempotent に。 issue
