@@ -3,6 +3,35 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.8.13 — 2026-06-03
+
+`TableBuilder::build()` を reopen 時 idempotent に。 issue
+[#50](https://github.com/Mutafika/enchudb/issues/50) で sinfohub-server が踏んだ
+crash-loop bug を根治。 file format / wire format 完全不変、 **0.8.12 から再
+build のみで上がれる**。
+
+### Fixed
+
+- **`TableBuilder::build()` が "already exists" を recoverable に扱わない** (=
+  migration crash): `load_schema` (`crates/enchudb-schema/src/lib.rs:622-630`)
+  は `define_table` の `"already exists"` を recoverable として handle してたが、
+  public `TableBuilder::build()` 経路は同じ error を bail させていた非対称。
+  multi-tenant shared-pool で deploy 越しに engine sidecar (`.tables`) が
+  table 定義を蓄積していく場合、 schema blob (`.schema`) と divergence した
+  状態で `db.table("foo").build()` が
+  `define_table(foo) failed: table 'foo' already exists` で fail して
+  server crash-loop に陥っていた (sinfohub production で観測)。
+  既に `v0.8.2-flush-patch` branch に `5ebc5b6` として fix 済だったが master
+  に merge 漏れ。 今回 cherry-pick で master に取り込み。
+- regression test を `crates/enchudb-schema/tests/issue50_build_idempotent.rs`
+  に追加 (= 修正前 fail 確認済み、 修正後 pass)。
+
+### 影響範囲
+
+`Database::open` (or `open_with_oplog`) 直後に `db.table(...).build()` を呼ぶ
+migration / re-declare pattern を使う user のみ。 single-shot `Database::create`
++ declare + finalize の通常 flow は影響なし。
+
 ## 0.8.12 — 2026-06-03
 
 **CRITICAL data-loss fix**。 sync 経路で foreign peer から届く Tie / Content op を
