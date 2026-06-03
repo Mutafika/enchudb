@@ -3,6 +3,38 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.8.12 — 2026-06-03
+
+**CRITICAL data-loss fix**。 sync 経路で foreign peer から届く Tie / Content op を
+apply する際、 `next_local` を前進させていなかったため、 後続の `entity_in` が
+既に live な local id を再払出 → user の新規 save が既存 entity を上書きする
+silent data loss。 issue [#47](https://github.com/Mutafika/enchudb/issues/47) で
+bisquit が踏んだ症状。 0.8.5 以降の全 sync user に影響、 0.8.12 へ即時更新を推奨。
+
+file format / wire format 完全不変、 **0.8.11 から再 build のみで上がれる**。
+
+### Fixed
+
+- **`remote_tie_apply` / `remote_content_apply` が `next_local` を進めない** (=
+  data loss): WAL recover 経路 (`apply_oplog_op`) は 0.8.1 で
+  `advance_table_next_local_for` を呼ぶよう修正済みだが、 sync 経路
+  (`remote_*_apply`) には同 fix が入っておらず非対称だった。 結果として、
+  Mac↔Android 等の peer sync で foreign eid が `entities.ensure_live(local)`
+  された後も `table.next_local` が古いまま据置 → 次の `entity_in` が
+  `fetch_add(1)` で live local を払出し、 schema 層の `tie_value` で既存 entity
+  に被せ書きしてしまう。 両 `remote_*_apply` に
+  `Self::advance_table_next_local_for(&self.tables, local)` を 1 行追加して根治。
+  regression test を `crates/enchudb-engine/tests/issue47_remote_tie_next_local.rs`
+  に追加 (= 修正前 `new_locals=[20, 21, 22]` collide with `foreign_locals=[20, 21]`
+  で fail、 修正後 fresh local を返して pass)。
+
+### 影響範囲
+
+sync mode (`open_with_oplog` + `enable_sync`) で、 自 peer が複数の foreign peer
+から記録を受信している環境のみ。 単一 peer / 非 sync 利用は無影響。 production
+で bisquit (Mac-Android 2 peer) が「Share Intent で URL 追加するたびに 1 件
+silent loss」 として観測した重大 bug。
+
 ## 0.8.11 — 2026-05-31
 
 `transfer_oplog_to_sync_ops` の **lock 不在** と **自己再帰 sync 循環** の
