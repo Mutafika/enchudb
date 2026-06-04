@@ -3,6 +3,55 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.8.15 — 2026-06-04
+
+ENOSPC 起因の warning スパムと sidecar 破損時の DB 読取不能 (issue
+[#52](https://github.com/Mutafika/enchudb/issues/52)) を fail-readable / self-heal
+で根治。 file format / wire format 完全不変、 **0.8.14 から再 build のみで
+上がれる**。
+
+### Fixed
+
+- **persist warning の rate-limit** (= ターミナル不能化): `try_persist_tables`
+  の失敗時 `eprintln` を **1 秒 1 行**に rate-limit (`Engine.last_persist_warn_ms:
+  AtomicU64` + CAS 前進)。 disk full 等で consumer thread が毎 batch 失敗 →
+  ターミナルに warning が秒間数百件流れる現象を抑止。 メッセージ末尾に
+  ` (rate-limited to 1/s)` を付与して抑止中であることを明示。
+- **sidecar 破損で全 DB 読取不能** (= 致命的 fail-closed):
+  - `.tables` (engine sidecar) parse 失敗を `InvalidData` で識別、
+    `.tables.corrupt-<unix_ts>` に rename して退避 → anonymous fallback で
+    engine open を続行 (`crates/enchudb-engine/src/engine.rs`)。
+  - `.schema` (schema sidecar) も同様に parse 失敗を catch、
+    `.schema.corrupt-<unix_ts>` に rename → 下流の legacy blob / engine
+    synthesize fallback に流す (`crates/enchudb-schema/src/lib.rs`)。
+  - これまで `.schema` 破損は `Database::open` 全体を fail させていたため、
+    sinfo / opyula 等の consumer が **disk full からの recovery 後も DB を
+    全く開けなくなる** 状態に陥っていた。 今回 fail-readable 化で engine の
+    `list_user_tables` から table 定義を再 synthesize できるようになり、
+    破損 sidecar を「警告 + 退避ファイル」 として処理して継続。
+- **`.tables.tmp` / `.schema.tmp` self-heal**: open 時に残骸 tmp file を明示削除。
+  既存 persist 経路は `truncate(true)` で上書きするため通常は不要だが、 disk
+  full → recovery 後の確実な clean state を保証する safety net。
+
+### 影響範囲
+
+すべての user が恩恵。 特に:
+- 高頻度 write workload (= opyula / sinfo / suzukapulse 等 ingest 系) が
+  ENOSPC を踏んでも terminal を失わない。
+- disk full → recovery で `.schema` 破損が起きた DB を、 再 deploy なしで
+  そのまま再 open 可能 (= synthesize で table 復元)。
+
+### 残課題 (将来 release)
+
+- mmap body (`.ecdb`) は default 16M entities で予約サイズ ~25 GiB (sparse)。
+  ENOSPC で touched page が全 reserve に行き渡って疎→密に化けるため、
+  default を小さく (= `create` の最小値を採用) するか lazy growth に
+  変更する検討は別 issue 推奨。
+- WAL append が ENOSPC で partial write を残す可能性 → atomic-rename と同等の
+  fsync-before-checkpoint pattern は維持されているが、 head pointer の rollback は
+  入っていない。 mid-record corruption は WAL recover (`OpLog::recover`) が
+  最後の commit までで truncate するので read path には影響しない。
+
 ## 0.8.14 — 2026-06-03
 
 `TableBuilder::cardinality(n)` を追加。 schema 列に distinct 値数の hint を渡せる

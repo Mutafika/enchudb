@@ -201,6 +201,56 @@ fn persist_tables_to_sidecar(db_path: &str, tables: &[TableDef]) -> io::Result<(
     Ok(())
 }
 
+/// 0.8.15 (issue #52): persist 失敗で残った `.tables.tmp` を open 時に明示削除。
+/// 通常 persist は `truncate(true)` で上書きするが、 disk full → recovery 後の
+/// 状態を確実に clean にするためだけの safety net。 削除失敗は warning だけで続行。
+#[cfg(not(target_arch = "wasm32"))]
+fn cleanup_tables_tmp(db_path: &str) {
+    let sidecar = tables_path_for(db_path);
+    let tmp_path = sidecar.with_extension("tables.tmp");
+    if tmp_path.exists() {
+        if let Err(e) = std::fs::remove_file(&tmp_path) {
+            eprintln!(
+                "warning: failed to remove stale tables tmp {}: {}",
+                tmp_path.display(),
+                e
+            );
+        }
+    }
+}
+
+/// 0.8.15 (issue #52): 破損 sidecar を `.tables.corrupt-<unix_ts>` に rename して
+/// 退避し、 anonymous fallback で open 続行する。 user 側は schema crate の
+/// synthesize 経路で engine 内 table 定義から復元できる。
+#[cfg(not(target_arch = "wasm32"))]
+fn rename_corrupt_sidecar(db_path: &str, kind: &str, err: &io::Error) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let sidecar = match kind {
+        "tables" => tables_path_for(db_path),
+        // 将来 schema 用に同 helper を使う場合のため switch (今は tables のみ)
+        _ => return,
+    };
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup = sidecar.with_extension(format!("{}.corrupt-{}", kind, ts));
+    eprintln!(
+        "warning: {} sidecar parse failed ({}): renaming to {} (anonymous fallback)",
+        kind,
+        err,
+        backup.display()
+    );
+    if let Err(e) = std::fs::rename(&sidecar, &backup) {
+        eprintln!(
+            "warning: failed to rename corrupt sidecar {} -> {}: {}",
+            sidecar.display(),
+            backup.display(),
+            e
+        );
+    }
+}
+
 /// β-light step 7: 既存 sidecar を読む。 不在 (v4 DB) なら Ok(None)。
 #[cfg(not(target_arch = "wasm32"))]
 fn load_tables_from_sidecar(db_path: &str) -> io::Result<Option<Vec<TableDef>>> {
@@ -919,6 +969,11 @@ pub struct Engine {
     /// 重複転送を根本解消。 lock 競合は per-fsync 頻度 (= 100ms 周期) で頻度低、
     /// hot path 影響は無視できる。
     transfer_lock: std::sync::Arc<std::sync::Mutex<()>>,
+    /// 0.8.15: `try_persist_tables` 内の warning emit を rate-limit するための
+    /// 最後の emit timestamp (millis since UNIX_EPOCH)。 ENOSPC 等で連続失敗
+    /// すると consumer thread が毎 batch eprintln → ターミナル不能なので 1 秒
+    /// 1 回に抑える。 0 = 未 emit。
+    last_persist_warn_ms: std::sync::atomic::AtomicU64,
     /// 0.7.0 Phase 4: `_sync_ops` row に振る単調 lsn (= u32 の publish_since cursor)。
     /// `entity_in` の eid とは別、 reclaim で row が消えても lsn は単調維持される。
     next_sync_lsn: std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -1087,6 +1142,7 @@ impl Engine {
             )),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
@@ -1332,6 +1388,7 @@ impl Engine {
                 enchudb_oplog::oplog::HEADER_SIZE as u64,
             )),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
+            last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
@@ -1387,10 +1444,30 @@ impl Engine {
         eng.path = path.to_string();
         eng._writer_lock = writer_lock;
 
+        // 0.8.15 (issue #52): open 前に残骸 `.tables.tmp` を掃除する self-heal。
+        // persist 失敗 (ENOSPC 等) で `.tmp` が残ったケースを次回 reopen で確実に
+        // clean できるよう、 next persist の truncate(true) に依存しない明示削除。
+        cleanup_tables_tmp(path);
+
         // β-light step 7: tables sidecar の読み込み。 不在なら anonymous fallback
         // (= load_from_backing が既に行った形のまま) で v4 DB 互換。
-        if let Ok(Some(persisted)) = load_tables_from_sidecar(path) {
-            eng.adopt_persisted_tables(persisted);
+        // 0.8.15 (issue #52): InvalidData (= 破損) は **fail-readable** で扱う。
+        // sidecar を `.tables.corrupt-<unix_ts>` に rename して退避し、 anonymous
+        // tables のまま続行する。 schema crate 側は engine の `list_user_tables`
+        // から再合成できるので、 sidecar 破損で全 DB が unreadable になる失敗
+        // モードを避ける。
+        match load_tables_from_sidecar(path) {
+            Ok(Some(persisted)) => eng.adopt_persisted_tables(persisted),
+            Ok(None) => {} // 不在: 新規 DB or v4 legacy
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                rename_corrupt_sidecar(path, "tables", &e);
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to read tables sidecar (anonymous fallback): {}",
+                    e
+                );
+            }
         }
 
         if verify_region_crc {
@@ -1728,6 +1805,7 @@ impl Engine {
             sync_ops_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 enchudb_oplog::oplog::HEADER_SIZE as u64,
             )),
+            last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
@@ -2316,9 +2394,38 @@ impl Engine {
                 if let Err(e) = persist_tables_to_sidecar(&self.path, &self.tables) {
                     // best effort: panic せずログだけ。 user table の定義は
                     // メモリには反映されてる、 次回 reopen で失われるだけ。
-                    eprintln!("warning: failed to persist tables sidecar: {}", e);
+                    // 0.8.15 (issue #52): ENOSPC 等で consumer thread が毎 batch
+                    // 失敗 → 同 warning がターミナル不能になる現象を回避するため、
+                    // 1 秒 1 行の rate-limit を入れる。
+                    self.warn_persist_failure_rate_limited(&e);
                 }
             }
+        }
+    }
+
+    /// 0.8.15 (issue #52): persist 失敗 warning を 1 秒 1 行に rate-limit。
+    /// 高頻度 write hot path で ENOSPC が起きると consumer thread が毎 batch
+    /// (= 100ms 周期) eprintln してターミナル使用不能になっていた。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn warn_persist_failure_rate_limited(&self, e: &io::Error) {
+        use std::sync::atomic::Ordering;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = self.last_persist_warn_ms.load(Ordering::Relaxed);
+        // 1 秒以上経過してたら CAS で前進させて emit (= 競合時はもう片方が emit 担当)。
+        if now_ms.saturating_sub(last) >= 1000
+            && self
+                .last_persist_warn_ms
+                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            eprintln!(
+                "warning: failed to persist tables sidecar: {} (rate-limited to 1/s)",
+                e
+            );
         }
     }
 
