@@ -588,9 +588,24 @@ impl Database {
 
     fn load_schema(&mut self) -> Result<(), SchemaError> {
         let path = self.eng.db_path().to_string();
+        // 0.8.15 (issue #52): open 前に `.schema.tmp` 残骸を掃除 (= self-heal)。
+        if !path.is_empty() {
+            cleanup_schema_tmp(&path);
+        }
         // 1. `.schema` sidecar (= 0.8.7 以降の正規 path) を試す
+        // 0.8.15 (issue #52): parse 失敗は **fail-readable** で扱う。 InvalidData
+        // (= UTF-8 / format 破損) は warn + `.schema.corrupt-<ts>` rename で退避し、
+        // 下流の legacy blob / engine からの synthesize fallback に流す。 disk full
+        // → recovery 後に store 全体が unreadable になる失敗モードを避ける。
         let mut parsed_opt: Option<Vec<RawTableDef>> = if !path.is_empty() {
-            load_schema_from_sidecar(&path).map_err(|e| SchemaError::Io(e.to_string()))?
+            match load_schema_from_sidecar(&path) {
+                Ok(opt) => opt,
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    rename_corrupt_schema_sidecar(&path, &e);
+                    None
+                }
+                Err(e) => return Err(SchemaError::Io(e.to_string())),
+            }
         } else {
             None
         };
@@ -809,6 +824,55 @@ fn load_schema_from_sidecar(db_path: &str) -> std::io::Result<Option<Vec<RawTabl
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+/// 0.8.15 (issue #52): persist 失敗で残った `.schema.tmp` を open 時に明示削除。
+#[cfg(not(target_arch = "wasm32"))]
+fn cleanup_schema_tmp(db_path: &str) {
+    let sidecar = schema_sidecar_path_for(db_path);
+    // persist_schema_to_sidecar が使う tmp 名と合わせる (= `.schema.tmp`)。
+    let tmp = sidecar.with_extension(format!(
+        "{}.tmp",
+        sidecar
+            .extension()
+            .map(|e| e.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
+    if tmp.exists() {
+        if let Err(e) = std::fs::remove_file(&tmp) {
+            eprintln!(
+                "warning: failed to remove stale schema tmp {}: {}",
+                tmp.display(),
+                e
+            );
+        }
+    }
+}
+
+/// 0.8.15 (issue #52): 破損した `.schema` sidecar を `.schema.corrupt-<unix_ts>` に
+/// rename して退避し、 下流の synthesize fallback に流す。
+#[cfg(not(target_arch = "wasm32"))]
+fn rename_corrupt_schema_sidecar(db_path: &str, err: &std::io::Error) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let sidecar = schema_sidecar_path_for(db_path);
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup = sidecar.with_extension(format!("schema.corrupt-{}", ts));
+    eprintln!(
+        "warning: schema sidecar parse failed ({}): renaming to {} and falling back to engine synthesize",
+        err,
+        backup.display()
+    );
+    if let Err(e) = std::fs::rename(&sidecar, &backup) {
+        eprintln!(
+            "warning: failed to rename corrupt schema sidecar {} -> {}: {}",
+            sidecar.display(),
+            backup.display(),
+            e
+        );
     }
 }
 
