@@ -66,6 +66,36 @@ pub struct EngineStats {
     pub max_hlc: Option<enchudb_oplog::Hlc>,
 }
 
+/// 0.8.16 (issue #54): vocab の orphan (= 死蔵 vid) 検出スナップショット。
+/// `HimoType::Leaf` の値は `vocab.insert` (常に新 vid 払出) で書かれるため、
+/// re-tie / remove で旧 vid が himo から外れても vocab data 側は残置する。
+/// 同 vid を参照する live cell が皆無の vid を orphan として計上する。
+///
+/// 計測は read-only で、 vocab 自体は変更しない。 `Tag` himo (= `get_or_insert`
+/// 経由で dedup) も live set の collection 対象 (= ある vid を Tag が参照中なら
+/// Leaf が後から orphan にしても live 判定)。
+#[derive(Debug, Clone)]
+pub struct VocabOrphanStats {
+    /// vocab に発行済みの全 vid 数 (= `Vocabulary::count()`)。
+    pub vocab_total: u32,
+    /// いずれかの himo cell から参照されている vid 数。
+    pub live_vids: u32,
+    /// `vocab_total - live_vids`。 死蔵の vid 数。
+    pub orphan_vids: u32,
+    /// orphan vid に対応する vocab data の総 byte 数 (= 救出可能領域)。
+    pub orphan_bytes: u64,
+    /// live vid に対応する vocab data の総 byte 数 (= 健全に使われてる領域)。
+    pub live_bytes: u64,
+}
+
+impl VocabOrphanStats {
+    /// `orphan_vids / vocab_total` の比率 (`vocab_total == 0` なら 0.0)。
+    pub fn dead_ratio(&self) -> f64 {
+        if self.vocab_total == 0 { 0.0 }
+        else { self.orphan_vids as f64 / self.vocab_total as f64 }
+    }
+}
+
 fn oplog_path_for(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{}.oplog", path))
 }
@@ -5593,6 +5623,70 @@ impl Engine {
             peer_id,
             hlc_entries,
             max_hlc,
+        }
+    }
+
+    /// 0.8.16 (issue #54): vocab の orphan (= 死蔵 vid) を read-only scan。
+    /// `HimoType::Leaf` の `vocab.insert` 経路は re-tie / remove で旧 vid を
+    /// 回収しないため、 long-lived な curated store (= 元ソースから rebuild
+    /// しないタイプ) で vocab data が単調増加する。 この API でその実量を計測。
+    ///
+    /// 計測手順:
+    /// 1. 全 himo (Tag / Leaf) の `unique_values()` を union して live vid 集合を作る
+    /// 2. `(0..vocab.count())` のうち live 集合に無いものを orphan と判定
+    /// 3. orphan vid の `vocab.get(vid).len()` を合計して救出可能 bytes を出す
+    ///
+    /// O(vocab.count() + Σ himos.unique_values().len())。 vid set は `Vec<bool>` で
+    /// vocab.count() bit。 vocab.count() = 1B なら 1GB 食うので注意。 巨大 DB なら
+    /// 別 issue で BitVec か stream 化を検討。
+    pub fn vocab_orphan_stats(&self) -> VocabOrphanStats {
+        let vocab_total = self.vocab.count();
+        if vocab_total == 0 {
+            return VocabOrphanStats {
+                vocab_total: 0,
+                live_vids: 0,
+                orphan_vids: 0,
+                orphan_bytes: 0,
+                live_bytes: 0,
+            };
+        }
+        // live vid 集合 — Tag / Leaf 両方を対象。 Number / Ref は vocab を使わない。
+        // 各 himo の unique_values は局所 stored 値 (= cylinder side で管理) を返す。
+        // stored は内部表現値 +1 ではなく素の vid なので decode 不要。
+        let mut is_live = vec![false; vocab_total as usize];
+        for hid in 0..self.himo_types.len() {
+            match self.himo_types[hid] {
+                HimoType::Tag | HimoType::Leaf => {
+                    let vids = self.himos[hid].unique_values();
+                    for v in vids {
+                        if (v as usize) < is_live.len() {
+                            is_live[v as usize] = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut live_vids: u32 = 0;
+        let mut orphan_vids: u32 = 0;
+        let mut live_bytes: u64 = 0;
+        let mut orphan_bytes: u64 = 0;
+        for vid in 0..vocab_total {
+            let len = self.vocab.get(vid).len() as u64;
+            if is_live[vid as usize] {
+                live_vids += 1;
+                live_bytes += len;
+            } else {
+                orphan_vids += 1;
+                orphan_bytes += len;
+            }
+        }
+        VocabOrphanStats {
+            vocab_total,
+            live_vids,
+            orphan_vids,
+            orphan_bytes,
+            live_bytes,
         }
     }
 

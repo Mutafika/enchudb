@@ -41,6 +41,7 @@ dot command:
   .entity <eid>                      entity の全 himo を表示
   .define <name> <type> [<max>]      himo 追加 (tag|num|leaf|ref)
   .stats                             engine stats (count / WAL lag)
+  .orphans                           vocab orphan stats (#54、 leaf 死蔵 vid 推定)
   .dump [LIMIT]                      全 entity を text dump
   .commit                            明示 commit
 ";
@@ -225,6 +226,7 @@ fn run_dot(eng: &mut Engine, line: &str) -> Result<(), String> {
         }
         ".define" => cmd_define(eng, &rest),
         ".stats" => { cmd_stats(eng); Ok(()) }
+        ".orphans" => { cmd_orphans(eng); Ok(()) }
         ".dump" => {
             let limit = parse_limit(rest.first().copied(), usize::MAX)?;
             cmd_dump(eng, limit);
@@ -330,6 +332,16 @@ fn cmd_stats(eng: &Engine) {
     println!("queue_len      {}", s.queue_len);
     println!("pushed/applied {}/{}", s.pushed, s.applied);
     println!("peer_id        {}", s.peer_id);
+}
+
+fn cmd_orphans(eng: &Engine) {
+    let s = eng.vocab_orphan_stats();
+    println!("vocab_total    {}", s.vocab_total);
+    println!("live_vids      {}", s.live_vids);
+    println!("orphan_vids    {}", s.orphan_vids);
+    println!("live_bytes     {}", s.live_bytes);
+    println!("orphan_bytes   {}", s.orphan_bytes);
+    println!("dead_ratio     {:.4}", s.dead_ratio());
 }
 
 fn cmd_dump(eng: &Engine, limit: usize) {

@@ -3,6 +3,41 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.8.16 — 2026-06-09
+
+`HimoType::Leaf` の re-tie / remove で発生する vocab orphan (= 死蔵 vid) を
+**読み取り専用**で実測する `Engine::vocab_orphan_stats()` API + CLI `.orphans`
+を追加。 issue [#54](https://github.com/Mutafika/enchudb/issues/54) の scope に
+合わせ **検出のみ**、 reclaim / compact は将来 release。 file format / wire
+format 完全不変、 **0.8.15 から再 build のみで上がれる**。
+
+### Added
+
+- `enchudb_engine::VocabOrphanStats` struct (`vocab_total` / `live_vids` /
+  `orphan_vids` / `live_bytes` / `orphan_bytes` + `dead_ratio()` helper)。
+- `Engine::vocab_orphan_stats()` — Tag / Leaf 全 himo の `unique_values()` を
+  union して live vid 集合を作り、 `(0..vocab.count())` との差を orphan として
+  返す。 vocab / himo は一切変更しない pure read-only。 計算量は
+  `O(vocab_total + Σ unique_values.len())`。
+- CLI `.orphans` — REPL の dot command として上記 stats を表示。
+
+### 背景
+
+`vocab.insert` (= Leaf 用の dedup なし append) は re-tie / remove で旧 vid を
+回収しないため、 long-lived な curated store (= 元ソースから rebuild しない
+タイプ、 例: opyula の memory / room store) で vocab data が単調増加。 opyula
+`wiki.ecdb` は live 45 entity に対し物理 155 MB (~3.4 MB/entity) と観測され
+ており、 大半が orphan と推定 (= この API で初めて実測可能に)。
+
+### scope 外 (follow-up)
+
+- vocab `compact()` API: live vid だけ残して data / offsets / lookup index を
+  詰め直す reclaim 経路。 oplog watermark との grace (= 未消化 WAL が旧 vid を
+  replay に要する間は free 不可) が前提。 別 issue で扱う。
+- 大規模 DB 向けの BitVec / streaming 化: 現実装は `Vec<bool>` で
+  `vocab.count()` bit 確保するため、 vocab 1B vid で 1 GB RAM。 巨大 DB は
+  別 issue で対応。
+
 ## 0.8.15 — 2026-06-04
 
 ENOSPC 起因の warning スパムと sidecar 破損時の DB 読取不能 (issue
