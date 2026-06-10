@@ -33,6 +33,7 @@
 
 use enchudb_sql::{Database, Output, Value};
 use std::ffi::{CStr, CString, c_char};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 
 // ────── return codes ──────
@@ -91,6 +92,21 @@ fn make_result(out: Output) -> enchudb_result {
     }
 }
 
+// ────── panic guard (issue #59) ──────
+//
+// engine 層は capacity 到達・破損 file・edge 値などで panic し得る。 panic が
+// extern "C" 境界を unwind して越えると **未定義動作**。 各 entry point を
+// catch_unwind でくるみ、 panic を「安全な失敗値」に潰す。 panic 後の handle は
+// 状態が不定なので、 caller は error 扱いで close すべき(UB よりは遥かにマシ)。
+// AssertUnwindSafe: raw pointer / &mut を closure に渡すため明示。
+
+fn guard_i32(f: impl FnOnce() -> i32) -> i32 {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or(ENCHUDB_ERROR)
+}
+// 注: result accessor (rows/cols/col_name/is_null/int/text/version/last_error) は
+// 全て bounds-check 済みの materialized data を読むだけで panic しないため、 engine に
+// 触れる 6 関数 (open/create/close/exec/query/result_free) のみ guard する。
+
 // ────── DB lifecycle ──────
 
 /// DB を開く（既存なら open、無ければ create）。
@@ -100,26 +116,28 @@ pub unsafe extern "C" fn enchudb_open(
     path: *const c_char,
     out_db: *mut *mut enchudb_db,
 ) -> i32 {
-    if out_db.is_null() { return ENCHUDB_INVALID_ARG; }
-    unsafe { *out_db = ptr::null_mut(); }
-    let path = match unsafe { cstr_to_str(path) } {
-        Ok(s) => s,
-        Err(rc) => return rc,
-    };
+    guard_i32(move || {
+        if out_db.is_null() { return ENCHUDB_INVALID_ARG; }
+        unsafe { *out_db = ptr::null_mut(); }
+        let path = match unsafe { cstr_to_str(path) } {
+            Ok(s) => s,
+            Err(rc) => return rc,
+        };
 
-    let result = if std::path::Path::new(path).exists() {
-        Database::open(path)
-    } else {
-        Database::create(path)
-    };
-    match result {
-        Ok(inner) => {
-            let boxed = Box::new(enchudb_db { inner, last_error: CString::default() });
-            unsafe { *out_db = Box::into_raw(boxed); }
-            ENCHUDB_OK
+        let result = if std::path::Path::new(path).exists() {
+            Database::open(path)
+        } else {
+            Database::create(path)
+        };
+        match result {
+            Ok(inner) => {
+                let boxed = Box::new(enchudb_db { inner, last_error: CString::default() });
+                unsafe { *out_db = Box::into_raw(boxed); }
+                ENCHUDB_OK
+            }
+            Err(_) => ENCHUDB_ERROR,
         }
-        Err(_) => ENCHUDB_ERROR,
-    }
+    })
 }
 
 /// 明示 create（既存ファイルがあると Engine 側でエラー）。
@@ -128,28 +146,33 @@ pub unsafe extern "C" fn enchudb_create(
     path: *const c_char,
     out_db: *mut *mut enchudb_db,
 ) -> i32 {
-    if out_db.is_null() { return ENCHUDB_INVALID_ARG; }
-    unsafe { *out_db = ptr::null_mut(); }
-    let path = match unsafe { cstr_to_str(path) } {
-        Ok(s) => s,
-        Err(rc) => return rc,
-    };
-    match Database::create(path) {
-        Ok(inner) => {
-            let boxed = Box::new(enchudb_db { inner, last_error: CString::default() });
-            unsafe { *out_db = Box::into_raw(boxed); }
-            ENCHUDB_OK
+    guard_i32(move || {
+        if out_db.is_null() { return ENCHUDB_INVALID_ARG; }
+        unsafe { *out_db = ptr::null_mut(); }
+        let path = match unsafe { cstr_to_str(path) } {
+            Ok(s) => s,
+            Err(rc) => return rc,
+        };
+        match Database::create(path) {
+            Ok(inner) => {
+                let boxed = Box::new(enchudb_db { inner, last_error: CString::default() });
+                unsafe { *out_db = Box::into_raw(boxed); }
+                ENCHUDB_OK
+            }
+            Err(_) => ENCHUDB_ERROR,
         }
-        Err(_) => ENCHUDB_ERROR,
-    }
+    })
 }
 
 /// DB handle を破棄。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn enchudb_close(db: *mut enchudb_db) -> i32 {
-    if db.is_null() { return ENCHUDB_INVALID_ARG; }
-    unsafe { drop(Box::from_raw(db)); }
-    ENCHUDB_OK
+    guard_i32(move || {
+        if db.is_null() { return ENCHUDB_INVALID_ARG; }
+        // Engine の Drop は consumer join / flush 系で panic し得るので guard 内で。
+        unsafe { drop(Box::from_raw(db)); }
+        ENCHUDB_OK
+    })
 }
 
 // ────── exec / query ──────
@@ -158,16 +181,18 @@ pub unsafe extern "C" fn enchudb_close(db: *mut enchudb_db) -> i32 {
 /// SELECT も流せるが結果は捨てられる。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn enchudb_exec(db: *mut enchudb_db, sql: *const c_char) -> i32 {
-    if db.is_null() { return ENCHUDB_INVALID_ARG; }
-    let db = unsafe { &mut *db };
-    let sql = match unsafe { cstr_to_str(sql) } {
-        Ok(s) => s,
-        Err(rc) => return rc,
-    };
-    match db.inner.execute(sql) {
-        Ok(_) => ENCHUDB_OK,
-        Err(e) => { set_error(db, e.to_string()); ENCHUDB_ERROR }
-    }
+    guard_i32(move || {
+        if db.is_null() { return ENCHUDB_INVALID_ARG; }
+        let db = unsafe { &mut *db };
+        let sql = match unsafe { cstr_to_str(sql) } {
+            Ok(s) => s,
+            Err(rc) => return rc,
+        };
+        match db.inner.execute(sql) {
+            Ok(_) => ENCHUDB_OK,
+            Err(e) => { set_error(db, e.to_string()); ENCHUDB_ERROR }
+        }
+    })
 }
 
 /// SQL を実行して結果を `*out_result` に返す。SELECT 用。
@@ -178,21 +203,23 @@ pub unsafe extern "C" fn enchudb_query(
     sql: *const c_char,
     out_result: *mut *mut enchudb_result,
 ) -> i32 {
-    if db.is_null() || out_result.is_null() { return ENCHUDB_INVALID_ARG; }
-    unsafe { *out_result = ptr::null_mut(); }
-    let db = unsafe { &mut *db };
-    let sql = match unsafe { cstr_to_str(sql) } {
-        Ok(s) => s,
-        Err(rc) => return rc,
-    };
-    match db.inner.execute(sql) {
-        Ok(out) => {
-            let r = make_result(out);
-            unsafe { *out_result = Box::into_raw(Box::new(r)); }
-            ENCHUDB_OK
+    guard_i32(move || {
+        if db.is_null() || out_result.is_null() { return ENCHUDB_INVALID_ARG; }
+        unsafe { *out_result = ptr::null_mut(); }
+        let db = unsafe { &mut *db };
+        let sql = match unsafe { cstr_to_str(sql) } {
+            Ok(s) => s,
+            Err(rc) => return rc,
+        };
+        match db.inner.execute(sql) {
+            Ok(out) => {
+                let r = make_result(out);
+                unsafe { *out_result = Box::into_raw(Box::new(r)); }
+                ENCHUDB_OK
+            }
+            Err(e) => { set_error(db, e.to_string()); ENCHUDB_ERROR }
         }
-        Err(e) => { set_error(db, e.to_string()); ENCHUDB_ERROR }
-    }
+    })
 }
 
 /// 直近 enchudb_exec / enchudb_query が失敗したときのエラーメッセージ。
@@ -276,9 +303,11 @@ pub unsafe extern "C" fn enchudb_result_text(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn enchudb_result_free(r: *mut enchudb_result) -> i32 {
-    if r.is_null() { return ENCHUDB_INVALID_ARG; }
-    unsafe { drop(Box::from_raw(r)); }
-    ENCHUDB_OK
+    guard_i32(move || {
+        if r.is_null() { return ENCHUDB_INVALID_ARG; }
+        unsafe { drop(Box::from_raw(r)); }
+        ENCHUDB_OK
+    })
 }
 
 // ────── version ──────

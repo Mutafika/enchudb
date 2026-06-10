@@ -3,6 +3,49 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.8.17 — 2026-06-10
+
+全コード監査 (issue #57–#61) で洗い出した **設計判断不要・後方互換** な堅牢性
+fix を 1 本にまとめた safe cluster。 file format / wire format 完全不変、
+**0.8.16 から再 build のみで上がれる**。 header CRC 拡張 (#58①) / PK 一意性の
+所有 (#60) / capacity panic の Result 化 (#59 の API 破壊部分) は format or API
+変更を伴うため本 release から除外、 別途。
+
+### Fixed
+
+- **oplog append 失敗が silent な op 欠落になる** ([#57](https://github.com/Mutafika/enchudb/issues/57)):
+  engine の tie/untie/delete 経路は `let _ = wal.append(..)` で失敗を握り潰す。
+  oplog 容量到達時 (`OutOfMemory`) に **mmap body は更新されるが op が stream に
+  載らない** ため、 `publish_since` で tail する peer が変更を恒久的に取りこぼす。
+  完全な伝播 / 修復経路は別 issue だが、 まず**検知可能**にするため
+  `OpLog::wal_full_err()` の単一地点で **1 秒 1 行** rate-limit の warning を
+  emit (0.8.15 の persist warning と同温度)。 silent loss を止める。
+- **`OpLog` の `pending_writes` が panic で leak** ([#58](https://github.com/Mutafika/enchudb/issues/58) ②):
+  `fetch_add` → `append_inner` → `fetch_sub` 直列のため `append_inner` panic で
+  counter が +1 のまま残り、 `try_reset` (`pending_writes == 0` 条件) が永久に
+  発火しなくなる。 RAII ガード (`pending_guard`) で panic 経路でも均衡させ、
+  `append` / `append_many` / `append_relayed` の 3 経路に適用。
+- **schema sidecar の serialize がエスケープなし** ([#61](https://github.com/Mutafika/enchudb/issues/61)):
+  `.schema` の format は table/column 名を `|` `;` `:` 改行・ relation `->` で
+  連結するため、 名前にこれらが入ると round-trip で schema 破損。
+  `TableBuilder::build()` で table 名 + 全 column 名を `validate_schema_name` で
+  検証し、 予約文字を含む名前を `BadValue` で弾いて silent corruption を止める。
+- **FFI が `catch_unwind` ゼロで panic が UB に化ける** ([#59](https://github.com/Mutafika/enchudb/issues/59) の安全部分):
+  engine 層の panic (capacity / 破損 file / edge 値) が `extern "C"` 境界を
+  unwind して越えると未定義動作。 engine に触れる 6 関数 (`open` / `create` /
+  `close` / `exec` / `query` / `result_free`) を `catch_unwind` でくるみ、
+  panic を error code に潰す。 result accessor 8 関数は bounds-check 済みの
+  materialized data を読むだけで panic しないため guard 不要。
+
+### 除外 (別 issue / 設計判断あり)
+
+- #58① record header の CRC 拡張 — 既存 `.oplog` の CRC 再計算が必要で
+  on-disk 互換に影響。 `REC_VERSION` gate 込みで別途。
+- #60 PK 一意性の所有層決定 (SQL 素 INSERT 無検査 + schema upsert TOCTOU) —
+  engine が atomic upsert primitive を持つか「保証しない」と明文化するかの判断。
+- #59 capacity panic (`entity_set` / `content_store` / `vocabulary`) の Result 化 —
+  public write API の signature 破壊を伴う。
+
 ## 0.8.16 — 2026-06-09
 
 `HimoType::Leaf` の re-tie / remove で発生する vocab orphan (= 死蔵 vid) を

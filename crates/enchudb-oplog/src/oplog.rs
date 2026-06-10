@@ -381,7 +381,62 @@ pub struct OpLog {
 unsafe impl Send for OpLog {}
 unsafe impl Sync for OpLog {}
 
+/// `pending_writes` を RAII で減算するガード。
+///
+/// issue #58: 旧コードは `fetch_add` → `append_inner` → `fetch_sub` を直列で
+/// 並べていたため、 `append_inner` が panic すると `fetch_sub` が skip され
+/// counter が +1 のまま残り、 `try_reset`(`pending_writes == 0` 条件)が
+/// 永久に発火しなくなった。 drop で必ず減算することで panic 経路でも均衡する。
+struct PendingGuard<'a> {
+    counter: &'a std::sync::atomic::AtomicU32,
+    n: u32,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.n, Ordering::AcqRel);
+    }
+}
+
 impl OpLog {
+    /// `pending_writes` を `n` 増やし、 drop 時に同量減らす RAII ガードを返す。
+    fn pending_guard(&self, n: u32) -> PendingGuard<'_> {
+        self.pending_writes.fetch_add(n, Ordering::AcqRel);
+        PendingGuard { counter: &self.pending_writes, n }
+    }
+
+    /// oplog 容量到達時の `OutOfMemory` エラーを生成する。
+    ///
+    /// issue #57: caller(engine の tie/untie/delete 経路)はこの Err を
+    /// `let _ =` で握り潰すため、 append 失敗が **silent な op 欠落**になっていた。
+    /// 少なくとも検知だけは可能にするため、 エラー生成の単一地点で警告を
+    /// emit する。 0.8.15 の persist warning と同じく **1 秒 1 行**に
+    /// rate-limit してターミナルを潰さない。 完全な伝播 / 修復経路は別 issue。
+    fn wal_full_err(&self) -> io::Error {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use std::sync::atomic::AtomicU64;
+            static LAST_WARN_MS: AtomicU64 = AtomicU64::new(0);
+            if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                let now_ms = now.as_millis() as u64;
+                let last = LAST_WARN_MS.load(Ordering::Relaxed);
+                if now_ms.saturating_sub(last) >= 1000
+                    && LAST_WARN_MS
+                        .compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    eprintln!(
+                        "enchudb oplog: WAL full (capacity={} bytes) — append dropped, \
+                         op NOT recorded to stream; advance checkpoint or enable auto_reset \
+                         (rate-limited to 1/s)",
+                        self.capacity
+                    );
+                }
+            }
+        }
+        io::Error::new(io::ErrorKind::OutOfMemory, "WAL full — consumer reset behind")
+    }
+
     /// 新規 WAL ファイル作成。capacity は初期サイズ(bytes)。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create(path: &Path, capacity: usize) -> io::Result<Self> {
@@ -512,10 +567,8 @@ impl OpLog {
         let payload_size = op.payload_size();
         let record_size = REC_HEADER_SIZE + payload_size;
 
-        self.pending_writes.fetch_add(1, Ordering::AcqRel);
-        let result = self.append_inner(op, payload_size, record_size, None);
-        self.pending_writes.fetch_sub(1, Ordering::AcqRel);
-        result
+        let _guard = self.pending_guard(1);
+        self.append_inner(op, payload_size, record_size, None)
     }
 
     /// 複数 record を **1 回の flock サイクル** で連続 append。
@@ -529,10 +582,8 @@ impl OpLog {
             .collect();
         let total: usize = sizes.iter().sum();
 
-        self.pending_writes.fetch_add(records.len() as u32, Ordering::AcqRel);
-        let result = self.append_many_inner(records, &sizes, total);
-        self.pending_writes.fetch_sub(records.len() as u32, Ordering::AcqRel);
-        result
+        let _guard = self.pending_guard(records.len() as u32);
+        self.append_many_inner(records, &sizes, total)
     }
 
     fn append_many_inner(
@@ -553,10 +604,7 @@ impl OpLog {
                 let cur = on_disk.max(self.head.load(Ordering::Acquire));
                 let new = cur + total as u64;
                 if new > self.capacity {
-                    return Err(io::Error::new(
-                        io::ErrorKind::OutOfMemory,
-                        "WAL full — consumer reset behind",
-                    ));
+                    return Err(self.wal_full_err());
                 }
                 self.head.store(new, Ordering::Release);
                 cur
@@ -566,10 +614,7 @@ impl OpLog {
                 let cur = self.head.load(Ordering::Acquire);
                 let new = cur + total as u64;
                 if new > self.capacity {
-                    return Err(io::Error::new(
-                        io::ErrorKind::OutOfMemory,
-                        "WAL full — consumer reset behind",
-                    ));
+                    return Err(self.wal_full_err());
                 }
                 self.head.store(new, Ordering::Release);
                 cur
@@ -642,9 +687,8 @@ impl OpLog {
     pub fn append_relayed(&self, op: Op<'_>, header: RelayedHeader) -> io::Result<u64> {
         let payload_size = op.payload_size();
         let record_size = REC_HEADER_SIZE + payload_size;
-        self.pending_writes.fetch_add(1, Ordering::AcqRel);
+        let _guard = self.pending_guard(1);
         let result = self.append_inner(op, payload_size, record_size, Some(header));
-        self.pending_writes.fetch_sub(1, Ordering::AcqRel);
         // ローカル HLC clock を受信 HLC で merge (後退防止)
         self.merge_external_hlc(header.hlc);
         result
@@ -694,10 +738,7 @@ impl OpLog {
                 let cur = on_disk.max(self.head.load(Ordering::Acquire));
                 let new = cur + record_size as u64;
                 if new > self.capacity {
-                    return Err(io::Error::new(
-                        io::ErrorKind::OutOfMemory,
-                        "WAL full — consumer reset behind",
-                    ));
+                    return Err(self.wal_full_err());
                 }
                 // lock を保持しているので CAS ではなく単純 store で OK
                 self.head.store(new, Ordering::Release);
@@ -708,10 +749,7 @@ impl OpLog {
                 let cur = self.head.load(Ordering::Acquire);
                 let new = cur + record_size as u64;
                 if new > self.capacity {
-                    return Err(io::Error::new(
-                        io::ErrorKind::OutOfMemory,
-                        "WAL full — consumer reset behind",
-                    ));
+                    return Err(self.wal_full_err());
                 }
                 self.head.store(new, Ordering::Release);
                 cur
