@@ -327,6 +327,36 @@ mod tests {
 
     fn cstr(s: &str) -> CString { CString::new(s).unwrap() }
 
+    // ── issue #59: panic-guard regression ──
+    //
+    // engine 層が capacity 到達・破損 file・edge 値で panic したとき、 その panic が
+    // extern "C" 境界を unwind して越えると UB。 `guard_i32` が panic を捕まえて
+    // ENCHUDB_ERROR に潰し、 process を生かす契約を直接検証する。
+
+    #[test]
+    fn guard_i32_passes_through_normal_return() {
+        assert_eq!(guard_i32(|| ENCHUDB_OK), ENCHUDB_OK);
+        assert_eq!(guard_i32(|| ENCHUDB_INVALID_ARG), ENCHUDB_INVALID_ARG);
+    }
+
+    #[test]
+    fn guard_i32_converts_panic_to_error_without_aborting() {
+        // panic backtrace でテスト出力を汚さないよう hook を一時無効化。
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let rc = guard_i32(|| panic!("engine capacity reached (simulated)"));
+
+        std::panic::set_hook(prev);
+
+        // catch_unwind が発火した証拠 (= ENCHUDB_ERROR)。 ここに到達できること自体が
+        // 「panic が ABI を越えて process を殺さなかった」 ことの証明。
+        assert_eq!(rc, ENCHUDB_ERROR);
+
+        // guard が以後も正常に機能する (catch 後に状態が壊れていない)。
+        assert_eq!(guard_i32(|| ENCHUDB_OK), ENCHUDB_OK);
+    }
+
     fn fresh(name: &str) -> *mut enchudb_db {
         let path = format!("/tmp/enchudb_ffi_{name}.db");
         let _ = std::fs::remove_file(&path);
