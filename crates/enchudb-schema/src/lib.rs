@@ -1049,6 +1049,13 @@ impl<'a> TableBuilder<'a> {
             return Ok(Table { db, inner: existing });
         }
 
+        // issue #61: 名前に sidecar 区切り文字が入ると round-trip で schema が壊れる。
+        // 新規 table 定義の時点で table 名 + 全 column 名を弾く。
+        validate_schema_name("table", &name)?;
+        for (col_name, _, _) in &col_specs {
+            validate_schema_name("column", col_name)?;
+        }
+
         // PK 検証
         if let Some(pk_name) = &pk {
             if !col_specs.iter().any(|(n, _, _)| n == pk_name) {
@@ -1780,6 +1787,30 @@ struct RawTableDef {
     cols: Vec<(String, ColumnType)>,
     pk: Option<String>,
     relations: Vec<(String, String)>,
+}
+
+/// `.schema` sidecar の serialize 形式は table / column / relation 名を
+/// 区切り文字 `|` `;` `:` 改行、 relation は `->` で連結する (下記 `serialize_schema`
+/// 参照)。 これらを名前に含むと round-trip で schema が壊れる (issue #61) ため、
+/// table / column を define する build 時点で弾いて silent corruption を止める。
+fn validate_schema_name(kind: &str, name: &str) -> Result<(), SchemaError> {
+    const FORBIDDEN: &[char] = &['|', ';', ':', '\n', '\r'];
+    if name.is_empty() {
+        return Err(SchemaError::BadValue(format!("{kind} name must not be empty")));
+    }
+    if let Some(c) = name.chars().find(|c| FORBIDDEN.contains(c)) {
+        return Err(SchemaError::BadValue(format!(
+            "{kind} name {name:?} contains reserved character {c:?} \
+             (| ; : newline and \"->\" are .schema sidecar delimiters)"
+        )));
+    }
+    if name.contains("->") {
+        return Err(SchemaError::BadValue(format!(
+            "{kind} name {name:?} contains reserved sequence \"->\" \
+             (.schema sidecar relation delimiter)"
+        )));
+    }
+    Ok(())
 }
 
 fn serialize_schema(tables: &[Arc<TableInner>]) -> String {
