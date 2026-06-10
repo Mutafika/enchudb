@@ -381,6 +381,13 @@ pub struct OpLog {
 unsafe impl Send for OpLog {}
 unsafe impl Sync for OpLog {}
 
+// テスト専用: 次の `append_inner` 呼び出しを panic させるフラグ (issue #58② 検証用)。
+// thread-local なので並行テストでも干渉しない。 release build には残らない。
+#[cfg(test)]
+thread_local! {
+    static FAULT_INJECT_APPEND_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// `pending_writes` を RAII で減算するガード。
 ///
 /// issue #58: 旧コードは `fetch_add` → `append_inner` → `fetch_sub` を直列で
@@ -719,6 +726,17 @@ impl OpLog {
         record_size: usize,
         relay: Option<RelayedHeader>,
     ) -> io::Result<u64> {
+        // テスト専用 fault injection: pending_writes の RAII ガード (issue #58②) が
+        // panic-unwind 経路でも均衡することを deterministic に検証するため、 ここで
+        // panic させられるようにする。 release build には一切残らない。
+        #[cfg(test)]
+        FAULT_INJECT_APPEND_PANIC.with(|c| {
+            if c.get() {
+                c.set(false);
+                panic!("fault-injected append panic (issue #58② test)");
+            }
+        });
+
         // multi-process safety: flock(LOCK_EX) で同じ .wal に対する append を直列化。
         // 単一 process 内では既に `head` の CAS で並列 OK だが、 別 process の OpLog は
         // 別の process-local AtomicU64 を持つので同 offset に書き込む race がある。
@@ -1134,6 +1152,59 @@ mod tests {
         assert_eq!(lsn1, 1);
         assert_eq!(lsn2, 2);
         assert_eq!(lsn3, 3);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// issue #57: 容量到達時、 `append` は panic せず `OutOfMemory` の `Err` を
+    /// graceful に返すこと (= wal_full_err 経路)。 旧来の挙動を回帰で固定する。
+    #[test]
+    fn append_returns_err_when_full_not_panic() {
+        let p = tmp("full");
+        // HEADER_SIZE(32) + 数レコードぶんしか入らない極小 capacity。
+        let wal = OpLog::create(&p, HEADER_SIZE + 256).unwrap();
+        let mut hit_full = false;
+        for i in 0..10_000u64 {
+            match wal.append(Op::Tie { eid: i, himo_id: 0, value: i as u32 }) {
+                Ok(_) => {}
+                Err(e) => {
+                    assert_eq!(e.kind(), io::ErrorKind::OutOfMemory, "full は OutOfMemory で返る");
+                    hit_full = true;
+                    break;
+                }
+            }
+        }
+        assert!(hit_full, "極小 capacity なら必ず満杯に到達して Err を返すはず");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// issue #58②: `append_inner` が panic しても `pending_writes` が RAII ガードで
+    /// 必ず減算され、 counter が +1 のまま leak しないこと。 leak すると
+    /// `try_reset`(pending == 0 条件)が永久に発火しなくなる。 fault injection で
+    /// deterministic に panic させて検証する。
+    #[test]
+    fn pending_writes_balanced_on_append_panic() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let p = tmp("panic_balance");
+        let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+        assert_eq!(wal.pending_writes(), 0);
+
+        // 次の append_inner を panic させる。 期待された panic なので、 backtrace で
+        // テスト出力を汚さないよう hook を一時無効化する。
+        FAULT_INJECT_APPEND_PANIC.with(|c| c.set(true));
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 })
+        }));
+        std::panic::set_hook(prev);
+        assert!(r.is_err(), "fault injection で append は panic するはず");
+
+        // ガードが効いていれば counter は 0 に戻っている (leak なし)。
+        assert_eq!(wal.pending_writes(), 0, "panic 後も pending_writes が均衡している");
+
+        // 後続の正常 append が通り、 pending も 0 に戻ることを確認。
+        wal.append(Op::Tie { eid: 2, himo_id: 0, value: 2 }).unwrap();
+        assert_eq!(wal.pending_writes(), 0);
         let _ = std::fs::remove_file(&p);
     }
 

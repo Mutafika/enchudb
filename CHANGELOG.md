@@ -37,6 +37,22 @@ fix を 1 本にまとめた safe cluster。 file format / wire format 完全不
   panic を error code に潰す。 result accessor 8 関数は bounds-check 済みの
   materialized data を読むだけで panic しないため guard 不要。
 
+### Tests
+
+各 fix の **新挙動**に対する回帰テストを追加 (= 既存テストの「壊れてない」ではなく
+「fix が効いてる」を固定):
+
+- #61 — `issue61_name_validation` 5 件 (予約文字を弾く / 正常名は通る)。
+- #57 — `append_returns_err_when_full_not_panic`: 極小 capacity で満杯にして
+  `append` が panic せず `OutOfMemory` の `Err` を返すことを固定。
+- #58② — `pending_writes_balanced_on_append_panic`: `#[cfg(test)]` の fault
+  injection で `append_inner` を deterministic に panic させ、 RAII ガードにより
+  `pending_writes` が leak しない (counter が 0 に戻る) ことを検証。 旧来の
+  `fetch_add → inner → fetch_sub` 直列ならこのテストは fail する。
+- #59 — `guard_i32_converts_panic_to_error_without_aborting` /
+  `guard_i32_passes_through_normal_return`: FFI guard が closure の panic を
+  `ENCHUDB_ERROR` に潰し process を abort させない / 正常時は素通しすることを固定。
+
 ### 除外 (別 issue / 設計判断あり)
 
 - #58① record header の CRC 拡張 — 既存 `.oplog` の CRC 再計算が必要で
