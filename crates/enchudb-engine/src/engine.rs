@@ -5429,6 +5429,11 @@ impl Engine {
                                 &listeners_for_thread,
                                 &emit_offset_for_thread,
                             );
+                            // graceful close でも ring を畳む: head==checkpoint なら
+                            // HEADER_SIZE へ巻き戻す。 100ms fsync tick を踏まない
+                            // short-lived writer (events.ecdb の log_event 等) でも
+                            // 次 open が full のまま始まらないようにするため。
+                            let _ = wal.try_reset();
                         }
                         return;
                     }
