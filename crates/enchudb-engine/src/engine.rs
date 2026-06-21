@@ -2103,6 +2103,22 @@ impl Engine {
         count
     }
 
+    /// oplog ring buffer が `try_reset` で head を HEADER_SIZE に巻き戻したとき、
+    /// bridge cursor (`sync_ops_offset`) も HEADER_SIZE に戻す。
+    ///
+    /// #63 fix の regression 対策: try_reset は head/checkpoint しか戻さないため、
+    /// これを呼ばないと sync_ops_offset が古い head を指したまま取り残され、
+    /// reset 後に append された record が `from > head` で transfer 対象から外れ、
+    /// `_sync_ops` に bridge されず sync から無言で欠落する。 reset と同じ
+    /// consumer thread から、 transfer 完了 (= offset==旧head) かつ pending==0 の
+    /// 直後にのみ呼ぶこと。
+    pub fn reset_sync_ops_offset(&self) {
+        self.sync_ops_offset.store(
+            enchudb_oplog::oplog::HEADER_SIZE as u64,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
     /// 0.7.0 (Phase 4): peer の watermark を更新する。 Syncer が peer から ack を
     /// 受け取ったタイミングで呼ぶ。 既存 row があれば update、 無ければ insert。
     /// `_sync_peers.consumed_lsn` を idempotent に更新。
@@ -5384,6 +5400,9 @@ impl Engine {
                                     enchudb_oplog::oplog::HEADER_SIZE as u64,
                                     Ordering::Release,
                                 );
+                                // #63 regression fix: bridge cursor も巻き戻す。
+                                // これが無いと reset 後の record が sync 欠落する。
+                                engine.reset_sync_ops_offset();
                             }
                             last_fsync = Instant::now();
                         }
@@ -5429,6 +5448,18 @@ impl Engine {
                                 &listeners_for_thread,
                                 &emit_offset_for_thread,
                             );
+                            // graceful close でも ring を畳む: head==checkpoint なら
+                            // HEADER_SIZE へ巻き戻す。 100ms fsync tick を踏まない
+                            // short-lived writer (events.ecdb の log_event 等) でも
+                            // 次 open が full のまま始まらないようにするため。
+                            if wal.try_reset() {
+                                emit_offset_for_thread.store(
+                                    enchudb_oplog::oplog::HEADER_SIZE as u64,
+                                    std::sync::atomic::Ordering::Release,
+                                );
+                                // #63 regression fix: bridge cursor も巻き戻す。
+                                engine.reset_sync_ops_offset();
+                            }
                         }
                         return;
                     }

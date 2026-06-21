@@ -112,3 +112,59 @@ fn publish_since_filters_by_hlc_through_sync_ops() {
     assert!(count > 0 && count < 10,
             "filter should produce subset, got {count}");
 }
+
+/// #63 regression: oplog ring が reset した後に書いた record も `_sync_ops` に
+/// bridge され、 sync で配信されること。
+///
+/// バグ版 (sync_ops_offset を巻き戻さない) では:
+///   batch1 書く → consumer が bridge + try_reset (head→HEADER, offset は旧head放置)
+///   batch2 書く → transfer の from=旧head > 現head → batch2 が transfer されない
+///   → publish_since が batch2 を取りこぼす (count < 全件)
+/// fix 版では offset も HEADER に戻るので batch2 も bridge され全件届く。
+#[test]
+fn records_after_ring_reset_are_still_synced() {
+    let path = tmp_path("after_reset_synced");
+    cleanup(&path);
+
+    let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
+    eng.define_table("notes", 1000).unwrap();
+    eng.define_himo_in("notes", "note", HimoType::Number, 0).unwrap();
+    eng.enable_sync_tables().unwrap();
+    let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
+    eng.set_peer_id(1);
+
+    // batch1: 3 件 → commit → consumer が bridge + try_reset するまで待つ
+    for i in 1u32..=3 {
+        let e = eng.entity_in("notes").unwrap();
+        eng.tie_to(e, "notes.note", i);
+    }
+    eng.oplog_commit();
+    std::thread::sleep(Duration::from_millis(400));
+
+    // ring が実際に reset したことを確認 (= このテストの前提が成立している)。
+    let head_after_reset = eng.oplog().unwrap().head();
+    assert_eq!(
+        head_after_reset,
+        enchudb_oplog::oplog::HEADER_SIZE as u64,
+        "precondition: oplog ring should have reset to HEADER_SIZE after batch1 drained"
+    );
+
+    // batch2: reset 後に 2 件追加 → commit → bridge を待つ
+    for i in 4u32..=5 {
+        let e = eng.entity_in("notes").unwrap();
+        eng.tie_to(e, "notes.note", i);
+    }
+    eng.oplog_commit();
+    std::thread::sleep(Duration::from_millis(400));
+
+    // 全 5 件が `_sync_ops` 経由で publish されること。
+    let transport: Arc<dyn enchudb_engine::transport::Transport> =
+        Arc::new(InMemoryTransport::new());
+    let syncer = Syncer::new(eng.clone(), transport.clone());
+    let count = syncer.publish_since(Hlc::ZERO);
+    assert_eq!(
+        count, 5,
+        "all 5 records must sync across the ring reset (got {count}); \
+         batch2 (notes 4-5) lost = sync_ops_offset not rewound on try_reset"
+    );
+}

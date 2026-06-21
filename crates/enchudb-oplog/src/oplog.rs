@@ -833,9 +833,16 @@ impl OpLog {
 
     /// v30: ring buffer reset。
     /// head == checkpoint && pending_writes == 0 のときのみ実行可能。
-    /// v32: auto_reset が false なら常に skip(Syncer attached の engine で使う)。
+    ///
+    /// fix: auto_reset ゲートを撤去。 元は v32 で「Syncer attached の engine は ring を
+    /// reset させない」ために入れた gate だが、 0.8.0 で sync publish path が `_sync_ops`
+    /// 経由になり oplog ring を直接読まなくなった (sync.rs 参照) ので gate の存在理由は
+    /// 消えていた。 にもかかわらず default が false のままだったため production では
+    /// try_reset が常時 no-op になり、 ring が一度も畳まれず 16MB を使い切ると WAL full
+    /// で append が全 drop される状態に陥っていた (#57 でようやく可視化)。 reset 条件
+    /// (head==checkpoint ⇒ body へ msync 済 && pending==0) を満たす領域は crash recovery
+    /// にも sync にも不要なので、 無条件に畳んでよい。 `auto_reset` フラグは vestigial。
     pub fn try_reset(&self) -> bool {
-        if !self.auto_reset.load(Ordering::Acquire) { return false; }
         let head = self.head.load(Ordering::Acquire);
         let cp = self.checkpoint.load(Ordering::Acquire);
         if head != cp || head <= HEADER_SIZE as u64 { return false; }
@@ -1454,6 +1461,34 @@ mod tests {
 
         let lsn = wal.append(Op::Tie { eid: 999, himo_id: 0, value: 99 }).unwrap();
         assert!(lsn > 100);
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 回帰 (#57 follow-up): production では `set_auto_reset(true)` を呼ばない。
+    /// 旧実装は `auto_reset` ゲートで `try_reset` を常時 no-op にしていたため、
+    /// ring が一度も畳まれず 16MB を使い切ると WAL full で全 append を drop していた。
+    /// フラグ未設定 (= create 直後の本番初期状態) でも head==checkpoint なら
+    /// reclaim されることを保証する。 このテストはゲートが復活したら fail する。
+    #[test]
+    fn try_reset_recycles_without_auto_reset_flag() {
+        let p = tmp("ring_reset_no_flag");
+        let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+        // ※ set_auto_reset(true) は意図的に呼ばない (本番と同じ初期状態)。
+        for i in 0..100u32 {
+            wal.append(Op::Tie { eid: i as u64, himo_id: 0, value: i }).unwrap();
+        }
+        wal.append(Op::Commit).unwrap();
+        let head_before = wal.head();
+        assert!(head_before > HEADER_SIZE as u64);
+
+        wal.advance_checkpoint(head_before);
+        assert!(
+            wal.try_reset(),
+            "ring must reclaim even without set_auto_reset(true)"
+        );
+        assert_eq!(wal.head(), HEADER_SIZE as u64);
+        assert_eq!(wal.checkpoint(), HEADER_SIZE as u64);
 
         let _ = std::fs::remove_file(&p);
     }
