@@ -1434,7 +1434,7 @@ impl Engine {
     /// 明示的に単独 Engine が欲しい場合はこちらを使う。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_standalone(path: &str) -> io::Result<Self> {
-        Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ true)
+        Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ true, /*readonly=*/ false)
     }
 
     /// read-only open: writer lock を取らず、 書き込み API は error。
@@ -1442,7 +1442,7 @@ impl Engine {
     /// 用途: GUI の表示専用 process、 監視ツール、 backup-reader 等。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_readonly(path: &str) -> io::Result<Self> {
-        let mut eng = Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ false)?;
+        let mut eng = Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ false, /*readonly=*/ true)?;
         eng.is_readonly.store(true, std::sync::atomic::Ordering::Release);
         Ok(eng)
     }
@@ -1457,7 +1457,7 @@ impl Engine {
     /// 内部用: region CRC 検証を skip できる open。WAL ルート用。
     /// `take_lock = true` で `.db.lock` の flock(LOCK_EX) を取得し、 Engine 寿命中保持。
     #[cfg(not(target_arch = "wasm32"))]
-    fn open_internal(path: &str, verify_region_crc: bool, take_lock: bool) -> io::Result<Self> {
+    fn open_internal(path: &str, verify_region_crc: bool, take_lock: bool, readonly: bool) -> io::Result<Self> {
         // open path: writer lock を mmap 前に取る (= 他 writer 居れば block)
         let writer_lock = if take_lock {
             Some(acquire_writer_lock(path)?)
@@ -1469,7 +1469,7 @@ impl Engine {
         let file_size = file.metadata()?.len();
         Self::validate_file_size(&file, file_size)?;
         let mmap = unsafe { MmapMut::map_mut(&file)? };
-        let mut eng = Self::load_from_backing(Backing::Mmap(mmap))
+        let mut eng = Self::load_from_backing(Backing::Mmap(mmap), readonly)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         eng.path = path.to_string();
         eng._writer_lock = writer_lock;
@@ -1670,10 +1670,10 @@ impl Engine {
     /// Vec<u8> からエンジンを構築。WASM ではこれが唯一のエントリポイント。
     /// native でも使える（テスト、ファイル丸読みなど）。
     pub fn from_bytes(data: Vec<u8>) -> Result<Self, String> {
-        Self::load_from_backing(Backing::Memory(data))
+        Self::load_from_backing(Backing::Memory(data), /*readonly=*/ false)
     }
 
-    fn load_from_backing(mut backing: Backing) -> Result<Self, String> {
+    fn load_from_backing(mut backing: Backing, readonly: bool) -> Result<Self, String> {
         let buf = backing.as_slice_mut();
 
         if buf.len() < HEADER_SIZE || buf[H_MAGIC..H_MAGIC + 4] != FILE_MAGIC {
@@ -1859,12 +1859,19 @@ impl Engine {
         // insert で index 書き換え → crash → 次 open で flag=1 のまま skip → 不整合、
         // という穴が空く。 該当 page (vocab/himo_reg の data header) だけ msync する
         // ことで、 default 25 GB layout でも 1 ms 以下で済む。
-        eng.vocab.mark_index_clean(false);
-        eng.himo_reg.mark_index_clean(false);
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let _ = eng.backing.flush_range(eng.layout.vocab_data_off, 16);
-            let _ = eng.backing.flush_range(eng.layout.himoreg_data_off, 16);
+        //
+        // #56: readonly open は後続 write が無いため flip 自体が不要。 かつ flip +
+        // msync は file を物理的に書き換えて DB を dirty 化し、 次回 open で full
+        // index rebuild を誘発する (= read-only のはずが DB を太らせる)。 readonly
+        // では clean flag を一切触らない (真に非破壊 open)。
+        if !readonly {
+            eng.vocab.mark_index_clean(false);
+            eng.himo_reg.mark_index_clean(false);
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let _ = eng.backing.flush_range(eng.layout.vocab_data_off, 16);
+                let _ = eng.backing.flush_range(eng.layout.himoreg_data_off, 16);
+            }
         }
 
         Ok(eng)
@@ -5109,7 +5116,7 @@ impl Engine {
     /// 代わりに古い `.crc` ファイルは削除して、次回 flush で regenerate させる。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_concurrent_with_oplog(path: &str, oplog_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
-        let mut eng = Self::open_internal(path, /*verify_region_crc=*/ false, /*take_lock=*/ true)?;
+        let mut eng = Self::open_internal(path, /*verify_region_crc=*/ false, /*take_lock=*/ true, /*readonly=*/ false)?;
         // 古い .crc は WAL 活動後に stale になるので削除
         let crc_path = crate::integrity::crc_path_for(path);
         let _ = std::fs::remove_file(&crc_path);
@@ -7544,6 +7551,34 @@ mod tests {
         let mut eng = Engine::open_readonly(&p).unwrap();
         let e = eng.entity(); // ← ここで panic
         eng.tie(e, "v", 1);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// #56: readonly open は file を mutate しない (clean flag flip + msync しない)。
+    /// 旧 behavior では open するだけで mtime が変わり DB が dirty 化していた。
+    #[test]
+    fn readonly_open_does_not_mutate_file() {
+        let p = tmp("readonly_nomutate");
+        {
+            let mut eng = Engine::create_standalone(&p).unwrap();
+            eng.define_himo("v", HimoType::Number, 100);
+            let e = eng.entity();
+            eng.tie(e, "v", 42);
+            eng.flush().unwrap(); // clean=true で確定
+        }
+        let mtime_before = std::fs::metadata(&p).unwrap().modified().unwrap();
+        // 書き込みがあれば mtime 差が必ず出るよう少し待つ
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        {
+            let eng = Engine::open_readonly(&p).unwrap();
+            // read path も非破壊であること
+            assert_eq!(eng.pull_raw("v", 42).len(), 1);
+        }
+        let mtime_after = std::fs::metadata(&p).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "readonly open + read must not modify the DB file (#56)"
+        );
         let _ = std::fs::remove_file(&p);
     }
 
