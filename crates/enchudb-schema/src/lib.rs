@@ -190,6 +190,11 @@ struct TableInner {
     /// pk の `cols` index。 PK 未指定なら None。
     pk: Option<usize>,
     relations: Vec<RelationInner>,
+    /// #60: PK upsert の lookup→allocate を直列化する per-table lock。
+    /// 並行 mode で 2 thread が同一 PK を upsert したとき、 両方が「PK 不在」を
+    /// 観測 → 両方 entity_in で別 eid を払い出す TOCTOU で重複行ができるのを防ぐ。
+    /// per-table なので別 table の upsert は並行のまま。
+    upsert_lock: std::sync::Mutex<()>,
 }
 
 impl TableInner {
@@ -509,6 +514,7 @@ impl Database {
                 from_col: r.from_col.clone(),
                 to_table: r.to_table.clone(),
             }).collect(),
+            upsert_lock: std::sync::Mutex::new(()),
         });
         let pos = self.tables.iter().position(|t| t.name.eq_ignore_ascii_case(table_name))
             .expect("table_inner found above");
@@ -687,6 +693,7 @@ impl Database {
                 cols,
                 pk,
                 relations,
+                upsert_lock: std::sync::Mutex::new(()),
             }));
         }
         Ok(())
@@ -1147,6 +1154,7 @@ impl<'a> TableBuilder<'a> {
             cols,
             pk: pk_idx,
             relations: relations.into_iter().map(|(from_col, to_table)| RelationInner { from_col, to_table }).collect(),
+            upsert_lock: std::sync::Mutex::new(()),
         });
         db.tables.push(inner.clone());
         // 0.8.2: build phase 中の persist_schema は finish_* に coalesce
@@ -1347,6 +1355,17 @@ impl<'a> RowBuilder<'a> {
         }
 
         // 2. upsert なら PK 一致 row を探す
+        //
+        // #60: lookup→allocate を per-table lock で直列化して TOCTOU を防ぐ。
+        // PK upsert のときだけ取得 (= PK 無し / 非 upsert は lock 不要で並行のまま)。
+        // poison しても () の中身は無いので into_inner で回復する。
+        // guard は commit 末尾まで保持 = PK tie が次 upserter から見えてから解放。
+        let _upsert_guard = if self.replace_on_pk && self.table.pk.is_some() {
+            Some(self.table.upsert_lock.lock().unwrap_or_else(|e| e.into_inner()))
+        } else {
+            None
+        };
+
         let mut target_eid: Option<EntityId> = None;
         if self.replace_on_pk {
             if let Some(pk_idx) = self.table.pk {
@@ -1967,6 +1986,56 @@ mod tests {
             let ts = t.entity(rows[0]).get("ts");
             assert_eq!(ts, Some(Value::Number(200)));
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #60: 並行 mode で同一 PK を複数 thread が同時 upsert しても重複行が
+    /// できないこと。 fix (per-table upsert_lock) 無効化時は TOCTOU で複数行が
+    /// できて fail する。
+    #[test]
+    fn concurrent_upsert_same_pk_does_not_duplicate() {
+        let path = tmp("concurrent_upsert_pk");
+        let _ = std::fs::remove_file(&path);
+        let db = {
+            let mut db = Database::create(&path).unwrap();
+            db.table("kv")
+                .tag("key")
+                .number("ts")
+                .primary_key("key")
+                .build()
+                .unwrap();
+            db.finish_concurrent().unwrap() // Arc<Database>
+        };
+
+        let n = 16usize;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
+        let mut handles = Vec::with_capacity(n);
+        for i in 0..n {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                // 全 thread を同時 release して contention を最大化
+                barrier.wait();
+                let t = db.get_table("kv").unwrap();
+                t.upsert()
+                    .set("key", "k1")
+                    .set("ts", (i as i64) + 1)
+                    .commit()
+                    .unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let t = db.get_table("kv").unwrap();
+        let rows = t.where_eq("key", "k1").find().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "concurrent upsert of same PK must produce exactly 1 row, got {}",
+            rows.len()
+        );
         let _ = std::fs::remove_file(&path);
     }
 
