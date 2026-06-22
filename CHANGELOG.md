@@ -3,6 +3,47 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.8.18 — 2026-06-22
+
+robustness fix 4 件。 **file format / wire format / public API いずれも不変**、
+0.8.17 から再 build のみで上がれる patch release。
+
+### Fixed
+
+- **oplog ring buffer が production で reclaim されず 16MB で全 append が drop**
+  ([#63](https://github.com/Mutafika/enchudb/issues/63) /
+  [#64](https://github.com/Mutafika/enchudb/pull/64)):
+  `try_reset` が `auto_reset` フラグで gate されていたが、 `set_auto_reset(true)`
+  は test でしか呼ばれず production では常に no-op。 ring が一度も reset されず
+  `head` が 16MB (= 既定 oplog capacity) に達した時点で以降の append が全て
+  `WAL full` で drop され、 long-running writer の変更が静かに失われていた。
+  gate を撤去し、 `head == checkpoint && pending == 0` の領域を無条件 reclaim。
+  consumer tick / graceful drain の両経路で発火。
+- **ring reset 後に書いた record が sync から無言で欠落** (#64 の回帰):
+  `try_reset` が head/checkpoint だけ巻き戻して bridge cursor (`sync_ops_offset`)
+  を放置するため、 reset 後の append が `_sync_ops` へ転送されず `publish_since`
+  が取りこぼしていた。 `Engine::reset_sync_ops_offset()` を追加し try_reset 成功時に
+  cursor も巻き戻す。 回帰テスト `records_after_ring_reset_are_still_synced` を追加。
+- **readonly open が DB を dirty 化する** ([#56](https://github.com/Mutafika/enchudb/issues/56)):
+  `open_readonly` でも共通 open path が無条件で clean flag を 0 に倒し msync して
+  いたため、 read-only のはずの open が file を物理的に書き換え、 次回 open で
+  full index rebuild を誘発して DB を太らせていた (wiki.ecdb: live ~70KB に対し
+  physical 155MB)。 readonly では clean flag を一切触らない真の非破壊 open に。
+  (② Drop で flush せず / ③ dirty rebuild の予約全域 zero-fill は別途。)
+- **schema upsert の PK 一意性が並行で破れて重複行ができる**
+  ([#60](https://github.com/Mutafika/enchudb/issues/60)):
+  並行 mode で 2 thread が同一 PK を upsert すると、 両方が lookup→allocate で
+  別 eid を払い出す TOCTOU で重複行ができていた。 `TableInner` の per-table
+  `upsert_lock` で lookup→allocate→PK tie を直列化 (別 table は並行のまま)。
+  16 thread が同一 PK を同時 upsert → 1 行になる回帰テストを追加。
+  (SQL 層は独立した別 table 実装のため対象外。)
+
+### Notes
+
+- [#36](https://github.com/Mutafika/enchudb/issues/36) (`schema_meta_entity`
+  panic) は 0.8.7 で既に撤去済みだったため、 再現シナリオを test で確認した上で
+  close。 コード変更なし。
+
 ## 0.8.17 — 2026-06-10
 
 全コード監査 (issue #57–#61) で洗い出した **設計判断不要・後方互換** な堅牢性
