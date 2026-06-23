@@ -3,11 +3,12 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
-## 0.9.0 — 2026-06-23
+## 0.8.19 — 2026-06-23
 
-cross-peer eid 翻訳 (#9)。 **public API 追加 + `.eidmap` sidecar 追加** のため minor
-bump。 file format / wire format は不変、 既存 DB は再 build のみで上がれる (sidecar
-不在 = 空 translator = 旧挙動、 backward-compatible、 migration 不要)。
+cross-peer eid 翻訳 (#9)。 foreign eid のサイレント上書きを直す bugfix。 public API +
+`.eidmap` sidecar を足すが file format / wire format は不変、 既存 DB は再 build のみで
+上がれる (sidecar 不在 = 空 translator = 旧挙動)。 完全 backward-compatible・migration
+不要のため **patch** として release。
 
 ### Fixed
 

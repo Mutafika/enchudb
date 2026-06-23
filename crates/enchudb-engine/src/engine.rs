@@ -307,7 +307,7 @@ fn eidmap_path_for(path: &str) -> std::path::PathBuf {
 }
 
 /// #9: eidmap sidecar の 1 entry。 `(author_peer, foreign_local, local, tombstone_hlc)`。
-/// `tombstone_hlc == Hlc::ZERO` は「削除されていない」。 v2 (0.9.0) で tombstone を追加し、
+/// `tombstone_hlc == Hlc::ZERO` は「削除されていない」。 v2 (0.8.19) で tombstone を追加し、
 /// reopen 後の削除済み entity 復活 (resurrection) を防ぐ。
 type EidmapEntry = (enchudb_oplog::PeerId, u32, u32, enchudb_oplog::Hlc);
 

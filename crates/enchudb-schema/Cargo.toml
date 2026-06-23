@@ -1,6 +1,6 @@
 [package]
 name = "enchudb-schema"
-version = "0.9.0"
+version = "0.8.19"
 edition = "2024"
 description = "EnchuDB 仮想 2D テーブル層 — native API。 schema を declare すると himo_id が pre-resolve されて、 query / insert は名前 lookup なしで engine に直 dispatch される。"
 license-file = "LICENSE.md"
