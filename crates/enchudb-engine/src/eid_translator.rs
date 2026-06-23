@@ -62,6 +62,9 @@ impl EidTranslator {
     /// foreign entity を解決しても double-alloc / orphan が起きない (= 全 caller が同じ
     /// local を得る)。
     ///
+    /// `alloc` が `None` を返したら (= 確保先 table を導けない table-less な op)、 insert
+    /// せず `None` を返す → 呼び出し側はその op を skip する。
+    ///
     /// 注意: `alloc` は **write lock 保持中** に呼ばれる。 `RwLock` は reentrant でない
     /// ので、 translator 自身を触る closure を渡してはならない (`alloc` = entity 確保は
     /// table lock しか取らないので安全)。
@@ -69,23 +72,23 @@ impl EidTranslator {
         &self,
         author_peer: PeerId,
         foreign_local: u32,
-        alloc: impl FnOnce() -> u32,
-    ) -> u32 {
+        alloc: impl FnOnce() -> Option<u32>,
+    ) -> Option<u32> {
         // fast path: 既に登録済みなら read lock だけで返す。
         {
             let guard = self.inner.read().unwrap();
             if let Some(&local) = guard.get(&(author_peer, foreign_local)) {
-                return local;
+                return Some(local);
             }
         }
         // slow path: write lock 下で再 check (= double-checked) → 確保 → insert。
         let mut guard = self.inner.write().unwrap();
         if let Some(&local) = guard.get(&(author_peer, foreign_local)) {
-            return local; // 別 thread が先に確保した
+            return Some(local); // 別 thread が先に確保した
         }
-        let local = alloc();
+        let local = alloc()?;
         guard.insert((author_peer, foreign_local), local);
-        local
+        Some(local)
     }
 
     pub fn len(&self) -> usize {

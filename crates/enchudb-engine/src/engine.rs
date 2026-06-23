@@ -1591,6 +1591,11 @@ impl Engine {
             Ok(Some(entries)) => {
                 for (peer, foreign_local, local) in entries {
                     eng.eid_translator.insert(peer, foreign_local, local);
+                    // #9 (H4): `.eidmap` と `.tables` は別々の rename なので crash で
+                    // 不整合になりうる。 mapped local を table の next_local が必ず追い
+                    // 越すよう前進させ、 stale `.tables` でも mapped slot を再 alloc して
+                    // 衝突する事態を防ぐ (= 最悪でも「重複」に留め「衝突」を起こさない)。
+                    Self::advance_table_next_local_for(&eng.tables, local);
                 }
             }
             Ok(None) => {}
@@ -2792,29 +2797,31 @@ impl Engine {
     }
 
     /// #9: 受信 op の foreign eid を「自分の eid 空間の local eid」に翻訳する。
-    /// 初見の `(author_peer, foreign_local)` には fresh な local entity を払い出す
-    /// (`himo_id` が属する table の eid_range 内、 anonymous himo なら anonymous 空間)。
+    /// 初見の `(author_peer, foreign_local)` には `himo_id` が属する closed table 内に
+    /// fresh な local entity を払い出す (= local entity と同じ allocator なので衝突しない)。
+    /// himo を closed table に解決できない table-less op (anonymous himo / sentinel) は
+    /// 安全に確保できる slot が無いので `None` を返す → caller は skip する。
     /// `author_peer == self.peer_id` なら identity (自分が author の op は翻訳しない)。
     pub fn resolve_remote_eid(
         &self,
         author_peer: enchudb_oplog::PeerId,
         foreign_eid: enchudb_oplog::EntityId,
         himo_id: u16,
-    ) -> enchudb_oplog::EntityId {
+    ) -> Option<enchudb_oplog::EntityId> {
         use std::sync::atomic::Ordering;
         let self_peer = self.peer_id.load(Ordering::Acquire);
         if author_peer == self_peer {
-            return foreign_eid; // identity: 自分が author の op
+            return Some(foreign_eid); // identity: 自分が author の op
         }
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
         // get-or-allocate を atomic に行う (= 並行 apply で同じ foreign entity を
-        // double-alloc しない)。 alloc は himo の table に fresh な local を払い出す。
+        // double-alloc しない)。 alloc が None (= table-less) なら写像を作らず None。
         let local = self
             .eid_translator
             .get_or_insert_with(author_peer, foreign_local, || {
                 self.alloc_translated_local(himo_id)
-            });
-        enchudb_oplog::make_eid(self_peer, local)
+            })?;
+        Some(enchudb_oplog::make_eid(self_peer, local))
     }
 
     /// #9: 既存の翻訳のみ引く (払い出しはしない)。 Delete のように himo を持たず
@@ -2836,23 +2843,25 @@ impl Engine {
             .map(|local| enchudb_oplog::make_eid(self_peer, local))
     }
 
-    /// #9: foreign entity 用に fresh な local eid を払い出す。 `himo_id` が table 所属
-    /// なら その table の `entity_in` 経路で確保 (= local entity と同じ allocator を
-    /// 使うので衝突しない + `validate_eid_for_himo` の range 内に入る)。 table を導け
-    /// ない (anonymous himo / Content) 場合は anonymous `entity()` で確保。 local 部を返す。
-    fn alloc_translated_local(&self, himo_id: u16) -> u32 {
+    /// #9: foreign entity 用に fresh な local eid を払い出す。 `himo_id` が closed table
+    /// 所属なら その table の `entity_in` 経路で確保 (= local entity と同じ allocator を
+    /// 使うので衝突しない + `validate_eid_for_himo` の range 内に入る)、 local 部を `Some`
+    /// で返す。 table を導けない (anonymous himo / sentinel) / entity_in 失敗 (table 枯渇)
+    /// なら **安全に確保できる slot が無い** ので `None` (caller が op を skip)。
+    /// `entity()` での anonymous fallback は使わない: sync engine では anonymous table が
+    /// 閉じていて panic するし、 `entities.allocate()` は table range と衝突しうる。
+    fn alloc_translated_local(&self, himo_id: u16) -> Option<u32> {
         let hid = himo_id as usize;
         if hid < self.himo_to_table.len() {
             let tid = self.himo_to_table[hid] as usize;
             if tid < self.tables.len() && self.tables[tid].eid_range_hi != u32::MAX {
                 let name = self.tables[tid].name.clone();
                 if let Ok(e) = self.entity_in(&name) {
-                    return enchudb_oplog::eid_local(e);
+                    return Some(enchudb_oplog::eid_local(e));
                 }
             }
         }
-        // anonymous fallback (table を導けない himo / Content op)
-        enchudb_oplog::eid_local(self.entity())
+        None
     }
 
     /// #9: himo が Ref 型か。 Ref の value は foreign target eid なので apply 時に
@@ -2872,14 +2881,15 @@ impl Engine {
         author_peer: enchudb_oplog::PeerId,
         foreign_value: u32,
         ref_himo_id: u16,
-    ) -> u32 {
+    ) -> Option<u32> {
         use std::sync::atomic::Ordering;
         let self_peer = self.peer_id.load(Ordering::Acquire);
         if author_peer == self_peer {
-            return foreign_value; // identity: 自分が author
+            return Some(foreign_value); // identity: 自分が author
         }
         // entity eid 翻訳と同じ key 空間・同じ atomic path。 ref-value 経由と target
         // entity 自身の Tie 経由が同じ foreign を解決しても 1 つの local に収束する。
+        // target table を導けなければ None (caller が op を skip)。
         self.eid_translator
             .get_or_insert_with(author_peer, foreign_value, || {
                 self.alloc_translated_local_in_target_table(ref_himo_id)
@@ -2887,8 +2897,8 @@ impl Engine {
     }
 
     /// #9: Ref himo の target table (fk_refs で引く) に fresh な local eid を払い出す。
-    /// target table を導けない場合は anonymous `entity()` で確保。
-    fn alloc_translated_local_in_target_table(&self, ref_himo_id: u16) -> u32 {
+    /// target table を導けない / entity_in 失敗なら `None` (caller が op を skip)。
+    fn alloc_translated_local_in_target_table(&self, ref_himo_id: u16) -> Option<u32> {
         let hid = ref_himo_id as usize;
         if hid < self.himo_to_table.len() {
             let owner_tid = self.himo_to_table[hid] as usize;
@@ -2903,13 +2913,13 @@ impl Engine {
                     {
                         let name = self.tables[target_tid].name.clone();
                         if let Ok(e) = self.entity_in(&name) {
-                            return enchudb_oplog::eid_local(e);
+                            return Some(enchudb_oplog::eid_local(e));
                         }
                     }
                 }
             }
         }
-        enchudb_oplog::eid_local(self.entity())
+        None
     }
 
     /// Phase C: 自 peer の鍵ペアを設定。WAL にも反映される。None で署名 off。

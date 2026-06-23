@@ -388,7 +388,23 @@ impl Syncer {
                 // で relayed append する。 gossip 転送の正しさには元の foreign eid で
                 // append すべきで、 別 commit で body-eid / relay-eid を分離する。 現状
                 // gossip は default off。
-                let local_eid = self.engine.resolve_remote_eid(rec.author_peer, *eid, *himo_id);
+                // table-less (himo を closed table に解決できない) なら確保先が無いので
+                // skip。 entity / ref value を先に解決してから LWW を更新する。
+                let local_eid = match self.engine.resolve_remote_eid(rec.author_peer, *eid, *himo_id) {
+                    Some(e) => e,
+                    None => return false,
+                };
+                // #9: Ref himo は value 自体が foreign target eid なので、 ref の target
+                // table 空間の local eid に翻訳 (確保できなければ skip)。 それ以外
+                // (Tag/Symbol) は remote vocab vid を local vid に変換 (Number は identity)。
+                let value = if self.engine.himo_is_ref(*himo_id) {
+                    match self.engine.resolve_remote_ref_value(rec.author_peer, *value, *himo_id) {
+                        Some(v) => v,
+                        None => return false,
+                    }
+                } else {
+                    self.engine.translate_remote_vid(rec.author_peer, *himo_id, *value)
+                };
                 // Tombstone check: 同 entity に tombstone (sentinel HLC) が記録済みで
                 // それより古い Tie は復活させない。
                 if let Some(tomb) = store.get(local_eid, u16::MAX) {
@@ -399,20 +415,15 @@ impl Syncer {
                 if !store.try_set(local_eid, *himo_id, rec.hlc) {
                     return false;
                 }
-                // #9: Ref himo は value 自体が foreign target eid なので、 ref の target
-                // table 空間の local eid に翻訳する。 それ以外 (Tag/Symbol) は remote
-                // vocab vid を local vid に変換 (Number himo は identity)。
-                let value = if self.engine.himo_is_ref(*himo_id) {
-                    self.engine.resolve_remote_ref_value(rec.author_peer, *value, *himo_id)
-                } else {
-                    self.engine.translate_remote_vid(rec.author_peer, *himo_id, *value)
-                };
                 self.engine.remote_tie_apply(local_eid, *himo_id, value, Some(relayed_header(rec)));
                 true
             }
             DecodedOp::Untie { eid, himo_id } => {
-                // #9: foreign eid を翻訳 (初見の払い出しは空 entity でも無害)。
-                let local_eid = self.engine.resolve_remote_eid(rec.author_peer, *eid, *himo_id);
+                // #9: foreign eid を翻訳 (table-less なら確保先が無いので skip)。
+                let local_eid = match self.engine.resolve_remote_eid(rec.author_peer, *eid, *himo_id) {
+                    Some(e) => e,
+                    None => return false,
+                };
                 if let Some(tomb) = store.get(local_eid, u16::MAX) {
                     if rec.hlc < tomb {
                         return false;
@@ -443,10 +454,13 @@ impl Syncer {
                 true
             }
             DecodedOp::Content { eid, key, data } => {
-                // #9: Content は himo を持たず table を導けない。 既に Tie 済みなら
-                // その mapping を再利用し、 未登録なら anonymous に払い出す (himo_id
-                // sentinel u16::MAX → anonymous fallback)。
-                let local_eid = self.engine.resolve_remote_eid(rec.author_peer, *eid, u16::MAX);
+                // #9: Content は himo を持たず table を導けないので、 Delete と同じく
+                // 既存の翻訳のみ引く。 未登録 (= まだ Tie されてない foreign entity) なら
+                // 確保先 table が無いので skip (content-only entity は未対応の edge)。
+                let local_eid = match self.engine.resolve_remote_eid_existing(rec.author_peer, *eid) {
+                    Some(e) => e,
+                    None => return false,
+                };
                 // Content は key 単位で LWW。himo_id を使えないので hash で代用。
                 if let Some(tomb) = store.get(local_eid, u16::MAX) {
                     if rec.hlc < tomb {

@@ -56,7 +56,7 @@ fn concurrent_resolve_same_foreign_is_consistent() {
         let barrier = barrier.clone();
         handles.push(std::thread::spawn(move || {
             barrier.wait();
-            eid_local(eng.resolve_remote_eid(1, foreign, himo))
+            eid_local(eng.resolve_remote_eid(1, foreign, himo).expect("notes himo resolves to a table"))
         }));
     }
     let locals: Vec<u32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
@@ -93,7 +93,10 @@ fn concurrent_resolve_distinct_foreigns_no_collision() {
         let barrier = barrier.clone();
         handles.push(std::thread::spawn(move || {
             barrier.wait();
-            eid_local(eng.resolve_remote_eid(1, make_eid(1, 100 + i), himo))
+            eid_local(
+                eng.resolve_remote_eid(1, make_eid(1, 100 + i), himo)
+                    .expect("notes himo resolves to a table"),
+            )
         }));
     }
     let mut locals: Vec<u32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
@@ -119,7 +122,7 @@ fn corrupt_eidmap_sidecar_falls_back_gracefully() {
     {
         let eng = make_engine(&path, 2);
         let himo = eng.himo_id("notes.note").unwrap() as u16;
-        eng.resolve_remote_eid(1, make_eid(1, 3), himo);
+        eng.resolve_remote_eid(1, make_eid(1, 3), himo).unwrap();
         eng.persist_tables().unwrap();
         assert!(eng.eid_translator().len() >= 1);
         drop(eng);
@@ -155,7 +158,7 @@ fn truncated_eidmap_sidecar_falls_back_gracefully() {
     {
         let eng = make_engine(&path, 2);
         let himo = eng.himo_id("notes.note").unwrap() as u16;
-        eng.resolve_remote_eid(1, make_eid(1, 9), himo);
+        eng.resolve_remote_eid(1, make_eid(1, 9), himo).unwrap();
         eng.persist_tables().unwrap();
         drop(eng);
     }
@@ -203,6 +206,52 @@ fn double_apply_is_idempotent_on_translator() {
         eng_b.eid_translator().len(),
         after_first,
         "re-applying the same records must not grow the translator"
+    );
+
+    drop(syncer_a);
+    drop(eng_a);
+    drop(syncer_b);
+    drop(eng_b);
+    cleanup(&path_a);
+    cleanup(&path_b);
+}
+
+/// FAILURE (C1 regression): syncing a `Content` op must NOT panic. The old
+/// anonymous `entity()` fallback panicked on every sync-capable engine (the
+/// anonymous table is closed once `enable_sync_tables` runs). Content after a
+/// Tie reuses the entity's mapping and applies; the property under test is
+/// "apply does not crash".
+#[test]
+fn content_sync_does_not_panic() {
+    let path_a = tmp_path("content_a");
+    let path_b = tmp_path("content_b");
+
+    let eng_a = make_engine(&path_a, 1);
+    let e_a = eng_a.entity_in("notes").unwrap();
+    eng_a.tie_to(e_a, "notes.note", 7);
+    eng_a.content_async(e_a, "memo", b"hello");
+    eng_a.oplog_commit();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
+    let syncer_a = Syncer::new(eng_a.clone(), transport.clone());
+    syncer_a.publish_since(Hlc::ZERO);
+    let records = transport.pull(1, Hlc::ZERO);
+
+    // B applies — pre-fix this panicked the applying thread on the Content op.
+    let eng_b = make_engine(&path_b, 2);
+    let syncer_b = Syncer::new(eng_b.clone(), transport.clone());
+    let out = syncer_b.apply_records(&records);
+    assert!(out.applied > 0, "the Tie (at least) should apply without panicking");
+
+    // The Tie'd entity's content followed via the reused mapping.
+    let local = eng_b
+        .resolve_remote_eid_existing(1, e_a)
+        .expect("entity should be mapped from its Tie");
+    assert_eq!(
+        eng_b.get_content(local, "memo"),
+        Some(b"hello".as_ref()),
+        "Content op should apply to the translated entity"
     );
 
     drop(syncer_a);
