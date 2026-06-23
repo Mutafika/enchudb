@@ -387,58 +387,76 @@ impl Syncer {
         }
         match &rec.op {
             DecodedOp::Tie { eid, himo_id, value } => {
+                // #9: foreign eid を自分の eid 空間の local eid に翻訳 (初見なら払い出し)。
+                // 以降の LWW bookkeeping (HlcStore) と body apply を全て local_eid で行う。
+                // NOTE(#9): gossip_remote_apply が ON のとき remote_tie_apply は local_eid
+                // で relayed append する。 gossip 転送の正しさには元の foreign eid で
+                // append すべきで、 別 commit で body-eid / relay-eid を分離する。 現状
+                // gossip は default off。
+                let local_eid = self.engine.resolve_remote_eid(rec.author_peer, *eid, *himo_id);
                 // Tombstone check: 同 entity に tombstone (sentinel HLC) が記録済みで
-                // それより古い Tie は復活させない。 「同 eid の再 save」は schema 層で
-                // 別 eid として扱う設計なので、 tombstone 以後の新 Tie が同 eid に
-                // 来ることは無く、 一律 skip で安全。
-                if let Some(tomb) = store.get(*eid, u16::MAX) {
+                // それより古い Tie は復活させない。
+                if let Some(tomb) = store.get(local_eid, u16::MAX) {
                     if rec.hlc < tomb {
                         return false;
                     }
                 }
-                if !store.try_set(*eid, *himo_id, rec.hlc) {
+                if !store.try_set(local_eid, *himo_id, rec.hlc) {
                     return false;
                 }
                 // Symbol 型 himo の場合、remote vocab の vid を local vid に変換
                 let value = self.engine.translate_remote_vid(rec.author_peer, *himo_id, *value);
-                self.engine.remote_tie_apply(*eid, *himo_id, value, Some(relayed_header(rec)));
+                self.engine.remote_tie_apply(local_eid, *himo_id, value, Some(relayed_header(rec)));
                 true
             }
             DecodedOp::Untie { eid, himo_id } => {
-                if let Some(tomb) = store.get(*eid, u16::MAX) {
+                // #9: foreign eid を翻訳 (初見の払い出しは空 entity でも無害)。
+                let local_eid = self.engine.resolve_remote_eid(rec.author_peer, *eid, *himo_id);
+                if let Some(tomb) = store.get(local_eid, u16::MAX) {
                     if rec.hlc < tomb {
                         return false;
                     }
                 }
-                if !store.try_set(*eid, *himo_id, rec.hlc) {
+                if !store.try_set(local_eid, *himo_id, rec.hlc) {
                     return false;
                 }
-                self.engine.remote_untie_apply(*eid, *himo_id, Some(relayed_header(rec)));
+                self.engine.remote_untie_apply(local_eid, *himo_id, Some(relayed_header(rec)));
                 true
             }
             DecodedOp::Delete { eid } => {
+                // #9: Delete は himo を持たず table を導けないので既存の翻訳のみ引く。
+                // 未登録 (= ここに一度も sync されてない foreign entity) なら消す対象が
+                // 無いので skip。
+                let local_eid = match self.engine.resolve_remote_eid_existing(rec.author_peer, *eid) {
+                    Some(e) => e,
+                    None => return false,
+                };
                 // Delete は全 himo に波及。sentinel himo_id = 0xFFFF で HLC を記録。
                 // remove_entity は呼ばず tombstone を残す。 後続の古い HLC の
                 // Tie/Untie/Content は上の tombstone check で skip され、 削除済み
                 // entity が復活しない。
-                if !store.try_set(*eid, u16::MAX, rec.hlc) {
+                if !store.try_set(local_eid, u16::MAX, rec.hlc) {
                     return false;
                 }
-                self.engine.remote_delete_apply(*eid, Some(relayed_header(rec)));
+                self.engine.remote_delete_apply(local_eid, Some(relayed_header(rec)));
                 true
             }
             DecodedOp::Content { eid, key, data } => {
+                // #9: Content は himo を持たず table を導けない。 既に Tie 済みなら
+                // その mapping を再利用し、 未登録なら anonymous に払い出す (himo_id
+                // sentinel u16::MAX → anonymous fallback)。
+                let local_eid = self.engine.resolve_remote_eid(rec.author_peer, *eid, u16::MAX);
                 // Content は key 単位で LWW。himo_id を使えないので hash で代用。
-                if let Some(tomb) = store.get(*eid, u16::MAX) {
+                if let Some(tomb) = store.get(local_eid, u16::MAX) {
                     if rec.hlc < tomb {
                         return false;
                     }
                 }
                 let key_hash = enchudb_oplog::content_key_hash15(key);
-                if !store.try_set(*eid, key_hash | 0x8000, rec.hlc) {
+                if !store.try_set(local_eid, key_hash | 0x8000, rec.hlc) {
                     return false;
                 }
-                self.engine.remote_content_apply(*eid, key, data, Some(relayed_header(rec)));
+                self.engine.remote_content_apply(local_eid, key, data, Some(relayed_header(rec)));
                 true
             }
             DecodedOp::Commit => true, // boundary marker、apply は不要
@@ -525,8 +543,12 @@ mod tests {
         let out = syncer.pull_once(2);
         assert_eq!(out.applied, 1);
 
-        // peer A 側から peer 2 の eid を get できる(local=3 で引く)
-        let v = eng_a.get(eid_b, "rows.val");
+        // #9: peer A は foreign eid をそのまま使わず、 自分の eid 空間の local eid に
+        // 翻訳して置く。 元の foreign local (=3) ではなく翻訳後の eid で値を引く。
+        let local = eng_a
+            .resolve_remote_eid_existing(2, eid_b)
+            .expect("translation mapping should exist after apply");
+        let v = eng_a.get(local, "rows.val");
         assert_eq!(v, Some(42));
 
         let _ = std::fs::remove_file(path_a);

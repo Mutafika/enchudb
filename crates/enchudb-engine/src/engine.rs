@@ -964,6 +964,8 @@ pub struct Engine {
     peer_id: std::sync::atomic::AtomicU32,
     /// v32: LWW 用に (eid, himo) → 最後の HLC を記録。
     hlc_store: std::sync::Arc<crate::hlc_store::HlcStore>,
+    /// #9: 受信した foreign eid を自分の eid 空間の local eid に翻訳する写像。
+    eid_translator: std::sync::Arc<crate::eid_translator::EidTranslator>,
     /// v32 Phase C: 自 peer の ed25519 鍵ペア。None なら署名しない/検証もしない。
     keypair: std::sync::RwLock<Option<std::sync::Arc<enchudb_oplog::keys::Keypair>>>,
     /// v32 Phase C: 他 peer の pubkey TOFU ストア。Syncer が verify に使う。
@@ -1157,6 +1159,7 @@ impl Engine {
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
+            eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
             keypair: std::sync::RwLock::new(None),
             pubkeys: std::sync::Arc::new(enchudb_oplog::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
@@ -1404,6 +1407,7 @@ impl Engine {
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
+            eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
             keypair: std::sync::RwLock::new(None),
             pubkeys: std::sync::Arc::new(enchudb_oplog::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
@@ -1822,6 +1826,7 @@ impl Engine {
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
+            eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
             keypair: std::sync::RwLock::new(None),
             pubkeys: std::sync::Arc::new(enchudb_oplog::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
@@ -2672,6 +2677,73 @@ impl Engine {
     /// LWW 用 HlcStore への参照(sync モジュールが使う)。
     pub fn hlc_store(&self) -> &std::sync::Arc<crate::hlc_store::HlcStore> {
         &self.hlc_store
+    }
+
+    /// #9: foreign eid 翻訳テーブルへの参照。
+    pub fn eid_translator(&self) -> &std::sync::Arc<crate::eid_translator::EidTranslator> {
+        &self.eid_translator
+    }
+
+    /// #9: 受信 op の foreign eid を「自分の eid 空間の local eid」に翻訳する。
+    /// 初見の `(author_peer, foreign_local)` には fresh な local entity を払い出す
+    /// (`himo_id` が属する table の eid_range 内、 anonymous himo なら anonymous 空間)。
+    /// `author_peer == self.peer_id` なら identity (自分が author の op は翻訳しない)。
+    pub fn resolve_remote_eid(
+        &self,
+        author_peer: enchudb_oplog::PeerId,
+        foreign_eid: enchudb_oplog::EntityId,
+        himo_id: u16,
+    ) -> enchudb_oplog::EntityId {
+        use std::sync::atomic::Ordering;
+        let self_peer = self.peer_id.load(Ordering::Acquire);
+        if author_peer == self_peer {
+            return foreign_eid; // identity: 自分が author の op
+        }
+        let foreign_local = enchudb_oplog::eid_local(foreign_eid);
+        if let Some(local) = self.eid_translator.get(author_peer, foreign_local) {
+            return enchudb_oplog::make_eid(self_peer, local);
+        }
+        let local = self.alloc_translated_local(himo_id);
+        self.eid_translator.insert(author_peer, foreign_local, local);
+        enchudb_oplog::make_eid(self_peer, local)
+    }
+
+    /// #9: 既存の翻訳のみ引く (払い出しはしない)。 Delete のように himo を持たず
+    /// table を導けない op 用。 未登録 (= 一度も Tie されてない foreign entity) なら
+    /// None → 呼び出し側で skip。 `author_peer == self` なら identity。
+    pub fn resolve_remote_eid_existing(
+        &self,
+        author_peer: enchudb_oplog::PeerId,
+        foreign_eid: enchudb_oplog::EntityId,
+    ) -> Option<enchudb_oplog::EntityId> {
+        use std::sync::atomic::Ordering;
+        let self_peer = self.peer_id.load(Ordering::Acquire);
+        if author_peer == self_peer {
+            return Some(foreign_eid);
+        }
+        let foreign_local = enchudb_oplog::eid_local(foreign_eid);
+        self.eid_translator
+            .get(author_peer, foreign_local)
+            .map(|local| enchudb_oplog::make_eid(self_peer, local))
+    }
+
+    /// #9: foreign entity 用に fresh な local eid を払い出す。 `himo_id` が table 所属
+    /// なら その table の `entity_in` 経路で確保 (= local entity と同じ allocator を
+    /// 使うので衝突しない + `validate_eid_for_himo` の range 内に入る)。 table を導け
+    /// ない (anonymous himo / Content) 場合は anonymous `entity()` で確保。 local 部を返す。
+    fn alloc_translated_local(&self, himo_id: u16) -> u32 {
+        let hid = himo_id as usize;
+        if hid < self.himo_to_table.len() {
+            let tid = self.himo_to_table[hid] as usize;
+            if tid < self.tables.len() && self.tables[tid].eid_range_hi != u32::MAX {
+                let name = self.tables[tid].name.clone();
+                if let Ok(e) = self.entity_in(&name) {
+                    return enchudb_oplog::eid_local(e);
+                }
+            }
+        }
+        // anonymous fallback (table を導けない himo / Content op)
+        enchudb_oplog::eid_local(self.entity())
     }
 
     /// Phase C: 自 peer の鍵ペアを設定。WAL にも反映される。None で署名 off。

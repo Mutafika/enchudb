@@ -55,8 +55,6 @@ fn make_engine(path: &str, peer: PeerId) -> Arc<Engine> {
 }
 
 #[test]
-#[ignore = "issue #9: foreign-eid translation (EidTranslator) not yet implemented. \
-            Remove #[ignore] to drive the fix red->green. Verified FAILING on 0.8.18."]
 fn foreign_eid_collision_must_not_clobber_local_entity() {
     let path_a = tmp_path("a");
     let path_b = tmp_path("b");
