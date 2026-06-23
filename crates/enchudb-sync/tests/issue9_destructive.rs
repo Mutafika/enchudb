@@ -261,3 +261,39 @@ fn content_sync_does_not_panic() {
     cleanup(&path_a);
     cleanup(&path_b);
 }
+
+/// FAILURE (C-1 regression): a `.eidmap` whose header declares a bogus huge entry
+/// count must NOT trigger a multi-GB `Vec::with_capacity` (process abort on open).
+/// Valid magic + version, count = u32::MAX, empty body → graceful empty fallback.
+/// Without the bounds guard this requests ~51 GB and aborts the whole process.
+#[test]
+fn huge_count_eidmap_sidecar_does_not_oom() {
+    let path = tmp_path("huge_count");
+    {
+        let eng = make_engine(&path, 2);
+        let himo = eng.himo_id("notes.note").unwrap() as u16;
+        eng.resolve_remote_eid(1, make_eid(1, 4), himo).unwrap();
+        eng.persist_tables().unwrap();
+        drop(eng);
+    }
+    // valid magic "EIDM" + version 1 + count = u32::MAX, but no entries follow.
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"EIDM");
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+    std::fs::write(format!("{}.eidmap", path), &bytes).unwrap();
+
+    let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
+    assert_eq!(
+        eng.eid_translator().len(),
+        0,
+        "bogus huge-count .eidmap must fall back to an empty translator, not OOM-abort"
+    );
+    // DB is still usable.
+    let e = eng.entity_in("notes").unwrap();
+    eng.tie_to(e, "notes.note", 1);
+    assert_eq!(eng.get(e, "notes.note"), Some(1));
+
+    drop(eng);
+    cleanup(&path);
+}

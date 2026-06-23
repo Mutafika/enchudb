@@ -160,7 +160,10 @@ fn deserialize_tables(buf: &[u8]) -> Result<Vec<TableDef>, String> {
         return Err(format!("tables sidecar: unsupported version {}", version));
     }
     let table_count = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
-    let mut tables = Vec::with_capacity(table_count);
+    // 破損ガード: 巨大 count をそのまま with_capacity に渡すと OOM abort。 各 table は
+    // 最低 24 byte (name_len + lo/hi/next/himo_count/fk_count = 6×u32、 name 空) なので
+    // 残りバッファで prealloc を cap する (truncation 自体は下の read_u32! が検出する)。
+    let mut tables = Vec::with_capacity(table_count.min((buf.len() - 12) / 24));
     let mut off = 12usize;
 
     macro_rules! read_u32 {
@@ -186,12 +189,12 @@ fn deserialize_tables(buf: &[u8]) -> Result<Vec<TableDef>, String> {
         let next_local_u32 = read_u32!(buf, off);
         let next_local = std::sync::atomic::AtomicU32::new(next_local_u32);
         let himo_count = read_u32!(buf, off) as usize;
-        let mut himo_ids = Vec::with_capacity(himo_count);
+        let mut himo_ids = Vec::with_capacity(himo_count.min((buf.len() - off) / 4));
         for _ in 0..himo_count {
             himo_ids.push(read_u32!(buf, off));
         }
         let fk_count = read_u32!(buf, off) as usize;
-        let mut fk_refs = Vec::with_capacity(fk_count);
+        let mut fk_refs = Vec::with_capacity(fk_count.min((buf.len() - off) / 8));
         for _ in 0..fk_count {
             let hid = read_u32!(buf, off);
             let tid = read_u32!(buf, off);
@@ -328,6 +331,17 @@ fn deserialize_eidmap(buf: &[u8]) -> Result<Vec<(enchudb_oplog::PeerId, u32, u32
         return Err(format!("eidmap sidecar: unsupported version {}", version));
     }
     let count = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
+    // 破損 / torn header ガード: `count` は信用しない。 各 entry は固定 12 byte なので
+    // 上限は残りバッファで決まる。 bogus な巨大 count をそのまま with_capacity に渡すと
+    // 数 GB の確保要求で open 時に abort する (.eidmap は CRC 無し)。 上限超過は破損と
+    // みなし Err → load_eidmap_from_sidecar 側で空 translator に graceful fallback。
+    let max_entries = (buf.len() - 12) / 12;
+    if count > max_entries {
+        return Err(format!(
+            "eidmap sidecar: count {} exceeds buffer capacity {} (corrupt/torn)",
+            count, max_entries
+        ));
+    }
     let mut entries = Vec::with_capacity(count);
     let mut off = 12usize;
     for _ in 0..count {
@@ -5841,8 +5855,14 @@ impl Engine {
     /// 返り値: コピーしたパス一覧。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn snapshot_export(&self, target: &str) -> io::Result<SnapshotFiles> {
-        // mmap ページを物理ディスクに確実に書き出す(v27 のみ)
+        // mmap ページを物理ディスクに確実に書き出す
         self.body_msync()?;
+        // #9 (H2): sidecar (.tables/.eidmap) を現在の in-memory 状態から再 persist して
+        // から copy する。 これをしないと consumer tick (≤100ms 周期) 時点の stale sidecar
+        // を新しい body に対してコピーしてしまい、 body にいる翻訳 entity が .eidmap に
+        // 載らず restore 後の再 sync で重複 entity を払い出す。 path 空なら no-op、 失敗は
+        // 明示エラー (snapshot は durability 操作なので loud に失敗させる)。
+        self.persist_tables()?;
 
         let mut files = SnapshotFiles {
             main: target.to_string(),
