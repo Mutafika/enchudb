@@ -2807,11 +2807,13 @@ impl Engine {
             return foreign_eid; // identity: 自分が author の op
         }
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
-        if let Some(local) = self.eid_translator.get(author_peer, foreign_local) {
-            return enchudb_oplog::make_eid(self_peer, local);
-        }
-        let local = self.alloc_translated_local(himo_id);
-        self.eid_translator.insert(author_peer, foreign_local, local);
+        // get-or-allocate を atomic に行う (= 並行 apply で同じ foreign entity を
+        // double-alloc しない)。 alloc は himo の table に fresh な local を払い出す。
+        let local = self
+            .eid_translator
+            .get_or_insert_with(author_peer, foreign_local, || {
+                self.alloc_translated_local(himo_id)
+            });
         enchudb_oplog::make_eid(self_peer, local)
     }
 
@@ -2876,12 +2878,12 @@ impl Engine {
         if author_peer == self_peer {
             return foreign_value; // identity: 自分が author
         }
-        if let Some(local) = self.eid_translator.get(author_peer, foreign_value) {
-            return local;
-        }
-        let local = self.alloc_translated_local_in_target_table(ref_himo_id);
-        self.eid_translator.insert(author_peer, foreign_value, local);
-        local
+        // entity eid 翻訳と同じ key 空間・同じ atomic path。 ref-value 経由と target
+        // entity 自身の Tie 経由が同じ foreign を解決しても 1 つの local に収束する。
+        self.eid_translator
+            .get_or_insert_with(author_peer, foreign_value, || {
+                self.alloc_translated_local_in_target_table(ref_himo_id)
+            })
     }
 
     /// #9: Ref himo の target table (fk_refs で引く) に fresh な local eid を払い出す。
