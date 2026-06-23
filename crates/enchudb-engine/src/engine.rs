@@ -5900,12 +5900,6 @@ impl Engine {
     pub fn snapshot_export(&self, target: &str) -> io::Result<SnapshotFiles> {
         // mmap ページを物理ディスクに確実に書き出す
         self.body_msync()?;
-        // #9 (H2): sidecar (.tables/.eidmap) を現在の in-memory 状態から再 persist して
-        // から copy する。 これをしないと consumer tick (≤100ms 周期) 時点の stale sidecar
-        // を新しい body に対してコピーしてしまい、 body にいる翻訳 entity が .eidmap に
-        // 載らず restore 後の再 sync で重複 entity を払い出す。 path 空なら no-op、 失敗は
-        // 明示エラー (snapshot は durability 操作なので loud に失敗させる)。
-        self.persist_tables()?;
 
         let mut files = SnapshotFiles {
             main: target.to_string(),
@@ -5928,20 +5922,19 @@ impl Engine {
             files.crc = Some(crc_dst);
         }
 
-        // 0.7.0: .tables sidecar も snapshot に含める (= receiver が table 構造を
-        // 復元できる、 reserved table `_sync_ops` / `_sync_peers` も含む)。
-        let tables_src = format!("{}.tables", self.path);
-        if std::path::Path::new(&tables_src).exists() {
-            let tables_dst = format!("{}.tables", target);
-            std::fs::copy(&tables_src, &tables_dst)?;
+        // #9 (H2): sidecar (.tables/.eidmap) は source を copy せず、 現在の in-memory
+        // 状態を直接 target へ書き出す。 source copy だと consumer tick (≤100ms 周期)
+        // 時点の stale sidecar を新しい body に対してコピーしてしまい、 翻訳 entity が
+        // .eidmap に載らず restore 後の再 sync で重複する。 直接書き出しなら msync 済 body
+        // と必ず整合し、 かつ source を fsync 再 persist しないので snapshot が遅くならない
+        // (durability は copy と同じ page-cache level、 backup の fsync は呼び出し側責務)。
+        // 0.7.0: .tables には reserved table `_sync_ops` / `_sync_peers` も含む。
+        if !self.tables.is_empty() {
+            std::fs::write(format!("{}.tables", target), serialize_tables(&self.tables))?;
         }
-
-        // #9: .eidmap sidecar も snapshot に含める (= restore 後の peer が foreign eid
-        // 翻訳 mapping を保ち、 再 sync で重複 entity を払い出さない)。
-        let eidmap_src = format!("{}.eidmap", self.path);
-        if std::path::Path::new(&eidmap_src).exists() {
-            let eidmap_dst = format!("{}.eidmap", target);
-            std::fs::copy(&eidmap_src, &eidmap_dst)?;
+        let eidmap_entries = self.eidmap_entries_with_tombstones();
+        if !eidmap_entries.is_empty() {
+            std::fs::write(format!("{}.eidmap", target), serialize_eidmap(&eidmap_entries))?;
         }
 
         Ok(files)
