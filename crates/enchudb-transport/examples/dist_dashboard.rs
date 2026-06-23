@@ -591,8 +591,14 @@ fn spawn_cluster(state: Arc<RwLock<ClusterState>>, shutdown: Arc<AtomicBool>) {
             let client = HttpTransport::new(url.clone());
             let _ = client.bootstrap_to(&paths[i]).unwrap();
             let eng = Arc::new(Engine::open_replica(&paths[i]).unwrap());
-            let peer_id = (i as u32) + 10; // 11, 12, 13
-            eng.set_peer_id(peer_id);
+            // #9: これらの replica は単一 origin (peer 1) の read-only mirror で、自分
+            // からは一切書き込まない。 origin と同じ peer_id を名乗ると #9 の eid 翻訳が
+            // identity に落ち、 foreign eid をそのまま raw slot に置く (= pre-#9 と同じ)。
+            // 書き手が origin だけなので衝突は起きない。 また HTTP bootstrap は本体 DB のみ
+            // 転送して `.tables` sidecar を運ばないため、 table-bound himo + enable_sync_tables
+            // への移行は別途 bootstrap 拡張が要る (このデモのスコープ外 → follow-up)。
+            // 表示上の peer 11/12/13 は PeerState 側 (s.peers[..].peer_id) で保持される。
+            eng.set_peer_id(1);
             replicas.push(eng.clone());
 
             let url_clone = url.clone();
