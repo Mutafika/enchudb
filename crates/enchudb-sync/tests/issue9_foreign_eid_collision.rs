@@ -41,6 +41,7 @@ fn cleanup(path: &str) {
     let _ = std::fs::remove_file(format!("{}.tables", path));
     let _ = std::fs::remove_file(format!("{}.crc", path));
     let _ = std::fs::remove_file(format!("{}.db.lock", path));
+    let _ = std::fs::remove_file(format!("{}.eidmap", path));
 }
 
 fn make_engine(path: &str, peer: PeerId) -> Arc<Engine> {
@@ -124,6 +125,74 @@ fn foreign_eid_collision_must_not_clobber_local_entity() {
 
     drop(eng_a);
     drop(eng_b);
+    cleanup(&path_a);
+    cleanup(&path_b);
+}
+
+/// #9 commit 2: 翻訳 mapping が reopen を跨いで永続化される (= 再 sync で
+/// 重複 entity を払い出さない)。 `.eidmap` sidecar の往復を検証する。
+#[test]
+fn translation_mapping_survives_reopen() {
+    let path_a = tmp_path("reopen_a");
+    let path_b = tmp_path("reopen_b");
+
+    // peer A (id=1): entity + tie、 publish。
+    let eng_a = make_engine(&path_a, 1);
+    let e_a = eng_a.entity_in("notes").unwrap();
+    eng_a.tie_to(e_a, "notes.note", 100);
+    eng_a.oplog_commit();
+    std::thread::sleep(Duration::from_millis(300));
+    let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
+    let syncer_a = Syncer::new(eng_a.clone(), transport.clone());
+    syncer_a.publish_since(Hlc::ZERO);
+    let records = transport.pull(1, Hlc::ZERO);
+    assert!(!records.is_empty());
+
+    // peer B (id=2): A の record を apply → foreign entity が local X に mapping。
+    let eng_b = make_engine(&path_b, 2);
+    let syncer_b = Syncer::new(eng_b.clone(), transport.clone());
+    let out = syncer_b.apply_records(&records);
+    assert!(out.applied > 0, "A's record should apply");
+    let local_x = eid_local(
+        eng_b
+            .resolve_remote_eid_existing(1, e_a)
+            .expect("mapping should exist after apply"),
+    );
+    let n_before = eng_b.eid_translator().len();
+    assert_eq!(n_before, 1, "exactly one foreign entity mapped");
+
+    // .eidmap + .tables を persist して全 Arc を drop → reopen。
+    eng_b.persist_tables().unwrap();
+    drop(syncer_a);
+    drop(eng_a);
+    drop(syncer_b);
+    drop(eng_b);
+
+    // reopen — mapping は `.eidmap` sidecar から復元される。
+    let eng_b2 = Engine::open_concurrent_with_oplog(&path_b, 16 * 1024 * 1024).unwrap();
+    eng_b2.set_peer_id(2);
+    assert_eq!(
+        eng_b2.eid_translator().len(),
+        n_before,
+        "translation mapping must be restored on reopen"
+    );
+    assert_eq!(
+        eng_b2.resolve_remote_eid_existing(1, e_a).map(eid_local),
+        Some(local_x),
+        "the same foreign entity must resolve to the same local eid after reopen"
+    );
+
+    // 再 sync しても新規払い出しせず既存 mapping を再利用 (= 重複しない)。
+    let syncer_b2 = Syncer::new(eng_b2.clone(), transport.clone());
+    syncer_b2.apply_records(&records);
+    assert_eq!(
+        eng_b2.eid_translator().len(),
+        n_before,
+        "re-applying after reopen must reuse the mapping, not allocate a duplicate"
+    );
+
+    drop(syncer_b2);
+    drop(eng_b2);
     cleanup(&path_a);
     cleanup(&path_b);
 }

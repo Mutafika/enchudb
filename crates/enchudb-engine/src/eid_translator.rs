@@ -64,6 +64,15 @@ impl EidTranslator {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// 全 entry の snapshot (sidecar 永続化用)。 各要素 = (author_peer, foreign_local, local)。
+    pub fn snapshot(&self) -> Vec<(PeerId, u32, u32)> {
+        let guard = self.inner.read().unwrap();
+        guard
+            .iter()
+            .map(|(&(peer, foreign_local), &local)| (peer, foreign_local, local))
+            .collect()
+    }
 }
 
 #[cfg(test)]

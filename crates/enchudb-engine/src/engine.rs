@@ -295,6 +295,97 @@ fn load_tables_from_sidecar(db_path: &str) -> io::Result<Option<Vec<TableDef>>> 
     }
 }
 
+/// #9: eid 翻訳テーブルの sidecar path。 `.eidmap`。 中身は
+/// `(author_peer, foreign_local, local)` の binary 配列。 不在 (= sync してない DB
+/// や旧 DB) なら open 時に空の translator で続行 (additive、 後方互換)。
+#[cfg(not(target_arch = "wasm32"))]
+fn eidmap_path_for(path: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}.eidmap", path))
+}
+
+/// #9: 翻訳 entry を binary encode。
+/// layout: magic "EIDM"(4) + version u32=1 + count u32 + (peer u32, foreign u32, local u32) × count
+fn serialize_eidmap(entries: &[(enchudb_oplog::PeerId, u32, u32)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + entries.len() * 12);
+    out.extend_from_slice(b"EIDM");
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for &(peer, foreign_local, local) in entries {
+        out.extend_from_slice(&peer.to_le_bytes());
+        out.extend_from_slice(&foreign_local.to_le_bytes());
+        out.extend_from_slice(&local.to_le_bytes());
+    }
+    out
+}
+
+/// #9: eidmap sidecar を decode。 magic 不一致 / truncated は Err。
+fn deserialize_eidmap(buf: &[u8]) -> Result<Vec<(enchudb_oplog::PeerId, u32, u32)>, String> {
+    if buf.len() < 12 || &buf[0..4] != b"EIDM" {
+        return Err("eidmap sidecar: bad magic".into());
+    }
+    let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+    if version != 1 {
+        return Err(format!("eidmap sidecar: unsupported version {}", version));
+    }
+    let count = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
+    let mut entries = Vec::with_capacity(count);
+    let mut off = 12usize;
+    for _ in 0..count {
+        if off + 12 > buf.len() {
+            return Err("eidmap sidecar: truncated".into());
+        }
+        let peer = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        let foreign_local = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap());
+        let local = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap());
+        off += 12;
+        entries.push((peer, foreign_local, local));
+    }
+    Ok(entries)
+}
+
+/// #9: eidmap を sidecar に atomic 書き換え (fsync 込み)。 entries 空なら何もしない
+/// (= sync してない DB に空ファイルを作らない)。
+#[cfg(not(target_arch = "wasm32"))]
+fn persist_eidmap_to_sidecar(
+    db_path: &str,
+    entries: &[(enchudb_oplog::PeerId, u32, u32)],
+) -> io::Result<()> {
+    use std::io::Write;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let sidecar = eidmap_path_for(db_path);
+    let tmp_path = sidecar.with_extension("eidmap.tmp");
+    let bytes = serialize_eidmap(entries);
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, &sidecar)?;
+    Ok(())
+}
+
+/// #9: eidmap sidecar を読む。 不在なら Ok(None)。
+#[cfg(not(target_arch = "wasm32"))]
+fn load_eidmap_from_sidecar(
+    db_path: &str,
+) -> io::Result<Option<Vec<(enchudb_oplog::PeerId, u32, u32)>>> {
+    let sidecar = eidmap_path_for(db_path);
+    match std::fs::read(&sidecar) {
+        Ok(buf) => match deserialize_eidmap(&buf) {
+            Ok(entries) => Ok(Some(entries)),
+            Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// writer 排他用 sidecar の path。 `.db.lock`。
 #[cfg(not(target_arch = "wasm32"))]
 fn writer_lock_path_for(path: &str) -> std::path::PathBuf {
@@ -1504,6 +1595,24 @@ impl Engine {
             }
         }
 
+        // #9: eid 翻訳テーブルの sidecar 読み込み。 不在 (= sync してない / 旧 DB) なら
+        // 空の translator で続行 (additive、 後方互換)。 破損は警告のみで空続行 (= 再
+        // sync で mapping は張り直せる)。
+        match load_eidmap_from_sidecar(path) {
+            Ok(Some(entries)) => {
+                for (peer, foreign_local, local) in entries {
+                    eng.eid_translator.insert(peer, foreign_local, local);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to read eidmap sidecar (empty translator): {}",
+                    e
+                );
+            }
+        }
+
         if verify_region_crc {
             // .crc ファイルがあれば全 region CRC 検証
             eng.verify_region_crcs()?;
@@ -2428,7 +2537,9 @@ impl Engine {
         if self.path.is_empty() {
             return Ok(());
         }
-        persist_tables_to_sidecar(&self.path, &self.tables)
+        persist_tables_to_sidecar(&self.path, &self.tables)?;
+        // #9: 翻訳テーブルも同じ trigger で persist (next_local と整合させる)。
+        persist_eidmap_to_sidecar(&self.path, &self.eid_translator.snapshot())
     }
 
     /// 0.8.7: DB ファイルパスを返す。 schema crate が schema sidecar
@@ -2455,6 +2566,13 @@ impl Engine {
                     // 0.8.15 (issue #52): ENOSPC 等で consumer thread が毎 batch
                     // 失敗 → 同 warning がターミナル不能になる現象を回避するため、
                     // 1 秒 1 行の rate-limit を入れる。
+                    self.warn_persist_failure_rate_limited(&e);
+                }
+                // #9: 翻訳テーブルも tables と同じ trigger で persist (next_local と
+                // 整合させる)。 entries 空なら no-op (sync してない DB に file を作らない)。
+                if let Err(e) =
+                    persist_eidmap_to_sidecar(&self.path, &self.eid_translator.snapshot())
+                {
                     self.warn_persist_failure_rate_limited(&e);
                 }
             }
@@ -5701,6 +5819,14 @@ impl Engine {
         if std::path::Path::new(&tables_src).exists() {
             let tables_dst = format!("{}.tables", target);
             std::fs::copy(&tables_src, &tables_dst)?;
+        }
+
+        // #9: .eidmap sidecar も snapshot に含める (= restore 後の peer が foreign eid
+        // 翻訳 mapping を保ち、 再 sync で重複 entity を払い出さない)。
+        let eidmap_src = format!("{}.eidmap", self.path);
+        if std::path::Path::new(&eidmap_src).exists() {
+            let eidmap_dst = format!("{}.eidmap", target);
+            std::fs::copy(&eidmap_src, &eidmap_dst)?;
         }
 
         Ok(files)
