@@ -3,6 +3,42 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.9.0 — 2026-06-23
+
+cross-peer eid 翻訳 (#9)。 **public API 追加 + `.eidmap` sidecar 追加** のため minor
+bump。 file format / wire format は不変、 既存 DB は再 build のみで上がれる (sidecar
+不在 = 空 translator = 旧挙動、 backward-compatible、 migration 不要)。
+
+### Fixed
+
+- **cross-peer sync で foreign eid がサイレント上書きを起こす**
+  ([#9](https://github.com/Mutafika/enchudb/issues/9)):
+  EntityId は peer ごとの空間だが、 `Syncer::apply_one` が受信 record の eid を
+  翻訳せず raw で apply していた。 foreign eid の local 部が受信側の既存 entity の
+  local slot と衝突すると、 その entity をサイレントに上書きしてデータを失っていた
+  (LWW の `HlcStore` も foreign eid を local として keying していた)。 engine に
+  `EidTranslator` (`(author_peer, foreign_local) → local_eid` 写像) を内蔵し、 apply
+  時に 4 op (Tie/Untie/Delete/Content) 全てを翻訳。 初見の foreign entity には himo の
+  table 内に fresh な local eid を払い出す (= local entity と同じ allocator、 衝突しない)。
+- **cross-peer ref が壊れる** (#9): Ref himo の value 自体が foreign target eid なので、
+  同じ translator で ref の target table 空間に翻訳。 forward ref も target entity 自身の
+  Tie と同じ local に収束する。
+
+### Added
+
+- `Engine::resolve_remote_eid` / `resolve_remote_eid_existing` / `himo_is_ref` /
+  `resolve_remote_ref_value` / `eid_translator` — sync 層が apply 時に foreign eid を
+  翻訳するための primitive。
+- `.eidmap` sidecar — 翻訳写像を `.tables` と同じ trigger で atomic 永続化。 reopen /
+  `snapshot_export` で復元され、 再 sync で重複 entity を払い出さない。
+
+### Notes
+
+- 翻訳写像は **peer-local**。 oplog / sync wire には載らない (各 peer が独立に翻訳)。
+- `gossip_remote_apply` が ON の場合の relayed append は現状 local_eid で append する。
+  gossip 転送の厳密な正しさには元の foreign eid で append すべきで、 別 commit で
+  body-eid / relay-eid を分離予定。 default は off。
+
 ## 0.8.18 — 2026-06-22
 
 robustness fix 4 件。 **file format / wire format / public API いずれも不変**、
