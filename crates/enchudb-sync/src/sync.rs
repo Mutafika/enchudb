@@ -67,10 +67,6 @@ pub struct Syncer {
     /// request4: per-peer subscription filter。 default は `AllRecords` (全送り、
     /// 旧 `publish_since` の挙動)。 `set_subscription_filter` で差し替え可。
     subscription_filter: std::sync::RwLock<Arc<dyn SubscriptionFilter>>,
-    /// 0.8.0: `_sync_ops` 経由 publish の進行点 (= 最後に publish した lsn)。
-    /// 次回 `publish_pending` は `pending_sync_ops(this)` で取得、 done で進める。
-    /// sync_tables_enabled な engine で初期化、 そうでなければ 0 のまま (= legacy path)。
-    published_lsn: std::sync::atomic::AtomicU32,
 }
 
 /// 1 回の pull-apply サイクルの結果。
@@ -128,7 +124,6 @@ impl Syncer {
             cursor_path: std::sync::RwLock::new(None),
             require_signature: std::sync::atomic::AtomicBool::new(false),
             subscription_filter: std::sync::RwLock::new(Arc::new(AllRecords)),
-            published_lsn: std::sync::atomic::AtomicU32::new(0),
         };
         // HlcStore は engine 内部のメモリ構造で永続化されない。 engine reopen 後は
         // 空状態なので、 attach 時に WAL を walk して LWW state を再構築する。

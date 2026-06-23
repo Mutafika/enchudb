@@ -523,16 +523,6 @@ impl Backing {
         }
     }
 
-    /// growable backing のときに commit を要求サイズまで伸ばす。
-    /// 他の variant では no-op (ヘッダ上限で既に確保済み)。
-    #[cfg(not(target_arch = "wasm32"))]
-    fn ensure_committed(&self, end: usize) -> io::Result<()> {
-        match self {
-            Backing::Growable(g) => g.grow_amortized(end),
-            _ => Ok(()),
-        }
-    }
-
     /// Growable backing なら GrowableMap への Arc を返す。 `Region::with_grower`
     /// で region を作り直したい後付けの init path 用 (例: `ensure_himo` で
     /// himo_slots 領域を lazy commit する)。
@@ -670,7 +660,6 @@ const H_PEER_ID: usize = 68; // u32
 /// CRC 保護外。 accidental truncation 検出が目的、 adversarial tampering は対象外。
 const H_BACKING_KIND: usize = 76; // u32
 
-const BACKING_KIND_EAGER: u32 = 0;
 const BACKING_KIND_GROWABLE: u32 = 1;
 const H_HIMO_TYPES: usize = 256;
 
@@ -5499,12 +5488,6 @@ impl Engine {
     fn spawn_consumer(eng: Self) -> std::sync::Arc<Self> {
         Self::spawn_consumer_with_oplog(eng, None)
     }
-
-    /// `oplog_record_queue` capacity の default (= write_queue と同じ 1 M)。
-    /// issue4: 旧 unbounded SegQueue では sustained writer で RSS 線形成長 → OOM。
-    /// caller は `create_concurrent_with_oplog_queue_cap` で上書きできる。
-    pub(crate) const DEFAULT_OPLOG_QUEUE_CAP: usize =
-        crate::write_queue::DEFAULT_WRITE_QUEUE_CAP;
 
     /// changefeed 内部ヘルパ: WAL から emit_offset 以降の record を取り出して
     /// 全 listener に渡し、cursor を進める。
