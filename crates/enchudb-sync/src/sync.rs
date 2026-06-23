@@ -404,8 +404,14 @@ impl Syncer {
                 if !store.try_set(local_eid, *himo_id, rec.hlc) {
                     return false;
                 }
-                // Symbol 型 himo の場合、remote vocab の vid を local vid に変換
-                let value = self.engine.translate_remote_vid(rec.author_peer, *himo_id, *value);
+                // #9: Ref himo は value 自体が foreign target eid なので、 ref の target
+                // table 空間の local eid に翻訳する。 それ以外 (Tag/Symbol) は remote
+                // vocab vid を local vid に変換 (Number himo は identity)。
+                let value = if self.engine.himo_is_ref(*himo_id) {
+                    self.engine.resolve_remote_ref_value(rec.author_peer, *value, *himo_id)
+                } else {
+                    self.engine.translate_remote_vid(rec.author_peer, *himo_id, *value)
+                };
                 self.engine.remote_tie_apply(local_eid, *himo_id, value, Some(relayed_header(rec)));
                 true
             }

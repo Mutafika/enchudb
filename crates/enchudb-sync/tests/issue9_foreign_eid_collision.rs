@@ -196,3 +196,94 @@ fn translation_mapping_survives_reopen() {
     cleanup(&path_a);
     cleanup(&path_b);
 }
+
+/// #9 commit 3: cross-peer ref。 Ref himo の value 自体が foreign target eid なので、
+/// apply 時に ref の target table 空間の local eid へ翻訳されること。
+///
+/// B は自分の company を先に作って allocator を 1 つ進めておく。 こうすると A の
+/// company の翻訳先が A の raw eid とズレるので、 「翻訳してない」 と ref が B 自身の
+/// company を指してしまい assertion で落ちる (= テストが翻訳を本当に検証する)。
+#[test]
+fn cross_peer_ref_value_is_translated() {
+    fn make_ref_engine(path: &str, peer: PeerId) -> Arc<Engine> {
+        cleanup(path);
+        let mut eng = Engine::create_with_capacity(path, 65_536).unwrap();
+        eng.define_table("companies", 1000).unwrap();
+        eng.define_himo_in("companies", "cid", HimoType::Number, 0).unwrap();
+        eng.define_table("users", 1000).unwrap();
+        eng.define_himo_in("users", "uid", HimoType::Number, 0).unwrap();
+        eng.define_ref_in("users", "company", "companies").unwrap();
+        eng.enable_sync_tables().unwrap();
+        let eng: Arc<Engine> =
+            Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
+        eng.set_peer_id(peer);
+        eng
+    }
+
+    let path_a = tmp_path("ref_a");
+    let path_b = tmp_path("ref_b");
+
+    // peer A: company c (cid=7), user u (uid=1) -> ref company = c。
+    let eng_a = make_ref_engine(&path_a, 1);
+    let c = eng_a.entity_in("companies").unwrap();
+    eng_a.tie_to(c, "companies.cid", 7);
+    let u = eng_a.entity_in("users").unwrap();
+    eng_a.tie_to(u, "users.uid", 1);
+    eng_a.tie_ref_to(u, "users.company", c);
+    eng_a.oplog_commit();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
+    let syncer_a = Syncer::new(eng_a.clone(), transport.clone());
+    syncer_a.publish_since(Hlc::ZERO);
+    let records = transport.pull(1, Hlc::ZERO);
+    assert!(!records.is_empty());
+
+    // peer B: 自分の company を先に作る (= allocator を 1 進める)。
+    let eng_b = make_ref_engine(&path_b, 2);
+    let b_own = eng_b.entity_in("companies").unwrap();
+    eng_b.tie_to(b_own, "companies.cid", 99);
+
+    // A の records を apply。
+    let syncer_b = Syncer::new(eng_b.clone(), transport.clone());
+    let out = syncer_b.apply_records(&records);
+    assert!(out.applied > 0, "A's records should apply");
+
+    // B 側の company / user の翻訳後 local eid。
+    let c_local = eid_local(
+        eng_b
+            .resolve_remote_eid_existing(1, c)
+            .expect("company should be mapped"),
+    );
+    let u_eid = eng_b
+        .resolve_remote_eid_existing(1, u)
+        .expect("user should be mapped");
+
+    // 翻訳が効いていれば A の company は B 自身の company とは別 slot に置かれる。
+    assert_ne!(
+        c_local,
+        eid_local(b_own),
+        "A's company must NOT land on B's own company slot"
+    );
+
+    // user の ref value は B の company local (= c_local) を指すこと。 翻訳してないと
+    // A の raw eid (= b_own と同じ slot) を指してしまう。
+    let ref_val = eng_b
+        .get(u_eid, "users.company")
+        .expect("user should have a company ref");
+    assert_eq!(
+        ref_val, c_local,
+        "cross-peer ref must be translated to B's local company eid (got {}, want {}); \
+         untranslated it would point at B's own company {}",
+        ref_val,
+        c_local,
+        eid_local(b_own)
+    );
+
+    drop(syncer_a);
+    drop(eng_a);
+    drop(syncer_b);
+    drop(eng_b);
+    cleanup(&path_a);
+    cleanup(&path_b);
+}

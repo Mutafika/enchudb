@@ -2864,6 +2864,63 @@ impl Engine {
         enchudb_oplog::eid_local(self.entity())
     }
 
+    /// #9: himo が Ref 型か。 Ref の value は foreign target eid なので apply 時に
+    /// entity eid とは別に value も translate する必要がある。
+    pub fn himo_is_ref(&self, himo_id: u16) -> bool {
+        let hid = himo_id as usize;
+        hid < self.himo_types.len() && self.himo_types[hid] == HimoType::Ref
+    }
+
+    /// #9: Ref himo の value (= foreign target eid の local 部) を自分の eid 空間の
+    /// local eid に翻訳する。 target entity が初見なら ref の **target table** に fresh
+    /// な local を払い出す。 後で target entity 自身の Tie が来ても同じ key
+    /// `(author_peer, foreign_value)` で同じ local に解決されるため整合する (= forward
+    /// ref も OK)。 `author_peer == self` なら identity。
+    pub fn resolve_remote_ref_value(
+        &self,
+        author_peer: enchudb_oplog::PeerId,
+        foreign_value: u32,
+        ref_himo_id: u16,
+    ) -> u32 {
+        use std::sync::atomic::Ordering;
+        let self_peer = self.peer_id.load(Ordering::Acquire);
+        if author_peer == self_peer {
+            return foreign_value; // identity: 自分が author
+        }
+        if let Some(local) = self.eid_translator.get(author_peer, foreign_value) {
+            return local;
+        }
+        let local = self.alloc_translated_local_in_target_table(ref_himo_id);
+        self.eid_translator.insert(author_peer, foreign_value, local);
+        local
+    }
+
+    /// #9: Ref himo の target table (fk_refs で引く) に fresh な local eid を払い出す。
+    /// target table を導けない場合は anonymous `entity()` で確保。
+    fn alloc_translated_local_in_target_table(&self, ref_himo_id: u16) -> u32 {
+        let hid = ref_himo_id as usize;
+        if hid < self.himo_to_table.len() {
+            let owner_tid = self.himo_to_table[hid] as usize;
+            if owner_tid < self.tables.len() {
+                let owner = &self.tables[owner_tid];
+                if let Some(&(_, target_tid)) =
+                    owner.fk_refs.iter().find(|(h, _)| *h == hid as u32)
+                {
+                    let target_tid = target_tid as usize;
+                    if target_tid < self.tables.len()
+                        && self.tables[target_tid].eid_range_hi != u32::MAX
+                    {
+                        let name = self.tables[target_tid].name.clone();
+                        if let Ok(e) = self.entity_in(&name) {
+                            return enchudb_oplog::eid_local(e);
+                        }
+                    }
+                }
+            }
+        }
+        enchudb_oplog::eid_local(self.entity())
+    }
+
     /// Phase C: 自 peer の鍵ペアを設定。WAL にも反映される。None で署名 off。
     pub fn set_keypair(&self, kp: Option<std::sync::Arc<enchudb_oplog::keys::Keypair>>) {
         *self.keypair.write().unwrap() = kp.clone();
