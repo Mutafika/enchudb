@@ -306,36 +306,48 @@ fn eidmap_path_for(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{}.eidmap", path))
 }
 
-/// #9: 翻訳 entry を binary encode。
-/// layout: magic "EIDM"(4) + version u32=1 + count u32 + (peer u32, foreign u32, local u32) × count
-fn serialize_eidmap(entries: &[(enchudb_oplog::PeerId, u32, u32)]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(12 + entries.len() * 12);
+/// #9: eidmap sidecar の 1 entry。 `(author_peer, foreign_local, local, tombstone_hlc)`。
+/// `tombstone_hlc == Hlc::ZERO` は「削除されていない」。 v2 (0.9.0) で tombstone を追加し、
+/// reopen 後の削除済み entity 復活 (resurrection) を防ぐ。
+type EidmapEntry = (enchudb_oplog::PeerId, u32, u32, enchudb_oplog::Hlc);
+
+/// #9: 翻訳 entry を binary encode (v2)。
+/// layout: magic "EIDM"(4) + version u32=2 + count u32
+///         + (peer u32, foreign u32, local u32, tomb_wall u64, tomb_logical u32, tomb_peer u32) × count
+fn serialize_eidmap(entries: &[EidmapEntry]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + entries.len() * 28);
     out.extend_from_slice(b"EIDM");
-    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&2u32.to_le_bytes());
     out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for &(peer, foreign_local, local) in entries {
+    for &(peer, foreign_local, local, tomb) in entries {
         out.extend_from_slice(&peer.to_le_bytes());
         out.extend_from_slice(&foreign_local.to_le_bytes());
         out.extend_from_slice(&local.to_le_bytes());
+        out.extend_from_slice(&tomb.wall.to_le_bytes());
+        out.extend_from_slice(&tomb.logical.to_le_bytes());
+        out.extend_from_slice(&tomb.peer.to_le_bytes());
     }
     out
 }
 
-/// #9: eidmap sidecar を decode。 magic 不一致 / truncated は Err。
-fn deserialize_eidmap(buf: &[u8]) -> Result<Vec<(enchudb_oplog::PeerId, u32, u32)>, String> {
+/// #9: eidmap sidecar を decode。 magic 不一致 / truncated は Err。 v1 (tombstone 無し、
+/// 12 byte/entry) と v2 (tombstone 込み、 28 byte/entry) の両方を読める。
+fn deserialize_eidmap(buf: &[u8]) -> Result<Vec<EidmapEntry>, String> {
     if buf.len() < 12 || &buf[0..4] != b"EIDM" {
         return Err("eidmap sidecar: bad magic".into());
     }
     let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-    if version != 1 {
-        return Err(format!("eidmap sidecar: unsupported version {}", version));
-    }
+    let entry_size = match version {
+        1 => 12usize,
+        2 => 28usize,
+        v => return Err(format!("eidmap sidecar: unsupported version {}", v)),
+    };
     let count = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
-    // 破損 / torn header ガード: `count` は信用しない。 各 entry は固定 12 byte なので
-    // 上限は残りバッファで決まる。 bogus な巨大 count をそのまま with_capacity に渡すと
-    // 数 GB の確保要求で open 時に abort する (.eidmap は CRC 無し)。 上限超過は破損と
-    // みなし Err → load_eidmap_from_sidecar 側で空 translator に graceful fallback。
-    let max_entries = (buf.len() - 12) / 12;
+    // 破損 / torn header ガード: `count` は信用しない。 各 entry は固定長なので上限は
+    // 残りバッファで決まる。 bogus な巨大 count をそのまま with_capacity に渡すと数 GB の
+    // 確保要求で open 時に abort する (.eidmap は CRC 無し)。 上限超過は破損とみなし Err
+    // → load_eidmap_from_sidecar 側で空 translator に graceful fallback。
+    let max_entries = (buf.len() - 12) / entry_size;
     if count > max_entries {
         return Err(format!(
             "eidmap sidecar: count {} exceeds buffer capacity {} (corrupt/torn)",
@@ -345,14 +357,22 @@ fn deserialize_eidmap(buf: &[u8]) -> Result<Vec<(enchudb_oplog::PeerId, u32, u32
     let mut entries = Vec::with_capacity(count);
     let mut off = 12usize;
     for _ in 0..count {
-        if off + 12 > buf.len() {
+        if off + entry_size > buf.len() {
             return Err("eidmap sidecar: truncated".into());
         }
         let peer = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
         let foreign_local = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap());
         let local = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap());
-        off += 12;
-        entries.push((peer, foreign_local, local));
+        let tomb = if entry_size == 28 {
+            let wall = u64::from_le_bytes(buf[off + 12..off + 20].try_into().unwrap());
+            let logical = u32::from_le_bytes(buf[off + 20..off + 24].try_into().unwrap());
+            let tpeer = u32::from_le_bytes(buf[off + 24..off + 28].try_into().unwrap());
+            enchudb_oplog::Hlc { wall, logical, peer: tpeer }
+        } else {
+            enchudb_oplog::Hlc::ZERO
+        };
+        off += entry_size;
+        entries.push((peer, foreign_local, local, tomb));
     }
     Ok(entries)
 }
@@ -360,10 +380,7 @@ fn deserialize_eidmap(buf: &[u8]) -> Result<Vec<(enchudb_oplog::PeerId, u32, u32
 /// #9: eidmap を sidecar に atomic 書き換え (fsync 込み)。 entries 空なら何もしない
 /// (= sync してない DB に空ファイルを作らない)。
 #[cfg(not(target_arch = "wasm32"))]
-fn persist_eidmap_to_sidecar(
-    db_path: &str,
-    entries: &[(enchudb_oplog::PeerId, u32, u32)],
-) -> io::Result<()> {
+fn persist_eidmap_to_sidecar(db_path: &str, entries: &[EidmapEntry]) -> io::Result<()> {
     use std::io::Write;
     if entries.is_empty() {
         return Ok(());
@@ -386,9 +403,7 @@ fn persist_eidmap_to_sidecar(
 
 /// #9: eidmap sidecar を読む。 不在なら Ok(None)。
 #[cfg(not(target_arch = "wasm32"))]
-fn load_eidmap_from_sidecar(
-    db_path: &str,
-) -> io::Result<Option<Vec<(enchudb_oplog::PeerId, u32, u32)>>> {
+fn load_eidmap_from_sidecar(db_path: &str) -> io::Result<Option<Vec<EidmapEntry>>> {
     let sidecar = eidmap_path_for(db_path);
     match std::fs::read(&sidecar) {
         Ok(buf) => match deserialize_eidmap(&buf) {
@@ -1603,13 +1618,22 @@ impl Engine {
         // sync で mapping は張り直せる)。
         match load_eidmap_from_sidecar(path) {
             Ok(Some(entries)) => {
-                for (peer, foreign_local, local) in entries {
+                // peer_id は上で header から復元済み → translated eid の key が正しく作れる。
+                let self_peer = eng.peer_id();
+                for (peer, foreign_local, local, tomb) in entries {
                     eng.eid_translator.insert(peer, foreign_local, local);
                     // #9 (H4): `.eidmap` と `.tables` は別々の rename なので crash で
                     // 不整合になりうる。 mapped local を table の next_local が必ず追い
                     // 越すよう前進させ、 stale `.tables` でも mapped slot を再 alloc して
                     // 衝突する事態を防ぐ (= 最悪でも「重複」に留め「衝突」を起こさない)。
                     Self::advance_table_next_local_for(&eng.tables, local);
+                    // #9 (C): foreign Delete tombstone を HlcStore に復元する。 これが無いと
+                    // reopen で tombstone が消え、 Delete より古い Tie が (Delete 抜きで) 再配送
+                    // された時に削除済み entity が復活する。 ZERO は未削除なので skip。
+                    if tomb != enchudb_oplog::Hlc::ZERO {
+                        eng.hlc_store
+                            .force_set(enchudb_oplog::make_eid(self_peer, local), u16::MAX, tomb);
+                    }
                 }
             }
             Ok(None) => {}
@@ -2532,6 +2556,25 @@ impl Engine {
         Ok(enchudb_oplog::make_eid(peer, global))
     }
 
+    /// #9: persist 用に翻訳写像 + 各 entity の foreign tombstone HLC を集める。 tombstone は
+    /// HlcStore の `(translated_eid, u16::MAX)` から引く (未削除なら `Hlc::ZERO`)。 reopen 時に
+    /// `.eidmap` v2 から復元され、 削除済み foreign entity の resurrection を防ぐ。
+    /// 呼ばれるのは persist trigger (consumer tick / 明示 persist) のみで read hot path 外。
+    fn eidmap_entries_with_tombstones(&self) -> Vec<EidmapEntry> {
+        let self_peer = self.peer_id();
+        self.eid_translator
+            .snapshot()
+            .into_iter()
+            .map(|(peer, foreign_local, local)| {
+                let tomb = self
+                    .hlc_store
+                    .get(enchudb_oplog::make_eid(self_peer, local), u16::MAX)
+                    .unwrap_or(enchudb_oplog::Hlc::ZERO);
+                (peer, foreign_local, local, tomb)
+            })
+            .collect()
+    }
+
     /// 0.8.1: `&self` で tables sidecar を強制 persist する public API。
     /// `Arc<Engine>` (= concurrent mode) でも `flush(&mut)` を取れない状況で
     /// `next_local` を含む tables 状態を disk に固める用途。
@@ -2547,7 +2590,7 @@ impl Engine {
         }
         persist_tables_to_sidecar(&self.path, &self.tables)?;
         // #9: 翻訳テーブルも同じ trigger で persist (next_local と整合させる)。
-        persist_eidmap_to_sidecar(&self.path, &self.eid_translator.snapshot())
+        persist_eidmap_to_sidecar(&self.path, &self.eidmap_entries_with_tombstones())
     }
 
     /// 0.8.7: DB ファイルパスを返す。 schema crate が schema sidecar
@@ -2579,7 +2622,7 @@ impl Engine {
                 // #9: 翻訳テーブルも tables と同じ trigger で persist (next_local と
                 // 整合させる)。 entries 空なら no-op (sync してない DB に file を作らない)。
                 if let Err(e) =
-                    persist_eidmap_to_sidecar(&self.path, &self.eid_translator.snapshot())
+                    persist_eidmap_to_sidecar(&self.path, &self.eidmap_entries_with_tombstones())
                 {
                     self.warn_persist_failure_rate_limited(&e);
                 }

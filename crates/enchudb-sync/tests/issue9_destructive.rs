@@ -1,8 +1,9 @@
 //! #9 destructive + failure tests: concurrency races and corrupt-sidecar fallback.
 
 use enchudb_engine::engine::Engine;
-use enchudb_engine::transport::{InMemoryTransport, Transport};
+use enchudb_engine::transport::{InMemoryTransport, Transport, WireRecord};
 use enchudb_engine::HimoType;
+use enchudb_oplog::oplog::DecodedOp;
 use enchudb_oplog::{eid_local, make_eid, Hlc, PeerId};
 use enchudb_sync::Syncer;
 use std::sync::Arc;
@@ -296,4 +297,136 @@ fn huge_count_eidmap_sidecar_does_not_oom() {
 
     drop(eng);
     cleanup(&path);
+}
+
+/// REORDER (B regression): a `Content` op delivered BEFORE its entity's `Tie`
+/// (separate pulls) must be buffered and applied once the Tie creates the
+/// mapping — not silently dropped. Pre-fix the Content skipped on an unmapped
+/// foreign and the blob was lost forever.
+#[test]
+fn content_before_tie_is_buffered_then_applied() {
+    let path_a = tmp_path("reorder_a");
+    let path_b = tmp_path("reorder_b");
+
+    let eng_a = make_engine(&path_a, 1);
+    let e_a = eng_a.entity_in("notes").unwrap();
+    eng_a.tie_to(e_a, "notes.note", 7);
+    eng_a.content_async(e_a, "memo", b"hello");
+    eng_a.oplog_commit();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
+    let syncer_a = Syncer::new(eng_a.clone(), transport.clone());
+    syncer_a.publish_since(Hlc::ZERO);
+    let records = transport.pull(1, Hlc::ZERO);
+
+    // Split the stream: deliver the Content record BEFORE the Tie.
+    let content_recs: Vec<_> = records
+        .iter()
+        .filter(|r| matches!(r.op, DecodedOp::Content { .. }))
+        .cloned()
+        .collect();
+    let non_content: Vec<_> = records
+        .iter()
+        .filter(|r| !matches!(r.op, DecodedOp::Content { .. }))
+        .cloned()
+        .collect();
+    assert!(!content_recs.is_empty(), "A should have a Content record");
+
+    let eng_b = make_engine(&path_b, 2);
+    let syncer_b = Syncer::new(eng_b.clone(), transport.clone());
+
+    // 1. Content arrives first — entity not yet mapped → buffered (not applied, not lost).
+    let out1 = syncer_b.apply_records(&content_recs);
+    assert_eq!(out1.applied, 0, "Content for an unmapped foreign entity is buffered");
+    assert!(
+        eng_b.resolve_remote_eid_existing(1, e_a).is_none(),
+        "no mapping should exist before the Tie"
+    );
+
+    // 2. The Tie arrives → mapping created → buffered Content drained + applied.
+    let out2 = syncer_b.apply_records(&non_content);
+    assert!(out2.applied > 0, "the Tie should apply");
+
+    let local = eng_b
+        .resolve_remote_eid_existing(1, e_a)
+        .expect("entity mapped after Tie");
+    assert_eq!(
+        eng_b.get_content(local, "memo"),
+        Some(b"hello".as_ref()),
+        "buffered Content must apply once the Tie creates the mapping (not lost)"
+    );
+
+    drop(syncer_a);
+    drop(eng_a);
+    drop(syncer_b);
+    drop(eng_b);
+    cleanup(&path_a);
+    cleanup(&path_b);
+}
+
+/// CRITICAL (C regression): a foreign Delete tombstone must survive reopen via
+/// `.eidmap` v2, so a stale older Tie (re-delivered WITHOUT its Delete) cannot
+/// resurrect the deleted entity. Pre-fix the HlcStore was wiped on reopen (foreign
+/// ops aren't in the local oplog under gossip-off) and the entity came back.
+#[test]
+fn foreign_delete_tombstone_survives_reopen() {
+    let path_b = tmp_path("tomb_b");
+    let foreign = make_eid(1, 5);
+    let himo_id;
+    {
+        let eng_b = make_engine(&path_b, 2);
+        himo_id = eng_b.himo_id("notes.note").unwrap() as u16;
+        let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
+        let syncer = Syncer::new(eng_b.clone(), transport);
+
+        // peer 1: Tie note=5 @100, then Delete @200 (Delete is the newer write).
+        let tie = WireRecord::unsigned(
+            Hlc { wall: 100, logical: 0, peer: 1 },
+            1,
+            DecodedOp::Tie { eid: foreign, himo_id, value: 5 },
+        );
+        let del = WireRecord::unsigned(
+            Hlc { wall: 200, logical: 0, peer: 1 },
+            1,
+            DecodedOp::Delete { eid: foreign },
+        );
+        let out = syncer.apply_records(&[tie, del]);
+        assert_eq!(out.applied, 2, "Tie + Delete should both apply");
+        let local = eng_b.resolve_remote_eid_existing(1, foreign).expect("mapped");
+        assert_eq!(eng_b.get(local, "notes.note"), None, "entity deleted before reopen");
+
+        eng_b.oplog_sync().unwrap(); // make the entity removal in the body durable
+        eng_b.persist_tables().unwrap(); // persist .eidmap v2 (carries the tombstone)
+        drop(syncer);
+        drop(eng_b);
+    }
+
+    // reopen — the tombstone is restored from .eidmap v2 (peer_id 2 came from the header).
+    let eng_b2 = Engine::open_concurrent_with_oplog(&path_b, 16 * 1024 * 1024).unwrap();
+    eng_b2.set_peer_id(2);
+    let transport2: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
+    let syncer2 = Syncer::new(eng_b2.clone(), transport2);
+
+    // re-deliver ONLY the stale Tie (older than the Delete, which is now gone).
+    let stale_tie = WireRecord::unsigned(
+        Hlc { wall: 100, logical: 0, peer: 1 },
+        1,
+        DecodedOp::Tie { eid: foreign, himo_id, value: 5 },
+    );
+    let out = syncer2.apply_records(&[stale_tie]);
+    assert_eq!(out.applied, 0, "stale Tie must be rejected by the restored tombstone");
+
+    let local = eng_b2
+        .resolve_remote_eid_existing(1, foreign)
+        .expect("mapping restored on reopen");
+    assert_eq!(
+        eng_b2.get(local, "notes.note"),
+        None,
+        "deleted foreign entity must NOT resurrect after reopen (tombstone persisted in .eidmap v2)"
+    );
+
+    drop(syncer2);
+    drop(eng_b2);
+    cleanup(&path_b);
 }

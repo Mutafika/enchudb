@@ -53,6 +53,10 @@ use enchudb_oplog::{Hlc, PeerId};
 
 use crate::subscription::{AllRecords, SubscriptionFilter};
 
+/// #9: 未着 Tie 待ちで退避する Content/Delete の総数上限。 一度も Tie されない
+/// foreign entity (content-only) 宛の op で buffer が無限肥大しないための backstop。
+const MAX_PENDING_OPS: usize = 16_384;
+
 pub struct Syncer {
     engine: Arc<Engine>,
     transport: Arc<dyn Transport>,
@@ -67,6 +71,13 @@ pub struct Syncer {
     /// request4: per-peer subscription filter。 default は `AllRecords` (全送り、
     /// 旧 `publish_since` の挙動)。 `set_subscription_filter` で差し替え可。
     subscription_filter: std::sync::RwLock<Arc<dyn SubscriptionFilter>>,
+    /// #9 foot-gun ガード: self_peer == 0 で foreign record を apply した事の一度だけ警告。
+    warned_unconfigured_peer: std::sync::atomic::AtomicBool,
+    /// #9: 確保先の写像がまだ無い (= entity の Tie が未着) foreign entity 宛の
+    /// Content / Delete を一時退避する buffer。 key = (author_peer, foreign_local)。
+    /// 対応する Tie が届いて写像が作られた直後に drain して apply する (= 配送順序が
+    /// 入れ替わっても op を落とさない)。
+    pending_ops: std::sync::Mutex<std::collections::HashMap<(PeerId, u32), Vec<WireRecord>>>,
 }
 
 /// 1 回の pull-apply サイクルの結果。
@@ -124,6 +135,8 @@ impl Syncer {
             cursor_path: std::sync::RwLock::new(None),
             require_signature: std::sync::atomic::AtomicBool::new(false),
             subscription_filter: std::sync::RwLock::new(Arc::new(AllRecords)),
+            warned_unconfigured_peer: std::sync::atomic::AtomicBool::new(false),
+            pending_ops: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         // HlcStore は engine 内部のメモリ構造で永続化されない。 engine reopen 後は
         // 空状態なので、 attach 時に WAL を walk して LWW state を再構築する。
@@ -332,6 +345,22 @@ impl Syncer {
     /// WS push client などの外部から呼び出すために public。
     pub fn apply_records(&self, records: &[WireRecord]) -> SyncOutcome {
         let mut out = SyncOutcome::default();
+        // #9 foot-gun ガード: self_peer 未設定 (= 0) で foreign record を apply すると、
+        // author 0 == self 0 が `resolve_remote_eid` の identity 分岐に落ち、 翻訳されず
+        // #9 の衝突 (自分の entity をサイレント上書き) が再発する。 sync には必ず非 0 の
+        // peer_id が要る。 一度だけ loud に警告する。
+        if !records.is_empty()
+            && self.engine.peer_id() == 0
+            && !self
+                .warned_unconfigured_peer
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!(
+                "warning: Syncer applying foreign records with peer_id == 0; call \
+                 Engine::set_peer_id(<non-zero>) before sync or foreign entities can \
+                 collide with local ones (#9)."
+            );
+        }
         let store = self.engine.hlc_store().clone();
         let require_sig = self.require_signature.load(std::sync::atomic::Ordering::Acquire);
         let pubkeys = self.engine.pubkeys().clone();
@@ -368,6 +397,38 @@ impl Syncer {
         out
     }
 
+    /// #9: 未着 Tie 待ちの Content を退避する。 同 HLC の重複 (再 pull) は無視。
+    /// 総数が `MAX_PENDING_OPS` を超えたら最古の bucket を 1 つ落とす (= 一度も Tie
+    /// されない content-only entity 宛で buffer が無限肥大しないための backstop)。
+    fn buffer_pending(&self, author_peer: PeerId, foreign_local: u32, rec: &WireRecord) {
+        let mut guard = self.pending_ops.lock().unwrap();
+        let total: usize = guard.values().map(|v| v.len()).sum();
+        if total >= MAX_PENDING_OPS {
+            if let Some(k) = guard.keys().next().copied() {
+                guard.remove(&k);
+            }
+        }
+        let bucket = guard.entry((author_peer, foreign_local)).or_default();
+        if !bucket.iter().any(|r| r.hlc == rec.hlc) {
+            bucket.push(rec.clone());
+        }
+    }
+
+    /// #9: (author_peer, foreign_local) 宛に退避していた Content を drain して apply する。
+    /// 対応する entity の Tie / Untie が届いて写像が作られた直後に呼ぶ。 写像は既に
+    /// あるので今度は resolve でき、 LWW / tombstone は `apply_one` 内で再評価される。
+    fn drain_pending(&self, store: &HlcStore, author_peer: PeerId, foreign_local: u32) {
+        let buffered = {
+            let mut guard = self.pending_ops.lock().unwrap();
+            guard.remove(&(author_peer, foreign_local))
+        };
+        if let Some(recs) = buffered {
+            for rec in &recs {
+                let _ = self.apply_one(store, rec);
+            }
+        }
+    }
+
     fn apply_one(&self, store: &HlcStore, rec: &WireRecord) -> bool {
         // 受信した WireRecord の header フィールドを Engine::remote_*_apply の relayed 引数に
         // そのまま渡す (gossip 経路で `OpLog::append_relayed` が元 HLC/author/署名を保持するため)。
@@ -394,6 +455,9 @@ impl Syncer {
                     Some(e) => e,
                     None => return false,
                 };
+                // #9: entity 写像ができたので、 この foreign entity 宛に Tie より先に届いて
+                // 退避していた Content を drain して apply する (= 配送順序ロス防止)。
+                self.drain_pending(store, rec.author_peer, enchudb_oplog::eid_local(*eid));
                 // #9: Ref himo は value 自体が foreign target eid なので、 ref の target
                 // table 空間の local eid に翻訳 (確保できなければ skip)。 それ以外
                 // (Tag/Symbol) は remote vocab vid を local vid に変換 (Number は identity)。
@@ -424,6 +488,8 @@ impl Syncer {
                     Some(e) => e,
                     None => return false,
                 };
+                // #9: 写像ができたので退避中の Content を drain。
+                self.drain_pending(store, rec.author_peer, enchudb_oplog::eid_local(*eid));
                 if let Some(tomb) = store.get(local_eid, u16::MAX) {
                     if rec.hlc < tomb {
                         return false;
@@ -454,12 +520,17 @@ impl Syncer {
                 true
             }
             DecodedOp::Content { eid, key, data } => {
-                // #9: Content は himo を持たず table を導けないので、 Delete と同じく
-                // 既存の翻訳のみ引く。 未登録 (= まだ Tie されてない foreign entity) なら
-                // 確保先 table が無いので skip (content-only entity は未対応の edge)。
+                // #9: Content は himo を持たず table を導けないので既存の写像のみ引く。
+                // 未着 (= entity の Tie がまだ来てない) なら確保先が無いので、 pending に
+                // 退避して Tie 到着時に drain する (= Content-before-Tie の reorder ロス防止)。
+                // Content は key 単位 LWW で他 op と独立なので、 Tie の後に遅延適用しても
+                // 可換 (= commutative、 順序非依存)。
                 let local_eid = match self.engine.resolve_remote_eid_existing(rec.author_peer, *eid) {
                     Some(e) => e,
-                    None => return false,
+                    None => {
+                        self.buffer_pending(rec.author_peer, enchudb_oplog::eid_local(*eid), rec);
+                        return false;
+                    }
                 };
                 // Content は key 単位で LWW。himo_id を使えないので hash で代用。
                 if let Some(tomb) = store.get(local_eid, u16::MAX) {
