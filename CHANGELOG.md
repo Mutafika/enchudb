@@ -3,6 +3,91 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.8.19 — 2026-06-23
+
+cross-peer eid 翻訳 (#9)。 foreign eid のサイレント上書きを直す bugfix。 public API +
+`.eidmap` sidecar を足すが file format / wire format は不変、 既存 DB は再 build のみで
+上がれる (sidecar 不在 = 空 translator = 旧挙動)。 完全 backward-compatible・migration
+不要のため **patch** として release。
+
+### Fixed
+
+- **cross-peer sync で foreign eid がサイレント上書きを起こす**
+  ([#9](https://github.com/Mutafika/enchudb/issues/9)):
+  EntityId は peer ごとの空間だが、 `Syncer::apply_one` が受信 record の eid を
+  翻訳せず raw で apply していた。 foreign eid の local 部が受信側の既存 entity の
+  local slot と衝突すると、 その entity をサイレントに上書きしてデータを失っていた
+  (LWW の `HlcStore` も foreign eid を local として keying していた)。 engine に
+  `EidTranslator` (`(author_peer, foreign_local) → local_eid` 写像) を内蔵し、 apply
+  時に 4 op (Tie/Untie/Delete/Content) 全てを翻訳。 初見の foreign entity には himo の
+  table 内に fresh な local eid を払い出す (= local entity と同じ allocator、 衝突しない)。
+- **cross-peer ref が壊れる** (#9): Ref himo の value 自体が foreign target eid なので、
+  同じ translator で ref の target table 空間に翻訳。 forward ref も target entity 自身の
+  Tie と同じ local に収束する。
+
+### Added
+
+- `Engine::resolve_remote_eid` / `resolve_remote_eid_existing` / `himo_is_ref` /
+  `resolve_remote_ref_value` / `eid_translator` — sync 層が apply 時に foreign eid を
+  翻訳するための primitive。
+- `.eidmap` sidecar — 翻訳写像を `.tables` と同じ trigger で atomic 永続化。 reopen /
+  `snapshot_export` で復元され、 再 sync で重複 entity を払い出さない。
+
+### Hardened (post-merge review pass)
+
+- **破損 sidecar で open 時 OOM abort を防ぐ**: `.eidmap` / `.tables` の deserialize が
+  header の `count` を信用して `Vec::with_capacity(count)` していた。 torn / 破損で巨大な
+  count を引くと数 GB の確保要求で process が abort しえた。 `count` を残りバッファ長で
+  cap し、 `.eidmap` は上限超過を破損とみなして空 translator に fallback。
+  回帰テスト: `huge_count_eidmap_sidecar_does_not_oom`。
+- **`snapshot_export` の sidecar 整合性**: body msync 後に古い on-disk `.tables` /
+  `.eidmap` をコピーしていたため、 直近 consumer tick (≤100ms) 以降に翻訳された entity が
+  snapshot の `.eidmap` に載らず、 restore 後の再 sync で重複 entity を払い出しえた。 copy
+  前に現 in-memory 状態を再 persist して body と sidecar を整合させる。
+- **`peer_id == 0` で sync する foot-gun を検知**: 未設定 (= 0) の node 同士が sync すると
+  author 0 == self 0 が identity 翻訳に落ち #9 の衝突が再発する。 `apply_records` が
+  self_peer == 0 で foreign record を apply する時に一度だけ警告する。 own-op replay は
+  author == self が正しく identity なので翻訳 semantics は変えず、 設定漏れだけ surface する。
+- **Content-before-Tie の配送順序ロスを解消**: entity の Tie より先に Content が別 pull で
+  届くと、 確保先写像が無く skip → cursor 前進で永久ロストしていた。 未着 entity 宛の
+  Content を `(author_peer, foreign_local)` 別の pending buffer へ退避し、 対応する Tie /
+  Untie が写像を作った直後に drain して apply する。 Content は key 単位 LWW で他 op と
+  独立なので遅延適用しても可換。 buffer は `MAX_PENDING_OPS` で bound。 回帰テスト:
+  `content_before_tie_is_buffered_then_applied`。
+- **foreign Delete tombstone を `.eidmap` v2 で永続化 (削除済み entity の復活を防止)**:
+  `HlcStore` は永続化されず gossip-off では foreign op が local oplog に載らないので、
+  reopen 後に foreign tombstone が消え、 削除済み entity が stale Tie で復活しえた。 `.eidmap`
+  を v2 に拡張し各写像 entry に foreign Delete の HLC を載せて persist、 reopen 時 (peer_id は
+  header から復元済み) に HlcStore tombstone を seed する。 v1 ファイルは tombstone 無しとして
+  読める (後方互換)。 回帰テスト: `foreign_delete_tombstone_survives_reopen`。
+
+### Notes / 残る制約
+
+- 翻訳写像は **peer-local**。 oplog / sync wire には載らない (各 peer が独立に翻訳)。
+- **`set_peer_id` を sync 前に必ず呼ぶこと**: multi-peer では各 node に非 0 の peer_id を
+  設定する (未設定だと上記 foot-gun ガードが warn する)。
+- **foreign LWW watermark の永続化は tombstone のみ**: 削除の復活 (resurrection) は v2 で
+  塞いだが、 非 tombstone の per-himo watermark は依然 reopen 時に local oplog からのみ
+  再構築する。 full re-pull は HLC 順序非依存で収束するので通常は問題ないが、 stale な
+  非削除 Tie が partial に再配送されると一時的に古い値が載りうる (= 次の新しい op で
+  上書きされる、 削除復活より軽微)。 完全な watermark 永続化は follow-up。
+- **配送順序の残り**: Content は buffer したが、 **Tie より先に届いた Delete** (新しい
+  Delete が entity の Tie より先に来るケース) は依然 skip する (Delete を buffer すると
+  tombstone-slot LWW と順序干渉するため意図的に保留)。 一度も Tie されない content-only
+  entity 宛の Content は cap まで buffer に残る。 汎用的な retry は follow-up。 なお Untie は
+  確保 (`resolve_remote_eid`) 経由で slot を anchor し untie HLC を記録するので、 out-of-order
+  な古い Tie は LWW で正しく弾かれる (skip ではない)。
+- **cross-peer ref は phantom target を作る**: ref value は wire に target の local 部しか
+  載らない (peer bits drop)。 ref が **author 以外の peer** の entity を指す場合、 翻訳は
+  `(author_peer, local)` で誤った peer に解決し target table に phantom entity を払い出す。
+  本物の target が後で sync されても別 slot に落ちて収束しない。 現状 **同一 peer 内 ref のみ**
+  正しく sync される。 wire に ref target peer を載せる format 拡張は follow-up。
+- `.eidmap` / `.tables` に per-file CRC は無い。 破損 / torn (bogus huge count 含む) は parse
+  失敗 → 空 fallback + 再 sync で復旧 (open は abort しない)。 CRC 付与は将来候補。
+- `gossip_remote_apply` が ON の場合の relayed append は現状 local_eid で append する。
+  gossip 転送の厳密な正しさには元の foreign eid で append すべきで、 別 commit で body-eid /
+  relay-eid を分離予定。 default は off。
+
 ## 0.8.18 — 2026-06-22
 
 robustness fix 4 件。 **file format / wire format / public API いずれも不変**、

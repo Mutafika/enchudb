@@ -33,6 +33,7 @@ pub mod write_queue;
 // `enchudb-wal` crate に分離済。 後方互換 re-export は提供しない。
 // 移行ガイド: docs/migration-wal-crate.md
 pub mod hlc_store;
+pub mod eid_translator;
 pub mod transport;
 // `sync::Syncer` は `enchudb-sync` crate に分離済。
 // engine は single-peer でも動くので sync を直接持たない。

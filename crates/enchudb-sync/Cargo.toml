@@ -1,6 +1,6 @@
 [package]
 name = "enchudb-sync"
-version = "0.8.18"
+version = "0.8.19"
 edition = "2024"
 description = "EnchuDB p2p sync — HLC-LWW Syncer。`enchudb-engine` に積む層。"
 license-file = "LICENSE.md"

@@ -160,7 +160,10 @@ fn deserialize_tables(buf: &[u8]) -> Result<Vec<TableDef>, String> {
         return Err(format!("tables sidecar: unsupported version {}", version));
     }
     let table_count = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
-    let mut tables = Vec::with_capacity(table_count);
+    // 破損ガード: 巨大 count をそのまま with_capacity に渡すと OOM abort。 各 table は
+    // 最低 24 byte (name_len + lo/hi/next/himo_count/fk_count = 6×u32、 name 空) なので
+    // 残りバッファで prealloc を cap する (truncation 自体は下の read_u32! が検出する)。
+    let mut tables = Vec::with_capacity(table_count.min((buf.len() - 12) / 24));
     let mut off = 12usize;
 
     macro_rules! read_u32 {
@@ -186,12 +189,12 @@ fn deserialize_tables(buf: &[u8]) -> Result<Vec<TableDef>, String> {
         let next_local_u32 = read_u32!(buf, off);
         let next_local = std::sync::atomic::AtomicU32::new(next_local_u32);
         let himo_count = read_u32!(buf, off) as usize;
-        let mut himo_ids = Vec::with_capacity(himo_count);
+        let mut himo_ids = Vec::with_capacity(himo_count.min((buf.len() - off) / 4));
         for _ in 0..himo_count {
             himo_ids.push(read_u32!(buf, off));
         }
         let fk_count = read_u32!(buf, off) as usize;
-        let mut fk_refs = Vec::with_capacity(fk_count);
+        let mut fk_refs = Vec::with_capacity(fk_count.min((buf.len() - off) / 8));
         for _ in 0..fk_count {
             let hid = read_u32!(buf, off);
             let tid = read_u32!(buf, off);
@@ -288,6 +291,123 @@ fn load_tables_from_sidecar(db_path: &str) -> io::Result<Option<Vec<TableDef>>> 
     match std::fs::read(&sidecar) {
         Ok(buf) => match deserialize_tables(&buf) {
             Ok(tables) => Ok(Some(tables)),
+            Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// #9: eid 翻訳テーブルの sidecar path。 `.eidmap`。 中身は
+/// `(author_peer, foreign_local, local)` の binary 配列。 不在 (= sync してない DB
+/// や旧 DB) なら open 時に空の translator で続行 (additive、 後方互換)。
+#[cfg(not(target_arch = "wasm32"))]
+fn eidmap_path_for(path: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}.eidmap", path))
+}
+
+/// #9: eidmap sidecar の 1 entry。 `(author_peer, foreign_local, local, tombstone_hlc)`。
+/// `tombstone_hlc == Hlc::ZERO` は「削除されていない」。 v2 (0.8.19) で tombstone を追加し、
+/// reopen 後の削除済み entity 復活 (resurrection) を防ぐ。
+type EidmapEntry = (enchudb_oplog::PeerId, u32, u32, enchudb_oplog::Hlc);
+
+/// #9: 翻訳 entry を binary encode (v2)。
+/// layout: magic "EIDM"(4) + version u32=2 + count u32
+///         + (peer u32, foreign u32, local u32, tomb_wall u64, tomb_logical u32, tomb_peer u32) × count
+fn serialize_eidmap(entries: &[EidmapEntry]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + entries.len() * 28);
+    out.extend_from_slice(b"EIDM");
+    out.extend_from_slice(&2u32.to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for &(peer, foreign_local, local, tomb) in entries {
+        out.extend_from_slice(&peer.to_le_bytes());
+        out.extend_from_slice(&foreign_local.to_le_bytes());
+        out.extend_from_slice(&local.to_le_bytes());
+        out.extend_from_slice(&tomb.wall.to_le_bytes());
+        out.extend_from_slice(&tomb.logical.to_le_bytes());
+        out.extend_from_slice(&tomb.peer.to_le_bytes());
+    }
+    out
+}
+
+/// #9: eidmap sidecar を decode。 magic 不一致 / truncated は Err。 v1 (tombstone 無し、
+/// 12 byte/entry) と v2 (tombstone 込み、 28 byte/entry) の両方を読める。
+fn deserialize_eidmap(buf: &[u8]) -> Result<Vec<EidmapEntry>, String> {
+    if buf.len() < 12 || &buf[0..4] != b"EIDM" {
+        return Err("eidmap sidecar: bad magic".into());
+    }
+    let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+    let entry_size = match version {
+        1 => 12usize,
+        2 => 28usize,
+        v => return Err(format!("eidmap sidecar: unsupported version {}", v)),
+    };
+    let count = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
+    // 破損 / torn header ガード: `count` は信用しない。 各 entry は固定長なので上限は
+    // 残りバッファで決まる。 bogus な巨大 count をそのまま with_capacity に渡すと数 GB の
+    // 確保要求で open 時に abort する (.eidmap は CRC 無し)。 上限超過は破損とみなし Err
+    // → load_eidmap_from_sidecar 側で空 translator に graceful fallback。
+    let max_entries = (buf.len() - 12) / entry_size;
+    if count > max_entries {
+        return Err(format!(
+            "eidmap sidecar: count {} exceeds buffer capacity {} (corrupt/torn)",
+            count, max_entries
+        ));
+    }
+    let mut entries = Vec::with_capacity(count);
+    let mut off = 12usize;
+    for _ in 0..count {
+        if off + entry_size > buf.len() {
+            return Err("eidmap sidecar: truncated".into());
+        }
+        let peer = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        let foreign_local = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap());
+        let local = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap());
+        let tomb = if entry_size == 28 {
+            let wall = u64::from_le_bytes(buf[off + 12..off + 20].try_into().unwrap());
+            let logical = u32::from_le_bytes(buf[off + 20..off + 24].try_into().unwrap());
+            let tpeer = u32::from_le_bytes(buf[off + 24..off + 28].try_into().unwrap());
+            enchudb_oplog::Hlc { wall, logical, peer: tpeer }
+        } else {
+            enchudb_oplog::Hlc::ZERO
+        };
+        off += entry_size;
+        entries.push((peer, foreign_local, local, tomb));
+    }
+    Ok(entries)
+}
+
+/// #9: eidmap を sidecar に atomic 書き換え (fsync 込み)。 entries 空なら何もしない
+/// (= sync してない DB に空ファイルを作らない)。
+#[cfg(not(target_arch = "wasm32"))]
+fn persist_eidmap_to_sidecar(db_path: &str, entries: &[EidmapEntry]) -> io::Result<()> {
+    use std::io::Write;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let sidecar = eidmap_path_for(db_path);
+    let tmp_path = sidecar.with_extension("eidmap.tmp");
+    let bytes = serialize_eidmap(entries);
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, &sidecar)?;
+    Ok(())
+}
+
+/// #9: eidmap sidecar を読む。 不在なら Ok(None)。
+#[cfg(not(target_arch = "wasm32"))]
+fn load_eidmap_from_sidecar(db_path: &str) -> io::Result<Option<Vec<EidmapEntry>>> {
+    let sidecar = eidmap_path_for(db_path);
+    match std::fs::read(&sidecar) {
+        Ok(buf) => match deserialize_eidmap(&buf) {
+            Ok(entries) => Ok(Some(entries)),
             Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
         },
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -432,16 +552,6 @@ impl Backing {
         }
     }
 
-    /// growable backing のときに commit を要求サイズまで伸ばす。
-    /// 他の variant では no-op (ヘッダ上限で既に確保済み)。
-    #[cfg(not(target_arch = "wasm32"))]
-    fn ensure_committed(&self, end: usize) -> io::Result<()> {
-        match self {
-            Backing::Growable(g) => g.grow_amortized(end),
-            _ => Ok(()),
-        }
-    }
-
     /// Growable backing なら GrowableMap への Arc を返す。 `Region::with_grower`
     /// で region を作り直したい後付けの init path 用 (例: `ensure_himo` で
     /// himo_slots 領域を lazy commit する)。
@@ -579,7 +689,6 @@ const H_PEER_ID: usize = 68; // u32
 /// CRC 保護外。 accidental truncation 検出が目的、 adversarial tampering は対象外。
 const H_BACKING_KIND: usize = 76; // u32
 
-const BACKING_KIND_EAGER: u32 = 0;
 const BACKING_KIND_GROWABLE: u32 = 1;
 const H_HIMO_TYPES: usize = 256;
 
@@ -964,6 +1073,8 @@ pub struct Engine {
     peer_id: std::sync::atomic::AtomicU32,
     /// v32: LWW 用に (eid, himo) → 最後の HLC を記録。
     hlc_store: std::sync::Arc<crate::hlc_store::HlcStore>,
+    /// #9: 受信した foreign eid を自分の eid 空間の local eid に翻訳する写像。
+    eid_translator: std::sync::Arc<crate::eid_translator::EidTranslator>,
     /// v32 Phase C: 自 peer の ed25519 鍵ペア。None なら署名しない/検証もしない。
     keypair: std::sync::RwLock<Option<std::sync::Arc<enchudb_oplog::keys::Keypair>>>,
     /// v32 Phase C: 他 peer の pubkey TOFU ストア。Syncer が verify に使う。
@@ -1157,6 +1268,7 @@ impl Engine {
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
+            eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
             keypair: std::sync::RwLock::new(None),
             pubkeys: std::sync::Arc::new(enchudb_oplog::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
@@ -1404,6 +1516,7 @@ impl Engine {
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
+            eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
             keypair: std::sync::RwLock::new(None),
             pubkeys: std::sync::Arc::new(enchudb_oplog::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
@@ -1495,6 +1608,38 @@ impl Engine {
             Err(e) => {
                 eprintln!(
                     "warning: failed to read tables sidecar (anonymous fallback): {}",
+                    e
+                );
+            }
+        }
+
+        // #9: eid 翻訳テーブルの sidecar 読み込み。 不在 (= sync してない / 旧 DB) なら
+        // 空の translator で続行 (additive、 後方互換)。 破損は警告のみで空続行 (= 再
+        // sync で mapping は張り直せる)。
+        match load_eidmap_from_sidecar(path) {
+            Ok(Some(entries)) => {
+                // peer_id は上で header から復元済み → translated eid の key が正しく作れる。
+                let self_peer = eng.peer_id();
+                for (peer, foreign_local, local, tomb) in entries {
+                    eng.eid_translator.insert(peer, foreign_local, local);
+                    // #9 (H4): `.eidmap` と `.tables` は別々の rename なので crash で
+                    // 不整合になりうる。 mapped local を table の next_local が必ず追い
+                    // 越すよう前進させ、 stale `.tables` でも mapped slot を再 alloc して
+                    // 衝突する事態を防ぐ (= 最悪でも「重複」に留め「衝突」を起こさない)。
+                    Self::advance_table_next_local_for(&eng.tables, local);
+                    // #9 (C): foreign Delete tombstone を HlcStore に復元する。 これが無いと
+                    // reopen で tombstone が消え、 Delete より古い Tie が (Delete 抜きで) 再配送
+                    // された時に削除済み entity が復活する。 ZERO は未削除なので skip。
+                    if tomb != enchudb_oplog::Hlc::ZERO {
+                        eng.hlc_store
+                            .force_set(enchudb_oplog::make_eid(self_peer, local), u16::MAX, tomb);
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to read eidmap sidecar (empty translator): {}",
                     e
                 );
             }
@@ -1822,6 +1967,7 @@ impl Engine {
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
+            eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
             keypair: std::sync::RwLock::new(None),
             pubkeys: std::sync::Arc::new(enchudb_oplog::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
@@ -2410,6 +2556,25 @@ impl Engine {
         Ok(enchudb_oplog::make_eid(peer, global))
     }
 
+    /// #9: persist 用に翻訳写像 + 各 entity の foreign tombstone HLC を集める。 tombstone は
+    /// HlcStore の `(translated_eid, u16::MAX)` から引く (未削除なら `Hlc::ZERO`)。 reopen 時に
+    /// `.eidmap` v2 から復元され、 削除済み foreign entity の resurrection を防ぐ。
+    /// 呼ばれるのは persist trigger (consumer tick / 明示 persist) のみで read hot path 外。
+    fn eidmap_entries_with_tombstones(&self) -> Vec<EidmapEntry> {
+        let self_peer = self.peer_id();
+        self.eid_translator
+            .snapshot()
+            .into_iter()
+            .map(|(peer, foreign_local, local)| {
+                let tomb = self
+                    .hlc_store
+                    .get(enchudb_oplog::make_eid(self_peer, local), u16::MAX)
+                    .unwrap_or(enchudb_oplog::Hlc::ZERO);
+                (peer, foreign_local, local, tomb)
+            })
+            .collect()
+    }
+
     /// 0.8.1: `&self` で tables sidecar を強制 persist する public API。
     /// `Arc<Engine>` (= concurrent mode) でも `flush(&mut)` を取れない状況で
     /// `next_local` を含む tables 状態を disk に固める用途。
@@ -2423,7 +2588,9 @@ impl Engine {
         if self.path.is_empty() {
             return Ok(());
         }
-        persist_tables_to_sidecar(&self.path, &self.tables)
+        persist_tables_to_sidecar(&self.path, &self.tables)?;
+        // #9: 翻訳テーブルも同じ trigger で persist (next_local と整合させる)。
+        persist_eidmap_to_sidecar(&self.path, &self.eidmap_entries_with_tombstones())
     }
 
     /// 0.8.7: DB ファイルパスを返す。 schema crate が schema sidecar
@@ -2450,6 +2617,13 @@ impl Engine {
                     // 0.8.15 (issue #52): ENOSPC 等で consumer thread が毎 batch
                     // 失敗 → 同 warning がターミナル不能になる現象を回避するため、
                     // 1 秒 1 行の rate-limit を入れる。
+                    self.warn_persist_failure_rate_limited(&e);
+                }
+                // #9: 翻訳テーブルも tables と同じ trigger で persist (next_local と
+                // 整合させる)。 entries 空なら no-op (sync してない DB に file を作らない)。
+                if let Err(e) =
+                    persist_eidmap_to_sidecar(&self.path, &self.eidmap_entries_with_tombstones())
+                {
                     self.warn_persist_failure_rate_limited(&e);
                 }
             }
@@ -2672,6 +2846,137 @@ impl Engine {
     /// LWW 用 HlcStore への参照(sync モジュールが使う)。
     pub fn hlc_store(&self) -> &std::sync::Arc<crate::hlc_store::HlcStore> {
         &self.hlc_store
+    }
+
+    /// #9: foreign eid 翻訳テーブルへの参照。
+    pub fn eid_translator(&self) -> &std::sync::Arc<crate::eid_translator::EidTranslator> {
+        &self.eid_translator
+    }
+
+    /// #9: 受信 op の foreign eid を「自分の eid 空間の local eid」に翻訳する。
+    /// 初見の `(author_peer, foreign_local)` には `himo_id` が属する closed table 内に
+    /// fresh な local entity を払い出す (= local entity と同じ allocator なので衝突しない)。
+    /// himo を closed table に解決できない table-less op (anonymous himo / sentinel) は
+    /// 安全に確保できる slot が無いので `None` を返す → caller は skip する。
+    /// `author_peer == self.peer_id` なら identity (自分が author の op は翻訳しない)。
+    pub fn resolve_remote_eid(
+        &self,
+        author_peer: enchudb_oplog::PeerId,
+        foreign_eid: enchudb_oplog::EntityId,
+        himo_id: u16,
+    ) -> Option<enchudb_oplog::EntityId> {
+        use std::sync::atomic::Ordering;
+        let self_peer = self.peer_id.load(Ordering::Acquire);
+        if author_peer == self_peer {
+            return Some(foreign_eid); // identity: 自分が author の op
+        }
+        let foreign_local = enchudb_oplog::eid_local(foreign_eid);
+        // get-or-allocate を atomic に行う (= 並行 apply で同じ foreign entity を
+        // double-alloc しない)。 alloc が None (= table-less) なら写像を作らず None。
+        let local = self
+            .eid_translator
+            .get_or_insert_with(author_peer, foreign_local, || {
+                self.alloc_translated_local(himo_id)
+            })?;
+        Some(enchudb_oplog::make_eid(self_peer, local))
+    }
+
+    /// #9: 既存の翻訳のみ引く (払い出しはしない)。 Delete のように himo を持たず
+    /// table を導けない op 用。 未登録 (= 一度も Tie されてない foreign entity) なら
+    /// None → 呼び出し側で skip。 `author_peer == self` なら identity。
+    pub fn resolve_remote_eid_existing(
+        &self,
+        author_peer: enchudb_oplog::PeerId,
+        foreign_eid: enchudb_oplog::EntityId,
+    ) -> Option<enchudb_oplog::EntityId> {
+        use std::sync::atomic::Ordering;
+        let self_peer = self.peer_id.load(Ordering::Acquire);
+        if author_peer == self_peer {
+            return Some(foreign_eid);
+        }
+        let foreign_local = enchudb_oplog::eid_local(foreign_eid);
+        self.eid_translator
+            .get(author_peer, foreign_local)
+            .map(|local| enchudb_oplog::make_eid(self_peer, local))
+    }
+
+    /// #9: foreign entity 用に fresh な local eid を払い出す。 `himo_id` が closed table
+    /// 所属なら その table の `entity_in` 経路で確保 (= local entity と同じ allocator を
+    /// 使うので衝突しない + `validate_eid_for_himo` の range 内に入る)、 local 部を `Some`
+    /// で返す。 table を導けない (anonymous himo / sentinel) / entity_in 失敗 (table 枯渇)
+    /// なら **安全に確保できる slot が無い** ので `None` (caller が op を skip)。
+    /// `entity()` での anonymous fallback は使わない: sync engine では anonymous table が
+    /// 閉じていて panic するし、 `entities.allocate()` は table range と衝突しうる。
+    fn alloc_translated_local(&self, himo_id: u16) -> Option<u32> {
+        let hid = himo_id as usize;
+        if hid < self.himo_to_table.len() {
+            let tid = self.himo_to_table[hid] as usize;
+            if tid < self.tables.len() && self.tables[tid].eid_range_hi != u32::MAX {
+                let name = self.tables[tid].name.clone();
+                if let Ok(e) = self.entity_in(&name) {
+                    return Some(enchudb_oplog::eid_local(e));
+                }
+            }
+        }
+        None
+    }
+
+    /// #9: himo が Ref 型か。 Ref の value は foreign target eid なので apply 時に
+    /// entity eid とは別に value も translate する必要がある。
+    pub fn himo_is_ref(&self, himo_id: u16) -> bool {
+        let hid = himo_id as usize;
+        hid < self.himo_types.len() && self.himo_types[hid] == HimoType::Ref
+    }
+
+    /// #9: Ref himo の value (= foreign target eid の local 部) を自分の eid 空間の
+    /// local eid に翻訳する。 target entity が初見なら ref の **target table** に fresh
+    /// な local を払い出す。 後で target entity 自身の Tie が来ても同じ key
+    /// `(author_peer, foreign_value)` で同じ local に解決されるため整合する (= forward
+    /// ref も OK)。 `author_peer == self` なら identity。
+    pub fn resolve_remote_ref_value(
+        &self,
+        author_peer: enchudb_oplog::PeerId,
+        foreign_value: u32,
+        ref_himo_id: u16,
+    ) -> Option<u32> {
+        use std::sync::atomic::Ordering;
+        let self_peer = self.peer_id.load(Ordering::Acquire);
+        if author_peer == self_peer {
+            return Some(foreign_value); // identity: 自分が author
+        }
+        // entity eid 翻訳と同じ key 空間・同じ atomic path。 ref-value 経由と target
+        // entity 自身の Tie 経由が同じ foreign を解決しても 1 つの local に収束する。
+        // target table を導けなければ None (caller が op を skip)。
+        self.eid_translator
+            .get_or_insert_with(author_peer, foreign_value, || {
+                self.alloc_translated_local_in_target_table(ref_himo_id)
+            })
+    }
+
+    /// #9: Ref himo の target table (fk_refs で引く) に fresh な local eid を払い出す。
+    /// target table を導けない / entity_in 失敗なら `None` (caller が op を skip)。
+    fn alloc_translated_local_in_target_table(&self, ref_himo_id: u16) -> Option<u32> {
+        let hid = ref_himo_id as usize;
+        if hid < self.himo_to_table.len() {
+            let owner_tid = self.himo_to_table[hid] as usize;
+            if owner_tid < self.tables.len() {
+                let owner = &self.tables[owner_tid];
+                if let Some(&(_, target_tid)) =
+                    owner.fk_refs.iter().find(|(h, _)| *h == hid as u32)
+                {
+                    let target_tid = target_tid as usize;
+                    if target_tid < self.tables.len()
+                        && self.tables[target_tid].eid_range_hi != u32::MAX
+                    {
+                        let name = self.tables[target_tid].name.clone();
+                        if let Ok(e) = self.entity_in(&name) {
+                            return Some(enchudb_oplog::eid_local(e));
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Phase C: 自 peer の鍵ペアを設定。WAL にも反映される。None で署名 off。
@@ -5253,12 +5558,6 @@ impl Engine {
         Self::spawn_consumer_with_oplog(eng, None)
     }
 
-    /// `oplog_record_queue` capacity の default (= write_queue と同じ 1 M)。
-    /// issue4: 旧 unbounded SegQueue では sustained writer で RSS 線形成長 → OOM。
-    /// caller は `create_concurrent_with_oplog_queue_cap` で上書きできる。
-    pub(crate) const DEFAULT_OPLOG_QUEUE_CAP: usize =
-        crate::write_queue::DEFAULT_WRITE_QUEUE_CAP;
-
     /// changefeed 内部ヘルパ: WAL から emit_offset 以降の record を取り出して
     /// 全 listener に渡し、cursor を進める。
     fn fire_change_listeners(
@@ -5599,7 +5898,7 @@ impl Engine {
     /// 返り値: コピーしたパス一覧。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn snapshot_export(&self, target: &str) -> io::Result<SnapshotFiles> {
-        // mmap ページを物理ディスクに確実に書き出す(v27 のみ)
+        // mmap ページを物理ディスクに確実に書き出す
         self.body_msync()?;
 
         let mut files = SnapshotFiles {
@@ -5623,12 +5922,19 @@ impl Engine {
             files.crc = Some(crc_dst);
         }
 
-        // 0.7.0: .tables sidecar も snapshot に含める (= receiver が table 構造を
-        // 復元できる、 reserved table `_sync_ops` / `_sync_peers` も含む)。
-        let tables_src = format!("{}.tables", self.path);
-        if std::path::Path::new(&tables_src).exists() {
-            let tables_dst = format!("{}.tables", target);
-            std::fs::copy(&tables_src, &tables_dst)?;
+        // #9 (H2): sidecar (.tables/.eidmap) は source を copy せず、 現在の in-memory
+        // 状態を直接 target へ書き出す。 source copy だと consumer tick (≤100ms 周期)
+        // 時点の stale sidecar を新しい body に対してコピーしてしまい、 翻訳 entity が
+        // .eidmap に載らず restore 後の再 sync で重複する。 直接書き出しなら msync 済 body
+        // と必ず整合し、 かつ source を fsync 再 persist しないので snapshot が遅くならない
+        // (durability は copy と同じ page-cache level、 backup の fsync は呼び出し側責務)。
+        // 0.7.0: .tables には reserved table `_sync_ops` / `_sync_peers` も含む。
+        if !self.tables.is_empty() {
+            std::fs::write(format!("{}.tables", target), serialize_tables(&self.tables))?;
+        }
+        let eidmap_entries = self.eidmap_entries_with_tombstones();
+        if !eidmap_entries.is_empty() {
+            std::fs::write(format!("{}.eidmap", target), serialize_eidmap(&eidmap_entries))?;
         }
 
         Ok(files)
