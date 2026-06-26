@@ -1295,7 +1295,7 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "enchudb"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "criterion",
  "duckdb",
@@ -1317,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "enchudb-cli"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "enchudb-engine",
  "enchudb-oplog",
@@ -1325,7 +1325,7 @@ dependencies = [
 
 [[package]]
 name = "enchudb-engine"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "async-trait",
  "crossbeam-queue",
@@ -1342,21 +1342,21 @@ dependencies = [
 
 [[package]]
 name = "enchudb-ffi"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "enchudb-sql",
 ]
 
 [[package]]
 name = "enchudb-ngram"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "memmap2",
 ]
 
 [[package]]
 name = "enchudb-oplog"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "ed25519-dalek",
  "libc",
@@ -1367,7 +1367,7 @@ dependencies = [
 
 [[package]]
 name = "enchudb-rag"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "enchudb",
  "enchudb-oplog",
@@ -1378,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "enchudb-schema"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "enchudb-engine",
  "enchudb-oplog",
@@ -1386,7 +1386,7 @@ dependencies = [
 
 [[package]]
 name = "enchudb-sql"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "enchudb-engine",
  "enchudb-oplog",
@@ -1396,7 +1396,7 @@ dependencies = [
 
 [[package]]
 name = "enchudb-sync"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "enchudb-engine",
  "enchudb-oplog",
@@ -1404,14 +1404,14 @@ dependencies = [
 
 [[package]]
 name = "enchudb-textsearch"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "enchudb-ngram",
 ]
 
 [[package]]
 name = "enchudb-transport"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "enchudb",
  "enchudb-oplog",
