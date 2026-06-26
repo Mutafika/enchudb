@@ -3,6 +3,28 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## Unreleased
+
+### Changed
+
+- **`enchudb-text` を `enchudb-ngram`(primitive) に改名し、テキスト検索を
+  `enchudb-textsearch`(policy) に分離**
+  ([#69](https://github.com/Mutafika/enchudb/issues/69)): `enchudb-text` は実体が
+  bigram 部分一致エンジンだが名前が「検索」という正体を隠していた。lawgraph の機械検索で
+  断片 `出力` が `入出力` の部分文字列として無関係条文を引き込むノイズ調査から、用途が
+  逆である事が判明（**人間の対話検索 = 部分一致が正解** `接地`→`接地極` ／ **機械 =
+  フレーズ完全一致が欲しい**）。これは bug でなく substring の正しい挙動なので、関心を
+  分離した:
+  - `enchudb-ngram` = index プリミティブ。bigram 抽出 / posting / intersect →
+    **候補 doc id**（`NgramIndex::candidates` / `scan`）。検索意味論は持たない。
+  - `enchudb-textsearch` = ポリシー。候補 + `.contains()` 検証 → 正確な部分一致
+    （`TextSearch::search`）。クレート名は「`text` が検索を隠す」不満を直す意図で
+    `textsearch`（= search over text）。機械向けフレーズ完全一致は入力フレーズを 1 単位で
+    渡せば同じ path で扱える（issue option (a)、専用 `enchudb-phrase` は未実装）。
+  - file format / magic `ETXT` は不変。既存 `.etxt` はそのまま読める。
+  - 旧 `TextEngine` は `TextSearch` にほぼ同型で移行（dep 差し替え + 型名リネーム）。
+    downstream（`lawgraph-explorer` / `naruhodo` / `bisquit`）は別 repo で dep 差し替えが要る。
+
 ## 0.8.19 — 2026-06-23
 
 cross-peer eid 翻訳 (#9)。 foreign eid のサイレント上書きを直す bugfix。 public API +

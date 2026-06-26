@@ -1348,6 +1348,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "enchudb-ngram"
+version = "0.8.19"
+dependencies = [
+ "memmap2",
+]
+
+[[package]]
 name = "enchudb-oplog"
 version = "0.8.19"
 dependencies = [
@@ -1396,10 +1403,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "enchudb-text"
+name = "enchudb-textsearch"
 version = "0.8.19"
 dependencies = [
- "memmap2",
+ "enchudb-ngram",
 ]
 
 [[package]]
@@ -4228,7 +4235,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "sabitori"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "console_error_panic_hook",
  "console_log",
@@ -4260,14 +4267,14 @@ dependencies = [
 
 [[package]]
 name = "sabitori-anim"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "sabitori-core",
 ]
 
 [[package]]
 name = "sabitori-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bytemuck",
  "glam",
@@ -4277,7 +4284,7 @@ dependencies = [
 
 [[package]]
 name = "sabitori-gpu"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bytemuck",
  "glam",
@@ -4291,14 +4298,14 @@ dependencies = [
 
 [[package]]
 name = "sabitori-input"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "sabitori-core",
 ]
 
 [[package]]
 name = "sabitori-layout"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "sabitori-core",
  "sabitori-style",
@@ -4307,7 +4314,7 @@ dependencies = [
 
 [[package]]
 name = "sabitori-net"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "image",
  "js-sys",
@@ -4321,7 +4328,7 @@ dependencies = [
 
 [[package]]
 name = "sabitori-scene"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "sabitori-core",
  "slotmap",
@@ -4329,7 +4336,7 @@ dependencies = [
 
 [[package]]
 name = "sabitori-style"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "sabitori-core",
  "serde",
@@ -4338,7 +4345,7 @@ dependencies = [
 
 [[package]]
 name = "sabitori-text"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -4350,7 +4357,7 @@ dependencies = [
 
 [[package]]
 name = "sabitori-widgets"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "sabitori-anim",
  "sabitori-core",
@@ -4361,7 +4368,7 @@ dependencies = [
 
 [[package]]
 name = "sabitori-window"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "console_error_panic_hook",
  "console_log",

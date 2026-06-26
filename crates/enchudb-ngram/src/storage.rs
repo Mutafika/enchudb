@@ -1,32 +1,32 @@
-/// mmap ファイル形式 (version 2)
-///
-/// [Header 32 bytes]
-///   magic: "ETXT" (4)
-///   version: u32 (4)  — 2 (eid u64 化に伴う break。v1 は読まない)
-///   bigram_count: u32 (4)
-///   posting_total: u32 (4) — entity ID エントリ総数（バイト数ではない）
-///   doc_count: u32 (4)
-///   text_total: u32 (4) — テキストデータ総バイト数
-///   _reserved: [u8; 8]
-///
-/// [Bigram Index] — bigram_count × 12 bytes
-///   key: u32, offset: u32, len: u32
-///   key 昇順ソート（二分探索用）
-///   offset/len は Posting Data 内のエントリ単位（byte 単位ではない）
-///
-/// [Padding] — 0..=7 bytes
-///   Posting Data の先頭を 8-byte 境界に揃えるための詰め物。
-///   現状の reader は from_le_bytes でアライメント非依存に読むので必須ではないが、
-///   将来 mmap 上で u64 slice cast に戻す余地を残すため format として保持する。
-///
-/// [Posting Data] — posting_total × 8 bytes
-///   flat array of u64 entity IDs (little-endian)
-///
-/// [Doc Index] — doc_count × 16 bytes
-///   eid: u64, offset: u32, len: u32
-///   eid 昇順ソート
-///
-/// [Text Data] — text_total bytes
+//! mmap ファイル形式 (version 2)
+//!
+//! [Header 32 bytes]
+//!   magic: "ETXT" (4)
+//!   version: u32 (4)  — 2 (eid u64 化に伴う break。v1 は読まない)
+//!   bigram_count: u32 (4)
+//!   posting_total: u32 (4) — entity ID エントリ総数（バイト数ではない）
+//!   doc_count: u32 (4)
+//!   text_total: u32 (4) — テキストデータ総バイト数
+//!   _reserved: [u8; 8]
+//!
+//! [Bigram Index] — bigram_count × 12 bytes
+//!   key: u32, offset: u32, len: u32
+//!   key 昇順ソート（二分探索用）
+//!   offset/len は Posting Data 内のエントリ単位（byte 単位ではない）
+//!
+//! [Padding] — 0..=7 bytes
+//!   Posting Data の先頭を 8-byte 境界に揃えるための詰め物。
+//!   現状の reader は from_le_bytes でアライメント非依存に読むので必須ではないが、
+//!   将来 mmap 上で u64 slice cast に戻す余地を残すため format として保持する。
+//!
+//! [Posting Data] — posting_total × 8 bytes
+//!   flat array of u64 entity IDs (little-endian)
+//!
+//! [Doc Index] — doc_count × 16 bytes
+//!   eid: u64, offset: u32, len: u32
+//!   eid 昇順ソート
+//!
+//! [Text Data] — text_total bytes
 
 use std::io;
 use std::path::Path;
@@ -204,7 +204,7 @@ impl MappedIndex {
     }
 
     /// 全 doc を (eid, text) で順に callback に渡す。
-    /// `TextEngine::open_mut` / `TextEngine::from_bytes_mut` で in-memory 再構築するのに使う。
+    /// `NgramIndex::open_mut` / `NgramIndex::from_bytes_mut` で in-memory 再構築するのに使う。
     pub fn for_each_doc<F: FnMut(u64, &str)>(&self, mut f: F) {
         let idx = self.doc_index();
         let data = self.text_data();
@@ -262,7 +262,7 @@ impl MappedIndex {
     }
 }
 
-/// インメモリの TextEngine データをファイルに書き出す
+/// インメモリの NgramIndex データをファイルに書き出す
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save(
     path: &Path,
