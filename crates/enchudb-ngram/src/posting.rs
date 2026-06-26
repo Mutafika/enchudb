@@ -80,7 +80,6 @@ impl PostingList {
 
     /// 統計
     pub fn key_count(&self) -> usize { self.buckets.len() }
-    pub fn total_entries(&self) -> usize { self.buckets.values().map(|v| v.len()).sum() }
 }
 
 #[cfg(test)]
