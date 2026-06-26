@@ -3,7 +3,12 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
-## Unreleased
+## 0.8.20 — 2026-06-26
+
+`enchudb-text` を `enchudb-ngram`(primitive) + `enchudb-textsearch`(policy) に分離する
+refactor (#69/#70)。 crate 名は変わるが file format / magic `ETXT` は不変で既存 `.etxt` は
+そのまま読めるため、 データ互換は保たれる **patch** として release。 downstream は dep
+差し替え + 型名リネームのみ。
 
 ### Changed
 
