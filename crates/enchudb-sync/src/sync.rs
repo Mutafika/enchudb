@@ -211,6 +211,13 @@ impl Syncer {
                     let key_hash = enchudb_oplog::content_key_hash15(key);
                     store.force_set(*eid, key_hash | 0x8000, rec.hlc);
                 }
+                DecodedOp::TieNamed { eid, himo_name, .. } => {
+                    // 0.9.0: 名前を local hid に解決できる場合のみ LWW entry を張る
+                    // (未定義 = local に一度も届いていない himo は hydrate 不要)。
+                    if let Some(hid) = engine.himo_id(himo_name) {
+                        store.force_set(*eid, hid as u16, rec.hlc);
+                    }
+                }
                 DecodedOp::Commit | DecodedOp::Vocab { .. } => {}
             }
         }
@@ -517,6 +524,33 @@ impl Syncer {
                     return false;
                 }
                 self.engine.remote_delete_apply(local_eid, Some(relayed_header(rec)));
+                true
+            }
+            DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => {
+                // 0.9.0: 動的 himo (content 互換層の `_c_{key}`) は id が peer 間で
+                // 揃わないため名前で解決する。 受信側に未定義なら lazy 定義 —
+                // これで Content 専用の reorder buffer / key hash が不要になる
+                // (mapping は Tie と同じ resolve_remote_eid で作られる)。
+                let local_hid = match self.engine.ensure_himo_named(himo_name, *himo_kind) {
+                    Ok(h) => h,
+                    Err(_) => return false, // himo 予算枯渇等 — 適用不能
+                };
+                let local_eid = match self.engine.resolve_remote_eid(rec.author_peer, *eid, local_hid) {
+                    Some(e) => e,
+                    None => return false,
+                };
+                self.drain_pending(store, rec.author_peer, enchudb_oplog::eid_local(*eid));
+                // 値は author-local vid → local vid に変換 (Leaf/Tag のみ、 Number は identity)
+                let value = self.engine.translate_remote_vid(rec.author_peer, local_hid, *value);
+                if let Some(tomb) = store.get(local_eid, u16::MAX) {
+                    if rec.hlc < tomb {
+                        return false;
+                    }
+                }
+                if !store.try_set(local_eid, local_hid, rec.hlc) {
+                    return false;
+                }
+                self.engine.remote_tie_apply(local_eid, local_hid, value, Some(relayed_header(rec)));
                 true
             }
             DecodedOp::Content { eid, key, data } => {

@@ -184,6 +184,11 @@ pub mod op_type {
     pub const COMMIT: u8 = 4;
     pub const SCHEMA: u8 = 5; // v32 予約(Phase D 以降で使う)
     pub const VOCAB: u8 = 6;  // v33: text vid → bytes 対応を peer 間で運ぶ
+    /// 0.9.0: himo を **名前で** 運ぶ Tie。 動的定義される content himo
+    /// (`_c_{key}`) は peer 間で himo_id が揃わないため、 id ではなく
+    /// full name を self-describing に運び、 受信側が ensure_himo_dynamic
+    /// で解決する。 id 変換表が不要 = 再起動でも壊れない。
+    pub const TIE_NAMED: u8 = 7;
 }
 
 /// WAL に書く所有型 op。 `Op` の owned 版で、 queue 渡し用 (consumer 側で
@@ -196,6 +201,9 @@ pub enum OwnedOp {
     Content { eid: u64, key: String, data: Vec<u8> },
     Commit,
     Vocab { vid: u32, bytes: Vec<u8> },
+    /// 0.9.0: himo を full name で運ぶ Tie (content 互換層用)。
+    /// `himo_kind` は HimoType の生 u8 (受信側の ensure 用)。
+    TieNamed { eid: u64, himo_name: String, himo_kind: u8, value: u32 },
 }
 
 impl OwnedOp {
@@ -212,6 +220,8 @@ impl OwnedOp {
             OwnedOp::Commit => Op::Commit,
             OwnedOp::Vocab { vid, bytes } =>
                 Op::Vocab { vid: *vid, bytes },
+            OwnedOp::TieNamed { eid, himo_name, himo_kind, value } =>
+                Op::TieNamed { eid: *eid, himo_name, himo_kind: *himo_kind, value: *value },
         }
     }
 }
@@ -228,6 +238,8 @@ pub enum Op<'a> {
     /// receiver 側は `(author_peer, vid) → local_vid` の mapping を持ち、
     /// 後続の Tie { value: vid } を受けたら local_vid に変換して適用する。
     Vocab { vid: u32, bytes: &'a [u8] },
+    /// 0.9.0: himo を full name で運ぶ Tie。 動的 himo (content `_c_{key}`) 用。
+    TieNamed { eid: u64, himo_name: &'a str, himo_kind: u8, value: u32 },
 }
 
 impl<'a> Op<'a> {
@@ -241,6 +253,8 @@ impl<'a> Op<'a> {
             Op::Content { key, data, .. } => 8 + 2 + 2 + 4 + key.len() + data.len(),
             Op::Commit => 0,
             Op::Vocab { bytes, .. } => 4 + 4 + bytes.len(), // vid(4) + len(4) + bytes
+            // eid(8) + value(4) + kind(1) + pad(1) + name_len(2) + name
+            Op::TieNamed { himo_name, .. } => 16 + himo_name.len(),
         }
     }
 
@@ -252,6 +266,7 @@ impl<'a> Op<'a> {
             Op::Content { .. } => op_type::CONTENT,
             Op::Commit => op_type::COMMIT,
             Op::Vocab { .. } => op_type::VOCAB,
+            Op::TieNamed { .. } => op_type::TIE_NAMED,
         }
     }
 
@@ -290,6 +305,16 @@ impl<'a> Op<'a> {
                 buf[4..8].copy_from_slice(&blen.to_le_bytes());
                 buf[8..8 + bytes.len()].copy_from_slice(bytes);
             }
+            Op::TieNamed { eid, himo_name, himo_kind, value } => {
+                assert!(himo_name.len() <= u16::MAX as usize, "himo name too long");
+                buf[0..8].copy_from_slice(&eid.to_le_bytes());
+                buf[8..12].copy_from_slice(&value.to_le_bytes());
+                buf[12] = *himo_kind;
+                buf[13] = 0;
+                let nlen = himo_name.len() as u16;
+                buf[14..16].copy_from_slice(&nlen.to_le_bytes());
+                buf[16..16 + himo_name.len()].copy_from_slice(himo_name.as_bytes());
+            }
         }
     }
 }
@@ -304,6 +329,8 @@ pub enum DecodedOp {
     Commit,
     /// v33: peer 間で vocab の (vid, bytes) を運ぶ。`vid` は record の author_peer ローカル。
     Vocab { vid: u32, bytes: Vec<u8> },
+    /// 0.9.0: himo full name 付き Tie (動的 content himo 用)。
+    TieNamed { eid: u64, himo_name: String, himo_kind: u8, value: u32 },
 }
 
 /// リカバリ結果の 1 レコード(HLC + 署名込み)。
@@ -1157,6 +1184,15 @@ fn decode_op(op_byte: u8, payload: &[u8]) -> Option<DecodedOp> {
             Some(DecodedOp::Content { eid, key, data })
         }
         op_type::COMMIT => Some(DecodedOp::Commit),
+        op_type::TIE_NAMED if payload.len() >= 16 => {
+            let eid = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+            let value = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+            let himo_kind = payload[12];
+            let nlen = u16::from_le_bytes(payload[14..16].try_into().unwrap()) as usize;
+            if payload.len() < 16 + nlen { return None; }
+            let himo_name = String::from_utf8(payload[16..16 + nlen].to_vec()).ok()?;
+            Some(DecodedOp::TieNamed { eid, himo_name, himo_kind, value })
+        }
         op_type::VOCAB if payload.len() >= 8 => {
             let vid = u32::from_le_bytes(payload[0..4].try_into().unwrap());
             let blen = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;

@@ -299,10 +299,11 @@ fn huge_count_eidmap_sidecar_does_not_oom() {
     cleanup(&path);
 }
 
-/// REORDER (B regression): a `Content` op delivered BEFORE its entity's `Tie`
-/// (separate pulls) must be buffered and applied once the Tie creates the
-/// mapping — not silently dropped. Pre-fix the Content skipped on an unmapped
-/// foreign and the blob was lost forever.
+/// REORDER (0.9.0 で書き換え): content は `TieNamed` (himo を名前で運ぶ Tie) と
+/// して同期されるようになり、 **自力で entity 写像を作れる** — 旧 `Content` op の
+/// 「Tie より先に届くと reorder buffer 退避」という構造問題そのものが消えた。
+/// このテストは content record を entity の他の Tie より **先** に配送しても
+/// 即 apply される (buffering 不要・ロスなし) ことを固定する。
 #[test]
 fn content_before_tie_is_buffered_then_applied() {
     let path_a = tmp_path("reorder_a");
@@ -320,42 +321,52 @@ fn content_before_tie_is_buffered_then_applied() {
     syncer_a.publish_since(Hlc::ZERO);
     let records = transport.pull(1, Hlc::ZERO);
 
-    // Split the stream: deliver the Content record BEFORE the Tie.
-    let content_recs: Vec<_> = records
+    // 0.9.0 regression: 旧 Content op は wire に居ないこと (TieNamed に置換済み)
+    assert!(
+        !records.iter().any(|r| matches!(r.op, DecodedOp::Content { .. })),
+        "0.9.0: content は Op::Content ではなく TieNamed で運ばれるはず"
+    );
+    // content の TieNamed (+ その直前の Vocab) を先に、 note の Tie を後に配送する。
+    // Vocab は vid mapping のため対応する TieNamed より先に必要 (append 順で保証
+    // されている連番をそのまま保つ)。
+    let content_first: Vec<_> = records
         .iter()
-        .filter(|r| matches!(r.op, DecodedOp::Content { .. }))
+        .filter(|r| matches!(r.op, DecodedOp::TieNamed { .. } | DecodedOp::Vocab { .. }))
         .cloned()
         .collect();
-    let non_content: Vec<_> = records
+    let rest: Vec<_> = records
         .iter()
-        .filter(|r| !matches!(r.op, DecodedOp::Content { .. }))
+        .filter(|r| !matches!(r.op, DecodedOp::TieNamed { .. } | DecodedOp::Vocab { .. }))
         .cloned()
         .collect();
-    assert!(!content_recs.is_empty(), "A should have a Content record");
+    assert!(
+        content_first.iter().any(|r| matches!(r.op, DecodedOp::TieNamed { .. })),
+        "A should have a TieNamed record for the content write"
+    );
 
     let eng_b = make_engine(&path_b, 2);
     let syncer_b = Syncer::new(eng_b.clone(), transport.clone());
 
-    // 1. Content arrives first — entity not yet mapped → buffered (not applied, not lost).
-    let out1 = syncer_b.apply_records(&content_recs);
-    assert_eq!(out1.applied, 0, "Content for an unmapped foreign entity is buffered");
-    assert!(
-        eng_b.resolve_remote_eid_existing(1, e_a).is_none(),
-        "no mapping should exist before the Tie"
-    );
-
-    // 2. The Tie arrives → mapping created → buffered Content drained + applied.
-    let out2 = syncer_b.apply_records(&non_content);
-    assert!(out2.applied > 0, "the Tie should apply");
-
+    // 1. content (TieNamed) が先に届く → TieNamed 自身が写像を作って即 apply。
+    let out1 = syncer_b.apply_records(&content_first);
+    assert!(out1.applied > 0, "TieNamed は写像を自力で作って即 apply されるはず");
     let local = eng_b
         .resolve_remote_eid_existing(1, e_a)
-        .expect("entity mapped after Tie");
+        .expect("TieNamed だけで entity が写像されるはず");
     assert_eq!(
         eng_b.get_content(local, "memo"),
         Some(b"hello".as_ref()),
-        "buffered Content must apply once the Tie creates the mapping (not lost)"
+        "content は Tie を待たずに読めるはず (reorder buffer 不要)"
     );
+
+    // 2. 残りの Tie が届く → 同じ entity に合流する (別 entity を作らない)。
+    let out2 = syncer_b.apply_records(&rest);
+    assert!(out2.applied > 0, "the Tie should apply");
+    let local2 = eng_b
+        .resolve_remote_eid_existing(1, e_a)
+        .expect("entity mapped");
+    assert_eq!(local, local2, "後続の Tie は既存写像に合流するはず");
+    assert_eq!(eng_b.get(local2, "notes.note"), Some(7));
 
     drop(syncer_a);
     drop(eng_a);

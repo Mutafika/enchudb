@@ -30,8 +30,6 @@ pub enum Op {
     Untie { eid: u32, himo_id: u16 },
     /// entity ごと削除。
     Delete { eid: u32 },
-    /// 非索引コンテンツ。WAL に載せるため owned 型で保持。
-    Content { eid: u32, key: Box<str>, data: Box<[u8]> },
     /// entity 作成 marker。 writer thread の `entity()` は slot allocation のみで戻り、
     /// この op を consumer 経由で空回しさせて `flush_writes` の barrier counter
     /// (`push_count` / `apply_count`) と整合を取る (issue5)。 payload は無し、

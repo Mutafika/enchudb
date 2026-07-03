@@ -2390,7 +2390,8 @@ impl Engine {
                 enchudb_oplog::oplog::DecodedOp::Tie { eid, .. }
                 | enchudb_oplog::oplog::DecodedOp::Untie { eid, .. }
                 | enchudb_oplog::oplog::DecodedOp::Delete { eid }
-                | enchudb_oplog::oplog::DecodedOp::Content { eid, .. } => is_internal_eid(*eid),
+                | enchudb_oplog::oplog::DecodedOp::Content { eid, .. }
+                | enchudb_oplog::oplog::DecodedOp::TieNamed { eid, .. } => is_internal_eid(*eid),
                 enchudb_oplog::oplog::DecodedOp::Commit => false,
                 enchudb_oplog::oplog::DecodedOp::Vocab { .. } => false,
             };
@@ -2412,7 +2413,7 @@ impl Engine {
             let lsn = self.next_sync_lsn.fetch_add(1, Ordering::AcqRel);
             self.tie_to_by_id(row_eid, lsn_hid, lsn);
             self.tie_to_by_id(row_eid, peer_id_hid, rec.author_peer);
-            // DecodedOp variant を tag (Tie=0, Untie=1, Delete=2, Content=3, Commit=4, Vocab=5)
+            // DecodedOp variant を tag (Tie=0, Untie=1, Delete=2, Content=3, Commit=4, Vocab=5, TieNamed=6)
             let op_type = match &rec.op {
                 enchudb_oplog::oplog::DecodedOp::Tie { .. } => 0,
                 enchudb_oplog::oplog::DecodedOp::Untie { .. } => 1,
@@ -2420,6 +2421,7 @@ impl Engine {
                 enchudb_oplog::oplog::DecodedOp::Content { .. } => 3,
                 enchudb_oplog::oplog::DecodedOp::Commit => 4,
                 enchudb_oplog::oplog::DecodedOp::Vocab { .. } => 5,
+                enchudb_oplog::oplog::DecodedOp::TieNamed { .. } => 6,
             };
             self.tie_to_by_id(row_eid, op_type_hid, op_type);
             // hlc.wall は u64 ms-since-epoch、 下位 32bit のみ保持 (= ~50 日サイクル
@@ -3680,7 +3682,17 @@ impl Engine {
             if let Some(wal) = self.oplog.as_ref() {
                 let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
                 let _ = wal.append(enchudb_oplog::oplog::Op::Vocab { vid, bytes: value });
-                let _ = wal.append(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid });
+                if self.himo_is_content(hid) {
+                    // 0.9.0: 動的 content himo は id が peer 間で揃わないため名前で運ぶ
+                    let _ = wal.append(enchudb_oplog::oplog::Op::TieNamed {
+                        eid: oplog_eid,
+                        himo_name: &self.himo_names[hid],
+                        himo_kind: self.himo_types[hid] as u8,
+                        value: vid,
+                    });
+                } else {
+                    let _ = wal.append(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid });
+                }
             }
         }
     }
@@ -3792,13 +3804,94 @@ impl Engine {
 
     // ──── content ────
 
+    /// eid が属する named table 名。 どの named table の range にも入らなければ
+    /// None (= anonymous 扱い)。
+    fn table_name_of_local(&self, local: u32) -> Option<String> {
+        for t in self.tables.iter() {
+            if t.name.is_empty() { continue; }
+            if local >= t.eid_range_lo && local < t.eid_range_hi {
+                return Some(t.name.clone());
+            }
+        }
+        None
+    }
+
+    /// 0.9.0 (#81): content key に対応する `_c_{key}` Leaf himo を lazy 確保。
+    /// eid が named table 所属ならその table に、 それ以外は anonymous に定義する。
+    fn ensure_content_himo(&self, local: u32, key: &str) -> u16 {
+        assert!(
+            !key.contains('.'),
+            "content key '{}' must not contain '.' (himo 名の table separator と衝突。 \
+             0.9.0 で content は Leaf himo 格納に変わった)",
+            key,
+        );
+        let himo_name = format!("_c_{key}");
+        let res = match self.table_name_of_local(local) {
+            Some(t) => self.ensure_himo_dynamic_in(&t, &himo_name, HimoType::Leaf, 0),
+            None => self.ensure_himo_dynamic(&himo_name, HimoType::Leaf, 0),
+        };
+        res.unwrap_or_else(|e| panic!("content key '{key}': himo allocation failed: {e}"))
+    }
+
+    /// full name ("table.himo" or "himo") で himo を lazy 解決。 table 部が既知
+    /// table なら所属付きで、 それ以外は anonymous へ定義する (TieNamed replay 用)。
+    fn ensure_himo_by_full_name(&self, full_name: &str, ht: HimoType) -> Result<u16, String> {
+        if let Some((table, himo)) = full_name.split_once('.') {
+            if self.tables.iter().any(|t| t.name == table) {
+                return self.ensure_himo_dynamic_in(table, himo, ht, 0);
+            }
+        }
+        self.ensure_himo_dynamic(full_name, ht, 0)
+    }
+
+    /// 0.9.0: sync 受信側用の公開版 — TieNamed の himo を名前で解決 (無ければ
+    /// lazy 定義) して local hid を返す。 `himo_kind` は wire 上の生 u8。
+    pub fn ensure_himo_named(&self, full_name: &str, himo_kind: u8) -> Result<u16, String> {
+        self.ensure_himo_by_full_name(full_name, HimoType::from_byte(himo_kind))
+    }
+
+    /// hid が content 互換層の himo (`_c_` prefix) か。 これらは動的定義のため
+    /// peer 間で himo_id が揃わず、 WAL/wire には Tie ではなく TieNamed で乗せる。
+    fn himo_is_content(&self, hid: usize) -> bool {
+        self.himo_names.get(hid).map_or(false, |n| {
+            n.rsplit('.').next().map_or(false, |leaf| leaf.starts_with("_c_"))
+        })
+    }
+
+    /// 既存の content himo id を引く (定義はしない)。 read 経路用。
+    fn content_himo_id(&self, local: u32, key: &str) -> Option<u16> {
+        let full = match self.table_name_of_local(local) {
+            Some(t) => format!("{t}._c_{key}"),
+            None => format!("_c_{key}"),
+        };
+        self.himo_id(&full).map(|h| h as u16)
+    }
+
+    /// entity に任意 bytes を添付する (sync 版)。
+    ///
+    /// 0.9.0: 保存先を旧 ContentStore region から **`_c_{key}` Leaf himo**
+    /// (bytes は vocab 格納) に変更。 write は Vocab+Tie として WAL / sync /
+    /// HLC / changefeed に自然に乗る。 これにより旧経路の既知バグ群
+    /// (mod-16 key hash 衝突・index torn read・sync/WAL 非対応・delete 残留)
+    /// が構造ごと退役する。 旧 content region は**凍結アーカイブ**:
+    /// `get_content` の fallback でのみ読み、 書き込みは一切しない。
     pub fn content(&self, eid: enchudb_oplog::EntityId, key: &str, data: &[u8]) {
         self.check_writable();
-        self.contents.set(enchudb_oplog::eid_local(eid), key, data);
+        let local = enchudb_oplog::eid_local(eid);
+        let hid = self.ensure_content_himo(local, key);
+        self.tie_bytes_to_by_id(eid, hid, data);
     }
 
     pub fn get_content(&self, eid: enchudb_oplog::EntityId, key: &str) -> Option<&[u8]> {
-        self.contents.get(enchudb_oplog::eid_local(eid), key)
+        let local = enchudb_oplog::eid_local(eid);
+        // 新経路 (`_c_{key}` Leaf himo) 優先
+        if let Some(hid) = self.content_himo_id(local, key) {
+            if let Some(vid) = self.get_by_id(eid, hid) {
+                return Some(self.vocab.get(vid));
+            }
+        }
+        // 旧 content region fallback (pre-0.9 data の read-through 互換)
+        self.contents.get(local, key)
     }
 
     // ──── changefeed (WAL 変更通知) ────
@@ -5783,8 +5876,20 @@ impl Engine {
                 self.entities.free(local);
             }
             DecodedOp::Content { eid, key, data } => {
+                // legacy (pre-0.9 WAL): 旧 content region へ replay。 0.9.0 以降は
+                // Op::Content を emit しないので、 旧 DB の WAL 再生でのみ通る。
                 let local = enchudb_oplog::eid_local(*eid);
                 self.contents.set(local, key, data);
+                self.entities.ensure_live(local);
+                Self::advance_table_next_local_for(&self.tables, local);
+            }
+            DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => {
+                // 0.9.0: 名前で himo を解決 (無ければ定義) して set。
+                let local = enchudb_oplog::eid_local(*eid);
+                let ht = HimoType::from_byte(*himo_kind);
+                if let Ok(hid) = self.ensure_himo_by_full_name(himo_name, ht) {
+                    self.himos[hid as usize].set(local, *value);
+                }
                 self.entities.ensure_live(local);
                 Self::advance_table_next_local_for(&self.tables, local);
             }
@@ -6398,9 +6503,6 @@ impl Engine {
                 }
                 self.entities.free(eid);
             }
-            Op::Content { eid, key, data } => {
-                self.contents.set(eid, &key, &data);
-            }
             Op::EntityCreated { local: _ } => {
                 // v4 (undo 廃止) 以降は no-op。 `entity()` で local slot は writer
                 // thread 側で既に allocate 済み。 ここに来るのは `flush_writes` の
@@ -6476,6 +6578,11 @@ impl Engine {
 
     /// `tie_text_async` の himo_id 直指定版。 text 本体は vocab 経由なので value はそのまま。
     pub fn tie_text_async_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: &str) {
+        self.tie_bytes_async_by_id(eid, himo_id, value.as_bytes());
+    }
+
+    /// `tie_text_async_by_id` の bytes 版 (0.9.0: content 互換層も使う)。
+    pub fn tie_bytes_async_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: &[u8]) {
         use std::sync::atomic::Ordering;
         self.check_writable();
         let local = enchudb_oplog::eid_local(eid);
@@ -6486,9 +6593,9 @@ impl Engine {
         self.validate_eid_for_himo(hid, local);
         // Tag は dedupe、Leaf は常に新規 id。
         let vid = match self.himo_types[hid] {
-            HimoType::Tag => self.vocab.get_or_insert(value.as_bytes()),
-            HimoType::Leaf => self.vocab.insert(value.as_bytes()),
-            ht => panic!("tie_text_async_by_id on non-text himo_id {}: {:?}", himo_id, ht),
+            HimoType::Tag => self.vocab.get_or_insert(value),
+            HimoType::Leaf => self.vocab.insert(value),
+            ht => panic!("tie_bytes_async_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
         assert!(vid < u32::MAX, "vocab vid must be < u32::MAX (sentinel reserved)");
         // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
@@ -6499,8 +6606,18 @@ impl Engine {
         if let Some(wal) = self.oplog.as_ref() {
             // Vocab op を先に(sync の receiver 側で Tie より先に mapping が張られるよう)
             let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
-            let vocab_rec = enchudb_oplog::oplog::OwnedOp::Vocab { vid, bytes: value.as_bytes().to_vec() };
-            let tie_rec = enchudb_oplog::oplog::OwnedOp::Tie { eid: oplog_eid, himo_id, value: vid };
+            let vocab_rec = enchudb_oplog::oplog::OwnedOp::Vocab { vid, bytes: value.to_vec() };
+            let tie_rec = if self.himo_is_content(hid) {
+                // 0.9.0: 動的 content himo は id が peer 間で揃わないため名前で運ぶ
+                enchudb_oplog::oplog::OwnedOp::TieNamed {
+                    eid: oplog_eid,
+                    himo_name: self.himo_names[hid].clone(),
+                    himo_kind: self.himo_types[hid] as u8,
+                    value: vid,
+                }
+            } else {
+                enchudb_oplog::oplog::OwnedOp::Tie { eid: oplog_eid, himo_id, value: vid }
+            };
             if let Some(wq) = self.oplog_record_queue.as_ref() {
                 // Vocab → Tie の順を保つため同一 thread から連続 push
                 push_oplog_record_blocking(wq, vocab_rec, &self.consumer_poisoned);
@@ -6606,30 +6723,14 @@ impl Engine {
     }
 
     /// 非同期 content 書き込み。WAL 有効時はクラッシュ後も復元される。
-    /// key と data は Box に move される(消費される)。
+    ///
+    /// 0.9.0: 保存先を `_c_{key}` Leaf himo に変更 (`content` の doc 参照)。
+    /// WAL には `Op::Content` ではなく通常の `Op::Vocab` + `Op::Tie` が乗る。
     pub fn content_async(&self, eid: enchudb_oplog::EntityId, key: &str, data: &[u8]) {
-        use std::sync::atomic::Ordering;
         self.check_writable();
         let local = enchudb_oplog::eid_local(eid);
-        // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
-        let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
-        q.push(crate::write_queue::Op::Content {
-            eid: local,
-            key: key.to_string().into_boxed_str(),
-            data: data.to_vec().into_boxed_slice(),
-        });
-        self.push_count.fetch_add(1, Ordering::Release);
-        if let Some(wal) = self.oplog.as_ref() {
-            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
-            let rec = enchudb_oplog::oplog::OwnedOp::Content {
-                eid: oplog_eid, key: key.to_string(), data: data.to_vec(),
-            };
-            if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec, &self.consumer_poisoned);
-            } else {
-                let _ = wal.append(rec.as_op());
-            }
-        }
+        let hid = self.ensure_content_himo(local, key);
+        self.tie_bytes_async_by_id(eid, hid, data);
     }
 
     /// 現在のトランザクションを WAL に commit marker で確定する。
