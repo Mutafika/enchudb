@@ -382,7 +382,7 @@ impl Syncer {
         let require_sig = self.require_signature.load(std::sync::atomic::Ordering::Acquire);
         let pubkeys = self.engine.pubkeys().clone();
         let acl = self.engine.acl().clone();
-        let mut note_reject = |out: &mut SyncOutcome, hlc: Hlc| {
+        let note_reject = |out: &mut SyncOutcome, hlc: Hlc| {
             if out.min_rejected_hlc.map_or(true, |m| hlc < m) {
                 out.min_rejected_hlc = Some(hlc);
             }
@@ -592,6 +592,11 @@ mod tests {
     use enchudb_oplog::PeerId;
     use enchudb_engine::transport::InMemoryTransport;
 
+    /// 固定 path だと並列 test run (別 binary / 前回 run の残骸) と衝突するため pid を混ぜる
+    fn test_path(name: &str) -> String {
+        format!("/tmp/enchudb_sync_{}_{}.db", name, std::process::id())
+    }
+
     fn new_eng(path: &str, peer: PeerId) -> Arc<Engine> {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(format!("{}.oplog", path));
@@ -614,8 +619,8 @@ mod tests {
 
     #[test]
     fn lww_newer_wins() {
-        let path_a = "/tmp/enchudb_sync_a.db";
-        let eng_a = new_eng(path_a, 1);
+        let path_a = test_path("a");
+        let eng_a = new_eng(&path_a, 1);
         let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
         let syncer = Syncer::new(eng_a.clone(), transport.clone());
 
@@ -637,8 +642,8 @@ mod tests {
 
     #[test]
     fn two_peer_pull_and_apply() {
-        let path_a = "/tmp/enchudb_sync_2peer_a.db";
-        let eng_a = new_eng(path_a, 1);
+        let path_a = test_path("2peer_a");
+        let eng_a = new_eng(&path_a, 1);
         let transport = Arc::new(InMemoryTransport::new());
 
         // peer 2 が tie した体で transport に直接 publish
@@ -664,8 +669,8 @@ mod tests {
 
     #[test]
     fn pull_incremental_advances_cursor() {
-        let path_a = "/tmp/enchudb_sync_cursor_a.db";
-        let eng_a = new_eng(path_a, 1);
+        let path_a = test_path("cursor_a");
+        let eng_a = new_eng(&path_a, 1);
         let transport = Arc::new(InMemoryTransport::new());
         let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
 
@@ -689,8 +694,8 @@ mod tests {
     /// 旧 broadcast 経路と等価に動く事を確認。
     #[test]
     fn default_filter_is_backward_compatible() {
-        let path_a = "/tmp/enchudb_sync_default_filter.db";
-        let eng_a = new_eng(path_a, 1);
+        let path_a = test_path("default_filter");
+        let eng_a = new_eng(&path_a, 1);
         let transport = Arc::new(InMemoryTransport::new());
         let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
 
@@ -724,8 +729,8 @@ mod tests {
     fn custom_filter_can_partition_records_per_peer() {
         use crate::subscription::SubscriptionFilter;
 
-        let path_a = "/tmp/enchudb_sync_partition_filter.db";
-        let eng_a = new_eng(path_a, 1);
+        let path_a = test_path("partition_filter");
+        let eng_a = new_eng(&path_a, 1);
         let transport = Arc::new(InMemoryTransport::new());
         let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
 
@@ -761,8 +766,8 @@ mod tests {
     /// publish_since_for_peer を直接呼んだ場合の動作確認。
     #[test]
     fn publish_since_for_peer_targets_one_peer_only() {
-        let path_a = "/tmp/enchudb_sync_pubsincefor.db";
-        let eng_a = new_eng(path_a, 1);
+        let path_a = test_path("pubsincefor");
+        let eng_a = new_eng(&path_a, 1);
         let transport = Arc::new(InMemoryTransport::new());
         let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
 

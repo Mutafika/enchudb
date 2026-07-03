@@ -104,13 +104,16 @@ fn current_sync_lsn_advances_with_transfer() {
     eng.flush_writes();
     eng.oplog_sync().unwrap();
 
-    // transfer 前は lsn まだ 0
-    assert_eq!(eng.current_sync_lsn(), 0);
-
-    eng.transfer_oplog_to_sync_ops();
-    // 3 record 転送後、 lsn は 3 (= 1, 2, 3 が払出された)
+    // 0.9.0: oplog_sync が bridge も済ませるため、 この時点で lsn は払出済み
+    // (旧: 手動 transfer まで 0 のままだった)
     assert!(eng.current_sync_lsn() >= 3,
-            "after transfer lsn should be >= 3, got {}", eng.current_sync_lsn());
+            "after oplog_sync lsn should be >= 3, got {}", eng.current_sync_lsn());
+
+    // 手動 transfer は追いつき済みで lsn を進めない (idempotent)
+    let lsn_before = eng.current_sync_lsn();
+    eng.transfer_oplog_to_sync_ops();
+    assert_eq!(eng.current_sync_lsn(), lsn_before,
+               "manual transfer after oplog_sync should be a no-op");
 
     cleanup(&path);
 }
