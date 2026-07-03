@@ -264,6 +264,27 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Resu
         None => (path, ""),
     };
 
+    // #78-H9: bootstrap sidecar 配信 (.eidmap = 翻訳写像 + tombstone、 .tables)。
+    // main DB body だけ配ると、 restore 後の再 sync で translator 空 + tombstone
+    // 喪失 → 重複 entity 払い出し / 削除済み entity の resurrection が起きる
+    // (snapshot_export は 1503ff2 で同じ理由により sidecar 直書きへ修正済み —
+    //  HTTP 配布経路が取り残されていた)。
+    if method == "GET" && route.starts_with("/bootstrap/") {
+        let src = match &state.bootstrap {
+            Some(s) => s,
+            None => return send_response(&mut stream, 404, b"bootstrap not enabled"),
+        };
+        let sfx = match &route["/bootstrap/".len()..] {
+            "eidmap" => ".eidmap",
+            "tables" => ".tables",
+            _ => return send_response(&mut stream, 404, b"unknown sidecar"),
+        };
+        return match std::fs::read(format!("{}{}", src.db_path, sfx)) {
+            Ok(bytes) => send_response(&mut stream, 200, &bytes),
+            Err(_) => send_response(&mut stream, 404, b"sidecar not present"),
+        };
+    }
+
     // bootstrap は room_id 無し。先に処理。
     if method == "GET" && route == "/bootstrap" {
         let src = match &state.bootstrap {
@@ -677,6 +698,23 @@ impl HttpTransport {
         let mut reader = prepended;
         decode_sparse_stream(&mut reader, &mut file, size)?;
         file.sync_all()?;
+
+        // #78-H9: sidecar (.eidmap / .tables) も取得。 .eidmap 無しの restore は
+        // 再 sync で重複 entity / tombstone 喪失を起こす。 旧 server (route 未対応)
+        // からは 404 が返るので、 その場合は main body のみの旧挙動に fallback。
+        for (name, sfx) in [("eidmap", ".eidmap"), ("tables", ".tables")] {
+            if let Ok((200, bytes)) = self.request("GET", &format!("/bootstrap/{name}"), b"") {
+                let sidecar_path = format!("{local_path}{sfx}");
+                let f = std::fs::File::create(&sidecar_path)?;
+                {
+                    use std::io::Write as _;
+                    let mut w = std::io::BufWriter::new(&f);
+                    w.write_all(&bytes)?;
+                    w.flush()?;
+                }
+                f.sync_all()?;
+            }
+        }
 
         Ok(Hlc { wall, logical, peer })
     }

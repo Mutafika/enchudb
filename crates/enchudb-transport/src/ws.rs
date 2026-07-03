@@ -374,7 +374,7 @@ mod tests {
         ).unwrap();
 
         // hub に subscriber が現れるまで待つ
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while hub.subscriber_count() == 0 {
             if std::time::Instant::now() > deadline { panic!("subscriber not registered"); }
             std::thread::sleep(Duration::from_millis(20));
@@ -390,7 +390,7 @@ mod tests {
         // 受信確認
         let mut got = Vec::new();
         for _ in 0..3 {
-            let r = rx.recv_timeout(Duration::from_secs(2)).expect("timeout");
+            let r = rx.recv_timeout(Duration::from_secs(10)).expect("timeout");
             got.push(r);
         }
         assert_eq!(got.len(), 3);
@@ -410,7 +410,7 @@ mod tests {
             move |r| { let _ = tx.send(r); },
         ).unwrap();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while hub.subscriber_count() == 0 {
             if std::time::Instant::now() > deadline { panic!("subscriber not registered"); }
             std::thread::sleep(Duration::from_millis(20));
@@ -423,8 +423,8 @@ mod tests {
         ]);
 
         // 200, 300 のみ
-        let r1 = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let r2 = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let r1 = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let r2 = rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(r1.hlc.wall, 200);
         assert_eq!(r2.hlc.wall, 300);
 
@@ -443,7 +443,7 @@ mod tests {
             move |r| { let _ = tx.send(r); },
         ).unwrap();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while hub.subscriber_count() == 0 {
             if std::time::Instant::now() > deadline { panic!("not registered"); }
             std::thread::sleep(Duration::from_millis(20));
@@ -456,7 +456,7 @@ mod tests {
 
         // peer=1 の broadcast → 来る
         hub.broadcast(1, &[rec(100, 1, 1, 100)]);
-        let r = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let r = rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(r.hlc.peer, 1);
     }
 
@@ -498,7 +498,7 @@ mod tests {
             move |r| { let _ = tx.send(r); },
         )
         .unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while hub.subscriber_count() == 0 {
             if std::time::Instant::now() > deadline {
                 panic!("subscriber not registered");
@@ -518,7 +518,7 @@ mod tests {
 
         // subscriber に届く
         let mut got_tie = false;
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
             match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(r) => {

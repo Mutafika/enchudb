@@ -39,8 +39,13 @@
 //! - `(eid, himo)` ペアの既存 HLC より受信 HLC が**厳密に大きい** → apply
 //! - それ以外(等しい、または既存が大きい) → skip
 //!
-//! Delete は特殊: entity ごとすべての himo HLC を比較せず、
-//! 「Delete の HLC が、その entity の全 himo 最大 HLC 以上」なら apply。
+//! Delete は特殊: himo を持たないため per-himo の比較はせず、 **tombstone slot
+//! (sentinel himo_id = `u16::MAX`) との LWW** で判定する。 apply されると
+//! tombstone HLC が記録され、 以後それより古い Tie/Untie は skip される
+//! (削除済み entity の復活防止)。 逆に reorder 配送で「新しい Tie の後に古い
+//! Delete」が届いた場合、 per-himo HLC は参照しないため Delete が entity を
+//! 物理削除する — 同一 author の log は HLC 順なのでこの経路は再送/gossip の
+//! 交錯時のみ (0.9.0 で doc を実装に合わせて訂正、 挙動は従来どおり)。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -52,10 +57,6 @@ use enchudb_oplog::oplog::DecodedOp;
 use enchudb_oplog::{Hlc, PeerId};
 
 use crate::subscription::{AllRecords, SubscriptionFilter};
-
-/// #9: 未着 Tie 待ちで退避する Content/Delete の総数上限。 一度も Tie されない
-/// foreign entity (content-only) 宛の op で buffer が無限肥大しないための backstop。
-const MAX_PENDING_OPS: usize = 16_384;
 
 pub struct Syncer {
     engine: Arc<Engine>,
@@ -73,11 +74,8 @@ pub struct Syncer {
     subscription_filter: std::sync::RwLock<Arc<dyn SubscriptionFilter>>,
     /// #9 foot-gun ガード: self_peer == 0 で foreign record を apply した事の一度だけ警告。
     warned_unconfigured_peer: std::sync::atomic::AtomicBool,
-    /// #9: 確保先の写像がまだ無い (= entity の Tie が未着) foreign entity 宛の
-    /// Content / Delete を一時退避する buffer。 key = (author_peer, foreign_local)。
-    /// 対応する Tie が届いて写像が作られた直後に drain して apply する (= 配送順序が
-    /// 入れ替わっても op を落とさない)。
-    pending_ops: std::sync::Mutex<std::collections::HashMap<(PeerId, u32), Vec<WireRecord>>>,
+    // 0.9.0: 旧 Content reorder buffer (`pending_ops`) は削除 — content は
+    // TieNamed で運ばれ、 自力で entity 写像を作れるため退避が不要になった。
 }
 
 /// 1 回の pull-apply サイクルの結果。
@@ -93,6 +91,10 @@ pub struct SyncOutcome {
     pub rejected_signature: usize,
     /// Phase C: ACL で reject した op 数。
     pub rejected_acl: usize,
+    /// #78 (0.9.0): reject (署名/ACL) された record の最小 HLC。 pull cursor は
+    /// これを越えて前進しない — pubkey 登録との race 窓で reject された record が
+    /// 永久に再配送されない silent gap を防ぐ (次回 pull で再検証される)。
+    pub min_rejected_hlc: Option<Hlc>,
 }
 
 impl Syncer {
@@ -136,7 +138,6 @@ impl Syncer {
             require_signature: std::sync::atomic::AtomicBool::new(false),
             subscription_filter: std::sync::RwLock::new(Arc::new(AllRecords)),
             warned_unconfigured_peer: std::sync::atomic::AtomicBool::new(false),
-            pending_ops: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         // HlcStore は engine 内部のメモリ構造で永続化されない。 engine reopen 後は
         // 空状態なので、 attach 時に WAL を walk して LWW state を再構築する。
@@ -211,6 +212,13 @@ impl Syncer {
                     let key_hash = enchudb_oplog::content_key_hash15(key);
                     store.force_set(*eid, key_hash | 0x8000, rec.hlc);
                 }
+                DecodedOp::TieNamed { eid, himo_name, .. } => {
+                    // 0.9.0: 名前を local hid に解決できる場合のみ LWW entry を張る
+                    // (未定義 = local に一度も届いていない himo は hydrate 不要)。
+                    if let Some(hid) = engine.himo_id(himo_name) {
+                        store.force_set(*eid, hid as u16, rec.hlc);
+                    }
+                }
                 DecodedOp::Commit | DecodedOp::Vocab { .. } => {}
             }
         }
@@ -248,7 +256,16 @@ impl Syncer {
         let outcome = self.apply_records(&records);
 
         // last_pulled を進める(空 pull でも既存のままで OK)。 進んだら disk に保存。
-        let advanced = if let Some(last) = records.iter().map(|r| r.hlc).max() {
+        // #78 (0.9.0): reject (署名/ACL) された record を cursor が越えない。
+        // 旧実装は reject 込みで max HLC まで前進し、 pubkey 登録との race 窓の
+        // record が永久に再配送されない silent gap を作っていた。 reject があった
+        // 場合は「最小 reject HLC 未満の accepted record」までしか進めない
+        // (= reject 分は次回 pull で再配送・再検証される)。
+        let target = match outcome.min_rejected_hlc {
+            None => records.iter().map(|r| r.hlc).max(),
+            Some(minrej) => records.iter().map(|r| r.hlc).filter(|h| *h < minrej).max(),
+        };
+        let advanced = if let Some(last) = target {
             let mut guard = self.last_pulled.lock().unwrap();
             let cur = guard.get(&from).copied().unwrap_or(Hlc::ZERO);
             if last > cur {
@@ -365,26 +382,35 @@ impl Syncer {
         let require_sig = self.require_signature.load(std::sync::atomic::Ordering::Acquire);
         let pubkeys = self.engine.pubkeys().clone();
         let acl = self.engine.acl().clone();
+        let note_reject = |out: &mut SyncOutcome, hlc: Hlc| {
+            if out.min_rejected_hlc.map_or(true, |m| hlc < m) {
+                out.min_rejected_hlc = Some(hlc);
+            }
+        };
         for rec in records {
             out.received += 1;
 
             // ACL チェック(未定義なら全員通す)
             if !acl.is_writer(rec.author_peer) {
                 out.rejected_acl += 1;
+                note_reject(&mut out, rec.hlc);
                 continue;
             }
 
             if require_sig {
                 if rec.signature == [0u8; 64] {
                     out.rejected_signature += 1;
+                    note_reject(&mut out, rec.hlc);
                     continue;
                 }
                 if pubkeys.get(rec.author_peer).is_none() {
                     out.rejected_signature += 1;
+                    note_reject(&mut out, rec.hlc);
                     continue;
                 }
                 if !pubkeys.verify(rec.author_peer, &rec.signed_bytes, &rec.signature) {
                     out.rejected_signature += 1;
+                    note_reject(&mut out, rec.hlc);
                     continue;
                 }
             }
@@ -397,37 +423,11 @@ impl Syncer {
         out
     }
 
-    /// #9: 未着 Tie 待ちの Content を退避する。 同 HLC の重複 (再 pull) は無視。
-    /// 総数が `MAX_PENDING_OPS` を超えたら最古の bucket を 1 つ落とす (= 一度も Tie
-    /// されない content-only entity 宛で buffer が無限肥大しないための backstop)。
-    fn buffer_pending(&self, author_peer: PeerId, foreign_local: u32, rec: &WireRecord) {
-        let mut guard = self.pending_ops.lock().unwrap();
-        let total: usize = guard.values().map(|v| v.len()).sum();
-        if total >= MAX_PENDING_OPS {
-            if let Some(k) = guard.keys().next().copied() {
-                guard.remove(&k);
-            }
-        }
-        let bucket = guard.entry((author_peer, foreign_local)).or_default();
-        if !bucket.iter().any(|r| r.hlc == rec.hlc) {
-            bucket.push(rec.clone());
-        }
-    }
-
-    /// #9: (author_peer, foreign_local) 宛に退避していた Content を drain して apply する。
-    /// 対応する entity の Tie / Untie が届いて写像が作られた直後に呼ぶ。 写像は既に
-    /// あるので今度は resolve でき、 LWW / tombstone は `apply_one` 内で再評価される。
-    fn drain_pending(&self, store: &HlcStore, author_peer: PeerId, foreign_local: u32) {
-        let buffered = {
-            let mut guard = self.pending_ops.lock().unwrap();
-            guard.remove(&(author_peer, foreign_local))
-        };
-        if let Some(recs) = buffered {
-            for rec in &recs {
-                let _ = self.apply_one(store, rec);
-            }
-        }
-    }
+    // 0.9.0: 旧 Content reorder buffer (`buffer_pending` / `drain_pending`) は削除。
+    // content は TieNamed で運ばれ、 TieNamed 自身が entity 写像を作れるため
+    // 「Tie より先に届いた Content の退避」という問題が構造的に消えた。
+    // (旧 buffer の既知バグ: in-memory のみで cursor だけ永続前進 → 再起動で
+    //  buffered record が恒久喪失 / eviction が「最古」でなく任意 bucket を破棄)
 
     fn apply_one(&self, store: &HlcStore, rec: &WireRecord) -> bool {
         // 受信した WireRecord の header フィールドを Engine::remote_*_apply の relayed 引数に
@@ -457,7 +457,6 @@ impl Syncer {
                 };
                 // #9: entity 写像ができたので、 この foreign entity 宛に Tie より先に届いて
                 // 退避していた Content を drain して apply する (= 配送順序ロス防止)。
-                self.drain_pending(store, rec.author_peer, enchudb_oplog::eid_local(*eid));
                 // #9: Ref himo は value 自体が foreign target eid なので、 ref の target
                 // table 空間の local eid に翻訳 (確保できなければ skip)。 それ以外
                 // (Tag/Symbol) は remote vocab vid を local vid に変換 (Number は identity)。
@@ -489,7 +488,6 @@ impl Syncer {
                     None => return false,
                 };
                 // #9: 写像ができたので退避中の Content を drain。
-                self.drain_pending(store, rec.author_peer, enchudb_oplog::eid_local(*eid));
                 if let Some(tomb) = store.get(local_eid, u16::MAX) {
                     if rec.hlc < tomb {
                         return false;
@@ -519,18 +517,42 @@ impl Syncer {
                 self.engine.remote_delete_apply(local_eid, Some(relayed_header(rec)));
                 true
             }
-            DecodedOp::Content { eid, key, data } => {
-                // #9: Content は himo を持たず table を導けないので既存の写像のみ引く。
-                // 未着 (= entity の Tie がまだ来てない) なら確保先が無いので、 pending に
-                // 退避して Tie 到着時に drain する (= Content-before-Tie の reorder ロス防止)。
-                // Content は key 単位 LWW で他 op と独立なので、 Tie の後に遅延適用しても
-                // 可換 (= commutative、 順序非依存)。
-                let local_eid = match self.engine.resolve_remote_eid_existing(rec.author_peer, *eid) {
+            DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => {
+                // 0.9.0: 動的 himo (content 互換層の `_c_{key}`) は id が peer 間で
+                // 揃わないため名前で解決する。 受信側に未定義なら lazy 定義 —
+                // これで Content 専用の reorder buffer / key hash が不要になる
+                // (mapping は Tie と同じ resolve_remote_eid で作られる)。
+                let local_hid = match self.engine.ensure_himo_named(himo_name, *himo_kind) {
+                    Ok(h) => h,
+                    Err(_) => return false, // himo 予算枯渇等 — 適用不能
+                };
+                let local_eid = match self.engine.resolve_remote_eid(rec.author_peer, *eid, local_hid) {
                     Some(e) => e,
-                    None => {
-                        self.buffer_pending(rec.author_peer, enchudb_oplog::eid_local(*eid), rec);
+                    None => return false,
+                };
+                // 値は author-local vid → local vid に変換 (Leaf/Tag のみ、 Number は identity)
+                let value = self.engine.translate_remote_vid(rec.author_peer, local_hid, *value);
+                if let Some(tomb) = store.get(local_eid, u16::MAX) {
+                    if rec.hlc < tomb {
                         return false;
                     }
+                }
+                if !store.try_set(local_eid, local_hid, rec.hlc) {
+                    return false;
+                }
+                self.engine.remote_tie_apply(local_eid, local_hid, value, Some(relayed_header(rec)));
+                true
+            }
+            DecodedOp::Content { eid, key, data } => {
+                // legacy (pre-0.9): 0.9.0 以降は content が TieNamed で運ばれるため、
+                // この arm はアップグレード移行期の旧 WAL 残渣にのみ到達する。
+                // 旧実装が持っていた reorder buffer (未着 Tie 待ち退避) は TieNamed が
+                // 自力で写像を作ることで構造的に不要になったため削除 — 写像が無い
+                // legacy Content は skip (= 一度も Tie されない entity 宛で、 旧経路
+                // でも実質死んでいたデータ)。
+                let local_eid = match self.engine.resolve_remote_eid_existing(rec.author_peer, *eid) {
+                    Some(e) => e,
+                    None => return false,
                 };
                 // Content は key 単位で LWW。himo_id を使えないので hash で代用。
                 if let Some(tomb) = store.get(local_eid, u16::MAX) {
@@ -570,6 +592,11 @@ mod tests {
     use enchudb_oplog::PeerId;
     use enchudb_engine::transport::InMemoryTransport;
 
+    /// 固定 path だと並列 test run (別 binary / 前回 run の残骸) と衝突するため pid を混ぜる
+    fn test_path(name: &str) -> String {
+        format!("/tmp/enchudb_sync_{}_{}.db", name, std::process::id())
+    }
+
     fn new_eng(path: &str, peer: PeerId) -> Arc<Engine> {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(format!("{}.oplog", path));
@@ -592,8 +619,8 @@ mod tests {
 
     #[test]
     fn lww_newer_wins() {
-        let path_a = "/tmp/enchudb_sync_a.db";
-        let eng_a = new_eng(path_a, 1);
+        let path_a = test_path("a");
+        let eng_a = new_eng(&path_a, 1);
         let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
         let syncer = Syncer::new(eng_a.clone(), transport.clone());
 
@@ -615,8 +642,8 @@ mod tests {
 
     #[test]
     fn two_peer_pull_and_apply() {
-        let path_a = "/tmp/enchudb_sync_2peer_a.db";
-        let eng_a = new_eng(path_a, 1);
+        let path_a = test_path("2peer_a");
+        let eng_a = new_eng(&path_a, 1);
         let transport = Arc::new(InMemoryTransport::new());
 
         // peer 2 が tie した体で transport に直接 publish
@@ -642,8 +669,8 @@ mod tests {
 
     #[test]
     fn pull_incremental_advances_cursor() {
-        let path_a = "/tmp/enchudb_sync_cursor_a.db";
-        let eng_a = new_eng(path_a, 1);
+        let path_a = test_path("cursor_a");
+        let eng_a = new_eng(&path_a, 1);
         let transport = Arc::new(InMemoryTransport::new());
         let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
 
@@ -667,8 +694,8 @@ mod tests {
     /// 旧 broadcast 経路と等価に動く事を確認。
     #[test]
     fn default_filter_is_backward_compatible() {
-        let path_a = "/tmp/enchudb_sync_default_filter.db";
-        let eng_a = new_eng(path_a, 1);
+        let path_a = test_path("default_filter");
+        let eng_a = new_eng(&path_a, 1);
         let transport = Arc::new(InMemoryTransport::new());
         let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
 
@@ -702,8 +729,8 @@ mod tests {
     fn custom_filter_can_partition_records_per_peer() {
         use crate::subscription::SubscriptionFilter;
 
-        let path_a = "/tmp/enchudb_sync_partition_filter.db";
-        let eng_a = new_eng(path_a, 1);
+        let path_a = test_path("partition_filter");
+        let eng_a = new_eng(&path_a, 1);
         let transport = Arc::new(InMemoryTransport::new());
         let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
 
@@ -739,8 +766,8 @@ mod tests {
     /// publish_since_for_peer を直接呼んだ場合の動作確認。
     #[test]
     fn publish_since_for_peer_targets_one_peer_only() {
-        let path_a = "/tmp/enchudb_sync_pubsincefor.db";
-        let eng_a = new_eng(path_a, 1);
+        let path_a = test_path("pubsincefor");
+        let eng_a = new_eng(&path_a, 1);
         let transport = Arc::new(InMemoryTransport::new());
         let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
 

@@ -184,6 +184,11 @@ pub mod op_type {
     pub const COMMIT: u8 = 4;
     pub const SCHEMA: u8 = 5; // v32 予約(Phase D 以降で使う)
     pub const VOCAB: u8 = 6;  // v33: text vid → bytes 対応を peer 間で運ぶ
+    /// 0.9.0: himo を **名前で** 運ぶ Tie。 動的定義される content himo
+    /// (`_c_{key}`) は peer 間で himo_id が揃わないため、 id ではなく
+    /// full name を self-describing に運び、 受信側が ensure_himo_dynamic
+    /// で解決する。 id 変換表が不要 = 再起動でも壊れない。
+    pub const TIE_NAMED: u8 = 7;
 }
 
 /// WAL に書く所有型 op。 `Op` の owned 版で、 queue 渡し用 (consumer 側で
@@ -196,6 +201,9 @@ pub enum OwnedOp {
     Content { eid: u64, key: String, data: Vec<u8> },
     Commit,
     Vocab { vid: u32, bytes: Vec<u8> },
+    /// 0.9.0: himo を full name で運ぶ Tie (content 互換層用)。
+    /// `himo_kind` は HimoType の生 u8 (受信側の ensure 用)。
+    TieNamed { eid: u64, himo_name: String, himo_kind: u8, value: u32 },
 }
 
 impl OwnedOp {
@@ -212,6 +220,8 @@ impl OwnedOp {
             OwnedOp::Commit => Op::Commit,
             OwnedOp::Vocab { vid, bytes } =>
                 Op::Vocab { vid: *vid, bytes },
+            OwnedOp::TieNamed { eid, himo_name, himo_kind, value } =>
+                Op::TieNamed { eid: *eid, himo_name, himo_kind: *himo_kind, value: *value },
         }
     }
 }
@@ -228,6 +238,8 @@ pub enum Op<'a> {
     /// receiver 側は `(author_peer, vid) → local_vid` の mapping を持ち、
     /// 後続の Tie { value: vid } を受けたら local_vid に変換して適用する。
     Vocab { vid: u32, bytes: &'a [u8] },
+    /// 0.9.0: himo を full name で運ぶ Tie。 動的 himo (content `_c_{key}`) 用。
+    TieNamed { eid: u64, himo_name: &'a str, himo_kind: u8, value: u32 },
 }
 
 impl<'a> Op<'a> {
@@ -241,6 +253,8 @@ impl<'a> Op<'a> {
             Op::Content { key, data, .. } => 8 + 2 + 2 + 4 + key.len() + data.len(),
             Op::Commit => 0,
             Op::Vocab { bytes, .. } => 4 + 4 + bytes.len(), // vid(4) + len(4) + bytes
+            // eid(8) + value(4) + kind(1) + pad(1) + name_len(2) + name
+            Op::TieNamed { himo_name, .. } => 16 + himo_name.len(),
         }
     }
 
@@ -252,6 +266,7 @@ impl<'a> Op<'a> {
             Op::Content { .. } => op_type::CONTENT,
             Op::Commit => op_type::COMMIT,
             Op::Vocab { .. } => op_type::VOCAB,
+            Op::TieNamed { .. } => op_type::TIE_NAMED,
         }
     }
 
@@ -290,6 +305,16 @@ impl<'a> Op<'a> {
                 buf[4..8].copy_from_slice(&blen.to_le_bytes());
                 buf[8..8 + bytes.len()].copy_from_slice(bytes);
             }
+            Op::TieNamed { eid, himo_name, himo_kind, value } => {
+                assert!(himo_name.len() <= u16::MAX as usize, "himo name too long");
+                buf[0..8].copy_from_slice(&eid.to_le_bytes());
+                buf[8..12].copy_from_slice(&value.to_le_bytes());
+                buf[12] = *himo_kind;
+                buf[13] = 0;
+                let nlen = himo_name.len() as u16;
+                buf[14..16].copy_from_slice(&nlen.to_le_bytes());
+                buf[16..16 + himo_name.len()].copy_from_slice(himo_name.as_bytes());
+            }
         }
     }
 }
@@ -304,6 +329,8 @@ pub enum DecodedOp {
     Commit,
     /// v33: peer 間で vocab の (vid, bytes) を運ぶ。`vid` は record の author_peer ローカル。
     Vocab { vid: u32, bytes: Vec<u8> },
+    /// 0.9.0: himo full name 付き Tie (動的 content himo 用)。
+    TieNamed { eid: u64, himo_name: String, himo_kind: u8, value: u32 },
 }
 
 /// リカバリ結果の 1 レコード(HLC + 署名込み)。
@@ -369,6 +396,12 @@ pub struct OpLog {
     peer_id: std::sync::atomic::AtomicU32,
     /// v32 Phase C: ed25519 鍵ペア。set_keypair で設定。None なら署名は zeros。
     keypair: std::sync::RwLock<Option<std::sync::Arc<crate::keys::Keypair>>>,
+    /// #75: 同一プロセス内 append の直列化。 flock は open file description
+    /// 単位のため、 同じ File を共有するスレッド間では排他にならない (2 本目の
+    /// LOCK_EX が「既保持の変換」として即成功する)。 head 採番 (read-modify-
+    /// write) と `next_hlc` はこの lock の下でのみ安全。 cross-process 排他は
+    /// 従来通り flock が担う。
+    append_lock: std::sync::Mutex<()>,
     /// v30: append 中の writer 数。try_reset はこれが 0 のときだけ実行できる。
     pending_writes: std::sync::atomic::AtomicU32,
     /// v32: auto reset を許可するか。default false。
@@ -473,6 +506,7 @@ impl OpLog {
             hlc_last_wall: AtomicU64::new(0),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
+            append_lock: std::sync::Mutex::new(()),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
         })
@@ -500,6 +534,32 @@ impl OpLog {
         let checkpoint = u64::from_le_bytes(mmap[16..24].try_into().unwrap());
         let capacity = u64::from_le_bytes(mmap[24..32].try_into().unwrap());
 
+        // 0.9.0 (L1): header の capacity / head / checkpoint を実 file 長と突き合わせる。
+        // 旧実装は無検証だったため、 truncated .oplog (crash / 不完全 copy) が
+        // 正常に open された後、 append の mmap[offset..] で OOB panic した。
+        let file_len = mmap.len() as u64;
+        if capacity > file_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "WAL truncated: header capacity {} exceeds file size {} — \
+                     file was cut short (crash / partial copy?)",
+                    capacity, file_len,
+                ),
+            ));
+        }
+        for (name, v) in [("head", head), ("checkpoint", checkpoint)] {
+            if v < HEADER_SIZE as u64 || v > capacity {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "WAL header corrupt: {} = {} out of range [{}, capacity {}]",
+                        name, v, HEADER_SIZE, capacity,
+                    ),
+                ));
+            }
+        }
+
         Ok(Self {
             _file: file,
             mmap,
@@ -511,6 +571,7 @@ impl OpLog {
             hlc_last_wall: AtomicU64::new(0),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
+            append_lock: std::sync::Mutex::new(()),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
         })
@@ -599,6 +660,8 @@ impl OpLog {
         sizes: &[usize],
         total: usize,
     ) -> io::Result<Vec<u64>> {
+        // #75: 同一プロセス内の直列化 (flock は同一 fd 共有スレッド間で no-op)
+        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
         #[cfg(not(target_arch = "wasm32"))]
         let _lock = self.flock_exclusive()?;
 
@@ -737,17 +800,16 @@ impl OpLog {
             }
         });
 
-        // multi-process safety: flock(LOCK_EX) で同じ .wal に対する append を直列化。
-        // 単一 process 内では既に `head` の CAS で並列 OK だが、 別 process の OpLog は
-        // 別の process-local AtomicU64 を持つので同 offset に書き込む race がある。
-        // git の .git/index.lock 相当。 read 側は lock を取らない。
+        // #75: 同一プロセス内は append_lock、 プロセス間は flock で直列化。
+        // flock は open file description 単位なので、 同じ File を共有する
+        // スレッド間では排他にならない — append_lock が必須。
+        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
         #[cfg(not(target_arch = "wasm32"))]
         let _lock = self.flock_exclusive()?;
 
         // ── head を mmap 上の値から読み直して採番 ──
         // 別 process が直前に append した場合、 self.head (process-local atomic) は
-        // 古い値を持ってるので、 lock 中に mmap 上の永続値を真実とする。 単一 process
-        // のときは既存 CAS と同じく無コスト。
+        // 古い値を持ってるので、 lock 中に mmap 上の永続値を真実とする。
         let offset = {
             #[cfg(not(target_arch = "wasm32"))]
             {
@@ -758,7 +820,7 @@ impl OpLog {
                 if new > self.capacity {
                     return Err(self.wal_full_err());
                 }
-                // lock を保持しているので CAS ではなく単純 store で OK
+                // append_lock + flock の両方を保持しているので単純 store で OK
                 self.head.store(new, Ordering::Release);
                 cur
             }
@@ -843,6 +905,11 @@ impl OpLog {
     /// (head==checkpoint ⇒ body へ msync 済 && pending==0) を満たす領域は crash recovery
     /// にも sync にも不要なので、 無条件に畳んでよい。 `auto_reset` フラグは vestigial。
     pub fn try_reset(&self) -> bool {
+        // #77-M8: append_lock で append と直列化。 旧実装は pending_writes
+        // チェックと head CAS の間に窓があり、 その間に進入した append の
+        // record が reset で head 外に落ちて喪失 + stale record 復活が起きた。
+        // append_lock 保持中は append_inner が進入できないため窓が閉じる。
+        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
         let head = self.head.load(Ordering::Acquire);
         let cp = self.checkpoint.load(Ordering::Acquire);
         if head != cp || head <= HEADER_SIZE as u64 { return false; }
@@ -884,38 +951,72 @@ impl OpLog {
     pub fn fsync(&self) -> io::Result<()> { Ok(()) }
 
     /// checkpoint を前進。本体 mmap に反映済み LSN の位置まで進める。
+    ///
+    /// #77-M8: checkpoint は head を越えられない (clamp)。 caller が reset 前に
+    /// 読んだ stale head を渡すと checkpoint > head の壊れ状態になり、 head が
+    /// その値を再突破するまで背景 fsync / sync 転送が止まっていた。
     pub fn advance_checkpoint(&self, new_checkpoint: u64) {
+        let head = self.head.load(Ordering::Acquire);
+        let target = new_checkpoint.min(head);
         let cur = self.checkpoint.load(Ordering::Acquire);
-        if new_checkpoint <= cur { return; }
-        self.checkpoint.store(new_checkpoint, Ordering::Release);
-        self.mmap_mut_slice()[16..24].copy_from_slice(&new_checkpoint.to_le_bytes());
+        if target <= cur { return; }
+        self.checkpoint.store(target, Ordering::Release);
+        self.mmap_mut_slice()[16..24].copy_from_slice(&target.to_le_bytes());
     }
 
     /// v32: HEADER_SIZE から head までを読んで、Commit で挟まれた全レコードを返す。
     /// checkpoint 位置は無視(既に apply 済みの記録もまだ WAL file 上にあれば拾う)。
     /// Syncer.publish_since で使う。ring buffer reset 済みの記録は取れない。
     pub fn iter_committed(&self) -> Vec<Record> {
-        self.iter_from_offset(HEADER_SIZE as u64)
+        self.scan_from_offset(HEADER_SIZE as u64).0
     }
 
     /// 指定 offset 以降の commit 済みレコードを返す。changefeed の差分発火用。
     /// `start_offset` は前回 emit 時の `wal.checkpoint()` を渡す想定。
     pub fn iter_committed_from(&self, start_offset: u64) -> Vec<Record> {
-        self.iter_from_offset(start_offset)
+        self.scan_from_offset(start_offset).0
+    }
+
+    /// #77-H4: `iter_committed_from` + 「読み切った commit 済み group の終端
+    /// offset」を返す版。 cursor (changefeed emit_offset / _sync_ops bridge) は
+    /// **この終端までしか進めてはいけない** — head は record 本体の書き込み前に
+    /// bump されるため、 scan 後に `head()` を再読して cursor にすると、 scan が
+    /// 書き込み途中 record で break した位置〜head 間の record を恒久 skip する。
+    pub fn iter_committed_from_with_end(&self, start_offset: u64) -> (Vec<Record>, u64) {
+        let (out, _, _, committed_end) = self.scan_from_offset(start_offset);
+        (out, committed_end)
     }
 
     /// リカバリ: checkpoint から head までを読んで、Commit で挟まれたグループだけ返す。
     /// CRC 破損レコードに到達したらそこで打ち切り(uncommitted tail の切り捨て)。
+    ///
+    /// #77-H5: LSN / HLC clock の復元 (`next_lsn` / `hlc_*` の store) は
+    /// **recover だけ**が行う (単一スレッドの起動時実行前提)。 以前は
+    /// iter_committed* (= changefeed / sync publish の並行 read 経路) も
+    /// 共通実装の副作用で clock を巻き戻しており、 scan 中に発行された
+    /// LSN/HLC を潰して重複発行 → sync dedupe による silent loss を招いた。
     pub fn recover(&self) -> Vec<Record> {
         let start = self.checkpoint.load(Ordering::Acquire);
-        self.iter_from_offset(start)
+        let (out, max_lsn, max_hlc, _) = self.scan_from_offset(start);
+        if max_lsn > 0 {
+            self.next_lsn.store(max_lsn + 1, Ordering::Release);
+        }
+        if max_hlc.wall > 0 {
+            self.hlc_last_wall.store(max_hlc.wall, Ordering::Release);
+            self.hlc_logical.store(max_hlc.logical, Ordering::Release);
+        }
+        out
     }
 
     /// 指定 offset から head までを Commit グループ単位で読む。共通実装。
-    fn iter_from_offset(&self, start_offset: u64) -> Vec<Record> {
+    /// 副作用なし (読むだけ)。返り値は (records, max_lsn, max_hlc,
+    /// committed_end)。 committed_end = 最後に読み切った Commit record の
+    /// 直後 offset (1 つも無ければ start_offset)。
+    fn scan_from_offset(&self, start_offset: u64) -> (Vec<Record>, u64, Hlc, u64) {
         let mut out = Vec::new();
         let mut batch = Vec::new();
         let mut offset = start_offset;
+        let mut committed_end = start_offset;
         let head = self.head.load(Ordering::Acquire);
         let mut max_lsn = 0;
         let mut max_hlc = Hlc::ZERO;
@@ -963,6 +1064,7 @@ impl OpLog {
             match op {
                 Some(DecodedOp::Commit) => {
                     out.append(&mut batch);
+                    committed_end = payload_end as u64;
                 }
                 Some(other) => {
                     batch.push(Record {
@@ -970,22 +1072,39 @@ impl OpLog {
                         signature, pubkey_fp, signed_bytes,
                     });
                 }
-                None => break,
+                None => {
+                    // forward-compat 可視化 (0.9.0 L1): 新しい version が書いた
+                    // 未知 op_type (or 不正 payload) は従来通りここで scan を打ち
+                    // 切るが、 silent だと以降の正常 record 落ちに気付けない。
+                    // changefeed 経路は cursor が進めず毎 tick 再 scan するため、
+                    // 0.8.15 の persist warning と同様に 1 秒 1 回に rate-limit。
+                    static LAST_WARN_MS: AtomicU64 = AtomicU64::new(0);
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let last = LAST_WARN_MS.load(Ordering::Relaxed);
+                    if now_ms.saturating_sub(last) >= 1000
+                        && LAST_WARN_MS
+                            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        eprintln!(
+                            "enchudb oplog: undecodable op (op_type={}) at offset {} — \
+                             stopping scan; later records in this WAL are ignored \
+                             (written by a newer version?)",
+                            op_byte, offset,
+                        );
+                    }
+                    break;
+                }
             }
 
             offset = (payload_end) as u64;
         }
 
         // uncommitted batch は破棄。recover の定義通り。
-        if max_lsn > 0 {
-            self.next_lsn.store(max_lsn + 1, Ordering::Release);
-        }
-        if max_hlc.wall > 0 {
-            self.hlc_last_wall.store(max_hlc.wall, Ordering::Release);
-            self.hlc_logical.store(max_hlc.logical, Ordering::Release);
-        }
-
-        out
+        (out, max_lsn, max_hlc, committed_end)
     }
 
     /// head を checkpoint に戻す(WAL truncate 相当、uncommitted も全捨て)。
@@ -1067,6 +1186,7 @@ impl OpLog {
             hlc_last_wall: AtomicU64::new(0),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
+            append_lock: std::sync::Mutex::new(()),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
         }
@@ -1115,6 +1235,15 @@ fn decode_op(op_byte: u8, payload: &[u8]) -> Option<DecodedOp> {
             Some(DecodedOp::Content { eid, key, data })
         }
         op_type::COMMIT => Some(DecodedOp::Commit),
+        op_type::TIE_NAMED if payload.len() >= 16 => {
+            let eid = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+            let value = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+            let himo_kind = payload[12];
+            let nlen = u16::from_le_bytes(payload[14..16].try_into().unwrap()) as usize;
+            if payload.len() < 16 + nlen { return None; }
+            let himo_name = String::from_utf8(payload[16..16 + nlen].to_vec()).ok()?;
+            Some(DecodedOp::TieNamed { eid, himo_name, himo_kind, value })
+        }
         op_type::VOCAB if payload.len() >= 8 => {
             let vid = u32::from_le_bytes(payload[0..4].try_into().unwrap());
             let blen = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
@@ -1403,6 +1532,57 @@ mod tests {
         }
         for h in handles { h.join().unwrap(); }
         assert_eq!(wal.next_lsn(), 4001);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// #75 regression: 同一プロセス並行 append で offset 衝突 / HLC 重複が
+    /// 起きないこと。旧実装は flock (同一 fd 間で no-op) + 非 CAS の head 採番
+    /// だったため、2 スレッドが同じ offset に書いて record を破壊し得た。
+    /// 既存の `concurrent_append` は next_lsn しか見ないので検出できなかった。
+    #[test]
+    fn concurrent_append_no_offset_collision_or_dup_hlc() {
+        use std::sync::Arc;
+        use std::thread;
+        let p = tmp("concurrent_offset");
+        let wal = Arc::new(OpLog::create(&p, 32 * 1024 * 1024).unwrap());
+        const THREADS: u64 = 8;
+        const PER: u64 = 500;
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let w = wal.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..PER {
+                    w.append(Op::Tie {
+                        eid: t * 10_000 + i,
+                        himo_id: 0,
+                        value: i as u32,
+                    }).unwrap();
+                }
+            }));
+        }
+        for h in handles { h.join().unwrap(); }
+        wal.append(Op::Commit).unwrap();
+
+        // 全 record が破壊されずに読めて、eid が完全に揃っていること
+        let records = wal.iter_committed();
+        assert_eq!(records.len(), (THREADS * PER) as usize,
+                   "offset 衝突で record が破壊された");
+        let mut eids: Vec<u64> = records.iter().map(|r| match &r.op {
+            DecodedOp::Tie { eid, .. } => *eid,
+            other => panic!("unexpected op: {other:?}"),
+        }).collect();
+        eids.sort_unstable();
+        eids.dedup();
+        assert_eq!(eids.len(), (THREADS * PER) as usize, "eid が欠落 / 重複");
+
+        // HLC が全 record で一意であること (旧 next_hlc は重複を発行し得た)
+        let mut hlcs: Vec<(u64, u32)> = records.iter()
+            .map(|r| (r.hlc.wall, r.hlc.logical)).collect();
+        hlcs.sort_unstable();
+        let before = hlcs.len();
+        hlcs.dedup();
+        assert_eq!(hlcs.len(), before, "HLC が重複発行された");
+
         let _ = std::fs::remove_file(&p);
     }
 

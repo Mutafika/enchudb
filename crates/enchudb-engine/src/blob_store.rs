@@ -133,6 +133,15 @@ pub trait BlobStore: Send + Sync {
     fn exists(&self, id: &BlobId) -> bool;
 
     /// 削除。消したら true、無ければ false。
+    ///
+    /// # 注意 (content-addressed store の共有削除ハザード)
+    ///
+    /// store は content-addressed で **参照カウントを持たない**。 同じ bytes を
+    /// put した全 entity が同一 blob を共有しているため、 `delete` は
+    /// **その BlobId を参照している全 entity の実体を一括で破壊する**。
+    /// 「この entity からだけ外す」 用途では呼ばないこと — 紐/content 側の参照を
+    /// 消すだけに留め、 実体の GC は「どの entity からも参照されていない」ことを
+    /// caller が確認してから行う。
     fn delete(&self, id: &BlobId) -> Result<bool, BlobError>;
 }
 
@@ -186,27 +195,78 @@ impl LocalBlobStore {
     }
 }
 
+impl LocalBlobStore {
+    /// 0.9.0 (M4): crash-durable な tmp + rename 書き込み。
+    /// schema sidecar writer (`persist_tables_to_sidecar`) と同じ標準:
+    /// tmp へ write → `sync_all` → rename → (unix) 親 dir fsync。
+    /// 旧実装は `fs::write` のみで fsync 無し — rename が metadata journal に
+    /// 乗る一方 data page が未着だと、 crash 後に final path へ truncated blob
+    /// が残った。
+    fn write_via_tmp(&self, final_path: &std::path::Path, data: &[u8]) -> Result<(), BlobError> {
+        use std::io::Write;
+        if let Some(parent) = final_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp_path = self.tmp_path(final_path);
+        let write_and_rename = || -> io::Result<()> {
+            {
+                let mut f = fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&tmp_path)?;
+                f.write_all(data)?;
+                f.sync_all()?;
+            }
+            // 別スレッドが先に rename してても、この rename は上書きになって安全(内容同じ)
+            fs::rename(&tmp_path, final_path)?;
+            // rename の directory entry 自体を永続化 (unix のみ、 失敗は無視 —
+            // dir の fsync 不可な FS でも blob data 自体は sync 済み)。
+            #[cfg(unix)]
+            if let Some(parent) = final_path.parent() {
+                if let Ok(dir) = fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
+            Ok(())
+        };
+        write_and_rename().map_err(|e| {
+            // 失敗時は tmp を片付ける
+            let _ = fs::remove_file(&tmp_path);
+            BlobError::from(e)
+        })
+    }
+
+    /// 0.9.0 (M4): 既存 file が id の内容と一致しているか検証する。
+    /// path 自体が content hash なので、 size (cheap) → sha-256 (確実) の順。
+    /// crash で truncated blob が final path に残った場合の検出用。
+    fn existing_blob_is_valid(final_path: &std::path::Path, id: &BlobId, expected_len: usize) -> bool {
+        match fs::metadata(final_path) {
+            Ok(m) if m.len() == expected_len as u64 => {}
+            _ => return false,
+        }
+        match fs::read(final_path) {
+            Ok(bytes) => BlobId::from_bytes(&bytes) == *id,
+            Err(_) => false,
+        }
+    }
+}
+
 impl BlobStore for LocalBlobStore {
     fn put(&self, data: &[u8]) -> Result<BlobId, BlobError> {
         let id = BlobId::from_bytes(data);
         let final_path = self.path_for(&id);
         if final_path.exists() {
-            return Ok(id); // content-addressed: 既存なら何もしない
-        }
-        if let Some(parent) = final_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let tmp_path = self.tmp_path(&final_path);
-        fs::write(&tmp_path, data)?;
-        // 別スレッドが先に rename してても、この rename は上書きになって安全(内容同じ)
-        match fs::rename(&tmp_path, &final_path) {
-            Ok(()) => Ok(id),
-            Err(e) => {
-                // rename 失敗時は tmp を片付ける
-                let _ = fs::remove_file(&tmp_path);
-                Err(e.into())
+            // content-addressed dedup — ただし M4: 存在するだけでは信用しない。
+            // crash 由来の truncated / 破損 blob なら正しい bytes で上書き修復する
+            // (検証は size → 再 hash。 dedup put が read コストになる代わりに
+            //  「一度壊れたら二度と直らない」 を解消)。
+            if Self::existing_blob_is_valid(&final_path, &id, data.len()) {
+                return Ok(id);
             }
         }
+        self.write_via_tmp(&final_path, data)?;
+        Ok(id)
     }
 
     fn get(&self, id: &BlobId) -> Result<Option<Vec<u8>>, BlobError> {
@@ -231,6 +291,9 @@ impl BlobStore for LocalBlobStore {
         self.path_for(id).exists()
     }
 
+    /// 削除。 trait doc の通り content-addressed store に refcount は無く、
+    /// この blob を参照している **全 entity** の実体が消える。 caller 側で
+    /// 参照ゼロを確認してから呼ぶこと。
     fn delete(&self, id: &BlobId) -> Result<bool, BlobError> {
         let path = self.path_for(id);
         match fs::remove_file(&path) {
@@ -458,6 +521,41 @@ mod tests {
             Err(BlobError::HashMismatch { .. }) => {} // 期待
             other => panic!("expected HashMismatch, got {:?}", other),
         }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn local_put_repairs_truncated_blob() {
+        // M4 regression: crash 由来の truncated blob が final path に居ても、
+        // 正しい bytes の再 put で修復されること (旧実装は exists() 即 return で
+        // 「一度壊れたら二度と直らない」)。
+        let root = tmp_root();
+        let store = LocalBlobStore::new(&root).unwrap();
+        let data = b"full blob content that got truncated by a crash";
+        let id = store.put(data).unwrap();
+        // crash simulate: 前半だけ残った truncated blob
+        let path = store.path_for(&id);
+        std::fs::write(&path, &data[..10]).unwrap();
+        assert!(matches!(store.get(&id), Err(BlobError::HashMismatch { .. })));
+        // 再 put → 修復
+        let id2 = store.put(data).unwrap();
+        assert_eq!(id2, id);
+        assert_eq!(store.get(&id).unwrap().as_deref(), Some(&data[..]));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn local_put_repairs_same_size_corruption() {
+        // M4: size が同じでも hash 不一致 (bitrot) なら再 put で修復
+        let root = tmp_root();
+        let store = LocalBlobStore::new(&root).unwrap();
+        let data = b"original content";
+        let id = store.put(data).unwrap();
+        let path = store.path_for(&id);
+        std::fs::write(&path, b"corrupted conten").unwrap(); // 同じ 16 bytes
+        let id2 = store.put(data).unwrap();
+        assert_eq!(id2, id);
+        assert_eq!(store.get(&id).unwrap().as_deref(), Some(&data[..]));
         std::fs::remove_dir_all(&root).ok();
     }
 

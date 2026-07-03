@@ -32,6 +32,11 @@ type Key = (PeerId, u32);
 /// foreign eid → local eid の翻訳テーブル。
 pub struct EidTranslator {
     inner: RwLock<HashMap<Key, u32>>,
+    /// #76 (0.9.0): 翻訳先として払い出された local eid の逆引き set。
+    /// 「この local は foreign entity のレプリカか」を O(1) で判定するために持つ。
+    /// レプリカへのローカル write-back は逆写像が無いため他 peer で別 entity に
+    /// 断片化する — bridge 側 guard がこれを見て伝搬を止める。
+    translated_locals: RwLock<std::collections::HashSet<u32>>,
 }
 
 impl Default for EidTranslator {
@@ -42,7 +47,10 @@ impl Default for EidTranslator {
 
 impl EidTranslator {
     pub fn new() -> Self {
-        Self { inner: RwLock::new(HashMap::new()) }
+        Self {
+            inner: RwLock::new(HashMap::new()),
+            translated_locals: RwLock::new(std::collections::HashSet::new()),
+        }
     }
 
     /// 既存の写像を引く。 未登録なら None。
@@ -51,10 +59,17 @@ impl EidTranslator {
         guard.get(&(author_peer, foreign_local)).copied()
     }
 
+    /// #76: local eid が foreign entity の翻訳先 (= レプリカ) かどうか。
+    pub fn is_translated_local(&self, local: u32) -> bool {
+        self.translated_locals.read().unwrap().contains(&local)
+    }
+
     /// 写像を登録 (上書き)。 recovery 復元時にも使う。
     pub fn insert(&self, author_peer: PeerId, foreign_local: u32, local: u32) {
         let mut guard = self.inner.write().unwrap();
         guard.insert((author_peer, foreign_local), local);
+        drop(guard);
+        self.translated_locals.write().unwrap().insert(local);
     }
 
     /// 写像を **atomic** に get-or-insert する。 未登録なら `alloc` を呼んで local を
@@ -88,6 +103,8 @@ impl EidTranslator {
         }
         let local = alloc()?;
         guard.insert((author_peer, foreign_local), local);
+        drop(guard);
+        self.translated_locals.write().unwrap().insert(local);
         Some(local)
     }
 

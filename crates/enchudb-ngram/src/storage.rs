@@ -76,6 +76,12 @@ pub struct MappedIndex {
     bigram_count: u32,
     posting_total: u32,
     doc_count: u32,
+    text_total: u32,
+}
+
+#[inline]
+fn invalid_data(msg: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
 impl MappedIndex {
@@ -95,19 +101,67 @@ impl MappedIndex {
     fn from_backing(backing: Backing) -> io::Result<Self> {
         let buf = backing.as_slice();
         if buf.len() < HEADER_SIZE || &buf[0..4] != MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "not an ETXT file"));
+            return Err(invalid_data("not an ETXT file"));
         }
         let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
         if version != VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unsupported ETXT version {version} (expected {VERSION})"),
-            ));
+            return Err(invalid_data(format!(
+                "unsupported ETXT version {version} (expected {VERSION})"
+            )));
         }
         let bigram_count = u32::from_le_bytes(buf[8..12].try_into().unwrap());
         let posting_total = u32::from_le_bytes(buf[12..16].try_into().unwrap());
         let doc_count = u32::from_le_bytes(buf[16..20].try_into().unwrap());
-        Ok(Self { backing, bigram_count, posting_total, doc_count })
+        let text_total = u32::from_le_bytes(buf[20..24].try_into().unwrap());
+
+        // ── 構造検証 ──
+        // header のカウント類と各エントリの offset/len を全部バッファサイズに対して
+        // 検証する。truncate されたファイルや壊れた header をここで InvalidData として
+        // 弾かないと、検索時 (get_posting / get_text) の slice index で panic する。
+        // レイアウト計算は u64 で行い、32bit target (wasm32) での桁あふれも防ぐ。
+        let bigram_end = HEADER_SIZE as u64 + bigram_count as u64 * BIGRAM_ENTRY as u64;
+        let posting_start = bigram_end + posting_padding(bigram_count) as u64;
+        let posting_end = posting_start + posting_total as u64 * POSTING_ENTRY as u64;
+        let doc_end = posting_end + doc_count as u64 * DOC_ENTRY as u64;
+        let total = doc_end + text_total as u64;
+        if total > buf.len() as u64 {
+            return Err(invalid_data(format!(
+                "truncated or corrupt ETXT file: header claims {total} bytes \
+                 (bigrams={bigram_count}, postings={posting_total}, docs={doc_count}, \
+                 text={text_total}), file has {}",
+                buf.len()
+            )));
+        }
+
+        // bigram index の各エントリ: posting 範囲が Posting Data 内に収まるか。
+        for i in 0..bigram_count as usize {
+            let base = HEADER_SIZE + i * BIGRAM_ENTRY;
+            let entry = &buf[base..base + BIGRAM_ENTRY];
+            let offset = u32::from_le_bytes(entry[4..8].try_into().unwrap()) as u64;
+            let len = u32::from_le_bytes(entry[8..12].try_into().unwrap()) as u64;
+            if offset + len > posting_total as u64 {
+                return Err(invalid_data(format!(
+                    "corrupt ETXT bigram entry {i}: posting range {offset}+{len} \
+                     exceeds posting_total {posting_total}"
+                )));
+            }
+        }
+
+        // doc index の各エントリ: text 範囲が Text Data 内に収まるか。
+        for i in 0..doc_count as usize {
+            let base = posting_end as usize + i * DOC_ENTRY;
+            let entry = &buf[base..base + DOC_ENTRY];
+            let offset = u32::from_le_bytes(entry[8..12].try_into().unwrap()) as u64;
+            let len = u32::from_le_bytes(entry[12..16].try_into().unwrap()) as u64;
+            if offset + len > text_total as u64 {
+                return Err(invalid_data(format!(
+                    "corrupt ETXT doc entry {i}: text range {offset}+{len} \
+                     exceeds text_total {text_total}"
+                )));
+            }
+        }
+
+        Ok(Self { backing, bigram_count, posting_total, doc_count, text_total })
     }
 
     /// bigram key → posting list (entity IDs)。
@@ -258,7 +312,8 @@ impl MappedIndex {
             + posting_padding(self.bigram_count)
             + self.posting_total as usize * POSTING_ENTRY
             + self.doc_count as usize * DOC_ENTRY;
-        &buf[start..]
+        // text_total で明示的に区切る (末尾に余計なバイトがあっても晒さない)
+        &buf[start..start + self.text_total as usize]
     }
 }
 
@@ -342,4 +397,96 @@ pub fn write_to<W: Write>(
 
     w.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// 有効な index をバイト列で作る helper。
+    fn build_valid_bytes() -> Vec<u8> {
+        let mut postings: HashMap<u32, Vec<u64>> = HashMap::new();
+        postings.insert(1, vec![10, 20]);
+        postings.insert(2, vec![10]);
+        let mut originals: HashMap<u64, String> = HashMap::new();
+        originals.insert(10, "国民は法の下に平等".to_string());
+        originals.insert(20, "個人として尊重される".to_string());
+        let mut buf = Vec::new();
+        write_to(&mut buf, &postings, &originals).unwrap();
+        buf
+    }
+
+    #[test]
+    fn valid_bytes_load_and_search() {
+        let buf = build_valid_bytes();
+        let idx = MappedIndex::from_bytes(buf).unwrap();
+        assert_eq!(idx.doc_count(), 2);
+        assert_eq!(idx.get_posting(1), vec![10, 20]);
+        assert_eq!(idx.get_text(10), Some("国民は法の下に平等"));
+    }
+
+    #[test]
+    fn truncated_bytes_error_instead_of_panic() {
+        let buf = build_valid_bytes();
+        // header は無傷のまま、あらゆる長さで truncate して panic しないことを確認。
+        // (HEADER_SIZE 未満は「not an ETXT file」、それ以上は構造検証で弾かれる)
+        for cut in 0..buf.len() {
+            let truncated = buf[..cut].to_vec();
+            let err = MappedIndex::from_bytes(truncated)
+                .err()
+                .unwrap_or_else(|| panic!("truncated at {cut}/{} must not load", buf.len()));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "cut={cut}");
+        }
+    }
+
+    #[test]
+    fn truncated_file_error_instead_of_panic() {
+        // 実ファイル経由 (mmap パス) でも truncate が InvalidData になること
+        let path = std::env::temp_dir().join(format!(
+            "enchu_ngram_truncated_{}.etxt",
+            std::process::id()
+        ));
+        let buf = build_valid_bytes();
+        // Text Data の途中でちょん切る
+        std::fs::write(&path, &buf[..buf.len() - 5]).unwrap();
+        let err = MappedIndex::open(&path).err().expect("truncated file must not load");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn corrupt_bigram_offset_rejected() {
+        let mut buf = build_valid_bytes();
+        // 先頭 bigram エントリの offset (header 直後 +4) を巨大値に書き換え
+        let base = HEADER_SIZE + 4;
+        buf[base..base + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = MappedIndex::from_bytes(buf).err().expect("corrupt index must not load");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn corrupt_doc_len_rejected() {
+        let mut buf = build_valid_bytes();
+        // doc index 先頭エントリの len (eid u64 + offset u32 の後) を巨大値に書き換え
+        let bigram_count = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        let posting_total = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+        let doc_base = HEADER_SIZE
+            + bigram_count as usize * BIGRAM_ENTRY
+            + posting_padding(bigram_count)
+            + posting_total as usize * POSTING_ENTRY;
+        let len_pos = doc_base + 12;
+        buf[len_pos..len_pos + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = MappedIndex::from_bytes(buf).err().expect("corrupt index must not load");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn corrupt_header_count_rejected() {
+        let mut buf = build_valid_bytes();
+        // doc_count を巨大値に書き換え → レイアウト合計がバッファ超過
+        buf[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = MappedIndex::from_bytes(buf).err().expect("corrupt index must not load");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
 }

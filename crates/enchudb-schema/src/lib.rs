@@ -145,6 +145,10 @@ pub enum SchemaError {
     BadValue(String),
     DuplicatePk,
     Parse(String),
+    /// 0.9.0 (#73): 既存 table への再宣言が on-disk schema と矛盾する
+    /// (on-disk 列の欠落 / 型不一致 / 並べ替え / PK 不一致)。 silent に進めると
+    /// data loss になるため loud に落とす。
+    SchemaConflict(String),
     /// 内部不整合 (himo_id 解決失敗など、 通常起こらない)
     Internal(String),
 }
@@ -159,6 +163,7 @@ impl std::fmt::Display for SchemaError {
             SchemaError::BadValue(s) => write!(f, "bad value: {s}"),
             SchemaError::DuplicatePk => write!(f, "duplicate primary key"),
             SchemaError::Parse(s) => write!(f, "parse: {s}"),
+            SchemaError::SchemaConflict(s) => write!(f, "schema conflict: {s}"),
             SchemaError::Internal(s) => write!(f, "internal: {s}"),
         }
     }
@@ -174,7 +179,7 @@ struct ColumnInner {
     himo_id: u16,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RelationInner {
     from_col: String,
     to_table: String,
@@ -204,6 +209,26 @@ impl TableInner {
     fn col_or_err(&self, name: &str) -> Result<&ColumnInner, SchemaError> {
         self.col(name).ok_or_else(|| SchemaError::UnknownColumn(name.to_string()))
     }
+}
+
+/// #73: `TableInner` は `Arc` 共有の immutable snapshot なので、 schema 変更
+/// (column 追加 / PK 補完) は copy-on-write で新 Arc に差し替える。 name /
+/// table_vid は `src` から引き継ぎ、 upsert_lock は新規 (= lock 状態は引き継が
+/// ない、 migration は書き込み静止時に行う前提)。
+fn rebuild_table_inner(
+    src: &TableInner,
+    cols: Vec<ColumnInner>,
+    pk: Option<usize>,
+    relations: Vec<RelationInner>,
+) -> Arc<TableInner> {
+    Arc::new(TableInner {
+        name: src.name.clone(),
+        table_vid: src.table_vid,
+        cols,
+        pk,
+        relations,
+        upsert_lock: std::sync::Mutex::new(()),
+    })
 }
 
 /// EnchuDB 上の virtual-table database。 schema 定義 + 永続化を担う。
@@ -284,7 +309,7 @@ impl Database {
         Self::wrap_new(eng)
     }
 
-    fn wrap_new(mut eng: Engine) -> Result<Self, SchemaError> {
+    fn wrap_new(eng: Engine) -> Result<Self, SchemaError> {
         // 0.8.2: build phase の sidecar fsync を coalesce (= define_table /
         // define_himo_in が毎回呼ぶ try_persist_tables を no-op 化)。
         // finish_* / Drop で false に戻して 1 回 explicit fsync。
@@ -468,60 +493,225 @@ impl Database {
             .map(|t| Table { db: self, inner: t.clone() })
     }
 
-    /// 既存 table に column を追加。 standalone (non-concurrent) モードでのみ可能。
-    /// 同名 column が既にあれば idempotent に成功で返る。 himo を新規 define して
-    /// schema blob を書き戻すので、 以降の再 open で復元される。
+    /// 既存 table に column を追加。 同名 column が既にあれば idempotent に成功で
+    /// 返る。 himo を新規 define して schema sidecar を書き戻すので、 以降の再 open
+    /// で復元される。
     ///
-    /// 典型用途: `Database::open` で開いた直後にスキーマ差分を当てて、
-    /// `finish_with_oplog` で concurrent に flip するマイグレーション pattern。
+    /// 0.9.0 (#73): himo 定義を `Engine::ensure_himo_dynamic_in` (`&self`,
+    /// idempotent) に置き換えたので、 standalone (`Database::open`) だけでなく
+    /// concurrent (`open_with_oplog` / `finish_*` 後) の Database でも呼べる。
+    /// concurrent 側は `Arc<Database>` の単一所有時に `Arc::get_mut` 経由で
+    /// `&mut Database` を取って呼ぶ (= open 直後の migration window)。
     pub fn add_column(
         &mut self,
         table_name: &str,
         col_name: &str,
         ty: ColumnType,
     ) -> Result<(), SchemaError> {
-        if self.is_concurrent {
+        self.add_column_to_table(table_name, col_name, ty, 0, None)?;
+        self.persist_schema()?;
+        Ok(())
+    }
+
+    /// #73: 既存 table への trailing column 追加の共通本体。 `add_column` と
+    /// `TableBuilder::build` の auto-migrate の両方から呼ぶ。
+    ///
+    /// himo 定義は `Engine::ensure_himo_dynamic_in` (`&self`, `himo_def_lock` で
+    /// 直列化 + idempotent) 経由なので standalone / concurrent 両モードで動く。
+    /// Ref column (relation 付き) だけは `define_ref_in` が `&mut Engine` を
+    /// 要求するため build phase (Arc 単一所有) 限定。
+    ///
+    /// schema sidecar の persist は **しない** — caller が末尾で 1 回
+    /// `persist_schema` を呼ぶこと (N 列追加 = 1 fsync に coalesce)。
+    fn add_column_to_table(
+        &mut self,
+        table_name: &str,
+        col_name: &str,
+        ty: ColumnType,
+        cardinality: u32,
+        ref_to: Option<&str>,
+    ) -> Result<(), SchemaError> {
+        if self.eng.is_readonly() {
             return Err(SchemaError::Internal(
-                "add_column requires standalone Database — open via Database::open, not open_with_oplog".into()
+                "cannot add column on read-only Database (open_readonly)".into()
             ));
         }
         let table_inner = self.find_table_inner(table_name)
             .ok_or_else(|| SchemaError::UnknownTable(table_name.to_string()))?;
         if table_inner.col(col_name).is_some() {
-            return Ok(());
+            return Ok(()); // idempotent: 同名 column 既存
         }
-        let himo_name = format!("{}.{}", table_inner.name, col_name);
-        let eng_mut = Arc::get_mut(&mut self.eng).ok_or_else(|| {
-            SchemaError::Internal("engine Arc shared — cannot mutate".into())
-        })?;
-        eng_mut.define_himo(&himo_name, ty.himo_type(), 0);
-        let hid = eng_mut.himo_id(&himo_name)
-            .ok_or_else(|| SchemaError::Internal(format!("himo {himo_name} after define")))?;
+        validate_column_name(col_name)?;
+
+        let hid: u16 = match ref_to {
+            Some(to_table) => {
+                // relation 先 table の存在チェック (self-ref は to_table == 自分で許可)
+                if to_table != table_inner.name && self.find_table_inner(to_table).is_none() {
+                    return Err(SchemaError::UnknownTable(to_table.to_string()));
+                }
+                let to_table = to_table.to_string();
+                let table_name_owned = table_inner.name.clone();
+                let eng_mut = Arc::get_mut(&mut self.eng).ok_or_else(|| {
+                    SchemaError::Internal(
+                        "Ref column addition requires exclusive Engine access — \
+                         add ref columns on a standalone Database (build phase), \
+                         not on a shared / concurrent one".into()
+                    )
+                })?;
+                let hid = eng_mut.define_ref_in(&table_name_owned, col_name, &to_table)
+                    .map_err(|e| SchemaError::Internal(format!(
+                        "define_ref_in({table_name_owned}.{col_name} -> {to_table}) failed: {e}"
+                    )))?;
+                hid as u16
+            }
+            None => self.eng
+                .ensure_himo_dynamic_in(&table_inner.name, col_name, ty.himo_type(), cardinality)
+                .map_err(|e| SchemaError::Internal(format!(
+                    "ensure_himo_dynamic_in({}.{col_name}) failed: {e}", table_inner.name
+                )))?,
+        };
 
         let mut new_cols = table_inner.cols.clone();
         new_cols.push(ColumnInner {
             name: col_name.to_string(),
             ty,
-            himo_name,
-            himo_id: hid as u16,
+            himo_name: format!("{}.{}", table_inner.name, col_name),
+            himo_id: hid,
         });
-        let new_inner = Arc::new(TableInner {
-            name: table_inner.name.clone(),
-            table_vid: table_inner.table_vid,
-            cols: new_cols,
-            pk: table_inner.pk,
-            relations: table_inner.relations.iter().map(|r| RelationInner {
-                from_col: r.from_col.clone(),
-                to_table: r.to_table.clone(),
-            }).collect(),
-            upsert_lock: std::sync::Mutex::new(()),
-        });
+        let mut new_relations = table_inner.relations.clone();
+        if let Some(to_table) = ref_to {
+            new_relations.push(RelationInner {
+                from_col: col_name.to_string(),
+                to_table: to_table.to_string(),
+            });
+        }
+        let new_inner = rebuild_table_inner(&table_inner, new_cols, table_inner.pk, new_relations);
         let pos = self.tables.iter().position(|t| t.name.eq_ignore_ascii_case(table_name))
             .expect("table_inner found above");
         self.tables[pos] = new_inner;
-
-        self.persist_schema()?;
         Ok(())
+    }
+
+    /// #73 (G1): 既存 table への再宣言の diff 検査 + trailing auto-migrate。
+    ///
+    /// - on-disk cols が declared の **prefix** (名前 + 型が順序込み一致) なら、
+    ///   残りの trailing 新列を `add_column` 機構で自動追加する
+    /// - 完全一致 (trailing なし) なら何もせず既存 handle を返す (従来の idempotent)
+    /// - それ以外 (on-disk 列の欠落 / 型不一致 / 並べ替え / PK・relation 不一致)
+    ///   は `SchemaError::SchemaConflict` で loud に落とす — 従来はここで宣言を
+    ///   黙って捨てていて、 後続の `set("newcol", ...)` が UnknownColumn になるか
+    ///   error swallow で silent data loss になっていた
+    fn migrate_existing_table(
+        &mut self,
+        existing: Arc<TableInner>,
+        col_specs: &[(String, ColumnType, u32)],
+        pk: Option<&str>,
+        relations: &[(String, String)],
+    ) -> Result<Arc<TableInner>, SchemaError> {
+        let tname = existing.name.clone();
+
+        // 1. on-disk cols は declared の prefix でなければならない
+        if col_specs.len() < existing.cols.len() {
+            let declared: Vec<&str> = col_specs.iter().map(|(n, _, _)| n.as_str()).collect();
+            let missing: Vec<&str> = existing.cols.iter()
+                .filter(|ec| !declared.iter().any(|d| d.eq_ignore_ascii_case(&ec.name)))
+                .map(|ec| ec.name.as_str())
+                .collect();
+            return Err(SchemaError::SchemaConflict(format!(
+                "table {tname}: declaration is missing on-disk column(s) {missing:?} \
+                 (declared: {declared:?}) — re-declare all existing columns in order, \
+                 new columns must be trailing"
+            )));
+        }
+        for (i, ec) in existing.cols.iter().enumerate() {
+            let (dn, dt, _) = &col_specs[i];
+            if !dn.eq_ignore_ascii_case(&ec.name) {
+                let reordered = col_specs.iter().any(|(n, _, _)| n.eq_ignore_ascii_case(&ec.name));
+                return Err(SchemaError::SchemaConflict(if reordered {
+                    format!(
+                        "table {tname}: declared columns are reordered — on-disk column #{i} \
+                         is {:?} but declaration has {dn:?} there (existing columns must keep \
+                         their on-disk order, new columns must be trailing)",
+                        ec.name
+                    )
+                } else {
+                    format!(
+                        "table {tname}: declaration is missing on-disk column {:?} \
+                         (declaration has {dn:?} at position {i}) — re-declare all existing \
+                         columns in order",
+                        ec.name
+                    )
+                }));
+            }
+            if *dt != ec.ty {
+                return Err(SchemaError::SchemaConflict(format!(
+                    "table {tname} column {dn:?}: declared as {dt:?} but on-disk type is {:?}",
+                    ec.ty
+                )));
+            }
+        }
+
+        // 2. PK: 双方 Some で不一致は conflict。 declared None は既存維持。
+        //    既存 None + declared Some は採用 (= synthesize 復元 DB の PK 補完)。
+        let existing_pk = existing.pk.map(|i| existing.cols[i].name.clone());
+        if let (Some(p), Some(ep)) = (pk, existing_pk.as_deref()) {
+            if !p.eq_ignore_ascii_case(ep) {
+                return Err(SchemaError::SchemaConflict(format!(
+                    "table {tname}: declared primary key {p:?} but on-disk primary key is {ep:?}"
+                )));
+            }
+        }
+
+        // 3. 既存 (prefix) 列に対する relation 宣言は on-disk relation と一致必須
+        for (from, to) in relations {
+            if existing.col(from).is_none() { continue; } // trailing 新列は後段で追加
+            match existing.relations.iter().find(|r| r.from_col.eq_ignore_ascii_case(from)) {
+                Some(r) if r.to_table.eq_ignore_ascii_case(to) => {}
+                Some(r) => return Err(SchemaError::SchemaConflict(format!(
+                    "table {tname}: column {from:?} declared as ref to {to:?} but on-disk \
+                     ref targets {:?}", r.to_table
+                ))),
+                None => return Err(SchemaError::SchemaConflict(format!(
+                    "table {tname}: column {from:?} declared as ref to {to:?} but on-disk \
+                     column has no relation"
+                ))),
+            }
+        }
+
+        // 4. trailing 新列を auto-migrate (#73 の本命)。 himo は
+        //    ensure_himo_dynamic_in (&self) 経由なので concurrent でも通る。
+        let mut changed = false;
+        for (cn, ct, card) in &col_specs[existing.cols.len()..] {
+            let ref_target = relations.iter()
+                .find(|(c, _)| c.eq_ignore_ascii_case(cn))
+                .map(|(_, t)| t.as_str());
+            self.add_column_to_table(&tname, cn, *ct, *card, ref_target)?;
+            changed = true;
+        }
+
+        // 5. PK 補完 (既存 None → declared Some)。 trailing 新列を PK にも出来る。
+        if existing_pk.is_none() {
+            if let Some(p) = pk {
+                let cur = self.find_table_inner(&tname).expect("table present");
+                let idx = cur.cols.iter().position(|c| c.name.eq_ignore_ascii_case(p))
+                    .ok_or_else(|| SchemaError::UnknownColumn(p.to_string()))?;
+                if cur.pk != Some(idx) {
+                    let updated = rebuild_table_inner(
+                        &cur, cur.cols.clone(), Some(idx), cur.relations.clone(),
+                    );
+                    let pos = self.tables.iter()
+                        .position(|t| t.name.eq_ignore_ascii_case(&tname))
+                        .expect("table present");
+                    self.tables[pos] = updated;
+                    changed = true;
+                }
+            }
+        }
+
+        if changed {
+            self.persist_schema()?;
+        }
+        Ok(self.find_table_inner(&tname).expect("table present after migration"))
     }
 
     /// 全 table を列挙。
@@ -1051,16 +1241,28 @@ impl<'a> TableBuilder<'a> {
     pub fn build(self) -> Result<Table<'a>, SchemaError> {
         let TableBuilder { db, name, cols: col_specs, pk, relations, capacity: capacity_hint } = self;
 
-        // 既存 table と同名なら handle を返す (idempotent)
+        // 既存 table と同名の場合 (#73 G1):
+        // - cols 未宣言 (= handle 取得 idiom) は従来通り existing を返す
+        // - cols 宣言ありは on-disk schema との diff 検査へ。 prefix 一致 +
+        //   trailing 新列なら auto-migrate、 矛盾は SchemaConflict で loud に落とす。
+        //   従来はここで宣言を無条件に捨てていて、 新列への `set` が
+        //   UnknownColumn になるか silent data loss になっていた。
         if let Some(existing) = db.find_table_inner(&name) {
-            return Ok(Table { db, inner: existing });
+            if col_specs.is_empty() {
+                return Ok(Table { db, inner: existing });
+            }
+            let inner = db.migrate_existing_table(
+                existing, &col_specs, pk.as_deref(), &relations,
+            )?;
+            return Ok(Table { db, inner });
         }
 
         // issue #61: 名前に sidecar 区切り文字が入ると round-trip で schema が壊れる。
         // 新規 table 定義の時点で table 名 + 全 column 名を弾く。
+        // (column は #73 で `_c_` 予約 prefix 検証も追加)
         validate_schema_name("table", &name)?;
         for (col_name, _, _) in &col_specs {
-            validate_schema_name("column", col_name)?;
+            validate_column_name(col_name)?;
         }
 
         // PK 検証
@@ -1827,6 +2029,20 @@ fn validate_schema_name(kind: &str, name: &str) -> Result<(), SchemaError> {
         return Err(SchemaError::BadValue(format!(
             "{kind} name {name:?} contains reserved sequence \"->\" \
              (.schema sidecar relation delimiter)"
+        )));
+    }
+    Ok(())
+}
+
+/// column 名の追加検証。 `validate_schema_name` (sidecar 区切り文字) に加えて、
+/// 0.9.0 で engine の content 互換 layer が `_c_{key}` himo 名を予約したため
+/// (`Engine::content` 参照)、 `_c_` prefix の user column を schema 層で弾く。
+fn validate_column_name(name: &str) -> Result<(), SchemaError> {
+    validate_schema_name("column", name)?;
+    if name.starts_with("_c_") {
+        return Err(SchemaError::BadValue(format!(
+            "column name {name:?} uses reserved prefix \"_c_\" \
+             (engine content compat layer himo namespace, 0.9.0)"
         )));
     }
     Ok(())

@@ -229,10 +229,62 @@ fn persistence_roundtrip() {
         .max_entities(100)
         .build()
         .unwrap();
-    // BM25 は揮発なので再構築しないと search はマッチしないが、
     // ベクトルとメタは永続化されている
     let q = embedder.embed("persisted text");
     let hits = store.search(Query::new(&q).top_k(5)).unwrap();
     assert!(!hits.is_empty());
     assert_eq!(hits[0].text.as_deref(), Some("persisted text"));
+}
+
+#[test]
+fn bm25_rebuilt_on_reopen() {
+    let path = tmp_path("bm25-reopen");
+    let embedder = HashEmbedder::new(16);
+
+    // 書き込み → flush → drop
+    {
+        let mut store = RagStore::builder()
+            .path(&path)
+            .dim(16)
+            .meta_symbol("lang")
+            .max_entities(100)
+            .build()
+            .unwrap();
+        store.insert(Chunk {
+            text: "enchudb himo database engine".into(),
+            vector: embedder.embed("enchudb himo database engine"),
+            meta: Meta::new().symbol("lang", "en"),
+        }).unwrap();
+        store.insert(Chunk {
+            text: "the quick brown fox".into(),
+            vector: embedder.embed("the quick brown fox"),
+            meta: Meta::new().symbol("lang", "en"),
+        }).unwrap();
+        store.flush().unwrap();
+    }
+
+    // 再 open: BM25 が保存済みテキストから自動再構築されている
+    let store = RagStore::builder()
+        .path(&path)
+        .dim(16)
+        .meta_symbol("lang")
+        .max_entities(100)
+        .build()
+        .unwrap();
+    assert_eq!(store.bm25().num_docs(), 2, "BM25 が reopen 後に再構築されていない");
+
+    // BM25 単体: "himo" は 1 doc だけにヒット
+    let bm25_hits = store.bm25().search("himo", None);
+    assert_eq!(bm25_hits.len(), 1);
+
+    // hybrid_search がベクトルオンリーに劣化していないこと:
+    // わざと無関係なクエリベクトルを渡し、テキスト側 ("himo") が効いて
+    // 該当 chunk が返ることを確認する
+    let q = embedder.embed("completely unrelated query");
+    let hits = store.hybrid_search(HybridQuery::new(&q, "himo").top_k(1)).unwrap();
+    assert!(!hits.is_empty());
+    assert!(
+        hits[0].text.as_deref() == Some("enchudb himo database engine"),
+        "hybrid_search が BM25 シグナルを使っていない: {:?}", hits[0].text,
+    );
 }

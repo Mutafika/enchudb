@@ -5,7 +5,8 @@
 //! - インデックスは**揮発インメモリ**。enchudb のメタ紐ではなくハッシュマップ。
 //!   理由: BM25 は tf/df/長さ統計を頻繁に参照する。全部紐に持たせると rebuild コストが
 //!   メリットを食う。20 万 chunk くらいまでは全部オンメモリで十分。
-//! - `add_document(eid, text)` で差分追加。`rebuild_from_store()` で一括構築。
+//! - `add_document(eid, text)` で差分追加。一括再構築は `RagStore::rebuild_bm25()`
+//!   (既存ストアを開いたとき builder が自動で呼ぶ)。
 //! - トークナイザは空白 + 基本的な句読点分割。日本語は形態素解析しない（MeCab 呼ぶなら自前で）。
 //!
 //! # ハイブリッド: RRF (Reciprocal Rank Fusion)

@@ -136,10 +136,12 @@ fn serialize_tables(tables: &[TableDef]) -> Vec<u8> {
         out.extend_from_slice(&t.eid_range_lo.to_le_bytes());
         out.extend_from_slice(&t.eid_range_hi.to_le_bytes());
         out.extend_from_slice(&t.next_local.load(std::sync::atomic::Ordering::Relaxed).to_le_bytes());
-        out.extend_from_slice(&(t.himo_ids.len() as u32).to_le_bytes());
-        for &h in &t.himo_ids {
+        let himo_ids = t.himo_ids.read().unwrap();
+        out.extend_from_slice(&(himo_ids.len() as u32).to_le_bytes());
+        for &h in himo_ids.iter() {
             out.extend_from_slice(&h.to_le_bytes());
         }
+        drop(himo_ids);
         out.extend_from_slice(&(t.fk_refs.len() as u32).to_le_bytes());
         for &(hid, tid) in &t.fk_refs {
             out.extend_from_slice(&hid.to_le_bytes());
@@ -202,7 +204,7 @@ fn deserialize_tables(buf: &[u8]) -> Result<Vec<TableDef>, String> {
         }
         tables.push(TableDef {
             name,
-            himo_ids,
+            himo_ids: std::sync::RwLock::new(himo_ids),
             eid_range_lo,
             eid_range_hi,
             fk_refs,
@@ -423,16 +425,26 @@ fn writer_lock_path_for(path: &str) -> std::path::PathBuf {
 
 /// `oplog_record_queue` (= bounded ArrayQueue) への blocking push。
 /// queue 満杯時は `yield_now` で consumer の進捗を待つ (issue4 backpressure)。
+/// #77-M2: consumer 死亡 (poisoned) 時は無限待ちせず panic で失敗する。
+/// push 成功時に `wal_push_count` を進める (flush_writes の WAL barrier 用)。
 #[inline]
 fn push_oplog_record_blocking(
     wq: &crossbeam_queue::ArrayQueue<enchudb_oplog::oplog::OwnedOp>,
     rec: enchudb_oplog::oplog::OwnedOp,
+    poisoned: &std::sync::atomic::AtomicBool,
+    wal_push_count: &std::sync::atomic::AtomicU64,
 ) {
     let mut rec = rec;
     loop {
         match wq.push(rec) {
-            Ok(()) => return,
+            Ok(()) => {
+                wal_push_count.fetch_add(1, std::sync::atomic::Ordering::Release);
+                return;
+            }
             Err(returned) => {
+                if poisoned.load(std::sync::atomic::Ordering::Acquire) {
+                    panic!("enchudb consumer thread has panicked — WAL record queue is dead (#77-M2)");
+                }
                 rec = returned;
                 std::thread::yield_now();
             }
@@ -512,6 +524,51 @@ fn acquire_writer_lock(path: &str) -> io::Result<WriterLock> {
         return Err(err);
     }
     Ok(WriterLock { _file: f, key })
+}
+
+/// 0.9.0 (H11): create 系 API の既存ファイルガード。
+/// 旧実装は `create(true).truncate(true)` で **既存 DB を無警告で 0 バイトに破壊**
+/// していた (typo った path を create しただけで全損)。 FFI 契約
+/// (`enchudb_create`: 「既存ファイルがあると Engine 側でエラー」) 通り、
+/// 存在する path への create は `AlreadyExists` で拒否する。
+/// 既存 DB を開くなら `Engine::open*`、 作り直すなら caller が明示的に削除すること。
+#[cfg(not(target_arch = "wasm32"))]
+fn ensure_create_target_absent(path: &str) -> io::Result<()> {
+    if std::path::Path::new(path).exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "database file already exists: \"{path}\" — refusing to overwrite. \
+                 use Engine::open* to open the existing DB, or remove the file first"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// H11: 新規 DB ファイルを `create_new` (= O_EXCL) で開く。
+/// `ensure_create_target_absent` の存在チェック〜open の間に他 process が
+/// 同 path を作った TOCTOU race も OS レベルで `AlreadyExists` になる。
+#[cfg(not(target_arch = "wasm32"))]
+fn open_new_db_file(path: &str) -> io::Result<std::fs::File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "database file already exists: \"{path}\" — refusing to overwrite \
+                         (created concurrently?)"
+                    ),
+                )
+            } else {
+                e
+            }
+        })
 }
 
 /// `snapshot_export` の結果。どのファイルを書き出したか。
@@ -613,6 +670,41 @@ impl Backing {
         }
     }
 
+    /// 0.9.0 himo dynamic definition: `&self` 版 `as_mut_ptr`。
+    /// `ensure_himo_dynamic` が Arc<Engine> 越しに新規 himo の column region を
+    /// 作るために使う。 header_mut と同じ前提 (定義は himo_def_lock で直列化、
+    /// 未公開 slot 領域にしか触れない)。
+    fn base_ptr_shared(&self) -> *mut u8 {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Backing::Mmap(m) => m.as_ptr() as *mut u8,
+            #[cfg(not(target_arch = "wasm32"))]
+            Backing::Growable(g) => g.base(),
+            Backing::Memory(v) => v.as_ptr() as *mut u8,
+        }
+    }
+
+    /// 0.9.0 himo dynamic definition: `&self` 版 `as_slice_mut`。
+    /// header の himo_types / max_values / himo_count / CRC を `&self` から
+    /// 更新するために使う。 これらの byte は himo_def_lock 下でしか書かれず、
+    /// reader は runtime にこの領域を読まない (open 時のみ) 前提。
+    #[allow(clippy::mut_from_ref)]
+    fn slice_mut_shared(&self) -> &mut [u8] {
+        unsafe {
+            match self {
+                #[cfg(not(target_arch = "wasm32"))]
+                Backing::Mmap(m) => {
+                    std::slice::from_raw_parts_mut(m.as_ptr() as *mut u8, m.len())
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                Backing::Growable(g) => std::slice::from_raw_parts_mut(g.base(), g.committed()),
+                Backing::Memory(v) => {
+                    std::slice::from_raw_parts_mut(v.as_ptr() as *mut u8, v.len())
+                }
+            }
+        }
+    }
+
     /// v32: &self 経由で header 領域に unsafe で書き込む。
     /// mmap 経由の並行書き込みは atomic スライス更新でガードされる前提。
     #[allow(clippy::mut_from_ref)]
@@ -637,6 +729,7 @@ impl Backing {
         }
     }
 }
+use crate::append_vec::AppendVec;
 use crate::vocabulary::Vocabulary;
 use crate::entity_set::EntitySet;
 use crate::himo_store::{HimoStore, HimoType};
@@ -789,6 +882,65 @@ fn verify_header_crc(buf: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// 0.9.0 (L1): header field の自己整合チェック。
+/// `verify_header_crc` は stored CRC == 0 (v27 以前の legacy DB) を素通しするため、
+/// 破損した himo_count / *_size / *_cap がそのまま layout 計算へ流れて panic /
+/// OOB region を起こし得た。 ここで「header 自身の field 同士の関係」だけを検証
+/// する (新しい定数上限は導入しない → 既存の正常 DB を誤って弾かない)。
+fn sanity_check_header_fields(
+    max_himos: u32, himo_count: u32,
+    vocab_max_entries: u32, vocab_index_cap: u32, vocab_data_size: usize,
+    himoreg_max_entries: u32, himoreg_index_cap: u32, himoreg_data_size: usize,
+    content_data_size: usize,
+) -> Result<(), String> {
+    if himo_count > max_himos {
+        return Err(format!(
+            "himo_count {} exceeds max_himos {} — corrupt header", himo_count, max_himos,
+        ));
+    }
+    // data_end は mmap 上の AtomicU32 (#77)。 u32::MAX 超は create 時点で拒否
+    // されるので、 header にあれば破損。
+    for (name, size) in [
+        ("vocab_data_size", vocab_data_size),
+        ("himoreg_data_size", himoreg_data_size),
+        ("content_data_size", content_data_size),
+    ] {
+        if size > u32::MAX as usize {
+            return Err(format!(
+                "{} {} exceeds format limit {} (u32 data_end) — corrupt header",
+                name, size, u32::MAX,
+            ));
+        }
+    }
+    // vocab / himoreg の index は cap-1 を hash mask に使う線形 probe
+    // (Vocabulary::lookup)。 cap == 0 は即 OOB / 除算相当、 非 2^n は probe が
+    // 全 slot を巡回できず無限 loop。 cap < max_entries は index が先に満杯に
+    // なり insert が無限 probe。 create 経路は必ず next_power_of_two(>= entries)
+    // で焼くので、 これらを満たさない header は破損。
+    for (name, max_entries, index_cap) in [
+        ("vocab", vocab_max_entries, vocab_index_cap),
+        ("himoreg", himoreg_max_entries, himoreg_index_cap),
+    ] {
+        if max_entries == 0 || index_cap == 0 {
+            return Err(format!(
+                "{} max_entries {} / index_cap {} must be nonzero — corrupt header",
+                name, max_entries, index_cap,
+            ));
+        }
+        if !index_cap.is_power_of_two() {
+            return Err(format!(
+                "{} index_cap {} is not a power of two — corrupt header", name, index_cap,
+            ));
+        }
+        if index_cap < max_entries {
+            return Err(format!(
+                "{} index_cap {} < max_entries {} — corrupt header", name, index_cap, max_entries,
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn himo_maxv_base(max_himos: u32) -> usize {
     (H_HIMO_TYPES + max_himos as usize + 3) & !3
 }
@@ -852,6 +1004,20 @@ impl Layout {
         let content_data_size = content_data_size.unwrap_or_else(ContentStore::data_region_size);
         let cyl_max_values = cyl_max_values.unwrap_or(DEFAULT_CYL_MAX_VALUES);
 
+        // #77: data_end (vocab / content) は mmap 上の AtomicU32 で、 index の
+        // offset/len も u32。 4 GiB 超の data region を許すと append offset が
+        // wrap して先頭から silent 上書きするため、 create 時点で拒否する。
+        assert!(
+            vocab_data_size <= u32::MAX as usize,
+            "vocab_data_size {} exceeds format limit {} (u32 data_end)",
+            vocab_data_size, u32::MAX,
+        );
+        assert!(
+            content_data_size <= u32::MAX as usize,
+            "content_data_size {} exceeds format limit {} (u32 data_end)",
+            content_data_size, u32::MAX,
+        );
+
         Self::from_params(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
@@ -866,6 +1032,39 @@ impl Layout {
         himoreg_max_entries: u32, himoreg_index_cap: u32, himoreg_data_size: usize,
         content_data_size: usize, cyl_max_values: u32,
     ) -> Self {
+        // create 経路 (= プログラム引数由来の params) 用。 open 経路 (= disk header
+        // 由来の params) は `try_from_params` を使い、 破損 header を InvalidData に
+        // 落とすこと (0.9.0 L1)。
+        Self::try_from_params(
+            max_entities, max_himos,
+            vocab_max_entries, vocab_index_cap, vocab_data_size,
+            himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
+            content_data_size, cyl_max_values,
+        )
+        .expect("layout size overflow — parameters too large")
+    }
+
+    /// 0.9.0 (L1): checked arithmetic 版。 header CRC==0 の legacy DB では
+    /// 破損した size field がそのまま流れ込むため、 usize wrap で過小な
+    /// total_size を計算 → OOB region を map する事故を Err で防ぐ。
+    fn try_from_params(
+        max_entities: u32, max_himos: u32,
+        vocab_max_entries: u32, vocab_index_cap: u32, vocab_data_size: usize,
+        himoreg_max_entries: u32, himoreg_index_cap: u32, himoreg_data_size: usize,
+        content_data_size: usize, cyl_max_values: u32,
+    ) -> Result<Self, String> {
+        // EntitySet::region_size 内部の `(max_entities + 7)` が u32 で wrap しない
+        // ガード。 この値の DB は create 時点で作れない (debug では overflow panic)。
+        if max_entities > u32::MAX - 7 {
+            return Err(format!(
+                "max_entities {} exceeds format limit — corrupt header?", max_entities,
+            ));
+        }
+        let ck_add = |a: usize, b: usize| -> Result<usize, String> {
+            a.checked_add(b)
+                .ok_or_else(|| "layout total_size overflow — corrupt header fields?".to_string())
+        };
+
         // v3 layout: 固定上限の region 群を前に、 append-only な
         // variable region 群 (vocab_data / himoreg_data / content_data)
         // を末尾に集める。 これで「ファイル末尾のみ伸びる」 monotonic
@@ -876,49 +1075,52 @@ impl Layout {
         // ── 固定 cluster: 上限が max_entities / max_himos / *_cap で決まる ──
         let entities_off = off;
         let entities_size = align8(EntitySet::region_size(max_entities));
-        off += entities_size;
+        off = ck_add(off, entities_size)?;
 
         let vocab_offsets_off = off;
         let vocab_offsets_size = align8(Vocabulary::offsets_region_size(vocab_max_entries));
-        off += vocab_offsets_size;
+        off = ck_add(off, vocab_offsets_size)?;
 
         let vocab_index_off = off;
         let vocab_index_size = align8(Vocabulary::index_region_size(vocab_index_cap));
-        off += vocab_index_size;
+        off = ck_add(off, vocab_index_size)?;
 
         let himoreg_offsets_off = off;
         let himoreg_offsets_size = align8(Vocabulary::offsets_region_size(himoreg_max_entries));
-        off += himoreg_offsets_size;
+        off = ck_add(off, himoreg_offsets_size)?;
 
         let himoreg_index_off = off;
         let himoreg_index_size = align8(Vocabulary::index_region_size(himoreg_index_cap));
-        off += himoreg_index_size;
+        off = ck_add(off, himoreg_index_size)?;
 
         let content_index_off = off;
         let content_index_size = align8(ContentStore::index_region_size_for(max_entities));
-        off += content_index_size;
+        off = ck_add(off, content_index_size)?;
 
         let himo_col_size = align8(Column::region_size(max_entities, 4));
         let himo_cyl_size = 0usize;
         let himo_slot_size = himo_col_size;
 
         let himo_base_off = off;
-        off += himo_slot_size * (max_himos as usize);
+        let himo_total = himo_slot_size
+            .checked_mul(max_himos as usize)
+            .ok_or_else(|| "layout himo region overflow — corrupt header fields?".to_string())?;
+        off = ck_add(off, himo_total)?;
 
         // ── Variable cluster (tail): append-only で伸びる region 群 ──
         let vocab_data_off = off;
         let vocab_data_size = align8(Vocabulary::data_region_size(vocab_data_size));
-        off += vocab_data_size;
+        off = ck_add(off, vocab_data_size)?;
 
         let himoreg_data_off = off;
         let himoreg_data_size = align8(Vocabulary::data_region_size(himoreg_data_size));
-        off += himoreg_data_size;
+        off = ck_add(off, himoreg_data_size)?;
 
         let content_data_off = off;
         let content_data_size = align8(content_data_size);
-        off += content_data_size;
+        off = ck_add(off, content_data_size)?;
 
-        Layout {
+        Ok(Layout {
             entities_off, entities_size,
             vocab_data_off, vocab_data_size,
             vocab_offsets_off, vocab_offsets_size,
@@ -933,7 +1135,7 @@ impl Layout {
             himo_base_off, himo_col_size, himo_cyl_size, himo_slot_size,
             cyl_max_values,
             total_size: off,
-        }
+        })
     }
 
     fn himo_col_off(&self, hid: usize) -> usize {
@@ -984,7 +1186,9 @@ pub(crate) struct TableDef {
     /// table 名 (anonymous は ""、 user 定義 table は固有名)。
     pub name: String,
     /// この table の column 軸を成す himo の id 列 (engine.himos の index)。
-    pub himo_ids: Vec<u32>,
+    /// 0.9.0: `&self` の himo 定義 (`ensure_himo_dynamic_in`) が attach できる
+    /// よう RwLock 化。 write は himo_def_lock 下でのみ発生する低頻度 path。
+    pub himo_ids: std::sync::RwLock<Vec<u32>>,
     /// この table が占有する eid 範囲の下限 (inclusive)。
     pub eid_range_lo: u32,
     /// 上限 (exclusive)。 `u32::MAX` は open-ended (= まだ後続 table が
@@ -1020,7 +1224,7 @@ impl Clone for TableDef {
     fn clone(&self) -> Self {
         Self {
             name: self.name.clone(),
-            himo_ids: self.himo_ids.clone(),
+            himo_ids: std::sync::RwLock::new(self.himo_ids.read().unwrap().clone()),
             eid_range_lo: self.eid_range_lo,
             eid_range_hi: self.eid_range_hi,
             fk_refs: self.fk_refs.clone(),
@@ -1045,7 +1249,7 @@ impl TableDef {
     pub fn anonymous() -> Self {
         Self {
             name: String::new(),
-            himo_ids: Vec::new(),
+            himo_ids: std::sync::RwLock::new(Vec::new()),
             eid_range_lo: 0,
             eid_range_hi: u32::MAX,
             fk_refs: Vec::new(),
@@ -1086,17 +1290,28 @@ pub struct Engine {
     max_himos: u32,
     vocab: Vocabulary,
     himo_reg: Vocabulary,
-    himo_names: Vec<String>,
-    himo_types: Vec<HimoType>,
-    himo_max_values: Vec<u32>,
-    himos: Vec<HimoStore>,
+    // 0.9.0 himo dynamic definition: himo の並列配列は AppendVec (固定 capacity
+    // + append-only + lock-free read) 化して `&self` から定義追加できるように
+    // した (design a: pre-sized slots + atomic len publish)。 reader の hot path
+    // (`self.himos[hid]` 等の indexed read) は lock を取らない。
+    // 定義追加は `himo_def_lock` で直列化される。
+    himo_names: AppendVec<String>,
+    himo_types: AppendVec<HimoType>,
+    himo_max_values: AppendVec<u32>,
+    himos: AppendVec<HimoStore>,
     /// β-light step 2: engine が認知する table 一覧。 index 0 は常に
     /// anonymous table (旧 API は全部ここに dispatch)。 step 3+ で
     /// define_table 時に push される。
     tables: Vec<TableDef>,
     /// β-light step 2: himo_id → 所属 table_id の逆引き (himos と同じ index)。
     /// 旧 API (`define_himo`) で追加された himo は全部 ANONYMOUS_TABLE。
-    himo_to_table: Vec<TableId>,
+    /// 0.9.0: `&self` の define_himo_in 相当 (`ensure_himo_dynamic_in`) が
+    /// attach 先を後書きできるよう要素を AtomicU16 (= TableId) にした。
+    himo_to_table: AppendVec<std::sync::atomic::AtomicU16>,
+    /// 0.9.0: himo 定義 (`ensure_himo_dynamic` 系) の直列化 lock。
+    /// 並列配列 5 本 + tables[].himo_ids + header write を 1 定義単位で
+    /// atomic に見せる。 read path はこの lock を取らない。
+    himo_def_lock: std::sync::Mutex<()>,
     entities: EntitySet,
     contents: ContentStore,
     /// 非同期書き込みキュー。`create_concurrent` で有効化される。
@@ -1117,6 +1332,23 @@ pub struct Engine {
     /// owned record を push。 consumer thread が drain して `wal.append_many` で
     /// 1 flock サイクル N records にまとめる (per-record flock コスト償却)。
     oplog_record_queue: Option<std::sync::Arc<crossbeam_queue::ArrayQueue<enchudb_oplog::oplog::OwnedOp>>>,
+    /// writer が `oplog_record_queue` へ push した WAL record の累積件数。
+    /// op は queue 先行・record 後追い (#77-H4) なので、 apply_count barrier
+    /// だけでは「op は適用済みだが record は未 append」の窓が残る。
+    /// `flush_writes` はこの counter 対でも待つ (下の wal_append_count 参照)。
+    wal_push_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// consumer が WAL へ append し終えた record の累積件数。
+    /// wal_append_count >= wal_push_count が「queue に record が残っていない」
+    /// 同期点 — これが無いと `oplog_sync` が record より先に Commit を打ち、
+    /// fsync 済みのはずの write が crash で消える。
+    wal_append_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// #77-M2: consumer thread が panic すると true。 flush_writes / Drop の
+    /// barrier spin と producer の blocking push が「絶対に進まない待ち」に
+    /// 陥らないための脱出フラグ。
+    consumer_poisoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// #76: レプリカ (translated foreign entity) への write-back を bridge から
+    /// 除外した際の一度きり警告フラグ。
+    warned_replica_writeback: std::sync::atomic::AtomicBool,
     /// 背景 fsync が最後に completed した LSN。
     durable_lsn: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// v32: この Engine を所有する peer の id。分散時 eid の上位 32bit。
@@ -1251,11 +1483,12 @@ impl Engine {
                 std::fs::create_dir_all(parent)?;
             }
         }
+        // H11: 既存 DB を silent truncate で破壊しない (lock 取得前に判定 —
+        // 既存 DB を別 process の writer が掴んでいる場合の flock block も回避)。
+        ensure_create_target_absent(path)?;
         // writer lock を先に取る (= 他 writer が居れば block)。 create も書き込みなので必須。
         let writer_lock = acquire_writer_lock(path)?;
-        let file = OpenOptions::new()
-            .read(true).write(true).create(true).truncate(true)
-            .open(path)?;
+        let file = open_new_db_file(path)?;
         file.set_len(layout.total_size as u64)?;
 
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
@@ -1303,18 +1536,24 @@ impl Engine {
         Ok(Self {
             path: path.to_string(), layout, max_entities, max_himos,
             vocab, himo_reg,
-            himo_names: Vec::new(),
-            himo_types: Vec::new(), himo_max_values: Vec::new(),
-            himos: Vec::new(), entities, contents,
+            himo_names: AppendVec::with_capacity(max_himos as usize),
+            himo_types: AppendVec::with_capacity(max_himos as usize),
+            himo_max_values: AppendVec::with_capacity(max_himos as usize),
+            himos: AppendVec::with_capacity(max_himos as usize), entities, contents,
             tables: vec![TableDef::anonymous()],
-            himo_to_table: Vec::new(),
+            himo_to_table: AppendVec::with_capacity(max_himos as usize),
+            himo_def_lock: std::sync::Mutex::new(()),
             write_queue: None,
             shutdown_flag: None,
             consumer_handle: std::sync::Mutex::new(None),
             push_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             apply_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            wal_push_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            wal_append_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             oplog: None,
             oplog_record_queue: None,
+            consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            warned_replica_writeback: std::sync::atomic::AtomicBool::new(false),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -1429,14 +1668,11 @@ impl Engine {
                 std::fs::create_dir_all(parent)?;
             }
         }
+        // H11: 既存 DB を silent truncate で破壊しない (create_full_with_cyl と同じガード)
+        ensure_create_target_absent(path)?;
         // writer lock を先に取る (= 他 writer が居れば block)
         let writer_lock = acquire_writer_lock(path)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
+        let file = open_new_db_file(path)?;
 
         // Phase B Step 3: initial_commit は variable cluster の手前 (=
         // 末尾の vocab_data の開始 offset) で打ち切る。 fixed cluster
@@ -1548,21 +1784,26 @@ impl Engine {
             max_himos,
             vocab,
             himo_reg,
-            himo_names: Vec::new(),
-            himo_types: Vec::new(),
-            himo_max_values: Vec::new(),
-            himos: Vec::new(),
+            himo_names: AppendVec::with_capacity(max_himos as usize),
+            himo_types: AppendVec::with_capacity(max_himos as usize),
+            himo_max_values: AppendVec::with_capacity(max_himos as usize),
+            himos: AppendVec::with_capacity(max_himos as usize),
             entities,
             contents,
             tables: vec![TableDef::anonymous()],
-            himo_to_table: Vec::new(),
+            himo_to_table: AppendVec::with_capacity(max_himos as usize),
+            himo_def_lock: std::sync::Mutex::new(()),
             write_queue: None,
             shutdown_flag: None,
             consumer_handle: std::sync::Mutex::new(None),
             push_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             apply_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            wal_push_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            wal_append_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             oplog: None,
             oplog_record_queue: None,
+            consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            warned_replica_writeback: std::sync::atomic::AtomicBool::new(false),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -1605,7 +1846,7 @@ impl Engine {
     /// 用途: GUI の表示専用 process、 監視ツール、 backup-reader 等。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_readonly(path: &str) -> io::Result<Self> {
-        let mut eng = Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ false, /*readonly=*/ true)?;
+        let eng = Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ false, /*readonly=*/ true)?;
         eng.is_readonly.store(true, std::sync::atomic::Ordering::Release);
         Ok(eng)
     }
@@ -1813,6 +2054,7 @@ impl Engine {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let max_entities = u32::from_le_bytes(buf[H_MAX_ENTITIES..H_MAX_ENTITIES + 4].try_into().unwrap());
         let max_himos = u32::from_le_bytes(buf[H_MAX_HIMOS..H_MAX_HIMOS + 4].try_into().unwrap());
+        let himo_count = u32::from_le_bytes(buf[H_HIMO_COUNT..H_HIMO_COUNT + 4].try_into().unwrap());
         let vocab_max_entries = u32::from_le_bytes(buf[H_VOCAB_MAX_ENTRIES..H_VOCAB_MAX_ENTRIES + 4].try_into().unwrap());
         let vocab_index_cap = u32::from_le_bytes(buf[H_VOCAB_INDEX_CAP..H_VOCAB_INDEX_CAP + 4].try_into().unwrap());
         let vocab_data_size = u64::from_le_bytes(buf[H_VOCAB_DATA_SIZE..H_VOCAB_DATA_SIZE + 8].try_into().unwrap()) as usize;
@@ -1822,12 +2064,23 @@ impl Engine {
         let content_data_size = u64::from_le_bytes(buf[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].try_into().unwrap()) as usize;
         let cyl_max_values = u32::from_le_bytes(buf[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].try_into().unwrap());
 
-        let layout = Layout::from_params(
+        // 0.9.0 (L1): CRC == 0 の legacy header は verify_header_crc を素通しする
+        // ため、 field の自己整合を明示チェック (破損値 → panic/OOB の前に InvalidData)。
+        sanity_check_header_fields(
+            max_himos, himo_count,
+            vocab_max_entries, vocab_index_cap, vocab_data_size,
+            himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
+            content_data_size,
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let layout = Layout::try_from_params(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, cyl_max_values,
-        );
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // Phase B 以降: backing_kind フラグで「growable 由来で file_size <
         // total_size が正常」 か 「eager 由来で file_size 不足は truncation」 か
@@ -1898,12 +2151,26 @@ impl Engine {
         let content_data_size = u64::from_le_bytes(buf[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].try_into().unwrap()) as usize;
         let cyl_max_values = u32::from_le_bytes(buf[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].try_into().unwrap());
 
-        let layout = Layout::from_params(
+        // 0.9.0 (L1): checked arithmetic 版で layout を計算 (破損 header の usize
+        // wrap → 過小 total_size → OOB region を防ぐ)。 file 経路は open_internal →
+        // validate_file_size で field sanity 済み、 Memory 経路 (from_bytes) は
+        // ここが最初の防壁。
+        let layout = Layout::try_from_params(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, cyl_max_values,
-        );
+        )?;
+
+        // backing が layout 全域をカバーしているか (Memory 経路の truncated bytes
+        // で Region が OOB を map する事故を防ぐ。 file 経路は validate_file_size
+        // が既に同等チェック + growable の set_len 拡張を済ませている)。
+        if buf.len() < layout.total_size {
+            return Err(format!(
+                "backing too small: {} bytes (layout.total_size = {}) — truncated file?",
+                buf.len(), layout.total_size,
+            ));
+        }
 
         let maxv_base = himo_maxv_base(max_himos);
         let mut type_bytes = Vec::with_capacity(himo_count as usize);
@@ -1933,7 +2200,7 @@ impl Engine {
         };
         let mut t = Instant::now();
         let mut p = pr();
-        let mut report = |label: &str, t: &mut Instant, p: &mut u64| {
+        let report = |label: &str, t: &mut Instant, p: &mut u64| {
             if profile {
                 let np = pr();
                 let dp = np - *p;
@@ -1952,12 +2219,14 @@ impl Engine {
             unsafe { Region::new(base.add(layout.vocab_data_off), layout.vocab_data_size) },
             unsafe { Region::new(base.add(layout.vocab_offsets_off), layout.vocab_offsets_size) },
             unsafe { Region::new(base.add(layout.vocab_index_off), layout.vocab_index_size) },
+            readonly, // #77-H1: readonly は共有 index を書き換えず shadow へ rebuild
         );
         report("Vocabulary::load", &mut t, &mut p);
         let himo_reg = Vocabulary::load(
             unsafe { Region::new(base.add(layout.himoreg_data_off), layout.himoreg_data_size) },
             unsafe { Region::new(base.add(layout.himoreg_offsets_off), layout.himoreg_offsets_size) },
             unsafe { Region::new(base.add(layout.himoreg_index_off), layout.himoreg_index_size) },
+            readonly,
         );
         report("himo_reg(Vocabulary)", &mut t, &mut p);
         let contents = ContentStore::load(
@@ -1966,10 +2235,13 @@ impl Engine {
         );
         report("ContentStore::load", &mut t, &mut p);
 
-        let mut himo_names = Vec::new();
-        let mut himo_types = Vec::new();
-        let mut himo_max_values = Vec::new();
-        let mut himos = Vec::new();
+        // 0.9.0: capacity は max_himos だが、 header の himo_count が万一それを
+        // 超えていても load 自体は落とさない (旧 Vec 実装と同じ寛容さ)。
+        let himo_cap = (max_himos as usize).max(himo_count as usize);
+        let himo_names: AppendVec<String> = AppendVec::with_capacity(himo_cap);
+        let himo_types: AppendVec<HimoType> = AppendVec::with_capacity(himo_cap);
+        let himo_max_values: AppendVec<u32> = AppendVec::with_capacity(himo_cap);
+        let himos: AppendVec<HimoStore> = AppendVec::with_capacity(himo_cap);
 
         for hid in 0..himo_count as usize {
             let ht = HimoType::from_byte(type_bytes[hid]);
@@ -1983,10 +2255,10 @@ impl Engine {
                 ht, effective_mv,
             );
 
-            himo_names.push(name);
-            himo_types.push(ht);
-            himo_max_values.push(mv);
-            himos.push(hs);
+            let _ = himo_names.push(name);
+            let _ = himo_types.push(ht);
+            let _ = himo_max_values.push(mv);
+            let _ = himos.push(hs);
         }
         report("HimoStore::load × N", &mut t, &mut p);
 
@@ -1994,26 +2266,35 @@ impl Engine {
         // step 3+ で v5 DB の table descriptor 読み出しに置き換える、 v4 DB は
         // 引き続きこの compat 経路で anonymous-only として open される。
         let initial_tables = vec![{
-            let mut anon = TableDef::anonymous();
-            anon.himo_ids = (0..himos.len() as u32).collect();
+            let anon = TableDef::anonymous();
+            *anon.himo_ids.write().unwrap() = (0..himos.len() as u32).collect();
             anon
         }];
-        let initial_himo_to_table = vec![ANONYMOUS_TABLE; himos.len()];
+        let initial_himo_to_table: AppendVec<std::sync::atomic::AtomicU16> =
+            AppendVec::with_capacity(himo_cap);
+        for _ in 0..himos.len() {
+            let _ = initial_himo_to_table.push(std::sync::atomic::AtomicU16::new(ANONYMOUS_TABLE));
+        }
 
-        let mut eng = Self {
+        let eng = Self {
             path: String::new(), layout, max_entities, max_himos,
             vocab, himo_reg,
             himo_names, himo_types, himo_max_values,
             himos, entities, contents,
             tables: initial_tables,
             himo_to_table: initial_himo_to_table,
+            himo_def_lock: std::sync::Mutex::new(()),
             write_queue: None,
             shutdown_flag: None,
             consumer_handle: std::sync::Mutex::new(None),
             push_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             apply_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            wal_push_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            wal_append_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             oplog: None,
             oplog_record_queue: None,
+            consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            warned_replica_writeback: std::sync::atomic::AtomicBool::new(false),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -2192,7 +2473,45 @@ impl Engine {
             self.define_himo_in("_sync_peers", "last_seen_at", HimoType::Number, 0)?;
         }
 
+        // #77-H6: 既存 DB の再 enable (reopen 経路) では、 body に残る過去 rows /
+        // watermark から lsn 採番を復元する。
+        self.rehydrate_next_sync_lsn();
+
         Ok(())
+    }
+
+    /// #77-H6: `next_sync_lsn` を既存 `_sync_ops` rows と `_sync_peers.consumed_lsn`
+    /// から復元する。 全 constructor が 1 固定で初期化するため、 reopen 後にこれを
+    /// 呼ばないと lsn 採番が 1 に戻り、 peer の ack 済み watermark より小さい lsn
+    /// が発行されて `pending_sync_ops(since)` が永久に空 = **再起動後の全 write が
+    /// 既存 peer に配信されない** silent loss になっていた。
+    fn rehydrate_next_sync_lsn(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.sync_tables_enabled() { return; }
+        let mut max_lsn = 0u32;
+        if let Some(lsn_hid) = self.himo_id("_sync_ops.lsn") {
+            let hid = lsn_hid as u16;
+            for eid in self.entities_with_himo(hid) {
+                if let Some(l) = self.get_by_id(eid, hid) {
+                    if l > max_lsn { max_lsn = l; }
+                }
+            }
+        }
+        if let Some(cons_hid) = self.himo_id("_sync_peers.consumed_lsn") {
+            let hid = cons_hid as u16;
+            for eid in self.entities_with_himo(hid) {
+                if let Some(l) = self.get_by_id(eid, hid) {
+                    if l > max_lsn { max_lsn = l; }
+                }
+            }
+        }
+        if max_lsn > 0 {
+            // 既に進んでいる場合は後退させない (enable → open の二重呼び等)
+            let cur = self.next_sync_lsn.load(Ordering::Acquire);
+            if max_lsn.saturating_add(1) > cur {
+                self.next_sync_lsn.store(max_lsn + 1, Ordering::Release);
+            }
+        }
     }
 
     /// 0.7.0 (Phase 3): sync tables が有効化済みか。 schema crate / Syncer が
@@ -2218,8 +2537,13 @@ impl Engine {
         let _guard = self.transfer_lock.lock().unwrap();
 
         let from = self.sync_ops_offset.load(Ordering::Acquire);
-        let records = wal.iter_committed_from(from);
+        // #77-H4: cursor は「読み切った commit 済み group の終端」までしか
+        // 進めない。 scan 後の wal.head() 再読は、 書き込み途中 record での
+        // break 位置〜head 間の record を恒久 skip していた (#63 と同 class)。
+        let (records, committed_end) = wal.iter_committed_from_with_end(from);
         if records.is_empty() {
+            // 空 commit group だけ読み進んだ場合も cursor は安全に前進できる
+            self.sync_ops_offset.store(committed_end, Ordering::Release);
             return 0;
         }
 
@@ -2257,26 +2581,57 @@ impl Engine {
                 enchudb_oplog::oplog::DecodedOp::Tie { eid, .. }
                 | enchudb_oplog::oplog::DecodedOp::Untie { eid, .. }
                 | enchudb_oplog::oplog::DecodedOp::Delete { eid }
-                | enchudb_oplog::oplog::DecodedOp::Content { eid, .. } => is_internal_eid(*eid),
+                | enchudb_oplog::oplog::DecodedOp::Content { eid, .. }
+                | enchudb_oplog::oplog::DecodedOp::TieNamed { eid, .. } => is_internal_eid(*eid),
                 enchudb_oplog::oplog::DecodedOp::Commit => false,
                 enchudb_oplog::oplog::DecodedOp::Vocab { .. } => false,
             };
             if skip { continue; }
+            // #76 (0.9.0): single-writer guard — foreign entity のレプリカ
+            // (translated local) への **self-authored** write は bridge しない。
+            // 逆写像が無いため他 peer では新規 entity として払い出され、 全 peer で
+            // 断片化する (silent divergence)。 「entity はその author だけが書く」
+            // を正式仕様とし、 レプリカへのローカル編集は local-only に留める。
+            // (逆写像の実装 = write-back の正式サポートは 0.10 候補、 別 request)
+            let self_peer = wal.peer_id();
+            let replica_writeback = rec.author_peer == self_peer && match &rec.op {
+                enchudb_oplog::oplog::DecodedOp::Tie { eid, .. }
+                | enchudb_oplog::oplog::DecodedOp::Untie { eid, .. }
+                | enchudb_oplog::oplog::DecodedOp::Delete { eid }
+                | enchudb_oplog::oplog::DecodedOp::Content { eid, .. }
+                | enchudb_oplog::oplog::DecodedOp::TieNamed { eid, .. } => {
+                    self.eid_translator.is_translated_local(enchudb_oplog::eid_local(*eid))
+                }
+                _ => false,
+            };
+            if replica_writeback {
+                if !self.warned_replica_writeback.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[enchudb] warning: local write to a replicated foreign entity is \
+                         NOT propagated to peers (single-writer per entity, #76). \
+                         Edit the entity on its author peer instead."
+                    );
+                }
+                continue;
+            }
             count += 1;
             let row_eid = match self.entity_in("_sync_ops") {
                 Ok(e) => e,
                 Err(_) => {
                     // eid_range exhausted: 0.7.0 では追加 row insert を諦める
                     // (= 0.8.0 で ring buffer 化)。 ここまでの転送は維持。
-                    let last_offset = wal.head(); // 部分転送、 次回は head から再開
-                    self.sync_ops_offset.store(last_offset, Ordering::Release);
+                    // #77-H4: 旧実装は wal.head() まで飛ばして書き込み途中
+                    // record まで skip していた。 committed_end 止まりに変更
+                    // (残り未転送分はこの group 内のため落ちるが、 in-flight
+                    // record の恒久 skip は防ぐ)。
+                    self.sync_ops_offset.store(committed_end, Ordering::Release);
                     return count;
                 }
             };
             let lsn = self.next_sync_lsn.fetch_add(1, Ordering::AcqRel);
             self.tie_to_by_id(row_eid, lsn_hid, lsn);
             self.tie_to_by_id(row_eid, peer_id_hid, rec.author_peer);
-            // DecodedOp variant を tag (Tie=0, Untie=1, Delete=2, Content=3, Commit=4, Vocab=5)
+            // DecodedOp variant を tag (Tie=0, Untie=1, Delete=2, Content=3, Commit=4, Vocab=5, TieNamed=6)
             let op_type = match &rec.op {
                 enchudb_oplog::oplog::DecodedOp::Tie { .. } => 0,
                 enchudb_oplog::oplog::DecodedOp::Untie { .. } => 1,
@@ -2284,6 +2639,7 @@ impl Engine {
                 enchudb_oplog::oplog::DecodedOp::Content { .. } => 3,
                 enchudb_oplog::oplog::DecodedOp::Commit => 4,
                 enchudb_oplog::oplog::DecodedOp::Vocab { .. } => 5,
+                enchudb_oplog::oplog::DecodedOp::TieNamed { .. } => 6,
             };
             self.tie_to_by_id(row_eid, op_type_hid, op_type);
             // hlc.wall は u64 ms-since-epoch、 下位 32bit のみ保持 (= ~50 日サイクル
@@ -2301,8 +2657,8 @@ impl Engine {
             self.tie_bytes_to_by_id(row_eid, payload_hid, &wire_payload);
         }
 
-        // 全部転送できた、 offset を head に進める
-        self.sync_ops_offset.store(wal.head(), Ordering::Release);
+        // 全部転送できた、 offset を「読み切った commit 済み終端」に進める (#77-H4)
+        self.sync_ops_offset.store(committed_end, Ordering::Release);
         count
     }
 
@@ -2520,7 +2876,7 @@ impl Engine {
         let tid = self.tables.len() as TableId;
         self.tables.push(TableDef {
             name: name.to_string(),
-            himo_ids: Vec::new(),
+            himo_ids: std::sync::RwLock::new(Vec::new()),
             eid_range_lo: new_lo,
             eid_range_hi: new_hi,
             fk_refs: Vec::new(),
@@ -2721,15 +3077,22 @@ impl Engine {
     fn adopt_persisted_tables(&mut self, tables: Vec<TableDef>) {
         let himo_count = self.himos.len();
         // 全 himo を一旦 anonymous default に戻し、 sidecar に書かれてる
-        // attach を上書きする (= sidecar が source of truth)
-        self.himo_to_table = vec![ANONYMOUS_TABLE; himo_count];
+        // attach を上書きする (= sidecar が source of truth)。
+        // `&mut self` (= open 時、 共有前) なので AppendVec ごと作り直して OK。
+        let rebuilt: AppendVec<std::sync::atomic::AtomicU16> =
+            AppendVec::with_capacity(self.himo_to_table.capacity().max(himo_count));
+        for _ in 0..himo_count {
+            let _ = rebuilt.push(std::sync::atomic::AtomicU16::new(ANONYMOUS_TABLE));
+        }
         for (tid, table) in tables.iter().enumerate() {
-            for &hid in &table.himo_ids {
+            for &hid in table.himo_ids.read().unwrap().iter() {
                 if (hid as usize) < himo_count {
-                    self.himo_to_table[hid as usize] = tid as TableId;
+                    rebuilt[hid as usize]
+                        .store(tid as TableId, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
+        self.himo_to_table = rebuilt;
         self.tables = tables;
     }
 
@@ -2840,6 +3203,13 @@ impl Engine {
             .collect()
     }
     pub fn entity_count(&self) -> u32 { self.entities.count() }
+
+    /// eid が live (= 割当済みで未削除) か。 0.9.0 (M10): query_lang の
+    /// update/delete が未割当 slot へ phantom write するのを防ぐ existence check 用。
+    /// 範囲外 eid は false。
+    pub fn is_live(&self, eid: enchudb_oplog::EntityId) -> bool {
+        self.entities.is_live(enchudb_oplog::eid_local(eid))
+    }
     pub fn next_eid(&self) -> enchudb_oplog::EntityId {
         let peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
         enchudb_oplog::make_eid(peer, self.entities.next_eid())
@@ -2959,8 +3329,8 @@ impl Engine {
     /// 閉じていて panic するし、 `entities.allocate()` は table range と衝突しうる。
     fn alloc_translated_local(&self, himo_id: u16) -> Option<u32> {
         let hid = himo_id as usize;
-        if hid < self.himo_to_table.len() {
-            let tid = self.himo_to_table[hid] as usize;
+        if let Some(tid) = self.himo_table_get(hid) {
+            let tid = tid as usize;
             if tid < self.tables.len() && self.tables[tid].eid_range_hi != u32::MAX {
                 let name = self.tables[tid].name.clone();
                 if let Ok(e) = self.entity_in(&name) {
@@ -3007,8 +3377,8 @@ impl Engine {
     /// target table を導けない / entity_in 失敗なら `None` (caller が op を skip)。
     fn alloc_translated_local_in_target_table(&self, ref_himo_id: u16) -> Option<u32> {
         let hid = ref_himo_id as usize;
-        if hid < self.himo_to_table.len() {
-            let owner_tid = self.himo_to_table[hid] as usize;
+        if let Some(owner_tid) = self.himo_table_get(hid) {
+            let owner_tid = owner_tid as usize;
             if owner_tid < self.tables.len() {
                 let owner = &self.tables[owner_tid];
                 if let Some(&(_, target_tid)) =
@@ -3243,6 +3613,23 @@ impl Engine {
         ht: HimoType,
         max_values: u32,
     ) -> Result<u32, String> {
+        // 0.9.0: 本体は `&self` 版 (ensure_himo_dynamic_in) に移譲。 signature は
+        // 互換維持のため `&mut self` / u32 のまま。
+        self.ensure_himo_dynamic_in(table_name, himo_name, ht, max_values)
+            .map(|hid| hid as u32)
+    }
+
+    /// 0.9.0: `define_himo_in` の `&self` 版。 `Arc<Engine>` (= concurrent mode)
+    /// から lazy に himo を定義できる。 idempotent: 既に同名 himo が target
+    /// table に attach 済みなら既存 hid を返す。 定義 (+ attach 移動) は
+    /// `himo_def_lock` で直列化される。
+    pub fn ensure_himo_dynamic_in(
+        &self,
+        table_name: &str,
+        himo_name: &str,
+        ht: HimoType,
+        max_values: u32,
+    ) -> Result<u16, String> {
         self.check_writable();
         if table_name.is_empty() {
             return Err("table name must be non-empty (use define_himo for anonymous)".into());
@@ -3264,27 +3651,36 @@ impl Engine {
 
         let full_name = format!("{}.{}", table_name, himo_name);
 
-        // ensure_himo は既に存在ならそのまま、 新規なら anonymous へ attach する。
+        // 定義 + attach 移動を 1 定義単位として himo_def_lock で直列化する
+        // (並行する同名 ensure が同じ hid に収束するように)。
+        let _guard = self.himo_def_lock.lock().unwrap();
+
+        // 既存ならそのまま、 新規なら anonymous へ attach で定義。
         // 後者なら anonymous の himo_ids から外して target table へ移す。
-        let hid = self.ensure_himo(&full_name, ht, max_values);
+        let hid = match self.himo_id(&full_name) {
+            Some(idx) => idx,
+            None => self.define_himo_slot_locked(&full_name, ht, max_values)? as usize,
+        };
         let hid_u32 = hid as u32;
 
         // 既に target table に attach 済みなら何もしない (重複 define_himo_in)
-        if self.himo_to_table[hid] == tid as TableId {
-            return Ok(hid_u32);
+        let cur_tid = self.himo_to_table[hid].load(std::sync::atomic::Ordering::Relaxed);
+        if cur_tid == tid as TableId {
+            return Ok(hid as u16);
         }
 
-        // ensure_himo は新規時に ANONYMOUS_TABLE へ attach するので、 別 table
-        // 既属の場合は migrate する形 (実用上は新規時のみ通る)。
-        let cur_tid = self.himo_to_table[hid];
+        // 新規時は ANONYMOUS_TABLE へ attach されているので、 別 table 既属の
+        // 場合は migrate する形 (実用上は新規時のみ通る)。
         self.tables[cur_tid as usize]
             .himo_ids
+            .write()
+            .unwrap()
             .retain(|&h| h != hid_u32);
-        self.tables[tid].himo_ids.push(hid_u32);
-        self.himo_to_table[hid] = tid as TableId;
+        self.tables[tid].himo_ids.write().unwrap().push(hid_u32);
+        self.himo_to_table[hid].store(tid as TableId, std::sync::atomic::Ordering::Relaxed);
 
         self.try_persist_tables();
-        Ok(hid_u32)
+        Ok(hid as u16)
     }
 
     /// β-light step 5: `Ref` 型 himo を target_table と紐付けて定義する。
@@ -3310,7 +3706,8 @@ impl Engine {
         let hid = self.define_himo_in(table_name, himo_name, HimoType::Ref, 0)?;
 
         // 所属 table の fk_refs に entry を追加 (idempotent)
-        let owner_tid = self.himo_to_table[hid as usize];
+        let owner_tid =
+            self.himo_to_table[hid as usize].load(std::sync::atomic::Ordering::Relaxed);
         let entry = (hid, target_tid);
         let owner = &mut self.tables[owner_tid as usize];
         if !owner.fk_refs.iter().any(|e| *e == entry) {
@@ -3339,10 +3736,10 @@ impl Engine {
         if self.tables.len() <= 1 {
             return;
         }
-        if hid >= self.himo_to_table.len() {
+        let Some(tid) = self.himo_table_get(hid) else {
             return;
-        }
-        let tid = self.himo_to_table[hid] as usize;
+        };
+        let tid = tid as usize;
         if tid >= self.tables.len() {
             return;
         }
@@ -3373,10 +3770,10 @@ impl Engine {
         if self.himo_types[hid] != HimoType::Ref {
             return;
         }
-        if hid >= self.himo_to_table.len() {
+        let Some(owner_tid) = self.himo_table_get(hid) else {
             return;
-        }
-        let owner_tid = self.himo_to_table[hid] as usize;
+        };
+        let owner_tid = owner_tid as usize;
         if owner_tid >= self.tables.len() {
             return;
         }
@@ -3482,8 +3879,8 @@ impl Engine {
     /// hot path で `tie_*_to_by_id` から呼ばれる、 inline で軽量化。
     #[inline]
     fn himo_is_in_reserved_table(&self, himo_id: usize) -> bool {
-        match self.himo_to_table.get(himo_id) {
-            Some(tid) => self.tables.get(*tid as usize)
+        match self.himo_table_get(himo_id) {
+            Some(tid) => self.tables.get(tid as usize)
                 .map(|td| td.is_reserved())
                 .unwrap_or(false),
             None => false,
@@ -3510,7 +3907,17 @@ impl Engine {
             if let Some(wal) = self.oplog.as_ref() {
                 let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
                 let _ = wal.append(enchudb_oplog::oplog::Op::Vocab { vid, bytes: value });
-                let _ = wal.append(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid });
+                if self.himo_is_content(hid) {
+                    // 0.9.0: 動的 content himo は id が peer 間で揃わないため名前で運ぶ
+                    let _ = wal.append(enchudb_oplog::oplog::Op::TieNamed {
+                        eid: oplog_eid,
+                        himo_name: &self.himo_names[hid],
+                        himo_kind: self.himo_types[hid] as u8,
+                        value: vid,
+                    });
+                } else {
+                    let _ = wal.append(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid });
+                }
             }
         }
     }
@@ -3622,13 +4029,94 @@ impl Engine {
 
     // ──── content ────
 
+    /// eid が属する named table 名。 どの named table の range にも入らなければ
+    /// None (= anonymous 扱い)。
+    fn table_name_of_local(&self, local: u32) -> Option<String> {
+        for t in self.tables.iter() {
+            if t.name.is_empty() { continue; }
+            if local >= t.eid_range_lo && local < t.eid_range_hi {
+                return Some(t.name.clone());
+            }
+        }
+        None
+    }
+
+    /// 0.9.0 (#81): content key に対応する `_c_{key}` Leaf himo を lazy 確保。
+    /// eid が named table 所属ならその table に、 それ以外は anonymous に定義する。
+    fn ensure_content_himo(&self, local: u32, key: &str) -> u16 {
+        assert!(
+            !key.contains('.'),
+            "content key '{}' must not contain '.' (himo 名の table separator と衝突。 \
+             0.9.0 で content は Leaf himo 格納に変わった)",
+            key,
+        );
+        let himo_name = format!("_c_{key}");
+        let res = match self.table_name_of_local(local) {
+            Some(t) => self.ensure_himo_dynamic_in(&t, &himo_name, HimoType::Leaf, 0),
+            None => self.ensure_himo_dynamic(&himo_name, HimoType::Leaf, 0),
+        };
+        res.unwrap_or_else(|e| panic!("content key '{key}': himo allocation failed: {e}"))
+    }
+
+    /// full name ("table.himo" or "himo") で himo を lazy 解決。 table 部が既知
+    /// table なら所属付きで、 それ以外は anonymous へ定義する (TieNamed replay 用)。
+    fn ensure_himo_by_full_name(&self, full_name: &str, ht: HimoType) -> Result<u16, String> {
+        if let Some((table, himo)) = full_name.split_once('.') {
+            if self.tables.iter().any(|t| t.name == table) {
+                return self.ensure_himo_dynamic_in(table, himo, ht, 0);
+            }
+        }
+        self.ensure_himo_dynamic(full_name, ht, 0)
+    }
+
+    /// 0.9.0: sync 受信側用の公開版 — TieNamed の himo を名前で解決 (無ければ
+    /// lazy 定義) して local hid を返す。 `himo_kind` は wire 上の生 u8。
+    pub fn ensure_himo_named(&self, full_name: &str, himo_kind: u8) -> Result<u16, String> {
+        self.ensure_himo_by_full_name(full_name, HimoType::from_byte(himo_kind))
+    }
+
+    /// hid が content 互換層の himo (`_c_` prefix) か。 これらは動的定義のため
+    /// peer 間で himo_id が揃わず、 WAL/wire には Tie ではなく TieNamed で乗せる。
+    fn himo_is_content(&self, hid: usize) -> bool {
+        self.himo_names.get(hid).map_or(false, |n| {
+            n.rsplit('.').next().map_or(false, |leaf| leaf.starts_with("_c_"))
+        })
+    }
+
+    /// 既存の content himo id を引く (定義はしない)。 read 経路用。
+    fn content_himo_id(&self, local: u32, key: &str) -> Option<u16> {
+        let full = match self.table_name_of_local(local) {
+            Some(t) => format!("{t}._c_{key}"),
+            None => format!("_c_{key}"),
+        };
+        self.himo_id(&full).map(|h| h as u16)
+    }
+
+    /// entity に任意 bytes を添付する (sync 版)。
+    ///
+    /// 0.9.0: 保存先を旧 ContentStore region から **`_c_{key}` Leaf himo**
+    /// (bytes は vocab 格納) に変更。 write は Vocab+Tie として WAL / sync /
+    /// HLC / changefeed に自然に乗る。 これにより旧経路の既知バグ群
+    /// (mod-16 key hash 衝突・index torn read・sync/WAL 非対応・delete 残留)
+    /// が構造ごと退役する。 旧 content region は**凍結アーカイブ**:
+    /// `get_content` の fallback でのみ読み、 書き込みは一切しない。
     pub fn content(&self, eid: enchudb_oplog::EntityId, key: &str, data: &[u8]) {
         self.check_writable();
-        self.contents.set(enchudb_oplog::eid_local(eid), key, data);
+        let local = enchudb_oplog::eid_local(eid);
+        let hid = self.ensure_content_himo(local, key);
+        self.tie_bytes_to_by_id(eid, hid, data);
     }
 
     pub fn get_content(&self, eid: enchudb_oplog::EntityId, key: &str) -> Option<&[u8]> {
-        self.contents.get(enchudb_oplog::eid_local(eid), key)
+        let local = enchudb_oplog::eid_local(eid);
+        // 新経路 (`_c_{key}` Leaf himo) 優先
+        if let Some(hid) = self.content_himo_id(local, key) {
+            if let Some(vid) = self.get_by_id(eid, hid) {
+                return Some(self.vocab.get(vid));
+            }
+        }
+        // 旧 content region fallback (pre-0.9 data の read-through 互換)
+        self.contents.get(local, key)
     }
 
     // ──── changefeed (WAL 変更通知) ────
@@ -5140,7 +5628,7 @@ impl Engine {
 
     #[allow(dead_code)]
     pub(crate) fn vocab(&self) -> &Vocabulary { &self.vocab }
-    pub fn himo_names(&self) -> &[String] { &self.himo_names }
+    pub fn himo_names(&self) -> &[String] { self.himo_names.as_slice() }
 
     pub fn himo_type(&self, himo: &str) -> Option<HimoType> {
         self.himo_id(himo).map(|idx| self.himo_types[idx])
@@ -5346,10 +5834,73 @@ impl Engine {
         self.himo_names.iter().position(|n| n == himo)
     }
 
+    /// 0.9.0: himo_to_table の bounds-checked read。 要素は AtomicU16 なので
+    /// load して TableId に戻す (attach 変更は himo_def_lock 下の低頻度 path)。
+    #[inline(always)]
+    fn himo_table_get(&self, hid: usize) -> Option<TableId> {
+        self.himo_to_table
+            .get(hid)
+            .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     fn ensure_himo(&mut self, himo: &str, ht: HimoType, max_values: u32) -> usize {
+        // 0.9.0: 本体は `&self` 版に移譲 (signature 互換の thin wrapper)。
+        // capacity 超過は旧実装の assert! と同様 panic のまま。
         if let Some(idx) = self.himo_id(himo) { return idx; }
+        let _guard = self.himo_def_lock.lock().unwrap();
+        if let Some(idx) = self.himo_id(himo) { return idx; }
+        match self.define_himo_slot_locked(himo, ht, max_values) {
+            Ok(hid) => hid as usize,
+            Err(e) => panic!("{}", e),
+        }
+    }
+
+    /// 0.9.0: `ensure_himo` の `&self` 版。 `Arc<Engine>` (= concurrent mode)
+    /// から lazy に himo を定義できる。 idempotent: 同名が既にあれば既存 hid を
+    /// 返す。 新規定義は `himo_def_lock` で直列化され、 anonymous table に
+    /// attach される (旧 `define_himo` と同じ)。 named table に attach するなら
+    /// `ensure_himo_dynamic_in` を使う。
+    pub fn ensure_himo_dynamic(
+        &self,
+        full_name: &str,
+        ht: HimoType,
+        max_values: u32,
+    ) -> Result<u16, String> {
+        self.check_writable();
+        // fast path: 既存名は lock 無しで解決 (himo_names は append-only なので
+        // 見つかった idx は安定)。
+        if let Some(idx) = self.himo_id(full_name) {
+            return Ok(idx as u16);
+        }
+        let _guard = self.himo_def_lock.lock().unwrap();
+        // double-check: lock 待ちの間に他 thread が同名を定義した可能性
+        if let Some(idx) = self.himo_id(full_name) {
+            return Ok(idx as u16);
+        }
+        let hid = self.define_himo_slot_locked(full_name, ht, max_values)?;
+        // himo → table attach (anonymous) を sidecar に反映 (best effort)。
+        self.try_persist_tables();
+        Ok(hid)
+    }
+
+    /// himo 定義の本体 (0.9.0 で ensure_himo から `&self` 化)。
+    ///
+    /// 呼び出し規約: **必ず `himo_def_lock` を保持して呼ぶこと** (直列化は
+    /// caller 責務)。 lock 下で himoreg 登録 → column region init → 並列配列
+    /// への push → header 書き込みまでを行う。 publish 順は `himo_names` を
+    /// 最後にする: `himo_id()` (= 名前の線形検索) で hid が見つかった時点で
+    /// 他の並列配列 (himos / himo_types / himo_max_values / himo_to_table /
+    /// tables[anon].himo_ids) は必ず埋まっている、 という不変条件を成す。
+    fn define_himo_slot_locked(
+        &self,
+        himo: &str,
+        ht: HimoType,
+        max_values: u32,
+    ) -> Result<u16, String> {
         let hid = self.himos.len();
-        assert!((hid as u32) < self.max_himos, "too many himos (max {})", self.max_himos);
+        if hid as u32 >= self.max_himos || hid >= u16::MAX as usize {
+            return Err(format!("too many himos (max {})", self.max_himos));
+        }
 
         self.himo_reg.get_or_insert(himo.as_bytes());
 
@@ -5362,7 +5913,7 @@ impl Engine {
         // 効くようにする。 static backing の場合は Region::new 経路。
         #[cfg(not(target_arch = "wasm32"))]
         let grower = self.backing.grower();
-        let base = self.backing.as_mut_ptr();
+        let base = self.backing.base_ptr_shared();
         let make_region = |off: usize, size: usize| -> Region {
             #[cfg(not(target_arch = "wasm32"))]
             if let Some(g) = &grower {
@@ -5376,27 +5927,38 @@ impl Engine {
             ht, effective_mv, self.max_entities,
         );
 
-        self.himos.push(hs);
-        self.himo_names.push(himo.to_string());
-        self.himo_types.push(ht);
-        self.himo_max_values.push(max_values);
+        // AppendVec は with_capacity(max_himos) 済みなので上の capacity check が
+        // 通れば push は失敗しない (万一の防御で明示 panic)。
+        let push_ok = self.himos.push(hs).is_ok()
+            && self.himo_types.push(ht).is_ok()
+            && self.himo_max_values.push(max_values).is_ok()
+            && self
+                .himo_to_table
+                .push(std::sync::atomic::AtomicU16::new(ANONYMOUS_TABLE))
+                .is_ok();
+        assert!(push_ok, "himo parallel arrays out of capacity (max {})", self.max_himos);
 
         // β-light step 2: 旧 API (define_himo) で追加された himo は anonymous
-        // table に attach する。 step 3+ で define_table 経由なら target table
-        // を指定して attach する形に拡張。
+        // table に attach する。 named table への attach は
+        // ensure_himo_dynamic_in / define_himo_in 側で migrate される。
         let hid_u32 = hid as u32;
-        self.tables[ANONYMOUS_TABLE as usize].himo_ids.push(hid_u32);
-        self.himo_to_table.push(ANONYMOUS_TABLE);
+        self.tables[ANONYMOUS_TABLE as usize]
+            .himo_ids
+            .write()
+            .unwrap()
+            .push(hid_u32);
 
-        // ヘッダにメタデータ書き込み
+        // ヘッダにメタデータ書き込み (himo_def_lock 下、 reader は runtime に
+        // この領域を読まないので &self からの直接書き込みで安全)
         let maxv_base = himo_maxv_base(self.max_himos);
-        self.backing.as_slice_mut()[H_HIMO_TYPES + hid] = ht as u8;
+        let buf = self.backing.slice_mut_shared();
+        buf[H_HIMO_TYPES + hid] = ht as u8;
         let mv_off = maxv_base + hid * 4;
-        self.backing.as_slice_mut()[mv_off..mv_off + 4].copy_from_slice(&max_values.to_le_bytes());
+        buf[mv_off..mv_off + 4].copy_from_slice(&max_values.to_le_bytes());
         let himo_count = (hid + 1) as u32;
-        self.backing.as_slice_mut()[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&himo_count.to_le_bytes());
+        buf[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&himo_count.to_le_bytes());
         // v28: header CRC を再計算(himo_count が変わったため)
-        write_header_crc(self.backing.as_slice_mut());
+        write_header_crc(buf);
 
         // v29 issue7 fix: schema 変更で region layout が変わったので、 seal_integrity
         // で焼かれた古い `.crc` sidecar は stale。 削除して、 次 open は CRC 検証
@@ -5407,7 +5969,10 @@ impl Engine {
             let _ = std::fs::remove_file(&crc_path);
         }
 
-        hid
+        // 最後に名前を publish (この時点で hid の全 metadata が可視)
+        let _ = self.himo_names.push(himo.to_string());
+
+        Ok(hid as u16)
     }
 
     // ──── v27 並行書き込み ────
@@ -5443,6 +6008,7 @@ impl Engine {
         let eng = Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)?;
         let oplog_path = oplog_path_for(path);
         let wal = std::sync::Arc::new(enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?);
+        eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
     }
 
@@ -5483,12 +6049,19 @@ impl Engine {
             for rec in &records {
                 eng.apply_oplog_op(&rec.op);
             }
-            // 本体に適用し終えたので checkpoint を head まで前進
+            // #77-H2: 適用効果を disk に固めてから checkpoint を前進する。
+            // 旧順序 (apply → 即 checkpoint) は kernel が checkpoint header を
+            // body より先に writeback すると、 recovery 直後の再 crash で
+            // 「一度 durable だった committed record」 が replay 対象外になり
+            // 恒久消失した。
+            let _ = eng.body_msync();
+            let _ = w.fsync();
             w.advance_checkpoint(w.head());
             std::sync::Arc::new(w)
         } else {
             std::sync::Arc::new(enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?)
         };
+        eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
     }
 
@@ -5528,8 +6101,20 @@ impl Engine {
                 self.entities.free(local);
             }
             DecodedOp::Content { eid, key, data } => {
+                // legacy (pre-0.9 WAL): 旧 content region へ replay。 0.9.0 以降は
+                // Op::Content を emit しないので、 旧 DB の WAL 再生でのみ通る。
                 let local = enchudb_oplog::eid_local(*eid);
                 self.contents.set(local, key, data);
+                self.entities.ensure_live(local);
+                Self::advance_table_next_local_for(&self.tables, local);
+            }
+            DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => {
+                // 0.9.0: 名前で himo を解決 (無ければ定義) して set。
+                let local = enchudb_oplog::eid_local(*eid);
+                let ht = HimoType::from_byte(*himo_kind);
+                if let Ok(hid) = self.ensure_himo_by_full_name(himo_name, ht) {
+                    self.himos[hid as usize].set(local, *value);
+                }
                 self.entities.ensure_live(local);
                 Self::advance_table_next_local_for(&self.tables, local);
             }
@@ -5596,11 +6181,15 @@ impl Engine {
             for rec in &records {
                 eng.apply_oplog_op(&rec.op);
             }
+            // #77-H2: body msync → checkpoint の順 (open_concurrent_with_oplog と同じ)
+            let _ = eng.body_msync();
+            let _ = w.fsync();
             w.advance_checkpoint(w.head());
             std::sync::Arc::new(w)
         } else {
             std::sync::Arc::new(enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?)
         };
+        eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
     }
 
@@ -5625,8 +6214,11 @@ impl Engine {
             return;
         }
         let start = emit_offset.load(Ordering::Acquire);
-        let recs = wal.iter_committed_from(start);
+        // #77-H4: cursor は commit 済み終端まで。 head 再読は in-flight record の
+        // 恒久 skip (listener への通知漏れ) を起こしていた。
+        let (recs, committed_end) = wal.iter_committed_from_with_end(start);
         if recs.is_empty() {
+            emit_offset.store(committed_end, Ordering::Release);
             return;
         }
         let wires: Vec<crate::transport::WireRecord> =
@@ -5634,7 +6226,7 @@ impl Engine {
         for listener in guard.iter() {
             listener.on_changes(&wires);
         }
-        emit_offset.store(wal.head(), Ordering::Release);
+        emit_offset.store(committed_end, Ordering::Release);
     }
 
     fn spawn_consumer_with_oplog(
@@ -5677,17 +6269,41 @@ impl Engine {
         let q_for_thread = queue.clone();
         let flag_for_thread = shutdown.clone();
         let apply_count_for_thread = arc.apply_count.clone();
+        let wal_append_count_for_thread = arc.wal_append_count.clone();
         let oplog_for_thread = oplog.clone();
         let oplog_record_queue_for_thread = oplog_record_queue.clone();
         let durable_lsn_for_thread = arc.durable_lsn.clone();
         let listeners_for_thread = arc.change_listeners.clone();
         let emit_offset_for_thread = arc.change_emit_offset.clone();
+        let poisoned_for_thread = arc.consumer_poisoned.clone();
+
+        // #77-M2: consumer が panic した場合に unwind 経路で poison を立てる
+        // guard。 これが無いと apply_count が永久に追いつかず、 flush_writes /
+        // Drop の barrier spin と満杯 queue の producer が全員無限待ちになる
+        // (旧 behavior: content cap 超過等の panic でプロセス全体が silent hang)。
+        struct PoisonOnPanic {
+            flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            queue: std::sync::Arc<crate::write_queue::WriteQueue>,
+        }
+        impl Drop for PoisonOnPanic {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    self.flag.store(true, std::sync::atomic::Ordering::Release);
+                    self.queue.poison();
+                    eprintln!("[enchudb] consumer thread panicked — engine poisoned, subsequent writes/flushes will fail fast");
+                }
+            }
+        }
 
         let handle = std::thread::Builder::new()
             .name("enchudb-consumer".into())
             .spawn(move || {
                 use std::sync::atomic::Ordering;
                 use std::time::{Duration, Instant};
+                let _poison_guard = PoisonOnPanic {
+                    flag: poisoned_for_thread,
+                    queue: q_for_thread.clone(),
+                };
                 let engine: &Engine = unsafe { &*(engine_addr as *const Engine) };
                 let fsync_interval = Duration::from_millis(100);
                 let mut last_fsync = Instant::now();
@@ -5703,6 +6319,10 @@ impl Engine {
                         while let Some(rec) = wq.pop() { batch.push(rec); }
                         if !batch.is_empty() {
                             let _ = wal.append_many(&batch);
+                            // append 失敗でも進める: barrier の意味は「queue に
+                            // 残っていない」であり、 失敗 record の再送は無い
+                            wal_append_count_for_thread
+                                .fetch_add(batch.len() as u64, Ordering::Release);
                             drained_any = true;
                         }
                     }
@@ -5719,6 +6339,14 @@ impl Engine {
                         if last_fsync.elapsed() >= fsync_interval {
                             if wal.head() > wal.checkpoint() {
                                 let _ = wal.append(enchudb_oplog::oplog::Op::Commit);
+                                // #77-H3: checkpoint の上限は「今回の fsync/msync に
+                                // 含まれることが確定した位置」= Commit append 直後の
+                                // head。 msync 後に head を再読すると、 その間に
+                                // append された record が「body 効果が msync に
+                                // 含まれないのに checkpoint される」= crash で
+                                // fsync 済み write が replay 対象外になり消失した。
+                                let durable_head = wal.head();
+                                let durable_lsn = wal.next_lsn().saturating_sub(1);
                                 let _ = wal.fsync();
                                 let _ = engine.body_msync();
                                 // 0.8.1: 周期 fsync でも tables sidecar を persist。
@@ -5726,10 +6354,8 @@ impl Engine {
                                 // (= 直後に process kill されても次 open で sidecar
                                 // の next_local が oplog の進行と整合する)。
                                 engine.try_persist_tables();
-                                let head = wal.head();
-                                wal.advance_checkpoint(head);
-                                let lsn = wal.next_lsn().saturating_sub(1);
-                                durable_lsn_for_thread.store(lsn, Ordering::Release);
+                                wal.advance_checkpoint(durable_head);
+                                durable_lsn_for_thread.store(durable_lsn, Ordering::Release);
 
                                 // 0.8.0: sync 並走の解消 — durable 化した record を
                                 // _sync_ops に自動転送する (= 0.7.0 では user が手動で
@@ -5751,6 +6377,14 @@ impl Engine {
                             // pending_writes == 0 のときだけ head/checkpoint を HEADER_SIZE に戻す。
                             // これで WAL 容量を食い切らずに長期運用できる。
                             // ※ auto_reset が発動して offset が後退したら listener cursor もリセット。
+                            // 0.9.0: 畳む前に bridge を必ず追いつかせる。 上の transfer は
+                            // head > checkpoint の時しか走らないが、 caller thread の
+                            // oplog_sync が checkpoint を進めた直後は head == checkpoint の
+                            // まま bridge 未了 record が残りえる (cursor 追いつき済みなら
+                            // 空 scan で即返るので毎 tick 呼んで無害)。
+                            if engine.sync_tables_enabled() {
+                                engine.transfer_oplog_to_sync_ops();
+                            }
                             if wal.try_reset() {
                                 emit_offset_for_thread.store(
                                     enchudb_oplog::oplog::HEADER_SIZE as u64,
@@ -5774,6 +6408,8 @@ impl Engine {
                             while let Some(rec) = wq.pop() { batch.push(rec); }
                             if !batch.is_empty() {
                                 let _ = wal.append_many(&batch);
+                                wal_append_count_for_thread
+                                    .fetch_add(batch.len() as u64, Ordering::Release);
                             }
                         }
                         while let Some(op) = q_for_thread.pop() {
@@ -5783,6 +6419,7 @@ impl Engine {
                         // shutdown 時の最終 Commit + 順序付き同期
                         if let Some(wal) = oplog_for_thread.as_ref() {
                             let _ = wal.append(enchudb_oplog::oplog::Op::Commit);
+                            let durable_head = wal.head(); // #77-H3: msync 前に snapshot
                             let _ = wal.fsync();
                             let _ = engine.body_msync();
                             // 0.8.1: shutdown 時に tables sidecar を強制 persist。
@@ -5792,7 +6429,7 @@ impl Engine {
                             // 経路では oplog checkpoint も進めてしまうので、 ここで
                             // sidecar を確実に固める必要がある。
                             engine.try_persist_tables();
-                            wal.advance_checkpoint(wal.head());
+                            wal.advance_checkpoint(durable_head);
                             // 0.8.0: shutdown 時も最終 sync 転送 (drop で残った record も
                             // _sync_ops に bridge し切ってから抜ける)
                             if engine.sync_tables_enabled() {
@@ -5872,12 +6509,21 @@ impl Engine {
         self.flush_writes();
         if let Some(wal) = self.oplog.as_ref() {
             let _ = wal.append(enchudb_oplog::oplog::Op::Commit);
+            // #77-H3: checkpoint 上限と durable_lsn は Commit append 直後に
+            // snapshot (msync 後の再読は未同期 record まで checkpoint してしまう)
+            let durable_head = wal.head();
+            let durable_lsn = wal.next_lsn().saturating_sub(1);
             wal.fsync()?;
             self.body_msync()?;
-            let head = wal.head();
-            wal.advance_checkpoint(head);
-            let lsn = wal.next_lsn().saturating_sub(1);
-            self.durable_lsn.store(lsn, Ordering::Release);
+            wal.advance_checkpoint(durable_head);
+            self.durable_lsn.store(durable_lsn, Ordering::Release);
+            // 0.9.0: checkpoint を進めたら bridge も追いつかせる。 consumer tick の
+            // try_reset は head==checkpoint の ring を無条件に畳むため、 ここで
+            // transfer しないと「committed だが bridge 未了」の record が wipe され
+            // sync から永久に消える (sync lib テスト flaky の第 2 の根)。
+            if self.sync_tables_enabled() {
+                self.transfer_oplog_to_sync_ops();
+            }
             // changefeed: durable 化したので listener へ即時 push
             // (consumer の 100ms tick を待たず caller スレッドで発火)
             Self::fire_change_listeners(wal, &self.change_listeners, &self.change_emit_offset);
@@ -6104,9 +6750,6 @@ impl Engine {
                 }
                 self.entities.free(eid);
             }
-            Op::Content { eid, key, data } => {
-                self.contents.set(eid, &key, &data);
-            }
             Op::EntityCreated { local: _ } => {
                 // v4 (undo 廃止) 以降は no-op。 `entity()` で local slot は writer
                 // thread 側で既に allocate 済み。 ここに来るのは `flush_writes` の
@@ -6143,19 +6786,25 @@ impl Engine {
         // β-light step 5: Ref himo の FK validation (非 Ref は即 return で
         // ~1 ns、 Ref で fk_refs entry なしも同じ)
         self.validate_ref_tie(himo_id as usize, value);
-        if let Some(wal) = self.oplog.as_ref() {
-            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
-            let rec = enchudb_oplog::oplog::OwnedOp::Tie { eid: oplog_eid, himo_id, value };
-            if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec);
-            } else {
-                let _ = wal.append(rec.as_op());
-            }
-        }
+        // #77-H4: op を write_queue へ push してから WAL record を push する。
+        // 逆順 (record 先) だと 2 push の間で preempt された場合、 consumer が
+        // record を fsync + checkpoint した時点で op が未適用となり、 crash で
+        // 「fsync 済みの write」が replay 対象外になって消えた。 op 先行なら
+        // consumer が wq drain で record を見た時点で op は必ず queue に居て、
+        // 同 tick の q drain (wq の後) で適用される。
         let q = self.write_queue.as_ref()
             .expect("tie_async requires create_concurrent or concurrentize");
         q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value });
         self.push_count.fetch_add(1, Ordering::Release);
+        if let Some(wal) = self.oplog.as_ref() {
+            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
+            let rec = enchudb_oplog::oplog::OwnedOp::Tie { eid: oplog_eid, himo_id, value };
+            if let Some(wq) = self.oplog_record_queue.as_ref() {
+                push_oplog_record_blocking(wq, rec, &self.consumer_poisoned, &self.wal_push_count);
+            } else {
+                let _ = wal.append(rec.as_op());
+            }
+        }
     }
 
     /// v33: 非同期 tie_text。text 値を vocab に挿入し、WAL に Vocab + Tie の 2 op を流す。
@@ -6176,6 +6825,11 @@ impl Engine {
 
     /// `tie_text_async` の himo_id 直指定版。 text 本体は vocab 経由なので value はそのまま。
     pub fn tie_text_async_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: &str) {
+        self.tie_bytes_async_by_id(eid, himo_id, value.as_bytes());
+    }
+
+    /// `tie_text_async_by_id` の bytes 版 (0.9.0: content 互換層も使う)。
+    pub fn tie_bytes_async_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: &[u8]) {
         use std::sync::atomic::Ordering;
         self.check_writable();
         let local = enchudb_oplog::eid_local(eid);
@@ -6186,29 +6840,40 @@ impl Engine {
         self.validate_eid_for_himo(hid, local);
         // Tag は dedupe、Leaf は常に新規 id。
         let vid = match self.himo_types[hid] {
-            HimoType::Tag => self.vocab.get_or_insert(value.as_bytes()),
-            HimoType::Leaf => self.vocab.insert(value.as_bytes()),
-            ht => panic!("tie_text_async_by_id on non-text himo_id {}: {:?}", himo_id, ht),
+            HimoType::Tag => self.vocab.get_or_insert(value),
+            HimoType::Leaf => self.vocab.insert(value),
+            ht => panic!("tie_bytes_async_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
         assert!(vid < u32::MAX, "vocab vid must be < u32::MAX (sentinel reserved)");
+        // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
+        let q = self.write_queue.as_ref()
+            .expect("tie_text_async requires create_concurrent or concurrentize");
+        q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value: vid });
+        self.push_count.fetch_add(1, Ordering::Release);
         if let Some(wal) = self.oplog.as_ref() {
             // Vocab op を先に(sync の receiver 側で Tie より先に mapping が張られるよう)
             let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
-            let vocab_rec = enchudb_oplog::oplog::OwnedOp::Vocab { vid, bytes: value.as_bytes().to_vec() };
-            let tie_rec = enchudb_oplog::oplog::OwnedOp::Tie { eid: oplog_eid, himo_id, value: vid };
+            let vocab_rec = enchudb_oplog::oplog::OwnedOp::Vocab { vid, bytes: value.to_vec() };
+            let tie_rec = if self.himo_is_content(hid) {
+                // 0.9.0: 動的 content himo は id が peer 間で揃わないため名前で運ぶ
+                enchudb_oplog::oplog::OwnedOp::TieNamed {
+                    eid: oplog_eid,
+                    himo_name: self.himo_names[hid].clone(),
+                    himo_kind: self.himo_types[hid] as u8,
+                    value: vid,
+                }
+            } else {
+                enchudb_oplog::oplog::OwnedOp::Tie { eid: oplog_eid, himo_id, value: vid }
+            };
             if let Some(wq) = self.oplog_record_queue.as_ref() {
                 // Vocab → Tie の順を保つため同一 thread から連続 push
-                push_oplog_record_blocking(wq, vocab_rec);
-                push_oplog_record_blocking(wq, tie_rec);
+                push_oplog_record_blocking(wq, vocab_rec, &self.consumer_poisoned, &self.wal_push_count);
+                push_oplog_record_blocking(wq, tie_rec, &self.consumer_poisoned, &self.wal_push_count);
             } else {
                 let _ = wal.append(vocab_rec.as_op());
                 let _ = wal.append(tie_rec.as_op());
             }
         }
-        let q = self.write_queue.as_ref()
-            .expect("tie_text_async requires create_concurrent or concurrentize");
-        q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value: vid });
-        self.push_count.fetch_add(1, Ordering::Release);
     }
 
     /// v33: 非同期 tie_ref。target_eid の local 部(u32)を WAL / 本体に運ぶ。
@@ -6235,23 +6900,24 @@ impl Engine {
         self.validate_eid_for_himo(himo_id as usize, local);
         // β-light step 5: target_eid が target_table の eid range 内か
         self.validate_ref_tie(himo_id as usize, target_local);
-        if let Some(wal) = self.oplog.as_ref() {
-            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
-            let rec = enchudb_oplog::oplog::OwnedOp::Tie {
-                eid: oplog_eid, himo_id, value: target_local,
-            };
-            if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec);
-            } else {
-                let _ = wal.append(rec.as_op());
-            }
-        }
+        // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
         let q = self.write_queue.as_ref()
             .expect("tie_ref_async requires create_concurrent or concurrentize");
         q.push(crate::write_queue::Op::Tie {
             eid: local, himo_id, value: target_local,
         });
         self.push_count.fetch_add(1, Ordering::Release);
+        if let Some(wal) = self.oplog.as_ref() {
+            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
+            let rec = enchudb_oplog::oplog::OwnedOp::Tie {
+                eid: oplog_eid, himo_id, value: target_local,
+            };
+            if let Some(wq) = self.oplog_record_queue.as_ref() {
+                push_oplog_record_blocking(wq, rec, &self.consumer_poisoned, &self.wal_push_count);
+            } else {
+                let _ = wal.append(rec.as_op());
+            }
+        }
     }
 
     /// 非同期 untie。
@@ -6268,18 +6934,19 @@ impl Engine {
         debug_assert!((himo_id as usize) < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         if (himo_id as usize) >= self.himos.len() { return; }
+        // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
+        let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
+        q.push(crate::write_queue::Op::Untie { eid: local, himo_id });
+        self.push_count.fetch_add(1, Ordering::Release);
         if let Some(wal) = self.oplog.as_ref() {
             let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
             let rec = enchudb_oplog::oplog::OwnedOp::Untie { eid: oplog_eid, himo_id };
             if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec);
+                push_oplog_record_blocking(wq, rec, &self.consumer_poisoned, &self.wal_push_count);
             } else {
                 let _ = wal.append(rec.as_op());
             }
         }
-        let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
-        q.push(crate::write_queue::Op::Untie { eid: local, himo_id });
-        self.push_count.fetch_add(1, Ordering::Release);
     }
 
     /// 非同期 delete。
@@ -6287,44 +6954,30 @@ impl Engine {
         use std::sync::atomic::Ordering;
         self.check_writable();
         let local = enchudb_oplog::eid_local(eid);
+        // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
+        let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
+        q.push(crate::write_queue::Op::Delete { eid: local });
+        self.push_count.fetch_add(1, Ordering::Release);
         if let Some(wal) = self.oplog.as_ref() {
             let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
             let rec = enchudb_oplog::oplog::OwnedOp::Delete { eid: oplog_eid };
             if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec);
+                push_oplog_record_blocking(wq, rec, &self.consumer_poisoned, &self.wal_push_count);
             } else {
                 let _ = wal.append(rec.as_op());
             }
         }
-        let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
-        q.push(crate::write_queue::Op::Delete { eid: local });
-        self.push_count.fetch_add(1, Ordering::Release);
     }
 
     /// 非同期 content 書き込み。WAL 有効時はクラッシュ後も復元される。
-    /// key と data は Box に move される(消費される)。
+    ///
+    /// 0.9.0: 保存先を `_c_{key}` Leaf himo に変更 (`content` の doc 参照)。
+    /// WAL には `Op::Content` ではなく通常の `Op::Vocab` + `Op::Tie` が乗る。
     pub fn content_async(&self, eid: enchudb_oplog::EntityId, key: &str, data: &[u8]) {
-        use std::sync::atomic::Ordering;
         self.check_writable();
         let local = enchudb_oplog::eid_local(eid);
-        if let Some(wal) = self.oplog.as_ref() {
-            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
-            let rec = enchudb_oplog::oplog::OwnedOp::Content {
-                eid: oplog_eid, key: key.to_string(), data: data.to_vec(),
-            };
-            if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec);
-            } else {
-                let _ = wal.append(rec.as_op());
-            }
-        }
-        let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
-        q.push(crate::write_queue::Op::Content {
-            eid: local,
-            key: key.to_string().into_boxed_str(),
-            data: data.to_vec().into_boxed_slice(),
-        });
-        self.push_count.fetch_add(1, Ordering::Release);
+        let hid = self.ensure_content_himo(local, key);
+        self.tie_bytes_async_by_id(eid, hid, data);
     }
 
     /// 現在のトランザクションを WAL に commit marker で確定する。
@@ -6349,7 +7002,19 @@ impl Engine {
         loop {
             let pushed = self.push_count.load(Ordering::Acquire);
             let applied = self.apply_count.load(Ordering::Acquire);
-            if applied >= pushed { return; }
+            // WAL record queue も barrier に含める: op は queue 先行・record
+            // 後追い (#77-H4) なので、 apply_count だけで返ると「op は適用済み
+            // だが WAL record は queue 内」の窓が残り、 直後の oplog_sync が
+            // record を含まない WAL に Commit + fsync してしまう
+            // (= fsync 済みのはずの write が crash で消える durability 破れ)。
+            let wal_pushed = self.wal_push_count.load(Ordering::Acquire);
+            let wal_appended = self.wal_append_count.load(Ordering::Acquire);
+            if applied >= pushed && wal_appended >= wal_pushed { return; }
+            // #77-M2: consumer が死んでいたら barrier は永遠に成立しない。
+            // silent hang ではなく診断可能な panic で失敗する。
+            if self.consumer_poisoned.load(Ordering::Acquire) {
+                panic!("enchudb consumer thread has panicked — flush_writes cannot complete (#77-M2)");
+            }
             std::thread::yield_now();
         }
     }
@@ -6418,6 +7083,9 @@ impl Drop for Engine {
                 let pushed = self.push_count.load(Ordering::Acquire);
                 let applied = self.apply_count.load(Ordering::Acquire);
                 if applied >= pushed { break; }
+                // #77-M2: consumer 死亡時は待っても進まない。 Drop は panic せず
+                // 諦めて shutdown へ進む (未 apply 分は失われるが、 hang しない)。
+                if self.consumer_poisoned.load(Ordering::Acquire) { break; }
                 std::thread::yield_now();
             }
         }
@@ -8069,6 +8737,120 @@ mod tests {
         let eng2 = Engine::open_standalone(&dir).unwrap();
         eng2.rebuild();
         assert_eq!(eng2.query(&[("score", 30)]).len(), 1);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    // ──── 0.9.0: ensure_himo_dynamic (&self himo definition) ────
+
+    /// `Arc<Engine>` (create_concurrent) から 4 thread 並行で
+    /// `ensure_himo_dynamic` を叩く。 同名 → 同 hid (idempotent)、 hid 重複
+    /// なし、 動的定義 himo の tie_to_by_id / get_by_id round-trip を確認。
+    #[test]
+    fn ensure_himo_dynamic_concurrent_idempotent() {
+        let dir = tmp("himo_dyn_conc");
+        let eng = Engine::create_concurrent(&dir).unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+        for t in 0..4u32 {
+            let e = eng.clone();
+            let b = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                let mut shared_ids = Vec::new();
+                let mut own_ids = Vec::new();
+                for i in 0..8u32 {
+                    // 全 thread 共通名 (奇偶 2 種) と thread 固有名を混ぜる
+                    let shared = e
+                        .ensure_himo_dynamic(
+                            &format!("dyn_shared_{}", i % 2),
+                            HimoType::Number,
+                            0,
+                        )
+                        .unwrap();
+                    let own = e
+                        .ensure_himo_dynamic(
+                            &format!("dyn_own_{}_{}", t, i),
+                            HimoType::Number,
+                            0,
+                        )
+                        .unwrap();
+                    shared_ids.push((i % 2, shared));
+                    own_ids.push(own);
+                }
+                (shared_ids, own_ids)
+            }));
+        }
+
+        let mut shared_by_name: std::collections::HashMap<u32, u16> =
+            std::collections::HashMap::new();
+        let mut all_own: Vec<u16> = Vec::new();
+        for h in handles {
+            let (shared_ids, own_ids) = h.join().unwrap();
+            for (name_key, hid) in shared_ids {
+                // idempotent: 同名は全 thread / 全呼び出しで同じ hid
+                if let Some(prev) = shared_by_name.insert(name_key, hid) {
+                    assert_eq!(prev, hid, "same name resolved to different hids");
+                }
+            }
+            all_own.extend(own_ids);
+        }
+
+        // 固有名 4 thread × 8 個 + 共有名 2 個 = 34 hid、 重複なし
+        let mut everything: Vec<u16> = all_own.clone();
+        everything.extend(shared_by_name.values().copied());
+        let total = everything.len();
+        assert_eq!(total, 4 * 8 + 2);
+        everything.sort_unstable();
+        everything.dedup();
+        assert_eq!(everything.len(), total, "duplicate hid assigned");
+        assert_eq!(eng.himo_count(), 34);
+
+        // 定義済み名の再呼び出しは lock-free fast path で同 hid
+        let again = eng
+            .ensure_himo_dynamic("dyn_shared_0", HimoType::Number, 0)
+            .unwrap();
+        assert_eq!(again, shared_by_name[&0]);
+
+        // 動的定義した himo で tie_to_by_id / get_by_id round-trip
+        let hid = eng
+            .ensure_himo_dynamic("dyn_roundtrip", HimoType::Number, 0)
+            .unwrap();
+        let e0 = eng.entity();
+        eng.tie_to_by_id(e0, hid, 42);
+        assert_eq!(eng.get_by_id(e0, hid), Some(42));
+
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// `ensure_himo_dynamic_in`: named table への lazy 定義も `&self` で通り、
+    /// 旧 `define_himo_in` と同じ attach semantics になることを確認。
+    #[test]
+    fn ensure_himo_dynamic_in_attaches_to_table() {
+        let dir = tmp("himo_dyn_in");
+        let mut eng = Engine::create_standalone(&dir).unwrap();
+        eng.define_table("users", 100).unwrap();
+        let eng = std::sync::Arc::new(eng);
+
+        let hid = eng
+            .ensure_himo_dynamic_in("users", "age", HimoType::Number, 0)
+            .unwrap();
+        // idempotent: 2 回目は同 hid
+        let hid2 = eng
+            .ensure_himo_dynamic_in("users", "age", HimoType::Number, 0)
+            .unwrap();
+        assert_eq!(hid, hid2);
+        // full name で引ける + table attach 済み
+        assert_eq!(eng.himo_id("users.age"), Some(hid as usize));
+        let e = eng.entity_in("users").unwrap();
+        eng.tie_to_by_id(e, hid, 30);
+        assert_eq!(eng.get_by_id(e, hid), Some(30));
+
+        // 未定義 table は Err
+        assert!(eng
+            .ensure_himo_dynamic_in("nope", "x", HimoType::Number, 0)
+            .is_err());
+
         let _ = std::fs::remove_file(&dir);
     }
 }

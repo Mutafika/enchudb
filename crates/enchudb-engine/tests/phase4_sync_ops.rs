@@ -78,21 +78,19 @@ fn transfer_and_pending_roundtrip() {
     eng.flush_writes();
     eng.oplog_sync().unwrap();
 
-    // _sync_ops に転送
+    // 0.9.0: oplog_sync が checkpoint 前進と同時に bridge も済ませる
+    // (try_reset が bridge 未了 record を wipe しないための契約)。
+    // 手動 transfer は追いつき済みで 0 件 = idempotent。
     let count = eng.transfer_oplog_to_sync_ops();
-    assert!(count > 0, "should transfer some records, got {count}");
+    assert_eq!(count, 0, "oplog_sync should have bridged already, got {count}");
 
-    // pending_sync_ops(since=0) で全件取れる
+    // pending_sync_ops(since=0) で bridge 済み全件が取れる (3 ties + commit 等)
     let pending = eng.pending_sync_ops(0);
-    assert_eq!(pending.len(), count, "pending should equal transferred count");
+    assert!(pending.len() >= 3, "expected >= 3 bridged records, got {}", pending.len());
     // 各 payload は non-empty (= wire bytes)
     for p in &pending {
         assert!(!p.is_empty());
     }
-
-    // 2 度目の transfer は idempotent (= 既に転送済み、 0 件)
-    let count2 = eng.transfer_oplog_to_sync_ops();
-    assert_eq!(count2, 0, "second transfer should be idempotent");
 
     cleanup(&path);
 }
@@ -118,10 +116,12 @@ fn ack_and_watermark_drive_reclaim() {
     eng.flush_writes();
     eng.oplog_sync().unwrap();
 
+    // 0.9.0: oplog_sync が bridge も済ませるので手動 transfer は 0 件
     let transferred = eng.transfer_oplog_to_sync_ops();
-    assert!(transferred >= 5, "should transfer at least the 5 ties");
+    assert_eq!(transferred, 0, "oplog_sync should have bridged already");
 
     let initial_pending = eng.pending_sync_ops(0).len();
+    assert!(initial_pending >= 5, "expected the 5 ties bridged, got {initial_pending}");
 
     // watermark = 0 (= 誰も ack してない、 reclaim できない)
     assert_eq!(eng.sync_watermark(), 0);

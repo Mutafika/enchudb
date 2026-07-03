@@ -63,8 +63,14 @@ pub struct GrowableMap {
     reserved: usize,
     /// File-backed bytes within the reservation. Atomic so a writer
     /// can read it on the hot path without locking; growth itself is
-    /// serialized (caller must hold whatever store-side lock applies).
+    /// serialized by `grow_lock` (#74 — caller-side の直列化は当てに
+    /// しない。 writer thread の vocab grow と consumer thread の
+    /// content grow が実際に並走する)。
     committed: AtomicUsize,
+    /// #74: grow の直列化。 stale な `committed` を読んだ 2 本目の grow が
+    /// ftruncate で縮小 → 書き込み済み data 破棄 + SIGBUS を防ぐ。
+    /// hot path (committed 読み) はロックを取らない。
+    grow_lock: std::sync::Mutex<()>,
     /// 直近 `flush_dirty` 以降に書き込まれた byte 範囲の lo (inclusive)。
     /// usize::MAX = clean (writes 無し)。 writer は `mark_dirty(off, len)`
     /// で fetch_min、 consumer は `flush_dirty` で snapshot + reset。
@@ -152,6 +158,7 @@ impl GrowableMap {
             base: base as *mut u8,
             reserved: reserve,
             committed: AtomicUsize::new(initial),
+            grow_lock: std::sync::Mutex::new(()),
             dirty_lo: AtomicUsize::new(usize::MAX),
             dirty_hi: AtomicUsize::new(0),
         })
@@ -161,14 +168,18 @@ impl GrowableMap {
     /// Idempotent: if already committed past `new_size`, returns
     /// without syscalls. Page-aligns the request.
     ///
-    /// Caller is responsible for serializing concurrent grows (the
-    /// store layer's existing lock, typically). Multi-process safety:
-    /// if another process already grew the underlying file, this call
-    /// will still execute the MAP_FIXED to bring our address space in
-    /// line — `ftruncate` is a no-op when the file is already large
-    /// enough.
+    /// #74: 内部で `grow_lock` により直列化する (caller 側の排他には
+    /// 依存しない)。 また `ftruncate` は**ファイルを縮小できる**ため、
+    /// 現ファイルサイズより大きい場合のみ実行する — 並行 grow / 別
+    /// プロセスの先行 grow を縮めて data 破棄 + SIGBUS になるのを防ぐ。
     pub fn grow_to(&self, new_size: usize) -> io::Result<()> {
         let aligned = align_up(new_size, PAGE_SIZE);
+        // hot path: ロックなしの早期 return
+        if aligned <= self.committed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let _g = self.grow_lock.lock().unwrap_or_else(|p| p.into_inner());
+        // lock 下で再チェック (並走した grow が先に伸ばしたケース)
         let cur = self.committed.load(Ordering::Acquire);
         if aligned <= cur {
             return Ok(());
@@ -184,12 +195,18 @@ impl GrowableMap {
             ));
         }
 
-        // Step 1: extend the file. `ftruncate` is idempotent — if
-        // another process already grew it past `aligned`, this is
-        // a no-op (returns 0 without changing the file).
-        let rc = unsafe { libc::ftruncate(self.fd, aligned as i64) };
-        if rc < 0 {
+        // Step 1: extend the file — ただし現サイズより大きい時のみ。
+        // 別プロセスが既に aligned 超へ伸ばしていた場合の縮小を防ぐ
+        // (同一プロセス内は grow_lock で直列化済み)。
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(self.fd, &mut st) } < 0 {
             return Err(io::Error::last_os_error());
+        }
+        if (st.st_size as u64) < aligned as u64 {
+            let rc = unsafe { libc::ftruncate(self.fd, aligned as i64) };
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
 
         // Step 2: re-map the entire file [0..aligned) over the
@@ -415,6 +432,47 @@ mod tests {
         buf[4095] = 0xCD;
         assert_eq!(buf[0], 0xAB);
         assert_eq!(buf[4095], 0xCD);
+    }
+
+    /// #74 regression: 並行 grow が ftruncate でファイルを縮小して
+    /// 書き込み済み data を破棄しないこと。旧実装では大きい grow の後に
+    /// stale な committed を読んだ小さい grow が ftruncate(小) を実行し、
+    /// [小, 大) の data がゼロ化 + mapping が EOF 越えで SIGBUS していた。
+    #[test]
+    fn concurrent_grows_never_shrink() {
+        use std::sync::Arc;
+        let f = fresh("concurrent");
+        let map = Arc::new(GrowableMap::new(f, 256 * 1024 * 1024, 4096).unwrap());
+
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let m = map.clone();
+                std::thread::spawn(move || {
+                    // thread ごとに違う target サイズで grow を繰り返す
+                    for round in 1..=20usize {
+                        let target = 4096 * (1 + (i * 7 + round * 13) % 512);
+                        m.grow_to(target).unwrap();
+                        // grow 直後、自分の target までは必ず書けること
+                        let committed = m.committed();
+                        assert!(committed >= (target + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE
+                                || committed >= target,
+                                "committed {committed} < target {target}");
+                        let buf = unsafe {
+                            std::slice::from_raw_parts_mut(m.base(), committed)
+                        };
+                        buf[target - 1] = 0xEE; // SIGBUS しないこと
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        // committed は単調増加のはず。最後に全域が読めること
+        let final_committed = map.committed();
+        let buf = unsafe { std::slice::from_raw_parts(map.base(), final_committed) };
+        let _ = buf[final_committed - 1];
     }
 
     #[test]

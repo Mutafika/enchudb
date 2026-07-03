@@ -30,8 +30,6 @@ pub enum Op {
     Untie { eid: u32, himo_id: u16 },
     /// entity ごと削除。
     Delete { eid: u32 },
-    /// 非索引コンテンツ。WAL に載せるため owned 型で保持。
-    Content { eid: u32, key: Box<str>, data: Box<[u8]> },
     /// entity 作成 marker。 writer thread の `entity()` は slot allocation のみで戻り、
     /// この op を consumer 経由で空回しさせて `flush_writes` の barrier counter
     /// (`push_count` / `apply_count`) と整合を取る (issue5)。 payload は無し、
@@ -41,6 +39,10 @@ pub enum Op {
 
 pub struct WriteQueue {
     queue: ArrayQueue<Op>,
+    /// #77-M2: consumer thread が panic したら true。 満杯 queue で yield spin
+    /// している producer を永久に待たせない (consumer が死んでいる = queue は
+    /// もう掃けない) ための脱出フラグ。
+    poisoned: std::sync::atomic::AtomicBool,
 }
 
 impl WriteQueue {
@@ -52,7 +54,21 @@ impl WriteQueue {
     /// capacity 指定。 0 は無効 (panic)。
     pub fn with_capacity(cap: usize) -> Self {
         assert!(cap > 0, "WriteQueue capacity must be > 0");
-        Self { queue: ArrayQueue::new(cap) }
+        Self {
+            queue: ArrayQueue::new(cap),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// #77-M2: consumer thread の panic 時に立てる。 以後の blocking push は
+    /// 無限待ちではなく panic で失敗する (診断可能なエラー化)。
+    pub fn poison(&self) {
+        self.poisoned.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[inline]
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// blocking push。 queue が満杯なら consumer の進捗を yield ループで待つ。
@@ -65,6 +81,9 @@ impl WriteQueue {
             match self.queue.push(op) {
                 Ok(()) => return,
                 Err(returned) => {
+                    if self.is_poisoned() {
+                        panic!("enchudb consumer thread has panicked — write queue is dead (#77-M2)");
+                    }
                     op = returned;
                     std::thread::yield_now();
                 }

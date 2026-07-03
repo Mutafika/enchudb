@@ -43,7 +43,13 @@ pub fn content_key_hash15(s: &str) -> u16 {
         h ^= b as u32;
         h = h.wrapping_mul(0x01000193);
     }
-    (h as u16) & 0x7fff
+    // #78: `% 0x7fff` で値域を 0..=0x7FFE に制限する。 旧 `& 0x7fff` は 0x7FFF を
+    // 返し得て、 caller の `hash | 0x8000` が 0xFFFF = Delete tombstone sentinel
+    // (u16::MAX) と衝突 — 該当 key への Content 書き込みが偽 tombstone を作り、
+    // 以後の op が「削除済み」として skip / 正規 Delete が適用されない / .eidmap
+    // に偽 tombstone が永続化されていた。 0.9.0 以降この hash は legacy Content
+    // (pre-0.9 WAL) の HLC slot にのみ使われる。
+    (h as u16) % 0x7fff
 }
 
 /// v32: Entity ID。u64 = `[peer_id: 32bit][local_id: 32bit]`。
