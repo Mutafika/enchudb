@@ -129,34 +129,34 @@ fn oplog_truncation_mid_record_recovers() {
 #[test]
 fn double_writer_open_blocks_until_first_drops() {
     // 0.7.0 設計: flock(LOCK_EX) は **blocking** (SQLite と同様、 取れるまで待つ)。
-    // = 2 番目の writer open は 1 番目が drop するまで return しない。
+    // #80: ただし **同一プロセス**の二重 open は flock では検知できず無期限
+    // ハングになるため、 プロセス内 registry で fast-fail する仕様に変更。
+    // 別プロセス writer との blocking 排他は従来通り。
     let path = tmp_path("double_writer");
     cleanup(&path);
 
     let eng1 = Engine::create_with_capacity(&path, 65_536).unwrap();
 
-    let path_clone = path.clone();
-    let (tx, rx) = std::sync::mpsc::channel();
-    let handle = std::thread::spawn(move || {
-        let eng2 = Engine::open_standalone(&path_clone);
-        tx.send(eng2.is_ok()).ok();
-    });
-
-    // 800ms 待っても 2 番目が return してこないこと = blocking が効いてる証拠
-    let timeout = std::time::Duration::from_millis(800);
-    match rx.recv_timeout(timeout) {
-        Ok(_) => panic!("second writer open returned too early — blocking flock not honored"),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {} // 期待挙動
-        Err(e) => panic!("unexpected channel error: {e:?}"),
+    // 同一プロセスの 2 番目の writer open は block せず即エラー
+    let started = std::time::Instant::now();
+    match Engine::open_standalone(&path) {
+        Ok(_) => panic!("second writer open in the same process should fail fast"),
+        Err(e) => {
+            assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
+            assert!(e.to_string().contains("already open for writing in this process"));
+        }
     }
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "fast-fail should not block"
+    );
 
     // 1 番目を drop すれば 2 番目が成功する
     drop(eng1);
-    let ok = rx.recv_timeout(std::time::Duration::from_secs(5))
-        .expect("second writer should unblock after first drop");
-    assert!(ok, "second writer should succeed after first drop");
+    let eng2 = Engine::open_standalone(&path);
+    assert!(eng2.is_ok(), "second writer should succeed after first drop");
+    drop(eng2);
 
-    handle.join().unwrap();
     cleanup(&path);
 }
 

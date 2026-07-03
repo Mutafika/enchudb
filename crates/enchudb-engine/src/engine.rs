@@ -440,11 +440,47 @@ fn push_oplog_record_blocking(
     }
 }
 
-/// `.db.lock` に flock(LOCK_EX) を取り、 fd を返す。 fd が drop されると lock も解放。
-/// 取得できないと **block する** (= sqlite と同様、 取れるまで待つ)。
-/// readonly open は呼ばない。 writer 系の open / create だけ呼ぶ。
+/// 同一プロセス内で writer lock を保持中の lock path の registry (#80)。
+/// flock は open file description 単位なので、同一プロセスからの二重 open は
+/// block 検知できず無期限ハングになる。flock に入る前にここで fast-fail する。
 #[cfg(not(target_arch = "wasm32"))]
-fn acquire_writer_lock(path: &str) -> io::Result<std::fs::File> {
+static WRITER_LOCK_REGISTRY: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+#[cfg(not(target_arch = "wasm32"))]
+fn writer_registry() -> std::sync::MutexGuard<'static, std::collections::HashSet<std::path::PathBuf>>
+{
+    WRITER_LOCK_REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// writer lock の保持を表す guard。 drop で registry から抜け、 fd close で
+/// flock も解放される。
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct WriterLock {
+    _file: std::fs::File,
+    key: std::path::PathBuf,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        writer_registry().remove(&self.key);
+        // `_file` はこの後 drop され、 close で flock が解放される。
+        // registry 解除 → close の順なので、 競合した同一プロセスの open は
+        // fast-fail ではなく一瞬 flock で待ってから取得する (spurious error なし)。
+    }
+}
+
+/// `.db.lock` に flock(LOCK_EX) を取り、 guard を返す。 guard が drop されると
+/// lock も解放。 **別プロセス**が保持中は block する (= sqlite と同様、 取れる
+/// まで待つ)。 **同一プロセス**が既に保持中は block せず即エラー (#80、
+/// `ErrorKind::WouldBlock`)。 readonly open は呼ばない。 writer 系の
+/// open / create だけ呼ぶ。
+#[cfg(not(target_arch = "wasm32"))]
+fn acquire_writer_lock(path: &str) -> io::Result<WriterLock> {
     use std::os::fd::AsRawFd;
     let lock_path = writer_lock_path_for(path);
     if let Some(parent) = lock_path.parent() {
@@ -457,11 +493,25 @@ fn acquire_writer_lock(path: &str) -> io::Result<std::fs::File> {
         .write(true)
         .truncate(false)
         .open(&lock_path)?;
+    // 直前に create 済みなので canonicalize は通常成功する (symlink / 相対 path
+    // の表記揺れで registry をすり抜けないための正規化)。
+    let key = lock_path.canonicalize().unwrap_or(lock_path);
+    if !writer_registry().insert(key.clone()) {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "\"{path}\" is already open for writing in this process \
+                 (drop the existing Engine handle first, or use open_readonly)"
+            ),
+        ));
+    }
     let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
     if rc != 0 {
-        return Err(io::Error::last_os_error());
+        let err = io::Error::last_os_error();
+        writer_registry().remove(&key);
+        return Err(err);
     }
-    Ok(f)
+    Ok(WriterLock { _file: f, key })
 }
 
 /// `snapshot_export` の結果。どのファイルを書き出したか。
@@ -1134,7 +1184,7 @@ pub struct Engine {
     /// flock(LOCK_EX)、 Engine drop で fd close = lock release。 readonly では None。
     /// 多 process write の同 .db 競合を防ぐ (sqlite WAL モード相当)。
     #[cfg(not(target_arch = "wasm32"))]
-    _writer_lock: Option<std::fs::File>,
+    _writer_lock: Option<WriterLock>,
     backing: Backing, // 最後に drop されるよう最終フィールド
 }
 
@@ -7893,7 +7943,6 @@ mod tests {
     /// 排他を確認、 1st を drop すると 2nd が unblock。
     #[test]
     fn writer_blocks_concurrent_writer() {
-        use std::sync::mpsc;
         let p = tmp("writer_block");
         {
             let mut eng = Engine::create_standalone(&p).unwrap();
@@ -7902,26 +7951,21 @@ mod tests {
         }
         let eng_a = Engine::open_standalone(&p).unwrap();
 
-        // 別 thread で 2 nd open_standalone を試みる。 block するはず。
-        let (tx, rx) = mpsc::channel::<()>();
-        let p_clone = p.clone();
-        let h = std::thread::spawn(move || {
-            let _eng_b = Engine::open_standalone(&p_clone).unwrap();
-            tx.send(()).unwrap();
-        });
+        // #80: 同一プロセスの 2nd writer open は flock で block せず即エラー。
+        // (別プロセス writer との排他は従来通り blocking flock — そちらは
+        //  tests/content_store_cross_process.rs 系の subprocess テストで担保)
+        let err = match Engine::open_standalone(&p) {
+            Ok(_) => panic!("2nd open_standalone should fail fast in the same process"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(err.to_string().contains("already open for writing in this process"));
 
-        // 200 ms 以内に取れちゃったら lock が効いてない
-        match rx.recv_timeout(std::time::Duration::from_millis(200)) {
-            Ok(_) => panic!("2nd open_standalone should have been blocked"),
-            Err(mpsc::RecvTimeoutError::Timeout) => {} // expected
-            Err(e) => panic!("unexpected: {:?}", e),
-        }
-
-        // 1 st を drop → 2 nd が unblock
+        // 1 st を drop → 再 open できる
         drop(eng_a);
-        rx.recv_timeout(std::time::Duration::from_secs(2))
+        let eng_b = Engine::open_standalone(&p)
             .expect("2nd open should succeed after 1st drop");
-        h.join().unwrap();
+        drop(eng_b);
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(format!("{}.lock", p));
     }
