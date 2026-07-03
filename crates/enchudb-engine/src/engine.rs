@@ -423,16 +423,21 @@ fn writer_lock_path_for(path: &str) -> std::path::PathBuf {
 
 /// `oplog_record_queue` (= bounded ArrayQueue) への blocking push。
 /// queue 満杯時は `yield_now` で consumer の進捗を待つ (issue4 backpressure)。
+/// #77-M2: consumer 死亡 (poisoned) 時は無限待ちせず panic で失敗する。
 #[inline]
 fn push_oplog_record_blocking(
     wq: &crossbeam_queue::ArrayQueue<enchudb_oplog::oplog::OwnedOp>,
     rec: enchudb_oplog::oplog::OwnedOp,
+    poisoned: &std::sync::atomic::AtomicBool,
 ) {
     let mut rec = rec;
     loop {
         match wq.push(rec) {
             Ok(()) => return,
             Err(returned) => {
+                if poisoned.load(std::sync::atomic::Ordering::Acquire) {
+                    panic!("enchudb consumer thread has panicked — WAL record queue is dead (#77-M2)");
+                }
                 rec = returned;
                 std::thread::yield_now();
             }
@@ -852,6 +857,20 @@ impl Layout {
         let content_data_size = content_data_size.unwrap_or_else(ContentStore::data_region_size);
         let cyl_max_values = cyl_max_values.unwrap_or(DEFAULT_CYL_MAX_VALUES);
 
+        // #77: data_end (vocab / content) は mmap 上の AtomicU32 で、 index の
+        // offset/len も u32。 4 GiB 超の data region を許すと append offset が
+        // wrap して先頭から silent 上書きするため、 create 時点で拒否する。
+        assert!(
+            vocab_data_size <= u32::MAX as usize,
+            "vocab_data_size {} exceeds format limit {} (u32 data_end)",
+            vocab_data_size, u32::MAX,
+        );
+        assert!(
+            content_data_size <= u32::MAX as usize,
+            "content_data_size {} exceeds format limit {} (u32 data_end)",
+            content_data_size, u32::MAX,
+        );
+
         Self::from_params(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
@@ -1117,6 +1136,10 @@ pub struct Engine {
     /// owned record を push。 consumer thread が drain して `wal.append_many` で
     /// 1 flock サイクル N records にまとめる (per-record flock コスト償却)。
     oplog_record_queue: Option<std::sync::Arc<crossbeam_queue::ArrayQueue<enchudb_oplog::oplog::OwnedOp>>>,
+    /// #77-M2: consumer thread が panic すると true。 flush_writes / Drop の
+    /// barrier spin と producer の blocking push が「絶対に進まない待ち」に
+    /// 陥らないための脱出フラグ。
+    consumer_poisoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 背景 fsync が最後に completed した LSN。
     durable_lsn: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// v32: この Engine を所有する peer の id。分散時 eid の上位 32bit。
@@ -1315,6 +1338,7 @@ impl Engine {
             apply_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             oplog: None,
             oplog_record_queue: None,
+            consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -1563,6 +1587,7 @@ impl Engine {
             apply_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             oplog: None,
             oplog_record_queue: None,
+            consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -1952,12 +1977,14 @@ impl Engine {
             unsafe { Region::new(base.add(layout.vocab_data_off), layout.vocab_data_size) },
             unsafe { Region::new(base.add(layout.vocab_offsets_off), layout.vocab_offsets_size) },
             unsafe { Region::new(base.add(layout.vocab_index_off), layout.vocab_index_size) },
+            readonly, // #77-H1: readonly は共有 index を書き換えず shadow へ rebuild
         );
         report("Vocabulary::load", &mut t, &mut p);
         let himo_reg = Vocabulary::load(
             unsafe { Region::new(base.add(layout.himoreg_data_off), layout.himoreg_data_size) },
             unsafe { Region::new(base.add(layout.himoreg_offsets_off), layout.himoreg_offsets_size) },
             unsafe { Region::new(base.add(layout.himoreg_index_off), layout.himoreg_index_size) },
+            readonly,
         );
         report("himo_reg(Vocabulary)", &mut t, &mut p);
         let contents = ContentStore::load(
@@ -2014,6 +2041,7 @@ impl Engine {
             apply_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             oplog: None,
             oplog_record_queue: None,
+            consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -2192,7 +2220,45 @@ impl Engine {
             self.define_himo_in("_sync_peers", "last_seen_at", HimoType::Number, 0)?;
         }
 
+        // #77-H6: 既存 DB の再 enable (reopen 経路) では、 body に残る過去 rows /
+        // watermark から lsn 採番を復元する。
+        self.rehydrate_next_sync_lsn();
+
         Ok(())
+    }
+
+    /// #77-H6: `next_sync_lsn` を既存 `_sync_ops` rows と `_sync_peers.consumed_lsn`
+    /// から復元する。 全 constructor が 1 固定で初期化するため、 reopen 後にこれを
+    /// 呼ばないと lsn 採番が 1 に戻り、 peer の ack 済み watermark より小さい lsn
+    /// が発行されて `pending_sync_ops(since)` が永久に空 = **再起動後の全 write が
+    /// 既存 peer に配信されない** silent loss になっていた。
+    fn rehydrate_next_sync_lsn(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.sync_tables_enabled() { return; }
+        let mut max_lsn = 0u32;
+        if let Some(lsn_hid) = self.himo_id("_sync_ops.lsn") {
+            let hid = lsn_hid as u16;
+            for eid in self.entities_with_himo(hid) {
+                if let Some(l) = self.get_by_id(eid, hid) {
+                    if l > max_lsn { max_lsn = l; }
+                }
+            }
+        }
+        if let Some(cons_hid) = self.himo_id("_sync_peers.consumed_lsn") {
+            let hid = cons_hid as u16;
+            for eid in self.entities_with_himo(hid) {
+                if let Some(l) = self.get_by_id(eid, hid) {
+                    if l > max_lsn { max_lsn = l; }
+                }
+            }
+        }
+        if max_lsn > 0 {
+            // 既に進んでいる場合は後退させない (enable → open の二重呼び等)
+            let cur = self.next_sync_lsn.load(Ordering::Acquire);
+            if max_lsn.saturating_add(1) > cur {
+                self.next_sync_lsn.store(max_lsn + 1, Ordering::Release);
+            }
+        }
     }
 
     /// 0.7.0 (Phase 3): sync tables が有効化済みか。 schema crate / Syncer が
@@ -2218,8 +2284,13 @@ impl Engine {
         let _guard = self.transfer_lock.lock().unwrap();
 
         let from = self.sync_ops_offset.load(Ordering::Acquire);
-        let records = wal.iter_committed_from(from);
+        // #77-H4: cursor は「読み切った commit 済み group の終端」までしか
+        // 進めない。 scan 後の wal.head() 再読は、 書き込み途中 record での
+        // break 位置〜head 間の record を恒久 skip していた (#63 と同 class)。
+        let (records, committed_end) = wal.iter_committed_from_with_end(from);
         if records.is_empty() {
+            // 空 commit group だけ読み進んだ場合も cursor は安全に前進できる
+            self.sync_ops_offset.store(committed_end, Ordering::Release);
             return 0;
         }
 
@@ -2268,8 +2339,11 @@ impl Engine {
                 Err(_) => {
                     // eid_range exhausted: 0.7.0 では追加 row insert を諦める
                     // (= 0.8.0 で ring buffer 化)。 ここまでの転送は維持。
-                    let last_offset = wal.head(); // 部分転送、 次回は head から再開
-                    self.sync_ops_offset.store(last_offset, Ordering::Release);
+                    // #77-H4: 旧実装は wal.head() まで飛ばして書き込み途中
+                    // record まで skip していた。 committed_end 止まりに変更
+                    // (残り未転送分はこの group 内のため落ちるが、 in-flight
+                    // record の恒久 skip は防ぐ)。
+                    self.sync_ops_offset.store(committed_end, Ordering::Release);
                     return count;
                 }
             };
@@ -2301,8 +2375,8 @@ impl Engine {
             self.tie_bytes_to_by_id(row_eid, payload_hid, &wire_payload);
         }
 
-        // 全部転送できた、 offset を head に進める
-        self.sync_ops_offset.store(wal.head(), Ordering::Release);
+        // 全部転送できた、 offset を「読み切った commit 済み終端」に進める (#77-H4)
+        self.sync_ops_offset.store(committed_end, Ordering::Release);
         count
     }
 
@@ -5443,6 +5517,7 @@ impl Engine {
         let eng = Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)?;
         let oplog_path = oplog_path_for(path);
         let wal = std::sync::Arc::new(enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?);
+        eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
     }
 
@@ -5483,12 +5558,19 @@ impl Engine {
             for rec in &records {
                 eng.apply_oplog_op(&rec.op);
             }
-            // 本体に適用し終えたので checkpoint を head まで前進
+            // #77-H2: 適用効果を disk に固めてから checkpoint を前進する。
+            // 旧順序 (apply → 即 checkpoint) は kernel が checkpoint header を
+            // body より先に writeback すると、 recovery 直後の再 crash で
+            // 「一度 durable だった committed record」 が replay 対象外になり
+            // 恒久消失した。
+            let _ = eng.body_msync();
+            let _ = w.fsync();
             w.advance_checkpoint(w.head());
             std::sync::Arc::new(w)
         } else {
             std::sync::Arc::new(enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?)
         };
+        eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
     }
 
@@ -5596,11 +5678,15 @@ impl Engine {
             for rec in &records {
                 eng.apply_oplog_op(&rec.op);
             }
+            // #77-H2: body msync → checkpoint の順 (open_concurrent_with_oplog と同じ)
+            let _ = eng.body_msync();
+            let _ = w.fsync();
             w.advance_checkpoint(w.head());
             std::sync::Arc::new(w)
         } else {
             std::sync::Arc::new(enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?)
         };
+        eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
     }
 
@@ -5625,8 +5711,11 @@ impl Engine {
             return;
         }
         let start = emit_offset.load(Ordering::Acquire);
-        let recs = wal.iter_committed_from(start);
+        // #77-H4: cursor は commit 済み終端まで。 head 再読は in-flight record の
+        // 恒久 skip (listener への通知漏れ) を起こしていた。
+        let (recs, committed_end) = wal.iter_committed_from_with_end(start);
         if recs.is_empty() {
+            emit_offset.store(committed_end, Ordering::Release);
             return;
         }
         let wires: Vec<crate::transport::WireRecord> =
@@ -5634,7 +5723,7 @@ impl Engine {
         for listener in guard.iter() {
             listener.on_changes(&wires);
         }
-        emit_offset.store(wal.head(), Ordering::Release);
+        emit_offset.store(committed_end, Ordering::Release);
     }
 
     fn spawn_consumer_with_oplog(
@@ -5682,12 +5771,35 @@ impl Engine {
         let durable_lsn_for_thread = arc.durable_lsn.clone();
         let listeners_for_thread = arc.change_listeners.clone();
         let emit_offset_for_thread = arc.change_emit_offset.clone();
+        let poisoned_for_thread = arc.consumer_poisoned.clone();
+
+        // #77-M2: consumer が panic した場合に unwind 経路で poison を立てる
+        // guard。 これが無いと apply_count が永久に追いつかず、 flush_writes /
+        // Drop の barrier spin と満杯 queue の producer が全員無限待ちになる
+        // (旧 behavior: content cap 超過等の panic でプロセス全体が silent hang)。
+        struct PoisonOnPanic {
+            flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            queue: std::sync::Arc<crate::write_queue::WriteQueue>,
+        }
+        impl Drop for PoisonOnPanic {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    self.flag.store(true, std::sync::atomic::Ordering::Release);
+                    self.queue.poison();
+                    eprintln!("[enchudb] consumer thread panicked — engine poisoned, subsequent writes/flushes will fail fast");
+                }
+            }
+        }
 
         let handle = std::thread::Builder::new()
             .name("enchudb-consumer".into())
             .spawn(move || {
                 use std::sync::atomic::Ordering;
                 use std::time::{Duration, Instant};
+                let _poison_guard = PoisonOnPanic {
+                    flag: poisoned_for_thread,
+                    queue: q_for_thread.clone(),
+                };
                 let engine: &Engine = unsafe { &*(engine_addr as *const Engine) };
                 let fsync_interval = Duration::from_millis(100);
                 let mut last_fsync = Instant::now();
@@ -5719,6 +5831,14 @@ impl Engine {
                         if last_fsync.elapsed() >= fsync_interval {
                             if wal.head() > wal.checkpoint() {
                                 let _ = wal.append(enchudb_oplog::oplog::Op::Commit);
+                                // #77-H3: checkpoint の上限は「今回の fsync/msync に
+                                // 含まれることが確定した位置」= Commit append 直後の
+                                // head。 msync 後に head を再読すると、 その間に
+                                // append された record が「body 効果が msync に
+                                // 含まれないのに checkpoint される」= crash で
+                                // fsync 済み write が replay 対象外になり消失した。
+                                let durable_head = wal.head();
+                                let durable_lsn = wal.next_lsn().saturating_sub(1);
                                 let _ = wal.fsync();
                                 let _ = engine.body_msync();
                                 // 0.8.1: 周期 fsync でも tables sidecar を persist。
@@ -5726,10 +5846,8 @@ impl Engine {
                                 // (= 直後に process kill されても次 open で sidecar
                                 // の next_local が oplog の進行と整合する)。
                                 engine.try_persist_tables();
-                                let head = wal.head();
-                                wal.advance_checkpoint(head);
-                                let lsn = wal.next_lsn().saturating_sub(1);
-                                durable_lsn_for_thread.store(lsn, Ordering::Release);
+                                wal.advance_checkpoint(durable_head);
+                                durable_lsn_for_thread.store(durable_lsn, Ordering::Release);
 
                                 // 0.8.0: sync 並走の解消 — durable 化した record を
                                 // _sync_ops に自動転送する (= 0.7.0 では user が手動で
@@ -5783,6 +5901,7 @@ impl Engine {
                         // shutdown 時の最終 Commit + 順序付き同期
                         if let Some(wal) = oplog_for_thread.as_ref() {
                             let _ = wal.append(enchudb_oplog::oplog::Op::Commit);
+                            let durable_head = wal.head(); // #77-H3: msync 前に snapshot
                             let _ = wal.fsync();
                             let _ = engine.body_msync();
                             // 0.8.1: shutdown 時に tables sidecar を強制 persist。
@@ -5792,7 +5911,7 @@ impl Engine {
                             // 経路では oplog checkpoint も進めてしまうので、 ここで
                             // sidecar を確実に固める必要がある。
                             engine.try_persist_tables();
-                            wal.advance_checkpoint(wal.head());
+                            wal.advance_checkpoint(durable_head);
                             // 0.8.0: shutdown 時も最終 sync 転送 (drop で残った record も
                             // _sync_ops に bridge し切ってから抜ける)
                             if engine.sync_tables_enabled() {
@@ -5872,12 +5991,14 @@ impl Engine {
         self.flush_writes();
         if let Some(wal) = self.oplog.as_ref() {
             let _ = wal.append(enchudb_oplog::oplog::Op::Commit);
+            // #77-H3: checkpoint 上限と durable_lsn は Commit append 直後に
+            // snapshot (msync 後の再読は未同期 record まで checkpoint してしまう)
+            let durable_head = wal.head();
+            let durable_lsn = wal.next_lsn().saturating_sub(1);
             wal.fsync()?;
             self.body_msync()?;
-            let head = wal.head();
-            wal.advance_checkpoint(head);
-            let lsn = wal.next_lsn().saturating_sub(1);
-            self.durable_lsn.store(lsn, Ordering::Release);
+            wal.advance_checkpoint(durable_head);
+            self.durable_lsn.store(durable_lsn, Ordering::Release);
             // changefeed: durable 化したので listener へ即時 push
             // (consumer の 100ms tick を待たず caller スレッドで発火)
             Self::fire_change_listeners(wal, &self.change_listeners, &self.change_emit_offset);
@@ -6143,19 +6264,25 @@ impl Engine {
         // β-light step 5: Ref himo の FK validation (非 Ref は即 return で
         // ~1 ns、 Ref で fk_refs entry なしも同じ)
         self.validate_ref_tie(himo_id as usize, value);
-        if let Some(wal) = self.oplog.as_ref() {
-            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
-            let rec = enchudb_oplog::oplog::OwnedOp::Tie { eid: oplog_eid, himo_id, value };
-            if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec);
-            } else {
-                let _ = wal.append(rec.as_op());
-            }
-        }
+        // #77-H4: op を write_queue へ push してから WAL record を push する。
+        // 逆順 (record 先) だと 2 push の間で preempt された場合、 consumer が
+        // record を fsync + checkpoint した時点で op が未適用となり、 crash で
+        // 「fsync 済みの write」が replay 対象外になって消えた。 op 先行なら
+        // consumer が wq drain で record を見た時点で op は必ず queue に居て、
+        // 同 tick の q drain (wq の後) で適用される。
         let q = self.write_queue.as_ref()
             .expect("tie_async requires create_concurrent or concurrentize");
         q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value });
         self.push_count.fetch_add(1, Ordering::Release);
+        if let Some(wal) = self.oplog.as_ref() {
+            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
+            let rec = enchudb_oplog::oplog::OwnedOp::Tie { eid: oplog_eid, himo_id, value };
+            if let Some(wq) = self.oplog_record_queue.as_ref() {
+                push_oplog_record_blocking(wq, rec, &self.consumer_poisoned);
+            } else {
+                let _ = wal.append(rec.as_op());
+            }
+        }
     }
 
     /// v33: 非同期 tie_text。text 値を vocab に挿入し、WAL に Vocab + Tie の 2 op を流す。
@@ -6191,6 +6318,11 @@ impl Engine {
             ht => panic!("tie_text_async_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
         assert!(vid < u32::MAX, "vocab vid must be < u32::MAX (sentinel reserved)");
+        // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
+        let q = self.write_queue.as_ref()
+            .expect("tie_text_async requires create_concurrent or concurrentize");
+        q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value: vid });
+        self.push_count.fetch_add(1, Ordering::Release);
         if let Some(wal) = self.oplog.as_ref() {
             // Vocab op を先に(sync の receiver 側で Tie より先に mapping が張られるよう)
             let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
@@ -6198,17 +6330,13 @@ impl Engine {
             let tie_rec = enchudb_oplog::oplog::OwnedOp::Tie { eid: oplog_eid, himo_id, value: vid };
             if let Some(wq) = self.oplog_record_queue.as_ref() {
                 // Vocab → Tie の順を保つため同一 thread から連続 push
-                push_oplog_record_blocking(wq, vocab_rec);
-                push_oplog_record_blocking(wq, tie_rec);
+                push_oplog_record_blocking(wq, vocab_rec, &self.consumer_poisoned);
+                push_oplog_record_blocking(wq, tie_rec, &self.consumer_poisoned);
             } else {
                 let _ = wal.append(vocab_rec.as_op());
                 let _ = wal.append(tie_rec.as_op());
             }
         }
-        let q = self.write_queue.as_ref()
-            .expect("tie_text_async requires create_concurrent or concurrentize");
-        q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value: vid });
-        self.push_count.fetch_add(1, Ordering::Release);
     }
 
     /// v33: 非同期 tie_ref。target_eid の local 部(u32)を WAL / 本体に運ぶ。
@@ -6235,23 +6363,24 @@ impl Engine {
         self.validate_eid_for_himo(himo_id as usize, local);
         // β-light step 5: target_eid が target_table の eid range 内か
         self.validate_ref_tie(himo_id as usize, target_local);
-        if let Some(wal) = self.oplog.as_ref() {
-            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
-            let rec = enchudb_oplog::oplog::OwnedOp::Tie {
-                eid: oplog_eid, himo_id, value: target_local,
-            };
-            if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec);
-            } else {
-                let _ = wal.append(rec.as_op());
-            }
-        }
+        // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
         let q = self.write_queue.as_ref()
             .expect("tie_ref_async requires create_concurrent or concurrentize");
         q.push(crate::write_queue::Op::Tie {
             eid: local, himo_id, value: target_local,
         });
         self.push_count.fetch_add(1, Ordering::Release);
+        if let Some(wal) = self.oplog.as_ref() {
+            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
+            let rec = enchudb_oplog::oplog::OwnedOp::Tie {
+                eid: oplog_eid, himo_id, value: target_local,
+            };
+            if let Some(wq) = self.oplog_record_queue.as_ref() {
+                push_oplog_record_blocking(wq, rec, &self.consumer_poisoned);
+            } else {
+                let _ = wal.append(rec.as_op());
+            }
+        }
     }
 
     /// 非同期 untie。
@@ -6268,18 +6397,19 @@ impl Engine {
         debug_assert!((himo_id as usize) < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         if (himo_id as usize) >= self.himos.len() { return; }
+        // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
+        let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
+        q.push(crate::write_queue::Op::Untie { eid: local, himo_id });
+        self.push_count.fetch_add(1, Ordering::Release);
         if let Some(wal) = self.oplog.as_ref() {
             let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
             let rec = enchudb_oplog::oplog::OwnedOp::Untie { eid: oplog_eid, himo_id };
             if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec);
+                push_oplog_record_blocking(wq, rec, &self.consumer_poisoned);
             } else {
                 let _ = wal.append(rec.as_op());
             }
         }
-        let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
-        q.push(crate::write_queue::Op::Untie { eid: local, himo_id });
-        self.push_count.fetch_add(1, Ordering::Release);
     }
 
     /// 非同期 delete。
@@ -6287,18 +6417,19 @@ impl Engine {
         use std::sync::atomic::Ordering;
         self.check_writable();
         let local = enchudb_oplog::eid_local(eid);
+        // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
+        let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
+        q.push(crate::write_queue::Op::Delete { eid: local });
+        self.push_count.fetch_add(1, Ordering::Release);
         if let Some(wal) = self.oplog.as_ref() {
             let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
             let rec = enchudb_oplog::oplog::OwnedOp::Delete { eid: oplog_eid };
             if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec);
+                push_oplog_record_blocking(wq, rec, &self.consumer_poisoned);
             } else {
                 let _ = wal.append(rec.as_op());
             }
         }
-        let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
-        q.push(crate::write_queue::Op::Delete { eid: local });
-        self.push_count.fetch_add(1, Ordering::Release);
     }
 
     /// 非同期 content 書き込み。WAL 有効時はクラッシュ後も復元される。
@@ -6307,17 +6438,7 @@ impl Engine {
         use std::sync::atomic::Ordering;
         self.check_writable();
         let local = enchudb_oplog::eid_local(eid);
-        if let Some(wal) = self.oplog.as_ref() {
-            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
-            let rec = enchudb_oplog::oplog::OwnedOp::Content {
-                eid: oplog_eid, key: key.to_string(), data: data.to_vec(),
-            };
-            if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec);
-            } else {
-                let _ = wal.append(rec.as_op());
-            }
-        }
+        // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
         let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
         q.push(crate::write_queue::Op::Content {
             eid: local,
@@ -6325,6 +6446,17 @@ impl Engine {
             data: data.to_vec().into_boxed_slice(),
         });
         self.push_count.fetch_add(1, Ordering::Release);
+        if let Some(wal) = self.oplog.as_ref() {
+            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
+            let rec = enchudb_oplog::oplog::OwnedOp::Content {
+                eid: oplog_eid, key: key.to_string(), data: data.to_vec(),
+            };
+            if let Some(wq) = self.oplog_record_queue.as_ref() {
+                push_oplog_record_blocking(wq, rec, &self.consumer_poisoned);
+            } else {
+                let _ = wal.append(rec.as_op());
+            }
+        }
     }
 
     /// 現在のトランザクションを WAL に commit marker で確定する。
@@ -6350,6 +6482,11 @@ impl Engine {
             let pushed = self.push_count.load(Ordering::Acquire);
             let applied = self.apply_count.load(Ordering::Acquire);
             if applied >= pushed { return; }
+            // #77-M2: consumer が死んでいたら barrier は永遠に成立しない。
+            // silent hang ではなく診断可能な panic で失敗する。
+            if self.consumer_poisoned.load(Ordering::Acquire) {
+                panic!("enchudb consumer thread has panicked — flush_writes cannot complete (#77-M2)");
+            }
             std::thread::yield_now();
         }
     }
@@ -6418,6 +6555,9 @@ impl Drop for Engine {
                 let pushed = self.push_count.load(Ordering::Acquire);
                 let applied = self.apply_count.load(Ordering::Acquire);
                 if applied >= pushed { break; }
+                // #77-M2: consumer 死亡時は待っても進まない。 Drop は panic せず
+                // 諦めて shutdown へ進む (未 apply 分は失われるが、 hang しない)。
+                if self.consumer_poisoned.load(Ordering::Acquire) { break; }
                 std::thread::yield_now();
             }
         }

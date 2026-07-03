@@ -20,6 +20,11 @@ pub struct EntitySet {
     max_entities: u32,
     bitset_offset: usize,
     free_offset: usize,
+    /// #77-H7: free stack の push/pop 直列化。 push (count 読み → eid 書き →
+    /// count 書き) は非 atomic な複合操作のため、 並行 free / saturation 時の
+    /// allocate と混ざると slot 破壊・二重払い出しが起きる。 writer は
+    /// .db.lock で 1 プロセスに限定されるため in-process Mutex で足りる。
+    free_lock: std::sync::Mutex<()>,
 }
 
 unsafe impl Sync for EntitySet {}
@@ -54,7 +59,8 @@ impl EntitySet {
         mm[0..4].copy_from_slice(&MAGIC);
         // next_eid = 0, live_count = 0 (already zero from fresh region)
 
-        Self { region, max_entities, bitset_offset, free_offset }
+        Self { region, max_entities, bitset_offset, free_offset,
+               free_lock: std::sync::Mutex::new(()) }
     }
 
     /// 既存領域をロード。
@@ -66,7 +72,8 @@ impl EntitySet {
         let bitset_offset = HEADER;
         let bitset_size = ((max_entities + 7) / 8) as usize;
         let free_offset = (bitset_offset + bitset_size + 3) & !3; // AtomicU32 alignment
-        Self { region, max_entities, bitset_offset, free_offset }
+        Self { region, max_entities, bitset_offset, free_offset,
+               free_lock: std::sync::Mutex::new(()) }
     }
 
     fn next_eid_atomic(&self) -> &AtomicU32 {
@@ -95,31 +102,34 @@ impl EntitySet {
         self.allocate_from_free_stack()
     }
 
-    /// free stack から CAS で安全に pop。上限到達時のみ呼ばれる。
+    /// free stack から pop。上限到達時のみ呼ばれる。
+    /// #77-H7: `free_lock` で push と直列化 (旧 CAS pop は push 側の
+    /// 「slot 書き → count 書き」非 atomic 複合と混ざると、 eid 未書き込みの
+    /// slot を読み得た)。
     fn allocate_from_free_stack(&self) -> u32 {
+        let _g = self.free_lock.lock().unwrap_or_else(|p| p.into_inner());
         let mm = self.region.slice_mut();
-        let fc_ptr = unsafe {
-            &*(mm.as_ptr().add(self.free_offset) as *const AtomicU32)
-        };
-        loop {
-            let fc = fc_ptr.load(Ordering::Acquire);
-            assert!(fc > 0, "entity limit reached: max_entities={}, no free slots", self.max_entities);
-            if fc_ptr.compare_exchange(fc, fc - 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                let eid_off = self.free_offset + 4 + ((fc - 1) as usize) * 4;
-                let eid = u32::from_le_bytes(mm[eid_off..eid_off + 4].try_into().unwrap());
-                self.set_bit(eid, true);
-                self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
-                // EntitySet 全領域は body_msync 内で常時 msync (issue6 perf 対策)。
-                return eid;
-            }
-        }
+        let free_count_off = self.free_offset;
+        let fc = u32::from_le_bytes(mm[free_count_off..free_count_off + 4].try_into().unwrap());
+        assert!(fc > 0, "entity limit reached: max_entities={}, no free slots", self.max_entities);
+        let eid_off = self.free_offset + 4 + ((fc - 1) as usize) * 4;
+        let eid = u32::from_le_bytes(mm[eid_off..eid_off + 4].try_into().unwrap());
+        mm[free_count_off..free_count_off + 4].copy_from_slice(&(fc - 1).to_le_bytes());
+        self.set_bit(eid, true);
+        self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
+        // EntitySet 全領域は body_msync 内で常時 msync (issue6 perf 対策)。
+        eid
     }
 
     pub fn free(&self, eid: u32) {
-        if !self.is_live(eid) { return; }
-        self.set_bit(eid, false);
+        // #77-H7: was-live 判定を bit の atomic 遷移そのもので行う。
+        // 旧実装の is_live → set_bit の 2 段は並行 free が両方通過し、
+        // free stack への二重 push → 同一 eid の二重払い出しに繋がった。
+        let was_live = self.set_bit(eid, false);
+        if !was_live { return; }
         self.live_count_atomic().fetch_sub(1, Ordering::Relaxed);
 
+        let _g = self.free_lock.lock().unwrap_or_else(|p| p.into_inner());
         let mm = self.region.slice_mut();
         let free_count_off = self.free_offset;
         let fc = u32::from_le_bytes(mm[free_count_off..free_count_off + 4].try_into().unwrap());
@@ -134,17 +144,18 @@ impl EntitySet {
 
     /// rollback用: 削除されたentityを復活させる。
     pub fn revive(&self, eid: u32) {
-        if eid >= self.max_entities || self.is_live(eid) { return; }
-        self.set_bit(eid, true);
-        self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
+        if eid >= self.max_entities { return; }
+        // bit 遷移で was-live を判定 (並行 revive の二重 count 防止)
+        if !self.set_bit(eid, true) {
+            self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// v32: リモート peer から届いた eid を「存在する」ことにする。
     /// 既に live なら no-op。next_eid / live_count / live bitmap を整合的に更新する。
     pub fn ensure_live(&self, eid: u32) {
         if eid >= self.max_entities { return; }
-        if self.is_live(eid) { return; }
-        self.set_bit(eid, true);
+        if self.set_bit(eid, true) { return; } // 既に live
         self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
         // next_eid は「これまで allocate した最大 +1」の概念。local を超えていたら進める。
         let cur = self.next_eid_atomic().load(Ordering::Acquire);
@@ -162,16 +173,23 @@ impl EntitySet {
         (mm[byte_off] & bit) != 0
     }
 
-    fn set_bit(&self, eid: u32, live: bool) {
-        if eid >= self.max_entities { return; }
-        let mm = self.region.slice_mut();
+    /// #77-H7: bit を atomic に立てる/落とす。 変更前にその bit が立っていたか
+    /// を返す。 旧実装の `mm[byte_off] |= bit` は非 atomic RMW で、 隣接 eid を
+    /// 払い出された並行スレッドと同一バイトを書き合うと片方の bit が消えた。
+    fn set_bit(&self, eid: u32, live: bool) -> bool {
+        if eid >= self.max_entities { return false; }
+        let mm = self.region.slice();
         let byte_off = self.bitset_offset + (eid / 8) as usize;
+        let byte = unsafe {
+            &*(mm.as_ptr().add(byte_off) as *const std::sync::atomic::AtomicU8)
+        };
         let bit = 1u8 << (eid % 8);
-        if live {
-            mm[byte_off] |= bit;
+        let prev = if live {
+            byte.fetch_or(bit, Ordering::AcqRel)
         } else {
-            mm[byte_off] &= !bit;
-        }
+            byte.fetch_and(!bit, Ordering::AcqRel)
+        };
+        (prev & bit) != 0
         // EntitySet 全領域は body_msync 内で常時 msync (issue6 perf 対策)。
     }
 
@@ -196,8 +214,9 @@ impl EntitySet {
             "allocate_at: eid {} exceeds max_entities {}",
             eid, self.max_entities,
         );
-        self.set_bit(eid, true);
-        self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
+        if !self.set_bit(eid, true) {
+            self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
+        }
         // next_eid を max(current, eid + 1) まで進める (CAS で torn write 防止)
         let mut cur = self.next_eid_atomic().load(Ordering::Relaxed);
         while cur <= eid {
@@ -225,5 +244,67 @@ impl EntitySet {
             }
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn make_set(max_entities: u32) -> Arc<EntitySet> {
+        let size = EntitySet::region_size(max_entities);
+        let buf: Box<[u8]> = vec![0u8; size].into_boxed_slice();
+        let ptr = Box::leak(buf).as_mut_ptr();
+        let region = unsafe { Region::new(ptr, size) };
+        Arc::new(EntitySet::init(region, max_entities))
+    }
+
+    /// #77-H7 regression: 並行 allocate で隣接 eid の live bit が消えないこと。
+    /// 旧実装は `mm[byte] |= bit` の非 atomic RMW だったため、同一バイトを
+    /// 共有する eid (7/8 の確率) の bit が並行書きで消失した。
+    #[test]
+    fn concurrent_allocate_no_lost_bits() {
+        let set = make_set(100_000);
+        const THREADS: usize = 8;
+        const PER: usize = 500;
+        let handles: Vec<_> = (0..THREADS).map(|_| {
+            let s = set.clone();
+            std::thread::spawn(move || {
+                (0..PER).map(|_| s.allocate()).collect::<Vec<u32>>()
+            })
+        }).collect();
+        let mut all: Vec<u32> = handles.into_iter()
+            .flat_map(|h| h.join().unwrap()).collect();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), THREADS * PER, "eid が重複払い出しされた");
+        for &eid in &all {
+            assert!(set.is_live(eid), "eid {eid} の live bit が消失");
+        }
+        assert_eq!(set.count(), (THREADS * PER) as u32);
+        assert_eq!(set.iter().len(), THREADS * PER);
+    }
+
+    /// #77-H7 regression: 同一 eid の並行 free が free stack に二重 push
+    /// しないこと。旧実装は is_live → set_bit の 2 段で両者が通過し、
+    /// 飽和後の allocate が同一 eid を二重払い出しした。
+    #[test]
+    fn concurrent_double_free_no_double_push() {
+        let set = make_set(4);
+        for _ in 0..4 { set.allocate(); } // 0..3 で飽和
+        let handles: Vec<_> = (0..8).map(|_| {
+            let s = set.clone();
+            std::thread::spawn(move || s.free(2))
+        }).collect();
+        for h in handles { h.join().unwrap(); }
+        assert_eq!(set.count(), 3, "live_count が二重減算された");
+
+        // free stack には 2 が 1 回だけ積まれているはず
+        assert_eq!(set.allocate(), 2, "stack から 2 が出るはず");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            set.allocate() // stack 空 + 飽和 → panic が正しい
+        }));
+        assert!(result.is_err(), "二重 push された 2 が再払い出しされた");
     }
 }

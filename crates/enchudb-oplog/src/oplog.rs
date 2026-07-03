@@ -852,6 +852,11 @@ impl OpLog {
     /// (head==checkpoint ⇒ body へ msync 済 && pending==0) を満たす領域は crash recovery
     /// にも sync にも不要なので、 無条件に畳んでよい。 `auto_reset` フラグは vestigial。
     pub fn try_reset(&self) -> bool {
+        // #77-M8: append_lock で append と直列化。 旧実装は pending_writes
+        // チェックと head CAS の間に窓があり、 その間に進入した append の
+        // record が reset で head 外に落ちて喪失 + stale record 復活が起きた。
+        // append_lock 保持中は append_inner が進入できないため窓が閉じる。
+        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
         let head = self.head.load(Ordering::Acquire);
         let cp = self.checkpoint.load(Ordering::Acquire);
         if head != cp || head <= HEADER_SIZE as u64 { return false; }
@@ -893,38 +898,72 @@ impl OpLog {
     pub fn fsync(&self) -> io::Result<()> { Ok(()) }
 
     /// checkpoint を前進。本体 mmap に反映済み LSN の位置まで進める。
+    ///
+    /// #77-M8: checkpoint は head を越えられない (clamp)。 caller が reset 前に
+    /// 読んだ stale head を渡すと checkpoint > head の壊れ状態になり、 head が
+    /// その値を再突破するまで背景 fsync / sync 転送が止まっていた。
     pub fn advance_checkpoint(&self, new_checkpoint: u64) {
+        let head = self.head.load(Ordering::Acquire);
+        let target = new_checkpoint.min(head);
         let cur = self.checkpoint.load(Ordering::Acquire);
-        if new_checkpoint <= cur { return; }
-        self.checkpoint.store(new_checkpoint, Ordering::Release);
-        self.mmap_mut_slice()[16..24].copy_from_slice(&new_checkpoint.to_le_bytes());
+        if target <= cur { return; }
+        self.checkpoint.store(target, Ordering::Release);
+        self.mmap_mut_slice()[16..24].copy_from_slice(&target.to_le_bytes());
     }
 
     /// v32: HEADER_SIZE から head までを読んで、Commit で挟まれた全レコードを返す。
     /// checkpoint 位置は無視(既に apply 済みの記録もまだ WAL file 上にあれば拾う)。
     /// Syncer.publish_since で使う。ring buffer reset 済みの記録は取れない。
     pub fn iter_committed(&self) -> Vec<Record> {
-        self.iter_from_offset(HEADER_SIZE as u64)
+        self.scan_from_offset(HEADER_SIZE as u64).0
     }
 
     /// 指定 offset 以降の commit 済みレコードを返す。changefeed の差分発火用。
     /// `start_offset` は前回 emit 時の `wal.checkpoint()` を渡す想定。
     pub fn iter_committed_from(&self, start_offset: u64) -> Vec<Record> {
-        self.iter_from_offset(start_offset)
+        self.scan_from_offset(start_offset).0
+    }
+
+    /// #77-H4: `iter_committed_from` + 「読み切った commit 済み group の終端
+    /// offset」を返す版。 cursor (changefeed emit_offset / _sync_ops bridge) は
+    /// **この終端までしか進めてはいけない** — head は record 本体の書き込み前に
+    /// bump されるため、 scan 後に `head()` を再読して cursor にすると、 scan が
+    /// 書き込み途中 record で break した位置〜head 間の record を恒久 skip する。
+    pub fn iter_committed_from_with_end(&self, start_offset: u64) -> (Vec<Record>, u64) {
+        let (out, _, _, committed_end) = self.scan_from_offset(start_offset);
+        (out, committed_end)
     }
 
     /// リカバリ: checkpoint から head までを読んで、Commit で挟まれたグループだけ返す。
     /// CRC 破損レコードに到達したらそこで打ち切り(uncommitted tail の切り捨て)。
+    ///
+    /// #77-H5: LSN / HLC clock の復元 (`next_lsn` / `hlc_*` の store) は
+    /// **recover だけ**が行う (単一スレッドの起動時実行前提)。 以前は
+    /// iter_committed* (= changefeed / sync publish の並行 read 経路) も
+    /// 共通実装の副作用で clock を巻き戻しており、 scan 中に発行された
+    /// LSN/HLC を潰して重複発行 → sync dedupe による silent loss を招いた。
     pub fn recover(&self) -> Vec<Record> {
         let start = self.checkpoint.load(Ordering::Acquire);
-        self.iter_from_offset(start)
+        let (out, max_lsn, max_hlc, _) = self.scan_from_offset(start);
+        if max_lsn > 0 {
+            self.next_lsn.store(max_lsn + 1, Ordering::Release);
+        }
+        if max_hlc.wall > 0 {
+            self.hlc_last_wall.store(max_hlc.wall, Ordering::Release);
+            self.hlc_logical.store(max_hlc.logical, Ordering::Release);
+        }
+        out
     }
 
     /// 指定 offset から head までを Commit グループ単位で読む。共通実装。
-    fn iter_from_offset(&self, start_offset: u64) -> Vec<Record> {
+    /// 副作用なし (読むだけ)。返り値は (records, max_lsn, max_hlc,
+    /// committed_end)。 committed_end = 最後に読み切った Commit record の
+    /// 直後 offset (1 つも無ければ start_offset)。
+    fn scan_from_offset(&self, start_offset: u64) -> (Vec<Record>, u64, Hlc, u64) {
         let mut out = Vec::new();
         let mut batch = Vec::new();
         let mut offset = start_offset;
+        let mut committed_end = start_offset;
         let head = self.head.load(Ordering::Acquire);
         let mut max_lsn = 0;
         let mut max_hlc = Hlc::ZERO;
@@ -972,6 +1011,7 @@ impl OpLog {
             match op {
                 Some(DecodedOp::Commit) => {
                     out.append(&mut batch);
+                    committed_end = payload_end as u64;
                 }
                 Some(other) => {
                     batch.push(Record {
@@ -986,15 +1026,7 @@ impl OpLog {
         }
 
         // uncommitted batch は破棄。recover の定義通り。
-        if max_lsn > 0 {
-            self.next_lsn.store(max_lsn + 1, Ordering::Release);
-        }
-        if max_hlc.wall > 0 {
-            self.hlc_last_wall.store(max_hlc.wall, Ordering::Release);
-            self.hlc_logical.store(max_hlc.logical, Ordering::Release);
-        }
-
-        out
+        (out, max_lsn, max_hlc, committed_end)
     }
 
     /// head を checkpoint に戻す(WAL truncate 相当、uncommitted も全捨て)。
