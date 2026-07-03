@@ -14,6 +14,7 @@
 //! # let _ = std::fs::remove_file(&path);
 //! ```
 
+pub(crate) mod append_vec;
 pub(crate) mod region;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod growable_map;

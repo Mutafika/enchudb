@@ -136,10 +136,12 @@ fn serialize_tables(tables: &[TableDef]) -> Vec<u8> {
         out.extend_from_slice(&t.eid_range_lo.to_le_bytes());
         out.extend_from_slice(&t.eid_range_hi.to_le_bytes());
         out.extend_from_slice(&t.next_local.load(std::sync::atomic::Ordering::Relaxed).to_le_bytes());
-        out.extend_from_slice(&(t.himo_ids.len() as u32).to_le_bytes());
-        for &h in &t.himo_ids {
+        let himo_ids = t.himo_ids.read().unwrap();
+        out.extend_from_slice(&(himo_ids.len() as u32).to_le_bytes());
+        for &h in himo_ids.iter() {
             out.extend_from_slice(&h.to_le_bytes());
         }
+        drop(himo_ids);
         out.extend_from_slice(&(t.fk_refs.len() as u32).to_le_bytes());
         for &(hid, tid) in &t.fk_refs {
             out.extend_from_slice(&hid.to_le_bytes());
@@ -202,7 +204,7 @@ fn deserialize_tables(buf: &[u8]) -> Result<Vec<TableDef>, String> {
         }
         tables.push(TableDef {
             name,
-            himo_ids,
+            himo_ids: std::sync::RwLock::new(himo_ids),
             eid_range_lo,
             eid_range_hi,
             fk_refs,
@@ -618,6 +620,41 @@ impl Backing {
         }
     }
 
+    /// 0.9.0 himo dynamic definition: `&self` 版 `as_mut_ptr`。
+    /// `ensure_himo_dynamic` が Arc<Engine> 越しに新規 himo の column region を
+    /// 作るために使う。 header_mut と同じ前提 (定義は himo_def_lock で直列化、
+    /// 未公開 slot 領域にしか触れない)。
+    fn base_ptr_shared(&self) -> *mut u8 {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Backing::Mmap(m) => m.as_ptr() as *mut u8,
+            #[cfg(not(target_arch = "wasm32"))]
+            Backing::Growable(g) => g.base(),
+            Backing::Memory(v) => v.as_ptr() as *mut u8,
+        }
+    }
+
+    /// 0.9.0 himo dynamic definition: `&self` 版 `as_slice_mut`。
+    /// header の himo_types / max_values / himo_count / CRC を `&self` から
+    /// 更新するために使う。 これらの byte は himo_def_lock 下でしか書かれず、
+    /// reader は runtime にこの領域を読まない (open 時のみ) 前提。
+    #[allow(clippy::mut_from_ref)]
+    fn slice_mut_shared(&self) -> &mut [u8] {
+        unsafe {
+            match self {
+                #[cfg(not(target_arch = "wasm32"))]
+                Backing::Mmap(m) => {
+                    std::slice::from_raw_parts_mut(m.as_ptr() as *mut u8, m.len())
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                Backing::Growable(g) => std::slice::from_raw_parts_mut(g.base(), g.committed()),
+                Backing::Memory(v) => {
+                    std::slice::from_raw_parts_mut(v.as_ptr() as *mut u8, v.len())
+                }
+            }
+        }
+    }
+
     /// v32: &self 経由で header 領域に unsafe で書き込む。
     /// mmap 経由の並行書き込みは atomic スライス更新でガードされる前提。
     #[allow(clippy::mut_from_ref)]
@@ -642,6 +679,7 @@ impl Backing {
         }
     }
 }
+use crate::append_vec::AppendVec;
 use crate::vocabulary::Vocabulary;
 use crate::entity_set::EntitySet;
 use crate::himo_store::{HimoStore, HimoType};
@@ -1003,7 +1041,9 @@ pub(crate) struct TableDef {
     /// table 名 (anonymous は ""、 user 定義 table は固有名)。
     pub name: String,
     /// この table の column 軸を成す himo の id 列 (engine.himos の index)。
-    pub himo_ids: Vec<u32>,
+    /// 0.9.0: `&self` の himo 定義 (`ensure_himo_dynamic_in`) が attach できる
+    /// よう RwLock 化。 write は himo_def_lock 下でのみ発生する低頻度 path。
+    pub himo_ids: std::sync::RwLock<Vec<u32>>,
     /// この table が占有する eid 範囲の下限 (inclusive)。
     pub eid_range_lo: u32,
     /// 上限 (exclusive)。 `u32::MAX` は open-ended (= まだ後続 table が
@@ -1039,7 +1079,7 @@ impl Clone for TableDef {
     fn clone(&self) -> Self {
         Self {
             name: self.name.clone(),
-            himo_ids: self.himo_ids.clone(),
+            himo_ids: std::sync::RwLock::new(self.himo_ids.read().unwrap().clone()),
             eid_range_lo: self.eid_range_lo,
             eid_range_hi: self.eid_range_hi,
             fk_refs: self.fk_refs.clone(),
@@ -1064,7 +1104,7 @@ impl TableDef {
     pub fn anonymous() -> Self {
         Self {
             name: String::new(),
-            himo_ids: Vec::new(),
+            himo_ids: std::sync::RwLock::new(Vec::new()),
             eid_range_lo: 0,
             eid_range_hi: u32::MAX,
             fk_refs: Vec::new(),
@@ -1105,17 +1145,28 @@ pub struct Engine {
     max_himos: u32,
     vocab: Vocabulary,
     himo_reg: Vocabulary,
-    himo_names: Vec<String>,
-    himo_types: Vec<HimoType>,
-    himo_max_values: Vec<u32>,
-    himos: Vec<HimoStore>,
+    // 0.9.0 himo dynamic definition: himo の並列配列は AppendVec (固定 capacity
+    // + append-only + lock-free read) 化して `&self` から定義追加できるように
+    // した (design a: pre-sized slots + atomic len publish)。 reader の hot path
+    // (`self.himos[hid]` 等の indexed read) は lock を取らない。
+    // 定義追加は `himo_def_lock` で直列化される。
+    himo_names: AppendVec<String>,
+    himo_types: AppendVec<HimoType>,
+    himo_max_values: AppendVec<u32>,
+    himos: AppendVec<HimoStore>,
     /// β-light step 2: engine が認知する table 一覧。 index 0 は常に
     /// anonymous table (旧 API は全部ここに dispatch)。 step 3+ で
     /// define_table 時に push される。
     tables: Vec<TableDef>,
     /// β-light step 2: himo_id → 所属 table_id の逆引き (himos と同じ index)。
     /// 旧 API (`define_himo`) で追加された himo は全部 ANONYMOUS_TABLE。
-    himo_to_table: Vec<TableId>,
+    /// 0.9.0: `&self` の define_himo_in 相当 (`ensure_himo_dynamic_in`) が
+    /// attach 先を後書きできるよう要素を AtomicU16 (= TableId) にした。
+    himo_to_table: AppendVec<std::sync::atomic::AtomicU16>,
+    /// 0.9.0: himo 定義 (`ensure_himo_dynamic` 系) の直列化 lock。
+    /// 並列配列 5 本 + tables[].himo_ids + header write を 1 定義単位で
+    /// atomic に見せる。 read path はこの lock を取らない。
+    himo_def_lock: std::sync::Mutex<()>,
     entities: EntitySet,
     contents: ContentStore,
     /// 非同期書き込みキュー。`create_concurrent` で有効化される。
@@ -1326,11 +1377,13 @@ impl Engine {
         Ok(Self {
             path: path.to_string(), layout, max_entities, max_himos,
             vocab, himo_reg,
-            himo_names: Vec::new(),
-            himo_types: Vec::new(), himo_max_values: Vec::new(),
-            himos: Vec::new(), entities, contents,
+            himo_names: AppendVec::with_capacity(max_himos as usize),
+            himo_types: AppendVec::with_capacity(max_himos as usize),
+            himo_max_values: AppendVec::with_capacity(max_himos as usize),
+            himos: AppendVec::with_capacity(max_himos as usize), entities, contents,
             tables: vec![TableDef::anonymous()],
-            himo_to_table: Vec::new(),
+            himo_to_table: AppendVec::with_capacity(max_himos as usize),
+            himo_def_lock: std::sync::Mutex::new(()),
             write_queue: None,
             shutdown_flag: None,
             consumer_handle: std::sync::Mutex::new(None),
@@ -1572,14 +1625,15 @@ impl Engine {
             max_himos,
             vocab,
             himo_reg,
-            himo_names: Vec::new(),
-            himo_types: Vec::new(),
-            himo_max_values: Vec::new(),
-            himos: Vec::new(),
+            himo_names: AppendVec::with_capacity(max_himos as usize),
+            himo_types: AppendVec::with_capacity(max_himos as usize),
+            himo_max_values: AppendVec::with_capacity(max_himos as usize),
+            himos: AppendVec::with_capacity(max_himos as usize),
             entities,
             contents,
             tables: vec![TableDef::anonymous()],
-            himo_to_table: Vec::new(),
+            himo_to_table: AppendVec::with_capacity(max_himos as usize),
+            himo_def_lock: std::sync::Mutex::new(()),
             write_queue: None,
             shutdown_flag: None,
             consumer_handle: std::sync::Mutex::new(None),
@@ -1993,10 +2047,13 @@ impl Engine {
         );
         report("ContentStore::load", &mut t, &mut p);
 
-        let mut himo_names = Vec::new();
-        let mut himo_types = Vec::new();
-        let mut himo_max_values = Vec::new();
-        let mut himos = Vec::new();
+        // 0.9.0: capacity は max_himos だが、 header の himo_count が万一それを
+        // 超えていても load 自体は落とさない (旧 Vec 実装と同じ寛容さ)。
+        let himo_cap = (max_himos as usize).max(himo_count as usize);
+        let himo_names: AppendVec<String> = AppendVec::with_capacity(himo_cap);
+        let himo_types: AppendVec<HimoType> = AppendVec::with_capacity(himo_cap);
+        let himo_max_values: AppendVec<u32> = AppendVec::with_capacity(himo_cap);
+        let himos: AppendVec<HimoStore> = AppendVec::with_capacity(himo_cap);
 
         for hid in 0..himo_count as usize {
             let ht = HimoType::from_byte(type_bytes[hid]);
@@ -2010,10 +2067,10 @@ impl Engine {
                 ht, effective_mv,
             );
 
-            himo_names.push(name);
-            himo_types.push(ht);
-            himo_max_values.push(mv);
-            himos.push(hs);
+            let _ = himo_names.push(name);
+            let _ = himo_types.push(ht);
+            let _ = himo_max_values.push(mv);
+            let _ = himos.push(hs);
         }
         report("HimoStore::load × N", &mut t, &mut p);
 
@@ -2021,11 +2078,15 @@ impl Engine {
         // step 3+ で v5 DB の table descriptor 読み出しに置き換える、 v4 DB は
         // 引き続きこの compat 経路で anonymous-only として open される。
         let initial_tables = vec![{
-            let mut anon = TableDef::anonymous();
-            anon.himo_ids = (0..himos.len() as u32).collect();
+            let anon = TableDef::anonymous();
+            *anon.himo_ids.write().unwrap() = (0..himos.len() as u32).collect();
             anon
         }];
-        let initial_himo_to_table = vec![ANONYMOUS_TABLE; himos.len()];
+        let initial_himo_to_table: AppendVec<std::sync::atomic::AtomicU16> =
+            AppendVec::with_capacity(himo_cap);
+        for _ in 0..himos.len() {
+            let _ = initial_himo_to_table.push(std::sync::atomic::AtomicU16::new(ANONYMOUS_TABLE));
+        }
 
         let mut eng = Self {
             path: String::new(), layout, max_entities, max_himos,
@@ -2034,6 +2095,7 @@ impl Engine {
             himos, entities, contents,
             tables: initial_tables,
             himo_to_table: initial_himo_to_table,
+            himo_def_lock: std::sync::Mutex::new(()),
             write_queue: None,
             shutdown_flag: None,
             consumer_handle: std::sync::Mutex::new(None),
@@ -2594,7 +2656,7 @@ impl Engine {
         let tid = self.tables.len() as TableId;
         self.tables.push(TableDef {
             name: name.to_string(),
-            himo_ids: Vec::new(),
+            himo_ids: std::sync::RwLock::new(Vec::new()),
             eid_range_lo: new_lo,
             eid_range_hi: new_hi,
             fk_refs: Vec::new(),
@@ -2795,15 +2857,22 @@ impl Engine {
     fn adopt_persisted_tables(&mut self, tables: Vec<TableDef>) {
         let himo_count = self.himos.len();
         // 全 himo を一旦 anonymous default に戻し、 sidecar に書かれてる
-        // attach を上書きする (= sidecar が source of truth)
-        self.himo_to_table = vec![ANONYMOUS_TABLE; himo_count];
+        // attach を上書きする (= sidecar が source of truth)。
+        // `&mut self` (= open 時、 共有前) なので AppendVec ごと作り直して OK。
+        let rebuilt: AppendVec<std::sync::atomic::AtomicU16> =
+            AppendVec::with_capacity(self.himo_to_table.capacity().max(himo_count));
+        for _ in 0..himo_count {
+            let _ = rebuilt.push(std::sync::atomic::AtomicU16::new(ANONYMOUS_TABLE));
+        }
         for (tid, table) in tables.iter().enumerate() {
-            for &hid in &table.himo_ids {
+            for &hid in table.himo_ids.read().unwrap().iter() {
                 if (hid as usize) < himo_count {
-                    self.himo_to_table[hid as usize] = tid as TableId;
+                    rebuilt[hid as usize]
+                        .store(tid as TableId, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
+        self.himo_to_table = rebuilt;
         self.tables = tables;
     }
 
@@ -3033,8 +3102,8 @@ impl Engine {
     /// 閉じていて panic するし、 `entities.allocate()` は table range と衝突しうる。
     fn alloc_translated_local(&self, himo_id: u16) -> Option<u32> {
         let hid = himo_id as usize;
-        if hid < self.himo_to_table.len() {
-            let tid = self.himo_to_table[hid] as usize;
+        if let Some(tid) = self.himo_table_get(hid) {
+            let tid = tid as usize;
             if tid < self.tables.len() && self.tables[tid].eid_range_hi != u32::MAX {
                 let name = self.tables[tid].name.clone();
                 if let Ok(e) = self.entity_in(&name) {
@@ -3081,8 +3150,8 @@ impl Engine {
     /// target table を導けない / entity_in 失敗なら `None` (caller が op を skip)。
     fn alloc_translated_local_in_target_table(&self, ref_himo_id: u16) -> Option<u32> {
         let hid = ref_himo_id as usize;
-        if hid < self.himo_to_table.len() {
-            let owner_tid = self.himo_to_table[hid] as usize;
+        if let Some(owner_tid) = self.himo_table_get(hid) {
+            let owner_tid = owner_tid as usize;
             if owner_tid < self.tables.len() {
                 let owner = &self.tables[owner_tid];
                 if let Some(&(_, target_tid)) =
@@ -3317,6 +3386,23 @@ impl Engine {
         ht: HimoType,
         max_values: u32,
     ) -> Result<u32, String> {
+        // 0.9.0: 本体は `&self` 版 (ensure_himo_dynamic_in) に移譲。 signature は
+        // 互換維持のため `&mut self` / u32 のまま。
+        self.ensure_himo_dynamic_in(table_name, himo_name, ht, max_values)
+            .map(|hid| hid as u32)
+    }
+
+    /// 0.9.0: `define_himo_in` の `&self` 版。 `Arc<Engine>` (= concurrent mode)
+    /// から lazy に himo を定義できる。 idempotent: 既に同名 himo が target
+    /// table に attach 済みなら既存 hid を返す。 定義 (+ attach 移動) は
+    /// `himo_def_lock` で直列化される。
+    pub fn ensure_himo_dynamic_in(
+        &self,
+        table_name: &str,
+        himo_name: &str,
+        ht: HimoType,
+        max_values: u32,
+    ) -> Result<u16, String> {
         self.check_writable();
         if table_name.is_empty() {
             return Err("table name must be non-empty (use define_himo for anonymous)".into());
@@ -3338,27 +3424,36 @@ impl Engine {
 
         let full_name = format!("{}.{}", table_name, himo_name);
 
-        // ensure_himo は既に存在ならそのまま、 新規なら anonymous へ attach する。
+        // 定義 + attach 移動を 1 定義単位として himo_def_lock で直列化する
+        // (並行する同名 ensure が同じ hid に収束するように)。
+        let _guard = self.himo_def_lock.lock().unwrap();
+
+        // 既存ならそのまま、 新規なら anonymous へ attach で定義。
         // 後者なら anonymous の himo_ids から外して target table へ移す。
-        let hid = self.ensure_himo(&full_name, ht, max_values);
+        let hid = match self.himo_id(&full_name) {
+            Some(idx) => idx,
+            None => self.define_himo_slot_locked(&full_name, ht, max_values)? as usize,
+        };
         let hid_u32 = hid as u32;
 
         // 既に target table に attach 済みなら何もしない (重複 define_himo_in)
-        if self.himo_to_table[hid] == tid as TableId {
-            return Ok(hid_u32);
+        let cur_tid = self.himo_to_table[hid].load(std::sync::atomic::Ordering::Relaxed);
+        if cur_tid == tid as TableId {
+            return Ok(hid as u16);
         }
 
-        // ensure_himo は新規時に ANONYMOUS_TABLE へ attach するので、 別 table
-        // 既属の場合は migrate する形 (実用上は新規時のみ通る)。
-        let cur_tid = self.himo_to_table[hid];
+        // 新規時は ANONYMOUS_TABLE へ attach されているので、 別 table 既属の
+        // 場合は migrate する形 (実用上は新規時のみ通る)。
         self.tables[cur_tid as usize]
             .himo_ids
+            .write()
+            .unwrap()
             .retain(|&h| h != hid_u32);
-        self.tables[tid].himo_ids.push(hid_u32);
-        self.himo_to_table[hid] = tid as TableId;
+        self.tables[tid].himo_ids.write().unwrap().push(hid_u32);
+        self.himo_to_table[hid].store(tid as TableId, std::sync::atomic::Ordering::Relaxed);
 
         self.try_persist_tables();
-        Ok(hid_u32)
+        Ok(hid as u16)
     }
 
     /// β-light step 5: `Ref` 型 himo を target_table と紐付けて定義する。
@@ -3384,7 +3479,8 @@ impl Engine {
         let hid = self.define_himo_in(table_name, himo_name, HimoType::Ref, 0)?;
 
         // 所属 table の fk_refs に entry を追加 (idempotent)
-        let owner_tid = self.himo_to_table[hid as usize];
+        let owner_tid =
+            self.himo_to_table[hid as usize].load(std::sync::atomic::Ordering::Relaxed);
         let entry = (hid, target_tid);
         let owner = &mut self.tables[owner_tid as usize];
         if !owner.fk_refs.iter().any(|e| *e == entry) {
@@ -3413,10 +3509,10 @@ impl Engine {
         if self.tables.len() <= 1 {
             return;
         }
-        if hid >= self.himo_to_table.len() {
+        let Some(tid) = self.himo_table_get(hid) else {
             return;
-        }
-        let tid = self.himo_to_table[hid] as usize;
+        };
+        let tid = tid as usize;
         if tid >= self.tables.len() {
             return;
         }
@@ -3447,10 +3543,10 @@ impl Engine {
         if self.himo_types[hid] != HimoType::Ref {
             return;
         }
-        if hid >= self.himo_to_table.len() {
+        let Some(owner_tid) = self.himo_table_get(hid) else {
             return;
-        }
-        let owner_tid = self.himo_to_table[hid] as usize;
+        };
+        let owner_tid = owner_tid as usize;
         if owner_tid >= self.tables.len() {
             return;
         }
@@ -3556,8 +3652,8 @@ impl Engine {
     /// hot path で `tie_*_to_by_id` から呼ばれる、 inline で軽量化。
     #[inline]
     fn himo_is_in_reserved_table(&self, himo_id: usize) -> bool {
-        match self.himo_to_table.get(himo_id) {
-            Some(tid) => self.tables.get(*tid as usize)
+        match self.himo_table_get(himo_id) {
+            Some(tid) => self.tables.get(tid as usize)
                 .map(|td| td.is_reserved())
                 .unwrap_or(false),
             None => false,
@@ -5214,7 +5310,7 @@ impl Engine {
 
     #[allow(dead_code)]
     pub(crate) fn vocab(&self) -> &Vocabulary { &self.vocab }
-    pub fn himo_names(&self) -> &[String] { &self.himo_names }
+    pub fn himo_names(&self) -> &[String] { self.himo_names.as_slice() }
 
     pub fn himo_type(&self, himo: &str) -> Option<HimoType> {
         self.himo_id(himo).map(|idx| self.himo_types[idx])
@@ -5420,10 +5516,73 @@ impl Engine {
         self.himo_names.iter().position(|n| n == himo)
     }
 
+    /// 0.9.0: himo_to_table の bounds-checked read。 要素は AtomicU16 なので
+    /// load して TableId に戻す (attach 変更は himo_def_lock 下の低頻度 path)。
+    #[inline(always)]
+    fn himo_table_get(&self, hid: usize) -> Option<TableId> {
+        self.himo_to_table
+            .get(hid)
+            .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     fn ensure_himo(&mut self, himo: &str, ht: HimoType, max_values: u32) -> usize {
+        // 0.9.0: 本体は `&self` 版に移譲 (signature 互換の thin wrapper)。
+        // capacity 超過は旧実装の assert! と同様 panic のまま。
         if let Some(idx) = self.himo_id(himo) { return idx; }
+        let _guard = self.himo_def_lock.lock().unwrap();
+        if let Some(idx) = self.himo_id(himo) { return idx; }
+        match self.define_himo_slot_locked(himo, ht, max_values) {
+            Ok(hid) => hid as usize,
+            Err(e) => panic!("{}", e),
+        }
+    }
+
+    /// 0.9.0: `ensure_himo` の `&self` 版。 `Arc<Engine>` (= concurrent mode)
+    /// から lazy に himo を定義できる。 idempotent: 同名が既にあれば既存 hid を
+    /// 返す。 新規定義は `himo_def_lock` で直列化され、 anonymous table に
+    /// attach される (旧 `define_himo` と同じ)。 named table に attach するなら
+    /// `ensure_himo_dynamic_in` を使う。
+    pub fn ensure_himo_dynamic(
+        &self,
+        full_name: &str,
+        ht: HimoType,
+        max_values: u32,
+    ) -> Result<u16, String> {
+        self.check_writable();
+        // fast path: 既存名は lock 無しで解決 (himo_names は append-only なので
+        // 見つかった idx は安定)。
+        if let Some(idx) = self.himo_id(full_name) {
+            return Ok(idx as u16);
+        }
+        let _guard = self.himo_def_lock.lock().unwrap();
+        // double-check: lock 待ちの間に他 thread が同名を定義した可能性
+        if let Some(idx) = self.himo_id(full_name) {
+            return Ok(idx as u16);
+        }
+        let hid = self.define_himo_slot_locked(full_name, ht, max_values)?;
+        // himo → table attach (anonymous) を sidecar に反映 (best effort)。
+        self.try_persist_tables();
+        Ok(hid)
+    }
+
+    /// himo 定義の本体 (0.9.0 で ensure_himo から `&self` 化)。
+    ///
+    /// 呼び出し規約: **必ず `himo_def_lock` を保持して呼ぶこと** (直列化は
+    /// caller 責務)。 lock 下で himoreg 登録 → column region init → 並列配列
+    /// への push → header 書き込みまでを行う。 publish 順は `himo_names` を
+    /// 最後にする: `himo_id()` (= 名前の線形検索) で hid が見つかった時点で
+    /// 他の並列配列 (himos / himo_types / himo_max_values / himo_to_table /
+    /// tables[anon].himo_ids) は必ず埋まっている、 という不変条件を成す。
+    fn define_himo_slot_locked(
+        &self,
+        himo: &str,
+        ht: HimoType,
+        max_values: u32,
+    ) -> Result<u16, String> {
         let hid = self.himos.len();
-        assert!((hid as u32) < self.max_himos, "too many himos (max {})", self.max_himos);
+        if hid as u32 >= self.max_himos || hid >= u16::MAX as usize {
+            return Err(format!("too many himos (max {})", self.max_himos));
+        }
 
         self.himo_reg.get_or_insert(himo.as_bytes());
 
@@ -5436,7 +5595,7 @@ impl Engine {
         // 効くようにする。 static backing の場合は Region::new 経路。
         #[cfg(not(target_arch = "wasm32"))]
         let grower = self.backing.grower();
-        let base = self.backing.as_mut_ptr();
+        let base = self.backing.base_ptr_shared();
         let make_region = |off: usize, size: usize| -> Region {
             #[cfg(not(target_arch = "wasm32"))]
             if let Some(g) = &grower {
@@ -5450,27 +5609,38 @@ impl Engine {
             ht, effective_mv, self.max_entities,
         );
 
-        self.himos.push(hs);
-        self.himo_names.push(himo.to_string());
-        self.himo_types.push(ht);
-        self.himo_max_values.push(max_values);
+        // AppendVec は with_capacity(max_himos) 済みなので上の capacity check が
+        // 通れば push は失敗しない (万一の防御で明示 panic)。
+        let push_ok = self.himos.push(hs).is_ok()
+            && self.himo_types.push(ht).is_ok()
+            && self.himo_max_values.push(max_values).is_ok()
+            && self
+                .himo_to_table
+                .push(std::sync::atomic::AtomicU16::new(ANONYMOUS_TABLE))
+                .is_ok();
+        assert!(push_ok, "himo parallel arrays out of capacity (max {})", self.max_himos);
 
         // β-light step 2: 旧 API (define_himo) で追加された himo は anonymous
-        // table に attach する。 step 3+ で define_table 経由なら target table
-        // を指定して attach する形に拡張。
+        // table に attach する。 named table への attach は
+        // ensure_himo_dynamic_in / define_himo_in 側で migrate される。
         let hid_u32 = hid as u32;
-        self.tables[ANONYMOUS_TABLE as usize].himo_ids.push(hid_u32);
-        self.himo_to_table.push(ANONYMOUS_TABLE);
+        self.tables[ANONYMOUS_TABLE as usize]
+            .himo_ids
+            .write()
+            .unwrap()
+            .push(hid_u32);
 
-        // ヘッダにメタデータ書き込み
+        // ヘッダにメタデータ書き込み (himo_def_lock 下、 reader は runtime に
+        // この領域を読まないので &self からの直接書き込みで安全)
         let maxv_base = himo_maxv_base(self.max_himos);
-        self.backing.as_slice_mut()[H_HIMO_TYPES + hid] = ht as u8;
+        let buf = self.backing.slice_mut_shared();
+        buf[H_HIMO_TYPES + hid] = ht as u8;
         let mv_off = maxv_base + hid * 4;
-        self.backing.as_slice_mut()[mv_off..mv_off + 4].copy_from_slice(&max_values.to_le_bytes());
+        buf[mv_off..mv_off + 4].copy_from_slice(&max_values.to_le_bytes());
         let himo_count = (hid + 1) as u32;
-        self.backing.as_slice_mut()[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&himo_count.to_le_bytes());
+        buf[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&himo_count.to_le_bytes());
         // v28: header CRC を再計算(himo_count が変わったため)
-        write_header_crc(self.backing.as_slice_mut());
+        write_header_crc(buf);
 
         // v29 issue7 fix: schema 変更で region layout が変わったので、 seal_integrity
         // で焼かれた古い `.crc` sidecar は stale。 削除して、 次 open は CRC 検証
@@ -5481,7 +5651,10 @@ impl Engine {
             let _ = std::fs::remove_file(&crc_path);
         }
 
-        hid
+        // 最後に名前を publish (この時点で hid の全 metadata が可視)
+        let _ = self.himo_names.push(himo.to_string());
+
+        Ok(hid as u16)
     }
 
     // ──── v27 並行書き込み ────
@@ -8209,6 +8382,120 @@ mod tests {
         let eng2 = Engine::open_standalone(&dir).unwrap();
         eng2.rebuild();
         assert_eq!(eng2.query(&[("score", 30)]).len(), 1);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    // ──── 0.9.0: ensure_himo_dynamic (&self himo definition) ────
+
+    /// `Arc<Engine>` (create_concurrent) から 4 thread 並行で
+    /// `ensure_himo_dynamic` を叩く。 同名 → 同 hid (idempotent)、 hid 重複
+    /// なし、 動的定義 himo の tie_to_by_id / get_by_id round-trip を確認。
+    #[test]
+    fn ensure_himo_dynamic_concurrent_idempotent() {
+        let dir = tmp("himo_dyn_conc");
+        let eng = Engine::create_concurrent(&dir).unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+        for t in 0..4u32 {
+            let e = eng.clone();
+            let b = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                let mut shared_ids = Vec::new();
+                let mut own_ids = Vec::new();
+                for i in 0..8u32 {
+                    // 全 thread 共通名 (奇偶 2 種) と thread 固有名を混ぜる
+                    let shared = e
+                        .ensure_himo_dynamic(
+                            &format!("dyn_shared_{}", i % 2),
+                            HimoType::Number,
+                            0,
+                        )
+                        .unwrap();
+                    let own = e
+                        .ensure_himo_dynamic(
+                            &format!("dyn_own_{}_{}", t, i),
+                            HimoType::Number,
+                            0,
+                        )
+                        .unwrap();
+                    shared_ids.push((i % 2, shared));
+                    own_ids.push(own);
+                }
+                (shared_ids, own_ids)
+            }));
+        }
+
+        let mut shared_by_name: std::collections::HashMap<u32, u16> =
+            std::collections::HashMap::new();
+        let mut all_own: Vec<u16> = Vec::new();
+        for h in handles {
+            let (shared_ids, own_ids) = h.join().unwrap();
+            for (name_key, hid) in shared_ids {
+                // idempotent: 同名は全 thread / 全呼び出しで同じ hid
+                if let Some(prev) = shared_by_name.insert(name_key, hid) {
+                    assert_eq!(prev, hid, "same name resolved to different hids");
+                }
+            }
+            all_own.extend(own_ids);
+        }
+
+        // 固有名 4 thread × 8 個 + 共有名 2 個 = 34 hid、 重複なし
+        let mut everything: Vec<u16> = all_own.clone();
+        everything.extend(shared_by_name.values().copied());
+        let total = everything.len();
+        assert_eq!(total, 4 * 8 + 2);
+        everything.sort_unstable();
+        everything.dedup();
+        assert_eq!(everything.len(), total, "duplicate hid assigned");
+        assert_eq!(eng.himo_count(), 34);
+
+        // 定義済み名の再呼び出しは lock-free fast path で同 hid
+        let again = eng
+            .ensure_himo_dynamic("dyn_shared_0", HimoType::Number, 0)
+            .unwrap();
+        assert_eq!(again, shared_by_name[&0]);
+
+        // 動的定義した himo で tie_to_by_id / get_by_id round-trip
+        let hid = eng
+            .ensure_himo_dynamic("dyn_roundtrip", HimoType::Number, 0)
+            .unwrap();
+        let e0 = eng.entity();
+        eng.tie_to_by_id(e0, hid, 42);
+        assert_eq!(eng.get_by_id(e0, hid), Some(42));
+
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// `ensure_himo_dynamic_in`: named table への lazy 定義も `&self` で通り、
+    /// 旧 `define_himo_in` と同じ attach semantics になることを確認。
+    #[test]
+    fn ensure_himo_dynamic_in_attaches_to_table() {
+        let dir = tmp("himo_dyn_in");
+        let mut eng = Engine::create_standalone(&dir).unwrap();
+        eng.define_table("users", 100).unwrap();
+        let eng = std::sync::Arc::new(eng);
+
+        let hid = eng
+            .ensure_himo_dynamic_in("users", "age", HimoType::Number, 0)
+            .unwrap();
+        // idempotent: 2 回目は同 hid
+        let hid2 = eng
+            .ensure_himo_dynamic_in("users", "age", HimoType::Number, 0)
+            .unwrap();
+        assert_eq!(hid, hid2);
+        // full name で引ける + table attach 済み
+        assert_eq!(eng.himo_id("users.age"), Some(hid as usize));
+        let e = eng.entity_in("users").unwrap();
+        eng.tie_to_by_id(e, hid, 30);
+        assert_eq!(eng.get_by_id(e, hid), Some(30));
+
+        // 未定義 table は Err
+        assert!(eng
+            .ensure_himo_dynamic_in("nope", "x", HimoType::Number, 0)
+            .is_err());
+
         let _ = std::fs::remove_file(&dir);
     }
 }
