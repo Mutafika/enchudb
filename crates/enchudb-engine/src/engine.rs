@@ -1191,6 +1191,9 @@ pub struct Engine {
     /// barrier spin と producer の blocking push が「絶対に進まない待ち」に
     /// 陥らないための脱出フラグ。
     consumer_poisoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// #76: レプリカ (translated foreign entity) への write-back を bridge から
+    /// 除外した際の一度きり警告フラグ。
+    warned_replica_writeback: std::sync::atomic::AtomicBool,
     /// 背景 fsync が最後に completed した LSN。
     durable_lsn: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// v32: この Engine を所有する peer の id。分散時 eid の上位 32bit。
@@ -1392,6 +1395,7 @@ impl Engine {
             oplog: None,
             oplog_record_queue: None,
             consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            warned_replica_writeback: std::sync::atomic::AtomicBool::new(false),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -1642,6 +1646,7 @@ impl Engine {
             oplog: None,
             oplog_record_queue: None,
             consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            warned_replica_writeback: std::sync::atomic::AtomicBool::new(false),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -2104,6 +2109,7 @@ impl Engine {
             oplog: None,
             oplog_record_queue: None,
             consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            warned_replica_writeback: std::sync::atomic::AtomicBool::new(false),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -2396,6 +2402,33 @@ impl Engine {
                 enchudb_oplog::oplog::DecodedOp::Vocab { .. } => false,
             };
             if skip { continue; }
+            // #76 (0.9.0): single-writer guard — foreign entity のレプリカ
+            // (translated local) への **self-authored** write は bridge しない。
+            // 逆写像が無いため他 peer では新規 entity として払い出され、 全 peer で
+            // 断片化する (silent divergence)。 「entity はその author だけが書く」
+            // を正式仕様とし、 レプリカへのローカル編集は local-only に留める。
+            // (逆写像の実装 = write-back の正式サポートは 0.10 候補、 別 request)
+            let self_peer = wal.peer_id();
+            let replica_writeback = rec.author_peer == self_peer && match &rec.op {
+                enchudb_oplog::oplog::DecodedOp::Tie { eid, .. }
+                | enchudb_oplog::oplog::DecodedOp::Untie { eid, .. }
+                | enchudb_oplog::oplog::DecodedOp::Delete { eid }
+                | enchudb_oplog::oplog::DecodedOp::Content { eid, .. }
+                | enchudb_oplog::oplog::DecodedOp::TieNamed { eid, .. } => {
+                    self.eid_translator.is_translated_local(enchudb_oplog::eid_local(*eid))
+                }
+                _ => false,
+            };
+            if replica_writeback {
+                if !self.warned_replica_writeback.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[enchudb] warning: local write to a replicated foreign entity is \
+                         NOT propagated to peers (single-writer per entity, #76). \
+                         Edit the entity on its author peer instead."
+                    );
+                }
+                continue;
+            }
             count += 1;
             let row_eid = match self.entity_in("_sync_ops") {
                 Ok(e) => e,

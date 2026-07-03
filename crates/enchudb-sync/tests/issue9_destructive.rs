@@ -441,3 +441,61 @@ fn foreign_delete_tombstone_survives_reopen() {
     drop(eng_b2);
     cleanup(&path_b);
 }
+
+/// #76 (0.9.0): レプリカ (translated foreign entity) への self-authored write は
+/// bridge されない (single-writer guard)。 旧挙動では B のローカル編集が
+/// 「B の新規 entity」として全 peer に配信され、 A/C 上で断片化していた。
+#[test]
+fn replica_writeback_is_not_propagated() {
+    let path_a = tmp_path("wb_a");
+    let path_b = tmp_path("wb_b");
+
+    // A: entity 作成 → publish
+    let eng_a = make_engine(&path_a, 1);
+    let e_a = eng_a.entity_in("notes").unwrap();
+    eng_a.tie_to(e_a, "notes.note", 7);
+    eng_a.oplog_commit();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
+    let syncer_a = Syncer::new(eng_a.clone(), transport.clone());
+    syncer_a.publish_since(Hlc::ZERO);
+
+    // B: pull して translated local を得る
+    let eng_b = make_engine(&path_b, 2);
+    let syncer_b = Syncer::new(eng_b.clone(), transport.clone());
+    let records = transport.pull(1, Hlc::ZERO);
+    syncer_b.apply_records(&records);
+    let local_b = eng_b
+        .resolve_remote_eid_existing(1, e_a)
+        .expect("A の entity が B に写像される");
+
+    // B がレプリカをローカル編集 → guard により bridge されないはず
+    eng_b.tie_to(local_b, "notes.note", 99);
+    eng_b.oplog_commit();
+    std::thread::sleep(Duration::from_millis(300));
+    eng_b.transfer_oplog_to_sync_ops();
+    let published = syncer_b.publish_since(Hlc::ZERO);
+    let leaked: Vec<_> = transport
+        .pull(2, Hlc::ZERO)
+        .into_iter()
+        .filter(|r| r.author_peer == 2)
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "レプリカへの write-back が bridge された ({} records, published={}) — \
+         他 peer で entity 断片化する (#76)",
+        leaked.len(),
+        published,
+    );
+
+    // ローカルには反映されている (local-only edit)
+    assert_eq!(eng_b.get(local_b, "notes.note"), Some(99));
+
+    drop(syncer_a);
+    drop(eng_a);
+    drop(syncer_b);
+    drop(eng_b);
+    cleanup(&path_a);
+    cleanup(&path_b);
+}
