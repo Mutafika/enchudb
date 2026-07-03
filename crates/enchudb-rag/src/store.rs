@@ -107,7 +107,8 @@ impl RagStoreBuilder {
         let vec_path = with_ext(&path, "vec");
 
         // enchudb を open or create
-        let mut db = if db_path.exists() {
+        let db_existed = db_path.exists();
+        let mut db = if db_existed {
             Engine::open_standalone(db_path.to_str().unwrap()).map_err(io_err)?
         } else {
             Engine::create_with_capacity(db_path.to_str().unwrap(), max_entities).map_err(io_err)?
@@ -124,7 +125,7 @@ impl RagStoreBuilder {
             return Err(Error::DimMismatch { expected: dim, got: actual_dim });
         }
 
-        Ok(RagStore {
+        let mut store = RagStore {
             db,
             schema: self.schema,
             dim,
@@ -132,7 +133,16 @@ impl RagStoreBuilder {
             _vec_file: vec_file,
             vec_mmap,
             bm25: Bm25Index::new(),
-        })
+        };
+
+        // 既存 DB を開いた場合は BM25 index を保存済みテキストから再構築する。
+        // BM25 は揮発インメモリなので、これをやらないと reopen 後の
+        // hybrid_search が silent にベクトル検索オンリーへ劣化する。
+        if db_existed {
+            store.rebuild_bm25();
+        }
+
+        Ok(store)
     }
 }
 
@@ -388,6 +398,22 @@ impl RagStore {
 
     /// BM25 インデックスへの参照。
     pub fn bm25(&self) -> &Bm25Index { &self.bm25 }
+
+    /// BM25 index を保存済み chunk テキスト (`__text` content) から一括再構築する。
+    ///
+    /// BM25 は揮発インメモリなので、既存ストアを開いた直後は空になっている。
+    /// builder の `build()` が既存 DB を検出した場合に自動で呼ぶため、
+    /// 通常はユーザーが直接呼ぶ必要はない (再構築は冪等なので呼んでも安全)。
+    pub fn rebuild_bm25(&mut self) {
+        self.bm25 = Bm25Index::new();
+        for eid in self.db.entities() {
+            if let Some(text) = self.db.get_content(eid, TEXT_KEY)
+                .and_then(|b| std::str::from_utf8(b).ok())
+            {
+                self.bm25.add_document(eid, text);
+            }
+        }
+    }
 
     /// ペアテーブル再構築（v26 feature 有効時のみ意味あり）。
     /// v27 では no-op でも害はない。

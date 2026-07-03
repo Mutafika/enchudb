@@ -534,6 +534,32 @@ impl OpLog {
         let checkpoint = u64::from_le_bytes(mmap[16..24].try_into().unwrap());
         let capacity = u64::from_le_bytes(mmap[24..32].try_into().unwrap());
 
+        // 0.9.0 (L1): header の capacity / head / checkpoint を実 file 長と突き合わせる。
+        // 旧実装は無検証だったため、 truncated .oplog (crash / 不完全 copy) が
+        // 正常に open された後、 append の mmap[offset..] で OOB panic した。
+        let file_len = mmap.len() as u64;
+        if capacity > file_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "WAL truncated: header capacity {} exceeds file size {} — \
+                     file was cut short (crash / partial copy?)",
+                    capacity, file_len,
+                ),
+            ));
+        }
+        for (name, v) in [("head", head), ("checkpoint", checkpoint)] {
+            if v < HEADER_SIZE as u64 || v > capacity {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "WAL header corrupt: {} = {} out of range [{}, capacity {}]",
+                        name, v, HEADER_SIZE, capacity,
+                    ),
+                ));
+            }
+        }
+
         Ok(Self {
             _file: file,
             mmap,
@@ -1046,7 +1072,32 @@ impl OpLog {
                         signature, pubkey_fp, signed_bytes,
                     });
                 }
-                None => break,
+                None => {
+                    // forward-compat 可視化 (0.9.0 L1): 新しい version が書いた
+                    // 未知 op_type (or 不正 payload) は従来通りここで scan を打ち
+                    // 切るが、 silent だと以降の正常 record 落ちに気付けない。
+                    // changefeed 経路は cursor が進めず毎 tick 再 scan するため、
+                    // 0.8.15 の persist warning と同様に 1 秒 1 回に rate-limit。
+                    static LAST_WARN_MS: AtomicU64 = AtomicU64::new(0);
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let last = LAST_WARN_MS.load(Ordering::Relaxed);
+                    if now_ms.saturating_sub(last) >= 1000
+                        && LAST_WARN_MS
+                            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        eprintln!(
+                            "enchudb oplog: undecodable op (op_type={}) at offset {} — \
+                             stopping scan; later records in this WAL are ignored \
+                             (written by a newer version?)",
+                            op_byte, offset,
+                        );
+                    }
+                    break;
+                }
             }
 
             offset = (payload_end) as u64;

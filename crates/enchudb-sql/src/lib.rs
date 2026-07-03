@@ -16,7 +16,7 @@
 //! SELECT [* | col, ...] FROM t
 //!   [WHERE <cond> [AND <cond>]*]
 //!   [ORDER BY col [ASC|DESC]]
-//!   [LIMIT n]
+//!   [LIMIT n] [OFFSET n]
 //!
 //! UPDATE t SET col = val [, col = val]* WHERE <cond> [AND <cond>]*
 //! DELETE FROM t WHERE <cond> [AND <cond>]*
@@ -33,6 +33,7 @@
 //! ## 未対応 (今後)
 //! - JOIN / subquery
 //! - 集計 (`SUM`, `COUNT`, `GROUP BY` の SQL 経由) — `query_lang` DSL を使う
+//! - `DISTINCT` / `HAVING` — 明示的に `SqlError::Unsupported` を返す (silent に無視しない)
 //! - 複数カラム PK
 //! - `DEFAULT` / `NOT NULL` / `CHECK` 制約
 //! - スキーマ永続化 (現状は in-memory、reopen 時に CREATE TABLE 再呼び出しが必要、`define_himo` は idempotent)
@@ -426,13 +427,18 @@ impl Database {
                 values.push((cd, eval_literal(e)?));
             }
 
-            // INSERT OR REPLACE: PK 一致行があれば置換
+            // PRIMARY KEY 制約:
+            // - INSERT OR REPLACE: PK 一致行があれば置換対象にする
+            // - plain INSERT: PK 一致行があれば DuplicatePk エラー
             let mut target_eid: Option<EntityId> = None;
-            if or_replace {
-                if let Some(pk_name) = &table.pk {
-                    let pk_val = values.iter().find(|(c, _)| c.name == *pk_name).map(|(_, v)| v.clone());
-                    if let Some(pkv) = pk_val {
-                        target_eid = self.find_by_pk(&table, pk_name, &pkv)?;
+            if let Some(pk_name) = &table.pk {
+                let pk_val = values.iter().find(|(c, _)| c.name == *pk_name).map(|(_, v)| v.clone());
+                if let Some(pkv) = pk_val {
+                    let existing = self.find_by_pk(&table, pk_name, &pkv)?;
+                    if or_replace {
+                        target_eid = existing;
+                    } else if existing.is_some() {
+                        return Err(SqlError::DuplicatePk);
                     }
                 }
             }
@@ -457,15 +463,38 @@ impl Database {
     // ────── SELECT ──────
 
     fn exec_select(&mut self, q: Query) -> Result<Output, SqlError> {
-        // ORDER BY / LIMIT は Query 直下の field、 select 本体じゃない。
+        // ORDER BY / LIMIT / OFFSET は Query 直下の field、 select 本体じゃない。
         // Query を分解してから select 内へ降りる。
         let order_by = q.order_by.as_ref().cloned();
         let limit_expr = q.limit.as_ref().cloned();
+        let offset_clause = q.offset.as_ref().cloned();
 
         let select = match *q.body {
             SetExpr::Select(s) => s,
             other => return Err(SqlError::Unsupported(format!("SELECT body: {other:?}"))),
         };
+
+        // 未対応句は silent に無視せず明示的にエラーにする (結果が黙って
+        // 間違うより、呼び出し側に「対応していない」と伝える方が安全)。
+        if select.distinct.is_some() {
+            return Err(SqlError::Unsupported(
+                "SELECT DISTINCT は未対応 (アプリ側で dedupe するか query_lang DSL を使う)".into(),
+            ));
+        }
+        match &select.group_by {
+            ast::GroupByExpr::Expressions(exprs, modifiers)
+                if exprs.is_empty() && modifiers.is_empty() => {}
+            _ => {
+                return Err(SqlError::Unsupported(
+                    "GROUP BY は未対応 (集計は query_lang DSL を使う)".into(),
+                ));
+            }
+        }
+        if select.having.is_some() {
+            return Err(SqlError::Unsupported(
+                "HAVING は未対応 (集計は query_lang DSL を使う)".into(),
+            ));
+        }
 
         if select.from.len() != 1 {
             return Err(SqlError::Unsupported("FROM with 0 or multiple tables".into()));
@@ -521,6 +550,18 @@ impl Database {
             },
         };
 
+        // OFFSET 解析: リテラル整数のみ。 ソート後に先頭 n 行 skip → LIMIT の順で
+        // 適用する (SQL 標準のページネーション意味論)。
+        let offset: Option<usize> = match offset_clause {
+            None => None,
+            Some(o) => match eval_literal(&o.value)? {
+                Value::Integer(n) if n >= 0 => Some(n as usize),
+                other => {
+                    return Err(SqlError::BadValue(format!("OFFSET: {other:?}")));
+                }
+            },
+        };
+
         let eids = self.eval_where(&table, select.selection.as_ref())?;
 
         // ORDER BY のソートキーを別 vec に out-of-band で持たせる。
@@ -544,6 +585,13 @@ impl Database {
                 let ord = compare_sort_values(a.2.as_ref(), b.2.as_ref());
                 if *asc { ord } else { ord.reverse() }
             });
+        }
+        if let Some(n) = offset {
+            if n >= indexed.len() {
+                indexed.clear();
+            } else {
+                indexed.drain(..n);
+            }
         }
         if let Some(n) = limit {
             indexed.truncate(n);
@@ -1115,6 +1163,91 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn duplicate_pk_insert_errors() {
+        let mut db = fresh("dup_pk");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'alice')").unwrap();
+        // 同一 PK の plain INSERT は DuplicatePk
+        let err = db.execute("INSERT INTO t VALUES (1, 'bob')").unwrap_err();
+        assert!(matches!(err, SqlError::DuplicatePk), "got {err:?}");
+        // 元の行は無傷 (1 行のまま、値も変わらない)
+        match db.execute("SELECT name FROM t WHERE id = 1").unwrap() {
+            Output::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Text("alice".into()));
+            }
+            _ => panic!(),
+        }
+        // 別 PK は普通に通る
+        db.execute("INSERT INTO t VALUES (2, 'bob')").unwrap();
+    }
+
+    #[test]
+    fn duplicate_pk_text_key() {
+        let mut db = fresh("dup_pk_text");
+        db.execute("CREATE TABLE notif (key TEXT PRIMARY KEY, ts INTEGER)").unwrap();
+        db.execute("INSERT INTO notif VALUES ('k1', 100)").unwrap();
+        let err = db.execute("INSERT INTO notif VALUES ('k1', 200)").unwrap_err();
+        assert!(matches!(err, SqlError::DuplicatePk), "got {err:?}");
+        // OR REPLACE は引き続き置換として成立
+        db.execute("INSERT OR REPLACE INTO notif VALUES ('k1', 300)").unwrap();
+        match db.execute("SELECT ts FROM notif").unwrap() {
+            Output::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Integer(300));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn duplicate_pk_within_multi_row_insert() {
+        let mut db = fresh("dup_pk_multirow");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        // 同一 statement 内での PK 重複も検出される
+        let err = db.execute("INSERT INTO t VALUES (1, 'a'), (1, 'b')").unwrap_err();
+        assert!(matches!(err, SqlError::DuplicatePk), "got {err:?}");
+    }
+
+    #[test]
+    fn limit_offset_paginates() {
+        let mut db = fresh("limit_offset");
+        db.execute("CREATE TABLE log (id INTEGER PRIMARY KEY, ts INTEGER)").unwrap();
+        for i in 1..=5i64 {
+            db.execute(&format!("INSERT INTO log VALUES ({i}, {})", i * 10)).unwrap();
+        }
+        let page = |db: &mut Database, off: usize| -> Vec<i64> {
+            match db.execute(&format!("SELECT id FROM log ORDER BY ts LIMIT 2 OFFSET {off}")).unwrap() {
+                Output::Rows { rows, .. } => rows.iter().map(|r| match r[0] { Value::Integer(n) => n, _ => -1 }).collect(),
+                _ => panic!(),
+            }
+        };
+        // ページごとに異なる行が返る (OFFSET が silent 無視だと全ページ同じになる)
+        assert_eq!(page(&mut db, 0), vec![1, 2]);
+        assert_eq!(page(&mut db, 2), vec![3, 4]);
+        assert_eq!(page(&mut db, 4), vec![5]);
+        // 全件を超える OFFSET は 0 行
+        assert_eq!(page(&mut db, 10), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn distinct_group_by_having_error_cleanly() {
+        let mut db = fresh("unsupported_clauses");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, dept INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 10)").unwrap();
+
+        let err = db.execute("SELECT DISTINCT dept FROM t").unwrap_err();
+        assert!(matches!(&err, SqlError::Unsupported(m) if m.contains("DISTINCT")), "got {err:?}");
+
+        let err = db.execute("SELECT dept FROM t GROUP BY dept").unwrap_err();
+        assert!(matches!(&err, SqlError::Unsupported(m) if m.contains("GROUP BY")), "got {err:?}");
+
+        let err = db.execute("SELECT dept FROM t GROUP BY dept HAVING dept > 5").unwrap_err();
+        // GROUP BY が先に弾かれる (HAVING 単独は SQL として成立しないため十分)
+        assert!(matches!(err, SqlError::Unsupported(_)), "got {err:?}");
     }
 
     #[test]

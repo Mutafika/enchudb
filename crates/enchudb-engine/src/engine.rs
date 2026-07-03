@@ -521,6 +521,51 @@ fn acquire_writer_lock(path: &str) -> io::Result<WriterLock> {
     Ok(WriterLock { _file: f, key })
 }
 
+/// 0.9.0 (H11): create 系 API の既存ファイルガード。
+/// 旧実装は `create(true).truncate(true)` で **既存 DB を無警告で 0 バイトに破壊**
+/// していた (typo った path を create しただけで全損)。 FFI 契約
+/// (`enchudb_create`: 「既存ファイルがあると Engine 側でエラー」) 通り、
+/// 存在する path への create は `AlreadyExists` で拒否する。
+/// 既存 DB を開くなら `Engine::open*`、 作り直すなら caller が明示的に削除すること。
+#[cfg(not(target_arch = "wasm32"))]
+fn ensure_create_target_absent(path: &str) -> io::Result<()> {
+    if std::path::Path::new(path).exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "database file already exists: \"{path}\" — refusing to overwrite. \
+                 use Engine::open* to open the existing DB, or remove the file first"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// H11: 新規 DB ファイルを `create_new` (= O_EXCL) で開く。
+/// `ensure_create_target_absent` の存在チェック〜open の間に他 process が
+/// 同 path を作った TOCTOU race も OS レベルで `AlreadyExists` になる。
+#[cfg(not(target_arch = "wasm32"))]
+fn open_new_db_file(path: &str) -> io::Result<std::fs::File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "database file already exists: \"{path}\" — refusing to overwrite \
+                         (created concurrently?)"
+                    ),
+                )
+            } else {
+                e
+            }
+        })
+}
+
 /// `snapshot_export` の結果。どのファイルを書き出したか。
 #[derive(Debug, Clone)]
 pub struct SnapshotFiles {
@@ -832,6 +877,65 @@ fn verify_header_crc(buf: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// 0.9.0 (L1): header field の自己整合チェック。
+/// `verify_header_crc` は stored CRC == 0 (v27 以前の legacy DB) を素通しするため、
+/// 破損した himo_count / *_size / *_cap がそのまま layout 計算へ流れて panic /
+/// OOB region を起こし得た。 ここで「header 自身の field 同士の関係」だけを検証
+/// する (新しい定数上限は導入しない → 既存の正常 DB を誤って弾かない)。
+fn sanity_check_header_fields(
+    max_himos: u32, himo_count: u32,
+    vocab_max_entries: u32, vocab_index_cap: u32, vocab_data_size: usize,
+    himoreg_max_entries: u32, himoreg_index_cap: u32, himoreg_data_size: usize,
+    content_data_size: usize,
+) -> Result<(), String> {
+    if himo_count > max_himos {
+        return Err(format!(
+            "himo_count {} exceeds max_himos {} — corrupt header", himo_count, max_himos,
+        ));
+    }
+    // data_end は mmap 上の AtomicU32 (#77)。 u32::MAX 超は create 時点で拒否
+    // されるので、 header にあれば破損。
+    for (name, size) in [
+        ("vocab_data_size", vocab_data_size),
+        ("himoreg_data_size", himoreg_data_size),
+        ("content_data_size", content_data_size),
+    ] {
+        if size > u32::MAX as usize {
+            return Err(format!(
+                "{} {} exceeds format limit {} (u32 data_end) — corrupt header",
+                name, size, u32::MAX,
+            ));
+        }
+    }
+    // vocab / himoreg の index は cap-1 を hash mask に使う線形 probe
+    // (Vocabulary::lookup)。 cap == 0 は即 OOB / 除算相当、 非 2^n は probe が
+    // 全 slot を巡回できず無限 loop。 cap < max_entries は index が先に満杯に
+    // なり insert が無限 probe。 create 経路は必ず next_power_of_two(>= entries)
+    // で焼くので、 これらを満たさない header は破損。
+    for (name, max_entries, index_cap) in [
+        ("vocab", vocab_max_entries, vocab_index_cap),
+        ("himoreg", himoreg_max_entries, himoreg_index_cap),
+    ] {
+        if max_entries == 0 || index_cap == 0 {
+            return Err(format!(
+                "{} max_entries {} / index_cap {} must be nonzero — corrupt header",
+                name, max_entries, index_cap,
+            ));
+        }
+        if !index_cap.is_power_of_two() {
+            return Err(format!(
+                "{} index_cap {} is not a power of two — corrupt header", name, index_cap,
+            ));
+        }
+        if index_cap < max_entries {
+            return Err(format!(
+                "{} index_cap {} < max_entries {} — corrupt header", name, index_cap, max_entries,
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn himo_maxv_base(max_himos: u32) -> usize {
     (H_HIMO_TYPES + max_himos as usize + 3) & !3
 }
@@ -923,6 +1027,39 @@ impl Layout {
         himoreg_max_entries: u32, himoreg_index_cap: u32, himoreg_data_size: usize,
         content_data_size: usize, cyl_max_values: u32,
     ) -> Self {
+        // create 経路 (= プログラム引数由来の params) 用。 open 経路 (= disk header
+        // 由来の params) は `try_from_params` を使い、 破損 header を InvalidData に
+        // 落とすこと (0.9.0 L1)。
+        Self::try_from_params(
+            max_entities, max_himos,
+            vocab_max_entries, vocab_index_cap, vocab_data_size,
+            himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
+            content_data_size, cyl_max_values,
+        )
+        .expect("layout size overflow — parameters too large")
+    }
+
+    /// 0.9.0 (L1): checked arithmetic 版。 header CRC==0 の legacy DB では
+    /// 破損した size field がそのまま流れ込むため、 usize wrap で過小な
+    /// total_size を計算 → OOB region を map する事故を Err で防ぐ。
+    fn try_from_params(
+        max_entities: u32, max_himos: u32,
+        vocab_max_entries: u32, vocab_index_cap: u32, vocab_data_size: usize,
+        himoreg_max_entries: u32, himoreg_index_cap: u32, himoreg_data_size: usize,
+        content_data_size: usize, cyl_max_values: u32,
+    ) -> Result<Self, String> {
+        // EntitySet::region_size 内部の `(max_entities + 7)` が u32 で wrap しない
+        // ガード。 この値の DB は create 時点で作れない (debug では overflow panic)。
+        if max_entities > u32::MAX - 7 {
+            return Err(format!(
+                "max_entities {} exceeds format limit — corrupt header?", max_entities,
+            ));
+        }
+        let ck_add = |a: usize, b: usize| -> Result<usize, String> {
+            a.checked_add(b)
+                .ok_or_else(|| "layout total_size overflow — corrupt header fields?".to_string())
+        };
+
         // v3 layout: 固定上限の region 群を前に、 append-only な
         // variable region 群 (vocab_data / himoreg_data / content_data)
         // を末尾に集める。 これで「ファイル末尾のみ伸びる」 monotonic
@@ -933,49 +1070,52 @@ impl Layout {
         // ── 固定 cluster: 上限が max_entities / max_himos / *_cap で決まる ──
         let entities_off = off;
         let entities_size = align8(EntitySet::region_size(max_entities));
-        off += entities_size;
+        off = ck_add(off, entities_size)?;
 
         let vocab_offsets_off = off;
         let vocab_offsets_size = align8(Vocabulary::offsets_region_size(vocab_max_entries));
-        off += vocab_offsets_size;
+        off = ck_add(off, vocab_offsets_size)?;
 
         let vocab_index_off = off;
         let vocab_index_size = align8(Vocabulary::index_region_size(vocab_index_cap));
-        off += vocab_index_size;
+        off = ck_add(off, vocab_index_size)?;
 
         let himoreg_offsets_off = off;
         let himoreg_offsets_size = align8(Vocabulary::offsets_region_size(himoreg_max_entries));
-        off += himoreg_offsets_size;
+        off = ck_add(off, himoreg_offsets_size)?;
 
         let himoreg_index_off = off;
         let himoreg_index_size = align8(Vocabulary::index_region_size(himoreg_index_cap));
-        off += himoreg_index_size;
+        off = ck_add(off, himoreg_index_size)?;
 
         let content_index_off = off;
         let content_index_size = align8(ContentStore::index_region_size_for(max_entities));
-        off += content_index_size;
+        off = ck_add(off, content_index_size)?;
 
         let himo_col_size = align8(Column::region_size(max_entities, 4));
         let himo_cyl_size = 0usize;
         let himo_slot_size = himo_col_size;
 
         let himo_base_off = off;
-        off += himo_slot_size * (max_himos as usize);
+        let himo_total = himo_slot_size
+            .checked_mul(max_himos as usize)
+            .ok_or_else(|| "layout himo region overflow — corrupt header fields?".to_string())?;
+        off = ck_add(off, himo_total)?;
 
         // ── Variable cluster (tail): append-only で伸びる region 群 ──
         let vocab_data_off = off;
         let vocab_data_size = align8(Vocabulary::data_region_size(vocab_data_size));
-        off += vocab_data_size;
+        off = ck_add(off, vocab_data_size)?;
 
         let himoreg_data_off = off;
         let himoreg_data_size = align8(Vocabulary::data_region_size(himoreg_data_size));
-        off += himoreg_data_size;
+        off = ck_add(off, himoreg_data_size)?;
 
         let content_data_off = off;
         let content_data_size = align8(content_data_size);
-        off += content_data_size;
+        off = ck_add(off, content_data_size)?;
 
-        Layout {
+        Ok(Layout {
             entities_off, entities_size,
             vocab_data_off, vocab_data_size,
             vocab_offsets_off, vocab_offsets_size,
@@ -990,7 +1130,7 @@ impl Layout {
             himo_base_off, himo_col_size, himo_cyl_size, himo_slot_size,
             cyl_max_values,
             total_size: off,
-        }
+        })
     }
 
     fn himo_col_off(&self, hid: usize) -> usize {
@@ -1328,11 +1468,12 @@ impl Engine {
                 std::fs::create_dir_all(parent)?;
             }
         }
+        // H11: 既存 DB を silent truncate で破壊しない (lock 取得前に判定 —
+        // 既存 DB を別 process の writer が掴んでいる場合の flock block も回避)。
+        ensure_create_target_absent(path)?;
         // writer lock を先に取る (= 他 writer が居れば block)。 create も書き込みなので必須。
         let writer_lock = acquire_writer_lock(path)?;
-        let file = OpenOptions::new()
-            .read(true).write(true).create(true).truncate(true)
-            .open(path)?;
+        let file = open_new_db_file(path)?;
         file.set_len(layout.total_size as u64)?;
 
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
@@ -1510,14 +1651,11 @@ impl Engine {
                 std::fs::create_dir_all(parent)?;
             }
         }
+        // H11: 既存 DB を silent truncate で破壊しない (create_full_with_cyl と同じガード)
+        ensure_create_target_absent(path)?;
         // writer lock を先に取る (= 他 writer が居れば block)
         let writer_lock = acquire_writer_lock(path)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
+        let file = open_new_db_file(path)?;
 
         // Phase B Step 3: initial_commit は variable cluster の手前 (=
         // 末尾の vocab_data の開始 offset) で打ち切る。 fixed cluster
@@ -1897,6 +2035,7 @@ impl Engine {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let max_entities = u32::from_le_bytes(buf[H_MAX_ENTITIES..H_MAX_ENTITIES + 4].try_into().unwrap());
         let max_himos = u32::from_le_bytes(buf[H_MAX_HIMOS..H_MAX_HIMOS + 4].try_into().unwrap());
+        let himo_count = u32::from_le_bytes(buf[H_HIMO_COUNT..H_HIMO_COUNT + 4].try_into().unwrap());
         let vocab_max_entries = u32::from_le_bytes(buf[H_VOCAB_MAX_ENTRIES..H_VOCAB_MAX_ENTRIES + 4].try_into().unwrap());
         let vocab_index_cap = u32::from_le_bytes(buf[H_VOCAB_INDEX_CAP..H_VOCAB_INDEX_CAP + 4].try_into().unwrap());
         let vocab_data_size = u64::from_le_bytes(buf[H_VOCAB_DATA_SIZE..H_VOCAB_DATA_SIZE + 8].try_into().unwrap()) as usize;
@@ -1906,12 +2045,23 @@ impl Engine {
         let content_data_size = u64::from_le_bytes(buf[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].try_into().unwrap()) as usize;
         let cyl_max_values = u32::from_le_bytes(buf[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].try_into().unwrap());
 
-        let layout = Layout::from_params(
+        // 0.9.0 (L1): CRC == 0 の legacy header は verify_header_crc を素通しする
+        // ため、 field の自己整合を明示チェック (破損値 → panic/OOB の前に InvalidData)。
+        sanity_check_header_fields(
+            max_himos, himo_count,
+            vocab_max_entries, vocab_index_cap, vocab_data_size,
+            himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
+            content_data_size,
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let layout = Layout::try_from_params(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, cyl_max_values,
-        );
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // Phase B 以降: backing_kind フラグで「growable 由来で file_size <
         // total_size が正常」 か 「eager 由来で file_size 不足は truncation」 か
@@ -1982,12 +2132,26 @@ impl Engine {
         let content_data_size = u64::from_le_bytes(buf[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].try_into().unwrap()) as usize;
         let cyl_max_values = u32::from_le_bytes(buf[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].try_into().unwrap());
 
-        let layout = Layout::from_params(
+        // 0.9.0 (L1): checked arithmetic 版で layout を計算 (破損 header の usize
+        // wrap → 過小 total_size → OOB region を防ぐ)。 file 経路は open_internal →
+        // validate_file_size で field sanity 済み、 Memory 経路 (from_bytes) は
+        // ここが最初の防壁。
+        let layout = Layout::try_from_params(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, cyl_max_values,
-        );
+        )?;
+
+        // backing が layout 全域をカバーしているか (Memory 経路の truncated bytes
+        // で Region が OOB を map する事故を防ぐ。 file 経路は validate_file_size
+        // が既に同等チェック + growable の set_len 拡張を済ませている)。
+        if buf.len() < layout.total_size {
+            return Err(format!(
+                "backing too small: {} bytes (layout.total_size = {}) — truncated file?",
+                buf.len(), layout.total_size,
+            ));
+        }
 
         let maxv_base = himo_maxv_base(max_himos);
         let mut type_bytes = Vec::with_capacity(himo_count as usize);
@@ -3018,6 +3182,13 @@ impl Engine {
             .collect()
     }
     pub fn entity_count(&self) -> u32 { self.entities.count() }
+
+    /// eid が live (= 割当済みで未削除) か。 0.9.0 (M10): query_lang の
+    /// update/delete が未割当 slot へ phantom write するのを防ぐ existence check 用。
+    /// 範囲外 eid は false。
+    pub fn is_live(&self, eid: enchudb_oplog::EntityId) -> bool {
+        self.entities.is_live(enchudb_oplog::eid_local(eid))
+    }
     pub fn next_eid(&self) -> enchudb_oplog::EntityId {
         let peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
         enchudb_oplog::make_eid(peer, self.entities.next_eid())

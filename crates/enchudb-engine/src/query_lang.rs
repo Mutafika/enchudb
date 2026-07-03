@@ -387,6 +387,11 @@ fn exec_update(eng: &mut Engine, input: &str) -> QueryResult {
         Ok(e) => e,
         Err(_) => return QueryResult::Error(format!("update: invalid eid: {eid_str}")),
     };
+    // M10: 存在チェック。 未割当 slot へ tie すると、 将来その slot に allocate
+    // された entity が phantom 値を継承するため、 live でない eid は拒否する。
+    if !eng.is_live(eid) {
+        return QueryResult::Error(format!("entity {eid} does not exist"));
+    }
     let tokens = parse_kv_tokens(rest);
     if tokens.is_empty() { return QueryResult::Error("update: nothing to set".into()); }
 
@@ -406,6 +411,11 @@ fn exec_update(eng: &mut Engine, input: &str) -> QueryResult {
 
 fn exec_delete(eng: &mut Engine, input: &str) -> QueryResult {
     match input.parse::<enchudb_oplog::EntityId>() {
+        // M10: update と同じ existence check — 存在しない eid の削除を
+        // 「ok」と報告しない (typo 検知)。
+        Ok(eid) if !eng.is_live(eid) => {
+            QueryResult::Error(format!("entity {eid} does not exist"))
+        }
         Ok(eid) => { eng.delete(eid); QueryResult::Deleted }
         Err(_) => QueryResult::Error(format!("invalid id: {input}")),
     }
@@ -551,6 +561,44 @@ mod tests {
         let mut eng = setup("update_empty");
         let r = execute(&mut eng, "~ 0");
         assert!(matches!(r, QueryResult::Error(_)));
+    }
+
+    #[test]
+    fn update_nonexistent_eid_is_error() {
+        // M10 regression: 未割当 slot への update は phantom write になるので拒否
+        let mut eng = setup("update_phantom");
+        let r = execute(&mut eng, "~ 9999 age:42");
+        match r {
+            QueryResult::Error(e) => assert!(e.contains("does not exist"), "got: {e}"),
+            other => panic!("expected error, got {other:?}"),
+        }
+        // phantom 値が書かれてないこと (将来 9999 に allocate された entity が
+        // age:42 を継承しない)
+        match execute(&mut eng, "age:42 | count") {
+            QueryResult::Count(0) => {}
+            other => panic!("expected 0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_deleted_eid_is_error() {
+        let mut eng = setup("update_deleted");
+        let eid = match execute(&mut eng, "age:20") {
+            QueryResult::Entities(v) => v[0],
+            _ => panic!(),
+        };
+        assert!(matches!(execute(&mut eng, &format!("- {eid}")), QueryResult::Deleted));
+        let r = execute(&mut eng, &format!("~ {eid} age:42"));
+        assert!(matches!(r, QueryResult::Error(_)), "got {r:?}");
+    }
+
+    #[test]
+    fn delete_nonexistent_eid_is_error() {
+        let mut eng = setup("delete_phantom");
+        match execute(&mut eng, "- 9999") {
+            QueryResult::Error(e) => assert!(e.contains("does not exist"), "got: {e}"),
+            other => panic!("expected error, got {other:?}"),
+        }
     }
 
     #[test]

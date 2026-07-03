@@ -1,34 +1,46 @@
-//! ACL — project 単位の書き込み権限を紐で表現する。
+//! ACL — **インメモリ・プロセス内限定** の writer 許可リスト。
 //!
-//! # 設計
+//! # 現状の正直な仕様 (重要)
 //!
-//! Project 自体を 1 つの entity として扱い、`acl_writer` 紐で
-//! 許可 peer を複数張る。
+//! この [`Acl`] は単なるプロセス内の allow-list で、以下の点に注意:
+//!
+//! - **永続化されない。** DB ファイルにも WAL にも書かれない。プロセスを
+//!   落とせば消える。
+//! - **どの himo にも紐付いていない。** 過去のドキュメントには `acl_writer`
+//!   himo 経由で紐として表現する設計が書かれていたが、その経路は未実装
+//!   (どこからも配線されていない)。
+//! - **open するたびに allow-all で始まる。** デフォルト (writer 未登録) は
+//!   「全 peer 許可」なので、ACL を効かせたい呼び出し側は **DB を開き直す
+//!   たびに [`Acl::add_writer`] で再投入する必要がある。**
+//! - 効果があるのは同一プロセス内で `is_writer()` を確認する経路
+//!   (sync の op 受信チェック等) のみ。
+//!
+//! 永続化された ACL (紐データとして WAL に乗り、peer 間で分散されるもの) は
+//! 将来の作業であり、現時点では存在しない。
+//!
+//! # 使い方
 //!
 //! ```
-//! # use enchudb_engine::{Engine, HimoType};
-//! let path = format!("/tmp/enchudb-acl-doc-{}.db", std::process::id());
-//! # let _ = std::fs::remove_file(&path);
-//! let mut eng = Engine::create_standalone(&path).unwrap();
-//! eng.define_himo("acl_writer", HimoType::Number, 4);
-//! let project = eng.entity();
-//! eng.tie(project, "acl_writer", 1);  // peer 1 に書き込み許可
-//! eng.tie(project, "acl_writer", 2);  // peer 2 にも
-//! # let _ = std::fs::remove_file(&path);
+//! use enchudb_engine::acl::Acl;
+//!
+//! let acl = Acl::new();
+//! // デフォルトは allow-all (ACL 未設定)
+//! assert!(acl.is_writer(42));
+//! assert!(!acl.is_enforced());
+//!
+//! // writer を登録した瞬間から allow-list として効く (このプロセス内のみ)
+//! acl.add_writer(1);
+//! assert!(acl.is_writer(1));
+//! assert!(!acl.is_writer(2));
+//!
+//! // 永続化されないので、DB を開き直したら再登録が必要
 //! ```
 //!
-//! Syncer は受信 op の `author_peer` が project の `acl_writer` に入っているか
-//! 確認する。入っていなければ reject。
+//! # スコープ
 //!
-//! # Phase C の範囲
-//!
-//! - グローバル ACL(project = DB 全体)のみ。
-//! - 細粒度(entity 単位、himo 単位)の ACL は Phase D 以降。
-//! - ACL の変更自体も WAL に乗り分散される(ACL 自身が紐データ)。
-//!
-//! # 最初の空 DB
-//!
-//! ACL が空(0 件)なら「全員 OK」扱い。Phase D で「所有者が必須」に厳しくする。
+//! - グローバル (プロセス単位) の writer 集合のみ。
+//! - 細粒度 (entity 単位、himo 単位) の ACL は未対応。
+//! - ACL 変更の永続化 / 分散 (WAL 経由) は未対応 — 将来の作業。
 
 use std::collections::HashSet;
 use std::sync::RwLock;
