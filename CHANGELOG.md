@@ -3,6 +3,109 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.9.0 — 2026-07-03
+
+content store を Leaf himo に統合する構造改定 (#81) + 2026-07-03 全体監査
+(31 findings、 GitHub #74-#79) の一括修正。 **wire format 変更 (`Op::TieNamed`
+追加) と挙動変更 (create/INSERT のエラー化) を含むため minor**。 DB file format
+は不変 — 既存 DB はそのまま開ける (migration 手順は下記)。
+
+### Migration ガイド
+
+- **全 peer 同時アップグレード必須**: sync wire に `TieNamed` (tag 6) が増えた。
+  0.8 peer は未知 op として skip するため、 混在運用すると content 系 op が
+  サイレントに落ちる。 wire version 混在は非サポート (運用判断 2026-07-03)。
+- **既存 DB file はそのまま開ける**: 旧 content region は読み取り専用アーカイブ
+  として凍結され、 `get_content` は新経路 (`_c_{key}` himo) → 旧 region の順で
+  read-through する。 データ書き換え・再構築は不要。 新規書き込みは全て Leaf 側に
+  入る (旧 region が育つことはもう無い)。
+- **エラーハンドリングの追加が要る箇所**:
+  - `Engine::create*` は既存 path に対して `io::ErrorKind::AlreadyExists` で
+    失敗する (今までは既存 DB を**サイレントに clobber** していた)。 「あれば
+    開く、 なければ作る」は open → 失敗時 create に書き換えること。
+  - SQL の plain `INSERT` は重複 PK で `DuplicatePk` エラーを返す (今までは
+    重複行がそのまま入った)。 upsert 意図なら従来通り `INSERT OR REPLACE`。
+- **`_c_` prefix の列名は予約**: schema 層の列名 validation が `_c_` 始まりを
+  reject する (content 互換 himo の名前空間)。
+- **レプリカへの write-back は local-only (#76)**: 翻訳済み foreign entity への
+  非 author peer の書き込みは、 その peer のローカルでは効くが **sync には
+  流れない** (silent 発散を guard で停止 + 初回 warn)。 双方向編集が要る場合は
+  0.10 予定の逆写像実装 ([[request9]]) を待つこと。
+- **制約 (known limitation)**: concurrent DB への Ref 列追加は不可 (`add_column`
+  が Unsupported を返す)。 `add_column` の再実行は名前一致のみで冪等判定し、
+  型違いは検出しない。
+
+### Changed — content store → Leaf 統合 (#81, #79 の根治)
+
+- **`content()` / `content_async` / `get_content` は互換 API として維持**しつつ、
+  実体を「`_c_{key}` Leaf himo の lazy 定義 + tie」に変更。 consumer 16 repo は
+  再コンパイルのみで移行 (key が静的リテラルのみである事は横断調査で確認済み)。
+- 専用 content store 構造 (mod-16 key hash index) を書き込み経路から撤去。
+  監査で content 系に集中していた 7 findings — key hash 衝突・8B index torn
+  read (#79)、 hash15 tombstone sentinel 衝突、 Content reorder buffer 非永続 +
+  eviction ロスト (#78)、 sync `content()` の WAL 漏れ、 delete 時の content
+  残留 — は**構造ごと消滅**。
+- WAL/wire の `Op::Content` は emit 廃止 (decode は残置 = 旧 oplog は読める)。
+  代わりに `Op::TieNamed` (op_type 7 / wire tag 6) を追加: himo full name +
+  kind + vid を運ぶ self-describing tie で、 peer 間で himo_id 空間が揃わない
+  動的定義 himo を同期できる。 受信側は `ensure_himo_named` で lazy 定義。
+- sync の Content reorder buffer (0.8.19) を撤去 — TieNamed は自力で entity
+  写像を作れるため退避が不要になった。
+- 内部: himo registry を `AppendVec` (固定 capacity・lock-free read) 化し、
+  `&self` で himo を動的定義できるようにした (`ensure_himo_dynamic`)。
+
+### Fixed — 監査 findings (#74-#79)
+
+- **#74 (critical)**: `GrowableMap::grow_to` の並行呼び出しで ftruncate が
+  file を**縮小**しえた (mmap 済み領域が SIGBUS / silent data loss)。 grow を
+  Mutex 化し、 fstat で現サイズ未満への ftruncate を禁止。
+- **#75 (critical)**: oplog の同一プロセス並行 append が flock (open file
+  description 単位 = プロセス内は素通し) で直列化されず、 offset 衝突で record
+  を相互破壊しえた。 プロセス内 `append_lock` Mutex を flock の前段に追加。
+- **#77 (durability/並行性)**: `open_readonly` が index rebuild で mmap に
+  書いていたのを真の非破壊に (shadow index へ rebuild)。 recovery は body
+  msync 完了後にのみ checkpoint を前進。 checkpoint head は Commit append 前に
+  snapshot、 cursor は committed 終端まで。 `next_sync_lsn` を open 時に
+  rehydrate。 EntitySet bitmap を AtomicU8 化 (free の二重投入防止)。 consumer
+  thread panic を poisoned 状態として伝搬 (無限 spin 廃止)。 vocab 4 GiB 超の
+  create を reject。 flush 後最初の write で clean flag を確実に落とす。
+- **#78 (sync)**: 署名/ACL reject された record を pull cursor が飛び越えて
+  永久 gap になる問題 — cursor を `min_rejected_hlc` で clamp し次回再検証。
+  HTTP bootstrap に `.eidmap` / `.tables` sidecar を同梱 (`GET
+  /bootstrap/{eidmap,tables}`、 旧 server は 404 → fallback)。 Delete 適用
+  条件の doc を実装に合わせ訂正。
+- **#76 (sync)**: レプリカ側で翻訳済み entity に書いた op が author peer の
+  op として bridge され silent 発散する経路を guard (local-only 化 +
+  warn-once)。 逆写像による本対応は 0.10 候補。
+- **#79 / #59 (API 契約・破損耐性)**: create 系の clobber (上記 migration 参照)。
+  oplog open 時の header 検証 + truncate された末尾の安全 recover。 未知
+  op_type の警告を rate-limit。 engine header の sanity check (CRC=0 経路の
+  bounds)。 ngram `MappedIndex` の全 bounds 検証 (panic → `io::Error`)。 blob
+  put の fsync + 既存 blob の内容検証。 query_lang `~ <eid>` の存在チェック。
+- **#73 (schema)**: 既存 table への列追加 — `add_column` API と、 既存 table を
+  含む superset での `define_table` 再宣言が末尾列を自動 migration する経路を
+  追加。 名前衝突で型が異なる再宣言は `SchemaConflict` で loud に失敗。
+  concurrent (oplog) DB でも列追加可 (Ref 列を除く、 上記制約参照)。
+- **`oplog_sync` の同期契約 2 件** (0.9.0 release 検証中に sync テストの稀な
+  取りこぼしとして発見・根治):
+  - `flush_writes` が op queue の apply しか待たず、 WAL record queue (op 先行・
+    record 後追い #77-H4) に record が残ったまま返る窓があった。 直後の
+    `oplog_sync` が record の入っていない WAL に Commit + fsync + checkpoint し、
+    「fsync 済みのはずの write」が crash で消える / sync 転送から 1 tick 消える。
+    WAL record queue にも push/append counter 対を追加し両 barrier を待つ。
+  - `oplog_sync` (caller thread) は checkpoint を進めるが `_sync_ops` への
+    transfer をしないため、 consumer tick の ring reset (head == checkpoint で
+    発火) が bridge 未了の committed record を wipe しえた — その record は
+    **sync から永久に消える**。 `oplog_sync` 内と consumer の `try_reset` 直前の
+    両方で transfer を走らせ、 「bridge が追いつくまで ring を畳まない」を
+    構造的に保証。 回帰テスト:
+    `oplog_sync_bridges_all_records_pushed_before_it`。
+- SQL: `OFFSET` を実装。 `DISTINCT` / `GROUP BY` / `HAVING` は silent に
+  無視せず `Unsupported` を明示 return。
+- RAG: reopen 時に BM25 index を再構築 (今までは空のまま検索 0 件)。
+- ACL: 未配線なのに permission 制御があるかのように読めた docs を実挙動
+  (in-memory・非永続・未 enforce) に訂正。 実装は需要が出たら別 request。
+
 ## 0.8.21 — 2026-07-03
 
 同一プロセス writer 二重 open の無期限 flock ハングを fast-fail に変える bugfix (#80)。
