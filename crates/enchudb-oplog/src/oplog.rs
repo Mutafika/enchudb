@@ -369,6 +369,12 @@ pub struct OpLog {
     peer_id: std::sync::atomic::AtomicU32,
     /// v32 Phase C: ed25519 鍵ペア。set_keypair で設定。None なら署名は zeros。
     keypair: std::sync::RwLock<Option<std::sync::Arc<crate::keys::Keypair>>>,
+    /// #75: 同一プロセス内 append の直列化。 flock は open file description
+    /// 単位のため、 同じ File を共有するスレッド間では排他にならない (2 本目の
+    /// LOCK_EX が「既保持の変換」として即成功する)。 head 採番 (read-modify-
+    /// write) と `next_hlc` はこの lock の下でのみ安全。 cross-process 排他は
+    /// 従来通り flock が担う。
+    append_lock: std::sync::Mutex<()>,
     /// v30: append 中の writer 数。try_reset はこれが 0 のときだけ実行できる。
     pending_writes: std::sync::atomic::AtomicU32,
     /// v32: auto reset を許可するか。default false。
@@ -473,6 +479,7 @@ impl OpLog {
             hlc_last_wall: AtomicU64::new(0),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
+            append_lock: std::sync::Mutex::new(()),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
         })
@@ -511,6 +518,7 @@ impl OpLog {
             hlc_last_wall: AtomicU64::new(0),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
+            append_lock: std::sync::Mutex::new(()),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
         })
@@ -599,6 +607,8 @@ impl OpLog {
         sizes: &[usize],
         total: usize,
     ) -> io::Result<Vec<u64>> {
+        // #75: 同一プロセス内の直列化 (flock は同一 fd 共有スレッド間で no-op)
+        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
         #[cfg(not(target_arch = "wasm32"))]
         let _lock = self.flock_exclusive()?;
 
@@ -737,17 +747,16 @@ impl OpLog {
             }
         });
 
-        // multi-process safety: flock(LOCK_EX) で同じ .wal に対する append を直列化。
-        // 単一 process 内では既に `head` の CAS で並列 OK だが、 別 process の OpLog は
-        // 別の process-local AtomicU64 を持つので同 offset に書き込む race がある。
-        // git の .git/index.lock 相当。 read 側は lock を取らない。
+        // #75: 同一プロセス内は append_lock、 プロセス間は flock で直列化。
+        // flock は open file description 単位なので、 同じ File を共有する
+        // スレッド間では排他にならない — append_lock が必須。
+        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
         #[cfg(not(target_arch = "wasm32"))]
         let _lock = self.flock_exclusive()?;
 
         // ── head を mmap 上の値から読み直して採番 ──
         // 別 process が直前に append した場合、 self.head (process-local atomic) は
-        // 古い値を持ってるので、 lock 中に mmap 上の永続値を真実とする。 単一 process
-        // のときは既存 CAS と同じく無コスト。
+        // 古い値を持ってるので、 lock 中に mmap 上の永続値を真実とする。
         let offset = {
             #[cfg(not(target_arch = "wasm32"))]
             {
@@ -758,7 +767,7 @@ impl OpLog {
                 if new > self.capacity {
                     return Err(self.wal_full_err());
                 }
-                // lock を保持しているので CAS ではなく単純 store で OK
+                // append_lock + flock の両方を保持しているので単純 store で OK
                 self.head.store(new, Ordering::Release);
                 cur
             }
@@ -1067,6 +1076,7 @@ impl OpLog {
             hlc_last_wall: AtomicU64::new(0),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
+            append_lock: std::sync::Mutex::new(()),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
         }
@@ -1403,6 +1413,57 @@ mod tests {
         }
         for h in handles { h.join().unwrap(); }
         assert_eq!(wal.next_lsn(), 4001);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// #75 regression: 同一プロセス並行 append で offset 衝突 / HLC 重複が
+    /// 起きないこと。旧実装は flock (同一 fd 間で no-op) + 非 CAS の head 採番
+    /// だったため、2 スレッドが同じ offset に書いて record を破壊し得た。
+    /// 既存の `concurrent_append` は next_lsn しか見ないので検出できなかった。
+    #[test]
+    fn concurrent_append_no_offset_collision_or_dup_hlc() {
+        use std::sync::Arc;
+        use std::thread;
+        let p = tmp("concurrent_offset");
+        let wal = Arc::new(OpLog::create(&p, 32 * 1024 * 1024).unwrap());
+        const THREADS: u64 = 8;
+        const PER: u64 = 500;
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let w = wal.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..PER {
+                    w.append(Op::Tie {
+                        eid: t * 10_000 + i,
+                        himo_id: 0,
+                        value: i as u32,
+                    }).unwrap();
+                }
+            }));
+        }
+        for h in handles { h.join().unwrap(); }
+        wal.append(Op::Commit).unwrap();
+
+        // 全 record が破壊されずに読めて、eid が完全に揃っていること
+        let records = wal.iter_committed();
+        assert_eq!(records.len(), (THREADS * PER) as usize,
+                   "offset 衝突で record が破壊された");
+        let mut eids: Vec<u64> = records.iter().map(|r| match &r.op {
+            DecodedOp::Tie { eid, .. } => *eid,
+            other => panic!("unexpected op: {other:?}"),
+        }).collect();
+        eids.sort_unstable();
+        eids.dedup();
+        assert_eq!(eids.len(), (THREADS * PER) as usize, "eid が欠落 / 重複");
+
+        // HLC が全 record で一意であること (旧 next_hlc は重複を発行し得た)
+        let mut hlcs: Vec<(u64, u32)> = records.iter()
+            .map(|r| (r.hlc.wall, r.hlc.logical)).collect();
+        hlcs.sort_unstable();
+        let before = hlcs.len();
+        hlcs.dedup();
+        assert_eq!(hlcs.len(), before, "HLC が重複発行された");
+
         let _ = std::fs::remove_file(&p);
     }
 
