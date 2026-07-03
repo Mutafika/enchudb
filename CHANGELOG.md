@@ -3,6 +3,29 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.8.21 — 2026-07-03
+
+同一プロセス writer 二重 open の無期限 flock ハングを fast-fail に変える bugfix (#80)。
+file format / wire format 不変。 挙動変更は「ハングしていたケースがエラーを返す」のみで、
+正常動作していたコードには影響しないため **patch** として release。
+
+### Fixed
+
+- **同一プロセスで writer を二重 open すると flock(LOCK_EX) で無期限ブロックする**
+  ([#80](https://github.com/Mutafika/enchudb/issues/80)): flock は open file
+  description 単位のロックのため、 同一プロセスからの 2 回目の writer open は
+  block 検知できず、 fast-fail もタイムアウトも無い診断不能なハングになっていた。
+  プロセス内 registry (canonicalize した lock path の set) を flock の前段に追加し、
+  重複 open は `ErrorKind::WouldBlock` +
+  `"... is already open for writing in this process"` で**即エラー**を返す。
+  - **別プロセス** writer との排他は従来通り blocking flock (sqlite 互換、 不変)。
+  - readonly open は writer lock を取らないので従来通り併存可。
+  - migration: 同一プロセス二重 open の旧挙動は実質デッドロックなので、 依存して
+    いた正常コードは無いはず。 pool / cache 層で並行 cold-open が起き得る consumer
+    は `WouldBlock` を catch して既存ハンドルの reuse (single-flight) に繋ぐこと。
+  - 「既存の共有ハンドルを返す」 (プロセス内 open-file レジストリの完全形) は
+    第 2 段として別途検討。
+
 ## 0.8.20 — 2026-06-26
 
 `enchudb-text` を `enchudb-ngram`(primitive) + `enchudb-textsearch`(policy) に分離する
