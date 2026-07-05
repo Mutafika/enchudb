@@ -3,12 +3,17 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
-## Unreleased (0.10.0 予定)
+## Unreleased (次期 minor — breaking)
+
+version 番号は release 時に確定。 0.10 は逆写像実装 ([[request9]]) に予約済み
+(0.9.0 の migration ガイドで言及) のため、 本 rename はそれ以降の minor
+(0.11 以降) に載る。
 
 ### Changed — `TenantView` → `Scope` rename (#24)
 
 `enchudb-schema` の tenant view API を rename。 **schema crate の public API
-breaking、 file format / wire format / engine API は完全不変**。
+breaking (= minor bump 必須)、 file format / wire format / engine API は完全
+不変 — データ migration は不要**で、 下記のソースコード置換のみ。
 
 「Tenant」 という use-case 名が 「engine 内に tenant 概念がある」 という誤読を
 実際に引き起こしたため (#24 起票の経緯)、 機構そのものの名前に変更: 実体は
