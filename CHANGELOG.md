@@ -3,10 +3,31 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
-## Unreleased (0.10.0 予定)
+## 0.10.0 — 2026-07-06
 
-現行 0.9.0 の次 minor。 逆写像実装 ([[request9]]、 0.9.0 の migration ガイドで
-0.10 予定と言及) と同 release に同梱見込み。
+命名の一括整理 release。 breaking rename 2 本 (`TenantView → Scope` /
+`HimoType → ValueType`) を同梱。 **file format / wire format は完全不変 —
+データ migration・peer 同時アップグレードとも不要**、 ソースコードの機械的
+置換のみで移行できる。
+
+note: 0.9.0 の migration ガイドで 「0.10 予定」 と言及していた逆写像実装
+([[request9]]) は本 release には**入っていない** — 0.11 以降にスライド
+(replica write-back の local-only 制約は 0.9.0 記載のまま)。
+
+### Changed — `HimoType` → `ValueType` rename
+
+engine の `HimoType` は 「himo の型」 に見えて実は 「value (= カード裏面) の
+格納方式」 を選ぶ enum だった (名前と実態の乖離、 glossary §12.10)。 全 crate で
+rename、 **variant (`Number` / `Tag` / `Leaf` / `Ref`) は不変**。
+
+| 旧 | 新 |
+|---|---|
+| `HimoType` | `ValueType` |
+| `Engine::himo_type(himo)` | `Engine::value_type(himo)` |
+| `Engine::himo_type_at(idx)` | `Engine::value_type_at(idx)` |
+
+schema 層の `ColumnType` は名前・variant とも不変 (column は schema 層の
+正規語彙のため)。
 
 ### Changed — `TenantView` → `Scope` rename (#24)
 
