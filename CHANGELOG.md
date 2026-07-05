@@ -3,6 +3,36 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## Unreleased (0.10.0 予定)
+
+### Changed — `TenantView` → `Scope` rename (#24)
+
+`enchudb-schema` の tenant view API を rename。 **schema crate の public API
+breaking、 file format / wire format / engine API は完全不変**。
+
+「Tenant」 という use-case 名が 「engine 内に tenant 概念がある」 という誤読を
+実際に引き起こしたため (#24 起票の経緯)、 機構そのものの名前に変更: 実体は
+**table 名前空間の prefix レンズ**であり、 multi-tenant はそのユースケースの
+1 つにすぎない。 旧 `as_view` の 「view」 も SQL VIEW (仮想 row 集合) と紛らわしい
+ため同時に廃止 (「view」 という語は将来の仮想 row 集合系機能のために温存)。
+
+#### Migration ガイド
+
+機械的置換で完了する (挙動変更なし):
+
+| 旧 | 新 |
+|---|---|
+| `TenantView<'a>` | `Scope<'a>` |
+| `TenantViewMut<'a>` | `ScopeMut<'a>` |
+| `db.tenant(name)` | `db.scope(name)` |
+| `db.tenant_mut(name)` | `db.scope_mut(name)` |
+| `db.as_view()` | `db.as_scope()` |
+| `db.as_view_mut()` | `db.as_scope_mut()` |
+
+`Scope::prefix()` / `get_table` / `list_tables` の意味論・prefix 規約
+(`{name}.`)・overhead は不変。 example は `tenant_view_demo` → `scope_demo` に
+rename。
+
 ## 0.9.0 — 2026-07-03
 
 content store を Leaf himo に統合する構造改定 (#81) + 2026-07-03 全体監査

@@ -727,33 +727,34 @@ impl Database {
         }).collect()
     }
 
-    // ───── TenantView ─────
+    // ───── Scope ─────
     //
-    // physical layout (table cluster vs DB ファイル) を隠して、 deployment が
-    // centralized (pattern A) でも distributed (pattern B / C) でも同一 app code
-    // で「ある tenant の view」 を扱えるようにする抽象。 詳細は issue #12。
+    // table 名前空間の prefix レンズ。 physical layout (table cluster vs DB ファイル)
+    // を隠して、 deployment が centralized (pattern A) でも distributed
+    // (pattern B / C) でも同一 app code で書けるようにする抽象。 multi-tenant は
+    // この機構のユースケースの 1 つ (詳細は issue #12、 rename 経緯は issue #24)。
 
-    /// tenant scope の read view を取り出す。 prefix は `{name}.` (例: `alice`)。
-    /// view 内で `get_table("users")` は実 table `alice.users` に解決される。
-    pub fn tenant<'a>(&'a self, name: &str) -> TenantView<'a> {
-        TenantView { db: self, prefix: Some(name.to_string()) }
+    /// 名前付き scope の read レンズを取り出す。 prefix は `{name}.` (例: `alice`)。
+    /// scope 内で `get_table("users")` は実 table `alice.users` に解決される。
+    pub fn scope<'a>(&'a self, name: &str) -> Scope<'a> {
+        Scope { db: self, prefix: Some(name.to_string()) }
     }
 
-    /// tenant scope の build view を取り出す。 `table(...)` で建てる table は
+    /// 名前付き scope の build レンズを取り出す。 `table(...)` で建てる table は
     /// 自動で `{name}.` prefix が付与される。
-    pub fn tenant_mut<'a>(&'a mut self, name: &str) -> TenantViewMut<'a> {
-        TenantViewMut { db: self, prefix: Some(name.to_string()) }
+    pub fn scope_mut<'a>(&'a mut self, name: &str) -> ScopeMut<'a> {
+        ScopeMut { db: self, prefix: Some(name.to_string()) }
     }
 
-    /// root read view (= prefix 無し)。 pattern B の `Database::open` 直後に
-    /// view 化したい時に使う、 全 table が見える。
-    pub fn as_view<'a>(&'a self) -> TenantView<'a> {
-        TenantView { db: self, prefix: None }
+    /// 絞りなしで全体を同じレンズ型に (= prefix 無し)。 pattern B の
+    /// `Database::open` 直後に scope 型で扱いたい時に使う、 全 table が見える。
+    pub fn as_scope<'a>(&'a self) -> Scope<'a> {
+        Scope { db: self, prefix: None }
     }
 
-    /// root build view。 prefix 無しで table を建てる、 pattern B の builder。
-    pub fn as_view_mut<'a>(&'a mut self) -> TenantViewMut<'a> {
-        TenantViewMut { db: self, prefix: None }
+    /// 絞りなしの build レンズ。 prefix 無しで table を建てる、 pattern B の builder。
+    pub fn as_scope_mut<'a>(&'a mut self) -> ScopeMut<'a> {
+        ScopeMut { db: self, prefix: None }
     }
 
     fn find_table_inner(&self, name: &str) -> Option<Arc<TableInner>> {
@@ -1073,20 +1074,21 @@ fn rename_corrupt_schema_sidecar(db_path: &str, err: &std::io::Error) {
     }
 }
 
-// ─────────────────────────── TenantView / TenantViewMut ───────────────────────────
+// ─────────────────────────── Scope / ScopeMut ───────────────────────────
 
-/// 読み取り専用の tenant view。 `Database::tenant(name)` で取り出す、
-/// あるいは pattern B (per-DB-file 単一 tenant) 用に `Database::as_view()` で
-/// prefix 無しの root view を取り出す。 内部表現は薄い ref + prefix のみ、
-/// storage layout は変えない。 詳細は issue #12。
-pub struct TenantView<'a> {
+/// 読み取り専用の scope (= table 名前空間の prefix レンズ)。
+/// `Database::scope(name)` で取り出す、 あるいは pattern B (per-DB-file) 用に
+/// `Database::as_scope()` で絞りなしのレンズを取り出す。 内部表現は薄い
+/// ref + prefix のみ、 storage layout は変えない。 multi-tenant はこの機構の
+/// ユースケースの 1 つ (詳細は issue #12、 rename 経緯は issue #24)。
+pub struct Scope<'a> {
     db: &'a Database,
     prefix: Option<String>,
 }
 
-/// build phase 用 tenant view。 `table(...)` で建てる table 名に prefix が
-/// 自動付与される。 root build view は `Database::as_view_mut()` から。
-pub struct TenantViewMut<'a> {
+/// build phase 用 scope。 `table(...)` で建てる table 名に prefix が
+/// 自動付与される。 絞りなしの build レンズは `Database::as_scope_mut()` から。
+pub struct ScopeMut<'a> {
     db: &'a mut Database,
     prefix: Option<String>,
 }
@@ -1114,8 +1116,8 @@ fn filter_tables_by_prefix(all: Vec<TableInfo>, prefix: Option<&str>) -> Vec<Tab
     }
 }
 
-impl<'a> TenantView<'a> {
-    /// この view の prefix (= tenant 名)。 root view なら None。
+impl<'a> Scope<'a> {
+    /// この scope の prefix。 絞りなし (`as_scope`) なら None。
     pub fn prefix(&self) -> Option<&str> {
         self.prefix.as_deref()
     }
@@ -1125,21 +1127,21 @@ impl<'a> TenantView<'a> {
         self.db.get_table(&resolve_prefixed(self.prefix.as_deref(), name))
     }
 
-    /// この view から見える table の一覧。 tenant scope なら `{prefix}.` で始まる
-    /// table のみ、 prefix は剥がして「view 内の short name」 で返す。 root view は
-    /// 全 table をそのまま返す。
+    /// この scope から見える table の一覧。 名前付き scope なら `{prefix}.` で
+    /// 始まる table のみ、 prefix は剥がして「scope 内の short name」 で返す。
+    /// 絞りなし scope は全 table をそのまま返す。
     pub fn list_tables(&self) -> Vec<TableInfo> {
         filter_tables_by_prefix(self.db.list_tables(), self.prefix.as_deref())
     }
 }
 
-impl<'a> TenantViewMut<'a> {
-    /// この view の prefix。
+impl<'a> ScopeMut<'a> {
+    /// この scope の prefix。
     pub fn prefix(&self) -> Option<&str> {
         self.prefix.as_deref()
     }
 
-    /// 新規 table を定義。 prefix が自動付与される (root view なら付与なし)。
+    /// 新規 table を定義。 prefix が自動付与される (絞りなし scope なら付与なし)。
     pub fn table<'b>(&'b mut self, name: &str) -> TableBuilder<'b> {
         let full = resolve_prefixed(self.prefix.as_deref(), name);
         self.db.table(&full)
@@ -1150,7 +1152,7 @@ impl<'a> TenantViewMut<'a> {
         self.db.get_table(&resolve_prefixed(self.prefix.as_deref(), name))
     }
 
-    /// この view scope の table 一覧。
+    /// この scope の table 一覧。
     pub fn list_tables(&self) -> Vec<TableInfo> {
         filter_tables_by_prefix(self.db.list_tables(), self.prefix.as_deref())
     }
