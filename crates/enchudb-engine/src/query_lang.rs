@@ -28,7 +28,7 @@
 //! Symbol 紐(tie_text)で group / distinct すると、結果の key は自動で text 表示される。
 
 use crate::engine::Engine;
-use crate::HimoType;
+use crate::ValueType;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum GroupKey {
@@ -285,8 +285,8 @@ fn apply_simple(eng: &Engine, eids: &[enchudb_oplog::EntityId], op: &str, arg: O
         "distinct" => match arg {
             Some(h) => {
                 let vals = eng.distinct(h, eids);
-                let ht = eng.himo_type(h);
-                let is_text = ht == Some(HimoType::Tag) || ht == Some(HimoType::Leaf);
+                let ht = eng.value_type(h);
+                let is_text = ht == Some(ValueType::Tag) || ht == Some(ValueType::Leaf);
                 let keys = vals.into_iter().map(|v| make_key(eng, v, is_text)).collect();
                 QueryResult::Distinct(keys)
             }
@@ -304,8 +304,8 @@ fn apply_group(
     agg_op: &str,
     agg_arg: Option<&str>,
 ) -> QueryResult {
-    let ht = eng.himo_type(group_himo);
-    let is_text = ht == Some(HimoType::Tag) || ht == Some(HimoType::Leaf);
+    let ht = eng.value_type(group_himo);
+    let is_text = ht == Some(ValueType::Tag) || ht == Some(ValueType::Leaf);
     let to_key = |v: u32| make_key(eng, v, is_text);
 
     match agg_op {

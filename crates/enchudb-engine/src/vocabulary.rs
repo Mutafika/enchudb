@@ -203,7 +203,7 @@ impl Vocabulary {
     }
 
     /// 重複検査なしで常に新規 id を発行して append する。
-    /// `HimoType::Leaf` (終端タグ・dedupe なし) の書き込み path で使う。
+    /// `ValueType::Leaf` (終端タグ・dedupe なし) の書き込み path で使う。
     /// 既に同じ bytes が登録済みでも気にせず新 id を払い出す。index_insert は走るが、
     /// 既存スロットがあれば early-return するため index 領域は dedup される副作用がある
     /// (data/offsets のみ完全に増分)。

@@ -7,7 +7,7 @@
 
 use enchudb_engine::engine::Engine;
 use enchudb_engine::transport::InMemoryTransport;
-use enchudb_engine::HimoType;
+use enchudb_engine::ValueType;
 use enchudb_oplog::Hlc;
 use enchudb_sync::Syncer;
 use std::sync::Arc;
@@ -40,7 +40,7 @@ fn publish_since_uses_sync_ops_when_enabled() {
 
     let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
     eng.define_table("notes", 1000).unwrap();
-    eng.define_himo_in("notes", "note", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
     eng.enable_sync_tables().unwrap();
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(1);
@@ -69,7 +69,7 @@ fn publish_since_filters_by_hlc_through_sync_ops() {
 
     let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
     eng.define_table("notes", 1000).unwrap();
-    eng.define_himo_in("notes", "note", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
     eng.enable_sync_tables().unwrap();
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(1);
@@ -128,7 +128,7 @@ fn records_after_ring_reset_are_still_synced() {
 
     let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
     eng.define_table("notes", 1000).unwrap();
-    eng.define_himo_in("notes", "note", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
     eng.enable_sync_tables().unwrap();
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(1);

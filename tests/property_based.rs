@@ -7,7 +7,7 @@
 
 #![cfg(feature = "v27")]
 
-use enchudb::{Engine, HimoType};
+use enchudb::{Engine, ValueType};
 use proptest::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,9 +28,9 @@ fn fresh_db_path(tag: &str) -> String {
 
 fn make_db(path: &str) -> Engine {
     let mut db = Engine::create_standalone(path).unwrap();
-    db.define_himo("a", HimoType::Number, 10);
-    db.define_himo("b", HimoType::Number, 10);
-    db.define_himo("c", HimoType::Number, 10);
+    db.define_himo("a", ValueType::Number, 10);
+    db.define_himo("b", ValueType::Number, 10);
+    db.define_himo("c", ValueType::Number, 10);
     // 100 個 entity を確保。eid 0..100 が allocate される。
     for _ in 0..100 {
         let _ = db.entity();

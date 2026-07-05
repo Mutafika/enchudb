@@ -4,7 +4,7 @@
 
 #![cfg(feature = "v27")]
 
-use enchudb::{Engine, HimoType};
+use enchudb::{Engine, ValueType};
 
 // ════════════════ ヘルパー ════════════════
 
@@ -58,22 +58,22 @@ struct EcData {
 }
 
 fn define_schema(db: &mut Engine) {
-    db.define_himo("type", HimoType::Number, 8);
-    db.define_himo("category", HimoType::Number, 20);
-    db.define_himo("price_band", HimoType::Number, 10);
-    db.define_himo("color", HimoType::Number, 12);
-    db.define_himo("brand", HimoType::Number, 50);
-    db.define_himo("region", HimoType::Number, 10);
-    db.define_himo("membership", HimoType::Number, 4);
-    db.define_himo("year", HimoType::Number, 5);
-    db.define_himo("month", HimoType::Number, 13);
-    db.define_himo("order_status", HimoType::Number, 5);
-    db.define_himo("rating", HimoType::Number, 6);
-    db.define_himo("quantity", HimoType::Number, 100);
+    db.define_himo("type", ValueType::Number, 8);
+    db.define_himo("category", ValueType::Number, 20);
+    db.define_himo("price_band", ValueType::Number, 10);
+    db.define_himo("color", ValueType::Number, 12);
+    db.define_himo("brand", ValueType::Number, 50);
+    db.define_himo("region", ValueType::Number, 10);
+    db.define_himo("membership", ValueType::Number, 4);
+    db.define_himo("year", ValueType::Number, 5);
+    db.define_himo("month", ValueType::Number, 13);
+    db.define_himo("order_status", ValueType::Number, 5);
+    db.define_himo("rating", ValueType::Number, 6);
+    db.define_himo("quantity", ValueType::Number, 100);
     // 参照紐 (max_values=0)
-    db.define_himo("user_ref", HimoType::Ref, 0);
-    db.define_himo("order_ref", HimoType::Ref, 0);
-    db.define_himo("product_ref", HimoType::Ref, 0);
+    db.define_himo("user_ref", ValueType::Ref, 0);
+    db.define_himo("order_ref", ValueType::Ref, 0);
+    db.define_himo("product_ref", ValueType::Ref, 0);
 }
 
 fn define_views(_db: &mut Engine) {

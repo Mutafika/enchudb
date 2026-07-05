@@ -61,7 +61,7 @@
 //! 時に自動で復元、 himo_id も再 resolve される。 `Drop` で flush が呼ばれるので
 //! 手動 flush は不要 (明示的に呼びたい場合は `db.engine_mut().flush()`)。
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 use enchudb_oplog::EntityId;
 use std::sync::Arc;
 
@@ -79,10 +79,10 @@ const LEGACY_SCHEMA_BLOB_HIMO: &str = "__enchu_schema_blob";
 
 /// 列の型。
 ///
-/// - `Number` — inline 数値 (HimoType::Number)
-/// - `Tag` — 共有タグ、vocab 経由 (HimoType::Tag)。enum / カテゴリ / 名前など引かれる値向き
-/// - `Leaf` — 終端タグ、FreeStore 経由 (HimoType::Leaf)。備考 / 本文など引かれない自由記述向き
-/// - `Ref` — 他テーブル entity への参照 (HimoType::Ref)
+/// - `Number` — inline 数値 (ValueType::Number)
+/// - `Tag` — 共有タグ、vocab 経由 (ValueType::Tag)。enum / カテゴリ / 名前など引かれる値向き
+/// - `Leaf` — 終端タグ、FreeStore 経由 (ValueType::Leaf)。備考 / 本文など引かれない自由記述向き
+/// - `Ref` — 他テーブル entity への参照 (ValueType::Ref)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnType {
     Number,
@@ -92,12 +92,12 @@ pub enum ColumnType {
 }
 
 impl ColumnType {
-    fn himo_type(self) -> HimoType {
+    fn value_type(self) -> ValueType {
         match self {
-            ColumnType::Number => HimoType::Number,
-            ColumnType::Tag => HimoType::Tag,
-            ColumnType::Leaf => HimoType::Leaf,
-            ColumnType::Ref => HimoType::Ref,
+            ColumnType::Number => ValueType::Number,
+            ColumnType::Tag => ValueType::Tag,
+            ColumnType::Leaf => ValueType::Leaf,
+            ColumnType::Ref => ValueType::Ref,
         }
     }
     fn tag(self) -> &'static str {
@@ -327,8 +327,8 @@ impl Database {
     ///
     /// 0.8.7: schema sidecar (`{path}.schema`) があれば PK / column type 含む
     /// 完全な schema を復元。 sidecar が無い engine 直 DB (= mlbpulse のような
-    /// `Engine::define_table` 構築) でも、 engine の `.tables` sidecar + himo_types
-    /// から fallback 復元 (= PK は不明扱い、 column type は himo_type から推定)。
+    /// `Engine::define_table` 構築) でも、 engine の `.tables` sidecar + value_types
+    /// から fallback 復元 (= PK は不明扱い、 column type は value_type から推定)。
     pub fn open_readonly(path: &str) -> Result<Self, SchemaError> {
         let eng = Engine::open_readonly(path).map_err(|e| SchemaError::Io(e.to_string()))?;
         let mut db = Self {
@@ -565,7 +565,7 @@ impl Database {
                 hid as u16
             }
             None => self.eng
-                .ensure_himo_dynamic_in(&table_inner.name, col_name, ty.himo_type(), cardinality)
+                .ensure_himo_dynamic_in(&table_inner.name, col_name, ty.value_type(), cardinality)
                 .map_err(|e| SchemaError::Internal(format!(
                     "ensure_himo_dynamic_in({}.{col_name}) failed: {e}", table_inner.name
                 )))?,
@@ -810,7 +810,7 @@ impl Database {
         if parsed_opt.is_none() {
             parsed_opt = self.load_schema_from_legacy_blob()?;
         }
-        // 3. fallback: engine `.tables` + himo_types (= mlbpulse 等の engine 直 DB)
+        // 3. fallback: engine `.tables` + value_types (= mlbpulse 等の engine 直 DB)
         if parsed_opt.is_none() {
             parsed_opt = self.synthesize_schema_from_engine()?;
         }
@@ -850,7 +850,7 @@ impl Database {
                 // relation あり col は後段で fk_refs を再 register。
                 if !is_readonly {
                     if let Some(eng_mut) = Arc::get_mut(&mut self.eng) {
-                        let _ = eng_mut.define_himo_in(&raw.name, col_name, ty.himo_type(), 0);
+                        let _ = eng_mut.define_himo_in(&raw.name, col_name, ty.value_type(), 0);
                     }
                 }
                 let hid = self.eng.himo_id(&himo_name)
@@ -918,12 +918,12 @@ impl Database {
         Ok(Some(parsed))
     }
 
-    /// 0.8.7: engine `.tables` sidecar + himo_types から synthetic な RawTableDef を
+    /// 0.8.7: engine `.tables` sidecar + value_types から synthetic な RawTableDef を
     /// 組み立てる fallback。 schema sidecar も legacy blob も無い engine 直構築 DB
     /// (= mlbpulse の 4.5M pitch DB 等) を query 可能にするための path。
     ///
     /// 復元できる情報: table 名、 column 名 (= himo full name の `.` 後)、 column type
-    /// (= engine の himo_type)、 relations (= engine の fk_refs)。
+    /// (= engine の value_type)、 relations (= engine の fk_refs)。
     /// 復元できない: PK (= sidecar に持たないので None 扱い)。 upsert したい場合は
     /// 0.9 で sidecar 拡張 or schema rebuild が要る。
     fn synthesize_schema_from_engine(&self) -> Result<Option<Vec<RawTableDef>>, SchemaError> {
@@ -940,12 +940,12 @@ impl Database {
             for hid_idx in 0..himo_count {
                 let Some(himo_name) = self.eng.himo_name_at(hid_idx) else { continue; };
                 let Some(col_name) = himo_name.strip_prefix(&prefix) else { continue; };
-                let Some(htype) = self.eng.himo_type_at(hid_idx) else { continue; };
+                let Some(htype) = self.eng.value_type_at(hid_idx) else { continue; };
                 let ty = match htype {
-                    HimoType::Number => ColumnType::Number,
-                    HimoType::Tag => ColumnType::Tag,
-                    HimoType::Leaf => ColumnType::Leaf,
-                    HimoType::Ref => ColumnType::Ref,
+                    ValueType::Number => ColumnType::Number,
+                    ValueType::Tag => ColumnType::Tag,
+                    ValueType::Leaf => ColumnType::Leaf,
+                    ValueType::Ref => ColumnType::Ref,
                 };
                 cols.push((col_name.to_string(), ty));
             }
@@ -1189,12 +1189,12 @@ impl<'a> TableBuilder<'a> {
         self.cols.push((name.into(), ty, 0));
         self
     }
-    /// inline 数値列 (HimoType::Number)。
+    /// inline 数値列 (ValueType::Number)。
     pub fn number(self, name: &str) -> Self { self.column(name, ColumnType::Number) }
-    /// 共有タグ列 (HimoType::Tag、vocab 経由 / dedupe あり)。
+    /// 共有タグ列 (ValueType::Tag、vocab 経由 / dedupe あり)。
     /// enum / カテゴリ / 名前など、引かれる値に向く。
     pub fn tag(self, name: &str) -> Self { self.column(name, ColumnType::Tag) }
-    /// 終端タグ列 (HimoType::Leaf、FreeStore 経由 / dedupe なし)。
+    /// 終端タグ列 (ValueType::Leaf、FreeStore 経由 / dedupe なし)。
     /// 備考・メモ・本文など、引かれない自由記述に向く。
     pub fn leaf(self, name: &str) -> Self { self.column(name, ColumnType::Leaf) }
 
@@ -1330,7 +1330,7 @@ impl<'a> TableBuilder<'a> {
                     }
                 }
                 None => {
-                    let r = eng_mut.define_himo_in(&name, col_name, ty.himo_type(), *card);
+                    let r = eng_mut.define_himo_in(&name, col_name, ty.value_type(), *card);
                     match r {
                         Ok(_) => {}
                         Err(e) if already_in_engine && e.contains("already") => {}
@@ -1990,7 +1990,7 @@ fn tie_value(eng: &Engine, eid: EntityId, cd: &ColumnInner, v: &Value) -> Result
             Ok(())
         }
         (ColumnType::Tag, Value::Text(s)) | (ColumnType::Leaf, Value::Text(s)) => {
-            // engine の tie_text_to_by_id は himo の HimoType (Tag / Leaf) を見て
+            // engine の tie_text_to_by_id は himo の ValueType (Tag / Leaf) を見て
             // vocab.get_or_insert (dedupe) vs vocab.insert (新規 id) を dispatch する。
             eng.tie_text_to_by_id(eid, cd.himo_id, s);
             Ok(())

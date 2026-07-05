@@ -119,7 +119,7 @@ fn main() {
     {
         let mut eng = eng;
         for i in 0..50 {
-            eng.define_himo(&format!("h{}", i), enchudb::HimoType::Number, 100);
+            eng.define_himo(&format!("h{}", i), enchudb::ValueType::Number, 100);
         }
         snap("after define_himo × 50", t0);
 

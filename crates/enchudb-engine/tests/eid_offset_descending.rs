@@ -12,7 +12,7 @@
 //!   - 経過時間が現実的 (= prepend が爆発的でない)
 //! ことを確認する。
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 use std::time::Instant;
 
 const N: u32 = 100_000;
@@ -38,7 +38,7 @@ fn descending_eid_tie_does_not_explode() {
     cleanup(&path);
 
     let mut eng = Engine::create_growable_with_capacity(&path, N + 100).unwrap();
-    eng.define_himo("v", HimoType::Number, 10);
+    eng.define_himo("v", ValueType::Number, 10);
 
     // entity slot を昇順に確保 (= eid 0..N が allocate される)
     let mut eids = Vec::with_capacity(N as usize);
@@ -91,7 +91,7 @@ fn mixed_high_then_low_eid_tie() {
     cleanup(&path);
 
     let mut eng = Engine::create_growable_with_capacity(&path, N + 100).unwrap();
-    eng.define_himo("v", HimoType::Number, 10);
+    eng.define_himo("v", ValueType::Number, 10);
 
     let mut eids = Vec::with_capacity(N as usize);
     for _ in 0..N {

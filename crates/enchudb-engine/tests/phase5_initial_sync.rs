@@ -4,7 +4,7 @@
 //! receiver 側で `current_sync_lsn` を取って `ack_sync` で watermark 進める
 //! 流れを engine API レベルで成立させる。 transport wire は別 phase で拡張。
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 
 fn tmp_path(tag: &str) -> String {
     format!(
@@ -41,7 +41,7 @@ fn snapshot_export_carries_sync_state() {
     // === peer A: 初期 data 投入 ===
     let mut eng_a = Engine::create_with_capacity(&path_a, 65_536).unwrap();
     eng_a.define_table("notes", 1000).unwrap();
-    eng_a.define_himo_in("notes", "note", HimoType::Number, 0).unwrap();
+    eng_a.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
     eng_a.enable_sync_tables().unwrap();
     let eng_a: Arc<Engine> = Engine::concurrentize_with_oplog(eng_a, 16 * 1024 * 1024).unwrap();
 
@@ -90,7 +90,7 @@ fn current_sync_lsn_advances_with_transfer() {
     use std::sync::Arc;
     let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
     eng.define_table("notes", 1000).unwrap();
-    eng.define_himo_in("notes", "note", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
     eng.enable_sync_tables().unwrap();
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
 

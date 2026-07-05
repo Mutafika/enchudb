@@ -588,7 +588,7 @@ impl Syncer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use enchudb_engine::{HimoType};
+    use enchudb_engine::{ValueType};
     use enchudb_oplog::PeerId;
     use enchudb_engine::transport::InMemoryTransport;
 
@@ -608,7 +608,7 @@ mod tests {
             // 0.8.0: user table 経路で使う (= anonymous は enable_sync_tables で
             // 閉じるため)。 既存 test の "rows.val" himo は "rows.val" 名前空間に。
             eng.define_table("rows", 1000).unwrap();
-            eng.define_himo_in("rows", "val", HimoType::Number, 100).unwrap();
+            eng.define_himo_in("rows", "val", ValueType::Number, 100).unwrap();
             eng.enable_sync_tables().unwrap();
             eng.flush().unwrap();
         }

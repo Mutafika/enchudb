@@ -6,7 +6,7 @@
 //!  - 結果の小さい複合クエリ (= 実用 SaaS/SNS のクエリ規模)
 //! を測る。
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 use std::time::Instant;
 
 fn main() {
@@ -15,9 +15,9 @@ fn main() {
 
     let mut eng = Engine::create_standalone(path).unwrap();
     // 結果集合が「小さく」 なるよう cardinality を高めに取る
-    eng.define_himo("user_id", HimoType::Number, 100_000); // 1M / 100K = 10 件/user
-    eng.define_himo("year",    HimoType::Number, 10);      // 10 値
-    eng.define_himo("city",    HimoType::Tag, 0);
+    eng.define_himo("user_id", ValueType::Number, 100_000); // 1M / 100K = 10 件/user
+    eng.define_himo("year",    ValueType::Number, 10);      // 10 値
+    eng.define_himo("city",    ValueType::Tag, 0);
 
     let n = 1_000_000u32;
     for i in 0..n {

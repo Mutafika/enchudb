@@ -7,7 +7,7 @@
 //!   - entity_in が table 内 eid range を割り当てる
 //!   - 重複 / 容量超過 / 不在 table のエラーケース
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 
 fn tmp_path(tag: &str) -> String {
     format!(
@@ -33,7 +33,7 @@ fn legacy_api_works_without_define_table() {
     cleanup(&path);
 
     let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("age", HimoType::Number, 100);
+    eng.define_himo("age", ValueType::Number, 100);
     let e1 = eng.entity();
     let e2 = eng.entity();
     eng.tie(e1, "age", 30);
@@ -75,7 +75,7 @@ fn entity_in_allocates_within_range() {
 
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_table("users", 100).unwrap();
-    eng.define_himo_in("users", "age", HimoType::Number, 100).unwrap();
+    eng.define_himo_in("users", "age", ValueType::Number, 100).unwrap();
 
     let e1 = eng.entity_in("users").unwrap();
     let e2 = eng.entity_in("users").unwrap();
@@ -194,7 +194,7 @@ fn define_himo_in_namespaces_full_name() {
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_table("users", 100).unwrap();
     let hid = eng
-        .define_himo_in("users", "age", HimoType::Number, 100)
+        .define_himo_in("users", "age", ValueType::Number, 100)
         .expect("define users.age");
     assert_eq!(hid, 0, "first himo should be id 0");
 
@@ -218,8 +218,8 @@ fn define_himo_in_separates_two_tables() {
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_table("users", 100).unwrap();
     eng.define_table("orders", 100).unwrap();
-    eng.define_himo_in("users", "age", HimoType::Number, 100).unwrap();
-    eng.define_himo_in("orders", "total", HimoType::Number, 100).unwrap();
+    eng.define_himo_in("users", "age", ValueType::Number, 100).unwrap();
+    eng.define_himo_in("orders", "total", ValueType::Number, 100).unwrap();
 
     let u = eng.entity_in("users").unwrap();
     let o = eng.entity_in("orders").unwrap();
@@ -241,7 +241,7 @@ fn define_himo_in_rejects_dot_in_name() {
 
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_table("users", 100).unwrap();
-    let result = eng.define_himo_in("users", "a.b", HimoType::Number, 100);
+    let result = eng.define_himo_in("users", "a.b", ValueType::Number, 100);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("must not contain '.'"));
 
@@ -254,7 +254,7 @@ fn define_himo_in_unknown_table_errors() {
     cleanup(&path);
 
     let mut eng = Engine::create_standalone(&path).unwrap();
-    let result = eng.define_himo_in("missing", "age", HimoType::Number, 100);
+    let result = eng.define_himo_in("missing", "age", ValueType::Number, 100);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("not found"));
 
@@ -321,14 +321,14 @@ fn define_ref_in_unknown_target_errors() {
 
 #[test]
 fn ref_without_fk_link_skips_validation() {
-    // 旧 API 経路: HimoType::Ref で define_himo_in 経由 (define_ref_in を
+    // 旧 API 経路: ValueType::Ref で define_himo_in 経由 (define_ref_in を
     // 呼ばない場合) は fk_refs entry なし → validation skip。 後方互換性。
     let path = tmp_path("ref_no_fk");
     cleanup(&path);
 
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_table("posts", 100).unwrap();
-    eng.define_himo_in("posts", "author", HimoType::Ref, 0).unwrap();
+    eng.define_himo_in("posts", "author", ValueType::Ref, 0).unwrap();
 
     let post = eng.entity_in("posts").unwrap();
     // 何でも tie 可能 (validation skip)
@@ -346,7 +346,7 @@ fn tie_out_of_table_range_panics() {
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_table("users", 100).unwrap();
     eng.define_table("posts", 100).unwrap();
-    eng.define_himo_in("users", "age", HimoType::Number, 100).unwrap();
+    eng.define_himo_in("users", "age", ValueType::Number, 100).unwrap();
 
     let _ = eng.entity_in("users").unwrap();
     let post = eng.entity_in("posts").unwrap();
@@ -369,7 +369,7 @@ fn anonymous_open_skips_eid_range_validation() {
     cleanup(&path);
 
     let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("age", HimoType::Number, 100);
+    eng.define_himo("age", ValueType::Number, 100);
     let e = eng.entity();
     eng.tie(e, "age", 30); // OK
     assert_eq!(eng.pull_raw("age", 30).len(), 1);
@@ -384,7 +384,7 @@ fn anonymous_closed_validates_eid_range() {
     cleanup(&path);
 
     let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("age", HimoType::Number, 100);
+    eng.define_himo("age", ValueType::Number, 100);
     let e1 = eng.entity(); // anonymous に 1 個確保 (eid=0)
     eng.tie(e1, "age", 30); // anonymous open なので OK
 
@@ -411,8 +411,8 @@ fn positions_isolated_per_table() {
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_table("a", 1000).unwrap();
     eng.define_table("b", 1000).unwrap();
-    eng.define_himo_in("a", "v", HimoType::Number, 100).unwrap();
-    eng.define_himo_in("b", "v", HimoType::Number, 100).unwrap();
+    eng.define_himo_in("a", "v", ValueType::Number, 100).unwrap();
+    eng.define_himo_in("b", "v", ValueType::Number, 100).unwrap();
 
     // a に 10 個、 b に 10 個 entity 作って tie
     let mut a_eids = Vec::new();
@@ -459,7 +459,7 @@ fn tables_persist_across_reopen() {
         let mut eng = Engine::create_standalone(&path).unwrap();
         eng.define_table("users", 100).unwrap();
         eng.define_table("posts", 100).unwrap();
-        eng.define_himo_in("users", "age", HimoType::Number, 100).unwrap();
+        eng.define_himo_in("users", "age", ValueType::Number, 100).unwrap();
         eng.define_ref_in("posts", "author", "users").unwrap();
 
         let alice = eng.entity_in("users").unwrap();
@@ -500,7 +500,7 @@ fn entity_in_continues_after_reopen() {
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
         eng.define_table("users", 100).unwrap();
-        eng.define_himo_in("users", "name", HimoType::Number, 10).unwrap();
+        eng.define_himo_in("users", "name", ValueType::Number, 10).unwrap();
         let alice = eng.entity_in("users").unwrap();
         alice_eid = enchudb_oplog::eid_local(alice);
         eng.tie(alice, "users.name", 1);
@@ -530,7 +530,7 @@ fn legacy_v4_db_opens_as_anonymous_only() {
 
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
-        eng.define_himo("legacy_himo", HimoType::Number, 10);
+        eng.define_himo("legacy_himo", ValueType::Number, 10);
         let e = eng.entity();
         eng.tie(e, "legacy_himo", 7);
         eng.flush().unwrap();
@@ -558,7 +558,7 @@ fn anonymous_keeps_open_until_first_define_table() {
     // entity() を先に呼ぶ
     let e1 = eng.entity();
     let e2 = eng.entity();
-    eng.define_himo("foo", HimoType::Number, 10);
+    eng.define_himo("foo", ValueType::Number, 10);
     eng.tie(e1, "foo", 1);
     eng.tie(e2, "foo", 2);
 

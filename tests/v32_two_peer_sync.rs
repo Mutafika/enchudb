@@ -6,7 +6,7 @@
 #![cfg(feature = "v32")]
 
 use std::sync::Arc;
-use enchudb::{Engine, HimoType};
+use enchudb::{Engine, ValueType};
 use enchudb_oplog::Hlc;
 use enchudb::sync::Syncer;
 use enchudb::transport::{InMemoryTransport, Transport, WireRecord};
@@ -32,8 +32,8 @@ fn cleanup(path: &str) {
 fn make_peer(path: &str, peer: u32) -> Arc<Engine> {
     {
         let mut eng = Engine::create_standalone(path).unwrap();
-        eng.define_himo("val", HimoType::Number, 100);
-        eng.define_himo("name", HimoType::Tag, 0);
+        eng.define_himo("val", ValueType::Number, 100);
+        eng.define_himo("name", ValueType::Tag, 0);
         eng.flush().unwrap();
     }
     let eng = Engine::open_concurrent_with_oplog(path, 16 * 1024 * 1024).unwrap();
@@ -251,7 +251,7 @@ fn peer_id_persists_across_reopen() {
     let path = tmp("peer_persist");
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
-        eng.define_himo("val", HimoType::Number, 10);
+        eng.define_himo("val", ValueType::Number, 10);
         eng.set_peer_id(42);
         eng.flush().unwrap();
     }

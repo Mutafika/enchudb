@@ -5,7 +5,7 @@
 //! `where_eq().find_one()` 等が壊れた eid を返していた。
 //! 修正: `make_eid(self.peer_id(), local)` で正しく peer prefix を付ける。
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 
 fn tmp_path(tag: &str) -> String {
     format!(
@@ -34,7 +34,7 @@ fn query_by_id_returns_eid_with_peer_prefix() {
 
     let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
     eng.define_table("notes", 1000).unwrap();
-    eng.define_himo_in("notes", "val", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "val", ValueType::Number, 0).unwrap();
     eng.set_peer_id(7);
     let hid = eng.himo_id("notes.val").unwrap() as u16;
 
@@ -65,7 +65,7 @@ fn query_by_id_default_peer_zero_still_works() {
 
     let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
     eng.define_table("notes", 1000).unwrap();
-    eng.define_himo_in("notes", "val", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "val", ValueType::Number, 0).unwrap();
     let hid = eng.himo_id("notes.val").unwrap() as u16;
 
     let e1 = eng.entity_in("notes").unwrap();

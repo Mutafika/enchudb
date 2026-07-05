@@ -2,7 +2,7 @@
 //! producer は queue 満杯時に yield-spin で block する。 small cap で writer 数 >>
 //! consumer rate な状況を作って、 hang せず全 push が完走する事を確認。
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 use std::sync::Arc;
 
 /// queue cap を 64 に絞って、 8 writer × 200 ops を投げる。 旧 unbounded queue
@@ -23,7 +23,7 @@ fn small_queue_cap_does_not_hang() {
 
     {
         let eng_mut = unsafe { &mut *(Arc::as_ptr(&eng) as *mut Engine) };
-        eng_mut.define_himo("marker", HimoType::Tag, 100);
+        eng_mut.define_himo("marker", ValueType::Tag, 100);
     }
     let marker_hid = eng.himo_id("marker").unwrap() as u16;
 

@@ -6,7 +6,7 @@
 //! 3) open_standalone で開いて、 さらに ~18 個 himo を append、 flush、 drop
 //! 4) もう一度 open_standalone → ここで SIGBUS が報告されている
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 
 fn tmp_path(tag: &str) -> String {
     format!(
@@ -45,7 +45,7 @@ fn append_himos_after_reopen_does_not_sigbus() {
         )
         .unwrap();
         for i in 0..44 {
-            eng.define_himo(&format!("h{}", i), HimoType::Number, 0);
+            eng.define_himo(&format!("h{}", i), ValueType::Number, 0);
         }
         for v in 0..1000u32 {
             let e = eng.entity();
@@ -58,7 +58,7 @@ fn append_himos_after_reopen_does_not_sigbus() {
     {
         let mut eng = Engine::open_standalone(&path).unwrap();
         for i in 44..62 {
-            eng.define_himo(&format!("h{}", i), HimoType::Number, 0);
+            eng.define_himo(&format!("h{}", i), ValueType::Number, 0);
         }
         eng.flush().unwrap();
     }
@@ -89,17 +89,17 @@ fn append_mixed_type_himos_after_reopen() {
             Some(16 * 1024 * 1024),
         )
         .unwrap();
-        let pre: &[(&str, HimoType)] = &[
-            ("kind", HimoType::Tag),
-            ("name", HimoType::Tag),
-            ("pubkey_hex", HimoType::Tag),
-            ("endpoint", HimoType::Tag),
-            ("last_seen_s", HimoType::Number),
-            ("room_ref", HimoType::Ref),
-            ("peer_ref", HimoType::Ref),
-            ("updated_at_s", HimoType::Number),
-            ("title", HimoType::Tag),
-            ("status", HimoType::Tag),
+        let pre: &[(&str, ValueType)] = &[
+            ("kind", ValueType::Tag),
+            ("name", ValueType::Tag),
+            ("pubkey_hex", ValueType::Tag),
+            ("endpoint", ValueType::Tag),
+            ("last_seen_s", ValueType::Number),
+            ("room_ref", ValueType::Ref),
+            ("peer_ref", ValueType::Ref),
+            ("updated_at_s", ValueType::Number),
+            ("title", ValueType::Tag),
+            ("status", ValueType::Tag),
         ];
         for (n, t) in pre {
             eng.define_himo(n, *t, 0);
@@ -112,17 +112,17 @@ fn append_mixed_type_himos_after_reopen() {
     // 新 himo を append (= fact_* 系を後付け、 issue7 の trigger)
     {
         let mut eng = Engine::open_standalone(&path).unwrap();
-        let new: &[(&str, HimoType)] = &[
-            ("fact_what", HimoType::Tag),
-            ("fact_why", HimoType::Tag),
-            ("fact_how", HimoType::Tag),
-            ("fact_when_start_s", HimoType::Number),
-            ("fact_when_end_s", HimoType::Number),
-            ("fact_where_project", HimoType::Tag),
-            ("fact_who_user", HimoType::Tag),
-            ("fact_ref", HimoType::Ref),
-            ("entity_tag", HimoType::Tag),
-            ("fact_kind", HimoType::Tag),
+        let new: &[(&str, ValueType)] = &[
+            ("fact_what", ValueType::Tag),
+            ("fact_why", ValueType::Tag),
+            ("fact_how", ValueType::Tag),
+            ("fact_when_start_s", ValueType::Number),
+            ("fact_when_end_s", ValueType::Number),
+            ("fact_where_project", ValueType::Tag),
+            ("fact_who_user", ValueType::Tag),
+            ("fact_ref", ValueType::Ref),
+            ("entity_tag", ValueType::Tag),
+            ("fact_kind", ValueType::Tag),
         ];
         for (n, t) in new {
             eng.define_himo(n, *t, 0);
@@ -169,7 +169,7 @@ fn append_himos_after_seal_integrity() {
         )
         .unwrap();
         for i in 0..10 {
-            eng.define_himo(&format!("h{}", i), HimoType::Number, 0);
+            eng.define_himo(&format!("h{}", i), ValueType::Number, 0);
         }
         let e = eng.entity();
         eng.tie(e, "h0", 42);
@@ -181,7 +181,7 @@ fn append_himos_after_seal_integrity() {
         let mut eng = Engine::open_standalone(&path).unwrap();
         // 新 himo append
         for i in 10..20 {
-            eng.define_himo(&format!("h{}", i), HimoType::Number, 0);
+            eng.define_himo(&format!("h{}", i), ValueType::Number, 0);
         }
         eng.flush().unwrap();
     }

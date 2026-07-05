@@ -7,7 +7,7 @@
 //!   - 連続 eid 集合 (= range 全件) でも `_range_par` と一致
 //!   - 不連続 (= 飛び飛び) でも正しく動く
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 
 const PAR_THRESHOLD: usize = 64_000;
 
@@ -32,8 +32,8 @@ fn cleanup(path: &str) {
 fn build(path: &str, n: u32) -> (Engine, u32, u32) {
     let mut eng = Engine::create_standalone(path).unwrap();
     eng.define_table("t", n).unwrap();
-    eng.define_himo_in("t", "val", HimoType::Number, 0).unwrap();
-    eng.define_himo_in("t", "dept", HimoType::Tag, 0).unwrap();
+    eng.define_himo_in("t", "val", ValueType::Number, 0).unwrap();
+    eng.define_himo_in("t", "dept", ValueType::Tag, 0).unwrap();
     let depts = ["a", "b", "c", "d", "e", "f", "g", "h"];
     for i in 0..n {
         let e = eng.entity_in("t").unwrap();

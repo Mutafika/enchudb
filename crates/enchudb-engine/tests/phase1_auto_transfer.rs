@@ -4,7 +4,7 @@
 //! 0.8.0 で consumer thread に自動化を組み込み、 user は何もしなくても
 //! tie 後 fsync_interval (100ms) 経過すれば pending_sync_ops で取れる。
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,7 +35,7 @@ fn consumer_thread_auto_transfers_to_sync_ops() {
 
     let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
     eng.define_table("notes", 1000).unwrap();
-    eng.define_himo_in("notes", "note", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
     eng.enable_sync_tables().unwrap();
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
 
@@ -76,7 +76,7 @@ fn manual_transfer_remains_idempotent_after_auto() {
 
     let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
     eng.define_table("notes", 1000).unwrap();
-    eng.define_himo_in("notes", "note", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
     eng.enable_sync_tables().unwrap();
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
 

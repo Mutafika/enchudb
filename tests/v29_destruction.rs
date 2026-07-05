@@ -13,7 +13,7 @@
 
 #![cfg(feature = "v27")]
 
-use enchudb::{Engine, HimoType};
+use enchudb::{Engine, ValueType};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
@@ -39,7 +39,7 @@ fn cleanup(path: &str) {
 
 fn prepare_db(path: &str) {
     let mut e = Engine::create_with_capacity(path, 10_000).unwrap();
-    e.define_himo("n", HimoType::Number, 1_000);
+    e.define_himo("n", ValueType::Number, 1_000);
     e.flush().unwrap();
 }
 
@@ -429,7 +429,7 @@ fn v29_body_bit_flip_detected() {
     {
         // sync API で書き込み + seal_integrity(flush + region CRC 保存)
         let mut e = Engine::create_with_capacity(&path, 1000).unwrap();
-        e.define_himo("n", HimoType::Number, 100);
+        e.define_himo("n", ValueType::Number, 100);
         let eid = e.entity();
         e.tie(eid, "n", 42);
         e.seal_integrity().unwrap();

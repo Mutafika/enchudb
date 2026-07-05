@@ -67,7 +67,7 @@ pub struct EngineStats {
 }
 
 /// 0.8.16 (issue #54): vocab の orphan (= 死蔵 vid) 検出スナップショット。
-/// `HimoType::Leaf` の値は `vocab.insert` (常に新 vid 払出) で書かれるため、
+/// `ValueType::Leaf` の値は `vocab.insert` (常に新 vid 払出) で書かれるため、
 /// re-tie / remove で旧 vid が himo から外れても vocab data 側は残置する。
 /// 同 vid を参照する live cell が皆無の vid を orphan として計上する。
 ///
@@ -685,7 +685,7 @@ impl Backing {
     }
 
     /// 0.9.0 himo dynamic definition: `&self` 版 `as_slice_mut`。
-    /// header の himo_types / max_values / himo_count / CRC を `&self` から
+    /// header の value_types / max_values / himo_count / CRC を `&self` から
     /// 更新するために使う。 これらの byte は himo_def_lock 下でしか書かれず、
     /// reader は runtime にこの領域を読まない (open 時のみ) 前提。
     #[allow(clippy::mut_from_ref)]
@@ -732,7 +732,7 @@ impl Backing {
 use crate::append_vec::AppendVec;
 use crate::vocabulary::Vocabulary;
 use crate::entity_set::EntitySet;
-use crate::himo_store::{HimoStore, HimoType};
+use crate::himo_store::{HimoStore, ValueType};
 use crate::content_store::ContentStore;
 use crate::column::Column;
 
@@ -845,7 +845,7 @@ fn align8(n: usize) -> usize { (n + 7) & !7 }
 /// ヘッダ整合性 CRC を計算する対象領域。
 /// magic, version, max_entities, max_himos, himo_count,
 /// vocab_*, himoreg_*, content_data_size, cyl_max_values の固定レイアウト部のみ。
-/// himo_types/max_values 領域は runtime で変動するので CRC 範囲外。
+/// value_types/max_values 領域は runtime で変動するので CRC 範囲外。
 
 #[inline]
 fn compute_header_crc(buf: &[u8]) -> u32 {
@@ -1296,7 +1296,7 @@ pub struct Engine {
     // (`self.himos[hid]` 等の indexed read) は lock を取らない。
     // 定義追加は `himo_def_lock` で直列化される。
     himo_names: AppendVec<String>,
-    himo_types: AppendVec<HimoType>,
+    value_types: AppendVec<ValueType>,
     himo_max_values: AppendVec<u32>,
     himos: AppendVec<HimoStore>,
     /// β-light step 2: engine が認知する table 一覧。 index 0 は常に
@@ -1537,7 +1537,7 @@ impl Engine {
             path: path.to_string(), layout, max_entities, max_himos,
             vocab, himo_reg,
             himo_names: AppendVec::with_capacity(max_himos as usize),
-            himo_types: AppendVec::with_capacity(max_himos as usize),
+            value_types: AppendVec::with_capacity(max_himos as usize),
             himo_max_values: AppendVec::with_capacity(max_himos as usize),
             himos: AppendVec::with_capacity(max_himos as usize), entities, contents,
             tables: vec![TableDef::anonymous()],
@@ -1785,7 +1785,7 @@ impl Engine {
             vocab,
             himo_reg,
             himo_names: AppendVec::with_capacity(max_himos as usize),
-            himo_types: AppendVec::with_capacity(max_himos as usize),
+            value_types: AppendVec::with_capacity(max_himos as usize),
             himo_max_values: AppendVec::with_capacity(max_himos as usize),
             himos: AppendVec::with_capacity(max_himos as usize),
             entities,
@@ -1965,7 +1965,7 @@ impl Engine {
             Backing::Memory(v) => &v[..],
         };
         // himo columns
-        for hid in 0..self.himo_types.len() {
+        for hid in 0..self.value_types.len() {
             let off = self.layout.himo_col_off(hid);
             let end = off + self.layout.himo_col_size;
             let crc = fnv1a_region(&buf[off..end]);
@@ -2239,12 +2239,12 @@ impl Engine {
         // 超えていても load 自体は落とさない (旧 Vec 実装と同じ寛容さ)。
         let himo_cap = (max_himos as usize).max(himo_count as usize);
         let himo_names: AppendVec<String> = AppendVec::with_capacity(himo_cap);
-        let himo_types: AppendVec<HimoType> = AppendVec::with_capacity(himo_cap);
+        let value_types: AppendVec<ValueType> = AppendVec::with_capacity(himo_cap);
         let himo_max_values: AppendVec<u32> = AppendVec::with_capacity(himo_cap);
         let himos: AppendVec<HimoStore> = AppendVec::with_capacity(himo_cap);
 
         for hid in 0..himo_count as usize {
-            let ht = HimoType::from_byte(type_bytes[hid]);
+            let ht = ValueType::from_byte(type_bytes[hid]);
             let mv = maxv_values[hid];
             let name_bytes = himo_reg.get(hid as u32);
             let name = String::from_utf8_lossy(name_bytes).to_string();
@@ -2256,7 +2256,7 @@ impl Engine {
             );
 
             let _ = himo_names.push(name);
-            let _ = himo_types.push(ht);
+            let _ = value_types.push(ht);
             let _ = himo_max_values.push(mv);
             let _ = himos.push(hs);
         }
@@ -2279,7 +2279,7 @@ impl Engine {
         let eng = Self {
             path: String::new(), layout, max_entities, max_himos,
             vocab, himo_reg,
-            himo_names, himo_types, himo_max_values,
+            himo_names, value_types, himo_max_values,
             himos, entities, contents,
             tables: initial_tables,
             himo_to_table: initial_himo_to_table,
@@ -2450,27 +2450,27 @@ impl Engine {
         if !self.has_reserved_table("_sync_ops") {
             self.define_reserved_table("_sync_ops", sync_ops_size)?;
             // lsn: u32 単調 (= publish_since cursor)
-            self.define_himo_in("_sync_ops", "lsn", HimoType::Number, 0)?;
+            self.define_himo_in("_sync_ops", "lsn", ValueType::Number, 0)?;
             // peer_id: record の author_peer (= filter 用)
-            self.define_himo_in("_sync_ops", "peer_id", HimoType::Number, 0)?;
+            self.define_himo_in("_sync_ops", "peer_id", ValueType::Number, 0)?;
             // op_type: 0=Tie, 1=Untie, 2=Delete, 3=Content, 4=Commit, 5=Schema, 6=Vocab
-            self.define_himo_in("_sync_ops", "op_type", HimoType::Number, 0)?;
+            self.define_himo_in("_sync_ops", "op_type", ValueType::Number, 0)?;
             // hlc_wall_lo: hlc.wall (u64 ms-since-epoch) の下位 32bit
             // 完全な hlc は payload の中、 これは粗 filter / debug 用。
-            self.define_himo_in("_sync_ops", "hlc_wall_lo", HimoType::Number, 0)?;
+            self.define_himo_in("_sync_ops", "hlc_wall_lo", ValueType::Number, 0)?;
             // payload: 完全な oplog record wire bytes (header 含む)、 Leaf で dedupe なし
-            self.define_himo_in("_sync_ops", "payload", HimoType::Leaf, 0)?;
+            self.define_himo_in("_sync_ops", "payload", ValueType::Leaf, 0)?;
         }
 
         // _sync_peers: peer ごと watermark。 100 peer 想定で 1 K の枠 (上で計算済み)。
         if !self.has_reserved_table("_sync_peers") {
             self.define_reserved_table("_sync_peers", sync_peers_size)?;
             // peer_id: PK
-            self.define_himo_in("_sync_peers", "peer_id", HimoType::Number, 0)?;
+            self.define_himo_in("_sync_peers", "peer_id", ValueType::Number, 0)?;
             // consumed_lsn: 当該 peer が ack した最後の _sync_ops.lsn
-            self.define_himo_in("_sync_peers", "consumed_lsn", HimoType::Number, 0)?;
+            self.define_himo_in("_sync_peers", "consumed_lsn", ValueType::Number, 0)?;
             // last_seen_at: 最後の活動時刻 (= 観測用、 unix ms / 2^16 等で u32 に収める想定)
-            self.define_himo_in("_sync_peers", "last_seen_at", HimoType::Number, 0)?;
+            self.define_himo_in("_sync_peers", "last_seen_at", ValueType::Number, 0)?;
         }
 
         // #77-H6: 既存 DB の再 enable (reopen 経路) では、 body に残る過去 rows /
@@ -3139,8 +3139,8 @@ impl Engine {
     }
 
     /// 0.8.7: index 直で himo の type (Tag/Number/Leaf/Ref) を返す。
-    pub fn himo_type_at(&self, idx: usize) -> Option<HimoType> {
-        self.himo_types.get(idx).copied()
+    pub fn value_type_at(&self, idx: usize) -> Option<ValueType> {
+        self.value_types.get(idx).copied()
     }
 
     /// 0.8.7: 指定 table の fk_refs を `(from_col_name, to_table_name)` ペアで返す
@@ -3345,7 +3345,7 @@ impl Engine {
     /// entity eid とは別に value も translate する必要がある。
     pub fn himo_is_ref(&self, himo_id: u16) -> bool {
         let hid = himo_id as usize;
-        hid < self.himo_types.len() && self.himo_types[hid] == HimoType::Ref
+        hid < self.value_types.len() && self.value_types[hid] == ValueType::Ref
     }
 
     /// #9: Ref himo の value (= foreign target eid の local 部) を自分の eid 空間の
@@ -3581,10 +3581,10 @@ impl Engine {
     /// Symbol 以外の himo、または mapping 未登録なら元値をそのまま返す。
     pub fn translate_remote_vid(&self, author_peer: enchudb_oplog::PeerId, himo_id: u16, value: u32) -> u32 {
         let hid = himo_id as usize;
-        if hid >= self.himo_types.len() { return value; }
+        if hid >= self.value_types.len() { return value; }
         // Tag / Leaf どちらも vocab 経由なので vid 翻訳が必要。
-        match self.himo_types[hid] {
-            HimoType::Tag | HimoType::Leaf => {
+        match self.value_types[hid] {
+            ValueType::Tag | ValueType::Leaf => {
                 let map = self.peer_vocab_map.read().unwrap();
                 *map.get(&(author_peer, value)).unwrap_or(&value)
             }
@@ -3594,7 +3594,7 @@ impl Engine {
 
     // ──── tie ────
 
-    pub fn define_himo(&mut self, himo: &str, ht: HimoType, max_values: u32) {
+    pub fn define_himo(&mut self, himo: &str, ht: ValueType, max_values: u32) {
         self.ensure_himo(himo, ht, max_values);
     }
 
@@ -3610,7 +3610,7 @@ impl Engine {
         &mut self,
         table_name: &str,
         himo_name: &str,
-        ht: HimoType,
+        ht: ValueType,
         max_values: u32,
     ) -> Result<u32, String> {
         // 0.9.0: 本体は `&self` 版 (ensure_himo_dynamic_in) に移譲。 signature は
@@ -3627,7 +3627,7 @@ impl Engine {
         &self,
         table_name: &str,
         himo_name: &str,
-        ht: HimoType,
+        ht: ValueType,
         max_values: u32,
     ) -> Result<u16, String> {
         self.check_writable();
@@ -3703,7 +3703,7 @@ impl Engine {
 
         // Ref として himo 登録 (define_himo_in が table_name / himo_name の
         // 各種チェックを行う)
-        let hid = self.define_himo_in(table_name, himo_name, HimoType::Ref, 0)?;
+        let hid = self.define_himo_in(table_name, himo_name, ValueType::Ref, 0)?;
 
         // 所属 table の fk_refs に entry を追加 (idempotent)
         let owner_tid =
@@ -3760,14 +3760,14 @@ impl Engine {
     /// entry を持つ場合、 target_eid が target_table の eid 範囲内かを assert。
     ///
     /// hot path 性能:
-    ///   - 非 Ref himo は最初の `himo_types[hid] != Ref` で即 return (~1 ns)
+    ///   - 非 Ref himo は最初の `value_types[hid] != Ref` で即 return (~1 ns)
     ///   - Ref himo は fk_refs (typically 1-5 件) の線形検索 (~5-10 ns)
     #[inline(always)]
     fn validate_ref_tie(&self, hid: usize, target_eid: u32) {
-        if hid >= self.himo_types.len() {
+        if hid >= self.value_types.len() {
             return;
         }
-        if self.himo_types[hid] != HimoType::Ref {
+        if self.value_types[hid] != ValueType::Ref {
             return;
         }
         let Some(owner_tid) = self.himo_table_get(hid) else {
@@ -3797,13 +3797,13 @@ impl Engine {
     pub fn tie_text(&mut self, eid: enchudb_oplog::EntityId, himo: &str, value: &str) {
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
-        let hid = self.ensure_himo(himo, HimoType::Tag, 0);
+        let hid = self.ensure_himo(himo, ValueType::Tag, 0);
         // β-light step 6: eid が himo の所属 table eid_range 内か
         self.validate_eid_for_himo(hid, eid);
         // Tag は dedupe (get_or_insert)、Leaf は新規 id 発行 (insert)。
-        let vid = match self.himo_types[hid] {
-            HimoType::Tag => self.vocab.get_or_insert(value.as_bytes()),
-            HimoType::Leaf => self.vocab.insert(value.as_bytes()),
+        let vid = match self.value_types[hid] {
+            ValueType::Tag => self.vocab.get_or_insert(value.as_bytes()),
+            ValueType::Leaf => self.vocab.insert(value.as_bytes()),
             ht => panic!("tie_text on non-text himo '{}': {:?}", himo, ht),
         };
         self.himos[hid].set(eid, vid);
@@ -3813,8 +3813,8 @@ impl Engine {
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
         assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
-        let hid = self.ensure_himo(himo, HimoType::Number, 0);
-        debug_assert!(self.himo_types[hid] == HimoType::Number || self.himo_types[hid] == HimoType::Ref, "tie on non-Value himo '{}'", himo);
+        let hid = self.ensure_himo(himo, ValueType::Number, 0);
+        debug_assert!(self.value_types[hid] == ValueType::Number || self.value_types[hid] == ValueType::Ref, "tie on non-Value himo '{}'", himo);
         // β-light step 6: eid が himo の所属 table eid_range 内か
         self.validate_eid_for_himo(hid, eid);
         // β-light step 5: Ref himo は target_table の eid range を validate
@@ -3827,8 +3827,8 @@ impl Engine {
         let eid = enchudb_oplog::eid_local(eid);
         let target_eid = enchudb_oplog::eid_local(target_eid);
         assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
-        let hid = self.ensure_himo(himo, HimoType::Ref, 0);
-        debug_assert!(self.himo_types[hid] == HimoType::Ref || self.himo_types[hid] == HimoType::Number, "tie_ref on non-Ref himo '{}'", himo);
+        let hid = self.ensure_himo(himo, ValueType::Ref, 0);
+        debug_assert!(self.value_types[hid] == ValueType::Ref || self.value_types[hid] == ValueType::Number, "tie_ref on non-Ref himo '{}'", himo);
         // β-light step 6: eid が himo の所属 table eid_range 内か
         self.validate_eid_for_himo(hid, eid);
         // β-light step 5: target_eid が target_table の eid range 内か
@@ -3855,9 +3855,9 @@ impl Engine {
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         // Tag は dedupe、Leaf は常に新規 id。
-        let vid = match self.himo_types[hid] {
-            HimoType::Tag => self.vocab.get_or_insert(value.as_bytes()),
-            HimoType::Leaf => self.vocab.insert(value.as_bytes()),
+        let vid = match self.value_types[hid] {
+            ValueType::Tag => self.vocab.get_or_insert(value.as_bytes()),
+            ValueType::Leaf => self.vocab.insert(value.as_bytes()),
             ht => panic!("tie_text_to_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
         self.himos[hid].set(eid, vid);
@@ -3896,9 +3896,9 @@ impl Engine {
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
-        let vid = match self.himo_types[hid] {
-            HimoType::Tag => self.vocab.get_or_insert(value),
-            HimoType::Leaf => self.vocab.insert(value),
+        let vid = match self.value_types[hid] {
+            ValueType::Tag => self.vocab.get_or_insert(value),
+            ValueType::Leaf => self.vocab.insert(value),
             ht => panic!("tie_bytes_to_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
         self.himos[hid].set(eid, vid);
@@ -3912,7 +3912,7 @@ impl Engine {
                     let _ = wal.append(enchudb_oplog::oplog::Op::TieNamed {
                         eid: oplog_eid,
                         himo_name: &self.himo_names[hid],
-                        himo_kind: self.himo_types[hid] as u8,
+                        himo_kind: self.value_types[hid] as u8,
                         value: vid,
                     });
                 } else {
@@ -3967,7 +3967,7 @@ impl Engine {
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         debug_assert!(
-            self.himo_types[hid] == HimoType::Ref || self.himo_types[hid] == HimoType::Number,
+            self.value_types[hid] == ValueType::Ref || self.value_types[hid] == ValueType::Number,
             "tie_ref_to_by_id on non-Ref himo_id {}", himo_id,
         );
         self.himos[hid].set(eid, target_eid);
@@ -4052,15 +4052,15 @@ impl Engine {
         );
         let himo_name = format!("_c_{key}");
         let res = match self.table_name_of_local(local) {
-            Some(t) => self.ensure_himo_dynamic_in(&t, &himo_name, HimoType::Leaf, 0),
-            None => self.ensure_himo_dynamic(&himo_name, HimoType::Leaf, 0),
+            Some(t) => self.ensure_himo_dynamic_in(&t, &himo_name, ValueType::Leaf, 0),
+            None => self.ensure_himo_dynamic(&himo_name, ValueType::Leaf, 0),
         };
         res.unwrap_or_else(|e| panic!("content key '{key}': himo allocation failed: {e}"))
     }
 
     /// full name ("table.himo" or "himo") で himo を lazy 解決。 table 部が既知
     /// table なら所属付きで、 それ以外は anonymous へ定義する (TieNamed replay 用)。
-    fn ensure_himo_by_full_name(&self, full_name: &str, ht: HimoType) -> Result<u16, String> {
+    fn ensure_himo_by_full_name(&self, full_name: &str, ht: ValueType) -> Result<u16, String> {
         if let Some((table, himo)) = full_name.split_once('.') {
             if self.tables.iter().any(|t| t.name == table) {
                 return self.ensure_himo_dynamic_in(table, himo, ht, 0);
@@ -4072,7 +4072,7 @@ impl Engine {
     /// 0.9.0: sync 受信側用の公開版 — TieNamed の himo を名前で解決 (無ければ
     /// lazy 定義) して local hid を返す。 `himo_kind` は wire 上の生 u8。
     pub fn ensure_himo_named(&self, full_name: &str, himo_kind: u8) -> Result<u16, String> {
-        self.ensure_himo_by_full_name(full_name, HimoType::from_byte(himo_kind))
+        self.ensure_himo_by_full_name(full_name, ValueType::from_byte(himo_kind))
     }
 
     /// hid が content 互換層の himo (`_c_` prefix) か。 これらは動的定義のため
@@ -4191,8 +4191,8 @@ impl Engine {
         let eid = enchudb_oplog::eid_local(eid);
         let hid = self.himo_id(himo)?;
         // Tag と Leaf は両方 vocab 経由で bytes を持つ (Leaf は dedupe なし、Tag は dedupe あり)。
-        match self.himo_types[hid] {
-            HimoType::Tag | HimoType::Leaf => {
+        match self.value_types[hid] {
+            ValueType::Tag | ValueType::Leaf => {
                 let vid = self.himos[hid].get_value(eid)?;
                 Some(self.vocab.get(vid))
             }
@@ -5616,8 +5616,8 @@ impl Engine {
         let mut fields = Vec::with_capacity(self.himos.len());
         for (i, hs) in self.himos.iter().enumerate() {
             if let Some(raw) = hs.get_value(eid) {
-                let val = match self.himo_types[i] {
-                    HimoType::Tag | HimoType::Leaf => EntityValue::Text(self.vocab.get(raw)),
+                let val = match self.value_types[i] {
+                    ValueType::Tag | ValueType::Leaf => EntityValue::Text(self.vocab.get(raw)),
                     _ => EntityValue::Num(raw),
                 };
                 fields.push((self.himo_names[i].as_str(), val));
@@ -5630,8 +5630,8 @@ impl Engine {
     pub(crate) fn vocab(&self) -> &Vocabulary { &self.vocab }
     pub fn himo_names(&self) -> &[String] { self.himo_names.as_slice() }
 
-    pub fn himo_type(&self, himo: &str) -> Option<HimoType> {
-        self.himo_id(himo).map(|idx| self.himo_types[idx])
+    pub fn value_type(&self, himo: &str) -> Option<ValueType> {
+        self.himo_id(himo).map(|idx| self.value_types[idx])
     }
 
     /// 指定紐の現在の unique 値数(非空バケット数)。O(1)。
@@ -5843,7 +5843,7 @@ impl Engine {
             .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
     }
 
-    fn ensure_himo(&mut self, himo: &str, ht: HimoType, max_values: u32) -> usize {
+    fn ensure_himo(&mut self, himo: &str, ht: ValueType, max_values: u32) -> usize {
         // 0.9.0: 本体は `&self` 版に移譲 (signature 互換の thin wrapper)。
         // capacity 超過は旧実装の assert! と同様 panic のまま。
         if let Some(idx) = self.himo_id(himo) { return idx; }
@@ -5863,7 +5863,7 @@ impl Engine {
     pub fn ensure_himo_dynamic(
         &self,
         full_name: &str,
-        ht: HimoType,
+        ht: ValueType,
         max_values: u32,
     ) -> Result<u16, String> {
         self.check_writable();
@@ -5889,12 +5889,12 @@ impl Engine {
     /// caller 責務)。 lock 下で himoreg 登録 → column region init → 並列配列
     /// への push → header 書き込みまでを行う。 publish 順は `himo_names` を
     /// 最後にする: `himo_id()` (= 名前の線形検索) で hid が見つかった時点で
-    /// 他の並列配列 (himos / himo_types / himo_max_values / himo_to_table /
+    /// 他の並列配列 (himos / value_types / himo_max_values / himo_to_table /
     /// tables[anon].himo_ids) は必ず埋まっている、 という不変条件を成す。
     fn define_himo_slot_locked(
         &self,
         himo: &str,
-        ht: HimoType,
+        ht: ValueType,
         max_values: u32,
     ) -> Result<u16, String> {
         let hid = self.himos.len();
@@ -5930,7 +5930,7 @@ impl Engine {
         // AppendVec は with_capacity(max_himos) 済みなので上の capacity check が
         // 通れば push は失敗しない (万一の防御で明示 panic)。
         let push_ok = self.himos.push(hs).is_ok()
-            && self.himo_types.push(ht).is_ok()
+            && self.value_types.push(ht).is_ok()
             && self.himo_max_values.push(max_values).is_ok()
             && self
                 .himo_to_table
@@ -6111,7 +6111,7 @@ impl Engine {
             DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => {
                 // 0.9.0: 名前で himo を解決 (無ければ定義) して set。
                 let local = enchudb_oplog::eid_local(*eid);
-                let ht = HimoType::from_byte(*himo_kind);
+                let ht = ValueType::from_byte(*himo_kind);
                 if let Ok(hid) = self.ensure_himo_by_full_name(himo_name, ht) {
                     self.himos[hid as usize].set(local, *value);
                 }
@@ -6650,7 +6650,7 @@ impl Engine {
 
         EngineStats {
             entity_count: self.entities.count(),
-            himo_count: self.himo_types.len() as u32,
+            himo_count: self.value_types.len() as u32,
             oplog_head,
             oplog_checkpoint,
             oplog_capacity,
@@ -6667,7 +6667,7 @@ impl Engine {
     }
 
     /// 0.8.16 (issue #54): vocab の orphan (= 死蔵 vid) を read-only scan。
-    /// `HimoType::Leaf` の `vocab.insert` 経路は re-tie / remove で旧 vid を
+    /// `ValueType::Leaf` の `vocab.insert` 経路は re-tie / remove で旧 vid を
     /// 回収しないため、 long-lived な curated store (= 元ソースから rebuild
     /// しないタイプ) で vocab data が単調増加する。 この API でその実量を計測。
     ///
@@ -6694,9 +6694,9 @@ impl Engine {
         // 各 himo の unique_values は局所 stored 値 (= cylinder side で管理) を返す。
         // stored は内部表現値 +1 ではなく素の vid なので decode 不要。
         let mut is_live = vec![false; vocab_total as usize];
-        for hid in 0..self.himo_types.len() {
-            match self.himo_types[hid] {
-                HimoType::Tag | HimoType::Leaf => {
+        for hid in 0..self.value_types.len() {
+            match self.value_types[hid] {
+                ValueType::Tag | ValueType::Leaf => {
                     let vids = self.himos[hid].unique_values();
                     for v in vids {
                         if (v as usize) < is_live.len() {
@@ -6839,9 +6839,9 @@ impl Engine {
         // β-light step 6: eid が himo の所属 table eid_range 内か
         self.validate_eid_for_himo(hid, local);
         // Tag は dedupe、Leaf は常に新規 id。
-        let vid = match self.himo_types[hid] {
-            HimoType::Tag => self.vocab.get_or_insert(value),
-            HimoType::Leaf => self.vocab.insert(value),
+        let vid = match self.value_types[hid] {
+            ValueType::Tag => self.vocab.get_or_insert(value),
+            ValueType::Leaf => self.vocab.insert(value),
             ht => panic!("tie_bytes_async_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
         assert!(vid < u32::MAX, "vocab vid must be < u32::MAX (sentinel reserved)");
@@ -6859,7 +6859,7 @@ impl Engine {
                 enchudb_oplog::oplog::OwnedOp::TieNamed {
                     eid: oplog_eid,
                     himo_name: self.himo_names[hid].clone(),
-                    himo_kind: self.himo_types[hid] as u8,
+                    himo_kind: self.value_types[hid] as u8,
                     value: vid,
                 }
             } else {
@@ -7041,10 +7041,10 @@ impl Engine {
         self.contents.sync();
 
         let maxv_base = himo_maxv_base(self.max_himos);
-        let hc = self.himo_types.len() as u32;
+        let hc = self.value_types.len() as u32;
         let buf = self.backing.as_slice_mut();
-        for hid in 0..self.himo_types.len() {
-            buf[H_HIMO_TYPES + hid] = self.himo_types[hid] as u8;
+        for hid in 0..self.value_types.len() {
+            buf[H_HIMO_TYPES + hid] = self.value_types[hid] as u8;
             let off = maxv_base + hid * 4;
             buf[off..off + 4].copy_from_slice(&self.himo_max_values[hid].to_le_bytes());
         }
@@ -7858,8 +7858,8 @@ mod tests {
     fn prefix_sum_point_query() {
         let dir = tmp("ps_point");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.define_himo("age", HimoType::Number, 100);
-        eng.define_himo("dept", HimoType::Number, 20);
+        eng.define_himo("age", ValueType::Number, 100);
+        eng.define_himo("dept", ValueType::Number, 20);
 
         for i in 0..1000u32 {
             let e = eng.entity();
@@ -7876,7 +7876,7 @@ mod tests {
     fn prefix_sum_value_zero() {
         let dir = tmp("ps_zero");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.define_himo("level", HimoType::Number, 10);
+        eng.define_himo("level", ValueType::Number, 10);
         let e = eng.entity();
         eng.tie(e, "level", 0);
         assert_eq!(eng.get(e, "level"), Some(0));
@@ -7888,7 +7888,7 @@ mod tests {
     fn prefix_sum_mixed_with_bsearch() {
         let dir = tmp("ps_mixed");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.define_himo("age", HimoType::Number, 100);
+        eng.define_himo("age", ValueType::Number, 100);
 
         for i in 0..100u32 {
             let e = eng.entity();
@@ -7907,7 +7907,7 @@ mod tests {
         let dir = tmp("ps_persist");
         {
             let mut eng = Engine::create_standalone(&dir).unwrap();
-            eng.define_himo("score", HimoType::Number, 200);
+            eng.define_himo("score", ValueType::Number, 200);
             for i in 0..100u32 {
                 let e = eng.entity();
                 eng.tie(e, "score", i % 20);
@@ -7925,7 +7925,7 @@ mod tests {
     fn prefix_sum_untie() {
         let dir = tmp("ps_untie");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.define_himo("age", HimoType::Number, 100);
+        eng.define_himo("age", ValueType::Number, 100);
         let e = eng.entity();
         eng.tie(e, "age", 30);
         assert_eq!(eng.query_count(&[("age", 30)]), 1);
@@ -7939,7 +7939,7 @@ mod tests {
     fn prefix_sum_overwrite() {
         let dir = tmp("ps_ow");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.define_himo("score", HimoType::Number, 1000);
+        eng.define_himo("score", ValueType::Number, 1000);
         let e = eng.entity();
         eng.tie(e, "score", 100);
         eng.tie(e, "score", 200);
@@ -7953,8 +7953,8 @@ mod tests {
     fn prefix_sum_delete() {
         let dir = tmp("ps_del");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.define_himo("age", HimoType::Number, 100);
-        eng.define_himo("dept", HimoType::Number, 20);
+        eng.define_himo("age", ValueType::Number, 100);
+        eng.define_himo("dept", ValueType::Number, 20);
         for i in 0..100u32 {
             let e = eng.entity();
             eng.tie(e, "age", i % 10);
@@ -7976,7 +7976,7 @@ mod tests {
     fn prefix_sum_boundary_max() {
         let dir = tmp("ps_bnd_max");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.define_himo("x", HimoType::Number, 10);
+        eng.define_himo("x", ValueType::Number, 10);
         let e = eng.entity();
         eng.tie(e, "x", 10);
         assert_eq!(eng.get(e, "x"), Some(10));
@@ -7988,7 +7988,7 @@ mod tests {
     fn prefix_sum_bulk_delete_reinsert() {
         let dir = tmp("ps_bulk");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.define_himo("val", HimoType::Number, 100);
+        eng.define_himo("val", ValueType::Number, 100);
         for _ in 0..500u32 {
             let e = eng.entity();
             eng.tie(e, "val", 42);
@@ -8013,9 +8013,9 @@ mod tests {
 
     fn setup_scale_prefix(dir: &str) -> Engine {
         let mut eng = Engine::create_standalone(dir).unwrap();
-        eng.define_himo("age", HimoType::Number, SCALE_AGES);
-        eng.define_himo("dept", HimoType::Number, SCALE_DEPTS);
-        eng.define_himo("company", HimoType::Number, SCALE_COMPANIES);
+        eng.define_himo("age", ValueType::Number, SCALE_AGES);
+        eng.define_himo("dept", ValueType::Number, SCALE_DEPTS);
+        eng.define_himo("company", ValueType::Number, SCALE_COMPANIES);
 
         for c in 0..SCALE_COMPANIES {
             for e in 0..SCALE_PER_CO {
@@ -8163,9 +8163,9 @@ mod tests {
         let groups = 1000u32;
 
         let mut eng = Engine::create_with_capacity(&dir, n + 1024).unwrap();
-        eng.define_himo("age", HimoType::Number, ages);
-        eng.define_himo("dept", HimoType::Number, depts);
-        eng.define_himo("group", HimoType::Number, groups);
+        eng.define_himo("age", ValueType::Number, ages);
+        eng.define_himo("dept", ValueType::Number, depts);
+        eng.define_himo("group", ValueType::Number, groups);
 
         for i in 0..n {
             let e = eng.entity();
@@ -8280,7 +8280,7 @@ mod tests {
         // tie_async → flush_writes → pull_raw で値が見えること。
         let dir = tmp("concurrent_basic");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.define_himo("age", HimoType::Number, 200);
+        eng.define_himo("age", ValueType::Number, 200);
         let eids: Vec<u64> = (0..100).map(|_| eng.entity()).collect();
 
         let arc = Engine::concurrentize(eng);
@@ -8307,7 +8307,7 @@ mod tests {
 
         let dir = tmp("concurrent_mrw");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.define_himo("k", HimoType::Number, 16);
+        eng.define_himo("k", ValueType::Number, 16);
         let eids: Vec<u64> = (0..1_000).map(|_| eng.entity()).collect();
         for (i, &e) in eids.iter().enumerate() {
             eng.tie(e, "k", (i as u32) % 16);
@@ -8410,7 +8410,7 @@ mod tests {
         // 実運用パターン: blob の hex を tie_text で紐付けて検索できる
         let dir = tmp("blob_tie");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        eng.define_himo("__blob_id", HimoType::Tag, 0);
+        eng.define_himo("__blob_id", ValueType::Tag, 0);
 
         let blob_root = std::env::temp_dir().join(format!(
             "enchu_blob_tie_{}",
@@ -8474,8 +8474,8 @@ mod tests {
     fn growable_create_tie_query_roundtrip() {
         let dir = tmp("growable_basic");
         let mut eng = Engine::create_growable(&dir).unwrap();
-        eng.define_himo("age", HimoType::Number, 0);
-        eng.define_himo("city", HimoType::Tag, 0);
+        eng.define_himo("age", ValueType::Number, 0);
+        eng.define_himo("city", ValueType::Tag, 0);
         for i in 0..50u32 {
             let e = eng.entity();
             eng.tie(e, "age", 20 + (i % 30));
@@ -8500,8 +8500,8 @@ mod tests {
         let dir = tmp("growable_tiny");
         {
             let mut eng = Engine::create_growable_tiny(&dir).unwrap();
-            eng.define_himo("key", HimoType::Tag, 0);
-            eng.define_himo("ts", HimoType::Number, 0);
+            eng.define_himo("key", ValueType::Tag, 0);
+            eng.define_himo("ts", ValueType::Number, 0);
             // 50 rows of (uuid-like, timestamp) — matcha の notif_state
             // が捌くサイズ感。
             for i in 0..50u32 {
@@ -8544,7 +8544,7 @@ mod tests {
         let p = tmp("readonly_no_block");
         {
             let mut eng = Engine::create_standalone(&p).unwrap();
-            eng.define_himo("v", HimoType::Number, 100);
+            eng.define_himo("v", ValueType::Number, 100);
             let e = eng.entity();
             eng.tie(e, "v", 42);
             eng.flush().unwrap();
@@ -8569,7 +8569,7 @@ mod tests {
         let p = tmp("readonly_panic");
         {
             let mut eng = Engine::create_standalone(&p).unwrap();
-            eng.define_himo("v", HimoType::Number, 100);
+            eng.define_himo("v", ValueType::Number, 100);
             eng.flush().unwrap();
         }
         let mut eng = Engine::open_readonly(&p).unwrap();
@@ -8585,7 +8585,7 @@ mod tests {
         let p = tmp("readonly_nomutate");
         {
             let mut eng = Engine::create_standalone(&p).unwrap();
-            eng.define_himo("v", HimoType::Number, 100);
+            eng.define_himo("v", ValueType::Number, 100);
             let e = eng.entity();
             eng.tie(e, "v", 42);
             eng.flush().unwrap(); // clean=true で確定
@@ -8614,7 +8614,7 @@ mod tests {
         let p = tmp("writer_block");
         {
             let mut eng = Engine::create_standalone(&p).unwrap();
-            eng.define_himo("v", HimoType::Number, 100);
+            eng.define_himo("v", ValueType::Number, 100);
             eng.flush().unwrap();
         }
         let eng_a = Engine::open_standalone(&p).unwrap();
@@ -8652,9 +8652,9 @@ mod tests {
             let eng = Engine::create_standalone(&p_str).unwrap();
             // string 版経路
             let mut eng = eng;
-            eng.define_himo("year", HimoType::Number, 100);
-            eng.define_himo("name", HimoType::Tag, 0);
-            eng.define_himo("self_ref", HimoType::Ref, 0);
+            eng.define_himo("year", ValueType::Number, 100);
+            eng.define_himo("name", ValueType::Tag, 0);
+            eng.define_himo("self_ref", ValueType::Ref, 0);
             let e = eng.entity();
             eng.tie_to(e, "year", 2026);
             eng.tie_text_to(e, "name", "alice");
@@ -8664,9 +8664,9 @@ mod tests {
         {
             let eng = Engine::create_standalone(&p_id).unwrap();
             let mut eng = eng;
-            eng.define_himo("year", HimoType::Number, 100);
-            eng.define_himo("name", HimoType::Tag, 0);
-            eng.define_himo("self_ref", HimoType::Ref, 0);
+            eng.define_himo("year", ValueType::Number, 100);
+            eng.define_himo("name", ValueType::Tag, 0);
+            eng.define_himo("self_ref", ValueType::Ref, 0);
             let year_id = eng.himo_id("year").unwrap() as u16;
             let name_id = eng.himo_id("name").unwrap() as u16;
             let ref_id = eng.himo_id("self_ref").unwrap() as u16;
@@ -8695,7 +8695,7 @@ mod tests {
     fn by_id_untie_equivalence_sync() {
         let p = tmp("by_id_untie");
         let mut eng = Engine::create_standalone(&p).unwrap();
-        eng.define_himo("year", HimoType::Number, 100);
+        eng.define_himo("year", ValueType::Number, 100);
         let year_id = eng.himo_id("year").unwrap() as u16;
         let e = eng.entity();
         eng.tie_to_by_id(e, year_id, 2026);
@@ -8710,7 +8710,7 @@ mod tests {
     fn by_id_out_of_range_panics() {
         let p = tmp("by_id_oor");
         let mut eng = Engine::create_standalone(&p).unwrap();
-        eng.define_himo("year", HimoType::Number, 100);
+        eng.define_himo("year", ValueType::Number, 100);
         let e = eng.entity();
         // himo_id = 99 だが define されたのは 1 つだけ (id=0)。
         // debug build では debug_assert! のメッセージ、 release では array indexing の
@@ -8727,7 +8727,7 @@ mod tests {
         let dir = tmp("growable_reopen");
         {
             let mut eng = Engine::create_growable(&dir).unwrap();
-            eng.define_himo("score", HimoType::Number, 0);
+            eng.define_himo("score", ValueType::Number, 0);
             for i in 0..10u32 {
                 let e = eng.entity();
                 eng.tie(e, "score", i * 10);
@@ -8764,14 +8764,14 @@ mod tests {
                     let shared = e
                         .ensure_himo_dynamic(
                             &format!("dyn_shared_{}", i % 2),
-                            HimoType::Number,
+                            ValueType::Number,
                             0,
                         )
                         .unwrap();
                     let own = e
                         .ensure_himo_dynamic(
                             &format!("dyn_own_{}_{}", t, i),
-                            HimoType::Number,
+                            ValueType::Number,
                             0,
                         )
                         .unwrap();
@@ -8808,13 +8808,13 @@ mod tests {
 
         // 定義済み名の再呼び出しは lock-free fast path で同 hid
         let again = eng
-            .ensure_himo_dynamic("dyn_shared_0", HimoType::Number, 0)
+            .ensure_himo_dynamic("dyn_shared_0", ValueType::Number, 0)
             .unwrap();
         assert_eq!(again, shared_by_name[&0]);
 
         // 動的定義した himo で tie_to_by_id / get_by_id round-trip
         let hid = eng
-            .ensure_himo_dynamic("dyn_roundtrip", HimoType::Number, 0)
+            .ensure_himo_dynamic("dyn_roundtrip", ValueType::Number, 0)
             .unwrap();
         let e0 = eng.entity();
         eng.tie_to_by_id(e0, hid, 42);
@@ -8833,11 +8833,11 @@ mod tests {
         let eng = std::sync::Arc::new(eng);
 
         let hid = eng
-            .ensure_himo_dynamic_in("users", "age", HimoType::Number, 0)
+            .ensure_himo_dynamic_in("users", "age", ValueType::Number, 0)
             .unwrap();
         // idempotent: 2 回目は同 hid
         let hid2 = eng
-            .ensure_himo_dynamic_in("users", "age", HimoType::Number, 0)
+            .ensure_himo_dynamic_in("users", "age", ValueType::Number, 0)
             .unwrap();
         assert_eq!(hid, hid2);
         // full name で引ける + table attach 済み
@@ -8848,7 +8848,7 @@ mod tests {
 
         // 未定義 table は Err
         assert!(eng
-            .ensure_himo_dynamic_in("nope", "x", HimoType::Number, 0)
+            .ensure_himo_dynamic_in("nope", "x", ValueType::Number, 0)
             .is_err());
 
         let _ = std::fs::remove_file(&dir);

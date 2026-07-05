@@ -14,7 +14,7 @@ use crate::cylinder_v27::BucketCylinder;
 use crate::region::Region;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum HimoType {
+pub enum ValueType {
     /// 共有タグ — Vocabulary を引く (dedupe あり)。複数 entity が同じ tag を共有する hub。
     Tag = 0,
     /// タグなし — u32 をそのまま値として扱う。inline 数値・eid 等。
@@ -25,7 +25,7 @@ pub enum HimoType {
     Leaf = 3,
 }
 
-impl HimoType {
+impl ValueType {
     pub fn from_byte(b: u8) -> Self {
         match b {
             0 => Self::Tag,
@@ -52,7 +52,7 @@ use std::sync::RwLock;
 pub struct HimoStore {
     col: UnsafeCell<Column>,
     cyl: RwLock<BucketCylinder>,
-    pub himo_type: HimoType,
+    pub value_type: ValueType,
     /// 初期 bucket サイズのヒント。0 は「ヒントなし、必要時に拡張」。
     /// 実際の値制限ではない。value > max_values でも tie 可能(BucketCylinder が動的拡張)。
     pub max_values: u32,
@@ -68,14 +68,14 @@ unsafe impl Sync for HimoStore {}
 unsafe impl Send for HimoStore {}
 
 impl HimoStore {
-    pub fn init(col_region: Region, ht: HimoType, max_values: u32, max_entities: u32) -> Self {
+    pub fn init(col_region: Region, ht: ValueType, max_values: u32, max_entities: u32) -> Self {
         let col = Column::init(col_region, 4, max_entities);
         // max_values == 0 は「ヒントなし」。bucket を空で作って必要時に拡張。
         let cyl = BucketCylinder::new(max_values, max_entities);
         Self {
             col: UnsafeCell::new(col),
             cyl: RwLock::new(cyl),
-            himo_type: ht,
+            value_type: ht,
             max_values,
             unique_count: AtomicU32::new(0),
             // 新規 column は空なので rebuild 不要、 即 built 状態。
@@ -87,14 +87,14 @@ impl HimoStore {
     /// per-himo に column 全 eid を走査していた。 himo 数 × entity 数で reopen latency
     /// が膨らむのを避けるため、 cylinder は空のまま返し、 最初の cyl 触りで
     /// `ensure_cylinder_built` 経由で rebuild する。
-    pub fn load(col_region: Region, ht: HimoType, max_values: u32) -> Self {
+    pub fn load(col_region: Region, ht: ValueType, max_values: u32) -> Self {
         let col = Column::load(col_region);
         let max_entities = col.max_entities;
         let cyl = BucketCylinder::new(max_values, max_entities);
         Self {
             col: UnsafeCell::new(col),
             cyl: RwLock::new(cyl),
-            himo_type: ht,
+            value_type: ht,
             max_values,
             // unique_count は cyl built 後に正しい値が入る。 build 前に
             // `unique_count()` を呼ばれる経路があったら ensure_cylinder_built 経由で

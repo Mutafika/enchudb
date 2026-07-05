@@ -4,7 +4,7 @@
 //! let path = format!("/tmp/enchudb-doc-{}.db", std::process::id());
 //! let _ = std::fs::remove_file(&path);
 //! let mut db = enchudb_engine::Engine::create_standalone(&path).unwrap();
-//! db.define_himo("age", enchudb_engine::HimoType::Number, 100);
+//! db.define_himo("age", enchudb_engine::ValueType::Number, 100);
 //! let e = db.entity();
 //! db.tie(e, "age", 30);
 //! db.tie_text(e, "city", "東京");
@@ -46,7 +46,7 @@ pub mod blob_store;
 
 pub use engine::{Engine, EntityValue, SnapshotFiles, AuditFilter};
 pub use engine::EngineStats;
-pub use himo_store::HimoType;
+pub use himo_store::ValueType;
 pub use cas::{CASStore, BlockHash};
 pub use ravn::{Ravn, RavnResult};
 

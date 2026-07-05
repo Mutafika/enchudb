@@ -41,7 +41,7 @@ fn remote_tie_apply_advances_next_local() {
     // create + define + spawn consumer
     let mut eng = Engine::create_growable_with_capacity(&path, 65_536).unwrap();
     eng.define_table("articles", 10_000).unwrap();
-    eng.define_himo_in("articles", "url", enchudb_engine::HimoType::Tag, 0).unwrap();
+    eng.define_himo_in("articles", "url", enchudb_engine::ValueType::Tag, 0).unwrap();
     let eng = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(0x10000001); // self
     eng.set_gossip_remote_apply(false);

@@ -21,7 +21,7 @@
 use crate::{Chunk, Error, Hit, Meta, MetaValue, Query, HybridQuery, Result};
 use crate::bm25::{Bm25Index, rrf_fuse};
 use crate::distance::Metric;
-use enchudb::{Engine, HimoType};
+use enchudb::{Engine, ValueType};
 use enchudb_oplog::EntityId;
 use memmap2::MmapMut;
 use std::fs::{File, OpenOptions};
@@ -31,7 +31,7 @@ const VEC_MAGIC: &[u8; 4] = b"ERV1";
 const VEC_HEADER_SIZE: usize = 16;
 const TEXT_KEY: &str = "__text";
 
-/// ユーザー定義メタフィールドの型。enchudb の HimoType に 1:1 マップ。
+/// ユーザー定義メタフィールドの型。enchudb の ValueType に 1:1 マップ。
 #[derive(Clone, Copy, Debug)]
 pub enum MetaType {
     /// 整数値（例: tenant_id、date）。
@@ -43,11 +43,11 @@ pub enum MetaType {
 }
 
 impl MetaType {
-    fn to_himo(self) -> HimoType {
+    fn to_himo(self) -> ValueType {
         match self {
-            MetaType::Value => HimoType::Number,
-            MetaType::Symbol => HimoType::Tag,
-            MetaType::Ref => HimoType::Ref,
+            MetaType::Value => ValueType::Number,
+            MetaType::Symbol => ValueType::Tag,
+            MetaType::Ref => ValueType::Ref,
         }
     }
 }

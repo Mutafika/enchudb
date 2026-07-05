@@ -5,7 +5,7 @@
 //! free_locals (= 解放 local id の reservoir) を持たせ、 entity_in は free list
 //! 優先で payout、 reclaim 時に free list に push、 という形で ring buffer 化。
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,7 +36,7 @@ fn reclaim_pushes_local_id_to_free_list() {
 
     let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
     eng.define_table("notes", 1000).unwrap();
-    eng.define_himo_in("notes", "note", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
     eng.enable_sync_tables().unwrap();
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
 
@@ -73,7 +73,7 @@ fn entity_in_reuses_freed_locals_after_reclaim() {
     // 小さい _sync_ops 容量で「次の entity_in が free list を使う」 ことを確認
     let mut eng = Engine::create_with_capacity(&path, 8192).unwrap();
     eng.define_table("notes", 100).unwrap();
-    eng.define_himo_in("notes", "note", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
     eng.enable_sync_tables().unwrap();
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
 
@@ -119,7 +119,7 @@ fn long_cycle_does_not_exhaust_eid_range() {
     // 「sync_ops 容量を超えても回る」 は別の test (= 飽和 case が必要なら別途)。
     let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
     eng.define_table("notes", 600).unwrap();
-    eng.define_himo_in("notes", "note", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
     eng.enable_sync_tables().unwrap();
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
 

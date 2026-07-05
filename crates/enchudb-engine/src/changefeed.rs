@@ -27,7 +27,7 @@
 //!
 //! ```
 //! use std::sync::{Arc, Mutex};
-//! use enchudb_engine::{Engine, HimoType};
+//! use enchudb_engine::{Engine, ValueType};
 //! use enchudb_engine::changefeed::ChangeListener;
 //! use enchudb_engine::transport::WireRecord;
 //!
@@ -43,7 +43,7 @@
 //! # let _ = std::fs::remove_file(format!("{}.oplog", path));
 //! {
 //!     let mut eng = Engine::create_standalone(&path).unwrap();
-//!     eng.define_himo("v", HimoType::Number, 100);
+//!     eng.define_himo("v", ValueType::Number, 100);
 //!     eng.flush().unwrap();
 //! }
 //! let eng = Engine::open_concurrent_with_oplog(&path, 4 * 1024 * 1024).unwrap();

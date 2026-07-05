@@ -8,7 +8,7 @@
 //! (= 100k) を持つ、 table-aware なら各 himo の positions は table 内
 //! 10k に収まる。 数値計測は bench 側に任せる。
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 
 fn tmp_path(tag: &str) -> String {
     format!(
@@ -41,7 +41,7 @@ fn sns_workload_10_tables_5_himos_each() {
         eng.define_table(&tname, 10_000).unwrap();
         for h in 0..5 {
             let hname = format!("h{}", h);
-            eng.define_himo_in(&tname, &hname, HimoType::Number, 100).unwrap();
+            eng.define_himo_in(&tname, &hname, ValueType::Number, 100).unwrap();
         }
     }
 
@@ -98,8 +98,8 @@ fn sns_workload_with_fk_refs() {
     eng.define_table("post", 5_000).unwrap();
     eng.define_table("like", 20_000).unwrap();
 
-    eng.define_himo_in("user", "name", HimoType::Number, 1000).unwrap();
-    eng.define_himo_in("post", "body", HimoType::Number, 1000).unwrap();
+    eng.define_himo_in("user", "name", ValueType::Number, 1000).unwrap();
+    eng.define_himo_in("post", "body", ValueType::Number, 1000).unwrap();
     eng.define_ref_in("post", "author", "user").unwrap();
     eng.define_ref_in("like", "from", "user").unwrap();
     eng.define_ref_in("like", "to", "post").unwrap();
@@ -163,7 +163,7 @@ fn sns_reopen_preserves_full_schema() {
             eng.define_table(&tname, 10_000).unwrap();
             for h in 0..3 {
                 let hname = format!("col{}", h);
-                eng.define_himo_in(&tname, &hname, HimoType::Number, 100).unwrap();
+                eng.define_himo_in(&tname, &hname, ValueType::Number, 100).unwrap();
             }
         }
         // Ref を 1 個追加

@@ -17,7 +17,7 @@
 
 use enchudb_engine::engine::Engine;
 use enchudb_engine::transport::{InMemoryTransport, Transport};
-use enchudb_engine::HimoType;
+use enchudb_engine::ValueType;
 use enchudb_oplog::{eid_local, Hlc, PeerId};
 use enchudb_sync::Syncer;
 use std::sync::Arc;
@@ -48,7 +48,7 @@ fn make_engine(path: &str, peer: PeerId) -> Arc<Engine> {
     cleanup(path);
     let mut eng = Engine::create_with_capacity(path, 65_536).unwrap();
     eng.define_table("notes", 1000).unwrap();
-    eng.define_himo_in("notes", "note", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
     eng.enable_sync_tables().unwrap();
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(peer);
@@ -209,9 +209,9 @@ fn cross_peer_ref_value_is_translated() {
         cleanup(path);
         let mut eng = Engine::create_with_capacity(path, 65_536).unwrap();
         eng.define_table("companies", 1000).unwrap();
-        eng.define_himo_in("companies", "cid", HimoType::Number, 0).unwrap();
+        eng.define_himo_in("companies", "cid", ValueType::Number, 0).unwrap();
         eng.define_table("users", 1000).unwrap();
-        eng.define_himo_in("users", "uid", HimoType::Number, 0).unwrap();
+        eng.define_himo_in("users", "uid", ValueType::Number, 0).unwrap();
         eng.define_ref_in("users", "company", "companies").unwrap();
         eng.enable_sync_tables().unwrap();
         let eng: Arc<Engine> =

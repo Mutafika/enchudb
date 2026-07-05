@@ -7,7 +7,7 @@
 
 #![cfg(feature = "v27")]
 
-use enchudb::{Engine, HimoType};
+use enchudb::{Engine, ValueType};
 use std::sync::Arc;
 
 fn tmp(name: &str) -> String {
@@ -31,10 +31,10 @@ fn max_himos_limit() {
     let path = tmp("max_himos_limit");
     let mut eng = Engine::create_full(&path, 1024, None, Some(16), None).unwrap();
     for i in 0..16 {
-        eng.define_himo(&format!("h{}", i), HimoType::Number, 4);
+        eng.define_himo(&format!("h{}", i), ValueType::Number, 4);
     }
     // 17 本目 → panic
-    eng.define_himo("overflow", HimoType::Number, 4);
+    eng.define_himo("overflow", ValueType::Number, 4);
 }
 
 /// `define_himo("x", Value, 10)` に対して value=9 は OK。
@@ -44,7 +44,7 @@ fn max_himos_limit() {
 fn max_values_boundary() {
     let path = tmp("max_values_boundary");
     let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("x", HimoType::Number, 10);
+    eng.define_himo("x", ValueType::Number, 10);
 
     let e9 = eng.entity();
     let e10 = eng.entity();
@@ -95,7 +95,7 @@ fn empty_db_query() {
 fn zero_value_tie() {
     let path = tmp("zero_value_tie");
     let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("x", HimoType::Number, 4);
+    eng.define_himo("x", ValueType::Number, 4);
 
     let e = eng.entity();
     eng.tie(e, "x", 0);
@@ -115,7 +115,7 @@ fn zero_value_tie() {
 fn tie_large_value_expands_buckets() {
     let path = tmp("large_value_expand");
     let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("x", HimoType::Number, 10); // ヒント 10
+    eng.define_himo("x", ValueType::Number, 10); // ヒント 10
     let e = eng.entity();
     eng.tie(e, "x", 100_000);
     assert_eq!(eng.get(e, "x"), Some(100_000));
@@ -155,7 +155,7 @@ fn max_value_panics() {
 fn delete_then_recreate_entity() {
     let path = tmp("del_recreate");
     let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("x", HimoType::Number, 4);
+    eng.define_himo("x", ValueType::Number, 4);
 
     let e0 = eng.entity();
     eng.tie(e0, "x", 3);
@@ -179,8 +179,8 @@ fn delete_then_recreate_entity() {
 fn untie_all_himos_from_entity() {
     let path = tmp("untie_all");
     let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("a", HimoType::Number, 4);
-    eng.define_himo("b", HimoType::Number, 4);
+    eng.define_himo("a", ValueType::Number, 4);
+    eng.define_himo("b", ValueType::Number, 4);
 
     let e = eng.entity();
     eng.tie(e, "a", 1);
@@ -202,7 +202,7 @@ fn untie_all_himos_from_entity() {
 fn double_delete() {
     let path = tmp("double_delete");
     let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("x", HimoType::Number, 4);
+    eng.define_himo("x", ValueType::Number, 4);
     let e = eng.entity();
     eng.tie(e, "x", 1);
 
@@ -219,7 +219,7 @@ fn double_delete() {
 fn delete_unknown_entity() {
     let path = tmp("delete_unknown");
     let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("x", HimoType::Number, 4);
+    eng.define_himo("x", ValueType::Number, 4);
 
     // 一度も entity() を呼んでないので 999 は未作成
     eng.delete(999);
@@ -247,11 +247,11 @@ fn value_then_text_same_himo() {
 
     // 最初は Value 型として作成
     eng.tie(e1, "x", 42);
-    assert!(matches!(eng.himo_type("x"), Some(HimoType::Number)));
+    assert!(matches!(eng.value_type("x"), Some(ValueType::Number)));
 
     // release build: 型混在は silent に通る(debug_assert が発火しない)
     eng.tie_text(e2, "x", "hello");
-    assert!(matches!(eng.himo_type("x"), Some(HimoType::Number)));
+    assert!(matches!(eng.value_type("x"), Some(ValueType::Number)));
 
     // get_text は Symbol 型でないので None を返す
     assert_eq!(eng.get_text(e2, "x"), None);
@@ -300,7 +300,7 @@ fn persist_then_modify() {
     // フェーズ 1: 初期データ
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
-        eng.define_himo("x", HimoType::Number, 100);
+        eng.define_himo("x", ValueType::Number, 100);
         let e0 = eng.entity();
         eng.tie(e0, "x", 10);
         assert_eq!(e0, 0);
@@ -388,7 +388,7 @@ fn concurrentize_with_empty() {
 fn concurrentize_basic_lifecycle() {
     let path = tmp("concurrent_basic");
     let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("x", HimoType::Number, 16);
+    eng.define_himo("x", ValueType::Number, 16);
     let arc: Arc<Engine> = Engine::concurrentize(eng);
 
     let e = arc.entity();
@@ -410,7 +410,7 @@ fn concurrentize_basic_lifecycle() {
 fn test_dynamic_bucket_expansion() {
     let path = tmp("dyn_bucket_expand");
     let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("x", HimoType::Number, 10);
+    eng.define_himo("x", ValueType::Number, 10);
     let e = eng.entity();
     eng.tie(e, "x", 1000);
     let pulled = eng.pull_raw("x", 1000);
@@ -427,7 +427,7 @@ fn test_dynamic_bucket_expansion() {
 fn test_unique_count_basic() {
     let path = tmp("uniq_count_basic");
     let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("k", HimoType::Number, 100);
+    eng.define_himo("k", ValueType::Number, 100);
     assert_eq!(eng.himo_cardinality("k"), Some(0));
 
     let e1 = eng.entity();
@@ -459,7 +459,7 @@ fn test_unique_count_basic() {
 fn test_unique_count_with_replace() {
     let path = tmp("uniq_count_replace");
     let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("k", HimoType::Number, 10);
+    eng.define_himo("k", ValueType::Number, 10);
     let e1 = eng.entity();
     let e2 = eng.entity();
 
@@ -483,7 +483,7 @@ fn test_himo_cardinality_api() {
     let path = tmp("card_api");
     let mut eng = Engine::create_standalone(&path).unwrap();
     assert_eq!(eng.himo_cardinality("unknown"), None);
-    eng.define_himo("k", HimoType::Number, 4);
+    eng.define_himo("k", ValueType::Number, 4);
     assert_eq!(eng.himo_cardinality("k"), Some(0));
     let e = eng.entity();
     eng.tie(e, "k", 0);

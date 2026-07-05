@@ -6,7 +6,7 @@
 //!
 //! 実行: `cargo run --release --example par_scan_bench`
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 use std::time::Instant;
 
 const N: u32 = 12_000_000; // 12M row scan
@@ -52,8 +52,8 @@ fn main() {
     let t = Instant::now();
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_table("t", N).unwrap();
-    eng.define_himo_in("t", "val", HimoType::Number, 0).unwrap();
-    eng.define_himo_in("t", "dept", HimoType::Tag, 0).unwrap();
+    eng.define_himo_in("t", "val", ValueType::Number, 0).unwrap();
+    eng.define_himo_in("t", "dept", ValueType::Tag, 0).unwrap();
     let depts = ["a", "b", "c", "d", "e", "f", "g", "h"];
     for i in 0..N {
         let e = eng.entity_in("t").unwrap();

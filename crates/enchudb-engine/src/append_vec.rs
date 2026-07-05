@@ -1,6 +1,6 @@
 //! `AppendVec<T>`: 固定 capacity・append-only・lock-free read の Vec 代替。
 //!
-//! `Engine` の himo 並列配列 (`himos` / `himo_names` / `himo_types` /
+//! `Engine` の himo 並列配列 (`himos` / `himo_names` / `value_types` /
 //! `himo_max_values` / `himo_to_table`) を `&self` から定義追加できるようにする
 //! ための内部構造 (himo dynamic definition, 0.9.0)。
 //!

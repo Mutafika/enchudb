@@ -32,7 +32,7 @@
 //!   並行で走ると数字が壊れる。
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
-use enchudb::{AuditFilter, Engine, HimoType};
+use enchudb::{AuditFilter, Engine, ValueType};
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,7 +74,7 @@ fn bench_tie(c: &mut Criterion) {
     // ±4x の system 揺れを受けていた。 1 eid を pre-allocate して reuse する。
     let path = tmp("tie_plain");
     let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("v", HimoType::Number, 100);
+    eng.define_himo("v", ValueType::Number, 100);
     let eid = eng.entity();
 
     let mut group = c.benchmark_group("tie");
@@ -102,7 +102,7 @@ fn bench_pull_raw(c: &mut Criterion) {
     // 事前に 10k entity を書いて rebuild、pull_raw 自体だけ計測
     let path = tmp("pull_raw");
     let mut eng = Engine::create_with_capacity(&path, 100_000).unwrap();
-    eng.define_himo("age", HimoType::Number, 100);
+    eng.define_himo("age", ValueType::Number, 100);
     for i in 0..10_000u32 {
         let e = eng.entity();
         eng.tie(e, "age", i % 100);
@@ -134,8 +134,8 @@ fn bench_pull_raw(c: &mut Criterion) {
 fn bench_query(c: &mut Criterion) {
     let path = tmp("query");
     let mut eng = Engine::create_with_capacity(&path, 100_000).unwrap();
-    eng.define_himo("age", HimoType::Number, 100);
-    eng.define_himo("dept", HimoType::Number, 20);
+    eng.define_himo("age", ValueType::Number, 100);
+    eng.define_himo("dept", ValueType::Number, 20);
     for i in 0..10_000u32 {
         let e = eng.entity();
         eng.tie(e, "age", i % 100);
@@ -173,7 +173,7 @@ fn bench_snapshot_export(c: &mut Criterion) {
     let path = tmp("snap_src");
     {
         let mut eng = Engine::create_with_capacity(&path, 2_000).unwrap();
-        eng.define_himo("v", HimoType::Number, 100);
+        eng.define_himo("v", ValueType::Number, 100);
         for i in 0..1_000u32 {
             let e = eng.entity();
             eng.tie(e, "v", i % 100);
@@ -220,7 +220,7 @@ fn bench_audit(c: &mut Criterion) {
     let path = tmp("audit");
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
-        eng.define_himo("v", HimoType::Number, 100);
+        eng.define_himo("v", ValueType::Number, 100);
         eng.flush().unwrap();
     }
     let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
@@ -257,7 +257,7 @@ fn bench_tie_async(c: &mut Criterion) {
     let path = tmp("tie_async");
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
-        eng.define_himo("v", HimoType::Number, 100);
+        eng.define_himo("v", ValueType::Number, 100);
         eng.flush().unwrap();
     }
     let eng: Arc<Engine> =
@@ -304,7 +304,7 @@ fn bench_scale(c: &mut Criterion) {
     // 10 table 相当 × 5 himo
     for t in 0..10 {
         for h in 0..5 {
-            eng.define_himo(&format!("t{}_h{}", t, h), HimoType::Number, 100);
+            eng.define_himo(&format!("t{}_h{}", t, h), ValueType::Number, 100);
         }
     }
 
@@ -402,7 +402,7 @@ fn bench_scale_tables(c: &mut Criterion) {
         eng.define_table(&tname, 10_000).unwrap();
         for h in 0..5 {
             let hname = format!("h{}", h);
-            eng.define_himo_in(&tname, &hname, HimoType::Number, 100).unwrap();
+            eng.define_himo_in(&tname, &hname, ValueType::Number, 100).unwrap();
         }
     }
     for t in 0..10 {

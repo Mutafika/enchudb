@@ -12,7 +12,7 @@
 use enchudb::changefeed::ChangeListener;
 use enchudb::transport::WireRecord;
 use enchudb_oplog::oplog::DecodedOp;
-use enchudb::{Engine, HimoType};
+use enchudb::{Engine, ValueType};
 use std::sync::{Arc, Mutex};
 
 fn tmp(tag: &str) -> String {
@@ -41,7 +41,7 @@ fn prepare_wal_engine(tag: &str) -> (String, Arc<Engine>) {
     let path = tmp(tag);
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
-        eng.define_himo("v", HimoType::Number, 100);
+        eng.define_himo("v", ValueType::Number, 100);
         eng.flush().unwrap();
     }
     let eng = Engine::open_concurrent_with_oplog(&path, 8 * 1024 * 1024).unwrap();
@@ -187,7 +187,7 @@ fn listener_does_not_fire_on_engine_without_oplog() {
     // WAL 無し engine では fire しない(create 直 + add で何も起きないこと)
     let path = tmp("no_wal");
     let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("v", HimoType::Number, 100);
+    eng.define_himo("v", ValueType::Number, 100);
     let eng = Arc::new(eng);
     // Note: add_change_listener は &self だが Arc<Engine> なので使える
     let sink = Arc::new(CollectSink::default());

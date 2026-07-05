@@ -7,7 +7,7 @@
 //!  - 書き込み後 `body_msync` → 再度 `body_msync` で 2 回目が clean (no-op)
 //! の最低限の整合性のみテスト。 perf は本 test では確認しない (CI 不安定化回避)。
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 use std::sync::Arc;
 
 #[test]
@@ -23,8 +23,8 @@ fn body_msync_handles_dirty_range_correctly() {
 
     {
         let eng_mut = unsafe { &mut *(Arc::as_ptr(&eng) as *mut Engine) };
-        eng_mut.define_himo("marker", HimoType::Tag, 100);
-        eng_mut.define_himo("value", HimoType::Tag, 1_000_000);
+        eng_mut.define_himo("marker", ValueType::Tag, 100);
+        eng_mut.define_himo("value", ValueType::Tag, 1_000_000);
     }
     let marker_hid = eng.himo_id("marker").unwrap() as u16;
     let value_hid = eng.himo_id("value").unwrap() as u16;
@@ -59,7 +59,7 @@ fn oplog_sync_with_dirty_range() {
 
     {
         let eng_mut = unsafe { &mut *(Arc::as_ptr(&eng) as *mut Engine) };
-        eng_mut.define_himo("k", HimoType::Tag, 100);
+        eng_mut.define_himo("k", ValueType::Tag, 100);
     }
     let k_hid = eng.himo_id("k").unwrap() as u16;
 

@@ -6,7 +6,7 @@
 //!   group_sum_range_par / group_min_range_par / group_max_range_par /
 //!   range_scan_par / histogram_range_par
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 
 /// 並列実行が起きる閾値 (= engine 側の `PAR_RANGE_THRESHOLD` と同値)。
 const PAR_THRESHOLD: u32 = 64_000;
@@ -34,8 +34,8 @@ fn cleanup(path: &str) {
 fn build_large_db(path: &str, n: u32) -> (Engine, u32, u32) {
     let mut eng = Engine::create_standalone(path).unwrap();
     eng.define_table("t", n).unwrap();
-    eng.define_himo_in("t", "val", HimoType::Number, 0).unwrap();
-    eng.define_himo_in("t", "dept", HimoType::Tag, 0).unwrap();
+    eng.define_himo_in("t", "val", ValueType::Number, 0).unwrap();
+    eng.define_himo_in("t", "dept", ValueType::Tag, 0).unwrap();
     let depts = ["a", "b", "c", "d", "e", "f", "g", "h"];
     for i in 0..n {
         let e = eng.entity_in("t").unwrap();
@@ -52,8 +52,8 @@ fn build_small_db(path: &str) -> (Engine, u32, u32) {
     let n = 100;
     let mut eng = Engine::create_standalone(path).unwrap();
     eng.define_table("t", n).unwrap();
-    eng.define_himo_in("t", "val", HimoType::Number, 0).unwrap();
-    eng.define_himo_in("t", "dept", HimoType::Tag, 0).unwrap();
+    eng.define_himo_in("t", "val", ValueType::Number, 0).unwrap();
+    eng.define_himo_in("t", "dept", ValueType::Tag, 0).unwrap();
     let depts = ["a", "b", "c"];
     for i in 0..n {
         let e = eng.entity_in("t").unwrap();

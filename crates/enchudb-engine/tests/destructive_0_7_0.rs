@@ -6,7 +6,7 @@
 //! 4. transfer 冪等性 + ack 未来値 (= 危険入力で reclaim が暴走しない)
 //! 5. stress: 10k row insert → transfer → reclaim 1 cycle (= leak しない)
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 use std::sync::Arc;
 
 fn tmp_path(tag: &str) -> String {
@@ -42,7 +42,7 @@ fn oplog_tail_garbage_is_dropped_on_reopen() {
     {
         let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
         eng.define_table("notes", 1000).unwrap();
-        eng.define_himo_in("notes", "note", HimoType::Number, 0).unwrap();
+        eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
         let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
         for i in 1u32..=5 {
             let e = eng.entity_in("notes").unwrap();
@@ -88,7 +88,7 @@ fn oplog_truncation_mid_record_recovers() {
     {
         let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
         eng.define_table("notes", 1000).unwrap();
-        eng.define_himo_in("notes", "note", HimoType::Number, 0).unwrap();
+        eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
         let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
         for i in 1u32..=10 {
             let e = eng.entity_in("notes").unwrap();
@@ -167,7 +167,7 @@ fn readonly_open_succeeds_alongside_writer() {
 
     let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
     eng.define_table("notes", 1000).unwrap();
-    eng.define_himo_in("notes", "note", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
     let e = eng.entity_in("notes").unwrap();
     eng.tie_to(e, "notes.note", 42u32);
     eng.flush_writes();
@@ -217,7 +217,7 @@ fn entity_in_returns_err_when_table_eid_range_exhausted() {
 
     let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
     eng.define_table("tiny", 4).unwrap();  // 4 row しか入らない table
-    eng.define_himo_in("tiny", "v", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("tiny", "v", ValueType::Number, 0).unwrap();
 
     // 4 件は OK
     for _ in 0..4 {
@@ -242,7 +242,7 @@ fn ack_with_future_lsn_does_not_corrupt_reclaim() {
 
     let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
     eng.define_table("notes", 1000).unwrap();
-    eng.define_himo_in("notes", "note", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
     eng.enable_sync_tables().unwrap();
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
 
@@ -281,7 +281,7 @@ fn transfer_after_reclaim_continues_lsn_monotonically() {
 
     let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
     eng.define_table("notes", 1000).unwrap();
-    eng.define_himo_in("notes", "note", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
     eng.enable_sync_tables().unwrap();
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
 
@@ -327,7 +327,7 @@ fn stress_10k_cycle() {
 
     let mut eng = Engine::create_with_capacity(&path, 128_000).unwrap();
     eng.define_table("rows", 50_000).unwrap();
-    eng.define_himo_in("rows", "v", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("rows", "v", ValueType::Number, 0).unwrap();
     eng.enable_sync_tables().unwrap();
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 64 * 1024 * 1024).unwrap();
 

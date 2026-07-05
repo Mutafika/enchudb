@@ -202,7 +202,7 @@ pub enum OwnedOp {
     Commit,
     Vocab { vid: u32, bytes: Vec<u8> },
     /// 0.9.0: himo を full name で運ぶ Tie (content 互換層用)。
-    /// `himo_kind` は HimoType の生 u8 (受信側の ensure 用)。
+    /// `himo_kind` は ValueType の生 u8 (受信側の ensure 用)。
     TieNamed { eid: u64, himo_name: String, himo_kind: u8, value: u32 },
 }
 

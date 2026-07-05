@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use enchudb::{Engine, HimoType};
+use enchudb::{Engine, ValueType};
 use enchudb_oplog::Hlc;
 use enchudb::sync::Syncer;
 use enchudb::transport::{Transport, WireRecord};
@@ -260,13 +260,13 @@ fn cmd_schema(opts: &HashMap<String, String>) {
 
     let ht = match type_str.as_str() {
         // 新名 (推奨)
-        "number" => HimoType::Number,
-        "tag" => HimoType::Tag,
-        "leaf" => HimoType::Leaf,
-        "ref" => HimoType::Ref,
+        "number" => ValueType::Number,
+        "tag" => ValueType::Tag,
+        "leaf" => ValueType::Leaf,
+        "ref" => ValueType::Ref,
         // 旧名エイリアス (後方互換)
-        "value" => HimoType::Number,
-        "symbol" => HimoType::Tag,
+        "value" => ValueType::Number,
+        "symbol" => ValueType::Tag,
         other => {
             eprintln!("invalid --type={}, expected number|tag|leaf|ref (legacy: value|symbol)", other);
             std::process::exit(1);

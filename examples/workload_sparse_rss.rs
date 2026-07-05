@@ -17,7 +17,7 @@
 //! Usage:
 //!   cargo run --release --example workload_sparse_rss [N=5000000]
 
-use enchudb::{Engine, HimoType};
+use enchudb::{Engine, ValueType};
 use std::time::Instant;
 
 fn rss_mb() -> u64 {
@@ -58,13 +58,13 @@ fn main() {
     snap("baseline", t0);
 
     let mut eng = Engine::create_growable_with_capacity(path, n + 100).unwrap();
-    eng.define_himo("tenant", HimoType::Number, 10);
-    eng.define_himo("dept",   HimoType::Number, 8);
-    eng.define_himo("role",   HimoType::Number, 4);
-    eng.define_himo("status", HimoType::Number, 5);
-    eng.define_himo("year",   HimoType::Number, 5);
-    eng.define_himo("salary", HimoType::Number, 1000);
-    eng.define_himo("age",    HimoType::Number, 60);
+    eng.define_himo("tenant", ValueType::Number, 10);
+    eng.define_himo("dept",   ValueType::Number, 8);
+    eng.define_himo("role",   ValueType::Number, 4);
+    eng.define_himo("status", ValueType::Number, 5);
+    eng.define_himo("year",   ValueType::Number, 5);
+    eng.define_himo("salary", ValueType::Number, 1000);
+    eng.define_himo("age",    ValueType::Number, 60);
     snap("after define_himo x 7", t0);
 
     // sparse pattern: 各 entity は (eid % 7) を起点に 3 個の himo を tie。

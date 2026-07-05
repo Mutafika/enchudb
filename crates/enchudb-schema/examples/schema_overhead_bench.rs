@@ -11,7 +11,7 @@
 //!  - 2 と 4 は完全に同等 (schema は build 時 transpiler、 runtime overhead 0)
 //!  - 2/4 < 1/3 by 数 ns/op (linear search 分)
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 use enchudb_schema::{Database, Value};
 use std::time::Instant;
 
@@ -33,9 +33,9 @@ fn main() {
 
     // ──── raw 構築 ────
     let mut eng = Engine::create_standalone(raw_path).unwrap();
-    eng.define_himo("user_id", HimoType::Number, N);
-    eng.define_himo("dept_id", HimoType::Number, DEPTS);
-    eng.define_himo("salary",  HimoType::Number, 800_000);
+    eng.define_himo("user_id", ValueType::Number, N);
+    eng.define_himo("dept_id", ValueType::Number, DEPTS);
+    eng.define_himo("salary",  ValueType::Number, 800_000);
     let user_hid_r = eng.himo_id("user_id").unwrap() as u16;
     let dept_hid_r = eng.himo_id("dept_id").unwrap() as u16;
     let _sal_hid_r = eng.himo_id("salary").unwrap() as u16;

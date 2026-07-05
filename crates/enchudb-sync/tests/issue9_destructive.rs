@@ -2,7 +2,7 @@
 
 use enchudb_engine::engine::Engine;
 use enchudb_engine::transport::{InMemoryTransport, Transport, WireRecord};
-use enchudb_engine::HimoType;
+use enchudb_engine::ValueType;
 use enchudb_oplog::oplog::DecodedOp;
 use enchudb_oplog::{eid_local, make_eid, Hlc, PeerId};
 use enchudb_sync::Syncer;
@@ -31,7 +31,7 @@ fn make_engine(path: &str, peer: PeerId) -> Arc<Engine> {
     cleanup(path);
     let mut eng = Engine::create_with_capacity(path, 65_536).unwrap();
     eng.define_table("notes", 1000).unwrap();
-    eng.define_himo_in("notes", "note", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
     eng.enable_sync_tables().unwrap();
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(peer);

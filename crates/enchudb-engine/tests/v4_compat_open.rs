@@ -13,7 +13,7 @@
 //! 中身は実質同一。 step 2 以降で table data が v5 のみ存在する形になっても、
 //! v4 DB は "tables なし = anonymous のみ" として open される必要がある。
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 use std::io::{Read, Seek, SeekFrom, Write};
 
 const H_VERSION_OFFSET: u64 = 4;
@@ -85,7 +85,7 @@ fn v4_db_opens_via_legacy_path() {
     // 1. v5 で作る
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
-        eng.define_himo("age", HimoType::Number, 100);
+        eng.define_himo("age", ValueType::Number, 100);
         let e1 = eng.entity();
         let e2 = eng.entity();
         eng.tie(e1, "age", 30);
@@ -117,7 +117,7 @@ fn v4_db_gradual_migration_to_tables() {
     // 1. v5 で作って data 入れる
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
-        eng.define_himo("legacy_age", HimoType::Number, 100);
+        eng.define_himo("legacy_age", ValueType::Number, 100);
         let e = eng.entity();
         eng.tie(e, "legacy_age", 42);
         eng.flush().unwrap();
@@ -135,7 +135,7 @@ fn v4_db_gradual_migration_to_tables() {
 
         // 新 table を追加
         eng.define_table("users", 100).unwrap();
-        eng.define_himo_in("users", "age", HimoType::Number, 100).unwrap();
+        eng.define_himo_in("users", "age", ValueType::Number, 100).unwrap();
         let alice = eng.entity_in("users").unwrap();
         eng.tie(alice, "users.age", 30);
         eng.flush().unwrap();
@@ -164,7 +164,7 @@ fn unknown_version_is_rejected() {
     // v5 で作る
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
-        eng.define_himo("v", HimoType::Number, 10);
+        eng.define_himo("v", ValueType::Number, 10);
         eng.flush().unwrap();
     }
 

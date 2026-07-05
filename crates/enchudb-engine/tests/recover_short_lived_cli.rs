@@ -10,7 +10,7 @@
 //! - 既存 eid と新規 entity_in が衝突しない (= next_local + entities 復元)
 //! - 既存 eid の `is_live` 相当が true (= entities.live bitmap 復元)
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 
 fn tmp_path(tag: &str) -> String {
     format!(
@@ -40,7 +40,7 @@ fn reopen_after_concurrent_tie_recovers_himo_value() {
     // === build phase ===
     let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
     eng.define_table("notes", 1000).unwrap();
-    eng.define_himo_in("notes", "val", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "val", ValueType::Number, 0).unwrap();
     eng.flush().unwrap();
 
     // === concurrentize + 1 tie ===
@@ -69,7 +69,7 @@ fn reopen_after_concurrent_tie_advances_next_local() {
     // === build phase ===
     let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
     eng.define_table("notes", 1000).unwrap();
-    eng.define_himo_in("notes", "val", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "val", ValueType::Number, 0).unwrap();
     eng.flush().unwrap();
 
     // === concurrentize + 3 ties ===
@@ -114,7 +114,7 @@ fn persist_tables_api_works_under_arc() {
 
     let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
     eng.define_table("notes", 1000).unwrap();
-    eng.define_himo_in("notes", "val", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "val", ValueType::Number, 0).unwrap();
     eng.flush().unwrap();
 
     let eng = Engine::concurrentize_with_oplog(eng, 4 * 1024 * 1024).unwrap();

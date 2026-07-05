@@ -23,8 +23,8 @@ fn db_path(tag: &str) -> String {
 fn tenant_isolation_query() {
     let path = db_path("tenant_iso");
     let mut db = Engine::create_with_capacity(&path, 2_000).unwrap();
-    db.define_himo("tenant", HimoType::Number, 10);
-    db.define_himo("user_no", HimoType::Number, 1_000);
+    db.define_himo("tenant", ValueType::Number, 10);
+    db.define_himo("user_no", ValueType::Number, 1_000);
 
     // 5 tenant × 200 user = 1000 entity
     let mut by_tenant: Vec<Vec<u64>> = vec![Vec::new(); 5];
@@ -65,8 +65,8 @@ fn tenant_isolation_query() {
 fn region_hierarchy_navigation() {
     let path = db_path("region_hier");
     let mut db = Engine::create_standalone(&path).unwrap();
-    db.define_himo("name", HimoType::Tag, 0);
-    db.define_himo("parent", HimoType::Ref, 0);
+    db.define_himo("name", ValueType::Tag, 0);
+    db.define_himo("parent", ValueType::Ref, 0);
 
     // 国
     let japan = db.entity();
@@ -107,7 +107,7 @@ fn region_hierarchy_navigation() {
 fn reverse_lookup_children() {
     let path = db_path("reverse_children");
     let mut db = Engine::create_standalone(&path).unwrap();
-    db.define_himo("parent", HimoType::Ref, 0);
+    db.define_himo("parent", ValueType::Ref, 0);
 
     let kanto = db.entity();
     let kansai = db.entity();
@@ -159,7 +159,7 @@ fn reverse_lookup_children() {
 fn move_entity_between_parents() {
     let path = db_path("move_parent");
     let mut db = Engine::create_standalone(&path).unwrap();
-    db.define_himo("dept", HimoType::Ref, 0);
+    db.define_himo("dept", ValueType::Ref, 0);
 
     let dept_old = db.entity();
     let dept_new = db.entity();
@@ -187,7 +187,7 @@ fn move_entity_between_parents() {
 fn delete_parent_dangling_refs() {
     let path = db_path("dangling");
     let mut db = Engine::create_standalone(&path).unwrap();
-    db.define_himo("parent", HimoType::Ref, 0);
+    db.define_himo("parent", ValueType::Ref, 0);
 
     let parent = db.entity();
     let child_a = db.entity();
@@ -216,9 +216,9 @@ fn delete_parent_dangling_refs() {
 fn bulk_tie_consistency() {
     let path = db_path("bulk");
     let mut db = Engine::create_with_capacity(&path, 110_000).unwrap();
-    db.define_himo("a", HimoType::Number, 100);
-    db.define_himo("b", HimoType::Number, 50);
-    db.define_himo("c", HimoType::Number, 10);
+    db.define_himo("a", ValueType::Number, 100);
+    db.define_himo("b", ValueType::Number, 50);
+    db.define_himo("c", ValueType::Number, 10);
 
     let n = 100_000u32;
     for i in 0..n {
@@ -256,7 +256,7 @@ fn bulk_tie_consistency() {
 fn repeated_tie_untie() {
     let path = db_path("repeat");
     let mut db = Engine::create_standalone(&path).unwrap();
-    db.define_himo("flag", HimoType::Number, 8);
+    db.define_himo("flag", ValueType::Number, 8);
 
     let e = db.entity();
     for i in 0..1_000u32 {
@@ -299,8 +299,8 @@ fn delete_reuse_id() {
     // 容量を小さくして free stack 経由の再利用を強制する
     let path = db_path("reuse_id");
     let mut db = Engine::create_with_capacity(&path, 4).unwrap();
-    db.define_himo("kind", HimoType::Number, 4);
-    db.define_himo("val", HimoType::Number, 100);
+    db.define_himo("kind", ValueType::Number, 4);
+    db.define_himo("val", ValueType::Number, 100);
 
     let mut eids = Vec::new();
     for i in 0..4u32 {
@@ -342,7 +342,7 @@ fn delete_reuse_id() {
 fn cascade_delete_effect() {
     let path = db_path("cascade");
     let mut db = Engine::create_standalone(&path).unwrap();
-    db.define_himo("owner", HimoType::Ref, 0);
+    db.define_himo("owner", ValueType::Ref, 0);
 
     let owner = db.entity();
     let docs: Vec<u64> = (0..5).map(|_| {
@@ -375,8 +375,8 @@ fn cascade_delete_effect() {
 fn mixed_workload() {
     let path = db_path("mixed");
     let mut db = Engine::create_with_capacity(&path, 20_000).unwrap();
-    db.define_himo("group", HimoType::Number, 10);
-    db.define_himo("score", HimoType::Number, 100);
+    db.define_himo("group", ValueType::Number, 10);
+    db.define_himo("score", ValueType::Number, 100);
 
     // 1万 tie
     let mut all_eids: Vec<u64> = Vec::with_capacity(10_000);
@@ -445,7 +445,7 @@ fn many_himos() {
     // 50 紐定義
     let names: Vec<String> = (0..50).map(|i| format!("h{:02}", i)).collect();
     for name in &names {
-        db.define_himo(name, HimoType::Number, 8);
+        db.define_himo(name, ValueType::Number, 8);
     }
 
     // 100 entity に全 50 紐を張る
@@ -481,8 +481,8 @@ fn many_himos() {
 fn text_and_value_mixed() {
     let path = db_path("text_value");
     let mut db = Engine::create_standalone(&path).unwrap();
-    db.define_himo("city", HimoType::Tag, 0);
-    db.define_himo("age", HimoType::Number, 100);
+    db.define_himo("city", ValueType::Tag, 0);
+    db.define_himo("age", ValueType::Number, 100);
 
     let cities = ["Tokyo", "Osaka", "Kyoto", "Sapporo"];
     let mut by_city: Vec<Vec<u64>> = vec![Vec::new(); cities.len()];
@@ -527,9 +527,9 @@ fn text_and_value_mixed() {
 fn query_pair_empty_cell_fallback() {
     let path = db_path("pair_empty_cell");
     let mut db = Engine::create_standalone(&path).unwrap();
-    db.define_himo("type_h", HimoType::Number, 4);
-    db.define_himo("board", HimoType::Number, 64);
-    db.define_himo("author", HimoType::Number, 1000);
+    db.define_himo("type_h", ValueType::Number, 4);
+    db.define_himo("board", ValueType::Number, 64);
+    db.define_himo("author", ValueType::Number, 1000);
 
     db.rebuild();
 
@@ -568,7 +568,7 @@ fn query_pair_empty_cell_fallback() {
 fn sum_basic() {
     let path = db_path("sum_basic");
     let mut db = Engine::create_standalone(&path).unwrap();
-    db.define_himo("cost", HimoType::Number, 0);
+    db.define_himo("cost", ValueType::Number, 0);
 
     let mut eids = Vec::new();
     for v in [100, 200, 300, 400] {
@@ -589,8 +589,8 @@ fn sum_basic() {
 fn sum_skips_missing_values() {
     let path = db_path("sum_skip");
     let mut db = Engine::create_standalone(&path).unwrap();
-    db.define_himo("price", HimoType::Number, 0);
-    db.define_himo("name", HimoType::Tag, 0);
+    db.define_himo("price", ValueType::Number, 0);
+    db.define_himo("name", ValueType::Tag, 0);
 
     let e1 = db.entity(); db.tie(e1, "price", 50);
     let e2 = db.entity(); // price なし
@@ -608,8 +608,8 @@ fn sum_skips_missing_values() {
 fn group_sum_basic() {
     let path = db_path("gsum_basic");
     let mut db = Engine::create_standalone(&path).unwrap();
-    db.define_himo("project", HimoType::Number, 10);
-    db.define_himo("cost", HimoType::Number, 0);
+    db.define_himo("project", ValueType::Number, 10);
+    db.define_himo("cost", ValueType::Number, 0);
 
     // project 0: cost 100, 200
     // project 1: cost 300, 400, 500
@@ -636,9 +636,9 @@ fn group_sum_basic() {
 fn group_sum_with_query() {
     let path = db_path("gsum_query");
     let mut db = Engine::create_standalone(&path).unwrap();
-    db.define_himo("status", HimoType::Number, 5);
-    db.define_himo("project", HimoType::Number, 10);
-    db.define_himo("material_cost", HimoType::Number, 0);
+    db.define_himo("status", ValueType::Number, 5);
+    db.define_himo("project", ValueType::Number, 10);
+    db.define_himo("material_cost", ValueType::Number, 0);
 
     // status=1 (施工中): project 0 に 1000, 2000 / project 1 に 3000
     // status=2 (完了): project 0 に 9999
@@ -674,7 +674,7 @@ fn group_sum_with_query() {
 fn pull_range_basic() {
     let path = db_path("range_basic");
     let mut db = Engine::create_standalone(&path).unwrap();
-    db.define_himo("age", HimoType::Number, 100);
+    db.define_himo("age", ValueType::Number, 100);
 
     for age in 20..=40 {
         let e = db.entity();
@@ -721,7 +721,7 @@ fn date_conversion_roundtrip() {
 fn tie_date_and_range() {
     let path = db_path("date_range");
     let mut db = Engine::create_standalone(&path).unwrap();
-    db.define_himo("created", HimoType::Number, 0);
+    db.define_himo("created", ValueType::Number, 0);
 
     // 2026年4月の10日分
     for day in 1..=10 {
@@ -757,8 +757,8 @@ fn tie_date_and_range() {
 fn date_with_sum() {
     let path = db_path("date_sum");
     let mut db = Engine::create_standalone(&path).unwrap();
-    db.define_himo("date", HimoType::Number, 0);
-    db.define_himo("sales", HimoType::Number, 0);
+    db.define_himo("date", ValueType::Number, 0);
+    db.define_himo("sales", ValueType::Number, 0);
 
     // 4/1: 1000, 4/2: 2000, 4/3: 3000
     for (day, amount) in [(1, 1000), (2, 2000), (3, 3000)] {
@@ -784,7 +784,7 @@ fn date_with_sum() {
 fn aggregates() {
     let path = db_path("aggregates");
     let mut db = Engine::create_standalone(&path).unwrap();
-    db.define_himo("score", HimoType::Number, 0);
+    db.define_himo("score", ValueType::Number, 0);
 
     let mut eids = Vec::new();
     for v in [10, 20, 30, 40, 50] {
@@ -823,7 +823,7 @@ fn aggregates() {
 fn aggregates_with_missing_values() {
     let path = db_path("agg_missing");
     let mut db = Engine::create_standalone(&path).unwrap();
-    db.define_himo("price", HimoType::Number, 0);
+    db.define_himo("price", ValueType::Number, 0);
 
     let e1 = db.entity(); db.tie(e1, "price", 100);
     let e2 = db.entity(); // price なし

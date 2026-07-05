@@ -1,7 +1,7 @@
 //! issue #54: leaf himo re-tie / remove で vocab に orphan が残ることを検出する
 //! `Engine::vocab_orphan_stats()` API の regression test。
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 
 fn tmp_path(tag: &str) -> String {
     format!(
@@ -30,7 +30,7 @@ fn leaf_retie_creates_orphan() {
 
     let mut eng = Engine::create_growable_with_capacity(&path, 1000).unwrap();
     eng.define_table("notes", 100).unwrap();
-    eng.define_himo_in("notes", "body", HimoType::Leaf, 0).unwrap();
+    eng.define_himo_in("notes", "body", ValueType::Leaf, 0).unwrap();
 
     let eid = eng.entity_in("notes").unwrap();
     eng.tie_text(eid, "notes.body", "first");
@@ -67,7 +67,7 @@ fn leaf_remove_creates_orphan() {
 
     let mut eng = Engine::create_growable_with_capacity(&path, 1000).unwrap();
     eng.define_table("notes", 100).unwrap();
-    eng.define_himo_in("notes", "body", HimoType::Leaf, 0).unwrap();
+    eng.define_himo_in("notes", "body", ValueType::Leaf, 0).unwrap();
 
     let eid = eng.entity_in("notes").unwrap();
     eng.tie_text(eid, "notes.body", "hello world");
@@ -92,7 +92,7 @@ fn tag_dedup_no_orphan() {
 
     let mut eng = Engine::create_growable_with_capacity(&path, 1000).unwrap();
     eng.define_table("items", 100).unwrap();
-    eng.define_himo_in("items", "kind", HimoType::Tag, 0).unwrap();
+    eng.define_himo_in("items", "kind", ValueType::Tag, 0).unwrap();
 
     // 同じ tag を 3 個 tie → vocab に 1 vid のみ (= dedup)、 orphan 0
     for _ in 0..3 {
@@ -114,7 +114,7 @@ fn dead_ratio_helper() {
 
     let mut eng = Engine::create_growable_with_capacity(&path, 1000).unwrap();
     eng.define_table("n", 100).unwrap();
-    eng.define_himo_in("n", "v", HimoType::Leaf, 0).unwrap();
+    eng.define_himo_in("n", "v", ValueType::Leaf, 0).unwrap();
 
     let eid = eng.entity_in("n").unwrap();
     eng.tie_text(eid, "n.v", "a");

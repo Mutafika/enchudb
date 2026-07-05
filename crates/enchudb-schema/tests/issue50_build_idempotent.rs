@@ -61,7 +61,7 @@ fn build_recovers_from_already_exists_on_reopen() {
     {
         let mut eng = Engine::open_standalone(&path).unwrap();
         eng.define_table("snapshot_tags", 1000).unwrap();
-        eng.define_himo_in("snapshot_tags", "tag_id", enchudb_engine::HimoType::Tag, 0).unwrap();
+        eng.define_himo_in("snapshot_tags", "tag_id", enchudb_engine::ValueType::Tag, 0).unwrap();
         eng.persist_tables().unwrap();
         // drop
     }

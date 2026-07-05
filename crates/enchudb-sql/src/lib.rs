@@ -51,7 +51,7 @@
 //! }
 //! ```
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 use enchudb_oplog::EntityId;
 use sqlparser::ast::{
     self, BinaryOperator, ColumnOption, DataType, Expr, ObjectName, Query, SelectItem, SetExpr,
@@ -72,11 +72,11 @@ const SCHEMA_TABLE_MARKER: &str = "__enchu_schema_v1__";
 const SCHEMA_BLOB_HIMO: &str = "__enchu_schema_blob";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// SQL 上の列型。`enchudb_engine::HimoType` への dispatch 用。
+/// SQL 上の列型。`enchudb_engine::ValueType` への dispatch 用。
 ///
-/// - `Integer` — `INTEGER` / `INT` 系。HimoType::Number。
-/// - `Text` — `TEXT` / `VARCHAR` 系。HimoType::Tag (vocab で dedupe)。
-/// - `Leaf` — 拡張型 `LEAF`。HimoType::Leaf (vocab に乗るが dedupe なし、自由記述用)。
+/// - `Integer` — `INTEGER` / `INT` 系。ValueType::Number。
+/// - `Text` — `TEXT` / `VARCHAR` 系。ValueType::Tag (vocab で dedupe)。
+/// - `Leaf` — 拡張型 `LEAF`。ValueType::Leaf (vocab に乗るが dedupe なし、自由記述用)。
 pub enum SqlType {
     Integer,
     Text,
@@ -237,8 +237,8 @@ impl Database {
     /// create 系の path で marker/blob himo を事前 define しておく。
     /// open() 経由は既存 himo を読むだけなので不要。
     fn init_schema_storage(&mut self) {
-        self.eng.define_himo(TABLE_MARKER_HIMO, HimoType::Tag, 0);
-        self.eng.define_himo(SCHEMA_BLOB_HIMO, HimoType::Tag, 0);
+        self.eng.define_himo(TABLE_MARKER_HIMO, ValueType::Tag, 0);
+        self.eng.define_himo(SCHEMA_BLOB_HIMO, ValueType::Tag, 0);
     }
 
     /// schema metadata を `content()` blob に書き出す。
@@ -286,9 +286,9 @@ impl Database {
         for t in &self.tables {
             for c in &t.cols {
                 let ht = match c.ty {
-                    SqlType::Integer => HimoType::Number,
-                    SqlType::Text => HimoType::Tag,
-                    SqlType::Leaf => HimoType::Leaf,
+                    SqlType::Integer => ValueType::Number,
+                    SqlType::Text => ValueType::Tag,
+                    SqlType::Leaf => ValueType::Leaf,
                 };
                 self.eng.define_himo(&c.himo, ht, 0);
             }
@@ -375,12 +375,12 @@ impl Database {
         }
 
         // himo を define
-        self.eng.define_himo(TABLE_MARKER_HIMO, HimoType::Tag, 0);
+        self.eng.define_himo(TABLE_MARKER_HIMO, ValueType::Tag, 0);
         for col in &cols {
             let ht = match col.ty {
-                SqlType::Integer => HimoType::Number,
-                SqlType::Text => HimoType::Tag,
-                SqlType::Leaf => HimoType::Leaf,
+                SqlType::Integer => ValueType::Number,
+                SqlType::Text => ValueType::Tag,
+                SqlType::Leaf => ValueType::Leaf,
             };
             self.eng.define_himo(&col.himo, ht, 0);
         }
@@ -951,7 +951,7 @@ fn tie_value(eng: &mut Engine, eid: EntityId, cd: &ColDef, v: &Value) -> Result<
             eng.tie(eid, &cd.himo, *n as u32);
         }
         (SqlType::Text, Value::Text(s)) | (SqlType::Leaf, Value::Text(s)) => {
-            // engine の tie_text は himo の HimoType (Tag / Leaf) で内部 dispatch する。
+            // engine の tie_text は himo の ValueType (Tag / Leaf) で内部 dispatch する。
             eng.tie_text(eid, &cd.himo, s);
         }
         (_, Value::Null) => { /* untie でも良いが v0 は no-op */ }

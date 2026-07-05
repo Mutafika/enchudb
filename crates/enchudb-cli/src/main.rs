@@ -9,7 +9,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 
 use enchudb_engine::engine::{Engine, EntityValue};
-use enchudb_engine::himo_store::HimoType;
+use enchudb_engine::himo_store::ValueType;
 use enchudb_engine::query_lang;
 
 const HELP: &str = "\
@@ -252,26 +252,26 @@ fn cmd_himos(eng: &Engine) {
     }
     println!("name\ttype");
     for n in names {
-        let ty = eng.himo_type(n).map(type_label).unwrap_or("?");
+        let ty = eng.value_type(n).map(type_label).unwrap_or("?");
         println!("{n}\t{ty}");
     }
 }
 
-fn type_label(t: HimoType) -> &'static str {
+fn type_label(t: ValueType) -> &'static str {
     match t {
-        HimoType::Tag => "tag",
-        HimoType::Number => "num",
-        HimoType::Leaf => "leaf",
-        HimoType::Ref => "ref",
+        ValueType::Tag => "tag",
+        ValueType::Number => "num",
+        ValueType::Leaf => "leaf",
+        ValueType::Ref => "ref",
     }
 }
 
-fn parse_type(s: &str) -> Result<HimoType, String> {
+fn parse_type(s: &str) -> Result<ValueType, String> {
     match s {
-        "tag" => Ok(HimoType::Tag),
-        "num" | "number" => Ok(HimoType::Number),
-        "leaf" => Ok(HimoType::Leaf),
-        "ref" => Ok(HimoType::Ref),
+        "tag" => Ok(ValueType::Tag),
+        "num" | "number" => Ok(ValueType::Number),
+        "leaf" => Ok(ValueType::Leaf),
+        "ref" => Ok(ValueType::Ref),
         _ => Err(format!("unknown type: {s} (tag|num|leaf|ref)")),
     }
 }

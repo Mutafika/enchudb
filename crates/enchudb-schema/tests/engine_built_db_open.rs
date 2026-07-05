@@ -10,10 +10,10 @@
 //! ```
 //!
 //! 修正後: `.schema` sidecar (= 0.8.7 以降の正規 path) が無く、 legacy blob も
-//! 無い engine 直 DB でも、 engine の `.tables` + himo_types から fallback 復元
+//! 無い engine 直 DB でも、 engine の `.tables` + value_types から fallback 復元
 //! して query 可能になる (PK は不明扱い、 他の column type は復元される)。
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 use enchudb_schema::Database;
 
 fn tmp_path(tag: &str) -> String {
@@ -46,8 +46,8 @@ fn database_open_works_on_engine_built_db_without_schema_marker() {
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
         eng.define_table("pitches", 100).unwrap();
-        eng.define_himo_in("pitches", "pitch_type", HimoType::Tag, 0).unwrap();
-        eng.define_himo_in("pitches", "velo", HimoType::Number, 0).unwrap();
+        eng.define_himo_in("pitches", "pitch_type", ValueType::Tag, 0).unwrap();
+        eng.define_himo_in("pitches", "velo", ValueType::Number, 0).unwrap();
         // tie
         let e1 = eng.entity_in("pitches").unwrap();
         eng.tie_text(e1, "pitches.pitch_type", "FF");

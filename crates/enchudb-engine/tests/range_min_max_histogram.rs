@@ -4,7 +4,7 @@
 //! 既存 `sum_range` / `group_sum_range` と同じ `_range` pattern。 dense path
 //! (= Tag with max_values 小) と sparse path (= Number with cap=0) の両方を網羅。
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 
 fn tmp_path(tag: &str) -> String {
     format!(
@@ -29,9 +29,9 @@ fn cleanup(path: &str) {
 fn build_db(path: &str, pairs: &[(u32, &str)]) -> (Engine, u32, u32) {
     let mut eng = Engine::create_standalone(path).unwrap();
     eng.define_table("t", pairs.len() as u32).unwrap();
-    eng.define_himo_in("t", "val", HimoType::Number, 0).unwrap();
+    eng.define_himo_in("t", "val", ValueType::Number, 0).unwrap();
     // dept は Tag (= vocab 経由)、 cardinality 小なので dense path に乗る。
-    eng.define_himo_in("t", "dept", HimoType::Tag, 0).unwrap();
+    eng.define_himo_in("t", "dept", ValueType::Tag, 0).unwrap();
 
     for &(val, dept) in pairs {
         let e = eng.entity_in("t").unwrap();

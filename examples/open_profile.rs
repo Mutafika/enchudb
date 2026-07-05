@@ -30,14 +30,14 @@ fn main() {
         };
         // vocab に entry が乗らないと rebuild_index は走らない。 Tag himo に
         // string を tie するため tie_text を使う。
-        eng.define_himo("tag", enchudb::HimoType::Tag, 1000);
+        eng.define_himo("tag", enchudb::ValueType::Tag, 1000);
         for i in 0..100 {
             let e = eng.entity();
             eng.tie_text(e, "tag", &format!("v{}", i));
         }
         // schema 層が himo_reg にも入れるので、 多めに define して count を稼ぐ
         for i in 0..200 {
-            eng.define_himo(&format!("h{}", i), enchudb::HimoType::Number, 100);
+            eng.define_himo(&format!("h{}", i), enchudb::ValueType::Number, 100);
         }
         eng.flush().unwrap();
     }

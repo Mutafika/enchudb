@@ -5,7 +5,7 @@
 //!
 //! cargo run --release --example group_sum_cap_probe
 
-use enchudb::{Engine, HimoType};
+use enchudb::{Engine, ValueType};
 use std::time::Instant;
 
 fn main() {
@@ -15,8 +15,8 @@ fn main() {
     let _ = std::fs::remove_file(format!("{}.oplog", path));
 
     let mut eng = Engine::create_growable_with_capacity(path, n + 100).unwrap();
-    eng.define_himo("dept", HimoType::Number, 20); // dense cap 20 (schema 層は 0)
-    eng.define_himo("salary", HimoType::Number, 1000);
+    eng.define_himo("dept", ValueType::Number, 20); // dense cap 20 (schema 層は 0)
+    eng.define_himo("salary", ValueType::Number, 1000);
     for i in 0..n {
         let e = eng.entity();
         eng.tie(e, "dept", i % 20);

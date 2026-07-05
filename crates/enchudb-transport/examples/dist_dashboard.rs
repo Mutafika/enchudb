@@ -20,7 +20,7 @@ use sabitori::*;
 use sabitori_core::tui::{block, hsep};
 use sabitori_style::Theme;
 
-use enchudb::{Engine, HimoType};
+use enchudb::{Engine, ValueType};
 use enchudb_oplog::Hlc;
 use enchudb::sync::Syncer;
 use enchudb::transport::{Transport, WireRecord};
@@ -574,7 +574,7 @@ fn spawn_cluster(state: Arc<RwLock<ClusterState>>, shutdown: Arc<AtomicBool>) {
         // peer 0 = origin
         {
             let mut eng = Engine::create_compact(&paths[0]).unwrap();
-            eng.define_himo("val", HimoType::Number, 100);
+            eng.define_himo("val", ValueType::Number, 100);
             eng.flush().unwrap();
         }
         let relay = HttpRelay::start_with_bootstrap("127.0.0.1:0", &paths[0]).unwrap();

@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use enchudb::{Engine, HimoType};
+use enchudb::{Engine, ValueType};
 use enchudb_oplog::Hlc;
 use enchudb::sync::Syncer;
 use enchudb::transport::{Transport, WireRecord};
@@ -39,7 +39,7 @@ fn origin_publishes_replica_pulls_over_http() {
     let origin_path = tmp("origin");
     {
         let mut eng = Engine::create_standalone(&origin_path).unwrap();
-        eng.define_himo("val", HimoType::Number, 100);
+        eng.define_himo("val", ValueType::Number, 100);
         eng.flush().unwrap();
     }
     let origin = Engine::open_concurrent_with_oplog(&origin_path, 16 * 1024 * 1024).unwrap();
@@ -49,7 +49,7 @@ fn origin_publishes_replica_pulls_over_http() {
     let replica_path = tmp("replica");
     {
         let mut eng = Engine::create_standalone(&replica_path).unwrap();
-        eng.define_himo("val", HimoType::Number, 100);
+        eng.define_himo("val", ValueType::Number, 100);
         eng.flush().unwrap();
     }
     let replica = Engine::open_concurrent_replica(&replica_path, 16 * 1024 * 1024).unwrap();
@@ -112,7 +112,7 @@ fn multiple_replicas_sync_from_same_origin() {
     let origin_path = tmp("multi_origin");
     {
         let mut eng = Engine::create_standalone(&origin_path).unwrap();
-        eng.define_himo("val", HimoType::Number, 100);
+        eng.define_himo("val", ValueType::Number, 100);
         eng.flush().unwrap();
     }
     let origin = Engine::open_concurrent_with_oplog(&origin_path, 16 * 1024 * 1024).unwrap();
@@ -122,7 +122,7 @@ fn multiple_replicas_sync_from_same_origin() {
     let replica_a_path = tmp("multi_replica_a");
     {
         let mut eng = Engine::create_standalone(&replica_a_path).unwrap();
-        eng.define_himo("val", HimoType::Number, 100);
+        eng.define_himo("val", ValueType::Number, 100);
         eng.flush().unwrap();
     }
     let replica_a = Engine::open_concurrent_replica(&replica_a_path, 16 * 1024 * 1024).unwrap();
@@ -132,7 +132,7 @@ fn multiple_replicas_sync_from_same_origin() {
     let replica_b_path = tmp("multi_replica_b");
     {
         let mut eng = Engine::create_standalone(&replica_b_path).unwrap();
-        eng.define_himo("val", HimoType::Number, 100);
+        eng.define_himo("val", ValueType::Number, 100);
         eng.flush().unwrap();
     }
     let replica_b = Engine::open_concurrent_replica(&replica_b_path, 16 * 1024 * 1024).unwrap();
@@ -190,7 +190,7 @@ fn fresh_replica_bootstraps_then_syncs() {
     // create_compact でファイルサイズを MB 級に抑える (bootstrap 全転送が現実的に)
     {
         let mut eng = Engine::create_compact(&origin_path).unwrap();
-        eng.define_himo("val", HimoType::Number, 100);
+        eng.define_himo("val", ValueType::Number, 100);
         let e1 = eng.entity();
         eng.tie(e1, "val", 42);
         let _e1_id = e1;
@@ -259,7 +259,7 @@ fn incremental_pull_advances_cursor() {
     let path = tmp("cursor_replica");
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
-        eng.define_himo("val", HimoType::Number, 100);
+        eng.define_himo("val", ValueType::Number, 100);
         eng.flush().unwrap();
     }
     let replica = Engine::open_concurrent_replica(&path, 16 * 1024 * 1024).unwrap();

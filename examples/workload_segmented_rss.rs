@@ -23,7 +23,7 @@
 //! Usage:
 //!   cargo run --release --example workload_segmented_rss [N_PER_TABLE=1000000]
 
-use enchudb::{Engine, HimoType};
+use enchudb::{Engine, ValueType};
 use std::time::Instant;
 
 fn rss_mb() -> u64 {
@@ -118,7 +118,7 @@ fn main() {
     let mut eng = Engine::create_growable_with_capacity(path, total_entities + 100).unwrap();
     for (_, himos) in &tbls {
         for &(name, max_v) in himos {
-            eng.define_himo(name, HimoType::Number, max_v);
+            eng.define_himo(name, ValueType::Number, max_v);
         }
     }
     snap(&format!("after define_himo x {}", total_himos), t0);

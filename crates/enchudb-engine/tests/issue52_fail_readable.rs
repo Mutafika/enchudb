@@ -50,7 +50,7 @@ fn open_recovers_from_corrupt_tables_sidecar() {
     {
         let mut eng = Engine::create_growable_with_capacity(&path, 1000).unwrap();
         eng.define_table("widgets", 100).unwrap();
-        eng.define_himo_in("widgets", "name", enchudb_engine::HimoType::Tag, 0).unwrap();
+        eng.define_himo_in("widgets", "name", enchudb_engine::ValueType::Tag, 0).unwrap();
         eng.persist_tables().unwrap();
     }
 

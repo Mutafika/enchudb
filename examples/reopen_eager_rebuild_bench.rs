@@ -16,7 +16,7 @@
 //!   queries -- reopen 後の 1000 random query の合計時間 (lazy rebuild の効果が
 //!              query 側に出るので、 reopen + query を合計して比較する)
 
-use enchudb::{Engine, HimoType};
+use enchudb::{Engine, ValueType};
 use std::time::Instant;
 
 fn rss_mb() -> u64 {
@@ -56,7 +56,7 @@ fn main() {
     {
         let mut eng = Engine::create_growable_with_capacity(&path, entities + 100).unwrap();
         for name in &himo_names {
-            eng.define_himo(name, HimoType::Number, 100);
+            eng.define_himo(name, ValueType::Number, 100);
         }
         for i in 0..entities {
             let e = eng.entity();

@@ -7,7 +7,7 @@
 //! - `tie_text_to` (&self text 書き込み)
 //! - `open_concurrent_replica` (v32 replica + concurrent writer)
 
-use enchudb::{Engine, EntityValue, HimoType};
+use enchudb::{Engine, EntityValue, ValueType};
 use std::sync::Arc;
 
 fn tmp(tag: &str) -> String {
@@ -37,7 +37,7 @@ fn create_with_options_respects_capacity_hint() {
     let path = tmp("opts");
     let mut eng =
         Engine::create_with_options(&path, 1_000_000, Some(1024 * 1024)).unwrap();
-    eng.define_himo("age", HimoType::Number, 100);
+    eng.define_himo("age", ValueType::Number, 100);
     let e = eng.entity();
     eng.tie(e, "age", 42);
     assert_eq!(eng.get(e, "age"), Some(42));
@@ -56,7 +56,7 @@ fn create_full_with_cyl_all_options() {
         Some(1024),
     )
     .unwrap();
-    eng.define_himo("v", HimoType::Number, 50);
+    eng.define_himo("v", ValueType::Number, 50);
     let e = eng.entity();
     eng.tie(e, "v", 7);
     assert_eq!(eng.get(e, "v"), Some(7));
@@ -67,8 +67,8 @@ fn create_full_with_cyl_all_options() {
 fn get_entity_returns_all_himos() {
     let path = tmp("get_entity");
     let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("age", HimoType::Number, 100);
-    eng.define_himo("city", HimoType::Tag, 0);
+    eng.define_himo("age", ValueType::Number, 100);
+    eng.define_himo("city", ValueType::Tag, 0);
     let e = eng.entity();
     eng.tie(e, "age", 30);
     eng.tie_text(e, "city", "東京");
@@ -109,7 +109,7 @@ fn create_concurrent_without_wal_accepts_tie_async() {
 fn tie_text_to_on_shared_arc() {
     let path = tmp("ttto");
     let mut eng = Engine::create_standalone(&path).unwrap();
-    eng.define_himo("name", HimoType::Tag, 0);
+    eng.define_himo("name", ValueType::Tag, 0);
     let eng = Arc::new(eng);
 
     let e = eng.entity();
@@ -129,7 +129,7 @@ fn open_concurrent_replica_rejects_writes_and_syncs_via_remote() {
     let path = tmp("repl");
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
-        eng.define_himo("v", HimoType::Number, 100);
+        eng.define_himo("v", ValueType::Number, 100);
         eng.flush().unwrap();
     }
     let eng = Engine::open_concurrent_replica(&path, 4 * 1024 * 1024).unwrap();

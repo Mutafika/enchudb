@@ -15,7 +15,7 @@
 //!
 //! 各フェーズで in-program RSS / VSZ を出す。 peak RSS は /usr/bin/time -l 併用推奨。
 
-use enchudb::{Engine, HimoType};
+use enchudb::{Engine, ValueType};
 use std::time::Instant;
 
 fn parse_n() -> u32 {
@@ -126,13 +126,13 @@ fn main() {
     snap("after create_growable", t0);
 
     // v33_vs_pairs と同じ schema: 5 low-card + 2 high-card himos
-    eng.define_himo("tenant", HimoType::Number, 10);
-    eng.define_himo("dept",   HimoType::Number, 8);
-    eng.define_himo("role",   HimoType::Number, 4);
-    eng.define_himo("status", HimoType::Number, 5);
-    eng.define_himo("year",   HimoType::Number, 5);
-    eng.define_himo("salary", HimoType::Number, 1000);
-    eng.define_himo("age",    HimoType::Number, 60);
+    eng.define_himo("tenant", ValueType::Number, 10);
+    eng.define_himo("dept",   ValueType::Number, 8);
+    eng.define_himo("role",   ValueType::Number, 4);
+    eng.define_himo("status", ValueType::Number, 5);
+    eng.define_himo("year",   ValueType::Number, 5);
+    eng.define_himo("salary", ValueType::Number, 1000);
+    eng.define_himo("age",    ValueType::Number, 60);
     snap("after define_himo x 7", t0);
 
     let t_ins = Instant::now();

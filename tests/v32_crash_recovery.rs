@@ -8,7 +8,7 @@
 
 #![cfg(feature = "v32")]
 
-use enchudb::{AuditFilter, Engine, HimoType};
+use enchudb::{AuditFilter, Engine, ValueType};
 use enchudb_oplog::keys::Keypair;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -33,7 +33,7 @@ fn cleanup(path: &str) {
 
 fn prepare_db(path: &str) {
     let mut e = Engine::create_with_capacity(path, 10_000).unwrap();
-    e.define_himo("n", HimoType::Number, 1_000);
+    e.define_himo("n", ValueType::Number, 1_000);
     e.flush().unwrap();
 }
 

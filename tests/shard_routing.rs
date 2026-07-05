@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use enchudb::{Engine, HimoType};
+use enchudb::{Engine, ValueType};
 use enchudb::sync::shard::{ExplicitRouter, HashRouter, InMemoryShardTransport, ShardQuery, ShardRouter};
 
 fn tmp(tag: &str) -> String {
@@ -26,7 +26,7 @@ fn cleanup(path: &str) {
 }
 
 /// 単一 himo を single peer で持つ engine を立てる。
-fn make_sharded_peer(path: &str, peer: u32, owned_himos: &[(&str, HimoType)]) -> Arc<Engine> {
+fn make_sharded_peer(path: &str, peer: u32, owned_himos: &[(&str, ValueType)]) -> Arc<Engine> {
     {
         let mut eng = Engine::create_standalone(path).unwrap();
         for (name, ty) in owned_himos {
@@ -44,8 +44,8 @@ fn single_condition_routes_to_owner_peer() {
     // 2 peer: A が "color"、B が "size"
     let pa = tmp("single_a");
     let pb = tmp("single_b");
-    let eng_a = make_sharded_peer(&pa, 1, &[("color", HimoType::Number)]);
-    let eng_b = make_sharded_peer(&pb, 2, &[("size", HimoType::Number)]);
+    let eng_a = make_sharded_peer(&pa, 1, &[("color", ValueType::Number)]);
+    let eng_b = make_sharded_peer(&pb, 2, &[("size", ValueType::Number)]);
 
     // A に entity 作って color=5 を tie
     let e1 = eng_a.entity();
@@ -89,7 +89,7 @@ fn single_condition_routes_to_owner_peer() {
 #[test]
 fn explicit_router_falls_back_for_unknown_himo() {
     let pa = tmp("fallback_a");
-    let eng_a = make_sharded_peer(&pa, 1, &[("color", HimoType::Number)]);
+    let eng_a = make_sharded_peer(&pa, 1, &[("color", ValueType::Number)]);
 
     let transport = Arc::new(InMemoryShardTransport::new());
     transport.register(1, eng_a.clone());
@@ -119,7 +119,7 @@ fn hash_router_deterministic_across_peers() {
 fn is_mine_filter() {
     // peer 自身が owner の himo だけ tie できるようにする運用判定
     let pa = tmp("mine_a");
-    let eng_a = make_sharded_peer(&pa, 1, &[("a_himo", HimoType::Number)]);
+    let eng_a = make_sharded_peer(&pa, 1, &[("a_himo", ValueType::Number)]);
 
     let transport = Arc::new(InMemoryShardTransport::new());
     transport.register(1, eng_a.clone());
@@ -147,8 +147,8 @@ fn two_condition_query_crosses_shards() {
     // 別の entity が条件 Y を満たすか (peer B で check)、交差が空」を確認。
     let pa = tmp("two_a");
     let pb = tmp("two_b");
-    let eng_a = make_sharded_peer(&pa, 1, &[("color", HimoType::Number)]);
-    let eng_b = make_sharded_peer(&pb, 2, &[("size", HimoType::Number)]);
+    let eng_a = make_sharded_peer(&pa, 1, &[("color", ValueType::Number)]);
+    let eng_b = make_sharded_peer(&pb, 2, &[("size", ValueType::Number)]);
 
     // A に entity e_a で color=3、B に別 entity e_b で size=5
     let e_a = eng_a.entity();
@@ -199,8 +199,8 @@ fn replicated_entity_matches_across_shards_via_sync() {
     // ここでは Syncer を介さず、手動で remote_tie_apply を呼んで「同じ eid 共有」を再現。
     let pa = tmp("repl_a");
     let pb = tmp("repl_b");
-    let eng_a = make_sharded_peer(&pa, 1, &[("color", HimoType::Number)]);
-    let eng_b = make_sharded_peer(&pb, 2, &[("size", HimoType::Number)]);
+    let eng_a = make_sharded_peer(&pa, 1, &[("color", ValueType::Number)]);
+    let eng_b = make_sharded_peer(&pb, 2, &[("size", ValueType::Number)]);
 
     // 共有 eid: peer 0 が「論理的に」作った entity とする (あるいは root peer 扱い)
     let shared_local = 42u32;

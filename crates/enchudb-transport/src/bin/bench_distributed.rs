@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use enchudb::{Engine, HimoType};
+use enchudb::{Engine, ValueType};
 use enchudb_oplog::Hlc;
 use enchudb::sync::Syncer;
 use enchudb::transport::{Transport, WireRecord, encode_batch};
@@ -49,7 +49,7 @@ fn main() {
     // origin 準備 (schema + flush)
     {
         let mut eng = Engine::create_compact(&origin_path).unwrap();
-        eng.define_himo("val", HimoType::Number, 100);
+        eng.define_himo("val", ValueType::Number, 100);
         eng.flush().unwrap();
     }
 

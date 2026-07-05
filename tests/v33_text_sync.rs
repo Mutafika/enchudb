@@ -8,7 +8,7 @@
 #![cfg(feature = "v33")]
 
 use std::sync::Arc;
-use enchudb::{Engine, HimoType};
+use enchudb::{Engine, ValueType};
 use enchudb_oplog::Hlc;
 use enchudb::sync::Syncer;
 use enchudb::transport::{InMemoryTransport, Transport};
@@ -31,8 +31,8 @@ fn cleanup(path: &str) {
 fn make_peer(path: &str, peer: u32) -> Arc<Engine> {
     {
         let mut eng = Engine::create_standalone(path).unwrap();
-        eng.define_himo("name", HimoType::Tag, 0);
-        eng.define_himo("age", HimoType::Number, 100);
+        eng.define_himo("name", ValueType::Tag, 0);
+        eng.define_himo("age", ValueType::Number, 100);
         eng.flush().unwrap();
     }
     let eng = Engine::open_concurrent_with_oplog(path, 16 * 1024 * 1024).unwrap();
@@ -146,12 +146,12 @@ fn tie_ref_async_propagates_between_peers() {
     let pb = tmp("ref_b");
     {
         let mut eng = Engine::create_standalone(&pa).unwrap();
-        eng.define_himo("parent", enchudb::HimoType::Ref, 0);
+        eng.define_himo("parent", enchudb::ValueType::Ref, 0);
         eng.flush().unwrap();
     }
     {
         let mut eng = Engine::create_standalone(&pb).unwrap();
-        eng.define_himo("parent", enchudb::HimoType::Ref, 0);
+        eng.define_himo("parent", enchudb::ValueType::Ref, 0);
         eng.flush().unwrap();
     }
     let eng_a = Engine::open_concurrent_with_oplog(&pa, 16 * 1024 * 1024).unwrap();

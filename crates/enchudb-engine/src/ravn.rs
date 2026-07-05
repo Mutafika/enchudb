@@ -343,19 +343,19 @@ fn resolve_value(eng: &Engine, val: &str) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Engine, HimoType};
+    use crate::{Engine, ValueType};
 
     fn setup(name: &str) -> (Arc<Engine>, Ravn) {
         let path = format!("/tmp/enchu_ravn_{name}.db");
         let _ = std::fs::remove_file(&path);
         let mut eng = Engine::create_standalone(&path).unwrap();
 
-        eng.define_himo("type", HimoType::Number, 10);
-        eng.define_himo("region", HimoType::Number, 10);
-        eng.define_himo("country", HimoType::Number, 10);
-        eng.define_himo("name", HimoType::Tag, 0);
-        eng.define_himo("parent", HimoType::Ref, 0);
-        eng.define_himo("manager", HimoType::Ref, 0);
+        eng.define_himo("type", ValueType::Number, 10);
+        eng.define_himo("region", ValueType::Number, 10);
+        eng.define_himo("country", ValueType::Number, 10);
+        eng.define_himo("name", ValueType::Tag, 0);
+        eng.define_himo("parent", ValueType::Ref, 0);
+        eng.define_himo("manager", ValueType::Ref, 0);
 
         // country: Japan(eid=0)
         let japan = eng.entity();

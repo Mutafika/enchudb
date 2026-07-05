@@ -10,7 +10,7 @@
 
 use enchudb_engine::engine::Engine;
 use enchudb_engine::transport::{InMemoryTransport, Transport};
-use enchudb_engine::HimoType;
+use enchudb_engine::ValueType;
 use enchudb_oplog::{Hlc, PeerId};
 use enchudb_sync::Syncer;
 use std::sync::Arc;
@@ -40,7 +40,7 @@ fn make_engine(path: &str, peer: PeerId) -> Arc<Engine> {
     cleanup(path);
     let mut eng = Engine::create_with_capacity(path, 65_536).unwrap();
     eng.define_table("notes", 1000).unwrap();
-    eng.define_himo_in("notes", "label", HimoType::Tag, 0).unwrap();
+    eng.define_himo_in("notes", "label", ValueType::Tag, 0).unwrap();
     eng.enable_sync_tables().unwrap();
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(peer);

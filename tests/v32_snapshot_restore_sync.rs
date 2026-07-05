@@ -13,7 +13,7 @@
 use enchudb_oplog::keys::Keypair;
 use enchudb::sync::Syncer;
 use enchudb::transport::{InMemoryTransport, Transport};
-use enchudb::{AuditFilter, Engine, HimoType};
+use enchudb::{AuditFilter, Engine, ValueType};
 use enchudb_oplog::Hlc;
 use std::sync::Arc;
 
@@ -41,7 +41,7 @@ fn cleanup(path: &str) {
 
 fn prepare_db(path: &str) {
     let mut eng = Engine::create_standalone(path).unwrap();
-    eng.define_himo("val", HimoType::Number, 100);
+    eng.define_himo("val", ValueType::Number, 100);
     eng.flush().unwrap();
 }
 

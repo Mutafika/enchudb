@@ -71,7 +71,7 @@ fn mmap_ahead_of_wal_silent_sync_loss() {
     // Phase 1: schema を準備して flush (mmap も WAL も clean baseline)
     {
         let mut eng = enchudb::Engine::create_with_capacity(&path, 1024).unwrap();
-        eng.define_himo("n", enchudb::HimoType::Number, 100);
+        eng.define_himo("n", enchudb::ValueType::Number, 100);
         eng.flush().unwrap();
     }
 
@@ -139,7 +139,7 @@ fn oplog_sync_closes_race_window() {
 
     {
         let mut eng = enchudb::Engine::create_with_capacity(&path, 1024).unwrap();
-        eng.define_himo("n", enchudb::HimoType::Number, 100);
+        eng.define_himo("n", enchudb::ValueType::Number, 100);
         eng.flush().unwrap();
     }
 

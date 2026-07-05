@@ -1,4 +1,4 @@
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 use std::time::Instant;
 
 fn main() {
@@ -7,10 +7,10 @@ fn main() {
     let _ = std::fs::remove_file(dir);
 
     let mut eng = Engine::create_standalone(dir).unwrap();
-    eng.define_himo("age", HimoType::Number, 50);
-    eng.define_himo("dept", HimoType::Number, 8);
-    eng.define_himo("company", HimoType::Number, 100);
-    eng.define_himo("city", HimoType::Tag, 0);
+    eng.define_himo("age", ValueType::Number, 50);
+    eng.define_himo("dept", ValueType::Number, 8);
+    eng.define_himo("company", ValueType::Number, 100);
+    eng.define_himo("city", ValueType::Tag, 0);
 
     let t = Instant::now();
     for i in 0..n {

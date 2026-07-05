@@ -14,7 +14,7 @@
 //! いた (= sync 転送漏れ / crash durability 破れ。 sync lib テストの flaky の
 //! 正体)。
 
-use enchudb_engine::{Engine, HimoType};
+use enchudb_engine::{Engine, ValueType};
 use std::sync::Arc;
 
 #[test]
@@ -34,8 +34,8 @@ fn flush_writes_waits_for_all_ties_including_entity_created_path() {
 
     {
         let eng_mut = unsafe { &mut *(Arc::as_ptr(&eng) as *mut Engine) };
-        eng_mut.define_himo("marker", HimoType::Tag, 100);
-        eng_mut.define_himo("value", HimoType::Tag, 1_000_000);
+        eng_mut.define_himo("marker", ValueType::Tag, 100);
+        eng_mut.define_himo("value", ValueType::Tag, 1_000_000);
     }
     let marker_hid = eng.himo_id("marker").unwrap() as u16;
     let value_hid = eng.himo_id("value").unwrap() as u16;
@@ -90,7 +90,7 @@ fn oplog_sync_bridges_all_records_pushed_before_it() {
     {
         let mut eng = Engine::create_standalone(&path).expect("create");
         eng.define_table("rows", 100_000).unwrap();
-        eng.define_himo_in("rows", "val", HimoType::Number, 1_000_000).unwrap();
+        eng.define_himo_in("rows", "val", ValueType::Number, 1_000_000).unwrap();
         eng.enable_sync_tables().unwrap();
         eng.flush().unwrap();
     }

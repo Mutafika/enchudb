@@ -285,7 +285,7 @@ impl Drop for WsPushClient {
 ///
 /// ```
 /// use std::sync::Arc;
-/// use enchudb::{Engine, HimoType};
+/// use enchudb::{Engine, ValueType};
 /// use enchudb_transport::ws::{WsPushHub, WsPushHubAdapter};
 ///
 /// let path = format!("/tmp/enchudb-ws-adapter-doc-{}.db", std::process::id());
@@ -293,7 +293,7 @@ impl Drop for WsPushClient {
 /// # let _ = std::fs::remove_file(format!("{}.oplog", path));
 /// {
 ///     let mut eng = Engine::create_standalone(&path).unwrap();
-///     eng.define_himo("v", HimoType::Number, 100);
+///     eng.define_himo("v", ValueType::Number, 100);
 ///     eng.flush().unwrap();
 /// }
 /// let eng = Engine::open_concurrent_with_oplog(&path, 4 * 1024 * 1024).unwrap();
@@ -465,7 +465,7 @@ mod tests {
     #[test]
     fn changelistener_adapter_pushes_engine_commits_to_subscriber() {
         // engine の WAL commit が adapter 経由で subscriber に届くか
-        use enchudb::{Engine, HimoType};
+        use enchudb::{Engine, ValueType};
         use std::sync::Arc;
 
         let path = format!(
@@ -481,7 +481,7 @@ mod tests {
         }
         {
             let mut eng = Engine::create_standalone(&path).unwrap();
-            eng.define_himo("v", HimoType::Number, 100);
+            eng.define_himo("v", ValueType::Number, 100);
             eng.flush().unwrap();
         }
         let eng = Engine::open_concurrent_with_oplog(&path, 4 * 1024 * 1024).unwrap();
