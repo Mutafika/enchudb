@@ -3,6 +3,29 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.11.1 — 2026-07-06
+
+### Added — postings-only な `.etxt` build + 生候補 API (#84 の第一歩): 索引が本文を二重化しない
+
+全文検索の `.etxt` (ETXT) が原文を自前保持していた分を、 DB 本体の本文 (0.9.0
+#81 の `_c_` Leaf 値) と二重化しない経路を追加。 driving consumer (naruhodo 判例)
+では incremental index ではなく **この冗長性解消**が #84 の実要件だった。
+
+- `TextSearch::save_postings_only` / `write_to_postings_only` (下層 `NgramIndex` /
+  `storage` にも): Doc Index / Text Data を省いた原文非保持 index を書き出す。
+  substring 検証は caller が DB 本体の原文で行う前提
+- `TextSearch::candidates` (生 bigram 候補、 `.contains()` 検証なし) を公開 —
+  postings-only index で偽陽性除去を caller 側に委ねる入口
+- `has_text()` を `MappedIndex` / `NgramIndex` / `TextSearch` に追加
+- postings-only index を `open_mut` / `from_bytes_mut` で in-memory rebuild
+  しようとすると `Unsupported` で弾く (原文が無い = index からは再構築不可、
+  source から作り直す方針)
+
+**format 互換**: ETXT header の `reserved[0]` に `FLAG_TEXT_OMITTED` を立てるだけで
+**version bump なし**。 原文保持の書き出しはバイト等価、 旧 reader も postings-only
+file を `doc_count=0` として無害に読める (非 breaking = patch)。 consumer 側
+(naruhodo の `build_hanrei_etxt` / search handler) の差し替えは別途。
+
 ## 0.11.0 — 2026-07-06
 
 ### Added — 逆写像 (request10 / #76 根治): write-back 正式サポート、 multi-writer p2p 完成

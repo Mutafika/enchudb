@@ -49,6 +49,7 @@ impl NgramIndex {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_mut(path: &str) -> io::Result<Self> {
         let mapped = MappedIndex::open(Path::new(path))?;
+        require_text_for_rebuild(&mapped)?;
         let mut idx = NgramIndex::new();
         mapped.for_each_doc(|eid, text| idx.index(eid, text));
         idx.compact();
@@ -64,6 +65,7 @@ impl NgramIndex {
     /// バイト列から in-memory mutable index を作る（`open_mut` の wasm 版）。
     pub fn from_bytes_mut(bytes: Vec<u8>) -> io::Result<Self> {
         let mapped = MappedIndex::from_bytes(bytes)?;
+        require_text_for_rebuild(&mapped)?;
         let mut idx = NgramIndex::new();
         mapped.for_each_doc(|eid, text| idx.index(eid, text));
         idx.compact();
@@ -90,6 +92,38 @@ impl NgramIndex {
         match &self.backend {
             Backend::Memory { postings, originals } => {
                 crate::storage::write_to(w, postings.raw(), originals)
+            }
+            Backend::Mapped(_) => {
+                Err(io::Error::new(io::ErrorKind::Unsupported, "mapped index is read-only"))
+            }
+        }
+    }
+
+    /// 原文非保持 (postings-only) でファイルに書き出す。native のみ。
+    ///
+    /// Doc Index / Text Data を省くので `.etxt` が DB 本体の本文を二重化しない
+    /// (#84)。 検索は [`candidates`](NgramIndex::candidates) の生候補を caller が
+    /// DB 本体の原文で `.contains()` 検証する前提。 この file を `open` した index は
+    /// `get_text` が常に None、 `open_mut` は不可 (rebuild は source から)。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn save_postings_only(&mut self, path: &str) -> io::Result<()> {
+        self.compact();
+        match &self.backend {
+            Backend::Memory { postings, .. } => {
+                crate::storage::save_postings_only(Path::new(path), postings.raw())
+            }
+            Backend::Mapped(_) => {
+                Err(io::Error::new(io::ErrorKind::Unsupported, "mapped index is read-only"))
+            }
+        }
+    }
+
+    /// `save_postings_only` の Writer 版。
+    pub fn write_to_postings_only<W: std::io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+        self.compact();
+        match &self.backend {
+            Backend::Memory { postings, .. } => {
+                crate::storage::write_to_postings_only(w, postings.raw())
             }
             Backend::Mapped(_) => {
                 Err(io::Error::new(io::ErrorKind::Unsupported, "mapped index is read-only"))
@@ -188,6 +222,16 @@ impl NgramIndex {
         }
     }
 
+    /// この index が原文を保持しているか。 postings-only で開いた index は false
+    /// = `get_text` が使えず、substring 検証は caller が DB 本体で行う必要がある。
+    /// 構築中 (Memory) は常に true。
+    pub fn has_text(&self) -> bool {
+        match &self.backend {
+            Backend::Memory { .. } => true,
+            Backend::Mapped(m) => m.has_text(),
+        }
+    }
+
     // ── internal ──
 
     fn memory_mut(&mut self) -> (&mut PostingList, &mut HashMap<u64, String>) {
@@ -196,6 +240,18 @@ impl NgramIndex {
             Backend::Mapped(_) => panic!("mapped index is read-only"),
         }
     }
+}
+
+/// postings-only index (原文非保持) を in-memory へ rebuild しようとしたら弾く。
+/// 原文が無いので index からは再構築できない — source (DB 本体) から作り直すべき。
+fn require_text_for_rebuild(mapped: &MappedIndex) -> io::Result<()> {
+    if !mapped.has_text() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot rebuild from a postings-only .etxt (no original text); rebuild from source",
+        ));
+    }
+    Ok(())
 }
 
 impl Default for NgramIndex {
@@ -348,6 +404,47 @@ mod tests {
     #[test]
     fn open_nonexistent() {
         assert!(NgramIndex::open("/tmp/does_not_exist.etxt").is_err());
+    }
+
+    #[test]
+    fn postings_only_candidates_no_text() {
+        let path = "/tmp/enchu_ngram_postings_only.etxt";
+        let _ = std::fs::remove_file(path);
+
+        let mut idx = NgramIndex::new();
+        idx.index(0, "国民は法の下に平等であって");
+        idx.index(1, "すべて国民は個人として尊重される");
+        idx.save_postings_only(path).unwrap();
+
+        let idx2 = NgramIndex::open(path).unwrap();
+        assert!(!idx2.has_text());
+        // 候補 (生 posting intersect) は引ける
+        assert!(idx2.candidates("国民").contains(&0));
+        assert!(idx2.candidates("国民").contains(&1));
+        // 原文非保持
+        assert_eq!(idx2.get_text(0), None);
+
+        // postings-only は index からの rebuild 不可 (source から作り直す)
+        let e = NgramIndex::open_mut(path).err().expect("postings-only は open_mut 不可");
+        assert_eq!(e.kind(), io::ErrorKind::Unsupported);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn postings_only_write_to_bytes_guard_mut() {
+        // Writer 版 + from_bytes_mut ガード
+        let mut idx = NgramIndex::new();
+        idx.index(7, "個人として尊重される");
+        let mut buf: Vec<u8> = Vec::new();
+        idx.write_to_postings_only(&mut buf).unwrap();
+
+        let idx2 = NgramIndex::from_bytes(buf.clone()).unwrap();
+        assert!(!idx2.has_text());
+        assert!(idx2.candidates("尊重").contains(&7));
+
+        let e = NgramIndex::from_bytes_mut(buf).err().expect("postings-only は mut 化不可");
+        assert_eq!(e.kind(), io::ErrorKind::Unsupported);
     }
 
     #[test]
