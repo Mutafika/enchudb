@@ -3,6 +3,31 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.11.0 — 2026-07-06
+
+### Added — 逆写像 (request10 / #76 根治): write-back 正式サポート、 multi-writer p2p 完成
+
+どの peer もどの entity に書けるようになり、 衝突はカード (himo) 単位の HLC LWW
+が裁く。 0.9.0 #76 の single-writer guard (= translated foreign entity への
+write は local-only) を根治で撤去。
+
+- `EidTranslator` に逆写像 (translated local → 元 entity の世界番号) を追加。
+  `.eidmap` sidecar から両方向を復元 (**sidecar format 不変**)
+- 翻訳キーを record の書き手から **eid の産みの親 (`eid_peer`)** に統一 —
+  `Engine::resolve_remote_eid` / `resolve_remote_eid_existing` から author 引数を
+  撤去 (= engine public API breaking)
+- oplog → `_sync_ops` bridge が replica への self-authored write を **元 entity の
+  世界番号に宛名を書き戻して再署名・発送** (`oplog::resign_with_eid` 新設。
+  lsn / HLC / author は維持 = LWW identity 不変)
+- **残る制約**: Ref 値が translated local を指す write は発送されず local-only +
+  一度だけ warn (wire の u32 value に世界番号 u64 が入らない、 wire 拡張の
+  follow-up)。 0.10.x まではこの経路が silent に断片化していたので封鎖でもある
+- **全 peer 同時アップグレード必須**: wire format は不変だが意味論が変わる
+  (0.10 peer は書き手キーで翻訳するため、 非 author write を受けると断片化する)
+- 検証: 3 peer 収束 / reopen 永続 / LWW 双方向 round-trip / ref guard の 4 test
+  (`writeback_reverse_eidmap.rs`) + falsify 実演 (逆写像を無効化すると収束系
+  3 test が「元 entity に着弾しない」で正しく落ちる)
+
 ## 0.10.0 — 2026-07-06
 
 命名の一括整理 release。 breaking rename 2 本 (`TenantView → Scope` /

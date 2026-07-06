@@ -13,13 +13,19 @@
 //!
 //! - 初見の `(author_peer, foreign_local)` → 新しい local eid を払い出して登録
 //! - 既知の組 → 既存 local eid に dispatch
-//! - `author_peer == self.peer_id` なら identity (翻訳不要、 呼び出し側で判定)
+//! - eid の産みの親 (`eid_peer`) が self なら identity (翻訳不要、 呼び出し側で判定)
+//!
+//! # 逆写像 (0.11、 #76 / request10)
+//!
+//! `translated_locals` は逆方向 `local → (author_peer, foreign_local)` の写像。
+//! write-back (= レプリカへの self-authored write) を bridge が元 entity の
+//! 世界番号に宛名を書き戻して発送するために使う。 forward と同じ insert 地点で
+//! 両方向を維持するので、 `.eidmap` sidecar の format は不変のまま再構築できる。
 //!
 //! # 永続化
 //!
-//! commit 1 では in-memory のみ。 再起動で写像が消えると、 同じ foreign entity の
-//! 再 sync が新しい local eid を払い出して **重複** するため、 後続 commit で
-//! oplog (`Op::EidMap`) 経由の永続化 + recovery 復元を入れる。
+//! `.eidmap` sidecar (engine 側) に forward entry を永続化し、 open 時に
+//! `insert` 経由で両方向を復元する。
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -32,11 +38,12 @@ type Key = (PeerId, u32);
 /// foreign eid → local eid の翻訳テーブル。
 pub struct EidTranslator {
     inner: RwLock<HashMap<Key, u32>>,
-    /// #76 (0.9.0): 翻訳先として払い出された local eid の逆引き set。
-    /// 「この local は foreign entity のレプリカか」を O(1) で判定するために持つ。
-    /// レプリカへのローカル write-back は逆写像が無いため他 peer で別 entity に
-    /// 断片化する — bridge 側 guard がこれを見て伝搬を止める。
-    translated_locals: RwLock<std::collections::HashSet<u32>>,
+    /// 0.11 (#76 逆写像): 翻訳先 local eid → 元 entity の世界番号成分
+    /// `(author_peer, foreign_local)` の逆写像。 用途は 2 つ:
+    /// 1. 「この local は foreign entity のレプリカか」の O(1) 判定 (旧 HashSet 相当)
+    /// 2. write-back の宛名解決 — bridge が self-authored write を元 entity の
+    ///    世界番号に書き戻して発送する (`reverse`)
+    translated_locals: RwLock<HashMap<u32, Key>>,
 }
 
 impl Default for EidTranslator {
@@ -49,7 +56,7 @@ impl EidTranslator {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
-            translated_locals: RwLock::new(std::collections::HashSet::new()),
+            translated_locals: RwLock::new(HashMap::new()),
         }
     }
 
@@ -61,15 +68,28 @@ impl EidTranslator {
 
     /// #76: local eid が foreign entity の翻訳先 (= レプリカ) かどうか。
     pub fn is_translated_local(&self, local: u32) -> bool {
-        self.translated_locals.read().unwrap().contains(&local)
+        self.translated_locals.read().unwrap().contains_key(&local)
     }
 
-    /// 写像を登録 (上書き)。 recovery 復元時にも使う。
+    /// 0.11 (#76 逆写像): 翻訳先 local から元 entity の世界番号成分
+    /// `(author_peer, foreign_local)` を引く。 レプリカでなければ None。
+    pub fn reverse(&self, local: u32) -> Option<(PeerId, u32)> {
+        self.translated_locals.read().unwrap().get(&local).copied()
+    }
+
+    /// 写像を登録 (上書き)。 recovery 復元時にも使う。 同 key の上書きで local が
+    /// 変わる場合は stale な逆写像 entry を掃除する。
     pub fn insert(&self, author_peer: PeerId, foreign_local: u32, local: u32) {
         let mut guard = self.inner.write().unwrap();
-        guard.insert((author_peer, foreign_local), local);
+        let old = guard.insert((author_peer, foreign_local), local);
         drop(guard);
-        self.translated_locals.write().unwrap().insert(local);
+        let mut rev = self.translated_locals.write().unwrap();
+        if let Some(old_local) = old {
+            if old_local != local {
+                rev.remove(&old_local);
+            }
+        }
+        rev.insert(local, (author_peer, foreign_local));
     }
 
     /// 写像を **atomic** に get-or-insert する。 未登録なら `alloc` を呼んで local を
@@ -104,7 +124,10 @@ impl EidTranslator {
         let local = alloc()?;
         guard.insert((author_peer, foreign_local), local);
         drop(guard);
-        self.translated_locals.write().unwrap().insert(local);
+        self.translated_locals
+            .write()
+            .unwrap()
+            .insert(local, (author_peer, foreign_local));
         Some(local)
     }
 
@@ -153,5 +176,23 @@ mod tests {
         t.insert(1, 42, 9);
         assert_eq!(t.get(1, 42), Some(9));
         assert_eq!(t.len(), 1);
+        // 0.11: 上書きで stale になった旧 local の逆写像は掃除される
+        assert_eq!(t.reverse(7), None);
+        assert!(!t.is_translated_local(7));
+        assert_eq!(t.reverse(9), Some((1, 42)));
+    }
+
+    #[test]
+    fn reverse_roundtrips() {
+        let t = EidTranslator::new();
+        t.insert(3, 100, 55);
+        assert_eq!(t.reverse(55), Some((3, 100)));
+        assert!(t.is_translated_local(55));
+        // 未登録 local は None
+        assert_eq!(t.reverse(56), None);
+        // get_or_insert_with 経由でも逆写像が載る
+        let l = t.get_or_insert_with(4, 200, || Some(77)).unwrap();
+        assert_eq!(l, 77);
+        assert_eq!(t.reverse(77), Some((4, 200)));
     }
 }

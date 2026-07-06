@@ -451,7 +451,7 @@ impl Syncer {
                 // gossip は default off。
                 // table-less (himo を closed table に解決できない) なら確保先が無いので
                 // skip。 entity / ref value を先に解決してから LWW を更新する。
-                let local_eid = match self.engine.resolve_remote_eid(rec.author_peer, *eid, *himo_id) {
+                let local_eid = match self.engine.resolve_remote_eid(*eid, *himo_id) {
                     Some(e) => e,
                     None => return false,
                 };
@@ -483,7 +483,7 @@ impl Syncer {
             }
             DecodedOp::Untie { eid, himo_id } => {
                 // #9: foreign eid を翻訳 (table-less なら確保先が無いので skip)。
-                let local_eid = match self.engine.resolve_remote_eid(rec.author_peer, *eid, *himo_id) {
+                let local_eid = match self.engine.resolve_remote_eid(*eid, *himo_id) {
                     Some(e) => e,
                     None => return false,
                 };
@@ -503,7 +503,7 @@ impl Syncer {
                 // #9: Delete は himo を持たず table を導けないので既存の翻訳のみ引く。
                 // 未登録 (= ここに一度も sync されてない foreign entity) なら消す対象が
                 // 無いので skip。
-                let local_eid = match self.engine.resolve_remote_eid_existing(rec.author_peer, *eid) {
+                let local_eid = match self.engine.resolve_remote_eid_existing(*eid) {
                     Some(e) => e,
                     None => return false,
                 };
@@ -526,7 +526,7 @@ impl Syncer {
                     Ok(h) => h,
                     Err(_) => return false, // himo 予算枯渇等 — 適用不能
                 };
-                let local_eid = match self.engine.resolve_remote_eid(rec.author_peer, *eid, local_hid) {
+                let local_eid = match self.engine.resolve_remote_eid(*eid, local_hid) {
                     Some(e) => e,
                     None => return false,
                 };
@@ -550,7 +550,7 @@ impl Syncer {
                 // 自力で写像を作ることで構造的に不要になったため削除 — 写像が無い
                 // legacy Content は skip (= 一度も Tie されない entity 宛で、 旧経路
                 // でも実質死んでいたデータ)。
-                let local_eid = match self.engine.resolve_remote_eid_existing(rec.author_peer, *eid) {
+                let local_eid = match self.engine.resolve_remote_eid_existing(*eid) {
                     Some(e) => e,
                     None => return false,
                 };
@@ -659,7 +659,7 @@ mod tests {
         // #9: peer A は foreign eid をそのまま使わず、 自分の eid 空間の local eid に
         // 翻訳して置く。 元の foreign local (=3) ではなく翻訳後の eid で値を引く。
         let local = eng_a
-            .resolve_remote_eid_existing(2, eid_b)
+            .resolve_remote_eid_existing(eid_b)
             .expect("translation mapping should exist after apply");
         let v = eng_a.get(local, "rows.val");
         assert_eq!(v, Some(42));
