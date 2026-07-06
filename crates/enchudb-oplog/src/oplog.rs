@@ -172,6 +172,60 @@ pub fn decode_sync_ops_payload(payload: &[u8]) -> Option<Record> {
     })
 }
 
+/// 0.11 (request10 / #76 逆写像): eid を書き換えて re-sign した record。
+/// bridge が `_sync_ops.payload` を組み立てるのに必要な 3 点セット。
+pub struct ResignedRecord {
+    pub signed_bytes: Vec<u8>,
+    pub signature: [u8; 64],
+    pub pubkey_fp: [u8; 8],
+}
+
+/// 0.11 (request10 / #76 逆写像): record の op 内 eid を `new_eid` に書き換えた
+/// signed_bytes を再構築し、 `keypair` で re-sign する。 bridge が
+/// 「translated foreign entity への self-authored write」 を元 entity の
+/// 世界番号で発送するために使う。
+///
+/// - lsn / hlc / author_peer は元 record の値を**維持**する (= LWW identity と
+///   record の由来を保つ。 変わるのは宛名 = eid だけ)
+/// - 全 op payload で eid は先頭 8 byte 固定 (v2 layout) なので定位置 patch +
+///   crc (payload の FNV-1a) 再計算 + 全体 re-sign で完結する
+/// - eid を持たない op (Commit / Vocab) は None
+/// - `keypair` が None なら zero 署名 (= 署名無効運用、 append 時と同じ扱い)
+pub fn resign_with_eid(
+    rec: &Record,
+    new_eid: u64,
+    keypair: Option<&crate::keys::Keypair>,
+) -> Option<ResignedRecord> {
+    match rec.op {
+        DecodedOp::Tie { .. }
+        | DecodedOp::Untie { .. }
+        | DecodedOp::Delete { .. }
+        | DecodedOp::Content { .. }
+        | DecodedOp::TieNamed { .. } => {}
+        DecodedOp::Commit | DecodedOp::Vocab { .. } => return None,
+    }
+    let mut sb = rec.signed_bytes.clone();
+    if sb.len() < SIGNED_PAYLOAD_HEADER_SIZE + 8 {
+        return None;
+    }
+    let payload_len = u32::from_le_bytes(sb[4..8].try_into().ok()?) as usize;
+    let payload_off = SIGNED_PAYLOAD_HEADER_SIZE;
+    let payload_end = payload_off + payload_len;
+    if payload_end > sb.len() || payload_len < 8 {
+        return None;
+    }
+    // eid patch (全 eid 持ち op で payload 先頭 8 byte)
+    sb[payload_off..payload_off + 8].copy_from_slice(&new_eid.to_le_bytes());
+    // crc は payload のみが対象 (append 時と同じ規約)
+    let crc = fnv1a(&sb[payload_off..payload_end]);
+    sb[36..40].copy_from_slice(&crc.to_le_bytes());
+    let (signature, pubkey_fp) = match keypair {
+        Some(kp) => (kp.sign(&sb), kp.pubkey_fp()),
+        None => (ZERO_SIGNATURE, ZERO_PUBKEY_FP),
+    };
+    Some(ResignedRecord { signed_bytes: sb, signature, pubkey_fp })
+}
+
 /// WAL 初期サイズ(256MB、sparse なので実ディスク消費は書いた分のみ)。
 pub const DEFAULT_OPLOG_SIZE: usize = 256 * 1024 * 1024;
 

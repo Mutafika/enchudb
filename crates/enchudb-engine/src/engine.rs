@@ -1346,9 +1346,10 @@ pub struct Engine {
     /// barrier spin と producer の blocking push が「絶対に進まない待ち」に
     /// 陥らないための脱出フラグ。
     consumer_poisoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// #76: レプリカ (translated foreign entity) への write-back を bridge から
-    /// 除外した際の一度きり警告フラグ。
-    warned_replica_writeback: std::sync::atomic::AtomicBool,
+    /// 0.11 (request10): Ref 値が translated foreign entity を指す write を
+    /// bridge から除外した際の一度きり警告フラグ (u32 wire value に世界番号が
+    /// 入らないため発送不能、 wire 拡張の follow-up 待ち)。
+    warned_ref_to_replica: std::sync::atomic::AtomicBool,
     /// 背景 fsync が最後に completed した LSN。
     durable_lsn: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// v32: この Engine を所有する peer の id。分散時 eid の上位 32bit。
@@ -1553,7 +1554,7 @@ impl Engine {
             oplog: None,
             oplog_record_queue: None,
             consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            warned_replica_writeback: std::sync::atomic::AtomicBool::new(false),
+            warned_ref_to_replica: std::sync::atomic::AtomicBool::new(false),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -1803,7 +1804,7 @@ impl Engine {
             oplog: None,
             oplog_record_queue: None,
             consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            warned_replica_writeback: std::sync::atomic::AtomicBool::new(false),
+            warned_ref_to_replica: std::sync::atomic::AtomicBool::new(false),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -2294,7 +2295,7 @@ impl Engine {
             oplog: None,
             oplog_record_queue: None,
             consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            warned_replica_writeback: std::sync::atomic::AtomicBool::new(false),
+            warned_ref_to_replica: std::sync::atomic::AtomicBool::new(false),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -2587,32 +2588,64 @@ impl Engine {
                 enchudb_oplog::oplog::DecodedOp::Vocab { .. } => false,
             };
             if skip { continue; }
-            // #76 (0.9.0): single-writer guard — foreign entity のレプリカ
-            // (translated local) への **self-authored** write は bridge しない。
-            // 逆写像が無いため他 peer では新規 entity として払い出され、 全 peer で
-            // 断片化する (silent divergence)。 「entity はその author だけが書く」
-            // を正式仕様とし、 レプリカへのローカル編集は local-only に留める。
-            // (逆写像の実装 = write-back の正式サポートは 0.10 候補、 別 request)
+            // 0.11 (request10 / #76 逆写像): translated foreign entity への
+            // **self-authored** write は、 元 entity の世界番号に宛名を書き戻して
+            // bridge する (lsn / hlc / author は維持、 eid を含む payload は再署名)。
+            // 受信側は eid_peer(eid) をキーに翻訳する (phase 2) ので全 peer で
+            // 同一 entity に収束し、 衝突は HLC LWW が裁く。 0.9.0-0.10.x の
+            // single-writer guard はこれで撤去。
+            //
+            // 例外: **Ref 値が translated local を指す write は発送不能**。 wire の
+            // value は u32 で世界番号 (u64) を運べない (= wire 拡張が要る、
+            // request10 follow-up) ため skip + 一度だけ warn で local-only に
+            // 留める。 これは 0.10.x まで silent に断片化していた潜在バグの封鎖。
             let self_peer = wal.peer_id();
-            let replica_writeback = rec.author_peer == self_peer && match &rec.op {
-                enchudb_oplog::oplog::DecodedOp::Tie { eid, .. }
-                | enchudb_oplog::oplog::DecodedOp::Untie { eid, .. }
-                | enchudb_oplog::oplog::DecodedOp::Delete { eid }
-                | enchudb_oplog::oplog::DecodedOp::Content { eid, .. }
-                | enchudb_oplog::oplog::DecodedOp::TieNamed { eid, .. } => {
-                    self.eid_translator.is_translated_local(enchudb_oplog::eid_local(*eid))
+            let mut resigned: Option<enchudb_oplog::oplog::ResignedRecord> = None;
+            if rec.author_peer == self_peer {
+                let ref_to_replica = match &rec.op {
+                    enchudb_oplog::oplog::DecodedOp::Tie { himo_id, value, .. } => {
+                        self.himo_is_ref(*himo_id)
+                            && self.eid_translator.is_translated_local(*value)
+                    }
+                    enchudb_oplog::oplog::DecodedOp::TieNamed { himo_kind, value, .. } => {
+                        *himo_kind == crate::himo_store::ValueType::Ref as u8
+                            && self.eid_translator.is_translated_local(*value)
+                    }
+                    _ => false,
+                };
+                if ref_to_replica {
+                    if !self.warned_ref_to_replica.swap(true, Ordering::Relaxed) {
+                        eprintln!(
+                            "[enchudb] warning: local Ref write pointing at a replicated \
+                             foreign entity is NOT propagated to peers (u32 wire value \
+                             cannot carry a foreign entity id, request10 follow-up)."
+                        );
+                    }
+                    continue;
                 }
-                _ => false,
-            };
-            if replica_writeback {
-                if !self.warned_replica_writeback.swap(true, Ordering::Relaxed) {
-                    eprintln!(
-                        "[enchudb] warning: local write to a replicated foreign entity is \
-                         NOT propagated to peers (single-writer per entity, #76). \
-                         Edit the entity on its author peer instead."
-                    );
+                let row_local = match &rec.op {
+                    enchudb_oplog::oplog::DecodedOp::Tie { eid, .. }
+                    | enchudb_oplog::oplog::DecodedOp::Untie { eid, .. }
+                    | enchudb_oplog::oplog::DecodedOp::Delete { eid }
+                    | enchudb_oplog::oplog::DecodedOp::Content { eid, .. }
+                    | enchudb_oplog::oplog::DecodedOp::TieNamed { eid, .. } => {
+                        Some(enchudb_oplog::eid_local(*eid))
+                    }
+                    _ => None,
+                };
+                if let Some(local) = row_local {
+                    if let Some((owner, owner_local)) = self.eid_translator.reverse(local) {
+                        let world = enchudb_oplog::make_eid(owner, owner_local);
+                        let kp_guard = self.keypair.read().unwrap();
+                        let kp = kp_guard.as_deref();
+                        match enchudb_oplog::oplog::resign_with_eid(rec, world, kp) {
+                            Some(r) => resigned = Some(r),
+                            // eid 持ち op で None は起きないはずだが、 起きたら
+                            // 発送せず local-only に留める (安全側)
+                            None => continue,
+                        }
+                    }
                 }
-                continue;
             }
             count += 1;
             let row_eid = match self.entity_in("_sync_ops") {
@@ -2650,10 +2683,15 @@ impl Engine {
             // _sync_ops 経由にするため signature 込みで保存し、 sync crate で完全な
             // WireRecord に復元できるよう拡張した。 wire format breaking、 0.7.x との
             // 並走 sync は不可。
-            let mut wire_payload = Vec::with_capacity(72 + rec.signed_bytes.len());
-            wire_payload.extend_from_slice(&rec.signature);
-            wire_payload.extend_from_slice(&rec.pubkey_fp);
-            wire_payload.extend_from_slice(&rec.signed_bytes);
+            // 0.11: 逆写像で宛名を書き戻した record は再署名済み payload を使う
+            let (sig, fp, sb): (&[u8; 64], &[u8; 8], &[u8]) = match &resigned {
+                Some(r) => (&r.signature, &r.pubkey_fp, &r.signed_bytes[..]),
+                None => (&rec.signature, &rec.pubkey_fp, &rec.signed_bytes[..]),
+            };
+            let mut wire_payload = Vec::with_capacity(72 + sb.len());
+            wire_payload.extend_from_slice(sig);
+            wire_payload.extend_from_slice(fp);
+            wire_payload.extend_from_slice(sb);
             self.tie_bytes_to_by_id(row_eid, payload_hid, &wire_payload);
         }
 
@@ -3274,28 +3312,33 @@ impl Engine {
     }
 
     /// #9: 受信 op の foreign eid を「自分の eid 空間の local eid」に翻訳する。
-    /// 初見の `(author_peer, foreign_local)` には `himo_id` が属する closed table 内に
+    /// 初見の `(owner, foreign_local)` には `himo_id` が属する closed table 内に
     /// fresh な local entity を払い出す (= local entity と同じ allocator なので衝突しない)。
     /// himo を closed table に解決できない table-less op (anonymous himo / sentinel) は
     /// 安全に確保できる slot が無いので `None` を返す → caller は skip する。
-    /// `author_peer == self.peer_id` なら identity (自分が author の op は翻訳しない)。
+    ///
+    /// 0.11 (request10 phase 2): 翻訳キーは **eid に埋まった産みの親**
+    /// (`eid_peer(foreign_eid)`) であって record の書き手ではない。 single-writer 下
+    /// では両者は常に一致するが、 write-back 解禁後は 「B が書いた A の entity の
+    /// record」 で乖離する — 書き手でキーすると受信側で別 entity に断片化する。
+    /// `eid_peer(foreign_eid) == self.peer_id` なら identity (自分が産んだ entity)。
     pub fn resolve_remote_eid(
         &self,
-        author_peer: enchudb_oplog::PeerId,
         foreign_eid: enchudb_oplog::EntityId,
         himo_id: u16,
     ) -> Option<enchudb_oplog::EntityId> {
         use std::sync::atomic::Ordering;
         let self_peer = self.peer_id.load(Ordering::Acquire);
-        if author_peer == self_peer {
-            return Some(foreign_eid); // identity: 自分が author の op
+        let owner = enchudb_oplog::eid_peer(foreign_eid);
+        if owner == self_peer {
+            return Some(foreign_eid); // identity: 自分が産んだ entity
         }
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
         // get-or-allocate を atomic に行う (= 並行 apply で同じ foreign entity を
         // double-alloc しない)。 alloc が None (= table-less) なら写像を作らず None。
         let local = self
             .eid_translator
-            .get_or_insert_with(author_peer, foreign_local, || {
+            .get_or_insert_with(owner, foreign_local, || {
                 self.alloc_translated_local(himo_id)
             })?;
         Some(enchudb_oplog::make_eid(self_peer, local))
@@ -3303,20 +3346,21 @@ impl Engine {
 
     /// #9: 既存の翻訳のみ引く (払い出しはしない)。 Delete のように himo を持たず
     /// table を導けない op 用。 未登録 (= 一度も Tie されてない foreign entity) なら
-    /// None → 呼び出し側で skip。 `author_peer == self` なら identity。
+    /// None → 呼び出し側で skip。 キーは `resolve_remote_eid` と同じく eid の
+    /// 産みの親 (`eid_peer`)、 産みの親 == self なら identity。
     pub fn resolve_remote_eid_existing(
         &self,
-        author_peer: enchudb_oplog::PeerId,
         foreign_eid: enchudb_oplog::EntityId,
     ) -> Option<enchudb_oplog::EntityId> {
         use std::sync::atomic::Ordering;
         let self_peer = self.peer_id.load(Ordering::Acquire);
-        if author_peer == self_peer {
+        let owner = enchudb_oplog::eid_peer(foreign_eid);
+        if owner == self_peer {
             return Some(foreign_eid);
         }
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
         self.eid_translator
-            .get(author_peer, foreign_local)
+            .get(owner, foreign_local)
             .map(|local| enchudb_oplog::make_eid(self_peer, local))
     }
 

@@ -57,7 +57,7 @@ fn concurrent_resolve_same_foreign_is_consistent() {
         let barrier = barrier.clone();
         handles.push(std::thread::spawn(move || {
             barrier.wait();
-            eid_local(eng.resolve_remote_eid(1, foreign, himo).expect("notes himo resolves to a table"))
+            eid_local(eng.resolve_remote_eid(foreign, himo).expect("notes himo resolves to a table"))
         }));
     }
     let locals: Vec<u32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
@@ -95,7 +95,7 @@ fn concurrent_resolve_distinct_foreigns_no_collision() {
         handles.push(std::thread::spawn(move || {
             barrier.wait();
             eid_local(
-                eng.resolve_remote_eid(1, make_eid(1, 100 + i), himo)
+                eng.resolve_remote_eid(make_eid(1, 100 + i), himo)
                     .expect("notes himo resolves to a table"),
             )
         }));
@@ -123,7 +123,7 @@ fn corrupt_eidmap_sidecar_falls_back_gracefully() {
     {
         let eng = make_engine(&path, 2);
         let himo = eng.himo_id("notes.note").unwrap() as u16;
-        eng.resolve_remote_eid(1, make_eid(1, 3), himo).unwrap();
+        eng.resolve_remote_eid(make_eid(1, 3), himo).unwrap();
         eng.persist_tables().unwrap();
         assert!(eng.eid_translator().len() >= 1);
         drop(eng);
@@ -159,7 +159,7 @@ fn truncated_eidmap_sidecar_falls_back_gracefully() {
     {
         let eng = make_engine(&path, 2);
         let himo = eng.himo_id("notes.note").unwrap() as u16;
-        eng.resolve_remote_eid(1, make_eid(1, 9), himo).unwrap();
+        eng.resolve_remote_eid(make_eid(1, 9), himo).unwrap();
         eng.persist_tables().unwrap();
         drop(eng);
     }
@@ -247,7 +247,7 @@ fn content_sync_does_not_panic() {
 
     // The Tie'd entity's content followed via the reused mapping.
     let local = eng_b
-        .resolve_remote_eid_existing(1, e_a)
+        .resolve_remote_eid_existing(e_a)
         .expect("entity should be mapped from its Tie");
     assert_eq!(
         eng_b.get_content(local, "memo"),
@@ -273,7 +273,7 @@ fn huge_count_eidmap_sidecar_does_not_oom() {
     {
         let eng = make_engine(&path, 2);
         let himo = eng.himo_id("notes.note").unwrap() as u16;
-        eng.resolve_remote_eid(1, make_eid(1, 4), himo).unwrap();
+        eng.resolve_remote_eid(make_eid(1, 4), himo).unwrap();
         eng.persist_tables().unwrap();
         drop(eng);
     }
@@ -351,7 +351,7 @@ fn content_before_tie_is_buffered_then_applied() {
     let out1 = syncer_b.apply_records(&content_first);
     assert!(out1.applied > 0, "TieNamed は写像を自力で作って即 apply されるはず");
     let local = eng_b
-        .resolve_remote_eid_existing(1, e_a)
+        .resolve_remote_eid_existing(e_a)
         .expect("TieNamed だけで entity が写像されるはず");
     assert_eq!(
         eng_b.get_content(local, "memo"),
@@ -363,7 +363,7 @@ fn content_before_tie_is_buffered_then_applied() {
     let out2 = syncer_b.apply_records(&rest);
     assert!(out2.applied > 0, "the Tie should apply");
     let local2 = eng_b
-        .resolve_remote_eid_existing(1, e_a)
+        .resolve_remote_eid_existing(e_a)
         .expect("entity mapped");
     assert_eq!(local, local2, "後続の Tie は既存写像に合流するはず");
     assert_eq!(eng_b.get(local2, "notes.note"), Some(7));
@@ -404,7 +404,7 @@ fn foreign_delete_tombstone_survives_reopen() {
         );
         let out = syncer.apply_records(&[tie, del]);
         assert_eq!(out.applied, 2, "Tie + Delete should both apply");
-        let local = eng_b.resolve_remote_eid_existing(1, foreign).expect("mapped");
+        let local = eng_b.resolve_remote_eid_existing(foreign).expect("mapped");
         assert_eq!(eng_b.get(local, "notes.note"), None, "entity deleted before reopen");
 
         eng_b.oplog_sync().unwrap(); // make the entity removal in the body durable
@@ -429,7 +429,7 @@ fn foreign_delete_tombstone_survives_reopen() {
     assert_eq!(out.applied, 0, "stale Tie must be rejected by the restored tombstone");
 
     let local = eng_b2
-        .resolve_remote_eid_existing(1, foreign)
+        .resolve_remote_eid_existing(foreign)
         .expect("mapping restored on reopen");
     assert_eq!(
         eng_b2.get(local, "notes.note"),
@@ -467,7 +467,7 @@ fn replica_writeback_is_not_propagated() {
     let records = transport.pull(1, Hlc::ZERO);
     syncer_b.apply_records(&records);
     let local_b = eng_b
-        .resolve_remote_eid_existing(1, e_a)
+        .resolve_remote_eid_existing(e_a)
         .expect("A の entity が B に写像される");
 
     // B がレプリカをローカル編集 → guard により bridge されないはず

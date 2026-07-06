@@ -155,7 +155,7 @@ fn translation_mapping_survives_reopen() {
     assert!(out.applied > 0, "A's record should apply");
     let local_x = eid_local(
         eng_b
-            .resolve_remote_eid_existing(1, e_a)
+            .resolve_remote_eid_existing(e_a)
             .expect("mapping should exist after apply"),
     );
     let n_before = eng_b.eid_translator().len();
@@ -177,7 +177,7 @@ fn translation_mapping_survives_reopen() {
         "translation mapping must be restored on reopen"
     );
     assert_eq!(
-        eng_b2.resolve_remote_eid_existing(1, e_a).map(eid_local),
+        eng_b2.resolve_remote_eid_existing(e_a).map(eid_local),
         Some(local_x),
         "the same foreign entity must resolve to the same local eid after reopen"
     );
@@ -252,11 +252,11 @@ fn cross_peer_ref_value_is_translated() {
     // B 側の company / user の翻訳後 local eid。
     let c_local = eid_local(
         eng_b
-            .resolve_remote_eid_existing(1, c)
+            .resolve_remote_eid_existing(c)
             .expect("company should be mapped"),
     );
     let u_eid = eng_b
-        .resolve_remote_eid_existing(1, u)
+        .resolve_remote_eid_existing(u)
         .expect("user should be mapped");
 
     // 翻訳が効いていれば A の company は B 自身の company とは別 slot に置かれる。

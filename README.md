@@ -279,6 +279,16 @@ writer は `.db.lock` sidecar に `flock(LOCK_EX)` を engine 寿命中保持。
 
 GUI app + CLI を同 DB で共存する場合は **GUI が `open_readonly`、 CLI が subprocess として writer で開く**のが推奨パターン。 詳細は [`docs/concurrency.md`](./docs/concurrency.md)。
 
+### peer 間の書き込み (sync)
+
+0.11 から **multi-writer**: どの peer もどの entity にも書けて、 衝突はカード
+(himo) 単位の HLC LWW で解決する (= 同時書き込みは時間が解決する)。 同期は
+**論理収束** (op 交換で内容が同じ蔵書に収束する) であって物理レプリカではない。
+唯一の残存制約: **Ref 値が foreign entity のレプリカを指す write** は local に
+留まり peer に流れない (wire の u32 value に世界番号が入らないため、 wire 拡張の
+follow-up 待ち)。 〜0.10.x は per-entity single-writer (= author しか書けない)
+だった。
+
 ## Testing
 
 ```bash
