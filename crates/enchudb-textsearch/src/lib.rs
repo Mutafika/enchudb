@@ -68,6 +68,22 @@ impl TextSearch {
         self.idx.write_to(w)
     }
 
+    /// 原文非保持 (postings-only) で書き出す。native のみ。
+    ///
+    /// `.etxt` が DB 本体の本文を二重化しなくなる (#84)。 この file を開いた engine は
+    /// 原文を持たないので [`search`](TextSearch::search) の substring 検証ができない。
+    /// caller は [`candidates`](TextSearch::candidates) の生候補を DB 本体の原文で
+    /// 検証する (naruhodo hanrei の body lookup がその経路)。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn save_postings_only(&mut self, path: &str) -> io::Result<()> {
+        self.idx.save_postings_only(path)
+    }
+
+    /// `save_postings_only` の Writer 版。
+    pub fn write_to_postings_only<W: std::io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+        self.idx.write_to_postings_only(w)
+    }
+
     /// entity にテキストを登録
     pub fn index(&mut self, eid: u64, text: &str) {
         self.idx.index(eid, text);
@@ -114,6 +130,25 @@ impl TextSearch {
             .into_iter()
             .filter(|&eid| self.idx.get_text(eid).is_some_and(|text| text.contains(query)))
             .collect()
+    }
+
+    /// クエリの **生候補** doc id（bigram intersect、`.contains()` 検証なし）。
+    ///
+    /// [`search`](TextSearch::search) が内部で行う原文照合を **しない**。原文を
+    /// index が持たない postings-only モード (#84) で、substring 検証を caller 側
+    /// (DB 本体の原文) に委ねるための入口:
+    /// - 多 bigram クエリは偽陽性を含みうる（`"AB" "BC"` を持つが連続 `"ABBC"` 無しの
+    ///   doc も入る）。caller が原文を引いて `.contains()` で落とす。
+    /// - 1 bigram（2 文字）は候補がそのまま正確一致。
+    /// - 2 文字未満は bigram を作れず空（単一文字は caller が source を全走査する）。
+    pub fn candidates(&self, query: &str) -> Vec<u64> {
+        self.idx.candidates(query)
+    }
+
+    /// この engine が原文を保持しているか。false = postings-only で開いた
+    /// (= `search` の検証不可、`candidates` + caller 検証を使う)。
+    pub fn has_text(&self) -> bool {
+        self.idx.has_text()
     }
 
     /// 原文を取得
@@ -299,6 +334,43 @@ mod tests {
 
         assert_eq!(eng2.get_text(0), Some("国民は法の下に平等であって"));
         assert_eq!(eng2.get_text(99), None);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn postings_only_caller_side_verification() {
+        // 原文を DB (ここでは source map で代用) が持ち、index は postings-only。
+        // 多 bigram の偽陽性は index では落ちない → caller が source の原文で検証して落とす。
+        // eid 0 は "法の" "の下" の bigram を両方持つが substring "法の下" を含まない = 偽陽性。
+        let source: std::collections::HashMap<u64, &str> =
+            [(0u64, "机の下に法の本"), (1u64, "法の下の平等")]
+                .into_iter()
+                .collect();
+
+        let mut eng = TextSearch::new();
+        for (&eid, &text) in &source {
+            eng.index(eid, text);
+        }
+        let path = "/tmp/enchu_textsearch_postings_only.etxt";
+        let _ = std::fs::remove_file(path);
+        eng.save_postings_only(path).unwrap();
+
+        let eng2 = TextSearch::open(path).unwrap();
+        assert!(!eng2.has_text());
+        assert_eq!(eng2.get_text(0), None, "postings-only は原文非保持");
+
+        // 生候補は両方 (偽陽性 eid 0 込み)
+        let mut cand = eng2.candidates("法の下");
+        cand.sort_unstable();
+        assert_eq!(cand, vec![0, 1]);
+
+        // caller 側で source の原文照合すると偽陽性が落ちる (= 現 search() の検証を外出し)
+        let verified: Vec<u64> = cand
+            .into_iter()
+            .filter(|eid| source.get(eid).is_some_and(|t| t.contains("法の下")))
+            .collect();
+        assert_eq!(verified, vec![1]);
 
         let _ = std::fs::remove_file(path);
     }

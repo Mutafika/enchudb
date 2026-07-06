@@ -7,7 +7,9 @@
 //!   posting_total: u32 (4) — entity ID エントリ総数（バイト数ではない）
 //!   doc_count: u32 (4)
 //!   text_total: u32 (4) — テキストデータ総バイト数
-//!   _reserved: [u8; 8]
+//!   flags: u8 (1) — bit0 TEXT_OMITTED: Doc Index / Text Data を持たない
+//!                   postings-only index (原文は DB 本体が所有、検証は caller 側 #84)
+//!   _reserved: [u8; 7]
 //!
 //! [Bigram Index] — bigram_count × 12 bytes
 //!   key: u32, offset: u32, len: u32
@@ -45,6 +47,12 @@ const BIGRAM_ENTRY: usize = 12;       // key u32 + offset u32 + len u32
 const POSTING_ENTRY: usize = 8;       // eid u64
 const DOC_ENTRY: usize = 16;          // eid u64 + offset u32 + len u32
 
+/// header の flags byte (`_reserved` の先頭 = buf[24])。 立っていれば Doc Index /
+/// Text Data 無しの postings-only index。 旧 v2 file は reserved 全 0 = 原文保持、
+/// で自然に後方互換 (#84)。
+const FLAG_TEXT_OMITTED: u8 = 0x01;
+const FLAGS_OFFSET: usize = 24;
+
 /// Posting Data 先頭を 8-byte 境界に揃えるためのパディング量
 #[inline]
 fn posting_padding(bigram_count: u32) -> usize {
@@ -77,6 +85,8 @@ pub struct MappedIndex {
     posting_total: u32,
     doc_count: u32,
     text_total: u32,
+    /// FLAG_TEXT_OMITTED が立っていれば原文非保持 (postings-only)。
+    text_omitted: bool,
 }
 
 #[inline]
@@ -113,6 +123,7 @@ impl MappedIndex {
         let posting_total = u32::from_le_bytes(buf[12..16].try_into().unwrap());
         let doc_count = u32::from_le_bytes(buf[16..20].try_into().unwrap());
         let text_total = u32::from_le_bytes(buf[20..24].try_into().unwrap());
+        let text_omitted = buf[FLAGS_OFFSET] & FLAG_TEXT_OMITTED != 0;
 
         // ── 構造検証 ──
         // header のカウント類と各エントリの offset/len を全部バッファサイズに対して
@@ -161,7 +172,7 @@ impl MappedIndex {
             }
         }
 
-        Ok(Self { backing, bigram_count, posting_total, doc_count, text_total })
+        Ok(Self { backing, bigram_count, posting_total, doc_count, text_total, text_omitted })
     }
 
     /// bigram key → posting list (entity IDs)。
@@ -219,8 +230,10 @@ impl MappedIndex {
         result
     }
 
-    /// entity ID → 原文
+    /// entity ID → 原文。 postings-only index は原文を持たないので常に None
+    /// (呼び出し側が DB 本体の原文を引く前提 #84)。
     pub fn get_text(&self, eid: u64) -> Option<&str> {
+        if self.text_omitted { return None; }
         let idx = self.doc_index();
         let mut lo = 0usize;
         let mut hi = self.doc_count as usize;
@@ -276,6 +289,9 @@ impl MappedIndex {
     pub fn bigram_count(&self) -> u32 { self.bigram_count }
     pub fn doc_count(&self) -> u32 { self.doc_count }
 
+    /// この index が原文 (Text Data) を保持しているか。 false = postings-only。
+    pub fn has_text(&self) -> bool { !self.text_omitted }
+
     // ── レイアウト ──
 
     fn bigram_index(&self) -> &[u8] {
@@ -328,11 +344,42 @@ pub fn save(
     write_to(&mut file, postings, originals)
 }
 
+/// 原文非保持 (postings-only) でファイルに書き出す。 Doc Index / Text Data を
+/// 省き header に FLAG_TEXT_OMITTED を立てる。 substring 検証は caller が DB 本体の
+/// 原文で行う前提 (#84)。 index が store の本文を二重化しなくなる。
+#[cfg(not(target_arch = "wasm32"))]
+pub fn save_postings_only(
+    path: &Path,
+    postings: &std::collections::HashMap<u32, Vec<u64>>,
+) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    write_to_postings_only(&mut file, postings)
+}
+
 /// 任意の Writer に書き出す。テストや tar/zst パイプラインから使う。
 pub fn write_to<W: Write>(
     w: &mut W,
     postings: &std::collections::HashMap<u32, Vec<u64>>,
     originals: &std::collections::HashMap<u64, String>,
+) -> io::Result<()> {
+    write_index(w, postings, Some(originals))
+}
+
+/// `write_to` の postings-only 版 (原文非保持)。
+pub fn write_to_postings_only<W: Write>(
+    w: &mut W,
+    postings: &std::collections::HashMap<u32, Vec<u64>>,
+) -> io::Result<()> {
+    write_index(w, postings, None)
+}
+
+/// 共通の書き出し。 `originals` が `None` なら postings-only
+/// (Doc Index / Text Data を省き flag を立てる)。 `Some` のときは従来と
+/// **バイト等価** (reserved 先頭が 0 = flag 無し)。
+fn write_index<W: Write>(
+    w: &mut W,
+    postings: &std::collections::HashMap<u32, Vec<u64>>,
+    originals: Option<&std::collections::HashMap<u64, String>>,
 ) -> io::Result<()> {
     // bigram index をキー順にソート
     let mut bigram_entries: Vec<(u32, &Vec<u64>)> = postings.iter().map(|(&k, v)| (k, v)).collect();
@@ -341,12 +388,20 @@ pub fn write_to<W: Write>(
     let bigram_count = bigram_entries.len() as u32;
     let posting_total: u32 = bigram_entries.iter().map(|(_, v)| v.len() as u32).sum();
 
-    // doc index を eid 順にソート
-    let mut doc_entries: Vec<(u64, &String)> = originals.iter().map(|(&k, v)| (k, v)).collect();
+    // doc index を eid 順にソート (postings-only なら空)
+    let mut doc_entries: Vec<(u64, &String)> = match originals {
+        Some(o) => o.iter().map(|(&k, v)| (k, v)).collect(),
+        None => Vec::new(),
+    };
     doc_entries.sort_by_key(|(k, _)| *k);
 
     let doc_count = doc_entries.len() as u32;
     let text_total: u32 = doc_entries.iter().map(|(_, v)| v.len() as u32).sum();
+
+    let mut reserved = [0u8; 8];
+    if originals.is_none() {
+        reserved[0] = FLAG_TEXT_OMITTED;
+    }
 
     // Header
     w.write_all(MAGIC)?;
@@ -355,7 +410,7 @@ pub fn write_to<W: Write>(
     w.write_all(&posting_total.to_le_bytes())?;
     w.write_all(&doc_count.to_le_bytes())?;
     w.write_all(&text_total.to_le_bytes())?;
-    w.write_all(&[0u8; 8])?; // reserved
+    w.write_all(&reserved)?;
 
     // Bigram Index
     let mut offset: u32 = 0;
@@ -424,6 +479,33 @@ mod tests {
         assert_eq!(idx.doc_count(), 2);
         assert_eq!(idx.get_posting(1), vec![10, 20]);
         assert_eq!(idx.get_text(10), Some("国民は法の下に平等"));
+    }
+
+    #[test]
+    fn postings_only_omits_text() {
+        let mut postings: HashMap<u32, Vec<u64>> = HashMap::new();
+        postings.insert(1, vec![10, 20]);
+        postings.insert(2, vec![10]);
+        let mut buf = Vec::new();
+        write_to_postings_only(&mut buf, &postings).unwrap();
+
+        let idx = MappedIndex::from_bytes(buf).unwrap();
+        assert!(!idx.has_text(), "postings-only は has_text=false");
+        assert_eq!(idx.doc_count(), 0, "Doc Index を持たない");
+        // 候補 (posting) は引ける
+        assert_eq!(idx.get_posting(1), vec![10, 20]);
+        assert_eq!(idx.intersect(&[1, 2]), vec![10]);
+        // 原文は持たない
+        assert_eq!(idx.get_text(10), None);
+    }
+
+    #[test]
+    fn text_holding_bytes_are_unchanged() {
+        // 原文保持の書き出しは flag 導入後もバイト等価 (reserved[0]==0)。
+        let buf = build_valid_bytes();
+        assert_eq!(buf[FLAGS_OFFSET] & FLAG_TEXT_OMITTED, 0);
+        let idx = MappedIndex::from_bytes(buf).unwrap();
+        assert!(idx.has_text());
     }
 
     #[test]
