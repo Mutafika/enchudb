@@ -1349,7 +1349,7 @@ mod tests {
     /// graceful に返すこと (= wal_full_err 経路)。 旧来の挙動を回帰で固定する。
     #[test]
     fn append_returns_err_when_full_not_panic() {
-        let p = tmp("full");
+        let p = tmp("full_graceful");
         // HEADER_SIZE(32) + 数レコードぶんしか入らない極小 capacity。
         let wal = OpLog::create(&p, HEADER_SIZE + 256).unwrap();
         let mut hit_full = false;
