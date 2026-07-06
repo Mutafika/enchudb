@@ -3,7 +3,7 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
-## Unreleased (0.11.0 予定)
+## 0.11.0 — 2026-07-06
 
 ### Added — 逆写像 (request10 / #76 根治): write-back 正式サポート、 multi-writer p2p 完成
 
