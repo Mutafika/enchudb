@@ -2396,6 +2396,10 @@ impl Engine {
         if !readonly {
             eng.vocab.mark_index_clean(false);
             eng.himo_reg.mark_index_clean(false);
+            // v6 (#88): routed-Leaf の live cell offset から LeafStore free-list を
+            // 再構成 (free-list は非永続)。 これが無いと dead slot が再利用されず
+            // footprint が増える。
+            eng.rebuild_leaf_free_list();
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let _ = eng.backing.flush_range(eng.layout.vocab_data_off, 16);
@@ -3550,6 +3554,43 @@ impl Engine {
         }
     }
 
+    /// v6 (#88): text 型 himo の cell 生値 (raw) を payload に解決。 routed-Leaf は
+    /// LeafStore offset として、 それ以外 (Tag / reserved Leaf) は vocab vid として読む。
+    #[inline]
+    fn text_value(&self, hid: usize, raw: u32) -> &[u8] {
+        match self.leaf_for(hid) {
+            Some(leaf) => leaf.get(raw),
+            None => self.vocab.get(raw),
+        }
+    }
+
+    /// v6 (#88): routed-Leaf の cell が offset を持っていれば LeafStore に free。
+    /// delete / untie / apply_op の remove 直前に呼ぶ (leak 防止)。 非 routed は no-op。
+    #[inline]
+    fn free_leaf_cell(&self, eid: u32, hid: usize) {
+        if let Some(leaf) = self.leaf_for(hid)
+            && let Some(off) = self.himos[hid].get_value(eid)
+        {
+            leaf.free(off);
+        }
+    }
+
+    /// v6 (#88): open 時に routed-Leaf の live cell offset を集めて LeafStore の
+    /// free-list を再構成する (free-list は非永続 = store の派生)。 writable open の
+    /// load 末尾で呼ぶ。 これが無いと過去 session で空いた slot が再利用されない。
+    fn rebuild_leaf_free_list(&self) {
+        let Some(leaf) = self.leaf.as_ref() else { return; };
+        let mut live: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for hid in 0..self.himos.len() {
+            if self.leaf_for(hid).is_some() {
+                for off in self.himos[hid].unique_values() {
+                    live.insert(off);
+                }
+            }
+        }
+        leaf.rebuild_free_list(&live);
+    }
+
     /// v6 (#88): リモート peer から届いた TieLeaf を apply。 bytes を local
     /// LeafStore に insert して cell に offset を張る (vid mapping 不要)。
     /// `remote_tie_apply` の Leaf 版。
@@ -3564,6 +3605,8 @@ impl Engine {
         let hid = himo_id as usize;
         if hid >= self.himos.len() { return; }
         self.entities.ensure_live(local);
+        // v6 (#88): remote re-tie 上書きで旧 offset を回収。
+        self.free_leaf_cell(local, hid);
         let value = match self.leaf_for(hid) {
             Some(leaf) => leaf.insert(bytes),
             None => self.vocab.insert(bytes), // pre-v6 / reserved: 旧 vocab fallback
@@ -3623,6 +3666,7 @@ impl Engine {
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
         if hid >= self.himos.len() { return; }
+        self.free_leaf_cell(local, hid);
         self.himos[hid].remove(local);
         if self.gossip_remote_apply() {
             if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
@@ -3642,6 +3686,7 @@ impl Engine {
     ) {
         let local = enchudb_oplog::eid_local(eid);
         for hid in 0..self.himos.len() {
+            self.free_leaf_cell(local, hid);
             self.himos[hid].remove(local);
         }
         self.entities.free(local);
@@ -3947,6 +3992,14 @@ impl Engine {
         let hid = self.ensure_himo(himo, ValueType::Tag, 0);
         // β-light step 6: eid が himo の所属 table eid_range 内か
         self.validate_eid_for_himo(hid, eid);
+        // v6 (#88): Leaf は LeafStore へ。 &mut self (build phase) は WAL emit しない
+        // ので leaf.insert + cell set のみ。 re-tie 上書きは旧 offset を free。
+        if let Some(leaf) = self.leaf_for(hid) {
+            if let Some(old) = self.himos[hid].get_value(eid) { leaf.free(old); }
+            let off = leaf.insert(value.as_bytes());
+            self.himos[hid].set(eid, off);
+            return;
+        }
         // Tag は dedupe (get_or_insert)、Leaf は新規 id 発行 (insert)。
         let vid = match self.value_types[hid] {
             ValueType::Tag => self.vocab.get_or_insert(value.as_bytes()),
@@ -4001,6 +4054,24 @@ impl Engine {
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
+        // v6 (#88): Leaf は LeafStore へ (vocab の vid は使わない)。 re-tie 上書きは
+        // 旧 offset を free してから insert (leak 防止)。 sync は bytes 同乗 TieLeaf。
+        if let Some(leaf) = self.leaf_for(hid) {
+            let bytes = value.as_bytes();
+            if let Some(old) = self.himos[hid].get_value(eid) { leaf.free(old); }
+            let off = leaf.insert(bytes);
+            self.himos[hid].set(eid, off);
+            if let Some(wal) = self.oplog.as_ref() {
+                let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
+                let _ = wal.append(enchudb_oplog::oplog::Op::TieLeaf {
+                    eid: oplog_eid,
+                    himo_name: &self.himo_names[hid],
+                    himo_kind: self.value_types[hid] as u8,
+                    bytes,
+                });
+            }
+            return;
+        }
         // Tag は dedupe、Leaf は常に新規 id。
         let vid = match self.value_types[hid] {
             ValueType::Tag => self.vocab.get_or_insert(value.as_bytes()),
@@ -4043,6 +4114,22 @@ impl Engine {
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
+        // v6 (#88): Leaf は LeafStore へ。 re-tie 上書きは旧 offset を free。
+        if let Some(leaf) = self.leaf_for(hid) {
+            if let Some(old) = self.himos[hid].get_value(eid) { leaf.free(old); }
+            let off = leaf.insert(value);
+            self.himos[hid].set(eid, off);
+            if let Some(wal) = self.oplog.as_ref() {
+                let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
+                let _ = wal.append(enchudb_oplog::oplog::Op::TieLeaf {
+                    eid: oplog_eid,
+                    himo_name: &self.himo_names[hid],
+                    himo_kind: self.value_types[hid] as u8,
+                    bytes: value,
+                });
+            }
+            return;
+        }
         let vid = match self.value_types[hid] {
             ValueType::Tag => self.vocab.get_or_insert(value),
             ValueType::Leaf => self.vocab.insert(value),
@@ -4142,6 +4229,7 @@ impl Engine {
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         if hid >= self.himos.len() { return; }
+        self.free_leaf_cell(eid, hid);
         self.himos[hid].remove(eid);
         if let Some(wal) = self.oplog.as_ref() {
             let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
@@ -4155,6 +4243,7 @@ impl Engine {
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
         for hid in 0..self.himos.len() {
+            self.free_leaf_cell(eid, hid);
             self.himos[hid].remove(eid);
         }
         self.entities.free(eid);
@@ -4259,7 +4348,7 @@ impl Engine {
         // 新経路 (`_c_{key}` Leaf himo) 優先
         if let Some(hid) = self.content_himo_id(local, key) {
             if let Some(vid) = self.get_by_id(eid, hid) {
-                return Some(self.vocab.get(vid));
+                return Some(self.text_value(hid as usize, vid));
             }
         }
         // 旧 content region fallback (pre-0.9 data の read-through 互換)
@@ -4337,11 +4426,11 @@ impl Engine {
     pub fn get_text(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Option<&[u8]> {
         let eid = enchudb_oplog::eid_local(eid);
         let hid = self.himo_id(himo)?;
-        // Tag と Leaf は両方 vocab 経由で bytes を持つ (Leaf は dedupe なし、Tag は dedupe あり)。
+        // Tag は vocab、 routed-Leaf (#88) は LeafStore、 reserved Leaf は vocab。
         match self.value_types[hid] {
             ValueType::Tag | ValueType::Leaf => {
-                let vid = self.himos[hid].get_value(eid)?;
-                Some(self.vocab.get(vid))
+                let raw = self.himos[hid].get_value(eid)?;
+                Some(self.text_value(hid, raw))
             }
             _ => None,
         }
@@ -5764,7 +5853,7 @@ impl Engine {
         for (i, hs) in self.himos.iter().enumerate() {
             if let Some(raw) = hs.get_value(eid) {
                 let val = match self.value_types[i] {
-                    ValueType::Tag | ValueType::Leaf => EntityValue::Text(self.vocab.get(raw)),
+                    ValueType::Tag | ValueType::Leaf => EntityValue::Text(self.text_value(i, raw)),
                     _ => EntityValue::Num(raw),
                 };
                 fields.push((self.himo_names[i].as_str(), val));
@@ -6855,6 +6944,9 @@ impl Engine {
         // stored は内部表現値 +1 ではなく素の vid なので decode 不要。
         let mut is_live = vec![false; vocab_total as usize];
         for hid in 0..self.value_types.len() {
+            // v6 (#88): routed-Leaf の cell は vocab vid でなく LeafStore offset なので
+            // vocab の live 判定から除外する (含めると無関係な vid を live 誤判定)。
+            if self.leaf_for(hid).is_some() { continue; }
             match self.value_types[hid] {
                 ValueType::Tag | ValueType::Leaf => {
                     let vids = self.himos[hid].unique_values();
@@ -6897,15 +6989,19 @@ impl Engine {
             Op::Tie { eid, himo_id, value } => {
                 let hid = himo_id as usize;
                 if hid >= self.himos.len() { return; }
+                // v6 (#88): routed-Leaf の re-tie 上書きは旧 offset を free (async path)。
+                self.free_leaf_cell(eid, hid);
                 self.himos[hid].set(eid, value);
             }
             Op::Untie { eid, himo_id } => {
                 let hid = himo_id as usize;
                 if hid >= self.himos.len() { return; }
+                self.free_leaf_cell(eid, hid);
                 self.himos[hid].remove(eid);
             }
             Op::Delete { eid } => {
                 for hid in 0..self.himos.len() {
+                    self.free_leaf_cell(eid, hid);
                     self.himos[hid].remove(eid);
                 }
                 self.entities.free(eid);
@@ -6998,6 +7094,31 @@ impl Engine {
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         // β-light step 6: eid が himo の所属 table eid_range 内か
         self.validate_eid_for_himo(hid, local);
+        // v6 (#88): Leaf は LeafStore へ。 offset を write_queue の value に載せ、
+        // WAL には bytes 同乗 TieLeaf を流す。 旧 offset の free は apply_op::Tie 側
+        // (= 適用時点の cell を見る。 push 時 free は queue 未適用の二重 free を招く)。
+        if let Some(leaf) = self.leaf_for(hid) {
+            let off = leaf.insert(value);
+            let q = self.write_queue.as_ref()
+                .expect("tie_bytes_async requires create_concurrent or concurrentize");
+            q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value: off });
+            self.push_count.fetch_add(1, Ordering::Release);
+            if let Some(wal) = self.oplog.as_ref() {
+                let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
+                let rec = enchudb_oplog::oplog::OwnedOp::TieLeaf {
+                    eid: oplog_eid,
+                    himo_name: self.himo_names[hid].clone(),
+                    himo_kind: self.value_types[hid] as u8,
+                    bytes: value.to_vec(),
+                };
+                if let Some(wq) = self.oplog_record_queue.as_ref() {
+                    push_oplog_record_blocking(wq, rec, &self.consumer_poisoned, &self.wal_push_count);
+                } else {
+                    let _ = wal.append(rec.as_op());
+                }
+            }
+            return;
+        }
         // Tag は dedupe、Leaf は常に新規 id。
         let vid = match self.value_types[hid] {
             ValueType::Tag => self.vocab.get_or_insert(value),
