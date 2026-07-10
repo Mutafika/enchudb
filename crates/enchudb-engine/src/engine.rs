@@ -2634,7 +2634,8 @@ impl Engine {
                 | enchudb_oplog::oplog::DecodedOp::Untie { eid, .. }
                 | enchudb_oplog::oplog::DecodedOp::Delete { eid }
                 | enchudb_oplog::oplog::DecodedOp::Content { eid, .. }
-                | enchudb_oplog::oplog::DecodedOp::TieNamed { eid, .. } => is_internal_eid(*eid),
+                | enchudb_oplog::oplog::DecodedOp::TieNamed { eid, .. }
+                | enchudb_oplog::oplog::DecodedOp::TieLeaf { eid, .. } => is_internal_eid(*eid),
                 enchudb_oplog::oplog::DecodedOp::Commit => false,
                 enchudb_oplog::oplog::DecodedOp::Vocab { .. } => false,
             };
@@ -2679,7 +2680,8 @@ impl Engine {
                     | enchudb_oplog::oplog::DecodedOp::Untie { eid, .. }
                     | enchudb_oplog::oplog::DecodedOp::Delete { eid }
                     | enchudb_oplog::oplog::DecodedOp::Content { eid, .. }
-                    | enchudb_oplog::oplog::DecodedOp::TieNamed { eid, .. } => {
+                    | enchudb_oplog::oplog::DecodedOp::TieNamed { eid, .. }
+                    | enchudb_oplog::oplog::DecodedOp::TieLeaf { eid, .. } => {
                         Some(enchudb_oplog::eid_local(*eid))
                     }
                     _ => None,
@@ -2715,7 +2717,7 @@ impl Engine {
             let lsn = self.next_sync_lsn.fetch_add(1, Ordering::AcqRel);
             self.tie_to_by_id(row_eid, lsn_hid, lsn);
             self.tie_to_by_id(row_eid, peer_id_hid, rec.author_peer);
-            // DecodedOp variant を tag (Tie=0, Untie=1, Delete=2, Content=3, Commit=4, Vocab=5, TieNamed=6)
+            // DecodedOp variant を tag (Tie=0, Untie=1, Delete=2, Content=3, Commit=4, Vocab=5, TieNamed=6, TieLeaf=7)
             let op_type = match &rec.op {
                 enchudb_oplog::oplog::DecodedOp::Tie { .. } => 0,
                 enchudb_oplog::oplog::DecodedOp::Untie { .. } => 1,
@@ -2724,6 +2726,7 @@ impl Engine {
                 enchudb_oplog::oplog::DecodedOp::Commit => 4,
                 enchudb_oplog::oplog::DecodedOp::Vocab { .. } => 5,
                 enchudb_oplog::oplog::DecodedOp::TieNamed { .. } => 6,
+                enchudb_oplog::oplog::DecodedOp::TieLeaf { .. } => 7,
             };
             self.tie_to_by_id(row_eid, op_type_hid, op_type);
             // hlc.wall は u64 ms-since-epoch、 下位 32bit のみ保持 (= ~50 日サイクル
@@ -3533,6 +3536,55 @@ impl Engine {
     /// `gossip_remote_apply` 有効かつ `relayed` が `Some` なら、 同じ op を
     /// `append_relayed` で自分の WAL にも記録 (HLC/author/署名は元のまま)。
     /// `relayed` は WAL 受信時の元 header (sync 側で WireRecord から作って渡す)。
+    /// v6 (#88): himo が LeafStore routing 対象なら `&LeafStore` を返す。
+    /// 対象 = leaf region あり (v6) && Leaf 型 && reserved table 配下でない
+    /// (`_sync_ops.payload` 等の内部 Leaf は従来通り vocab)。
+    fn leaf_for(&self, hid: usize) -> Option<&LeafStore> {
+        if hid < self.value_types.len()
+            && self.value_types[hid] == ValueType::Leaf
+            && !self.himo_is_in_reserved_table(hid)
+        {
+            self.leaf.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// v6 (#88): リモート peer から届いた TieLeaf を apply。 bytes を local
+    /// LeafStore に insert して cell に offset を張る (vid mapping 不要)。
+    /// `remote_tie_apply` の Leaf 版。
+    pub fn remote_tieleaf_apply(
+        &self,
+        eid: enchudb_oplog::EntityId,
+        himo_id: u16,
+        bytes: &[u8],
+        relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
+    ) {
+        let local = enchudb_oplog::eid_local(eid);
+        let hid = himo_id as usize;
+        if hid >= self.himos.len() { return; }
+        self.entities.ensure_live(local);
+        let value = match self.leaf_for(hid) {
+            Some(leaf) => leaf.insert(bytes),
+            None => self.vocab.insert(bytes), // pre-v6 / reserved: 旧 vocab fallback
+        };
+        self.himos[hid].set(local, value);
+        Self::advance_table_next_local_for(&self.tables, local);
+        if self.gossip_remote_apply() {
+            if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
+                let _ = wal.append_relayed(
+                    enchudb_oplog::oplog::Op::TieLeaf {
+                        eid,
+                        himo_name: &self.himo_names[hid],
+                        himo_kind: self.value_types[hid] as u8,
+                        bytes,
+                    },
+                    h,
+                );
+            }
+        }
+    }
+
     pub fn remote_tie_apply(
         &self,
         eid: enchudb_oplog::EntityId,
@@ -6212,6 +6264,13 @@ impl Engine {
                 }
                 self.entities.ensure_live(local);
                 Self::advance_table_next_local_for(&self.tables, local);
+            }
+            DecodedOp::TieLeaf { .. } => {
+                // 0.12.0 (#88): self-authored TieLeaf の recover は no-op。
+                // Leaf payload は LeafStore、 cell offset は himo 列、 どちらも mmap
+                // body として durable なので「既に local に在る」(Vocab と同思想)。
+                // 再 insert すると offset が変わり slot が二重化するため触らない。
+                // remote peer からの TieLeaf は sync crate の apply-one 経由で別 apply。
             }
             DecodedOp::Commit => {}
             DecodedOp::Vocab { .. } => {

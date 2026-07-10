@@ -219,6 +219,12 @@ impl Syncer {
                         store.force_set(*eid, hid as u16, rec.hlc);
                     }
                 }
+                DecodedOp::TieLeaf { eid, himo_name, .. } => {
+                    // 0.12.0 (#88): Leaf も名前で hid 解決して LWW entry を張る (TieNamed と同扱い)。
+                    if let Some(hid) = engine.himo_id(himo_name) {
+                        store.force_set(*eid, hid as u16, rec.hlc);
+                    }
+                }
                 DecodedOp::Commit | DecodedOp::Vocab { .. } => {}
             }
         }
@@ -541,6 +547,28 @@ impl Syncer {
                     return false;
                 }
                 self.engine.remote_tie_apply(local_eid, local_hid, value, Some(relayed_header(rec)));
+                true
+            }
+            DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => {
+                // 0.12.0 (#88): Leaf payload を bytes 同乗で受信。 名前で himo 解決 →
+                // eid 翻訳 → LWW → LeafStore.insert + cell set (vid mapping 不要)。
+                let local_hid = match self.engine.ensure_himo_named(himo_name, *himo_kind) {
+                    Ok(h) => h,
+                    Err(_) => return false,
+                };
+                let local_eid = match self.engine.resolve_remote_eid(*eid, local_hid) {
+                    Some(e) => e,
+                    None => return false,
+                };
+                if let Some(tomb) = store.get(local_eid, u16::MAX) {
+                    if rec.hlc < tomb {
+                        return false;
+                    }
+                }
+                if !store.try_set(local_eid, local_hid, rec.hlc) {
+                    return false;
+                }
+                self.engine.remote_tieleaf_apply(local_eid, local_hid, bytes, Some(relayed_header(rec)));
                 true
             }
             DecodedOp::Content { eid, key, data } => {

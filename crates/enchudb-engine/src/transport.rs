@@ -141,6 +141,15 @@ impl WireRecord {
                 out.extend_from_slice(&(himo_name.len() as u16).to_le_bytes());
                 out.extend_from_slice(himo_name.as_bytes());
             }
+            DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => {
+                out.push(7);
+                out.extend_from_slice(&eid.to_le_bytes());
+                out.push(*himo_kind);
+                out.extend_from_slice(&(himo_name.len() as u16).to_le_bytes());
+                out.extend_from_slice(himo_name.as_bytes());
+                out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                out.extend_from_slice(bytes);
+            }
         }
         out
     }
@@ -233,6 +242,22 @@ impl WireRecord {
                     .map_err(|_| WireDecodeError::UnknownOpTag(6))?;
                 p += nlen;
                 DecodedOp::TieNamed { eid, himo_name, himo_kind, value }
+            }
+            7 => {
+                need(p, 8, buf)?;
+                let eid = u64::from_le_bytes(buf[p..p+8].try_into().unwrap()); p += 8;
+                need(p, 3, buf)?;
+                let himo_kind = buf[p]; p += 1;
+                let nlen = u16::from_le_bytes(buf[p..p+2].try_into().unwrap()) as usize; p += 2;
+                need(p, nlen, buf)?;
+                let himo_name = String::from_utf8(buf[p..p+nlen].to_vec())
+                    .map_err(|_| WireDecodeError::InvalidUtf8)?;
+                p += nlen;
+                need(p, 4, buf)?;
+                let blen = u32::from_le_bytes(buf[p..p+4].try_into().unwrap()) as usize; p += 4;
+                need(p, blen, buf)?;
+                let bytes = buf[p..p+blen].to_vec(); p += blen;
+                DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes }
             }
             other => return Err(WireDecodeError::UnknownOpTag(other)),
         };

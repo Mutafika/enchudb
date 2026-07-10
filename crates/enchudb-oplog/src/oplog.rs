@@ -201,7 +201,8 @@ pub fn resign_with_eid(
         | DecodedOp::Untie { .. }
         | DecodedOp::Delete { .. }
         | DecodedOp::Content { .. }
-        | DecodedOp::TieNamed { .. } => {}
+        | DecodedOp::TieNamed { .. }
+        | DecodedOp::TieLeaf { .. } => {}
         DecodedOp::Commit | DecodedOp::Vocab { .. } => return None,
     }
     let mut sb = rec.signed_bytes.clone();
@@ -243,6 +244,11 @@ pub mod op_type {
     /// full name を self-describing に運び、 受信側が ensure_himo_dynamic
     /// で解決する。 id 変換表が不要 = 再起動でも壊れない。
     pub const TIE_NAMED: u8 = 7;
+    /// 0.12.0 (#88): Leaf 終端ノードの payload を **bytes 同乗** で運ぶ Tie。
+    /// Leaf は共有辞書 vocab でなく LeafStore に格納するので vid を持たない。
+    /// himo は名前で運ぶ (content `_c_{key}` 等 動的 himo と同じ理由)。 受信側は
+    /// ensure_himo_named → leaf.insert(bytes) → cell に offset を set する。
+    pub const TIE_LEAF: u8 = 8;
 }
 
 /// WAL に書く所有型 op。 `Op` の owned 版で、 queue 渡し用 (consumer 側で
@@ -258,6 +264,8 @@ pub enum OwnedOp {
     /// 0.9.0: himo を full name で運ぶ Tie (content 互換層用)。
     /// `himo_kind` は ValueType の生 u8 (受信側の ensure 用)。
     TieNamed { eid: u64, himo_name: String, himo_kind: u8, value: u32 },
+    /// 0.12.0 (#88): Leaf payload を bytes 同乗で運ぶ (vid 無し、 himo は名前)。
+    TieLeaf { eid: u64, himo_name: String, himo_kind: u8, bytes: Vec<u8> },
 }
 
 impl OwnedOp {
@@ -276,6 +284,8 @@ impl OwnedOp {
                 Op::Vocab { vid: *vid, bytes },
             OwnedOp::TieNamed { eid, himo_name, himo_kind, value } =>
                 Op::TieNamed { eid: *eid, himo_name, himo_kind: *himo_kind, value: *value },
+            OwnedOp::TieLeaf { eid, himo_name, himo_kind, bytes } =>
+                Op::TieLeaf { eid: *eid, himo_name, himo_kind: *himo_kind, bytes },
         }
     }
 }
@@ -294,6 +304,8 @@ pub enum Op<'a> {
     Vocab { vid: u32, bytes: &'a [u8] },
     /// 0.9.0: himo を full name で運ぶ Tie。 動的 himo (content `_c_{key}`) 用。
     TieNamed { eid: u64, himo_name: &'a str, himo_kind: u8, value: u32 },
+    /// 0.12.0 (#88): Leaf payload を bytes 同乗で運ぶ Tie (vid 無し、 himo は名前)。
+    TieLeaf { eid: u64, himo_name: &'a str, himo_kind: u8, bytes: &'a [u8] },
 }
 
 impl<'a> Op<'a> {
@@ -309,6 +321,8 @@ impl<'a> Op<'a> {
             Op::Vocab { bytes, .. } => 4 + 4 + bytes.len(), // vid(4) + len(4) + bytes
             // eid(8) + value(4) + kind(1) + pad(1) + name_len(2) + name
             Op::TieNamed { himo_name, .. } => 16 + himo_name.len(),
+            // eid(8) + kind(1) + pad(1) + name_len(2) + bytes_len(4) + name + bytes
+            Op::TieLeaf { himo_name, bytes, .. } => 16 + himo_name.len() + bytes.len(),
         }
     }
 
@@ -321,6 +335,7 @@ impl<'a> Op<'a> {
             Op::Commit => op_type::COMMIT,
             Op::Vocab { .. } => op_type::VOCAB,
             Op::TieNamed { .. } => op_type::TIE_NAMED,
+            Op::TieLeaf { .. } => op_type::TIE_LEAF,
         }
     }
 
@@ -369,6 +384,19 @@ impl<'a> Op<'a> {
                 buf[14..16].copy_from_slice(&nlen.to_le_bytes());
                 buf[16..16 + himo_name.len()].copy_from_slice(himo_name.as_bytes());
             }
+            Op::TieLeaf { eid, himo_name, himo_kind, bytes } => {
+                assert!(himo_name.len() <= u16::MAX as usize, "himo name too long");
+                buf[0..8].copy_from_slice(&eid.to_le_bytes());
+                buf[8] = *himo_kind;
+                buf[9] = 0;
+                let nlen = himo_name.len() as u16;
+                buf[10..12].copy_from_slice(&nlen.to_le_bytes());
+                let blen = bytes.len() as u32;
+                buf[12..16].copy_from_slice(&blen.to_le_bytes());
+                buf[16..16 + himo_name.len()].copy_from_slice(himo_name.as_bytes());
+                let bo = 16 + himo_name.len();
+                buf[bo..bo + bytes.len()].copy_from_slice(bytes);
+            }
         }
     }
 }
@@ -385,6 +413,8 @@ pub enum DecodedOp {
     Vocab { vid: u32, bytes: Vec<u8> },
     /// 0.9.0: himo full name 付き Tie (動的 content himo 用)。
     TieNamed { eid: u64, himo_name: String, himo_kind: u8, value: u32 },
+    /// 0.12.0 (#88): Leaf payload を bytes 同乗で運ぶ Tie (vid 無し)。
+    TieLeaf { eid: u64, himo_name: String, himo_kind: u8, bytes: Vec<u8> },
 }
 
 /// リカバリ結果の 1 レコード(HLC + 署名込み)。
@@ -1298,6 +1328,16 @@ fn decode_op(op_byte: u8, payload: &[u8]) -> Option<DecodedOp> {
             let himo_name = String::from_utf8(payload[16..16 + nlen].to_vec()).ok()?;
             Some(DecodedOp::TieNamed { eid, himo_name, himo_kind, value })
         }
+        op_type::TIE_LEAF if payload.len() >= 16 => {
+            let eid = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+            let himo_kind = payload[8];
+            let nlen = u16::from_le_bytes(payload[10..12].try_into().unwrap()) as usize;
+            let blen = u32::from_le_bytes(payload[12..16].try_into().unwrap()) as usize;
+            if payload.len() < 16 + nlen + blen { return None; }
+            let himo_name = String::from_utf8(payload[16..16 + nlen].to_vec()).ok()?;
+            let bytes = payload[16 + nlen..16 + nlen + blen].to_vec();
+            Some(DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes })
+        }
         op_type::VOCAB if payload.len() >= 8 => {
             let vid = u32::from_le_bytes(payload[0..4].try_into().unwrap());
             let blen = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
@@ -1343,6 +1383,32 @@ mod tests {
         assert_eq!(lsn2, 2);
         assert_eq!(lsn3, 3);
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// 0.12.0 (#88): Op::TieLeaf の wire payload write ↔ decode round-trip。
+    #[test]
+    fn tie_leaf_wire_roundtrip() {
+        let name = "table.body";
+        let payload = "終端ノードの本文\0bin".as_bytes(); // 非 UTF8 境界も含む binary
+        let op = Op::TieLeaf { eid: 0xABCD_1234_5678, himo_name: name, himo_kind: 3, bytes: payload };
+        let mut buf = vec![0u8; op.payload_size()];
+        op.write_payload(&mut buf);
+        match decode_op(op.op_byte(), &buf).expect("decode TieLeaf") {
+            DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => {
+                assert_eq!(eid, 0xABCD_1234_5678);
+                assert_eq!(himo_name, name);
+                assert_eq!(himo_kind, 3);
+                assert_eq!(bytes, payload);
+            }
+            other => panic!("expected TieLeaf, got {:?}", other),
+        }
+        // 空 name / 空 bytes の edge
+        let op0 = Op::TieLeaf { eid: 1, himo_name: "", himo_kind: 3, bytes: b"" };
+        let mut b0 = vec![0u8; op0.payload_size()];
+        op0.write_payload(&mut b0);
+        assert!(matches!(decode_op(op0.op_byte(), &b0), Some(DecodedOp::TieLeaf { .. })));
+        // truncated payload は None (out-of-bounds を返さない)
+        assert!(decode_op(op_type::TIE_LEAF, &buf[..8]).is_none());
     }
 
     /// issue #57: 容量到達時、 `append` は panic せず `OutOfMemory` の `Err` を
