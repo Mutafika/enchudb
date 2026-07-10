@@ -734,6 +734,7 @@ use crate::vocabulary::Vocabulary;
 use crate::entity_set::EntitySet;
 use crate::himo_store::{HimoStore, ValueType};
 use crate::content_store::ContentStore;
+use crate::leaf_store::LeafStore;
 use crate::column::Column;
 
 // ════════════════ ギャロッピング交差 ════════════════
@@ -794,8 +795,9 @@ const FILE_MAGIC: [u8; 4] = *b"ECDB";
 /// undo は WAL 有効時には Commit で自動 clear される redundant な層であり、
 /// standalone mode では `record()` 内の spin-wait が consumer 不在で
 /// permanent hang を起こしていた (GitHub issue #1)。 v3 DB は再作成必要。
-const FILE_VERSION: u32 = 5;
+const FILE_VERSION: u32 = 6;
 /// v4 DB を後方互換で open する識別子。 v4 → v5 migrate は open 時透過。
+const FILE_VERSION_LEGACY_V5: u32 = 5;
 const FILE_VERSION_LEGACY_V4: u32 = 4;
 const HEADER_SIZE: usize = 4096;
 
@@ -803,6 +805,9 @@ const DEFAULT_MAX_ENTITIES: u32 = 16_777_216;
 const DEFAULT_MAX_HIMOS: u32 = 256;
 const DEFAULT_CYL_MAX_VALUES: u32 = 65536;
 const DEFAULT_VOCAB_DATA_SIZE: usize = 512 * 1024 * 1024;
+/// v6 (0.12.0, #88): Leaf payload 用 `LeafStore` の default 予約。 vocab と同等
+/// (set_len sparse / growable lazy commit なので実 usage まで物理消費しない)。 tunable。
+const DEFAULT_LEAF_DATA_SIZE: usize = 512 * 1024 * 1024;
 
 // ヘッダオフセット
 const H_MAGIC: usize = 0;
@@ -831,6 +836,10 @@ const H_PEER_ID: usize = 68; // u32
 /// 用途: `validate_file_size` で auto-extend を許すか strict check するかの分岐のみ。
 /// CRC 保護外。 accidental truncation 検出が目的、 adversarial tampering は対象外。
 const H_BACKING_KIND: usize = 76; // u32
+/// v6 (0.12.0, #88): LeafStore data region size (u64)。 0 = leaf region 無し
+/// (pre-v6 DB)。 CRC 保護外 (H_PEER_ID / H_BACKING_KIND と同様、 破損は
+/// try_from_params の checked arithmetic + u32::MAX assert で捕捉)。
+const H_LEAF_DATA_SIZE: usize = 80; // u64
 
 const BACKING_KIND_GROWABLE: u32 = 1;
 const H_HIMO_TYPES: usize = 256;
@@ -968,6 +977,8 @@ struct Layout {
     content_index_size: usize,
     content_data_off: usize,
     content_data_size: usize,
+    leaf_data_off: usize,
+    leaf_data_size: usize,
     himo_base_off: usize,
     himo_col_size: usize,
     #[allow(dead_code)]
@@ -1018,11 +1029,13 @@ impl Layout {
             content_data_size, u32::MAX,
         );
 
+        // v6 (#88): create 経路の leaf region は default 予約。 tunable 化は後段。
+        let leaf_data_size = DEFAULT_LEAF_DATA_SIZE;
         Self::from_params(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
-            content_data_size, cyl_max_values,
+            content_data_size, leaf_data_size, cyl_max_values,
         )
     }
 
@@ -1030,7 +1043,7 @@ impl Layout {
         max_entities: u32, max_himos: u32,
         vocab_max_entries: u32, vocab_index_cap: u32, vocab_data_size: usize,
         himoreg_max_entries: u32, himoreg_index_cap: u32, himoreg_data_size: usize,
-        content_data_size: usize, cyl_max_values: u32,
+        content_data_size: usize, leaf_data_size: usize, cyl_max_values: u32,
     ) -> Self {
         // create 経路 (= プログラム引数由来の params) 用。 open 経路 (= disk header
         // 由来の params) は `try_from_params` を使い、 破損 header を InvalidData に
@@ -1039,7 +1052,7 @@ impl Layout {
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
-            content_data_size, cyl_max_values,
+            content_data_size, leaf_data_size, cyl_max_values,
         )
         .expect("layout size overflow — parameters too large")
     }
@@ -1051,13 +1064,20 @@ impl Layout {
         max_entities: u32, max_himos: u32,
         vocab_max_entries: u32, vocab_index_cap: u32, vocab_data_size: usize,
         himoreg_max_entries: u32, himoreg_index_cap: u32, himoreg_data_size: usize,
-        content_data_size: usize, cyl_max_values: u32,
+        content_data_size: usize, leaf_data_size: usize, cyl_max_values: u32,
     ) -> Result<Self, String> {
         // EntitySet::region_size 内部の `(max_entities + 7)` が u32 で wrap しない
         // ガード。 この値の DB は create 時点で作れない (debug では overflow panic)。
         if max_entities > u32::MAX - 7 {
             return Err(format!(
                 "max_entities {} exceeds format limit — corrupt header?", max_entities,
+            ));
+        }
+        // v6 (#88): LeafStore の high_water は u32。 4 GiB 超は offset wrap を招くので拒否。
+        if leaf_data_size > u32::MAX as usize {
+            return Err(format!(
+                "leaf_data_size {} exceeds format limit {} (u32 high_water) — corrupt header?",
+                leaf_data_size, u32::MAX,
             ));
         }
         let ck_add = |a: usize, b: usize| -> Result<usize, String> {
@@ -1120,6 +1140,12 @@ impl Layout {
         let content_data_size = align8(content_data_size);
         off = ck_add(off, content_data_size)?;
 
+        // v6 (#88): Leaf payload store。 append-only variable cluster の末尾に追加。
+        // size 0 (pre-v6 header) なら region 無し (off 不変)。
+        let leaf_data_off = off;
+        let leaf_data_size = align8(leaf_data_size);
+        off = ck_add(off, leaf_data_size)?;
+
         Ok(Layout {
             entities_off, entities_size,
             vocab_data_off, vocab_data_size,
@@ -1132,6 +1158,7 @@ impl Layout {
             himoreg_max_entries, himoreg_index_cap,
             content_index_off, content_index_size,
             content_data_off, content_data_size,
+            leaf_data_off, leaf_data_size,
             himo_base_off, himo_col_size, himo_cyl_size, himo_slot_size,
             cyl_max_values,
             total_size: off,
@@ -1314,6 +1341,9 @@ pub struct Engine {
     himo_def_lock: std::sync::Mutex<()>,
     entities: EntitySet,
     contents: ContentStore,
+    /// v6 (0.12.0, #88): Leaf 終端ノードの可変長 payload store。 vocab から剥がした
+    /// reclaim 対応 store。 pre-v6 DB (leaf region 無し) は None。
+    leaf: Option<LeafStore>,
     /// 非同期書き込みキュー。`create_concurrent` で有効化される。
     write_queue: Option<std::sync::Arc<crate::write_queue::WriteQueue>>,
     /// consumer スレッドへの shutdown 通知。`Drop` で true に。
@@ -1507,6 +1537,7 @@ impl Engine {
         mmap[H_HIMOREG_DATA_SIZE..H_HIMOREG_DATA_SIZE + 8].copy_from_slice(&(layout.himoreg_data_size as u64).to_le_bytes());
         mmap[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].copy_from_slice(&(layout.content_data_size as u64).to_le_bytes());
         mmap[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].copy_from_slice(&layout.cyl_max_values.to_le_bytes());
+        mmap[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8].copy_from_slice(&(layout.leaf_data_size as u64).to_le_bytes());
 
         // v28: ヘッダ整合性 CRC
         write_header_crc(&mut mmap);
@@ -1533,6 +1564,9 @@ impl Engine {
             unsafe { Region::new(base.add(layout.content_index_off), layout.content_index_size) },
             unsafe { Region::new(base.add(layout.content_data_off), layout.content_data_size) },
         );
+        let leaf = Some(LeafStore::init(unsafe {
+            Region::new(base.add(layout.leaf_data_off), layout.leaf_data_size)
+        }));
 
         Ok(Self {
             path: path.to_string(), layout, max_entities, max_himos,
@@ -1540,7 +1574,7 @@ impl Engine {
             himo_names: AppendVec::with_capacity(max_himos as usize),
             value_types: AppendVec::with_capacity(max_himos as usize),
             himo_max_values: AppendVec::with_capacity(max_himos as usize),
-            himos: AppendVec::with_capacity(max_himos as usize), entities, contents,
+            himos: AppendVec::with_capacity(max_himos as usize), entities, contents, leaf,
             tables: vec![TableDef::anonymous()],
             himo_to_table: AppendVec::with_capacity(max_himos as usize),
             himo_def_lock: std::sync::Mutex::new(()),
@@ -1718,6 +1752,8 @@ impl Engine {
         // open 側の validate_file_size でこのフラグを見て分岐する。
         header[H_BACKING_KIND..H_BACKING_KIND + 4]
             .copy_from_slice(&BACKING_KIND_GROWABLE.to_le_bytes());
+        header[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8]
+            .copy_from_slice(&(layout.leaf_data_size as u64).to_le_bytes());
         write_header_crc(header);
 
         let _ = base; // base ptr is implicit via Region::with_grower from here on
@@ -1777,6 +1813,9 @@ impl Engine {
                 Region::with_grower(map.clone(), layout.content_data_off, layout.content_data_size)
             },
         );
+        let leaf = Some(LeafStore::init(unsafe {
+            Region::with_grower(map.clone(), layout.leaf_data_off, layout.leaf_data_size)
+        }));
 
         Ok(Self {
             path: path.to_string(),
@@ -1791,6 +1830,7 @@ impl Engine {
             himos: AppendVec::with_capacity(max_himos as usize),
             entities,
             contents,
+            leaf,
             tables: vec![TableDef::anonymous()],
             himo_to_table: AppendVec::with_capacity(max_himos as usize),
             himo_def_lock: std::sync::Mutex::new(()),
@@ -2075,11 +2115,13 @@ impl Engine {
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
+        // v6 (#88): leaf region size (pre-v6 header は 0 = leaf region 無し)。
+        let leaf_data_size = u64::from_le_bytes(buf[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8].try_into().unwrap()) as usize;
         let layout = Layout::try_from_params(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
-            content_data_size, cyl_max_values,
+            content_data_size, leaf_data_size, cyl_max_values,
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -2132,7 +2174,7 @@ impl Engine {
         // v5 が現行、 v4 は後方互換で受け付ける (= anonymous table 1 個に migrate)。
         // v4 DB を v5 として open しても、 引き続き flat anonymous モードで動作する
         // (table 概念は step 2 以降の実装に伴って活性化)。
-        if version != FILE_VERSION && version != FILE_VERSION_LEGACY_V4 {
+        if version != FILE_VERSION && version != FILE_VERSION_LEGACY_V5 && version != FILE_VERSION_LEGACY_V4 {
             return Err(format!(
                 "unsupported EnchuDB file version {} (supported: {}, {} compat). dev phase — recreate the DB.",
                 version, FILE_VERSION, FILE_VERSION_LEGACY_V4
@@ -2156,11 +2198,12 @@ impl Engine {
         // wrap → 過小 total_size → OOB region を防ぐ)。 file 経路は open_internal →
         // validate_file_size で field sanity 済み、 Memory 経路 (from_bytes) は
         // ここが最初の防壁。
+        let leaf_data_size = u64::from_le_bytes(buf[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8].try_into().unwrap()) as usize;
         let layout = Layout::try_from_params(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
-            content_data_size, cyl_max_values,
+            content_data_size, leaf_data_size, cyl_max_values,
         )?;
 
         // backing が layout 全域をカバーしているか (Memory 経路の truncated bytes
@@ -2235,6 +2278,13 @@ impl Engine {
             unsafe { Region::new(base.add(layout.content_data_off), layout.content_data_size) },
         );
         report("ContentStore::load", &mut t, &mut p);
+        let leaf = if layout.leaf_data_size > 0 {
+            Some(LeafStore::load(unsafe {
+                Region::new(base.add(layout.leaf_data_off), layout.leaf_data_size)
+            }))
+        } else {
+            None
+        };
 
         // 0.9.0: capacity は max_himos だが、 header の himo_count が万一それを
         // 超えていても load 自体は落とさない (旧 Vec 実装と同じ寛容さ)。
@@ -2282,6 +2332,7 @@ impl Engine {
             vocab, himo_reg,
             himo_names, value_types, himo_max_values,
             himos, entities, contents,
+            leaf,
             tables: initial_tables,
             himo_to_table: initial_himo_to_table,
             himo_def_lock: std::sync::Mutex::new(()),
@@ -6723,6 +6774,12 @@ impl Engine {
     /// O(vocab.count() + Σ himos.unique_values().len())。 vid set は `Vec<bool>` で
     /// vocab.count() bit。 vocab.count() = 1B なら 1GB 食うので注意。 巨大 DB なら
     /// 別 issue で BitVec か stream 化を検討。
+    /// v6 (#88): LeafStore の現 footprint (high_water)。 pre-v6 DB (leaf region
+    /// 無し) は None。 routing 前 (2.1 scaffolding) は常に HEADER 相当。
+    pub fn leaf_footprint(&self) -> Option<u32> {
+        self.leaf.as_ref().map(|l| l.high_water())
+    }
+
     pub fn vocab_orphan_stats(&self) -> VocabOrphanStats {
         let vocab_total = self.vocab.count();
         if vocab_total == 0 {
