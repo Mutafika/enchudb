@@ -20,6 +20,7 @@ pub(crate) mod region;
 pub mod growable_map;
 pub mod column;
 pub mod vocabulary;
+pub mod leaf_store;
 pub mod entity_set;
 pub mod cylinder;
 pub mod cylinder_v27;
@@ -44,7 +45,7 @@ pub mod acl;
 pub mod integrity;
 pub mod blob_store;
 
-pub use engine::{Engine, EntityValue, SnapshotFiles, AuditFilter};
+pub use engine::{Engine, EntityValue, SnapshotFiles, AuditFilter, MigrationStats};
 pub use engine::EngineStats;
 pub use himo_store::ValueType;
 pub use cas::{CASStore, BlockHash};

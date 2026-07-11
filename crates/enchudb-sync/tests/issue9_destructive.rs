@@ -299,8 +299,8 @@ fn huge_count_eidmap_sidecar_does_not_oom() {
     cleanup(&path);
 }
 
-/// REORDER (0.9.0 で書き換え): content は `TieNamed` (himo を名前で運ぶ Tie) と
-/// して同期されるようになり、 **自力で entity 写像を作れる** — 旧 `Content` op の
+/// REORDER (0.12.0 #88 で更新): content (Leaf) は `TieLeaf` (himo 名 + bytes 同乗)
+/// として同期され、 **自力で entity 写像を作れる** — 旧 `Content` op の
 /// 「Tie より先に届くと reorder buffer 退避」という構造問題そのものが消えた。
 /// このテストは content record を entity の他の Tie より **先** に配送しても
 /// 即 apply される (buffering 不要・ロスなし) ことを固定する。
@@ -324,35 +324,34 @@ fn content_before_tie_is_buffered_then_applied() {
     // 0.9.0 regression: 旧 Content op は wire に居ないこと (TieNamed に置換済み)
     assert!(
         !records.iter().any(|r| matches!(r.op, DecodedOp::Content { .. })),
-        "0.9.0: content は Op::Content ではなく TieNamed で運ばれるはず"
+        "0.12.0: content は Op::Content ではなく TieLeaf で運ばれるはず"
     );
-    // content の TieNamed (+ その直前の Vocab) を先に、 note の Tie を後に配送する。
-    // Vocab は vid mapping のため対応する TieNamed より先に必要 (append 順で保証
-    // されている連番をそのまま保つ)。
+    // 0.12.0 (#88): content (Leaf) は TieLeaf (bytes 同乗) で運ばれる。 Vocab op は
+    // 不要 (vid mapping が消えた)。 content の TieLeaf を先に、 note の Tie を後に配送。
     let content_first: Vec<_> = records
         .iter()
-        .filter(|r| matches!(r.op, DecodedOp::TieNamed { .. } | DecodedOp::Vocab { .. }))
+        .filter(|r| matches!(r.op, DecodedOp::TieLeaf { .. }))
         .cloned()
         .collect();
     let rest: Vec<_> = records
         .iter()
-        .filter(|r| !matches!(r.op, DecodedOp::TieNamed { .. } | DecodedOp::Vocab { .. }))
+        .filter(|r| !matches!(r.op, DecodedOp::TieLeaf { .. }))
         .cloned()
         .collect();
     assert!(
-        content_first.iter().any(|r| matches!(r.op, DecodedOp::TieNamed { .. })),
-        "A should have a TieNamed record for the content write"
+        content_first.iter().any(|r| matches!(r.op, DecodedOp::TieLeaf { .. })),
+        "A should have a TieLeaf record for the content write"
     );
 
     let eng_b = make_engine(&path_b, 2);
     let syncer_b = Syncer::new(eng_b.clone(), transport.clone());
 
-    // 1. content (TieNamed) が先に届く → TieNamed 自身が写像を作って即 apply。
+    // 1. content (TieLeaf) が先に届く → TieLeaf 自身が写像を作って即 apply。
     let out1 = syncer_b.apply_records(&content_first);
-    assert!(out1.applied > 0, "TieNamed は写像を自力で作って即 apply されるはず");
+    assert!(out1.applied > 0, "TieLeaf は写像を自力で作って即 apply されるはず");
     let local = eng_b
         .resolve_remote_eid_existing(e_a)
-        .expect("TieNamed だけで entity が写像されるはず");
+        .expect("TieLeaf だけで entity が写像されるはず");
     assert_eq!(
         eng_b.get_content(local, "memo"),
         Some(b"hello".as_ref()),

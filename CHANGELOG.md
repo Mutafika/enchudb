@@ -3,6 +3,80 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.12.0 — 2026-07-11
+
+### Changed — `Leaf` を vocab から剥がし reclaim 対応 store に載せる (#88): high-churn Leaf の単一 DB 無限運用
+
+`content()` → `Leaf` 統合 (0.9.0 #81) 以降、 高 churn な `Leaf` 値 (wikipulse の
+毎 event content 等) が **共有辞書 vocab に単調 append され、 delete しても回収
+されない** 問題 (#88)。 `Leaf` は先が無い終端ノード = 単一所有・dedup 不要なのに、
+append-only-never-reclaim の vocab に入るから貯まる。 対策は「vocab に reclaim を
+後付け」ではなく **`Leaf` を vocab から出し、 単一所有・reclaim 対応の専用 store に
+載せる** こと。
+
+- **`LeafStore`**: 単一所有・dedup 無し・reclaim 対応の可変長 value store。
+  free-list (offset→size の BTreeMap) + 隣接空き coalesce + 末尾空きは high_water
+  を retract。 live は動かさない (compaction 非搭載 = footprint 有界化には不要)。
+  free-list は非永続 = open 時に live cell から再構成。
+- **routing**: `Leaf` の tie / read (`get_text` / `get_content` / `get_entity`) /
+  delete / untie / sync が `LeafStore` を経由。 **`Tag` は従来通り vocab** (dedup
+  される共有辞書性が活きる)。 reserved-table 内の `Leaf` (`_sync_ops.payload` 等)
+  も vocab 据え置き。
+- **wire**: `Op::TieLeaf{eid, himo_name, himo_kind, bytes}` を新設し、 旧 `Leaf`
+  sync (`Op::Vocab{vid}` + `Op::Tie`/`TieNamed`) を置換。 受信側の
+  `(author,vid)→local_vid` remap が消える。
+- **create tunable**: `Engine::create_full_with_leaf(.., leaf_data_size)` で
+  leaf region 予約サイズを指定可 (`Some(0)` = leaf region 無し = v5 相当)。
+
+**footprint bench** (rolling retention, 20000 rounds / window 200 / content 1KB):
+
+| rounds | before (`Leaf`→vocab, 回収なし) | after (`LeafStore`, reclaim) |
+|-------:|-------------------------------:|-----------------------------:|
+|   4000 |  3.91 MiB | 0.20 MiB |
+|  20000 | 19.53 MiB | 0.20 MiB |
+
+before は round に線形増加 (retention delete でも vocab は戻らない)、 after は
+live 集合 ~200×1KB で **平坦・有界** (20000 rounds で 99x)。 = 単一 DB の無限運用が
+可能に。 perf: query / scan / `Number` get は不変、 text read (`Tag`/`Leaf`) のみ
+routing 分岐で ~+1 ns/attr。
+
+**format v5 → v6 / wire は breaking**: v6 は末尾に leaf region を持ち、 `Leaf` sync
+は `TieLeaf` に変わる。 **全 peer 同時アップグレード必須** (0.11 peer とは Leaf 経路が
+非互換)。 v5 DB は open 自体は可能だが leaf region が無いため **`Leaf` reclaim は
+効かない** (= 下記 migration が必要)。
+
+#### Migration ガイド (v5 → v6)
+
+既存 v5 DB を移送して `Leaf` reclaim を有効化する:
+
+```rust
+// src は不変、 dst に新 v6 DB を書く (default leaf region size)。
+Engine::migrate_file_v5_to_v6("old.ecdb", "new.ecdb")?;
+// leaf region size を指定する版 / bytes 版もあり:
+Engine::migrate_file_v5_to_v6_with_leaf(src, dst, leaf_data_size)?;
+let (v6_bytes, stats) = Engine::migrate_bytes_v5_to_v6(src_bytes, leaf_data_size, &[])?;
+```
+
+- 末尾に leaf region を新設し、 各 `Leaf` himo の live cell (旧 vocab vid) を辿って
+  vocab bytes を `LeafStore` へ移し、 cell を leaf offset に書換える。 vocab / entity
+  / himo / content は byte 単位で引き継ぐ (in-place file 手術ではなく copy + tail
+  追加)。
+- `.tables` sidecar はコピーし、 **reserved-table の `Leaf` は移送しない**
+  (reopen で `.tables` 復元 → vocab 経路に戻るため)。
+- **旧 `.oplog` は引き継がない** (dst の stale `.oplog` は削除)。 v5 の `Leaf` tie op
+  は旧 wire 形で移送後の cell と不整合になり replay が巻き戻すため、 dst は fresh
+  oplog で開く (= main file の現在状態を checkpoint とみなす)。
+- **既知 trade-off**: 移送した旧 `Leaf` bytes は vocab に orphan として残る
+  (`stats.vocab_orphan_bytes_left`)。 vocab 自体の compaction は本 migration の
+  対象外 = 目的は「以後の `Leaf` 書込みを reclaim 対象にし、 成長を止める」こと。
+  既に満杯の DB は「dead vocab (一度きりの sunk) + reclaim される `LeafStore`」に
+  なり成長は止まる。 dead vocab の回収が要るなら別途 vocab-compact。
+
+**検証**: `LeafStore` churn の footprint 有界性 (free 無効化で growth 再現の
+falsify 付き)、 `issue54` の orphan test 更新 (`Leaf` は vocab を汚さない)、
+`issue88_migration` 4 test (移送 read 整合 / reclaim 稼働 falsify / already_v6
+no-op / file 非破壊)、 sync の `TieLeaf` 収束、 全 workspace test green。
+
 ## 0.11.1 — 2026-07-06
 
 ### Added — postings-only な `.etxt` build + 生候補 API (#84 の第一歩): 索引が本文を二重化しない

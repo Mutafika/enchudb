@@ -96,6 +96,25 @@ impl VocabOrphanStats {
     }
 }
 
+/// #88 (0.12.0): v5 (leaf region 無し = Leaf を vocab に格納) DB を v6
+/// (LeafStore あり) へ移送した結果。 `Engine::migrate_bytes_v5_to_v6` 等が返す。
+#[derive(Debug, Clone, Default)]
+pub struct MigrationStats {
+    /// 入力が既に v6 (leaf region あり) で移送不要だった。 他フィールドは 0。
+    pub already_v6: bool,
+    /// 移送対象になった Leaf himo 数。
+    pub leaf_himos: u32,
+    /// vocab → LeafStore に移した cell (= Leaf 値) の数。
+    pub cells_moved: u64,
+    /// 移した payload の総 byte 数 (slot header / padding は含まない生 bytes)。
+    pub bytes_moved: u64,
+    /// 移送後の LeafStore footprint (high_water)。
+    pub leaf_footprint: u32,
+    /// 移送後も vocab data に残る旧 Leaf bytes (= 死蔵)。 本 migration は
+    /// vocab compaction をしないので、 この分は footprint に残る (既知の trade-off)。
+    pub vocab_orphan_bytes_left: u64,
+}
+
 fn oplog_path_for(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{}.oplog", path))
 }
@@ -734,6 +753,7 @@ use crate::vocabulary::Vocabulary;
 use crate::entity_set::EntitySet;
 use crate::himo_store::{HimoStore, ValueType};
 use crate::content_store::ContentStore;
+use crate::leaf_store::LeafStore;
 use crate::column::Column;
 
 // ════════════════ ギャロッピング交差 ════════════════
@@ -794,8 +814,9 @@ const FILE_MAGIC: [u8; 4] = *b"ECDB";
 /// undo は WAL 有効時には Commit で自動 clear される redundant な層であり、
 /// standalone mode では `record()` 内の spin-wait が consumer 不在で
 /// permanent hang を起こしていた (GitHub issue #1)。 v3 DB は再作成必要。
-const FILE_VERSION: u32 = 5;
+const FILE_VERSION: u32 = 6;
 /// v4 DB を後方互換で open する識別子。 v4 → v5 migrate は open 時透過。
+const FILE_VERSION_LEGACY_V5: u32 = 5;
 const FILE_VERSION_LEGACY_V4: u32 = 4;
 const HEADER_SIZE: usize = 4096;
 
@@ -803,6 +824,9 @@ const DEFAULT_MAX_ENTITIES: u32 = 16_777_216;
 const DEFAULT_MAX_HIMOS: u32 = 256;
 const DEFAULT_CYL_MAX_VALUES: u32 = 65536;
 const DEFAULT_VOCAB_DATA_SIZE: usize = 512 * 1024 * 1024;
+/// v6 (0.12.0, #88): Leaf payload 用 `LeafStore` の default 予約。 vocab と同等
+/// (set_len sparse / growable lazy commit なので実 usage まで物理消費しない)。 tunable。
+const DEFAULT_LEAF_DATA_SIZE: usize = 512 * 1024 * 1024;
 
 // ヘッダオフセット
 const H_MAGIC: usize = 0;
@@ -831,6 +855,10 @@ const H_PEER_ID: usize = 68; // u32
 /// 用途: `validate_file_size` で auto-extend を許すか strict check するかの分岐のみ。
 /// CRC 保護外。 accidental truncation 検出が目的、 adversarial tampering は対象外。
 const H_BACKING_KIND: usize = 76; // u32
+/// v6 (0.12.0, #88): LeafStore data region size (u64)。 0 = leaf region 無し
+/// (pre-v6 DB)。 CRC 保護外 (H_PEER_ID / H_BACKING_KIND と同様、 破損は
+/// try_from_params の checked arithmetic + u32::MAX assert で捕捉)。
+const H_LEAF_DATA_SIZE: usize = 80; // u64
 
 const BACKING_KIND_GROWABLE: u32 = 1;
 const H_HIMO_TYPES: usize = 256;
@@ -968,6 +996,8 @@ struct Layout {
     content_index_size: usize,
     content_data_off: usize,
     content_data_size: usize,
+    leaf_data_off: usize,
+    leaf_data_size: usize,
     himo_base_off: usize,
     himo_col_size: usize,
     #[allow(dead_code)]
@@ -978,12 +1008,12 @@ struct Layout {
 }
 
 impl Layout {
-    fn compute(max_entities: u32, max_himos: u32, vocab_data_size: usize, content_data_size: Option<usize>, cyl_max_values: Option<u32>) -> Self {
+    fn compute(max_entities: u32, max_himos: u32, vocab_data_size: usize, content_data_size: Option<usize>, cyl_max_values: Option<u32>, leaf_data_size: Option<usize>) -> Self {
         let vocab_max_entries = max_entities.saturating_mul(16).min(256_000_000);
         Self::compute_with_caps(
             max_entities, max_himos,
             vocab_max_entries, vocab_data_size,
-            content_data_size, cyl_max_values,
+            content_data_size, cyl_max_values, leaf_data_size,
         )
     }
 
@@ -996,6 +1026,7 @@ impl Layout {
         vocab_data_size: usize,
         content_data_size: Option<usize>,
         cyl_max_values: Option<u32>,
+        leaf_data_size: Option<usize>,
     ) -> Self {
         let vocab_index_cap = vocab_max_entries.next_power_of_two();
         let himoreg_max_entries = max_himos.max(256);
@@ -1018,11 +1049,15 @@ impl Layout {
             content_data_size, u32::MAX,
         );
 
+        // v6 (#88): create 経路の leaf region 予約サイズ。 None = default。
+        // Some(0) は「leaf region 無し」= v5 相当 DB (migration test / bench の
+        // before 生成、 及び將来の pre-v6 互換 create に使う)。
+        let leaf_data_size = leaf_data_size.unwrap_or(DEFAULT_LEAF_DATA_SIZE);
         Self::from_params(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
-            content_data_size, cyl_max_values,
+            content_data_size, leaf_data_size, cyl_max_values,
         )
     }
 
@@ -1030,7 +1065,7 @@ impl Layout {
         max_entities: u32, max_himos: u32,
         vocab_max_entries: u32, vocab_index_cap: u32, vocab_data_size: usize,
         himoreg_max_entries: u32, himoreg_index_cap: u32, himoreg_data_size: usize,
-        content_data_size: usize, cyl_max_values: u32,
+        content_data_size: usize, leaf_data_size: usize, cyl_max_values: u32,
     ) -> Self {
         // create 経路 (= プログラム引数由来の params) 用。 open 経路 (= disk header
         // 由来の params) は `try_from_params` を使い、 破損 header を InvalidData に
@@ -1039,7 +1074,7 @@ impl Layout {
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
-            content_data_size, cyl_max_values,
+            content_data_size, leaf_data_size, cyl_max_values,
         )
         .expect("layout size overflow — parameters too large")
     }
@@ -1051,13 +1086,20 @@ impl Layout {
         max_entities: u32, max_himos: u32,
         vocab_max_entries: u32, vocab_index_cap: u32, vocab_data_size: usize,
         himoreg_max_entries: u32, himoreg_index_cap: u32, himoreg_data_size: usize,
-        content_data_size: usize, cyl_max_values: u32,
+        content_data_size: usize, leaf_data_size: usize, cyl_max_values: u32,
     ) -> Result<Self, String> {
         // EntitySet::region_size 内部の `(max_entities + 7)` が u32 で wrap しない
         // ガード。 この値の DB は create 時点で作れない (debug では overflow panic)。
         if max_entities > u32::MAX - 7 {
             return Err(format!(
                 "max_entities {} exceeds format limit — corrupt header?", max_entities,
+            ));
+        }
+        // v6 (#88): LeafStore の high_water は u32。 4 GiB 超は offset wrap を招くので拒否。
+        if leaf_data_size > u32::MAX as usize {
+            return Err(format!(
+                "leaf_data_size {} exceeds format limit {} (u32 high_water) — corrupt header?",
+                leaf_data_size, u32::MAX,
             ));
         }
         let ck_add = |a: usize, b: usize| -> Result<usize, String> {
@@ -1120,6 +1162,12 @@ impl Layout {
         let content_data_size = align8(content_data_size);
         off = ck_add(off, content_data_size)?;
 
+        // v6 (#88): Leaf payload store。 append-only variable cluster の末尾に追加。
+        // size 0 (pre-v6 header) なら region 無し (off 不変)。
+        let leaf_data_off = off;
+        let leaf_data_size = align8(leaf_data_size);
+        off = ck_add(off, leaf_data_size)?;
+
         Ok(Layout {
             entities_off, entities_size,
             vocab_data_off, vocab_data_size,
@@ -1132,6 +1180,7 @@ impl Layout {
             himoreg_max_entries, himoreg_index_cap,
             content_index_off, content_index_size,
             content_data_off, content_data_size,
+            leaf_data_off, leaf_data_size,
             himo_base_off, himo_col_size, himo_cyl_size, himo_slot_size,
             cyl_max_values,
             total_size: off,
@@ -1314,6 +1363,9 @@ pub struct Engine {
     himo_def_lock: std::sync::Mutex<()>,
     entities: EntitySet,
     contents: ContentStore,
+    /// v6 (0.12.0, #88): Leaf 終端ノードの可変長 payload store。 vocab から剥がした
+    /// reclaim 対応 store。 pre-v6 DB (leaf region 無し) は None。
+    leaf: Option<LeafStore>,
     /// 非同期書き込みキュー。`create_concurrent` で有効化される。
     write_queue: Option<std::sync::Arc<crate::write_queue::WriteQueue>>,
     /// consumer スレッドへの shutdown 通知。`Drop` で true に。
@@ -1475,9 +1527,28 @@ impl Engine {
         content_data_size: Option<usize>,
         cyl_max_values: Option<u32>,
     ) -> io::Result<Self> {
+        Self::create_full_with_leaf(
+            path, max_entities, vocab_data_size, max_himos, content_data_size,
+            cyl_max_values, None,
+        )
+    }
+
+    /// `create_full_with_cyl` の leaf region size を明示できる版。
+    /// `leaf_data_size = Some(0)` は leaf region 無し = v5 相当 DB を作る
+    /// (#88 migration test / bench の before 生成)。 None は default 予約。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn create_full_with_leaf(
+        path: &str,
+        max_entities: u32,
+        vocab_data_size: Option<usize>,
+        max_himos: Option<u32>,
+        content_data_size: Option<usize>,
+        cyl_max_values: Option<u32>,
+        leaf_data_size: Option<usize>,
+    ) -> io::Result<Self> {
         let vds = vocab_data_size.unwrap_or(DEFAULT_VOCAB_DATA_SIZE);
         let max_himos = max_himos.unwrap_or(DEFAULT_MAX_HIMOS);
-        let layout = Layout::compute(max_entities, max_himos, vds, content_data_size, cyl_max_values);
+        let layout = Layout::compute(max_entities, max_himos, vds, content_data_size, cyl_max_values, leaf_data_size);
 
         if let Some(parent) = std::path::Path::new(path).parent() {
             if !parent.as_os_str().is_empty() {
@@ -1507,6 +1578,7 @@ impl Engine {
         mmap[H_HIMOREG_DATA_SIZE..H_HIMOREG_DATA_SIZE + 8].copy_from_slice(&(layout.himoreg_data_size as u64).to_le_bytes());
         mmap[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].copy_from_slice(&(layout.content_data_size as u64).to_le_bytes());
         mmap[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].copy_from_slice(&layout.cyl_max_values.to_le_bytes());
+        mmap[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8].copy_from_slice(&(layout.leaf_data_size as u64).to_le_bytes());
 
         // v28: ヘッダ整合性 CRC
         write_header_crc(&mut mmap);
@@ -1533,6 +1605,15 @@ impl Engine {
             unsafe { Region::new(base.add(layout.content_index_off), layout.content_index_size) },
             unsafe { Region::new(base.add(layout.content_data_off), layout.content_data_size) },
         );
+        // leaf_data_size == 0 (= v5 相当 create) は leaf region 無し。 load 経路
+        // (line ~2281) と同じ gate。
+        let leaf = if layout.leaf_data_size > 0 {
+            Some(LeafStore::init(unsafe {
+                Region::new(base.add(layout.leaf_data_off), layout.leaf_data_size)
+            }))
+        } else {
+            None
+        };
 
         Ok(Self {
             path: path.to_string(), layout, max_entities, max_himos,
@@ -1540,7 +1621,7 @@ impl Engine {
             himo_names: AppendVec::with_capacity(max_himos as usize),
             value_types: AppendVec::with_capacity(max_himos as usize),
             himo_max_values: AppendVec::with_capacity(max_himos as usize),
-            himos: AppendVec::with_capacity(max_himos as usize), entities, contents,
+            himos: AppendVec::with_capacity(max_himos as usize), entities, contents, leaf,
             tables: vec![TableDef::anonymous()],
             himo_to_table: AppendVec::with_capacity(max_himos as usize),
             himo_def_lock: std::sync::Mutex::new(()),
@@ -1601,7 +1682,7 @@ impl Engine {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create_growable_with_capacity(path: &str, max_entities: u32) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
-        let layout = Layout::compute(max_entities, max_himos, DEFAULT_VOCAB_DATA_SIZE, None, None);
+        let layout = Layout::compute(max_entities, max_himos, DEFAULT_VOCAB_DATA_SIZE, None, None, None);
         Self::create_growable_full(path, layout, max_entities, max_himos)
     }
 
@@ -1618,7 +1699,7 @@ impl Engine {
         vocab_data_size: usize,
     ) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
-        let layout = Layout::compute(max_entities, max_himos, vocab_data_size, None, None);
+        let layout = Layout::compute(max_entities, max_himos, vocab_data_size, None, None, None);
         Self::create_growable_full(path, layout, max_entities, max_himos)
     }
 
@@ -1653,6 +1734,7 @@ impl Engine {
             64 * 1024,        // vocab_data: 64 KB
             Some(64 * 1024),  // content_data: 64 KB
             Some(64),         // cyl_max_values: small per-himo cylinders
+            None,             // leaf_data: default
         );
         Self::create_growable_full(path, layout, max_entities, max_himos)
     }
@@ -1718,6 +1800,8 @@ impl Engine {
         // open 側の validate_file_size でこのフラグを見て分岐する。
         header[H_BACKING_KIND..H_BACKING_KIND + 4]
             .copy_from_slice(&BACKING_KIND_GROWABLE.to_le_bytes());
+        header[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8]
+            .copy_from_slice(&(layout.leaf_data_size as u64).to_le_bytes());
         write_header_crc(header);
 
         let _ = base; // base ptr is implicit via Region::with_grower from here on
@@ -1777,6 +1861,9 @@ impl Engine {
                 Region::with_grower(map.clone(), layout.content_data_off, layout.content_data_size)
             },
         );
+        let leaf = Some(LeafStore::init(unsafe {
+            Region::with_grower(map.clone(), layout.leaf_data_off, layout.leaf_data_size)
+        }));
 
         Ok(Self {
             path: path.to_string(),
@@ -1791,6 +1878,7 @@ impl Engine {
             himos: AppendVec::with_capacity(max_himos as usize),
             entities,
             contents,
+            leaf,
             tables: vec![TableDef::anonymous()],
             himo_to_table: AppendVec::with_capacity(max_himos as usize),
             himo_def_lock: std::sync::Mutex::new(()),
@@ -2075,11 +2163,13 @@ impl Engine {
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
+        // v6 (#88): leaf region size (pre-v6 header は 0 = leaf region 無し)。
+        let leaf_data_size = u64::from_le_bytes(buf[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8].try_into().unwrap()) as usize;
         let layout = Layout::try_from_params(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
-            content_data_size, cyl_max_values,
+            content_data_size, leaf_data_size, cyl_max_values,
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -2122,6 +2212,191 @@ impl Engine {
         Self::load_from_backing(Backing::Memory(data), /*readonly=*/ false)
     }
 
+    /// #88 (0.12.0): v5 DB (leaf region 無し = `Leaf` 値が vocab 辞書に単調
+    /// append される) の bytes を v6 (`LeafStore` あり = reclaim 対応) へ移送する
+    /// 純関数版 (file I/O なし)。 返り値は `(v6 bytes, stats)`。
+    ///
+    /// 手順: 末尾に `leaf_data_size` の LeafStore region を新設し、 各 `Leaf`
+    /// himo の live cell が持つ旧 vocab vid を辿って vocab bytes を LeafStore へ
+    /// `insert`、 cell を leaf offset に書換える。 vocab / entity / himo 構造・
+    /// content は byte 単位でそのまま引き継ぐ。
+    ///
+    /// - `leaf_data_size`: 新設 region の予約サイズ (`1..=u32::MAX`)。
+    /// - `skip_himos`: vocab に据え置く himo id。 file 経路は reopen で `.tables`
+    ///   が復元され reserved-table の Leaf が `leaf_for()==None` に戻るため、 その
+    ///   himo を渡して移送から除外し read 整合を保つ。 Memory 経路 (reopen が
+    ///   全 anonymous) は空でよい。
+    ///
+    /// 既知の trade-off: 旧 vocab の Leaf bytes は orphan として残る
+    /// (`stats.vocab_orphan_bytes_left`)。 vocab compaction は本 migration の
+    /// 対象外で、 目的は「以後の Leaf 書込みを reclaim 対象にする」こと。
+    pub fn migrate_bytes_v5_to_v6(
+        src: Vec<u8>,
+        leaf_data_size: usize,
+        skip_himos: &[u16],
+    ) -> Result<(Vec<u8>, MigrationStats), String> {
+        if src.len() < HEADER_SIZE || src[H_MAGIC..H_MAGIC + 4] != FILE_MAGIC {
+            return Err("not an EnchuDB file".into());
+        }
+        let existing_leaf = u64::from_le_bytes(
+            src[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8].try_into().unwrap(),
+        ) as usize;
+        if existing_leaf > 0 {
+            // 既に leaf region あり (v6) — 移送不要。 bytes はそのまま返す。
+            return Ok((src, MigrationStats { already_v6: true, ..Default::default() }));
+        }
+        if leaf_data_size == 0 || leaf_data_size > u32::MAX as usize {
+            return Err(format!("leaf_data_size {} out of range (1..=u32::MAX)", leaf_data_size));
+        }
+
+        // header fields (load_from_backing と同じ読み出し順)。
+        let max_entities = u32::from_le_bytes(src[H_MAX_ENTITIES..H_MAX_ENTITIES + 4].try_into().unwrap());
+        let max_himos = u32::from_le_bytes(src[H_MAX_HIMOS..H_MAX_HIMOS + 4].try_into().unwrap());
+        let himo_count = u32::from_le_bytes(src[H_HIMO_COUNT..H_HIMO_COUNT + 4].try_into().unwrap());
+        let vocab_max_entries = u32::from_le_bytes(src[H_VOCAB_MAX_ENTRIES..H_VOCAB_MAX_ENTRIES + 4].try_into().unwrap());
+        let vocab_index_cap = u32::from_le_bytes(src[H_VOCAB_INDEX_CAP..H_VOCAB_INDEX_CAP + 4].try_into().unwrap());
+        let vocab_data_size = u64::from_le_bytes(src[H_VOCAB_DATA_SIZE..H_VOCAB_DATA_SIZE + 8].try_into().unwrap()) as usize;
+        let himoreg_max_entries = u32::from_le_bytes(src[H_HIMOREG_MAX_ENTRIES..H_HIMOREG_MAX_ENTRIES + 4].try_into().unwrap());
+        let himoreg_index_cap = u32::from_le_bytes(src[H_HIMOREG_INDEX_CAP..H_HIMOREG_INDEX_CAP + 4].try_into().unwrap());
+        let himoreg_data_size = u64::from_le_bytes(src[H_HIMOREG_DATA_SIZE..H_HIMOREG_DATA_SIZE + 8].try_into().unwrap()) as usize;
+        let content_data_size = u64::from_le_bytes(src[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].try_into().unwrap()) as usize;
+        let cyl_max_values = u32::from_le_bytes(src[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].try_into().unwrap());
+
+        let layout = Layout::try_from_params(
+            max_entities, max_himos,
+            vocab_max_entries, vocab_index_cap, vocab_data_size,
+            himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
+            content_data_size, leaf_data_size, cyl_max_values,
+        )?;
+
+        // src が v5 layout 全域 (= leaf_data_off までのバイト列) をカバーしているか。
+        // leaf region は tail 追加なので v6 の leaf_data_off == v5 total_size。
+        if src.len() < layout.leaf_data_off {
+            return Err(format!(
+                "source too small: {} bytes (expected >= {}) — truncated?",
+                src.len(), layout.leaf_data_off,
+            ));
+        }
+
+        // dst = v6 layout 全域。 leaf_data_off までを src からコピー、 leaf region は
+        // 0 埋め (LeafStore::init が MAGIC + high_water を書く)。
+        let mut dst = vec![0u8; layout.total_size];
+        dst[..layout.leaf_data_off].copy_from_slice(&src[..layout.leaf_data_off]);
+
+        // header: version=6 (CRC 範囲内)、 leaf region size (CRC 範囲外)、 CRC 再計算。
+        dst[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION.to_le_bytes());
+        dst[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8]
+            .copy_from_slice(&(layout.leaf_data_size as u64).to_le_bytes());
+        write_header_crc(&mut dst);
+
+        let type_bytes: Vec<u8> = (0..himo_count as usize).map(|hid| dst[H_HIMO_TYPES + hid]).collect();
+        let skip: std::collections::HashSet<u16> = skip_himos.iter().copied().collect();
+
+        // dst 上に region を張って cell を移送する (Region::new は非所有 view なので
+        // dst は move 可能なまま)。 vocab は get のみ (readonly=true)、 leaf は新規 init。
+        let base = dst.as_mut_ptr();
+        let vocab = Vocabulary::load(
+            unsafe { Region::new(base.add(layout.vocab_data_off), layout.vocab_data_size) },
+            unsafe { Region::new(base.add(layout.vocab_offsets_off), layout.vocab_offsets_size) },
+            unsafe { Region::new(base.add(layout.vocab_index_off), layout.vocab_index_size) },
+            /*readonly=*/ true,
+        );
+        let leaf = LeafStore::init(unsafe {
+            Region::new(base.add(layout.leaf_data_off), layout.leaf_data_size)
+        });
+
+        let mut stats = MigrationStats::default();
+        for (hid, &tb) in type_bytes.iter().enumerate() {
+            if ValueType::from_byte(tb) != ValueType::Leaf { continue; }
+            if skip.contains(&(hid as u16)) { continue; }
+            stats.leaf_himos += 1;
+            let col = Column::load(unsafe {
+                Region::new(base.add(layout.himo_col_off(hid)), layout.himo_col_size)
+            });
+            let count = col.count();
+            for eid in 0..count {
+                // cell = stored 形式 (0 = 未設定、 N = 旧 vocab vid N-1)。
+                let stored = u32::from_le_bytes(col.get(eid).try_into().unwrap());
+                if stored == 0 { continue; }
+                let old_vid = stored - 1;
+                let new_off = {
+                    let bytes = vocab.get(old_vid);
+                    stats.bytes_moved += bytes.len() as u64;
+                    leaf.insert(bytes)
+                };
+                col.set(eid, &(new_off + 1).to_le_bytes());
+                stats.cells_moved += 1;
+            }
+        }
+        stats.leaf_footprint = leaf.high_water();
+        stats.vocab_orphan_bytes_left = stats.bytes_moved;
+
+        Ok((dst, stats))
+    }
+
+    /// #88: v5 DB ファイル (`src_path`) を v6 に移送して `dst_path` に書く
+    /// (default leaf region size)。 `src_path` は不変。 詳細は
+    /// [`Self::migrate_file_v5_to_v6_with_leaf`]。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn migrate_file_v5_to_v6(src_path: &str, dst_path: &str) -> Result<MigrationStats, String> {
+        Self::migrate_file_v5_to_v6_with_leaf(src_path, dst_path, DEFAULT_LEAF_DATA_SIZE)
+    }
+
+    /// #88: v5 DB ファイルを v6 に移送 (`dst_path` は `src_path` と別にすること)。
+    ///
+    /// - main DB (`.ecdb` 相当) を移送。 `.tables` sidecar は himo/table 構造を
+    ///   そのまま引き継ぐためコピーし、 reserved-table の Leaf himo は移送から
+    ///   除外して vocab に据え置く (reopen で `.tables` 復元 → `leaf_for()==None`
+    ///   と整合)。
+    /// - 旧 `.oplog` は **引き継がない** (dst の stale `.oplog` は削除)。 v5 の
+    ///   Leaf tie op は旧 wire 形 (`Vocab`+`TieNamed`) で、 移送後の cell と
+    ///   不整合になり reopen 時の replay が巻き戻すため。 dst は fresh oplog で
+    ///   開く (= main file の現在状態を checkpoint とみなす)。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn migrate_file_v5_to_v6_with_leaf(
+        src_path: &str, dst_path: &str, leaf_data_size: usize,
+    ) -> Result<MigrationStats, String> {
+        let src = std::fs::read(src_path).map_err(|e| format!("read {src_path}: {e}"))?;
+        let skip = Self::reserved_leaf_himos_from_sidecar(src_path, &src);
+        let (dst, stats) = Self::migrate_bytes_v5_to_v6(src, leaf_data_size, &skip)?;
+
+        // atomic 書き: tmp → rename (途中 crash で half-written dst を残さない)。
+        let tmp = format!("{dst_path}.migrating");
+        std::fs::write(&tmp, &dst).map_err(|e| format!("write {tmp}: {e}"))?;
+        std::fs::rename(&tmp, dst_path).map_err(|e| format!("rename {tmp} -> {dst_path}: {e}"))?;
+
+        // himo/table 構造は不変なので `.tables` をコピー。 stale な dst sidecar は掃除。
+        if let Ok(t) = std::fs::read(tables_path_for(src_path)) {
+            let _ = std::fs::write(tables_path_for(dst_path), t);
+        } else {
+            let _ = std::fs::remove_file(tables_path_for(dst_path));
+        }
+        let _ = std::fs::remove_file(format!("{dst_path}.oplog"));
+        Ok(stats)
+    }
+
+    /// `.tables` sidecar から reserved-table 配下の `Leaf` himo id を集める
+    /// (migration の skip 集合)。 sidecar が無ければ空 (= 全 anonymous 相当)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn reserved_leaf_himos_from_sidecar(path: &str, src: &[u8]) -> Vec<u16> {
+        let tables = match load_tables_from_sidecar(path) {
+            Ok(Some(t)) => t,
+            _ => return Vec::new(),
+        };
+        let himo_count = u32::from_le_bytes(src[H_HIMO_COUNT..H_HIMO_COUNT + 4].try_into().unwrap()) as usize;
+        let mut out = Vec::new();
+        for t in &tables {
+            if !t.is_reserved() { continue; }
+            for &hid in t.himo_ids.read().unwrap().iter() {
+                let h = hid as usize;
+                if h < himo_count && ValueType::from_byte(src[H_HIMO_TYPES + h]) == ValueType::Leaf {
+                    out.push(hid as u16);
+                }
+            }
+        }
+        out
+    }
+
     fn load_from_backing(mut backing: Backing, readonly: bool) -> Result<Self, String> {
         let buf = backing.as_slice_mut();
 
@@ -2132,7 +2407,7 @@ impl Engine {
         // v5 が現行、 v4 は後方互換で受け付ける (= anonymous table 1 個に migrate)。
         // v4 DB を v5 として open しても、 引き続き flat anonymous モードで動作する
         // (table 概念は step 2 以降の実装に伴って活性化)。
-        if version != FILE_VERSION && version != FILE_VERSION_LEGACY_V4 {
+        if version != FILE_VERSION && version != FILE_VERSION_LEGACY_V5 && version != FILE_VERSION_LEGACY_V4 {
             return Err(format!(
                 "unsupported EnchuDB file version {} (supported: {}, {} compat). dev phase — recreate the DB.",
                 version, FILE_VERSION, FILE_VERSION_LEGACY_V4
@@ -2156,11 +2431,12 @@ impl Engine {
         // wrap → 過小 total_size → OOB region を防ぐ)。 file 経路は open_internal →
         // validate_file_size で field sanity 済み、 Memory 経路 (from_bytes) は
         // ここが最初の防壁。
+        let leaf_data_size = u64::from_le_bytes(buf[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8].try_into().unwrap()) as usize;
         let layout = Layout::try_from_params(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
-            content_data_size, cyl_max_values,
+            content_data_size, leaf_data_size, cyl_max_values,
         )?;
 
         // backing が layout 全域をカバーしているか (Memory 経路の truncated bytes
@@ -2235,6 +2511,13 @@ impl Engine {
             unsafe { Region::new(base.add(layout.content_data_off), layout.content_data_size) },
         );
         report("ContentStore::load", &mut t, &mut p);
+        let leaf = if layout.leaf_data_size > 0 {
+            Some(LeafStore::load(unsafe {
+                Region::new(base.add(layout.leaf_data_off), layout.leaf_data_size)
+            }))
+        } else {
+            None
+        };
 
         // 0.9.0: capacity は max_himos だが、 header の himo_count が万一それを
         // 超えていても load 自体は落とさない (旧 Vec 実装と同じ寛容さ)。
@@ -2282,6 +2565,7 @@ impl Engine {
             vocab, himo_reg,
             himo_names, value_types, himo_max_values,
             himos, entities, contents,
+            leaf,
             tables: initial_tables,
             himo_to_table: initial_himo_to_table,
             himo_def_lock: std::sync::Mutex::new(()),
@@ -2345,6 +2629,10 @@ impl Engine {
         if !readonly {
             eng.vocab.mark_index_clean(false);
             eng.himo_reg.mark_index_clean(false);
+            // v6 (#88): routed-Leaf の live cell offset から LeafStore free-list を
+            // 再構成 (free-list は非永続)。 これが無いと dead slot が再利用されず
+            // footprint が増える。
+            eng.rebuild_leaf_free_list();
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let _ = eng.backing.flush_range(eng.layout.vocab_data_off, 16);
@@ -2583,7 +2871,8 @@ impl Engine {
                 | enchudb_oplog::oplog::DecodedOp::Untie { eid, .. }
                 | enchudb_oplog::oplog::DecodedOp::Delete { eid }
                 | enchudb_oplog::oplog::DecodedOp::Content { eid, .. }
-                | enchudb_oplog::oplog::DecodedOp::TieNamed { eid, .. } => is_internal_eid(*eid),
+                | enchudb_oplog::oplog::DecodedOp::TieNamed { eid, .. }
+                | enchudb_oplog::oplog::DecodedOp::TieLeaf { eid, .. } => is_internal_eid(*eid),
                 enchudb_oplog::oplog::DecodedOp::Commit => false,
                 enchudb_oplog::oplog::DecodedOp::Vocab { .. } => false,
             };
@@ -2628,7 +2917,8 @@ impl Engine {
                     | enchudb_oplog::oplog::DecodedOp::Untie { eid, .. }
                     | enchudb_oplog::oplog::DecodedOp::Delete { eid }
                     | enchudb_oplog::oplog::DecodedOp::Content { eid, .. }
-                    | enchudb_oplog::oplog::DecodedOp::TieNamed { eid, .. } => {
+                    | enchudb_oplog::oplog::DecodedOp::TieNamed { eid, .. }
+                    | enchudb_oplog::oplog::DecodedOp::TieLeaf { eid, .. } => {
                         Some(enchudb_oplog::eid_local(*eid))
                     }
                     _ => None,
@@ -2664,7 +2954,7 @@ impl Engine {
             let lsn = self.next_sync_lsn.fetch_add(1, Ordering::AcqRel);
             self.tie_to_by_id(row_eid, lsn_hid, lsn);
             self.tie_to_by_id(row_eid, peer_id_hid, rec.author_peer);
-            // DecodedOp variant を tag (Tie=0, Untie=1, Delete=2, Content=3, Commit=4, Vocab=5, TieNamed=6)
+            // DecodedOp variant を tag (Tie=0, Untie=1, Delete=2, Content=3, Commit=4, Vocab=5, TieNamed=6, TieLeaf=7)
             let op_type = match &rec.op {
                 enchudb_oplog::oplog::DecodedOp::Tie { .. } => 0,
                 enchudb_oplog::oplog::DecodedOp::Untie { .. } => 1,
@@ -2673,6 +2963,7 @@ impl Engine {
                 enchudb_oplog::oplog::DecodedOp::Commit => 4,
                 enchudb_oplog::oplog::DecodedOp::Vocab { .. } => 5,
                 enchudb_oplog::oplog::DecodedOp::TieNamed { .. } => 6,
+                enchudb_oplog::oplog::DecodedOp::TieLeaf { .. } => 7,
             };
             self.tie_to_by_id(row_eid, op_type_hid, op_type);
             // hlc.wall は u64 ms-since-epoch、 下位 32bit のみ保持 (= ~50 日サイクル
@@ -3482,6 +3773,94 @@ impl Engine {
     /// `gossip_remote_apply` 有効かつ `relayed` が `Some` なら、 同じ op を
     /// `append_relayed` で自分の WAL にも記録 (HLC/author/署名は元のまま)。
     /// `relayed` は WAL 受信時の元 header (sync 側で WireRecord から作って渡す)。
+    /// v6 (#88): himo が LeafStore routing 対象なら `&LeafStore` を返す。
+    /// 対象 = leaf region あり (v6) && Leaf 型 && reserved table 配下でない
+    /// (`_sync_ops.payload` 等の内部 Leaf は従来通り vocab)。
+    fn leaf_for(&self, hid: usize) -> Option<&LeafStore> {
+        if hid < self.value_types.len()
+            && self.value_types[hid] == ValueType::Leaf
+            && !self.himo_is_in_reserved_table(hid)
+        {
+            self.leaf.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// v6 (#88): text 型 himo の cell 生値 (raw) を payload に解決。 routed-Leaf は
+    /// LeafStore offset として、 それ以外 (Tag / reserved Leaf) は vocab vid として読む。
+    #[inline]
+    fn text_value(&self, hid: usize, raw: u32) -> &[u8] {
+        match self.leaf_for(hid) {
+            Some(leaf) => leaf.get(raw),
+            None => self.vocab.get(raw),
+        }
+    }
+
+    /// v6 (#88): routed-Leaf の cell が offset を持っていれば LeafStore に free。
+    /// delete / untie / apply_op の remove 直前に呼ぶ (leak 防止)。 非 routed は no-op。
+    #[inline]
+    fn free_leaf_cell(&self, eid: u32, hid: usize) {
+        if let Some(leaf) = self.leaf_for(hid)
+            && let Some(off) = self.himos[hid].get_value(eid)
+        {
+            leaf.free(off);
+        }
+    }
+
+    /// v6 (#88): open 時に routed-Leaf の live cell offset を集めて LeafStore の
+    /// free-list を再構成する (free-list は非永続 = store の派生)。 writable open の
+    /// load 末尾で呼ぶ。 これが無いと過去 session で空いた slot が再利用されない。
+    fn rebuild_leaf_free_list(&self) {
+        let Some(leaf) = self.leaf.as_ref() else { return; };
+        let mut live: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for hid in 0..self.himos.len() {
+            if self.leaf_for(hid).is_some() {
+                for off in self.himos[hid].unique_values() {
+                    live.insert(off);
+                }
+            }
+        }
+        leaf.rebuild_free_list(&live);
+    }
+
+    /// v6 (#88): リモート peer から届いた TieLeaf を apply。 bytes を local
+    /// LeafStore に insert して cell に offset を張る (vid mapping 不要)。
+    /// `remote_tie_apply` の Leaf 版。
+    pub fn remote_tieleaf_apply(
+        &self,
+        eid: enchudb_oplog::EntityId,
+        himo_id: u16,
+        bytes: &[u8],
+        relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
+    ) {
+        let local = enchudb_oplog::eid_local(eid);
+        let hid = himo_id as usize;
+        if hid >= self.himos.len() { return; }
+        self.entities.ensure_live(local);
+        // v6 (#88): remote re-tie 上書きで旧 offset を回収。
+        self.free_leaf_cell(local, hid);
+        let value = match self.leaf_for(hid) {
+            Some(leaf) => leaf.insert(bytes),
+            None => self.vocab.insert(bytes), // pre-v6 / reserved: 旧 vocab fallback
+        };
+        self.himos[hid].set(local, value);
+        Self::advance_table_next_local_for(&self.tables, local);
+        if self.gossip_remote_apply() {
+            if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
+                let _ = wal.append_relayed(
+                    enchudb_oplog::oplog::Op::TieLeaf {
+                        eid,
+                        himo_name: &self.himo_names[hid],
+                        himo_kind: self.value_types[hid] as u8,
+                        bytes,
+                    },
+                    h,
+                );
+            }
+        }
+    }
+
     pub fn remote_tie_apply(
         &self,
         eid: enchudb_oplog::EntityId,
@@ -3520,6 +3899,7 @@ impl Engine {
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
         if hid >= self.himos.len() { return; }
+        self.free_leaf_cell(local, hid);
         self.himos[hid].remove(local);
         if self.gossip_remote_apply() {
             if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
@@ -3539,6 +3919,7 @@ impl Engine {
     ) {
         let local = enchudb_oplog::eid_local(eid);
         for hid in 0..self.himos.len() {
+            self.free_leaf_cell(local, hid);
             self.himos[hid].remove(local);
         }
         self.entities.free(local);
@@ -3844,6 +4225,14 @@ impl Engine {
         let hid = self.ensure_himo(himo, ValueType::Tag, 0);
         // β-light step 6: eid が himo の所属 table eid_range 内か
         self.validate_eid_for_himo(hid, eid);
+        // v6 (#88): Leaf は LeafStore へ。 &mut self (build phase) は WAL emit しない
+        // ので leaf.insert + cell set のみ。 re-tie 上書きは旧 offset を free。
+        if let Some(leaf) = self.leaf_for(hid) {
+            if let Some(old) = self.himos[hid].get_value(eid) { leaf.free(old); }
+            let off = leaf.insert(value.as_bytes());
+            self.himos[hid].set(eid, off);
+            return;
+        }
         // Tag は dedupe (get_or_insert)、Leaf は新規 id 発行 (insert)。
         let vid = match self.value_types[hid] {
             ValueType::Tag => self.vocab.get_or_insert(value.as_bytes()),
@@ -3898,6 +4287,24 @@ impl Engine {
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
+        // v6 (#88): Leaf は LeafStore へ (vocab の vid は使わない)。 re-tie 上書きは
+        // 旧 offset を free してから insert (leak 防止)。 sync は bytes 同乗 TieLeaf。
+        if let Some(leaf) = self.leaf_for(hid) {
+            let bytes = value.as_bytes();
+            if let Some(old) = self.himos[hid].get_value(eid) { leaf.free(old); }
+            let off = leaf.insert(bytes);
+            self.himos[hid].set(eid, off);
+            if let Some(wal) = self.oplog.as_ref() {
+                let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
+                let _ = wal.append(enchudb_oplog::oplog::Op::TieLeaf {
+                    eid: oplog_eid,
+                    himo_name: &self.himo_names[hid],
+                    himo_kind: self.value_types[hid] as u8,
+                    bytes,
+                });
+            }
+            return;
+        }
         // Tag は dedupe、Leaf は常に新規 id。
         let vid = match self.value_types[hid] {
             ValueType::Tag => self.vocab.get_or_insert(value.as_bytes()),
@@ -3940,6 +4347,22 @@ impl Engine {
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
+        // v6 (#88): Leaf は LeafStore へ。 re-tie 上書きは旧 offset を free。
+        if let Some(leaf) = self.leaf_for(hid) {
+            if let Some(old) = self.himos[hid].get_value(eid) { leaf.free(old); }
+            let off = leaf.insert(value);
+            self.himos[hid].set(eid, off);
+            if let Some(wal) = self.oplog.as_ref() {
+                let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
+                let _ = wal.append(enchudb_oplog::oplog::Op::TieLeaf {
+                    eid: oplog_eid,
+                    himo_name: &self.himo_names[hid],
+                    himo_kind: self.value_types[hid] as u8,
+                    bytes: value,
+                });
+            }
+            return;
+        }
         let vid = match self.value_types[hid] {
             ValueType::Tag => self.vocab.get_or_insert(value),
             ValueType::Leaf => self.vocab.insert(value),
@@ -4039,6 +4462,7 @@ impl Engine {
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         if hid >= self.himos.len() { return; }
+        self.free_leaf_cell(eid, hid);
         self.himos[hid].remove(eid);
         if let Some(wal) = self.oplog.as_ref() {
             let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
@@ -4052,6 +4476,7 @@ impl Engine {
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
         for hid in 0..self.himos.len() {
+            self.free_leaf_cell(eid, hid);
             self.himos[hid].remove(eid);
         }
         self.entities.free(eid);
@@ -4156,7 +4581,7 @@ impl Engine {
         // 新経路 (`_c_{key}` Leaf himo) 優先
         if let Some(hid) = self.content_himo_id(local, key) {
             if let Some(vid) = self.get_by_id(eid, hid) {
-                return Some(self.vocab.get(vid));
+                return Some(self.text_value(hid as usize, vid));
             }
         }
         // 旧 content region fallback (pre-0.9 data の read-through 互換)
@@ -4234,11 +4659,11 @@ impl Engine {
     pub fn get_text(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Option<&[u8]> {
         let eid = enchudb_oplog::eid_local(eid);
         let hid = self.himo_id(himo)?;
-        // Tag と Leaf は両方 vocab 経由で bytes を持つ (Leaf は dedupe なし、Tag は dedupe あり)。
+        // Tag は vocab、 routed-Leaf (#88) は LeafStore、 reserved Leaf は vocab。
         match self.value_types[hid] {
             ValueType::Tag | ValueType::Leaf => {
-                let vid = self.himos[hid].get_value(eid)?;
-                Some(self.vocab.get(vid))
+                let raw = self.himos[hid].get_value(eid)?;
+                Some(self.text_value(hid, raw))
             }
             _ => None,
         }
@@ -5661,7 +6086,7 @@ impl Engine {
         for (i, hs) in self.himos.iter().enumerate() {
             if let Some(raw) = hs.get_value(eid) {
                 let val = match self.value_types[i] {
-                    ValueType::Tag | ValueType::Leaf => EntityValue::Text(self.vocab.get(raw)),
+                    ValueType::Tag | ValueType::Leaf => EntityValue::Text(self.text_value(i, raw)),
                     _ => EntityValue::Num(raw),
                 };
                 fields.push((self.himo_names[i].as_str(), val));
@@ -6161,6 +6586,13 @@ impl Engine {
                 }
                 self.entities.ensure_live(local);
                 Self::advance_table_next_local_for(&self.tables, local);
+            }
+            DecodedOp::TieLeaf { .. } => {
+                // 0.12.0 (#88): self-authored TieLeaf の recover は no-op。
+                // Leaf payload は LeafStore、 cell offset は himo 列、 どちらも mmap
+                // body として durable なので「既に local に在る」(Vocab と同思想)。
+                // 再 insert すると offset が変わり slot が二重化するため触らない。
+                // remote peer からの TieLeaf は sync crate の apply-one 経由で別 apply。
             }
             DecodedOp::Commit => {}
             DecodedOp::Vocab { .. } => {
@@ -6723,6 +7155,18 @@ impl Engine {
     /// O(vocab.count() + Σ himos.unique_values().len())。 vid set は `Vec<bool>` で
     /// vocab.count() bit。 vocab.count() = 1B なら 1GB 食うので注意。 巨大 DB なら
     /// 別 issue で BitVec か stream 化を検討。
+    /// v6 (#88): LeafStore の現 footprint (high_water)。 pre-v6 DB (leaf region
+    /// 無し) は None。 routing 前 (2.1 scaffolding) は常に HEADER 相当。
+    pub fn leaf_footprint(&self) -> Option<u32> {
+        self.leaf.as_ref().map(|l| l.high_water())
+    }
+
+    /// vocab data 領域の消費 byte 数 (単調・回収なし)。 #88 bench で
+    /// 「Leaf を vocab に載せる旧挙動」の footprint 増加を計測する用。
+    pub fn vocab_data_footprint(&self) -> u32 {
+        self.vocab.data_footprint()
+    }
+
     pub fn vocab_orphan_stats(&self) -> VocabOrphanStats {
         let vocab_total = self.vocab.count();
         if vocab_total == 0 {
@@ -6739,6 +7183,9 @@ impl Engine {
         // stored は内部表現値 +1 ではなく素の vid なので decode 不要。
         let mut is_live = vec![false; vocab_total as usize];
         for hid in 0..self.value_types.len() {
+            // v6 (#88): routed-Leaf の cell は vocab vid でなく LeafStore offset なので
+            // vocab の live 判定から除外する (含めると無関係な vid を live 誤判定)。
+            if self.leaf_for(hid).is_some() { continue; }
             match self.value_types[hid] {
                 ValueType::Tag | ValueType::Leaf => {
                     let vids = self.himos[hid].unique_values();
@@ -6781,15 +7228,19 @@ impl Engine {
             Op::Tie { eid, himo_id, value } => {
                 let hid = himo_id as usize;
                 if hid >= self.himos.len() { return; }
+                // v6 (#88): routed-Leaf の re-tie 上書きは旧 offset を free (async path)。
+                self.free_leaf_cell(eid, hid);
                 self.himos[hid].set(eid, value);
             }
             Op::Untie { eid, himo_id } => {
                 let hid = himo_id as usize;
                 if hid >= self.himos.len() { return; }
+                self.free_leaf_cell(eid, hid);
                 self.himos[hid].remove(eid);
             }
             Op::Delete { eid } => {
                 for hid in 0..self.himos.len() {
+                    self.free_leaf_cell(eid, hid);
                     self.himos[hid].remove(eid);
                 }
                 self.entities.free(eid);
@@ -6882,6 +7333,31 @@ impl Engine {
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         // β-light step 6: eid が himo の所属 table eid_range 内か
         self.validate_eid_for_himo(hid, local);
+        // v6 (#88): Leaf は LeafStore へ。 offset を write_queue の value に載せ、
+        // WAL には bytes 同乗 TieLeaf を流す。 旧 offset の free は apply_op::Tie 側
+        // (= 適用時点の cell を見る。 push 時 free は queue 未適用の二重 free を招く)。
+        if let Some(leaf) = self.leaf_for(hid) {
+            let off = leaf.insert(value);
+            let q = self.write_queue.as_ref()
+                .expect("tie_bytes_async requires create_concurrent or concurrentize");
+            q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value: off });
+            self.push_count.fetch_add(1, Ordering::Release);
+            if let Some(wal) = self.oplog.as_ref() {
+                let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
+                let rec = enchudb_oplog::oplog::OwnedOp::TieLeaf {
+                    eid: oplog_eid,
+                    himo_name: self.himo_names[hid].clone(),
+                    himo_kind: self.value_types[hid] as u8,
+                    bytes: value.to_vec(),
+                };
+                if let Some(wq) = self.oplog_record_queue.as_ref() {
+                    push_oplog_record_blocking(wq, rec, &self.consumer_poisoned, &self.wal_push_count);
+                } else {
+                    let _ = wal.append(rec.as_op());
+                }
+            }
+            return;
+        }
         // Tag は dedupe、Leaf は常に新規 id。
         let vid = match self.value_types[hid] {
             ValueType::Tag => self.vocab.get_or_insert(value),
