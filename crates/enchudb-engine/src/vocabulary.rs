@@ -287,6 +287,10 @@ impl Vocabulary {
 
     pub fn count(&self) -> u32 { self.count.load(Ordering::Relaxed) }
 
+    /// data 領域の append pointer (= 消費済み byte 数)。 単調増加・回収なし。
+    /// #88 bench: Leaf を vocab に載せた場合の「回収されない footprint」計測用。
+    pub fn data_footprint(&self) -> u32 { self.data_end.load(Ordering::Relaxed) }
+
     /// 内部状態をRegionヘッダに書き戻す（flushの前に呼ぶ）。
     pub fn sync(&self) {
         let dm = self.data.slice_mut();
