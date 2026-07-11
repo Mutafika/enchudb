@@ -3,6 +3,53 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.12.2 — 2026-07-11
+
+### Fixed — dirty open が vocab index 予約全域を物理コミットする問題 (#92 / #56 ③)
+
+crash 相当の落ち方 (flush せず drop / `process::exit` = `clean_flag=0`) をした DB を
+write open するたび、 `Vocabulary::rebuild_index_into` が **index 予約全域
+(`index_cap`×13B) を zero-fill** してから live entry を再挿入していた。 index region は
+fixed cluster で mmap 済みだが **sparse** (物理ブロック未確保) なので、 この全域
+書き込みが sparse ページを 1 枚残らず物理化 → **live vocab 数と無関係に `index_cap`
+比例の物理コミット**が起きていた (#56 で ①② は fix 済だが ③「rebuild は used slot
+だけ touch する」提案が未実装のまま残存)。 `create_growable_with_capacity` は
+`vocab_max_entries = cap×16` なので大 pool ほど深刻 (cap=1M で dirty reopen 一発
++~200MB、 cap=16M で ~3.5GB)。 sinfo CLI (sf) の「空 DB でも起動が pool 比例で重い」
+の主因。
+
+- **全域 zero-fill を廃止**し、 既存 on-disk index の上へ live entry (id 0..count) を
+  **再挿入するだけ** に (used-slot only touch)。 append-only vocab の count が単調な
+  ことを利用:
+  - 通常の落ち方では on-disk index は data と consistent → 全 entry が dup 一致で
+    **書き込みゼロ** (触るのは live slot が載る数ページのみ)。
+  - torn write で index が count より遅れ (slot 欠落) → 空 slot へ再挿入して self-heal。
+  - torn write で index が count より先行 (`vid >= count` の「未来」slot 残存) →
+    live entry ではないので `slot_hash` 一致でも `get(vid)` を呼ばず読み飛ばす guard を
+    `rebuild` / `lookup` / `index_insert` に一貫追加 (OOB と誤 dedup を防ぐ)。 通常運用の
+    committed slot は必ず `vid < count` なので **hot path は無影響** (guard は crash
+    復旧後のみ発火)。
+- **readonly open の RAM 肥大も同時に解消**: dirty DB の readonly open は heap の
+  shadow index に rebuild するが、 同じ zero-fill が shadow (calloc で sparse) の全
+  ページを touch し `index_cap` 比例の RSS を食っていた。 zero-fill 撤廃で O(count) に。
+
+**互換性**: on-disk format 不変 (v7 のまま)、 wire 不変、 API 不変。 純粋な内部 open
+経路の fix。 既に旧挙動で膨らんだ DB の**コミット済み物理を回収**する shrink 経路は
+別スコープ (本 fix は今後の bloat を防ぐ)。
+
+**効果 (`issue92_dirty_footprint` bench, live vocab 5 件)**:
+
+| cap | index region | dirty reopen 増分 (before → after) |
+|----:|----:|---|
+| 256K | ~54MB | +18,112 KB → **+0 KB** |
+| 1M | ~218MB | +204,720 KB → **+0 KB** |
+| 4M | ~832MB | +843,680 KB → **+0 KB** |
+
+**検証**: `issue92_dirty_index_full_commit` (別プロセス `process::exit` で dirty 化 →
+reopen 増分 < 4MB、 fix を戻すと fail する regression guard)、 `vocabulary` unit 3
+(consistent 再挿入 / torn-behind self-heal / torn-ahead の OOB 回避)、 全 workspace
+test green。
+
 ## 0.12.1 — 2026-07-11
 
 ### Changed — `LeafStore` の cell offset を word 単位化 + region cap を選択式に (#90)
