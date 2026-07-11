@@ -3,6 +3,49 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.12.1 — 2026-07-11
+
+### Changed — `LeafStore` の cell offset を word 単位化 + region cap を選択式に (#90)
+
+`LeafStore` (#88 / 0.12.0) の cell 参照・`high_water`・free-list が **生 byte offset
+の u32** だったため leaf region が ~4.29GB でハードキャップだった。 slot は
+`2^off_shift` aligned で確保されるので **offset の下位 bit は常に 0** = **word offset
+(`byte >> off_shift`)** で持てば、 列幅も indirection も増やさず cap を拡げられる。
+
+- cell handle / `high_water` / free-list を **word 単位** に (slot header の
+  `slot_size` / `len` は byte のまま)。 region cap = `u32::MAX << off_shift`:
+
+  | scale (`LeafScale`) | off_shift / align | cap |
+  |---------------------|-------------------|-----|
+  | `Gb16` (default)    | 2 / 4B            | ~16GB |
+  | `Gb32`              | 3 / 8B            | ~32GB |
+  | `Gb64`              | 4 / 16B           | ~64GB |
+
+- **選択式**: `create_full_with_leaf_scale` / `create_growable_with_leaf` で
+  `LeafScale` を指定 (default `Gb16`)。 大きい scale ほど slot alignment (padding)
+  が粗くなるので、 小さい payload は `Gb16`、 wikipulse 型の大 payload × 巨大
+  working set は `Gb32`/`Gb64`。 予約 `leaf_data_size` は選んだ scale の cap 以下を検証。
+- `off_shift` は leaf region header に self-describing に記録。
+- `leaf_footprint()` / `MigrationStats.leaf_footprint` を **`u64` (byte)** に
+  (16GB 超を表せるよう u32 から拡張 — 呼び出し側の型注釈のみ影響)。
+
+**互換性 (patch に収まる理由)**: on-disk format は v6 → v7 に上がるが、
+
+- **既存 v6 DB は無改変で動く**: v7 engine は v6 region を header の `off_shift == 0`
+  (= byte offset) として **read-through** で開く (migration 不要、 4GB cap のまま)。
+- **wire / sync は完全に不変**: offset は各 node ローカルの storage 詳細で wire に
+  乗らない (`TieLeaf` は生 bytes を運ぶ)。 → **peer 同時アップグレード不要**、
+  v6/v7 node 混在でも収束する。
+- 既存の create API・tie/read 挙動・reclaim は不変 (additive)。
+- **唯一の非互換**: v7 で作った DB は **0.12.0 engine では開けない** (word offset を
+  byte と誤読するため version gate で reject)。 = 新規 DB は 0.12.1 以降が必要。
+  既存 DB を 4GB 超に伸ばしたい場合は v7 で作り直す (v5→v6 migration の出力は
+  従来通り byte-offset の v6)。
+
+**検証**: `leaf_store` unit 10 (word encoding / cap 16-64GB / 5GB sparse で 4GB 超
+offset の往復 / shift 2·4 の churn reclaim / v6 byte 互換)、 `issue90_leaf_scale` 3
+(scale reopen 永続 / reclaim / cap 超過 reject)、 全 workspace test green。
+
 ## 0.12.0 — 2026-07-11
 
 ### Changed — `Leaf` を vocab から剥がし reclaim 対応 store に載せる (#88): high-churn Leaf の単一 DB 無限運用
