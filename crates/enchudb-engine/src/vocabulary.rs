@@ -129,12 +129,31 @@ impl Vocabulary {
 
     /// `xm` (index layout のバイト列、 mmap でも heap でも可) へ index を
     /// 再構築する。 open 時の単一スレッド実行前提なので atomic は使わない。
+    ///
+    /// #92 (#56 ③): **予約全域を zero-fill しない**。 旧実装は先頭で
+    /// `for b in &mut xm[INDEX_HEADER..] { *b = 0; }` と index_cap×13B を全ゼロ
+    /// 埋めしてから live entry を再挿入していた。 index region は fixed cluster で
+    /// mmap 済みだが **sparse** (物理未確保) なので、 この全域書き込みが sparse
+    /// ページを 1 枚残らず物理化 → live vocab 数と無関係に index_cap 比例の物理
+    /// commit (writer) / RAM commit (readonly shadow) を起こしていた。
+    ///
+    /// 代わりに **既存の on-disk index の上へ live entry (id 0..count) を再挿入
+    /// するだけ** にする (used-slot only touch)。 append-only vocab の count は
+    /// 単調なので:
+    /// - 通常の落ち方 (page cache 経由の drop / process::exit) では on-disk index は
+    ///   data と consistent。 → 各 entry は自分の slot で dup 一致し **書き込みゼロ**
+    ///   (触るのは live slot が載る数ページのみ)。
+    /// - torn write で index が count より遅れていた (slot 欠落) 場合は空 slot へ
+    ///   再挿入して self-heal。
+    /// - 旧実装は全域 zero-fill で破損/不整合 slot を全 scrub していた。 no-clear では
+    ///   既存 slot が残るので、 **vid >= max_entries の破損 slot** (実 insert は
+    ///   `vid < max_entries` を assert するので通常あり得ないが、 bit-rot 等) を
+    ///   `slot_hash == h` でも `get(vid)` を呼ばず読み飛ばす guard を入れる。 get が
+    ///   offsets region を溢れて OOB するのを防ぐ = 旧 zero-fill と同じ安全性を復元。
+    ///   lookup / index_insert も同じ predicate で一貫させる。
     fn rebuild_index_into(v: &Self, xm: &mut [u8]) {
         let count = v.count.load(Ordering::Relaxed);
         if count == 0 { return; }
-
-        // インデックス領域をゼロクリア（ヘッダは保持）
-        for b in &mut xm[INDEX_HEADER..] { *b = 0; }
 
         let mask = (v.index_cap - 1) as u64;
         for id in 0..count {
@@ -152,7 +171,10 @@ impl Vocabulary {
                 let slot_hash = u64::from_le_bytes(xm[off + 1..off + 9].try_into().unwrap());
                 if slot_hash == h {
                     let vid = u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap());
-                    if v.get(vid) == value { break; } // Leaf 二重 append 等の真の重複
+                    // #92: vid >= max_entries の破損 slot は get(vid) が offsets region を
+                    // 溢れて OOB するので dup 判定に使わず読み飛ばす (lookup / index_insert と
+                    // 同じ predicate = 破損 slot の扱いを 3 経路で一貫させる)。
+                    if vid < v.max_entries && v.get(vid) == value { break; } // 真の重複 (Leaf 二重 append 等)
                 }
                 idx = ((idx as u64 + 1) & mask) as usize;
             }
@@ -195,8 +217,11 @@ impl Vocabulary {
             let slot_hash = u64::from_le_bytes(xm[off + 1..off + 9].try_into().unwrap());
             if slot_hash == h {
                 let vid = u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap());
-                let stored = self.get(vid);
-                if stored == value { return Some(vid); }
+                // #92: 実 insert は必ず vid < max_entries を assert する。 no-clear
+                // rebuild で残りうる **vid >= max_entries の破損 slot** は get(vid) が
+                // offsets region を溢れて OOB するので読み飛ばす。 max_entries は不変
+                // なので atomic 不要・並行 insert の valid slot を skip しない (race 無)。
+                if vid < self.max_entries && self.get(vid) == value { return Some(vid); }
             }
             idx = ((idx as u64 + 1) & mask) as usize;
         }
@@ -278,8 +303,13 @@ impl Vocabulary {
             if slot_hash == h {
                 // ハッシュ一致 → 実際の値を比較して本当に重複か確認
                 let vid = u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap());
-                if self.get(vid) == value { return; } // 本当の重複
-                // ハッシュ衝突 → linear probe 続行
+                // #92: vid >= max_entries の破損 slot は get(vid) が OOB するので
+                // 読み飛ばす (実 insert は vid < max_entries を保証 = 通常運用では常に
+                // 通過。 max_entries は不変で並行 insert を skip しない = dedup race 無)。
+                if vid < self.max_entries && self.get(vid) == value {
+                    return; // 本当の重複
+                }
+                // ハッシュ衝突 or 破損 slot → linear probe 続行
             }
             idx = ((idx as u64 + 1) & mask) as usize;
         }
@@ -403,6 +433,167 @@ mod tests {
         assert_eq!(flag(&r), 1, "flush 直後は clean=1");
         w.get_or_insert(b"second");
         assert_eq!(flag(&r), 0, "flush 後の insert で clean=0 に戻るはず (#77-M1)");
+    }
+
+    /// index 領域を直接叩くための helper。
+    impl Regions {
+        fn index_mut(&self) -> &mut [u8] {
+            unsafe { std::slice::from_raw_parts_mut(self.index_ptr, self.index_len) }
+        }
+        /// vid を持つ live slot を探して 0 クリア (= torn write で slot 欠落を模す)。
+        fn clear_slot_of(&self, vid: u32) {
+            let xm = self.index_mut();
+            let mut off = INDEX_HEADER;
+            while off + INDEX_SLOT_SIZE <= self.index_len {
+                if xm[off] != 0
+                    && u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap()) == vid
+                {
+                    for b in &mut xm[off..off + INDEX_SLOT_SIZE] {
+                        *b = 0;
+                    }
+                }
+                off += INDEX_SLOT_SIZE;
+            }
+        }
+        /// value の probe home 以降で最初の空 slot に (hash, vid) を植える
+        /// (= torn write で count より先行した「未来」slot を模す)。
+        fn plant_slot(&self, index_cap: u32, value: &[u8], vid: u32) {
+            let xm = self.index_mut();
+            let mask = (index_cap - 1) as u64;
+            let h = fxhash(value);
+            let mut idx = (h & mask) as usize;
+            loop {
+                let off = INDEX_HEADER + idx * INDEX_SLOT_SIZE;
+                if xm[off] == 0 {
+                    xm[off] = 1;
+                    xm[off + 1..off + 9].copy_from_slice(&h.to_le_bytes());
+                    xm[off + 9..off + 13].copy_from_slice(&vid.to_le_bytes());
+                    return;
+                }
+                idx = ((idx as u64 + 1) & mask) as usize;
+            }
+        }
+    }
+
+    /// #92: dirty reopen (no-clear rebuild) が全 live value を保持し、 dedup も
+    /// 効くこと。 on-disk index が data と consistent (通常の落ち方) な標準ケース。
+    #[test]
+    fn dirty_rebuild_preserves_all_values() {
+        let r = make_regions(1024, 1024, 64 * 1024);
+        let w = r.vocab_init(1024, 1024);
+        let mut ids = Vec::new();
+        for i in 0..300 {
+            ids.push(w.get_or_insert(format!("v{i}").as_bytes()));
+        }
+        w.sync(); // count/data_end を書き戻す。 clean_flag は 0 のまま = dirty。
+        drop(w);
+
+        let w2 = r.vocab_load(/*readonly=*/ false); // no-clear rebuild
+        for i in 0..300 {
+            assert_eq!(
+                w2.lookup(format!("v{i}").as_bytes()),
+                Some(ids[i]),
+                "v{i} が dirty rebuild 後に消えた"
+            );
+        }
+        assert_eq!(w2.lookup(b"absent"), None);
+        assert_eq!(w2.get_or_insert(b"v0"), ids[0], "既存値の dedup が壊れた");
+        let fresh = w2.get_or_insert(b"brand-new");
+        assert_eq!(fresh, 300, "新規値は次の id を取るはず");
+        assert_eq!(w2.lookup(b"brand-new"), Some(300));
+    }
+
+    /// #92: torn-behind (index が count より遅れて slot 欠落) を dirty rebuild が
+    /// self-heal すること。
+    #[test]
+    fn dirty_rebuild_self_heals_missing_slot() {
+        let r = make_regions(1024, 1024, 64 * 1024);
+        let w = r.vocab_init(1024, 1024);
+        let mut ids = Vec::new();
+        for i in 0..20 {
+            ids.push(w.get_or_insert(format!("k{i}").as_bytes()));
+        }
+        w.sync();
+        r.clear_slot_of(ids[7]); // torn: k7 の slot が flush されず消失
+        drop(w);
+
+        let w2 = r.vocab_load(false);
+        assert_eq!(
+            w2.lookup(b"k7"),
+            Some(ids[7]),
+            "torn-behind の欠落 slot が self-heal されない"
+        );
+        for i in 0..20 {
+            assert_eq!(w2.lookup(format!("k{i}").as_bytes()), Some(ids[i]));
+        }
+    }
+
+    /// #92: no-clear rebuild で残りうる **vid >= max_entries の破損 slot** (bit-rot 等)
+    /// でも rebuild / lookup / insert が offsets region を溢れて OOB せず正しく振る舞う
+    /// こと。 破損 slot の hash がクエリと衝突する配置にして guard 経路を必ず踏ませる。
+    #[test]
+    fn dirty_rebuild_tolerates_corrupt_slot_no_oob() {
+        let max_entries = 1024u32;
+        let r = make_regions(max_entries, 1024, 64 * 1024);
+        let index_cap = 1024u32; // 1024.next_power_of_two()
+        let w = r.vocab_init(max_entries, index_cap);
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            ids.push(w.get_or_insert(format!("t{i}").as_bytes()));
+        }
+        w.sync();
+        let count = w.count(); // 10
+        // 破損 slot: value "probe-me" の home 以降に slot_hash=fxhash("probe-me")、
+        // vid=9999 (>= max_entries=1024) を植える。 offsets region は max_entries×8 しか
+        // 無いので guard 無しで get(9999) を呼ぶと offsets region 自体を OOB する配置。
+        r.plant_slot(index_cap, b"probe-me", 9999);
+        drop(w);
+
+        let w2 = r.vocab_load(false); // rebuild は破損 slot で OOB してはならない
+        // probe-me は未挿入 → 破損 slot を skip して None (誤 hit / OOB しない)。
+        assert_eq!(w2.lookup(b"probe-me"), None, "破損 slot が誤 hit / OOB");
+        for i in 0..10 {
+            assert_eq!(w2.lookup(format!("t{i}").as_bytes()), Some(ids[i]));
+        }
+        // 挿入も破損 slot を skip して新 id を取れること。
+        let np = w2.get_or_insert(b"probe-me");
+        assert_eq!(np, count, "破損 slot を跨いだ挿入が新 id を取れない");
+        assert_eq!(w2.lookup(b"probe-me"), Some(count));
+    }
+
+    /// #92: guard を `vid < max_entries` (不変) にしたので、 並行 `get_or_insert` が
+    /// valid slot を stale count で取りこぼして dedup を壊す race が無いこと。 8 thread で
+    /// 重複する値集合を叩き、 全 distinct 値が lost せず findable であること + OOB
+    /// panic しないことを確認する (index_insert / lookup 双方を contention 下で踏む)。
+    #[test]
+    fn concurrent_get_or_insert_stays_findable() {
+        use std::sync::Arc;
+        let max_entries = 16384u32;
+        let r = make_regions(max_entries, 16384, 1024 * 1024);
+        let w = Arc::new(r.vocab_init(max_entries, 16384));
+        let n_distinct = 128usize;
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let w = w.clone();
+                std::thread::spawn(move || {
+                    for i in 0..1000usize {
+                        let v = format!("v{:05}", (i * 7 + t) % n_distinct);
+                        let id = w.get_or_insert(v.as_bytes());
+                        assert!(id < max_entries, "vocab full / 不正 id");
+                    }
+                })
+            })
+            .collect();
+        for h in threads {
+            h.join().unwrap();
+        }
+        // 全 distinct 値が findable (取りこぼし無し) かつ返る vid の実体が一致。
+        for k in 0..n_distinct {
+            let v = format!("v{:05}", k);
+            let got = w.lookup(v.as_bytes());
+            assert!(got.is_some(), "並行 insert 後に {v} が lost (dedup race)");
+            assert_eq!(w.get(got.unwrap()), v.as_bytes(), "{v} の vid 実体不一致");
+        }
     }
 }
 
