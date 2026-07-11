@@ -108,8 +108,8 @@ pub struct MigrationStats {
     pub cells_moved: u64,
     /// 移した payload の総 byte 数 (slot header / padding は含まない生 bytes)。
     pub bytes_moved: u64,
-    /// 移送後の LeafStore footprint (high_water)。
-    pub leaf_footprint: u32,
+    /// 移送後の LeafStore footprint (high_water、 byte)。
+    pub leaf_footprint: u64,
     /// 移送後も vocab data に残る旧 Leaf bytes (= 死蔵)。 本 migration は
     /// vocab compaction をしないので、 この分は footprint に残る (既知の trade-off)。
     pub vocab_orphan_bytes_left: u64,
@@ -753,7 +753,7 @@ use crate::vocabulary::Vocabulary;
 use crate::entity_set::EntitySet;
 use crate::himo_store::{HimoStore, ValueType};
 use crate::content_store::ContentStore;
-use crate::leaf_store::LeafStore;
+use crate::leaf_store::{LeafStore, cap_bytes_for_shift, MAX_OFF_SHIFT};
 use crate::column::Column;
 
 // ════════════════ ギャロッピング交差 ════════════════
@@ -814,10 +814,16 @@ const FILE_MAGIC: [u8; 4] = *b"ECDB";
 /// undo は WAL 有効時には Commit で自動 clear される redundant な層であり、
 /// standalone mode では `record()` 内の spin-wait が consumer 不在で
 /// permanent hang を起こしていた (GitHub issue #1)。 v3 DB は再作成必要。
-const FILE_VERSION: u32 = 6;
+/// v7 (0.13.0, #90): LeafStore の cell offset を word 単位化 (16/32/64GB 選択可)。
+/// v6 (0.12.0) は leaf offset が byte なので、 v6 region は self-describing な
+/// `off_shift == 0` として v7 engine が read-through で扱う (migration 不要)。
+const FILE_VERSION: u32 = 7;
 /// v4 DB を後方互換で open する識別子。 v4 → v5 migrate は open 時透過。
 const FILE_VERSION_LEGACY_V5: u32 = 5;
 const FILE_VERSION_LEGACY_V4: u32 = 4;
+/// v6 (0.12.0, #88): byte-offset LeafStore。 v7 engine が read-through で open
+/// (leaf off_shift=0)。 v5→v6 migration の出力 version でもある。
+const FILE_VERSION_LEGACY_V6: u32 = 6;
 const HEADER_SIZE: usize = 4096;
 
 const DEFAULT_MAX_ENTITIES: u32 = 16_777_216;
@@ -827,6 +833,36 @@ const DEFAULT_VOCAB_DATA_SIZE: usize = 512 * 1024 * 1024;
 /// v6 (0.12.0, #88): Leaf payload 用 `LeafStore` の default 予約。 vocab と同等
 /// (set_len sparse / growable lazy commit なので実 usage まで物理消費しない)。 tunable。
 const DEFAULT_LEAF_DATA_SIZE: usize = 512 * 1024 * 1024;
+/// v7 (0.13.0, #90): 新規 DB の LeafStore offset shift の default = 2 (16GB cap、
+/// slot align4 で v6 と byte 等価)。
+const DEFAULT_LEAF_OFF_SHIFT: u32 = 2;
+
+/// v7 (#90): LeafStore region の addressable 上限を選ぶ (create 時)。 cell 参照を
+/// word offset (`byte >> shift`) で持つことで、 列幅・indirection を増やさず cap を
+/// 拡げる。 大きいほど slot alignment (= padding) が粗くなるので、 payload が小さい
+/// 用途は `Gb16`、 wikipulse のような大 payload × 巨大 working set は `Gb32`/`Gb64`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeafScale {
+    /// shift 2 / align4 / ~16GB。 default。
+    Gb16,
+    /// shift 3 / align8 / ~32GB。
+    Gb32,
+    /// shift 4 / align16 / ~64GB。
+    Gb64,
+}
+
+impl LeafScale {
+    #[inline]
+    pub fn off_shift(self) -> u32 {
+        match self {
+            LeafScale::Gb16 => 2,
+            LeafScale::Gb32 => 3,
+            LeafScale::Gb64 => 4,
+        }
+    }
+    #[inline]
+    pub fn cap_bytes(self) -> u64 { cap_bytes_for_shift(self.off_shift()) }
+}
 
 // ヘッダオフセット
 const H_MAGIC: usize = 0;
@@ -1095,11 +1131,15 @@ impl Layout {
                 "max_entities {} exceeds format limit — corrupt header?", max_entities,
             ));
         }
-        // v6 (#88): LeafStore の high_water は u32。 4 GiB 超は offset wrap を招くので拒否。
-        if leaf_data_size > u32::MAX as usize {
+        // v7 (#90): LeafStore の high_water は word u32。 addressable 上限は
+        // off_shift で決まる (16/32/64GB)。 layout は shift を知らないので、 ここでは
+        // 絶対上限 (= MAX_OFF_SHIFT = 64GB) だけ弾く。 shift 個別の cap は create 側で
+        // `LeafScale::cap_bytes` に対して検証する。
+        let leaf_abs_cap = cap_bytes_for_shift(MAX_OFF_SHIFT);
+        if leaf_data_size as u64 > leaf_abs_cap {
             return Err(format!(
-                "leaf_data_size {} exceeds format limit {} (u32 high_water) — corrupt header?",
-                leaf_data_size, u32::MAX,
+                "leaf_data_size {} exceeds absolute format limit {} (64GB) — corrupt header?",
+                leaf_data_size, leaf_abs_cap,
             ));
         }
         let ck_add = |a: usize, b: usize| -> Result<usize, String> {
@@ -1536,6 +1576,7 @@ impl Engine {
     /// `create_full_with_cyl` の leaf region size を明示できる版。
     /// `leaf_data_size = Some(0)` は leaf region 無し = v5 相当 DB を作る
     /// (#88 migration test / bench の before 生成)。 None は default 予約。
+    /// leaf scale は default (`Gb16`)。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create_full_with_leaf(
         path: &str,
@@ -1546,9 +1587,42 @@ impl Engine {
         cyl_max_values: Option<u32>,
         leaf_data_size: Option<usize>,
     ) -> io::Result<Self> {
+        Self::create_full_with_leaf_scale(
+            path, max_entities, vocab_data_size, max_himos, content_data_size,
+            cyl_max_values, leaf_data_size, None,
+        )
+    }
+
+    /// #90: LeafStore の scale (`LeafScale::Gb16`/`Gb32`/`Gb64` = 16/32/64GB cap) を
+    /// 明示する版。 None は default (`Gb16`)。 leaf offset は word 単位で持つので、
+    /// scale を上げても列幅は増えず slot alignment (padding) だけ粗くなる。
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_full_with_leaf_scale(
+        path: &str,
+        max_entities: u32,
+        vocab_data_size: Option<usize>,
+        max_himos: Option<u32>,
+        content_data_size: Option<usize>,
+        cyl_max_values: Option<u32>,
+        leaf_data_size: Option<usize>,
+        leaf_scale: Option<LeafScale>,
+    ) -> io::Result<Self> {
+        let off_shift = leaf_scale.map(|s| s.off_shift()).unwrap_or(DEFAULT_LEAF_OFF_SHIFT);
         let vds = vocab_data_size.unwrap_or(DEFAULT_VOCAB_DATA_SIZE);
         let max_himos = max_himos.unwrap_or(DEFAULT_MAX_HIMOS);
         let layout = Layout::compute(max_entities, max_himos, vds, content_data_size, cyl_max_values, leaf_data_size);
+        // #90: 予約 leaf region が選んだ scale の cap を超えないか検証。
+        let leaf_cap = cap_bytes_for_shift(off_shift);
+        if layout.leaf_data_size as u64 > leaf_cap {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "leaf_data_size {} exceeds scale cap {} (off_shift {}) — 大きい LeafScale を選べ",
+                    layout.leaf_data_size, leaf_cap, off_shift,
+                ),
+            ));
+        }
 
         if let Some(parent) = std::path::Path::new(path).parent() {
             if !parent.as_os_str().is_empty() {
@@ -1610,7 +1684,7 @@ impl Engine {
         let leaf = if layout.leaf_data_size > 0 {
             Some(LeafStore::init(unsafe {
                 Region::new(base.add(layout.leaf_data_off), layout.leaf_data_size)
-            }))
+            }, off_shift))
         } else {
             None
         };
@@ -1683,7 +1757,7 @@ impl Engine {
     pub fn create_growable_with_capacity(path: &str, max_entities: u32) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
         let layout = Layout::compute(max_entities, max_himos, DEFAULT_VOCAB_DATA_SIZE, None, None, None);
-        Self::create_growable_full(path, layout, max_entities, max_himos)
+        Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
     }
 
     /// growable backing で開く。`max_entities` と `vocab_data_size` を明示。
@@ -1700,7 +1774,35 @@ impl Engine {
     ) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
         let layout = Layout::compute(max_entities, max_himos, vocab_data_size, None, None, None);
-        Self::create_growable_full(path, layout, max_entities, max_himos)
+        Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
+    }
+
+    /// #90: growable backing で、 leaf region の予約 size と scale (16/32/64GB) を
+    /// 明示する。 wikipulse のような大 payload × 巨大 live working set 用途で、
+    /// leaf region を 4GB 超に伸ばす場合に使う。 `leaf_data_size` は選んだ scale の
+    /// cap 以下であること。 leaf offset は word 単位なので列幅は不変。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn create_growable_with_leaf(
+        path: &str,
+        max_entities: u32,
+        vocab_data_size: Option<usize>,
+        leaf_data_size: Option<usize>,
+        leaf_scale: LeafScale,
+    ) -> io::Result<Self> {
+        let max_himos = DEFAULT_MAX_HIMOS;
+        let vds = vocab_data_size.unwrap_or(DEFAULT_VOCAB_DATA_SIZE);
+        let layout = Layout::compute(max_entities, max_himos, vds, None, None, leaf_data_size);
+        let leaf_cap = leaf_scale.cap_bytes();
+        if layout.leaf_data_size as u64 > leaf_cap {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "leaf_data_size {} exceeds scale cap {} ({:?}) — 大きい LeafScale を選べ",
+                    layout.leaf_data_size, leaf_cap, leaf_scale,
+                ),
+            ));
+        }
+        Self::create_growable_full(path, layout, max_entities, max_himos, leaf_scale.off_shift())
     }
 
     /// Tiny growable preset for app state-logs (matcha-style: a few
@@ -1736,7 +1838,7 @@ impl Engine {
             Some(64),         // cyl_max_values: small per-himo cylinders
             None,             // leaf_data: default
         );
-        Self::create_growable_full(path, layout, max_entities, max_himos)
+        Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1745,6 +1847,7 @@ impl Engine {
         layout: Layout,
         max_entities: u32,
         max_himos: u32,
+        leaf_off_shift: u32,
     ) -> io::Result<Self> {
         if let Some(parent) = std::path::Path::new(path).parent() {
             if !parent.as_os_str().is_empty() {
@@ -1863,7 +1966,7 @@ impl Engine {
         );
         let leaf = Some(LeafStore::init(unsafe {
             Region::with_grower(map.clone(), layout.leaf_data_off, layout.leaf_data_size)
-        }));
+        }, leaf_off_shift));
 
         Ok(Self {
             path: path.to_string(),
@@ -2284,7 +2387,9 @@ impl Engine {
         dst[..layout.leaf_data_off].copy_from_slice(&src[..layout.leaf_data_off]);
 
         // header: version=6 (CRC 範囲内)、 leaf region size (CRC 範囲外)、 CRC 再計算。
-        dst[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION.to_le_bytes());
+        // v5→v6 migration は byte-offset の v6 を出力 (leaf off_shift=0)。 v7 engine は
+        // read-through で開ける。 16GB 超が要るなら別途 v7 で create し直す。
+        dst[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION_LEGACY_V6.to_le_bytes());
         dst[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8]
             .copy_from_slice(&(layout.leaf_data_size as u64).to_le_bytes());
         write_header_crc(&mut dst);
@@ -2301,9 +2406,10 @@ impl Engine {
             unsafe { Region::new(base.add(layout.vocab_index_off), layout.vocab_index_size) },
             /*readonly=*/ true,
         );
+        // v6 出力なので leaf offset は byte (off_shift=0)。
         let leaf = LeafStore::init(unsafe {
             Region::new(base.add(layout.leaf_data_off), layout.leaf_data_size)
-        });
+        }, 0);
 
         let mut stats = MigrationStats::default();
         for (hid, &tb) in type_bytes.iter().enumerate() {
@@ -2407,10 +2513,16 @@ impl Engine {
         // v5 が現行、 v4 は後方互換で受け付ける (= anonymous table 1 個に migrate)。
         // v4 DB を v5 として open しても、 引き続き flat anonymous モードで動作する
         // (table 概念は step 2 以降の実装に伴って活性化)。
-        if version != FILE_VERSION && version != FILE_VERSION_LEGACY_V5 && version != FILE_VERSION_LEGACY_V4 {
+        // v7 (現行) / v6 / v5 / v4 を受け付ける。 v6 は leaf offset が byte だが、
+        // LeafStore が region header の off_shift=0 で self-describing に read-through。
+        if version != FILE_VERSION
+            && version != FILE_VERSION_LEGACY_V6
+            && version != FILE_VERSION_LEGACY_V5
+            && version != FILE_VERSION_LEGACY_V4
+        {
             return Err(format!(
-                "unsupported EnchuDB file version {} (supported: {}, {} compat). dev phase — recreate the DB.",
-                version, FILE_VERSION, FILE_VERSION_LEGACY_V4
+                "unsupported EnchuDB file version {} (supported: {}, {}/{}/{} compat). dev phase — recreate the DB.",
+                version, FILE_VERSION, FILE_VERSION_LEGACY_V6, FILE_VERSION_LEGACY_V5, FILE_VERSION_LEGACY_V4
             ));
         }
         // v28: ヘッダ整合性 CRC 検証(stored == 0 は v27 以前の DB として許容)
@@ -7157,7 +7269,7 @@ impl Engine {
     /// 別 issue で BitVec か stream 化を検討。
     /// v6 (#88): LeafStore の現 footprint (high_water)。 pre-v6 DB (leaf region
     /// 無し) は None。 routing 前 (2.1 scaffolding) は常に HEADER 相当。
-    pub fn leaf_footprint(&self) -> Option<u32> {
+    pub fn leaf_footprint(&self) -> Option<u64> {
         self.leaf.as_ref().map(|l| l.high_water())
     }
 

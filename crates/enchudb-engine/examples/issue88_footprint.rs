@@ -34,7 +34,7 @@ fn content_for(i: usize) -> String {
 
 /// workload を回して checkpoint 毎の footprint (bytes) を返す。
 /// `leaf_size = Some(0)` は before (leaf region 無し → vocab footprint を計測)。
-fn run(path: &str, leaf_size: Option<usize>) -> Vec<(usize, u32)> {
+fn run(path: &str, leaf_size: Option<usize>) -> Vec<(usize, u64)> {
     cleanup(path);
     let mut eng = Engine::create_full_with_leaf(
         path,
@@ -57,10 +57,10 @@ fn run(path: &str, leaf_size: Option<usize>) -> Vec<(usize, u32)> {
             eng.delete((i - WINDOW) as u64); // retention: WINDOW 前を削除
         }
         if (i + 1) % 4_000 == 0 || i + 1 == ROUNDS {
-            let fp = if is_after {
+            let fp: u64 = if is_after {
                 eng.leaf_footprint().unwrap()
             } else {
-                eng.vocab_data_footprint()
+                eng.vocab_data_footprint() as u64
             };
             curve.push((i + 1, fp));
         }
@@ -70,7 +70,7 @@ fn run(path: &str, leaf_size: Option<usize>) -> Vec<(usize, u32)> {
     curve
 }
 
-fn mib(bytes: u32) -> f64 {
+fn mib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 

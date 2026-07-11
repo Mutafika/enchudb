@@ -45,7 +45,7 @@ pub mod acl;
 pub mod integrity;
 pub mod blob_store;
 
-pub use engine::{Engine, EntityValue, SnapshotFiles, AuditFilter, MigrationStats};
+pub use engine::{Engine, EntityValue, SnapshotFiles, AuditFilter, MigrationStats, LeafScale};
 pub use engine::EngineStats;
 pub use himo_store::ValueType;
 pub use cas::{CASStore, BlockHash};
