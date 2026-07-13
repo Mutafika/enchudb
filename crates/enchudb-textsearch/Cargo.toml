@@ -1,6 +1,6 @@
 [package]
 name = "enchudb-textsearch"
-version = "0.12.2"
+version = "0.13.0"
 edition = "2021"
 description = "enchudb-ngram の上に乗るテキスト検索ポリシー。候補 doc id + .contains() 検証 → 正確な部分一致（= 人間の対話検索）。機械向けフレーズ完全一致も入力フレーズを 1 単位で渡せば同じ path で扱える。"
 license-file = "LICENSE.md"

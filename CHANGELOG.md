@@ -3,7 +3,7 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
-## Unreleased
+## 0.13.0 — 2026-07-14
 
 ### Changed — Cylinder read を lock-free 化（#95、RwLock 撤去）
 

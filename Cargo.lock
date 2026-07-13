@@ -1295,7 +1295,7 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "enchudb"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "criterion",
  "crossbeam-epoch",
@@ -1318,7 +1318,7 @@ dependencies = [
 
 [[package]]
 name = "enchudb-cli"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "enchudb-engine",
  "enchudb-oplog",
@@ -1326,7 +1326,7 @@ dependencies = [
 
 [[package]]
 name = "enchudb-engine"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "crossbeam-epoch",
@@ -1334,8 +1334,10 @@ dependencies = [
  "ed25519-dalek",
  "enchudb-oplog",
  "libc",
+ "loom",
  "memmap2",
  "parking_lot",
+ "proptest",
  "rand_core 0.6.4",
  "rayon",
  "sha2",
@@ -1345,21 +1347,21 @@ dependencies = [
 
 [[package]]
 name = "enchudb-ffi"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "enchudb-sql",
 ]
 
 [[package]]
 name = "enchudb-ngram"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "memmap2",
 ]
 
 [[package]]
 name = "enchudb-oplog"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "ed25519-dalek",
  "libc",
@@ -1370,7 +1372,7 @@ dependencies = [
 
 [[package]]
 name = "enchudb-rag"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "enchudb",
  "enchudb-oplog",
@@ -1381,7 +1383,7 @@ dependencies = [
 
 [[package]]
 name = "enchudb-schema"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "enchudb-engine",
  "enchudb-oplog",
@@ -1389,7 +1391,7 @@ dependencies = [
 
 [[package]]
 name = "enchudb-sql"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "enchudb-engine",
  "enchudb-oplog",
@@ -1399,7 +1401,7 @@ dependencies = [
 
 [[package]]
 name = "enchudb-sync"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "enchudb-engine",
  "enchudb-oplog",
@@ -1407,14 +1409,14 @@ dependencies = [
 
 [[package]]
 name = "enchudb-textsearch"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "enchudb-ngram",
 ]
 
 [[package]]
 name = "enchudb-transport"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "enchudb",
  "enchudb-oplog",
@@ -1698,6 +1700,21 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "generator"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3b854b0e584ead1a33f18b2fcad7cf7be18b3875c78816b753639aa501513ae"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "log",
+ "rustversion",
+ "windows-link",
+ "windows-result 0.4.1",
 ]
 
 [[package]]
@@ -2623,6 +2640,19 @@ name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+
+[[package]]
+name = "loom"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "419e0dc8046cb947daa77eb95ae174acfbddb7673b4151f56d1eed8e93fbfaca"
+dependencies = [
+ "cfg-if",
+ "generator",
+ "scoped-tls",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "lru-slab"
@@ -5991,7 +6021,7 @@ checksum = "6ba6d44ec8c2591c134257ce647b7ea6b20335bf6379a27dac5f1641fcf59f99"
 dependencies = [
  "windows-implement",
  "windows-interface",
- "windows-result",
+ "windows-result 0.2.0",
  "windows-strings",
  "windows-targets",
 ]
@@ -6034,12 +6064,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "windows-result"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
+dependencies = [
+ "windows-link",
+]
+
+[[package]]
 name = "windows-strings"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cd9b125c486025df0eabcb585e62173c6c9eddcec5d117d3b6e8c30e2ee4d10"
 dependencies = [
- "windows-result",
+ "windows-result 0.2.0",
  "windows-targets",
 ]
 
