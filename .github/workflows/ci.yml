@@ -12,6 +12,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# root meta crate の dev-dep に外部 sibling repo (../sabitori、 bench 専用) への path
+# 依存があり、 clean checkout では manifest 解決が失敗する。 enchudb-engine 等の core
+# crate は sabitori に一切依存しないので、 CI では該当行を除去して workspace を解決可能に
+# する (テスト対象の core crate はこれで完全に build/test できる)。
 jobs:
   test:
     name: test (stable)
@@ -20,9 +24,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # core logic crate 群。 root meta crate の bench 用 heavy dev-dep
-      # (duckdb / lmdb 等) を避けて速く・安定に回す。
-      # model-based proptest / fault-injection / 破壊テストはここに含まれる。
+      - name: drop external sibling dev-dep (../sabitori, bench-only)
+        run: sed -i '/\.\.\/sabitori/d' Cargo.toml
+      # core logic crate 群。 model-based proptest / fault-injection / 破壊テスト込み。
       - name: cargo test (core crates)
         run: >
           cargo test
@@ -46,6 +50,8 @@ jobs:
           # miri は sysroot を source から build するので rust-src が要る。
           components: miri, rust-src
       - uses: Swatinem/rust-cache@v2
+      - name: drop external sibling dev-dep (../sabitori, bench-only)
+        run: sed -i '/\.\.\/sabitori/d' Cargo.toml
       # lock-free プリミティブの unsafe (from_raw_parts / UnsafeCell / epoch) を UB 検証。
       - name: miri append_bucket
         run: cargo miri test -p enchudb-engine --lib append_bucket
@@ -62,6 +68,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: drop external sibling dev-dep (../sabitori, bench-only)
+        run: sed -i '/\.\.\/sabitori/d' Cargo.toml
       - name: loom model check
         run: cargo test -p enchudb-engine --test loom_append_publish --release
 
@@ -77,4 +85,6 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: drop external sibling dev-dep (../sabitori, bench-only)
+        run: sed -i '/\.\.\/sabitori/d' Cargo.toml
       - run: cargo clippy -p enchudb-engine --lib --tests
