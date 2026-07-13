@@ -30,6 +30,8 @@ enchudb-ffi = { path = "crates/enchudb-ffi", optional = true }
 [dev-dependencies]
 proptest = "1"
 libc = "0.2"
+# #95 lock-free read prototype (examples/lockfree_bucket_probe.rs) — 依存ツリーに既存
+crossbeam-epoch = "0.9"
 rusqlite = { version = "0.36", features = ["bundled"] }
 # in-process DuckDB binding for vs_db bench (= subprocess CLI overhead を排除して
 # columnar OLAP の真の比較を取る)。 bundled で system に依存しない build。
