@@ -14,7 +14,7 @@
 //! - `push` は **同時に 1 thread のみ**（consumer）。 複数 writer は未対応（race する）。
 //! - `read_to_vec` / `with_read` / `len` は **多 reader 並行可**、 writer と並行可。
 
-use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned, Shared};
+use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned};
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

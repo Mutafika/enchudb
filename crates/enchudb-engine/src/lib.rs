@@ -16,6 +16,7 @@
 
 pub(crate) mod append_vec;
 pub(crate) mod append_bucket;
+pub(crate) mod lockfree_cylinder;
 pub(crate) mod region;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod growable_map;
