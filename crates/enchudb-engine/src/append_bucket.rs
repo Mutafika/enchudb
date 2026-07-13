@@ -70,7 +70,14 @@ impl AppendBucket {
     /// 単一 writer append。 spare があれば in-place、 満杯なら倍化 + epoch 遅延解放。
     pub fn push(&self, eid: u32) {
         let guard = epoch::pin();
-        let cur = self.backing.load(Ordering::Acquire, &guard);
+        self.push_in(eid, &guard);
+    }
+
+    /// `push` の外部 guard 版。 呼び出し元が 1 query/1 insert 単位で pin 済みのとき
+    /// pin の重複を避ける（#95: insert 経路の pin 3 回 → 1 回）。
+    /// 戻り値は push 前の published len（0 なら「空 bucket への初 push」= unique 判定用）。
+    pub fn push_in(&self, eid: u32, guard: &Guard) -> usize {
+        let cur = self.backing.load(Ordering::Acquire, guard);
         // SAFETY: backing は常に非 null（new/push で維持）。
         let b = unsafe { cur.deref() };
         let l = b.len.load(Ordering::Relaxed); // 単一 writer なので自身の len は Relaxed で可
@@ -100,6 +107,7 @@ impl AppendBucket {
                 guard.defer_destroy(cur);
             }
         }
+        l
     }
 
     /// 外部 guard 下で published slice を borrow（query 単位 pin 用、 zero-copy）。
