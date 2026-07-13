@@ -155,7 +155,7 @@ impl HimoStore {
         }
     }
 
-    /// 現在の unique 値数。append-only では正確、churn 時は over-count（#95、compaction 未実装）。
+    /// 現在の unique 値数。append-only では正確、churn 時は over-count（#95、compaction = #99）。
     pub fn unique_count(&self) -> u32 {
         self.ensure_cylinder_built();
         self.cyl.unique_count()
