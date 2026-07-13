@@ -38,11 +38,13 @@ backing の総 bytes（メモリ会計・double-buffer 検知）。
 - **統合**: `issue95_lockfree_read`（並行 pull・値更新 stale の verify filter）。
 - **loom model check** (`tests/loom_append_publish.rs`、`#![cfg(loom)]`): AppendBucket の
   publish protocol（writer が slot 書込→`len.store(Release)`、reader が `len.load(Acquire)`→
-  prefix 読み）を de-epoch した model で **全 thread interleaving を網羅検証**。1 writer + 1/2
-  reader で torn read / data race ゼロ。`Release`→`Relaxed` に落とすと loom が
-  torn read の interleaving を検出して落ちることを確認済み（= ordering を実際に gate）。
-  crossbeam-epoch の遅延解放は loom 非対応なので単一 backing の ordering に絞る（epoch は
-  Miri で別途検証）。実行: `RUSTFLAGS="--cfg loom" cargo test --test loom_append_publish --release`。
+  prefix 読み）を de-epoch した model で全 interleaving を model check。**範囲は単一 backing の
+  publish handshake のみ**（grow/swap + epoch 解放は loom 非対応につき対象外、そちらは Miri +
+  `grow_under_read` stress で補完）。1 writer + 1/2 reader で torn read / data race ゼロ。
+  `Release`→`Relaxed` に落とすと loom が torn read を検出して落ちることを確認済み
+  （再現手順は test 冒頭コメント）。手書き model なので `append_bucket.rs` の ordering 変更時は
+  model の同期が必要（相互参照コメントあり）。
+  実行: `RUSTFLAGS="--cfg loom" cargo test --test loom_append_publish --release`。
 - **model-based property test** (`tests/engine_model_proptest.rs`): tie/tie_text/untie/delete/
   reopen のランダム op 列（proptest、200 case × ≤40 op）を参照 oracle（`BTreeMap`）と毎 op 後に
   厳密照合。**Number と Tag himo を跨いで**（Number は Column 直値、Tag は Vocabulary intern
@@ -54,13 +56,20 @@ backing の総 bytes（メモリ会計・double-buffer 検知）。
   live 集合と厳密一致）、`crash_recovery_compacts`（churn→drop→reopen で Cylinder が column
   から rebuild され stale が消える）、`grow_under_read`（dense 配列 realloc 多発 × 旧配列を
   掴む reader で epoch 解放が安全）。
-- **fault-injection** (`tests/oplog_recovery_fault.rs`): oplog を truncate（7 点）/ byte-flip
-  （8 offset）で破損させても reopen が SIGBUS/panic せず、Ok なら pull 結果が書いた集合の
-  subset（phantom/破損 eid なし）。oplog 線形 parse（CRC32 per record）の破損耐性を網羅。
-- **Miri UB 検証**: `append_bucket` / `lockfree_cylinder` の `unsafe`（`from_raw_parts` over
-  `UnsafeCell`、epoch `defer_destroy`）を Miri **Tree Borrows** で UB なしを確認。crossbeam-epoch
-  0.9 は Stacked Borrows 非互換（内部 intrusive list、既知）なので TB + `-Zmiri-ignore-leaks`
-  で回す（epoch 遅延解放の exit 時 garbage を除外）。concurrent test は `cfg!(miri)` で縮小。
+- **fault-injection** (`tests/oplog_recovery_fault.rs`): ① file 縮小 truncate（7 点）— WAL は
+  固定容量 pre-allocate なので capacity guard の **clean Err が仕様**（crash しないことを検証）。
+  ② tail zero 化（5 点、file size 不変 = torn write の現実的模擬）/ ③ byte-flip（8 offset）—
+  graceful かつ Ok なら pull が**書いた集合と完全一致**（body msync 済み = 開けた以上 1 件も
+  欠けない）、**最低 1 case は Ok**（全 case Err の vacuous pass を弾く guard。この guard 導入で
+  旧 truncate テストが実は全 Err の空振り passだったことを検出し、② を追加した）。
+  body sync 前 crash（未 checkpoint tail の replay）は subprocess crash harness が要るので
+  #98 ④ の範囲。
+- **Miri UB 検証**: `append_bucket` 全 test + `lockfree_cylinder` の dense 系 test を Miri
+  **Tree Borrows** で回し UB なしを確認（unsafe 表面 = `from_raw_parts` over `UnsafeCell`、
+  epoch `defer_destroy` はこの範囲で全て踏む。sparse path は `Mutex` + `HashMap` で unsafe なし）。
+  crossbeam-epoch 0.9 は Stacked Borrows 非互換（内部 intrusive list、既知）なので TB +
+  `-Zmiri-ignore-leaks` で回す（epoch 遅延解放の exit 時 garbage を除外）。concurrent/大量 test は
+  `cfg!(miri)` で縮小。
 - **bench** (`examples/lockfree_engine_bench.rs`、実 Engine 経路): A. 巨大 bucket を 4 reader が
   clone し続けても drain は同オーダー（write は long read に stall しない、減少分は CPU 帯域
   contention であって lock 待ちではない）。B. writer が同 bucket を叩き続けても pull_raw の

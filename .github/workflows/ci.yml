@@ -1,8 +1,10 @@
 name: CI
 
-# エンジン全体の standing test。 push / PR ごとに回り、 論理正当性・並行安全性・
-# 破損耐性・unsafe UB を毎回 gate する。 #95 で足した proptest / fault-injection /
-# Miri / loom もここに乗るので「一回きりの証明」ではなく永続的な回帰テストになる。
+# core crate 群 (oplog / engine / schema / sql / sync) の standing test。 push / PR ごとに
+# 回り、 論理正当性・並行安全性・破損耐性・unsafe UB を毎回 gate する。 #95 で足した
+# proptest / fault-injection / Miri / loom もここに乗るので「一回きりの証明」ではなく
+# 永続的な回帰テストになる。 root meta crate (examples/bench) と transport / ffi は対象外
+# (root は duckdb bundled 等の重量 dev-dep があるため。 拡張は #98)。
 
 on:
   push:
@@ -25,7 +27,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: drop external sibling dev-dep (sabitori, bench-only)
-        run: find . -name Cargo.toml -not -path './target/*' -exec sed -i '/sabitori/d' {} +
+        # sed は単行 `sabitori = { path = ... }` 形式が前提。 行分割や
+        # [dev-dependencies.sabitori] 形式に変わると静かに空振りするので、
+        # 除去後に workspace が実際に解決できることを cargo metadata で検証する。
+        run: |
+          find . -name Cargo.toml -not -path './target/*' -exec sed -i '/sabitori/d' {} +
+          cargo metadata -q --format-version 1 > /dev/null
       # core logic crate 群。 model-based proptest / fault-injection / 破壊テスト込み。
       - name: cargo test (core crates)
         run: >
@@ -51,7 +58,12 @@ jobs:
           components: miri, rust-src
       - uses: Swatinem/rust-cache@v2
       - name: drop external sibling dev-dep (sabitori, bench-only)
-        run: find . -name Cargo.toml -not -path './target/*' -exec sed -i '/sabitori/d' {} +
+        # sed は単行 `sabitori = { path = ... }` 形式が前提。 行分割や
+        # [dev-dependencies.sabitori] 形式に変わると静かに空振りするので、
+        # 除去後に workspace が実際に解決できることを cargo metadata で検証する。
+        run: |
+          find . -name Cargo.toml -not -path './target/*' -exec sed -i '/sabitori/d' {} +
+          cargo metadata -q --format-version 1 > /dev/null
       # lock-free プリミティブの unsafe (from_raw_parts / UnsafeCell / epoch) を UB 検証。
       - name: miri append_bucket
         run: cargo miri test -p enchudb-engine --lib append_bucket
@@ -69,7 +81,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: drop external sibling dev-dep (sabitori, bench-only)
-        run: find . -name Cargo.toml -not -path './target/*' -exec sed -i '/sabitori/d' {} +
+        # sed は単行 `sabitori = { path = ... }` 形式が前提。 行分割や
+        # [dev-dependencies.sabitori] 形式に変わると静かに空振りするので、
+        # 除去後に workspace が実際に解決できることを cargo metadata で検証する。
+        run: |
+          find . -name Cargo.toml -not -path './target/*' -exec sed -i '/sabitori/d' {} +
+          cargo metadata -q --format-version 1 > /dev/null
       - name: loom model check
         run: cargo test -p enchudb-engine --test loom_append_publish --release
 
@@ -86,5 +103,10 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: drop external sibling dev-dep (sabitori, bench-only)
-        run: find . -name Cargo.toml -not -path './target/*' -exec sed -i '/sabitori/d' {} +
+        # sed は単行 `sabitori = { path = ... }` 形式が前提。 行分割や
+        # [dev-dependencies.sabitori] 形式に変わると静かに空振りするので、
+        # 除去後に workspace が実際に解決できることを cargo metadata で検証する。
+        run: |
+          find . -name Cargo.toml -not -path './target/*' -exec sed -i '/sabitori/d' {} +
+          cargo metadata -q --format-version 1 > /dev/null
       - run: cargo clippy -p enchudb-engine --lib --tests

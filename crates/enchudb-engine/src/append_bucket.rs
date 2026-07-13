@@ -192,11 +192,14 @@ mod tests {
     #[test]
     fn realloc_growth() {
         let b = AppendBucket::new();
-        for i in 0..10_000u32 {
+        // miri は ~1000x 遅い。 1,000 push でも doubling (cap 4 起点) を 8 回踏むので
+        // 成長 path の UB 検証には十分。
+        let n = if cfg!(miri) { 1_000u32 } else { 10_000u32 };
+        for i in 0..n {
             b.push(i);
         }
-        assert_eq!(b.len(), 10_000);
-        assert_eq!(b.read_to_vec(), (0..10_000).collect::<Vec<_>>());
+        assert_eq!(b.len(), n as usize);
+        assert_eq!(b.read_to_vec(), (0..n).collect::<Vec<_>>());
     }
 
     #[test]
