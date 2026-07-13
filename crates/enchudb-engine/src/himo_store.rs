@@ -10,9 +10,9 @@
 //! Cylinder を触らず（append-only）、 stale は read 側の Column verify で落とす
 //! （lazy / conditional verify）。
 
+use parking_lot::Mutex;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 
 use crate::column::Column;
 use crate::lockfree_cylinder::LockFreeCylinder;
@@ -42,12 +42,18 @@ impl ValueType {
 }
 
 // #95 並行性:
-//   LockFreeCylinder は単一 writer（consumer）/ 多 reader。
-//   - set/remove/restore は consumer thread（or 同期 tie の &mut self）が呼ぶ = 単一 writer
+//   LockFreeCylinder 自体は「同時に 1 writer」を要求する。 write の呼び出し元は
+//   1 本ではない — consumer thread (tie_async) に加えて、 **同期 tie API
+//   (`tie_to_by_id` 系、 schema `RowBuilder::commit` の経路) は任意の user thread が
+//   &self で直接呼ぶ**。 master ではこれを RwLock の write lock が直列化していた。
+//   よって:
+//   - set/remove/restore は per-himo `write_lock` で直列化（多 thread 呼び出し可、
+//     master の write 直列度と同一。 himo が違えば並列）
 //   - pull/slice_len は lock-free read（epoch）。 read は write を一切待たない
-//   Column は UnsafeCell のまま（Column::set/clear は単一 writer 前提、write path は
-//   consumer 1 本 + 同期 tie が &mut self なので競合しない。 pull の verify は Column を
-//   直読みするが、これは #95 とは別の既知の無同期読みで別 issue 候補）。
+//     （write_lock は writer 同士のみ、 reader は一切触らない = #95 の目的は維持）
+//   Column の write も write_lock 下に入る（get_value→set の read-modify-write が
+//   atomic になる）。 pull の verify は Column を直読みするが、 これは #95 とは
+//   別の既知の無同期読みで別 issue（#100 と同時に設計）。
 
 pub struct HimoStore {
     col: UnsafeCell<Column>,
@@ -58,13 +64,14 @@ pub struct HimoStore {
     /// cylinder が column から populate 済みか。lazy rebuild 用。
     /// `init`（新規 DB）では即 true（column 空）、`load`（既存 DB）では false で開始。
     cyl_built: AtomicBool,
-    /// lazy build を単一 thread に絞る guard（build は多数 insert = 単一 writer 必須）。
-    /// build 完了後は cyl_built の fast path で触られない。
-    build_lock: Mutex<()>,
+    /// writer 直列化 lock。 lazy build と set/remove/restore が取る。
+    /// reader (pull 系) は一切取らない。 同期 tie / schema commit の多 thread
+    /// 呼び出しを master (RwLock write) と同じ直列度で安全にする（#96 レビュー発覚分）。
+    write_lock: Mutex<()>,
 }
 
-// SAFETY: 単一 writer / 多 reader。Cylinder は epoch + Mutex(sparse)、Column は上記の
-// 単一 writer 契約で保護。
+// SAFETY: writer は write_lock で直列、 reader は lock-free（Cylinder は epoch +
+// Mutex(sparse)）。 Column の read は無同期（既知、 別 issue）。
 unsafe impl Sync for HimoStore {}
 unsafe impl Send for HimoStore {}
 
@@ -78,7 +85,7 @@ impl HimoStore {
             max_values,
             // 新規 column は空なので rebuild 不要、即 built 状態。
             cyl_built: AtomicBool::new(true),
-            build_lock: Mutex::new(()),
+            write_lock: Mutex::new(()),
         }
     }
 
@@ -92,7 +99,7 @@ impl HimoStore {
             value_type: ht,
             max_values,
             cyl_built: AtomicBool::new(false),
-            build_lock: Mutex::new(()),
+            write_lock: Mutex::new(()),
         }
     }
 
@@ -103,14 +110,14 @@ impl HimoStore {
     /// cylinder が未 build なら column から rebuild。lazy build の入口。
     /// fast path は AtomicBool::load で即 return。
     ///
-    /// #95: build は多数 insert（単一 writer 必須）なので `build_lock` で排他する。
-    /// build 中の他 thread は build_lock を待つ（one-time、load 直後の初回のみ）。
+    /// #95: build は多数 insert（単一 writer 必須）なので `write_lock` で排他する。
+    /// build 中の他 thread は write_lock を待つ（one-time、load 直後の初回のみ）。
     #[inline]
     fn ensure_cylinder_built(&self) {
         if self.cyl_built.load(Ordering::Acquire) {
             return;
         }
-        let _g = self.build_lock.lock().unwrap();
+        let _g = self.write_lock.lock();
         // double-check（build 中に競合した別 thread が先に置いた可能性）
         if self.cyl_built.load(Ordering::Acquire) {
             return;
@@ -130,6 +137,7 @@ impl HimoStore {
 
     pub fn set(&self, eid: u32, value: u32) {
         self.ensure_cylinder_built();
+        let _w = self.write_lock.lock();
         self.col().ensure_count(eid);
         let old = self.get_value(eid);
         if old == Some(value) {
@@ -146,6 +154,7 @@ impl HimoStore {
     pub fn remove(&self, eid: u32) {
         if eid < self.col().count() {
             self.ensure_cylinder_built();
+            let _w = self.write_lock.lock();
             let had = self.get_value(eid).is_some();
             self.col().clear(eid);
             if had {
@@ -213,6 +222,7 @@ impl HimoStore {
 
     pub fn restore(&self, eid: u32, old_bytes: &[u8; 4]) {
         self.ensure_cylinder_built();
+        let _w = self.write_lock.lock();
         self.col().ensure_count(eid);
         let stored = u32::from_le_bytes(*old_bytes);
         let old = self.get_value(eid);

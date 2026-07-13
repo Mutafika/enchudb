@@ -4,6 +4,11 @@
 //!     壊れない・crash しない（旧 RwLock 相当の相互排他を撤去した後の安全性）。
 //! (2) 値更新で生じた stale entry が、 read 側の Column verify で正しく落ちる
 //!     （append-only + lazy verify）。
+//! (3) 同期 tie API（`tie_to_by_id` 系 = schema `RowBuilder::commit` の経路）を
+//!     複数 thread から並行に呼んでも壊れない。 master では RwLock write が直列化して
+//!     いた契約で、 lock-free 化直後は per-himo write_lock が無く sunsu matrix bench
+//!     (schema commit ×4 thread) が malloc abort（epoch defer_destroy の double free）
+//!     していた（レビュー発覚分。 修正 = HimoStore::write_lock）。
 
 use enchudb_engine::{Engine, ValueType};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -110,5 +115,51 @@ fn update_stale_filtered_by_verify() {
     let got = eng.pull_raw("v", 7);
     assert_eq!(got.len(), 1);
     assert_eq!(enchudb_oplog::eid_local(got[0]), enchudb_oplog::eid_local(e2));
+    fresh(path);
+}
+
+/// (3) 同期 tie を複数 thread から並行実行しても壊れず、 1 件も lost しない。
+/// value を散らして AppendBucket realloc と dense 配列の成長を意図的に多発させる
+/// （成長 path の defer_destroy が並行 writer で二重解放していた）。
+/// 修正（write_lock）を外すとこのテストは crash する（debug=SIGSEGV / release=malloc
+/// abort、確認済み）。
+#[test]
+fn concurrent_sync_writes_from_many_threads() {
+    let path = "/tmp/test_issue95_syncwrite.db";
+    fresh(path);
+    let eng: Arc<Engine> =
+        Engine::create_concurrent_with_oplog(path, 32 * 1024 * 1024).expect("create");
+    let vhid = define(&eng, "v");
+
+    const N_THREADS: u32 = 4;
+    const PER: u32 = 50_000;
+    const VALUES: u32 = 10_000;
+
+    let handles: Vec<_> = (0..N_THREADS)
+        .map(|t| {
+            let eng = eng.clone();
+            std::thread::spawn(move || {
+                for i in 0..PER {
+                    let e = eng.entity();
+                    // 全 thread が同じ value 空間を叩く = 同一 bucket への並行 write を最大化
+                    eng.tie_to_by_id(e, vhid, (t * PER + i) % VALUES);
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // 総数一致 = lost update なし（append-only + 重複 eid なしなので raw 件数が真値）
+    let mut total = 0usize;
+    for v in 0..VALUES {
+        total += eng.pull_raw("v", v).len();
+    }
+    assert_eq!(
+        total,
+        (N_THREADS * PER) as usize,
+        "並行同期 write で lost update"
+    );
     fresh(path);
 }

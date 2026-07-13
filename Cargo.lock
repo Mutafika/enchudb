@@ -1334,9 +1334,8 @@ dependencies = [
  "ed25519-dalek",
  "enchudb-oplog",
  "libc",
- "loom",
  "memmap2",
- "proptest",
+ "parking_lot",
  "rand_core 0.6.4",
  "rayon",
  "sha2",
@@ -1699,21 +1698,6 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
-]
-
-[[package]]
-name = "generator"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3b854b0e584ead1a33f18b2fcad7cf7be18b3875c78816b753639aa501513ae"
-dependencies = [
- "cc",
- "cfg-if",
- "libc",
- "log",
- "rustversion",
- "windows-link",
- "windows-result 0.4.1",
 ]
 
 [[package]]
@@ -2639,19 +2623,6 @@ name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
-
-[[package]]
-name = "loom"
-version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "419e0dc8046cb947daa77eb95ae174acfbddb7673b4151f56d1eed8e93fbfaca"
-dependencies = [
- "cfg-if",
- "generator",
- "scoped-tls",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "lru-slab"
@@ -4267,7 +4238,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "sabitori"
-version = "0.2.11"
+version = "0.2.5"
 dependencies = [
  "console_error_panic_hook",
  "console_log",
@@ -4299,14 +4270,14 @@ dependencies = [
 
 [[package]]
 name = "sabitori-anim"
-version = "0.2.11"
+version = "0.2.5"
 dependencies = [
  "sabitori-core",
 ]
 
 [[package]]
 name = "sabitori-core"
-version = "0.2.11"
+version = "0.2.5"
 dependencies = [
  "bytemuck",
  "glam",
@@ -4316,7 +4287,7 @@ dependencies = [
 
 [[package]]
 name = "sabitori-gpu"
-version = "0.2.11"
+version = "0.2.5"
 dependencies = [
  "bytemuck",
  "glam",
@@ -4330,14 +4301,14 @@ dependencies = [
 
 [[package]]
 name = "sabitori-input"
-version = "0.2.11"
+version = "0.2.5"
 dependencies = [
  "sabitori-core",
 ]
 
 [[package]]
 name = "sabitori-layout"
-version = "0.2.11"
+version = "0.2.5"
 dependencies = [
  "sabitori-core",
  "sabitori-style",
@@ -4346,7 +4317,7 @@ dependencies = [
 
 [[package]]
 name = "sabitori-net"
-version = "0.2.11"
+version = "0.2.5"
 dependencies = [
  "image",
  "js-sys",
@@ -4360,7 +4331,7 @@ dependencies = [
 
 [[package]]
 name = "sabitori-scene"
-version = "0.2.11"
+version = "0.2.5"
 dependencies = [
  "sabitori-core",
  "slotmap",
@@ -4368,7 +4339,7 @@ dependencies = [
 
 [[package]]
 name = "sabitori-style"
-version = "0.2.11"
+version = "0.2.5"
 dependencies = [
  "sabitori-core",
  "serde",
@@ -4377,7 +4348,7 @@ dependencies = [
 
 [[package]]
 name = "sabitori-text"
-version = "0.2.11"
+version = "0.2.5"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -4389,7 +4360,7 @@ dependencies = [
 
 [[package]]
 name = "sabitori-widgets"
-version = "0.2.11"
+version = "0.2.5"
 dependencies = [
  "sabitori-anim",
  "sabitori-core",
@@ -4400,7 +4371,7 @@ dependencies = [
 
 [[package]]
 name = "sabitori-window"
-version = "0.2.11"
+version = "0.2.5"
 dependencies = [
  "console_error_panic_hook",
  "console_log",
@@ -6020,7 +5991,7 @@ checksum = "6ba6d44ec8c2591c134257ce647b7ea6b20335bf6379a27dac5f1641fcf59f99"
 dependencies = [
  "windows-implement",
  "windows-interface",
- "windows-result 0.2.0",
+ "windows-result",
  "windows-strings",
  "windows-targets",
 ]
@@ -6063,21 +6034,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "windows-result"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
-dependencies = [
- "windows-link",
-]
-
-[[package]]
 name = "windows-strings"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cd9b125c486025df0eabcb585e62173c6c9eddcec5d117d3b6e8c30e2ee4d10"
 dependencies = [
- "windows-result 0.2.0",
+ "windows-result",
  "windows-targets",
 ]
 

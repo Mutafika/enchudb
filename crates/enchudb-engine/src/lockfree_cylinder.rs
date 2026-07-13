@@ -1,6 +1,8 @@
 //! `LockFreeCylinder` — value → eid の lock-free concurrent bucket store。 #95。
 //!
-//! 現状の `RwLock<BucketCylinder>` を置き換える。 単一 writer（consumer）/ 多 reader。
+//! 現状の `RwLock<BucketCylinder>` を置き換える。 **同時に 1 writer** / 多 reader。
+//! writer は 1 thread とは限らない（consumer + 同期 tie + schema commit）ので、
+//! 呼び出し側 = `HimoStore` が per-himo `write_lock` で直列化して契約を満たす。
 //!
 //! ## 構造
 //! - **dense**（value < `DENSE_CAP`）: `Atomic<Vec<Arc<AppendBucket>>>`。 外側 Vec を
@@ -71,24 +73,24 @@ impl LockFreeCylinder {
     }
 
     /// 単一 writer append。 value の bucket に eid を足す（旧 value は放置＝lazy verify）。
+    /// pin は insert 全体で 1 回（push / unique 判定に guard を回す。 hot path の
+    /// pin 3 回 → 1 回、 write 天井対策）。
     pub fn insert(&self, eid: u32, value: u32) {
         debug_assert!(value != u32::MAX, "value == u32::MAX is sentinel");
+        let guard = epoch::pin();
         if value < DENSE_CAP {
-            let guard = epoch::pin();
             let arr = self.dense.load(Ordering::Acquire, &guard);
             // SAFETY: dense は常に非 null。
             let vec = unsafe { arr.deref() };
             if (value as usize) < vec.len() {
-                let b = &vec[value as usize];
-                let was_empty = b.is_empty();
-                b.push(eid);
-                self.bump_stats(was_empty);
+                let prev_len = vec[value as usize].push_in(eid, &guard);
+                self.bump_stats(prev_len == 0);
             } else {
                 // 成長: doubling で amortize、 既存 Arc は clone（refcount）、 新規は空 bucket
                 let mut nv: DenseArr = vec.clone();
                 let new_len = ((value as usize) + 1).max(vec.len() * 2).min(DENSE_CAP as usize);
                 nv.resize_with(new_len, || Arc::new(AppendBucket::new()));
-                nv[value as usize].push(eid);
+                nv[value as usize].push_in(eid, &guard);
                 self.bump_stats(true); // 新 bucket は必ず空だった
                 self.dense.store(Owned::new(nv), Ordering::Release);
                 // SAFETY: 旧 array は全 reader が epoch 通過後に解放。
@@ -101,10 +103,9 @@ impl LockFreeCylinder {
             let b = sp
                 .entry(value)
                 .or_insert_with(|| Arc::new(AppendBucket::new()));
-            let was_empty = b.is_empty();
-            b.push(eid);
+            let prev_len = b.push_in(eid, &guard);
             drop(sp);
-            self.bump_stats(was_empty);
+            self.bump_stats(prev_len == 0);
         }
     }
 
