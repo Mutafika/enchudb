@@ -35,6 +35,13 @@ backing の総 bytes（メモリ会計・double-buffer 検知）。
 - **unit**: `append_bucket` / `lockfree_cylinder` の並行 test（1 writer + N reader、破損なし）、
   `no_double_buffer_backing_bound`（backing < 2× = double-buffer していない厳密証明、実測 1.28×）。
 - **統合**: `issue95_lockfree_read`（並行 pull・値更新 stale の verify filter）。
+- **loom model check** (`tests/loom_append_publish.rs`、`#![cfg(loom)]`): AppendBucket の
+  publish protocol（writer が slot 書込→`len.store(Release)`、reader が `len.load(Acquire)`→
+  prefix 読み）を de-epoch した model で **全 thread interleaving を網羅検証**。1 writer + 1/2
+  reader で torn read / data race ゼロ。`Release`→`Relaxed` に落とすと loom が
+  torn read の interleaving を検出して落ちることを確認済み（= ordering を実際に gate）。
+  crossbeam-epoch の遅延解放は loom 非対応なので単一 backing の ordering に絞る（epoch は
+  Miri で別途検証）。実行: `RUSTFLAGS="--cfg loom" cargo test --test loom_append_publish --release`。
 - **model-based property test** (`tests/engine_model_proptest.rs`): tie/untie/delete/reopen の
   ランダム op 列（proptest、200 case × ≤40 op）を参照 oracle（`BTreeMap`）と毎 op 後に厳密照合。
   `pull_raw` / `get` / 2-cond `query` の 3 path を網羅し、値更新→削除→再 tie→reopen の
