@@ -20,7 +20,7 @@
 use crate::append_bucket::AppendBucket;
 use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const DENSE_CAP: u32 = 1 << 20;
@@ -30,10 +30,11 @@ type DenseArr = Vec<Arc<AppendBucket>>;
 pub struct LockFreeCylinder {
     dense: Atomic<DenseArr>,
     sparse: Mutex<HashMap<u32, Arc<AppendBucket>>>,
-    /// value < DENSE_CAP の初期成長ヒント（0 = 空 start）。
-    dense_hint: u32,
     total: AtomicUsize,
     unique_count: AtomicU32,
+    /// delete / 値更新が一度でも起きたか。 read の conditional-verify を有効化する。
+    /// false（append-only）なら read は Column verify を skip できる。
+    any_removed: AtomicBool,
 }
 
 // SAFETY: 単一 writer / 多 reader。 dense は epoch、 sparse は Mutex で同期。
@@ -51,10 +52,22 @@ impl LockFreeCylinder {
         Self {
             dense: Atomic::new(init),
             sparse: Mutex::new(HashMap::new()),
-            dense_hint: hint,
             total: AtomicUsize::new(0),
             unique_count: AtomicU32::new(0),
+            any_removed: AtomicBool::new(false),
         }
+    }
+
+    /// delete / 値更新が起きたことを記録（以降 read は Column verify する）。単一 writer。
+    #[inline]
+    pub fn mark_removed(&self) {
+        self.any_removed.store(true, Ordering::Relaxed);
+    }
+
+    /// これまでに delete / 値更新があったか（conditional-verify の判定）。
+    #[inline]
+    pub fn any_removed(&self) -> bool {
+        self.any_removed.load(Ordering::Relaxed)
     }
 
     /// 単一 writer append。 value の bucket に eid を足す（旧 value は放置＝lazy verify）。
