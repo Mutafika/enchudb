@@ -6226,6 +6226,14 @@ impl Engine {
         Some(self.himos[idx].unique_count())
     }
 
+    /// himo の Cylinder が確保している eid backing の総 bytes（メモリ観測用、#95）。
+    /// append-only なので各 eid は 1 度だけ載る = `unique×平均 × pow2 slack`。
+    /// double-buffer していれば `>= 2×(eid 数×4)` になるので、その検知にも使える。
+    pub fn himo_cylinder_backing_bytes(&self, himo: &str) -> Option<usize> {
+        let idx = self.himo_id(himo)?;
+        Some(self.himos[idx].cyl_backing_bytes())
+    }
+
     // ──── 紐を引く（Cylinder 経由）────
 
     /// Cylinder + Bitmap キャッシュを再構築。delta をクリア。

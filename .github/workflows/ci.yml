@@ -1,0 +1,112 @@
+name: CI
+
+# core crate 群 (oplog / engine / schema / sql / sync) の standing test。 push / PR ごとに
+# 回り、 論理正当性・並行安全性・破損耐性・unsafe UB を毎回 gate する。 #95 で足した
+# proptest / fault-injection / Miri / loom もここに乗るので「一回きりの証明」ではなく
+# 永続的な回帰テストになる。 root meta crate (examples/bench) と transport / ffi は対象外
+# (root は duckdb bundled 等の重量 dev-dep があるため。 拡張は #98)。
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# root meta crate の dev-dep に外部 sibling repo (../sabitori、 bench 専用) への path
+# 依存があり、 clean checkout では manifest 解決が失敗する。 enchudb-engine 等の core
+# crate は sabitori に一切依存しないので、 CI では該当行を除去して workspace を解決可能に
+# する (テスト対象の core crate はこれで完全に build/test できる)。
+jobs:
+  test:
+    name: test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: drop external sibling dev-dep (sabitori, bench-only)
+        # sed は単行 `sabitori = { path = ... }` 形式が前提。 行分割や
+        # [dev-dependencies.sabitori] 形式に変わると静かに空振りするので、
+        # 除去後に workspace が実際に解決できることを cargo metadata で検証する。
+        run: |
+          find . -name Cargo.toml -not -path './target/*' -exec sed -i '/sabitori/d' {} +
+          cargo metadata -q --format-version 1 > /dev/null
+      # core logic crate 群。 model-based proptest / fault-injection / 破壊テスト込み。
+      - name: cargo test (core crates)
+        run: >
+          cargo test
+          -p enchudb-oplog
+          -p enchudb-engine
+          -p enchudb-schema
+          -p enchudb-sql
+          -p enchudb-sync
+
+  miri:
+    name: miri (unsafe UB)
+    runs-on: ubuntu-latest
+    # crossbeam-epoch 0.9 は Stacked Borrows 非互換なので Tree Borrows。
+    # epoch 遅延解放の exit 時 garbage は ignore-leaks で除外。
+    env:
+      MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-tree-borrows -Zmiri-ignore-leaks
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          # miri は sysroot を source から build するので rust-src が要る。
+          components: miri, rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: drop external sibling dev-dep (sabitori, bench-only)
+        # sed は単行 `sabitori = { path = ... }` 形式が前提。 行分割や
+        # [dev-dependencies.sabitori] 形式に変わると静かに空振りするので、
+        # 除去後に workspace が実際に解決できることを cargo metadata で検証する。
+        run: |
+          find . -name Cargo.toml -not -path './target/*' -exec sed -i '/sabitori/d' {} +
+          cargo metadata -q --format-version 1 > /dev/null
+      # lock-free プリミティブの unsafe (from_raw_parts / UnsafeCell / epoch) を UB 検証。
+      - name: miri append_bucket
+        run: cargo miri test -p enchudb-engine --lib append_bucket
+      - name: miri lockfree_cylinder (dense)
+        run: cargo miri test -p enchudb-engine --lib "lockfree_cylinder::tests::dense"
+
+  loom:
+    name: loom (interleaving)
+    runs-on: ubuntu-latest
+    # publish protocol の全 thread interleaving を model check。
+    env:
+      RUSTFLAGS: --cfg loom
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: drop external sibling dev-dep (sabitori, bench-only)
+        # sed は単行 `sabitori = { path = ... }` 形式が前提。 行分割や
+        # [dev-dependencies.sabitori] 形式に変わると静かに空振りするので、
+        # 除去後に workspace が実際に解決できることを cargo metadata で検証する。
+        run: |
+          find . -name Cargo.toml -not -path './target/*' -exec sed -i '/sabitori/d' {} +
+          cargo metadata -q --format-version 1 > /dev/null
+      - name: loom model check
+        run: cargo test -p enchudb-engine --test loom_append_publish --release
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    # 既存 #83 (region.rs slice_mut) 等の pre-existing error が残るため現状は
+    # 情報提供のみ (blocking にしない)。 #83 解消後に continue-on-error を外す。
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: drop external sibling dev-dep (sabitori, bench-only)
+        # sed は単行 `sabitori = { path = ... }` 形式が前提。 行分割や
+        # [dev-dependencies.sabitori] 形式に変わると静かに空振りするので、
+        # 除去後に workspace が実際に解決できることを cargo metadata で検証する。
+        run: |
+          find . -name Cargo.toml -not -path './target/*' -exec sed -i '/sabitori/d' {} +
+          cargo metadata -q --format-version 1 > /dev/null
+      - run: cargo clippy -p enchudb-engine --lib --tests

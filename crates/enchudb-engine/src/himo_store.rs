@@ -295,6 +295,12 @@ impl HimoStore {
         self.cyl.total()
     }
 
+    /// Cylinder の eid backing 総 bytes（メモリ観測用、#95）。
+    pub fn cyl_backing_bytes(&self) -> usize {
+        self.ensure_cylinder_built();
+        self.cyl.backing_bytes()
+    }
+
     pub fn delta_eids(&self) -> &[u32] {
         &[]
     }

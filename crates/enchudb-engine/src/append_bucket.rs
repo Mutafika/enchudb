@@ -13,6 +13,18 @@
 //! ## 並行契約
 //! - `push` は **同時に 1 thread のみ**（consumer）。 複数 writer は未対応（race する）。
 //! - `read_to_vec` / `with_read` / `len` は **多 reader 並行可**、 writer と並行可。
+//!
+//! ## Miri での UB 検証（#95）
+//! この型の `unsafe`（`from_raw_parts` over `UnsafeCell`、epoch `defer_destroy`）は
+//! Miri で aliasing UB がないことを確認済み。crossbeam-epoch 0.9 は **Stacked Borrows**
+//! に非互換（内部の intrusive list で違反、既知）なので **Tree Borrows** で回す。
+//! epoch は遅延解放なので exit 時の未回収 garbage を leak 扱いしない `-Zmiri-ignore-leaks`
+//! も要る。concurrent/大量 test は `cfg!(miri)` で縮小。
+//!
+//! ```sh
+//! MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-tree-borrows -Zmiri-ignore-leaks" \
+//!   cargo +nightly miri test -p enchudb-engine --lib append_bucket
+//! ```
 
 use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned};
 use std::cell::UnsafeCell;
@@ -137,6 +149,14 @@ impl AppendBucket {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// 現在の backing 容量（slot 数、 pow2 で切り上がる）。 メモリ会計用。
+    /// append-only なので eid は 1 度だけ載る = capacity は published len の pow2 上界。
+    pub fn capacity(&self) -> usize {
+        let guard = epoch::pin();
+        let cur = self.backing.load(Ordering::Acquire, &guard);
+        unsafe { cur.deref() }.cap()
+    }
 }
 
 impl Default for AppendBucket {
@@ -180,11 +200,14 @@ mod tests {
     #[test]
     fn realloc_growth() {
         let b = AppendBucket::new();
-        for i in 0..10_000u32 {
+        // miri は ~1000x 遅い。 1,000 push でも doubling (cap 4 起点) を 8 回踏むので
+        // 成長 path の UB 検証には十分。
+        let n = if cfg!(miri) { 1_000u32 } else { 10_000u32 };
+        for i in 0..n {
             b.push(i);
         }
-        assert_eq!(b.len(), 10_000);
-        assert_eq!(b.read_to_vec(), (0..10_000).collect::<Vec<_>>());
+        assert_eq!(b.len(), n as usize);
+        assert_eq!(b.read_to_vec(), (0..n).collect::<Vec<_>>());
     }
 
     #[test]
@@ -203,7 +226,8 @@ mod tests {
     fn concurrent_writer_readers() {
         let b = Arc::new(AppendBucket::new());
         let stop = Arc::new(AtomicBool::new(false));
-        let n = 200_000u32;
+        // miri は ~1000x 遅い + UB 検出が目的なので少回数で interleaving を突く。
+        let n = if cfg!(miri) { 300u32 } else { 200_000u32 };
 
         let readers: Vec<_> = (0..4)
             .map(|_| {
