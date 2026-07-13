@@ -14,8 +14,8 @@
 //!   （swap_remove / positions は廃止）。 値更新・削除で生じる stale entry は、
 //!   **read 側が Column を verify して filter** する（`HimoStore` 層の責務）。
 //! - よって `total()` / `unique_count()` は churn した himo では **append 数ベースの
-//!   over-count**（compaction するまで）。 append-only himo（削除なし）では正確。
-//!   compaction は後付け最適化（#95）。
+//!   over-count**（compaction #99 まで）。 append-only himo（削除なし）では正確。
+//!   compaction は後付け最適化（#99）。
 
 use crate::append_bucket::AppendBucket;
 use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned};
@@ -145,8 +145,11 @@ impl LockFreeCylinder {
             self.with_dense_read(&guard, value, |s| s.to_vec())
                 .unwrap_or_default()
         } else {
-            let sp = self.sparse.lock().unwrap();
-            match sp.get(&value) {
+            // Arc を取ったら lock を即座に落とす。 bucket コピーを lock 下でやると
+            // 巨大 sparse bucket の read が writer の insert(sparse) を stall させる
+            // （#95 の相互排他を sparse 側で再発させない）。
+            let b = self.sparse.lock().unwrap().get(&value).cloned();
+            match b {
                 Some(b) => b.read_to_vec(),
                 None => Vec::new(),
             }
