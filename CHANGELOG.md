@@ -35,6 +35,11 @@ backing の総 bytes（メモリ会計・double-buffer 検知）。
 - **unit**: `append_bucket` / `lockfree_cylinder` の並行 test（1 writer + N reader、破損なし）、
   `no_double_buffer_backing_bound`（backing < 2× = double-buffer していない厳密証明、実測 1.28×）。
 - **統合**: `issue95_lockfree_read`（並行 pull・値更新 stale の verify filter）。
+- **model-based property test** (`tests/engine_model_proptest.rs`): tie/untie/delete/reopen の
+  ランダム op 列（proptest、200 case × ≤40 op）を参照 oracle（`BTreeMap`）と毎 op 後に厳密照合。
+  `pull_raw` / `get` / 2-cond `query` の 3 path を網羅し、値更新→削除→再 tie→reopen の
+  組み合わせで stale/dedup/verify/rebuild を自動生成 + shrink。engine crate に proptest
+  dev-dep を追加。
 - **破壊テスト** (`tests/issue95_stress.rs`): `churn_storm_exact`（20k×40 round の値更新で
   bucket を stale だらけにし、並行 read の構造 invariant を保ちつつ quiesce 後の pull が
   live 集合と厳密一致）、`crash_recovery_compacts`（churn→drop→reopen で Cylinder が column

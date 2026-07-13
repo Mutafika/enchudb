@@ -34,3 +34,7 @@ rayon = "1"
 # std::time panics on wasm32-unknown-unknown ("time not implemented"); web-time
 # shims Instant/SystemTime for the browser.
 web-time = "1"
+
+[dev-dependencies]
+# model-based property test (engine op 列 vs 参照 oracle、#95 の stale/verify 網羅)
+proptest = "1"
