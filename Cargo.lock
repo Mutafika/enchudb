@@ -1329,6 +1329,7 @@ name = "enchudb-engine"
 version = "0.12.2"
 dependencies = [
  "async-trait",
+ "crossbeam-epoch",
  "crossbeam-queue",
  "ed25519-dalek",
  "enchudb-oplog",

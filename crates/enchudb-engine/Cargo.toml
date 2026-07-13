@@ -15,6 +15,8 @@ async-blob = ["dep:async-trait", "dep:tokio"]
 [dependencies]
 enchudb-oplog = { path = "../enchudb-oplog" }
 crossbeam-queue = "0.3"
+# #95: lock-free read の realloc 遅延解放 (epoch-based reclamation)
+crossbeam-epoch = "0.9"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 async-trait = { version = "0.1", optional = true }
