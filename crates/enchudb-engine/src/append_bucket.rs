@@ -129,6 +129,14 @@ impl AppendBucket {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// 現在の backing 容量（slot 数、 pow2 で切り上がる）。 メモリ会計用。
+    /// append-only なので eid は 1 度だけ載る = capacity は published len の pow2 上界。
+    pub fn capacity(&self) -> usize {
+        let guard = epoch::pin();
+        let cur = self.backing.load(Ordering::Acquire, &guard);
+        unsafe { cur.deref() }.cap()
+    }
 }
 
 impl Default for AppendBucket {

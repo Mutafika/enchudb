@@ -178,6 +178,20 @@ impl LockFreeCylinder {
         self.unique_count.load(Ordering::Relaxed)
     }
 
+    /// cylinder が現在確保している eid backing の総 bytes（pow2 slack 込み、 メモリ観測用）。
+    /// append-only なので各 eid は 1 度だけ載る → `total()*4 * (pow2 slack)` に収まる。
+    /// double-buffer（2 コピー保持）なら `>= 2x` になるので、 それとの区別に使える。
+    pub fn backing_bytes(&self) -> usize {
+        let guard = epoch::pin();
+        let arr = self.dense.load(Ordering::Acquire, &guard);
+        let vec = unsafe { arr.deref() };
+        let mut slots: usize = vec.iter().map(|b| b.capacity()).sum();
+        let sp = self.sparse.lock().unwrap();
+        slots += sp.values().map(|b| b.capacity()).sum::<usize>();
+        drop(sp);
+        slots * std::mem::size_of::<u32>()
+    }
+
     /// 非空 bucket の value を列挙（順序保証なし、 stale 込みの近似）。
     pub fn unique_values(&self) -> Vec<u32> {
         let guard = epoch::pin();
@@ -248,6 +262,31 @@ mod tests {
         assert_eq!(c.read_to_vec(big), vec![7, 8]);
         assert_eq!(c.unique_count(), 1);
         assert_eq!(c.slice_len(big), 2);
+    }
+
+    /// #95 メモリ制約: append-only なので各 eid は backing に 1 度だけ載る。
+    /// pow2 doubling の slack 込みでも `< 2x`。 double-buffer（2 コピー）なら `>= 2x`
+    /// になるので、 この上界が「double-buffer していない」ことの厳密証明になる。
+    #[test]
+    fn no_double_buffer_backing_bound() {
+        let c = LockFreeCylinder::new(0);
+        let n = 1_000_000u32;
+        for e in 0..n {
+            c.insert(e, e % 10_000); // 10k bucket、 各 ~100 要素（pow2 fill 良好）
+        }
+        assert_eq!(c.total(), n as usize);
+        let bytes = c.backing_bytes();
+        let min = n as usize * 4; // 各 eid 1 度・slack ゼロの理論下限
+        assert!(
+            bytes < 2 * min,
+            "backing {bytes} >= 2x min {min}: double-buffer の疑い（append-only 破れ）"
+        );
+        // 参考: 実比率（pow2 slack）を可視化。
+        eprintln!(
+            "backing {} bytes = {:.2}x min（pow2 slack のみ）",
+            bytes,
+            bytes as f64 / min as f64
+        );
     }
 
     #[test]
