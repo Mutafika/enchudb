@@ -241,16 +241,21 @@ mod tests {
     #[test]
     fn dense_grow() {
         let c = LockFreeCylinder::new(0);
-        // value を疎に増やして外側 Vec の成長を誘発
+        // value を疎に増やして外側 Vec の成長（store + defer_destroy）を誘発。
         c.insert(1, 5);
-        c.insert(2, 500);
-        c.insert(3, 50_000);
-        c.insert(4, 999_999);
-        // insert(eid, value): value 500→eid2, value 50000→eid3, value 999999→eid4
+        c.insert(2, 500); // 0→~501 bucket に grow、epoch swap を叩く
         assert_eq!(c.read_to_vec(500), vec![2]);
-        assert_eq!(c.read_to_vec(50_000), vec![3]);
-        assert_eq!(c.read_to_vec(999_999), vec![4]);
-        assert_eq!(c.unique_count(), 4);
+        // 大 value（value+1 個の bucket 確保）は miri で alloc 爆発するので skip。
+        // grow + defer の unsafe は value 500 の時点で網羅済み。
+        if cfg!(miri) {
+            assert_eq!(c.unique_count(), 2);
+        } else {
+            c.insert(3, 50_000);
+            c.insert(4, 999_999);
+            assert_eq!(c.read_to_vec(50_000), vec![3]);
+            assert_eq!(c.read_to_vec(999_999), vec![4]);
+            assert_eq!(c.unique_count(), 4);
+        }
     }
 
     #[test]
@@ -270,9 +275,14 @@ mod tests {
     #[test]
     fn no_double_buffer_backing_bound() {
         let c = LockFreeCylinder::new(0);
-        let n = 1_000_000u32;
+        // per-bucket 密度 ~100 を維持（pow2 fill 良好 → slack ~1.28x）。miri は総数だけ縮小。
+        let (n, card) = if cfg!(miri) {
+            (3_000u32, 30u32)
+        } else {
+            (1_000_000u32, 10_000u32)
+        };
         for e in 0..n {
-            c.insert(e, e % 10_000); // 10k bucket、 各 ~100 要素（pow2 fill 良好）
+            c.insert(e, e % card);
         }
         assert_eq!(c.total(), n as usize);
         let bytes = c.backing_bytes();
@@ -293,7 +303,7 @@ mod tests {
     fn concurrent_writer_readers() {
         let c = Arc::new(LockFreeCylinder::new(0));
         let stop = Arc::new(AtomicBool::new(false));
-        let n = 100_000u32;
+        let n = if cfg!(miri) { 150u32 } else { 100_000u32 };
         let readers: Vec<_> = (0..4)
             .map(|_| {
                 let c = c.clone();

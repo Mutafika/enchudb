@@ -13,6 +13,18 @@
 //! ## 並行契約
 //! - `push` は **同時に 1 thread のみ**（consumer）。 複数 writer は未対応（race する）。
 //! - `read_to_vec` / `with_read` / `len` は **多 reader 並行可**、 writer と並行可。
+//!
+//! ## Miri での UB 検証（#95）
+//! この型の `unsafe`（`from_raw_parts` over `UnsafeCell`、epoch `defer_destroy`）は
+//! Miri で aliasing UB がないことを確認済み。crossbeam-epoch 0.9 は **Stacked Borrows**
+//! に非互換（内部の intrusive list で違反、既知）なので **Tree Borrows** で回す。
+//! epoch は遅延解放なので exit 時の未回収 garbage を leak 扱いしない `-Zmiri-ignore-leaks`
+//! も要る。concurrent/大量 test は `cfg!(miri)` で縮小。
+//!
+//! ```sh
+//! MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-tree-borrows -Zmiri-ignore-leaks" \
+//!   cargo +nightly miri test -p enchudb-engine --lib append_bucket
+//! ```
 
 use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned};
 use std::cell::UnsafeCell;
@@ -203,7 +215,8 @@ mod tests {
     fn concurrent_writer_readers() {
         let b = Arc::new(AppendBucket::new());
         let stop = Arc::new(AtomicBool::new(false));
-        let n = 200_000u32;
+        // miri は ~1000x 遅い + UB 検出が目的なので少回数で interleaving を突く。
+        let n = if cfg!(miri) { 300u32 } else { 200_000u32 };
 
         let readers: Vec<_> = (0..4)
             .map(|_| {

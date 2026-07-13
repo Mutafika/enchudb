@@ -45,6 +45,13 @@ backing の総 bytes（メモリ会計・double-buffer 検知）。
   live 集合と厳密一致）、`crash_recovery_compacts`（churn→drop→reopen で Cylinder が column
   から rebuild され stale が消える）、`grow_under_read`（dense 配列 realloc 多発 × 旧配列を
   掴む reader で epoch 解放が安全）。
+- **fault-injection** (`tests/oplog_recovery_fault.rs`): oplog を truncate（7 点）/ byte-flip
+  （8 offset）で破損させても reopen が SIGBUS/panic せず、Ok なら pull 結果が書いた集合の
+  subset（phantom/破損 eid なし）。oplog 線形 parse（CRC32 per record）の破損耐性を網羅。
+- **Miri UB 検証**: `append_bucket` / `lockfree_cylinder` の `unsafe`（`from_raw_parts` over
+  `UnsafeCell`、epoch `defer_destroy`）を Miri **Tree Borrows** で UB なしを確認。crossbeam-epoch
+  0.9 は Stacked Borrows 非互換（内部 intrusive list、既知）なので TB + `-Zmiri-ignore-leaks`
+  で回す（epoch 遅延解放の exit 時 garbage を除外）。concurrent test は `cfg!(miri)` で縮小。
 - **bench** (`examples/lockfree_engine_bench.rs`、実 Engine 経路): A. 巨大 bucket を 4 reader が
   clone し続けても drain は同オーダー（write は long read に stall しない、減少分は CPU 帯域
   contention であって lock 待ちではない）。B. writer が同 bucket を叩き続けても pull_raw の
