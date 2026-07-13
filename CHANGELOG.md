@@ -3,6 +3,55 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## Unreleased
+
+### Changed — Cylinder read を lock-free 化（#95、RwLock 撤去）
+
+`HimoStore` の `RwLock<BucketCylinder>` は read が write と per-himo で相互排他になり、
+長い read（巨大 bucket の clone）が write を stall させ、read↔write が取り合っていた
+（sinfo 等「開いたまま read しつつ write する」アプリで問題）。CLAUDE.md が謳う
+「ロックフリー並行 read / ダブルバッファ + AtomicBool swap」は**実装されておらず**
+（履歴上 double-buffer は一度も存在せず）、実物は `std::sync::RwLock` だった。
+
+これを **append-only + epoch（crossbeam-epoch）** の `LockFreeCylinder` に置換:
+
+- **read は完全 lock-free**（writer を一切待たない、epoch pin）。value→eid の各 bucket は
+  append-only（publish 範囲は不変、contiguous `&[u32]` を維持 → query 無改造）。
+- dense（value < 1M）は `Atomic<Vec<Arc<AppendBucket>>>` を epoch-swap で on-demand 成長、
+  sparse（value ≥ 1M、稀）は `Mutex`。realloc の旧 backing は epoch で全 reader 通過後に解放。
+- **write は per-himo writer lock で直列**（append O(1) amortized、メモリ ~1 倍）。writer の
+  呼び出し元は consumer 1 本ではない — **同期 tie（`tie_to_by_id` 系）/ schema
+  `RowBuilder::commit` は任意の user thread が呼ぶ**（master では RwLock write が直列化）。
+  初版はここを見落として無 lock にしており、多 thread schema commit（sunsu matrix bench）で
+  epoch defer_destroy の double free → malloc abort していた。writer lock で master と同じ
+  write 直列度に復元（reader は lock を一切取らないまま = 本 fix の目的は維持）。
+  lock は `parking_lot::Mutex`（critical section ~100ns に対し std::sync::Mutex は競合で即
+  カーネル休眠 = psynch 待ちが支配項になり schema write が ~40% 落ちた。adaptive spin で回復）。
+  insert の epoch pin も 3 回 → 1 回に集約（`push_in`、pin を insert 全体で共有）。
+
+  sunsu matrix（100k posts / 4 thread、warm、同一機）で master 同等を確認:
+
+  | 構成 | master | 本 branch |
+  |---|---|---|
+  | raw tie_async / oplog off | 8〜15M ties/s | 8〜26M ties/s（同等） |
+  | raw tie_async / oplog on | 5.0M | 5.1M |
+  | schema commit / oplog off | 5.6〜8.0M | 5.6〜7.6M |
+  | schema commit / oplog on | 0.4M | 0.4M |
+- 削除/更新は Cylinder を触らず（append-only）、read 側が **Column verify で stale を
+  filter**（conditional: append-only himo は verify を skip = fast path）。churn 由来の
+  dup は read で dedup。compaction は後付け最適化（未実装、#99 で追跡）。
+- `rebuild()` は no-op 化（互換で残置）。Cylinder は open 後 lazy build + live 維持。
+
+**互換性**: 公開 API・on-disk format・wire 不変。`unique_count` / `total` は churn した
+himo で over-count になる（append 数ベース、compaction #99 まで）。append-only では従来通り正確。
+読みは live semantics（snapshot なし）— read-while-write の held snapshot は #100 へ切り出し。
+
+**検証**: `append_bucket` / `lockfree_cylinder` の並行 unit（1 writer + N reader、破損なし）、
+engine 統合 test（`issue95_lockfree_read`: 並行 pull・値更新 stale の verify filter・
+同期 tie ×4 thread の並行 write = write_lock regression test、修正を外すと crash することを確認済み）、
+engine lib 199 + schema/sql/sync 全 green。prototype 実測（`examples/lockfree_bucket_probe`）で
+write starvation 214ms → 解消、verify tax 0.85〜4.5 ns/elem（`examples/verify_tax_probe`）。
+
 ## 0.12.2 — 2026-07-11
 
 ### Fixed — dirty open が vocab index 予約全域を物理コミットする問題 (#92 / #56 ③)
