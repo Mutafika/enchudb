@@ -7694,11 +7694,56 @@ impl Engine {
 
         // 全 region を disk に同期した後、 vocab/himo_reg の index 整合性 OK
         // マークを書いてもう一度 msync。 次 open で rebuild_index を skip できる。
+        self.sync_and_mark_clean()
+    }
+
+    /// #101: 全 region msync → vocab/himo_reg の clean マーク → 再 msync。
+    /// mark 前の msync で「flag が指す中身」を先に固める順序が要る (flush() から切り出し)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn sync_and_mark_clean(&self) -> io::Result<()> {
         self.backing.flush_to_disk()?;
         self.vocab.mark_index_clean(true);
         self.himo_reg.mark_index_clean(true);
         self.backing.flush_to_disk()?;
         Ok(())
+    }
+
+    /// #101: graceful close 用の clean-flush (`&self` 版)。 滞留 write を全 apply して
+    /// msync し、 vocab/himo_reg の整合性マーク (clean=1) を永続化する。 次 open は
+    /// rebuild_index (O(count)) を skip でき、 readonly open の shadow rebuild も消える。
+    ///
+    /// `flush()` (&mut) と違い header は書き直さない (himo 定義は define 時に persist 済み)。
+    /// readonly open では no-op。 書き込み thread が並行中に呼んだ場合、 mark 後の
+    /// insert が flag を 0 に戻すので安全側 (次 open が rebuild) に倒れる。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn flush_clean(&self) -> io::Result<()> {
+        if self.is_readonly.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        self.flush_writes();
+        self.commit();
+        self.try_persist_tables();
+        for ds in &self.himos {
+            ds.sync();
+        }
+        self.vocab.sync();
+        self.himo_reg.sync();
+        self.contents.sync();
+        self.sync_and_mark_clean()
+    }
+
+    /// #101: 観測用 — vocab index の clean flag。 注意: writer open は #56 の保護で
+    /// open 直後に flag を 0 へ戻すので、 session 中に true になるのは
+    /// 「flush_clean 後 & 次の vocab insert 前」のみ。 「open が rebuild を skip
+    /// できたか」は `vocab_index_rebuilt_on_load()` で見る。
+    pub fn vocab_index_is_clean(&self) -> bool {
+        self.vocab.index_clean_on_disk()
+    }
+
+    /// #101: 観測用 — この Engine の open 時に vocab index の rebuild (O(count)) が
+    /// 走ったか。 false = 前回 graceful close の clean flag で skip できた。
+    pub fn vocab_index_rebuilt_on_load(&self) -> bool {
+        self.vocab.rebuilt_on_load
     }
 
     /// v29: region CRC を計算して `.crc` sidecar に永続化する。
@@ -7737,6 +7782,26 @@ impl Drop for Engine {
             if let Some(handle) = h.take() {
                 let _ = handle.join();
             }
+        }
+        // #101: graceful close で clean flag を永続化 → 次 open は rebuild_index skip。
+        // panic unwinding 中 / consumer 死亡時は「dirty のまま」に倒す (= 次 open で
+        // rebuild が走るのが正しい recovery)。 readonly は共有 mmap を書けないので除外。
+        // queue は上の drain + consumer join で空なので barrier (flush_writes) は不要。
+        // best-effort: msync の Err は握る (dirty のままでも安全側)。
+        #[cfg(not(target_arch = "wasm32"))]
+        if !std::thread::panicking()
+            && !self.is_readonly.load(Ordering::Acquire)
+            && !self.consumer_poisoned.load(Ordering::Acquire)
+        {
+            self.commit();
+            self.try_persist_tables();
+            for ds in &self.himos {
+                ds.sync();
+            }
+            self.vocab.sync();
+            self.himo_reg.sync();
+            self.contents.sync();
+            let _ = self.sync_and_mark_clean();
         }
     }
 }

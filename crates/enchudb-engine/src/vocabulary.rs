@@ -29,6 +29,9 @@ pub struct Vocabulary {
     /// しか 0 に倒さず、 flush 後の追加 write 中 crash で破損 index を
     /// 次 open が無検証採用した)。
     clean_on_disk: std::sync::atomic::AtomicBool,
+    /// #101: この instance の load で rebuild_index が走ったか (= dirty open だったか)。
+    /// 観測専用 (graceful close の regression test / 診断)。 init (新規) は false。
+    pub rebuilt_on_load: bool,
     count: AtomicU32,
     data_end: AtomicU32,
     max_entries: u32,
@@ -63,6 +66,7 @@ impl Vocabulary {
             data, offsets, index,
             shadow_index: None,
             clean_on_disk: std::sync::atomic::AtomicBool::new(false),
+            rebuilt_on_load: false,
             count: AtomicU32::new(0),
             data_end: AtomicU32::new(HEADER as u32),
             max_entries, index_cap,
@@ -98,6 +102,7 @@ impl Vocabulary {
             data, offsets, index,
             shadow_index: None,
             clean_on_disk: std::sync::atomic::AtomicBool::new(clean_flag == 1),
+            rebuilt_on_load: !is_fresh && clean_flag != 1,
             count: AtomicU32::new(count),
             data_end: AtomicU32::new(data_end),
             max_entries, index_cap,
@@ -334,6 +339,12 @@ impl Vocabulary {
     /// `clean = false`: insert が走った／crash 検知用 → 次回 open で rebuild 強制
     ///
     /// 自身では msync しない。 caller (Engine) が body_msync で永続化する責任を負う。
+    /// #101: 観測用 — clean flag の現在値。 open 直後に true なら「前回 graceful close
+    /// 済みで rebuild を skip した」。 insert が走ると false に戻る (#77-M1)。
+    pub fn index_clean_on_disk(&self) -> bool {
+        self.clean_on_disk.load(Ordering::Acquire)
+    }
+
     pub fn mark_index_clean(&self, clean: bool) {
         // data 領域は variable cluster (lazy commit) なので、 先頭 header を
         // 確実に commit してから書く。

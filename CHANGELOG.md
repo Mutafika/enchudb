@@ -3,6 +3,29 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## Unreleased
+
+### Fixed — graceful close で clean flag を永続化 (#101): 毎 open の vocab/himo index rebuild を解消
+
+clean flag（index↔data 整合性マーク）を書く経路が `flush()`（`&mut`、実質 `seal_integrity`
+専用）にしか無く、通常の close は dirty のまま終了 → **writer open 毎に vocab/himo_reg の
+`rebuild_index` が O(count) で走っていた**（sf のような 1 コマンド 1 open の使い方で全コマンドに
+乗る固定税。readonly open も shadow index を毎回 heap rebuild）。vocab は回収なし単調増加なので
+税は unbounded に育つ（20万 entry で実測 +20ms/コマンド）。
+
+- **`Engine::flush_clean(&self)`** 追加: 滞留 write を全 apply → 全 region msync →
+  vocab/himo_reg の clean マーク → 再 msync。プロセス生存中の checkpoint 用（sinfo の
+  `sync()` 等から呼べる `&self` 版）。readonly open では no-op。
+- **`Engine::Drop` で best-effort clean-flush**: graceful close だけで次 open が rebuild を
+  skip できる。panic unwinding 中 / consumer 死亡時 / readonly は書かない（= dirty のまま
+  → 次 open の rebuild が正しい recovery）。
+- 観測 API: `vocab_index_rebuilt_on_load()`（open で rebuild が走ったか）/
+  `vocab_index_is_clean()`（disk 上の clean flag）。
+- writer open が open 直後に flag を 0 へ戻す #56 の write-crash 保護は不変。
+  semantics は「graceful exit → clean → 次 open skip / crash → dirty → rebuild」。
+- regression test: `issue101_clean_reopen`（graceful close で skip・crash 相当 copy で
+  rebuild・readonly 非破壊。Drop hook を無効化すると落ちることを確認済み）。
+
 ## 0.13.0 — 2026-07-14
 
 ### Changed — Cylinder read を lock-free 化（#95、RwLock 撤去）
