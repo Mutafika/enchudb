@@ -32,12 +32,16 @@ type DenseArr = Vec<Arc<AppendBucket>>;
 pub struct LockFreeCylinder {
     dense: Atomic<DenseArr>,
     sparse: Mutex<HashMap<u32, Arc<AppendBucket>>>,
-    /// append 総数 (raw、stale 込み)。メモリ会計・診断用。
+    /// backing に現存する slot 総数 (stale 込み。compaction の除去分は反映)。
+    /// メモリ会計・診断用、かつ total_live 導出の被減数 (request12.1)。
     total: AtomicUsize,
     /// 一度でも要素が入った bucket 数 (raw)。診断用。
     unique_count: AtomicU32,
-    /// live な tie 総数 (= Column が現在指している数、正確)。request12。
-    total_live: AtomicUsize,
+    /// backing に現存する stale slot 総数 (= note_stale 累計 − compaction 除去分)。
+    /// live な tie 総数は `total − stale_total` で導出する (request12.1)。
+    /// per-insert の RMW を避け、churn 経路 (note_stale / compaction) でのみ更新
+    /// — 純 insert workload の hot path を master と同一コストに保つ。
+    stale_total: AtomicUsize,
     /// live > 0 の bucket 数 (= 正確な cardinality)。request12。
     unique_live: AtomicU32,
     /// delete / 値更新が一度でも起きたか (himo 全体、診断用)。
@@ -63,7 +67,7 @@ impl LockFreeCylinder {
             sparse: Mutex::new(HashMap::new()),
             total: AtomicUsize::new(0),
             unique_count: AtomicU32::new(0),
-            total_live: AtomicUsize::new(0),
+            stale_total: AtomicUsize::new(0),
             unique_live: AtomicU32::new(0),
             any_removed: AtomicBool::new(false),
         }
@@ -110,7 +114,7 @@ impl LockFreeCylinder {
         };
         match stats {
             Some((_, live_after)) => {
-                self.total_live.fetch_sub(1, Ordering::Relaxed);
+                self.stale_total.fetch_add(1, Ordering::Relaxed);
                 if live_after == 0 {
                     // この bucket の live が 0 になった = cardinality 減
                     self.unique_live.fetch_sub(1, Ordering::Relaxed);
@@ -136,7 +140,11 @@ impl LockFreeCylinder {
             // SAFETY: dense は常に非 null。
             let vec = unsafe { arr.deref() };
             if (value as usize) < vec.len() {
-                vec[value as usize].compact_in(&guard, keep)
+                let b = &vec[value as usize];
+                let before = b.len();
+                let kept = b.compact_in(&guard, keep);
+                self.discount_compacted(before - kept);
+                kept
             } else {
                 0
             }
@@ -145,10 +153,23 @@ impl LockFreeCylinder {
             match b {
                 Some(b) => {
                     let guard = epoch::pin();
-                    b.compact_in(&guard, keep)
+                    let before = b.len();
+                    let kept = b.compact_in(&guard, keep);
+                    self.discount_compacted(before - kept);
+                    kept
                 }
                 None => 0,
             }
+        }
+    }
+
+    /// compaction で除去された slot 数 (= その bucket に居た stale 全量) を
+    /// total / stale_total から同数引く — `total_live` (= 差分) は不変のまま、
+    /// raw `total` は「backing に現存する slot 総数」として正確さを保つ。
+    fn discount_compacted(&self, removed: usize) {
+        if removed > 0 {
+            self.total.fetch_sub(removed, Ordering::Relaxed);
+            self.stale_total.fetch_sub(removed, Ordering::Relaxed);
         }
     }
 
@@ -196,7 +217,9 @@ impl LockFreeCylinder {
     #[inline]
     fn bump_stats(&self, was_empty: bool, was_dead: bool) {
         self.total.fetch_add(1, Ordering::Relaxed);
-        self.total_live.fetch_add(1, Ordering::Relaxed);
+        // total_live は total − stale_total で導出 (request12.1) — ここで RMW を
+        // 増やさない (raw tie_async + oplog の consumer apply が per-insert コストに
+        // 直結する。sunsu matrix で +33% の実測退行が出た)。
         if was_empty {
             self.unique_count.fetch_add(1, Ordering::Relaxed);
         }
@@ -284,7 +307,7 @@ impl LockFreeCylinder {
         }
     }
 
-    /// append 総数 (raw、stale 込み)。診断用。
+    /// backing に現存する slot 総数 (raw、stale 込み、compaction 除去は反映)。診断用。
     #[allow(dead_code)]
     pub fn total(&self) -> usize {
         self.total.load(Ordering::Relaxed)
@@ -297,8 +320,12 @@ impl LockFreeCylinder {
     }
 
     /// live な tie 総数 (正確、churn の影響なし)。request12。
+    /// `total − stale_total` で導出。stale → total の順で load するので
+    /// 並行 insert があっても負に振れない (並行 compaction 中のみ一時的に
+    /// 過少に見えうる — Relaxed 統計として許容、saturating で防御)。
     pub fn total_live(&self) -> usize {
-        self.total_live.load(Ordering::Relaxed)
+        let stale = self.stale_total.load(Ordering::Relaxed);
+        self.total.load(Ordering::Relaxed).saturating_sub(stale)
     }
 
     /// live > 0 の bucket 数 (正確な cardinality)。request12。
@@ -483,6 +510,8 @@ mod tests {
         // live 集合は不変なので cylinder 側カウンタは動かない
         assert_eq!(c.total_live(), 100);
         assert_eq!(c.unique_live(), 2);
+        // request12.1: raw total も compaction 除去分を反映 (Σ len と一致)
+        assert_eq!(c.total(), 100, "total = 現存 slot 総数 (v0:40 + v1:60)");
     }
 
     /// #95 メモリ制約: append-only なので各 eid は backing に 1 度だけ載る。
