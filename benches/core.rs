@@ -472,6 +472,63 @@ fn bench_scale_tables(c: &mut Criterion) {
     let _ = std::fs::remove_file(format!("{}.tables", path));
 }
 
+// ─────────────────────────────────────────────────────────────
+// churn_read — 値更新 (churn) 後の read (#95 lazy verify / request12)
+// ─────────────────────────────────────────────────────────────
+//
+// 1 himo (100 値 × 10k entity) のうち value 0/1 の eid だけを 0↔1 で往復
+// re-tie して stale を積んだ後、
+//   - pull_untouched_value: churn していない value 50 の pull
+//   - pull_churned_value:   churn した value 0 の pull (stale 込み bucket)
+// を測る。himo 単位 any_removed (現行) では untouched 側も verify + sort +
+// dedup に落ちる。request12 P1 (bucket 単位 flag) 後は raw fast path に戻る。
+
+fn bench_churn_read(c: &mut Criterion) {
+    let path = tmp("churn_read");
+    let mut eng = Engine::create_with_capacity(&path, 100_000).unwrap();
+    eng.define_himo("cat", ValueType::Number, 100);
+    let mut churn_eids = Vec::new();
+    for i in 0..10_000u32 {
+        let e = eng.entity();
+        eng.tie(e, "cat", i % 100);
+        if i % 100 <= 1 {
+            churn_eids.push(e); // value 0/1 に居る eid (計 200)
+        }
+    }
+    eng.rebuild();
+
+    // churn: 200 eid を 0↔1 で 20 往復 = bucket 0/1 に 4000 slot の stale が積もる
+    for round in 0..20u32 {
+        let v = if round % 2 == 0 { 1 } else { 0 };
+        for &e in &churn_eids {
+            eng.tie(e, "cat", v);
+        }
+    }
+
+    let mut group = c.benchmark_group("churn_read");
+    group.throughput(Throughput::Elements(1));
+    group.measurement_time(MEASUREMENT_TIME);
+    group.sample_size(SAMPLE_SIZE);
+    group.bench_function("pull_untouched_value", |b| {
+        b.iter(|| {
+            // value 50 は一度も churn していない (live 100 == raw 100)
+            let r = eng.pull("cat", black_box(50));
+            black_box(r);
+        });
+    });
+    group.bench_function("pull_churned_value", |b| {
+        b.iter(|| {
+            // value 0 は stale 込み。verify + dedup の worst 側 (退行検知用)
+            let r = eng.pull("cat", black_box(0));
+            black_box(r);
+        });
+    });
+    group.finish();
+
+    drop(eng);
+    cleanup(&path);
+}
+
 criterion_group!(
     benches,
     bench_tie,
@@ -482,5 +539,6 @@ criterion_group!(
     bench_audit,
     bench_scale,
     bench_scale_tables,
+    bench_churn_read,
 );
 criterion_main!(benches);
