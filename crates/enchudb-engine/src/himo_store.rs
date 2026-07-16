@@ -55,6 +55,11 @@ impl ValueType {
 //   atomic になる）。 pull の verify は Column を直読みするが、 これは #95 とは
 //   別の既知の無同期読みで別 issue（#100 と同時に設計）。
 
+/// incremental compaction (request12 P2) の trigger: これ未満の bucket は
+/// 組み直さない (小 bucket は verify の方が安い)。stale 率 (len-live)/len >= 1/2
+/// と併用。閾値は churn_read ベンチで調整。
+const COMPACT_MIN_LEN: usize = 64;
+
 pub struct HimoStore {
     col: UnsafeCell<Column>,
     cyl: LockFreeCylinder,
@@ -143,13 +148,18 @@ impl HimoStore {
         if old == Some(value) {
             return; // 冗長な re-tie = no-op（bucket に dup を作らない）
         }
+        let mut stale = None;
         if let Some(o) = old {
             // 値更新: 旧 value の bucket に stale が残る → その bucket の read は verify する。
             // Column を書き換える **前** に flag を立てる (request12、順序契約は note_stale 参照)
-            self.cyl.note_stale(o);
+            stale = self.cyl.note_stale(o).map(|s| (o, s));
         }
         self.col().set(eid, &(value + 1).to_le_bytes());
         self.cyl.insert(eid, value);
+        // compaction は Column 更新の **後** (keep = value_eq が新状態を見るため)
+        if let Some((o, (len, live))) = stale {
+            self.maybe_compact(o, len, live);
+        }
     }
 
     pub fn remove(&self, eid: u32) {
@@ -159,9 +169,32 @@ impl HimoStore {
             if let Some(o) = self.get_value(eid) {
                 // 削除: 旧 bucket に stale が残る（Cylinder は触らない、verify で落とす）。
                 // flag → Column の順 (set と同じ)
-                self.cyl.note_stale(o);
+                let stale = self.cyl.note_stale(o);
                 self.col().clear(eid);
+                if let Some((len, live)) = stale {
+                    self.maybe_compact(o, len, live);
+                }
             }
+        }
+    }
+
+    /// stale 率が閾値を超えた bucket を Column 基準で組み直す (request12 P2)。
+    /// write_lock 下・Column 更新後に呼ぶこと。trigger は stale 率 50% なので
+    /// amortized O(1)/write (Vec doubling と同じ理屈 — 組み直し後の stale は 0、
+    /// 次の trigger までに live 相当数の churn が必要)。
+    fn maybe_compact(&self, value: u32, len: usize, live: u32) {
+        if len >= COMPACT_MIN_LEN && (len - live as usize) * 2 >= len {
+            self.cyl.compact_bucket(value, |eid| self.value_eq(eid, value));
+        }
+    }
+
+    /// 全 bucket を Column 基準で即時 compaction する明示 API (運用/テスト用)。
+    /// reader は停止しない (bucket ごとの epoch swap)。
+    pub fn compact_now(&self) {
+        self.ensure_cylinder_built();
+        let _w = self.write_lock.lock();
+        for v in self.cyl.unique_values() {
+            self.cyl.compact_bucket(v, |eid| self.value_eq(eid, v));
         }
     }
 
@@ -231,13 +264,17 @@ impl HimoStore {
         if old == new {
             return; // 同値 restore = no-op (bytes も同一)
         }
+        let mut stale = None;
         if let Some(o) = old {
             // flag → Column の順 (set と同じ、request12)
-            self.cyl.note_stale(o);
+            stale = self.cyl.note_stale(o).map(|s| (o, s));
         }
         self.col().set(eid, old_bytes);
         if let Some(n) = new {
             self.cyl.insert(eid, n);
+        }
+        if let Some((o, (len, live))) = stale {
+            self.maybe_compact(o, len, live);
         }
     }
 

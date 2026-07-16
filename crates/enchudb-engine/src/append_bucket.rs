@@ -11,8 +11,12 @@
 //! - 容量超過時のみ backing を倍化し、 旧 backing は epoch で全 reader 通過後に解放。
 //!
 //! ## 並行契約
-//! - `push` は **同時に 1 thread のみ**（consumer）。 複数 writer は未対応（race する）。
+//! - `push` / `compact_in` は **同時に 1 thread のみ**（HimoStore write_lock 下）。
+//!   複数 writer は未対応（race する）。
 //! - `read_to_vec` / `with_read` / `len` は **多 reader 並行可**、 writer と並行可。
+//! - request12 P2: `compact_in` は backing を組み直して swap するため、
+//!   **len は単調非減少ではない** (compaction で縮む)。reader は len の減少を
+//!   「並行 compaction があった」として扱うこと (スナップショット自体は常に整合)。
 //!
 //! ## Miri での UB 検証（#95）
 //! この型の `unsafe`（`from_raw_parts` over `UnsafeCell`、epoch `defer_destroy`）は
@@ -167,6 +171,47 @@ impl AppendBucket {
         l
     }
 
+    /// published prefix を `keep` 判定で組み直して backing を atomic swap する
+    /// (request12 P2 = incremental compaction)。単一 writer (write_lock 下) 前提。
+    ///
+    /// - 同一 eid の重複 slot (re-tie 往復痕) は最初の 1 本だけ残す (dedup)
+    /// - 旧 backing は epoch で全 reader 通過後に解放 — reader は停止しない
+    /// - swap 後に live を確定し、removed flag を **backing swap の後で** false に
+    ///   戻す (Release)。reader は flag を Acquire で slice より先に読むので、
+    ///   flag=false を見た reader は必ず新 backing を見る。
+    ///
+    /// 戻り値は compaction 後の live 数。
+    pub fn compact_in(&self, guard: &Guard, mut keep: impl FnMut(u32) -> bool) -> usize {
+        let cur = self.backing.load(Ordering::Acquire, guard);
+        // SAFETY: backing は常に非 null。
+        let b = unsafe { cur.deref() };
+        let l = b.len.load(Ordering::Relaxed); // 単一 writer なので自身の len は Relaxed で可
+        let src = unsafe { b.published(l) };
+        let mut seen = std::collections::HashSet::with_capacity(self.live() as usize + 1);
+        let kept: Vec<u32> = src
+            .iter()
+            .copied()
+            .filter(|&e| keep(e) && seen.insert(e))
+            .collect();
+
+        let ncap = kept.len().next_power_of_two().max(INITIAL_CAP);
+        let nb = Buf::with_cap(ncap);
+        for (i, &v) in kept.iter().enumerate() {
+            unsafe {
+                *nb.data[i].get() = v;
+            }
+        }
+        nb.len.store(kept.len(), Ordering::Relaxed); // まだ誰も見ていない
+        self.backing.store(Owned::new(nb), Ordering::Release);
+        // SAFETY: 旧 backing は全 reader が epoch を通過してから解放。
+        unsafe {
+            guard.defer_destroy(cur);
+        }
+        self.live.store(kept.len() as u32, Ordering::Relaxed);
+        self.removed.store(false, Ordering::Release); // swap 後 — 順序契約はメソッド doc 参照
+        kept.len()
+    }
+
     /// 外部 guard 下で published slice を borrow（query 単位 pin 用、 zero-copy）。
     #[inline]
     pub fn with_read<R>(&self, guard: &Guard, f: impl FnOnce(&[u32]) -> R) -> R {
@@ -264,6 +309,40 @@ mod tests {
         let guard = epoch::pin();
         let sum: u64 = b.with_read(&guard, |s| s.iter().map(|&x| x as u64).sum());
         assert_eq!(sum, (0..50).map(|i| (i * 2) as u64).sum());
+    }
+
+    /// request12 P2: compact_in が stale を落とし、dup を 1 本化し、flag を戻す。
+    /// (miri 対象 — compact_in の unsafe を Tree Borrows で検証する入口)
+    #[test]
+    fn compact_filters_and_dedups() {
+        let b = AppendBucket::new();
+        for i in 0..100u32 {
+            b.push(i);
+            b.live_inc();
+        }
+        // 前半 50 個が stale になった想定
+        for _ in 0..50 {
+            b.note_stale();
+        }
+        assert!(b.needs_verify());
+        assert_eq!(b.live(), 50);
+
+        let guard = epoch::pin();
+        let n = b.compact_in(&guard, |e| e >= 50);
+        assert_eq!(n, 50);
+        assert!(!b.needs_verify(), "compact 後は fast path に戻る");
+        assert_eq!(b.live(), 50);
+        assert_eq!(b.read_to_vec(), (50..100).collect::<Vec<_>>());
+        assert!(b.capacity() <= 64, "backing が縮んでいない: cap {}", b.capacity());
+
+        // dup (re-tie 往復痕) は最初の 1 本だけ残る
+        let d = AppendBucket::new();
+        for e in [5u32, 5, 7, 5] {
+            d.push(e);
+        }
+        let n = d.compact_in(&guard, |_| true);
+        assert_eq!(n, 2);
+        assert_eq!(d.read_to_vec(), vec![5, 7]);
     }
 
     /// 1 writer + N reader 並行: 破損なし、 len 単調非減少、 全要素 valid。

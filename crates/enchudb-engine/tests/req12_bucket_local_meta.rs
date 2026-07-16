@@ -114,6 +114,80 @@ fn retie_roundtrip_dedups() {
     fresh(path);
 }
 
+/// request12 P2: 重 churn でも incremental compaction が backing を有界に保つ。
+/// 無 compaction なら 80k append × 4B ≈ 320KB+ に単調増加する — このテストが
+/// trigger 無効化 (COMPACT_MIN_LEN = usize::MAX) で落ちることは実証済み。
+#[test]
+fn compaction_bounds_backing_under_heavy_churn() {
+    let path = "/tmp/test_req12_compact_bound.db";
+    fresh(path);
+    let mut eng = Engine::create_standalone(path).expect("create");
+    eng.define_himo("s", ValueType::Number, 10);
+
+    let eids: Vec<_> = (0..200).map(|_| eng.entity()).collect();
+    for &e in &eids {
+        eng.tie(e, "s", 0);
+    }
+    // 200 eid を v0 ⇔ v1 で 400 往復 = 80k appends 相当の churn
+    for round in 0..400u32 {
+        let to = if round % 2 == 0 { 1 } else { 0 };
+        for &e in &eids {
+            eng.tie(e, "s", to);
+        }
+    }
+
+    let bytes = eng.himo_cylinder_backing_bytes("s").expect("himo");
+    assert!(
+        bytes < 32 * 1024,
+        "compaction が効いていない: backing {bytes}B (live 200 eid ≈ KB 台のはず、無 compaction なら 320KB+)"
+    );
+
+    // 正しさ: 最終 round (399) は to=0 → 全員 v0
+    assert_eq!(eng.pull("s", 0).len(), 200);
+    assert_eq!(eng.pull("s", 1).len(), 0);
+    assert_eq!(eng.himo_cardinality("s"), Some(1));
+
+    drop(eng);
+    fresh(path);
+}
+
+/// 明示 compaction API (`Engine::compact_himo`) の正しさと非破壊性。
+#[test]
+fn explicit_compact_himo() {
+    let path = "/tmp/test_req12_compact_api.db";
+    fresh(path);
+    let mut eng = Engine::create_standalone(path).expect("create");
+    eng.define_himo("s", ValueType::Number, 10);
+
+    let eids: Vec<_> = (0..20).map(|_| eng.entity()).collect();
+    for &e in &eids {
+        eng.tie(e, "s", 0);
+    }
+    // 少量 churn (trigger 閾値 64 未満なので自動 compaction は走らない)
+    for &e in &eids[..8] {
+        eng.tie(e, "s", 1);
+    }
+    let before0 = eng.pull("s", 0);
+    let before1 = eng.pull("s", 1);
+    assert_eq!(before0.len(), 12);
+    assert_eq!(before1.len(), 8);
+
+    assert!(eng.compact_himo("s"));
+    assert!(!eng.compact_himo("存在しない himo"));
+
+    // compaction は観測結果を一切変えない
+    let mut a = eng.pull("s", 0);
+    let mut b = before0.clone();
+    a.sort_unstable();
+    b.sort_unstable();
+    assert_eq!(a, b);
+    assert_eq!(eng.pull("s", 1).len(), 8);
+    assert_eq!(eng.himo_cardinality("s"), Some(2));
+
+    drop(eng);
+    fresh(path);
+}
+
 /// 無傷の値の pull は churn の影響を受けず正しいまま (fast path の正しさ)。
 #[test]
 fn untouched_value_pull_correct_after_churn() {

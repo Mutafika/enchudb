@@ -6234,6 +6234,21 @@ impl Engine {
         Some(self.himos[idx].cyl_backing_bytes())
     }
 
+    /// 指定 himo の全 bucket を Column 基準で即時 compaction する (request12 P2)。
+    /// stale (churn 痕) を除去して backing を縮め、以降の read を verify-free の
+    /// fast path に戻す。reader は停止しない (bucket ごとの epoch swap)。
+    /// 通常は書き込み時の自動 trigger (stale 率 50%) に任せてよく、これは
+    /// 明示的に掃除したい運用・テスト用。紐が未定義なら false。
+    pub fn compact_himo(&self, himo: &str) -> bool {
+        match self.himo_id(himo) {
+            Some(idx) => {
+                self.himos[idx].compact_now();
+                true
+            }
+            None => false,
+        }
+    }
+
     // ──── 紐を引く（Cylinder 経由）────
 
     /// Cylinder + Bitmap キャッシュを再構築。delta をクリア。

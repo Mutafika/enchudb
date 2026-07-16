@@ -81,15 +81,19 @@ impl LockFreeCylinder {
     /// 該当 bucket の removed flag を立て、live を -1。write_lock 下の単一 writer 前提。
     /// **Column を書き換える前に呼ぶこと** (reader が「flag 未設定なのに Column は
     /// 新値」を観測する窓を作らない — 旧 mark_removed と同じ順序契約)。
-    pub fn note_stale(&self, value: u32) {
+    ///
+    /// 戻り値は `(bucket の raw len, 減分後の live)` — 呼び出し側 (HimoStore) が
+    /// incremental compaction の trigger 判定 (stale 率) に使う (P2)。
+    pub fn note_stale(&self, value: u32) -> Option<(usize, u32)> {
         self.any_removed.store(true, Ordering::Relaxed);
-        let prev = if value < DENSE_CAP {
+        let stats = if value < DENSE_CAP {
             let guard = epoch::pin();
             let arr = self.dense.load(Ordering::Acquire, &guard);
             // SAFETY: dense は常に非 null。
             let vec = unsafe { arr.deref() };
             if (value as usize) < vec.len() {
-                vec[value as usize].note_stale()
+                let b = &vec[value as usize];
+                b.note_stale().map(|prev| (b.len(), prev - 1))
             } else {
                 debug_assert!(false, "note_stale: 未確保 bucket (value={value})");
                 None
@@ -97,22 +101,54 @@ impl LockFreeCylinder {
         } else {
             let sp = self.sparse.lock().unwrap();
             match sp.get(&value) {
-                Some(b) => b.note_stale(),
+                Some(b) => b.note_stale().map(|prev| (b.len(), prev - 1)),
                 None => {
                     debug_assert!(false, "note_stale: 未確保 sparse bucket (value={value})");
                     None
                 }
             }
         };
-        match prev {
-            Some(p) => {
+        match stats {
+            Some((_, live_after)) => {
                 self.total_live.fetch_sub(1, Ordering::Relaxed);
-                if p == 1 {
+                if live_after == 0 {
                     // この bucket の live が 0 になった = cardinality 減
                     self.unique_live.fetch_sub(1, Ordering::Relaxed);
                 }
             }
             None => debug_assert!(false, "note_stale: live 0 の bucket への stale 通知"),
+        }
+        stats
+    }
+
+    /// `value` の bucket を `keep` 判定で組み直す (request12 P2 = incremental
+    /// compaction)。write_lock 下の単一 writer 前提。reader は停止しない
+    /// (epoch swap)。**Column が最新になってから呼ぶこと** — keep は Column の
+    /// 現在値照合 (`value_eq`) であり、更新前に呼ぶと移動中の eid を live と
+    /// 誤認して残し、removed=false の fast path が stale を返すようになる。
+    ///
+    /// live/removed は bucket 内で確定し直すため、cylinder 側の total_live /
+    /// unique_live は不変 (live な eid の集合は compaction で変わらない)。
+    pub fn compact_bucket(&self, value: u32, keep: impl FnMut(u32) -> bool) -> usize {
+        if value < DENSE_CAP {
+            let guard = epoch::pin();
+            let arr = self.dense.load(Ordering::Acquire, &guard);
+            // SAFETY: dense は常に非 null。
+            let vec = unsafe { arr.deref() };
+            if (value as usize) < vec.len() {
+                vec[value as usize].compact_in(&guard, keep)
+            } else {
+                0
+            }
+        } else {
+            let b = self.sparse.lock().unwrap().get(&value).cloned();
+            match b {
+                Some(b) => {
+                    let guard = epoch::pin();
+                    b.compact_in(&guard, keep)
+                }
+                None => 0,
+            }
         }
     }
 
@@ -418,6 +454,35 @@ mod tests {
         assert_eq!(c.unique_live(), 1, "live 0 の bucket は cardinality から消える");
         assert_eq!(c.total_live(), 10);
         assert_eq!(c.slice_len_live(0), 0);
+    }
+
+    /// request12 P2: compact_bucket が stale を除去して flag を戻し、
+    /// live 系カウンタは不変のまま。
+    #[test]
+    fn compact_bucket_shrinks_and_resets_flag() {
+        let c = LockFreeCylinder::new(0);
+        for e in 0..100u32 {
+            c.insert(e, 0);
+        }
+        // e0..e59 が v1 へ移動 (呼び出し側の順序で note_stale → insert)
+        for e in 0..60u32 {
+            c.note_stale(0);
+            c.insert(e, 1);
+        }
+        assert!(c.read_to_vec_verify(0).1);
+        assert_eq!(c.slice_len(0), 100, "raw は stale 込みのまま");
+        assert_eq!(c.slice_len_live(0), 40);
+
+        // Column 相当の keep: e60 以上が今も v0
+        let n = c.compact_bucket(0, |e| e >= 60);
+        assert_eq!(n, 40);
+        let (v, needs_verify) = c.read_to_vec_verify(0);
+        assert!(!needs_verify, "compact 後は fast path");
+        assert_eq!(v, (60..100).collect::<Vec<_>>());
+        assert_eq!(c.slice_len(0), 40, "raw len も縮む");
+        // live 集合は不変なので cylinder 側カウンタは動かない
+        assert_eq!(c.total_live(), 100);
+        assert_eq!(c.unique_live(), 2);
     }
 
     /// #95 メモリ制約: append-only なので各 eid は backing に 1 度だけ載る。
