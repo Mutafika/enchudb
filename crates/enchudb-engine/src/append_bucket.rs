@@ -28,7 +28,7 @@
 
 use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned};
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 const INITIAL_CAP: usize = 4;
 
@@ -65,6 +65,13 @@ impl Buf {
 
 pub struct AppendBucket {
     backing: Atomic<Buf>,
+    /// この bucket の値を Column が現在指している eid 数 (= verify 後の正確な件数)。
+    /// request12: 書き込み側 (HimoStore、write_lock 下) が旧値の decrement / 新値の
+    /// increment を行う。read の fast-path 判定と統計・planner の pivot 選択に使う。
+    live: AtomicU32,
+    /// この bucket に stale (値更新/削除の残骸) が居るか。true なら read は
+    /// Column verify + dedup を通す。himo 全体 flag (旧 any_removed) の bucket 局所版。
+    removed: AtomicBool,
 }
 
 // SAFETY: 単一 writer / 多 reader。 全アクセスは atomic len + epoch で同期される。
@@ -76,10 +83,48 @@ impl AppendBucket {
     pub fn new() -> Self {
         Self {
             backing: Atomic::new(Buf::with_cap(0)),
+            live: AtomicU32::new(0),
+            removed: AtomicBool::new(false),
         }
     }
 
+    // ──── request12: bucket ローカルメタデータ ────
+    // live/removed は write_lock 下の単一 writer だけが更新する。read 側は
+    // needs_verify を「slice を読む前」に load する (旧 any_removed と同じ
+    // 先読み順序 — 値の線形化点は flag load 時点。Column 側の無同期読みは
+    // 既知の別 issue #100)。
+
+    /// live +1。戻り値は増分前 (0 なら「live な値が初めて入った」= unique 判定)。
+    #[inline]
+    pub fn live_inc(&self) -> u32 {
+        self.live.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// stale 化: removed flag を立てて live -1。戻り値は減分前の live。
+    /// live == 0 のとき (契約違反: Column に無い値の stale 通知) は何もせず None。
+    #[inline]
+    pub fn note_stale(&self) -> Option<u32> {
+        self.removed.store(true, Ordering::Release);
+        self.live
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
+            .ok()
+    }
+
+    /// 現在の live 数 (= verify 後の正確な件数)。
+    #[inline]
+    pub fn live(&self) -> u32 {
+        self.live.load(Ordering::Relaxed)
+    }
+
+    /// この bucket の read が Column verify を要するか。
+    #[inline]
+    pub fn needs_verify(&self) -> bool {
+        self.removed.load(Ordering::Acquire)
+    }
+
     /// 単一 writer append。 spare があれば in-place、 満杯なら倍化 + epoch 遅延解放。
+    /// (standalone 用。 hot path は `push_in` — lib 内 caller が居なくても API として維持)
+    #[allow(dead_code)]
     pub fn push(&self, eid: u32) {
         let guard = epoch::pin();
         self.push_in(eid, &guard);
