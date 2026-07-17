@@ -93,10 +93,14 @@ impl AppendBucket {
     }
 
     // ──── request12: bucket ローカルメタデータ ────
-    // live/removed は write_lock 下の単一 writer だけが更新する。read 側は
-    // needs_verify を「slice を読む前」に load する (旧 any_removed と同じ
-    // 先読み順序 — 値の線形化点は flag load 時点。Column 側の無同期読みは
-    // 既知の別 issue #100)。
+    // live/removed は write_lock 下の単一 writer だけが更新する。read 側の
+    // verify 要否は `read_snapshot_verify` の 3 段プロトコル (slice → flag →
+    // backing ptr 再検証) で判定する。flag 単独の前読み/後読みはどちらも不健全:
+    // - 前読み: flag=false load 後に積まれた churn 痕 (往復 churn の dup) を
+    //   fast path が素通しする (PR #103 レビューで実証、再現テストあり)
+    // - 後読み: compaction の flag リセットと交差すると旧 backing の stale を
+    //   flag=false で素通しする
+    // Column 側の無同期読みは既知の別 issue #100。
 
     /// live +1。戻り値は増分前 (0 なら「live な値が初めて入った」= unique 判定)。
     #[inline]
@@ -227,6 +231,31 @@ impl AppendBucket {
     pub fn read_to_vec(&self) -> Vec<u32> {
         let guard = epoch::pin();
         self.with_read(&guard, |s| s.to_vec())
+    }
+
+    /// snapshot コピー + verify 要否 (request12)。順序が本質 (PR #103 レビュー):
+    ///
+    /// 1. backing p1 の published slice を copy
+    /// 2. removed flag を load — slice より **後**
+    /// 3. backing p2 を再 load、p1 != p2 なら compaction と交差 → verify
+    ///
+    /// 健全性: churn 痕 (dup / 離脱後 slot と新 slot の混在) を slice で観測した
+    /// なら、その push の len Release-store を Acquire で読んでいる ⇒ writer が
+    /// push より前に立てた flag=true が (2) で見える。flag を false に戻すのは
+    /// compaction だけで、その場合 backing が必ず swap されるので (3) が落とす。
+    /// flag=false && p1==p2 で残る観測遅延は「stale をまだ live と見る」方向のみ
+    /// = 読み開始時点への線形化で正当 (旧 any_removed と同等の許容)。
+    /// guard を (1)-(3) で保持し続けるため旧 backing は解放されず ptr ABA なし。
+    pub fn read_snapshot_verify(&self, guard: &Guard) -> (Vec<u32>, bool) {
+        let p1 = self.backing.load(Ordering::Acquire, guard);
+        // SAFETY: backing は常に非 null。
+        let b = unsafe { p1.deref() };
+        let n = b.len.load(Ordering::Acquire);
+        // SAFETY: [0..n] は publish 済み = 不変。 guard が backing を生存させる。
+        let v = unsafe { b.published(n) }.to_vec();
+        let f = self.removed.load(Ordering::Acquire);
+        let p2 = self.backing.load(Ordering::Acquire, guard);
+        (v, f || p2 != p1)
     }
 
     /// 現在の publish 済み件数（lock-free）。

@@ -6239,7 +6239,9 @@ impl Engine {
     /// fast path に戻す。reader は停止しない (bucket ごとの epoch swap)。
     /// 通常は書き込み時の自動 trigger (stale 率 50%) に任せてよく、これは
     /// 明示的に掃除したい運用・テスト用。紐が未定義なら false。
+    /// mutating API なので readonly / replica open では他の write 系と同様 panic。
     pub fn compact_himo(&self, himo: &str) -> bool {
+        self.check_writable();
         match self.himo_id(himo) {
             Some(idx) => {
                 self.himos[idx].compact_now();

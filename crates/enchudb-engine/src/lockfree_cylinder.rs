@@ -259,8 +259,8 @@ impl LockFreeCylinder {
     }
 
     /// `read_to_vec` + この bucket の read が Column verify を要するか (request12)。
-    /// flag は slice より先に読む — flag load 時点が線形化点で、それ以降の churn は
-    /// 「呼び出し中に起きた並行更新」として次回 read が拾う (旧 any_removed と同じ契約)。
+    /// 判定は `AppendBucket::read_snapshot_verify` の 3 段プロトコル
+    /// (slice → flag → backing ptr 再検証) — 順序の健全性論証はそちらの doc 参照。
     pub fn read_to_vec_verify(&self, value: u32) -> (Vec<u32>, bool) {
         if value < DENSE_CAP {
             let guard = epoch::pin();
@@ -268,9 +268,7 @@ impl LockFreeCylinder {
             // SAFETY: dense は常に非 null。
             let vec = unsafe { arr.deref() };
             if (value as usize) < vec.len() {
-                let b = &vec[value as usize];
-                let needs_verify = b.needs_verify();
-                (b.with_read(&guard, |s| s.to_vec()), needs_verify)
+                vec[value as usize].read_snapshot_verify(&guard)
             } else {
                 (Vec::new(), false)
             }
@@ -281,8 +279,8 @@ impl LockFreeCylinder {
             let b = self.sparse.lock().unwrap().get(&value).cloned();
             match b {
                 Some(b) => {
-                    let needs_verify = b.needs_verify();
-                    (b.read_to_vec(), needs_verify)
+                    let guard = epoch::pin();
+                    b.read_snapshot_verify(&guard)
                 }
                 None => (Vec::new(), false),
             }
@@ -542,6 +540,52 @@ mod tests {
             bytes,
             bytes as f64 / min as f64
         );
+    }
+
+    /// request12 レビュー指摘 (PR #103): fast path は「verify 判定の後に積まれた
+    /// churn 痕」を返してはならない。flag 先読みのみの実装では、reader の
+    /// flag=false load → writer の往復 churn (B→A→B で bucket に [e,e]) →
+    /// slice copy の interleaving で fast path が重複 eid を返す。
+    /// slice → flag → backing ptr 再検証の 3 段プロトコルで防ぐ。
+    #[test]
+    fn fast_path_never_returns_duplicates_under_churn() {
+        let c = Arc::new(LockFreeCylinder::new(0));
+        c.insert(7, 1); // e=7 が v1 に live
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (c, stop) = (c.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    // e を v1 → v0 → v1 と往復 (himo_store の順序契約: flag → 移動)
+                    c.note_stale(1);
+                    c.insert(7, 0);
+                    c.note_stale(0);
+                    c.insert(7, 1);
+                    // Column 相当: e は今 v1 に居る。compact で flag が false に戻り、
+                    // reader が fast path を踏めるようになる (= 検証対象の窓が開く)
+                    c.compact_bucket(0, |_| false);
+                    c.compact_bucket(1, |e| e == 7);
+                }
+            })
+        };
+        let iters = if cfg!(miri) { 300u64 } else { 3_000_000 };
+        let mut fast_reads = 0u64;
+        for _ in 0..iters {
+            let (v, needs_verify) = c.read_to_vec_verify(1);
+            if !needs_verify {
+                fast_reads += 1;
+                // fast path の slice は dup-free でなければならない (verify を通らない)
+                if v.len() > 1 {
+                    let mut s = v.clone();
+                    s.sort_unstable();
+                    s.dedup();
+                    assert_eq!(s.len(), v.len(), "fast path が重複 eid を返した: {v:?}");
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(fast_reads > 0, "fast path を一度も踏まなかった (テストが無効化している)");
     }
 
     #[test]
