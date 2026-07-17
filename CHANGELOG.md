@@ -3,6 +3,38 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.13.2 — 2026-07-17
+
+### Changed — bucket ローカルメタデータ: verify 局所化 + 正確な統計 + incremental compaction (#99)
+
+`AppendBucket` に live counter と removed flag を持たせ、書き込み側が既に読んでいる
+旧値でメンテするようにした。#95 の「churn した himo は read が全 bucket で
+verify + sort + dedup を払い続ける」「unique_count / total / slice_len が stale 込み
+over-count」という 2 つの構造的コストが解消され、#99 (compaction) の実体が入った。
+
+- **verify の bucket 局所化**: churn していない bucket の read は verify-free fast path の
+  まま (旧実装は himo 全体 flag `any_removed` が 1 回の値更新で恒久 ON)。判定は
+  slice → flag → backing ptr 再検証の 3 段プロトコル (`read_snapshot_verify`) で、
+  並行 churn 中の fast path が重複 eid を返さないことを stress テストで保証。
+  churn 後の無傷 value の pull: 520ns → 57ns (-91%)。
+- **統計の live 基準化**: `unique_count` / `total` / `slice_len` が「Column が現在
+  指している数」を返すように (over-count 解消)。**query planner の wrong-result 修正
+  を含む**: 全滅 (all-stale) bucket の raw len が entity 数を超えると 2 条件 query の
+  always-true skip が誤発火し、実際には誰も match しない条件で誤ヒットしていた
+  (regression テスト付き)。insert hot path の atomic RMW 数は従来と同一
+  (total_live は total − stale_total の導出、per-insert 加算なし)。
+- **incremental compaction (#99)**: 書き込み時に stale 率 50% && len ≥ 64 の bucket
+  だけを Column 基準で組み直して epoch swap (readers 非停止)。churn した value の
+  pull: 36.8µs → 1.48µs (25x)。200 eid × 400 往復 churn の backing が 512KB 単調増加
+  → <32KB 有界。明示 API **`Engine::compact_himo(himo: &str) -> bool`** 追加
+  (readonly / replica open では他の write 系 API と同様 panic)。
+- **挙動注記 (非 breaking)**: churn 済み himo の `pull` の返却順が変わり得る。
+  旧実装は churn があると常に sort 済みを返したが、新実装は無傷 / compaction 済み
+  bucket で raw append 順を返す (verify 経路のみ sort+dedup)。順序が必要な場合は
+  呼び出し側で sort すること (`pull_sorted` / 自前 sort — 同梱 crate は全て順序非依存
+  を確認済み)。
+- AppendBucket の「len 単調非減少」契約は撤回 (compaction で縮む)。
+
 ## 0.13.1 — 2026-07-15
 
 ### Fixed — graceful close で clean flag を永続化 (#101): 毎 open の vocab/himo index rebuild を解消

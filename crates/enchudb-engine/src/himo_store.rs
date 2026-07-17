@@ -55,6 +55,11 @@ impl ValueType {
 //   atomic になる）。 pull の verify は Column を直読みするが、 これは #95 とは
 //   別の既知の無同期読みで別 issue（#100 と同時に設計）。
 
+/// incremental compaction (request12 P2) の trigger: これ未満の bucket は
+/// 組み直さない (小 bucket は verify の方が安い)。stale 率 (len-live)/len >= 1/2
+/// と併用。閾値は churn_read ベンチで調整。
+const COMPACT_MIN_LEN: usize = 64;
+
 pub struct HimoStore {
     col: UnsafeCell<Column>,
     cyl: LockFreeCylinder,
@@ -143,31 +148,65 @@ impl HimoStore {
         if old == Some(value) {
             return; // 冗長な re-tie = no-op（bucket に dup を作らない）
         }
-        if old.is_some() {
-            // 値更新: 旧 value の bucket に stale が残る → 以降 read は verify する
-            self.cyl.mark_removed();
+        let mut stale = None;
+        if let Some(o) = old {
+            // 値更新: 旧 value の bucket に stale が残る → その bucket の read は verify する。
+            // Column を書き換える **前** に flag を立てる (request12、順序契約は note_stale 参照)
+            stale = self.cyl.note_stale(o).map(|s| (o, s));
         }
         self.col().set(eid, &(value + 1).to_le_bytes());
         self.cyl.insert(eid, value);
+        // compaction は Column 更新の **後** (keep = value_eq が新状態を見るため)
+        if let Some((o, (len, live))) = stale {
+            self.maybe_compact(o, len, live);
+        }
     }
 
     pub fn remove(&self, eid: u32) {
         if eid < self.col().count() {
             self.ensure_cylinder_built();
             let _w = self.write_lock.lock();
-            let had = self.get_value(eid).is_some();
-            self.col().clear(eid);
-            if had {
-                // 削除: 旧 bucket に stale が残る（Cylinder は触らない、verify で落とす）
-                self.cyl.mark_removed();
+            if let Some(o) = self.get_value(eid) {
+                // 削除: 旧 bucket に stale が残る（Cylinder は触らない、verify で落とす）。
+                // flag → Column の順 (set と同じ)
+                let stale = self.cyl.note_stale(o);
+                self.col().clear(eid);
+                if let Some((len, live)) = stale {
+                    self.maybe_compact(o, len, live);
+                }
             }
         }
     }
 
-    /// 現在の unique 値数。append-only では正確、churn 時は over-count（#95、compaction = #99）。
+    /// stale 率が閾値を超えた bucket を Column 基準で組み直す (request12 P2)。
+    /// write_lock 下・Column 更新後に呼ぶこと。trigger は stale 率 50% なので
+    /// amortized O(1)/write (Vec doubling と同じ理屈 — 組み直し後の stale は 0、
+    /// 次の trigger までに live 相当数の churn が必要)。
+    fn maybe_compact(&self, value: u32, len: usize, live: u32) {
+        if len >= COMPACT_MIN_LEN && (len - live as usize) * 2 >= len {
+            self.cyl.compact_bucket(value, |eid| self.value_eq(eid, value));
+        }
+    }
+
+    /// 全 bucket を Column 基準で即時 compaction する明示 API (運用/テスト用)。
+    /// reader は停止しない (bucket ごとの epoch swap)。
+    pub fn compact_now(&self) {
+        self.ensure_cylinder_built();
+        let _w = self.write_lock.lock();
+        for v in self.cyl.unique_values() {
+            // clean bucket (churn 痕なし) は組み直し不要 — 無条件 swap は巨大 himo で
+            // write_lock の長期保持 + 旧 backing の epoch 滞留 (一時 ~2x RSS) を招く
+            // (PR #103 レビュー)。write_lock 下なので flag 判定は正確。
+            if self.cyl.bucket_needs_verify(v) {
+                self.cyl.compact_bucket(v, |eid| self.value_eq(eid, v));
+            }
+        }
+    }
+
+    /// 現在の unique 値数 (live 基準、churn があっても正確 — request12)。
     pub fn unique_count(&self) -> u32 {
         self.ensure_cylinder_built();
-        self.cyl.unique_count()
+        self.cyl.unique_live()
     }
 
     // ──── 読む（Column 直読み、Cylinder 非依存）────
@@ -226,31 +265,34 @@ impl HimoStore {
         self.col().ensure_count(eid);
         let stored = u32::from_le_bytes(*old_bytes);
         let old = self.get_value(eid);
+        let new = if stored == 0 { None } else { Some(stored - 1) };
+        if old == new {
+            return; // 同値 restore = no-op (bytes も同一)
+        }
+        let mut stale = None;
+        if let Some(o) = old {
+            // flag → Column の順 (set と同じ、request12)
+            stale = self.cyl.note_stale(o).map(|s| (o, s));
+        }
         self.col().set(eid, old_bytes);
-        if stored == 0 {
-            if old.is_some() {
-                self.cyl.mark_removed();
-            }
-        } else {
-            let new_val = stored - 1;
-            if old != Some(new_val) {
-                if old.is_some() {
-                    self.cyl.mark_removed();
-                }
-                self.cyl.insert(eid, new_val);
-            }
+        if let Some(n) = new {
+            self.cyl.insert(eid, n);
+        }
+        if let Some((o, (len, live))) = stale {
+            self.maybe_compact(o, len, live);
         }
     }
 
     // ──── 引く ────
 
-    /// 値に合致する entity。#95: Cylinder の raw を、削除/更新があった himo でのみ
-    /// Column verify + dedup で filter（append-only himo なら raw 直返し = fast path）。
+    /// 値に合致する entity。#95: Cylinder の raw を、削除/更新があった **bucket** でのみ
+    /// Column verify + dedup で filter（churn していない bucket は raw 直返し =
+    /// fast path。request12 で himo 単位 → bucket 単位に局所化）。
     pub fn pull(&self, value: u32) -> Vec<u32> {
         self.ensure_cylinder_built();
-        let raw = self.cyl.read_to_vec(value);
-        if !self.cyl.any_removed() {
-            // append-only: 全 live、dup なし
+        let (raw, needs_verify) = self.cyl.read_to_vec_verify(value);
+        if !needs_verify {
+            // この bucket は append-only: 全 live、dup なし
             raw
         } else {
             // lazy verify: Column で現在値を確認、churn 由来の dup を除去
@@ -277,10 +319,12 @@ impl HimoStore {
         result
     }
 
-    /// bucket 長（raw、stale 込み）。planner の pivot 選択用 heuristic（over-count 可）。
+    /// value の live 件数 (= pull 結果の件数、正確)。planner の pivot 選択用。
+    /// request12 で raw (stale 込み over-count) から live 基準に変更 — churn 後も
+    /// 最小スライスを正しく選べる。
     pub fn slice_len(&self, value: u32) -> usize {
         self.ensure_cylinder_built();
-        self.cyl.slice_len(value)
+        self.cyl.slice_len_live(value)
     }
 
     /// 入っている値を列挙（順序保証なし、churn 時は stale 含む近似）。
@@ -289,10 +333,10 @@ impl HimoStore {
         self.cyl.unique_values()
     }
 
-    /// 総件数（append-only では正確、churn 時は over-count）。
+    /// 総件数 (live 基準、churn があっても正確 — request12)。
     pub fn total(&self) -> usize {
         self.ensure_cylinder_built();
-        self.cyl.total()
+        self.cyl.total_live()
     }
 
     /// Cylinder の eid backing 総 bytes（メモリ観測用、#95）。
