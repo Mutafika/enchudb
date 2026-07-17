@@ -2,27 +2,28 @@
 
 **Embedded graph engine with multi-condition AND in nanoseconds.**
 
-紐 (himo) ベースの円柱エンジンを中核に据えた組み込み DB。単一ファイル mmap、BucketCylinder (値 → eid バケット) で **lookup decision が ns 級**、ロックフリー並行 read。結果の返却は memcpy 律速で結果サイズに比例 (µs スケール、物理限界)。
+紐 (himo) ベースの円柱エンジンを中核に据えた組み込み DB。単一ファイル mmap、LockFreeCylinder (値 → eid バケット) で **lookup decision が ns 級**、ロックフリー並行 read。結果の返却は memcpy 律速で結果サイズに比例 (µs スケール、物理限界)。
 
 その上に **schema / SQL / FFI / 全文検索 / RAG / P2P sync / transport** を積めるワークスペース。
 
 ## なぜ
 
-- **SQLite より速い lookup**: BucketCylinder で値 → eid が ns、多条件 AND がバケット交差で爆速
-- **Rocks / Lmdb と違って relations 持てる**: 紐 + 円柱で graph 的 traversal (Ravn)
-- **Append-only WAL + HLC**: P2P sync (`enchudb-sync`) が built-in、partial sync (`SubscriptionFilter`) も
+- **SQLite より速い lookup**: LockFreeCylinder で値 → eid が ns、多条件 AND がバケット交差で爆速
+- **Rocks / Lmdb と違って relations 持てる**: 紐 + 円柱で entity 間を辿れる (ref 列 + バケット逆引き)
+- **Append-only oplog + HLC**: P2P sync (`enchudb-sync`) が built-in、partial sync (`SubscriptionFilter`) も
 - **メモリフットプリント小**: mmap 単一ファイル、ページキャッシュ依存
 
 ## Workspace
 
 | Crate | 役割 | meta crate での opt-in |
 |---|---|---|
-| [`enchudb-wal`](./crates/enchudb-wal) | append-only WAL、HLC、peer keys。engine / sync / transport の共通 primitive | always |
-| [`enchudb-engine`](./crates/enchudb-engine) | コアストレージエンジン。Cylinder + PairTable + WAL + Ravn | always |
+| [`enchudb-oplog`](./crates/enchudb-oplog) | oplog wire primitives (Hlc / PeerId / EntityId + record)。engine / sync / transport の共通 primitive | always |
+| [`enchudb-engine`](./crates/enchudb-engine) | コアストレージエンジン。Column + LockFreeCylinder + oplog | always |
 | [`enchudb-schema`](./crates/enchudb-schema) | **native API**。 仮想 2D テーブル + himo_id pre-resolve + schema 永続化 | always |
 | [`enchudb-sync`](./crates/enchudb-sync) | HLC-LWW Syncer、ShardRouter、SubscriptionFilter | always |
 | [`enchudb-transport`](./crates/enchudb-transport) | HTTP relay / WebSocket push hub | 直接依存 |
-| [`enchudb-text`](./crates/enchudb-text) | bigram 転置インデックスによる全文検索 | 直接依存 |
+| [`enchudb-textsearch`](./crates/enchudb-textsearch) | ngram の上に乗るテキスト検索ポリシー。候補 doc id + `.contains()` 検証で正確な部分一致 | 直接依存 |
+| [`enchudb-ngram`](./crates/enchudb-ngram) | bigram 転置インデックスの index プリミティブ (posting → intersect → 候補 doc id)、mmap 永続化 | 直接依存 |
 | [`enchudb-rag`](./crates/enchudb-rag) | RAG ストア。メタフィルタ先行 + brute force cosine、ANN 不要 | 直接依存 |
 | [`enchudb-sql`](./crates/enchudb-sql) | SQLite 上位互換の SQL frontend (CRUD + ORDER BY / LIMIT / 範囲 / IS NULL / INSERT OR REPLACE)、 **schema 永続化** | `features = ["sql"]` |
 | [`enchudb-ffi`](./crates/enchudb-ffi) | SQLite 風 C ABI 12 関数、`cdylib + staticlib`、Python / Node / Swift から叩ける土台 | `features = ["ffi"]` |
@@ -182,35 +183,15 @@ enchu> .quit
 
 create preset: `--default` / `--compact` / `--growable` (default) / `--tiny`。
 
-### 耐久性 (WAL)
+### 耐久性 (oplog)
 
 ```rust
-let db = Engine::create_concurrent_with_wal("/tmp/my.db", 256 * 1024 * 1024)?;
+let db = Engine::create_concurrent_with_oplog("/tmp/my.db", 256 * 1024 * 1024)?;
 
 let e = db.entity();
 db.tie_async(e, "age", 30);
-db.wal_sync()?;       // fsync + msync
-// または wal_commit() で背景 fsync (Async モード)
-```
-
-### グラフ辿り (Ravn)
-
-```rust
-use enchudb::Ravn;
-
-let ravn = Ravn::new(db.clone());
-
-// 「Alice が Next.js について話したセッションの決定事項」
-let nextjs       = db.query(&[("name", vocab_id_for("Next.js")), ("kind", 2)]);
-let sessions     = ravn.reverse_follow(&nextjs, "topic");
-let by_alice     = ravn.filter_by(&sessions, "speaker", alice_id);
-let decisions    = ravn.extract_text(&by_alice, "decision");
-```
-
-DSL も使える:
-
-```
-kind:2 name:"Next.js" | reverse topic | where speaker:<alice_eid> | get decision
+db.oplog_sync()?;     // fsync + msync
+// または oplog_commit() で背景 fsync (Async モード)
 ```
 
 ### RAG (`enchudb-rag`)
@@ -247,9 +228,8 @@ cargo run --release --example vs_db
 
 - **紐 (himo)**: entity に張る属性 = 索引の単位、 任意の文字列名 (UTF-8)
 - **Column**: source of truth、 mmap 永続化、 `Column[himo][eid] = value`
-- **BucketCylinder**: 値ごとの eid バケット、 値 → バケット O(1)、 cylinder slice + Column filter で多条件 AND
-- **WAL**: crash consistency、 背景 fsync、 リングバッファ再利用
-- **Ravn**: グラフ辿り DSL、 多段 reverse_follow + filter_by
+- **LockFreeCylinder**: 値ごとの eid バケット、 値 → バケット O(1)、 append-only + epoch で lock-free 並行 read、 cylinder slice + Column filter で多条件 AND
+- **oplog** (`enchudb-oplog`): crash consistency、 背景 fsync、 リングバッファ再利用
 - **仮想 2D テーブル層** (`enchudb-schema`): N 個の紐を 1 つの table 名で束ねる、 col → himo_id を pre-resolve、 schema は DB ファイル内に永続化。 SQL frontend と FFI もこの上に乗る。
 
 メンタルモデル: engine 全体は **モンジャラ** (蔓 = 紐、 entity = 蔓の交差点に隠れた本体)。 1 つの紐の中身は **2D table** (値 × eid バケット)。
@@ -259,8 +239,8 @@ cargo run --release --example vs_db
 ## ファイル構成
 
 ```
-{path}         メイン DB (mmap、 layout v4、 FILE_VERSION 4)
-{path}.wal     WAL (有効時、 sparse file)
+{path}         メイン DB (mmap、 FILE_VERSION 7、 v4/v5/v6 は read 互換)
+{path}.oplog   oplog (有効時、 sparse file)
 {path}.lock    writer 排他 sidecar (writer open 時に flock、 close で release)
 {path}.crc     region CRC (seal_integrity 時のみ)
 <blob_root>/   BlobStore (別ディレクトリ、 content-addressed、 大 blob 外出し用)
@@ -272,7 +252,7 @@ cargo run --release --example vs_db
 
 | やりたい事 | API | lock | 同時 process |
 |---|---|---|---|
-| 書く + 読む | `Engine::open_concurrent_with_wal` / `Engine::open_standalone` | exclusive | 1 |
+| 書く + 読む | `Engine::open_concurrent_with_oplog` / `Engine::open_standalone` | exclusive | 1 |
 | 読むだけ | `Engine::open_readonly` / `Database::open_readonly` | なし | 無制限 |
 
 writer は `.db.lock` sidecar に `flock(LOCK_EX)` を engine 寿命中保持。 2 つ目の writer は drop されるまで block (sqlite default 動作と同じ)。 readonly は lock を取らないので writer と共存可、 write API を呼ぶと panic で即気付く。
