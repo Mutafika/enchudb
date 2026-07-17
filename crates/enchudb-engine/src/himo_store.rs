@@ -194,7 +194,12 @@ impl HimoStore {
         self.ensure_cylinder_built();
         let _w = self.write_lock.lock();
         for v in self.cyl.unique_values() {
-            self.cyl.compact_bucket(v, |eid| self.value_eq(eid, v));
+            // clean bucket (churn 痕なし) は組み直し不要 — 無条件 swap は巨大 himo で
+            // write_lock の長期保持 + 旧 backing の epoch 滞留 (一時 ~2x RSS) を招く
+            // (PR #103 レビュー)。write_lock 下なので flag 判定は正確。
+            if self.cyl.bucket_needs_verify(v) {
+                self.cyl.compact_bucket(v, |eid| self.value_eq(eid, v));
+            }
         }
     }
 

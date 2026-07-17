@@ -227,3 +227,44 @@ fn untouched_value_pull_correct_after_churn() {
     drop(eng);
     fresh(path);
 }
+
+/// planner regression (PR #103 レビューで発見・実測): all-stale bucket が条件に
+/// 入った 2-cond query。master は raw slice_len の over-count で
+/// `slice_lens[i] >= total` の always-true skip が誤発火し、h=1 に誰も居ないのに
+/// g=5 の 3 匹をそのまま返していた (wrong result)。live 基準 pivot で解消。
+#[test]
+fn query_with_all_stale_bucket_returns_empty() {
+    let path = "/tmp/test_req12_planner_stale.db";
+    fresh(path);
+    let mut eng = Engine::create_standalone(path).expect("create");
+    eng.define_himo("g", ValueType::Number, 10);
+    eng.define_himo("h", ValueType::Number, 10);
+
+    let eids: Vec<_> = (0..10).map(|_| eng.entity()).collect();
+    // h=1 の bucket に slot を積みつつ全員 h=2 で終える (1↔2 往復で raw を膨らませ、
+    // h=1 は live 0 の all-stale bucket になる。COMPACT_MIN_LEN 未満なので
+    // compaction は走らず、verify + live-pivot の経路を直接検証する)
+    for v in [1u32, 2, 1, 2] {
+        for &e in &eids {
+            eng.tie(e, "h", v);
+        }
+    }
+    for &e in &eids[..3] {
+        eng.tie(e, "g", 5);
+    }
+
+    // h=1 は誰も居ない → 空が正
+    assert!(
+        eng.query(&[("g", 5), ("h", 1)]).is_empty(),
+        "all-stale bucket 条件の query が誤ヒット (planner の always-true skip 誤発火)"
+    );
+    // 条件順を入れ替えて pivot 側に all-stale が来ても正しい
+    assert!(eng.query(&[("h", 1), ("g", 5)]).is_empty());
+    // live cardinality: h の live 値は {2} のみ
+    assert_eq!(eng.himo_cardinality("h"), Some(1));
+    // 正方向: h=2 ∩ g=5 は 3 匹
+    assert_eq!(eng.query(&[("g", 5), ("h", 2)]).len(), 3);
+
+    drop(eng);
+    fresh(path);
+}

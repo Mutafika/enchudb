@@ -349,6 +349,21 @@ impl LockFreeCylinder {
         }
     }
 
+    /// value の bucket に churn 痕があるか。write_lock 下 (単一 writer) では正確 —
+    /// `compact_now` の clean-bucket skip 判定用。
+    pub fn bucket_needs_verify(&self, value: u32) -> bool {
+        if value < DENSE_CAP {
+            let guard = epoch::pin();
+            let arr = self.dense.load(Ordering::Acquire, &guard);
+            // SAFETY: dense は常に非 null。
+            let vec = unsafe { arr.deref() };
+            (value as usize) < vec.len() && vec[value as usize].needs_verify()
+        } else {
+            let sp = self.sparse.lock().unwrap();
+            sp.get(&value).map(|b| b.needs_verify()).unwrap_or(false)
+        }
+    }
+
     /// cylinder が現在確保している eid backing の総 bytes（pow2 slack 込み、 メモリ観測用）。
     /// append-only なので各 eid は 1 度だけ載る → `total()*4 * (pow2 slack)` に収まる。
     /// double-buffer（2 コピー保持）なら `>= 2x` になるので、 それとの区別に使える。
