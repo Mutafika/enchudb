@@ -3,6 +3,35 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.14.0 — 2026-07-18
+
+### Fixed — `LeafStore` の read-while-write torn read を根絶 (#106): slot gen seqlock
+
+`Leaf` himo を writer 稼働中に別 thread / 別プロセス (`open_readonly` の mmap reader)
+が読むと、 torn read で **silent data corruption** か **OOB panic** が起きていた
+(0.12.0〜0.13.2 全滅、 実測 violation 率 ~0.07%)。 `LeafStore` が #95 (lock-free read) /
+#99 (bucket-local verify) のどちらの保護にも入っていなかったのが穴。 slot ごとの
+**世代カウンタ + seqlock** で in-process / cross-process とも torn を根絶した。
+
+- **slot header 8B→12B (gen 付き)**: 新規 slot は `[slot_size|HAS_GEN][len][gen]` の 12B
+  header。 `slot_size` の bit0 を gen フラグに使う (4-align で本来 0)。 write は
+  gen odd→payload→even (Release)、 read は gen Acquire で g0→copy→再読 g1 一致を確認。
+  gen は store-wide 単調カウンタ由来 (offset 再利用のたび必ず変わる)。
+- **read API `Engine::get_text_owned(eid, himo) -> Option<Vec<u8>>` を追加**: 並行 read
+  する consumer 用の安全版。 gen seqlock + column offset 再読 + bounds clamp で torn/
+  stale/OOB を封じ、 所有 `Vec` を返すので live mmap `&[u8]` の aliasing UB も無い。
+  **借用を返す従来の `get_text` は single-thread / quiesce 前提** (writer 稼働中の Leaf を
+  並行 read する経路は `get_text_owned` へ移行すること — 特に `open_readonly` の
+  cross-process reader)。
+- **format 変更 (LEF1→LEF2)**: 既存 v6/v7 DB は **read 互換** (旧 8B slot はそのまま読め、
+  新規 insert のみ 12B gen slot、 **データ移行不要**)。 ただし新 DB / gen slot を書いた DB は
+  magic が `LEF2` になり、 **旧 engine (≤0.13.2) は open を clean refuse** する
+  (forward-incompatible)。 → minor bump。
+- **leaf footprint**: gen 4B/slot 分わずかに増える (小値 slot が多いほど相対的に効く)。
+- 検証: in-process 66M reads / cross-process (`open_readonly`) 27M reads とも violation 0
+  (決定的、 falsify 済み)。 `tests/issue106_leaf_torn_read.rs` /
+  `tests/issue106_leaf_cross_process.rs`。
+
 ## 0.13.2 — 2026-07-17
 
 ### Changed — bucket ローカルメタデータ: verify 局所化 + 正確な統計 + incremental compaction (#99)
