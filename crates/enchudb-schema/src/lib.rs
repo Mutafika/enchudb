@@ -309,6 +309,27 @@ impl Database {
         Self::wrap_new(eng)
     }
 
+    /// growable backing + **Leaf データ領域サイズ**を明示。 大量の Leaf text
+    /// (chunk 本文 / tool 出力 / 長文備考など) を持つアプリで default 512 MiB の
+    /// leaf 領域 cap に当たる場合に使う。 leaf 領域は create 時に固定確保 (auto-grow
+    /// しない) なので、 本文総量から余裕を持って見積もる。 `leaf_scale` は既定
+    /// `Gb16` (= leaf_data_size は 16 GiB まで指定可)。
+    pub fn create_growable_with_leaf(
+        path: &str,
+        max_entities: u32,
+        leaf_data_size: usize,
+    ) -> Result<Self, SchemaError> {
+        let eng = Engine::create_growable_with_leaf(
+            path,
+            max_entities,
+            None,
+            Some(leaf_data_size),
+            enchudb_engine::LeafScale::Gb16,
+        )
+        .map_err(|e| SchemaError::Io(e.to_string()))?;
+        Self::wrap_new(eng)
+    }
+
     fn wrap_new(eng: Engine) -> Result<Self, SchemaError> {
         // 0.8.2: build phase の sidecar fsync を coalesce (= define_table /
         // define_himo_in が毎回呼ぶ try_persist_tables を no-op 化)。
