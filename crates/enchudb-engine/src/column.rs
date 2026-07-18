@@ -57,6 +57,24 @@ impl Column {
         &mm[off..off + vs]
     }
 
+    /// #106: 4B 値を Release で publish する (leaf offset 用)。 `load_u32_acquire` と対で、
+    /// この offset を書く *前* の書込 (= LeafStore slot の payload/gen) の可視性を保証する。
+    /// これが無いと reader が「新 offset は見えるが leaf slot はまだ stale」を掴み、
+    /// seqlock (gen) を stale 値で誤通過して torn read になる。 value_size==4 前提。
+    #[inline]
+    pub fn store_u32_release(&self, entity_id: u32, v: u32) {
+        let off = HEADER + (entity_id as usize) * (self.value_size as usize);
+        self.region.as_atomic_u32(off).store(v, Ordering::Release);
+        self.region.mark_dirty(off, 4);
+    }
+
+    /// #106: 4B 値を Acquire で読む (`store_u32_release` と対)。 value_size==4 前提。
+    #[inline]
+    pub fn load_u32_acquire(&self, entity_id: u32) -> u32 {
+        let off = HEADER + (entity_id as usize) * (self.value_size as usize);
+        self.region.as_atomic_u32(off).load(Ordering::Acquire)
+    }
+
     /// 0.8.6: u32 packed value slice。 SIMD 集計 / 全件 scan 用の fast path。
     /// `value_size == 4` (= Number / Tag / Leaf 等の通常 himo) でのみ意味あり。
     /// 戻り値の長さは `count()`、 stored 形式 (= 0 = 未設定、 N = 値 N-1)。
