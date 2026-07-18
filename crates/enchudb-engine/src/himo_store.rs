@@ -154,7 +154,9 @@ impl HimoStore {
             // Column を書き換える **前** に flag を立てる (request12、順序契約は note_stale 参照)
             stale = self.cyl.note_stale(o).map(|s| (o, s));
         }
-        self.col().set(eid, &(value + 1).to_le_bytes());
+        // #106: Release store。 leaf offset を publish する前に書いた LeafStore slot
+        // (payload/gen) を、 offset を Acquire で読む reader が必ず観測できるようにする。
+        self.col().store_u32_release(eid, value + 1);
         self.cyl.insert(eid, value);
         // compaction は Column 更新の **後** (keep = value_eq が新状態を見るため)
         if let Some((o, (len, live))) = stale {
@@ -215,7 +217,9 @@ impl HimoStore {
         if eid >= self.col().count() {
             return None;
         }
-        let stored = u32::from_le_bytes(self.col().get(eid).try_into().unwrap());
+        // #106: Acquire load。 writer の `store_u32_release` と対で、 leaf offset を
+        // 掴んだら対応する LeafStore slot の payload/gen も必ず観測できるようにする。
+        let stored = self.col().load_u32_acquire(eid);
         if stored == 0 {
             None
         } else {

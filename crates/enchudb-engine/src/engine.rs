@@ -753,7 +753,7 @@ use crate::vocabulary::Vocabulary;
 use crate::entity_set::EntitySet;
 use crate::himo_store::{HimoStore, ValueType};
 use crate::content_store::ContentStore;
-use crate::leaf_store::{LeafStore, cap_bytes_for_shift, MAX_OFF_SHIFT};
+use crate::leaf_store::{LeafRead, LeafStore, cap_bytes_for_shift, MAX_OFF_SHIFT};
 use crate::column::Column;
 
 // ════════════════ ギャロッピング交差 ════════════════
@@ -4399,13 +4399,19 @@ impl Engine {
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
-        // v6 (#88): Leaf は LeafStore へ (vocab の vid は使わない)。 re-tie 上書きは
-        // 旧 offset を free してから insert (leak 防止)。 sync は bytes 同乗 TieLeaf。
+        // v6 (#88): Leaf は LeafStore へ (vocab の vid は使わない)。 sync は bytes 同乗 TieLeaf。
+        // #106: 書込順は insert(新 slot) → set(column publish) → free(旧 slot) の順。
+        //   - 旧: free → insert (best-fit で旧 slot 即再利用) → set だと、 reader が
+        //     set 前に握った旧 offset が別世代 bytes に上書きされ torn read になった。
+        //   - 新: 新 slot は誰も参照しない状態で payload を書き切ってから column を
+        //     publish するので in-place 上書きが消える。 旧 slot は最後に free するので、
+        //     旧 offset を掴んだ reader は column 再読 (get_text_owned) で stale を検出。
         if let Some(leaf) = self.leaf_for(hid) {
             let bytes = value.as_bytes();
-            if let Some(old) = self.himos[hid].get_value(eid) { leaf.free(old); }
+            let old = self.himos[hid].get_value(eid);
             let off = leaf.insert(bytes);
             self.himos[hid].set(eid, off);
+            if let Some(old) = old { leaf.free(old); }
             if let Some(wal) = self.oplog.as_ref() {
                 let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
                 let _ = wal.append(enchudb_oplog::oplog::Op::TieLeaf {
@@ -4777,6 +4783,50 @@ impl Engine {
                 let raw = self.himos[hid].get_value(eid)?;
                 Some(self.text_value(hid, raw))
             }
+            _ => None,
+        }
+    }
+
+    /// #106: read-while-write でも torn read しない安全な text 取得 (所有 copy 返し)。
+    ///
+    /// - **Leaf (routed)**: LeafStore の live mmap を `try_read` (slot gen seqlock) で
+    ///   bounds-safe に copy し、 さらに copy の前後で column offset を再読して一致する
+    ///   まで retry する。 これで (a) 別 offset への relocation = column 変化、
+    ///   (b) 同 offset 再利用 / in-place torn = slot gen 変化、 の両方を検出する。
+    ///   破れた slot を掴んでも `try_read` が `Retry` を返すので panic しない。
+    /// - **Tag / reserved Leaf**: append-only vocab は不変なので copy のみ (retry 不要)。
+    ///
+    /// 借用を返す [`get_text`] は writer 稼働中の Leaf に対しては aliasing UB になる
+    /// ため、 並行 read する consumer は本 API を使う。
+    pub fn get_text_owned(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Option<Vec<u8>> {
+        let eid = enchudb_oplog::eid_local(eid);
+        let hid = self.himo_id(himo)?;
+        match self.value_types[hid] {
+            ValueType::Tag | ValueType::Leaf => match self.leaf_for(hid) {
+                // routed-Leaf: seqlock verify で torn read / stale を排除。
+                Some(leaf) => {
+                    // churn が極端でも収束する上限。 同 eid は次の re-tie まで offset
+                    // 不変なので実運用では 1〜2 回で確定する。
+                    const MAX_TRY: usize = 64;
+                    for _ in 0..MAX_TRY {
+                        let raw = self.himos[hid].get_value(eid)?;
+                        // slot 内の seqlock (gen) で torn / 同 offset 再利用を検出。
+                        let LeafRead::Ok(bytes) = leaf.try_read(raw) else { continue };
+                        // column offset を再読。 不変なら relocation も無かった = 確定。
+                        // (slot gen が同 offset 再利用を、 column 再読が別 offset への
+                        //  relocation を担当し、 併せて torn/stale を封じる。)
+                        if self.himos[hid].get_value(eid) == Some(raw) {
+                            return Some(bytes);
+                        }
+                    }
+                    None
+                }
+                // Tag / reserved Leaf: 不変な vocab bytes を copy。
+                None => {
+                    let raw = self.himos[hid].get_value(eid)?;
+                    Some(self.vocab.get(raw).to_vec())
+                }
+            },
             _ => None,
         }
     }

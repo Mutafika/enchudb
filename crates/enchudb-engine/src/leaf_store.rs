@@ -55,14 +55,26 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use crate::region::Region;
 
+/// v6/v7 の leaf region magic (8B header slot)。 read は今も受理。
 const MAGIC: [u8; 4] = [b'L', b'E', b'F', b'1'];
+/// #106 (gen seqlock) を書ける region の magic (12B header slot を含みうる)。
+/// 新規 DB はこちら。 旧 engine は magic assert で clean refuse (forward-incompat)。
+const MAGIC_GEN: [u8; 4] = [b'L', b'E', b'F', b'2'];
 /// header: MAGIC(4) + high_water word(4) + off_shift(1) + reserved(3)
 const HEADER: usize = 12;
 const HIGH_WATER_OFF: usize = 4;
 /// off_shift を書く byte (v6 region は予約ゼロ = 0 = byte offset)。
 const SHIFT_OFF: usize = 8;
-/// slot 先頭の [slot_size:4][len:4] (どちらも byte)
+/// legacy slot 先頭の [slot_size:4][len:4] (どちらも byte)。 slot_size は 4-align で
+/// bit0 は常に 0 = legacy 標識。
 const SLOT_HEADER: usize = 8;
+/// #106: gen 付き slot 先頭の [slot_size|HAS_GEN:4][len:4][gen:4]。 slot_size の
+/// bit0(HAS_GEN) が 1 の slot は gen 付き = 12B header。
+const SLOT_HEADER_GEN: usize = 12;
+/// gen field の slot 内 byte offset (= legacy payload の開始位置に重なる)。
+const GEN_OFF: usize = 8;
+/// slot_size の bit0。 4-align で本来 0 なので、 1 を「gen 付き 12B header」の標識に使う。
+const HAS_GEN: u32 = 1;
 /// 最小 slot (空 payload = header のみ、 byte)。 これ未満の余りは hole にできない。
 const MIN_SLOT: usize = SLOT_HEADER;
 /// off_shift の上限 (16B align = 64GB)。 これ以上は padding 過大で不許可。
@@ -87,6 +99,13 @@ pub struct LeafStore {
     holes: Mutex<BTreeMap<u32, u32>>,
     /// byte_off = word_off << off_shift。 0 = byte offset (v6 互換)。
     off_shift: u32,
+    /// #106: slot gen seqlock 用の store-wide 単調カウンタ。 insert ごとに +2 した
+    /// **偶数** を新 slot の gen に焼く。 offset ごとに再利用のたび必ず異なる値になるので、
+    /// 旧 offset を掴んだ reader が seqlock で再利用/torn を検出できる。 payload バイトから
+    /// 導出すると 'x' filler 等で衝突する (それが #106 の torn 残渣だった) ため、
+    /// 独立カウンタにする。 in-memory (writer 単一プロセス内で単調)。 wrap は 2^31 insert
+    /// 毎 = reader の read 窓 (µs) では衝突しない。
+    gen_seq: std::sync::atomic::AtomicU32,
 }
 
 // Region は raw ptr を持つため。 vocab / entity_set と同じ扱い (writer 排他は
@@ -94,16 +113,28 @@ pub struct LeafStore {
 unsafe impl Sync for LeafStore {}
 unsafe impl Send for LeafStore {}
 
+/// #106: `try_read` の結果。 `Retry` は torn/stale の可能性 = 呼び側で column
+/// offset を再読して loop する合図。
+pub enum LeafRead {
+    Ok(Vec<u8>),
+    Retry,
+}
+
 impl LeafStore {
     /// 新規領域を初期化。 `off_shift` (0/2/3/4) で region cap を選ぶ。
     /// high_water = 最初の aligned slot 位置 (word)。
     pub fn init(region: Region, off_shift: u32) -> Self {
         assert!(off_shift <= MAX_OFF_SHIFT, "off_shift {} > {}", off_shift, MAX_OFF_SHIFT);
-        let s = Self { region, holes: Mutex::new(BTreeMap::new()), off_shift };
+        let s = Self {
+            region,
+            holes: Mutex::new(BTreeMap::new()),
+            off_shift,
+            gen_seq: std::sync::atomic::AtomicU32::new(0),
+        };
         let data_start = s.data_start_byte();
         let _ = s.region.ensure_committed(data_start);
         let mm = s.region.slice_mut();
-        mm[0..4].copy_from_slice(&MAGIC);
+        mm[0..4].copy_from_slice(&MAGIC_GEN); // #106: 新規は gen 対応 magic
         mm[SHIFT_OFF] = off_shift as u8;
         s.high_water_atomic().store(s.b2w(data_start), Ordering::Relaxed);
         s
@@ -114,10 +145,18 @@ impl LeafStore {
     /// を呼ぶまで reclaim は効かない (fresh append のみ)。
     pub fn load(region: Region) -> Self {
         let mm = region.slice();
-        assert!(mm.len() >= HEADER && mm[0..4] == MAGIC, "bad leaf store magic");
+        assert!(
+            mm.len() >= HEADER && (mm[0..4] == MAGIC || mm[0..4] == MAGIC_GEN),
+            "bad leaf store magic"
+        );
         let off_shift = mm[SHIFT_OFF] as u32;
         assert!(off_shift <= MAX_OFF_SHIFT, "leaf store corrupt: off_shift {}", off_shift);
-        Self { region, holes: Mutex::new(BTreeMap::new()), off_shift }
+        Self {
+            region,
+            holes: Mutex::new(BTreeMap::new()),
+            off_shift,
+            gen_seq: std::sync::atomic::AtomicU32::new(0),
+        }
     }
 
     /// この store の cell offset shift (0 = byte / v6 互換、 2/3/4 = 16/32/64GB)。
@@ -156,28 +195,122 @@ impl LeafStore {
         (self.hw_words() as u64) << self.off_shift
     }
 
-    /// word offset の slot が占める **byte** slot_size。
+    /// word offset の slot が占める **byte** slot_size。 gen 付き slot は bit0(HAS_GEN)
+    /// が立つので必ず mask して実 size を返す (real slot_size は 4-align で bit0=0)。
     #[inline]
     fn slot_size_bytes_at(&self, word_off: u32) -> u32 {
         let mm = self.region.slice();
         let o = self.w2b(word_off);
-        u32::from_le_bytes(mm[o..o + 4].try_into().unwrap())
+        u32::from_le_bytes(mm[o..o + 4].try_into().unwrap()) & !HAS_GEN
     }
 
-    /// slot 先頭 (word offset) から payload を読む。
+    /// この slot の header 長 (gen 付き = 12B、 legacy = 8B) を bit0 で判定。
+    #[inline]
+    fn header_len(ss_raw: u32) -> usize {
+        if ss_raw & HAS_GEN != 0 { SLOT_HEADER_GEN } else { SLOT_HEADER }
+    }
+
+    /// slot 先頭 (word offset) から payload を読む。 **single-thread / quiesce 前提**
+    /// (live mmap への参照を返す)。 read-while-write する経路は `try_read` を使う。
     pub fn get(&self, word_off: u32) -> &[u8] {
         let mm = self.region.slice();
         let o = self.w2b(word_off);
+        let ss_raw = u32::from_le_bytes(mm[o..o + 4].try_into().unwrap());
+        let hdr = Self::header_len(ss_raw);
         let len = u32::from_le_bytes(mm[o + 4..o + 8].try_into().unwrap()) as usize;
-        &mm[o + SLOT_HEADER..o + SLOT_HEADER + len]
+        &mm[o + hdr..o + hdr + len]
+    }
+
+    /// #106: read-while-write でも安全に payload の一貫 snapshot を **copy** して返す
+    /// (seqlock read)。 live mmap への参照を返さないので aliasing UB が無い。
+    ///
+    /// - **gen 付き slot (12B)**: gen を Acquire で読み (偶数=stable)、 copy 後に
+    ///   fence(Acquire) + gen 再読して一致を確認。 writer が同 slot を上書き/再利用
+    ///   していれば gen が変わる (odd 中 or 別の even) ので `Retry` を返す。
+    /// - **legacy slot (8B)**: writer 側は今後 gen 付き slot しか書かないので、 legacy
+    ///   slot は不変 (freed→再利用時に gen 付き 12B に化ける)。 ss を copy 前後で
+    ///   再読し、 変化 (= bit0 が立った = 再利用) なら `Retry`。
+    /// - bounds を全て検証し、 破れた len を掴んでも panic せず `Retry`。
+    ///
+    /// `Retry` は「stale/torn の可能性」= 呼び側 (engine `get_text_owned`) が column
+    /// offset を再読して loop する合図。
+    pub fn try_read(&self, word_off: u32) -> LeafRead {
+        let mm = self.region.slice();
+        let o = self.w2b(word_off);
+        let Some(h8) = o.checked_add(SLOT_HEADER) else { return LeafRead::Retry };
+        if h8 > mm.len() {
+            return LeafRead::Retry;
+        }
+        // header field は **atomic load** で読む。 plain な `&[u8]` slice 読みは
+        // 「不変」とコンパイラに誤認され、 並行 writer 下 (data race) で再順序化/
+        // 重複除去され seqlock を破る。 as_atomic_u32 で volatile 相当にする。
+        let ss0 = self.region.as_atomic_u32(o).load(Ordering::Relaxed);
+
+        if ss0 & HAS_GEN != 0 {
+            // ── gen 付き 12B slot: seqlock ──
+            // 鉄則: gen(g0) を **先に** 読み、 slot_size / len / payload は **すべて g0 の
+            // 後・g1 の前** に読む。 こうしないと slot field が seqlock の外に漏れ、
+            // 世代跨ぎ (slot_size と len の不整合) で torn を通す。
+            let Some(h12) = o.checked_add(SLOT_HEADER_GEN) else { return LeafRead::Retry };
+            if h12 > mm.len() {
+                return LeafRead::Retry;
+            }
+            let gen_at = self.region.as_atomic_u32(o + GEN_OFF);
+            let g0 = gen_at.load(Ordering::Acquire);
+            if g0 & 1 != 0 {
+                return LeafRead::Retry; // odd = writer が書込中
+            }
+            // ここから全 field を g0 の後で atomic load する。
+            let ss = self.region.as_atomic_u32(o).load(Ordering::Relaxed);
+            if ss & HAS_GEN == 0 {
+                return LeafRead::Retry; // g0 直後に legacy 化 = 再利用途中
+            }
+            let slot_size = (ss & !HAS_GEN) as usize;
+            let len = self.region.as_atomic_u32(o + 4).load(Ordering::Relaxed) as usize;
+            if len > slot_size.saturating_sub(SLOT_HEADER_GEN) {
+                return LeafRead::Retry;
+            }
+            let Some(end) = h12.checked_add(len) else { return LeafRead::Retry };
+            if end > mm.len() {
+                return LeafRead::Retry;
+            }
+            // payload は memcpy (opaque) で copy。
+            let bytes = mm[h12..end].to_vec();
+            // data read が gen 再読より前で確定するよう Acquire fence を挟む。
+            std::sync::atomic::fence(Ordering::Acquire);
+            let g1 = gen_at.load(Ordering::Acquire);
+            if g1 != g0 {
+                return LeafRead::Retry; // copy 中に上書き/再利用された
+            }
+            LeafRead::Ok(bytes)
+        } else {
+            // ── legacy 8B slot (不変・再利用時のみ 12B へ化ける) ──
+            let slot_size = ss0 as usize;
+            let len = self.region.as_atomic_u32(o + 4).load(Ordering::Relaxed) as usize;
+            if len > slot_size.saturating_sub(SLOT_HEADER) {
+                return LeafRead::Retry;
+            }
+            let Some(end) = h8.checked_add(len) else { return LeafRead::Retry };
+            if end > mm.len() {
+                return LeafRead::Retry;
+            }
+            let bytes = mm[h8..end].to_vec();
+            std::sync::atomic::fence(Ordering::Acquire);
+            let ss1 = self.region.as_atomic_u32(o).load(Ordering::Relaxed);
+            if ss1 != ss0 {
+                return LeafRead::Retry; // 再利用されて 12B 化 = stale
+            }
+            LeafRead::Ok(bytes)
+        }
     }
 
     /// payload を格納し slot 先頭 **word offset** を返す。 free-list に嵌まる空きが
     /// あればそこへ、 無ければ high_water を伸ばす。
     pub fn insert(&self, bytes: &[u8]) -> u32 {
         let blen = bytes.len();
-        assert!(blen <= (u32::MAX as usize - SLOT_HEADER), "leaf value too large");
-        let need_bytes = self.align_slot(SLOT_HEADER + blen);
+        assert!(blen <= (u32::MAX as usize - SLOT_HEADER_GEN), "leaf value too large");
+        // #106: 新規 slot は常に gen 付き 12B header。
+        let need_bytes = self.align_slot(SLOT_HEADER_GEN + blen);
         let need_words = self.b2w(need_bytes);
 
         let mut holes = self.holes.lock().unwrap_or_else(|p| p.into_inner());
@@ -187,10 +320,35 @@ impl LeafStore {
         let byte_off = self.w2b(word_off);
         let slot_bytes = self.w2b(slot_words);
         let _ = self.region.ensure_committed(byte_off + slot_bytes);
+
+        // #106: store-wide 単調カウンタから新 gen (偶数) を採る。 offset ごとに再利用の
+        // たび必ず異なる値になるので、 旧 offset を掴んだ reader が seqlock で torn/再利用を
+        // 検出できる。 payload バイト由来だと 'x' filler 等で衝突する (torn 残渣の原因)。
+        let gen_atomic = self.region.as_atomic_u32(byte_off + GEN_OFF);
+        let g = self.gen_seq.fetch_add(2, Ordering::Relaxed).wrapping_add(2); // even
+
         let mm = self.region.slice_mut();
-        mm[byte_off..byte_off + 4].copy_from_slice(&(slot_bytes as u32).to_le_bytes());
+        // 1. slot_size に HAS_GEN を立てて「gen 付き 12B」と標識 (+ 実 size)。
+        mm[byte_off..byte_off + 4].copy_from_slice(&((slot_bytes as u32) | HAS_GEN).to_le_bytes());
+        // 2. gen を odd に (書込開始マーカ)。
+        gen_atomic.store(g | 1, Ordering::Relaxed);
+        // 3. Release fence: odd + ss の書込を payload 書込より前に順序づける。 これが
+        //    無いと weak-memory (ARM) で payload の plain write が odd store より先に
+        //    reader へ可視化し、 reader が「g0=旧even, torn payload, g1=旧even」を掴んで
+        //    torn を通す穴になる (標準 seqlock の begin fence)。
+        std::sync::atomic::fence(Ordering::Release);
+        // 4. len + payload。
         mm[byte_off + 4..byte_off + 8].copy_from_slice(&(blen as u32).to_le_bytes());
-        mm[byte_off + SLOT_HEADER..byte_off + SLOT_HEADER + blen].copy_from_slice(bytes);
+        mm[byte_off + SLOT_HEADER_GEN..byte_off + SLOT_HEADER_GEN + blen].copy_from_slice(bytes);
+        // 5. gen を even=g に (Release publish)。 reader の Acquire fence と対で payload の
+        //    可視性を保証。
+        gen_atomic.store(g, Ordering::Release);
+
+        // legacy magic の DB に初めて gen slot を書いたら magic を upgrade (forward-incompat)。
+        if mm[0..4] != MAGIC_GEN {
+            mm[0..4].copy_from_slice(&MAGIC_GEN);
+            self.region.mark_dirty(0, 4);
+        }
         self.region.mark_dirty(byte_off, slot_bytes);
         self.region.mark_dirty(HIGH_WATER_OFF, 4);
         word_off
@@ -364,9 +522,10 @@ mod tests {
         let s2 = make_store_shift(64 * 1024, 2);
         let a2 = s2.insert(b"x");
         assert_eq!(a2, 3, "shift2 は word offset (12>>2=3)");
-        // 2 個目の handle 差分は need_words 単位 ("x" → slot 12B = 3 word)
+        // 2 個目の handle 差分は need_words 単位。 #106: gen 付き 12B header なので
+        // "x" (1B) → slot = align4(12+1) = 16B = 4 word。
         let b2 = s2.insert(b"y");
-        assert_eq!(b2 - a2, 3, "handle 増分は word 単位");
+        assert_eq!(b2 - a2, 4, "handle 増分は word 単位");
         // それでも payload は正しく往復
         assert_eq!(s2.get(a2), b"x");
         assert_eq!(s2.get(b2), b"y");
