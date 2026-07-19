@@ -198,9 +198,9 @@ impl LeafStore {
     /// が立つので必ず mask して実 size を返す (real slot_size は 4-align で bit0=0)。
     #[inline]
     fn slot_size_bytes_at(&self, word_off: u32) -> u32 {
-        let mm = self.region.slice();
+        // #113: slot_size は writer が atomic store するので atomic load で読む (uniform)。
         let o = self.w2b(word_off);
-        u32::from_le_bytes(mm[o..o + 4].try_into().unwrap()) & !HAS_GEN
+        self.region.as_atomic_u32(o).load(Ordering::Relaxed) & !HAS_GEN
     }
 
     /// この slot の header 長 (gen 付き = 12B、 legacy = 8B) を bit0 で判定。
@@ -234,15 +234,15 @@ impl LeafStore {
     /// `Retry` は「stale/torn の可能性」= 呼び側 (engine `get_text_owned`) が column
     /// offset を再読して loop する合図。
     pub fn try_read(&self, word_off: u32) -> LeafRead {
-        let mm = self.region.slice();
+        let region_len = self.region.len();
         let o = self.w2b(word_off);
         let Some(h8) = o.checked_add(SLOT_HEADER) else { return LeafRead::Retry };
-        if h8 > mm.len() {
+        if h8 > region_len {
             return LeafRead::Retry;
         }
-        // header field は **atomic load** で読む。 plain な `&[u8]` slice 読みは
-        // 「不変」とコンパイラに誤認され、 並行 writer 下 (data race) で再順序化/
-        // 重複除去され seqlock を破る。 as_atomic_u32 で volatile 相当にする。
+        // header field も payload も **atomic load** で読む (#113: read_atomic)。 plain な
+        // slice 読みは「不変」とコンパイラに誤認され、 並行 writer 下 (data race = UB) で
+        // 再順序化/重複除去され seqlock を破る。 atomic なら writer の atomic store と対で健全。
         let ss0 = self.region.as_atomic_u32(o).load(Ordering::Relaxed);
 
         if ss0 & HAS_GEN != 0 {
@@ -251,7 +251,7 @@ impl LeafStore {
             // 後・g1 の前** に読む。 こうしないと slot field が seqlock の外に漏れ、
             // 世代跨ぎ (slot_size と len の不整合) で torn を通す。
             let Some(h12) = o.checked_add(SLOT_HEADER_GEN) else { return LeafRead::Retry };
-            if h12 > mm.len() {
+            if h12 > region_len {
                 return LeafRead::Retry;
             }
             let gen_at = self.region.as_atomic_u32(o + GEN_OFF);
@@ -270,11 +270,12 @@ impl LeafStore {
                 return LeafRead::Retry;
             }
             let Some(end) = h12.checked_add(len) else { return LeafRead::Retry };
-            if end > mm.len() {
+            if end > region_len {
                 return LeafRead::Retry;
             }
-            // payload は memcpy (opaque) で copy。
-            let bytes = mm[h12..end].to_vec();
+            // payload を relaxed-atomic で copy (#113: writer の write_atomic と対で data
+            // race 除去)。 h12 = byte_off + 12 は 4B aligned。
+            let bytes = self.region.read_atomic(h12, len);
             // data read が gen 再読より前で確定するよう Acquire fence を挟む。
             std::sync::atomic::fence(Ordering::Acquire);
             let g1 = gen_at.load(Ordering::Acquire);
@@ -290,10 +291,11 @@ impl LeafStore {
                 return LeafRead::Retry;
             }
             let Some(end) = h8.checked_add(len) else { return LeafRead::Retry };
-            if end > mm.len() {
+            if end > region_len {
                 return LeafRead::Retry;
             }
-            let bytes = mm[h8..end].to_vec();
+            // h8 = byte_off + 8 も 4B aligned。 legacy slot は不変だが uniform に atomic read。
+            let bytes = self.region.read_atomic(h8, len);
             std::sync::atomic::fence(Ordering::Acquire);
             let ss1 = self.region.as_atomic_u32(o).load(Ordering::Relaxed);
             if ss1 != ss0 {
@@ -326,21 +328,25 @@ impl LeafStore {
         let gen_atomic = self.region.as_atomic_u32(byte_off + GEN_OFF);
         let g = self.gen_seq.fetch_add(2, Ordering::Relaxed).wrapping_add(2); // even
 
-        // #83: 書込は全て `write_at` (raw ptr, `&mut [u8]` を作らない)。 gen_atomic と
-        // 同じ `&self` で interior-mutate するので aliasing 参照が発生しない。 順序は
-        // plain store のままなので下の Release fence / gen store の seqlock 契約は不変。
-        // 1. slot_size に HAS_GEN を立てて「gen 付き 12B」と標識 (+ 実 size)。
-        self.region.write_at(byte_off, &((slot_bytes as u32) | HAS_GEN).to_le_bytes());
+        // #113: ss / len / payload は reader が atomic load するので writer も **atomic
+        // store** で書く (plain 書きだと plain-write vs atomic-read の data race = UB で、
+        // weak-memory で稀に seqlock を破る #106 残渣になる)。 relaxed でも下の fence(Release)
+        // + gen の Release store が可視性順序を与えるので seqlock は健全 (Boehm の fence 版)。
+        // 1. slot_size に HAS_GEN を立てて「gen 付き 12B」と標識 (+ 実 size)。 byte_off は
+        //    slot align (>=4B) なので 4B aligned。
+        self.region
+            .as_atomic_u32(byte_off)
+            .store((slot_bytes as u32) | HAS_GEN, Ordering::Relaxed);
         // 2. gen を odd に (書込開始マーカ)。
         gen_atomic.store(g | 1, Ordering::Relaxed);
-        // 3. Release fence: odd + ss の書込を payload 書込より前に順序づける。 これが
-        //    無いと weak-memory (ARM) で payload の plain write が odd store より先に
-        //    reader へ可視化し、 reader が「g0=旧even, torn payload, g1=旧even」を掴んで
-        //    torn を通す穴になる (標準 seqlock の begin fence)。
+        // 3. Release fence: odd + ss の書込を payload 書込より前に順序づける (標準 seqlock の
+        //    begin fence)。 これが無いと reader が「g0=旧even, torn payload, g1=旧even」を通す。
         std::sync::atomic::fence(Ordering::Release);
-        // 4. len + payload。
-        self.region.write_at(byte_off + 4, &(blen as u32).to_le_bytes());
-        self.region.write_at(byte_off + SLOT_HEADER_GEN, bytes);
+        // 4. len + payload (relaxed-atomic)。
+        self.region
+            .as_atomic_u32(byte_off + 4)
+            .store(blen as u32, Ordering::Relaxed);
+        self.region.write_atomic(byte_off + SLOT_HEADER_GEN, bytes);
         // 5. gen を even=g に (Release publish)。 reader の Acquire fence と対で payload の
         //    可視性を保証。
         gen_atomic.store(g, Ordering::Release);
@@ -372,7 +378,9 @@ impl LeafStore {
                 // split: 余りを hole として登録 (byte slot_size header を書いて walkable に)
                 let roff = hoff + need_words;
                 let rbyte = self.w2b(roff);
-                self.region.write_at(rbyte, &(self.w2b(remainder) as u32).to_le_bytes());
+                // #113: slot_size は reader が as_atomic_u32 で読むので atomic store
+                // (stale reader が split remainder を try_read しても data race にしない)。
+                self.region.as_atomic_u32(rbyte).store(self.w2b(remainder) as u32, Ordering::Relaxed);
                 holes.insert(roff, remainder);
                 (hoff, need_words)
             } else {
@@ -416,9 +424,11 @@ impl LeafStore {
             self.set_hw_words(hoff);
             self.region.mark_dirty(HIGH_WATER_OFF, 4);
         } else {
-            // merged header (byte slot_size) を書いて walkable 維持 + free-list 登録
+            // merged header (byte slot_size) を書いて walkable 維持 + free-list 登録。
+            // #113: slot_size は reader (stale offset を掴んだ try_read) が as_atomic_u32 で
+            // 読むので atomic store で書き、 plain-write vs atomic-read の data race を避ける。
             let hbyte = self.w2b(hoff);
-            self.region.write_at(hbyte, &(self.w2b(hsize) as u32).to_le_bytes());
+            self.region.as_atomic_u32(hbyte).store(self.w2b(hsize) as u32, Ordering::Relaxed);
             self.region.mark_dirty(hbyte, 4);
             holes.insert(hoff, hsize);
         }
@@ -466,8 +476,9 @@ impl LeafStore {
         if off + size == hw {
             self.set_hw_words(off);
         } else {
+            // #113: uniform に atomic store (rebuild は open 時単一スレッドだが reader 規約に揃える)。
             let obyte = self.w2b(off);
-            self.region.write_at(obyte, &(self.w2b(size) as u32).to_le_bytes());
+            self.region.as_atomic_u32(obyte).store(self.w2b(size) as u32, Ordering::Relaxed);
             holes.insert(off, size);
         }
     }
