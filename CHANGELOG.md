@@ -3,6 +3,39 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.14.2 — 2026-07-20
+
+soundness 2 件。 いずれも公開 API / on-disk format は不変 (patch)。
+
+### Fixed — `Region::slice_mut(&self)` を撤廃、 sound な write API に置換 (#83 option 2)
+
+0.14.1 (#83) は clippy gate を `#[allow(clippy::mut_from_ref)]` で green にしただけの
+band-aid だった。 本 release で soundness の本筋を完遂: `&self` から `&mut [u8]` を返す
+`Region::slice_mut` (safe code から aliasing UB を作れる) を **完全撤廃**し、 `&mut [u8]` を
+一切実体化しない write API へ 26 call site を移行した。
+
+- 追加 API: `write_at` (raw ptr memcpy) / `fill_at` (memset) / `as_atomic_u8` (slot flag) /
+  `as_mut_slice(&mut self)` (排他借用版、 open 時 rebuild 専用)。 いずれも `&self` からの
+  long-lived な mutable alias を作らない。
+- `column` / `cylinder` / `entity_set` / `content_store` / `leaf_store` / `vocabulary` の
+  slice_mut を全廃。 vocabulary `rebuild_index` は `&mut self` + 分割借用に。
+- `cargo clippy --workspace --all-targets` = 0 error (理由付き `#[allow]` も不要に)。
+- engine.rs `Backing::slice_mut_shared` / `header_mut` の同種置換は別 follow-up。
+
+### Fixed — #106 seqlock の残存 torn read を根絶 (#113): payload を relaxed-atomic 化
+
+#106 (0.14.0) の gen seqlock 後も、 `issue106_leaf_torn_read` は aarch64 で **~1e-8/read**
+の torn read が残っていた (reader/writer が payload を **plain memcpy** 同士で読み書き =
+形式上 data race UB、 weak-memory で稀に seqlock を突破)。 seqlock が触る全 field
+(`slot_size` / `len` / `payload` / free-slot header) を **relaxed-atomic** 化して data race を
+除去した。 fence / gen の Release/Acquire は #106 のままなので順序契約は不変
+(Boehm の fence 版 seqlock が relaxed-atomic data で成立)。
+
+- Region に `write_atomic` / `read_atomic` (4B aligned bulk は `AtomicU32`、 端数 `AtomicU8`)。
+- 検証: master ~50% run fail → 本 fix **12/12 PASS / CORRUPT 0**。 reader だけ plain へ戻すと
+  CORRUPT 再発 (1/6) で load-bearing を falsify 実証。 `issue106_leaf_torn_read` が信頼できる
+  regression guard に昇格。 slot layout は不変 = **format 変更なし**。
+
 ## 0.14.1 — 2026-07-19
 
 ### Added — schema `Database::create_growable_with_leaf` (#109)
