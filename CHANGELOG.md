@@ -3,6 +3,26 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.14.1 — 2026-07-19
+
+### Added — schema `Database::create_growable_with_leaf` (#109)
+
+schema `Database` に Leaf データ領域サイズを指定する
+`create_growable_with_leaf(path, max_entities, leaf_data_size)` を追加。 vocab 版
+`create_growable_with_options` に対する Leaf 版で、 大量 Leaf text (chunk 本文 /
+tool 出力 / 長文備考) を持つアプリが default 512 MiB を溢れる場合に使う。
+`Engine::create_growable_with_leaf` を wrap (`LeafScale::Gb16` = `leaf_data_size` は
+16 GiB まで指定可)。 round-trip + reopen 永続 + cap 超過 reject の test 付き。
+
+### Fixed — clippy gate を green に戻す (#83)
+
+CI の `cargo clippy --all-targets` が deny lint で全滅し、 workspace の clippy gate が
+赤いままだった問題を解消。 `query_lang::apply_stages` の `while` を `if` に
+(許可 stage 列は先頭で分岐確定 = 構造上 1 周のみ = `never_loop`、 挙動不変)、
+`Region::slice_mut` / vocabulary test helper の `mut_from_ref` を理由明記で局所
+`#[allow]`。 soundness の本筋 (`&mut [u8]` 返し廃止 = `write_at`/`ptr` 置換) は #83 に
+P2 として残す。 `cargo clippy --workspace --all-targets` = 0 error。
+
 ## 0.14.0 — 2026-07-18
 
 ### Fixed — `LeafStore` の read-while-write torn read を根絶 (#106): slot gen seqlock
