@@ -6,7 +6,7 @@
 //! までの commit を要求できる。 store 側 (vocabulary / content_store / cylinder)
 //! が data_end を進める前に呼ぶのが期待されるパターン。
 
-use std::sync::atomic::{AtomicU8, AtomicU32};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
@@ -120,6 +120,64 @@ impl Region {
         unsafe {
             std::ptr::write_bytes(self.ptr.add(off), val, len);
         }
+    }
+
+    /// `off..off+src.len()` を **relaxed-atomic** で書く (#113 seqlock payload 用)。
+    /// reader の `read_atomic` と対で、 payload の plain-vs-plain data race (= 形式上 UB、
+    /// weak-memory で稀に seqlock を破る #106 残渣) を除去する。 relaxed でも writer 側の
+    /// `fence(Release)` + gen の Release store が可視性順序を与えるので seqlock は健全。
+    /// 4B aligned の bulk は `AtomicU32`、 端数 (<4B) は `AtomicU8`。
+    ///
+    /// # Panics
+    /// - `off + src.len() > len`、 または `off % 4 != 0` (payload 開始は 4B aligned 前提)
+    #[inline]
+    pub fn write_atomic(&self, off: usize, src: &[u8]) {
+        assert!(
+            off + src.len() <= self.len,
+            "write_atomic out of range: {} + {} > {}",
+            off,
+            src.len(),
+            self.len
+        );
+        assert!(off % 4 == 0, "write_atomic off {} not 4-byte aligned", off);
+        let n = src.len();
+        let words = n / 4;
+        for w in 0..words {
+            let b = w * 4;
+            let v = u32::from_le_bytes([src[b], src[b + 1], src[b + 2], src[b + 3]]);
+            self.as_atomic_u32(off + b).store(v, Ordering::Relaxed);
+        }
+        for b in (words * 4)..n {
+            self.as_atomic_u8(off + b).store(src[b], Ordering::Relaxed);
+        }
+    }
+
+    /// `off..off+len` を **relaxed-atomic** で読み `Vec` に copy する (#113)。 `write_atomic`
+    /// と対で payload の data race を除去。 live mmap への参照ではなく copy を返すので
+    /// aliasing UB も無い。 4B aligned bulk は `AtomicU32`、 端数は `AtomicU8`。
+    ///
+    /// # Panics
+    /// - `off + len > self.len`、 または `off % 4 != 0`
+    #[inline]
+    pub fn read_atomic(&self, off: usize, len: usize) -> Vec<u8> {
+        assert!(
+            off + len <= self.len,
+            "read_atomic out of range: {} + {} > {}",
+            off,
+            len,
+            self.len
+        );
+        assert!(off % 4 == 0, "read_atomic off {} not 4-byte aligned", off);
+        let mut out = Vec::with_capacity(len);
+        let words = len / 4;
+        for w in 0..words {
+            let v = self.as_atomic_u32(off + w * 4).load(Ordering::Relaxed);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for b in (words * 4)..len {
+            out.push(self.as_atomic_u8(off + b).load(Ordering::Relaxed));
+        }
+        out
     }
 
     /// 排他 (`&mut self`) な可変 slice。 `&mut self` を握れる時点でこの Region への
