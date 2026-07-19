@@ -78,7 +78,14 @@ impl Region {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
+    // `mut_from_ref` (deny by default): `&self` から `&mut [u8]` を返すのは通常 aliasing
+    // UB の温床。 本 store は「単一 writer プロセス + in-process は各 store の Mutex /
+    // append-only + epoch 規約」で同時可変 alias を出さない運用不変式で回している
+    // (`unsafe impl Sync` と同じ前提)。 これは *型* 不変式ではなく運用規約なので、
+    // long-lived な mutable alias を実体化しない API (`write_at` / `ptr`) への置換が
+    // 本筋 (issue #83 の option 2、 P2)。 それまでは理由明記で lint を局所 allow する。
     #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
     pub fn slice_mut(&self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }

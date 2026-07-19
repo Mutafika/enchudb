@@ -222,38 +222,39 @@ fn apply_stages(eng: &Engine, eids: Vec<enchudb_oplog::EntityId>, stages: &[&str
         return QueryResult::Entities(eids);
     }
 
-    // group は intermediate state を作る。group の直後の stage は per-group aggregation。
-    let mut idx = 0;
-    while idx < stages.len() {
-        let stage = stages[idx];
-        let (op, arg) = split_stage(stage);
-        match op {
-            "group" => {
-                let group_himo = arg.ok_or("group: needs himo");
-                let group_himo = match group_himo {
-                    Ok(h) => h,
-                    Err(e) => return QueryResult::Error(e.into()),
-                };
-                // 次のステージで集計を選ぶ
-                let next = stages.get(idx + 1).copied().unwrap_or("count");
-                let (next_op, next_arg) = split_stage(next);
-                let result = apply_group(eng, &eids, group_himo, next_op, next_arg);
-                // group は 2 stage 消費（自分 + 直後）。直後がなければ count 扱い。
-                if stages.get(idx + 1).is_some() { idx += 2; } else { idx += 1; }
-                if idx < stages.len() {
-                    return QueryResult::Error(format!("unexpected stage after group: {}", stages[idx]));
-                }
-                return result;
+    // 許可される stage 列は [simple] / [group] / [group, agg] のみなので、 先頭 stage を
+    // 見れば分岐が確定する (旧実装は while だが構造上 1 周しか回らず never_loop に該当、
+    // issue #83)。 stages は空でないことをこの時点で保証済み。
+    let stage = stages[0];
+    let (op, arg) = split_stage(stage);
+    match op {
+        "group" => {
+            let group_himo = match arg.ok_or("group: needs himo") {
+                Ok(h) => h,
+                Err(e) => return QueryResult::Error(e.into()),
+            };
+            // 次のステージで集計を選ぶ
+            let next = stages.get(1).copied().unwrap_or("count");
+            let (next_op, next_arg) = split_stage(next);
+            let result = apply_group(eng, &eids, group_himo, next_op, next_arg);
+            // group は 2 stage 消費（自分 + 直後）。直後がなければ count 扱い。
+            let consumed = if stages.get(1).is_some() { 2 } else { 1 };
+            if consumed < stages.len() {
+                return QueryResult::Error(format!(
+                    "unexpected stage after group: {}", stages[consumed]
+                ));
             }
-            _ => {
-                if idx != stages.len() - 1 {
-                    return QueryResult::Error(format!("stage `{op}` must be last (only `group` chains)"));
-                }
-                return apply_simple(eng, &eids, op, arg);
+            result
+        }
+        _ => {
+            if stages.len() != 1 {
+                return QueryResult::Error(format!(
+                    "stage `{op}` must be last (only `group` chains)"
+                ));
             }
+            apply_simple(eng, &eids, op, arg)
         }
     }
-    QueryResult::Entities(eids)
 }
 
 fn split_stage(stage: &str) -> (&str, Option<&str>) {
