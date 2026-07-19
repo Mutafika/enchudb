@@ -51,8 +51,7 @@ impl ContentStore {
     /// 出しで lazy 初期化する (Phase B Step 2)。 これで growable backing
     /// の `initial_commit` が data 領域を含まなくて済む。
     pub fn init(index: Region, data: Region) -> Self {
-        let im = index.slice_mut();
-        im[0..4].copy_from_slice(&MAGIC);
+        index.write_at(0, &MAGIC);
         Self { index, data }
     }
 
@@ -101,23 +100,22 @@ impl ContentStore {
             .data
             .ensure_committed((data_off + len) as usize);
         let _ = self.index.ensure_committed(off + 8);
-        let dm = self.data.slice_mut();
-        if (data_off + len) as usize > dm.len() {
+        let data_len = self.data.len();
+        if (data_off + len) as usize > data_len {
             // data領域溢れ — fetch_addを巻き戻してパニック
             self.data_end().fetch_sub(len, Ordering::Relaxed);
-            panic!("ContentStore data overflow: {} + {} > {}", data_off, len, dm.len());
+            panic!("ContentStore data overflow: {} + {} > {}", data_off, len, data_len);
         }
         // MAGIC は lazy — ここで毎回書く (idempotent、 4 byte copy)。
-        dm[0..4].copy_from_slice(&MAGIC);
-        dm[data_off as usize..(data_off + len) as usize].copy_from_slice(content);
+        self.data.write_at(0, &MAGIC);
+        self.data.write_at(data_off as usize, content);
         // request3: MAGIC + content 範囲を dirty
         self.data.mark_dirty(0, 4);
         self.data.mark_dirty(data_off as usize, len as usize);
 
-        let im = self.index.slice_mut();
-        if off + 8 <= im.len() {
-            im[off..off + 4].copy_from_slice(&data_off.to_le_bytes());
-            im[off + 4..off + 8].copy_from_slice(&len.to_le_bytes());
+        if off + 8 <= self.index.len() {
+            self.index.write_at(off, &data_off.to_le_bytes());
+            self.index.write_at(off + 4, &len.to_le_bytes());
             self.index.mark_dirty(off, 8);
         }
     }
@@ -141,9 +139,8 @@ impl ContentStore {
     pub fn remove(&self, eid: u32, key: &str) {
         let kh = Self::key_hash(key);
         let off = Self::index_offset(eid, kh);
-        let im = self.index.slice_mut();
-        if off + 8 <= im.len() {
-            im[off..off + 8].fill(0);
+        if off + 8 <= self.index.len() {
+            self.index.fill_at(off, 8, 0);
             self.index.mark_dirty(off, 8);
         }
     }

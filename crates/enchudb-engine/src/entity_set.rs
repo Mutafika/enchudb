@@ -55,8 +55,7 @@ impl EntitySet {
         let region_total = Self::region_size(max_entities);
 
         let _ = region.ensure_committed(region_total);
-        let mm = region.slice_mut();
-        mm[0..4].copy_from_slice(&MAGIC);
+        region.write_at(0, &MAGIC);
         // next_eid = 0, live_count = 0 (already zero from fresh region)
 
         Self { region, max_entities, bitset_offset, free_offset,
@@ -108,13 +107,13 @@ impl EntitySet {
     /// slot を読み得た)。
     fn allocate_from_free_stack(&self) -> u32 {
         let _g = self.free_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let mm = self.region.slice_mut();
+        let mm = self.region.slice();
         let free_count_off = self.free_offset;
         let fc = u32::from_le_bytes(mm[free_count_off..free_count_off + 4].try_into().unwrap());
         assert!(fc > 0, "entity limit reached: max_entities={}, no free slots", self.max_entities);
         let eid_off = self.free_offset + 4 + ((fc - 1) as usize) * 4;
         let eid = u32::from_le_bytes(mm[eid_off..eid_off + 4].try_into().unwrap());
-        mm[free_count_off..free_count_off + 4].copy_from_slice(&(fc - 1).to_le_bytes());
+        self.region.write_at(free_count_off, &(fc - 1).to_le_bytes());
         self.set_bit(eid, true);
         self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
         // EntitySet 全領域は body_msync 内で常時 msync (issue6 perf 対策)。
@@ -130,14 +129,15 @@ impl EntitySet {
         self.live_count_atomic().fetch_sub(1, Ordering::Relaxed);
 
         let _g = self.free_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let mm = self.region.slice_mut();
         let free_count_off = self.free_offset;
-        let fc = u32::from_le_bytes(mm[free_count_off..free_count_off + 4].try_into().unwrap());
+        let fc = u32::from_le_bytes(
+            self.region.slice()[free_count_off..free_count_off + 4].try_into().unwrap(),
+        );
         let free_cap = (FREE_STACK_MAX as usize).min(self.max_entities as usize) as u32;
         if fc < free_cap {
             let eid_off = self.free_offset + 4 + (fc as usize) * 4;
-            mm[eid_off..eid_off + 4].copy_from_slice(&eid.to_le_bytes());
-            mm[free_count_off..free_count_off + 4].copy_from_slice(&(fc + 1).to_le_bytes());
+            self.region.write_at(eid_off, &eid.to_le_bytes());
+            self.region.write_at(free_count_off, &(fc + 1).to_le_bytes());
         }
         // EntitySet 全領域は body_msync 内で常時 msync (issue6 perf 対策)。
     }

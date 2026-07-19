@@ -20,10 +20,9 @@ unsafe impl Send for Column {}
 
 impl Column {
     pub fn init(region: Region, value_size: u32, max_entities: u32) -> Self {
-        let mm = region.slice_mut();
-        mm[0..4].copy_from_slice(&0u32.to_le_bytes());
-        mm[4..8].copy_from_slice(&value_size.to_le_bytes());
-        mm[8..12].copy_from_slice(&max_entities.to_le_bytes());
+        region.write_at(0, &0u32.to_le_bytes());
+        region.write_at(4, &value_size.to_le_bytes());
+        region.write_at(8, &max_entities.to_le_bytes());
         Self { region, count: AtomicU32::new(0), value_size, max_entities }
     }
 
@@ -44,8 +43,7 @@ impl Column {
         let vs = self.value_size as usize;
         let off = HEADER + (entity_id as usize) * vs;
         let len = value.len().min(vs);
-        let mm = self.region.slice_mut();
-        mm[off..off + len].copy_from_slice(&value[..len]);
+        self.region.write_at(off, &value[..len]);
         self.region.mark_dirty(off, len);
     }
 
@@ -97,8 +95,7 @@ impl Column {
     pub fn clear(&self, entity_id: u32) {
         let vs = self.value_size as usize;
         let off = HEADER + (entity_id as usize) * vs;
-        let mm = self.region.slice_mut();
-        for b in &mut mm[off..off + vs] { *b = 0; }
+        self.region.fill_at(off, vs, 0);
         self.region.mark_dirty(off, vs);
     }
 
@@ -108,19 +105,16 @@ impl Column {
     pub fn ensure_count(&self, eid: u32) {
         let needed = eid + 1;
         self.count.fetch_max(needed, Ordering::Relaxed);
-        // mmapヘッダにも書く
-        let mm = self.region.slice_mut();
-        // ヘッダの count は rebuild/flush 時に確定するので、ここでは最大値を書く
-        let current = u32::from_le_bytes(mm[0..4].try_into().unwrap());
+        // mmapヘッダにも書く。 count は rebuild/flush 時に確定するので、ここでは最大値。
+        let current = u32::from_le_bytes(self.region.slice()[0..4].try_into().unwrap());
         if needed > current {
-            mm[0..4].copy_from_slice(&needed.to_le_bytes());
+            self.region.write_at(0, &needed.to_le_bytes());
         }
     }
 
     /// flush用: 現在のcountをmmapヘッダに書き出す。
     pub fn sync_count(&self) {
         let c = self.count.load(Ordering::Relaxed);
-        let mm = self.region.slice_mut();
-        mm[0..4].copy_from_slice(&c.to_le_bytes());
+        self.region.write_at(0, &c.to_le_bytes());
     }
 }
