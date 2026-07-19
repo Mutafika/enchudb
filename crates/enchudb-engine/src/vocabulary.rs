@@ -448,6 +448,9 @@ mod tests {
 
     /// index 領域を直接叩くための helper。
     impl Regions {
+        // test 専用 helper。 Region::slice_mut と同じ運用不変式 (単一 writer) の下で
+        // torn write を模すため生ポインタから可変 slice を作る (issue #83)。
+        #[allow(clippy::mut_from_ref)]
         fn index_mut(&self) -> &mut [u8] {
             unsafe { std::slice::from_raw_parts_mut(self.index_ptr, self.index_len) }
         }
