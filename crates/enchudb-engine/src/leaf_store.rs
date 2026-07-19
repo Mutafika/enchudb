@@ -133,9 +133,8 @@ impl LeafStore {
         };
         let data_start = s.data_start_byte();
         let _ = s.region.ensure_committed(data_start);
-        let mm = s.region.slice_mut();
-        mm[0..4].copy_from_slice(&MAGIC_GEN); // #106: 新規は gen 対応 magic
-        mm[SHIFT_OFF] = off_shift as u8;
+        s.region.write_at(0, &MAGIC_GEN); // #106: 新規は gen 対応 magic
+        s.region.write_at(SHIFT_OFF, &[off_shift as u8]);
         s.high_water_atomic().store(s.b2w(data_start), Ordering::Relaxed);
         s
     }
@@ -327,9 +326,11 @@ impl LeafStore {
         let gen_atomic = self.region.as_atomic_u32(byte_off + GEN_OFF);
         let g = self.gen_seq.fetch_add(2, Ordering::Relaxed).wrapping_add(2); // even
 
-        let mm = self.region.slice_mut();
+        // #83: 書込は全て `write_at` (raw ptr, `&mut [u8]` を作らない)。 gen_atomic と
+        // 同じ `&self` で interior-mutate するので aliasing 参照が発生しない。 順序は
+        // plain store のままなので下の Release fence / gen store の seqlock 契約は不変。
         // 1. slot_size に HAS_GEN を立てて「gen 付き 12B」と標識 (+ 実 size)。
-        mm[byte_off..byte_off + 4].copy_from_slice(&((slot_bytes as u32) | HAS_GEN).to_le_bytes());
+        self.region.write_at(byte_off, &((slot_bytes as u32) | HAS_GEN).to_le_bytes());
         // 2. gen を odd に (書込開始マーカ)。
         gen_atomic.store(g | 1, Ordering::Relaxed);
         // 3. Release fence: odd + ss の書込を payload 書込より前に順序づける。 これが
@@ -338,15 +339,15 @@ impl LeafStore {
         //    torn を通す穴になる (標準 seqlock の begin fence)。
         std::sync::atomic::fence(Ordering::Release);
         // 4. len + payload。
-        mm[byte_off + 4..byte_off + 8].copy_from_slice(&(blen as u32).to_le_bytes());
-        mm[byte_off + SLOT_HEADER_GEN..byte_off + SLOT_HEADER_GEN + blen].copy_from_slice(bytes);
+        self.region.write_at(byte_off + 4, &(blen as u32).to_le_bytes());
+        self.region.write_at(byte_off + SLOT_HEADER_GEN, bytes);
         // 5. gen を even=g に (Release publish)。 reader の Acquire fence と対で payload の
         //    可視性を保証。
         gen_atomic.store(g, Ordering::Release);
 
         // legacy magic の DB に初めて gen slot を書いたら magic を upgrade (forward-incompat)。
-        if mm[0..4] != MAGIC_GEN {
-            mm[0..4].copy_from_slice(&MAGIC_GEN);
+        if self.region.slice()[0..4] != MAGIC_GEN {
+            self.region.write_at(0, &MAGIC_GEN);
             self.region.mark_dirty(0, 4);
         }
         self.region.mark_dirty(byte_off, slot_bytes);
@@ -371,8 +372,7 @@ impl LeafStore {
                 // split: 余りを hole として登録 (byte slot_size header を書いて walkable に)
                 let roff = hoff + need_words;
                 let rbyte = self.w2b(roff);
-                let mm = self.region.slice_mut();
-                mm[rbyte..rbyte + 4].copy_from_slice(&(self.w2b(remainder) as u32).to_le_bytes());
+                self.region.write_at(rbyte, &(self.w2b(remainder) as u32).to_le_bytes());
                 holes.insert(roff, remainder);
                 (hoff, need_words)
             } else {
@@ -418,8 +418,7 @@ impl LeafStore {
         } else {
             // merged header (byte slot_size) を書いて walkable 維持 + free-list 登録
             let hbyte = self.w2b(hoff);
-            let mm = self.region.slice_mut();
-            mm[hbyte..hbyte + 4].copy_from_slice(&(self.w2b(hsize) as u32).to_le_bytes());
+            self.region.write_at(hbyte, &(self.w2b(hsize) as u32).to_le_bytes());
             self.region.mark_dirty(hbyte, 4);
             holes.insert(hoff, hsize);
         }
@@ -468,8 +467,7 @@ impl LeafStore {
             self.set_hw_words(off);
         } else {
             let obyte = self.w2b(off);
-            let mm = self.region.slice_mut();
-            mm[obyte..obyte + 4].copy_from_slice(&(self.w2b(size) as u32).to_le_bytes());
+            self.region.write_at(obyte, &(self.w2b(size) as u32).to_le_bytes());
             holes.insert(off, size);
         }
     }

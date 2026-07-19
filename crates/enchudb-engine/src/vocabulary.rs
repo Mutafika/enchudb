@@ -58,9 +58,8 @@ impl Vocabulary {
         let index_cap = index_cap.next_power_of_two();
 
         // index header — eager init は固定 cluster なのでコスト低
-        let xm = index.slice_mut();
-        xm[0..4].copy_from_slice(&INDEX_MAGIC);
-        xm[4..8].copy_from_slice(&index_cap.to_le_bytes());
+        index.write_at(0, &INDEX_MAGIC);
+        index.write_at(4, &index_cap.to_le_bytes());
 
         Self {
             data, offsets, index,
@@ -117,7 +116,14 @@ impl Vocabulary {
                 let mut shadow = vec![0u8; size].into_boxed_slice();
                 shadow[0..4].copy_from_slice(&INDEX_MAGIC);
                 shadow[4..8].copy_from_slice(&v.index_cap.to_le_bytes());
-                Self::rebuild_index_into(&v, &mut shadow);
+                Self::rebuild_index_into(
+                    &v.offsets,
+                    &v.data,
+                    v.count.load(Ordering::Relaxed),
+                    v.index_cap,
+                    v.max_entries,
+                    &mut shadow,
+                );
                 v.shadow_index = Some(shadow);
             } else {
                 v.rebuild_index();
@@ -128,8 +134,16 @@ impl Vocabulary {
 
     /// ハッシュインデックスを data/offsets から再構築する (writer 専用、
     /// 共有 mmap 上の index を in-place で書き直す)。
-    fn rebuild_index(&self) {
-        Self::rebuild_index_into(self, self.index.slice_mut());
+    ///
+    /// #83: `index` を **排他借用** (`&mut self.index` → `as_mut_slice`) して可変
+    /// slice を得る。 open 時の単一スレッド実行なので排他が保証され、 `slice_mut(&self)`
+    /// のような aliasing 参照を作らない。 `offsets`/`data` は分割借用で不変参照する。
+    fn rebuild_index(&mut self) {
+        let count = self.count.load(Ordering::Relaxed);
+        let index_cap = self.index_cap;
+        let max_entries = self.max_entries;
+        let Self { index, offsets, data, .. } = self;
+        Self::rebuild_index_into(offsets, data, count, index_cap, max_entries, index.as_mut_slice());
     }
 
     /// `xm` (index layout のバイト列、 mmap でも heap でも可) へ index を
@@ -156,13 +170,23 @@ impl Vocabulary {
     ///   `slot_hash == h` でも `get(vid)` を呼ばず読み飛ばす guard を入れる。 get が
     ///   offsets region を溢れて OOB するのを防ぐ = 旧 zero-fill と同じ安全性を復元。
     ///   lookup / index_insert も同じ predicate で一貫させる。
-    fn rebuild_index_into(v: &Self, xm: &mut [u8]) {
-        let count = v.count.load(Ordering::Relaxed);
+    ///
+    /// #83: `&Self` ではなく必要な region (`offsets`/`data`) + scalar を直接受ける。
+    /// これで呼び出し側が `index` を `&mut` 借用したまま (writer 経路) でも分割借用
+    /// で呼べる。 heap shadow (readonly) 経路とも `xm: &mut [u8]` で共有できて DRY。
+    fn rebuild_index_into(
+        offsets: &Region,
+        data: &Region,
+        count: u32,
+        index_cap: u32,
+        max_entries: u32,
+        xm: &mut [u8],
+    ) {
         if count == 0 { return; }
 
-        let mask = (v.index_cap - 1) as u64;
+        let mask = (index_cap - 1) as u64;
         for id in 0..count {
-            let value = v.get(id);
+            let value = read_value(offsets, data, id);
             let h = fxhash(value);
             let mut idx = (h & mask) as usize;
             loop {
@@ -176,10 +200,10 @@ impl Vocabulary {
                 let slot_hash = u64::from_le_bytes(xm[off + 1..off + 9].try_into().unwrap());
                 if slot_hash == h {
                     let vid = u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap());
-                    // #92: vid >= max_entries の破損 slot は get(vid) が offsets region を
+                    // #92: vid >= max_entries の破損 slot は read_value(vid) が offsets region を
                     // 溢れて OOB するので dup 判定に使わず読み飛ばす (lookup / index_insert と
                     // 同じ predicate = 破損 slot の扱いを 3 経路で一貫させる)。
-                    if vid < v.max_entries && v.get(vid) == value { break; } // 真の重複 (Leaf 二重 append 等)
+                    if vid < max_entries && read_value(offsets, data, vid) == value { break; } // 真の重複 (Leaf 二重 append 等)
                 }
                 idx = ((idx as u64 + 1) & mask) as usize;
             }
@@ -198,12 +222,7 @@ impl Vocabulary {
 
     #[inline]
     pub fn get(&self, id: u32) -> &[u8] {
-        let om = self.offsets.slice();
-        let off_pos = (id as usize) * 8;
-        let offset = u32::from_le_bytes(om[off_pos..off_pos + 4].try_into().unwrap()) as usize;
-        let len = u32::from_le_bytes(om[off_pos + 4..off_pos + 8].try_into().unwrap()) as usize;
-        let dm = self.data.slice();
-        &dm[offset..offset + len]
+        read_value(&self.offsets, &self.data, id)
     }
 
     #[inline]
@@ -252,26 +271,24 @@ impl Vocabulary {
         let _ = self
             .offsets
             .ensure_committed(((id as usize) + 1) * 8);
-        let dm = self.data.slice_mut();
-        dm[offset as usize..offset as usize + len as usize].copy_from_slice(value);
-        dm[0..4].copy_from_slice(&MAGIC);
+        self.data.write_at(offset as usize, value);
+        self.data.write_at(0, &MAGIC);
         let new_count = id + 1;
         let new_end = offset + len;
-        dm[4..8].copy_from_slice(&new_count.to_le_bytes());
-        dm[8..12].copy_from_slice(&new_end.to_le_bytes());
+        self.data.write_at(4, &new_count.to_le_bytes());
+        self.data.write_at(8, &new_end.to_le_bytes());
         self.data.mark_dirty(0, 12);
         // #77-M1: flush() が clean=1 を書いた後の最初の insert で 0 に戻す。
         // これが無いと flush 後の write 中 crash で、 次 open が部分 writeback
         // された index を rebuild なしで信用してしまう。
         if self.clean_on_disk.swap(false, Ordering::AcqRel) {
-            dm[CLEAN_FLAG_OFF..CLEAN_FLAG_OFF + 4].copy_from_slice(&0u32.to_le_bytes());
+            self.data.write_at(CLEAN_FLAG_OFF, &0u32.to_le_bytes());
             self.data.mark_dirty(CLEAN_FLAG_OFF, 4);
         }
         self.data.mark_dirty(offset as usize, len as usize);
-        let om = self.offsets.slice_mut();
         let off_pos = (id as usize) * 8;
-        om[off_pos..off_pos + 4].copy_from_slice(&offset.to_le_bytes());
-        om[off_pos + 4..off_pos + 8].copy_from_slice(&len.to_le_bytes());
+        self.offsets.write_at(off_pos, &offset.to_le_bytes());
+        self.offsets.write_at(off_pos + 4, &len.to_le_bytes());
         self.offsets.mark_dirty(off_pos, 8);
         self.index_insert(value, id);
         id
@@ -279,20 +296,19 @@ impl Vocabulary {
 
     fn index_insert(&self, value: &[u8], id: u32) {
         let mask = (self.index_cap - 1) as u64;
-        let xm = self.index.slice_mut();
         let h = fxhash(value);
         let mut idx = (h & mask) as usize;
         loop {
             let off = INDEX_HEADER + idx * INDEX_SLOT_SIZE;
-            let flag = unsafe {
-                &*(xm.as_ptr().add(off) as *const std::sync::atomic::AtomicU8)
-            };
+            // #83: slot flag は Region 経由の AtomicU8 で直接触る (`&mut [u8]` を
+            // 実体化しない)。 hash/id の書込も write_at (raw ptr)。
+            let flag = self.index.as_atomic_u8(off);
             let f = flag.load(Ordering::Acquire);
             if f == 0 {
                 match flag.compare_exchange(0, 2, Ordering::AcqRel, Ordering::Relaxed) {
                     Ok(_) => {
-                        xm[off + 1..off + 9].copy_from_slice(&h.to_le_bytes());
-                        xm[off + 9..off + 13].copy_from_slice(&id.to_le_bytes());
+                        self.index.write_at(off + 1, &h.to_le_bytes());
+                        self.index.write_at(off + 9, &id.to_le_bytes());
                         flag.store(1, Ordering::Release);
                         self.index.mark_dirty(off, INDEX_SLOT_SIZE);
                         return;
@@ -301,13 +317,22 @@ impl Vocabulary {
                 }
             }
             if f == 2 {
-                while flag.load(Ordering::Acquire) == 2 { std::hint::spin_loop(); }
+                while self.index.as_atomic_u8(off).load(Ordering::Acquire) == 2 {
+                    std::hint::spin_loop();
+                }
                 continue;
             }
-            let slot_hash = u64::from_le_bytes(xm[off + 1..off + 9].try_into().unwrap());
+            // f == 1 (committed): hash/id は flag=1 の Release publish より前に書かれ、
+            // 上の flag Acquire load と対で可視。 slice() で読む。
+            let (slot_hash, vid) = {
+                let xm = self.index.slice();
+                (
+                    u64::from_le_bytes(xm[off + 1..off + 9].try_into().unwrap()),
+                    u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap()),
+                )
+            };
             if slot_hash == h {
-                // ハッシュ一致 → 実際の値を比較して本当に重複か確認
-                let vid = u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap());
+                // ハッシュ一致 → 実際の値を比較して本当に重複か確認。
                 // #92: vid >= max_entries の破損 slot は get(vid) が OOB するので
                 // 読み飛ばす (実 insert は vid < max_entries を保証 = 通常運用では常に
                 // 通過。 max_entries は不変で並行 insert を skip しない = dedup race 無)。
@@ -328,9 +353,8 @@ impl Vocabulary {
 
     /// 内部状態をRegionヘッダに書き戻す（flushの前に呼ぶ）。
     pub fn sync(&self) {
-        let dm = self.data.slice_mut();
-        dm[4..8].copy_from_slice(&self.count.load(Ordering::Relaxed).to_le_bytes());
-        dm[8..12].copy_from_slice(&self.data_end.load(Ordering::Relaxed).to_le_bytes());
+        self.data.write_at(4, &self.count.load(Ordering::Relaxed).to_le_bytes());
+        self.data.write_at(8, &self.data_end.load(Ordering::Relaxed).to_le_bytes());
     }
 
     /// index と data の整合性マーカーを書く。
@@ -349,9 +373,8 @@ impl Vocabulary {
         // data 領域は variable cluster (lazy commit) なので、 先頭 header を
         // 確実に commit してから書く。
         let _ = self.data.ensure_committed(HEADER);
-        let dm = self.data.slice_mut();
         let val: u32 = if clean { 1 } else { 0 };
-        dm[CLEAN_FLAG_OFF..CLEAN_FLAG_OFF + 4].copy_from_slice(&val.to_le_bytes());
+        self.data.write_at(CLEAN_FLAG_OFF, &val.to_le_bytes());
         self.clean_on_disk.store(clean, Ordering::Release); // #77-M1 キャッシュ追従
     }
 }
@@ -448,23 +471,25 @@ mod tests {
 
     /// index 領域を直接叩くための helper。
     impl Regions {
-        // test 専用 helper。 Region::slice_mut と同じ運用不変式 (単一 writer) の下で
-        // torn write を模すため生ポインタから可変 slice を作る (issue #83)。
-        #[allow(clippy::mut_from_ref)]
-        fn index_mut(&self) -> &mut [u8] {
-            unsafe { std::slice::from_raw_parts_mut(self.index_ptr, self.index_len) }
+        // test 専用 helper。 単一 writer 運用不変式の下で torn write を模す。 #83 で
+        // `slice_mut` を廃したので、 本番と同じ Region write API 経由で書く。
+        fn index_region(&self) -> Region {
+            unsafe { Region::new(self.index_ptr, self.index_len) }
         }
         /// vid を持つ live slot を探して 0 クリア (= torn write で slot 欠落を模す)。
         fn clear_slot_of(&self, vid: u32) {
-            let xm = self.index_mut();
+            let region = self.index_region();
             let mut off = INDEX_HEADER;
             while off + INDEX_SLOT_SIZE <= self.index_len {
-                if xm[off] != 0
-                    && u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap()) == vid
-                {
-                    for b in &mut xm[off..off + INDEX_SLOT_SIZE] {
-                        *b = 0;
-                    }
+                let (flag, slot_vid) = {
+                    let xm = region.slice();
+                    (
+                        xm[off],
+                        u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap()),
+                    )
+                };
+                if flag != 0 && slot_vid == vid {
+                    region.fill_at(off, INDEX_SLOT_SIZE, 0);
                 }
                 off += INDEX_SLOT_SIZE;
             }
@@ -472,16 +497,16 @@ mod tests {
         /// value の probe home 以降で最初の空 slot に (hash, vid) を植える
         /// (= torn write で count より先行した「未来」slot を模す)。
         fn plant_slot(&self, index_cap: u32, value: &[u8], vid: u32) {
-            let xm = self.index_mut();
+            let region = self.index_region();
             let mask = (index_cap - 1) as u64;
             let h = fxhash(value);
             let mut idx = (h & mask) as usize;
             loop {
                 let off = INDEX_HEADER + idx * INDEX_SLOT_SIZE;
-                if xm[off] == 0 {
-                    xm[off] = 1;
-                    xm[off + 1..off + 9].copy_from_slice(&h.to_le_bytes());
-                    xm[off + 9..off + 13].copy_from_slice(&vid.to_le_bytes());
+                if region.slice()[off] == 0 {
+                    region.write_at(off, &[1]);
+                    region.write_at(off + 1, &h.to_le_bytes());
+                    region.write_at(off + 9, &vid.to_le_bytes());
                     return;
                 }
                 idx = ((idx as u64 + 1) & mask) as usize;
@@ -609,6 +634,19 @@ mod tests {
             assert_eq!(w.get(got.unwrap()), v.as_bytes(), "{v} の vid 実体不一致");
         }
     }
+}
+
+/// offsets/data region から id の value slice を読む。 `get` と `rebuild_index_into`
+/// で共有する (後者は index を `&mut` 借用中に呼ぶため `&self` メソッドではなく
+/// region を直接受ける free fn にして分割借用を可能にする)。
+#[inline]
+fn read_value<'a>(offsets: &'a Region, data: &'a Region, id: u32) -> &'a [u8] {
+    let om = offsets.slice();
+    let off_pos = (id as usize) * 8;
+    let offset = u32::from_le_bytes(om[off_pos..off_pos + 4].try_into().unwrap()) as usize;
+    let len = u32::from_le_bytes(om[off_pos + 4..off_pos + 8].try_into().unwrap()) as usize;
+    let dm = data.slice();
+    &dm[offset..offset + len]
 }
 
 #[inline(always)]

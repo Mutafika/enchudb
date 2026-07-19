@@ -6,7 +6,7 @@
 //! までの commit を要求できる。 store 側 (vocabulary / content_store / cylinder)
 //! が data_end を進める前に呼ぶのが期待されるパターン。
 
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU8, AtomicU32};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
@@ -78,19 +78,61 @@ impl Region {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
-    // `mut_from_ref` (deny by default): `&self` から `&mut [u8]` を返すのは通常 aliasing
-    // UB の温床。 本 store は「単一 writer プロセス + in-process は各 store の Mutex /
-    // append-only + epoch 規約」で同時可変 alias を出さない運用不変式で回している
-    // (`unsafe impl Sync` と同じ前提)。 これは *型* 不変式ではなく運用規約なので、
-    // long-lived な mutable alias を実体化しない API (`write_at` / `ptr`) への置換が
-    // 本筋 (issue #83 の option 2、 P2)。 それまでは理由明記で lint を局所 allow する。
+    /// `off..off+src.len()` に `src` を書く。 `&mut [u8]` を **実体化せず** raw
+    /// pointer 経由で書くので、 `slice()` の `&[u8]` や別 slot への書込と並行しても
+    /// aliasing *参照* を作らない (issue #83 option 2: `slice_mut(&self) -> &mut [u8]`
+    /// の廃止代替)。 `&self` で interior-mutate するのは `as_atomic_u32().store()` と
+    /// 同じ扱い (`unsafe impl Sync` = 単一 writer + in-process lock の運用不変式)。
+    ///
+    /// # Panics
+    /// - `off + src.len() > len` なら panic
     #[inline(always)]
-    #[allow(clippy::mut_from_ref)]
-    pub fn slice_mut(&self) -> &mut [u8] {
+    pub fn write_at(&self, off: usize, src: &[u8]) {
+        assert!(
+            off + src.len() <= self.len,
+            "write_at out of range: {} + {} > {}",
+            off,
+            src.len(),
+            self.len
+        );
+        // SAFETY: 範囲は上の assert 済み。 src (caller buffer) は region 外なので
+        // 非重複。 `&mut [u8]` を作らないので aliasing 参照が発生しない。
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.add(off), src.len());
+        }
+    }
+
+    /// `off..off+len` を `val` で埋める (memset)。 `write_at` と同じく `&mut [u8]`
+    /// を作らない (issue #83)。
+    ///
+    /// # Panics
+    /// - `off + len > self.len` なら panic
+    #[inline(always)]
+    pub fn fill_at(&self, off: usize, len: usize, val: u8) {
+        assert!(
+            off + len <= self.len,
+            "fill_at out of range: {} + {} > {}",
+            off,
+            len,
+            self.len
+        );
+        // SAFETY: 範囲は上の assert 済み。 `&mut [u8]` を作らない。
+        unsafe {
+            std::ptr::write_bytes(self.ptr.add(off), val, len);
+        }
+    }
+
+    /// 排他 (`&mut self`) な可変 slice。 `&mut self` を握れる時点でこの Region への
+    /// 他参照が無いことを型で保証するので aliasing UB が無い (clippy `mut_from_ref`
+    /// も出ない)。 open 時の単一スレッド rebuild など「その瞬間 writer が排他」な
+    /// 経路専用 (issue #83 で `slice_mut(&self)` を置き換えた sound 版)。
+    #[inline(always)]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `&mut self` = 排他借用。 ptr..ptr+len は ctor 契約で有効。
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 
-    #[allow(dead_code)]
+    #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
@@ -152,5 +194,22 @@ impl Region {
             offset
         );
         unsafe { &*(self.ptr.add(offset) as *const AtomicU32) }
+    }
+
+    /// mmap 上の 1 byte を `AtomicU8` として参照する (`as_atomic_u32` の u8 版)。
+    /// u8 なので alignment 制約なし。 vocabulary index slot の flag (0/1/2 の CAS
+    /// lock) を `&self` から atomic に触るのに使う。
+    ///
+    /// # Panics
+    /// - `offset >= len` なら panic
+    #[inline(always)]
+    pub fn as_atomic_u8(&self, offset: usize) -> &AtomicU8 {
+        assert!(
+            offset < self.len,
+            "atomic_u8 out of range: {} >= {}",
+            offset,
+            self.len
+        );
+        unsafe { &*(self.ptr.add(offset) as *const AtomicU8) }
     }
 }

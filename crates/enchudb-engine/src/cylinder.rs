@@ -43,11 +43,10 @@ impl Cylinder {
         let entities_offset = values_offset + (max_entities as usize) * 4;
         let prefix_offset = entities_offset + (max_entities as usize) * 4;
 
-        let mm = region.slice_mut();
-        mm[0..4].copy_from_slice(&MAGIC);
-        mm[4..8].copy_from_slice(&0u32.to_le_bytes());
-        mm[8..12].copy_from_slice(&max_entities.to_le_bytes());
-        mm[12..16].copy_from_slice(&max_values.to_le_bytes());
+        region.write_at(0, &MAGIC);
+        region.write_at(4, &0u32.to_le_bytes());
+        region.write_at(8, &max_entities.to_le_bytes());
+        region.write_at(12, &max_values.to_le_bytes());
 
         Self {
             region, max_entities, max_values,
@@ -77,13 +76,11 @@ impl Cylinder {
     pub fn rebuild(&self, mut pairs: Vec<(u32, u32)>) {
         pairs.sort_unstable_by_key(|&(v, e)| (v, e));
 
-        let mm = self.region.slice_mut();
-
         for (i, &(val, eid)) in pairs.iter().enumerate() {
             let vo = self.values_offset + i * 4;
             let eo = self.entities_offset + i * 4;
-            mm[vo..vo + 4].copy_from_slice(&val.to_le_bytes());
-            mm[eo..eo + 4].copy_from_slice(&eid.to_le_bytes());
+            self.region.write_at(vo, &val.to_le_bytes());
+            self.region.write_at(eo, &eid.to_le_bytes());
         }
 
         if self.max_values > 0 {
@@ -97,13 +94,13 @@ impl Cylinder {
             let mut acc = 0u32;
             for s in 0..slots {
                 let off = pbase + s * 4;
-                mm[off..off + 4].copy_from_slice(&acc.to_le_bytes());
+                self.region.write_at(off, &acc.to_le_bytes());
                 acc += counts[s];
             }
         }
 
         let t = pairs.len() as u32;
-        mm[4..8].copy_from_slice(&t.to_le_bytes());
+        self.region.write_at(4, &t.to_le_bytes());
         self.total.store(t, Ordering::Release);
     }
 
