@@ -3,6 +3,46 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.14.3 — 2026-07-24
+
+data corruption 1 件。 公開 API / on-disk format は不変 (patch)。
+
+### Fixed — schema `Database` + raw `define_table` の DB が reopen で silent にデータ破壊 (#117)
+
+`enchudb::schema::Database` を経由しつつ raw `engine_mut().define_table()` /
+`define_himo_in()` で table を定義し、 `finish_*` を呼ばず `flush()` + drop する DB
+(opyula の wiki route / cord junction 等) で `.tables` sidecar が永続されず、 reopen 時に
+2 つの顔で壊れていた:
+
+1. **table 定義消失** → range 再導出で既存 entity が範囲外に孤立し tie が panic
+   (`tie eid N not in himo's table ... eid_range`)。
+2. **`next_local` 巻き戻り** → `entity_in` が生きた eid を再払出し、 既存 entity を無警告で
+   上書き破壊 (元 node と archive が同一 eid に合体する frankenstein entity)。 (2) が致命的。
+
+root cause は `Database::wrap_new` の `defer_tables_persist=true` を、 builder の `self.tables`
+に載らない raw-define table に対して Drop guard が「空 Database」と誤認し persist を skip して
+いたこと。 #47 (builder 経路の同種 reissue) が別経路から再噴出した形。
+
+- **[本修正] open 時に live bitmap から `next_local` を自己修復** (`reconcile_next_local_from_bitmap`)。
+  body に msync 永続された live bitset を ground truth に、 各 table 範囲の「max live local + 1」まで
+  `next_local` を前進させる。 persist 頻度非依存の self-healing で、 alloc 後 persist 前の
+  **crash window の eid 再払出も塞ぐ**。 経路非依存。
+- **[補助] Drop guard を engine 実態で判定**: `self.tables` ではなく `eng.list_user_tables()`
+  非空で persist を判定し、 raw-define DB の sidecar 永続漏れを解消。 user table が実在する DB は
+  region commit 済なので、 旧 skip が避けていた「空 growable の msync SIGBUS」経路には入らない。
+- 検証: repro 2 face (table 消失 / eid 再払出) を `issue117_raw_define_reopen` で test 化 (master
+  fail → 修正 pass)。 falsify matrix で両 fix が load-bearing を実証 (Drop guard 無効化 = crash
+  window 相当で face2 が本修正のみで生存)。 workspace 641 test green、 open bench 有意差なし。
+- **format 変更なし** (on-disk layout 不変。 既存 healthy DB は `next_local` 据え置きで挙動不変)。
+
+#### Migration
+
+- **≤0.14.2 で raw-define パターンを使っていた DB (opyula 等)**: 0.14.3 で open 時に `next_local` が
+  自己修復されるため **今後の eid 再払出は止まる**。 ただし **既に上書き破壊された entity は復元
+  されない** — 破壊が疑われる DB は snapshot / rebuild で作り直すこと。
+- schema builder (`db.table().build()`) + `finish_*` のみを使う consumer (sinfo 等) は影響なし、
+  upgrade で挙動不変。
+
 ## 0.14.2 — 2026-07-20
 
 soundness 2 件。 いずれも公開 API / on-disk format は不変 (patch)。
