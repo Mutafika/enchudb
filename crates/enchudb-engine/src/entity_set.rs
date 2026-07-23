@@ -197,6 +197,37 @@ impl EntitySet {
         self.live_count_atomic().load(Ordering::Relaxed)
     }
 
+    /// #117: `[lo, hi)` 範囲内で最上位の live eid を返す (無ければ None)。
+    /// open 時に per-table `next_local` を live bitmap から自己修復するために使う。
+    /// bitset を上から逆走査し、 空 byte は byte 単位で skip するので append-mostly
+    /// なら top 数 byte で早期 exit する。 bitset は body に mmap 永続され `flush` で
+    /// msync 済 = sidecar (next_local) が失われても ground truth はここに残る。
+    pub fn highest_live_in(&self, lo: u32, hi: u32) -> Option<u32> {
+        let hi = hi.min(self.max_entities);
+        if lo >= hi {
+            return None;
+        }
+        let mm = self.region.slice();
+        let mut e = hi; // exclusive 上端
+        while e > lo {
+            e -= 1;
+            let byte = mm[self.bitset_offset + (e / 8) as usize];
+            if byte == 0 {
+                // この byte に live 無し → byte 先頭へ飛ばす (次周回の e-=1 で前 byte 最上位へ)。
+                let byte_first = e & !7;
+                if byte_first <= lo {
+                    break;
+                }
+                e = byte_first;
+                continue;
+            }
+            if byte & (1u8 << (e % 8)) != 0 {
+                return Some(e);
+            }
+        }
+        None
+    }
+
     pub fn next_eid(&self) -> u32 {
         self.next_eid_atomic().load(Ordering::Relaxed)
     }

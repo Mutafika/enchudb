@@ -257,7 +257,15 @@ impl Drop for Database {
         // 0.8.7: tables 0 (= 空 Database が即 drop) の場合は sidecar 書き出しは
         // skip (= 不必要な I/O を回避、 引いては growable backing で msync が
         // SIGBUS する可能性も避ける)。
-        if !self.is_concurrent && !self.eng.is_readonly() && !self.tables.is_empty() {
+        // #117: builder の `self.tables` ではなく engine 実態の user table 有無で
+        // 判定する。 raw `engine_mut().define_table()` で作った table は builder の
+        // `self.tables` に載らないため、 旧条件だと「空 Database」と誤認して sidecar
+        // 未永続 → reopen で table 消失 / next_local 巻き戻り → 生きた eid 再払出
+        // (silent 破壊) を招いていた。 user table が実在する DB は region commit 済
+        // なので、 skip が避けていた「空 growable の msync SIGBUS」経路には入らない。
+        let has_user_tables =
+            !self.tables.is_empty() || !self.eng.list_user_tables().is_empty();
+        if !self.is_concurrent && !self.eng.is_readonly() && has_user_tables {
             self.eng.set_defer_tables_persist(false);
             let _ = self.persist_schema();
         }

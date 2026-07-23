@@ -2128,6 +2128,15 @@ impl Engine {
             }
         }
 
+        // #117: sidecar の per-table next_local が未永続 / stale でも、 body に msync
+        // 永続された live bitmap を ground truth に next_local を自己修復する。
+        // adopt / eidmap で確定した各 table 範囲に対し「max live local + 1」を保証し、
+        // 「reopen で next_local 巻き戻り → 生きた eid 再払出 (silent 破壊)」を経路
+        // 非依存で塞ぐ (schema Database + raw define + finish_* 無し drop でも安全)。
+        // oplog recover 済 entity は apply_oplog_op が別途 advance するので二重でも
+        // monotone (max) なため問題ない。
+        eng.reconcile_next_local_from_bitmap();
+
         if verify_region_crc {
             // .crc ファイルがあれば全 region CRC 検証
             eng.verify_region_crcs()?;
@@ -6794,6 +6803,21 @@ impl Engine {
     /// `(eid - lo) + 1` まで進める (= 次 alloc が衝突しないように)。
     /// global が未登録 table の range なら no-op (= reserved table 等で
     /// recover 順序的に table 定義が先に存在することを期待)。
+    /// #117: open 時、 各 user table の `next_local` を live bitmap から自己修復する。
+    /// sidecar が未永続 / stale で next_local が巻き戻っていても、 body 永続の bitmap
+    /// に残る「範囲内 max live eid + 1」まで next_local を前進させ、 生きた eid の
+    /// 再払出を防ぐ。 `next_local` は RAM の AtomicU32 (mmap 非依存) なので readonly
+    /// open でも安全 (disk は触らない)。 anonymous / reserved も含め全 table を見る。
+    fn reconcile_next_local_from_bitmap(&self) {
+        for i in 0..self.tables.len() {
+            let lo = self.tables[i].eid_range_lo;
+            let hi = self.tables[i].eid_range_hi;
+            if let Some(highest) = self.entities.highest_live_in(lo, hi) {
+                Self::advance_table_next_local_for(&self.tables, highest);
+            }
+        }
+    }
+
     fn advance_table_next_local_for(tables: &[TableDef], global: u32) {
         use std::sync::atomic::Ordering;
         for table in tables {
