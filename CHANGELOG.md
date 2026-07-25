@@ -3,6 +3,39 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.14.4 — 2026-07-26
+
+公開 API 追加 1 件 (additive・後方互換)。 on-disk format / 既定 layout は不変。
+
+### Added — `GrowableOptions` で growable の全 layout knob を露出 (#118)
+
+`Database` の growable create API が `max_entities` / `vocab_data_size` / `leaf_data_size`
+しか露出せず、 **`max_himos`（DB 全体の himo = table × column 通し上限、 default 256）** /
+`content_data_size` / `cyl_max_values` を設定する術が無かった。 himo は DB 全体で通し採番
+されるため、 router+scope を 1 DB に同居させる sinfo が 40 table / 列合計 255 まで育った
+ところで新列追加が `too many himos (max 256)` で失敗し、 **無関係な全 table の open を
+巻き添えで殺していた**。 (queue_cap #116 に続く「schema が engine knob を出し損ねる」系の 2 件目。)
+
+- 追加: `GrowableOptions { max_entities, max_himos, vocab_data_size, content_data_size,
+  cyl_max_values, leaf_data_size, leaf_scale }` + `Default` (engine / schema で re-export)。
+  `Engine::create_growable_opts(path, opts)` / `Database::create_growable_with(path, opts)`。
+  気にする knob だけ `..Default::default()` で上書きでき、 **将来 knob を足しても variant が
+  増殖しない** (従来は `create_growable_with_capacity` / `_with_options` / `_with_leaf` と
+  部分被覆 variant が増える一方 + 組合せ不可だった)。
+- `too many himos` エラーを actionable 化 (「GrowableOptions で引き上げよ、 既存 DB は rebuild」)。
+
+**default は 256 据え置き (raise しない)**: himo 領域 = `max_himos × Column::region_size(
+max_entities)` = **max_entities 比例の per-himo 列領域を max_himos 倍する**構造。 16M entity DB で
+256→4096 にすると himo 領域が ~16GB→~256GB の apparent (Linux は sparse だが macOS/APFS は phys
+inflate) に膨れるため、 全 DB の default 引き上げは不可。 → 必要な consumer が
+`GrowableOptions { max_himos, .. }` で自 DB の apparent 増を承知の上で opt-in する設計 (#116 と同原則)。
+
+#### Migration
+
+- **既存 DB は max_himos が header 焼き込み**のため、 上げるには `create_growable_with` で
+  新規作成 + rebuild が必要 (既存 DB を開くだけでは 256 のまま)。
+- 旧 `create_growable*` は全て残置 (後方互換)。 新 knob が要らなければ変更不要。
+
 ## 0.14.3 — 2026-07-24
 
 data corruption 1 件。 公開 API / on-disk format は不変 (patch)。
