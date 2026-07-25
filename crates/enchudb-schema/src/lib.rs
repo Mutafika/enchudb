@@ -62,6 +62,9 @@
 //! 手動 flush は不要 (明示的に呼びたい場合は `db.engine_mut().flush()`)。
 
 use enchudb_engine::{Engine, ValueType};
+/// #118: growable layout の全 knob を露出する options 型を re-export
+/// (`enchudb_schema::GrowableOptions` / `LeafScale` で使えるように)。
+pub use enchudb_engine::{GrowableOptions, LeafScale};
 use enchudb_oplog::EntityId;
 use std::sync::Arc;
 
@@ -335,6 +338,23 @@ impl Database {
             enchudb_engine::LeafScale::Gb16,
         )
         .map_err(|e| SchemaError::Io(e.to_string()))?;
+        Self::wrap_new(eng)
+    }
+
+    /// #118: 全 layout knob を `GrowableOptions` で指定して growable DB を作る一本化 API。
+    /// `create_growable_with_capacity` / `_with_options` / `_with_leaf` が出し損ねていた
+    /// `max_himos` / `content_data_size` / `cyl_max_values` もここから設定でき、 knob の
+    /// 組合せも自由。 気にする knob だけ struct-update で:
+    ///
+    /// ```ignore
+    /// let db = Database::create_growable_with(
+    ///     path,
+    ///     GrowableOptions { max_entities: 4_000_000, max_himos: 8192, ..Default::default() },
+    /// )?;
+    /// ```
+    pub fn create_growable_with(path: &str, opts: GrowableOptions) -> Result<Self, SchemaError> {
+        let eng = Engine::create_growable_opts(path, opts)
+            .map_err(|e| SchemaError::Io(e.to_string()))?;
         Self::wrap_new(eng)
     }
 

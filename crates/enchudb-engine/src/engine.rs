@@ -827,6 +827,16 @@ const FILE_VERSION_LEGACY_V6: u32 = 6;
 const HEADER_SIZE: usize = 4096;
 
 const DEFAULT_MAX_ENTITIES: u32 = 16_777_216;
+/// DB 全体の himo (= table × column の通し) 上限の default。
+///
+/// #118: **default は 256 据え置き、 raise しない**。 当初 4096 への引き上げを検討したが、
+/// himo 領域 = `max_himos × Column::region_size(max_entities, 4)` = **max_entities 比例の
+/// per-himo 列領域を max_himos 倍する**構造 (try_from_params L1234-1242)。 16M entity DB で
+/// 256→4096 にすると himo 領域が ~16GB→~256GB の apparent (sparse だが macOS/APFS では phys
+/// inflate) に膨れる。 → 全 DB の default を上げるのは footprint 的に不可。 代わりに
+/// `GrowableOptions { max_himos, .. }` で **必要な consumer (sinfo 等) が明示的に引き上げる**
+/// (自分の DB の apparent 増を承知の上で opt-in)。 header 焼き込みなので既存 DB は rebuild
+/// するまで旧値のまま。
 const DEFAULT_MAX_HIMOS: u32 = 256;
 const DEFAULT_CYL_MAX_VALUES: u32 = 65536;
 const DEFAULT_VOCAB_DATA_SIZE: usize = 512 * 1024 * 1024;
@@ -862,6 +872,51 @@ impl LeafScale {
     }
     #[inline]
     pub fn cap_bytes(self) -> u64 { cap_bytes_for_shift(self.off_shift()) }
+}
+
+/// #118: growable backing の全 layout knob を 1 struct でまとめて指定する。
+///
+/// 個別 variant (`create_growable_with_capacity` / `_with_options` / `_with_leaf`) は
+/// 部分被覆で組合せ不可 (max_entities と max_himos を同時指定できない等)、 かつ knob が
+/// 増えるたび variant が増殖していた。 これを一本化する。 未指定 field は `Default` で
+/// 埋まるので、 **気にする knob だけ struct-update で上書き**する:
+///
+/// ```ignore
+/// Engine::create_growable_opts(path, GrowableOptions { max_himos: 8192, ..Default::default() })?;
+/// ```
+///
+/// 将来 knob を足しても `..Default::default()` 利用側は無変更 = variant 爆発が止まる。
+#[derive(Debug, Clone)]
+pub struct GrowableOptions {
+    /// DB 全体の entity (eid) 上限。 default 16 M。
+    pub max_entities: u32,
+    /// DB 全体の himo (= table × column 通し) 上限。 default 4096。 header 焼き込みなので
+    /// 既存 DB は rebuild しないと変わらない。
+    pub max_himos: u32,
+    /// vocab (Tag/Leaf 値) データ領域の予約 byte。 default 512 MiB (sparse、 未使用なら実消費 0)。
+    pub vocab_data_size: usize,
+    /// content 領域の予約 byte。 `None` = engine 既定。
+    pub content_data_size: Option<usize>,
+    /// himo あたり cylinder の値上限。 default 65536。
+    pub cyl_max_values: u32,
+    /// leaf データ領域の予約 byte。 `None` = engine 既定 (512 MiB)。
+    pub leaf_data_size: Option<usize>,
+    /// leaf offset scale (16/32/64 GB)。 default `Gb16`。
+    pub leaf_scale: LeafScale,
+}
+
+impl Default for GrowableOptions {
+    fn default() -> Self {
+        Self {
+            max_entities: DEFAULT_MAX_ENTITIES,
+            max_himos: DEFAULT_MAX_HIMOS,
+            vocab_data_size: DEFAULT_VOCAB_DATA_SIZE,
+            content_data_size: None,
+            cyl_max_values: DEFAULT_CYL_MAX_VALUES,
+            leaf_data_size: None,
+            leaf_scale: LeafScale::Gb16,
+        }
+    }
 }
 
 // ヘッダオフセット
@@ -1803,6 +1858,38 @@ impl Engine {
             ));
         }
         Self::create_growable_full(path, layout, max_entities, max_himos, leaf_scale.off_shift())
+    }
+
+    /// #118: `GrowableOptions` から growable DB を作る一本化 API。 全 layout knob
+    /// (max_entities / max_himos / vocab / content / cyl / leaf / leaf_scale) を露出する。
+    /// 個別 `create_growable_with_*` は本メソッドの部分特化に相当 (後方互換で残置)。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn create_growable_opts(path: &str, opts: GrowableOptions) -> io::Result<Self> {
+        let layout = Layout::compute(
+            opts.max_entities,
+            opts.max_himos,
+            opts.vocab_data_size,
+            opts.content_data_size,
+            Some(opts.cyl_max_values),
+            opts.leaf_data_size,
+        );
+        let leaf_cap = opts.leaf_scale.cap_bytes();
+        if layout.leaf_data_size as u64 > leaf_cap {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "leaf_data_size {} exceeds leaf_scale cap {} ({:?}) — 大きい LeafScale を選べ",
+                    layout.leaf_data_size, leaf_cap, opts.leaf_scale,
+                ),
+            ));
+        }
+        Self::create_growable_full(
+            path,
+            layout,
+            opts.max_entities,
+            opts.max_himos,
+            opts.leaf_scale.off_shift(),
+        )
     }
 
     /// Tiny growable preset for app state-logs (matcha-style: a few
@@ -6564,7 +6651,11 @@ impl Engine {
     ) -> Result<u16, String> {
         let hid = self.himos.len();
         if hid as u32 >= self.max_himos || hid >= u16::MAX as usize {
-            return Err(format!("too many himos (max {})", self.max_himos));
+            return Err(format!(
+                "too many himos (max {}) — DB 全体の himo (table × column 通し) 上限に達した。 \
+                 create 時に GrowableOptions {{ max_himos, .. }} で引き上げよ (既存 DB は rebuild が必要)",
+                self.max_himos,
+            ));
         }
 
         self.himo_reg.get_or_insert(himo.as_bytes());
