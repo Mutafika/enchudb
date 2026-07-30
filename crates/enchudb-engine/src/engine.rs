@@ -1099,7 +1099,10 @@ struct Layout {
 }
 
 impl Layout {
-    fn compute(max_entities: u32, max_himos: u32, vocab_data_size: usize, content_data_size: Option<usize>, cyl_max_values: Option<u32>, leaf_data_size: Option<usize>) -> Self {
+    /// #120: 上限超過 (align8 後の u32 data_end / total_size overflow) は
+    /// **書く前に** Err で返す。 呼び元 (create 経路) は `io::ErrorKind::InvalidInput`
+    /// に写して伝播すること — panic にすると caller が握れない。
+    fn compute(max_entities: u32, max_himos: u32, vocab_data_size: usize, content_data_size: Option<usize>, cyl_max_values: Option<u32>, leaf_data_size: Option<usize>) -> Result<Self, String> {
         let vocab_max_entries = max_entities.saturating_mul(16).min(256_000_000);
         Self::compute_with_caps(
             max_entities, max_himos,
@@ -1118,7 +1121,7 @@ impl Layout {
         content_data_size: Option<usize>,
         cyl_max_values: Option<u32>,
         leaf_data_size: Option<usize>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let vocab_index_cap = vocab_max_entries.next_power_of_two();
         let himoreg_max_entries = max_himos.max(256);
         let himoreg_index_cap = (himoreg_max_entries * 2).next_power_of_two();
@@ -1126,48 +1129,20 @@ impl Layout {
         let content_data_size = content_data_size.unwrap_or_else(ContentStore::data_region_size);
         let cyl_max_values = cyl_max_values.unwrap_or(DEFAULT_CYL_MAX_VALUES);
 
-        // #77: data_end (vocab / content) は mmap 上の AtomicU32 で、 index の
-        // offset/len も u32。 4 GiB 超の data region を許すと append offset が
-        // wrap して先頭から silent 上書きするため、 create 時点で拒否する。
-        assert!(
-            vocab_data_size <= u32::MAX as usize,
-            "vocab_data_size {} exceeds format limit {} (u32 data_end)",
-            vocab_data_size, u32::MAX,
-        );
-        assert!(
-            content_data_size <= u32::MAX as usize,
-            "content_data_size {} exceeds format limit {} (u32 data_end)",
-            content_data_size, u32::MAX,
-        );
-
         // v6 (#88): create 経路の leaf region 予約サイズ。 None = default。
         // Some(0) は「leaf region 無し」= v5 相当 DB (migration test / bench の
         // before 生成、 及び將来の pre-v6 互換 create に使う)。
+        //
+        // #120: u32 上限の検証は `try_from_params` 内の **align8 後** の値に対して
+        // 行う (整列前の要求値だけを見ていたため、 u32::MAX の create が成功して
+        // header に 2^32 が焼かれ、 open 不能な DB ができていた)。
         let leaf_data_size = leaf_data_size.unwrap_or(DEFAULT_LEAF_DATA_SIZE);
-        Self::from_params(
-            max_entities, max_himos,
-            vocab_max_entries, vocab_index_cap, vocab_data_size,
-            himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
-            content_data_size, leaf_data_size, cyl_max_values,
-        )
-    }
-
-    fn from_params(
-        max_entities: u32, max_himos: u32,
-        vocab_max_entries: u32, vocab_index_cap: u32, vocab_data_size: usize,
-        himoreg_max_entries: u32, himoreg_index_cap: u32, himoreg_data_size: usize,
-        content_data_size: usize, leaf_data_size: usize, cyl_max_values: u32,
-    ) -> Self {
-        // create 経路 (= プログラム引数由来の params) 用。 open 経路 (= disk header
-        // 由来の params) は `try_from_params` を使い、 破損 header を InvalidData に
-        // 落とすこと (0.9.0 L1)。
         Self::try_from_params(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, leaf_data_size, cyl_max_values,
         )
-        .expect("layout size overflow — parameters too large")
     }
 
     /// 0.9.0 (L1): checked arithmetic 版。 header CRC==0 の legacy DB では
@@ -1245,16 +1220,37 @@ impl Layout {
         off = ck_add(off, himo_total)?;
 
         // ── Variable cluster (tail): append-only で伸びる region 群 ──
+        //
+        // #77: data_end (vocab / himoreg / content) は mmap 上の AtomicU32 で、 index の
+        // offset/len も u32。 4 GiB 超の data region を許すと append offset が wrap して
+        // 先頭から silent 上書きするため拒否する。
+        // #120: 検証は **align8 後** の値に対して行う。 align8 は u32::MAX を 2^32 に
+        // 切り上げるので、 整列前だけ見ると `vocab_data_size = u32::MAX` の create が
+        // 通り、 header には 2^32 が焼かれ、 open 側検証 (validate_header の
+        // "u32 data_end") で恒久的に開けない DB ができる (create もビルドも成功した
+        // 後に全損する最悪の壊れ方)。
+        let ck_u32 = |name: &str, aligned: usize| -> Result<usize, String> {
+            if aligned > u32::MAX as usize {
+                return Err(format!(
+                    "{} {} (align8 後) exceeds format limit {} (u32 data_end)",
+                    name, aligned, u32::MAX,
+                ));
+            }
+            Ok(aligned)
+        };
+
         let vocab_data_off = off;
-        let vocab_data_size = align8(Vocabulary::data_region_size(vocab_data_size));
+        let vocab_data_size =
+            ck_u32("vocab_data_size", align8(Vocabulary::data_region_size(vocab_data_size)))?;
         off = ck_add(off, vocab_data_size)?;
 
         let himoreg_data_off = off;
-        let himoreg_data_size = align8(Vocabulary::data_region_size(himoreg_data_size));
+        let himoreg_data_size =
+            ck_u32("himoreg_data_size", align8(Vocabulary::data_region_size(himoreg_data_size)))?;
         off = ck_add(off, himoreg_data_size)?;
 
         let content_data_off = off;
-        let content_data_size = align8(content_data_size);
+        let content_data_size = ck_u32("content_data_size", align8(content_data_size))?;
         off = ck_add(off, content_data_size)?;
 
         // v6 (#88): Leaf payload store。 append-only variable cluster の末尾に追加。
@@ -1666,7 +1662,7 @@ impl Engine {
         let off_shift = leaf_scale.map(|s| s.off_shift()).unwrap_or(DEFAULT_LEAF_OFF_SHIFT);
         let vds = vocab_data_size.unwrap_or(DEFAULT_VOCAB_DATA_SIZE);
         let max_himos = max_himos.unwrap_or(DEFAULT_MAX_HIMOS);
-        let layout = Layout::compute(max_entities, max_himos, vds, content_data_size, cyl_max_values, leaf_data_size);
+        let layout = Layout::compute(max_entities, max_himos, vds, content_data_size, cyl_max_values, leaf_data_size).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         // #90: 予約 leaf region が選んだ scale の cap を超えないか検証。
         let leaf_cap = cap_bytes_for_shift(off_shift);
         if layout.leaf_data_size as u64 > leaf_cap {
@@ -1811,7 +1807,7 @@ impl Engine {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create_growable_with_capacity(path: &str, max_entities: u32) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
-        let layout = Layout::compute(max_entities, max_himos, DEFAULT_VOCAB_DATA_SIZE, None, None, None);
+        let layout = Layout::compute(max_entities, max_himos, DEFAULT_VOCAB_DATA_SIZE, None, None, None).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
     }
 
@@ -1828,7 +1824,7 @@ impl Engine {
         vocab_data_size: usize,
     ) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
-        let layout = Layout::compute(max_entities, max_himos, vocab_data_size, None, None, None);
+        let layout = Layout::compute(max_entities, max_himos, vocab_data_size, None, None, None).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
     }
 
@@ -1846,7 +1842,7 @@ impl Engine {
     ) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
         let vds = vocab_data_size.unwrap_or(DEFAULT_VOCAB_DATA_SIZE);
-        let layout = Layout::compute(max_entities, max_himos, vds, None, None, leaf_data_size);
+        let layout = Layout::compute(max_entities, max_himos, vds, None, None, leaf_data_size).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let leaf_cap = leaf_scale.cap_bytes();
         if layout.leaf_data_size as u64 > leaf_cap {
             return Err(io::Error::new(
@@ -1872,7 +1868,8 @@ impl Engine {
             opts.content_data_size,
             Some(opts.cyl_max_values),
             opts.leaf_data_size,
-        );
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let leaf_cap = opts.leaf_scale.cap_bytes();
         if layout.leaf_data_size as u64 > leaf_cap {
             return Err(io::Error::new(
@@ -1924,7 +1921,8 @@ impl Engine {
             Some(64 * 1024),  // content_data: 64 KB
             Some(64),         // cyl_max_values: small per-himo cylinders
             None,             // leaf_data: default
-        );
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
     }
 
