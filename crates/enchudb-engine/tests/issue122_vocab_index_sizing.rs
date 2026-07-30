@@ -134,3 +134,67 @@ fn v7_db_upgrades_to_v8_on_writer_open() {
     Engine::open(&path).expect("migrate 後も open できること");
     cleanup(&path);
 }
+
+/// #119 Step 0: `get_content_owned` が `get_content` と同じ値を返し、 content を re-tie し
+/// 続ける writer と並行でも silent None / torn を出さないこと (rag の本文読み経路)。
+#[test]
+fn get_content_owned_matches_borrow_and_survives_rewrite() {
+    let path = tmp_path("content_owned");
+    cleanup(&path);
+
+    let eng = std::sync::Arc::new(
+        Engine::create_growable_opts(&path, GrowableOptions::default()).expect("create"),
+    );
+    let eid = eng.entity();
+    let bodies: Vec<String> = (0..5).map(|i| format!("c{}-{}", i, "y".repeat(48 + i * 61))).collect();
+    eng.content(eid, "body", bodies[0].as_bytes());
+
+    // 単独 read: 借用版と owned 版が一致する
+    assert_eq!(
+        eng.get_content(eid, "body").map(|b| b.to_vec()),
+        eng.get_content_owned(eid, "body"),
+        "owned 版が借用版と違う値を返した"
+    );
+
+    // 並行 re-tie 下でも既知値のどれかが必ず返る
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let eng = eng.clone();
+        let stop = stop.clone();
+        let bodies = bodies.clone();
+        std::thread::spawn(move || {
+            let mut n = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                eng.content(eid, "body", bodies[n % bodies.len()].as_bytes());
+                n += 1;
+            }
+        })
+    };
+    let mut reads = 0usize;
+    let mut missing = 0usize;
+    let mut corrupt = 0usize;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
+    while std::time::Instant::now() < deadline {
+        match eng.get_content_owned(eid, "body") {
+            Some(b) => {
+                if !bodies.iter().any(|x| x.as_bytes() == b.as_slice()) {
+                    corrupt += 1;
+                }
+            }
+            None => missing += 1,
+        }
+        reads += 1;
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+
+    assert!(reads > 500, "read が回っていない (reads={reads})");
+    assert_eq!(missing, 0, "silent None が {missing} 件 / reads={reads}");
+    assert_eq!(corrupt, 0, "既知値以外 (torn) が {corrupt} 件 / reads={reads}");
+
+    drop(writer_marker(&eng));
+    cleanup(&path);
+}
+
+/// drop 順を明示するためのヘルパ (Arc を最後に落とす)。
+fn writer_marker<T>(_t: &T) {}

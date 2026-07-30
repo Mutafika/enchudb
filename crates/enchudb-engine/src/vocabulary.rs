@@ -352,7 +352,17 @@ impl Vocabulary {
     /// (data/offsets のみ完全に増分)。
     pub fn insert(&self, value: &[u8]) -> u32 {
         let id = self.count.fetch_add(1, Ordering::Relaxed);
-        assert!(id < self.max_entries, "vocabulary full");
+        // #122: vocab_max_entries が公開 knob になったので、 天井 hit を actionable に
+        // する (#118 の `too many himos` と同じ扱い)。 既存 DB は header 焼き込みなので
+        // 引き上げには rebuild が必要、 という点まで伝える。
+        assert!(
+            id < self.max_entries,
+            "vocabulary full: {} unique values exceeds vocab_max_entries {} — \
+             raise it via GrowableOptions {{ vocab_max_entries: Some(n), .. }} \
+             (header 焼き込みなので既存 DB は再作成が必要)",
+            id + 1,
+            self.max_entries,
+        );
         let len = value.len() as u32;
         let offset = self.data_end.fetch_add(len, Ordering::Relaxed);
         // Growable backing: extend the file-backed window before
@@ -579,6 +589,92 @@ mod tests {
             modern.len(), keys.len(),
             "新 slot 選択 (上位ビット) が散っていない: {modern:?}"
         );
+    }
+
+    /// #122: 天井 hit のメッセージが「どの knob を上げればよいか」を示すこと
+    /// (#118 の `too many himos` と同じ actionable 化)。 knob を公開した以上、
+    /// 小さく見積もった consumer が原因の分からない panic を踏まないようにする。
+    #[test]
+    #[should_panic(expected = "vocab_max_entries")]
+    fn issue122_vocab_full_panic_names_the_knob() {
+        let r = make_regions(4, 8, 64 * 1024);
+        let v = r.vocab_init(4, 8);
+        for i in 0..8 {
+            v.insert(format!("v{i}").as_bytes());
+        }
+    }
+
+    /// #123: migrate 後に graceful close (clean flag) すると、 次の open は rebuild を
+    /// **skip** する (= VIX3 magic が永続化されている)。 magic を書き忘れると毎 open
+    /// rebuild し続けるので、 その回帰を止める。
+    #[test]
+    fn issue123_migrated_index_is_clean_on_next_open() {
+        let cap = 1u32 << 8;
+        let r = make_regions(1024, cap, 64 * 1024);
+        let keys: Vec<String> = (0..16).map(|i| format!("第{}条", 10 + i)).collect();
+
+        let ids: Vec<u32> = {
+            let w = r.vocab_init(1024, cap);
+            let ids = keys.iter().map(|k| w.get_or_insert(k.as_bytes())).collect();
+            w.sync();
+            ids
+        };
+        let entries: Vec<(&[u8], u32)> =
+            keys.iter().zip(&ids).map(|(k, id)| (k.as_bytes(), *id)).collect();
+        r.plant_legacy_index(cap, &entries);
+
+        // 1 回目: VIX2 → migrate される
+        {
+            let v = r.vocab_load(false);
+            assert!(v.rebuilt_on_load, "1 回目は migrate されるべき");
+            v.sync();
+            v.mark_index_clean(true); // graceful close 相当
+        }
+        // 2 回目: VIX3 + clean なので rebuild しない
+        let v2 = r.vocab_load(false);
+        assert!(
+            !v2.rebuilt_on_load,
+            "migrate 後も rebuild され続けている (VIX3 magic が永続化されていない)"
+        );
+        for (k, id) in keys.iter().zip(&ids) {
+            assert_eq!(v2.lookup(k.as_bytes()), Some(*id), "{k} が引けない");
+        }
+    }
+
+    /// #123: readonly open で VIX2 を掴んだ場合、 共有 index を **1 byte も書かず**に
+    /// shadow (新 slot 関数) で正しく引けること。 別 process の writer と併走する
+    /// oboro / sinfo-studio 型の構成が該当する。
+    #[test]
+    fn issue123_readonly_open_of_legacy_index_uses_shadow() {
+        let cap = 1u32 << 8;
+        let r = make_regions(1024, cap, 64 * 1024);
+        let keys: Vec<String> = (0..16).map(|i| format!("第{}条", 10 + i)).collect();
+
+        let ids: Vec<u32> = {
+            let w = r.vocab_init(1024, cap);
+            let ids = keys.iter().map(|k| w.get_or_insert(k.as_bytes())).collect();
+            w.sync();
+            w.mark_index_clean(true);
+            ids
+        };
+        let entries: Vec<(&[u8], u32)> =
+            keys.iter().zip(&ids).map(|(k, id)| (k.as_bytes(), *id)).collect();
+        r.plant_legacy_index(cap, &entries);
+
+        let before = r.index_bytes();
+        let ro = r.vocab_load(/*readonly=*/ true);
+        for (k, id) in keys.iter().zip(&ids) {
+            assert_eq!(ro.lookup(k.as_bytes()), Some(*id), "shadow で {k} が引けない");
+        }
+        assert_eq!(r.index_bytes(), before, "readonly open が共有 index を書き換えた");
+    }
+
+    /// #123: cap == 1 の退化ケースで `home_slot` が shift overflow しない。
+    #[test]
+    fn issue123_home_slot_handles_degenerate_cap() {
+        assert_eq!(home_slot(u64::MAX, 1), 0);
+        assert_eq!(home_slot(0, 1), 0);
+        assert!(home_slot(u64::MAX, 2) < 2);
     }
 
     /// #123: VIX2 index を持つ DB を開くと、 clean_flag が立っていても index を作り直し、

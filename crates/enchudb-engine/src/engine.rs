@@ -4471,9 +4471,12 @@ impl Engine {
         // v6 (#88): Leaf は LeafStore へ。 &mut self (build phase) は WAL emit しない
         // ので leaf.insert + cell set のみ。 re-tie 上書きは旧 offset を free。
         if let Some(leaf) = self.leaf_for(hid) {
-            if let Some(old) = self.himos[hid].get_value(eid) { leaf.free(old); }
+            // #119: insert → publish → free に揃える (この経路は `&mut self` = 並行 reader
+            // なしなので実害はないが、 3 経路で順序が揃っていないと事故の温床になる)。
+            let old = self.himos[hid].get_value(eid);
             let off = leaf.insert(value.as_bytes());
             self.himos[hid].set(eid, off);
+            if let Some(old) = old { leaf.free(old); }
             return;
         }
         // Tag は dedupe (get_or_insert)、Leaf は新規 id 発行 (insert)。
@@ -4598,9 +4601,15 @@ impl Engine {
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         // v6 (#88): Leaf は LeafStore へ。 re-tie 上書きは旧 offset を free。
         if let Some(leaf) = self.leaf_for(hid) {
-            if let Some(old) = self.himos[hid].get_value(eid) { leaf.free(old); }
+            // #119: **insert → publish → free** の順に守る (旧 slot を先に free すると、
+            // 同サイズ re-tie では best-fit が「たった今 free した hole」を必ず再利用し、
+            // 旧 offset を掴んでいる並行 reader が再利用 slot を読んで seqlock retry を
+            // 使い切り None になる — content 経路で実測 8,132/60,463 件)。
+            // 既に `tie_text_to_by_id` はこの順序。
+            let old = self.himos[hid].get_value(eid);
             let off = leaf.insert(value);
             self.himos[hid].set(eid, off);
+            if let Some(old) = old { leaf.free(old); }
             if let Some(wal) = self.oplog.as_ref() {
                 let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
                 let _ = wal.append(enchudb_oplog::oplog::Op::TieLeaf {
