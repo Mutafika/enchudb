@@ -26,9 +26,26 @@ fn cleanup(path: &str) {
     }
 }
 
+/// header の 4 byte だけを seek して読む。
+///
+/// **`std::fs::read` を使ってはいけない** — growable DB は apparent が巨大な sparse file
+/// なので、 全体をメモリへ読むと Linux では OOM killer に SIGKILL される (macOS では
+/// 通ってしまい、 OrbStack の Linux 実行で初めて露見した)。
 fn header_u32(path: &str, off: usize) -> u32 {
-    let buf = std::fs::read(path).expect("read db header");
-    u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).expect("open db");
+    f.seek(SeekFrom::Start(off as u64)).expect("seek");
+    let mut b = [0u8; 4];
+    f.read_exact(&mut b).expect("read header word");
+    u32::from_le_bytes(b)
+}
+
+/// header の 4 byte だけを seek して書く (同上の理由でファイル全体を読み書きしない)。
+fn write_header_u32(path: &str, off: usize, v: u32) {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = std::fs::OpenOptions::new().write(true).open(path).expect("open db rw");
+    f.seek(SeekFrom::Start(off as u64)).expect("seek");
+    f.write_all(&v.to_le_bytes()).expect("write header word");
 }
 
 /// 明示した `vocab_max_entries` が header に焼かれ、 索引が実需サイズに縮む。
@@ -105,12 +122,8 @@ fn v7_db_upgrades_to_v8_on_writer_open() {
 
     // v7 を偽造する。 header CRC == 0 は「v27 以前の DB」として検証を通る経路なので、
     // version を 7 に戻して CRC を 0 にすれば v7 DB として open される。
-    {
-        let mut buf = std::fs::read(&path).expect("read");
-        buf[H_VERSION..H_VERSION + 4].copy_from_slice(&7u32.to_le_bytes());
-        buf[H_HEADER_CRC..H_HEADER_CRC + 4].copy_from_slice(&0u32.to_le_bytes());
-        std::fs::write(&path, &buf).expect("write forged v7");
-    }
+    write_header_u32(&path, H_VERSION, 7);
+    write_header_u32(&path, H_HEADER_CRC, 0);
     assert_eq!(header_u32(&path, H_VERSION), 7, "偽造に失敗");
 
     // readonly open は据え置き (共有 mmap を書かない)。
