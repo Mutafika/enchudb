@@ -3,6 +3,74 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.15.0 — 2026-07-30
+
+**on-disk format v8** (index の slot 関数変更に伴う version bump)。 公開 API 追加 1 件 +
+enchudb-rag の signature 変更 1 件。 いずれも naruhodo の実ワークロードから出た 3 件。
+
+### Fixed — vocab index の slot が hash 下位ビットで clustering する (#123)
+
+索引の slot を `h & mask` = hash の**下位**ビットで選んでいた。 一方 `fxhash` は乗算で
+終わる (`(h.rotate_left(5) ^ word).wrapping_mul(SEED)`) ため、 **積の下位 k bit は両
+オペランドの下位 k bit だけで決まり**、 上位側の entropy が下位に届かない。 結果、 構造の
+似たキーが同じ slot に集まって linear probing のクラスタが伸びていた。 実例 (日本法令
+コーパスの実キー): `第10条` は UTF-8 で 8 byte = 1 word ちょうどなので `h = word * SEED`
+そのものになり、 `第10条`〜`第13条` の**下位 32 bit が完全一致**する。
+
+- `Vocabulary::home_slot()` で **上位ビット**を採る。 slot に格納する hash は従来どおり
+  完全な 64 bit なので、 **格納形式は不変** (変わるのは probe 開始位置だけ)。
+- index magic `VIX2` → `VIX3`。 VIX2 を検出したら **clean_flag が立っていても作り直す**
+  (旧 slot 関数の index を新 slot 関数で引くと全 miss する)。
+- `migrate_legacy_index()` が旧 probe で**旧 slot を tombstone 経由で正確に消してから**
+  rebuild する。 消さずに再挿入すると no-clear rebuild (#92) の上に二重に載り、 占有率が
+  最大 2 倍になってクラスタ改善が相殺される。 index 全域の zero-fill は sparse ページを
+  全物理化する (#92 の回帰) ので採らない — clear / insert とも O(count)。
+
+### Added — `GrowableOptions::vocab_max_entries` (#122)
+
+`vocab_max_entries` が `max_entities × 16` (上限 256 M) から導出されていたが、 **vocab に
+入る値の種類数は entity 数と相関しない**。 辺が entity の大半を占めるグラフ形で索引が実需の
+1,000 倍以上確保される。 実測 (日本法令コーパス: 9,518 法令 / node 788,464 / 辺 20,691,521):
+
+| | 従来 | 実需 |
+|---|---|---|
+| max_entities | 44,126,694 (辺が 94%) | — |
+| vocab_max_entries | 256,000,000 (上限に張り付き) | 104,971 (実ユニーク Tag 値) |
+| vocab_index_cap | 268,435,456 slot × 13 B = 3.49 GB | 13.6 MB 相当 |
+| on-disk / maxrss | 1,260 MB / 1,252 MB | — |
+
+充填率 **0.04%**。 `GrowableOptions { vocab_max_entries: Some(n), .. }` で consumer が実測値を
+渡せるようにした (#118 と同じ opt-in 方式)。 `None` は従来式のままなので**既存 consumer の
+挙動は不変**。 header 焼き込みなので既存 DB は rebuild が必要 (`max_himos` と同じ性質)。
+
+### Fixed — schema / SQL / RAG / ravn の text 読みが並行 write 中に壊れる (#119 Step 0)
+
+上位 4 層がいずれも engine の**借用返し** `get_text` / `get_content` を呼び、 受け取った
+借用を即コピーしていた。 借用版は #106 の slot gen seqlock verify を通らないため、 writer が
+Leaf を re-tie している間に torn bytes を掴む。 実害は silent `None` (「値が無い」と「壊れて
+読めなかった」が区別できない) だけでなく、 **host process を殺す panic** まで含む —
+`LeafStore::get` が torn slot header の len で slice 範囲を作り OOB する (#59 の系統、
+falsify で実演)。
+
+- 内部呼び出しを `get_text_owned` (verify + retry 付き) へ移行。 元々コピーしていたので
+  **コピー回数は不変**、 増えるのは verify の再読のみ。
+- `Engine::get_content_owned` を追加 (`get_text_owned` の content 版)。
+
+#### Migration
+
+- **既存 DB はそのまま開ける**。 vocab index は derived data なので、 v7 DB を writer で
+  open した時点で自動的に作り直される (`VIX2` 検出 → in-place migrate)。 手動作業は不要。
+- **mixed-version 運用は非サポート**。 0.15 が書いた DB は header v8 になり、 **0.14 以前の
+  binary は `unsupported EnchuDB file version 8` で open を拒否する**。 これは意図的な設計で、
+  0.14 は index magic を検証しないため、 新 slot 関数で書かれた clean index を旧 slot 関数で
+  読んで **silent に lookup miss** するのを防ぐ。 同じ DB を複数バージョンで開く運用がある
+  場合は、 全 consumer を 0.15 へ揃えてから移行すること。
+  - v7 → v8 の書き換えは **writer open 時のみ**。 `open_readonly` は共有 mmap を書かない
+    ので header は据え置き (= readonly consumer だけ先に 0.15 化しても v7 のまま保てる)。
+- **breaking (enchudb-rag)**: `RagStore::text` が `Option<&str>` → `Option<String>`。 借用を
+  外に出さないための変更。 呼び元は `.as_deref()` で従来の比較がそのまま書ける。
+- `GrowableOptions` への field 追加は `..Default::default()` 利用側は無変更。
+
 ## 0.14.5 — 2026-07-30
 
 silent データ全損の防止 1 件。 on-disk format / 公開 API / 既定 layout は不変。
