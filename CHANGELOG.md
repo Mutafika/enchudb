@@ -3,7 +3,7 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
-## 0.15.0 — 2026-07-30
+## 0.15.0 — 2026-07-31
 
 **on-disk format v8** (index の slot 関数変更に伴う version bump)。 公開 API 追加 1 件 +
 enchudb-rag の signature 変更 1 件。 いずれも naruhodo の実ワークロードから出た 3 件。
@@ -75,6 +75,23 @@ falsify で実演)。
 - 内部呼び出しを `get_text_owned` (verify + retry 付き) へ移行。 元々コピーしていたので
   **コピー回数は不変**、 増えるのは verify の再読のみ。
 - `Engine::get_content_owned` を追加 (`get_text_owned` の content 版)。
+
+#### 検証
+
+| 項目 | 結果 |
+|---|---|
+| macOS workspace (逐次) | 679 passed / 0 failed |
+| Linux (OrbStack `rust:latest`、 engine/schema/sql/rag/oplog) | 519 passed / 0 failed |
+| **実 v7 DB** (0.14.4 実バイナリが生成、 FILE_VERSION 7 / index magic VIX2) | readonly open は v7・VIX2 のまま 200/200、 writer open で v8・VIX3 へ移行し 200/200、 再 open も 200/200 |
+| **本物の 2 プロセス** (子 writer が Leaf churn、 親が `open_readonly` を反復) | 258,869 writes と並行で lookup mismatch 0 |
+| re-tie 順序 (直接 / sync / async の 3 経路) | silent None・捏造 bytes とも 0 |
+
+falsify (修正を無効化して落ちることの実演) は #120 の align8 検証、 #123 の VIX2 migration、
+#119 Step 0 の借用版差し戻し、 crash 中断 tombstone の回収、 の 4 件で実施。
+
+`cargo test --workspace` は `enchudb-transport` が repo 外の `../sabitori` に path 依存する
+ため clean 環境では manifest 解決に失敗する (0.15.0 とは独立の既知問題、 別途 issue 化予定)。
+Linux 検証は該当 crate を除いた 5 crate 指定で実行した。
 
 #### Migration
 
