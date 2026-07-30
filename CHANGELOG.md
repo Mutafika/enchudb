@@ -3,6 +3,114 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.15.1 — 2026-07-31
+
+`enchudb-ngram` / `enchudb-textsearch` のみの変更。 **engine の on-disk format は不変**
+(v8 のまま)。 既定設定 (`n = 2`) での `.etxt` 出力は #121 以前と**バイト等価**なので、
+既存の索引・既存の生成パイプライン・外部 reader は一切影響を受けない。
+
+### Added — n-gram の n を可変化 (#121)
+
+`enchudb-ngram` は n = 2 固定で、 型・key encoding・file format・API 名まで bigram が
+焼き込まれていた。 **最適な n はスクリプトとコーパスに依存する**ので、 これは「trigram の
+方が良い」という話ではなく「n を選べないこと自体が gap」という話。
+
+```rust
+let mut idx = NgramIndex::with_n(3)?;   // 2..=4、 既定は 2
+idx.save("corpus.etxt")?;
+
+let idx = NgramIndex::open("corpus.etxt")?;
+assert_eq!(idx.n(), 3);                 // caller は n を覚えなくていい
+assert_eq!(idx.min_query_len(), 3);     // index で絞れないクエリ長を事前に判定できる
+```
+
+n は `.etxt` header に焼かれ `open` で戻るので、 **build と query で n がズレる事故が
+構造的に起きない**。 `TextSearch` 側の挙動 (どの長さから `.contains()` 検証が要るか) も
+index の n に自動追従する。
+
+- key は `n` 文字を 16bit ずつ詰めた **exact な u64** (hash ではない)。 `n ≤ 4` なら
+  衝突ゼロで、 「n 文字ちょうどのクエリは候補がそのまま正確一致 = 検証不要」という
+  `textsearch` の最適化が n によらず成立する。 hash 案だと `keys_are_exact()` gate の
+  入れ忘れが n ≥ 3 で silent な誤ヒットになる — その地雷ごと消えている。
+- file format v3 (Gram Index の entry 12 B → 16 B) を追加。 **v2 は読み書きとも従来どおり**
+  で、 v3 が出るのは `with_n(3)` / `with_n(4)` を明示したときだけ。 n = 2 の key は u64 でも
+  上位 32 bit が 0 なので、 v2 はゼロ拡張するだけで読め昇順ソート順も保たれる。
+- `NgramIndex::gram_count()` / `TextSearch::gram_count()` を追加 (旧名 `bigram_count` も残置)。
+- `enchudb_ngram::gram` module (`extract_keys` / `pack` / `key_to_string` / `validate_n`) を公開。
+  `bigram` module は n = 2 の薄い互換 wrapper として残置。
+
+### Added — `TextSearch::try_search` — 「答えられない」を明示エラーにする (#121 (c))
+
+postings-only な `.etxt` (#84) は原文を持たないので、 **クエリ長 < n** (全走査する原文が
+無い) と **クエリ長 > n** (偽陽性を落とす照合ができない) では答えを出せない。 従来の
+`search()` はどちらも**黙って空を返して**いて、 「該当なし」と区別できなかった。
+
+`try_search()` はこれを `ErrorKind::Unsupported` で返す。 `search()` は互換のため
+`Vec` を返し続ける (`try_search().unwrap_or_default()`)。 クエリ長 == n だけは検証が
+不要なので postings-only でも `Ok`。
+
+### 実測 — n をどう選ぶか (#121 受け入れ条件)
+
+同梱の `cargo run --release -p enchudb-ngram --example ngram_n_bench -- <label>=<corpus>` で、
+同一コーパスに対する n = 2/3/4 の index サイズ / 候補数 / 偽陽性率 / レイテンシを出せる。
+クエリはコーパス自身から抜いた実在部分文字列 200 件 × 長さ別、 正解は総当たり `.contains()`。
+
+**ASCII (この repo の `.rs` から ASCII 行のみ、 33,021 doc / 1.27 M 文字)** — n を上げると効く:
+
+| クエリ長 | n=2 候補/件 | n=2 FP率 | n=2 search | n=3 FP率 | n=3 search | n=4 FP率 | n=4 search |
+|---|---|---|---|---|---|---|---|
+| 4 | 376.0 | 18.1% | 66.2 µs | 1.35% | 25.1 µs | 0.00% | 21.6 µs |
+| 6 | 193.8 | 14.9% | 64.4 µs | 1.29% | 22.6 µs | 0.05% | 17.3 µs |
+| 10 | 75.9 | 8.2% | 67.1 µs | 0.95% | 22.9 µs | 0.25% | 15.0 µs |
+
+合成 ASCII (単語リストから生成、 20,000 doc / 3.68 M 文字) はもっと極端で、 10 文字クエリの
+偽陽性率が **99.43% → 35.86% (n=3) → 8.68% (n=4)**、 search が **431.9 → 46.1 → 8.9 µs (48x)**。
+
+**日本語 (この repo の `CHANGELOG.md` + `notes/` + `docs/`、 6,664 doc / 38 万文字)** —
+n を上げると **2 文字クエリが死ぬ**:
+
+| クエリ長 | n=2 | n=3 | n=4 |
+|---|---|---|---|
+| 2 (最頻) | **27.4 µs** | 421.8 µs (scan) | 425.5 µs (scan) |
+| 3 | 21.3 µs | 9.2 µs | 451.9 µs (scan) |
+| 6 | 9.7 µs | 3.0 µs | 2.2 µs |
+
+CJK は bigram で既に偽陽性率が 18〜33% と低く、 n=3 の改善幅 (数 µs) より **`国民` `接地` の
+ような 2 文字クエリが O(N) 全走査に落ちる 15 倍の劣化**が支配する。 判例 67k 件 / 3.3 GB
+(#84) でこれをやると致命的。
+
+**index サイズ**は issue の見積り (+4%) より大きい: ASCII で 8.5 → 9.1 MiB (n=3、 +7%) /
+9.6 MiB (n=4)、 日本語で 2.7 → 3.5 MiB (+30%) / 4.3 MiB (+59%)。 key 幅 (12 B → 16 B) の
+寄与はほぼ無く、 効いているのは **posting エントリ数**: n が小さいほど 1 doc 内で同じ gram が
+繰り返され dedup で消えるため、 n を上げると posting が増える。 それでも n=3 の ASCII は
++7% で 3 倍速いので、 サイズは判断材料にならない。
+
+→ **既定を変える理由は無い** (CJK が主戦場)。 ASCII/英語コーパスを持つ consumer が
+`with_n(3)` を明示的に選ぶ、 という形が正しい。 (d) の script-adaptive n
+(CJK run は n=2 / latin run は n=3 を 1 index 内で切り替え) は数字が出ているので
+wontfix にはしない — 別 issue。
+
+### 検証 (0.15.1)
+
+- `cargo test --workspace` — **718 passed / 0 failed / 28 ignored** (0.15.0 時点 679)
+- `tests/issue121_variable_n.rs` (9) — n=3/4 の file / bytes round-trip、 `open_mut` の
+  rebuild が n を引き継ぐこと、 n ≥ 3 の key が hash に潰れず衝突ゼロであること
+  (先頭 2 文字が同じ trigram 400 種が全て別 posting になる)、 範囲外 n の拒否
+- **旧 v2 の後方互換は「crate の writer を使わない手組みバイト列」に対して固定**
+  (`build_legacy_v2_bytes`)。 key の計算も `(c1 << 16) | c2` を直書きして
+  `to_key` に依存しない = writer と reader が同時に壊れても気づける。 併せて
+  `NgramIndex::new()` の出力がこの手組みバイト列と**完全一致**することも assert している
+- `crates/enchudb-textsearch/tests/issue121_query_len_policy.rs` (9) — クエリ長 × 原文有無の
+  4 象限、 `search` と `try_search` の一致、 n 文字ちょうどの結果が総当たり `.contains()` の
+  正解と一致すること
+- `cargo clippy --all-targets` 警告 0
+
+### 非対応のまま残したもの (#121)
+
+- n ≥ 5 (16 bit × 5 = 80 bit で u64 に収まらない = exact key を諦めることになる)
+- (d) script-adaptive n — 上記のとおり別 issue
+- 1..n の短い gram を別 posting 空間に併載して短クエリを救う案 (index 肥大とのトレードオフ)
+
 ## 0.15.0 — 2026-07-31
 
 **on-disk format v8** (index の slot 関数変更に伴う version bump)。 公開 API 追加 1 件 +
