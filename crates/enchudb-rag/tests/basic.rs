@@ -187,7 +187,7 @@ fn delete_and_upsert() {
         meta: Meta::new().value("tag", 2),
     }).unwrap();
 
-    assert_eq!(store.text(eid), Some("updated"));
+    assert_eq!(store.text(eid).as_deref(), Some("updated")); // #119: text() は owned 返しへ
     assert_eq!(store.meta_value(eid, "tag"), Some(2));
 
     store.delete(eid);

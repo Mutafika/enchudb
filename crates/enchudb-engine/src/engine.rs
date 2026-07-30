@@ -4837,6 +4837,24 @@ impl Engine {
         self.contents.get(local, key)
     }
 
+    /// #119: read-while-write でも torn read しない content 取得 (所有 copy 返し)。
+    ///
+    /// `get_content` は借用返しで、 新経路 (`_c_{key}` Leaf himo) では writer 稼働中に
+    /// slot 再利用で借用が死ぬ / seqlock verify を通さないので torn bytes を掴む。
+    /// 並行 read する consumer は本 API を使う ([`get_text_owned`] の content 版)。
+    ///
+    /// 旧 content region (pre-0.9) は 0.9.0 以降 **凍結アーカイブで書き込みゼロ** なので
+    /// copy のみ (verify 不要)。
+    pub fn get_content_owned(&self, eid: enchudb_oplog::EntityId, key: &str) -> Option<Vec<u8>> {
+        let local = enchudb_oplog::eid_local(eid);
+        if let Some(hid) = self.content_himo_id(local, key) {
+            if let Some(bytes) = self.text_owned_by_id(hid as usize, local) {
+                return Some(bytes);
+            }
+        }
+        self.contents.get(local, key).map(|b| b.to_vec())
+    }
+
     // ──── changefeed (WAL 変更通知) ────
 
     /// WAL に durable 化した record を listener に push する。
@@ -4932,6 +4950,17 @@ impl Engine {
     pub fn get_text_owned(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Option<Vec<u8>> {
         let eid = enchudb_oplog::eid_local(eid);
         let hid = self.himo_id(himo)?;
+        self.text_owned_by_id(hid, eid)
+    }
+
+    /// `get_text_owned` / `get_content_owned` 共通の本体 (hid 解決済み・local eid)。
+    ///
+    /// - **Leaf (routed)**: LeafStore の live mmap を `try_read` (slot gen seqlock) で
+    ///   bounds-safe に copy し、 copy の前後で column offset を再読して一致するまで retry。
+    ///   (a) 別 offset への relocation = column 変化、 (b) 同 offset 再利用 / in-place torn =
+    ///   slot gen 変化、 の両方を検出する。
+    /// - **Tag / reserved Leaf**: append-only vocab は不変なので copy のみ (retry 不要)。
+    fn text_owned_by_id(&self, hid: usize, eid_local: u32) -> Option<Vec<u8>> {
         match self.value_types[hid] {
             ValueType::Tag | ValueType::Leaf => match self.leaf_for(hid) {
                 // routed-Leaf: seqlock verify で torn read / stale を排除。
@@ -4940,13 +4969,11 @@ impl Engine {
                     // 不変なので実運用では 1〜2 回で確定する。
                     const MAX_TRY: usize = 64;
                     for _ in 0..MAX_TRY {
-                        let raw = self.himos[hid].get_value(eid)?;
+                        let raw = self.himos[hid].get_value(eid_local)?;
                         // slot 内の seqlock (gen) で torn / 同 offset 再利用を検出。
                         let LeafRead::Ok(bytes) = leaf.try_read(raw) else { continue };
                         // column offset を再読。 不変なら relocation も無かった = 確定。
-                        // (slot gen が同 offset 再利用を、 column 再読が別 offset への
-                        //  relocation を担当し、 併せて torn/stale を封じる。)
-                        if self.himos[hid].get_value(eid) == Some(raw) {
+                        if self.himos[hid].get_value(eid_local) == Some(raw) {
                             return Some(bytes);
                         }
                     }
@@ -4954,7 +4981,7 @@ impl Engine {
                 }
                 // Tag / reserved Leaf: 不変な vocab bytes を copy。
                 None => {
-                    let raw = self.himos[hid].get_value(eid)?;
+                    let raw = self.himos[hid].get_value(eid_local)?;
                     Some(self.vocab.get(raw).to_vec())
                 }
             },

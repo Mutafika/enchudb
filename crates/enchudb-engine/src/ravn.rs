@@ -53,7 +53,8 @@ impl Ravn {
             if i < steps.len() - 1 {
                 current = self.engine.get(current, step)? as enchudb_oplog::EntityId;
             } else {
-                return self.engine.get_text(current, step).map(|b| b.to_vec());
+                // #119: owned + seqlock verify 版 (借用版は writer 稼働中 torn-unsafe)。
+                return self.engine.get_text_owned(current, step);
             }
         }
         None
@@ -128,7 +129,7 @@ impl Ravn {
     /// v31: テキスト抽出。
     pub fn extract_text(&self, eids: &[enchudb_oplog::EntityId], himo: &str) -> Vec<Vec<u8>> {
         eids.iter()
-            .filter_map(|&e| self.engine.get_text(e, himo).map(|b| b.to_vec()))
+            .filter_map(|&e| self.engine.get_text_owned(e, himo)) // #119
             .collect()
     }
 
@@ -153,7 +154,7 @@ impl Ravn {
         let eids = self.engine.query(conds);
         eids.iter().map(|&eid| {
             let values: Vec<Option<Vec<u8>>> = fields.iter()
-                .map(|f| self.engine.get_text(eid, f).map(|b| b.to_vec()))
+                .map(|f| self.engine.get_text_owned(eid, f)) // #119
                 .collect();
             (eid, values)
         }).collect()

@@ -1950,8 +1950,11 @@ impl<'a> EntityRef<'a> {
         match cd.ty {
             ColumnType::Number => eng.get(self.eid, &cd.himo_name).map(|v| Value::Number(v as i64)),
             ColumnType::Ref => eng.get(self.eid, &cd.himo_name).map(|v| Value::Ref(v as EntityId)),
-            ColumnType::Tag | ColumnType::Leaf => eng.get_text(self.eid, &cd.himo_name)
-                .and_then(|b| std::str::from_utf8(b).ok().map(|s| Value::Text(s.to_string()))),
+            // #119: 借用返しの `get_text` は writer 稼働中に seqlock verify を通らず torn
+            // bytes を掴む (= from_utf8 が失敗して silent に None を返す)。 元々即コピーして
+            // いるので、 verify 付きの owned 版に寄せてもコピー回数は変わらない。
+            ColumnType::Tag | ColumnType::Leaf => eng.get_text_owned(self.eid, &cd.himo_name)
+                .and_then(|b| String::from_utf8(b).ok().map(Value::Text)),
         }
     }
 

@@ -966,9 +966,10 @@ fn read_value(eng: &Engine, eid: EntityId, cd: &ColDef) -> Value {
             Some(n) => Value::Integer(n as i64),
             None => Value::Null,
         },
-        SqlType::Text | SqlType::Leaf => match eng.get_text(eid, &cd.himo) {
-            Some(b) => match std::str::from_utf8(b) {
-                Ok(s) => Value::Text(s.to_string()),
+        // #119: owned + seqlock verify 版に寄せる (借用版は writer 稼働中 torn-unsafe)。
+        SqlType::Text | SqlType::Leaf => match eng.get_text_owned(eid, &cd.himo) {
+            Some(b) => match String::from_utf8(b) {
+                Ok(s) => Value::Text(s),
                 Err(_) => Value::Null,
             },
             None => Value::Null,

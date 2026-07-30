@@ -228,9 +228,13 @@ impl RagStore {
     }
 
     /// テキストを取得。
-    pub fn text(&self, eid: EntityId) -> Option<&str> {
-        self.db.get_content(eid, TEXT_KEY)
-            .and_then(|b| std::str::from_utf8(b).ok())
+    ///
+    /// #119: 借用 (`Option<&str>`) から所有 (`Option<String>`) に変更。 借用返しの
+    /// `get_content` は writer 稼働中に Leaf slot 再利用で借用が死び、 seqlock verify も
+    /// 通らないため torn bytes を掴む。 呼び元は元々 `to_string()` していた。
+    pub fn text(&self, eid: EntityId) -> Option<String> {
+        self.db.get_content_owned(eid, TEXT_KEY)
+            .and_then(|b| String::from_utf8(b).ok())
     }
 
     /// ベクトルを取得。
@@ -245,8 +249,9 @@ impl RagStore {
 
     /// Symbol の生文字列を取得。
     pub fn meta_symbol(&self, eid: EntityId, field: &str) -> Option<String> {
-        self.db.get_text(eid, field)
-            .and_then(|b| std::str::from_utf8(b).ok().map(|s| s.to_string()))
+        // #119: owned + seqlock verify 版 (借用版は writer 稼働中 torn-unsafe)。
+        self.db.get_text_owned(eid, field)
+            .and_then(|b| String::from_utf8(b).ok())
     }
 
     /// ベクトル検索。Filter でメタを絞り込んでから brute force cosine。
@@ -285,7 +290,7 @@ impl RagStore {
         let mut hits = top.into_sorted();
         // テキストを詰める
         for h in &mut hits {
-            h.text = self.text(h.eid).map(|s| s.to_string());
+            h.text = self.text(h.eid);
         }
         Ok(hits)
     }
@@ -386,7 +391,7 @@ impl RagStore {
             .map(|(eid, score)| Hit {
                 eid,
                 score, // RRF score (大きいほど良い)
-                text: self.text(eid).map(|s| s.to_string()),
+                text: self.text(eid),
             })
             .collect();
 
@@ -407,10 +412,10 @@ impl RagStore {
     pub fn rebuild_bm25(&mut self) {
         self.bm25 = Bm25Index::new();
         for eid in self.db.entities() {
-            if let Some(text) = self.db.get_content(eid, TEXT_KEY)
-                .and_then(|b| std::str::from_utf8(b).ok())
+            if let Some(text) = self.db.get_content_owned(eid, TEXT_KEY)
+                .and_then(|b| String::from_utf8(b).ok())
             {
-                self.bm25.add_document(eid, text);
+                self.bm25.add_document(eid, &text);
             }
         }
     }
