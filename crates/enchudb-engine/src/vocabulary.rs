@@ -607,6 +607,64 @@ mod tests {
         }
     }
 
+    /// #123 (F6): migration の途中で kill された状態 = **tombstone (flag = 3) が残った
+    /// index** を次の open が回収できること。 旧実装は `xm[off] == 1` しか同一 entry と
+    /// 見なさず、 rebuild は no-clear (#92) なので flag 3 が恒久ゴミとして残り、 占有率と
+    /// probe 長が永久に劣化していた。 crash は「open の単一スレッド区間で必ず消える」
+    /// という前提を破る。
+    #[test]
+    fn issue123_crash_left_tombstones_are_reclaimed() {
+        let cap = 1u32 << 8;
+        let r = make_regions(1024, cap, 64 * 1024);
+        let keys: Vec<String> = (0..24).map(|i| format!("第{}条", 10 + i)).collect();
+
+        let ids: Vec<u32> = {
+            let w = r.vocab_init(1024, cap);
+            let ids = keys.iter().map(|k| w.get_or_insert(k.as_bytes())).collect();
+            w.sync();
+            ids
+        };
+        let entries: Vec<(&[u8], u32)> =
+            keys.iter().zip(&ids).map(|(k, id)| (k.as_bytes(), *id)).collect();
+        r.plant_legacy_index(cap, &entries);
+
+        // migration ① (tombstone を立てた) 直後に kill された状態を再現する:
+        // 先頭 8 entry の flag を 3 にし、 payload (hash/vid) は残す。
+        {
+            let xm = unsafe {
+                std::slice::from_raw_parts_mut(r.index_ptr, r.index_len)
+            };
+            let mut done = 0;
+            for i in 0..cap as usize {
+                let off = INDEX_HEADER + i * INDEX_SLOT_SIZE;
+                if xm[off] == 1 {
+                    xm[off] = 3;
+                    done += 1;
+                    if done == 8 { break; }
+                }
+            }
+            assert_eq!(done, 8, "tombstone を立てられていない");
+        }
+
+        let v = r.vocab_load(/*readonly=*/ false);
+
+        for (k, id) in keys.iter().zip(&ids) {
+            assert_eq!(v.lookup(k.as_bytes()), Some(*id), "crash 復帰後に {k} が引けない");
+        }
+        assert_eq!(
+            r.occupied_slots(cap),
+            keys.len(),
+            "crash で残った tombstone が回収されず恒久ゴミになっている (F6)"
+        );
+        // flag 3 が 1 つも残っていないこと (lookup/insert は 0/非 0 でしか見ないので
+        // 正しさは保たれるが、 占有と probe 長が劣化し続ける)
+        let xm = r.index_bytes();
+        let leftovers = (0..cap as usize)
+            .filter(|i| xm[INDEX_HEADER + i * INDEX_SLOT_SIZE] == 3)
+            .count();
+        assert_eq!(leftovers, 0, "flag=3 の tombstone が {leftovers} 個残っている");
+    }
+
     /// #123: migrate 後に graceful close (clean flag) すると、 次の open は rebuild を
     /// **skip** する (= VIX3 magic が永続化されている)。 magic を書き忘れると毎 open
     /// rebuild し続けるので、 その回帰を止める。

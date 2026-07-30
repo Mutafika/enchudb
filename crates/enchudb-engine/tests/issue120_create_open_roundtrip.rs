@@ -72,3 +72,29 @@ fn vocab_data_size_at_aligned_limit_roundtrips() {
 
     cleanup(&path);
 }
+
+/// #120 同型: `content_data_size` も align8 後の値で検証されること。 検証は 3 region 共通の
+/// `ck_u32` に載っているが、 test は vocab しか無かった (レビュー指摘)。
+#[test]
+fn content_data_size_u32_max_is_rejected_at_create() {
+    use enchudb_engine::GrowableOptions;
+    let path = tmp_path("content_u32max");
+    cleanup(&path);
+
+    let err = match Engine::create_growable_opts(
+        &path,
+        GrowableOptions {
+            max_entities: 1000,
+            content_data_size: Some(u32::MAX as usize), // align8 → 2^32
+            ..Default::default()
+        },
+    ) {
+        Ok(_) => panic!("create が成功した — content 側で #120 が再発している"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "err = {err}");
+    assert!(err.to_string().contains("content_data_size"), "knob 名が出ない: {err}");
+    assert!(!std::path::Path::new(&path).exists(), "書いてから落ちている");
+
+    cleanup(&path);
+}
