@@ -43,6 +43,26 @@ enchudb-rag の signature 変更 1 件。 いずれも naruhodo の実ワーク�
 渡せるようにした (#118 と同じ opt-in 方式)。 `None` は従来式のままなので**既存 consumer の
 挙動は不変**。 header 焼き込みなので既存 DB は rebuild が必要 (`max_himos` と同じ性質)。
 
+### Fixed — Leaf re-tie の順序を全経路で `insert → publish → free` に統一 (#119)
+
+旧 slot を **free してから** insert / publish する経路が残っていた。 同サイズの re-tie では
+best-fit が「たった今 free した hole」を必ず再利用するため、 旧 offset を掴んでいる並行
+reader が再利用済み slot を読む。 独立レビューで sync / async の 2 経路が漏れているのが
+判明した (直接経路のみ修正した状態でリリースしかけていた)。 実測:
+
+| 経路 | 修正前 | 修正後 |
+|---|---|---|
+| `tie_bytes_to_by_id` (直接 / `Engine::content` 等) | silent None 8,132 / 60,463 reads | 0 |
+| `remote_tieleaf_apply` (sync = replica / gossip 受信) | silent None 59,444 / 6.6 M reads | 0 |
+| `apply_op::Tie` (async = `create_concurrent*` + `tie_*_async`) | **捏造 bytes 370,471** + None 20,390 / 8.4 M reads | 0 |
+
+async 経路の「捏造 bytes」は payload に free-list の hole header (`[36,0,0,0]` 等) が
+混ざった値で、 legacy slot 経路では seqlock でも検出できない = **静かに間違った値が読める**。
+
+あわせて `get_text_owned` の retry を時間方向に散らした (spin → yield の backoff、 上限
+64 → 256)。 単一 cell を止めどなく re-tie する writer と競ると retry を間を置かずに使い切り、
+「値が無い」と区別できない None を返していた (3〜9 件 / 33 万 read → 0)。
+
 ### Fixed — schema / SQL / RAG / ravn の text 読みが並行 write 中に壊れる (#119 Step 0)
 
 上位 4 層がいずれも engine の**借用返し** `get_text` / `get_content` を呼び、 受け取った
@@ -70,6 +90,13 @@ falsify で実演)。
 - **breaking (enchudb-rag)**: `RagStore::text` が `Option<&str>` → `Option<String>`。 借用を
   外に出さないための変更。 呼び元は `.as_deref()` で従来の比較がそのまま書ける。
 - `GrowableOptions` への field 追加は `..Default::default()` 利用側は無変更。
+- `vocab_max_entries` に 2^31 超を渡すと create が Err になる (`next_power_of_two` が u32 を
+  溢れ、 release build では index_cap 0 が header に焼かれて open 不能な DB ができるため。
+  #120 と同型を新 knob で再発させない)。 天井 hit の panic message も knob 名と
+  「header 焼き込みなので既存 DB は再作成が必要」を含む actionable な形にした。
+- `Engine::get_content_owned` は新経路の cell が設定されている場合、 retry 枯渇でも
+  **legacy content region に fallback しない** (0.9.0 以降凍結しているアーカイブの古い値が
+  蘇るため)。 fallback は「新経路に cell が無い」ときだけ。
 
 ## 0.14.5 — 2026-07-30
 

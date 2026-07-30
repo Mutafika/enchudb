@@ -136,7 +136,7 @@ impl Ravn {
     /// v31: content 抽出。
     pub fn extract_content(&self, eids: &[enchudb_oplog::EntityId], key: &str) -> Vec<Vec<u8>> {
         eids.iter()
-            .filter_map(|&e| self.engine.get_content(e, key).map(|b| b.to_vec()))
+            .filter_map(|&e| self.engine.get_content_owned(e, key)) // #119
             .collect()
     }
 

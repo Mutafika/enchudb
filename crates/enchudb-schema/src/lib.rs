@@ -960,8 +960,9 @@ impl Database {
         self.eng.rebuild();
         let eids = self.eng.pull_raw(LEGACY_SCHEMA_META_HIMO, vid);
         let Some(&eid) = eids.first() else { return Ok(None); };
-        let Some(blob) = self.eng.get_content(eid, LEGACY_SCHEMA_BLOB_HIMO) else { return Ok(None); };
-        let s = std::str::from_utf8(blob)
+        // #119: blob 読みも owned + verify 版へ (cross-process writer と併走する open がある)。
+        let Some(blob) = self.eng.get_content_owned(eid, LEGACY_SCHEMA_BLOB_HIMO) else { return Ok(None); };
+        let s = std::str::from_utf8(&blob)
             .map_err(|_| SchemaError::Parse("legacy schema blob not utf8".into()))?;
         let parsed = deserialize_schema(s)?;
         Ok(Some(parsed))

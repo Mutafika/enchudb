@@ -273,8 +273,9 @@ impl Database {
         self.eng.rebuild();
         let eids = self.eng.pull_raw(TABLE_MARKER_HIMO, vid);
         let Some(&eid) = eids.first() else { return Ok(()); };
-        let blob = match self.eng.get_content(eid, SCHEMA_BLOB_HIMO) {
-            Some(b) => b.to_vec(),
+        // #119: blob 読みも owned + verify 版へ (cross-process writer と併走する open がある)。
+        let blob = match self.eng.get_content_owned(eid, SCHEMA_BLOB_HIMO) {
+            Some(b) => b,
             None => return Ok(()),
         };
         let s = std::str::from_utf8(&blob)

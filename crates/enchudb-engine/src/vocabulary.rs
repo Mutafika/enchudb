@@ -209,7 +209,10 @@ impl Vocabulary {
                 let vid = u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap());
                 // #92 と同じ predicate: vid >= max_entries の破損 slot は read_value が
                 // offsets を溢れるので触らない。
-                if xm[off] == 1
+                // flag == 3 は「前回の migration が crash で中断して残した tombstone」。
+                // 同じ entry なのでここで回収し、 ② で 0 に戻す (migration を idempotent に
+                // する。 index 全域の scan は sparse ページ全物理化 = #92 の回帰なので採らない)。
+                if (xm[off] == 1 || xm[off] == 3)
                     && slot_hash == h
                     && vid < max_entries
                     && read_value(offsets, data, vid) == value

@@ -1126,9 +1126,20 @@ impl Layout {
     fn compute(max_entities: u32, max_himos: u32, vocab_data_size: usize, content_data_size: Option<usize>, cyl_max_values: Option<u32>, leaf_data_size: Option<usize>, vocab_max_entries: Option<u32>) -> Result<Self, String> {
         // #122: 既定は max_entities × 16 (上限 256 M)。 vocab の値の種類数は entity 数と
         // 相関しないので、 実測で分かっている consumer は GrowableOptions で明示する。
-        let vocab_max_entries = vocab_max_entries
-            .map(|v| v.max(1))
-            .unwrap_or_else(|| max_entities.saturating_mul(16).min(256_000_000));
+        let vocab_max_entries = match vocab_max_entries {
+            // #120 と同じ原則: 上限超過は **書く前に** Err。 2^31 超は下の
+            // `next_power_of_two()` が overflow し (release では 0 に化けて header に
+            // 焼かれ、 open が "index_cap 0 must be nonzero" で恒久失敗する)。
+            Some(v) if v > (1u32 << 31) => {
+                return Err(format!(
+                    "vocab_max_entries {} exceeds format limit {} (next_power_of_two が u32 を溢れる)",
+                    v,
+                    1u32 << 31,
+                ));
+            }
+            Some(v) => v.max(1),
+            None => max_entities.saturating_mul(16).min(256_000_000),
+        };
         Self::compute_with_caps(
             max_entities, max_himos,
             vocab_max_entries, vocab_data_size,
@@ -4043,6 +4054,26 @@ impl Engine {
     /// v6 (#88): routed-Leaf の cell が offset を持っていれば LeafStore に free。
     /// delete / untie / apply_op の remove 直前に呼ぶ (leak 防止)。 非 routed は no-op。
     #[inline]
+    /// #119: **publish 後**に旧 offset を free するための 2 段版。 `take_leaf_cell` で
+    /// 旧 offset を先に捕まえ、 column を更新してから `free_leaf_offset` に渡す。
+    ///
+    /// free を先に呼ぶと、 同サイズ re-tie では best-fit が「たった今 free した hole」を
+    /// 必ず再利用するため、 旧 offset を掴んでいる並行 reader が再利用済み slot を読む
+    /// (silent None / free-list の hole header が payload に混ざった捏造 bytes)。
+    fn take_leaf_cell(&self, eid: u32, hid: usize) -> Option<u32> {
+        if self.leaf_for(hid).is_some() {
+            self.himos[hid].get_value(eid)
+        } else {
+            None
+        }
+    }
+
+    fn free_leaf_offset(&self, hid: usize, off: Option<u32>) {
+        if let (Some(leaf), Some(off)) = (self.leaf_for(hid), off) {
+            leaf.free(off);
+        }
+    }
+
     fn free_leaf_cell(&self, eid: u32, hid: usize) {
         if let Some(leaf) = self.leaf_for(hid)
             && let Some(off) = self.himos[hid].get_value(eid)
@@ -4082,12 +4113,14 @@ impl Engine {
         if hid >= self.himos.len() { return; }
         self.entities.ensure_live(local);
         // v6 (#88): remote re-tie 上書きで旧 offset を回収。
-        self.free_leaf_cell(local, hid);
+        // #119: **insert → publish → free** の順 (逆順だと並行 reader が再利用 slot を読む)。
+        let old = self.take_leaf_cell(local, hid);
         let value = match self.leaf_for(hid) {
             Some(leaf) => leaf.insert(bytes),
             None => self.vocab.insert(bytes), // pre-v6 / reserved: 旧 vocab fallback
         };
         self.himos[hid].set(local, value);
+        self.free_leaf_offset(hid, old);
         Self::advance_table_next_local_for(&self.tables, local);
         if self.gossip_remote_apply() {
             if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
@@ -4857,8 +4890,12 @@ impl Engine {
     pub fn get_content_owned(&self, eid: enchudb_oplog::EntityId, key: &str) -> Option<Vec<u8>> {
         let local = enchudb_oplog::eid_local(eid);
         if let Some(hid) = self.content_himo_id(local, key) {
-            if let Some(bytes) = self.text_owned_by_id(hid as usize, local) {
-                return Some(bytes);
+            // cell が設定されていれば新経路の結果をそのまま返す。 `text_owned_by_id` の
+            // **retry 枯渇 (None)** で legacy region に fallback すると、 0.9.0 以降凍結して
+            // いる古いアーカイブ値が蘇ってしまう (= 新しい値を書いたのに古い値が読める)。
+            // fallback は「新経路に cell が無い」ときだけに限定する。
+            if self.himos[hid as usize].get_value(local).is_some() {
+                return self.text_owned_by_id(hid as usize, local);
             }
         }
         self.contents.get(local, key).map(|b| b.to_vec())
@@ -4976,8 +5013,22 @@ impl Engine {
                 Some(leaf) => {
                     // churn が極端でも収束する上限。 同 eid は次の re-tie まで offset
                     // 不変なので実運用では 1〜2 回で確定する。
-                    const MAX_TRY: usize = 64;
-                    for _ in 0..MAX_TRY {
+                    //
+                    // #119: 単一 cell を止めどなく re-tie する writer と競ると、 retry を
+                    // **間を置かずに** 64 回消費して「値が無い」と区別できない None を返して
+                    // いた (実測 3〜9 件 / 33 万 read)。 writer は 1 回の re-tie ごとに前進
+                    // するので、 再試行を時間方向に散らせば収束する。 spin → yield と
+                    // backoff させ、 上限も引き上げる。
+                    const MAX_TRY: usize = 256;
+                    const SPIN_TRIES: usize = 16;
+                    for attempt in 0..MAX_TRY {
+                        if attempt > 0 {
+                            if attempt < SPIN_TRIES {
+                                std::hint::spin_loop();
+                            } else {
+                                std::thread::yield_now();
+                            }
+                        }
                         let raw = self.himos[hid].get_value(eid_local)?;
                         // slot 内の seqlock (gen) で torn / 同 offset 再利用を検出。
                         let LeafRead::Ok(bytes) = leaf.try_read(raw) else { continue };
@@ -7602,8 +7653,10 @@ impl Engine {
                 let hid = himo_id as usize;
                 if hid >= self.himos.len() { return; }
                 // v6 (#88): routed-Leaf の re-tie 上書きは旧 offset を free (async path)。
-                self.free_leaf_cell(eid, hid);
+                // #119: **publish → free** の順 (逆順だと並行 reader が再利用 slot を読む)。
+                let old = self.take_leaf_cell(eid, hid);
                 self.himos[hid].set(eid, value);
+                self.free_leaf_offset(hid, old);
             }
             Op::Untie { eid, himo_id } => {
                 let hid = himo_id as usize;
