@@ -3,6 +3,38 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.14.5 — 2026-07-30
+
+silent データ全損の防止 1 件。 on-disk format / 公開 API / 既定 layout は不変。
+
+### Fixed — align8 が u32 上限を跨ぐ create が「二度と開けない DB」を作る (#120)
+
+`create_growable_with_leaf(path, ents, Some(u32::MAX as usize), ..)` が **create もビルドも
+成功する**のに、 できたストアを open すると
+`vocab_data_size 4294967296 exceeds format limit 4294967295 (u32 data_end) — corrupt header`
+で恒久的に開けなかった。 naruhodo の配信ストア準備で、 **7 分のフルビルドが「完走ログを
+出した後に全損」**する形で実踏 (v0.14.4)。
+
+原因は検証の当て先。 create 側は **整列前** の要求値 (`u32::MAX` = 4 GiB−1) を検証して
+通すが、 layout は `align8(n) = (n + 7) & !7` で **4 GiB ちょうど (2^32)** に切り上げた値を
+header に焼く。 open 側は header の値を u32 data_end 制約で検証するため、 create と open で
+判定が食い違っていた。
+
+- `Layout::try_from_params` で可変 region 3 本 (vocab / himoreg / content data) を
+  **align8 後**の値で検証。 create / open が同じ関数を通るので判定が原理的に一致する。
+- `Layout::compute` / `compute_with_caps` を `Result` 化し、 create 経路は
+  `io::ErrorKind::InvalidInput` で伝播 (旧 `from_params` の `expect` panic を廃止) —
+  **1 byte も書く前に Err で落ちる**。 どちらも private 関数なので公開 API は不変。
+- 上限ちょうど (8-aligned = `u32::MAX & !7`) は従来どおり create でき、 open も通る
+  (検証を厳しくしすぎて正常な最大値を弾いていないことを test で固定)。
+
+#### Migration
+
+- 不要。 既存の正常な DB / 公開 API / format はいずれも不変。
+- **既に生成してしまった壊れた DB は開けないため作り直しが必要** (該当条件は
+  `vocab_data_size > u32::MAX - 7` を渡した create のみ)。 0.14.5 では同じ引数が
+  create 時点で Err になる。
+
 ## 0.14.4 — 2026-07-26
 
 公開 API 追加 1 件 (additive・後方互換)。 on-disk format / 既定 layout は不変。
