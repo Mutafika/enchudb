@@ -10,7 +10,11 @@ const HEADER: usize = 16;
 /// 0 = dirty (rebuild 要)、 1 = clean (rebuild skip 可)。
 /// 残り 13-15 byte は reserved。
 const CLEAN_FLAG_OFF: usize = 12;
-const INDEX_MAGIC: [u8; 4] = [b'V', b'I', b'X', b'2'];
+const INDEX_MAGIC: [u8; 4] = [b'V', b'I', b'X', b'3'];
+/// #123: slot 選択を hash 下位ビット (`h & mask`) から **上位ビット** に変えた前の index。
+/// 0.14 以前の DB はこの magic を持つので、 open 時に in-place migrate する
+/// (`migrate_legacy_index`)。
+const INDEX_MAGIC_V2: [u8; 4] = [b'V', b'I', b'X', b'2'];
 const INDEX_HEADER: usize = 16;
 const INDEX_SLOT_SIZE: usize = 13;
 
@@ -40,6 +44,29 @@ pub struct Vocabulary {
 
 unsafe impl Sync for Vocabulary {}
 unsafe impl Send for Vocabulary {}
+
+/// #123: slot は **hash の上位ビット**から採る。
+///
+/// `fxhash` は乗算で終わる (`h = (h.rotate_left(5) ^ word).wrapping_mul(SEED)`) ため、
+/// **積の下位 k bit は両オペランドの下位 k bit だけで決まり**、 上位側の entropy が下位に
+/// 伝播しない。 旧実装 (VIX2) は `h & mask` で下位を採っていたので、 構造の似たキーが同一
+/// slot に集まって linear probe のクラスタが伸びていた (実例: `第10条` / `第11条` / `第12条`
+/// は 1 word ちょうどで `h = word * SEED`、 下位 32 bit が完全一致)。 上位ビットなら乗算の
+/// 桁上がりが載る。
+///
+/// `index_cap` は 2^n (open 時に検証済み、 `validate_header`)。 cap == 1 の退化ケースは 0。
+#[inline]
+fn home_slot(h: u64, index_cap: u32) -> usize {
+    let bits = index_cap.trailing_zeros();
+    if bits == 0 { 0 } else { (h >> (64 - bits)) as usize }
+}
+
+/// VIX2 (0.14 以前) の slot 選択。 index の in-place migration で **旧 slot を正確に消す**
+/// ためだけに残す。
+#[inline]
+fn home_slot_legacy(h: u64, index_cap: u32) -> usize {
+    (h & (index_cap - 1) as u64) as usize
+}
 
 impl Vocabulary {
     pub fn data_region_size(data_size: usize) -> usize { data_size.max(HEADER) }
@@ -96,12 +123,16 @@ impl Vocabulary {
 
         let xm = index.slice();
         let index_cap = u32::from_le_bytes(xm[4..8].try_into().unwrap());
+        // #123: VIX2 = slot が hash **下位**ビットの旧 index。 clean_flag が立っていても
+        // slot 関数が違うので再利用できない (lookup が全部 miss する) → 必ず作り直す。
+        let legacy_index = !is_fresh && xm[0..4] == INDEX_MAGIC_V2;
+        let needs_rebuild = !is_fresh && (clean_flag != 1 || legacy_index);
 
         let mut v = Self {
             data, offsets, index,
             shadow_index: None,
-            clean_on_disk: std::sync::atomic::AtomicBool::new(clean_flag == 1),
-            rebuilt_on_load: !is_fresh && clean_flag != 1,
+            clean_on_disk: std::sync::atomic::AtomicBool::new(clean_flag == 1 && !legacy_index),
+            rebuilt_on_load: needs_rebuild,
             count: AtomicU32::new(count),
             data_end: AtomicU32::new(data_end),
             max_entries, index_cap,
@@ -110,8 +141,10 @@ impl Vocabulary {
         // 保証されているので rebuild skip。 それ以外 (= 初期 / crash 後 / 未対応の旧 DB) は
         // 全部 rebuild。
         // #77-H1: readonly open は共有 mmap を書き換えず heap の shadow へ。
-        if !is_fresh && clean_flag != 1 {
+        if needs_rebuild {
             if readonly {
+                // shadow は zero 済み = 旧 slot が存在しないので legacy でも clear 不要。
+                // on-disk index は VIX2 のまま残す (readonly は共有 mmap を書かない)。
                 let size = Self::index_region_size(v.index_cap);
                 let mut shadow = vec![0u8; size].into_boxed_slice();
                 shadow[0..4].copy_from_slice(&INDEX_MAGIC);
@@ -126,10 +159,71 @@ impl Vocabulary {
                 );
                 v.shadow_index = Some(shadow);
             } else {
+                // #123: legacy は旧 slot を消してから (消さないと no-clear rebuild (#92) の
+                // 上に新 slot で二重に載って占有率が最大 2 倍になる)。
+                if legacy_index {
+                    v.migrate_legacy_index();
+                }
                 v.rebuild_index();
+                if legacy_index {
+                    v.index.write_at(0, &INDEX_MAGIC);
+                    v.index.mark_dirty(0, 4);
+                }
             }
         }
         v
+    }
+
+    /// #123: VIX2 index (slot = hash 下位ビット) の entry を **正確に消す** (writer 専用)。
+    ///
+    /// 手順: ① 旧 probe (`home_slot_legacy`) で各 live id の slot を見つけ **tombstone
+    /// (flag = 3)** にして位置を記録する。 その場で 0 にすると後続 id の probe chain が
+    /// 途切れて取り残しが出るため、 chain を保つ中間状態を使う。 ② 記録した tombstone を
+    /// 0 に戻す。 この後 `rebuild_index` が新 slot 関数で再挿入する。
+    ///
+    /// index 全域の zero-fill は sparse ページを 1 枚残らず物理化する (#92 の回帰) ので
+    /// 採らない。 clear / insert とも O(count) で、 触るのは live slot が載るページのみ。
+    /// flag = 3 は open 時の単一スレッド区間だけに存在し、 ② で必ず消える。
+    fn migrate_legacy_index(&mut self) {
+        let count = self.count.load(Ordering::Relaxed);
+        if count == 0 {
+            return;
+        }
+        let index_cap = self.index_cap;
+        let max_entries = self.max_entries;
+        let mask = (index_cap - 1) as u64;
+        let Self { index, offsets, data, .. } = self;
+        let xm = index.as_mut_slice();
+
+        let mut tombstones: Vec<usize> = Vec::new();
+        for id in 0..count {
+            let value = read_value(offsets, data, id);
+            let h = fxhash(value);
+            let mut idx = home_slot_legacy(h, index_cap);
+            for _ in 0..index_cap as usize {
+                let off = INDEX_HEADER + idx * INDEX_SLOT_SIZE;
+                if xm[off] == 0 {
+                    break; // 旧 index に載っていない (torn write 等) — rebuild が入れ直す
+                }
+                let slot_hash = u64::from_le_bytes(xm[off + 1..off + 9].try_into().unwrap());
+                let vid = u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap());
+                // #92 と同じ predicate: vid >= max_entries の破損 slot は read_value が
+                // offsets を溢れるので触らない。
+                if xm[off] == 1
+                    && slot_hash == h
+                    && vid < max_entries
+                    && read_value(offsets, data, vid) == value
+                {
+                    xm[off] = 3;
+                    tombstones.push(off);
+                    break;
+                }
+                idx = ((idx as u64 + 1) & mask) as usize;
+            }
+        }
+        for off in tombstones {
+            xm[off..off + INDEX_SLOT_SIZE].fill(0);
+        }
     }
 
     /// ハッシュインデックスを data/offsets から再構築する (writer 専用、
@@ -188,7 +282,7 @@ impl Vocabulary {
         for id in 0..count {
             let value = read_value(offsets, data, id);
             let h = fxhash(value);
-            let mut idx = (h & mask) as usize;
+            let mut idx = home_slot(h, index_cap); // #123
             loop {
                 let off = INDEX_HEADER + idx * INDEX_SLOT_SIZE;
                 if xm[off] == 0 {
@@ -234,7 +328,7 @@ impl Vocabulary {
             None => self.index.slice(),
         };
         let h = fxhash(value);
-        let mut idx = (h & mask) as usize;
+        let mut idx = home_slot(h, self.index_cap); // #123
         loop {
             let off = INDEX_HEADER + idx * INDEX_SLOT_SIZE;
             if xm[off] == 0 { return None; }
@@ -297,7 +391,7 @@ impl Vocabulary {
     fn index_insert(&self, value: &[u8], id: u32) {
         let mask = (self.index_cap - 1) as u64;
         let h = fxhash(value);
-        let mut idx = (h & mask) as usize;
+        let mut idx = home_slot(h, self.index_cap); // #123
         loop {
             let off = INDEX_HEADER + idx * INDEX_SLOT_SIZE;
             // #83: slot flag は Region 経由の AtomicU8 で直接触る (`&mut [u8]` を
@@ -426,6 +520,105 @@ mod tests {
         fn index_bytes(&self) -> Vec<u8> {
             unsafe { std::slice::from_raw_parts(self.index_ptr, self.index_len) }.to_vec()
         }
+        /// index region 内の「使用中」 slot 数 (flag != 0)。 migration で旧 slot が
+        /// 残っていないか (= 占有率が二重になっていないか) を見るのに使う。
+        fn occupied_slots(&self, index_cap: u32) -> usize {
+            let xm = unsafe { std::slice::from_raw_parts(self.index_ptr, self.index_len) };
+            (0..index_cap as usize)
+                .filter(|i| xm[INDEX_HEADER + i * INDEX_SLOT_SIZE] != 0)
+                .count()
+        }
+        /// 0.14 (VIX2) が書いた index を再現する — 全ゼロ化して旧 magic + **旧 slot 選択**
+        /// (hash 下位ビット) で live entry を植える。
+        fn plant_legacy_index(&self, index_cap: u32, entries: &[(&[u8], u32)]) {
+            let xm = unsafe { std::slice::from_raw_parts_mut(self.index_ptr, self.index_len) };
+            xm.fill(0);
+            xm[0..4].copy_from_slice(&INDEX_MAGIC_V2);
+            xm[4..8].copy_from_slice(&index_cap.to_le_bytes());
+            for (value, vid) in entries {
+                let h = fxhash(value);
+                let mut idx = home_slot_legacy(h, index_cap);
+                loop {
+                    let off = INDEX_HEADER + idx * INDEX_SLOT_SIZE;
+                    if xm[off] == 0 {
+                        xm[off] = 1;
+                        xm[off + 1..off + 9].copy_from_slice(&h.to_le_bytes());
+                        xm[off + 9..off + 13].copy_from_slice(&vid.to_le_bytes());
+                        break;
+                    }
+                    idx = (idx + 1) & (index_cap as usize - 1);
+                }
+            }
+        }
+    }
+
+    /// #123: `fxhash` は乗算で終わるので **下位ビットに上位の entropy が届かない**。
+    /// issue の実キー (`第N条` は UTF-8 で 8 byte = 1 word ちょうどなので
+    /// `h = word * SEED` そのもの) で、 旧 slot 選択が全滅し新 slot 選択が散ることを固定する。
+    #[test]
+    fn issue123_low_bits_collide_high_bits_spread() {
+        let keys: Vec<&[u8]> = vec![
+            "第10条".as_bytes(),
+            "第11条".as_bytes(),
+            "第12条".as_bytes(),
+            "第13条".as_bytes(),
+        ];
+        assert!(keys.iter().all(|k| k.len() == 8), "1 word ちょうどの前提");
+        let cap = 1u32 << 12;
+
+        let legacy: std::collections::HashSet<usize> =
+            keys.iter().map(|k| home_slot_legacy(fxhash(k), cap)).collect();
+        let modern: std::collections::HashSet<usize> =
+            keys.iter().map(|k| home_slot(fxhash(k), cap)).collect();
+
+        assert_eq!(
+            legacy.len(), 1,
+            "旧 slot 選択 (下位ビット) は同一 slot に潰れる — issue #123 の実例が再現しない: {legacy:?}"
+        );
+        assert_eq!(
+            modern.len(), keys.len(),
+            "新 slot 選択 (上位ビット) が散っていない: {modern:?}"
+        );
+    }
+
+    /// #123: VIX2 index を持つ DB を開くと、 clean_flag が立っていても index を作り直し、
+    /// **旧 slot を残さない** (占有 slot 数 == live 値数)。 旧 slot を消さずに新 slot 関数で
+    /// 再挿入すると (rebuild は #92 で no-clear) 占有が二重になる。
+    #[test]
+    fn issue123_vix2_index_migrates_without_stale_slots() {
+        let cap = 1u32 << 8;
+        let r = make_regions(1024, cap, 64 * 1024);
+        let keys: Vec<String> = (0..40).map(|i| format!("第{}条", 10 + i)).collect();
+
+        let ids: Vec<u32> = {
+            let w = r.vocab_init(1024, cap);
+            let ids = keys.iter().map(|k| w.get_or_insert(k.as_bytes())).collect();
+            w.sync();
+            w.mark_index_clean(true); // clean = 「rebuild 不要」 マーカーを立てておく
+            ids
+        };
+
+        // 0.14 が書いた状態を再現 (VIX2 magic + 旧 slot)。 clean_flag は 1 のまま。
+        let entries: Vec<(&[u8], u32)> =
+            keys.iter().zip(&ids).map(|(k, id)| (k.as_bytes(), *id)).collect();
+        r.plant_legacy_index(cap, &entries);
+        assert_eq!(r.occupied_slots(cap), keys.len(), "植え付けが失敗している");
+
+        let v = r.vocab_load(/*readonly=*/ false);
+
+        assert!(v.rebuilt_on_load, "VIX2 は clean_flag が立っていても rebuild されるべき");
+        for (k, id) in keys.iter().zip(&ids) {
+            assert_eq!(v.lookup(k.as_bytes()), Some(*id), "migration 後に {k} が引けない");
+        }
+        assert_eq!(v.lookup("第999条".as_bytes()), None, "無い値が引けてしまう");
+        assert_eq!(
+            &r.index_bytes()[0..4], &INDEX_MAGIC,
+            "migration 後の index magic が VIX3 になっていない (次 open で毎回 rebuild する)"
+        );
+        assert_eq!(
+            r.occupied_slots(cap), keys.len(),
+            "旧 slot が残って占有が二重になっている (#123 migration の取り残し)"
+        );
     }
 
     /// #77-H1 regression: dirty (clean_flag≠1) な DB の readonly load が
@@ -500,7 +693,7 @@ mod tests {
             let region = self.index_region();
             let mask = (index_cap - 1) as u64;
             let h = fxhash(value);
-            let mut idx = (h & mask) as usize;
+            let mut idx = home_slot(h, index_cap); // #123
             loop {
                 let off = INDEX_HEADER + idx * INDEX_SLOT_SIZE;
                 if region.slice()[off] == 0 {

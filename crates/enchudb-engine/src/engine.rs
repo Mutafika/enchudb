@@ -817,7 +817,15 @@ const FILE_MAGIC: [u8; 4] = *b"ECDB";
 /// v7 (0.13.0, #90): LeafStore の cell offset を word 単位化 (16/32/64GB 選択可)。
 /// v6 (0.12.0) は leaf offset が byte なので、 v6 region は self-describing な
 /// `off_shift == 0` として v7 engine が read-through で扱う (migration 不要)。
-const FILE_VERSION: u32 = 7;
+/// v8 (0.15.0, #123): vocab index の slot 選択を hash 下位ビット → **上位ビット** に変更
+/// (`Vocabulary::home_slot`)。 index は derived data なので open 時に自動 rebuild される
+/// (VIX2 magic を検出して in-place migrate) が、 **0.14 以前の binary は index magic を
+/// 検証しない**ため、 新 slot で書かれた clean index を旧 slot 関数で読んで silent に
+/// lookup miss する。 これを防ぐために file version を上げ、 旧 binary の open を
+/// unsupported version で loud に失敗させる (mixed-version 運用は非サポート)。
+const FILE_VERSION: u32 = 8;
+/// v7 (0.13.0〜0.14.x)。 writer open で v8 へ透過 migrate する (index も同時に VIX3 化)。
+const FILE_VERSION_LEGACY_V7: u32 = 7;
 /// v4 DB を後方互換で open する識別子。 v4 → v5 migrate は open 時透過。
 const FILE_VERSION_LEGACY_V5: u32 = 5;
 const FILE_VERSION_LEGACY_V4: u32 = 4;
@@ -903,6 +911,18 @@ pub struct GrowableOptions {
     pub leaf_data_size: Option<usize>,
     /// leaf offset scale (16/32/64 GB)。 default `Gb16`。
     pub leaf_scale: LeafScale,
+    /// #122: vocab (Tag/Leaf 値) 索引の entry 上限。 `None` = `max_entities × 16`
+    /// (上限 256 M) の従来式。
+    ///
+    /// **vocab に入る値の種類数は entity 数と相関しない**。 グラフのように辺が entity の
+    /// 大半を占める形では従来式が実需の 1,000 倍以上を確保する (日本法令コーパスの実測:
+    /// entity 44 M → 索引 268 M slot × 13 B = 3.49 GB / on-disk 1,260 MB に対し、
+    /// ユニーク Tag 値は 104,971 = 充填率 0.04%)。 実測に基づく値を渡せば索引は実需
+    /// サイズに縮む (上の例では 13.6 MB 相当)。
+    ///
+    /// 値は内部で `next_power_of_two` に丸められ、 header に焼かれる (= 既存 DB は
+    /// rebuild しないと変わらない、 `max_himos` と同じ性質)。
+    pub vocab_max_entries: Option<u32>,
 }
 
 impl Default for GrowableOptions {
@@ -915,6 +935,7 @@ impl Default for GrowableOptions {
             cyl_max_values: DEFAULT_CYL_MAX_VALUES,
             leaf_data_size: None,
             leaf_scale: LeafScale::Gb16,
+            vocab_max_entries: None,
         }
     }
 }
@@ -1102,8 +1123,12 @@ impl Layout {
     /// #120: 上限超過 (align8 後の u32 data_end / total_size overflow) は
     /// **書く前に** Err で返す。 呼び元 (create 経路) は `io::ErrorKind::InvalidInput`
     /// に写して伝播すること — panic にすると caller が握れない。
-    fn compute(max_entities: u32, max_himos: u32, vocab_data_size: usize, content_data_size: Option<usize>, cyl_max_values: Option<u32>, leaf_data_size: Option<usize>) -> Result<Self, String> {
-        let vocab_max_entries = max_entities.saturating_mul(16).min(256_000_000);
+    fn compute(max_entities: u32, max_himos: u32, vocab_data_size: usize, content_data_size: Option<usize>, cyl_max_values: Option<u32>, leaf_data_size: Option<usize>, vocab_max_entries: Option<u32>) -> Result<Self, String> {
+        // #122: 既定は max_entities × 16 (上限 256 M)。 vocab の値の種類数は entity 数と
+        // 相関しないので、 実測で分かっている consumer は GrowableOptions で明示する。
+        let vocab_max_entries = vocab_max_entries
+            .map(|v| v.max(1))
+            .unwrap_or_else(|| max_entities.saturating_mul(16).min(256_000_000));
         Self::compute_with_caps(
             max_entities, max_himos,
             vocab_max_entries, vocab_data_size,
@@ -1662,7 +1687,7 @@ impl Engine {
         let off_shift = leaf_scale.map(|s| s.off_shift()).unwrap_or(DEFAULT_LEAF_OFF_SHIFT);
         let vds = vocab_data_size.unwrap_or(DEFAULT_VOCAB_DATA_SIZE);
         let max_himos = max_himos.unwrap_or(DEFAULT_MAX_HIMOS);
-        let layout = Layout::compute(max_entities, max_himos, vds, content_data_size, cyl_max_values, leaf_data_size).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, vds, content_data_size, cyl_max_values, leaf_data_size, None).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         // #90: 予約 leaf region が選んだ scale の cap を超えないか検証。
         let leaf_cap = cap_bytes_for_shift(off_shift);
         if layout.leaf_data_size as u64 > leaf_cap {
@@ -1807,7 +1832,7 @@ impl Engine {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create_growable_with_capacity(path: &str, max_entities: u32) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
-        let layout = Layout::compute(max_entities, max_himos, DEFAULT_VOCAB_DATA_SIZE, None, None, None).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, DEFAULT_VOCAB_DATA_SIZE, None, None, None, None).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
     }
 
@@ -1824,7 +1849,7 @@ impl Engine {
         vocab_data_size: usize,
     ) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
-        let layout = Layout::compute(max_entities, max_himos, vocab_data_size, None, None, None).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, vocab_data_size, None, None, None, None).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
     }
 
@@ -1842,7 +1867,7 @@ impl Engine {
     ) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
         let vds = vocab_data_size.unwrap_or(DEFAULT_VOCAB_DATA_SIZE);
-        let layout = Layout::compute(max_entities, max_himos, vds, None, None, leaf_data_size).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, vds, None, None, leaf_data_size, None).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let leaf_cap = leaf_scale.cap_bytes();
         if layout.leaf_data_size as u64 > leaf_cap {
             return Err(io::Error::new(
@@ -1868,6 +1893,7 @@ impl Engine {
             opts.content_data_size,
             Some(opts.cyl_max_values),
             opts.leaf_data_size,
+            opts.vocab_max_entries, // #122
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let leaf_cap = opts.leaf_scale.cap_bytes();
@@ -2610,17 +2636,28 @@ impl Engine {
         // v7 (現行) / v6 / v5 / v4 を受け付ける。 v6 は leaf offset が byte だが、
         // LeafStore が region header の off_shift=0 で self-describing に read-through。
         if version != FILE_VERSION
+            && version != FILE_VERSION_LEGACY_V7
             && version != FILE_VERSION_LEGACY_V6
             && version != FILE_VERSION_LEGACY_V5
             && version != FILE_VERSION_LEGACY_V4
         {
             return Err(format!(
-                "unsupported EnchuDB file version {} (supported: {}, {}/{}/{} compat). dev phase — recreate the DB.",
-                version, FILE_VERSION, FILE_VERSION_LEGACY_V6, FILE_VERSION_LEGACY_V5, FILE_VERSION_LEGACY_V4
+                "unsupported EnchuDB file version {} (supported: {}, {}/{}/{}/{} compat). dev phase — recreate the DB.",
+                version, FILE_VERSION, FILE_VERSION_LEGACY_V7, FILE_VERSION_LEGACY_V6,
+                FILE_VERSION_LEGACY_V5, FILE_VERSION_LEGACY_V4
             ));
         }
         // v28: ヘッダ整合性 CRC 検証(stored == 0 は v27 以前の DB として許容)
         verify_header_crc(buf)?;
+        // #123 (v8): writer open は header version を v8 へ上げる。 この open で vocab index は
+        // 新 slot 関数 (上位ビット) で書き直されるので、 version を据え置くと **index magic を
+        // 見ない 0.14 以前の binary** が同じ DB を開いて clean index を旧 slot で読み、 silent に
+        // lookup miss する。 version を上げれば旧 binary は unsupported version で明示的に落ちる。
+        // readonly open は共有 mmap を書かない (index も heap shadow へ rebuild) ので据え置き。
+        if !readonly && version != FILE_VERSION {
+            buf[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION.to_le_bytes());
+            write_header_crc(buf);
+        }
         let max_entities = u32::from_le_bytes(buf[H_MAX_ENTITIES..H_MAX_ENTITIES + 4].try_into().unwrap());
         let max_himos = u32::from_le_bytes(buf[H_MAX_HIMOS..H_MAX_HIMOS + 4].try_into().unwrap());
         let himo_count = u32::from_le_bytes(buf[H_HIMO_COUNT..H_HIMO_COUNT + 4].try_into().unwrap());
