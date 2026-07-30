@@ -1,18 +1,35 @@
-//! mmap ファイル形式 (version 2)
+//! mmap ファイル形式 (`.etxt`)
 //!
+//! version 2 と version 3 の 2 系統を読む。違いは **gram key の幅だけ**で、
+//! それ以外のセクション構成は共通 (#121)。
+//!
+//! | | v2 | v3 |
+//! |---|---|---|
+//! | n | 2 固定 (header に持たない) | header `n` byte (2..=4) |
+//! | key | u32 (16bit × 2) | u64 (16bit × n) |
+//! | Gram Index entry | 12 bytes | 16 bytes |
+//!
+//! n = 2 の key は u64 でも上位 32bit が 0 なので、**v2 はゼロ拡張するだけで読める**
+//! （昇順ソート順も保たれるので二分探索がそのまま効く）。逆に writer は
+//! **n = 2 なら v2 を書く** ので、既定設定での出力バイト列は #121 以前と完全に同じ。
+//! v3 が出るのは `with_n(3)` / `with_n(4)` を明示したときだけ。
+//!
+//! ```text
 //! [Header 32 bytes]
 //!   magic: "ETXT" (4)
-//!   version: u32 (4)  — 2 (eid u64 化に伴う break。v1 は読まない)
-//!   bigram_count: u32 (4)
+//!   version: u32 (4)  — 2 または 3 (v1 = eid u32 時代は読まない)
+//!   gram_count: u32 (4)
 //!   posting_total: u32 (4) — entity ID エントリ総数（バイト数ではない）
 //!   doc_count: u32 (4)
 //!   text_total: u32 (4) — テキストデータ総バイト数
 //!   flags: u8 (1) — bit0 TEXT_OMITTED: Doc Index / Text Data を持たない
 //!                   postings-only index (原文は DB 本体が所有、検証は caller 側 #84)
-//!   _reserved: [u8; 7]
+//!   n: u8 (1) — v3 のみ有効 (2..=4)。v2 は常に 2 と解釈し、この byte は読まない
+//!   _reserved: [u8; 6]
 //!
-//! [Bigram Index] — bigram_count × 12 bytes
-//!   key: u32, offset: u32, len: u32
+//! [Gram Index] — gram_count × (12 | 16) bytes
+//!   v2: key u32, offset u32, len u32
+//!   v3: key u64, offset u32, len u32
 //!   key 昇順ソート（二分探索用）
 //!   offset/len は Posting Data 内のエントリ単位（byte 単位ではない）
 //!
@@ -20,6 +37,7 @@
 //!   Posting Data の先頭を 8-byte 境界に揃えるための詰め物。
 //!   現状の reader は from_le_bytes でアライメント非依存に読むので必須ではないが、
 //!   将来 mmap 上で u64 slice cast に戻す余地を残すため format として保持する。
+//!   (v3 は entry 16B なので常に 0 だが、計算は共通経路に載せる)
 //!
 //! [Posting Data] — posting_total × 8 bytes
 //!   flat array of u64 entity IDs (little-endian)
@@ -29,6 +47,7 @@
 //!   eid 昇順ソート
 //!
 //! [Text Data] — text_total bytes
+//! ```
 
 use std::io;
 use std::path::Path;
@@ -40,10 +59,16 @@ use memmap2::Mmap;
 
 use std::io::Write;
 
+use crate::gram;
+
 const MAGIC: &[u8; 4] = b"ETXT";
-const VERSION: u32 = 2;
+/// key u32 / n = 2 固定。#121 以前の唯一の format。
+const VERSION_V2: u32 = 2;
+/// key u64 / n を header に持つ (#121)。
+const VERSION_V3: u32 = 3;
 const HEADER_SIZE: usize = 32;
-const BIGRAM_ENTRY: usize = 12;       // key u32 + offset u32 + len u32
+const GRAM_ENTRY_V2: usize = 12;      // key u32 + offset u32 + len u32
+const GRAM_ENTRY_V3: usize = 16;      // key u64 + offset u32 + len u32
 const POSTING_ENTRY: usize = 8;       // eid u64
 const DOC_ENTRY: usize = 16;          // eid u64 + offset u32 + len u32
 
@@ -52,12 +77,26 @@ const DOC_ENTRY: usize = 16;          // eid u64 + offset u32 + len u32
 /// で自然に後方互換 (#84)。
 const FLAG_TEXT_OMITTED: u8 = 0x01;
 const FLAGS_OFFSET: usize = 24;
+/// n を置く byte (v3 のみ)。v2 file はここが 0 だが version で判別するので読まない。
+const N_OFFSET: usize = 25;
+
+/// version に対応する Gram Index の 1 エントリ幅。
+#[inline]
+fn gram_entry(version: u32) -> usize {
+    if version == VERSION_V2 { GRAM_ENTRY_V2 } else { GRAM_ENTRY_V3 }
+}
+
+/// n に対応する書き出し version。n = 2 は v2 (= #121 以前とバイト等価)。
+#[inline]
+fn version_for_n(n: usize) -> u32 {
+    if n == gram::DEFAULT_N { VERSION_V2 } else { VERSION_V3 }
+}
 
 /// Posting Data 先頭を 8-byte 境界に揃えるためのパディング量
 #[inline]
-fn posting_padding(bigram_count: u32) -> usize {
-    let after_bigrams = HEADER_SIZE + (bigram_count as usize) * BIGRAM_ENTRY;
-    (8 - (after_bigrams % 8)) % 8
+fn posting_padding(gram_count: u32, entry: usize) -> usize {
+    let after_grams = HEADER_SIZE + (gram_count as usize) * entry;
+    (8 - (after_grams % 8)) % 8
 }
 
 /// 永続化バックエンド。native は mmap、wasm は Vec<u8>（fetch 結果を所有）。
@@ -81,7 +120,11 @@ impl Backing {
 /// 読み取り専用インデックス。
 pub struct MappedIndex {
     backing: Backing,
-    bigram_count: u32,
+    /// Gram Index の 1 エントリ幅（version 由来。key の読み方もこれで決まる）
+    gram_entry: usize,
+    /// この index が使っている n（v2 は常に 2）
+    n: usize,
+    gram_count: u32,
     posting_total: u32,
     doc_count: u32,
     text_total: u32,
@@ -114,12 +157,26 @@ impl MappedIndex {
             return Err(invalid_data("not an ETXT file"));
         }
         let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-        if version != VERSION {
+        if version != VERSION_V2 && version != VERSION_V3 {
             return Err(invalid_data(format!(
-                "unsupported ETXT version {version} (expected {VERSION})"
+                "unsupported ETXT version {version} (expected {VERSION_V2} or {VERSION_V3})"
             )));
         }
-        let bigram_count = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        let gram_entry = gram_entry(version);
+        // n: v2 は 2 固定。v3 は header の byte を検証して採用する。
+        let n = if version == VERSION_V2 {
+            gram::DEFAULT_N
+        } else {
+            let raw = buf[N_OFFSET] as usize;
+            gram::validate_n(raw).map_err(|_| {
+                invalid_data(format!(
+                    "corrupt ETXT header: n = {raw} (v3 は {}..={} のみ)",
+                    gram::MIN_N,
+                    gram::MAX_N
+                ))
+            })?
+        };
+        let gram_count = u32::from_le_bytes(buf[8..12].try_into().unwrap());
         let posting_total = u32::from_le_bytes(buf[12..16].try_into().unwrap());
         let doc_count = u32::from_le_bytes(buf[16..20].try_into().unwrap());
         let text_total = u32::from_le_bytes(buf[20..24].try_into().unwrap());
@@ -130,29 +187,28 @@ impl MappedIndex {
         // 検証する。truncate されたファイルや壊れた header をここで InvalidData として
         // 弾かないと、検索時 (get_posting / get_text) の slice index で panic する。
         // レイアウト計算は u64 で行い、32bit target (wasm32) での桁あふれも防ぐ。
-        let bigram_end = HEADER_SIZE as u64 + bigram_count as u64 * BIGRAM_ENTRY as u64;
-        let posting_start = bigram_end + posting_padding(bigram_count) as u64;
+        let gram_end = HEADER_SIZE as u64 + gram_count as u64 * gram_entry as u64;
+        let posting_start = gram_end + posting_padding(gram_count, gram_entry) as u64;
         let posting_end = posting_start + posting_total as u64 * POSTING_ENTRY as u64;
         let doc_end = posting_end + doc_count as u64 * DOC_ENTRY as u64;
         let total = doc_end + text_total as u64;
         if total > buf.len() as u64 {
             return Err(invalid_data(format!(
                 "truncated or corrupt ETXT file: header claims {total} bytes \
-                 (bigrams={bigram_count}, postings={posting_total}, docs={doc_count}, \
+                 (grams={gram_count}, postings={posting_total}, docs={doc_count}, \
                  text={text_total}), file has {}",
                 buf.len()
             )));
         }
 
-        // bigram index の各エントリ: posting 範囲が Posting Data 内に収まるか。
-        for i in 0..bigram_count as usize {
-            let base = HEADER_SIZE + i * BIGRAM_ENTRY;
-            let entry = &buf[base..base + BIGRAM_ENTRY];
-            let offset = u32::from_le_bytes(entry[4..8].try_into().unwrap()) as u64;
-            let len = u32::from_le_bytes(entry[8..12].try_into().unwrap()) as u64;
-            if offset + len > posting_total as u64 {
+        // gram index の各エントリ: posting 範囲が Posting Data 内に収まるか。
+        for i in 0..gram_count as usize {
+            let base = HEADER_SIZE + i * gram_entry;
+            let entry = &buf[base..base + gram_entry];
+            let (_, offset, len) = decode_gram_entry(entry, gram_entry);
+            if offset as u64 + len as u64 > posting_total as u64 {
                 return Err(invalid_data(format!(
-                    "corrupt ETXT bigram entry {i}: posting range {offset}+{len} \
+                    "corrupt ETXT gram entry {i}: posting range {offset}+{len} \
                      exceeds posting_total {posting_total}"
                 )));
             }
@@ -172,25 +228,33 @@ impl MappedIndex {
             }
         }
 
-        Ok(Self { backing, bigram_count, posting_total, doc_count, text_total, text_omitted })
+        Ok(Self {
+            backing,
+            gram_entry,
+            n,
+            gram_count,
+            posting_total,
+            doc_count,
+            text_total,
+            text_omitted,
+        })
     }
 
-    /// bigram key → posting list (entity IDs)。
+    /// gram key → posting list (entity IDs)。
     /// アライメント非依存の読み出しで Vec<u64> を返す（slice cast を使わない）。
-    pub fn get_posting(&self, key: u32) -> Vec<u64> {
-        let idx = self.bigram_index();
+    pub fn get_posting(&self, key: u64) -> Vec<u64> {
+        let idx = self.gram_index();
+        let w = self.gram_entry;
         // 二分探索
         let mut lo = 0usize;
-        let mut hi = self.bigram_count as usize;
+        let mut hi = self.gram_count as usize;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let entry = &idx[mid * BIGRAM_ENTRY..(mid + 1) * BIGRAM_ENTRY];
-            let entry_key = u32::from_le_bytes(entry[0..4].try_into().unwrap());
+            let (entry_key, offset, len) = decode_gram_entry(&idx[mid * w..(mid + 1) * w], w);
             if entry_key < key { lo = mid + 1; }
             else if entry_key > key { hi = mid; }
             else {
-                let offset = u32::from_le_bytes(entry[4..8].try_into().unwrap()) as usize;
-                let len = u32::from_le_bytes(entry[8..12].try_into().unwrap()) as usize;
+                let (offset, len) = (offset as usize, len as usize);
                 let data = self.posting_data();
                 let mut out = Vec::with_capacity(len);
                 for i in 0..len {
@@ -205,7 +269,7 @@ impl MappedIndex {
     }
 
     /// 複数 key の AND
-    pub fn intersect(&self, keys: &[u32]) -> Vec<u64> {
+    pub fn intersect(&self, keys: &[u64]) -> Vec<u64> {
         if keys.is_empty() { return vec![]; }
 
         let postings: Vec<Vec<u64>> = keys.iter().map(|&k| self.get_posting(k)).collect();
@@ -286,46 +350,49 @@ impl MappedIndex {
         }
     }
 
-    pub fn bigram_count(&self) -> u32 { self.bigram_count }
+    pub fn gram_count(&self) -> u32 { self.gram_count }
     pub fn doc_count(&self) -> u32 { self.doc_count }
+
+    /// この index が使っている n。v2 file は 2。
+    pub fn n(&self) -> usize { self.n }
 
     /// この index が原文 (Text Data) を保持しているか。 false = postings-only。
     pub fn has_text(&self) -> bool { !self.text_omitted }
 
     // ── レイアウト ──
 
-    fn bigram_index(&self) -> &[u8] {
+    fn gram_index(&self) -> &[u8] {
         let buf = self.backing.as_slice();
         let start = HEADER_SIZE;
-        let end = start + self.bigram_count as usize * BIGRAM_ENTRY;
+        let end = start + self.gram_count as usize * self.gram_entry;
         &buf[start..end]
+    }
+
+    /// Gram Index + padding の直後 = Posting Data の開始 offset。
+    #[inline]
+    fn posting_start(&self) -> usize {
+        HEADER_SIZE
+            + self.gram_count as usize * self.gram_entry
+            + posting_padding(self.gram_count, self.gram_entry)
     }
 
     fn posting_data(&self) -> &[u8] {
         let buf = self.backing.as_slice();
-        let start = HEADER_SIZE
-            + self.bigram_count as usize * BIGRAM_ENTRY
-            + posting_padding(self.bigram_count);
+        let start = self.posting_start();
         let end = start + self.posting_total as usize * POSTING_ENTRY;
         &buf[start..end]
     }
 
     fn doc_index(&self) -> &[u8] {
         let buf = self.backing.as_slice();
-        let posting_end = HEADER_SIZE
-            + self.bigram_count as usize * BIGRAM_ENTRY
-            + posting_padding(self.bigram_count)
-            + self.posting_total as usize * POSTING_ENTRY;
-        let start = posting_end;
+        let start = self.posting_start() + self.posting_total as usize * POSTING_ENTRY;
         let end = start + self.doc_count as usize * DOC_ENTRY;
         &buf[start..end]
     }
 
     fn text_data(&self) -> &[u8] {
         let buf = self.backing.as_slice();
-        let start = HEADER_SIZE
-            + self.bigram_count as usize * BIGRAM_ENTRY
-            + posting_padding(self.bigram_count)
+        let start = self.posting_start()
             + self.posting_total as usize * POSTING_ENTRY
             + self.doc_count as usize * DOC_ENTRY;
         // text_total で明示的に区切る (末尾に余計なバイトがあっても晒さない)
@@ -333,15 +400,35 @@ impl MappedIndex {
     }
 }
 
+/// Gram Index の 1 エントリを (key, offset, len) に分解する。key 幅は version 由来の
+/// `entry` で決まる (v2 = u32 をゼロ拡張、v3 = u64)。読み出しはアライメント非依存。
+#[inline]
+fn decode_gram_entry(entry: &[u8], gram_entry: usize) -> (u64, u32, u32) {
+    if gram_entry == GRAM_ENTRY_V2 {
+        (
+            u32::from_le_bytes(entry[0..4].try_into().unwrap()) as u64,
+            u32::from_le_bytes(entry[4..8].try_into().unwrap()),
+            u32::from_le_bytes(entry[8..12].try_into().unwrap()),
+        )
+    } else {
+        (
+            u64::from_le_bytes(entry[0..8].try_into().unwrap()),
+            u32::from_le_bytes(entry[8..12].try_into().unwrap()),
+            u32::from_le_bytes(entry[12..16].try_into().unwrap()),
+        )
+    }
+}
+
 /// インメモリの NgramIndex データをファイルに書き出す
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save(
     path: &Path,
-    postings: &std::collections::HashMap<u32, Vec<u64>>,
+    postings: &std::collections::HashMap<u64, Vec<u64>>,
     originals: &std::collections::HashMap<u64, String>,
+    n: usize,
 ) -> io::Result<()> {
     let mut file = File::create(path)?;
-    write_to(&mut file, postings, originals)
+    write_to(&mut file, postings, originals, n)
 }
 
 /// 原文非保持 (postings-only) でファイルに書き出す。 Doc Index / Text Data を
@@ -350,43 +437,65 @@ pub fn save(
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save_postings_only(
     path: &Path,
-    postings: &std::collections::HashMap<u32, Vec<u64>>,
+    postings: &std::collections::HashMap<u64, Vec<u64>>,
+    n: usize,
 ) -> io::Result<()> {
     let mut file = File::create(path)?;
-    write_to_postings_only(&mut file, postings)
+    write_to_postings_only(&mut file, postings, n)
 }
 
 /// 任意の Writer に書き出す。テストや tar/zst パイプラインから使う。
 pub fn write_to<W: Write>(
     w: &mut W,
-    postings: &std::collections::HashMap<u32, Vec<u64>>,
+    postings: &std::collections::HashMap<u64, Vec<u64>>,
     originals: &std::collections::HashMap<u64, String>,
+    n: usize,
 ) -> io::Result<()> {
-    write_index(w, postings, Some(originals))
+    write_index(w, postings, Some(originals), n)
 }
 
 /// `write_to` の postings-only 版 (原文非保持)。
 pub fn write_to_postings_only<W: Write>(
     w: &mut W,
-    postings: &std::collections::HashMap<u32, Vec<u64>>,
+    postings: &std::collections::HashMap<u64, Vec<u64>>,
+    n: usize,
 ) -> io::Result<()> {
-    write_index(w, postings, None)
+    write_index(w, postings, None, n)
 }
 
 /// 共通の書き出し。 `originals` が `None` なら postings-only
 /// (Doc Index / Text Data を省き flag を立てる)。 `Some` のときは従来と
 /// **バイト等価** (reserved 先頭が 0 = flag 無し)。
+///
+/// `n` が format を決める: n = 2 → v2 (key u32、#121 以前とバイト等価)、
+/// n ≥ 3 → v3 (key u64、header に n)。
 fn write_index<W: Write>(
     w: &mut W,
-    postings: &std::collections::HashMap<u32, Vec<u64>>,
+    postings: &std::collections::HashMap<u64, Vec<u64>>,
     originals: Option<&std::collections::HashMap<u64, String>>,
+    n: usize,
 ) -> io::Result<()> {
-    // bigram index をキー順にソート
-    let mut bigram_entries: Vec<(u32, &Vec<u64>)> = postings.iter().map(|(&k, v)| (k, v)).collect();
-    bigram_entries.sort_by_key(|(k, _)| *k);
+    gram::validate_n(n)?;
+    let version = version_for_n(n);
+    let entry_width = gram_entry(version);
 
-    let bigram_count = bigram_entries.len() as u32;
-    let posting_total: u32 = bigram_entries.iter().map(|(_, v)| v.len() as u32).sum();
+    // gram index をキー順にソート
+    let mut gram_entries: Vec<(u64, &Vec<u64>)> = postings.iter().map(|(&k, v)| (k, v)).collect();
+    gram_entries.sort_by_key(|(k, _)| *k);
+
+    // v2 は key u32。n = 2 の key は 32bit に収まるはずだが、format を壊すくらいなら
+    // 落とす (build 時の n と postings の n がずれた場合の保険)。
+    if version == VERSION_V2 {
+        if let Some((bad, _)) = gram_entries.iter().find(|(k, _)| *k > u32::MAX as u64) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("n = 2 (v2 format) なのに key {bad:#x} が u32 を超えている"),
+            ));
+        }
+    }
+
+    let gram_count = gram_entries.len() as u32;
+    let posting_total: u32 = gram_entries.iter().map(|(_, v)| v.len() as u32).sum();
 
     // doc index を eid 順にソート (postings-only なら空)
     let mut doc_entries: Vec<(u64, &String)> = match originals {
@@ -402,34 +511,41 @@ fn write_index<W: Write>(
     if originals.is_none() {
         reserved[0] = FLAG_TEXT_OMITTED;
     }
+    if version == VERSION_V3 {
+        reserved[N_OFFSET - FLAGS_OFFSET] = n as u8;
+    }
 
     // Header
     w.write_all(MAGIC)?;
-    w.write_all(&VERSION.to_le_bytes())?;
-    w.write_all(&bigram_count.to_le_bytes())?;
+    w.write_all(&version.to_le_bytes())?;
+    w.write_all(&gram_count.to_le_bytes())?;
     w.write_all(&posting_total.to_le_bytes())?;
     w.write_all(&doc_count.to_le_bytes())?;
     w.write_all(&text_total.to_le_bytes())?;
     w.write_all(&reserved)?;
 
-    // Bigram Index
+    // Gram Index
     let mut offset: u32 = 0;
-    for (key, eids) in &bigram_entries {
+    for (key, eids) in &gram_entries {
         let len = eids.len() as u32;
-        w.write_all(&key.to_le_bytes())?;
+        if version == VERSION_V2 {
+            w.write_all(&(*key as u32).to_le_bytes())?;
+        } else {
+            w.write_all(&key.to_le_bytes())?;
+        }
         w.write_all(&offset.to_le_bytes())?;
         w.write_all(&len.to_le_bytes())?;
         offset += len;
     }
 
     // Padding to 8-byte align Posting Data
-    let pad = posting_padding(bigram_count);
+    let pad = posting_padding(gram_count, entry_width);
     if pad > 0 {
         w.write_all(&[0u8; 8][..pad])?;
     }
 
     // Posting Data (u64 each)
-    for (_, eids) in &bigram_entries {
+    for (_, eids) in &gram_entries {
         for &eid in eids.iter() {
             w.write_all(&eid.to_le_bytes())?;
         }
@@ -461,14 +577,28 @@ mod tests {
 
     /// 有効な index をバイト列で作る helper。
     fn build_valid_bytes() -> Vec<u8> {
-        let mut postings: HashMap<u32, Vec<u64>> = HashMap::new();
+        let mut postings: HashMap<u64, Vec<u64>> = HashMap::new();
         postings.insert(1, vec![10, 20]);
         postings.insert(2, vec![10]);
         let mut originals: HashMap<u64, String> = HashMap::new();
         originals.insert(10, "国民は法の下に平等".to_string());
         originals.insert(20, "個人として尊重される".to_string());
         let mut buf = Vec::new();
-        write_to(&mut buf, &postings, &originals).unwrap();
+        write_to(&mut buf, &postings, &originals, 2).unwrap();
+        buf
+    }
+
+    /// n ≥ 3 (= v3、key u64) の index をバイト列で作る helper。
+    fn build_v3_bytes(n: usize) -> Vec<u8> {
+        let mut postings: HashMap<u64, Vec<u64>> = HashMap::new();
+        // 32bit を超える key を必ず含める
+        postings.insert(gram::extract_keys("国民は法", n)[0], vec![10, 20]);
+        postings.insert(gram::extract_keys("民は法の", n)[0], vec![10]);
+        let mut originals: HashMap<u64, String> = HashMap::new();
+        originals.insert(10, "国民は法の下に平等".to_string());
+        originals.insert(20, "個人として尊重される".to_string());
+        let mut buf = Vec::new();
+        write_to(&mut buf, &postings, &originals, n).unwrap();
         buf
     }
 
@@ -483,11 +613,11 @@ mod tests {
 
     #[test]
     fn postings_only_omits_text() {
-        let mut postings: HashMap<u32, Vec<u64>> = HashMap::new();
+        let mut postings: HashMap<u64, Vec<u64>> = HashMap::new();
         postings.insert(1, vec![10, 20]);
         postings.insert(2, vec![10]);
         let mut buf = Vec::new();
-        write_to_postings_only(&mut buf, &postings).unwrap();
+        write_to_postings_only(&mut buf, &postings, 2).unwrap();
 
         let idx = MappedIndex::from_bytes(buf).unwrap();
         assert!(!idx.has_text(), "postings-only は has_text=false");
@@ -509,16 +639,112 @@ mod tests {
     }
 
     #[test]
-    fn truncated_bytes_error_instead_of_panic() {
+    fn default_n_still_writes_v2() {
+        // #121 で n を可変にしても、既定 (n=2) の出力は v2 のまま
+        // = 既存の reader / 既存の .etxt 生成パイプラインが一切変わらない。
         let buf = build_valid_bytes();
-        // header は無傷のまま、あらゆる長さで truncate して panic しないことを確認。
-        // (HEADER_SIZE 未満は「not an ETXT file」、それ以上は構造検証で弾かれる)
-        for cut in 0..buf.len() {
-            let truncated = buf[..cut].to_vec();
-            let err = MappedIndex::from_bytes(truncated)
+        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), VERSION_V2);
+        assert_eq!(buf[N_OFFSET], 0, "v2 は n byte を使わない");
+        let idx = MappedIndex::from_bytes(buf).unwrap();
+        assert_eq!(idx.n(), 2, "v2 は n=2 と解釈される");
+    }
+
+    #[test]
+    fn v3_records_n_and_wide_keys() {
+        for n in 3..=gram::MAX_N {
+            let buf = build_v3_bytes(n);
+            assert_eq!(
+                u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+                VERSION_V3,
+                "n={n}"
+            );
+            assert_eq!(buf[N_OFFSET] as usize, n, "header に n が焼かれること");
+
+            let idx = MappedIndex::from_bytes(buf).unwrap();
+            assert_eq!(idx.n(), n);
+            let key = gram::extract_keys("国民は法", n)[0];
+            assert!(key > u32::MAX as u64, "n={n} の key が u32 に収まってしまっている");
+            assert_eq!(idx.get_posting(key), vec![10, 20], "u64 key を exact に引ける");
+            assert_eq!(idx.get_text(10), Some("国民は法の下に平等"));
+        }
+    }
+
+    #[test]
+    fn v3_binary_search_over_many_wide_keys() {
+        // 二分探索が u64 key の昇順で正しく効くこと (エントリ幅 16B の読み出し込み)。
+        let text: String = (0..500).map(|i| char::from_u32(0x4E00 + i).unwrap()).collect();
+        let keys = gram::extract_keys(&text, 3);
+        let mut postings: HashMap<u64, Vec<u64>> = HashMap::new();
+        for (i, &k) in keys.iter().enumerate() {
+            postings.insert(k, vec![i as u64]);
+        }
+        let mut buf = Vec::new();
+        write_to_postings_only(&mut buf, &postings, 3).unwrap();
+        let idx = MappedIndex::from_bytes(buf).unwrap();
+        assert_eq!(idx.gram_count() as usize, keys.len());
+        for (i, &k) in keys.iter().enumerate() {
+            assert_eq!(idx.get_posting(k), vec![i as u64], "key #{i}");
+        }
+        // 存在しない key は空
+        assert!(idx.get_posting(u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn v3_bad_n_in_header_rejected() {
+        let mut buf = build_v3_bytes(3);
+        buf[N_OFFSET] = 9;
+        let err = MappedIndex::from_bytes(buf.clone()).err().expect("n=9 は不正");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("n = 9"), "{err}");
+
+        buf[N_OFFSET] = 0;
+        let err = MappedIndex::from_bytes(buf).err().expect("n=0 は不正");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn unknown_version_rejected() {
+        let mut buf = build_valid_bytes();
+        buf[4..8].copy_from_slice(&4u32.to_le_bytes());
+        let err = MappedIndex::from_bytes(buf).err().expect("v4 は未対応");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("version 4"), "{err}");
+    }
+
+    #[test]
+    fn write_rejects_out_of_range_n() {
+        let postings: HashMap<u64, Vec<u64>> = HashMap::new();
+        for n in [0usize, 1, 5, 255] {
+            let mut buf = Vec::new();
+            let err = write_to_postings_only(&mut buf, &postings, n)
                 .err()
-                .unwrap_or_else(|| panic!("truncated at {cut}/{} must not load", buf.len()));
-            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "cut={cut}");
+                .unwrap_or_else(|| panic!("n={n} は書けてはいけない"));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "n={n}");
+        }
+    }
+
+    #[test]
+    fn v2_write_rejects_wide_key() {
+        // n=2 指定なのに 32bit 超の key が混ざっていたら format を壊さず落とす。
+        let mut postings: HashMap<u64, Vec<u64>> = HashMap::new();
+        postings.insert(1u64 << 40, vec![1]);
+        let mut buf = Vec::new();
+        let err = write_to_postings_only(&mut buf, &postings, 2).expect_err("落ちること");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn truncated_bytes_error_instead_of_panic() {
+        for buf in [build_valid_bytes(), build_v3_bytes(3)] {
+            // header は無傷のまま、あらゆる長さで truncate して panic しないことを確認。
+            // (HEADER_SIZE 未満は「not an ETXT file」、それ以上は構造検証で弾かれる)
+            for cut in 0..buf.len() {
+                let truncated = buf[..cut].to_vec();
+                let err = MappedIndex::from_bytes(truncated)
+                    .err()
+                    .unwrap_or_else(|| panic!("truncated at {cut}/{} must not load", buf.len()));
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData, "cut={cut}");
+            }
         }
     }
 
@@ -538,29 +764,38 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_bigram_offset_rejected() {
-        let mut buf = build_valid_bytes();
-        // 先頭 bigram エントリの offset (header 直後 +4) を巨大値に書き換え
-        let base = HEADER_SIZE + 4;
-        buf[base..base + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-        let err = MappedIndex::from_bytes(buf).err().expect("corrupt index must not load");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    fn corrupt_gram_offset_rejected() {
+        // v2 (offset は key u32 の直後) / v3 (key u64 の直後) の両方
+        for (buf, off) in [
+            (build_valid_bytes(), HEADER_SIZE + 4),
+            (build_v3_bytes(3), HEADER_SIZE + 8),
+        ] {
+            let mut buf = buf;
+            buf[off..off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            let err = MappedIndex::from_bytes(buf).err().expect("corrupt index must not load");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
     }
 
     #[test]
     fn corrupt_doc_len_rejected() {
-        let mut buf = build_valid_bytes();
-        // doc index 先頭エントリの len (eid u64 + offset u32 の後) を巨大値に書き換え
-        let bigram_count = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-        let posting_total = u32::from_le_bytes(buf[12..16].try_into().unwrap());
-        let doc_base = HEADER_SIZE
-            + bigram_count as usize * BIGRAM_ENTRY
-            + posting_padding(bigram_count)
-            + posting_total as usize * POSTING_ENTRY;
-        let len_pos = doc_base + 12;
-        buf[len_pos..len_pos + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-        let err = MappedIndex::from_bytes(buf).err().expect("corrupt index must not load");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        for (buf, entry) in [
+            (build_valid_bytes(), GRAM_ENTRY_V2),
+            (build_v3_bytes(4), GRAM_ENTRY_V3),
+        ] {
+            let mut buf = buf;
+            // doc index 先頭エントリの len (eid u64 + offset u32 の後) を巨大値に書き換え
+            let gram_count = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+            let posting_total = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+            let doc_base = HEADER_SIZE
+                + gram_count as usize * entry
+                + posting_padding(gram_count, entry)
+                + posting_total as usize * POSTING_ENTRY;
+            let len_pos = doc_base + 12;
+            buf[len_pos..len_pos + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            let err = MappedIndex::from_bytes(buf).err().expect("corrupt index must not load");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
     }
 
     #[test]

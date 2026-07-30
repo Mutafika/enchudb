@@ -3,7 +3,7 @@ use std::io;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
-use crate::bigram;
+use crate::gram;
 use crate::posting::PostingList;
 use crate::storage::MappedIndex;
 
@@ -23,16 +23,40 @@ enum Backend {
 /// `enchudb-textsearch` 側のポリシーとして組む。
 pub struct NgramIndex {
     backend: Backend,
+    /// この index の n。構築時に決まり、`save` で file に焼かれ、`open` で戻る (#121)。
+    /// `candidates` / `index` は常にこの n を使うので、build と query で n がズレない。
+    n: usize,
 }
 
 impl NgramIndex {
-    /// インメモリモード（構築用）
+    /// インメモリモード（構築用）。n は既定の 2。
     pub fn new() -> Self {
+        Self::with_n_unchecked(gram::DEFAULT_N)
+    }
+
+    /// n を指定してインメモリ構築する (#121)。
+    ///
+    /// 最適な n は **スクリプトとコーパス依存**: ASCII/英語は bigram のエントロピーが
+    /// 低く trigram が効きやすい、CJK は bigram で十分エントロピーが高いうえ 2 文字
+    /// クエリが最頻なので n=3 にすると index で絞れず全走査に落ちる。
+    ///
+    /// 対応範囲は 2..=4（文字 16bit × n が u64 key に収まる = 衝突ゼロの境界）。
+    /// n は [`save`](Self::save) で `.etxt` header に記録され、[`open`](Self::open)
+    /// した側は [`n`](Self::n) で取得できるので、呼び出し側が覚える必要はない。
+    ///
+    /// n = 2 のときの出力バイト列は #121 以前と同一（file format v2）。
+    pub fn with_n(n: usize) -> io::Result<Self> {
+        gram::validate_n(n)?;
+        Ok(Self::with_n_unchecked(n))
+    }
+
+    fn with_n_unchecked(n: usize) -> Self {
         Self {
             backend: Backend::Memory {
                 postings: PostingList::new(),
                 originals: HashMap::new(),
             },
+            n,
         }
     }
 
@@ -40,7 +64,7 @@ impl NgramIndex {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open(path: &str) -> io::Result<Self> {
         let mapped = MappedIndex::open(Path::new(path))?;
-        Ok(Self { backend: Backend::Mapped(mapped) })
+        Ok(Self { n: mapped.n(), backend: Backend::Mapped(mapped) })
     }
 
     /// 既存の .etxt を読み込んで in-memory mutable index に再構築する。native のみ。
@@ -50,7 +74,8 @@ impl NgramIndex {
     pub fn open_mut(path: &str) -> io::Result<Self> {
         let mapped = MappedIndex::open(Path::new(path))?;
         require_text_for_rebuild(&mapped)?;
-        let mut idx = NgramIndex::new();
+        // n は file から引き継ぐ (rebuild で n が変わったら別 index になってしまう)
+        let mut idx = NgramIndex::with_n_unchecked(mapped.n());
         mapped.for_each_doc(|eid, text| idx.index(eid, text));
         idx.compact();
         Ok(idx)
@@ -59,14 +84,14 @@ impl NgramIndex {
     /// バイト列から読み取り専用 index を作る。wasm で fetch したレスポンスを直接渡せる。
     pub fn from_bytes(bytes: Vec<u8>) -> io::Result<Self> {
         let mapped = MappedIndex::from_bytes(bytes)?;
-        Ok(Self { backend: Backend::Mapped(mapped) })
+        Ok(Self { n: mapped.n(), backend: Backend::Mapped(mapped) })
     }
 
     /// バイト列から in-memory mutable index を作る（`open_mut` の wasm 版）。
     pub fn from_bytes_mut(bytes: Vec<u8>) -> io::Result<Self> {
         let mapped = MappedIndex::from_bytes(bytes)?;
         require_text_for_rebuild(&mapped)?;
-        let mut idx = NgramIndex::new();
+        let mut idx = NgramIndex::with_n_unchecked(mapped.n());
         mapped.for_each_doc(|eid, text| idx.index(eid, text));
         idx.compact();
         Ok(idx)
@@ -76,9 +101,10 @@ impl NgramIndex {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn save(&mut self, path: &str) -> io::Result<()> {
         self.compact();
+        let n = self.n;
         match &self.backend {
             Backend::Memory { postings, originals } => {
-                crate::storage::save(Path::new(path), postings.raw(), originals)
+                crate::storage::save(Path::new(path), postings.raw(), originals, n)
             }
             Backend::Mapped(_) => {
                 Err(io::Error::new(io::ErrorKind::Unsupported, "mapped index is read-only"))
@@ -89,9 +115,10 @@ impl NgramIndex {
     /// 任意の Writer に書き出す（wasm でも動くが、wasm に index 構築のニーズは普通ない）。
     pub fn write_to<W: std::io::Write>(&mut self, w: &mut W) -> io::Result<()> {
         self.compact();
+        let n = self.n;
         match &self.backend {
             Backend::Memory { postings, originals } => {
-                crate::storage::write_to(w, postings.raw(), originals)
+                crate::storage::write_to(w, postings.raw(), originals, n)
             }
             Backend::Mapped(_) => {
                 Err(io::Error::new(io::ErrorKind::Unsupported, "mapped index is read-only"))
@@ -108,9 +135,10 @@ impl NgramIndex {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn save_postings_only(&mut self, path: &str) -> io::Result<()> {
         self.compact();
+        let n = self.n;
         match &self.backend {
             Backend::Memory { postings, .. } => {
-                crate::storage::save_postings_only(Path::new(path), postings.raw())
+                crate::storage::save_postings_only(Path::new(path), postings.raw(), n)
             }
             Backend::Mapped(_) => {
                 Err(io::Error::new(io::ErrorKind::Unsupported, "mapped index is read-only"))
@@ -121,9 +149,10 @@ impl NgramIndex {
     /// `save_postings_only` の Writer 版。
     pub fn write_to_postings_only<W: std::io::Write>(&mut self, w: &mut W) -> io::Result<()> {
         self.compact();
+        let n = self.n;
         match &self.backend {
             Backend::Memory { postings, .. } => {
-                crate::storage::write_to_postings_only(w, postings.raw())
+                crate::storage::write_to_postings_only(w, postings.raw(), n)
             }
             Backend::Mapped(_) => {
                 Err(io::Error::new(io::ErrorKind::Unsupported, "mapped index is read-only"))
@@ -133,27 +162,21 @@ impl NgramIndex {
 
     /// entity にテキストを登録
     pub fn index(&mut self, eid: u64, text: &str) {
+        let n = self.n;
         let (postings, originals) = self.memory_mut();
         // 既存を削除
-        if let Some(old) = originals.remove(&eid) {
-            for bg in bigram::extract(&old) {
-                postings.remove(bigram::to_key(bg), eid);
-            }
-        }
-        for bg in bigram::extract(text) {
-            postings.add(bigram::to_key(bg), eid);
+        unindex(postings, originals, eid, n);
+        for key in gram::extract_keys(text, n) {
+            postings.add(key, eid);
         }
         originals.insert(eid, text.to_string());
     }
 
     /// entity のテキストを削除
     pub fn remove(&mut self, eid: u64) {
+        let n = self.n;
         let (postings, originals) = self.memory_mut();
-        if let Some(old) = originals.remove(&eid) {
-            for bg in bigram::extract(&old) {
-                postings.remove(bigram::to_key(bg), eid);
-            }
-        }
+        unindex(postings, originals, eid, n);
     }
 
     /// クエリの **候補** doc id（bigram 抽出 → intersect）。
@@ -166,11 +189,10 @@ impl NgramIndex {
     /// - 2 文字未満のクエリは bigram が作れないので空を返す（単一文字は
     ///   [`scan`](NgramIndex::scan) で扱う）。
     pub fn candidates(&self, query: &str) -> Vec<u64> {
-        let bgs = bigram::extract(query);
-        if bgs.is_empty() {
+        let keys = gram::extract_keys(query, self.n);
+        if keys.is_empty() {
             return vec![];
         }
-        let keys: Vec<u32> = bgs.iter().map(|bg| bigram::to_key(*bg)).collect();
         match &self.backend {
             Backend::Memory { postings, .. } => postings.intersect(&keys),
             Backend::Mapped(m) => m.intersect(&keys),
@@ -207,12 +229,32 @@ impl NgramIndex {
         }
     }
 
-    /// 統計
-    pub fn bigram_count(&self) -> usize {
+    /// この index の n (#121)。`open` した index は file の header 由来。
+    pub fn n(&self) -> usize {
+        self.n
+    }
+
+    /// index で絞り込める最短のクエリ長（文字数）= n。
+    ///
+    /// これ未満のクエリは gram を作れないので [`candidates`](Self::candidates) は
+    /// 空を返し、上位層は [`scan`](Self::scan) の O(N) 全走査に落ちるしかない。
+    /// postings-only index は原文を持たないのでその fallback すら不能
+    /// (`enchudb-textsearch` の `try_search` が明示エラーにする)。
+    pub fn min_query_len(&self) -> usize {
+        self.n
+    }
+
+    /// 統計 — 相異なる gram key の数。
+    pub fn gram_count(&self) -> usize {
         match &self.backend {
             Backend::Memory { postings, .. } => postings.key_count(),
-            Backend::Mapped(m) => m.bigram_count() as usize,
+            Backend::Mapped(m) => m.gram_count() as usize,
         }
+    }
+
+    /// [`gram_count`](Self::gram_count) の旧名 (n = 2 前提の名前)。
+    pub fn bigram_count(&self) -> usize {
+        self.gram_count()
     }
 
     pub fn doc_count(&self) -> usize {
@@ -238,6 +280,16 @@ impl NgramIndex {
         match &mut self.backend {
             Backend::Memory { postings, originals } => (postings, originals),
             Backend::Mapped(_) => panic!("mapped index is read-only"),
+        }
+    }
+}
+
+/// 既存の登録を posting から外す。`index` の上書きと `remove` で共通 (#121 で n を
+/// 引数に取るようになった分、重複を 1 箇所に寄せた)。
+fn unindex(postings: &mut PostingList, originals: &mut HashMap<u64, String>, eid: u64, n: usize) {
+    if let Some(old) = originals.remove(&eid) {
+        for key in gram::extract_keys(&old, n) {
+            postings.remove(key, eid);
         }
     }
 }

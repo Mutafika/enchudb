@@ -1,12 +1,13 @@
-/// bigram key → entity ID リストの逆引きインデックス。
+/// n-gram key → entity ID リストの逆引きインデックス。
 /// BucketCylinder と同じ発想: key ごとに Vec<u64> を持つ。
 ///
-/// key は u32（bigram の 2 文字を pack）、eid は u64（EnchuDB v32+ の entity ID）。
+/// key は u64（gram の n 文字を 16bit ずつ pack、#121）、eid も u64（EnchuDB v32+ の
+/// entity ID）。n = 2 の key は上位 32bit が 0 で、旧 u32 key と同じビット列。
 use std::collections::HashMap;
 
 pub struct PostingList {
-    /// bigram key → ソート済み entity ID リスト
-    buckets: HashMap<u32, Vec<u64>>,
+    /// gram key → ソート済み entity ID リスト
+    buckets: HashMap<u64, Vec<u64>>,
 }
 
 impl PostingList {
@@ -15,12 +16,12 @@ impl PostingList {
     }
 
     /// entity を追加。重複は許容（後で dedup）。
-    pub fn add(&mut self, key: u32, eid: u64) {
+    pub fn add(&mut self, key: u64, eid: u64) {
         self.buckets.entry(key).or_default().push(eid);
     }
 
     /// entity を削除。
-    pub fn remove(&mut self, key: u32, eid: u64) {
+    pub fn remove(&mut self, key: u64, eid: u64) {
         if let Some(list) = self.buckets.get_mut(&key) {
             list.retain(|&e| e != eid);
             if list.is_empty() {
@@ -30,12 +31,12 @@ impl PostingList {
     }
 
     /// 指定 key の entity リスト。
-    pub fn get(&self, key: u32) -> &[u64] {
+    pub fn get(&self, key: u64) -> &[u64] {
         self.buckets.get(&key).map_or(&[], |v| v.as_slice())
     }
 
     /// 複数 key の AND（共通 entity）。最小リストから開始して絞り込む。
-    pub fn intersect(&self, keys: &[u32]) -> Vec<u64> {
+    pub fn intersect(&self, keys: &[u64]) -> Vec<u64> {
         if keys.is_empty() { return vec![]; }
 
         // 最小の posting list を起点にする
@@ -76,7 +77,7 @@ impl PostingList {
     }
 
     /// 内部データへのアクセス（保存用）
-    pub fn raw(&self) -> &HashMap<u32, Vec<u64>> { &self.buckets }
+    pub fn raw(&self) -> &HashMap<u64, Vec<u64>> { &self.buckets }
 
     /// 統計
     pub fn key_count(&self) -> usize { self.buckets.len() }
@@ -137,6 +138,21 @@ mod tests {
 
         pl.remove(100, 2);
         assert_eq!(pl.get(100), &[] as &[u64]);
+    }
+
+    #[test]
+    fn wide_key() {
+        // n >= 3 の gram key は 32bit を超える (16bit × 3 = 48bit)。#121
+        let mut pl = PostingList::new();
+        let k3 = crate::gram::extract_keys("国民は", 3)[0];
+        let k4 = crate::gram::extract_keys("国民は法", 4)[0];
+        assert!(k3 > u32::MAX as u64, "n=3 key が u32 に収まってしまっている");
+        pl.add(k3, 7);
+        pl.add(k4, 8);
+        pl.compact();
+        assert_eq!(pl.get(k3), &[7u64]);
+        assert_eq!(pl.get(k4), &[8u64]);
+        assert_eq!(pl.key_count(), 2, "u32 に潰れて衝突していない");
     }
 
     #[test]

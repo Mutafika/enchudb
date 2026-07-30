@@ -1,3 +1,12 @@
+//! n = 2 専用の薄い互換 API。
+//!
+//! 実体は [`crate::gram`]（n 可変、key u64）に一本化された (#121)。この module は
+//! `bigram::extract` / `bigram::to_key` を直接叩いていた既存の呼び出し元のために
+//! 残してあるが、**新規コードは `gram::extract_keys(text, n)` を使うこと**。
+//! index の n は `NgramIndex::n()` が持っているので、呼び出し側が 2 を書く必要はない。
+
+use crate::gram;
+
 /// 文字列を bigram に分割。Unicode 文字単位。
 /// "国民は法" → ["国民", "民は", "は法"]
 pub fn extract(text: &str) -> Vec<[char; 2]> {
@@ -10,18 +19,16 @@ pub fn extract(text: &str) -> Vec<[char; 2]> {
 
 /// bigram → u32 キー。2 文字を 16bit ずつ pack。
 /// BMP 外の文字（emoji 等）は下位 16bit に切り詰め。
+///
+/// `gram::pack` の n = 2 特殊化で、ビット列は `gram::extract_keys(_, 2)` と同一。
 #[inline]
 pub fn to_key(bg: [char; 2]) -> u32 {
-    let a = (bg[0] as u32) & 0xFFFF;
-    let b = (bg[1] as u32) & 0xFFFF;
-    (a << 16) | b
+    gram::pack(&bg) as u32
 }
 
 /// u32 キー → bigram 文字列（デバッグ用）
 pub fn from_key(key: u32) -> Option<String> {
-    let a = char::from_u32((key >> 16) & 0xFFFF)?;
-    let b = char::from_u32(key & 0xFFFF)?;
-    Some(format!("{a}{b}"))
+    gram::key_to_string(key as u64, 2)
 }
 
 #[cfg(test)]

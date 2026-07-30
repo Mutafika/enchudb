@@ -1,6 +1,6 @@
 //! enchudb-textsearch — `enchudb-ngram` の上に乗る **テキスト検索ポリシー**。
 //!
-//! [`NgramIndex`](enchudb_ngram::NgramIndex) が返す bigram 候補を `.contains()` で検証して
+//! [`NgramIndex`](enchudb_ngram::NgramIndex) が返す n-gram 候補を `.contains()` で検証して
 //! **正確な部分一致 (substring)** にする。これは「人間の対話検索」に正しい挙動（`接地` で
 //! `接地極` / `接地工事` が出るのは望ましい UX）。
 //!
@@ -16,8 +16,11 @@
 //! ## なぜ別クレートか
 //!
 //! 人間 = 部分一致と 機械 = フレーズ完全一致は「正しい」が用途が逆。同一エンジンに両立
-//! させるとどちらかが歪むので関心を分離する。index プリミティブ（bigram / posting /
+//! させるとどちらかが歪むので関心を分離する。index プリミティブ（n-gram / posting /
 //! intersect）は `enchudb-ngram` が持ち、その上に検索ポリシーが乗る。
+//!
+//! n は index が覚えているので (#121)、このレイヤの挙動 —— どの長さのクエリを index で
+//! 絞れるか、どこから `.contains()` 検証が要るか —— は n に自動追従する。
 
 use std::io;
 
@@ -30,9 +33,17 @@ pub struct TextSearch {
 }
 
 impl TextSearch {
-    /// インメモリモード（構築用）
+    /// インメモリモード（構築用）。n は既定の 2。
     pub fn new() -> Self {
         Self { idx: NgramIndex::new() }
+    }
+
+    /// n を指定してインメモリ構築する (#121)。対応範囲は 2..=4。
+    ///
+    /// n は `.etxt` に焼かれるので、[`open`](Self::open) した側は n を知らなくてよい。
+    /// 検索の挙動は n に自動追従する（[`min_query_len`](Self::min_query_len) 参照）。
+    pub fn with_n(n: usize) -> io::Result<Self> {
+        Ok(Self { idx: NgramIndex::with_n(n)? })
     }
 
     /// mmap モードで開く（読み取り専用、即起動）。native のみ。
@@ -101,35 +112,70 @@ impl TextSearch {
 
     /// 部分一致検索 (substring)。
     ///
-    /// `ngram` の候補（bigram intersect）を `.contains()` で検証して偽陽性を除外する。
-    /// - 2 文字未満のクエリは bigram で絞れないので全 doc 走査（`scan`）にフォールバック。
-    /// - 1 bigram（2 文字）のクエリは候補がそのまま正確一致なので検証を省く。
+    /// `ngram` の候補（n-gram intersect）を `.contains()` で検証して偽陽性を除外する。
+    /// n は index が覚えているので呼び出し側は意識しなくてよい (#121)。
+    /// - n 文字未満のクエリは index で絞れないので全 doc 走査（`scan`）にフォールバック。
+    /// - ちょうど n 文字のクエリは gram == query（key は文字を詰めた exact 値で衝突が
+    ///   無い）なので、候補がそのまま正確一致。検証を省く。
     /// - 機械向けフレーズ完全一致は、フレーズ全体を 1 単位でここに渡す（断片に割らない）。
+    ///
+    /// **原文を持たない index（postings-only、#84）では答えを出せない組合せがある**
+    /// — その場合ここは黙って空を返す。区別したいなら
+    /// [`try_search`](Self::try_search) を使う。
     pub fn search(&self, query: &str) -> Vec<u64> {
-        let bgs = enchudb_ngram::bigram::extract(query);
+        self.try_search(query).unwrap_or_default()
+    }
 
-        if bgs.is_empty() {
-            if query.is_empty() {
-                return vec![];
+    /// [`search`](Self::search) の「答えられないなら Err」版 (#121)。
+    ///
+    /// postings-only index (`has_text() == false`) は原文を持たないので、
+    /// **substring 検証も全走査 fallback もできない**。該当するのは:
+    /// - クエリ長 < n — 絞り込む gram が作れず `scan` に落ちるが、走査する原文が無い
+    /// - クエリ長 > n — 候補は出るが偽陽性を落とす照合ができない
+    ///
+    /// どちらも `ErrorKind::Unsupported`。呼び出し側は
+    /// [`candidates`](Self::candidates) を取って自分の source（DB 本体）で検証する。
+    /// クエリ長 == n だけは検証不要なので postings-only でも `Ok`。
+    pub fn try_search(&self, query: &str) -> io::Result<Vec<u64>> {
+        let n = self.idx.n();
+        let qlen = query.chars().count();
+
+        if qlen == 0 {
+            return Ok(vec![]);
+        }
+
+        if qlen < n {
+            // n 文字未満は gram を作れないので全 doc を走査するしかない。
+            if !self.idx.has_text() {
+                return Err(no_text(format!(
+                    "query {qlen} chars < n = {n}: index で絞れず全走査が必要だが、\
+                     この index は原文を持たない (postings-only)。source 側で走査すること"
+                )));
             }
-            // 1 文字クエリは bigram で絞れないので全 doc を走査する。
-            return self.idx.scan(|text| text.contains(query));
+            return Ok(self.idx.scan(|text| text.contains(query)));
         }
 
         let candidates = self.idx.candidates(query);
 
-        // 1 bigram クエリ（2 文字）は bigram == query なので、候補に居る ⟺ query が
-        // substring として存在する。検証は無駄なのでスキップ。
-        if bgs.len() == 1 {
-            return candidates;
+        // ちょうど n 文字のクエリは gram == query なので、候補に居る ⟺ query が
+        // substring として存在する。検証は無駄なのでスキップ。key は hash ではなく
+        // 文字を詰めた exact 値なので、この同値は n がいくつでも成り立つ。
+        if qlen == n {
+            return Ok(candidates);
         }
 
-        // 多 bigram クエリは原文照合で偽陽性を除外（"ABXYBC" は "AB" "BC" の bigram を
+        // n 文字超のクエリは原文照合で偽陽性を除外（"ABXYBC" は "AB" "BC" の bigram を
         // 両方持つが、連続した "ABBC" は含まない）。
-        candidates
+        if !self.idx.has_text() {
+            return Err(no_text(format!(
+                "query {qlen} chars > n = {n}: 候補の偽陽性を落とすのに原文照合が要るが、\
+                 この index は原文を持たない (postings-only)。candidates() を source で検証すること"
+            )));
+        }
+        Ok(candidates
             .into_iter()
             .filter(|&eid| self.idx.get_text(eid).is_some_and(|text| text.contains(query)))
-            .collect()
+            .collect())
     }
 
     /// クエリの **生候補** doc id（bigram intersect、`.contains()` 検証なし）。
@@ -151,14 +197,31 @@ impl TextSearch {
         self.idx.has_text()
     }
 
+    /// この engine の n (#121)。`open` した場合は `.etxt` header 由来。
+    pub fn n(&self) -> usize {
+        self.idx.n()
+    }
+
+    /// index で絞り込める最短のクエリ長（文字数）= n。
+    /// これ未満のクエリは O(N) 全走査に落ちる（postings-only では
+    /// [`try_search`](Self::try_search) が Err）。
+    pub fn min_query_len(&self) -> usize {
+        self.idx.min_query_len()
+    }
+
     /// 原文を取得
     pub fn get_text(&self, eid: u64) -> Option<&str> {
         self.idx.get_text(eid)
     }
 
-    /// 統計
+    /// 統計 — 相異なる gram key の数。
+    pub fn gram_count(&self) -> usize {
+        self.idx.gram_count()
+    }
+
+    /// [`gram_count`](Self::gram_count) の旧名 (n = 2 前提の名前)。
     pub fn bigram_count(&self) -> usize {
-        self.idx.bigram_count()
+        self.gram_count()
     }
 
     pub fn doc_count(&self) -> usize {
@@ -169,6 +232,11 @@ impl TextSearch {
     pub fn ngram(&self) -> &NgramIndex {
         &self.idx
     }
+}
+
+/// postings-only index に原文照合を求めたときのエラー。
+fn no_text(msg: String) -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, msg)
 }
 
 impl Default for TextSearch {
