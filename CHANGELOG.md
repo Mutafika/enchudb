@@ -3,6 +3,85 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.15.2 — 2026-08-01
+
+bug fix のみ。 **engine の on-disk format は不変** (v8 のまま)、 公開 API の追加・
+変更なし。 migration 不要。
+
+### Fixed — `where_in` (Predicate::In) が単独使用で常に空を返す
+
+`Table::where_in(col, values)` を他の述語なしで単独で使うと、 対象 row が存在しても
+常に 0 件になっていた。 `Query::find` が IN を「候補集合への post-filter (retain)」
+としてしか扱っておらず、 IN が唯一の述語のとき base candidates が `query_by_id(&[])`
+= 空集合になり、 空集合を retain して常に空だった。 eq_conds が空で IN があるときは
+`pull_in_by_id` を候補の seed にするよう修正。
+
+併せて `pull_in_by_idx` の `e as EntityId` (= #32 と同型の **peer prefix 抜け**) を
+`make_eid(peer, e)` に修正 — `where_eq(x).where_in(y)` の組合せが peer_id ≠ 0 の
+DB で空になる潜在バグも同時に消えている。
+
+- 発見: sunsu home-timeline (fan-out-on-read) を `posts.where_in(author, followees)`
+  で引いたら全 user で空。 followee ごとに `where_ref` を N 回呼ぶ回避策 (クエリ N 倍)
+  から `where_in` 一括に戻せる。
+- regression test: `crates/enchudb-schema/tests/issue12_where_in_standalone.rs` (3) —
+  単独 IN / eq × IN intersect / `where_ref` との eid 一致。
+
+### Fixed — readonly open の dirty index shadow が index_cap 比例の anon RSS を占有 (#127)
+
+dirty (clean_flag ≠ 1) / legacy (VIX2) DB の readonly open は index を heap の shadow へ
+rebuild するが (#77-H1)、 旧形式は index layout の byte 複製
+(`vec![0u8; index_cap × 13B]`)。 確保は calloc (仮想) でも、 **#123 で hash slot が
+一様分散になったため rebuild が shadow の全ページに live slot を書いて全ページを
+物理化**し、 readonly open 1 回ごとに index_cap 比例の anon RSS が Engine 寿命の間
+残っていた。 1 GB VPS で同一 DB を複数 layer が readonly open する構成 (naruhodo) の
+boot +~300 MB / storm OOM の有力因。
+
+shadow を `(fxhash(value), vid)` sorted の **count 比例 compact 形式**に変更:
+
+| readonly open (max_entities=1M 実測) | 0.15.1 | 0.15.2 |
+|---|---|---|
+| clean | +0.05 MB | +0.05 MB (不変) |
+| dirty, vocab_max_entries=4M | **+52.05 MB/open** | +0.06 MB |
+| dirty, 既定式 (16M entries) | **+208.05 MB/open** | +0.06 MB |
+
+- lookup は hash の binary search + 同 hash 区間の値比較。 「先着 vid が勝つ」 dup
+  解決は旧 probe と同一。
+- 計測 harness: `cargo run --release -p enchudb-engine --example issue127_open_heap`
+- regression test: `tests/issue127_readonly_shadow_compact.rs` — counting allocator で
+  dirty readonly open の heap 増分 < 4 MB を固定 (旧実装は 54.58 MB で fail)。
+- #127 の実環境確認 (1 GB cgroup での anon 比較) は 0.15.2 適用後に要実測 —
+  serving DB が dirty かは `vocab_index_rebuilt_on_load()` で判定できる。
+
+### Fixed — Leaf read retry が並列 contention 下で silent None (#128)
+
+`get_text_owned` / `get_content_owned` の retry は一律 256 回で give-up して None を
+返していたが、 単一 cell を止めどなく re-tie する writer と CPU contention が重なると
+writer loop と位相が噛み合ったまま (resonance) 256 連敗し、 **値が存在するのに
+silent None** を返すことがあった (issue119 torture test の並列実行で実測 10/30 run fail)。
+
+「進捗の無い連敗」 だけを数える方式に変更:
+
+- column offset か slot stamp (gen/ss、 内部 `LeafStore::slot_stamp` 新設) が動いて
+  いる間は writer 前進中 = 値は存在するので諦めない (seqlock reader と同じ契約)
+- 同じ (raw, stamp) のまま 256 連敗 (crash 残骸の odd gen / 恒久 stale / 破損) の
+  ときだけ None — escape は維持し hang しない (odd gen を汚す unit test で固定)
+- yield だけでは位相が崩れないことがあるので µs sleep の階段 backoff (≤ 100 µs) を追加
+
+issue119 binary 並列実行 30 回: **10 fail → 0 fail**。
+
+### Tests
+
+- issue7 (seal_integrity 後の himo append で `.crc` 追従漏れ) の reproducer を assert
+  付きに強化して `#[ignore]` 撤去 — fix 自体は v29 で入っていたが test が置き去り
+  だった。 stale `.crc` の unlink / reopen 成功 / 再 seal での regenerate を固定。
+
+### 検証 (0.15.2)
+
+- `cargo test --workspace --no-fail-fast` — **724 passed / 0 failed / 27 ignored**
+  (0.15.1 時点 718)。 issue119 系 flaky の根治込み (上記 30 run 検証)。
+- 各 fix とも「fix を無効化すると該当 test が fail する」 falsify を実施済み
+  (where_in: 2 test fail / #127: 54.58 MB 確保で fail / #128: 10/30 run fail)。
+
 ## 0.15.1 — 2026-07-31
 
 `enchudb-ngram` / `enchudb-textsearch` のみの変更。 **engine の on-disk format は不変**

@@ -141,20 +141,13 @@ fn append_mixed_type_himos_after_reopen() {
     cleanup(&path);
 }
 
-/// seal_integrity で `.crc` を焼いた後に himo を追加 → reopen が崩れるかの確認。
-/// 仮説 B: `.crc` sidecar が 「44 個分」 のまま残って 62 個目の column を見たとき
-/// integrity check が落ちる / SIGBUS する。
+/// seal_integrity で `.crc` を焼いた後に himo を追加 → reopen できることの確認。
 ///
-/// **status: 未 fix bug の reproducer**。 master では `flush()` が `.crc` を再焼きしない
-/// ため、 `seal_integrity` 後に `define_himo` で schema 変更すると `.crc` が前 schema
-/// 時点のまま残り、 次 open の `verify_region_crcs` が vocab/himoreg mismatch で `Err`。
-/// SIGBUS ではないが DB が開けない状態になる。
-///
-/// 修正案 (engine 側): `ensure_himo` (= schema 変更経路) で `.crc` を unlink、
-/// 次 open は v28 以前 fallback で skip。 これを入れたら `#[ignore]` を剥がす。
-/// fix 単体で再現確認したい時は `cargo test -- --ignored` で実行。
+/// v29 issue7 fix (`define_himo_slot_locked` が stale `.crc` sidecar を unlink)
+/// の regression test。 fix 前は `.crc` が前 schema 時点のまま残り、 次 open の
+/// `verify_region_crcs` が vocab/himoreg mismatch で `Err` になっていた
+/// (SIGBUS ではないが DB が開けない)。
 #[test]
-#[ignore = "未 fix: seal_integrity 後の define_himo append で .crc 追従漏れ → reopen 失敗。 engine 側で ensure_himo が .crc invalidate する fix 待ち。"]
 fn append_himos_after_seal_integrity() {
     let path = tmp_path("append_after_seal");
     cleanup(&path);
@@ -175,27 +168,42 @@ fn append_himos_after_seal_integrity() {
         eng.tie(e, "h0", 42);
         // seal_integrity = flush + .crc 焼き
         eng.seal_integrity().unwrap();
+        assert!(
+            std::path::Path::new(&format!("{}.crc", path)).exists(),
+            ".crc sidecar should exist after seal_integrity"
+        );
     }
 
     {
         let mut eng = Engine::open_standalone(&path).unwrap();
-        // 新 himo append
+        // 新 himo append → stale になった .crc は engine が unlink する
         for i in 10..20 {
             eng.define_himo(&format!("h{}", i), ValueType::Number, 0);
         }
         eng.flush().unwrap();
+        assert!(
+            !std::path::Path::new(&format!("{}.crc", path)).exists(),
+            "define_himo after seal_integrity must invalidate the stale .crc sidecar"
+        );
     }
 
     {
-        // .crc は前 schema 時点で焼かれているので、 verify_region_crcs が失敗する
-        // 可能性 (= SIGBUS とは違うけど DB が開けなくなる)。
-        match Engine::open_standalone(&path) {
-            Ok(_) => {}
-            Err(e) => {
-                // CRC mismatch だけならまだ良い (errno で帰る)、 SIGBUS じゃない
-                eprintln!("open after seal+append: {}", e);
-            }
-        }
+        // fix 前はここで verify_region_crcs が vocab/himoreg mismatch で Err だった
+        let eng = Engine::open_standalone(&path)
+            .expect("reopen after seal_integrity + define_himo append must succeed");
+        assert_eq!(eng.pull_raw("h0", 42).len(), 1, "old data should survive");
+        assert_eq!(eng.pull_raw("h19", 0).len(), 0, "new himo should be queryable");
+    }
+
+    // 再 seal → 再 open で .crc が現 schema で焼き直されることも確認
+    {
+        let mut eng = Engine::open_standalone(&path).unwrap();
+        eng.seal_integrity().unwrap();
+    }
+    {
+        let eng = Engine::open_standalone(&path)
+            .expect("reopen with regenerated .crc must succeed");
+        assert_eq!(eng.pull_raw("h0", 42).len(), 1);
     }
 
     cleanup(&path);
