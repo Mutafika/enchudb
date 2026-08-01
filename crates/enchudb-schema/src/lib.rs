@@ -1796,11 +1796,27 @@ impl<'a> Query<'a> {
         }
         if empty { return Ok(Vec::new()); }
 
-        // 2. base candidates。 eq_conds が空 = `.all()` 系 → table 所属を表す
-        //    代表 column (PK or first col) で「値が tie された全 entity」 を取る。
-        //    case 1 設計では「table の row」 = 「table の column を 1 つ以上 tie してる entity」、
-        //    厳密には全 column union だが、 代表 column slice で実用上十分。
-        let mut candidates = if eq_conds.is_empty() && in_pred.is_none() {
+        // 2. base candidates。
+        //    - eq_conds あり → engine query が primary index
+        //    - eq_conds 無し + IN あり → IN 集合自体を候補の seed にする (issue12:
+        //      旧実装は IN を post-filter 専用にしていて、 単独 where_in が
+        //      query_by_id(&[]) = 空集合の retain となり常に 0 件だった)
+        //    - どちらも無し = `.all()` 系 → table 所属を表す代表 column (PK or
+        //      first col) で「値が tie された全 entity」 を取る。
+        //      case 1 設計では「table の row」 = 「table の column を 1 つ以上 tie してる entity」、
+        //      厳密には全 column union だが、 代表 column slice で実用上十分。
+        let mut candidates = if !eq_conds.is_empty() {
+            let mut c = eng.query_by_id(&eq_conds);
+            // 3. IN は候補集合への set-membership filter として intersect
+            //    (pull_in_by_id の結果は sort + dedup 済み)
+            if let Some((h, vs)) = in_pred {
+                let in_sorted = eng.pull_in_by_id(h, &vs);
+                c.retain(|e| in_sorted.binary_search(e).is_ok());
+            }
+            c
+        } else if let Some((h, vs)) = in_pred {
+            eng.pull_in_by_id(h, &vs)
+        } else {
             let representative_hid = self.table.pk
                 .or_else(|| if self.table.cols.is_empty() { None } else { Some(0) })
                 .map(|i| self.table.cols[i].himo_id);
@@ -1808,18 +1824,7 @@ impl<'a> Query<'a> {
                 Some(hid) => eng.entities_with_himo(hid),
                 None => Vec::new(),
             }
-        } else {
-            eng.query_by_id(&eq_conds)
         };
-
-        // 3. apply IN as a set-membership filter
-        if let Some((h, vs)) = in_pred {
-            let in_set = eng.pull_in_by_id(h, &vs);
-            // intersect with candidates
-            let mut in_sorted = in_set;
-            in_sorted.sort_unstable();
-            candidates.retain(|e| in_sorted.binary_search(e).is_ok());
-        }
 
         // 4. post-filter range / cmp predicates (Column 直読み)
         if !range_preds.is_empty() || !cmp_preds.is_empty() {

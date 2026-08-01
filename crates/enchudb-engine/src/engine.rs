@@ -6566,7 +6566,10 @@ impl Engine {
         }
         out.sort_unstable();
         out.dedup();
-        out.into_iter().map(|e| e as enchudb_oplog::EntityId).collect()
+        // issue12: 旧 `e as EntityId` は #32 と同型 (peer prefix 抜け)。
+        // query_by_id / entities_with_himo と同じ make_eid(peer, e) で揃える。
+        let peer = self.peer_id();
+        out.into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect()
     }
 
     /// Cylinder 結果に delta を適用。
