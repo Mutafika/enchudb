@@ -305,6 +305,46 @@ impl LeafStore {
         }
     }
 
+    /// #128: retry の進捗検出用に slot の状態 stamp (ss word + gen) を返す。
+    ///
+    /// `try_read` が `Retry` を返した offset について、 呼び側 (engine
+    /// `text_owned_by_id`) が「stamp が動いた = writer 前進中の生きた race
+    /// (値は存在する、 諦めない)」 と 「同 stamp のまま連敗 = 恒久 stale /
+    /// crash 残骸の odd gen (escape すべき)」 を区別する。 観測専用なので
+    /// 一貫性は不要 — ss と gen が別世代でも「動いたか」の判定には足りる。
+    /// bounds 外は 0 固定 (= 不変 stamp として stall 側に数えられる)。
+    pub fn slot_stamp(&self, word_off: u32) -> u64 {
+        let region_len = self.region.len();
+        let o = self.w2b(word_off);
+        let Some(h8) = o.checked_add(SLOT_HEADER) else { return 0 };
+        if h8 > region_len {
+            return 0;
+        }
+        let ss = self.region.as_atomic_u32(o).load(Ordering::Relaxed);
+        let mut stamp = ss as u64;
+        if ss & HAS_GEN != 0 {
+            if let Some(h12) = o.checked_add(SLOT_HEADER_GEN) {
+                if h12 <= region_len {
+                    let g = self.region.as_atomic_u32(o + GEN_OFF).load(Ordering::Relaxed);
+                    stamp |= (g as u64) << 32;
+                }
+            }
+        }
+        stamp
+    }
+
+    /// #128 escape 経路の test 用: slot の gen を odd に汚す (= writer が書込中に
+    /// crash した残骸を再現)。 進捗の無い Retry 連発で reader が hang せず None に
+    /// 落ちることの検証にだけ使う。
+    #[cfg(test)]
+    pub(crate) fn poison_gen_odd_for_test(&self, word_off: u32) {
+        let o = self.w2b(word_off);
+        let ss = self.region.as_atomic_u32(o).load(Ordering::Relaxed);
+        assert!(ss & HAS_GEN != 0, "poison target must be a gen slot");
+        let g = self.region.as_atomic_u32(o + GEN_OFF);
+        g.store(g.load(Ordering::Relaxed) | 1, Ordering::Release);
+    }
+
     /// payload を格納し slot 先頭 **word offset** を返す。 free-list に嵌まる空きが
     /// あればそこへ、 無ければ high_water を伸ばす。
     pub fn insert(&self, bytes: &[u8]) -> u32 {
