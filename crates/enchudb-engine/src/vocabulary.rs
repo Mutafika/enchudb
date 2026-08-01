@@ -27,7 +27,15 @@ pub struct Vocabulary {
     /// とき lookup はこちらを参照。 writer open では常に None。
     /// 旧実装は readonly でも `rebuild_index` が共有 index をゼロクリアして
     /// おり、 併走中の writer の index entry を恒久消失させていた。
-    shadow_index: Option<Box<[u8]>>,
+    ///
+    /// #127: 形式は index layout の byte 複製 (`Box<[u8]>`、 index_cap × 13B) から
+    /// **count 比例の compact 形式** `(fxhash(value), vid)` sorted に変更。 旧形式は
+    /// 確保こそ calloc (仮想) だが、 #123 で hash が一様分散になったため rebuild が
+    /// shadow の全ページに live slot を書いて **index_cap 比例の anon RSS** を
+    /// Engine 寿命の間占有していた (dirty DB の readonly open 1 回ごと。 naruhodo
+    /// 1GB VPS の boot +~300MB の正体)。 lookup は hash の binary search + 同 hash
+    /// 内の値比較で、 旧 probe と同じ「最小 vid が勝つ」 解決を保つ。
+    shadow_index: Option<Vec<(u64, u32)>>,
     /// #77-M1: disk 上の clean_flag のキャッシュ。 flush() が 1 を書いた後の
     /// 最初の insert で 0 に戻すための判定に使う (旧実装は open 時の 1 回
     /// しか 0 に倒さず、 flush 後の追加 write 中 crash で破損 index を
@@ -143,20 +151,21 @@ impl Vocabulary {
         // #77-H1: readonly open は共有 mmap を書き換えず heap の shadow へ。
         if needs_rebuild {
             if readonly {
-                // shadow は zero 済み = 旧 slot が存在しないので legacy でも clear 不要。
-                // on-disk index は VIX2 のまま残す (readonly は共有 mmap を書かない)。
-                let size = Self::index_region_size(v.index_cap);
-                let mut shadow = vec![0u8; size].into_boxed_slice();
-                shadow[0..4].copy_from_slice(&INDEX_MAGIC);
-                shadow[4..8].copy_from_slice(&v.index_cap.to_le_bytes());
-                Self::rebuild_index_into(
-                    &v.offsets,
-                    &v.data,
-                    v.count.load(Ordering::Relaxed),
-                    v.index_cap,
-                    v.max_entries,
-                    &mut shadow,
-                );
+                // #127: count 比例の compact shadow を data/offsets (= ground truth)
+                // から構築する。 on-disk index は VIX2 / dirty のまま残す (readonly は
+                // 共有 mmap を書かない)。 構築元が data 直なので、 旧 shadow rebuild の
+                // 「破損 slot (vid >= max_entries) 読み飛ばし」 は不要 — count 側だけ
+                // 破損 header 対策で max_entries に clamp する (旧実装は clamp なしで
+                // read_value が offsets を溢れる余地があった、 安全側の強化)。
+                let count = v.count.load(Ordering::Relaxed).min(v.max_entries);
+                let mut shadow: Vec<(u64, u32)> = Vec::with_capacity(count as usize);
+                for id in 0..count {
+                    let value = read_value(&v.offsets, &v.data, id);
+                    shadow.push((fxhash(value), id));
+                }
+                // (hash, vid) 昇順 = 同 hash 内は vid 昇順。 lookup の線形走査が
+                // 最小 vid から当たるので、 旧 probe の dup 解決 (先着 vid) と一致。
+                shadow.sort_unstable();
                 v.shadow_index = Some(shadow);
             } else {
                 // #123: legacy は旧 slot を消してから (消さないと no-clear rebuild (#92) の
@@ -324,12 +333,21 @@ impl Vocabulary {
 
     #[inline]
     pub fn lookup(&self, value: &[u8]) -> Option<u32> {
+        // #77-H1 / #127: readonly open で dirty だった場合は compact shadow を参照。
+        // hash の partition_point → 同 hash 区間を vid 昇順に値比較 (probe と同じ
+        // 「先着 vid が勝つ」 解決)。
+        if let Some(shadow) = &self.shadow_index {
+            let h = fxhash(value);
+            let mut i = shadow.partition_point(|&(sh, _)| sh < h);
+            while let Some(&(sh, vid)) = shadow.get(i) {
+                if sh != h { break; }
+                if self.get(vid) == value { return Some(vid); }
+                i += 1;
+            }
+            return None;
+        }
         let mask = (self.index_cap - 1) as u64;
-        // #77-H1: readonly open で dirty だった場合は heap の shadow を参照
-        let xm: &[u8] = match &self.shadow_index {
-            Some(s) => s,
-            None => self.index.slice(),
-        };
+        let xm: &[u8] = self.index.slice();
         let h = fxhash(value);
         let mut idx = home_slot(h, self.index_cap); // #123
         loop {
