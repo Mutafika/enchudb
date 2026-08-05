@@ -16,11 +16,6 @@ enchudb = { path = "../.." }
 enchudb-oplog = { path = "../enchudb-oplog" }
 tungstenite = { version = "0.24", optional = true, default-features = false, features = ["handshake"] }
 
-[dev-dependencies]
-sabitori = { path = "../../../sabitori/crates/sabitori" }
-sabitori-style = { path = "../../../sabitori/crates/sabitori-style" }
-sabitori-core = { path = "../../../sabitori/crates/sabitori-core" }
-
 [[bin]]
 name = "enchu_demo"
 path = "src/bin/enchu_demo.rs"
@@ -28,7 +23,3 @@ path = "src/bin/enchu_demo.rs"
 [[bin]]
 name = "bench_distributed"
 path = "src/bin/bench_distributed.rs"
-
-[[example]]
-name = "dist_dashboard"
-path = "examples/dist_dashboard.rs"
