@@ -3,6 +3,45 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.15.3 — 2026-08-06
+
+**ライブラリコードの変更なし** (engine on-disk format v8 不変、 公開 API 不変)。
+packaging / CI のみの chore release。 依存を更新するだけで上がれる。
+
+### Fixed — workspace が repo 外の `../sabitori` に path 依存していた (#124)
+
+clean checkout (CI / コンテナ / 外部 contributor / crates.io 公開) では
+**manifest 読み込み段階で** workspace 全体が解決できず、 `cargo test --workspace` が
+`failed to read /sabitori/crates/sabitori/Cargo.toml` で落ちていた。 ローカルの
+`~/myapp` レイアウトでしか workspace build が通らない状態。
+
+```
+error: failed to load manifest for workspace member `/repo/.`
+Caused by: failed to load manifest for dependency `enchudb-transport`
+Caused by: failed to load manifest for dependency `sabitori`
+```
+
+`sabitori` (自作 GPU GUI framework) を使っていたのは
+`enchudb-transport/examples/dist_dashboard.rs` の 1 本だけ — origin + replica × 3 を
+1 プロセスに同居させて 4 分割ビューで可視化する分散デモ (1030 行、 実質休眠)。
+**example ごと削除**した。 `[dev-dependencies]` に置くだけでは直らない (path 解決は
+dev-dep でも manifest 段階で走る) こと、 repo 外の font asset を
+`include_bytes!("../../../../sabitori/assets/...")` で直参照していて feature gate では
+path が残ること、 の 2 点から「隠す」ではなく「出す」を選んだ。 デモを残すなら依存の
+向きが自然な sabitori 側 repo へ引っ越すのが筋 (git 履歴からはいつでも復元できる)。
+
+- root `Cargo.toml` にも同じ dev-deps 3 行があったが、 root には使用箇所が無く
+  **dead だった** (「bench 専用」 の注記に反して) ので併せて撤去。
+- **CI の回避ハックを撤去**: 全 4 job (test / miri / loom / clippy) が
+  `find . -name Cargo.toml -exec sed -i '/sabitori/d' {} +` で manifest を書き換えてから
+  検証していた。 CI が素の repo をそのまま検証するようになった。
+
+検証は clean 環境 (sibling に `sabitori` が無い隔離 dir へ repo を複製) で
+`cargo metadata` / `cargo check -p enchudb-transport --all-targets` の通過を確認し、
+**同環境で sabitori 行を 1 行戻すと manifest 解決が失敗する**ことまで実演している。
+`cargo test --workspace --no-fail-fast` は 724 passed / 0 failed / 27 ignored で
+0.15.2 と同数 (regression なし)。
+
 ## 0.15.2 — 2026-08-01
 
 bug fix のみ。 **engine の on-disk format は不変** (v8 のまま)、 公開 API の追加・
