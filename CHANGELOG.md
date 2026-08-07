@@ -3,6 +3,69 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.15.4 — 2026-08-07
+
+**silent data corruption の修正を含む。 routed Leaf を read-while-write する構成は
+上げること。** engine の on-disk format は不変 (v8 のまま)、 公開 API 変更なし、
+migration 不要 — 依存を更新するだけで上がれる。
+
+### Fixed — free した Leaf slot が corrupt payload を返す (#132)
+
+高 churn かつ read/write 並行下で、`get_content_owned` / `get_content` /
+`get_text_owned` / `get_text` が稀に **payload を 4 byte (1 word) 手前からスライスした
+blob** を返していた。長さは正しいまま先頭 4 byte に gen カウンタが混入し、末尾 4 byte が
+欠落する。長さ prefix 付き codec なら decode 失敗で弾けるが、**固定長 codec では silent に
+誤値を掴む**。
+
+実測 (wikipulse の torture test): owned ~1/25 万 read、借用 ~1/10 万 read。
+`get_*_owned` への移行 (#119 Step 0) で頻度は下がるが根治しない。
+
+原因は `LeafStore::free()` が hole header を **`HAS_GEN` を落とした素の `slot_size`** で
+書き、かつ **先頭 4 byte しか上書きしない**こと。gen slot の `len` (+4) と `gen` (+8) が
+生き残るため、その offset を掴んだ reader は `try_read` の **legacy 8 byte header 分岐**に
+落ち、残った旧 `len` を信じて payload を +12 ではなく **+8 から** copy していた。
+bounds check `len > slot_size - 8` は旧 `len` ≤ 旧 `slot_size` − 12 なので必ず通過し、
+`ss1 == ss0` も成立するため何にも引っかからず `Ok` で返る。
+
+gen seqlock は **gen 分岐に入って初めて効く**ので、分岐判定自体が誤る本件は seqlock の
+外側。`text_owned_by_id` の外側 verify も offset だけを比べる **ABA 比較**で、best-fit
+allocator + 同サイズ re-tie の churn では free した slot が即再利用されて column が
+`raw → 別 → raw` と戻るためすり抜ける。借用版はこの verify すら無く、実測の約 2.5 倍差と
+整合する。
+
+**修正**: hole header を「**gen が odd の 12 byte slot**」として書く。`try_read` の gen
+分岐が既に持つ「`g0` が odd なら `Retry`」にそのまま乗るので **reader 側の判定は一行も
+増えていない**。`HAS_GEN` が立つので `slot_size_bytes_at` の `!HAS_GEN` マスクが効き
+`rebuild_free_list` の walk も無傷。旧 binary も odd gen の扱いを持っているため
+**format 互換で、version bump は不要**。
+
+- `free()`: 冒頭で freed offset の gen を odd に publish。coalesce で merged header が
+  前方へ移っても、末尾で high_water が後退して header を書かない経路でも弾かれる
+- `alloc_locked()`: split remainder も同じ header で書く。印を書けない余りを作らないよう
+  split 閾値を 8 byte → 12 byte に引き上げ。walk の assert が使う下限は 8 byte のまま
+  (上げると payload 長 0 の legacy slot を持つ v6/v7 DB が開けなくなる)
+- `flush_run()`: open ごとに全 hole の先頭が塗り直されるので、**旧 binary が書いた既存 DB
+  の hole も初回 open で self-heal** する
+- legacy 8 byte slot 由来の 12 byte 未満 hole だけは gen を置けないが、payload 開始位置が
+  reader の legacy 分岐と一致する (+8) ため誤読は起きない
+
+**影響範囲**: 0.14.0 (#106 で gen slot 導入) 〜 0.15.3。writer が quiesce している構成
+(readonly open、バッチ後の読み出し) では `free` が走らないので発生しない。
+
+回帰テストは **並行不要の決定的テスト 4 本** (churn に依存しないので flaky にならない):
+freed slot / coalesce で header が前方へ移った場合 / split remainder が旧 gen slot の
+先頭から始まる場合 / free 後の再利用が正しく読めること。fix を無効化すると前 3 本が
+落ちることを確認済み。
+
+### Removed
+
+- repo 内の旧 LP (`lp/index.html`、2026-05-13 が最終更新、どこからも未参照) を削除。
+
+### 検証 (0.15.4)
+
+`cargo test --workspace --no-fail-fast` — **728 passed / 0 failed / 27 ignored**
+(0.15.3 時点 724、差分は #132 の回帰テスト 4 本)。
+
 ## 0.15.3 — 2026-08-06
 
 **ライブラリコードの変更なし** (engine on-disk format v8 不変、 公開 API 不変)。
