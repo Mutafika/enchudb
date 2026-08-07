@@ -3,6 +3,75 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.16.0 — 2026-08-07
+
+**Windows でビルドできるようになった (#133)。** engine の on-disk format は不変
+(v8 のまま)、既存の公開 API に変更なし、migration 不要。**MSRV が 1.89 に上がる**ため
+minor bump とした。
+
+### Added — Windows ビルド対応 (#133)
+
+unix 依存だった 4 箇所を解消し、`aarch64-pc-windows-gnullvm` で workspace 全体が
+ビルドできるようになった (下流 syncretic の Windows 対応の前提)。
+
+| 箇所 | 対応 |
+|---|---|
+| `growable_map.rs` | `#[cfg(unix)]` 化。非 unix は構築不能な stub |
+| `engine.rs` / `oplog.rs` の `libc::flock` × 2 | `std::fs::File::lock` に置換 (依存追加なし) |
+| `keys.rs` の `mode(0o600)` | `#[cfg(unix)]` 分岐 |
+| `enchudb-oplog` の `libc` | unix 限定の依存に移動 |
+
+- **lock の挙動は不変**。`libc::flock(LOCK_EX)` → `File::lock()`、`LOCK_UN` →
+  `unlock()` で、どちらもブロッキング排他。`File::lock` は unix では内部で `flock` を
+  使うので `.db.lock` による writer 排他の意味論はそのまま。
+- **growable backing は unix 限定になった**。「予約 (`PROT_NONE`) → `MAP_FIXED` で
+  貼り直す」手が Windows の `MapViewOfFileEx` では使えないため。ただし growable が
+  要るのは create 時だけで (`Engine::open` は growable で作った DB でも常に素の
+  `MmapMut` で開き直す)、非 unix では eager create で代替できる。非 unix で
+  `create_growable*` を呼ぶと `io::ErrorKind::Unsupported` を返す (コンパイルは通るので
+  **実行時**に出る点に注意)。
+- `enchudb-schema` に eager 版 `Database::create_with_capacity` を追加。
+
+**MSRV**: `File::lock` の安定化に合わせて **1.89**。各 manifest に `rust-version` を
+明記した。`enchudb-ngram` / `enchudb-textsearch` は `File::lock` を使わず edition 2021 の
+ままなので、意図的に据え置いている (この 2 crate 単体はより古い toolchain でも使える)。
+
+### Known limitation — NTFS では create が実領域を確保する
+
+Windows の NTFS は既定で sparse file を作らないため、`set_len(total_size)` が
+**見かけサイズぶんの実領域を消費する**。`FSCTL_SET_SPARSE` の対応は未実施。
+
+注意すべきは **`max_entities` を下げてもほとんど縮まない**こと — 支配的なのは
+entity 比例部分ではなく vocab / content / leaf の**固定既定サイズ**である
+(macOS で apparent size を実測):
+
+| 構成 | apparent |
+|---|---|
+| `create_with_capacity(1_000_000)` | 2968.7 MB |
+| `create_with_capacity(100_000)` | 1684.5 MB |
+| `create_with_capacity(10_000)` | 1551.6 MB |
+| `create_compact()` | 589.3 MB |
+
+固定 region まで絞れば下がる (`Engine::create_full`):
+
+| 構成 | apparent |
+|---|---|
+| `max_entities=100k` / vocab 4 MB / himos 256 / content 4 MB | 668.5 MB |
+| `max_entities=10k` / vocab 1 MB / himos 64 / content 1 MB | 522.2 MB |
+
+→ Windows で作るときは `create_with_capacity` ではなく **`create_full` で固定 region も
+絞る**のが当面の指針。それでも 522 MB が下限なので、実用上は sparse 対応が本命。
+
+### 検証 (0.16.0)
+
+- `cargo test --workspace --no-fail-fast` (macOS) — **728 passed / 0 failed / 27 ignored**
+  (0.15.4 と同数、回帰なし)
+- `cargo check --workspace --target aarch64-pc-windows-gnullvm` — **error 0**
+  (0.15.4 では `std::os::fd` / `libc::flock` / `mode()` / `as_raw_fd` で 10 errors)
+- Windows 11 ARM64 実機 (Parallels, build 22621) で DB 作成 → scan → apply → daemon 起動
+  → mDNS 広告まで通過 (PR #133 の報告)
+- Windows 上での `cargo test` 実行は未検証
+
 ## 0.15.4 — 2026-08-07
 
 **silent data corruption の修正を含む。 routed Leaf を read-while-write する構成は
