@@ -18,7 +18,15 @@ pub(crate) mod append_vec;
 pub(crate) mod append_bucket;
 pub(crate) mod lockfree_cylinder;
 pub(crate) mod region;
-#[cfg(not(target_arch = "wasm32"))]
+// growable backing は「虚仮アドレス予約 (PROT_NONE) → MAP_FIXED で貼り直す」
+// unix 固有の手を使う。 Windows の MapViewOfFileEx は空きアドレスにしかマップ
+// できないので同じ実装は使えない。 ただし **growable が要るのは create 時だけ**
+// (`Engine::open` は常に素の mmap backing で開き直す) なので、 Windows では
+// 構築不能な stub を置き、 eager な `create_with_capacity` 系を使う。
+#[cfg(all(not(target_arch = "wasm32"), unix))]
+pub mod growable_map;
+#[cfg(all(not(target_arch = "wasm32"), not(unix)))]
+#[path = "growable_map_stub.rs"]
 pub mod growable_map;
 pub mod column;
 pub mod vocabulary;

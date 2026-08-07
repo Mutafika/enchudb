@@ -284,6 +284,15 @@ impl Database {
         let eng = Engine::create_compact(path).map_err(|e| SchemaError::Io(e.to_string()))?;
         Self::wrap_new(eng)
     }
+    /// eager (非 growable) backing の capacity 指定版。 `create_growable_with_capacity`
+    /// と同じ layout を **最初に全部確保**して開く。 growable が使えない platform
+    /// (非 unix) 向け。 sparse を自動でやらない FS (NTFS 既定) では見かけサイズが
+    /// そのまま実消費になる点に注意。
+    pub fn create_with_capacity(path: &str, max_entities: u32) -> Result<Self, SchemaError> {
+        let eng = Engine::create_with_capacity(path, max_entities)
+            .map_err(|e| SchemaError::Io(e.to_string()))?;
+        Self::wrap_new(eng)
+    }
     pub fn create_growable(path: &str) -> Result<Self, SchemaError> {
         let eng = Engine::create_growable(path).map_err(|e| SchemaError::Io(e.to_string()))?;
         Self::wrap_new(eng)
