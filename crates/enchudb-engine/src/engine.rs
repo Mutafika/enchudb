@@ -512,7 +512,6 @@ impl Drop for WriterLock {
 /// open / create だけ呼ぶ。
 #[cfg(not(target_arch = "wasm32"))]
 fn acquire_writer_lock(path: &str) -> io::Result<WriterLock> {
-    use std::os::fd::AsRawFd;
     let lock_path = writer_lock_path_for(path);
     if let Some(parent) = lock_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -536,9 +535,9 @@ fn acquire_writer_lock(path: &str) -> io::Result<WriterLock> {
             ),
         ));
     }
-    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
-    if rc != 0 {
-        let err = io::Error::last_os_error();
+    // std::fs::File::lock (Rust 1.89 安定化) は unix で flock、 Windows で
+    // LockFileEx に落ちる。 素の libc::flock は Windows に fd 自体が無く使えない。
+    if let Err(err) = f.lock() {
         writer_registry().remove(&key);
         return Err(err);
     }

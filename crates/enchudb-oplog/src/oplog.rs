@@ -444,19 +444,18 @@ pub struct RelayedHeader {
     pub pubkey_fp: [u8; 8],
 }
 
-/// `flock(LOCK_EX)` 解放用 RAII guard。 drop で `LOCK_UN` を呼ぶ。
+/// 排他 advisory lock 解放用 RAII guard。 drop で unlock する。
+/// `std::fs::File::lock` は unix で flock、 Windows で LockFileEx に落ちる
+/// (Rust 1.89 で安定化)。 素の `libc::flock` は Windows に fd 自体が無く使えない。
 #[cfg(not(target_arch = "wasm32"))]
 struct OpLogLockGuard<'a> {
-    fd: std::os::fd::RawFd,
-    _marker: std::marker::PhantomData<&'a ()>,
+    file: &'a File,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for OpLogLockGuard<'_> {
     fn drop(&mut self) {
-        unsafe {
-            let _ = libc::flock(self.fd, libc::LOCK_UN);
-        }
+        let _ = self.file.unlock();
     }
 }
 
@@ -1212,13 +1211,8 @@ impl OpLog {
     /// 取得まで block する (典型的に数 µs〜ms)。 read 経路は lock 取らない。
     #[cfg(not(target_arch = "wasm32"))]
     fn flock_exclusive(&self) -> io::Result<OpLogLockGuard<'_>> {
-        use std::os::fd::AsRawFd;
-        let fd = self._file.as_raw_fd();
-        let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(OpLogLockGuard { fd, _marker: std::marker::PhantomData })
+        self._file.lock()?;
+        Ok(OpLogLockGuard { file: &self._file })
     }
 
     // ---- internal mmap helpers ----

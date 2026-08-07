@@ -14,4 +14,7 @@ sha2 = "0.10"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 memmap2 = "0.9"
+
+# libc は unix 限定 (flock は std::fs::File::lock に移行済み)。
+[target.'cfg(all(not(target_arch = "wasm32"), unix))'.dependencies]
 libc = "0.2"

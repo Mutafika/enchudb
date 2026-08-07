@@ -86,13 +86,16 @@ impl Keypair {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(path)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).truncate(true).write(true);
+        // Windows は POSIX mode を持たない (ACL)。 既定の継承 ACL に委ねる —
+        // 厳密な owner-only 化は SetNamedSecurityInfo が要るので TODO。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(path)?;
         f.write_all(&self.secret_bytes())?;
         Ok(())
     }
