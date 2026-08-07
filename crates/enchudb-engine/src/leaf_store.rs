@@ -75,6 +75,9 @@ const SLOT_HEADER_GEN: usize = 12;
 const GEN_OFF: usize = 8;
 /// slot_size の bit0。 4-align で本来 0 なので、 1 を「gen 付き 12B header」の標識に使う。
 const HAS_GEN: u32 = 1;
+/// #132: hole (free 済み領域) の header に焼く gen。 **odd = 書込中/読むな** の既存規約に
+/// 乗せているので、 reader 側に新しい判定を足す必要がない。
+const HOLE_GEN: u32 = 1;
 /// 最小 slot (空 payload = header のみ、 byte)。 これ未満の余りは hole にできない。
 const MIN_SLOT: usize = SLOT_HEADER;
 /// off_shift の上限 (16B align = 64GB)。 これ以上は padding 過大で不許可。
@@ -176,9 +179,52 @@ impl LeafStore {
     /// 最初の slot の byte offset (HEADER を alignment まで押し上げた位置)。
     #[inline]
     fn data_start_byte(&self) -> usize { self.align_slot(HEADER) }
-    /// 最小 slot の word 数 (padding 込みで header を収める最小)。 常に >= 1。
+    /// walk が受け付ける最小 slot の word 数 (= 旧 8B header slot も含む歴史的下限)。
+    /// `rebuild_free_list` の健全性 assert 用。 v6/v7 DB には payload 長 0 の legacy
+    /// 8B slot が実在するので、 ここを引き上げると既存 DB が open できなくなる。
     #[inline]
     fn min_slot_words(&self) -> u32 { self.b2w(self.align_slot(MIN_SLOT)) }
+
+    /// #132: **新たに hole を作るときの**最小 word 数。 hole header は gen(+8..12) まで
+    /// 書いて「読めない印」を付ける必要があるので 12B を下回れない。 これ未満の余りは
+    /// split せず内部断片として払い出しに含める (従来 8B だった split 閾値が 12B になる)。
+    #[inline]
+    fn min_hole_words(&self) -> u32 { self.b2w(self.align_slot(SLOT_HEADER_GEN)) }
+
+    /// #132: hole header を **payload として絶対に読めない形**で書く。
+    ///
+    /// `slot_size` に `HAS_GEN` を立てて「12B header」と標識し、 gen を **odd** にする。
+    /// `try_read` の gen 分岐は既に `g0 & 1 != 0 → Retry` を持っているので、 stale offset を
+    /// 掴んだ reader は必ず弾かれる。 素の size を書く旧実装だと `HAS_GEN` が落ちるため
+    /// reader が **legacy 8B header 分岐**に落ち、 +4 に残った旧 len を信じて payload を
+    /// +12 ではなく +8 から copy し、 gen 4B 前置 + 末尾 4B 欠落の corrupt を `Ok` で返して
+    /// いた (これが #132)。
+    ///
+    /// `HAS_GEN` 付きなので `slot_size_bytes_at` の `!HAS_GEN` マスクがそのまま効き、
+    /// `rebuild_free_list` の walk も従来どおり。 旧 binary も odd gen の扱いを既に持って
+    /// いるので **format 互換** (version bump 不要)。
+    ///
+    /// gen を先に置いてから ss を publish する。 逆順だと「新 ss + 旧 even gen」の瞬間が
+    /// 生まれ、 reader が stale payload を `Ok` で返しうる。
+    #[inline]
+    fn write_hole_header(&self, word_off: u32, hole_bytes: u32) {
+        let o = self.w2b(word_off);
+        if hole_bytes as usize >= SLOT_HEADER_GEN {
+            self.region
+                .as_atomic_u32(o + GEN_OFF)
+                .store(HOLE_GEN, Ordering::Release);
+            self.region
+                .as_atomic_u32(o)
+                .store(hole_bytes | HAS_GEN, Ordering::Release);
+        } else {
+            // 12B 未満 = 元が legacy 8B slot (payload 長 0) の hole。 gen を置く場所が
+            // 無いが、 legacy slot は payload 開始位置が +8 で reader の legacy 分岐と
+            // 一致するため誤読は起きない (len も 0 のまま = 空を返す)。
+            self.region
+                .as_atomic_u32(o)
+                .store(hole_bytes, Ordering::Relaxed);
+        }
+    }
 
     #[inline]
     fn high_water_atomic(&self) -> &AtomicU32 {
@@ -414,13 +460,14 @@ impl LeafStore {
         if let Some((hoff, hsize)) = best {
             holes.remove(&hoff);
             let remainder = hsize - need_words;
-            if remainder >= self.min_slot_words() {
-                // split: 余りを hole として登録 (byte slot_size header を書いて walkable に)
+            // #132: split 閾値は 12B (= hole header に odd gen まで書ける最小)。
+            if remainder >= self.min_hole_words() {
+                // split: 余りを hole として登録 (walkable + 読めない印)
                 let roff = hoff + need_words;
-                let rbyte = self.w2b(roff);
-                // #113: slot_size は reader が as_atomic_u32 で読むので atomic store
-                // (stale reader が split remainder を try_read しても data race にしない)。
-                self.region.as_atomic_u32(rbyte).store(self.w2b(remainder) as u32, Ordering::Relaxed);
+                // #113/#132: reader が as_atomic_u32 で読むので atomic store。 remainder の
+                // 先頭が過去に gen slot の先頭だった場合、 素の size で書くと stale reader が
+                // legacy 分岐に落ちて corrupt を返す (#132) ため、 必ず hole header で書く。
+                self.write_hole_header(roff, self.w2b(remainder) as u32);
                 holes.insert(roff, remainder);
                 (hoff, need_words)
             } else {
@@ -440,6 +487,22 @@ impl LeafStore {
     /// slot を解放 (word offset)。 隣接 free hole と coalesce し、 末尾なら high_water 後退。
     pub fn free(&self, word_off: u32) {
         let mut hsize = self.b2w(self.slot_size_bytes_at(word_off) as usize);
+
+        // #132: 何よりも先に「この offset はもう読めない」を publish する。 coalesce で
+        // merged header の位置が前方 (poff) へ移ったり、 末尾で high_water が後退して
+        // header 自体を書かない経路に入っても、 **freed slot 自身の offset** を掴んだ
+        // stale reader は必ず Retry する。 gen 付き slot のみ (legacy 8B は payload 開始
+        // 位置が reader の legacy 分岐と一致するので誤読しない)。
+        {
+            let o = self.w2b(word_off);
+            let ss_raw = self.region.as_atomic_u32(o).load(Ordering::Relaxed);
+            if ss_raw & HAS_GEN != 0 {
+                self.region
+                    .as_atomic_u32(o + GEN_OFF)
+                    .store(HOLE_GEN, Ordering::Release);
+            }
+        }
+
         let mut hoff = word_off;
         let mut holes = self.holes.lock().unwrap_or_else(|p| p.into_inner());
 
@@ -464,12 +527,12 @@ impl LeafStore {
             self.set_hw_words(hoff);
             self.region.mark_dirty(HIGH_WATER_OFF, 4);
         } else {
-            // merged header (byte slot_size) を書いて walkable 維持 + free-list 登録。
-            // #113: slot_size は reader (stale offset を掴んだ try_read) が as_atomic_u32 で
-            // 読むので atomic store で書き、 plain-write vs atomic-read の data race を避ける。
-            let hbyte = self.w2b(hoff);
-            self.region.as_atomic_u32(hbyte).store(self.w2b(hsize) as u32, Ordering::Relaxed);
-            self.region.mark_dirty(hbyte, 4);
+            // merged header を書いて walkable 維持 + free-list 登録。
+            // #113: reader (stale offset を掴んだ try_read) が as_atomic_u32 で読むので
+            // atomic store で書き、 plain-write vs atomic-read の data race を避ける。
+            // #132: 素の size ではなく hole header (HAS_GEN + odd gen) で書く。
+            self.write_hole_header(hoff, self.w2b(hsize) as u32);
+            self.region.mark_dirty(self.w2b(hoff), SLOT_HEADER_GEN);
             holes.insert(hoff, hsize);
         }
     }
@@ -517,8 +580,12 @@ impl LeafStore {
             self.set_hw_words(off);
         } else {
             // #113: uniform に atomic store (rebuild は open 時単一スレッドだが reader 規約に揃える)。
-            let obyte = self.w2b(off);
-            self.region.as_atomic_u32(obyte).store(self.w2b(size) as u32, Ordering::Relaxed);
+            // #132: hole header (HAS_GEN + odd gen) で書く。 open のたびに全 hole の先頭が
+            // これで塗り直されるので、 **旧 binary が素の size で書いた既存 DB の hole も
+            // 初回 open で self-heal** する (run の内部 offset は live column が指さないので
+            // 対象外 — stale offset は「この process 内で live だった」ものだけで、 それらは
+            // runtime の free() が印を付ける)。
+            self.write_hole_header(off, self.w2b(size) as u32);
             holes.insert(off, size);
         }
     }
@@ -544,6 +611,97 @@ mod tests {
         let ptr = Box::leak(buf).as_mut_ptr();
         let region = unsafe { Region::new(ptr, bytes) };
         LeafStore::init(region, off_shift)
+    }
+
+    /// #132: free 済み slot を掴んだ reader が **corrupt payload を Ok で返さない**。
+    ///
+    /// 旧実装は hole header を素の slot_size (HAS_GEN 落ち) で書いていたため、 reader が
+    /// legacy 8B header 分岐に落ち、 +4 に残った旧 len を信じて payload を +12 ではなく
+    /// **+8 から** copy していた → gen 4B が前置され末尾 4B が欠落した blob を `Ok` で返す
+    /// (長さは正しいまま)。 並行不要で決定的に再現する。
+    #[test]
+    fn issue132_freed_slot_is_never_readable() {
+        let s = make_store(64 * 1024);
+        let payload = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+        let a = s.insert(payload);
+        // 末尾でない (= high_water 後退経路に入らない) よう後続 slot を置く
+        let _b = s.insert(b"keep-me-so-high-water-does-not-retreat");
+        assert_eq!(s.get(a), payload, "前提: free 前は正しく読める");
+
+        s.free(a);
+
+        match s.try_read(a) {
+            LeafRead::Retry => {}
+            LeafRead::Ok(b) => panic!(
+                "free 済み slot が Ok を返した: len={} 先頭8B={:?} (元先頭8B={:?})",
+                b.len(),
+                &b[..8.min(b.len())],
+                &payload[..8],
+            ),
+        }
+    }
+
+    /// #132: coalesce で merged header の位置が前方へ移っても、 **free した offset 自身**を
+    /// 掴んだ reader が弾かれる (free 冒頭の odd gen publish が効いていること)。
+    #[test]
+    fn issue132_freed_slot_unreadable_even_when_coalesced_backward() {
+        let s = make_store(64 * 1024);
+        let a = s.insert(&[b'a'; 40]);
+        let b = s.insert(&[b'b'; 40]);
+        let _keep = s.insert(&[b'k'; 40]); // 末尾を埋めて hw 後退を防ぐ
+
+        s.free(a); // 先に a を hole に
+        s.free(b); // b は直前 hole (a) と coalesce → merged header は a 側に書かれる
+
+        assert!(
+            matches!(s.try_read(b), LeafRead::Retry),
+            "coalesce で header 位置が前方に移った freed offset が読めてしまう"
+        );
+        assert!(matches!(s.try_read(a), LeafRead::Retry));
+    }
+
+    /// #132: split remainder の先頭も hole header で書かれる。
+    ///
+    /// **remainder の先頭が「過去に gen slot の先頭だった offset」になる形**を作らないと
+    /// 意味が無い (単なる payload の途中なら +4 の値が巨大で bounds check に弾かれ、
+    /// fix の有無に関わらず Retry になって空振りする)。 そこで隣接 2 slot を free して
+    /// coalesce させ、 前半と同サイズを入れ直して **remainder が後半 slot の先頭から
+    /// 始まる**ようにする。
+    #[test]
+    fn issue132_split_remainder_is_never_readable() {
+        let s = make_store(64 * 1024);
+        let a = s.insert(&[b'a'; 40]);
+        let b = s.insert(&[b'b'; 40]);
+        let _keep = s.insert(&[b'k'; 40]); // 末尾を埋めて hw 後退を防ぐ
+
+        s.free(b);
+        s.free(a); // a と b が coalesce → hole は [a, a+2slot)
+
+        // a と同サイズを入れると a に嵌まり、 remainder は **b の旧 offset**から始まる
+        let re = s.insert(&[b'r'; 40]);
+        assert_eq!(re, a, "前提: 同サイズなら a の位置に再利用される");
+        assert_eq!(s.get(re), &[b'r'; 40]);
+
+        assert!(
+            matches!(s.try_read(b), LeafRead::Retry),
+            "split remainder の先頭 (= 旧 gen slot 先頭) が payload として読めてしまう"
+        );
+    }
+
+    /// #132: free → 再利用 (同 offset) の後も新しい値が正しく読めること。
+    /// hole header に HAS_GEN を立てる変更が insert の publish を壊していないかの確認。
+    #[test]
+    fn issue132_reused_slot_reads_new_value() {
+        let s = make_store(64 * 1024);
+        let a = s.insert(b"first-value-0123456789");
+        let _keep = s.insert(&[b'k'; 40]);
+        s.free(a);
+        let b = s.insert(b"second-value-abcdefghi");
+        assert_eq!(s.get(b), b"second-value-abcdefghi");
+        match s.try_read(b) {
+            LeafRead::Ok(v) => assert_eq!(v, b"second-value-abcdefghi"),
+            LeafRead::Retry => panic!("再利用した live slot が読めない"),
+        }
     }
 
     #[test]
