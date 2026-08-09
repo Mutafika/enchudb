@@ -2,8 +2,6 @@
 //!
 //! 実行: `cargo test --features v27 --test ec_site -- --nocapture`
 
-#![cfg(feature = "v27")]
-
 use enchudb::{Engine, ValueType};
 
 // ════════════════ ヘルパー ════════════════

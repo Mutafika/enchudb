@@ -5,8 +5,6 @@
 //!
 //! `cargo test --features v27 --test edge_cases`
 
-#![cfg(feature = "v27")]
-
 use enchudb::{Engine, ValueType};
 use std::sync::Arc;
 

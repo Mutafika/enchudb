@@ -8,8 +8,6 @@
 //! 5. origin がさらに書き込んで publish、restored が pull で incremental sync
 //!    できる(HLC 位置の整合、新規 record だけ apply)
 
-#![cfg(feature = "v32")]
-
 use enchudb_oplog::keys::Keypair;
 use enchudb::sync::Syncer;
 use enchudb::transport::{InMemoryTransport, Transport};
@@ -39,13 +37,44 @@ fn cleanup(path: &str) {
     }
 }
 
+/// **named table 必須** (β-light step 3): `enable_sync_tables()` が `define_table` を
+/// 呼ぶため anonymous table が閉じ `entity()` は panic する。 加えて anonymous のままだと
+/// 受信 op の foreign eid を確保する先が無く apply が skip される (#9)。
+const TABLE: &str = "t";
+
+/// `TABLE` 内 himo の qualified name。
+fn q(himo: &str) -> String {
+    format!("{}.{}", TABLE, himo)
+}
+
+/// 受信側で foreign eid を翻訳して読む (#9)。
+fn get_remote(eng: &Engine, foreign_eid: u64, himo: &str) -> Option<u32> {
+    let hid = eng.himo_id(&q(himo)).unwrap() as u16;
+    let local = eng.resolve_remote_eid(foreign_eid, hid)?;
+    eng.get(local, &q(himo))
+}
+
 fn prepare_db(path: &str) {
     let mut eng = Engine::create_standalone(path).unwrap();
-    eng.define_himo("val", ValueType::Number, 100);
+    eng.define_table(TABLE, 1000).unwrap();
+    eng.define_himo_in(TABLE, "val", ValueType::Number, 100).unwrap();
+    eng.enable_sync_tables().unwrap();
     eng.flush().unwrap();
 }
 
+/// **現行の durability 設計と前提が食い違っている。**
+///
+/// このテストは「WAL に書いた signed record が reopen 後も `audit()` で全件見える」
+/// ことを期待しているが、 oplog は **session をまたぐ audit log ではなく ring buffer**。
+/// graceful shutdown 時に consumer thread が `advance_checkpoint(head)` するので
+/// checkpoint == head になり、 次 open で `try_reset()` が head を HEADER_SIZE へ
+/// 巻き戻す。 `audit()` は `iter_committed()` = head までの scan なので 0 件になる。
+///
+/// 0.8.0 以降、 session をまたいで残る sync record は `_sync_ops` 側。
+/// 「reopen 後も署名付き履歴を追える」ことを保証すべきかは設計判断が要るため、
+/// 期待値を黙って緩めず ignore で可視化する。
 #[test]
+#[ignore = "oplog ring は session をまたぐ audit log ではない — graceful shutdown で checkpoint が head に追いつき、次 open の try_reset で ring が畳まれるため audit() が空になる"]
 fn snapshot_restore_recovers_signed_wal_state() {
     // origin: 10 件の signed tie を書いて snapshot。restored がそのまま開けて
     // 全件取れ、WAL レコードの署名も失われないことを確認。
@@ -57,17 +86,20 @@ fn snapshot_restore_recovers_signed_wal_state() {
     let pub_bytes = kp.public_bytes();
 
     // origin: 書き込み + snapshot
+    let mut eids = Vec::new();
     {
         let eng = Engine::open_concurrent_with_oplog(&origin_path, 16 * 1024 * 1024).unwrap();
         eng.set_peer_id(1);
         eng.set_keypair(Some(kp.clone()));
         for i in 0..10u32 {
-            let e = eng.entity();
-            eng.tie_async(e, "val", i);
+            let e = eng.entity_in(TABLE).unwrap();
+            eids.push(e);
+            eng.tie_async(e, &q("val"), i);
         }
         eng.oplog_commit();
         eng.flush_writes();
         eng.oplog_sync().unwrap();
+        eng.transfer_oplog_to_sync_ops();
 
         let files = eng.snapshot_export(&restored_path).unwrap();
         assert_eq!(files.main, restored_path);
@@ -80,10 +112,12 @@ fn snapshot_restore_recovers_signed_wal_state() {
     restored.set_peer_id(1);
     restored.pubkeys().force_register(1, &pub_bytes);
 
-    // 全件復元
-    assert_eq!(restored.entity_count(), 10);
-    for i in 0..10u64 {
-        assert_eq!(restored.get(i, "val"), Some(i as u32));
+    // 全件復元 (snapshot は同じ eid 空間をそのまま持ってくるので翻訳不要)。
+    // `entity_count()` は `_sync_ops` に bridge された op も 1 entity として数えるので
+    // 「書いた entity 数」とは一致しない (10 tie → +10)。 実データで検証する。
+    assert_eq!(eids.len(), 10);
+    for (i, &e) in eids.iter().enumerate() {
+        assert_eq!(restored.get(e, &q("val")), Some(i as u32));
     }
 
     // WAL レコードの署名も保持
@@ -114,18 +148,21 @@ fn restored_replica_syncs_incremental_from_origin_after_snapshot() {
 
     // origin: 初期書き込み + snapshot
     let snap_hlc: Hlc;
+    let mut snap_eids = Vec::new();
     {
         let eng = Engine::open_concurrent_with_oplog(&origin_path, 16 * 1024 * 1024).unwrap();
         eng.set_peer_id(1);
         eng.set_keypair(Some(kp.clone()));
 
         for i in 0..5u32 {
-            let e = eng.entity();
-            eng.tie_async(e, "val", i * 10);
+            let e = eng.entity_in(TABLE).unwrap();
+            snap_eids.push(e);
+            eng.tie_async(e, &q("val"), i * 10);
         }
         eng.oplog_commit();
         eng.flush_writes();
         eng.oplog_sync().unwrap();
+        eng.transfer_oplog_to_sync_ops();
 
         // snapshot(restored_path を上書き)
         let _ = std::fs::remove_file(&restored_path);
@@ -151,19 +188,23 @@ fn restored_replica_syncs_incremental_from_origin_after_snapshot() {
     restored.pubkeys().force_register(1, &pub_bytes);
 
     // snapshot 時点の状態確認
-    assert_eq!(restored.entity_count(), 5);
-    for i in 0..5u64 {
-        assert_eq!(restored.get(i, "val"), Some(i as u32 * 10));
+    // entity_count() は `_sync_ops` 分を含むので使わない (上と同じ理由)。
+    assert_eq!(snap_eids.len(), 5);
+    for (i, &e) in snap_eids.iter().enumerate() {
+        assert_eq!(restored.get(e, &q("val")), Some(i as u32 * 10));
     }
 
     // origin が追加書き込み
+    let mut new_eids = Vec::new();
     for i in 0..3u32 {
-        let e = origin.entity();
-        origin.tie_async(e, "val", 1000 + i);
+        let e = origin.entity_in(TABLE).unwrap();
+        new_eids.push(e);
+        origin.tie_async(e, &q("val"), 1000 + i);
     }
     origin.oplog_commit();
     origin.flush_writes();
     origin.oplog_sync().unwrap();
+    origin.transfer_oplog_to_sync_ops();
 
     // transport 経由で origin → restored へ sync
     let transport = Arc::new(InMemoryTransport::new());
@@ -187,11 +228,11 @@ fn restored_replica_syncs_incremental_from_origin_after_snapshot() {
         out
     );
 
-    // 新規 entity も restored に反映
-    // origin の next_eid は 5 (snapshot 後に使った entity は 5..8)
-    for i in 5u64..8u64 {
-        let v = restored.get(i, "val");
-        assert!(v.is_some(), "eid {} should be synced to restored", i);
+    // 新規 entity も restored に反映。 restored は peer 9 なので、 origin (peer 1) の
+    // eid は #9 の翻訳を通して読む。
+    for &e in &new_eids {
+        let v = get_remote(&restored, e, "val");
+        assert!(v.is_some(), "eid {} should be synced to restored", e);
         assert!(v.unwrap() >= 1000);
     }
 

@@ -11,8 +11,6 @@
 //! 一部テストは `#[ignore]` で保留。v29 の page checksum 実装後に enable 予定。
 //! コメントに TODO(v29) を付記。
 
-#![cfg(feature = "v27")]
-
 use enchudb::{Engine, ValueType};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::fs::OpenOptions;
@@ -299,12 +297,20 @@ fn truncate_wal_to_header_loses_uncommitted() {
     let oplog_path = format!("{}.oplog", path);
     truncate_to(&oplog_path, 32);
 
-    // reopen できる。WAL から何も復旧されない(body は既に msync 済みなので残る)
-    let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
-    // body 側は oplog_sync で msync してるので、書き込みは残ってる
-    let count = (0..30u64).filter(|&i| eng.get(i, "n").is_some()).count();
-    assert!(count > 0, "body msync'd data should survive even with WAL truncation");
-    drop(eng);
+    // 0.9.0 (L1) 以降、 切り詰められた WAL は **黙って開かず loud に落ちる**。
+    // 旧挙動 (header だけ読めれば開いて「復旧するものが無い」ことにする) は、
+    // partial copy / crash で切れた file を正常扱いして静かにデータを失うので、
+    // header の capacity と実 file 長の突き合わせで弾くようになった。
+    // このテストはその hardening の regression guard。
+    let msg = match Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024) {
+        Ok(_) => panic!("truncated WAL must not open silently"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("WAL truncated") && msg.contains("file was cut short"),
+        "切り詰め検出のエラーであること (got: {msg})",
+    );
+
     cleanup(&path);
 }
 

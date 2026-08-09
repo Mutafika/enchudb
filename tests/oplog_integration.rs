@@ -1,7 +1,5 @@
 //! v28 WAL 統合テスト。プロセスクラッシュ / fsync 挙動 / リカバリを検証。
 
-#![cfg(feature = "v27")]
-
 use enchudb::{Engine, ValueType};
 use std::path::Path;
 use std::sync::Arc;

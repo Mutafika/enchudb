@@ -1,7 +1,5 @@
 //! Phase E(snapshot_export)/ Phase F(stats HLC、audit) integration tests。
 
-#![cfg(feature = "v32")]
-
 use enchudb::{AuditFilter, Engine, ValueType};
 use enchudb_oplog::Hlc;
 use std::sync::Arc;

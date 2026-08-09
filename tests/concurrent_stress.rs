@@ -3,8 +3,6 @@
 //! `cargo test --features v27 --test concurrent_stress` で実行する。
 //! v27 が無効な場合はテスト本体が空になるのでビルドだけ通る。
 
-#![cfg(feature = "v27")]
-
 use enchudb::{Engine, ValueType};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};

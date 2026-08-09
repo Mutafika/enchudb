@@ -10,8 +10,6 @@
 //! 「成功するかどうか」は気にしない(むしろランダムは大半 Err になる)、
 //! **サニタイザが抜ける = パニック無し** だけ確認。
 
-#![cfg(feature = "v32")]
-
 use enchudb::transport::{decode_batch, WireRecord};
 use proptest::prelude::*;
 
