@@ -5,8 +5,6 @@
 //!
 //! 実行: `cargo test --features v27 --test property_based`
 
-#![cfg(feature = "v27")]
-
 use enchudb::{Engine, ValueType};
 use proptest::prelude::*;
 use std::collections::{HashMap, HashSet};

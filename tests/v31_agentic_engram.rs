@@ -26,8 +26,6 @@
 //! = topic="Next.js" の Topic を起点 → そのセッション群を逆引き →
 //!   speaker が Alice で絞り込み → decision を抽出
 
-#![cfg(feature = "v27")]
-
 use enchudb::{Engine, ValueType, Ravn};
 use std::sync::Arc;
 

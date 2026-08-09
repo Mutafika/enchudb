@@ -13,8 +13,6 @@
 //! - **Stuck peer**: 黙り peer は他の peer の sync を阻害しない
 //! - **Keypair rotation**: 同じ peer_id が途中で別鍵に切り替え (TOFU 下で拒否される)
 
-#![cfg(feature = "v32")]
-
 use std::sync::Arc;
 use enchudb::{Engine, ValueType};
 use enchudb_oplog::Hlc;
@@ -37,10 +35,23 @@ fn cleanup(path: &str) {
     }
 }
 
+/// **named table 必須** (β-light step 3): `enable_sync_tables()` が `define_table` を
+/// 呼ぶため anonymous table が閉じ `entity()` は panic する。 加えて anonymous のままだと
+/// 受信 op の foreign eid を確保する先が無く `resolve_remote_eid` が None を返して
+/// apply が丸ごと skip される (#9)。 `enable_sync_tables()` 自体は 0.8.0 以降 Syncer
+/// attach の必須条件。
+const TABLE: &str = "t";
+
+fn define_schema(eng: &mut Engine) {
+    eng.define_table(TABLE, 1000).unwrap();
+    eng.define_himo_in(TABLE, "val", ValueType::Number, 100).unwrap();
+    eng.enable_sync_tables().unwrap();
+}
+
 fn make_peer(path: &str, peer: u32) -> Arc<Engine> {
     {
         let mut eng = Engine::create_standalone(path).unwrap();
-        eng.define_himo("val", ValueType::Number, 100);
+        define_schema(&mut eng);
         eng.flush().unwrap();
     }
     let eng = Engine::open_concurrent_with_oplog(path, 16 * 1024 * 1024).unwrap();
@@ -50,12 +61,25 @@ fn make_peer(path: &str, peer: u32) -> Arc<Engine> {
 
 fn make_peer_with_oplog(path: &str, peer: u32) -> Arc<Engine> {
     let mut eng = Engine::create_standalone(path).unwrap();
-    eng.define_himo("val", ValueType::Number, 100);
+    define_schema(&mut eng);
     eng.flush().unwrap();
     drop(eng);
     let eng = Engine::open_concurrent_with_oplog(path, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(peer);
     eng
+}
+
+/// `TABLE` 内 himo の qualified name。
+fn q(himo: &str) -> String {
+    format!("{}.{}", TABLE, himo)
+}
+
+/// 受信側で foreign eid を自分の eid 空間へ翻訳して読む (#9)。
+/// 翻訳が無い (= 一度も apply されていない) 場合は None。
+fn get_remote(eng: &Engine, foreign_eid: u64, himo: &str) -> Option<u32> {
+    let hid = eng.himo_id(&q(himo)).unwrap() as u16;
+    let local = eng.resolve_remote_eid(foreign_eid, hid)?;
+    eng.get(local, &q(himo))
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -79,32 +103,44 @@ fn replay_of_signed_op_is_idempotent() {
     let syncer_b = Syncer::new(eng_b.clone(), transport.clone() as Arc<dyn Transport>);
     syncer_b.set_require_signature(true);
 
-    let eid = eng_a.entity();
-    eng_a.tie_async(eid, "val", 99);
+    let eid = eng_a.entity_in(TABLE).unwrap();
+    eng_a.tie_async(eid, &q("val"), 99);
     eng_a.oplog_commit();
     eng_a.flush_writes();
     eng_a.oplog_sync().unwrap();
+    // 0.8.0: publish の primary path は `_sync_ops`。 oplog からの転送は
+    // background thread 任せだと publish_since が空振りするので明示的に回す
+    // (sleep より決定的)。
+    eng_a.transfer_oplog_to_sync_ops();
     syncer_a.publish_since(Hlc::ZERO);
 
     // 1 回目 apply
     let out1 = syncer_b.pull_once(1);
     assert!(out1.applied >= 1, "first apply");
-    assert_eq!(eng_b.get(eid, "val"), Some(99));
+    assert_eq!(get_remote(&eng_b, eid, "val"), Some(99));
 
-    // 同じ record を 5 回 replay
+    // 同じ record を 5 回 replay。
+    //
+    // transport 経由で 5 回 publish しても `InMemoryTransport::publish` が
+    // (peer, hlc) で dedupe する (transport.rs、 gossip の重複受信対策) ので
+    // log には 1 件しか積まれず、 LWW 側の idempotency を素通ししてしまう。
+    // ここで見たいのは **apply 経路の LWW skip** なので、 transport を挟まず
+    // 同じ batch を直接 5 回 apply_records に食わせる。
     let records = transport.pull(1, Hlc::ZERO);
     assert!(!records.is_empty());
-    let replay_transport = Arc::new(InMemoryTransport::new());
-    for _ in 0..5 {
-        replay_transport.publish(1, records.clone());
-    }
-    let syncer_b2 = Syncer::new(eng_b.clone(), replay_transport.clone() as Arc<dyn Transport>);
+    let syncer_b2 = Syncer::new(eng_b.clone(), transport.clone() as Arc<dyn Transport>);
     syncer_b2.set_require_signature(true);
-    let out2 = syncer_b2.pull_once(1);
+    let mut total_received = 0usize;
+    let mut total_applied = 0usize;
+    for _ in 0..5 {
+        let out = syncer_b2.apply_records(&records);
+        total_received += out.received;
+        total_applied += out.applied;
+    }
 
-    // 受信は 5 倍だが、LWW で apply は 0 (既存 HLC 以下なので skip)
-    assert!(out2.received >= 5);
-    assert_eq!(out2.applied, 0, "replays should be idempotent (LWW skip)");
+    // 受信は 5 バッチぶん、 だが apply は 0 (既存 HLC 以下なので全部 skip)
+    assert!(total_received >= 5, "5 batches should all be received, got {total_received}");
+    assert_eq!(total_applied, 0, "replays should be idempotent (LWW skip)");
 
     cleanup(&pa);
     cleanup(&pb);
@@ -126,7 +162,7 @@ fn future_hlc_attack_dominates_lww_known_limitation() {
 
     // 悪意 peer 1 が HLC=MAX で偽書き込み (署名無しで OK — signature 要求無しのシナリオ)
     let eid = enchudb_oplog::make_eid(1, 7);
-    let himo_id = eng_b.himo_id("val").unwrap() as u16;
+    let himo_id = eng_b.himo_id(&q("val")).unwrap() as u16;
     transport.publish(1, vec![
         WireRecord::unsigned(
             Hlc { wall: u64::MAX, logical: 0, peer: 1 }, 1,
@@ -138,7 +174,7 @@ fn future_hlc_attack_dominates_lww_known_limitation() {
     // require_signature 無し (このテストは LWW の生挙動を検証)
     let out = syncer_b.pull_once(1);
     assert_eq!(out.applied, 1);
-    assert_eq!(eng_b.get(eid, "val"), Some(999));
+    assert_eq!(get_remote(&eng_b, eid, "val"), Some(999));
 
     // 正当な後続 write (wall=100)。同じ syncer だと cursor が MAX に進んでて
     // since フィルタで received=0 になるので、LWW skip の挙動を見るために fresh syncer を使う。
@@ -152,7 +188,7 @@ fn future_hlc_attack_dominates_lww_known_limitation() {
     let out2 = fresh_syncer.pull_once(1);
     assert!(out2.received >= 2, "fresh syncer should see both records");
     assert_eq!(out2.applied, 0, "honest write skipped (LWW: wall=100 < MAX) + future-HLC record also already applied");
-    assert_eq!(eng_b.get(eid, "val"), Some(999), "malicious value stuck");
+    assert_eq!(get_remote(&eng_b, eid, "val"), Some(999), "malicious value stuck");
 
     cleanup(&pb);
 }
@@ -178,15 +214,19 @@ fn mixed_batch_signed_kept_unsigned_dropped() {
     syncer_b.set_require_signature(true);
 
     // peer A が署名付きで 1 件
-    let eid_good = eng_a.entity();
-    eng_a.tie_async(eid_good, "val", 42);
+    let eid_good = eng_a.entity_in(TABLE).unwrap();
+    eng_a.tie_async(eid_good, &q("val"), 42);
     eng_a.oplog_commit();
     eng_a.flush_writes();
     eng_a.oplog_sync().unwrap();
+    // 0.8.0: publish の primary path は `_sync_ops`。 oplog からの転送は
+    // background thread 任せだと publish_since が空振りするので明示的に回す
+    // (sleep より決定的)。
+    eng_a.transfer_oplog_to_sync_ops();
     syncer_a.publish_since(Hlc::ZERO);
 
     // 同じ transport に悪意の unsigned record を混ぜ込む
-    let himo_id = eng_b.himo_id("val").unwrap() as u16;
+    let himo_id = eng_b.himo_id(&q("val")).unwrap() as u16;
     let eid_bad = enchudb_oplog::make_eid(1, 999);
     transport.publish(1, vec![
         WireRecord::unsigned(
@@ -198,8 +238,8 @@ fn mixed_batch_signed_kept_unsigned_dropped() {
     let out = syncer_b.pull_once(1);
     assert!(out.applied >= 1, "signed should land");
     assert!(out.rejected_signature >= 1, "unsigned should be rejected");
-    assert_eq!(eng_b.get(eid_good, "val"), Some(42));
-    assert_eq!(eng_b.get(eid_bad, "val"), None, "unsigned op must not land");
+    assert_eq!(get_remote(&eng_b, eid_good, "val"), Some(42));
+    assert_eq!(get_remote(&eng_b, eid_bad, "val"), None, "unsigned op must not land");
 
     cleanup(&pa);
     cleanup(&pb);
@@ -219,10 +259,10 @@ fn stuck_peer_does_not_block_sync_from_others() {
     let transport = Arc::new(InMemoryTransport::new());
 
     // peer A が publish
-    let eid = eng_a.entity();
+    let eid = eng_a.entity_in(TABLE).unwrap();
     transport.publish(1, vec![
         WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 1 }, 1,
-            DecodedOp::Tie { eid, himo_id: 0, value: 123 }),
+            DecodedOp::Tie { eid, himo_id: eng_a.himo_id(&q("val")).unwrap() as u16, value: 123 }),
     ]);
     // peer B (id=2) は黙り、transport に何も入れない
 
@@ -233,7 +273,7 @@ fn stuck_peer_does_not_block_sync_from_others() {
 
     assert_eq!(out_a.applied, 1);
     assert_eq!(out_b.received, 0);
-    assert_eq!(eng_c.get(eid, "val"), Some(123));
+    assert_eq!(get_remote(&eng_c, eid, "val"), Some(123));
 
     cleanup(&pa);
     cleanup(&pc);
@@ -260,12 +300,21 @@ fn keypair_rotation_rejected_under_tofu() {
     let syncer_b = Syncer::new(eng_b.clone(), transport.clone() as Arc<dyn Transport>);
     syncer_b.set_require_signature(true);
 
-    let eid1 = eng_a.entity();
-    eng_a.tie_async(eid1, "val", 1);
+    let eid1 = eng_a.entity_in(TABLE).unwrap();
+    eng_a.tie_async(eid1, &q("val"), 1);
     eng_a.oplog_commit();
     eng_a.flush_writes();
     eng_a.oplog_sync().unwrap();
-    syncer_a.publish_since(Hlc::ZERO);
+    // 0.8.0: publish の primary path は `_sync_ops`。 oplog からの転送は
+    // background thread 任せだと publish_since が空振りするので明示的に回す
+    // (sleep より決定的)。
+    eng_a.transfer_oplog_to_sync_ops();
+    // request4 以降、 `publish_since` は transport の `known_peers()` が空なら
+    // broadcast、 非空なら「自分以外の既知 peer」への per-peer 送信に切り替わる。
+    // peer B は一度も publish しないので known_peers に載らず、 1 回目の publish で
+    // peer A 自身が登録された時点から publish_since は宛先ゼロ = 黙って 0 件になる。
+    // このテストは 2 回配信するので、 宛先を明示する for_peer 版を使う。
+    assert_eq!(syncer_a.publish_since_for_peer(2, Hlc::ZERO), 1);
     let out1 = syncer_b.pull_once(1);
     assert!(out1.applied >= 1);
 
@@ -273,18 +322,19 @@ fn keypair_rotation_rejected_under_tofu() {
     let kp2 = Arc::new(Keypair::generate());
     eng_a.set_keypair(Some(kp2.clone()));
 
-    let eid2 = eng_a.entity();
-    eng_a.tie_async(eid2, "val", 2);
+    let eid2 = eng_a.entity_in(TABLE).unwrap();
+    eng_a.tie_async(eid2, &q("val"), 2);
     eng_a.oplog_commit();
     eng_a.flush_writes();
     eng_a.oplog_sync().unwrap();
-    syncer_a.publish_since(Hlc::ZERO);
+    eng_a.transfer_oplog_to_sync_ops();
+    assert!(syncer_a.publish_since_for_peer(2, Hlc::ZERO) >= 2, "rotate 後の op も配信されること");
 
     // peer B は TOFU で kp1 の pubkey しか持ってない → kp2 署名は verify 失敗 → reject
     let out2 = syncer_b.pull_once(1);
     assert_eq!(out2.applied, 0);
     assert!(out2.rejected_signature >= 1, "rotated keypair must be rejected under TOFU");
-    assert_eq!(eng_b.get(eid2, "val"), None, "rotated-key op must not land");
+    assert_eq!(get_remote(&eng_b, eid2, "val"), None, "rotated-key op must not land");
 
     cleanup(&pa);
     cleanup(&pb);

@@ -3,8 +3,6 @@
 //! origin Engine → HTTP relay → replica Engine のデータ伝搬を確認する。
 //! "2-node localhost デモ" の最小形。
 
-#![cfg(feature = "v32")]
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +27,31 @@ fn cleanup(path: &str) {
     }
 }
 
+/// **pull 側は replica mode ではなく通常 engine で開く。**
+/// #9 の foreign-eid 翻訳は「受信 op の eid を自分の eid 空間へ *確保* する」動作なので、
+/// `open_concurrent_replica` の `check_writable` guard に弾かれて apply できない
+/// (`Engine is in replica mode; writes must go through Syncer`)。 replica mode と
+/// sync apply の両立は未解決の設計課題 (#138 item 2)。 このファイルの主題は
+/// **HTTP transport 経路** なので、 pull 側は通常の writable engine を使う。
+///
+/// **named table 必須** (β-light step 3): `enable_sync_tables()` が `define_table` を
+/// 呼ぶため anonymous table が閉じ `entity()` は panic する。 加えて anonymous のままだと
+/// 受信 op の foreign eid を確保する先が無く `resolve_remote_eid` が None を返して
+/// apply が丸ごと skip される (#9)。
+const TABLE: &str = "t";
+
+/// `TABLE` 内 himo の qualified name。
+fn q(himo: &str) -> String {
+    format!("{}.{}", TABLE, himo)
+}
+
+/// 受信側で foreign eid を翻訳して読む (#9)。
+fn get_remote(eng: &Engine, foreign_eid: u64, himo: &str) -> Option<u32> {
+    let hid = eng.himo_id(&q(himo)).unwrap() as u16;
+    let local = eng.resolve_remote_eid(foreign_eid, hid)?;
+    eng.get(local, &q(himo))
+}
+
 #[test]
 fn origin_publishes_replica_pulls_over_http() {
     // relay サーバー起動
@@ -39,7 +62,9 @@ fn origin_publishes_replica_pulls_over_http() {
     let origin_path = tmp("origin");
     {
         let mut eng = Engine::create_standalone(&origin_path).unwrap();
-        eng.define_himo("val", ValueType::Number, 100);
+        eng.define_table(TABLE, 1000).unwrap();
+        eng.define_himo_in(TABLE, "val", ValueType::Number, 100).unwrap();
+        eng.enable_sync_tables().unwrap();
         eng.flush().unwrap();
     }
     let origin = Engine::open_concurrent_with_oplog(&origin_path, 16 * 1024 * 1024).unwrap();
@@ -49,10 +74,12 @@ fn origin_publishes_replica_pulls_over_http() {
     let replica_path = tmp("replica");
     {
         let mut eng = Engine::create_standalone(&replica_path).unwrap();
-        eng.define_himo("val", ValueType::Number, 100);
+        eng.define_table(TABLE, 1000).unwrap();
+        eng.define_himo_in(TABLE, "val", ValueType::Number, 100).unwrap();
+        eng.enable_sync_tables().unwrap();
         eng.flush().unwrap();
     }
-    let replica = Engine::open_concurrent_replica(&replica_path, 16 * 1024 * 1024).unwrap();
+    let replica = Engine::open_concurrent_with_oplog(&replica_path, 16 * 1024 * 1024).unwrap();
     replica.set_peer_id(9);
 
     // origin 側 transport = HTTP client、publish 用
@@ -62,7 +89,7 @@ fn origin_publishes_replica_pulls_over_http() {
 
     // origin 側で publish (直接 transport に流す、WAL 経由じゃなく手動 WireRecord)
     let eid = enchudb_oplog::make_eid(1, 7);
-    let himo_id = origin.himo_id("val").unwrap() as u16;
+    let himo_id = origin.himo_id(&q("val")).unwrap() as u16;
     let records = vec![
         WireRecord::unsigned(
             Hlc { wall: 100, logical: 0, peer: 1 },
@@ -96,8 +123,8 @@ fn origin_publishes_replica_pulls_over_http() {
     assert_eq!(out.skipped, 0);
 
     // replica 側に反映
-    assert_eq!(replica.get(eid, "val"), Some(42));
-    assert_eq!(replica.get(enchudb_oplog::make_eid(1, 8), "val"), Some(88));
+    assert_eq!(get_remote(&replica, eid, "val"), Some(42));
+    assert_eq!(get_remote(&replica, enchudb_oplog::make_eid(1, 8), "val"), Some(88));
 
     cleanup(&origin_path);
     cleanup(&replica_path);
@@ -112,7 +139,9 @@ fn multiple_replicas_sync_from_same_origin() {
     let origin_path = tmp("multi_origin");
     {
         let mut eng = Engine::create_standalone(&origin_path).unwrap();
-        eng.define_himo("val", ValueType::Number, 100);
+        eng.define_table(TABLE, 1000).unwrap();
+        eng.define_himo_in(TABLE, "val", ValueType::Number, 100).unwrap();
+        eng.enable_sync_tables().unwrap();
         eng.flush().unwrap();
     }
     let origin = Engine::open_concurrent_with_oplog(&origin_path, 16 * 1024 * 1024).unwrap();
@@ -122,24 +151,28 @@ fn multiple_replicas_sync_from_same_origin() {
     let replica_a_path = tmp("multi_replica_a");
     {
         let mut eng = Engine::create_standalone(&replica_a_path).unwrap();
-        eng.define_himo("val", ValueType::Number, 100);
+        eng.define_table(TABLE, 1000).unwrap();
+        eng.define_himo_in(TABLE, "val", ValueType::Number, 100).unwrap();
+        eng.enable_sync_tables().unwrap();
         eng.flush().unwrap();
     }
-    let replica_a = Engine::open_concurrent_replica(&replica_a_path, 16 * 1024 * 1024).unwrap();
+    let replica_a = Engine::open_concurrent_with_oplog(&replica_a_path, 16 * 1024 * 1024).unwrap();
     replica_a.set_peer_id(101);
 
     // replica B
     let replica_b_path = tmp("multi_replica_b");
     {
         let mut eng = Engine::create_standalone(&replica_b_path).unwrap();
-        eng.define_himo("val", ValueType::Number, 100);
+        eng.define_table(TABLE, 1000).unwrap();
+        eng.define_himo_in(TABLE, "val", ValueType::Number, 100).unwrap();
+        eng.enable_sync_tables().unwrap();
         eng.flush().unwrap();
     }
-    let replica_b = Engine::open_concurrent_replica(&replica_b_path, 16 * 1024 * 1024).unwrap();
+    let replica_b = Engine::open_concurrent_with_oplog(&replica_b_path, 16 * 1024 * 1024).unwrap();
     replica_b.set_peer_id(102);
 
     // origin が publish
-    let himo_id = origin.himo_id("val").unwrap() as u16;
+    let himo_id = origin.himo_id(&q("val")).unwrap() as u16;
     let eid = enchudb_oplog::make_eid(1, 1);
     let origin_t: Arc<dyn Transport> = Arc::new(HttpTransport::new(url.clone()));
     origin_t.publish(1, vec![
@@ -166,8 +199,8 @@ fn multiple_replicas_sync_from_same_origin() {
     assert_eq!(oa.applied, 1);
     assert_eq!(ob.applied, 1);
 
-    assert_eq!(replica_a.get(eid, "val"), Some(555));
-    assert_eq!(replica_b.get(eid, "val"), Some(555));
+    assert_eq!(get_remote(&replica_a, eid, "val"), Some(555));
+    assert_eq!(get_remote(&replica_b, eid, "val"), Some(555));
 
     cleanup(&origin_path);
     cleanup(&replica_a_path);
@@ -190,9 +223,11 @@ fn fresh_replica_bootstraps_then_syncs() {
     // create_compact でファイルサイズを MB 級に抑える (bootstrap 全転送が現実的に)
     {
         let mut eng = Engine::create_compact(&origin_path).unwrap();
-        eng.define_himo("val", ValueType::Number, 100);
-        let e1 = eng.entity();
-        eng.tie(e1, "val", 42);
+        eng.define_table(TABLE, 1000).unwrap();
+        eng.define_himo_in(TABLE, "val", ValueType::Number, 100).unwrap();
+        eng.enable_sync_tables().unwrap();
+        let e1 = eng.entity_in(TABLE).unwrap();
+        eng.tie(e1, &q("val"), 42);
         let _e1_id = e1;
         eng.rebuild();
         eng.flush().unwrap();
@@ -210,19 +245,19 @@ fn fresh_replica_bootstraps_then_syncs() {
     assert_eq!(snapshot_hlc, Hlc::ZERO, "no records published yet, HLC=0");
 
     // replica を open
-    let replica = Engine::open_concurrent_replica(&replica_path, 16 * 1024 * 1024).unwrap();
+    let replica = Engine::open_concurrent_with_oplog(&replica_path, 16 * 1024 * 1024).unwrap();
     replica.set_peer_id(9);
 
     // replica で初期データが読める (bootstrap で DB ごとコピーされた)
     let entities: Vec<_> = replica.entities();
     assert_eq!(entities.len(), 1);
     let e1 = entities[0];
-    assert_eq!(replica.get(e1, "val"), Some(42));
+    assert_eq!(get_remote(&replica, e1, "val"), Some(42));
 
     // step 4: origin が新データを publish
     let origin_t = HttpTransport::new(url.clone());
     let new_eid = enchudb_oplog::make_eid(1, 2);
-    let himo_id = origin.himo_id("val").unwrap() as u16;
+    let himo_id = origin.himo_id(&q("val")).unwrap() as u16;
     origin_t.publish(1, vec![
         WireRecord::unsigned(
             Hlc { wall: 1000, logical: 0, peer: 1 },
@@ -243,9 +278,9 @@ fn fresh_replica_bootstraps_then_syncs() {
     assert_eq!(out.applied, 1);
 
     // replica で新データも読める
-    assert_eq!(replica.get(new_eid, "val"), Some(999));
+    assert_eq!(get_remote(&replica, new_eid, "val"), Some(999));
     // 旧データも残ってる
-    assert_eq!(replica.get(e1, "val"), Some(42));
+    assert_eq!(get_remote(&replica, e1, "val"), Some(42));
 
     cleanup(&origin_path);
     cleanup(&replica_path);
@@ -259,13 +294,15 @@ fn incremental_pull_advances_cursor() {
     let path = tmp("cursor_replica");
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
-        eng.define_himo("val", ValueType::Number, 100);
+        eng.define_table(TABLE, 1000).unwrap();
+        eng.define_himo_in(TABLE, "val", ValueType::Number, 100).unwrap();
+        eng.enable_sync_tables().unwrap();
         eng.flush().unwrap();
     }
-    let replica = Engine::open_concurrent_replica(&path, 16 * 1024 * 1024).unwrap();
+    let replica = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
     replica.set_peer_id(9);
 
-    let himo_id = replica.himo_id("val").unwrap() as u16;
+    let himo_id = replica.himo_id(&q("val")).unwrap() as u16;
 
     let publisher: Arc<dyn Transport> = Arc::new(HttpTransport::new(url.clone()));
     publisher.publish(1, vec![

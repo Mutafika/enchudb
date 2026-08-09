@@ -3,8 +3,6 @@
 //! 通常テストは速く終わるべきなので、重いものは `#[ignore]` + 明示 run で。
 //! `cargo test --features v27 --test v29_stress -- --ignored` で実行。
 
-#![cfg(feature = "v27")]
-
 use enchudb::{Engine, ValueType};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

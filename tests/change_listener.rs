@@ -7,8 +7,6 @@
 //! - listener を追加するより前の commit は流れない(過去 fire は無し)
 //! - 大量 record でも順序崩れない
 
-#![cfg(feature = "v32")]
-
 use enchudb::changefeed::ChangeListener;
 use enchudb::transport::WireRecord;
 use enchudb_oplog::oplog::DecodedOp;

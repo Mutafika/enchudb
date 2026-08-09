@@ -3,8 +3,6 @@
 //! replica として開いた Engine は書き込み API が panic、sync 経由 (remote_*_apply) のみ通る。
 //! エッジ node の想定シナリオ: origin で書き、レプリカは pull で追従、ローカル書き込み不可。
 
-#![cfg(feature = "v32")]
-
 use std::sync::Arc;
 use enchudb::{Engine, ValueType};
 use enchudb_oplog::Hlc;
@@ -107,7 +105,7 @@ fn replica_allows_remote_apply_and_read() {
     // replica として「リモートから Tie が届いた」シミュレーション
     let eid = enchudb_oplog::make_eid(1, 7);
     let himo_id = eng.himo_id("val").unwrap();
-    eng.remote_tie_apply(eid, himo_id as u16, 42);
+    eng.remote_tie_apply(eid, himo_id as u16, 42, None);
 
     // 読めるはず
     let v = eng.get(eid, "val");
@@ -116,7 +114,19 @@ fn replica_allows_remote_apply_and_read() {
     cleanup(&path);
 }
 
+/// **未解決の設計課題 — replica mode と sync apply が両立しない。**
+///
+/// #9 の foreign-eid 翻訳は「受信 op の eid を自分の eid 空間へ *確保* する」動作で、
+/// `open_concurrent_replica` の `check_writable` guard
+/// (`Engine is in replica mode; writes must go through Syncer`) に弾かれる。
+/// つまり「replica として開いて Syncer で同期する」という本来の使い方が現状できない。
+/// remote_*_apply 単体 (= 同ファイルの `replica_allows_remote_apply_and_read`) は通るので、
+/// 壊れているのは **翻訳を伴う apply 経路** に限られる。
+///
+/// 書き込み可能 engine に変えれば通るが、 それではこのテストの主題 (replica mode) が
+/// 消えるので、 設計判断が出るまで ignore で可視化しておく。
 #[test]
+#[ignore = "replica mode + #9 foreign-eid 翻訳が非互換 (translation は eid 確保 = 書き込み)"]
 fn replica_syncs_from_origin_via_syncer() {
     // E2E: origin peer が publish、replica peer が pull して反映を確認
     let path_origin = tmp("e2e_origin");

@@ -3,8 +3,6 @@
 //! peer A が tie した値が、pull 経由で peer B に届く。
 //! その逆も。LWW で衝突解決。
 
-#![cfg(feature = "v32")]
-
 use std::sync::Arc;
 use enchudb::{Engine, ValueType};
 use enchudb_oplog::Hlc;
@@ -29,11 +27,24 @@ fn cleanup(path: &str) {
 /// Syncer には WAL が必須(B guard で panic するので)、全 peer を WAL 付きで作る。
 /// `Engine::create_concurrent_with_oplog` は Arc<Engine> を返すので define_himo が
 /// 直に呼べない。一旦 plain create で define + flush → reopen で WAL 付き Arc を取る。
+///
+/// **named table 必須** (β-light step 3): `enable_sync_tables()` が
+/// `_sync_ops` / `_sync_peers` を `define_table` するため anonymous table が閉じ、
+/// `entity()` は panic する。 さらに anonymous のままだと受信 op の foreign eid を
+/// 確保する先が無く `resolve_remote_eid` が None を返して apply が丸ごと skip される
+/// (#9 の foreign-eid 翻訳)。 よって実 table `TABLE` を定義してそこに himo を置く。
+///
+/// `enable_sync_tables()` 自体は 0.8.0 (bdc76e7) 以降必須 — Syncer の publish primary
+/// path が `_sync_ops` になったため、 未呼び出しは attach 時に loud panic。
+const TABLE: &str = "t";
+
 fn make_peer(path: &str, peer: u32) -> Arc<Engine> {
     {
         let mut eng = Engine::create_standalone(path).unwrap();
-        eng.define_himo("val", ValueType::Number, 100);
-        eng.define_himo("name", ValueType::Tag, 0);
+        eng.define_table(TABLE, 1000).unwrap();
+        eng.define_himo_in(TABLE, "val", ValueType::Number, 100).unwrap();
+        eng.define_himo_in(TABLE, "name", ValueType::Tag, 0).unwrap();
+        eng.enable_sync_tables().unwrap();
         eng.flush().unwrap();
     }
     let eng = Engine::open_concurrent_with_oplog(path, 16 * 1024 * 1024).unwrap();
@@ -43,6 +54,24 @@ fn make_peer(path: &str, peer: u32) -> Arc<Engine> {
 
 fn make_peer_with_oplog(path: &str, peer: u32) -> Arc<Engine> {
     make_peer(path, peer)
+}
+
+/// `TABLE` 内 himo の qualified name。
+fn q(himo: &str) -> String {
+    format!("{}.{}", TABLE, himo)
+}
+
+/// wire record に載せる himo_id。 両 peer とも `make_peer` で作るので id は一致する。
+fn hid(eng: &Engine, himo: &str) -> u16 {
+    eng.himo_id(&q(himo)).unwrap() as u16
+}
+
+/// 受信側で foreign eid を自分の eid 空間へ翻訳して読む (#9)。
+/// `Syncer::apply_one` が `resolve_remote_eid` で翻訳して格納するので、
+/// 送信側の eid のままでは読めない。
+fn get_remote(eng: &Engine, foreign_eid: u64, himo: &str) -> Option<u32> {
+    let local = eng.resolve_remote_eid(foreign_eid, hid(eng, himo))?;
+    eng.get(local, &q(himo))
 }
 
 #[test]
@@ -55,11 +84,11 @@ fn peer_a_writes_peer_b_reads_via_pull() {
     let transport = Arc::new(InMemoryTransport::new());
 
     // peer A が tie する。transport に直接 publish するスタイルで Phase B 試験。
-    let eid_a1 = eng_a.entity();
+    let eid_a1 = eng_a.entity_in(TABLE).unwrap();
     // このテストでは peer A の WAL を使わず、直接 transport に publish する形で
     // apply 経路だけ検証する。
     transport.publish(1, vec![
-        WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 1 }, 1, DecodedOp::Tie { eid: eid_a1, himo_id: 0, value: 42 }),
+        WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 1 }, 1, DecodedOp::Tie { eid: eid_a1, himo_id: hid(&eng_a, "val"), value: 42 }),
     ]);
 
     let syncer_b = Syncer::new(eng_b.clone(), transport.clone() as Arc<dyn Transport>);
@@ -67,7 +96,7 @@ fn peer_a_writes_peer_b_reads_via_pull() {
     assert_eq!(out.applied, 1, "peer B should apply peer A's tie");
 
     // peer B から同じ eid_a1 で value が読める
-    assert_eq!(eng_b.get(eid_a1, "val"), Some(42));
+    assert_eq!(get_remote(&eng_b, eid_a1, "val"), Some(42));
 
     cleanup(&pa);
     cleanup(&pb);
@@ -83,11 +112,11 @@ fn bidirectional_sync_no_conflict() {
     let transport = Arc::new(InMemoryTransport::new());
 
     // A と B がそれぞれ別 eid を tie
-    let eid_a = eng_a.entity();
-    let eid_b = eng_b.entity();
+    let eid_a = eng_a.entity_in(TABLE).unwrap();
+    let eid_b = eng_b.entity_in(TABLE).unwrap();
 
-    transport.publish(1, vec![WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 1 }, 1, DecodedOp::Tie { eid: eid_a, himo_id: 0, value: 10 })]);
-    transport.publish(2, vec![WireRecord::unsigned(Hlc { wall: 110, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: eid_b, himo_id: 0, value: 20 })]);
+    transport.publish(1, vec![WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 1 }, 1, DecodedOp::Tie { eid: eid_a, himo_id: hid(&eng_a, "val"), value: 10 })]);
+    transport.publish(2, vec![WireRecord::unsigned(Hlc { wall: 110, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: eid_b, himo_id: hid(&eng_a, "val"), value: 20 })]);
 
     let syncer_a = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
     let syncer_b = Syncer::new(eng_b.clone(), transport.clone() as Arc<dyn Transport>);
@@ -96,8 +125,8 @@ fn bidirectional_sync_no_conflict() {
     syncer_b.pull_once(1);
 
     // A は B の eid を見れる、B は A の eid を見れる
-    assert_eq!(eng_a.get(eid_b, "val"), Some(20));
-    assert_eq!(eng_b.get(eid_a, "val"), Some(10));
+    assert_eq!(get_remote(&eng_a, eid_b, "val"), Some(20));
+    assert_eq!(get_remote(&eng_b, eid_a, "val"), Some(10));
 
     cleanup(&pa);
     cleanup(&pb);
@@ -117,10 +146,10 @@ fn lww_concurrent_write_to_same_cell() {
     let shared_eid = enchudb_oplog::make_eid(1, 0);
 
     // A が wall=100 で value=10 を書いた
-    transport.publish(1, vec![WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 1 }, 1, DecodedOp::Tie { eid: shared_eid, himo_id: 0, value: 10 })]);
+    transport.publish(1, vec![WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 1 }, 1, DecodedOp::Tie { eid: shared_eid, himo_id: hid(&eng_a, "val"), value: 10 })]);
 
     // B は wall=200 で value=99 を書いた(concurrent、実時刻では後)
-    transport.publish(2, vec![WireRecord::unsigned(Hlc { wall: 200, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: shared_eid, himo_id: 0, value: 99 })]);
+    transport.publish(2, vec![WireRecord::unsigned(Hlc { wall: 200, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid: shared_eid, himo_id: hid(&eng_a, "val"), value: 99 })]);
 
     let syncer_a = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
     let syncer_b = Syncer::new(eng_b.clone(), transport.clone() as Arc<dyn Transport>);
@@ -138,8 +167,8 @@ fn lww_concurrent_write_to_same_cell() {
     syncer_b.pull_once(2);
 
     // 両 peer とも value=99 を見える
-    assert_eq!(eng_a.get(shared_eid, "val"), Some(99));
-    assert_eq!(eng_b.get(shared_eid, "val"), Some(99));
+    assert_eq!(get_remote(&eng_a, shared_eid, "val"), Some(99));
+    assert_eq!(get_remote(&eng_b, shared_eid, "val"), Some(99));
 
     cleanup(&pa);
     cleanup(&pb);
@@ -154,14 +183,14 @@ fn hlc_tie_broken_by_peer_id() {
     let shared_eid = enchudb_oplog::make_eid(9, 0);
 
     // 同じ wall/logical、peer_id だけ違う → 大きい peer が勝つ
-    transport.publish(5, vec![WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 5 }, 5, DecodedOp::Tie { eid: shared_eid, himo_id: 0, value: 55 })]);
-    transport.publish(7, vec![WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 7 }, 7, DecodedOp::Tie { eid: shared_eid, himo_id: 0, value: 77 })]);
+    transport.publish(5, vec![WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 5 }, 5, DecodedOp::Tie { eid: shared_eid, himo_id: hid(&eng_a, "val"), value: 55 })]);
+    transport.publish(7, vec![WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 7 }, 7, DecodedOp::Tie { eid: shared_eid, himo_id: hid(&eng_a, "val"), value: 77 })]);
 
     let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
     syncer.pull_once(5);
     syncer.pull_once(7);
     // peer 7 が勝つ
-    assert_eq!(eng_a.get(shared_eid, "val"), Some(77));
+    assert_eq!(get_remote(&eng_a, shared_eid, "val"), Some(77));
 
     // 逆順でも同じ結果
     let pb = tmp("hlc_tie_b");
@@ -169,7 +198,7 @@ fn hlc_tie_broken_by_peer_id() {
     let syncer_b = Syncer::new(eng_b.clone(), transport.clone() as Arc<dyn Transport>);
     syncer_b.pull_once(7);
     syncer_b.pull_once(5);
-    assert_eq!(eng_b.get(shared_eid, "val"), Some(77));
+    assert_eq!(get_remote(&eng_b, shared_eid, "val"), Some(77));
 
     cleanup(&pa);
     cleanup(&pb);
@@ -189,11 +218,15 @@ fn e2e_write_publish_pull() {
     let syncer_b = Syncer::new(eng_b.clone(), transport.clone() as Arc<dyn Transport>);
 
     // peer A が tie_async する(consumer thread 経由で本体に apply + WAL 残存)
-    let eid = eng_a.entity();
-    eng_a.tie_async(eid, "val", 42);
+    let eid = eng_a.entity_in(TABLE).unwrap();
+    eng_a.tie_async(eid, &q("val"), 42);
     eng_a.oplog_commit();
     eng_a.flush_writes();
     eng_a.oplog_sync().unwrap();
+    // 0.8.0: publish の primary path は `_sync_ops`。 oplog からの転送は
+    // background thread 任せだと publish_since が空振りするので明示的に回す
+    // (sleep より決定的)。
+    eng_a.transfer_oplog_to_sync_ops();
 
     // A が WAL 内容を transport に publish
     let published = syncer_a.publish_since(Hlc::ZERO);
@@ -202,7 +235,7 @@ fn e2e_write_publish_pull() {
     // peer B が pull → 同じ値が読める
     let out = syncer_b.pull_once(1);
     assert!(out.applied >= 1, "peer B should apply peer A's tie");
-    assert_eq!(eng_b.get(eid, "val"), Some(42));
+    assert_eq!(get_remote(&eng_b, eid, "val"), Some(42));
 
     cleanup(&pa);
     cleanup(&pb);
@@ -222,13 +255,17 @@ fn e2e_multiple_writes_published_and_pulled() {
 
     // peer A が 10 件 tie_async
     let eids: Vec<u64> = (0..10).map(|i| {
-        let eid = eng_a.entity();
-        eng_a.tie_async(eid, "val", i as u32);
+        let eid = eng_a.entity_in(TABLE).unwrap();
+        eng_a.tie_async(eid, &q("val"), i as u32);
         eid
     }).collect();
     eng_a.oplog_commit();
     eng_a.flush_writes();
     eng_a.oplog_sync().unwrap();
+    // 0.8.0: publish の primary path は `_sync_ops`。 oplog からの転送は
+    // background thread 任せだと publish_since が空振りするので明示的に回す
+    // (sleep より決定的)。
+    eng_a.transfer_oplog_to_sync_ops();
 
     // publish → pull
     let published = syncer_a.publish_since(Hlc::ZERO);
@@ -238,7 +275,7 @@ fn e2e_multiple_writes_published_and_pulled() {
     assert!(out.applied >= 10);
 
     for (i, &eid) in eids.iter().enumerate() {
-        assert_eq!(eng_b.get(eid, "val"), Some(i as u32));
+        assert_eq!(get_remote(&eng_b, eid, "val"), Some(i as u32));
     }
 
     cleanup(&pa);
@@ -289,17 +326,21 @@ fn signed_wal_verifies_between_peers() {
     let syncer_b = Syncer::new(eng_b.clone(), transport.clone() as Arc<dyn Transport>);
     syncer_b.set_require_signature(true);
 
-    let eid = eng_a.entity();
-    eng_a.tie_async(eid, "val", 123);
+    let eid = eng_a.entity_in(TABLE).unwrap();
+    eng_a.tie_async(eid, &q("val"), 123);
     eng_a.oplog_commit();
     eng_a.flush_writes();
     eng_a.oplog_sync().unwrap();
+    // 0.8.0: publish の primary path は `_sync_ops`。 oplog からの転送は
+    // background thread 任せだと publish_since が空振りするので明示的に回す
+    // (sleep より決定的)。
+    eng_a.transfer_oplog_to_sync_ops();
     syncer_a.publish_since(Hlc::ZERO);
 
     let out = syncer_b.pull_once(1);
     assert!(out.applied >= 1, "signed op should be applied, got {:?}", out);
     assert_eq!(out.rejected_signature, 0);
-    assert_eq!(eng_b.get(eid, "val"), Some(123));
+    assert_eq!(get_remote(&eng_b, eid, "val"), Some(123));
 
     cleanup(&pa);
     cleanup(&pb);
@@ -314,7 +355,7 @@ fn unsigned_rejected_when_require_signature() {
     // peer 2 が未署名で publish
     transport.publish(2, vec![
         WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 2 }, 2,
-            DecodedOp::Tie { eid: enchudb_oplog::make_eid(2, 0), himo_id: 0, value: 99 }),
+            DecodedOp::Tie { eid: enchudb_oplog::make_eid(2, 0), himo_id: hid(&eng_a, "val"), value: 99 }),
     ]);
 
     let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
@@ -345,11 +386,15 @@ fn tampered_signature_rejected() {
     let syncer_b = Syncer::new(eng_b.clone(), transport.clone() as Arc<dyn Transport>);
     syncer_b.set_require_signature(true);
 
-    let eid = eng_a.entity();
-    eng_a.tie_async(eid, "val", 7);
+    let eid = eng_a.entity_in(TABLE).unwrap();
+    eng_a.tie_async(eid, &q("val"), 7);
     eng_a.oplog_commit();
     eng_a.flush_writes();
     eng_a.oplog_sync().unwrap();
+    // 0.8.0: publish の primary path は `_sync_ops`。 oplog からの転送は
+    // background thread 任せだと publish_since が空振りするので明示的に回す
+    // (sleep より決定的)。
+    eng_a.transfer_oplog_to_sync_ops();
     syncer_a.publish_since(Hlc::ZERO);
 
     // transport からレコードを取り、署名を 1bit 反転させて入れ直す
@@ -391,11 +436,15 @@ fn wrong_peer_pubkey_rejected() {
     let syncer_b = Syncer::new(eng_b.clone(), transport.clone() as Arc<dyn Transport>);
     syncer_b.set_require_signature(true);
 
-    let eid = eng_a.entity();
-    eng_a.tie_async(eid, "val", 42);
+    let eid = eng_a.entity_in(TABLE).unwrap();
+    eng_a.tie_async(eid, &q("val"), 42);
     eng_a.oplog_commit();
     eng_a.flush_writes();
     eng_a.oplog_sync().unwrap();
+    // 0.8.0: publish の primary path は `_sync_ops`。 oplog からの転送は
+    // background thread 任せだと publish_since が空振りするので明示的に回す
+    // (sleep より決定的)。
+    eng_a.transfer_oplog_to_sync_ops();
     syncer_a.publish_since(Hlc::ZERO);
 
     let out = syncer_b.pull_once(1);
@@ -420,7 +469,7 @@ fn acl_blocks_non_writer_peer() {
     // peer 99 から op が届く
     transport.publish(99, vec![
         WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 99 }, 99,
-            DecodedOp::Tie { eid: enchudb_oplog::make_eid(99, 0), himo_id: 0, value: 42 }),
+            DecodedOp::Tie { eid: enchudb_oplog::make_eid(99, 0), himo_id: hid(&eng_a, "val"), value: 42 }),
     ]);
 
     let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
@@ -431,7 +480,7 @@ fn acl_blocks_non_writer_peer() {
     // peer 1 から op が来れば apply される
     transport.publish(1, vec![
         WireRecord::unsigned(Hlc { wall: 200, logical: 0, peer: 1 }, 1,
-            DecodedOp::Tie { eid: enchudb_oplog::make_eid(1, 0), himo_id: 0, value: 77 }),
+            DecodedOp::Tie { eid: enchudb_oplog::make_eid(1, 0), himo_id: hid(&eng_a, "val"), value: 77 }),
     ]);
     let out2 = syncer.pull_once(1);
     assert_eq!(out2.applied, 1);
@@ -449,7 +498,7 @@ fn acl_empty_is_permissive() {
 
     transport.publish(42, vec![
         WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 42 }, 42,
-            DecodedOp::Tie { eid: enchudb_oplog::make_eid(42, 0), himo_id: 0, value: 9 }),
+            DecodedOp::Tie { eid: enchudb_oplog::make_eid(42, 0), himo_id: hid(&eng_a, "val"), value: 9 }),
     ]);
 
     let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
@@ -470,8 +519,8 @@ fn delete_remote_removes_all_himos() {
 
     // peer 2 が 3 つの himo に値を書いてから delete
     transport.publish(2, vec![
-        WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid, himo_id: 0, value: 1 }),
-        WireRecord::unsigned(Hlc { wall: 101, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid, himo_id: 1, value: 2 }),
+        WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid, himo_id: hid(&eng_a, "val"), value: 1 }),
+        WireRecord::unsigned(Hlc { wall: 101, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid, himo_id: hid(&eng_a, "name"), value: 2 }),
         WireRecord::unsigned(Hlc { wall: 200, logical: 0, peer: 2 }, 2, DecodedOp::Delete { eid }),
     ]);
 
@@ -480,7 +529,7 @@ fn delete_remote_removes_all_himos() {
     assert_eq!(out.applied, 3);
 
     // delete 後は全 himo で None
-    assert_eq!(eng_a.get(eid, "val"), None);
+    assert_eq!(get_remote(&eng_a, eid, "val"), None);
 
     cleanup(&pa);
 }
