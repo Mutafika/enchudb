@@ -143,6 +143,19 @@ fn tables_path_for(path: &str) -> std::path::PathBuf {
 ///     himo_ids: u32[himo_count]
 ///     fk_count: u32
 ///     fk_refs: [(u32 himo_id, u32 (target_table as u32))] × fk_count
+///
+/// #141 の PK は **全 table を書き切った後ろに optional block** として足す
+/// (version は 1 のまま):
+///   pk_magic: "PKS1" (4)
+///   pk_count: u32
+///   [(table_index: u32, pk_himo: u32)] × pk_count
+///
+/// version を上げずに末尾追記にしているのは **前方互換のため**。 table loop は
+/// `table_count` 回で終わって残りを読まないので、 #141 以前のバイナリはこの block を
+/// 単に無視して従来どおり開ける (PK 情報が落ちるだけ = PK-aware apply が効かなくなる
+/// だけで、 DB が開けなくなることはない)。 version を 2 に上げると古いバイナリが
+/// `unsupported version` で **開けなくなる** ため、 同じ DB を旧 enchudb で開く別
+/// プロセスを巻き込む。
 fn serialize_tables(tables: &[TableDef]) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 + tables.len() * 128);
     out.extend_from_slice(b"TBL1");
@@ -165,6 +178,21 @@ fn serialize_tables(tables: &[TableDef]) -> Vec<u8> {
         for &(hid, tid) in &t.fk_refs {
             out.extend_from_slice(&hid.to_le_bytes());
             out.extend_from_slice(&(tid as u32).to_le_bytes());
+        }
+    }
+    // #141: PK block (optional trailer)。 PK を 1 つも持たないなら書かない
+    // (= #141 以前と 1 byte も変わらない出力)。
+    let pks: Vec<(u32, u32)> = tables
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| t.pk_himo.map(|h| (i as u32, h as u32)))
+        .collect();
+    if !pks.is_empty() {
+        out.extend_from_slice(b"PKS1");
+        out.extend_from_slice(&(pks.len() as u32).to_le_bytes());
+        for (idx, hid) in pks {
+            out.extend_from_slice(&idx.to_le_bytes());
+            out.extend_from_slice(&hid.to_le_bytes());
         }
     }
     out
@@ -230,7 +258,31 @@ fn deserialize_tables(buf: &[u8]) -> Result<Vec<TableDef>, String> {
             next_local,
             free_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             free_locals_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pk_himo: None,
         });
+    }
+
+    // #141: optional PK trailer。 無ければ (= #141 以前が書いた sidecar) PK 無しのまま。
+    // 壊れた trailer は「PK 情報が無い」扱いにするだけで、 sidecar 全体は有効とする
+    // (PK は再 build で復元できる派生情報であって、 table 定義の本体ではない)。
+    if off + 8 <= buf.len() && &buf[off..off + 4] == b"PKS1" {
+        off += 4;
+        let pk_count = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        for _ in 0..pk_count {
+            if off + 8 > buf.len() {
+                break;
+            }
+            let idx = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+            off += 4;
+            let hid = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+            off += 4;
+            if let Some(t) = tables.get_mut(idx) {
+                if hid <= u16::MAX as u32 {
+                    t.pk_himo = Some(hid as u16);
+                }
+            }
+        }
     }
     Ok(tables)
 }
@@ -1393,6 +1445,13 @@ pub(crate) struct TableDef {
     /// で空になったら false に戻す。 厳密な race は entity_in 内で mutex 取った
     /// あと再 check するので OK (= AtomicBool は fast path の hint)。
     pub free_locals_nonempty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// #141: この table の primary key を成す himo の id。 PK 未指定なら `None`。
+    ///
+    /// PK 自体は schema 層 (`TableBuilder::primary_key`) の概念だが、 **sync の
+    /// apply 経路は engine より上を見られない** (`enchudb-sync` と `enchudb-schema`
+    /// は兄弟 crate)。 apply 側が「同じ PK の既存 row に束ねる」判断をするために、
+    /// schema が build 時に `set_table_pk` で engine へ降ろす。
+    pub pk_himo: Option<u16>,
 }
 
 impl Clone for TableDef {
@@ -1412,6 +1471,7 @@ impl Clone for TableDef {
             // 側で coordinate する想定)。
             free_locals: self.free_locals.clone(),
             free_locals_nonempty: self.free_locals_nonempty.clone(),
+            pk_himo: self.pk_himo,
         }
     }
 }
@@ -1431,6 +1491,8 @@ impl TableDef {
             next_local: std::sync::atomic::AtomicU32::new(0),
             free_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             free_locals_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // #141: PK は schema 層が build 後に `set_table_pk` で降ろす。
+            pk_himo: None,
         }
     }
 
@@ -3465,6 +3527,8 @@ impl Engine {
             next_local: std::sync::atomic::AtomicU32::new(0),
             free_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             free_locals_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // #141: PK は schema 層が build 後に `set_table_pk` で降ろす。
+            pk_himo: None,
         });
         self.try_persist_tables();
         Ok(tid)
@@ -3707,6 +3771,68 @@ impl Engine {
     /// 未定義 table は None。
     pub fn table_eid_range(&self, name: &str) -> Option<(u32, u32)> {
         self.tables.iter().find(|t| t.name == name).map(|t| (t.eid_range_lo, t.eid_range_hi))
+    }
+
+    /// #141: table の primary key himo を登録する。 schema 層 (`TableBuilder::build`)
+    /// から降ろす専用の API。
+    ///
+    /// PK は本来 schema 層の概念だが、 sync の apply 経路 (`enchudb-sync`) は schema を
+    /// 見られない (兄弟 crate)。 「受信 op の foreign entity を、 同じ PK の既存 row に
+    /// 束ねる」判断を apply 側でするために engine が PK を知っている必要がある。
+    ///
+    /// 未定義 table / 範囲外 himo は `Err`。 `.tables` sidecar (v2) に永続化される。
+    pub fn set_table_pk(&mut self, table: &str, himo_id: u16) -> Result<(), String> {
+        if himo_id as usize >= self.himos.len() {
+            return Err(format!("set_table_pk: himo_id {} out of range", himo_id));
+        }
+        let Some(t) = self.tables.iter_mut().find(|t| t.name == table) else {
+            return Err(format!("set_table_pk: unknown table '{}'", table));
+        };
+        t.pk_himo = Some(himo_id);
+        self.try_persist_tables();
+        Ok(())
+    }
+
+    /// #141: table の PK himo id。 未設定なら None。
+    pub fn table_pk_himo(&self, table: &str) -> Option<u16> {
+        self.tables.iter().find(|t| t.name == table).and_then(|t| t.pk_himo)
+    }
+
+    /// #141: この himo がどれかの table の PK かどうか。 apply 経路の hot path から
+    /// 呼ぶので、 table 数ぶんの線形走査で済む形にしてある (table 数は通常 1 桁)。
+    pub fn is_pk_himo(&self, himo_id: u16) -> bool {
+        self.tables.iter().any(|t| t.pk_himo == Some(himo_id))
+    }
+
+    /// #141: `(author_peer, foreign_eid)` → `local_eid` の翻訳を明示的に張る。
+    ///
+    /// 通常 `resolve_remote_eid` は未知の foreign entity に **新規 local eid を
+    /// 払い出す**が、 PK 一致の既存 row が居る場合はそこへ束ねたい。 apply 側が
+    /// PK lookup で行き先を決めてから、 この API で写像を固定する。
+    ///
+    /// 既に写像がある場合は **変更しない** (先に確定した束ね先を優先)。 戻り値は
+    /// 実際に有効な local eid (既存写像があればそちら)。
+    pub fn bind_remote_eid(
+        &self,
+        author_peer: enchudb_oplog::PeerId,
+        foreign_eid: enchudb_oplog::EntityId,
+        local_eid: enchudb_oplog::EntityId,
+    ) -> enchudb_oplog::EntityId {
+        use std::sync::atomic::Ordering;
+        let self_peer = self.peer_id.load(Ordering::Acquire);
+        if enchudb_oplog::eid_peer(foreign_eid) == self_peer {
+            return foreign_eid; // identity: 自分が産んだ entity
+        }
+        let foreign_local = enchudb_oplog::eid_local(foreign_eid);
+        let target_local = enchudb_oplog::eid_local(local_eid);
+        let local = self
+            .eid_translator
+            .get_or_insert_with(author_peer, foreign_local, || Some(target_local))
+            .unwrap_or(target_local);
+        // 束ね先の entity は live 扱いにしておく (remote_tie_apply と同じ前提)。
+        self.entities.ensure_live(local);
+        Self::advance_table_next_local_for(&self.tables, local);
+        enchudb_oplog::make_eid(self_peer, local)
     }
 
     /// 0.8.7: 登録済 himo の総数。 schema crate の synthesize fallback (= engine 直

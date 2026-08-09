@@ -366,6 +366,60 @@ impl Syncer {
 
     /// 受信レコードを LWW で apply する。Phase C: 署名検証 + ACL も通す。
     /// WS push client などの外部から呼び出すために public。
+    /// #141: apply 本体の前に走る **PK bind pass**。
+    ///
+    /// `resolve_remote_eid` は `(author, remote_eid)` 写像しか見ないので、 初見の
+    /// foreign entity には無条件で新規 local eid を払い出す。 その結果、 2 台が同じ
+    /// 自然キーの row を **独立に** 作ってから相互 sync すると、 同一 PK の entity が
+    /// author ごとに二重化し、 恒久チャーンループ → WAL 膨張 → oplog リング一周
+    /// (#140 の tombstone 消失) まで連鎖する。
+    ///
+    /// そこで apply 前に batch を走査し、 PK himo への Tie を見つけたら
+    /// 「その PK 値を既に持つ local entity」を引いて、 写像をそこへ固定する
+    /// (`bind_remote_eid`)。 以降の `resolve_remote_eid` は払い出しではなくその
+    /// entity を返すので、 LWW は himo 単位で通常どおり効いて 1 row に収束する。
+    ///
+    /// **既知の制約**: bind できるのは PK Tie が batch に含まれる場合だけ。 ある row の
+    /// PK Tie と非 PK Tie が別 batch に分かれ、 かつ非 PK 側が先に届くと、 その時点で
+    /// 新規 eid が払い出されて束ね損なう。 1 row の insert は 1 commit = 同 batch に
+    /// 載るのが通常なので実運用の主経路は塞がるが、 完全ではない (既に二重化した
+    /// store の修復も別途必要 — #141 参照)。
+    fn bind_by_primary_key(&self, records: &[WireRecord]) {
+        // PK Tie を含まない batch では rebuild も lookup もしない (hot path 保護)。
+        let has_pk_tie = records.iter().any(|rec| {
+            matches!(&rec.op, DecodedOp::Tie { himo_id, .. } if self.engine.is_pk_himo(*himo_id))
+        });
+        if !has_pk_tie {
+            return;
+        }
+        // query_by_id は cylinder index 経由なので、 直前の tie を見えるようにする
+        // (schema 層の upsert が PK lookup 前に rebuild するのと同じ理由)。
+        self.engine.rebuild();
+
+        for rec in records {
+            let DecodedOp::Tie { eid, himo_id, value } = &rec.op else { continue };
+            if !self.engine.is_pk_himo(*himo_id) {
+                continue;
+            }
+            // 既に写像がある foreign entity は触らない (先に確定した束ね先を優先)。
+            if self.engine.resolve_remote_eid_existing(*eid).is_some() {
+                continue;
+            }
+            // PK は Tag / Number 想定 (Ref を PK にはしない)。 remote vocab vid を
+            // local vid に翻訳してから引く。
+            let local_value = self.engine.translate_remote_vid(rec.author_peer, *himo_id, *value);
+            let Some(existing) = self
+                .engine
+                .query_by_id(&[(*himo_id, local_value)])
+                .into_iter()
+                .next()
+            else {
+                continue; // 同じ PK の row はまだ無い → 通常の払い出しに任せる
+            };
+            self.engine.bind_remote_eid(rec.author_peer, *eid, existing);
+        }
+    }
+
     pub fn apply_records(&self, records: &[WireRecord]) -> SyncOutcome {
         let mut out = SyncOutcome::default();
         // #9 foot-gun ガード: self_peer 未設定 (= 0) で foreign record を apply すると、
@@ -384,6 +438,7 @@ impl Syncer {
                  collide with local ones (#9)."
             );
         }
+        self.bind_by_primary_key(records);
         let store = self.engine.hlc_store().clone();
         let require_sig = self.require_signature.load(std::sync::atomic::Ordering::Acquire);
         let pubkeys = self.engine.pubkeys().clone();
