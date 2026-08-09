@@ -203,6 +203,11 @@ impl Drop for HttpRelay {
 }
 
 fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Result<()> {
+    // listener は accept 検出のため non-blocking（start_inner）だが、 BSD/macOS と
+    // Windows では accept した socket がそれを継承する。 そのままだと送信バッファ超の
+    // 応答で write_all が WouldBlock 即死 → Content-Length より短い body で切断される
+    // （ws.rs の accept 後 set_nonblocking(false) と同じ対処）。
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     let storage = state.storage.clone();
