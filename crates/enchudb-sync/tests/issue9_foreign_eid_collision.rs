@@ -21,7 +21,6 @@ use enchudb_engine::ValueType;
 use enchudb_oplog::{eid_local, Hlc, PeerId};
 use enchudb_sync::Syncer;
 use std::sync::Arc;
-use std::time::Duration;
 
 fn tmp_path(tag: &str) -> String {
     format!(
@@ -65,7 +64,11 @@ fn foreign_eid_collision_must_not_clobber_local_entity() {
     let e_b = eng_b.entity_in("notes").unwrap();
     eng_b.tie_to(e_b, "notes.note", 200);
     eng_b.oplog_commit();
-    std::thread::sleep(Duration::from_millis(300));
+    // publish の primary は `_sync_ops`。 oplog からの転送は consumer thread の
+    // fsync ループ (100ms) 任せなので、 sleep で待つと **負荷が高いときに
+    // 足りず publish_since が 0 件になる** (workspace 全体を並列で回すと再現)。
+    // 明示的に転送して timing 依存を消す。
+    eng_b.transfer_oplog_to_sync_ops();
 
     // peer A (id=1): its first entity, note = 100 — the NEWER write (later wall
     // clock), so it wins LWW and the failure is purely the missing translation.
@@ -73,7 +76,11 @@ fn foreign_eid_collision_must_not_clobber_local_entity() {
     let e_a = eng_a.entity_in("notes").unwrap();
     eng_a.tie_to(e_a, "notes.note", 100);
     eng_a.oplog_commit();
-    std::thread::sleep(Duration::from_millis(300));
+    // publish の primary は `_sync_ops`。 oplog からの転送は consumer thread の
+    // fsync ループ (100ms) 任せなので、 sleep で待つと **負荷が高いときに
+    // 足りず publish_since が 0 件になる** (workspace 全体を並列で回すと再現)。
+    // 明示的に転送して timing 依存を消す。
+    eng_a.transfer_oplog_to_sync_ops();
 
     // Capture A's records into the transport (= B's view of the stream).
     let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
@@ -141,7 +148,11 @@ fn translation_mapping_survives_reopen() {
     let e_a = eng_a.entity_in("notes").unwrap();
     eng_a.tie_to(e_a, "notes.note", 100);
     eng_a.oplog_commit();
-    std::thread::sleep(Duration::from_millis(300));
+    // publish の primary は `_sync_ops`。 oplog からの転送は consumer thread の
+    // fsync ループ (100ms) 任せなので、 sleep で待つと **負荷が高いときに
+    // 足りず publish_since が 0 件になる** (workspace 全体を並列で回すと再現)。
+    // 明示的に転送して timing 依存を消す。
+    eng_a.transfer_oplog_to_sync_ops();
     let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
     let syncer_a = Syncer::new(eng_a.clone(), transport.clone());
     syncer_a.publish_since(Hlc::ZERO);
@@ -231,7 +242,11 @@ fn cross_peer_ref_value_is_translated() {
     eng_a.tie_to(u, "users.uid", 1);
     eng_a.tie_ref_to(u, "users.company", c);
     eng_a.oplog_commit();
-    std::thread::sleep(Duration::from_millis(300));
+    // publish の primary は `_sync_ops`。 oplog からの転送は consumer thread の
+    // fsync ループ (100ms) 任せなので、 sleep で待つと **負荷が高いときに
+    // 足りず publish_since が 0 件になる** (workspace 全体を並列で回すと再現)。
+    // 明示的に転送して timing 依存を消す。
+    eng_a.transfer_oplog_to_sync_ops();
 
     let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
     let syncer_a = Syncer::new(eng_a.clone(), transport.clone());
