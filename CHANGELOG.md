@@ -3,6 +3,58 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.16.1 — 2026-08-09
+
+**HTTP relay 経由の sync が数 MB 規模で無音のまま失敗する問題の修正 (#137)。**
+`enchudb-transport` の `HttpRelay` を使う構成 (特に macOS / Windows) は上げること。
+engine の on-disk format は不変 (v8 のまま)、公開 API 変更なし、MSRV も 1.89 のまま、
+migration 不要 — 依存を更新するだけで上がれる。
+
+### Fixed — HTTP relay の大きな応答が途中切断される (#137)
+
+`HttpRelay` の応答が socket 送信バッファ (loopback で数百 KB) を超えると、
+**Content-Length より短い body のまま接続が閉じる**。読み手が遅いほど確実に起きる。
+
+下流 syncretic (Mac ↔ Windows folder sync) では、片端の WAL が 4.7 MB に育った時点で
+相手の「cursor 0 からの初回フル pull」が**ほぼ毎回** (実測 10 回中 8 回) 途中切断され、
+pull クライアントが失敗を空 batch に落とすため **cursor が永遠に 0 のまま 1 件も同期
+しない**という形で発現した。エラーログも出ないので無音の停止に見える。
+
+原因は `start_inner` が accept 検出のため listener を `set_nonblocking(true)` にして
+いること。**BSD/macOS と Windows では accept した接続 socket がこのフラグを継承する**
+(Linux は継承しない)。そのまま `write_all` すると送信バッファが埋まった時点で
+`WouldBlock` がエラー扱いになり、`?` でハンドラが即死して接続が閉じる。
+
+**修正**: `handle_connection` 冒頭で `stream.set_nonblocking(false)` に戻す。read 側の
+ハング防止は既存の `set_read_timeout` (10s) / `set_write_timeout` (30s) がそのまま担う。
+`ws.rs` は accept 後に同じ対処を済ませており、**`http.rs` だけ取り残されていた**。
+
+**影響範囲**: `HttpRelay` を使う全バージョン。Linux では accept が O_NONBLOCK を継承
+しないため発生しない (裏を返すと、この回帰テストは Linux では fix を戻しても通る)。
+
+回帰テストは `crates/enchudb-transport/tests/relay_large_response.rs` — 8 MB の record を
+relay に積み、「request 送信後 500 ms 読まない遅い読み手」で `/pull` を受けて、body の
+実長 == Content-Length を assert する。修正を戻すと確実に落ちる (切断時 327 KB / 8.4 MB)。
+
+### Known limitation — CI がこの回帰を守れていない
+
+`.github/workflows/ci.yml` の test job は `enchudb-oplog` / `-engine` / `-schema` /
+`-sql` / `-sync` の 5 crate しか回しておらず、**`enchudb-transport` は CI 対象外**。
+加えて runner が `ubuntu-latest` 単独のため、対象に加えても本件は Linux では再現せず
+ガードにならない。CI の crate 追加と macOS runner の追加は別途対応する。
+
+同様に、`tests/` 直下の **11 ファイルが存在しない feature `v32` の gate で丸ごと無効化
+されている** (`v32_http_transport.rs` / `crdt_and_chaos.rs` / `change_listener.rs` /
+`shard_routing.rs` ほか)。HTTP transport の E2E が一度も走っていないことが、本件が
+生き延びた一因。蘇生は Syncer の現行 API との乖離が大きく、別途対応とした。
+
+### 検証 (0.16.1)
+
+- `cargo test --workspace --no-fail-fast` (macOS) — **729 passed / 0 failed / 27 ignored**
+  (0.16.0 の 728 + 新規回帰テスト 1、回帰なし)
+- CI (ubuntu) — clippy / miri / loom / test すべて success
+- 新テストを単体で 4 連続実行して flake なし
+
 ## 0.16.0 — 2026-08-07
 
 **Windows でビルドできるようになった (#133)。** engine の on-disk format は不変
