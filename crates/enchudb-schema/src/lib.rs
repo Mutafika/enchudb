@@ -1411,6 +1411,17 @@ impl<'a> TableBuilder<'a> {
         }
         let pk_idx = pk.as_ref().and_then(|n| cols.iter().position(|c| &c.name == n));
 
+        // #141: PK himo を engine へ降ろす。 sync の apply 経路は schema 層を見られない
+        // ので、 「同じ PK の既存 row に束ねる」判断を engine 側の情報だけでできるように
+        // しておく必要がある。 これを怠ると cross-author apply が同一 PK の entity を
+        // 二重に払い出す。
+        if let Some(i) = pk_idx {
+            let pk_hid = cols[i].himo_id;
+            eng_mut
+                .set_table_pk(&name, pk_hid)
+                .map_err(SchemaError::Internal)?;
+        }
+
         let inner = Arc::new(TableInner {
             name: name.clone(),
             table_vid,
