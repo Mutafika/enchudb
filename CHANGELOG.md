@@ -3,6 +3,96 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.17.0 — 2026-08-10
+
+**cross-author sync のデータ破損修正 (#141)。 PK を宣言した table を p2p sync している
+構成は上げること。** engine の on-disk format は v8 のまま不変、 MSRV も 1.89 据え置き、
+既存の公開 API に変更なし (追加のみ)。 `.tables` sidecar は後方・前方互換のまま拡張した
+ので migration 不要 — 依存を更新するだけで上がれる。
+
+public API の追加と sidecar の拡張を含むため、 方針どおり patch ではなく minor。
+
+### Fixed — 同一 PK の entity が cross-author apply で二重払い出しされる (#141)
+
+2 台が**同じ自然キーの row を独立に作って**から相互 sync すると、 同一 PK の entity が
+author ごとに二重化していた。 実測 (下流 syncretic) では 1 table 内 2,358 entity 中
+**788 個が同一キー文字列の重複**。 二次被害が本体で、 2 つの entity が同じ外部状態を
+取り合う**恒久チャーンループ** → 数時間で DB 1.7 GB / oplog リング一周 → #140 の
+tombstone 消失 (削除済み entity の亡霊復活) まで連鎖していた。
+
+原因は `Syncer::apply_one` → `Engine::resolve_remote_eid` が `(author, remote_eid)` 写像
+だけで解決し、 初見の remote_eid には `alloc_translated_local` で**無条件に新規 eid を
+払い出す**こと。 適用先 table に同じ PK の既存 row が居ても束ねない。
+
+根っこは **engine が PK を知らなかった**こと。 PK は schema 層
+(`TableBuilder::primary_key`) の概念で、 `enchudb-sync` と `enchudb-schema` は兄弟 crate
+なので apply 側から見えない。
+
+**修正**: PK を engine へ降ろし、 apply 前に PK で既存 entity へ束ねる。
+
+| 層 | 変更 |
+|---|---|
+| engine | `TableDef.pk_himo` + `set_table_pk` / `table_pk_himo` / `is_pk_himo` / `bind_remote_eid` を追加 |
+| schema | `TableBuilder::build()` が `primary_key()` 指定時に PK himo を engine へ降ろす |
+| sync | `apply_records` 冒頭に **PK bind pass** — batch 内の PK himo Tie を先に走査し、 その PK 値を既に持つ local entity が居れば写像をそこへ固定 |
+
+以降 `resolve_remote_eid` は払い出さずその entity を返すので、 LWW が himo 単位で通常
+どおり効いて 1 row に収束する。
+
+**`.tables` sidecar は version 1 のまま**。 PK は全 table を書き切った後ろの optional
+trailer (`PKS1` block) として永続化する。 table のデコードは `table_count` 回で終わって
+残りを読まないので、 **0.17.0 以前のバイナリはこの block を無視して従来どおり開ける**
+(PK が落ちて PK-aware apply が効かなくなるだけ)。 version を 2 に上げると旧バイナリが
+`unsupported version` で開けなくなり、 同じ DB を旧 enchudb で開く別プロセスを巻き込む
+ため採らなかった。 PK を持たない DB では出力が 1 byte も変わらない。
+
+#### Known limitation — 本 release だけでは直りきらない
+
+- bind できるのは **PK Tie が同じ batch に含まれる場合のみ**。 1 row の insert は
+  1 commit = 同 batch なので実運用の主経路は塞がるが、 PK Tie と非 PK Tie が別 batch に
+  分かれ非 PK 側が先に届くと束ね損なう
+- **既に二重化した store の修復パスは未実装**。 上げても既存の重複は解消しないので、
+  修復ツールか apply 時の遅延統合が別途要る (#141 に残作業として記載)
+
+### Fixed — feature gate で 3 ヶ月死んでいた integration test 20 file を復活 (#138)
+
+`tests/` 29 file 中 **20 file** が存在しない feature (`v27` / `v32` / `v33`) の
+`#![cfg(...)]` で丸ごと無効化されており、 2026-05-12 の `1f37678`「v## feature flag を
+全廃」以降**コンパイルすらされていなかった** (src/ の 223 cfg site は inline 化されたが
+`tests/` が対象外だった)。 #138 は 1 file の話として起票されていたが実スコープは 20 file。
+
+**workspace: 729 passed → 900 passed / 0 failed / 32 ignored。**
+
+とくに **HTTP transport の E2E 4 本が実際に走るようになった** — 0.16.1 で直した #137
+(relay の途中切断) が長期間見つからなかった一因。
+
+復活の過程で、 sync 系テストの前提が 3 つ変わっていたことが判明した (いずれも
+0.8.0〜β-light の意図的な仕様変更):
+
+- **named table 必須** — `enable_sync_tables()` が `define_table` を呼ぶため anonymous
+  table が閉じ `entity()` が panic。 さらに anonymous のままだと受信 op の foreign eid を
+  確保する先が無く apply が丸ごと skip される (#9)
+- **cross-peer read は翻訳経由** (#9) — 送信側 eid のままでは読めない
+- **`_sync_ops` への転送** (0.8.0) — background 転送待ちだと `publish_since` が空振りする
+
+現行仕様と食い違っていた 3 test は、 assert を黙って緩めず機構を doc comment に書いて
+`#[ignore]` で可視化した (replica mode と #9 翻訳の非互換 / oplog ring は session を
+またぐ audit log ではない件)。
+
+### Fixed — テストの timing 依存を除去
+
+`issue9_foreign_eid_collision` が `_sync_ops` への非同期 bridge を 300 ms の sleep で
+待っており、 復活した 168 test で並列実行の負荷が上がった結果 `publish_since` が 0 件に
+なって落ちるようになった。 sleep 4 箇所を決定的な `transfer_oplog_to_sync_ops()` に
+置換。 同種の sleep 依存は他 file にも残っている (別途対応)。
+
+### 検証 (0.17.0)
+
+- `cargo test --workspace --no-fail-fast` (macOS) — **900 passed / 0 failed / 32 ignored**
+  (0.16.1 の 729 + 復活 168 + #141 新規 3)
+- CI (ubuntu) — clippy / miri / loom / test すべて success
+- #141 の修正は **反証済み**: PK bind pass を無効化すると最小再現が確実に 2 row で落ちる
+
 ## 0.16.1 — 2026-08-09
 
 **HTTP relay 経由の sync が数 MB 規模で無音のまま失敗する問題の修正 (#137)。**
