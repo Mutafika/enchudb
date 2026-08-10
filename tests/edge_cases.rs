@@ -232,10 +232,17 @@ fn delete_unknown_entity() {
 // 4. 紐の型混在
 // ──────────────────────────────────────────────────────────────────
 
-/// 同じ紐名で tie と tie_text を混在 → 型は最初の define で確定、
-/// 以降は元の型として扱われる(get_text は型不一致で None)。
-#[cfg(not(debug_assertions))]
+/// 同じ紐名で tie と tie_text を混在 → 型は最初の define で確定し、
+/// 型不一致の `tie_text` は **debug / release とも panic** する
+/// (engine.rs の `ht => panic!("tie_text on non-text himo ...")`)。
+///
+/// 註: 旧版は `#[cfg(not(debug_assertions))]` + 「release では silent に通る」
+/// を前提にしていたが、 型判定は 2026-05-14 (b1fe738) の Tag/Number/Leaf 軸
+/// リネーム以降 debug_assert ではなく無条件 panic。 #138 の test 復活時に
+/// 前提が古いまま蘇っていた (release build でのみ compile されるため、
+/// debug 実行の CI / 手元検証では見えなかった)。
 #[test]
+#[should_panic(expected = "tie_text on non-text himo")]
 fn value_then_text_same_himo() {
     let path = tmp("type_mix");
     let mut eng = Engine::create_standalone(&path).unwrap();
@@ -243,20 +250,12 @@ fn value_then_text_same_himo() {
     let e1 = eng.entity();
     let e2 = eng.entity();
 
-    // 最初は Value 型として作成
+    // 最初は Number 型として確定する
     eng.tie(e1, "x", 42);
     assert!(matches!(eng.value_type("x"), Some(ValueType::Number)));
 
-    // release build: 型混在は silent に通る(debug_assert が発火しない)
+    // 型不一致 → panic (cleanup には到達しない)
     eng.tie_text(e2, "x", "hello");
-    assert!(matches!(eng.value_type("x"), Some(ValueType::Number)));
-
-    // get_text は Symbol 型でないので None を返す
-    assert_eq!(eng.get_text(e2, "x"), None);
-
-    // get は内部の vid を返す(値は取れる)
-    assert!(eng.get(e2, "x").is_some());
-    assert_eq!(eng.get(e1, "x"), Some(42));
 
     cleanup(&path);
 }

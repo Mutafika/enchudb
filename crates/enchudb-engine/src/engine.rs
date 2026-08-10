@@ -3149,7 +3149,11 @@ impl Engine {
         // #77-H4: cursor は「読み切った commit 済み group の終端」までしか
         // 進めない。 scan 後の wal.head() 再読は、 書き込み途中 record での
         // break 位置〜head 間の record を恒久 skip していた (#63 と同 class)。
-        let (records, committed_end) = wal.iter_committed_from_with_end(from);
+        // #152: record ごとの終端 offset 付きで読む。 満杯で打ち切ったとき、
+        // 「処理し切った最後の record の終端」まで cursor を進める (partial advance)
+        // ため。 これが無いと group 全体を retry することになり、 backlog が ring 容量を
+        // 超えると先頭 K 件を永久に再挿入し続けて進行しない。
+        let (records, committed_end) = wal.iter_committed_from_with_offsets(from);
         if records.is_empty() {
             // 空 commit group だけ読み進んだ場合も cursor は安全に前進できる
             self.sync_ops_offset.store(committed_end, Ordering::Release);
@@ -3183,7 +3187,11 @@ impl Engine {
         };
 
         let mut count = 0usize;
-        for rec in &records {
+        // #152: 「ここまでは処理し切った」record の終端 offset。 挿入した record だけ
+        // でなく、 skip した record も「処理し切った」に含める (再訪しても同じく skip
+        // されるので、 進めておく方が backlog を残さない)。
+        let mut done_end: Option<u64> = None;
+        for (rec, rec_end) in &records {
             // 自己再帰 op は skip。 Commit (= barrier marker) / Vocab (= global
             // sync 必須) は eid 持たないのでそのまま通す。
             let skip = match &rec.op {
@@ -3196,7 +3204,7 @@ impl Engine {
                 enchudb_oplog::oplog::DecodedOp::Commit => false,
                 enchudb_oplog::oplog::DecodedOp::Vocab { .. } => false,
             };
-            if skip { continue; }
+            if skip { done_end = Some(*rec_end); continue; }
             // 0.11 (request10 / #76 逆写像): translated foreign entity への
             // **self-authored** write は、 元 entity の世界番号に宛名を書き戻して
             // bridge する (lsn / hlc / author は維持、 eid を含む payload は再署名)。
@@ -3230,6 +3238,7 @@ impl Engine {
                              cannot carry a foreign entity id, request10 follow-up)."
                         );
                     }
+                    done_end = Some(*rec_end);
                     continue;
                 }
                 let row_local = match &rec.op {
@@ -3252,35 +3261,44 @@ impl Engine {
                             Some(r) => resigned = Some(r),
                             // eid 持ち op で None は起きないはずだが、 起きたら
                             // 発送せず local-only に留める (安全側)
-                            None => continue,
+                            None => {
+                                done_end = Some(*rec_end);
+                                continue;
+                            }
                         }
                     }
                 }
             }
-            count += 1;
             let row_eid = match self.entity_in("_sync_ops") {
                 Ok(e) => e,
                 Err(_) => {
-                    // eid_range exhausted。 0.18.2: cursor を**進めない**で返す
-                    // （= backpressure。 次周回で group 全体を retry する）。
+                    // eid_range exhausted (= ring 満杯)。 #152: **挿入し切った分まで**
+                    // cursor を進めて返す (partial advance)。
                     //
-                    // 旧実装は committed_end まで進めて「残り未転送分はこの group
-                    // 内のため落ちる」としていたが、 これは ring 満杯が続く限り
-                    // **全ての新規変更が配布から無言で欠落**する data loss だった
-                    // (実機発現)。 retry では挿入済み prefix が二重挿入され得るが、
-                    // それは (a) 満杯継続中は先頭で即 Err なので増えない、
-                    // (b) 解消をまたぐ 1 回だけ発生し得る有界な重複で、 受信側は
-                    // HLC dedupe で捨てるため無害。 損失より重複を選ぶ。
+                    // 履歴:
+                    // - 0.18.1 まで: committed_end まで飛ばして残りを破棄 → ring 満杯が
+                    //   続く限り全ての新規変更が配布から無言で欠落する data loss
+                    // - 0.18.2 (#150): cursor を一切進めない retry → 損失は消えたが、
+                    //   backlog が ring 容量を超えると毎周「先頭 K 件を再挿入 → K+1 件目で
+                    //   満杯 → cursor 据置」を繰り返して**永久に前進しない** (#152)
+                    // - 本実装: 処理し切った record の終端まで進める。 各 record は
+                    //   ちょうど 1 回だけ挿入され、 重複も損失も進行不能も無い。
+                    //   ring が空けば必ず続きから再開する。
+                    if let Some(end) = done_end {
+                        self.sync_ops_offset.store(end, Ordering::Release);
+                    }
                     if !self.warned_sync_ops_full.swap(true, Ordering::Relaxed) {
                         eprintln!(
                             "[enchudb] warning: _sync_ops ring is full — oplog→sync bridge is \
-                             backpressured (records are retried, NOT dropped). Consumers must \
-                             ack (ack_sync) so reclaim_sync_ops can free the ring."
+                             backpressured (transferred records are kept, the rest wait; \
+                             nothing is dropped). Consumers must ack (ack_sync) so \
+                             reclaim_sync_ops can free the ring."
                         );
                     }
                     return count;
                 }
             };
+            count += 1;
             let lsn = self.next_sync_lsn.fetch_add(1, Ordering::AcqRel);
             self.tie_to_by_id(row_eid, lsn_hid, lsn);
             self.tie_to_by_id(row_eid, peer_id_hid, rec.author_peer);
@@ -3314,9 +3332,12 @@ impl Engine {
             wire_payload.extend_from_slice(fp);
             wire_payload.extend_from_slice(sb);
             self.tie_bytes_to_by_id(row_eid, payload_hid, &wire_payload);
+            done_end = Some(*rec_end);
         }
 
-        // 全部転送できた、 offset を「読み切った commit 済み終端」に進める (#77-H4)
+        // 全部転送できた、 offset を「読み切った commit 済み終端」に進める (#77-H4)。
+        // committed_end は最後の Commit record の直後なので、 最終 record の終端
+        // (done_end) より必ず先に居る。
         self.sync_ops_offset.store(committed_end, Ordering::Release);
         // 満杯が解消して完走した — 次の満杯では再び warn する
         self.warned_sync_ops_full.store(false, Ordering::Relaxed);
