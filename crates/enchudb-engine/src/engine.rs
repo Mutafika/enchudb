@@ -1590,6 +1590,8 @@ pub struct Engine {
     /// bridge から除外した際の一度きり警告フラグ (u32 wire value に世界番号が
     /// 入らないため発送不能、 wire 拡張の follow-up 待ち)。
     warned_ref_to_replica: std::sync::atomic::AtomicBool,
+    /// 0.18.2: `_sync_ops` 満杯 backpressure の warn を 1 回に抑制（解消で解除）。
+    warned_sync_ops_full: std::sync::atomic::AtomicBool,
     /// 背景 fsync が最後に completed した LSN。
     durable_lsn: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// v32: この Engine を所有する peer の id。分散時 eid の上位 32bit。
@@ -1858,6 +1860,7 @@ impl Engine {
             oplog_record_queue: None,
             consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             warned_ref_to_replica: std::sync::atomic::AtomicBool::new(false),
+            warned_sync_ops_full: std::sync::atomic::AtomicBool::new(false),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -2179,6 +2182,7 @@ impl Engine {
             oplog_record_queue: None,
             consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             warned_ref_to_replica: std::sync::atomic::AtomicBool::new(false),
+            warned_sync_ops_full: std::sync::atomic::AtomicBool::new(false),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -2895,6 +2899,7 @@ impl Engine {
             oplog_record_queue: None,
             consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             warned_ref_to_replica: std::sync::atomic::AtomicBool::new(false),
+            warned_sync_ops_full: std::sync::atomic::AtomicBool::new(false),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
@@ -3256,13 +3261,23 @@ impl Engine {
             let row_eid = match self.entity_in("_sync_ops") {
                 Ok(e) => e,
                 Err(_) => {
-                    // eid_range exhausted: 0.7.0 では追加 row insert を諦める
-                    // (= 0.8.0 で ring buffer 化)。 ここまでの転送は維持。
-                    // #77-H4: 旧実装は wal.head() まで飛ばして書き込み途中
-                    // record まで skip していた。 committed_end 止まりに変更
-                    // (残り未転送分はこの group 内のため落ちるが、 in-flight
-                    // record の恒久 skip は防ぐ)。
-                    self.sync_ops_offset.store(committed_end, Ordering::Release);
+                    // eid_range exhausted。 0.18.2: cursor を**進めない**で返す
+                    // （= backpressure。 次周回で group 全体を retry する）。
+                    //
+                    // 旧実装は committed_end まで進めて「残り未転送分はこの group
+                    // 内のため落ちる」としていたが、 これは ring 満杯が続く限り
+                    // **全ての新規変更が配布から無言で欠落**する data loss だった
+                    // (実機発現)。 retry では挿入済み prefix が二重挿入され得るが、
+                    // それは (a) 満杯継続中は先頭で即 Err なので増えない、
+                    // (b) 解消をまたぐ 1 回だけ発生し得る有界な重複で、 受信側は
+                    // HLC dedupe で捨てるため無害。 損失より重複を選ぶ。
+                    if !self.warned_sync_ops_full.swap(true, Ordering::Relaxed) {
+                        eprintln!(
+                            "[enchudb] warning: _sync_ops ring is full — oplog→sync bridge is \
+                             backpressured (records are retried, NOT dropped). Consumers must \
+                             ack (ack_sync) so reclaim_sync_ops can free the ring."
+                        );
+                    }
                     return count;
                 }
             };
@@ -3303,6 +3318,8 @@ impl Engine {
 
         // 全部転送できた、 offset を「読み切った commit 済み終端」に進める (#77-H4)
         self.sync_ops_offset.store(committed_end, Ordering::Release);
+        // 満杯が解消して完走した — 次の満杯では再び warn する
+        self.warned_sync_ops_full.store(false, Ordering::Relaxed);
         count
     }
 
@@ -3320,6 +3337,26 @@ impl Engine {
             enchudb_oplog::oplog::HEADER_SIZE as u64,
             std::sync::atomic::Ordering::Release,
         );
+    }
+
+    /// 0.18.2: WAL ring を畳んで（`try_reset`）よいか。
+    ///
+    /// sync bridge（`transfer_oplog_to_sync_ops`）がまだ読んでいない領域が残って
+    /// いる間は畳んではならない — 畳むと未 bridge record が WAL ごと消え、 その変更は
+    /// **sync から無言で欠落**する。 0.18.1 までの「無条件に畳んでよい」は
+    /// 「sync は `_sync_ops` 経由で ring を直接読まない」という誤った前提だった
+    /// （bridge 自体が ring の reader）。 bridge が backpressure で止まっている間
+    /// （ring 満杯）は fold も止まり、 WAL が保持を引き受ける。
+    pub fn wal_fold_safe(&self) -> bool {
+        if !self.sync_tables_enabled() {
+            return true;
+        }
+        let Some(wal) = self.oplog.as_ref() else {
+            return true;
+        };
+        self.sync_ops_offset
+            .load(std::sync::atomic::Ordering::Acquire)
+            >= wal.head()
     }
 
     /// 0.7.0 (Phase 4): peer の watermark を更新する。 Syncer が peer から ack を
@@ -3628,6 +3665,17 @@ impl Engine {
         let table_size = table.eid_range_hi - table.eid_range_lo;
         let cur = table.next_local.fetch_add(1, Ordering::AcqRel);
         if cur >= table_size {
+            // 0.18.2: `free_locals` は in-memory のみで reopen で消える。 reclaim 済み
+            // slot を持つ store を reopen すると、 range は「満杯」に見えるのに実際は
+            // 穴だらけで、 ここが恒久 Err になる。 `_sync_ops` ではこれが
+            // 「transfer が row を挿せない → 変更が sync から**無言で欠落**」として
+            // 実機発現した (ring ~25K 全 reclaim 後の reopen で bridge 全停止)。
+            // 枯渇時に一度 EntitySet の liveness から穴を再構築して自己修復する。
+            if self.rebuild_free_locals(tid) {
+                // 穴が見つかった — free list 経由で取り直す。 再帰は一段で止まる:
+                // 再構築後も枯渇なら fl が空のままなので次は Err に落ちる。
+                return self.entity_in(table_name);
+            }
             // 払出した分を rollback (= overflow 状態を維持しないため厳密には
             // 必要だが、 単調 monotone な next_local なので少々超過しても
             // 次回以降の check で確実に弾ける。 ここは error を返すのみ)。
@@ -3648,6 +3696,39 @@ impl Engine {
         }
         let peer = self.peer_id.load(Ordering::Acquire);
         Ok(enchudb_oplog::make_eid(peer, global))
+    }
+
+    /// 0.18.2: `free_locals` を EntitySet の liveness から再構築する（穴 = 割当済み
+    /// range 内で live でない local）。 free list は in-memory のみで reopen で消える
+    /// ため、 reclaim 済み slot を持つ store の reopen 後は range が「満杯」に見える —
+    /// その枯渇時の自己修復パス（`entity_in` の slow path からのみ呼ばれる想定）。
+    ///
+    /// 戻り値: 穴が 1 つでも見つかったか。 lock を持ったまま scan するので、 並行する
+    /// 枯渇 thread は再構築完了を待ってから free list を pop する（同じ穴の二重払い出し
+    /// を防ぐ）。 range 全体の線形 scan だが、 呼ばれるのは枯渇時のみで hot path 外。
+    fn rebuild_free_locals(&self, tid: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        let table = &self.tables[tid];
+        let mut fl = table.free_locals.lock().unwrap();
+        if !fl.is_empty() {
+            return true; // 別 thread が再構築済み
+        }
+        let allocated = table
+            .next_local
+            .load(Ordering::Acquire)
+            .min(table.eid_range_hi - table.eid_range_lo);
+        for global in table.eid_range_lo..(table.eid_range_lo + allocated) {
+            if !self.entities.is_live(global) {
+                fl.push(global - table.eid_range_lo);
+            }
+        }
+        let found = !fl.is_empty();
+        if found {
+            table
+                .free_locals_nonempty
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        found
     }
 
     /// #9: persist 用に翻訳写像 + 各 entity の foreign tombstone HLC を集める。 tombstone は
@@ -7516,7 +7597,10 @@ impl Engine {
                             if engine.sync_tables_enabled() {
                                 engine.transfer_oplog_to_sync_ops();
                             }
-                            if wal.try_reset() {
+                            // 0.18.2: bridge が未読領域を残している間（ring 満杯の
+                            // backpressure 中）は畳まない。 畳むと未 bridge record が
+                            // 消えて sync から無言で欠落する（実機発現）。
+                            if engine.wal_fold_safe() && wal.try_reset() {
                                 emit_offset_for_thread.store(
                                     enchudb_oplog::oplog::HEADER_SIZE as u64,
                                     Ordering::Release,
@@ -7576,7 +7660,8 @@ impl Engine {
                             // HEADER_SIZE へ巻き戻す。 100ms fsync tick を踏まない
                             // short-lived writer (events.ecdb の log_event 等) でも
                             // 次 open が full のまま始まらないようにするため。
-                            if wal.try_reset() {
+                            // 0.18.2: こちらも bridge 未読領域があるうちは畳まない。
+                            if engine.wal_fold_safe() && wal.try_reset() {
                                 emit_offset_for_thread.store(
                                     enchudb_oplog::oplog::HEADER_SIZE as u64,
                                     std::sync::atomic::Ordering::Release,
