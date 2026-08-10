@@ -4460,6 +4460,36 @@ impl Engine {
         }
     }
 
+    /// [`translate_remote_vid`] の厳密版: **mapping 未登録なら `None`**（fallback で
+    /// 生値を返さない）。 vid は author ローカルな番号なので、 未翻訳の生値で index を
+    /// 引くと**無関係な local entity に数値衝突でヒット**する。 PK bind（#141）の
+    /// lookup はこちらを使い、 未翻訳なら bind をスキップすること — fresh store 同士は
+    /// intern 順が対称で vid 番号がほぼ必ず衝突するため、 fallback 生値での lookup は
+    /// 誤 bind → row 上書き → 恒久チャーンに直結する（0.17.0 で実際に発生）。
+    /// vocab 翻訳が不要な himo（Number 等）は `Some(value)` を返す。
+    pub fn try_translate_remote_vid(
+        &self,
+        author_peer: enchudb_oplog::PeerId,
+        himo_id: u16,
+        value: u32,
+    ) -> Option<u32> {
+        let hid = himo_id as usize;
+        if hid >= self.value_types.len() { return Some(value); }
+        match self.value_types[hid] {
+            ValueType::Tag | ValueType::Leaf => {
+                let map = self.peer_vocab_map.read().unwrap();
+                map.get(&(author_peer, value)).copied()
+            }
+            _ => Some(value),
+        }
+    }
+
+    /// local vocab を **bytes で**引く（`vocab_id` の bytes 版）。 PK bind が
+    /// 「同 batch 内の未適用 Vocab record の bytes」から既存 row を照合するのに使う。
+    pub fn vocab_id_bytes(&self, bytes: &[u8]) -> Option<u32> {
+        self.vocab.lookup(bytes)
+    }
+
     // ──── tie ────
 
     pub fn define_himo(&mut self, himo: &str, ht: ValueType, max_values: u32) {

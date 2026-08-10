@@ -213,3 +213,74 @@ fn pk_survives_reopen_via_tables_sidecar() {
     drop(db);
     cleanup(&path);
 }
+
+/// #141 修正 (0.17.0) のリグレッション — **別のキー同士が vid の数値衝突で誤って
+/// 束ねられてはいけない**。
+///
+/// vid は author ローカルな番号で、 fresh store 同士は intern 順が対称なので
+/// 「A の既存キーの vid」と「B の新規キーの vid」が**ほぼ必ず同じ番号**になる。
+/// 0.17.0 の bind pass は、 同 batch 内の未適用 Vocab record を翻訳できず
+/// `translate_remote_vid` の fallback で**生の remote vid のまま** PK lookup して
+/// いたため、 無関係な row へ誤 bind → キー上書き → 相手の row が消える →
+/// 下流では materialize が被害者のファイルを消し、 scan が復活させる恒久チャーン
+/// ループになった (実機で「1 written, 1 removed」が毎周回)。
+#[test]
+fn different_pk_with_colliding_vid_numbers_stay_separate() {
+    let pa = tmp("vidcol-a");
+    let pb = tmp("vidcol-b");
+
+    let db_a = make_peer(&pa, 1);
+    let db_b = make_peer(&pb, 2);
+
+    // fresh store 同士: 最初に intern される URL 文字列は両側で**同じ vid 番号**を
+    // 取る (これが実機の「fresh store なのに即壊れる」条件そのもの)。
+    const URL_A: &str = "https://a.example/one";
+    const URL_B: &str = "https://b.example/other";
+    db_a.get_table(TABLE)
+        .unwrap()
+        .upsert()
+        .set(COL_URL, URL_A)
+        .set(COL_TITLE, "a's own")
+        .commit()
+        .unwrap();
+    db_b.get_table(TABLE)
+        .unwrap()
+        .upsert()
+        .set(COL_URL, URL_B)
+        .set(COL_TITLE, "b's own")
+        .commit()
+        .unwrap();
+
+    let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
+    let sync_a = Syncer::new(db_a.arc_engine(), transport.clone());
+    let sync_b = Syncer::new(db_b.arc_engine(), transport.clone());
+
+    publish_all(&db_a, &sync_a);
+    publish_all(&db_b, &sync_b);
+
+    sync_b.pull_once(1);
+    sync_a.pull_once(2);
+
+    db_a.engine().rebuild();
+    db_b.engine().rebuild();
+
+    // キーが違うのだから、 両側とも 2 row（各キー 1 個ずつ）になるべき。
+    // 誤 bind すると片方のキーが上書きされて 0 個 / もう片方が 2 個になる。
+    for (name, db) in [("A", &db_a), ("B", &db_b)] {
+        assert_eq!(
+            count_by_url(db, URL_A),
+            1,
+            "{name}: {URL_A} が 1 row であること（誤 bind でキーが潰れていない）"
+        );
+        assert_eq!(
+            count_by_url(db, URL_B),
+            1,
+            "{name}: {URL_B} が 1 row であること（誤 bind でキーが潰れていない）"
+        );
+    }
+
+    drop(db_a);
+    drop(db_b);
+    cleanup(&pa);
+    cleanup(&pb);
+}
