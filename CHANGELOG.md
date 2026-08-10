@@ -3,6 +3,59 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.18.2 — 2026-08-11
+
+**reopen した store で oplog→sync bridge が恒久停止する事故の修正 (#150)。** relay 型経路
+(ack 無し) で `_sync_ops` ring を一周以上使った store を**再起動**すると、 以後の全変更が
+sync から無言で欠落していた。 on-disk format は v8 のまま不変、 公開 API は追加のみ、
+migration 不要。
+
+### Fixed — reclaim 済み slot が reopen で失われ bridge が全停止する (#150)
+
+**症状**: ring を使い切った store をプロセス再起動すると、 以後のローカル変更が一切
+配布されない。 `publish` は毎周回「配った」と報告し続けるため、 外からは正常に見える。
+
+**原因** (独立した 3 欠陥の合成):
+
+1. `free_locals` (reclaim で空けた slot の reservoir) が in-memory のみで reopen で消える。
+   `next_local` は sidecar で永続化されて range 端に居るため、 reopen 後の
+   `entity_in("_sync_ops")` は**穴だらけなのに恒久 Err** になる
+2. `transfer_oplog_to_sync_ops` が満杯時に cursor を `committed_end` へ進めて record を
+   破棄していたため、 1 の状態では**全 batch が毎回丸ごと破棄**される
+3. 0.18.1 で WAL fold のゲートが「sync は `_sync_ops` 経由で ring を直接読まない」という
+   誤った前提で撤去されていた。 bridge (`transfer_oplog_to_sync_ops`) 自体が ring の
+   reader なので、 fold が未 bridge 領域ごと畳んで record の現物を消していた
+
+**修正**:
+
+- `entity_in`: 枯渇時に EntitySet の liveness から `free_locals` を一度再構築する self-heal。
+  既に毒された store も次の書き込みで自動修復される
+- `transfer_oplog_to_sync_ops`: 満杯時は cursor を**進めず** retry (backpressure)。
+  rate-limited warn で可視化
+- `Engine::wal_fold_safe()` (新規 public): bridge 未読領域が残る間は `try_reset` しない
+
+**検証**: `crates/enchudb-engine/tests/sync_ops_freelist_reopen.rs` に回帰 2 本。 いずれも
+修正を無効化すると FAIL することを確認済み (self-heal 無効化で `lsn 637 → 637` 凍結、
+backpressure 無効化で「ring を空けても待機 record が bridge されない」)。
+
+### Known limitation — backlog が ring 容量を超えると backpressure が進行不能 (#152)
+
+本 release の backpressure は cursor を**まったく**進めないため、 未転送 backlog が
+`_sync_ops` の ring 容量を超えると、 毎周回「先頭 K 件を挿入 → K+1 件目で満杯 →
+cursor 据置」を繰り返して**永久に前進しない**。 `next_sync_lsn` は挿入のたびに増えるので
+外形上は配布が進んでいるように見える。 実測 (ring 508 / backlog 1281) で 12 周回しても
+marker record は一度も bridge されなかった。
+
+さらに livelock 中は `wal_fold_safe()` が false 固定になるため WAL が畳まれず、 容量到達で
+`append` が drop され始める (ローカル store は無傷だが oplog record は消えるため恒久的に
+同期不能)。 **損失点が bridge から WAL へ移動しただけで、 #149 の silent loss は解消して
+いない。**
+
+初回 full-union のように backlog が ring を超える規模の構成は、 根治 (#152: 挿入できた分
+だけ cursor を進める partial advance) まで **0.16.1 に留まるか、 publish 後に self-ack して
+ring を回す #149 の回避策を併用すること**。 ring 1 周に収まる backlog では本 release で
+損失なく動作する。
+
 ## 0.18.1 — 2026-08-10
 
 **0.17.0 で入った PK bind のリグレッション修正 (#147)。 0.17.0 / 0.18.0 を使っている構成は
