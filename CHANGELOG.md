@@ -3,6 +3,81 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.18.0 — 2026-08-10
+
+**reclaim で落ちた履歴を黙って部分適用しなくなった (#140 Phase 1)。** engine の on-disk
+format は v8 のまま不変、 MSRV も 1.89 据え置き、 migration 不要。 ただし
+**`SyncOutcome` に public field 追加** と **`pull_once` の挙動変更**を含むため minor。
+
+**この release だけでは HTTP 経路には効かない。** 下記「残り」を参照。
+
+### Fixed — 差分で追いつけない peer に部分履歴を配っていた (#140 Phase 1)
+
+`_sync_ops` は ring buffer で、 `lsn < sync_watermark()` (= **登録済み**全 peer が
+consume した境界) の row は reclaim される。 未登録の新規 peer や長期オフラインの peer は
+watermark を押さえないので、 **自分が必要とする履歴が先に落ちる**。 それでも pull は成功
+扱いで返っていたため、 peer は不完全な store を持ったまま同期済みだと信じていた。
+
+実測 (`tests/issue140_history_truncation.rs`):
+
+```
+A の live state = 1 row
+B の pull 結果  = SyncOutcome { received: 1, applied: 0, skipped: 1, ... }
+B の最終状態    = 0 row  → エラーも警告も無く「同期成功」
+```
+
+**修正**: 配れる履歴の下限を publisher が広告し、 puller は cursor がそれより古ければ
+**records を一切適用せず** truncation を通知する。 部分履歴を黙って適用するのをやめ、
+Kafka の `OffsetOutOfRange` と同じ「差分では追いつけないので bootstrap し直せ」を明示する
+形にした。
+
+| 層 | 変更 |
+|---|---|
+| engine | `sync_history_reclaimed()` / `min_sync_ops_lsn()` を追加 |
+| transport | `set_history_floor` / `history_floor` を trait に追加 (default は no-op / None) |
+| sync | `publish_since` が floor を広告、 `pull_once` が `SyncOutcome::history_truncated` を返す |
+
+判定は **`_sync_ops` の内容から導出**できるので新規の永続化は不要。 lsn は 1 始まりなので
+「生存 row の最小 lsn > 1」 または 「row 空 + publish 実績あり」 で reclaim 済みと判定できる。
+`next_sync_lsn` は open 時に `_sync_ops` / `_sync_peers.consumed_lsn` から rehydrate される
+ため、 reopen をまたいでも成立する。
+
+#### #140 本文の経路記述を実測で訂正
+
+再現を作る過程で、 issue 本文の記述が実測と食い違うことが分かった (issue にもコメント済み):
+
+- 本文は「16MiB の oplog リング一周で tombstone が脱落」だが、 consumer thread は
+  `try_reset()` の **前に** `transfer_oplog_to_sync_ops()` を流し切るので、 oplog の
+  巻き戻しでは失われない。 実際の retention 境界は **`_sync_ops` の reclaim**
+- reclaim は `lsn` 昇順 (= 古い順) に落とすので、 素の「作成 → 削除 → reclaim」では
+  **作成 record が先に落ちる**。 本文の「作成 record はあるが削除 record が無い」並びには
+  素の手順ではならない。 あの並びは #141 のチャーンループ (同一 PK の重複を作り続ける) が
+  生成源だった可能性が高く、 0.17.0 の #141 修正で主要な生成源は塞がっている
+
+### Breaking
+
+- `SyncOutcome` に public field `history_truncated: bool` を追加。 `#[non_exhaustive]` では
+  ないので **struct literal で構築しているコードは影響を受ける** (`..Default::default()` を
+  使っていれば無影響)
+- `pull_once` は truncation を検知したとき **records を適用せずに返る**。 従来は部分履歴を
+  そのまま適用していた
+- `Transport` trait の追加メソッドは default 実装付きなので、 **既存の実装者は無改修**
+
+### Known limitation — 残り (bootstrap-first の Phase 2/3)
+
+1. **HTTP transport への floor 伝搬が未実装**。 `Transport` trait の default が `None` を
+   返すため、 **HTTP 経路では検知が働かない**。 下流 bisquit に効かせるにはこれが要る
+2. `GET /bootstrap` を初回 full-sync の正規経路に昇格させる Syncer フロー
+3. bisquit 側のペアリング経路改修 (`/bootstrap` を未使用、 cursor 0 pull のみ)
+
+### 検証 (0.18.0)
+
+- `cargo test --workspace --no-fail-fast` (macOS) — **901 passed / 0 failed / 32 ignored**
+- CI (ubuntu) — clippy / miri / loom / test すべて success
+- **反証済み**: `history_floor` の参照を無効化すると新規テストが確実に落ちる。 また
+  「この筋書きでは truncation が必ず通知される」ことも明示的に assert している
+  (最初に書いた亡霊化テストが vacuous pass だったため)
+
 ## 0.17.0 — 2026-08-10
 
 **cross-author sync のデータ破損修正 (#141)。 PK を宣言した table を p2p sync している
