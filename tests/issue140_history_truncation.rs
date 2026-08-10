@@ -72,7 +72,6 @@ fn flush(db: &Database) {
 /// reclaim で履歴が落ちた store に cursor 0 の新規 peer がフル pull したとき、
 /// **黙って不完全な store になってはならない** (収束するか、 truncation を通知するか)。
 #[test]
-#[ignore = "#140 未修正 — retention 通知と bootstrap-first フル同期の実装待ち (実行すると落ちる)"]
 fn full_pull_after_reclaim_must_not_silently_lose_history() {
     let pa = tmp("origin");
     let pb = tmp("fresh");
@@ -119,22 +118,35 @@ fn full_pull_after_reclaim_must_not_silently_lose_history() {
     let out = sync_b.pull_once(1);
     db_b.engine().rebuild();
 
-    // 4. B は A の live state に収束しているべき。
-    //    現状は reclaim で落ちた履歴が黙って抜けるため、 B は空のまま「同期済み」になる。
+    // 4. 「収束する」か「追いつけないと通知する」かのどちらかであること。
+    //    黙って不完全な store になるのが #140。
+    let b_live = db_b.get_table(TABLE).unwrap().all().count().unwrap();
     let ghosts = db_b
         .get_table(TABLE)
         .unwrap()
         .where_eq(COL_BODY, "to be deleted")
         .count()
         .unwrap();
-    assert_eq!(ghosts, 0, "#140: 削除済み entity が {ghosts} 件復活した");
+    assert_eq!(ghosts, 0, "削除済み entity が {ghosts} 件復活した");
 
-    let b_live = db_b.get_table(TABLE).unwrap().all().count().unwrap();
-    assert_eq!(
-        b_live, a_live,
-        "#140: reclaim で履歴が落ちた分、 B が黙って不完全になっている \
-         (A={a_live} / B={b_live}、 pull は成功扱い: {out:?})",
+    // この筋書きは意図的に reclaim を起こしているので、 **必ず** truncation 側に落ちること。
+    // (これを assert しないと「B に何も届かないので亡霊も居ない」で自明に通ってしまう —
+    //  最初に書いた版が実際にその vacuous pass だった。)
+    assert!(
+        out.history_truncated,
+        "reclaim 済みなのに truncation が通知されていない: {out:?}",
     );
+
+    if out.history_truncated {
+        // 通知された場合は何も適用していないこと (部分適用は不完全な store を作る)。
+        assert_eq!(out.applied, 0, "truncation 通知時は適用しないこと: {out:?}");
+        assert_eq!(b_live, 0, "truncation 通知時は store を触らないこと");
+    } else {
+        assert_eq!(
+            b_live, a_live,
+            "#140: 通知も無く B が不完全になっている (A={a_live} / B={b_live}、 {out:?})",
+        );
+    }
 
     drop(db_a);
     drop(db_b);

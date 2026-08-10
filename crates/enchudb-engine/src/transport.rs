@@ -371,6 +371,23 @@ pub trait Transport: Send + Sync {
     fn known_peers(&self) -> Vec<PeerId> {
         Vec::new()
     }
+
+    /// #140: publisher が「自分の履歴は `floor` 以下が reclaim 済み」と広告する。
+    ///
+    /// `_sync_ops` は ring buffer なので、 publisher 側で reclaim が走ると **配れる履歴に
+    /// 下限ができる**。 これを伝えないと、 cursor がその下限より古い puller は部分履歴を
+    /// 「全履歴」として受け取って黙って不完全な store になる (#140)。
+    ///
+    /// default は no-op — 広告を運べない transport では `history_floor` が None を返し、
+    /// puller 側の判定は従来どおり (= 検知なし) にフォールバックする。
+    fn set_history_floor(&self, _peer: PeerId, _floor: Hlc) {}
+
+    /// #140: `peer` が広告した履歴の下限。 `None` は「下限なし (= 全履歴あり)」または
+    /// 「この transport は広告を運べない」。 puller は自分の cursor がこれより古ければ
+    /// 差分では追いつけないと判断する。
+    fn history_floor(&self, _peer: PeerId) -> Option<Hlc> {
+        None
+    }
 }
 
 /// テスト用: プロセス内で peer 間の WAL を共有する。
@@ -387,6 +404,8 @@ pub struct InMemoryTransport {
     inner: Arc<Mutex<HashMap<PeerId, Vec<WireRecord>>>>,
     /// (from, to) → records — partial sync 用 targeted log
     targeted: Arc<Mutex<HashMap<(PeerId, PeerId), Vec<WireRecord>>>>,
+    /// #140: peer → 広告された履歴の下限 (これ以下は publisher 側で reclaim 済み)。
+    floors: Arc<Mutex<HashMap<PeerId, Hlc>>>,
 }
 
 impl InMemoryTransport {
@@ -394,6 +413,7 @@ impl InMemoryTransport {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             targeted: Arc::new(Mutex::new(HashMap::new())),
+            floors: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -488,6 +508,17 @@ impl Transport for InMemoryTransport {
     fn known_peers(&self) -> Vec<PeerId> {
         let guard = self.inner.lock().unwrap();
         guard.keys().copied().collect()
+    }
+
+    // #140: 広告は「後退させない」— reclaim は進む一方なので floor も単調増加。
+    fn set_history_floor(&self, peer: PeerId, floor: Hlc) {
+        let mut g = self.floors.lock().unwrap();
+        let e = g.entry(peer).or_insert(floor);
+        if floor > *e { *e = floor; }
+    }
+
+    fn history_floor(&self, peer: PeerId) -> Option<Hlc> {
+        self.floors.lock().unwrap().get(&peer).copied()
     }
 }
 
