@@ -449,8 +449,35 @@ impl Syncer {
                 continue;
             }
             // PK は Tag / Number 想定 (Ref を PK にはしない)。 remote vocab vid を
-            // local vid に翻訳してから引く。
-            let local_value = self.engine.translate_remote_vid(rec.author_peer, *himo_id, *value);
+            // local vid に翻訳してから引く。 **未翻訳の生 vid で引いてはいけない** —
+            // vid は author ローカル番号で、 fresh store 同士は intern 順が対称なので
+            // ほぼ必ず数値衝突し、 無関係な row へ誤 bind → 上書き → 恒久チャーンに
+            // なる (0.17.0 リグレッション。 新規文字列の Vocab record は同 batch 内で
+            // 未適用のため translate_remote_vid の fallback 生値が漏れていた)。
+            let local_value = match self
+                .engine
+                .try_translate_remote_vid(rec.author_peer, *himo_id, *value)
+            {
+                Some(v) => v,
+                None => {
+                    // mapping 未登録 = この vid の Vocab record は同 batch 内に居る
+                    // はず。 その bytes で local vocab を引き、 同じ文字列が local に
+                    // 既存ならその vid で照合する。 bytes ごと未知なら、 この PK
+                    // 文字列を持つ既存 row は存在し得ない → bind せず払い出しに任せる。
+                    let from_batch = records.iter().find_map(|r| match &r.op {
+                        DecodedOp::Vocab { vid, bytes }
+                            if r.author_peer == rec.author_peer && vid == value =>
+                        {
+                            self.engine.vocab_id_bytes(bytes)
+                        }
+                        _ => None,
+                    });
+                    match from_batch {
+                        Some(v) => v,
+                        None => continue,
+                    }
+                }
+            };
             let Some(existing) = self
                 .engine
                 .query_by_id(&[(*himo_id, local_value)])
