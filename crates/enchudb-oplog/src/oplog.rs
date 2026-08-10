@@ -432,6 +432,13 @@ pub struct Record {
     pub signed_bytes: Vec<u8>,
 }
 
+/// #152: scan の内部表現 `(Record, 終端 offset)` から offset を落とす。
+/// partial advance が要らない既存 caller 用。
+#[inline]
+fn strip_offsets(v: Vec<(Record, u64)>) -> Vec<Record> {
+    v.into_iter().map(|(r, _)| r).collect()
+}
+
 /// WAL 本体。
 /// `append_relayed` で受信レコードの header フィールド (HLC/author/署名) を
 /// 引き継ぐためのバンドル。 LSN と payload は自分で発行/再計算する。
@@ -1051,13 +1058,27 @@ impl OpLog {
     /// checkpoint 位置は無視(既に apply 済みの記録もまだ WAL file 上にあれば拾う)。
     /// Syncer.publish_since で使う。ring buffer reset 済みの記録は取れない。
     pub fn iter_committed(&self) -> Vec<Record> {
-        self.scan_from_offset(HEADER_SIZE as u64).0
+        strip_offsets(self.scan_from_offset(HEADER_SIZE as u64).0)
     }
 
     /// 指定 offset 以降の commit 済みレコードを返す。changefeed の差分発火用。
     /// `start_offset` は前回 emit 時の `wal.checkpoint()` を渡す想定。
     pub fn iter_committed_from(&self, start_offset: u64) -> Vec<Record> {
-        self.scan_from_offset(start_offset).0
+        strip_offsets(self.scan_from_offset(start_offset).0)
+    }
+
+    /// #152: `iter_committed_from_with_end` に **各 record の終端 offset** を添えた版。
+    ///
+    /// 途中で処理を打ち切った consumer が「どこまで処理し切ったか」を cursor に落とせる
+    /// ようにする (= partial advance)。 record の終端 offset は次 record の先頭でもあるので、
+    /// そのまま次回の `start_offset` として渡せる。
+    ///
+    /// group の途中を指す offset から再開しても取りこぼさない: `out` に入る record は
+    /// 必ず Commit で閉じられた group の一員なので、 再 scan は残りの record を読んでから
+    /// その Commit に到達して flush する。
+    pub fn iter_committed_from_with_offsets(&self, start_offset: u64) -> (Vec<(Record, u64)>, u64) {
+        let (out, _, _, committed_end) = self.scan_from_offset(start_offset);
+        (out, committed_end)
     }
 
     /// #77-H4: `iter_committed_from` + 「読み切った commit 済み group の終端
@@ -1067,7 +1088,7 @@ impl OpLog {
     /// 書き込み途中 record で break した位置〜head 間の record を恒久 skip する。
     pub fn iter_committed_from_with_end(&self, start_offset: u64) -> (Vec<Record>, u64) {
         let (out, _, _, committed_end) = self.scan_from_offset(start_offset);
-        (out, committed_end)
+        (strip_offsets(out), committed_end)
     }
 
     /// リカバリ: checkpoint から head までを読んで、Commit で挟まれたグループだけ返す。
@@ -1088,14 +1109,18 @@ impl OpLog {
             self.hlc_last_wall.store(max_hlc.wall, Ordering::Release);
             self.hlc_logical.store(max_hlc.logical, Ordering::Release);
         }
-        out
+        strip_offsets(out)
     }
 
     /// 指定 offset から head までを Commit グループ単位で読む。共通実装。
     /// 副作用なし (読むだけ)。返り値は (records, max_lsn, max_hlc,
     /// committed_end)。 committed_end = 最後に読み切った Commit record の
     /// 直後 offset (1 つも無ければ start_offset)。
-    fn scan_from_offset(&self, start_offset: u64) -> (Vec<Record>, u64, Hlc, u64) {
+    ///
+    /// #152: records は `(Record, その record の終端 offset)` の組。 終端 offset は
+    /// partial advance (= 途中まで処理した consumer の cursor) に使う。 offset 不要な
+    /// caller は `strip_offsets` で落とす。
+    fn scan_from_offset(&self, start_offset: u64) -> (Vec<(Record, u64)>, u64, Hlc, u64) {
         let mut out = Vec::new();
         let mut batch = Vec::new();
         let mut offset = start_offset;
@@ -1150,10 +1175,13 @@ impl OpLog {
                     committed_end = payload_end as u64;
                 }
                 Some(other) => {
-                    batch.push(Record {
-                        lsn, hlc, author_peer, op: other,
-                        signature, pubkey_fp, signed_bytes,
-                    });
+                    batch.push((
+                        Record {
+                            lsn, hlc, author_peer, op: other,
+                            signature, pubkey_fp, signed_bytes,
+                        },
+                        payload_end as u64,
+                    ));
                 }
                 None => {
                     // forward-compat 可視化 (0.9.0 L1): 新しい version が書いた

@@ -38,23 +38,44 @@ migration 不要。
 修正を無効化すると FAIL することを確認済み (self-heal 無効化で `lsn 637 → 637` 凍結、
 backpressure 無効化で「ring を空けても待機 record が bridge されない」)。
 
-### Known limitation — backlog が ring 容量を超えると backpressure が進行不能 (#152)
+### Fixed — 満杯 backpressure が backlog > ring 容量で進行不能になる (#152)
 
-本 release の backpressure は cursor を**まったく**進めないため、 未転送 backlog が
-`_sync_ops` の ring 容量を超えると、 毎周回「先頭 K 件を挿入 → K+1 件目で満杯 →
-cursor 据置」を繰り返して**永久に前進しない**。 `next_sync_lsn` は挿入のたびに増えるので
-外形上は配布が進んでいるように見える。 実測 (ring 508 / backlog 1281) で 12 周回しても
-marker record は一度も bridge されなかった。
+上記の backpressure を「cursor を一切進めない retry」で実装すると、 未転送 backlog が
+`_sync_ops` の ring 容量を超えたときに**永久に前進しない**。 毎周回「先頭 K 件を挿入 →
+K+1 件目で満杯 → cursor 据置」を繰り返すだけで、 K+1 件目に到達しない。 `next_sync_lsn` は
+挿入のたびに増えるので外形上は「毎周 K 件配っている」= 正常に見えるのが厄介。
+実測 (ring 508 / backlog 1281) で 12 周回しても末尾 marker は一度も bridge されなかった。
 
-さらに livelock 中は `wal_fold_safe()` が false 固定になるため WAL が畳まれず、 容量到達で
-`append` が drop され始める (ローカル store は無傷だが oplog record は消えるため恒久的に
-同期不能)。 **損失点が bridge から WAL へ移動しただけで、 #149 の silent loss は解消して
-いない。**
+**修正**: 処理し切った record の**終端 offset まで cursor を進める** (partial advance)。
+各 record はちょうど 1 回だけ挿入され、 重複も損失も進行不能も無い。 ring が空けば必ず
+続きから再開する。
 
-初回 full-union のように backlog が ring を超える規模の構成は、 根治 (#152: 挿入できた分
-だけ cursor を進める partial advance) まで **0.16.1 に留まるか、 publish 後に self-ack して
-ring を回す #149 の回避策を併用すること**。 ring 1 周に収まる backlog では本 release で
-損失なく動作する。
+- `OpLog::iter_committed_from_with_offsets` (新規 public): `(Record, その record の終端
+  offset)` の組を返す。 group の途中を指す offset から再開しても取りこぼさない
+  (`out` に入る record は必ず Commit で閉じられた group の一員なので、 再 scan は残りを
+  読んでからその Commit に到達して flush する)
+- `transfer_oplog_to_sync_ops`: 挿入した record も skip した record も「処理し切った」
+  として cursor を進める。 満杯で打ち切ったときはそこまでを store
+- 併せて `count` の off-by-one を修正 (挿入できなかった record を転送数に数えていた)
+
+**検証**: `crates/enchudb-engine/tests/sync_ops_backlog_drain.rs` に回帰 1 本
+(backlog ~1280 > ring ~508 で末尾 marker が届くこと)。 partial advance を無効化すると
+FAIL することを確認済み。
+
+### Known limitation — ack が一切来ない構成では WAL が畳まれず full に至る (#149)
+
+backpressure の必然として、 **ack を呼ぶ主体がいない構成** (HttpRelay / gateway 越しの
+publish / pull のみ) では ring が永久に空かないため bridge が止まり続ける。 その間は
+`wal_fold_safe()` が false のままなので WAL も畳まれず、 容量到達で `append` が drop
+され始める (rate-limited warn あり、 ローカル store は無傷だが oplog record は消えるため
+その変更は恒久的に同期不能)。
+
+実測: ack 無しで書き続けると `wal_fold_safe=false` のまま `WAL full — append dropped`。
+一方 **ack が回っていれば `wal_fold_safe=true` を保ち WAL は正常に畳まれる** (20 周回
+確認済み) ので、 通常運用に影響は無い。
+
+根治は #149 の「pull 経路を ack として扱う口」。 それまでは publish 成功後に自分の
+peer_id で self-ack する回避策 (#149 に記載) を併用すること。
 
 ## 0.18.1 — 2026-08-10
 
