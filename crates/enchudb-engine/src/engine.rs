@@ -3420,6 +3420,48 @@ impl Engine {
         self.next_sync_lsn.load(std::sync::atomic::Ordering::Acquire).saturating_sub(1)
     }
 
+    /// #140: `_sync_ops` から既に reclaim された履歴があるか。
+    ///
+    /// `reclaim_sync_ops` は `lsn < sync_watermark()` の row を purge する。 watermark は
+    /// **登録済み peer** の consumed_lsn の最小値なので、 `_sync_peers` に居ない新規 peer が
+    /// 必要とする履歴も落ちる。 その状態で cursor 0 のフル pull を受けると、 部分履歴を
+    /// 「全履歴」として配ってしまう (= #140)。
+    ///
+    /// 判定は `_sync_ops` の内容から導出できるので**新たな永続化は不要**:
+    /// lsn は 1 始まりなので、 生存 row の最小 lsn が 1 より大きければ古い分が purge 済み。
+    /// row が空でも publish 実績 (`current_sync_lsn() > 0`) があれば全部 purge 済み。
+    /// `next_sync_lsn` は open 時に `_sync_ops` / `_sync_peers.consumed_lsn` から
+    /// rehydrate されるので、 この判定は reopen をまたいでも成立する。
+    pub fn sync_history_reclaimed(&self) -> bool {
+        if !self.sync_tables_enabled() { return false; }
+        let published = self.current_sync_lsn();
+        if published == 0 {
+            return false; // 一度も publish していない = 落ちた履歴も無い
+        }
+        match self.min_sync_ops_lsn() {
+            // 生存 row があるなら、 最小 lsn が 1 を超えている分だけ古い履歴が落ちている
+            Some(min_lsn) => min_lsn > 1,
+            // 空 + publish 実績あり = 全部 reclaim 済み
+            None => true,
+        }
+    }
+
+    /// #140: `_sync_ops` に生存している row の最小 lsn。 空なら None。
+    pub fn min_sync_ops_lsn(&self) -> Option<u32> {
+        if !self.sync_tables_enabled() { return None; }
+        let lsn_hid = self.himo_id("_sync_ops.lsn")? as u16;
+        let mut min_lsn: Option<u32> = None;
+        for eid in self.entities_with_himo(lsn_hid) {
+            if let Some(l) = self.get_by_id(eid, lsn_hid) {
+                min_lsn = Some(match min_lsn {
+                    Some(m) if m <= l => m,
+                    _ => l,
+                });
+            }
+        }
+        min_lsn
+    }
+
     /// 0.7.0 (Phase 4): `_sync_ops` の `lsn > since_lsn` row を全 himo set で
     /// 返す。 Syncer の publish_since が「peer.consumed_lsn より新しい op を
     /// 流す」 用途で呼ぶ。 返り値の各 entry は payload (= 完全 wire bytes)。

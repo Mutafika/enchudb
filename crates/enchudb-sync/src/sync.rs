@@ -95,6 +95,15 @@ pub struct SyncOutcome {
     /// これを越えて前進しない — pubkey 登録との race 窓で reject された record が
     /// 永久に再配送されない silent gap を防ぐ (次回 pull で再検証される)。
     pub min_rejected_hlc: Option<Hlc>,
+    /// #140: **自分の cursor より新しい履歴が publisher 側で既に reclaim されていた**。
+    ///
+    /// `_sync_ops` は ring buffer なので、 登録済み全 peer が consume した分は捨てられる。
+    /// 未登録の新規 peer や長期オフラインの peer は、 差分 pull では**追いつけない**
+    /// (部分履歴を全履歴として適用すると store が黙って不完全になる = #140)。
+    ///
+    /// `true` のとき **records は一切適用していない**。 caller は差分 pull を諦めて
+    /// bootstrap (= `GET /bootstrap` などによる snapshot 取得) からやり直す必要がある。
+    pub history_truncated: bool,
 }
 
 impl Syncer {
@@ -258,6 +267,19 @@ impl Syncer {
             guard.get(&from).copied().unwrap_or(Hlc::ZERO)
         };
         let self_peer = self.engine.peer_id();
+
+        // #140: publisher が広告した履歴の下限より自分の cursor が古いなら、 差分では
+        // 埋められない穴がある。 部分履歴をそのまま適用すると store が黙って不完全に
+        // なる (削除 record を取りこぼせば削除済み entity が復活する) ので、 **何も
+        // 適用せず** truncation を通知して caller に bootstrap を促す。
+        //
+        // cursor が floor 以上なら、 落ちた分は既に自分が consume 済みなので安全。
+        if let Some(floor) = self.transport.history_floor(from) {
+            if since < floor {
+                return SyncOutcome { history_truncated: true, ..SyncOutcome::default() };
+            }
+        }
+
         let records = self.transport.pull_as(self_peer, from, since);
         let outcome = self.apply_records(&records);
 
@@ -308,6 +330,7 @@ impl Syncer {
     /// 空なら **broadcast 経路** (= 旧 `publish_since` の挙動) にフォールバック。
     /// = 既存 caller (broadcast 前提) は API 不変で動く。
     pub fn publish_since(&self, since: Hlc) -> usize {
+        self.advertise_history_floor();
         let peers = self.transport.known_peers();
         if peers.is_empty() {
             // backward compat: known_peers 未実装 transport (HTTP/WS push 等) は
@@ -325,6 +348,26 @@ impl Syncer {
             total += self.publish_since_for_peer(p, since);
         }
         total
+    }
+
+    /// #140: 自分の `_sync_ops` が reclaim 済みなら、 配れる履歴の下限を transport に広告する。
+    ///
+    /// 下限は「生存している record の最小 HLC」。 これより古い cursor を持つ puller は、
+    /// 差分では埋められない穴があるので bootstrap が要る。 reclaim が起きていなければ
+    /// 何も広告しない (= 全履歴が配れる)。
+    fn advertise_history_floor(&self) {
+        if !self.engine.sync_history_reclaimed() {
+            return;
+        }
+        let floor = self
+            .collect_records_since(Hlc::ZERO)
+            .into_iter()
+            .map(|r| r.hlc)
+            .min();
+        // 生存 record が 1 件も無い = 全部 reclaim 済み。 どんな cursor でも追いつけないので
+        // 到達不能に高い下限 (Hlc::MAX) を広告する。
+        let floor = floor.unwrap_or(Hlc { wall: u64::MAX, logical: u32::MAX, peer: u32::MAX });
+        self.transport.set_history_floor(self.engine.peer_id(), floor);
     }
 
     /// 0.8.0: `since` HLC より新しい WireRecord を集める。 `_sync_ops` 経由
