@@ -3,6 +3,53 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.18.1 — 2026-08-10
+
+**0.17.0 で入った PK bind のリグレッション修正 (#147)。 0.17.0 / 0.18.0 を使っている構成は
+即座に上げること** — 別のキー同士が誤って束ねられ、 **既存 row のキーが上書きされて消える**。
+engine の on-disk format は v8 のまま不変、 公開 API は追加のみ、 migration 不要。
+
+### Fixed — PK bind が未翻訳の生 vid で lookup して無関係な row へ誤 bind する (#147)
+
+0.17.0 で入れた PK bind pass (#141) のリグレッション。
+
+**症状**: 実機 2 台 (fresh store 同士) で、 片側が新規 row を作ると相手に届かず、 代わりに
+**無関係な既存 row が消えて scan が復活させる**「1 written, 1 removed」の恒久チャーン
+ループになる。
+
+**原因**: bind pass の lookup が `translate_remote_vid` を使っていたが、 この関数は mapping
+未登録時に **author ローカルな生 vid をそのまま返す** fallback を持つ。 新規文字列の
+`Vocab` record は同 batch 内でまだ適用されていないため mapping が無く、 生 vid のまま
+`query_by_id` していた。 vid は peer ローカルの連番なので、 **fresh store 同士は intern 順が
+対称でほぼ必ず数値衝突する** — 発症は事実上必然だった (「flake っぽい」に見えていたのは
+vid 割当タイミング依存のため)。
+
+**修正**:
+
+- `Engine::try_translate_remote_vid` (Option 版、 fallback で生値を返さない) と
+  `Engine::vocab_id_bytes` を追加
+- bind pass は未翻訳なら **同 batch 内の `Vocab` record の bytes → local vocab 照合** に
+  切り替える。 bytes ごと未知なら **bind しない** — その PK 文字列を持つ既存 row は
+  存在し得ないので、 通常の払い出しが正しい
+
+#141 の本来の収束 (同一キーの独立作成が 1 row になる) は保たれている。
+
+### 検証 (0.18.1)
+
+- `cargo test --workspace --no-fail-fast` (macOS) — **902 passed / 0 failed / 32 ignored**
+- CI (ubuntu) — clippy / miri / loom / test すべて success
+- **反証済み**: 修正を 0.17.0 相当に戻すと新規回帰テスト
+  `different_pk_with_colliding_vid_numbers_stay_separate` が
+  「A 自身のキーが 0 row に潰れる」で確実に落ちる
+- 下流 syncretic のフルスイート **86 / 0**。 0.17.0 で 46 秒 timeout していた
+  `symmetric_sync` が 3 連続 9 秒で安定 pass
+
+### 影響範囲
+
+- **0.17.0 / 0.18.0 のみ**。 PK bind pass は 0.17.0 で導入したので、 0.16.1 以前は
+  この誤 bind 自体が起きない
+- PK を宣言した table を p2p sync している構成が対象
+
 ## 0.18.0 — 2026-08-10
 
 **reclaim で落ちた履歴を黙って部分適用しなくなった (#140 Phase 1)。** engine の on-disk

@@ -1,6 +1,6 @@
 [package]
 name = "enchudb-engine"
-version = "0.18.0"
+version = "0.18.1"
 edition = "2024"
 rust-version = "1.89"   # std::fs::File::lock (#133 Windows 対応)
 description = "EnchuDB engine — 紐ベース円柱エンジン本体。WAL / BlobStore / HLC primitive / keys / ACL まで含む、単独 DB として動く層。"
