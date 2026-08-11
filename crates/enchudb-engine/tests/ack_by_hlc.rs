@@ -36,6 +36,7 @@ fn cursor_hlc_ack_advances_watermark_and_reclaims() {
     eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
     eng.enable_sync_tables().unwrap();
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
+    eng.set_peer_id(42); // self（watermark の self 除外を検証するのに必要）
     let e = eng.entity_in("notes").unwrap();
 
     // 30 record を書いて bridge を待つ。
@@ -89,6 +90,18 @@ fn cursor_hlc_ack_advances_watermark_and_reclaims() {
         "先頭 row まで消化済みなら bridged 先端まで ack"
     );
     eng.reclaim_sync_ops();
+
+    // ── 自分自身の peer row は watermark を固定しない ────────────────────────
+    // （過去の self-ack 経路の残骸などで self row が古い lsn を持っていても、
+    //  他 peer の消化が進めば reclaim は回る — 自著 record を「持っている」のは自明）
+    let self_peer = eng.peer_id();
+    assert_eq!(self_peer, 42);
+    eng.ack_sync(self_peer, 1).unwrap(); // 古い self row を捏造
+    assert_eq!(
+        eng.sync_watermark(),
+        acked2,
+        "self row の古い consumed_lsn が watermark を引き下げてはいけない"
+    );
 
     cleanup(&path);
 }

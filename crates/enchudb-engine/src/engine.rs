@@ -3483,13 +3483,27 @@ impl Engine {
         let peer_rows = self.entities_with_himo(peer_id_hid as u16);
         if peer_rows.is_empty() { return 0; }
 
+        // #149: 自分自身の peer row は watermark から除外する。 自分が自分の record を
+        // 「持っている」のは自明（著者本人）で、 self row は pull で前進する機会が無い
+        // ため、 一度でも作られると（過去の self-ack 経路の残骸等）min を永久に固定して
+        // reclaim を殺す（実機発現: watermark が古い self row に張り付いてリング満杯）。
+        let self_peer = self.peer_id();
+
         let mut min_lsn = u32::MAX;
+        let mut counted = false;
         for eid in peer_rows {
+            if self_peer != 0 {
+                if let Some(pid) = self.get_by_id(eid, peer_id_hid as u16) {
+                    if pid == self_peer { continue; }
+                }
+            }
             if let Some(v) = self.get_by_id(eid, consumed_lsn_hid as u16) {
+                counted = true;
                 if v < min_lsn { min_lsn = v; }
             }
         }
-        if min_lsn == u32::MAX { 0 } else { min_lsn }
+        if !counted { return 0; }
+        min_lsn
     }
 
     /// 0.7.0 (Phase 4): `_sync_ops` の `lsn < watermark` row を削除する。
