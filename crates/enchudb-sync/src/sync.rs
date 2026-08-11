@@ -201,41 +201,75 @@ impl Syncer {
         }
     }
 
-    /// engine の WAL を読んで HlcStore に LWW entry を再構築する。
+    /// engine の WAL と `_sync_ops` を読んで HlcStore に LWW entry を再構築する。
     /// `Syncer::new` 内から呼ばれる。 Delete は sentinel (`u16::MAX`) で残す
     /// (= tombstone) ので、 後で来る古い HLC の Tie/Untie/Content が `apply_one`
     /// 内の tombstone check で skip される。
+    ///
+    /// #154: WAL だけでは足りない。 WAL ring は bridge 済み領域を fold する
+    /// (`Engine::wal_fold_safe`) ので、 **fold された record の HLC は reopen 後の
+    /// hydrate で復元されない**。 その状態で cursor を持たない caller が `Hlc::ZERO`
+    /// から pull すると、 相手 ring の陳腐 record が「未知」と判定されて再 apply され、
+    /// ローカルのより新しい行が巻き戻る (tombstone の記憶も消えるので削除済み entity の
+    /// 復活にもなる)。 fold で WAL から消えた record は bridge 先の `_sync_ops`
+    /// (永続) に残っているので、 そちらも歩く。
     fn hydrate_hlc_store(&self, engine: &Engine) {
-        let Some(wal) = engine.oplog_arc() else { return };
         let store = engine.hlc_store();
-        for rec in wal.iter_committed() {
-            match &rec.op {
-                DecodedOp::Tie { eid, himo_id, .. }
-                | DecodedOp::Untie { eid, himo_id } => {
-                    store.force_set(*eid, *himo_id, rec.hlc);
-                }
-                DecodedOp::Delete { eid } => {
-                    store.force_set(*eid, u16::MAX, rec.hlc);
-                }
-                DecodedOp::Content { eid, key, .. } => {
-                    let key_hash = enchudb_oplog::content_key_hash15(key);
-                    store.force_set(*eid, key_hash | 0x8000, rec.hlc);
-                }
-                DecodedOp::TieNamed { eid, himo_name, .. } => {
-                    // 0.9.0: 名前を local hid に解決できる場合のみ LWW entry を張る
-                    // (未定義 = local に一度も届いていない himo は hydrate 不要)。
-                    if let Some(hid) = engine.himo_id(himo_name) {
-                        store.force_set(*eid, hid as u16, rec.hlc);
-                    }
-                }
-                DecodedOp::TieLeaf { eid, himo_name, .. } => {
-                    // 0.12.0 (#88): Leaf も名前で hid 解決して LWW entry を張る (TieNamed と同扱い)。
-                    if let Some(hid) = engine.himo_id(himo_name) {
-                        store.force_set(*eid, hid as u16, rec.hlc);
-                    }
-                }
-                DecodedOp::Commit | DecodedOp::Vocab { .. } => {}
+        // 1. WAL の生存範囲 (fold されていない分)
+        if let Some(wal) = engine.oplog_arc() {
+            for rec in wal.iter_committed() {
+                Self::hydrate_one(engine, store, &rec);
             }
+        }
+        // 2. #154: bridge 先の `_sync_ops` (fold 済み record はここにしか残っていない)
+        for payload in engine.pending_sync_ops(0) {
+            if let Some(rec) = enchudb_oplog::oplog::decode_sync_ops_payload(&payload) {
+                Self::hydrate_one(engine, store, &rec);
+            }
+        }
+    }
+
+    /// hydrate の 1 record 分。 2 つの source (WAL / `_sync_ops`) から呼ばれるので
+    /// **monotonic max** (`try_set`) で merge する — 片方の古い entry が
+    /// もう片方の新しい entry を潰さないため (旧実装は単一 source 前提の `force_set`)。
+    ///
+    /// #154: eid は必ず `resolve_remote_eid_existing` を通す。 `_sync_ops` の record は
+    /// **逆写像で元 owner の世界番号に宛名が書き戻されている** (request10 / #76) ため、
+    /// 生の eid を key にすると apply 側 (= local eid で lookup) と一致せず、
+    /// hydrate したのに LWW が効かないという silent な取りこぼしになる。
+    /// 写像は `.eidmap` で永続化されているので reopen 後も引ける。 写像が無い
+    /// foreign eid は「local に一度も届いていない entity」なので hydrate 不要。
+    fn hydrate_one(engine: &Engine, store: &HlcStore, rec: &enchudb_oplog::oplog::Record) {
+        let Some(local_eid) = (match &rec.op {
+            DecodedOp::Tie { eid, .. }
+            | DecodedOp::Untie { eid, .. }
+            | DecodedOp::Delete { eid }
+            | DecodedOp::Content { eid, .. }
+            | DecodedOp::TieNamed { eid, .. }
+            | DecodedOp::TieLeaf { eid, .. } => engine.resolve_remote_eid_existing(*eid),
+            DecodedOp::Commit | DecodedOp::Vocab { .. } => None,
+        }) else {
+            return;
+        };
+        match &rec.op {
+            DecodedOp::Tie { himo_id, .. } | DecodedOp::Untie { himo_id, .. } => {
+                store.try_set(local_eid, *himo_id, rec.hlc);
+            }
+            DecodedOp::Delete { .. } => {
+                store.try_set(local_eid, u16::MAX, rec.hlc);
+            }
+            DecodedOp::Content { key, .. } => {
+                let key_hash = enchudb_oplog::content_key_hash15(key);
+                store.try_set(local_eid, key_hash | 0x8000, rec.hlc);
+            }
+            // 0.9.0 / 0.12.0 (#88): 名前を local hid に解決できる場合のみ LWW entry を
+            // 張る (未定義 = local に一度も届いていない himo は hydrate 不要)。
+            DecodedOp::TieNamed { himo_name, .. } | DecodedOp::TieLeaf { himo_name, .. } => {
+                if let Some(hid) = engine.himo_id(himo_name) {
+                    store.try_set(local_eid, hid as u16, rec.hlc);
+                }
+            }
+            DecodedOp::Commit | DecodedOp::Vocab { .. } => {}
         }
     }
 
