@@ -2,38 +2,38 @@
 
 **Embedded graph engine with multi-condition AND in nanoseconds.**
 
-紐 (himo) ベースの円柱エンジンを中核に据えた組み込み DB。単一ファイル mmap、LockFreeCylinder (値 → eid バケット) で **lookup decision が ns 級**、ロックフリー並行 read。結果の返却は memcpy 律速で結果サイズに比例 (µs スケール、物理限界)。
+An embedded database built around a *himo* (紐, "cord")-based cylinder engine. Single-file mmap, and a LockFreeCylinder (value → eid buckets) makes the **lookup decision ns-scale** with lock-free concurrent reads. Returning results is memcpy-bound and proportional to result size (µs scale — the physical floor).
 
-その上に **schema / SQL / FFI / 全文検索 / RAG / P2P sync / transport** を積めるワークスペース。
+On top of it you can stack **schema / SQL / FFI / full-text search / RAG / P2P sync / transport**, all in one workspace.
 
-## なぜ
+## Why
 
-- **SQLite より速い lookup**: LockFreeCylinder で値 → eid が ns、多条件 AND がバケット交差で爆速
-- **Rocks / Lmdb と違って relations 持てる**: 紐 + 円柱で entity 間を辿れる (ref 列 + バケット逆引き)
-- **Append-only oplog + HLC**: P2P sync (`enchudb-sync`) が built-in、partial sync (`SubscriptionFilter`) も
-- **メモリフットプリント小**: mmap 単一ファイル、ページキャッシュ依存
+- **Faster lookups than SQLite**: LockFreeCylinder resolves value → eid in ns, and multi-condition AND is just a bucket intersection.
+- **Relations, unlike Rocks / LMDB**: himo + cylinder let you traverse between entities (ref columns + reverse bucket lookup).
+- **Append-only oplog + HLC**: P2P sync (`enchudb-sync`) is built in, including partial sync (`SubscriptionFilter`).
+- **Small memory footprint**: a single mmap file that leans on the OS page cache.
 
 ## Workspace
 
-| Crate | 役割 | meta crate での opt-in |
+| Crate | Role | Opt-in from the meta crate |
 |---|---|---|
-| [`enchudb-oplog`](./crates/enchudb-oplog) | oplog wire primitives (Hlc / PeerId / EntityId + record)。engine / sync / transport の共通 primitive | always |
-| [`enchudb-engine`](./crates/enchudb-engine) | コアストレージエンジン。Column + LockFreeCylinder + oplog | always |
-| [`enchudb-schema`](./crates/enchudb-schema) | **native API**。 仮想 2D テーブル + himo_id pre-resolve + schema 永続化 | always |
-| [`enchudb-sync`](./crates/enchudb-sync) | HLC-LWW Syncer、ShardRouter、SubscriptionFilter | always |
-| [`enchudb-transport`](./crates/enchudb-transport) | HTTP relay / WebSocket push hub | 直接依存 |
-| [`enchudb-textsearch`](./crates/enchudb-textsearch) | ngram の上に乗るテキスト検索ポリシー。候補 doc id + `.contains()` 検証で正確な部分一致 | 直接依存 |
-| [`enchudb-ngram`](./crates/enchudb-ngram) | bigram 転置インデックスの index プリミティブ (posting → intersect → 候補 doc id)、mmap 永続化 | 直接依存 |
-| [`enchudb-rag`](./crates/enchudb-rag) | RAG ストア。メタフィルタ先行 + brute force cosine、ANN 不要 | 直接依存 |
-| [`enchudb-sql`](./crates/enchudb-sql) | SQLite 上位互換の SQL frontend (CRUD + ORDER BY / LIMIT / 範囲 / IS NULL / INSERT OR REPLACE)、 **schema 永続化** | `features = ["sql"]` |
-| [`enchudb-ffi`](./crates/enchudb-ffi) | SQLite 風 C ABI 12 関数、`cdylib + staticlib`、Python / Node / Swift から叩ける土台 | `features = ["ffi"]` |
-| [`enchudb-cli`](./crates/enchudb-cli) | `enchu` REPL。 `query_lang` 構文 + dot command で engine を直接叩く (SQL 経由しない) | `cargo install --path crates/enchudb-cli` |
+| [`enchudb-oplog`](./crates/enchudb-oplog) | oplog wire primitives (Hlc / PeerId / EntityId + record). Shared primitive for engine / sync / transport | always |
+| [`enchudb-engine`](./crates/enchudb-engine) | Core storage engine. Column + LockFreeCylinder + oplog | always |
+| [`enchudb-schema`](./crates/enchudb-schema) | **Native API.** Virtual 2D tables + himo_id pre-resolution + persisted schema | always |
+| [`enchudb-sync`](./crates/enchudb-sync) | HLC-LWW Syncer, ShardRouter, SubscriptionFilter | always |
+| [`enchudb-transport`](./crates/enchudb-transport) | HTTP relay / WebSocket push hub | direct dep |
+| [`enchudb-textsearch`](./crates/enchudb-textsearch) | Text-search policy on top of ngram. Candidate doc ids + `.contains()` verification for exact substring matching | direct dep |
+| [`enchudb-ngram`](./crates/enchudb-ngram) | bigram inverted-index primitive (posting → intersect → candidate doc ids), mmap-persisted | direct dep |
+| [`enchudb-rag`](./crates/enchudb-rag) | RAG store. Metadata filter first + brute-force cosine, no ANN | direct dep |
+| [`enchudb-sql`](./crates/enchudb-sql) | SQLite-superset SQL frontend (CRUD + ORDER BY / LIMIT / ranges / IS NULL / INSERT OR REPLACE), **persisted schema** | `features = ["sql"]` |
+| [`enchudb-ffi`](./crates/enchudb-ffi) | SQLite-style C ABI (12 functions), `cdylib + staticlib`; the base for calling from Python / Node / Swift | `features = ["ffi"]` |
+| [`enchudb-cli`](./crates/enchudb-cli) | The `enchu` REPL. Drives the engine directly via `query_lang` syntax + dot commands (does **not** go through SQL) | `cargo install --path crates/enchudb-cli` |
 
-各 sub-crate の `README.md` に詳細あり。Node.js バインディングは独立 repo [`mutafika/enchu-extend`](https://github.com/mutafika/enchu-extend)。
+Each sub-crate has its own `README.md` with details. Node.js bindings live in a separate repo, [`mutafika/enchu-extend`](https://github.com/mutafika/enchu-extend).
 
 ## Quick start
 
-推奨は **schema 層**。 仮想 2D テーブルを宣言して CRUD、 schema は DB ファイル内に永続化されるので reopen 時に CREATE 不要。
+The recommended entry point is the **schema layer**. Declare virtual 2D tables and do CRUD; the schema is persisted inside the DB file, so no CREATE is needed on reopen.
 
 ```rust
 use enchudb::schema::Database;
@@ -56,14 +56,14 @@ let hits = users.where_eq("age", 30i64)
     .find()?;
 ```
 
-`build()` で col → himo_id が pre-resolve されるので、 hot path の string lookup は内部で消える。 「最適化したいから engine 直叩き」は通常不要 (v0.3.0 で schema 層を zero-cost 化済み)。
+`build()` pre-resolves col → himo_id, so the hot-path string lookup disappears internally. "Drop to the engine for performance" is normally unnecessary (the schema layer has been zero-cost since v0.3.0).
 
-group / filter される low-cardinality 列 (`dept` / `status` / カテゴリ等) には `.cardinality(n)` で distinct 値数の hint を渡せる。 その列を group key にした集計 (`group_sum` / `group_min` / `group_max` / `histogram`) が dense + 並列 fast path に乗る (未指定だと HashMap fallback、 [#46](https://github.com/Mutafika/enchudb/issues/46))。 値の上限ではなく hint なので超過しても tie 可能。
+For low-cardinality columns that you group / filter on (`dept` / `status` / categories), pass a hint of the distinct-value count via `.cardinality(n)`. Aggregations that use that column as the group key (`group_sum` / `group_min` / `group_max` / `histogram`) then take a dense, parallel fast path (without the hint they fall back to a HashMap, [#46](https://github.com/Mutafika/enchudb/issues/46)). It is a hint, not a cap — you can still tie values beyond it.
 
 ```rust
 db.table("events")
     .number("id")
-    .number("kind").cardinality(16)   // group / filter される低カーディナリティ列
+    .number("kind").cardinality(16)   // low-cardinality column you group / filter on
     .number("ts")
     .primary_key("id")
     .build()?;
@@ -73,12 +73,14 @@ reopen:
 
 ```rust
 let db = Database::open("/tmp/app.db")?;
-let users = db.get_table("users").unwrap();   // CREATE 不要、schema 復元済み
+let users = db.get_table("users").unwrap();   // no CREATE needed, schema already restored
 ```
 
-詳細は [`crates/enchudb-schema/README.md`](./crates/enchudb-schema/README.md)。
+Apps that store lots of large text (`Leaf` himos — article bodies, tool output, long notes) and would overflow the default 512 MiB leaf region can size it explicitly with `Database::create_growable_with_leaf(path, max_entities, leaf_data_size)` ([#109](https://github.com/Mutafika/enchudb/issues/109)).
 
-### Engine 層直叩き (graph 操作 / 自前 dispatch がしたい時)
+See [`crates/enchudb-schema/README.md`](./crates/enchudb-schema/README.md) for the full API.
+
+### Engine layer (for graph ops / custom dispatch)
 
 ```rust
 use enchudb::{Engine, ValueType};
@@ -88,7 +90,7 @@ db.define_himo("age", ValueType::Number, 100);
 
 let alice = db.entity();
 db.tie(alice, "age", 30);
-db.tie_text(alice, "city", "東京");
+db.tie_text(alice, "city", "Tokyo");
 
 db.rebuild();
 let result = db.query(&[("age", 30)]);
@@ -115,10 +117,10 @@ if let Output::Rows { rows, columns } = db.execute("
 drop(db);
 
 let mut db = Database::open("/tmp/notif.db")?;
-assert_eq!(db.list_tables().len(), 1);    // schema 復元済み
+assert_eq!(db.list_tables().len(), 1);    // schema already restored
 ```
 
-非 SQL コンシューマは `Database::list_tables()` で schema を読める。
+Non-SQL consumers can read the schema via `Database::list_tables()`.
 
 ### C ABI (`features = ["ffi"]`)
 
@@ -143,23 +145,23 @@ enchudb_result_free(r);
 enchudb_close(db);
 ```
 
-ヘッダ: `crates/enchudb-ffi/include/enchudb.h`、デモ: `crates/enchudb-ffi/examples/demo.c`。
+Header: `crates/enchudb-ffi/include/enchudb.h`; demo: `crates/enchudb-ffi/examples/demo.c`.
 
 ### CLI (`enchu`)
 
-`sqlite3` 風 REPL で engine を直接叩く。 `query_lang` 構文 (`age:30 city:"東京" | group dept | sum salary`) と dot command (`.himos` / `.entity <eid>` / `.dump` …)。 **SQL は経由しない**。
+A `sqlite3`-style REPL that drives the engine directly. It speaks `query_lang` syntax (`age:30 city:"Tokyo" | group dept | sum salary`) and dot commands (`.himos` / `.entity <eid>` / `.dump` …). It does **not** go through SQL.
 
 ```bash
 cargo install --path crates/enchudb-cli
-# binary 名は `enchu`
+# the binary is named `enchu`
 
-enchu --create --tiny /tmp/state.db          # 新規 DB (1024 行 preset)
-enchu /tmp/state.db                          # REPL に入る
+enchu --create --tiny /tmp/state.db          # new DB (1024-row preset)
+enchu /tmp/state.db                          # enter the REPL
 enchu /tmp/state.db -e 'age:30 | count'      # one-shot
 enchu --readonly /tmp/state.db               # read-only open
 ```
 
-REPL の例:
+A REPL session:
 
 ```
 enchu> .define name tag
@@ -181,9 +183,9 @@ eid=0
 enchu> .quit
 ```
 
-create preset: `--default` / `--compact` / `--growable` (default) / `--tiny`。
+create presets: `--default` / `--compact` / `--growable` (default) / `--tiny`.
 
-### 耐久性 (oplog)
+### Durability (oplog)
 
 ```rust
 let db = Engine::create_concurrent_with_oplog("/tmp/my.db", 256 * 1024 * 1024)?;
@@ -191,7 +193,7 @@ let db = Engine::create_concurrent_with_oplog("/tmp/my.db", 256 * 1024 * 1024)?;
 let e = db.entity();
 db.tie_async(e, "age", 30);
 db.oplog_sync()?;     // fsync + msync
-// または oplog_commit() で背景 fsync (Async モード)
+// or oplog_commit() for a background fsync (Async mode)
 ```
 
 ### RAG (`enchudb-rag`)
@@ -213,78 +215,74 @@ let hits = store.search(
 )?;
 ```
 
-個人スケール (〜1M chunks) + メタフィルタ先行で sub-ms RAG。実測は [`crates/enchudb-rag/examples/`](./crates/enchudb-rag/examples) を参照。
+Sub-ms RAG at personal scale (~1M chunks) by filtering on metadata first. For measured numbers see [`crates/enchudb-rag/examples/`](./crates/enchudb-rag/examples).
 
-## ベンチマーク
+## Benchmarks
 
-再現コマンド・実測値・ハードウェア記述は [`benches/README.md`](./benches/README.md) に集約。誇大な数字を README に書かない方針 — 興味ある人は自分で走らせて検証できる。
+Reproduction commands, measured numbers, and hardware are collected in [`benches/README.md`](./benches/README.md). We keep inflated numbers out of the README — anyone curious can run them and verify.
 
 ```bash
 cargo bench --bench core
 cargo run --release --example vs_db
 ```
 
-## アーキテクチャ要点
+## Architecture
 
-- **紐 (himo)**: entity に張る属性 = 索引の単位、 任意の文字列名 (UTF-8)
-- **Column**: source of truth、 mmap 永続化、 `Column[himo][eid] = value`
-- **LockFreeCylinder**: 値ごとの eid バケット、 値 → バケット O(1)、 append-only + epoch で lock-free 並行 read、 cylinder slice + Column filter で多条件 AND
-- **oplog** (`enchudb-oplog`): crash consistency、 背景 fsync、 リングバッファ再利用
-- **仮想 2D テーブル層** (`enchudb-schema`): N 個の紐を 1 つの table 名で束ねる、 col → himo_id を pre-resolve、 schema は DB ファイル内に永続化。 SQL frontend と FFI もこの上に乗る。
+- **himo**: an attribute attached to an entity — the unit of indexing, named by any UTF-8 string.
+- **Column**: the source of truth, mmap-persisted, `Column[himo][eid] = value`.
+- **LockFreeCylinder**: per-value eid buckets, value → bucket in O(1), append-only + epoch for lock-free concurrent reads; a cylinder slice + a Column filter gives multi-condition AND.
+- **oplog** (`enchudb-oplog`): crash consistency, background fsync, ring-buffer reuse.
+- **Virtual 2D table layer** (`enchudb-schema`): bundles N himos under one table name, pre-resolves col → himo_id, and persists the schema inside the DB file. The SQL frontend and FFI sit on top of this.
 
-メンタルモデル: engine 全体は **モンジャラ** (蔓 = 紐、 entity = 蔓の交差点に隠れた本体)。 1 つの紐の中身は **2D table** (値 × eid バケット)。
+Mental model: the whole engine is one big tangle of vines — the vines are himo, and an entity is the body hidden where vines cross. A single himo's contents form a 2D table (value × eid buckets).
 
-各 sub-crate の `README.md` に詳細あり。`docs/` に architecture / concurrency / migration 各種ノートも。 用語を素早く引きたい場合は [`docs/glossary.md`](docs/glossary.md) (layer 別 索引 + 混同しやすい同形語の disambiguation)。
+Each sub-crate has its own `README.md` with details, and `docs/` holds architecture / concurrency / migration notes. For a quick term lookup, see [`docs/glossary.md`](docs/glossary.md) (a per-layer index plus disambiguation of easily-confused homonyms).
 
-## ファイル構成
+## File layout
 
 ```
-{path}         メイン DB (mmap、 FILE_VERSION 7、 v4/v5/v6 は read 互換)
-{path}.oplog   oplog (有効時、 sparse file)
-{path}.lock    writer 排他 sidecar (writer open 時に flock、 close で release)
-{path}.crc     region CRC (seal_integrity 時のみ)
-<blob_root>/   BlobStore (別ディレクトリ、 content-addressed、 大 blob 外出し用)
+{path}         main DB (mmap, FILE_VERSION 7; v4/v5/v6 are read-compatible)
+{path}.oplog   oplog (when enabled; sparse file)
+{path}.lock    writer-exclusion sidecar (flock on writer open, released on close)
+{path}.crc     region CRC (only when seal_integrity is used)
+<blob_root>/   BlobStore (separate directory, content-addressed, for offloading large blobs)
 ```
 
-## 並行アクセス
+## Concurrency
 
-「**writer 1 process + reader 無制限**」 の SQLite WAL 相当モデル。
+A SQLite-WAL-style model: **one writer process + unlimited readers**.
 
-| やりたい事 | API | lock | 同時 process |
+| Goal | API | lock | concurrent processes |
 |---|---|---|---|
-| 書く + 読む | `Engine::open_concurrent_with_oplog` / `Engine::open_standalone` | exclusive | 1 |
-| 読むだけ | `Engine::open_readonly` / `Database::open_readonly` | なし | 無制限 |
+| Write + read | `Engine::open_concurrent_with_oplog` / `Engine::open_standalone` | exclusive | 1 |
+| Read only | `Engine::open_readonly` / `Database::open_readonly` | none | unlimited |
 
-writer は `.db.lock` sidecar に `flock(LOCK_EX)` を engine 寿命中保持。 2 つ目の writer は drop されるまで block (sqlite default 動作と同じ)。 readonly は lock を取らないので writer と共存可、 write API を呼ぶと panic で即気付く。
+The writer holds `flock(LOCK_EX)` on the `.db.lock` sidecar for the engine's lifetime. A second writer blocks until the first is dropped (same as sqlite's default). Readonly opens take no lock, so they coexist with the writer; calling a write API on one panics so you notice immediately.
 
-GUI app + CLI を同 DB で共存する場合は **GUI が `open_readonly`、 CLI が subprocess として writer で開く**のが推奨パターン。 詳細は [`docs/concurrency.md`](./docs/concurrency.md)。
+Reading variable-length text (`Leaf` / text himos) while a writer is live should go through `Engine::get_text_owned`, which returns an owned `Vec<u8>` via a per-slot gen-seqlock (the borrowing `get_text` is for single-threaded / quiesced access). This is what makes cross-process readonly reads of live text torn-read-safe ([#106](https://github.com/Mutafika/enchudb/issues/106) / [#113](https://github.com/Mutafika/enchudb/issues/113)).
 
-### peer 間の書き込み (sync)
+For a GUI app + CLI sharing one DB, the recommended pattern is **the GUI opens `open_readonly` and the CLI opens as a writer subprocess**. See [`docs/concurrency.md`](./docs/concurrency.md).
 
-0.11 から **multi-writer**: どの peer もどの entity にも書けて、 衝突はカード
-(himo) 単位の HLC LWW で解決する (= 同時書き込みは時間が解決する)。 同期は
-**論理収束** (op 交換で内容が同じ蔵書に収束する) であって物理レプリカではない。
-唯一の残存制約: **Ref 値が foreign entity のレプリカを指す write** は local に
-留まり peer に流れない (wire の u32 value に世界番号が入らないため、 wire 拡張の
-follow-up 待ち)。 〜0.10.x は per-entity single-writer (= author しか書けない)
-だった。
+### Writes between peers (sync)
+
+Since 0.11, EnchuDB is **multi-writer**: any peer can write to any entity, and conflicts are resolved per card (himo) by HLC LWW (concurrent writes are settled by time). Convergence is **logical** (exchanging ops converges the contents) rather than physical replication. The one remaining constraint: **a write whose Ref value points at a replica of a foreign entity** stays local and does not propagate to peers (the wire u32 value has no room for a world id; a wire extension is a follow-up). Up to 0.10.x it was per-entity single-writer (only the author could write).
 
 ## Testing
 
 ```bash
-# unit + integration (~400 件、 1 分程度)
+# unit + integration (~400 tests, ~1 min)
 cargo test --workspace
 
-# 重いスケーリング・ストレステスト (手動実行)
+# heavy scaling / stress tests (run manually)
 cargo test --workspace -- --ignored
 
 # bench
 cargo bench --bench core
 ```
 
-## 開発状況
+## Project status
 
-0.x 段階。SemVer 1.0 未到達、 API / on-disk format に破壊的変更が入る可能性あり。 プロダクション利用は自己責任で。
+Still 0.x. Not at SemVer 1.0 yet; breaking changes to the API / on-disk format are possible. Use in production at your own risk.
 
 ## License
 
