@@ -3375,9 +3375,43 @@ impl Engine {
         let Some(wal) = self.oplog.as_ref() else {
             return true;
         };
-        self.sync_ops_offset
-            .load(std::sync::atomic::Ordering::Acquire)
-            >= wal.head()
+        let offset = self
+            .sync_ops_offset
+            .load(std::sync::atomic::Ordering::Acquire);
+        if offset >= wal.head() {
+            return true;
+        }
+        // offset < head でも、 WAL が「Commit 1 個すら append できない」満杯
+        // （append_dead）で、 かつ bridge が最後の committed group まで読み切って
+        // いるなら、 残る tail は「閉じの Commit が満杯で書けなかった孤児 group」。
+        // 今後 commit される可能性がゼロ（append が全て失敗する）なので、 recovery
+        // からも sync からも永久に不可視 = 保持する意味が無く、 畳んでよい。
+        //
+        // この例外が無いと、 commit group の途中で WAL が満杯に達した瞬間に
+        //   閉じ Commit が書けない → committed_end < head 固定 → fold 恒久不能
+        //   → 以後の append 全滅（無音 drop）→ 新規変更が sync から永久欠落
+        //   → reopen のたび旧 backlog だけを全量再 bridge
+        // という**自己修復不能の brick** になる（実機発現）。 tail に未 bridge の
+        // committed group が残っている間（= ring 満杯の backpressure 中）は、 従来
+        // どおり畳まない。
+        if wal.append_dead() {
+            let (records, _) = wal.iter_committed_from_with_offsets(offset);
+            return records.is_empty();
+        }
+        false
+    }
+
+    /// WAL がこれ以上いかなる record も受け付けない満杯か（観測用）。
+    /// oplog 未使用なら false。 `wal_fold_safe` の死区間例外と対で、 呼び出し側が
+    /// 「配布が止まっている」を無音にしないための可視化に使う。
+    pub fn wal_append_dead(&self) -> bool {
+        self.oplog.as_ref().is_some_and(|w| w.append_dead())
+    }
+
+    /// WAL の残り append 可能バイト数（観測用）。 oplog 未使用なら `u64::MAX`
+    /// （= 逼迫という概念が無い）。
+    pub fn wal_free_bytes(&self) -> u64 {
+        self.oplog.as_ref().map_or(u64::MAX, |w| w.free_bytes())
     }
 
     /// 0.7.0 (Phase 4): peer の watermark を更新する。 Syncer が peer から ack を
@@ -7614,6 +7648,10 @@ impl Engine {
                 let engine: &Engine = unsafe { &*(engine_addr as *const Engine) };
                 let fsync_interval = Duration::from_millis(100);
                 let mut last_fsync = Instant::now();
+                // WAL append 失敗（満杯等）の warn-once。 失敗した record は table
+                // 本体には apply 済みだが sync には二度と流れない — これが無音だと
+                // 「配布だけが死んでいる」を誰も観測できない（実機発現）。
+                let mut warned_wal_append = false;
 
                 loop {
                     let mut drained_any = false;
@@ -7625,11 +7663,25 @@ impl Engine {
                         let mut batch: Vec<enchudb_oplog::oplog::OwnedOp> = Vec::new();
                         while let Some(rec) = wq.pop() { batch.push(rec); }
                         if !batch.is_empty() {
-                            let _ = wal.append_many(&batch);
                             // append 失敗でも進める: barrier の意味は「queue に
                             // 残っていない」であり、 失敗 record の再送は無い
-                            wal_append_count_for_thread
-                                .fetch_add(batch.len() as u64, Ordering::Release);
+                            match wal.append_many(&batch) {
+                                Ok(_) => {
+                                    wal_append_count_for_thread
+                                        .fetch_add(batch.len() as u64, Ordering::Release);
+                                }
+                                Err(e) => {
+                                    if !warned_wal_append {
+                                        warned_wal_append = true;
+                                        eprintln!(
+                                            "[enchudb] warning: WAL append failed ({e}) — \
+                                             {} record(s) dropped from the sync path \
+                                             (tables are still updated locally)",
+                                            batch.len()
+                                        );
+                                    }
+                                }
+                            }
                             drained_any = true;
                         }
                     }
@@ -7717,9 +7769,24 @@ impl Engine {
                             let mut batch: Vec<enchudb_oplog::oplog::OwnedOp> = Vec::new();
                             while let Some(rec) = wq.pop() { batch.push(rec); }
                             if !batch.is_empty() {
-                                let _ = wal.append_many(&batch);
-                                wal_append_count_for_thread
-                                    .fetch_add(batch.len() as u64, Ordering::Release);
+                                match wal.append_many(&batch) {
+                                    Ok(_) => {
+                                        wal_append_count_for_thread
+                                            .fetch_add(batch.len() as u64, Ordering::Release);
+                                    }
+                                    Err(e) => {
+                                        // shutdown 経路は一度しか通らないので gate の
+                                        // 再セットは不要（main loop 側と共有の warn-once）
+                                        if !warned_wal_append {
+                                            eprintln!(
+                                                "[enchudb] warning: WAL append failed ({e}) — \
+                                                 {} record(s) dropped from the sync path \
+                                                 (tables are still updated locally)",
+                                                batch.len()
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                         while let Some(op) = q_for_thread.pop() {

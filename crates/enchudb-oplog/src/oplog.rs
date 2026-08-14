@@ -1019,6 +1019,26 @@ impl OpLog {
         self.pending_writes.load(Ordering::Acquire)
     }
 
+    /// これ以上**いかなる record も** append できない満杯か。
+    ///
+    /// 最小の record は payload 0 の Commit（= REC_HEADER_SIZE bytes）なので、
+    /// それすら入らない残量なら、 この WAL は畳まれるまで一切前進できない。
+    /// commit group の途中でこの状態に達すると、 閉じの Commit も書けず tail は
+    /// **永久に未 commit** のまま残る（recovery からも sync bridge からも不可視）。
+    /// その tail を「畳んでよい死区間」と判定するために使う
+    /// （engine の `wal_fold_safe` 参照）。
+    pub fn append_dead(&self) -> bool {
+        let head = self.head.load(Ordering::Acquire);
+        head + REC_HEADER_SIZE as u64 > self.capacity
+    }
+
+    /// 残り append 可能バイト数（観測用）。 `append_dead` と対で、 呼び出し側が
+    /// 「WAL がどれだけ逼迫しているか」を可視化するのに使う。
+    pub fn free_bytes(&self) -> u64 {
+        self.capacity
+            .saturating_sub(self.head.load(Ordering::Acquire))
+    }
+
     /// auto_reset を切り替え(Syncer attached の engine では false にする)。
     /// false にすると ring buffer reset が発火しなくなり、WAL は使い切るまで線形成長する。
     /// v32 の sync 前に消える race を防ぐ用途。
