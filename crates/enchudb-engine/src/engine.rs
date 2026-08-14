@@ -3453,9 +3453,16 @@ impl Engine {
     /// なっている。 これを consumed_lsn に写して reclaim を回せるようにする。
     ///
     /// `_sync_ops` の生存 row を lsn 降順に走査し、 `hlc <= cursor` の最初の
-    /// (= 最大 lsn の) row で `ack_sync(peer, lsn)` する。 生存 row 全てが
-    /// cursor 以下なら bridged 済み先端 (`current_sync_lsn`) まで ack する。
+    /// (= 最大 lsn の) row で `ack_sync(peer, lsn)` する。
     /// 該当が無い (cursor が最古の生存 row より古い) 場合は ack せず 0 を返す。
+    ///
+    /// **ack するのは必ず「実在を確認した生存 row の lsn」**であって、 bridge 先端
+    /// (`current_sync_lsn`) ではない。 先端まで ack すると、 生存 row の snapshot を
+    /// 取った後に bridge が append した record — cursor より新しい = **まだ pull されて
+    /// いない record** — まで「消化済み」と記録され、 `reclaim_sync_ops` が peer に
+    /// 届く前に回収してしまう (失うと再著者でしか復旧しない)。 rows[0] の lsn で
+    /// 止めても生存リングは同じだけ reclaim でき (`lsn < watermark` の delete なので
+    /// rows[0] 未満は全て対象)、 取りこぼした先端は次周回の cursor が拾う。
     ///
     /// 前提: `_sync_ops` は自 WAL の bridge で lsn と hlc が単調 (gossip の relayed
     /// append で foreign HLC が混ざる構成では、 降順走査の早期打ち切りにより
@@ -3489,15 +3496,16 @@ impl Engine {
         }
 
         let mut ack_lsn: u32 = 0;
-        for (i, (lsn, eid)) in rows.iter().enumerate() {
+        for (lsn, eid) in rows.iter() {
             let Some(payload_vid) = self.get_by_id(*eid, payload_hid) else { continue };
             let bytes = self.vocab.get(payload_vid).to_vec();
             let Some(rec) = enchudb_oplog::oplog::decode_sync_ops_payload(&bytes) else {
                 continue;
             };
             if rec.hlc <= cursor {
-                // 先頭 (最新) row から consumed なら、 bridged 済み先端まで全消化。
-                ack_lsn = if i == 0 { self.current_sync_lsn() } else { *lsn };
+                // 実在を確認したこの row の lsn で止める。 先端 (`current_sync_lsn`) まで
+                // 進めると snapshot 後に bridge された未 pull record まで ack される。
+                ack_lsn = *lsn;
                 break;
             }
         }
