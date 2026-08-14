@@ -3413,6 +3413,66 @@ impl Engine {
         Ok(())
     }
 
+    /// #149: pull cursor (HLC) に基づく ack。 relay/gateway 経路には明示 ack が
+    /// 無いが、 pull の since カーソルは「適用済み record の max HLC」からしか
+    /// 前進しないので、 それ自体が **「この peer はここまで消化済み」の到達証明**に
+    /// なっている。 これを consumed_lsn に写して reclaim を回せるようにする。
+    ///
+    /// `_sync_ops` の生存 row を lsn 降順に走査し、 `hlc <= cursor` の最初の
+    /// (= 最大 lsn の) row で `ack_sync(peer, lsn)` する。 生存 row 全てが
+    /// cursor 以下なら bridged 済み先端 (`current_sync_lsn`) まで ack する。
+    /// 該当が無い (cursor が最古の生存 row より古い) 場合は ack せず 0 を返す。
+    ///
+    /// 前提: `_sync_ops` は自 WAL の bridge で lsn と hlc が単調 (gossip の relayed
+    /// append で foreign HLC が混ざる構成では、 降順走査の早期打ち切りにより
+    /// **安全側 (小さめ) の lsn** に落ちる — 過剰 reclaim はしない)。
+    /// 定常状態では cursor が先端付近にあるため走査は数 row で終わる。
+    pub fn ack_sync_up_to_hlc(
+        &self,
+        peer: enchudb_oplog::PeerId,
+        cursor: enchudb_oplog::Hlc,
+    ) -> Result<u32, String> {
+        if !self.sync_tables_enabled() {
+            return Err("sync tables not enabled (call enable_sync first)".into());
+        }
+        let lsn_hid = self.himo_id("_sync_ops.lsn").ok_or("missing _sync_ops.lsn")? as u16;
+        let payload_hid =
+            self.himo_id("_sync_ops.payload").ok_or("missing _sync_ops.payload")? as u16;
+
+        // 生存 row の (lsn, eid) を降順に。
+        let mut rows: Vec<(u32, u64)> = self
+            .entities_with_himo(lsn_hid)
+            .into_iter()
+            .filter_map(|eid| self.get_by_id(eid, lsn_hid).map(|lsn| (lsn, eid)))
+            .collect();
+        rows.sort_by(|a, b| b.0.cmp(&a.0));
+
+        // 生存 row 無し = reclaim するものが無い。 消化の証明が無いのに先端へ ack すると
+        // 「消化した」という嘘の記録になるので、 何もしない (後続の bridge を次の pull の
+        // cursor が越えたときに通常経路で ack される)。
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let mut ack_lsn: u32 = 0;
+        for (i, (lsn, eid)) in rows.iter().enumerate() {
+            let Some(payload_vid) = self.get_by_id(*eid, payload_hid) else { continue };
+            let bytes = self.vocab.get(payload_vid).to_vec();
+            let Some(rec) = enchudb_oplog::oplog::decode_sync_ops_payload(&bytes) else {
+                continue;
+            };
+            if rec.hlc <= cursor {
+                // 先頭 (最新) row から consumed なら、 bridged 済み先端まで全消化。
+                ack_lsn = if i == 0 { self.current_sync_lsn() } else { *lsn };
+                break;
+            }
+        }
+        if ack_lsn > 0 {
+            self.ack_sync(peer, ack_lsn)?;
+        }
+        Ok(ack_lsn)
+    }
+
     /// 0.7.0 (Phase 4): 全 peer の最小 consumed_lsn (= reclaim 安全点)。
     /// peer 0 件なら 0 を返す (= 「まだ誰も ack してない、 reclaim 不可」)。
     pub fn sync_watermark(&self) -> u32 {
@@ -3423,13 +3483,27 @@ impl Engine {
         let peer_rows = self.entities_with_himo(peer_id_hid as u16);
         if peer_rows.is_empty() { return 0; }
 
+        // #149: 自分自身の peer row は watermark から除外する。 自分が自分の record を
+        // 「持っている」のは自明（著者本人）で、 self row は pull で前進する機会が無い
+        // ため、 一度でも作られると（過去の self-ack 経路の残骸等）min を永久に固定して
+        // reclaim を殺す（実機発現: watermark が古い self row に張り付いてリング満杯）。
+        let self_peer = self.peer_id();
+
         let mut min_lsn = u32::MAX;
+        let mut counted = false;
         for eid in peer_rows {
+            if self_peer != 0 {
+                if let Some(pid) = self.get_by_id(eid, peer_id_hid as u16) {
+                    if pid == self_peer { continue; }
+                }
+            }
             if let Some(v) = self.get_by_id(eid, consumed_lsn_hid as u16) {
+                counted = true;
                 if v < min_lsn { min_lsn = v; }
             }
         }
-        if min_lsn == u32::MAX { 0 } else { min_lsn }
+        if !counted { return 0; }
+        min_lsn
     }
 
     /// 0.7.0 (Phase 4): `_sync_ops` の `lsn < watermark` row を削除する。
