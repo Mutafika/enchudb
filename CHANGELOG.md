@@ -67,6 +67,11 @@ cursor を持たない caller が `Hlc::ZERO` から pull すると、 相手 ri
 HLC は依然どこにも残らない。 完全な健全性には `HlcStore` 自体の永続化 (hlc_store.rs doc の
 "Phase D") が要る。 本 release は #154 の主経路 (fold 済み record) を塞ぐところまで。
 
+なお `ack_sync_up_to_hlc` の HLC → lsn 変換は、 **`_sync_ops` 内で lsn と HLC が単調**
+(自 WAL の bridge 順) であることを前提にしている。 gossip の relayed append で foreign HLC が
+混ざる構成では降順走査が早期に打ち切られ、 安全側 (小さめ) の lsn に落ちる — 過剰 reclaim は
+しない。
+
 ### Docs
 
 - README を日本語から英語へ全面書き換え (内容・構成は据え置き、 訳のみ)
@@ -131,6 +136,9 @@ K+1 件目で満杯 → cursor 据置」を繰り返すだけで、 K+1 件目�
 FAIL することを確認済み。
 
 ### Known limitation — ack が一切来ない構成では WAL が畳まれず full に至る (#149)
+
+> **→ 0.18.3 で解消済み** (`Engine::ack_sync_up_to_hlc` により pull cursor を到達証明として
+> reclaim が回る)。 以下は 0.18.2 時点の状況。
 
 backpressure の必然として、 **ack を呼ぶ主体がいない構成** (HttpRelay / gateway 越しの
 publish / pull のみ) では ring が永久に空かないため bridge が止まり続ける。 その間は
