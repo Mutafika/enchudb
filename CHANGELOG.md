@@ -19,11 +19,22 @@ on-disk format は v8 のまま不変、 公開 API は追加のみ、 migration
   reclaim が回る
 - `sync_watermark` から**自分自身の peer row を除外**。 自 peer の古い ack 残骸が
   watermark を固定し、 reclaim が一度も回らない状態を作っていた
+- ack するのは**実在を確認した生存 row の lsn** であって bridge 先端
+  (`current_sync_lsn`) ではない。 先端まで ack すると、 生存 row の snapshot を取った
+  後に bridge が append した record — cursor より新しい = **まだ pull されていない
+  record** — まで「消化済み」と記録され、 `reclaim_sync_ops` が peer に届く前に
+  回収してしまう (失うと再著者でしか復旧しない)。 成立条件は「相手が追いついている
+  状態で ack した最中に append が入る」 = 追いついた直後に burst が始まる瞬間
 
 実測: 過去の誤 ack 残骸 (consumed_lsn=25099) で固定されていた store で 24,575 行を解放、
 バックログ 2.4 万 record の bridge と blob 転送が再開。
 
-**検証**: `crates/enchudb-engine/tests/ack_by_hlc.rs` に回帰 1 本。
+**検証**: `crates/enchudb-engine/tests/ack_by_hlc.rs` に回帰 2 本 (写像の境界 = 中間 /
+先端 / 証明なし、 および並行 bridge 下で未 pull record を ack しないこと)。 後者は engine の
+consumer が 1ms 周期 + 実測数十 ms 遅れでまとめて流すため素の並行 write では窓を踏めず、
+生存 row 5000 (snapshot 走査を ms オーダーにする) + `transfer_oplog_to_sync_ops` の直接
+駆動で窓に当てている。 先端 ack に戻すと `acked=5004` (cursor より新しい record を ack)
+で FAIL することを確認済み。
 
 ### Fixed — WAL 満杯で commit group の tail が孤児化し自己修復不能になる
 
