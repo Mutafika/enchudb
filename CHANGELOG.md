@@ -3,6 +3,74 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.18.3 — 2026-08-14
+
+**0.18.2 の Known limitation (#149) の根治と、 それに伴って露出した sync 事故 2 件の修正。**
+ack を呼ぶ主体がいない relay / gateway 経路でも reclaim が回るようになり、 WAL 満杯で
+自己修復不能になる経路と、 reopen で LWW 記憶が消えて行が巻き戻る経路を塞いだ。
+on-disk format は v8 のまま不変、 公開 API は追加のみ、 migration 不要。
+
+### Fixed — ack が来ない経路で watermark が 0 固定になり ring が永久に空かない (#149)
+
+0.18.2 の Known limitation (「ack が一切来ない構成では WAL が畳まれず full に至る」) の根治。
+
+- `Engine::ack_sync_up_to_hlc` (新規 public): pull cursor (HLC) を consumed_lsn に写す。
+  pull 済み = 到達証明なので、 ack エンドポイントを持たない relay / gateway 経路でも
+  reclaim が回る
+- `sync_watermark` から**自分自身の peer row を除外**。 自 peer の古い ack 残骸が
+  watermark を固定し、 reclaim が一度も回らない状態を作っていた
+
+実測: 過去の誤 ack 残骸 (consumed_lsn=25099) で固定されていた store で 24,575 行を解放、
+バックログ 2.4 万 record の bridge と blob 転送が再開。
+
+**検証**: `crates/enchudb-engine/tests/ack_by_hlc.rs` に回帰 1 本。
+
+### Fixed — WAL 満杯で commit group の tail が孤児化し自己修復不能になる
+
+commit group の途中で WAL が「Commit 1 個すら append できない」満杯に達すると、 閉じの
+Commit が書けず tail が永久に未 commit のまま残る。 `committed_end < head` が固定されて
+`wal_fold_safe` が恒久 false になり、 fold 不能 → 以後の append 全滅 (consumer が無音 drop)
+→ 新規変更が sync から永久欠落 → reopen のたび旧 backlog だけを全量再 bridge、 という
+自己修復不能の brick になっていた (実運用で発現: ring 満杯の backpressure 中に大量登録
+burst が WAL を埋め切った)。
+
+- `OpLog::append_dead()` (最小 record も入らない満杯か) / `free_bytes()` (新規 public)
+- `wal_fold_safe` に「append_dead かつ committed 読み残しなし」の例外を追加。 その tail は
+  今後 commit され得ず recovery からも sync からも不可視なので畳んでよい。 余裕のある
+  書きかけ group の保護 (畳まない) は従来どおり
+- consumer の WAL append 失敗を warn-once で可視化 (無音 drop が今回の障害を数時間
+  観測不能にした) + 失敗 batch を append 数に計上しない
+
+**検証**: `crates/enchudb-engine/tests/wal_full_fold.rs` に回帰 3 本。 fold 例外を外すと
+恒久ブロックの assert で FAIL することを確認済み。
+
+### Fixed — hydrate が WAL fold 済み record を見ず reopen で LWW 記憶が消える (#154)
+
+`HlcStore` (LWW の記憶) は in-memory で、 `Syncer::new` の `hydrate_hlc_store` は engine WAL
+しか歩かない。 #150 の fold ゲート以降「bridge 済み record を WAL から fold する」のは正当な
+挙動になったが、 fold された record の HLC が reopen 後の hydrate で復元されない。 その状態で
+cursor を持たない caller が `Hlc::ZERO` から pull すると、 相手 ring の陳腐 record が「未知」と
+判定されて再 apply され、 **ローカルのより新しい行が古い値へ巻き戻る** (tombstone の記憶も
+消えるので削除済み entity の復活もあり得る)。 実機発現。
+
+- `hydrate_hlc_store` が WAL に加えて `_sync_ops` (bridge 先、 永続) も歩く。 fold で WAL から
+  消えた record の HLC はそこに残っている
+- eid は必ず `resolve_remote_eid_existing` を通す。 `_sync_ops` の record は逆写像で元 owner の
+  世界番号に宛名が書き戻されている (request10 / #76) ため、 生の eid を key にすると apply 側
+  (= local eid で lookup) と一致せず、 hydrate したのに LWW が効かない silent な取りこぼしになる
+- 2 source を merge するので `force_set` → `try_set` (monotonic max) に変更
+
+**検証**: `crates/enchudb-sync/tests/issue154_hydrate_after_fold.rs` に回帰 1 本。
+`_sync_ops` 走査を外した場合と eid 翻訳を外した場合の**両方で FAIL する**ことを確認済み。
+
+**既知の残ギャップ**: `_sync_ops` の row は ack 後に reclaim されるため、 reclaim 済み record の
+HLC は依然どこにも残らない。 完全な健全性には `HlcStore` 自体の永続化 (hlc_store.rs doc の
+"Phase D") が要る。 本 release は #154 の主経路 (fold 済み record) を塞ぐところまで。
+
+### Docs
+
+- README を日本語から英語へ全面書き換え (内容・構成は据え置き、 訳のみ)
+
 ## 0.18.2 — 2026-08-11
 
 **reopen した store で oplog→sync bridge が恒久停止する事故の修正 (#150)。** relay 型経路

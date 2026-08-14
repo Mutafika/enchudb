@@ -1,6 +1,6 @@
 [package]
 name = "enchudb-oplog"
-version = "0.18.2"
+version = "0.18.3"
 edition = "2024"
 rust-version = "1.89"   # std::fs::File::lock (#133 Windows 対応)
 description = "EnchuDB oplog — append-only operation log, HLC, peer keys. Wire-level primitives shared by engine / sync / transport."
