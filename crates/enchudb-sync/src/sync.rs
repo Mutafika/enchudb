@@ -104,22 +104,6 @@ pub struct SyncOutcome {
     /// `true` のとき **records は一切適用していない**。 caller は差分 pull を諦めて
     /// bootstrap (= `GET /bootstrap` などによる snapshot 取得) からやり直す必要がある。
     pub history_truncated: bool,
-
-    /// #160: **自分側の LWW 記憶 (`HlcStore`) が不完全なまま `Hlc::ZERO` から pull しようと
-    /// した**。
-    ///
-    /// `HlcStore` は in-memory で、 reopen 後は `hydrate_hlc_store` が WAL と `_sync_ops` を
-    /// 歩いて再構築する (#154)。 だが `_sync_ops` の row は ack 後に reclaim されるため、
-    /// **reclaim 済み range の HLC はどこにも残らない**。 その状態で cursor を持たずに
-    /// `Hlc::ZERO` から pull すると、 相手 ring に残る陳腐 record が LWW 比較の基準を欠いた
-    /// まま素通しで適用され、 **ローカルのより新しい行が古い値へ巻き戻る** (tombstone の
-    /// 記憶も消えるので削除済み entity の復活もあり得る)。
-    ///
-    /// `true` のとき **records は一切適用していない**。 caller は永続 cursor
-    /// (`Syncer::with_cursor_path`) を使うか、 bootstrap からやり直すこと。
-    ///
-    /// 根治は `HlcStore` 自体の永続化 (#160 Phase 2 / hlc_store.rs doc の "Phase D")。
-    pub lww_memory_incomplete: bool,
 }
 
 impl Syncer {
@@ -328,19 +312,6 @@ impl Syncer {
             if since < floor {
                 return SyncOutcome { history_truncated: true, ..SyncOutcome::default() };
             }
-        }
-
-        // #160: 上の floor 判定は **publisher 側が reclaim している** ケースしか塞がない。
-        // 相手の ring に古い record が残っていれば floor は広告されず、 記録は全部届く —
-        // だが **自分の LWW 記憶が欠けている**なら、 陳腐 record が素通しで適用されて
-        // ローカルの新しい行が巻き戻る。
-        //
-        // 自分の `_sync_ops` が reclaim 済み = その range の HLC は hydrate で復元できて
-        // いない (`HlcStore` は in-memory、 hydrate の source は WAL と `_sync_ops` だけ)。
-        // cursor を持たない `Hlc::ZERO` pull はその欠落した範囲をまるごと踏むので、
-        // **何も適用せず**通知して caller に永続 cursor / bootstrap を促す。
-        if since == Hlc::ZERO && self.engine.sync_history_reclaimed() {
-            return SyncOutcome { lww_memory_incomplete: true, ..SyncOutcome::default() };
         }
 
         let records = self.transport.pull_as(self_peer, from, since);
