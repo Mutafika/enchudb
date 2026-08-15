@@ -1033,6 +1033,11 @@ const H_HIMO_TYPES: usize = 256;
 
 fn align8(n: usize) -> usize { (n + 7) & !7 }
 
+/// v9 (request17-A): version column の 1 cell が持つ HLC のバイト数
+/// (`wall: u64` + `logical: u32` + `peer: u32`)。 `Hlc::ZERO` (全 0) が「版数不明」を
+/// 意味するので、 zero-fill された region がそのまま正しい初期状態になる。
+const HLC_CELL_BYTES: u32 = 16;
+
 /// ヘッダ整合性 CRC を計算する対象領域。
 /// magic, version, max_entities, max_himos, himo_count,
 /// vocab_*, himoreg_*, content_data_size, cyl_max_values の固定レイアウト部のみ。
@@ -1161,6 +1166,25 @@ struct Layout {
     content_data_size: usize,
     leaf_data_off: usize,
     leaf_data_size: usize,
+    /// v9 (request17-A): per-cell version column の base。 himo ごとに **HLC を生で**
+    /// (16B: wall u64 / logical u32 / peer u32) 並べる (`Column` と同じ形)。
+    /// **variable cluster の末尾**に置くので、 pre-v9 DB の既存 region は 1 byte も
+    /// 動かない (`leaf_data` の「size 0 なら region 無し」と同じ)。
+    /// `ver_col_size == 0` = version column 無し (pre-v9)。
+    ///
+    /// `Hlc::ZERO` (全 0) が「版数不明」を意味するので、 zero-fill された region が
+    /// そのまま正しい初期状態になる (追加の初期化不要 / A-1)。
+    #[allow(dead_code)]
+    ver_base_off: usize,
+    #[allow(dead_code)]
+    ver_col_size: usize,
+    /// v9 (request17-A5): tombstone version column。 削除は himo を持たない
+    /// (`Delete { eid }`) ので himo ごとの version column には置けず、 eid 空間に
+    /// **1 本だけ**持つ。 `tomb_size == 0` = 無し (pre-v9)。
+    #[allow(dead_code)]
+    tomb_off: usize,
+    #[allow(dead_code)]
+    tomb_size: usize,
     himo_base_off: usize,
     himo_col_size: usize,
     #[allow(dead_code)]
@@ -1174,7 +1198,7 @@ impl Layout {
     /// #120: 上限超過 (align8 後の u32 data_end / total_size overflow) は
     /// **書く前に** Err で返す。 呼び元 (create 経路) は `io::ErrorKind::InvalidInput`
     /// に写して伝播すること — panic にすると caller が握れない。
-    fn compute(max_entities: u32, max_himos: u32, vocab_data_size: usize, content_data_size: Option<usize>, cyl_max_values: Option<u32>, leaf_data_size: Option<usize>, vocab_max_entries: Option<u32>) -> Result<Self, String> {
+    fn compute(max_entities: u32, max_himos: u32, vocab_data_size: usize, content_data_size: Option<usize>, cyl_max_values: Option<u32>, leaf_data_size: Option<usize>, vocab_max_entries: Option<u32>, cell_version: bool) -> Result<Self, String> {
         // #122: 既定は max_entities × 16 (上限 256 M)。 vocab の値の種類数は entity 数と
         // 相関しないので、 実測で分かっている consumer は GrowableOptions で明示する。
         let vocab_max_entries = match vocab_max_entries {
@@ -1195,6 +1219,7 @@ impl Layout {
             max_entities, max_himos,
             vocab_max_entries, vocab_data_size,
             content_data_size, cyl_max_values, leaf_data_size,
+            cell_version,
         )
     }
 
@@ -1208,6 +1233,8 @@ impl Layout {
         content_data_size: Option<usize>,
         cyl_max_values: Option<u32>,
         leaf_data_size: Option<usize>,
+        // v9 (request17-A): per-cell version column を持つか。
+        cell_version: bool,
     ) -> Result<Self, String> {
         let vocab_index_cap = vocab_max_entries.next_power_of_two();
         let himoreg_max_entries = max_himos.max(256);
@@ -1229,6 +1256,7 @@ impl Layout {
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, leaf_data_size, cyl_max_values,
+            cell_version,
         )
     }
 
@@ -1240,6 +1268,9 @@ impl Layout {
         vocab_max_entries: u32, vocab_index_cap: u32, vocab_data_size: usize,
         himoreg_max_entries: u32, himoreg_index_cap: u32, himoreg_data_size: usize,
         content_data_size: usize, leaf_data_size: usize, cyl_max_values: u32,
+        // v9 (request17-A): per-cell version column を持つか。
+        // false = pre-v9 DB、 または v9 を有効化していない create。
+        cell_version: bool,
     ) -> Result<Self, String> {
         // EntitySet::region_size 内部の `(max_entities + 7)` が u32 で wrap しない
         // ガード。 この値の DB は create 時点で作れない (debug では overflow panic)。
@@ -1346,7 +1377,36 @@ impl Layout {
         let leaf_data_size = align8(leaf_data_size);
         off = ck_add(off, leaf_data_size)?;
 
+        // v9 (request17-A): per-cell version column (himo ごと) + tombstone column (1 本)。
+        // leaf と同じく variable cluster の末尾に置くので、 **pre-v9 DB の既存 region は
+        // 動かない**。 無効時は両方 size 0 で layout は pre-v9 と byte 単位で同一。
+        //
+        // cell には HLC を **生で** 置く (16B)。 intern 表案は `next_hlc()` が record ごとに
+        // logical を進める実装のため「同じ HLC が繰り返し出る」ことが無く、
+        // `4B(id) + 16B(entry)` = 20B/cell で生 HLC (16B) より重くなるので却下した。
+        let ver_base_off = off;
+        let (ver_col_size, ver_total) = if cell_version {
+            let s = align8(Column::region_size(max_entities, HLC_CELL_BYTES));
+            let total = s
+                .checked_mul(max_himos as usize)
+                .ok_or_else(|| "layout version column region overflow".to_string())?;
+            (s, total)
+        } else {
+            (0, 0)
+        };
+        off = ck_add(off, ver_total)?;
+
+        let tomb_off = off;
+        let tomb_size = if cell_version {
+            align8(Column::region_size(max_entities, HLC_CELL_BYTES))
+        } else {
+            0
+        };
+        off = ck_add(off, tomb_size)?;
+
         Ok(Layout {
+            ver_base_off, ver_col_size,
+            tomb_off, tomb_size,
             entities_off, entities_size,
             vocab_data_off, vocab_data_size,
             vocab_offsets_off, vocab_offsets_size,
@@ -1367,6 +1427,18 @@ impl Layout {
 
     fn himo_col_off(&self, hid: usize) -> usize {
         self.himo_base_off + hid * self.himo_slot_size
+    }
+    /// v9 (request17-A): himo `hid` の version column 先頭 (HLC 16B の並び)。
+    /// `ver_col_size == 0` の DB (pre-v9) には領域が無いので、 呼び側が先に
+    /// `has_cell_version()` を確認すること。
+    #[allow(dead_code)]
+    fn ver_col_off(&self, hid: usize) -> usize {
+        self.ver_base_off + hid * self.ver_col_size
+    }
+    /// v9 領域 (version column + tombstone column) を持つ DB か。
+    #[allow(dead_code)]
+    fn has_cell_version(&self) -> bool {
+        self.ver_col_size > 0 && self.tomb_size > 0
     }
     #[allow(dead_code)]
     fn himo_cyl_a_off(&self, hid: usize) -> usize {
@@ -1761,7 +1833,7 @@ impl Engine {
         let off_shift = leaf_scale.map(|s| s.off_shift()).unwrap_or(DEFAULT_LEAF_OFF_SHIFT);
         let vds = vocab_data_size.unwrap_or(DEFAULT_VOCAB_DATA_SIZE);
         let max_himos = max_himos.unwrap_or(DEFAULT_MAX_HIMOS);
-        let layout = Layout::compute(max_entities, max_himos, vds, content_data_size, cyl_max_values, leaf_data_size, None).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, vds, content_data_size, cyl_max_values, leaf_data_size, None, false).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         // #90: 予約 leaf region が選んだ scale の cap を超えないか検証。
         let leaf_cap = cap_bytes_for_shift(off_shift);
         if layout.leaf_data_size as u64 > leaf_cap {
@@ -1907,7 +1979,7 @@ impl Engine {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create_growable_with_capacity(path: &str, max_entities: u32) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
-        let layout = Layout::compute(max_entities, max_himos, DEFAULT_VOCAB_DATA_SIZE, None, None, None, None).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, DEFAULT_VOCAB_DATA_SIZE, None, None, None, None, false).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
     }
 
@@ -1924,7 +1996,7 @@ impl Engine {
         vocab_data_size: usize,
     ) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
-        let layout = Layout::compute(max_entities, max_himos, vocab_data_size, None, None, None, None).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, vocab_data_size, None, None, None, None, false).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
     }
 
@@ -1942,7 +2014,7 @@ impl Engine {
     ) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
         let vds = vocab_data_size.unwrap_or(DEFAULT_VOCAB_DATA_SIZE);
-        let layout = Layout::compute(max_entities, max_himos, vds, None, None, leaf_data_size, None).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, vds, None, None, leaf_data_size, None, false).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let leaf_cap = leaf_scale.cap_bytes();
         if layout.leaf_data_size as u64 > leaf_cap {
             return Err(io::Error::new(
@@ -1969,6 +2041,7 @@ impl Engine {
             Some(opts.cyl_max_values),
             opts.leaf_data_size,
             opts.vocab_max_entries, // #122
+            false,                  // v9 (request17): 未有効化
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let leaf_cap = opts.leaf_scale.cap_bytes();
@@ -2022,6 +2095,7 @@ impl Engine {
             Some(64 * 1024),  // content_data: 64 KB
             Some(64),         // cyl_max_values: small per-himo cylinders
             None,             // leaf_data: default
+            false,            // v9 (request17): 未有効化
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
@@ -2469,6 +2543,7 @@ impl Engine {
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, leaf_data_size, cyl_max_values,
+            false, // v9 (request17): 未有効化。 header から読むのは有効化と同時
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -2566,6 +2641,7 @@ impl Engine {
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, leaf_data_size, cyl_max_values,
+            false, // v9 (request17): 未有効化。 header から読むのは有効化と同時
         )?;
 
         // src が v5 layout 全域 (= leaf_data_off までのバイト列) をカバーしているか。
@@ -2756,6 +2832,7 @@ impl Engine {
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, leaf_data_size, cyl_max_values,
+            false, // v9 (request17): 未有効化。 header から読むのは有効化と同時
         )?;
 
         // backing が layout 全域をカバーしているか (Memory 経路の truncated bytes
@@ -8618,6 +8695,78 @@ impl Drop for Engine {
 }
 
 // ════════════════ テスト ════════════════
+
+#[cfg(test)]
+mod layout_v9_tests {
+    use super::*;
+
+    fn base(cell_version: bool) -> Layout {
+        Layout::compute(1024, 16, 64 * 1024, None, None, None, None, cell_version).unwrap()
+    }
+
+    /// v9 を有効化していない layout は **pre-v9 と完全に同一**であること。
+    /// version column / tombstone column は variable cluster の末尾に置く設計なので、
+    /// 無効時は 1 byte も増えてはいけない。
+    #[test]
+    fn v9_disabled_layout_is_byte_identical() {
+        let l = base(false);
+        assert_eq!(l.ver_col_size, 0, "無効時に version column を確保している");
+        assert_eq!(l.tomb_size, 0, "無効時に tombstone column を確保している");
+        assert!(!l.has_cell_version());
+    }
+
+    /// v9 を有効化しても **既存 region の offset は 1 つも動かない**こと。
+    /// これが崩れると pre-v9 DB を開いた瞬間に全データが別位置を指す。
+    #[test]
+    fn enabling_v9_does_not_move_existing_regions() {
+        let off = base(false);
+        let on = base(true);
+
+        assert_eq!(on.entities_off, off.entities_off);
+        assert_eq!(on.vocab_data_off, off.vocab_data_off);
+        assert_eq!(on.vocab_index_off, off.vocab_index_off);
+        assert_eq!(on.himoreg_data_off, off.himoreg_data_off);
+        assert_eq!(on.content_index_off, off.content_index_off);
+        assert_eq!(on.content_data_off, off.content_data_off);
+        assert_eq!(on.leaf_data_off, off.leaf_data_off);
+        assert_eq!(on.himo_base_off, off.himo_base_off, "himo region が動いた");
+        assert_eq!(on.himo_slot_size, off.himo_slot_size, "himo slot の形が変わった");
+        assert!(on.total_size > off.total_size, "v9 領域が確保されていない");
+    }
+
+    /// version column は himo ごとに cell 16B (HLC を生で持つ)。 slot が重ならず、
+    /// tombstone column も踏まないこと。
+    #[test]
+    fn version_columns_do_not_overlap_and_leave_room_for_tombstone() {
+        let l = base(true);
+        assert!(l.has_cell_version());
+        assert_eq!(l.ver_col_off(0), l.ver_base_off);
+
+        for hid in 0..15usize {
+            let a = l.ver_col_off(hid);
+            let b = l.ver_col_off(hid + 1);
+            assert_eq!(b - a, l.ver_col_size, "himo {hid} と {} の slot が重なる", hid + 1);
+        }
+
+        let last_end = l.ver_col_off(15) + l.ver_col_size;
+        assert!(last_end <= l.tomb_off, "version column が tombstone column を踏んでいる");
+        assert!(l.tomb_off + l.tomb_size <= l.total_size, "tombstone column が file 外に出ている");
+    }
+
+    /// cell は HLC を生で持つので、 1 himo ぶんの version column は
+    /// 値 column (4B/cell) の 4 倍のオーダーになること。 intern 表を採らなかった
+    /// 判断 (request17-A) がそのまま layout に出ていることの確認。
+    #[test]
+    fn version_column_holds_raw_hlc_16b_per_cell() {
+        let l = base(true);
+        assert_eq!(HLC_CELL_BYTES, 16);
+        // himo_col_size は 4B/cell、 ver_col_size は 16B/cell。 header 分を除いて 4 倍。
+        let cells = 1024usize;
+        assert!(l.ver_col_size >= cells * 16, "version column が 16B/cell 未満");
+        assert!(l.ver_col_size < cells * 16 + 64, "version column に余分な確保がある");
+        assert_eq!(l.tomb_size, l.ver_col_size, "tombstone column も同じ形 (eid 空間 × 16B)");
+    }
+}
 
 #[cfg(test)]
 mod tests {
