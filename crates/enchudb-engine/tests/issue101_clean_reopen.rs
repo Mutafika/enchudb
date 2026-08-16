@@ -25,11 +25,22 @@ fn define_tag(eng: &Arc<Engine>, name: &str) {
     eng_mut.define_himo(name, ValueType::Tag, 0);
 }
 
+/// DB body は sparse (apparent 巨大 / 実データはごく一部) なので、 素の
+/// `std::fs::copy` だと Linux で apparent 全量が物理化する。 CAP = 8M の DB は
+/// apparent 13 GB (v9 なら 45 GB) あり、 CI のディスクを食い潰して runner ごと
+/// 落ちた。 穴を維持する `copy_sparse` を使う。
 fn copy_db(src: &str, dst: &str) {
+    use std::path::Path;
     fresh(dst);
-    std::fs::copy(src, dst).expect("copy body");
-    let _ = std::fs::copy(format!("{src}.oplog"), format!("{dst}.oplog"));
-    let _ = std::fs::copy(format!("{src}.tables"), format!("{dst}.tables"));
+    enchudb_engine::copy_sparse(Path::new(src), Path::new(dst)).expect("copy body");
+    let _ = enchudb_engine::copy_sparse(
+        Path::new(&format!("{src}.oplog")),
+        Path::new(&format!("{dst}.oplog")),
+    );
+    let _ = enchudb_engine::copy_sparse(
+        Path::new(&format!("{src}.tables")),
+        Path::new(&format!("{dst}.tables")),
+    );
 }
 
 /// graceful Drop → 次 open は rebuild skip。 crash (dirty copy) → rebuild が走る。
