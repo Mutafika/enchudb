@@ -51,10 +51,18 @@ fn make_durable(path: &str, n: u32) -> HashMap<u32, u32> {
     written
 }
 
+/// DB body は sparse (apparent 巨大 / 実データはごく一部) なので、 素の
+/// `std::fs::copy` だと Linux で apparent 全量が物理化して CI のディスクを
+/// 食い潰す。 穴を維持する `copy_sparse` を使う。
 fn copy_db(src: &str, dst: &str) {
+    use std::path::Path;
     fresh(dst);
-    std::fs::copy(src, dst).expect("copy body");
-    std::fs::copy(format!("{src}.oplog"), format!("{dst}.oplog")).expect("copy oplog");
+    enchudb_engine::copy_sparse(Path::new(src), Path::new(dst)).expect("copy body");
+    enchudb_engine::copy_sparse(
+        Path::new(&format!("{src}.oplog")),
+        Path::new(&format!("{dst}.oplog")),
+    )
+    .expect("copy oplog");
 }
 
 fn oplog_len(path: &str) -> u64 {

@@ -54,8 +54,10 @@ pub mod changefeed;
 pub mod acl;
 pub mod integrity;
 pub mod blob_store;
+pub mod sparse_copy;
 
 pub use engine::{Engine, EntityValue, SnapshotFiles, AuditFilter, MigrationStats, LeafScale, GrowableOptions};
+pub use sparse_copy::copy_sparse;
 pub use engine::EngineStats;
 pub use himo_store::ValueType;
 pub use cas::{CASStore, BlockHash};

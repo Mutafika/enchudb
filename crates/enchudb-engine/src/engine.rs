@@ -7977,9 +7977,22 @@ impl Engine {
     /// **呼び出し前に必ず `oplog_sync()` or `flush()` で durable 化すること**。
     /// mmap 非同期ページが残っていると snapshot に反映されない。
     ///
+    /// body の copy は `copy_sparse` で行う (= 穴を穴のまま写す)。 DB body は
+    /// apparent が巨大で実データがごく一部の sparse ファイルなので、 素の
+    /// `std::fs::copy` だと **Linux では apparent 全量が物理化する** (既定
+    /// capacity で 24 GB。 詳細は `sparse_copy` の module doc)。
+    ///
+    /// # durability
+    ///
+    /// **この関数は fsync しない。** 書き出しは page cache 止まりで、 直後に電源断が
+    /// 起きれば snapshot は残らない。 これは意図した方針で、 source を fsync 再
+    /// persist しないことで snapshot を速く保っている (sidecar 側も同じ。 下の #9 (H2)
+    /// のコメント参照)。 **backup として残すなら呼び出し側が fsync すること。**
+    ///
     /// 返り値: コピーしたパス一覧。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn snapshot_export(&self, target: &str) -> io::Result<SnapshotFiles> {
+        use crate::sparse_copy::copy_sparse;
         // mmap ページを物理ディスクに確実に書き出す
         self.body_msync()?;
 
@@ -7988,19 +8001,25 @@ impl Engine {
             oplog: None,
             crc: None,
         };
-        std::fs::copy(&self.path, target)?;
+        copy_sparse(std::path::Path::new(&self.path), std::path::Path::new(target))?;
 
         let oplog_src = format!("{}.oplog", self.path);
         if std::path::Path::new(&oplog_src).exists() {
             let oplog_dst = format!("{}.oplog", target);
-            std::fs::copy(&oplog_src, &oplog_dst)?;
+            copy_sparse(
+                std::path::Path::new(&oplog_src),
+                std::path::Path::new(&oplog_dst),
+            )?;
             files.oplog = Some(oplog_dst);
         }
 
         let crc_src = format!("{}.crc", self.path);
         if std::path::Path::new(&crc_src).exists() {
             let crc_dst = format!("{}.crc", target);
-            std::fs::copy(&crc_src, &crc_dst)?;
+            copy_sparse(
+                std::path::Path::new(&crc_src),
+                std::path::Path::new(&crc_dst),
+            )?;
             files.crc = Some(crc_dst);
         }
 
