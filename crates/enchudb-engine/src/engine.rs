@@ -4835,12 +4835,13 @@ impl Engine {
         true
     }
 
-    /// slot 再利用時に **前の住人の版数を落とす** (v9)。
+    /// slot 再利用時に **前の住人の版数を落とす**。
     ///
-    /// version column / tombstone column は local slot で index されるので、 free
-    /// list から払い出された slot には前の住人の版数が残っている。 消さずに渡すと
-    /// 新しい住人への write が「前の住人の削除より古い」「前の住人の cell より
-    /// 古い」と判定されて **無言で落ちる** (`set_cell` は `false` を返すだけ)。
+    /// 版数の置き場は v9 なら version / tombstone column、 pre-v9 なら揮発
+    /// `HlcStore` だが、 **どちらも local slot で index される**ので事情は同じ:
+    /// free list から払い出された slot には前の住人の版数が残っている。 消さずに
+    /// 渡すと新しい住人への write が「前の住人の削除より古い」「前の住人の cell
+    /// より古い」と判定されて **無言で落ちる** (`set_cell` は `false` を返すだけ)。
     /// 古い record をまとめて再生する局面 (bootstrap / `Hlc::ZERO` からの pull) で
     /// 顕在化する: 相手が t1 に author した record が、 こちらが t2 (> t1) に消した
     /// **別の** entity の tombstone に負けて適用されない。
@@ -4848,11 +4849,28 @@ impl Engine {
     /// 前の住人の eid は slot が free list に入った時点で到達不能なので、 版数を
     /// 落として困る読み手はいない。
     ///
-    /// `count() <= local` の column は **その cell を一度も書いていない** =
+    /// v9 側で `count() <= local` の column は **その cell を一度も書いていない** =
     /// 中身は zero (= 版数不明) なので触らない。 growable backing の未コミット
     /// page を掴まないための guard でもある (触ると SIGBUS)。
+    ///
+    /// pre-v9 側は himo 数ぶんの `remove` を回す。 `HlcStore::remove_entity` は
+    /// HashMap 全体を `retain` で走査する O(n) なので、 `_sync_ops` の ring 再利用の
+    /// ような払い出し hot path から呼ぶと別の事故になる。
+    ///
+    /// なお **slot に紐づく状態はこれで全部ではない** — `EidTranslator` の
+    /// `(author_peer, foreign_local) -> local` 写像も同じ理由で stale になるが、
+    /// そちらは remove API 自体が無く master から続く別の穴なので #166 で扱う。
     fn clear_cell_versions(&self, local: u32) {
-        if !self.has_cell_version() || local >= self.max_entities {
+        if local >= self.max_entities {
+            return;
+        }
+        // pre-v9: 版数は揮発 HlcStore にある。 sentinel (u16::MAX) が tombstone。
+        if !self.has_cell_version() {
+            let key = self.version_key(local);
+            for hid in 0..self.himos.len() {
+                self.hlc_store.remove(key, hid as u16);
+            }
+            self.hlc_store.remove(key, u16::MAX);
             return;
         }
         for col in self.ver_cols.iter() {
@@ -9748,6 +9766,40 @@ mod cell_version_tests {
         );
         assert_eq!(eng.get(reused, "age"), Some(7));
         assert_eq!(eng.tombstone_hlc(reused), Hlc::ZERO, "前の住人の tombstone を引き継いだ");
+    }
+
+    /// **pre-v9 DB でも同じ穴が開く。** 版数の置き場が version column ではなく揮発
+    /// `HlcStore` になるだけで、 キーは `version_key(local)` = local slot なので
+    /// 事情は v9 と変わらない。 しかも `HlcStore` のエントリは production code から
+    /// 一度も消されないので、 落とさなければ永久に残る。
+    ///
+    /// falsify: `clear_cell_versions` の pre-v9 枝を消すと最後の 3 assert が落ちる。
+    #[test]
+    fn reused_slot_does_not_inherit_previous_tenant_version_on_pre_v9() {
+        let mut eng = Engine::create_without_cell_version(&tmp("slot_reuse_prev9"), 1024).unwrap();
+        eng.define_himo("age", ValueType::Number, 0);
+        let hid = eng.himo_id("age").unwrap() as u16;
+        eng.define_table("t", 1).unwrap(); // slot 1 個 → 2 個目は必ず再利用
+        assert!(!eng.has_cell_version(), "前提が崩れた: pre-v9 DB でない");
+
+        let first = eng.entity_in("t").unwrap();
+        assert!(eng.set_cell(first, hid, 42, hlc(300, 1)));
+        assert!(eng.set_tombstone(first, hlc(300, 1)));
+        eng.delete(first);
+
+        let second = eng.entity_in("t").unwrap();
+        assert_eq!(
+            enchudb_oplog::eid_local(second),
+            enchudb_oplog::eid_local(first),
+            "前提が崩れた: slot が再利用されていない",
+        );
+
+        assert!(
+            eng.set_cell(second, hid, 7, hlc(200, 1)),
+            "前の住人の版数が新しい住人への write を無言で落とした (pre-v9)",
+        );
+        assert_eq!(eng.get(second, "age"), Some(7));
+        assert_eq!(eng.tombstone_hlc(second), Hlc::ZERO, "前の住人の tombstone を引き継いだ");
     }
 
     // ──── step 4: ローカル write が版数を書く ────
