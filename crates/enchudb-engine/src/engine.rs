@@ -7982,6 +7982,13 @@ impl Engine {
     /// `std::fs::copy` だと **Linux では apparent 全量が物理化する** (既定
     /// capacity で 24 GB。 詳細は `sparse_copy` の module doc)。
     ///
+    /// # durability
+    ///
+    /// **この関数は fsync しない。** 書き出しは page cache 止まりで、 直後に電源断が
+    /// 起きれば snapshot は残らない。 これは意図した方針で、 source を fsync 再
+    /// persist しないことで snapshot を速く保っている (sidecar 側も同じ。 下の #9 (H2)
+    /// のコメント参照)。 **backup として残すなら呼び出し側が fsync すること。**
+    ///
     /// 返り値: コピーしたパス一覧。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn snapshot_export(&self, target: &str) -> io::Result<SnapshotFiles> {

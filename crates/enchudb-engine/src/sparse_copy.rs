@@ -31,7 +31,7 @@ use std::io;
 use std::path::Path;
 
 /// data 範囲を写すときの読み書き単位。
-#[cfg(any(all(unix, not(target_os = "macos")), test))]
+#[cfg(all(unix, any(not(target_os = "macos"), test)))]
 const CHUNK: usize = 1 << 20; // 1 MiB
 
 /// 穴を維持したままファイルをコピーする。 戻り値は `std::fs::copy` と同じく
@@ -39,8 +39,20 @@ const CHUNK: usize = 1 << 20; // 1 MiB
 ///
 /// - macOS: `std::fs::copy` (= `fcopyfile` clonefile。 穴を維持したまま最速)
 /// - その他の unix: `SEEK_DATA` / `SEEK_HOLE` でデータ範囲だけ写す
-/// - `SEEK_DATA` 非対応の FS など、 穴を辿れない環境では `std::fs::copy` に落ちる
-///   (遅くなるだけで結果は正しい)
+/// - Windows / その他: `std::fs::copy` (穴の概念が無いか、 辿る API が無い)
+///
+/// # `SEEK_DATA` 非対応の FS
+///
+/// `EINVAL` / `ENOTSUP` / `ENOSYS` が返る環境では素の `std::fs::copy` に落ちる。
+/// `SEEK_DATA` を持たない FS は多くの場合そもそも穴を持てない (FAT 等) ので、
+/// apparent == 実データで実害は無い。 ただし **穴は持てるが `SEEK_DATA` が無い**
+/// 環境 (一部の network FS 等) では元の症状 (= apparent 全量の物理化) に戻る。
+///
+/// # durability
+///
+/// **fsync しない。** 書き終わった時点では page cache 止まりなので、 電源断で
+/// 消えうる。 durable にしたい呼び側が自分で fsync すること
+/// (`Engine::snapshot_export` も同じ方針 — その doc を参照)。
 pub fn copy_sparse(src: &Path, dst: &Path) -> io::Result<u64> {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -69,7 +81,7 @@ fn is_unsupported(e: &io::Error) -> bool {
 ///
 /// macOS では `copy_sparse` から呼ばれない (clonefile のほうが速い) が、
 /// **アルゴリズムを両 OS のテストで踏ませる**ために test build では常にコンパイルする。
-#[cfg(any(all(unix, not(target_os = "macos")), test))]
+#[cfg(all(unix, any(not(target_os = "macos"), test)))]
 fn copy_via_holes(src: &Path, dst: &Path) -> io::Result<u64> {
     use std::fs::File;
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -111,6 +123,8 @@ fn copy_via_holes(src: &Path, dst: &Path) -> io::Result<u64> {
         }
         off = hole;
     }
+    // `File::flush` は no-op (userspace buffer が無い)。 durable 化は呼び側責務なので
+    // ここでは fsync しない (module doc の durability 節を参照)。
     fout.flush()?;
     // `std::fs::copy` は permission を引き継ぐので合わせる。
     let mode = meta.permissions().mode();
@@ -119,7 +133,7 @@ fn copy_via_holes(src: &Path, dst: &Path) -> io::Result<u64> {
 }
 
 /// `lseek(fd, off, whence)`。 `ENXIO` (= もうデータが無い) は `None`。
-#[cfg(any(all(unix, not(target_os = "macos")), test))]
+#[cfg(all(unix, any(not(target_os = "macos"), test)))]
 fn lseek(fd: std::os::unix::io::RawFd, off: u64, whence: i32) -> io::Result<Option<u64>> {
     let r = unsafe { libc::lseek(fd, off as libc::off_t, whence) };
     if r < 0 {
