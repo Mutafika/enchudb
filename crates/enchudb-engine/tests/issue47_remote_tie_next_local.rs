@@ -70,7 +70,7 @@ fn remote_tie_apply_advances_next_local() {
     for offset in 20..22 {
         let foreign_eid = make_eid(foreign_peer, articles_lo + offset);
         // remote_tie_apply は value (vid) を渡す形式 — 任意の小さい vid で OK
-        eng.remote_tie_apply(foreign_eid, url_hid, 1, None);
+        eng.remote_tie_apply(foreign_eid, url_hid, 1, enchudb_oplog::Hlc::ZERO, None);
         assert_eq!(eid_local(foreign_eid), articles_lo + offset);
     }
 

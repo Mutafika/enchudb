@@ -915,6 +915,16 @@ impl OpLog {
         result.map(|(lsn, _)| lsn)
     }
 
+    /// request17 step 5: **受信 HLC でローカル clock を進める** (HLC の merge 規則)。
+    ///
+    /// これが無いと、 相手の wall clock が先行している間ずっと「自分が次に採番する
+    /// HLC < 既に適用した remote の版数」になり、 版数を storage に置いた途端に
+    /// **自分のローカル write が自分の DB で負ける**。 適用した record は必ず
+    /// これを通すこと (`append_relayed` は内部で呼ぶので二重呼び出し不要)。
+    pub fn observe_hlc(&self, recv: Hlc) {
+        self.merge_external_hlc(recv);
+    }
+
     fn merge_external_hlc(&self, recv: Hlc) {
         loop {
             let last_wall = self.hlc_last_wall.load(Ordering::Acquire);

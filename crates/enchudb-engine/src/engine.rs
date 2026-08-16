@@ -4586,6 +4586,83 @@ impl Engine {
         }
     }
 
+    /// request17 step 5: 受信 record の HLC でローカル HLC clock を merge する。
+    ///
+    /// これが無いと、 相手の wall clock が先行している間ずっと「自分が次に採番する
+    /// HLC < 既に適用した remote の版数」になり、 **自分のローカル write が自分の DB で
+    /// 負ける** (版数を storage に置いた途端に顕在化する。 #161 と同じ「止めた先に
+    /// 脱出路が無い」形)。 HLC の merge 規則そのもの。
+    #[inline]
+    fn observe_remote_hlc(&self, hlc: enchudb_oplog::Hlc) {
+        if hlc == enchudb_oplog::Hlc::ZERO {
+            return;
+        }
+        if let Some(wal) = self.oplog.as_ref() {
+            wal.observe_hlc(hlc);
+        }
+    }
+
+    /// pre-v9 DB の版数置き場 (揮発 `HlcStore`) の key。 sync.rs が使っていた key
+    /// (`resolve_remote_eid` が返す self peer 付き EntityId) と同一にする。
+    #[inline]
+    fn version_key(&self, local: u32) -> u64 {
+        enchudb_oplog::make_eid(self.peer_id(), local)
+    }
+
+    /// cell の現在の版数。 v9 DB は version column、 pre-v9 DB は揮発 `HlcStore`
+    /// (= 従来 sync.rs が持っていた記憶) を見る。 どちらも無ければ `Hlc::ZERO`。
+    ///
+    /// **判定の入口はこの 1 本だけ** — 版数の置き場が column か HashMap かは
+    /// ここから先に漏らさない。 pre-v9 の fallback は step 6/7 (v9 既定化) で外す。
+    #[inline]
+    fn version_of(&self, local: u32, himo_id: u16) -> enchudb_oplog::Hlc {
+        if self.has_cell_version() {
+            self.cell_hlc_local(local, himo_id)
+        } else {
+            self.hlc_store
+                .get(self.version_key(local), himo_id)
+                .unwrap_or(enchudb_oplog::Hlc::ZERO)
+        }
+    }
+
+    /// entity の tombstone 版数 (`version_of` の delete 版、 sentinel himo = `u16::MAX`)。
+    #[inline]
+    fn tombstone_version_of(&self, local: u32) -> enchudb_oplog::Hlc {
+        if self.has_cell_version() {
+            self.tombstone_hlc_local(local)
+        } else {
+            self.hlc_store
+                .get(self.version_key(local), u16::MAX)
+                .unwrap_or(enchudb_oplog::Hlc::ZERO)
+        }
+    }
+
+    /// 削除より古い write か (A-5)。 true なら適用してはいけない —
+    /// 適用すると削除済み entity が復活する (#140 の根)。
+    ///
+    /// 版数不明 (`ZERO`) の write は判定対象外 (A-1 の現状維持)。
+    pub fn tombstone_blocks(&self, eid: enchudb_oplog::EntityId, hlc: enchudb_oplog::Hlc) -> bool {
+        if hlc == enchudb_oplog::Hlc::ZERO {
+            return false;
+        }
+        let tomb = self.tombstone_version_of(enchudb_oplog::eid_local(eid));
+        tomb != enchudb_oplog::Hlc::ZERO && hlc < tomb
+    }
+
+    /// cell への write を採用してよいか。 `set_cell` / `clear_cell` の唯一の判定。
+    #[inline]
+    fn accepts_write(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc) -> bool {
+        if hlc == enchudb_oplog::Hlc::ZERO {
+            return true; // 版数不明 (standalone のローカル write) は従来どおり通す
+        }
+        // 削除済み entity を古い Tie/Untie で蘇らせない (A-5)
+        let tomb = self.tombstone_version_of(local);
+        if tomb != enchudb_oplog::Hlc::ZERO && hlc < tomb {
+            return false;
+        }
+        Self::accepts_hlc(self.version_of(local, himo_id), hlc)
+    }
+
     /// LWW 判定 (A-2)。 true = 採用してよい。
     ///
     /// - 受信 HLC が `ZERO` (= 版数不明。 oplog 無効な standalone のローカル write)
@@ -4606,9 +4683,16 @@ impl Engine {
         if hlc == enchudb_oplog::Hlc::ZERO || local >= self.max_entities {
             return;
         }
-        if let Some(col) = self.ver_col(himo_id) {
-            col.ensure_count(local);
-            col.set(local, &hlc_to_cell(hlc));
+        match self.ver_col(himo_id) {
+            Some(col) => {
+                col.ensure_count(local);
+                col.set(local, &hlc_to_cell(hlc));
+            }
+            // pre-v9: 揮発 HlcStore に置く (= 従来 sync.rs がやっていたこと)。
+            // 版数の置き場が違うだけで、 判定は `accepts_write` の 1 本のまま。
+            None => {
+                self.hlc_store.try_set(self.version_key(local), himo_id, hlc);
+            }
         }
     }
 
@@ -4642,7 +4726,7 @@ impl Engine {
     /// himo_id の範囲チェックは呼び元が済ませている — 範囲外は他の write 経路と
     /// 同じく `himos[hid]` の panic になる)。
     fn set_cell_local(&self, local: u32, himo_id: u16, value: u32, hlc: enchudb_oplog::Hlc) -> bool {
-        if !Self::accepts_hlc(self.cell_hlc_local(local, himo_id), hlc) {
+        if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
         self.himos[himo_id as usize].set(local, value);
@@ -4669,7 +4753,7 @@ impl Engine {
     /// `clear_cell` の local eid 版。 Leaf payload の解放 (`free_leaf_cell`) は
     /// **採用が決まってから**呼ぶこと (不採用なら cell は変わらないので解放しない)。
     fn clear_cell_local(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc) -> bool {
-        if !Self::accepts_hlc(self.cell_hlc_local(local, himo_id), hlc) {
+        if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
         self.himos[himo_id as usize].remove(local);
@@ -4681,7 +4765,7 @@ impl Engine {
     /// 解放する。 不採用 (= 古い untie) のときは payload を **解放しない**
     /// (cell がまだその payload を指しているため)。
     fn clear_cell_local_freeing_leaf(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc) -> bool {
-        if !Self::accepts_hlc(self.cell_hlc_local(local, himo_id), hlc) {
+        if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
         self.free_leaf_cell(local, himo_id as usize);
@@ -4703,17 +4787,23 @@ impl Engine {
 
     /// `set_tombstone` の local eid 版。
     fn set_tombstone_local(&self, local: u32, hlc: enchudb_oplog::Hlc) -> bool {
-        if !Self::accepts_hlc(self.tombstone_hlc_local(local), hlc) {
+        if !Self::accepts_hlc(self.tombstone_version_of(local), hlc) {
             return false;
         }
         if hlc == enchudb_oplog::Hlc::ZERO || local >= self.max_entities {
-            // 版数不明の delete は記録できない (v9 領域が無い DB も同様) が、
-            // 「採用する」判定自体は変わらない = A-1 の現状維持。
+            // 版数不明の delete は記録できないが、 「採用する」判定自体は
+            // 変わらない = A-1 の現状維持。
             return true;
         }
-        if let Some(col) = self.tomb_col.as_ref() {
-            col.ensure_count(local);
-            col.set(local, &hlc_to_cell(hlc));
+        match self.tomb_col.as_ref() {
+            Some(col) => {
+                col.ensure_count(local);
+                col.set(local, &hlc_to_cell(hlc));
+            }
+            // pre-v9: 従来どおり揮発 HlcStore の sentinel himo に置く。
+            None => {
+                self.hlc_store.try_set(self.version_key(local), u16::MAX, hlc);
+            }
         }
         true
     }
@@ -4973,11 +5063,19 @@ impl Engine {
         eid: enchudb_oplog::EntityId,
         himo_id: u16,
         bytes: &[u8],
+        hlc: enchudb_oplog::Hlc,
         relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
-    ) {
+    ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
-        if hid >= self.himos.len() { return; }
+        if hid >= self.himos.len() { return false; }
+        // request17 step 5: 受信 HLC でローカル clock を進める (これが無いと、
+        // 相手の clock が先行している間ずっと自分のローカル write が負ける)。
+        self.observe_remote_hlc(hlc);
+        // 値を作る前に判定する — 不採用なら LeafStore に payload を確保しない。
+        if !self.accepts_write(local, himo_id, hlc) {
+            return false;
+        }
         self.entities.ensure_live(local);
         // v6 (#88): remote re-tie 上書きで旧 offset を回収。
         // #119: **insert → publish → free** の順 (逆順だと並行 reader が再利用 slot を読む)。
@@ -4986,7 +5084,7 @@ impl Engine {
             Some(leaf) => leaf.insert(bytes),
             None => self.vocab.insert(bytes), // pre-v6 / reserved: 旧 vocab fallback
         };
-        self.himos[hid].set(local, value);
+        self.set_cell_local(local, himo_id, value, hlc);
         self.free_leaf_offset(hid, old);
         Self::advance_table_next_local_for(&self.tables, local);
         if self.gossip_remote_apply() {
@@ -5002,6 +5100,7 @@ impl Engine {
                 );
             }
         }
+        true
     }
 
     pub fn remote_tie_apply(
@@ -5009,14 +5108,20 @@ impl Engine {
         eid: enchudb_oplog::EntityId,
         himo_id: u16,
         value: u32,
+        hlc: enchudb_oplog::Hlc,
         relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
-    ) {
+    ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
-        if hid >= self.himos.len() { return; }
+        if hid >= self.himos.len() { return false; }
+        self.observe_remote_hlc(hlc);
+        // request17 step 5: LWW 判定は `set_cell` の内側だけ (A-2)。 sync 層で
+        // 判定してから別関数で適用する形は、 呼び忘れれば黙って壊れる。
+        if !self.set_cell_local(local, himo_id, value, hlc) {
+            return false;
+        }
         // entity 未確保ならローカル側の EntitySet に登録(eid は peer 側が決めた値)
         self.entities.ensure_live(local);
-        self.himos[hid].set(local, value);
         // issue #47 fix: foreign local が我々の table eid_range 内に落ちた場合、
         // 次の `entity_in` が同 local を払出して live entity を上書きしないよう
         // `next_local` を `local + 1` まで前進させる。 これは `apply_oplog_op`
@@ -5030,6 +5135,7 @@ impl Engine {
                 );
             }
         }
+        true
     }
 
     /// リモート peer から届いた Untie を apply。
@@ -5037,13 +5143,16 @@ impl Engine {
         &self,
         eid: enchudb_oplog::EntityId,
         himo_id: u16,
+        hlc: enchudb_oplog::Hlc,
         relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
-    ) {
+    ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
-        if hid >= self.himos.len() { return; }
-        self.free_leaf_cell(local, hid);
-        self.himos[hid].remove(local);
+        if hid >= self.himos.len() { return false; }
+        self.observe_remote_hlc(hlc);
+        if !self.clear_cell_local_freeing_leaf(local, himo_id, hlc) {
+            return false;
+        }
         if self.gossip_remote_apply() {
             if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
                 let _ = wal.append_relayed(
@@ -5052,15 +5161,23 @@ impl Engine {
                 );
             }
         }
+        true
     }
 
     /// リモート peer から届いた Delete を apply。
     pub fn remote_delete_apply(
         &self,
         eid: enchudb_oplog::EntityId,
+        hlc: enchudb_oplog::Hlc,
         relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
-    ) {
+    ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
+        self.observe_remote_hlc(hlc);
+        // A-5: 削除の版数を残す。 これが永続することで、 配送バッファから
+        // tombstone が消えた後も削除済み entity が復活しない (#140 の根)。
+        if !self.set_tombstone_local(local, hlc) {
+            return false;
+        }
         for hid in 0..self.himos.len() {
             self.free_leaf_cell(local, hid);
             self.himos[hid].remove(local);
@@ -5071,6 +5188,7 @@ impl Engine {
                 let _ = wal.append_relayed(enchudb_oplog::oplog::Op::Delete { eid }, h);
             }
         }
+        true
     }
 
     /// リモート peer から届いた Content 書き込みを apply。
@@ -5079,9 +5197,16 @@ impl Engine {
         eid: enchudb_oplog::EntityId,
         key: &str,
         data: &[u8],
+        hlc: enchudb_oplog::Hlc,
         relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
-    ) {
+    ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
+        self.observe_remote_hlc(hlc);
+        // legacy op (pre-0.9 WAL のみ)。 cell を持たないので版数は `HlcStore` の
+        // key hash entry のまま (sync 側) だが、 tombstone 判定だけは engine に寄せる。
+        if self.tombstone_blocks(eid, hlc) {
+            return false;
+        }
         self.entities.ensure_live(local);
         self.contents.set(local, key, data);
         // issue #47 fix: Tie 経路と同じ理由で next_local を前進させる。
@@ -5094,6 +5219,7 @@ impl Engine {
                 );
             }
         }
+        true
     }
 
     /// v33: リモート peer から届いた Vocab op を apply。
@@ -9397,21 +9523,30 @@ mod cell_version_tests {
         assert_eq!(eng.cell_hlc(eid, hid), hlc(200, 1), "ZERO 書き込みが既存の版数を消した");
     }
 
-    /// pre-v9 DB は version column を持たないので、 判定は常に素通し =
-    /// 従来挙動そのまま (migration 不要という Phase 1 の前提)。
+    /// pre-v9 DB は version column を持たないので、 版数は **揮発 `HlcStore`** に置く
+    /// (= 従来 sync.rs が持っていた記憶。 step 5 で判定ごと engine に移した)。
+    ///
+    /// 判定の入口は v9 と同じ `set_cell` 1 本で、 違うのは置き場だけ:
+    /// 永続の column が無いので `cell_hlc` は ZERO のまま、 プロセスを跨ぐと忘れる。
     #[test]
-    fn pre_v9_db_never_blocks_writes() {
+    fn pre_v9_db_falls_back_to_volatile_versions() {
         let mut eng = Engine::create_with_capacity(&tmp("prev9_write"), 1024).unwrap();
         eng.define_himo("age", ValueType::Number, 0);
         let hid = eng.himo_id("age").unwrap() as u16;
         let eid = eng.entity();
 
         assert!(eng.set_cell(eid, hid, 1, hlc(200, 1)));
-        assert!(eng.set_cell(eid, hid, 2, hlc(100, 1)), "版数を持てない DB で write を止めた");
-        assert_eq!(eng.get(eid, "age"), Some(2));
+        assert!(!eng.set_cell(eid, hid, 2, hlc(100, 1)), "古い HLC を採用した");
+        assert!(eng.set_cell(eid, hid, 3, hlc(300, 1)));
+        assert_eq!(eng.get(eid, "age"), Some(3));
+        // 永続の版数は持たない (v9 領域が無い) — 記憶は揮発
         assert_eq!(eng.cell_hlc(eid, hid), Hlc::ZERO);
-        assert!(eng.set_tombstone(eid, hlc(100, 1)));
+
+        assert!(eng.set_tombstone(eid, hlc(400, 1)));
+        assert!(!eng.set_tombstone(eid, hlc(350, 1)), "古い delete を採用した");
         assert_eq!(eng.tombstone_hlc(eid), Hlc::ZERO);
+        // tombstone より古い write は蘇らない (A-5、 pre-v9 でも同じ判定)
+        assert!(!eng.set_cell(eid, hid, 9, hlc(390, 1)), "削除より古い write が通った");
     }
 
     /// untie も版数を進める。 これが無いと外した cell に古い tie が蘇る。
@@ -9570,6 +9705,76 @@ mod cell_version_tests {
         eng.delete_async(eid2);
         eng.flush_writes();
         assert_ne!(eng.tombstone_hlc(eid2), Hlc::ZERO, "async delete が tombstone を残していない");
+    }
+
+    // ──── step 5: remote apply も同じ 1 本を通る ────
+
+    /// tombstone より古い remote Tie は **適用されない** (A-5)。 これが永続する
+    /// ことで、 配送バッファから tombstone が消えた後も削除済み entity が
+    /// 復活しない (#140 の根)。
+    #[test]
+    fn tombstone_blocks_older_remote_tie() {
+        let (eng, hid) = v9_with_wal("tomb_remote", "age");
+        let eid = eng.entity();
+
+        assert!(eng.remote_delete_apply(eid, hlc(1000, 1), None));
+        assert!(
+            !eng.remote_tie_apply(eid, hid, 5, hlc(900, 1), None),
+            "削除より古い Tie が蘇った",
+        );
+        assert_eq!(eng.get(eid, "age"), None);
+        assert!(
+            eng.remote_tie_apply(eid, hid, 6, hlc(1100, 1), None),
+            "削除より新しい Tie が入らない",
+        );
+        assert_eq!(eng.get(eid, "age"), Some(6));
+    }
+
+    /// remote apply の LWW も engine の 1 本で判定されること。
+    #[test]
+    fn remote_apply_is_lww_without_any_sync_layer_help() {
+        let (eng, hid) = v9_with_wal("remote_lww", "age");
+        let eid = eng.entity();
+
+        assert!(eng.remote_tie_apply(eid, hid, 1, hlc(200, 1), None));
+        assert!(!eng.remote_tie_apply(eid, hid, 2, hlc(100, 1), None), "古い record を適用した");
+        assert_eq!(eng.get(eid, "age"), Some(1));
+        assert!(eng.remote_tie_apply(eid, hid, 3, hlc(300, 1), None));
+        assert_eq!(eng.get(eid, "age"), Some(3));
+        assert_eq!(eng.cell_hlc(eid, hid), hlc(300, 1), "remote の版数が cell に残っていない");
+        // untie も同じ判定
+        assert!(!eng.remote_untie_apply(eid, hid, hlc(250, 1), None));
+        assert!(eng.remote_untie_apply(eid, hid, hlc(400, 1), None));
+        assert_eq!(eng.get(eid, "age"), None);
+    }
+
+    /// **受信 HLC でローカル clock を merge する** (step 5)。
+    ///
+    /// 相手の wall clock が先行していると、 merge しない限り自分の次の HLC は
+    /// 相手の版数より小さいままで、 版数を storage に置いた途端に
+    /// **自分のローカル write が自分の DB で負ける**。 #161 と同じ「止めた先に
+    /// 脱出路が無い」形なので、 構造で塞ぐ。
+    #[test]
+    fn local_write_still_wins_after_a_far_future_remote_hlc() {
+        let (eng, hid) = v9_with_wal("clock_merge", "age");
+        let eid = eng.entity();
+
+        // 10 年先の clock を持つ peer からの record
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let far_future = Hlc { wall: now_ms + 10 * 365 * 24 * 3600 * 1000, logical: 0, peer: 9 };
+        assert!(eng.remote_tie_apply(eid, hid, 7, far_future, None));
+        assert_eq!(eng.get(eid, "age"), Some(7));
+
+        // 直後のローカル write が負けてはいけない
+        eng.tie_to(eid, "age", 42);
+        assert_eq!(
+            eng.get(eid, "age"), Some(42),
+            "未来 HLC を受けた後にローカル write が負けた (clock を merge していない)",
+        );
+        assert!(eng.cell_hlc(eid, hid) > far_future, "ローカル版数が受信 HLC を追い越していない");
     }
 
     /// **WAL 上の HLC は record の並び順どおり単調増加**すること。

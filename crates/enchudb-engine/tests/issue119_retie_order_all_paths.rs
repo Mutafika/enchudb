@@ -131,7 +131,7 @@ fn sync_apply_path_no_silent_none_or_torn() {
     let hid = eng.himo_id("body").unwrap() as u16;
     let eng = Arc::new(eng);
     let t = churn_and_read(eng, eid, bodies(), move |e, eid, s| {
-        e.remote_tieleaf_apply(eid, hid, s.as_bytes(), None);
+        e.remote_tieleaf_apply(eid, hid, s.as_bytes(), enchudb_oplog::Hlc::ZERO, None);
     });
     assert_eq!(
         t.missing + t.corrupt,

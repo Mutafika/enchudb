@@ -1,25 +1,27 @@
-//! **現状の欠陥の実証** — ローカル write が LWW に参加しない (request17 Phase 1 で修正予定)。
+//! **ローカル write が LWW に参加すること** (request17 Phase 1 の完了証明)。
 //!
-//! # 何が壊れているか
+//! # 何が壊れていたか
 //!
 //! `HlcStore` を更新しているのは `sync.rs` の apply と hydrate だけで、 engine の
-//! ローカル write (`tie_to` / `tie_to_by_id`) は `Column` を書くが HLC を記録しない。
+//! ローカル write (`tie_to` / `tie_to_by_id`) は `Column` を書くが HLC を記録しなかった。
 //!
 //! したがって「ローカル write の後に、 それより古い remote record を受ける」と、
 //! LWW 比較の基準が存在しないまま素通しで適用され、 **ローカルのより新しい値が
-//! 古い値へ巻き戻る**。 reopen も reclaim も要らない — プロセスは起動したまま起きる。
+//! 古い値へ巻き戻った**。 reopen も reclaim も要らない — プロセスは起動したまま起きる。
 //!
 //! # なぜ今まで見つからなかったか
 //!
 //! 既存の LWW テスト (`tests/v32_two_peer_sync.rs` の `lww_concurrent_write_to_same_cell`
 //! など) は `transport.publish()` で record を**直接注入**しており、 engine のローカル
-//! write を一度も経由していない。 つまり検証されているのは「remote apply 同士の LWW」
-//! だけで、 **ローカル write が絡む経路がテストスイートに存在しない**。
+//! write を一度も経由していない。 つまり検証されていたのは「remote apply 同士の LWW」
+//! だけで、 **ローカル write が絡む経路がテストスイートに存在しなかった**。
 //!
-//! # 修正方針
+//! # どう直したか (request17 Phase 1 step 4 / 5)
 //!
-//! request17 (A): HLC を cell と一緒に永続化し、 ローカル write も remote apply も
-//! `set_cell(eid, hid, value, hlc)` 一本を通す。 そうすれば版数は必ず記録される。
+//! ローカル write も remote apply も `set_cell(eid, hid, value, hlc)` 一本を通す。
+//! 版数の置き場は v9 DB なら per-cell version column、 pre-v9 DB なら従来の揮発
+//! `HlcStore` だが、 **判定の入口が 1 本になったので「記録し忘れ」が構造的に起きない**。
+//! この test は pre-v9 DB (= 通常 create) で回っているので、 fallback 側の証明でもある。
 
 use enchudb_engine::engine::Engine;
 use enchudb_engine::transport::{InMemoryTransport, Transport, WireRecord};
@@ -59,11 +61,7 @@ fn open_engine(path: &str, peer: u32) -> Arc<Engine> {
 }
 
 /// ローカル write は、 それより古い HLC の remote record に**負けてはいけない**。
-///
-/// 現状は `HlcStore` にローカル write の HLC が記録されないため、 古い record が
-/// 素通しで適用されて巻き戻る。
 #[test]
-#[ignore = "request17 Phase 1 (per-cell HLC 永続化) で修正予定 — 現状の欠陥を可視化"]
 fn local_write_must_not_be_overwritten_by_older_remote_record() {
     let pb = tmp_path("B");
     cleanup(&pb);
