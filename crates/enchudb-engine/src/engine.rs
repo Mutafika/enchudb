@@ -4049,6 +4049,9 @@ impl Engine {
             None
         };
         if let Some(global) = reused_global {
+            // 再利用 slot には前の住人の版数が残っている。 払い出す前に落とす
+            // (`clear_cell_versions` の doc 参照)。
+            self.clear_cell_versions(global);
             self.entities.allocate_at(global);
             if let Some(q) = self.write_queue.as_ref() {
                 q.push(crate::write_queue::Op::EntityCreated { local: global });
@@ -4411,7 +4414,12 @@ impl Engine {
                  use entity_in('<table>') instead of entity()"
             );
         }
-        let local = self.entities.allocate();
+        // 上限到達後の `allocate` は free stack から slot を再利用する。
+        // 再利用なら前の住人の版数を落としてから渡す (entity_in の再利用枝と同じ)。
+        let (local, reused) = self.entities.allocate_tracked();
+        if reused {
+            self.clear_cell_versions(local);
+        }
         // concurrent mode (= consumer thread 稼働) なら barrier 用に空 op を
         // 流す。 issue5: push_count と apply_count を対称に保たないと
         // `flush_writes` が ties drain 前に early return して live query が
@@ -4825,6 +4833,38 @@ impl Engine {
         self.himos[himo_id as usize].remove(local);
         self.store_cell_hlc(local, himo_id, hlc);
         true
+    }
+
+    /// slot 再利用時に **前の住人の版数を落とす** (v9)。
+    ///
+    /// version column / tombstone column は local slot で index されるので、 free
+    /// list から払い出された slot には前の住人の版数が残っている。 消さずに渡すと
+    /// 新しい住人への write が「前の住人の削除より古い」「前の住人の cell より
+    /// 古い」と判定されて **無言で落ちる** (`set_cell` は `false` を返すだけ)。
+    /// 古い record をまとめて再生する局面 (bootstrap / `Hlc::ZERO` からの pull) で
+    /// 顕在化する: 相手が t1 に author した record が、 こちらが t2 (> t1) に消した
+    /// **別の** entity の tombstone に負けて適用されない。
+    ///
+    /// 前の住人の eid は slot が free list に入った時点で到達不能なので、 版数を
+    /// 落として困る読み手はいない。
+    ///
+    /// `count() <= local` の column は **その cell を一度も書いていない** =
+    /// 中身は zero (= 版数不明) なので触らない。 growable backing の未コミット
+    /// page を掴まないための guard でもある (触ると SIGBUS)。
+    fn clear_cell_versions(&self, local: u32) {
+        if !self.has_cell_version() || local >= self.max_entities {
+            return;
+        }
+        for col in self.ver_cols.iter() {
+            if col.count() > local {
+                col.clear(local);
+            }
+        }
+        if let Some(col) = self.tomb_col.as_ref()
+            && col.count() > local
+        {
+            col.clear(local);
+        }
     }
 
     /// entity の削除版数を記録する (A-5)。 `false` = 受信 HLC が古いので不採用。
@@ -9636,6 +9676,78 @@ mod cell_version_tests {
         assert_eq!(eng.tombstone_hlc(eid), hlc(300, 1));
 
         assert_eq!(eng.cell_hlc(eid, hid), Hlc::ZERO, "tombstone が himo の版数を踏んだ");
+    }
+
+    // ──── slot 再利用: 前の住人の版数を持ち越さない ────
+
+    /// version / tombstone column は local slot で index されるので、 free list
+    /// から再利用された slot には前の住人の版数が残る。 落とさずに渡すと、 新しい
+    /// 住人への write が「前の住人の削除より古い」と判定されて **無言で落ちる**。
+    ///
+    /// 実害が出るのは bootstrap / `Hlc::ZERO` からの pull のように **古い record を
+    /// まとめて再生する**局面: 相手が t1 に author した record が、 こちらが
+    /// t2 (> t1) に消した無関係な entity の tombstone に負けて適用されない。
+    ///
+    /// falsify: `entity_in` の再利用枝から `clear_cell_versions` を外すと
+    /// 最後の 3 assert が落ちる。
+    #[test]
+    fn reused_table_slot_does_not_inherit_previous_tenant_version() {
+        let mut eng = Engine::create_with_capacity(&tmp("slot_reuse_table"), 1024).unwrap();
+        eng.define_himo("age", ValueType::Number, 0);
+        let hid = eng.himo_id("age").unwrap() as u16;
+        // slot 1 個だけの table → 2 個目の entity_in は必ず再利用に落ちる
+        eng.define_table("t", 1).unwrap();
+
+        let first = eng.entity_in("t").unwrap();
+        assert!(eng.set_cell(first, hid, 42, hlc(300, 1)));
+        assert!(eng.set_tombstone(first, hlc(300, 1)));
+        eng.delete(first); // slot が free list に戻る
+
+        let second = eng.entity_in("t").unwrap();
+        assert_eq!(
+            enchudb_oplog::eid_local(second),
+            enchudb_oplog::eid_local(first),
+            "前提が崩れた: slot が再利用されていない",
+        );
+
+        // 前の住人の版数 (300) より古い remote record 相当 = 実害が出る形
+        assert!(
+            eng.set_cell(second, hid, 7, hlc(200, 1)),
+            "前の住人の版数が新しい住人への write を無言で落とした",
+        );
+        assert_eq!(eng.get(second, "age"), Some(7));
+        assert_eq!(eng.cell_hlc(second, hid), hlc(200, 1));
+        assert_eq!(eng.tombstone_hlc(second), Hlc::ZERO, "前の住人の tombstone を引き継いだ");
+    }
+
+    /// anonymous table 側 (`entity()` → `EntitySet` free stack) の同じ穴。
+    /// こちらは eid 空間を使い切った時だけ再利用に落ちる。
+    #[test]
+    fn reused_entity_set_slot_does_not_inherit_previous_tenant_version() {
+        let mut eng = Engine::create_with_capacity(&tmp("slot_reuse_anon"), 2).unwrap();
+        eng.define_himo("age", ValueType::Number, 0);
+        let hid = eng.himo_id("age").unwrap() as u16;
+
+        let a = eng.entity();
+        let b = eng.entity(); // ここで max_entities (2) を使い切る
+        assert!(eng.set_cell(b, hid, 42, hlc(300, 1)));
+        assert!(eng.set_tombstone(b, hlc(300, 1)));
+        eng.delete(b);
+
+        let reused = eng.entity(); // free stack から b の slot を再利用
+        assert_ne!(enchudb_oplog::eid_local(reused), enchudb_oplog::eid_local(a));
+        assert_eq!(
+            enchudb_oplog::eid_local(reused),
+            enchudb_oplog::eid_local(b),
+            "前提が崩れた: free stack から再利用されていない",
+        );
+
+        assert!(
+            eng.set_cell(reused, hid, 7, hlc(200, 1)),
+            "前の住人の版数が新しい住人への write を無言で落とした",
+        );
+        assert_eq!(eng.get(reused, "age"), Some(7));
+        assert_eq!(eng.tombstone_hlc(reused), Hlc::ZERO, "前の住人の tombstone を引き継いだ");
     }
 
     // ──── step 4: ローカル write が版数を書く ────

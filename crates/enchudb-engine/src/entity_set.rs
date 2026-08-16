@@ -86,6 +86,16 @@ impl EntitySet {
     }
 
     pub fn allocate(&self) -> u32 {
+        self.allocate_tracked().0
+    }
+
+    /// `allocate` + 「その slot が free stack からの **再利用**か」。
+    ///
+    /// 再利用 slot は前の住人が書いた per-cell 版数 (v9 の version / tombstone
+    /// column) を持ち得るので、 払い出す側が落とす必要がある
+    /// (`Engine::clear_cell_versions`)。 monotonic 払い出し (= 新品 slot) では
+    /// 消す物が無いので、 hot path に消去コストを持ち込まないための戻り値。
+    pub fn allocate_tracked(&self) -> (u32, bool) {
         // 高速パス: monotonic increment（欠番方式、ロックフリー）
         let eid = self.next_eid_atomic().fetch_add(1, Ordering::Relaxed);
         if eid < self.max_entities {
@@ -94,11 +104,11 @@ impl EntitySet {
             // issue6 (perf 退化対策): writer hot path から mark_dirty を撤廃。
             // EntitySet 全領域は body_msync 内で常時 msync される (固定サイズ
             // で cheap な小領域)。
-            return eid;
+            return (eid, false);
         }
         // 上限到達 → fetch_addを巻き戻してfree stackから再利用
         self.next_eid_atomic().fetch_sub(1, Ordering::Relaxed);
-        self.allocate_from_free_stack()
+        (self.allocate_from_free_stack(), true)
     }
 
     /// free stack から pop。上限到達時のみ呼ばれる。
