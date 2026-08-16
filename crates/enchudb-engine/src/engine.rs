@@ -876,7 +876,16 @@ const FILE_MAGIC: [u8; 4] = *b"ECDB";
 /// 検証しない**ため、 新 slot で書かれた clean index を旧 slot 関数で読んで silent に
 /// lookup miss する。 これを防ぐために file version を上げ、 旧 binary の open を
 /// unsupported version で loud に失敗させる (mixed-version 運用は非サポート)。
-const FILE_VERSION: u32 = 8;
+/// v9 (request17): per-cell version column + tombstone column。 **領域の有無は
+/// version 番号ではなく `H_CELL_VERSION` flag が真実** (leaf region の
+/// `H_LEAF_DATA_SIZE == 0` と同じ self-describing 方式)。 v8 で作られた DB を v9
+/// binary で開くと version stamp だけ 9 に上がるが flag は 0 のままで、 layout は
+/// 1 byte も変わらない (= migration 不要)。 version を上げるのは、 v9 領域を持つ DB を
+/// **旧 binary が開いて version column を無視したまま書く**のを止めるため。
+const FILE_VERSION: u32 = 9;
+/// v8 (0.15.0〜0.18.x)。 v9 binary で writer open すると version stamp は 9 に上がる
+/// (layout は変わらない — v9 領域は `H_CELL_VERSION` flag で管理)。
+const FILE_VERSION_LEGACY_V8: u32 = 8;
 /// v7 (0.13.0〜0.14.x)。 writer open で v8 へ透過 migrate する (index も同時に VIX3 化)。
 const FILE_VERSION_LEGACY_V7: u32 = 7;
 /// v4 DB を後方互換で open する識別子。 v4 → v5 migrate は open 時透過。
@@ -1024,6 +1033,11 @@ const H_BACKING_KIND: usize = 76; // u32
 /// (pre-v6 DB)。 CRC 保護外 (H_PEER_ID / H_BACKING_KIND と同様、 破損は
 /// try_from_params の checked arithmetic + u32::MAX assert で捕捉)。
 const H_LEAF_DATA_SIZE: usize = 80; // u64
+/// v9 (request17): per-cell version column + tombstone column を持つか (u32、 0 = 無し)。
+/// sizes は `max_entities` / `max_himos` から一意に決まるので flag 1 本で足りる。
+/// CRC 保護外 (H_LEAF_DATA_SIZE と同様) だが、 破損して 1 に化けても layout の
+/// total_size が file size を超えて open 時に `backing too small` で弾かれる。
+const H_CELL_VERSION: usize = 88; // u32
 
 const BACKING_KIND_GROWABLE: u32 = 1;
 const H_HIMO_TYPES: usize = 256;
@@ -1067,6 +1081,9 @@ fn hlc_from_cell(b: &[u8]) -> enchudb_oplog::Hlc {
 /// された) region は Column header が空なので `init`、 既存 v9 DB の region は
 /// `load` する。 判定は header の value_size (offset 4..8) を覗くだけ。
 fn ver_column_from_region(region: Region, max_entities: u32) -> Column {
+    // growable backing では v9 領域は variable cluster の末尾 = 初期 commit の外。
+    // header (16B) を読む前に commit を伸ばさないと未コミット page で SIGBUS する。
+    let _ = region.ensure_committed(crate::column::HEADER_BYTES);
     let stored_vs = u32::from_le_bytes(region.slice()[4..8].try_into().unwrap());
     if stored_vs == HLC_CELL_BYTES {
         Column::load(region)
@@ -1417,6 +1434,20 @@ impl Layout {
         // cell には HLC を **生で** 置く (16B)。 intern 表案は `next_hlc()` が record ごとに
         // logical を進める実装のため「同じ HLC が繰り返し出る」ことが無く、
         // `4B(id) + 16B(entry)` = 20B/cell で生 HLC (16B) より重くなるので却下した。
+        //
+        // 並びは **tombstone → himo ごとの version column** の順。 growable backing の
+        // commit は単調な high-water mark なので、 後ろの region を触ると手前が丸ごと
+        // commit される (= apparent size が跳ねる)。 tombstone は 1 本しか無いので、
+        // 「delete しただけで version column 全体 (himo 数 × 16B/cell) が commit される」
+        // のを避けるために手前に置く。
+        let tomb_off = off;
+        let tomb_size = if cell_version {
+            align8(Column::region_size(max_entities, HLC_CELL_BYTES))
+        } else {
+            0
+        };
+        off = ck_add(off, tomb_size)?;
+
         let ver_base_off = off;
         let (ver_col_size, ver_total) = if cell_version {
             let s = align8(Column::region_size(max_entities, HLC_CELL_BYTES));
@@ -1428,14 +1459,6 @@ impl Layout {
             (0, 0)
         };
         off = ck_add(off, ver_total)?;
-
-        let tomb_off = off;
-        let tomb_size = if cell_version {
-            align8(Column::region_size(max_entities, HLC_CELL_BYTES))
-        } else {
-            0
-        };
-        off = ck_add(off, tomb_size)?;
 
         Ok(Layout {
             ver_base_off, ver_col_size,
@@ -1888,26 +1911,22 @@ impl Engine {
         Self::create_full_with_leaf_scale_v9(
             path, max_entities, vocab_data_size, max_himos, content_data_size,
             cyl_max_values, leaf_data_size, leaf_scale,
-            // v9 (request17): 未有効化。 全 create 経路が false を渡す間、
-            // file layout は pre-v9 と byte 単位で同一 (step 7 で反転)。
-            false,
+            // v9 (request17 step 7): per-cell version 領域を確保する。
+            true,
         )
     }
 
-    /// request17 Phase 1 step 2 の橋渡し: v9 (per-cell version) 領域を確保した
-    /// DB を作る。 **`FILE_VERSION` はまだ 8 のまま**なので、 この DB を再 open
-    /// すると header から v9 領域を復元できず、 全 cell が「版数不明」に戻る
-    /// (データ本体は無傷 — v9 領域は variable cluster の末尾で既存 region を
-    /// 1 byte も動かさないため)。
+    /// **v9 領域を持たない** DB を作る (= v8 相当の layout)。 pre-v9 DB を v9 binary で
+    /// 開く経路の回帰テスト用で、 通常の用途では使わない (`leaf_data_size = Some(0)` で
+    /// v5 相当 DB を作れるようにしてあるのと同じ趣旨)。
     ///
-    /// step 7 (`FILE_VERSION = 9` + header への記録) で通常 create に統合し、
-    /// この関数は消える。 それまでの間、 step 2〜5 の版数付き write を実プロセス内で
-    /// テストするための入口。
+    /// この DB では版数の置き場が per-cell column ではなく揮発 `HlcStore` になる
+    /// (= 判定は同じ、 記憶がプロセス寿命)。
     #[cfg(not(target_arch = "wasm32"))]
     #[doc(hidden)]
-    pub fn create_with_cell_version(path: &str, max_entities: u32) -> io::Result<Self> {
+    pub fn create_without_cell_version(path: &str, max_entities: u32) -> io::Result<Self> {
         Self::create_full_with_leaf_scale_v9(
-            path, max_entities, None, None, None, None, None, None, true,
+            path, max_entities, None, None, None, None, None, None, false,
         )
     }
 
@@ -1969,6 +1988,9 @@ impl Engine {
         mmap[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].copy_from_slice(&(layout.content_data_size as u64).to_le_bytes());
         mmap[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].copy_from_slice(&layout.cyl_max_values.to_le_bytes());
         mmap[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8].copy_from_slice(&(layout.leaf_data_size as u64).to_le_bytes());
+        // v9 (request17): per-cell version 領域の有無。 open 側はこの flag だけを見る。
+        mmap[H_CELL_VERSION..H_CELL_VERSION + 4]
+            .copy_from_slice(&(layout.has_cell_version() as u32).to_le_bytes());
 
         // v28: ヘッダ整合性 CRC
         write_header_crc(&mut mmap);
@@ -2007,9 +2029,8 @@ impl Engine {
         // v9 (request17-A5): tombstone column は himo に依らないので create 時に確保。
         // himo ごとの version column は define_himo_slot_locked で himo と同時に作る。
         let tomb_col = if layout.has_cell_version() {
-            Some(Column::init(
+            Some(ver_column_from_region(
                 unsafe { Region::new(base.add(layout.tomb_off), layout.tomb_size) },
-                HLC_CELL_BYTES,
                 max_entities,
             ))
         } else {
@@ -2089,7 +2110,7 @@ impl Engine {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create_growable_with_capacity(path: &str, max_entities: u32) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
-        let layout = Layout::compute(max_entities, max_himos, DEFAULT_VOCAB_DATA_SIZE, None, None, None, None, false).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, DEFAULT_VOCAB_DATA_SIZE, None, None, None, None, true).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
     }
 
@@ -2106,7 +2127,7 @@ impl Engine {
         vocab_data_size: usize,
     ) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
-        let layout = Layout::compute(max_entities, max_himos, vocab_data_size, None, None, None, None, false).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, vocab_data_size, None, None, None, None, true).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
     }
 
@@ -2124,7 +2145,7 @@ impl Engine {
     ) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
         let vds = vocab_data_size.unwrap_or(DEFAULT_VOCAB_DATA_SIZE);
-        let layout = Layout::compute(max_entities, max_himos, vds, None, None, leaf_data_size, None, false).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, vds, None, None, leaf_data_size, None, true).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let leaf_cap = leaf_scale.cap_bytes();
         if layout.leaf_data_size as u64 > leaf_cap {
             return Err(io::Error::new(
@@ -2151,7 +2172,7 @@ impl Engine {
             Some(opts.cyl_max_values),
             opts.leaf_data_size,
             opts.vocab_max_entries, // #122
-            false,                  // v9 (request17): 未有効化
+            true,                   // v9 (request17): per-cell version 領域を確保
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let leaf_cap = opts.leaf_scale.cap_bytes();
@@ -2275,6 +2296,9 @@ impl Engine {
             .copy_from_slice(&BACKING_KIND_GROWABLE.to_le_bytes());
         header[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8]
             .copy_from_slice(&(layout.leaf_data_size as u64).to_le_bytes());
+        // v9 (request17): per-cell version 領域の有無。
+        header[H_CELL_VERSION..H_CELL_VERSION + 4]
+            .copy_from_slice(&(layout.has_cell_version() as u32).to_le_bytes());
         write_header_crc(header);
 
         let _ = base; // base ptr is implicit via Region::with_grower from here on
@@ -2339,9 +2363,8 @@ impl Engine {
         }, leaf_off_shift));
         // v9 (request17-A5): tombstone column (mmap create 経路と同じ、 grower 版)。
         let tomb_col = if layout.has_cell_version() {
-            Some(Column::init(
+            Some(ver_column_from_region(
                 unsafe { Region::with_grower(map.clone(), layout.tomb_off, layout.tomb_size) },
-                HLC_CELL_BYTES,
                 max_entities,
             ))
         } else {
@@ -2662,12 +2685,15 @@ impl Engine {
 
         // v6 (#88): leaf region size (pre-v6 header は 0 = leaf region 無し)。
         let leaf_data_size = u64::from_le_bytes(buf[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8].try_into().unwrap()) as usize;
+        // v9 (request17): v9 領域の有無 (無しなら layout は pre-v9 と完全同一)。
+        let cell_version =
+            u32::from_le_bytes(buf[H_CELL_VERSION..H_CELL_VERSION + 4].try_into().unwrap()) != 0;
         let layout = Layout::try_from_params(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, leaf_data_size, cyl_max_values,
-            false, // v9 (request17): 未有効化。 header から読むのは有効化と同時
+            cell_version,
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -2788,6 +2814,10 @@ impl Engine {
         dst[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION_LEGACY_V6.to_le_bytes());
         dst[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8]
             .copy_from_slice(&(layout.leaf_data_size as u64).to_le_bytes());
+        // v9 (request17): 出力は v6 layout なので per-cell version 領域は無い。
+        // src 由来の flag が残ると、 open 側が「有る」前提の layout を組んで
+        // `backing too small` になる (src が v9 DB の場合)。
+        dst[H_CELL_VERSION..H_CELL_VERSION + 4].copy_from_slice(&0u32.to_le_bytes());
         write_header_crc(&mut dst);
 
         let type_bytes: Vec<u8> = (0..himo_count as usize).map(|hid| dst[H_HIMO_TYPES + hid]).collect();
@@ -2912,15 +2942,16 @@ impl Engine {
         // v7 (現行) / v6 / v5 / v4 を受け付ける。 v6 は leaf offset が byte だが、
         // LeafStore が region header の off_shift=0 で self-describing に read-through。
         if version != FILE_VERSION
+            && version != FILE_VERSION_LEGACY_V8
             && version != FILE_VERSION_LEGACY_V7
             && version != FILE_VERSION_LEGACY_V6
             && version != FILE_VERSION_LEGACY_V5
             && version != FILE_VERSION_LEGACY_V4
         {
             return Err(format!(
-                "unsupported EnchuDB file version {} (supported: {}, {}/{}/{}/{} compat). dev phase — recreate the DB.",
-                version, FILE_VERSION, FILE_VERSION_LEGACY_V7, FILE_VERSION_LEGACY_V6,
-                FILE_VERSION_LEGACY_V5, FILE_VERSION_LEGACY_V4
+                "unsupported EnchuDB file version {} (supported: {}, {}/{}/{}/{}/{} compat). dev phase — recreate the DB.",
+                version, FILE_VERSION, FILE_VERSION_LEGACY_V8, FILE_VERSION_LEGACY_V7,
+                FILE_VERSION_LEGACY_V6, FILE_VERSION_LEGACY_V5, FILE_VERSION_LEGACY_V4
             ));
         }
         // v28: ヘッダ整合性 CRC 検証(stored == 0 は v27 以前の DB として許容)
@@ -2951,12 +2982,17 @@ impl Engine {
         // validate_file_size で field sanity 済み、 Memory 経路 (from_bytes) は
         // ここが最初の防壁。
         let leaf_data_size = u64::from_le_bytes(buf[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8].try_into().unwrap()) as usize;
+        // v9 (request17): v9 領域の有無は header flag が真実 (version 番号ではない)。
+        // v8 で作られた DB は 0 のまま = version column 無し → 版数は揮発 HlcStore に
+        // fallback する (A-1 の「migration 不要」)。
+        let cell_version =
+            u32::from_le_bytes(buf[H_CELL_VERSION..H_CELL_VERSION + 4].try_into().unwrap()) != 0;
         let layout = Layout::try_from_params(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, leaf_data_size, cyl_max_values,
-            false, // v9 (request17): 未有効化。 header から読むのは有効化と同時
+            cell_version,
         )?;
 
         // backing が layout 全域をカバーしているか (Memory 経路の truncated bytes
@@ -4566,7 +4602,11 @@ impl Engine {
     #[inline]
     fn cell_hlc_local(&self, local: u32, himo_id: u16) -> enchudb_oplog::Hlc {
         match self.ver_col(himo_id) {
-            Some(col) if local < self.max_entities => hlc_from_cell(col.get(local)),
+            Some(col) if local < self.max_entities => {
+                // growable backing: 未コミット page は read でも SIGBUS。
+                let _ = col.ensure_committed_for(local);
+                hlc_from_cell(col.get(local))
+            }
             _ => enchudb_oplog::Hlc::ZERO,
         }
     }
@@ -4581,7 +4621,10 @@ impl Engine {
     #[inline]
     fn tombstone_hlc_local(&self, local: u32) -> enchudb_oplog::Hlc {
         match self.tomb_col.as_ref() {
-            Some(col) if local < self.max_entities => hlc_from_cell(col.get(local)),
+            Some(col) if local < self.max_entities => {
+                let _ = col.ensure_committed_for(local);
+                hlc_from_cell(col.get(local))
+            }
             _ => enchudb_oplog::Hlc::ZERO,
         }
     }
@@ -4685,6 +4728,8 @@ impl Engine {
         }
         match self.ver_col(himo_id) {
             Some(col) => {
+                // growable backing: 未コミット page への書き込みは SIGBUS。
+                let _ = col.ensure_committed_for(local);
                 col.ensure_count(local);
                 col.set(local, &hlc_to_cell(hlc));
             }
@@ -4797,6 +4842,7 @@ impl Engine {
         }
         match self.tomb_col.as_ref() {
             Some(col) => {
+                let _ = col.ensure_committed_for(local);
                 col.ensure_count(local);
                 col.set(local, &hlc_to_cell(hlc));
             }
@@ -9402,9 +9448,11 @@ mod layout_v9_tests {
             assert_eq!(b - a, l.ver_col_size, "himo {hid} と {} の slot が重なる", hid + 1);
         }
 
+        // 並びは tombstone → version columns (growable の commit が単調なので、
+        // 1 本しかない tombstone を手前に置く)。
+        assert!(l.tomb_off + l.tomb_size <= l.ver_base_off, "tombstone が version column を踏んでいる");
         let last_end = l.ver_col_off(15) + l.ver_col_size;
-        assert!(last_end <= l.tomb_off, "version column が tombstone column を踏んでいる");
-        assert!(l.tomb_off + l.tomb_size <= l.total_size, "tombstone column が file 外に出ている");
+        assert!(last_end <= l.total_size, "version column が file 外に出ている");
     }
 
     /// cell は HLC を生で持つので、 1 himo ぶんの version column は
@@ -9442,7 +9490,7 @@ mod cell_version_tests {
 
     /// v9 DB + himo 1 本 + entity 1 つ。
     fn v9_engine(name: &str, himo: &str) -> (Engine, u16, enchudb_oplog::EntityId) {
-        let mut eng = Engine::create_with_cell_version(&tmp(name), 1024).unwrap();
+        let mut eng = Engine::create_with_capacity(&tmp(name), 1024).unwrap();
         eng.define_himo(himo, ValueType::Number, 0);
         let hid = eng.himo_id(himo).unwrap() as u16;
         let eid = eng.entity();
@@ -9455,9 +9503,9 @@ mod cell_version_tests {
         assert!(eng.has_cell_version(), "v9 create が version 領域を確保していない");
         assert_eq!(eng.cell_hlc(eid, hid), Hlc::ZERO, "未書き込み cell は版数不明");
 
-        let mut old = Engine::create_with_capacity(&tmp("no_region"), 1024).unwrap();
+        let mut old = Engine::create_without_cell_version(&tmp("no_region"), 1024).unwrap();
         old.define_himo("age", ValueType::Number, 0);
-        assert!(!old.has_cell_version(), "通常 create が v9 領域を確保している (step 7 まで無効のはず)");
+        assert!(!old.has_cell_version(), "pre-v9 create が v9 領域を確保している");
     }
 
     #[test]
@@ -9530,7 +9578,7 @@ mod cell_version_tests {
     /// 永続の column が無いので `cell_hlc` は ZERO のまま、 プロセスを跨ぐと忘れる。
     #[test]
     fn pre_v9_db_falls_back_to_volatile_versions() {
-        let mut eng = Engine::create_with_capacity(&tmp("prev9_write"), 1024).unwrap();
+        let mut eng = Engine::create_without_cell_version(&tmp("prev9_write"), 1024).unwrap();
         eng.define_himo("age", ValueType::Number, 0);
         let hid = eng.himo_id("age").unwrap() as u16;
         let eid = eng.entity();
@@ -9588,7 +9636,7 @@ mod cell_version_tests {
     fn v9_with_wal(name: &str, himo: &str) -> (std::sync::Arc<Engine>, u16) {
         let path = tmp(name);
         let _ = std::fs::remove_file(format!("{path}.wal"));
-        let mut eng = Engine::create_with_cell_version(&path, 1024).unwrap();
+        let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
         eng.define_himo(himo, ValueType::Number, 0);
         let hid = eng.himo_id(himo).unwrap() as u16;
         let arc = Engine::concurrentize_with_oplog(eng, 1024 * 1024).unwrap();
@@ -9707,6 +9755,105 @@ mod cell_version_tests {
         assert_ne!(eng.tombstone_hlc(eid2), Hlc::ZERO, "async delete が tombstone を残していない");
     }
 
+    // ──── step 7: v9 を既定にする (版数が reopen を跨いで残る) ────
+
+    /// **版数が reopen を跨いで残る** — request17 全体の目的そのもの。
+    ///
+    /// 従来 LWW の真実は揮発 HashMap にしか無く、 プロセスが落ちるか配送バッファが
+    /// reclaim されると失われた (#140 / #154 / #160 の共通の根)。 v9 では cell と
+    /// 一緒に永続するので、 reopen 後も古い record に負けない。
+    #[test]
+    fn versions_survive_reopen() {
+        let path = tmp("reopen");
+        let (eid, other, hid) = {
+            let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
+            eng.define_himo("age", ValueType::Number, 0);
+            let hid = eng.himo_id("age").unwrap() as u16;
+            let eid = eng.entity();
+            let other = eng.entity();
+            assert!(eng.has_cell_version(), "通常 create が v9 領域を確保していない");
+            assert!(eng.set_cell(eid, hid, 42, hlc(500, 7)));
+            assert!(eng.set_tombstone(other, hlc(600, 7)));
+            eng.flush().unwrap();
+            (eid, other, hid)
+        };
+
+        let eng = Engine::open_standalone(&path).unwrap();
+        assert!(eng.has_cell_version(), "reopen で v9 領域を見失った");
+        assert_eq!(eng.get(eid, "age"), Some(42), "値が消えた");
+        assert_eq!(eng.cell_hlc(eid, hid), hlc(500, 7), "cell の版数が reopen で消えた");
+        assert_eq!(eng.tombstone_hlc(other), hlc(600, 7), "tombstone が reopen で消えた");
+
+        // 記憶が残っているので、 reopen 後も古い record は負ける
+        assert!(
+            !eng.remote_tie_apply(eid, hid, 9, hlc(400, 7), None),
+            "reopen 後に古い record が勝った (版数が永続していない)",
+        );
+        assert_eq!(eng.get(eid, "age"), Some(42));
+    }
+
+    /// **growable backing で v9 領域を書いても SIGBUS しない**。
+    ///
+    /// growable の commit は初期値が `vocab_data_off` (= 固定 cluster まで) で、
+    /// v9 領域は variable cluster の末尾 = その外側にある。 触る前に commit を
+    /// 伸ばさないと未コミット page への read/write で **プロセスが即死** する
+    /// (step 7 で実際に踏んだ: bench が exit 138 = SIGBUS)。
+    ///
+    /// 既存の growable テストが素通ししたのは、 oplog 無しでは版数が `ZERO` で
+    /// version column を一度も触らないため。 oplog 付きで書くこと自体が条件。
+    #[test]
+    fn growable_backing_writes_versions_without_sigbus() {
+        let path = tmp("growable_v9");
+        let _ = std::fs::remove_file(format!("{path}.wal"));
+        let mut eng = Engine::create_growable_with_capacity(&path, 100_000).unwrap();
+        eng.define_himo("age", ValueType::Number, 0);
+        let hid = eng.himo_id("age").unwrap() as u16;
+        let eng = Engine::concurrentize_with_oplog(eng, 1024 * 1024).unwrap();
+        assert!(eng.has_cell_version(), "growable create が v9 領域を確保していない");
+
+        // 末尾寄りの eid ほど commit の外 — 手前だけ触って満足しないように広く書く。
+        let mut eids = Vec::new();
+        for i in 0..64u32 {
+            let e = eng.entity();
+            eng.tie_to(e, "age", i);
+            eids.push(e);
+        }
+        eng.tie_async(eids[0], "age", 999);
+        eng.delete(eids[1]);
+        eng.flush_writes();
+
+        assert_ne!(eng.cell_hlc(eids[0], hid), Hlc::ZERO, "版数が記録されていない");
+        assert_ne!(eng.tombstone_hlc(eids[1]), Hlc::ZERO, "tombstone が記録されていない");
+        assert_eq!(eng.get(eids[0], "age"), Some(999));
+    }
+
+    /// pre-v9 DB を v9 binary で開いて (a) 開ける (b) 既存データが読める
+    /// (c) 版数不明として従来どおり適用される (A-1 の「migration 不要」)。
+    #[test]
+    fn pre_v9_db_opens_and_behaves_as_before() {
+        let path = tmp("prev9_reopen");
+        let (eid, hid) = {
+            let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+            eng.define_himo("age", ValueType::Number, 0);
+            let hid = eng.himo_id("age").unwrap() as u16;
+            let eid = eng.entity();
+            eng.tie_to(eid, "age", 7);
+            eng.flush().unwrap();
+            (eid, hid)
+        };
+
+        let eng = Engine::open_standalone(&path).unwrap();
+        assert!(!eng.has_cell_version(), "pre-v9 DB に v9 領域が生えた (勝手に migrate した)");
+        assert_eq!(eng.get(eid, "age"), Some(7), "既存データが読めない");
+        assert_eq!(eng.cell_hlc(eid, hid), Hlc::ZERO, "持てないはずの版数を返した");
+        // 版数不明なので remote record は従来どおり適用される
+        assert!(
+            eng.remote_tie_apply(eid, hid, 9, hlc(400, 7), None),
+            "版数不明 cell への remote apply を止めた (既存 DB が同期不能になる)",
+        );
+        assert_eq!(eng.get(eid, "age"), Some(9));
+    }
+
     // ──── step 5: remote apply も同じ 1 本を通る ────
 
     /// tombstone より古い remote Tie は **適用されない** (A-5)。 これが永続する
@@ -9788,7 +9935,7 @@ mod cell_version_tests {
     fn wal_hlcs_are_monotonic_in_record_order() {
         let path = tmp("wal_monotonic");
         let _ = std::fs::remove_file(format!("{path}.wal"));
-        let mut eng = Engine::create_with_cell_version(&path, 1024).unwrap();
+        let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
         eng.define_himo("age", ValueType::Number, 0);
         eng.define_himo("name", ValueType::Tag, 0);
         let eng = Engine::concurrentize_with_oplog(eng, 1024 * 1024).unwrap();
@@ -9823,7 +9970,7 @@ mod cell_version_tests {
     fn pre_v9_local_writes_are_unchanged() {
         let path = tmp("prev9_local");
         let _ = std::fs::remove_file(format!("{path}.wal"));
-        let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
+        let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
         eng.define_himo("age", ValueType::Number, 0);
         let hid = eng.himo_id("age").unwrap() as u16;
         let eng = Engine::concurrentize_with_oplog(eng, 1024 * 1024).unwrap();

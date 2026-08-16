@@ -106,9 +106,17 @@ fn default_keeps_legacy_multiplier() {
     cleanup(&path);
 }
 
-/// #123: 新規 DB は v8。 v7 DB は writer open で v8 へ上がる (= 旧 binary が開けなくなる)。
+/// #123: 新規 DB は現行 version。 v7 DB は writer open で現行へ上がる
+/// (= 旧 binary が開けなくなる)。
+///
+/// request17 (v9) で現行は 9。 **version stamp が上がっても v9 領域は生えない**
+/// (per-cell version の有無は別 header flag `H_CELL_VERSION` が持つ) ので、
+/// 既存 DB の layout は 1 byte も変わらない — その回帰は engine 側の
+/// `pre_v9_db_opens_and_behaves_as_before` が見ている。
+const CURRENT_FILE_VERSION: u32 = 9;
+
 #[test]
-fn v7_db_upgrades_to_v8_on_writer_open() {
+fn v7_db_upgrades_to_current_version_on_writer_open() {
     let path = tmp_path("v7upgrade");
     cleanup(&path);
 
@@ -118,7 +126,11 @@ fn v7_db_upgrades_to_v8_on_writer_open() {
         eng.define_himo("k", ValueType::Tag, 1024);
         drop(eng);
     }
-    assert_eq!(header_u32(&path, H_VERSION), 8, "新規 create が v8 でない");
+    assert_eq!(
+        header_u32(&path, H_VERSION),
+        CURRENT_FILE_VERSION,
+        "新規 create が現行 version でない",
+    );
 
     // v7 を偽造する。 header CRC == 0 は「v27 以前の DB」として検証を通る経路なので、
     // version を 7 に戻して CRC を 0 にすれば v7 DB として open される。
@@ -140,8 +152,8 @@ fn v7_db_upgrades_to_v8_on_writer_open() {
     }
     assert_eq!(
         header_u32(&path, H_VERSION),
-        8,
-        "writer open で v8 へ migrate されていない (旧 binary が新 index を誤読する穴が残る)"
+        CURRENT_FILE_VERSION,
+        "writer open で現行 version へ migrate されていない (旧 binary が新 index を誤読する穴が残る)"
     );
 
     Engine::open(&path).expect("migrate 後も open できること");
