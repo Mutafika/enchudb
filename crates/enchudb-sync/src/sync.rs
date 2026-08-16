@@ -148,11 +148,19 @@ impl Syncer {
             subscription_filter: std::sync::RwLock::new(Arc::new(AllRecords)),
             warned_unconfigured_peer: std::sync::atomic::AtomicBool::new(false),
         };
-        // HlcStore は engine 内部のメモリ構造で永続化されない。 engine reopen 後は
-        // 空状態なので、 attach 時に WAL を walk して LWW state を再構築する。
-        // これがないと sync で過去レコードを未知扱いして再 apply してしまい、
-        // 削除済み entity が復活する (= ① のバグの根本)。
-        syncer.hydrate_hlc_store(&engine);
+        // request17 step 6: **v9 DB では hydrate しない**。
+        //
+        // v9 (per-cell version column) では LWW の版数が cell と一緒に永続するので、
+        // 「配送バッファ (`_sync_ops`) から揮発 HashMap を再構築する」必要が無い。
+        // この再構築こそが #140 / #154 / #160 の共通の根 (= 配れる履歴が reclaim
+        // されたら記憶も消える) だったので、 v9 では経路ごと通らない。
+        //
+        // pre-v9 DB (v8 以前で作られ、 migration していない DB) は版数の置き場が
+        // 揮発 `HlcStore` のままなので、 従来どおり hydrate する。 pre-v9 の
+        // サポートを落とす時にこの分岐ごと消える。
+        if !engine.has_cell_version() {
+            syncer.hydrate_hlc_store(&engine);
+        }
         syncer
     }
 
@@ -213,6 +221,8 @@ impl Syncer {
     /// ローカルのより新しい行が巻き戻る (tombstone の記憶も消えるので削除済み entity の
     /// 復活にもなる)。 fold で WAL から消えた record は bridge 先の `_sync_ops`
     /// (永続) に残っているので、 そちらも歩く。
+    /// **pre-v9 DB 専用の legacy 経路** (request17 step 6)。 v9 DB は版数を cell と
+    /// 一緒に永続するので呼ばれない (`Syncer::new` の分岐を参照)。
     fn hydrate_hlc_store(&self, engine: &Engine) {
         let store = engine.hlc_store();
         // 1. WAL の生存範囲 (fold されていない分)

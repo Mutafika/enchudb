@@ -60,9 +60,11 @@ pub struct EngineStats {
     pub applied: u64,
     /// v32: 自 peer の peer_id(非 v32 では 0)
     pub peer_id: u32,
-    /// v32: HlcStore の総エントリ数((eid, himo) で区別、非 v32 では 0)
+    /// **pre-v9 DB の**揮発版数置き場のエントリ数。 v9 DB では版数が
+    /// per-cell version column に載るので常に 0 (走査が O(entity × himo) に
+    /// なるため column 側の集計は取らない)。
     pub hlc_entries: usize,
-    /// v32: HlcStore 内の最大 HLC(LWW 基準の最新書き込み時刻、非 v32 では None)
+    /// 同上 — pre-v9 DB の揮発置き場の最大 HLC。 v9 DB では None。
     pub max_hlc: Option<enchudb_oplog::Hlc>,
 }
 
@@ -2509,8 +2511,6 @@ impl Engine {
         // sync で mapping は張り直せる)。
         match load_eidmap_from_sidecar(path) {
             Ok(Some(entries)) => {
-                // peer_id は上で header から復元済み → translated eid の key が正しく作れる。
-                let self_peer = eng.peer_id();
                 for (peer, foreign_local, local, tomb) in entries {
                     eng.eid_translator.insert(peer, foreign_local, local);
                     // #9 (H4): `.eidmap` と `.tables` は別々の rename なので crash で
@@ -2518,12 +2518,15 @@ impl Engine {
                     // 越すよう前進させ、 stale `.tables` でも mapped slot を再 alloc して
                     // 衝突する事態を防ぐ (= 最悪でも「重複」に留め「衝突」を起こさない)。
                     Self::advance_table_next_local_for(&eng.tables, local);
-                    // #9 (C): foreign Delete tombstone を HlcStore に復元する。 これが無いと
+                    // #9 (C): foreign Delete tombstone を復元する。 これが無いと
                     // reopen で tombstone が消え、 Delete より古い Tie が (Delete 抜きで) 再配送
                     // された時に削除済み entity が復活する。 ZERO は未削除なので skip。
+                    //
+                    // request17 step 6: 復元先も `set_tombstone_local` に一本化
+                    // (v9 なら tombstone column、 pre-v9 なら HlcStore)。 v9 では既に
+                    // 本体側に載っているので monotone-max の no-op になる。
                     if tomb != enchudb_oplog::Hlc::ZERO {
-                        eng.hlc_store
-                            .force_set(enchudb_oplog::make_eid(self_peer, local), u16::MAX, tomb);
+                        eng.set_tombstone_local(local, tomb);
                     }
                 }
             }
@@ -4125,21 +4128,22 @@ impl Engine {
         found
     }
 
-    /// #9: persist 用に翻訳写像 + 各 entity の foreign tombstone HLC を集める。 tombstone は
-    /// HlcStore の `(translated_eid, u16::MAX)` から引く (未削除なら `Hlc::ZERO`)。 reopen 時に
-    /// `.eidmap` v2 から復元され、 削除済み foreign entity の resurrection を防ぐ。
-    /// 呼ばれるのは persist trigger (consumer tick / 明示 persist) のみで read hot path 外。
+    /// #9: persist 用に翻訳写像 + 各 entity の foreign tombstone HLC を集める。
+    /// reopen 時に `.eidmap` v2 から復元され、 削除済み foreign entity の
+    /// resurrection を防ぐ。 呼ばれるのは persist trigger (consumer tick / 明示
+    /// persist) のみで read hot path 外。
+    ///
+    /// request17 step 6: tombstone の出所は `tombstone_version_of` に一本化した
+    /// (v9 なら tombstone column、 pre-v9 なら従来の揮発 `HlcStore`)。 v9 では
+    /// 版数が本体側に永続しているので sidecar は冗長だが、 pre-v9 DB と同じ
+    /// sidecar を書き続けることで **v9 binary で書いた DB を pre-v9 の経路で
+    /// 読んでも tombstone が失われない**。
     fn eidmap_entries_with_tombstones(&self) -> Vec<EidmapEntry> {
-        let self_peer = self.peer_id();
         self.eid_translator
             .snapshot()
             .into_iter()
             .map(|(peer, foreign_local, local)| {
-                let tomb = self
-                    .hlc_store
-                    .get(enchudb_oplog::make_eid(self_peer, local), u16::MAX)
-                    .unwrap_or(enchudb_oplog::Hlc::ZERO);
-                (peer, foreign_local, local, tomb)
+                (peer, foreign_local, local, self.tombstone_version_of(local))
             })
             .collect()
     }
@@ -4488,7 +4492,11 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// LWW 用 HlcStore への参照(sync モジュールが使う)。
+    /// **pre-v9 DB の版数置き場**への参照 (legacy)。 v9 DB では空のまま
+    /// (版数は per-cell version column に永続する)。 判定はすべて engine の
+    /// `set_cell` 側で行うので、 新しい呼び出しを増やさないこと。
+    /// 残っている用途は sync 側の `hydrate_hlc_store` (pre-v9 専用) と
+    /// legacy `Content` op の key 単位 LWW だけ。
     pub fn hlc_store(&self) -> &std::sync::Arc<crate::hlc_store::HlcStore> {
         &self.hlc_store
     }
