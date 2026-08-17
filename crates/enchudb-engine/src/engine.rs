@@ -389,10 +389,27 @@ type EidmapEntry = (enchudb_oplog::PeerId, u32, u32, enchudb_oplog::Hlc);
 /// #9: 翻訳 entry を binary encode (v2)。
 /// layout: magic "EIDM"(4) + version u32=2 + count u32
 ///         + (peer u32, foreign u32, local u32, tomb_wall u64, tomb_logical u32, tomb_peer u32) × count
+/// #166: `.eidmap` の現行 format 版数。
+///
+/// - v1: tombstone 無し (12 byte/entry)
+/// - v2: tombstone 込み (28 byte/entry)
+/// - v3: v2 と **同じ 28 byte/entry**。 `local == NO_LOCAL_SLOT` の entry が
+///   「slot を持たない削除記録」 を意味するようになった (`foreign_tombs` の永続化)
+///
+/// 読み手は 3 版すべてを読める。 v3 を v2 の reader に食わせると
+/// `NO_LOCAL_SLOT` を実在 slot として扱ってしまうので版数を上げてある
+/// (v9 DB は FILE_VERSION 側で旧 binary を弾くため実害は無いが、 format の
+/// 自己記述性として正しい形にしておく)。
+const EIDMAP_VERSION: u32 = 3;
+
+/// #166: 「この entry は写像ではなく削除記録だけ」 を表す番兵。
+/// `max_entities` は `u32::MAX` 未満なので実在 slot と衝突しない。
+const NO_LOCAL_SLOT: u32 = u32::MAX;
+
 fn serialize_eidmap(entries: &[EidmapEntry]) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + entries.len() * 28);
     out.extend_from_slice(b"EIDM");
-    out.extend_from_slice(&2u32.to_le_bytes());
+    out.extend_from_slice(&EIDMAP_VERSION.to_le_bytes());
     out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for &(peer, foreign_local, local, tomb) in entries {
         out.extend_from_slice(&peer.to_le_bytes());
@@ -414,7 +431,9 @@ fn deserialize_eidmap(buf: &[u8]) -> Result<Vec<EidmapEntry>, String> {
     let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
     let entry_size = match version {
         1 => 12usize,
-        2 => 28usize,
+        // v2 と v3 は同じ長さ。 違いは `local == NO_LOCAL_SLOT` の解釈だけで、
+        // その判定は読み手 (`load` 側) が行う。
+        2 | 3 => 28usize,
         v => return Err(format!("eidmap sidecar: unsupported version {}", v)),
     };
     let count = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
@@ -1752,6 +1771,22 @@ pub struct Engine {
     hlc_store: std::sync::Arc<crate::hlc_store::HlcStore>,
     /// #9: 受信した foreign eid を自分の eid 空間の local eid に翻訳する写像。
     eid_translator: std::sync::Arc<crate::eid_translator::EidTranslator>,
+    /// #166: **slot から切り離された** foreign entity の削除版数。
+    ///
+    /// tombstone は普段 local slot 側 (v9 の tombstone column / pre-v9 の
+    /// `HlcStore`) に載るが、 slot が別の住人に再利用されると当然そこには残せない。
+    /// 一方 「その foreign entity は削除済み」 という事実は **identity に属する**
+    /// ので、 slot を手放しても覚えていないと、 削除より古い record が再配送された
+    /// ときに新しい slot を確保して復活してしまう (#140 の再来)。
+    ///
+    /// そこで slot を手放す時点で `(author_peer, foreign_local) -> Hlc` に退避し、
+    /// 同じ identity に新しい slot を払い出すとき (`alloc_translated_local`) に
+    /// その slot へ書き戻す。 これで 「削除済み」 が slot の寿命から独立する。
+    foreign_tombs: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<(enchudb_oplog::PeerId, u32), enchudb_oplog::Hlc>>>,
+    /// #166: `foreign_tombs` が空かどうかの fast path flag。 slot 再利用が一度も
+    /// 起きていない DB (= 常態) で、 受信 apply の hot path が read lock すら
+    /// 取らないようにするためだけのもの。
+    foreign_tombs_empty: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// v32 Phase C: 自 peer の ed25519 鍵ペア。None なら署名しない/検証もしない。
     keypair: std::sync::RwLock<Option<std::sync::Arc<enchudb_oplog::keys::Keypair>>>,
     /// v32 Phase C: 他 peer の pubkey TOFU ストア。Syncer が verify に使う。
@@ -2070,6 +2105,8 @@ impl Engine {
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
+            foreign_tombs: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            foreign_tombs_empty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             keypair: std::sync::RwLock::new(None),
             pubkeys: std::sync::Arc::new(enchudb_oplog::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
@@ -2410,6 +2447,8 @@ impl Engine {
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
+            foreign_tombs: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            foreign_tombs_empty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             keypair: std::sync::RwLock::new(None),
             pubkeys: std::sync::Arc::new(enchudb_oplog::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
@@ -2512,6 +2551,13 @@ impl Engine {
         match load_eidmap_from_sidecar(path) {
             Ok(Some(entries)) => {
                 for (peer, foreign_local, local, tomb) in entries {
+                    // #166: 写像を持たない削除記録 (slot を手放した identity)。
+                    // 写像も slot も復元せず、 退避表にだけ載せる。 次にこの
+                    // identity へ slot を払い出すとき書き戻される。
+                    if local == NO_LOCAL_SLOT {
+                        eng.remember_foreign_tombstone(peer, foreign_local, tomb);
+                        continue;
+                    }
                     eng.eid_translator.insert(peer, foreign_local, local);
                     // #9 (H4): `.eidmap` と `.tables` は別々の rename なので crash で
                     // 不整合になりうる。 mapped local を table の next_local が必ず追い
@@ -3164,6 +3210,8 @@ impl Engine {
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
+            foreign_tombs: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            foreign_tombs_empty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             keypair: std::sync::RwLock::new(None),
             pubkeys: std::sync::Arc::new(enchudb_oplog::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
@@ -4142,13 +4190,23 @@ impl Engine {
     /// sidecar を書き続けることで **v9 binary で書いた DB を pre-v9 の経路で
     /// 読んでも tombstone が失われない**。
     fn eidmap_entries_with_tombstones(&self) -> Vec<EidmapEntry> {
-        self.eid_translator
+        let mut out: Vec<EidmapEntry> = self
+            .eid_translator
             .snapshot()
             .into_iter()
             .map(|(peer, foreign_local, local)| {
                 (peer, foreign_local, local, self.tombstone_version_of(local))
             })
-            .collect()
+            .collect();
+        // #166: slot を手放した identity の削除記録も残す。 これが無いと reopen で
+        // 「削除済み」 を忘れ、 削除より古い record の再配送で復活する。
+        // 写像を持たないので `local` は番兵。
+        out.extend(
+            self.orphan_foreign_tombstones()
+                .into_iter()
+                .map(|(peer, foreign_local, tomb)| (peer, foreign_local, NO_LOCAL_SLOT, tomb)),
+        );
+        out
     }
 
     /// 0.8.1: `&self` で tables sidecar を強制 persist する public API。
@@ -4861,6 +4919,9 @@ impl Engine {
     /// `(author_peer, foreign_local) -> local` 写像も同じ理由で stale になるが、
     /// そちらは remove API 自体が無く master から続く別の穴なので #166 で扱う。
     fn clear_cell_versions(&self, local: u32) {
+        // #166: 版数を消す **前** に翻訳写像を外す。 退避する tombstone は
+        // まだ slot 上にあるので、 順序を逆にすると読めなくなる。
+        self.evict_translation_for_reuse(local);
         if local >= self.max_entities {
             return;
         }
@@ -4883,6 +4944,83 @@ impl Engine {
         {
             col.clear(local);
         }
+    }
+
+    /// #166: slot を別の住人に渡す前に、 **その slot が持っていた翻訳写像を外し、
+    /// 削除版数を identity 側へ退避する**。
+    ///
+    /// 写像を外さないと、 元の foreign entity 宛の record が新しい住人へ書き込まれる
+    /// (無関係な行の silent 破壊)。 かといって外すだけだと、 削除より古い record が
+    /// 「初見の foreign entity」として新しい slot を確保し **削除済み entity が復活
+    /// する** — 破壊が復活に化けるだけになる。 tombstone は slot ではなく identity に
+    /// 属する事実なので、 `foreign_tombs` へ移して slot の寿命から切り離す。
+    ///
+    /// レプリカでない local (= 自分が産んだ entity) では no-op。
+    fn evict_translation_for_reuse(&self, local: u32) {
+        let Some(key) = self.eid_translator.remove_local(local) else {
+            return;
+        };
+        let tomb = self.tombstone_version_of(local);
+        if tomb == enchudb_oplog::Hlc::ZERO {
+            // 削除されずに slot だけ回った (= 到達不能になった) ケース。 覚えることは無い。
+            return;
+        }
+        let mut g = self.foreign_tombs.write().unwrap();
+        let e = g.entry(key).or_insert(enchudb_oplog::Hlc::ZERO);
+        if *e < tomb {
+            *e = tomb; // monotone-max (同 identity が複数回 slot を回った場合)
+        }
+        self.foreign_tombs_empty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// #166: `(author_peer, foreign_local)` に **新しい slot** を払い出した直後に、
+    /// 退避してあった削除版数を書き戻す。
+    ///
+    /// これで 「この foreign entity は t で削除済み」 が slot を跨いで生き残り、
+    /// t より古い record は新しい slot 上の tombstone で従来どおり弾かれる
+    /// (= 判定経路は `set_cell` 1 本のまま。 A-2 を崩さない)。
+    fn restore_foreign_tombstone(&self, peer: enchudb_oplog::PeerId, foreign_local: u32, local: u32) {
+        if self.foreign_tombs_empty.load(std::sync::atomic::Ordering::Relaxed) {
+            return; // 常態 (= 一度も slot が回っていない)。 lock を取らない
+        }
+        let tomb = {
+            let g = self.foreign_tombs.read().unwrap();
+            match g.get(&(peer, foreign_local)) {
+                Some(&t) if t != enchudb_oplog::Hlc::ZERO => t,
+                _ => return,
+            }
+        };
+        self.set_tombstone_local(local, tomb);
+    }
+
+    /// #166: slot に載っていない (= 退避済みの) foreign tombstone の snapshot。
+    /// `.eidmap` v3 の 「写像を持たない tombstone だけの entry」 として永続化する。
+    fn orphan_foreign_tombstones(&self) -> Vec<(enchudb_oplog::PeerId, u32, enchudb_oplog::Hlc)> {
+        let g = self.foreign_tombs.read().unwrap();
+        g.iter()
+            .filter(|(_, t)| **t != enchudb_oplog::Hlc::ZERO)
+            .map(|(&(peer, fl), &t)| (peer, fl, t))
+            .collect()
+    }
+
+    /// #166: 復元 / 再受信で使う。 退避表へ直接載せる (monotone-max)。
+    fn remember_foreign_tombstone(
+        &self,
+        peer: enchudb_oplog::PeerId,
+        foreign_local: u32,
+        tomb: enchudb_oplog::Hlc,
+    ) {
+        if tomb == enchudb_oplog::Hlc::ZERO {
+            return;
+        }
+        let mut g = self.foreign_tombs.write().unwrap();
+        let e = g.entry((peer, foreign_local)).or_insert(enchudb_oplog::Hlc::ZERO);
+        if *e < tomb {
+            *e = tomb;
+        }
+        self.foreign_tombs_empty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// entity の削除版数を記録する (A-5)。 `false` = 受信 HLC が古いので不採用。
@@ -4955,6 +5093,11 @@ impl Engine {
             .get_or_insert_with(owner, foreign_local, || {
                 self.alloc_translated_local(himo_id)
             })?;
+        // #166: slot が回った identity なら、 退避してある削除版数を今の slot に
+        // 書き戻す。 `set_tombstone_local` は monotone-max なので、 既に載っている
+        // 場合も新規 slot の場合も同じ呼びで済む (idempotent)。 退避表が空なら
+        // read lock も取らない。
+        self.restore_foreign_tombstone(owner, foreign_local, local);
         Some(enchudb_oplog::make_eid(self_peer, local))
     }
 
