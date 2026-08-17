@@ -44,6 +44,16 @@ pub struct EidTranslator {
     /// 2. write-back の宛名解決 — bridge が self-authored write を元 entity の
     ///    世界番号に書き戻して発送する (`reverse`)
     translated_locals: RwLock<HashMap<u32, Key>>,
+    /// #166: `get_or_insert_with` の 「引く → 確保 → 登録」 を直列化する専用 lock。
+    ///
+    /// 以前は `inner` の write lock を保持したまま `alloc` を呼んでいたが、
+    /// `alloc` (= `entity_in`) は free list から slot を再利用する際に
+    /// `remove_local` を呼ぶようになった (#166) ため、 `inner` の再入で
+    /// **self-deadlock** する。 `RwLock` は reentrant ではない。
+    ///
+    /// 確保の atomicity は写像の lock ではなくこの lock が担保する。 保持順は必ず
+    /// `alloc_lock` → (`inner` | `translated_locals`) で、 逆向きに取る経路は無い。
+    alloc_lock: std::sync::Mutex<()>,
 }
 
 impl Default for EidTranslator {
@@ -57,6 +67,7 @@ impl EidTranslator {
         Self {
             inner: RwLock::new(HashMap::new()),
             translated_locals: RwLock::new(HashMap::new()),
+            alloc_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -100,9 +111,10 @@ impl EidTranslator {
     /// `alloc` が `None` を返したら (= 確保先 table を導けない table-less な op)、 insert
     /// せず `None` を返す → 呼び出し側はその op を skip する。
     ///
-    /// 注意: `alloc` は **write lock 保持中** に呼ばれる。 `RwLock` は reentrant でない
-    /// ので、 translator 自身を触る closure を渡してはならない (`alloc` = entity 確保は
-    /// table lock しか取らないので安全)。
+    /// #166: `alloc` は **写像の lock を一切保持しない状態**で呼ばれる。 直列化は
+    /// 専用の `alloc_lock` が行うので、 `alloc` の中から translator を触ってよい
+    /// (`entity_in` は slot 再利用時に `remove_local` を呼ぶ)。 以前は `inner` の
+    /// write lock 保持中に呼んでいて、 その経路が self-deadlock していた。
     pub fn get_or_insert_with(
         &self,
         author_peer: PeerId,
@@ -110,25 +122,44 @@ impl EidTranslator {
         alloc: impl FnOnce() -> Option<u32>,
     ) -> Option<u32> {
         // fast path: 既に登録済みなら read lock だけで返す。
-        {
-            let guard = self.inner.read().unwrap();
-            if let Some(&local) = guard.get(&(author_peer, foreign_local)) {
-                return Some(local);
-            }
+        if let Some(local) = self.get(author_peer, foreign_local) {
+            return Some(local);
         }
-        // slow path: write lock 下で再 check (= double-checked) → 確保 → insert。
-        let mut guard = self.inner.write().unwrap();
-        if let Some(&local) = guard.get(&(author_peer, foreign_local)) {
+        // slow path: alloc_lock で直列化 → 再 check (= double-checked) → 確保 → 登録。
+        let _serialize = self.alloc_lock.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(local) = self.get(author_peer, foreign_local) {
             return Some(local); // 別 thread が先に確保した
         }
         let local = alloc()?;
-        guard.insert((author_peer, foreign_local), local);
-        drop(guard);
-        self.translated_locals
-            .write()
-            .unwrap()
-            .insert(local, (author_peer, foreign_local));
+        self.insert(author_peer, foreign_local, local);
         Some(local)
+    }
+
+    /// #166: **local slot が再利用されるとき**に写像を外す。 外した
+    /// `(author_peer, foreign_local)` を返す (レプリカでなければ `None`)。
+    ///
+    /// 写像は local slot を指すが、 slot は削除後に free list へ戻って **別の
+    /// entity に払い出される**。 写像を残したままだと、 その foreign entity 宛の
+    /// record が新しい住人へ書き込まれる (= 無関係な行の silent 破壊)。
+    ///
+    /// 呼ぶのは **slot を手放す時ではなく、 別の住人に渡す時**。 手放しただけの
+    /// 段階では写像も slot 上の tombstone も有効で、 削除済み entity 宛の古い
+    /// record はその tombstone で正しく弾ける。
+    ///
+    /// **戻り値を捨ててはいけない**: 呼び元は外した identity 宛の tombstone を
+    /// slot から退避する責務がある (`Engine::evict_translation_for_reuse`)。
+    /// これを怠ると 「破壊」 が 「削除済み entity の復活」 に化けるだけになる。
+    #[must_use = "外した identity の tombstone を退避しないと削除済み entity が復活する (#166)"]
+    pub fn remove_local(&self, local: u32) -> Option<Key> {
+        // lock 順序は `inner` → `translated_locals` に固定する (`insert` は両方を
+        // 同時には保持しないので、 この順序だけ守れば cycle は生じない)。
+        let mut fwd = self.inner.write().unwrap();
+        let key = self.translated_locals.write().unwrap().remove(&local)?;
+        // 同 key が別 local に張り替わっている可能性があるので、 一致する時だけ消す。
+        if fwd.get(&key) == Some(&local) {
+            fwd.remove(&key);
+        }
+        Some(key)
     }
 
     pub fn len(&self) -> usize {
@@ -179,6 +210,42 @@ mod tests {
         // 0.11: 上書きで stale になった旧 local の逆写像は掃除される
         assert_eq!(t.reverse(7), None);
         assert!(!t.is_translated_local(7));
+        assert_eq!(t.reverse(9), Some((1, 42)));
+    }
+
+    /// #166: slot 再利用時に写像を外せること。 forward / reverse の両方が消える。
+    #[test]
+    fn remove_local_drops_both_directions() {
+        let t = EidTranslator::new();
+        t.insert(1, 42, 7);
+        assert_eq!(t.remove_local(7), Some((1, 42)));
+        assert_eq!(t.get(1, 42), None, "forward が残っている");
+        assert_eq!(t.reverse(7), None, "reverse が残っている");
+        assert!(!t.is_translated_local(7));
+        assert_eq!(t.len(), 0);
+        // 2 度目は None (= 既に外れている)
+        assert_eq!(t.remove_local(7), None);
+    }
+
+    /// レプリカでない local を渡しても何も壊さない。
+    #[test]
+    fn remove_local_is_noop_for_unmapped() {
+        let t = EidTranslator::new();
+        t.insert(1, 42, 7);
+        assert_eq!(t.remove_local(99), None);
+        assert_eq!(t.get(1, 42), Some(7), "無関係な写像を巻き込んだ");
+    }
+
+    /// 同じ key が別 local へ張り替わった後に、 **古い local** で remove しても
+    /// 新しい forward 写像を巻き込まない (`insert` が reverse を掃除するので
+    /// 通常は起きないが、 forward を消す条件が緩いと事故る)。
+    #[test]
+    fn remove_local_does_not_kill_a_rebound_mapping() {
+        let t = EidTranslator::new();
+        t.insert(1, 42, 7);
+        t.insert(1, 42, 9); // 張り替え。 reverse(7) はここで消える
+        assert_eq!(t.remove_local(7), None, "既に張り替わっているので何も外さない");
+        assert_eq!(t.get(1, 42), Some(9), "張り替え後の写像を巻き込んだ");
         assert_eq!(t.reverse(9), Some((1, 42)));
     }
 
