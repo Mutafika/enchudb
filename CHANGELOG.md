@@ -3,6 +3,127 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.19.0 — 2026-08-17
+
+**LWW の真実を、 配送バッファ依存の揮発 HashMap から storage へ移した (request17 Phase 1)。**
+削除や上書きの版数が per-cell の column として本体に載るようになり、 reopen しても
+配送履歴が reclaim されても失われない。 判定は `set_cell` 1 本に集約したので、 呼び忘れで
+黙って壊れる構造も無くなった。 **on-disk format は v8 → v9**、 migration 不要だが
+**version stamp は一方通行** (下記)。
+
+### ⚠️ Migration — 先に読むこと
+
+**v8 以前の DB を 0.19.0 の writer で open すると、 version stamp が 9 に上がり、
+0.18.x 以前の binary では開けなくなる。** layout そのものは 1 byte も変わらない
+(v9 領域は header flag で gate されている) ので migration 作業は不要だが、 **戻れない**。
+
+- **consumer を全部 rebuild してから本番 DB に触ること** (opyula / oboro / sinfo /
+  sinfohub / sunsu / bisquit)。 readonly consumer も含む
+- 試すときは本番 DB を直接開かず、 `Engine::snapshot_export` か
+  `enchudb_engine::copy_sparse` で隔離コピーを取ってから
+- 既存の v8 DB は **v9 領域を持たない**ままなので、 per-cell 版数の恩恵は
+  作り直すまで得られない (A-1: 「版数不明 = 現状維持」)。 壊れはしない
+
+`.eidmap` sidecar も v2 → v3。 reader は v1 / v2 / v3 すべて読める。
+
+### Added
+
+- **per-cell version column + tombstone column (file format v9)** — 各 cell の HLC を
+  生 16B で eid 空間の column に持つ。 variable cluster の末尾に置いたので v8 以前の
+  領域は 1 byte も動かない
+- `Engine::set_cell` / `clear_cell` / `set_tombstone` / `cell_hlc` / `tombstone_hlc` /
+  `has_cell_version` — 値と版数を不可分に書く API
+- `OpLog::append_with_hlc` / `mint_hlc` / `append_at_hlc` / `append_many_with_hlcs` /
+  `observe_hlc` — HLC の採番責務を呼び出し側に開いた
+- **`enchudb_engine::copy_sparse`** — 穴を維持したままファイルを copy する
+  (`SEEK_DATA` / `SEEK_HOLE`)。 バックアップを自前で取る場合はこれを使う
+
+### Fixed — ローカル write が LWW に参加しない (#154 / #160)
+
+版数を記録するのが受信経路だけだったので、 ローカルで書いた値には版数が付かず、
+古い remote record に負けて巻き戻ることがあった。 ローカル write (同期 / async /
+WAL replay) も版数を書くようにし、 判定を engine の `set_cell` 内側 1 本に集約した。
+再現テスト `local_write_lww_gap.rs` は `#[ignore]` を外して green。
+
+**この修正は v9 を有効化する前から効く** — 版数の置き場を v9 column と pre-v9 の揮発
+`HlcStore` に振り分ける形にしたので、 既存 DB でもローカル write の穴は閉じる。
+
+### Fixed — tombstone が reopen + reclaim で消える (#140 の一部)
+
+削除の版数が揮発 `HlcStore` にしか無く、 その再構築が配送バッファの walk に依存して
+いた。 「再起動」 + 「配送バッファが reclaim 済み」 が揃うと tombstone が消え、 古い Tie の
+再配送で削除済み entity が復活していた。 v9 で tombstone を column に永続化。
+
+**#140 の本体 (cursor 喪失 / 履歴 reclaim 後に差分で追いつけない) は未解決**で、
+anti-entropy (Phase 2) 待ち。 今回閉じたのは 「tombstone が消える」 側だけ。
+
+### Fixed — 再利用 slot が前の住人の状態を引き継ぐ (#166)
+
+版数 / tombstone / 翻訳写像はすべて **local slot** で index されるのに、 slot は削除後に
+free list へ戻って別の entity に払い出される。 3 つとも引き継がれていた。
+
+- **版数 / tombstone** — 払い出し口 2 つ (`entity_in` の再利用枝 / `EntitySet` の free
+  stack) で落とす。 v9 の column と pre-v9 の `HlcStore` の両方
+- **翻訳写像 (#166)** — `EidTranslator::remove_local` を追加。 これが無いと **削除済み
+  foreign entity 宛の record が、 slot を引き継いだ無関係な entity に書き込まれる**
+  (silent な cross-entity 破壊)。 master から続いていた穴で、 request17 とは独立
+- 写像を消すだけだと 「破壊」 が 「削除済み entity の復活」 に化けるので、 削除版数を
+  `(peer, foreign_local) -> Hlc` へ退避し、 同じ identity に新しい slot を払い出すときに
+  書き戻す。 **tombstone を slot の寿命から切り離した** (`.eidmap` v3)
+
+`EidTranslator::get_or_insert_with` が写像の write lock を保持したまま alloc を呼ぶ
+設計だったので、 上記の経路で self-deadlock する。 直列化を専用 lock に移した。
+
+### Fixed — Linux で snapshot が apparent size 全量を物理化する
+
+`std::fs::copy` は macOS では穴を維持する (clonefile) が、 **Linux では 0 で埋めて実際に
+書き出す**。 公開 API の `Engine::snapshot_export` がこれを使っていたため、 既定 capacity の
+DB の snapshot が Linux で **24 GB の実書き込み**になっていた (実測: 8 GB の穴だけファイルで
+macOS 0.0003 秒 / 0 MB に対し Linux 8.09 秒 / 8192 MB)。
+
+`copy_sparse` に差し替え。 CI (ubuntu) が `No space left on device` で runner ごと落ちて
+いたのも同じ原因だった (`/tmp` ピーク 20 GB 使い切り → **110 MB**)。
+
+### Changed — 性能
+
+`examples/write_ceiling_bench` (1M ties、 drain M/s):
+
+| writers | 0.18.3 | 0.19.0 |
+|---|---|---|
+| 1 | 7.8 | **5.1** |
+| 2 | 4.3 | 5.5 |
+| 4 | 3.2 | **5.0** |
+| 8 | 2.5 | **4.3** |
+
+増減はすべて HLC 採番の直列化 lock に由来する。 producer を直列化した副作用で
+ArrayQueue の CAS 競合が減り multi-writer が伸びる一方、 **単一 writer は −35%**。
+採番順の保証 (= transport が HLC 順に並べ替えるため、 崩すと依存 record が受信側で
+逆転する) を取って lock を残している。 取り戻す案は Phase 2/3 で再検討。
+
+### Changed — 容量
+
+既定 create (max_entities 16M / max_himos 256) の **apparent** size が 23.8 GB → 85.1 GB。
+sparse なので **物理消費は不変** (数百 KB) だが、 apparent で数えるツールには効く。
+気になる用途は `create_growable_*` か、 小さい `max_entities` を使うこと。
+
+### Known limitation — ディスク満杯が SIGBUS になる (#167)
+
+書き込みは `mmap` 経由なので、 穴に block を割り当てられない (`ENOSPC`) 時に errno を
+返す先が無く **SIGBUS でプロセスごと落ちる**。 `Result` で受けられない。 `create` は
+`set_len` するだけなので作成時点では必ず成功し、 落ちるのは後で書いた時。
+
+**空きは apparent size ぶんを見込むこと。** 「`df` に空きがある」 は安全を意味しない。
+0.19.0 では README と `enchudb-engine` の module doc に注意書きを入れただけで、
+signal をエラーに変える対応は未着手。
+
+### 積み残し (Phase 2 / 3)
+
+- **#140 の本体** — cursor 喪失 / 履歴 reclaim 後の追いつけなさは anti-entropy 待ち
+- 検知系 (`history_floor` / `sync_history_reclaimed` / `SyncOutcome::history_truncated`)
+  の撤去
+- `mmap_ahead_of_wal_silent_sync_loss` / `replica_syncs_from_origin_via_syncer` は
+  `#[ignore]` のまま
+
 ## 0.18.3 — 2026-08-14
 
 **0.18.2 の Known limitation (#149) の根治と、 それに伴って露出した sync 事故 2 件の修正。**
