@@ -241,12 +241,50 @@ Each sub-crate has its own `README.md` with details, and `docs/` holds architect
 ## File layout
 
 ```
-{path}         main DB (mmap, FILE_VERSION 7; v4/v5/v6 are read-compatible)
+{path}         main DB (mmap, FILE_VERSION 9; v4-v8 are read-compatible)
 {path}.oplog   oplog (when enabled; sparse file)
 {path}.lock    writer-exclusion sidecar (flock on writer open, released on close)
 {path}.crc     region CRC (only when seal_integrity is used)
+{path}.eidmap  foreign-eid translation + tombstones (only when syncing)
 <blob_root>/   BlobStore (separate directory, content-addressed, for offloading large blobs)
 ```
+
+> **Opening a pre-v9 DB with a v9 writer stamps it as v9, and older binaries can no
+> longer open it.** The layout itself does not change (the v9 regions are gated by a
+> header flag), and no migration is needed — but the version stamp is one-way, so
+> rebuild every consumer before pointing a v9 binary at a production DB.
+
+## Disk space
+
+The main DB is a **sparse** file: the apparent size is fixed at create time from
+`max_entities` x `max_himos`, while physical usage only grows with what you actually
+write. A default-capacity store looks like ~95 GB in `ls -l` but costs a few hundred KB
+on disk. `df` does not move. This is by design — but it has three consequences worth
+knowing.
+
+**1. A full disk crashes the process, it does not return an error.** Writes go through
+`mmap`, so when the kernel cannot allocate a block for a hole it raises **SIGBUS**
+rather than returning `ENOSPC`. There is no `Result` to handle and no way to catch it
+in normal code. Note that `create` succeeds regardless (it only does `set_len`), so the
+failure surfaces later, at write time. **Provision for the apparent size, not the
+current physical usage** — "`df` says there is room" is not a safety property here. See
+[#167](https://github.com/Mutafika/enchudb/issues/167).
+
+**2. Copying the DB can materialize every hole.** `std::fs::copy` preserves holes on
+macOS (APFS clones) but **fills them with zeros on Linux** — copying a default store
+there writes the full apparent size. Use `enchudb_engine::copy_sparse`, which walks
+`SEEK_DATA` / `SEEK_HOLE` and copies only the data ranges. `Engine::snapshot_export`
+already uses it.
+
+**3. External backup tools have the same problem.** `rsync` without `--sparse`, naive
+`cp`, and apparent-size-based tools (Time Machine) will expand the file. Prefer
+`snapshot_export`, or pass the sparse-aware flags. If the apparent size itself is a
+problem for your environment, create with a smaller `max_entities` or use
+`create_growable_*`.
+
+Note that `snapshot_export` does **not** fsync: the copy lands in the page cache, so a
+power loss right after can lose it. That is deliberate (it keeps snapshots fast by not
+re-persisting the source); fsync it yourself if the snapshot is a backup you rely on.
 
 ## Concurrency
 
