@@ -13,6 +13,30 @@
 //! assert_eq!(result, vec![0]);
 //! # let _ = std::fs::remove_file(&path);
 //! ```
+//!
+//! # ディスク容量について (#167)
+//!
+//! 本体 DB は **sparse ファイル**。 apparent size は create 時に
+//! `max_entities` x `max_himos` から決まる固定値で (既定 capacity で ~95 GB)、
+//! 実際に消費するのは書いた分だけ (数百 KB)。 `df` は動かない。 これは設計どおり
+//! だが、 3 つ注意が要る。
+//!
+//! **1. ディスクが埋まるとエラーではなく SIGBUS でプロセスごと落ちる。** 書き込みは
+//! `mmap` 経由なので、 穴に block を割り当てられない (`ENOSPC`) 時に errno を返す先が
+//! 無く signal になる。 `Result` で受けられないし、 通常のコードでは捕まえられない。
+//! `create` は `set_len` するだけなので **作成時点では必ず成功し**、 落ちるのは後で
+//! 書いた時。 **空きは apparent size ぶんを見込むこと** — 「`df` に空きがある」 は
+//! 安全を意味しない。
+//!
+//! **2. DB を copy すると穴が実体化しうる。** `std::fs::copy` は macOS では穴を維持
+//! する (APFS clonefile) が、 **Linux では 0 で埋めて書き出す**。 [`copy_sparse`] は
+//! `SEEK_DATA` / `SEEK_HOLE` でデータ範囲だけを写すので、 こちらを使うこと
+//! (`Engine::snapshot_export` は既に使っている)。
+//!
+//! **3. 外部のバックアップツールも同じ罠を踏む。** `--sparse` 無しの `rsync`、 素の
+//! `cp`、 apparent size で数えるツール (Time Machine) はファイルを膨らませる。
+//! apparent size 自体が問題になる用途では、 `max_entities` を小さくするか
+//! `create_growable_*` を使う。
 
 pub(crate) mod append_vec;
 pub(crate) mod append_bucket;
