@@ -206,12 +206,12 @@ fn replicated_entity_matches_across_shards_via_sync() {
 
     // peer A の color column に entry
     let color_himo = eng_a.himo_id("color").unwrap() as u16;
-    eng_a.remote_tie_apply(shared_eid, color_himo, 3, None);
+    eng_a.remote_tie_apply(shared_eid, color_himo, 3, enchudb_oplog::Hlc::ZERO, None);
     eng_a.rebuild();
 
     // peer B の size column に entry (同じ shared_local)
     let size_himo = eng_b.himo_id("size").unwrap() as u16;
-    eng_b.remote_tie_apply(shared_eid, size_himo, 5, None);
+    eng_b.remote_tie_apply(shared_eid, size_himo, 5, enchudb_oplog::Hlc::ZERO, None);
     eng_b.rebuild();
 
     let transport = Arc::new(InMemoryShardTransport::new());

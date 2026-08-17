@@ -8,6 +8,11 @@ use crate::region::Region;
 
 const HEADER: usize = 16;
 
+/// Column region 先頭のメタ領域 (count / value_size / max_entities)。
+/// growable backing で「header を読む前にどこまで commit すべきか」を
+/// 呼び側 (engine の v9 version column) が知るために公開する。
+pub const HEADER_BYTES: usize = HEADER;
+
 pub struct Column {
     region: Region,
     count: AtomicU32,
@@ -45,6 +50,18 @@ impl Column {
         let len = value.len().min(vs);
         self.region.write_at(off, &value[..len]);
         self.region.mark_dirty(off, len);
+    }
+
+    /// growable backing 用: `entity_id` の cell まで file の commit を伸ばす。
+    /// 静的 backing (通常の mmap / memory) では no-op。
+    ///
+    /// variable cluster の末尾に置かれる region (v9 version column / tombstone
+    /// column) は初期 commit の外にあるので、 **書く前に必ず呼ぶこと** —
+    /// 呼ばずに触ると未コミット page への書き込みで SIGBUS する。
+    #[inline]
+    pub fn ensure_committed_for(&self, entity_id: u32) -> std::io::Result<()> {
+        let vs = self.value_size.max(1) as usize;
+        self.region.ensure_committed(HEADER + (entity_id as usize + 1) * vs)
     }
 
     #[inline]

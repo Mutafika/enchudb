@@ -148,11 +148,19 @@ impl Syncer {
             subscription_filter: std::sync::RwLock::new(Arc::new(AllRecords)),
             warned_unconfigured_peer: std::sync::atomic::AtomicBool::new(false),
         };
-        // HlcStore は engine 内部のメモリ構造で永続化されない。 engine reopen 後は
-        // 空状態なので、 attach 時に WAL を walk して LWW state を再構築する。
-        // これがないと sync で過去レコードを未知扱いして再 apply してしまい、
-        // 削除済み entity が復活する (= ① のバグの根本)。
-        syncer.hydrate_hlc_store(&engine);
+        // request17 step 6: **v9 DB では hydrate しない**。
+        //
+        // v9 (per-cell version column) では LWW の版数が cell と一緒に永続するので、
+        // 「配送バッファ (`_sync_ops`) から揮発 HashMap を再構築する」必要が無い。
+        // この再構築こそが #140 / #154 / #160 の共通の根 (= 配れる履歴が reclaim
+        // されたら記憶も消える) だったので、 v9 では経路ごと通らない。
+        //
+        // pre-v9 DB (v8 以前で作られ、 migration していない DB) は版数の置き場が
+        // 揮発 `HlcStore` のままなので、 従来どおり hydrate する。 pre-v9 の
+        // サポートを落とす時にこの分岐ごと消える。
+        if !engine.has_cell_version() {
+            syncer.hydrate_hlc_store(&engine);
+        }
         syncer
     }
 
@@ -213,6 +221,8 @@ impl Syncer {
     /// ローカルのより新しい行が巻き戻る (tombstone の記憶も消えるので削除済み entity の
     /// 復活にもなる)。 fold で WAL から消えた record は bridge 先の `_sync_ops`
     /// (永続) に残っているので、 そちらも歩く。
+    /// **pre-v9 DB 専用の legacy 経路** (request17 step 6)。 v9 DB は版数を cell と
+    /// 一緒に永続するので呼ばれない (`Syncer::new` の分岐を参照)。
     fn hydrate_hlc_store(&self, engine: &Engine) {
         let store = engine.hlc_store();
         // 1. WAL の生存範囲 (fold されていない分)
@@ -633,18 +643,10 @@ impl Syncer {
                 } else {
                     self.engine.translate_remote_vid(rec.author_peer, *himo_id, *value)
                 };
-                // Tombstone check: 同 entity に tombstone (sentinel HLC) が記録済みで
-                // それより古い Tie は復活させない。
-                if let Some(tomb) = store.get(local_eid, u16::MAX) {
-                    if rec.hlc < tomb {
-                        return false;
-                    }
-                }
-                if !store.try_set(local_eid, *himo_id, rec.hlc) {
-                    return false;
-                }
-                self.engine.remote_tie_apply(local_eid, *himo_id, value, Some(relayed_header(rec)));
-                true
+                // request17 step 5: LWW / tombstone の判定は engine (`set_cell`) の
+                // 内側だけ。 ここで判定して別関数で適用する形は、 呼び忘れれば黙って
+                // 壊れる (実際 ローカル write 経路がそうなっていた = #154/#160 の根)。
+                self.engine.remote_tie_apply(local_eid, *himo_id, value, rec.hlc, Some(relayed_header(rec)))
             }
             DecodedOp::Untie { eid, himo_id } => {
                 // #9: foreign eid を翻訳 (table-less なら確保先が無いので skip)。
@@ -653,16 +655,7 @@ impl Syncer {
                     None => return false,
                 };
                 // #9: 写像ができたので退避中の Content を drain。
-                if let Some(tomb) = store.get(local_eid, u16::MAX) {
-                    if rec.hlc < tomb {
-                        return false;
-                    }
-                }
-                if !store.try_set(local_eid, *himo_id, rec.hlc) {
-                    return false;
-                }
-                self.engine.remote_untie_apply(local_eid, *himo_id, Some(relayed_header(rec)));
-                true
+                self.engine.remote_untie_apply(local_eid, *himo_id, rec.hlc, Some(relayed_header(rec)))
             }
             DecodedOp::Delete { eid } => {
                 // #9: Delete は himo を持たず table を導けないので既存の翻訳のみ引く。
@@ -672,15 +665,11 @@ impl Syncer {
                     Some(e) => e,
                     None => return false,
                 };
-                // Delete は全 himo に波及。sentinel himo_id = 0xFFFF で HLC を記録。
-                // remove_entity は呼ばず tombstone を残す。 後続の古い HLC の
-                // Tie/Untie/Content は上の tombstone check で skip され、 削除済み
-                // entity が復活しない。
-                if !store.try_set(local_eid, u16::MAX, rec.hlc) {
-                    return false;
-                }
-                self.engine.remote_delete_apply(local_eid, Some(relayed_header(rec)));
-                true
+                // Delete は全 himo に波及。 tombstone 版数は engine が
+                // (v9 なら tombstone column に永続で) 記録する。 後続の古い HLC の
+                // Tie/Untie/Content は engine 側の tombstone 判定で skip され、
+                // 削除済み entity が復活しない。
+                self.engine.remote_delete_apply(local_eid, rec.hlc, Some(relayed_header(rec)))
             }
             DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => {
                 // 0.9.0: 動的 himo (content 互換層の `_c_{key}`) は id が peer 間で
@@ -697,16 +686,7 @@ impl Syncer {
                 };
                 // 値は author-local vid → local vid に変換 (Leaf/Tag のみ、 Number は identity)
                 let value = self.engine.translate_remote_vid(rec.author_peer, local_hid, *value);
-                if let Some(tomb) = store.get(local_eid, u16::MAX) {
-                    if rec.hlc < tomb {
-                        return false;
-                    }
-                }
-                if !store.try_set(local_eid, local_hid, rec.hlc) {
-                    return false;
-                }
-                self.engine.remote_tie_apply(local_eid, local_hid, value, Some(relayed_header(rec)));
-                true
+                self.engine.remote_tie_apply(local_eid, local_hid, value, rec.hlc, Some(relayed_header(rec)))
             }
             DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => {
                 // 0.12.0 (#88): Leaf payload を bytes 同乗で受信。 名前で himo 解決 →
@@ -719,16 +699,7 @@ impl Syncer {
                     Some(e) => e,
                     None => return false,
                 };
-                if let Some(tomb) = store.get(local_eid, u16::MAX) {
-                    if rec.hlc < tomb {
-                        return false;
-                    }
-                }
-                if !store.try_set(local_eid, local_hid, rec.hlc) {
-                    return false;
-                }
-                self.engine.remote_tieleaf_apply(local_eid, local_hid, bytes, Some(relayed_header(rec)));
-                true
+                self.engine.remote_tieleaf_apply(local_eid, local_hid, bytes, rec.hlc, Some(relayed_header(rec)))
             }
             DecodedOp::Content { eid, key, data } => {
                 // legacy (pre-0.9): 0.9.0 以降は content が TieNamed で運ばれるため、
@@ -741,18 +712,13 @@ impl Syncer {
                     Some(e) => e,
                     None => return false,
                 };
-                // Content は key 単位で LWW。himo_id を使えないので hash で代用。
-                if let Some(tomb) = store.get(local_eid, u16::MAX) {
-                    if rec.hlc < tomb {
-                        return false;
-                    }
-                }
+                // legacy Content は cell を持たないので key 単位の LWW だけここに残す
+                // (tombstone 判定は engine 側 `remote_content_apply` が行う)。
                 let key_hash = enchudb_oplog::content_key_hash15(key);
                 if !store.try_set(local_eid, key_hash | 0x8000, rec.hlc) {
                     return false;
                 }
-                self.engine.remote_content_apply(local_eid, key, data, Some(relayed_header(rec)));
-                true
+                self.engine.remote_content_apply(local_eid, key, data, rec.hlc, Some(relayed_header(rec)))
             }
             DecodedOp::Commit => true, // boundary marker、apply は不要
             DecodedOp::Vocab { vid, bytes } => {

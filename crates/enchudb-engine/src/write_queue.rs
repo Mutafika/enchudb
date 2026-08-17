@@ -14,6 +14,7 @@
 //! で指定可能 (default は緩めの値で latency への影響を抑える)。
 
 use crossbeam_queue::ArrayQueue;
+use enchudb_oplog::Hlc;
 
 /// queue capacity の default。 既存 caller 互換のため、 sustained writer の
 /// peak rate を捌ける程度の余裕を持たせる。 SNS 系 hot path (sunsu の
@@ -22,14 +23,21 @@ use crossbeam_queue::ArrayQueue;
 pub(crate) const DEFAULT_WRITE_QUEUE_CAP: usize = 1_048_576; // 1 M ops
 
 /// 非同期オペレーション。
+///
+/// request17 (v9): `hlc` は **push した writer thread が採番した版数** (A-3)。
+/// 適用は consumer thread が後から行うため、 採番を適用側に任せると
+/// 「cell に載る版数」と「WAL record に載る版数」がずれる (両者は別 queue を
+/// 通って別のタイミングで確定する)。 ずれると peer 間で自分の版数と配った版数が
+/// 食い違うので、 **push 時に 1 回採番して両方に同じ値を運ぶ**。
+/// oplog 無効なら `Hlc::ZERO` (= 版数不明、 従来どおりの無条件適用)。
 #[derive(Clone, Debug)]
 pub enum Op {
     /// 値の紐づけ。himo_id は事前に解決済み。
-    Tie { eid: u32, himo_id: u16, value: u32 },
+    Tie { eid: u32, himo_id: u16, value: u32, hlc: Hlc },
     /// 紐を外す。
-    Untie { eid: u32, himo_id: u16 },
+    Untie { eid: u32, himo_id: u16, hlc: Hlc },
     /// entity ごと削除。
-    Delete { eid: u32 },
+    Delete { eid: u32, hlc: Hlc },
     /// entity 作成 marker。 writer thread の `entity()` は slot allocation のみで戻り、
     /// この op を consumer 経由で空回しさせて `flush_writes` の barrier counter
     /// (`push_count` / `apply_count`) と整合を取る (issue5)。 payload は無し、
@@ -128,12 +136,12 @@ mod tests {
     fn push_pop_basic() {
         let q = WriteQueue::new();
         assert!(q.is_empty());
-        q.push(Op::Tie { eid: 1, himo_id: 0, value: 10 });
-        q.push(Op::Untie { eid: 2, himo_id: 1 });
+        q.push(Op::Tie { eid: 1, himo_id: 0, value: 10, hlc: Hlc::ZERO });
+        q.push(Op::Untie { eid: 2, himo_id: 1, hlc: Hlc::ZERO });
         assert_eq!(q.len(), 2);
 
         match q.pop() {
-            Some(Op::Tie { eid, himo_id, value }) => {
+            Some(Op::Tie { eid, himo_id, value, .. }) => {
                 assert_eq!(eid, 1);
                 assert_eq!(himo_id, 0);
                 assert_eq!(value, 10);
@@ -141,7 +149,7 @@ mod tests {
             _ => panic!("expected Tie"),
         }
         match q.pop() {
-            Some(Op::Untie { eid, himo_id }) => {
+            Some(Op::Untie { eid, himo_id, .. }) => {
                 assert_eq!(eid, 2);
                 assert_eq!(himo_id, 1);
             }
@@ -155,12 +163,12 @@ mod tests {
         let q = WriteQueue::new();
         // default 1 M cap、 そこまでは block せず push できる
         for i in 0..100_000u32 {
-            q.push(Op::Delete { eid: i });
+            q.push(Op::Delete { eid: i, hlc: Hlc::ZERO });
         }
         assert_eq!(q.len(), 100_000);
         for i in 0..100_000u32 {
             match q.pop() {
-                Some(Op::Delete { eid }) => assert_eq!(eid, i),
+                Some(Op::Delete { eid, .. }) => assert_eq!(eid, i),
                 _ => panic!("expected Delete({i})"),
             }
         }
@@ -174,7 +182,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let q = Arc::new(WriteQueue::with_capacity(4));
         for i in 0..4 {
-            q.push(Op::Delete { eid: i });
+            q.push(Op::Delete { eid: i, hlc: Hlc::ZERO });
         }
         assert_eq!(q.len(), 4);
         // drainer thread を起動して 50 ms 後に 1 個 pop
@@ -187,7 +195,7 @@ mod tests {
             drained2.store(true, Ordering::Release);
         });
         // この push は block するはず、 drainer が動くまで返らない
-        q.push(Op::Delete { eid: 99 });
+        q.push(Op::Delete { eid: 99, hlc: Hlc::ZERO });
         assert!(drained.load(Ordering::Acquire), "push should have waited for drainer");
         h.join().unwrap();
     }

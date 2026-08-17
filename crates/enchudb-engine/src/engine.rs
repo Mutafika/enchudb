@@ -60,9 +60,11 @@ pub struct EngineStats {
     pub applied: u64,
     /// v32: 自 peer の peer_id(非 v32 では 0)
     pub peer_id: u32,
-    /// v32: HlcStore の総エントリ数((eid, himo) で区別、非 v32 では 0)
+    /// **pre-v9 DB の**揮発版数置き場のエントリ数。 v9 DB では版数が
+    /// per-cell version column に載るので常に 0 (走査が O(entity × himo) に
+    /// なるため column 側の集計は取らない)。
     pub hlc_entries: usize,
-    /// v32: HlcStore 内の最大 HLC(LWW 基準の最新書き込み時刻、非 v32 では None)
+    /// 同上 — pre-v9 DB の揮発置き場の最大 HLC。 v9 DB では None。
     pub max_hlc: Option<enchudb_oplog::Hlc>,
 }
 
@@ -387,10 +389,27 @@ type EidmapEntry = (enchudb_oplog::PeerId, u32, u32, enchudb_oplog::Hlc);
 /// #9: 翻訳 entry を binary encode (v2)。
 /// layout: magic "EIDM"(4) + version u32=2 + count u32
 ///         + (peer u32, foreign u32, local u32, tomb_wall u64, tomb_logical u32, tomb_peer u32) × count
+/// #166: `.eidmap` の現行 format 版数。
+///
+/// - v1: tombstone 無し (12 byte/entry)
+/// - v2: tombstone 込み (28 byte/entry)
+/// - v3: v2 と **同じ 28 byte/entry**。 `local == NO_LOCAL_SLOT` の entry が
+///   「slot を持たない削除記録」 を意味するようになった (`foreign_tombs` の永続化)
+///
+/// 読み手は 3 版すべてを読める。 v3 を v2 の reader に食わせると
+/// `NO_LOCAL_SLOT` を実在 slot として扱ってしまうので版数を上げてある
+/// (v9 DB は FILE_VERSION 側で旧 binary を弾くため実害は無いが、 format の
+/// 自己記述性として正しい形にしておく)。
+const EIDMAP_VERSION: u32 = 3;
+
+/// #166: 「この entry は写像ではなく削除記録だけ」 を表す番兵。
+/// `max_entities` は `u32::MAX` 未満なので実在 slot と衝突しない。
+const NO_LOCAL_SLOT: u32 = u32::MAX;
+
 fn serialize_eidmap(entries: &[EidmapEntry]) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + entries.len() * 28);
     out.extend_from_slice(b"EIDM");
-    out.extend_from_slice(&2u32.to_le_bytes());
+    out.extend_from_slice(&EIDMAP_VERSION.to_le_bytes());
     out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for &(peer, foreign_local, local, tomb) in entries {
         out.extend_from_slice(&peer.to_le_bytes());
@@ -412,7 +431,9 @@ fn deserialize_eidmap(buf: &[u8]) -> Result<Vec<EidmapEntry>, String> {
     let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
     let entry_size = match version {
         1 => 12usize,
-        2 => 28usize,
+        // v2 と v3 は同じ長さ。 違いは `local == NO_LOCAL_SLOT` の解釈だけで、
+        // その判定は読み手 (`load` 側) が行う。
+        2 | 3 => 28usize,
         v => return Err(format!("eidmap sidecar: unsupported version {}", v)),
     };
     let count = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
@@ -500,12 +521,14 @@ fn writer_lock_path_for(path: &str) -> std::path::PathBuf {
 /// push 成功時に `wal_push_count` を進める (flush_writes の WAL barrier 用)。
 #[inline]
 fn push_oplog_record_blocking(
-    wq: &crossbeam_queue::ArrayQueue<enchudb_oplog::oplog::OwnedOp>,
+    wq: &crossbeam_queue::ArrayQueue<(enchudb_oplog::oplog::OwnedOp, enchudb_oplog::Hlc)>,
     rec: enchudb_oplog::oplog::OwnedOp,
+    // request17-A3: push 側が採番した版数。 cell に書いたものと同一。
+    hlc: enchudb_oplog::Hlc,
     poisoned: &std::sync::atomic::AtomicBool,
     wal_push_count: &std::sync::atomic::AtomicU64,
 ) {
-    let mut rec = rec;
+    let mut rec = (rec, hlc);
     loop {
         match wq.push(rec) {
             Ok(()) => {
@@ -874,7 +897,16 @@ const FILE_MAGIC: [u8; 4] = *b"ECDB";
 /// 検証しない**ため、 新 slot で書かれた clean index を旧 slot 関数で読んで silent に
 /// lookup miss する。 これを防ぐために file version を上げ、 旧 binary の open を
 /// unsupported version で loud に失敗させる (mixed-version 運用は非サポート)。
-const FILE_VERSION: u32 = 8;
+/// v9 (request17): per-cell version column + tombstone column。 **領域の有無は
+/// version 番号ではなく `H_CELL_VERSION` flag が真実** (leaf region の
+/// `H_LEAF_DATA_SIZE == 0` と同じ self-describing 方式)。 v8 で作られた DB を v9
+/// binary で開くと version stamp だけ 9 に上がるが flag は 0 のままで、 layout は
+/// 1 byte も変わらない (= migration 不要)。 version を上げるのは、 v9 領域を持つ DB を
+/// **旧 binary が開いて version column を無視したまま書く**のを止めるため。
+const FILE_VERSION: u32 = 9;
+/// v8 (0.15.0〜0.18.x)。 v9 binary で writer open すると version stamp は 9 に上がる
+/// (layout は変わらない — v9 領域は `H_CELL_VERSION` flag で管理)。
+const FILE_VERSION_LEGACY_V8: u32 = 8;
 /// v7 (0.13.0〜0.14.x)。 writer open で v8 へ透過 migrate する (index も同時に VIX3 化)。
 const FILE_VERSION_LEGACY_V7: u32 = 7;
 /// v4 DB を後方互換で open する識別子。 v4 → v5 migrate は open 時透過。
@@ -1022,6 +1054,11 @@ const H_BACKING_KIND: usize = 76; // u32
 /// (pre-v6 DB)。 CRC 保護外 (H_PEER_ID / H_BACKING_KIND と同様、 破損は
 /// try_from_params の checked arithmetic + u32::MAX assert で捕捉)。
 const H_LEAF_DATA_SIZE: usize = 80; // u64
+/// v9 (request17): per-cell version column + tombstone column を持つか (u32、 0 = 無し)。
+/// sizes は `max_entities` / `max_himos` から一意に決まるので flag 1 本で足りる。
+/// CRC 保護外 (H_LEAF_DATA_SIZE と同様) だが、 破損して 1 に化けても layout の
+/// total_size が file size を超えて open 時に `backing too small` で弾かれる。
+const H_CELL_VERSION: usize = 88; // u32
 
 const BACKING_KIND_GROWABLE: u32 = 1;
 const H_HIMO_TYPES: usize = 256;
@@ -1032,6 +1069,49 @@ const H_HIMO_TYPES: usize = 256;
 // は 0 で残置)、 既存 DB は何もせず読める。
 
 fn align8(n: usize) -> usize { (n + 7) & !7 }
+
+/// v9 (request17-A): version column の 1 cell が持つ HLC のバイト数
+/// (`wall: u64` + `logical: u32` + `peer: u32`)。 `Hlc::ZERO` (全 0) が「版数不明」を
+/// 意味するので、 zero-fill された region がそのまま正しい初期状態になる。
+const HLC_CELL_BYTES: u32 = 16;
+
+/// v9 (request17-A): HLC → version column の 1 cell (16B LE)。
+/// layout は `wall: u64` / `logical: u32` / `peer: u32` の順。
+#[inline]
+fn hlc_to_cell(h: enchudb_oplog::Hlc) -> [u8; HLC_CELL_BYTES as usize] {
+    let mut b = [0u8; HLC_CELL_BYTES as usize];
+    b[0..8].copy_from_slice(&h.wall.to_le_bytes());
+    b[8..12].copy_from_slice(&h.logical.to_le_bytes());
+    b[12..16].copy_from_slice(&h.peer.to_le_bytes());
+    b
+}
+
+/// v9 (request17-A): version column の 1 cell → HLC。 zero-fill された cell は
+/// そのまま `Hlc::ZERO` (= 版数不明) になる。
+#[inline]
+fn hlc_from_cell(b: &[u8]) -> enchudb_oplog::Hlc {
+    debug_assert_eq!(b.len(), HLC_CELL_BYTES as usize);
+    enchudb_oplog::Hlc {
+        wall: u64::from_le_bytes(b[0..8].try_into().unwrap()),
+        logical: u32::from_le_bytes(b[8..12].try_into().unwrap()),
+        peer: u32::from_le_bytes(b[12..16].try_into().unwrap()),
+    }
+}
+
+/// v9 (request17-A): version column を region から作る。 fresh な (= zero-fill
+/// された) region は Column header が空なので `init`、 既存 v9 DB の region は
+/// `load` する。 判定は header の value_size (offset 4..8) を覗くだけ。
+fn ver_column_from_region(region: Region, max_entities: u32) -> Column {
+    // growable backing では v9 領域は variable cluster の末尾 = 初期 commit の外。
+    // header (16B) を読む前に commit を伸ばさないと未コミット page で SIGBUS する。
+    let _ = region.ensure_committed(crate::column::HEADER_BYTES);
+    let stored_vs = u32::from_le_bytes(region.slice()[4..8].try_into().unwrap());
+    if stored_vs == HLC_CELL_BYTES {
+        Column::load(region)
+    } else {
+        Column::init(region, HLC_CELL_BYTES, max_entities)
+    }
+}
 
 /// ヘッダ整合性 CRC を計算する対象領域。
 /// magic, version, max_entities, max_himos, himo_count,
@@ -1161,6 +1241,21 @@ struct Layout {
     content_data_size: usize,
     leaf_data_off: usize,
     leaf_data_size: usize,
+    /// v9 (request17-A): per-cell version column の base。 himo ごとに **HLC を生で**
+    /// (16B: wall u64 / logical u32 / peer u32) 並べる (`Column` と同じ形)。
+    /// **variable cluster の末尾**に置くので、 pre-v9 DB の既存 region は 1 byte も
+    /// 動かない (`leaf_data` の「size 0 なら region 無し」と同じ)。
+    /// `ver_col_size == 0` = version column 無し (pre-v9)。
+    ///
+    /// `Hlc::ZERO` (全 0) が「版数不明」を意味するので、 zero-fill された region が
+    /// そのまま正しい初期状態になる (追加の初期化不要 / A-1)。
+    ver_base_off: usize,
+    ver_col_size: usize,
+    /// v9 (request17-A5): tombstone version column。 削除は himo を持たない
+    /// (`Delete { eid }`) ので himo ごとの version column には置けず、 eid 空間に
+    /// **1 本だけ**持つ。 `tomb_size == 0` = 無し (pre-v9)。
+    tomb_off: usize,
+    tomb_size: usize,
     himo_base_off: usize,
     himo_col_size: usize,
     #[allow(dead_code)]
@@ -1174,7 +1269,7 @@ impl Layout {
     /// #120: 上限超過 (align8 後の u32 data_end / total_size overflow) は
     /// **書く前に** Err で返す。 呼び元 (create 経路) は `io::ErrorKind::InvalidInput`
     /// に写して伝播すること — panic にすると caller が握れない。
-    fn compute(max_entities: u32, max_himos: u32, vocab_data_size: usize, content_data_size: Option<usize>, cyl_max_values: Option<u32>, leaf_data_size: Option<usize>, vocab_max_entries: Option<u32>) -> Result<Self, String> {
+    fn compute(max_entities: u32, max_himos: u32, vocab_data_size: usize, content_data_size: Option<usize>, cyl_max_values: Option<u32>, leaf_data_size: Option<usize>, vocab_max_entries: Option<u32>, cell_version: bool) -> Result<Self, String> {
         // #122: 既定は max_entities × 16 (上限 256 M)。 vocab の値の種類数は entity 数と
         // 相関しないので、 実測で分かっている consumer は GrowableOptions で明示する。
         let vocab_max_entries = match vocab_max_entries {
@@ -1195,6 +1290,7 @@ impl Layout {
             max_entities, max_himos,
             vocab_max_entries, vocab_data_size,
             content_data_size, cyl_max_values, leaf_data_size,
+            cell_version,
         )
     }
 
@@ -1208,6 +1304,8 @@ impl Layout {
         content_data_size: Option<usize>,
         cyl_max_values: Option<u32>,
         leaf_data_size: Option<usize>,
+        // v9 (request17-A): per-cell version column を持つか。
+        cell_version: bool,
     ) -> Result<Self, String> {
         let vocab_index_cap = vocab_max_entries.next_power_of_two();
         let himoreg_max_entries = max_himos.max(256);
@@ -1229,6 +1327,7 @@ impl Layout {
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, leaf_data_size, cyl_max_values,
+            cell_version,
         )
     }
 
@@ -1240,6 +1339,9 @@ impl Layout {
         vocab_max_entries: u32, vocab_index_cap: u32, vocab_data_size: usize,
         himoreg_max_entries: u32, himoreg_index_cap: u32, himoreg_data_size: usize,
         content_data_size: usize, leaf_data_size: usize, cyl_max_values: u32,
+        // v9 (request17-A): per-cell version column を持つか。
+        // false = pre-v9 DB、 または v9 を有効化していない create。
+        cell_version: bool,
     ) -> Result<Self, String> {
         // EntitySet::region_size 内部の `(max_entities + 7)` が u32 で wrap しない
         // ガード。 この値の DB は create 時点で作れない (debug では overflow panic)。
@@ -1346,7 +1448,42 @@ impl Layout {
         let leaf_data_size = align8(leaf_data_size);
         off = ck_add(off, leaf_data_size)?;
 
+        // v9 (request17-A): per-cell version column (himo ごと) + tombstone column (1 本)。
+        // leaf と同じく variable cluster の末尾に置くので、 **pre-v9 DB の既存 region は
+        // 動かない**。 無効時は両方 size 0 で layout は pre-v9 と byte 単位で同一。
+        //
+        // cell には HLC を **生で** 置く (16B)。 intern 表案は `next_hlc()` が record ごとに
+        // logical を進める実装のため「同じ HLC が繰り返し出る」ことが無く、
+        // `4B(id) + 16B(entry)` = 20B/cell で生 HLC (16B) より重くなるので却下した。
+        //
+        // 並びは **tombstone → himo ごとの version column** の順。 growable backing の
+        // commit は単調な high-water mark なので、 後ろの region を触ると手前が丸ごと
+        // commit される (= apparent size が跳ねる)。 tombstone は 1 本しか無いので、
+        // 「delete しただけで version column 全体 (himo 数 × 16B/cell) が commit される」
+        // のを避けるために手前に置く。
+        let tomb_off = off;
+        let tomb_size = if cell_version {
+            align8(Column::region_size(max_entities, HLC_CELL_BYTES))
+        } else {
+            0
+        };
+        off = ck_add(off, tomb_size)?;
+
+        let ver_base_off = off;
+        let (ver_col_size, ver_total) = if cell_version {
+            let s = align8(Column::region_size(max_entities, HLC_CELL_BYTES));
+            let total = s
+                .checked_mul(max_himos as usize)
+                .ok_or_else(|| "layout version column region overflow".to_string())?;
+            (s, total)
+        } else {
+            (0, 0)
+        };
+        off = ck_add(off, ver_total)?;
+
         Ok(Layout {
+            ver_base_off, ver_col_size,
+            tomb_off, tomb_size,
             entities_off, entities_size,
             vocab_data_off, vocab_data_size,
             vocab_offsets_off, vocab_offsets_size,
@@ -1367,6 +1504,16 @@ impl Layout {
 
     fn himo_col_off(&self, hid: usize) -> usize {
         self.himo_base_off + hid * self.himo_slot_size
+    }
+    /// v9 (request17-A): himo `hid` の version column 先頭 (HLC 16B の並び)。
+    /// `ver_col_size == 0` の DB (pre-v9) には領域が無いので、 呼び側が先に
+    /// `has_cell_version()` を確認すること。
+    fn ver_col_off(&self, hid: usize) -> usize {
+        self.ver_base_off + hid * self.ver_col_size
+    }
+    /// v9 領域 (version column + tombstone column) を持つ DB か。
+    fn has_cell_version(&self) -> bool {
+        self.ver_col_size > 0 && self.tomb_size > 0
     }
     #[allow(dead_code)]
     fn himo_cyl_a_off(&self, hid: usize) -> usize {
@@ -1536,6 +1683,14 @@ pub struct Engine {
     value_types: AppendVec<ValueType>,
     himo_max_values: AppendVec<u32>,
     himos: AppendVec<HimoStore>,
+    /// v9 (request17-A): himo ごとの version column (HLC 16B/cell)。 `himos` と
+    /// **同じ index** で並ぶ parallel array。 v9 領域を持たない DB (pre-v9 /
+    /// v9 未有効 create) では **空のまま**で、 `cell_hlc` は常に `Hlc::ZERO`
+    /// (= 版数不明) を返す (A-1 の「現状維持」)。
+    ver_cols: AppendVec<Column>,
+    /// v9 (request17-A5): tombstone version column。 削除 (`Delete { eid }`) は
+    /// himo を持たないので eid 空間に 1 本だけ持つ。 v9 領域が無ければ None。
+    tomb_col: Option<Column>,
     /// β-light step 2: engine が認知する table 一覧。 index 0 は常に
     /// anonymous table (旧 API は全部ここに dispatch)。 step 3+ で
     /// define_table 時に push される。
@@ -1571,7 +1726,9 @@ pub struct Engine {
     /// async path 専用の WAL record queue。 writer は WAL に直接書かず、 ここに
     /// owned record を push。 consumer thread が drain して `wal.append_many` で
     /// 1 flock サイクル N records にまとめる (per-record flock コスト償却)。
-    oplog_record_queue: Option<std::sync::Arc<crossbeam_queue::ArrayQueue<enchudb_oplog::oplog::OwnedOp>>>,
+    /// request17 (A-3): record と **その版数** を対で運ぶ。 consumer は
+    /// `append_many_with_hlcs` でこの HLC のまま WAL に載せる (採番し直さない)。
+    oplog_record_queue: Option<std::sync::Arc<crossbeam_queue::ArrayQueue<(enchudb_oplog::oplog::OwnedOp, enchudb_oplog::Hlc)>>>,
     /// writer が `oplog_record_queue` へ push した WAL record の累積件数。
     /// op は queue 先行・record 後追い (#77-H4) なので、 apply_count barrier
     /// だけでは「op は適用済みだが record は未 append」の窓が残る。
@@ -1592,6 +1749,20 @@ pub struct Engine {
     warned_ref_to_replica: std::sync::atomic::AtomicBool,
     /// 0.18.2: `_sync_ops` 満杯 backpressure の warn を 1 回に抑制（解消で解除）。
     warned_sync_ops_full: std::sync::atomic::AtomicBool,
+    /// request17 (v9): ローカル write が cell の版数判定で弾かれた warn の一度きり
+    /// フラグ。 構造上起きないはずの事象なので、 起きたら無音にしない。
+    warned_cell_version_reject: std::sync::atomic::AtomicBool,
+    /// request17 (A-3): **async write の HLC 事前採番と queue push を束ねる lock**。
+    ///
+    /// async 経路は「op の適用」も「WAL append」も consumer thread が後から行うため、
+    /// 版数は push 側で採番して両 queue に同じ値を運ぶしかない。 その採番順と queue
+    /// 投入順がずれると WAL 上で HLC が単調増加しなくなり、 **HLC 順に record を
+    /// 並べ替えて配る transport** の下で依存順 (Vocab → その vid を使う Tie) が逆転する
+    /// (#141 の誤 bind と同じ壊れ方)。 採番と push を 1 単位にして順序を固定する。
+    ///
+    /// 同期経路はこの lock を取らない (採番が `append` の直列化の内側にあるため
+    /// 構造的に単調 — `append_local_op` 参照)。
+    hlc_mint_lock: parking_lot::Mutex<()>,
     /// 背景 fsync が最後に completed した LSN。
     durable_lsn: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// v32: この Engine を所有する peer の id。分散時 eid の上位 32bit。
@@ -1600,6 +1771,22 @@ pub struct Engine {
     hlc_store: std::sync::Arc<crate::hlc_store::HlcStore>,
     /// #9: 受信した foreign eid を自分の eid 空間の local eid に翻訳する写像。
     eid_translator: std::sync::Arc<crate::eid_translator::EidTranslator>,
+    /// #166: **slot から切り離された** foreign entity の削除版数。
+    ///
+    /// tombstone は普段 local slot 側 (v9 の tombstone column / pre-v9 の
+    /// `HlcStore`) に載るが、 slot が別の住人に再利用されると当然そこには残せない。
+    /// 一方 「その foreign entity は削除済み」 という事実は **identity に属する**
+    /// ので、 slot を手放しても覚えていないと、 削除より古い record が再配送された
+    /// ときに新しい slot を確保して復活してしまう (#140 の再来)。
+    ///
+    /// そこで slot を手放す時点で `(author_peer, foreign_local) -> Hlc` に退避し、
+    /// 同じ identity に新しい slot を払い出すとき (`alloc_translated_local`) に
+    /// その slot へ書き戻す。 これで 「削除済み」 が slot の寿命から独立する。
+    foreign_tombs: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<(enchudb_oplog::PeerId, u32), enchudb_oplog::Hlc>>>,
+    /// #166: `foreign_tombs` が空かどうかの fast path flag。 slot 再利用が一度も
+    /// 起きていない DB (= 常態) で、 受信 apply の hot path が read lock すら
+    /// 取らないようにするためだけのもの。
+    foreign_tombs_empty: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// v32 Phase C: 自 peer の ed25519 鍵ペア。None なら署名しない/検証もしない。
     keypair: std::sync::RwLock<Option<std::sync::Arc<enchudb_oplog::keys::Keypair>>>,
     /// v32 Phase C: 他 peer の pubkey TOFU ストア。Syncer が verify に使う。
@@ -1758,10 +1945,45 @@ impl Engine {
         leaf_data_size: Option<usize>,
         leaf_scale: Option<LeafScale>,
     ) -> io::Result<Self> {
+        Self::create_full_with_leaf_scale_v9(
+            path, max_entities, vocab_data_size, max_himos, content_data_size,
+            cyl_max_values, leaf_data_size, leaf_scale,
+            // v9 (request17 step 7): per-cell version 領域を確保する。
+            true,
+        )
+    }
+
+    /// **v9 領域を持たない** DB を作る (= v8 相当の layout)。 pre-v9 DB を v9 binary で
+    /// 開く経路の回帰テスト用で、 通常の用途では使わない (`leaf_data_size = Some(0)` で
+    /// v5 相当 DB を作れるようにしてあるのと同じ趣旨)。
+    ///
+    /// この DB では版数の置き場が per-cell column ではなく揮発 `HlcStore` になる
+    /// (= 判定は同じ、 記憶がプロセス寿命)。
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn create_without_cell_version(path: &str, max_entities: u32) -> io::Result<Self> {
+        Self::create_full_with_leaf_scale_v9(
+            path, max_entities, None, None, None, None, None, None, false,
+        )
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::too_many_arguments)]
+    fn create_full_with_leaf_scale_v9(
+        path: &str,
+        max_entities: u32,
+        vocab_data_size: Option<usize>,
+        max_himos: Option<u32>,
+        content_data_size: Option<usize>,
+        cyl_max_values: Option<u32>,
+        leaf_data_size: Option<usize>,
+        leaf_scale: Option<LeafScale>,
+        cell_version: bool,
+    ) -> io::Result<Self> {
         let off_shift = leaf_scale.map(|s| s.off_shift()).unwrap_or(DEFAULT_LEAF_OFF_SHIFT);
         let vds = vocab_data_size.unwrap_or(DEFAULT_VOCAB_DATA_SIZE);
         let max_himos = max_himos.unwrap_or(DEFAULT_MAX_HIMOS);
-        let layout = Layout::compute(max_entities, max_himos, vds, content_data_size, cyl_max_values, leaf_data_size, None).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, vds, content_data_size, cyl_max_values, leaf_data_size, None, cell_version).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         // #90: 予約 leaf region が選んだ scale の cap を超えないか検証。
         let leaf_cap = cap_bytes_for_shift(off_shift);
         if layout.leaf_data_size as u64 > leaf_cap {
@@ -1803,6 +2025,9 @@ impl Engine {
         mmap[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].copy_from_slice(&(layout.content_data_size as u64).to_le_bytes());
         mmap[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].copy_from_slice(&layout.cyl_max_values.to_le_bytes());
         mmap[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8].copy_from_slice(&(layout.leaf_data_size as u64).to_le_bytes());
+        // v9 (request17): per-cell version 領域の有無。 open 側はこの flag だけを見る。
+        mmap[H_CELL_VERSION..H_CELL_VERSION + 4]
+            .copy_from_slice(&(layout.has_cell_version() as u32).to_le_bytes());
 
         // v28: ヘッダ整合性 CRC
         write_header_crc(&mut mmap);
@@ -1838,6 +2063,16 @@ impl Engine {
         } else {
             None
         };
+        // v9 (request17-A5): tombstone column は himo に依らないので create 時に確保。
+        // himo ごとの version column は define_himo_slot_locked で himo と同時に作る。
+        let tomb_col = if layout.has_cell_version() {
+            Some(ver_column_from_region(
+                unsafe { Region::new(base.add(layout.tomb_off), layout.tomb_size) },
+                max_entities,
+            ))
+        } else {
+            None
+        };
 
         Ok(Self {
             path: path.to_string(), layout, max_entities, max_himos,
@@ -1845,7 +2080,10 @@ impl Engine {
             himo_names: AppendVec::with_capacity(max_himos as usize),
             value_types: AppendVec::with_capacity(max_himos as usize),
             himo_max_values: AppendVec::with_capacity(max_himos as usize),
-            himos: AppendVec::with_capacity(max_himos as usize), entities, contents, leaf,
+            himos: AppendVec::with_capacity(max_himos as usize),
+            ver_cols: AppendVec::with_capacity(max_himos as usize),
+            tomb_col,
+            entities, contents, leaf,
             tables: vec![TableDef::anonymous()],
             himo_to_table: AppendVec::with_capacity(max_himos as usize),
             himo_def_lock: std::sync::Mutex::new(()),
@@ -1861,10 +2099,14 @@ impl Engine {
             consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             warned_ref_to_replica: std::sync::atomic::AtomicBool::new(false),
             warned_sync_ops_full: std::sync::atomic::AtomicBool::new(false),
+            warned_cell_version_reject: std::sync::atomic::AtomicBool::new(false),
+            hlc_mint_lock: parking_lot::Mutex::new(()),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
+            foreign_tombs: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            foreign_tombs_empty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             keypair: std::sync::RwLock::new(None),
             pubkeys: std::sync::Arc::new(enchudb_oplog::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
@@ -1907,7 +2149,7 @@ impl Engine {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create_growable_with_capacity(path: &str, max_entities: u32) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
-        let layout = Layout::compute(max_entities, max_himos, DEFAULT_VOCAB_DATA_SIZE, None, None, None, None).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, DEFAULT_VOCAB_DATA_SIZE, None, None, None, None, true).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
     }
 
@@ -1924,7 +2166,7 @@ impl Engine {
         vocab_data_size: usize,
     ) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
-        let layout = Layout::compute(max_entities, max_himos, vocab_data_size, None, None, None, None).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, vocab_data_size, None, None, None, None, true).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
     }
 
@@ -1942,7 +2184,7 @@ impl Engine {
     ) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
         let vds = vocab_data_size.unwrap_or(DEFAULT_VOCAB_DATA_SIZE);
-        let layout = Layout::compute(max_entities, max_himos, vds, None, None, leaf_data_size, None).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, vds, None, None, leaf_data_size, None, true).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let leaf_cap = leaf_scale.cap_bytes();
         if layout.leaf_data_size as u64 > leaf_cap {
             return Err(io::Error::new(
@@ -1969,6 +2211,7 @@ impl Engine {
             Some(opts.cyl_max_values),
             opts.leaf_data_size,
             opts.vocab_max_entries, // #122
+            true,                   // v9 (request17): per-cell version 領域を確保
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let leaf_cap = opts.leaf_scale.cap_bytes();
@@ -2022,6 +2265,7 @@ impl Engine {
             Some(64 * 1024),  // content_data: 64 KB
             Some(64),         // cyl_max_values: small per-himo cylinders
             None,             // leaf_data: default
+            false,            // v9 (request17): 未有効化
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
@@ -2091,6 +2335,9 @@ impl Engine {
             .copy_from_slice(&BACKING_KIND_GROWABLE.to_le_bytes());
         header[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8]
             .copy_from_slice(&(layout.leaf_data_size as u64).to_le_bytes());
+        // v9 (request17): per-cell version 領域の有無。
+        header[H_CELL_VERSION..H_CELL_VERSION + 4]
+            .copy_from_slice(&(layout.has_cell_version() as u32).to_le_bytes());
         write_header_crc(header);
 
         let _ = base; // base ptr is implicit via Region::with_grower from here on
@@ -2153,6 +2400,15 @@ impl Engine {
         let leaf = Some(LeafStore::init(unsafe {
             Region::with_grower(map.clone(), layout.leaf_data_off, layout.leaf_data_size)
         }, leaf_off_shift));
+        // v9 (request17-A5): tombstone column (mmap create 経路と同じ、 grower 版)。
+        let tomb_col = if layout.has_cell_version() {
+            Some(ver_column_from_region(
+                unsafe { Region::with_grower(map.clone(), layout.tomb_off, layout.tomb_size) },
+                max_entities,
+            ))
+        } else {
+            None
+        };
 
         Ok(Self {
             path: path.to_string(),
@@ -2165,6 +2421,8 @@ impl Engine {
             value_types: AppendVec::with_capacity(max_himos as usize),
             himo_max_values: AppendVec::with_capacity(max_himos as usize),
             himos: AppendVec::with_capacity(max_himos as usize),
+            ver_cols: AppendVec::with_capacity(max_himos as usize),
+            tomb_col,
             entities,
             contents,
             leaf,
@@ -2183,10 +2441,14 @@ impl Engine {
             consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             warned_ref_to_replica: std::sync::atomic::AtomicBool::new(false),
             warned_sync_ops_full: std::sync::atomic::AtomicBool::new(false),
+            warned_cell_version_reject: std::sync::atomic::AtomicBool::new(false),
+            hlc_mint_lock: parking_lot::Mutex::new(()),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
+            foreign_tombs: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            foreign_tombs_empty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             keypair: std::sync::RwLock::new(None),
             pubkeys: std::sync::Arc::new(enchudb_oplog::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
@@ -2288,21 +2550,29 @@ impl Engine {
         // sync で mapping は張り直せる)。
         match load_eidmap_from_sidecar(path) {
             Ok(Some(entries)) => {
-                // peer_id は上で header から復元済み → translated eid の key が正しく作れる。
-                let self_peer = eng.peer_id();
                 for (peer, foreign_local, local, tomb) in entries {
+                    // #166: 写像を持たない削除記録 (slot を手放した identity)。
+                    // 写像も slot も復元せず、 退避表にだけ載せる。 次にこの
+                    // identity へ slot を払い出すとき書き戻される。
+                    if local == NO_LOCAL_SLOT {
+                        eng.remember_foreign_tombstone(peer, foreign_local, tomb);
+                        continue;
+                    }
                     eng.eid_translator.insert(peer, foreign_local, local);
                     // #9 (H4): `.eidmap` と `.tables` は別々の rename なので crash で
                     // 不整合になりうる。 mapped local を table の next_local が必ず追い
                     // 越すよう前進させ、 stale `.tables` でも mapped slot を再 alloc して
                     // 衝突する事態を防ぐ (= 最悪でも「重複」に留め「衝突」を起こさない)。
                     Self::advance_table_next_local_for(&eng.tables, local);
-                    // #9 (C): foreign Delete tombstone を HlcStore に復元する。 これが無いと
+                    // #9 (C): foreign Delete tombstone を復元する。 これが無いと
                     // reopen で tombstone が消え、 Delete より古い Tie が (Delete 抜きで) 再配送
                     // された時に削除済み entity が復活する。 ZERO は未削除なので skip。
+                    //
+                    // request17 step 6: 復元先も `set_tombstone_local` に一本化
+                    // (v9 なら tombstone column、 pre-v9 なら HlcStore)。 v9 では既に
+                    // 本体側に載っているので monotone-max の no-op になる。
                     if tomb != enchudb_oplog::Hlc::ZERO {
-                        eng.hlc_store
-                            .force_set(enchudb_oplog::make_eid(self_peer, local), u16::MAX, tomb);
+                        eng.set_tombstone_local(local, tomb);
                     }
                 }
             }
@@ -2464,11 +2734,15 @@ impl Engine {
 
         // v6 (#88): leaf region size (pre-v6 header は 0 = leaf region 無し)。
         let leaf_data_size = u64::from_le_bytes(buf[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8].try_into().unwrap()) as usize;
+        // v9 (request17): v9 領域の有無 (無しなら layout は pre-v9 と完全同一)。
+        let cell_version =
+            u32::from_le_bytes(buf[H_CELL_VERSION..H_CELL_VERSION + 4].try_into().unwrap()) != 0;
         let layout = Layout::try_from_params(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, leaf_data_size, cyl_max_values,
+            cell_version,
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -2566,6 +2840,7 @@ impl Engine {
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, leaf_data_size, cyl_max_values,
+            false, // v9 (request17): 未有効化。 header から読むのは有効化と同時
         )?;
 
         // src が v5 layout 全域 (= leaf_data_off までのバイト列) をカバーしているか。
@@ -2588,6 +2863,10 @@ impl Engine {
         dst[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION_LEGACY_V6.to_le_bytes());
         dst[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8]
             .copy_from_slice(&(layout.leaf_data_size as u64).to_le_bytes());
+        // v9 (request17): 出力は v6 layout なので per-cell version 領域は無い。
+        // src 由来の flag が残ると、 open 側が「有る」前提の layout を組んで
+        // `backing too small` になる (src が v9 DB の場合)。
+        dst[H_CELL_VERSION..H_CELL_VERSION + 4].copy_from_slice(&0u32.to_le_bytes());
         write_header_crc(&mut dst);
 
         let type_bytes: Vec<u8> = (0..himo_count as usize).map(|hid| dst[H_HIMO_TYPES + hid]).collect();
@@ -2712,15 +2991,16 @@ impl Engine {
         // v7 (現行) / v6 / v5 / v4 を受け付ける。 v6 は leaf offset が byte だが、
         // LeafStore が region header の off_shift=0 で self-describing に read-through。
         if version != FILE_VERSION
+            && version != FILE_VERSION_LEGACY_V8
             && version != FILE_VERSION_LEGACY_V7
             && version != FILE_VERSION_LEGACY_V6
             && version != FILE_VERSION_LEGACY_V5
             && version != FILE_VERSION_LEGACY_V4
         {
             return Err(format!(
-                "unsupported EnchuDB file version {} (supported: {}, {}/{}/{}/{} compat). dev phase — recreate the DB.",
-                version, FILE_VERSION, FILE_VERSION_LEGACY_V7, FILE_VERSION_LEGACY_V6,
-                FILE_VERSION_LEGACY_V5, FILE_VERSION_LEGACY_V4
+                "unsupported EnchuDB file version {} (supported: {}, {}/{}/{}/{}/{} compat). dev phase — recreate the DB.",
+                version, FILE_VERSION, FILE_VERSION_LEGACY_V8, FILE_VERSION_LEGACY_V7,
+                FILE_VERSION_LEGACY_V6, FILE_VERSION_LEGACY_V5, FILE_VERSION_LEGACY_V4
             ));
         }
         // v28: ヘッダ整合性 CRC 検証(stored == 0 は v27 以前の DB として許容)
@@ -2751,11 +3031,17 @@ impl Engine {
         // validate_file_size で field sanity 済み、 Memory 経路 (from_bytes) は
         // ここが最初の防壁。
         let leaf_data_size = u64::from_le_bytes(buf[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8].try_into().unwrap()) as usize;
+        // v9 (request17): v9 領域の有無は header flag が真実 (version 番号ではない)。
+        // v8 で作られた DB は 0 のまま = version column 無し → 版数は揮発 HlcStore に
+        // fallback する (A-1 の「migration 不要」)。
+        let cell_version =
+            u32::from_le_bytes(buf[H_CELL_VERSION..H_CELL_VERSION + 4].try_into().unwrap()) != 0;
         let layout = Layout::try_from_params(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, leaf_data_size, cyl_max_values,
+            cell_version,
         )?;
 
         // backing が layout 全域をカバーしているか (Memory 経路の truncated bytes
@@ -2845,6 +3131,10 @@ impl Engine {
         let value_types: AppendVec<ValueType> = AppendVec::with_capacity(himo_cap);
         let himo_max_values: AppendVec<u32> = AppendVec::with_capacity(himo_cap);
         let himos: AppendVec<HimoStore> = AppendVec::with_capacity(himo_cap);
+        // v9 (request17-A): version column は himo と 1:1。 v9 領域が無い DB
+        // (pre-v9 / 未有効 create) では空のままにする (= 全 cell 版数不明)。
+        let ver_cols: AppendVec<Column> = AppendVec::with_capacity(himo_cap);
+        let has_cell_version = layout.has_cell_version();
 
         for hid in 0..himo_count as usize {
             let ht = ValueType::from_byte(type_bytes[hid]);
@@ -2857,12 +3147,26 @@ impl Engine {
                 unsafe { Region::new(base.add(layout.himo_col_off(hid)), layout.himo_col_size) },
                 ht, effective_mv,
             );
+            if has_cell_version {
+                let _ = ver_cols.push(ver_column_from_region(
+                    unsafe { Region::new(base.add(layout.ver_col_off(hid)), layout.ver_col_size) },
+                    max_entities,
+                ));
+            }
 
             let _ = himo_names.push(name);
             let _ = value_types.push(ht);
             let _ = himo_max_values.push(mv);
             let _ = himos.push(hs);
         }
+        let tomb_col = if has_cell_version {
+            Some(ver_column_from_region(
+                unsafe { Region::new(base.add(layout.tomb_off), layout.tomb_size) },
+                max_entities,
+            ))
+        } else {
+            None
+        };
         report("HimoStore::load × N", &mut t, &mut p);
 
         // β-light step 2: load 時は全 himo を anonymous table に attach する。
@@ -2883,7 +3187,7 @@ impl Engine {
             path: String::new(), layout, max_entities, max_himos,
             vocab, himo_reg,
             himo_names, value_types, himo_max_values,
-            himos, entities, contents,
+            himos, ver_cols, tomb_col, entities, contents,
             leaf,
             tables: initial_tables,
             himo_to_table: initial_himo_to_table,
@@ -2900,10 +3204,14 @@ impl Engine {
             consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             warned_ref_to_replica: std::sync::atomic::AtomicBool::new(false),
             warned_sync_ops_full: std::sync::atomic::AtomicBool::new(false),
+            warned_cell_version_reject: std::sync::atomic::AtomicBool::new(false),
+            hlc_mint_lock: parking_lot::Mutex::new(()),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
+            foreign_tombs: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            foreign_tombs_empty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             keypair: std::sync::RwLock::new(None),
             pubkeys: std::sync::Arc::new(enchudb_oplog::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
@@ -3789,6 +4097,9 @@ impl Engine {
             None
         };
         if let Some(global) = reused_global {
+            // 再利用 slot には前の住人の版数が残っている。 払い出す前に落とす
+            // (`clear_cell_versions` の doc 参照)。
+            self.clear_cell_versions(global);
             self.entities.allocate_at(global);
             if let Some(q) = self.write_queue.as_ref() {
                 q.push(crate::write_queue::Op::EntityCreated { local: global });
@@ -3868,23 +4179,34 @@ impl Engine {
         found
     }
 
-    /// #9: persist 用に翻訳写像 + 各 entity の foreign tombstone HLC を集める。 tombstone は
-    /// HlcStore の `(translated_eid, u16::MAX)` から引く (未削除なら `Hlc::ZERO`)。 reopen 時に
-    /// `.eidmap` v2 から復元され、 削除済み foreign entity の resurrection を防ぐ。
-    /// 呼ばれるのは persist trigger (consumer tick / 明示 persist) のみで read hot path 外。
+    /// #9: persist 用に翻訳写像 + 各 entity の foreign tombstone HLC を集める。
+    /// reopen 時に `.eidmap` v2 から復元され、 削除済み foreign entity の
+    /// resurrection を防ぐ。 呼ばれるのは persist trigger (consumer tick / 明示
+    /// persist) のみで read hot path 外。
+    ///
+    /// request17 step 6: tombstone の出所は `tombstone_version_of` に一本化した
+    /// (v9 なら tombstone column、 pre-v9 なら従来の揮発 `HlcStore`)。 v9 では
+    /// 版数が本体側に永続しているので sidecar は冗長だが、 pre-v9 DB と同じ
+    /// sidecar を書き続けることで **v9 binary で書いた DB を pre-v9 の経路で
+    /// 読んでも tombstone が失われない**。
     fn eidmap_entries_with_tombstones(&self) -> Vec<EidmapEntry> {
-        let self_peer = self.peer_id();
-        self.eid_translator
+        let mut out: Vec<EidmapEntry> = self
+            .eid_translator
             .snapshot()
             .into_iter()
             .map(|(peer, foreign_local, local)| {
-                let tomb = self
-                    .hlc_store
-                    .get(enchudb_oplog::make_eid(self_peer, local), u16::MAX)
-                    .unwrap_or(enchudb_oplog::Hlc::ZERO);
-                (peer, foreign_local, local, tomb)
+                (peer, foreign_local, local, self.tombstone_version_of(local))
             })
-            .collect()
+            .collect();
+        // #166: slot を手放した identity の削除記録も残す。 これが無いと reopen で
+        // 「削除済み」 を忘れ、 削除より古い record の再配送で復活する。
+        // 写像を持たないので `local` は番兵。
+        out.extend(
+            self.orphan_foreign_tombstones()
+                .into_iter()
+                .map(|(peer, foreign_local, tomb)| (peer, foreign_local, NO_LOCAL_SLOT, tomb)),
+        );
+        out
     }
 
     /// 0.8.1: `&self` で tables sidecar を強制 persist する public API。
@@ -4150,7 +4472,12 @@ impl Engine {
                  use entity_in('<table>') instead of entity()"
             );
         }
-        let local = self.entities.allocate();
+        // 上限到達後の `allocate` は free stack から slot を再利用する。
+        // 再利用なら前の住人の版数を落としてから渡す (entity_in の再利用枝と同じ)。
+        let (local, reused) = self.entities.allocate_tracked();
+        if reused {
+            self.clear_cell_versions(local);
+        }
         // concurrent mode (= consumer thread 稼働) なら barrier 用に空 op を
         // 流す。 issue5: push_count と apply_count を対称に保たないと
         // `flush_writes` が ties drain 前に early return して live query が
@@ -4231,9 +4558,504 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// LWW 用 HlcStore への参照(sync モジュールが使う)。
+    /// **pre-v9 DB の版数置き場**への参照 (legacy)。 v9 DB では空のまま
+    /// (版数は per-cell version column に永続する)。 判定はすべて engine の
+    /// `set_cell` 側で行うので、 新しい呼び出しを増やさないこと。
+    /// 残っている用途は sync 側の `hydrate_hlc_store` (pre-v9 専用) と
+    /// legacy `Content` op の key 単位 LWW だけ。
     pub fn hlc_store(&self) -> &std::sync::Arc<crate::hlc_store::HlcStore> {
         &self.hlc_store
+    }
+
+    // ──── v9 (request17-A): per-cell version — LWW の真実を storage に置く ────
+    //
+    // 揮発 `HlcStore` (配送バッファからの再構築でしか埋まらない HashMap) が
+    // #140 / #154 / #160 の共通の根だった。 ここでは cell の値と HLC を **1 本の
+    // 関数の中で**書き、 「判定を呼び忘れると黙って壊れる」構造 (ローカル write が
+    // まさにそうだった) を無くす。 request17 Phase 1 step 2: API だけ追加し、
+    // まだ engine 内の write 経路からは呼ばない (step 4 / 5 で切替)。
+
+    /// この DB が v9 の per-cell version 領域を持つか。 pre-v9 DB や v9 を
+    /// 有効化していない create では false で、 `cell_hlc` は常に `Hlc::ZERO`
+    /// (= 版数不明) を返す (A-1 の漸進的移行)。
+    pub fn has_cell_version(&self) -> bool {
+        self.layout.has_cell_version()
+    }
+
+    #[inline]
+    fn ver_col(&self, himo_id: u16) -> Option<&Column> {
+        self.ver_cols.get(himo_id as usize)
+    }
+
+    /// ローカル write 用に HLC を 1 個 **事前**採番する (A-3)。 oplog 無効 (standalone) は
+    /// 採番元が無いので `Hlc::ZERO` = 版数不明のまま書く (A-1 の現状維持。 standalone は
+    /// そもそも sync しないので実害は無い)。
+    ///
+    /// 採番したら **必ずその HLC で WAL record も書く**こと (`append_at_hlc` /
+    /// `append_many_with_hlcs`)。 cell の版数と record の HLC がずれると、 peer 間で
+    /// 「自分が持つ版数」と「配った版数」が食い違う。
+    ///
+    /// **事前採番は async 経路専用** — 同期経路は `append_local_op` (WAL 先行) を使う。
+    /// 事前採番には「採番順 = WAL 上の並び順」を呼び側が保証する義務が付く
+    /// (`hlc_mint_lock` 参照)。
+    #[inline]
+    fn mint_local_hlc(&self) -> enchudb_oplog::Hlc {
+        match self.oplog.as_ref() {
+            Some(wal) => wal.mint_hlc(),
+            None => enchudb_oplog::Hlc::ZERO,
+        }
+    }
+
+    /// 同期経路のローカル write を WAL に載せ、 **その record に載った HLC** を返す。
+    ///
+    /// 採番を `append` の直列化 (append_lock + flock) の内側に置くのが要点で、
+    /// これで **WAL 上の HLC が並び順どおり単調増加**する。 transport は record を
+    /// HLC 順に並べ替えて配る (`InMemoryTransport::pull_as` 等) ので、 崩すと
+    /// 「Vocab → その vid を使う Tie」のような依存順が受信側で逆転し、 vid 翻訳が
+    /// 生値に fallback して無関係な row へ誤 bind する (#141 の再来)。
+    ///
+    /// oplog 無効、 または append 失敗 (WAL 満杯) は `Hlc::ZERO` = 版数不明。
+    /// 後者は「本体には適用するが sync には流れない」従来の挙動と揃える。
+    /// local eid → WAL に載せる global eid。 oplog 無効なら peer 0 扱い
+    /// (record を出さないので値は使われない)。
+    #[inline]
+    fn oplog_eid(&self, local: u32) -> enchudb_oplog::EntityId {
+        let peer = self.oplog.as_ref().map_or(0, |wal| wal.peer_id());
+        enchudb_oplog::make_eid(peer, local)
+    }
+
+    /// async write 用: 「版数の採番」と「2 本の queue への push」を 1 単位にする guard。
+    /// oplog 無効なら版数は常に `Hlc::ZERO` で並び順に意味が無いので lock を取らない。
+    #[inline]
+    fn mint_guard(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
+        self.oplog.as_ref().map(|_| self.hlc_mint_lock.lock())
+    }
+
+    #[inline]
+    fn append_local_op(&self, op: enchudb_oplog::oplog::Op<'_>) -> enchudb_oplog::Hlc {
+        match self.oplog.as_ref() {
+            Some(wal) => wal
+                .append_with_hlc(op)
+                .map(|(_, h)| h)
+                .unwrap_or(enchudb_oplog::Hlc::ZERO),
+            None => enchudb_oplog::Hlc::ZERO,
+        }
+    }
+
+    /// ローカル write が版数判定で弾かれた (= 自分で採番した HLC より新しい版数が
+    /// cell に載っていた) ことを 1 回だけ報せる。
+    ///
+    /// 構造上ここには来ない — ローカル採番は単調増加で、 remote apply は受信 HLC で
+    /// ローカル clock を merge するため、 自分の次の HLC は必ず既存版数より大きい。
+    /// 来たなら clock の巻き戻り (システム時刻の後退等) を意味し、 **その write は
+    /// 落ちている**ので無音にはしない。
+    fn warn_local_write_rejected(&self, local: u32, himo_id: u16, mine: enchudb_oplog::Hlc) {
+        use std::sync::atomic::Ordering;
+        if self.warned_cell_version_reject.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        eprintln!(
+            "[enchudb] warning: local write (eid {}, himo {}) was rejected by the cell version \
+             guard — stored HLC {:?} >= minted {:?}. clock went backwards? \
+             (this write was NOT applied and is NOT published)",
+            local, himo_id, self.cell_hlc(local as enchudb_oplog::EntityId, himo_id), mine,
+        );
+    }
+
+    /// cell `(eid, himo_id)` に最後に書かれた HLC。
+    ///
+    /// `Hlc::ZERO` は **版数不明** — v9 領域が無い DB、 または まだ一度も
+    /// 版数付きで書かれていない cell。 A-1 のとおり版数不明 cell は従来どおり
+    /// (= 無条件に上書き) 扱う。
+    pub fn cell_hlc(&self, eid: enchudb_oplog::EntityId, himo_id: u16) -> enchudb_oplog::Hlc {
+        self.cell_hlc_local(enchudb_oplog::eid_local(eid), himo_id)
+    }
+
+    /// `cell_hlc` の local eid 版 (engine 内の write 経路は既に local に落として
+    /// いるので、 偽 EntityId を組み立てずに済ませる)。
+    #[inline]
+    fn cell_hlc_local(&self, local: u32, himo_id: u16) -> enchudb_oplog::Hlc {
+        match self.ver_col(himo_id) {
+            Some(col) if local < self.max_entities => {
+                // growable backing: 未コミット page は read でも SIGBUS。
+                let _ = col.ensure_committed_for(local);
+                hlc_from_cell(col.get(local))
+            }
+            _ => enchudb_oplog::Hlc::ZERO,
+        }
+    }
+
+    /// entity `eid` の tombstone HLC (= いつ削除されたか)。 未削除 / 版数不明は
+    /// `Hlc::ZERO`。 himo を持たない `Delete { eid }` 用に eid 空間へ 1 本だけ
+    /// 持つ column (A-5)。
+    pub fn tombstone_hlc(&self, eid: enchudb_oplog::EntityId) -> enchudb_oplog::Hlc {
+        self.tombstone_hlc_local(enchudb_oplog::eid_local(eid))
+    }
+
+    #[inline]
+    fn tombstone_hlc_local(&self, local: u32) -> enchudb_oplog::Hlc {
+        match self.tomb_col.as_ref() {
+            Some(col) if local < self.max_entities => {
+                let _ = col.ensure_committed_for(local);
+                hlc_from_cell(col.get(local))
+            }
+            _ => enchudb_oplog::Hlc::ZERO,
+        }
+    }
+
+    /// request17 step 5: 受信 record の HLC でローカル HLC clock を merge する。
+    ///
+    /// これが無いと、 相手の wall clock が先行している間ずっと「自分が次に採番する
+    /// HLC < 既に適用した remote の版数」になり、 **自分のローカル write が自分の DB で
+    /// 負ける** (版数を storage に置いた途端に顕在化する。 #161 と同じ「止めた先に
+    /// 脱出路が無い」形)。 HLC の merge 規則そのもの。
+    #[inline]
+    fn observe_remote_hlc(&self, hlc: enchudb_oplog::Hlc) {
+        if hlc == enchudb_oplog::Hlc::ZERO {
+            return;
+        }
+        if let Some(wal) = self.oplog.as_ref() {
+            wal.observe_hlc(hlc);
+        }
+    }
+
+    /// pre-v9 DB の版数置き場 (揮発 `HlcStore`) の key。 sync.rs が使っていた key
+    /// (`resolve_remote_eid` が返す self peer 付き EntityId) と同一にする。
+    #[inline]
+    fn version_key(&self, local: u32) -> u64 {
+        enchudb_oplog::make_eid(self.peer_id(), local)
+    }
+
+    /// cell の現在の版数。 v9 DB は version column、 pre-v9 DB は揮発 `HlcStore`
+    /// (= 従来 sync.rs が持っていた記憶) を見る。 どちらも無ければ `Hlc::ZERO`。
+    ///
+    /// **判定の入口はこの 1 本だけ** — 版数の置き場が column か HashMap かは
+    /// ここから先に漏らさない。 pre-v9 の fallback は step 6/7 (v9 既定化) で外す。
+    #[inline]
+    fn version_of(&self, local: u32, himo_id: u16) -> enchudb_oplog::Hlc {
+        if self.has_cell_version() {
+            self.cell_hlc_local(local, himo_id)
+        } else {
+            self.hlc_store
+                .get(self.version_key(local), himo_id)
+                .unwrap_or(enchudb_oplog::Hlc::ZERO)
+        }
+    }
+
+    /// entity の tombstone 版数 (`version_of` の delete 版、 sentinel himo = `u16::MAX`)。
+    #[inline]
+    fn tombstone_version_of(&self, local: u32) -> enchudb_oplog::Hlc {
+        if self.has_cell_version() {
+            self.tombstone_hlc_local(local)
+        } else {
+            self.hlc_store
+                .get(self.version_key(local), u16::MAX)
+                .unwrap_or(enchudb_oplog::Hlc::ZERO)
+        }
+    }
+
+    /// 削除より古い write か (A-5)。 true なら適用してはいけない —
+    /// 適用すると削除済み entity が復活する (#140 の根)。
+    ///
+    /// 版数不明 (`ZERO`) の write は判定対象外 (A-1 の現状維持)。
+    pub fn tombstone_blocks(&self, eid: enchudb_oplog::EntityId, hlc: enchudb_oplog::Hlc) -> bool {
+        if hlc == enchudb_oplog::Hlc::ZERO {
+            return false;
+        }
+        let tomb = self.tombstone_version_of(enchudb_oplog::eid_local(eid));
+        tomb != enchudb_oplog::Hlc::ZERO && hlc < tomb
+    }
+
+    /// cell への write を採用してよいか。 `set_cell` / `clear_cell` の唯一の判定。
+    #[inline]
+    fn accepts_write(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc) -> bool {
+        if hlc == enchudb_oplog::Hlc::ZERO {
+            return true; // 版数不明 (standalone のローカル write) は従来どおり通す
+        }
+        // 削除済み entity を古い Tie/Untie で蘇らせない (A-5)
+        let tomb = self.tombstone_version_of(local);
+        if tomb != enchudb_oplog::Hlc::ZERO && hlc < tomb {
+            return false;
+        }
+        Self::accepts_hlc(self.version_of(local, himo_id), hlc)
+    }
+
+    /// LWW 判定 (A-2)。 true = 採用してよい。
+    ///
+    /// - 受信 HLC が `ZERO` (= 版数不明。 oplog 無効な standalone のローカル write)
+    ///   は判定対象外で常に採用する。 止めると standalone が書けなくなるだけで、
+    ///   #161 と同じ「塞いだ先に脱出路が無い」形になる
+    /// - 現在値が `ZERO` (版数不明 cell) も常に採用 = 従来挙動の維持 (A-1)
+    #[inline]
+    fn accepts_hlc(cur: enchudb_oplog::Hlc, incoming: enchudb_oplog::Hlc) -> bool {
+        incoming == enchudb_oplog::Hlc::ZERO
+            || cur == enchudb_oplog::Hlc::ZERO
+            || cur < incoming
+    }
+
+    /// version column へ HLC を書く。 `ZERO` は「版数不明」を意味するので書かない
+    /// (既に載っている版数を消さない)。 v9 領域が無ければ no-op。
+    #[inline]
+    fn store_cell_hlc(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc) {
+        if hlc == enchudb_oplog::Hlc::ZERO || local >= self.max_entities {
+            return;
+        }
+        match self.ver_col(himo_id) {
+            Some(col) => {
+                // growable backing: 未コミット page への書き込みは SIGBUS。
+                let _ = col.ensure_committed_for(local);
+                col.ensure_count(local);
+                col.set(local, &hlc_to_cell(hlc));
+            }
+            // pre-v9: 揮発 HlcStore に置く (= 従来 sync.rs がやっていたこと)。
+            // 版数の置き場が違うだけで、 判定は `accepts_write` の 1 本のまま。
+            None => {
+                self.hlc_store.try_set(self.version_key(local), himo_id, hlc);
+            }
+        }
+    }
+
+    /// cell への書き込みと版数の記録を **不可分に**行う (A-2)。
+    ///
+    /// 戻り値 `false` = 受信 HLC が現在の版数より古いので不採用。 このとき
+    /// `Column` も cylinder も version column も 1 byte も触っていない。
+    ///
+    /// 書く順序は **値 → HLC** (A-4)。 value と HLC は別 region なので 1 命令では
+    /// 書けず、 逆順にすると「HLC だけ新しい」窓ができて後続の正しい record が
+    /// 永久に負ける。 「値は新しいが HLC は古い」窓は次の write で必ず解消する。
+    ///
+    /// `value` は `tie_to_by_id` と同じ raw な cell 値。 Leaf himo の旧 payload
+    /// 解放 (`take_leaf_cell` / `free_leaf_offset`) は呼び元の責務。
+    pub fn set_cell(
+        &self,
+        eid: enchudb_oplog::EntityId,
+        himo_id: u16,
+        value: u32,
+        hlc: enchudb_oplog::Hlc,
+    ) -> bool {
+        self.check_writable();
+        if himo_id as usize >= self.himos.len() {
+            debug_assert!(false, "himo_id {} out of range (max {})", himo_id, self.himos.len());
+            return false;
+        }
+        self.set_cell_local(enchudb_oplog::eid_local(eid), himo_id, value, hlc)
+    }
+
+    /// `set_cell` の local eid 版 (engine 内の write 経路用。 `check_writable` と
+    /// himo_id の範囲チェックは呼び元が済ませている — 範囲外は他の write 経路と
+    /// 同じく `himos[hid]` の panic になる)。
+    fn set_cell_local(&self, local: u32, himo_id: u16, value: u32, hlc: enchudb_oplog::Hlc) -> bool {
+        if !self.accepts_write(local, himo_id, hlc) {
+            return false;
+        }
+        self.himos[himo_id as usize].set(local, value);
+        self.store_cell_hlc(local, himo_id, hlc);
+        true
+    }
+
+    /// `set_cell` の untie 版 — cell を空にして版数を進める。 untie も
+    /// 「値の変更」なので LWW 判定を通す (通さないと外した cell に古い tie が
+    /// 蘇る)。
+    pub fn clear_cell(
+        &self,
+        eid: enchudb_oplog::EntityId,
+        himo_id: u16,
+        hlc: enchudb_oplog::Hlc,
+    ) -> bool {
+        self.check_writable();
+        if himo_id as usize >= self.himos.len() {
+            return false;
+        }
+        self.clear_cell_local(enchudb_oplog::eid_local(eid), himo_id, hlc)
+    }
+
+    /// `clear_cell` の local eid 版。 Leaf payload の解放 (`free_leaf_cell`) は
+    /// **採用が決まってから**呼ぶこと (不採用なら cell は変わらないので解放しない)。
+    fn clear_cell_local(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc) -> bool {
+        if !self.accepts_write(local, himo_id, hlc) {
+            return false;
+        }
+        self.himos[himo_id as usize].remove(local);
+        self.store_cell_hlc(local, himo_id, hlc);
+        true
+    }
+
+    /// untie 経路用の `clear_cell_local` — 採用が決まった cell の Leaf payload も
+    /// 解放する。 不採用 (= 古い untie) のときは payload を **解放しない**
+    /// (cell がまだその payload を指しているため)。
+    fn clear_cell_local_freeing_leaf(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc) -> bool {
+        if !self.accepts_write(local, himo_id, hlc) {
+            return false;
+        }
+        self.free_leaf_cell(local, himo_id as usize);
+        self.himos[himo_id as usize].remove(local);
+        self.store_cell_hlc(local, himo_id, hlc);
+        true
+    }
+
+    /// slot 再利用時に **前の住人の版数を落とす**。
+    ///
+    /// 版数の置き場は v9 なら version / tombstone column、 pre-v9 なら揮発
+    /// `HlcStore` だが、 **どちらも local slot で index される**ので事情は同じ:
+    /// free list から払い出された slot には前の住人の版数が残っている。 消さずに
+    /// 渡すと新しい住人への write が「前の住人の削除より古い」「前の住人の cell
+    /// より古い」と判定されて **無言で落ちる** (`set_cell` は `false` を返すだけ)。
+    /// 古い record をまとめて再生する局面 (bootstrap / `Hlc::ZERO` からの pull) で
+    /// 顕在化する: 相手が t1 に author した record が、 こちらが t2 (> t1) に消した
+    /// **別の** entity の tombstone に負けて適用されない。
+    ///
+    /// 前の住人の eid は slot が free list に入った時点で到達不能なので、 版数を
+    /// 落として困る読み手はいない。
+    ///
+    /// v9 側で `count() <= local` の column は **その cell を一度も書いていない** =
+    /// 中身は zero (= 版数不明) なので触らない。 growable backing の未コミット
+    /// page を掴まないための guard でもある (触ると SIGBUS)。
+    ///
+    /// pre-v9 側は himo 数ぶんの `remove` を回す。 `HlcStore::remove_entity` は
+    /// HashMap 全体を `retain` で走査する O(n) なので、 `_sync_ops` の ring 再利用の
+    /// ような払い出し hot path から呼ぶと別の事故になる。
+    ///
+    /// なお **slot に紐づく状態はこれで全部ではない** — `EidTranslator` の
+    /// `(author_peer, foreign_local) -> local` 写像も同じ理由で stale になるが、
+    /// そちらは remove API 自体が無く master から続く別の穴なので #166 で扱う。
+    fn clear_cell_versions(&self, local: u32) {
+        // #166: 版数を消す **前** に翻訳写像を外す。 退避する tombstone は
+        // まだ slot 上にあるので、 順序を逆にすると読めなくなる。
+        self.evict_translation_for_reuse(local);
+        if local >= self.max_entities {
+            return;
+        }
+        // pre-v9: 版数は揮発 HlcStore にある。 sentinel (u16::MAX) が tombstone。
+        if !self.has_cell_version() {
+            let key = self.version_key(local);
+            for hid in 0..self.himos.len() {
+                self.hlc_store.remove(key, hid as u16);
+            }
+            self.hlc_store.remove(key, u16::MAX);
+            return;
+        }
+        for col in self.ver_cols.iter() {
+            if col.count() > local {
+                col.clear(local);
+            }
+        }
+        if let Some(col) = self.tomb_col.as_ref()
+            && col.count() > local
+        {
+            col.clear(local);
+        }
+    }
+
+    /// #166: slot を別の住人に渡す前に、 **その slot が持っていた翻訳写像を外し、
+    /// 削除版数を identity 側へ退避する**。
+    ///
+    /// 写像を外さないと、 元の foreign entity 宛の record が新しい住人へ書き込まれる
+    /// (無関係な行の silent 破壊)。 かといって外すだけだと、 削除より古い record が
+    /// 「初見の foreign entity」として新しい slot を確保し **削除済み entity が復活
+    /// する** — 破壊が復活に化けるだけになる。 tombstone は slot ではなく identity に
+    /// 属する事実なので、 `foreign_tombs` へ移して slot の寿命から切り離す。
+    ///
+    /// レプリカでない local (= 自分が産んだ entity) では no-op。
+    fn evict_translation_for_reuse(&self, local: u32) {
+        let Some(key) = self.eid_translator.remove_local(local) else {
+            return;
+        };
+        let tomb = self.tombstone_version_of(local);
+        if tomb == enchudb_oplog::Hlc::ZERO {
+            // 削除されずに slot だけ回った (= 到達不能になった) ケース。 覚えることは無い。
+            return;
+        }
+        let mut g = self.foreign_tombs.write().unwrap();
+        let e = g.entry(key).or_insert(enchudb_oplog::Hlc::ZERO);
+        if *e < tomb {
+            *e = tomb; // monotone-max (同 identity が複数回 slot を回った場合)
+        }
+        self.foreign_tombs_empty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// #166: `(author_peer, foreign_local)` に **新しい slot** を払い出した直後に、
+    /// 退避してあった削除版数を書き戻す。
+    ///
+    /// これで 「この foreign entity は t で削除済み」 が slot を跨いで生き残り、
+    /// t より古い record は新しい slot 上の tombstone で従来どおり弾かれる
+    /// (= 判定経路は `set_cell` 1 本のまま。 A-2 を崩さない)。
+    fn restore_foreign_tombstone(&self, peer: enchudb_oplog::PeerId, foreign_local: u32, local: u32) {
+        if self.foreign_tombs_empty.load(std::sync::atomic::Ordering::Relaxed) {
+            return; // 常態 (= 一度も slot が回っていない)。 lock を取らない
+        }
+        let tomb = {
+            let g = self.foreign_tombs.read().unwrap();
+            match g.get(&(peer, foreign_local)) {
+                Some(&t) if t != enchudb_oplog::Hlc::ZERO => t,
+                _ => return,
+            }
+        };
+        self.set_tombstone_local(local, tomb);
+    }
+
+    /// #166: slot に載っていない (= 退避済みの) foreign tombstone の snapshot。
+    /// `.eidmap` v3 の 「写像を持たない tombstone だけの entry」 として永続化する。
+    fn orphan_foreign_tombstones(&self) -> Vec<(enchudb_oplog::PeerId, u32, enchudb_oplog::Hlc)> {
+        let g = self.foreign_tombs.read().unwrap();
+        g.iter()
+            .filter(|(_, t)| **t != enchudb_oplog::Hlc::ZERO)
+            .map(|(&(peer, fl), &t)| (peer, fl, t))
+            .collect()
+    }
+
+    /// #166: 復元 / 再受信で使う。 退避表へ直接載せる (monotone-max)。
+    fn remember_foreign_tombstone(
+        &self,
+        peer: enchudb_oplog::PeerId,
+        foreign_local: u32,
+        tomb: enchudb_oplog::Hlc,
+    ) {
+        if tomb == enchudb_oplog::Hlc::ZERO {
+            return;
+        }
+        let mut g = self.foreign_tombs.write().unwrap();
+        let e = g.entry((peer, foreign_local)).or_insert(enchudb_oplog::Hlc::ZERO);
+        if *e < tomb {
+            *e = tomb;
+        }
+        self.foreign_tombs_empty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// entity の削除版数を記録する (A-5)。 `false` = 受信 HLC が古いので不採用。
+    ///
+    /// entity 本体の解放はこの関数の責務ではない (呼び元の delete 経路が行う)。
+    /// ここが持つのは「いつ消えたか」という版数だけで、 これが永続することで
+    /// 配送バッファから tombstone が消えた後も削除済み entity が復活しない
+    /// (#140 の根)。
+    pub fn set_tombstone(&self, eid: enchudb_oplog::EntityId, hlc: enchudb_oplog::Hlc) -> bool {
+        self.check_writable();
+        self.set_tombstone_local(enchudb_oplog::eid_local(eid), hlc)
+    }
+
+    /// `set_tombstone` の local eid 版。
+    fn set_tombstone_local(&self, local: u32, hlc: enchudb_oplog::Hlc) -> bool {
+        if !Self::accepts_hlc(self.tombstone_version_of(local), hlc) {
+            return false;
+        }
+        if hlc == enchudb_oplog::Hlc::ZERO || local >= self.max_entities {
+            // 版数不明の delete は記録できないが、 「採用する」判定自体は
+            // 変わらない = A-1 の現状維持。
+            return true;
+        }
+        match self.tomb_col.as_ref() {
+            Some(col) => {
+                let _ = col.ensure_committed_for(local);
+                col.ensure_count(local);
+                col.set(local, &hlc_to_cell(hlc));
+            }
+            // pre-v9: 従来どおり揮発 HlcStore の sentinel himo に置く。
+            None => {
+                self.hlc_store.try_set(self.version_key(local), u16::MAX, hlc);
+            }
+        }
+        true
     }
 
     /// #9: foreign eid 翻訳テーブルへの参照。
@@ -4271,6 +5093,11 @@ impl Engine {
             .get_or_insert_with(owner, foreign_local, || {
                 self.alloc_translated_local(himo_id)
             })?;
+        // #166: slot が回った identity なら、 退避してある削除版数を今の slot に
+        // 書き戻す。 `set_tombstone_local` は monotone-max なので、 既に載っている
+        // 場合も新規 slot の場合も同じ呼びで済む (idempotent)。 退避表が空なら
+        // read lock も取らない。
+        self.restore_foreign_tombstone(owner, foreign_local, local);
         Some(enchudb_oplog::make_eid(self_peer, local))
     }
 
@@ -4491,11 +5318,19 @@ impl Engine {
         eid: enchudb_oplog::EntityId,
         himo_id: u16,
         bytes: &[u8],
+        hlc: enchudb_oplog::Hlc,
         relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
-    ) {
+    ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
-        if hid >= self.himos.len() { return; }
+        if hid >= self.himos.len() { return false; }
+        // request17 step 5: 受信 HLC でローカル clock を進める (これが無いと、
+        // 相手の clock が先行している間ずっと自分のローカル write が負ける)。
+        self.observe_remote_hlc(hlc);
+        // 値を作る前に判定する — 不採用なら LeafStore に payload を確保しない。
+        if !self.accepts_write(local, himo_id, hlc) {
+            return false;
+        }
         self.entities.ensure_live(local);
         // v6 (#88): remote re-tie 上書きで旧 offset を回収。
         // #119: **insert → publish → free** の順 (逆順だと並行 reader が再利用 slot を読む)。
@@ -4504,7 +5339,7 @@ impl Engine {
             Some(leaf) => leaf.insert(bytes),
             None => self.vocab.insert(bytes), // pre-v6 / reserved: 旧 vocab fallback
         };
-        self.himos[hid].set(local, value);
+        self.set_cell_local(local, himo_id, value, hlc);
         self.free_leaf_offset(hid, old);
         Self::advance_table_next_local_for(&self.tables, local);
         if self.gossip_remote_apply() {
@@ -4520,6 +5355,7 @@ impl Engine {
                 );
             }
         }
+        true
     }
 
     pub fn remote_tie_apply(
@@ -4527,14 +5363,20 @@ impl Engine {
         eid: enchudb_oplog::EntityId,
         himo_id: u16,
         value: u32,
+        hlc: enchudb_oplog::Hlc,
         relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
-    ) {
+    ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
-        if hid >= self.himos.len() { return; }
+        if hid >= self.himos.len() { return false; }
+        self.observe_remote_hlc(hlc);
+        // request17 step 5: LWW 判定は `set_cell` の内側だけ (A-2)。 sync 層で
+        // 判定してから別関数で適用する形は、 呼び忘れれば黙って壊れる。
+        if !self.set_cell_local(local, himo_id, value, hlc) {
+            return false;
+        }
         // entity 未確保ならローカル側の EntitySet に登録(eid は peer 側が決めた値)
         self.entities.ensure_live(local);
-        self.himos[hid].set(local, value);
         // issue #47 fix: foreign local が我々の table eid_range 内に落ちた場合、
         // 次の `entity_in` が同 local を払出して live entity を上書きしないよう
         // `next_local` を `local + 1` まで前進させる。 これは `apply_oplog_op`
@@ -4548,6 +5390,7 @@ impl Engine {
                 );
             }
         }
+        true
     }
 
     /// リモート peer から届いた Untie を apply。
@@ -4555,13 +5398,16 @@ impl Engine {
         &self,
         eid: enchudb_oplog::EntityId,
         himo_id: u16,
+        hlc: enchudb_oplog::Hlc,
         relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
-    ) {
+    ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
-        if hid >= self.himos.len() { return; }
-        self.free_leaf_cell(local, hid);
-        self.himos[hid].remove(local);
+        if hid >= self.himos.len() { return false; }
+        self.observe_remote_hlc(hlc);
+        if !self.clear_cell_local_freeing_leaf(local, himo_id, hlc) {
+            return false;
+        }
         if self.gossip_remote_apply() {
             if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
                 let _ = wal.append_relayed(
@@ -4570,15 +5416,23 @@ impl Engine {
                 );
             }
         }
+        true
     }
 
     /// リモート peer から届いた Delete を apply。
     pub fn remote_delete_apply(
         &self,
         eid: enchudb_oplog::EntityId,
+        hlc: enchudb_oplog::Hlc,
         relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
-    ) {
+    ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
+        self.observe_remote_hlc(hlc);
+        // A-5: 削除の版数を残す。 これが永続することで、 配送バッファから
+        // tombstone が消えた後も削除済み entity が復活しない (#140 の根)。
+        if !self.set_tombstone_local(local, hlc) {
+            return false;
+        }
         for hid in 0..self.himos.len() {
             self.free_leaf_cell(local, hid);
             self.himos[hid].remove(local);
@@ -4589,6 +5443,7 @@ impl Engine {
                 let _ = wal.append_relayed(enchudb_oplog::oplog::Op::Delete { eid }, h);
             }
         }
+        true
     }
 
     /// リモート peer から届いた Content 書き込みを apply。
@@ -4597,9 +5452,16 @@ impl Engine {
         eid: enchudb_oplog::EntityId,
         key: &str,
         data: &[u8],
+        hlc: enchudb_oplog::Hlc,
         relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
-    ) {
+    ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
+        self.observe_remote_hlc(hlc);
+        // legacy op (pre-0.9 WAL のみ)。 cell を持たないので版数は `HlcStore` の
+        // key hash entry のまま (sync 側) だが、 tombstone 判定だけは engine に寄せる。
+        if self.tombstone_blocks(eid, hlc) {
+            return false;
+        }
         self.entities.ensure_live(local);
         self.contents.set(local, key, data);
         // issue #47 fix: Tie 経路と同じ理由で next_local を前進させる。
@@ -4612,6 +5474,7 @@ impl Engine {
                 );
             }
         }
+        true
     }
 
     /// v33: リモート peer から届いた Vocab op を apply。
@@ -4992,17 +5855,22 @@ impl Engine {
             let bytes = value.as_bytes();
             let old = self.himos[hid].get_value(eid);
             let off = leaf.insert(bytes);
-            self.himos[hid].set(eid, off);
-            if let Some(old) = old { leaf.free(old); }
-            if let Some(wal) = self.oplog.as_ref() {
-                let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
-                let _ = wal.append(enchudb_oplog::oplog::Op::TieLeaf {
-                    eid: oplog_eid,
-                    himo_name: &self.himo_names[hid],
-                    himo_kind: self.value_types[hid] as u8,
-                    bytes,
-                });
+            // request17 step 4: WAL 先行で採番 → 値と版数を不可分に書く。 不採用なら
+            // **今 insert した payload** を捨てる (cell は旧 offset を指したままなので
+            // 旧 payload は生きている)。
+            let oplog_eid = self.oplog_eid(eid);
+            let hlc = self.append_local_op(enchudb_oplog::oplog::Op::TieLeaf {
+                eid: oplog_eid,
+                himo_name: &self.himo_names[hid],
+                himo_kind: self.value_types[hid] as u8,
+                bytes,
+            });
+            if !self.set_cell_local(eid, himo_id, off, hlc) {
+                leaf.free(off);
+                self.warn_local_write_rejected(eid, himo_id, hlc);
+                return;
             }
+            if let Some(old) = old { leaf.free(old); }
             return;
         }
         // Tag は dedupe、Leaf は常に新規 id。
@@ -5011,17 +5879,30 @@ impl Engine {
             ValueType::Leaf => self.vocab.insert(value.as_bytes()),
             ht => panic!("tie_text_to_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
-        self.himos[hid].set(eid, vid);
         // WAL に Vocab + Tie を流す。 schema layer (enchudb-schema) は同期版の
         // tie_text_to を経由するため、 ここで append しないと WAL が空のままで
         // peer 同期が成立しない (publish 側が iter_committed で 0 件を見る).
         // 0.7.0: reserved table (`_sync_ops` 等) への write は oplog skip。
-        if !self.himo_is_in_reserved_table(hid) {
+        //
+        // request17 step 4: **Vocab → Tie の順に append** し、 Tie に載った HLC で
+        // 値と版数を書く。 順序が要るのは transport が record を HLC 順に配るため —
+        // Tie が先に採番されると受信側で vid mapping が未登録のまま Tie を適用し、
+        // 生の remote vid で誤 bind する (#141)。
+        let reserved = self.himo_is_in_reserved_table(hid);
+        let hlc = if reserved {
+            enchudb_oplog::Hlc::ZERO
+        } else {
+            let oplog_eid = self.oplog_eid(eid);
             if let Some(wal) = self.oplog.as_ref() {
-                let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
+                // Vocab は cell を持たない (= 版数の対象外)。
                 let _ = wal.append(enchudb_oplog::oplog::Op::Vocab { vid, bytes: value.as_bytes() });
-                let _ = wal.append(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid });
             }
+            self.append_local_op(
+                enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid },
+            )
+        };
+        if !self.set_cell_local(eid, himo_id, vid, hlc) {
+            self.warn_local_write_rejected(eid, himo_id, hlc);
         }
     }
 
@@ -5056,17 +5937,20 @@ impl Engine {
             // 既に `tie_text_to_by_id` はこの順序。
             let old = self.himos[hid].get_value(eid);
             let off = leaf.insert(value);
-            self.himos[hid].set(eid, off);
-            if let Some(old) = old { leaf.free(old); }
-            if let Some(wal) = self.oplog.as_ref() {
-                let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
-                let _ = wal.append(enchudb_oplog::oplog::Op::TieLeaf {
-                    eid: oplog_eid,
-                    himo_name: &self.himo_names[hid],
-                    himo_kind: self.value_types[hid] as u8,
-                    bytes: value,
-                });
+            // request17 step 4: WAL 先行で採番。 不採用なら今 insert した payload を捨てる。
+            let oplog_eid = self.oplog_eid(eid);
+            let hlc = self.append_local_op(enchudb_oplog::oplog::Op::TieLeaf {
+                eid: oplog_eid,
+                himo_name: &self.himo_names[hid],
+                himo_kind: self.value_types[hid] as u8,
+                bytes: value,
+            });
+            if !self.set_cell_local(eid, himo_id, off, hlc) {
+                leaf.free(off);
+                self.warn_local_write_rejected(eid, himo_id, hlc);
+                return;
             }
+            if let Some(old) = old { leaf.free(old); }
             return;
         }
         let vid = match self.value_types[hid] {
@@ -5074,24 +5958,34 @@ impl Engine {
             ValueType::Leaf => self.vocab.insert(value),
             ht => panic!("tie_bytes_to_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
-        self.himos[hid].set(eid, vid);
         // reserved table への write は oplog 再 append を skip (= 2 重書き防止)。
-        if !self.himo_is_in_reserved_table(hid) {
+        // request17 step 4: Vocab → Tie/TieNamed の順に append し (transport は HLC 順に
+        // 配るので依存順を崩せない)、 Tie に載った HLC で値と版数を書く。
+        let reserved = self.himo_is_in_reserved_table(hid);
+        let hlc = if reserved {
+            enchudb_oplog::Hlc::ZERO
+        } else {
+            let oplog_eid = self.oplog_eid(eid);
             if let Some(wal) = self.oplog.as_ref() {
-                let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
+                // Vocab は cell を持たない (= 版数の対象外)。
                 let _ = wal.append(enchudb_oplog::oplog::Op::Vocab { vid, bytes: value });
-                if self.himo_is_content(hid) {
-                    // 0.9.0: 動的 content himo は id が peer 間で揃わないため名前で運ぶ
-                    let _ = wal.append(enchudb_oplog::oplog::Op::TieNamed {
-                        eid: oplog_eid,
-                        himo_name: &self.himo_names[hid],
-                        himo_kind: self.value_types[hid] as u8,
-                        value: vid,
-                    });
-                } else {
-                    let _ = wal.append(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid });
-                }
             }
+            if self.himo_is_content(hid) {
+                // 0.9.0: 動的 content himo は id が peer 間で揃わないため名前で運ぶ
+                self.append_local_op(enchudb_oplog::oplog::Op::TieNamed {
+                    eid: oplog_eid,
+                    himo_name: &self.himo_names[hid],
+                    himo_kind: self.value_types[hid] as u8,
+                    value: vid,
+                })
+            } else {
+                self.append_local_op(
+                    enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid },
+                )
+            }
+        };
+        if !self.set_cell_local(eid, himo_id, vid, hlc) {
+            self.warn_local_write_rejected(eid, himo_id, hlc);
         }
     }
 
@@ -5113,13 +6007,19 @@ impl Engine {
         // Tag / Leaf 型 (vocab_id を value として持つ) も許可。 schema 層が
         // 起動時に解決済みの table_vid を marker himo に張る hot path 用途で
         // 必要 (request2.md 提案)。 caller 責任で vocab に既に居る id を渡すこと。
-        self.himos[hid].set(eid, value);
-        // 0.7.0: reserved table への write は oplog skip。
-        if !self.himo_is_in_reserved_table(hid) {
-            if let Some(wal) = self.oplog.as_ref() {
-                let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
-                let _ = wal.append(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value });
-            }
+        //
+        // request17 step 4: 値と版数は `set_cell` で不可分に書き、 **同じ HLC** を
+        // WAL record にも載せる (`append_at_hlc`)。 0.7.0: reserved table への write は
+        // sync 対象外なので採番しない (版数不明のまま = 従来どおり)。
+        let reserved = self.himo_is_in_reserved_table(hid);
+        let hlc = if reserved {
+            enchudb_oplog::Hlc::ZERO
+        } else {
+            let oplog_eid = self.oplog_eid(eid);
+            self.append_local_op(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value })
+        };
+        if !self.set_cell_local(eid, himo_id, value, hlc) {
+            self.warn_local_write_rejected(eid, himo_id, hlc);
         }
     }
 
@@ -5143,10 +6043,13 @@ impl Engine {
             self.value_types[hid] == ValueType::Ref || self.value_types[hid] == ValueType::Number,
             "tie_ref_to_by_id on non-Ref himo_id {}", himo_id,
         );
-        self.himos[hid].set(eid, target_eid);
-        if let Some(wal) = self.oplog.as_ref() {
-            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
-            let _ = wal.append(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: target_eid });
+        // request17 step 4: WAL 先行で採番し、 その HLC で値と版数を不可分に書く。
+        let oplog_eid = self.oplog_eid(eid);
+        let hlc = self.append_local_op(
+            enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: target_eid },
+        );
+        if !self.set_cell_local(eid, himo_id, target_eid, hlc) {
+            self.warn_local_write_rejected(eid, himo_id, hlc);
         }
     }
 
@@ -5168,11 +6071,14 @@ impl Engine {
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         if hid >= self.himos.len() { return; }
-        self.free_leaf_cell(eid, hid);
-        self.himos[hid].remove(eid);
-        if let Some(wal) = self.oplog.as_ref() {
-            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
-            let _ = wal.append(enchudb_oplog::oplog::Op::Untie { eid: oplog_eid, himo_id });
+        // request17 step 4: untie も版数を進める (進めないと外した cell に古い tie が
+        // 蘇る)。 Leaf payload の解放は **採用が決まってから**。
+        let oplog_eid = self.oplog_eid(eid);
+        let hlc = self.append_local_op(
+            enchudb_oplog::oplog::Op::Untie { eid: oplog_eid, himo_id },
+        );
+        if !self.clear_cell_local_freeing_leaf(eid, himo_id, hlc) {
+            self.warn_local_write_rejected(eid, himo_id, hlc);
         }
     }
 
@@ -5181,15 +6087,20 @@ impl Engine {
     pub fn delete(&self, eid: enchudb_oplog::EntityId) {
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
+        // request17 step 4 (A-5): 削除は himo を持たないので eid 空間の tombstone
+        // column に版数を記録する。 これが永続することで、 配送バッファから
+        // tombstone が消えた後も削除済み entity が復活しない (#140 の根)。
+        let oplog_eid = self.oplog_eid(eid);
+        let hlc = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: oplog_eid });
+        if !self.set_tombstone_local(eid, hlc) {
+            self.warn_local_write_rejected(eid, u16::MAX, hlc);
+            return;
+        }
         for hid in 0..self.himos.len() {
             self.free_leaf_cell(eid, hid);
             self.himos[hid].remove(eid);
         }
         self.entities.free(eid);
-        if let Some(wal) = self.oplog.as_ref() {
-            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), eid);
-            let _ = wal.append(enchudb_oplog::oplog::Op::Delete { eid: oplog_eid });
-        }
     }
 
     // ──── トランザクション ────
@@ -7254,6 +8165,21 @@ impl Engine {
             ht, effective_mv, self.max_entities,
         );
 
+        // v9 (request17-A): version column は himo と 1:1 で確保する。 himos より
+        // **先に** push して、 `himo_names` publish 時点で ver_cols[hid] も可視に
+        // なる不変条件 (parallel array の publish 順) を守る。
+        if self.layout.has_cell_version() {
+            let ver = ver_column_from_region(
+                make_region(self.layout.ver_col_off(hid), self.layout.ver_col_size),
+                self.max_entities,
+            );
+            assert!(
+                self.ver_cols.push(ver).is_ok(),
+                "version column array out of capacity (max {})",
+                self.max_himos,
+            );
+        }
+
         // AppendVec は with_capacity(max_himos) 済みなので上の capacity check が
         // 通れば push は失敗しない (万一の防御で明示 panic)。
         let push_ok = self.himos.push(hs).is_ok()
@@ -7374,7 +8300,7 @@ impl Engine {
             // リカバリ: commit されたレコードを本体に適用
             let records = w.recover();
             for rec in &records {
-                eng.apply_oplog_op(&rec.op);
+                eng.apply_oplog_op(&rec.op, rec.hlc);
             }
             // #77-H2: 適用効果を disk に固めてから checkpoint を前進する。
             // 旧順序 (apply → 即 checkpoint) は kernel が checkpoint header を
@@ -7401,15 +8327,19 @@ impl Engine {
     ///   - entity_set の live bitmap が stale → 次 entity_in が eid 重複払出し
     ///   - table.next_local が 0 のまま → 次 alloc が既存 eid と衝突
     /// になる。 sinfo 連携で表面化したので 0.8.1 patch で根治。
-    fn apply_oplog_op(&mut self, op: &enchudb_oplog::oplog::DecodedOp) {
+    fn apply_oplog_op(&mut self, op: &enchudb_oplog::oplog::DecodedOp, hlc: enchudb_oplog::Hlc) {
         use enchudb_oplog::oplog::DecodedOp;
         match op {
             DecodedOp::Tie { eid, himo_id, value } => {
                 let hid = *himo_id as usize;
                 let local = enchudb_oplog::eid_local(*eid);
                 if hid < self.himos.len() {
-                    self.himos[hid].set(local, *value);
+                    // request17 step 4: replay も版数付きで書く。 不採用 (= cell に
+                    // 既に同じか新しい版数が載っている = body に msync 済み) なら
+                    // 値を戻さない — 戻すと新しい write を古い record で潰す。
+                    self.set_cell_local(local, *himo_id, *value, hlc);
                 }
+                // eid 空間の整合 (live bitmap / next_local) は適用可否に依らず進める。
                 self.entities.ensure_live(local);
                 Self::advance_table_next_local_for(&self.tables, local);
             }
@@ -7417,15 +8347,17 @@ impl Engine {
                 let hid = *himo_id as usize;
                 let local = enchudb_oplog::eid_local(*eid);
                 if hid < self.himos.len() {
-                    self.himos[hid].remove(local);
+                    self.clear_cell_local(local, *himo_id, hlc);
                 }
             }
             DecodedOp::Delete { eid } => {
                 let local = enchudb_oplog::eid_local(*eid);
-                for hid in 0..self.himos.len() {
-                    self.himos[hid].remove(local);
+                if self.set_tombstone_local(local, hlc) {
+                    for hid in 0..self.himos.len() {
+                        self.himos[hid].remove(local);
+                    }
+                    self.entities.free(local);
                 }
-                self.entities.free(local);
             }
             DecodedOp::Content { eid, key, data } => {
                 // legacy (pre-0.9 WAL): 旧 content region へ replay。 0.9.0 以降は
@@ -7440,7 +8372,7 @@ impl Engine {
                 let local = enchudb_oplog::eid_local(*eid);
                 let ht = ValueType::from_byte(*himo_kind);
                 if let Ok(hid) = self.ensure_himo_by_full_name(himo_name, ht) {
-                    self.himos[hid as usize].set(local, *value);
+                    self.set_cell_local(local, hid, *value, hlc);
                 }
                 self.entities.ensure_live(local);
                 Self::advance_table_next_local_for(&self.tables, local);
@@ -7528,7 +8460,7 @@ impl Engine {
             let w = enchudb_oplog::oplog::OpLog::open(&oplog_path)?;
             let records = w.recover();
             for rec in &records {
-                eng.apply_oplog_op(&rec.op);
+                eng.apply_oplog_op(&rec.op, rec.hlc);
             }
             // #77-H2: body msync → checkpoint の順 (open_concurrent_with_oplog と同じ)
             let _ = eng.body_msync();
@@ -7603,8 +8535,11 @@ impl Engine {
         // WAL 有効時のみ oplog_record_queue を生やす。 writer は直接 wal.append せず
         // ここに owned record を push する → consumer thread が drain して append_many。
         // issue4: bounded `ArrayQueue` で sustained writer の RSS を cap する。
-        let oplog_record_queue = oplog.as_ref()
-            .map(|_| Arc::new(crossbeam_queue::ArrayQueue::<enchudb_oplog::oplog::OwnedOp>::new(qc)));
+        let oplog_record_queue = oplog.as_ref().map(|_| {
+            Arc::new(crossbeam_queue::ArrayQueue::<
+                (enchudb_oplog::oplog::OwnedOp, enchudb_oplog::Hlc),
+            >::new(qc))
+        });
 
         eng.write_queue = Some(queue.clone());
         eng.shutdown_flag = Some(shutdown.clone());
@@ -7669,11 +8604,17 @@ impl Engine {
                         oplog_for_thread.as_ref(),
                     ) {
                         let mut batch: Vec<enchudb_oplog::oplog::OwnedOp> = Vec::new();
-                        while let Some(rec) = wq.pop() { batch.push(rec); }
+                        let mut hlcs: Vec<enchudb_oplog::Hlc> = Vec::new();
+                        while let Some((rec, hlc)) = wq.pop() {
+                            batch.push(rec);
+                            hlcs.push(hlc);
+                        }
                         if !batch.is_empty() {
                             // append 失敗でも進める: barrier の意味は「queue に
                             // 残っていない」であり、 失敗 record の再送は無い
-                            match wal.append_many(&batch) {
+                            // request17-A3: push 時に採番済みの HLC で書く
+                            // (採番し直すと cell の版数と record がずれる)。
+                            match wal.append_many_with_hlcs(&batch, &hlcs) {
                                 Ok(_) => {
                                     wal_append_count_for_thread
                                         .fetch_add(batch.len() as u64, Ordering::Release);
@@ -7775,9 +8716,14 @@ impl Engine {
                             oplog_for_thread.as_ref(),
                         ) {
                             let mut batch: Vec<enchudb_oplog::oplog::OwnedOp> = Vec::new();
-                            while let Some(rec) = wq.pop() { batch.push(rec); }
+                            let mut hlcs: Vec<enchudb_oplog::Hlc> = Vec::new();
+                            while let Some((rec, hlc)) = wq.pop() {
+                                batch.push(rec);
+                                hlcs.push(hlc);
+                            }
                             if !batch.is_empty() {
-                                match wal.append_many(&batch) {
+                                // request17-A3: push 時に採番済みの HLC で書く。
+                                match wal.append_many_with_hlcs(&batch, &hlcs) {
                                     Ok(_) => {
                                         wal_append_count_for_thread
                                             .fetch_add(batch.len() as u64, Ordering::Release);
@@ -8154,22 +9100,36 @@ impl Engine {
     fn apply_op(&self, op: crate::write_queue::Op) {
         use crate::write_queue::Op;
         match op {
-            Op::Tie { eid, himo_id, value } => {
+            Op::Tie { eid, himo_id, value, hlc } => {
                 let hid = himo_id as usize;
                 if hid >= self.himos.len() { return; }
                 // v6 (#88): routed-Leaf の re-tie 上書きは旧 offset を free (async path)。
                 // #119: **publish → free** の順 (逆順だと並行 reader が再利用 slot を読む)。
                 let old = self.take_leaf_cell(eid, hid);
-                self.himos[hid].set(eid, value);
-                self.free_leaf_offset(hid, old);
+                // request17 step 4: push 時に採番した版数で値と一緒に書く。
+                if self.set_cell_local(eid, himo_id, value, hlc) {
+                    self.free_leaf_offset(hid, old);
+                } else {
+                    // 不採用: cell は旧値のまま = 旧 payload はまだ生きている。
+                    // 代わりに push 側が確保済みの **新** payload (= value) を捨てる
+                    // (routed-Leaf 以外では no-op)。
+                    self.free_leaf_offset(hid, Some(value));
+                    self.warn_local_write_rejected(eid, himo_id, hlc);
+                }
             }
-            Op::Untie { eid, himo_id } => {
+            Op::Untie { eid, himo_id, hlc } => {
                 let hid = himo_id as usize;
                 if hid >= self.himos.len() { return; }
-                self.free_leaf_cell(eid, hid);
-                self.himos[hid].remove(eid);
+                if !self.clear_cell_local_freeing_leaf(eid, himo_id, hlc) {
+                    self.warn_local_write_rejected(eid, himo_id, hlc);
+                }
             }
-            Op::Delete { eid } => {
+            Op::Delete { eid, hlc } => {
+                // request17 (A-5): 削除の版数は eid 空間の tombstone column へ。
+                if !self.set_tombstone_local(eid, hlc) {
+                    self.warn_local_write_rejected(eid, u16::MAX, hlc);
+                    return;
+                }
                 for hid in 0..self.himos.len() {
                     self.free_leaf_cell(eid, hid);
                     self.himos[hid].remove(eid);
@@ -8218,17 +9178,24 @@ impl Engine {
         // 「fsync 済みの write」が replay 対象外になって消えた。 op 先行なら
         // consumer が wq drain で record を見た時点で op は必ず queue に居て、
         // 同 tick の q drain (wq の後) で適用される。
+        //
+        // request17 step 4 (A-3): 版数は **push 側で 1 回だけ**採番し、 write_queue の
+        // op と WAL record の両方に同じ値を運ぶ。 適用も append も consumer thread が
+        // 後から別々に行うため、 どちらかで採番し直すと cell の版数と配った版数がずれる。
+        // 採番と 2 本の queue push は 1 単位 (`hlc_mint_lock` の doc 参照)。
+        let _mint = self.mint_guard();
+        let hlc = self.mint_local_hlc();
         let q = self.write_queue.as_ref()
             .expect("tie_async requires create_concurrent or concurrentize");
-        q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value });
+        q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value, hlc });
         self.push_count.fetch_add(1, Ordering::Release);
         if let Some(wal) = self.oplog.as_ref() {
             let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
             let rec = enchudb_oplog::oplog::OwnedOp::Tie { eid: oplog_eid, himo_id, value };
             if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec, &self.consumer_poisoned, &self.wal_push_count);
+                push_oplog_record_blocking(wq, rec, hlc, &self.consumer_poisoned, &self.wal_push_count);
             } else {
-                let _ = wal.append(rec.as_op());
+                let _ = wal.append_at_hlc(rec.as_op(), hlc);
             }
         }
     }
@@ -8269,9 +9236,13 @@ impl Engine {
         // (= 適用時点の cell を見る。 push 時 free は queue 未適用の二重 free を招く)。
         if let Some(leaf) = self.leaf_for(hid) {
             let off = leaf.insert(value);
+            // request17 step 4: push 側で採番、 op と record に同じ版数を載せる。
+            // 採番 → push は `hlc_mint_lock` で 1 単位に。
+            let _mint = self.mint_guard();
+            let hlc = self.mint_local_hlc();
             let q = self.write_queue.as_ref()
                 .expect("tie_bytes_async requires create_concurrent or concurrentize");
-            q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value: off });
+            q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value: off, hlc });
             self.push_count.fetch_add(1, Ordering::Release);
             if let Some(wal) = self.oplog.as_ref() {
                 let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
@@ -8282,9 +9253,9 @@ impl Engine {
                     bytes: value.to_vec(),
                 };
                 if let Some(wq) = self.oplog_record_queue.as_ref() {
-                    push_oplog_record_blocking(wq, rec, &self.consumer_poisoned, &self.wal_push_count);
+                    push_oplog_record_blocking(wq, rec, hlc, &self.consumer_poisoned, &self.wal_push_count);
                 } else {
-                    let _ = wal.append(rec.as_op());
+                    let _ = wal.append_at_hlc(rec.as_op(), hlc);
                 }
             }
             return;
@@ -8297,9 +9268,15 @@ impl Engine {
         };
         assert!(vid < u32::MAX, "vocab vid must be < u32::MAX (sentinel reserved)");
         // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
+        // request17 step 4: Vocab は cell を持たない (= 版数の対象外) が、 record queue は
+        // 版数付きで運ぶので Tie の手前で 1 個採番しておく (WAL 上の並びと HLC の
+        // 並びを揃える)。
+        let _mint = self.mint_guard();
+        let vocab_hlc = self.mint_local_hlc();
+        let hlc = self.mint_local_hlc();
         let q = self.write_queue.as_ref()
             .expect("tie_text_async requires create_concurrent or concurrentize");
-        q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value: vid });
+        q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value: vid, hlc });
         self.push_count.fetch_add(1, Ordering::Release);
         if let Some(wal) = self.oplog.as_ref() {
             // Vocab op を先に(sync の receiver 側で Tie より先に mapping が張られるよう)
@@ -8318,11 +9295,11 @@ impl Engine {
             };
             if let Some(wq) = self.oplog_record_queue.as_ref() {
                 // Vocab → Tie の順を保つため同一 thread から連続 push
-                push_oplog_record_blocking(wq, vocab_rec, &self.consumer_poisoned, &self.wal_push_count);
-                push_oplog_record_blocking(wq, tie_rec, &self.consumer_poisoned, &self.wal_push_count);
+                push_oplog_record_blocking(wq, vocab_rec, vocab_hlc, &self.consumer_poisoned, &self.wal_push_count);
+                push_oplog_record_blocking(wq, tie_rec, hlc, &self.consumer_poisoned, &self.wal_push_count);
             } else {
-                let _ = wal.append(vocab_rec.as_op());
-                let _ = wal.append(tie_rec.as_op());
+                let _ = wal.append_at_hlc(vocab_rec.as_op(), vocab_hlc);
+                let _ = wal.append_at_hlc(tie_rec.as_op(), hlc);
             }
         }
     }
@@ -8352,10 +9329,13 @@ impl Engine {
         // β-light step 5: target_eid が target_table の eid range 内か
         self.validate_ref_tie(himo_id as usize, target_local);
         // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
+        // request17 step 4: push 側で採番、 op と record に同じ版数 (採番 → push は 1 単位)。
+        let _mint = self.mint_guard();
+        let hlc = self.mint_local_hlc();
         let q = self.write_queue.as_ref()
             .expect("tie_ref_async requires create_concurrent or concurrentize");
         q.push(crate::write_queue::Op::Tie {
-            eid: local, himo_id, value: target_local,
+            eid: local, himo_id, value: target_local, hlc,
         });
         self.push_count.fetch_add(1, Ordering::Release);
         if let Some(wal) = self.oplog.as_ref() {
@@ -8364,9 +9344,9 @@ impl Engine {
                 eid: oplog_eid, himo_id, value: target_local,
             };
             if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec, &self.consumer_poisoned, &self.wal_push_count);
+                push_oplog_record_blocking(wq, rec, hlc, &self.consumer_poisoned, &self.wal_push_count);
             } else {
-                let _ = wal.append(rec.as_op());
+                let _ = wal.append_at_hlc(rec.as_op(), hlc);
             }
         }
     }
@@ -8386,16 +9366,19 @@ impl Engine {
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         if (himo_id as usize) >= self.himos.len() { return; }
         // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
+        // request17 step 4: untie も版数を進める (push 側で採番、 採番 → push は 1 単位)。
+        let _mint = self.mint_guard();
+        let hlc = self.mint_local_hlc();
         let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
-        q.push(crate::write_queue::Op::Untie { eid: local, himo_id });
+        q.push(crate::write_queue::Op::Untie { eid: local, himo_id, hlc });
         self.push_count.fetch_add(1, Ordering::Release);
         if let Some(wal) = self.oplog.as_ref() {
             let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
             let rec = enchudb_oplog::oplog::OwnedOp::Untie { eid: oplog_eid, himo_id };
             if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec, &self.consumer_poisoned, &self.wal_push_count);
+                push_oplog_record_blocking(wq, rec, hlc, &self.consumer_poisoned, &self.wal_push_count);
             } else {
-                let _ = wal.append(rec.as_op());
+                let _ = wal.append_at_hlc(rec.as_op(), hlc);
             }
         }
     }
@@ -8406,16 +9389,19 @@ impl Engine {
         self.check_writable();
         let local = enchudb_oplog::eid_local(eid);
         // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
+        // request17 step 4 (A-5): delete の版数は tombstone column へ (適用は consumer)。
+        let _mint = self.mint_guard();
+        let hlc = self.mint_local_hlc();
         let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
-        q.push(crate::write_queue::Op::Delete { eid: local });
+        q.push(crate::write_queue::Op::Delete { eid: local, hlc });
         self.push_count.fetch_add(1, Ordering::Release);
         if let Some(wal) = self.oplog.as_ref() {
             let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
             let rec = enchudb_oplog::oplog::OwnedOp::Delete { eid: oplog_eid };
             if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec, &self.consumer_poisoned, &self.wal_push_count);
+                push_oplog_record_blocking(wq, rec, hlc, &self.consumer_poisoned, &self.wal_push_count);
             } else {
-                let _ = wal.append(rec.as_op());
+                let _ = wal.append_at_hlc(rec.as_op(), hlc);
             }
         }
     }
@@ -8618,6 +9604,730 @@ impl Drop for Engine {
 }
 
 // ════════════════ テスト ════════════════
+
+#[cfg(test)]
+mod layout_v9_tests {
+    use super::*;
+
+    fn base(cell_version: bool) -> Layout {
+        Layout::compute(1024, 16, 64 * 1024, None, None, None, None, cell_version).unwrap()
+    }
+
+    /// v9 を有効化していない layout は **pre-v9 と完全に同一**であること。
+    /// version column / tombstone column は variable cluster の末尾に置く設計なので、
+    /// 無効時は 1 byte も増えてはいけない。
+    #[test]
+    fn v9_disabled_layout_is_byte_identical() {
+        let l = base(false);
+        assert_eq!(l.ver_col_size, 0, "無効時に version column を確保している");
+        assert_eq!(l.tomb_size, 0, "無効時に tombstone column を確保している");
+        assert!(!l.has_cell_version());
+    }
+
+    /// v9 を有効化しても **既存 region の offset は 1 つも動かない**こと。
+    /// これが崩れると pre-v9 DB を開いた瞬間に全データが別位置を指す。
+    #[test]
+    fn enabling_v9_does_not_move_existing_regions() {
+        let off = base(false);
+        let on = base(true);
+
+        assert_eq!(on.entities_off, off.entities_off);
+        assert_eq!(on.vocab_data_off, off.vocab_data_off);
+        assert_eq!(on.vocab_index_off, off.vocab_index_off);
+        assert_eq!(on.himoreg_data_off, off.himoreg_data_off);
+        assert_eq!(on.content_index_off, off.content_index_off);
+        assert_eq!(on.content_data_off, off.content_data_off);
+        assert_eq!(on.leaf_data_off, off.leaf_data_off);
+        assert_eq!(on.himo_base_off, off.himo_base_off, "himo region が動いた");
+        assert_eq!(on.himo_slot_size, off.himo_slot_size, "himo slot の形が変わった");
+        assert!(on.total_size > off.total_size, "v9 領域が確保されていない");
+    }
+
+    /// version column は himo ごとに cell 16B (HLC を生で持つ)。 slot が重ならず、
+    /// tombstone column も踏まないこと。
+    #[test]
+    fn version_columns_do_not_overlap_and_leave_room_for_tombstone() {
+        let l = base(true);
+        assert!(l.has_cell_version());
+        assert_eq!(l.ver_col_off(0), l.ver_base_off);
+
+        for hid in 0..15usize {
+            let a = l.ver_col_off(hid);
+            let b = l.ver_col_off(hid + 1);
+            assert_eq!(b - a, l.ver_col_size, "himo {hid} と {} の slot が重なる", hid + 1);
+        }
+
+        // 並びは tombstone → version columns (growable の commit が単調なので、
+        // 1 本しかない tombstone を手前に置く)。
+        assert!(l.tomb_off + l.tomb_size <= l.ver_base_off, "tombstone が version column を踏んでいる");
+        let last_end = l.ver_col_off(15) + l.ver_col_size;
+        assert!(last_end <= l.total_size, "version column が file 外に出ている");
+    }
+
+    /// cell は HLC を生で持つので、 1 himo ぶんの version column は
+    /// 値 column (4B/cell) の 4 倍のオーダーになること。 intern 表を採らなかった
+    /// 判断 (request17-A) がそのまま layout に出ていることの確認。
+    #[test]
+    fn version_column_holds_raw_hlc_16b_per_cell() {
+        let l = base(true);
+        assert_eq!(HLC_CELL_BYTES, 16);
+        // himo_col_size は 4B/cell、 ver_col_size は 16B/cell。 header 分を除いて 4 倍。
+        let cells = 1024usize;
+        assert!(l.ver_col_size >= cells * 16, "version column が 16B/cell 未満");
+        assert!(l.ver_col_size < cells * 16 + 64, "version column に余分な確保がある");
+        assert_eq!(l.tomb_size, l.ver_col_size, "tombstone column も同じ形 (eid 空間 × 16B)");
+    }
+}
+
+/// request17 Phase 1 step 2: `set_cell` / `cell_hlc` / `clear_cell` /
+/// `set_tombstone` / `tombstone_hlc` の単体。 まだ engine 内の write 経路からは
+/// 呼ばれないので、 ここが唯一の caller。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod cell_version_tests {
+    use super::*;
+    use enchudb_oplog::Hlc;
+
+    fn tmp(name: &str) -> String {
+        let path = format!("/tmp/enchu_v9cell_{name}.db");
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn hlc(wall: u64, peer: u32) -> Hlc {
+        Hlc { wall, logical: 0, peer }
+    }
+
+    /// v9 DB + himo 1 本 + entity 1 つ。
+    fn v9_engine(name: &str, himo: &str) -> (Engine, u16, enchudb_oplog::EntityId) {
+        let mut eng = Engine::create_with_capacity(&tmp(name), 1024).unwrap();
+        eng.define_himo(himo, ValueType::Number, 0);
+        let hid = eng.himo_id(himo).unwrap() as u16;
+        let eid = eng.entity();
+        (eng, hid, eid)
+    }
+
+    #[test]
+    fn v9_db_has_version_region_and_pre_v9_does_not() {
+        let (eng, hid, eid) = v9_engine("has_region", "age");
+        assert!(eng.has_cell_version(), "v9 create が version 領域を確保していない");
+        assert_eq!(eng.cell_hlc(eid, hid), Hlc::ZERO, "未書き込み cell は版数不明");
+
+        let mut old = Engine::create_without_cell_version(&tmp("no_region"), 1024).unwrap();
+        old.define_himo("age", ValueType::Number, 0);
+        assert!(!old.has_cell_version(), "pre-v9 create が v9 領域を確保している");
+    }
+
+    #[test]
+    fn set_cell_writes_value_and_version_together() {
+        let (eng, hid, eid) = v9_engine("write", "age");
+        assert!(eng.set_cell(eid, hid, 42, hlc(100, 1)));
+        assert_eq!(eng.get(eid, "age"), Some(42));
+        assert_eq!(eng.cell_hlc(eid, hid), hlc(100, 1), "値は入ったが版数が残っていない");
+        assert_eq!(eng.pull("age", 42), vec![enchudb_oplog::eid_local(eid)]);
+    }
+
+    /// A-2 の核: 古い HLC は **値も版数も cylinder も** 触らずに落とす。
+    /// 同値 HLC も不採用 (`cur >= hlc`)。
+    #[test]
+    fn older_hlc_is_rejected_without_touching_the_cell() {
+        let (eng, hid, eid) = v9_engine("reject_old", "age");
+        assert!(eng.set_cell(eid, hid, 42, hlc(200, 1)));
+
+        assert!(!eng.set_cell(eid, hid, 7, hlc(100, 1)), "古い HLC を採用した");
+        assert_eq!(eng.get(eid, "age"), Some(42), "不採用なのに値が変わった");
+        assert_eq!(eng.cell_hlc(eid, hid), hlc(200, 1), "不採用なのに版数が変わった");
+        assert!(eng.pull("age", 7).is_empty(), "不採用なのに cylinder に載った");
+
+        assert!(!eng.set_cell(eid, hid, 8, hlc(200, 1)), "同値 HLC を採用した");
+        assert_eq!(eng.get(eid, "age"), Some(42));
+    }
+
+    #[test]
+    fn newer_hlc_wins() {
+        let (eng, hid, eid) = v9_engine("newer", "age");
+        assert!(eng.set_cell(eid, hid, 42, hlc(100, 1)));
+        assert!(eng.set_cell(eid, hid, 43, hlc(101, 1)));
+        assert_eq!(eng.get(eid, "age"), Some(43));
+        assert_eq!(eng.cell_hlc(eid, hid), hlc(101, 1));
+        // wall 同値なら peer が tiebreak (Hlc の全順序)
+        assert!(eng.set_cell(eid, hid, 44, hlc(101, 2)));
+        assert_eq!(eng.get(eid, "age"), Some(44));
+    }
+
+    /// A-1: 版数不明 (`Hlc::ZERO`) の cell は従来どおり無条件に上書きされる。
+    /// ここを塞ぐと既存 DB が何も同期できなくなる (#161 の再来)。
+    #[test]
+    fn unknown_version_cell_accepts_any_write() {
+        let (eng, hid, eid) = v9_engine("unknown_cur", "age");
+        // 版数を書かない従来経路
+        eng.tie_to_by_id(eid, hid, 5);
+        assert_eq!(eng.cell_hlc(eid, hid), Hlc::ZERO, "前提: 旧経路は版数を書かない");
+
+        assert!(eng.set_cell(eid, hid, 9, hlc(50, 1)), "版数不明 cell への write を止めた");
+        assert_eq!(eng.get(eid, "age"), Some(9));
+        assert_eq!(eng.cell_hlc(eid, hid), hlc(50, 1), "以後は版数が付く");
+    }
+
+    /// A-3: oplog 無効 (standalone) の write は HLC を採番できず `ZERO` で来る。
+    /// 値は従来どおり通し、 既に載っている版数は消さない。
+    #[test]
+    fn zero_hlc_write_applies_and_keeps_recorded_version() {
+        let (eng, hid, eid) = v9_engine("zero_incoming", "age");
+        assert!(eng.set_cell(eid, hid, 42, hlc(200, 1)));
+
+        assert!(eng.set_cell(eid, hid, 43, Hlc::ZERO), "版数不明の write を止めた");
+        assert_eq!(eng.get(eid, "age"), Some(43));
+        assert_eq!(eng.cell_hlc(eid, hid), hlc(200, 1), "ZERO 書き込みが既存の版数を消した");
+    }
+
+    /// pre-v9 DB は version column を持たないので、 版数は **揮発 `HlcStore`** に置く
+    /// (= 従来 sync.rs が持っていた記憶。 step 5 で判定ごと engine に移した)。
+    ///
+    /// 判定の入口は v9 と同じ `set_cell` 1 本で、 違うのは置き場だけ:
+    /// 永続の column が無いので `cell_hlc` は ZERO のまま、 プロセスを跨ぐと忘れる。
+    #[test]
+    fn pre_v9_db_falls_back_to_volatile_versions() {
+        let mut eng = Engine::create_without_cell_version(&tmp("prev9_write"), 1024).unwrap();
+        eng.define_himo("age", ValueType::Number, 0);
+        let hid = eng.himo_id("age").unwrap() as u16;
+        let eid = eng.entity();
+
+        assert!(eng.set_cell(eid, hid, 1, hlc(200, 1)));
+        assert!(!eng.set_cell(eid, hid, 2, hlc(100, 1)), "古い HLC を採用した");
+        assert!(eng.set_cell(eid, hid, 3, hlc(300, 1)));
+        assert_eq!(eng.get(eid, "age"), Some(3));
+        // 永続の版数は持たない (v9 領域が無い) — 記憶は揮発
+        assert_eq!(eng.cell_hlc(eid, hid), Hlc::ZERO);
+
+        assert!(eng.set_tombstone(eid, hlc(400, 1)));
+        assert!(!eng.set_tombstone(eid, hlc(350, 1)), "古い delete を採用した");
+        assert_eq!(eng.tombstone_hlc(eid), Hlc::ZERO);
+        // tombstone より古い write は蘇らない (A-5、 pre-v9 でも同じ判定)
+        assert!(!eng.set_cell(eid, hid, 9, hlc(390, 1)), "削除より古い write が通った");
+    }
+
+    /// untie も版数を進める。 これが無いと外した cell に古い tie が蘇る。
+    #[test]
+    fn clear_cell_is_versioned() {
+        let (eng, hid, eid) = v9_engine("clear", "age");
+        assert!(eng.set_cell(eid, hid, 42, hlc(100, 1)));
+
+        assert!(!eng.clear_cell(eid, hid, hlc(50, 1)), "古い untie を採用した");
+        assert_eq!(eng.get(eid, "age"), Some(42));
+
+        assert!(eng.clear_cell(eid, hid, hlc(200, 1)));
+        assert_eq!(eng.get(eid, "age"), None);
+        assert_eq!(eng.cell_hlc(eid, hid), hlc(200, 1));
+
+        assert!(!eng.set_cell(eid, hid, 42, hlc(150, 1)), "untie より古い tie が蘇った");
+        assert_eq!(eng.get(eid, "age"), None);
+    }
+
+    /// A-5: tombstone は eid 空間の 1 本。 himo の版数とは別空間で、 LWW も別。
+    #[test]
+    fn tombstone_column_is_lww_and_separate_from_himo_versions() {
+        let (eng, hid, eid) = v9_engine("tomb", "age");
+        assert_eq!(eng.tombstone_hlc(eid), Hlc::ZERO);
+
+        assert!(eng.set_tombstone(eid, hlc(100, 1)));
+        assert_eq!(eng.tombstone_hlc(eid), hlc(100, 1));
+        assert!(!eng.set_tombstone(eid, hlc(50, 1)), "古い delete を採用した");
+        assert_eq!(eng.tombstone_hlc(eid), hlc(100, 1));
+        assert!(eng.set_tombstone(eid, hlc(300, 1)));
+        assert_eq!(eng.tombstone_hlc(eid), hlc(300, 1));
+
+        assert_eq!(eng.cell_hlc(eid, hid), Hlc::ZERO, "tombstone が himo の版数を踏んだ");
+    }
+
+    // ──── slot 再利用: 前の住人の版数を持ち越さない ────
+
+    /// version / tombstone column は local slot で index されるので、 free list
+    /// から再利用された slot には前の住人の版数が残る。 落とさずに渡すと、 新しい
+    /// 住人への write が「前の住人の削除より古い」と判定されて **無言で落ちる**。
+    ///
+    /// 実害が出るのは bootstrap / `Hlc::ZERO` からの pull のように **古い record を
+    /// まとめて再生する**局面: 相手が t1 に author した record が、 こちらが
+    /// t2 (> t1) に消した無関係な entity の tombstone に負けて適用されない。
+    ///
+    /// falsify: `entity_in` の再利用枝から `clear_cell_versions` を外すと
+    /// 最後の 3 assert が落ちる。
+    #[test]
+    fn reused_table_slot_does_not_inherit_previous_tenant_version() {
+        let mut eng = Engine::create_with_capacity(&tmp("slot_reuse_table"), 1024).unwrap();
+        eng.define_himo("age", ValueType::Number, 0);
+        let hid = eng.himo_id("age").unwrap() as u16;
+        // slot 1 個だけの table → 2 個目の entity_in は必ず再利用に落ちる
+        eng.define_table("t", 1).unwrap();
+
+        let first = eng.entity_in("t").unwrap();
+        assert!(eng.set_cell(first, hid, 42, hlc(300, 1)));
+        assert!(eng.set_tombstone(first, hlc(300, 1)));
+        eng.delete(first); // slot が free list に戻る
+
+        let second = eng.entity_in("t").unwrap();
+        assert_eq!(
+            enchudb_oplog::eid_local(second),
+            enchudb_oplog::eid_local(first),
+            "前提が崩れた: slot が再利用されていない",
+        );
+
+        // 前の住人の版数 (300) より古い remote record 相当 = 実害が出る形
+        assert!(
+            eng.set_cell(second, hid, 7, hlc(200, 1)),
+            "前の住人の版数が新しい住人への write を無言で落とした",
+        );
+        assert_eq!(eng.get(second, "age"), Some(7));
+        assert_eq!(eng.cell_hlc(second, hid), hlc(200, 1));
+        assert_eq!(eng.tombstone_hlc(second), Hlc::ZERO, "前の住人の tombstone を引き継いだ");
+    }
+
+    /// anonymous table 側 (`entity()` → `EntitySet` free stack) の同じ穴。
+    /// こちらは eid 空間を使い切った時だけ再利用に落ちる。
+    #[test]
+    fn reused_entity_set_slot_does_not_inherit_previous_tenant_version() {
+        let mut eng = Engine::create_with_capacity(&tmp("slot_reuse_anon"), 2).unwrap();
+        eng.define_himo("age", ValueType::Number, 0);
+        let hid = eng.himo_id("age").unwrap() as u16;
+
+        let a = eng.entity();
+        let b = eng.entity(); // ここで max_entities (2) を使い切る
+        assert!(eng.set_cell(b, hid, 42, hlc(300, 1)));
+        assert!(eng.set_tombstone(b, hlc(300, 1)));
+        eng.delete(b);
+
+        let reused = eng.entity(); // free stack から b の slot を再利用
+        assert_ne!(enchudb_oplog::eid_local(reused), enchudb_oplog::eid_local(a));
+        assert_eq!(
+            enchudb_oplog::eid_local(reused),
+            enchudb_oplog::eid_local(b),
+            "前提が崩れた: free stack から再利用されていない",
+        );
+
+        assert!(
+            eng.set_cell(reused, hid, 7, hlc(200, 1)),
+            "前の住人の版数が新しい住人への write を無言で落とした",
+        );
+        assert_eq!(eng.get(reused, "age"), Some(7));
+        assert_eq!(eng.tombstone_hlc(reused), Hlc::ZERO, "前の住人の tombstone を引き継いだ");
+    }
+
+    /// **pre-v9 DB でも同じ穴が開く。** 版数の置き場が version column ではなく揮発
+    /// `HlcStore` になるだけで、 キーは `version_key(local)` = local slot なので
+    /// 事情は v9 と変わらない。 しかも `HlcStore` のエントリは production code から
+    /// 一度も消されないので、 落とさなければ永久に残る。
+    ///
+    /// falsify: `clear_cell_versions` の pre-v9 枝を消すと最後の 3 assert が落ちる。
+    #[test]
+    fn reused_slot_does_not_inherit_previous_tenant_version_on_pre_v9() {
+        let mut eng = Engine::create_without_cell_version(&tmp("slot_reuse_prev9"), 1024).unwrap();
+        eng.define_himo("age", ValueType::Number, 0);
+        let hid = eng.himo_id("age").unwrap() as u16;
+        eng.define_table("t", 1).unwrap(); // slot 1 個 → 2 個目は必ず再利用
+        assert!(!eng.has_cell_version(), "前提が崩れた: pre-v9 DB でない");
+
+        let first = eng.entity_in("t").unwrap();
+        assert!(eng.set_cell(first, hid, 42, hlc(300, 1)));
+        assert!(eng.set_tombstone(first, hlc(300, 1)));
+        eng.delete(first);
+
+        let second = eng.entity_in("t").unwrap();
+        assert_eq!(
+            enchudb_oplog::eid_local(second),
+            enchudb_oplog::eid_local(first),
+            "前提が崩れた: slot が再利用されていない",
+        );
+
+        assert!(
+            eng.set_cell(second, hid, 7, hlc(200, 1)),
+            "前の住人の版数が新しい住人への write を無言で落とした (pre-v9)",
+        );
+        assert_eq!(eng.get(second, "age"), Some(7));
+        assert_eq!(eng.tombstone_hlc(second), Hlc::ZERO, "前の住人の tombstone を引き継いだ");
+    }
+
+    // ──── step 4: ローカル write が版数を書く ────
+
+    /// v9 DB + oplog (WAL) + consumer。 async 経路まで通した実構成。
+    fn v9_with_wal(name: &str, himo: &str) -> (std::sync::Arc<Engine>, u16) {
+        let path = tmp(name);
+        let _ = std::fs::remove_file(format!("{path}.wal"));
+        let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
+        eng.define_himo(himo, ValueType::Number, 0);
+        let hid = eng.himo_id(himo).unwrap() as u16;
+        let arc = Engine::concurrentize_with_oplog(eng, 1024 * 1024).unwrap();
+        (arc, hid)
+    }
+
+    /// WAL 上の record を (op 種別を問わず) HLC 付きで拾う。
+    fn wal_hlcs(eng: &Engine) -> Vec<(enchudb_oplog::oplog::DecodedOp, Hlc)> {
+        let wal = eng.oplog().expect("wal");
+        wal.append(enchudb_oplog::oplog::Op::Commit).unwrap();
+        wal.iter_committed().into_iter().map(|r| (r.op, r.hlc)).collect()
+    }
+
+    /// 同期 write が **版数を記録し、 その版数が WAL record の HLC と一致する**こと。
+    /// 一致していないと、 自分が持つ版数と peer に配る版数が食い違う。
+    #[test]
+    fn sync_local_tie_records_the_same_hlc_as_the_record() {
+        let (eng, hid) = v9_with_wal("sync_tie", "age");
+        let eid = eng.entity();
+        eng.tie_to(eid, "age", 42);
+        eng.flush_writes();
+
+        let cell = eng.cell_hlc(eid, hid);
+        assert_ne!(cell, Hlc::ZERO, "ローカル write が版数を書いていない");
+
+        let ties: Vec<Hlc> = wal_hlcs(&eng)
+            .into_iter()
+            .filter(|(op, _)| matches!(op, enchudb_oplog::oplog::DecodedOp::Tie { .. }))
+            .map(|(_, h)| h)
+            .collect();
+        assert_eq!(ties, vec![cell], "cell の版数と WAL record の HLC が違う");
+    }
+
+    /// untie も版数を進める (= 外した cell に古い tie が蘇らない)。
+    #[test]
+    fn sync_local_untie_advances_the_version() {
+        let (eng, hid) = v9_with_wal("sync_untie", "age");
+        let eid = eng.entity();
+        eng.tie_to(eid, "age", 42);
+        let after_tie = eng.cell_hlc(eid, hid);
+        eng.untie(eid, "age");
+        let after_untie = eng.cell_hlc(eid, hid);
+
+        assert!(after_untie > after_tie, "untie が版数を進めていない");
+        assert_eq!(eng.get(eid, "age"), None);
+        // untie より古い tie は蘇らない
+        assert!(!eng.set_cell(eid, hid, 42, after_tie));
+        assert_eq!(eng.get(eid, "age"), None);
+    }
+
+    /// delete が tombstone 版数を残す (A-5)。
+    #[test]
+    fn sync_local_delete_records_tombstone() {
+        let (eng, _hid) = v9_with_wal("sync_delete", "age");
+        let eid = eng.entity();
+        eng.tie_to(eid, "age", 42);
+        assert_eq!(eng.tombstone_hlc(eid), Hlc::ZERO);
+
+        eng.delete(eid);
+        let tomb = eng.tombstone_hlc(eid);
+        assert_ne!(tomb, Hlc::ZERO, "delete が tombstone 版数を残していない");
+
+        let deletes: Vec<Hlc> = wal_hlcs(&eng)
+            .into_iter()
+            .filter(|(op, _)| matches!(op, enchudb_oplog::oplog::DecodedOp::Delete { .. }))
+            .map(|(_, h)| h)
+            .collect();
+        assert_eq!(deletes, vec![tomb], "tombstone 版数と Delete record の HLC が違う");
+    }
+
+    /// **async 経路** (適用と WAL append が別 queue / 別タイミング) でも、 cell の版数と
+    /// record の HLC が一致すること。 ここがずれると peer 間で勝者が分かれる。
+    #[test]
+    fn async_write_puts_the_same_hlc_on_cell_and_record() {
+        let (eng, hid) = v9_with_wal("async_tie", "age");
+        let eid = eng.entity();
+        eng.tie_async(eid, "age", 7);
+        eng.tie_async(eid, "age", 8);
+        eng.flush_writes();
+
+        assert_eq!(eng.get(eid, "age"), Some(8));
+        let cell = eng.cell_hlc(eid, hid);
+        assert_ne!(cell, Hlc::ZERO, "async write が版数を書いていない");
+
+        let ties: Vec<Hlc> = wal_hlcs(&eng)
+            .into_iter()
+            .filter(|(op, _)| matches!(op, enchudb_oplog::oplog::DecodedOp::Tie { .. }))
+            .map(|(_, h)| h)
+            .collect();
+        assert_eq!(ties.len(), 2, "record が 2 本乗っていない");
+        assert!(ties[0] < ties[1], "record の HLC が単調増加していない");
+        assert_eq!(
+            ties[1], cell,
+            "最後に適用された cell の版数が、 その write の record の HLC と違う",
+        );
+    }
+
+    /// async untie / delete も同様に版数を進める。
+    #[test]
+    fn async_untie_and_delete_are_versioned() {
+        let (eng, hid) = v9_with_wal("async_untie", "age");
+        let eid = eng.entity();
+        eng.tie_async(eid, "age", 7);
+        eng.flush_writes();
+        let after_tie = eng.cell_hlc(eid, hid);
+
+        eng.untie_async(eid, "age");
+        eng.flush_writes();
+        assert!(eng.cell_hlc(eid, hid) > after_tie, "async untie が版数を進めていない");
+        assert_eq!(eng.get(eid, "age"), None);
+
+        let eid2 = eng.entity();
+        eng.tie_async(eid2, "age", 9);
+        eng.delete_async(eid2);
+        eng.flush_writes();
+        assert_ne!(eng.tombstone_hlc(eid2), Hlc::ZERO, "async delete が tombstone を残していない");
+    }
+
+    // ──── step 7: v9 を既定にする (版数が reopen を跨いで残る) ────
+
+    /// **版数が reopen を跨いで残る** — request17 全体の目的そのもの。
+    ///
+    /// 従来 LWW の真実は揮発 HashMap にしか無く、 プロセスが落ちるか配送バッファが
+    /// reclaim されると失われた (#140 / #154 / #160 の共通の根)。 v9 では cell と
+    /// 一緒に永続するので、 reopen 後も古い record に負けない。
+    #[test]
+    fn versions_survive_reopen() {
+        let path = tmp("reopen");
+        let (eid, other, hid) = {
+            let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
+            eng.define_himo("age", ValueType::Number, 0);
+            let hid = eng.himo_id("age").unwrap() as u16;
+            let eid = eng.entity();
+            let other = eng.entity();
+            assert!(eng.has_cell_version(), "通常 create が v9 領域を確保していない");
+            assert!(eng.set_cell(eid, hid, 42, hlc(500, 7)));
+            assert!(eng.set_tombstone(other, hlc(600, 7)));
+            eng.flush().unwrap();
+            (eid, other, hid)
+        };
+
+        let eng = Engine::open_standalone(&path).unwrap();
+        assert!(eng.has_cell_version(), "reopen で v9 領域を見失った");
+        assert_eq!(eng.get(eid, "age"), Some(42), "値が消えた");
+        assert_eq!(eng.cell_hlc(eid, hid), hlc(500, 7), "cell の版数が reopen で消えた");
+        assert_eq!(eng.tombstone_hlc(other), hlc(600, 7), "tombstone が reopen で消えた");
+
+        // 記憶が残っているので、 reopen 後も古い record は負ける
+        assert!(
+            !eng.remote_tie_apply(eid, hid, 9, hlc(400, 7), None),
+            "reopen 後に古い record が勝った (版数が永続していない)",
+        );
+        assert_eq!(eng.get(eid, "age"), Some(42));
+    }
+
+    /// **growable backing で v9 領域を書いても SIGBUS しない**。
+    ///
+    /// growable の commit は初期値が `vocab_data_off` (= 固定 cluster まで) で、
+    /// v9 領域は variable cluster の末尾 = その外側にある。 触る前に commit を
+    /// 伸ばさないと未コミット page への read/write で **プロセスが即死** する
+    /// (step 7 で実際に踏んだ: bench が exit 138 = SIGBUS)。
+    ///
+    /// 既存の growable テストが素通ししたのは、 oplog 無しでは版数が `ZERO` で
+    /// version column を一度も触らないため。 oplog 付きで書くこと自体が条件。
+    #[test]
+    fn growable_backing_writes_versions_without_sigbus() {
+        let path = tmp("growable_v9");
+        let _ = std::fs::remove_file(format!("{path}.wal"));
+        let mut eng = Engine::create_growable_with_capacity(&path, 100_000).unwrap();
+        eng.define_himo("age", ValueType::Number, 0);
+        let hid = eng.himo_id("age").unwrap() as u16;
+        let eng = Engine::concurrentize_with_oplog(eng, 1024 * 1024).unwrap();
+        assert!(eng.has_cell_version(), "growable create が v9 領域を確保していない");
+
+        // 末尾寄りの eid ほど commit の外 — 手前だけ触って満足しないように広く書く。
+        let mut eids = Vec::new();
+        for i in 0..64u32 {
+            let e = eng.entity();
+            eng.tie_to(e, "age", i);
+            eids.push(e);
+        }
+        eng.tie_async(eids[0], "age", 999);
+        eng.delete(eids[1]);
+        eng.flush_writes();
+
+        assert_ne!(eng.cell_hlc(eids[0], hid), Hlc::ZERO, "版数が記録されていない");
+        assert_ne!(eng.tombstone_hlc(eids[1]), Hlc::ZERO, "tombstone が記録されていない");
+        assert_eq!(eng.get(eids[0], "age"), Some(999));
+    }
+
+    /// pre-v9 DB を v9 binary で開いて (a) 開ける (b) 既存データが読める
+    /// (c) 版数不明として従来どおり適用される (A-1 の「migration 不要」)。
+    #[test]
+    fn pre_v9_db_opens_and_behaves_as_before() {
+        let path = tmp("prev9_reopen");
+        let (eid, hid) = {
+            let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+            eng.define_himo("age", ValueType::Number, 0);
+            let hid = eng.himo_id("age").unwrap() as u16;
+            let eid = eng.entity();
+            eng.tie_to(eid, "age", 7);
+            eng.flush().unwrap();
+            (eid, hid)
+        };
+
+        let eng = Engine::open_standalone(&path).unwrap();
+        assert!(!eng.has_cell_version(), "pre-v9 DB に v9 領域が生えた (勝手に migrate した)");
+        assert_eq!(eng.get(eid, "age"), Some(7), "既存データが読めない");
+        assert_eq!(eng.cell_hlc(eid, hid), Hlc::ZERO, "持てないはずの版数を返した");
+        // 版数不明なので remote record は従来どおり適用される
+        assert!(
+            eng.remote_tie_apply(eid, hid, 9, hlc(400, 7), None),
+            "版数不明 cell への remote apply を止めた (既存 DB が同期不能になる)",
+        );
+        assert_eq!(eng.get(eid, "age"), Some(9));
+    }
+
+    // ──── step 5: remote apply も同じ 1 本を通る ────
+
+    /// tombstone より古い remote Tie は **適用されない** (A-5)。 これが永続する
+    /// ことで、 配送バッファから tombstone が消えた後も削除済み entity が
+    /// 復活しない (#140 の根)。
+    #[test]
+    fn tombstone_blocks_older_remote_tie() {
+        let (eng, hid) = v9_with_wal("tomb_remote", "age");
+        let eid = eng.entity();
+
+        assert!(eng.remote_delete_apply(eid, hlc(1000, 1), None));
+        assert!(
+            !eng.remote_tie_apply(eid, hid, 5, hlc(900, 1), None),
+            "削除より古い Tie が蘇った",
+        );
+        assert_eq!(eng.get(eid, "age"), None);
+        assert!(
+            eng.remote_tie_apply(eid, hid, 6, hlc(1100, 1), None),
+            "削除より新しい Tie が入らない",
+        );
+        assert_eq!(eng.get(eid, "age"), Some(6));
+    }
+
+    /// remote apply の LWW も engine の 1 本で判定されること。
+    #[test]
+    fn remote_apply_is_lww_without_any_sync_layer_help() {
+        let (eng, hid) = v9_with_wal("remote_lww", "age");
+        let eid = eng.entity();
+
+        assert!(eng.remote_tie_apply(eid, hid, 1, hlc(200, 1), None));
+        assert!(!eng.remote_tie_apply(eid, hid, 2, hlc(100, 1), None), "古い record を適用した");
+        assert_eq!(eng.get(eid, "age"), Some(1));
+        assert!(eng.remote_tie_apply(eid, hid, 3, hlc(300, 1), None));
+        assert_eq!(eng.get(eid, "age"), Some(3));
+        assert_eq!(eng.cell_hlc(eid, hid), hlc(300, 1), "remote の版数が cell に残っていない");
+        // untie も同じ判定
+        assert!(!eng.remote_untie_apply(eid, hid, hlc(250, 1), None));
+        assert!(eng.remote_untie_apply(eid, hid, hlc(400, 1), None));
+        assert_eq!(eng.get(eid, "age"), None);
+    }
+
+    /// **受信 HLC でローカル clock を merge する** (step 5)。
+    ///
+    /// 相手の wall clock が先行していると、 merge しない限り自分の次の HLC は
+    /// 相手の版数より小さいままで、 版数を storage に置いた途端に
+    /// **自分のローカル write が自分の DB で負ける**。 #161 と同じ「止めた先に
+    /// 脱出路が無い」形なので、 構造で塞ぐ。
+    #[test]
+    fn local_write_still_wins_after_a_far_future_remote_hlc() {
+        let (eng, hid) = v9_with_wal("clock_merge", "age");
+        let eid = eng.entity();
+
+        // 10 年先の clock を持つ peer からの record
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let far_future = Hlc { wall: now_ms + 10 * 365 * 24 * 3600 * 1000, logical: 0, peer: 9 };
+        assert!(eng.remote_tie_apply(eid, hid, 7, far_future, None));
+        assert_eq!(eng.get(eid, "age"), Some(7));
+
+        // 直後のローカル write が負けてはいけない
+        eng.tie_to(eid, "age", 42);
+        assert_eq!(
+            eng.get(eid, "age"), Some(42),
+            "未来 HLC を受けた後にローカル write が負けた (clock を merge していない)",
+        );
+        assert!(eng.cell_hlc(eid, hid) > far_future, "ローカル版数が受信 HLC を追い越していない");
+    }
+
+    /// **WAL 上の HLC は record の並び順どおり単調増加**すること。
+    ///
+    /// transport は record を HLC 順に並べ替えて配る (`InMemoryTransport::pull_as`)。
+    /// 崩れると「Vocab → その vid を使う Tie」の依存順が受信側で逆転し、 vid 翻訳が
+    /// 生の remote vid に fallback して無関係な row へ誤 bind する (#141 の再来)。
+    /// step 4 で採番を engine 側に寄せたとき、 一度これを壊して #141 の回帰テストが
+    /// 落ちた — その再発防止。
+    #[test]
+    fn wal_hlcs_are_monotonic_in_record_order() {
+        let path = tmp("wal_monotonic");
+        let _ = std::fs::remove_file(format!("{path}.wal"));
+        let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
+        eng.define_himo("age", ValueType::Number, 0);
+        eng.define_himo("name", ValueType::Tag, 0);
+        let eng = Engine::concurrentize_with_oplog(eng, 1024 * 1024).unwrap();
+
+        let e1 = eng.entity();
+        let e2 = eng.entity();
+        // 同期経路: text tie は Vocab + Tie の 2 record を出す
+        eng.tie_text_to(e1, "name", "alice");
+        eng.tie_to(e1, "age", 30);
+        eng.tie_text_to(e2, "name", "bob");
+        eng.untie(e1, "age");
+        // async 経路も混ぜる
+        eng.tie_async(e2, "age", 20);
+        eng.tie_text_async(e2, "name", "bobby");
+        eng.delete_async(e1);
+        eng.flush_writes();
+
+        let recs = wal_hlcs(&eng);
+        assert!(recs.len() >= 8, "record が足りない ({} 本)", recs.len());
+        for w in recs.windows(2) {
+            assert!(
+                w[0].1 < w[1].1,
+                "WAL 上で HLC が並び順どおりでない: {:?}({:?}) → {:?}({:?})",
+                w[0].0, w[0].1, w[1].0, w[1].1,
+            );
+        }
+    }
+
+    /// pre-v9 DB (= 通常 create) のローカル write は **何も変わらない**。
+    /// step 7 まで既定はこちらなので、 これが step 4 の「挙動不変」の担保。
+    #[test]
+    fn pre_v9_local_writes_are_unchanged() {
+        let path = tmp("prev9_local");
+        let _ = std::fs::remove_file(format!("{path}.wal"));
+        let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+        eng.define_himo("age", ValueType::Number, 0);
+        let hid = eng.himo_id("age").unwrap() as u16;
+        let eng = Engine::concurrentize_with_oplog(eng, 1024 * 1024).unwrap();
+
+        let eid = eng.entity();
+        eng.tie_to(eid, "age", 1);
+        eng.tie_async(eid, "age", 2);
+        eng.flush_writes();
+        assert_eq!(eng.get(eid, "age"), Some(2));
+        assert_eq!(eng.cell_hlc(eid, hid), Hlc::ZERO, "v9 領域が無いのに版数が読めている");
+
+        eng.untie(eid, "age");
+        assert_eq!(eng.get(eid, "age"), None);
+        eng.delete(eid);
+        assert_eq!(eng.tombstone_hlc(eid), Hlc::ZERO);
+        // record 自体は従来どおり出ている
+        let n = wal_hlcs(&eng).len();
+        assert!(n >= 4, "WAL record が減っている ({n} 本)");
+    }
+
+    /// 版数は cell (eid × himo) ごとに独立。 himo が動的定義でも
+    /// (= define_himo_slot_locked 経由でも) version column が付く。
+    #[test]
+    fn versions_are_independent_per_cell() {
+        let (mut eng, hid_a, e1) = v9_engine("per_cell", "a");
+        eng.define_himo("b", ValueType::Number, 0);
+        let hid_b = eng.himo_id("b").unwrap() as u16;
+        let e2 = eng.entity();
+
+        assert!(eng.set_cell(e1, hid_a, 1, hlc(300, 1)));
+        assert!(eng.set_cell(e1, hid_b, 2, hlc(100, 1)), "himo a の版数が b を塞いだ");
+        assert!(eng.set_cell(e2, hid_a, 3, hlc(100, 1)), "e1 の版数が e2 を塞いだ");
+
+        assert_eq!(eng.cell_hlc(e1, hid_a), hlc(300, 1));
+        assert_eq!(eng.cell_hlc(e1, hid_b), hlc(100, 1));
+        assert_eq!(eng.cell_hlc(e2, hid_a), hlc(100, 1));
+        assert_eq!(eng.cell_hlc(e2, hid_b), Hlc::ZERO);
+        assert_eq!(eng.get(e1, "a"), Some(1));
+        assert_eq!(eng.get(e1, "b"), Some(2));
+        assert_eq!(eng.get(e2, "a"), Some(3));
+    }
+}
 
 #[cfg(test)]
 mod tests {

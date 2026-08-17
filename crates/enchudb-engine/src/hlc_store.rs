@@ -1,23 +1,32 @@
-//! HlcStore — (eid, himo_id) ごとの「最後に書いた HLC」を保持する。
+//! HlcStore — (eid, himo_id) ごとの「最後に書いた HLC」を保持する **pre-v9 専用の
+//! 版数置き場** (request17 で役目を終えつつある legacy 構造)。
 //!
-//! # 用途
+//! # 現在の位置づけ (request17 Phase 1 以降)
 //!
-//! LWW(Last-Write-Wins)衝突解決のために必要。peer A と peer B が同じ
-//! (eid, himo) に違う値を書いたとき、HLC が大きい方を採用する。
+//! LWW の判定は engine の `set_cell` 1 本に集約された。 版数の**置き場**だけが
+//! DB の format で分かれる:
 //!
-//! 受信 op を apply する前に、HlcStore の現在 HLC と比較:
-//! - 既存なし、または既存 < 受信 HLC → apply、HlcStore を受信 HLC に更新
-//! - 既存 >= 受信 HLC → skip(受信 op は古い)
+//! - **v9 DB (現行の create)**: per-cell version column + tombstone column に
+//!   **永続**する。 この HlcStore は使われない
+//! - **pre-v9 DB (v8 以前で作られ migration していない DB)**: ここに載る。
+//!   揮発なのでプロセスを跨ぐと忘れ、 `Syncer::new` の `hydrate_hlc_store` が
+//!   配送バッファ (`_sync_ops`) から再構築する
 //!
-//! # 永続化
+//! 「LWW の真実が配送バッファからの再構築でしか得られない揮発 HashMap にある」
+//! ことが #140 / #154 / #160 の共通の構造的欠陥だった (配れる履歴が reclaim
+//! されたら記憶も消える)。 v9 ではこの依存が構造ごと消えている。
 //!
-//! v32 Phase B では in-memory HashMap のみ。再起動後は最初の sync で再構築する。
-//! Phase D で mmap region として永続化予定。
+//! **pre-v9 DB のサポートを落とす時に、 このモジュールごと削除する。**
+//! 新しい参照を増やさないこと。
+//!
+//! # 判定 (pre-v9 でも v9 と同じ)
+//!
+//! - 既存なし、または既存 < 受信 HLC → apply、 受信 HLC に更新
+//! - 既存 >= 受信 HLC → skip (受信 op は古い)
 //!
 //! # メモリ
 //!
 //! (eid: u64, himo_id: u16) → Hlc(16B) のエントリ。100万 (eid, himo) 組で ~40MB。
-//! 紐ごとに RwLock を分ければ concurrent apply も並列化できるが、Phase B は単一 Mutex。
 
 use std::collections::HashMap;
 use std::sync::RwLock;

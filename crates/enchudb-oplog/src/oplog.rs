@@ -717,16 +717,51 @@ impl OpLog {
         }
     }
 
+    /// request17-A3: HLC を **1 個だけ先に払い出す**。 採番したら clock は進むので、
+    /// 呼んだ側は必ずその HLC で record を書くこと (`append_at_hlc` /
+    /// `append_many_with_hlcs`)。
+    ///
+    /// async write 経路 (`tie_async`) は「op の適用」と「WAL への append」が別 queue で
+    /// 非同期に進むため、 append の戻り値を待っていては適用時点で版数を書けない。
+    /// 事前採番して **cell の version column と WAL record に同じ HLC を載せる**ための入口。
+    /// 両者がずれると、 peer 間で「自分が持つ版数」と「相手に配った版数」が食い違い、
+    /// その隙間に入った並行 write が peer ごとに別々の勝者を選ぶ (= divergence)。
+    pub fn mint_hlc(&self) -> Hlc {
+        self.next_hlc()
+    }
+
     /// op を append。新しいレコードの LSN を返す。
     ///
     /// v30: pending_writes カウンタで try_reset との race を防ぐ。
     /// writer は append 中 +1、完了時 -1。consumer reset は pending==0 時のみ。
     pub fn append(&self, op: Op<'_>) -> io::Result<u64> {
+        self.append_with_hlc(op).map(|(lsn, _)| lsn)
+    }
+
+    /// request17-A3: `append` + **払い出した HLC も返す**版。 同期 write 経路が
+    /// 「WAL に載せた HLC」をそのまま cell の version column に書けるようにする。
+    pub fn append_with_hlc(&self, op: Op<'_>) -> io::Result<(u64, Hlc)> {
         let payload_size = op.payload_size();
         let record_size = REC_HEADER_SIZE + payload_size;
 
         let _guard = self.pending_guard(1);
-        self.append_inner(op, payload_size, record_size, None)
+        self.append_inner(op, payload_size, record_size, None, None)
+    }
+
+    /// request17-A3: `mint_hlc` で事前採番した HLC を載せて append する。 署名は
+    /// 自鍵で行う (= 他 peer 由来の record をそのまま中継する `append_relayed` とは違い、
+    /// これは **自分の write**)。
+    ///
+    /// 注意: 事前採番と append の間に別の write が挟まると、 WAL 上で HLC の並びが
+    /// LSN の並びと一致しなくなる。 LWW は HLC の全順序だけを見る (LSN は cursor 用) ので
+    /// 判定には影響しない。
+    pub fn append_at_hlc(&self, op: Op<'_>, hlc: Hlc) -> io::Result<u64> {
+        let payload_size = op.payload_size();
+        let record_size = REC_HEADER_SIZE + payload_size;
+
+        let _guard = self.pending_guard(1);
+        self.append_inner(op, payload_size, record_size, None, Some(hlc))
+            .map(|(lsn, _)| lsn)
     }
 
     /// 複数 record を **1 回の flock サイクル** で連続 append。
@@ -734,6 +769,25 @@ impl OpLog {
     /// consumer thread が queue を drain して呼ぶことで flock コストを償却できる。
     /// 戻り値は各 record の LSN (順序対応)。
     pub fn append_many(&self, records: &[OwnedOp]) -> io::Result<Vec<u64>> {
+        self.append_many_impl(records, None)
+    }
+
+    /// request17-A3: `append_many` の **HLC 事前採番**版。 `hlcs[i]` が `records[i]` の
+    /// HLC になる (採番し直さない)。 async write 経路が、 適用時に `mint_hlc` した HLC を
+    /// cell の version column と WAL record の両方へ載せるために使う。
+    ///
+    /// # Panics
+    /// - `records.len() != hlcs.len()`
+    pub fn append_many_with_hlcs(&self, records: &[OwnedOp], hlcs: &[Hlc]) -> io::Result<Vec<u64>> {
+        assert_eq!(
+            records.len(), hlcs.len(),
+            "append_many_with_hlcs: records {} と hlcs {} の数が違う",
+            records.len(), hlcs.len(),
+        );
+        self.append_many_impl(records, Some(hlcs))
+    }
+
+    fn append_many_impl(&self, records: &[OwnedOp], hlcs: Option<&[Hlc]>) -> io::Result<Vec<u64>> {
         if records.is_empty() { return Ok(Vec::new()); }
         let sizes: Vec<usize> = records.iter()
             .map(|r| REC_HEADER_SIZE + r.as_op().payload_size())
@@ -741,7 +795,7 @@ impl OpLog {
         let total: usize = sizes.iter().sum();
 
         let _guard = self.pending_guard(records.len() as u32);
-        self.append_many_inner(records, &sizes, total)
+        self.append_many_inner(records, &sizes, total, hlcs)
     }
 
     fn append_many_inner(
@@ -749,6 +803,8 @@ impl OpLog {
         records: &[OwnedOp],
         sizes: &[usize],
         total: usize,
+        // request17-A3: Some なら採番せず与えられた HLC を載せる (index 対応)。
+        hlcs: Option<&[Hlc]>,
     ) -> io::Result<Vec<u64>> {
         // #75: 同一プロセス内の直列化 (flock は同一 fd 共有スレッド間で no-op)
         let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -786,11 +842,16 @@ impl OpLog {
         let mut offset = start_offset;
         let mmap = self.mmap_mut_slice();
 
-        for (rec, &record_size) in records.iter().zip(sizes.iter()) {
+        for (i, (rec, &record_size)) in records.iter().zip(sizes.iter()).enumerate() {
             let op = rec.as_op();
             let payload_size = record_size - REC_HEADER_SIZE;
             let lsn = self.next_lsn.fetch_add(1, Ordering::AcqRel);
-            let hlc = self.next_hlc();
+            // request17-A3: 事前採番された HLC があればそれを使う (採番し直すと
+            // cell の version column と record の HLC がずれる)。
+            let hlc = match hlcs {
+                Some(h) => h[i],
+                None => self.next_hlc(),
+            };
             let author_peer = hlc.peer;
 
             let op_byte = op.op_byte();
@@ -848,10 +909,20 @@ impl OpLog {
         let payload_size = op.payload_size();
         let record_size = REC_HEADER_SIZE + payload_size;
         let _guard = self.pending_guard(1);
-        let result = self.append_inner(op, payload_size, record_size, Some(header));
+        let result = self.append_inner(op, payload_size, record_size, Some(header), None);
         // ローカル HLC clock を受信 HLC で merge (後退防止)
         self.merge_external_hlc(header.hlc);
-        result
+        result.map(|(lsn, _)| lsn)
+    }
+
+    /// request17 step 5: **受信 HLC でローカル clock を進める** (HLC の merge 規則)。
+    ///
+    /// これが無いと、 相手の wall clock が先行している間ずっと「自分が次に採番する
+    /// HLC < 既に適用した remote の版数」になり、 版数を storage に置いた途端に
+    /// **自分のローカル write が自分の DB で負ける**。 適用した record は必ず
+    /// これを通すこと (`append_relayed` は内部で呼ぶので二重呼び出し不要)。
+    pub fn observe_hlc(&self, recv: Hlc) {
+        self.merge_external_hlc(recv);
     }
 
     fn merge_external_hlc(&self, recv: Hlc) {
@@ -878,7 +949,9 @@ impl OpLog {
         payload_size: usize,
         record_size: usize,
         relay: Option<RelayedHeader>,
-    ) -> io::Result<u64> {
+        // request17-A3: Some なら採番せず与えられた HLC を載せる (`mint_hlc` 済み)。
+        hlc_override: Option<Hlc>,
+    ) -> io::Result<(u64, Hlc)> {
         // テスト専用 fault injection: pending_writes の RAII ガード (issue #58②) が
         // panic-unwind 経路でも均衡することを deterministic に検証するため、 ここで
         // panic させられるようにする。 release build には一切残らない。
@@ -932,7 +1005,7 @@ impl OpLog {
         let (hlc, author_peer) = match &relay {
             Some(o) => (o.hlc, o.author),
             None => {
-                let h = self.next_hlc();
+                let h = hlc_override.unwrap_or_else(|| self.next_hlc());
                 let a = h.peer;
                 (h, a)
             }
@@ -980,7 +1053,7 @@ impl OpLog {
         // ファイルヘッダの head も更新
         mmap[8..16].copy_from_slice(&(offset + record_size as u64).to_le_bytes());
 
-        Ok(lsn)
+        Ok((lsn, hlc))
     }
 
     /// v30: ring buffer reset。
@@ -1864,5 +1937,98 @@ mod tests {
         let r = wal.append(Op::Tie { eid: 2, himo_id: 0, value: 2 });
         assert!(r.is_err());
         let _ = std::fs::remove_file(&p);
+    }
+
+    // ──── request17-A3: HLC の採番責務を呼び出し側に開く ────
+    //
+    // engine が cell の version column と WAL record に **同じ HLC** を載せられる
+    // ようにするための API 群。 ずれると peer 間で「自分が持つ版数」と「配った版数」が
+    // 食い違い、 その隙間の並行 write が peer ごとに別々の勝者を選ぶ。
+
+    /// Commit で閉じて、 Tie record だけを HLC 付きで拾う。
+    fn tie_hlcs(wal: &OpLog) -> Vec<(u64, Hlc)> {
+        wal.append(Op::Commit).unwrap();
+        wal.iter_committed()
+            .into_iter()
+            .filter(|r| matches!(r.op, DecodedOp::Tie { .. }))
+            .map(|r| (r.lsn, r.hlc))
+            .collect()
+    }
+
+    #[test]
+    fn append_with_hlc_returns_exactly_what_the_record_carries() {
+        let p = tmp("append_with_hlc");
+        let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+        let (lsn1, h1) = wal.append_with_hlc(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
+        let (lsn2, h2) = wal.append_with_hlc(Op::Tie { eid: 2, himo_id: 0, value: 2 }).unwrap();
+        assert!(h1 < h2, "連続 append で HLC が単調増加していない: {h1:?} → {h2:?}");
+
+        let on_disk = tie_hlcs(&wal);
+        assert_eq!(on_disk, vec![(lsn1, h1), (lsn2, h2)], "返した HLC が record と違う");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 事前採番した HLC は **そのまま** record に載る (append 側で採番し直さない)。
+    #[test]
+    fn append_at_hlc_uses_the_minted_hlc_verbatim() {
+        let p = tmp("append_at_hlc");
+        let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+        let minted1 = wal.mint_hlc();
+        let minted2 = wal.mint_hlc();
+        assert!(minted1 < minted2, "mint_hlc が単調増加していない");
+
+        // 採番と逆順に append しても、 record が持つのは採番時の HLC。
+        let lsn2 = wal.append_at_hlc(Op::Tie { eid: 2, himo_id: 0, value: 2 }, minted2).unwrap();
+        let lsn1 = wal.append_at_hlc(Op::Tie { eid: 1, himo_id: 0, value: 1 }, minted1).unwrap();
+
+        assert_eq!(tie_hlcs(&wal), vec![(lsn2, minted2), (lsn1, minted1)]);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn append_many_with_hlcs_uses_the_given_hlcs() {
+        let p = tmp("append_many_hlcs");
+        let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+        let batch = vec![
+            OwnedOp::Tie { eid: 1, himo_id: 0, value: 1 },
+            OwnedOp::Tie { eid: 2, himo_id: 0, value: 2 },
+        ];
+        let minted: Vec<Hlc> = (0..2).map(|_| wal.mint_hlc()).collect();
+        let lsns = wal.append_many_with_hlcs(&batch, &minted).unwrap();
+
+        let on_disk = tie_hlcs(&wal);
+        assert_eq!(
+            on_disk,
+            vec![(lsns[0], minted[0]), (lsns[1], minted[1])],
+            "batch append が HLC を採番し直している",
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// HLC 無し (従来の `append_many`) は今までどおり自前で採番し、 単調増加する。
+    #[test]
+    fn append_many_still_mints_monotonic_hlcs_without_override() {
+        let p = tmp("append_many_mint");
+        let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+        let batch = vec![
+            OwnedOp::Tie { eid: 1, himo_id: 0, value: 1 },
+            OwnedOp::Tie { eid: 2, himo_id: 0, value: 2 },
+        ];
+        wal.append_many(&batch).unwrap();
+
+        let on_disk = tie_hlcs(&wal);
+        assert_eq!(on_disk.len(), 2);
+        assert!(on_disk[0].1 < on_disk[1].1, "batch 内で HLC が単調増加していない");
+        assert_ne!(on_disk[0].1, Hlc::ZERO, "HLC が採番されていない");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    #[should_panic(expected = "数が違う")]
+    fn append_many_with_hlcs_rejects_length_mismatch() {
+        let p = tmp("append_many_mismatch");
+        let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+        let batch = vec![OwnedOp::Tie { eid: 1, himo_id: 0, value: 1 }];
+        let _ = wal.append_many_with_hlcs(&batch, &[]);
     }
 }
