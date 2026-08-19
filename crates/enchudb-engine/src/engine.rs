@@ -2510,6 +2510,24 @@ impl Engine {
             None
         };
         let file = OpenOptions::new().read(true).write(true).open(path)?;
+        // v9 (request17): v8 以前の DB に v9 領域を生やす。 **mmap を張る前**に
+        // やる必要がある — ファイルを伸ばすので、 先に map すると古いサイズで
+        // 固定されてしまう。 readonly は共有 mmap を書かない契約なので対象外
+        // (= 旧 binary と同じく版数無しで動く)。 no-op のときは header を 1 回
+        // 読むだけ。
+        if !readonly {
+            match Self::migrate_v8_to_v9_in_place(&file, file.metadata()?.len()) {
+                Ok(true) => {}
+                Ok(false) => {}
+                // 移行に失敗しても open 自体は続行する (= v8 のまま開く)。 ここで
+                // 新しい失敗モードを作らない。 版数が無いままなので #154 / #160 の
+                // 穴は残るが、 開けなくなるより良い。
+                Err(e) => eprintln!(
+                    "warning: failed to add v9 cell-version regions (opening as-is): {}",
+                    e
+                ),
+            }
+        }
         // v29: ファイルサイズ検証 — truncate で SIGBUS を防ぐ
         let file_size = file.metadata()?.len();
         Self::validate_file_size(&file, file_size)?;
@@ -2690,6 +2708,117 @@ impl Engine {
     /// ヘッダを先読みして、ファイルサイズが layout.total_size 以上かチェックする。
     /// 以下だったら truncate されている → mmap すると OOB アクセスで SIGBUS 直行。
     #[cfg(not(target_arch = "wasm32"))]
+    /// v8 以前の DB に **v9 領域を生やす** in-place migration。
+    ///
+    /// # なぜ自動か
+    ///
+    /// 版数 (= その cell がいつ書かれたか) を持たない DB は、 LWW の判定材料が
+    /// 無いので #154 / #160 の穴を抱えたままになり、 anti-entropy (Phase 2) も
+    /// 効かない。 だが v9 領域は **variable cluster の末尾**にあり、 それより手前の
+    /// region offset は `cell_version` の真偽で 1 byte も変わらない (request17
+    /// step 1 の設計)。 つまり移行は **ファイルを末尾に伸ばして header の flag を
+    /// 立てるだけ**で済み、 データの移動が一切要らない。
+    ///
+    /// それなら consumer に手動 migration を強いる理由が無いので、 writer open で
+    /// 自動的に行う。 #123 の vocab index migration (`VIX2` 検出 → in-place) と
+    /// 同じ方針。
+    ///
+    /// # 何が起きて、 何が起きないか
+    ///
+    /// 移行直後は **全 cell の版数が ZERO (= 版数不明)**。 A-1 の定義どおり
+    /// 「不明 = 現状維持 = 何でも受け入れる」 なので、 **移行しただけで過去の
+    /// 巻き戻りが直るわけではない**。 各 cell が一度書かれて初めて版数が入り、
+    /// そこから守られる。 移行は 「修正を有効化する」 ものであって
+    /// 「過去に遡って直す」 ものではない。
+    ///
+    /// ただし **削除の記録だけは移行直後から効く**: `.eidmap` sidecar が foreign
+    /// entity の tombstone HLC を既に永続化しており、 その読み込み
+    /// (`open_internal` 内、 本関数より後) が `set_tombstone_local` を通るので、
+    /// 生えたばかりの tombstone column に自動で載る。
+    ///
+    /// version column の header 初期化は不要 — `ver_column_from_region` が
+    /// `value_size` を覗いて未初期化なら `Column::init` する (lazy)。
+    ///
+    /// # 戻り値
+    ///
+    /// 移行したなら `Ok(true)`。 既に v9 / readonly / memory backing なら
+    /// `Ok(false)` (no-op)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn migrate_v8_to_v9_in_place(file: &std::fs::File, file_size: u64) -> io::Result<bool> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        if file_size < HEADER_SIZE as u64 {
+            return Ok(false); // 破損は validate_file_size が弾く
+        }
+        let mut f = file.try_clone()?;
+        f.seek(SeekFrom::Start(0))?;
+        let mut buf = [0u8; HEADER_SIZE];
+        f.read_exact(&mut buf)?;
+
+        if buf[H_MAGIC..H_MAGIC + 4] != FILE_MAGIC {
+            return Ok(false);
+        }
+        // 既に v9 領域を持っているなら何もしない (冪等)。
+        if u32::from_le_bytes(buf[H_CELL_VERSION..H_CELL_VERSION + 4].try_into().unwrap()) != 0 {
+            return Ok(false);
+        }
+        // header が壊れている DB を掴んで layout を計算すると危ないので、 CRC と
+        // field sanity を先に通す。 落ちたら移行せず、 通常の open path のエラーに
+        // 任せる (= ここで新しい失敗モードを作らない)。
+        if verify_header_crc(&buf).is_err() {
+            return Ok(false);
+        }
+        let max_entities = u32::from_le_bytes(buf[H_MAX_ENTITIES..H_MAX_ENTITIES + 4].try_into().unwrap());
+        let max_himos = u32::from_le_bytes(buf[H_MAX_HIMOS..H_MAX_HIMOS + 4].try_into().unwrap());
+        let himo_count = u32::from_le_bytes(buf[H_HIMO_COUNT..H_HIMO_COUNT + 4].try_into().unwrap());
+        let vocab_max_entries = u32::from_le_bytes(buf[H_VOCAB_MAX_ENTRIES..H_VOCAB_MAX_ENTRIES + 4].try_into().unwrap());
+        let vocab_index_cap = u32::from_le_bytes(buf[H_VOCAB_INDEX_CAP..H_VOCAB_INDEX_CAP + 4].try_into().unwrap());
+        let vocab_data_size = u64::from_le_bytes(buf[H_VOCAB_DATA_SIZE..H_VOCAB_DATA_SIZE + 8].try_into().unwrap()) as usize;
+        let himoreg_max_entries = u32::from_le_bytes(buf[H_HIMOREG_MAX_ENTRIES..H_HIMOREG_MAX_ENTRIES + 4].try_into().unwrap());
+        let himoreg_index_cap = u32::from_le_bytes(buf[H_HIMOREG_INDEX_CAP..H_HIMOREG_INDEX_CAP + 4].try_into().unwrap());
+        let himoreg_data_size = u64::from_le_bytes(buf[H_HIMOREG_DATA_SIZE..H_HIMOREG_DATA_SIZE + 8].try_into().unwrap()) as usize;
+        let content_data_size = u64::from_le_bytes(buf[H_CONTENT_DATA_SIZE..H_CONTENT_DATA_SIZE + 8].try_into().unwrap()) as usize;
+        let cyl_max_values = u32::from_le_bytes(buf[H_CYL_MAX_VALUES..H_CYL_MAX_VALUES + 4].try_into().unwrap());
+        let leaf_data_size = u64::from_le_bytes(buf[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8].try_into().unwrap()) as usize;
+        if sanity_check_header_fields(
+            max_himos, himo_count,
+            vocab_max_entries, vocab_index_cap, vocab_data_size,
+            himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
+            content_data_size,
+        )
+        .is_err()
+        {
+            return Ok(false);
+        }
+
+        // v9 込みの layout。 手前の region offset は pre-v9 と完全に一致するので、
+        // 差は末尾に付く v9 領域ぶんだけ。
+        let Ok(v9) = Layout::try_from_params(
+            max_entities, max_himos,
+            vocab_max_entries, vocab_index_cap, vocab_data_size,
+            himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
+            content_data_size, leaf_data_size, cyl_max_values,
+            true,
+        ) else {
+            return Ok(false);
+        };
+
+        // 順序が重要: **先にファイルを伸ばしてから flag を立てる**。 逆にすると、
+        // flag だけ立って領域が無い状態で crash した DB が残り、 次の open が
+        // v9 layout を期待して file 末尾の外を触る (= SIGBUS / truncation error)。
+        // 伸ばすだけなら中断しても 「末尾に穴が増えた v8 DB」 にしかならず無害。
+        if (v9.total_size as u64) > file_size {
+            file.set_len(v9.total_size as u64)?;
+            file.sync_all()?;
+        }
+
+        buf[H_CELL_VERSION..H_CELL_VERSION + 4].copy_from_slice(&1u32.to_le_bytes());
+        write_header_crc(&mut buf);
+        f.seek(SeekFrom::Start(0))?;
+        f.write_all(&buf)?;
+        f.sync_all()?;
+        Ok(true)
+    }
+
     fn validate_file_size(file: &std::fs::File, file_size: u64) -> io::Result<()> {
         use std::io::{Read, Seek, SeekFrom};
         if file_size < HEADER_SIZE as u64 {
@@ -10142,10 +10271,21 @@ mod cell_version_tests {
         assert_eq!(eng.get(eids[0], "age"), Some(999));
     }
 
-    /// pre-v9 DB を v9 binary で開いて (a) 開ける (b) 既存データが読める
-    /// (c) 版数不明として従来どおり適用される (A-1 の「migration 不要」)。
+    /// pre-v9 DB を v9 binary で **writer open すると v9 領域が生える** (自動 migration)。
+    /// 確認するのは (a) 開ける (b) 既存データが無傷 (c) 既存 cell は版数不明のままなので
+    /// 従来どおり remote record を受け入れる。
+    ///
+    /// **仕様変更の記録**: 0.19.0 までは 「開いても migrate しない」 が方針で、 この test は
+    /// `!has_cell_version()` を固定していた。 だが版数を持たない DB は #154 / #160 の穴を
+    /// 抱えたままで anti-entropy (Phase 2) も効かず、 「新機能の恩恵を受けられない DB が
+    /// 永久に残る」 のは DB として筋が悪い。 v9 領域は layout 末尾で手前を 1 byte も
+    /// 動かさないため移行が in-place で済むので、 自動化する判断に変えた。
+    ///
+    /// A-1 (「版数不明 = 現状維持」) は **cell の粒度では維持されている** — 移行しても
+    /// 既存 cell の版数は ZERO のままで、 古い record を弾いたりしない。 変わったのは
+    /// 「領域を生やすかどうか」 だけ。
     #[test]
-    fn pre_v9_db_opens_and_behaves_as_before() {
+    fn pre_v9_db_opens_and_migrates_without_touching_the_data() {
         let path = tmp("prev9_reopen");
         let (eid, hid) = {
             let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
@@ -10158,9 +10298,13 @@ mod cell_version_tests {
         };
 
         let eng = Engine::open_standalone(&path).unwrap();
-        assert!(!eng.has_cell_version(), "pre-v9 DB に v9 領域が生えた (勝手に migrate した)");
-        assert_eq!(eng.get(eid, "age"), Some(7), "既存データが読めない");
-        assert_eq!(eng.cell_hlc(eid, hid), Hlc::ZERO, "持てないはずの版数を返した");
+        assert!(eng.has_cell_version(), "writer open で v9 領域が生えていない");
+        assert_eq!(eng.get(eid, "age"), Some(7), "移行で既存データが壊れた");
+        assert_eq!(
+            eng.cell_hlc(eid, hid),
+            Hlc::ZERO,
+            "移行しただけの cell に版数が付いた (A-1: 版数不明のままであるべき)",
+        );
         // 版数不明なので remote record は従来どおり適用される
         assert!(
             eng.remote_tie_apply(eid, hid, 9, hlc(400, 7), None),
