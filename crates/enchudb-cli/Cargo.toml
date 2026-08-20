@@ -1,6 +1,6 @@
 [package]
 name = "enchudb-cli"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2024"
 rust-version = "1.89"   # std::fs::File::lock (#133 Windows 対応)
 description = "EnchuDB CLI — sqlite3 風 REPL で engine を直接叩く。 query_lang 構文 (`age:30 | count` 等) と dot command (`.himos`, `.dump`) のみ、 SQL を経由しない。"

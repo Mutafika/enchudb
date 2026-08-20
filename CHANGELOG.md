@@ -3,6 +3,91 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.20.0 — 2026-08-21
+
+**v8 以前の DB を writer open したときに、 自動で v9 領域を生やすようにした。** 手動作業は
+不要。 0.19.0 で 「migration 不要」 としていた方針を **明示的に翻す**変更で、 既存 DB の
+on-disk 状態が変わるため minor bump。
+
+### なぜ方針を変えたか
+
+0.19.0 の 「migration 不要」 は 「古い DB もそのまま動く」 という意味では正しかった。 だが版数
+(= その cell がいつ書かれたか) を持たない DB は:
+
+- LWW の判定材料が無いので **#154 / #160 の巻き戻りを抱えたまま**
+- **anti-entropy (Phase 2) が効かない** — digest に載せる HLC が無い
+
+つまり 「新機能の恩恵を受けられない DB が永久に残る」 構図だった。 DB としてデータを持って
+いけないのは筋が悪いので、 自動移行に切り替えた。
+
+### なぜ自動でよいか — 移行がほぼタダだから
+
+request17 step 1 で **v9 領域を variable cluster の末尾に置き、 手前の region を 1 byte も
+動かさない**設計にしてあった。 `cell_version` の真偽で変わるのは末尾に付く領域だけなので、
+移行は:
+
+1. ファイルを新しい `total_size` まで `ftruncate` で伸ばす
+2. `H_CELL_VERSION = 1` を書いて header CRC を貼り直す
+
+**データの移動が一切無い。** 100 GB の DB でもミリ秒。 version column の header 初期化すら
+不要 (`ver_column_from_region` が lazy に `Column::init` する)。 #123 の vocab index migration
+(`VIX2` 検出 → in-place、 「手動作業は不要」) と同じ方針。
+
+### ⚠️ 移行しただけでは過去の巻き戻りは直らない
+
+移行直後は **全 cell の版数が ZERO (= 版数不明)**。 A-1 の定義どおり 「不明 = 現状維持 =
+何でも受け入れる」 なので、 各 cell が一度書かれて初めて版数が入り、 そこから守られる。
+
+**移行は 「修正を有効化する」 ものであって 「過去に遡って直す」 ものではない。**
+誤読されると危ないので test で明示的に固定してある
+(`migration_alone_does_not_retroactively_protect_existing_cells`)。
+
+**例外は削除の記録**: `.eidmap` sidecar が foreign entity の tombstone HLC を既に永続化して
+おり、 その読み込みが `set_tombstone_local` を通るので、 生えたばかりの tombstone column に
+自動で載る。 版数と違って移行前の情報が残っている唯一の軸なので、 ここだけは移行直後から
+効く。
+
+### ⚠️ apparent size が ~3.6 倍になる
+
+開いた瞬間にファイルが伸びる (既定 capacity で 24 GB → 85 GB 相当)。 **物理消費は変わらない**
+(sparse) が:
+
+- `ls -l` の数字は跳ねる
+- apparent で数えるバックアップツール (`--sparse` 無しの `rsync` / Time Machine) には効く
+- **#167 (ディスク満杯 = SIGBUS) と組み合わさると危険**。 伸ばせなかった場合は warn を出して
+  v8 のまま開くが、 **伸ばせた後に書き込みで埋まると SIGBUS**
+
+0.19.0 の README に書いた 「空きは apparent size ぶんを見込むこと」 がそのまま効く。
+DB を copy する必要がある場合は `enchudb_engine::copy_sparse` を使うこと。
+
+### 実装ノート
+
+- **mmap を張る前**に実行する (ファイルを伸ばすので、 先に map すると古いサイズで固定される)
+- **先にファイルを伸ばしてから flag を立てる**。 逆順だと 「flag だけ立って領域が無い」 DB が
+  crash で残り、 次の open が file 末尾の外を触る。 伸ばすだけなら中断しても 「末尾に穴が
+  増えた v8 DB」 にしかならず無害
+- **readonly open は移行しない** (共有 mmap を書かない契約)。 readonly consumer から見える
+  DB は writer が一度開くまで v8 のまま
+- header CRC / field sanity が通らない DB は移行せず素通しする (ここで新しい失敗モードを
+  作らない)。 移行自体が失敗しても warn を出して v8 のまま開く
+
+### Changed
+
+- `pre_v9_db_opens_and_behaves_as_before` → `pre_v9_db_opens_and_migrates_without_touching_the_data`
+  に書き直し。 A-1 は **cell の粒度では維持**されている (移行しても既存 cell の版数は ZERO の
+  ままで古い record を弾かない)。 変わったのは 「領域を生やすかどうか」 だけ
+
+### 検証
+
+回帰テスト 7 本。 falsify 2 通り:
+
+| 無効化したもの | 結果 |
+|---|---|
+| migration 呼び | 3 本 FAILED |
+| ファイルを伸ばす処理 (= flag だけ立てる) | 4 本 FAILED — **open 自体が失敗** (= 順序の担保が効いている) |
+
+5 crate 全 green (exit 0 / 85 binary)、 clippy 新規指摘なし、 Windows target の cfg エラーなし。
+
 ## 0.19.0 — 2026-08-17
 
 **LWW の真実を、 配送バッファ依存の揮発 HashMap から storage へ移した (request17 Phase 1)。**
