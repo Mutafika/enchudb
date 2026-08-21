@@ -7,7 +7,6 @@ use enchudb_oplog::oplog::DecodedOp;
 use enchudb_oplog::{eid_local, make_eid, Hlc, PeerId};
 use enchudb_sync::Syncer;
 use std::sync::Arc;
-use std::time::Duration;
 
 fn tmp_path(tag: &str) -> String {
     format!(
@@ -190,10 +189,15 @@ fn double_apply_is_idempotent_on_translator() {
     let eng_a = make_engine(&path_a, 1);
     let e_a = eng_a.entity_in("notes").unwrap();
     eng_a.tie_to(e_a, "notes.note", 42);
+    eng_a.flush_writes(); // 背景 consumer の適用を待つ決定的な barrier (sleep 依存を排除)
     eng_a.oplog_commit();
-    std::thread::sleep(Duration::from_millis(300));
     let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
     let syncer_a = Syncer::new(eng_a.clone(), transport.clone());
+    // 背景 consumer の transfer を待たずに自分で運ぶ。 sleep だけに頼ると、
+    // 遅い runner で WAL → `_sync_ops` が間に合わず publish が空を返し、
+    // 「B に record が届かない = 翻訳されない」 という **この test の主題と無関係な**
+    // 落ち方をする (CI で実際に踏んだ)。 B 側は元から明示的に呼んでいた。
+    eng_a.transfer_oplog_to_sync_ops();
     syncer_a.publish_since(Hlc::ZERO);
     let records = transport.pull(1, Hlc::ZERO);
 
@@ -231,11 +235,16 @@ fn content_sync_does_not_panic() {
     let e_a = eng_a.entity_in("notes").unwrap();
     eng_a.tie_to(e_a, "notes.note", 7);
     eng_a.content_async(e_a, "memo", b"hello");
+    eng_a.flush_writes(); // 背景 consumer の適用を待つ決定的な barrier (sleep 依存を排除)
     eng_a.oplog_commit();
-    std::thread::sleep(Duration::from_millis(300));
 
     let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
     let syncer_a = Syncer::new(eng_a.clone(), transport.clone());
+    // 背景 consumer の transfer を待たずに自分で運ぶ。 sleep だけに頼ると、
+    // 遅い runner で WAL → `_sync_ops` が間に合わず publish が空を返し、
+    // 「B に record が届かない = 翻訳されない」 という **この test の主題と無関係な**
+    // 落ち方をする (CI で実際に踏んだ)。 B 側は元から明示的に呼んでいた。
+    eng_a.transfer_oplog_to_sync_ops();
     syncer_a.publish_since(Hlc::ZERO);
     let records = transport.pull(1, Hlc::ZERO);
 
@@ -313,11 +322,16 @@ fn content_before_tie_is_buffered_then_applied() {
     let e_a = eng_a.entity_in("notes").unwrap();
     eng_a.tie_to(e_a, "notes.note", 7);
     eng_a.content_async(e_a, "memo", b"hello");
+    eng_a.flush_writes(); // 背景 consumer の適用を待つ決定的な barrier (sleep 依存を排除)
     eng_a.oplog_commit();
-    std::thread::sleep(Duration::from_millis(300));
 
     let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
     let syncer_a = Syncer::new(eng_a.clone(), transport.clone());
+    // 背景 consumer の transfer を待たずに自分で運ぶ。 sleep だけに頼ると、
+    // 遅い runner で WAL → `_sync_ops` が間に合わず publish が空を返し、
+    // 「B に record が届かない = 翻訳されない」 という **この test の主題と無関係な**
+    // 落ち方をする (CI で実際に踏んだ)。 B 側は元から明示的に呼んでいた。
+    eng_a.transfer_oplog_to_sync_ops();
     syncer_a.publish_since(Hlc::ZERO);
     let records = transport.pull(1, Hlc::ZERO);
 
@@ -453,11 +467,16 @@ fn replica_writeback_is_not_propagated() {
     let eng_a = make_engine(&path_a, 1);
     let e_a = eng_a.entity_in("notes").unwrap();
     eng_a.tie_to(e_a, "notes.note", 7);
+    eng_a.flush_writes(); // 背景 consumer の適用を待つ決定的な barrier (sleep 依存を排除)
     eng_a.oplog_commit();
-    std::thread::sleep(Duration::from_millis(300));
 
     let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
     let syncer_a = Syncer::new(eng_a.clone(), transport.clone());
+    // 背景 consumer の transfer を待たずに自分で運ぶ。 sleep だけに頼ると、
+    // 遅い runner で WAL → `_sync_ops` が間に合わず publish が空を返し、
+    // 「B に record が届かない = 翻訳されない」 という **この test の主題と無関係な**
+    // 落ち方をする (CI で実際に踏んだ)。 B 側は元から明示的に呼んでいた。
+    eng_a.transfer_oplog_to_sync_ops();
     syncer_a.publish_since(Hlc::ZERO);
 
     // B: pull して translated local を得る
@@ -471,8 +490,8 @@ fn replica_writeback_is_not_propagated() {
 
     // B がレプリカをローカル編集 → guard により bridge されないはず
     eng_b.tie_to(local_b, "notes.note", 99);
+    eng_b.flush_writes(); // 背景 consumer の適用を待つ決定的な barrier (sleep 依存を排除)
     eng_b.oplog_commit();
-    std::thread::sleep(Duration::from_millis(300));
     eng_b.transfer_oplog_to_sync_ops();
     let published = syncer_b.publish_since(Hlc::ZERO);
     let leaked: Vec<_> = transport
