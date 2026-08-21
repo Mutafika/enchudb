@@ -5054,6 +5054,18 @@ impl Engine {
         if hlc == enchudb_oplog::Hlc::ZERO {
             return true; // 版数不明 (standalone のローカル write) は従来どおり通す
         }
+        // request18: 版数の置き場を **構造的に持たない** DB (= sync tables が無く、
+        // v9 領域も無い) は判定材料が存在しない。 `store_cell_hlc` /
+        // `set_tombstone_local` が記帳を止めているので `HlcStore` は必ず空で、
+        // 下の 2 本は必ず ZERO を返す = 必ず true になる。
+        //
+        // ここで抜けることで **peer を使わない DB の write path が request17 以前と
+        // 同じ**になる (空 HashMap の lookup ×2 が消える)。 v9 領域を持つ DB
+        // (0.19/0.20 で作られた非 sync DB 含む) は載っている版数を無視しないよう
+        // 従来どおり判定に入る。
+        if !self.sync_tables_on() && !self.has_cell_version() {
+            return true;
+        }
         // 削除済み entity を古い Tie/Untie で蘇らせない (A-5)
         let tomb = self.tombstone_version_of(local);
         if tomb != enchudb_oplog::Hlc::ZERO && hlc < tomb {
@@ -10588,6 +10600,28 @@ mod cell_version_tests {
             before,
             "sync しない DB の open でファイルが伸びた",
         );
+    }
+
+    /// request18: `accepts_write` の短絡が、 **版数を持っている非 sync DB** まで
+    /// 飲み込まないこと。
+    ///
+    /// 0.19.0 / 0.20.0 は sync の有無に関わらず v9 領域を確保していたので、
+    /// 「v9 領域があり、 版数も載っているが sync tables は無い」 DB が現に存在する。
+    /// 短絡条件を `!sync_tables_on()` だけにするとその版数を無視してしまい、
+    /// 古い record を通す = 静かな巻き戻りになる。
+    #[test]
+    fn v9_db_without_sync_tables_still_honors_recorded_versions() {
+        let (eng, hid, eid) = v9_engine("v9_nosync", "age");
+        assert!(!eng.sync_tables_enabled(), "前提が崩れた: sync tables 無しのはず");
+        assert!(eng.has_cell_version(), "前提が崩れた: v9 領域ありのはず");
+
+        assert!(eng.set_cell(eid, hid, 42, hlc(200, 1)));
+        assert_eq!(eng.cell_hlc(eid, hid), hlc(200, 1), "版数が載っていない");
+        assert!(
+            !eng.set_cell(eid, hid, 9, hlc(100, 1)),
+            "版数を持つ非 sync DB で古い write が通った (accepts_write の短絡が広すぎる)",
+        );
+        assert_eq!(eng.get(eid, "age"), Some(42));
     }
 
     /// request18: sync しない DB は **揮発 `HlcStore` にも記帳しない**。
