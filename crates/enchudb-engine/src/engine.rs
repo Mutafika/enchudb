@@ -373,6 +373,23 @@ fn load_tables_from_sidecar(db_path: &str) -> io::Result<Option<Vec<TableDef>>> 
     }
 }
 
+/// request18: `.tables` sidecar に sync tables (`_sync_ops` / `_sync_peers`) が
+/// 居るか。 **mmap を張る前**に判定する必要がある (auto-migration がファイルを
+/// 伸ばすため) ので、 engine を組み立てずに sidecar を直読みする。
+///
+/// 読めない / 不在 / 破損はすべて `false` (= migration を見送る)。 見送っても版数は
+/// 揮発 `HlcStore` に落ちて従来どおり動き、 sidecar が直った次の open で自己修復する。
+#[cfg(not(target_arch = "wasm32"))]
+fn sidecar_has_sync_tables(db_path: &str) -> bool {
+    match load_tables_from_sidecar(db_path) {
+        Ok(Some(tables)) => {
+            let has = |n: &str| tables.iter().any(|t| t.name == n);
+            has("_sync_ops") && has("_sync_peers")
+        }
+        _ => false,
+    }
+}
+
 /// #9: eid 翻訳テーブルの sidecar path。 `.eidmap`。 中身は
 /// `(author_peer, foreign_local, local)` の binary 配列。 不在 (= sync してない DB
 /// や旧 DB) なら open 時に空の translator で続行 (additive、 後方互換)。
@@ -1102,9 +1119,19 @@ fn hlc_from_cell(b: &[u8]) -> enchudb_oplog::Hlc {
 /// された) region は Column header が空なので `init`、 既存 v9 DB の region は
 /// `load` する。 判定は header の value_size (offset 4..8) を覗くだけ。
 fn ver_column_from_region(region: Region, max_entities: u32) -> Column {
-    // growable backing では v9 領域は variable cluster の末尾 = 初期 commit の外。
-    // header (16B) を読む前に commit を伸ばさないと未コミット page で SIGBUS する。
-    let _ = region.ensure_committed(crate::column::HEADER_BYTES);
+    // request18: growable backing では v9 領域は variable cluster の末尾 = 初期
+    // commit の外にある。 commit は **単調 high-water** なので、 header 16B を
+    // 読むためだけに `ensure_committed` を呼ぶと手前の vocab_data / content_data /
+    // leaf_data が丸ごと commit される (100K entity の growable DB で create 直後
+    // 1.7 GB、 1M entity で 3.1 GB)。 Phase B Step 3 の lazy commit 設計が
+    // v9 で無効化されていた。
+    //
+    // まだ commit が届いていない region には **書かれた版数が存在し得ない**ので、
+    // 触らずに空 column として組み立ててよい。 header は最初の実書き込み直前に
+    // `Column::ensure_header` が書く。
+    if !region.is_committed(crate::column::HEADER_BYTES) {
+        return Column::init_lazy(region, HLC_CELL_BYTES, max_entities);
+    }
     let stored_vs = u32::from_le_bytes(region.slice()[4..8].try_into().unwrap());
     if stored_vs == HLC_CELL_BYTES {
         Column::load(region)
@@ -1769,6 +1796,11 @@ pub struct Engine {
     peer_id: std::sync::atomic::AtomicU32,
     /// v32: LWW 用に (eid, himo) → 最後の HLC を記録。
     hlc_store: std::sync::Arc<crate::hlc_store::HlcStore>,
+    /// request18: `sync_tables_enabled()` の cache。 本体は `has_reserved_table`
+    /// (= table 名の線形走査) なので write hot path から呼べない。 更新点は
+    /// `enable_sync_tables` と open 時の table 復元の 2 箇所だけ (sync tables は
+    /// 一度有効にしたら無効化できない = 単調)。
+    sync_tables_on: std::sync::atomic::AtomicBool,
     /// #9: 受信した foreign eid を自分の eid 空間の local eid に翻訳する写像。
     eid_translator: std::sync::Arc<crate::eid_translator::EidTranslator>,
     /// #166: **slot から切り離された** foreign entity の削除版数。
@@ -1948,22 +1980,39 @@ impl Engine {
         Self::create_full_with_leaf_scale_v9(
             path, max_entities, vocab_data_size, max_himos, content_data_size,
             cyl_max_values, leaf_data_size, leaf_scale,
-            // v9 (request17 step 7): per-cell version 領域を確保する。
-            true,
+            // request18: v9 領域は **sync に参加する DB だけ**が持つ。 create 時点では
+            // まだ sync tables が無いので確保しない。 `enable_sync_tables()` が
+            // 領域を生やし (`add_v9_regions_for_sync`)、 次の open で version column が
+            // 生える。 それまでの版数は揮発 `HlcStore` に置かれる (A-1 の現状維持)。
+            //
+            // 0.19.0/0.20.0 は無条件に確保していたため、 sync しない DB が
+            // apparent ×3.6 (既定 capacity で 26.5 GB → 95.5 GB) を払っていた。
+            false,
         )
     }
 
-    /// **v9 領域を持たない** DB を作る (= v8 相当の layout)。 pre-v9 DB を v9 binary で
-    /// 開く経路の回帰テスト用で、 通常の用途では使わない (`leaf_data_size = Some(0)` で
-    /// v5 相当 DB を作れるようにしてあるのと同じ趣旨)。
+    /// **v9 領域を持たない** DB を作る (= v8 相当の layout)。
     ///
-    /// この DB では版数の置き場が per-cell column ではなく揮発 `HlcStore` になる
-    /// (= 判定は同じ、 記憶がプロセス寿命)。
+    /// request18 で create の既定が v9 無しになったため、 これは
+    /// `create_with_capacity` と同じ layout を作る (後方互換の別名として残置)。
     #[cfg(not(target_arch = "wasm32"))]
     #[doc(hidden)]
     pub fn create_without_cell_version(path: &str, max_entities: u32) -> io::Result<Self> {
         Self::create_full_with_leaf_scale_v9(
             path, max_entities, None, None, None, None, None, None, false,
+        )
+    }
+
+    /// **v9 領域を持つ** DB を最初から作る。 sync する前提が create 時点で判っている
+    /// 場合と、 v9 機構そのものの test 用。
+    ///
+    /// 通常の経路は `create*` → `enable_sync_tables()` で、 そちらは領域を後から
+    /// 生やす (request18)。 これはその 1 ステップ版。
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn create_with_cell_version(path: &str, max_entities: u32) -> io::Result<Self> {
+        Self::create_full_with_leaf_scale_v9(
+            path, max_entities, None, None, None, None, None, None, true,
         )
     }
 
@@ -2104,6 +2153,7 @@ impl Engine {
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
+            sync_tables_on: std::sync::atomic::AtomicBool::new(false),
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
             foreign_tombs: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             foreign_tombs_empty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -2149,6 +2199,17 @@ impl Engine {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create_growable_with_capacity(path: &str, max_entities: u32) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
+        let layout = Layout::compute(max_entities, max_himos, DEFAULT_VOCAB_DATA_SIZE, None, None, None, None, false).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
+    }
+
+    /// `create_growable_with_capacity` の **v9 領域あり**版 (request18)。
+    /// 通常の経路は create → `enable_sync_tables()` で後から生やす。 これはその
+    /// 1 ステップ版で、 v9 機構そのものの test / sync 前提が最初から判っている場合用。
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn create_growable_with_cell_version(path: &str, max_entities: u32) -> io::Result<Self> {
+        let max_himos = DEFAULT_MAX_HIMOS;
         let layout = Layout::compute(max_entities, max_himos, DEFAULT_VOCAB_DATA_SIZE, None, None, None, None, true).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
     }
@@ -2166,7 +2227,7 @@ impl Engine {
         vocab_data_size: usize,
     ) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
-        let layout = Layout::compute(max_entities, max_himos, vocab_data_size, None, None, None, None, true).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, vocab_data_size, None, None, None, None, false).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
     }
 
@@ -2184,7 +2245,7 @@ impl Engine {
     ) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
         let vds = vocab_data_size.unwrap_or(DEFAULT_VOCAB_DATA_SIZE);
-        let layout = Layout::compute(max_entities, max_himos, vds, None, None, leaf_data_size, None, true).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, vds, None, None, leaf_data_size, None, false).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let leaf_cap = leaf_scale.cap_bytes();
         if layout.leaf_data_size as u64 > leaf_cap {
             return Err(io::Error::new(
@@ -2211,7 +2272,8 @@ impl Engine {
             Some(opts.cyl_max_values),
             opts.leaf_data_size,
             opts.vocab_max_entries, // #122
-            true,                   // v9 (request17): per-cell version 領域を確保
+            // request18: v9 領域は enable_sync_tables() が生やす (create では確保しない)
+            false,
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let leaf_cap = opts.leaf_scale.cap_bytes();
@@ -2446,6 +2508,7 @@ impl Engine {
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
+            sync_tables_on: std::sync::atomic::AtomicBool::new(false),
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
             foreign_tombs: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             foreign_tombs_empty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -2515,7 +2578,12 @@ impl Engine {
         // 固定されてしまう。 readonly は共有 mmap を書かない契約なので対象外
         // (= 旧 binary と同じく版数無しで動く)。 no-op のときは header を 1 回
         // 読むだけ。
-        if !readonly {
+        //
+        // request18: **sync tables を持つ DB だけ**が対象。 0.20.0 は無条件に
+        // v9 化していたため、 sync しない DB まで apparent ×3.6 を払っていた。
+        // ここは `enable_sync_tables` の B-lite (`add_v9_regions_for_sync`) を
+        // 取りこぼした DB (crash / 旧 binary で enable した DB) の回収路。
+        if !readonly && sidecar_has_sync_tables(path) {
             match Self::migrate_v8_to_v9_in_place(&file, file.metadata()?.len()) {
                 Ok(true) => {}
                 Ok(false) => {}
@@ -2562,6 +2630,8 @@ impl Engine {
                 );
             }
         }
+        // request18: table 定義が確定したので hot path 用 cache を張り直す。
+        eng.refresh_sync_tables_flag();
 
         // #9: eid 翻訳テーブルの sidecar 読み込み。 不在 (= sync してない / 旧 DB) なら
         // 空の translator で続行 (additive、 後方互換)。 破損は警告のみで空続行 (= 再
@@ -2817,6 +2887,58 @@ impl Engine {
         f.write_all(&buf)?;
         f.sync_all()?;
         Ok(true)
+    }
+
+    /// request18 (B-lite): sync tables を有効化した DB に **file 上の** v9 領域を生やす。
+    ///
+    /// mmap は張り替えない — ファイルを伸ばして header flag を立てるだけで、
+    /// in-memory の `layout` は pre-v9 のまま。 したがってこのセッション中の版数は
+    /// `version_of()` の fallback で揮発 `HlcStore` に置かれ (= 0.18 以前と同じ動作)、
+    /// **次に open した時**に version column が生える。
+    ///
+    /// ライブ remap を採らない理由: mmap を張り替えると全 store 構造の再構築が要り、
+    /// DB 寿命に 1 回 (ふつうは create 直後の空 DB) しか呼ばれない API に対して割に
+    /// 合わない。 ファイルを **伸ばす**だけなら自 process の mapping も、 oboro の
+    /// ような別 process の readonly mapping も無効化しない (縮めると SIGBUS するので
+    /// demote は絶対にやらない)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn add_v9_regions_for_sync(&mut self) -> io::Result<()> {
+        if self.layout.has_cell_version() {
+            return Ok(()); // 既に v9 (明示 create / migration 済み)
+        }
+        let l = &self.layout;
+        let v9 = Layout::try_from_params(
+            self.max_entities, self.max_himos,
+            l.vocab_max_entries, l.vocab_index_cap, l.vocab_data_size,
+            l.himoreg_max_entries, l.himoreg_index_cap, l.himoreg_data_size,
+            l.content_data_size, l.leaf_data_size, l.cyl_max_values,
+            true,
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+        // 順序は `migrate_v8_to_v9_in_place` と同じ — **先にファイルを伸ばしてから
+        // flag を立てる**。 逆にすると flag だけ立った DB が crash で残り、 次の open
+        // が領域の外を触る (SIGBUS / truncation error)。
+        match &self.backing {
+            Backing::Mmap(_) => {
+                let f = OpenOptions::new().read(true).write(true).open(&self.path)?;
+                if (v9.total_size as u64) > f.metadata()?.len() {
+                    f.set_len(v9.total_size as u64)?;
+                    f.sync_all()?;
+                }
+            }
+            // growable は commit が需要駆動 (単調 high-water) なので今伸ばす必要は
+            // 無い。 次の open が v9 込みの total_size で予約し直す。
+            Backing::Growable(_) => {}
+            // memory backing は永続しないので flag に意味が無い。
+            Backing::Memory(_) => return Ok(()),
+        }
+
+        let buf = self.backing.slice_mut_shared();
+        buf[H_CELL_VERSION..H_CELL_VERSION + 4].copy_from_slice(&1u32.to_le_bytes());
+        write_header_crc(buf);
+        self.backing.flush_range(0, HEADER_SIZE)?;
+        Ok(())
     }
 
     fn validate_file_size(file: &std::fs::File, file_size: u64) -> io::Result<()> {
@@ -3338,6 +3460,7 @@ impl Engine {
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
+            sync_tables_on: std::sync::atomic::AtomicBool::new(false),
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
             foreign_tombs: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             foreign_tombs_empty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -3523,6 +3646,21 @@ impl Engine {
         // watermark から lsn 採番を復元する。
         self.rehydrate_next_sync_lsn();
 
+        // request18: ここが 「この DB は sync に参加する」 と確定する唯一の点。
+        // v9 領域 (per-cell version column + tombstone column) はこれ以降に意味を
+        // 持つので、 ここで file 上に生やす。 失敗しても enable 自体は成功扱いに
+        // する — 版数は `HlcStore` fallback で従来どおり動き、 次の writer open の
+        // auto-migration が回収する。
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Err(e) = self.add_v9_regions_for_sync() {
+            eprintln!(
+                "[enchudb] warning: failed to add v9 cell-version regions on enable_sync_tables \
+                 (versions stay in-memory until the next open): {}",
+                e
+            );
+        }
+        self.refresh_sync_tables_flag();
+
         Ok(())
     }
 
@@ -3565,6 +3703,21 @@ impl Engine {
     #[inline]
     pub fn sync_tables_enabled(&self) -> bool {
         self.has_reserved_table("_sync_ops") && self.has_reserved_table("_sync_peers")
+    }
+
+    /// request18: `sync_tables_enabled()` の cache 版。 中身は
+    /// `has_reserved_table` の線形走査なので、 **write hot path からはこちらを
+    /// 使う**こと。 cache は `refresh_sync_tables_flag` で更新する。
+    #[inline]
+    pub(crate) fn sync_tables_on(&self) -> bool {
+        self.sync_tables_on.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// request18: `sync_tables_on` cache を実体から引き直す。 呼ぶのは
+    /// `enable_sync_tables` の末尾と、 open で table 定義を復元し終えた直後。
+    pub(crate) fn refresh_sync_tables_flag(&self) {
+        self.sync_tables_on
+            .store(self.sync_tables_enabled(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 0.7.0 (Phase 4): oplog の `sync_ops_offset` 以降の record を `_sync_ops`
@@ -4933,14 +5086,74 @@ impl Engine {
             Some(col) => {
                 // growable backing: 未コミット page への書き込みは SIGBUS。
                 let _ = col.ensure_committed_for(local);
+                // request18: `init_lazy` で作られた column はここで header を確定する。
+                col.ensure_header();
                 col.ensure_count(local);
                 col.set(local, &hlc_to_cell(hlc));
             }
             // pre-v9: 揮発 HlcStore に置く (= 従来 sync.rs がやっていたこと)。
             // 版数の置き場が違うだけで、 判定は `accepts_write` の 1 本のまま。
+            //
+            // request18: **sync しない DB では記帳しない**。 `HlcStore` は上限の無い
+            // HashMap で、 版数を使う相手 (remote record の LWW 判定) が居ないまま
+            // 書き続けると 1 M cell で ~40 MB の純粋な漏れになる。 sync tables を
+            // 有効化した直後 (v9 領域はできたが column はまだ生えていない) の窓では
+            // `sync_tables_on()` が true なので従来どおり記帳される。
             None => {
+                if !self.sync_tables_on() {
+                    return;
+                }
                 self.hlc_store.try_set(self.version_key(local), himo_id, hlc);
             }
+        }
+    }
+
+    /// request18: v9 領域はあるが **まだ 1 つも版数が載っていない** 状態か。
+    ///
+    /// `enable_sync_tables()` の窓 (= 領域は生えたが column はまだで、 版数が揮発
+    /// `HlcStore` にしか無かったセッション) を経て初めて open した DB がこれに当たる。
+    /// 揮発 store はプロセスと共に消えているので、 このときだけは配送バッファ
+    /// (`_sync_ops`) からの hydrate が唯一の復元手段になる。
+    ///
+    /// 一度でも版数が載った DB では false になり、 hydrate は二度と走らない
+    /// (request17 step 6 の 「v9 では hydrate しない」 を実質維持する)。
+    pub fn cell_versions_are_empty(&self) -> bool {
+        self.has_cell_version()
+            && self.tomb_col.as_ref().is_none_or(|c| c.count() == 0)
+            && self.ver_cols.iter().all(|c| c.count() == 0)
+    }
+
+    /// request18: 版数の **再構築** (`Syncer::hydrate_hlc_store`) 用の入口。
+    ///
+    /// 置き場 (v9 version column / tombstone column / 揮発 `HlcStore`) の選択は
+    /// `store_cell_hlc` と同じ判断に委ね、 既に載っている版数より新しいときだけ書く
+    /// (monotone-max)。 `himo_id` は hydrate 側の sentinel をそのまま受ける:
+    ///
+    /// - `u16::MAX` = entity の削除版数 → tombstone column
+    /// - `0x8000 | key_hash` = Content key → column を持たないので `HlcStore`
+    ///
+    /// **なぜ要るか**: `enable_sync_tables()` の窓 (= v9 領域は生えたが column は
+    /// 次の open から、 という 1 セッション) で書かれた版数は揮発 `HlcStore` に
+    /// しか無い。 次の open で column が生えると `version_of` は column しか見なく
+    /// なるので、 hydrate が `HlcStore` へ書いても読まれない = 陳腐 record の再 apply
+    /// (#154 の再来) になる。 hydrate をこの 1 本に通すことで、 復元先が常に
+    /// 「その DB が今使っている置き場」 に揃う。
+    pub fn remember_version(
+        &self,
+        eid: enchudb_oplog::EntityId,
+        himo_id: u16,
+        hlc: enchudb_oplog::Hlc,
+    ) {
+        let local = enchudb_oplog::eid_local(eid);
+        if hlc == enchudb_oplog::Hlc::ZERO || local >= self.max_entities {
+            return;
+        }
+        if himo_id == u16::MAX {
+            self.set_tombstone_local(local, hlc); // 内部で monotone-max
+            return;
+        }
+        if Self::accepts_hlc(self.version_of(local, himo_id), hlc) {
+            self.store_cell_hlc(local, himo_id, hlc);
         }
     }
 
@@ -5176,11 +5389,17 @@ impl Engine {
         match self.tomb_col.as_ref() {
             Some(col) => {
                 let _ = col.ensure_committed_for(local);
+                // request18: `init_lazy` で作られた column はここで header を確定する。
+                col.ensure_header();
                 col.ensure_count(local);
                 col.set(local, &hlc_to_cell(hlc));
             }
             // pre-v9: 従来どおり揮発 HlcStore の sentinel himo に置く。
+            // request18: sync しない DB では記帳しない (`store_cell_hlc` と同じ理由)。
             None => {
+                if !self.sync_tables_on() {
+                    return true;
+                }
                 self.hlc_store.try_set(self.version_key(local), u16::MAX, hlc);
             }
         }
@@ -9826,9 +10045,24 @@ mod cell_version_tests {
         Hlc { wall, logical: 0, peer }
     }
 
+    /// request18: header の `H_CELL_VERSION` flag を落として 「v9 化を取りこぼした
+    /// DB」 を作る。 `enable_sync_tables` の B-lite が crash / 旧 binary で走らなかった
+    /// ケースの再現で、 open 側の回収路 (sidecar-gated auto-migration) を試すのに使う。
+    fn clear_cell_version_flag(path: &str) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+        let mut buf = [0u8; HEADER_SIZE];
+        f.read_exact(&mut buf).unwrap();
+        buf[H_CELL_VERSION..H_CELL_VERSION + 4].copy_from_slice(&0u32.to_le_bytes());
+        write_header_crc(&mut buf);
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(&buf).unwrap();
+        f.sync_all().unwrap();
+    }
+
     /// v9 DB + himo 1 本 + entity 1 つ。
     fn v9_engine(name: &str, himo: &str) -> (Engine, u16, enchudb_oplog::EntityId) {
-        let mut eng = Engine::create_with_capacity(&tmp(name), 1024).unwrap();
+        let mut eng = Engine::create_with_cell_version(&tmp(name), 1024).unwrap();
         eng.define_himo(himo, ValueType::Number, 0);
         let hid = eng.himo_id(himo).unwrap() as u16;
         let eid = eng.entity();
@@ -9914,12 +10148,21 @@ mod cell_version_tests {
     ///
     /// 判定の入口は v9 と同じ `set_cell` 1 本で、 違うのは置き場だけ:
     /// 永続の column が無いので `cell_hlc` は ZERO のまま、 プロセスを跨ぐと忘れる。
+    ///
+    /// request18: この fallback が働くのは **sync tables を持つ DB だけ**。
+    /// ここで再現しているのは 「`enable_sync_tables()` を呼んだが、 v9 column が
+    /// 生えるのは次の open から」 という窓のセッション。 sync しない DB では
+    /// 記帳自体を止める (`hlc_store` の無制限成長を作らない) ので、
+    /// `no_sync_db_does_not_record_versions_at_all` が別に押さえている。
     #[test]
     fn pre_v9_db_falls_back_to_volatile_versions() {
         let mut eng = Engine::create_without_cell_version(&tmp("prev9_write"), 1024).unwrap();
         eng.define_himo("age", ValueType::Number, 0);
         let hid = eng.himo_id("age").unwrap() as u16;
         let eid = eng.entity();
+        // sync tables を足すと anonymous table が closed になるので entity() の後で呼ぶ。
+        eng.enable_sync_tables().unwrap();
+        assert!(!eng.has_cell_version(), "前提が崩れた: 窓のセッションは pre-v9 layout のまま");
 
         assert!(eng.set_cell(eid, hid, 1, hlc(200, 1)));
         assert!(!eng.set_cell(eid, hid, 2, hlc(100, 1)), "古い HLC を採用した");
@@ -9982,7 +10225,7 @@ mod cell_version_tests {
     /// 最後の 3 assert が落ちる。
     #[test]
     fn reused_table_slot_does_not_inherit_previous_tenant_version() {
-        let mut eng = Engine::create_with_capacity(&tmp("slot_reuse_table"), 1024).unwrap();
+        let mut eng = Engine::create_with_cell_version(&tmp("slot_reuse_table"), 1024).unwrap();
         eng.define_himo("age", ValueType::Number, 0);
         let hid = eng.himo_id("age").unwrap() as u16;
         // slot 1 個だけの table → 2 個目の entity_in は必ず再利用に落ちる
@@ -10014,7 +10257,7 @@ mod cell_version_tests {
     /// こちらは eid 空間を使い切った時だけ再利用に落ちる。
     #[test]
     fn reused_entity_set_slot_does_not_inherit_previous_tenant_version() {
-        let mut eng = Engine::create_with_capacity(&tmp("slot_reuse_anon"), 2).unwrap();
+        let mut eng = Engine::create_with_cell_version(&tmp("slot_reuse_anon"), 2).unwrap();
         eng.define_himo("age", ValueType::Number, 0);
         let hid = eng.himo_id("age").unwrap() as u16;
 
@@ -10080,7 +10323,7 @@ mod cell_version_tests {
     fn v9_with_wal(name: &str, himo: &str) -> (std::sync::Arc<Engine>, u16) {
         let path = tmp(name);
         let _ = std::fs::remove_file(format!("{path}.wal"));
-        let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
+        let mut eng = Engine::create_with_cell_version(&path, 1024).unwrap();
         eng.define_himo(himo, ValueType::Number, 0);
         let hid = eng.himo_id(himo).unwrap() as u16;
         let arc = Engine::concurrentize_with_oplog(eng, 1024 * 1024).unwrap();
@@ -10210,7 +10453,7 @@ mod cell_version_tests {
     fn versions_survive_reopen() {
         let path = tmp("reopen");
         let (eid, other, hid) = {
-            let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
+            let mut eng = Engine::create_with_cell_version(&path, 1024).unwrap();
             eng.define_himo("age", ValueType::Number, 0);
             let hid = eng.himo_id("age").unwrap() as u16;
             let eid = eng.entity();
@@ -10249,7 +10492,7 @@ mod cell_version_tests {
     fn growable_backing_writes_versions_without_sigbus() {
         let path = tmp("growable_v9");
         let _ = std::fs::remove_file(format!("{path}.wal"));
-        let mut eng = Engine::create_growable_with_capacity(&path, 100_000).unwrap();
+        let mut eng = Engine::create_growable_with_cell_version(&path, 100_000).unwrap();
         eng.define_himo("age", ValueType::Number, 0);
         let hid = eng.himo_id("age").unwrap() as u16;
         let eng = Engine::concurrentize_with_oplog(eng, 1024 * 1024).unwrap();
@@ -10271,21 +10514,27 @@ mod cell_version_tests {
         assert_eq!(eng.get(eids[0], "age"), Some(999));
     }
 
-    /// pre-v9 DB を v9 binary で **writer open すると v9 領域が生える** (自動 migration)。
+    /// pre-v9 の **sync DB** を writer open すると v9 領域が生える (自動 migration)。
     /// 確認するのは (a) 開ける (b) 既存データが無傷 (c) 既存 cell は版数不明のままなので
     /// 従来どおり remote record を受け入れる。
     ///
-    /// **仕様変更の記録**: 0.19.0 までは 「開いても migrate しない」 が方針で、 この test は
-    /// `!has_cell_version()` を固定していた。 だが版数を持たない DB は #154 / #160 の穴を
-    /// 抱えたままで anti-entropy (Phase 2) も効かず、 「新機能の恩恵を受けられない DB が
-    /// 永久に残る」 のは DB として筋が悪い。 v9 領域は layout 末尾で手前を 1 byte も
-    /// 動かさないため移行が in-place で済むので、 自動化する判断に変えた。
+    /// **仕様変更の記録 (その 1、 0.20.0)**: 0.19.0 までは 「開いても migrate しない」 が
+    /// 方針だった。 だが版数を持たない DB は #154 / #160 の穴を抱えたままで anti-entropy
+    /// (Phase 2) も効かず、 「新機能の恩恵を受けられない DB が永久に残る」 のは DB として
+    /// 筋が悪い。 v9 領域は layout 末尾で手前を 1 byte も動かさないため移行が in-place で
+    /// 済むので、 自動化する判断に変えた。
+    ///
+    /// **仕様変更の記録 (その 2、 request18 / 0.21.0)**: 0.20.0 は **無条件に** v9 化して
+    /// いたため、 sync しない DB まで apparent ×3.6 (既定 capacity で 26.5 GB → 95.5 GB) を
+    /// 払っていた。 版数・tombstone は remote record の LWW 判定にしか使わず、 それは
+    /// `Syncer` 経由でしか起きない (`Syncer::new` が `sync_tables_enabled()` を必須
+    /// チェックする) ので、 **sync tables を持つ DB だけ**を対象に絞った。
     ///
     /// A-1 (「版数不明 = 現状維持」) は **cell の粒度では維持されている** — 移行しても
     /// 既存 cell の版数は ZERO のままで、 古い record を弾いたりしない。 変わったのは
     /// 「領域を生やすかどうか」 だけ。
     #[test]
-    fn pre_v9_db_opens_and_migrates_without_touching_the_data() {
+    fn pre_v9_sync_db_opens_and_migrates_without_touching_the_data() {
         let path = tmp("prev9_reopen");
         let (eid, hid) = {
             let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
@@ -10293,12 +10542,17 @@ mod cell_version_tests {
             let hid = eng.himo_id("age").unwrap() as u16;
             let eid = eng.entity();
             eng.tie_to(eid, "age", 7);
+            // sync DB にする。 `enable_sync_tables` 自身も file を伸ばして header flag を
+            // 立てる (B-lite) が、 ここで確かめたいのは **open 側の回収路**なので
+            // 意図的に flag を落として 「B-lite を取りこぼした DB」 を作る。
+            eng.enable_sync_tables().unwrap();
             eng.flush().unwrap();
             (eid, hid)
         };
+        clear_cell_version_flag(&path);
 
         let eng = Engine::open_standalone(&path).unwrap();
-        assert!(eng.has_cell_version(), "writer open で v9 領域が生えていない");
+        assert!(eng.has_cell_version(), "sync DB の writer open で v9 領域が生えていない");
         assert_eq!(eng.get(eid, "age"), Some(7), "移行で既存データが壊れた");
         assert_eq!(
             eng.cell_hlc(eid, hid),
@@ -10311,6 +10565,46 @@ mod cell_version_tests {
             "版数不明 cell への remote apply を止めた (既存 DB が同期不能になる)",
         );
         assert_eq!(eng.get(eid, "age"), Some(9));
+    }
+
+    /// request18 の主眼: **sync しない DB は writer open しても v9 化されない**。
+    /// 0.20.0 はここで無条件に領域を生やしていた。
+    #[test]
+    fn plain_db_is_not_migrated_on_open() {
+        let path = tmp("plain_no_migrate");
+        {
+            let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
+            eng.define_himo("age", ValueType::Number, 0);
+            let eid = eng.entity();
+            eng.tie_to(eid, "age", 7);
+            eng.flush().unwrap();
+        }
+        let before = std::fs::metadata(&path).unwrap().len();
+        let eng = Engine::open_standalone(&path).unwrap();
+        assert!(!eng.has_cell_version(), "sync しない DB が v9 化された");
+        drop(eng);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            before,
+            "sync しない DB の open でファイルが伸びた",
+        );
+    }
+
+    /// request18: sync しない DB は **揮発 `HlcStore` にも記帳しない**。
+    /// 記帳しても読む相手が居らず、 上限の無い HashMap が漏れるだけ。
+    #[test]
+    fn no_sync_db_does_not_record_versions_at_all() {
+        let mut eng = Engine::create_without_cell_version(&tmp("nosync_nostore"), 1024).unwrap();
+        eng.define_himo("age", ValueType::Number, 0);
+        let hid = eng.himo_id("age").unwrap() as u16;
+        let eid = eng.entity();
+
+        assert!(eng.set_cell(eid, hid, 1, hlc(200, 1)));
+        assert!(eng.set_tombstone(eid, hlc(400, 1)));
+        assert_eq!(eng.hlc_store().len(), 0, "sync しない DB が版数を記帳した");
+        // 記帳しない = 判定材料が無い = 従来どおり全部通る (A-1 の現状維持)
+        assert!(eng.set_cell(eid, hid, 2, hlc(100, 1)));
+        assert_eq!(eng.get(eid, "age"), Some(2));
     }
 
     // ──── step 5: remote apply も同じ 1 本を通る ────
@@ -10394,7 +10688,7 @@ mod cell_version_tests {
     fn wal_hlcs_are_monotonic_in_record_order() {
         let path = tmp("wal_monotonic");
         let _ = std::fs::remove_file(format!("{path}.wal"));
-        let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
+        let mut eng = Engine::create_with_cell_version(&path, 1024).unwrap();
         eng.define_himo("age", ValueType::Number, 0);
         eng.define_himo("name", ValueType::Tag, 0);
         let eng = Engine::concurrentize_with_oplog(eng, 1024 * 1024).unwrap();

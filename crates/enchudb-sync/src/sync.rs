@@ -158,7 +158,14 @@ impl Syncer {
         // pre-v9 DB (v8 以前で作られ、 migration していない DB) は版数の置き場が
         // 揮発 `HlcStore` のままなので、 従来どおり hydrate する。 pre-v9 の
         // サポートを落とす時にこの分岐ごと消える。
-        if !engine.has_cell_version() {
+        //
+        // request18: v9 DB でも **版数がまだ 1 つも載っていない**なら hydrate する。
+        // `enable_sync_tables()` の窓 (= 領域は生えたが column は次の open からで、
+        // 版数が揮発 store にしかなかったセッション) を経た DB がこれに当たり、
+        // ここで復元しないと陳腐 record が再 apply される (#154 の再来)。
+        // 一度でも版数が載れば `cell_versions_are_empty` は false になるので、
+        // 「v9 では hydrate しない」 は実質維持される。
+        if !engine.has_cell_version() || engine.cell_versions_are_empty() {
             syncer.hydrate_hlc_store(&engine);
         }
         syncer
@@ -261,22 +268,27 @@ impl Syncer {
         }) else {
             return;
         };
+        // request18: 復元先は engine に委ねる (`remember_version`)。 v9 DB なら
+        // version / tombstone column、 まだ column が無い DB なら揮発 `HlcStore`。
+        // 直接 `HlcStore` へ書くと、 v9 化した DB では `version_of` が column しか
+        // 見ないので復元が読まれず #154 が再発する。
+        let _ = store;
         match &rec.op {
             DecodedOp::Tie { himo_id, .. } | DecodedOp::Untie { himo_id, .. } => {
-                store.try_set(local_eid, *himo_id, rec.hlc);
+                engine.remember_version(local_eid, *himo_id, rec.hlc);
             }
             DecodedOp::Delete { .. } => {
-                store.try_set(local_eid, u16::MAX, rec.hlc);
+                engine.remember_version(local_eid, u16::MAX, rec.hlc);
             }
             DecodedOp::Content { key, .. } => {
                 let key_hash = enchudb_oplog::content_key_hash15(key);
-                store.try_set(local_eid, key_hash | 0x8000, rec.hlc);
+                engine.remember_version(local_eid, key_hash | 0x8000, rec.hlc);
             }
             // 0.9.0 / 0.12.0 (#88): 名前を local hid に解決できる場合のみ LWW entry を
             // 張る (未定義 = local に一度も届いていない himo は hydrate 不要)。
             DecodedOp::TieNamed { himo_name, .. } | DecodedOp::TieLeaf { himo_name, .. } => {
                 if let Some(hid) = engine.himo_id(himo_name) {
-                    store.try_set(local_eid, hid as u16, rec.hlc);
+                    engine.remember_version(local_eid, hid as u16, rec.hlc);
                 }
             }
             DecodedOp::Commit | DecodedOp::Vocab { .. } => {}

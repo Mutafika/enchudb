@@ -31,6 +31,29 @@ impl Column {
         Self { region, count: AtomicU32::new(0), value_size, max_entities }
     }
 
+    /// region を **1 byte も触らずに** 空の column を組み立てる (request18)。
+    ///
+    /// growable backing では commit が単調 high-water なので、 variable cluster
+    /// 末尾に置かれた region (v9 version column / tombstone column) の header を
+    /// 読み書きするだけで **手前の vocab_data / content_data / leaf_data が丸ごと
+    /// commit される** (100K entity の growable DB で create 直後 1.7 GB)。
+    /// header は最初の実書き込み直前に `ensure_header` が書く。
+    pub fn init_lazy(region: Region, value_size: u32, max_entities: u32) -> Self {
+        Self { region, count: AtomicU32::new(0), value_size, max_entities }
+    }
+
+    /// `init_lazy` で作った column の header を確定させる。 既に書かれていれば no-op。
+    /// 呼び側は先に `ensure_committed_for` で region 先頭を commit しておくこと。
+    #[inline]
+    pub fn ensure_header(&self) {
+        let stored = u32::from_le_bytes(self.region.slice()[4..8].try_into().unwrap());
+        if stored != self.value_size {
+            self.region.write_at(4, &self.value_size.to_le_bytes());
+            self.region.write_at(8, &self.max_entities.to_le_bytes());
+            self.region.mark_dirty(0, HEADER);
+        }
+    }
+
     pub fn load(region: Region) -> Self {
         let mm = region.slice();
         let count = u32::from_le_bytes(mm[0..4].try_into().unwrap());
