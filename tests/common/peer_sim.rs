@@ -67,6 +67,11 @@ pub fn q(himo: &str) -> String {
 pub struct Authored {
     /// author 側 (= 発行 peer) の eid。 収束判定の識別子に使う。
     pub eid: u64,
+    /// **author ローカル**の vocab id。 受信側でこの番号のまま cell に書くと
+    /// 受信側の無関係な文字列を指す (= 写像が要る理由)。
+    pub vid: u32,
+    /// 書いた文字列そのもの。 写像の照合に使う。
+    pub value: String,
     /// `(author_peer, vid) → bytes` を運ぶ record。
     pub vocab: WireRecord,
     /// cell に vid を書く record。 `vocab` 無しでは意味を持たない。
@@ -233,6 +238,8 @@ impl PeerSim {
         self.tracked.push((eid, himo.to_string()));
         Authored {
             eid,
+            vid,
+            value: value.to_string(),
             vocab: WireRecord::unsigned(
                 h_vocab,
                 peer,
@@ -257,6 +264,16 @@ impl PeerSim {
         let peer = records[0].author_peer;
         debug_assert!(records.iter().all(|r| r.author_peer == peer));
         self.transport.publish(peer, records);
+    }
+
+    /// peer `i` が `from` の vid → 自分の vid の写像を持っているか。
+    ///
+    /// `Vocab` op を適用した直後は `true`。 これが `false` に戻ると、 以降届く
+    /// `Tie` は翻訳できない。
+    pub fn has_vocab_mapping(&self, i: usize, authored: &Authored, from: u32) -> bool {
+        self.peers[i]
+            .eng()
+            .has_remote_vocab(from, authored.vid, authored.value.as_bytes())
     }
 
     /// peer `i` が peer `from` から pull する。

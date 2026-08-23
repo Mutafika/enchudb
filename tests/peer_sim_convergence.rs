@@ -73,3 +73,35 @@ fn text_converges_across_peer_restart() {
     }
     sim.assert_converged();
 }
+
+/// **根因の pin**: 消費済みの `Vocab` 写像は再起動で消えるが、 cursor は消えない。
+///
+/// `peer_vocab_map` は memory 上にしか無く、 WAL からも `_sync_ops` からも
+/// 再構築されない (`Syncer::hydrate_one` は `DecodedOp::Vocab` を捨てる)。
+/// 同種の `(peer, remote_eid) → local` 写像が `.eidmap` で sidecar 永続化
+/// されているのと非対称。
+///
+/// この非対称が消えれば `text_converges_across_peer_restart` も自然に通る。
+/// 逆に、 apply 地点で「翻訳できないなら書かない」に変えるだけでは通らない —
+/// 消えた写像は戻らないので、 cell が壊れる代わりに永久に古いままになる。
+#[test]
+fn consumed_vocab_mapping_survives_restart() {
+    let mut sim = PeerSim::new("vocabgap", 2);
+    let from_a = sim.peer_id(0);
+
+    let a = sim.author_text(0, "name", "alpha");
+    sim.deliver(vec![a.vocab.clone()]);
+    sim.pull(1, from_a);
+    assert!(
+        sim.has_vocab_mapping(1, &a, from_a),
+        "Vocab を適用した直後は写像がある"
+    );
+
+    sim.restart(1);
+
+    assert!(
+        sim.has_vocab_mapping(1, &a, from_a),
+        "再起動後も写像が残っていること — 消えると後続 Tie を翻訳できず、 \
+         cursor は Vocab を消費済みと言うので二度と再配送されない"
+    );
+}
