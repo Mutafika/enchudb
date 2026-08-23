@@ -120,6 +120,43 @@ entity が 2 つになる。
 手当て不要。 **ただし既に失われた cell は戻らない** — checkpoint が越えた record は物理的に
 残っていても scan 対象外なので、 再 author で埋め直すこと。
 
+### 翻訳できない remote vocab id を cell に書かない
+
+**翻訳できない remote の vocab id を cell に書かないようにした。** text (Tag/Leaf) の値は
+`(author_peer, remote_vid) → local_vid` の写像を通してしか意味を持たないのに、 apply 経路
+(`Syncer::apply_one` の `Tie` / `TieNamed`) は写像が無いとき **生値をそのまま書いていた**。
+
+vid は author ローカルな番号なので、 生値は受信側の**無関係な文字列**を指す。 実地
+(syncretic / mac ↔ Windows) では files table 15962 行のうち 12 行がこの経路で壊れた:
+
+| 壊れた列 | 入っていた値 |
+|---|---|
+| `path` | 別の行の PK (`"{module_id} {path}"`) |
+| `path` | mtime の 13 桁 epoch ms |
+| `size` | mtime の 13 桁 epoch ms |
+| `key` (PK) | blob の sha256 hex |
+| `module_id` | 空文字 |
+
+アプリ側はこれを信じて `outputs/win/ab7e38fa2b56d1f72ebb09f3623a91e7 myapp/kasane/…` という
+化けた名前のディレクトリを disk に作っていた。
+
+写像は受信済み `Vocab` op から組み立てる。 上の `.vocabmap` で再起動を跨いで残るようになったが、
+`_sync_ops` ring の巻き込みで `Vocab` op 自体を取り逃した場合は依然として欠けうる。 `history_floor` を広告しない
+transport では `history_truncated` も立たないので、 欠落は黙って通る。
+
+#### 変更
+
+- `Syncer::apply_one`: `Tie` / `TieNamed` の値翻訳を `try_translate_remote_vid` に変更。
+  **未翻訳なら op を適用しない**。
+- `SyncOutcome::dropped_vocab`: そうして捨てた op 数 (`ApplyResult::DroppedVocab`)。 `> 0` なら
+  当該 cell は**古いまま** (壊れてはいない)。 caller は再 author / bootstrap で埋め直す。
+  `dropped_unresolved` と**分けてある** — あちらは未知の foreign entity 宛 `Delete` などで
+  正常系でも 0 にならない背景値を持つのに対し、 こちらは**定常 0 であるべき**値なので、
+  合算すると警報の閾値が引けなくなる。
+
+黙って壊すより、 書かずに数える方を選んだ。 PK bind 経路 (#141) は 0.17.0 で既に厳密版に
+移していたので、 残っていた最後の生値 fallback がこれ。
+
 ### 0.19.0 / 0.20.0 の封印 (sync 用途)
 
 **sync に参加する DB では 0.19.0 / 0.20.0 を使わないこと。** 0.21.0 (本 release) へ上げる。
