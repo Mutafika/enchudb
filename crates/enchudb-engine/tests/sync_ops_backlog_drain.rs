@@ -26,7 +26,7 @@ fn tmp_path(tag: &str) -> String {
 }
 
 fn cleanup(path: &str) {
-    for suffix in ["", ".oplog", ".tables", ".crc", ".db.lock", ".eidmap", ".schema"] {
+    for suffix in ["", ".oplog", ".tables", ".crc", ".db.lock", ".eidmap", ".vocabmap", ".schema"] {
         let _ = std::fs::remove_file(format!("{}{}", path, suffix));
     }
 }

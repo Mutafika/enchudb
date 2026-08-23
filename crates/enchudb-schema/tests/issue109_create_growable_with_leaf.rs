@@ -21,7 +21,7 @@ fn tmp(tag: &str) -> String {
 }
 
 fn cleanup(path: &str) {
-    for suf in ["", ".tables", ".oplog", ".wal", ".crc", ".db.lock", ".eidmap", ".positions"] {
+    for suf in ["", ".tables", ".oplog", ".wal", ".crc", ".db.lock", ".eidmap", ".vocabmap", ".positions"] {
         let _ = std::fs::remove_file(format!("{path}{suf}"));
     }
 }

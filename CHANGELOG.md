@@ -3,6 +3,84 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## Unreleased
+
+**pull cursor が、 それが消費した state より先に durable になる順序違反を直した。** 併せて
+sync の写像 (`(author_peer, remote_vid) → local_vid`) に永続先を作り、 `SyncOutcome` の
+counter を「正常系の LWW skip」と「二度と来ない形で捨てた分」に分けた。
+
+### 何が壊れていたか
+
+受信 op を適用すると、 cell (mmap) のほかに 3 つの派生 state が動く:
+
+| state | 置き場 | 消えたら |
+|---|---|---|
+| `next_local` (翻訳先 slot の払い出し位置) | `.tables` | #117 が live bitmap から自己修復 |
+| `(author_peer, foreign_local) → local` の entity 写像 | `.eidmap` | **復元手段が無い** |
+| `(author_peer, remote_vid) → local_vid` の text 写像 | **どこにも無かった** | **復元手段が無い** |
+
+「復元手段が無い」のは、 **受信 op が自分の WAL に残らない**から (gossip_remote_apply が
+off なら `append_relayed` も走らない)。 一方 `Syncer` の pull cursor は disk に永続する。
+
+`pull_once` は `apply_records` → `save_cursors()` の順で、 写像の永続は caller 任せだった。
+つまり **cursor だけが先に durable になる**。 ここで落ちると 「cursor は消費済みと言うが
+写像は無い」 が確定し、 差分 pull では**二度と埋まらない** (cursor が越えているので当該
+record は再配送されない)。
+
+**caller 側では直せない** — `pull_once` が return した時点で cursor は既に落ちているため。
+
+実地の発現 (syncretic、 SIGKILL を混ぜた 2 台の soak、 6 万操作):
+
+- **相手が削除した行がこちらで生き残る** (194 件)。 写像を失うと後続の `Delete` が
+  `resolve_remote_eid_existing` で外れ、 `skipped` に紛れて cursor が越える
+- text cell に**受信側の無関係な文字列**が入る。 `Vocab` を消費した後に写像を失うと、
+  後続 `Tie` の生 vid が別の文字列を指す
+
+### 変更
+
+- **`.vocabmap` sidecar を追加**。 `.eidmap` と同格の永続先。 magic `EVCM` / v1、
+  atomic write + fsync、 不在なら空で続行 (additive、 後方互換)。 dirty のときだけ書く。
+  1 entry 12 byte、 `(peer, remote_vid)` ごとに 1 つ (= memory 上の写像と同じ増え方。
+  永続化で増加特性は変わらない)。 `snapshot_export` と HTTP bootstrap
+  (`GET /bootstrap/vocabmap`) も運ぶ — ここが抜けると restore 後に同じ穴が再発する
+- **`Engine::persist_sync_state()`**: sync 由来 state の durability barrier。
+  `body_msync()` (cell 本体) + `persist_tables()` (`.tables` / `.eidmap` / `.vocabmap`)。
+  local write 経路が既に守っていた順序 (`oplog_sync`: WAL fsync → body msync →
+  checkpoint 前進) の**受信側 counterpart**で、 pull cursor が受信側の checkpoint に当たる。
+  `persist_tables()` 自体の意味は変えていない (sidecar のみ、 `.vocabmap` が 1 つ増えただけ)
+- **`Syncer::pull_once` が barrier を内側で守る**。 適用があったら永続してから cursor を
+  進め、 **永続に失敗したら cursor を進めない** (次の pull で同じ record を再適用 —
+  apply は冪等)
+- **`SyncOutcome::dropped_unresolved`** を追加。 `skipped` は 「LWW で古いと判定した」
+  だけを数える。 合算されていると、 無視して良い LWW noise に本物の欠落が紛れる。
+  内訳は entity 写像が引けない / himo を定義できない / ref の target を解決できない。
+  一度も sync していない entity 宛の `Delete` のように**正常系でも 0 にならない**が、
+  予期しない増加は配送欠落の兆候
+- `apply_one` の戻りを `bool` から型 (`ApplyResult`) に変更 (internal)
+
+### 残っている穴 (この変更では塞いでいない)
+
+`dropped_unresolved` に数えられる中で、 **「今は無理だが後なら適用できる」**ケースは
+cursor を止めていない (= 従来どおり捨てて前進する):
+
+- **table 容量の枯渇** — `resolve_remote_eid` の slot 払い出しが失敗すると、 受信行が
+  黙って落ちる。 本来は backpressure として cursor を止めるべきだが、 `resolve_remote_eid`
+  は `Option` で理由を返さないため区別できない
+- **himo 予算の枯渇 (#118)** — こちらは枠が解放されないので、 止めると永久に進まない。
+  捨てて数えるのが正しい
+
+前者は理由を返す形に変えれば止められる。 「止めると永久に進まない」 ものと混ざっているので、
+一律に止めるのは危険。
+
+### 移行
+
+`.vocabmap` は無ければ空で始まり、 次に `Vocab` を受信した時点から積み上がる。 既存 DB に
+手当ては不要。 **ただし 「すでに消えている写像」 は戻らない** — 過去に取りこぼした cell は
+再 author / bootstrap で埋め直すこと。
+
+自前で cursor を持つ caller (WS push で `apply_records` を直接叩く等) は、 cursor を永続
+する前に `Engine::persist_sync_state()` を呼ぶこと。
+
 ## 0.20.0 — 2026-08-21
 
 **v8 以前の DB を writer open したときに、 自動で v9 領域を生やすようにした。** 手動作業は

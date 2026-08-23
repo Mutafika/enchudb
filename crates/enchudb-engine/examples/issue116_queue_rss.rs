@@ -43,7 +43,7 @@ fn env_usize(key: &str) -> Option<usize> {
 }
 
 fn cleanup(path: &str) {
-    for suf in ["", ".oplog", ".tables", ".crc", ".db.lock", ".eidmap", ".wal"] {
+    for suf in ["", ".oplog", ".tables", ".crc", ".db.lock", ".eidmap", ".vocabmap", ".wal"] {
         let _ = std::fs::remove_file(format!("{path}{suf}"));
     }
 }

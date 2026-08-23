@@ -40,14 +40,14 @@ const COL_BODY: &str = "body";
 
 fn tmp(tag: &str) -> String {
     let p = format!("/tmp/enchudb-issue140-{}-{}", tag, std::process::id());
-    for suffix in ["", ".oplog", ".crc", ".tables", ".schema", ".eidmap", ".db.lock"] {
+    for suffix in ["", ".oplog", ".crc", ".tables", ".schema", ".eidmap", ".vocabmap", ".db.lock"] {
         let _ = std::fs::remove_file(format!("{}{}", p, suffix));
     }
     p
 }
 
 fn cleanup(path: &str) {
-    for suffix in ["", ".oplog", ".crc", ".tables", ".schema", ".eidmap", ".db.lock"] {
+    for suffix in ["", ".oplog", ".crc", ".tables", ".schema", ".eidmap", ".vocabmap", ".db.lock"] {
         let _ = std::fs::remove_file(format!("{}{}", path, suffix));
     }
 }

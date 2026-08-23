@@ -240,3 +240,89 @@ fn cursor_never_outlives_the_state_it_consumed() {
         cursor
     );
 }
+
+/// **永続に失敗したら cursor を進めない** (invariant の反対側)。
+///
+/// `cursor_never_outlives_the_state_it_consumed` は `pull_once` から戻った後の
+/// disk を見るので、 barrier が `save_cursors` の前にあるか後にあるかを区別
+/// できない。 順序そのものを固定するのがこの test — 永続を失敗させたときに
+/// cursor が進んでいなければ、 barrier は cursor より前にある。
+///
+/// 失敗の作り方: sidecar の tmp path をディレクトリで塞ぐ。
+#[test]
+fn cursor_is_held_when_state_cannot_be_persisted() {
+    let mut sim = PeerSim::new("holdcursor", 2);
+    let from_b = sim.peer_id(1);
+
+    // `.eidmap` の atomic write を必ず失敗させる (tmp を open できない)。
+    let blocker = format!("{}.eidmap.tmp", sim.db_path(0));
+    std::fs::create_dir_all(&blocker).unwrap();
+
+    let b = sim.author_text(1, "name", "held");
+    sim.deliver(b.all());
+    let out = sim.pull(0, from_b);
+    eprintln!(
+        "[hold] applied={} cursor={:?}",
+        out.applied,
+        sim.persisted_cursor(0, from_b)
+    );
+    assert!(out.applied > 0, "適用自体は起きる (memory 上)");
+    assert_eq!(
+        sim.persisted_cursor(0, from_b),
+        None,
+        "state を永続できていないのに cursor が進んでいる"
+    );
+
+    // 塞ぎを外せば次の pull で同じ record が再適用され、 収束する。
+    std::fs::remove_dir(&blocker).unwrap();
+    sim.pull(0, from_b);
+    assert!(sim.persisted_cursor(0, from_b).is_some(), "回復後は cursor が進む");
+    sim.assert_converged();
+}
+
+/// `skipped` (LWW) と `dropped_unresolved` (宛先不明) が混ざらないこと。
+///
+/// 合算されていると、 無視して良い LWW noise に本物の配送欠落が紛れる。
+#[test]
+fn lww_skip_and_unresolved_drop_are_counted_separately() {
+    let mut sim = PeerSim::new("counters", 2);
+    let from_b = sim.peer_id(1);
+
+    // 一度も sync されていない foreign entity への Delete = 宛先が無い。
+    let unknown = sim.author_delete(1, enchudb_oplog::make_eid(sim.peer_id(1), 999));
+    sim.deliver(vec![unknown]);
+    let out = sim.pull(0, from_b);
+    assert_eq!(out.dropped_unresolved, 1, "宛先不明は dropped_unresolved");
+    assert_eq!(out.skipped, 0, "LWW の counter を汚さない");
+
+    // 同じ record をもう一度配っても、 cursor が越えているので届かない
+    // (= dropped は「二度と来ない」形であることの確認)。
+    let out2 = sim.pull(0, from_b);
+    assert_eq!(out2.received, 0);
+}
+
+/// **snapshot / bootstrap も text 写像を運ぶこと**。
+///
+/// `snapshot_export` は body を copy せず in-memory 状態から sidecar を直接書き出す。
+/// `.eidmap` は #78-H9 で追加済みだったが `.vocabmap` は抜けていた — restore 後に
+/// 受信済み `Vocab` の写像だけが失われ、 後続 `Tie` を翻訳できなくなる
+/// (= この branch が塞いだ穴と同じものが restore 経路で再発する)。
+#[test]
+fn snapshot_export_carries_the_vocab_mapping() {
+    let mut sim = PeerSim::new("snapvocab", 2);
+    let from_b = sim.peer_id(1);
+
+    let b = sim.author_text(1, "name", "carried");
+    sim.deliver(b.all());
+    sim.pull(0, from_b);
+    assert_eq!(sim.read(0, b.eid, "name").as_deref(), Some(&b"carried"[..]));
+
+    let target = format!("{}.snap", sim.db_path(0));
+    sim.engine(0).snapshot_export(&target).unwrap();
+
+    let restored = enchudb::Engine::open_concurrent_with_oplog(&target, 16 * 1024 * 1024).unwrap();
+    assert!(
+        restored.has_remote_vocab(from_b, b.vid, b.value.as_bytes()),
+        "snapshot に text 写像が入っていない — restore 後に後続 Tie を翻訳できない"
+    );
+}
