@@ -178,6 +178,25 @@ impl PeerSim {
         eng.flush().unwrap();
     }
 
+    /// peer `i` の cursor file に**永続済み**の `from` 向け HLC。
+    ///
+    /// `Syncer::save_cursors` は `pull_once` が caller に return する**前**に
+    /// 走る。 つまりここに値が入っている時点で、 caller はまだ何もできていない。
+    pub fn persisted_cursor(&self, i: usize, from: u32) -> Option<(u64, u32, u32)> {
+        let s = std::fs::read_to_string(&self.peers[i].cursor_path).ok()?;
+        for line in s.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() == 4 && f[0].parse::<u32>() == Ok(from) {
+                return Some((
+                    f[1].parse().ok()?,
+                    f[2].parse().ok()?,
+                    f[3].parse().ok()?,
+                ));
+            }
+        }
+        None
+    }
+
     /// peer `i` の DB path (crash copy の検査用)。
     pub fn db_path(&self, i: usize) -> &str {
         &self.peers[i].db_path

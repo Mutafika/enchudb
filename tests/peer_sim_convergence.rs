@@ -203,3 +203,40 @@ fn eid_mapping_is_durable_without_clean_shutdown() {
         durable_after_persist
     );
 }
+
+/// **cursor は、それが消費した state より先に durable になってはいけない**。
+///
+/// `Syncer::pull_once` の中の順序は
+///
+/// 1. `apply_records` — eid 写像は **memory だけ**
+/// 2. `save_cursors()` — **cursor は disk**
+/// 3. return → caller が `persist_tables()` — ここでやっと写像が disk
+///
+/// 2 と 3 の間で落ちると「cursor は進んだが写像は無い」が確定する。 caller から
+/// は直せない (return 時点で cursor は既に落ちている)。 差分 pull でも埋まらない
+/// — cursor が越えているので該当 record は二度と来ない。
+///
+/// これが `Delete` に当たると、 相手は消したのにこちらは行が生きたまま残る。
+#[test]
+fn cursor_never_outlives_the_state_it_consumed() {
+    let mut sim = PeerSim::new("cursororder", 2);
+    let from_b = sim.peer_id(1);
+
+    let b = sim.author_text(1, "name", "doomed");
+    sim.deliver(b.all());
+
+    // pull_once から戻った直後 = caller がまだ何もしていない時点。
+    sim.pull(0, from_b);
+
+    let cursor = sim.persisted_cursor(0, from_b);
+    let crashed = sim.crash_snapshot(0);
+    let mapping = crashed.resolve_remote_eid_existing(b.eid);
+    eprintln!("[order] 永続 cursor={:?}  crash 後の eid 写像={:?}", cursor, mapping);
+
+    assert!(
+        !(cursor.is_some() && mapping.is_none()),
+        "cursor は {:?} まで永続しているのに、 その record が作った eid 写像は \
+         disk に無い。 ここで落ちると当該 record は永久に失われる",
+        cursor
+    );
+}
