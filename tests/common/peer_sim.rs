@@ -178,6 +178,11 @@ impl PeerSim {
         eng.flush().unwrap();
     }
 
+    /// peer `i` の DB path (crash copy の検査用)。
+    pub fn db_path(&self, i: usize) -> &str {
+        &self.peers[i].db_path
+    }
+
     pub fn peer_id(&self, i: usize) -> u32 {
         self.peers[i].id
     }
@@ -210,6 +215,43 @@ impl PeerSim {
         let transport = self.transport.clone();
         self.peers[i].shutdown();
         self.peers[i].boot(&transport);
+    }
+
+    /// **電源断相当の拾い直し**。 clean close を挟まずに、 いま disk にある物だけを
+    /// 別 path へコピーして開く。
+    ///
+    /// `restart` は in-process の drop なので、 どうしても clean shutdown になる。
+    /// SIGKILL で失われる state (= まだ sidecar に落ちていない物) を見るには、
+    /// 「今の disk の中身だけで開き直せるか」を直接見るしかない。
+    ///
+    /// 返る `Engine` は元 peer とは別 DB。 検査専用で、 sim には組み込まれない。
+    pub fn crash_snapshot(&self, i: usize) -> Arc<Engine> {
+        self.crash_snapshot_at(i, "crashcopy")
+    }
+
+    /// `crash_snapshot` の copy 先を分ける版 (1 test 内で 2 回撮る用)。
+    pub fn crash_snapshot_at(&self, i: usize, tag: &str) -> Arc<Engine> {
+        let src = self.peers[i].db_path.clone();
+        let dst = format!("{}.{}", src, tag);
+        let src_name = std::path::Path::new(&src)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let dir = std::path::Path::new(&src).parent().unwrap().to_path_buf();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // `.lock` は flock 済みなのでコピーしない (再取得は開き直し側で行う)。
+            if !name.starts_with(&src_name) || name.ends_with(".lock") {
+                continue;
+            }
+            let suffix = &name[src_name.len()..];
+            let _ = std::fs::copy(entry.path(), format!("{}{}", dst, suffix));
+        }
+        let eng = Engine::open_concurrent_with_oplog(&dst, OPLOG_CAPACITY).unwrap();
+        eng.set_peer_id(self.peers[i].id);
+        eng
     }
 
     // ──── author / 配送 ────
@@ -247,6 +289,18 @@ impl PeerSim {
             ),
             tie: WireRecord::unsigned(h_tie, peer, DecodedOp::Tie { eid, himo_id, value: vid }),
         }
+    }
+
+    /// peer `i` が entity を削除する wire record を作る。 peer 自身の行も消す。
+    ///
+    /// `Delete` は himo を持たないので、 受信側は `resolve_remote_eid_existing`
+    /// (= 既存の写像のみ) でしか宛先を引けない。 写像が無ければ `apply_one` は
+    /// `false` を返し、 **cursor はそれを越えて前進する**。
+    pub fn author_delete(&mut self, i: usize, eid: u64) -> WireRecord {
+        let peer = self.peers[i].id;
+        self.peers[i].eng().delete(eid);
+        let hlc = self.mint(peer);
+        WireRecord::unsigned(hlc, peer, DecodedOp::Delete { eid })
     }
 
     /// peer `i` のローカル書き込み。 sync には出さない (vid 空間を埋める用途)。

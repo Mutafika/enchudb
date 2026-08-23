@@ -105,3 +105,101 @@ fn consumed_vocab_mapping_survives_restart() {
          cursor は Vocab を消費済みと言うので二度と再配送されない"
     );
 }
+
+/// **削除が受信側の再起動を跨いで効くか** (syncretic の「亡霊」観測の切り分け)。
+///
+/// `Delete` は himo を持たないので、 受信側は `resolve_remote_eid_existing`
+/// (= 既存の eid 写像) でしか宛先を引けない。 引けなければ `apply_one` は false を
+/// 返し、 `skipped` に 1 数えられて **cursor はそれを越えて前進する** =
+/// 二度と再配送されない。 相手は消したのにこちらは行が生きたまま残る。
+///
+/// eid 写像は `.eidmap` sidecar に永続する設計なので、 clean な再起動なら効くはず。
+/// ここが通れば「写像の喪失」は亡霊の原因から外れる。
+#[test]
+fn delete_applies_after_receiver_restart() {
+    let mut sim = PeerSim::new("delrestart", 2);
+    let from_b = sim.peer_id(1);
+
+    // 1. peer B が author → peer A が materialize
+    let b = sim.author_text(1, "name", "doomed");
+    sim.deliver(b.all());
+    sim.pull(0, from_b);
+    assert_eq!(sim.read(0, b.eid, "name").as_deref(), Some(&b"doomed"[..]));
+
+    // 2. 受信側 (A) を再起動。 memory 上の写像は消えるが `.eidmap` は残る。
+    sim.restart(0);
+
+    // 3. B が削除 → A が pull
+    let del = sim.author_delete(1, b.eid);
+    sim.deliver(vec![del]);
+    let out = sim.pull(0, from_b);
+    eprintln!(
+        "[delete] pull: received={} applied={} skipped={}",
+        out.received, out.applied, out.skipped
+    );
+
+    assert_eq!(
+        sim.read(0, b.eid, "name"),
+        None,
+        "削除が届いていない = 亡霊。 skipped に紛れて cursor が越えると二度と来ない"
+    );
+    sim.assert_converged();
+}
+
+/// **eid 写像は clean close を挟まずに耐えるか** (SIGKILL 相当)。
+///
+/// `delete_applies_after_receiver_restart` が通るのは in-process の drop が
+/// 必ず clean shutdown になるから。 syncretic の chaos harness は SIGKILL を
+/// 混ぜているので、 「apply した直後に電源が落ちたら `.eidmap` に載っているか」
+/// が本当の分かれ目になる。
+///
+/// 載っていなければ: 写像を失う → 後続の `Delete` が
+/// `resolve_remote_eid_existing` で外れる → `skipped` に紛れて cursor が越える
+/// → 二度と再配送されない = 相手は消したのにこちらは行が生きたまま。
+#[test]
+fn eid_mapping_is_durable_without_clean_shutdown() {
+    let mut sim = PeerSim::new("crashdur", 2);
+    let from_b = sim.peer_id(1);
+
+    let b = sim.author_text(1, "name", "doomed");
+    sim.deliver(b.all());
+    sim.pull(0, from_b);
+    assert_eq!(sim.read(0, b.eid, "name").as_deref(), Some(&b"doomed"[..]));
+
+    // clean shutdown を挟まずに、 今 disk にある物だけで開き直す。
+    let crashed = sim.crash_snapshot(0);
+    // harness の copy 忠実度の問題ではないことを先に確認する。
+    eprintln!(
+        "[crash] copied sidecars: {:?}",
+        std::fs::read_dir(std::path::Path::new(&sim.db_path(0)).parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("crashcopy"))
+            .collect::<Vec<_>>()
+    );
+    eprintln!(
+        "[crash] eidmap sidecar bytes: live={:?} copy={:?}",
+        std::fs::metadata(format!("{}.eidmap", sim.db_path(0))).map(|m| m.len()).ok(),
+        std::fs::metadata(format!("{}.crashcopy.eidmap", sim.db_path(0))).map(|m| m.len()).ok(),
+    );
+    let durable = crashed.resolve_remote_eid_existing(b.eid).is_some();
+
+    // 回避策の確認: `persist_tables()` は `&self` で eidmap も一緒に fsync する。
+    // pull 直後にこれを呼べば窓を閉じられるなら、 caller 側の当座の手当てになる。
+    sim.engine(0).persist_tables().unwrap();
+    let after = sim.crash_snapshot_at(0, "afterpersist");
+    let durable_after_persist = after.resolve_remote_eid_existing(b.eid).is_some();
+    eprintln!(
+        "[crash] durable: apply 直後={} persist_tables()後={}",
+        durable, durable_after_persist
+    );
+
+    assert!(
+        durable,
+        "apply 直後に落ちると eid 写像が消える — 以降その entity 宛の Delete は \
+         宛先不明で捨てられ、 cursor が越えるので二度と届かない \
+         (persist_tables() 後は {})",
+        durable_after_persist
+    );
+}
