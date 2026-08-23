@@ -8623,7 +8623,12 @@ impl Engine {
         let wal = if oplog_path.exists() {
             let w = enchudb_oplog::oplog::OpLog::open(&oplog_path)?;
             // リカバリ: commit されたレコードを本体に適用
-            let records = w.recover();
+            // #77-H2 の順序に加えて: **未 commit tail も replay する**。
+            // concurrent 経路は WAL append → body 適用 の順に流すので、 crash が
+            // その間に入ると 「WAL には在るが body には無い record」 が末尾に残る。
+            // ここで適用せずに checkpoint で越えると恒久消失する
+            // (`OpLog::recover_with_tail` の doc 参照)。
+            let records = w.recover_with_tail();
             for rec in &records {
                 eng.apply_oplog_op(&rec.op, rec.hlc);
             }
@@ -8783,7 +8788,12 @@ impl Engine {
         let _ = std::fs::remove_file(&crc_path);
         let wal = if oplog_path.exists() {
             let w = enchudb_oplog::oplog::OpLog::open(&oplog_path)?;
-            let records = w.recover();
+            // #77-H2 の順序に加えて: **未 commit tail も replay する**。
+            // concurrent 経路は WAL append → body 適用 の順に流すので、 crash が
+            // その間に入ると 「WAL には在るが body には無い record」 が末尾に残る。
+            // ここで適用せずに checkpoint で越えると恒久消失する
+            // (`OpLog::recover_with_tail` の doc 参照)。
+            let records = w.recover_with_tail();
             for rec in &records {
                 eng.apply_oplog_op(&rec.op, rec.hlc);
             }

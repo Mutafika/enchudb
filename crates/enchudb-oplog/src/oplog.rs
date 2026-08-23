@@ -1170,7 +1170,7 @@ impl OpLog {
     /// 必ず Commit で閉じられた group の一員なので、 再 scan は残りの record を読んでから
     /// その Commit に到達して flush する。
     pub fn iter_committed_from_with_offsets(&self, start_offset: u64) -> (Vec<(Record, u64)>, u64) {
-        let (out, _, _, committed_end) = self.scan_from_offset(start_offset);
+        let (out, _, _, committed_end, _) = self.scan_from_offset(start_offset);
         (out, committed_end)
     }
 
@@ -1180,7 +1180,7 @@ impl OpLog {
     /// bump されるため、 scan 後に `head()` を再読して cursor にすると、 scan が
     /// 書き込み途中 record で break した位置〜head 間の record を恒久 skip する。
     pub fn iter_committed_from_with_end(&self, start_offset: u64) -> (Vec<Record>, u64) {
-        let (out, _, _, committed_end) = self.scan_from_offset(start_offset);
+        let (out, _, _, committed_end, _) = self.scan_from_offset(start_offset);
         (strip_offsets(out), committed_end)
     }
 
@@ -1193,8 +1193,37 @@ impl OpLog {
     /// 共通実装の副作用で clock を巻き戻しており、 scan 中に発行された
     /// LSN/HLC を潰して重複発行 → sync dedupe による silent loss を招いた。
     pub fn recover(&self) -> Vec<Record> {
+        self.recover_inner().0
+    }
+
+    /// recovery 専用: commit 済み group に加えて **末尾の未 commit batch も返す**。
+    ///
+    /// body が primary state で、 WAL は **body より先に書かれる** (concurrent 経路の
+    /// consumer は 1 tick の中で WAL append → body 適用 の順に流す)。 crash がその間に
+    /// 入ると 「WAL には在るが body には無い record」 が末尾に残る。
+    ///
+    /// これを replay せずに checkpoint で越えると、 その write は body に反映されない
+    /// まま**恒久的に失われる** — 以後どの scan も checkpoint より前は見ないため。
+    /// `advance_checkpoint` を committed_end に留めるだけでは足りない: 走行中の engine
+    /// は誰もその record を body に適用しないので、 次の周期 fsync が Commit を打って
+    /// checkpoint を再び越え、 しかも Commit が付いた時点で `_sync_ops` へ bridge される
+    /// (= body に無いものを相手に配る)。 だから **recovery で適用しきる**。
+    ///
+    /// 再適用は冪等: cell 版数 (v9) / LWW が同じ HLC を弾くので、 既に body へ効いて
+    /// いる record を含んでいても二重適用にならない。
+    ///
+    /// CRC 破損 record に当たった時点で scan は打ち切るので (`scan_from_offset`)、
+    /// 書きかけの tail が混ざることはない。
+    pub fn recover_with_tail(&self) -> Vec<Record> {
+        let (mut out, tail) = self.recover_inner();
+        out.extend(tail);
+        out
+    }
+
+    /// `recover` / `recover_with_tail` の共通部。 clock 復元 (#77-H5) はここだけで行う。
+    fn recover_inner(&self) -> (Vec<Record>, Vec<Record>) {
         let start = self.checkpoint.load(Ordering::Acquire);
-        let (out, max_lsn, max_hlc, _) = self.scan_from_offset(start);
+        let (out, max_lsn, max_hlc, _, tail) = self.scan_from_offset(start);
         if max_lsn > 0 {
             self.next_lsn.store(max_lsn + 1, Ordering::Release);
         }
@@ -1202,7 +1231,7 @@ impl OpLog {
             self.hlc_last_wall.store(max_hlc.wall, Ordering::Release);
             self.hlc_logical.store(max_hlc.logical, Ordering::Release);
         }
-        strip_offsets(out)
+        (strip_offsets(out), strip_offsets(tail))
     }
 
     /// 指定 offset から head までを Commit グループ単位で読む。共通実装。
@@ -1213,7 +1242,13 @@ impl OpLog {
     /// #152: records は `(Record, その record の終端 offset)` の組。 終端 offset は
     /// partial advance (= 途中まで処理した consumer の cursor) に使う。 offset 不要な
     /// caller は `strip_offsets` で落とす。
-    fn scan_from_offset(&self, start_offset: u64) -> (Vec<(Record, u64)>, u64, Hlc, u64) {
+    /// 戻り値の 5 番目は **末尾の未 commit batch** (Commit で閉じられなかった分)。
+    /// `iter_committed*` は捨てるが、 recovery だけは replay に使う
+    /// (`recover_with_tail` の doc 参照)。
+    fn scan_from_offset(
+        &self,
+        start_offset: u64,
+    ) -> (Vec<(Record, u64)>, u64, Hlc, u64, Vec<(Record, u64)>) {
         let mut out = Vec::new();
         let mut batch = Vec::new();
         let mut offset = start_offset;
@@ -1307,8 +1342,8 @@ impl OpLog {
             offset = (payload_end) as u64;
         }
 
-        // uncommitted batch は破棄。recover の定義通り。
-        (out, max_lsn, max_hlc, committed_end)
+        // 未 commit batch は `out` には混ぜず、 呼び手が選べるよう別枠で返す。
+        (out, max_lsn, max_hlc, committed_end, batch)
     }
 
     /// head を checkpoint に戻す(WAL truncate 相当、uncommitted も全捨て)。

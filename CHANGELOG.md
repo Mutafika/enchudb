@@ -81,6 +81,45 @@ cursor を止めていない (= 従来どおり捨てて前進する):
 自前で cursor を持つ caller (WS push で `apply_records` を直接叩く等) は、 cursor を永続
 する前に `Engine::persist_sync_state()` を呼ぶこと。
 
+---
+
+**recovery が、 body に適用していない record を checkpoint に埋めて恒久消失させていた
+のを直した。**
+
+concurrent write path は queue を 2 本持つ。 producer は op を `write_queue` へ、 record を
+`oplog_record_queue` へ push し、 consumer thread が 1 tick の中で WAL append → body 適用 →
+fsync/msync/checkpoint 前進 の順に流す。 つまり **WAL は body より先に書かれる**。
+
+その間で殺されると 「WAL には在るが body には無い record」 が末尾に残る。 これ自体は crash
+として正常で、 次の open の recovery が replay して埋めるのが筋。 ところが旧実装は
+`recover()` が捨てた未 commit tail まで `advance_checkpoint(head)` で越えていた。 越えられた
+record は以後どの scan からも見えず、 **body に反映されないまま恒久的に失われる**。
+
+`advance_checkpoint` を committed_end に留めるだけでは直らない。 走行中の engine は誰もその
+record を body に適用しないので、 次の周期 fsync が Commit を打って checkpoint を再び越える。
+しかも Commit が付いた時点で `_sync_ops` へ bridge されるので、 **body に無いものを相手に
+配る**状態が確定する。
+
+実地 (SIGKILL 混じりの 2 台 soak): 9 cell を 1 行として書く insert が 「著者側の body には
+2 cell、 相手には 3 cell」 で固まり、 以後の scan でも埋まらない行として残った。 PK cell が
+欠けた行は PK 引きに掛からないので、 次の scan が同じ行をもう一度 insert し、 同一 PK の
+entity が 2 つになる。
+
+### 変更
+
+- `OpLog::recover_with_tail()` を追加。 commit 済み group に加えて末尾の未 commit batch も
+  返す。 `recover()` は既存の意味のまま (呼び出し元が他に 7 箇所あるため)
+- `scan_from_offset` が未 commit batch を戻り値に含める (今までは捨てていた)
+- `Engine` の recovery 2 経路を `recover_with_tail()` に
+
+再適用は冪等 — cell 版数 (v9) / LWW が同じ HLC を弾く。 CRC 破損 record は
+`scan_from_offset` が元から打ち切るので、 書きかけの tail は混ざらない。
+
+### 移行
+
+手当て不要。 **ただし既に失われた cell は戻らない** — checkpoint が越えた record は物理的に
+残っていても scan 対象外なので、 再 author で埋め直すこと。
+
 ## 0.20.0 — 2026-08-21
 
 **v8 以前の DB を writer open したときに、 自動で v9 領域を生やすようにした。** 手動作業は
