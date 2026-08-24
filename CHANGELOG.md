@@ -120,6 +120,25 @@ entity が 2 つになる。
 手当て不要。 **ただし既に失われた cell は戻らない** — checkpoint が越えた record は物理的に
 残っていても scan 対象外なので、 再 author で埋め直すこと。
 
+### 書き戻しの宛名が付け替わらなかった時に、 それを数える (#178 の検知)
+
+**静かに壊れる経路を、 まず観測できるようにした。** 直しそのものは #178 で継続。
+
+翻訳した行 (= 相手が author の entity) への書き戻しは、 bridge 時に
+`eid_translator.reverse()` を引いて元 entity の世界番号へ付け替えてから発送する。
+つまり **束ねられる前に書いた分は自分の eid のまま出て行く**。 受け側はそれを既存行に
+結び付ける手段が無いので (`bind_by_primary_key` は PK Tie が同 batch に居る時だけ効く)、
+**PK を持たない重複行**を払い出す。 その行は代表 column (= PK) を持たないため
+`Table::all()` の母集団にも入らず、 **アプリの監査からも見えない**。
+
+実地 (syncretic の chaos soak) では 8 seed 中 1 seed で両側に 1 件ずつ出た。
+
+- `Engine::bind_over_local_writes()` / `EngineStats::bind_over_local_writes` を追加。
+  **「自分が書いた行が、 後から foreign identity に束ねられた」 回数**を数える
+  (= その行の write は既に自分の eid で出ており、 相手に重複行が生えている可能性がある)。
+  判定材料は cell の版数 (`Hlc::peer`) だけで、 追加の state は持たない
+- 一度だけ warning を出す。 `0` が常態
+
 ### local-only table — WAL の耐久性は使うが peer には配らない table (request19)
 
 **「この端末で観測した事実」 を、 本体の行と同じ WAL / commit に載せられるようにした。**
