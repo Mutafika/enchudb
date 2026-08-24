@@ -517,16 +517,22 @@ fn delete_remote_removes_all_himos() {
 
     let eid = enchudb_oplog::make_eid(2, 0);
 
-    // peer 2 が 3 つの himo に値を書いてから delete
+    // peer 2 が 2 つの himo に値を書いてから delete。
+    // text (Tag) の Tie には **その vid の `Vocab` が先行する** — author 側の
+    // `tie_text_to_by_id` が必ず Vocab → Tie の順で append するため。 vid は author
+    // ローカルな番号なので、 Vocab 無しの Tie は翻訳できず適用されない
+    // (`SyncOutcome::dropped_vocab`)。
     transport.publish(2, vec![
         WireRecord::unsigned(Hlc { wall: 100, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid, himo_id: hid(&eng_a, "val"), value: 1 }),
-        WireRecord::unsigned(Hlc { wall: 101, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid, himo_id: hid(&eng_a, "name"), value: 2 }),
+        WireRecord::unsigned(Hlc { wall: 101, logical: 0, peer: 2 }, 2, DecodedOp::Vocab { vid: 2, bytes: b"hello".to_vec() }),
+        WireRecord::unsigned(Hlc { wall: 102, logical: 0, peer: 2 }, 2, DecodedOp::Tie { eid, himo_id: hid(&eng_a, "name"), value: 2 }),
         WireRecord::unsigned(Hlc { wall: 200, logical: 0, peer: 2 }, 2, DecodedOp::Delete { eid }),
     ]);
 
     let syncer = Syncer::new(eng_a.clone(), transport.clone() as Arc<dyn Transport>);
     let out = syncer.pull_once(2);
-    assert_eq!(out.applied, 3);
+    assert_eq!(out.applied, 4);
+    assert_eq!(out.dropped_vocab, 0);
 
     // delete 後は全 himo で None
     assert_eq!(get_remote(&eng_a, eid, "val"), None);

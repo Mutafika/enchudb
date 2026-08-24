@@ -100,8 +100,23 @@ pub struct SyncOutcome {
     /// 正しい) が、 予期しない増加は配送欠落の兆候。
     ///
     /// 「配送で落ちた」のか「自分のゲートで止めた」のかを caller が切り分けるための
-    /// counter。
+    /// counter。 **vocab 未翻訳は [`SyncOutcome::dropped_vocab`] に分けてある** —
+    /// 背景値のあるこの counter に、 定常 0 であるべき値を混ぜると閾値が引けない。
     pub dropped_unresolved: usize,
+    /// **author の vocab id を local vid に翻訳できず、 書かずに捨てた op 数**。
+    ///
+    /// text 値 (Tag/Leaf) は `(author_peer, remote_vid) → local_vid` の写像でしか
+    /// 意味を持たない。 写像は `.vocabmap` sidecar で永続するが、 ring buffer の
+    /// 巻き込みで `Vocab` op 自体を取り逃した場合は欠ける。 欠けた vid を**生値の
+    /// まま cell に書く**と、 その番号が指す**無関係な local 文字列**が入る
+    /// (実地発現: `path` 列に別行の PK、 `size` 列に mtime、 `key` 列に hash)。
+    /// 黙って壊すより書かない方が良いのでここで数える。
+    ///
+    /// [`SyncOutcome::dropped_unresolved`] と**分けてある**: あちらは一度も sync
+    /// されていない foreign entity 宛の `Delete` などで**正常系でも 0 にならない**
+    /// 背景値を持つ。 こちらは**定常状態で 0 であるべき**値で、 > 0 なら当該 cell は
+    /// **古いまま**なので、 caller は再 author / bootstrap で埋め直すこと。
+    pub dropped_vocab: usize,
     /// Phase C: 署名検証で reject した op 数。
     pub rejected_signature: usize,
     /// Phase C: ACL で reject した op 数。
@@ -134,6 +149,10 @@ enum ApplyResult {
     SkippedOlder,
     /// **宛先を解決できず捨てた**。 cursor は越えるので二度と再配送されない。
     Dropped,
+    /// **author の vocab id を翻訳できず捨てた**。 `Dropped` と分けるのは、
+    /// あちらが正常系でも立つ背景値を持つのに対し、 こちらは定常 0 であるべき
+    /// = 監視上の意味が逆だから ([`SyncOutcome::dropped_vocab`])。
+    DroppedVocab,
 }
 
 impl ApplyResult {
@@ -683,6 +702,7 @@ impl Syncer {
                 ApplyResult::Applied => out.applied += 1,
                 ApplyResult::SkippedOlder => out.skipped += 1,
                 ApplyResult::Dropped => out.dropped_unresolved += 1,
+                ApplyResult::DroppedVocab => out.dropped_vocab += 1,
             }
         }
         out
@@ -731,7 +751,12 @@ impl Syncer {
                         None => return ApplyResult::Dropped,
                     }
                 } else {
-                    self.engine.translate_remote_vid(rec.author_peer, *himo_id, *value)
+                    // 未翻訳の生値を書くと**無関係な local 文字列**が cell に入る
+                    // (`SyncOutcome::dropped_vocab` 参照)。 書かずに捨てる。
+                    match self.engine.try_translate_remote_vid(rec.author_peer, *himo_id, *value) {
+                        Some(v) => v,
+                        None => return ApplyResult::DroppedVocab,
+                    }
                 };
                 // request17 step 5: LWW / tombstone の判定は engine (`set_cell`) の
                 // 内側だけ。 ここで判定して別関数で適用する形は、 呼び忘れれば黙って
@@ -774,8 +799,12 @@ impl Syncer {
                     Some(e) => e,
                     None => return ApplyResult::Dropped,
                 };
-                // 値は author-local vid → local vid に変換 (Leaf/Tag のみ、 Number は identity)
-                let value = self.engine.translate_remote_vid(rec.author_peer, local_hid, *value);
+                // 値は author-local vid → local vid に変換 (Leaf/Tag のみ、 Number は identity)。
+                // Tie と同じく、 翻訳できないなら書かない (`SyncOutcome::dropped_vocab`)。
+                let value = match self.engine.try_translate_remote_vid(rec.author_peer, local_hid, *value) {
+                    Some(v) => v,
+                    None => return ApplyResult::DroppedVocab,
+                };
                 ApplyResult::from_lww(self.engine.remote_tie_apply(local_eid, local_hid, value, rec.hlc, Some(relayed_header(rec))))
             }
             DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => {
@@ -852,6 +881,8 @@ mod tests {
             // 閉じるため)。 既存 test の "rows.val" himo は "rows.val" 名前空間に。
             eng.define_table("rows", 1000).unwrap();
             eng.define_himo_in("rows", "val", ValueType::Number, 100).unwrap();
+            // vid 翻訳が要るのは text (Tag/Leaf) だけ。 `dropped_vocab` の test 用。
+            eng.define_himo_in("rows", "name", ValueType::Tag, 100).unwrap();
             eng.enable_sync_tables().unwrap();
             eng.flush().unwrap();
         }
@@ -879,6 +910,72 @@ mod tests {
         let out2 = syncer.apply_records(&[rec_old.clone()]);
         assert_eq!(out2.applied, 0);
         assert_eq!(out2.skipped, 1);
+
+        let _ = std::fs::remove_file(path_a);
+    }
+
+    /// **翻訳できない remote vid を cell に書かない。**
+    ///
+    /// text の vid は author ローカルな番号でしかない。 `Vocab` op を受け損ねた
+    /// (ring buffer の巻き込み / プロセスを跨いだ) 状態で生値のまま書くと、 その番号が
+    /// 指す**無関係な local 文字列**が入る。 実地では `path` 列に別行の PK、
+    /// `size` 列に mtime、 `key` 列に hash が現れた (15962 行中 12 行)。
+    ///
+    /// ここでは local に文字列を 1 つ intern してから、 その vid を「remote の vid」と
+    /// して Vocab 無しで送りつける。 旧実装はこれを素通しして local 文字列を書いていた。
+    #[test]
+    fn untranslatable_remote_vid_is_dropped_not_written() {
+        let path_a = test_path("vocabgap_a");
+        let eng_a = new_eng(&path_a, 1);
+        let hid = eng_a.himo_id("rows.name").expect("rows.name") as u16;
+
+        // local に 1 つ intern → この vid が「無関係な既存文字列」の役。
+        let local_eid = enchudb_oplog::make_eid(1, 1);
+        eng_a.tie_text_to(local_eid, "rows.name", "LOCAL-ONLY");
+        let colliding_vid = eng_a.vocab_id_bytes(b"LOCAL-ONLY").expect("interned");
+
+        // peer 2 が同じ番号を自分の vid として使った体で、 Vocab 無しに Tie だけ送る。
+        let transport: Arc<dyn Transport> = Arc::new(InMemoryTransport::new());
+        let syncer = Syncer::new(eng_a.clone(), transport.clone());
+        let remote_eid = enchudb_oplog::make_eid(2, 9);
+        let rec = WireRecord::unsigned(
+            Hlc { wall: 100, logical: 0, peer: 2 },
+            2,
+            DecodedOp::Tie { eid: remote_eid, himo_id: hid, value: colliding_vid },
+        );
+        let out = syncer.apply_records(&[rec]);
+
+        assert_eq!(out.applied, 0, "翻訳不能な vid は適用しない");
+        assert_eq!(out.dropped_vocab, 1, "捨てたことを数える");
+        // 相手の entity に local 文字列が漏れていない。
+        if let Some(local) = eng_a.resolve_remote_eid_existing(remote_eid) {
+            assert_eq!(
+                eng_a.get_text_owned(local, "rows.name"),
+                None,
+                "未翻訳 vid の生値が書かれてはいけない"
+            );
+        }
+
+        // Vocab が届けば通る。
+        let recs = vec![
+            WireRecord::unsigned(
+                Hlc { wall: 200, logical: 0, peer: 2 },
+                2,
+                DecodedOp::Vocab { vid: colliding_vid, bytes: b"REMOTE-VALUE".to_vec() },
+            ),
+            WireRecord::unsigned(
+                Hlc { wall: 201, logical: 0, peer: 2 },
+                2,
+                DecodedOp::Tie { eid: remote_eid, himo_id: hid, value: colliding_vid },
+            ),
+        ];
+        let out2 = syncer.apply_records(&recs);
+        assert_eq!(out2.dropped_vocab, 0);
+        let local = eng_a.resolve_remote_eid_existing(remote_eid).expect("mapping");
+        assert_eq!(
+            eng_a.get_text_owned(local, "rows.name").as_deref(),
+            Some(&b"REMOTE-VALUE"[..])
+        );
 
         let _ = std::fs::remove_file(path_a);
     }
