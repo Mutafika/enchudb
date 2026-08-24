@@ -541,6 +541,7 @@ impl Database {
             pk: None,
             relations: Vec::new(),
             capacity: None,
+            local_only: false,
         }
     }
 
@@ -889,7 +890,16 @@ impl Database {
                 if let Some(eng_mut) = Arc::get_mut(&mut self.eng) {
                     let remaining = eng_mut.remaining_eid_space();
                     let size_hint = (remaining / 4).max(16).min(1_000_000);
-                    match eng_mut.define_table(&raw.name, size_hint) {
+                    // request19: `_` 始まり (= local-only / reserved) は
+                    // `define_reserved_table` へ振る。 `define_table` は reserved
+                    // namespace を弾くので、 ここを分けないと reopen 時に
+                    // schema blob の再 register で失敗する。
+                    let redefine = if enchudb_engine::engine::is_reserved_table_name(&raw.name) {
+                        eng_mut.define_reserved_table(&raw.name, size_hint)
+                    } else {
+                        eng_mut.define_table(&raw.name, size_hint)
+                    };
+                    match redefine {
                         Ok(_) => {} // 新規 register (legacy DB か新規 DB の初回 load)
                         Err(e) if e.contains("already exists") => {} // 既に sidecar から復元済み
                         Err(e) => {
@@ -1241,6 +1251,7 @@ pub struct TableBuilder<'a> {
     pk: Option<String>,
     relations: Vec<(String, String)>, // (from_col, to_table)
     capacity: Option<u32>,
+    local_only: bool,
 }
 
 impl<'a> TableBuilder<'a> {
@@ -1299,8 +1310,25 @@ impl<'a> TableBuilder<'a> {
         self
     }
 
+    /// request19: **local-only table** として作る — WAL / commit の耐久性は使うが、
+    /// **peer には配らない**。
+    ///
+    /// 「この端末で観測した事実」 (例: 「この path を、 まさに disk と突き合わせた」)
+    /// のように、 **他の端末に配ると嘘になる** state の置き場。 通常の table と同じく
+    /// WAL に載り、 同じ commit group で durable になり、 crash 後は replay される。
+    /// ただし `_sync_ops` へ bridge されないので peer には流れない。
+    ///
+    /// - **名前は `_` で始めること** (reserved namespace)。 そうでなければ build が失敗する
+    /// - snapshot / bootstrap は body を丸ごと写すので**中身も乗る**。 受け取った側は
+    ///   `Engine::clear_local_only_tables()` で空にしてから使うこと
+    /// - `list_user_tables` などの user 向け列挙からは外れる (reserved 扱い)
+    pub fn local_only(mut self) -> Self {
+        self.local_only = true;
+        self
+    }
+
     pub fn build(self) -> Result<Table<'a>, SchemaError> {
-        let TableBuilder { db, name, cols: col_specs, pk, relations, capacity: capacity_hint } = self;
+        let TableBuilder { db, name, cols: col_specs, pk, relations, capacity: capacity_hint, local_only } = self;
 
         // 既存 table と同名の場合 (#73 G1):
         // - cols 未宣言 (= handle 取得 idiom) は従来通り existing を返す
@@ -1367,7 +1395,15 @@ impl<'a> TableBuilder<'a> {
         // 前回 run の engine sidecar が table を持ってるが、 schema blob は未更新
         // (Drop が concurrent skip 仕様)。 ここで "already exists" は recoverable
         // として扱い、 db.tables だけ追加して engine 状態を流用する。
-        let already_in_engine = match eng_mut.define_table(&name, size_hint) {
+        // request19: local-only は engine の reserved table として作る (= bridge 除外)。
+        let define = |eng_mut: &mut Engine, name: &str, size_hint: u32| {
+            if local_only {
+                eng_mut.define_reserved_table(name, size_hint)
+            } else {
+                eng_mut.define_table(name, size_hint)
+            }
+        };
+        let already_in_engine = match define(eng_mut, &name, size_hint) {
             Ok(_) => false,
             Err(e) if e.contains("already exists") => true,
             Err(e) => return Err(SchemaError::Internal(format!("define_table({name}) failed: {e}"))),

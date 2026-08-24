@@ -1751,6 +1751,13 @@ pub fn is_reserved_table_name(name: &str) -> bool {
     name.starts_with('_')
 }
 
+/// request19: engine 自身が持つ内部 table か (= `clear_local_only_tables` の対象外)。
+/// アプリが `define_reserved_table` で作った local-only table と区別する。
+#[inline]
+pub fn is_engine_internal_table(name: &str) -> bool {
+    name == "_sync_ops" || name == "_sync_peers"
+}
+
 /// `define_table` で size_hint=0 を渡した時の default。 SNS scale (10M+) では
 /// 明示指定推奨、 embedded scale (10k-1M) では default で足りる。
 pub const DEFAULT_TABLE_RESERVED: u32 = 1_000_000;
@@ -3733,17 +3740,20 @@ impl Engine {
         // lsn が新しくて消えない残骸として蓄積、 stress_10k_cycle の
         // `final_pending < 100` 期待を壊す (= 実測 ~25%)。 これらは local-only
         // state で他 peer に sync 不要なので、 transfer 対象から除外。
-        let sync_ops_range = self.table_eid_range("_sync_ops");
-        let sync_peers_range = self.table_eid_range("_sync_peers");
+        // request19: 除外対象は `_sync_ops` / `_sync_peers` 決め打ちではなく
+        // **reserved table (= `_` 始まり) 全部**。 アプリが `define_reserved_table` で
+        // 作った table も同じ扱いになる = 「WAL / commit の耐久性は使うが peer には
+        // 配らない」 local-only table として使える。 判定は名前だけなので sidecar の
+        // format 変更は無く、 reopen を跨いでそのまま効く。
+        let local_only_ranges: Vec<(u32, u32)> = self
+            .tables
+            .iter()
+            .filter(|t| t.is_reserved())
+            .map(|t| (t.eid_range_lo, t.eid_range_hi))
+            .collect();
         let is_internal_eid = |eid: u64| -> bool {
             let local = enchudb_oplog::eid_local(eid);
-            if let Some((lo, hi)) = sync_ops_range {
-                if local >= lo && local < hi { return true; }
-            }
-            if let Some((lo, hi)) = sync_peers_range {
-                if local >= lo && local < hi { return true; }
-            }
-            false
+            local_only_ranges.iter().any(|&(lo, hi)| local >= lo && local < hi)
         };
 
         let mut count = 0usize;
@@ -4678,6 +4688,51 @@ impl Engine {
     /// 未定義 table は None。
     pub fn table_eid_range(&self, name: &str) -> Option<(u32, u32)> {
         self.tables.iter().find(|t| t.name == name).map(|t| (t.eid_range_lo, t.eid_range_hi))
+    }
+
+    /// request19: **local-only table の行を全部落とす** (snapshot / bootstrap の受け側用)。
+    /// 戻り値は消した entity 数。
+    ///
+    /// local-only table (= `define_reserved_table` で作った `_` 始まりの table) は
+    /// 「**この端末で観測した事実**」 を置く場所で、 peer には配らない
+    /// (`transfer_oplog_to_sync_ops` が bridge から除外する)。 ところが
+    /// `snapshot_export` は body を丸ごと写すので、 **snapshot にはその中身も乗る**。
+    /// 受け取った側がそれを自分の観測として使うと嘘になるので、 **restore / bootstrap の
+    /// 直後にこれを呼んで空にする**。
+    ///
+    /// engine 自身の sync 内部 table (`_sync_ops` / `_sync_peers`) は**対象外** —
+    /// あちらは bootstrap で引き継ぐのが正しい (未配送 backlog と peer watermark)。
+    pub fn clear_local_only_tables(&self) -> usize {
+        self.check_writable();
+        let ranges: Vec<(u32, u32)> = self
+            .tables
+            .iter()
+            .filter(|t| t.is_reserved() && !is_engine_internal_table(&t.name))
+            .map(|t| (t.eid_range_lo, t.eid_range_hi))
+            .collect();
+        if ranges.is_empty() {
+            return 0;
+        }
+        let mut cleared = 0usize;
+        for local in self.entities.iter() {
+            if !ranges.iter().any(|&(lo, hi)| local >= lo && local < hi) {
+                continue;
+            }
+            // 版数を進めずに落とす — local-only なので LWW の相手が居ない。
+            for hid in 0..self.himos.len() {
+                self.free_leaf_cell(local, hid);
+                self.himos[hid].remove(local);
+            }
+            self.entities.free(local);
+            cleared += 1;
+        }
+        // 払い出し位置も戻す (= 空の table として始める)。
+        for t in self.tables.iter() {
+            if t.is_reserved() && !is_engine_internal_table(&t.name) {
+                t.next_local.store(0, std::sync::atomic::Ordering::Release);
+            }
+        }
+        cleared
     }
 
     /// #141: table の primary key himo を登録する。 schema 層 (`TableBuilder::build`)
@@ -5702,12 +5757,17 @@ impl Engine {
     /// `append_relayed` で自分の WAL にも記録 (HLC/author/署名は元のまま)。
     /// `relayed` は WAL 受信時の元 header (sync 側で WireRecord から作って渡す)。
     /// v6 (#88): himo が LeafStore routing 対象なら `&LeafStore` を返す。
-    /// 対象 = leaf region あり (v6) && Leaf 型 && reserved table 配下でない
+    /// 対象 = leaf region あり (v6) && Leaf 型 && engine 内部 table 配下でない
     /// (`_sync_ops.payload` 等の内部 Leaf は従来通り vocab)。
+    ///
+    /// request19: 除外は **engine 自身の内部 table だけ**。 アプリが作った
+    /// local-only table (`define_reserved_table`) の Leaf 列は通常 table と同じ
+    /// LeafStore 経路に載せる — 「配らない」 以外は普通の table として振る舞うべきで、
+    /// 内部 table の都合 (vocab 据え置き) を持ち込む理由が無い。
     fn leaf_for(&self, hid: usize) -> Option<&LeafStore> {
         if hid < self.value_types.len()
             && self.value_types[hid] == ValueType::Leaf
-            && !self.himo_is_in_reserved_table(hid)
+            && !self.himo_is_in_engine_internal_table(hid)
         {
             self.leaf.as_ref()
         } else {
@@ -6353,7 +6413,7 @@ impl Engine {
         // 値と版数を書く。 順序が要るのは transport が record を HLC 順に配るため —
         // Tie が先に採番されると受信側で vid mapping が未登録のまま Tie を適用し、
         // 生の remote vid で誤 bind する (#141)。
-        let reserved = self.himo_is_in_reserved_table(hid);
+        let reserved = self.himo_is_in_engine_internal_table(hid);
         let hlc = if reserved {
             enchudb_oplog::Hlc::ZERO
         } else {
@@ -6379,6 +6439,24 @@ impl Engine {
         match self.himo_table_get(himo_id) {
             Some(tid) => self.tables.get(tid as usize)
                 .map(|td| td.is_reserved())
+                .unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// request19: その himo が **engine 自身の内部 table** (`_sync_ops` / `_sync_peers`)
+    /// に属するか。
+    ///
+    /// この 2 つへの write を WAL に積んではいけない — `_sync_ops` の行は **WAL record
+    /// から作られる**ので、 積むと WAL が自分自身を食う (record を書くたびに record が
+    /// 増える)。 一方 **アプリが `define_reserved_table` で作った local-only table は
+    /// WAL に積む** — 配送しないだけで、 crash 後に replay されないと
+    /// 「本体の行は在るのに、 それに対する観測記録だけ消えた」 が起きる (= request19 の
+    /// 動機そのもの)。
+    fn himo_is_in_engine_internal_table(&self, himo_id: usize) -> bool {
+        match self.himo_table_get(himo_id) {
+            Some(tid) => self.tables.get(tid as usize)
+                .map(|td| is_engine_internal_table(&td.name))
                 .unwrap_or(false),
             None => false,
         }
@@ -6426,7 +6504,7 @@ impl Engine {
         // reserved table への write は oplog 再 append を skip (= 2 重書き防止)。
         // request17 step 4: Vocab → Tie/TieNamed の順に append し (transport は HLC 順に
         // 配るので依存順を崩せない)、 Tie に載った HLC で値と版数を書く。
-        let reserved = self.himo_is_in_reserved_table(hid);
+        let reserved = self.himo_is_in_engine_internal_table(hid);
         let hlc = if reserved {
             enchudb_oplog::Hlc::ZERO
         } else {
@@ -6476,7 +6554,7 @@ impl Engine {
         // request17 step 4: 値と版数は `set_cell` で不可分に書き、 **同じ HLC** を
         // WAL record にも載せる (`append_at_hlc`)。 0.7.0: reserved table への write は
         // sync 対象外なので採番しない (版数不明のまま = 従来どおり)。
-        let reserved = self.himo_is_in_reserved_table(hid);
+        let reserved = self.himo_is_in_engine_internal_table(hid);
         let hlc = if reserved {
             enchudb_oplog::Hlc::ZERO
         } else {

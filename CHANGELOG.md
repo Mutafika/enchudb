@@ -120,6 +120,52 @@ entity が 2 つになる。
 手当て不要。 **ただし既に失われた cell は戻らない** — checkpoint が越えた record は物理的に
 残っていても scan 対象外なので、 再 author で埋め直すこと。
 
+### local-only table — WAL の耐久性は使うが peer には配らない table (request19)
+
+**「この端末で観測した事実」 を、 本体の行と同じ WAL / commit に載せられるようにした。**
+
+アプリが 「この path を、 まさに disk と突き合わせた」 のような**端末ローカルな観測**を
+持つとき、 それを別ファイル (JSON 等) に置くと **「本体の行は WAL 経由で復元されるのに、
+観測記録だけ消える」** が起きる。 実地 (syncretic の chaos soak) では、 削除の証拠を失った
+path の削除が永久に見送られ、 apply が書き戻して**削除したファイルが復活**した
+(8 seed 中 4 seed)。
+
+一方この記録は **peer に配ってはいけない** — 端末ごとに違う事実なので、 配ると相手の
+判断を壊す。 つまり 「**WAL には載せたいが `_sync_ops` には流したくない**」 table が要る。
+`_sync_ops` / `_sync_peers` が既にその性質を持っていたので、 一般化して外に出した。
+
+#### 変更
+
+- `TableBuilder::local_only()` (schema 層) — `_` 始まりの table を local-only として作る。
+  engine 層では従来どおり `Engine::define_reserved_table()`
+- bridge の除外判定を **`_sync_ops` / `_sync_peers` 決め打ちから 「reserved table (= `_`
+  始まり) 全部」 へ**一般化。 判定は名前だけなので sidecar の format 変更は無く、
+  reopen を跨いでそのまま効く
+- **local-only table への write を WAL に載せるようにした**。 従来は reserved table への
+  write を丸ごと WAL から外していたが、 それでは耐久性が本体の行と揃わない。 外すのは
+  **engine 自身の内部 table (`_sync_ops` / `_sync_peers`) だけ** — あちらの行は WAL record
+  から作られるので、 積むと WAL が自分自身を食う
+- local-only table の `Leaf` 列も通常 table と同じ LeafStore 経路に載るようにした
+  (内部 table の vocab 据え置きは `_sync_ops.payload` 等だけの都合)
+- `Engine::clear_local_only_tables()` を追加。 **snapshot / bootstrap の受け側**で呼ぶ —
+  body を丸ごと写す以上 snapshot には local-only の中身も乗るが、 受け取った側にとって
+  それは 「自分が観測していない事実」 なので空にしてから使う。 engine 内部 table は対象外
+  (未配送 backlog と peer watermark は引き継ぐのが正しい)
+
+#### 使い方
+
+```rust
+db.table("_local_seen").local_only()
+  .tag("path").tag("hash").number("size").number("mtime")
+  .with_capacity(200_000)
+  .build()?;
+```
+
+- **eid 空間を `with_capacity` 分予約する** (`max_entities` と同じ性質)。 溢れると
+  `entity_in` が `Err("table '...' eid range exhausted")` を返す (黙って落ちはしない)
+- 「本体の行と同じ commit」 の意味は **WAL の同一 commit group に入る**まで。 group 途中で
+  crash した場合は 「途中まで適用された状態」 で復元される (`recover_with_tail`)
+
 ### crash が途中で切った delete を、 再配送と open の両方で埋める (#176)
 
 **削除は 「tombstone は在るが行は生きている」 で固まってはいけない。**
