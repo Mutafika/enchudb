@@ -61,7 +61,7 @@ fn tmp_path(tag: &str) -> String {
 }
 
 fn cleanup(path: &str) {
-    for sfx in ["", ".oplog", ".tables", ".crc", ".schema", ".db.lock", ".eidmap"] {
+    for sfx in ["", ".oplog", ".tables", ".crc", ".schema", ".db.lock", ".eidmap", ".vocabmap"] {
         let _ = std::fs::remove_file(format!("{}{}", path, sfx));
     }
 }

@@ -19,7 +19,7 @@ fn tmp(name: &str) -> String {
         std::process::id()
     ));
     let s = p.to_str().unwrap().to_string();
-    for suffix in ["", ".oplog", ".crc", ".tables", ".eidmap", ".lock"] {
+    for suffix in ["", ".oplog", ".crc", ".tables", ".eidmap", ".vocabmap", ".lock"] {
         let _ = std::fs::remove_file(format!("{s}{suffix}"));
     }
     s

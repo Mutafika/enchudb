@@ -289,24 +289,32 @@ fn deserialize_tables(buf: &[u8]) -> Result<Vec<TableDef>, String> {
     Ok(tables)
 }
 
-/// β-light step 7: tables を sidecar に atomic 書き換え。 fsync まで含む。
+/// sidecar を atomic に置き換える (tmp write → fsync → rename)。
+///
+/// `.tables` / `.eidmap` / `.vocabmap` が同じ手順を踏むので 1 箇所に寄せてある。
+/// tmp 名は `{sidecar}.tmp` (= sidecar ごとに別名) なので、 同時 persist しても
+/// 互いの tmp を踏まない。
 #[cfg(not(target_arch = "wasm32"))]
-fn persist_tables_to_sidecar(db_path: &str, tables: &[TableDef]) -> io::Result<()> {
+fn atomic_write_sidecar(sidecar: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
-    let sidecar = tables_path_for(db_path);
-    let tmp_path = sidecar.with_extension("tables.tmp");
-    let bytes = serialize_tables(tables);
+    let tmp_path = std::path::PathBuf::from(format!("{}.tmp", sidecar.display()));
     {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(&tmp_path)?;
-        f.write_all(&bytes)?;
+        f.write_all(bytes)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp_path, &sidecar)?;
+    std::fs::rename(&tmp_path, sidecar)?;
     Ok(())
+}
+
+/// β-light step 7: tables を sidecar に atomic 書き換え。 fsync まで含む。
+#[cfg(not(target_arch = "wasm32"))]
+fn persist_tables_to_sidecar(db_path: &str, tables: &[TableDef]) -> io::Result<()> {
+    atomic_write_sidecar(&tables_path_for(db_path), &serialize_tables(tables))
 }
 
 /// 0.8.15 (issue #52): persist 失敗で残った `.tables.tmp` を open 時に明示削除。
@@ -475,24 +483,10 @@ fn deserialize_eidmap(buf: &[u8]) -> Result<Vec<EidmapEntry>, String> {
 /// (= sync してない DB に空ファイルを作らない)。
 #[cfg(not(target_arch = "wasm32"))]
 fn persist_eidmap_to_sidecar(db_path: &str, entries: &[EidmapEntry]) -> io::Result<()> {
-    use std::io::Write;
     if entries.is_empty() {
         return Ok(());
     }
-    let sidecar = eidmap_path_for(db_path);
-    let tmp_path = sidecar.with_extension("eidmap.tmp");
-    let bytes = serialize_eidmap(entries);
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp_path, &sidecar)?;
-    Ok(())
+    atomic_write_sidecar(&eidmap_path_for(db_path), &serialize_eidmap(entries))
 }
 
 /// #9: eidmap sidecar を読む。 不在なら Ok(None)。
@@ -501,6 +495,101 @@ fn load_eidmap_from_sidecar(db_path: &str) -> io::Result<Option<Vec<EidmapEntry>
     let sidecar = eidmap_path_for(db_path);
     match std::fs::read(&sidecar) {
         Ok(buf) => match deserialize_eidmap(&buf) {
+            Ok(entries) => Ok(Some(entries)),
+            Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// **peer vocab 写像の sidecar path**。 `.vocabmap`。
+///
+/// text (Tag/Leaf) の cell 値は `(author_peer, remote_vid) → local_vid` の写像を
+/// 通してしか意味を持たない。 この写像は受信した `Vocab` op から組み立てるが、
+/// **受信 op は自分の WAL には残らない** (gossip_remote_apply が off なら
+/// append_relayed も走らない) ため、 memory から消えると復元手段が無い。
+///
+/// `(peer, remote_eid) → local` を持つ `.eidmap` と同格の永続先がここ。 両方
+/// 揃って初めて「pull cursor が消費した state」が disk 上で再構成できる。
+#[cfg(not(target_arch = "wasm32"))]
+fn vocabmap_path_for(path: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}.vocabmap", path))
+}
+
+/// vocabmap sidecar の 1 entry。 `(author_peer, remote_vid, local_vid)`。
+type VocabmapEntry = (enchudb_oplog::PeerId, u32, u32);
+
+/// `.vocabmap` の現行 format 版数。
+///
+/// - v1: magic "EVCM"(4) + version u32 + count u32 + (peer u32, remote u32, local u32) × count
+const VOCABMAP_VERSION: u32 = 1;
+
+/// vocabmap entry を binary encode (v1)。
+fn serialize_vocabmap(entries: &[VocabmapEntry]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + entries.len() * 12);
+    out.extend_from_slice(b"EVCM");
+    out.extend_from_slice(&VOCABMAP_VERSION.to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for &(peer, remote_vid, local_vid) in entries {
+        out.extend_from_slice(&peer.to_le_bytes());
+        out.extend_from_slice(&remote_vid.to_le_bytes());
+        out.extend_from_slice(&local_vid.to_le_bytes());
+    }
+    out
+}
+
+/// vocabmap sidecar を decode。 magic 不一致 / truncated は Err。
+///
+/// `.eidmap` と同じく CRC を持たないので、 header の `count` は信用せず
+/// 残りバッファから上限を出す (bogus な巨大 count での確保 abort を防ぐ)。
+fn deserialize_vocabmap(buf: &[u8]) -> Result<Vec<VocabmapEntry>, String> {
+    if buf.len() < 12 || &buf[0..4] != b"EVCM" {
+        return Err("vocabmap sidecar: bad magic".into());
+    }
+    let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+    if version != VOCABMAP_VERSION {
+        return Err(format!("vocabmap sidecar: unsupported version {}", version));
+    }
+    const ENTRY_SIZE: usize = 12;
+    let count = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
+    let max_entries = (buf.len() - 12) / ENTRY_SIZE;
+    if count > max_entries {
+        return Err(format!(
+            "vocabmap sidecar: count {} exceeds buffer capacity {} (corrupt/torn)",
+            count, max_entries
+        ));
+    }
+    let mut entries = Vec::with_capacity(count);
+    let mut off = 12usize;
+    for _ in 0..count {
+        if off + ENTRY_SIZE > buf.len() {
+            return Err("vocabmap sidecar: truncated".into());
+        }
+        let peer = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        let remote_vid = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap());
+        let local_vid = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap());
+        off += ENTRY_SIZE;
+        entries.push((peer, remote_vid, local_vid));
+    }
+    Ok(entries)
+}
+
+/// vocabmap を sidecar に atomic 書き換え (fsync 込み)。 entries 空なら何もしない
+/// (= sync してない DB に空ファイルを作らない)。
+#[cfg(not(target_arch = "wasm32"))]
+fn persist_vocabmap_to_sidecar(db_path: &str, entries: &[VocabmapEntry]) -> io::Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    atomic_write_sidecar(&vocabmap_path_for(db_path), &serialize_vocabmap(entries))
+}
+
+/// vocabmap sidecar を読む。 不在なら Ok(None)。
+#[cfg(not(target_arch = "wasm32"))]
+fn load_vocabmap_from_sidecar(db_path: &str) -> io::Result<Option<Vec<VocabmapEntry>>> {
+    match std::fs::read(vocabmap_path_for(db_path)) {
+        Ok(buf) => match deserialize_vocabmap(&buf) {
             Ok(entries) => Ok(Some(entries)),
             Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
         },
@@ -1834,6 +1923,9 @@ pub struct Engine {
     /// Symbol 型 himo の Tie を受信した時に remote_vid を local_vid に変換して apply する。
     /// peer-local に保持(replica でも独立、open 時は空、受信で徐々に埋まる)。
     peer_vocab_map: std::sync::RwLock<std::collections::HashMap<(enchudb_oplog::PeerId, u32), u32>>,
+    /// `peer_vocab_map` が最後の persist 以降に変化したか。 pull ごとに sidecar を
+    /// 書き直さないための dirty flag (写像は単調増加なので「増えたか」で足りる)。
+    peer_vocab_map_dirty: std::sync::atomic::AtomicBool,
     /// v34: read-only モード。 true なら書き込み API は error/panic。 open_readonly で立つ。
     /// `is_replica` は「直 write 拒否、 Syncer 経由は受ける」、 こちらは「一切 write 不可」。
     is_readonly: std::sync::atomic::AtomicBool,
@@ -2124,6 +2216,7 @@ impl Engine {
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
+            peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             _writer_lock: Some(writer_lock),
@@ -2466,6 +2559,7 @@ impl Engine {
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
+            peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             _writer_lock: Some(writer_lock),
@@ -2598,6 +2692,28 @@ impl Engine {
             Err(e) => {
                 eprintln!(
                     "warning: failed to read eidmap sidecar (empty translator): {}",
+                    e
+                );
+            }
+        }
+
+        // text 写像 (`(author_peer, remote_vid) → local_vid`) の sidecar 読み込み。
+        //
+        // これが無いと、 受信済み `Vocab` を消費した cursor だけが残り、 後続の
+        // `Tie` を翻訳できなくなる (旧実装は生の remote vid をそのまま cell に書き、
+        // **受信側の無関係な文字列**を指していた)。 `.eidmap` と同じく、 不在なら
+        // 空で続行し、 破損は警告のみ (再 sync で張り直せる)。
+        match load_vocabmap_from_sidecar(path) {
+            Ok(Some(entries)) => {
+                let mut map = eng.peer_vocab_map.write().unwrap();
+                for (peer, remote_vid, local_vid) in entries {
+                    map.insert((peer, remote_vid), local_vid);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to read vocabmap sidecar (empty vocab translation): {}",
                     e
                 );
             }
@@ -3358,6 +3474,7 @@ impl Engine {
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
+            peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             #[cfg(not(target_arch = "wasm32"))]
@@ -4338,9 +4455,14 @@ impl Engine {
         out
     }
 
-    /// 0.8.1: `&self` で tables sidecar を強制 persist する public API。
+    /// 0.8.1: `&self` で sidecar 群を強制 persist する public API。
     /// `Arc<Engine>` (= concurrent mode) でも `flush(&mut)` を取れない状況で
     /// `next_local` を含む tables 状態を disk に固める用途。
+    ///
+    /// 書くのは `.tables` / `.eidmap` / `.vocabmap` の 3 つ (= 翻訳 state は
+    /// `next_local` と整合していないと意味が無いので同じ trigger で落とす)。
+    /// **cell 本体は msync しない** — 受信 op を適用した後の barrier が要るなら
+    /// [`Engine::persist_sync_state`] を使うこと。
     ///
     /// short-lived CLI (= 1 write → drop) で sinfo 等の embed consumer が
     /// 明示的に呼ぶ想定。 wasm / memory-only (= path 空) では Ok(()) no-op。
@@ -4353,7 +4475,71 @@ impl Engine {
         }
         persist_tables_to_sidecar(&self.path, &self.tables)?;
         // #9: 翻訳テーブルも同じ trigger で persist (next_local と整合させる)。
-        persist_eidmap_to_sidecar(&self.path, &self.eidmap_entries_with_tombstones())
+        persist_eidmap_to_sidecar(&self.path, &self.eidmap_entries_with_tombstones())?;
+        self.persist_vocab_map_if_dirty()
+    }
+
+    /// **sync 由来 state の durability barrier**。
+    ///
+    /// `body_msync()` (cell 本体) + [`Engine::persist_tables`] (sidecar 3 つ)。
+    ///
+    /// 受信 op を適用すると、 cell 本体のほかに 3 つの派生 state が動く:
+    ///
+    /// - `.tables` — `next_local` (翻訳先 slot の払い出し位置)
+    /// - `.eidmap` — `(author_peer, foreign_local) → local` の entity 写像
+    /// - `.vocabmap` — `(author_peer, remote_vid) → local_vid` の text 写像
+    ///
+    /// このうち後ろ 2 つは **memory から消えると復元手段が無い** (受信 op は自分の
+    /// WAL に残らない)。 一方 `Syncer` の pull cursor は disk に永続するので、
+    /// 「cursor は消費済みと言うが写像は無い」状態を作ると、 差分 pull では
+    /// 二度と埋まらない (cursor が越えているので当該 record は再配送されない)。
+    ///
+    /// よって守るべき順序は **「消費した state を durable にしてから cursor を
+    /// 進める」**。 `Syncer::pull_once` はこれを呼んでからでないと cursor を
+    /// 前進させない。 失敗したら cursor は進まず、 次の pull で同じ record を
+    /// 再適用する (apply は冪等: LWW と `get_or_insert`)。
+    ///
+    /// `.vocabmap` は dirty のときだけ書く (写像は単調増加なので「増えたか」で足りる)。
+    /// memory-only (= path 空) / wasm では no-op。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn persist_sync_state(&self) -> io::Result<()> {
+        if self.path.is_empty() {
+            return Ok(());
+        }
+        // cell 本体を先に。 local write 経路が守っている順序 (`oplog_sync`:
+        // WAL fsync → body msync → checkpoint 前進) の受信側 counterpart で、
+        // pull cursor が受信側の checkpoint に当たる。 dirty range 単位なので
+        // 変更量に比例する (request3)。
+        self.body_msync()?;
+        self.persist_tables()
+    }
+
+    /// `.vocabmap` を dirty のときだけ書く。 写像は単調増加なので「増えたか」で足りる。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn persist_vocab_map_if_dirty(&self) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        if !self.peer_vocab_map_dirty.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        persist_vocabmap_to_sidecar(&self.path, &self.peer_vocab_map_entries())?;
+        self.peer_vocab_map_dirty.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// wasm 版 (sidecar を持たないので no-op)。
+    #[cfg(target_arch = "wasm32")]
+    pub fn persist_sync_state(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// `.vocabmap` に落とす entry 列。
+    fn peer_vocab_map_entries(&self) -> Vec<VocabmapEntry> {
+        let map = self.peer_vocab_map.read().unwrap();
+        let mut out: Vec<VocabmapEntry> =
+            map.iter().map(|(&(peer, remote), &local)| (peer, remote, local)).collect();
+        // 決定的な並びにしておく (diff / 再現性のため。 読み手は順序に依存しない)。
+        out.sort_unstable();
+        out
     }
 
     /// 0.8.7: DB ファイルパスを返す。 schema crate が schema sidecar
@@ -4387,6 +4573,10 @@ impl Engine {
                 if let Err(e) =
                     persist_eidmap_to_sidecar(&self.path, &self.eidmap_entries_with_tombstones())
                 {
+                    self.warn_persist_failure_rate_limited(&e);
+                }
+                // text 写像も同格。 dirty のときだけ書く。
+                if let Err(e) = self.persist_vocab_map_if_dirty() {
                     self.warn_persist_failure_rate_limited(&e);
                 }
             }
@@ -5621,8 +5811,14 @@ impl Engine {
     ) {
         let was_new = self.vocab.lookup(bytes).is_none();
         let local_vid = self.vocab.get_or_insert(bytes);
-        let mut map = self.peer_vocab_map.write().unwrap();
-        map.insert((author_peer, remote_vid), local_vid);
+        {
+            let mut map = self.peer_vocab_map.write().unwrap();
+            if map.insert((author_peer, remote_vid), local_vid) != Some(local_vid) {
+                // 新規 / 張り替え。 sidecar が古くなったので次の barrier で書き直す。
+                self.peer_vocab_map_dirty
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
         if was_new && self.gossip_remote_apply() {
             if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
                 // 自 vocab の vid を貼り直し (Tie 受信側が translate_remote_vid で再翻訳)。
@@ -8427,7 +8623,12 @@ impl Engine {
         let wal = if oplog_path.exists() {
             let w = enchudb_oplog::oplog::OpLog::open(&oplog_path)?;
             // リカバリ: commit されたレコードを本体に適用
-            let records = w.recover();
+            // #77-H2 の順序に加えて: **未 commit tail も replay する**。
+            // concurrent 経路は WAL append → body 適用 の順に流すので、 crash が
+            // その間に入ると 「WAL には在るが body には無い record」 が末尾に残る。
+            // ここで適用せずに checkpoint で越えると恒久消失する
+            // (`OpLog::recover_with_tail` の doc 参照)。
+            let records = w.recover_with_tail();
             for rec in &records {
                 eng.apply_oplog_op(&rec.op, rec.hlc);
             }
@@ -8587,7 +8788,12 @@ impl Engine {
         let _ = std::fs::remove_file(&crc_path);
         let wal = if oplog_path.exists() {
             let w = enchudb_oplog::oplog::OpLog::open(&oplog_path)?;
-            let records = w.recover();
+            // #77-H2 の順序に加えて: **未 commit tail も replay する**。
+            // concurrent 経路は WAL append → body 適用 の順に流すので、 crash が
+            // その間に入ると 「WAL には在るが body には無い record」 が末尾に残る。
+            // ここで適用せずに checkpoint で越えると恒久消失する
+            // (`OpLog::recover_with_tail` の doc 参照)。
+            let records = w.recover_with_tail();
             for rec in &records {
                 eng.apply_oplog_op(&rec.op, rec.hlc);
             }
@@ -9111,6 +9317,15 @@ impl Engine {
         let eidmap_entries = self.eidmap_entries_with_tombstones();
         if !eidmap_entries.is_empty() {
             std::fs::write(format!("{}.eidmap", target), serialize_eidmap(&eidmap_entries))?;
+        }
+        // text 写像も同じ理由で in-memory から直接書き出す。 これが抜けると restore 後に
+        // 受信済み `Vocab` の写像だけが失われ、 後続 `Tie` を翻訳できなくなる。
+        let vocabmap_entries = self.peer_vocab_map_entries();
+        if !vocabmap_entries.is_empty() {
+            std::fs::write(
+                format!("{}.vocabmap", target),
+                serialize_vocabmap(&vocabmap_entries),
+            )?;
         }
 
         Ok(files)

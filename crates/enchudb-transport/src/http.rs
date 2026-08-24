@@ -269,7 +269,8 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Resu
         None => (path, ""),
     };
 
-    // #78-H9: bootstrap sidecar 配信 (.eidmap = 翻訳写像 + tombstone、 .tables)。
+    // #78-H9: bootstrap sidecar 配信 (.eidmap = 翻訳写像 + tombstone、 .tables、
+    // .vocabmap = text の vid 写像)。
     // main DB body だけ配ると、 restore 後の再 sync で translator 空 + tombstone
     // 喪失 → 重複 entity 払い出し / 削除済み entity の resurrection が起きる
     // (snapshot_export は 1503ff2 で同じ理由により sidecar 直書きへ修正済み —
@@ -282,6 +283,7 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Resu
         let sfx = match &route["/bootstrap/".len()..] {
             "eidmap" => ".eidmap",
             "tables" => ".tables",
+            "vocabmap" => ".vocabmap",
             _ => return send_response(&mut stream, 404, b"unknown sidecar"),
         };
         return match std::fs::read(format!("{}{}", src.db_path, sfx)) {
@@ -704,10 +706,12 @@ impl HttpTransport {
         decode_sparse_stream(&mut reader, &mut file, size)?;
         file.sync_all()?;
 
-        // #78-H9: sidecar (.eidmap / .tables) も取得。 .eidmap 無しの restore は
-        // 再 sync で重複 entity / tombstone 喪失を起こす。 旧 server (route 未対応)
-        // からは 404 が返るので、 その場合は main body のみの旧挙動に fallback。
-        for (name, sfx) in [("eidmap", ".eidmap"), ("tables", ".tables")] {
+        // #78-H9: sidecar (.eidmap / .tables / .vocabmap) も取得。 .eidmap 無しの
+        // restore は再 sync で重複 entity / tombstone 喪失を起こし、 .vocabmap 無しでは
+        // 受信済み `Vocab` の写像が失われて後続 `Tie` を翻訳できない。 旧 server
+        // (route 未対応) からは 404 が返るので、 その場合は main body のみの旧挙動に
+        // fallback。
+        for (name, sfx) in [("eidmap", ".eidmap"), ("tables", ".tables"), ("vocabmap", ".vocabmap")] {
             if let Ok((200, bytes)) = self.request("GET", &format!("/bootstrap/{name}"), b"") {
                 let sidecar_path = format!("{local_path}{sfx}");
                 let f = std::fs::File::create(&sidecar_path)?;

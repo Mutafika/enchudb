@@ -19,7 +19,7 @@ const WINDOW: usize = 200;
 const CONTENT_LEN: usize = 1024;
 
 fn cleanup(path: &str) {
-    for suf in ["", ".oplog", ".tables", ".crc", ".db.lock", ".eidmap"] {
+    for suf in ["", ".oplog", ".tables", ".crc", ".db.lock", ".eidmap", ".vocabmap"] {
         let _ = std::fs::remove_file(format!("{path}{suf}"));
     }
 }

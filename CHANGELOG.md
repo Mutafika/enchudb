@@ -3,7 +3,153 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## Unreleased
+
+**pull cursor が、 それが消費した state より先に durable になる順序違反を直した。** 併せて
+sync の写像 (`(author_peer, remote_vid) → local_vid`) に永続先を作り、 `SyncOutcome` の
+counter を「正常系の LWW skip」と「二度と来ない形で捨てた分」に分けた。
+
+### 何が壊れていたか
+
+受信 op を適用すると、 cell (mmap) のほかに 3 つの派生 state が動く:
+
+| state | 置き場 | 消えたら |
+|---|---|---|
+| `next_local` (翻訳先 slot の払い出し位置) | `.tables` | #117 が live bitmap から自己修復 |
+| `(author_peer, foreign_local) → local` の entity 写像 | `.eidmap` | **復元手段が無い** |
+| `(author_peer, remote_vid) → local_vid` の text 写像 | **どこにも無かった** | **復元手段が無い** |
+
+「復元手段が無い」のは、 **受信 op が自分の WAL に残らない**から (gossip_remote_apply が
+off なら `append_relayed` も走らない)。 一方 `Syncer` の pull cursor は disk に永続する。
+
+`pull_once` は `apply_records` → `save_cursors()` の順で、 写像の永続は caller 任せだった。
+つまり **cursor だけが先に durable になる**。 ここで落ちると 「cursor は消費済みと言うが
+写像は無い」 が確定し、 差分 pull では**二度と埋まらない** (cursor が越えているので当該
+record は再配送されない)。
+
+**caller 側では直せない** — `pull_once` が return した時点で cursor は既に落ちているため。
+
+実地の発現 (syncretic、 SIGKILL を混ぜた 2 台の soak、 6 万操作):
+
+- **相手が削除した行がこちらで生き残る** (194 件)。 写像を失うと後続の `Delete` が
+  `resolve_remote_eid_existing` で外れ、 `skipped` に紛れて cursor が越える
+- text cell に**受信側の無関係な文字列**が入る。 `Vocab` を消費した後に写像を失うと、
+  後続 `Tie` の生 vid が別の文字列を指す
+
+### 変更
+
+- **`.vocabmap` sidecar を追加**。 `.eidmap` と同格の永続先。 magic `EVCM` / v1、
+  atomic write + fsync、 不在なら空で続行 (additive、 後方互換)。 dirty のときだけ書く。
+  1 entry 12 byte、 `(peer, remote_vid)` ごとに 1 つ (= memory 上の写像と同じ増え方。
+  永続化で増加特性は変わらない)。 `snapshot_export` と HTTP bootstrap
+  (`GET /bootstrap/vocabmap`) も運ぶ — ここが抜けると restore 後に同じ穴が再発する
+- **`Engine::persist_sync_state()`**: sync 由来 state の durability barrier。
+  `body_msync()` (cell 本体) + `persist_tables()` (`.tables` / `.eidmap` / `.vocabmap`)。
+  local write 経路が既に守っていた順序 (`oplog_sync`: WAL fsync → body msync →
+  checkpoint 前進) の**受信側 counterpart**で、 pull cursor が受信側の checkpoint に当たる。
+  `persist_tables()` 自体の意味は変えていない (sidecar のみ、 `.vocabmap` が 1 つ増えただけ)
+- **`Syncer::pull_once` が barrier を内側で守る**。 適用があったら永続してから cursor を
+  進め、 **永続に失敗したら cursor を進めない** (次の pull で同じ record を再適用 —
+  apply は冪等)
+- **`SyncOutcome::dropped_unresolved`** を追加。 `skipped` は 「LWW で古いと判定した」
+  だけを数える。 合算されていると、 無視して良い LWW noise に本物の欠落が紛れる。
+  内訳は entity 写像が引けない / himo を定義できない / ref の target を解決できない。
+  一度も sync していない entity 宛の `Delete` のように**正常系でも 0 にならない**が、
+  予期しない増加は配送欠落の兆候
+- `apply_one` の戻りを `bool` から型 (`ApplyResult`) に変更 (internal)
+
+### 残っている穴 (この変更では塞いでいない)
+
+`dropped_unresolved` に数えられる中で、 **「今は無理だが後なら適用できる」**ケースは
+cursor を止めていない (= 従来どおり捨てて前進する):
+
+- **table 容量の枯渇** — `resolve_remote_eid` の slot 払い出しが失敗すると、 受信行が
+  黙って落ちる。 本来は backpressure として cursor を止めるべきだが、 `resolve_remote_eid`
+  は `Option` で理由を返さないため区別できない
+- **himo 予算の枯渇 (#118)** — こちらは枠が解放されないので、 止めると永久に進まない。
+  捨てて数えるのが正しい
+
+前者は理由を返す形に変えれば止められる。 「止めると永久に進まない」 ものと混ざっているので、
+一律に止めるのは危険。
+
+### 移行
+
+`.vocabmap` は無ければ空で始まり、 次に `Vocab` を受信した時点から積み上がる。 既存 DB に
+手当ては不要。 **ただし 「すでに消えている写像」 は戻らない** — 過去に取りこぼした cell は
+再 author / bootstrap で埋め直すこと。
+
+自前で cursor を持つ caller (WS push で `apply_records` を直接叩く等) は、 cursor を永続
+する前に `Engine::persist_sync_state()` を呼ぶこと。
+
+---
+
+**recovery が、 body に適用していない record を checkpoint に埋めて恒久消失させていた
+のを直した。**
+
+concurrent write path は queue を 2 本持つ。 producer は op を `write_queue` へ、 record を
+`oplog_record_queue` へ push し、 consumer thread が 1 tick の中で WAL append → body 適用 →
+fsync/msync/checkpoint 前進 の順に流す。 つまり **WAL は body より先に書かれる**。
+
+その間で殺されると 「WAL には在るが body には無い record」 が末尾に残る。 これ自体は crash
+として正常で、 次の open の recovery が replay して埋めるのが筋。 ところが旧実装は
+`recover()` が捨てた未 commit tail まで `advance_checkpoint(head)` で越えていた。 越えられた
+record は以後どの scan からも見えず、 **body に反映されないまま恒久的に失われる**。
+
+`advance_checkpoint` を committed_end に留めるだけでは直らない。 走行中の engine は誰もその
+record を body に適用しないので、 次の周期 fsync が Commit を打って checkpoint を再び越える。
+しかも Commit が付いた時点で `_sync_ops` へ bridge されるので、 **body に無いものを相手に
+配る**状態が確定する。
+
+実地 (SIGKILL 混じりの 2 台 soak): 9 cell を 1 行として書く insert が 「著者側の body には
+2 cell、 相手には 3 cell」 で固まり、 以後の scan でも埋まらない行として残った。 PK cell が
+欠けた行は PK 引きに掛からないので、 次の scan が同じ行をもう一度 insert し、 同一 PK の
+entity が 2 つになる。
+
+### 変更
+
+- `OpLog::recover_with_tail()` を追加。 commit 済み group に加えて末尾の未 commit batch も
+  返す。 `recover()` は既存の意味のまま (呼び出し元が他に 7 箇所あるため)
+- `scan_from_offset` が未 commit batch を戻り値に含める (今までは捨てていた)
+- `Engine` の recovery 2 経路を `recover_with_tail()` に
+
+再適用は冪等 — cell 版数 (v9) / LWW が同じ HLC を弾く。 CRC 破損 record は
+`scan_from_offset` が元から打ち切るので、 書きかけの tail は混ざらない。
+
+### 移行
+
+手当て不要。 **ただし既に失われた cell は戻らない** — checkpoint が越えた record は物理的に
+残っていても scan 対象外なので、 再 author で埋め直すこと。
+
+### 0.19.0 / 0.20.0 の封印 (sync 用途)
+
+**sync に参加する DB では 0.19.0 / 0.20.0 を使わないこと。** 0.21.0 (本 release) へ上げる。
+
+理由は上の 2 つの欠陥そのものではなく、 **露出の仕方**にある。 上の 2 つは 0.19.0 より前から
+在る (vocab 写像の永続先はどの版にも無く、 `advance_checkpoint(w.head())` は crate 分割期の
+`538b943` / `3b3f38a` から在る)。 だが **v9 (per-cell version) を既定にした `b28446d` = 0.19.0
+以降**、 crash 後の壊れ方が 「PK cell だけ落ちた行が残る」 形を取るようになり、 これは
+
+- PK 引きに掛からない → アプリが同じ行をもう一度 insert → **同一 PK の entity が 2 つ**
+- `Table::all()` は代表 column (= PK) を tie した entity しか列挙しないので、 **監査からも見えない**
+
+という、 再 author では戻らない壊れ方になる。 実地の chaos soak (2 台 daemon / SIGKILL 混じり /
+1800s / 4 seed) では v0.20.0 で PK 欠落行 3 件・PK 重複 2 seed、 本 release で 0 件・0 seed。
+
+0.20.0 は加えて **v8 の既存 DB を writer open で自動的に v9 へ引き上げる** (`d8b287f`) ので、
+対象が広い。 0.19.0 は新規作成分だけが v9 になる。
+
+**0.18.3 以前が安全という意味ではない。** 同じ soak で 0.18.3 も 4 seed とも収束せず
+(亡霊 57 / 内容不一致 24)、 PK 重複という次元で出なかっただけ。 sync を使うなら 0.21.0 へ。
+
+tag は消していない (既存の pin / lock を壊さないため)。 0.19.0 / 0.20.0 の節にも同じ注意を
+書いてある。
+
+
 ## 0.20.0 — 2026-08-21
+
+> **⚠️ sync 用途では封印 (0.21.0 で修正)** — この版は v9 (per-cell version) が既定なので、
+> crash 後に 「PK cell だけ落ちた行」 が残り、 同一 PK の entity が 2 つになる経路が露出する。
+> 詳細と実測は 0.21.0 の 「0.19.0 / 0.20.0 の封印」 節。 sync に参加する DB は 0.21.0 へ。
 
 **v8 以前の DB を writer open したときに、 自動で v9 領域を生やすようにした。** 手動作業は
 不要。 0.19.0 で 「migration 不要」 としていた方針を **明示的に翻す**変更で、 既存 DB の
@@ -89,6 +235,10 @@ DB を copy する必要がある場合は `enchudb_engine::copy_sparse` を使�
 5 crate 全 green (exit 0 / 85 binary)、 clippy 新規指摘なし、 Windows target の cfg エラーなし。
 
 ## 0.19.0 — 2026-08-17
+
+> **⚠️ sync 用途では封印 (0.21.0 で修正)** — この版は v9 (per-cell version) が既定なので、
+> crash 後に 「PK cell だけ落ちた行」 が残り、 同一 PK の entity が 2 つになる経路が露出する。
+> 詳細と実測は 0.21.0 の 「0.19.0 / 0.20.0 の封印」 節。 sync に参加する DB は 0.21.0 へ。
 
 **LWW の真実を、 配送バッファ依存の揮発 HashMap から storage へ移した (request17 Phase 1)。**
 削除や上書きの版数が per-cell の column として本体に載るようになり、 reopen しても

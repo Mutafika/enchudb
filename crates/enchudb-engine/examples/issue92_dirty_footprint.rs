@@ -21,7 +21,7 @@ use std::os::unix::fs::MetadataExt;
 const LIVE_VOCAB: usize = 5;
 
 fn cleanup(path: &str) {
-    for suf in ["", ".oplog", ".tables", ".crc", ".db.lock", ".eidmap"] {
+    for suf in ["", ".oplog", ".tables", ".crc", ".db.lock", ".eidmap", ".vocabmap"] {
         let _ = std::fs::remove_file(format!("{path}{suf}"));
     }
 }

@@ -13,7 +13,7 @@ fn tmp(name: &str) -> String {
     ));
     let s = p.to_str().unwrap().to_string();
     // 前回残骸を掃除 (DB 本体 + sidecar 群)
-    for suffix in ["", ".oplog", ".crc", ".tables", ".eidmap", ".lock"] {
+    for suffix in ["", ".oplog", ".crc", ".tables", ".eidmap", ".vocabmap", ".lock"] {
         let _ = std::fs::remove_file(format!("{s}{suffix}"));
     }
     s
@@ -63,7 +63,7 @@ fn create_wal_variant_over_existing_is_already_exists() {
     let eng = Engine::open(&path).unwrap();
     assert_eq!(eng.entity_count(), 1);
     drop(eng);
-    for suffix in ["", ".oplog", ".crc", ".tables", ".eidmap"] {
+    for suffix in ["", ".oplog", ".crc", ".tables", ".eidmap", ".vocabmap"] {
         let _ = std::fs::remove_file(format!("{path}{suffix}"));
     }
 }

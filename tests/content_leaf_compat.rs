@@ -11,7 +11,7 @@ use enchudb::Engine;
 
 fn tmp(name: &str) -> String {
     let p = format!("/tmp/enchudb-cleaf-{}-{}", name, std::process::id());
-    for sfx in ["", ".oplog", ".lock", ".crc", ".tables", ".eidmap"] {
+    for sfx in ["", ".oplog", ".lock", ".crc", ".tables", ".eidmap", ".vocabmap"] {
         let _ = std::fs::remove_file(format!("{}{}", p, sfx));
     }
     p

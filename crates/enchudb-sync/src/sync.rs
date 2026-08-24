@@ -85,8 +85,23 @@ pub struct SyncOutcome {
     pub received: usize,
     /// LWW で新規/上書きされた op 数。
     pub applied: usize,
-    /// LWW で古いと判定して skip した op 数。
+    /// **LWW で古いと判定して skip した op 数**。 正常系の counter。
+    ///
+    /// 「相手より自分の方が新しい」だけなので、 再配送は不要。 宛先を解決できずに
+    /// 捨てた分は [`SyncOutcome::dropped_unresolved`] に分けてある (両者を合算すると、
+    /// 無視して良い LWW noise に本物の欠落が紛れる)。
     pub skipped: usize,
+    /// **宛先を解決できずに捨てた op 数**。 pull cursor はこれを越えて前進するので、
+    /// **二度と再配送されない**。
+    ///
+    /// 内訳は「entity 写像が引けない」「himo を定義できない (予算枯渇)」
+    /// 「ref の target を解決できない」。 一度も sync されていない foreign entity 宛の
+    /// `Delete` のように、 **正常系でも 0 にならない** (消す対象が無いので no-op が
+    /// 正しい) が、 予期しない増加は配送欠落の兆候。
+    ///
+    /// 「配送で落ちた」のか「自分のゲートで止めた」のかを caller が切り分けるための
+    /// counter。
+    pub dropped_unresolved: usize,
     /// Phase C: 署名検証で reject した op 数。
     pub rejected_signature: usize,
     /// Phase C: ACL で reject した op 数。
@@ -104,6 +119,30 @@ pub struct SyncOutcome {
     /// `true` のとき **records は一切適用していない**。 caller は差分 pull を諦めて
     /// bootstrap (= `GET /bootstrap` などによる snapshot 取得) からやり直す必要がある。
     pub history_truncated: bool,
+}
+
+/// `apply_one` の結果。
+///
+/// 「LWW で古いから適用しない」と「宛先を解決できないから捨てる」を **bool 1 本で
+/// 返していたため合算されていた**。 前者は正常系で再配送も不要、 後者は cursor が
+/// 越えるので二度と来ない — 監視上まったく別物なので型で分ける。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyResult {
+    /// 適用した。
+    Applied,
+    /// LWW で古いと判定した (または既に適用済みの重複)。 再配送は不要。
+    SkippedOlder,
+    /// **宛先を解決できず捨てた**。 cursor は越えるので二度と再配送されない。
+    Dropped,
+}
+
+impl ApplyResult {
+    /// `remote_*_apply` の LWW 判定 (bool) を型に持ち上げる。
+    /// `false` = 「自分の方が新しいので書かなかった」= 正常系。
+    #[inline]
+    fn from_lww(applied: bool) -> Self {
+        if applied { ApplyResult::Applied } else { ApplyResult::SkippedOlder }
+    }
 }
 
 impl Syncer {
@@ -327,6 +366,30 @@ impl Syncer {
         let records = self.transport.pull_as(self_peer, from, since);
         let outcome = self.apply_records(&records);
 
+        // **cursor は、 それが消費した state より先に durable になってはいけない。**
+        //
+        // 適用は cell (mmap) のほかに 3 つの派生 state を動かす: `.tables` の
+        // next_local、 `.eidmap` の entity 写像、 `.vocabmap` の text 写像。 後ろ 2 つは
+        // memory から消えると復元手段が無い (受信 op は自分の WAL に残らない)。
+        //
+        // 先に cursor を落とすと「cursor は消費済みと言うが写像は無い」が確定し、
+        // 差分 pull では**二度と埋まらない** (cursor が越えているので当該 record は
+        // 再配送されない)。 実地では text cell に無関係な文字列が入り、 相手が消した
+        // 行がこちらで生き残った。
+        //
+        // caller 側では直せない — `pull_once` が return した時点で cursor は既に
+        // 落ちているため。 だから barrier はここに置く。 失敗したら cursor を進めず、
+        // 次の pull で同じ record を再適用する (apply は冪等: LWW と `get_or_insert`)。
+        //
+        // 条件が `applied > 0` なのは、 何も書いていない pull で fsync しないため。
+        // 「写像だけ確保して drop した」 record (例: ref の target が引けない Tie) は
+        // 未永続の slot を残しうるが、 その slot には何も書かれていないので crash で
+        // 失われても **leak であって破損ではない** (次に同じ entity が来たら別 slot に
+        // 張り直る)。
+        if outcome.applied > 0 && !self.persist_applied_state(from) {
+            return outcome;
+        }
+
         // last_pulled を進める(空 pull でも既存のままで OK)。 進んだら disk に保存。
         // #78 (0.9.0): reject (署名/ACL) された record を cursor が越えない。
         // 旧実装は reject 込みで max HLC まで前進し、 pubkey 登録との race 窓の
@@ -354,6 +417,25 @@ impl Syncer {
         }
 
         outcome
+    }
+
+    /// 適用した state を durable にする。 失敗したら `false` (= cursor を進めない)。
+    ///
+    /// 進めないだけで data は memory 上に載っているので、 次の pull で同じ record が
+    /// 再配送され再適用される (apply は冪等)。 永続できない状態が続く限り cursor は
+    /// 止まったままで、 これは 「黙って先へ進んで欠落を作る」 より望ましい。
+    fn persist_applied_state(&self, from: PeerId) -> bool {
+        match self.engine.persist_sync_state() {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!(
+                    "[enchudb] sync: persist_sync_state failed ({}), holding pull cursor for \
+                     peer {} — the same records will be re-applied on the next pull.",
+                    e, from
+                );
+                false
+            }
+        }
     }
 
     /// request4: subscription filter を差し替える (起動時 1 度設定する想定)。
@@ -534,6 +616,14 @@ impl Syncer {
         }
     }
 
+    /// 受信 record 列を適用する。 `pull_once` の中身であり、 transport を介さず
+    /// record を直接持っている caller (WS push など) の入口でもある。
+    ///
+    /// **注意**: 自前で cursor を持つ caller は、 cursor を永続する
+    /// 前に [`Engine::persist_sync_state`] を呼ぶこと。 適用が作った写像
+    /// (`.eidmap` / `.vocabmap`) より先に cursor が durable になると、 その間の
+    /// crash で「消費済みと言うが写像は無い」が確定し、 差分 pull では埋まらない。
+    /// `pull_once` はこの順序を内側で守っている。
     pub fn apply_records(&self, records: &[WireRecord]) -> SyncOutcome {
         let mut out = SyncOutcome::default();
         // #9 foot-gun ガード: self_peer 未設定 (= 0) で foreign record を apply すると、
@@ -589,10 +679,10 @@ impl Syncer {
                     continue;
                 }
             }
-            if self.apply_one(&store, rec) {
-                out.applied += 1;
-            } else {
-                out.skipped += 1;
+            match self.apply_one(&store, rec) {
+                ApplyResult::Applied => out.applied += 1,
+                ApplyResult::SkippedOlder => out.skipped += 1,
+                ApplyResult::Dropped => out.dropped_unresolved += 1,
             }
         }
         out
@@ -604,7 +694,7 @@ impl Syncer {
     // (旧 buffer の既知バグ: in-memory のみで cursor だけ永続前進 → 再起動で
     //  buffered record が恒久喪失 / eviction が「最古」でなく任意 bucket を破棄)
 
-    fn apply_one(&self, store: &HlcStore, rec: &WireRecord) -> bool {
+    fn apply_one(&self, store: &HlcStore, rec: &WireRecord) -> ApplyResult {
         // 受信した WireRecord の header フィールドを Engine::remote_*_apply の relayed 引数に
         // そのまま渡す (gossip 経路で `OpLog::append_relayed` が元 HLC/author/署名を保持するため)。
         #[inline]
@@ -628,7 +718,7 @@ impl Syncer {
                 // skip。 entity / ref value を先に解決してから LWW を更新する。
                 let local_eid = match self.engine.resolve_remote_eid(*eid, *himo_id) {
                     Some(e) => e,
-                    None => return false,
+                    None => return ApplyResult::Dropped,
                 };
                 // #9: entity 写像ができたので、 この foreign entity 宛に Tie より先に届いて
                 // 退避していた Content を drain して apply する (= 配送順序ロス防止)。
@@ -638,7 +728,7 @@ impl Syncer {
                 let value = if self.engine.himo_is_ref(*himo_id) {
                     match self.engine.resolve_remote_ref_value(rec.author_peer, *value, *himo_id) {
                         Some(v) => v,
-                        None => return false,
+                        None => return ApplyResult::Dropped,
                     }
                 } else {
                     self.engine.translate_remote_vid(rec.author_peer, *himo_id, *value)
@@ -646,16 +736,16 @@ impl Syncer {
                 // request17 step 5: LWW / tombstone の判定は engine (`set_cell`) の
                 // 内側だけ。 ここで判定して別関数で適用する形は、 呼び忘れれば黙って
                 // 壊れる (実際 ローカル write 経路がそうなっていた = #154/#160 の根)。
-                self.engine.remote_tie_apply(local_eid, *himo_id, value, rec.hlc, Some(relayed_header(rec)))
+                ApplyResult::from_lww(self.engine.remote_tie_apply(local_eid, *himo_id, value, rec.hlc, Some(relayed_header(rec))))
             }
             DecodedOp::Untie { eid, himo_id } => {
                 // #9: foreign eid を翻訳 (table-less なら確保先が無いので skip)。
                 let local_eid = match self.engine.resolve_remote_eid(*eid, *himo_id) {
                     Some(e) => e,
-                    None => return false,
+                    None => return ApplyResult::Dropped,
                 };
                 // #9: 写像ができたので退避中の Content を drain。
-                self.engine.remote_untie_apply(local_eid, *himo_id, rec.hlc, Some(relayed_header(rec)))
+                ApplyResult::from_lww(self.engine.remote_untie_apply(local_eid, *himo_id, rec.hlc, Some(relayed_header(rec))))
             }
             DecodedOp::Delete { eid } => {
                 // #9: Delete は himo を持たず table を導けないので既存の翻訳のみ引く。
@@ -663,13 +753,13 @@ impl Syncer {
                 // 無いので skip。
                 let local_eid = match self.engine.resolve_remote_eid_existing(*eid) {
                     Some(e) => e,
-                    None => return false,
+                    None => return ApplyResult::Dropped,
                 };
                 // Delete は全 himo に波及。 tombstone 版数は engine が
                 // (v9 なら tombstone column に永続で) 記録する。 後続の古い HLC の
                 // Tie/Untie/Content は engine 側の tombstone 判定で skip され、
                 // 削除済み entity が復活しない。
-                self.engine.remote_delete_apply(local_eid, rec.hlc, Some(relayed_header(rec)))
+                ApplyResult::from_lww(self.engine.remote_delete_apply(local_eid, rec.hlc, Some(relayed_header(rec))))
             }
             DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => {
                 // 0.9.0: 動的 himo (content 互換層の `_c_{key}`) は id が peer 間で
@@ -678,28 +768,28 @@ impl Syncer {
                 // (mapping は Tie と同じ resolve_remote_eid で作られる)。
                 let local_hid = match self.engine.ensure_himo_named(himo_name, *himo_kind) {
                     Ok(h) => h,
-                    Err(_) => return false, // himo 予算枯渇等 — 適用不能
+                    Err(_) => return ApplyResult::Dropped, // himo 予算枯渇等 — 適用不能
                 };
                 let local_eid = match self.engine.resolve_remote_eid(*eid, local_hid) {
                     Some(e) => e,
-                    None => return false,
+                    None => return ApplyResult::Dropped,
                 };
                 // 値は author-local vid → local vid に変換 (Leaf/Tag のみ、 Number は identity)
                 let value = self.engine.translate_remote_vid(rec.author_peer, local_hid, *value);
-                self.engine.remote_tie_apply(local_eid, local_hid, value, rec.hlc, Some(relayed_header(rec)))
+                ApplyResult::from_lww(self.engine.remote_tie_apply(local_eid, local_hid, value, rec.hlc, Some(relayed_header(rec))))
             }
             DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => {
                 // 0.12.0 (#88): Leaf payload を bytes 同乗で受信。 名前で himo 解決 →
                 // eid 翻訳 → LWW → LeafStore.insert + cell set (vid mapping 不要)。
                 let local_hid = match self.engine.ensure_himo_named(himo_name, *himo_kind) {
                     Ok(h) => h,
-                    Err(_) => return false,
+                    Err(_) => return ApplyResult::Dropped,
                 };
                 let local_eid = match self.engine.resolve_remote_eid(*eid, local_hid) {
                     Some(e) => e,
-                    None => return false,
+                    None => return ApplyResult::Dropped,
                 };
-                self.engine.remote_tieleaf_apply(local_eid, local_hid, bytes, rec.hlc, Some(relayed_header(rec)))
+                ApplyResult::from_lww(self.engine.remote_tieleaf_apply(local_eid, local_hid, bytes, rec.hlc, Some(relayed_header(rec))))
             }
             DecodedOp::Content { eid, key, data } => {
                 // legacy (pre-0.9): 0.9.0 以降は content が TieNamed で運ばれるため、
@@ -710,29 +800,29 @@ impl Syncer {
                 // でも実質死んでいたデータ)。
                 let local_eid = match self.engine.resolve_remote_eid_existing(*eid) {
                     Some(e) => e,
-                    None => return false,
+                    None => return ApplyResult::Dropped,
                 };
                 // legacy Content は cell を持たないので key 単位の LWW だけここに残す
                 // (tombstone 判定は engine 側 `remote_content_apply` が行う)。
                 let key_hash = enchudb_oplog::content_key_hash15(key);
                 if !store.try_set(local_eid, key_hash | 0x8000, rec.hlc) {
-                    return false;
+                    return ApplyResult::SkippedOlder;
                 }
-                self.engine.remote_content_apply(local_eid, key, data, rec.hlc, Some(relayed_header(rec)))
+                ApplyResult::from_lww(self.engine.remote_content_apply(local_eid, key, data, rec.hlc, Some(relayed_header(rec))))
             }
-            DecodedOp::Commit => true, // boundary marker、apply は不要
+            DecodedOp::Commit => ApplyResult::Applied, // boundary marker、apply は不要
             DecodedOp::Vocab { vid, bytes } => {
                 // 0.8.4 issue #30: 既に同 (author_peer, vid, bytes) を登録済みなら
                 // skip。 これが無いと gossip_remote_apply ON で同じ vocab record が
                 // 再 apply され続け、 caller (Syncer) の applied counter が永久に
                 // 0 に戻らず amplification loop の見かけになる。
                 if self.engine.has_remote_vocab(rec.author_peer, *vid, bytes) {
-                    return false;
+                    return ApplyResult::SkippedOlder;
                 }
                 // author_peer の (vid, bytes) を受信。
                 // Engine 側の remote_vocab_apply に委譲 (peer 別 vid mapping を構築)。
                 self.engine.remote_vocab_apply(rec.author_peer, *vid, bytes, Some(relayed_header(rec)));
-                true
+                ApplyResult::Applied
             }
         }
     }
