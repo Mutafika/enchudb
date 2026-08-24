@@ -2728,6 +2728,12 @@ impl Engine {
         // monotone (max) なため問題ない。
         eng.reconcile_next_local_from_bitmap();
 
+        // crash が delete を途中で切った跡 (tombstone は durable、 本体は残存) を
+        // 埋める。 readonly は共有 mmap を書かない契約なので対象外。
+        if !readonly {
+            eng.finish_interrupted_deletes();
+        }
+
         if verify_region_crc {
             // .crc ファイルがあれば全 region CRC 検証
             eng.verify_region_crcs()?;
@@ -5342,6 +5348,143 @@ impl Engine {
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// 削除を **本体まで** 適用する。 `false` = 受信 HLC が既存 tombstone より古いので不採用。
+    ///
+    /// `set_tombstone_local` が扱うのは 「いつ消えたか」 の版数だけで、 本体の除去は
+    /// 呼び元の責務だった。 3 経路 (`delete` / `remote_delete_apply` / WAL replay) が
+    /// 同じ手順を書き写しており、 かつ **判定と適用が 1 本の bool に潰れていた**ため、
+    /// 次の 2 つが起きていた:
+    ///
+    /// - **crash が間に落ちると固まる**: tombstone を書いた直後に殺されると
+    ///   「tombstone は在るが cell は生きている」 で残る。 query 経路
+    ///   (`entities_with_himo` 等) は tombstone を見ないので、 アプリからは
+    ///   **生きた行**に見える (= 消したはずのものが復活して見える)
+    /// - **再適用で直らない**: 同じ Delete が再配送 / WAL replay で戻ってきても、
+    ///   `set_tombstone_local` は同値を `false` で弾く (LWW は真に新しい版だけ通す) ため
+    ///   本体除去に到達しない。 **二度と直らない**
+    ///
+    /// そこで **判定 (LWW) と適用 (本体除去) を分ける**。 拒否するのは受信 HLC が
+    /// 既存 tombstone より**真に古い**ときだけで、 それ以外 (新しい / 同値) は
+    /// 本体除去を必ず実行する = **冪等**。 順序は tombstone 先行のまま変えていない —
+    /// 先に本体を消すと 「tombstone 無しで cell が半端」 な窓ができ、 そこへ届いた
+    /// tie が復活させうるため。 crash 窓に残る 「tombstone は在るが本体が残る」 形は
+    /// 再配送 (この冪等化) と open 時の sweep (`finish_interrupted_deletes`) の
+    /// 両方で埋まる。
+    fn apply_delete_local(&self, local: u32, hlc: enchudb_oplog::Hlc) -> bool {
+        let tomb = self.tombstone_version_of(local);
+        if hlc != enchudb_oplog::Hlc::ZERO
+            && tomb != enchudb_oplog::Hlc::ZERO
+            && hlc < tomb
+        {
+            return false; // 既に記録した削除より古い Delete — 巻き戻さない
+        }
+        // monotone-max。 同値なら版数側は no-op になるが、 本体除去は必ず走らせる。
+        self.set_tombstone_local(local, hlc);
+        self.remove_entity_body(local, hlc);
+        true
+    }
+
+    /// crash が delete を途中で切った跡を open 時に掃除する。 戻り値は直した entity 数。
+    ///
+    /// 対象は **「tombstone が立っているのに、 それより古い cell が生きている」 entity**。
+    /// この形は `apply_delete_local` の doc にあるとおり、 tombstone を書いた直後に
+    /// 落ちると残る。 query 経路は tombstone を見ないので、 放置するとアプリからは
+    /// 生きた行に見え続ける (実地: syncretic の chaos soak で保全した store 3/3 に
+    /// 1 件ずつ在った)。 再配送があれば冪等化した apply が直すが、 record が ring から
+    /// 落ちた後は再配送が来ないので、 **open 時にこちらでも埋める**。
+    ///
+    /// 消すのは 「版数が判っていて、 かつ tombstone より古い」 cell だけ:
+    ///
+    /// - **tombstone より新しい cell は残す** — 削除後に作り直された entity が
+    ///   これに当たる (LWW 上は正しく生きている)
+    /// - **版数不明 (`ZERO`) の cell も残す** — pre-v9 に書かれた / oplog 無効の
+    ///   standalone write などで、 削除との前後が判らない。 判らないものを消すと
+    ///   復元手段が無いので保守側に倒す
+    ///
+    /// 生き残る cell が 1 つも無くなった entity だけ live 登録から外す。
+    /// pre-v9 (版数 column が無い) DB では tombstone 版数自体が揮発なので何もしない。
+    fn finish_interrupted_deletes(&self) -> usize {
+        if !self.has_cell_version() {
+            return 0;
+        }
+        // tombstone column の count = 削除版数を書いた local の上限。 これを越える
+        // slot に tombstone は在り得ないので走査を打ち切る (growable backing の
+        // 未 commit 領域を触らないためでもある)。
+        let tomb_count = match self.tomb_col.as_ref() {
+            Some(col) => col.count(),
+            None => return 0,
+        };
+        if tomb_count == 0 {
+            return 0;
+        }
+        let mut repaired = 0usize;
+        for local in self.entities.iter() {
+            if local >= tomb_count {
+                continue;
+            }
+            let tomb = self.tombstone_hlc_local(local);
+            if tomb == enchudb_oplog::Hlc::ZERO {
+                continue; // 削除されていない = 常態
+            }
+            let mut survivor = false;
+            let mut removed = false;
+            for hid in 0..self.himos.len() {
+                if self.himos[hid].get_value(local).is_none() {
+                    continue;
+                }
+                let v = self.version_of(local, hid as u16);
+                if v != enchudb_oplog::Hlc::ZERO && v < tomb {
+                    self.free_leaf_cell(local, hid);
+                    self.himos[hid].remove(local);
+                    removed = true;
+                } else {
+                    survivor = true;
+                }
+            }
+            if !survivor {
+                self.entities.free(local);
+            }
+            if removed {
+                repaired += 1;
+            }
+        }
+        if repaired > 0 {
+            eprintln!(
+                "warning: finished {repaired} interrupted delete(s) at open (tombstone was durable but the row was still live)"
+            );
+        }
+        repaired
+    }
+
+    /// entity 本体 (全 himo の cell + Leaf payload + live 登録) を落とす。
+    ///
+    /// 削除より **真に新しい** cell は残す — 削除の後に作り直された entity が
+    /// これに当たる (同じ Delete が再配送されたとき、 その後の書き込みまで
+    /// 巻き添えにしないため)。 版数不明 (`ZERO`) の cell は従来どおり消す:
+    /// pre-v9 の cell や oplog 無効の standalone write は版数を持たないので、
+    /// ここで残すと delete が効かなくなる。 `hlc` 自体が `ZERO` (版数を持てない
+    /// standalone の delete) のときも全部消す = 従来挙動。
+    ///
+    /// 版数 column は**触らない** — 「この cell が最後に書かれた版」 は削除後も
+    /// LWW 判定に要る (古い tie の復活を弾くのは版数の役目)。
+    fn remove_entity_body(&self, local: u32, hlc: enchudb_oplog::Hlc) {
+        let mut survivor = false;
+        for hid in 0..self.himos.len() {
+            if self.himos[hid].get_value(local).is_none() {
+                continue;
+            }
+            if hlc != enchudb_oplog::Hlc::ZERO && self.version_of(local, hid as u16) > hlc {
+                survivor = true;
+                continue;
+            }
+            self.free_leaf_cell(local, hid);
+            self.himos[hid].remove(local);
+        }
+        if !survivor {
+            self.entities.free(local);
+        }
+    }
+
     /// entity の削除版数を記録する (A-5)。 `false` = 受信 HLC が古いので不採用。
     ///
     /// entity 本体の解放はこの関数の責務ではない (呼び元の delete 経路が行う)。
@@ -5749,14 +5892,11 @@ impl Engine {
         self.observe_remote_hlc(hlc);
         // A-5: 削除の版数を残す。 これが永続することで、 配送バッファから
         // tombstone が消えた後も削除済み entity が復活しない (#140 の根)。
-        if !self.set_tombstone_local(local, hlc) {
+        // 版数の記録と本体の除去は `apply_delete_local` で不可分に扱う (再配送でも
+        // 本体が必ず落ちる = 冪等)。
+        if !self.apply_delete_local(local, hlc) {
             return false;
         }
-        for hid in 0..self.himos.len() {
-            self.free_leaf_cell(local, hid);
-            self.himos[hid].remove(local);
-        }
-        self.entities.free(local);
         if self.gossip_remote_apply() {
             if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
                 let _ = wal.append_relayed(enchudb_oplog::oplog::Op::Delete { eid }, h);
@@ -6417,15 +6557,9 @@ impl Engine {
         // tombstone が消えた後も削除済み entity が復活しない (#140 の根)。
         let oplog_eid = self.oplog_eid(eid);
         let hlc = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: oplog_eid });
-        if !self.set_tombstone_local(eid, hlc) {
+        if !self.apply_delete_local(eid, hlc) {
             self.warn_local_write_rejected(eid, u16::MAX, hlc);
-            return;
         }
-        for hid in 0..self.himos.len() {
-            self.free_leaf_cell(eid, hid);
-            self.himos[hid].remove(eid);
-        }
-        self.entities.free(eid);
     }
 
     // ──── トランザクション ────
@@ -8681,13 +8815,11 @@ impl Engine {
                 }
             }
             DecodedOp::Delete { eid } => {
+                // replay は冪等でなければならない — 同じ record を二度食っても
+                // 本体が落ちる (`apply_delete_local`)。 旧実装は同値 HLC を
+                // `set_tombstone_local` で弾いて本体を残していた。
                 let local = enchudb_oplog::eid_local(*eid);
-                if self.set_tombstone_local(local, hlc) {
-                    for hid in 0..self.himos.len() {
-                        self.himos[hid].remove(local);
-                    }
-                    self.entities.free(local);
-                }
+                self.apply_delete_local(local, hlc);
             }
             DecodedOp::Content { eid, key, data } => {
                 // legacy (pre-0.9 WAL): 旧 content region へ replay。 0.9.0 以降は

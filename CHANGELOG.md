@@ -120,6 +120,54 @@ entity が 2 つになる。
 手当て不要。 **ただし既に失われた cell は戻らない** — checkpoint が越えた record は物理的に
 残っていても scan 対象外なので、 再 author で埋め直すこと。
 
+### crash が途中で切った delete を、 再配送と open の両方で埋める (#176)
+
+**削除は 「tombstone は在るが行は生きている」 で固まってはいけない。**
+
+delete の 3 経路 (`Engine::delete` / `remote_delete_apply` / WAL replay) はいずれも
+**(1) tombstone 版数を書く → (2) 全 himo の cell を落とす → (3) live 登録を外す** の順で
+流す。 SIGKILL が (1) と (2) の間、 あるいは (2) のループ途中で落ちると (1) だけが残る。
+
+query 経路 (`entities_with_himo` / `Table::all()`) は tombstone を見ないので、 この行は
+**アプリからは生きて見える** — 実地では 「消したファイルが復活する」 形になる。 しかも
+3 経路とも 「本体除去は `set_tombstone_local` が `true` を返したときだけ」 と書かれていて、
+LWW は同値 HLC を弾くので **同じ Delete が再配送 / replay されても本体除去に到達しない**。
+判定と適用が bool 1 本に潰れていたのが根で、 **一度この形になると二度と直らなかった**。
+
+実地 (syncretic の chaos soak / SIGKILL 混じり) では保全した peer store **3 本すべてに
+1 件ずつ**在った。 生き残った cell が毎回 himo 宣言順ループの**接尾辞**になっており、
+中断点がループ内であることが確認できている:
+
+| 生き残った cell | 形 |
+|---|---|
+| 9 cell 全部 | PK も生きているのでアプリから見える行 = 亡霊ファイル |
+| `size` / `mode` / `mtime` / `symlink_target` | 識別子が落ちた残骸。 `Table::all()` の母集団に入らないので監査からも見えず、 `entities.free` も走らないので slot を占有し続ける |
+
+#### 変更
+
+- `Engine::apply_delete_local()` を追加し、 delete 3 経路をここへ寄せた。 **判定 (LWW) と
+  適用 (本体除去) を分ける** — 拒否するのは受信 HLC が既存 tombstone より**真に古い**ときだけで、
+  それ以外 (新しい / 同値) は本体除去を必ず実行する = **冪等**。 再配送と WAL replay が
+  修復経路になる
+- `Engine::finish_interrupted_deletes()` を追加し、 **writer open のたびに** 「tombstone より
+  古い cell が生きている entity」 を掃除する。 record が ring から落ちた後は再配送が来ないので、
+  既に壊れた DB を直す道がこれしか無い。 直した件数は warning として stderr に出す
+- 本体除去は **削除より真に新しい cell を残す** ようになった (削除後に作り直された行を、
+  同じ Delete の再配送で巻き添えにしないため)。 版数不明 (`ZERO`) の cell は従来どおり消す —
+  pre-v9 / oplog 無効の standalone write は版数を持たないので、 残すと delete が効かなくなる
+- WAL replay の Delete 経路が `free_leaf_cell` を呼んでいなかった (Leaf payload の leak) のも
+  同時に直った
+
+順序 (tombstone 先行) は**変えていない**。 先に本体を消すと 「tombstone 無しで cell が半端」 な
+窓ができ、 そこへ届いた古い tie が復活させうる。 crash 窓に残る形は冪等化と open sweep の
+両方で埋まる。
+
+#### 移行
+
+手当て不要。 **既に壊れている DB は writer open で自動的に直る** (v9 の DB のみ — pre-v9 は
+tombstone 版数が揮発なので対象外)。 実地で壊れていた store 3 本で、 open 時に 1 件ずつ
+掃除されることを確認済み。
+
 ### 翻訳できない remote vocab id を cell に書かない
 
 **翻訳できない remote の vocab id を cell に書かないようにした。** text (Tag/Leaf) の値は
