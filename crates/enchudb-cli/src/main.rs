@@ -332,6 +332,7 @@ fn cmd_stats(eng: &Engine) {
     println!("queue_len      {}", s.queue_len);
     println!("pushed/applied {}/{}", s.pushed, s.applied);
     println!("peer_id        {}", s.peer_id);
+    println!("bind_over_local_writes {}", s.bind_over_local_writes);
 }
 
 fn cmd_orphans(eng: &Engine) {

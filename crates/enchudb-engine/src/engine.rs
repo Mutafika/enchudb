@@ -66,6 +66,9 @@ pub struct EngineStats {
     pub hlc_entries: usize,
     /// 同上 — pre-v9 DB の揮発置き場の最大 HLC。 v9 DB では None。
     pub max_hlc: Option<enchudb_oplog::Hlc>,
+    /// #178: 「自分が書いた行が後から foreign identity に束ねられた」 累計。
+    /// `> 0` なら相手側に PK 無しの重複行が生えている可能性がある。 0 が常態。
+    pub bind_over_local_writes: u64,
 }
 
 /// 0.8.16 (issue #54): vocab の orphan (= 死蔵 vid) 検出スナップショット。
@@ -1843,6 +1846,15 @@ pub struct Engine {
     /// bridge から除外した際の一度きり警告フラグ (u32 wire value に世界番号が
     /// 入らないため発送不能、 wire 拡張の follow-up 待ち)。
     warned_ref_to_replica: std::sync::atomic::AtomicBool,
+    /// #178 検知: 「自分が書いた行が、 後から foreign identity に束ねられた」 回数。
+    ///
+    /// 書き戻しの宛名付け替えは bridge 時に `eid_translator.reverse()` を引くので、
+    /// **束ねられる前に書いた分は自分の eid のまま出て行く**。 相手側はそれを別 entity
+    /// として払い出すので、 **PK を持たない重複行**が生える (詳細は #178)。
+    /// ここでその瞬間 (= bind 時に、 その行に自分が書いた cell が既に在る) を数える。
+    /// 静かに壊れる経路なので、 まず観測できるようにするのが目的。
+    bind_over_local_writes: std::sync::atomic::AtomicU64,
+    warned_bind_over_local_writes: std::sync::atomic::AtomicBool,
     /// 0.18.2: `_sync_ops` 満杯 backpressure の warn を 1 回に抑制（解消で解除）。
     warned_sync_ops_full: std::sync::atomic::AtomicBool,
     /// request17 (v9): ローカル write が cell の版数判定で弾かれた warn の一度きり
@@ -2197,6 +2209,8 @@ impl Engine {
             oplog_record_queue: None,
             consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             warned_ref_to_replica: std::sync::atomic::AtomicBool::new(false),
+            bind_over_local_writes: std::sync::atomic::AtomicU64::new(0),
+            warned_bind_over_local_writes: std::sync::atomic::AtomicBool::new(false),
             warned_sync_ops_full: std::sync::atomic::AtomicBool::new(false),
             warned_cell_version_reject: std::sync::atomic::AtomicBool::new(false),
             hlc_mint_lock: parking_lot::Mutex::new(()),
@@ -2540,6 +2554,8 @@ impl Engine {
             oplog_record_queue: None,
             consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             warned_ref_to_replica: std::sync::atomic::AtomicBool::new(false),
+            bind_over_local_writes: std::sync::atomic::AtomicU64::new(0),
+            warned_bind_over_local_writes: std::sync::atomic::AtomicBool::new(false),
             warned_sync_ops_full: std::sync::atomic::AtomicBool::new(false),
             warned_cell_version_reject: std::sync::atomic::AtomicBool::new(false),
             hlc_mint_lock: parking_lot::Mutex::new(()),
@@ -3461,6 +3477,8 @@ impl Engine {
             oplog_record_queue: None,
             consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             warned_ref_to_replica: std::sync::atomic::AtomicBool::new(false),
+            bind_over_local_writes: std::sync::atomic::AtomicU64::new(0),
+            warned_bind_over_local_writes: std::sync::atomic::AtomicBool::new(false),
             warned_sync_ops_full: std::sync::atomic::AtomicBool::new(false),
             warned_cell_version_reject: std::sync::atomic::AtomicBool::new(false),
             hlc_mint_lock: parking_lot::Mutex::new(()),
@@ -4791,10 +4809,48 @@ impl Engine {
             .eid_translator
             .get_or_insert_with(author_peer, foreign_local, || Some(target_local))
             .unwrap_or(target_local);
+        // #178: **束ねる前に自分が書いていた**なら、 その write は既に自分の eid のまま
+        // bridge されている (宛名の付け替えは bridge 時に `reverse()` を引くため)。
+        // 相手側はそれを別 entity として払い出すので PK 無しの重複行が生える。
+        // ここでは直せない (出て行った record は取り消せない) ので、 **観測できるように
+        // 数える**。 実地で静かに壊れていた経路。
+        self.note_bind_over_local_writes(local, self_peer);
         // 束ね先の entity は live 扱いにしておく (remote_tie_apply と同じ前提)。
         self.entities.ensure_live(local);
         Self::advance_table_next_local_for(&self.tables, local);
         enchudb_oplog::make_eid(self_peer, local)
+    }
+
+    /// #178 検知の実体。 `local` の行に **自分が著者の cell** が 1 つでも在れば数える。
+    ///
+    /// 判定材料は cell の版数 (`Hlc::peer`) だけ — 別の state を持たないので、
+    /// bind (= foreign entity ごとに一度) のときだけ O(himo 数) 走るコストで済む。
+    fn note_bind_over_local_writes(&self, local: u32, self_peer: enchudb_oplog::PeerId) {
+        use std::sync::atomic::Ordering;
+        let mine = (0..self.himos.len()).any(|hid| {
+            self.himos[hid].get_value(local).is_some()
+                && self.version_of(local, hid as u16).peer == self_peer
+        });
+        if !mine {
+            return;
+        }
+        self.bind_over_local_writes.fetch_add(1, Ordering::Relaxed);
+        if !self.warned_bind_over_local_writes.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[enchudb] warning: a row this peer had written was bound to a remote identity \
+                 afterwards; writes made before the bind went out under this peer's own eid and \
+                 may have created a duplicate row on the other side (#178). \
+                 see Engine::bind_over_local_writes()"
+            );
+        }
+    }
+
+    /// #178: 「自分が書いた行が後から foreign identity に束ねられた」 累計回数。
+    ///
+    /// `> 0` なら、 相手側に **PK を持たない重複行**が生えている可能性がある
+    /// (bind 前に出て行った write の分)。 監視用。 0 が常態。
+    pub fn bind_over_local_writes(&self) -> u64 {
+        self.bind_over_local_writes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 0.8.7: 登録済 himo の総数。 schema crate の synthesize fallback (= engine 直
@@ -9566,6 +9622,7 @@ impl Engine {
             pushed: self.push_count.load(Ordering::Acquire),
             applied: self.apply_count.load(Ordering::Acquire),
             peer_id,
+            bind_over_local_writes: self.bind_over_local_writes(),
             hlc_entries,
             max_hlc,
         }
