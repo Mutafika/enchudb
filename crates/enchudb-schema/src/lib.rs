@@ -64,6 +64,7 @@
 use enchudb_engine::{Engine, ValueType};
 /// #118: growable layout の全 knob を露出する options 型を re-export
 /// (`enchudb_schema::GrowableOptions` / `LeafScale` で使えるように)。
+pub use enchudb_engine::engine::TableEidUsage;
 pub use enchudb_engine::{GrowableOptions, LeafScale};
 use enchudb_oplog::EntityId;
 use std::sync::Arc;
@@ -496,6 +497,20 @@ impl Database {
     }
 
     pub fn engine(&self) -> &Engine { &self.eng }
+
+    /// まだどの table にも割り当てていない eid 空間。 追加の table を
+    /// `with_capacity` で切り出す前にここを見る。
+    ///
+    /// `max_entities` は create 時に header へ焼かれるので、 超える `with_capacity`
+    /// は `build()` が `Err` になる (黙って縮めない — 頼んだ枠と違う table が
+    /// できる方が事故になる)。
+    pub fn remaining_eid_capacity(&self) -> u32 { self.eng.remaining_eid_capacity() }
+
+    /// table の eid 枠の使用状況 (未定義 table は `None`)。 枠は create 時に固定で
+    /// 後から伸ばせないので、 **満杯にする前に気付く**のがアプリ側の防御になる。
+    pub fn table_eid_usage(&self, name: &str) -> Option<TableEidUsage> {
+        self.eng.table_eid_usage(name)
+    }
 
     /// `Arc<Engine>` を clone して返す。 engine 直接アクセス / 他 component との共有用。
     pub fn arc_engine(&self) -> Arc<Engine> { self.eng.clone() }
