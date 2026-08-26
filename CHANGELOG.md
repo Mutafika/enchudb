@@ -3,7 +3,33 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
-## Unreleased
+## 0.21.0 — 2026-08-26
+
+**sync 経路で 「消えた / 復活した / 二重になった」 が起きる道を塞いだ release。** 2 台の
+daemon に SIGKILL を混ぜた soak と実機で出ていた壊れ方を、 1 つずつ根まで追って潰している。
+
+| 実地で見えた症状 | 直したもの |
+|---|---|
+| 相手が削除した行がこちらで生き残る / text cell に無関係な文字列が入る | pull cursor の順序違反 + `.vocabmap` (写像の永続先) |
+| WAL に届いた write が body 未適用のまま checkpoint に埋められて消える | `recover_with_tail` |
+| 翻訳できない remote vocab id を cell に書く | `dropped_vocab` として落とす |
+| 消したはずのファイルが復活する | delete の冪等化 + open の sweep。 **移行してきた行も** |
+| 観測記録だけ消えて、 その path の削除が永久に見送られる | local-only table (request19) |
+| eid 枠が詰まって回復不能になりうる | 残量 API + 「満杯でも delete は通る」 の固定 |
+
+### 検証状況 (先に読むこと)
+
+**この rev そのものでは chaos soak を回していない。** 直前の rev (`7977053` = pull cursor /
+`recover_with_tail` / delete の冪等化 / local-only table まで) では **8 seed × 30 分 ×
+SIGKILL を 3 回連続で全 green**、 実機でも 218,971 records を捌いて dropped 0。
+
+その green な rev からの差分は 2 つだけで、 どちらも独立に確認してある:
+
+- **`bind_over_local_writes` counter** — 数えるだけで挙動を変えない (#178 の検知)
+- **sweep の版数不明 cell の扱い** — 実機 store の複製で before / after を実測
+  (8,490 行 → 0、 枠の使用率 97% → 46%)
+
+---
 
 **pull cursor が、 それが消費した state より先に durable になる順序違反を直した。** 併せて
 sync の写像 (`(author_peer, remote_vid) → local_vid`) に永続先を作り、 `SyncOutcome` の
