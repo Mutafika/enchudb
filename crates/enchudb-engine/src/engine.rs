@@ -35,6 +35,25 @@ pub enum EntityValue<'a> {
     Content(&'a [u8]),
 }
 
+/// table の eid 枠の使用状況。 `Engine::table_eid_usage` の戻り値。
+///
+/// 枠 (`capacity`) は create 時に固定で、 後から伸ばせない。 溢れると
+/// `entity_in` が `Err` を返し、 **アプリの掃引がそこで止まる** — 掃引が
+/// 止まると削除も流れなくなり、 削除は枠を空ける唯一の手段なので回復不能に
+/// なる。 その手前で気付けるように、 残量を公式に問い合わせられるようにした。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableEidUsage {
+    /// 枠の総数 (= `eid_range_hi - eid_range_lo`)。
+    pub capacity: u32,
+    /// これまでに払い出した最大 (= `next_local`)。 削除で空いた分は含んだまま。
+    pub allocated: u32,
+    /// いま生きている行数。
+    pub live: u32,
+    /// あと何行入るか (= `capacity - live`)。 削除で空いた slot は
+    /// `entity_in` が free list 経由で再利用するのでここに戻る。
+    pub free: u32,
+}
+
 /// v29: Engine の実行時状態スナップショット。
 #[derive(Debug, Clone)]
 pub struct EngineStats {
@@ -4316,8 +4335,9 @@ impl Engine {
             .ok_or_else(|| "eid space overflow (u32::MAX)".to_string())?;
         if new_hi > self.max_entities {
             return Err(format!(
-                "table '{}' eid range [{}, {}) exceeds max_entities {}",
+                "table '{}' eid range [{}, {}) exceeds max_entities {} (remaining {}; see Engine::remaining_eid_capacity)",
                 name, new_lo, new_hi, self.max_entities,
+                self.max_entities.saturating_sub(new_lo),
             ));
         }
 
@@ -4706,6 +4726,43 @@ impl Engine {
     /// 未定義 table は None。
     pub fn table_eid_range(&self, name: &str) -> Option<(u32, u32)> {
         self.tables.iter().find(|t| t.name == name).map(|t| (t.eid_range_lo, t.eid_range_hi))
+    }
+
+    /// table の eid 枠の使用状況 (未定義 table は `None`)。
+    ///
+    /// 枠は create 時に固定なので、 **満杯にする前に気付く**のがアプリ側の唯一の
+    /// 防御になる。 満杯後は `entity_in` が `Err` を返し、 そこで掃引を止めると
+    /// 削除まで流れなくなって回復不能になる (削除は枠を空ける唯一の手段)。
+    pub fn table_eid_usage(&self, name: &str) -> Option<TableEidUsage> {
+        let t = self.tables.iter().find(|t| t.name == name)?;
+        let capacity = t.eid_range_hi.saturating_sub(t.eid_range_lo);
+        let allocated = t
+            .next_local
+            .load(std::sync::atomic::Ordering::Acquire)
+            .min(capacity);
+        let live = self.entities.live_count_in(t.eid_range_lo, t.eid_range_hi);
+        Some(TableEidUsage { capacity, allocated, live, free: capacity.saturating_sub(live) })
+    }
+
+    /// まだどの table にも割り当てていない eid 空間 (= これから `define_table` で
+    /// 切り出せる上限)。
+    ///
+    /// `max_entities` は create 時に header へ焼かれるので、 後から table を足す
+    /// アプリ (例: 追加の local-only table) はここを見てから `with_capacity` を
+    /// 決める必要がある。 これが無いと 「既知の table 名の range を全部引いて
+    /// 自分で引き算する」 しかなかった。
+    pub fn remaining_eid_capacity(&self) -> u32 {
+        // anonymous table は open (`hi == u32::MAX`) のことがある。 `define_table` は
+        // それを現 `next_eid` で閉じてから max を取るので、 ここでも同じ数え方をする。
+        let used = self
+            .tables
+            .iter()
+            .map(|t| {
+                if t.eid_range_hi == u32::MAX { self.entities.next_eid() } else { t.eid_range_hi }
+            })
+            .max()
+            .unwrap_or(0);
+        self.max_entities.saturating_sub(used)
     }
 
     /// request19: **local-only table の行を全部落とす** (snapshot / bootstrap の受け側用)。
@@ -5495,6 +5552,29 @@ impl Engine {
         true
     }
 
+    /// 途中で切れた delete の跡を **数えるだけ** (修復しない)。 readonly でも呼べる。
+    ///
+    /// アプリ側の監査が 「tombstone が在る && 行が生きている」 で数えると、
+    /// **削除の後に作り直された行**まで拾ってしまう (LWW 上は正しく生きている)。
+    /// 判定は sweep と同一にしておかないと 「直したのに数字が減らない」 になる。
+    pub fn interrupted_delete_count(&self) -> usize {
+        self.scan_interrupted_deletes(/*repair=*/ false)
+    }
+
+    /// 途中で切れた delete の跡を **その場で埋める** (open 時の sweep と同じ)。 戻り値は直した数。
+    ///
+    /// 通常は writer open のたびに自動で走るので明示的に呼ぶ必要は無い。 長時間
+    /// 開きっぱなしの daemon が、 再起動せずに修復したい場合の入口。
+    pub fn repair_interrupted_deletes(&self) -> usize {
+        self.check_writable();
+        self.scan_interrupted_deletes(/*repair=*/ true)
+    }
+
+    /// writer open 時の自動 sweep 入口 (`open_internal` から)。
+    fn finish_interrupted_deletes(&self) -> usize {
+        self.scan_interrupted_deletes(/*repair=*/ true)
+    }
+
     /// crash が delete を途中で切った跡を open 時に掃除する。 戻り値は直した entity 数。
     ///
     /// 対象は **「tombstone が立っているのに、 それより古い cell が生きている」 entity**。
@@ -5504,17 +5584,18 @@ impl Engine {
     /// 1 件ずつ在った)。 再配送があれば冪等化した apply が直すが、 record が ring から
     /// 落ちた後は再配送が来ないので、 **open 時にこちらでも埋める**。
     ///
-    /// 消すのは 「版数が判っていて、 かつ tombstone より古い」 cell だけ:
-    ///
-    /// - **tombstone より新しい cell は残す** — 削除後に作り直された entity が
-    ///   これに当たる (LWW 上は正しく生きている)
-    /// - **版数不明 (`ZERO`) の cell も残す** — pre-v9 に書かれた / oplog 無効の
-    ///   standalone write などで、 削除との前後が判らない。 判らないものを消すと
-    ///   復元手段が無いので保守側に倒す
+    /// 残すのは **tombstone より真に新しい cell** だけ — 削除後に作り直された
+    /// entity がこれに当たる (LWW 上は正しく生きている)。 それ以外は本体除去
+    /// (`remove_entity_body`) と同じ判断で落とす。 **版数不明 (`ZERO`) も落とす**:
+    /// durable な tombstone は v9 領域が生えた後にしか書けない (pre-v9 の tombstone は
+    /// 揮発 `HlcStore`、 foreign 分の `.eidmap` 復元先も移行後の tombstone column) ので、
+    /// 「durable な tombstone が在る」 ⇒ 「その版数不明 cell は削除より前」 が言える。
+    /// ここだけ保守側に倒すと、 **古い版から上げてきた store** (= 移行で全 cell が
+    /// 版数不明になる = 実運用で最も修復が要る母集団) だけが永久に直らない。
     ///
     /// 生き残る cell が 1 つも無くなった entity だけ live 登録から外す。
     /// pre-v9 (版数 column が無い) DB では tombstone 版数自体が揮発なので何もしない。
-    fn finish_interrupted_deletes(&self) -> usize {
+    fn scan_interrupted_deletes(&self, repair: bool) -> usize {
         if !self.has_cell_version() {
             return 0;
         }
@@ -5537,29 +5618,41 @@ impl Engine {
             if tomb == enchudb_oplog::Hlc::ZERO {
                 continue; // 削除されていない = 常態
             }
-            let mut survivor = false;
-            let mut removed = false;
+            // 削除より後に書かれた cell だけが 「削除後に作り直された行」。
+            // それ以外 (古い / 版数不明) が 1 つでも生きていれば、 削除が
+            // 途中で切れた跡なので本体除去をやり直す。 判断は
+            // `remove_entity_body` と同一 — ここだけ保守側に倒すと、
+            // 「本体除去なら消える cell が、 sweep では永久に残る」 になる。
+            let mut has_cell = false;
+            let mut stale = false;
             for hid in 0..self.himos.len() {
                 if self.himos[hid].get_value(local).is_none() {
                     continue;
                 }
-                let v = self.version_of(local, hid as u16);
-                if v != enchudb_oplog::Hlc::ZERO && v < tomb {
-                    self.free_leaf_cell(local, hid);
-                    self.himos[hid].remove(local);
-                    removed = true;
-                } else {
-                    survivor = true;
+                has_cell = true;
+                if !(self.version_of(local, hid as u16) > tomb) {
+                    stale = true;
+                    break;
                 }
             }
-            if !survivor {
-                self.entities.free(local);
-            }
-            if removed {
+            if !has_cell {
+                // tombstone は durable、 cell も落ちきっているのに live 登録だけ
+                // 残った形 (= (2) と (3) の間で落ちた)。 slot を返す。
+                if repair {
+                    self.entities.free(local);
+                }
                 repaired += 1;
+                continue;
             }
+            if !stale {
+                continue; // 削除後に作り直された行 — LWW 上は正しく生きている
+            }
+            if repair {
+                self.remove_entity_body(local, tomb);
+            }
+            repaired += 1;
         }
-        if repaired > 0 {
+        if repair && repaired > 0 {
             eprintln!(
                 "warning: finished {repaired} interrupted delete(s) at open (tombstone was durable but the row was still live)"
             );

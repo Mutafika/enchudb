@@ -120,6 +120,73 @@ entity が 2 つになる。
 手当て不要。 **ただし既に失われた cell は戻らない** — checkpoint が越えた record は物理的に
 残っていても scan 対象外なので、 再 author で埋め直すこと。
 
+### 移行してきた行の delete が open の sweep で埋まらない (#176 の続き)
+
+**#177 の sweep が、 実運用で最も修復が要る母集団だけ素通りしていた。**
+
+実地 (syncretic の実機 store、 作り直す前のコピー / live 15,953 / 枠 16,384) を
+**#177 入りのバイナリで複数回 writer open した上で** 8,490 行が残っていた。 内訳:
+
+| | |
+|---|---|
+| tombstone 付きで生きている行 | 8,490 |
+| うち 「削除より後に書かれた cell」 を含む (= 作り直し。 直す対象ではない) | **0** |
+| うち live cell が全部 **版数不明 (ZERO)** | **8,490** (100%) |
+| live cell の内訳 | zero 67,919 / stale 0 / newer 0 |
+
+= **全行が全列そろって生きたまま、 削除が 1 cell も進んでいない**。 sweep が走った上で
+残っているので、 版数不明 cell を素通りしていたことの裏付けになる。
+
+修正版 (df90377) を同じ store に当てた結果:
+
+|  | 修復前 | 修復後 |
+|---|---|---|
+| `interrupted_delete_count()` | 8,490 | **0** |
+| `files` の live | 15,953 | 7,463 |
+| `files` の free | 431 | 8,921 |
+| 枠の使用率 | 97% | 46% |
+
+open 時に `warning: finished 8490 interrupted delete(s) at open` が 1 行。 **枠が 8,490 戻る**
+ので、 この形の store は作り直さずに済む。
+
+v8 以前から上げてきた DB は、 移行時に既存 cell の版数が **不明 (`ZERO`)** になる。 sweep は
+版数不明の cell を 「削除との前後が判らない」 として保守的に残していたため、 そういう行は
+tombstone が durable でも本体が残り続けた — 再配送が来ない (record が ring から落ちた後)
+場合、 **二度と直らない**。
+
+durable な tombstone は v9 領域が生えた後にしか書けない (pre-v9 の tombstone は揮発
+`HlcStore`、 `.eidmap` から復元される foreign 分も復元先は移行後の tombstone column) ので、
+
+> durable な tombstone が在る ⇒ その版数不明 cell は削除より前に書かれた
+
+が言える。 本体除去 (`remove_entity_body`) は元からこの判断で版数不明 cell を消していたので、
+**sweep だけが食い違っていた**形。
+
+- sweep の判定を本体除去と同一にした (残すのは **tombstone より真に新しい cell** だけ)
+- `Engine::interrupted_delete_count()` — 修復せずに数えるだけ (readonly 可)。
+  アプリ側が 「tombstone が在る && 行が生きている」 で数えると **削除の後に作り直された行**
+  まで拾い、 修復しても数字が減らない (実地の監査が 8,490 行を残骸と報告したのがこの形)。
+  判定を sweep と共有することで 「直したのに直っていない」 を無くす
+- `Engine::repair_interrupted_deletes()` — 再起動せずにその場で埋める入口
+  (通常は writer open のたびに自動で走る)
+
+### eid 枠の残量を問い合わせられるようにした
+
+**枠は create 時に固定で、 満杯にすると回復不能になりうる。** `entity_in` が `Err` を返した
+ところでアプリが掃引を止めると、 **削除も流れなくなる** — 削除は枠を空ける唯一の手段なので、
+一度この形に入ると自力では戻れない。 手前で気付く手段が公式に無く、 既知の table 名の
+range から手で引き算するしかなかった。
+
+- `Engine::remaining_eid_capacity()` / `Database::remaining_eid_capacity()` —
+  まだどの table にも割り当てていない eid 空間 (= これから `with_capacity` で切り出せる上限)
+- `Engine::table_eid_usage(name)` / `Database::table_eid_usage(name)` →
+  `TableEidUsage { capacity, allocated, live, free }`。 `free` は削除で戻る
+  (`allocated` は払出の最大なので減らない)
+- `define_table` の枠超過 error に残量を載せた。 **黙って縮めない** — 頼んだ枠と違う
+  table ができる方が事故になる
+
+満杯でも `delete` は通り、 枠は即座に戻る (test で固定)。 枠そのものを後から伸ばす件は
+`notes/requests/request20.md`。
 ### 書き戻しの宛名が付け替わらなかった時に、 それを数える (#178 の検知)
 
 **静かに壊れる経路を、 まず観測できるようにした。** 直しそのものは #178 で継続。

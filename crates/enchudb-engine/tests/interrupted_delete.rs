@@ -195,3 +195,96 @@ fn redelivered_delete_keeps_cells_written_after_it() {
 
     fresh(&path);
 }
+
+/// **v8 → v9 migration を経た行** (= cell の版数が不明) でも、 途中で切れた
+/// delete が open の sweep で埋まること。
+///
+/// 移行してきた DB では既存 cell の版数は `ZERO` (= 不明) になる。 一方
+/// tombstone は **v9 領域が生えた後にしか durable に書けない** (pre-v9 の
+/// tombstone は揮発 `HlcStore`、 foreign 分は `.eidmap` から復元されるが、
+/// いずれも復元先は移行後の tombstone column)。 つまり
+///
+///   「durable な tombstone が在る」 ⇒ 「その cell は tombstone より前に書かれた」
+///
+/// が成り立つので、 版数不明の cell は **削除より古い**と判断してよい。
+/// これを保守側に倒して残すと、 実運用で最も修復が要る母集団 (= 古い版から
+/// 上げてきた store) だけが永久に直らない。 本体除去 (`remove_entity_body`) が
+/// 版数不明 cell を消しているのと判断も揃える。
+#[test]
+fn a_migrated_row_whose_delete_was_interrupted_is_finished_too() {
+    let path = tmp_path("migrated");
+    fresh(&path);
+
+    // v9 領域を持たない DB に 2 cell 書く (= 版数が付かない)。
+    let eid = {
+        let mut eng = Engine::create_without_cell_version(&path, 256).unwrap();
+        eng.define_himo("a", ValueType::Number, 0);
+        eng.define_himo("b", ValueType::Number, 0);
+        assert!(!eng.has_cell_version(), "前提が崩れた: v9 領域を持っている");
+        let eid = eng.entity();
+        eng.tie_to(eid, "a", 11);
+        eng.tie_to(eid, "b", 22);
+        eng.flush().unwrap();
+        eid
+    };
+
+    // writer open で v9 へ自動移行 → tombstone を書いた直後に落ちる。
+    {
+        let eng = Engine::open_concurrent_with_oplog(&path, CAP).expect("migrate open");
+        assert!(eng.has_cell_version(), "v9 へ移行していない");
+        assert_eq!(
+            eng.cell_hlc(eid, 0),
+            Hlc::ZERO,
+            "移行してきた cell に版数が付いてしまっている (test の前提が崩れた)"
+        );
+        interrupt_delete_at_tombstone(&eng, eid, hlc(200));
+        eng.flush_writes();
+        eng.oplog_sync().expect("durable");
+    }
+
+    let eng = Engine::open_concurrent_with_oplog(&path, CAP).expect("reopen");
+    assert_eq!(
+        eng.get(eid, "a"),
+        None,
+        "版数不明の cell を持つ行だけ、 途中で切れた delete が永久に直らない \
+         (古い版から上げてきた store が修復対象から漏れる)"
+    );
+    assert_eq!(eng.get(eid, "b"), None);
+    assert!(!eng.is_live(eid), "行が live のまま = query から見えてしまう");
+
+    fresh(&path);
+}
+
+/// 監査用の数え方 (`interrupted_delete_count`) が **sweep と同じ判定**であること。
+///
+/// アプリ側が 「tombstone が在る && 行が生きている」 で数えると、 **削除の後に
+/// 作り直された行**まで拾う (LWW 上は正しく生きているので、 修復しても数字は
+/// 減らない = 「直したのに直っていない」 と読めてしまう)。 実地の監査が
+/// 8,490 行を 「途中で切れた削除」 と報告したのがこの形。
+#[test]
+fn the_audit_count_excludes_rows_recreated_after_the_delete() {
+    let path = tmp_path("count");
+    fresh(&path);
+
+    let (eng, broken, ha, _) = open_with_row(&path);
+    // (1) 途中で切れた削除 = 修復対象。
+    interrupt_delete_at_tombstone(&eng, broken, hlc(200));
+
+    // (2) 削除の後に作り直された行 = 修復対象ではない。
+    let recreated = eng.entity();
+    assert!(eng.remote_tie_apply(recreated, ha, 1, hlc(100), None));
+    assert!(eng.set_tombstone(recreated, hlc(200)));
+    assert!(eng.remote_tie_apply(recreated, ha, 2, hlc(300), None));
+
+    assert_eq!(
+        eng.interrupted_delete_count(),
+        1,
+        "削除後に作り直された行まで 「途中で切れた削除」 として数えている"
+    );
+    assert_eq!(eng.repair_interrupted_deletes(), 1, "修復数が数えた数と合わない");
+    assert_eq!(eng.interrupted_delete_count(), 0, "修復後も数字が残っている");
+    assert_eq!(eng.get(recreated, "a"), Some(2), "作り直された行を消している");
+    assert_eq!(eng.get(broken, "a"), None);
+
+    fresh(&path);
+}

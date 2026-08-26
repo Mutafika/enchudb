@@ -207,6 +207,43 @@ impl EntitySet {
         self.live_count_atomic().load(Ordering::Relaxed)
     }
 
+    /// `[lo, hi)` 範囲の live 数。 table 単位の枠使用量 (`Engine::table_eid_usage`)
+    /// を出すのに使う。 bitset を byte 単位で popcount するので 1M entity でも
+    /// 128KB の線形走査で済む (呼ばれるのは診断時のみで hot path 外)。
+    pub fn live_count_in(&self, lo: u32, hi: u32) -> u32 {
+        let hi = hi.min(self.max_entities);
+        if lo >= hi {
+            return 0;
+        }
+        let mm = self.region.slice();
+        let mut n = 0u32;
+        // 端の byte は bit 単位、 中間は byte 単位で数える。
+        let first_full = (lo + 7) & !7;
+        let last_full = hi & !7;
+        if first_full >= hi {
+            for e in lo..hi {
+                if mm[self.bitset_offset + (e / 8) as usize] & (1u8 << (e % 8)) != 0 {
+                    n += 1;
+                }
+            }
+            return n;
+        }
+        for e in lo..first_full {
+            if mm[self.bitset_offset + (e / 8) as usize] & (1u8 << (e % 8)) != 0 {
+                n += 1;
+            }
+        }
+        for b in (first_full / 8)..(last_full / 8) {
+            n += mm[self.bitset_offset + b as usize].count_ones();
+        }
+        for e in last_full..hi {
+            if mm[self.bitset_offset + (e / 8) as usize] & (1u8 << (e % 8)) != 0 {
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// #117: `[lo, hi)` 範囲内で最上位の live eid を返す (無ければ None)。
     /// open 時に per-table `next_local` を live bitmap から自己修復するために使う。
     /// bitset を上から逆走査し、 空 byte は byte 単位で skip するので append-mostly
