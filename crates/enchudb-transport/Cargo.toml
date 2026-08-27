@@ -1,6 +1,6 @@
 [package]
 name = "enchudb-transport"
-version = "0.22.0"
+version = "0.23.0"
 edition = "2024"
 rust-version = "1.89"   # std::fs::File::lock (#133 Windows 対応)
 description = "Transport implementations for enchudb — HTTP (std-only) and WebSocket (tungstenite)."
