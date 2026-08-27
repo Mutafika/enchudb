@@ -5635,9 +5635,15 @@ impl Engine {
         self.peer_id.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// CRDT mesh mode の有効化。 true にすると `remote_*_apply` で受信した op を
-    /// `append_relayed` で自分の WAL にも記録し、 次の publish で他 peer に gossip する。
+    /// CRDT mesh / relay mode の有効化。 true にすると Syncer が受信 record を
+    /// **原型のまま** (`Engine::relay_record` #209) 自分の WAL に載せ、 次の
+    /// publish で他 peer に配布する = 読み専 replica / gossip の土台。
     /// ホスト/クライアント構成では false のまま (= ホストの WAL に届いた時点で完結)。
+    ///
+    /// #209: 旧実装は `remote_*_apply` (翻訳後の値しか持たない場所) が翻訳後の
+    /// eid/value を append しており、 direct 経路と混在すると row 重複 / vocab
+    /// 写像汚染 / 署名不一致を起こした。 relay の append は Syncer 側 (原
+    /// WireRecord を持つ場所) に移動済み。
     pub fn set_gossip_remote_apply(&self, on: bool) {
         self.gossip_remote_apply
             .store(on, std::sync::atomic::Ordering::Release);
@@ -5646,6 +5652,71 @@ impl Engine {
     pub fn gossip_remote_apply(&self) -> bool {
         self.gossip_remote_apply
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// #209: 受信 record を**素通し** (原 eid / 原 value / 原 HLC / 原 author /
+    /// 原署名) で自分の WAL に relay append する。 Syncer が「apply が accept した
+    /// record」に限って呼ぶ (LWW gate が cyclic topology の echo を止める唯一の
+    /// 栓なので、 skip した record を relay してはいけない)。
+    ///
+    /// 翻訳 (eid/vid/ref) は body apply 専用で、 relay stream には漏らさない —
+    /// 「中継であって作者交代ではない」。 WAL recovery はこの record を
+    /// `apply_oplog_op` の relayed 経路 (受信時と同じ翻訳) で replay する。
+    ///
+    /// 戻り値: append できたか (oplog 無効 / append 失敗で false)。
+    pub fn relay_record(&self, rec: &crate::transport::WireRecord) -> bool {
+        use enchudb_oplog::oplog::{DecodedOp, Op, RelayedHeader};
+        let Some(wal) = self.oplog.as_ref() else { return false };
+        // Commit は relay しない: dedupe identity を持たず、 閉路があると無限反響
+        // する。 group 境界は relay 自身の commit 周期で足りる。
+        if matches!(rec.op, DecodedOp::Commit) {
+            return false;
+        }
+        // 署名対象 bytes を持つ record は **byte 単位の素通し** — 署名は LSN 込みの
+        // 領域に掛かっているので、 再 encode すると必ず不一致になる。
+        if !rec.signed_bytes.is_empty() {
+            return wal
+                .append_relayed_verbatim(&rec.signed_bytes, &rec.signature, &rec.pubkey_fp)
+                .is_ok();
+        }
+        // signed_bytes を持たない record (state 転写 #140 等) は op 再 encode で
+        // relay する (署名なしなので一致性の問題はない)。
+        let header = RelayedHeader {
+            hlc: rec.hlc,
+            author: rec.author_peer,
+            signature: rec.signature,
+            pubkey_fp: rec.pubkey_fp,
+        };
+        let op: Op<'_> = match &rec.op {
+            DecodedOp::Tie { eid, himo_id, value } => {
+                Op::Tie { eid: *eid, himo_id: *himo_id, value: *value }
+            }
+            DecodedOp::Untie { eid, himo_id } => Op::Untie { eid: *eid, himo_id: *himo_id },
+            DecodedOp::Delete { eid } => Op::Delete { eid: *eid },
+            DecodedOp::Content { eid, key, data } => {
+                Op::Content { eid: *eid, key, data }
+            }
+            DecodedOp::Vocab { vid, bytes } => Op::Vocab { vid: *vid, bytes },
+            DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => Op::TieNamed {
+                eid: *eid,
+                himo_name,
+                himo_kind: *himo_kind,
+                value: *value,
+            },
+            DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => Op::TieLeaf {
+                eid: *eid,
+                himo_name,
+                himo_kind: *himo_kind,
+                bytes,
+            },
+            DecodedOp::TieRef { eid, himo_id, target } => {
+                Op::TieRef { eid: *eid, himo_id: *himo_id, target: *target }
+            }
+            // Commit は relay しない: dedupe identity を持たず、 閉路があると
+            // 無限反響する。 group 境界は relay 自身の commit 周期で足りる。
+            DecodedOp::Commit => return false,
+        };
+        wal.append_relayed(op, header).is_ok()
     }
 
     /// **pre-v9 DB の版数置き場**への参照 (legacy)。 v9 DB では空のまま
@@ -6615,7 +6686,9 @@ impl Engine {
         himo_id: u16,
         bytes: &[u8],
         hlc: enchudb_oplog::Hlc,
-        relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
+        // #209: relay は Syncer 側 (relay_record) に移動済み。 引数は API 互換の
+        // ため残置 — 次の breaking release (0.23 #201 系) で撤去する。
+        _relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
     ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
@@ -6647,19 +6720,8 @@ impl Engine {
         self.set_cell_local(local, himo_id, value, hlc);
         self.free_leaf_offset(hid, old);
         Self::advance_table_next_local_for(&self.tables, local);
-        if self.gossip_remote_apply() {
-            if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
-                let _ = wal.append_relayed(
-                    enchudb_oplog::oplog::Op::TieLeaf {
-                        eid,
-                        himo_name: &self.himo_names[hid],
-                        himo_kind: self.value_types[hid] as u8,
-                        bytes,
-                    },
-                    h,
-                );
-            }
-        }
+        // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
+        // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
         true
     }
 
@@ -6669,7 +6731,9 @@ impl Engine {
         himo_id: u16,
         value: u32,
         hlc: enchudb_oplog::Hlc,
-        relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
+        // #209: relay は Syncer 側 (relay_record) に移動済み。 引数は API 互換の
+        // ため残置 — 次の breaking release (0.23 #201 系) で撤去する。
+        _relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
     ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
@@ -6687,14 +6751,8 @@ impl Engine {
         // `next_local` を `local + 1` まで前進させる。 これは `apply_oplog_op`
         // (WAL recover 経路、 engine.rs:3790) と対称の処理。
         Self::advance_table_next_local_for(&self.tables, local);
-        if self.gossip_remote_apply() {
-            if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
-                let _ = wal.append_relayed(
-                    enchudb_oplog::oplog::Op::Tie { eid, himo_id, value },
-                    h,
-                );
-            }
-        }
+        // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
+        // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
         true
     }
 
@@ -6704,7 +6762,9 @@ impl Engine {
         eid: enchudb_oplog::EntityId,
         himo_id: u16,
         hlc: enchudb_oplog::Hlc,
-        relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
+        // #209: relay は Syncer 側 (relay_record) に移動済み。 引数は API 互換の
+        // ため残置 — 次の breaking release (0.23 #201 系) で撤去する。
+        _relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
     ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
@@ -6713,14 +6773,8 @@ impl Engine {
         if !self.clear_cell_local_freeing_leaf(local, himo_id, hlc) {
             return false;
         }
-        if self.gossip_remote_apply() {
-            if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
-                let _ = wal.append_relayed(
-                    enchudb_oplog::oplog::Op::Untie { eid, himo_id },
-                    h,
-                );
-            }
-        }
+        // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
+        // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
         true
     }
 
@@ -6729,7 +6783,9 @@ impl Engine {
         &self,
         eid: enchudb_oplog::EntityId,
         hlc: enchudb_oplog::Hlc,
-        relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
+        // #209: relay は Syncer 側 (relay_record) に移動済み。 引数は API 互換の
+        // ため残置 — 次の breaking release (0.23 #201 系) で撤去する。
+        _relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
     ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         self.observe_remote_hlc(hlc);
@@ -6740,11 +6796,8 @@ impl Engine {
         if !self.apply_delete_local(local, hlc) {
             return false;
         }
-        if self.gossip_remote_apply() {
-            if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
-                let _ = wal.append_relayed(enchudb_oplog::oplog::Op::Delete { eid }, h);
-            }
-        }
+        // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
+        // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
         true
     }
 
@@ -6755,7 +6808,9 @@ impl Engine {
         key: &str,
         data: &[u8],
         hlc: enchudb_oplog::Hlc,
-        relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
+        // #209: relay は Syncer 側 (relay_record) に移動済み。 引数は API 互換の
+        // ため残置 — 次の breaking release (0.23 #201 系) で撤去する。
+        _relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
     ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         self.observe_remote_hlc(hlc);
@@ -6775,14 +6830,8 @@ impl Engine {
         }
         // issue #47 fix: Tie 経路と同じ理由で next_local を前進させる。
         Self::advance_table_next_local_for(&self.tables, local);
-        if self.gossip_remote_apply() {
-            if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
-                let _ = wal.append_relayed(
-                    enchudb_oplog::oplog::Op::Content { eid, key, data },
-                    h,
-                );
-            }
-        }
+        // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
+        // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
         true
     }
 
@@ -6797,9 +6846,10 @@ impl Engine {
         author_peer: enchudb_oplog::PeerId,
         remote_vid: u32,
         bytes: &[u8],
-        relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
+        // #209: relay は Syncer 側 (relay_record) に移動済み。 引数は API 互換の
+        // ため残置 — 次の breaking release (0.23 #201 系) で撤去する。
+        _relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
     ) {
-        let was_new = self.vocab.lookup(bytes).is_none();
         let local_vid = self.vocab.get_or_insert(bytes);
         {
             let mut map = self.peer_vocab_map.write().unwrap();
@@ -6809,15 +6859,9 @@ impl Engine {
                     .store(true, std::sync::atomic::Ordering::Release);
             }
         }
-        if was_new && self.gossip_remote_apply() {
-            if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
-                // 自 vocab の vid を貼り直し (Tie 受信側が translate_remote_vid で再翻訳)。
-                let _ = wal.append_relayed(
-                    enchudb_oplog::oplog::Op::Vocab { vid: local_vid, bytes },
-                    h,
-                );
-            }
-        }
+        // #209: relay append はここから Syncer 側 (Engine::relay_record、原 vid の
+        // まま素通し) に移動した。 旧実装の「local_vid に貼り直して relay」は
+        // author 名義の vid namespace を relay namespace で汚染していた。
     }
 
     /// 0.8.4 issue #30: 受信 Vocab record の dedupe 用。 `(author_peer, remote_vid)`
@@ -9741,7 +9785,7 @@ impl Engine {
             // (`OpLog::recover_with_tail` の doc 参照)。
             let records = w.recover_with_tail();
             for rec in &records {
-                eng.apply_oplog_op(&rec.op, rec.hlc);
+                eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer);
             }
             // #77-H2: 適用効果を disk に固めてから checkpoint を前進する。
             // 旧順序 (apply → 即 checkpoint) は kernel が checkpoint header を
@@ -9768,8 +9812,22 @@ impl Engine {
     ///   - entity_set の live bitmap が stale → 次 entity_in が eid 重複払出し
     ///   - table.next_local が 0 のまま → 次 alloc が既存 eid と衝突
     /// になる。 sinfo 連携で表面化したので 0.8.1 patch で根治。
-    fn apply_oplog_op(&mut self, op: &enchudb_oplog::oplog::DecodedOp, hlc: enchudb_oplog::Hlc) {
+    fn apply_oplog_op(
+        &mut self,
+        op: &enchudb_oplog::oplog::DecodedOp,
+        hlc: enchudb_oplog::Hlc,
+        author: enchudb_oplog::PeerId,
+    ) {
         use enchudb_oplog::oplog::DecodedOp;
+        // #209: relay (gossip) が verbatim で積んだ foreign-author record は、
+        // 受信時 (Syncer::apply_one) と同じ翻訳経路で replay する。 eid をそのまま
+        // local slot に書くと relay の body が壊れる (原 eid は author の番号)。
+        // self peer は header (H_PEER_ID) から復元済み。
+        let self_peer = self.peer_id();
+        if self_peer != 0 && author != 0 && author != self_peer {
+            self.replay_relayed_op(op, hlc, author);
+            return;
+        }
         match op {
             DecodedOp::Tie { eid, himo_id, value } => {
                 let hid = *himo_id as usize;
@@ -9841,6 +9899,79 @@ impl Engine {
                 // (author_peer == self の場合は既に local vocab にある)。
                 // Sync 経由で他 peer から受信する場合のみ apply_one 側で処理。
             }
+        }
+    }
+
+    /// #209: relay (gossip) が verbatim で WAL に積んだ foreign-author record の
+    /// recovery replay。 Syncer::apply_one の翻訳規則をなぞる (recovery 時に
+    /// Syncer は存在しない)。 翻訳写像は live 適用の barrier で .eidmap/.vocabmap
+    /// に永続しているのが通常で、 crash 窓で欠けていても `get_or_insert` 系が
+    /// 受信時と同じ規則で貼り直す。 apply は LWW 冪等。 解決できない record は
+    /// skip — relay の役目上、 元 record は author に在り再 pull で埋め直せる。
+    fn replay_relayed_op(
+        &self,
+        op: &enchudb_oplog::oplog::DecodedOp,
+        hlc: enchudb_oplog::Hlc,
+        author: enchudb_oplog::PeerId,
+    ) {
+        use enchudb_oplog::oplog::DecodedOp;
+        match op {
+            DecodedOp::Vocab { vid, bytes } => {
+                if !self.has_remote_vocab(author, *vid, bytes) {
+                    self.remote_vocab_apply(author, *vid, bytes, None);
+                }
+            }
+            DecodedOp::Tie { eid, himo_id, value } => {
+                let Some(le) = self.resolve_remote_eid(*eid, *himo_id) else { return };
+                let v = if self.himo_is_ref(*himo_id) {
+                    match self.resolve_remote_ref_value(author, *value, *himo_id) {
+                        Some(v) => v,
+                        None => return,
+                    }
+                } else {
+                    match self.try_translate_remote_vid(author, *himo_id, *value) {
+                        Some(v) => v,
+                        None => return,
+                    }
+                };
+                self.remote_tie_apply(le, *himo_id, v, hlc, None);
+            }
+            DecodedOp::TieRef { eid, himo_id, target } => {
+                let Some(le) = self.resolve_remote_eid(*eid, *himo_id) else { return };
+                let v = match self.resolve_remote_ref_value(
+                    enchudb_oplog::eid_peer(*target),
+                    enchudb_oplog::eid_local(*target),
+                    *himo_id,
+                ) {
+                    Some(v) => v,
+                    None => return,
+                };
+                self.remote_tie_apply(le, *himo_id, v, hlc, None);
+            }
+            DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => {
+                let Ok(hid) = self.ensure_himo_named(himo_name, *himo_kind) else { return };
+                let Some(le) = self.resolve_remote_eid(*eid, hid) else { return };
+                let Some(v) = self.try_translate_remote_vid(author, hid, *value) else { return };
+                self.remote_tie_apply(le, hid, v, hlc, None);
+            }
+            DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => {
+                let Ok(hid) = self.ensure_himo_named(himo_name, *himo_kind) else { return };
+                let Some(le) = self.resolve_remote_eid(*eid, hid) else { return };
+                self.remote_tieleaf_apply(le, hid, bytes, hlc, None);
+            }
+            DecodedOp::Untie { eid, himo_id } => {
+                let Some(le) = self.resolve_remote_eid(*eid, *himo_id) else { return };
+                self.remote_untie_apply(le, *himo_id, hlc, None);
+            }
+            DecodedOp::Delete { eid } => {
+                let Some(le) = self.resolve_remote_eid_existing(*eid) else { return };
+                self.remote_delete_apply(le, hlc, None);
+            }
+            DecodedOp::Content { eid, key, data } => {
+                let Some(le) = self.resolve_remote_eid_existing(*eid) else { return };
+                self.remote_content_apply(le, key, data, hlc, None);
+            }
+            DecodedOp::Commit => {}
         }
     }
 
@@ -9944,7 +10075,7 @@ impl Engine {
             // (`OpLog::recover_with_tail` の doc 参照)。
             let records = w.recover_with_tail();
             for rec in &records {
-                eng.apply_oplog_op(&rec.op, rec.hlc);
+                eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer);
             }
             // #77-H2: body msync → checkpoint の順 (open_concurrent_with_oplog と同じ)
             let _ = eng.body_msync();

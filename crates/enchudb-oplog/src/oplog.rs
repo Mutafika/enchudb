@@ -354,6 +354,11 @@ pub enum Op<'a> {
     TieNamed { eid: u64, himo_name: &'a str, himo_kind: u8, value: u32 },
     /// 0.12.0 (#88): Leaf payload を bytes 同乗で運ぶ Tie (vid 無し、 himo は名前)。
     TieLeaf { eid: u64, himo_name: &'a str, himo_kind: u8, bytes: &'a [u8] },
+    /// #183/#209: Ref 値の target を世界番号 (u64) 同乗で運ぶ Tie。 bridge は
+    /// resign (byte patch) で合成するが、 relay の verbatim 転送 (#209) は受信
+    /// record からこの variant で `append_relayed` する。 layout は decode 側
+    /// (op_type::TIE_REF) と同一: eid(8) + himo_id(2) + pad(2) + target(8)。
+    TieRef { eid: u64, himo_id: u16, target: u64 },
 }
 
 impl<'a> Op<'a> {
@@ -371,6 +376,7 @@ impl<'a> Op<'a> {
             Op::TieNamed { himo_name, .. } => 16 + himo_name.len(),
             // eid(8) + kind(1) + pad(1) + name_len(2) + bytes_len(4) + name + bytes
             Op::TieLeaf { himo_name, bytes, .. } => 16 + himo_name.len() + bytes.len(),
+            Op::TieRef { .. } => 20, // eid(8) + himo_id(2) + pad(2) + target(8)
         }
     }
 
@@ -384,6 +390,7 @@ impl<'a> Op<'a> {
             Op::Vocab { .. } => op_type::VOCAB,
             Op::TieNamed { .. } => op_type::TIE_NAMED,
             Op::TieLeaf { .. } => op_type::TIE_LEAF,
+            Op::TieRef { .. } => op_type::TIE_REF,
         }
     }
 
@@ -444,6 +451,12 @@ impl<'a> Op<'a> {
                 buf[16..16 + himo_name.len()].copy_from_slice(himo_name.as_bytes());
                 let bo = 16 + himo_name.len();
                 buf[bo..bo + bytes.len()].copy_from_slice(bytes);
+            }
+            Op::TieRef { eid, himo_id, target } => {
+                buf[0..8].copy_from_slice(&eid.to_le_bytes());
+                buf[8..10].copy_from_slice(&himo_id.to_le_bytes());
+                buf[10..12].copy_from_slice(&[0, 0]);
+                buf[12..20].copy_from_slice(&target.to_le_bytes());
             }
         }
     }
@@ -969,6 +982,98 @@ impl OpLog {
         // ローカル HLC clock を受信 HLC で merge (後退防止)
         self.merge_external_hlc(header.hlc);
         result.map(|(lsn, _)| lsn)
+    }
+
+    /// #209: 受信 record を **byte 単位でそのまま** WAL に載せる relay append。
+    ///
+    /// `append_relayed` (op を再 encode) は署名対象領域 (fixed header 40B +
+    /// payload、**LSN を含む**) を自分の値で書き直すため、 author の署名と一致
+    /// しなくなる。 署名を素通しするには author が署名した bytes をそのまま格納
+    /// するしかない — `sb` は `WireRecord::signed_bytes` (= 元 record の
+    /// fixed header ‖ payload)、 disk 上の record は
+    /// `sb[0..40] ‖ signature(64) ‖ pubkey_fp(8) ‖ sb[40..]` として復元される。
+    ///
+    /// LSN も author のものが残る (自分の `next_lsn` は消費しない)。 WAL 内 LSN の
+    /// 単調性は relayed record では成立しないが、 recover / bridge / audit は
+    /// 位置ベース走査で LSN 単調性に依存しない。
+    ///
+    /// 検証: magic / version / len 整合 / payload CRC。 壊れた bytes は Err。
+    pub fn append_relayed_verbatim(
+        &self,
+        sb: &[u8],
+        signature: &[u8; 64],
+        pubkey_fp: &[u8; 8],
+    ) -> io::Result<u64> {
+        let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+        if sb.len() < SIGNED_PAYLOAD_HEADER_SIZE {
+            return Err(bad("relayed signed_bytes too short"));
+        }
+        if &sb[0..2] != REC_MAGIC {
+            return Err(bad("relayed signed_bytes: bad magic"));
+        }
+        if sb[2] != REC_VERSION {
+            return Err(bad("relayed signed_bytes: unsupported record version"));
+        }
+        let payload_len = u32::from_le_bytes(sb[4..8].try_into().unwrap()) as usize;
+        if sb.len() != SIGNED_PAYLOAD_HEADER_SIZE + payload_len {
+            return Err(bad("relayed signed_bytes: len field mismatch"));
+        }
+        let crc_stored = u32::from_le_bytes(sb[36..40].try_into().unwrap());
+        if fnv1a(&sb[SIGNED_PAYLOAD_HEADER_SIZE..]) != crc_stored {
+            return Err(bad("relayed signed_bytes: payload crc mismatch"));
+        }
+        let record_size = REC_HEADER_SIZE + payload_len;
+
+        let _guard = self.pending_guard(1);
+        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
+        #[cfg(not(target_arch = "wasm32"))]
+        let _lock = self.flock_exclusive()?;
+
+        // head 採番は append_inner と同じ規則 (mmap 上の永続値を真実とする)。
+        let offset = {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let mm = self.mmap_slice();
+                let on_disk = u64::from_le_bytes(mm[8..16].try_into().unwrap());
+                let cur = on_disk.max(self.head.load(Ordering::Acquire));
+                let new = cur + record_size as u64;
+                if new > self.capacity {
+                    return Err(self.wal_full_err());
+                }
+                self.head.store(new, Ordering::Release);
+                cur
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let cur = self.head.load(Ordering::Acquire);
+                let new = cur + record_size as u64;
+                if new > self.capacity {
+                    return Err(self.wal_full_err());
+                }
+                self.head.store(new, Ordering::Release);
+                cur
+            }
+        };
+
+        let mmap = self.mmap_mut_slice();
+        let off = offset as usize;
+        mmap[off..off + SIGNED_PAYLOAD_HEADER_SIZE]
+            .copy_from_slice(&sb[0..SIGNED_PAYLOAD_HEADER_SIZE]);
+        mmap[off + OFF_SIGNATURE..off + OFF_SIGNATURE + 64].copy_from_slice(signature);
+        mmap[off + OFF_PUBKEY_FP..off + OFF_PUBKEY_FP + 8].copy_from_slice(pubkey_fp);
+        mmap[off + REC_HEADER_SIZE..off + record_size]
+            .copy_from_slice(&sb[SIGNED_PAYLOAD_HEADER_SIZE..]);
+        // ファイルヘッダの head も更新
+        mmap[8..16].copy_from_slice(&(offset + record_size as u64).to_le_bytes());
+
+        // ローカル HLC clock を受信 HLC で merge (後退防止)
+        let hlc = Hlc {
+            wall: u64::from_le_bytes(sb[16..24].try_into().unwrap()),
+            logical: u32::from_le_bytes(sb[24..28].try_into().unwrap()),
+            peer: u32::from_le_bytes(sb[28..32].try_into().unwrap()),
+        };
+        self.merge_external_hlc(hlc);
+        Ok(u64::from_le_bytes(sb[8..16].try_into().unwrap()))
     }
 
     /// request17 step 5: **受信 HLC でローカル clock を進める** (HLC の merge 規則)。
