@@ -150,6 +150,13 @@ impl WireRecord {
                 out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                 out.extend_from_slice(bytes);
             }
+            DecodedOp::TieRef { eid, himo_id, target } => {
+                // #183: Ref target の世界番号 (u64) 同乗版 Tie
+                out.push(8);
+                out.extend_from_slice(&eid.to_le_bytes());
+                out.extend_from_slice(&himo_id.to_le_bytes());
+                out.extend_from_slice(&target.to_le_bytes());
+            }
         }
         out
     }
@@ -258,6 +265,13 @@ impl WireRecord {
                 need(p, blen, buf)?;
                 let bytes = buf[p..p+blen].to_vec(); p += blen;
                 DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes }
+            }
+            8 => {
+                need(p, 18, buf)?;
+                let eid = u64::from_le_bytes(buf[p..p+8].try_into().unwrap()); p += 8;
+                let himo_id = u16::from_le_bytes(buf[p..p+2].try_into().unwrap()); p += 2;
+                let target = u64::from_le_bytes(buf[p..p+8].try_into().unwrap()); p += 8;
+                DecodedOp::TieRef { eid, himo_id, target }
             }
             other => return Err(WireDecodeError::UnknownOpTag(other)),
         };

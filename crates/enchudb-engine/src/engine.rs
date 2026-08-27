@@ -3807,7 +3807,8 @@ impl Engine {
                 | enchudb_oplog::oplog::DecodedOp::Delete { eid }
                 | enchudb_oplog::oplog::DecodedOp::Content { eid, .. }
                 | enchudb_oplog::oplog::DecodedOp::TieNamed { eid, .. }
-                | enchudb_oplog::oplog::DecodedOp::TieLeaf { eid, .. } => is_internal_eid(*eid),
+                | enchudb_oplog::oplog::DecodedOp::TieLeaf { eid, .. }
+                | enchudb_oplog::oplog::DecodedOp::TieRef { eid, .. } => is_internal_eid(*eid),
                 enchudb_oplog::oplog::DecodedOp::Commit => false,
                 enchudb_oplog::oplog::DecodedOp::Vocab { .. } => false,
             };
@@ -3825,11 +3826,33 @@ impl Engine {
             // 留める。 これは 0.10.x まで silent に断片化していた潜在バグの封鎖。
             let self_peer = wal.peer_id();
             let mut resigned: Option<enchudb_oplog::oplog::ResignedRecord> = None;
+            // #183: この record を TieRef へ書き換えて発送したか (op_type metadata 用)
+            let mut sent_as_tie_ref = false;
             if rec.author_peer == self_peer {
-                let ref_to_replica = match &rec.op {
-                    enchudb_oplog::oplog::DecodedOp::Tie { himo_id, value, .. } => {
-                        self.himo_is_ref(*himo_id)
+                // #183: Ref 値が translated foreign entity を指す self-authored Tie は
+                // target の世界番号 (逆写像で復元) を同乗させた **TieRef** に書き換えて
+                // 発送する — 0.11.0 の「残る制約」(wire の u32 value に世界番号が
+                // 入らない) の解消。逆写像が引けない場合と TieNamed の Ref は従来
+                // どおり skip + 一度だけ warn (安全側、silent 断片化はさせない)。
+                let mut tie_ref: Option<(u64, u64)> = None; // (target_world, 元 row eid)
+                let ref_unsendable = match &rec.op {
+                    enchudb_oplog::oplog::DecodedOp::Tie { eid, himo_id, value } => {
+                        if self.himo_is_ref(*himo_id)
                             && self.eid_translator.is_translated_local(*value)
+                        {
+                            match self.eid_translator.reverse(*value) {
+                                Some((owner, owner_local)) => {
+                                    tie_ref = Some((
+                                        enchudb_oplog::make_eid(owner, owner_local),
+                                        *eid,
+                                    ));
+                                    false
+                                }
+                                None => true, // 逆写像なし = 元 entity を導けない
+                            }
+                        } else {
+                            false
+                        }
                     }
                     enchudb_oplog::oplog::DecodedOp::TieNamed { himo_kind, value, .. } => {
                         *himo_kind == crate::himo_store::ValueType::Ref as u8
@@ -3837,12 +3860,12 @@ impl Engine {
                     }
                     _ => false,
                 };
-                if ref_to_replica {
+                if ref_unsendable {
                     if !self.warned_ref_to_replica.swap(true, Ordering::Relaxed) {
                         eprintln!(
                             "[enchudb] warning: local Ref write pointing at a replicated \
-                             foreign entity is NOT propagated to peers (u32 wire value \
-                             cannot carry a foreign entity id, request10 follow-up)."
+                             foreign entity could not be propagated (reverse eid mapping \
+                             missing, or named-himo Ref) — kept local-only (#183)."
                         );
                     }
                     done_end = Some(*rec_end);
@@ -3854,24 +3877,45 @@ impl Engine {
                     | enchudb_oplog::oplog::DecodedOp::Delete { eid }
                     | enchudb_oplog::oplog::DecodedOp::Content { eid, .. }
                     | enchudb_oplog::oplog::DecodedOp::TieNamed { eid, .. }
-                    | enchudb_oplog::oplog::DecodedOp::TieLeaf { eid, .. } => {
+                    | enchudb_oplog::oplog::DecodedOp::TieLeaf { eid, .. }
+                    | enchudb_oplog::oplog::DecodedOp::TieRef { eid, .. } => {
                         Some(enchudb_oplog::eid_local(*eid))
                     }
                     _ => None,
                 };
-                if let Some(local) = row_local {
-                    if let Some((owner, owner_local)) = self.eid_translator.reverse(local) {
-                        let world = enchudb_oplog::make_eid(owner, owner_local);
-                        let kp_guard = self.keypair.read().unwrap();
-                        let kp = kp_guard.as_deref();
-                        match enchudb_oplog::oplog::resign_with_eid(rec, world, kp) {
-                            Some(r) => resigned = Some(r),
-                            // eid 持ち op で None は起きないはずだが、 起きたら
-                            // 発送せず local-only に留める (安全側)
-                            None => {
-                                done_end = Some(*rec_end);
-                                continue;
-                            }
+                // 行 eid 自体が translated foreign なら世界番号へ書き戻す (0.11 #76)
+                let row_world = row_local.and_then(|local| {
+                    self.eid_translator
+                        .reverse(local)
+                        .map(|(owner, owner_local)| enchudb_oplog::make_eid(owner, owner_local))
+                });
+                if let Some((target_world, orig_eid)) = tie_ref {
+                    let new_eid = row_world.unwrap_or(orig_eid);
+                    let kp_guard = self.keypair.read().unwrap();
+                    let kp = kp_guard.as_deref();
+                    match enchudb_oplog::oplog::resign_as_tie_ref(rec, new_eid, target_world, kp)
+                    {
+                        Some(r) => {
+                            resigned = Some(r);
+                            sent_as_tie_ref = true;
+                        }
+                        // Tie 以外で None だが tie_ref は Tie でしか立たない。
+                        // 万一の場合も発送せず local-only に留める (安全側)
+                        None => {
+                            done_end = Some(*rec_end);
+                            continue;
+                        }
+                    }
+                } else if let Some(world) = row_world {
+                    let kp_guard = self.keypair.read().unwrap();
+                    let kp = kp_guard.as_deref();
+                    match enchudb_oplog::oplog::resign_with_eid(rec, world, kp) {
+                        Some(r) => resigned = Some(r),
+                        // eid 持ち op で None は起きないはずだが、 起きたら
+                        // 発送せず local-only に留める (安全側)
+                        None => {
+                            done_end = Some(*rec_end);
+                            continue;
                         }
                     }
                 }
@@ -3909,16 +3953,22 @@ impl Engine {
             let lsn = self.next_sync_lsn.fetch_add(1, Ordering::AcqRel);
             self.tie_to_by_id(row_eid, lsn_hid, lsn);
             self.tie_to_by_id(row_eid, peer_id_hid, rec.author_peer);
-            // DecodedOp variant を tag (Tie=0, Untie=1, Delete=2, Content=3, Commit=4, Vocab=5, TieNamed=6, TieLeaf=7)
-            let op_type = match &rec.op {
-                enchudb_oplog::oplog::DecodedOp::Tie { .. } => 0,
-                enchudb_oplog::oplog::DecodedOp::Untie { .. } => 1,
-                enchudb_oplog::oplog::DecodedOp::Delete { .. } => 2,
-                enchudb_oplog::oplog::DecodedOp::Content { .. } => 3,
-                enchudb_oplog::oplog::DecodedOp::Commit => 4,
-                enchudb_oplog::oplog::DecodedOp::Vocab { .. } => 5,
-                enchudb_oplog::oplog::DecodedOp::TieNamed { .. } => 6,
-                enchudb_oplog::oplog::DecodedOp::TieLeaf { .. } => 7,
+            // DecodedOp variant を tag (Tie=0, Untie=1, Delete=2, Content=3, Commit=4, Vocab=5, TieNamed=6, TieLeaf=7, TieRef=8)
+            // #183: Tie → TieRef へ書き換えて発送した record は payload に合わせて 8。
+            let op_type = if sent_as_tie_ref {
+                8
+            } else {
+                match &rec.op {
+                    enchudb_oplog::oplog::DecodedOp::Tie { .. } => 0,
+                    enchudb_oplog::oplog::DecodedOp::Untie { .. } => 1,
+                    enchudb_oplog::oplog::DecodedOp::Delete { .. } => 2,
+                    enchudb_oplog::oplog::DecodedOp::Content { .. } => 3,
+                    enchudb_oplog::oplog::DecodedOp::Commit => 4,
+                    enchudb_oplog::oplog::DecodedOp::Vocab { .. } => 5,
+                    enchudb_oplog::oplog::DecodedOp::TieNamed { .. } => 6,
+                    enchudb_oplog::oplog::DecodedOp::TieLeaf { .. } => 7,
+                    enchudb_oplog::oplog::DecodedOp::TieRef { .. } => 8,
+                }
             };
             self.tie_to_by_id(row_eid, op_type_hid, op_type);
             // hlc.wall は u64 ms-since-epoch、 下位 32bit のみ保持 (= ~50 日サイクル
@@ -9072,6 +9122,11 @@ impl Engine {
                 // body として durable なので「既に local に在る」(Vocab と同思想)。
                 // 再 insert すると offset が変わり slot が二重化するため触らない。
                 // remote peer からの TieLeaf は sync crate の apply-one 経由で別 apply。
+            }
+            DecodedOp::TieRef { .. } => {
+                // #183: TieRef は bridge が `_sync_ops` 発送時に合成する op で、
+                // ローカル oplog には現れない (author の oplog は Op::Tie のまま)。
+                // 万一混入しても local state は Tie で既に durable なので no-op。
             }
             DecodedOp::Commit => {}
             DecodedOp::Vocab { .. } => {
