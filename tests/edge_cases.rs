@@ -5,7 +5,7 @@
 //!
 //! `cargo test --test edge_cases`
 
-use enchudb::{Engine, ValueType};
+use enchudb::{Engine, FaultKind, ValueType};
 use std::sync::Arc;
 
 fn tmp(name: &str) -> String {
@@ -124,13 +124,34 @@ fn tie_large_value_expands_buckets() {
     cleanup(&path);
 }
 
+/// `u32::MAX` は cell の sentinel (「値なし」) として予約されているので紐に載せられない。
+///
+/// **0.23.0 (#59) で挙動が変わった**: 旧実装は `assert!` で panic していたが、 embedded DB が
+/// 「値が範囲外」 で host process を殺すのは誤りなので、 **write を拒否して
+/// `FaultKind::ValueOutOfRange` に計上 + rate-limited warn** する形になった。
+/// この test はその新しい契約 (= 落ちない、 かつ壊れた値も書かない) を固定する。
 #[test]
-#[should_panic(expected = "u32::MAX")]
-fn max_value_panics() {
-    let path = tmp("max_value_panics");
+fn max_value_is_rejected_without_panicking() {
+    let path = tmp("max_value_rejected");
     let mut eng = Engine::create_standalone(&path).unwrap();
     let e = eng.entity().unwrap();
+
+    let before = eng.fault_count(FaultKind::ValueOutOfRange);
     eng.tie(e, "x", u32::MAX);
+
+    assert_eq!(
+        eng.get(e, "x"),
+        None,
+        "sentinel 値が cell に書かれている (read が壊れる)"
+    );
+    assert!(
+        eng.fault_count(FaultKind::ValueOutOfRange) > before,
+        "拒否が FaultKind::ValueOutOfRange に計上されていない"
+    );
+
+    // 拒否がその紐を壊していないこと — 正常値は通る。
+    eng.tie(e, "x", u32::MAX - 1);
+    assert_eq!(eng.get(e, "x"), Some(u32::MAX - 1));
     cleanup(&path);
 }
 
