@@ -79,7 +79,7 @@ pub mod integrity;
 pub mod blob_store;
 pub mod sparse_copy;
 
-pub use engine::{Engine, EntityValue, SnapshotFiles, AuditFilter, MigrationStats, LeafScale, GrowableOptions, FaultKind};
+pub use engine::{Engine, EntityValue, SnapshotFiles, AuditFilter, MigrationStats, LeafScale, GrowableOptions, FaultKind, RemoteApply};
 pub use sparse_copy::copy_sparse;
 pub use engine::EngineStats;
 pub use himo_store::ValueType;

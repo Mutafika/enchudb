@@ -50,7 +50,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use enchudb_engine::engine::Engine;
+use enchudb_engine::engine::{Engine, RemoteApply};
 use enchudb_engine::hlc_store::HlcStore;
 use enchudb_engine::transport::{Transport, WireRecord};
 use enchudb_oplog::oplog::DecodedOp;
@@ -121,9 +121,21 @@ pub struct SyncOutcome {
     pub rejected_signature: usize,
     /// Phase C: ACL で reject した op 数。
     pub rejected_acl: usize,
-    /// #78 (0.9.0): reject (署名/ACL) された record の最小 HLC。 pull cursor は
+    /// #210: **容量が足りず apply を拒否した op 数** (ディスク満杯 / content 天井)。
+    ///
+    /// 値は一切書いていないので、 [`SyncOutcome::skipped`] (= LWW で古い、 再配送不要)
+    /// とは意味が真逆で、 **空きが出てからの再配送が必要**。 そのため
+    /// [`SyncOutcome::min_rejected_hlc`] にも計上して cursor を止める。
+    ///
+    /// > 0 なら engine 側の `FaultKind::DiskSpace` / `ContentSpace` も同時に立っている。
+    pub rejected_capacity: usize,
+    /// #78 (0.9.0): reject された record の最小 HLC。 pull cursor は
     /// これを越えて前進しない — pubkey 登録との race 窓で reject された record が
     /// 永久に再配送されない silent gap を防ぐ (次回 pull で再検証される)。
+    ///
+    /// #210: 署名 / ACL に加えて **容量拒否** ([`SyncOutcome::rejected_capacity`]) も
+    /// ここに計上する。 どちらも 「今は入れられないが、 条件が変われば入る」 ので
+    /// cursor を越えさせてはいけない。
     pub min_rejected_hlc: Option<Hlc>,
     /// #140: **自分の cursor より新しい履歴が publisher 側で既に reclaim されていた**。
     ///
@@ -165,6 +177,19 @@ enum ApplyResult {
     /// あちらが正常系でも立つ背景値を持つのに対し、 こちらは定常 0 であるべき
     /// = 監視上の意味が逆だから ([`SyncOutcome::dropped_vocab`])。
     DroppedVocab,
+    /// #210: **容量が足りず apply を拒否した**。 値は書いていないので、
+    /// `SkippedOlder` (再配送不要) ではなく **cursor を止めて再配送させる**。
+    RejectedCapacity,
+}
+
+impl From<RemoteApply> for ApplyResult {
+    fn from(r: RemoteApply) -> Self {
+        match r {
+            RemoteApply::Applied => ApplyResult::Applied,
+            RemoteApply::Stale => ApplyResult::SkippedOlder,
+            RemoteApply::RejectedCapacity => ApplyResult::RejectedCapacity,
+        }
+    }
 }
 
 impl ApplyResult {
@@ -941,6 +966,11 @@ impl Syncer {
                 ApplyResult::SkippedOlder => out.skipped += 1,
                 ApplyResult::Dropped => out.dropped_unresolved += 1,
                 ApplyResult::DroppedVocab => out.dropped_vocab += 1,
+                ApplyResult::RejectedCapacity => {
+                    // #210: 「今は容量が無い」 だけなので cursor を止めて再配送させる。
+                    out.rejected_capacity += 1;
+                    note_reject(&mut out, rec.hlc);
+                }
             }
         }
         out
@@ -1077,7 +1107,7 @@ impl Syncer {
                     Some(e) => e,
                     None => return ApplyResult::Dropped,
                 };
-                ApplyResult::from_lww(self.engine.remote_tieleaf_apply(local_eid, local_hid, bytes, rec.hlc, Some(relayed_header(rec))))
+                ApplyResult::from(self.engine.remote_tieleaf_apply(local_eid, local_hid, bytes, rec.hlc, Some(relayed_header(rec))))
             }
             DecodedOp::Content { eid, key, data } => {
                 // legacy (pre-0.9): 0.9.0 以降は content が TieNamed で運ばれるため、
@@ -1092,11 +1122,18 @@ impl Syncer {
                 };
                 // legacy Content は cell を持たないので key 単位の LWW だけここに残す
                 // (tombstone 判定は engine 側 `remote_content_apply` が行う)。
-                let key_hash = enchudb_oplog::content_key_hash15(key);
-                if !store.try_set(local_eid, key_hash | 0x8000, rec.hlc) {
+                let slot = enchudb_oplog::content_key_hash15(key) | 0x8000;
+                // #210: HLC の記録は **apply が成功してから**。 先に `try_set` すると、
+                // 容量拒否で 1 byte も書けなかった record の HLC だけが残り、 空きが
+                // 出た後の再配送が 「新しくない」 と judge されて永久に入らなくなる。
+                if store.get(local_eid, slot).is_some_and(|cur| rec.hlc <= cur) {
                     return ApplyResult::SkippedOlder;
                 }
-                ApplyResult::from_lww(self.engine.remote_content_apply(local_eid, key, data, rec.hlc, Some(relayed_header(rec))))
+                let r = ApplyResult::from(self.engine.remote_content_apply(local_eid, key, data, rec.hlc, Some(relayed_header(rec))));
+                if r == ApplyResult::Applied {
+                    store.try_set(local_eid, slot, rec.hlc);
+                }
+                r
             }
             DecodedOp::Commit => ApplyResult::Applied, // boundary marker、apply は不要
             DecodedOp::Vocab { vid, bytes } => {
