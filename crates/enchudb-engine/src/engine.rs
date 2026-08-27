@@ -4457,8 +4457,14 @@ impl Engine {
     ///   塞いだ loss が既存 DB で一度起きる)。 そこで session 最初の walk は lsn 0
     ///   から全 ring を検証し直し、 検証結果が stored より小さければ**下方修正で
     ///   上書き**する (watermark が下がる = 保守側)。 残余窓: この session で一度も
-    ///   ack しない peer の膨張 stored は watermark に残る — これは 0.23.0 の
-    ///   absorb + reclaim が既に持っていた露出で、 heal はそれを厳密に縮める。
+    ///   ack しない peer の膨張 stored は watermark に残り、 pressure reclaim が
+    ///   その嘘を purge しうる — ただし purge は `record_reclaimed_floor` で floor を
+    ///   上げるので、 当該 peer は次の pull で `history_truncated` → bootstrap で
+    ///   回復する (= loss ではなく**余分な bootstrap への縮退**)。 回復経路が無い
+    ///   例外は 2 つ: decode 不能 row の purge は floor に現れない (#218) /
+    ///   state provider 未登録の構成では truncation が行き止まり (relay topology
+    ///   では `serve_state` 必須)。 いずれも 0.23.0 の absorb + reclaim が既に
+    ///   持っていた露出で、 heal はそれを ack する peer から順に厳密に縮める。
     /// - **dead row**: payload 欠落 / decode 不能な row は構造的に配送不能
     ///   (`collect_records_since` も skip する = 誰の cursor もそこを消化と証明
     ///   できない) なので、 prefix blocker にすると全 peer の ack が永久にそこで
