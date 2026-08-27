@@ -105,7 +105,7 @@ fn replica_allows_remote_apply_and_read() {
     // replica として「リモートから Tie が届いた」シミュレーション
     let eid = enchudb_oplog::make_eid(1, 7);
     let himo_id = eng.himo_id("val").unwrap();
-    eng.remote_tie_apply(eid, himo_id as u16, 42, enchudb_oplog::Hlc::ZERO, None);
+    eng.remote_tie_apply(eid, himo_id as u16, 42, enchudb_oplog::Hlc::ZERO);
 
     // 読めるはず
     let v = eng.get(eid, "val");

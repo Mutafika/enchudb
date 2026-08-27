@@ -983,17 +983,6 @@ impl Syncer {
     //  buffered record が恒久喪失 / eviction が「最古」でなく任意 bucket を破棄)
 
     fn apply_one(&self, store: &HlcStore, rec: &WireRecord) -> ApplyResult {
-        // 受信した WireRecord の header フィールドを Engine::remote_*_apply の relayed 引数に
-        // そのまま渡す (gossip 経路で `OpLog::append_relayed` が元 HLC/author/署名を保持するため)。
-        #[inline]
-        fn relayed_header(rec: &WireRecord) -> enchudb_oplog::oplog::RelayedHeader {
-            enchudb_oplog::oplog::RelayedHeader {
-                hlc: rec.hlc,
-                author: rec.author_peer,
-                signature: rec.signature,
-                pubkey_fp: rec.pubkey_fp,
-            }
-        }
         match &rec.op {
             DecodedOp::Tie { eid, himo_id, value } => {
                 // #9: foreign eid を自分の eid 空間の local eid に翻訳 (初見なら払い出し)。
@@ -1029,7 +1018,7 @@ impl Syncer {
                 // request17 step 5: LWW / tombstone の判定は engine (`set_cell`) の
                 // 内側だけ。 ここで判定して別関数で適用する形は、 呼び忘れれば黙って
                 // 壊れる (実際 ローカル write 経路がそうなっていた = #154/#160 の根)。
-                ApplyResult::from_lww(self.engine.remote_tie_apply(local_eid, *himo_id, value, rec.hlc, Some(relayed_header(rec))))
+                ApplyResult::from_lww(self.engine.remote_tie_apply(local_eid, *himo_id, value, rec.hlc))
             }
             DecodedOp::TieRef { eid, himo_id, target } => {
                 // #183: Ref 値の target を**世界番号 (u64) 同乗**で運ぶ Tie。author の
@@ -1050,7 +1039,7 @@ impl Syncer {
                     Some(v) => v,
                     None => return ApplyResult::Dropped,
                 };
-                ApplyResult::from_lww(self.engine.remote_tie_apply(local_eid, *himo_id, value, rec.hlc, Some(relayed_header(rec))))
+                ApplyResult::from_lww(self.engine.remote_tie_apply(local_eid, *himo_id, value, rec.hlc))
             }
             DecodedOp::Untie { eid, himo_id } => {
                 // #9: foreign eid を翻訳 (table-less なら確保先が無いので skip)。
@@ -1059,7 +1048,7 @@ impl Syncer {
                     None => return ApplyResult::Dropped,
                 };
                 // #9: 写像ができたので退避中の Content を drain。
-                ApplyResult::from_lww(self.engine.remote_untie_apply(local_eid, *himo_id, rec.hlc, Some(relayed_header(rec))))
+                ApplyResult::from_lww(self.engine.remote_untie_apply(local_eid, *himo_id, rec.hlc))
             }
             DecodedOp::Delete { eid } => {
                 // #9: Delete は himo を持たず table を導けないので既存の翻訳のみ引く。
@@ -1073,7 +1062,7 @@ impl Syncer {
                 // (v9 なら tombstone column に永続で) 記録する。 後続の古い HLC の
                 // Tie/Untie/Content は engine 側の tombstone 判定で skip され、
                 // 削除済み entity が復活しない。
-                ApplyResult::from_lww(self.engine.remote_delete_apply(local_eid, rec.hlc, Some(relayed_header(rec))))
+                ApplyResult::from_lww(self.engine.remote_delete_apply(local_eid, rec.hlc))
             }
             DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => {
                 // 0.9.0: 動的 himo (content 互換層の `_c_{key}`) は id が peer 間で
@@ -1094,7 +1083,7 @@ impl Syncer {
                     Some(v) => v,
                     None => return ApplyResult::DroppedVocab,
                 };
-                ApplyResult::from_lww(self.engine.remote_tie_apply(local_eid, local_hid, value, rec.hlc, Some(relayed_header(rec))))
+                ApplyResult::from_lww(self.engine.remote_tie_apply(local_eid, local_hid, value, rec.hlc))
             }
             DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => {
                 // 0.12.0 (#88): Leaf payload を bytes 同乗で受信。 名前で himo 解決 →
@@ -1107,7 +1096,7 @@ impl Syncer {
                     Some(e) => e,
                     None => return ApplyResult::Dropped,
                 };
-                ApplyResult::from(self.engine.remote_tieleaf_apply(local_eid, local_hid, bytes, rec.hlc, Some(relayed_header(rec))))
+                ApplyResult::from(self.engine.remote_tieleaf_apply(local_eid, local_hid, bytes, rec.hlc))
             }
             DecodedOp::Content { eid, key, data } => {
                 // legacy (pre-0.9): 0.9.0 以降は content が TieNamed で運ばれるため、
@@ -1129,7 +1118,7 @@ impl Syncer {
                 if store.get(local_eid, slot).is_some_and(|cur| rec.hlc <= cur) {
                     return ApplyResult::SkippedOlder;
                 }
-                let r = ApplyResult::from(self.engine.remote_content_apply(local_eid, key, data, rec.hlc, Some(relayed_header(rec))));
+                let r = ApplyResult::from(self.engine.remote_content_apply(local_eid, key, data, rec.hlc));
                 if r == ApplyResult::Applied {
                     store.try_set(local_eid, slot, rec.hlc);
                 }
@@ -1146,7 +1135,7 @@ impl Syncer {
                 }
                 // author_peer の (vid, bytes) を受信。
                 // Engine 側の remote_vocab_apply に委譲 (peer 別 vid mapping を構築)。
-                self.engine.remote_vocab_apply(rec.author_peer, *vid, bytes, Some(relayed_header(rec)));
+                self.engine.remote_vocab_apply(rec.author_peer, *vid, bytes);
                 ApplyResult::Applied
             }
         }
