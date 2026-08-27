@@ -219,8 +219,8 @@ fn foreign_delete_records_land_in_the_new_tombstone_column() {
         assert!(!eng.has_cell_version(), "前提が崩れた");
 
         let t = eng.resolve_remote_eid(foreign, hid).expect("翻訳できない");
-        assert!(eng.remote_tie_apply(t, hid, 111, hlc(1000, 1), None));
-        assert!(eng.remote_delete_apply(t, hlc(2000, 1), None));
+        assert!(eng.remote_tie_apply(t, hid, 111, hlc(1000, 1)));
+        assert!(eng.remote_delete_apply(t, hlc(2000, 1)));
 
         eng.persist_tables().unwrap(); // .eidmap に tombstone が載る
         eng.flush().unwrap();
@@ -239,7 +239,7 @@ fn foreign_delete_records_land_in_the_new_tombstone_column() {
     );
     // 削除より古い Tie は弾かれる = 移行直後から効いている
     assert!(
-        !eng.remote_tie_apply(t, hid, 111, hlc(1500, 1), None),
+        !eng.remote_tie_apply(t, hid, 111, hlc(1500, 1)),
         "削除より古い Tie が通った",
     );
     drop(eng);

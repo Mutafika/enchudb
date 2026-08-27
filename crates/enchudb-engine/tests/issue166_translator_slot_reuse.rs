@@ -63,7 +63,7 @@ fn setup(path: &str) -> (Engine, u16, enchudb_oplog::EntityId, enchudb_oplog::En
 
     let foreign = enchudb_oplog::make_eid(1, 777);
     let translated = eng.resolve_remote_eid(foreign, hid).expect("翻訳できない");
-    assert!(eng.remote_tie_apply(translated, hid, 111, hlc(1000, 1), None));
+    assert!(eng.remote_tie_apply(translated, hid, 111, hlc(1000, 1)));
     assert_eq!(eng.get(translated, "t.age"), Some(111));
     (eng, hid, foreign, translated)
 }
@@ -100,7 +100,7 @@ fn record_for_deleted_foreign_entity_does_not_hit_the_new_tenant() {
     let slot = enchudb_oplog::eid_local(translated);
 
     // X を remote delete → slot が free list に戻る
-    assert!(eng.remote_delete_apply(translated, hlc(2000, 1), None));
+    assert!(eng.remote_delete_apply(translated, hlc(2000, 1)));
     assert_eq!(eng.get(translated, "t.age"), None, "delete が効いていない");
 
     // 別 entity Y が slot を引き継ぐ
@@ -116,7 +116,7 @@ fn record_for_deleted_foreign_entity_does_not_hit_the_new_tenant() {
             slot,
             "写像が古い slot を指したまま (= Y に書き込む)",
         );
-        eng.remote_tie_apply(t, hid, 999, hlc(3000, 1), None);
+        eng.remote_tie_apply(t, hid, 999, hlc(3000, 1));
     }
 
     assert_eq!(
@@ -140,14 +140,14 @@ fn older_record_does_not_resurrect_a_deleted_foreign_entity_after_slot_reuse() {
     let (eng, hid, foreign, translated) = setup(&path);
     let slot = enchudb_oplog::eid_local(translated);
 
-    assert!(eng.remote_delete_apply(translated, hlc(2000, 1), None));
+    assert!(eng.remote_delete_apply(translated, hlc(2000, 1)));
     let (y, fillers) = take_over_slot(&eng, slot);
     eng.tie_to(y, "t.age", 555);
     free_one_slot(&eng, &fillers);
 
     // **削除 (2000) より古い** Tie が再配送される
     let t = eng.resolve_remote_eid(foreign, hid).expect("翻訳できない");
-    let applied = eng.remote_tie_apply(t, hid, 111, hlc(1500, 1), None);
+    let applied = eng.remote_tie_apply(t, hid, 111, hlc(1500, 1));
 
     assert!(!applied, "削除より古い Tie が適用された (削除済み entity が復活)");
     assert!(
@@ -168,7 +168,7 @@ fn newer_record_still_applies_after_slot_reuse() {
     let (eng, hid, foreign, translated) = setup(&path);
     let slot = enchudb_oplog::eid_local(translated);
 
-    assert!(eng.remote_delete_apply(translated, hlc(2000, 1), None));
+    assert!(eng.remote_delete_apply(translated, hlc(2000, 1)));
     let (y, fillers) = take_over_slot(&eng, slot);
     eng.tie_to(y, "t.age", 555);
     free_one_slot(&eng, &fillers);
@@ -176,7 +176,7 @@ fn newer_record_still_applies_after_slot_reuse() {
     // 削除 (2000) より新しい Tie → LWW 的には採用されるべき
     let t = eng.resolve_remote_eid(foreign, hid).expect("翻訳できない");
     assert!(
-        eng.remote_tie_apply(t, hid, 111, hlc(3000, 1), None),
+        eng.remote_tie_apply(t, hid, 111, hlc(3000, 1)),
         "削除より新しい Tie が適用されない (退避 tombstone が過剰に効いている)",
     );
     assert_eq!(eng.get(t, "t.age"), Some(111));
@@ -194,7 +194,7 @@ fn evicted_tombstone_survives_reopen() {
         let (eng, hid, foreign, translated) = setup(&path);
         let slot = enchudb_oplog::eid_local(translated);
 
-        assert!(eng.remote_delete_apply(translated, hlc(2000, 1), None));
+        assert!(eng.remote_delete_apply(translated, hlc(2000, 1)));
         let (y, fillers) = take_over_slot(&eng, slot);
         eng.tie_to(y, "t.age", 555);
         free_one_slot(&eng, &fillers);
@@ -209,7 +209,7 @@ fn evicted_tombstone_survives_reopen() {
 
     // 削除より古い Tie。 reopen で忘れていれば通ってしまう
     let t = eng2.resolve_remote_eid(foreign, hid).expect("翻訳できない");
-    let applied = eng2.remote_tie_apply(t, hid, 111, hlc(1500, 1), None);
+    let applied = eng2.remote_tie_apply(t, hid, 111, hlc(1500, 1));
     eng2.rebuild();
 
     assert!(!applied, "reopen 後に削除より古い Tie が適用された");
@@ -233,14 +233,14 @@ fn translating_into_a_reused_slot_does_not_deadlock() {
     let (eng, hid, _foreign, translated) = setup(&path);
 
     // 1 個目の foreign を消して slot を空ける
-    assert!(eng.remote_delete_apply(translated, hlc(2000, 1), None));
+    assert!(eng.remote_delete_apply(translated, hlc(2000, 1)));
 
     // 別 peer の foreign entity を翻訳する = alloc 経路で free slot を掴む。
     // ここで固まるなら deadlock (test harness の timeout で落ちる)。
     for i in 0..4u32 {
         let f = enchudb_oplog::make_eid(3, 500 + i);
         if let Some(t) = eng.resolve_remote_eid(f, hid) {
-            eng.remote_tie_apply(t, hid, 700 + i, hlc(4000 + i as u64, 3), None);
+            eng.remote_tie_apply(t, hid, 700 + i, hlc(4000 + i as u64, 3));
         }
     }
     drop(eng);

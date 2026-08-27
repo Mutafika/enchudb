@@ -6715,9 +6715,6 @@ impl Engine {
         himo_id: u16,
         bytes: &[u8],
         hlc: enchudb_oplog::Hlc,
-        // #209: relay は Syncer 側 (relay_record) に移動済み。 引数は API 互換の
-        // ため残置 — 次の breaking release (0.23 #201 系) で撤去する。
-        _relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
     ) -> RemoteApply {
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
@@ -6760,9 +6757,6 @@ impl Engine {
         himo_id: u16,
         value: u32,
         hlc: enchudb_oplog::Hlc,
-        // #209: relay は Syncer 側 (relay_record) に移動済み。 引数は API 互換の
-        // ため残置 — 次の breaking release (0.23 #201 系) で撤去する。
-        _relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
     ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
@@ -6791,9 +6785,6 @@ impl Engine {
         eid: enchudb_oplog::EntityId,
         himo_id: u16,
         hlc: enchudb_oplog::Hlc,
-        // #209: relay は Syncer 側 (relay_record) に移動済み。 引数は API 互換の
-        // ため残置 — 次の breaking release (0.23 #201 系) で撤去する。
-        _relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
     ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
@@ -6812,9 +6803,6 @@ impl Engine {
         &self,
         eid: enchudb_oplog::EntityId,
         hlc: enchudb_oplog::Hlc,
-        // #209: relay は Syncer 側 (relay_record) に移動済み。 引数は API 互換の
-        // ため残置 — 次の breaking release (0.23 #201 系) で撤去する。
-        _relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
     ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         self.observe_remote_hlc(hlc);
@@ -6837,9 +6825,6 @@ impl Engine {
         key: &str,
         data: &[u8],
         hlc: enchudb_oplog::Hlc,
-        // #209: relay は Syncer 側 (relay_record) に移動済み。 引数は API 互換の
-        // ため残置 — 次の breaking release (0.23 #201 系) で撤去する。
-        _relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
     ) -> RemoteApply {
         let local = enchudb_oplog::eid_local(eid);
         self.observe_remote_hlc(hlc);
@@ -6875,9 +6860,6 @@ impl Engine {
         author_peer: enchudb_oplog::PeerId,
         remote_vid: u32,
         bytes: &[u8],
-        // #209: relay は Syncer 側 (relay_record) に移動済み。 引数は API 互換の
-        // ため残置 — 次の breaking release (0.23 #201 系) で撤去する。
-        _relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
     ) {
         let local_vid = self.vocab.get_or_insert(bytes);
         {
@@ -9947,7 +9929,7 @@ impl Engine {
         match op {
             DecodedOp::Vocab { vid, bytes } => {
                 if !self.has_remote_vocab(author, *vid, bytes) {
-                    self.remote_vocab_apply(author, *vid, bytes, None);
+                    self.remote_vocab_apply(author, *vid, bytes);
                 }
             }
             DecodedOp::Tie { eid, himo_id, value } => {
@@ -9963,7 +9945,7 @@ impl Engine {
                         None => return,
                     }
                 };
-                self.remote_tie_apply(le, *himo_id, v, hlc, None);
+                self.remote_tie_apply(le, *himo_id, v, hlc);
             }
             DecodedOp::TieRef { eid, himo_id, target } => {
                 let Some(le) = self.resolve_remote_eid(*eid, *himo_id) else { return };
@@ -9975,30 +9957,30 @@ impl Engine {
                     Some(v) => v,
                     None => return,
                 };
-                self.remote_tie_apply(le, *himo_id, v, hlc, None);
+                self.remote_tie_apply(le, *himo_id, v, hlc);
             }
             DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => {
                 let Ok(hid) = self.ensure_himo_named(himo_name, *himo_kind) else { return };
                 let Some(le) = self.resolve_remote_eid(*eid, hid) else { return };
                 let Some(v) = self.try_translate_remote_vid(author, hid, *value) else { return };
-                self.remote_tie_apply(le, hid, v, hlc, None);
+                self.remote_tie_apply(le, hid, v, hlc);
             }
             DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => {
                 let Ok(hid) = self.ensure_himo_named(himo_name, *himo_kind) else { return };
                 let Some(le) = self.resolve_remote_eid(*eid, hid) else { return };
-                self.remote_tieleaf_apply(le, hid, bytes, hlc, None);
+                self.remote_tieleaf_apply(le, hid, bytes, hlc);
             }
             DecodedOp::Untie { eid, himo_id } => {
                 let Some(le) = self.resolve_remote_eid(*eid, *himo_id) else { return };
-                self.remote_untie_apply(le, *himo_id, hlc, None);
+                self.remote_untie_apply(le, *himo_id, hlc);
             }
             DecodedOp::Delete { eid } => {
                 let Some(le) = self.resolve_remote_eid_existing(*eid) else { return };
-                self.remote_delete_apply(le, hlc, None);
+                self.remote_delete_apply(le, hlc);
             }
             DecodedOp::Content { eid, key, data } => {
                 let Some(le) = self.resolve_remote_eid_existing(*eid) else { return };
-                self.remote_content_apply(le, key, data, hlc, None);
+                self.remote_content_apply(le, key, data, hlc);
             }
             DecodedOp::Commit => {}
         }
@@ -11852,7 +11834,7 @@ mod cell_version_tests {
 
         // 記憶が残っているので、 reopen 後も古い record は負ける
         assert!(
-            !eng.remote_tie_apply(eid, hid, 9, hlc(400, 7), None),
+            !eng.remote_tie_apply(eid, hid, 9, hlc(400, 7)),
             "reopen 後に古い record が勝った (版数が永続していない)",
         );
         assert_eq!(eng.get(eid, "age"), Some(42));
@@ -11929,7 +11911,7 @@ mod cell_version_tests {
         );
         // 版数不明なので remote record は従来どおり適用される
         assert!(
-            eng.remote_tie_apply(eid, hid, 9, hlc(400, 7), None),
+            eng.remote_tie_apply(eid, hid, 9, hlc(400, 7)),
             "版数不明 cell への remote apply を止めた (既存 DB が同期不能になる)",
         );
         assert_eq!(eng.get(eid, "age"), Some(9));
@@ -11945,14 +11927,14 @@ mod cell_version_tests {
         let (eng, hid) = v9_with_wal("tomb_remote", "age");
         let eid = eng.entity().unwrap();
 
-        assert!(eng.remote_delete_apply(eid, hlc(1000, 1), None));
+        assert!(eng.remote_delete_apply(eid, hlc(1000, 1)));
         assert!(
-            !eng.remote_tie_apply(eid, hid, 5, hlc(900, 1), None),
+            !eng.remote_tie_apply(eid, hid, 5, hlc(900, 1)),
             "削除より古い Tie が蘇った",
         );
         assert_eq!(eng.get(eid, "age"), None);
         assert!(
-            eng.remote_tie_apply(eid, hid, 6, hlc(1100, 1), None),
+            eng.remote_tie_apply(eid, hid, 6, hlc(1100, 1)),
             "削除より新しい Tie が入らない",
         );
         assert_eq!(eng.get(eid, "age"), Some(6));
@@ -11964,15 +11946,15 @@ mod cell_version_tests {
         let (eng, hid) = v9_with_wal("remote_lww", "age");
         let eid = eng.entity().unwrap();
 
-        assert!(eng.remote_tie_apply(eid, hid, 1, hlc(200, 1), None));
-        assert!(!eng.remote_tie_apply(eid, hid, 2, hlc(100, 1), None), "古い record を適用した");
+        assert!(eng.remote_tie_apply(eid, hid, 1, hlc(200, 1)));
+        assert!(!eng.remote_tie_apply(eid, hid, 2, hlc(100, 1)), "古い record を適用した");
         assert_eq!(eng.get(eid, "age"), Some(1));
-        assert!(eng.remote_tie_apply(eid, hid, 3, hlc(300, 1), None));
+        assert!(eng.remote_tie_apply(eid, hid, 3, hlc(300, 1)));
         assert_eq!(eng.get(eid, "age"), Some(3));
         assert_eq!(eng.cell_hlc(eid, hid), hlc(300, 1), "remote の版数が cell に残っていない");
         // untie も同じ判定
-        assert!(!eng.remote_untie_apply(eid, hid, hlc(250, 1), None));
-        assert!(eng.remote_untie_apply(eid, hid, hlc(400, 1), None));
+        assert!(!eng.remote_untie_apply(eid, hid, hlc(250, 1)));
+        assert!(eng.remote_untie_apply(eid, hid, hlc(400, 1)));
         assert_eq!(eng.get(eid, "age"), None);
     }
 
@@ -11993,7 +11975,7 @@ mod cell_version_tests {
             .unwrap()
             .as_millis() as u64;
         let far_future = Hlc { wall: now_ms + 10 * 365 * 24 * 3600 * 1000, logical: 0, peer: 9 };
-        assert!(eng.remote_tie_apply(eid, hid, 7, far_future, None));
+        assert!(eng.remote_tie_apply(eid, hid, 7, far_future));
         assert_eq!(eng.get(eid, "age"), Some(7));
 
         // 直後のローカル write が負けてはいけない
