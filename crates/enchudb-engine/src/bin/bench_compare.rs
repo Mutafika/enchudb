@@ -63,7 +63,7 @@ fn main() {
     }
     let read = t.elapsed();
 
-    eprintln!("=== v24 実用ベンチ (1M entities) ===");
+    eprintln!("=== 実用ベンチ (1M entities) ===");
     eprintln!("");
     eprintln!("--- 書き込み ---");
     eprintln!("バルク 1M                    : {:>6}ms", bulk_insert.as_millis());

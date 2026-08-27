@@ -318,7 +318,7 @@ impl RagStore {
     }
 
     /// eid の下位 32bit を vector スロット index として使う。
-    /// 単一 peer 前提（RagStore は v32 分散を使わない）。
+    /// 単一 peer 前提（RagStore は分散 sync を使わない）。
     fn vector_offset(&self, eid: EntityId) -> usize {
         let local = enchudb_oplog::eid_local(eid) as usize;
         VEC_HEADER_SIZE + local * self.dim * 4
@@ -420,11 +420,10 @@ impl RagStore {
         }
     }
 
-    /// ペアテーブル再構築（v26 feature 有効時のみ意味あり）。
-    /// v27 では no-op でも害はない。
+    /// ペアテーブル再構築（旧 PairTable 構成でのみ意味があった）。
+    /// 現行 engine では no-op でも害はない。
     pub fn rebuild_pairs(&mut self) {
-        // v26 feature の cross-crate 指定は現在のところ手軽に出来ないので
-        // とりあえず何もしない。v26 併用したい人は `engine_mut().rebuild_pairs()` を直接呼ぶ。
+        // PairTable は engine から削除済みのため、互換のための no-op として残す。
     }
 }
 

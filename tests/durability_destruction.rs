@@ -1,4 +1,4 @@
-//! v29 用の破壊テスト。v28 の耐久性保証を実証 + v29 で埋める穴を記録。
+//! 破壊テスト。oplog の耐久性保証を実証 + page checksum で埋める穴を記録。
 //!
 //! # カテゴリ
 //!
@@ -6,10 +6,10 @@
 //! - B. ファイル破損: バイト改竄、truncate
 //! - C. ordering / ファズ: 低確率だが検出すべきケース
 //!
-//! # v29 で対応予定の既知ギャップ
+//! # page checksum (未実装) で対応予定の既知ギャップ
 //!
-//! 一部テストは `#[ignore]` で保留。v29 の page checksum 実装後に enable 予定。
-//! コメントに TODO(v29) を付記。
+//! 一部テストは `#[ignore]` で保留。page checksum 実装後に enable 予定。
+//! コメントに TODO(page-checksum) を付記。
 
 use enchudb::{Engine, ValueType};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -23,7 +23,7 @@ use std::sync::Arc;
 fn tmp(name: &str) -> String {
     let mut counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     counter += 1;
-    let p = format!("/tmp/enchudb-v29-{}-{}-{}", name, std::process::id(), counter);
+    let p = format!("/tmp/enchudb-destruction-{}-{}-{}", name, std::process::id(), counter);
     cleanup(&p);
     p
 }
@@ -49,7 +49,7 @@ fn crash_writer_bin() -> PathBuf {
     p.push("debug");
     p.push("crash_writer");
     if !p.exists() {
-        panic!("crash_writer binary not built. run: cargo build --features v27 --bin crash_writer");
+        panic!("crash_writer binary not built. run: cargo build -p enchudb-engine --bin crash_writer");
     }
     p
 }
@@ -260,7 +260,7 @@ fn byte_flip_wal_tail_truncated_silently() {
 
 #[test]
 fn truncate_db_to_half_fails_to_open() {
-    // v29: 先読みで file size < layout.total_size を検出してエラーにする。
+    // open 時に先読みで file size < layout.total_size を検出してエラーにする。
     let path = tmp("truncate_half");
     prepare_db(&path);
 
@@ -416,21 +416,21 @@ fn fuzz_random_byte_flip_no_silent_corruption() {
     }
 
     println!("fuzz outcomes ({}iters): {:?}", iters, outcomes);
-    // silent_corruption が出ていれば v28 が負け。v29 で解消したい。
+    // silent_corruption が出ていれば現状の負け。page checksum で解消したい。
     let silent = *outcomes.get("silent_corruption").unwrap_or(&0);
     assert_eq!(silent, 0,
         "silent corruption detected — CRC/validation insufficient. outcomes: {:?}", outcomes);
 }
 
 // ═══════════════════════════════════════════════════════════
-// v29 未実装ギャップ — これらは現状 fail or silent、v29 で直す
+// page checksum 未実装ギャップ — これらは現状 fail or silent
 // ═══════════════════════════════════════════════════════════
 
-/// body データ領域の bit flip は v29 で page checksum により検出される。
+/// body データ領域の bit flip は page checksum (未実装) により検出される想定。
 /// ワークフロー: create → flush(CRC 保存) → 書き込み → flush(CRC 更新)
 /// → 外部改竄 → open → CRC mismatch エラー。
 #[test]
-fn v29_body_bit_flip_detected() {
+fn body_bit_flip_detected() {
     let path = tmp("body_flip");
     {
         // sync API で書き込み + seal_integrity(flush + region CRC 保存)

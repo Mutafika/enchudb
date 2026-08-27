@@ -143,7 +143,7 @@ fn append_mixed_type_himos_after_reopen() {
 
 /// seal_integrity で `.crc` を焼いた後に himo を追加 → reopen できることの確認。
 ///
-/// v29 issue7 fix (`define_himo_slot_locked` が stale `.crc` sidecar を unlink)
+/// issue7 fix (`define_himo_slot_locked` が stale `.crc` sidecar を unlink)
 /// の regression test。 fix 前は `.crc` が前 schema 時点のまま残り、 次 open の
 /// `verify_region_crcs` が vocab/himoreg mismatch で `Err` になっていた
 /// (SIGBUS ではないが DB が開けない)。

@@ -1,4 +1,4 @@
-//! v24 Engine — 量子円柱。単一ファイル。全コンポーネントが1つのmmapを共有。
+//! Engine — 量子円柱。単一ファイル。全コンポーネントが1つのmmapを共有。
 //!
 //!   entity() → ID 振る
 //!   tie_text → 文字列を紐で張る（Vocabulary 経由）
@@ -54,7 +54,7 @@ pub struct TableEidUsage {
     pub free: u32,
 }
 
-/// v29: Engine の実行時状態スナップショット。
+/// Engine の実行時状態スナップショット。
 #[derive(Debug, Clone)]
 pub struct EngineStats {
     pub entity_count: u32,
@@ -77,7 +77,7 @@ pub struct EngineStats {
     pub pushed: u64,
     /// consumer が apply した累計
     pub applied: u64,
-    /// v32: 自 peer の peer_id(非 v32 では 0)
+    /// 自 peer の peer_id(単独 peer 運用では 0)
     pub peer_id: u32,
     /// **pre-v9 DB の**揮発版数置き場のエントリ数。 v9 DB では版数が
     /// per-cell version column に載るので常に 0 (走査が O(entity × himo) に
@@ -909,7 +909,7 @@ impl Backing {
         }
     }
 
-    /// v32: &self 経由で header 領域に unsafe で書き込む。
+    /// &self 経由で header 領域に unsafe で書き込む。
     /// mmap 経由の並行書き込みは atomic スライス更新でガードされる前提。
     #[allow(clippy::mut_from_ref)]
     fn header_mut(&self) -> &mut [u8] {
@@ -942,7 +942,7 @@ use crate::leaf_store::{LeafRead, LeafStore, cap_bytes_for_shift, MAX_OFF_SHIFT}
 use crate::column::Column;
 
 // ════════════════ ギャロッピング交差 ════════════════
-// 旧 v24/v26 経路で使っていた。v27+ でも将来再利用の余地あり。
+// 旧 query 経路で使っていた。将来再利用の余地あり。
 
 #[allow(dead_code)]
 #[inline]
@@ -1148,10 +1148,10 @@ const H_HIMOREG_INDEX_CAP: usize = 40;
 const H_HIMOREG_DATA_SIZE: usize = 44; // u64
 const H_CONTENT_DATA_SIZE: usize = 52; // u64
 const H_CYL_MAX_VALUES: usize = 60;
-/// v28: ヘッダ整合性 CRC。[H_MAGIC..H_HEADER_CRC] の CRC32(FNV-1a)。
+/// ヘッダ整合性 CRC。[H_MAGIC..H_HEADER_CRC] の CRC32(FNV-1a)。
 /// create/flush/define_himo 時に更新、open 時に検証。
 const H_HEADER_CRC: usize = 64; // u32
-/// v32: この DB を所有する peer の id。0 は「未設定 / single peer」。
+/// この DB を所有する peer の id。0 は「未設定 / single peer」。
 /// CRC 保護外(後から set_peer_id で上書き可能)。
 const H_PEER_ID: usize = 68; // u32
 /// 72..76 は予約済み (v3 まで `H_UNDO_MAX_ENTRIES` が居た跡地)。 v4 で undo 全廃に
@@ -1265,7 +1265,7 @@ fn verify_header_crc(buf: &[u8]) -> Result<(), String> {
 }
 
 /// 0.9.0 (L1): header field の自己整合チェック。
-/// `verify_header_crc` は stored CRC == 0 (v27 以前の legacy DB) を素通しするため、
+/// `verify_header_crc` は stored CRC == 0 (header CRC 導入以前の legacy DB) を素通しするため、
 /// 破損した himo_count / *_size / *_cap がそのまま layout 計算へ流れて panic /
 /// OOB region を起こし得た。 ここで「header 自身の field 同士の関係」だけを検証
 /// する (新しい定数上限は導入しない → 既存の正常 DB を誤って弾かない)。
@@ -1837,7 +1837,7 @@ pub struct Engine {
     push_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// consumer が apply 完了した累積件数。apply_count >= push_count が同期点。
     apply_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// v28 WAL。`create_concurrent_with_oplog` or `open_concurrent_with_oplog` で有効化。
+    /// WAL。`create_concurrent_with_oplog` or `open_concurrent_with_oplog` で有効化。
     /// Some なら tie_async/untie_async/delete_async は oplog_record_queue 経由で
     /// consumer thread 側に batch flush を委ねる。
     oplog: Option<std::sync::Arc<enchudb_oplog::oplog::OpLog>>,
@@ -1892,9 +1892,9 @@ pub struct Engine {
     hlc_mint_lock: parking_lot::Mutex<()>,
     /// 背景 fsync が最後に completed した LSN。
     durable_lsn: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// v32: この Engine を所有する peer の id。分散時 eid の上位 32bit。
+    /// この Engine を所有する peer の id。分散時 eid の上位 32bit。
     peer_id: std::sync::atomic::AtomicU32,
-    /// v32: LWW 用に (eid, himo) → 最後の HLC を記録。
+    /// LWW 用に (eid, himo) → 最後の HLC を記録。
     hlc_store: std::sync::Arc<crate::hlc_store::HlcStore>,
     /// #9: 受信した foreign eid を自分の eid 空間の local eid に翻訳する写像。
     eid_translator: std::sync::Arc<crate::eid_translator::EidTranslator>,
@@ -1914,13 +1914,13 @@ pub struct Engine {
     /// 起きていない DB (= 常態) で、 受信 apply の hot path が read lock すら
     /// 取らないようにするためだけのもの。
     foreign_tombs_empty: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// v32 Phase C: 自 peer の ed25519 鍵ペア。None なら署名しない/検証もしない。
+    /// 自 peer の ed25519 鍵ペア。None なら署名しない/検証もしない。
     keypair: std::sync::RwLock<Option<std::sync::Arc<enchudb_oplog::keys::Keypair>>>,
-    /// v32 Phase C: 他 peer の pubkey TOFU ストア。Syncer が verify に使う。
+    /// 他 peer の pubkey TOFU ストア。Syncer が verify に使う。
     pubkeys: std::sync::Arc<enchudb_oplog::keys::PubkeyStore>,
-    /// v32 Phase C: ACL(書き込み許可 peer の集合)。Syncer が enforce する。
+    /// ACL(書き込み許可 peer の集合)。Syncer が enforce する。
     acl: std::sync::Arc<crate::acl::Acl>,
-    /// v32 エッジ用: true なら書き込み API が panic、sync 経由 (remote_*_apply) のみ受ける。
+    /// エッジ replica 用: true なら書き込み API が panic、sync 経由 (remote_*_apply) のみ受ける。
     is_replica: std::sync::atomic::AtomicBool,
     /// CRDT mesh mode: true なら `remote_*_apply` で受信した op を **元 HLC/author/署名のまま**
     /// 自分の WAL にも `append_relayed` で記録し、 次の publish で他 peer に gossip する。
@@ -1957,14 +1957,14 @@ pub struct Engine {
     /// 0.7.0 Phase 4: `_sync_ops` row に振る単調 lsn (= u32 の publish_since cursor)。
     /// `entity_in` の eid とは別、 reclaim で row が消えても lsn は単調維持される。
     next_sync_lsn: std::sync::Arc<std::sync::atomic::AtomicU32>,
-    /// v33: 受信した Vocab op の `(author_peer, remote_vid) → local_vid` mapping。
+    /// 受信した Vocab op の `(author_peer, remote_vid) → local_vid` mapping。
     /// Symbol 型 himo の Tie を受信した時に remote_vid を local_vid に変換して apply する。
     /// peer-local に保持(replica でも独立、open 時は空、受信で徐々に埋まる)。
     peer_vocab_map: std::sync::RwLock<std::collections::HashMap<(enchudb_oplog::PeerId, u32), u32>>,
     /// `peer_vocab_map` が最後の persist 以降に変化したか。 pull ごとに sidecar を
     /// 書き直さないための dirty flag (写像は単調増加なので「増えたか」で足りる)。
     peer_vocab_map_dirty: std::sync::atomic::AtomicBool,
-    /// v34: read-only モード。 true なら書き込み API は error/panic。 open_readonly で立つ。
+    /// read-only モード。 true なら書き込み API は error/panic。 open_readonly で立つ。
     /// `is_replica` は「直 write 拒否、 Syncer 経由は受ける」、 こちらは「一切 write 不可」。
     is_readonly: std::sync::atomic::AtomicBool,
     /// 0.8.2: build phase の sidecar fsync 抑止。 schema crate が
@@ -1979,7 +1979,7 @@ pub struct Engine {
     /// state の snapshot (serialize) から rename までを丸ごとこの lock 下に置く —
     /// serialize も lock 内なので「後から取った方が必ず新しい状態を書く」が成立する。
     sidecar_persist_lock: std::sync::Mutex<()>,
-    /// v34: writer lock の保持 fd。 open_writer / create_* で `.db.lock` sidecar を
+    /// writer lock の保持 fd。 open_writer / create_* で `.db.lock` sidecar を
     /// flock(LOCK_EX)、 Engine drop で fd close = lock release。 readonly では None。
     /// 多 process write の同 .db 競合を防ぐ (sqlite WAL モード相当)。
     #[cfg(not(target_arch = "wasm32"))]
@@ -1989,9 +1989,8 @@ pub struct Engine {
 
 impl Engine {
     /// 現行の単独 Engine を作る(WAL 無し、&mut self で mutation)。
-    /// v32 以前: `Engine::create` の別名。
-    /// v33 以降: `Engine::create` が WAL 付き `Arc<Self>` を返すようになるため、
-    /// 明示的に単独 Engine が欲しい場合はこちらを使う。
+    /// 元は `Engine::create` の別名だったが、現在の `Engine::create` は WAL 付き
+    /// `Arc<Self>` を返すため、明示的に単独 Engine が欲しい場合はこちらを使う。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create_standalone(path: &str) -> io::Result<Self> {
         Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)
@@ -2166,7 +2165,7 @@ impl Engine {
         mmap[H_CELL_VERSION..H_CELL_VERSION + 4]
             .copy_from_slice(&(layout.has_cell_version() as u32).to_le_bytes());
 
-        // v28: ヘッダ整合性 CRC
+        // ヘッダ整合性 CRC
         write_header_crc(&mut mmap);
 
         let base = mmap.as_mut_ptr();
@@ -2619,9 +2618,8 @@ impl Engine {
     }
 
     /// 現行の単独 Engine を開く(WAL 無し、&mut self で mutation)。
-    /// v32 以前: `Engine::open` の別名。
-    /// v33 以降: `Engine::open` が WAL 付き `Arc<Self>` を返すようになるため、
-    /// 明示的に単独 Engine が欲しい場合はこちらを使う。
+    /// 元は `Engine::open` の別名だったが、現在の `Engine::open` は WAL 付き
+    /// `Arc<Self>` を返すため、明示的に単独 Engine が欲しい場合はこちらを使う。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_standalone(path: &str) -> io::Result<Self> {
         Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ true, /*readonly=*/ false)
@@ -2673,7 +2671,7 @@ impl Engine {
                 ),
             }
         }
-        // v29: ファイルサイズ検証 — truncate で SIGBUS を防ぐ
+        // ファイルサイズ検証 — truncate で SIGBUS を防ぐ
         let file_size = file.metadata()?.len();
         Self::validate_file_size(&file, file_size)?;
         let mmap = unsafe { MmapMut::map_mut(&file)? };
@@ -2794,7 +2792,7 @@ impl Engine {
 
     /// 全 region の CRC テーブルを計算する。
     ///
-    /// v29 issue7 fix: vocab/himoreg 領域の header には index clean flag (offset
+    /// issue7 fix: vocab/himoreg 領域の header には index clean flag (offset
     /// 12..16) があり、 open 時に必ず flip される (clean=true → false)。 この 4
     /// バイトを CRC 計算から除外することで、 seal_integrity で焼いた `.crc` が
     /// 次回 open でも変わらず検証 OK になる。 clean flag の値は msync 直後に
@@ -2853,7 +2851,7 @@ impl Engine {
         let crc_path = crc_path_for(&self.path);
         let stored = match CrcTable::load(&crc_path)? {
             Some(t) => t,
-            None => return Ok(()), // v28 以前の DB 互換
+            None => return Ok(()), // `.crc` sidecar の無い DB 互換
         };
         let expected = self.compute_region_crc_table();
         let mismatches = stored.diff(&expected);
@@ -3054,7 +3052,7 @@ impl Engine {
         //
         // - EAGER (0、 default、 legacy zero-fill 含む): file_size は
         //   layout.total_size と一致が必須。 不足は accidental truncation /
-        //   ファイル破損 → エラーで弾く (v29 crash safety)。
+        //   ファイル破損 → エラーで弾く (crash safety)。
         // - GROWABLE (1): file_size < total_size でも正常 (variable cluster
         //   未コミット)。 ftruncate で sparse 拡張して mmap 用に揃える
         //   (実 disk usage はゼロ、 各 store の load() は MAGIC missing で
@@ -3305,7 +3303,7 @@ impl Engine {
                 FILE_VERSION_LEGACY_V6, FILE_VERSION_LEGACY_V5, FILE_VERSION_LEGACY_V4
             ));
         }
-        // v28: ヘッダ整合性 CRC 検証(stored == 0 は v27 以前の DB として許容)
+        // ヘッダ整合性 CRC 検証(stored == 0 は header CRC 導入以前の DB として許容)
         verify_header_crc(buf)?;
         // #123 (v8): writer open は header version を v8 へ上げる。 この open で vocab index は
         // 新 slot 関数 (上位ビット) で書き直されるので、 version を据え置くと **index magic を
@@ -3542,7 +3540,7 @@ impl Engine {
             backing,
         };
 
-        // v32: header から peer_id を復元
+        // header から peer_id を復元
         {
             let hdr = eng.backing.header_mut();
             let peer = u32::from_le_bytes(hdr[H_PEER_ID..H_PEER_ID + 4].try_into().unwrap());
@@ -3577,7 +3575,7 @@ impl Engine {
         Ok(eng)
     }
 
-    // ──── v32: エッジ向け read-only replica ────
+    // ──── エッジ向け read-only replica ────
 
     /// 既存 DB を read-only replica として開く。
     /// 書き込み API (tie / untie / delete / content / entity 等) は panic する。
@@ -5175,7 +5173,7 @@ impl Engine {
     /// size_hint を自動算出する用。
     pub fn max_entities(&self) -> u32 { self.max_entities }
 
-    // ──── v32: peer_id ────
+    // ──── peer_id ────
 
     /// この Engine を所有する peer の id を設定。WAL / DB header にも反映される。
     /// 起動時に 1 回だけ呼ぶ想定。
@@ -6054,7 +6052,7 @@ impl Engine {
         self.oplog.clone()
     }
 
-    // ──── v32: リモート peer から pull したレコードを apply する ────
+    // ──── リモート peer から pull したレコードを apply する ────
     // これらは LWW 判定を通った後の無条件 apply。HlcStore は Syncer が先に更新済み。
 
     /// リモート peer から届いた Tie を apply。
@@ -6301,7 +6299,7 @@ impl Engine {
         true
     }
 
-    /// v33: リモート peer から届いた Vocab op を apply。
+    /// リモート peer から届いた Vocab op を apply。
     /// `bytes` を local vocab に insert し、local_vid を取得して
     /// `(author_peer, remote_vid) → local_vid` の mapping を記録する。
     /// 後続の Tie { value: remote_vid } を受信したら `translate_remote_vid` で local_vid に変換。
@@ -6356,7 +6354,7 @@ impl Engine {
         false
     }
 
-    /// v33: Symbol 型 himo の Tie を受信した際、remote vid を local vid に変換する。
+    /// Symbol 型 himo の Tie を受信した際、remote vid を local vid に変換する。
     /// Symbol 以外の himo、または mapping 未登録なら元値をそのまま返す。
     pub fn translate_remote_vid(&self, author_peer: enchudb_oplog::PeerId, himo_id: u16, value: u32) -> u32 {
         let hid = himo_id as usize;
@@ -8685,7 +8683,7 @@ impl Engine {
     /// 指定紐の現在の unique 値数(非空バケット数)。O(1)。
     /// 紐が未定義なら None。
     ///
-    /// v27 の BucketCylinder は tie/untie/remove 時に AtomicU32 を増減させる。
+    /// BucketCylinder は tie/untie/remove 時に AtomicU32 を増減させる。
     /// `define_himo` の `max_values` はヒントに過ぎないので、ここで返るのは
     /// 実データ上の cardinality。
     pub fn himo_cardinality(&self, himo: &str) -> Option<u32> {
@@ -9052,12 +9050,12 @@ impl Engine {
         buf[mv_off..mv_off + 4].copy_from_slice(&max_values.to_le_bytes());
         let himo_count = (hid + 1) as u32;
         buf[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&himo_count.to_le_bytes());
-        // v28: header CRC を再計算(himo_count が変わったため)
+        // header CRC を再計算(himo_count が変わったため)
         write_header_crc(buf);
 
-        // v29 issue7 fix: schema 変更で region layout が変わったので、 seal_integrity
+        // issue7 fix: schema 変更で region layout が変わったので、 seal_integrity
         // で焼かれた古い `.crc` sidecar は stale。 削除して、 次 open は CRC 検証
-        // skip (v28 以前と同じ fallback)、 次 seal_integrity で regenerate させる。
+        // skip (`.crc` 無し DB と同じ fallback)、 次 seal_integrity で regenerate させる。
         #[cfg(not(target_arch = "wasm32"))]
         {
             let crc_path = crate::integrity::crc_path_for(&self.path);
@@ -9070,7 +9068,7 @@ impl Engine {
         Ok(hid as u16)
     }
 
-    // ──── v27 並行書き込み ────
+    // ──── 並行書き込み ────
 
     /// 並行対応版の create。
     ///
@@ -9091,7 +9089,7 @@ impl Engine {
         Ok(Self::spawn_consumer(eng))
     }
 
-    /// v28: WAL 付き create_concurrent。
+    /// WAL 付き create_concurrent。
     /// `{path}.wal` に Write-Ahead Log を作成。
     ///
     /// tie_async / untie_async / delete_async は hot path で WAL append(memcpy)を行い、
@@ -9127,8 +9125,8 @@ impl Engine {
         Ok(Self::spawn_consumer_with_oplog_queue_cap(eng, Some(wal), Some(queue_capacity)))
     }
 
-    /// v28: WAL 付き open_concurrent。既存 WAL があればリカバリする。
-    /// v29: region CRC は WAL ルートでは skip(WAL が source of truth)。
+    /// WAL 付き open_concurrent。既存 WAL があればリカバリする。
+    /// region CRC は WAL ルートでは skip(WAL が source of truth)。
     /// 代わりに古い `.crc` ファイルは削除して、次回 flush で regenerate させる。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_concurrent_with_oplog(path: &str, oplog_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
@@ -9186,7 +9184,7 @@ impl Engine {
     }
 
     /// WAL の 1 op を本体に適用(recover 専用)。
-    /// v32: eid は u64 だが Column は local u32 で保持。eid_local() で剥がす。
+    /// eid は u64 だが Column は local u32 で保持。eid_local() で剥がす。
     ///
     /// 0.8.1: Tie/Content で `entities.ensure_live` + table `next_local` の
     /// max 推進を入れた。 これが無いと short-lived CLI (= sidecar persist
@@ -9256,7 +9254,7 @@ impl Engine {
             }
             DecodedOp::Commit => {}
             DecodedOp::Vocab { .. } => {
-                // v33: 自プロセスの recover 時は Vocab 個別の apply 不要
+                // 自プロセスの recover 時は Vocab 個別の apply 不要
                 // (author_peer == self の場合は既に local vocab にある)。
                 // Sync 経由で他 peer から受信する場合のみ apply_one 側で処理。
             }
@@ -9591,7 +9589,7 @@ impl Engine {
                                     &emit_offset_for_thread,
                                 );
                             }
-                            // v30: ring buffer reset を試みる。head == checkpoint &&
+                            // ring buffer reset を試みる。head == checkpoint &&
                             // pending_writes == 0 のときだけ head/checkpoint を HEADER_SIZE に戻す。
                             // これで WAL 容量を食い切らずに長期運用できる。
                             // ※ auto_reset が発動して offset が後退したら listener cursor もリセット。
@@ -9779,7 +9777,7 @@ impl Engine {
         self.durable_lsn.load(Ordering::Acquire)
     }
 
-    /// v29: エンジン状態の一覧。監視・デバッグ用。
+    /// エンジン状態の一覧。監視・デバッグ用。
     // ──── Phase F: 監査 ────
 
     /// WAL 監査: commit 済みレコードを filter して返す。
@@ -10123,7 +10121,7 @@ impl Engine {
         }
     }
 
-    /// v33: 非同期 tie_text。text 値を vocab に挿入し、WAL に Vocab + Tie の 2 op を流す。
+    /// 非同期 tie_text。text 値を vocab に挿入し、WAL に Vocab + Tie の 2 op を流す。
     ///
     /// 流れ:
     /// 1. local vocab に bytes を get_or_insert → `local_vid`
@@ -10227,11 +10225,11 @@ impl Engine {
         }
     }
 
-    /// v33: 非同期 tie_ref。target_eid の local 部(u32)を WAL / 本体に運ぶ。
+    /// 非同期 tie_ref。target_eid の local 部(u32)を WAL / 本体に運ぶ。
     /// target_eid は u64 [peer|local] だが、現行 WAL は value: u32 しか運べないため
     /// peer_id 部は捨てる。すなわち receiver 側では「author_peer と同一 peer 上の entity」を
     /// 指す ref として再構成される。cross-peer ref (peer A が peer B の entity を指す)は
-    /// 現状未対応 (Ref 用 WAL op を別途用意する必要あり、v34 以降)。
+    /// 現状未対応 (Ref 用 WAL op を別途用意する必要あり)。
     pub fn tie_ref_async(&self, eid: enchudb_oplog::EntityId, himo: &str, target_eid: enchudb_oplog::EntityId) {
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo)) as u16;
@@ -10415,7 +10413,7 @@ impl Engine {
             buf[off..off + 4].copy_from_slice(&self.himo_max_values[hid].to_le_bytes());
         }
         buf[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&hc.to_le_bytes());
-        // v28: ヘッダ整合性 CRC(himo_count 含む固定レイアウト部のみを対象)
+        // ヘッダ整合性 CRC(himo_count 含む固定レイアウト部のみを対象)
         write_header_crc(buf);
 
         // 全 region を disk に同期した後、 vocab/himo_reg の index 整合性 OK
@@ -10472,7 +10470,7 @@ impl Engine {
         self.vocab.rebuilt_on_load
     }
 
-    /// v29: region CRC を計算して `.crc` sidecar に永続化する。
+    /// region CRC を計算して `.crc` sidecar に永続化する。
     /// flush() とは別の opt-in API。512MB+ の vocab 走査を含むので秒オーダー。
     /// コールドバックアップを封緘するユースケース向け。
     #[cfg(not(target_arch = "wasm32"))]
@@ -11725,7 +11723,7 @@ mod tests {
         let result = eng.pull_raw("ts", ts);
         assert_eq!(result, vec![e]);
 
-        // v27 BucketCylinder は動的拡張するので、 u32::MAX-2 だと
+        // BucketCylinder は動的拡張するので、 u32::MAX-2 だと
         // バケット 40 億本分の Vec を確保してしまう。 ここでは代わりに
         // 100 万オーダーの「大きめ値」で検証する。
         let big = 1_000_000u32;

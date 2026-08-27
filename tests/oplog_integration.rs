@@ -1,4 +1,4 @@
-//! v28 WAL 統合テスト。プロセスクラッシュ / fsync 挙動 / リカバリを検証。
+//! oplog 統合テスト。プロセスクラッシュ / fsync 挙動 / リカバリを検証。
 
 use enchudb::{Engine, ValueType};
 use std::path::Path;

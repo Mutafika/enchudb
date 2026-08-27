@@ -2,7 +2,7 @@
 //! 抜きで proptest でランダム bytes を食わせて panic/UB しないことを検証する。
 //!
 //! カバー対象(TEST_DESIGN.md P2-8):
-//! - WireRecord::decode — v32 sync で相手 peer から受け取る bytes
+//! - WireRecord::decode — peer sync で相手 peer から受け取る bytes
 //! - decode_batch — 複数 record 並びの framing
 //! - WAL の iter_committed — 破損 tail を含む WAL ファイルの走査
 //!

@@ -97,7 +97,7 @@ fn content_async_survives_wal_recovery() {
         eng.oplog_commit();
         eng.flush_writes();
         // graceful drop (最終 Commit + checkpoint) — recovery 経路は
-        // v32_crash_recovery 系が subprocess kill で担保しているので、
+        // crash_recovery 系が subprocess kill で担保しているので、
         // ここでは「WAL 経由の非同期 content が reopen 後に読めること」を固定
     }
     let eng = Engine::open_concurrent_with_oplog(&path, 1 << 20).expect("reopen");

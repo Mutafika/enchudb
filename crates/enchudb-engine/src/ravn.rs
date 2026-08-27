@@ -74,7 +74,7 @@ impl Ravn {
         current
     }
 
-    /// v31: 逆方向 tie 辿り。
+    /// 逆方向 tie 辿り。
     pub fn reverse_follow(&self, start: &[enchudb_oplog::EntityId], himo: &str) -> Vec<enchudb_oplog::EntityId> {
         let mut out = Vec::new();
         for &e in start {
@@ -88,7 +88,7 @@ impl Ravn {
         out
     }
 
-    /// v31: 深さ制限付き BFS。`himo` を繰り返し forward で辿る。
+    /// 深さ制限付き BFS。`himo` を繰り返し forward で辿る。
     pub fn bfs(&self, start: &[enchudb_oplog::EntityId], himo: &str, max_depth: u32) -> Vec<(u32, Vec<enchudb_oplog::EntityId>)> {
         use std::collections::HashSet;
         let mut visited: HashSet<enchudb_oplog::EntityId> = start.iter().copied().collect();
@@ -104,7 +104,7 @@ impl Ravn {
         result
     }
 
-    /// v31: entity 集合を「`himo == value` を満たすもの」だけに絞る。
+    /// entity 集合を「`himo == value` を満たすもの」だけに絞る。
     pub fn filter_by(&self, eids: &[enchudb_oplog::EntityId], himo: &str, value: u32) -> Vec<enchudb_oplog::EntityId> {
         eids.iter()
             .filter(|&&e| self.engine.get(e, himo) == Some(value))
@@ -112,13 +112,13 @@ impl Ravn {
             .collect()
     }
 
-    /// v31: テキスト値でフィルタ(Symbol 型 himo 用)。
+    /// テキスト値でフィルタ(Symbol 型 himo 用)。
     pub fn filter_by_text(&self, eids: &[enchudb_oplog::EntityId], himo: &str, text: &str) -> Vec<enchudb_oplog::EntityId> {
         let Some(vid) = self.engine.vocab_id(text) else { return Vec::new(); };
         self.filter_by(eids, himo, vid)
     }
 
-    /// v31: entity 集合から himo の値(u32)を抽出。
+    /// entity 集合から himo の値(u32)を抽出。
     /// None は除外。
     pub fn extract(&self, eids: &[enchudb_oplog::EntityId], himo: &str) -> Vec<u32> {
         eids.iter()
@@ -126,14 +126,14 @@ impl Ravn {
             .collect()
     }
 
-    /// v31: テキスト抽出。
+    /// テキスト抽出。
     pub fn extract_text(&self, eids: &[enchudb_oplog::EntityId], himo: &str) -> Vec<Vec<u8>> {
         eids.iter()
             .filter_map(|&e| self.engine.get_text_owned(e, himo)) // #119
             .collect()
     }
 
-    /// v31: content 抽出。
+    /// content 抽出。
     pub fn extract_content(&self, eids: &[enchudb_oplog::EntityId], key: &str) -> Vec<Vec<u8>> {
         eids.iter()
             .filter_map(|&e| self.engine.get_content_owned(e, key)) // #119
@@ -192,14 +192,14 @@ impl Ravn {
                     let steps: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
                     eids = self.follow(&eids, &steps);
                 }
-                // v31: 逆方向 tie 辿り。`reverse parent` で parent 指している entity 集合。
+                // 逆方向 tie 辿り。`reverse parent` で parent 指している entity 集合。
                 "reverse" | "rev" => {
                     if args.is_empty() {
                         return RavnResult::Error("reverse: no himo specified".into());
                     }
                     eids = self.reverse_follow(&eids, &args[0]);
                 }
-                // v31: フィルタ。`where himo:value` で絞り込み。
+                // フィルタ。`where himo:value` で絞り込み。
                 "where" => {
                     // args 形式: "himo:value" or "himo:\"text\""
                     let joined = args.join(" ");
@@ -211,7 +211,7 @@ impl Ravn {
                         eids = self.filter_by(&eids, &himo, value);
                     }
                 }
-                // v31: 深さ制限 BFS。`bfs <himo> <depth>` で全レベル展開(flat)。
+                // 深さ制限 BFS。`bfs <himo> <depth>` で全レベル展開(flat)。
                 "bfs" => {
                     if args.len() < 2 {
                         return RavnResult::Error("bfs: usage `bfs <himo> <depth>`".into());
@@ -460,7 +460,7 @@ mod tests {
         }
     }
 
-    // ──── v31 additions ────
+    // ──── graph traversal: reverse / bfs / filter / extract ────
 
     #[test]
     fn reverse_follow_finds_children() {

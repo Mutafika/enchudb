@@ -1,4 +1,4 @@
-//! v32: Read-only replica モードのテスト。
+//! Read-only replica モードのテスト。
 //!
 //! replica として開いた Engine は書き込み API が panic、sync 経由 (remote_*_apply) のみ通る。
 //! エッジ node の想定シナリオ: origin で書き、レプリカは pull で追従、ローカル書き込み不可。
@@ -10,7 +10,7 @@ use enchudb::sync::Syncer;
 use enchudb::transport::{InMemoryTransport, Transport};
 
 fn tmp(tag: &str) -> String {
-    let p = format!("/tmp/enchudb-v32-replica-{}-{}", tag, std::process::id());
+    let p = format!("/tmp/enchudb-replica-{}-{}", tag, std::process::id());
     for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", p, suffix));
     }

@@ -1,4 +1,4 @@
-//! v32 HTTP transport の E2E 統合テスト。
+//! HTTP transport の E2E 統合テスト。
 //!
 //! origin Engine → HTTP relay → replica Engine のデータ伝搬を確認する。
 //! "2-node localhost デモ" の最小形。
@@ -14,7 +14,7 @@ use enchudb_transport::http::{HttpRelay, HttpTransport};
 use enchudb_oplog::oplog::DecodedOp;
 
 fn tmp(tag: &str) -> String {
-    let p = format!("/tmp/enchudb-v32-http-{}-{}", tag, std::process::id());
+    let p = format!("/tmp/enchudb-http-{}-{}", tag, std::process::id());
     for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", p, suffix));
     }

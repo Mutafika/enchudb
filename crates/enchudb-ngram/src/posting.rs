@@ -1,8 +1,8 @@
 /// n-gram key → entity ID リストの逆引きインデックス。
 /// BucketCylinder と同じ発想: key ごとに Vec<u64> を持つ。
 ///
-/// key は u64（gram の n 文字を 16bit ずつ pack、#121）、eid も u64（EnchuDB v32+ の
-/// entity ID）。n = 2 の key は上位 32bit が 0 で、旧 u32 key と同じビット列。
+/// key は u64（gram の n 文字を 16bit ずつ pack、#121）、eid も u64（EnchuDB の
+/// [peer|local] 合成 entity ID）。n = 2 の key は上位 32bit が 0 で、旧 u32 key と同じビット列。
 use std::collections::HashMap;
 
 pub struct PostingList {
@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn wide_eid() {
-        // u32 を超える eid（v32 layout: [peer_id: 32][local_id: 32]）でも動く
+        // u32 を超える eid（[peer_id: 32][local_id: 32] layout）でも動く
         let mut pl = PostingList::new();
         let peer1_local0 = 1u64 << 32;
         let peer1_local1 = (1u64 << 32) | 1;

@@ -16,7 +16,7 @@
 //!   → 200 OK, body = empty
 //! ```
 //!
-//! # Room scoping (v33+)
+//! # Room scoping
 //!
 //! 上記 path を `/rooms/<room_id>/pull` / `/rooms/<room_id>/publish` 形式にすると、
 //! 同じ relay 上で複数 room の record log を独立に扱える。room_id は URL 上の

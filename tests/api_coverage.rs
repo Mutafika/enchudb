@@ -5,7 +5,7 @@
 //! - `create_concurrent` (WAL 無し concurrent)
 //! - `get_entity` (全 himo 一括取得)
 //! - `tie_text_to` (&self text 書き込み)
-//! - `open_concurrent_replica` (v32 replica + concurrent writer)
+//! - `open_concurrent_replica` (replica + concurrent writer)
 
 use enchudb::{Engine, EntityValue, ValueType};
 use std::sync::Arc;

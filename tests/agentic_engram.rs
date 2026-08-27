@@ -1,4 +1,4 @@
-//! v31 実証テスト: Agentic Engram 相当の長期記憶ユースケースを
+//! 実証テスト: Agentic Engram 相当の長期記憶ユースケースを
 //! **Lance + Kuzu 不使用で、EnchuDB + Ravn だけ**で実装。
 //!
 //! 参考(元記事): AI エージェント用の記憶システム。
@@ -30,7 +30,7 @@ use enchudb::{Engine, ValueType, Ravn};
 use std::sync::Arc;
 
 fn tmp(name: &str) -> String {
-    let p = format!("/tmp/enchudb-v31-engram-{}-{}", name, std::process::id());
+    let p = format!("/tmp/enchudb-engram-{}-{}", name, std::process::id());
     let _ = std::fs::remove_file(&p);
     let _ = std::fs::remove_file(format!("{}.oplog", p));
     let _ = std::fs::remove_file(format!("{}.crc", p));

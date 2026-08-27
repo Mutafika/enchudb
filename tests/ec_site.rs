@@ -1,6 +1,6 @@
-//! EnchuDB v27 EC サイト実用テスト。
+//! EnchuDB EC サイト実用テスト。
 //!
-//! 実行: `cargo test --features v27 --test ec_site -- --nocapture`
+//! 実行: `cargo test --test ec_site -- --nocapture`
 
 use enchudb::{Engine, ValueType};
 

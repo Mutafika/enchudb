@@ -1,11 +1,11 @@
-//! Operation log (v28→v32) — append-only op stream for peer sync + audit + recovery.
+//! Operation log — append-only op stream for peer sync + audit + recovery.
 //!
 //! 0.6.0 で `enchudb-wal` から rename (issue #8)。 実態は write-ahead log では
 //! なく oplog (MongoDB oplog と同パターン): mmap が primary state、 oplog は
 //! 「何が起きたか」 の正準ストリーム。 wire format は v2 で不変、 在野の
 //! file magic は歴史的経緯で `EWAL` のまま (= 既存 file binary 互換のため)。
 //!
-//! # v32 レイアウト (oplog v2)
+//! # レイアウト (oplog v2)
 //!
 //! - **eid を u64 化**(分散の [peer|local] 合成 ID)
 //! - **HLC スロット**: `(wall:8, logical:4, peer:4)` 全順序用
@@ -281,8 +281,8 @@ pub mod op_type {
     pub const DELETE: u8 = 2;
     pub const CONTENT: u8 = 3;
     pub const COMMIT: u8 = 4;
-    pub const SCHEMA: u8 = 5; // v32 予約(Phase D 以降で使う)
-    pub const VOCAB: u8 = 6;  // v33: text vid → bytes 対応を peer 間で運ぶ
+    pub const SCHEMA: u8 = 5; // 予約(Phase D 以降で使う)
+    pub const VOCAB: u8 = 6;  // text vid → bytes 対応を peer 間で運ぶ
     /// 0.9.0: himo を **名前で** 運ぶ Tie。 動的定義される content himo
     /// (`_c_{key}`) は peer 間で himo_id が揃わないため、 id ではなく
     /// full name を self-describing に運び、 受信側が ensure_himo_dynamic
@@ -338,7 +338,7 @@ impl OwnedOp {
     }
 }
 
-/// WAL に書く op。eid は u64(v32)。
+/// WAL に書く op。eid は u64。
 #[derive(Debug, Clone)]
 pub enum Op<'a> {
     Tie { eid: u64, himo_id: u16, value: u32 },
@@ -346,7 +346,7 @@ pub enum Op<'a> {
     Delete { eid: u64 },
     Content { eid: u64, key: &'a str, data: &'a [u8] },
     Commit,
-    /// v33: text 文字列を peer 間で運ぶ。`vid` は author_peer ローカルの vocab ID。
+    /// text 文字列を peer 間で運ぶ。`vid` は author_peer ローカルの vocab ID。
     /// receiver 側は `(author_peer, vid) → local_vid` の mapping を持ち、
     /// 後続の Tie { value: vid } を受けたら local_vid に変換して適用する。
     Vocab { vid: u32, bytes: &'a [u8] },
@@ -457,7 +457,7 @@ pub enum DecodedOp {
     Delete { eid: u64 },
     Content { eid: u64, key: String, data: Vec<u8> },
     Commit,
-    /// v33: peer 間で vocab の (vid, bytes) を運ぶ。`vid` は record の author_peer ローカル。
+    /// peer 間で vocab の (vid, bytes) を運ぶ。`vid` は record の author_peer ローカル。
     Vocab { vid: u32, bytes: Vec<u8> },
     /// 0.9.0: himo full name 付き Tie (動的 content himo 用)。
     TieNamed { eid: u64, himo_name: String, himo_kind: u8, value: u32 },
@@ -474,7 +474,7 @@ pub enum DecodedOp {
 }
 
 /// リカバリ結果の 1 レコード(HLC + 署名込み)。
-/// v32 Phase C: signature と pubkey_fp も含めて返し、Syncer/PubkeyStore で検証できる。
+/// signature と pubkey_fp も含めて返し、Syncer/PubkeyStore で検証できる。
 #[derive(Debug, Clone)]
 pub struct Record {
     pub lsn: u64,
@@ -534,13 +534,13 @@ pub struct OpLog {
     head: AtomicU64,
     checkpoint: AtomicU64,
     next_lsn: AtomicU64,
-    /// v32: HLC logical counter(wall が進まない時の tiebreaker 単調増加)。
+    /// HLC logical counter(wall が進まない時の tiebreaker 単調増加)。
     hlc_logical: std::sync::atomic::AtomicU32,
-    /// v32: 最後に書いた HLC wall(ms)。
+    /// 最後に書いた HLC wall(ms)。
     hlc_last_wall: AtomicU64,
-    /// v32: この OpLog を持つ peer の id(header には書かず Engine から設定)。
+    /// この OpLog を持つ peer の id(header には書かず Engine から設定)。
     peer_id: std::sync::atomic::AtomicU32,
-    /// v32 Phase C: ed25519 鍵ペア。set_keypair で設定。None なら署名は zeros。
+    /// ed25519 鍵ペア。set_keypair で設定。None なら署名は zeros。
     keypair: std::sync::RwLock<Option<std::sync::Arc<crate::keys::Keypair>>>,
     /// #75: 同一プロセス内 append の直列化。 flock は open file description
     /// 単位のため、 同じ File を共有するスレッド間では排他にならない (2 本目の
@@ -548,9 +548,9 @@ pub struct OpLog {
     /// write) と `next_hlc` はこの lock の下でのみ安全。 cross-process 排他は
     /// 従来通り flock が担う。
     append_lock: std::sync::Mutex<()>,
-    /// v30: append 中の writer 数。try_reset はこれが 0 のときだけ実行できる。
+    /// append 中の writer 数。try_reset はこれが 0 のときだけ実行できる。
     pending_writes: std::sync::atomic::AtomicU32,
-    /// v32: auto reset を許可するか。default false。
+    /// auto reset を許可するか。default false。
     /// true にすると consumer が head==checkpoint の tick で ring buffer を空に戻し
     /// 長期運用で WAL 容量を食い切らない動きになるが、audit/iter_committed/publish_since
     /// で読む前に消える race があるので opt-in。
@@ -788,7 +788,7 @@ impl OpLog {
 
     /// op を append。新しいレコードの LSN を返す。
     ///
-    /// v30: pending_writes カウンタで try_reset との race を防ぐ。
+    /// pending_writes カウンタで try_reset との race を防ぐ。
     /// writer は append 中 +1、完了時 -1。consumer reset は pending==0 時のみ。
     pub fn append(&self, op: Op<'_>) -> io::Result<u64> {
         self.append_with_hlc(op).map(|(lsn, _)| lsn)
@@ -1112,10 +1112,10 @@ impl OpLog {
         Ok((lsn, hlc))
     }
 
-    /// v30: ring buffer reset。
+    /// ring buffer reset。
     /// head == checkpoint && pending_writes == 0 のときのみ実行可能。
     ///
-    /// fix: auto_reset ゲートを撤去。 元は v32 で「Syncer attached の engine は ring を
+    /// fix: auto_reset ゲートを撤去。 元は「Syncer attached の engine は ring を
     /// reset させない」ために入れた gate だが、 0.8.0 で sync publish path が `_sync_ops`
     /// 経由になり oplog ring を直接読まなくなった (sync.rs 参照) ので gate の存在理由は
     /// 消えていた。 にもかかわらず default が false のままだったため production では
@@ -1170,7 +1170,7 @@ impl OpLog {
 
     /// auto_reset を切り替え(Syncer attached の engine では false にする)。
     /// false にすると ring buffer reset が発火しなくなり、WAL は使い切るまで線形成長する。
-    /// v32 の sync 前に消える race を防ぐ用途。
+    /// record が peer sync 前に消える race を防ぐ用途。
     pub fn set_auto_reset(&self, enabled: bool) {
         self.auto_reset.store(enabled, Ordering::Release);
     }
@@ -1203,7 +1203,7 @@ impl OpLog {
         self.mmap_mut_slice()[16..24].copy_from_slice(&target.to_le_bytes());
     }
 
-    /// v32: HEADER_SIZE から head までを読んで、Commit で挟まれた全レコードを返す。
+    /// HEADER_SIZE から head までを読んで、Commit で挟まれた全レコードを返す。
     /// checkpoint 位置は無視(既に apply 済みの記録もまだ WAL file 上にあれば拾う)。
     /// Syncer.publish_since で使う。ring buffer reset 済みの記録は取れない。
     pub fn iter_committed(&self) -> Vec<Record> {

@@ -1,7 +1,7 @@
-//! v29 ストレステスト。長時間・大量・並行のシナリオ。
+//! ストレステスト。長時間・大量・並行のシナリオ。
 //!
 //! 通常テストは速く終わるべきなので、重いものは `#[ignore]` + 明示 run で。
-//! `cargo test --features v27 --test v29_stress -- --ignored` で実行。
+//! `cargo test --test stress -- --ignored` で実行。
 
 use enchudb::{Engine, ValueType};
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 fn tmp(name: &str) -> String {
-    let p = format!("/tmp/enchudb-v29-stress-{}-{}", name, std::process::id());
+    let p = format!("/tmp/enchudb-stress-{}-{}", name, std::process::id());
     let _ = std::fs::remove_file(&p);
     let _ = std::fs::remove_file(format!("{}.oplog", p));
     let _ = std::fs::remove_file(format!("{}.crc", p));

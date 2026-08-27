@@ -1,4 +1,4 @@
-//! 0.9.0 (L1) regression: header CRC == 0 の legacy 経路 (v27 以前 DB 互換で
+//! 0.9.0 (L1) regression: header CRC == 0 の legacy 経路 (header CRC 導入以前の DB 互換で
 //! `verify_header_crc` が素通し) でも、 破損した himo_count / *_size / *_cap は
 //! open 時に InvalidData で弾く (旧実装は panic / OOB region map まで進んだ)。
 
@@ -39,7 +39,7 @@ fn patch(path: &str, offset: u64, bytes: &[u8]) {
     f.sync_all().unwrap();
 }
 
-/// header CRC を 0 にして legacy (v27 以前) 経路に落とす。
+/// header CRC を 0 にして legacy (header CRC 導入以前) 経路に落とす。
 fn zero_header_crc(path: &str) {
     patch(path, H_HEADER_CRC, &0u32.to_le_bytes());
 }

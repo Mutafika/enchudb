@@ -4,21 +4,21 @@
 //!
 //! ```bash
 //! # ターミナル 1: origin を起動
-//! cargo run --features v32 --bin enchu_demo -- origin --db /tmp/origin.db --port 8080
+//! cargo run -p enchudb-transport --bin enchu_demo -- origin --db /tmp/origin.db --port 8080
 //!
 //! # ターミナル 2: 初期 schema 定義 + 初期データ (origin が loop 中でもできる)
-//! cargo run --features v32 --bin enchu_demo -- schema --db /tmp/origin.db --himo val
+//! cargo run -p enchudb-transport --bin enchu_demo -- schema --db /tmp/origin.db --himo val
 //!
 //! # ターミナル 3: publish (replica が見えるように)
-//! cargo run --features v32 --bin enchu_demo -- publish \
+//! cargo run -p enchudb-transport --bin enchu_demo -- publish \
 //!     --origin http://127.0.0.1:8080 --peer 1 --eid 1 --himo-id 0 --value 42 --hlc-wall 1000
 //!
 //! # ターミナル 4: replica を起動 (bootstrap + 継続 sync)
-//! cargo run --features v32 --bin enchu_demo -- replica \
+//! cargo run -p enchudb-transport --bin enchu_demo -- replica \
 //!     --origin http://127.0.0.1:8080 --db /tmp/replica.db --peer 9
 //!
 //! # 値を読む
-//! cargo run --features v32 --bin enchu_demo -- read --db /tmp/replica.db --eid 1 --himo val
+//! cargo run -p enchudb-transport --bin enchu_demo -- read --db /tmp/replica.db --eid 1 --himo val
 //! ```
 
 
