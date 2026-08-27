@@ -3,6 +3,98 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.23.1 — 2026-08-28
+
+**relay 経路の correctness patch。** 0.23.0 が relay の**配布**を byte 単位の素通しに直した
+(#209) のに対し、 こちらはその帰結を**受け取る側**が引き継げていなかった 3 箇所を塞ぐ。
+症状はどれも「黙って消える」で、 relay を使っていれば定常運転で踏む。 非 breaking。
+
+根っこは 1 つ: **relay の stream は複数 author の merge で HLC が単調でない** (自分の row は
+自 clock、 中継 row は原 author の HLC 素通し)。 なのに cursor / ack / floor が scalar HLC の
+まま = 「単調な単一 stream」 を前提にしていた。
+
+| 実地で起きうる壊れ方 | 直したもの |
+|---|---|
+| 下流の cursor が relay 自身の新しい row で進んだ後、 **中継された古い HLC の record が永久に届かない** (`received: 0`、 truncation 通知も無し) | pull cursor を link × author の vector に (#216) |
+| relay 混在 ring で ack が**未消化 record を watermark の下に巻き込み**、 reclaim が消す | ack walk を longest-consumed-prefix + per-author 述語に (#217) |
+| relay の定常運転で `min(cursor) < floor` が恒常成立し、 **既追従の follower が bootstrap ループに入る** | history floor も author 別に (#216) |
+| 並行 reclaim が free list に slot を二重 push し、 **同じ eid が二度払い出されて bridge row が上書き消失** | purge の delete + push を同一 lock 区間に (#221) |
+
+### #216 — cursor / ack / floor を author 別に
+
+author ごとの substream は relay を何 hop 挟んでも HLC 単調 (relay は pull 順 = author の
+HLC 順に append する)。 この不変式が唯一の健全な粒度を決めるので、 3 つとも author 別にした。
+
+- `Transport::pull_as_multi` / `record_pull_ack_multi` / `take_pull_acks_multi` /
+  `set_history_floor_multi` / `history_floor_multi` を追加 (**すべて default 実装つき**、
+  既存 transport は無改修で動く)
+- **未知 author は `Hlc::ZERO` 起点** — 「既知 author の min」への短絡は同じ穴を一段下で
+  再現する (新しく relay され始めた author の古い record が落ちる)
+- cursor sidecar は v2 (`link author wall logical peer` の 5 field)。 **legacy 4 field 行は
+  author=link として読む**ので、 他 author は ZERO 起点で再配送される = **旧実装が silent
+  drop した record を upgrade が自己修復する**
+- floor は author 別 max を記録する v2 encoding。 legacy の scalar floor は
+  **無帰属 baseline (`u32::MAX` entry)** として温存し、 受信側が `max(entry[a], baseline)` で
+  全 author に畳み込む。 baseline を越えた author から順に per-author 精度が戻るので、
+  legacy floor を持つ既存 DB でも patch が効く (sentinel は自然 retire する)
+- **`u32::MAX` は peer id として予約**になった (baseline sentinel と衝突するため)
+
+### #217 — ack は「消化済みの最長 prefix」
+
+旧実装は生存 row を lsn **降順**に走査して最初の `hlc <= cursor` で ack していた。 relay 混在
+ring は lsn 順で HLC 非単調なので、 高 lsn に乗った古い HLC の中継 row に即 match し、
+**その下の未消化 row を watermark の下に巻き込む**。 doc の「降順打ち切りは安全側に落ちる」
+という記述は逆だった。
+
+- lsn **昇順**に走り、 消化の証明が続く間だけ前進、 証明の無い row で停止する
+- `Engine::ack_sync_up_to_cursors(peer, &[(author, hlc)])` を追加 (完全形)。 既存の
+  `ack_sync_up_to_hlc` は `[(self, cursor)]` の退化形として同じ walk を通る — scalar は
+  author を判別できないので **self-author 行の証明としてのみ**解釈する (`author == 0` =
+  peer identity 設定前の local 著作も self 扱い。 除外すると単独運用 → sync 参加の path で
+  永久 blocker になる)
+- **dead row (payload 欠落 / decode 不能) は削除して越える** (`sync_dead_rows_purged()` で
+  観測)。 配送不能な row を prefix blocker にすると全 peer の ack がそこで止まり ring が
+  満杯になる (#149 で潰した backpressure の復活)
+- 走査は前回 walk の到達点から再開する。 ただし**再開点は in-memory** — 永続の
+  `consumed_lsn` には旧実装が over-ack した値が残りうるので、 session 最初の walk は
+  それを信用せず全 ring を検証し、 小さければ**下方修正する** (移行 heal)
+
+### #221 — purge の delete と free list push を atomic に
+
+`Engine::delete` は冪等で「実際に消したか」を返さないため、 並行 reclaim
+(`absorb_pull_acks` は複数 peer からの並行 pull で並行実行される) が同じ slot を free list に
+二重 push していた。 実測で **138 write に対し 4 row の silent 消失**、 purge 数の二重計上も
+確認。
+
+- purge 専用 lock の下で **`expected_lsn` 一致**を再検証してから消す。 生存判定だけでは
+  ABA を踏む (T1 が purge → slot が bridge に再利用されて同一 eid に新 row → T2 が stale
+  snapshot で「生存」と判定して**その新 row を消す**)。 `lsn` は単調増加なので row の
+  同一性判別子として機能する
+- **`free_locals` は `delete` の前に取り push まで保持**する。 free list の producer は purge
+  だけではなく、 枯渇 slow path の `rebuild_free_locals` が非 live local を穴として push する
+  ため、 「delete 済み・push 前」の中間状態を観測されると両者から独立に入る
+
+### observability
+
+- `Syncer::truncated_pulls()` — `history_truncated` を返した累計。 単調増加しているのに
+  bootstrap 成功が無いなら回復経路が塞がっている
+- `bootstrap_pull` が state provider 不在で失敗したときの once-warn。 その構成では
+  truncation が**回復経路の無い行き止まり**になるため。 **relay / reclaim が回る topology では
+  `serve_state` は実質必須**
+- `Engine::sync_dead_rows_purged()` — #217 の dead row purge 累計 (平常時 0)
+
+### 既知の残り
+
+- **#218** — decode 不能 row を purge しても history floor が上がらない。 この 1 種類だけは
+  floor に現れないので、 over-ack が起きても truncation 通知に乗らず silent partial になる
+- **#219** — publisher 側 `SubscriptionFilter` は pull cursor を scope 依存にする。 filter で
+  落とした record は publisher の reclaim 後 bootstrap でしか戻らない (契約の明文化が必要)
+- #221 の窓を**決定論的に踏む test は作れなかった** (発火に「free list が空 + 枯渇 +
+  delete と push の間」の同時成立が要る)。 test 2 本は回帰検知として置いてあるが、
+  正しさの根拠は lock 順序であってその緑ではない、と doc に明記した
+
+検証: workspace 1058 passed / 0 failed (root crate 込み)、 参照 app (sunsu2) 21/21。
+
 ## 0.23.0 — 2026-08-28
 
 **「黙って消えない」 を 3 層で塞いだ release。** 0.21.0 / 0.22.0 が sync の壊れ方を潰したのに
