@@ -4234,24 +4234,100 @@ impl Engine {
 
         // _sync_ops 全 row を走査して lsn < watermark を delete
         let rows = self.entities_with_himo(lsn_hid_u16);
+        let payload_hid = self.himo_id("_sync_ops.payload").map(|h| h as u16);
         let mut purged = 0;
+        // #191: purge した record の最大 HLC = 「差分 pull で配れない履歴の上限」。
+        // publish 側はこれを history floor として広告する (生存 record の最小 HLC を
+        // 使うと、消化完了直後の正常な cursor まで gap と誤認する)。
+        let mut reclaimed_max: Option<enchudb_oplog::Hlc> = None;
         for eid in rows {
-            if let Some(lsn) = self.get_by_id(eid, lsn_hid_u16) {
-                if lsn < watermark {
-                    let local = enchudb_oplog::eid_local(eid);
-                    self.delete(eid);
-                    // 0.8.0: free list に追加 (= 次回 entity_in("_sync_ops") で再利用)
-                    if let Some((lo, ref free_list, ref nonempty)) = sync_ops_meta {
-                        if local >= lo {
-                            free_list.lock().unwrap().push(local - lo);
-                            nonempty.store(true, std::sync::atomic::Ordering::Release);
-                        }
-                    }
-                    purged += 1;
-                }
+            let Some(lsn) = self.get_by_id(eid, lsn_hid_u16) else { continue };
+            if lsn >= watermark {
+                continue;
             }
+            if let Some(rec) = payload_hid
+                .and_then(|h| self.get_by_id(eid, h))
+                .map(|vid| self.vocab.get(vid).to_vec())
+                .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b))
+                && reclaimed_max.is_none_or(|m| rec.hlc > m)
+            {
+                reclaimed_max = Some(rec.hlc);
+            }
+            let local = enchudb_oplog::eid_local(eid);
+            self.delete(eid);
+            // 0.8.0: free list に追加 (= 次回 entity_in("_sync_ops") で再利用)
+            if let Some((lo, ref free_list, ref nonempty)) = sync_ops_meta
+                && local >= lo
+            {
+                free_list.lock().unwrap().push(local - lo);
+                nonempty.store(true, std::sync::atomic::Ordering::Release);
+            }
+            purged += 1;
+        }
+        if let Some(hlc) = reclaimed_max {
+            self.record_reclaimed_floor(hlc);
         }
         purged
+    }
+
+    /// #191: reclaim で `_sync_ops` から消した record の最大 HLC。
+    ///
+    /// `cursor >= floor` の peer は「reclaim で消えた分を全部消化済み」なので
+    /// 差分 pull を続けて良い。`cursor < floor` の peer だけが bootstrap 対象。
+    /// `_sync_peers` の sentinel row (`reclaimed_floor` Leaf、16 bytes BE) に
+    /// 保存する。row は body mmap なので reclaim の delete と durability の運命を
+    /// 共有する (crash で両方巻き戻れば pre-reclaim 状態として整合する)。
+    pub fn sync_reclaimed_floor(&self) -> Option<enchudb_oplog::Hlc> {
+        if !self.sync_tables_enabled() {
+            return None;
+        }
+        let hid = self.himo_id("_sync_peers.reclaimed_floor")? as u16;
+        let row = self.entities_with_himo(hid).into_iter().next()?;
+        let vid = self.get_by_id(row, hid)?;
+        let bytes = self.vocab.get(vid).to_vec();
+        if bytes.len() != 16 {
+            return None;
+        }
+        Some(enchudb_oplog::Hlc {
+            wall: u64::from_be_bytes(bytes[0..8].try_into().ok()?),
+            logical: u32::from_be_bytes(bytes[8..12].try_into().ok()?),
+            peer: u32::from_be_bytes(bytes[12..16].try_into().ok()?),
+        })
+    }
+
+    /// #191: reclaimed floor を単調 max で更新する (下がることは無い)。
+    /// himo は lazy に ensure する (fix 前に作られた DB の reopen でも育つ)。
+    fn record_reclaimed_floor(&self, candidate: enchudb_oplog::Hlc) {
+        if self.sync_reclaimed_floor().is_some_and(|cur| cur >= candidate) {
+            return;
+        }
+        let hid = match self.ensure_himo_dynamic_in(
+            "_sync_peers",
+            "reclaimed_floor",
+            ValueType::Leaf,
+            0,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("[enchudb] warning: reclaimed_floor himo unavailable ({e}) — history floor will over-approximate after restart");
+                return;
+            }
+        };
+        let row = match self.entities_with_himo(hid).into_iter().next() {
+            Some(r) => r,
+            None => match self.entity_in("_sync_peers") {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[enchudb] warning: reclaimed_floor row unavailable ({e})");
+                    return;
+                }
+            },
+        };
+        let mut bytes = [0u8; 16];
+        bytes[0..8].copy_from_slice(&candidate.wall.to_be_bytes());
+        bytes[8..12].copy_from_slice(&candidate.logical.to_be_bytes());
+        bytes[12..16].copy_from_slice(&candidate.peer.to_be_bytes());
+        self.tie_bytes_to_by_id(row, hid, &bytes);
     }
 
     /// 0.7.0 (Phase 5): 現時点の sync lsn (= 次に転送される record の lsn - 1)。

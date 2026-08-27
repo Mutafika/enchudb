@@ -500,10 +500,21 @@ impl Syncer {
 
     /// #140: 自分の `_sync_ops` が reclaim 済みなら、 配れる履歴の下限を transport に広告する。
     ///
-    /// 下限は「生存している record の最小 HLC」。 これより古い cursor を持つ puller は、
-    /// 差分では埋められない穴があるので bootstrap が要る。 reclaim が起きていなければ
+    /// #191: 下限は「reclaim で消えた record の最大 HLC」。 cursor >= floor の puller は
+    /// 消えた分を全部消化済みなので差分 pull を続けて良い。 cursor < floor の puller だけが
+    /// 差分で埋められない穴を持つ = bootstrap 対象。 reclaim が起きていなければ
     /// 何も広告しない (= 全履歴が配れる)。
     fn advertise_history_floor(&self) {
+        // #191: 以前の「生存 record の最小 HLC (空なら Hlc::MAX)」は、 消化完了直後の
+        // 正常な cursor (max_reclaimed <= cursor < min_alive) まで gap と誤認し、
+        // reclaim 1 回で既追従 follower 全員が bootstrap 行きになっていた。
+        if let Some(floor) = self.engine.sync_reclaimed_floor() {
+            self.transport.set_history_floor(self.engine.peer_id(), floor);
+            return;
+        }
+        // fallback: fix 前に reclaim してから reopen した既存 DB (floor 未記録)。
+        // 正確な下限は失われているので過大側 (min alive / MAX) に倒す —
+        // silent gap より余分な bootstrap 誘導の方が安全。
         if !self.engine.sync_history_reclaimed() {
             return;
         }
@@ -512,8 +523,6 @@ impl Syncer {
             .into_iter()
             .map(|r| r.hlc)
             .min();
-        // 生存 record が 1 件も無い = 全部 reclaim 済み。 どんな cursor でも追いつけないので
-        // 到達不能に高い下限 (Hlc::MAX) を広告する。
         let floor = floor.unwrap_or(Hlc { wall: u64::MAX, logical: u32::MAX, peer: u32::MAX });
         self.transport.set_history_floor(self.engine.peer_id(), floor);
     }
