@@ -438,6 +438,20 @@ impl Syncer {
             self.save_cursors();
         }
 
+        // #149: 確定 cursor を pull-as-ack として transport に記録する。 cursor は
+        // 上の durable barrier を通過した後にしか前進しないので、 そのまま
+        // 「ここまで消化済み」の到達証明として使える。 truncation / persist 失敗の
+        // early return はここに来ない (= 未消化の cursor を ack しない)。
+        // 空 pull でも既存 cursor を再記録する — author 側が ack 状態を失っても、
+        // pull が回っている限り watermark が自然回復する。
+        let cursor = {
+            let guard = self.last_pulled.lock().unwrap();
+            guard.get(&from).copied().unwrap_or(Hlc::ZERO)
+        };
+        if cursor > Hlc::ZERO {
+            self.transport.record_pull_ack(from, self_peer, cursor);
+        }
+
         outcome
     }
 
@@ -467,9 +481,51 @@ impl Syncer {
         *self.subscription_filter.write().unwrap() = filter;
     }
 
-    /// 自 peer の commit 済み ops を transport に publish。
-    /// `iter_committed` は checkpoint を無視して WAL 全体を列挙するので、
-    /// 既に本体に apply 済みでも WAL ring buffer 内にあれば拾える。
+    /// #149: transport に溜まった pull ack を消化し、 ring に圧力があれば reclaim を回す。
+    ///
+    /// puller が `pull_once` で記録した cursor (HLC) を `ack_sync_up_to_hlc` で
+    /// `_sync_peers.consumed_lsn` に写す (= watermark は常に最新)。 ただし
+    /// **reclaim は `_sync_ops` の使用率が 50% を超えている時だけ**呼ぶ。
+    ///
+    /// 履歴は容量が許す限り保持するのが正しい: reclaim すると floor が上がり、
+    /// **その author をまだ一度も pull していない follower** (作成直後 / 長期 offline)
+    /// は cursor < floor で truncation 行きになる。 bootstrap (#140) が受け皿だが、
+    /// 差分で追いつけるならその方が安いので、 reclaim は「容量管理」であって
+    /// 「消化済みの掃除」ではない。 eager に回すと、 round 1 個ずれて参加した
+    /// follower が即 bootstrap 送りになる (sunsu2 Phase 2 chaos で実測)。
+    ///
+    /// `publish_since` の冒頭から自動で呼ばれるので、 app は publish/pull を
+    /// 回すだけで良い。 publish しない caller (pull 専用 hub 等) が明示的に
+    /// 回せるよう pub。 戻り値は consumed_lsn が前進した peer 数。
+    pub fn absorb_pull_acks(&self) -> usize {
+        let self_peer = self.engine.peer_id();
+        let acks = self.transport.take_pull_acks(self_peer);
+        if acks.is_empty() {
+            return 0;
+        }
+        let mut advanced = 0usize;
+        for (by, cursor) in acks {
+            // self row は sync_watermark から除外されるが、 そもそも作らない
+            if by == self_peer {
+                continue;
+            }
+            if let Ok(lsn) = self.engine.ack_sync_up_to_hlc(by, cursor)
+                && lsn > 0
+            {
+                advanced += 1;
+            }
+        }
+        if advanced > 0
+            && let Some(usage) = self.engine.table_eid_usage("_sync_ops")
+            && usage.live * 2 >= usage.capacity
+        {
+            self.engine.reclaim_sync_ops();
+        }
+        advanced
+    }
+
+    /// 自 peer の commit 済み ops を transport に publish
+    /// (source は `_sync_ops` ring — [`Syncer::collect_records_since`] 参照)。
     /// 戻り値は publish したレコード数 (重複カウントしない、 最終 broadcast/peer 別
     /// のいずれか単一経路で配信した数)。
     ///
@@ -478,6 +534,9 @@ impl Syncer {
     /// 空なら **broadcast 経路** (= 旧 `publish_since` の挙動) にフォールバック。
     /// = 既存 caller (broadcast 前提) は API 不変で動く。
     pub fn publish_since(&self, since: Hlc) -> usize {
+        // #149: publish の beat で pull ack を消化して reclaim を回す。 absorb →
+        // advertise の順序が要: reclaim で上がった floor を同じ beat で広告する。
+        self.absorb_pull_acks();
         self.advertise_history_floor();
         let peers = self.transport.known_peers();
         if peers.is_empty() {

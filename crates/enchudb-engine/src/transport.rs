@@ -402,6 +402,23 @@ pub trait Transport: Send + Sync {
     fn history_floor(&self, _peer: PeerId) -> Option<Hlc> {
         None
     }
+
+    /// #149: puller が「`author` の履歴を HLC `cursor` まで消化した」ことを記録する。
+    ///
+    /// pull の since cursor は durable barrier (`Syncer::pull_once` の
+    /// persist_applied_state) を通過した後にしか前進しないので、 それ自体が
+    /// **消化の到達証明**になっている。 author は `take_pull_acks` で回収して
+    /// `Engine::ack_sync_up_to_hlc` に写し、 `_sync_ops` の reclaim を回す。
+    ///
+    /// default は no-op — ack を運べない transport では従来どおり (= reclaim は
+    /// caller の明示 `ack_sync` 頼み、 ring はいずれ満杯で backpressure)。
+    fn record_pull_ack(&self, _author: PeerId, _by: PeerId, _cursor: Hlc) {}
+
+    /// #149: `author` 宛に溜まった pull ack を drain して返す。
+    /// puller ごとに 1 エントリ (最大 cursor のみ保持)。 default は空。
+    fn take_pull_acks(&self, _author: PeerId) -> Vec<(PeerId, Hlc)> {
+        Vec::new()
+    }
 }
 
 /// テスト用: プロセス内で peer 間の WAL を共有する。
@@ -420,6 +437,8 @@ pub struct InMemoryTransport {
     targeted: Arc<Mutex<HashMap<(PeerId, PeerId), Vec<WireRecord>>>>,
     /// #140: peer → 広告された履歴の下限 (これ以下は publisher 側で reclaim 済み)。
     floors: Arc<Mutex<HashMap<PeerId, Hlc>>>,
+    /// #149: author → (puller → 消化済み max HLC)。 `take_pull_acks` で drain。
+    pull_acks: Arc<Mutex<HashMap<PeerId, HashMap<PeerId, Hlc>>>>,
 }
 
 impl InMemoryTransport {
@@ -428,6 +447,7 @@ impl InMemoryTransport {
             inner: Arc::new(Mutex::new(HashMap::new())),
             targeted: Arc::new(Mutex::new(HashMap::new())),
             floors: Arc::new(Mutex::new(HashMap::new())),
+            pull_acks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -533,6 +553,20 @@ impl Transport for InMemoryTransport {
 
     fn history_floor(&self, peer: PeerId) -> Option<Hlc> {
         self.floors.lock().unwrap().get(&peer).copied()
+    }
+
+    // #149: ack は puller ごとに max cursor だけ保持 (再送・巻き戻りは無視)。
+    fn record_pull_ack(&self, author: PeerId, by: PeerId, cursor: Hlc) {
+        let mut g = self.pull_acks.lock().unwrap();
+        let slot = g.entry(author).or_default().entry(by).or_insert(Hlc::ZERO);
+        if cursor > *slot {
+            *slot = cursor;
+        }
+    }
+
+    fn take_pull_acks(&self, author: PeerId) -> Vec<(PeerId, Hlc)> {
+        let mut g = self.pull_acks.lock().unwrap();
+        g.remove(&author).map(|m| m.into_iter().collect()).unwrap_or_default()
     }
 }
 
