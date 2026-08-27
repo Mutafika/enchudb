@@ -79,6 +79,13 @@ pub struct Syncer {
     subscription_filter: std::sync::RwLock<Arc<dyn SubscriptionFilter>>,
     /// #9 foot-gun ガード: self_peer == 0 で foreign record を apply した事の一度だけ警告。
     warned_unconfigured_peer: std::sync::atomic::AtomicBool,
+    /// #216 observability: `pull_once` が `history_truncated` を返した回数。
+    /// 「単調増加しているのに bootstrap 成功が無い」= 回復経路が塞がっている
+    /// (state provider 不在等) の運用 signal。
+    truncated_pulls: std::sync::atomic::AtomicU64,
+    /// #216: 「truncated なのに transport が state を運べない (fetch_state = None)」
+    /// の一度だけ警告 — この構成では truncation が回復経路の無い行き止まりになる。
+    warned_no_state_provider: std::sync::atomic::AtomicBool,
     // 0.9.0: 旧 Content reorder buffer (`pending_ops`) は削除 — content は
     // TieNamed で運ばれ、 自力で entity 写像を作れるため退避が不要になった。
 }
@@ -264,6 +271,8 @@ impl Syncer {
             require_signature: std::sync::atomic::AtomicBool::new(false),
             subscription_filter: std::sync::RwLock::new(Arc::new(AllRecords)),
             warned_unconfigured_peer: std::sync::atomic::AtomicBool::new(false),
+            truncated_pulls: std::sync::atomic::AtomicU64::new(0),
+            warned_no_state_provider: std::sync::atomic::AtomicBool::new(false),
         };
         // request17 step 6: **v9 DB では hydrate しない**。
         //
@@ -448,6 +457,11 @@ impl Syncer {
     /// 登録後、 truncated puller は `bootstrap_pull` で現在状態を取得できる。
     /// provider は呼ばれるたびに `Engine::state_records` で合成する (常に最新)。
     /// state を運べない transport (default 実装) では no-op。
+    ///
+    /// #216: relay / reclaim が回る topology では **実質必須** — reclaim は floor を
+    /// 上げ、 floor を跨いだ puller の唯一の回復経路が bootstrap になるため。
+    /// provider 不在だと `history_truncated` は回復経路の無い行き止まりになる
+    /// (`bootstrap_pull` が once-warn を出し、 `Syncer::truncated_pulls` で観測可)。
     pub fn serve_state(&self) {
         // Weak 必須: transport は peer より長生きする。 強参照で capture すると、
         // restart で drop したはずの engine (background consumer 込み) が provider の
@@ -478,7 +492,23 @@ impl Syncer {
     ///    既に消した行」なので LWW 的に正しい方向にしか働かない
     /// 4. cursor を `as_of` へ前進 (後退はさせない) — 以降は通常の差分 pull
     pub fn bootstrap_pull(&self, from: PeerId) -> Option<BootstrapOutcome> {
-        let batch = self.transport.fetch_state(from)?;
+        let Some(batch) = self.transport.fetch_state(from) else {
+            // #216: この構成では truncation が回復経路の無い行き止まり — silent に
+            // しない。 relay topology (reclaim が回る構成) では author 側の
+            // `serve_state` 登録が実質必須。
+            if !self
+                .warned_no_state_provider
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                eprintln!(
+                    "[enchudb] sync: bootstrap_pull({from}) failed — the transport carries \
+                     no state for this peer (no serve_state provider?). History-truncated \
+                     pulls from it cannot recover; in relay/reclaim topologies serve_state \
+                     is effectively mandatory. (warned once)"
+                );
+            }
+            return None;
+        };
         let gossip = self.engine.gossip_remote_apply();
         let mut relay_accepted: Vec<usize> = Vec::new();
         let outcome =
@@ -524,10 +554,9 @@ impl Syncer {
 
         // cursor := max(現行, as_of)。 進んだら永続 + pull-as-ack (#149) も記録。
         // #216: StateBatch は author (= from) 単一なので author=from の entry のみ
-        // 前進させる。 ack は link の author 別 cursor の min (保守側 — 「hlc ≤ ack
-        // は全 author 分消化済み」の証明として健全)。
+        // 前進させ、 ack は author 別 cursor の vector を送る (pull_once と同じ)。
         let self_peer = self.engine.peer_id();
-        let (advanced, ack) = {
+        let (advanced, cursors) = {
             let mut guard = self.last_pulled.lock().unwrap();
             let link = guard.entry(from).or_default();
             let cur = link.entry(from).or_insert(Hlc::ZERO);
@@ -537,12 +566,13 @@ impl Syncer {
             } else {
                 false
             };
-            let ack = link.values().min().copied().unwrap_or(Hlc::ZERO);
-            (advanced, ack)
+            let cursors: Vec<(PeerId, Hlc)> =
+                link.iter().map(|(a, h)| (*a, *h)).collect();
+            (advanced, cursors)
         };
         if advanced {
             self.save_cursors();
-            self.transport.record_pull_ack(from, self_peer, ack);
+            self.transport.record_pull_ack_multi(from, self_peer, &cursors);
         }
 
         Some(BootstrapOutcome { outcome, swept, as_of: batch.as_of })
@@ -565,6 +595,7 @@ impl Syncer {
                 .unwrap_or_default()
         };
         let self_peer = self.engine.peer_id();
+        let floors_multi = self.transport.history_floor_multi(from);
         let floor = self.transport.history_floor(from);
 
         // #140: publisher が広告した履歴の下限より自分の cursor が古いなら、 差分では
@@ -573,13 +604,32 @@ impl Syncer {
         // 適用せず** truncation を通知して caller に bootstrap を促す。
         //
         // cursor が floor 以上なら、 落ちた分は既に自分が consume 済みなので安全。
-        // #216: 判定は author 別 cursor の min (保守側 — floor は publisher ring
-        // 全体の scalar で、 どの author の履歴が落ちたかまでは語らない)。
-        let link_min = since.iter().map(|(_, h)| *h).min().unwrap_or(Hlc::ZERO);
-        if let Some(floor) = floor {
-            if link_min < floor {
-                return SyncOutcome { history_truncated: true, ..SyncOutcome::default() };
-            }
+        //
+        // #216: author 別 floor が広告されていればそちらで判定する —
+        // `cursor[a] < floor[a]` の author がいる時だけ truncation。 scalar floor に
+        // 対する min 判定は、 relay 混在 ring の定常運転 (relay 自身の row の cursor は
+        // 古いまま、 中継分の reclaim で floor が上がる) で恒常 false positive になる。
+        // 未知 author (cursor 無し = ZERO) の floor entry も truncation — その author の
+        // 履歴の一部は受け取る前に消えている。
+        let truncated_by_floor = if let Some(floors) = &floors_multi {
+            floors.iter().any(|(a, f)| {
+                let cur = since
+                    .iter()
+                    .find(|(p, _)| p == a)
+                    .map(|(_, h)| *h)
+                    .unwrap_or(Hlc::ZERO);
+                cur < *f
+            })
+        } else if let Some(floor) = floor {
+            let link_min = since.iter().map(|(_, h)| *h).min().unwrap_or(Hlc::ZERO);
+            link_min < floor
+        } else {
+            false
+        };
+        if truncated_by_floor {
+            self.truncated_pulls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return SyncOutcome { history_truncated: true, ..SyncOutcome::default() };
         }
 
         let fetched = self.transport.pull_as_multi(self_peer, from, &since);
@@ -597,12 +647,16 @@ impl Syncer {
             .filter(|r| r.hlc > cursor_of(r.author_peer))
             .collect();
 
-        // #216: publisher が reclaim 済み (floor あり) の link に **cursor 未登録の
-        // 新 author** が現れた場合、 その author の古い record は既に ring から
-        // 落ちている可能性がある (scalar floor では author 別に判別できない)。
-        // 適用と cursor 前進は行った上で truncation を通知し、 app に当該 author の
-        // bootstrap を促す — 次回以降は author が map に載るので clean diff に戻る。
-        let new_author_on_reclaimed_link = floor.is_some()
+        // #216: **scalar floor しか無い** link (author 別広告を運べない transport) に
+        // cursor 未登録の新 author が現れた場合、 その author の古い record は既に
+        // ring から落ちている可能性がある (scalar floor では author 別に判別
+        // できない)。 適用と cursor 前進は行った上で truncation を通知し、 app に
+        // 当該 author の bootstrap を促す — 次回以降は author が map に載るので
+        // clean diff に戻る。 author 別 floor がある場合は上の pre-fetch 判定が
+        // 「floor entry のある新 author」を正確に拾う (entry の無い新 author は
+        // reclaim されていない = clean、 flag 不要)。
+        let new_author_on_reclaimed_link = floors_multi.is_none()
+            && floor.is_some()
             && records
                 .iter()
                 .any(|r| !since.iter().any(|(p, _)| *p == r.author_peer));
@@ -610,7 +664,11 @@ impl Syncer {
         let mut relay_accepted: Vec<usize> = Vec::new();
         let mut outcome =
             self.apply_records_impl(&records, gossip.then_some(&mut relay_accepted));
-        outcome.history_truncated |= new_author_on_reclaimed_link;
+        if new_author_on_reclaimed_link {
+            outcome.history_truncated = true;
+            self.truncated_pulls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // #209: relay (gossip) — accept した record を**原型のまま** (原 eid / 原
         // value / 原 HLC / 原署名) 自分の WAL へ。 翻訳後の姿を relay すると
@@ -685,24 +743,31 @@ impl Syncer {
         // 空 pull でも既存 cursor を再記録する — author 側が ack 状態を失っても、
         // pull が回っている限り watermark が自然回復する。
         //
-        // #216: ack は author 別 cursor の **min** — 「hlc ≤ ack は全 author 分
-        // 消化済み」の保守的な証明。 既知の狭い race: link に新 author が現れる
-        // 直前の ack はその author の未消化分を覆えない (transport は max 保持)。
-        // publisher がその ack で当該 record を reclaim すると、 上の
-        // new-author-on-reclaimed-link 検知が truncation として拾い、 bootstrap で
-        // 回収する — silent にはならない。
-        let cursor = {
+        // #216: ack は author 別 cursor の **vector** をそのまま送る。 publisher 側は
+        // `ack_sync_up_to_cursors` の per-row 述語で消化を判定する — relay 混在
+        // ring では relayed row の消化は vector でしか証明できない (scalar min は
+        // 未知 author の row を消化済みと誤判定する over-ack)。 vector を運べない
+        // transport は default 実装が author=link の entry だけを scalar 経路に
+        // 落とす (保守側、 relay 経路の reclaim は回らない)。
+        let cursors: Vec<(PeerId, Hlc)> = {
             let guard = self.last_pulled.lock().unwrap();
             guard
                 .get(&from)
-                .and_then(|m| m.values().min().copied())
-                .unwrap_or(Hlc::ZERO)
+                .map(|m| m.iter().map(|(a, h)| (*a, *h)).collect())
+                .unwrap_or_default()
         };
-        if cursor > Hlc::ZERO {
-            self.transport.record_pull_ack(from, self_peer, cursor);
+        if !cursors.is_empty() {
+            self.transport.record_pull_ack_multi(from, self_peer, &cursors);
         }
 
         outcome
+    }
+
+    /// #216 observability: `pull_once` が `history_truncated` を返した累計回数。
+    /// 単調増加しているのに bootstrap 成功が無いなら、 回復経路が塞がっている
+    /// (state provider 不在、 または app が bootstrap を呼んでいない)。
+    pub fn truncated_pulls(&self) -> u64 {
+        self.truncated_pulls.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 適用した state を durable にする。 失敗したら `false` (= cursor を進めない)。
@@ -749,11 +814,25 @@ impl Syncer {
     /// 回せるよう pub。 戻り値は consumed_lsn が前進した peer 数。
     pub fn absorb_pull_acks(&self) -> usize {
         let self_peer = self.engine.peer_id();
+        let multi = self.transport.take_pull_acks_multi(self_peer);
         let acks = self.transport.take_pull_acks(self_peer);
-        if acks.is_empty() {
+        if multi.is_empty() && acks.is_empty() {
             return 0;
         }
         let mut advanced = 0usize;
+        // #216: vector ack (author 別 cursor) — relay 混在 ring の完全形。
+        for (by, cursors) in multi {
+            if by == self_peer {
+                continue;
+            }
+            if let Ok(lsn) = self.engine.ack_sync_up_to_cursors(by, &cursors)
+                && lsn > 0
+            {
+                advanced += 1;
+            }
+        }
+        // scalar ack (vector を運べない transport の退化形) — self-author 行のみの
+        // 消化証明として #217 の prefix walk に乗る。
         for (by, cursor) in acks {
             // self row は sync_watermark から除外されるが、 そもそも作らない
             if by == self_peer {
@@ -817,6 +896,20 @@ impl Syncer {
         // #191: 以前の「生存 record の最小 HLC (空なら Hlc::MAX)」は、 消化完了直後の
         // 正常な cursor (max_reclaimed <= cursor < min_alive) まで gap と誤認し、
         // reclaim 1 回で既追従 follower 全員が bootstrap 行きになっていた。
+        //
+        // #216: author 別 floor があればそれも広告する (scalar は互換のため常に併記)。
+        // relay 混在 ring では scalar floor だけだと「author a の cursor は新しいのに
+        // author b の reclaim で恒常 truncation」の false positive が定常運転で出る。
+        if let Some(floors) = self.engine.sync_reclaimed_floors()
+            && !floors.is_empty()
+        {
+            self.transport
+                .set_history_floor_multi(self.engine.peer_id(), &floors);
+            if let Some(max) = floors.iter().map(|(_, h)| *h).max() {
+                self.transport.set_history_floor(self.engine.peer_id(), max);
+            }
+            return;
+        }
         if let Some(floor) = self.engine.sync_reclaimed_floor() {
             self.transport.set_history_floor(self.engine.peer_id(), floor);
             return;

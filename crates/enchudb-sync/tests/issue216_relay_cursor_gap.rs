@@ -189,6 +189,70 @@ fn new_author_starts_from_zero() {
     cleanup(&pc);
 }
 
+/// #216 E2E: vector ack (→ #217 per-row 述語) だけで relay の混在 ring が reclaim
+/// され、 **reclaim 後も既追従の下流は truncation を踏まない** (author 別 floor)。
+///
+/// scalar floor だと定常運転で必ず false positive になる構成: relay 自身の row の
+/// cursor は古いまま (relay は滅多に自分では書かない)、 中継分の reclaim で floor が
+/// 上がる → `min(cursor) < floor` が恒常成立 → bootstrap ループ。
+#[test]
+fn steady_relay_reclaim_does_not_false_truncate() {
+    let pa = tmp_path("a5");
+    let pr = tmp_path("r5");
+    let pc = tmp_path("c5");
+    let pd = tmp_path("d5");
+    let transport = make_transport(&[1, 2, 3, 4]);
+
+    let eng_a = make_engine(&pa, 1);
+    let eng_r = make_engine(&pr, 2);
+    let eng_c = make_engine(&pc, 3);
+    let sync_a = Syncer::new(eng_a.clone(), transport.clone());
+    let sync_r = Syncer::new(eng_r.clone(), transport.clone());
+    let sync_c = Syncer::new(eng_c.clone(), transport.clone());
+    eng_r.set_gossip_remote_apply(true);
+
+    // R own row (古い HLC 側に固定される) → A の notes → 中継 → C が全量 pull。
+    author_note(&eng_r, 900);
+    for i in 1..=3 {
+        author_note(&eng_a, i);
+    }
+    sync_a.publish_since(Hlc::ZERO);
+    relay_cycle(&eng_r, &sync_r, 1);
+    let out = sync_c.pull_once(2);
+    assert!(out.applied > 0, "{out:?}");
+
+    // C の vector ack で R の ring を reclaim (pressure gate を待たず直接呼ぶ)。
+    sync_r.absorb_pull_acks();
+    let purged = eng_r.reclaim_sync_ops();
+    assert!(purged > 0, "vector ack で relay ring の reclaim が回ること");
+
+    // floor 広告込みで次の差分を回す — C は truncation を踏まずに受かること。
+    author_note(&eng_a, 4);
+    sync_a.publish_since(Hlc::ZERO);
+    relay_cycle(&eng_r, &sync_r, 1);
+    let out2 = sync_c.pull_once(2);
+    assert!(
+        !out2.history_truncated,
+        "定常 relay + reclaim で false truncation (scalar floor の症状): {out2:?}"
+    );
+    assert!(has_note(&eng_c, 4), "reclaim 後の差分が届いていない");
+
+    // 一方、 何も pull していない新参 D は floor を踏んで truncated (正しい方向)。
+    let eng_d = make_engine(&pd, 4);
+    let sync_d = Syncer::new(eng_d.clone(), transport.clone());
+    let outd = sync_d.pull_once(2);
+    assert!(
+        outd.history_truncated,
+        "reclaim 済み link への新参が truncation 通知を受けない: {outd:?}"
+    );
+    assert_eq!(sync_d.truncated_pulls(), 1, "truncated counter (#216 observability)");
+
+    cleanup(&pa);
+    cleanup(&pr);
+    cleanup(&pc);
+    cleanup(&pd);
+}
+
 #[test]
 fn legacy_scalar_cursor_self_heals() {
     let pa = tmp_path("a3");
