@@ -1972,6 +1972,13 @@ pub struct Engine {
     /// false に戻して 1 度だけ explicit に `persist_tables()` を呼ぶ。
     /// macOS APFS で N table 宣言時の N×fsync (= 1 fsync 5-7ms) を 1 回に圧縮。
     defer_tables_persist: std::sync::atomic::AtomicBool,
+    /// #190: sidecar persist (`.tables` / `.eidmap` / `.vocabmap`) の直列化 lock。
+    /// tmp 名が sidecar ごとに固定なので、 同一 sidecar を 2 thread (consumer の
+    /// `try_persist_tables` と pull 側の `persist_sync_state`) が同時に書くと
+    /// truncate し合って torn install / rename ENOENT / 新旧逆転 install が起きる。
+    /// state の snapshot (serialize) から rename までを丸ごとこの lock 下に置く —
+    /// serialize も lock 内なので「後から取った方が必ず新しい状態を書く」が成立する。
+    sidecar_persist_lock: std::sync::Mutex<()>,
     /// v34: writer lock の保持 fd。 open_writer / create_* で `.db.lock` sidecar を
     /// flock(LOCK_EX)、 Engine drop で fd close = lock release。 readonly では None。
     /// 多 process write の同 .db 競合を防ぐ (sqlite WAL モード相当)。
@@ -2259,6 +2266,7 @@ impl Engine {
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
+            sidecar_persist_lock: std::sync::Mutex::new(()),
             _writer_lock: Some(writer_lock),
             backing: Backing::Mmap(mmap),
         })
@@ -2604,6 +2612,7 @@ impl Engine {
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
+            sidecar_persist_lock: std::sync::Mutex::new(()),
             _writer_lock: Some(writer_lock),
             backing: Backing::Growable(map),
         })
@@ -3527,6 +3536,7 @@ impl Engine {
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
+            sidecar_persist_lock: std::sync::Mutex::new(()),
             #[cfg(not(target_arch = "wasm32"))]
             _writer_lock: None, // caller (open_internal) が後から差し替える
             backing,
@@ -4577,6 +4587,11 @@ impl Engine {
         if self.path.is_empty() {
             return Ok(());
         }
+        // #190: serialize から rename までを直列化 (同一 tmp の truncate 合戦と
+        // 新旧逆転 install の防止)。poisoned でも persist は続行して良い
+        // (守っているのは file I/O の順序だけで、guard 下の共有 state は無い)。
+        let _guard =
+            self.sidecar_persist_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         persist_tables_to_sidecar(&self.path, &self.tables)?;
         // #9: 翻訳テーブルも同じ trigger で persist (next_local と整合させる)。
         persist_eidmap_to_sidecar(&self.path, &self.eidmap_entries_with_tombstones())?;
@@ -4664,6 +4679,11 @@ impl Engine {
                 return;
             }
             if !self.path.is_empty() {
+                // #190: persist_tables と同じ直列化 (consumer thread はこちらを通る)。
+                let _guard = self
+                    .sidecar_persist_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if let Err(e) = persist_tables_to_sidecar(&self.path, &self.tables) {
                     // best effort: panic せずログだけ。 user table の定義は
                     // メモリには反映されてる、 次回 reopen で失われるだけ。
