@@ -24,7 +24,8 @@
 pub mod bigram;
 pub mod gram;
 mod posting;
-pub(crate) mod storage;
+pub mod storage;
 mod index;
 
 pub use index::NgramIndex;
+pub use storage::MergeStats;

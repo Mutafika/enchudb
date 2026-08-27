@@ -133,6 +133,24 @@ impl NgramIndex {
     /// DB 本体の原文で `.contains()` 検証する前提。 この file を `open` した index は
     /// `get_text` が常に None、 `open_mut` は不可 (rebuild は source から)。
     #[cfg(not(target_arch = "wasm32"))]
+    /// 複数の `.etxt` を 1 本に統合する (#188)。
+    ///
+    /// 索引を「小さい segment を並べて後から統合する」形で運用するための口。
+    /// build を segment に刻めば、**ピークがコーパス量から独立する**
+    /// (統合に要るのは 1 gram ぶんの posting run + Gram/Doc Index 相当のみ)。
+    ///
+    /// 意味論は [`crate::storage::merge_files`] を参照 — **後の input が勝つ**
+    /// (LSM の上書き)。全 input の n が一致していること・原文保持 / postings-only の
+    /// 混在は不可。
+    ///
+    /// segment を作るには通常どおり `index()` して `save()` すればよい
+    /// (segment は「小さいだけの普通の `.etxt`」で、専用の形式は無い)。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn merge_files(inputs: &[&str], out: &str) -> io::Result<crate::storage::MergeStats> {
+        let paths: Vec<&Path> = inputs.iter().map(|p| Path::new(*p)).collect();
+        crate::storage::merge_files(&paths, Path::new(out))
+    }
+
     pub fn save_postings_only(&mut self, path: &str) -> io::Result<()> {
         self.compact();
         let n = self.n;

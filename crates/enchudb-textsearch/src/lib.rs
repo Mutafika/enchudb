@@ -90,6 +90,20 @@ impl TextSearch {
         self.idx.save_postings_only(path)
     }
 
+    /// 複数の `.etxt` を 1 本に統合する (#188)。
+    ///
+    /// 索引の作り直しを「小さい segment を並べて後から統合する」形に置き換えるための口。
+    /// segment は `index()` → `save()` で作った普通の `.etxt` で、専用形式は無い。
+    /// **後の input が勝つ** (同じ eid が複数 segment に居たら最後のものが採用され、
+    /// それ以前の posting は落ちる)。
+    ///
+    /// これを使うと build のピークがコーパス量から独立する — 統合中にメモリへ載るのは
+    /// 1 gram ぶんの posting run と Gram/Doc Index 相当だけ。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn merge_files(inputs: &[&str], out: &str) -> io::Result<enchudb_ngram::MergeStats> {
+        NgramIndex::merge_files(inputs, out)
+    }
+
     /// `save_postings_only` の Writer 版。
     pub fn write_to_postings_only<W: std::io::Write>(&mut self, w: &mut W) -> io::Result<()> {
         self.idx.write_to_postings_only(w)

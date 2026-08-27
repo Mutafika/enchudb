@@ -570,6 +570,286 @@ fn write_index<W: Write>(
     Ok(())
 }
 
+
+// ══════════════════════════════════════════════════════════════════════
+// segment merge (#188)
+// ══════════════════════════════════════════════════════════════════════
+//
+// 索引を「小さい完結ファイル (segment) を並べて、後から統合する」形で運用できるようにする。
+// これが無いと索引の作り直しは常に全 doc をメモリに載せる形しか取れず、build のピークが
+// コーパス量に比例する (naruhodo の実測で 494,133 doc = +2.7GB)。
+//
+// **形式は変えない。** `.etxt` は Gram Index が key 昇順・Doc Index が eid 昇順・
+// 各 gram の posting run が eid 昇順 (compact 済み) なので、統合は整列済みリストの
+// k-way merge で書ける。
+//
+// 必要メモリ = Gram Index 相当 (distinct gram 数 × 16B) + Doc Index 相当
+// (doc 数 × 14B) + 出力バッファ。**本文量には比例しない**のが要点。
+
+/// `merge_files` の結果統計。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeStats {
+    pub grams: u32,
+    pub postings: u32,
+    pub docs: u32,
+    pub text_bytes: u32,
+    /// 複数 input に居た eid の数 (= 後勝ちで上書きされた doc 数)。
+    pub superseded_docs: u32,
+}
+
+/// Gram Index を先頭から舐めるカーソル。
+struct GramCursor<'a> {
+    idx: &'a [u8],
+    width: usize,
+    i: usize,
+    len: usize,
+}
+
+impl<'a> GramCursor<'a> {
+    fn new(m: &'a MappedIndex) -> Self {
+        Self { idx: m.gram_index(), width: m.gram_entry, i: 0, len: m.gram_count as usize }
+    }
+    fn peek(&self) -> Option<u64> {
+        if self.i >= self.len { return None; }
+        let e = &self.idx[self.i * self.width..(self.i + 1) * self.width];
+        Some(decode_gram_entry(e, self.width).0)
+    }
+    fn bump(&mut self) { self.i += 1; }
+}
+
+/// Doc Index を先頭から舐めるカーソル。
+struct DocCursor<'a> {
+    idx: &'a [u8],
+    i: usize,
+    len: usize,
+}
+
+impl<'a> DocCursor<'a> {
+    fn new(m: &'a MappedIndex) -> Self {
+        Self { idx: m.doc_index(), i: 0, len: m.doc_count as usize }
+    }
+    /// (eid, text offset, text len)
+    fn peek(&self) -> Option<(u64, u32, u32)> {
+        if self.i >= self.len { return None; }
+        let e = &self.idx[self.i * DOC_ENTRY..(self.i + 1) * DOC_ENTRY];
+        Some((
+            u64::from_le_bytes(e[0..8].try_into().unwrap()),
+            u32::from_le_bytes(e[8..12].try_into().unwrap()),
+            u32::from_le_bytes(e[12..16].try_into().unwrap()),
+        ))
+    }
+    fn bump(&mut self) { self.i += 1; }
+}
+
+/// 複数の `.etxt` を 1 本に統合する。
+///
+/// - **後の input が勝つ** (LSM の上書き意味論)。同じ eid が複数の input に居る場合、
+///   採用されるのは最後の input の原文で、**それ以前の input が持っていたその eid の
+///   posting は落とす** — 統合結果が「全部を一度に索引した場合」と一致するようにするため。
+/// - 全 input の `n` が一致していること。原文保持 / postings-only の混在は拒否する
+///   (flag を勝手に継承すると、原文を持たない index が原文保持を名乗る)。
+/// - postings-only 同士の統合では doc index が無いので上書き判定ができない。
+///   同じ eid が複数 input に居ても **union** になる (caller が DB 本体の原文で
+///   検証する前提 #84 なので、候補が増えるだけで誤答にはならない)。
+#[cfg(not(target_arch = "wasm32"))]
+pub fn merge_files(inputs: &[&Path], out: &Path) -> io::Result<MergeStats> {
+    if inputs.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "merge_files: input が空"));
+    }
+    let maps: Vec<MappedIndex> = inputs.iter().map(|p| MappedIndex::open(p)).collect::<io::Result<_>>()?;
+    let n = maps[0].n;
+    let has_text = maps[0].has_text();
+    for (i, m) in maps.iter().enumerate().skip(1) {
+        if m.n != n {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("merge_files: n が食い違う (input 0 = {n}, input {i} = {})", m.n),
+            ));
+        }
+        if m.has_text() != has_text {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "merge_files: 原文保持 / postings-only の混在 (input 0 = {}, input {i} = {})",
+                    if has_text { "原文保持" } else { "postings-only" },
+                    if m.has_text() { "原文保持" } else { "postings-only" },
+                ),
+            ));
+        }
+    }
+
+    // ── ① doc の所有権を決める (eid 昇順 k-way merge・後勝ち) ──
+    // 保持するのは (eid, src, offset, len) だけ。原文そのものは mmap に置いたまま。
+    let mut docs: Vec<(u64, u16, u32, u32)> = Vec::new();
+    let mut dup_eids: Vec<u64> = Vec::new(); // 上書きが起きた eid (昇順)
+    if has_text {
+        let mut cur: Vec<DocCursor> = maps.iter().map(DocCursor::new).collect();
+        loop {
+            let Some(min) = cur.iter().filter_map(|c| c.peek().map(|(e, _, _)| e)).min() else { break };
+            let mut winner: Option<(u16, u32, u32)> = None;
+            let mut seen = 0usize;
+            for (si, c) in cur.iter_mut().enumerate() {
+                if c.peek().map(|(e, _, _)| e) != Some(min) { continue; }
+                let (_, off, len) = c.peek().unwrap();
+                winner = Some((si as u16, off, len)); // 後の input で上書き = 後勝ち
+                seen += 1;
+                c.bump();
+            }
+            let (src, off, len) = winner.unwrap();
+            if seen > 1 { dup_eids.push(min); }
+            docs.push((min, src, off, len));
+        }
+    }
+    // 上書きが 1 件も無ければ (= segment が doc を分割している通常ケース) posting の
+    // 所有権チェックは丸ごと不要。この判定 1 つで hot path の binary search が消える。
+    let owner_of = |eid: u64| -> Option<u16> {
+        docs.binary_search_by_key(&eid, |(e, _, _, _)| *e).ok().map(|i| docs[i].1)
+    };
+
+    // ── ② gram の計画を作る (key 昇順 k-way merge) ──
+    // key ごとの統合後 posting 数だけを持つ。posting 本体は ③ で引き直す
+    // (全部持つと本文量に比例してしまうため)。
+    let mut plan: Vec<(u64, u32)> = Vec::new();
+    let mut posting_total: u64 = 0;
+    {
+        let mut cur: Vec<GramCursor> = maps.iter().map(GramCursor::new).collect();
+        let mut buf: Vec<u64> = Vec::new();
+        loop {
+            let Some(min) = cur.iter().filter_map(|c| c.peek()).min() else { break };
+            for c in cur.iter_mut() {
+                if c.peek() == Some(min) { c.bump(); }
+            }
+            merged_posting(&maps, min, &dup_eids, &owner_of, &mut buf);
+            posting_total += buf.len() as u64;
+            if posting_total > u32::MAX as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "merge_files: posting 総数が u32 を超える (format 上限)",
+                ));
+            }
+            plan.push((min, buf.len() as u32));
+        }
+    }
+    // 所有権で全部落ちた key は index から消す (空 posting の gram entry を残さない)。
+    plan.retain(|(_, len)| *len > 0);
+    let gram_count = plan.len() as u32;
+    let posting_total = posting_total as u32;
+
+    let doc_count = docs.len() as u32;
+    let text_total: u64 = docs.iter().map(|(_, _, _, l)| *l as u64).sum();
+    if text_total > u32::MAX as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "merge_files: text 総量が u32 を超える (format 上限)",
+        ));
+    }
+    let text_total = text_total as u32;
+
+    // ── ③ 書き出し ──
+    let version = version_for_n(n);
+    let entry_width = gram_entry(version);
+    if version == VERSION_V2 {
+        if let Some((bad, _)) = plan.iter().find(|(k, _)| *k > u32::MAX as u64) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("n = 2 (v2 format) なのに key {bad:#x} が u32 を超えている"),
+            ));
+        }
+    }
+    let mut reserved = [0u8; 8];
+    if !has_text {
+        reserved[0] = FLAG_TEXT_OMITTED;
+    }
+    if version == VERSION_V3 {
+        reserved[N_OFFSET - FLAGS_OFFSET] = n as u8;
+    }
+
+    let file = File::create(out)?;
+    let mut w = std::io::BufWriter::with_capacity(1 << 20, file);
+
+    w.write_all(MAGIC)?;
+    w.write_all(&version.to_le_bytes())?;
+    w.write_all(&gram_count.to_le_bytes())?;
+    w.write_all(&posting_total.to_le_bytes())?;
+    w.write_all(&doc_count.to_le_bytes())?;
+    w.write_all(&text_total.to_le_bytes())?;
+    w.write_all(&reserved)?;
+
+    let mut offset: u32 = 0;
+    for (key, len) in &plan {
+        if version == VERSION_V2 {
+            w.write_all(&(*key as u32).to_le_bytes())?;
+        } else {
+            w.write_all(&key.to_le_bytes())?;
+        }
+        w.write_all(&offset.to_le_bytes())?;
+        w.write_all(len.to_le_bytes().as_ref())?;
+        offset += *len;
+    }
+
+    let pad = posting_padding(gram_count, entry_width);
+    if pad > 0 {
+        w.write_all(&[0u8; 8][..pad])?;
+    }
+
+    let mut buf: Vec<u64> = Vec::new();
+    for (key, len) in &plan {
+        merged_posting(&maps, *key, &dup_eids, &owner_of, &mut buf);
+        debug_assert_eq!(buf.len() as u32, *len, "merge: 計画と書き出しで posting 数が食い違った");
+        for &eid in buf.iter() {
+            w.write_all(&eid.to_le_bytes())?;
+        }
+    }
+
+    let mut text_offset: u32 = 0;
+    for (eid, _, _, len) in &docs {
+        w.write_all(&eid.to_le_bytes())?;
+        w.write_all(&text_offset.to_le_bytes())?;
+        w.write_all(&len.to_le_bytes())?;
+        text_offset += *len;
+    }
+    for (_, src, off, len) in &docs {
+        let data = maps[*src as usize].text_data();
+        w.write_all(&data[*off as usize..(*off + *len) as usize])?;
+    }
+
+    w.flush()?;
+    Ok(MergeStats {
+        grams: gram_count,
+        postings: posting_total,
+        docs: doc_count,
+        text_bytes: text_total,
+        superseded_docs: dup_eids.len() as u32,
+    })
+}
+
+/// 1 gram ぶんの posting を全 input から集めて統合する (昇順・重複除去・所有権フィルタ)。
+///
+/// `out` は使い回す (key ごとに確保し直さない)。ここが merge の hot path で、
+/// **一度に触るのは 1 gram ぶんの posting run だけ** = メモリがコーパス量から独立する。
+#[cfg(not(target_arch = "wasm32"))]
+fn merged_posting(
+    maps: &[MappedIndex],
+    key: u64,
+    dup_eids: &[u64],
+    owner_of: &impl Fn(u64) -> Option<u16>,
+    out: &mut Vec<u64>,
+) {
+    out.clear();
+    for (si, m) in maps.iter().enumerate() {
+        for eid in m.get_posting(key) {
+            // 上書きが起きた eid だけ所有権を見る。上書きが無ければ (通常ケース)
+            // `dup_eids` が空なのでこの判定は is_empty() 一発で終わる。
+            if !dup_eids.is_empty() && dup_eids.binary_search(&eid).is_ok() {
+                if owner_of(eid) != Some(si as u16) { continue; }
+            }
+            out.push(eid);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
