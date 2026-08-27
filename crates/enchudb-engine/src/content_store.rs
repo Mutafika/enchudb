@@ -97,10 +97,14 @@ impl ContentStore {
         let data_off = self.data_end().fetch_add(len, Ordering::Relaxed);
         // Extend the file-backed commit before writing — no-op on
         // static backings, real grow on Backing::Growable.
-        let _ = self
-            .data
-            .ensure_committed((data_off + len) as usize);
-        let _ = self.index.ensure_committed(off + 8);
+        // #167: commit を伸ばせなければ書かずに諦める (未 commit page への write は
+        // ディスク満杯なら SIGBUS)。 fetch_add した分は巻き戻す。
+        if self.data.ensure_committed((data_off + len) as usize).is_err()
+            || self.index.ensure_committed(off + 8).is_err()
+        {
+            self.data_end().fetch_sub(len, Ordering::Relaxed);
+            return false;
+        }
         let data_len = self.data.len();
         if (data_off + len) as usize > data_len {
             // #59: data 領域溢れ — fetch_add を巻き戻して **false を返す**。

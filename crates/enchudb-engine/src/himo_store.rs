@@ -140,13 +140,19 @@ impl HimoStore {
 
     // ──── ぶら下げる / 外す ────
 
-    pub fn set(&self, eid: u32, value: u32) {
+    /// cell に値を書く。 **書けなかったら `false`** (#167: growable backing で
+    /// commit を伸ばせない = ディスク満杯。 未 commit page に書くと SIGBUS になるので
+    /// 書かずに諦める)。 戻り値を無視しても従来どおり動く。
+    pub fn set(&self, eid: u32, value: u32) -> bool {
         self.ensure_cylinder_built();
         let _w = self.write_lock.lock();
+        if self.col().ensure_committed_for(eid).is_err() {
+            return false;
+        }
         self.col().ensure_count(eid);
         let old = self.get_value(eid);
         if old == Some(value) {
-            return; // 冗長な re-tie = no-op（bucket に dup を作らない）
+            return true; // 冗長な re-tie = no-op（bucket に dup を作らない）
         }
         let mut stale = None;
         if let Some(o) = old {
@@ -162,6 +168,7 @@ impl HimoStore {
         if let Some((o, (len, live))) = stale {
             self.maybe_compact(o, len, live);
         }
+        true
     }
 
     pub fn remove(&self, eid: u32) {

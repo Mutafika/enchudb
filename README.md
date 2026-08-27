@@ -262,13 +262,33 @@ write. A default-capacity store looks like ~95 GB in `ls -l` but costs a few hun
 on disk. `df` does not move. This is by design — but it has three consequences worth
 knowing.
 
-**1. A full disk crashes the process, it does not return an error.** Writes go through
-`mmap`, so when the kernel cannot allocate a block for a hole it raises **SIGBUS**
-rather than returning `ENOSPC`. There is no `Result` to handle and no way to catch it
-in normal code. Note that `create` succeeds regardless (it only does `set_len`), so the
-failure surfaces later, at write time. **Provision for the apparent size, not the
-current physical usage** — "`df` says there is room" is not a safety property here. See
-[#167](https://github.com/Mutafika/enchudb/issues/167).
+**1. A full disk is refused, not crashed — but only on a best-effort basis.** Writes go
+through `mmap`, so when the kernel cannot allocate a block for a hole it raises
+**SIGBUS** rather than returning `ENOSPC`: there is no write syscall for the errno to
+come back from. Two mitigations are in place
+([#167](https://github.com/Mutafika/enchudb/issues/167)):
+
+- **The grow path checks free space first.** `ftruncate` never reports `ENOSPC` (it just
+  extends sparsely), so before extending, the engine calls `statvfs` and requires
+  *(bytes to commit + a 32 MB margin)* to be available. If they are not, it returns
+  `io::ErrorKind::StorageFull` as a normal `Result`.
+- **That result is no longer discarded.** When the commit cannot be extended, the write
+  is **refused** rather than performed against an uncommitted page — counted as
+  `FaultKind::DiskSpace` and reported through a rate-limited warning.
+
+```rust
+eng.disk_free_bytes();  // Option<u64> — growable backings only; watch this
+eng.space_denials();    // grow refusals; non-zero means writes are being dropped
+eng.fault_count(enchudb::FaultKind::DiskSpace);
+```
+
+This is deliberately best-effort: a write into a hole **inside an already-committed
+range** does not pass through the check (the margin exists to absorb exactly that).
+Reserving the whole file with `fallocate` would close the gap but defeats the sparse
+design, so it is not done. `create` still succeeds regardless of free space (it only
+does `set_len`), so the failure surfaces later, at write time. **Provision for the
+apparent size, not the current physical usage** — "`df` says there is room" is not a
+safety property here.
 
 **2. Copying the DB can materialize every hole.** `std::fs::copy` preserves holes on
 macOS (APFS clones) but **fills them with zeros on Linux** — copying a default store
@@ -285,6 +305,31 @@ problem for your environment, create with a smaller `max_entities` or use
 Note that `snapshot_export` does **not** fsync: the copy lands in the page cache, so a
 power loss right after can lose it. That is deliberate (it keeps snapshots fast by not
 re-persisting the source); fsync it yourself if the snapshot is a backup you rely on.
+
+## Capacity limits
+
+enchudb is embedded — it runs inside someone else's process — so "the DB is full" and
+"that value does not fit" must not take the host down with them. Since 0.21.0+ these
+never panic ([#59](https://github.com/Mutafika/enchudb/issues/59)): the write is
+**refused**, counted per kind, and reported through a rate-limited warning. APIs that
+can carry an error return one.
+
+```rust
+use enchudb::FaultKind;
+
+eng.try_entity();                             // Err when the eid space is exhausted
+                                              // (entity() still panics — documented)
+eng.fault_count(FaultKind::EntitySpace);      // refused: no eid slots left
+eng.fault_count(FaultKind::VocabSpace);       // refused: vocab_max_entries reached
+eng.fault_count(FaultKind::ContentSpace);     // refused: content region full
+eng.fault_count(FaultKind::ValueOutOfRange);  // refused: value == u32::MAX (sentinel)
+eng.fault_count(FaultKind::DiskSpace);        // refused: cannot grow the file
+eng.fault_total();
+```
+
+A non-zero count means writes were dropped on purpose. Watch it the way you would watch
+a queue depth: the DB stays readable and usable, but it is telling you it could not
+accept everything.
 
 ## Concurrency
 
