@@ -386,6 +386,30 @@ pub trait Transport: Send + Sync {
         Vec::new()
     }
 
+    /// #216: **author 別 cursor** での pull。 relay (gossip) の stream は
+    /// 「自分の row (自 clock)」と「relay された row (原 author の HLC 素通し、
+    /// #209)」の merge で **全体としては HLC 非単調** — scalar cursor の
+    /// `hlc > since` filter は、 cursor が別 author の新しい row で先に進んだ後に
+    /// relay された古い HLC の record を永久に落とす (silent data loss)。
+    ///
+    /// author ごとの substream は relay を何 hop 挟んでも HLC 単調なので、
+    /// cursor を (author → Hlc) の vector にすれば健全になる。 `since` に無い
+    /// author は **Hlc::ZERO 起点** (= 全量) — 新しく relay され始めた author の
+    /// 古い record を落とさないための必須条件で、 「既知 author の min」への
+    /// 短絡は同じ穴を一段下で再現する。
+    ///
+    /// default 実装は `pull_as(to, from, Hlc::ZERO)` の全量 fetch — 正しさ優先の
+    /// fallback で、 既知分は受信側 (`Syncer::pull_once`) の author 別 filter が
+    /// 落とす。 効率が要る transport は per-author filter を override すること。
+    fn pull_as_multi(
+        &self,
+        to: PeerId,
+        from: PeerId,
+        _since: &[(PeerId, Hlc)],
+    ) -> Vec<WireRecord> {
+        self.pull_as(to, from, Hlc::ZERO)
+    }
+
     /// #140: publisher が「自分の履歴は `floor` 以下が reclaim 済み」と広告する。
     ///
     /// `_sync_ops` は ring buffer なので、 publisher 側で reclaim が走ると **配れる履歴に
@@ -403,6 +427,26 @@ pub trait Transport: Send + Sync {
         None
     }
 
+    /// #216: author 別の history floor 広告。 relay 混在 ring では scalar floor が
+    /// 「author a の cursor は新しいのに author b の reclaim で恒常 truncation」の
+    /// false positive を作るため、 publisher は author 別に広告し、 puller は
+    /// `cursor[a] < floor[a]` で判定する。
+    ///
+    /// default 実装は scalar `set_history_floor(peer, max)` への退化 (保守側 —
+    /// 判定の粒度が落ちるだけで安全方向)。
+    fn set_history_floor_multi(&self, peer: PeerId, floors: &[(PeerId, Hlc)]) {
+        if let Some(max) = floors.iter().map(|(_, h)| *h).max() {
+            self.set_history_floor(peer, max);
+        }
+    }
+
+    /// #216: `peer` の author 別 history floor。 `None` = この transport は author 別
+    /// 広告を運べない (または未広告) — puller は scalar `history_floor` の保守的
+    /// 判定に fall back する。
+    fn history_floor_multi(&self, _peer: PeerId) -> Option<Vec<(PeerId, Hlc)>> {
+        None
+    }
+
     /// #149: puller が「`author` の履歴を HLC `cursor` まで消化した」ことを記録する。
     ///
     /// pull の since cursor は durable barrier (`Syncer::pull_once` の
@@ -417,6 +461,35 @@ pub trait Transport: Send + Sync {
     /// #149: `author` 宛に溜まった pull ack を drain して返す。
     /// puller ごとに 1 エントリ (最大 cursor のみ保持)。 default は空。
     fn take_pull_acks(&self, _author: PeerId) -> Vec<(PeerId, Hlc)> {
+        Vec::new()
+    }
+
+    /// #216: author 別 cursor (vector) での pull ack。 relay 混在 ring の reclaim を
+    /// 健全に回す完全形 — publisher 側は [`Engine::ack_sync_up_to_cursors`] の
+    /// per-row 述語 (`consumed(row) = row.hlc <= cursors[row.author]`、 未知 author
+    /// は ZERO) に直結する。 scalar ack は relayed row を消化と証明できないため、
+    /// relay 経路の reclaim は vector ack でしか前進しない。
+    ///
+    /// default 実装は退化形: `cursors` から **author = link (`author` 引数) の
+    /// entry だけ**を scalar `record_pull_ack` に落とす。 「他 author は証明なし」の
+    /// 保守側解釈で、 scalar 側の self-only 述語と意味論が揃う (min に潰すのは
+    /// 未知 author の row を消化済みと誤判定する over-ack になるので不可)。
+    fn record_pull_ack_multi(
+        &self,
+        author: PeerId,
+        by: PeerId,
+        cursors: &[(PeerId, Hlc)],
+    ) {
+        if let Some((_, h)) = cursors.iter().find(|(p, _)| *p == author) {
+            self.record_pull_ack(author, by, *h);
+        }
+    }
+
+    /// #216: `author` 宛に溜まった vector ack を drain して返す。
+    /// puller ごとに 1 エントリ (author 別 max cursor)。 default は空 —
+    /// 未対応 transport では `record_pull_ack_multi` の default が scalar 経路に
+    /// 落としているので、 `take_pull_acks` 側で回収される。
+    fn take_pull_acks_multi(&self, _author: PeerId) -> Vec<(PeerId, Vec<(PeerId, Hlc)>)> {
         Vec::new()
     }
 
@@ -474,8 +547,14 @@ pub struct InMemoryTransport {
     targeted: Arc<Mutex<HashMap<(PeerId, PeerId), Vec<WireRecord>>>>,
     /// #140: peer → 広告された履歴の下限 (これ以下は publisher 側で reclaim 済み)。
     floors: Arc<Mutex<HashMap<PeerId, Hlc>>>,
+    /// #216: peer → (author → 履歴下限)。 author 別 floor 広告。
+    floors_multi: Arc<Mutex<HashMap<PeerId, HashMap<PeerId, Hlc>>>>,
     /// #149: author → (puller → 消化済み max HLC)。 `take_pull_acks` で drain。
     pull_acks: Arc<Mutex<HashMap<PeerId, HashMap<PeerId, Hlc>>>>,
+    /// #216: author → (puller → (author 別 max cursor))。 `take_pull_acks_multi` で
+    /// drain。 relay 混在 ring の reclaim を回す vector ack 用。
+    pull_acks_multi:
+        Arc<Mutex<HashMap<PeerId, HashMap<PeerId, HashMap<PeerId, Hlc>>>>>,
     /// #140: peer → live-state provider。
     state_providers: Arc<Mutex<HashMap<PeerId, StateProvider>>>,
 }
@@ -486,7 +565,9 @@ impl InMemoryTransport {
             inner: Arc::new(Mutex::new(HashMap::new())),
             targeted: Arc::new(Mutex::new(HashMap::new())),
             floors: Arc::new(Mutex::new(HashMap::new())),
+            floors_multi: Arc::new(Mutex::new(HashMap::new())),
             pull_acks: Arc::new(Mutex::new(HashMap::new())),
+            pull_acks_multi: Arc::new(Mutex::new(HashMap::new())),
             state_providers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -584,6 +665,39 @@ impl Transport for InMemoryTransport {
         guard.keys().copied().collect()
     }
 
+    /// #216: author 別 filter — record の `author_peer` ごとに cursor を引き、
+    /// 未知 author は Hlc::ZERO 起点 (= 全量)。
+    fn pull_as_multi(
+        &self,
+        to: PeerId,
+        from: PeerId,
+        since: &[(PeerId, Hlc)],
+    ) -> Vec<WireRecord> {
+        let cursor_of = |author: PeerId| {
+            since
+                .iter()
+                .find(|(p, _)| *p == author)
+                .map(|(_, h)| *h)
+                .unwrap_or(Hlc::ZERO)
+        };
+        let bcast: Vec<WireRecord> = {
+            let guard = self.inner.lock().unwrap();
+            guard.get(&from).cloned().unwrap_or_default()
+        };
+        let targeted: Vec<WireRecord> = {
+            let guard = self.targeted.lock().unwrap();
+            guard.get(&(from, to)).cloned().unwrap_or_default()
+        };
+        let mut merged: Vec<WireRecord> = bcast
+            .into_iter()
+            .chain(targeted)
+            .filter(|r| r.hlc > cursor_of(r.author_peer))
+            .collect();
+        merged.sort_by_key(|r| r.hlc);
+        merged.dedup_by_key(|r| r.hlc);
+        merged
+    }
+
     // #140: 広告は「後退させない」— reclaim は進む一方なので floor も単調増加。
     fn set_history_floor(&self, peer: PeerId, floor: Hlc) {
         let mut g = self.floors.lock().unwrap();
@@ -593,6 +707,24 @@ impl Transport for InMemoryTransport {
 
     fn history_floor(&self, peer: PeerId) -> Option<Hlc> {
         self.floors.lock().unwrap().get(&peer).copied()
+    }
+
+    // #216: author 別 floor — 単調 max で merge (後退させない)。
+    fn set_history_floor_multi(&self, peer: PeerId, floors: &[(PeerId, Hlc)]) {
+        let mut g = self.floors_multi.lock().unwrap();
+        let slot = g.entry(peer).or_default();
+        for (a, h) in floors {
+            let e = slot.entry(*a).or_insert(Hlc::ZERO);
+            if *h > *e {
+                *e = *h;
+            }
+        }
+    }
+
+    fn history_floor_multi(&self, peer: PeerId) -> Option<Vec<(PeerId, Hlc)>> {
+        let g = self.floors_multi.lock().unwrap();
+        g.get(&peer)
+            .map(|m| m.iter().map(|(a, h)| (*a, *h)).collect())
     }
 
     // #149: ack は puller ごとに max cursor だけ保持 (再送・巻き戻りは無視)。
@@ -607,6 +739,34 @@ impl Transport for InMemoryTransport {
     fn take_pull_acks(&self, author: PeerId) -> Vec<(PeerId, Hlc)> {
         let mut g = self.pull_acks.lock().unwrap();
         g.remove(&author).map(|m| m.into_iter().collect()).unwrap_or_default()
+    }
+
+    // #216: vector ack — puller ごとに author 別 max cursor を merge して保持。
+    fn record_pull_ack_multi(
+        &self,
+        author: PeerId,
+        by: PeerId,
+        cursors: &[(PeerId, Hlc)],
+    ) {
+        let mut g = self.pull_acks_multi.lock().unwrap();
+        let slot = g.entry(author).or_default().entry(by).or_default();
+        for (a, h) in cursors {
+            let e = slot.entry(*a).or_insert(Hlc::ZERO);
+            if *h > *e {
+                *e = *h;
+            }
+        }
+    }
+
+    fn take_pull_acks_multi(&self, author: PeerId) -> Vec<(PeerId, Vec<(PeerId, Hlc)>)> {
+        let mut g = self.pull_acks_multi.lock().unwrap();
+        g.remove(&author)
+            .map(|m| {
+                m.into_iter()
+                    .map(|(by, cursors)| (by, cursors.into_iter().collect()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     // #140: in-process なので provider をそのまま持って fetch 時に呼ぶ。

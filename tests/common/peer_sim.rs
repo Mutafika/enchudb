@@ -186,11 +186,16 @@ impl PeerSim {
         let s = std::fs::read_to_string(&self.peers[i].cursor_path).ok()?;
         for line in s.lines() {
             let f: Vec<&str> = line.split_whitespace().collect();
-            if f.len() == 4 && f[0].parse::<u32>() == Ok(from) {
+            // #216 v2 書式 `link author wall logical hlc_peer`。 直 pull の sim では
+            // author == link の行が従来の「from 向け cursor」に相当する。
+            if f.len() == 5
+                && f[0].parse::<u32>() == Ok(from)
+                && f[1].parse::<u32>() == Ok(from)
+            {
                 return Some((
-                    f[1].parse().ok()?,
                     f[2].parse().ok()?,
                     f[3].parse().ok()?,
+                    f[4].parse().ok()?,
                 ));
             }
         }

@@ -4644,7 +4644,12 @@ impl Engine {
         // #191: purge した record の最大 HLC = 「差分 pull で配れない履歴の上限」。
         // publish 側はこれを history floor として広告する (生存 record の最小 HLC を
         // 使うと、消化完了直後の正常な cursor まで gap と誤認する)。
-        let mut reclaimed_max: Option<enchudb_oplog::Hlc> = None;
+        // #216: **author 別**に最大を取る — relay 混在 ring では scalar floor が
+        // 「author a の cursor は新しいのに、 author b の reclaim で floor が上がって
+        // 恒常的に truncation 判定」の false positive を作るため (per-author cursor の
+        // 双対として floor も per-author が要る)。
+        let mut reclaimed_max: std::collections::HashMap<u32, enchudb_oplog::Hlc> =
+            std::collections::HashMap::new();
         for eid in rows {
             let Some(lsn) = self.get_by_id(eid, lsn_hid_u16) else { continue };
             if lsn >= watermark {
@@ -4654,9 +4659,13 @@ impl Engine {
                 .and_then(|h| self.get_by_id(eid, h))
                 .map(|vid| self.vocab.get(vid).to_vec())
                 .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b))
-                && reclaimed_max.is_none_or(|m| rec.hlc > m)
             {
-                reclaimed_max = Some(rec.hlc);
+                let e = reclaimed_max
+                    .entry(rec.author_peer)
+                    .or_insert(enchudb_oplog::Hlc::ZERO);
+                if rec.hlc > *e {
+                    *e = rec.hlc;
+                }
             }
             let local = enchudb_oplog::eid_local(eid);
             self.delete(eid);
@@ -4669,20 +4678,52 @@ impl Engine {
             }
             purged += 1;
         }
-        if let Some(hlc) = reclaimed_max {
-            self.record_reclaimed_floor(hlc);
+        if !reclaimed_max.is_empty() {
+            let entries: Vec<(u32, enchudb_oplog::Hlc)> =
+                reclaimed_max.into_iter().collect();
+            self.record_reclaimed_floors(&entries);
         }
         purged
     }
 
-    /// #191: reclaim で `_sync_ops` から消した record の最大 HLC。
+    /// #191: reclaim で `_sync_ops` から消した record の最大 HLC (全 author 横断)。
     ///
     /// `cursor >= floor` の peer は「reclaim で消えた分を全部消化済み」なので
     /// 差分 pull を続けて良い。`cursor < floor` の peer だけが bootstrap 対象。
-    /// `_sync_peers` の sentinel row (`reclaimed_floor` Leaf、16 bytes BE) に
-    /// 保存する。row は body mmap なので reclaim の delete と durability の運命を
-    /// 共有する (crash で両方巻き戻れば pre-reclaim 状態として整合する)。
+    /// `_sync_peers` の sentinel row (`reclaimed_floor` Leaf) に保存する。row は
+    /// body mmap なので reclaim の delete と durability の運命を共有する
+    /// (crash で両方巻き戻れば pre-reclaim 状態として整合する)。
+    ///
+    /// #216: 内部表現は author 別 map (v2)。 本 API は互換の scalar view
+    /// (= 全 entry の max)。 author 別は [`Engine::sync_reclaimed_floors`]。
     pub fn sync_reclaimed_floor(&self) -> Option<enchudb_oplog::Hlc> {
+        let entries = self.read_reclaimed_floor_entries()?;
+        entries.iter().map(|(_, h)| *h).max()
+    }
+
+    /// #216: reclaim floor の author 別 view。 relay 混在 ring では scalar floor が
+    /// 「author a の cursor は新しいのに author b の reclaim で恒常 truncation」の
+    /// false positive を作るため、 puller は author 別に `cursor[a] < floor[a]` で
+    /// 判定する (per-author cursor の双対)。
+    ///
+    /// **`(u32::MAX, h)` の entry は「無帰属 baseline」** — 旧 (scalar) 書式時代に
+    /// purge した row の最大 HLC で、 どの author の分かは失われている。 puller は
+    /// これを**全 author に対する下限**として畳み込むこと
+    /// (`effective_floor[a] = max(entry[a], baseline)`)。 これは sound
+    /// (`cursor[a] >= max` なら upgrade 前分 ≤ baseline も後分 ≤ entry[a] も消化済み)
+    /// かつ scalar max fallback より厳密に tight — baseline を越えた cursor の
+    /// author から順に per-author 精度が戻るので、 sentinel を消さなくても自然に
+    /// retire する。 このため **peer id `u32::MAX` は author として使用不可** (予約)。
+    ///
+    /// `None` = floor 記録なし (一度も reclaim していない)。
+    pub fn sync_reclaimed_floors(&self) -> Option<Vec<(u32, enchudb_oplog::Hlc)>> {
+        self.read_reclaimed_floor_entries()
+    }
+
+    /// floor row の生 entry 列 (author, hlc)。 legacy 16B scalar は
+    /// `author = u32::MAX` (無帰属 sentinel) の 1 entry として読む。
+    /// v2 書式: `[0xF2, 0x01, count: u16 LE][author u32 | wall u64 | logical u32 | peer u32 (全て BE)]*`
+    fn read_reclaimed_floor_entries(&self) -> Option<Vec<(u32, enchudb_oplog::Hlc)>> {
         if !self.sync_tables_enabled() {
             return None;
         }
@@ -4690,20 +4731,55 @@ impl Engine {
         let row = self.entities_with_himo(hid).into_iter().next()?;
         let vid = self.get_by_id(row, hid)?;
         let bytes = self.vocab.get(vid).to_vec();
-        if bytes.len() != 16 {
+        let hlc_at = |b: &[u8]| -> Option<enchudb_oplog::Hlc> {
+            Some(enchudb_oplog::Hlc {
+                wall: u64::from_be_bytes(b[0..8].try_into().ok()?),
+                logical: u32::from_be_bytes(b[8..12].try_into().ok()?),
+                peer: u32::from_be_bytes(b[12..16].try_into().ok()?),
+            })
+        };
+        if bytes.len() == 16 {
+            // legacy scalar (#191 初版)
+            return Some(vec![(u32::MAX, hlc_at(&bytes)?)]);
+        }
+        if bytes.len() < 4 || bytes[0] != 0xF2 || bytes[1] != 0x01 {
             return None;
         }
-        Some(enchudb_oplog::Hlc {
-            wall: u64::from_be_bytes(bytes[0..8].try_into().ok()?),
-            logical: u32::from_be_bytes(bytes[8..12].try_into().ok()?),
-            peer: u32::from_be_bytes(bytes[12..16].try_into().ok()?),
-        })
+        let count = u16::from_le_bytes(bytes[2..4].try_into().ok()?) as usize;
+        if bytes.len() != 4 + count * 20 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = 4 + i * 20;
+            let author = u32::from_be_bytes(bytes[off..off + 4].try_into().ok()?);
+            out.push((author, hlc_at(&bytes[off + 4..off + 20])?));
+        }
+        Some(out)
     }
 
-    /// #191: reclaimed floor を単調 max で更新する (下がることは無い)。
-    /// himo は lazy に ensure する (fix 前に作られた DB の reopen でも育つ)。
-    fn record_reclaimed_floor(&self, candidate: enchudb_oplog::Hlc) {
-        if self.sync_reclaimed_floor().is_some_and(|cur| cur >= candidate) {
+    /// #191/#216: reclaimed floor を author 別に単調 max で merge する (下がる
+    /// ことは無い)。 himo は lazy に ensure する (fix 前 DB の reopen でも育つ)。
+    /// legacy scalar が残っていれば無帰属 sentinel (`u32::MAX`) entry として
+    /// 温存する — 帰属不明の上限を落とすと silent gap 側に倒れるため。 puller は
+    /// sentinel を全 author への baseline として畳み込む
+    /// ([`Engine::sync_reclaimed_floors`] の doc 参照)。 **`u32::MAX` は author の
+    /// peer id として予約済み** (実 author に使うと legacy baseline と誤分類される)。
+    fn record_reclaimed_floors(&self, candidates: &[(u32, enchudb_oplog::Hlc)]) {
+        let mut merged: std::collections::HashMap<u32, enchudb_oplog::Hlc> = self
+            .read_reclaimed_floor_entries()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let mut changed = false;
+        for (a, h) in candidates {
+            let e = merged.entry(*a).or_insert(enchudb_oplog::Hlc::ZERO);
+            if *h > *e {
+                *e = *h;
+                changed = true;
+            }
+        }
+        if !changed {
             return;
         }
         let hid = match self.ensure_himo_dynamic_in(
@@ -4728,10 +4804,18 @@ impl Engine {
                 }
             },
         };
-        let mut bytes = [0u8; 16];
-        bytes[0..8].copy_from_slice(&candidate.wall.to_be_bytes());
-        bytes[8..12].copy_from_slice(&candidate.logical.to_be_bytes());
-        bytes[12..16].copy_from_slice(&candidate.peer.to_be_bytes());
+        let mut entries: Vec<(u32, enchudb_oplog::Hlc)> = merged.into_iter().collect();
+        entries.sort_by_key(|(a, _)| *a);
+        let mut bytes = Vec::with_capacity(4 + entries.len() * 20);
+        bytes.push(0xF2);
+        bytes.push(0x01);
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (a, h) in &entries {
+            bytes.extend_from_slice(&a.to_be_bytes());
+            bytes.extend_from_slice(&h.wall.to_be_bytes());
+            bytes.extend_from_slice(&h.logical.to_be_bytes());
+            bytes.extend_from_slice(&h.peer.to_be_bytes());
+        }
         self.tie_bytes_to_by_id(row, hid, &bytes);
     }
 
@@ -11494,6 +11578,54 @@ impl Drop for Engine {
 }
 
 // ════════════════ テスト ════════════════
+
+#[cfg(test)]
+mod reclaimed_floor_tests {
+    use super::*;
+
+    fn tmp_engine(tag: &str) -> Engine {
+        let path = format!(
+            "{}/enchudb-floor-{}-{}",
+            std::env::temp_dir().display(),
+            tag,
+            std::process::id()
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.tables"));
+        let mut eng = Engine::create_with_capacity(&path, 4096).unwrap();
+        eng.define_table("t", 100).unwrap();
+        eng.enable_sync_tables().unwrap();
+        eng
+    }
+
+    fn hlc(wall: u64) -> enchudb_oplog::Hlc {
+        enchudb_oplog::Hlc { wall, logical: 0, peer: 0 }
+    }
+
+    /// #216 (review): 無帰属 sentinel (`u32::MAX` = legacy scalar 由来) は
+    /// v2 entry と共存して**温存**され、 `sync_reclaimed_floors` は sentinel 込みで
+    /// Some を返す (None に落とすと legacy floor を持つ既存 DB で per-author 判定が
+    /// 一生有効化されない)。 scalar view は全 entry の max。
+    #[test]
+    fn sentinel_baseline_is_preserved_and_exposed() {
+        let eng = tmp_engine("sentinel");
+        eng.record_reclaimed_floors(&[(u32::MAX, hlc(100))]);
+        eng.record_reclaimed_floors(&[(1, hlc(50)), (2, hlc(200))]);
+
+        let floors = eng.sync_reclaimed_floors().expect("floor 記録済み");
+        assert!(
+            floors.contains(&(u32::MAX, hlc(100))),
+            "sentinel が消えた: {floors:?}"
+        );
+        assert!(floors.contains(&(1, hlc(50))) && floors.contains(&(2, hlc(200))));
+        assert_eq!(eng.sync_reclaimed_floor(), Some(hlc(200)), "scalar view = max");
+
+        // 単調 max merge: 古い値では下がらない
+        eng.record_reclaimed_floors(&[(2, hlc(150))]);
+        let floors = eng.sync_reclaimed_floors().unwrap();
+        assert!(floors.contains(&(2, hlc(200))), "floor が後退した: {floors:?}");
+    }
+}
 
 #[cfg(test)]
 mod layout_v9_tests {
