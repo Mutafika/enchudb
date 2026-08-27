@@ -4706,16 +4706,18 @@ impl Engine {
     /// false positive を作るため、 puller は author 別に `cursor[a] < floor[a]` で
     /// 判定する (per-author cursor の双対)。
     ///
-    /// `None` = 帰属情報なし — 旧 (scalar) 書式の floor が残っている DB。 caller は
-    /// scalar [`Engine::sync_reclaimed_floor`] の保守的判定に fall back すること
-    /// (legacy 分は「どの author の履歴が消えたか」が失われており復元できない)。
+    /// **`(u32::MAX, h)` の entry は「無帰属 baseline」** — 旧 (scalar) 書式時代に
+    /// purge した row の最大 HLC で、 どの author の分かは失われている。 puller は
+    /// これを**全 author に対する下限**として畳み込むこと
+    /// (`effective_floor[a] = max(entry[a], baseline)`)。 これは sound
+    /// (`cursor[a] >= max` なら upgrade 前分 ≤ baseline も後分 ≤ entry[a] も消化済み)
+    /// かつ scalar max fallback より厳密に tight — baseline を越えた cursor の
+    /// author から順に per-author 精度が戻るので、 sentinel を消さなくても自然に
+    /// retire する。 このため **peer id `u32::MAX` は author として使用不可** (予約)。
+    ///
+    /// `None` = floor 記録なし (一度も reclaim していない)。
     pub fn sync_reclaimed_floors(&self) -> Option<Vec<(u32, enchudb_oplog::Hlc)>> {
-        let entries = self.read_reclaimed_floor_entries()?;
-        if entries.iter().any(|(a, _)| *a == u32::MAX) {
-            // legacy 由来の無帰属 entry が混ざっている → author 別判定は不完全
-            return None;
-        }
-        Some(entries)
+        self.read_reclaimed_floor_entries()
     }
 
     /// floor row の生 entry 列 (author, hlc)。 legacy 16B scalar は
@@ -4759,7 +4761,10 @@ impl Engine {
     /// #191/#216: reclaimed floor を author 別に単調 max で merge する (下がる
     /// ことは無い)。 himo は lazy に ensure する (fix 前 DB の reopen でも育つ)。
     /// legacy scalar が残っていれば無帰属 sentinel (`u32::MAX`) entry として
-    /// 温存する — 帰属不明の上限を落とすと silent gap 側に倒れるため。
+    /// 温存する — 帰属不明の上限を落とすと silent gap 側に倒れるため。 puller は
+    /// sentinel を全 author への baseline として畳み込む
+    /// ([`Engine::sync_reclaimed_floors`] の doc 参照)。 **`u32::MAX` は author の
+    /// peer id として予約済み** (実 author に使うと legacy baseline と誤分類される)。
     fn record_reclaimed_floors(&self, candidates: &[(u32, enchudb_oplog::Hlc)]) {
         let mut merged: std::collections::HashMap<u32, enchudb_oplog::Hlc> = self
             .read_reclaimed_floor_entries()
@@ -11573,6 +11578,54 @@ impl Drop for Engine {
 }
 
 // ════════════════ テスト ════════════════
+
+#[cfg(test)]
+mod reclaimed_floor_tests {
+    use super::*;
+
+    fn tmp_engine(tag: &str) -> Engine {
+        let path = format!(
+            "{}/enchudb-floor-{}-{}",
+            std::env::temp_dir().display(),
+            tag,
+            std::process::id()
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.tables"));
+        let mut eng = Engine::create_with_capacity(&path, 4096).unwrap();
+        eng.define_table("t", 100).unwrap();
+        eng.enable_sync_tables().unwrap();
+        eng
+    }
+
+    fn hlc(wall: u64) -> enchudb_oplog::Hlc {
+        enchudb_oplog::Hlc { wall, logical: 0, peer: 0 }
+    }
+
+    /// #216 (review): 無帰属 sentinel (`u32::MAX` = legacy scalar 由来) は
+    /// v2 entry と共存して**温存**され、 `sync_reclaimed_floors` は sentinel 込みで
+    /// Some を返す (None に落とすと legacy floor を持つ既存 DB で per-author 判定が
+    /// 一生有効化されない)。 scalar view は全 entry の max。
+    #[test]
+    fn sentinel_baseline_is_preserved_and_exposed() {
+        let eng = tmp_engine("sentinel");
+        eng.record_reclaimed_floors(&[(u32::MAX, hlc(100))]);
+        eng.record_reclaimed_floors(&[(1, hlc(50)), (2, hlc(200))]);
+
+        let floors = eng.sync_reclaimed_floors().expect("floor 記録済み");
+        assert!(
+            floors.contains(&(u32::MAX, hlc(100))),
+            "sentinel が消えた: {floors:?}"
+        );
+        assert!(floors.contains(&(1, hlc(50))) && floors.contains(&(2, hlc(200))));
+        assert_eq!(eng.sync_reclaimed_floor(), Some(hlc(200)), "scalar view = max");
+
+        // 単調 max merge: 古い値では下がらない
+        eng.record_reclaimed_floors(&[(2, hlc(150))]);
+        let floors = eng.sync_reclaimed_floors().unwrap();
+        assert!(floors.contains(&(2, hlc(200))), "floor が後退した: {floors:?}");
+    }
+}
 
 #[cfg(test)]
 mod layout_v9_tests {

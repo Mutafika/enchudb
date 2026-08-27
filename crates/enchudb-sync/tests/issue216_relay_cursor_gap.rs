@@ -253,6 +253,68 @@ fn steady_relay_reclaim_does_not_false_truncate() {
     cleanup(&pd);
 }
 
+/// #216 (review): `(u32::MAX, h)` = 無帰属 baseline (legacy scalar floor 由来)。
+/// puller は全 author への下限として畳み込む — 既知 author 全員の cursor が
+/// baseline を越えていれば truncation なし (scalar max fallback だと legacy floor を
+/// 持つ既存 DB で per-author 判定が一生有効化されず、 恒常 truncation が残る)。
+#[test]
+fn legacy_baseline_floor_folds_into_all_authors() {
+    let pa = tmp_path("a6");
+    let pr = tmp_path("r6");
+    let pc = tmp_path("c6");
+    let pd = tmp_path("d6");
+    let transport = make_transport(&[1, 2, 3, 4]);
+
+    let eng_a = make_engine(&pa, 1);
+    let eng_r = make_engine(&pr, 2);
+    let eng_c = make_engine(&pc, 3);
+    let sync_a = Syncer::new(eng_a.clone(), transport.clone());
+    let sync_r = Syncer::new(eng_r.clone(), transport.clone());
+    let sync_c = Syncer::new(eng_c.clone(), transport.clone());
+    eng_r.set_gossip_remote_apply(true);
+
+    author_note(&eng_r, 900);
+    author_note(&eng_a, 1);
+    sync_a.publish_since(Hlc::ZERO);
+    relay_cycle(&eng_r, &sync_r, 1);
+    let out = sync_c.pull_once(2);
+    assert!(out.applied > 0, "{out:?}");
+
+    // legacy 由来の無帰属 baseline (全 cursor より古い HLC) を広告。
+    transport.set_history_floor_multi(2, &[(u32::MAX, Hlc { wall: 1, logical: 0, peer: 0 })]);
+
+    // 既追従の C は baseline を全 author で越えている → truncation なしで差分継続。
+    author_note(&eng_a, 2);
+    sync_a.publish_since(Hlc::ZERO);
+    relay_cycle(&eng_r, &sync_r, 1);
+    let out2 = sync_c.pull_once(2);
+    assert!(
+        !out2.history_truncated,
+        "baseline を越えた cursor が truncation 判定された (scalar max へ落ちている): {out2:?}"
+    );
+    assert!(has_note(&eng_c, 2));
+
+    // 初回 pull の新参 D は baseline-only floor でも truncated (従来どおり)。
+    let eng_d = make_engine(&pd, 4);
+    let sync_d = Syncer::new(eng_d.clone(), transport.clone());
+    let outd = sync_d.pull_once(2);
+    assert!(outd.history_truncated, "新参が baseline floor を素通りした: {outd:?}");
+
+    // baseline が cursor より新しくなれば truncated (max(entry, baseline) の畳み込み)。
+    transport
+        .set_history_floor_multi(2, &[(u32::MAX, Hlc { wall: u64::MAX, logical: 0, peer: 0 })]);
+    let out3 = sync_c.pull_once(2);
+    assert!(
+        out3.history_truncated,
+        "cursor より新しい baseline が畳み込まれていない: {out3:?}"
+    );
+
+    cleanup(&pa);
+    cleanup(&pr);
+    cleanup(&pc);
+    cleanup(&pd);
+}
+
 #[test]
 fn legacy_scalar_cursor_self_heals() {
     let pa = tmp_path("a3");

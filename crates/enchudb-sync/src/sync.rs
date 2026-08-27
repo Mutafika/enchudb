@@ -606,20 +606,44 @@ impl Syncer {
         // cursor が floor 以上なら、 落ちた分は既に自分が consume 済みなので安全。
         //
         // #216: author 別 floor が広告されていればそちらで判定する —
-        // `cursor[a] < floor[a]` の author がいる時だけ truncation。 scalar floor に
-        // 対する min 判定は、 relay 混在 ring の定常運転 (relay 自身の row の cursor は
-        // 古いまま、 中継分の reclaim で floor が上がる) で恒常 false positive になる。
-        // 未知 author (cursor 無し = ZERO) の floor entry も truncation — その author の
-        // 履歴の一部は受け取る前に消えている。
+        // `cursor[a] < effective_floor[a]` の author がいる時だけ truncation。
+        // scalar floor に対する min 判定は、 relay 混在 ring の定常運転 (relay 自身の
+        // row の cursor は古いまま、 中継分の reclaim で floor が上がる) で恒常
+        // false positive になる。 未知 author (cursor 無し = ZERO) の floor entry も
+        // truncation — その author の履歴の一部は受け取る前に消えている。
+        //
+        // `(u32::MAX, h)` entry = 無帰属 baseline (legacy scalar 由来、 全 author への
+        // 下限として畳み込む)。 これを分けずに scalar max へ落とすと、 legacy floor を
+        // 持つ既存 DB で per-author 判定が一生有効化されない (review 指摘)。
+        let baseline = floors_multi
+            .as_ref()
+            .and_then(|f| f.iter().find(|(a, _)| *a == u32::MAX).map(|(_, h)| *h))
+            .unwrap_or(Hlc::ZERO);
         let truncated_by_floor = if let Some(floors) = &floors_multi {
-            floors.iter().any(|(a, f)| {
-                let cur = since
+            let cursor_of_a = |a: PeerId| {
+                since
                     .iter()
-                    .find(|(p, _)| p == a)
+                    .find(|(p, _)| *p == a)
+                    .map(|(_, h)| *h)
+                    .unwrap_or(Hlc::ZERO)
+            };
+            let violates = |a: PeerId| {
+                let f = floors
+                    .iter()
+                    .find(|(p, _)| *p == a)
                     .map(|(_, h)| *h)
                     .unwrap_or(Hlc::ZERO);
-                cur < *f
-            })
+                cursor_of_a(a) < f.max(baseline)
+            };
+            // 初回 pull (cursor 無し) で reclaim 済み link → 従来どおり truncation
+            // (baseline-only の floor では下の走査対象が無いので明示する)。
+            let fresh_puller = since.is_empty() && !floors.is_empty();
+            fresh_puller
+                || floors
+                    .iter()
+                    .filter(|(a, _)| *a != u32::MAX)
+                    .any(|(a, _)| violates(*a))
+                || since.iter().any(|(a, _)| violates(*a))
         } else if let Some(floor) = floor {
             let link_min = since.iter().map(|(_, h)| *h).min().unwrap_or(Hlc::ZERO);
             link_min < floor
@@ -647,16 +671,19 @@ impl Syncer {
             .filter(|r| r.hlc > cursor_of(r.author_peer))
             .collect();
 
-        // #216: **scalar floor しか無い** link (author 別広告を運べない transport) に
-        // cursor 未登録の新 author が現れた場合、 その author の古い record は既に
-        // ring から落ちている可能性がある (scalar floor では author 別に判別
-        // できない)。 適用と cursor 前進は行った上で truncation を通知し、 app に
-        // 当該 author の bootstrap を促す — 次回以降は author が map に載るので
-        // clean diff に戻る。 author 別 floor がある場合は上の pre-fetch 判定が
-        // 「floor entry のある新 author」を正確に拾う (entry の無い新 author は
-        // reclaim されていない = clean、 flag 不要)。
-        let new_author_on_reclaimed_link = floors_multi.is_none()
-            && floor.is_some()
+        // #216: 新 author の record が「reclaim 済みの link」に現れた場合、 その
+        // author の古い record は既に ring から落ちている可能性がある。 適用と
+        // cursor 前進は行った上で truncation を通知し、 app に当該 author の
+        // bootstrap を促す — 次回以降は author が map に載るので clean diff に戻る。
+        // 発火条件は 2 つ:
+        // - scalar floor しか無い link (author 別に判別できない → 保守的に全新 author)
+        // - author 別 floor に無帰属 baseline (legacy) がある link (baseline 以前の
+        //   purge は帰属不明 → 新 author の過去分が消えていても entry に現れない)
+        // author 別 floor のみ (baseline 無し) なら、 entry のある新 author は
+        // pre-fetch 判定が拾い、 entry の無い新 author は reclaim されていない =
+        // clean なので flag 不要。
+        let new_author_on_reclaimed_link = ((floors_multi.is_none() && floor.is_some())
+            || baseline > Hlc::ZERO)
             && records
                 .iter()
                 .any(|r| !since.iter().any(|(p, _)| *p == r.author_peer));
