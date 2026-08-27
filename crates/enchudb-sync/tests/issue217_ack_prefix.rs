@@ -204,6 +204,73 @@ fn vector_ack_consumes_per_author() {
     cleanup(&pr);
 }
 
+/// author 0 = peer identity 設定前の local 著作 (単独 peer 運用 → 後から sync
+/// 参加、 の正規 path)。 scalar ack が self 限定だと author=0 row は dead row でも
+/// ないのに永久 prefix blocker になる — self と同じ扱いで越えられること。
+#[test]
+fn author_zero_rows_are_consumable_by_scalar_ack() {
+    let p = tmp_path("z");
+    cleanup(&p);
+    let mut eng = Engine::create_with_capacity(&p, 65_536).unwrap();
+    eng.define_table("notes", 1000).unwrap();
+    eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
+    eng.enable_sync_tables().unwrap();
+    let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
+
+    // set_peer_id 前に書く → ring に author=0 の row が入る
+    author_note(&eng, 1);
+    tick();
+    eng.set_peer_id(2);
+    author_note(&eng, 2);
+
+    let rows = ring_rows(&eng);
+    assert!(
+        rows.iter().any(|(_, a, _)| *a == 0),
+        "前提: author=0 row が ring にある (rows: {rows:?})"
+    );
+    let head_hlc = rows.iter().map(|(_, _, h)| *h).max().unwrap();
+    let head_lsn = rows.iter().map(|(l, _, _)| *l).max().unwrap();
+    let ack = eng.ack_sync_up_to_hlc(3, head_hlc).unwrap();
+    assert_eq!(
+        ack, head_lsn,
+        "author=0 row が prefix blocker になっている (ack {ack} / head {head_lsn})"
+    );
+
+    cleanup(&p);
+}
+
+/// 0.23.x 以前の降順 first-match が over-ack した `consumed_lsn` が残る DB を
+/// 模す。 walk は stored を再開点に信用せず 0 から検証し、 下方修正 (heal)
+/// する — 信用すると「真の prefix と膨張値の間の row」が未検査のまま次の
+/// reclaim で消える。
+#[test]
+fn inflated_stored_consumed_lsn_is_not_trusted() {
+    let pa = tmp_path("a4");
+    let pr = tmp_path("r4");
+    let (eng_r, t_mid, b2_min, b2_max, relayed_max) = build_mixed_ring(&pa, &pr);
+
+    // 旧実装の over-ack を再現: stored が ring 先端まで膨らんでいる。
+    eng_r.ack_sync(3, relayed_max).unwrap();
+
+    // session 最初の walk = 全 ring 検証 → 真の prefix (batch1 末尾) へ下方修正。
+    let ack = eng_r.ack_sync_up_to_hlc(3, t_mid).unwrap();
+    assert!(
+        ack > 0 && ack < b2_min,
+        "heal が効いていない (ack {ack}, batch2 {b2_min}..={b2_max})"
+    );
+
+    // reclaim しても未消化 row (batch2 / relayed) は生存すること。
+    eng_r.reclaim_sync_ops();
+    let after: Vec<u32> = ring_rows(&eng_r).iter().map(|(l, _, _)| *l).collect();
+    assert!(
+        after.contains(&b2_min) && after.contains(&b2_max) && after.contains(&relayed_max),
+        "膨張 stored を信用して未消化 row が reclaim された: {after:?}"
+    );
+
+    cleanup(&pa);
+    cleanup(&pr);
+}
+
 #[test]
 fn dead_row_is_purged_not_a_permanent_blocker() {
     let pa = tmp_path("a3");

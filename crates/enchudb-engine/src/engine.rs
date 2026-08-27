@@ -2037,6 +2037,12 @@ pub struct Engine {
     /// 配送不能) を削除して越えた回数。 0 でないなら bridge が壊れた payload を
     /// 書いたことがある (要調査) — が、 ring を permanent blocker にはしない。
     sync_dead_rows_purged: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// #217: ack prefix walk の再開点 (peer → 検証済み prefix 末尾 lsn)。
+    /// **意図的に in-memory** — 永続の `_sync_peers.consumed_lsn` は旧実装
+    /// (降順 first-match) が over-ack した値を含みうるので、 session 最初の walk は
+    /// これを信用せず lsn 0 から全 ring を検証し直す (移行 heal)。 entry の有無が
+    /// 「この session で検証済みか」の marker を兼ねる。
+    ack_walk_resume: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, u32>>>,
     /// 0.8.11 (issue: stress_10k_cycle flaky): `transfer_oplog_to_sync_ops` の
     /// 排他 lock。 0.8.0 で `concurrentize_with_oplog` の background consumer thread
     /// が自動 transfer を呼ぶようになったが、 手動 transfer との並列実行で
@@ -2358,6 +2364,7 @@ impl Engine {
             fold_race_saves: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ack_walk_resume: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
@@ -2711,6 +2718,7 @@ impl Engine {
             fold_race_saves: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ack_walk_resume: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
             faults: std::sync::Arc::new(std::array::from_fn(|_| {
@@ -3646,6 +3654,7 @@ impl Engine {
             fold_race_saves: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ack_walk_resume: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
             faults: std::sync::Arc::new(std::array::from_fn(|_| {
                 std::sync::atomic::AtomicU64::new(0)
@@ -4401,8 +4410,14 @@ impl Engine {
         peer: enchudb_oplog::PeerId,
         cursor: enchudb_oplog::Hlc,
     ) -> Result<u32, String> {
+        // author 0 は「peer identity 設定前の local 著作」 (単独 peer 運用 →
+        // 後から sync 参加、 の正規 path) — 定義上 foreign ではないので self と
+        // 同じ扱い。 除外すると set_peer_id 後に永久 prefix blocker になる
+        // (dead row ではないので削除もされない)。
         let self_peer = self.peer_id();
-        self.ack_sync_prefix(peer, &|author, hlc| author == self_peer && hlc <= cursor)
+        self.ack_sync_prefix(peer, &|author, hlc| {
+            (author == self_peer || author == 0) && hlc <= cursor
+        })
     }
 
     /// #217: author 別 cursor (vector) に基づく ack — relay 混在 ring 用の完全形。
@@ -4429,12 +4444,21 @@ impl Engine {
     /// #217 core: `consumed(author, hlc)` が **先頭から連続して成り立つ最長 prefix**
     /// の末尾 lsn へ `ack_sync(peer, lsn)` する。 前進が無ければ ack せず 0。
     ///
-    /// - **前回 ack からの再開**: prefix は peer ごとに単調なので、 走査は
-    ///   `_sync_peers.consumed_lsn` より大きい lsn だけ。 昇順 walk は「全部消化済み =
-    ///   最も健全な状態で ring 全 row を decode する」コスト反転を持つが、 再開に
-    ///   より償却で「前回 ack 以降の新規 row 数」に落ちる。 reclaim 済み row は
-    ///   必ず `lsn < watermark <= consumed_lsn(peer)` なので再開点より下 = 走査に
+    /// - **前回 walk からの再開**: prefix は peer ごとに単調なので、 走査は前回の
+    ///   検証済み末尾 (`ack_walk_resume`、 in-memory) より先だけ。 昇順 walk は
+    ///   「全部消化済み = 最も健全な状態で ring 全 row を decode する」コスト反転を
+    ///   持つが、 再開により償却で「前回 walk 以降の新規 row 数」に落ちる。
+    ///   reclaim 済み row は必ず `lsn < watermark <=` 検証済み末尾なので走査に
     ///   穴は生じない。
+    /// - **永続 `consumed_lsn` を再開点に使わない (移行 heal)**: 0.23.x 以前の
+    ///   降順 first-match は over-ack した値を `_sync_peers.consumed_lsn` に残して
+    ///   いる可能性がある。 これを再開点に信用すると「真の prefix と膨張値の間の
+    ///   row」が二度と検査されず、 次の reclaim で未消化のまま消える (#217 が
+    ///   塞いだ loss が既存 DB で一度起きる)。 そこで session 最初の walk は lsn 0
+    ///   から全 ring を検証し直し、 検証結果が stored より小さければ**下方修正で
+    ///   上書き**する (watermark が下がる = 保守側)。 残余窓: この session で一度も
+    ///   ack しない peer の膨張 stored は watermark に残る — これは 0.23.0 の
+    ///   absorb + reclaim が既に持っていた露出で、 heal はそれを厳密に縮める。
     /// - **dead row**: payload 欠落 / decode 不能な row は構造的に配送不能
     ///   (`collect_records_since` も skip する = 誰の cursor もそこを消化と証明
     ///   できない) なので、 prefix blocker にすると全 peer の ack が永久にそこで
@@ -4452,9 +4476,13 @@ impl Engine {
         let lsn_hid = self.himo_id("_sync_ops.lsn").ok_or("missing _sync_ops.lsn")? as u16;
         let payload_hid =
             self.himo_id("_sync_ops.payload").ok_or("missing _sync_ops.payload")? as u16;
-        let start = self.sync_consumed_lsn_of(peer);
+        let session_start = {
+            let guard = self.ack_walk_resume.lock().unwrap();
+            guard.get(&peer).copied()
+        };
+        let start = session_start.unwrap_or(0);
 
-        // 前回 ack より先の生存 row を lsn 昇順に。
+        // 前回 walk より先の生存 row を lsn 昇順に。
         let mut rows: Vec<(u32, u64)> = self
             .entities_with_himo(lsn_hid)
             .into_iter()
@@ -4465,7 +4493,8 @@ impl Engine {
 
         // 生存 row 無し = reclaim するものが無い。 消化の証明が無いのに先端へ ack すると
         // 「消化した」という嘘の記録になるので、 何もしない (後続の bridge を次の pull の
-        // cursor が越えたときに通常経路で ack される)。
+        // cursor が越えたときに通常経路で ack される)。 heal も不要 — 膨張 stored が
+        // 過大申告しうるのは生存 row だけで、 それが無いなら失うものが無い。
         if rows.is_empty() {
             return Ok(0);
         }
@@ -4507,8 +4536,29 @@ impl Engine {
                 }
             }
         }
+
+        // 再開点を更新 (entry の存在 = この session で検証済み、 の marker)。
+        {
+            let mut guard = self.ack_walk_resume.lock().unwrap();
+            let e = guard.entry(peer).or_insert(0);
+            let new_resume = start.max(ack_lsn);
+            if new_resume > *e {
+                *e = new_resume;
+            }
+        }
+
         if ack_lsn > 0 {
+            // session 最初の walk では stored (膨張の可能性) より小さくても上書き =
+            // 下方修正 heal。 2 回目以降は再開走査により単調前進しかしない。
             self.ack_sync(peer, ack_lsn)?;
+        } else if session_start.is_none() {
+            // session 最初の walk で prefix を 1 row も検証できなかった: 膨張 stored が
+            // 生存 row を過大申告している可能性があるので 0 に落とす (reclaim を
+            // 止める側 = 保守的)。 正しい値は後続の ack が再構築する。
+            let stored = self.sync_consumed_lsn_of(peer);
+            if stored > 0 {
+                self.ack_sync(peer, 0)?;
+            }
         }
         Ok(ack_lsn)
     }
