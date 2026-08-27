@@ -3,6 +3,96 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.22.0 — 2026-08-27
+
+**author の生涯 op 数上限 (≒ ring 容量) を撤廃した release。** peer SNS 試験機
+(sunsu2) を 24-peer Zipf chaos / celebrity fanout / ring 溢れで回して踏んだ 7 件を、
+1 つずつ根まで追って潰している。全て sync 経路の正しさ・容量の話で、 **storage
+format 変更なし** (file format v9 のまま、 旧 DB はそのまま開ける)。
+
+| 実地で見えた症状 | 直したもの |
+|---|---|
+| relay/pull-only 構成で author が数千 op 書くと、 以後の変更が一切配布されない | #149 pull-as-ack (PR #202) |
+| 一部 follower だけ永久に 0 配布になる (eager reclaim の床上げ) | reclaim の圧力 50% gate (PR #202) |
+| reclaim 1 回で消化済み follower まで全員 bootstrap 送り | #191 floor = reclaim 済み最大 HLC (PR #193) |
+| 大 burst (数万 tie) で書き込みが永久停止する livelock | #195 consumer の自 queue push 撤廃 (PR #198) |
+| `.tables` sidecar が並行 persist で消える / 壊れる (ENOENT / torn install) | #190 persist の per-engine 直列化 (PR #192) |
+| peer 1 個開くだけで write queue が 1M slot を eager 確保 | #116 scaled default + capacity knob (PR #189) |
+| foreign entity への Ref が sync で壊れる / read で peer prefix が落ちる | #183 TieRef wire (PR #187) + #184/#185 Ref read・facade (PR #186) |
+
+### #149 pull-as-ack — 生涯 op 数上限の撤廃 (PR #202)
+
+relay/gateway (pull-only) 経路には明示 ack が無く、 誰も `ack_sync` を呼ばない →
+`sync_watermark()` = 0 固定 → `_sync_ops` ring が reclaim されず満杯 → bridge が
+backpressure で stall。 **author の生涯 op 数 ≒ ring 容量** (65k-entity 構成で
+実測 971 post で stall) だった。 CHANGELOG 0.18.2 の self-ack 回避策は現行では
+二重に死んでいる (v9 で `stats().max_hlc` = None / `sync_watermark` の self 除外)
+ので、 利用側での回避も不可能だった。
+
+fix: pull cursor は durable barrier 通過後にしか前進しない = そのまま消化の
+到達証明なので、 これを transport 経由で author に還流する。
+
+- `Transport` trait に `record_pull_ack` / `take_pull_acks` を追加 (**default
+  no-op で後方互換**。 運べない transport は従来挙動)。 `InMemoryTransport` 対応済み
+- `Syncer::pull_once` が確定 cursor を自動記録、 `Syncer::publish_since` 冒頭の
+  `absorb_pull_acks` が `ack_sync_up_to_hlc` で consumed_lsn に写す。
+  **app は publish/pull を回すだけ、 新 API 呼び出し不要**
+- E2E: ring 850 row に対し 6000 op を publish/pull loop で全配布
+  (旧挙動は **846/6000 で silent stall**)
+
+**reclaim は ring 使用率 50% 超の時だけ** (ここが要)。 「ack が来たら即 reclaim」
+は 24-peer chaos が即死パターンを検出した: floor が即上昇し、 その author を
+**まだ一度も pull していない follower** (round 1 個ズレの参加 / 一時 offline) が
+cursor < floor で永久 truncation になる。 履歴は容量が許す限り保持して差分
+追いつきを最大化し、 reclaim は容量管理に徹する。 semantics の明示:
+
+- watermark は「一度でも pull して ack が届いた peer」の min。 pull したことの
+  ない peer は待たない (open topology では存在を知りようがない)
+- 一度 pull して消えた laggard は watermark を pin する (追い出し policy は未実装)
+- ack は「実在確認済み生存 row の lsn」までしか進まない = 未 pull record の
+  過剰 reclaim なし
+
+### その他の fix
+
+- **#191 (PR #193)**: history floor が「生存 record の最小 HLC (空なら Hlc::MAX)」
+  だったため、 reclaim 1 回で**全履歴消化済みの follower まで** truncation 判定に
+  なっていた。 floor = 「reclaim で消えた record の最大 HLC」 に変更し、
+  `_sync_peers` の sentinel row に永続 (reopen 後も正しく広告)。
+- **#195 (PR #198)**: consumer thread の bridge が `entity_in("_sync_ops")` 経由で
+  **自分しか drain しない write queue に blocking push** し、 満杯時に livelock。
+  drain handler が no-op の `EntityCreated` を counter 対称 bump に置換。
+  #116 の小 queue default で顕在化していた。
+- **#190 (PR #192)**: `.tables` sidecar の atomic write が同一 tmp 名を共有し、
+  consumer の定期 persist × pull 側 persist の並行で ENOENT / torn install /
+  順序逆転。 per-engine lock で serialize → write → fsync → rename を直列化。
+- **#116 (PR #189)**: write queue が容量 1M slot を eager 確保していた。 default を
+  max_entities 連動に scale + `with_queue_capacity` knob。 queue 4096 でも
+  write/read 速度は不変 (drain 分布重複を実測)。
+- **#183/#184/#185 (PR #186/#187)**: foreign entity への `tie_ref` が wire で
+  local 部しか運ばず壊れていたのを世界番号 (peer prefix 込み eid) 同乗で発送
+  (TieRef op)。 `Value::Ref` read の peer prefix 落ちと facade の eid ヘルパー
+  re-export も修正。
+
+### 既知の制限 (= 0.23 の scope)
+
+- **HTTP transport (enchu-transport) は ack / floor をまだ運ばない** — trait
+  default により旧挙動のまま動く (壊れないが ring 回転の恩恵なし)。 endpoint
+  追加は enchu-transport 側の follow-up
+- truncation された遅参 peer の復旧経路 (#140 bootstrap-first flow) は未実装 —
+  圧力 gate で発生自体は稀だが、 起きたら手動 bootstrap
+- laggard (一度 pull して消えた peer) の追い出し policy なし — watermark が
+  pin されたままだと ring は再び埋まりうる (その場合も #152 backpressure で
+  欠番は出ない)
+
+### 検証状況
+
+- workspace 1045 tests green (新規 guard: #149 ×4 / #190 / #191 ×2 / #195)
+- 実 consumer gate: sunsu2 全 18 tests green — 24-peer Zipf chaos (churn /
+  offline 窓 / restart ×2) 収束 + truncation ゼロ、 ring 容量超 1500 post flood
+  全配布、 cold backlog 1200 post の ring 回転 drain
+- fanout 実測 (M4 Max): follower catch-up 26k posts/s/core、 25 並列 62.6k
+  deliveries/s/host
+
 ## 0.21.0 — 2026-08-26
 
 **sync 経路で 「消えた / 復活した / 二重になった」 が起きる道を塞いだ release。** 2 台の
