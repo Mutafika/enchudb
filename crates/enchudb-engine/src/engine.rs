@@ -98,6 +98,49 @@ pub struct EngineStats {
 /// 計測は read-only で、 vocab 自体は変更しない。 `Tag` himo (= `get_or_insert`
 /// 経由で dedup) も live set の collection 対象 (= ある vid を Tag が参照中なら
 /// Leaf が後から orphan にしても live 判定)。
+/// **capacity 到達・edge 値・破損 file のような 「想定内だが続行不能」 な事象** (#59)。
+///
+/// embedded DB は他人の process に埋め込まれる。 「DB が一杯」 「値が範囲外」 で
+/// `panic!` すると host app ごと落ちるし、 FFI 境界を unwind すれば未定義動作になる。
+/// そこで engine 内部ではこれらを panic にせず、
+///
+/// 1. その write を **拒否** し (壊れた値を書かない)
+/// 2. 種別ごとに **計数** し (`Engine::fault_count`)
+/// 3. **rate-limited に warn** する (黙って落とさない)
+///
+/// という扱いに統一する。 `Result` を返せる API では併せて `Err` を返す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultKind {
+    /// entity 枠が満杯 (max_entities 到達 + free stack 空)
+    EntitySpace,
+    /// content data 領域が満杯 (既定 512 MB)
+    ContentSpace,
+    /// vocabulary が満杯 (vocab_max_entries 到達)
+    VocabSpace,
+    /// 値が cell に入らない (`u32::MAX` は sentinel 予約)
+    ValueOutOfRange,
+}
+
+impl FaultKind {
+    pub(crate) const COUNT: usize = 4;
+    pub(crate) fn index(self) -> usize {
+        match self {
+            FaultKind::EntitySpace => 0,
+            FaultKind::ContentSpace => 1,
+            FaultKind::VocabSpace => 2,
+            FaultKind::ValueOutOfRange => 3,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FaultKind::EntitySpace => "entity space exhausted",
+            FaultKind::ContentSpace => "content space exhausted",
+            FaultKind::VocabSpace => "vocabulary full",
+            FaultKind::ValueOutOfRange => "value out of range",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VocabOrphanStats {
     /// vocab に発行済みの全 vid 数 (= `Vocabulary::count()`)。
@@ -1785,6 +1828,10 @@ pub fn is_engine_internal_table(name: &str) -> bool {
 pub const DEFAULT_TABLE_RESERVED: u32 = 1_000_000;
 
 pub struct Engine {
+    /// #59: 「想定内だが続行不能」 な事象の種別ごとの発生回数。 panic の代替。
+    faults: std::sync::Arc<[std::sync::atomic::AtomicU64; FaultKind::COUNT]>,
+    /// fault warn の rate limit (unix ms)。 満杯状態では毎 write で warn が出るので絞る。
+    last_fault_warn_ms: std::sync::atomic::AtomicU64,
     #[allow(dead_code)]
     path: String,
     layout: Layout,
@@ -2271,6 +2318,10 @@ impl Engine {
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
+            faults: std::sync::Arc::new(std::array::from_fn(|_| {
+                std::sync::atomic::AtomicU64::new(0)
+            })),
+            last_fault_warn_ms: std::sync::atomic::AtomicU64::new(0),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
@@ -2618,6 +2669,10 @@ impl Engine {
             sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
+            faults: std::sync::Arc::new(std::array::from_fn(|_| {
+                std::sync::atomic::AtomicU64::new(0)
+            })),
+            last_fault_warn_ms: std::sync::atomic::AtomicU64::new(0),
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
@@ -3542,6 +3597,10 @@ impl Engine {
             fold_race_saves: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
+            faults: std::sync::Arc::new(std::array::from_fn(|_| {
+                std::sync::atomic::AtomicU64::new(0)
+            })),
+            last_fault_warn_ms: std::sync::atomic::AtomicU64::new(0),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
@@ -3797,10 +3856,22 @@ impl Engine {
 
         // himo_id を 1 度 lookup (= hot path での文字列引きを避ける)
         let lsn_hid = match self.himo_id("_sync_ops.lsn") { Some(h) => h as u16, None => return 0 };
-        let peer_id_hid = self.himo_id("_sync_ops.peer_id").unwrap() as u16;
-        let op_type_hid = self.himo_id("_sync_ops.op_type").unwrap() as u16;
-        let hlc_wall_lo_hid = self.himo_id("_sync_ops.hlc_wall_lo").unwrap() as u16;
-        let payload_hid = self.himo_id("_sync_ops.payload").unwrap() as u16;
+        // #59: 直前の lsn は None を graceful に扱っているのに、 ここだけ unwrap で
+        // panic していた (非対称)。 sync tables が部分定義な DB で host を殺す。
+        let (Some(peer_id_hid), Some(op_type_hid), Some(hlc_wall_lo_hid), Some(payload_hid)) = (
+            self.himo_id("_sync_ops.peer_id"),
+            self.himo_id("_sync_ops.op_type"),
+            self.himo_id("_sync_ops.hlc_wall_lo"),
+            self.himo_id("_sync_ops.payload"),
+        ) else {
+            return 0;
+        };
+        let (peer_id_hid, op_type_hid, hlc_wall_lo_hid, payload_hid) = (
+            peer_id_hid as u16,
+            op_type_hid as u16,
+            hlc_wall_lo_hid as u16,
+            payload_hid as u16,
+        );
 
         // 0.8.11: 自己再帰 sync の循環を断つ filter。
         // `_sync_ops` / `_sync_peers` 配下の write (= ack_sync の watermark
@@ -5361,21 +5432,52 @@ impl Engine {
 
     // ──── entity ────
 
+    /// anonymous entity を払い出す。
+    ///
+    /// # Panics
+    /// - anonymous table が closed (= `define_table` 済み) のとき — 使い方の誤り
+    /// - **entity 枠が満杯のとき** — host process を殺したくない caller は
+    ///   [`Engine::try_entity`] を使うこと (#59)
     pub fn entity(&self) -> enchudb_oplog::EntityId {
+        match self.try_entity() {
+            Ok(eid) => eid,
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// [`Engine::entity`] の非 panic 版 (#59)。
+    ///
+    /// embedded DB は他人の process に埋め込まれるので、 「entity 枠が満杯」 という
+    /// 想定内事象で host を殺してはいけない。 満杯なら `Err` を返し、 engine 側では
+    /// `FaultKind::EntitySpace` として計数 + rate-limited warn する。
+    /// 空き枠は `remaining_eid_space()` で事前に見られる。
+    pub fn try_entity(&self) -> Result<enchudb_oplog::EntityId, String> {
         use std::sync::atomic::Ordering;
         self.check_writable();
         // β-light step 3: anonymous table が closed (= 既に define_table が
-        // 呼ばれた) なら entity() は panic。 entity_in を使うこと。
+        // 呼ばれた) なら entity() は使えない。 entity_in を使うこと。
         let anon_hi = self.tables[ANONYMOUS_TABLE as usize].eid_range_hi;
         if anon_hi != u32::MAX {
-            panic!(
+            return Err(
                 "anonymous table is closed (define_table was called); \
                  use entity_in('<table>') instead of entity()"
+                    .to_string(),
             );
         }
         // 上限到達後の `allocate` は free stack から slot を再利用する。
         // 再利用なら前の住人の版数を落としてから渡す (entity_in の再利用枝と同じ)。
-        let (local, reused) = self.entities.allocate_tracked();
+        let Some((local, reused)) = self.entities.allocate_tracked() else {
+            self.record_fault(
+                FaultKind::EntitySpace,
+                "entity() で払い出す枠が無い (max_entities 到達 + free stack 空)",
+            );
+            return Err(format!(
+                "entity space exhausted: max_entities={} and the free stack is empty — \
+                 delete entities to free slots, or recreate the DB with a larger \
+                 create_with_capacity (remaining_eid_space() で残量が見られる)",
+                self.entities.max_entities(),
+            ));
+        };
         if reused {
             self.clear_cell_versions(local);
         }
@@ -5396,7 +5498,7 @@ impl Engine {
             self.apply_count.fetch_add(1, Ordering::Release);
         }
         let peer = self.peer_id.load(Ordering::Acquire);
-        enchudb_oplog::make_eid(peer, local)
+        Ok(enchudb_oplog::make_eid(peer, local))
     }
 
     pub fn entities(&self) -> Vec<enchudb_oplog::EntityId> {
@@ -5420,6 +5522,47 @@ impl Engine {
     /// 0.7.0: 残り eid 空間 (= max_entities - 既存 table の eid_range_hi の max)。
     /// schema crate が `define_table` を呼ぶ前に「table 1 個分にどれだけ割けるか」
     /// 判断する用。
+    /// #59: 「想定内だが続行不能」 な事象を記録する。 **panic の代替**。
+    ///
+    /// 呼び出し側は必ず 「その write を拒否する」 ところまでやること
+    /// (記録だけして壊れた値を書いたら、 panic より悪い)。
+    pub(crate) fn record_fault(&self, kind: FaultKind, detail: &str) {
+        use std::sync::atomic::Ordering;
+        self.faults[kind.index()].fetch_add(1, Ordering::Relaxed);
+        // 満杯状態では write ごとに来るので 1/s に絞る。 「黙って落とす」 のを
+        // 避けるのが目的なので、 完全に消してはいけない。
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = self.last_fault_warn_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= 1000
+            && self
+                .last_fault_warn_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            eprintln!(
+                "[enchudb] warning: {} — write rejected: {detail} \
+                 (rate-limited to 1/s; 累計は Engine::fault_count で見られる)",
+                kind.as_str(),
+            );
+        }
+    }
+
+    /// #59: 種別ごとの fault 発生回数。 0 でないなら **その分の write が拒否されている**。
+    pub fn fault_count(&self, kind: FaultKind) -> u64 {
+        self.faults[kind.index()].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #59: fault 総数 (全種別)。 監視の 1 本目の指標に。
+    pub fn fault_total(&self) -> u64 {
+        self.faults
+            .iter()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .sum()
+    }
+
     pub fn remaining_eid_space(&self) -> u32 {
         let used = self.tables.iter().map(|t| {
             if t.eid_range_hi == u32::MAX {
@@ -6546,7 +6689,14 @@ impl Engine {
             return false;
         }
         self.entities.ensure_live(local);
-        self.contents.set(local, key, data);
+        if !self.contents.set(local, key, data) {
+            // #59: content data 領域が満杯。 panic せず拒否 + 計上。
+            self.record_fault(
+                FaultKind::ContentSpace,
+                "content data region is full — content write rejected",
+            );
+            return false;
+        }
         // issue #47 fix: Tie 経路と同じ理由で next_local を前進させる。
         Self::advance_table_next_local_for(&self.tables, local);
         if self.gossip_remote_apply() {
@@ -6885,13 +7035,32 @@ impl Engine {
             ValueType::Leaf => self.vocab.insert(value.as_bytes()),
             ht => panic!("tie_text on non-text himo '{}': {:?}", himo, ht),
         };
+        if vid == u32::MAX {
+            // #59: vocab 満杯 → `insert`/`get_or_insert` が予約 sentinel を返した。
+            // panic せず write を拒否 + 計上 (sentinel を cell に書くと read 側が
+            // 「値なし」 と区別できない壊れ方をする)。
+            self.record_fault(
+                FaultKind::VocabSpace,
+                "vocabulary is full (vocab_max_entries 到達) — text write rejected. \
+                 GrowableOptions { vocab_max_entries: Some(n), .. } で上げられるが、\
+                 header 焼き込みなので既存 DB は再作成が必要",
+            );
+            return;
+        }
         self.himos[hid].set(eid, vid);
     }
 
     pub fn tie(&mut self, eid: enchudb_oplog::EntityId, himo: &str, value: u32) {
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
-        assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
+        if value == u32::MAX {
+            // #59: sentinel 値は cell に入らない。 panic せず write を拒否 + 計上。
+            self.record_fault(
+                FaultKind::ValueOutOfRange,
+                "tie value == u32::MAX (sentinel reserved)",
+            );
+            return;
+        }
         let hid = self.ensure_himo(himo, ValueType::Number, 0);
         debug_assert!(self.value_types[hid] == ValueType::Number || self.value_types[hid] == ValueType::Ref, "tie on non-Value himo '{}'", himo);
         // β-light step 6: eid が himo の所属 table eid_range 内か
@@ -6905,7 +7074,13 @@ impl Engine {
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
         let target_eid = enchudb_oplog::eid_local(target_eid);
-        assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
+        if target_eid == u32::MAX {
+            self.record_fault(
+                FaultKind::ValueOutOfRange,
+                "tie_ref target_eid >= u32::MAX (sentinel reserved)",
+            );
+            return;
+        }
         let hid = self.ensure_himo(himo, ValueType::Ref, 0);
         debug_assert!(self.value_types[hid] == ValueType::Ref || self.value_types[hid] == ValueType::Number, "tie_ref on non-Ref himo '{}'", himo);
         // β-light step 6: eid が himo の所属 table eid_range 内か
@@ -6968,6 +7143,18 @@ impl Engine {
             ValueType::Leaf => self.vocab.insert(value.as_bytes()),
             ht => panic!("tie_text_to_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
+        if vid == u32::MAX {
+            // #59: vocab 満杯 → `insert`/`get_or_insert` が予約 sentinel を返した。
+            // panic せず write を拒否 + 計上 (sentinel を cell に書くと read 側が
+            // 「値なし」 と区別できない壊れ方をする)。
+            self.record_fault(
+                FaultKind::VocabSpace,
+                "vocabulary is full (vocab_max_entries 到達) — text write rejected. \
+                 GrowableOptions { vocab_max_entries: Some(n), .. } で上げられるが、\
+                 header 焼き込みなので既存 DB は再作成が必要",
+            );
+            return;
+        }
         // WAL に Vocab + Tie を流す。 schema layer (enchudb-schema) は同期版の
         // tie_text_to を経由するため、 ここで append しないと WAL が空のままで
         // peer 同期が成立しない (publish 側が iter_committed で 0 件を見る).
@@ -7065,6 +7252,18 @@ impl Engine {
             ValueType::Leaf => self.vocab.insert(value),
             ht => panic!("tie_bytes_to_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
+        if vid == u32::MAX {
+            // #59: vocab 満杯 → `insert`/`get_or_insert` が予約 sentinel を返した。
+            // panic せず write を拒否 + 計上 (sentinel を cell に書くと read 側が
+            // 「値なし」 と区別できない壊れ方をする)。
+            self.record_fault(
+                FaultKind::VocabSpace,
+                "vocabulary is full (vocab_max_entries 到達) — text write rejected. \
+                 GrowableOptions { vocab_max_entries: Some(n), .. } で上げられるが、\
+                 header 焼き込みなので既存 DB は再作成が必要",
+            );
+            return;
+        }
         // reserved table への write は oplog 再 append を skip (= 2 重書き防止)。
         // request17 step 4: Vocab → Tie/TieNamed の順に append し (transport は HLC 順に
         // 配るので依存順を崩せない)、 Tie に載った HLC で値と版数を書く。
@@ -7107,7 +7306,14 @@ impl Engine {
     pub fn tie_to_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: u32) {
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
-        assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
+        if value == u32::MAX {
+            // #59: sentinel 値は cell に入らない。 panic せず write を拒否 + 計上。
+            self.record_fault(
+                FaultKind::ValueOutOfRange,
+                "tie value == u32::MAX (sentinel reserved)",
+            );
+            return;
+        }
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
@@ -7142,7 +7348,13 @@ impl Engine {
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
         let target_eid = enchudb_oplog::eid_local(target_eid);
-        assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
+        if target_eid == u32::MAX {
+            self.record_fault(
+                FaultKind::ValueOutOfRange,
+                "tie_ref target_eid >= u32::MAX (sentinel reserved)",
+            );
+            return;
+        }
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
@@ -9487,7 +9699,14 @@ impl Engine {
                 // legacy (pre-0.9 WAL): 旧 content region へ replay。 0.9.0 以降は
                 // Op::Content を emit しないので、 旧 DB の WAL 再生でのみ通る。
                 let local = enchudb_oplog::eid_local(*eid);
-                self.contents.set(local, key, data);
+                if !self.contents.set(local, key, data) {
+                    // #59: content data 領域が満杯。 panic せず拒否 + 計上。
+                    self.record_fault(
+                        FaultKind::ContentSpace,
+                        "content data region is full — content write rejected",
+                    );
+                    return;
+                }
                 self.entities.ensure_live(local);
                 Self::advance_table_next_local_for(&self.tables, local);
             }
@@ -10396,7 +10615,14 @@ impl Engine {
         use std::sync::atomic::Ordering;
         self.check_writable();
         let local = enchudb_oplog::eid_local(eid);
-        assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
+        if value == u32::MAX {
+            // #59: sentinel 値は cell に入らない。 panic せず write を拒否 + 計上。
+            self.record_fault(
+                FaultKind::ValueOutOfRange,
+                "tie value == u32::MAX (sentinel reserved)",
+            );
+            return;
+        }
         debug_assert!((himo_id as usize) < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         // β-light step 6: eid が himo の所属 table eid_range 内か (anonymous
@@ -10499,7 +10725,15 @@ impl Engine {
             ValueType::Leaf => self.vocab.insert(value),
             ht => panic!("tie_bytes_async_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
-        assert!(vid < u32::MAX, "vocab vid must be < u32::MAX (sentinel reserved)");
+        if vid == u32::MAX {
+            // #59: vocab 満杯 (insert が sentinel を返した) or sentinel 値。
+            self.record_fault(
+                FaultKind::VocabSpace,
+                "vocab vid == u32::MAX — text write rejected (vocab_max_entries 到達か \
+                 sentinel 値)。 GrowableOptions { vocab_max_entries: Some(n), .. } を参照",
+            );
+            return;
+        }
         // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
         // request17 step 4: Vocab は cell を持たない (= 版数の対象外) が、 record queue は
         // 版数付きで運ぶので Tie の手前で 1 個採番しておく (WAL 上の並びと HLC の
@@ -10554,7 +10788,13 @@ impl Engine {
         self.check_writable();
         let local = enchudb_oplog::eid_local(eid);
         let target_local = enchudb_oplog::eid_local(target_eid);
-        assert!(target_local < u32::MAX, "target_local must be < u32::MAX");
+        if target_local == u32::MAX {
+            self.record_fault(
+                FaultKind::ValueOutOfRange,
+                "tie_ref target_local == u32::MAX (sentinel reserved)",
+            );
+            return;
+        }
         debug_assert!((himo_id as usize) < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         // β-light step 6: eid が himo の所属 table eid_range 内か

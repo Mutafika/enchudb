@@ -187,21 +187,38 @@ impl Syncer {
     /// WAL 有効な Engine を作るには `Engine::open_concurrent_with_oplog` /
     /// `Engine::create_concurrent_with_oplog` を使うこと。
     pub fn new(engine: Arc<Engine>, transport: Arc<dyn Transport>) -> Self {
-        let wal = engine.oplog_arc().unwrap_or_else(|| {
-            panic!(
+        match Self::try_new(engine, transport) {
+            Ok(s) => s,
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// [`Syncer::new`] の非 panic 版 (#59)。
+    ///
+    /// `new` の 2 つの前提 (WAL 有効 / sync tables 有効) は 「使い方の誤り」 なので
+    /// loud に止めるのが既定だが、 embedded DB を host app に埋め込む caller は
+    /// process を殺さずに判断したい。 前提を満たさなければ `Err` を返す。
+    pub fn try_new(
+        engine: Arc<Engine>,
+        transport: Arc<dyn Transport>,
+    ) -> Result<Self, String> {
+        let Some(wal) = engine.oplog_arc() else {
+            return Err(
                 "Syncer requires a WAL-enabled Engine. \
                  Use Engine::open_concurrent_with_oplog / create_concurrent_with_oplog \
                  instead of Engine::open / create."
-            )
-        });
+                    .to_string(),
+            );
+        };
         // 0.8.0: sync 配信の primary は `_sync_ops` 一本、 legacy oplog iter
         // fallback は撤去。 `Database::enable_sync()` (= `enable_sync_tables`) を
         // 呼んでない engine で Syncer を attach するのは fatal。
         if !engine.sync_tables_enabled() {
-            panic!(
+            return Err(
                 "Syncer requires sync tables (_sync_ops / _sync_peers). \
                  Call Database::enable_sync() / Engine::enable_sync_tables() before \
                  attaching Syncer."
+                    .to_string(),
             );
         }
         // 0.8.0: oplog auto_reset を OFF にする hack は撤去。 publish path が
@@ -231,7 +248,7 @@ impl Syncer {
         if !engine.has_cell_version() {
             syncer.hydrate_hlc_store(&engine);
         }
-        syncer
+        Ok(syncer)
     }
 
     /// `last_pulled` の永続化先を設定し、 既存ファイルから cursor をロードする。
