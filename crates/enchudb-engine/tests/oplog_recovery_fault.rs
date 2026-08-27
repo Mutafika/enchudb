@@ -40,7 +40,7 @@ fn make_durable(path: &str, n: u32) -> HashMap<u32, u32> {
     let vhid = define(&eng, "v");
     let mut written = HashMap::new();
     for i in 0..n {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         let v = i % VMAX;
         eng.tie_async_by_id(e, vhid, v);
         written.insert(eid_local(e), v);

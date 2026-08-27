@@ -41,7 +41,7 @@ fn scale_persists_across_reopen() {
                 Engine::create_growable_with_leaf(&path, 1000, None, None, scale).unwrap();
             eng.define_himo("body", ValueType::Leaf, 0);
             for v in vals {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_text(e, "body", v);
             }
             // 同 session でも読める
@@ -78,7 +78,7 @@ fn reclaim_works_at_each_scale() {
         cleanup(&path);
         let mut eng = Engine::create_growable_with_leaf(&path, 1000, None, None, scale).unwrap();
         eng.define_himo("body", ValueType::Leaf, 0);
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_text(e, "body", "0123456789");
         let fp1 = eng.leaf_footprint().unwrap();
         // 同サイズ 30 回 re-tie → 旧 slot を free して再利用 → footprint 不変

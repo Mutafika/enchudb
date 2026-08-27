@@ -75,7 +75,7 @@ fn bench_tie(c: &mut Criterion) {
     let path = tmp("tie_plain");
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("v", ValueType::Number, 100);
-    let eid = eng.entity();
+    let eid = eng.entity().unwrap();
 
     let mut group = c.benchmark_group("tie");
     group.throughput(Throughput::Elements(1));
@@ -104,7 +104,7 @@ fn bench_pull_raw(c: &mut Criterion) {
     let mut eng = Engine::create_with_capacity(&path, 100_000).unwrap();
     eng.define_himo("age", ValueType::Number, 100);
     for i in 0..10_000u32 {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "age", i % 100);
     }
     eng.rebuild();
@@ -137,7 +137,7 @@ fn bench_query(c: &mut Criterion) {
     eng.define_himo("age", ValueType::Number, 100);
     eng.define_himo("dept", ValueType::Number, 20);
     for i in 0..10_000u32 {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "age", i % 100);
         eng.tie(e, "dept", i % 20);
     }
@@ -175,7 +175,7 @@ fn bench_snapshot_export(c: &mut Criterion) {
         let mut eng = Engine::create_with_capacity(&path, 2_000).unwrap();
         eng.define_himo("v", ValueType::Number, 100);
         for i in 0..1_000u32 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "v", i % 100);
         }
         eng.flush().unwrap();
@@ -226,7 +226,7 @@ fn bench_audit(c: &mut Criterion) {
     let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(1);
     for i in 0..1_000u32 {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_async(e, "v", i % 100);
     }
     eng.oplog_commit();
@@ -265,10 +265,10 @@ fn bench_tie_async(c: &mut Criterion) {
     eng.set_peer_id(1);
 
     // 1 entity を事前確保して reuse する。 `b.iter` は warmup + 100 samples で
-    // 数千万 iteration になるため、 毎回 `eng.entity()` で slot を取ると
+    // 数千万 iteration になるため、 毎回 `eng.entity().unwrap()` で slot を取ると
     // `DEFAULT_MAX_ENTITIES = 16M` に当たって panic する (#tie_async bench
     // fragility)。 ここでは tie 自体の cost を測りたいので eid は固定。
-    let eid = eng.entity();
+    let eid = eng.entity().unwrap();
 
     let mut group = c.benchmark_group("tie_async");
     group.throughput(Throughput::Elements(1));
@@ -314,7 +314,7 @@ fn bench_scale(c: &mut Criterion) {
         .collect();
     for t in 0..10 {
         for _ in 0..10_000 {
-            table_eids[t].push(eng.entity());
+            table_eids[t].push(eng.entity().unwrap());
         }
     }
     for t in 0..10 {
@@ -489,7 +489,7 @@ fn bench_churn_read(c: &mut Criterion) {
     eng.define_himo("cat", ValueType::Number, 100);
     let mut churn_eids = Vec::new();
     for i in 0..10_000u32 {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "cat", i % 100);
         if i % 100 <= 1 {
             churn_eids.push(e); // value 0/1 に居る eid (計 200)

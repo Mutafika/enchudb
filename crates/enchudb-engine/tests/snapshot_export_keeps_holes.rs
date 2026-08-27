@@ -63,7 +63,7 @@ fn snapshot_export_does_not_materialize_the_holes() {
     eng.define_himo("age", ValueType::Number, 0);
     let mut eids = Vec::new();
     for i in 0..1000u32 {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_to(e, "age", i);
         eids.push(e);
     }

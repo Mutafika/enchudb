@@ -127,7 +127,7 @@ fn main() {
     let t_ins = Instant::now();
     for (table_idx, (_, himos)) in tbls.iter().enumerate() {
         for i in 0..n {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             // この entity は自 table の himo だけを tie
             for (h_idx, &(name, _)) in himos.iter().enumerate() {
                 let val = (i.wrapping_mul(31).wrapping_add(h_idx as u32 * 17 + table_idx as u32 * 13)) % 1000;

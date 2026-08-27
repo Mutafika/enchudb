@@ -36,7 +36,7 @@ fn main() {
     match scenario {
         "normal" => {
             for i in 0..count {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_async(e, "n", i);
             }
             eng.flush_writes();
@@ -44,7 +44,7 @@ fn main() {
         }
         "no_commit" => {
             for i in 0..count {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_async(e, "n", i);
             }
             eng.flush_writes();
@@ -53,7 +53,7 @@ fn main() {
         }
         "no_sync" => {
             for i in 0..count {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_async(e, "n", i);
             }
             eng.flush_writes();
@@ -64,7 +64,7 @@ fn main() {
         "abort_mid" => {
             let half = count / 2;
             for i in 0..half {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_async(e, "n", i);
             }
             eng.flush_writes();
@@ -74,7 +74,7 @@ fn main() {
             // 前半は確実に耐久化されている
             // ここから後半を書いて、fsync せずに abort
             for i in half..count {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_async(e, "n", i);
             }
             // abort()は Drop を走らせずにプロセス終了(SIGABRT 相当)
@@ -83,7 +83,7 @@ fn main() {
         "loop_writes" => {
             let mut i = 0u32;
             loop {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_async(e, "n", i % 1000);
                 i += 1;
                 if i % 1000 == 0 {
@@ -99,7 +99,7 @@ fn main() {
         }
         "sleep_after" => {
             for i in 0..count {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_async(e, "n", i);
             }
             eng.flush_writes();
@@ -120,7 +120,7 @@ fn main() {
             // 5. abort で Drop を skip (= consumer thread の周期 fsync も走らず)
             //
             // 結果: mmap disk = 新値、 WAL disk = 空。 再起動時に mmap だけ進んでる状態。
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie_async(e, "n", 42);
             eng.flush_writes();
             eng.body_msync().unwrap();
@@ -137,7 +137,7 @@ fn main() {
 
             let mut i = 0u32;
             loop {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_async(e, "n", i % 1000);
                 i += 1;
                 if i.is_multiple_of(500) {

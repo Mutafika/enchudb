@@ -22,7 +22,7 @@ fn content_roundtrip_and_reopen() {
     let path = tmp("roundtrip");
     {
         let mut eng = Engine::create_standalone(&path).expect("create");
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.content(e, "memo", b"hello world");
         eng.content(e, "data", &[0xDE, 0xAD, 0xBE, 0xEF]);
         assert_eq!(eng.get_content(e, "memo"), Some(b"hello world".as_ref()));
@@ -46,7 +46,7 @@ fn content_roundtrip_and_reopen() {
 fn colliding_keys_are_independent() {
     let path = tmp("collide");
     let mut eng = Engine::create_standalone(&path).expect("create");
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.content(e, "memo", b"private");
     eng.content(e, "summary", b"public");
     assert_eq!(
@@ -72,7 +72,7 @@ fn colliding_keys_are_independent() {
 fn delete_clears_content() {
     let path = tmp("delete");
     let mut eng = Engine::create_standalone(&path).expect("create");
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.content(e, "secret", b"classified");
     assert!(eng.get_content(e, "secret").is_some());
     eng.delete(e);
@@ -92,7 +92,7 @@ fn content_async_survives_wal_recovery() {
     let e;
     {
         let eng = Engine::open_concurrent_with_oplog(&path, 1 << 20).expect("open");
-        e = eng.entity();
+        e = eng.entity().unwrap();
         eng.content_async(e, "blob", b"survives crash");
         eng.oplog_commit();
         eng.flush_writes();

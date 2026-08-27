@@ -28,7 +28,7 @@ fn dirty_reopen_does_not_commit_full_index_region() {
     if std::env::var("ENCHU_DIRTY_HELPER").is_ok() {
         let path = std::env::var("ENCHU_DIRTY_PATH").unwrap();
         let mut eng = Engine::open_standalone(&path).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_text(e, "tag", "x");
         std::process::exit(0);
     }
@@ -45,7 +45,7 @@ fn dirty_reopen_does_not_commit_full_index_region() {
         let mut eng = Engine::create_growable_with_capacity(p, 262_144).unwrap();
         eng.define_himo("tag", ValueType::Tag, 1000);
         for i in 0..5 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie_text(e, "tag", &format!("v{i}"));
         }
         eng.flush().unwrap();

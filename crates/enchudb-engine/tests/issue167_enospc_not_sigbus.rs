@@ -53,7 +53,7 @@ fn full_disk_rejects_writes_instead_of_sigbus() {
     );
 
     // ここまでは正常に書けること (前提の確認)
-    let warm = eng.try_entity().expect("枠はある");
+    let warm = eng.entity().expect("枠はある");
     eng.tie(warm, "n", 1);
     eng.tie_text(warm, "t", "before-full");
     assert_eq!(eng.get(warm, "n"), Some(1));
@@ -67,7 +67,7 @@ fn full_disk_rejects_writes_instead_of_sigbus() {
     // 枠 (create_growable_tiny = 1024) を使い切らない範囲に留める — 最後の
     // 「空きが戻れば書ける」 確認で 1 個必要なため。
     for i in 0..500u32 {
-        let Ok(e) = eng.try_entity() else { break };
+        let Ok(e) = eng.entity() else { break };
         eng.tie(e, "n", i);
         eng.tie_text(e, "t", &format!("payload-{i}-{}", "x".repeat(512)));
         eids.push(e);
@@ -102,7 +102,7 @@ fn full_disk_rejects_writes_instead_of_sigbus() {
 
     // 空きが戻れば書けること (状態が brick していない = sticky にしていない)
     eng.set_space_margin(0);
-    let after = eng.try_entity().expect("枠はある");
+    let after = eng.entity().expect("枠はある");
     eng.tie_text(after, "t", "after-recovery");
     assert_eq!(
         eng.get_text(after, "t"),

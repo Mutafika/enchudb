@@ -100,7 +100,7 @@ fn setup(tag: &str) -> (String, Engine, u64) {
     cleanup(&path);
     let mut eng = Engine::create_growable_opts(&path, GrowableOptions::default()).unwrap();
     eng.define_himo("body", ValueType::Leaf, 0);
-    let eid = eng.entity();
+    let eid = eng.entity().unwrap();
     eng.tie_text(eid, "body", "init-0000000000000000");
     (path, eng, eid)
 }

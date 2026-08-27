@@ -34,7 +34,7 @@ fn sustained_10k_writes_and_reopen() {
 
     let eng = Engine::open_concurrent_with_oplog(&path, 64 * 1024 * 1024).unwrap();
     for i in 0..10_000u32 {
-        let ent = eng.entity();
+        let ent = eng.entity().unwrap();
         eng.tie_async(ent, "v", i % 100);
     }
     eng.flush_writes();
@@ -63,7 +63,7 @@ fn parallel_10_writers() {
         let e = Arc::clone(&eng);
         handles.push(std::thread::spawn(move || {
             for i in 0..1_000u32 {
-                let ent = e.entity();
+                let ent = e.entity().unwrap();
                 e.tie_async(ent, "v", t * 1000 + i);
             }
         }));
@@ -97,7 +97,7 @@ fn repeated_drop_recover_cycles() {
     for cycle in 0..cycles {
         let eng = Engine::open_concurrent_with_oplog(&path, 64 * 1024 * 1024).unwrap();
         for i in 0..per_cycle {
-            let ent = eng.entity();
+            let ent = eng.entity().unwrap();
             eng.tie_async(ent, "v", (cycle * 1000 + i) as u32);
         }
         eng.flush_writes();
@@ -124,7 +124,7 @@ fn content_heavy_load() {
     let eng = Engine::open_concurrent_with_oplog(&path, 64 * 1024 * 1024).unwrap();
     let payload: Vec<u8> = (0..1024u16).map(|i| (i & 0xff) as u8).collect();
     for i in 0..1000u32 {
-        let ent = eng.entity();
+        let ent = eng.entity().unwrap();
         eng.tie_async(ent, "id", i);
         eng.content_async(ent, "blob", &payload);
     }
@@ -159,7 +159,7 @@ fn heavy_1m_writes() {
     let eng = Engine::open_concurrent_with_oplog(&path, 512 * 1024 * 1024).unwrap();
     let t0 = Instant::now();
     for i in 0..1_000_000u32 {
-        let ent = eng.entity();
+        let ent = eng.entity().unwrap();
         eng.tie_async(ent, "v", i % 10_000);
     }
     eng.flush_writes();
@@ -214,7 +214,7 @@ fn random_ops_fuzz_30s() {
         match r {
             0..=60 => {
                 // 60% tie new
-                let ent = eng.entity();
+                let ent = eng.entity().unwrap();
                 eng.tie_async(ent, "k", (next() % 1000) as u32);
                 live_eids.push(ent);
             }

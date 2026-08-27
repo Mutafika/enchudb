@@ -55,7 +55,7 @@ fn open_with_row(path: &str) -> (Arc<Engine>, u64, u16, u16) {
     eng.define_himo("b", ValueType::Number, 0);
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, CAP).unwrap();
     eng.set_peer_id(PEER);
-    let eid = eng.entity();
+    let eid = eng.entity().unwrap();
     let ha = eng.himo_id("a").expect("himo a") as u16;
     let hb = eng.himo_id("b").expect("himo b") as u16;
     // remote 経路で書く = cell に版数が載る (local write でも載るが、 版数を
@@ -221,7 +221,7 @@ fn a_migrated_row_whose_delete_was_interrupted_is_finished_too() {
         eng.define_himo("a", ValueType::Number, 0);
         eng.define_himo("b", ValueType::Number, 0);
         assert!(!eng.has_cell_version(), "前提が崩れた: v9 領域を持っている");
-        let eid = eng.entity();
+        let eid = eng.entity().unwrap();
         eng.tie_to(eid, "a", 11);
         eng.tie_to(eid, "b", 22);
         eng.flush().unwrap();
@@ -271,7 +271,7 @@ fn the_audit_count_excludes_rows_recreated_after_the_delete() {
     interrupt_delete_at_tombstone(&eng, broken, hlc(200));
 
     // (2) 削除の後に作り直された行 = 修復対象ではない。
-    let recreated = eng.entity();
+    let recreated = eng.entity().unwrap();
     assert!(eng.remote_tie_apply(recreated, ha, 1, hlc(100), None));
     assert!(eng.set_tombstone(recreated, hlc(200)));
     assert!(eng.remote_tie_apply(recreated, ha, 2, hlc(300), None));

@@ -46,12 +46,12 @@ fn single_condition_routes_to_owner_peer() {
     let eng_b = make_sharded_peer(&pb, 2, &[("size", ValueType::Number)]);
 
     // A に entity 作って color=5 を tie
-    let e1 = eng_a.entity();
+    let e1 = eng_a.entity().unwrap();
     eng_a.tie_to(e1, "color", 5);
     eng_a.rebuild();
 
     // B に entity 作って size=10 を tie
-    let e2 = eng_b.entity();
+    let e2 = eng_b.entity().unwrap();
     eng_b.tie_to(e2, "size", 10);
     eng_b.rebuild();
 
@@ -149,11 +149,11 @@ fn two_condition_query_crosses_shards() {
     let eng_b = make_sharded_peer(&pb, 2, &[("size", ValueType::Number)]);
 
     // A に entity e_a で color=3、B に別 entity e_b で size=5
-    let e_a = eng_a.entity();
+    let e_a = eng_a.entity().unwrap();
     eng_a.tie_to(e_a, "color", 3);
     eng_a.rebuild();
 
-    let e_b = eng_b.entity();
+    let e_b = eng_b.entity().unwrap();
     eng_b.tie_to(e_b, "size", 5);
     eng_b.rebuild();
 

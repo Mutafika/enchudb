@@ -55,7 +55,7 @@ fn make_v5_bytes(path: &str) -> (Vec<u8>, Vec<String>, String) {
     ];
     let tag = "note".to_string();
     for lv in &leaves {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_text(e, "body", lv);
         eng.tie_text(e, "kind", &tag);
     }
@@ -155,7 +155,7 @@ fn migrate_bytes_already_v6_is_noop() {
     )
     .unwrap();
     eng.define_himo("body", ValueType::Leaf, 0);
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie_text(e, "body", "already v6");
     eng.flush().unwrap();
     drop(eng);
@@ -184,7 +184,7 @@ fn migrate_file_roundtrip() {
         .unwrap();
         eng.define_himo("body", ValueType::Leaf, 0);
         for lv in ["alpha", "beta value", "gamma"] {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie_text(e, "body", lv);
         }
         assert!(eng.leaf_footprint().is_none());

@@ -18,7 +18,7 @@ fn main() {
     eng.define_himo("dept", ValueType::Number, 20); // dense cap 20 (schema 層は 0)
     eng.define_himo("salary", ValueType::Number, 1000);
     for i in 0..n {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "dept", i % 20);
         eng.tie(e, "salary", (i * 7 + 13) % 1000);
     }

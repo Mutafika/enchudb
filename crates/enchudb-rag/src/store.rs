@@ -183,7 +183,8 @@ impl RagStore {
         if chunk.vector.len() != self.dim {
             return Err(Error::DimMismatch { expected: self.dim, got: chunk.vector.len() });
         }
-        let eid = self.db.entity();
+        // #59: entity 枠が満杯なら panic せず Err。
+        let eid = self.db.entity().map_err(Error::Engine)?;
         self.apply_meta(eid, &chunk.meta)?;
         if !chunk.text.is_empty() {
             self.db.content(eid, TEXT_KEY, chunk.text.as_bytes());

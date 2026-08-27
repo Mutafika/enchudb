@@ -47,7 +47,7 @@ fn run(path: &str, cap: u32) -> (u64, u64, u64) {
         let mut eng = Engine::create_growable_with_capacity(path, cap).unwrap();
         eng.define_himo("kind", ValueType::Tag, 100);
         for i in 0..LIVE_VOCAB {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie_text(e, "kind", &format!("kind-{i}"));
         }
         eng.flush().unwrap();

@@ -49,7 +49,7 @@ fn ten_million_insert_and_lookup() {
 
     let t0 = Instant::now();
     for i in 0..10_000_000u32 {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "bucket", i % 1000);
         eng.tie(e, "flag", i % 4);
     }
@@ -98,7 +98,7 @@ fn one_million_flush_reopen_cycle() {
         let mut eng = Engine::create_with_capacity(&path, 1_000_000).unwrap();
         eng.define_himo("v", ValueType::Number, 100);
         for i in 0..1_000_000u32 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "v", i % 100);
         }
         eng.rebuild();
@@ -137,7 +137,7 @@ fn high_cardinality_100k_unique_values() {
 
     let t0 = Instant::now();
     for i in 0..100_000u32 {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "uid", i);
     }
     eng.rebuild();

@@ -68,7 +68,7 @@ fn concurrent_pull_during_writes() {
 
     // writer: value 7 を大量 tie_async
     for _ in 0..n {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_async_by_id(e, vhid, 7);
     }
     eng.flush_writes();
@@ -95,7 +95,7 @@ fn update_stale_filtered_by_verify() {
         Engine::create_concurrent_with_oplog(path, 8 * 1024 * 1024).expect("create");
     let vhid = define(&eng, "v");
 
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie_async_by_id(e, vhid, 7);
     eng.flush_writes();
     assert_eq!(eng.pull_raw("v", 7).len(), 1);
@@ -109,7 +109,7 @@ fn update_stale_filtered_by_verify() {
     assert_eq!(eng.pull_raw("v", 8).len(), 1, "更新後の値が引けない");
 
     // 別 entity を 7 に足す → 7 が復活（stale と混ざらない）
-    let e2 = eng.entity();
+    let e2 = eng.entity().unwrap();
     eng.tie_async_by_id(e2, vhid, 7);
     eng.flush_writes();
     let got = eng.pull_raw("v", 7);
@@ -140,7 +140,7 @@ fn concurrent_sync_writes_from_many_threads() {
             let eng = eng.clone();
             std::thread::spawn(move || {
                 for i in 0..PER {
-                    let e = eng.entity();
+                    let e = eng.entity().unwrap();
                     // 全 thread が同じ value 空間を叩く = 同一 bucket への並行 write を最大化
                     eng.tie_to_by_id(e, vhid, (t * PER + i) % VALUES);
                 }

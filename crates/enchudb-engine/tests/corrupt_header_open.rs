@@ -27,7 +27,7 @@ fn tmp(name: &str) -> String {
 
 fn make_db(path: &str) {
     let mut eng = Engine::create_compact(path).unwrap();
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie(e, "age", 30);
 }
 

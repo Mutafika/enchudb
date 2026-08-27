@@ -170,7 +170,7 @@ fn get_content_owned_matches_borrow_and_survives_rewrite() {
     let eng = std::sync::Arc::new(
         Engine::create_growable_opts(&path, GrowableOptions::default()).expect("create"),
     );
-    let eid = eng.entity();
+    let eid = eng.entity().unwrap();
     let bodies: Vec<String> = (0..5).map(|i| format!("c{}-{}", i, "y".repeat(48 + i * 61))).collect();
     eng.content(eid, "body", bodies[0].as_bytes());
 

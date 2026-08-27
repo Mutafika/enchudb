@@ -137,7 +137,7 @@ fn main() {
 
     let t_ins = Instant::now();
     for i in 0..n {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "tenant", i % 10);
         eng.tie(e, "dept",   (i / 10) % 8);
         eng.tie(e, "role",   (i / 80) % 4);

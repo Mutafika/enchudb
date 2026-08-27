@@ -49,7 +49,7 @@ fn flush_writes_waits_for_all_ties_including_entity_created_path() {
         let eng = eng.clone();
         std::thread::spawn(move || {
             for i in 0..per {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_async_by_id(e, marker_hid, marker_vid);
                 eng.tie_async_by_id(e, value_hid, i);
             }

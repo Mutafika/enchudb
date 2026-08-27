@@ -29,7 +29,7 @@ fn parallel_readers_during_writes() {
     eng.define_himo("k", ValueType::Number, 32);
 
     // 初期データを撒く
-    let eids: Vec<u64> = (0..2_000).map(|_| eng.entity()).collect();
+    let eids: Vec<u64> = (0..2_000).map(|_| eng.entity().unwrap()).collect();
     for (i, &e) in eids.iter().enumerate() {
         eng.tie(e, "k", (i as u32) % 32);
     }
@@ -106,7 +106,7 @@ fn read_after_flush_sees_writes() {
     // entity を撒きつつ tie_async
     let mut eids = Vec::with_capacity(n as usize);
     for _ in 0..n {
-        eids.push(arc.entity());
+        eids.push(arc.entity().unwrap());
     }
     for (i, &e) in eids.iter().enumerate() {
         arc.tie_async(e, "v", (i as u32) % 100);
@@ -140,7 +140,7 @@ fn unbounded_queue_handles_burst() {
     let path = tmp("unbounded_burst");
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("k", ValueType::Number, 50);
-    let eids: Vec<u64> = (0..10_000).map(|_| eng.entity()).collect();
+    let eids: Vec<u64> = (0..10_000).map(|_| eng.entity().unwrap()).collect();
 
     let arc = Engine::concurrentize(eng);
 
@@ -173,7 +173,7 @@ fn flush_writes_drains_fully() {
     let path = tmp("flush_drains");
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("a", ValueType::Number, 10);
-    let eids: Vec<u64> = (0..5_000).map(|_| eng.entity()).collect();
+    let eids: Vec<u64> = (0..5_000).map(|_| eng.entity().unwrap()).collect();
 
     let arc = Engine::concurrentize(eng);
 
@@ -197,7 +197,7 @@ fn drop_while_reading() {
     let path = tmp("drop_reading");
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("k", ValueType::Number, 16);
-    let eids: Vec<u64> = (0..500).map(|_| eng.entity()).collect();
+    let eids: Vec<u64> = (0..500).map(|_| eng.entity().unwrap()).collect();
     for (i, &e) in eids.iter().enumerate() {
         eng.tie(e, "k", (i as u32) % 16);
     }
@@ -240,7 +240,7 @@ fn drop_with_pending_writes() {
     let path = tmp("drop_pending");
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("k", ValueType::Number, 50);
-    let eids: Vec<u64> = (0..3_000).map(|_| eng.entity()).collect();
+    let eids: Vec<u64> = (0..3_000).map(|_| eng.entity().unwrap()).collect();
 
     let arc = Engine::concurrentize(eng);
 
@@ -287,7 +287,7 @@ fn multiple_async_writers() {
         handles.push(thread::spawn(move || {
             let mut local_eids = Vec::with_capacity(per_writer as usize);
             for _ in 0..per_writer {
-                local_eids.push(arc.entity());
+                local_eids.push(arc.entity().unwrap());
             }
             for (i, &e) in local_eids.iter().enumerate() {
                 arc.tie_async(e, "g", ((w as u32) + (i as u32)) % 8);
@@ -321,7 +321,7 @@ fn reader_sees_consistent_snapshot() {
     eng.define_himo("c", ValueType::Number, 16);
 
     let n_ent: u32 = 1_000;
-    let eids: Vec<u64> = (0..n_ent).map(|_| eng.entity()).collect();
+    let eids: Vec<u64> = (0..n_ent).map(|_| eng.entity().unwrap()).collect();
     for (i, &e) in eids.iter().enumerate() {
         eng.tie(e, "c", (i as u32) % 16);
     }
@@ -400,7 +400,7 @@ fn long_running_query_during_writes() {
     eng.define_himo("b", ValueType::Number, 20);
 
     let n_ent: u32 = 2_000;
-    let eids: Vec<u64> = (0..n_ent).map(|_| eng.entity()).collect();
+    let eids: Vec<u64> = (0..n_ent).map(|_| eng.entity().unwrap()).collect();
     for (i, &e) in eids.iter().enumerate() {
         eng.tie(e, "a", (i as u32) % 20);
         eng.tie(e, "b", (i as u32 / 20) % 20);
@@ -481,7 +481,7 @@ fn panic_in_reader_doesnt_corrupt() {
     let path = tmp("panic_reader");
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("k", ValueType::Number, 16);
-    let eids: Vec<u64> = (0..500).map(|_| eng.entity()).collect();
+    let eids: Vec<u64> = (0..500).map(|_| eng.entity().unwrap()).collect();
     for (i, &e) in eids.iter().enumerate() {
         eng.tie(e, "k", (i as u32) % 16);
     }
@@ -518,7 +518,7 @@ fn panic_in_reader_doesnt_corrupt() {
     assert_eq!(total, 500, "engine lost data after reader panic");
 
     // 書き込みもまだできる
-    let new_e = arc.entity();
+    let new_e = arc.entity().unwrap();
     arc.tie_async(new_e, "k", 7);
     arc.flush_writes();
     let after = arc.pull_raw("k", 7);

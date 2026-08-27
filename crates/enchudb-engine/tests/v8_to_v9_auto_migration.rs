@@ -54,7 +54,7 @@ fn make_pre_v9(path: &str) -> u16 {
     let hid = eng.himo_id("age").unwrap() as u16;
     assert!(!eng.has_cell_version(), "前提が崩れた: v9 領域を持っている");
     for i in 0..3u32 {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_to(e, "age", 100 + i);
     }
     eng.flush().unwrap();
@@ -183,7 +183,7 @@ fn already_v9_is_untouched() {
         let mut eng = Engine::create_with_capacity(&path, 4096).unwrap();
         eng.define_himo("age", ValueType::Number, 0);
         assert!(eng.has_cell_version());
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_to(e, "age", 7);
         eng.flush().unwrap();
     }

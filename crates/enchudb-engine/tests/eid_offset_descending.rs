@@ -43,7 +43,7 @@ fn descending_eid_tie_does_not_explode() {
     // entity slot を昇順に確保 (= eid 0..N が allocate される)
     let mut eids = Vec::with_capacity(N as usize);
     for _ in 0..N {
-        eids.push(eng.entity());
+        eids.push(eng.entity().unwrap());
     }
 
     // tie は降順 (eid N-1 → 0) で投入。 BucketCylinder の `ensure_positions`
@@ -95,7 +95,7 @@ fn mixed_high_then_low_eid_tie() {
 
     let mut eids = Vec::with_capacity(N as usize);
     for _ in 0..N {
-        eids.push(eng.entity());
+        eids.push(eng.entity().unwrap());
     }
 
     // 後半 (eid N/2..N) を先に昇順で tie → offset が N/2 で固定

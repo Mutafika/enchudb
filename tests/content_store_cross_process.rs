@@ -25,7 +25,7 @@ fn drop_without_sync_persists_data_end() {
 
     let e1 = {
         let mut eng = Engine::create_standalone(&path).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.content(e, "body", b"first process data");
         // flush() / sync() は意図的に呼ばない。drop だけ。
         e
@@ -34,7 +34,7 @@ fn drop_without_sync_persists_data_end() {
     // 2 回目の open、別 entity に異なる content を書く。
     let e2 = {
         let mut eng = Engine::open_standalone(&path).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.content(e, "body", b"second process data");
         e
     };
@@ -59,7 +59,7 @@ fn many_short_lived_writes_do_not_corrupt() {
     for i in 0..20 {
         let mut eng = Engine::open_standalone(&path).ok()
             .unwrap_or_else(|| Engine::create_standalone(&path).unwrap());
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         let body = format!("hook event #{i}, timestamp={}", i * 1000);
         eng.content(e, "body", body.as_bytes());
         entities.push((e, body));

@@ -44,7 +44,7 @@ fn churn_storm_exact() {
     let rounds = 40u32;
 
     // entity を確保して初期値を張る。
-    let eids: Vec<_> = (0..n).map(|_| eng.entity()).collect();
+    let eids: Vec<_> = (0..n).map(|_| eng.entity().unwrap()).collect();
     for (i, &e) in eids.iter().enumerate() {
         eng.tie_async_by_id(e, vhid, (i as u32) % VALUES);
     }
@@ -144,7 +144,7 @@ fn crash_recovery_compacts() {
         let eng: Arc<Engine> =
             Engine::create_concurrent_with_oplog(path, 32 * 1024 * 1024).expect("create");
         let vhid = define(&eng, "v", ValueType::Number);
-        let eids: Vec<_> = (0..n).map(|_| eng.entity()).collect();
+        let eids: Vec<_> = (0..n).map(|_| eng.entity().unwrap()).collect();
         // 3 回張り替えて各 bucket に stale を作る。
         for pass in 0..3u32 {
             for (i, &e) in eids.iter().enumerate() {
@@ -224,7 +224,7 @@ fn grow_under_read() {
     // value = lid % 100（1 は reader が読む固定 bucket、 他は配列を伸ばすため散らす）。
     let n = 200_000u32;
     for _ in 0..n {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         let lid = enchudb_oplog::eid_local(e);
         eng.tie_async_by_id(e, vhid, lid % 100);
     }

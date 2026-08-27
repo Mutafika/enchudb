@@ -77,7 +77,7 @@ fn leaf_read_while_write_torn_read() {
     let hid = define(&eng, "body", ValueType::Leaf);
 
     // entity を確保して gen 0 を張る。
-    let eids: Vec<_> = (0..N_ENTITIES).map(|_| eng.entity()).collect();
+    let eids: Vec<_> = (0..N_ENTITIES).map(|_| eng.entity().unwrap()).collect();
     for (e, &eid) in eids.iter().enumerate() {
         eng.tie_text_to_by_id(eid, hid, &body_for(0, e));
     }

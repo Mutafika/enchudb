@@ -88,7 +88,7 @@ use enchudb::{Engine, ValueType};
 let db = Engine::create_standalone("/tmp/my.db")?;
 db.define_himo("age", ValueType::Number, 100);
 
-let alice = db.entity();
+let alice = db.entity().unwrap();
 db.tie(alice, "age", 30);
 db.tie_text(alice, "city", "Tokyo");
 
@@ -190,7 +190,7 @@ create presets: `--default` / `--compact` / `--growable` (default) / `--tiny`.
 ```rust
 let db = Engine::create_concurrent_with_oplog("/tmp/my.db", 256 * 1024 * 1024)?;
 
-let e = db.entity();
+let e = db.entity().unwrap();
 db.tie_async(e, "age", 30);
 db.oplog_sync()?;     // fsync + msync
 // or oplog_commit() for a background fsync (Async mode)
@@ -317,8 +317,10 @@ can carry an error return one.
 ```rust
 use enchudb::FaultKind;
 
-eng.try_entity();                             // Err when the eid space is exhausted
-                                              // (entity() still panics — documented)
+eng.entity();                                 // Result — Err when the eid space is
+                                              // exhausted, or when the anonymous table
+                                              // is closed (entity_in is the one to use
+                                              // then). Same shape as entity_in().
 eng.fault_count(FaultKind::EntitySpace);      // refused: no eid slots left
 eng.fault_count(FaultKind::VocabSpace);       // refused: vocab_max_entries reached
 eng.fault_count(FaultKind::ContentSpace);     // refused: content region full

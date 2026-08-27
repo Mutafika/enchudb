@@ -93,14 +93,14 @@ fn scenario_a(n: u32) {
 
         // value 7 に巨大 bucket を仕込む（reader の clone を重くする）。
         for _ in 0..prefill {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie_async_by_id(e, hid, 7);
         }
         eng.flush_writes();
 
         // 計測対象 entity を timing の外で先に確保（entity() の allocation noise を除外、
         // 測るのは純粋に tie_async → consumer drain の経路）。
-        let eids: Vec<_> = (0..n).map(|_| eng.entity()).collect();
+        let eids: Vec<_> = (0..n).map(|_| eng.entity().unwrap()).collect();
 
         let stop = Arc::new(AtomicBool::new(false));
         let reads = Arc::new(AtomicU64::new(0));
@@ -163,7 +163,7 @@ fn scenario_b(n: u32) {
 
     // value 7 に bucket を仕込む。
     for _ in 0..prefill {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_async_by_id(e, hid, 7);
     }
     eng.flush_writes();
@@ -195,7 +195,7 @@ fn scenario_b(n: u32) {
             while !stop.load(Ordering::Relaxed)
                 && applied.load(Ordering::Relaxed) < hammer_budget as u64
             {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_async_by_id(e, hid, 7);
                 applied.fetch_add(1, Ordering::Relaxed);
             }
@@ -241,7 +241,7 @@ fn scenario_c(n: u32) {
 
     let before = rss_mb();
     // 10k cardinality に散らす（bucket 平均 ~200、 現実的な分布）。&mut tie は cylinder も live 更新。
-    let eids: Vec<_> = (0..n).map(|_| eng.entity()).collect();
+    let eids: Vec<_> = (0..n).map(|_| eng.entity().unwrap()).collect();
     for (i, &e) in eids.iter().enumerate() {
         eng.tie(e, "v", (i as u32) % 10_000);
     }

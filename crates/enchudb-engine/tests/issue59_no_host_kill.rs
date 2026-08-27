@@ -8,7 +8,7 @@
 //!
 //! なので engine 内部ではこれらを panic にせず、 **write を拒否 + 種別ごとに計数 +
 //! rate-limited warn** に統一する (`FaultKind` / `Engine::fault_count`)。 `Result` を
-//! 返せる API では併せて `Err` を返す (`try_entity` 等)。
+//! 返せる API では併せて `Err` を返す (`entity()` / `entity_in()` 等)。
 //!
 //! ここでは 「昔 panic していた入力で panic しないこと」 と 「拒否が観測できること」 を
 //! 両方見る。 拒否だけして数えないのは 「黙って落とす」 で、 panic より悪い。
@@ -31,7 +31,7 @@ fn tmp(tag: &str) -> String {
     p
 }
 
-/// entity 枠を使い切っても panic しない。 `try_entity` が `Err`、 fault が計上される。
+/// entity 枠を使い切っても panic しない。 `entity()` が `Err`、 fault が計上される。
 #[test]
 fn entity_space_exhaustion_returns_err_instead_of_panicking() {
     let path = tmp("entity-space");
@@ -40,7 +40,7 @@ fn entity_space_exhaustion_returns_err_instead_of_panicking() {
     let mut made = 0usize;
     let mut last_err: Option<String> = None;
     for _ in 0..64 {
-        match eng.try_entity() {
+        match eng.entity() {
             Ok(_) => made += 1,
             Err(e) => {
                 last_err = Some(e);
@@ -69,7 +69,7 @@ fn sentinel_value_is_rejected_not_panicked() {
     let path = tmp("sentinel");
     let mut eng = Engine::create_standalone(&path).expect("create");
     eng.define_himo("age", ValueType::Number, 100);
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
 
     eng.tie(e, "age", u32::MAX); // 旧実装は assert! で panic
 
@@ -107,7 +107,7 @@ fn vocabulary_full_rejects_text_writes_instead_of_panicking() {
     // 天井 (4) を必ず越える数の *別々の* 値を張る
     let mut eids = Vec::new();
     for i in 0..32 {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_text(e, "city", &format!("city-{i}"));
         eids.push((e, format!("city-{i}")));
     }

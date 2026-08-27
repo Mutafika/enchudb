@@ -32,7 +32,7 @@ fn body_msync_handles_dirty_range_correctly() {
     // 何回か writes + body_msync を交互に走らせて、 異常終了しないこと。
     for batch in 0..5 {
         for i in 0..1000u32 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie_async_by_id(e, marker_hid, 1);
             eng.tie_async_by_id(e, value_hid, batch * 1000 + i);
         }
@@ -64,7 +64,7 @@ fn oplog_sync_with_dirty_range() {
     let k_hid = eng.himo_id("k").unwrap() as u16;
 
     for i in 0..200u32 {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_async_by_id(e, k_hid, i);
     }
     eng.oplog_sync().expect("oplog_sync");

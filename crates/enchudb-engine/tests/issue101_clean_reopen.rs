@@ -54,7 +54,7 @@ fn graceful_close_skips_rebuild_crash_does_not() {
     {
         let eng = Engine::create_concurrent_with_oplog(path, CAP).expect("create");
         define_tag(&eng, "tag");
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_text_async(e, "tag", "hello");
         eng.flush_writes();
         eng.oplog_sync().expect("durable");
@@ -103,7 +103,7 @@ fn explicit_flush_clean_marks_clean() {
 
     let eng = Engine::create_concurrent_with_oplog(path, CAP).expect("create");
     define_tag(&eng, "tag");
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie_text_async(e, "tag", "alpha");
     eng.flush_writes();
     assert!(!eng.vocab_index_is_clean(), "insert 後に clean のままはおかしい");
@@ -115,7 +115,7 @@ fn explicit_flush_clean_marks_clean() {
     );
 
     // 続けて vocab insert すると dirty に戻る (#77-M1 保護)
-    let e2 = eng.entity();
+    let e2 = eng.entity().unwrap();
     eng.tie_text_async(e2, "tag", "beta");
     eng.flush_writes();
     assert!(!eng.vocab_index_is_clean());
@@ -133,7 +133,7 @@ fn readonly_close_stays_nondestructive() {
     {
         let eng = Engine::create_concurrent_with_oplog(path, CAP).expect("create");
         define_tag(&eng, "tag");
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_text_async(e, "tag", "hello");
         eng.flush_writes();
     } // graceful close → clean
