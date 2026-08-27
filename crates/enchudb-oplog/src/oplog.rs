@@ -1124,6 +1124,23 @@ impl OpLog {
     /// (head==checkpoint ⇒ body へ msync 済 && pending==0) を満たす領域は crash recovery
     /// にも sync にも不要なので、 無条件に畳んでよい。 `auto_reset` フラグは vestigial。
     pub fn try_reset(&self) -> bool {
+        self.try_reset_if(|| true)
+    }
+
+    /// `try_reset` の述語つき版。 `fold_safe` は **`append_lock` 保持中に、 fold の
+    /// 直前に**評価される。
+    ///
+    /// 呼び出し側が lock の外で 「畳んでよいか」 を判定してから `try_reset` を呼ぶと、
+    /// 判定と fold の間に他 thread の append + `advance_checkpoint` が割り込める
+    /// (check-then-act)。 その窓を通ると 「判定時は bridge 済みだったが fold 時には
+    /// 未 bridge record が居る」 状態で ring を畳んでしまい、 その record は WAL ごと
+    /// 消えて **sync から無言で欠落**する (engine の `wal_fold_safe` が防いでいる
+    /// はずのもの)。 述語を lock 下で再評価することで窓を閉じる。
+    ///
+    /// `fold_safe` は `append_lock` を保持したまま呼ばれるので、 この OpLog の
+    /// append 系 API を再入的に呼んではならない (`head` / `checkpoint` /
+    /// `pending_writes` の読みと scan 系は lock を取らないので安全)。
+    pub fn try_reset_if(&self, fold_safe: impl FnOnce() -> bool) -> bool {
         // #77-M8: append_lock で append と直列化。 旧実装は pending_writes
         // チェックと head CAS の間に窓があり、 その間に進入した append の
         // record が reset で head 外に落ちて喪失 + stale record 復活が起きた。
@@ -1133,6 +1150,8 @@ impl OpLog {
         let cp = self.checkpoint.load(Ordering::Acquire);
         if head != cp || head <= HEADER_SIZE as u64 { return false; }
         if self.pending_writes.load(Ordering::Acquire) > 0 { return false; }
+        // lock 下での再評価。 ここで false なら畳まない (= 未 bridge record を守る)。
+        if !fold_safe() { return false; }
         if self.head.compare_exchange(head, HEADER_SIZE as u64, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return false;
         }

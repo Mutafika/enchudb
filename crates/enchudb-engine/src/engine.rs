@@ -1940,6 +1940,14 @@ pub struct Engine {
     /// consumer thread が背景 fsync 後に新規 commit を `_sync_ops` へ転送する。
     /// `enable_sync_tables` 有効化前は使われない (= 0)、 後は単調前進。
     sync_ops_offset: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// fold ↔ bridge の check-then-act を lock 下の再検証で弾いた回数。
+    /// `wal_fold_safe()` (lock 外) が true を返した後、 `try_reset_if` の述語
+    /// (lock 内) が false になった = まさにその窓を踏んだケース。 0 でないことは
+    /// 「この race は実在し、 再検証が実際に record を救っている」 の証拠になる。
+    fold_race_saves: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// bridge cursor が head を追い越した (= fold ↔ transfer の lost update) のを
+    /// 検出して巻き戻した回数。 0 でないなら直列化が破れている。
+    sync_ops_cursor_repairs: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// 0.8.11 (issue: stress_10k_cycle flaky): `transfer_oplog_to_sync_ops` の
     /// 排他 lock。 0.8.0 で `concurrentize_with_oplog` の background consumer thread
     /// が自動 transfer を呼ぶようになったが、 手動 transfer との並列実行で
@@ -2258,6 +2266,8 @@ impl Engine {
             sync_ops_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 enchudb_oplog::oplog::HEADER_SIZE as u64,
             )),
+            fold_race_saves: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
@@ -2604,6 +2614,8 @@ impl Engine {
             sync_ops_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 enchudb_oplog::oplog::HEADER_SIZE as u64,
             )),
+            fold_race_saves: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
@@ -3527,6 +3539,8 @@ impl Engine {
             sync_ops_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 enchudb_oplog::oplog::HEADER_SIZE as u64,
             )),
+            fold_race_saves: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
@@ -3758,6 +3772,7 @@ impl Engine {
         let _guard = self.transfer_lock.lock().unwrap();
 
         let from = self.sync_ops_offset.load(Ordering::Acquire);
+        let trace = Self::trace_bridge_enabled();
         // #77-H4: cursor は「読み切った commit 済み group の終端」までしか
         // 進めない。 scan 後の wal.head() 再読は、 書き込み途中 record での
         // break 位置〜head 間の record を恒久 skip していた (#63 と同 class)。
@@ -3766,9 +3781,17 @@ impl Engine {
         // ため。 これが無いと group 全体を retry することになり、 backlog が ring 容量を
         // 超えると先頭 K 件を永久に再挿入し続けて進行しない。
         let (records, committed_end) = wal.iter_committed_from_with_offsets(from);
+        if trace {
+            eprintln!(
+                "[bridge] scan from={from} committed_end={committed_end} head={} cp={} records={}",
+                wal.head(),
+                wal.checkpoint(),
+                records.len(),
+            );
+        }
         if records.is_empty() {
             // 空 commit group だけ読み進んだ場合も cursor は安全に前進できる
-            self.sync_ops_offset.store(committed_end, Ordering::Release);
+            self.advance_sync_ops_cursor(from, committed_end);
             return 0;
         }
 
@@ -3944,7 +3967,7 @@ impl Engine {
                     //   ちょうど 1 回だけ挿入され、 重複も損失も進行不能も無い。
                     //   ring が空けば必ず続きから再開する。
                     if let Some(end) = done_end {
-                        self.sync_ops_offset.store(end, Ordering::Release);
+                        self.advance_sync_ops_cursor(from, end);
                     }
                     if !self.warned_sync_ops_full.swap(true, Ordering::Relaxed) {
                         eprintln!(
@@ -3959,6 +3982,16 @@ impl Engine {
             };
             count += 1;
             let lsn = self.next_sync_lsn.fetch_add(1, Ordering::AcqRel);
+            if trace {
+                eprintln!(
+                    "[bridge]   row lsn={lsn} eid={row_eid} op={:?}",
+                    match &rec.op {
+                        enchudb_oplog::oplog::DecodedOp::Tie { value, himo_id, .. } =>
+                            format!("Tie(himo={himo_id},val={value})"),
+                        other => format!("{other:?}"),
+                    }
+                );
+            }
             self.tie_to_by_id(row_eid, lsn_hid, lsn);
             self.tie_to_by_id(row_eid, peer_id_hid, rec.author_peer);
             // DecodedOp variant を tag (Tie=0, Untie=1, Delete=2, Content=3, Commit=4, Vocab=5, TieNamed=6, TieLeaf=7, TieRef=8)
@@ -4003,10 +4036,40 @@ impl Engine {
         // 全部転送できた、 offset を「読み切った commit 済み終端」に進める (#77-H4)。
         // committed_end は最後の Commit record の直後なので、 最終 record の終端
         // (done_end) より必ず先に居る。
-        self.sync_ops_offset.store(committed_end, Ordering::Release);
+        if trace {
+            eprintln!("[bridge] done inserted={count} offset:={committed_end}");
+        }
+        self.advance_sync_ops_cursor(from, committed_end);
         // 満杯が解消して完走した — 次の満杯では再び warn する
         self.warned_sync_ops_full.store(false, Ordering::Relaxed);
         count
+    }
+
+    /// transfer の cursor 前進。 **入口で読んだ `from` からの CAS** で行う。
+    ///
+    /// transfer は入口で `from` を読み、 scan → row insert のあと最後に cursor を
+    /// store する。 その間に fold が cursor を巻き戻していた場合、 素の store は
+    /// 巻き戻しを stale 値で上書きしてしまう (= cursor が head を追い越して固定、
+    /// 新 ring の record が永久に scan 対象外)。 CAS が外れたら **store しない**:
+    /// 巻き戻し後の位置から読み直され、 最悪 重複配布で済む (apply は冪等)。
+    ///
+    /// 呼び出し側は `transfer_lock` を保持しているので平常時 CAS は必ず成功する。
+    /// 失敗は 「fold との直列化が破れた」 の signal なので数える。
+    fn advance_sync_ops_cursor(&self, from: u64, to: u64) {
+        use std::sync::atomic::Ordering;
+        if self
+            .sync_ops_offset
+            .compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.sync_ops_cursor_repairs.fetch_add(1, Ordering::Relaxed);
+            if Self::trace_bridge_enabled() {
+                eprintln!(
+                    "[bridge] cursor CAS lost ({from} → {to}); keeping {} (fold が巻き戻した)",
+                    self.sync_ops_offset.load(Ordering::Acquire),
+                );
+            }
+        }
     }
 
     /// oplog ring buffer が `try_reset` で head を HEADER_SIZE に巻き戻したとき、
@@ -4043,7 +4106,28 @@ impl Engine {
         let offset = self
             .sync_ops_offset
             .load(std::sync::atomic::Ordering::Acquire);
-        if offset >= wal.head() {
+        let head = wal.head();
+        // cursor が head を **追い越している** のは不整合。 起きうる道は fold の
+        // 巻き戻しと in-flight transfer の store の race (lost update) で、 この状態を
+        // `offset >= head` として 「追いつき済み」 と読むと、 新 ring に積まれた
+        // 未 bridge record を畳み続けて無言の恒久欠落になる (実測: 300 iter で 1 件)。
+        // 畳まず、 cursor を ring 先頭に戻して拾い直させる (= 最悪 重複配布、
+        // apply は冪等なので損失より軽い)。 黙って直さない — 数えて警告する。
+        if offset > head {
+            self.sync_ops_cursor_repairs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.sync_ops_offset.store(
+                enchudb_oplog::oplog::HEADER_SIZE as u64,
+                std::sync::atomic::Ordering::Release,
+            );
+            eprintln!(
+                "[enchudb] warning: sync bridge cursor ({offset}) overtook oplog head ({head}) — \
+                 rewound to ring start to avoid dropping un-bridged records \
+                 (records already delivered may be re-sent; apply is idempotent)"
+            );
+            return false;
+        }
+        if offset >= head {
             return true;
         }
         // offset < head でも、 WAL が「Commit 1 個すら append できない」満杯
@@ -4064,6 +4148,58 @@ impl Engine {
             return records.is_empty();
         }
         false
+    }
+
+    /// `ENCHU_TRACE_BRIDGE=1` のときだけ有効になる、 oplog→`_sync_ops` bridge と
+    /// ring fold の系列トレース。 「`oplog_sync()` は成功したのに record が
+    /// `_sync_ops` に無い」 類の欠落は、 事後状態 (head/checkpoint/offset) だけでは
+    /// どの段で落ちたか判別できないため、 段ごとに出す。
+    pub fn trace_bridge_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("ENCHU_TRACE_BRIDGE").is_ok_and(|v| v != "0"))
+    }
+
+    /// `try_reset_if` の述語として `append_lock` 保持下で呼ばれる `wal_fold_safe`。
+    ///
+    /// 判定内容は `wal_fold_safe` と同一。 違いは **false だった回数を数える**点だけ。
+    /// lock 外の pre-check が true を返した後にここで false になるのは、 pre-check と
+    /// fold の間に append + `advance_checkpoint` が割り込んだ場合だけなので、
+    /// この counter は check-then-act の窓を踏んだ回数そのものになる。
+    pub fn wal_fold_safe_locked(&self) -> bool {
+        let safe = self.wal_fold_safe();
+        if !safe {
+            self.fold_race_saves
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        safe
+    }
+
+    /// fold (`try_reset` + `reset_sync_ops_offset`) を `transfer_oplog_to_sync_ops`
+    /// と直列化するための guard。 fold は cursor を巻き戻すので、 cursor を最後に
+    /// store する transfer と並走してはならない (lost update → 恒久欠落)。
+    pub fn transfer_lock_for_fold(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.transfer_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// bridge cursor が head を追い越したのを検出して修復した回数（観測用）。
+    /// 平常時は 0。 増えていれば fold と transfer の直列化が破れている。
+    pub fn sync_ops_cursor_repairs(&self) -> u64 {
+        self.sync_ops_cursor_repairs
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// bridge cursor の現在値（観測用）。
+    pub fn sync_ops_bridge_offset(&self) -> u64 {
+        self.sync_ops_offset.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// fold ↔ bridge の check-then-act を lock 下の再検証で弾いた回数（観測用）。
+    /// 増えていれば「その窓を踏んだが record は守られた」。
+    pub fn fold_race_saves(&self) -> u64 {
+        self.fold_race_saves
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// WAL がこれ以上いかなる record も受け付けない満杯か（観測用）。
@@ -9729,7 +9865,28 @@ impl Engine {
                             // 0.18.2: bridge が未読領域を残している間（ring 満杯の
                             // backpressure 中）は畳まない。 畳むと未 bridge record が
                             // 消えて sync から無言で欠落する（実機発現）。
-                            if engine.wal_fold_safe() && wal.try_reset() {
+                            if Engine::trace_bridge_enabled() {
+                                eprintln!(
+                                    "[fold] try head={} cp={} offset={} safe={}",
+                                    wal.head(),
+                                    wal.checkpoint(),
+                                    engine.sync_ops_bridge_offset(),
+                                    engine.wal_fold_safe(),
+                                );
+                            }
+                            // fold は bridge cursor を巻き戻す (`reset_sync_ops_offset`)。
+                            // in-flight の `transfer_oplog_to_sync_ops` は入口で読んだ
+                            // `from` を元に **最後に** cursor を store するので、 fold と
+                            // 並走すると巻き戻しが stale 値で上書きされ、 cursor が head を
+                            // 追い越したまま固定する (= 新 ring の record が永久に scan
+                            // 対象外 + `wal_fold_safe` が offset>=head を「追いつき済み」と
+                            // 誤読して畳み続ける = 無言の恒久欠落)。 transfer と同じ lock を
+                            // 取って直列化する。 lock 順は transfer_lock → append_lock で
+                            // transfer 自身 (row insert → append) と同じなので deadlock しない。
+                            let fold_guard = engine.transfer_lock_for_fold();
+                            if engine.wal_fold_safe()
+                                && wal.try_reset_if(|| engine.wal_fold_safe_locked())
+                            {
                                 emit_offset_for_thread.store(
                                     enchudb_oplog::oplog::HEADER_SIZE as u64,
                                     Ordering::Release,
@@ -9738,6 +9895,7 @@ impl Engine {
                                 // これが無いと reset 後の record が sync 欠落する。
                                 engine.reset_sync_ops_offset();
                             }
+                            drop(fold_guard);
                             last_fsync = Instant::now();
                         }
                     }
@@ -9810,7 +9968,28 @@ impl Engine {
                             // short-lived writer (events.ecdb の log_event 等) でも
                             // 次 open が full のまま始まらないようにするため。
                             // 0.18.2: こちらも bridge 未読領域があるうちは畳まない。
-                            if engine.wal_fold_safe() && wal.try_reset() {
+                            if Engine::trace_bridge_enabled() {
+                                eprintln!(
+                                    "[fold] try head={} cp={} offset={} safe={}",
+                                    wal.head(),
+                                    wal.checkpoint(),
+                                    engine.sync_ops_bridge_offset(),
+                                    engine.wal_fold_safe(),
+                                );
+                            }
+                            // fold は bridge cursor を巻き戻す (`reset_sync_ops_offset`)。
+                            // in-flight の `transfer_oplog_to_sync_ops` は入口で読んだ
+                            // `from` を元に **最後に** cursor を store するので、 fold と
+                            // 並走すると巻き戻しが stale 値で上書きされ、 cursor が head を
+                            // 追い越したまま固定する (= 新 ring の record が永久に scan
+                            // 対象外 + `wal_fold_safe` が offset>=head を「追いつき済み」と
+                            // 誤読して畳み続ける = 無言の恒久欠落)。 transfer と同じ lock を
+                            // 取って直列化する。 lock 順は transfer_lock → append_lock で
+                            // transfer 自身 (row insert → append) と同じなので deadlock しない。
+                            let fold_guard = engine.transfer_lock_for_fold();
+                            if engine.wal_fold_safe()
+                                && wal.try_reset_if(|| engine.wal_fold_safe_locked())
+                            {
                                 emit_offset_for_thread.store(
                                     enchudb_oplog::oplog::HEADER_SIZE as u64,
                                     std::sync::atomic::Ordering::Release,
@@ -9818,6 +9997,7 @@ impl Engine {
                                 // #63 regression fix: bridge cursor も巻き戻す。
                                 engine.reset_sync_ops_offset();
                             }
+                            drop(fold_guard);
                         }
                         return;
                     }
@@ -9887,6 +10067,13 @@ impl Engine {
             // transfer しないと「committed だが bridge 未了」の record が wipe され
             // sync から永久に消える (sync lib テスト flaky の第 2 の根)。
             if self.sync_tables_enabled() {
+                if Self::trace_bridge_enabled() {
+                    eprintln!(
+                        "[sync] after checkpoint: head={} cp={} durable_head={durable_head}",
+                        wal.head(),
+                        wal.checkpoint(),
+                    );
+                }
                 self.transfer_oplog_to_sync_ops();
             }
             // changefeed: durable 化したので listener へ即時 push
@@ -11410,6 +11597,113 @@ mod tests {
     fn qc(eng: &Engine, conds: &[(&str, u32)]) -> usize {
         eng.rebuild();
         eng.query(conds).len()
+    }
+
+    /// **fold の cursor 巻き戻しは、 巻き戻し前の `from` を握った in-flight transfer の
+    /// store に上書きされてはならない。**
+    ///
+    /// `transfer_oplog_to_sync_ops` は入口で `from` を読み、 最後に cursor を進める。
+    /// その間に fold (`try_reset` + `reset_sync_ops_offset`) が入ると、 素の store は
+    /// 巻き戻しを stale 値で上書きし、 cursor が head を追い越したまま固定する。
+    /// そうなると scan は永久に 0 件、 かつ `wal_fold_safe` が `offset >= head` を
+    /// 「追いつき済み」 と誤読して畳み続けるので、 新 ring の record は無言で恒久欠落する
+    /// (実測: 300 iter の stress で ~15% の run で 1 件消えた)。
+    #[test]
+    fn stale_transfer_store_cannot_clobber_a_fold_rewind() {
+        let path = tmp("bridge_cursor_clobber");
+        for suffix in ["", ".oplog", ".tables", ".crc", ".lock"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
+        {
+            let mut eng = Engine::create_standalone(&path).unwrap();
+            eng.define_table("rows", 1_000).unwrap();
+            eng.define_himo_in("rows", "val", ValueType::Number, 1_000).unwrap();
+            eng.enable_sync_tables().unwrap();
+            eng.flush().unwrap();
+        }
+        let eng = Engine::open_concurrent_with_oplog(&path, 4 * 1024 * 1024).unwrap();
+        eng.set_peer_id(1);
+        let hid = eng.himo_id("rows.val").unwrap() as u16;
+
+        // bridge を 1 回走らせて cursor を進める
+        let e = eng.entity_in("rows").unwrap();
+        eng.tie_async_by_id(e, hid, 7);
+        eng.oplog_sync().unwrap();
+        let advanced = eng.sync_ops_bridge_offset();
+        assert!(
+            advanced > enchudb_oplog::oplog::HEADER_SIZE as u64,
+            "premise: bridge が cursor を進めていること (offset={advanced})"
+        );
+
+        // fold の巻き戻しを再現
+        eng.reset_sync_ops_offset();
+        assert_eq!(
+            eng.sync_ops_bridge_offset(),
+            enchudb_oplog::oplog::HEADER_SIZE as u64,
+            "premise: 巻き戻しが効いていること"
+        );
+
+        // 巻き戻し前に読んだ `from` を握った transfer が cursor を進めようとする。
+        // trace で実際に観測されたのは records 空 (= from == committed_end) の path。
+        eng.advance_sync_ops_cursor(advanced, advanced);
+
+        assert_eq!(
+            eng.sync_ops_bridge_offset(),
+            enchudb_oplog::oplog::HEADER_SIZE as u64,
+            "stale store が fold の巻き戻しを上書きした (= 新 ring の record が恒久欠落する)"
+        );
+        assert_eq!(
+            eng.sync_ops_cursor_repairs(),
+            1,
+            "上書きを弾いたことが観測できること"
+        );
+        for suffix in ["", ".oplog", ".tables", ".crc", ".lock"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
+    }
+
+    /// **cursor が head を追い越した状態は 「畳んでよい」 ではなく 「不整合」。**
+    ///
+    /// `wal_fold_safe` は `offset >= head` で fold を許可していたため、 上の lost update で
+    /// 壊れた cursor を 「bridge 追いつき済み」 と読んで畳み続けていた。 追い越しは
+    /// 検出して畳まず、 ring 先頭へ巻き戻す (最悪 重複配布、 apply は冪等)。
+    #[test]
+    fn cursor_overtaking_head_blocks_the_fold_and_self_heals() {
+        let path = tmp("bridge_cursor_overtake");
+        for suffix in ["", ".oplog", ".tables", ".crc", ".lock"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
+        {
+            let mut eng = Engine::create_standalone(&path).unwrap();
+            eng.define_table("rows", 1_000).unwrap();
+            eng.define_himo_in("rows", "val", ValueType::Number, 1_000).unwrap();
+            eng.enable_sync_tables().unwrap();
+            eng.flush().unwrap();
+        }
+        let eng = Engine::open_concurrent_with_oplog(&path, 4 * 1024 * 1024).unwrap();
+        eng.set_peer_id(1);
+        let hid = eng.himo_id("rows.val").unwrap() as u16;
+        let e = eng.entity_in("rows").unwrap();
+        eng.tie_async_by_id(e, hid, 9);
+        eng.oplog_sync().unwrap();
+
+        let head = eng.oplog.as_ref().unwrap().head();
+        eng.sync_ops_offset
+            .store(head + 4096, std::sync::atomic::Ordering::Release);
+
+        assert!(
+            !eng.wal_fold_safe(),
+            "cursor が head を追い越しているのに fold を許可した"
+        );
+        assert_eq!(
+            eng.sync_ops_bridge_offset(),
+            enchudb_oplog::oplog::HEADER_SIZE as u64,
+            "追い越しを検出したら ring 先頭へ巻き戻すこと"
+        );
+        assert!(eng.sync_ops_cursor_repairs() >= 1, "修復が観測できること");
+        for suffix in ["", ".oplog", ".tables", ".crc", ".lock"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
     }
 
     /// #128: 進捗の無い Retry 連発 (= crash 残骸の odd gen) では reader が
