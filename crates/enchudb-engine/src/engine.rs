@@ -4531,7 +4531,7 @@ impl Engine {
                 }
                 None => {
                     // #221: delete + free list push は専用 lock 下で atomic に。
-                    if self.purge_sync_ops_row(*eid, lsn_hid) {
+                    if self.purge_sync_ops_row(*eid, lsn_hid, *lsn) {
                         eprintln!(
                             "[enchudb] sync: purging undeliverable _sync_ops row \
                              (lsn {lsn}, missing/undecodable payload) — see #217"
@@ -4571,7 +4571,8 @@ impl Engine {
     }
 
     /// #221: `_sync_ops` の row を 1 件 purge する (delete + ring free list への
-    /// slot 返却)。 **専用 lock 下で「まだ生きているか」を再検証してから**消す。
+    /// slot 返却)。 **専用 lock 下で「snapshot 当時と同じ row か」を再検証してから**
+    /// 消す。
     ///
     /// `Engine::delete` は冪等で戻り値を持たないため、 lock 無しで並行 purge すると
     /// 同じ slot が free list に二重 push され、 後続の `entity_in("_sync_ops")` が
@@ -4579,12 +4580,25 @@ impl Engine {
     /// 実在する: `Syncer::absorb_pull_acks` (→ `reclaim_sync_ops` / ack walk の
     /// dead row purge) は複数 peer からの並行 pull で並行実行される。
     ///
+    /// **検証は「生存」ではなく `expected_lsn` との一致で行う (ABA)。** 生存だけを
+    /// 見ると、 T1 が purge → slot が bridge に再利用されて同一 eid に新 row が乗る
+    /// → T2 が stale snapshot で「生存」と判定して**その新 row を消す**、 が成立する
+    /// (しかも slot は pop 済みなので dedupe も効かない)。 `next_sync_lsn` は単調
+    /// 増加なので、 lsn は「同じ row か」の判別子として機能する (再利用後の row は
+    /// 必ず大きい lsn を持つ)。 この窓は ring 再利用が常時走る構成 —
+    /// まさに reclaim + bridge を並行で回す運転 — で開く。
+    ///
     /// 戻り値 `true` = 自分が消した (呼び元は計数して良い)、 `false` = 既に他者が
-    /// 消していた。 free list への push は前者のみ (dedupe も併用)。
-    fn purge_sync_ops_row(&self, eid: enchudb_oplog::EntityId, lsn_hid: u16) -> bool {
+    /// 消した / slot が再利用されて別 row になっていた。 free list への push は
+    /// 前者のみ (dedupe も belt and braces で併用)。
+    fn purge_sync_ops_row(
+        &self,
+        eid: enchudb_oplog::EntityId,
+        lsn_hid: u16,
+        expected_lsn: u32,
+    ) -> bool {
         let _guard = self.sync_ops_purge_lock.lock().unwrap();
-        // lock 下の再検証: lsn cell が引ければ生存 (delete は全 himo を落とす)。
-        if self.get_by_id(eid, lsn_hid).is_none() {
+        if self.get_by_id(eid, lsn_hid) != Some(expected_lsn) {
             return false;
         }
         let meta = self
@@ -4599,11 +4613,16 @@ impl Engine {
         {
             let slot = local - lo;
             let mut list = free_list.lock().unwrap();
-            // belt and braces: 万一 (lock 外の別経路が増えた等) でも二重にしない。
-            if !list.contains(&slot) {
-                list.push(slot);
-                nonempty.store(true, std::sync::atomic::Ordering::Release);
-            }
+            // belt and braces: expected_lsn 検証が主防御なので、 ここは
+            // 「lock 外の別経路が増えた」等の保険。 free list が長い構成では
+            // contains が O(n) なので debug 時のみ厳密に見る。
+            debug_assert!(
+                !list.contains(&slot),
+                "#221: slot {slot} が free list に二重 push されようとした \
+                 (expected_lsn 検証をすり抜けた経路がある)"
+            );
+            list.push(slot);
+            nonempty.store(true, std::sync::atomic::Ordering::Release);
         }
         true
     }
@@ -4703,7 +4722,7 @@ impl Engine {
             // 0.8.0: free list に追加 (= 次回 entity_in("_sync_ops") で再利用)。
             // #221: delete + push は専用 lock 下で atomic に (並行 reclaim の二重
             // push = slot 二重払い出し → bridge row の silent 上書き、を塞ぐ)。
-            if self.purge_sync_ops_row(eid, lsn_hid_u16) {
+            if self.purge_sync_ops_row(eid, lsn_hid_u16, lsn) {
                 purged += 1;
             }
         }
@@ -11607,6 +11626,73 @@ impl Drop for Engine {
 }
 
 // ════════════════ テスト ════════════════
+
+#[cfg(test)]
+mod sync_ops_purge_tests {
+    use super::*;
+
+    fn tmp_engine(tag: &str) -> Engine {
+        let path = format!(
+            "{}/enchudb-purge-{}-{}",
+            std::env::temp_dir().display(),
+            tag,
+            std::process::id()
+        );
+        for suf in ["", ".tables", ".oplog"] {
+            let _ = std::fs::remove_file(format!("{path}{suf}"));
+        }
+        let mut eng = Engine::create_with_capacity(&path, 4096).unwrap();
+        eng.define_table("t", 100).unwrap();
+        eng.enable_sync_tables().unwrap();
+        eng
+    }
+
+    /// #221 (review): purge の再検証は「生存」ではなく **`expected_lsn` 一致**で
+    /// 行うこと (ABA)。
+    ///
+    /// 生存だけを見ると、 T1 の purge で解放された slot が bridge に再利用されて
+    /// 同一 eid に新 row が乗った後、 T2 が stale snapshot で「生存」と判定して
+    /// **その新 row を消す**。 slot は pop 済みなので dedupe も効かない。 この窓は
+    /// ring 再利用が常時走る運転 (reclaim + bridge の並行) で開く。
+    ///
+    /// ここでは interleaving を手で固定して核を検証する:
+    /// T1 purge → slot 再利用 (同一 eid に新 lsn) → T2 が stale lsn で purge。
+    #[test]
+    fn stale_snapshot_does_not_purge_the_reused_slot() {
+        let eng = tmp_engine("aba");
+        let lsn_hid = eng.himo_id("_sync_ops.lsn").unwrap() as u16;
+
+        // row A: lsn = 5
+        let eid = eng.entity_in("_sync_ops").unwrap();
+        eng.tie_to_by_id(eid, lsn_hid, 5);
+        assert_eq!(eng.get_by_id(eid, lsn_hid), Some(5));
+
+        // T1 相当: snapshot (eid, lsn=5) で purge → slot が free list へ
+        assert!(eng.purge_sync_ops_row(eid, lsn_hid, 5), "T1 の purge が成立すること");
+        assert_eq!(eng.get_by_id(eid, lsn_hid), None);
+
+        // bridge 相当: 解放 slot を再利用して **同一 eid** に新 row (lsn = 900)
+        let reused = eng.entity_in("_sync_ops").unwrap();
+        assert_eq!(reused, eid, "前提: 解放 slot が再利用されて同じ eid になる");
+        eng.tie_to_by_id(reused, lsn_hid, 900);
+
+        // T2 相当: stale snapshot (lsn=5) のまま purge を試みる。
+        // 生存判定だけの実装はここで新 row を消してしまう。
+        assert!(
+            !eng.purge_sync_ops_row(eid, lsn_hid, 5),
+            "#221 ABA: stale snapshot が再利用後の row を purge した"
+        );
+        assert_eq!(
+            eng.get_by_id(eid, lsn_hid),
+            Some(900),
+            "#221 ABA: bridge されたばかりの row が silent に消えた"
+        );
+
+        // 正しい snapshot なら消せる (検証が過剰に厳しくないこと)。
+        assert!(eng.purge_sync_ops_row(eid, lsn_hid, 900));
+        assert_eq!(eng.get_by_id(eid, lsn_hid), None);
+    }
+}
 
 #[cfg(test)]
 mod reclaimed_floor_tests {
