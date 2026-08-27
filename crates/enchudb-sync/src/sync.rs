@@ -427,7 +427,18 @@ impl Syncer {
     /// 4. cursor を `as_of` へ前進 (後退はさせない) — 以降は通常の差分 pull
     pub fn bootstrap_pull(&self, from: PeerId) -> Option<BootstrapOutcome> {
         let batch = self.transport.fetch_state(from)?;
-        let outcome = self.apply_records(&batch.records);
+        let gossip = self.engine.gossip_remote_apply();
+        let mut relay_accepted: Vec<usize> = Vec::new();
+        let outcome =
+            self.apply_records_impl(&batch.records, gossip.then_some(&mut relay_accepted));
+
+        // #209: relay が bootstrap で取った state も原型のまま relay stream へ —
+        // これで新規 relay も author の複製 + 配布点として立ち上がれる。
+        if gossip {
+            for &i in &relay_accepted {
+                let _ = self.engine.relay_record(&batch.records[i]);
+            }
+        }
 
         // pull_once と同じ barrier: 派生 state (eidmap / vocabmap / tables) が
         // durable になる前に cursor を進めない。
@@ -503,7 +514,23 @@ impl Syncer {
         }
 
         let records = self.transport.pull_as(self_peer, from, since);
-        let outcome = self.apply_records(&records);
+        let gossip = self.engine.gossip_remote_apply();
+        let mut relay_accepted: Vec<usize> = Vec::new();
+        let outcome =
+            self.apply_records_impl(&records, gossip.then_some(&mut relay_accepted));
+
+        // #209: relay (gossip) — accept した record を**原型のまま** (原 eid / 原
+        // value / 原 HLC / 原署名) 自分の WAL へ。 翻訳後の姿を relay すると
+        // direct 経路との混在で row 重複 / vocab 写像汚染になる。 append は
+        // barrier より前: crash で append が飛んでも cursor 未前進なら再 pull で
+        // 再適用+再判定される。 既知の狭い窓 (apply 済み・append 前の crash で
+        // 当該 record が relay stream から漏れる) は #209 に記録済み — 下流の
+        // 回収路は author 直 bootstrap。
+        if gossip {
+            for &i in &relay_accepted {
+                let _ = self.engine.relay_record(&records[i]);
+            }
+        }
 
         // **cursor は、 それが消費した state より先に durable になってはいけない。**
         //
@@ -832,6 +859,19 @@ impl Syncer {
     /// crash で「消費済みと言うが写像は無い」が確定し、 差分 pull では埋まらない。
     /// `pull_once` はこの順序を内側で守っている。
     pub fn apply_records(&self, records: &[WireRecord]) -> SyncOutcome {
+        self.apply_records_impl(records, None)
+    }
+
+    /// #209: `relay_accepted` が Some なら、 relay (gossip) すべき record の index を
+    /// 集める: **apply が accept (Applied) したものだけ** — LWW gate が cyclic
+    /// topology の echo を止める栓なので、 skip した record を relay してはいけない。
+    /// Commit (dedupe identity なし) と自 author の record (発信元に戻ってきた echo)
+    /// も除外する。
+    fn apply_records_impl(
+        &self,
+        records: &[WireRecord],
+        mut relay_accepted: Option<&mut Vec<usize>>,
+    ) -> SyncOutcome {
         let mut out = SyncOutcome::default();
         // #9 foot-gun ガード: self_peer 未設定 (= 0) で foreign record を apply すると、
         // author 0 == self 0 が `resolve_remote_eid` の identity 分岐に落ち、 翻訳されず
@@ -859,7 +899,8 @@ impl Syncer {
                 out.min_rejected_hlc = Some(hlc);
             }
         };
-        for rec in records {
+        let self_peer = self.engine.peer_id();
+        for (idx, rec) in records.iter().enumerate() {
             out.received += 1;
 
             // ACL チェック(未定義なら全員通す)
@@ -887,7 +928,16 @@ impl Syncer {
                 }
             }
             match self.apply_one(&store, rec) {
-                ApplyResult::Applied => out.applied += 1,
+                ApplyResult::Applied => {
+                    out.applied += 1;
+                    if let Some(list) = relay_accepted.as_deref_mut() {
+                        let relayable = !matches!(rec.op, DecodedOp::Commit)
+                            && rec.author_peer != self_peer;
+                        if relayable {
+                            list.push(idx);
+                        }
+                    }
+                }
                 ApplyResult::SkippedOlder => out.skipped += 1,
                 ApplyResult::Dropped => out.dropped_unresolved += 1,
                 ApplyResult::DroppedVocab => out.dropped_vocab += 1,
