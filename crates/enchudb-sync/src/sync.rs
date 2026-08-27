@@ -132,8 +132,20 @@ pub struct SyncOutcome {
     /// (部分履歴を全履歴として適用すると store が黙って不完全になる = #140)。
     ///
     /// `true` のとき **records は一切適用していない**。 caller は差分 pull を諦めて
-    /// bootstrap (= `GET /bootstrap` などによる snapshot 取得) からやり直す必要がある。
+    /// [`Syncer::bootstrap_pull`] (author が `serve_state` 済みの transport) か
+    /// `GET /bootstrap` (replica 型の snapshot 取得) からやり直す必要がある。
     pub history_truncated: bool,
+}
+
+/// #140: [`Syncer::bootstrap_pull`] の結果。
+#[derive(Debug, Clone)]
+pub struct BootstrapOutcome {
+    /// state record 適用の内訳 (LWW 冪等なので再 bootstrap では applied が減る)。
+    pub outcome: SyncOutcome,
+    /// ghost sweep で削除した entity 数 (= state に現れなかった author の行)。
+    pub swept: usize,
+    /// state 合成時点の HLC。 適用後の pull cursor はここに揃っている。
+    pub as_of: Hlc,
 }
 
 /// `apply_one` の結果。
@@ -360,6 +372,94 @@ impl Syncer {
     /// 0.8.0 で transport API を拡張して 1 行に纏める想定。
     pub fn mark_initial_sync_complete(&self, peer: PeerId, snapshot_lsn: u32) -> Result<(), String> {
         self.engine.ack_sync(peer, snapshot_lsn)
+    }
+
+    /// #140: 自 engine の live state を transport に配布登録する (author 側)。
+    ///
+    /// 登録後、 truncated puller は `bootstrap_pull` で現在状態を取得できる。
+    /// provider は呼ばれるたびに `Engine::state_records` で合成する (常に最新)。
+    /// state を運べない transport (default 実装) では no-op。
+    pub fn serve_state(&self) {
+        // Weak 必須: transport は peer より長生きする。 強参照で capture すると、
+        // restart で drop したはずの engine (background consumer 込み) が provider の
+        // 中で生き続け、 同一 DB file を再 open した新 engine と並走して sidecar
+        // persist が衝突する (sunsu2 chaos の restart で実測)。
+        let engine = Arc::downgrade(&self.engine);
+        let self_peer = self.engine.peer_id();
+        self.transport.register_state_provider(
+            self_peer,
+            Arc::new(move || {
+                let eng = engine.upgrade()?;
+                let (records, as_of) = eng.state_records();
+                Some(enchudb_engine::transport::StateBatch { records, as_of, complete: true })
+            }),
+        );
+    }
+
+    /// #140: truncation からの復旧経路 — author の live state を取得して適用する。
+    ///
+    /// `pull_once` が `history_truncated` を返した peer に対して呼ぶ。
+    /// 1. `Transport::fetch_state(from)` で StateBatch 取得 (None = 運べない transport
+    ///    または author 未登録 → 復旧不能、 None を返す)
+    /// 2. 通常の apply 経路 (LWW、 冪等) で適用 + durable barrier
+    /// 3. **ghost sweep**: 自 store に居る author の行のうち state に現れなかった
+    ///    entity を削除 — author の現在状態に無い = author 側で削除済み。 truncated
+    ///    期間に tombstone を取り逃した亡霊 (#140 の原症状) をここで吸収する。
+    ///    sweep の Delete は自分の oplog にも載って伝播するが、 対象は「author が
+    ///    既に消した行」なので LWW 的に正しい方向にしか働かない
+    /// 4. cursor を `as_of` へ前進 (後退はさせない) — 以降は通常の差分 pull
+    pub fn bootstrap_pull(&self, from: PeerId) -> Option<BootstrapOutcome> {
+        let batch = self.transport.fetch_state(from)?;
+        let outcome = self.apply_records(&batch.records);
+
+        // pull_once と同じ barrier: 派生 state (eidmap / vocabmap / tables) が
+        // durable になる前に cursor を進めない。
+        if outcome.applied > 0 && !self.persist_applied_state(from) {
+            return Some(BootstrapOutcome { outcome, swept: 0, as_of: batch.as_of });
+        }
+
+        let mut swept = 0usize;
+        if batch.complete {
+            let covered: std::collections::HashSet<u32> = batch
+                .records
+                .iter()
+                .filter_map(|r| match &r.op {
+                    DecodedOp::Tie { eid, .. }
+                    | DecodedOp::Untie { eid, .. }
+                    | DecodedOp::Delete { eid }
+                    | DecodedOp::Content { eid, .. }
+                    | DecodedOp::TieNamed { eid, .. }
+                    | DecodedOp::TieLeaf { eid, .. }
+                    | DecodedOp::TieRef { eid, .. } => Some(enchudb_oplog::eid_local(*eid)),
+                    DecodedOp::Commit | DecodedOp::Vocab { .. } => None,
+                })
+                .collect();
+            for (foreign_local, local) in self.engine.translated_locals_of(from) {
+                if !covered.contains(&foreign_local) {
+                    self.engine.delete(local as u64);
+                    swept += 1;
+                }
+            }
+        }
+
+        // cursor := max(現行, as_of)。 進んだら永続 + pull-as-ack (#149) も記録。
+        let self_peer = self.engine.peer_id();
+        let advanced = {
+            let mut guard = self.last_pulled.lock().unwrap();
+            let cur = guard.get(&from).copied().unwrap_or(Hlc::ZERO);
+            if batch.as_of > cur {
+                guard.insert(from, batch.as_of);
+                true
+            } else {
+                false
+            }
+        };
+        if advanced {
+            self.save_cursors();
+            self.transport.record_pull_ack(from, self_peer, batch.as_of);
+        }
+
+        Some(BootstrapOutcome { outcome, swept, as_of: batch.as_of })
     }
 
     /// 指定 peer から未取得レコードを 1 回 pull して本体に apply。

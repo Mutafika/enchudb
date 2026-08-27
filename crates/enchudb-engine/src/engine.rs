@@ -4330,6 +4330,131 @@ impl Engine {
         self.tie_bytes_to_by_id(row, hid, &bytes);
     }
 
+    /// #140: 自 peer が author した **live state** を bridge と同語彙の wire record
+    /// として合成する。 ring (`_sync_ops`) が「最近の差分」なのに対し、 これは
+    /// 「現在状態の転写」 — truncated puller の bootstrap 用 (`Syncer::serve_state`
+    /// 経由で transport に登録され、 `Syncer::bootstrap_pull` が適用する)。
+    ///
+    /// - HLC は v9 per-cell version column の真値 (`version_of`)。 版数不明 (ZERO)
+    ///   の cell は `as_of` で stamp する (単一 author cell では現在値が最新なので
+    ///   LWW 的に安全)
+    /// - `as_of` は合成**開始前**に採番する。 合成中の並行 write は HLC > as_of に
+    ///   なるので、 適用後の cursor = as_of からの差分 pull で必ず拾える
+    /// - 語彙は bridge (`transfer_oplog_to_sync_ops`) と同じ: Number = `Tie`、
+    ///   Tag = `Vocab` + `Tie`、 Leaf = `TieLeaf` (bytes 同乗)、 Ref は translated
+    ///   target のみ `TieRef` (世界番号同乗、 #183)、 自 entity target は `Tie`
+    /// - **含まないもの** (v1): 署名 (signature = zeros — require_signature な受信側
+    ///   では使えない)、 content blob、 他 peer 行への self-authored write
+    ///   (translated local 行は skip)、 untie 済み cell の tombstone
+    ///
+    /// 戻り値 `(records, as_of)`。 oplog 無効 (standalone) では `as_of` が採番
+    /// できないため空を返す。
+    pub fn state_records(
+        &self,
+    ) -> (Vec<crate::transport::WireRecord>, enchudb_oplog::Hlc) {
+        use enchudb_oplog::oplog::DecodedOp;
+        let Some(wal) = self.oplog.as_ref() else {
+            return (Vec::new(), enchudb_oplog::Hlc::ZERO);
+        };
+        let as_of = wal.mint_hlc();
+        let self_peer = self.peer_id();
+
+        let mut records: Vec<crate::transport::WireRecord> = Vec::new();
+        let mut vocab_sent: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mk = |op: DecodedOp, hlc: enchudb_oplog::Hlc| crate::transport::WireRecord {
+            hlc,
+            author_peer: self_peer,
+            op,
+            signature: [0u8; 64],
+            pubkey_fp: [0u8; 8],
+            signed_bytes: Vec::new(),
+        };
+
+        for hid in 0..self.himos.len() {
+            if self.himo_is_in_reserved_table(hid) {
+                continue;
+            }
+            let himo_id = hid as u16;
+            let vt = self.value_types[hid];
+            for eid in self.entities_with_himo(himo_id) {
+                let local = enchudb_oplog::eid_local(eid);
+                // 他 peer の行 (translated local) は author がその peer — ここでは
+                // 自分が author した行だけを配る (self-authored cross-row write は
+                // v1 対象外、doc 参照)。
+                if self.eid_translator.is_translated_local(local) {
+                    continue;
+                }
+                let Some(value) = self.get_by_id(eid, himo_id) else { continue };
+                let mut hlc = self.version_of(local, himo_id);
+                if hlc == enchudb_oplog::Hlc::ZERO {
+                    hlc = as_of;
+                }
+                match vt {
+                    ValueType::Number => {
+                        records.push(mk(DecodedOp::Tie { eid, himo_id, value }, hlc));
+                    }
+                    ValueType::Ref => {
+                        // bridge と同じ規則: translated foreign target は世界番号
+                        // 同乗の TieRef、 自 entity target は素の Tie (受信側が
+                        // author key で翻訳する)。
+                        if self.eid_translator.is_translated_local(value) {
+                            match self.eid_translator.reverse(value) {
+                                Some((owner, owner_local)) => {
+                                    records.push(mk(
+                                        DecodedOp::TieRef {
+                                            eid,
+                                            himo_id,
+                                            target: enchudb_oplog::make_eid(owner, owner_local),
+                                        },
+                                        hlc,
+                                    ));
+                                }
+                                // 逆写像なし = 元 entity を導けない。 bridge と同じく
+                                // 発送しない (silent 断片化させるより欠けを明示)。
+                                None => continue,
+                            }
+                        } else {
+                            records.push(mk(DecodedOp::Tie { eid, himo_id, value }, hlc));
+                        }
+                    }
+                    ValueType::Tag => {
+                        if vocab_sent.insert(value) {
+                            let bytes = self.vocab.get(value).to_vec();
+                            records.push(mk(DecodedOp::Vocab { vid: value, bytes }, hlc));
+                        }
+                        records.push(mk(DecodedOp::Tie { eid, himo_id, value }, hlc));
+                    }
+                    ValueType::Leaf => {
+                        let Some(bytes) = self.text_owned_by_id(hid, local) else { continue };
+                        let Some(name) = self.himo_names.get(hid) else { continue };
+                        records.push(mk(
+                            DecodedOp::TieLeaf {
+                                eid,
+                                himo_name: name.clone(),
+                                himo_kind: ValueType::Leaf as u8,
+                                bytes,
+                            },
+                            hlc,
+                        ));
+                    }
+                }
+            }
+        }
+        (records, as_of)
+    }
+
+    /// #140: `author` peer の行として翻訳済みの local slot 一覧
+    /// `(foreign_local, local)`。 bootstrap 後の ghost sweep (state に現れなかった
+    /// author の行 = author 側で削除済み) の走査に使う。
+    pub fn translated_locals_of(&self, author: enchudb_oplog::PeerId) -> Vec<(u32, u32)> {
+        self.eid_translator
+            .snapshot()
+            .into_iter()
+            .filter(|(p, _, _)| *p == author)
+            .map(|(_, foreign_local, local)| (foreign_local, local))
+            .collect()
+    }
+
     /// 0.7.0 (Phase 5): 現時点の sync lsn (= 次に転送される record の lsn - 1)。
     /// `transfer_oplog_to_sync_ops` で割当て済みの max lsn。 snapshot 取得時に
     /// 「snapshot 時点でここまで配信済み」 を表すマーカーとして使う。

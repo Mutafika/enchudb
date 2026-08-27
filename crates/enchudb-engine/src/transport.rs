@@ -419,6 +419,43 @@ pub trait Transport: Send + Sync {
     fn take_pull_acks(&self, _author: PeerId) -> Vec<(PeerId, Hlc)> {
         Vec::new()
     }
+
+    /// #140: `peer` の live-state 配布元を登録する。 truncated puller が
+    /// `fetch_state` で author の現在状態を取得する経路 (`Syncer::serve_state`
+    /// が author 側で呼ぶ)。 default は no-op — 運べない transport では
+    /// `fetch_state` が None を返し、 bootstrap は成立しない (従来どおり)。
+    fn register_state_provider(&self, _peer: PeerId, _provider: StateProvider) {}
+
+    /// #140: `author` の live state を取得する。 None = この transport は
+    /// state 配布を運べない、 または author が provider 未登録。
+    fn fetch_state(&self, _author: PeerId) -> Option<StateBatch> {
+        None
+    }
+}
+
+/// #140: live-state 配布元。 呼ばれるたびに author の現在状態を合成して返す。
+/// None = 配布元が既に閉じている (restart で engine が drop 済み等)。
+/// **実装は engine を `Weak` で持つこと** — transport は peer より長生きするので、
+/// 強参照だと drop 済みのはずの engine (consumer thread 込み) が生き続け、
+/// 同一 DB file を再 open した新 engine と衝突する。
+pub type StateProvider = Arc<dyn Fn() -> Option<StateBatch> + Send + Sync>;
+
+/// #140: author の live state 一式 (`Engine::state_records` の出力)。
+///
+/// ring (`_sync_ops`) が「最近の差分」を担保するのに対し、 これは「現在状態の
+/// 転写」。 truncated puller は records を通常の apply 経路 (LWW、 冪等) で
+/// 適用し、 cursor を `as_of` に合わせて差分 pull に接続する。
+#[derive(Clone)]
+pub struct StateBatch {
+    /// author の live cell を bridge と同語彙で合成した record 列。
+    /// v1 制約: 署名なし (signature = zeros、 signed_bytes 空) — require_signature
+    /// な受信側では reject される。 content blob は含まない。
+    pub records: Vec<WireRecord>,
+    /// 合成開始時点の HLC。 これ以降の op は ring に必ず居る (floor は必ず
+    /// これより古い) ので、 適用後の pull cursor はここに設定できる。
+    pub as_of: Hlc,
+    /// false = 部分的な合成 (転送打ち切り等)。 受信側は ghost sweep を skip する。
+    pub complete: bool,
 }
 
 /// テスト用: プロセス内で peer 間の WAL を共有する。
@@ -439,6 +476,8 @@ pub struct InMemoryTransport {
     floors: Arc<Mutex<HashMap<PeerId, Hlc>>>,
     /// #149: author → (puller → 消化済み max HLC)。 `take_pull_acks` で drain。
     pull_acks: Arc<Mutex<HashMap<PeerId, HashMap<PeerId, Hlc>>>>,
+    /// #140: peer → live-state provider。
+    state_providers: Arc<Mutex<HashMap<PeerId, StateProvider>>>,
 }
 
 impl InMemoryTransport {
@@ -448,6 +487,7 @@ impl InMemoryTransport {
             targeted: Arc::new(Mutex::new(HashMap::new())),
             floors: Arc::new(Mutex::new(HashMap::new())),
             pull_acks: Arc::new(Mutex::new(HashMap::new())),
+            state_providers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -567,6 +607,16 @@ impl Transport for InMemoryTransport {
     fn take_pull_acks(&self, author: PeerId) -> Vec<(PeerId, Hlc)> {
         let mut g = self.pull_acks.lock().unwrap();
         g.remove(&author).map(|m| m.into_iter().collect()).unwrap_or_default()
+    }
+
+    // #140: in-process なので provider をそのまま持って fetch 時に呼ぶ。
+    fn register_state_provider(&self, peer: PeerId, provider: StateProvider) {
+        self.state_providers.lock().unwrap().insert(peer, provider);
+    }
+
+    fn fetch_state(&self, author: PeerId) -> Option<StateBatch> {
+        let provider = self.state_providers.lock().unwrap().get(&author).cloned();
+        provider.and_then(|p| p())
     }
 }
 
