@@ -47,7 +47,7 @@ fn run(total: u32, writers: u32) -> (f64, f64) {
             let eng = eng.clone();
             std::thread::spawn(move || {
                 for i in 0..per {
-                    let e = eng.entity();
+                    let e = eng.entity().unwrap();
                     // 値は 10k cardinality に散らす (bucket 平均 ~200)
                     let val = (w.wrapping_mul(per).wrapping_add(i)) % 10_000;
                     eng.tie_async_by_id(e, hid, val);

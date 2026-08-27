@@ -50,7 +50,7 @@
 //! let counter = Arc::new(Mutex::new(0usize));
 //! eng.add_change_listener(Arc::new(CountSink(counter.clone())));
 //!
-//! let e = eng.entity();
+//! let e = eng.entity().unwrap();
 //! eng.tie_async(e, "v", 1);
 //! eng.oplog_commit();
 //! eng.flush_writes();

@@ -37,7 +37,7 @@ fn main() {
     eng.define_himo("a", ValueType::Number, 0);
     eng.define_himo("grp", ValueType::Number, 0);
     for i in 0..BASE {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "a", 7);
         eng.tie(e, "grp", i % 1000);
     }
@@ -115,7 +115,7 @@ fn main() {
         handles.push(std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 for _ in 0..2000 {
-                    let e = eng.entity();
+                    let e = eng.entity().unwrap();
                     eng.tie_async_by_id(e, a_hid, 7);
                     eng.tie_async_by_id(e, grp_hid, e as u32 % 1000);
                 }

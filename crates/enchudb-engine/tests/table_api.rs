@@ -34,8 +34,8 @@ fn legacy_api_works_without_define_table() {
 
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("age", ValueType::Number, 100);
-    let e1 = eng.entity();
-    let e2 = eng.entity();
+    let e1 = eng.entity().unwrap();
+    let e2 = eng.entity().unwrap();
     eng.tie(e1, "age", 30);
     eng.tie(e2, "age", 25);
     eng.flush().unwrap();
@@ -103,7 +103,7 @@ fn entity_after_define_table_panics() {
 
     // anonymous closed なので entity() は panic するはず
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        eng.entity()
+        eng.entity().unwrap()
     }));
     assert!(result.is_err(), "entity() should panic after define_table");
 
@@ -370,7 +370,7 @@ fn anonymous_open_skips_eid_range_validation() {
 
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("age", ValueType::Number, 100);
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie(e, "age", 30); // OK
     assert_eq!(eng.pull_raw("age", 30).len(), 1);
 
@@ -385,7 +385,7 @@ fn anonymous_closed_validates_eid_range() {
 
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("age", ValueType::Number, 100);
-    let e1 = eng.entity(); // anonymous に 1 個確保 (eid=0)
+    let e1 = eng.entity().unwrap(); // anonymous に 1 個確保 (eid=0)
     eng.tie(e1, "age", 30); // anonymous open なので OK
 
     eng.define_table("users", 100).unwrap(); // anonymous を [0, 1) で close
@@ -531,7 +531,7 @@ fn legacy_v4_db_opens_as_anonymous_only() {
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
         eng.define_himo("legacy_himo", ValueType::Number, 10);
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "legacy_himo", 7);
         eng.flush().unwrap();
     }
@@ -556,8 +556,8 @@ fn anonymous_keeps_open_until_first_define_table() {
 
     let mut eng = Engine::create_standalone(&path).unwrap();
     // entity() を先に呼ぶ
-    let e1 = eng.entity();
-    let e2 = eng.entity();
+    let e1 = eng.entity().unwrap();
+    let e2 = eng.entity().unwrap();
     eng.define_himo("foo", ValueType::Number, 10);
     eng.tie(e1, "foo", 1);
     eng.tie(e2, "foo", 2);

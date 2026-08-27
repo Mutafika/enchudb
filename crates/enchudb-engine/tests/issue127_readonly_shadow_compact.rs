@@ -83,7 +83,7 @@ fn dirty_readonly_open_heap_is_count_proportional() {
         let mut eng = Engine::create_growable_opts(&path, opts).unwrap();
         eng.define_himo("kind", ValueType::Tag, 0);
         for i in 0..N_TAGS {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie_text(e, "kind", &format!("tag{:04}", i));
         }
         eng.flush().unwrap();

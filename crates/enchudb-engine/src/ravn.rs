@@ -359,30 +359,30 @@ mod tests {
         eng.define_himo("manager", ValueType::Ref, 0);
 
         // country: Japan(eid=0)
-        let japan = eng.entity();
+        let japan = eng.entity().unwrap();
         eng.tie(japan, "type", 1);
         eng.tie_text(japan, "name", "Japan");
 
         // region: Kanto(eid=1), parent → Japan
-        let kanto = eng.entity();
+        let kanto = eng.entity().unwrap();
         eng.tie(kanto, "type", 2);
         eng.tie_text(kanto, "name", "Kanto");
         eng.tie_ref(kanto, "parent", japan);
 
         // region: Kansai(eid=2), parent → Japan
-        let kansai = eng.entity();
+        let kansai = eng.entity().unwrap();
         eng.tie(kansai, "type", 2);
         eng.tie_text(kansai, "name", "Kansai");
         eng.tie_ref(kansai, "parent", japan);
 
         // manager: Tanaka(eid=3)
-        let tanaka = eng.entity();
+        let tanaka = eng.entity().unwrap();
         eng.tie(tanaka, "type", 3);
         eng.tie_text(tanaka, "name", "Tanaka");
         eng.tie(tanaka, "region", 1); // store kanto's eid as region value? No. Use parent ref.
 
         // dept(eid=4), manager → Tanaka, parent → Kanto
-        let dept = eng.entity();
+        let dept = eng.entity().unwrap();
         eng.tie(dept, "type", 4);
         eng.tie_ref(dept, "manager", tanaka);
         eng.tie_ref(dept, "parent", kanto);

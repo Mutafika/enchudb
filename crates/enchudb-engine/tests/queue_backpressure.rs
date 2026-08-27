@@ -33,7 +33,7 @@ fn small_queue_cap_does_not_hang() {
         let eng = eng.clone();
         std::thread::spawn(move || {
             for i in 0..per {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_async_by_id(e, marker_hid, w * 1000 + i);
             }
         })

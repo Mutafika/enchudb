@@ -86,8 +86,8 @@ fn v4_db_opens_via_legacy_path() {
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
         eng.define_himo("age", ValueType::Number, 100);
-        let e1 = eng.entity();
-        let e2 = eng.entity();
+        let e1 = eng.entity().unwrap();
+        let e2 = eng.entity().unwrap();
         eng.tie(e1, "age", 30);
         eng.tie(e2, "age", 25);
         eng.flush().unwrap();
@@ -118,7 +118,7 @@ fn v4_db_gradual_migration_to_tables() {
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
         eng.define_himo("legacy_age", ValueType::Number, 100);
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "legacy_age", 42);
         eng.flush().unwrap();
     }

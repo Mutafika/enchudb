@@ -5,7 +5,7 @@
 //! let _ = std::fs::remove_file(&path);
 //! let mut db = enchudb_engine::Engine::create_standalone(&path).unwrap();
 //! db.define_himo("age", enchudb_engine::ValueType::Number, 100);
-//! let e = db.entity();
+//! let e = db.entity().unwrap();
 //! db.tie(e, "age", 30);
 //! db.tie_text(e, "city", "東京");
 //! db.rebuild();

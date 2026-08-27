@@ -58,30 +58,30 @@ fn seed(path: &str) -> Arc<Engine> {
     eng.define_himo("date", ValueType::Number, 0);
 
     // 人物
-    let alice = eng.entity();
+    let alice = eng.entity().unwrap();
     eng.tie(alice, "kind", 1);
     eng.tie_text(alice, "name", "Alice");
 
-    let bob = eng.entity();
+    let bob = eng.entity().unwrap();
     eng.tie(bob, "kind", 1);
     eng.tie_text(bob, "name", "Bob");
 
     // トピック
-    let nextjs = eng.entity();
+    let nextjs = eng.entity().unwrap();
     eng.tie(nextjs, "kind", 2);
     eng.tie_text(nextjs, "name", "Next.js");
 
-    let rust_topic = eng.entity();
+    let rust_topic = eng.entity().unwrap();
     eng.tie(rust_topic, "kind", 2);
     eng.tie_text(rust_topic, "name", "Rust");
 
     // ファイル
-    let route_file = eng.entity();
+    let route_file = eng.entity().unwrap();
     eng.tie(route_file, "kind", 3);
     eng.tie_text(route_file, "name", "app/api/auth/route.ts");
 
     // セッション: Alice × Next.js × route_file × "middleware で早期 return"
-    let s1 = eng.entity();
+    let s1 = eng.entity().unwrap();
     eng.tie(s1, "kind", 4);
     eng.tie_ref(s1, "speaker", alice);
     eng.tie_ref(s1, "topic", nextjs);
@@ -90,7 +90,7 @@ fn seed(path: &str) -> Arc<Engine> {
     eng.tie(s1, "date", 9100);
 
     // セッション: Alice × Next.js × "SSR を維持"
-    let s2 = eng.entity();
+    let s2 = eng.entity().unwrap();
     eng.tie(s2, "kind", 4);
     eng.tie_ref(s2, "speaker", alice);
     eng.tie_ref(s2, "topic", nextjs);
@@ -98,7 +98,7 @@ fn seed(path: &str) -> Arc<Engine> {
     eng.tie(s2, "date", 9120);
 
     // セッション: Bob × Next.js(Alice じゃない → 絞られる対象)
-    let s3 = eng.entity();
+    let s3 = eng.entity().unwrap();
     eng.tie(s3, "kind", 4);
     eng.tie_ref(s3, "speaker", bob);
     eng.tie_ref(s3, "topic", nextjs);
@@ -106,7 +106,7 @@ fn seed(path: &str) -> Arc<Engine> {
     eng.tie(s3, "date", 9110);
 
     // セッション: Alice × Rust(Next.js じゃない → 絞られる対象)
-    let s4 = eng.entity();
+    let s4 = eng.entity().unwrap();
     eng.tie(s4, "kind", 4);
     eng.tie_ref(s4, "speaker", alice);
     eng.tie_ref(s4, "topic", rust_topic);
@@ -222,11 +222,11 @@ fn graph_traversal_depth_limit() {
     eng.define_himo("parent", ValueType::Ref, 0);
 
     // root -> a -> b -> c -> d
-    let root = eng.entity();
-    let a = eng.entity(); eng.tie_ref(a, "parent", root);
-    let b = eng.entity(); eng.tie_ref(b, "parent", a);
-    let c = eng.entity(); eng.tie_ref(c, "parent", b);
-    let d = eng.entity(); eng.tie_ref(d, "parent", c);
+    let root = eng.entity().unwrap();
+    let a = eng.entity().unwrap(); eng.tie_ref(a, "parent", root);
+    let b = eng.entity().unwrap(); eng.tie_ref(b, "parent", a);
+    let c = eng.entity().unwrap(); eng.tie_ref(c, "parent", b);
+    let d = eng.entity().unwrap(); eng.tie_ref(d, "parent", c);
 
     eng.rebuild();
     let eng = Arc::new(eng);

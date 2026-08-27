@@ -57,7 +57,7 @@ fn replica_rejects_entity_and_delete() {
     let eng = Arc::new(Engine::open_replica(&path).unwrap());
 
     let entity_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        eng.entity();
+        eng.entity().unwrap();
     }));
     assert!(entity_panic.is_err(), "entity() must panic on replica");
 
@@ -199,7 +199,7 @@ fn set_replica_mode_toggle() {
     eng.set_peer_id(1);
 
     // 初期: 書ける
-    let e1 = eng.entity();
+    let e1 = eng.entity().unwrap();
     eng.tie_to(e1, "val", 10);
     assert_eq!(eng.get(e1, "val"), Some(10));
 

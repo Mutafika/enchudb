@@ -244,7 +244,7 @@ impl Database {
     /// schema metadata を `content()` blob に書き出す。
     /// CREATE TABLE のたびに呼ぶ (毎回上書き、 sky big でもないので OK)。
     fn persist_schema(&mut self) -> Result<(), SqlError> {
-        let eid = self.ensure_schema_entity();
+        let eid = self.ensure_schema_entity()?;
         let blob = serialize_schema(&self.tables);
         self.eng.content(eid, SCHEMA_BLOB_HIMO, blob.as_bytes());
         self.eng.flush().map_err(|e| SqlError::Io(e.to_string()))?;
@@ -253,16 +253,17 @@ impl Database {
 
     /// schema 専用 entity を引く or 新規作成。 marker himo に
     /// `SCHEMA_TABLE_MARKER` を tie してある entity が 1 個だけ存在する想定。
-    fn ensure_schema_entity(&mut self) -> EntityId {
+    fn ensure_schema_entity(&mut self) -> Result<EntityId, SqlError> {
         self.eng.rebuild();
         if let Some(vid) = self.eng.vocab_id(SCHEMA_TABLE_MARKER) {
             let eids = self.eng.pull_raw(TABLE_MARKER_HIMO, vid);
-            if let Some(&eid) = eids.first() { return eid; }
+            if let Some(&eid) = eids.first() { return Ok(eid); }
         }
         // 無ければ新規作成。
-        let eid = self.eng.entity();
+        // #59: entity 枠が満杯なら panic せず Err (embedded DB は host を殺さない)。
+        let eid = self.eng.entity().map_err(SqlError::Io)?;
         self.eng.tie_text(eid, TABLE_MARKER_HIMO, SCHEMA_TABLE_MARKER);
-        eid
+        Ok(eid)
     }
 
     /// open() 時に DB ファイルから schema を読み戻す。
@@ -447,7 +448,7 @@ impl Database {
             let eid = match target_eid {
                 Some(e) => e,
                 None => {
-                    let e = self.eng.entity();
+                    let e = self.eng.entity().map_err(SqlError::Io)?;
                     self.eng.tie_text(e, TABLE_MARKER_HIMO, &table.name);
                     e
                 }

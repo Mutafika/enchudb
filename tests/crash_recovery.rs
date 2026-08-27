@@ -78,7 +78,7 @@ fn signed_wal_records_survive_reopen() {
         eng.set_keypair(Some(kp.clone()));
 
         for i in 0..50u32 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie_async(e, "n", i);
         }
         eng.oplog_commit();

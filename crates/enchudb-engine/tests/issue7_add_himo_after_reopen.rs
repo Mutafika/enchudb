@@ -48,7 +48,7 @@ fn append_himos_after_reopen_does_not_sigbus() {
             eng.define_himo(&format!("h{}", i), ValueType::Number, 0);
         }
         for v in 0..1000u32 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "h0", v);
         }
         eng.flush().unwrap();
@@ -104,7 +104,7 @@ fn append_mixed_type_himos_after_reopen() {
         for (n, t) in pre {
             eng.define_himo(n, *t, 0);
         }
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_text(e, "name", "test");
         eng.flush().unwrap();
     }
@@ -164,7 +164,7 @@ fn append_himos_after_seal_integrity() {
         for i in 0..10 {
             eng.define_himo(&format!("h{}", i), ValueType::Number, 0);
         }
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "h0", 42);
         // seal_integrity = flush + .crc 焼き
         eng.seal_integrity().unwrap();

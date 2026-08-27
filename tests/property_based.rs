@@ -31,7 +31,7 @@ fn make_db(path: &str) -> Engine {
     db.define_himo("c", ValueType::Number, 10);
     // 100 個 entity を確保。eid 0..100 が allocate される。
     for _ in 0..100 {
-        let _ = db.entity();
+        let _ = db.entity().unwrap();
     }
     db
 }

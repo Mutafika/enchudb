@@ -66,7 +66,7 @@ fn readonly_process_reads_while_writer_migrates() {
         eng.define_himo("art", ValueType::Tag, 4096);
         eng.define_himo("body", ValueType::Leaf, 0);
         for k in &ks {
-            let eid = eng.entity();
+            let eid = eng.entity().unwrap();
             eng.tie_text(eid, "art", k);
             eng.tie_text(eid, "body", &format!("本文-init-{}", k));
         }

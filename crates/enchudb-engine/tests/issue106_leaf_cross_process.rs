@@ -59,7 +59,7 @@ fn leaf_read_while_write_cross_process() {
         w.define_himo("body", ValueType::Leaf, 0);
         writer.himo_id("body").unwrap() as u16
     };
-    let eids: Vec<_> = (0..N_ENTITIES).map(|_| writer.entity()).collect();
+    let eids: Vec<_> = (0..N_ENTITIES).map(|_| writer.entity().unwrap()).collect();
     for (e, &eid) in eids.iter().enumerate() {
         writer.tie_text_to_by_id(eid, hid, &body_for(0, e));
     }

@@ -65,7 +65,7 @@ fn single_listener_receives_after_wal_sync() {
     eng.add_change_listener(sink.clone());
     assert_eq!(eng.change_listener_count(), 1);
 
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie_async(e, "v", 42);
     eng.oplog_commit();
     eng.flush_writes();
@@ -97,7 +97,7 @@ fn multiple_listeners_all_fire() {
     assert_eq!(eng.change_listener_count(), 2);
 
     for i in 0..5u32 {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_async(e, "v", i);
     }
     eng.oplog_commit();
@@ -119,7 +119,7 @@ fn records_are_hlc_ascending() {
     eng.add_change_listener(sink.clone());
 
     for i in 0..50u32 {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_async(e, "v", i);
     }
     eng.oplog_commit();
@@ -147,7 +147,7 @@ fn listener_added_after_first_commit_only_sees_subsequent() {
     let (path, eng) = prepare_wal_engine("late_attach");
 
     // 1 回目 commit (listener 無し)
-    let e0 = eng.entity();
+    let e0 = eng.entity().unwrap();
     eng.tie_async(e0, "v", 100);
     eng.oplog_commit();
     eng.flush_writes();
@@ -158,7 +158,7 @@ fn listener_added_after_first_commit_only_sees_subsequent() {
     eng.add_change_listener(sink.clone());
 
     // 2 回目 commit
-    let e1 = eng.entity();
+    let e1 = eng.entity().unwrap();
     eng.tie_async(e1, "v", 200);
     eng.oplog_commit();
     eng.flush_writes();
@@ -191,7 +191,7 @@ fn listener_does_not_fire_on_engine_without_oplog() {
     let sink = Arc::new(CollectSink::default());
     eng.add_change_listener(sink.clone());
 
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     // tie() は WAL 経由しない
     eng.tie_to(e, "v", 1);
     drop(eng);

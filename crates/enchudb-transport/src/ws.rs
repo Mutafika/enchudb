@@ -305,7 +305,7 @@ impl Drop for WsPushClient {
 ///
 /// // 以降の commit は subscriber に自動 broadcast
 /// // (このテストでは subscriber 居ないので broadcast は no-op)
-/// let e = eng.entity();
+/// let e = eng.entity().unwrap();
 /// eng.tie_async(e, "v", 42);
 /// eng.oplog_commit();
 /// eng.flush_writes();
@@ -510,7 +510,7 @@ mod tests {
         eng.add_change_listener(Arc::new(WsPushHubAdapter::new(hub.clone(), 1)));
 
         // commit
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_async(e, "v", 777);
         eng.oplog_commit();
         eng.flush_writes();

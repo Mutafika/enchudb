@@ -44,9 +44,9 @@ fn max_values_boundary() {
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("x", ValueType::Number, 10);
 
-    let e9 = eng.entity();
-    let e10 = eng.entity();
-    let e11 = eng.entity();
+    let e9 = eng.entity().unwrap();
+    let e10 = eng.entity().unwrap();
+    let e11 = eng.entity().unwrap();
     eng.tie(e9, "x", 9);
     eng.tie(e10, "x", 10);
     eng.tie(e11, "x", 11); // ヒント超え → 動的拡張
@@ -95,7 +95,7 @@ fn zero_value_tie() {
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("x", ValueType::Number, 4);
 
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie(e, "x", 0);
 
     assert_eq!(eng.get(e, "x"), Some(0));
@@ -114,7 +114,7 @@ fn tie_large_value_expands_buckets() {
     let path = tmp("large_value_expand");
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("x", ValueType::Number, 10); // ヒント 10
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie(e, "x", 100_000);
     assert_eq!(eng.get(e, "x"), Some(100_000));
     let pulled = eng.pull_raw("x", 100_000);
@@ -129,7 +129,7 @@ fn tie_large_value_expands_buckets() {
 fn max_value_panics() {
     let path = tmp("max_value_panics");
     let mut eng = Engine::create_standalone(&path).unwrap();
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie(e, "x", u32::MAX);
     cleanup(&path);
 }
@@ -155,7 +155,7 @@ fn delete_then_recreate_entity() {
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("x", ValueType::Number, 4);
 
-    let e0 = eng.entity();
+    let e0 = eng.entity().unwrap();
     eng.tie(e0, "x", 3);
     assert_eq!(eng.get(e0, "x"), Some(3));
 
@@ -163,7 +163,7 @@ fn delete_then_recreate_entity() {
     assert_eq!(eng.get(e0, "x"), None);
     assert_eq!(eng.entity_count(), 0);
 
-    let e1 = eng.entity();
+    let e1 = eng.entity().unwrap();
     // monotonic 方式 → e1 != e0(欠番)
     assert_ne!(e1, e0, "新 entity は古い ID を再利用しない(monotonic)");
     // 古い紐は見えない
@@ -180,7 +180,7 @@ fn untie_all_himos_from_entity() {
     eng.define_himo("a", ValueType::Number, 4);
     eng.define_himo("b", ValueType::Number, 4);
 
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie(e, "a", 1);
     eng.tie(e, "b", 2);
     assert!(eng.pull_raw("a", 1).contains(&e));
@@ -201,7 +201,7 @@ fn double_delete() {
     let path = tmp("double_delete");
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("x", ValueType::Number, 4);
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie(e, "x", 1);
 
     eng.delete(e);
@@ -223,7 +223,7 @@ fn delete_unknown_entity() {
     eng.delete(999);
     assert_eq!(eng.entity_count(), 0);
 
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     assert_eq!(e, 0);
     cleanup(&path);
 }
@@ -247,8 +247,8 @@ fn value_then_text_same_himo() {
     let path = tmp("type_mix");
     let mut eng = Engine::create_standalone(&path).unwrap();
 
-    let e1 = eng.entity();
-    let e2 = eng.entity();
+    let e1 = eng.entity().unwrap();
+    let e2 = eng.entity().unwrap();
 
     // 最初は Number 型として確定する
     eng.tie(e1, "x", 42);
@@ -265,7 +265,7 @@ fn value_then_text_same_himo() {
 fn ref_self_reference() {
     let path = tmp("ref_self");
     let mut eng = Engine::create_standalone(&path).unwrap();
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie_ref(e, "self", e);
     assert_eq!(eng.get(e, "self"), Some(e as u32));
     assert!(eng.pull_raw("self", e as u32).contains(&e));
@@ -298,7 +298,7 @@ fn persist_then_modify() {
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
         eng.define_himo("x", ValueType::Number, 100);
-        let e0 = eng.entity();
+        let e0 = eng.entity().unwrap();
         eng.tie(e0, "x", 10);
         assert_eq!(e0, 0);
         eng.flush().unwrap();
@@ -308,7 +308,7 @@ fn persist_then_modify() {
     {
         let mut eng = Engine::open_standalone(&path).unwrap();
         assert_eq!(eng.get(0, "x"), Some(10));
-        let e1 = eng.entity();
+        let e1 = eng.entity().unwrap();
         eng.tie(e1, "x", 20);
         assert_eq!(e1, 1);
         eng.flush().unwrap();
@@ -388,7 +388,7 @@ fn concurrentize_basic_lifecycle() {
     eng.define_himo("x", ValueType::Number, 16);
     let arc: Arc<Engine> = Engine::concurrentize(eng);
 
-    let e = arc.entity();
+    let e = arc.entity().unwrap();
     arc.tie_async(e, "x", 5);
     arc.flush_writes();
     assert_eq!(arc.get(e, "x"), Some(5));
@@ -408,7 +408,7 @@ fn test_dynamic_bucket_expansion() {
     let path = tmp("dyn_bucket_expand");
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("x", ValueType::Number, 10);
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie(e, "x", 1000);
     let pulled = eng.pull_raw("x", 1000);
     assert_eq!(pulled, vec![e]);
@@ -427,9 +427,9 @@ fn test_unique_count_basic() {
     eng.define_himo("k", ValueType::Number, 100);
     assert_eq!(eng.himo_cardinality("k"), Some(0));
 
-    let e1 = eng.entity();
-    let e2 = eng.entity();
-    let e3 = eng.entity();
+    let e1 = eng.entity().unwrap();
+    let e2 = eng.entity().unwrap();
+    let e3 = eng.entity().unwrap();
 
     eng.tie(e1, "k", 3);
     assert_eq!(eng.himo_cardinality("k"), Some(1));
@@ -457,8 +457,8 @@ fn test_unique_count_with_replace() {
     let path = tmp("uniq_count_replace");
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("k", ValueType::Number, 10);
-    let e1 = eng.entity();
-    let e2 = eng.entity();
+    let e1 = eng.entity().unwrap();
+    let e2 = eng.entity().unwrap();
 
     eng.tie(e1, "k", 1);
     eng.tie(e2, "k", 1);
@@ -482,7 +482,7 @@ fn test_himo_cardinality_api() {
     assert_eq!(eng.himo_cardinality("unknown"), None);
     eng.define_himo("k", ValueType::Number, 4);
     assert_eq!(eng.himo_cardinality("k"), Some(0));
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie(e, "k", 0);
     assert_eq!(eng.himo_cardinality("k"), Some(1));
     cleanup(&path);

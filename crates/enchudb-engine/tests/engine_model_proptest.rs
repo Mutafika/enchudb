@@ -95,7 +95,7 @@ fn build() -> (Engine, Vec<enchudb_oplog::EntityId>) {
         };
         eng.define_himo(name, vt, 0);
     }
-    let eids: Vec<_> = (0..POOL).map(|_| eng.entity()).collect();
+    let eids: Vec<_> = (0..POOL).map(|_| eng.entity().unwrap()).collect();
     (eng, eids)
 }
 

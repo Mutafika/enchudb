@@ -30,7 +30,7 @@ let mut db = Engine::create_standalone("/tmp/my.db")?;
 db.define_himo("age", ValueType::Value, 100);
 
 // 書き込み
-let alice = db.entity();
+let alice = db.entity().unwrap();
 db.tie(alice, "age", 30);
 db.tie_text(alice, "city", "東京");
 

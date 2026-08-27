@@ -235,7 +235,7 @@ fn byte_flip_wal_tail_truncated_silently() {
     {
         let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
         for i in 0..50u32 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie_async(e, "n", i);
         }
         eng.flush_writes();
@@ -286,7 +286,7 @@ fn truncate_wal_to_header_loses_uncommitted() {
     {
         let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
         for i in 0..30u32 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie_async(e, "n", i);
         }
         eng.flush_writes();
@@ -329,7 +329,7 @@ fn concurrent_writers_with_sync_no_data_loss() {
         let e = Arc::clone(&eng);
         handles.push(std::thread::spawn(move || {
             for i in 0..500u32 {
-                let ent = e.entity();
+                let ent = e.entity().unwrap();
                 e.tie_async(ent, "n", (t * 1000 + i) as u32);
             }
         }));
@@ -377,7 +377,7 @@ fn fuzz_random_byte_flip_no_silent_corruption() {
         {
             let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
             for i in 0..20u32 {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_async(e, "n", i);
                 expected.push((e, i));
             }
@@ -436,7 +436,7 @@ fn body_bit_flip_detected() {
         // sync API で書き込み + seal_integrity(flush + region CRC 保存)
         let mut e = Engine::create_with_capacity(&path, 1000).unwrap();
         e.define_himo("n", ValueType::Number, 100);
-        let eid = e.entity();
+        let eid = e.entity().unwrap();
         e.tie(eid, "n", 42);
         e.seal_integrity().unwrap();
     }

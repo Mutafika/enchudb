@@ -82,7 +82,7 @@ fn a_record_the_body_never_got_is_replayed_not_buried() {
         eng.define_himo("v", ValueType::Number, 0);
         let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, CAP).unwrap();
         eng.set_peer_id(PEER);
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         let hid = eng.himo_id("v").expect("himo") as u16;
         eng.tie_async(e, "v", 111);
         eng.flush_writes();

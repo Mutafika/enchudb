@@ -21,7 +21,7 @@ fn main() {
 
     let n = 1_000_000u32;
     for i in 0..n {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "user_id", i % 100_000);
         eng.tie(e, "year",    i % 10);
         eng.tie_text(e, "city", &format!("city_{}", i % 100));

@@ -39,7 +39,7 @@ fn snapshot_export_plain_engine_roundtrip() {
     {
         let mut eng = Engine::create_standalone(&src_path).unwrap();
         eng.define_himo("age", ValueType::Number, 100);
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "age", 30);
         eng.tie_text(e, "name", "alice");
         eng.flush().unwrap();
@@ -76,7 +76,7 @@ fn snapshot_export_with_wal_includes_wal_file() {
     // WAL 経由で書き込み
     let eng = Engine::open_concurrent_with_oplog(&src_path, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(1);
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie_async(e, "val", 42);
     eng.oplog_commit();
     eng.flush_writes();
@@ -124,7 +124,7 @@ fn stats_includes_hlc_info() {
 
     // 何か書く(HlcStore は sync 受信時に埋まる、自 peer 書き込みでは埋まらない仕様の可能性)
     // だが hlc_store の len は常に監視できる
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie_async(e, "val", 1);
     eng.oplog_commit();
     eng.flush_writes();
@@ -157,9 +157,9 @@ fn audit_returns_wal_records() {
     let eng = Engine::open_concurrent_with_oplog(&src_path, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(3);
 
-    let e1 = eng.entity();
+    let e1 = eng.entity().unwrap();
     eng.tie_async(e1, "val", 10);
-    let e2 = eng.entity();
+    let e2 = eng.entity().unwrap();
     eng.tie_async(e2, "val", 20);
     eng.oplog_commit();
     eng.flush_writes();
@@ -194,7 +194,7 @@ fn audit_filter_by_author_excludes_others() {
     let eng = Engine::open_concurrent_with_oplog(&src_path, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(5);
 
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie_async(e, "val", 1);
     eng.oplog_commit();
     eng.flush_writes();
@@ -232,7 +232,7 @@ fn audit_filter_by_hlc_range() {
     let eng = Engine::open_concurrent_with_oplog(&src_path, 16 * 1024 * 1024).unwrap();
     eng.set_peer_id(1);
 
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie_async(e, "val", 42);
     eng.oplog_commit();
     eng.flush_writes();

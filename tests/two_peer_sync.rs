@@ -296,7 +296,7 @@ fn peer_id_persists_across_reopen() {
     assert_eq!(eng.peer_id(), 42);
 
     // entity() が peer=42 を合成した eid を返す
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     assert_eq!(enchudb_oplog::eid_peer(e), 42);
 
     cleanup(&path);

@@ -73,7 +73,7 @@ fn main() {
     let mut total_ties: u64 = 0;
     let t_ins = Instant::now();
     for i in 0..n {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         let start = (i % 7) as usize;
         for k in 0..3 {
             let h = (start + k) % 7;

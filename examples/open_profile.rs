@@ -32,7 +32,7 @@ fn main() {
         // string を tie するため tie_text を使う。
         eng.define_himo("tag", enchudb::ValueType::Tag, 1000);
         for i in 0..100 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie_text(e, "tag", &format!("v{}", i));
         }
         // schema 層が himo_reg にも入れるので、 多めに define して count を稼ぐ
@@ -52,7 +52,7 @@ fn main() {
     // Phase 3: crash 相当 (insert 後 flush 呼ばず forget) の状態を作って再 open
     {
         let mut eng = enchudb::Engine::open_standalone(&path).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_text(e, "tag", "extra");
         // Drop も flush も呼ばずに leak。 graceful close 経路を回避し、
         // disk 上の clean flag を 0 のまま残す = 次 open で rebuild を強制する

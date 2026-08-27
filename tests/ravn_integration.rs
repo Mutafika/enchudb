@@ -24,24 +24,24 @@ fn ec_path_navigation() {
     eng.define_himo("name", ValueType::Tag, 0);
 
     // product(0)
-    let product = eng.entity();
+    let product = eng.entity().unwrap();
     eng.tie(product, "type", 1);
     eng.tie_text(product, "name", "Widget");
     eng.tie(product, "price", 500);
 
     // user(1)
-    let user = eng.entity();
+    let user = eng.entity().unwrap();
     eng.tie(user, "type", 2);
     eng.tie_text(user, "name", "Alice");
 
     // order(2)
-    let order = eng.entity();
+    let order = eng.entity().unwrap();
     eng.tie(order, "type", 3);
     eng.tie_ref(order, "user_ref", user);
     eng.tie(order, "status", 1);
 
     // order_item(3)
-    let item = eng.entity();
+    let item = eng.entity().unwrap();
     eng.tie(item, "type", 4);
     eng.tie_ref(item, "order_ref", order);
     eng.tie_ref(item, "product_ref", product);
@@ -77,31 +77,31 @@ fn sns_timeline() {
     eng.define_himo("content_id", ValueType::Number, 100);
 
     // users
-    let alice = eng.entity(); // 0
+    let alice = eng.entity().unwrap(); // 0
     eng.tie(alice, "type", 1);
     eng.tie_text(alice, "name", "Alice");
 
-    let bob = eng.entity(); // 1
+    let bob = eng.entity().unwrap(); // 1
     eng.tie(bob, "type", 1);
     eng.tie_text(bob, "name", "Bob");
 
-    let carol = eng.entity(); // 2
+    let carol = eng.entity().unwrap(); // 2
     eng.tie(carol, "type", 1);
     eng.tie_text(carol, "name", "Carol");
 
     // posts by Bob
-    let post1 = eng.entity(); // 3
+    let post1 = eng.entity().unwrap(); // 3
     eng.tie(post1, "type", 2);
     eng.tie_ref(post1, "author", bob);
     eng.tie(post1, "content_id", 10);
 
-    let post2 = eng.entity(); // 4
+    let post2 = eng.entity().unwrap(); // 4
     eng.tie(post2, "type", 2);
     eng.tie_ref(post2, "author", bob);
     eng.tie(post2, "content_id", 20);
 
     // posts by Carol
-    let post3 = eng.entity(); // 5
+    let post3 = eng.entity().unwrap(); // 5
     eng.tie(post3, "type", 2);
     eng.tie_ref(post3, "author", carol);
     eng.tie(post3, "content_id", 30);
@@ -133,19 +133,19 @@ fn select_with_text() {
     eng.define_himo("name", ValueType::Tag, 0);
     eng.define_himo("city", ValueType::Tag, 0);
 
-    let e1 = eng.entity();
+    let e1 = eng.entity().unwrap();
     eng.tie(e1, "type", 1);
     eng.tie(e1, "age", 30);
     eng.tie_text(e1, "name", "Tanaka");
     eng.tie_text(e1, "city", "Tokyo");
 
-    let e2 = eng.entity();
+    let e2 = eng.entity().unwrap();
     eng.tie(e2, "type", 1);
     eng.tie(e2, "age", 25);
     eng.tie_text(e2, "name", "Suzuki");
     eng.tie_text(e2, "city", "Osaka");
 
-    let e3 = eng.entity();
+    let e3 = eng.entity().unwrap();
     eng.tie(e3, "type", 2);
     eng.tie(e3, "age", 40);
     eng.tie_text(e3, "name", "Sato");
@@ -182,18 +182,18 @@ fn exec_follow_pipe() {
     eng.define_himo("status", ValueType::Number, 5);
 
     // dept(0)
-    let dept = eng.entity();
+    let dept = eng.entity().unwrap();
     eng.tie(dept, "type", 5);
     eng.tie_text(dept, "name", "Engineering");
 
     // employee(1)
-    let emp1 = eng.entity();
+    let emp1 = eng.entity().unwrap();
     eng.tie(emp1, "type", 2);
     eng.tie(emp1, "status", 0);
     eng.tie_ref(emp1, "dept_ref", dept);
 
     // employee(2)
-    let emp2 = eng.entity();
+    let emp2 = eng.entity().unwrap();
     eng.tie(emp2, "type", 2);
     eng.tie(emp2, "status", 0);
     eng.tie_ref(emp2, "dept_ref", dept);
@@ -235,12 +235,12 @@ fn exec_count() {
     eng.define_himo("category", ValueType::Number, 10);
 
     for i in 0..20u32 {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "type", 1);
         eng.tie(e, "category", i % 5);
     }
     for i in 0..10u32 {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "type", 2);
         eng.tie(e, "category", i % 5);
     }
@@ -274,30 +274,30 @@ fn chained_pipes() {
     eng.define_himo("name", ValueType::Tag, 0);
 
     // region(0)
-    let region = eng.entity();
+    let region = eng.entity().unwrap();
     eng.tie(region, "type", 1);
     eng.tie_text(region, "name", "Kanto");
 
     // user(1)
-    let user1 = eng.entity();
+    let user1 = eng.entity().unwrap();
     eng.tie(user1, "type", 2);
     eng.tie_ref(user1, "region_ref", region);
 
     // user(2)
-    let user2 = eng.entity();
+    let user2 = eng.entity().unwrap();
     eng.tie(user2, "type", 2);
     eng.tie_ref(user2, "region_ref", region);
 
     // posts by user1
-    let post1 = eng.entity(); // 3
+    let post1 = eng.entity().unwrap(); // 3
     eng.tie(post1, "type", 5);
     eng.tie_ref(post1, "user_ref", user1);
 
-    let post2 = eng.entity(); // 4
+    let post2 = eng.entity().unwrap(); // 4
     eng.tie(post2, "type", 5);
     eng.tie_ref(post2, "user_ref", user2);
 
-    let post3 = eng.entity(); // 5
+    let post3 = eng.entity().unwrap(); // 5
     eng.tie(post3, "type", 5);
     eng.tie_ref(post3, "user_ref", user1);
 
@@ -322,11 +322,11 @@ fn exec_get() {
     eng.define_himo("type", ValueType::Number, 10);
     eng.define_himo("score", ValueType::Number, 100);
 
-    let e1 = eng.entity();
+    let e1 = eng.entity().unwrap();
     eng.tie(e1, "type", 1);
     eng.tie(e1, "score", 42);
 
-    let e2 = eng.entity();
+    let e2 = eng.entity().unwrap();
     eng.tie(e2, "type", 1);
     eng.tie(e2, "score", 77);
 
@@ -351,7 +351,7 @@ fn exec_errors() {
     let path = db_path("exec_errors");
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("type", ValueType::Number, 10);
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie(e, "type", 1);
     eng.rebuild();
     let ravn = Ravn::new(Arc::new(eng));
@@ -370,7 +370,7 @@ fn exec_empty_result() {
     let path = db_path("exec_empty");
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("type", ValueType::Number, 10);
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie(e, "type", 1);
     eng.rebuild();
     let ravn = Ravn::new(Arc::new(eng));

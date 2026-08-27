@@ -51,7 +51,7 @@ fn run(path: &str, leaf_size: Option<usize>) -> Vec<(usize, u64)> {
     let is_after = leaf_size != Some(0);
     let mut curve = Vec::new();
     for i in 0..ROUNDS {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_text(e, "content", &content_for(i));
         if i >= WINDOW {
             eng.delete((i - WINDOW) as u64); // retention: WINDOW 前を削除
