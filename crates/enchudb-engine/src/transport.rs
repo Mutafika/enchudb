@@ -386,6 +386,30 @@ pub trait Transport: Send + Sync {
         Vec::new()
     }
 
+    /// #216: **author 別 cursor** での pull。 relay (gossip) の stream は
+    /// 「自分の row (自 clock)」と「relay された row (原 author の HLC 素通し、
+    /// #209)」の merge で **全体としては HLC 非単調** — scalar cursor の
+    /// `hlc > since` filter は、 cursor が別 author の新しい row で先に進んだ後に
+    /// relay された古い HLC の record を永久に落とす (silent data loss)。
+    ///
+    /// author ごとの substream は relay を何 hop 挟んでも HLC 単調なので、
+    /// cursor を (author → Hlc) の vector にすれば健全になる。 `since` に無い
+    /// author は **Hlc::ZERO 起点** (= 全量) — 新しく relay され始めた author の
+    /// 古い record を落とさないための必須条件で、 「既知 author の min」への
+    /// 短絡は同じ穴を一段下で再現する。
+    ///
+    /// default 実装は `pull_as(to, from, Hlc::ZERO)` の全量 fetch — 正しさ優先の
+    /// fallback で、 既知分は受信側 (`Syncer::pull_once`) の author 別 filter が
+    /// 落とす。 効率が要る transport は per-author filter を override すること。
+    fn pull_as_multi(
+        &self,
+        to: PeerId,
+        from: PeerId,
+        _since: &[(PeerId, Hlc)],
+    ) -> Vec<WireRecord> {
+        self.pull_as(to, from, Hlc::ZERO)
+    }
+
     /// #140: publisher が「自分の履歴は `floor` 以下が reclaim 済み」と広告する。
     ///
     /// `_sync_ops` は ring buffer なので、 publisher 側で reclaim が走ると **配れる履歴に
@@ -582,6 +606,39 @@ impl Transport for InMemoryTransport {
     fn known_peers(&self) -> Vec<PeerId> {
         let guard = self.inner.lock().unwrap();
         guard.keys().copied().collect()
+    }
+
+    /// #216: author 別 filter — record の `author_peer` ごとに cursor を引き、
+    /// 未知 author は Hlc::ZERO 起点 (= 全量)。
+    fn pull_as_multi(
+        &self,
+        to: PeerId,
+        from: PeerId,
+        since: &[(PeerId, Hlc)],
+    ) -> Vec<WireRecord> {
+        let cursor_of = |author: PeerId| {
+            since
+                .iter()
+                .find(|(p, _)| *p == author)
+                .map(|(_, h)| *h)
+                .unwrap_or(Hlc::ZERO)
+        };
+        let bcast: Vec<WireRecord> = {
+            let guard = self.inner.lock().unwrap();
+            guard.get(&from).cloned().unwrap_or_default()
+        };
+        let targeted: Vec<WireRecord> = {
+            let guard = self.targeted.lock().unwrap();
+            guard.get(&(from, to)).cloned().unwrap_or_default()
+        };
+        let mut merged: Vec<WireRecord> = bcast
+            .into_iter()
+            .chain(targeted)
+            .filter(|r| r.hlc > cursor_of(r.author_peer))
+            .collect();
+        merged.sort_by_key(|r| r.hlc);
+        merged.dedup_by_key(|r| r.hlc);
+        merged
     }
 
     // #140: 広告は「後退させない」— reclaim は進む一方なので floor も単調増加。

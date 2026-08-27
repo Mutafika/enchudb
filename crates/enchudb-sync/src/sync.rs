@@ -61,10 +61,15 @@ use crate::subscription::{AllRecords, SubscriptionFilter};
 pub struct Syncer {
     engine: Arc<Engine>,
     transport: Arc<dyn Transport>,
-    /// 各 peer から最後に pull した地点(HLC)。次回はここより後だけ取る。
+    /// 各 pull 先 (link) から最後に pull した地点。 #216: relay の stream は
+    /// 複数 author の merge で HLC 非単調なので、 cursor は **link × author** の
+    /// 2 段 map — author ごとの substream は relay を何 hop 挟んでも単調、 が
+    /// この粒度を健全にする不変式。 relay を使わない 1-hop 構成では
+    /// `{link: {author=link: hlc}}` の 1 entry で従来と同一挙動。
     /// `cursor_path` が設定されていれば update のたびにディスクに保存し、
     /// `Syncer::new` 時にロードして差分同期を継続する。
-    last_pulled: std::sync::Mutex<std::collections::HashMap<PeerId, Hlc>>,
+    last_pulled:
+        std::sync::Mutex<std::collections::HashMap<PeerId, std::collections::HashMap<PeerId, Hlc>>>,
     /// `last_pulled` の永続化先。 `None` ならメモリのみ。
     cursor_path: std::sync::RwLock<Option<PathBuf>>,
     /// Phase C: true なら署名検証を強制。未署名 or 検証失敗 op は reject。
@@ -290,20 +295,37 @@ impl Syncer {
         let mut guard = self.last_pulled.lock().unwrap();
         for line in s.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() != 4 {
-                continue;
-            }
-            let Ok(p) = parts[0].parse::<PeerId>() else { continue };
-            let Ok(wall) = parts[1].parse::<u64>() else { continue };
-            let Ok(logical) = parts[2].parse::<u32>() else { continue };
-            let Ok(peer) = parts[3].parse::<PeerId>() else { continue };
-            guard.insert(p, Hlc { wall, logical, peer });
+            // #216 v2 書式: `link author wall logical hlc_peer` (5 field)。
+            // legacy 4 field (`link wall logical hlc_peer`) は author=link の
+            // cursor として読む — 他 author は Hlc::ZERO 起点になり再配送されるが
+            // apply は LWW で冪等。 旧 scalar cursor が silent drop した relayed
+            // record は、 この再配送で自己修復される。
+            let (link, author, rest) = match parts.len() {
+                5 => {
+                    let Ok(l) = parts[0].parse::<PeerId>() else { continue };
+                    let Ok(a) = parts[1].parse::<PeerId>() else { continue };
+                    (l, a, &parts[2..])
+                }
+                4 => {
+                    let Ok(l) = parts[0].parse::<PeerId>() else { continue };
+                    (l, l, &parts[1..])
+                }
+                _ => continue,
+            };
+            let Ok(wall) = rest[0].parse::<u64>() else { continue };
+            let Ok(logical) = rest[1].parse::<u32>() else { continue };
+            let Ok(peer) = rest[2].parse::<PeerId>() else { continue };
+            guard
+                .entry(link)
+                .or_default()
+                .insert(author, Hlc { wall, logical, peer });
         }
     }
 
     /// `last_pulled` を atomic write でディスクに保存。 `cursor_path` 未設定なら no-op。
-    /// 書式: 1 行 1 エントリ、 `peer_id wall logical hlc_peer` (空白区切り)。
-    /// 失敗しても sync は続行 (cursor は次回ロードで古いまま、 multi-apply は LWW で吸収)。
+    /// 書式 (#216 v2): 1 行 1 エントリ、 `link author wall logical hlc_peer`
+    /// (空白区切り)。 失敗しても sync は続行 (cursor は次回ロードで古いまま、
+    /// multi-apply は LWW で吸収)。
     fn save_cursors(&self) {
         let path = match self.cursor_path.read().unwrap().clone() {
             Some(p) => p,
@@ -311,8 +333,13 @@ impl Syncer {
         };
         let guard = self.last_pulled.lock().unwrap();
         let mut buf = String::new();
-        for (p, h) in guard.iter() {
-            buf.push_str(&format!("{} {} {} {}\n", p, h.wall, h.logical, h.peer));
+        for (link, authors) in guard.iter() {
+            for (author, h) in authors.iter() {
+                buf.push_str(&format!(
+                    "{} {} {} {} {}\n",
+                    link, author, h.wall, h.logical, h.peer
+                ));
+            }
         }
         drop(guard);
         let tmp = path.with_extension("tmp");
@@ -496,20 +523,26 @@ impl Syncer {
         }
 
         // cursor := max(現行, as_of)。 進んだら永続 + pull-as-ack (#149) も記録。
+        // #216: StateBatch は author (= from) 単一なので author=from の entry のみ
+        // 前進させる。 ack は link の author 別 cursor の min (保守側 — 「hlc ≤ ack
+        // は全 author 分消化済み」の証明として健全)。
         let self_peer = self.engine.peer_id();
-        let advanced = {
+        let (advanced, ack) = {
             let mut guard = self.last_pulled.lock().unwrap();
-            let cur = guard.get(&from).copied().unwrap_or(Hlc::ZERO);
-            if batch.as_of > cur {
-                guard.insert(from, batch.as_of);
+            let link = guard.entry(from).or_default();
+            let cur = link.entry(from).or_insert(Hlc::ZERO);
+            let advanced = if batch.as_of > *cur {
+                *cur = batch.as_of;
                 true
             } else {
                 false
-            }
+            };
+            let ack = link.values().min().copied().unwrap_or(Hlc::ZERO);
+            (advanced, ack)
         };
         if advanced {
             self.save_cursors();
-            self.transport.record_pull_ack(from, self_peer, batch.as_of);
+            self.transport.record_pull_ack(from, self_peer, ack);
         }
 
         Some(BootstrapOutcome { outcome, swept, as_of: batch.as_of })
@@ -520,11 +553,19 @@ impl Syncer {
     /// (from, self_peer) targeted log を両方拾う。 partial sync 対応 transport
     /// (InMemoryTransport 等) では targeted 経由の per-peer record も受信できる。
     pub fn pull_once(&self, from: PeerId) -> SyncOutcome {
-        let since = {
+        // #216: cursor は link × author の vector — relay の stream は複数 author の
+        // merge で HLC 非単調なので、 scalar cursor は relay された古い HLC の
+        // record を永久に落とす (silent data loss)。 author substream は単調なので
+        // author 粒度の cursor が健全。
+        let since: Vec<(PeerId, Hlc)> = {
             let guard = self.last_pulled.lock().unwrap();
-            guard.get(&from).copied().unwrap_or(Hlc::ZERO)
+            guard
+                .get(&from)
+                .map(|m| m.iter().map(|(a, h)| (*a, *h)).collect())
+                .unwrap_or_default()
         };
         let self_peer = self.engine.peer_id();
+        let floor = self.transport.history_floor(from);
 
         // #140: publisher が広告した履歴の下限より自分の cursor が古いなら、 差分では
         // 埋められない穴がある。 部分履歴をそのまま適用すると store が黙って不完全に
@@ -532,17 +573,44 @@ impl Syncer {
         // 適用せず** truncation を通知して caller に bootstrap を促す。
         //
         // cursor が floor 以上なら、 落ちた分は既に自分が consume 済みなので安全。
-        if let Some(floor) = self.transport.history_floor(from) {
-            if since < floor {
+        // #216: 判定は author 別 cursor の min (保守側 — floor は publisher ring
+        // 全体の scalar で、 どの author の履歴が落ちたかまでは語らない)。
+        let link_min = since.iter().map(|(_, h)| *h).min().unwrap_or(Hlc::ZERO);
+        if let Some(floor) = floor {
+            if link_min < floor {
                 return SyncOutcome { history_truncated: true, ..SyncOutcome::default() };
             }
         }
 
-        let records = self.transport.pull_as(self_peer, from, since);
+        let fetched = self.transport.pull_as_multi(self_peer, from, &since);
+        // #216: default 実装 transport (全量 fetch fallback) 向けの受信側 filter。
+        // per-author filter 済み transport (InMemory) では素通り。
+        let cursor_of = |author: PeerId| {
+            since
+                .iter()
+                .find(|(p, _)| *p == author)
+                .map(|(_, h)| *h)
+                .unwrap_or(Hlc::ZERO)
+        };
+        let records: Vec<WireRecord> = fetched
+            .into_iter()
+            .filter(|r| r.hlc > cursor_of(r.author_peer))
+            .collect();
+
+        // #216: publisher が reclaim 済み (floor あり) の link に **cursor 未登録の
+        // 新 author** が現れた場合、 その author の古い record は既に ring から
+        // 落ちている可能性がある (scalar floor では author 別に判別できない)。
+        // 適用と cursor 前進は行った上で truncation を通知し、 app に当該 author の
+        // bootstrap を促す — 次回以降は author が map に載るので clean diff に戻る。
+        let new_author_on_reclaimed_link = floor.is_some()
+            && records
+                .iter()
+                .any(|r| !since.iter().any(|(p, _)| *p == r.author_peer));
         let gossip = self.engine.gossip_remote_apply();
         let mut relay_accepted: Vec<usize> = Vec::new();
-        let outcome =
+        let mut outcome =
             self.apply_records_impl(&records, gossip.then_some(&mut relay_accepted));
+        outcome.history_truncated |= new_author_on_reclaimed_link;
 
         // #209: relay (gossip) — accept した record を**原型のまま** (原 eid / 原
         // value / 原 HLC / 原署名) 自分の WAL へ。 翻訳後の姿を relay すると
@@ -587,22 +655,25 @@ impl Syncer {
         // record が永久に再配送されない silent gap を作っていた。 reject があった
         // 場合は「最小 reject HLC 未満の accepted record」までしか進めない
         // (= reject 分は次回 pull で再配送・再検証される)。
-        let target = match outcome.min_rejected_hlc {
-            None => records.iter().map(|r| r.hlc).max(),
-            Some(minrej) => records.iter().map(|r| r.hlc).filter(|h| *h < minrej).max(),
-        };
-        let advanced = if let Some(last) = target {
+        // #216: 前進は author 別。 minrej は batch 全体の scalar を全 author に
+        // 適用する (author を跨いで保守側に倒すだけ — reject は稀な例外経路)。
+        let mut advanced = false;
+        {
             let mut guard = self.last_pulled.lock().unwrap();
-            let cur = guard.get(&from).copied().unwrap_or(Hlc::ZERO);
-            if last > cur {
-                guard.insert(from, last);
-                true
-            } else {
-                false
+            let link = guard.entry(from).or_default();
+            for r in &records {
+                if let Some(minrej) = outcome.min_rejected_hlc {
+                    if r.hlc >= minrej {
+                        continue;
+                    }
+                }
+                let cur = link.entry(r.author_peer).or_insert(Hlc::ZERO);
+                if r.hlc > *cur {
+                    *cur = r.hlc;
+                    advanced = true;
+                }
             }
-        } else {
-            false
-        };
+        }
         if advanced {
             self.save_cursors();
         }
@@ -613,9 +684,19 @@ impl Syncer {
         // early return はここに来ない (= 未消化の cursor を ack しない)。
         // 空 pull でも既存 cursor を再記録する — author 側が ack 状態を失っても、
         // pull が回っている限り watermark が自然回復する。
+        //
+        // #216: ack は author 別 cursor の **min** — 「hlc ≤ ack は全 author 分
+        // 消化済み」の保守的な証明。 既知の狭い race: link に新 author が現れる
+        // 直前の ack はその author の未消化分を覆えない (transport は max 保持)。
+        // publisher がその ack で当該 record を reclaim すると、 上の
+        // new-author-on-reclaimed-link 検知が truncation として拾い、 bootstrap で
+        // 回収する — silent にはならない。
         let cursor = {
             let guard = self.last_pulled.lock().unwrap();
-            guard.get(&from).copied().unwrap_or(Hlc::ZERO)
+            guard
+                .get(&from)
+                .and_then(|m| m.values().min().copied())
+                .unwrap_or(Hlc::ZERO)
         };
         if cursor > Hlc::ZERO {
             self.transport.record_pull_ack(from, self_peer, cursor);
@@ -759,6 +840,11 @@ impl Syncer {
     /// (= publish の primary source、 legacy oplog iter fallback は 0.8.0 で
     /// 撤去、 `Syncer::new` で `sync_tables_enabled` チェック済み)。
     fn collect_records_since(&self, since: Hlc) -> Vec<WireRecord> {
+        // #216: relay (gossip) の ring は HLC 非単調 — relayed record が原 HLC の
+        // まま後から乗るので、 scalar since での間引きは relayed 分を落とす。
+        // gossip 有効時は常に全量 collect し、 重複は transport 側の dedupe
+        // ((peer, hlc) 一意) に任せる。
+        let since = if self.engine.gossip_remote_apply() { Hlc::ZERO } else { since };
         let payloads = self.engine.pending_sync_ops(0);
         let mut out = Vec::with_capacity(payloads.len());
         for p in &payloads {
