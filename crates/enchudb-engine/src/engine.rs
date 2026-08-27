@@ -9026,6 +9026,26 @@ impl Engine {
     /// 代わりに古い `.crc` ファイルは削除して、次回 flush で regenerate させる。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_concurrent_with_oplog(path: &str, oplog_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
+        Self::open_concurrent_with_oplog_queue_opt(path, oplog_capacity, None)
+    }
+
+    /// #116: `open_concurrent_with_oplog` + queue capacity 上書き。多 DB を LRU pool で
+    /// open/close する hosted 構成の open 側 knob (説明は `concurrentize_with_oplog_queue`)。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_concurrent_with_oplog_queue(
+        path: &str,
+        oplog_capacity: usize,
+        queue_capacity: usize,
+    ) -> io::Result<std::sync::Arc<Self>> {
+        Self::open_concurrent_with_oplog_queue_opt(path, oplog_capacity, Some(queue_capacity))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_concurrent_with_oplog_queue_opt(
+        path: &str,
+        oplog_capacity: usize,
+        queue_capacity: Option<usize>,
+    ) -> io::Result<std::sync::Arc<Self>> {
         let mut eng = Self::open_internal(path, /*verify_region_crc=*/ false, /*take_lock=*/ true, /*readonly=*/ false)?;
         // 古い .crc は WAL 活動後に stale になるので削除
         let crc_path = crate::integrity::crc_path_for(path);
@@ -9056,7 +9076,7 @@ impl Engine {
             std::sync::Arc::new(enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?)
         };
         eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
-        Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
+        Ok(Self::spawn_consumer_with_oplog_queue_cap(eng, Some(wal), queue_capacity))
     }
 
     /// WAL の 1 op を本体に適用(recover 専用)。
@@ -9194,7 +9214,35 @@ impl Engine {
     /// 既存 `.wal` ファイルがあれば recover してから consumer 起動。
     /// (build phase で flush 済みなら本体は最新、 WAL は空のまま start)
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn concurrentize_with_oplog(mut eng: Self, oplog_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
+    pub fn concurrentize_with_oplog(eng: Self, oplog_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
+        Self::concurrentize_with_oplog_queue_opt(eng, oplog_capacity, None)
+    }
+
+    /// #116: `concurrentize_with_oplog` + write/oplog-record queue の capacity 上書き。
+    /// 多 DB 同居 / 低メモリ host は 4096〜16384 程度に落とすと per-DB の固定 RSS が
+    /// ~128MiB → ~1〜2MiB になる (queue は burst 吸収バッファなので、writer rate が
+    /// consumer を長時間超えない workload なら小さくて良い)。省略時 (= 既存 API) は
+    /// `max_entities` 連動の scaled default。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn concurrentize_with_oplog_queue(
+        eng: Self,
+        oplog_capacity: usize,
+        queue_capacity: usize,
+    ) -> io::Result<std::sync::Arc<Self>> {
+        Self::concurrentize_with_oplog_queue_opt(eng, oplog_capacity, Some(queue_capacity))
+    }
+
+    /// #116: `concurrentize` (oplog なし) + queue capacity 上書き。
+    pub fn concurrentize_queue(eng: Self, queue_capacity: usize) -> std::sync::Arc<Self> {
+        Self::spawn_consumer_with_oplog_queue_cap(eng, None, Some(queue_capacity))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn concurrentize_with_oplog_queue_opt(
+        mut eng: Self,
+        oplog_capacity: usize,
+        queue_capacity: Option<usize>,
+    ) -> io::Result<std::sync::Arc<Self>> {
         let path = eng.path.clone();
         let oplog_path = oplog_path_for(&path);
         // 古い .crc は WAL 活動後に stale になるので削除 (open_concurrent_with_oplog と同じ扱い)
@@ -9220,7 +9268,7 @@ impl Engine {
             std::sync::Arc::new(enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?)
         };
         eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
-        Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
+        Ok(Self::spawn_consumer_with_oplog_queue_cap(eng, Some(wal), queue_capacity))
     }
 
     fn spawn_consumer(eng: Self) -> std::sync::Arc<Self> {
@@ -9278,7 +9326,14 @@ impl Engine {
         use std::sync::atomic::AtomicBool;
         use crate::write_queue::WriteQueue;
 
-        let qc = queue_cap.unwrap_or(crate::write_queue::DEFAULT_WRITE_QUEUE_CAP);
+        // #116: default を DB の max_entities に連動させる。1M slot 固定は
+        // write_queue + oplog_record_queue の 2 本で per-DB ~128MiB を eager 確保し、
+        // per-tenant / per-user に DB を分ける構成の host 密度を RAM(GB)×~8 に縛る。
+        // 小 DB (max_entities が小さい) は queue も小さく、default 16M DB は従来
+        // どおり 1M slot (挙動不変)。floor 4096 は burst 吸収の下限。
+        let qc = queue_cap.unwrap_or_else(|| {
+            (eng.max_entities as usize).clamp(4096, crate::write_queue::DEFAULT_WRITE_QUEUE_CAP)
+        });
         let queue = Arc::new(WriteQueue::with_capacity(qc));
         let shutdown = Arc::new(AtomicBool::new(false));
         // WAL 有効時のみ oplog_record_queue を生やす。 writer は直接 wal.append せず
@@ -10188,6 +10243,12 @@ impl Engine {
 
     /// oplog への参照(テスト / 内部用)。
     pub fn oplog(&self) -> Option<&std::sync::Arc<enchudb_oplog::oplog::OpLog>> { self.oplog.as_ref() }
+
+    /// #116: write queue の slot 数 (観測用)。concurrent mode でなければ None。
+    /// oplog_record_queue も同じ capacity で確保される。
+    pub fn write_queue_capacity(&self) -> Option<usize> {
+        self.write_queue.as_ref().map(|q| q.capacity())
+    }
 
     /// push 済みの全 Op が apply 完了するまで spin 待ち。`tie_async` の同期点。
     /// `queue.is_empty()` は pop 直後 / apply 前のウィンドウで true になる race が
