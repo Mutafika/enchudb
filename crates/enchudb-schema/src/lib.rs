@@ -2026,7 +2026,12 @@ impl<'a> EntityRef<'a> {
         let eng = self.db.engine();
         match cd.ty {
             ColumnType::Number => eng.get(self.eid, &cd.himo_name).map(|v| Value::Number(v as i64)),
-            ColumnType::Ref => eng.get(self.eid, &cd.himo_name).map(|v| Value::Ref(v as EntityId)),
+            // #184: storage の Ref 値は u32 (local 部) なので、素 cast すると find() /
+            // commit() が返す full eid (peer prefix 付き) と食い違う。Ref は必ず自 DB 内
+            // entity (翻訳済み foreign 含む = 自 prefix) を指すので自 peer_id で復元する。
+            ColumnType::Ref => eng
+                .get(self.eid, &cd.himo_name)
+                .map(|v| Value::Ref(enchudb_oplog::make_eid(eng.peer_id(), v))),
             // #119: 借用返しの `get_text` は writer 稼働中に seqlock verify を通らず torn
             // bytes を掴む (= from_utf8 が失敗して silent に None を返す)。 元々即コピーして
             // いるので、 verify 付きの owned 版に寄せてもコピー回数は変わらない。
