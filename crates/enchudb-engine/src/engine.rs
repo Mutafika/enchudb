@@ -4537,9 +4537,10 @@ impl Engine {
             // (`clear_cell_versions` の doc 参照)。
             self.clear_cell_versions(global);
             self.entities.allocate_at(global);
-            if let Some(q) = self.write_queue.as_ref() {
-                q.push(crate::write_queue::Op::EntityCreated { local: global });
+            // #195: queue に積まず counter 対称 bump (entity() の同所コメント参照)。
+            if self.write_queue.is_some() {
                 self.push_count.fetch_add(1, Ordering::Release);
+                self.apply_count.fetch_add(1, Ordering::Release);
             }
             let peer = self.peer_id.load(Ordering::Acquire);
             return Ok(enchudb_oplog::make_eid(peer, global));
@@ -4573,10 +4574,12 @@ impl Engine {
         // EntitySet で live mark + next_eid 前進 (CAS safe)
         self.entities.allocate_at(global);
 
-        // concurrent mode barrier (entity() と同じ)
-        if let Some(q) = self.write_queue.as_ref() {
-            q.push(crate::write_queue::Op::EntityCreated { local: global });
+        // concurrent mode barrier (entity() と同じ)。
+        // #195: queue に積まず counter 対称 bump — consumer thread 自身が bridge 中に
+        // ここを通る (blocking push だと自縄自縛 livelock)。
+        if self.write_queue.is_some() {
             self.push_count.fetch_add(1, Ordering::Release);
+            self.apply_count.fetch_add(1, Ordering::Release);
         }
         let peer = self.peer_id.load(Ordering::Acquire);
         Ok(enchudb_oplog::make_eid(peer, global))
@@ -5117,14 +5120,21 @@ impl Engine {
         if reused {
             self.clear_cell_versions(local);
         }
-        // concurrent mode (= consumer thread 稼働) なら barrier 用に空 op を
-        // 流す。 issue5: push_count と apply_count を対称に保たないと
+        // concurrent mode (= consumer thread 稼働) なら barrier counter を対称に
+        // 進める。 issue5: push_count と apply_count を対称に保たないと
         // `flush_writes` が ties drain 前に early return して live query が
         // pending Tie を見落とす。 undo 廃止 (v4) 後は payload なしで
         // counter increment のみが起こる。
-        if let Some(q) = self.write_queue.as_ref() {
-            q.push(crate::write_queue::Op::EntityCreated { local });
+        //
+        // #195: 以前は `Op::EntityCreated` を queue に積んでいたが、 drain 側は
+        // no-op (counter 対称用のみ) なのに blocking push で、 consumer thread
+        // 自身が bridge (`transfer_oplog_to_sync_ops`) 中に `entity_in` する経路で
+        // 「満杯 queue の唯一の drainer が push に blocking」する livelock に
+        // なった (#116 の小 queue default で顕在化)。 queue を経由せず両 counter を
+        // 直接進める (push 先 → apply 後、 apply > push を作らない順序)。
+        if self.write_queue.is_some() {
             self.push_count.fetch_add(1, Ordering::Release);
+            self.apply_count.fetch_add(1, Ordering::Release);
         }
         let peer = self.peer_id.load(Ordering::Acquire);
         enchudb_oplog::make_eid(peer, local)
@@ -10050,6 +10060,9 @@ impl Engine {
                 // v4 (undo 廃止) 以降は no-op。 `entity()` で local slot は writer
                 // thread 側で既に allocate 済み。 ここに来るのは `flush_writes` の
                 // push_count / apply_count counter を対称に進めるためだけ (issue5)。
+                // #195: 新規 code はこの op を queue に積まない (counter 直接 bump に
+                // 置換 — blocking push が consumer 自身の bridge 経路で livelock を
+                // 起こした)。 variant と本 arm は互換のため残置。
             }
         }
     }
