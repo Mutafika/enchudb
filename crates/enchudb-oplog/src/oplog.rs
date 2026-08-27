@@ -202,7 +202,8 @@ pub fn resign_with_eid(
         | DecodedOp::Delete { .. }
         | DecodedOp::Content { .. }
         | DecodedOp::TieNamed { .. }
-        | DecodedOp::TieLeaf { .. } => {}
+        | DecodedOp::TieLeaf { .. }
+        | DecodedOp::TieRef { .. } => {}
         DecodedOp::Commit | DecodedOp::Vocab { .. } => return None,
     }
     let mut sb = rec.signed_bytes.clone();
@@ -219,6 +220,49 @@ pub fn resign_with_eid(
     sb[payload_off..payload_off + 8].copy_from_slice(&new_eid.to_le_bytes());
     // crc は payload のみが対象 (append 時と同じ規約)
     let crc = fnv1a(&sb[payload_off..payload_end]);
+    sb[36..40].copy_from_slice(&crc.to_le_bytes());
+    let (signature, pubkey_fp) = match keypair {
+        Some(kp) => (kp.sign(&sb), kp.pubkey_fp()),
+        None => (ZERO_SIGNATURE, ZERO_PUBKEY_FP),
+    };
+    Some(ResignedRecord { signed_bytes: sb, signature, pubkey_fp })
+}
+
+/// #183: `Tie` record を **`TieRef` (target 世界番号同乗) に書き換えて** re-sign する。
+///
+/// bridge が「Ref 値が translated foreign entity を指す self-authored write」を
+/// 発送するために使う。wire の `Tie.value` (u32) は元 entity の世界番号 (u64) を
+/// 運べないため、op ごと組み替える。`resign_with_eid` と同じく lsn / hlc /
+/// author_peer は**維持** (LWW identity 不変、変わるのは op 表現と宛名だけ)。
+///
+/// - `new_eid`: 行 eid (自行なら元のまま、translated 行なら世界番号へ書き戻し済みの値)
+/// - `target_world`: Ref が指す元 entity の世界番号 (`make_eid(owner, owner_local)`)
+/// - `Tie` 以外の op は None (TieNamed の Ref は従来どおり呼び元で skip)
+pub fn resign_as_tie_ref(
+    rec: &Record,
+    new_eid: u64,
+    target_world: u64,
+    keypair: Option<&crate::keys::Keypair>,
+) -> Option<ResignedRecord> {
+    let himo_id = match rec.op {
+        DecodedOp::Tie { himo_id, .. } => himo_id,
+        _ => return None,
+    };
+    let old = &rec.signed_bytes;
+    if old.len() < SIGNED_PAYLOAD_HEADER_SIZE {
+        return None;
+    }
+    // header は元 record から流用し、op_byte / payload_len / crc を差し替える
+    let mut sb = Vec::with_capacity(SIGNED_PAYLOAD_HEADER_SIZE + 20);
+    sb.extend_from_slice(&old[0..SIGNED_PAYLOAD_HEADER_SIZE]);
+    sb[3] = op_type::TIE_REF;
+    sb[4..8].copy_from_slice(&20u32.to_le_bytes());
+    // payload: eid(8) + himo_id(2) + pad(2) + target(8) — Tie と同じ 4-align 規約
+    sb.extend_from_slice(&new_eid.to_le_bytes());
+    sb.extend_from_slice(&himo_id.to_le_bytes());
+    sb.extend_from_slice(&[0u8; 2]);
+    sb.extend_from_slice(&target_world.to_le_bytes());
+    let crc = fnv1a(&sb[SIGNED_PAYLOAD_HEADER_SIZE..]);
     sb[36..40].copy_from_slice(&crc.to_le_bytes());
     let (signature, pubkey_fp) = match keypair {
         Some(kp) => (kp.sign(&sb), kp.pubkey_fp()),
@@ -249,6 +293,10 @@ pub mod op_type {
     /// himo は名前で運ぶ (content `_c_{key}` 等 動的 himo と同じ理由)。 受信側は
     /// ensure_himo_named → leaf.insert(bytes) → cell に offset を set する。
     pub const TIE_LEAF: u8 = 8;
+    /// #183: Ref 値の target を世界番号 (u64) 同乗で運ぶ Tie。bridge が
+    /// 「translated foreign entity への Ref write」を発送するときだけ合成する
+    /// (author のローカル oplog には現れない)。
+    pub const TIE_REF: u8 = 9;
 }
 
 /// WAL に書く所有型 op。 `Op` の owned 版で、 queue 渡し用 (consumer 側で
@@ -415,6 +463,14 @@ pub enum DecodedOp {
     TieNamed { eid: u64, himo_name: String, himo_kind: u8, value: u32 },
     /// 0.12.0 (#88): Leaf payload を bytes 同乗で運ぶ Tie (vid 無し)。
     TieLeaf { eid: u64, himo_name: String, himo_kind: u8, bytes: Vec<u8> },
+    /// #183: Ref 値を **target の世界番号 (u64) 同乗**で運ぶ Tie。
+    ///
+    /// wire の `Tie.value` (u32) は translated foreign target の元 entity
+    /// (世界番号) を表現できないため、bridge が発送時に `Tie` から書き換える。
+    /// author の**ローカル oplog にはこの op は現れない** (bridge 合成専用)。
+    /// 受信側は `target` を「産みの親」key (0.11 semantics) で ref target table
+    /// 空間の local eid へ翻訳する。
+    TieRef { eid: u64, himo_id: u16, target: u64 },
 }
 
 /// リカバリ結果の 1 レコード(HLC + 署名込み)。
@@ -1494,6 +1550,12 @@ fn decode_op(op_byte: u8, payload: &[u8]) -> Option<DecodedOp> {
             if payload.len() < 8 + blen { return None; }
             let bytes = payload[8..8 + blen].to_vec();
             Some(DecodedOp::Vocab { vid, bytes })
+        }
+        op_type::TIE_REF if payload.len() >= 20 => {
+            let eid = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+            let himo_id = u16::from_le_bytes(payload[8..10].try_into().unwrap());
+            let target = u64::from_le_bytes(payload[12..20].try_into().unwrap());
+            Some(DecodedOp::TieRef { eid, himo_id, target })
         }
         _ => None,
     }

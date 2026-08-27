@@ -314,13 +314,16 @@ impl Syncer {
             | DecodedOp::Delete { eid }
             | DecodedOp::Content { eid, .. }
             | DecodedOp::TieNamed { eid, .. }
-            | DecodedOp::TieLeaf { eid, .. } => engine.resolve_remote_eid_existing(*eid),
+            | DecodedOp::TieLeaf { eid, .. }
+            | DecodedOp::TieRef { eid, .. } => engine.resolve_remote_eid_existing(*eid),
             DecodedOp::Commit | DecodedOp::Vocab { .. } => None,
         }) else {
             return;
         };
         match &rec.op {
-            DecodedOp::Tie { himo_id, .. } | DecodedOp::Untie { himo_id, .. } => {
+            DecodedOp::Tie { himo_id, .. }
+            | DecodedOp::Untie { himo_id, .. }
+            | DecodedOp::TieRef { himo_id, .. } => {
                 store.try_set(local_eid, *himo_id, rec.hlc);
             }
             DecodedOp::Delete { .. } => {
@@ -761,6 +764,27 @@ impl Syncer {
                 // request17 step 5: LWW / tombstone の判定は engine (`set_cell`) の
                 // 内側だけ。 ここで判定して別関数で適用する形は、 呼び忘れれば黙って
                 // 壊れる (実際 ローカル write 経路がそうなっていた = #154/#160 の根)。
+                ApplyResult::from_lww(self.engine.remote_tie_apply(local_eid, *himo_id, value, rec.hlc, Some(relayed_header(rec))))
+            }
+            DecodedOp::TieRef { eid, himo_id, target } => {
+                // #183: Ref 値の target を**世界番号 (u64) 同乗**で運ぶ Tie。author の
+                // bridge が「translated foreign entity への Ref write」を書き換えた形。
+                // 行 eid は通常の翻訳、target は「産みの親」key (0.11 semantics =
+                // eid_peer が author) で ref target table 空間の local eid へ翻訳する。
+                // 自分が target の産みの親なら identity、第三者 peer なら target 自身の
+                // Tie と同じ写像に収束する (resolve_remote_ref_value の key 空間共有)。
+                let local_eid = match self.engine.resolve_remote_eid(*eid, *himo_id) {
+                    Some(e) => e,
+                    None => return ApplyResult::Dropped,
+                };
+                let value = match self.engine.resolve_remote_ref_value(
+                    enchudb_oplog::eid_peer(*target),
+                    enchudb_oplog::eid_local(*target),
+                    *himo_id,
+                ) {
+                    Some(v) => v,
+                    None => return ApplyResult::Dropped,
+                };
                 ApplyResult::from_lww(self.engine.remote_tie_apply(local_eid, *himo_id, value, rec.hlc, Some(relayed_header(rec))))
             }
             DecodedOp::Untie { eid, himo_id } => {
