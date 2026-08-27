@@ -2043,6 +2043,14 @@ pub struct Engine {
     /// これを信用せず lsn 0 から全 ring を検証し直す (移行 heal)。 entry の有無が
     /// 「この session で検証済みか」の marker を兼ねる。
     ack_walk_resume: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, u32>>>,
+    /// #221: `_sync_ops` row の purge (delete + free list への slot 返却) を atomic に
+    /// する専用 lock。 `Engine::delete` は「実際に消したか」を返さない (冪等) ので、
+    /// lock 無しだと並行 purge (`absorb_pull_acks` は複数 peer からの並行 pull で
+    /// 並行実行される) が同じ slot を free list に**二重 push** → 後続の
+    /// `entity_in("_sync_ops")` が同じ eid を二回払い出し、 bridge row が上書きで
+    /// 消える (silent)。 lock 内で「row がまだ生きているか」を再検証してから
+    /// delete + push する。
+    sync_ops_purge_lock: std::sync::Arc<std::sync::Mutex<()>>,
     /// 0.8.11 (issue: stress_10k_cycle flaky): `transfer_oplog_to_sync_ops` の
     /// 排他 lock。 0.8.0 で `concurrentize_with_oplog` の background consumer thread
     /// が自動 transfer を呼ぶようになったが、 手動 transfer との並列実行で
@@ -2365,6 +2373,7 @@ impl Engine {
             sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ack_walk_resume: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            sync_ops_purge_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
@@ -2719,6 +2728,7 @@ impl Engine {
             sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ack_walk_resume: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            sync_ops_purge_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
             faults: std::sync::Arc::new(std::array::from_fn(|_| {
@@ -3655,6 +3665,7 @@ impl Engine {
             sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ack_walk_resume: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            sync_ops_purge_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
             faults: std::sync::Arc::new(std::array::from_fn(|_| {
                 std::sync::atomic::AtomicU64::new(0)
@@ -4505,11 +4516,6 @@ impl Engine {
             return Ok(0);
         }
 
-        // dead row の slot 返却用 (reclaim_sync_ops と同じ手順)。
-        let sync_ops_meta = self.tables.iter()
-            .find(|t| t.name == "_sync_ops")
-            .map(|t| (t.eid_range_lo, t.free_locals.clone(), t.free_locals_nonempty.clone()));
-
         let mut ack_lsn: u32 = 0;
         for (lsn, eid) in rows.iter() {
             let decoded = self
@@ -4524,19 +4530,14 @@ impl Engine {
                     ack_lsn = *lsn;
                 }
                 None => {
-                    eprintln!(
-                        "[enchudb] sync: purging undeliverable _sync_ops row \
-                         (lsn {lsn}, missing/undecodable payload) — see #217"
-                    );
-                    self.sync_dead_rows_purged
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let local = enchudb_oplog::eid_local(*eid);
-                    self.delete(*eid);
-                    if let Some((lo, ref free_list, ref nonempty)) = sync_ops_meta
-                        && local >= lo
-                    {
-                        free_list.lock().unwrap().push(local - lo);
-                        nonempty.store(true, std::sync::atomic::Ordering::Release);
+                    // #221: delete + free list push は専用 lock 下で atomic に。
+                    if self.purge_sync_ops_row(*eid, lsn_hid, *lsn) {
+                        eprintln!(
+                            "[enchudb] sync: purging undeliverable _sync_ops row \
+                             (lsn {lsn}, missing/undecodable payload) — see #217"
+                        );
+                        self.sync_dead_rows_purged
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     ack_lsn = *lsn;
                 }
@@ -4567,6 +4568,72 @@ impl Engine {
             }
         }
         Ok(ack_lsn)
+    }
+
+    /// #221: `_sync_ops` の row を 1 件 purge する (delete + ring free list への
+    /// slot 返却)。 **専用 lock 下で「snapshot 当時と同じ row か」を再検証してから**
+    /// 消す。
+    ///
+    /// `Engine::delete` は冪等で戻り値を持たないため、 lock 無しで並行 purge すると
+    /// 同じ slot が free list に二重 push され、 後続の `entity_in("_sync_ops")` が
+    /// 同一 eid を二回払い出して bridge row が silent に上書きされる。 並行経路は
+    /// 実在する: `Syncer::absorb_pull_acks` (→ `reclaim_sync_ops` / ack walk の
+    /// dead row purge) は複数 peer からの並行 pull で並行実行される。
+    ///
+    /// **検証は「生存」ではなく `expected_lsn` との一致で行う (ABA)。** 生存だけを
+    /// 見ると、 T1 が purge → slot が bridge に再利用されて同一 eid に新 row が乗る
+    /// → T2 が stale snapshot で「生存」と判定して**その新 row を消す**、 が成立する
+    /// (しかも slot は pop 済みなので dedupe も効かない)。 `next_sync_lsn` は単調
+    /// 増加なので、 lsn は「同じ row か」の判別子として機能する (再利用後の row は
+    /// 必ず大きい lsn を持つ)。 この窓は ring 再利用が常時走る構成 —
+    /// まさに reclaim + bridge を並行で回す運転 — で開く。
+    ///
+    /// **`free_locals` は `delete` の前に取り、 push まで保持する。** free list への
+    /// producer は本 helper だけではない — `entity_in` の枯渇 slow path から呼ばれる
+    /// [`Engine::rebuild_free_locals`] が range を線形 scan して**非 live な local を
+    /// 穴として push** する。 delete 後 push 前の中間状態でこれが走ると、 同じ slot が
+    /// 両者から独立に push されて二重になる (expected_lsn は「同じ row を 2 者が
+    /// 消す」しか防げない)。 free list を掴んだまま delete すれば rebuild は中間状態を
+    /// 観測できず、 待たされた後は `fl` が非空なので早期 return する。 枯渇は
+    /// 「free list を使い切るまで bridge する」運転で常態なので、 この窓は実運用で開く。
+    ///
+    /// lock 順序は `free_locals` → (delete 内部の) `EntitySet::free_lock` の一方向のみ。
+    /// `EntitySet` 側は Engine の table に触らないので逆転しない。
+    ///
+    /// **コストの注記 (未実測)**: この形で critical section は「Vec への push」から
+    /// 「`delete` 全体 (oplog append + column write + tombstone)」に広がる。 その間
+    /// `entity_in("_sync_ops")` は待つので、 reclaim sweep 中は bridge の row 払い出しが
+    /// row 単位で purge と競合する。 row ごとに解放されるので sweep 全体を止める形では
+    /// ないが、 影響は測っていない — fanout で bridge throughput を見るときの観測点。
+    ///
+    /// 戻り値 `true` = 自分が消した (呼び元は計数して良い)、 `false` = 既に他者が
+    /// 消した / slot が再利用されて別 row になっていた。
+    fn purge_sync_ops_row(
+        &self,
+        eid: enchudb_oplog::EntityId,
+        lsn_hid: u16,
+        expected_lsn: u32,
+    ) -> bool {
+        let _guard = self.sync_ops_purge_lock.lock().unwrap();
+        if self.get_by_id(eid, lsn_hid) != Some(expected_lsn) {
+            return false;
+        }
+        let meta = self
+            .tables
+            .iter()
+            .find(|t| t.name == "_sync_ops")
+            .map(|t| (t.eid_range_lo, t.free_locals.clone(), t.free_locals_nonempty.clone()));
+        let local = enchudb_oplog::eid_local(eid);
+        match meta {
+            Some((lo, free_list, nonempty)) if local >= lo => {
+                let mut list = free_list.lock().unwrap();
+                self.delete(eid);
+                list.push(local - lo);
+                nonempty.store(true, std::sync::atomic::Ordering::Release);
+            }
+            _ => self.delete(eid),
+        }
+        true
     }
 
     /// #217: `_sync_peers` に記録済みの `peer` の consumed_lsn。 row 無しは 0。
@@ -4631,12 +4698,6 @@ impl Engine {
         let Some(lsn_hid) = self.himo_id("_sync_ops.lsn") else { return 0; };
         let lsn_hid_u16 = lsn_hid as u16;
 
-        // 0.8.0: _sync_ops table の eid_range_lo を取り、 reclaim 後 free list に
-        // local id を push する (= ring buffer 化)。
-        let sync_ops_meta = self.tables.iter()
-            .find(|t| t.name == "_sync_ops")
-            .map(|t| (t.eid_range_lo, t.free_locals.clone(), t.free_locals_nonempty.clone()));
-
         // _sync_ops 全 row を走査して lsn < watermark を delete
         let rows = self.entities_with_himo(lsn_hid_u16);
         let payload_hid = self.himo_id("_sync_ops.payload").map(|h| h as u16);
@@ -4667,16 +4728,12 @@ impl Engine {
                     *e = rec.hlc;
                 }
             }
-            let local = enchudb_oplog::eid_local(eid);
-            self.delete(eid);
-            // 0.8.0: free list に追加 (= 次回 entity_in("_sync_ops") で再利用)
-            if let Some((lo, ref free_list, ref nonempty)) = sync_ops_meta
-                && local >= lo
-            {
-                free_list.lock().unwrap().push(local - lo);
-                nonempty.store(true, std::sync::atomic::Ordering::Release);
+            // 0.8.0: free list に追加 (= 次回 entity_in("_sync_ops") で再利用)。
+            // #221: delete + push は専用 lock 下で atomic に (並行 reclaim の二重
+            // push = slot 二重払い出し → bridge row の silent 上書き、を塞ぐ)。
+            if self.purge_sync_ops_row(eid, lsn_hid_u16, lsn) {
+                purged += 1;
             }
-            purged += 1;
         }
         if !reclaimed_max.is_empty() {
             let entries: Vec<(u32, enchudb_oplog::Hlc)> =
@@ -11578,6 +11635,177 @@ impl Drop for Engine {
 }
 
 // ════════════════ テスト ════════════════
+
+#[cfg(test)]
+mod sync_ops_purge_tests {
+    use super::*;
+
+    fn tmp_engine(tag: &str) -> Engine {
+        let path = format!(
+            "{}/enchudb-purge-{}-{}",
+            std::env::temp_dir().display(),
+            tag,
+            std::process::id()
+        );
+        for suf in ["", ".tables", ".oplog"] {
+            let _ = std::fs::remove_file(format!("{path}{suf}"));
+        }
+        let mut eng = Engine::create_with_capacity(&path, 4096).unwrap();
+        eng.define_table("t", 100).unwrap();
+        eng.enable_sync_tables().unwrap();
+        eng
+    }
+
+    /// #221 (review 2): free list への producer は purge helper だけではない —
+    /// `rebuild_free_locals` (枯渇 slow path) が非 live local を穴として push する。
+    /// purge が delete 後 push 前に中断されると同じ slot が両者から入る。
+    ///
+    /// ここでは逐次順序での不変条件だけを確認する: purge 済み slot に対して rebuild を
+    /// 走らせても free list に重複が生まれない (rebuild は非空を見て早期 return)。
+    /// **窓そのものは逐次では作れない**ので、 これは回帰検知であって window の
+    /// guard ではない (`concurrent_exhaustion_and_purge_do_not_duplicate_slots` の
+    /// 注意書きも参照)。
+    #[test]
+    fn rebuild_does_not_duplicate_purged_slots() {
+        let eng = tmp_engine("rebuild");
+        let lsn_hid = eng.himo_id("_sync_ops.lsn").unwrap() as u16;
+        let tid = eng.tables.iter().position(|t| t.name == "_sync_ops").unwrap();
+
+        let mut eids = Vec::new();
+        for i in 0..8u32 {
+            let e = eng.entity_in("_sync_ops").unwrap();
+            eng.tie_to_by_id(e, lsn_hid, i + 1);
+            eids.push((e, i + 1));
+        }
+        for (e, lsn) in &eids {
+            assert!(eng.purge_sync_ops_row(*e, lsn_hid, *lsn));
+        }
+
+        // 枯渇 slow path 相当: 非 live local を scan して穴を push する経路。
+        eng.rebuild_free_locals(tid);
+
+        let list = eng.tables[tid].free_locals.lock().unwrap().clone();
+        let mut uniq = list.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(
+            list.len(),
+            uniq.len(),
+            "#221: free list に slot が二重に入った (purge と rebuild の二重 push): {list:?}"
+        );
+    }
+
+    /// #221 (review 2): purge と **枯渇 slow path (`rebuild_free_locals`)** を並行
+    /// させても free list に slot が二重に入らないこと。
+    ///
+    /// purge が `free_locals` を delete の前に取らないと、 「delete 済み・push 前」の
+    /// 中間状態を rebuild の scan が観測して同じ slot を独立に push する。
+    ///
+    /// **注意: この test は窓が閉じていることの証明にはならない。** 発火には
+    /// 「free list が空 + 枯渇 + purge が delete と push の間」の同時成立が要り、
+    /// fix を外した状態でも緑のままだった (3 回試行)。 回帰検知として置いているが、
+    /// 正しさの根拠は helper 側の lock 順序 (doc 参照) であってこの test ではない。
+    #[test]
+    fn concurrent_exhaustion_and_purge_do_not_duplicate_slots() {
+        let eng = std::sync::Arc::new(tmp_engine("exhaust"));
+        let lsn_hid = eng.himo_id("_sync_ops.lsn").unwrap() as u16;
+        let tid = eng.tables.iter().position(|t| t.name == "_sync_ops").unwrap();
+
+        // ring をほぼ埋める (次の alloc が枯渇 → rebuild_free_locals を踏む状態)。
+        let range = eng.tables[tid].eid_range_hi - eng.tables[tid].eid_range_lo;
+        let fill = range.saturating_sub(4);
+        let mut rows = Vec::with_capacity(fill as usize);
+        for i in 0..fill {
+            let e = eng.entity_in("_sync_ops").unwrap();
+            eng.tie_to_by_id(e, lsn_hid, i + 1);
+            rows.push((e, i + 1));
+        }
+
+        // A: 前半 row を purge (free list に slot を返す)
+        // B: 枯渇まで alloc し続ける (= rebuild_free_locals を繰り返し踏む)
+        let purger = {
+            let eng = eng.clone();
+            let rows: Vec<_> = rows.iter().take(rows.len() / 2).copied().collect();
+            std::thread::spawn(move || {
+                for (e, lsn) in rows {
+                    eng.purge_sync_ops_row(e, lsn_hid, lsn);
+                }
+            })
+        };
+        let allocator = {
+            let eng = eng.clone();
+            std::thread::spawn(move || {
+                for i in 0..2000u32 {
+                    match eng.entity_in("_sync_ops") {
+                        Ok(e) => eng.tie_to_by_id(e, lsn_hid, 1_000_000 + i),
+                        Err(_) => std::thread::yield_now(),
+                    }
+                }
+            })
+        };
+        purger.join().unwrap();
+        allocator.join().unwrap();
+
+        let list = eng.tables[tid].free_locals.lock().unwrap().clone();
+        let mut uniq = list.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(
+            list.len(),
+            uniq.len(),
+            "#221: purge と rebuild_free_locals の並行で slot が二重 push された \
+             (free list {} entries, {} unique)",
+            list.len(),
+            uniq.len()
+        );
+    }
+
+    /// #221 (review): purge の再検証は「生存」ではなく **`expected_lsn` 一致**で
+    /// 行うこと (ABA)。
+    ///
+    /// 生存だけを見ると、 T1 の purge で解放された slot が bridge に再利用されて
+    /// 同一 eid に新 row が乗った後、 T2 が stale snapshot で「生存」と判定して
+    /// **その新 row を消す**。 slot は pop 済みなので dedupe も効かない。 この窓は
+    /// ring 再利用が常時走る運転 (reclaim + bridge の並行) で開く。
+    ///
+    /// ここでは interleaving を手で固定して核を検証する:
+    /// T1 purge → slot 再利用 (同一 eid に新 lsn) → T2 が stale lsn で purge。
+    #[test]
+    fn stale_snapshot_does_not_purge_the_reused_slot() {
+        let eng = tmp_engine("aba");
+        let lsn_hid = eng.himo_id("_sync_ops.lsn").unwrap() as u16;
+
+        // row A: lsn = 5
+        let eid = eng.entity_in("_sync_ops").unwrap();
+        eng.tie_to_by_id(eid, lsn_hid, 5);
+        assert_eq!(eng.get_by_id(eid, lsn_hid), Some(5));
+
+        // T1 相当: snapshot (eid, lsn=5) で purge → slot が free list へ
+        assert!(eng.purge_sync_ops_row(eid, lsn_hid, 5), "T1 の purge が成立すること");
+        assert_eq!(eng.get_by_id(eid, lsn_hid), None);
+
+        // bridge 相当: 解放 slot を再利用して **同一 eid** に新 row (lsn = 900)
+        let reused = eng.entity_in("_sync_ops").unwrap();
+        assert_eq!(reused, eid, "前提: 解放 slot が再利用されて同じ eid になる");
+        eng.tie_to_by_id(reused, lsn_hid, 900);
+
+        // T2 相当: stale snapshot (lsn=5) のまま purge を試みる。
+        // 生存判定だけの実装はここで新 row を消してしまう。
+        assert!(
+            !eng.purge_sync_ops_row(eid, lsn_hid, 5),
+            "#221 ABA: stale snapshot が再利用後の row を purge した"
+        );
+        assert_eq!(
+            eng.get_by_id(eid, lsn_hid),
+            Some(900),
+            "#221 ABA: bridge されたばかりの row が silent に消えた"
+        );
+
+        // 正しい snapshot なら消せる (検証が過剰に厳しくないこと)。
+        assert!(eng.purge_sync_ops_row(eid, lsn_hid, 900));
+        assert_eq!(eng.get_by_id(eid, lsn_hid), None);
+    }
+}
 
 #[cfg(test)]
 mod reclaimed_floor_tests {
