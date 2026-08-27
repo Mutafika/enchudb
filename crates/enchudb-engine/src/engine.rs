@@ -2043,6 +2043,14 @@ pub struct Engine {
     /// これを信用せず lsn 0 から全 ring を検証し直す (移行 heal)。 entry の有無が
     /// 「この session で検証済みか」の marker を兼ねる。
     ack_walk_resume: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, u32>>>,
+    /// #221: `_sync_ops` row の purge (delete + free list への slot 返却) を atomic に
+    /// する専用 lock。 `Engine::delete` は「実際に消したか」を返さない (冪等) ので、
+    /// lock 無しだと並行 purge (`absorb_pull_acks` は複数 peer からの並行 pull で
+    /// 並行実行される) が同じ slot を free list に**二重 push** → 後続の
+    /// `entity_in("_sync_ops")` が同じ eid を二回払い出し、 bridge row が上書きで
+    /// 消える (silent)。 lock 内で「row がまだ生きているか」を再検証してから
+    /// delete + push する。
+    sync_ops_purge_lock: std::sync::Arc<std::sync::Mutex<()>>,
     /// 0.8.11 (issue: stress_10k_cycle flaky): `transfer_oplog_to_sync_ops` の
     /// 排他 lock。 0.8.0 で `concurrentize_with_oplog` の background consumer thread
     /// が自動 transfer を呼ぶようになったが、 手動 transfer との並列実行で
@@ -2365,6 +2373,7 @@ impl Engine {
             sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ack_walk_resume: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            sync_ops_purge_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
@@ -2719,6 +2728,7 @@ impl Engine {
             sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ack_walk_resume: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            sync_ops_purge_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
             faults: std::sync::Arc::new(std::array::from_fn(|_| {
@@ -3655,6 +3665,7 @@ impl Engine {
             sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ack_walk_resume: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            sync_ops_purge_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
             faults: std::sync::Arc::new(std::array::from_fn(|_| {
                 std::sync::atomic::AtomicU64::new(0)
@@ -4505,11 +4516,6 @@ impl Engine {
             return Ok(0);
         }
 
-        // dead row の slot 返却用 (reclaim_sync_ops と同じ手順)。
-        let sync_ops_meta = self.tables.iter()
-            .find(|t| t.name == "_sync_ops")
-            .map(|t| (t.eid_range_lo, t.free_locals.clone(), t.free_locals_nonempty.clone()));
-
         let mut ack_lsn: u32 = 0;
         for (lsn, eid) in rows.iter() {
             let decoded = self
@@ -4524,19 +4530,14 @@ impl Engine {
                     ack_lsn = *lsn;
                 }
                 None => {
-                    eprintln!(
-                        "[enchudb] sync: purging undeliverable _sync_ops row \
-                         (lsn {lsn}, missing/undecodable payload) — see #217"
-                    );
-                    self.sync_dead_rows_purged
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let local = enchudb_oplog::eid_local(*eid);
-                    self.delete(*eid);
-                    if let Some((lo, ref free_list, ref nonempty)) = sync_ops_meta
-                        && local >= lo
-                    {
-                        free_list.lock().unwrap().push(local - lo);
-                        nonempty.store(true, std::sync::atomic::Ordering::Release);
+                    // #221: delete + free list push は専用 lock 下で atomic に。
+                    if self.purge_sync_ops_row(*eid, lsn_hid) {
+                        eprintln!(
+                            "[enchudb] sync: purging undeliverable _sync_ops row \
+                             (lsn {lsn}, missing/undecodable payload) — see #217"
+                        );
+                        self.sync_dead_rows_purged
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     ack_lsn = *lsn;
                 }
@@ -4567,6 +4568,44 @@ impl Engine {
             }
         }
         Ok(ack_lsn)
+    }
+
+    /// #221: `_sync_ops` の row を 1 件 purge する (delete + ring free list への
+    /// slot 返却)。 **専用 lock 下で「まだ生きているか」を再検証してから**消す。
+    ///
+    /// `Engine::delete` は冪等で戻り値を持たないため、 lock 無しで並行 purge すると
+    /// 同じ slot が free list に二重 push され、 後続の `entity_in("_sync_ops")` が
+    /// 同一 eid を二回払い出して bridge row が silent に上書きされる。 並行経路は
+    /// 実在する: `Syncer::absorb_pull_acks` (→ `reclaim_sync_ops` / ack walk の
+    /// dead row purge) は複数 peer からの並行 pull で並行実行される。
+    ///
+    /// 戻り値 `true` = 自分が消した (呼び元は計数して良い)、 `false` = 既に他者が
+    /// 消していた。 free list への push は前者のみ (dedupe も併用)。
+    fn purge_sync_ops_row(&self, eid: enchudb_oplog::EntityId, lsn_hid: u16) -> bool {
+        let _guard = self.sync_ops_purge_lock.lock().unwrap();
+        // lock 下の再検証: lsn cell が引ければ生存 (delete は全 himo を落とす)。
+        if self.get_by_id(eid, lsn_hid).is_none() {
+            return false;
+        }
+        let meta = self
+            .tables
+            .iter()
+            .find(|t| t.name == "_sync_ops")
+            .map(|t| (t.eid_range_lo, t.free_locals.clone(), t.free_locals_nonempty.clone()));
+        let local = enchudb_oplog::eid_local(eid);
+        self.delete(eid);
+        if let Some((lo, free_list, nonempty)) = meta
+            && local >= lo
+        {
+            let slot = local - lo;
+            let mut list = free_list.lock().unwrap();
+            // belt and braces: 万一 (lock 外の別経路が増えた等) でも二重にしない。
+            if !list.contains(&slot) {
+                list.push(slot);
+                nonempty.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        true
     }
 
     /// #217: `_sync_peers` に記録済みの `peer` の consumed_lsn。 row 無しは 0。
@@ -4631,12 +4670,6 @@ impl Engine {
         let Some(lsn_hid) = self.himo_id("_sync_ops.lsn") else { return 0; };
         let lsn_hid_u16 = lsn_hid as u16;
 
-        // 0.8.0: _sync_ops table の eid_range_lo を取り、 reclaim 後 free list に
-        // local id を push する (= ring buffer 化)。
-        let sync_ops_meta = self.tables.iter()
-            .find(|t| t.name == "_sync_ops")
-            .map(|t| (t.eid_range_lo, t.free_locals.clone(), t.free_locals_nonempty.clone()));
-
         // _sync_ops 全 row を走査して lsn < watermark を delete
         let rows = self.entities_with_himo(lsn_hid_u16);
         let payload_hid = self.himo_id("_sync_ops.payload").map(|h| h as u16);
@@ -4667,16 +4700,12 @@ impl Engine {
                     *e = rec.hlc;
                 }
             }
-            let local = enchudb_oplog::eid_local(eid);
-            self.delete(eid);
-            // 0.8.0: free list に追加 (= 次回 entity_in("_sync_ops") で再利用)
-            if let Some((lo, ref free_list, ref nonempty)) = sync_ops_meta
-                && local >= lo
-            {
-                free_list.lock().unwrap().push(local - lo);
-                nonempty.store(true, std::sync::atomic::Ordering::Release);
+            // 0.8.0: free list に追加 (= 次回 entity_in("_sync_ops") で再利用)。
+            // #221: delete + push は専用 lock 下で atomic に (並行 reclaim の二重
+            // push = slot 二重払い出し → bridge row の silent 上書き、を塞ぐ)。
+            if self.purge_sync_ops_row(eid, lsn_hid_u16) {
+                purged += 1;
             }
-            purged += 1;
         }
         if !reclaimed_max.is_empty() {
             let entries: Vec<(u32, enchudb_oplog::Hlc)> =
