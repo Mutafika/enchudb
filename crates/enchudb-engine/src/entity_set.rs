@@ -85,8 +85,17 @@ impl EntitySet {
         unsafe { &*(mm.as_ptr().add(8) as *const AtomicU32) }
     }
 
-    pub fn allocate(&self) -> u32 {
-        self.allocate_tracked().0
+    /// 設定された entity 上限。
+    pub fn max_entities(&self) -> u32 {
+        self.max_entities
+    }
+
+    /// slot を払い出す。 **満杯 (max_entities 到達 + free stack 空) なら `None`**。
+    ///
+    /// #59: 旧実装は `assert!` で panic していた。 embedded DB は他人の process に
+    /// 埋め込まれるので、 「DB が一杯」 という想定内事象で host を殺してはいけない。
+    pub fn allocate(&self) -> Option<u32> {
+        self.allocate_tracked().map(|(eid, _)| eid)
     }
 
     /// `allocate` + 「その slot が free stack からの **再利用**か」。
@@ -95,7 +104,7 @@ impl EntitySet {
     /// column) を持ち得るので、 払い出す側が落とす必要がある
     /// (`Engine::clear_cell_versions`)。 monotonic 払い出し (= 新品 slot) では
     /// 消す物が無いので、 hot path に消去コストを持ち込まないための戻り値。
-    pub fn allocate_tracked(&self) -> (u32, bool) {
+    pub fn allocate_tracked(&self) -> Option<(u32, bool)> {
         // 高速パス: monotonic increment（欠番方式、ロックフリー）
         let eid = self.next_eid_atomic().fetch_add(1, Ordering::Relaxed);
         if eid < self.max_entities {
@@ -104,30 +113,34 @@ impl EntitySet {
             // issue6 (perf 退化対策): writer hot path から mark_dirty を撤廃。
             // EntitySet 全領域は body_msync 内で常時 msync される (固定サイズ
             // で cheap な小領域)。
-            return (eid, false);
+            return Some((eid, false));
         }
         // 上限到達 → fetch_addを巻き戻してfree stackから再利用
         self.next_eid_atomic().fetch_sub(1, Ordering::Relaxed);
-        (self.allocate_from_free_stack(), true)
+        self.allocate_from_free_stack().map(|eid| (eid, true))
     }
 
     /// free stack から pop。上限到達時のみ呼ばれる。
     /// #77-H7: `free_lock` で push と直列化 (旧 CAS pop は push 側の
     /// 「slot 書き → count 書き」非 atomic 複合と混ざると、 eid 未書き込みの
     /// slot を読み得た)。
-    fn allocate_from_free_stack(&self) -> u32 {
+    fn allocate_from_free_stack(&self) -> Option<u32> {
         let _g = self.free_lock.lock().unwrap_or_else(|p| p.into_inner());
         let mm = self.region.slice();
         let free_count_off = self.free_offset;
         let fc = u32::from_le_bytes(mm[free_count_off..free_count_off + 4].try_into().unwrap());
-        assert!(fc > 0, "entity limit reached: max_entities={}, no free slots", self.max_entities);
+        // #59: 満杯は 「想定内だが続行不能」。 panic せず None を返し、 呼び出し側
+        // (Engine) が fault として記録 + 報告する。
+        if fc == 0 {
+            return None;
+        }
         let eid_off = self.free_offset + 4 + ((fc - 1) as usize) * 4;
         let eid = u32::from_le_bytes(mm[eid_off..eid_off + 4].try_into().unwrap());
         self.region.write_at(free_count_off, &(fc - 1).to_le_bytes());
         self.set_bit(eid, true);
         self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
         // EntitySet 全領域は body_msync 内で常時 msync (issue6 perf 対策)。
-        eid
+        Some(eid)
     }
 
     pub fn free(&self, eid: u32) {
@@ -349,7 +362,9 @@ mod tests {
         let handles: Vec<_> = (0..THREADS).map(|_| {
             let s = set.clone();
             std::thread::spawn(move || {
-                (0..PER).map(|_| s.allocate()).collect::<Vec<u32>>()
+                (0..PER)
+                    .map(|_| s.allocate().expect("枠は足りているはず"))
+                    .collect::<Vec<u32>>()
             })
         }).collect();
         let mut all: Vec<u32> = handles.into_iter()
@@ -370,7 +385,7 @@ mod tests {
     #[test]
     fn concurrent_double_free_no_double_push() {
         let set = make_set(4);
-        for _ in 0..4 { set.allocate(); } // 0..3 で飽和
+        for _ in 0..4 { assert!(set.allocate().is_some()); } // 0..3 で飽和
         let handles: Vec<_> = (0..8).map(|_| {
             let s = set.clone();
             std::thread::spawn(move || s.free(2))
@@ -379,10 +394,12 @@ mod tests {
         assert_eq!(set.count(), 3, "live_count が二重減算された");
 
         // free stack には 2 が 1 回だけ積まれているはず
-        assert_eq!(set.allocate(), 2, "stack から 2 が出るはず");
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            set.allocate() // stack 空 + 飽和 → panic が正しい
-        }));
-        assert!(result.is_err(), "二重 push された 2 が再払い出しされた");
+        assert_eq!(set.allocate(), Some(2), "stack から 2 が出るはず");
+        // #59: stack 空 + 飽和は panic ではなく None (embedded DB は host を殺さない)。
+        assert_eq!(
+            set.allocate(),
+            None,
+            "二重 push された 2 が再払い出しされた (満杯なら None であるべき)"
+        );
     }
 }

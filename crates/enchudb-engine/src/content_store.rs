@@ -76,7 +76,8 @@ impl ContentStore {
         INDEX_HEADER + ((eid as usize) * (MAX_KEYS as usize) + key_hash as usize) * 8
     }
 
-    pub fn set(&self, eid: u32, key: &str, content: &[u8]) {
+    /// content を格納する。 **data 領域が溢れたら `false`** (#59: panic しない)。
+    pub fn set(&self, eid: u32, key: &str, content: &[u8]) -> bool {
         let kh = Self::key_hash(key);
         let off = Self::index_offset(eid, kh);
 
@@ -102,9 +103,12 @@ impl ContentStore {
         let _ = self.index.ensure_committed(off + 8);
         let data_len = self.data.len();
         if (data_off + len) as usize > data_len {
-            // data領域溢れ — fetch_addを巻き戻してパニック
+            // #59: data 領域溢れ — fetch_add を巻き戻して **false を返す**。
+            // 512 MB 上限到達は 「想定内だが続行不能」 で、 embedded DB が host
+            // process を殺す理由にはならない。 呼び出し側 (Engine) が fault として
+            // 記録 + 報告する。
             self.data_end().fetch_sub(len, Ordering::Relaxed);
-            panic!("ContentStore data overflow: {} + {} > {}", data_off, len, data_len);
+            return false;
         }
         // MAGIC は lazy — ここで毎回書く (idempotent、 4 byte copy)。
         self.data.write_at(0, &MAGIC);
@@ -118,6 +122,7 @@ impl ContentStore {
             self.index.write_at(off + 4, &len.to_le_bytes());
             self.index.mark_dirty(off, 8);
         }
+        true
     }
 
     pub fn get(&self, eid: u32, key: &str) -> Option<&[u8]> {
