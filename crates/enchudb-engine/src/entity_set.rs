@@ -161,7 +161,7 @@ impl EntitySet {
         }
     }
 
-    /// v32: リモート peer から届いた eid を「存在する」ことにする。
+    /// リモート peer から届いた eid を「存在する」ことにする。
     /// 既に live なら no-op。next_eid / live_count / live bitmap を整合的に更新する。
     pub fn ensure_live(&self, eid: u32) {
         if eid >= self.max_entities { return; }

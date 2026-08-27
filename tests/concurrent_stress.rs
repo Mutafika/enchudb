@@ -1,7 +1,6 @@
-//! v27 並行性ストレステスト。
+//! 並行性ストレステスト。
 //!
-//! `cargo test --features v27 --test concurrent_stress` で実行する。
-//! v27 が無効な場合はテスト本体が空になるのでビルドだけ通る。
+//! `cargo test --test concurrent_stress` で実行する。
 
 use enchudb::{Engine, ValueType};
 use std::sync::Arc;

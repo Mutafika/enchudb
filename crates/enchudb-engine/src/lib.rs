@@ -57,7 +57,6 @@ pub mod vocabulary;
 pub mod leaf_store;
 pub mod entity_set;
 pub mod cylinder;
-pub mod cylinder_v27;
 pub mod himo_store;
 pub mod content_store;
 pub mod engine;

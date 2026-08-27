@@ -132,7 +132,7 @@ fn v7_db_upgrades_to_current_version_on_writer_open() {
         "新規 create が現行 version でない",
     );
 
-    // v7 を偽造する。 header CRC == 0 は「v27 以前の DB」として検証を通る経路なので、
+    // v7 を偽造する。 header CRC == 0 は「header CRC 導入以前の DB」として検証を通る経路なので、
     // version を 7 に戻して CRC を 0 にすれば v7 DB として open される。
     write_header_u32(&path, H_VERSION, 7);
     write_header_u32(&path, H_HEADER_CRC, 0);

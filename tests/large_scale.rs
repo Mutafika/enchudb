@@ -1,6 +1,6 @@
 //! 大量データ regression tests。`#[ignore]` 付きで手動実行用。
 //!
-//! 実行: `cargo test --features v32 --test large_scale -- --ignored --nocapture`
+//! 実行: `cargo test --test large_scale -- --ignored --nocapture`
 //!
 //! 目的:
 //! - 1000 万 entity スケールで基本 op がスケールする(O(1)/O(log n) 保持)

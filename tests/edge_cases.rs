@@ -1,9 +1,9 @@
-//! v27 エッジケーステスト。
+//! エッジケーステスト。
 //!
 //! 容量・上限、observation views、entity lifecycle、紐型混在、
 //! 永続化、concurrent モードの境界条件を確認する。
 //!
-//! `cargo test --features v27 --test edge_cases`
+//! `cargo test --test edge_cases`
 
 use enchudb::{Engine, ValueType};
 use std::sync::Arc;

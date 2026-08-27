@@ -1,9 +1,9 @@
-//! Property-based tests for EnchuDB v27.
+//! Property-based tests for EnchuDB.
 //!
 //! ランダムな操作列を shadow model (HashMap/HashSet) と並走させ、
 //! db の観測結果が shadow と一致することを検証する。
 //!
-//! 実行: `cargo test --features v27 --test property_based`
+//! 実行: `cargo test --test property_based`
 
 use enchudb::{Engine, ValueType};
 use proptest::prelude::*;

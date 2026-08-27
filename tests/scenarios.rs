@@ -1,9 +1,8 @@
-//! EnchuDB v27 実運用シナリオ統合テスト。
+//! EnchuDB 実運用シナリオ統合テスト。
 //!
-//! 実行: `cargo test --features v27 --test scenarios`
+//! 実行: `cargo test --test scenarios`
 //!
 //! - パブリック API のみ (`use enchudb::*`)
-//! - v27 前提(`#[cfg(feature = "v27")]` は付けず、cargo の feature 指定で実行する)
 //! - std 以外の依存なし
 
 use enchudb::*;

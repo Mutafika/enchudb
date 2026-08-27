@@ -1,11 +1,11 @@
-//! v29 ページチェックサム — region 単位の FNV-1a CRC。
+//! ページチェックサム — region 単位の FNV-1a CRC。
 //!
 //! # 設計
 //!
 //! - 別ファイル `{db_path}.crc` に CRC テーブルを保存
 //! - 明示的な `flush()` 時に各 region の CRC を再計算 → `.crc` ファイル更新
 //! - open() 時に `.crc` があれば全 region を検証、不一致は region ID 付きエラー
-//! - `.crc` 欠損は許容(v28 以前の DB と後方互換)
+//! - `.crc` 欠損は許容(region CRC 導入以前の DB と後方互換)
 //! - auto-fsync(100ms 周期) では CRC を計算しない(hot path から外す)
 //!
 //! # ファイル形式
@@ -153,7 +153,7 @@ impl CrcTable {
     }
 }
 
-/// FNV-1a 32bit(v28 wal.rs と同じアルゴリズム、共通化候補だが切り出さず重複)
+/// FNV-1a 32bit(oplog.rs と同じアルゴリズム、共通化候補だが切り出さず重複)
 #[inline]
 pub fn fnv1a_region(data: &[u8]) -> u32 {
     let mut h: u32 = 0x811c9dc5;

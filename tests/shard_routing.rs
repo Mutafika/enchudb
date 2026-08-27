@@ -228,7 +228,7 @@ fn replicated_entity_matches_across_shards_via_sync() {
     // 現実装の制約: InMemoryShardTransport が peer_id を上位 32bit に composite するため、
     // peer 1 由来の eid = [1|42]、peer 2 由来の eid = [2|42] で別 u64 扱い、intersect 空。
     // 「共有 entity」を表現するには entity id そのものを normalize する合意が要る。
-    // → v34+ で「論理 eid (peer 0 のような root)」「peer 跨ぎ resolver」を追加する時に解消。
+    // → 将来「論理 eid (peer 0 のような root)」「peer 跨ぎ resolver」を追加する時に解消。
     assert_eq!(r.len(), 0, "current impl: cross-peer eid composition prevents shared-entity match");
 
     cleanup(&pa);
