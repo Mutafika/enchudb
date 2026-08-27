@@ -4600,6 +4600,12 @@ impl Engine {
     /// lock 順序は `free_locals` → (delete 内部の) `EntitySet::free_lock` の一方向のみ。
     /// `EntitySet` 側は Engine の table に触らないので逆転しない。
     ///
+    /// **コストの注記 (未実測)**: この形で critical section は「Vec への push」から
+    /// 「`delete` 全体 (oplog append + column write + tombstone)」に広がる。 その間
+    /// `entity_in("_sync_ops")` は待つので、 reclaim sweep 中は bridge の row 払い出しが
+    /// row 単位で purge と競合する。 row ごとに解放されるので sweep 全体を止める形では
+    /// ないが、 影響は測っていない — fanout で bridge throughput を見るときの観測点。
+    ///
     /// 戻り値 `true` = 自分が消した (呼び元は計数して良い)、 `false` = 既に他者が
     /// 消した / slot が再利用されて別 row になっていた。
     fn purge_sync_ops_row(
