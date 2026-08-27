@@ -4588,9 +4588,20 @@ impl Engine {
     /// 必ず大きい lsn を持つ)。 この窓は ring 再利用が常時走る構成 —
     /// まさに reclaim + bridge を並行で回す運転 — で開く。
     ///
+    /// **`free_locals` は `delete` の前に取り、 push まで保持する。** free list への
+    /// producer は本 helper だけではない — `entity_in` の枯渇 slow path から呼ばれる
+    /// [`Engine::rebuild_free_locals`] が range を線形 scan して**非 live な local を
+    /// 穴として push** する。 delete 後 push 前の中間状態でこれが走ると、 同じ slot が
+    /// 両者から独立に push されて二重になる (expected_lsn は「同じ row を 2 者が
+    /// 消す」しか防げない)。 free list を掴んだまま delete すれば rebuild は中間状態を
+    /// 観測できず、 待たされた後は `fl` が非空なので早期 return する。 枯渇は
+    /// 「free list を使い切るまで bridge する」運転で常態なので、 この窓は実運用で開く。
+    ///
+    /// lock 順序は `free_locals` → (delete 内部の) `EntitySet::free_lock` の一方向のみ。
+    /// `EntitySet` 側は Engine の table に触らないので逆転しない。
+    ///
     /// 戻り値 `true` = 自分が消した (呼び元は計数して良い)、 `false` = 既に他者が
-    /// 消した / slot が再利用されて別 row になっていた。 free list への push は
-    /// 前者のみ (dedupe も belt and braces で併用)。
+    /// 消した / slot が再利用されて別 row になっていた。
     fn purge_sync_ops_row(
         &self,
         eid: enchudb_oplog::EntityId,
@@ -4607,22 +4618,14 @@ impl Engine {
             .find(|t| t.name == "_sync_ops")
             .map(|t| (t.eid_range_lo, t.free_locals.clone(), t.free_locals_nonempty.clone()));
         let local = enchudb_oplog::eid_local(eid);
-        self.delete(eid);
-        if let Some((lo, free_list, nonempty)) = meta
-            && local >= lo
-        {
-            let slot = local - lo;
-            let mut list = free_list.lock().unwrap();
-            // belt and braces: expected_lsn 検証が主防御なので、 ここは
-            // 「lock 外の別経路が増えた」等の保険。 free list が長い構成では
-            // contains が O(n) なので debug 時のみ厳密に見る。
-            debug_assert!(
-                !list.contains(&slot),
-                "#221: slot {slot} が free list に二重 push されようとした \
-                 (expected_lsn 検証をすり抜けた経路がある)"
-            );
-            list.push(slot);
-            nonempty.store(true, std::sync::atomic::Ordering::Release);
+        match meta {
+            Some((lo, free_list, nonempty)) if local >= lo => {
+                let mut list = free_list.lock().unwrap();
+                self.delete(eid);
+                list.push(local - lo);
+                nonempty.store(true, std::sync::atomic::Ordering::Release);
+            }
+            _ => self.delete(eid),
         }
         true
     }
@@ -11645,6 +11648,110 @@ mod sync_ops_purge_tests {
         eng.define_table("t", 100).unwrap();
         eng.enable_sync_tables().unwrap();
         eng
+    }
+
+    /// #221 (review 2): free list への producer は purge helper だけではない —
+    /// `rebuild_free_locals` (枯渇 slow path) が非 live local を穴として push する。
+    /// purge が delete 後 push 前に中断されると同じ slot が両者から入る。
+    ///
+    /// ここでは逐次順序での不変条件だけを確認する: purge 済み slot に対して rebuild を
+    /// 走らせても free list に重複が生まれない (rebuild は非空を見て早期 return)。
+    /// **窓そのものは逐次では作れない**ので、 これは回帰検知であって window の
+    /// guard ではない (`concurrent_exhaustion_and_purge_do_not_duplicate_slots` の
+    /// 注意書きも参照)。
+    #[test]
+    fn rebuild_does_not_duplicate_purged_slots() {
+        let eng = tmp_engine("rebuild");
+        let lsn_hid = eng.himo_id("_sync_ops.lsn").unwrap() as u16;
+        let tid = eng.tables.iter().position(|t| t.name == "_sync_ops").unwrap();
+
+        let mut eids = Vec::new();
+        for i in 0..8u32 {
+            let e = eng.entity_in("_sync_ops").unwrap();
+            eng.tie_to_by_id(e, lsn_hid, i + 1);
+            eids.push((e, i + 1));
+        }
+        for (e, lsn) in &eids {
+            assert!(eng.purge_sync_ops_row(*e, lsn_hid, *lsn));
+        }
+
+        // 枯渇 slow path 相当: 非 live local を scan して穴を push する経路。
+        eng.rebuild_free_locals(tid);
+
+        let list = eng.tables[tid].free_locals.lock().unwrap().clone();
+        let mut uniq = list.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(
+            list.len(),
+            uniq.len(),
+            "#221: free list に slot が二重に入った (purge と rebuild の二重 push): {list:?}"
+        );
+    }
+
+    /// #221 (review 2): purge と **枯渇 slow path (`rebuild_free_locals`)** を並行
+    /// させても free list に slot が二重に入らないこと。
+    ///
+    /// purge が `free_locals` を delete の前に取らないと、 「delete 済み・push 前」の
+    /// 中間状態を rebuild の scan が観測して同じ slot を独立に push する。
+    ///
+    /// **注意: この test は窓が閉じていることの証明にはならない。** 発火には
+    /// 「free list が空 + 枯渇 + purge が delete と push の間」の同時成立が要り、
+    /// fix を外した状態でも緑のままだった (3 回試行)。 回帰検知として置いているが、
+    /// 正しさの根拠は helper 側の lock 順序 (doc 参照) であってこの test ではない。
+    #[test]
+    fn concurrent_exhaustion_and_purge_do_not_duplicate_slots() {
+        let eng = std::sync::Arc::new(tmp_engine("exhaust"));
+        let lsn_hid = eng.himo_id("_sync_ops.lsn").unwrap() as u16;
+        let tid = eng.tables.iter().position(|t| t.name == "_sync_ops").unwrap();
+
+        // ring をほぼ埋める (次の alloc が枯渇 → rebuild_free_locals を踏む状態)。
+        let range = eng.tables[tid].eid_range_hi - eng.tables[tid].eid_range_lo;
+        let fill = range.saturating_sub(4);
+        let mut rows = Vec::with_capacity(fill as usize);
+        for i in 0..fill {
+            let e = eng.entity_in("_sync_ops").unwrap();
+            eng.tie_to_by_id(e, lsn_hid, i + 1);
+            rows.push((e, i + 1));
+        }
+
+        // A: 前半 row を purge (free list に slot を返す)
+        // B: 枯渇まで alloc し続ける (= rebuild_free_locals を繰り返し踏む)
+        let purger = {
+            let eng = eng.clone();
+            let rows: Vec<_> = rows.iter().take(rows.len() / 2).copied().collect();
+            std::thread::spawn(move || {
+                for (e, lsn) in rows {
+                    eng.purge_sync_ops_row(e, lsn_hid, lsn);
+                }
+            })
+        };
+        let allocator = {
+            let eng = eng.clone();
+            std::thread::spawn(move || {
+                for i in 0..2000u32 {
+                    match eng.entity_in("_sync_ops") {
+                        Ok(e) => eng.tie_to_by_id(e, lsn_hid, 1_000_000 + i),
+                        Err(_) => std::thread::yield_now(),
+                    }
+                }
+            })
+        };
+        purger.join().unwrap();
+        allocator.join().unwrap();
+
+        let list = eng.tables[tid].free_locals.lock().unwrap().clone();
+        let mut uniq = list.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(
+            list.len(),
+            uniq.len(),
+            "#221: purge と rebuild_free_locals の並行で slot が二重 push された \
+             (free list {} entries, {} unique)",
+            list.len(),
+            uniq.len()
+        );
     }
 
     /// #221 (review): purge の再検証は「生存」ではなく **`expected_lsn` 一致**で
