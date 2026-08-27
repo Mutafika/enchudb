@@ -145,6 +145,40 @@ impl FaultKind {
     }
 }
 
+/// `remote_*_apply` (sync 受信の apply) の結果 (#210)。
+///
+/// 旧 `bool` は 「適用した / しなかった」 しか区別できず、 **「LWW で古い」 と
+/// 「容量が無くて置けなかった」 が同じ `false` に潰れていた**。 sync 側はそれを
+/// `SkippedOlder` (= 再配送不要) として計上するため、 **ディスク満杯や content
+/// 天井に当たった record は cursor を越えられて恒久的に失われる**。
+///
+/// 前者は再配送しても結果が変わらないが、 後者は **空きが出てから再配送しないと
+/// 埋まらない**。 cursor を進めてよいかの判断が真逆なので型で分ける
+/// (`SyncOutcome::skipped` と `dropped_unresolved` を分けたのと同じ理由)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteApply {
+    /// 適用した。
+    Applied,
+    /// **LWW で古い** / 既に適用済み / tombstone に負けた / 宛先の himo が無い。
+    /// 再配送しても結果は変わらない。
+    Stale,
+    /// **容量が足りず置けなかった** (`FaultKind::DiskSpace` / `ContentSpace`)。
+    /// 値は一切書いていない。 **空きが出てからの再配送が必要**。
+    RejectedCapacity,
+}
+
+impl RemoteApply {
+    /// 適用されたか。
+    pub fn applied(self) -> bool {
+        matches!(self, RemoteApply::Applied)
+    }
+
+    /// 再配送が必要か (= cursor をこの record より先に進めてはいけない)。
+    pub fn needs_redelivery(self) -> bool {
+        matches!(self, RemoteApply::RejectedCapacity)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VocabOrphanStats {
     /// vocab に発行済みの全 vid 数 (= `Vocabulary::count()`)。
@@ -6684,16 +6718,16 @@ impl Engine {
         // #209: relay は Syncer 側 (relay_record) に移動済み。 引数は API 互換の
         // ため残置 — 次の breaking release (0.23 #201 系) で撤去する。
         _relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
-    ) -> bool {
+    ) -> RemoteApply {
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
-        if hid >= self.himos.len() { return false; }
+        if hid >= self.himos.len() { return RemoteApply::Stale; }
         // request17 step 5: 受信 HLC でローカル clock を進める (これが無いと、
         // 相手の clock が先行している間ずっと自分のローカル write が負ける)。
         self.observe_remote_hlc(hlc);
         // 値を作る前に判定する — 不採用なら LeafStore に payload を確保しない。
         if !self.accepts_write(local, himo_id, hlc) {
-            return false;
+            return RemoteApply::Stale;
         }
         self.entities.ensure_live(local);
         // v6 (#88): remote re-tie 上書きで旧 offset を回収。
@@ -6708,16 +6742,16 @@ impl Engine {
             // 満杯、 または vocab 天井)。 sentinel を cell に書くと read が壊れる。
             self.record_fault(
                 FaultKind::DiskSpace,
-                "受信 TieLeaf の payload を格納できない — apply を拒否 (再配送で埋め直す)",
+                "受信 TieLeaf の payload を格納できない — apply を拒否 (空きが出てから再配送)",
             );
-            return false;
+            return RemoteApply::RejectedCapacity;
         }
         self.set_cell_local(local, himo_id, value, hlc);
         self.free_leaf_offset(hid, old);
         Self::advance_table_next_local_for(&self.tables, local);
         // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
         // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
-        true
+        RemoteApply::Applied
     }
 
     pub fn remote_tie_apply(
@@ -6806,28 +6840,28 @@ impl Engine {
         // #209: relay は Syncer 側 (relay_record) に移動済み。 引数は API 互換の
         // ため残置 — 次の breaking release (0.23 #201 系) で撤去する。
         _relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
-    ) -> bool {
+    ) -> RemoteApply {
         let local = enchudb_oplog::eid_local(eid);
         self.observe_remote_hlc(hlc);
         // legacy op (pre-0.9 WAL のみ)。 cell を持たないので版数は `HlcStore` の
         // key hash entry のまま (sync 側) だが、 tombstone 判定だけは engine に寄せる。
         if self.tombstone_blocks(eid, hlc) {
-            return false;
+            return RemoteApply::Stale;
         }
         self.entities.ensure_live(local);
         if !self.contents.set(local, key, data) {
             // #59: content data 領域が満杯。 panic せず拒否 + 計上。
             self.record_fault(
                 FaultKind::ContentSpace,
-                "content data region is full — content write rejected",
+                "content data region is full — content write rejected (空きが出てから再配送)",
             );
-            return false;
+            return RemoteApply::RejectedCapacity;
         }
         // issue #47 fix: Tie 経路と同じ理由で next_local を前進させる。
         Self::advance_table_next_local_for(&self.tables, local);
         // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
         // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
-        true
+        RemoteApply::Applied
     }
 
     /// リモート peer から届いた Vocab op を apply。
