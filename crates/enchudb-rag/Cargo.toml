@@ -1,6 +1,6 @@
 [package]
 name = "enchudb-rag"
-version = "0.23.0"
+version = "0.23.1"
 edition = "2024"
 rust-version = "1.89"   # std::fs::File::lock (#133 Windows 対応)
 description = "EnchuDB の上に積む RAG ストア。メタフィルタ ns オーダー + brute force cosine。"
