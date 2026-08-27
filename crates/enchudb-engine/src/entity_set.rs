@@ -54,6 +54,9 @@ impl EntitySet {
         let free_offset = (bitset_offset + bitset_size + 3) & !3;
         let region_total = Self::region_size(max_entities);
 
+        // #167: init 時の commit。 ここが失敗する = そもそも DB を作れない状況で、
+        // 直後の header write で気付く (領域は固定サイズの小領域)。 write 経路の
+        // ensure_committed は error を捨てないこと (`leaf_store` / `vocabulary` 参照)。
         let _ = region.ensure_committed(region_total);
         region.write_at(0, &MAGIC);
         // next_eid = 0, live_count = 0 (already zero from fresh region)

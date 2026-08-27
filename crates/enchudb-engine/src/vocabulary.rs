@@ -407,12 +407,15 @@ impl Vocabulary {
         // writing past the current commit. No-op for static backings.
         // We also grow the offsets region in case `id` advanced
         // past its committed footprint (offsets have id × 8 layout).
-        let _ = self
-            .data
-            .ensure_committed((offset + len) as usize);
-        let _ = self
-            .offsets
-            .ensure_committed(((id as usize) + 1) * 8);
+        // #167: commit を伸ばせなければ **書かずに諦める** (予約 sentinel を返す)。
+        // 未 commit page への書き込みは (ディスク満杯なら) SIGBUS でプロセスごと
+        // 落ちるので、 error を捨てて書き進めてはいけない。 採番は巻き戻す。
+        if self.data.ensure_committed((offset + len) as usize).is_err()
+            || self.offsets.ensure_committed(((id as usize) + 1) * 8).is_err()
+        {
+            self.count.fetch_sub(1, Ordering::Relaxed);
+            return u32::MAX;
+        }
         self.data.write_at(offset as usize, value);
         self.data.write_at(0, &MAGIC);
         let new_count = id + 1;
@@ -530,7 +533,12 @@ impl Vocabulary {
     pub fn mark_index_clean(&self, clean: bool) {
         // data 領域は variable cluster (lazy commit) なので、 先頭 header を
         // 確実に commit してから書く。
-        let _ = self.data.ensure_committed(HEADER);
+        // #167: commit を伸ばせなければ flag を書かない (未 commit page への write は
+        // ディスク満杯なら SIGBUS)。 flag を落とせないと次回 open が rebuild する =
+        // 遅くなるだけで壊れない、 安全側。
+        if self.data.ensure_committed(HEADER).is_err() {
+            return;
+        }
         let val: u32 = if clean { 1 } else { 0 };
         self.data.write_at(CLEAN_FLAG_OFF, &val.to_le_bytes());
         self.clean_on_disk.store(clean, Ordering::Release); // #77-M1 キャッシュ追従

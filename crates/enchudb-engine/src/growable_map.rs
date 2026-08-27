@@ -32,7 +32,7 @@ use std::fs::File;
 use std::io;
 use std::os::fd::{IntoRawFd, RawFd};
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Conservative compile-time page size used for layout-side alignment
 /// (`grow_to` / `set_len` 等)。 file の論理 size を扱う場面はこれで十分。
@@ -80,6 +80,34 @@ pub struct GrowableMap {
     /// 直近 `flush_dirty` 以降に書き込まれた byte 範囲の hi (exclusive)。
     /// 0 = clean。 writer は `mark_dirty` で fetch_max。
     dirty_hi: AtomicUsize,
+    /// #167: grow 時に残す空き容量 margin。 既定 `SPACE_MARGIN`。
+    /// `set_space_margin` はテストで 「空きが足りない」 状態を決定的に作るためのもの。
+    space_margin: AtomicU64,
+    /// #167: 空き容量不足で grow を拒否した回数。
+    space_denials: AtomicU64,
+}
+
+/// #167: grow 時に 「これから commit する分」 に加えて残しておく空き容量。
+///
+/// grow のタイミングで空きを見ても、 **既に commit 済み range 内の穴への write** は
+/// その check を通らない (kernel が write の瞬間に block を割り当て、 mmap 経路には
+/// errno の返り先が無いので SIGBUS になる)。 margin を残すことで 「grow 直後に
+/// 数十 MB 書いても落ちない」 状態を保つ。 完全な保証ではない (best-effort)。
+const SPACE_MARGIN: u64 = 32 * 1024 * 1024;
+
+/// fd の載っている filesystem で **非 root user が使える空き byte 数**。
+pub(crate) fn free_bytes_for_fd(fd: libc::c_int) -> io::Result<u64> {
+    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatvfs(fd, &mut vfs) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // f_frsize が 0 を返す filesystem があるので f_bsize に落ちる
+    let unit = if vfs.f_frsize != 0 {
+        vfs.f_frsize as u64
+    } else {
+        vfs.f_bsize as u64
+    };
+    Ok((vfs.f_bavail as u64).saturating_mul(unit))
 }
 
 unsafe impl Send for GrowableMap {}
@@ -161,6 +189,8 @@ impl GrowableMap {
             grow_lock: std::sync::Mutex::new(()),
             dirty_lo: AtomicUsize::new(usize::MAX),
             dirty_hi: AtomicUsize::new(0),
+            space_margin: AtomicU64::new(SPACE_MARGIN),
+            space_denials: AtomicU64::new(0),
         })
     }
 
@@ -172,6 +202,24 @@ impl GrowableMap {
     /// 依存しない)。 また `ftruncate` は**ファイルを縮小できる**ため、
     /// 現ファイルサイズより大きい場合のみ実行する — 並行 grow / 別
     /// プロセスの先行 grow を縮めて data 破棄 + SIGBUS になるのを防ぐ。
+    /// #167: grow 時に残す空き容量 margin を上書きする。
+    ///
+    /// **テスト用**: 巨大な値を渡すと 「空きが足りない」 状態を決定的に作れる
+    /// (実際にディスクを埋めずに ENOSPC 経路を踏ませる fault injection)。
+    pub fn set_space_margin(&self, bytes: u64) {
+        self.space_margin.store(bytes, Ordering::Relaxed);
+    }
+
+    /// #167: 空き容量不足で grow を拒否した回数。 0 でなければ write が拒否されている。
+    pub fn space_denials(&self) -> u64 {
+        self.space_denials.load(Ordering::Relaxed)
+    }
+
+    /// #167: この DB が載っている filesystem の空き byte 数 (観測用)。
+    pub fn free_bytes(&self) -> io::Result<u64> {
+        free_bytes_for_fd(self.fd)
+    }
+
     pub fn grow_to(&self, new_size: usize) -> io::Result<()> {
         let aligned = align_up(new_size, PAGE_SIZE);
         // hot path: ロックなしの早期 return
@@ -203,6 +251,35 @@ impl GrowableMap {
             return Err(io::Error::last_os_error());
         }
         if (st.st_size as u64) < aligned as u64 {
+            // #167: **ftruncate は ENOSPC を返さない**。 sparse に伸ばすだけなので、
+            // 空きが無い状態でも成功し、 後で穴に書いた瞬間に kernel が block 割当に
+            // 失敗する。 mmap 経路には errno の返り先が無いので、 そこは
+            // **SIGBUS でプロセスごと即死**になる (Result に落ちてこない)。
+            //
+            // 全域 fallocate すれば防げるが、 それは sparse 設計 (apparent は巨大 /
+            // 実消費はごく一部) と真っ向から衝突する。 ここでは grow の瞬間に
+            // 「これから commit する分 + margin」 の空きを確認し、 無ければ ENOSPC を
+            // **Result として**返す。 grow は amortize 済みなので statvfs のコストは
+            // 無視できる。
+            let delta = aligned as u64 - st.st_size as u64;
+            // statvfs 自体が失敗する環境 (特殊 fs 等) では従来どおり伸ばす。
+            // 「見られないから止める」 のは可用性を下げるだけなので。
+            if let Ok(free) = free_bytes_for_fd(self.fd) {
+                let margin = self.space_margin.load(Ordering::Relaxed);
+                let need = delta.saturating_add(margin);
+                if free < need {
+                    self.space_denials.fetch_add(1, Ordering::Relaxed);
+                    return Err(io::Error::new(
+                        io::ErrorKind::StorageFull,
+                        format!(
+                            "refusing to grow the DB: filesystem has {free} bytes free, \
+                             need {delta} to commit + {margin} margin. \
+                             sparse mmap で伸ばすと ENOSPC が SIGBUS になるため、 \
+                             ここで拒否する (#167)"
+                        ),
+                    ));
+                }
+            }
             let rc = unsafe { libc::ftruncate(self.fd, aligned as i64) };
             if rc < 0 {
                 return Err(io::Error::last_os_error());

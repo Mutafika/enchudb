@@ -119,16 +119,19 @@ pub enum FaultKind {
     VocabSpace,
     /// 値が cell に入らない (`u32::MAX` は sentinel 予約)
     ValueOutOfRange,
+    /// #167: filesystem の空き容量不足で DB を伸ばせない
+    DiskSpace,
 }
 
 impl FaultKind {
-    pub(crate) const COUNT: usize = 4;
+    pub(crate) const COUNT: usize = 5;
     pub(crate) fn index(self) -> usize {
         match self {
             FaultKind::EntitySpace => 0,
             FaultKind::ContentSpace => 1,
             FaultKind::VocabSpace => 2,
             FaultKind::ValueOutOfRange => 3,
+            FaultKind::DiskSpace => 4,
         }
     }
     pub fn as_str(self) -> &'static str {
@@ -137,6 +140,7 @@ impl FaultKind {
             FaultKind::ContentSpace => "content space exhausted",
             FaultKind::VocabSpace => "vocabulary full",
             FaultKind::ValueOutOfRange => "value out of range",
+            FaultKind::DiskSpace => "filesystem is (nearly) full",
         }
     }
 }
@@ -3260,6 +3264,11 @@ impl Engine {
                     stats.bytes_moved += bytes.len() as u64;
                     leaf.insert(bytes)
                 };
+                if new_off == u32::MAX {
+                    // #167: 移送先を確保できない (commit を伸ばせない)。 cell は旧
+                    // offset を指したままにして、 この cell の移送は諦める。
+                    continue;
+                }
                 col.set(eid, &(new_off + 1).to_le_bytes());
                 stats.cells_moved += 1;
             }
@@ -5386,6 +5395,36 @@ impl Engine {
     /// 0.7.0: 残り eid 空間 (= max_entities - 既存 table の eid_range_hi の max)。
     /// schema crate が `define_table` を呼ぶ前に「table 1 個分にどれだけ割けるか」
     /// 判断する用。
+    /// #167: この DB が載っている filesystem の空き byte 数。 growable backing のみ。
+    ///
+    /// **sparse 前提の設計なので 「df に空きがある」 は安全を意味しない** — apparent size
+    /// (既定 24 GB、 cell version 有効なら更に大) の全部を書ける空きが必要になり得る。
+    /// 監視でこの値を見て、 枯渇前に対処すること。
+    pub fn disk_free_bytes(&self) -> Option<u64> {
+        match &self.backing {
+            Backing::Growable(g) => g.free_bytes().ok(),
+            _ => None,
+        }
+    }
+
+    /// #167: 空き容量不足で grow を拒否した回数。 0 でなければ write が落とされている。
+    pub fn space_denials(&self) -> u64 {
+        match &self.backing {
+            Backing::Growable(g) => g.space_denials(),
+            _ => 0,
+        }
+    }
+
+    /// #167: grow 時に残す空き容量 margin を上書きする (**テスト用**)。
+    ///
+    /// 巨大な値を渡すと、 実際にディスクを埋めずに 「空きが足りない」 経路を
+    /// 決定的に踏める。 production では呼ばないこと。
+    pub fn set_space_margin(&self, bytes: u64) {
+        if let Backing::Growable(g) = &self.backing {
+            g.set_space_margin(bytes);
+        }
+    }
+
     /// #59: 「想定内だが続行不能」 な事象を記録する。 **panic の代替**。
     ///
     /// 呼び出し側は必ず 「その write を拒否する」 ところまでやること
@@ -5593,7 +5632,14 @@ impl Engine {
         match self.ver_col(himo_id) {
             Some(col) if local < self.max_entities => {
                 // growable backing: 未コミット page は read でも SIGBUS。
-                let _ = col.ensure_committed_for(local);
+                // #167: 伸ばせなければ **読まない** (ZERO 扱い)。 触れば落ちる。
+                if col.ensure_committed_for(local).is_err() {
+                    self.record_fault(
+                        FaultKind::DiskSpace,
+                        "cell version の read に必要な commit を伸ばせない — ZERO として扱う",
+                    );
+                    return enchudb_oplog::Hlc::ZERO;
+                }
                 hlc_from_cell(col.get(local))
             }
             _ => enchudb_oplog::Hlc::ZERO,
@@ -5611,7 +5657,14 @@ impl Engine {
     fn tombstone_hlc_local(&self, local: u32) -> enchudb_oplog::Hlc {
         match self.tomb_col.as_ref() {
             Some(col) if local < self.max_entities => {
-                let _ = col.ensure_committed_for(local);
+                // #167: 伸ばせなければ読まない (未 commit page の read も SIGBUS)。
+                if col.ensure_committed_for(local).is_err() {
+                    self.record_fault(
+                        FaultKind::DiskSpace,
+                        "tombstone の read に必要な commit を伸ばせない — ZERO として扱う",
+                    );
+                    return enchudb_oplog::Hlc::ZERO;
+                }
                 hlc_from_cell(col.get(local))
             }
             _ => enchudb_oplog::Hlc::ZERO,
@@ -5718,7 +5771,14 @@ impl Engine {
         match self.ver_col(himo_id) {
             Some(col) => {
                 // growable backing: 未コミット page への書き込みは SIGBUS。
-                let _ = col.ensure_committed_for(local);
+                // #167: 伸ばせなければ **書かない**。
+                if col.ensure_committed_for(local).is_err() {
+                    self.record_fault(
+                        FaultKind::DiskSpace,
+                        "cell version の write に必要な commit を伸ばせない — 版数を記録しない",
+                    );
+                    return;
+                }
                 col.ensure_count(local);
                 col.set(local, &hlc_to_cell(hlc));
             }
@@ -6134,7 +6194,14 @@ impl Engine {
         }
         match self.tomb_col.as_ref() {
             Some(col) => {
-                let _ = col.ensure_committed_for(local);
+                // #167: 伸ばせなければ書かない (未 commit page への write は SIGBUS)。
+                if col.ensure_committed_for(local).is_err() {
+                    self.record_fault(
+                        FaultKind::DiskSpace,
+                        "tombstone の write に必要な commit を伸ばせない — 記録しない",
+                    );
+                    return true;
+                }
                 col.ensure_count(local);
                 col.set(local, &hlc_to_cell(hlc));
             }
@@ -6432,6 +6499,15 @@ impl Engine {
             Some(leaf) => leaf.insert(bytes),
             None => self.vocab.insert(bytes), // pre-v6 / reserved: 旧 vocab fallback
         };
+        if value == u32::MAX {
+            // #167 / #59: payload を格納できなかった (commit を伸ばせない = ディスク
+            // 満杯、 または vocab 天井)。 sentinel を cell に書くと read が壊れる。
+            self.record_fault(
+                FaultKind::DiskSpace,
+                "受信 TieLeaf の payload を格納できない — apply を拒否 (再配送で埋め直す)",
+            );
+            return false;
+        }
         self.set_cell_local(local, himo_id, value, hlc);
         self.free_leaf_offset(hid, old);
         Self::advance_table_next_local_for(&self.tables, local);
@@ -6889,6 +6965,15 @@ impl Engine {
             // なしなので実害はないが、 3 経路で順序が揃っていないと事故の温床になる)。
             let old = self.himos[hid].get_value(eid);
             let off = leaf.insert(value.as_bytes());
+            if off == u32::MAX {
+                // #167: leaf payload を書けなかった (commit を伸ばせない = ディスク
+                // 満杯)。 sentinel を cell に書くと read が壊れるので write を拒否。
+                self.record_fault(
+                    FaultKind::DiskSpace,
+                    "leaf payload の格納に必要な commit を伸ばせない — text write を拒否",
+                );
+                return;
+            }
             self.himos[hid].set(eid, off);
             if let Some(old) = old { leaf.free(old); }
             return;
@@ -6983,6 +7068,15 @@ impl Engine {
             let bytes = value.as_bytes();
             let old = self.himos[hid].get_value(eid);
             let off = leaf.insert(bytes);
+            if off == u32::MAX {
+                // #167: leaf payload を書けなかった (commit を伸ばせない = ディスク
+                // 満杯)。 sentinel を cell に書くと read が壊れるので write を拒否。
+                self.record_fault(
+                    FaultKind::DiskSpace,
+                    "leaf payload の格納に必要な commit を伸ばせない — text write を拒否",
+                );
+                return;
+            }
             // request17 step 4: WAL 先行で採番 → 値と版数を不可分に書く。 不採用なら
             // **今 insert した payload** を捨てる (cell は旧 offset を指したままなので
             // 旧 payload は生きている)。
@@ -7095,6 +7189,15 @@ impl Engine {
             // 既に `tie_text_to_by_id` はこの順序。
             let old = self.himos[hid].get_value(eid);
             let off = leaf.insert(value);
+            if off == u32::MAX {
+                // #167: leaf payload を書けなかった (commit を伸ばせない = ディスク
+                // 満杯)。 sentinel を cell に書くと read が壊れるので write を拒否。
+                self.record_fault(
+                    FaultKind::DiskSpace,
+                    "leaf payload の格納に必要な commit を伸ばせない — text write を拒否",
+                );
+                return;
+            }
             // request17 step 4: WAL 先行で採番。 不採用なら今 insert した payload を捨てる。
             let oplog_eid = self.oplog_eid(eid);
             let hlc = self.append_local_op(enchudb_oplog::oplog::Op::TieLeaf {
@@ -10508,6 +10611,15 @@ impl Engine {
         // (= 適用時点の cell を見る。 push 時 free は queue 未適用の二重 free を招く)。
         if let Some(leaf) = self.leaf_for(hid) {
             let off = leaf.insert(value);
+            if off == u32::MAX {
+                // #167: leaf payload を書けなかった (commit を伸ばせない = ディスク
+                // 満杯)。 sentinel を cell に書くと read が壊れるので write を拒否。
+                self.record_fault(
+                    FaultKind::DiskSpace,
+                    "leaf payload の格納に必要な commit を伸ばせない — text write を拒否",
+                );
+                return;
+            }
             // request17 step 4: push 側で採番、 op と record に同じ版数を載せる。
             // 採番 → push は `hlc_mint_lock` で 1 単位に。
             let _mint = self.mint_guard();

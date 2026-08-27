@@ -135,6 +135,8 @@ impl LeafStore {
             gen_seq: std::sync::atomic::AtomicU32::new(0),
         };
         let data_start = s.data_start_byte();
+        // #167: init 時 (header 領域) の commit。 write 経路は `insert` 側で
+        // error を捨てずに拒否する。
         let _ = s.region.ensure_committed(data_start);
         s.region.write_at(0, &MAGIC_GEN); // #106: 新規は gen 対応 magic
         s.region.write_at(SHIFT_OFF, &[off_shift as u8]);
@@ -393,6 +395,7 @@ impl LeafStore {
 
     /// payload を格納し slot 先頭 **word offset** を返す。 free-list に嵌まる空きが
     /// あればそこへ、 無ければ high_water を伸ばす。
+    /// slot を確保して payload を書く。 **commit を伸ばせなければ `u32::MAX`** (#167)。
     pub fn insert(&self, bytes: &[u8]) -> u32 {
         let blen = bytes.len();
         assert!(blen <= (u32::MAX as usize - SLOT_HEADER_GEN), "leaf value too large");
@@ -406,7 +409,13 @@ impl LeafStore {
 
         let byte_off = self.w2b(word_off);
         let slot_bytes = self.w2b(slot_words);
-        let _ = self.region.ensure_committed(byte_off + slot_bytes);
+        // #167: commit を伸ばせなければ **書かずに諦める**。 未 commit page への
+        // 書き込みは (ディスク満杯なら) SIGBUS でプロセスごと落ちるので、 error を
+        // 捨てて書き進めてはいけない。 `u32::MAX` は呼び出し側 (engine) が
+        // 「値なし / 拒否」 として見る予約 sentinel。
+        if self.region.ensure_committed(byte_off + slot_bytes).is_err() {
+            return u32::MAX;
+        }
 
         // #106: store-wide 単調カウンタから新 gen (偶数) を採る。 offset ごとに再利用の
         // たび必ず異なる値になるので、 旧 offset を掴んだ reader が seqlock で torn/再利用を
@@ -478,6 +487,9 @@ impl LeafStore {
             // fresh: high_water を伸ばす
             let hw = self.hw_words();
             let end = hw + need_words;
+            // #167: high_water の前進ぶん。 実際に payload を書く範囲は `insert` が
+            // 改めて ensure_committed して **失敗したら書かない** ので、 ここは
+            // 先行 commit の best-effort に留める。
             let _ = self.region.ensure_committed(self.w2b(end));
             self.set_hw_words(end);
             (hw, need_words)
