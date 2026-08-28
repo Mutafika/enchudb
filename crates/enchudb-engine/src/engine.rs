@@ -4680,6 +4680,12 @@ impl Engine {
         }
 
         let mut ack_lsn: u32 = 0;
+        // #218: dead row を消した分の history floor。 loop 内で
+        // `record_reclaimed_floors` を呼ぶと sentinel row の read-modify-write を
+        // row 数だけ繰り返すので、 貯めてループ後に 1 回。
+        let mut dead_row_floors: std::collections::HashMap<u32, enchudb_oplog::Hlc> =
+            std::collections::HashMap::new();
+        let mut known_authors: Option<std::collections::HashSet<u32>> = None;
         for (lsn, eid) in rows.iter() {
             let decoded = self
                 .get_by_id(*eid, payload_hid)
@@ -4707,18 +4713,48 @@ impl Engine {
                     if *lsn >= self.current_sync_lsn() {
                         break;
                     }
+                    // #218: 消す前に floor 候補を作る (delete 後は peer_id を読めない)。
+                    // ここで floor を上げないと、 消えた record を必要としていた puller が
+                    // 「cursor >= floor」 と誤判定して差分 pull を続ける = #140 で塞いだ
+                    // silent partial の復活。 帰属と上界の作り方は
+                    // `dead_row_floor_candidate` の doc を参照。
+                    let cand = {
+                        let known = known_authors.get_or_insert_with(|| self.ring_authors());
+                        self.dead_row_floor_candidate(*eid, known)
+                    };
                     // #221: delete + free list push は専用 lock 下で atomic に。
                     if self.purge_sync_ops_row(*eid, lsn_hid, *lsn) {
+                        let (author, hlc) = cand;
+                        let whose = if author == u32::MAX {
+                            "all authors (unattributable row)".to_string()
+                        } else {
+                            format!("author {author}")
+                        };
                         eprintln!(
                             "[enchudb] sync: purging undeliverable _sync_ops row \
-                             (lsn {lsn}, missing/undecodable payload) — see #217"
+                             (lsn {lsn}, missing/undecodable payload) — see #217; \
+                             raising history floor for {whose} to {hlc:?} \
+                             (followers below it will be told to bootstrap) — see #218"
                         );
                         self.sync_dead_rows_purged
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let e = dead_row_floors
+                            .entry(author)
+                            .or_insert(enchudb_oplog::Hlc::ZERO);
+                        if hlc > *e {
+                            *e = hlc;
+                        }
                     }
                     ack_lsn = *lsn;
                 }
             }
+        }
+
+        // #218: 消した dead row の分だけ floor を上げる。 単調 max で merge されるので
+        // 呼び直しても下がらない。
+        if !dead_row_floors.is_empty() {
+            let entries: Vec<(u32, enchudb_oplog::Hlc)> = dead_row_floors.into_iter().collect();
+            self.record_reclaimed_floors(&entries);
         }
 
         // 再開点を更新 (entry の存在 = この session で検証済み、 の marker)。
@@ -4829,6 +4865,102 @@ impl Engine {
     pub fn sync_dead_rows_purged(&self) -> u64 {
         self.sync_dead_rows_purged
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #218: **decode 不能な `_sync_ops` row を purge する直前**に、 その row が
+    /// history floor へ寄与すべき `(author, HLC 上界)` を作る。
+    ///
+    /// purge した record は ring から永久に消えるので、 floor を上げないと
+    /// 「cursor >= floor だから差分 pull を続けてよい」 と puller が誤判定して、
+    /// **#140 で塞いだ silent partial がこの経路で復活する**。 decode できた row
+    /// だけで floor を作るのは floor の過少申告。
+    ///
+    /// **帰属は取れる** — bridge は payload とは別の列に author を書いている
+    /// (`_sync_ops.peer_id`)。 Column が別なので payload が壊れていても普通に読める。
+    /// 無帰属 baseline (`u32::MAX`) に倒すと全 author の follower が bootstrap する
+    /// のに対し、 帰属できればその author の follower だけで済む。
+    ///
+    /// ただし **row 全体が壊れている場合は `peer_id` もゴミ値**になり得る。 ゴミを
+    /// 信じると (a) 無関係な author の follower が余計に bootstrap し、 (b) 本当の
+    /// author の follower は silent gap のまま、 という最悪の組み合わせになるので、
+    /// **実在の裏が取れている author ([`Engine::ring_authors`]) でなければ baseline に
+    /// 落とす**。 判定の失敗形は 「厳しすぎる → 余計な bootstrap」 と
+    /// 「緩すぎる → silent gap」 で非対称なので、 迷ったら baseline 側。
+    ///
+    /// HLC 上界は `mint_local_hlc()` (= 今の HLC)。 engine は適用した remote record で
+    /// 必ず clock を merge する (`observe_remote_hlc` → `OpLog::observe_hlc`、
+    /// `append_relayed` も内部で呼ぶ) ので、 ring に載り得た HLC は全部一度は観測済み
+    /// = 今 mint した HLC はその上界。 record を書かない mint は logical を 1 進める
+    /// だけで、 `hlc_mint_lock` の規則 (採番順 = WAL 順) は WAL に載る record に
+    /// ついての規則なので破らない。
+    ///
+    /// より tight な上界は採らなかった:
+    ///
+    /// - `_sync_ops.hlc_wall_lo` は wall の**下位 32bit のみ**。 上位を近傍 row から
+    ///   借りる必要があり、 remote の clock skew で外れる。 外れ方が下振れすると
+    ///   silent gap そのものなので unsound。
+    /// - 「同 author の次の row の HLC」 (per-author lsn 単調性) が一番 tight だが、
+    ///   正しさが 「relay が複数 upstream から同一 author を引いても ring 内で HLC 順が
+    ///   崩れない」 に依存する。 purge 地点でそれを検証できず、 外れたときの失敗形が
+    ///   silent gap = 今直しているバグそのものなので採らない。
+    /// - `Hlc::MAX` は論外 — floor は単調 max で下がらないので、 1 件の破損で恒久的に
+    ///   全 peer truncation になる。
+    ///
+    /// 使うのは `ack_sync_prefix` (dead row **だけ**を消すので、 decodable な row は
+    /// 全部生き残っており [`Engine::ring_authors`] で裏が取れる)。 `reclaim_sync_ops`
+    /// は decodable な row も消すため、 走査後に `reclaimed_max` の key と併せて
+    /// 帰属を確定する — そちらは関数内にインラインで書いてある。
+    fn dead_row_floor_candidate(
+        &self,
+        eid: enchudb_oplog::EntityId,
+        known_authors: &std::collections::HashSet<u32>,
+    ) -> (u32, enchudb_oplog::Hlc) {
+        let author = self
+            .himo_id("_sync_ops.peer_id")
+            .and_then(|h| self.get_by_id(eid, h as u16))
+            .filter(|a| known_authors.contains(a))
+            .unwrap_or(u32::MAX);
+        (author, self.mint_local_hlc())
+    }
+
+    /// #218: `dead_row_floor_candidate` の妥当性判定に使う 「実在すると分かっている
+    /// author」 の集合。
+    ///
+    /// - 自分 (自分が author した row)
+    /// - ring 内で **payload が decode できた** row が名乗っている author。 payload で
+    ///   裏が取れているので、 壊れた row のゴミ値は (偶然一致しない限り) 入らない
+    /// - 既存の floor entry の author (無帰属 baseline は除く)。 ring が薄くなっても
+    ///   帰属精度を保つため。 floor に載る author は上の 2 経路のどちらかを通ったもの
+    ///   だけなので、 ゴミが混ざることはない
+    ///
+    /// `eid_translator.authors()` (= [`Engine::replicated_authors`]) は使えない —
+    /// **#209 の verbatim relay は eid を翻訳しない** (author の eid をそのまま流す) ので、
+    /// relay が中継しているだけの author は一度も translator に載らない。 relay こそが
+    /// 帰属を一番必要とする側なので、 それでは常に baseline に落ちる。
+    fn ring_authors(&self) -> std::collections::HashSet<u32> {
+        let mut set = std::collections::HashSet::new();
+        set.insert(self.peer_id());
+        if let Some(floors) = self.read_reclaimed_floor_entries() {
+            for (a, _) in floors {
+                if a != u32::MAX {
+                    set.insert(a);
+                }
+            }
+        }
+        let (Some(lsn_hid), Some(payload_hid)) = (
+            self.himo_id("_sync_ops.lsn"),
+            self.himo_id("_sync_ops.payload"),
+        ) else {
+            return set;
+        };
+        for eid in self.entities_with_himo(lsn_hid as u16) {
+            let Some(vid) = self.get_by_id(eid, payload_hid as u16) else { continue };
+            let bytes = self.vocab.get(vid).to_vec();
+            if let Some(rec) = enchudb_oplog::oplog::decode_sync_ops_payload(&bytes) {
+                set.insert(rec.author_peer);
+            }
+        }
+        set
     }
 
     /// #227: **下流全員が消化し切った位置** を author 別 HLC で返す (transitive
@@ -4982,6 +5114,10 @@ impl Engine {
         // 危険なのは 「未完成」 と 「破損」 を区別できない一点なので、 両方を満たす
         // row だけを避ける — `ack_sync_prefix` の dead-row 分岐と同じ粒度。
         let inflight_lsn = self.current_sync_lsn();
+        // #218: dead row の生の `_sync_ops.peer_id`。 帰属の確定は**走査後**
+        // (下の resolve ブロック参照) だが、 値は delete 前にしか読めないのでここで拾う。
+        let mut dead_raw_authors: Vec<u32> = Vec::new();
+        let dead_peer_id_hid = self.himo_id("_sync_ops.peer_id").map(|h| h as u16);
         for eid in rows {
             let Some(lsn) = self.get_by_id(eid, lsn_hid_u16) else { continue };
             if lsn >= watermark {
@@ -4994,19 +5130,57 @@ impl Engine {
             if decoded.is_none() && lsn >= inflight_lsn {
                 continue;
             }
-            if let Some(rec) = decoded {
-                let e = reclaimed_max
-                    .entry(rec.author_peer)
-                    .or_insert(enchudb_oplog::Hlc::ZERO);
-                if rec.hlc > *e {
-                    *e = rec.hlc;
+            // #218: floor は **decode できた row だけ**で作っていた = 過少申告。
+            // decode 不能な row も消す以上、 その分の履歴は差分 pull で配れない。
+            match &decoded {
+                Some(rec) => {
+                    let e = reclaimed_max
+                        .entry(rec.author_peer)
+                        .or_insert(enchudb_oplog::Hlc::ZERO);
+                    if rec.hlc > *e {
+                        *e = rec.hlc;
+                    }
                 }
+                None => dead_raw_authors.push(
+                    dead_peer_id_hid
+                        .and_then(|h| self.get_by_id(eid, h))
+                        .unwrap_or(u32::MAX),
+                ),
             }
             // 0.8.0: free list に追加 (= 次回 entity_in("_sync_ops") で再利用)。
             // #221: delete + push は専用 lock 下で atomic に (並行 reclaim の二重
             // push = slot 二重払い出し → bridge row の silent 上書き、を塞ぐ)。
             if self.purge_sync_ops_row(eid, lsn_hid_u16, lsn) {
                 purged += 1;
+            }
+        }
+        // #218: dead row の帰属は **走査後**に確定する。 reclaim は decodable な row も
+        // 消すので、 dead row を見た時点では 「同じ author の裏を取れる row」 が既に
+        // 消えていることがある (走査順は lsn 順ではない)。 裏取りの材料は
+        // `reclaimed_max` の key (この走査で decode できた author) と、 生き残った row
+        // から作る `ring_authors()`。 後者は全走査なので、 生の peer_id が前者だけで
+        // 説明できないときにだけ作る。
+        if !dead_raw_authors.is_empty() {
+            let mut known: std::collections::HashSet<u32> =
+                reclaimed_max.keys().copied().collect();
+            known.insert(self.peer_id());
+            // 読めなかった row (`u32::MAX`) はどのみち baseline なので、 そのためだけに
+            // 全走査しない。
+            if dead_raw_authors
+                .iter()
+                .any(|a| *a != u32::MAX && !known.contains(a))
+            {
+                known.extend(self.ring_authors());
+            }
+            let hlc = self.mint_local_hlc();
+            for raw in dead_raw_authors {
+                let author = if known.contains(&raw) { raw } else { u32::MAX };
+                let e = reclaimed_max
+                    .entry(author)
+                    .or_insert(enchudb_oplog::Hlc::ZERO);
+                if hlc > *e {
+                    *e = hlc;
+                }
             }
         }
         if !reclaimed_max.is_empty() {
