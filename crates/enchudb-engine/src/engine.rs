@@ -4898,18 +4898,70 @@ impl Engine {
     pub fn state_records(
         &self,
     ) -> (Vec<crate::transport::WireRecord>, enchudb_oplog::Hlc) {
+        self.state_records_for(self.peer_id())
+    }
+
+    /// #226: `author` が author した live state を合成する — `state_records` の
+    /// **replica 版**。 relay (gossip) は author の行を translated local として
+    /// 保持しているので、 原 eid / 原 author / 原 HLC に**戻して**配れる。
+    /// これが無いと relay 経由でしか author に届かない follower は
+    /// `history_truncated` から回復できない (#140 は author 直結しか救えなかった)。
+    ///
+    /// `author == peer_id()` なら `state_records` と同一。 それ以外は:
+    ///
+    /// - 対象は `translated_locals_of(author)` の local のみ。 eid は原 eid
+    ///   (`make_eid(author, foreign_local)`)、 `author_peer` は `author`。
+    /// - HLC は cell の版数をそのまま。 remote apply は `set_cell(.., hlc)` 経由で
+    ///   **author の HLC を版数に書いている**ので、 relayed cell の版数 = 原 HLC。
+    ///   版数不明 (ZERO) の cell は **配らない** — foreign author の cell に自分の
+    ///   clock を stamp する権利が無く、 ZERO のまま送ると LWW が順序を付けられない。
+    /// - `as_of` は emit した record の **max HLC**。 self 版のように `mint_hlc()`
+    ///   すると自分の clock で author の HLC 空間を進めてしまい、 受信側の
+    ///   `cursor[author]` が author の後続 record を飛び越す (#216 で cursor が
+    ///   author 別になったのでここが直撃する)。
+    /// - Tag は **author の vid 空間に戻して**配る (`peer_vocab_map` の逆引き)。
+    ///   自分の local vid のまま `(author, vid)` として配ると、 author 直 pull で
+    ///   来る同じ key の別テキストと衝突して vocab 写像が壊れる (#209 と同種)。
+    ///   逆引きできない cell は配らない。
+    ///
+    /// 呼び元は `StateBatch.complete` を **false** にすること — relay が author の
+    /// live state を全部持っている保証は無い (途中から relay を始めた場合)。
+    ///
+    /// `himo_id` は自分の番号をそのまま載せる。 これは wire format 全体の前提と
+    /// 同じ (`Tie` の himo_id は受信側でそのまま使われる = peer 間で himo 番号が
+    /// 一致している前提) なので、 replica 経路が新しく持ち込む仮定ではない。
+    pub fn state_records_for(
+        &self,
+        author: enchudb_oplog::PeerId,
+    ) -> (Vec<crate::transport::WireRecord>, enchudb_oplog::Hlc) {
         use enchudb_oplog::oplog::DecodedOp;
         let Some(wal) = self.oplog.as_ref() else {
             return (Vec::new(), enchudb_oplog::Hlc::ZERO);
         };
-        let as_of = wal.mint_hlc();
         let self_peer = self.peer_id();
+        let is_self = author == self_peer;
+        // self: 合成**開始前**に採番 (合成中の write は HLC > as_of なので差分で拾える)。
+        // foreign: 自分の clock を author の HLC 空間に混ぜないため、 emit 後に max を採る。
+        let as_of = if is_self { wal.mint_hlc() } else { enchudb_oplog::Hlc::ZERO };
+
+        // foreign author の行 = translated local。 local -> foreign_local の写像。
+        let foreign: std::collections::HashMap<u32, u32> = if is_self {
+            std::collections::HashMap::new()
+        } else {
+            self.translated_locals_of(author).into_iter().map(|(f, l)| (l, f)).collect()
+        };
+        if !is_self && foreign.is_empty() {
+            return (Vec::new(), enchudb_oplog::Hlc::ZERO);
+        }
+        // Tag: local vid -> author の remote vid (逆引き)。
+        let vid_back: std::collections::HashMap<u32, u32> =
+            if is_self { std::collections::HashMap::new() } else { self.remote_vid_reverse_of(author) };
 
         let mut records: Vec<crate::transport::WireRecord> = Vec::new();
         let mut vocab_sent: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mk = |op: DecodedOp, hlc: enchudb_oplog::Hlc| crate::transport::WireRecord {
             hlc,
-            author_peer: self_peer,
+            author_peer: author,
             op,
             signature: [0u8; 64],
             pubkey_fp: [0u8; 8],
@@ -4924,31 +4976,56 @@ impl Engine {
             let vt = self.value_types[hid];
             for eid in self.entities_with_himo(himo_id) {
                 let local = enchudb_oplog::eid_local(eid);
-                // 他 peer の行 (translated local) は author がその peer — ここでは
-                // 自分が author した行だけを配る (self-authored cross-row write は
-                // v1 対象外、doc 参照)。
-                if self.eid_translator.is_translated_local(local) {
-                    continue;
-                }
+                // 出力する eid。 self 版は自分が author した行だけ (translated local は
+                // 他 peer が author なので skip、 self-authored cross-row write は v1
+                // 対象外)。 replica 版はその逆で、 author の translated local だけを
+                // **原 eid に戻して**配る (#226)。
+                let out_eid = if is_self {
+                    if self.eid_translator.is_translated_local(local) {
+                        continue;
+                    }
+                    eid
+                } else {
+                    let Some(&foreign_local) = foreign.get(&local) else { continue };
+                    enchudb_oplog::make_eid(author, foreign_local)
+                };
                 let Some(value) = self.get_by_id(eid, himo_id) else { continue };
                 let mut hlc = self.version_of(local, himo_id);
                 if hlc == enchudb_oplog::Hlc::ZERO {
+                    // self: 現在値が最新なので `as_of` stamp で LWW 的に安全。
+                    // replica: foreign cell に自分の clock を stamp する権利が無い
+                    // (as_of も ZERO)。 順序を付けられない record は配らない。
+                    if !is_self {
+                        continue;
+                    }
                     hlc = as_of;
                 }
                 match vt {
                     ValueType::Number => {
-                        records.push(mk(DecodedOp::Tie { eid, himo_id, value }, hlc));
+                        records.push(mk(DecodedOp::Tie { eid: out_eid, himo_id, value }, hlc));
                     }
                     ValueType::Ref => {
                         // bridge と同じ規則: translated foreign target は世界番号
                         // 同乗の TieRef、 自 entity target は素の Tie (受信側が
-                        // author key で翻訳する)。
+                        // author key で翻訳する)。 replica 版では「author 自身の
+                        // entity への ref」も translated local なので、 owner が
+                        // author なら素の Tie に戻す (= author 本人が出す形と同じ)。
                         if self.eid_translator.is_translated_local(value) {
                             match self.eid_translator.reverse(value) {
+                                Some((owner, owner_local)) if owner == author && !is_self => {
+                                    records.push(mk(
+                                        DecodedOp::Tie {
+                                            eid: out_eid,
+                                            himo_id,
+                                            value: owner_local,
+                                        },
+                                        hlc,
+                                    ));
+                                }
                                 Some((owner, owner_local)) => {
                                     records.push(mk(
                                         DecodedOp::TieRef {
-                                            eid,
+                                            eid: out_eid,
                                             himo_id,
                                             target: enchudb_oplog::make_eid(owner, owner_local),
                                         },
@@ -4959,23 +5036,39 @@ impl Engine {
                                 // 発送しない (silent 断片化させるより欠けを明示)。
                                 None => continue,
                             }
+                        } else if is_self {
+                            records.push(mk(DecodedOp::Tie { eid: out_eid, himo_id, value }, hlc));
                         } else {
-                            records.push(mk(DecodedOp::Tie { eid, himo_id, value }, hlc));
+                            // replica: author の行が「自分が author した entity」を
+                            // 指すことはない (それは翻訳先を持つ)。 導けないので skip。
+                            continue;
                         }
                     }
                     ValueType::Tag => {
-                        if vocab_sent.insert(value) {
+                        // replica は author の vid 空間に戻す。 戻せない vid は
+                        // 配らない — 自分の local vid を `(author, vid)` として送ると
+                        // author 直 pull の同 key と衝突して写像が壊れる。
+                        let out_vid = if is_self {
+                            value
+                        } else {
+                            match vid_back.get(&value) {
+                                Some(v) => *v,
+                                None => continue,
+                            }
+                        };
+                        if vocab_sent.insert(out_vid) {
                             let bytes = self.vocab.get(value).to_vec();
-                            records.push(mk(DecodedOp::Vocab { vid: value, bytes }, hlc));
+                            records.push(mk(DecodedOp::Vocab { vid: out_vid, bytes }, hlc));
                         }
-                        records.push(mk(DecodedOp::Tie { eid, himo_id, value }, hlc));
+                        records
+                            .push(mk(DecodedOp::Tie { eid: out_eid, himo_id, value: out_vid }, hlc));
                     }
                     ValueType::Leaf => {
                         let Some(bytes) = self.text_owned_by_id(hid, local) else { continue };
                         let Some(name) = self.himo_names.get(hid) else { continue };
                         records.push(mk(
                             DecodedOp::TieLeaf {
-                                eid,
+                                eid: out_eid,
                                 himo_name: name.clone(),
                                 himo_kind: ValueType::Leaf as u8,
                                 bytes,
@@ -4986,7 +5079,42 @@ impl Engine {
                 }
             }
         }
+        // replica 版の as_of = emit した record の max HLC (self 版は採番済み)。
+        let as_of = if is_self {
+            as_of
+        } else {
+            records.iter().map(|r| r.hlc).max().unwrap_or(enchudb_oplog::Hlc::ZERO)
+        };
         (records, as_of)
+    }
+
+    /// #226: `author` の remote vid → local vid 写像 (`peer_vocab_map`) の逆引き。
+    /// replica が Tag cell を author の vid 空間に戻すために使う。 写像は実質
+    /// 単射 (vocab は dedupe 済み) なので衝突は起きない想定だが、 万一重複したら
+    /// 小さい remote vid を採って決定的にする。
+    fn remote_vid_reverse_of(
+        &self,
+        author: enchudb_oplog::PeerId,
+    ) -> std::collections::HashMap<u32, u32> {
+        let map = self.peer_vocab_map.read().unwrap();
+        let mut out: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for ((peer, remote_vid), local_vid) in map.iter() {
+            if *peer != author {
+                continue;
+            }
+            let e = out.entry(*local_vid).or_insert(*remote_vid);
+            if *remote_vid < *e {
+                *e = *remote_vid;
+            }
+        }
+        out
+    }
+
+    /// #226: 自 store に replica (translated local) を持っている author 一覧。
+    /// relay が `serve_state` で「どの author の state を配れるか」を決めるのに使う。
+    /// pull ごとに引かれるので、 写像全体の走査ではなく translator 側の索引を見る。
+    pub fn replicated_authors(&self) -> Vec<enchudb_oplog::PeerId> {
+        self.eid_translator.authors()
     }
 
     /// #140: `author` peer の行として翻訳済みの local slot 一覧

@@ -499,8 +499,28 @@ pub trait Transport: Send + Sync {
     /// `fetch_state` が None を返し、 bootstrap は成立しない (従来どおり)。
     fn register_state_provider(&self, _peer: PeerId, _provider: StateProvider) {}
 
+    /// #226: `by` が `author` の live state を配れると名乗る (relay/replica 用)。
+    ///
+    /// `author == by` は #140 の author 直配布と同じ。 `author != by` は
+    /// **replica 配布** — relay は author の行を translated local として保持して
+    /// いるので、 `Engine::state_records_for(author)` で原型に戻して配れる。
+    /// relay topology では author に直接届かない follower の唯一の回復経路。
+    ///
+    /// default は `author == by` の時だけ既存の scalar 登録に落とす
+    /// (= replica 配布を運べない transport では従来どおり author 直のみ)。
+    /// 同じ `(author, by)` の再登録は置換すること (`serve_state` は繰り返し
+    /// 呼ばれる)。
+    fn register_state_provider_for(&self, author: PeerId, by: PeerId, provider: StateProvider) {
+        if author == by {
+            self.register_state_provider(author, provider);
+        }
+    }
+
     /// #140: `author` の live state を取得する。 None = この transport は
     /// state 配布を運べない、 または author が provider 未登録。
+    ///
+    /// #226: replica が名乗っている場合、 実装は **author 本人の provider を
+    /// 優先**すること (本人発だけが `complete: true` = ghost sweep 可)。
     fn fetch_state(&self, _author: PeerId) -> Option<StateBatch> {
         None
     }
@@ -555,9 +575,14 @@ pub struct InMemoryTransport {
     /// drain。 relay 混在 ring の reclaim を回す vector ack 用。
     pull_acks_multi:
         Arc<Mutex<HashMap<PeerId, HashMap<PeerId, HashMap<PeerId, Hlc>>>>>,
-    /// #140: peer → live-state provider。
-    state_providers: Arc<Mutex<HashMap<PeerId, StateProvider>>>,
+    /// #140/#226: author → 配布元 `(by, provider)` の一覧。 `by == author` が
+    /// 本人発 (complete)、 それ以外は replica 発 (partial)。 `fetch_state` は
+    /// 本人発を優先する。
+    state_providers: StateProviderRegistry,
 }
+
+/// #226: author → 配布元 `(by, provider)` の一覧。
+type StateProviderRegistry = Arc<Mutex<HashMap<PeerId, Vec<(PeerId, StateProvider)>>>>;
 
 impl InMemoryTransport {
     pub fn new() -> Self {
@@ -771,12 +796,32 @@ impl Transport for InMemoryTransport {
 
     // #140: in-process なので provider をそのまま持って fetch 時に呼ぶ。
     fn register_state_provider(&self, peer: PeerId, provider: StateProvider) {
-        self.state_providers.lock().unwrap().insert(peer, provider);
+        self.register_state_provider_for(peer, peer, provider);
+    }
+
+    // #226: replica 発も受け付ける。 同じ `(author, by)` は置換 (serve_state は
+    // 新しい author が増えるたびに呼び直される)。
+    fn register_state_provider_for(&self, author: PeerId, by: PeerId, provider: StateProvider) {
+        let mut g = self.state_providers.lock().unwrap();
+        let slot = g.entry(author).or_default();
+        match slot.iter_mut().find(|(p, _)| *p == by) {
+            Some(e) => e.1 = provider,
+            None => slot.push((by, provider)),
+        }
     }
 
     fn fetch_state(&self, author: PeerId) -> Option<StateBatch> {
-        let provider = self.state_providers.lock().unwrap().get(&author).cloned();
-        provider.and_then(|p| p())
+        // 本人発 (complete、 ghost sweep 可) を先に。 次に replica 発を登録順に。
+        let candidates: Vec<StateProvider> = {
+            let g = self.state_providers.lock().unwrap();
+            let slot = g.get(&author)?;
+            slot.iter()
+                .filter(|(by, _)| *by == author)
+                .chain(slot.iter().filter(|(by, _)| *by != author))
+                .map(|(_, p)| p.clone())
+                .collect()
+        };
+        candidates.into_iter().find_map(|p| p())
     }
 }
 

@@ -86,6 +86,10 @@ pub struct Syncer {
     /// #216: 「truncated なのに transport が state を運べない (fetch_state = None)」
     /// の一度だけ警告 — この構成では truncation が回復経路の無い行き止まりになる。
     warned_no_state_provider: std::sync::atomic::AtomicBool,
+    /// #226: `serve_state` で state 配布に opt-in 済みか、 および既に provider を
+    /// 登録した author 一覧。 relay は pull のたびに新しい author を持ちうるので、
+    /// opt-in 済みなら差分を自動で登録し直す (app 側の儀式を増やさない)。
+    served_authors: std::sync::Mutex<Option<std::collections::HashSet<PeerId>>>,
     // 0.9.0: 旧 Content reorder buffer (`pending_ops`) は削除 — content は
     // TieNamed で運ばれ、 自力で entity 写像を作れるため退避が不要になった。
 }
@@ -159,6 +163,17 @@ pub struct SyncOutcome {
     /// [`Syncer::bootstrap_pull`] (author が `serve_state` 済みの transport) か
     /// `GET /bootstrap` (replica 型の snapshot 取得) からやり直す必要がある。
     pub history_truncated: bool,
+    /// #226: `history_truncated` を立てた **author** の一覧。
+    ///
+    /// relay 経由の pull は 1 本の link に複数 author の stream が乗るので、
+    /// 「link が truncated」 だけでは**どの author を bootstrap すればいいか**
+    /// 決まらない。 caller は各 author について
+    /// [`Syncer::bootstrap_pull_via`]`(link, author)` を呼ぶ。
+    ///
+    /// 空 かつ `history_truncated` = author を特定できない広域 truncation
+    /// (author 別 floor を運べない transport、 または legacy baseline 由来)。
+    /// この場合は link 自身 (= 1-hop 構成なら author) を bootstrap するしかない。
+    pub truncated_authors: Vec<PeerId>,
 }
 
 /// #140: [`Syncer::bootstrap_pull`] の結果。
@@ -273,6 +288,7 @@ impl Syncer {
             warned_unconfigured_peer: std::sync::atomic::AtomicBool::new(false),
             truncated_pulls: std::sync::atomic::AtomicU64::new(0),
             warned_no_state_provider: std::sync::atomic::AtomicBool::new(false),
+            served_authors: std::sync::Mutex::new(None),
         };
         // request17 step 6: **v9 DB では hydrate しない**。
         //
@@ -462,21 +478,78 @@ impl Syncer {
     /// 上げ、 floor を跨いだ puller の唯一の回復経路が bootstrap になるため。
     /// provider 不在だと `history_truncated` は回復経路の無い行き止まりになる
     /// (`bootstrap_pull` が once-warn を出し、 `Syncer::truncated_pulls` で観測可)。
+    ///
+    /// #226: relay (gossip) なら、 自分が replica を持っている **他 author の分も**
+    /// 配布登録する。 relay topology では author に直接届かない follower の唯一の
+    /// 回復経路がこれ。 replica 発の batch は `complete: false` — relay が author の
+    /// live state を全部持っている保証は無い (途中から relay を始めた場合) ので、
+    /// 受信側の ghost sweep は走らせない。 **亡霊掃除は author 直 bootstrap の
+    /// 特権**として残る (relay 経由 bootstrap は内容だけ回復する)。
+    ///
+    /// 一度呼べば opt-in が残り、 以降 `pull_once` / `bootstrap_pull` で新しい
+    /// author を取り込むたびに自動で登録が追加される (app 側に儀式を増やさない)。
+    /// 何度呼んでも冪等。
     pub fn serve_state(&self) {
-        // Weak 必須: transport は peer より長生きする。 強参照で capture すると、
-        // restart で drop したはずの engine (background consumer 込み) が provider の
-        // 中で生き続け、 同一 DB file を再 open した新 engine と並走して sidecar
-        // persist が衝突する (sunsu2 chaos の restart で実測)。
-        let engine = Arc::downgrade(&self.engine);
+        {
+            let mut g = self.served_authors.lock().unwrap();
+            if g.is_none() {
+                *g = Some(std::collections::HashSet::new());
+            }
+        }
+        self.refresh_state_providers();
+    }
+
+    /// `serve_state` で opt-in 済みなら、 未登録の author 分の provider を張る。
+    /// opt-in していなければ no-op。
+    fn refresh_state_providers(&self) {
+        // pull ごとに呼ばれる。 opt-in していなければ engine に一切触れずに返す。
+        if self.served_authors.lock().unwrap().is_none() {
+            return;
+        }
         let self_peer = self.engine.peer_id();
-        self.transport.register_state_provider(
-            self_peer,
-            Arc::new(move || {
-                let eng = engine.upgrade()?;
-                let (records, as_of) = eng.state_records();
-                Some(enchudb_engine::transport::StateBatch { records, as_of, complete: true })
-            }),
-        );
+        let mut authors: Vec<PeerId> = vec![self_peer];
+        // relay でない peer は他 author の行を転送しないので、 replica として
+        // 名乗らない (持っていても配送経路が無い)。
+        if self.engine.gossip_remote_apply() {
+            for a in self.engine.replicated_authors() {
+                if a != self_peer {
+                    authors.push(a);
+                }
+            }
+        }
+        let fresh: Vec<PeerId> = {
+            let mut g = self.served_authors.lock().unwrap();
+            let Some(seen) = g.as_mut() else { return };
+            authors.into_iter().filter(|a| seen.insert(*a)).collect()
+        };
+        for author in fresh {
+            // Weak 必須: transport は peer より長生きする。 強参照で capture すると、
+            // restart で drop したはずの engine (background consumer 込み) が provider の
+            // 中で生き続け、 同一 DB file を再 open した新 engine と並走して sidecar
+            // persist が衝突する (sunsu2 chaos の restart で実測)。
+            let engine = Arc::downgrade(&self.engine);
+            let is_self = author == self_peer;
+            self.transport.register_state_provider_for(
+                author,
+                self_peer,
+                Arc::new(move || {
+                    let eng = engine.upgrade()?;
+                    let (records, as_of) = eng.state_records_for(author);
+                    if !is_self && records.is_empty() {
+                        // 何も持っていない replica は None を返して次の候補に譲る。
+                        // 空 batch でも `Some` を返すと、 caller は「state を受け取った
+                        // = 回復した」と見なして truncation を解除してしまう。
+                        // (self の空 batch は「author に行が無い」の正しい表明なので別)
+                        return None;
+                    }
+                    Some(enchudb_engine::transport::StateBatch {
+                        records,
+                        as_of,
+                        complete: is_self,
+                    })
+                }),
+            );
+        }
     }
 
     /// #140: truncation からの復旧経路 — author の live state を取得して適用する。
@@ -492,7 +565,21 @@ impl Syncer {
     ///    既に消した行」なので LWW 的に正しい方向にしか働かない
     /// 4. cursor を `as_of` へ前進 (後退はさせない) — 以降は通常の差分 pull
     pub fn bootstrap_pull(&self, from: PeerId) -> Option<BootstrapOutcome> {
-        let Some(batch) = self.transport.fetch_state(from) else {
+        self.bootstrap_pull_via(from, from)
+    }
+
+    /// #226: `link` 経由で `author` の state を bootstrap する — relay topology 用の
+    /// `bootstrap_pull` 一般形 (`bootstrap_pull(p)` = `bootstrap_pull_via(p, p)`)。
+    ///
+    /// author に直接 pull していない follower は cursor を `last_pulled[link][author]`
+    /// に持つ。 link と author を同一視したままだと、 bootstrap が誰も pull しない
+    /// link の下に cursor を書いてしまい **前進が効かない**。 ここを分けることで
+    /// 「relay から author の state をもらい、 以降は relay からの差分で追う」が成立する。
+    ///
+    /// `fetch_state` は author 名で引く (どの provider が応じるかは transport の
+    /// 責務 — `InMemoryTransport` は本人発を優先し、 次に replica 発)。
+    pub fn bootstrap_pull_via(&self, link: PeerId, author: PeerId) -> Option<BootstrapOutcome> {
+        let Some(batch) = self.transport.fetch_state(author) else {
             // #216: この構成では truncation が回復経路の無い行き止まり — silent に
             // しない。 relay topology (reclaim が回る構成) では author 側の
             // `serve_state` 登録が実質必須。
@@ -501,7 +588,7 @@ impl Syncer {
                 .swap(true, std::sync::atomic::Ordering::Relaxed)
             {
                 eprintln!(
-                    "[enchudb] sync: bootstrap_pull({from}) failed — the transport carries \
+                    "[enchudb] sync: bootstrap_pull({author}) failed — the transport carries \
                      no state for this peer (no serve_state provider?). History-truncated \
                      pulls from it cannot recover; in relay/reclaim topologies serve_state \
                      is effectively mandatory. (warned once)"
@@ -524,7 +611,7 @@ impl Syncer {
 
         // pull_once と同じ barrier: 派生 state (eidmap / vocabmap / tables) が
         // durable になる前に cursor を進めない。
-        if outcome.applied > 0 && !self.persist_applied_state(from) {
+        if outcome.applied > 0 && !self.persist_applied_state(link) {
             return Some(BootstrapOutcome { outcome, swept: 0, as_of: batch.as_of });
         }
 
@@ -544,7 +631,7 @@ impl Syncer {
                     DecodedOp::Commit | DecodedOp::Vocab { .. } => None,
                 })
                 .collect();
-            for (foreign_local, local) in self.engine.translated_locals_of(from) {
+            for (foreign_local, local) in self.engine.translated_locals_of(author) {
                 if !covered.contains(&foreign_local) {
                     self.engine.delete(local as u64);
                     swept += 1;
@@ -553,27 +640,31 @@ impl Syncer {
         }
 
         // cursor := max(現行, as_of)。 進んだら永続 + pull-as-ack (#149) も記録。
-        // #216: StateBatch は author (= from) 単一なので author=from の entry のみ
-        // 前進させ、 ack は author 別 cursor の vector を送る (pull_once と同じ)。
+        // #216: StateBatch は author 単一なので author の entry のみ前進させ、
+        // ack は author 別 cursor の vector を送る (pull_once と同じ)。
+        // #226: cursor が住むのは **link** の下 — 以降その author を追うのは link
+        // からの差分 pull なので、 author の下に書いても誰も見ない。
         let self_peer = self.engine.peer_id();
         let (advanced, cursors) = {
             let mut guard = self.last_pulled.lock().unwrap();
-            let link = guard.entry(from).or_default();
-            let cur = link.entry(from).or_insert(Hlc::ZERO);
+            let link_map = guard.entry(link).or_default();
+            let cur = link_map.entry(author).or_insert(Hlc::ZERO);
             let advanced = if batch.as_of > *cur {
                 *cur = batch.as_of;
                 true
             } else {
                 false
             };
-            let cursors: Vec<(PeerId, Hlc)> =
-                link.iter().map(|(a, h)| (*a, *h)).collect();
+            let cursors: Vec<(PeerId, Hlc)> = link_map.iter().map(|(a, h)| (*a, *h)).collect();
             (advanced, cursors)
         };
         if advanced {
             self.save_cursors();
-            self.transport.record_pull_ack_multi(from, self_peer, &cursors);
+            self.transport.record_pull_ack_multi(link, self_peer, &cursors);
         }
+        // #226: relay が bootstrap で新しい author を取り込んだ → その author の
+        // 配布元としても名乗る (opt-in 済みなら)。
+        self.refresh_state_providers();
 
         Some(BootstrapOutcome { outcome, swept, as_of: batch.as_of })
     }
@@ -619,6 +710,7 @@ impl Syncer {
             .as_ref()
             .and_then(|f| f.iter().find(|(a, _)| *a == u32::MAX).map(|(_, h)| *h))
             .unwrap_or(Hlc::ZERO);
+        let mut truncated_authors: Vec<PeerId> = Vec::new();
         let truncated_by_floor = if let Some(floors) = &floors_multi {
             let cursor_of_a = |a: PeerId| {
                 since
@@ -635,16 +727,26 @@ impl Syncer {
                     .unwrap_or(Hlc::ZERO);
                 cursor_of_a(a) < f.max(baseline)
             };
+            // #226: どの author が穴を空けたかを caller に渡す — relay link には
+            // 複数 author の stream が乗るので、 bool だけでは bootstrap 対象が
+            // 決まらない。
+            for (a, _) in floors.iter().filter(|(a, _)| *a != u32::MAX) {
+                if violates(*a) && !truncated_authors.contains(a) {
+                    truncated_authors.push(*a);
+                }
+            }
+            for (a, _) in since.iter() {
+                if violates(*a) && !truncated_authors.contains(a) {
+                    truncated_authors.push(*a);
+                }
+            }
             // 初回 pull (cursor 無し) で reclaim 済み link → 従来どおり truncation
-            // (baseline-only の floor では下の走査対象が無いので明示する)。
+            // (baseline-only の floor では上の走査対象が無いので明示する。 author を
+            // 特定できないので `truncated_authors` は空のまま = 広域 truncation)。
             let fresh_puller = since.is_empty() && !floors.is_empty();
-            fresh_puller
-                || floors
-                    .iter()
-                    .filter(|(a, _)| *a != u32::MAX)
-                    .any(|(a, _)| violates(*a))
-                || since.iter().any(|(a, _)| violates(*a))
+            fresh_puller || !truncated_authors.is_empty()
         } else if let Some(floor) = floor {
+            // scalar floor は author を判別できない → 広域 truncation。
             let link_min = since.iter().map(|(_, h)| *h).min().unwrap_or(Hlc::ZERO);
             link_min < floor
         } else {
@@ -653,7 +755,11 @@ impl Syncer {
         if truncated_by_floor {
             self.truncated_pulls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return SyncOutcome { history_truncated: true, ..SyncOutcome::default() };
+            return SyncOutcome {
+                history_truncated: true,
+                truncated_authors,
+                ..SyncOutcome::default()
+            };
         }
 
         let fetched = self.transport.pull_as_multi(self_peer, from, &since);
@@ -682,17 +788,25 @@ impl Syncer {
         // author 別 floor のみ (baseline 無し) なら、 entry のある新 author は
         // pre-fetch 判定が拾い、 entry の無い新 author は reclaim されていない =
         // clean なので flag 不要。
-        let new_author_on_reclaimed_link = ((floors_multi.is_none() && floor.is_some())
-            || baseline > Hlc::ZERO)
-            && records
-                .iter()
-                .any(|r| !since.iter().any(|(p, _)| *p == r.author_peer));
+        let mut new_authors: Vec<PeerId> = Vec::new();
+        if (floors_multi.is_none() && floor.is_some()) || baseline > Hlc::ZERO {
+            for r in &records {
+                if !since.iter().any(|(p, _)| *p == r.author_peer)
+                    && !new_authors.contains(&r.author_peer)
+                {
+                    new_authors.push(r.author_peer);
+                }
+            }
+        }
+        let new_author_on_reclaimed_link = !new_authors.is_empty();
         let gossip = self.engine.gossip_remote_apply();
         let mut relay_accepted: Vec<usize> = Vec::new();
         let mut outcome =
             self.apply_records_impl(&records, gossip.then_some(&mut relay_accepted));
         if new_author_on_reclaimed_link {
             outcome.history_truncated = true;
+            // #226: この経路は author を特定できる (新規に現れた author そのもの)。
+            outcome.truncated_authors = new_authors;
             self.truncated_pulls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -786,6 +900,10 @@ impl Syncer {
         if !cursors.is_empty() {
             self.transport.record_pull_ack_multi(from, self_peer, &cursors);
         }
+
+        // #226: relay が新しい author を取り込んだら、 その author の state 配布元
+        // としても名乗る (`serve_state` で opt-in 済みなら)。
+        self.refresh_state_providers();
 
         outcome
     }
