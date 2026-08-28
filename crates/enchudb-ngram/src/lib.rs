@@ -28,3 +28,7 @@ pub(crate) mod storage;
 mod index;
 
 pub use index::NgramIndex;
+// #188: merge に要る 2 型だけを出す。 モジュールごと公開すると
+// `save` / `write_to` 系 4 本の生 writer 入口が NgramIndex の wrapper と
+// 二重に露出し、 以後あれを触るたび breaking 判定になる。
+pub use storage::{MappedIndex, MergeStats};

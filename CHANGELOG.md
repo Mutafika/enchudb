@@ -3,6 +3,177 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.24.0 — 2026-08-28
+
+**`.etxt` の segment merge (#188) と、 relay topology に残っていた scalar 前提 3 箇所の
+除去 (#226 / #227 / #228)。** 前者は索引の作り直しを「全再索引」から「segment を足して
+時々統合」に変え、 **build のピークをコーパス量から独立させる**。 後者は 0.23.1 が
+relay の受け取り側 (cursor / ack / floor) を author 別に直した続きで、 **配布側・ack 側・
+push 側**を揃える。
+
+**on-disk format は不変** (`.etxt` / engine の v9 とも、 migration 不要)。 公開 API は
+追加のみだが、 `enchudb-ngram` の再エクスポートと `Transport` trait の新メソッド
+(いずれも既存コードは無改修) で公開面が広がるため minor bump。
+
+### Added — `.etxt` の segment merge (#188 / PR #194)
+
+`storage::merge_files(inputs, out) -> MergeStats` と、 `NgramIndex::merge_files` /
+`TextSearch::merge_files` の委譲。 Gram Index (key 昇順) / Doc Index (eid 昇順) /
+posting run (compact 済み = eid 昇順) が全部整列済みなので、 素直な k-way merge で書ける。
+
+- 一度に触るのは **1 gram ぶんの posting run** だけ。 メモリに残すのは Gram Index 相当
+  (distinct gram × 16B) と Doc Index 相当 (doc × 14B) で、 **本文量に比例しない**
+- **後の input が勝つ** (LSM の上書き)。 上書きされた doc の**旧 posting も落とす**ので、
+  統合結果は 「新本文で最初から索引した場合」 と一致する。 これが無いと畳んだ後も旧本文の
+  語で候補に出る
+- 上書きが 1 件も無い場合 (segment が doc を分割している通常ケース) は所有権判定を丸ごと
+  飛ばす — hot path に binary search を持ち込まないため
+- `n` 不一致 / 原文保持・postings-only の混在は明示エラー (flag を勝手に継承しない)
+- **segment を作る専用 API は無い**。 `index()` → `save()` で焼いた普通の `.etxt` が
+  そのまま segment になる
+
+実測 (naruhodo の法令索引・494,133 doc / 1,007,416,823 B の `.etxt`):
+
+| | ピークメモリ |
+|---|---|
+| 一気に索引 (従来) | 索引投入 +1.8GB / `save()` +0.9GB = **~2.7GB** |
+| 25,000 doc × 20 segment に刻んで焼く | **146MB** |
+| 20 segment を統合 | **27MB** |
+
+統合結果は一気に索引したものと **byte 単位で同一** (1,007,416,823 B / sha256 `ebb172cd…`)。
+`grams=227,268 / postings=69,238,492 / docs=494,133 / text=442,875,511B`。
+
+統合の所要時間は **1.2〜5.8 秒** (page cache 次第。 segment が温かい直後が 1.2s、
+cold read で 5.8s)。 ピークメモリは 2 回とも 27〜28MB で安定。 従来側の時間は
+`save()` フェーズ単体しか測れておらず索引投入ぶんを含まないため、 比較対象として
+載せない。
+
+**公開 API**: `enchudb_ngram::{MappedIndex, MergeStats}` を再エクスポート
+(`storage` モジュール自体は `pub(crate)` のまま — `save` / `write_to` 系の生の入口は
+`NgramIndex` の wrapper と二重に露出させない)。
+
+### 呼び出し側にとって何が変わるか
+
+索引の作り直しが segment 単位になるので、 build ピークがコーパス量から独立する。
+naruhodo は日次差分のために **本体 `.etxt` + `delta.etxt` の 2 層引き** (delta 在籍 doc は
+本体ヒットを tombstone 抑制) を既に実装していて、 これは segment 数 2 に固定した segment
+検索そのもの。 delta を本体へ畳む作業がこの merge に置き換わる。
+
+### relay topology の補完 — replica 配布 / transitive watermark / push cursor (#226 / #227 / #228)
+
+0.23.1 が relay の **受け取り側** (cursor / ack / floor) を author 別に直したのに続いて、
+こちらは relay topology で**まだ scalar のままだった 3 箇所**を塞ぐ。 根は 0.23.1 と同じ
+一つで、 **複数 author が merge された stream に scalar な値を当てている**こと。
+
+| 実地で起きうる壊れ方 | 直したもの |
+|---|---|
+| relay 経由でしか author に届かない follower が `history_truncated` から**回復できない** (relay の state batch が常に空、 `bootstrap_pull` が None) | replica を state 配布元にする (#226) |
+| relay が「配った」だけの履歴を author が「消化された」と信じて reclaim し、 relay の恒久消失で下流が**永久欠落** | ack を下流の消化で丸める (#227) |
+| relay に張った WS subscriber が、 **中継された古い HLC の record を永久に落とす** (#216 の push 版) | push の subscriber filter を author 別に (#228) |
+
+#### #226 — relay/replica が author の live state を配れるように
+
+`Engine::state_records()` は live cell の走査で translated local を全 skip していた。
+relay は author の行を**まさに translated local として**保持しているので、 replica の
+state batch は**常に空**だった (実測: note 3 件を relay 済みの peer で
+`state_records()` = 0 records、 `translated_locals_of(author)` = 3)。 加えて
+`serve_state` は self_peer の 1 key でしか provider を登録せず、 `fetch_state(author)` が
+relay に当たらなかった。 結果 #140 の bootstrap は **author 直結でしか効かなかった**。
+
+- `Engine::state_records_for(author)` — replica 版の state 合成。 **原 eid** /
+  **原 author** / **原 HLC** に戻す (remote apply は `set_cell(.., hlc)` 経由で author の
+  HLC を版数に書いているので、 relayed cell の版数 = 原 HLC)。 `as_of` は emit した
+  record の max HLC — 自分の clock で author の HLC 空間を進めると、 author 別 cursor
+  (#216) が author の後続 record を飛び越す
+- **Tag は author の vid 空間に戻す** (`peer_vocab_map` の逆引き)。 relay の local vid を
+  `(author, vid)` として配ると、 author 直 pull で来る同じ key の別テキストと衝突して
+  vocab 写像が壊れる (#209 と同種)。 逆引きできない vid は配らない
+- `Transport::register_state_provider_for(author, by, provider)` (**default 実装つき**、
+  既存 transport は無改修)。 `InMemoryTransport` は **author 本人発を優先**、 次に
+  replica 発 — 本人発だけが `complete: true` (= ghost sweep を許せる)。 本人の engine が
+  drop 済みなら自動で replica にフェイルオーバする
+- `Syncer::serve_state()` は opt-in を記憶し、 pull で新しい author を取り込むたびに
+  provider を自動追加する (app 側に儀式を増やさない)
+- `Syncer::bootstrap_pull_via(link, author)` — **cursor は link の下に住む**。 link と
+  author を同一視したままだと、 誰も pull しない link の下に cursor を書いてしまい
+  前進が効かない。 `bootstrap_pull(p)` = `bootstrap_pull_via(p, p)` で後方互換
+- `SyncOutcome::truncated_authors` — relay link には複数 author の stream が乗るので、
+  bool だけでは bootstrap 対象が決まらない。 空 = author を特定できない広域 truncation
+
+**v1 の限界**: replica 発の batch は `complete: false`。 relay が author の live state を
+全部持っている保証が無い (途中から relay を始めた場合) ので、 受信側の ghost sweep は
+走らせない。 **亡霊掃除は author 直 bootstrap の特権**として残る。 HTTP/WS transport は
+state provider を実装していないので、 #140 と同じく `fetch_state` = None のまま。
+
+#### #227 — relay の ack を下流の消化で丸める (transitive watermark)
+
+pull-as-ack (#149) は「自分が apply した位置」を author に返す。 1-hop ならそれが消化
+証明そのものだが、 **relay では「配った」でしかない**。 reclaim の安全条件は
+「全 follower が **apply し切った**」なので、 relay が配った直後に恒久消失すると author は
+履歴を捨て、 下流は永久欠落する (#191 の裏返しで 1 段深い)。 実測: 5 note (= 10 row) を
+author し relay だけが pull した時点で、 下流が 1 件も消化していないのに author の
+watermark = 10。
+
+- `Engine::sync_delivered_cursors()` — 「下流全員が消化し切った位置」を author 別 HLC で
+  返す。 **新しい永続 state は増やさない**: `lsn <= sync_watermark()` の `_sync_ops` row の
+  author 別 max HLC + `sync_reclaimed_floors()` (#216) の author 別 entry から導出する。
+  無帰属 baseline (`u32::MAX`) は author に帰属させられないので使わない (保守側)。
+  `None` = 下流ゼロ
+- ack 送出直前に `ack[a] = min(自分の cursor[a], delivered[a])` へ丸める。 tree のどの
+  深さでも規則は同じ (「直接の下流の min」) なので、 hop を跨いで transitive に成立する
+- 丸めるのは **relay (gossip) の時だけ** — 非 relay は他 author の row を転送しないし、
+  下流ゼロの葉ノードで丸めると author の reclaim を永久に止める
+
+**既知の縮退** (どれも「欠落」ではなく「reclaim 遅延」側): SubscriptionFilter で一部
+author しか見ない下流がいると prefix walk が止まる (根は #219) / 下流の恒久消失で ack が
+固定される (author 側の dead follower と同じ性質) / **「pull はしたが 1 件も消化して
+いない下流」は `_sync_peers` に行を作らない**ので下流ゼロと区別できず丸めが効かない
+(塞ぐには pull で行を materialize する必要があるが、 それは relay に限らず全 author の
+reclaim 挙動を変える = 一度 pull して消えた peer が watermark を 0 に固定する #149 の
+失敗形。 受け皿は #140 / #226 の bootstrap)。
+
+#### #228 — WS push の subscriber filter を author 別 cursor に
+
+`WsPushHub` の broadcast filter が `r.hlc > sub.since` の scalar 比較だった。 pull path は
+#216 で author 別に直したが、 **push path は scalar のままだった**ので、 relay に張った
+subscriber は中継された古い HLC の record を永久に落とす。
+
+- `Subscriber` が author 別 cursor を持つ。 **entry の無い author は `Hlc::ZERO` 起点** —
+  「既知 author の max」への短絡は同じ穴を一段下で再現する
+- subscribe query に `since_by=<author>:<wall>.<logical>.<peer>[,...]`。 **1 entry でも
+  壊れていたら丸ごと捨てる** (半端に読むと「消化済み」を偽る floor になる。 空なら全部
+  ZERO 起点で送り直されるだけ)
+- legacy の scalar `since` は **無帰属 baseline** として全 author に効かせる
+  (「単一 author の stream に張っている」という宣言なので契約を変えない)
+- `WsPushClient::connect_and_run_multi(url, from, &[(author, hlc)], cb)` を追加
+
+doc で 2 点を明示: **push は pull を置き換えない** (delivery ≠ apply — WS の送信完了は
+相手が apply したことを何も保証しない。 cursor 前進と pull-as-ack は `pull_once` の
+仕事で、 push は pull の頻度を下げるもの) / relay が使う時の `peer_id` は **link 名**
+(changefeed には原 author の record が流れるが、 subscriber は pull と同じく link に張る)。
+
+### Known limitation — この release で増えたテストの多くは CI で走らない (#98)
+
+CI の `test` job が回すのは core 5 crate (`oplog` / `engine` / `schema` / `sql` / `sync`)
+だけで、 **`ngram` / `textsearch` / `transport` / `ffi` / `cli` / `rag` / root は全部対象外**。
+`clippy` job も `continue-on-error: true` で non-blocking。 この release で増えたテストのうち
+
+- `enchudb-ngram` 9 本 (#194)
+- `enchudb-textsearch` 9 本 (#194)
+- `enchudb-transport` 2 本 (#228)
+
+は **CI では 1 本も実行されない**。 PR の緑チェックはこれらの crate について何も保証しない
+(緑なのは「無関係な 5 crate が緑」という意味)。 拡張は #98。
+
+実際にこの穴を踏んでいる: PR #194 の初版は `merge_files` を `save_postings_only` の
+doc comment と `#[cfg(not(target_arch = "wasm32"))]` の**間**に挿入していて、 cfg gate が
+新関数側に移り **`enchudb-ngram` の wasm32 build が壊れていた** (`E0425` / `E0433`)。
+native では 66 pass で素通りするので、 native だけ回している限り永久に見えない。
+**`cargo check --target wasm32-unknown-unknown` を 1 回走らせるだけで捕まる**種類の欠陥
+だったが、 CI に wasm job が無いためどこにも信号が出なかった (merge 前に修正済み。
+並べ替えのみ・意味の変更なし、 `wasm32-unknown-unknown` / `wasm32-wasip1` ともに
+green を確認)。 wasm の対象範囲を定義して CI で守る件は #230。
+
 ## 0.23.1 — 2026-08-28
 
 **relay 経路の correctness patch。** 0.23.0 が relay の**配布**を byte 単位の素通しに直した
