@@ -3,6 +3,111 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.25.0 — 2026-08-28
+
+**v9 領域 (per-cell version column + tombstone column) を sync に参加する DB だけが持つ
+ようにした (request18 / #173 / PR #233)。** 0.19.0 / 0.20.0 は無条件に確保していたため、
+sync しない DB が **apparent ×3.6** (既定 capacity で 26.5 GB → 95.5 GB) を払っていた。
+版数・tombstone は remote record の LWW 判定にしか使わず、 それは `Syncer` 経由でしか起きない
+(`Syncer::new` が `sync_tables_enabled()` を必須チェック) ので、 存在条件をそこに寄せた。
+0.20.0 の 「⚠️ apparent size が ~3.6 倍になる」 はこの release で **sync しない DB については解消**。
+
+**on-disk format は不変** (v9 の region layout も header flag も同じ)。 変わるのは 「いつ v9
+領域を生やすか」 の既定だけ。 `create_with_capacity` の既定が v9 無しになるのと新 API 2 本で
+minor bump。 **既存 DB の migration は不要** (下記)。
+
+### Changed — v9 領域の存在条件 (request18 / #173)
+
+| | 0.20.0 〜 0.24.0 | 0.25.0 |
+|---|---|---|
+| `create*` の既定 | v9 領域を確保 | **確保しない** (eager / growable 両方)。 明示は `create_with_cell_version` / `create_growable_with_cell_version` |
+| `enable_sync_tables()` | table を足すだけ | **file を伸ばして header flag を立てる** (B-lite)。 mmap は張り替えないので version column が生えるのは **次の open から** |
+| writer open の auto-migration | 無条件 | **`.tables` sidecar に sync tables がある DB だけ**。 `enable_sync_tables()` を取りこぼした DB (crash / 旧 binary で enable) の回収路 |
+| 版数の記帳 | 常に | `sync_tables_on()` (AtomicBool cache) で gate。 **sync しない DB は揮発 `HlcStore` にも書かない** (上限の無い HashMap で 1M cell ≈ 40 MB 漏れていた) |
+| `accepts_write` | 常に判定 | sync tables も v9 領域も無い DB は即 true (判定だけで 2.4x、 end-to-end は WAL append に埋もれる)。 **v9 領域を持つ非 sync DB (0.19〜0.24 で作った DB) は載っている版数を従来どおり尊重する** |
+
+`enable_sync_tables()` の**窓** (= 領域は生えたが column は次の open から、 という 1 セッション)
+で書かれた版数は揮発 `HlcStore` にしか無い。 次の open で column が生えると `version_of` は
+column しか見なくなるので、 何もしないと陳腐 record が再 apply される (#154 の再来)。 塞ぎ方:
+
+1. `Syncer::hydrate_hlc_store` の復元先を `Engine::remember_version` に一本化 (v9 なら
+   column、 pre-v9 なら `HlcStore`。 直接 `HlcStore` へ書くと読まれない)
+2. hydrate 条件を `!has_cell_version() || cell_versions_are_empty()` に。 **版数が 1 つも
+   載っていない v9 DB** = 窓を経て初めて開いた DB だけが対象で、 一度でも載れば二度と走らない
+
+foreign entity の tombstone は `.eidmap` sidecar 経由で open が `set_tombstone_local` を通す
+ので、 追加対応なしで生えたての column に載る。
+
+### Fixed — growable backing の lazy commit が v9 で無効化されていた
+
+growable の commit は単調 high-water なので、 variable cluster 末尾の v9 region の header を
+読むだけで手前の vocab_data / content_data / leaf_data が丸ごと commit されていた
+(100K entity の growable DB で create 直後 1.7 GB)。 `Column::init_lazy` + `Region::is_committed`
+で、 commit が届いていない region は **触らずに空 column として組み立てる** (header は最初の
+実書き込み直前に `Column::ensure_header` が書く)。 sync DB にも効く独立の修正。
+
+### 実測 (macOS / APFS)
+
+| ケース | plain create | `enable_sync_tables` 後 |
+|---|---|---|
+| 既定 capacity (16.7M ent) | **26,482 MB** | 95,469 MB |
+| 1M ent | **3,112 MB** | 7,224 MB |
+
+- apparent は FS を問わず (sparse file の見かけサイズ)。 Linux でも `--sparse` 無しの `cp` /
+  `rsync` / `tar` や apparent で数える quota に効く
+- 1M ent では APFS が 16 MB 以下の穴を extent 合体で埋めるため、 書いたのは各 column 先頭
+  12 バイトだけなのに version column が丸ごと実体化していた (physical 64 MB)。 これも非 sync
+  DB からは消えた (ext4 / xfs では元々起きない)
+- **書き込み速度は v9 / pre-v9 で有意差なし** (同条件 3 回で両者とも 0.63–1.31 M tie/s)。
+  request17 の 「-35%」 は版数機構そのものを入れる前との比較
+
+### 既存 DB への影響 — migration 不要、 demote は自動でやらない
+
+- **0.19〜0.24 で作った / 開いた非 sync DB** は v9 領域を持ったまま。 実害は apparent のみで、
+  載っている版数も従来どおり尊重される。 戻したい場合は `snapshot_export` → 新規 create
+- **自動 demote (v9 → v8) はしない。** `oboro` / `opyula` が Leaf を別 process から readonly
+  mmap で直読みしており、 writer の `.db.lock` flock は readonly open を排他しない。 ファイルを
+  縮めた瞬間に reader が SIGBUS する。 伸ばすのは安全、 縮めるのは危険
+- **sync DB** は `enable_sync_tables()` 済み = sidecar に sync tables があるので、 次の writer
+  open で従来どおり v9 化される (0.20.0 と同じ経路、 gate が付いただけ)
+- 0.25.0 で作った非 sync DB を **0.24.0 以前の binary で開くと writer open で v9 化される**
+  (旧 binary は無条件 migration のまま)。 壊れはしないが apparent が戻る
+
+### 呼び出し側にとって何が変わるか
+
+- 何もしなければ: `create*` した DB が `ls -l` で 26 GB に見える (0.24.0 までは 95 GB)
+- sync する DB: `enable_sync_tables()` を呼ぶ既存コードのまま。 version column が生えるのは
+  次の open からだが、 そのセッションの版数は従来 (0.18 以前) と同じく in-memory で判定される
+- test / tool で v9 layout が最初から要る場合: `create_with_cell_version` /
+  `create_growable_with_cell_version` (`#[doc(hidden)]`)
+- `create_without_cell_version` は `create_with_capacity` と同じ layout を作る後方互換の別名に
+
+### 検証
+
+- workspace 全体 (0.24.0 上、 `--no-fail-fast --test-threads=1`): 163 suites / 1082 passed /
+  0 failed (v9 無関係の timing flake 1 本を除く、 下記)
+- 新規 test: 非 sync DB は open しても v9 化されない (`plain_db_is_not_migrated_on_open`) /
+  `enable_sync_tables` が次の open 用に領域を生やす / 非 sync DB は `HlcStore` にも記帳しない /
+  v9 領域を持つ非 sync DB は版数を尊重する / 窓のセッションで受けた削除が reopen 後も効く
+  (`tombstone_written_in_the_enable_sync_window_survives_reopen`)
+- **falsify 済み**: hydrate 条件から `cell_versions_are_empty()` を外すと
+  `issue154_hydrate_after_fold` が、 open の sidecar gate を外すと
+  `plain_db_is_not_migrated_on_open` が落ちる
+- 0.21 以降に足された `interrupted_delete.rs` (7 本) は 「`create_with_capacity` = v9」 前提
+  だったので sync DB 前提に揃えた (test の前提変更のみ、 対象の挙動は不変)
+
+### 既知の残り
+
+- `sync_ops_freelist_reopen::full_ring_backpressures_instead_of_dropping` が全走の負荷下で
+  1 回落ちた。 `sleep(400/600ms)` で背景 consumer を待つ作りの timing flake で、 単独 13/13
+  pass、 `_sync_ops` ring の話で本 release の変更には触れない。 sleep を barrier に置き換える
+  のは別途
+- #206 (行の書き込み境界) は **v9 に乗せない** (純ローカル並行問題なので、 sync 参加 DB 限定に
+  した v9 に相乗りさせると 「必要な DB にだけ機構が無い」 逆立ちになる)。 entity 1 個の
+  世代番号 (`LeafStore` slot gen の seqlock を entity scope へ) で別途
+- growable の残り 1,229 MB (100K ent) は `ContentStore::init` / `LeafStore::init` が同じ形を
+  踏んでいるため。 v9 とは独立 (#172)
+
 ## 0.24.0 — 2026-08-28
 
 **`.etxt` の segment merge (#188) と、 relay topology に残っていた scalar 前提 3 箇所の
