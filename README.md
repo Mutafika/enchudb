@@ -249,18 +249,27 @@ Each sub-crate has its own `README.md` with details, and `docs/` holds architect
 <blob_root>/   BlobStore (separate directory, content-addressed, for offloading large blobs)
 ```
 
-> **Opening a pre-v9 DB with a v9 writer stamps it as v9, and older binaries can no
-> longer open it.** The layout itself does not change (the v9 regions are gated by a
-> header flag), and no migration is needed — but the version stamp is one-way, so
-> rebuild every consumer before pointing a v9 binary at a production DB.
+> **The v9 per-cell version regions belong to syncing databases only.** They are
+> allocated when `enable_sync_tables()` is called (and, as a fallback, when a writer
+> opens a database that already has the sync tables). A database that never syncs stays
+> at the v8 layout and pays nothing for them — that is a ~3.6x difference in apparent
+> size at default capacity. Version columns become readable on the *next* open after
+> `enable_sync_tables()`; during that first session versions are kept in memory, exactly
+> as pre-v9 builds behaved.
+>
+> **Stamping a database as v9 is one-way, and older binaries can no longer open it.**
+> The layout itself does not change (the v9 regions are gated by a header flag) and no
+> data is moved, but there is no automatic demotion: shrinking the file would SIGBUS any
+> reader that has it mapped read-only from another process. To go back, use
+> `snapshot_export` into a freshly created database.
 
 ## Disk space
 
 The main DB is a **sparse** file: the apparent size is fixed at create time from
 `max_entities` x `max_himos`, while physical usage only grows with what you actually
-write. A default-capacity store looks like ~95 GB in `ls -l` but costs a few hundred KB
-on disk. `df` does not move. This is by design — but it has three consequences worth
-knowing.
+write. A default-capacity store looks like ~26 GB in `ls -l` (~95 GB once sync is
+enabled and the v9 version columns are allocated) but costs a few hundred KB on disk.
+`df` does not move. This is by design — but it has three consequences worth knowing.
 
 **1. A full disk is refused, not crashed — but only on a best-effort basis.** Writes go
 through `mmap`, so when the kernel cannot allocate a block for a hole it raises
