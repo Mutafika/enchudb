@@ -45,9 +45,34 @@ use enchudb_oplog::{Hlc, PeerId};
 
 /// 接続中の subscriber。broadcast 時に書き込みする。
 struct Subscriber {
-    from_peer: PeerId,        // この subscriber が興味ある origin peer
-    since: Hlc,               // この HLC より新しい record だけ送る
+    /// この subscriber が張っている **link** (= pull における pull 先)。
+    /// relay に張れば relay の stream 全部 (複数 author) が来る。
+    from_peer: PeerId,
+    /// #228: author 別の消化位置。 **relay の stream は HLC が単調でない**
+    /// (自 row = 自 clock、 中継 row = 原 author の HLC 素通し #209) ので、
+    /// scalar cursor で filter すると中継された古い record が永久に落ちる
+    /// (#216 の push 版)。 **entry の無い author は `Hlc::ZERO` 起点** —
+    /// 「既知 author の min」 や baseline への短絡は同じ穴を一段下で再現する。
+    since_by: std::collections::HashMap<PeerId, Hlc>,
+    /// legacy (scalar `since`) 用の**無帰属 baseline**。 author 別を運べない
+    /// 旧 client は「単一 author の stream に張っている」という宣言なので、
+    /// 全 author への下限として従来どおり効かせる。 `since_by` を送ってくる
+    /// client では使わない (ZERO)。
+    baseline: Hlc,
     ws: Mutex<WebSocket<TcpStream>>,
+}
+
+impl Subscriber {
+    /// この record を送るべきか。
+    fn wants(&self, r: &WireRecord) -> bool {
+        let floor = self
+            .since_by
+            .get(&r.author_peer)
+            .copied()
+            .unwrap_or(Hlc::ZERO)
+            .max(self.baseline);
+        r.hlc > floor
+    }
 }
 
 /// WebSocket push サーバー。listen + handshake + broadcast。
@@ -99,8 +124,14 @@ impl WsPushHub {
         self.subscribers.lock().unwrap().len()
     }
 
-    /// `peer` の records を、興味ある subscriber 全員に push する。
-    /// since フィルタを通った record だけ送る。
+    /// `peer` (= **link**) の records を、そこに張っている subscriber 全員に push する。
+    ///
+    /// `peer` は「この stream を誰から受け取ったことにするか」= pull における pull 先。
+    /// relay がこれを呼ぶ場合、 records には **原 author の record** が混ざる
+    /// (#209 素通し) が、 それでも `peer` は relay 自身の id にする — subscriber は
+    /// link に張るので (pull の意味論と同じ)。 author 別の絞り込みは
+    /// [`Subscriber::wants`] が `author_peer` を見て行う (#228)。
+    ///
     /// 死んでる subscriber は次回 broadcast で除去 (write エラー検出時)。
     pub fn broadcast(&self, peer: PeerId, records: &[WireRecord]) {
         if records.is_empty() { return; }
@@ -110,7 +141,7 @@ impl WsPushHub {
         for (idx, sub) in subs.iter().enumerate() {
             if sub.from_peer != peer { continue; }
             let filtered: Vec<WireRecord> = records.iter()
-                .filter(|r| r.hlc > sub.since)
+                .filter(|r| sub.wants(r))
                 .cloned()
                 .collect();
             if filtered.is_empty() { continue; }
@@ -140,6 +171,43 @@ impl Drop for WsPushHub {
     }
 }
 
+/// #228: `since_by` query の parse。 `author:wall.logical.peer` を `,` 区切り。
+///
+/// **entry が 1 つでも壊れていたら丸ごと捨てる** — 半端に読むと「消化済み」を偽る
+/// floor になり、 record を黙って落とす。 空 map に落ちれば全部 ZERO 起点で
+/// 送り直されるだけ (冪等な apply が受け止める)。
+fn parse_since_by(v: &str) -> std::collections::HashMap<PeerId, Hlc> {
+    let mut out = std::collections::HashMap::new();
+    for entry in v.split(',').filter(|e| !e.is_empty()) {
+        let Some((author, hlc)) = entry.split_once(':') else { return Default::default() };
+        let mut parts = hlc.split('.');
+        let (Some(wall), Some(logical), Some(peer), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Default::default();
+        };
+        let (Ok(author), Ok(wall), Ok(logical), Ok(peer)) = (
+            author.parse::<PeerId>(),
+            wall.parse::<u64>(),
+            logical.parse::<u32>(),
+            peer.parse::<u32>(),
+        ) else {
+            return Default::default();
+        };
+        out.insert(author, Hlc { wall, logical, peer });
+    }
+    out
+}
+
+/// `since_by` query の組み立て (client 側)。
+fn encode_since_by(since: &[(PeerId, Hlc)]) -> String {
+    since
+        .iter()
+        .map(|(a, h)| format!("{}:{}.{}.{}", a, h.wall, h.logical, h.peer))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// 1 接続の handshake → subscriber 登録 → 接続生存維持。
 fn handle_ws_connection(
     stream: TcpStream,
@@ -152,7 +220,9 @@ fn handle_ws_connection(
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
 
     // handshake と同時に path から query を抜く (Arc<Mutex> で共有)
-    let captured: Arc<Mutex<(PeerId, Hlc)>> = Arc::new(Mutex::new((0, Hlc::ZERO)));
+    type Captured = (PeerId, Hlc, std::collections::HashMap<PeerId, Hlc>);
+    let captured: Arc<Mutex<Captured>> =
+        Arc::new(Mutex::new((0, Hlc::ZERO, std::collections::HashMap::new())));
     let captured_cb = captured.clone();
     let callback = move |req: &Request, response: Response| -> Result<Response, ErrorResponse> {
         let uri = req.uri().to_string();
@@ -165,6 +235,10 @@ fn handle_ws_connection(
                         "wall" => g.1.wall = v.parse().unwrap_or(0),
                         "logical" => g.1.logical = v.parse().unwrap_or(0),
                         "peer" => g.1.peer = v.parse().unwrap_or(0),
+                        // #228: author 別 cursor。 `author:wall.logical.peer` を `,` 区切り。
+                        // 壊れた entry は黙って落とさず**丸ごと無視**する
+                        // (半端に読むと「消化済み」を偽る floor になる)。
+                        "since_by" => g.2 = parse_since_by(v),
                         _ => {}
                     }
                 }
@@ -178,8 +252,12 @@ fn handle_ws_connection(
         let s = ws.get_ref();
         s.set_read_timeout(Some(Duration::from_millis(100)))?;
     }
-    let (from_peer, since) = *captured.lock().unwrap();
-    let sub = Arc::new(Subscriber { from_peer, since, ws: Mutex::new(ws) });
+    let (from_peer, scalar_since, since_by) = captured.lock().unwrap().clone();
+    // #228: author 別を送ってきた client には baseline を適用しない — 未知 author は
+    // ZERO 起点でなければならない (baseline へ短絡すると同じ穴の再発)。 scalar しか
+    // 送らない legacy client では従来どおり全 author への下限として効かせる。
+    let baseline = if since_by.is_empty() { scalar_since } else { Hlc::ZERO };
+    let sub = Arc::new(Subscriber { from_peer, since_by, baseline, ws: Mutex::new(ws) });
     subscribers.lock().unwrap().push(sub.clone());
 
     // 短い read timeout で poll、WouldBlock のたびに lock 解放して broadcast に譲る
@@ -220,20 +298,69 @@ pub struct WsPushClient {
 
 impl WsPushClient {
     /// `url` 例: "ws://127.0.0.1:8080/push"
-    /// `from` = 興味ある origin peer、`since` = この HLC より後だけ受け取る。
+    /// `from` = 張り先の **link** (pull における pull 先)、
+    /// `since` = この HLC より後だけ受け取る。
+    ///
+    /// **`since` は全 author への下限として効く**ので、 relay に張る場合は
+    /// [`WsPushClient::connect_and_run_multi`] を使うこと — relay の stream は
+    /// HLC が単調でないので、 scalar cursor は中継された古い record を落とす
+    /// (#228)。 単一 author の stream に張る場合はこちらで正しい。
     pub fn connect_and_run<F>(
         url: &str,
         from: PeerId,
         since: Hlc,
+        on_record: F,
+    ) -> Result<Self, Box<dyn std::error::Error>>
+    where
+        F: FnMut(WireRecord) + Send + 'static,
+    {
+        Self::connect_inner(url, from, since, &[], on_record)
+    }
+
+    /// #228: author 別 cursor で subscribe する (relay link 用)。
+    ///
+    /// relay の stream は「自 row (自 clock)」と「中継 row (原 author の HLC 素通し
+    /// #209)」の merge なので **HLC が単調でない**。 scalar cursor で filter すると、
+    /// relay 自身の新しい row を跨いだ後に中継された古い record が永久に落ちる
+    /// (#216 の push 版)。 author ごとの substream は relay を何 hop 挟んでも単調、
+    /// がこの粒度を健全にする不変式。
+    ///
+    /// **`since` に無い author は `Hlc::ZERO` 起点**で全部届く。 push は changefeed
+    /// (= これから commit される分) しか流さないので、 過去の再送にはならない。
+    ///
+    /// 受け取った record を apply しても、 それ自体は author への消化証明にならない
+    /// (**delivery ≠ apply**)。 cursor 前進と ack は従来どおり `Syncer::pull_once`
+    /// の仕事で、 **push は pull を置き換えず pull の頻度を下げる**もの。
+    pub fn connect_and_run_multi<F>(
+        url: &str,
+        from: PeerId,
+        since: &[(PeerId, Hlc)],
+        on_record: F,
+    ) -> Result<Self, Box<dyn std::error::Error>>
+    where
+        F: FnMut(WireRecord) + Send + 'static,
+    {
+        Self::connect_inner(url, from, Hlc::ZERO, since, on_record)
+    }
+
+    fn connect_inner<F>(
+        url: &str,
+        from: PeerId,
+        since: Hlc,
+        since_by: &[(PeerId, Hlc)],
         mut on_record: F,
     ) -> Result<Self, Box<dyn std::error::Error>>
     where
         F: FnMut(WireRecord) + Send + 'static,
     {
-        let full_url = format!(
+        let mut full_url = format!(
             "{}?from={}&wall={}&logical={}&peer={}",
             url, from, since.wall, since.logical, since.peer
         );
+        if !since_by.is_empty() {
+            full_url.push_str("&since_by=");
+            full_url.push_str(&encode_since_by(since_by));
+        }
         let (mut ws, _) = tungstenite::connect(&full_url)?;
         // Drop で shutdown → join したい、長い read を中断するため短い timeout を入れる
         {
@@ -280,6 +407,23 @@ impl Drop for WsPushClient {
 /// `enchudb::changefeed::ChangeListener` を実装して [`WsPushHub`] に流すアダプタ。
 ///
 /// engine が WAL に commit するたびに、自動で connected subscriber に push される。
+///
+/// # push は pull を置き換えない (#228)
+///
+/// **delivery ≠ apply**。 push で届いた record を subscriber が apply しても、
+/// それは author への消化証明にはならない (WS の送信完了は「相手が書けた」ことを
+/// 何も保証しない)。 cursor の前進と pull-as-ack (#149) は従来どおり
+/// `Syncer::pull_once` の仕事で、 **push は pull の頻度を下げるもの**。
+/// reclaim が回るのは pull が回っている時だけ。
+///
+/// # relay が使う場合 (#209 / #228)
+///
+/// `peer_id` は broadcast の **link 名**として使われる (subscriber の `from` と照合)。
+/// relay の changefeed には**原 author の record** が流れるが、 `peer_id` には
+/// **relay 自身の id** を渡すこと — subscriber は pull と同じく link に張るため。
+/// author 別の絞り込みは subscriber 側の `since_by` が `author_peer` を見て行う
+/// ([`WsPushClient::connect_and_run_multi`])。 relay に張る subscriber が scalar
+/// `since` を使うと、 中継された古い HLC の record が落ちる。
 ///
 /// # 使い方
 ///
@@ -430,6 +574,100 @@ mod tests {
 
         let extra = rx.recv_timeout(Duration::from_millis(200));
         assert!(extra.is_err(), "should not receive third (filtered)");
+    }
+
+    /// #228: relay link に張った subscriber が、 **中継された古い HLC の record** を
+    /// 落とさないこと。
+    ///
+    /// relay の stream は「自 row (自 clock)」 と 「中継 row (原 author の HLC 素通し
+    /// #209)」 の merge なので **HLC が単調でない**。 scalar な `since` は
+    /// 「単調な単一 stream」 を前提にしているので、 relay 自身の新しい row を跨いだ
+    /// cursor で subscribe すると、 後から中継された author の古い record が
+    /// filter で永久に落ちる (#216 の push 版)。
+    #[test]
+    fn relayed_old_hlc_record_is_not_filtered_out() {
+        let hub = WsPushHub::start("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}/push", hub.addr());
+
+        // link = relay(2)。 relay 自身の row は wall 300 まで消化済み、
+        // author 1 は未知 (= ZERO 起点)。
+        let (tx, rx) = mpsc::channel();
+        let _client = WsPushClient::connect_and_run_multi(
+            &url,
+            2,
+            &[(2, Hlc { wall: 300, logical: 0, peer: 2 })],
+            move |r| {
+                let _ = tx.send(r);
+            },
+        )
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while hub.subscriber_count() == 0 {
+            if std::time::Instant::now() > deadline {
+                panic!("subscriber not registered");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // relay が 「自 row (wall 400)」 と 「中継 row (author 1、 wall 100)」 を
+        // まとめて push する。
+        hub.broadcast(
+            2,
+            &[rec(100, 1, 10, 100), rec(400, 2, 20, 400)],
+        );
+
+        let mut got: Vec<WireRecord> = Vec::new();
+        for _ in 0..2 {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(r) => got.push(r),
+                Err(_) => break,
+            }
+        }
+        let authors: Vec<PeerId> = got.iter().map(|r| r.author_peer).collect();
+        assert!(
+            authors.contains(&1),
+            "中継された author 1 の古い record (wall 100) が scalar since で落ちている \
+             — 届いたのは {authors:?}"
+        );
+        assert!(authors.contains(&2), "relay 自身の row も届くこと: {authors:?}");
+    }
+
+    /// legacy (scalar `since`) の subscriber は従来どおり全 author への下限として
+    /// 効くこと — 「単一 author の stream に張っている」 という宣言なので、 その
+    /// 契約は変えない。
+    #[test]
+    fn scalar_since_still_applies_as_baseline() {
+        let hub = WsPushHub::start("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}/push", hub.addr());
+
+        let (tx, rx) = mpsc::channel();
+        let _client = WsPushClient::connect_and_run(
+            &url,
+            2,
+            Hlc { wall: 300, logical: 0, peer: 2 },
+            move |r| {
+                let _ = tx.send(r);
+            },
+        )
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while hub.subscriber_count() == 0 {
+            if std::time::Instant::now() > deadline {
+                panic!("subscriber not registered");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        hub.broadcast(2, &[rec(100, 1, 10, 100), rec(400, 2, 20, 400)]);
+
+        let first = rx.recv_timeout(Duration::from_secs(5)).expect("wall 400 は届く");
+        assert_eq!(first.hlc.wall, 400);
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "scalar since の baseline が効いていない"
+        );
     }
 
     #[test]
