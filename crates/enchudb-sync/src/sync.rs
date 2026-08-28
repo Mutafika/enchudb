@@ -90,6 +90,18 @@ pub struct Syncer {
     /// 登録した author 一覧。 relay は pull のたびに新しい author を持ちうるので、
     /// opt-in 済みなら差分を自動で登録し直す (app 側の儀式を増やさない)。
     served_authors: std::sync::Mutex<Option<std::collections::HashSet<PeerId>>>,
+    /// #219: `SubscriptionFilter` が **target 別に落とした record** の author 別
+    /// 最大 HLC (`{target: {author: hlc}}`)。 落とした record は puller の cursor が
+    /// 飛び越えるので差分 pull では二度と届かない — その事実を publisher 側で
+    /// 観測可能にする ([`Syncer::suppressed_since`])。
+    ///
+    /// in-memory only。 永続する意味が薄いため (プロセスを跨いだら 「この target に
+    /// 何を配らなかったか」 は filter 自身の state から再構成すべきもので、
+    /// Syncer が持つ写しは常に部分的)。
+    suppressed_since:
+        std::sync::Mutex<std::collections::HashMap<PeerId, std::collections::HashMap<PeerId, Hlc>>>,
+    /// #219: filter が落とした record の累計 (観測用)。 `AllRecords` なら常に 0。
+    suppressed_records: std::sync::atomic::AtomicU64,
     // 0.9.0: 旧 Content reorder buffer (`pending_ops`) は削除 — content は
     // TieNamed で運ばれ、 自力で entity 写像を作れるため退避が不要になった。
 }
@@ -289,6 +301,8 @@ impl Syncer {
             truncated_pulls: std::sync::atomic::AtomicU64::new(0),
             warned_no_state_provider: std::sync::atomic::AtomicBool::new(false),
             served_authors: std::sync::Mutex::new(None),
+            suppressed_since: std::sync::Mutex::new(std::collections::HashMap::new()),
+            suppressed_records: std::sync::atomic::AtomicU64::new(0),
         };
         // request17 step 6: **v9 DB では hydrate しない**。
         //
@@ -870,6 +884,12 @@ impl Syncer {
         // (= reject 分は次回 pull で再配送・再検証される)。
         // #216: 前進は author 別。 minrej は batch 全体の scalar を全 author に
         // 適用する (author を跨いで保守側に倒すだけ — reject は稀な例外経路)。
+        //
+        // #219: **ここが 「受け取った = 消化した」 を仮定している唯一の点**。
+        // publisher 側の `SubscriptionFilter` が落とした record は、 そもそも
+        // `records` に現れないまま同 author の後続 record が cursor を押し上げるので、
+        // 差分 pull では二度と届かない。 cursor は author 粒度で、 scope 粒度ではない。
+        // 契約と回復手段は `SubscriptionFilter` の doc を参照。
         let mut advanced = false;
         {
             let mut guard = self.last_pulled.lock().unwrap();
@@ -1169,13 +1189,68 @@ impl Syncer {
     pub fn publish_since_for_peer(&self, target_peer: PeerId, since: Hlc) -> usize {
         let self_peer = self.engine.peer_id();
         let filter = self.subscription_filter.read().unwrap().clone();
-        let filtered: Vec<WireRecord> = self.collect_records_since(since)
-            .into_iter()
-            .filter(|r| filter.should_send(target_peer, r))
-            .collect();
+        // #219: 落とした record は **puller の cursor が飛び越える** (cursor は
+        // 受け取った record の author 別 max HLC で進む) ので、 差分 pull では
+        // 二度と届かない。 契約は `SubscriptionFilter` の doc 参照。 ここでは
+        // 「誰に何をどこまで配らなかったか」 を author 別に記録して、 少なくとも
+        // publisher 側から観測できるようにする。
+        let mut suppressed: std::collections::HashMap<PeerId, Hlc> =
+            std::collections::HashMap::new();
+        let mut filtered: Vec<WireRecord> = Vec::new();
+        for r in self.collect_records_since(since) {
+            if filter.should_send(target_peer, &r) {
+                filtered.push(r);
+                continue;
+            }
+            let e = suppressed.entry(r.author_peer).or_insert(Hlc::ZERO);
+            if r.hlc > *e {
+                *e = r.hlc;
+            }
+            self.suppressed_records
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if !suppressed.is_empty() {
+            let mut guard = self.suppressed_since.lock().unwrap();
+            let per_target = guard.entry(target_peer).or_default();
+            for (author, hlc) in suppressed {
+                let e = per_target.entry(author).or_insert(Hlc::ZERO);
+                if hlc > *e {
+                    *e = hlc;
+                }
+            }
+        }
         let count = filtered.len();
         self.transport.publish_to(self_peer, target_peer, filtered);
         count
+    }
+
+    /// #219: `SubscriptionFilter` が `target_peer` 向けに落とした record の
+    /// **author 別最大 HLC**。 一度も落としていない target は `None`。
+    ///
+    /// 用途は 「subscription scope を広げるとき、 広げた分の過去を bootstrap で
+    /// 回収する必要があるか」 の判定。 entry がある author については、 その HLC 以下に
+    /// **差分 pull では二度と届かない record がある**と考えること
+    /// (詳細は `SubscriptionFilter` の doc)。
+    ///
+    /// この Syncer が publish した分の記録なので、 プロセス再起動で消える。
+    /// 「配らなかったもの」の正準な source は filter 自身の subscription state であって
+    /// ここではない — これはあくまで観測窓。
+    pub fn suppressed_since(&self, target_peer: PeerId) -> Option<Vec<(PeerId, Hlc)>> {
+        let guard = self.suppressed_since.lock().unwrap();
+        let per_target = guard.get(&target_peer)?;
+        if per_target.is_empty() {
+            return None;
+        }
+        let mut out: Vec<(PeerId, Hlc)> = per_target.iter().map(|(a, h)| (*a, *h)).collect();
+        out.sort_by_key(|(a, _)| *a);
+        Some(out)
+    }
+
+    /// #219: `SubscriptionFilter` が落とした record の累計 (全 target 合算、 観測用)。
+    /// default の `AllRecords` を使っている限り常に 0。
+    pub fn suppressed_records(&self) -> u64 {
+        self.suppressed_records
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 受信レコードを LWW で apply する。Phase C: 署名検証 + ACL も通す。
