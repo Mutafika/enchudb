@@ -660,6 +660,8 @@ impl Syncer {
         };
         if advanced {
             self.save_cursors();
+            // #227: relay なら下流の消化で丸めてから ack する。
+            let cursors = self.cap_ack_by_downstream(cursors);
             self.transport.record_pull_ack_multi(link, self_peer, &cursors);
         }
         // #226: relay が bootstrap で新しい author を取り込んだ → その author の
@@ -897,6 +899,7 @@ impl Syncer {
                 .map(|m| m.iter().map(|(a, h)| (*a, *h)).collect())
                 .unwrap_or_default()
         };
+        let cursors = self.cap_ack_by_downstream(cursors);
         if !cursors.is_empty() {
             self.transport.record_pull_ack_multi(from, self_peer, &cursors);
         }
@@ -906,6 +909,53 @@ impl Syncer {
         self.refresh_state_providers();
 
         outcome
+    }
+
+    /// #227: **transitive watermark** — relay が上流に返す ack を、 自分の下流が
+    /// 消化し切った位置で丸める。
+    ///
+    /// pull-as-ack (#149) は「自分が apply した位置」を author に返す。 1-hop なら
+    /// それが消化証明そのものだが、 **relay では「配った」でしかない**。 reclaim の
+    /// 安全条件は「全 follower が apply し切った」なので、 relay が配った直後に
+    /// 恒久消失すると author は履歴を捨て、 下流は永久欠落する (#191 の裏返しで
+    /// 1 段深い)。
+    ///
+    /// `ack[a] = min(自分の cursor[a], 下流全員が消化し切った位置[a])`。 tree の
+    /// どの深さでも規則は同じ (「直接の下流の min」) なので、 hop を跨いで
+    /// transitive に成立する。 reclaim が遅れるのは正しいトレードオフ (ring 圧力は
+    /// 50% gate 側で調整する)。
+    ///
+    /// 丸めるのは **relay (gossip) の時だけ**:
+    /// - 非 relay は他 author の row を転送しないので、 下流がそれを待つはずが無い
+    /// - 下流ゼロ (`sync_delivered_cursors` = `None`) の葉ノードで丸めると、
+    ///   author の reclaim を永久に止める
+    ///
+    /// 既知の縮退 (どれも「欠落」ではなく「reclaim 遅延」側):
+    /// - SubscriptionFilter で一部 author しか見ない下流がいると、 その row で
+    ///   `ack_sync_prefix` が止まり watermark が上がらない → 上流への ack も
+    ///   上がらない。 根は #219
+    /// - 下流が恒久消失すると ack が固定される。 author 側で dead follower が
+    ///   watermark を固定するのと同じ性質で、 新しい露出ではない
+    /// - 「pull はしたが 1 件も消化していない下流」は `_sync_peers` に現れないので
+    ///   丸めが効かない (#227 に記録)。 受け皿は floor + bootstrap (#140/#226)
+    fn cap_ack_by_downstream(&self, cursors: Vec<(PeerId, Hlc)>) -> Vec<(PeerId, Hlc)> {
+        if !self.engine.gossip_remote_apply() {
+            return cursors;
+        }
+        let Some(delivered) = self.engine.sync_delivered_cursors() else {
+            return cursors;
+        };
+        cursors
+            .into_iter()
+            .map(|(author, hlc)| {
+                let d = delivered
+                    .iter()
+                    .find(|(p, _)| *p == author)
+                    .map(|(_, h)| *h)
+                    .unwrap_or(Hlc::ZERO);
+                (author, hlc.min(d))
+            })
+            .collect()
     }
 
     /// #216 observability: `pull_once` が `history_truncated` を返した累計回数。

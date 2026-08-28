@@ -4654,6 +4654,89 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// #227: **下流全員が消化し切った位置** を author 別 HLC で返す (transitive
+    /// watermark の材料)。
+    ///
+    /// relay が author に返す pull-as-ack は「自分が apply した位置」ではいけない。
+    /// reclaim の安全条件は「全 follower が **apply し切った**」であって「配った」
+    /// ではないので、 relay が配った直後に消えると author は「消化済み」と信じて
+    /// 履歴を捨て、 下流が永久欠落する (#191 の裏返しで 1 段深い)。
+    ///
+    /// 導出は既存の永続 state だけで足りる — **新しい記録は増やさない**:
+    ///
+    /// - `lsn <= sync_watermark()` の `_sync_ops` row = 下流全員が消化済み。
+    ///   その範囲の author 別 max HLC がそのまま transitive ack の値。
+    /// - 既に purge された分は `sync_reclaimed_floors()` (#216 で author 別) に
+    ///   author 別 max HLC として残っているので畳み込む。 無帰属 baseline
+    ///   (`u32::MAX`) は author に帰属させられないので**使わない** (保守側)。
+    ///
+    /// `None` = 下流 peer が 1 つも `_sync_peers` に居ない = 「配り切った」の判定
+    /// 材料が無い。 caller は自分の cursor をそのまま使うこと — 葉ノード (中継先の
+    /// 居ない peer) がここで ZERO を返すと author の reclaim を永久に止める。
+    ///
+    /// **既知の残り窓**: 「pull はしたが 1 件も消化していない下流」 は
+    /// `_sync_peers` に行を作らない (`ack_sync_prefix` は ack_lsn 0 では
+    /// `ack_sync` を呼ばない) ので、 下流ゼロと区別できない。 その間 relay は
+    /// full ack する。 塞ぐには pull で行を materialize する必要があるが、
+    /// それは relay に限らず全 author の reclaim 挙動を変える (一度 pull して
+    /// 消えた peer が watermark を 0 に固定 = #149 の失敗形) ので採らない。
+    /// 受け皿は floor + bootstrap (#140 / replica は #226)。
+    pub fn sync_delivered_cursors(&self) -> Option<Vec<(enchudb_oplog::PeerId, enchudb_oplog::Hlc)>> {
+        if !self.sync_tables_enabled() {
+            return None;
+        }
+        let peer_id_hid = self.himo_id("_sync_peers.peer_id")? as u16;
+        let self_peer = self.peer_id();
+        // 下流 (self を除く登録済み peer) が 1 つも無ければ判定材料が無い。
+        let has_downstream = self.entities_with_himo(peer_id_hid).into_iter().any(|eid| {
+            match self.get_by_id(eid, peer_id_hid) {
+                Some(pid) => self_peer == 0 || pid != self_peer,
+                None => false,
+            }
+        });
+        if !has_downstream {
+            return None;
+        }
+
+        let mut out: std::collections::HashMap<enchudb_oplog::PeerId, enchudb_oplog::Hlc> =
+            std::collections::HashMap::new();
+        let mut bump = |author: enchudb_oplog::PeerId, hlc: enchudb_oplog::Hlc| {
+            let e = out.entry(author).or_insert(enchudb_oplog::Hlc::ZERO);
+            if hlc > *e {
+                *e = hlc;
+            }
+        };
+        // purge 済み = 当時の下流全員が消化した範囲。
+        if let Some(entries) = self.read_reclaimed_floor_entries() {
+            for (author, hlc) in entries {
+                if author != u32::MAX {
+                    bump(author, hlc);
+                }
+            }
+        }
+        // 生存 row のうち watermark 以下 (= 下流全員が消化済み)。
+        let watermark = self.sync_watermark();
+        if watermark > 0
+            && let Some(lsn_hid) = self.himo_id("_sync_ops.lsn")
+            && let Some(payload_hid) = self.himo_id("_sync_ops.payload")
+        {
+            for eid in self.entities_with_himo(lsn_hid as u16) {
+                let Some(lsn) = self.get_by_id(eid, lsn_hid as u16) else { continue };
+                if lsn > watermark {
+                    continue;
+                }
+                if let Some(rec) = self
+                    .get_by_id(eid, payload_hid as u16)
+                    .map(|vid| self.vocab.get(vid).to_vec())
+                    .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b))
+                {
+                    bump(rec.author_peer, rec.hlc);
+                }
+            }
+        }
+        Some(out.into_iter().collect())
+    }
+
     /// 0.7.0 (Phase 4): 全 peer の最小 consumed_lsn (= reclaim 安全点)。
     /// peer 0 件なら 0 を返す (= 「まだ誰も ack してない、 reclaim 不可」)。
     pub fn sync_watermark(&self) -> u32 {
