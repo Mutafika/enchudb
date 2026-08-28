@@ -44,6 +44,14 @@ pub struct EidTranslator {
     /// 2. write-back の宛名解決 — bridge が self-authored write を元 entity の
     ///    世界番号に書き戻して発送する (`reverse`)
     translated_locals: RwLock<HashMap<u32, Key>>,
+    /// #226: replica を保持している author の一覧。 relay が `serve_state` で
+    /// 「どの author の state を配れるか」を pull ごとに引くので、 写像全体の
+    /// 走査 (O(entry 数)) を避けるための索引。
+    ///
+    /// **grow-only** — `remove_local` で最後の entry が消えても author は残る。
+    /// 残っても `state_records_for` が空を返し provider が名乗りを取り下げるだけ
+    /// なので害が無く、 その代わり remove 経路に走査を持ち込まずに済む。
+    authors: RwLock<std::collections::BTreeSet<PeerId>>,
     /// #166: `get_or_insert_with` の 「引く → 確保 → 登録」 を直列化する専用 lock。
     ///
     /// 以前は `inner` の write lock を保持したまま `alloc` を呼んでいたが、
@@ -67,6 +75,7 @@ impl EidTranslator {
         Self {
             inner: RwLock::new(HashMap::new()),
             translated_locals: RwLock::new(HashMap::new()),
+            authors: RwLock::new(std::collections::BTreeSet::new()),
             alloc_lock: std::sync::Mutex::new(()),
         }
     }
@@ -101,6 +110,17 @@ impl EidTranslator {
             }
         }
         rev.insert(local, (author_peer, foreign_local));
+        drop(rev);
+        // #226: author 索引。 lock は単独で取る (`inner` / `translated_locals` と
+        // 同時には保持しないので、 既存の順序制約に影響しない)。
+        if !self.authors.read().unwrap().contains(&author_peer) {
+            self.authors.write().unwrap().insert(author_peer);
+        }
+    }
+
+    /// #226: replica を保持している author の一覧 (grow-only、 `authors` field 参照)。
+    pub fn authors(&self) -> Vec<PeerId> {
+        self.authors.read().unwrap().iter().copied().collect()
     }
 
     /// 写像を **atomic** に get-or-insert する。 未登録なら `alloc` を呼んで local を
