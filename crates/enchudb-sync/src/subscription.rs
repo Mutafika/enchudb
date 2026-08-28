@@ -24,6 +24,41 @@ use enchudb_oplog::PeerId;
 /// `Syncer::publish_since_for_peer` から呼ばれる。 `Syncer::set_subscription_filter`
 /// で 1 度差し替える (起動時想定)。 caller が `Send + Sync` を満たせば、
 /// 内部の subscription state (peer 別 follow set 等) は自由に持っていい。
+///
+/// # 契約: filter は pull cursor を scope 依存にする (#219)
+///
+/// **publisher 側で落とした record は、 差分 pull では二度と届かない。**
+///
+/// puller の cursor は 「受け取った record の author 別 max HLC」 で前進する
+/// (`Syncer::pull_once`)。 同一 author の record を filter が間引くと、 **cursor は
+/// 落とされた分を飛び越える**。 cursor は author 粒度であって scope 粒度ではないので、
+/// #216 の per-author 化でもこれは閉じない。
+///
+/// 帰結は 2 つ:
+///
+/// 1. 後から subscription を広げても、 **広げた scope の過去分は差分 pull では
+///    永久に届かない**。 `history_truncated` も立たない (floor は 「reclaim で消えた」
+///    分しか表さず、 「その peer には配らなかった」 分は表さない)
+/// 2. cursor 述語 (#216/#217) では `hlc <= cursor[author]` が成立するので、
+///    **author 側はその record を reclaim してよいと判断する** → 以降は bootstrap
+///    以外に回復手段が無い
+///
+/// したがって:
+///
+/// > **subscription scope を広げた puller は、 広げた分について差分 pull の完全性を
+/// > 仮定してはならない。** 過去分の回収は bootstrap (#140、
+/// > `Syncer::bootstrap_pull_via`) で行う。
+///
+/// scope を広げる側の app は、 広げた author について明示的に bootstrap すること。
+/// publisher 側で 「この target に何をどこまで配らなかったか」 を見るには
+/// `Syncer::suppressed_since` / `Syncer::suppressed_records`。
+///
+/// **scope 変更を自動で truncation 扱いにする機構はまだ無い** — target 別の
+/// scope 世代を transport に載せる必要があり、 実際の app の follow 変更フローを
+/// 見てから形を決める (#219)。 それまでは上の契約が app 側の義務。
+///
+/// この hazard は `should_send` が false を返す filter にだけ存在する。 default の
+/// [`AllRecords`] は何も落とさないので無関係。
 pub trait SubscriptionFilter: Send + Sync {
     /// `target_peer` に `record` を送るべきか。 default 実装は **true**
     /// (= 全送り、 `AllRecords` 相当の挙動)。
