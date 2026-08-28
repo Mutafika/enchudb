@@ -2069,6 +2069,10 @@ pub struct Engine {
     /// 配送不能) を削除して越えた回数。 0 でないなら bridge が壊れた payload を
     /// 書いたことがある (要調査) — が、 ring を permanent blocker にはしない。
     sync_dead_rows_purged: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// #236: `state_records_for` が **配れないと判断して落とした cell** の累計。
+    /// 判断自体はどれも正しい (doc 参照) が、 落とした事実がどこにも残らないと
+    /// 「replica が系統的に不完全な state を配っている」 が観測できない。
+    state_records_dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// #217: ack prefix walk の再開点 (peer → 検証済み prefix 末尾 lsn)。
     /// **意図的に in-memory** — 永続の `_sync_peers.consumed_lsn` は旧実装
     /// (降順 first-match) が over-ack した値を含みうるので、 session 最初の walk は
@@ -2422,6 +2426,7 @@ impl Engine {
             fold_race_saves: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            state_records_dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ack_walk_resume: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             sync_ops_purge_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
@@ -2790,6 +2795,7 @@ impl Engine {
             fold_race_saves: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            state_records_dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ack_walk_resume: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             sync_ops_purge_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
@@ -3787,6 +3793,7 @@ impl Engine {
             fold_race_saves: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            state_records_dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ack_walk_resume: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             sync_ops_purge_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
@@ -4867,6 +4874,23 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// #236: [`Engine::state_records_for`] が **配れないと判断して落とした cell** の
+    /// 累計 (理由は問わない)。 平常時 0。
+    ///
+    /// 落とす判断はどれも個別には正しく、 batch は `complete: false` なので受信側の
+    /// ghost sweep も走らない。 危険なのは判断ではなく **落とした事実がどこにも
+    /// 残らない**ことで、 replica が系統的に不完全な state を配っていても呼び出し側
+    /// からは 「bootstrap は成功した」 としか見えない — #140 / #216 / #218 で繰り返し
+    /// 「defect の class」 と扱ってきた silent partial そのもの。
+    ///
+    /// 増えていたら 「その replica の state は cell 単位で欠けている」。 到達経路は
+    /// 版数 ZERO の cell (pre-v9 DB / #160) と、 relay 自身が translated local へ
+    /// write-back した Tag cell (#76 / #178)。 回復手段は author 直 bootstrap。
+    pub fn state_records_dropped(&self) -> u64 {
+        self.state_records_dropped
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// #218: **decode 不能な `_sync_ops` row を purge する直前**に、 その row が
     /// history floor へ寄与すべき `(author, HLC 上界)` を作る。
     ///
@@ -5375,6 +5399,24 @@ impl Engine {
     /// 呼び元は `StateBatch.complete` を **false** にすること — relay が author の
     /// live state を全部持っている保証は無い (途中から relay を始めた場合)。
     ///
+    /// # replica 発 batch は **cell 単位でも欠けうる** (#236)
+    ///
+    /// `complete: false` は 「row を全部持っている保証が無い」 だけでなく、
+    /// **持っている row の中でも配れない cell がある**ことまで含む。 replica 経路が
+    /// cell を落とす条件は 4 つ (どれも上記のとおり個別には正しい判断):
+    ///
+    /// | 条件 | 理由 |
+    /// |---|---|
+    /// | 版数が `Hlc::ZERO` | foreign cell に自分の clock を stamp する権利が無い |
+    /// | Tag の vid を逆引きできない | author の vid 空間に戻せない |
+    /// | Ref の target を `reverse` できない | 元 entity を導けない |
+    /// | Ref の値が translated local でない | author の行が自分の entity を指すことはない |
+    ///
+    /// 落とした件数は [`Engine::state_records_dropped`] に載る。 **基本の relay 経路
+    /// では 0 件** (`replica_state_matches_author_state` が author 本人の wire 形との
+    /// 集合一致を要求している) なので、 増えていたら到達経路 (版数 ZERO の cell /
+    /// relay 自身の write-back) を疑うこと。 欠けた分の回復手段は author 直 bootstrap。
+    ///
     /// `himo_id` は自分の番号をそのまま載せる。 これは wire format 全体の前提と
     /// 同じ (`Tie` の himo_id は受信側でそのまま使われる = peer 間で himo 番号が
     /// 一致している前提) なので、 replica 経路が新しく持ち込む仮定ではない。
@@ -5406,6 +5448,10 @@ impl Engine {
             if is_self { std::collections::HashMap::new() } else { self.remote_vid_reverse_of(author) };
 
         let mut records: Vec<crate::transport::WireRecord> = Vec::new();
+        // #236: 「配れないと判断して落とした cell」 の件数。 判断はどれも正しいが、
+        // 記録が無いと 「この replica の state は cell 単位で欠けている」 が
+        // 観測できない ([`Engine::state_records_dropped`])。
+        let mut dropped: u64 = 0;
         let mut vocab_sent: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mk = |op: DecodedOp, hlc: enchudb_oplog::Hlc| crate::transport::WireRecord {
             hlc,
@@ -5444,6 +5490,7 @@ impl Engine {
                     // replica: foreign cell に自分の clock を stamp する権利が無い
                     // (as_of も ZERO)。 順序を付けられない record は配らない。
                     if !is_self {
+                        dropped += 1; // #236
                         continue;
                     }
                     hlc = as_of;
@@ -5482,13 +5529,17 @@ impl Engine {
                                 }
                                 // 逆写像なし = 元 entity を導けない。 bridge と同じく
                                 // 発送しない (silent 断片化させるより欠けを明示)。
-                                None => continue,
+                                None => {
+                                    dropped += 1; // #236
+                                    continue;
+                                }
                             }
                         } else if is_self {
                             records.push(mk(DecodedOp::Tie { eid: out_eid, himo_id, value }, hlc));
                         } else {
                             // replica: author の行が「自分が author した entity」を
                             // 指すことはない (それは翻訳先を持つ)。 導けないので skip。
+                            dropped += 1; // #236
                             continue;
                         }
                     }
@@ -5501,7 +5552,10 @@ impl Engine {
                         } else {
                             match vid_back.get(&value) {
                                 Some(v) => *v,
-                                None => continue,
+                                None => {
+                                    dropped += 1; // #236
+                                    continue;
+                                }
                             }
                         };
                         if vocab_sent.insert(out_vid) {
@@ -5526,6 +5580,12 @@ impl Engine {
                     }
                 }
             }
+        }
+        if dropped > 0 {
+            // #236: 呼び出し側は差分を見て 「この batch は cell 単位で欠けている」 を
+            // 判定する (`Syncer::refresh_state_providers` の provider が前後で読む)。
+            self.state_records_dropped
+                .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
         }
         // replica 版の as_of = emit した record の max HLC (self 版は採番済み)。
         let as_of = if is_self {
