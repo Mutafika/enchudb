@@ -146,6 +146,14 @@ replica batch の cell 単位の欠け) を sync 節に追記。
 
 ## 0.25.0 — 2026-08-28
 
+> **⚠️ relay / sync 用途では 0.25.1 へ (#235)** — この版は bridge が `_sync_ops` の `lsn` を
+> **payload より先に** tie するため、 走査 (`entities_with_himo(lsn_hid)`) に payload の無い row が
+> 載る。 そこへ #217 の dead-row purge が当たると 「壊れている」 と誤判定して消し、 oplog cursor は
+> 既に越えているので **二度と bridge されない**。 破損の注入は不要で、 **bridge と ack が並走して
+> いるだけ**で踏む (実測: lsn 発行 51,960 に対し `_sync_ops` は 51,956 行)。 詳細は 0.25.1 の
+> #235 節。 **sync / relay を使わない DB は影響なし。**
+
+
 **v9 領域 (per-cell version column + tombstone column) を sync に参加する DB だけが持つ
 ようにした (request18 / #173 / PR #233)。** 0.19.0 / 0.20.0 は無条件に確保していたため、
 sync しない DB が **apparent ×3.6** (既定 capacity で 26.5 GB → 95.5 GB) を払っていた。
@@ -250,6 +258,14 @@ growable の commit は単調 high-water なので、 variable cluster 末尾の
   踏んでいるため。 v9 とは独立 (#172)
 
 ## 0.24.0 — 2026-08-28
+
+> **⚠️ relay / sync 用途では 0.25.1 へ (#235)** — この版は bridge が `_sync_ops` の `lsn` を
+> **payload より先に** tie するため、 走査 (`entities_with_himo(lsn_hid)`) に payload の無い row が
+> 載る。 そこへ #217 の dead-row purge が当たると 「壊れている」 と誤判定して消し、 oplog cursor は
+> 既に越えているので **二度と bridge されない**。 破損の注入は不要で、 **bridge と ack が並走して
+> いるだけ**で踏む (実測: lsn 発行 51,960 に対し `_sync_ops` は 51,956 行)。 詳細は 0.25.1 の
+> #235 節。 **sync / relay を使わない DB は影響なし。**
+
 
 **`.etxt` の segment merge (#188) と、 relay topology に残っていた scalar 前提 3 箇所の
 除去 (#226 / #227 / #228)。** 前者は索引の作り直しを「全再索引」から「segment を足して
@@ -421,6 +437,14 @@ native では 66 pass で素通りするので、 native だけ回している�
 green を確認)。 wasm の対象範囲を定義して CI で守る件は #230。
 
 ## 0.23.1 — 2026-08-28
+
+> **⚠️ relay / sync 用途では 0.25.1 へ (#235)** — この版は bridge が `_sync_ops` の `lsn` を
+> **payload より先に** tie するため、 走査 (`entities_with_himo(lsn_hid)`) に payload の無い row が
+> 載る。 そこへ #217 の dead-row purge が当たると 「壊れている」 と誤判定して消し、 oplog cursor は
+> 既に越えているので **二度と bridge されない**。 破損の注入は不要で、 **bridge と ack が並走して
+> いるだけ**で踏む (実測: lsn 発行 51,960 に対し `_sync_ops` は 51,956 行)。 詳細は 0.25.1 の
+> #235 節。 **sync / relay を使わない DB は影響なし。**
+
 
 **relay 経路の correctness patch。** 0.23.0 が relay の**配布**を byte 単位の素通しに直した
 (#209) のに対し、 こちらはその帰結を**受け取る側**が引き継げていなかった 3 箇所を塞ぐ。
