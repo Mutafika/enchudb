@@ -359,7 +359,16 @@ For a GUI app + CLI sharing one DB, the recommended pattern is **the GUI opens `
 
 ### Writes between peers (sync)
 
-Since 0.11, EnchuDB is **multi-writer**: any peer can write to any entity, and conflicts are resolved per card (himo) by HLC LWW (concurrent writes are settled by time). Convergence is **logical** (exchanging ops converges the contents) rather than physical replication. The one remaining constraint: **a write whose Ref value points at a replica of a foreign entity** stays local and does not propagate to peers (the wire u32 value has no room for a world id; a wire extension is a follow-up). Up to 0.10.x it was per-entity single-writer (only the author could write).
+Since 0.11, EnchuDB is **multi-writer**: any peer can write to any entity, and conflicts are resolved per card (himo) by HLC LWW (concurrent writes are settled by time). Convergence is **logical** (exchanging ops converges the contents) rather than physical replication. Refs that point at a replica of a foreign entity propagate too — the `TieRef` op carries the world id (peer-prefixed eid) since 0.22.0. Up to 0.10.x it was per-entity single-writer (only the author could write).
+
+#### What a differential pull does *not* promise
+
+A puller's cursor advances to the **max HLC it received, per author**. Two things follow, and both are contracts rather than bugs:
+
+- **A publisher-side `SubscriptionFilter` makes the cursor scope-dependent.** Records the filter drops are skipped by the cursor, so widening a subscription later does **not** bring the past back through a differential pull — and no truncation is signalled either. Recover the widened range with `Syncer::bootstrap_pull_via`. `Syncer::suppressed_since(target)` shows what a publisher declined to send, per author; `suppressed_records()` is the running total (always 0 with the default `AllRecords`).
+- **A state batch served by a *replica* can be incomplete at cell granularity**, not just row granularity — a relay cannot always map a cell back into the author's namespace. `Engine::state_records_dropped()` counts the cells it declined to serve (0 on the ordinary relay path), and the replica warns once when it serves such a batch.
+
+Neither is silent any more, but neither is fixed by retrying: both recover through a direct bootstrap from the author.
 
 ## Testing
 
