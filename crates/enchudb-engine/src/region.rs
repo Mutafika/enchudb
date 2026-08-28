@@ -212,6 +212,20 @@ impl Region {
         let _ = len;
     }
 
+    /// request18: growable backing で `end_in_region` まで commit 済みか。
+    /// 静的 backing (通常の mmap / memory) は常に全コミット済みなので true。
+    ///
+    /// v9 領域は variable cluster の末尾にあるため、 「commit を伸ばさずに
+    /// 中身を読めるか」 を先に確かめたい経路 (`ver_column_from_region`) で使う。
+    pub fn is_committed(&self, end_in_region: usize) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(g) = &self.grower {
+            return g.committed() >= self.file_offset + end_in_region;
+        }
+        let _ = end_in_region;
+        true
+    }
+
     /// Region 内の `end_in_region` byte までを書き込み可能にする (= ファイル
     /// 内 commit を `file_offset + end_in_region` まで進める)。 grower が
     /// 設定されていなければ no-op (静的 backing は既に全コミット済み)。

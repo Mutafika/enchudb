@@ -53,7 +53,10 @@ fn hlc(w: u64, p: u32) -> Hlc {
 /// 戻り値: (engine, himo_id, foreign_eid, translated_local_eid)
 fn setup(path: &str) -> (Engine, u16, enchudb_oplog::EntityId, enchudb_oplog::EntityId) {
     cleanup(path);
-    let mut eng = Engine::create_with_capacity(path, 4096).unwrap();
+    // request18: 版数・tombstone を持つのは sync に参加する DB だけになったので、
+    // foreign record を受ける前提のこの test は v9 込みで作る (= 本番で
+    // `enable_sync_tables()` → reopen した後と同じ layout)。
+    let mut eng = Engine::create_with_cell_version(path, 4096).unwrap();
     // slot 3 個。 X が 1 個使い、 詰め物 2 個で枯渇 → 再利用が起きる。
     // 「再利用後にもう一度翻訳する」 ために詰め物を 1 個消して席を空ける。
     eng.define_table("t", 3).unwrap();

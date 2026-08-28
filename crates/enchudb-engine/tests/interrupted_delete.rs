@@ -49,8 +49,12 @@ fn hlc(wall: u64) -> Hlc {
 }
 
 /// 行を 2 cell 書いて開いたまま返す。
+///
+/// request18 (#173): 版数・tombstone (v9 領域) を持つのは sync に参加する DB だけに
+/// なった。 ここは remote delete の中断を扱うので **steady state の sync DB**
+/// (= `enable_sync_tables()` → reopen 後と同じ layout) を 1 ステップで作る。
 fn open_with_row(path: &str) -> (Arc<Engine>, u64, u16, u16) {
-    let mut eng = Engine::create_with_capacity(path, 256).unwrap();
+    let mut eng = Engine::create_with_cell_version(path, 256).unwrap();
     eng.define_himo("a", ValueType::Number, 0);
     eng.define_himo("b", ValueType::Number, 0);
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, CAP).unwrap();
@@ -224,11 +228,16 @@ fn a_migrated_row_whose_delete_was_interrupted_is_finished_too() {
         let eid = eng.entity().unwrap();
         eng.tie_to(eid, "a", 11);
         eng.tie_to(eid, "b", 22);
+        // request18 (#173): v9 化されるのは sync に参加する DB だけ。 sync tables を
+        // 足すと file 上に領域が生え (B-lite)、 **次の open で** version column が
+        // 生える。 anonymous table が closed になるので entity() より後で呼ぶ。
+        eng.enable_sync_tables().unwrap();
         eng.flush().unwrap();
         eid
     };
 
-    // writer open で v9 へ自動移行 → tombstone を書いた直後に落ちる。
+    // 次の open で v9 column が生える (既存 cell の版数は ZERO のまま)
+    // → tombstone を書いた直後に落ちる。
     {
         let eng = Engine::open_concurrent_with_oplog(&path, CAP).expect("migrate open");
         assert!(eng.has_cell_version(), "v9 へ移行していない");
