@@ -555,12 +555,32 @@ impl Syncer {
             // persist が衝突する (sunsu2 chaos の restart で実測)。
             let engine = Arc::downgrade(&self.engine);
             let is_self = author == self_peer;
+            // #236: replica batch が cell 単位で欠けていたら一度だけ warn する。
+            // provider は transport から何度も呼ばれるので flag は provider ごとに持つ。
+            let warned_incomplete = Arc::new(std::sync::atomic::AtomicBool::new(false));
             self.transport.register_state_provider_for(
                 author,
                 self_peer,
                 Arc::new(move || {
                     let eng = engine.upgrade()?;
+                    let before = eng.state_records_dropped();
                     let (records, as_of) = eng.state_records_for(author);
+                    let dropped = eng.state_records_dropped().saturating_sub(before);
+                    // #236: `complete: false` は 「row が足りないかも」 としか読まれない。
+                    // cell 単位の欠けは受信側からは絶対に見えない (欠けた cell は
+                    // batch に現れないだけ) ので、 配る側で一度だけ声を上げる。
+                    if dropped > 0
+                        && !warned_incomplete.swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        eprintln!(
+                            "[enchudb] sync: replica state for author {author} is \
+                             incomplete at cell granularity — dropped {dropped} cell(s) \
+                             (undeliverable: ZERO version / unmapped Tag vid / \
+                             unresolvable Ref). Followers bootstrapping via this replica \
+                             will be missing them; recover with a direct bootstrap from \
+                             the author — see #236"
+                        );
+                    }
                     if !is_self && records.is_empty() {
                         // 何も持っていない replica は None を返して次の候補に譲る。
                         // 空 batch でも `Some` を返すと、 caller は「state を受け取った
