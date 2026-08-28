@@ -4286,7 +4286,6 @@ impl Engine {
                     }
                 );
             }
-            self.tie_to_by_id(row_eid, lsn_hid, lsn);
             self.tie_to_by_id(row_eid, peer_id_hid, rec.author_peer);
             // DecodedOp variant を tag (Tie=0, Untie=1, Delete=2, Content=3, Commit=4, Vocab=5, TieNamed=6, TieLeaf=7, TieRef=8)
             // #183: Tie → TieRef へ書き換えて発送した record は payload に合わせて 8。
@@ -4324,6 +4323,17 @@ impl Engine {
             wire_payload.extend_from_slice(fp);
             wire_payload.extend_from_slice(sb);
             self.tie_bytes_to_by_id(row_eid, payload_hid, &wire_payload);
+            // #235: **`lsn` は最後**。 `_sync_ops` の走査は全部 `entities_with_himo(lsn_hid)`
+            // 経由 (`reclaim_sync_ops` / `ack_sync_prefix` / `pending_sync_ops`) なので、
+            // lsn を tie した瞬間に row が索引へ載る。 先に tie すると payload の無い
+            // row が見えて、 #217 の dead-row purge が **書き込み途中の row を
+            // 「壊れている」と誤判定して消す** (実測: 健全な系で 51960 発行 → 51956 行、
+            // 差の 4 件は oplog cursor が越えているので二度と bridge されない)。
+            //
+            // lsn を commit marker にすると 「索引に載っている row は必ず完成している」
+            // が成立する。 engine 内の `set_cell` (値 → HLC の順) と同じ規則で、
+            // 逆順にすると 「識別子だけ新しい」 窓ができる、 も同じ。
+            self.tie_to_by_id(row_eid, lsn_hid, lsn);
             done_end = Some(*rec_end);
         }
 
@@ -4683,6 +4693,20 @@ impl Engine {
                     ack_lsn = *lsn;
                 }
                 None => {
+                    // #235: **最新 lsn の row は dead 判定しない**。 bridge は
+                    // `transfer_lock` 下で 1 行ずつ書き、 `next_sync_lsn` は ties の
+                    // 前に fetch_add されるので、 書き込み途中の row は常に高々 1 つ、
+                    // かつ必ず最新 lsn。 「まだ書けていない row」を「壊れた row」と
+                    // 取り違えると、 健全な record を消して二度と bridge されない
+                    // (実測: 51960 発行 → 51956 行)。
+                    //
+                    // 本命の fix は bridge 側の書き込み順 (lsn を最後に = commit
+                    // marker) だが、 store の並べ替えや将来の書き込み順変更に対する
+                    // backstop としてここでも止める。 break なので、 完成後の次の
+                    // walk で普通に判定される。
+                    if *lsn >= self.current_sync_lsn() {
+                        break;
+                    }
                     // #221: delete + free list push は専用 lock 下で atomic に。
                     if self.purge_sync_ops_row(*eid, lsn_hid, *lsn) {
                         eprintln!(
@@ -4947,16 +4971,30 @@ impl Engine {
         // 双対として floor も per-author が要る)。
         let mut reclaimed_max: std::collections::HashMap<u32, enchudb_oplog::Hlc> =
             std::collections::HashMap::new();
+        // #235: **decode 不能かつ最新 lsn の row** = 書き込み途中の bridge row。
+        // 通常は watermark がそこまで届かないので到達しないが、 `ack_sync` は生の
+        // lsn を受ける public API なので、 caller が実在より先を ack すると
+        // watermark が未完成 row を跨ぐ。 reclaim は decode 可否を見ずに削除して
+        // いたので、 そのとき `ack_sync_prefix` と同じ silent loss になった。
+        //
+        // 条件を 「最新 lsn」 だけにすると、 完成済みの最新 row も永久に残って
+        // reclaim の意味論が変わる (`ack_with_future_lsn_does_not_corrupt_reclaim`)。
+        // 危険なのは 「未完成」 と 「破損」 を区別できない一点なので、 両方を満たす
+        // row だけを避ける — `ack_sync_prefix` の dead-row 分岐と同じ粒度。
+        let inflight_lsn = self.current_sync_lsn();
         for eid in rows {
             let Some(lsn) = self.get_by_id(eid, lsn_hid_u16) else { continue };
             if lsn >= watermark {
                 continue;
             }
-            if let Some(rec) = payload_hid
+            let decoded = payload_hid
                 .and_then(|h| self.get_by_id(eid, h))
                 .map(|vid| self.vocab.get(vid).to_vec())
-                .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b))
-            {
+                .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b));
+            if decoded.is_none() && lsn >= inflight_lsn {
+                continue;
+            }
+            if let Some(rec) = decoded {
                 let e = reclaimed_max
                     .entry(rec.author_peer)
                     .or_insert(enchudb_oplog::Hlc::ZERO);
