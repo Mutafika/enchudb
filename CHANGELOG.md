@@ -3,7 +3,156 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.25.1 — 2026-08-28
+
+**sync ring から record が「黙って消える」経路を 2 件塞いだ patch。** 片方 (#235) は
+**0.23.1 で入れた regression** で、 **破損を一切注入していない健全な系**で起きる。
+0.23.1 / 0.24.0 / 0.25.0 が影響を受けるので、 **relay / sync を使っている構成は上げること**。
+
+on-disk format は不変、 migration 不要、 breaking なし。 公開 API は観測用の **追加 3 本**のみ
+(既存コードは無改修)。
+
+| 実地で起きうる壊れ方 | 直したもの |
+|---|---|
+| bridge と ack が並走しているだけで、 **書き込み途中の row が「壊れている」と誤判定されて消える** (oplog cursor は越えているので二度と bridge されない) | `lsn` を row の commit marker に (#235) |
+| decode 不能 row を消しても history floor が上がらず、 その帯を必要とする puller が **truncation 通知を受け取れないまま差分 pull を続ける** | purge した dead row も floor に反映 (#218) |
+
+### Fixed — dead-row purge が書き込み途中の bridge row を食べる (#235 / PR #237)
+
+実測 (6 秒走らせただけ): lsn 発行 **51,960** に対し `_sync_ops` は **51,956** 行、
+`sync_dead_rows_purged` = 4。 破損は一切注入していない。 再現条件は
+「bridge と ack が並走している」 だけ = 通常運転そのもの。
+
+root cause は bridge (`transfer_oplog_to_sync_ops`) が `lsn` を**先に**、 `payload` を最後に
+tie していたこと。 `_sync_ops` の走査は全部 `entities_with_himo(lsn_hid)` 経由
+(`reclaim_sync_ops` / `ack_sync_prefix` / `pending_sync_ops`) なので、 **lsn を tie した瞬間に
+row が索引へ載る** — payload はまだ無い。 そこへ 0.23.1 (#217) の dead-row purge が当たると、
+`consumed` 述語を通らないまま 「壊れている」 と判定して消す。
+
+#217 は 「payload が構造的に壊れた row」 を想定していたが、 **「まだ書けていない row」 と
+「壊れた row」 が観測上区別できない**ことを見落としていた。
+
+- **bridge は `lsn` を最後に書く** (本命)。 lsn を commit marker にすると 「索引に載っている
+  row は必ず完成している」 が成立する。 engine 内の `set_cell` (値 → HLC の順) と同じ規則
+- `ack_sync_prefix` の dead-row 分岐: `lsn >= current_sync_lsn()` なら purge せず break
+  (backstop)。 未完成 row は常に高々 1 つ、 かつ必ず最新 lsn
+- `reclaim_sync_ops` も同じ扉を持っていた — `ack_sync` は生の lsn を受ける public API なので、
+  実在より先を ack されると watermark が未完成 row を跨ぐ。 **decode 不能かつ最新 lsn** の row
+  だけ避ける (「最新 lsn」 だけを条件にすると完成済み row まで永久に残り reclaim の意味論が
+  変わる — `destructive_0_7_0::ack_with_future_lsn_does_not_corrupt_reclaim` が検出した)
+
+**正しさの根拠は書き込み順の不変式**であって並行 test の緑ではない。 検出力は実測で
+「fix を両方外すと 3 回中 2 回落ちる」 (100% ではないので test の doc に明記)。
+
+### Fixed — decode 不能 row の purge が history floor を上げない (#218 / PR #238)
+
+purge した record は ring から永久に消えるのに、 floor (= 「差分 pull で配れない履歴の上限」)
+は **decode できた row からしか**作っていなかった。 floor の過少申告 = その HLC 帯を必要と
+していた puller が 「cursor >= floor だから差分で追える」 と誤判定する = **#140 で塞いだ
+silent partial の復活**。
+
+穴は **2 箇所**。 `reclaim_sync_ops` (decode できた row でしか `reclaimed_max` を更新しない) と、
+0.23.1 が足した `ack_sync_prefix` の dead-row 分岐 (floor に一切触らない)。
+
+**帰属は取れる** — bridge は payload とは別の Column に author を書いている
+(`_sync_ops.peer_id`)。 無帰属 baseline (`u32::MAX`、 puller が全 author に畳み込む) に倒すと
+全 follower が bootstrap するのに対し、 帰属できればその author の follower だけで済む。
+
+- 裏取りは **ring 内で payload が decode できた row が名乗る author** + 自分 + 既存 floor entry。
+  `eid_translator` 由来の `replicated_authors()` は使えない — **#209 の verbatim relay は eid を
+  翻訳しない**ので、 中継しているだけの author は一度も translator に載らない
+- `reclaim_sync_ops` では**帰属の確定を走査後**に回した。 decodable な row も消すので、
+  dead row を見た時点では 「同じ author の裏を取れる row」 が既に消えていることがある
+- HLC 上界は `mint_local_hlc()`。 engine は適用した remote record で必ず clock を merge する
+  (`observe_remote_hlc` → `OpLog::observe_hlc`、 `append_relayed` も内部で呼ぶ) ので、
+  ring に載り得た HLC 全部の上界になる
+- 判定の失敗形は 「厳しすぎる → 余計な bootstrap」 と 「緩すぎる → silent gap」 で非対称なので、
+  迷ったら保守側 (baseline) に倒す (#191 と同じ原則)
+
+より tight な上界は却下した: `_sync_ops.hlc_wall_lo` は wall の下位 32bit しか無く上位を近傍
+row から借りると clock skew で外れる (下振れすると silent gap そのもの)。 「同 author の次の
+row の HLC」 は一番 tight だが、 正しさが 「relay が複数 upstream から同一 author を引いても
+ring 内で HLC 順が崩れない」 に依存し、 purge 地点で検証できない。 `Hlc::MAX` は floor が
+単調 max なので 1 件の破損で恒久的に全 peer truncation になる。
+
+### Added — 観測 API 3 本 (追加のみ、 既存コードは無改修)
+
+- `Engine::state_records_dropped()` (#236) — `state_records_for` が **配れないと判断して
+  落とした cell** の累計。 平常時 0
+- `Syncer::suppressed_since(target)` / `Syncer::suppressed_records()` (#219) —
+  `SubscriptionFilter` が target 別に落とした record の author 別最大 HLC と累計。
+  default の `AllRecords` を使っている限り常に 0
+
+### Documented — replica 発 state batch は cell 単位でも欠けうる (#236 / PR #240)
+
+`state_records_for` は 4 条件で cell を配らない (版数が `Hlc::ZERO` / Tag の vid を author の
+空間へ逆引きできない / Ref の target を `reverse` できない / Ref の値が translated local でない)。
+**どれも個別には正しい判断なので挙動は変えていない。** 問題は落とした事実がどこにも残らない
+ことで、 `complete: false` は row 単位の話としか読まれず、 **欠けた cell は batch に現れない
+だけなので受信側からは原理的に見えない**。
+
+counter に加えて、 `Syncer` の state provider が **落ちた batch を配る時に once-warn** する
+(配る側でしか観測できないので、 声を上げるのもそこ)。 到達経路は版数 ZERO の cell
+(pre-v9 DB / #160) と、 relay 自身が translated local へ write-back した Tag cell (#76 / #178)。
+欠けた分の回復手段は author 直 bootstrap。
+
+### Documented — publisher 側 filter は pull cursor を scope 依存にする (#219 / PR #239)
+
+puller の cursor は 「受け取った record の author 別 max HLC」 で前進するので、
+`SubscriptionFilter` が同一 author の record を間引くと **cursor は落とされた分を飛び越える**。
+cursor は author 粒度であって scope 粒度ではないので、 0.23.1 の per-author 化でも閉じない。
+
+> **subscription scope を広げた puller は、 広げた分について差分 pull の完全性を仮定しては
+> ならない。** 過去分の回収は bootstrap (#140、 `Syncer::bootstrap_pull_via`) で行う。
+
+`SubscriptionFilter` の trait doc と、 `pull_once` の cursor 前進地点 (「受け取った = 消化した」
+を仮定している唯一の点) の両方に明記した。 **scope 変更を自動で `history_truncated` 扱いに
+する機構はまだ無い** — truncation 判定は puller 側で floor は source peer 単位 (target 別では
+ない) なので、 target 別の伝達経路を `Transport` に足す必要がある。 実 app の follow 変更
+フローを見てから形を決める (#219 は open のまま)。
+
+### Documented — README の stale な制限を除去
+
+「foreign entity の replica を指す Ref は peer に伝播しない (wire の u32 に世界番号を
+載せる余地が無い)」 は **0.22.0 の #183 (TieRef op が peer prefix 込み eid を同乗) で
+解消済み**なのに README に残っていた。 併せて上記 2 つの契約 (filter の scope 依存 /
+replica batch の cell 単位の欠け) を sync 節に追記。
+
+### 呼び出し側にとって何が変わるか
+
+- **relay / sync を使っているなら上げること。** #235 は破損の注入なしで踏む
+- **破損した row を実際に持っている DB では、 その author の follower が一度 bootstrap する**
+  (#218)。 これは意図した挙動で、 silent gap より余分な bootstrap を選んでいる。 平常時
+  (`sync_dead_rows_purged() == 0`) は何も変わらない
+- API は追加のみ。 `SubscriptionFilter` を自前実装している構成は、 上の契約を読むこと
+  (挙動は変わらないが、 差分 pull の完全性を仮定していたなら前提が誤っている)
+
+### 検証
+
+- `cargo test --workspace` (**root crate 込み** — CI は `oplog/engine/schema/sql/sync` の
+  5 crate のみで、 #98 の穴): **167 suites / 1,096 passed / 0 failed**
+- 実 consumer (sunsu2) `cargo test --workspace`: 11 suites / 0 failed
+- clippy: 追加分に指摘 0
+- **falsify 済み**: #235 は fix を両方外すと 3 回中 2 回 `dead == 0` が破れる。 #218 は
+  新規 6 本のうち **5 本が落ちる** (残る 1 本 `healthy_reclaim_does_not_raise_baseline` は
+  回帰の再現ではなく 「保守側に倒す fix が行き過ぎていないこと」 の歯止めなので前後とも緑)
+
+### 既知の残り
+
+- **#219 の 2 段目** (scope 変更 → 自動 truncation) は `Transport` trait の変更が要るので
+  別 release
+- `state_records_for` の 4 条件は**観測できるようにしただけ**で、 落とすこと自体は変えていない
+  (#236 は close 済み。 落ちる条件を減らすなら #160 / #178 側)
+
 ## 0.25.0 — 2026-08-28
+
+> **⚠️ relay / sync 用途では 0.25.1 へ (#235)** — この版は bridge が `_sync_ops` の `lsn` を
+> **payload より先に** tie するため、 走査 (`entities_with_himo(lsn_hid)`) に payload の無い row が
+> 載る。 そこへ #217 の dead-row purge が当たると 「壊れている」 と誤判定して消し、 oplog cursor は
+> 既に越えているので **二度と bridge されない**。 破損の注入は不要で、 **bridge と ack が並走して
+> いるだけ**で踏む (実測: lsn 発行 51,960 に対し `_sync_ops` は 51,956 行)。 詳細は 0.25.1 の
+> #235 節。 **sync / relay を使わない DB は影響なし。**
+
 
 **v9 領域 (per-cell version column + tombstone column) を sync に参加する DB だけが持つ
 ようにした (request18 / #173 / PR #233)。** 0.19.0 / 0.20.0 は無条件に確保していたため、
@@ -109,6 +258,14 @@ growable の commit は単調 high-water なので、 variable cluster 末尾の
   踏んでいるため。 v9 とは独立 (#172)
 
 ## 0.24.0 — 2026-08-28
+
+> **⚠️ relay / sync 用途では 0.25.1 へ (#235)** — この版は bridge が `_sync_ops` の `lsn` を
+> **payload より先に** tie するため、 走査 (`entities_with_himo(lsn_hid)`) に payload の無い row が
+> 載る。 そこへ #217 の dead-row purge が当たると 「壊れている」 と誤判定して消し、 oplog cursor は
+> 既に越えているので **二度と bridge されない**。 破損の注入は不要で、 **bridge と ack が並走して
+> いるだけ**で踏む (実測: lsn 発行 51,960 に対し `_sync_ops` は 51,956 行)。 詳細は 0.25.1 の
+> #235 節。 **sync / relay を使わない DB は影響なし。**
+
 
 **`.etxt` の segment merge (#188) と、 relay topology に残っていた scalar 前提 3 箇所の
 除去 (#226 / #227 / #228)。** 前者は索引の作り直しを「全再索引」から「segment を足して
@@ -280,6 +437,14 @@ native では 66 pass で素通りするので、 native だけ回している�
 green を確認)。 wasm の対象範囲を定義して CI で守る件は #230。
 
 ## 0.23.1 — 2026-08-28
+
+> **⚠️ relay / sync 用途では 0.25.1 へ (#235)** — この版は bridge が `_sync_ops` の `lsn` を
+> **payload より先に** tie するため、 走査 (`entities_with_himo(lsn_hid)`) に payload の無い row が
+> 載る。 そこへ #217 の dead-row purge が当たると 「壊れている」 と誤判定して消し、 oplog cursor は
+> 既に越えているので **二度と bridge されない**。 破損の注入は不要で、 **bridge と ack が並走して
+> いるだけ**で踏む (実測: lsn 発行 51,960 に対し `_sync_ops` は 51,956 行)。 詳細は 0.25.1 の
+> #235 節。 **sync / relay を使わない DB は影響なし。**
+
 
 **relay 経路の correctness patch。** 0.23.0 が relay の**配布**を byte 単位の素通しに直した
 (#209) のに対し、 こちらはその帰結を**受け取る側**が引き継げていなかった 3 箇所を塞ぐ。
