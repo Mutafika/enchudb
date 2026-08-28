@@ -1215,6 +1215,13 @@ pub struct GrowableOptions {
     /// 値は内部で `next_power_of_two` に丸められ、 header に焼かれる (= 既存 DB は
     /// rebuild しないと変わらない、 `max_himos` と同じ性質)。
     pub vocab_max_entries: Option<u32>,
+    /// #243: v9 (per-cell version) 領域を **create 時点で**確保するか。 default `false`。
+    ///
+    /// **sync に参加する DB は `true`**。 `false` のまま `enable_sync_tables()` に
+    /// 頼ると、 growable では file すら伸びず (address 予約が v8 total)、 その
+    /// セッションで書いた cell 版数は close と同時に消える。 詳細は
+    /// [`Engine::create_with_cell_version`] / [`Engine::volatile_cell_versions`]。
+    pub cell_version: bool,
 }
 
 impl Default for GrowableOptions {
@@ -1228,6 +1235,7 @@ impl Default for GrowableOptions {
             leaf_data_size: None,
             leaf_scale: LeafScale::Gb16,
             vocab_max_entries: None,
+            cell_version: false,
         }
     }
 }
@@ -2073,6 +2081,20 @@ pub struct Engine {
     /// 判断自体はどれも正しい (doc 参照) が、 落とした事実がどこにも残らないと
     /// 「replica が系統的に不完全な state を配っている」 が観測できない。
     state_records_dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// #243: **v9 column がまだ無いまま版数付き write が起きた**回数。 到達するのは
+    /// `enable_sync_tables()` の窓 — 領域は生えたが column は次の open からで、
+    /// 版数は揮発 `HlcStore` にしか置けない 1 セッション。 その版数はプロセスと
+    /// 共に消え、 次の open で cell は版数 ZERO に固定される。
+    volatile_cell_versions: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// #243: 上の once-warn 済み flag (毎 write の eprintln を避ける)。
+    warned_volatile_cell_version: std::sync::atomic::AtomicBool,
+    /// #243: **open 直後** (= この session の write も `.eidmap` 復元も入る前) に
+    /// 評価した `cell_versions_are_empty()`。
+    ///
+    /// `Syncer::new` の時点で評価すると 「open → initial scan で書く → sync 開始」
+    /// という実アプリの通常順序で必ず false になり、 窓を経た DB の復元路が
+    /// 塞がっていた。 判定材料は 「開いた瞬間の file の状態」 なので、 そこで凍らせる。
+    cell_versions_empty_at_open: std::sync::atomic::AtomicBool,
     /// #217: ack prefix walk の再開点 (peer → 検証済み prefix 末尾 lsn)。
     /// **意図的に in-memory** — 永続の `_sync_peers.consumed_lsn` は旧実装
     /// (降順 first-match) が over-ack した値を含みうるので、 session 最初の walk は
@@ -2254,13 +2276,21 @@ impl Engine {
         )
     }
 
-    /// **v9 領域を持つ** DB を最初から作る。 sync する前提が create 時点で判っている
-    /// 場合と、 v9 機構そのものの test 用。
+    /// **v9 (per-cell version) 領域を持つ** DB を最初から作る。
+    /// **sync に参加する DB はこちらで作る** (#243)。
     ///
-    /// 通常の経路は `create*` → `enable_sync_tables()` で、 そちらは領域を後から
-    /// 生やす (request18)。 これはその 1 ステップ版。
+    /// `create*` → `enable_sync_tables()` でも領域は生えるが、 生えるのは file 上
+    /// だけで **column は次の open から**。 その 1 セッションで書いた cell の版数は
+    /// 揮発 `HlcStore` にしか無く、 close と同時に消える (次の open で版数 ZERO 固定
+    /// = LWW が 「版数不明」 に倒れる)。 create 時点で sync すると判っているなら、
+    /// この constructor でその窓に入らずに済む。
+    ///
+    /// 窓に居るかは [`Engine::has_cell_version`] が false かで判り、 窓の中で版数が
+    /// 落ちた件数は [`Engine::volatile_cell_versions`] に載る。
+    ///
+    /// growable backing 版は [`Engine::create_growable_with_cell_version`]、
+    /// layout knob を細かく指定するなら `GrowableOptions.cell_version`。
     #[cfg(not(target_arch = "wasm32"))]
-    #[doc(hidden)]
     pub fn create_with_cell_version(path: &str, max_entities: u32) -> io::Result<Self> {
         Self::create_full_with_leaf_scale_v9(
             path, max_entities, None, None, None, None, None, None, true,
@@ -2427,6 +2457,9 @@ impl Engine {
             sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             state_records_dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            volatile_cell_versions: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            warned_volatile_cell_version: std::sync::atomic::AtomicBool::new(false),
+            cell_versions_empty_at_open: std::sync::atomic::AtomicBool::new(true),
             ack_walk_resume: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             sync_ops_purge_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
@@ -2468,11 +2501,14 @@ impl Engine {
         Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
     }
 
-    /// `create_growable_with_capacity` の **v9 領域あり**版 (request18)。
-    /// 通常の経路は create → `enable_sync_tables()` で後から生やす。 これはその
-    /// 1 ステップ版で、 v9 機構そのものの test / sync 前提が最初から判っている場合用。
+    /// `create_growable_with_capacity` の **v9 (per-cell version) 領域あり**版。
+    /// **sync に参加する growable DB はこちらで作る** (#243 — 窓の説明は
+    /// [`Engine::create_with_cell_version`] を参照)。
+    ///
+    /// growable では `enable_sync_tables()` は header flag を立てるだけで file すら
+    /// 伸ばさない (address 予約が v8 total で取られているため)。 窓は eager backing
+    /// より確実に踏む。
     #[cfg(not(target_arch = "wasm32"))]
-    #[doc(hidden)]
     pub fn create_growable_with_cell_version(path: &str, max_entities: u32) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
         let layout = Layout::compute(max_entities, max_himos, DEFAULT_VOCAB_DATA_SIZE, None, None, None, None, true).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -2537,8 +2573,10 @@ impl Engine {
             Some(opts.cyl_max_values),
             opts.leaf_data_size,
             opts.vocab_max_entries, // #122
-            // request18: v9 領域は enable_sync_tables() が生やす (create では確保しない)
-            false,
+            // #243: sync に参加する DB は create 時点で v9 を確保する。 default は
+            // false のまま (= 単独 DB は eid 空間も apparent size も払わない) で、
+            // `enable_sync_tables()` に頼る経路は窓が残る。
+            opts.cell_version,
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let leaf_cap = opts.leaf_scale.cap_bytes();
@@ -2796,6 +2834,9 @@ impl Engine {
             sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             state_records_dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            volatile_cell_versions: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            warned_volatile_cell_version: std::sync::atomic::AtomicBool::new(false),
+            cell_versions_empty_at_open: std::sync::atomic::AtomicBool::new(true),
             ack_walk_resume: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             sync_ops_purge_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
@@ -3794,6 +3835,9 @@ impl Engine {
             sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             state_records_dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            volatile_cell_versions: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            warned_volatile_cell_version: std::sync::atomic::AtomicBool::new(false),
+            cell_versions_empty_at_open: std::sync::atomic::AtomicBool::new(true),
             ack_walk_resume: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             sync_ops_purge_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
@@ -3821,6 +3865,15 @@ impl Engine {
         }
 
         eng.rebuild();
+
+        // #243: 版数の 「開いた瞬間の状態」 をここで凍らせる。 この後に来る
+        // `.eidmap` の foreign tombstone 復元も、 app の initial scan も、
+        // `cell_versions_are_empty()` を false にしてしまう — どちらも
+        // 「窓を経た DB か」 とは無関係なのに、 hydrate の判定を潰していた。
+        eng.cell_versions_empty_at_open.store(
+            eng.cell_versions_are_empty(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // clean flag を 0 に倒し、 即 msync で永続化する。 こうしないと、 この後
         // insert で index 書き換え → crash → 次 open で flag=1 のまま skip → 不整合、
@@ -3924,6 +3977,29 @@ impl Engine {
     ///
     /// 0.7.0 では opt-in 方針。 一度有効化すると無効化は不可 (= reserved table
     /// は close できない、 ただし himo は最小)。
+    ///
+    /// # 契約: このセッションの cell 版数は揮発する (#243)
+    ///
+    /// v9 (per-cell version) 領域はここで **file 上に**生やすが、 column が生えるのは
+    /// **次の open から**。 したがって:
+    ///
+    /// ```text
+    /// create* → enable_sync_tables() → 書く → close → reopen
+    ///                                  ~~~~ この write の版数は消える
+    /// ```
+    ///
+    /// 呼んだ直後に [`Engine::has_cell_version`] が **false** なら窓の中に居る。
+    /// 窓の中で落ちた版数の件数は [`Engine::volatile_cell_versions`] に載り、
+    /// 最初の 1 件で警告も出る。 次の open でその cell は版数 ZERO = 「版数不明」 に
+    /// なり、 LWW は無条件受け入れ側に倒れる (A-1)。
+    ///
+    /// 窓に入らない書き方は 2 つ:
+    ///
+    /// - **create 時点で v9 を確保する** — [`Engine::create_with_cell_version`] /
+    ///   [`Engine::create_growable_with_cell_version`] / `GrowableOptions.cell_version`。
+    ///   sync すると create 時点で判っているならこちら
+    /// - **enable の直後に 1 度 close → open する** — 既に持っている DB を後から
+    ///   sync 化する場合
     pub fn enable_sync_tables(&mut self) -> Result<(), String> {
         self.check_writable();
 
@@ -4888,6 +4964,39 @@ impl Engine {
     /// write-back した Tag cell (#76 / #178)。 回復手段は author 直 bootstrap。
     pub fn state_records_dropped(&self) -> u64 {
         self.state_records_dropped
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #243: **この session で書いた cell 版数のうち、 揮発 `HlcStore` にしか
+    /// 置けなかった件数**。 平常時 0。
+    ///
+    /// 非 0 なら、 この DB は `enable_sync_tables()` の窓の中に居る — sync tables は
+    /// 有効だが v9 の cell-version column がまだ生えておらず (`has_cell_version()`
+    /// が false)、 数えた分の版数は **close と同時に消える**。 次の open でその cell は
+    /// 版数 ZERO = 「版数不明」 になり、 LWW が 「無条件に受け入れる」 側に倒れる。
+    ///
+    /// 窓に入らない書き方:
+    ///
+    /// - create 時点で v9 を確保する — [`Engine::create_with_cell_version`] /
+    ///   [`Engine::create_growable_with_cell_version`] / `GrowableOptions.cell_version`
+    /// - `enable_sync_tables()` の直後に 1 度 close → open する (領域は既に file 上に
+    ///   あるので、 次の open で column が生える)
+    ///
+    /// 既存の v8 DB を後から sync 化する経路だけは窓が残る。 そこは 0.20.0 以来の
+    /// 「移行済み cell は版数 ZERO」 と同じ意味論。
+    pub fn volatile_cell_versions(&self) -> u64 {
+        self.volatile_cell_versions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #243: **open した瞬間**の [`Engine::cell_versions_are_empty`]。
+    ///
+    /// `Syncer` の hydrate 判定用。 判定材料は 「file に版数が載っているか」 なのに、
+    /// `cell_versions_are_empty()` を後で呼ぶと この session の write や `.eidmap` の
+    /// foreign tombstone 復元まで数えてしまい、 「open → 何か書く → sync 開始」 という
+    /// 通常順序で復元路が塞がっていた。
+    pub fn cell_versions_were_empty_at_open(&self) -> bool {
+        self.cell_versions_empty_at_open
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -6791,6 +6900,15 @@ impl Engine {
     /// `Hlc::ZERO` は **版数不明** — v9 領域が無い DB、 または まだ一度も
     /// 版数付きで書かれていない cell。 A-1 のとおり版数不明 cell は従来どおり
     /// (= 無条件に上書き) 扱う。
+    ///
+    /// #243: これは **永続している版数**であって、 LWW が使う版数とは限らない。
+    /// `enable_sync_tables()` の窓 (v9 column がまだ無いセッション) では、 LWW は
+    /// 揮発 `HlcStore` の版数で正しく判定しているのに、 ここは ZERO を返す —
+    /// 「その版数は close で消える」 が本当だからで、 消える値をここで返すと
+    /// 永続の有無を確かめる用途に使えなくなる。
+    ///
+    /// 窓に居るかは [`Engine::has_cell_version`] が false かで判り、 消える版数の
+    /// 件数は [`Engine::volatile_cell_versions`] に載る。
     pub fn cell_hlc(&self, eid: enchudb_oplog::EntityId, himo_id: u16) -> enchudb_oplog::Hlc {
         self.cell_hlc_local(enchudb_oplog::eid_local(eid), himo_id)
     }
@@ -6977,6 +7095,27 @@ impl Engine {
             None => {
                 if !self.sync_tables_on() {
                     return;
+                }
+                // #243: ここに来た = `enable_sync_tables()` の窓の中。 版数は
+                // 揮発 store にしか置けず、 **この session が閉じた瞬間に消える**
+                // (次の open で cell は版数 ZERO 固定 = LWW が 「版数不明」 に倒れる)。
+                // 窓に入ったこと自体は `has_cell_version()` が false で観測できるが、
+                // 「気づいた consumer だけが助かる」 形にしないために数えて 1 度警告する。
+                self.volatile_cell_versions
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if !self
+                    .warned_volatile_cell_version
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    eprintln!(
+                        "[enchudb] warning: cell versions written in this session are IN-MEMORY \
+                         ONLY and will be lost on close (#243). the DB has sync tables but no v9 \
+                         cell-version columns yet — `enable_sync_tables()` grows the file, the \
+                         columns appear on the NEXT open. fix: create the DB with \
+                         `create_with_cell_version` / `create_growable_with_cell_version` (or \
+                         `GrowableOptions {{ cell_version: true, .. }}`), or reopen once right \
+                         after `enable_sync_tables()`. count: `Engine::volatile_cell_versions()`"
+                    );
                 }
                 self.hlc_store.try_set(self.version_key(local), himo_id, hlc);
             }

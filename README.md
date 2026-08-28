@@ -253,9 +253,20 @@ Each sub-crate has its own `README.md` with details, and `docs/` holds architect
 > allocated when `enable_sync_tables()` is called (and, as a fallback, when a writer
 > opens a database that already has the sync tables). A database that never syncs stays
 > at the v8 layout and pays nothing for them — that is a ~3.6x difference in apparent
-> size at default capacity. Version columns become readable on the *next* open after
-> `enable_sync_tables()`; during that first session versions are kept in memory, exactly
-> as pre-v9 builds behaved.
+> size at default capacity.
+>
+> **Create a syncing database with the regions already in place.** `enable_sync_tables()`
+> grows the file, but the version columns only become readable on the *next* open. Cells
+> written during that first session keep their versions in memory only, so they are **lost
+> on close** — after the reopen those cells read back as version `ZERO` ("unknown"), and
+> LWW falls back to accepting any write for them. For a brand-new store that first session
+> is the whole initial import, so use `create_with_cell_version` /
+> `create_growable_with_cell_version` (or `GrowableOptions { cell_version: true, .. }`, or
+> `Database::create_with_cell_version` at the schema layer) when you already know the
+> database will sync. To turn an existing database into a syncing one, reopen it once right
+> after `enable_sync_tables()`. Being inside that window is observable:
+> `has_cell_version()` is `false`, `volatile_cell_versions()` counts the versions that will
+> be lost, and the first one logs a warning. (#243)
 >
 > **Stamping a database as v9 is one-way, and older binaries can no longer open it.**
 > The layout itself does not change (the v9 regions are gated by a header flag) and no

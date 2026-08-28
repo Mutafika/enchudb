@@ -321,7 +321,13 @@ impl Syncer {
         // ここで復元しないと陳腐 record が再 apply される (#154 の再来)。
         // 一度でも版数が載れば `cell_versions_are_empty` は false になるので、
         // 「v9 では hydrate しない」 は実質維持される。
-        if !engine.has_cell_version() || engine.cell_versions_are_empty() {
+        //
+        // #243: 判定を **open 時点の snapshot** に変える。 `cell_versions_are_empty()`
+        // をここで呼ぶと、 この session の write (実アプリの通常順序は
+        // 「open → initial scan で書く → sync 開始」) や `.eidmap` の foreign
+        // tombstone 復元まで数えてしまい、 窓を経た DB でも hydrate が走らなかった。
+        // 判定材料は 「開いた瞬間の file に版数が載っていたか」 だけでよい。
+        if !engine.has_cell_version() || engine.cell_versions_were_empty_at_open() {
             syncer.hydrate_hlc_store(&engine);
         }
         Ok(syncer)

@@ -294,8 +294,30 @@ impl Database {
             .map_err(|e| SchemaError::Io(e.to_string()))?;
         Self::wrap_new(eng)
     }
+    /// #243: **sync に参加する DB はこちら**。 eager backing で、 v9 (per-cell
+    /// version) 領域を create 時点で確保する。
+    ///
+    /// `create_*` → [`Database::enable_sync`] でも領域は生えるが、 column が生えるのは
+    /// 次の open からで、 その 1 セッションで書いた cell 版数は close と同時に消える。
+    /// 詳細と観測 API は [`enchudb_engine::Engine::create_with_cell_version`]。
+    pub fn create_with_cell_version(path: &str, max_entities: u32) -> Result<Self, SchemaError> {
+        let eng = Engine::create_with_cell_version(path, max_entities)
+            .map_err(|e| SchemaError::Io(e.to_string()))?;
+        Self::wrap_new(eng)
+    }
     pub fn create_growable(path: &str) -> Result<Self, SchemaError> {
         let eng = Engine::create_growable(path).map_err(|e| SchemaError::Io(e.to_string()))?;
+        Self::wrap_new(eng)
+    }
+    /// #243: [`Database::create_with_cell_version`] の growable backing 版。
+    /// layout knob も指定したいなら [`Database::create_growable_with`] +
+    /// `GrowableOptions { cell_version: true, .. }`。
+    pub fn create_growable_with_cell_version(
+        path: &str,
+        max_entities: u32,
+    ) -> Result<Self, SchemaError> {
+        let eng = Engine::create_growable_with_cell_version(path, max_entities)
+            .map_err(|e| SchemaError::Io(e.to_string()))?;
         Self::wrap_new(eng)
     }
     /// `create_growable` の max_entities を絞る版。 default の 16 M は
@@ -588,6 +610,19 @@ impl Database {
     /// idempotent: 既に有効化済みなら何もしない。 sync が要らない単独 DB は
     /// 呼ばなくて OK (= reserved table が物理的に存在しない、 eid 空間も浪費しない)。
     /// 一度有効化すると無効化は不可。
+    ///
+    /// # 契約: このセッションの cell 版数は揮発する (#243)
+    ///
+    /// 新規 DB を作ってすぐこれを呼ぶ形 (`create_*` → `enable_sync` → 書く → close)
+    /// では、 **そのセッションで書いた行の cell 版数が reopen 後に ZERO で固定される**。
+    /// v9 の cell-version column が生えるのは次の open からで、 版数は揮発 store に
+    /// しか置けないため。
+    ///
+    /// 新規に作る DB なら [`Database::create_with_cell_version`] /
+    /// [`Database::create_growable_with_cell_version`] を使えばこの窓に入らない。
+    /// 既存 DB を後から sync 化する場合は、 enable の直後に 1 度 close → open する。
+    /// 窓に居るかは `engine().has_cell_version()` が false かで判り、 落ちた版数の
+    /// 件数は `engine().volatile_cell_versions()` に載る。
     pub fn enable_sync(&mut self) -> Result<(), SchemaError> {
         let eng_mut = Arc::get_mut(&mut self.eng).ok_or_else(|| {
             SchemaError::Internal(
