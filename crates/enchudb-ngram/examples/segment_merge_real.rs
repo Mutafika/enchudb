@@ -16,8 +16,7 @@
 //! 各フェーズを別プロセスにしてあるのは、`/usr/bin/time -l` の Max RSS が
 //! フェーズごとに読めるようにするため。
 
-use enchudb_ngram::storage::MappedIndex;
-use enchudb_ngram::NgramIndex;
+use enchudb_ngram::{MappedIndex, NgramIndex};
 use std::path::Path;
 use std::time::Instant;
 
@@ -48,7 +47,7 @@ fn split(src: &str, outdir: &str, per_seg: usize) {
 
     let mut seg = NgramIndex::with_n(m.n()).expect("with_n");
     let (mut n_in_seg, mut n_seg, mut n_doc) = (0usize, 0usize, 0usize);
-    let mut flush = |seg: &mut NgramIndex, n_seg: &mut usize, n_in_seg: &mut usize| {
+    let flush = |seg: &mut NgramIndex, n_seg: &mut usize, n_in_seg: &mut usize| {
         if *n_in_seg == 0 { return; }
         let path = format!("{outdir}/seg{:04}.etxt", *n_seg);
         seg.save(&path).expect("save segment");

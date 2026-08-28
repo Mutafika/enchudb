@@ -241,7 +241,7 @@ impl MappedIndex {
     }
 
     /// gram key → posting list (entity IDs)。
-    /// アライメント非依存の読み出しで Vec<u64> を返す（slice cast を使わない）。
+    /// アライメント非依存の読み出しで `Vec<u64>` を返す（slice cast を使わない）。
     pub fn get_posting(&self, key: u64) -> Vec<u64> {
         let idx = self.gram_index();
         let w = self.gram_entry;
@@ -598,6 +598,7 @@ pub struct MergeStats {
 }
 
 /// Gram Index を先頭から舐めるカーソル。
+#[cfg(not(target_arch = "wasm32"))]
 struct GramCursor<'a> {
     idx: &'a [u8],
     width: usize,
@@ -605,6 +606,7 @@ struct GramCursor<'a> {
     len: usize,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl<'a> GramCursor<'a> {
     fn new(m: &'a MappedIndex) -> Self {
         Self { idx: m.gram_index(), width: m.gram_entry, i: 0, len: m.gram_count as usize }
@@ -618,12 +620,14 @@ impl<'a> GramCursor<'a> {
 }
 
 /// Doc Index を先頭から舐めるカーソル。
+#[cfg(not(target_arch = "wasm32"))]
 struct DocCursor<'a> {
     idx: &'a [u8],
     i: usize,
     len: usize,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl<'a> DocCursor<'a> {
     fn new(m: &'a MappedIndex) -> Self {
         Self { idx: m.doc_index(), i: 0, len: m.doc_count as usize }
@@ -684,8 +688,7 @@ pub fn merge_files(inputs: &[&Path], out: &Path) -> io::Result<MergeStats> {
     let mut dup_eids: Vec<u64> = Vec::new(); // 上書きが起きた eid (昇順)
     if has_text {
         let mut cur: Vec<DocCursor> = maps.iter().map(DocCursor::new).collect();
-        loop {
-            let Some(min) = cur.iter().filter_map(|c| c.peek().map(|(e, _, _)| e)).min() else { break };
+        while let Some(min) = cur.iter().filter_map(|c| c.peek().map(|(e, _, _)| e)).min() {
             let mut winner: Option<(u16, u32, u32)> = None;
             let mut seen = 0usize;
             for (si, c) in cur.iter_mut().enumerate() {
@@ -714,8 +717,7 @@ pub fn merge_files(inputs: &[&Path], out: &Path) -> io::Result<MergeStats> {
     {
         let mut cur: Vec<GramCursor> = maps.iter().map(GramCursor::new).collect();
         let mut buf: Vec<u64> = Vec::new();
-        loop {
-            let Some(min) = cur.iter().filter_map(|c| c.peek()).min() else { break };
+        while let Some(min) = cur.iter().filter_map(|c| c.peek()).min() {
             for c in cur.iter_mut() {
                 if c.peek() == Some(min) { c.bump(); }
             }
@@ -840,8 +842,11 @@ fn merged_posting(
         for eid in m.get_posting(key) {
             // 上書きが起きた eid だけ所有権を見る。上書きが無ければ (通常ケース)
             // `dup_eids` が空なのでこの判定は is_empty() 一発で終わる。
-            if !dup_eids.is_empty() && dup_eids.binary_search(&eid).is_ok() {
-                if owner_of(eid) != Some(si as u16) { continue; }
+            if !dup_eids.is_empty()
+                && dup_eids.binary_search(&eid).is_ok()
+                && owner_of(eid) != Some(si as u16)
+            {
+                continue;
             }
             out.push(eid);
         }
