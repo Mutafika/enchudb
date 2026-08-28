@@ -420,6 +420,20 @@ impl Database {
         Self::wrap_concurrent(arc_eng)
     }
 
+    /// #116: `open_with_oplog` + write/oplog-record queue の capacity 指定。
+    /// 多 DB を LRU pool で open/close する hosted 構成の open 側 knob (説明は
+    /// `finish_with_oplog_with_queue` 参照)。
+    pub fn open_with_oplog_with_queue(
+        path: &str,
+        oplog_capacity: usize,
+        queue_capacity: usize,
+    ) -> Result<Arc<Self>, SchemaError> {
+        let arc_eng =
+            Engine::open_concurrent_with_oplog_queue(path, oplog_capacity, queue_capacity)
+                .map_err(|e| SchemaError::Io(e.to_string()))?;
+        Self::wrap_concurrent(arc_eng)
+    }
+
     fn wrap_concurrent(arc_eng: Arc<Engine>) -> Result<Arc<Self>, SchemaError> {
         // 0.8.7: schema sidecar / engine `.tables` から復元 (= marker himo は不要)。
         // mlbpulse のような engine 直構築 DB でも fallback 復元できる。
@@ -456,6 +470,30 @@ impl Database {
         }))
     }
 
+    /// #116: `finish_with_oplog` + write/oplog-record queue の capacity 指定。
+    ///
+    /// queue は engine ごとに 2 本 eager 確保され、default 1M slot だと per-DB
+    /// ~128MiB の固定 RSS になる (低 write / 多 DB 同居の host では 4096〜16384
+    /// 程度で十分)。省略版 `finish_with_oplog` は `max_entities` 連動の scaled
+    /// default (小 DB は自動で小さくなる)。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn finish_with_oplog_with_queue(
+        mut self,
+        oplog_capacity: usize,
+        queue_capacity: usize,
+    ) -> Result<Arc<Self>, SchemaError> {
+        self.eng.set_defer_tables_persist(false);
+        self.persist_schema()?;
+        let (eng, tables) = self.into_parts()?;
+        let arc_eng = Engine::concurrentize_with_oplog_queue(eng, oplog_capacity, queue_capacity)
+            .map_err(|e| SchemaError::Io(e.to_string()))?;
+        Ok(Arc::new(Self {
+            eng: arc_eng,
+            tables,
+            is_concurrent: true,
+        }))
+    }
+
     /// build phase 終了 + consumer thread spawn (concurrent)、 WAL なし。
     /// crash consistency 不要 (cache / 揮発 store) なケース向け。
     #[cfg(not(target_arch = "wasm32"))]
@@ -465,6 +503,24 @@ impl Database {
         self.persist_schema()?;
         let (eng, tables) = self.into_parts()?;
         let arc_eng = Engine::concurrentize(eng);
+        Ok(Arc::new(Self {
+            eng: arc_eng,
+            tables,
+            is_concurrent: true,
+        }))
+    }
+
+    /// #116: `finish_concurrent` + queue capacity 指定 (説明は
+    /// `finish_with_oplog_with_queue` 参照)。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn finish_concurrent_with_queue(
+        mut self,
+        queue_capacity: usize,
+    ) -> Result<Arc<Self>, SchemaError> {
+        self.eng.set_defer_tables_persist(false);
+        self.persist_schema()?;
+        let (eng, tables) = self.into_parts()?;
+        let arc_eng = Engine::concurrentize_queue(eng, queue_capacity);
         Ok(Arc::new(Self {
             eng: arc_eng,
             tables,
@@ -2026,7 +2082,12 @@ impl<'a> EntityRef<'a> {
         let eng = self.db.engine();
         match cd.ty {
             ColumnType::Number => eng.get(self.eid, &cd.himo_name).map(|v| Value::Number(v as i64)),
-            ColumnType::Ref => eng.get(self.eid, &cd.himo_name).map(|v| Value::Ref(v as EntityId)),
+            // #184: storage の Ref 値は u32 (local 部) なので、素 cast すると find() /
+            // commit() が返す full eid (peer prefix 付き) と食い違う。Ref は必ず自 DB 内
+            // entity (翻訳済み foreign 含む = 自 prefix) を指すので自 peer_id で復元する。
+            ColumnType::Ref => eng
+                .get(self.eid, &cd.himo_name)
+                .map(|v| Value::Ref(enchudb_oplog::make_eid(eng.peer_id(), v))),
             // #119: 借用返しの `get_text` は writer 稼働中に seqlock verify を通らず torn
             // bytes を掴む (= from_utf8 が失敗して silent に None を返す)。 元々即コピーして
             // いるので、 verify 付きの owned 版に寄せてもコピー回数は変わらない。

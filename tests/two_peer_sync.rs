@@ -1,4 +1,4 @@
-//! v32 Phase B: 2-peer 同期の E2E 統合テスト。
+//! Phase B: 2-peer 同期の E2E 統合テスト。
 //!
 //! peer A が tie した値が、pull 経由で peer B に届く。
 //! その逆も。LWW で衝突解決。
@@ -11,7 +11,7 @@ use enchudb::transport::{InMemoryTransport, Transport, WireRecord};
 use enchudb_oplog::oplog::DecodedOp;
 
 fn tmp(tag: &str) -> String {
-    let p = format!("/tmp/enchudb-v32-2peer-{}-{}", tag, std::process::id());
+    let p = format!("/tmp/enchudb-2peer-{}-{}", tag, std::process::id());
     for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", p, suffix));
     }
@@ -296,7 +296,7 @@ fn peer_id_persists_across_reopen() {
     assert_eq!(eng.peer_id(), 42);
 
     // entity() が peer=42 を合成した eid を返す
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     assert_eq!(enchudb_oplog::eid_peer(e), 42);
 
     cleanup(&path);

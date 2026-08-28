@@ -132,7 +132,7 @@ fn v7_db_upgrades_to_current_version_on_writer_open() {
         "新規 create が現行 version でない",
     );
 
-    // v7 を偽造する。 header CRC == 0 は「v27 以前の DB」として検証を通る経路なので、
+    // v7 を偽造する。 header CRC == 0 は「header CRC 導入以前の DB」として検証を通る経路なので、
     // version を 7 に戻して CRC を 0 にすれば v7 DB として open される。
     write_header_u32(&path, H_VERSION, 7);
     write_header_u32(&path, H_HEADER_CRC, 0);
@@ -170,7 +170,7 @@ fn get_content_owned_matches_borrow_and_survives_rewrite() {
     let eng = std::sync::Arc::new(
         Engine::create_growable_opts(&path, GrowableOptions::default()).expect("create"),
     );
-    let eid = eng.entity();
+    let eid = eng.entity().unwrap();
     let bodies: Vec<String> = (0..5).map(|i| format!("c{}-{}", i, "y".repeat(48 + i * 61))).collect();
     eng.content(eid, "body", bodies[0].as_bytes());
 

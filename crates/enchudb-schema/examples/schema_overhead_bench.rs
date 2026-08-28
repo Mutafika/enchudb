@@ -3,7 +3,7 @@
 //! 4 経路を比較:
 //!  1. raw (name 経由):    eng.tie / eng.get / eng.query  ← name → himo_id linear search 毎回
 //!  2. raw (id 経由):      eng.tie_to_by_id / eng.get_by_id / eng.query_by_id  ← bindings
-//!  3. schema DSL:         emp.insert().set() / emp.entity().get() / emp.where_eq().find()
+//!  3. schema DSL:         emp.insert().set() / emp.entity().unwrap().get() / emp.where_eq().find()
 //!  4. schema bindings:    起動時に emp.himo_id() で id を抜き、 以後は 2 と同じ engine 直叩き
 //!
 //! 仮説:
@@ -44,7 +44,7 @@ fn main() {
     let mut rng = 0x9E3779B97F4A7C15u64;
     for i in 0..N {
         rng = xorshift(rng);
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "user_id", i);
         eng.tie(e, "dept_id", i % DEPTS);
         eng.tie(e, "salary", 200_000u32 + (rng as u32 % 800_000));
@@ -107,7 +107,7 @@ fn main() {
     }
     let q1_raw_id = t.elapsed().as_nanos() as f64 / iters_pt as f64;
 
-    // 3. schema DSL: emp.entity().get()
+    // 3. schema DSL: emp.entity().unwrap().get()
     let t = Instant::now();
     let mut s3 = 0u64;
     for _ in 0..iters_pt {

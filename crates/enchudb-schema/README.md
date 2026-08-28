@@ -63,7 +63,7 @@ drop(users);
 
 // runtime: bindings + engine 直叩き
 let eng = db.arc_engine();
-let e = eng.entity();
+let e = eng.entity().unwrap();
 eng.tie_text_to_by_id(e, name_hid, "Alice");
 eng.tie_to_by_id(e, age_hid, 30);
 eng.tie_text_to_by_id(e, city_hid, "Tokyo");

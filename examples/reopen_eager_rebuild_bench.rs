@@ -59,7 +59,7 @@ fn main() {
             eng.define_himo(name, ValueType::Number, 100);
         }
         for i in 0..entities {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             for (h_idx, name) in himo_names.iter().enumerate() {
                 let v = (i.wrapping_mul(31).wrapping_add(h_idx as u32 * 17)) % 100;
                 eng.tie(e, name, v);

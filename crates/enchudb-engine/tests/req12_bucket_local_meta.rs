@@ -22,7 +22,7 @@ fn cardinality_stays_exact_under_churn() {
     let mut eng = Engine::create_standalone(path).expect("create");
     eng.define_himo("s", ValueType::Number, 10);
 
-    let eids: Vec<_> = (0..5).map(|_| eng.entity()).collect();
+    let eids: Vec<_> = (0..5).map(|_| eng.entity().unwrap()).collect();
     for &e in &eids {
         eng.tie(e, "s", 0);
     }
@@ -57,7 +57,7 @@ fn untie_updates_counts() {
     let mut eng = Engine::create_standalone(path).expect("create");
     eng.define_himo("s", ValueType::Number, 10);
 
-    let eids: Vec<_> = (0..3).map(|_| eng.entity()).collect();
+    let eids: Vec<_> = (0..3).map(|_| eng.entity().unwrap()).collect();
     for &e in &eids {
         eng.tie(e, "s", 5);
     }
@@ -90,8 +90,8 @@ fn retie_roundtrip_dedups() {
     let mut eng = Engine::create_standalone(path).expect("create");
     eng.define_himo("s", ValueType::Number, 10);
 
-    let a = eng.entity();
-    let b = eng.entity();
+    let a = eng.entity().unwrap();
+    let b = eng.entity().unwrap();
     eng.tie(a, "s", 0);
     eng.tie(b, "s", 0);
 
@@ -124,7 +124,7 @@ fn compaction_bounds_backing_under_heavy_churn() {
     let mut eng = Engine::create_standalone(path).expect("create");
     eng.define_himo("s", ValueType::Number, 10);
 
-    let eids: Vec<_> = (0..200).map(|_| eng.entity()).collect();
+    let eids: Vec<_> = (0..200).map(|_| eng.entity().unwrap()).collect();
     for &e in &eids {
         eng.tie(e, "s", 0);
     }
@@ -159,7 +159,7 @@ fn explicit_compact_himo() {
     let mut eng = Engine::create_standalone(path).expect("create");
     eng.define_himo("s", ValueType::Number, 10);
 
-    let eids: Vec<_> = (0..20).map(|_| eng.entity()).collect();
+    let eids: Vec<_> = (0..20).map(|_| eng.entity().unwrap()).collect();
     for &e in &eids {
         eng.tie(e, "s", 0);
     }
@@ -198,13 +198,13 @@ fn untouched_value_pull_correct_after_churn() {
 
     let mut v7 = Vec::new();
     for i in 0..30u32 {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "s", i % 3); // v0/v1/v2
         if i % 3 == 0 {
             // 後で v7 に固定する組
         }
         if i < 10 {
-            let e2 = eng.entity();
+            let e2 = eng.entity().unwrap();
             eng.tie(e2, "s", 7);
             v7.push(enchudb_oplog::eid_local(e2));
         }
@@ -240,7 +240,7 @@ fn query_with_all_stale_bucket_returns_empty() {
     eng.define_himo("g", ValueType::Number, 10);
     eng.define_himo("h", ValueType::Number, 10);
 
-    let eids: Vec<_> = (0..10).map(|_| eng.entity()).collect();
+    let eids: Vec<_> = (0..10).map(|_| eng.entity().unwrap()).collect();
     // h=1 の bucket に slot を積みつつ全員 h=2 で終える (1↔2 往復で raw を膨らませ、
     // h=1 は live 0 の all-stale bucket になる。COMPACT_MIN_LEN 未満なので
     // compaction は走らず、verify + live-pivot の経路を直接検証する)

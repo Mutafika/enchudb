@@ -1,9 +1,8 @@
-//! EnchuDB v27 実運用シナリオ統合テスト。
+//! EnchuDB 実運用シナリオ統合テスト。
 //!
-//! 実行: `cargo test --features v27 --test scenarios`
+//! 実行: `cargo test --test scenarios`
 //!
 //! - パブリック API のみ (`use enchudb::*`)
-//! - v27 前提(`#[cfg(feature = "v27")]` は付けず、cargo の feature 指定で実行する)
 //! - std 以外の依存なし
 
 use enchudb::*;
@@ -30,7 +29,7 @@ fn tenant_isolation_query() {
     let mut by_tenant: Vec<Vec<u64>> = vec![Vec::new(); 5];
     for t in 0..5u32 {
         for u in 0..200u32 {
-            let e = db.entity();
+            let e = db.entity().unwrap();
             db.tie(e, "tenant", t);
             db.tie(e, "user_no", u);
             by_tenant[t as usize].push(e);
@@ -69,21 +68,21 @@ fn region_hierarchy_navigation() {
     db.define_himo("parent", ValueType::Ref, 0);
 
     // 国
-    let japan = db.entity();
+    let japan = db.entity().unwrap();
     db.tie_text(japan, "name", "Japan");
 
     // 地方
-    let kanto = db.entity();
+    let kanto = db.entity().unwrap();
     db.tie_text(kanto, "name", "Kanto");
     db.tie_ref(kanto, "parent", japan);
 
     // 都道府県
-    let tokyo = db.entity();
+    let tokyo = db.entity().unwrap();
     db.tie_text(tokyo, "name", "Tokyo");
     db.tie_ref(tokyo, "parent", kanto);
 
     // 市区町村
-    let shibuya = db.entity();
+    let shibuya = db.entity().unwrap();
     db.tie_text(shibuya, "name", "Shibuya");
     db.tie_ref(shibuya, "parent", tokyo);
 
@@ -109,12 +108,12 @@ fn reverse_lookup_children() {
     let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("parent", ValueType::Ref, 0);
 
-    let kanto = db.entity();
-    let kansai = db.entity();
+    let kanto = db.entity().unwrap();
+    let kansai = db.entity().unwrap();
 
     let kanto_pref: Vec<u64> = (0..7)
         .map(|_| {
-            let e = db.entity();
+            let e = db.entity().unwrap();
             db.tie_ref(e, "parent", kanto);
             e
         })
@@ -122,7 +121,7 @@ fn reverse_lookup_children() {
 
     let _kansai_pref: Vec<u64> = (0..6)
         .map(|_| {
-            let e = db.entity();
+            let e = db.entity().unwrap();
             db.tie_ref(e, "parent", kansai);
             e
         })
@@ -145,7 +144,7 @@ fn reverse_lookup_children() {
     assert!(!r.contains(&kanto_pref[0]));
 
     // 追加で増える
-    let new_pref = db.entity();
+    let new_pref = db.entity().unwrap();
     db.tie_ref(new_pref, "parent", kanto);
     let r = db.pull_raw("parent", kanto as u32);
     assert_eq!(r.len(), 7);
@@ -161,10 +160,10 @@ fn move_entity_between_parents() {
     let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("dept", ValueType::Ref, 0);
 
-    let dept_old = db.entity();
-    let dept_new = db.entity();
+    let dept_old = db.entity().unwrap();
+    let dept_new = db.entity().unwrap();
 
-    let user = db.entity();
+    let user = db.entity().unwrap();
     db.tie_ref(user, "dept", dept_old);
     db.rebuild();
 
@@ -189,9 +188,9 @@ fn delete_parent_dangling_refs() {
     let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("parent", ValueType::Ref, 0);
 
-    let parent = db.entity();
-    let child_a = db.entity();
-    let child_b = db.entity();
+    let parent = db.entity().unwrap();
+    let child_a = db.entity().unwrap();
+    let child_b = db.entity().unwrap();
     db.tie_ref(child_a, "parent", parent);
     db.tie_ref(child_b, "parent", parent);
     db.rebuild();
@@ -222,7 +221,7 @@ fn bulk_tie_consistency() {
 
     let n = 100_000u32;
     for i in 0..n {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         db.tie(e, "a", i % 100);
         db.tie(e, "b", (i / 100) % 50);
         db.tie(e, "c", (i / 5_000) % 10);
@@ -258,7 +257,7 @@ fn repeated_tie_untie() {
     let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("flag", ValueType::Number, 8);
 
-    let e = db.entity();
+    let e = db.entity().unwrap();
     for i in 0..1_000u32 {
         db.tie(e, "flag", i % 8);
         db.untie(e, "flag");
@@ -304,7 +303,7 @@ fn delete_reuse_id() {
 
     let mut eids = Vec::new();
     for i in 0..4u32 {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         eids.push(e);
         db.tie(e, "kind", i % 4);
         db.tie(e, "val", i + 10);
@@ -316,7 +315,7 @@ fn delete_reuse_id() {
     assert_eq!(db.get(target, "kind"), None);
     assert_eq!(db.get(target, "val"), None);
 
-    let reused = db.entity();
+    let reused = db.entity().unwrap();
     assert_eq!(reused, target, "free stack should return the freed ID");
 
     // 再利用 ID には古い紐が残っていない
@@ -344,9 +343,9 @@ fn cascade_delete_effect() {
     let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("owner", ValueType::Ref, 0);
 
-    let owner = db.entity();
+    let owner = db.entity().unwrap();
     let docs: Vec<u64> = (0..5).map(|_| {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         db.tie_ref(e, "owner", owner);
         e
     }).collect();
@@ -381,7 +380,7 @@ fn mixed_workload() {
     // 1万 tie
     let mut all_eids: Vec<u64> = Vec::with_capacity(10_000);
     for i in 0..10_000u32 {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         db.tie(e, "group", i % 10);
         db.tie(e, "score", i % 100);
         all_eids.push(e);
@@ -451,7 +450,7 @@ fn many_himos() {
     // 100 entity に全 50 紐を張る
     let n = 100u32;
     for i in 0..n {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         for (k, name) in names.iter().enumerate() {
             db.tie(e, name, (i + k as u32) % 8);
         }
@@ -488,7 +487,7 @@ fn text_and_value_mixed() {
     let mut by_city: Vec<Vec<u64>> = vec![Vec::new(); cities.len()];
     let n = 200u32;
     for i in 0..n {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         let ci = (i as usize) % cities.len();
         db.tie_text(e, "city", cities[ci]);
         db.tie(e, "age", i % 100);
@@ -535,13 +534,13 @@ fn query_pair_empty_cell_fallback() {
 
     // データ投入（pair table 構築後）
     for i in 0..100u32 {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         db.tie(e, "type_h", 1);
         db.tie(e, "board", 0);
         db.tie(e, "author", i);
     }
     for i in 0..500u32 {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         db.tie(e, "type_h", 2);
         db.tie(e, "board", 0);
         db.tie(e, "author", i % 100);
@@ -572,7 +571,7 @@ fn sum_basic() {
 
     let mut eids = Vec::new();
     for v in [100, 200, 300, 400] {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         db.tie(e, "cost", v);
         eids.push(e);
     }
@@ -592,9 +591,9 @@ fn sum_skips_missing_values() {
     db.define_himo("price", ValueType::Number, 0);
     db.define_himo("name", ValueType::Tag, 0);
 
-    let e1 = db.entity(); db.tie(e1, "price", 50);
-    let e2 = db.entity(); // price なし
-    let e3 = db.entity(); db.tie(e3, "price", 30);
+    let e1 = db.entity().unwrap(); db.tie(e1, "price", 50);
+    let e2 = db.entity().unwrap(); // price なし
+    let e3 = db.entity().unwrap(); db.tie(e3, "price", 30);
 
     assert_eq!(db.sum("price", &[e1, e2, e3]), 80);
 
@@ -615,7 +614,7 @@ fn group_sum_basic() {
     // project 1: cost 300, 400, 500
     let mut eids = Vec::new();
     for (proj, cost) in [(0, 100), (0, 200), (1, 300), (1, 400), (1, 500)] {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         db.tie(e, "project", proj);
         db.tie(e, "cost", cost);
         eids.push(e);
@@ -643,7 +642,7 @@ fn group_sum_with_query() {
     // status=1 (施工中): project 0 に 1000, 2000 / project 1 に 3000
     // status=2 (完了): project 0 に 9999
     for (status, proj, cost) in [(1, 0, 1000), (1, 0, 2000), (1, 1, 3000), (2, 0, 9999)] {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         db.tie(e, "status", status);
         db.tie(e, "project", proj);
         db.tie(e, "material_cost", cost);
@@ -677,7 +676,7 @@ fn pull_range_basic() {
     db.define_himo("age", ValueType::Number, 100);
 
     for age in 20..=40 {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         db.tie(e, "age", age);
     }
     db.rebuild();
@@ -725,7 +724,7 @@ fn tie_date_and_range() {
 
     // 2026年4月の10日分
     for day in 1..=10 {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         db.tie_date(e, "created", 2026, 4, day);
     }
     db.rebuild();
@@ -762,7 +761,7 @@ fn date_with_sum() {
 
     // 4/1: 1000, 4/2: 2000, 4/3: 3000
     for (day, amount) in [(1, 1000), (2, 2000), (3, 3000)] {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         db.tie_date(e, "date", 2026, 4, day);
         db.tie(e, "sales", amount);
     }
@@ -788,7 +787,7 @@ fn aggregates() {
 
     let mut eids = Vec::new();
     for v in [10, 20, 30, 40, 50] {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         db.tie(e, "score", v);
         eids.push(e);
     }
@@ -825,9 +824,9 @@ fn aggregates_with_missing_values() {
     let mut db = Engine::create_standalone(&path).unwrap();
     db.define_himo("price", ValueType::Number, 0);
 
-    let e1 = db.entity(); db.tie(e1, "price", 100);
-    let e2 = db.entity(); // price なし
-    let e3 = db.entity(); db.tie(e3, "price", 300);
+    let e1 = db.entity().unwrap(); db.tie(e1, "price", 100);
+    let e2 = db.entity().unwrap(); // price なし
+    let e3 = db.entity().unwrap(); db.tie(e3, "price", 300);
 
     assert_eq!(db.min("price", &[e1, e2, e3]), Some(100));
     assert_eq!(db.max("price", &[e1, e2, e3]), Some(300));

@@ -1,7 +1,7 @@
 //! Shard routing — himo 名で owner peer を決め、跨 peer で `pull_raw` する。
 //!
 //! 各 peer が「担当 himo」だけ `define_himo` して write する構成で使う。
-//! v33 の Syncer は WAL record を全 peer に撒くが、受信側で himo 未定義なら
+//! Syncer は WAL record を全 peer に撒くが、受信側で himo 未定義なら
 //! silently drop するため、storage は自然に sharded される。
 //! このモジュールはその上で **query の routing** だけを足す薄い層。
 //!

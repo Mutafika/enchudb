@@ -3,6 +3,345 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.23.1 — 2026-08-28
+
+**relay 経路の correctness patch。** 0.23.0 が relay の**配布**を byte 単位の素通しに直した
+(#209) のに対し、 こちらはその帰結を**受け取る側**が引き継げていなかった 3 箇所を塞ぐ。
+症状はどれも「黙って消える」で、 relay を使っていれば定常運転で踏む。 非 breaking。
+
+根っこは 1 つ: **relay の stream は複数 author の merge で HLC が単調でない** (自分の row は
+自 clock、 中継 row は原 author の HLC 素通し)。 なのに cursor / ack / floor が scalar HLC の
+まま = 「単調な単一 stream」 を前提にしていた。
+
+| 実地で起きうる壊れ方 | 直したもの |
+|---|---|
+| 下流の cursor が relay 自身の新しい row で進んだ後、 **中継された古い HLC の record が永久に届かない** (`received: 0`、 truncation 通知も無し) | pull cursor を link × author の vector に (#216) |
+| relay 混在 ring で ack が**未消化 record を watermark の下に巻き込み**、 reclaim が消す | ack walk を longest-consumed-prefix + per-author 述語に (#217) |
+| relay の定常運転で `min(cursor) < floor` が恒常成立し、 **既追従の follower が bootstrap ループに入る** | history floor も author 別に (#216) |
+| 並行 reclaim が free list に slot を二重 push し、 **同じ eid が二度払い出されて bridge row が上書き消失** | purge の delete + push を同一 lock 区間に (#221) |
+
+### #216 — cursor / ack / floor を author 別に
+
+author ごとの substream は relay を何 hop 挟んでも HLC 単調 (relay は pull 順 = author の
+HLC 順に append する)。 この不変式が唯一の健全な粒度を決めるので、 3 つとも author 別にした。
+
+- `Transport::pull_as_multi` / `record_pull_ack_multi` / `take_pull_acks_multi` /
+  `set_history_floor_multi` / `history_floor_multi` を追加 (**すべて default 実装つき**、
+  既存 transport は無改修で動く)
+- **未知 author は `Hlc::ZERO` 起点** — 「既知 author の min」への短絡は同じ穴を一段下で
+  再現する (新しく relay され始めた author の古い record が落ちる)
+- cursor sidecar は v2 (`link author wall logical peer` の 5 field)。 **legacy 4 field 行は
+  author=link として読む**ので、 他 author は ZERO 起点で再配送される = **旧実装が silent
+  drop した record を upgrade が自己修復する**
+- floor は author 別 max を記録する v2 encoding。 legacy の scalar floor は
+  **無帰属 baseline (`u32::MAX` entry)** として温存し、 受信側が `max(entry[a], baseline)` で
+  全 author に畳み込む。 baseline を越えた author から順に per-author 精度が戻るので、
+  legacy floor を持つ既存 DB でも patch が効く (sentinel は自然 retire する)
+- **`u32::MAX` は peer id として予約**になった (baseline sentinel と衝突するため)
+
+### #217 — ack は「消化済みの最長 prefix」
+
+旧実装は生存 row を lsn **降順**に走査して最初の `hlc <= cursor` で ack していた。 relay 混在
+ring は lsn 順で HLC 非単調なので、 高 lsn に乗った古い HLC の中継 row に即 match し、
+**その下の未消化 row を watermark の下に巻き込む**。 doc の「降順打ち切りは安全側に落ちる」
+という記述は逆だった。
+
+- lsn **昇順**に走り、 消化の証明が続く間だけ前進、 証明の無い row で停止する
+- `Engine::ack_sync_up_to_cursors(peer, &[(author, hlc)])` を追加 (完全形)。 既存の
+  `ack_sync_up_to_hlc` は `[(self, cursor)]` の退化形として同じ walk を通る — scalar は
+  author を判別できないので **self-author 行の証明としてのみ**解釈する (`author == 0` =
+  peer identity 設定前の local 著作も self 扱い。 除外すると単独運用 → sync 参加の path で
+  永久 blocker になる)
+- **dead row (payload 欠落 / decode 不能) は削除して越える** (`sync_dead_rows_purged()` で
+  観測)。 配送不能な row を prefix blocker にすると全 peer の ack がそこで止まり ring が
+  満杯になる (#149 で潰した backpressure の復活)
+- 走査は前回 walk の到達点から再開する。 ただし**再開点は in-memory** — 永続の
+  `consumed_lsn` には旧実装が over-ack した値が残りうるので、 session 最初の walk は
+  それを信用せず全 ring を検証し、 小さければ**下方修正する** (移行 heal)
+
+### #221 — purge の delete と free list push を atomic に
+
+`Engine::delete` は冪等で「実際に消したか」を返さないため、 並行 reclaim
+(`absorb_pull_acks` は複数 peer からの並行 pull で並行実行される) が同じ slot を free list に
+二重 push していた。 実測で **138 write に対し 4 row の silent 消失**、 purge 数の二重計上も
+確認。
+
+- purge 専用 lock の下で **`expected_lsn` 一致**を再検証してから消す。 生存判定だけでは
+  ABA を踏む (T1 が purge → slot が bridge に再利用されて同一 eid に新 row → T2 が stale
+  snapshot で「生存」と判定して**その新 row を消す**)。 `lsn` は単調増加なので row の
+  同一性判別子として機能する
+- **`free_locals` は `delete` の前に取り push まで保持**する。 free list の producer は purge
+  だけではなく、 枯渇 slow path の `rebuild_free_locals` が非 live local を穴として push する
+  ため、 「delete 済み・push 前」の中間状態を観測されると両者から独立に入る
+
+### observability
+
+- `Syncer::truncated_pulls()` — `history_truncated` を返した累計。 単調増加しているのに
+  bootstrap 成功が無いなら回復経路が塞がっている
+- `bootstrap_pull` が state provider 不在で失敗したときの once-warn。 その構成では
+  truncation が**回復経路の無い行き止まり**になるため。 **relay / reclaim が回る topology では
+  `serve_state` は実質必須**
+- `Engine::sync_dead_rows_purged()` — #217 の dead row purge 累計 (平常時 0)
+
+### 既知の残り
+
+- **#218** — decode 不能 row を purge しても history floor が上がらない。 この 1 種類だけは
+  floor に現れないので、 over-ack が起きても truncation 通知に乗らず silent partial になる
+- **#219** — publisher 側 `SubscriptionFilter` は pull cursor を scope 依存にする。 filter で
+  落とした record は publisher の reclaim 後 bootstrap でしか戻らない (契約の明文化が必要)
+- #221 の窓を**決定論的に踏む test は作れなかった** (発火に「free list が空 + 枯渇 +
+  delete と push の間」の同時成立が要る)。 test 2 本は回帰検知として置いてあるが、
+  正しさの根拠は lock 順序であってその緑ではない、と doc に明記した
+
+検証: workspace 1058 passed / 0 failed (root crate 込み)、 参照 app (sunsu2) 21/21。
+
+## 0.23.0 — 2026-08-28
+
+**「黙って消えない」 を 3 層で塞いだ release。** 0.21.0 / 0.22.0 が sync の壊れ方を潰したのに
+対し、 こちらは **engine が host に対して起こす事故** (panic での即死、 mmap 越しの SIGBUS)
+と、 **`Ok(())` を返しながら op を捨てる 2 つの経路** を止めている。 relay/replica の
+「中継 ≠ 作者交代」 も実装で固定した。
+
+| 実地で起きうる壊れ方 | 直したもの |
+|---|---|
+| `oplog_sync()` が `Ok(())` を返したのに op が peer に永久に届かない | bridge cursor の lost update (#196) |
+| entity 枠 / vocab / content が満杯になった瞬間、 **組み込み先の process ごと死ぬ** | capacity 到達を 「拒否 + 計数 + warn」 に (#59) |
+| vocab index が満杯になると 100% CPU で無限ループ | 線形 probe の bounded 化 (#59 の副産物) |
+| ディスクが満杯になると **`SIGBUS` で即死** (errno を返す syscall が無い) | `grow` 前の空き確認 → `ErrorKind::StorageFull` (#167) |
+| **ディスク満杯で受け取れなかった record が二度と再配送されない** | 容量拒否を `SkippedOlder` に潰さない (#210) |
+| relay 経由の配布が翻訳後の宛名を author 名義で撒き、 direct 経路と混ざると行が重複する | relay を byte 単位で素通しに (#209) |
+
+### ⚠️ breaking: `Engine::entity()` が `Result` を返す
+
+```rust
+// 0.22.0 まで
+let e = eng.entity();
+// 0.23.0 から
+let e = eng.entity()?;          // or .unwrap()
+```
+
+table 版の `Engine::entity_in()` は元から `Result` だった。 同じ 「entity を作る」 操作が
+**片方は `Err`、 片方は process 即死** という非対称を消すための変更 (#59 の締め)。
+`Err` になる条件は 2 つだけで、 どちらも 0.22.0 までは panic だった:
+
+- **entity 枠が満杯** — 「DB が一杯」 は実行時の状態であって使い方の誤りではない。
+  空き枠は `remaining_eid_space()` で事前に見られる
+- **anonymous table が closed** (= `define_table` 済み) — `entity_in("<table>")` を使うこと
+
+移行は呼び出し側に `?` か `.unwrap()` を足すだけで、 意味は変わらない。
+
+### ⚠️ breaking: `remote_*_apply` の `relayed` 引数を撤去
+
+`remote_tieleaf_apply` / `remote_tie_apply` / `remote_untie_apply` /
+`remote_delete_apply` / `remote_content_apply` / `remote_vocab_apply` の末尾引数
+(`Option<RelayedHeader>`) を削除した。
+
+#209 で relay の実行が Syncer 経由の `Engine::relay_record` (原 `WireRecord` を持つ場所) に移った時点で
+engine 側では **使われなくなっていた**引数。 breaking を 1 つの release にまとめるため
+ここで撤去する。 移行は呼び出し側の末尾 `None` / `Some(relayed_header(rec))` を消すだけ。
+
+### 検証状況 (先に読むこと)
+
+- **#196 の fix は決定論的 regression test 2 本で固定**してある (fix 無しで必ず落ちる)。
+  一方 **300 回の stress A/B は 「flake が消えた」 証明にはなっていない** — baseline 側が
+  再現しない round があった (0/8)。 残りの切り分けは **#208** で追う
+- **#167 / #210 は ディスクを埋めずに決定論的に再現**した (`set_space_margin` で必要空き量を
+  水増しする knob)。 #167 は guard を外すと SIGBUS が戻ることも、 #210 は mapping を旧挙動に
+  戻すと `skipped: 1 / min_rejected_hlc: None` になることも確認済み
+- **#196 は 0.22.0 で踏みやすくなっていた**: #149 pull-as-ack が reclaim で ring を回す
+  ようになったぶん `head == checkpoint` が成立しやすく、 fold の発火頻度が上がっていた
+- **workspace 全体 (root crate 込み)**: release 対象の tree (`c473895`) で
+  **1042 passed / 0 failed**。 2 台のセッションが独立に実測しており、 うち片方は
+  CI 対象外の root crate (263 passed) と clippy パリティも併せて確認している
+- **実 consumer での確認**: sunsu2 が **20/20 green** (relay fanout の収束 + relay 死亡 →
+  bootstrap 復旧を含む)。 `entity()` の breaking は schema 層を経由しているため無風だった
+- **CI の範囲に穴があった** (#213): `test` job は core 5 crate しか回さず、 root crate は
+  重量 dev-dep のため除外されている (#98)。 #59 で panic を撤去したのに
+  `#[should_panic]` の test が取り残されていたのを、 root crate 全体を回して発見・修正した
+  (影響はその 1 件のみ)。 以降は手元 gate に root crate を含めている
+
+### #196 — `Ok(())` を返しながら op を捨てる経路
+
+`_sync_ops` は oplog の commit 済み record を peer 配布用に写す bridge で、
+`sync_ops_offset` がその cursor。 ring を畳む (`try_reset`) ときは cursor も
+`HEADER_SIZE` に巻き戻す必要がある。 ここに lost update があった:
+
+1. consumer が fold して cursor を `HEADER_SIZE` に巻き戻す
+2. **その直後**、 走っていた transfer が完了して **古い cursor 値を `store` で上書き** する
+3. cursor が **未 bridge 領域を飛び越えた** 状態になり、 その区間の op は
+   `_sync_ops` に永久に現れない = peer に届かない。 `oplog_sync()` は `Ok(())` を返す
+
+3 層で塞いだ:
+
+- cursor 前進を **CAS 化** — 期待値と違えば stale store として弾き、
+  `sync_ops_cursor_repairs` に計上
+- fold を **`transfer_lock` 保持下で再評価** — `try_reset_if(|| wal_fold_safe_locked())` に
+  述語として渡し、 lock 外の判定と fold の間に transfer が挟まる窓を閉じる
+- **tripwire**: `offset > head` (= cursor が head を追い越した) を検知したら cursor を
+  巻き戻して計数 + warn。 既に壊れている DB も self-heal する
+
+### #59 — capacity 到達で host を殺さない
+
+embedded DB は他人の process に埋め込まれる。 「枠が満杯」 は想定内の実行時状態であって
+使い方の誤りではないので、 panic で host を殺してはいけない。
+
+- `FaultKind` (`EntitySpace` / `ContentSpace` / `VocabSpace` / `ValueOutOfRange` /
+  `DiskSpace`) 単位で計数 + 1 秒に 1 回の rate-limited warn。 `fault_count(kind)` /
+  `fault_total()` で観測できる
+- `EntitySet::allocate` が `Option`、 `Vocabulary::insert` が sentinel、
+  `ContentStore::set` が `bool` を返すようになった (旧: `assert!` / `panic!`)
+- `value >= u32::MAX` の 7 箇所の `assert!` を 「拒否 + 計数」 に。 `u32::MAX` は sentinel 予約
+- `Syncer::try_new` を追加 (`new` は従来どおり panic)
+- FFI の cell accessor が row/col の範囲前提を外した
+
+**副産物の hang 修正**: vocab index が 100% 埋まった状態で `lookup` / `index_insert` の
+線形 probe が終了条件を持たず、 **10 分間 100% CPU で回り続ける** のを実測した。
+両方 `index_cap` で bounded 化。
+
+### #167 — ディスク満杯を SIGBUS ではなく Result にする
+
+全 mmap なので書き込みは write syscall を通らない。 **errno を返す経路が無いため、
+ディスクが満杯だと SIGBUS になる**。 `ftruncate` も ENOSPC を報告しない (sparse なので
+予約しない)。
+
+`grow_to` の前に `fstatvfs` で空きを見て、 `必要 delta + margin` に足りなければ
+`io::ErrorKind::StorageFull` を返すようにした。 margin 既定 32 MB、
+`set_space_margin()` で調整、 `space_denials()` / `disk_free_bytes()` で観測。
+
+併せて、 **捨てられていた `ensure_committed` の error を 12 箇所 threading** した
+(`LeafStore::insert` / `Vocabulary::insert` が sentinel、 `HimoStore::set` が `bool` 化、
+cell version / tombstone の read は `Hlc::ZERO`)。 ここを捨てていると、
+空き確認を通した後で伸ばせなかった場合に同じ SIGBUS に戻る。
+
+### #210 — 「今は置けない」 を 「再配送不要」 に潰さない
+
+#167 の容量拒否は engine 側の戻り値が `bool` だったため、 sync 受信側が
+`ApplyResult::SkippedOlder` (doc に 「再配送は不要」) として計上していた。 `SkippedOlder` は
+`min_rejected_hlc` を立てないので **pull cursor がその record を越え、 空きが出ても二度と
+再配送されない**。 #167 は破損を防いだ代わりに、 それを静かな喪失に置き換えていた。
+
+`remote_*_apply` の戻り値を **`RemoteApply::{Applied, Stale, RejectedCapacity}`** の 3 状態に
+した (容量拒否の経路を持つ `remote_tieleaf_apply` / `remote_content_apply` の 2 関数のみ)。
+sync 側は `RejectedCapacity` で `note_reject` を呼び、 cursor を止めて再配送させる
+(`SyncOutcome::rejected_capacity` で観測)。
+
+Content 経路は `store.try_set` が engine 呼び出しの **前** にあり、 1 byte も書けなかった
+record の HLC だけが残って再配送も弾かれる状態だったので、 **apply 成功後に記録** する形に
+変えた。
+
+### #209 — relay/replica の正しさ: 中継 ≠ 作者交代
+
+gossip relay が **翻訳後の eid / value** (relay-local slot / vid / translated ref) を
+author 名義で再配布していた。 relay 経由のみなら 「一貫して間違った namespace」 で辻褄が
+合うが、 direct 経路と混在 (bootstrap 復旧 / relay 死亡 fallback) すると **行が重複し、
+vocab 写像が汚染される**。 署名も eid / value を書き換えた時点で不一致になるため、
+`require_signature` 環境では relay がそもそも成立しない。
+
+- engine 側 6 箇所の gossip 分岐を撤去し、 relay の判断を `Syncer` に移した
+  (**`ApplyResult::Applied` の枝限定** + Commit / 自 author 除外)。 これは
+  「LWW gate だけが cyclic topology の echo を止めている」 ため — 無条件に relay すると
+  閉路 1 本で無限反響する
+- **署名素通しは byte 単位でしか成立しない**: 署名は LSN 込みの固定 header に掛かるので
+  op を再 encode すると必ず壊れる → `OpLog::append_relayed_verbatim` が `signed_bytes` を
+  そのまま格納し、 LSN も author のまま置く (`next_lsn` を消費しない)
+- verbatim 化で **原 eid が WAL に載る** ため、 WAL recovery に翻訳経路
+  (`replay_relayed_op`) を追加
+
+`remote_*_apply` の `_relayed` 引数は互換のため残置してあり、 `entity()` の breaking と
+同じ release で撤去する。
+
+storage format 変更なし (v9 のまま)。
+
+## 0.22.0 — 2026-08-27
+
+**author の生涯 op 数上限 (≒ ring 容量) を撤廃した release。** peer SNS 試験機
+(sunsu2) を 24-peer Zipf chaos / celebrity fanout / ring 溢れで回して踏んだ 7 件を、
+1 つずつ根まで追って潰している。全て sync 経路の正しさ・容量の話で、 **storage
+format 変更なし** (file format v9 のまま、 旧 DB はそのまま開ける)。
+
+| 実地で見えた症状 | 直したもの |
+|---|---|
+| relay/pull-only 構成で author が数千 op 書くと、 以後の変更が一切配布されない | #149 pull-as-ack (PR #202) |
+| 一部 follower だけ永久に 0 配布になる (eager reclaim の床上げ) | reclaim の圧力 50% gate (PR #202) |
+| reclaim 1 回で消化済み follower まで全員 bootstrap 送り | #191 floor = reclaim 済み最大 HLC (PR #193) |
+| 大 burst (数万 tie) で書き込みが永久停止する livelock | #195 consumer の自 queue push 撤廃 (PR #198) |
+| `.tables` sidecar が並行 persist で消える / 壊れる (ENOENT / torn install) | #190 persist の per-engine 直列化 (PR #192) |
+| peer 1 個開くだけで write queue が 1M slot を eager 確保 | #116 scaled default + capacity knob (PR #189) |
+| foreign entity への Ref が sync で壊れる / read で peer prefix が落ちる | #183 TieRef wire (PR #187) + #184/#185 Ref read・facade (PR #186) |
+
+### #149 pull-as-ack — 生涯 op 数上限の撤廃 (PR #202)
+
+relay/gateway (pull-only) 経路には明示 ack が無く、 誰も `ack_sync` を呼ばない →
+`sync_watermark()` = 0 固定 → `_sync_ops` ring が reclaim されず満杯 → bridge が
+backpressure で stall。 **author の生涯 op 数 ≒ ring 容量** (65k-entity 構成で
+実測 971 post で stall) だった。 CHANGELOG 0.18.2 の self-ack 回避策は現行では
+二重に死んでいる (v9 で `stats().max_hlc` = None / `sync_watermark` の self 除外)
+ので、 利用側での回避も不可能だった。
+
+fix: pull cursor は durable barrier 通過後にしか前進しない = そのまま消化の
+到達証明なので、 これを transport 経由で author に還流する。
+
+- `Transport` trait に `record_pull_ack` / `take_pull_acks` を追加 (**default
+  no-op で後方互換**。 運べない transport は従来挙動)。 `InMemoryTransport` 対応済み
+- `Syncer::pull_once` が確定 cursor を自動記録、 `Syncer::publish_since` 冒頭の
+  `absorb_pull_acks` が `ack_sync_up_to_hlc` で consumed_lsn に写す。
+  **app は publish/pull を回すだけ、 新 API 呼び出し不要**
+- E2E: ring 850 row に対し 6000 op を publish/pull loop で全配布
+  (旧挙動は **846/6000 で silent stall**)
+
+**reclaim は ring 使用率 50% 超の時だけ** (ここが要)。 「ack が来たら即 reclaim」
+は 24-peer chaos が即死パターンを検出した: floor が即上昇し、 その author を
+**まだ一度も pull していない follower** (round 1 個ズレの参加 / 一時 offline) が
+cursor < floor で永久 truncation になる。 履歴は容量が許す限り保持して差分
+追いつきを最大化し、 reclaim は容量管理に徹する。 semantics の明示:
+
+- watermark は「一度でも pull して ack が届いた peer」の min。 pull したことの
+  ない peer は待たない (open topology では存在を知りようがない)
+- 一度 pull して消えた laggard は watermark を pin する (追い出し policy は未実装)
+- ack は「実在確認済み生存 row の lsn」までしか進まない = 未 pull record の
+  過剰 reclaim なし
+
+### その他の fix
+
+- **#191 (PR #193)**: history floor が「生存 record の最小 HLC (空なら Hlc::MAX)」
+  だったため、 reclaim 1 回で**全履歴消化済みの follower まで** truncation 判定に
+  なっていた。 floor = 「reclaim で消えた record の最大 HLC」 に変更し、
+  `_sync_peers` の sentinel row に永続 (reopen 後も正しく広告)。
+- **#195 (PR #198)**: consumer thread の bridge が `entity_in("_sync_ops")` 経由で
+  **自分しか drain しない write queue に blocking push** し、 満杯時に livelock。
+  drain handler が no-op の `EntityCreated` を counter 対称 bump に置換。
+  #116 の小 queue default で顕在化していた。
+- **#190 (PR #192)**: `.tables` sidecar の atomic write が同一 tmp 名を共有し、
+  consumer の定期 persist × pull 側 persist の並行で ENOENT / torn install /
+  順序逆転。 per-engine lock で serialize → write → fsync → rename を直列化。
+- **#116 (PR #189)**: write queue が容量 1M slot を eager 確保していた。 default を
+  max_entities 連動に scale + `with_queue_capacity` knob。 queue 4096 でも
+  write/read 速度は不変 (drain 分布重複を実測)。
+- **#183/#184/#185 (PR #186/#187)**: foreign entity への `tie_ref` が wire で
+  local 部しか運ばず壊れていたのを世界番号 (peer prefix 込み eid) 同乗で発送
+  (TieRef op)。 `Value::Ref` read の peer prefix 落ちと facade の eid ヘルパー
+  re-export も修正。
+
+### 既知の制限 (= 0.23 の scope)
+
+- **HTTP transport (enchu-transport) は ack / floor をまだ運ばない** — trait
+  default により旧挙動のまま動く (壊れないが ring 回転の恩恵なし)。 endpoint
+  追加は enchu-transport 側の follow-up
+- truncation された遅参 peer の復旧経路 (#140 bootstrap-first flow) は未実装 —
+  圧力 gate で発生自体は稀だが、 起きたら手動 bootstrap
+- laggard (一度 pull して消えた peer) の追い出し policy なし — watermark が
+  pin されたままだと ring は再び埋まりうる (その場合も #152 backpressure で
+  欠番は出ない)
+
+### 検証状況
+
+- workspace 1045 tests green (新規 guard: #149 ×4 / #190 / #191 ×2 / #195)
+- 実 consumer gate: sunsu2 全 18 tests green — 24-peer Zipf chaos (churn /
+  offline 窓 / restart ×2) 収束 + truncation ゼロ、 ring 容量超 1500 post flood
+  全配布、 cold backlog 1200 post の ring 回転 drain
+- fanout 実測 (M4 Max): follower catch-up 26k posts/s/core、 25 並列 62.6k
+  deliveries/s/host
+
 ## 0.21.0 — 2026-08-26
 
 **sync 経路で 「消えた / 復活した / 二重になった」 が起きる道を塞いだ release。** 2 台の

@@ -48,7 +48,7 @@ fn append_himos_after_reopen_does_not_sigbus() {
             eng.define_himo(&format!("h{}", i), ValueType::Number, 0);
         }
         for v in 0..1000u32 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "h0", v);
         }
         eng.flush().unwrap();
@@ -104,7 +104,7 @@ fn append_mixed_type_himos_after_reopen() {
         for (n, t) in pre {
             eng.define_himo(n, *t, 0);
         }
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_text(e, "name", "test");
         eng.flush().unwrap();
     }
@@ -143,7 +143,7 @@ fn append_mixed_type_himos_after_reopen() {
 
 /// seal_integrity で `.crc` を焼いた後に himo を追加 → reopen できることの確認。
 ///
-/// v29 issue7 fix (`define_himo_slot_locked` が stale `.crc` sidecar を unlink)
+/// issue7 fix (`define_himo_slot_locked` が stale `.crc` sidecar を unlink)
 /// の regression test。 fix 前は `.crc` が前 schema 時点のまま残り、 次 open の
 /// `verify_region_crcs` が vocab/himoreg mismatch で `Err` になっていた
 /// (SIGBUS ではないが DB が開けない)。
@@ -164,7 +164,7 @@ fn append_himos_after_seal_integrity() {
         for i in 0..10 {
             eng.define_himo(&format!("h{}", i), ValueType::Number, 0);
         }
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "h0", 42);
         // seal_integrity = flush + .crc 焼き
         eng.seal_integrity().unwrap();

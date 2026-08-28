@@ -3,7 +3,7 @@
 //!
 //! 旧 behavior: `Database::open` は `__enchu_schema_meta__` marker himo の存在を
 //! 前提にしていたが、 engine 直構築 DB には marker が無いため、 query 実行時に
-//! `ensure_schema_entity` が `eng.entity()` (= anonymous) を呼び panic:
+//! `ensure_schema_entity` が `eng.entity().unwrap()` (= anonymous) を呼び panic:
 //! ```
 //! anonymous table is closed (define_table was called);
 //! use entity_in('<table>') instead of entity()

@@ -99,9 +99,7 @@ fn binding_over_an_untouched_row_is_not_counted() {
         recv,
         eng.himo_id("files.size").unwrap() as u16,
         7,
-        Hlc { wall: 100, logical: 0, peer: OTHER_PEER },
-        None
-    ));
+        Hlc { wall: 100, logical: 0, peer: OTHER_PEER }));
     let foreign2 = enchudb_oplog::make_eid(OTHER_PEER, 79);
     eng.bind_remote_eid(OTHER_PEER, foreign2, recv);
     assert_eq!(

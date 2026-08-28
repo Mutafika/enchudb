@@ -32,7 +32,7 @@
 //! let _ = std::fs::remove_file(&path);
 //! let mut db = enchudb::Engine::create_standalone(&path).unwrap();
 //! db.define_himo("age", enchudb::ValueType::Number, 100);
-//! let e = db.entity();
+//! let e = db.entity().unwrap();
 //! db.tie(e, "age", 30);
 //! db.rebuild();
 //! assert_eq!(db.pull_raw("age", 30), vec![0]);
@@ -44,7 +44,7 @@ pub use enchudb_engine::*;
 // Convenience re-exports for downstream crates that previously imported these
 // from the root (opyula など)。 EntityId / Hlc / PeerId / keys は本来
 // `enchudb_oplog` 配下だが、 meta crate として薄く再露出する。
-pub use enchudb_oplog::{EntityId, Hlc, PeerId};
+pub use enchudb_oplog::{eid_local, eid_peer, make_eid, EntityId, Hlc, PeerId};
 pub mod keys {
     pub use enchudb_oplog::keys::*;
 }

@@ -52,11 +52,11 @@ pub fn content_key_hash15(s: &str) -> u16 {
     (h as u16) % 0x7fff
 }
 
-/// v32: Entity ID。u64 = `[peer_id: 32bit][local_id: 32bit]`。
+/// Entity ID。u64 = `[peer_id: 32bit][local_id: 32bit]`。
 /// 単独 peer 運用時は peer_id = 0、実質 local_id のみ使われる。
 pub type EntityId = u64;
 
-/// v32: Peer ID。各 peer が固有 u32 ID を持ち、上位 32bit を EntityId に埋め込む。
+/// Peer ID。各 peer が固有 u32 ID を持ち、上位 32bit を EntityId に埋め込む。
 pub type PeerId = u32;
 
 /// local_id と peer_id から EntityId を合成。
@@ -77,7 +77,7 @@ pub const fn eid_local(eid: EntityId) -> u32 {
     eid as u32
 }
 
-/// v32: Hybrid Logical Clock。分散 peer 間で全順序を確立する。
+/// Hybrid Logical Clock。分散 peer 間で全順序を確立する。
 /// wall: 物理時刻(ms since epoch)、logical: 同時刻内のカウンタ、peer: tiebreaker。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Hlc {

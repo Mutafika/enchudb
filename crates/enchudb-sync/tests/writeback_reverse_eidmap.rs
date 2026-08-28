@@ -13,8 +13,9 @@
 //!    reopen 後の write-back も正しく宛名解決される (phase 1 の永続化 e2e)
 //! 3. `lww_concurrent_same_card_converges` — 同じ card の双方向編集が
 //!    「時間が解決する」 (HLC LWW) で収束する
-//! 4. `ref_value_to_replica_stays_local` — Ref 値が translated local を指す write
-//!    は発送されない (u32 wire value に世界番号が入らない、 request10 follow-up)
+//! 4. `ref_value_to_replica_propagates_as_tie_ref` — Ref 値が translated local を指す write
+//!    は TieRef (target 世界番号同乗、 #183) に書き換えられて発送され、 受信側は
+//!    未見 target でも stub を確保して断片化せずに収束する
 
 use enchudb_engine::engine::Engine;
 use enchudb_engine::transport::{InMemoryTransport, Transport};
@@ -261,8 +262,13 @@ fn lww_concurrent_same_card_converges() {
     cleanup(&path_a); cleanup(&path_b);
 }
 
+/// #183: Ref 値が translated local を指す write は **TieRef (target 世界番号同乗)**
+/// に書き換えられて発送され、受信側で断片化せずに収束する。
+///
+/// 0.11.0〜0.21.0 は「wire の u32 value に世界番号が入らない」ため skip + warn で
+/// local-only に留めていた (本 test の旧名 `ref_value_to_replica_stays_local`)。
 #[test]
-fn ref_value_to_replica_stays_local() {
+fn ref_value_to_replica_propagates_as_tie_ref() {
     fn make_ref_engine(path: &str, peer: PeerId) -> Arc<Engine> {
         cleanup(path);
         let mut eng = Engine::create_with_capacity(path, 65_536).unwrap();
@@ -310,8 +316,9 @@ fn ref_value_to_replica_stays_local() {
     let records_b = t_b.pull(2, Hlc::ZERO);
     assert!(!records_b.is_empty(), "uid tie must be published");
 
-    // C: B の stream を apply。 uid は届くが、 レプリカ宛 ref は guard されて
-    // 届かない (= 誤った宛名で断片を作るくらいなら発送しない)。
+    // C: B の stream を apply (A の stream より**先**)。 uid も ref も届く。
+    // ref の target は世界番号で運ばれるので、 C は A の company をまだ知らなく
+    // ても target table 空間に stub を確保して繋ぐ (#183 TieRef)。
     let eng_c = make_ref_engine(&path_c, 3);
     let syncer_c = Syncer::new(eng_c.clone(), t_b.clone());
     assert!(syncer_c.apply_records(&records_b).applied > 0);
@@ -319,13 +326,37 @@ fn ref_value_to_replica_stays_local() {
         .resolve_remote_eid_existing(u_b)
         .expect("B's user must arrive on C");
     assert_eq!(eng_c.get(u_c, "users.uid"), Some(42), "uid card must arrive");
+    let c_on_c = eng_c
+        .resolve_remote_eid_existing(c_a)
+        .expect("#183: the ref target must be allocated on C from the world number");
     assert_eq!(
-        eng_c.get(u_c, "users.company"),
-        None,
-        "ref-to-replica must NOT be propagated (request10 follow-up until wire \
-         can carry a foreign entity id in the value)"
+        eng_c.get(u_c, "users.company").map(|v| v as u64),
+        Some(enchudb_oplog::eid_local(c_on_c) as u64),
+        "#183: the ref must arrive on C and point at C's local for A's company"
     );
-    // B のローカルでは ref は生きている (local-only)。
+
+    // 後から A の stream が届いても断片化しない — cid は同じ local に着弾する。
+    let syncer_c_a = Syncer::new(eng_c.clone(), t_a.clone());
+    assert!(syncer_c_a.apply_records(&records_a).applied > 0);
+    assert_eq!(
+        eng_c.get(c_on_c, "companies.cid"),
+        Some(7),
+        "#183: A's own tie for the company must land on the same stub (no fragmentation)"
+    );
+
+    // A: B の stream を apply。 target は A 自身の entity なので identity 解決。
+    let syncer_a_in = Syncer::new(eng_a.clone(), t_b.clone());
+    assert!(syncer_a_in.apply_records(&records_b).applied > 0);
+    let u_on_a = eng_a
+        .resolve_remote_eid_existing(u_b)
+        .expect("B's user must arrive on A");
+    assert_eq!(
+        eng_a.get(u_on_a, "users.company").map(|v| v as u64),
+        Some(enchudb_oplog::eid_local(c_a) as u64),
+        "#183: on the author of the target, the ref must resolve to the original entity"
+    );
+
+    // B のローカルでも ref は従来どおり生きている。
     assert_eq!(
         eng_b.get(u_b, "users.company").map(|v| v as u64),
         Some(enchudb_oplog::eid_local(c_replica) as u64),
@@ -333,6 +364,7 @@ fn ref_value_to_replica_stays_local() {
     );
 
     drop(syncer_a); drop(syncer_b_in); drop(syncer_b_out); drop(syncer_c);
+    drop(syncer_c_a); drop(syncer_a_in);
     drop(eng_a); drop(eng_b); drop(eng_c);
     cleanup(&path_a); cleanup(&path_b); cleanup(&path_c);
 }

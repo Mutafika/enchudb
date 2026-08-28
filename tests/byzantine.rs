@@ -1,6 +1,6 @@
-//! v32 Byzantine tolerance テスト — 悪意/故障 peer 下での健全 peer の挙動検証。
+//! Byzantine tolerance テスト — 悪意/故障 peer 下での健全 peer の挙動検証。
 //!
-//! Phase C の基本テスト (v32_two_peer_sync.rs) で既にカバーしてるもの:
+//! Phase C の基本テスト (two_peer_sync.rs) で既にカバーしてるもの:
 //! - unsigned op は require_signature で弾かれる
 //! - 署名改竄 (1bit 反転) は弾かれる
 //! - 異なる pubkey による impersonation は弾かれる
@@ -22,7 +22,7 @@ use enchudb_oplog::oplog::DecodedOp;
 use enchudb_oplog::keys::Keypair;
 
 fn tmp(tag: &str) -> String {
-    let p = format!("/tmp/enchudb-v32-byz-{}-{}", tag, std::process::id());
+    let p = format!("/tmp/enchudb-byz-{}-{}", tag, std::process::id());
     for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", p, suffix));
     }

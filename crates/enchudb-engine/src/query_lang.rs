@@ -364,7 +364,11 @@ fn exec_insert(eng: &mut Engine, input: &str) -> QueryResult {
     let tokens = parse_kv_tokens(input);
     if tokens.is_empty() { return QueryResult::Error("nothing to insert".into()); }
 
-    let eid = eng.entity();
+    let eid = match eng.entity() {
+        Ok(e) => e,
+        // #59: entity 枠が満杯 (or anonymous table が closed)。 panic せず Error で返す。
+        Err(e) => return QueryResult::Error(e),
+    };
     for (himo, val) in &tokens {
         if val.starts_with('"') && val.ends_with('"') && val.len() >= 2 {
             let text = &val[1..val.len() - 1];
@@ -476,7 +480,7 @@ mod tests {
         let mut eng = Engine::create_standalone(&dir).unwrap();
 
         for i in 0..10u32 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "age", 20 + i);
             eng.tie(e, "dept", i % 3);
             eng.tie(e, "salary", 100 + i * 10);

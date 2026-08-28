@@ -1,9 +1,9 @@
-//! Property-based tests for EnchuDB v27.
+//! Property-based tests for EnchuDB.
 //!
 //! ランダムな操作列を shadow model (HashMap/HashSet) と並走させ、
 //! db の観測結果が shadow と一致することを検証する。
 //!
-//! 実行: `cargo test --features v27 --test property_based`
+//! 実行: `cargo test --test property_based`
 
 use enchudb::{Engine, ValueType};
 use proptest::prelude::*;
@@ -31,7 +31,7 @@ fn make_db(path: &str) -> Engine {
     db.define_himo("c", ValueType::Number, 10);
     // 100 個 entity を確保。eid 0..100 が allocate される。
     for _ in 0..100 {
-        let _ = db.entity();
+        let _ = db.entity().unwrap();
     }
     db
 }

@@ -1,4 +1,4 @@
-//! v24 Engine — 量子円柱。単一ファイル。全コンポーネントが1つのmmapを共有。
+//! Engine — 量子円柱。単一ファイル。全コンポーネントが1つのmmapを共有。
 //!
 //!   entity() → ID 振る
 //!   tie_text → 文字列を紐で張る（Vocabulary 経由）
@@ -54,7 +54,7 @@ pub struct TableEidUsage {
     pub free: u32,
 }
 
-/// v29: Engine の実行時状態スナップショット。
+/// Engine の実行時状態スナップショット。
 #[derive(Debug, Clone)]
 pub struct EngineStats {
     pub entity_count: u32,
@@ -77,7 +77,7 @@ pub struct EngineStats {
     pub pushed: u64,
     /// consumer が apply した累計
     pub applied: u64,
-    /// v32: 自 peer の peer_id(非 v32 では 0)
+    /// 自 peer の peer_id(単独 peer 運用では 0)
     pub peer_id: u32,
     /// **pre-v9 DB の**揮発版数置き場のエントリ数。 v9 DB では版数が
     /// per-cell version column に載るので常に 0 (走査が O(entity × himo) に
@@ -98,6 +98,87 @@ pub struct EngineStats {
 /// 計測は read-only で、 vocab 自体は変更しない。 `Tag` himo (= `get_or_insert`
 /// 経由で dedup) も live set の collection 対象 (= ある vid を Tag が参照中なら
 /// Leaf が後から orphan にしても live 判定)。
+/// **capacity 到達・edge 値・破損 file のような 「想定内だが続行不能」 な事象** (#59)。
+///
+/// embedded DB は他人の process に埋め込まれる。 「DB が一杯」 「値が範囲外」 で
+/// `panic!` すると host app ごと落ちるし、 FFI 境界を unwind すれば未定義動作になる。
+/// そこで engine 内部ではこれらを panic にせず、
+///
+/// 1. その write を **拒否** し (壊れた値を書かない)
+/// 2. 種別ごとに **計数** し (`Engine::fault_count`)
+/// 3. **rate-limited に warn** する (黙って落とさない)
+///
+/// という扱いに統一する。 `Result` を返せる API では併せて `Err` を返す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultKind {
+    /// entity 枠が満杯 (max_entities 到達 + free stack 空)
+    EntitySpace,
+    /// content data 領域が満杯 (既定 512 MB)
+    ContentSpace,
+    /// vocabulary が満杯 (vocab_max_entries 到達)
+    VocabSpace,
+    /// 値が cell に入らない (`u32::MAX` は sentinel 予約)
+    ValueOutOfRange,
+    /// #167: filesystem の空き容量不足で DB を伸ばせない
+    DiskSpace,
+}
+
+impl FaultKind {
+    pub(crate) const COUNT: usize = 5;
+    pub(crate) fn index(self) -> usize {
+        match self {
+            FaultKind::EntitySpace => 0,
+            FaultKind::ContentSpace => 1,
+            FaultKind::VocabSpace => 2,
+            FaultKind::ValueOutOfRange => 3,
+            FaultKind::DiskSpace => 4,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FaultKind::EntitySpace => "entity space exhausted",
+            FaultKind::ContentSpace => "content space exhausted",
+            FaultKind::VocabSpace => "vocabulary full",
+            FaultKind::ValueOutOfRange => "value out of range",
+            FaultKind::DiskSpace => "filesystem is (nearly) full",
+        }
+    }
+}
+
+/// `remote_*_apply` (sync 受信の apply) の結果 (#210)。
+///
+/// 旧 `bool` は 「適用した / しなかった」 しか区別できず、 **「LWW で古い」 と
+/// 「容量が無くて置けなかった」 が同じ `false` に潰れていた**。 sync 側はそれを
+/// `SkippedOlder` (= 再配送不要) として計上するため、 **ディスク満杯や content
+/// 天井に当たった record は cursor を越えられて恒久的に失われる**。
+///
+/// 前者は再配送しても結果が変わらないが、 後者は **空きが出てから再配送しないと
+/// 埋まらない**。 cursor を進めてよいかの判断が真逆なので型で分ける
+/// (`SyncOutcome::skipped` と `dropped_unresolved` を分けたのと同じ理由)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteApply {
+    /// 適用した。
+    Applied,
+    /// **LWW で古い** / 既に適用済み / tombstone に負けた / 宛先の himo が無い。
+    /// 再配送しても結果は変わらない。
+    Stale,
+    /// **容量が足りず置けなかった** (`FaultKind::DiskSpace` / `ContentSpace`)。
+    /// 値は一切書いていない。 **空きが出てからの再配送が必要**。
+    RejectedCapacity,
+}
+
+impl RemoteApply {
+    /// 適用されたか。
+    pub fn applied(self) -> bool {
+        matches!(self, RemoteApply::Applied)
+    }
+
+    /// 再配送が必要か (= cursor をこの record より先に進めてはいけない)。
+    pub fn needs_redelivery(self) -> bool {
+        matches!(self, RemoteApply::RejectedCapacity)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VocabOrphanStats {
     /// vocab に発行済みの全 vid 数 (= `Vocabulary::count()`)。
@@ -909,7 +990,7 @@ impl Backing {
         }
     }
 
-    /// v32: &self 経由で header 領域に unsafe で書き込む。
+    /// &self 経由で header 領域に unsafe で書き込む。
     /// mmap 経由の並行書き込みは atomic スライス更新でガードされる前提。
     #[allow(clippy::mut_from_ref)]
     fn header_mut(&self) -> &mut [u8] {
@@ -942,7 +1023,7 @@ use crate::leaf_store::{LeafRead, LeafStore, cap_bytes_for_shift, MAX_OFF_SHIFT}
 use crate::column::Column;
 
 // ════════════════ ギャロッピング交差 ════════════════
-// 旧 v24/v26 経路で使っていた。v27+ でも将来再利用の余地あり。
+// 旧 query 経路で使っていた。将来再利用の余地あり。
 
 #[allow(dead_code)]
 #[inline]
@@ -1148,10 +1229,10 @@ const H_HIMOREG_INDEX_CAP: usize = 40;
 const H_HIMOREG_DATA_SIZE: usize = 44; // u64
 const H_CONTENT_DATA_SIZE: usize = 52; // u64
 const H_CYL_MAX_VALUES: usize = 60;
-/// v28: ヘッダ整合性 CRC。[H_MAGIC..H_HEADER_CRC] の CRC32(FNV-1a)。
+/// ヘッダ整合性 CRC。[H_MAGIC..H_HEADER_CRC] の CRC32(FNV-1a)。
 /// create/flush/define_himo 時に更新、open 時に検証。
 const H_HEADER_CRC: usize = 64; // u32
-/// v32: この DB を所有する peer の id。0 は「未設定 / single peer」。
+/// この DB を所有する peer の id。0 は「未設定 / single peer」。
 /// CRC 保護外(後から set_peer_id で上書き可能)。
 const H_PEER_ID: usize = 68; // u32
 /// 72..76 は予約済み (v3 まで `H_UNDO_MAX_ENTRIES` が居た跡地)。 v4 で undo 全廃に
@@ -1265,7 +1346,7 @@ fn verify_header_crc(buf: &[u8]) -> Result<(), String> {
 }
 
 /// 0.9.0 (L1): header field の自己整合チェック。
-/// `verify_header_crc` は stored CRC == 0 (v27 以前の legacy DB) を素通しするため、
+/// `verify_header_crc` は stored CRC == 0 (header CRC 導入以前の legacy DB) を素通しするため、
 /// 破損した himo_count / *_size / *_cap がそのまま layout 計算へ流れて panic /
 /// OOB region を起こし得た。 ここで「header 自身の field 同士の関係」だけを検証
 /// する (新しい定数上限は導入しない → 既存の正常 DB を誤って弾かない)。
@@ -1785,6 +1866,10 @@ pub fn is_engine_internal_table(name: &str) -> bool {
 pub const DEFAULT_TABLE_RESERVED: u32 = 1_000_000;
 
 pub struct Engine {
+    /// #59: 「想定内だが続行不能」 な事象の種別ごとの発生回数。 panic の代替。
+    faults: std::sync::Arc<[std::sync::atomic::AtomicU64; FaultKind::COUNT]>,
+    /// fault warn の rate limit (unix ms)。 満杯状態では毎 write で warn が出るので絞る。
+    last_fault_warn_ms: std::sync::atomic::AtomicU64,
     #[allow(dead_code)]
     path: String,
     layout: Layout,
@@ -1837,7 +1922,7 @@ pub struct Engine {
     push_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// consumer が apply 完了した累積件数。apply_count >= push_count が同期点。
     apply_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// v28 WAL。`create_concurrent_with_oplog` or `open_concurrent_with_oplog` で有効化。
+    /// WAL。`create_concurrent_with_oplog` or `open_concurrent_with_oplog` で有効化。
     /// Some なら tie_async/untie_async/delete_async は oplog_record_queue 経由で
     /// consumer thread 側に batch flush を委ねる。
     oplog: Option<std::sync::Arc<enchudb_oplog::oplog::OpLog>>,
@@ -1892,9 +1977,9 @@ pub struct Engine {
     hlc_mint_lock: parking_lot::Mutex<()>,
     /// 背景 fsync が最後に completed した LSN。
     durable_lsn: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// v32: この Engine を所有する peer の id。分散時 eid の上位 32bit。
+    /// この Engine を所有する peer の id。分散時 eid の上位 32bit。
     peer_id: std::sync::atomic::AtomicU32,
-    /// v32: LWW 用に (eid, himo) → 最後の HLC を記録。
+    /// LWW 用に (eid, himo) → 最後の HLC を記録。
     hlc_store: std::sync::Arc<crate::hlc_store::HlcStore>,
     /// #9: 受信した foreign eid を自分の eid 空間の local eid に翻訳する写像。
     eid_translator: std::sync::Arc<crate::eid_translator::EidTranslator>,
@@ -1914,13 +1999,13 @@ pub struct Engine {
     /// 起きていない DB (= 常態) で、 受信 apply の hot path が read lock すら
     /// 取らないようにするためだけのもの。
     foreign_tombs_empty: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// v32 Phase C: 自 peer の ed25519 鍵ペア。None なら署名しない/検証もしない。
+    /// 自 peer の ed25519 鍵ペア。None なら署名しない/検証もしない。
     keypair: std::sync::RwLock<Option<std::sync::Arc<enchudb_oplog::keys::Keypair>>>,
-    /// v32 Phase C: 他 peer の pubkey TOFU ストア。Syncer が verify に使う。
+    /// 他 peer の pubkey TOFU ストア。Syncer が verify に使う。
     pubkeys: std::sync::Arc<enchudb_oplog::keys::PubkeyStore>,
-    /// v32 Phase C: ACL(書き込み許可 peer の集合)。Syncer が enforce する。
+    /// ACL(書き込み許可 peer の集合)。Syncer が enforce する。
     acl: std::sync::Arc<crate::acl::Acl>,
-    /// v32 エッジ用: true なら書き込み API が panic、sync 経由 (remote_*_apply) のみ受ける。
+    /// エッジ replica 用: true なら書き込み API が panic、sync 経由 (remote_*_apply) のみ受ける。
     is_replica: std::sync::atomic::AtomicBool,
     /// CRDT mesh mode: true なら `remote_*_apply` で受信した op を **元 HLC/author/署名のまま**
     /// 自分の WAL にも `append_relayed` で記録し、 次の publish で他 peer に gossip する。
@@ -1940,6 +2025,32 @@ pub struct Engine {
     /// consumer thread が背景 fsync 後に新規 commit を `_sync_ops` へ転送する。
     /// `enable_sync_tables` 有効化前は使われない (= 0)、 後は単調前進。
     sync_ops_offset: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// fold ↔ bridge の check-then-act を lock 下の再検証で弾いた回数。
+    /// `wal_fold_safe()` (lock 外) が true を返した後、 `try_reset_if` の述語
+    /// (lock 内) が false になった = まさにその窓を踏んだケース。 0 でないことは
+    /// 「この race は実在し、 再検証が実際に record を救っている」 の証拠になる。
+    fold_race_saves: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// bridge cursor が head を追い越した (= fold ↔ transfer の lost update) のを
+    /// 検出して巻き戻した回数。 0 でないなら直列化が破れている。
+    sync_ops_cursor_repairs: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// #217: ack prefix walk が dead row (payload 欠落 / decode 不能 = 構造的に
+    /// 配送不能) を削除して越えた回数。 0 でないなら bridge が壊れた payload を
+    /// 書いたことがある (要調査) — が、 ring を permanent blocker にはしない。
+    sync_dead_rows_purged: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// #217: ack prefix walk の再開点 (peer → 検証済み prefix 末尾 lsn)。
+    /// **意図的に in-memory** — 永続の `_sync_peers.consumed_lsn` は旧実装
+    /// (降順 first-match) が over-ack した値を含みうるので、 session 最初の walk は
+    /// これを信用せず lsn 0 から全 ring を検証し直す (移行 heal)。 entry の有無が
+    /// 「この session で検証済みか」の marker を兼ねる。
+    ack_walk_resume: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, u32>>>,
+    /// #221: `_sync_ops` row の purge (delete + free list への slot 返却) を atomic に
+    /// する専用 lock。 `Engine::delete` は「実際に消したか」を返さない (冪等) ので、
+    /// lock 無しだと並行 purge (`absorb_pull_acks` は複数 peer からの並行 pull で
+    /// 並行実行される) が同じ slot を free list に**二重 push** → 後続の
+    /// `entity_in("_sync_ops")` が同じ eid を二回払い出し、 bridge row が上書きで
+    /// 消える (silent)。 lock 内で「row がまだ生きているか」を再検証してから
+    /// delete + push する。
+    sync_ops_purge_lock: std::sync::Arc<std::sync::Mutex<()>>,
     /// 0.8.11 (issue: stress_10k_cycle flaky): `transfer_oplog_to_sync_ops` の
     /// 排他 lock。 0.8.0 で `concurrentize_with_oplog` の background consumer thread
     /// が自動 transfer を呼ぶようになったが、 手動 transfer との並列実行で
@@ -1957,14 +2068,14 @@ pub struct Engine {
     /// 0.7.0 Phase 4: `_sync_ops` row に振る単調 lsn (= u32 の publish_since cursor)。
     /// `entity_in` の eid とは別、 reclaim で row が消えても lsn は単調維持される。
     next_sync_lsn: std::sync::Arc<std::sync::atomic::AtomicU32>,
-    /// v33: 受信した Vocab op の `(author_peer, remote_vid) → local_vid` mapping。
+    /// 受信した Vocab op の `(author_peer, remote_vid) → local_vid` mapping。
     /// Symbol 型 himo の Tie を受信した時に remote_vid を local_vid に変換して apply する。
     /// peer-local に保持(replica でも独立、open 時は空、受信で徐々に埋まる)。
     peer_vocab_map: std::sync::RwLock<std::collections::HashMap<(enchudb_oplog::PeerId, u32), u32>>,
     /// `peer_vocab_map` が最後の persist 以降に変化したか。 pull ごとに sidecar を
     /// 書き直さないための dirty flag (写像は単調増加なので「増えたか」で足りる)。
     peer_vocab_map_dirty: std::sync::atomic::AtomicBool,
-    /// v34: read-only モード。 true なら書き込み API は error/panic。 open_readonly で立つ。
+    /// read-only モード。 true なら書き込み API は error/panic。 open_readonly で立つ。
     /// `is_replica` は「直 write 拒否、 Syncer 経由は受ける」、 こちらは「一切 write 不可」。
     is_readonly: std::sync::atomic::AtomicBool,
     /// 0.8.2: build phase の sidecar fsync 抑止。 schema crate が
@@ -1972,7 +2083,14 @@ pub struct Engine {
     /// false に戻して 1 度だけ explicit に `persist_tables()` を呼ぶ。
     /// macOS APFS で N table 宣言時の N×fsync (= 1 fsync 5-7ms) を 1 回に圧縮。
     defer_tables_persist: std::sync::atomic::AtomicBool,
-    /// v34: writer lock の保持 fd。 open_writer / create_* で `.db.lock` sidecar を
+    /// #190: sidecar persist (`.tables` / `.eidmap` / `.vocabmap`) の直列化 lock。
+    /// tmp 名が sidecar ごとに固定なので、 同一 sidecar を 2 thread (consumer の
+    /// `try_persist_tables` と pull 側の `persist_sync_state`) が同時に書くと
+    /// truncate し合って torn install / rename ENOENT / 新旧逆転 install が起きる。
+    /// state の snapshot (serialize) から rename までを丸ごとこの lock 下に置く —
+    /// serialize も lock 内なので「後から取った方が必ず新しい状態を書く」が成立する。
+    sidecar_persist_lock: std::sync::Mutex<()>,
+    /// writer lock の保持 fd。 open_writer / create_* で `.db.lock` sidecar を
     /// flock(LOCK_EX)、 Engine drop で fd close = lock release。 readonly では None。
     /// 多 process write の同 .db 競合を防ぐ (sqlite WAL モード相当)。
     #[cfg(not(target_arch = "wasm32"))]
@@ -1982,9 +2100,8 @@ pub struct Engine {
 
 impl Engine {
     /// 現行の単独 Engine を作る(WAL 無し、&mut self で mutation)。
-    /// v32 以前: `Engine::create` の別名。
-    /// v33 以降: `Engine::create` が WAL 付き `Arc<Self>` を返すようになるため、
-    /// 明示的に単独 Engine が欲しい場合はこちらを使う。
+    /// 元は `Engine::create` の別名だったが、現在の `Engine::create` は WAL 付き
+    /// `Arc<Self>` を返すため、明示的に単独 Engine が欲しい場合はこちらを使う。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create_standalone(path: &str) -> io::Result<Self> {
         Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)
@@ -2159,7 +2276,7 @@ impl Engine {
         mmap[H_CELL_VERSION..H_CELL_VERSION + 4]
             .copy_from_slice(&(layout.has_cell_version() as u32).to_le_bytes());
 
-        // v28: ヘッダ整合性 CRC
+        // ヘッダ整合性 CRC
         write_header_crc(&mut mmap);
 
         let base = mmap.as_mut_ptr();
@@ -2252,13 +2369,23 @@ impl Engine {
             sync_ops_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 enchudb_oplog::oplog::HEADER_SIZE as u64,
             )),
+            fold_race_saves: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ack_walk_resume: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            sync_ops_purge_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
+            faults: std::sync::Arc::new(std::array::from_fn(|_| {
+                std::sync::atomic::AtomicU64::new(0)
+            })),
+            last_fault_warn_ms: std::sync::atomic::AtomicU64::new(0),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
+            sidecar_persist_lock: std::sync::Mutex::new(()),
             _writer_lock: Some(writer_lock),
             backing: Backing::Mmap(mmap),
         })
@@ -2597,22 +2724,31 @@ impl Engine {
             sync_ops_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 enchudb_oplog::oplog::HEADER_SIZE as u64,
             )),
+            fold_race_saves: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ack_walk_resume: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            sync_ops_purge_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
+            faults: std::sync::Arc::new(std::array::from_fn(|_| {
+                std::sync::atomic::AtomicU64::new(0)
+            })),
+            last_fault_warn_ms: std::sync::atomic::AtomicU64::new(0),
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
+            sidecar_persist_lock: std::sync::Mutex::new(()),
             _writer_lock: Some(writer_lock),
             backing: Backing::Growable(map),
         })
     }
 
     /// 現行の単独 Engine を開く(WAL 無し、&mut self で mutation)。
-    /// v32 以前: `Engine::open` の別名。
-    /// v33 以降: `Engine::open` が WAL 付き `Arc<Self>` を返すようになるため、
-    /// 明示的に単独 Engine が欲しい場合はこちらを使う。
+    /// 元は `Engine::open` の別名だったが、現在の `Engine::open` は WAL 付き
+    /// `Arc<Self>` を返すため、明示的に単独 Engine が欲しい場合はこちらを使う。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_standalone(path: &str) -> io::Result<Self> {
         Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ true, /*readonly=*/ false)
@@ -2664,7 +2800,7 @@ impl Engine {
                 ),
             }
         }
-        // v29: ファイルサイズ検証 — truncate で SIGBUS を防ぐ
+        // ファイルサイズ検証 — truncate で SIGBUS を防ぐ
         let file_size = file.metadata()?.len();
         Self::validate_file_size(&file, file_size)?;
         let mmap = unsafe { MmapMut::map_mut(&file)? };
@@ -2785,7 +2921,7 @@ impl Engine {
 
     /// 全 region の CRC テーブルを計算する。
     ///
-    /// v29 issue7 fix: vocab/himoreg 領域の header には index clean flag (offset
+    /// issue7 fix: vocab/himoreg 領域の header には index clean flag (offset
     /// 12..16) があり、 open 時に必ず flip される (clean=true → false)。 この 4
     /// バイトを CRC 計算から除外することで、 seal_integrity で焼いた `.crc` が
     /// 次回 open でも変わらず検証 OK になる。 clean flag の値は msync 直後に
@@ -2844,7 +2980,7 @@ impl Engine {
         let crc_path = crc_path_for(&self.path);
         let stored = match CrcTable::load(&crc_path)? {
             Some(t) => t,
-            None => return Ok(()), // v28 以前の DB 互換
+            None => return Ok(()), // `.crc` sidecar の無い DB 互換
         };
         let expected = self.compute_region_crc_table();
         let mismatches = stored.diff(&expected);
@@ -3045,7 +3181,7 @@ impl Engine {
         //
         // - EAGER (0、 default、 legacy zero-fill 含む): file_size は
         //   layout.total_size と一致が必須。 不足は accidental truncation /
-        //   ファイル破損 → エラーで弾く (v29 crash safety)。
+        //   ファイル破損 → エラーで弾く (crash safety)。
         // - GROWABLE (1): file_size < total_size でも正常 (variable cluster
         //   未コミット)。 ftruncate で sparse 拡張して mmap 用に揃える
         //   (実 disk usage はゼロ、 各 store の load() は MAGIC missing で
@@ -3198,6 +3334,11 @@ impl Engine {
                     stats.bytes_moved += bytes.len() as u64;
                     leaf.insert(bytes)
                 };
+                if new_off == u32::MAX {
+                    // #167: 移送先を確保できない (commit を伸ばせない)。 cell は旧
+                    // offset を指したままにして、 この cell の移送は諦める。
+                    continue;
+                }
                 col.set(eid, &(new_off + 1).to_le_bytes());
                 stats.cells_moved += 1;
             }
@@ -3296,7 +3437,7 @@ impl Engine {
                 FILE_VERSION_LEGACY_V6, FILE_VERSION_LEGACY_V5, FILE_VERSION_LEGACY_V4
             ));
         }
-        // v28: ヘッダ整合性 CRC 検証(stored == 0 は v27 以前の DB として許容)
+        // ヘッダ整合性 CRC 検証(stored == 0 は header CRC 導入以前の DB として許容)
         verify_header_crc(buf)?;
         // #123 (v8): writer open は header version を v8 へ上げる。 この open で vocab index は
         // 新 slot 関数 (上位ビット) で書き直されるので、 version を据え置くと **index magic を
@@ -3520,19 +3661,29 @@ impl Engine {
             sync_ops_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 enchudb_oplog::oplog::HEADER_SIZE as u64,
             )),
+            fold_race_saves: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ack_walk_resume: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            sync_ops_purge_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             last_persist_warn_ms: std::sync::atomic::AtomicU64::new(0),
+            faults: std::sync::Arc::new(std::array::from_fn(|_| {
+                std::sync::atomic::AtomicU64::new(0)
+            })),
+            last_fault_warn_ms: std::sync::atomic::AtomicU64::new(0),
             next_sync_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             transfer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
+            sidecar_persist_lock: std::sync::Mutex::new(()),
             #[cfg(not(target_arch = "wasm32"))]
             _writer_lock: None, // caller (open_internal) が後から差し替える
             backing,
         };
 
-        // v32: header から peer_id を復元
+        // header から peer_id を復元
         {
             let hdr = eng.backing.header_mut();
             let peer = u32::from_le_bytes(hdr[H_PEER_ID..H_PEER_ID + 4].try_into().unwrap());
@@ -3567,7 +3718,7 @@ impl Engine {
         Ok(eng)
     }
 
-    // ──── v32: エッジ向け read-only replica ────
+    // ──── エッジ向け read-only replica ────
 
     /// 既存 DB を read-only replica として開く。
     /// 書き込み API (tie / untie / delete / content / entity 等) は panic する。
@@ -3750,6 +3901,7 @@ impl Engine {
         let _guard = self.transfer_lock.lock().unwrap();
 
         let from = self.sync_ops_offset.load(Ordering::Acquire);
+        let trace = Self::trace_bridge_enabled();
         // #77-H4: cursor は「読み切った commit 済み group の終端」までしか
         // 進めない。 scan 後の wal.head() 再読は、 書き込み途中 record での
         // break 位置〜head 間の record を恒久 skip していた (#63 と同 class)。
@@ -3758,18 +3910,38 @@ impl Engine {
         // ため。 これが無いと group 全体を retry することになり、 backlog が ring 容量を
         // 超えると先頭 K 件を永久に再挿入し続けて進行しない。
         let (records, committed_end) = wal.iter_committed_from_with_offsets(from);
+        if trace {
+            eprintln!(
+                "[bridge] scan from={from} committed_end={committed_end} head={} cp={} records={}",
+                wal.head(),
+                wal.checkpoint(),
+                records.len(),
+            );
+        }
         if records.is_empty() {
             // 空 commit group だけ読み進んだ場合も cursor は安全に前進できる
-            self.sync_ops_offset.store(committed_end, Ordering::Release);
+            self.advance_sync_ops_cursor(from, committed_end);
             return 0;
         }
 
         // himo_id を 1 度 lookup (= hot path での文字列引きを避ける)
         let lsn_hid = match self.himo_id("_sync_ops.lsn") { Some(h) => h as u16, None => return 0 };
-        let peer_id_hid = self.himo_id("_sync_ops.peer_id").unwrap() as u16;
-        let op_type_hid = self.himo_id("_sync_ops.op_type").unwrap() as u16;
-        let hlc_wall_lo_hid = self.himo_id("_sync_ops.hlc_wall_lo").unwrap() as u16;
-        let payload_hid = self.himo_id("_sync_ops.payload").unwrap() as u16;
+        // #59: 直前の lsn は None を graceful に扱っているのに、 ここだけ unwrap で
+        // panic していた (非対称)。 sync tables が部分定義な DB で host を殺す。
+        let (Some(peer_id_hid), Some(op_type_hid), Some(hlc_wall_lo_hid), Some(payload_hid)) = (
+            self.himo_id("_sync_ops.peer_id"),
+            self.himo_id("_sync_ops.op_type"),
+            self.himo_id("_sync_ops.hlc_wall_lo"),
+            self.himo_id("_sync_ops.payload"),
+        ) else {
+            return 0;
+        };
+        let (peer_id_hid, op_type_hid, hlc_wall_lo_hid, payload_hid) = (
+            peer_id_hid as u16,
+            op_type_hid as u16,
+            hlc_wall_lo_hid as u16,
+            payload_hid as u16,
+        );
 
         // 0.8.11: 自己再帰 sync の循環を断つ filter。
         // `_sync_ops` / `_sync_peers` 配下の write (= ack_sync の watermark
@@ -3807,7 +3979,8 @@ impl Engine {
                 | enchudb_oplog::oplog::DecodedOp::Delete { eid }
                 | enchudb_oplog::oplog::DecodedOp::Content { eid, .. }
                 | enchudb_oplog::oplog::DecodedOp::TieNamed { eid, .. }
-                | enchudb_oplog::oplog::DecodedOp::TieLeaf { eid, .. } => is_internal_eid(*eid),
+                | enchudb_oplog::oplog::DecodedOp::TieLeaf { eid, .. }
+                | enchudb_oplog::oplog::DecodedOp::TieRef { eid, .. } => is_internal_eid(*eid),
                 enchudb_oplog::oplog::DecodedOp::Commit => false,
                 enchudb_oplog::oplog::DecodedOp::Vocab { .. } => false,
             };
@@ -3825,11 +3998,33 @@ impl Engine {
             // 留める。 これは 0.10.x まで silent に断片化していた潜在バグの封鎖。
             let self_peer = wal.peer_id();
             let mut resigned: Option<enchudb_oplog::oplog::ResignedRecord> = None;
+            // #183: この record を TieRef へ書き換えて発送したか (op_type metadata 用)
+            let mut sent_as_tie_ref = false;
             if rec.author_peer == self_peer {
-                let ref_to_replica = match &rec.op {
-                    enchudb_oplog::oplog::DecodedOp::Tie { himo_id, value, .. } => {
-                        self.himo_is_ref(*himo_id)
+                // #183: Ref 値が translated foreign entity を指す self-authored Tie は
+                // target の世界番号 (逆写像で復元) を同乗させた **TieRef** に書き換えて
+                // 発送する — 0.11.0 の「残る制約」(wire の u32 value に世界番号が
+                // 入らない) の解消。逆写像が引けない場合と TieNamed の Ref は従来
+                // どおり skip + 一度だけ warn (安全側、silent 断片化はさせない)。
+                let mut tie_ref: Option<(u64, u64)> = None; // (target_world, 元 row eid)
+                let ref_unsendable = match &rec.op {
+                    enchudb_oplog::oplog::DecodedOp::Tie { eid, himo_id, value } => {
+                        if self.himo_is_ref(*himo_id)
                             && self.eid_translator.is_translated_local(*value)
+                        {
+                            match self.eid_translator.reverse(*value) {
+                                Some((owner, owner_local)) => {
+                                    tie_ref = Some((
+                                        enchudb_oplog::make_eid(owner, owner_local),
+                                        *eid,
+                                    ));
+                                    false
+                                }
+                                None => true, // 逆写像なし = 元 entity を導けない
+                            }
+                        } else {
+                            false
+                        }
                     }
                     enchudb_oplog::oplog::DecodedOp::TieNamed { himo_kind, value, .. } => {
                         *himo_kind == crate::himo_store::ValueType::Ref as u8
@@ -3837,12 +4032,12 @@ impl Engine {
                     }
                     _ => false,
                 };
-                if ref_to_replica {
+                if ref_unsendable {
                     if !self.warned_ref_to_replica.swap(true, Ordering::Relaxed) {
                         eprintln!(
                             "[enchudb] warning: local Ref write pointing at a replicated \
-                             foreign entity is NOT propagated to peers (u32 wire value \
-                             cannot carry a foreign entity id, request10 follow-up)."
+                             foreign entity could not be propagated (reverse eid mapping \
+                             missing, or named-himo Ref) — kept local-only (#183)."
                         );
                     }
                     done_end = Some(*rec_end);
@@ -3854,24 +4049,45 @@ impl Engine {
                     | enchudb_oplog::oplog::DecodedOp::Delete { eid }
                     | enchudb_oplog::oplog::DecodedOp::Content { eid, .. }
                     | enchudb_oplog::oplog::DecodedOp::TieNamed { eid, .. }
-                    | enchudb_oplog::oplog::DecodedOp::TieLeaf { eid, .. } => {
+                    | enchudb_oplog::oplog::DecodedOp::TieLeaf { eid, .. }
+                    | enchudb_oplog::oplog::DecodedOp::TieRef { eid, .. } => {
                         Some(enchudb_oplog::eid_local(*eid))
                     }
                     _ => None,
                 };
-                if let Some(local) = row_local {
-                    if let Some((owner, owner_local)) = self.eid_translator.reverse(local) {
-                        let world = enchudb_oplog::make_eid(owner, owner_local);
-                        let kp_guard = self.keypair.read().unwrap();
-                        let kp = kp_guard.as_deref();
-                        match enchudb_oplog::oplog::resign_with_eid(rec, world, kp) {
-                            Some(r) => resigned = Some(r),
-                            // eid 持ち op で None は起きないはずだが、 起きたら
-                            // 発送せず local-only に留める (安全側)
-                            None => {
-                                done_end = Some(*rec_end);
-                                continue;
-                            }
+                // 行 eid 自体が translated foreign なら世界番号へ書き戻す (0.11 #76)
+                let row_world = row_local.and_then(|local| {
+                    self.eid_translator
+                        .reverse(local)
+                        .map(|(owner, owner_local)| enchudb_oplog::make_eid(owner, owner_local))
+                });
+                if let Some((target_world, orig_eid)) = tie_ref {
+                    let new_eid = row_world.unwrap_or(orig_eid);
+                    let kp_guard = self.keypair.read().unwrap();
+                    let kp = kp_guard.as_deref();
+                    match enchudb_oplog::oplog::resign_as_tie_ref(rec, new_eid, target_world, kp)
+                    {
+                        Some(r) => {
+                            resigned = Some(r);
+                            sent_as_tie_ref = true;
+                        }
+                        // Tie 以外で None だが tie_ref は Tie でしか立たない。
+                        // 万一の場合も発送せず local-only に留める (安全側)
+                        None => {
+                            done_end = Some(*rec_end);
+                            continue;
+                        }
+                    }
+                } else if let Some(world) = row_world {
+                    let kp_guard = self.keypair.read().unwrap();
+                    let kp = kp_guard.as_deref();
+                    match enchudb_oplog::oplog::resign_with_eid(rec, world, kp) {
+                        Some(r) => resigned = Some(r),
+                        // eid 持ち op で None は起きないはずだが、 起きたら
+                        // 発送せず local-only に留める (安全側)
+                        None => {
+                            done_end = Some(*rec_end);
+                            continue;
                         }
                     }
                 }
@@ -3892,7 +4108,7 @@ impl Engine {
                     //   ちょうど 1 回だけ挿入され、 重複も損失も進行不能も無い。
                     //   ring が空けば必ず続きから再開する。
                     if let Some(end) = done_end {
-                        self.sync_ops_offset.store(end, Ordering::Release);
+                        self.advance_sync_ops_cursor(from, end);
                     }
                     if !self.warned_sync_ops_full.swap(true, Ordering::Relaxed) {
                         eprintln!(
@@ -3907,18 +4123,34 @@ impl Engine {
             };
             count += 1;
             let lsn = self.next_sync_lsn.fetch_add(1, Ordering::AcqRel);
+            if trace {
+                eprintln!(
+                    "[bridge]   row lsn={lsn} eid={row_eid} op={:?}",
+                    match &rec.op {
+                        enchudb_oplog::oplog::DecodedOp::Tie { value, himo_id, .. } =>
+                            format!("Tie(himo={himo_id},val={value})"),
+                        other => format!("{other:?}"),
+                    }
+                );
+            }
             self.tie_to_by_id(row_eid, lsn_hid, lsn);
             self.tie_to_by_id(row_eid, peer_id_hid, rec.author_peer);
-            // DecodedOp variant を tag (Tie=0, Untie=1, Delete=2, Content=3, Commit=4, Vocab=5, TieNamed=6, TieLeaf=7)
-            let op_type = match &rec.op {
-                enchudb_oplog::oplog::DecodedOp::Tie { .. } => 0,
-                enchudb_oplog::oplog::DecodedOp::Untie { .. } => 1,
-                enchudb_oplog::oplog::DecodedOp::Delete { .. } => 2,
-                enchudb_oplog::oplog::DecodedOp::Content { .. } => 3,
-                enchudb_oplog::oplog::DecodedOp::Commit => 4,
-                enchudb_oplog::oplog::DecodedOp::Vocab { .. } => 5,
-                enchudb_oplog::oplog::DecodedOp::TieNamed { .. } => 6,
-                enchudb_oplog::oplog::DecodedOp::TieLeaf { .. } => 7,
+            // DecodedOp variant を tag (Tie=0, Untie=1, Delete=2, Content=3, Commit=4, Vocab=5, TieNamed=6, TieLeaf=7, TieRef=8)
+            // #183: Tie → TieRef へ書き換えて発送した record は payload に合わせて 8。
+            let op_type = if sent_as_tie_ref {
+                8
+            } else {
+                match &rec.op {
+                    enchudb_oplog::oplog::DecodedOp::Tie { .. } => 0,
+                    enchudb_oplog::oplog::DecodedOp::Untie { .. } => 1,
+                    enchudb_oplog::oplog::DecodedOp::Delete { .. } => 2,
+                    enchudb_oplog::oplog::DecodedOp::Content { .. } => 3,
+                    enchudb_oplog::oplog::DecodedOp::Commit => 4,
+                    enchudb_oplog::oplog::DecodedOp::Vocab { .. } => 5,
+                    enchudb_oplog::oplog::DecodedOp::TieNamed { .. } => 6,
+                    enchudb_oplog::oplog::DecodedOp::TieLeaf { .. } => 7,
+                    enchudb_oplog::oplog::DecodedOp::TieRef { .. } => 8,
+                }
             };
             self.tie_to_by_id(row_eid, op_type_hid, op_type);
             // hlc.wall は u64 ms-since-epoch、 下位 32bit のみ保持 (= ~50 日サイクル
@@ -3945,10 +4177,40 @@ impl Engine {
         // 全部転送できた、 offset を「読み切った commit 済み終端」に進める (#77-H4)。
         // committed_end は最後の Commit record の直後なので、 最終 record の終端
         // (done_end) より必ず先に居る。
-        self.sync_ops_offset.store(committed_end, Ordering::Release);
+        if trace {
+            eprintln!("[bridge] done inserted={count} offset:={committed_end}");
+        }
+        self.advance_sync_ops_cursor(from, committed_end);
         // 満杯が解消して完走した — 次の満杯では再び warn する
         self.warned_sync_ops_full.store(false, Ordering::Relaxed);
         count
+    }
+
+    /// transfer の cursor 前進。 **入口で読んだ `from` からの CAS** で行う。
+    ///
+    /// transfer は入口で `from` を読み、 scan → row insert のあと最後に cursor を
+    /// store する。 その間に fold が cursor を巻き戻していた場合、 素の store は
+    /// 巻き戻しを stale 値で上書きしてしまう (= cursor が head を追い越して固定、
+    /// 新 ring の record が永久に scan 対象外)。 CAS が外れたら **store しない**:
+    /// 巻き戻し後の位置から読み直され、 最悪 重複配布で済む (apply は冪等)。
+    ///
+    /// 呼び出し側は `transfer_lock` を保持しているので平常時 CAS は必ず成功する。
+    /// 失敗は 「fold との直列化が破れた」 の signal なので数える。
+    fn advance_sync_ops_cursor(&self, from: u64, to: u64) {
+        use std::sync::atomic::Ordering;
+        if self
+            .sync_ops_offset
+            .compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.sync_ops_cursor_repairs.fetch_add(1, Ordering::Relaxed);
+            if Self::trace_bridge_enabled() {
+                eprintln!(
+                    "[bridge] cursor CAS lost ({from} → {to}); keeping {} (fold が巻き戻した)",
+                    self.sync_ops_offset.load(Ordering::Acquire),
+                );
+            }
+        }
     }
 
     /// oplog ring buffer が `try_reset` で head を HEADER_SIZE に巻き戻したとき、
@@ -3985,7 +4247,28 @@ impl Engine {
         let offset = self
             .sync_ops_offset
             .load(std::sync::atomic::Ordering::Acquire);
-        if offset >= wal.head() {
+        let head = wal.head();
+        // cursor が head を **追い越している** のは不整合。 起きうる道は fold の
+        // 巻き戻しと in-flight transfer の store の race (lost update) で、 この状態を
+        // `offset >= head` として 「追いつき済み」 と読むと、 新 ring に積まれた
+        // 未 bridge record を畳み続けて無言の恒久欠落になる (実測: 300 iter で 1 件)。
+        // 畳まず、 cursor を ring 先頭に戻して拾い直させる (= 最悪 重複配布、
+        // apply は冪等なので損失より軽い)。 黙って直さない — 数えて警告する。
+        if offset > head {
+            self.sync_ops_cursor_repairs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.sync_ops_offset.store(
+                enchudb_oplog::oplog::HEADER_SIZE as u64,
+                std::sync::atomic::Ordering::Release,
+            );
+            eprintln!(
+                "[enchudb] warning: sync bridge cursor ({offset}) overtook oplog head ({head}) — \
+                 rewound to ring start to avoid dropping un-bridged records \
+                 (records already delivered may be re-sent; apply is idempotent)"
+            );
+            return false;
+        }
+        if offset >= head {
             return true;
         }
         // offset < head でも、 WAL が「Commit 1 個すら append できない」満杯
@@ -4006,6 +4289,58 @@ impl Engine {
             return records.is_empty();
         }
         false
+    }
+
+    /// `ENCHU_TRACE_BRIDGE=1` のときだけ有効になる、 oplog→`_sync_ops` bridge と
+    /// ring fold の系列トレース。 「`oplog_sync()` は成功したのに record が
+    /// `_sync_ops` に無い」 類の欠落は、 事後状態 (head/checkpoint/offset) だけでは
+    /// どの段で落ちたか判別できないため、 段ごとに出す。
+    pub fn trace_bridge_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("ENCHU_TRACE_BRIDGE").is_ok_and(|v| v != "0"))
+    }
+
+    /// `try_reset_if` の述語として `append_lock` 保持下で呼ばれる `wal_fold_safe`。
+    ///
+    /// 判定内容は `wal_fold_safe` と同一。 違いは **false だった回数を数える**点だけ。
+    /// lock 外の pre-check が true を返した後にここで false になるのは、 pre-check と
+    /// fold の間に append + `advance_checkpoint` が割り込んだ場合だけなので、
+    /// この counter は check-then-act の窓を踏んだ回数そのものになる。
+    pub fn wal_fold_safe_locked(&self) -> bool {
+        let safe = self.wal_fold_safe();
+        if !safe {
+            self.fold_race_saves
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        safe
+    }
+
+    /// fold (`try_reset` + `reset_sync_ops_offset`) を `transfer_oplog_to_sync_ops`
+    /// と直列化するための guard。 fold は cursor を巻き戻すので、 cursor を最後に
+    /// store する transfer と並走してはならない (lost update → 恒久欠落)。
+    pub fn transfer_lock_for_fold(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.transfer_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// bridge cursor が head を追い越したのを検出して修復した回数（観測用）。
+    /// 平常時は 0。 増えていれば fold と transfer の直列化が破れている。
+    pub fn sync_ops_cursor_repairs(&self) -> u64 {
+        self.sync_ops_cursor_repairs
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// bridge cursor の現在値（観測用）。
+    pub fn sync_ops_bridge_offset(&self) -> u64 {
+        self.sync_ops_offset.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// fold ↔ bridge の check-then-act を lock 下の再検証で弾いた回数（観測用）。
+    /// 増えていれば「その窓を踏んだが record は守られた」。
+    pub fn fold_race_saves(&self) -> u64 {
+        self.fold_race_saves
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// WAL がこれ以上いかなる record も受け付けない満杯か（観測用）。
@@ -4059,8 +4394,13 @@ impl Engine {
     /// 前進しないので、 それ自体が **「この peer はここまで消化済み」の到達証明**に
     /// なっている。 これを consumed_lsn に写して reclaim を回せるようにする。
     ///
-    /// `_sync_ops` の生存 row を lsn 降順に走査し、 `hlc <= cursor` の最初の
-    /// (= 最大 lsn の) row で `ack_sync(peer, lsn)` する。
+    /// #217: scalar cursor は「**自 peer が author の row** に対する消化証明」として
+    /// のみ解釈する (= `[(self, cursor)]` + 他 author は ZERO の退化形)。 scalar は
+    /// author を判別できないため、 全 author に適用すると relay 経由の「未知 author
+    /// の古い HLC の row」を受信していないのに消化済みと誤判定する (over-ack →
+    /// 未消化 record の reclaim)。 relay された row (foreign author) は
+    /// [`Engine::ack_sync_up_to_cursors`] の vector ack が来るまで prefix を止める —
+    /// これは保守側で、 消化の証明が無い row を越えないという原則そのもの。
     /// 該当が無い (cursor が最古の生存 row より古い) 場合は ack せず 0 を返す。
     ///
     /// **ack するのは必ず「実在を確認した生存 row の lsn」**であって、 bridge 先端
@@ -4071,14 +4411,81 @@ impl Engine {
     /// 止めても生存リングは同じだけ reclaim でき (`lsn < watermark` の delete なので
     /// rows[0] 未満は全て対象)、 取りこぼした先端は次周回の cursor が拾う。
     ///
-    /// 前提: `_sync_ops` は自 WAL の bridge で lsn と hlc が単調 (gossip の relayed
-    /// append で foreign HLC が混ざる構成では、 降順走査の早期打ち切りにより
-    /// **安全側 (小さめ) の lsn** に落ちる — 過剰 reclaim はしない)。
-    /// 定常状態では cursor が先端付近にあるため走査は数 row で終わる。
+    /// #217: walk は **longest-consumed-prefix** — lsn 昇順に走査し、 消化の証明が
+    /// ある row が続く間だけ前進、 証明の無い row で停止する。 旧実装の降順
+    /// first-match は relay 混在 ring (relayed append が原 HLC 素通しで乗るため
+    /// lsn 順で HLC 非単調) で、 高 lsn の古い HLC row に match して未消化 row を
+    /// watermark の下に巻き込んでいた (over-ack → 未消化 record の reclaim)。
     pub fn ack_sync_up_to_hlc(
         &self,
         peer: enchudb_oplog::PeerId,
         cursor: enchudb_oplog::Hlc,
+    ) -> Result<u32, String> {
+        // author 0 は「peer identity 設定前の local 著作」 (単独 peer 運用 →
+        // 後から sync 参加、 の正規 path) — 定義上 foreign ではないので self と
+        // 同じ扱い。 除外すると set_peer_id 後に永久 prefix blocker になる
+        // (dead row ではないので削除もされない)。
+        let self_peer = self.peer_id();
+        self.ack_sync_prefix(peer, &|author, hlc| {
+            (author == self_peer || author == 0) && hlc <= cursor
+        })
+    }
+
+    /// #217: author 別 cursor (vector) に基づく ack — relay 混在 ring 用の完全形。
+    ///
+    /// `consumed(row) = row.hlc <= cursors[row.author]`、 **cursors に無い author は
+    /// ZERO (= 必ず prefix を止める)**。 未知 author の row は「puller に届いた証明が
+    /// 無い」ので越えない — scalar min への短絡はこの row を消化済みと誤判定する
+    /// (over-ack)。 puller 側の #216 author 別 pull cursor をそのまま渡す。
+    ///
+    /// 将来 note: author 別 cursor は「author 別 lsn substream (ring 分割)」への
+    /// 足場でもある — 単一 ring の prefix walk は最遅 follower / author 1 つで全体が
+    /// pin されるのが celebrity fanout の最終的な scale 限界で、 その時 per-author
+    /// ack が throughput にも効くようになる。
+    pub fn ack_sync_up_to_cursors(
+        &self,
+        peer: enchudb_oplog::PeerId,
+        cursors: &[(enchudb_oplog::PeerId, enchudb_oplog::Hlc)],
+    ) -> Result<u32, String> {
+        self.ack_sync_prefix(peer, &|author, hlc| {
+            cursors.iter().find(|(p, _)| *p == author).is_some_and(|(_, c)| hlc <= *c)
+        })
+    }
+
+    /// #217 core: `consumed(author, hlc)` が **先頭から連続して成り立つ最長 prefix**
+    /// の末尾 lsn へ `ack_sync(peer, lsn)` する。 前進が無ければ ack せず 0。
+    ///
+    /// - **前回 walk からの再開**: prefix は peer ごとに単調なので、 走査は前回の
+    ///   検証済み末尾 (`ack_walk_resume`、 in-memory) より先だけ。 昇順 walk は
+    ///   「全部消化済み = 最も健全な状態で ring 全 row を decode する」コスト反転を
+    ///   持つが、 再開により償却で「前回 walk 以降の新規 row 数」に落ちる。
+    ///   reclaim 済み row は必ず `lsn < watermark <=` 検証済み末尾なので走査に
+    ///   穴は生じない。
+    /// - **永続 `consumed_lsn` を再開点に使わない (移行 heal)**: 0.23.x 以前の
+    ///   降順 first-match は over-ack した値を `_sync_peers.consumed_lsn` に残して
+    ///   いる可能性がある。 これを再開点に信用すると「真の prefix と膨張値の間の
+    ///   row」が二度と検査されず、 次の reclaim で未消化のまま消える (#217 が
+    ///   塞いだ loss が既存 DB で一度起きる)。 そこで session 最初の walk は lsn 0
+    ///   から全 ring を検証し直し、 検証結果が stored より小さければ**下方修正で
+    ///   上書き**する (watermark が下がる = 保守側)。 残余窓: この session で一度も
+    ///   ack しない peer の膨張 stored は watermark に残り、 pressure reclaim が
+    ///   その嘘を purge しうる — ただし purge は `record_reclaimed_floor` で floor を
+    ///   上げるので、 当該 peer は次の pull で `history_truncated` → bootstrap で
+    ///   回復する (= loss ではなく**余分な bootstrap への縮退**)。 回復経路が無い
+    ///   例外は 2 つ: decode 不能 row の purge は floor に現れない (#218) /
+    ///   state provider 未登録の構成では truncation が行き止まり (relay topology
+    ///   では `serve_state` 必須)。 いずれも 0.23.0 の absorb + reclaim が既に
+    ///   持っていた露出で、 heal はそれを ack する peer から順に厳密に縮める。
+    /// - **dead row**: payload 欠落 / decode 不能な row は構造的に配送不能
+    ///   (`collect_records_since` も skip する = 誰の cursor もそこを消化と証明
+    ///   できない) なので、 prefix blocker にすると全 peer の ack が永久にそこで
+    ///   止まり ring が満杯になる (#149 で潰した backpressure の復活)。 consumption を
+    ///   偽らないまま前進するため、 **削除して越える** (計数 + warn、
+    ///   [`Engine::sync_dead_rows_purged`])。 削除 slot は ring free list へ返す。
+    fn ack_sync_prefix(
+        &self,
+        peer: enchudb_oplog::PeerId,
+        consumed: &dyn Fn(enchudb_oplog::PeerId, enchudb_oplog::Hlc) -> bool,
     ) -> Result<u32, String> {
         if !self.sync_tables_enabled() {
             return Err("sync tables not enabled (call enable_sync first)".into());
@@ -4086,40 +4493,248 @@ impl Engine {
         let lsn_hid = self.himo_id("_sync_ops.lsn").ok_or("missing _sync_ops.lsn")? as u16;
         let payload_hid =
             self.himo_id("_sync_ops.payload").ok_or("missing _sync_ops.payload")? as u16;
+        let session_start = {
+            let guard = self.ack_walk_resume.lock().unwrap();
+            guard.get(&peer).copied()
+        };
+        let start = session_start.unwrap_or(0);
 
-        // 生存 row の (lsn, eid) を降順に。
+        // 前回 walk より先の生存 row を lsn 昇順に。
         let mut rows: Vec<(u32, u64)> = self
             .entities_with_himo(lsn_hid)
             .into_iter()
             .filter_map(|eid| self.get_by_id(eid, lsn_hid).map(|lsn| (lsn, eid)))
+            .filter(|(lsn, _)| *lsn > start)
             .collect();
-        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        rows.sort_by_key(|r| r.0);
 
         // 生存 row 無し = reclaim するものが無い。 消化の証明が無いのに先端へ ack すると
         // 「消化した」という嘘の記録になるので、 何もしない (後続の bridge を次の pull の
-        // cursor が越えたときに通常経路で ack される)。
+        // cursor が越えたときに通常経路で ack される)。 heal も不要 — 膨張 stored が
+        // 過大申告しうるのは生存 row だけで、 それが無いなら失うものが無い。
         if rows.is_empty() {
             return Ok(0);
         }
 
         let mut ack_lsn: u32 = 0;
         for (lsn, eid) in rows.iter() {
-            let Some(payload_vid) = self.get_by_id(*eid, payload_hid) else { continue };
-            let bytes = self.vocab.get(payload_vid).to_vec();
-            let Some(rec) = enchudb_oplog::oplog::decode_sync_ops_payload(&bytes) else {
-                continue;
-            };
-            if rec.hlc <= cursor {
-                // 実在を確認したこの row の lsn で止める。 先端 (`current_sync_lsn`) まで
-                // 進めると snapshot 後に bridge された未 pull record まで ack される。
-                ack_lsn = *lsn;
-                break;
+            let decoded = self
+                .get_by_id(*eid, payload_hid)
+                .map(|vid| self.vocab.get(vid).to_vec())
+                .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b));
+            match decoded {
+                Some(rec) => {
+                    if !consumed(rec.author_peer, rec.hlc) {
+                        break;
+                    }
+                    ack_lsn = *lsn;
+                }
+                None => {
+                    // #221: delete + free list push は専用 lock 下で atomic に。
+                    if self.purge_sync_ops_row(*eid, lsn_hid, *lsn) {
+                        eprintln!(
+                            "[enchudb] sync: purging undeliverable _sync_ops row \
+                             (lsn {lsn}, missing/undecodable payload) — see #217"
+                        );
+                        self.sync_dead_rows_purged
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    ack_lsn = *lsn;
+                }
             }
         }
+
+        // 再開点を更新 (entry の存在 = この session で検証済み、 の marker)。
+        {
+            let mut guard = self.ack_walk_resume.lock().unwrap();
+            let e = guard.entry(peer).or_insert(0);
+            let new_resume = start.max(ack_lsn);
+            if new_resume > *e {
+                *e = new_resume;
+            }
+        }
+
         if ack_lsn > 0 {
+            // session 最初の walk では stored (膨張の可能性) より小さくても上書き =
+            // 下方修正 heal。 2 回目以降は再開走査により単調前進しかしない。
             self.ack_sync(peer, ack_lsn)?;
+        } else if session_start.is_none() {
+            // session 最初の walk で prefix を 1 row も検証できなかった: 膨張 stored が
+            // 生存 row を過大申告している可能性があるので 0 に落とす (reclaim を
+            // 止める側 = 保守的)。 正しい値は後続の ack が再構築する。
+            let stored = self.sync_consumed_lsn_of(peer);
+            if stored > 0 {
+                self.ack_sync(peer, 0)?;
+            }
         }
         Ok(ack_lsn)
+    }
+
+    /// #221: `_sync_ops` の row を 1 件 purge する (delete + ring free list への
+    /// slot 返却)。 **専用 lock 下で「snapshot 当時と同じ row か」を再検証してから**
+    /// 消す。
+    ///
+    /// `Engine::delete` は冪等で戻り値を持たないため、 lock 無しで並行 purge すると
+    /// 同じ slot が free list に二重 push され、 後続の `entity_in("_sync_ops")` が
+    /// 同一 eid を二回払い出して bridge row が silent に上書きされる。 並行経路は
+    /// 実在する: `Syncer::absorb_pull_acks` (→ `reclaim_sync_ops` / ack walk の
+    /// dead row purge) は複数 peer からの並行 pull で並行実行される。
+    ///
+    /// **検証は「生存」ではなく `expected_lsn` との一致で行う (ABA)。** 生存だけを
+    /// 見ると、 T1 が purge → slot が bridge に再利用されて同一 eid に新 row が乗る
+    /// → T2 が stale snapshot で「生存」と判定して**その新 row を消す**、 が成立する
+    /// (しかも slot は pop 済みなので dedupe も効かない)。 `next_sync_lsn` は単調
+    /// 増加なので、 lsn は「同じ row か」の判別子として機能する (再利用後の row は
+    /// 必ず大きい lsn を持つ)。 この窓は ring 再利用が常時走る構成 —
+    /// まさに reclaim + bridge を並行で回す運転 — で開く。
+    ///
+    /// **`free_locals` は `delete` の前に取り、 push まで保持する。** free list への
+    /// producer は本 helper だけではない — `entity_in` の枯渇 slow path から呼ばれる
+    /// [`Engine::rebuild_free_locals`] が range を線形 scan して**非 live な local を
+    /// 穴として push** する。 delete 後 push 前の中間状態でこれが走ると、 同じ slot が
+    /// 両者から独立に push されて二重になる (expected_lsn は「同じ row を 2 者が
+    /// 消す」しか防げない)。 free list を掴んだまま delete すれば rebuild は中間状態を
+    /// 観測できず、 待たされた後は `fl` が非空なので早期 return する。 枯渇は
+    /// 「free list を使い切るまで bridge する」運転で常態なので、 この窓は実運用で開く。
+    ///
+    /// lock 順序は `free_locals` → (delete 内部の) `EntitySet::free_lock` の一方向のみ。
+    /// `EntitySet` 側は Engine の table に触らないので逆転しない。
+    ///
+    /// **コストの注記 (未実測)**: この形で critical section は「Vec への push」から
+    /// 「`delete` 全体 (oplog append + column write + tombstone)」に広がる。 その間
+    /// `entity_in("_sync_ops")` は待つので、 reclaim sweep 中は bridge の row 払い出しが
+    /// row 単位で purge と競合する。 row ごとに解放されるので sweep 全体を止める形では
+    /// ないが、 影響は測っていない — fanout で bridge throughput を見るときの観測点。
+    ///
+    /// 戻り値 `true` = 自分が消した (呼び元は計数して良い)、 `false` = 既に他者が
+    /// 消した / slot が再利用されて別 row になっていた。
+    fn purge_sync_ops_row(
+        &self,
+        eid: enchudb_oplog::EntityId,
+        lsn_hid: u16,
+        expected_lsn: u32,
+    ) -> bool {
+        let _guard = self.sync_ops_purge_lock.lock().unwrap();
+        if self.get_by_id(eid, lsn_hid) != Some(expected_lsn) {
+            return false;
+        }
+        let meta = self
+            .tables
+            .iter()
+            .find(|t| t.name == "_sync_ops")
+            .map(|t| (t.eid_range_lo, t.free_locals.clone(), t.free_locals_nonempty.clone()));
+        let local = enchudb_oplog::eid_local(eid);
+        match meta {
+            Some((lo, free_list, nonempty)) if local >= lo => {
+                let mut list = free_list.lock().unwrap();
+                self.delete(eid);
+                list.push(local - lo);
+                nonempty.store(true, std::sync::atomic::Ordering::Release);
+            }
+            _ => self.delete(eid),
+        }
+        true
+    }
+
+    /// #217: `_sync_peers` に記録済みの `peer` の consumed_lsn。 row 無しは 0。
+    fn sync_consumed_lsn_of(&self, peer: enchudb_oplog::PeerId) -> u32 {
+        let Some(peer_id_hid) = self.himo_id("_sync_peers.peer_id") else { return 0; };
+        let Some(consumed_lsn_hid) = self.himo_id("_sync_peers.consumed_lsn") else { return 0; };
+        self.query_by_id(&[(peer_id_hid as u16, peer)])
+            .into_iter()
+            .next()
+            .and_then(|eid| self.get_by_id(eid, consumed_lsn_hid as u16))
+            .unwrap_or(0)
+    }
+
+    /// #217: ack prefix walk が削除した dead row (配送不能 payload) の累計 (観測用)。
+    /// 平常時は 0。 増えていれば bridge が壊れた payload を書いたことがある。
+    pub fn sync_dead_rows_purged(&self) -> u64 {
+        self.sync_dead_rows_purged
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #227: **下流全員が消化し切った位置** を author 別 HLC で返す (transitive
+    /// watermark の材料)。
+    ///
+    /// relay が author に返す pull-as-ack は「自分が apply した位置」ではいけない。
+    /// reclaim の安全条件は「全 follower が **apply し切った**」であって「配った」
+    /// ではないので、 relay が配った直後に消えると author は「消化済み」と信じて
+    /// 履歴を捨て、 下流が永久欠落する (#191 の裏返しで 1 段深い)。
+    ///
+    /// 導出は既存の永続 state だけで足りる — **新しい記録は増やさない**:
+    ///
+    /// - `lsn <= sync_watermark()` の `_sync_ops` row = 下流全員が消化済み。
+    ///   その範囲の author 別 max HLC がそのまま transitive ack の値。
+    /// - 既に purge された分は `sync_reclaimed_floors()` (#216 で author 別) に
+    ///   author 別 max HLC として残っているので畳み込む。 無帰属 baseline
+    ///   (`u32::MAX`) は author に帰属させられないので**使わない** (保守側)。
+    ///
+    /// `None` = 下流 peer が 1 つも `_sync_peers` に居ない = 「配り切った」の判定
+    /// 材料が無い。 caller は自分の cursor をそのまま使うこと — 葉ノード (中継先の
+    /// 居ない peer) がここで ZERO を返すと author の reclaim を永久に止める。
+    ///
+    /// **既知の残り窓**: 「pull はしたが 1 件も消化していない下流」 は
+    /// `_sync_peers` に行を作らない (`ack_sync_prefix` は ack_lsn 0 では
+    /// `ack_sync` を呼ばない) ので、 下流ゼロと区別できない。 その間 relay は
+    /// full ack する。 塞ぐには pull で行を materialize する必要があるが、
+    /// それは relay に限らず全 author の reclaim 挙動を変える (一度 pull して
+    /// 消えた peer が watermark を 0 に固定 = #149 の失敗形) ので採らない。
+    /// 受け皿は floor + bootstrap (#140 / replica は #226)。
+    pub fn sync_delivered_cursors(&self) -> Option<Vec<(enchudb_oplog::PeerId, enchudb_oplog::Hlc)>> {
+        if !self.sync_tables_enabled() {
+            return None;
+        }
+        let peer_id_hid = self.himo_id("_sync_peers.peer_id")? as u16;
+        let self_peer = self.peer_id();
+        // 下流 (self を除く登録済み peer) が 1 つも無ければ判定材料が無い。
+        let has_downstream = self.entities_with_himo(peer_id_hid).into_iter().any(|eid| {
+            match self.get_by_id(eid, peer_id_hid) {
+                Some(pid) => self_peer == 0 || pid != self_peer,
+                None => false,
+            }
+        });
+        if !has_downstream {
+            return None;
+        }
+
+        let mut out: std::collections::HashMap<enchudb_oplog::PeerId, enchudb_oplog::Hlc> =
+            std::collections::HashMap::new();
+        let mut bump = |author: enchudb_oplog::PeerId, hlc: enchudb_oplog::Hlc| {
+            let e = out.entry(author).or_insert(enchudb_oplog::Hlc::ZERO);
+            if hlc > *e {
+                *e = hlc;
+            }
+        };
+        // purge 済み = 当時の下流全員が消化した範囲。
+        if let Some(entries) = self.read_reclaimed_floor_entries() {
+            for (author, hlc) in entries {
+                if author != u32::MAX {
+                    bump(author, hlc);
+                }
+            }
+        }
+        // 生存 row のうち watermark 以下 (= 下流全員が消化済み)。
+        let watermark = self.sync_watermark();
+        if watermark > 0
+            && let Some(lsn_hid) = self.himo_id("_sync_ops.lsn")
+            && let Some(payload_hid) = self.himo_id("_sync_ops.payload")
+        {
+            for eid in self.entities_with_himo(lsn_hid as u16) {
+                let Some(lsn) = self.get_by_id(eid, lsn_hid as u16) else { continue };
+                if lsn > watermark {
+                    continue;
+                }
+                if let Some(rec) = self
+                    .get_by_id(eid, payload_hid as u16)
+                    .map(|vid| self.vocab.get(vid).to_vec())
+                    .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b))
+                {
+                    bump(rec.author_peer, rec.hlc);
+                }
+            }
+        }
+        Some(out.into_iter().collect())
     }
 
     /// 0.7.0 (Phase 4): 全 peer の最小 consumed_lsn (= reclaim 安全点)。
@@ -4166,32 +4781,435 @@ impl Engine {
         let Some(lsn_hid) = self.himo_id("_sync_ops.lsn") else { return 0; };
         let lsn_hid_u16 = lsn_hid as u16;
 
-        // 0.8.0: _sync_ops table の eid_range_lo を取り、 reclaim 後 free list に
-        // local id を push する (= ring buffer 化)。
-        let sync_ops_meta = self.tables.iter()
-            .find(|t| t.name == "_sync_ops")
-            .map(|t| (t.eid_range_lo, t.free_locals.clone(), t.free_locals_nonempty.clone()));
-
         // _sync_ops 全 row を走査して lsn < watermark を delete
         let rows = self.entities_with_himo(lsn_hid_u16);
+        let payload_hid = self.himo_id("_sync_ops.payload").map(|h| h as u16);
         let mut purged = 0;
+        // #191: purge した record の最大 HLC = 「差分 pull で配れない履歴の上限」。
+        // publish 側はこれを history floor として広告する (生存 record の最小 HLC を
+        // 使うと、消化完了直後の正常な cursor まで gap と誤認する)。
+        // #216: **author 別**に最大を取る — relay 混在 ring では scalar floor が
+        // 「author a の cursor は新しいのに、 author b の reclaim で floor が上がって
+        // 恒常的に truncation 判定」の false positive を作るため (per-author cursor の
+        // 双対として floor も per-author が要る)。
+        let mut reclaimed_max: std::collections::HashMap<u32, enchudb_oplog::Hlc> =
+            std::collections::HashMap::new();
         for eid in rows {
-            if let Some(lsn) = self.get_by_id(eid, lsn_hid_u16) {
-                if lsn < watermark {
-                    let local = enchudb_oplog::eid_local(eid);
-                    self.delete(eid);
-                    // 0.8.0: free list に追加 (= 次回 entity_in("_sync_ops") で再利用)
-                    if let Some((lo, ref free_list, ref nonempty)) = sync_ops_meta {
-                        if local >= lo {
-                            free_list.lock().unwrap().push(local - lo);
-                            nonempty.store(true, std::sync::atomic::Ordering::Release);
+            let Some(lsn) = self.get_by_id(eid, lsn_hid_u16) else { continue };
+            if lsn >= watermark {
+                continue;
+            }
+            if let Some(rec) = payload_hid
+                .and_then(|h| self.get_by_id(eid, h))
+                .map(|vid| self.vocab.get(vid).to_vec())
+                .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b))
+            {
+                let e = reclaimed_max
+                    .entry(rec.author_peer)
+                    .or_insert(enchudb_oplog::Hlc::ZERO);
+                if rec.hlc > *e {
+                    *e = rec.hlc;
+                }
+            }
+            // 0.8.0: free list に追加 (= 次回 entity_in("_sync_ops") で再利用)。
+            // #221: delete + push は専用 lock 下で atomic に (並行 reclaim の二重
+            // push = slot 二重払い出し → bridge row の silent 上書き、を塞ぐ)。
+            if self.purge_sync_ops_row(eid, lsn_hid_u16, lsn) {
+                purged += 1;
+            }
+        }
+        if !reclaimed_max.is_empty() {
+            let entries: Vec<(u32, enchudb_oplog::Hlc)> =
+                reclaimed_max.into_iter().collect();
+            self.record_reclaimed_floors(&entries);
+        }
+        purged
+    }
+
+    /// #191: reclaim で `_sync_ops` から消した record の最大 HLC (全 author 横断)。
+    ///
+    /// `cursor >= floor` の peer は「reclaim で消えた分を全部消化済み」なので
+    /// 差分 pull を続けて良い。`cursor < floor` の peer だけが bootstrap 対象。
+    /// `_sync_peers` の sentinel row (`reclaimed_floor` Leaf) に保存する。row は
+    /// body mmap なので reclaim の delete と durability の運命を共有する
+    /// (crash で両方巻き戻れば pre-reclaim 状態として整合する)。
+    ///
+    /// #216: 内部表現は author 別 map (v2)。 本 API は互換の scalar view
+    /// (= 全 entry の max)。 author 別は [`Engine::sync_reclaimed_floors`]。
+    pub fn sync_reclaimed_floor(&self) -> Option<enchudb_oplog::Hlc> {
+        let entries = self.read_reclaimed_floor_entries()?;
+        entries.iter().map(|(_, h)| *h).max()
+    }
+
+    /// #216: reclaim floor の author 別 view。 relay 混在 ring では scalar floor が
+    /// 「author a の cursor は新しいのに author b の reclaim で恒常 truncation」の
+    /// false positive を作るため、 puller は author 別に `cursor[a] < floor[a]` で
+    /// 判定する (per-author cursor の双対)。
+    ///
+    /// **`(u32::MAX, h)` の entry は「無帰属 baseline」** — 旧 (scalar) 書式時代に
+    /// purge した row の最大 HLC で、 どの author の分かは失われている。 puller は
+    /// これを**全 author に対する下限**として畳み込むこと
+    /// (`effective_floor[a] = max(entry[a], baseline)`)。 これは sound
+    /// (`cursor[a] >= max` なら upgrade 前分 ≤ baseline も後分 ≤ entry[a] も消化済み)
+    /// かつ scalar max fallback より厳密に tight — baseline を越えた cursor の
+    /// author から順に per-author 精度が戻るので、 sentinel を消さなくても自然に
+    /// retire する。 このため **peer id `u32::MAX` は author として使用不可** (予約)。
+    ///
+    /// `None` = floor 記録なし (一度も reclaim していない)。
+    pub fn sync_reclaimed_floors(&self) -> Option<Vec<(u32, enchudb_oplog::Hlc)>> {
+        self.read_reclaimed_floor_entries()
+    }
+
+    /// floor row の生 entry 列 (author, hlc)。 legacy 16B scalar は
+    /// `author = u32::MAX` (無帰属 sentinel) の 1 entry として読む。
+    /// v2 書式: `[0xF2, 0x01, count: u16 LE][author u32 | wall u64 | logical u32 | peer u32 (全て BE)]*`
+    fn read_reclaimed_floor_entries(&self) -> Option<Vec<(u32, enchudb_oplog::Hlc)>> {
+        if !self.sync_tables_enabled() {
+            return None;
+        }
+        let hid = self.himo_id("_sync_peers.reclaimed_floor")? as u16;
+        let row = self.entities_with_himo(hid).into_iter().next()?;
+        let vid = self.get_by_id(row, hid)?;
+        let bytes = self.vocab.get(vid).to_vec();
+        let hlc_at = |b: &[u8]| -> Option<enchudb_oplog::Hlc> {
+            Some(enchudb_oplog::Hlc {
+                wall: u64::from_be_bytes(b[0..8].try_into().ok()?),
+                logical: u32::from_be_bytes(b[8..12].try_into().ok()?),
+                peer: u32::from_be_bytes(b[12..16].try_into().ok()?),
+            })
+        };
+        if bytes.len() == 16 {
+            // legacy scalar (#191 初版)
+            return Some(vec![(u32::MAX, hlc_at(&bytes)?)]);
+        }
+        if bytes.len() < 4 || bytes[0] != 0xF2 || bytes[1] != 0x01 {
+            return None;
+        }
+        let count = u16::from_le_bytes(bytes[2..4].try_into().ok()?) as usize;
+        if bytes.len() != 4 + count * 20 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = 4 + i * 20;
+            let author = u32::from_be_bytes(bytes[off..off + 4].try_into().ok()?);
+            out.push((author, hlc_at(&bytes[off + 4..off + 20])?));
+        }
+        Some(out)
+    }
+
+    /// #191/#216: reclaimed floor を author 別に単調 max で merge する (下がる
+    /// ことは無い)。 himo は lazy に ensure する (fix 前 DB の reopen でも育つ)。
+    /// legacy scalar が残っていれば無帰属 sentinel (`u32::MAX`) entry として
+    /// 温存する — 帰属不明の上限を落とすと silent gap 側に倒れるため。 puller は
+    /// sentinel を全 author への baseline として畳み込む
+    /// ([`Engine::sync_reclaimed_floors`] の doc 参照)。 **`u32::MAX` は author の
+    /// peer id として予約済み** (実 author に使うと legacy baseline と誤分類される)。
+    fn record_reclaimed_floors(&self, candidates: &[(u32, enchudb_oplog::Hlc)]) {
+        let mut merged: std::collections::HashMap<u32, enchudb_oplog::Hlc> = self
+            .read_reclaimed_floor_entries()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let mut changed = false;
+        for (a, h) in candidates {
+            let e = merged.entry(*a).or_insert(enchudb_oplog::Hlc::ZERO);
+            if *h > *e {
+                *e = *h;
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        let hid = match self.ensure_himo_dynamic_in(
+            "_sync_peers",
+            "reclaimed_floor",
+            ValueType::Leaf,
+            0,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("[enchudb] warning: reclaimed_floor himo unavailable ({e}) — history floor will over-approximate after restart");
+                return;
+            }
+        };
+        let row = match self.entities_with_himo(hid).into_iter().next() {
+            Some(r) => r,
+            None => match self.entity_in("_sync_peers") {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[enchudb] warning: reclaimed_floor row unavailable ({e})");
+                    return;
+                }
+            },
+        };
+        let mut entries: Vec<(u32, enchudb_oplog::Hlc)> = merged.into_iter().collect();
+        entries.sort_by_key(|(a, _)| *a);
+        let mut bytes = Vec::with_capacity(4 + entries.len() * 20);
+        bytes.push(0xF2);
+        bytes.push(0x01);
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (a, h) in &entries {
+            bytes.extend_from_slice(&a.to_be_bytes());
+            bytes.extend_from_slice(&h.wall.to_be_bytes());
+            bytes.extend_from_slice(&h.logical.to_be_bytes());
+            bytes.extend_from_slice(&h.peer.to_be_bytes());
+        }
+        self.tie_bytes_to_by_id(row, hid, &bytes);
+    }
+
+    /// #140: 自 peer が author した **live state** を bridge と同語彙の wire record
+    /// として合成する。 ring (`_sync_ops`) が「最近の差分」なのに対し、 これは
+    /// 「現在状態の転写」 — truncated puller の bootstrap 用 (`Syncer::serve_state`
+    /// 経由で transport に登録され、 `Syncer::bootstrap_pull` が適用する)。
+    ///
+    /// - HLC は v9 per-cell version column の真値 (`version_of`)。 版数不明 (ZERO)
+    ///   の cell は `as_of` で stamp する (単一 author cell では現在値が最新なので
+    ///   LWW 的に安全)
+    /// - `as_of` は合成**開始前**に採番する。 合成中の並行 write は HLC > as_of に
+    ///   なるので、 適用後の cursor = as_of からの差分 pull で必ず拾える
+    /// - 語彙は bridge (`transfer_oplog_to_sync_ops`) と同じ: Number = `Tie`、
+    ///   Tag = `Vocab` + `Tie`、 Leaf = `TieLeaf` (bytes 同乗)、 Ref は translated
+    ///   target のみ `TieRef` (世界番号同乗、 #183)、 自 entity target は `Tie`
+    /// - **含まないもの** (v1): 署名 (signature = zeros — require_signature な受信側
+    ///   では使えない)、 content blob、 他 peer 行への self-authored write
+    ///   (translated local 行は skip)、 untie 済み cell の tombstone
+    ///
+    /// 戻り値 `(records, as_of)`。 oplog 無効 (standalone) では `as_of` が採番
+    /// できないため空を返す。
+    pub fn state_records(
+        &self,
+    ) -> (Vec<crate::transport::WireRecord>, enchudb_oplog::Hlc) {
+        self.state_records_for(self.peer_id())
+    }
+
+    /// #226: `author` が author した live state を合成する — `state_records` の
+    /// **replica 版**。 relay (gossip) は author の行を translated local として
+    /// 保持しているので、 原 eid / 原 author / 原 HLC に**戻して**配れる。
+    /// これが無いと relay 経由でしか author に届かない follower は
+    /// `history_truncated` から回復できない (#140 は author 直結しか救えなかった)。
+    ///
+    /// `author == peer_id()` なら `state_records` と同一。 それ以外は:
+    ///
+    /// - 対象は `translated_locals_of(author)` の local のみ。 eid は原 eid
+    ///   (`make_eid(author, foreign_local)`)、 `author_peer` は `author`。
+    /// - HLC は cell の版数をそのまま。 remote apply は `set_cell(.., hlc)` 経由で
+    ///   **author の HLC を版数に書いている**ので、 relayed cell の版数 = 原 HLC。
+    ///   版数不明 (ZERO) の cell は **配らない** — foreign author の cell に自分の
+    ///   clock を stamp する権利が無く、 ZERO のまま送ると LWW が順序を付けられない。
+    /// - `as_of` は emit した record の **max HLC**。 self 版のように `mint_hlc()`
+    ///   すると自分の clock で author の HLC 空間を進めてしまい、 受信側の
+    ///   `cursor[author]` が author の後続 record を飛び越す (#216 で cursor が
+    ///   author 別になったのでここが直撃する)。
+    /// - Tag は **author の vid 空間に戻して**配る (`peer_vocab_map` の逆引き)。
+    ///   自分の local vid のまま `(author, vid)` として配ると、 author 直 pull で
+    ///   来る同じ key の別テキストと衝突して vocab 写像が壊れる (#209 と同種)。
+    ///   逆引きできない cell は配らない。
+    ///
+    /// 呼び元は `StateBatch.complete` を **false** にすること — relay が author の
+    /// live state を全部持っている保証は無い (途中から relay を始めた場合)。
+    ///
+    /// `himo_id` は自分の番号をそのまま載せる。 これは wire format 全体の前提と
+    /// 同じ (`Tie` の himo_id は受信側でそのまま使われる = peer 間で himo 番号が
+    /// 一致している前提) なので、 replica 経路が新しく持ち込む仮定ではない。
+    pub fn state_records_for(
+        &self,
+        author: enchudb_oplog::PeerId,
+    ) -> (Vec<crate::transport::WireRecord>, enchudb_oplog::Hlc) {
+        use enchudb_oplog::oplog::DecodedOp;
+        let Some(wal) = self.oplog.as_ref() else {
+            return (Vec::new(), enchudb_oplog::Hlc::ZERO);
+        };
+        let self_peer = self.peer_id();
+        let is_self = author == self_peer;
+        // self: 合成**開始前**に採番 (合成中の write は HLC > as_of なので差分で拾える)。
+        // foreign: 自分の clock を author の HLC 空間に混ぜないため、 emit 後に max を採る。
+        let as_of = if is_self { wal.mint_hlc() } else { enchudb_oplog::Hlc::ZERO };
+
+        // foreign author の行 = translated local。 local -> foreign_local の写像。
+        let foreign: std::collections::HashMap<u32, u32> = if is_self {
+            std::collections::HashMap::new()
+        } else {
+            self.translated_locals_of(author).into_iter().map(|(f, l)| (l, f)).collect()
+        };
+        if !is_self && foreign.is_empty() {
+            return (Vec::new(), enchudb_oplog::Hlc::ZERO);
+        }
+        // Tag: local vid -> author の remote vid (逆引き)。
+        let vid_back: std::collections::HashMap<u32, u32> =
+            if is_self { std::collections::HashMap::new() } else { self.remote_vid_reverse_of(author) };
+
+        let mut records: Vec<crate::transport::WireRecord> = Vec::new();
+        let mut vocab_sent: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mk = |op: DecodedOp, hlc: enchudb_oplog::Hlc| crate::transport::WireRecord {
+            hlc,
+            author_peer: author,
+            op,
+            signature: [0u8; 64],
+            pubkey_fp: [0u8; 8],
+            signed_bytes: Vec::new(),
+        };
+
+        for hid in 0..self.himos.len() {
+            if self.himo_is_in_reserved_table(hid) {
+                continue;
+            }
+            let himo_id = hid as u16;
+            let vt = self.value_types[hid];
+            for eid in self.entities_with_himo(himo_id) {
+                let local = enchudb_oplog::eid_local(eid);
+                // 出力する eid。 self 版は自分が author した行だけ (translated local は
+                // 他 peer が author なので skip、 self-authored cross-row write は v1
+                // 対象外)。 replica 版はその逆で、 author の translated local だけを
+                // **原 eid に戻して**配る (#226)。
+                let out_eid = if is_self {
+                    if self.eid_translator.is_translated_local(local) {
+                        continue;
+                    }
+                    eid
+                } else {
+                    let Some(&foreign_local) = foreign.get(&local) else { continue };
+                    enchudb_oplog::make_eid(author, foreign_local)
+                };
+                let Some(value) = self.get_by_id(eid, himo_id) else { continue };
+                let mut hlc = self.version_of(local, himo_id);
+                if hlc == enchudb_oplog::Hlc::ZERO {
+                    // self: 現在値が最新なので `as_of` stamp で LWW 的に安全。
+                    // replica: foreign cell に自分の clock を stamp する権利が無い
+                    // (as_of も ZERO)。 順序を付けられない record は配らない。
+                    if !is_self {
+                        continue;
+                    }
+                    hlc = as_of;
+                }
+                match vt {
+                    ValueType::Number => {
+                        records.push(mk(DecodedOp::Tie { eid: out_eid, himo_id, value }, hlc));
+                    }
+                    ValueType::Ref => {
+                        // bridge と同じ規則: translated foreign target は世界番号
+                        // 同乗の TieRef、 自 entity target は素の Tie (受信側が
+                        // author key で翻訳する)。 replica 版では「author 自身の
+                        // entity への ref」も translated local なので、 owner が
+                        // author なら素の Tie に戻す (= author 本人が出す形と同じ)。
+                        if self.eid_translator.is_translated_local(value) {
+                            match self.eid_translator.reverse(value) {
+                                Some((owner, owner_local)) if owner == author && !is_self => {
+                                    records.push(mk(
+                                        DecodedOp::Tie {
+                                            eid: out_eid,
+                                            himo_id,
+                                            value: owner_local,
+                                        },
+                                        hlc,
+                                    ));
+                                }
+                                Some((owner, owner_local)) => {
+                                    records.push(mk(
+                                        DecodedOp::TieRef {
+                                            eid: out_eid,
+                                            himo_id,
+                                            target: enchudb_oplog::make_eid(owner, owner_local),
+                                        },
+                                        hlc,
+                                    ));
+                                }
+                                // 逆写像なし = 元 entity を導けない。 bridge と同じく
+                                // 発送しない (silent 断片化させるより欠けを明示)。
+                                None => continue,
+                            }
+                        } else if is_self {
+                            records.push(mk(DecodedOp::Tie { eid: out_eid, himo_id, value }, hlc));
+                        } else {
+                            // replica: author の行が「自分が author した entity」を
+                            // 指すことはない (それは翻訳先を持つ)。 導けないので skip。
+                            continue;
                         }
                     }
-                    purged += 1;
+                    ValueType::Tag => {
+                        // replica は author の vid 空間に戻す。 戻せない vid は
+                        // 配らない — 自分の local vid を `(author, vid)` として送ると
+                        // author 直 pull の同 key と衝突して写像が壊れる。
+                        let out_vid = if is_self {
+                            value
+                        } else {
+                            match vid_back.get(&value) {
+                                Some(v) => *v,
+                                None => continue,
+                            }
+                        };
+                        if vocab_sent.insert(out_vid) {
+                            let bytes = self.vocab.get(value).to_vec();
+                            records.push(mk(DecodedOp::Vocab { vid: out_vid, bytes }, hlc));
+                        }
+                        records
+                            .push(mk(DecodedOp::Tie { eid: out_eid, himo_id, value: out_vid }, hlc));
+                    }
+                    ValueType::Leaf => {
+                        let Some(bytes) = self.text_owned_by_id(hid, local) else { continue };
+                        let Some(name) = self.himo_names.get(hid) else { continue };
+                        records.push(mk(
+                            DecodedOp::TieLeaf {
+                                eid: out_eid,
+                                himo_name: name.clone(),
+                                himo_kind: ValueType::Leaf as u8,
+                                bytes,
+                            },
+                            hlc,
+                        ));
+                    }
                 }
             }
         }
-        purged
+        // replica 版の as_of = emit した record の max HLC (self 版は採番済み)。
+        let as_of = if is_self {
+            as_of
+        } else {
+            records.iter().map(|r| r.hlc).max().unwrap_or(enchudb_oplog::Hlc::ZERO)
+        };
+        (records, as_of)
+    }
+
+    /// #226: `author` の remote vid → local vid 写像 (`peer_vocab_map`) の逆引き。
+    /// replica が Tag cell を author の vid 空間に戻すために使う。 写像は実質
+    /// 単射 (vocab は dedupe 済み) なので衝突は起きない想定だが、 万一重複したら
+    /// 小さい remote vid を採って決定的にする。
+    fn remote_vid_reverse_of(
+        &self,
+        author: enchudb_oplog::PeerId,
+    ) -> std::collections::HashMap<u32, u32> {
+        let map = self.peer_vocab_map.read().unwrap();
+        let mut out: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for ((peer, remote_vid), local_vid) in map.iter() {
+            if *peer != author {
+                continue;
+            }
+            let e = out.entry(*local_vid).or_insert(*remote_vid);
+            if *remote_vid < *e {
+                *e = *remote_vid;
+            }
+        }
+        out
+    }
+
+    /// #226: 自 store に replica (translated local) を持っている author 一覧。
+    /// relay が `serve_state` で「どの author の state を配れるか」を決めるのに使う。
+    /// pull ごとに引かれるので、 写像全体の走査ではなく translator 側の索引を見る。
+    pub fn replicated_authors(&self) -> Vec<enchudb_oplog::PeerId> {
+        self.eid_translator.authors()
+    }
+
+    /// #140: `author` peer の行として翻訳済みの local slot 一覧
+    /// `(foreign_local, local)`。 bootstrap 後の ghost sweep (state に現れなかった
+    /// author の行 = author 側で削除済み) の走査に使う。
+    pub fn translated_locals_of(&self, author: enchudb_oplog::PeerId) -> Vec<(u32, u32)> {
+        self.eid_translator
+            .snapshot()
+            .into_iter()
+            .filter(|(p, _, _)| *p == author)
+            .map(|(_, foreign_local, local)| (foreign_local, local))
+            .collect()
     }
 
     /// 0.7.0 (Phase 5): 現時点の sync lsn (= 次に転送される record の lsn - 1)。
@@ -4401,9 +5419,10 @@ impl Engine {
             // (`clear_cell_versions` の doc 参照)。
             self.clear_cell_versions(global);
             self.entities.allocate_at(global);
-            if let Some(q) = self.write_queue.as_ref() {
-                q.push(crate::write_queue::Op::EntityCreated { local: global });
+            // #195: queue に積まず counter 対称 bump (entity() の同所コメント参照)。
+            if self.write_queue.is_some() {
                 self.push_count.fetch_add(1, Ordering::Release);
+                self.apply_count.fetch_add(1, Ordering::Release);
             }
             let peer = self.peer_id.load(Ordering::Acquire);
             return Ok(enchudb_oplog::make_eid(peer, global));
@@ -4437,10 +5456,12 @@ impl Engine {
         // EntitySet で live mark + next_eid 前進 (CAS safe)
         self.entities.allocate_at(global);
 
-        // concurrent mode barrier (entity() と同じ)
-        if let Some(q) = self.write_queue.as_ref() {
-            q.push(crate::write_queue::Op::EntityCreated { local: global });
+        // concurrent mode barrier (entity() と同じ)。
+        // #195: queue に積まず counter 対称 bump — consumer thread 自身が bridge 中に
+        // ここを通る (blocking push だと自縄自縛 livelock)。
+        if self.write_queue.is_some() {
             self.push_count.fetch_add(1, Ordering::Release);
+            self.apply_count.fetch_add(1, Ordering::Release);
         }
         let peer = self.peer_id.load(Ordering::Acquire);
         Ok(enchudb_oplog::make_eid(peer, global))
@@ -4527,6 +5548,11 @@ impl Engine {
         if self.path.is_empty() {
             return Ok(());
         }
+        // #190: serialize から rename までを直列化 (同一 tmp の truncate 合戦と
+        // 新旧逆転 install の防止)。poisoned でも persist は続行して良い
+        // (守っているのは file I/O の順序だけで、guard 下の共有 state は無い)。
+        let _guard =
+            self.sidecar_persist_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         persist_tables_to_sidecar(&self.path, &self.tables)?;
         // #9: 翻訳テーブルも同じ trigger で persist (next_local と整合させる)。
         persist_eidmap_to_sidecar(&self.path, &self.eidmap_entries_with_tombstones())?;
@@ -4614,6 +5640,11 @@ impl Engine {
                 return;
             }
             if !self.path.is_empty() {
+                // #190: persist_tables と同じ直列化 (consumer thread はこちらを通る)。
+                let _guard = self
+                    .sidecar_persist_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if let Err(e) = persist_tables_to_sidecar(&self.path, &self.tables) {
                     // best effort: panic せずログだけ。 user table の定義は
                     // メモリには反映されてる、 次回 reopen で失われるだけ。
@@ -4953,35 +5984,68 @@ impl Engine {
 
     // ──── entity ────
 
-    pub fn entity(&self) -> enchudb_oplog::EntityId {
+    /// anonymous entity を払い出す。
+    ///
+    /// **`Err` を返す条件は 2 つ** (どちらも旧実装では panic だった、 #59):
+    ///
+    /// - **entity 枠が満杯** — 「DB が一杯」 は実行時の状態であって使い方の誤りではない。
+    ///   embedded DB は他人の process に埋め込まれるので、 これで host を殺してはいけない。
+    ///   `FaultKind::EntitySpace` として計数 + rate-limited warn もする。
+    ///   空き枠は `remaining_eid_space()` で事前に見られる
+    /// - **anonymous table が closed** (= `define_table` 済み) — この DB では
+    ///   `entity_in("<table>")` を使うこと
+    ///
+    /// table 版の [`Engine::entity_in`] と同じ形 (`Result<_, String>`) にしてある。
+    /// 同じ 「entity を作る」 操作が、 片方は Err で片方は process 即死、 という
+    /// 非対称を無くすための signature 変更 (0.23.0 breaking)。
+    pub fn entity(&self) -> Result<enchudb_oplog::EntityId, String> {
         use std::sync::atomic::Ordering;
         self.check_writable();
         // β-light step 3: anonymous table が closed (= 既に define_table が
-        // 呼ばれた) なら entity() は panic。 entity_in を使うこと。
+        // 呼ばれた) なら entity() は使えない。 entity_in を使うこと。
         let anon_hi = self.tables[ANONYMOUS_TABLE as usize].eid_range_hi;
         if anon_hi != u32::MAX {
-            panic!(
+            return Err(
                 "anonymous table is closed (define_table was called); \
                  use entity_in('<table>') instead of entity()"
+                    .to_string(),
             );
         }
         // 上限到達後の `allocate` は free stack から slot を再利用する。
         // 再利用なら前の住人の版数を落としてから渡す (entity_in の再利用枝と同じ)。
-        let (local, reused) = self.entities.allocate_tracked();
+        let Some((local, reused)) = self.entities.allocate_tracked() else {
+            self.record_fault(
+                FaultKind::EntitySpace,
+                "entity() で払い出す枠が無い (max_entities 到達 + free stack 空)",
+            );
+            return Err(format!(
+                "entity space exhausted: max_entities={} and the free stack is empty — \
+                 delete entities to free slots, or recreate the DB with a larger \
+                 create_with_capacity (remaining_eid_space() で残量が見られる)",
+                self.entities.max_entities(),
+            ));
+        };
         if reused {
             self.clear_cell_versions(local);
         }
-        // concurrent mode (= consumer thread 稼働) なら barrier 用に空 op を
-        // 流す。 issue5: push_count と apply_count を対称に保たないと
+        // concurrent mode (= consumer thread 稼働) なら barrier counter を対称に
+        // 進める。 issue5: push_count と apply_count を対称に保たないと
         // `flush_writes` が ties drain 前に early return して live query が
         // pending Tie を見落とす。 undo 廃止 (v4) 後は payload なしで
         // counter increment のみが起こる。
-        if let Some(q) = self.write_queue.as_ref() {
-            q.push(crate::write_queue::Op::EntityCreated { local });
+        //
+        // #195: 以前は `Op::EntityCreated` を queue に積んでいたが、 drain 側は
+        // no-op (counter 対称用のみ) なのに blocking push で、 consumer thread
+        // 自身が bridge (`transfer_oplog_to_sync_ops`) 中に `entity_in` する経路で
+        // 「満杯 queue の唯一の drainer が push に blocking」する livelock に
+        // なった (#116 の小 queue default で顕在化)。 queue を経由せず両 counter を
+        // 直接進める (push 先 → apply 後、 apply > push を作らない順序)。
+        if self.write_queue.is_some() {
             self.push_count.fetch_add(1, Ordering::Release);
+            self.apply_count.fetch_add(1, Ordering::Release);
         }
         let peer = self.peer_id.load(Ordering::Acquire);
-        enchudb_oplog::make_eid(peer, local)
+        Ok(enchudb_oplog::make_eid(peer, local))
     }
 
     pub fn entities(&self) -> Vec<enchudb_oplog::EntityId> {
@@ -5005,6 +6069,77 @@ impl Engine {
     /// 0.7.0: 残り eid 空間 (= max_entities - 既存 table の eid_range_hi の max)。
     /// schema crate が `define_table` を呼ぶ前に「table 1 個分にどれだけ割けるか」
     /// 判断する用。
+    /// #167: この DB が載っている filesystem の空き byte 数。 growable backing のみ。
+    ///
+    /// **sparse 前提の設計なので 「df に空きがある」 は安全を意味しない** — apparent size
+    /// (既定 24 GB、 cell version 有効なら更に大) の全部を書ける空きが必要になり得る。
+    /// 監視でこの値を見て、 枯渇前に対処すること。
+    pub fn disk_free_bytes(&self) -> Option<u64> {
+        match &self.backing {
+            Backing::Growable(g) => g.free_bytes().ok(),
+            _ => None,
+        }
+    }
+
+    /// #167: 空き容量不足で grow を拒否した回数。 0 でなければ write が落とされている。
+    pub fn space_denials(&self) -> u64 {
+        match &self.backing {
+            Backing::Growable(g) => g.space_denials(),
+            _ => 0,
+        }
+    }
+
+    /// #167: grow 時に残す空き容量 margin を上書きする (**テスト用**)。
+    ///
+    /// 巨大な値を渡すと、 実際にディスクを埋めずに 「空きが足りない」 経路を
+    /// 決定的に踏める。 production では呼ばないこと。
+    pub fn set_space_margin(&self, bytes: u64) {
+        if let Backing::Growable(g) = &self.backing {
+            g.set_space_margin(bytes);
+        }
+    }
+
+    /// #59: 「想定内だが続行不能」 な事象を記録する。 **panic の代替**。
+    ///
+    /// 呼び出し側は必ず 「その write を拒否する」 ところまでやること
+    /// (記録だけして壊れた値を書いたら、 panic より悪い)。
+    pub(crate) fn record_fault(&self, kind: FaultKind, detail: &str) {
+        use std::sync::atomic::Ordering;
+        self.faults[kind.index()].fetch_add(1, Ordering::Relaxed);
+        // 満杯状態では write ごとに来るので 1/s に絞る。 「黙って落とす」 のを
+        // 避けるのが目的なので、 完全に消してはいけない。
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = self.last_fault_warn_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= 1000
+            && self
+                .last_fault_warn_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            eprintln!(
+                "[enchudb] warning: {} — write rejected: {detail} \
+                 (rate-limited to 1/s; 累計は Engine::fault_count で見られる)",
+                kind.as_str(),
+            );
+        }
+    }
+
+    /// #59: 種別ごとの fault 発生回数。 0 でないなら **その分の write が拒否されている**。
+    pub fn fault_count(&self, kind: FaultKind) -> u64 {
+        self.faults[kind.index()].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #59: fault 総数 (全種別)。 監視の 1 本目の指標に。
+    pub fn fault_total(&self) -> u64 {
+        self.faults
+            .iter()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .sum()
+    }
+
     pub fn remaining_eid_space(&self) -> u32 {
         let used = self.tables.iter().map(|t| {
             if t.eid_range_hi == u32::MAX {
@@ -5019,7 +6154,7 @@ impl Engine {
     /// size_hint を自動算出する用。
     pub fn max_entities(&self) -> u32 { self.max_entities }
 
-    // ──── v32: peer_id ────
+    // ──── peer_id ────
 
     /// この Engine を所有する peer の id を設定。WAL / DB header にも反映される。
     /// 起動時に 1 回だけ呼ぶ想定。
@@ -5038,9 +6173,15 @@ impl Engine {
         self.peer_id.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// CRDT mesh mode の有効化。 true にすると `remote_*_apply` で受信した op を
-    /// `append_relayed` で自分の WAL にも記録し、 次の publish で他 peer に gossip する。
+    /// CRDT mesh / relay mode の有効化。 true にすると Syncer が受信 record を
+    /// **原型のまま** (`Engine::relay_record` #209) 自分の WAL に載せ、 次の
+    /// publish で他 peer に配布する = 読み専 replica / gossip の土台。
     /// ホスト/クライアント構成では false のまま (= ホストの WAL に届いた時点で完結)。
+    ///
+    /// #209: 旧実装は `remote_*_apply` (翻訳後の値しか持たない場所) が翻訳後の
+    /// eid/value を append しており、 direct 経路と混在すると row 重複 / vocab
+    /// 写像汚染 / 署名不一致を起こした。 relay の append は Syncer 側 (原
+    /// WireRecord を持つ場所) に移動済み。
     pub fn set_gossip_remote_apply(&self, on: bool) {
         self.gossip_remote_apply
             .store(on, std::sync::atomic::Ordering::Release);
@@ -5049,6 +6190,71 @@ impl Engine {
     pub fn gossip_remote_apply(&self) -> bool {
         self.gossip_remote_apply
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// #209: 受信 record を**素通し** (原 eid / 原 value / 原 HLC / 原 author /
+    /// 原署名) で自分の WAL に relay append する。 Syncer が「apply が accept した
+    /// record」に限って呼ぶ (LWW gate が cyclic topology の echo を止める唯一の
+    /// 栓なので、 skip した record を relay してはいけない)。
+    ///
+    /// 翻訳 (eid/vid/ref) は body apply 専用で、 relay stream には漏らさない —
+    /// 「中継であって作者交代ではない」。 WAL recovery はこの record を
+    /// `apply_oplog_op` の relayed 経路 (受信時と同じ翻訳) で replay する。
+    ///
+    /// 戻り値: append できたか (oplog 無効 / append 失敗で false)。
+    pub fn relay_record(&self, rec: &crate::transport::WireRecord) -> bool {
+        use enchudb_oplog::oplog::{DecodedOp, Op, RelayedHeader};
+        let Some(wal) = self.oplog.as_ref() else { return false };
+        // Commit は relay しない: dedupe identity を持たず、 閉路があると無限反響
+        // する。 group 境界は relay 自身の commit 周期で足りる。
+        if matches!(rec.op, DecodedOp::Commit) {
+            return false;
+        }
+        // 署名対象 bytes を持つ record は **byte 単位の素通し** — 署名は LSN 込みの
+        // 領域に掛かっているので、 再 encode すると必ず不一致になる。
+        if !rec.signed_bytes.is_empty() {
+            return wal
+                .append_relayed_verbatim(&rec.signed_bytes, &rec.signature, &rec.pubkey_fp)
+                .is_ok();
+        }
+        // signed_bytes を持たない record (state 転写 #140 等) は op 再 encode で
+        // relay する (署名なしなので一致性の問題はない)。
+        let header = RelayedHeader {
+            hlc: rec.hlc,
+            author: rec.author_peer,
+            signature: rec.signature,
+            pubkey_fp: rec.pubkey_fp,
+        };
+        let op: Op<'_> = match &rec.op {
+            DecodedOp::Tie { eid, himo_id, value } => {
+                Op::Tie { eid: *eid, himo_id: *himo_id, value: *value }
+            }
+            DecodedOp::Untie { eid, himo_id } => Op::Untie { eid: *eid, himo_id: *himo_id },
+            DecodedOp::Delete { eid } => Op::Delete { eid: *eid },
+            DecodedOp::Content { eid, key, data } => {
+                Op::Content { eid: *eid, key, data }
+            }
+            DecodedOp::Vocab { vid, bytes } => Op::Vocab { vid: *vid, bytes },
+            DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => Op::TieNamed {
+                eid: *eid,
+                himo_name,
+                himo_kind: *himo_kind,
+                value: *value,
+            },
+            DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => Op::TieLeaf {
+                eid: *eid,
+                himo_name,
+                himo_kind: *himo_kind,
+                bytes,
+            },
+            DecodedOp::TieRef { eid, himo_id, target } => {
+                Op::TieRef { eid: *eid, himo_id: *himo_id, target: *target }
+            }
+            // Commit は relay しない: dedupe identity を持たず、 閉路があると
+            // 無限反響する。 group 境界は relay 自身の commit 周期で足りる。
+            DecodedOp::Commit => return false,
+        };
+        wal.append_relayed(op, header).is_ok()
     }
 
     /// **pre-v9 DB の版数置き場**への参照 (legacy)。 v9 DB では空のまま
@@ -5171,7 +6377,14 @@ impl Engine {
         match self.ver_col(himo_id) {
             Some(col) if local < self.max_entities => {
                 // growable backing: 未コミット page は read でも SIGBUS。
-                let _ = col.ensure_committed_for(local);
+                // #167: 伸ばせなければ **読まない** (ZERO 扱い)。 触れば落ちる。
+                if col.ensure_committed_for(local).is_err() {
+                    self.record_fault(
+                        FaultKind::DiskSpace,
+                        "cell version の read に必要な commit を伸ばせない — ZERO として扱う",
+                    );
+                    return enchudb_oplog::Hlc::ZERO;
+                }
                 hlc_from_cell(col.get(local))
             }
             _ => enchudb_oplog::Hlc::ZERO,
@@ -5189,7 +6402,14 @@ impl Engine {
     fn tombstone_hlc_local(&self, local: u32) -> enchudb_oplog::Hlc {
         match self.tomb_col.as_ref() {
             Some(col) if local < self.max_entities => {
-                let _ = col.ensure_committed_for(local);
+                // #167: 伸ばせなければ読まない (未 commit page の read も SIGBUS)。
+                if col.ensure_committed_for(local).is_err() {
+                    self.record_fault(
+                        FaultKind::DiskSpace,
+                        "tombstone の read に必要な commit を伸ばせない — ZERO として扱う",
+                    );
+                    return enchudb_oplog::Hlc::ZERO;
+                }
                 hlc_from_cell(col.get(local))
             }
             _ => enchudb_oplog::Hlc::ZERO,
@@ -5296,7 +6516,14 @@ impl Engine {
         match self.ver_col(himo_id) {
             Some(col) => {
                 // growable backing: 未コミット page への書き込みは SIGBUS。
-                let _ = col.ensure_committed_for(local);
+                // #167: 伸ばせなければ **書かない**。
+                if col.ensure_committed_for(local).is_err() {
+                    self.record_fault(
+                        FaultKind::DiskSpace,
+                        "cell version の write に必要な commit を伸ばせない — 版数を記録しない",
+                    );
+                    return;
+                }
                 col.ensure_count(local);
                 col.set(local, &hlc_to_cell(hlc));
             }
@@ -5712,7 +6939,14 @@ impl Engine {
         }
         match self.tomb_col.as_ref() {
             Some(col) => {
-                let _ = col.ensure_committed_for(local);
+                // #167: 伸ばせなければ書かない (未 commit page への write は SIGBUS)。
+                if col.ensure_committed_for(local).is_err() {
+                    self.record_fault(
+                        FaultKind::DiskSpace,
+                        "tombstone の write に必要な commit を伸ばせない — 記録しない",
+                    );
+                    return true;
+                }
                 col.ensure_count(local);
                 col.set(local, &hlc_to_cell(hlc));
             }
@@ -5898,7 +7132,7 @@ impl Engine {
         self.oplog.clone()
     }
 
-    // ──── v32: リモート peer から pull したレコードを apply する ────
+    // ──── リモート peer から pull したレコードを apply する ────
     // これらは LWW 判定を通った後の無条件 apply。HlcStore は Syncer が先に更新済み。
 
     /// リモート peer から届いた Tie を apply。
@@ -5990,17 +7224,16 @@ impl Engine {
         himo_id: u16,
         bytes: &[u8],
         hlc: enchudb_oplog::Hlc,
-        relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
-    ) -> bool {
+    ) -> RemoteApply {
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
-        if hid >= self.himos.len() { return false; }
+        if hid >= self.himos.len() { return RemoteApply::Stale; }
         // request17 step 5: 受信 HLC でローカル clock を進める (これが無いと、
         // 相手の clock が先行している間ずっと自分のローカル write が負ける)。
         self.observe_remote_hlc(hlc);
         // 値を作る前に判定する — 不採用なら LeafStore に payload を確保しない。
         if !self.accepts_write(local, himo_id, hlc) {
-            return false;
+            return RemoteApply::Stale;
         }
         self.entities.ensure_live(local);
         // v6 (#88): remote re-tie 上書きで旧 offset を回収。
@@ -6010,23 +7243,21 @@ impl Engine {
             Some(leaf) => leaf.insert(bytes),
             None => self.vocab.insert(bytes), // pre-v6 / reserved: 旧 vocab fallback
         };
+        if value == u32::MAX {
+            // #167 / #59: payload を格納できなかった (commit を伸ばせない = ディスク
+            // 満杯、 または vocab 天井)。 sentinel を cell に書くと read が壊れる。
+            self.record_fault(
+                FaultKind::DiskSpace,
+                "受信 TieLeaf の payload を格納できない — apply を拒否 (空きが出てから再配送)",
+            );
+            return RemoteApply::RejectedCapacity;
+        }
         self.set_cell_local(local, himo_id, value, hlc);
         self.free_leaf_offset(hid, old);
         Self::advance_table_next_local_for(&self.tables, local);
-        if self.gossip_remote_apply() {
-            if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
-                let _ = wal.append_relayed(
-                    enchudb_oplog::oplog::Op::TieLeaf {
-                        eid,
-                        himo_name: &self.himo_names[hid],
-                        himo_kind: self.value_types[hid] as u8,
-                        bytes,
-                    },
-                    h,
-                );
-            }
-        }
-        true
+        // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
+        // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
+        RemoteApply::Applied
     }
 
     pub fn remote_tie_apply(
@@ -6035,7 +7266,6 @@ impl Engine {
         himo_id: u16,
         value: u32,
         hlc: enchudb_oplog::Hlc,
-        relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
     ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
@@ -6053,14 +7283,8 @@ impl Engine {
         // `next_local` を `local + 1` まで前進させる。 これは `apply_oplog_op`
         // (WAL recover 経路、 engine.rs:3790) と対称の処理。
         Self::advance_table_next_local_for(&self.tables, local);
-        if self.gossip_remote_apply() {
-            if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
-                let _ = wal.append_relayed(
-                    enchudb_oplog::oplog::Op::Tie { eid, himo_id, value },
-                    h,
-                );
-            }
-        }
+        // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
+        // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
         true
     }
 
@@ -6070,7 +7294,6 @@ impl Engine {
         eid: enchudb_oplog::EntityId,
         himo_id: u16,
         hlc: enchudb_oplog::Hlc,
-        relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
     ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
@@ -6079,14 +7302,8 @@ impl Engine {
         if !self.clear_cell_local_freeing_leaf(local, himo_id, hlc) {
             return false;
         }
-        if self.gossip_remote_apply() {
-            if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
-                let _ = wal.append_relayed(
-                    enchudb_oplog::oplog::Op::Untie { eid, himo_id },
-                    h,
-                );
-            }
-        }
+        // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
+        // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
         true
     }
 
@@ -6095,7 +7312,6 @@ impl Engine {
         &self,
         eid: enchudb_oplog::EntityId,
         hlc: enchudb_oplog::Hlc,
-        relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
     ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         self.observe_remote_hlc(hlc);
@@ -6106,11 +7322,8 @@ impl Engine {
         if !self.apply_delete_local(local, hlc) {
             return false;
         }
-        if self.gossip_remote_apply() {
-            if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
-                let _ = wal.append_relayed(enchudb_oplog::oplog::Op::Delete { eid }, h);
-            }
-        }
+        // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
+        // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
         true
     }
 
@@ -6121,31 +7334,31 @@ impl Engine {
         key: &str,
         data: &[u8],
         hlc: enchudb_oplog::Hlc,
-        relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
-    ) -> bool {
+    ) -> RemoteApply {
         let local = enchudb_oplog::eid_local(eid);
         self.observe_remote_hlc(hlc);
         // legacy op (pre-0.9 WAL のみ)。 cell を持たないので版数は `HlcStore` の
         // key hash entry のまま (sync 側) だが、 tombstone 判定だけは engine に寄せる。
         if self.tombstone_blocks(eid, hlc) {
-            return false;
+            return RemoteApply::Stale;
         }
         self.entities.ensure_live(local);
-        self.contents.set(local, key, data);
+        if !self.contents.set(local, key, data) {
+            // #59: content data 領域が満杯。 panic せず拒否 + 計上。
+            self.record_fault(
+                FaultKind::ContentSpace,
+                "content data region is full — content write rejected (空きが出てから再配送)",
+            );
+            return RemoteApply::RejectedCapacity;
+        }
         // issue #47 fix: Tie 経路と同じ理由で next_local を前進させる。
         Self::advance_table_next_local_for(&self.tables, local);
-        if self.gossip_remote_apply() {
-            if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
-                let _ = wal.append_relayed(
-                    enchudb_oplog::oplog::Op::Content { eid, key, data },
-                    h,
-                );
-            }
-        }
-        true
+        // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
+        // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
+        RemoteApply::Applied
     }
 
-    /// v33: リモート peer から届いた Vocab op を apply。
+    /// リモート peer から届いた Vocab op を apply。
     /// `bytes` を local vocab に insert し、local_vid を取得して
     /// `(author_peer, remote_vid) → local_vid` の mapping を記録する。
     /// 後続の Tie { value: remote_vid } を受信したら `translate_remote_vid` で local_vid に変換。
@@ -6156,9 +7369,7 @@ impl Engine {
         author_peer: enchudb_oplog::PeerId,
         remote_vid: u32,
         bytes: &[u8],
-        relayed: Option<enchudb_oplog::oplog::RelayedHeader>,
     ) {
-        let was_new = self.vocab.lookup(bytes).is_none();
         let local_vid = self.vocab.get_or_insert(bytes);
         {
             let mut map = self.peer_vocab_map.write().unwrap();
@@ -6168,15 +7379,9 @@ impl Engine {
                     .store(true, std::sync::atomic::Ordering::Release);
             }
         }
-        if was_new && self.gossip_remote_apply() {
-            if let (Some(wal), Some(h)) = (self.oplog.as_ref(), relayed) {
-                // 自 vocab の vid を貼り直し (Tie 受信側が translate_remote_vid で再翻訳)。
-                let _ = wal.append_relayed(
-                    enchudb_oplog::oplog::Op::Vocab { vid: local_vid, bytes },
-                    h,
-                );
-            }
-        }
+        // #209: relay append はここから Syncer 側 (Engine::relay_record、原 vid の
+        // まま素通し) に移動した。 旧実装の「local_vid に貼り直して relay」は
+        // author 名義の vid namespace を relay namespace で汚染していた。
     }
 
     /// 0.8.4 issue #30: 受信 Vocab record の dedupe 用。 `(author_peer, remote_vid)`
@@ -6200,7 +7405,7 @@ impl Engine {
         false
     }
 
-    /// v33: Symbol 型 himo の Tie を受信した際、remote vid を local vid に変換する。
+    /// Symbol 型 himo の Tie を受信した際、remote vid を local vid に変換する。
     /// Symbol 以外の himo、または mapping 未登録なら元値をそのまま返す。
     pub fn translate_remote_vid(&self, author_peer: enchudb_oplog::PeerId, himo_id: u16, value: u32) -> u32 {
         let hid = himo_id as usize;
@@ -6460,6 +7665,15 @@ impl Engine {
             // なしなので実害はないが、 3 経路で順序が揃っていないと事故の温床になる)。
             let old = self.himos[hid].get_value(eid);
             let off = leaf.insert(value.as_bytes());
+            if off == u32::MAX {
+                // #167: leaf payload を書けなかった (commit を伸ばせない = ディスク
+                // 満杯)。 sentinel を cell に書くと read が壊れるので write を拒否。
+                self.record_fault(
+                    FaultKind::DiskSpace,
+                    "leaf payload の格納に必要な commit を伸ばせない — text write を拒否",
+                );
+                return;
+            }
             self.himos[hid].set(eid, off);
             if let Some(old) = old { leaf.free(old); }
             return;
@@ -6470,13 +7684,32 @@ impl Engine {
             ValueType::Leaf => self.vocab.insert(value.as_bytes()),
             ht => panic!("tie_text on non-text himo '{}': {:?}", himo, ht),
         };
+        if vid == u32::MAX {
+            // #59: vocab 満杯 → `insert`/`get_or_insert` が予約 sentinel を返した。
+            // panic せず write を拒否 + 計上 (sentinel を cell に書くと read 側が
+            // 「値なし」 と区別できない壊れ方をする)。
+            self.record_fault(
+                FaultKind::VocabSpace,
+                "vocabulary is full (vocab_max_entries 到達) — text write rejected. \
+                 GrowableOptions { vocab_max_entries: Some(n), .. } で上げられるが、\
+                 header 焼き込みなので既存 DB は再作成が必要",
+            );
+            return;
+        }
         self.himos[hid].set(eid, vid);
     }
 
     pub fn tie(&mut self, eid: enchudb_oplog::EntityId, himo: &str, value: u32) {
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
-        assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
+        if value == u32::MAX {
+            // #59: sentinel 値は cell に入らない。 panic せず write を拒否 + 計上。
+            self.record_fault(
+                FaultKind::ValueOutOfRange,
+                "tie value == u32::MAX (sentinel reserved)",
+            );
+            return;
+        }
         let hid = self.ensure_himo(himo, ValueType::Number, 0);
         debug_assert!(self.value_types[hid] == ValueType::Number || self.value_types[hid] == ValueType::Ref, "tie on non-Value himo '{}'", himo);
         // β-light step 6: eid が himo の所属 table eid_range 内か
@@ -6490,7 +7723,13 @@ impl Engine {
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
         let target_eid = enchudb_oplog::eid_local(target_eid);
-        assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
+        if target_eid == u32::MAX {
+            self.record_fault(
+                FaultKind::ValueOutOfRange,
+                "tie_ref target_eid >= u32::MAX (sentinel reserved)",
+            );
+            return;
+        }
         let hid = self.ensure_himo(himo, ValueType::Ref, 0);
         debug_assert!(self.value_types[hid] == ValueType::Ref || self.value_types[hid] == ValueType::Number, "tie_ref on non-Ref himo '{}'", himo);
         // β-light step 6: eid が himo の所属 table eid_range 内か
@@ -6529,6 +7768,15 @@ impl Engine {
             let bytes = value.as_bytes();
             let old = self.himos[hid].get_value(eid);
             let off = leaf.insert(bytes);
+            if off == u32::MAX {
+                // #167: leaf payload を書けなかった (commit を伸ばせない = ディスク
+                // 満杯)。 sentinel を cell に書くと read が壊れるので write を拒否。
+                self.record_fault(
+                    FaultKind::DiskSpace,
+                    "leaf payload の格納に必要な commit を伸ばせない — text write を拒否",
+                );
+                return;
+            }
             // request17 step 4: WAL 先行で採番 → 値と版数を不可分に書く。 不採用なら
             // **今 insert した payload** を捨てる (cell は旧 offset を指したままなので
             // 旧 payload は生きている)。
@@ -6553,6 +7801,18 @@ impl Engine {
             ValueType::Leaf => self.vocab.insert(value.as_bytes()),
             ht => panic!("tie_text_to_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
+        if vid == u32::MAX {
+            // #59: vocab 満杯 → `insert`/`get_or_insert` が予約 sentinel を返した。
+            // panic せず write を拒否 + 計上 (sentinel を cell に書くと read 側が
+            // 「値なし」 と区別できない壊れ方をする)。
+            self.record_fault(
+                FaultKind::VocabSpace,
+                "vocabulary is full (vocab_max_entries 到達) — text write rejected. \
+                 GrowableOptions { vocab_max_entries: Some(n), .. } で上げられるが、\
+                 header 焼き込みなので既存 DB は再作成が必要",
+            );
+            return;
+        }
         // WAL に Vocab + Tie を流す。 schema layer (enchudb-schema) は同期版の
         // tie_text_to を経由するため、 ここで append しないと WAL が空のままで
         // peer 同期が成立しない (publish 側が iter_committed で 0 件を見る).
@@ -6629,6 +7889,15 @@ impl Engine {
             // 既に `tie_text_to_by_id` はこの順序。
             let old = self.himos[hid].get_value(eid);
             let off = leaf.insert(value);
+            if off == u32::MAX {
+                // #167: leaf payload を書けなかった (commit を伸ばせない = ディスク
+                // 満杯)。 sentinel を cell に書くと read が壊れるので write を拒否。
+                self.record_fault(
+                    FaultKind::DiskSpace,
+                    "leaf payload の格納に必要な commit を伸ばせない — text write を拒否",
+                );
+                return;
+            }
             // request17 step 4: WAL 先行で採番。 不採用なら今 insert した payload を捨てる。
             let oplog_eid = self.oplog_eid(eid);
             let hlc = self.append_local_op(enchudb_oplog::oplog::Op::TieLeaf {
@@ -6650,6 +7919,18 @@ impl Engine {
             ValueType::Leaf => self.vocab.insert(value),
             ht => panic!("tie_bytes_to_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
+        if vid == u32::MAX {
+            // #59: vocab 満杯 → `insert`/`get_or_insert` が予約 sentinel を返した。
+            // panic せず write を拒否 + 計上 (sentinel を cell に書くと read 側が
+            // 「値なし」 と区別できない壊れ方をする)。
+            self.record_fault(
+                FaultKind::VocabSpace,
+                "vocabulary is full (vocab_max_entries 到達) — text write rejected. \
+                 GrowableOptions { vocab_max_entries: Some(n), .. } で上げられるが、\
+                 header 焼き込みなので既存 DB は再作成が必要",
+            );
+            return;
+        }
         // reserved table への write は oplog 再 append を skip (= 2 重書き防止)。
         // request17 step 4: Vocab → Tie/TieNamed の順に append し (transport は HLC 順に
         // 配るので依存順を崩せない)、 Tie に載った HLC で値と版数を書く。
@@ -6692,7 +7973,14 @@ impl Engine {
     pub fn tie_to_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: u32) {
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
-        assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
+        if value == u32::MAX {
+            // #59: sentinel 値は cell に入らない。 panic せず write を拒否 + 計上。
+            self.record_fault(
+                FaultKind::ValueOutOfRange,
+                "tie value == u32::MAX (sentinel reserved)",
+            );
+            return;
+        }
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
@@ -6727,7 +8015,13 @@ impl Engine {
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
         let target_eid = enchudb_oplog::eid_local(target_eid);
-        assert!(target_eid < u32::MAX, "target_eid must be < u32::MAX (sentinel reserved)");
+        if target_eid == u32::MAX {
+            self.record_fault(
+                FaultKind::ValueOutOfRange,
+                "tie_ref target_eid >= u32::MAX (sentinel reserved)",
+            );
+            return;
+        }
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
@@ -8529,7 +9823,7 @@ impl Engine {
     /// 指定紐の現在の unique 値数(非空バケット数)。O(1)。
     /// 紐が未定義なら None。
     ///
-    /// v27 の BucketCylinder は tie/untie/remove 時に AtomicU32 を増減させる。
+    /// BucketCylinder は tie/untie/remove 時に AtomicU32 を増減させる。
     /// `define_himo` の `max_values` はヒントに過ぎないので、ここで返るのは
     /// 実データ上の cardinality。
     pub fn himo_cardinality(&self, himo: &str) -> Option<u32> {
@@ -8896,12 +10190,12 @@ impl Engine {
         buf[mv_off..mv_off + 4].copy_from_slice(&max_values.to_le_bytes());
         let himo_count = (hid + 1) as u32;
         buf[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&himo_count.to_le_bytes());
-        // v28: header CRC を再計算(himo_count が変わったため)
+        // header CRC を再計算(himo_count が変わったため)
         write_header_crc(buf);
 
-        // v29 issue7 fix: schema 変更で region layout が変わったので、 seal_integrity
+        // issue7 fix: schema 変更で region layout が変わったので、 seal_integrity
         // で焼かれた古い `.crc` sidecar は stale。 削除して、 次 open は CRC 検証
-        // skip (v28 以前と同じ fallback)、 次 seal_integrity で regenerate させる。
+        // skip (`.crc` 無し DB と同じ fallback)、 次 seal_integrity で regenerate させる。
         #[cfg(not(target_arch = "wasm32"))]
         {
             let crc_path = crate::integrity::crc_path_for(&self.path);
@@ -8914,7 +10208,7 @@ impl Engine {
         Ok(hid as u16)
     }
 
-    // ──── v27 並行書き込み ────
+    // ──── 並行書き込み ────
 
     /// 並行対応版の create。
     ///
@@ -8935,7 +10229,7 @@ impl Engine {
         Ok(Self::spawn_consumer(eng))
     }
 
-    /// v28: WAL 付き create_concurrent。
+    /// WAL 付き create_concurrent。
     /// `{path}.wal` に Write-Ahead Log を作成。
     ///
     /// tie_async / untie_async / delete_async は hot path で WAL append(memcpy)を行い、
@@ -8971,11 +10265,31 @@ impl Engine {
         Ok(Self::spawn_consumer_with_oplog_queue_cap(eng, Some(wal), Some(queue_capacity)))
     }
 
-    /// v28: WAL 付き open_concurrent。既存 WAL があればリカバリする。
-    /// v29: region CRC は WAL ルートでは skip(WAL が source of truth)。
+    /// WAL 付き open_concurrent。既存 WAL があればリカバリする。
+    /// region CRC は WAL ルートでは skip(WAL が source of truth)。
     /// 代わりに古い `.crc` ファイルは削除して、次回 flush で regenerate させる。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_concurrent_with_oplog(path: &str, oplog_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
+        Self::open_concurrent_with_oplog_queue_opt(path, oplog_capacity, None)
+    }
+
+    /// #116: `open_concurrent_with_oplog` + queue capacity 上書き。多 DB を LRU pool で
+    /// open/close する hosted 構成の open 側 knob (説明は `concurrentize_with_oplog_queue`)。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_concurrent_with_oplog_queue(
+        path: &str,
+        oplog_capacity: usize,
+        queue_capacity: usize,
+    ) -> io::Result<std::sync::Arc<Self>> {
+        Self::open_concurrent_with_oplog_queue_opt(path, oplog_capacity, Some(queue_capacity))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_concurrent_with_oplog_queue_opt(
+        path: &str,
+        oplog_capacity: usize,
+        queue_capacity: Option<usize>,
+    ) -> io::Result<std::sync::Arc<Self>> {
         let mut eng = Self::open_internal(path, /*verify_region_crc=*/ false, /*take_lock=*/ true, /*readonly=*/ false)?;
         // 古い .crc は WAL 活動後に stale になるので削除
         let crc_path = crate::integrity::crc_path_for(path);
@@ -8991,7 +10305,7 @@ impl Engine {
             // (`OpLog::recover_with_tail` の doc 参照)。
             let records = w.recover_with_tail();
             for rec in &records {
-                eng.apply_oplog_op(&rec.op, rec.hlc);
+                eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer);
             }
             // #77-H2: 適用効果を disk に固めてから checkpoint を前進する。
             // 旧順序 (apply → 即 checkpoint) は kernel が checkpoint header を
@@ -9006,11 +10320,11 @@ impl Engine {
             std::sync::Arc::new(enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?)
         };
         eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
-        Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
+        Ok(Self::spawn_consumer_with_oplog_queue_cap(eng, Some(wal), queue_capacity))
     }
 
     /// WAL の 1 op を本体に適用(recover 専用)。
-    /// v32: eid は u64 だが Column は local u32 で保持。eid_local() で剥がす。
+    /// eid は u64 だが Column は local u32 で保持。eid_local() で剥がす。
     ///
     /// 0.8.1: Tie/Content で `entities.ensure_live` + table `next_local` の
     /// max 推進を入れた。 これが無いと short-lived CLI (= sidecar persist
@@ -9018,8 +10332,22 @@ impl Engine {
     ///   - entity_set の live bitmap が stale → 次 entity_in が eid 重複払出し
     ///   - table.next_local が 0 のまま → 次 alloc が既存 eid と衝突
     /// になる。 sinfo 連携で表面化したので 0.8.1 patch で根治。
-    fn apply_oplog_op(&mut self, op: &enchudb_oplog::oplog::DecodedOp, hlc: enchudb_oplog::Hlc) {
+    fn apply_oplog_op(
+        &mut self,
+        op: &enchudb_oplog::oplog::DecodedOp,
+        hlc: enchudb_oplog::Hlc,
+        author: enchudb_oplog::PeerId,
+    ) {
         use enchudb_oplog::oplog::DecodedOp;
+        // #209: relay (gossip) が verbatim で積んだ foreign-author record は、
+        // 受信時 (Syncer::apply_one) と同じ翻訳経路で replay する。 eid をそのまま
+        // local slot に書くと relay の body が壊れる (原 eid は author の番号)。
+        // self peer は header (H_PEER_ID) から復元済み。
+        let self_peer = self.peer_id();
+        if self_peer != 0 && author != 0 && author != self_peer {
+            self.replay_relayed_op(op, hlc, author);
+            return;
+        }
         match op {
             DecodedOp::Tie { eid, himo_id, value } => {
                 let hid = *himo_id as usize;
@@ -9052,7 +10380,14 @@ impl Engine {
                 // legacy (pre-0.9 WAL): 旧 content region へ replay。 0.9.0 以降は
                 // Op::Content を emit しないので、 旧 DB の WAL 再生でのみ通る。
                 let local = enchudb_oplog::eid_local(*eid);
-                self.contents.set(local, key, data);
+                if !self.contents.set(local, key, data) {
+                    // #59: content data 領域が満杯。 panic せず拒否 + 計上。
+                    self.record_fault(
+                        FaultKind::ContentSpace,
+                        "content data region is full — content write rejected",
+                    );
+                    return;
+                }
                 self.entities.ensure_live(local);
                 Self::advance_table_next_local_for(&self.tables, local);
             }
@@ -9073,12 +10408,90 @@ impl Engine {
                 // 再 insert すると offset が変わり slot が二重化するため触らない。
                 // remote peer からの TieLeaf は sync crate の apply-one 経由で別 apply。
             }
+            DecodedOp::TieRef { .. } => {
+                // #183: TieRef は bridge が `_sync_ops` 発送時に合成する op で、
+                // ローカル oplog には現れない (author の oplog は Op::Tie のまま)。
+                // 万一混入しても local state は Tie で既に durable なので no-op。
+            }
             DecodedOp::Commit => {}
             DecodedOp::Vocab { .. } => {
-                // v33: 自プロセスの recover 時は Vocab 個別の apply 不要
+                // 自プロセスの recover 時は Vocab 個別の apply 不要
                 // (author_peer == self の場合は既に local vocab にある)。
                 // Sync 経由で他 peer から受信する場合のみ apply_one 側で処理。
             }
+        }
+    }
+
+    /// #209: relay (gossip) が verbatim で WAL に積んだ foreign-author record の
+    /// recovery replay。 Syncer::apply_one の翻訳規則をなぞる (recovery 時に
+    /// Syncer は存在しない)。 翻訳写像は live 適用の barrier で .eidmap/.vocabmap
+    /// に永続しているのが通常で、 crash 窓で欠けていても `get_or_insert` 系が
+    /// 受信時と同じ規則で貼り直す。 apply は LWW 冪等。 解決できない record は
+    /// skip — relay の役目上、 元 record は author に在り再 pull で埋め直せる。
+    fn replay_relayed_op(
+        &self,
+        op: &enchudb_oplog::oplog::DecodedOp,
+        hlc: enchudb_oplog::Hlc,
+        author: enchudb_oplog::PeerId,
+    ) {
+        use enchudb_oplog::oplog::DecodedOp;
+        match op {
+            DecodedOp::Vocab { vid, bytes } => {
+                if !self.has_remote_vocab(author, *vid, bytes) {
+                    self.remote_vocab_apply(author, *vid, bytes);
+                }
+            }
+            DecodedOp::Tie { eid, himo_id, value } => {
+                let Some(le) = self.resolve_remote_eid(*eid, *himo_id) else { return };
+                let v = if self.himo_is_ref(*himo_id) {
+                    match self.resolve_remote_ref_value(author, *value, *himo_id) {
+                        Some(v) => v,
+                        None => return,
+                    }
+                } else {
+                    match self.try_translate_remote_vid(author, *himo_id, *value) {
+                        Some(v) => v,
+                        None => return,
+                    }
+                };
+                self.remote_tie_apply(le, *himo_id, v, hlc);
+            }
+            DecodedOp::TieRef { eid, himo_id, target } => {
+                let Some(le) = self.resolve_remote_eid(*eid, *himo_id) else { return };
+                let v = match self.resolve_remote_ref_value(
+                    enchudb_oplog::eid_peer(*target),
+                    enchudb_oplog::eid_local(*target),
+                    *himo_id,
+                ) {
+                    Some(v) => v,
+                    None => return,
+                };
+                self.remote_tie_apply(le, *himo_id, v, hlc);
+            }
+            DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => {
+                let Ok(hid) = self.ensure_himo_named(himo_name, *himo_kind) else { return };
+                let Some(le) = self.resolve_remote_eid(*eid, hid) else { return };
+                let Some(v) = self.try_translate_remote_vid(author, hid, *value) else { return };
+                self.remote_tie_apply(le, hid, v, hlc);
+            }
+            DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => {
+                let Ok(hid) = self.ensure_himo_named(himo_name, *himo_kind) else { return };
+                let Some(le) = self.resolve_remote_eid(*eid, hid) else { return };
+                self.remote_tieleaf_apply(le, hid, bytes, hlc);
+            }
+            DecodedOp::Untie { eid, himo_id } => {
+                let Some(le) = self.resolve_remote_eid(*eid, *himo_id) else { return };
+                self.remote_untie_apply(le, *himo_id, hlc);
+            }
+            DecodedOp::Delete { eid } => {
+                let Some(le) = self.resolve_remote_eid_existing(*eid) else { return };
+                self.remote_delete_apply(le, hlc);
+            }
+            DecodedOp::Content { eid, key, data } => {
+                let Some(le) = self.resolve_remote_eid_existing(*eid) else { return };
+                self.remote_content_apply(le, key, data, hlc);
+            }
+            DecodedOp::Commit => {}
         }
     }
 
@@ -9139,7 +10552,35 @@ impl Engine {
     /// 既存 `.wal` ファイルがあれば recover してから consumer 起動。
     /// (build phase で flush 済みなら本体は最新、 WAL は空のまま start)
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn concurrentize_with_oplog(mut eng: Self, oplog_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
+    pub fn concurrentize_with_oplog(eng: Self, oplog_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
+        Self::concurrentize_with_oplog_queue_opt(eng, oplog_capacity, None)
+    }
+
+    /// #116: `concurrentize_with_oplog` + write/oplog-record queue の capacity 上書き。
+    /// 多 DB 同居 / 低メモリ host は 4096〜16384 程度に落とすと per-DB の固定 RSS が
+    /// ~128MiB → ~1〜2MiB になる (queue は burst 吸収バッファなので、writer rate が
+    /// consumer を長時間超えない workload なら小さくて良い)。省略時 (= 既存 API) は
+    /// `max_entities` 連動の scaled default。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn concurrentize_with_oplog_queue(
+        eng: Self,
+        oplog_capacity: usize,
+        queue_capacity: usize,
+    ) -> io::Result<std::sync::Arc<Self>> {
+        Self::concurrentize_with_oplog_queue_opt(eng, oplog_capacity, Some(queue_capacity))
+    }
+
+    /// #116: `concurrentize` (oplog なし) + queue capacity 上書き。
+    pub fn concurrentize_queue(eng: Self, queue_capacity: usize) -> std::sync::Arc<Self> {
+        Self::spawn_consumer_with_oplog_queue_cap(eng, None, Some(queue_capacity))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn concurrentize_with_oplog_queue_opt(
+        mut eng: Self,
+        oplog_capacity: usize,
+        queue_capacity: Option<usize>,
+    ) -> io::Result<std::sync::Arc<Self>> {
         let path = eng.path.clone();
         let oplog_path = oplog_path_for(&path);
         // 古い .crc は WAL 活動後に stale になるので削除 (open_concurrent_with_oplog と同じ扱い)
@@ -9154,7 +10595,7 @@ impl Engine {
             // (`OpLog::recover_with_tail` の doc 参照)。
             let records = w.recover_with_tail();
             for rec in &records {
-                eng.apply_oplog_op(&rec.op, rec.hlc);
+                eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer);
             }
             // #77-H2: body msync → checkpoint の順 (open_concurrent_with_oplog と同じ)
             let _ = eng.body_msync();
@@ -9165,7 +10606,7 @@ impl Engine {
             std::sync::Arc::new(enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?)
         };
         eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
-        Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
+        Ok(Self::spawn_consumer_with_oplog_queue_cap(eng, Some(wal), queue_capacity))
     }
 
     fn spawn_consumer(eng: Self) -> std::sync::Arc<Self> {
@@ -9223,7 +10664,14 @@ impl Engine {
         use std::sync::atomic::AtomicBool;
         use crate::write_queue::WriteQueue;
 
-        let qc = queue_cap.unwrap_or(crate::write_queue::DEFAULT_WRITE_QUEUE_CAP);
+        // #116: default を DB の max_entities に連動させる。1M slot 固定は
+        // write_queue + oplog_record_queue の 2 本で per-DB ~128MiB を eager 確保し、
+        // per-tenant / per-user に DB を分ける構成の host 密度を RAM(GB)×~8 に縛る。
+        // 小 DB (max_entities が小さい) は queue も小さく、default 16M DB は従来
+        // どおり 1M slot (挙動不変)。floor 4096 は burst 吸収の下限。
+        let qc = queue_cap.unwrap_or_else(|| {
+            (eng.max_entities as usize).clamp(4096, crate::write_queue::DEFAULT_WRITE_QUEUE_CAP)
+        });
         let queue = Arc::new(WriteQueue::with_capacity(qc));
         let shutdown = Arc::new(AtomicBool::new(false));
         // WAL 有効時のみ oplog_record_queue を生やす。 writer は直接 wal.append せず
@@ -9375,7 +10823,7 @@ impl Engine {
                                     &emit_offset_for_thread,
                                 );
                             }
-                            // v30: ring buffer reset を試みる。head == checkpoint &&
+                            // ring buffer reset を試みる。head == checkpoint &&
                             // pending_writes == 0 のときだけ head/checkpoint を HEADER_SIZE に戻す。
                             // これで WAL 容量を食い切らずに長期運用できる。
                             // ※ auto_reset が発動して offset が後退したら listener cursor もリセット。
@@ -9390,7 +10838,28 @@ impl Engine {
                             // 0.18.2: bridge が未読領域を残している間（ring 満杯の
                             // backpressure 中）は畳まない。 畳むと未 bridge record が
                             // 消えて sync から無言で欠落する（実機発現）。
-                            if engine.wal_fold_safe() && wal.try_reset() {
+                            if Engine::trace_bridge_enabled() {
+                                eprintln!(
+                                    "[fold] try head={} cp={} offset={} safe={}",
+                                    wal.head(),
+                                    wal.checkpoint(),
+                                    engine.sync_ops_bridge_offset(),
+                                    engine.wal_fold_safe(),
+                                );
+                            }
+                            // fold は bridge cursor を巻き戻す (`reset_sync_ops_offset`)。
+                            // in-flight の `transfer_oplog_to_sync_ops` は入口で読んだ
+                            // `from` を元に **最後に** cursor を store するので、 fold と
+                            // 並走すると巻き戻しが stale 値で上書きされ、 cursor が head を
+                            // 追い越したまま固定する (= 新 ring の record が永久に scan
+                            // 対象外 + `wal_fold_safe` が offset>=head を「追いつき済み」と
+                            // 誤読して畳み続ける = 無言の恒久欠落)。 transfer と同じ lock を
+                            // 取って直列化する。 lock 順は transfer_lock → append_lock で
+                            // transfer 自身 (row insert → append) と同じなので deadlock しない。
+                            let fold_guard = engine.transfer_lock_for_fold();
+                            if engine.wal_fold_safe()
+                                && wal.try_reset_if(|| engine.wal_fold_safe_locked())
+                            {
                                 emit_offset_for_thread.store(
                                     enchudb_oplog::oplog::HEADER_SIZE as u64,
                                     Ordering::Release,
@@ -9399,6 +10868,7 @@ impl Engine {
                                 // これが無いと reset 後の record が sync 欠落する。
                                 engine.reset_sync_ops_offset();
                             }
+                            drop(fold_guard);
                             last_fsync = Instant::now();
                         }
                     }
@@ -9471,7 +10941,28 @@ impl Engine {
                             // short-lived writer (events.ecdb の log_event 等) でも
                             // 次 open が full のまま始まらないようにするため。
                             // 0.18.2: こちらも bridge 未読領域があるうちは畳まない。
-                            if engine.wal_fold_safe() && wal.try_reset() {
+                            if Engine::trace_bridge_enabled() {
+                                eprintln!(
+                                    "[fold] try head={} cp={} offset={} safe={}",
+                                    wal.head(),
+                                    wal.checkpoint(),
+                                    engine.sync_ops_bridge_offset(),
+                                    engine.wal_fold_safe(),
+                                );
+                            }
+                            // fold は bridge cursor を巻き戻す (`reset_sync_ops_offset`)。
+                            // in-flight の `transfer_oplog_to_sync_ops` は入口で読んだ
+                            // `from` を元に **最後に** cursor を store するので、 fold と
+                            // 並走すると巻き戻しが stale 値で上書きされ、 cursor が head を
+                            // 追い越したまま固定する (= 新 ring の record が永久に scan
+                            // 対象外 + `wal_fold_safe` が offset>=head を「追いつき済み」と
+                            // 誤読して畳み続ける = 無言の恒久欠落)。 transfer と同じ lock を
+                            // 取って直列化する。 lock 順は transfer_lock → append_lock で
+                            // transfer 自身 (row insert → append) と同じなので deadlock しない。
+                            let fold_guard = engine.transfer_lock_for_fold();
+                            if engine.wal_fold_safe()
+                                && wal.try_reset_if(|| engine.wal_fold_safe_locked())
+                            {
                                 emit_offset_for_thread.store(
                                     enchudb_oplog::oplog::HEADER_SIZE as u64,
                                     std::sync::atomic::Ordering::Release,
@@ -9479,6 +10970,7 @@ impl Engine {
                                 // #63 regression fix: bridge cursor も巻き戻す。
                                 engine.reset_sync_ops_offset();
                             }
+                            drop(fold_guard);
                         }
                         return;
                     }
@@ -9548,6 +11040,13 @@ impl Engine {
             // transfer しないと「committed だが bridge 未了」の record が wipe され
             // sync から永久に消える (sync lib テスト flaky の第 2 の根)。
             if self.sync_tables_enabled() {
+                if Self::trace_bridge_enabled() {
+                    eprintln!(
+                        "[sync] after checkpoint: head={} cp={} durable_head={durable_head}",
+                        wal.head(),
+                        wal.checkpoint(),
+                    );
+                }
                 self.transfer_oplog_to_sync_ops();
             }
             // changefeed: durable 化したので listener へ即時 push
@@ -9563,7 +11062,7 @@ impl Engine {
         self.durable_lsn.load(Ordering::Acquire)
     }
 
-    /// v29: エンジン状態の一覧。監視・デバッグ用。
+    /// エンジン状態の一覧。監視・デバッグ用。
     // ──── Phase F: 監査 ────
 
     /// WAL 監査: commit 済みレコードを filter して返す。
@@ -9844,6 +11343,9 @@ impl Engine {
                 // v4 (undo 廃止) 以降は no-op。 `entity()` で local slot は writer
                 // thread 側で既に allocate 済み。 ここに来るのは `flush_writes` の
                 // push_count / apply_count counter を対称に進めるためだけ (issue5)。
+                // #195: 新規 code はこの op を queue に積まない (counter 直接 bump に
+                // 置換 — blocking push が consumer 自身の bridge 経路で livelock を
+                // 起こした)。 variant と本 arm は互換のため残置。
             }
         }
     }
@@ -9867,7 +11369,14 @@ impl Engine {
         use std::sync::atomic::Ordering;
         self.check_writable();
         let local = enchudb_oplog::eid_local(eid);
-        assert!(value < u32::MAX, "value must be < u32::MAX (sentinel reserved)");
+        if value == u32::MAX {
+            // #59: sentinel 値は cell に入らない。 panic せず write を拒否 + 計上。
+            self.record_fault(
+                FaultKind::ValueOutOfRange,
+                "tie value == u32::MAX (sentinel reserved)",
+            );
+            return;
+        }
         debug_assert!((himo_id as usize) < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         // β-light step 6: eid が himo の所属 table eid_range 内か (anonymous
@@ -9904,7 +11413,7 @@ impl Engine {
         }
     }
 
-    /// v33: 非同期 tie_text。text 値を vocab に挿入し、WAL に Vocab + Tie の 2 op を流す。
+    /// 非同期 tie_text。text 値を vocab に挿入し、WAL に Vocab + Tie の 2 op を流す。
     ///
     /// 流れ:
     /// 1. local vocab に bytes を get_or_insert → `local_vid`
@@ -9940,6 +11449,15 @@ impl Engine {
         // (= 適用時点の cell を見る。 push 時 free は queue 未適用の二重 free を招く)。
         if let Some(leaf) = self.leaf_for(hid) {
             let off = leaf.insert(value);
+            if off == u32::MAX {
+                // #167: leaf payload を書けなかった (commit を伸ばせない = ディスク
+                // 満杯)。 sentinel を cell に書くと read が壊れるので write を拒否。
+                self.record_fault(
+                    FaultKind::DiskSpace,
+                    "leaf payload の格納に必要な commit を伸ばせない — text write を拒否",
+                );
+                return;
+            }
             // request17 step 4: push 側で採番、 op と record に同じ版数を載せる。
             // 採番 → push は `hlc_mint_lock` で 1 単位に。
             let _mint = self.mint_guard();
@@ -9970,7 +11488,15 @@ impl Engine {
             ValueType::Leaf => self.vocab.insert(value),
             ht => panic!("tie_bytes_async_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
-        assert!(vid < u32::MAX, "vocab vid must be < u32::MAX (sentinel reserved)");
+        if vid == u32::MAX {
+            // #59: vocab 満杯 (insert が sentinel を返した) or sentinel 値。
+            self.record_fault(
+                FaultKind::VocabSpace,
+                "vocab vid == u32::MAX — text write rejected (vocab_max_entries 到達か \
+                 sentinel 値)。 GrowableOptions { vocab_max_entries: Some(n), .. } を参照",
+            );
+            return;
+        }
         // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
         // request17 step 4: Vocab は cell を持たない (= 版数の対象外) が、 record queue は
         // 版数付きで運ぶので Tie の手前で 1 個採番しておく (WAL 上の並びと HLC の
@@ -10008,11 +11534,11 @@ impl Engine {
         }
     }
 
-    /// v33: 非同期 tie_ref。target_eid の local 部(u32)を WAL / 本体に運ぶ。
+    /// 非同期 tie_ref。target_eid の local 部(u32)を WAL / 本体に運ぶ。
     /// target_eid は u64 [peer|local] だが、現行 WAL は value: u32 しか運べないため
     /// peer_id 部は捨てる。すなわち receiver 側では「author_peer と同一 peer 上の entity」を
     /// 指す ref として再構成される。cross-peer ref (peer A が peer B の entity を指す)は
-    /// 現状未対応 (Ref 用 WAL op を別途用意する必要あり、v34 以降)。
+    /// 現状未対応 (Ref 用 WAL op を別途用意する必要あり)。
     pub fn tie_ref_async(&self, eid: enchudb_oplog::EntityId, himo: &str, target_eid: enchudb_oplog::EntityId) {
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo)) as u16;
@@ -10025,7 +11551,13 @@ impl Engine {
         self.check_writable();
         let local = enchudb_oplog::eid_local(eid);
         let target_local = enchudb_oplog::eid_local(target_eid);
-        assert!(target_local < u32::MAX, "target_local must be < u32::MAX");
+        if target_local == u32::MAX {
+            self.record_fault(
+                FaultKind::ValueOutOfRange,
+                "tie_ref target_local == u32::MAX (sentinel reserved)",
+            );
+            return;
+        }
         debug_assert!((himo_id as usize) < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         // β-light step 6: eid が himo の所属 table eid_range 内か
@@ -10134,6 +11666,12 @@ impl Engine {
     /// oplog への参照(テスト / 内部用)。
     pub fn oplog(&self) -> Option<&std::sync::Arc<enchudb_oplog::oplog::OpLog>> { self.oplog.as_ref() }
 
+    /// #116: write queue の slot 数 (観測用)。concurrent mode でなければ None。
+    /// oplog_record_queue も同じ capacity で確保される。
+    pub fn write_queue_capacity(&self) -> Option<usize> {
+        self.write_queue.as_ref().map(|q| q.capacity())
+    }
+
     /// push 済みの全 Op が apply 完了するまで spin 待ち。`tie_async` の同期点。
     /// `queue.is_empty()` は pop 直後 / apply 前のウィンドウで true になる race が
     /// あるため、push_count と apply_count の累積カウンタで apply 完了を待つ。
@@ -10190,7 +11728,7 @@ impl Engine {
             buf[off..off + 4].copy_from_slice(&self.himo_max_values[hid].to_le_bytes());
         }
         buf[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&hc.to_le_bytes());
-        // v28: ヘッダ整合性 CRC(himo_count 含む固定レイアウト部のみを対象)
+        // ヘッダ整合性 CRC(himo_count 含む固定レイアウト部のみを対象)
         write_header_crc(buf);
 
         // 全 region を disk に同期した後、 vocab/himo_reg の index 整合性 OK
@@ -10247,7 +11785,7 @@ impl Engine {
         self.vocab.rebuilt_on_load
     }
 
-    /// v29: region CRC を計算して `.crc` sidecar に永続化する。
+    /// region CRC を計算して `.crc` sidecar に永続化する。
     /// flush() とは別の opt-in API。512MB+ の vocab 走査を含むので秒オーダー。
     /// コールドバックアップを封緘するユースケース向け。
     #[cfg(not(target_arch = "wasm32"))]
@@ -10308,6 +11846,225 @@ impl Drop for Engine {
 }
 
 // ════════════════ テスト ════════════════
+
+#[cfg(test)]
+mod sync_ops_purge_tests {
+    use super::*;
+
+    fn tmp_engine(tag: &str) -> Engine {
+        let path = format!(
+            "{}/enchudb-purge-{}-{}",
+            std::env::temp_dir().display(),
+            tag,
+            std::process::id()
+        );
+        for suf in ["", ".tables", ".oplog"] {
+            let _ = std::fs::remove_file(format!("{path}{suf}"));
+        }
+        let mut eng = Engine::create_with_capacity(&path, 4096).unwrap();
+        eng.define_table("t", 100).unwrap();
+        eng.enable_sync_tables().unwrap();
+        eng
+    }
+
+    /// #221 (review 2): free list への producer は purge helper だけではない —
+    /// `rebuild_free_locals` (枯渇 slow path) が非 live local を穴として push する。
+    /// purge が delete 後 push 前に中断されると同じ slot が両者から入る。
+    ///
+    /// ここでは逐次順序での不変条件だけを確認する: purge 済み slot に対して rebuild を
+    /// 走らせても free list に重複が生まれない (rebuild は非空を見て早期 return)。
+    /// **窓そのものは逐次では作れない**ので、 これは回帰検知であって window の
+    /// guard ではない (`concurrent_exhaustion_and_purge_do_not_duplicate_slots` の
+    /// 注意書きも参照)。
+    #[test]
+    fn rebuild_does_not_duplicate_purged_slots() {
+        let eng = tmp_engine("rebuild");
+        let lsn_hid = eng.himo_id("_sync_ops.lsn").unwrap() as u16;
+        let tid = eng.tables.iter().position(|t| t.name == "_sync_ops").unwrap();
+
+        let mut eids = Vec::new();
+        for i in 0..8u32 {
+            let e = eng.entity_in("_sync_ops").unwrap();
+            eng.tie_to_by_id(e, lsn_hid, i + 1);
+            eids.push((e, i + 1));
+        }
+        for (e, lsn) in &eids {
+            assert!(eng.purge_sync_ops_row(*e, lsn_hid, *lsn));
+        }
+
+        // 枯渇 slow path 相当: 非 live local を scan して穴を push する経路。
+        eng.rebuild_free_locals(tid);
+
+        let list = eng.tables[tid].free_locals.lock().unwrap().clone();
+        let mut uniq = list.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(
+            list.len(),
+            uniq.len(),
+            "#221: free list に slot が二重に入った (purge と rebuild の二重 push): {list:?}"
+        );
+    }
+
+    /// #221 (review 2): purge と **枯渇 slow path (`rebuild_free_locals`)** を並行
+    /// させても free list に slot が二重に入らないこと。
+    ///
+    /// purge が `free_locals` を delete の前に取らないと、 「delete 済み・push 前」の
+    /// 中間状態を rebuild の scan が観測して同じ slot を独立に push する。
+    ///
+    /// **注意: この test は窓が閉じていることの証明にはならない。** 発火には
+    /// 「free list が空 + 枯渇 + purge が delete と push の間」の同時成立が要り、
+    /// fix を外した状態でも緑のままだった (3 回試行)。 回帰検知として置いているが、
+    /// 正しさの根拠は helper 側の lock 順序 (doc 参照) であってこの test ではない。
+    #[test]
+    fn concurrent_exhaustion_and_purge_do_not_duplicate_slots() {
+        let eng = std::sync::Arc::new(tmp_engine("exhaust"));
+        let lsn_hid = eng.himo_id("_sync_ops.lsn").unwrap() as u16;
+        let tid = eng.tables.iter().position(|t| t.name == "_sync_ops").unwrap();
+
+        // ring をほぼ埋める (次の alloc が枯渇 → rebuild_free_locals を踏む状態)。
+        let range = eng.tables[tid].eid_range_hi - eng.tables[tid].eid_range_lo;
+        let fill = range.saturating_sub(4);
+        let mut rows = Vec::with_capacity(fill as usize);
+        for i in 0..fill {
+            let e = eng.entity_in("_sync_ops").unwrap();
+            eng.tie_to_by_id(e, lsn_hid, i + 1);
+            rows.push((e, i + 1));
+        }
+
+        // A: 前半 row を purge (free list に slot を返す)
+        // B: 枯渇まで alloc し続ける (= rebuild_free_locals を繰り返し踏む)
+        let purger = {
+            let eng = eng.clone();
+            let rows: Vec<_> = rows.iter().take(rows.len() / 2).copied().collect();
+            std::thread::spawn(move || {
+                for (e, lsn) in rows {
+                    eng.purge_sync_ops_row(e, lsn_hid, lsn);
+                }
+            })
+        };
+        let allocator = {
+            let eng = eng.clone();
+            std::thread::spawn(move || {
+                for i in 0..2000u32 {
+                    match eng.entity_in("_sync_ops") {
+                        Ok(e) => eng.tie_to_by_id(e, lsn_hid, 1_000_000 + i),
+                        Err(_) => std::thread::yield_now(),
+                    }
+                }
+            })
+        };
+        purger.join().unwrap();
+        allocator.join().unwrap();
+
+        let list = eng.tables[tid].free_locals.lock().unwrap().clone();
+        let mut uniq = list.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(
+            list.len(),
+            uniq.len(),
+            "#221: purge と rebuild_free_locals の並行で slot が二重 push された \
+             (free list {} entries, {} unique)",
+            list.len(),
+            uniq.len()
+        );
+    }
+
+    /// #221 (review): purge の再検証は「生存」ではなく **`expected_lsn` 一致**で
+    /// 行うこと (ABA)。
+    ///
+    /// 生存だけを見ると、 T1 の purge で解放された slot が bridge に再利用されて
+    /// 同一 eid に新 row が乗った後、 T2 が stale snapshot で「生存」と判定して
+    /// **その新 row を消す**。 slot は pop 済みなので dedupe も効かない。 この窓は
+    /// ring 再利用が常時走る運転 (reclaim + bridge の並行) で開く。
+    ///
+    /// ここでは interleaving を手で固定して核を検証する:
+    /// T1 purge → slot 再利用 (同一 eid に新 lsn) → T2 が stale lsn で purge。
+    #[test]
+    fn stale_snapshot_does_not_purge_the_reused_slot() {
+        let eng = tmp_engine("aba");
+        let lsn_hid = eng.himo_id("_sync_ops.lsn").unwrap() as u16;
+
+        // row A: lsn = 5
+        let eid = eng.entity_in("_sync_ops").unwrap();
+        eng.tie_to_by_id(eid, lsn_hid, 5);
+        assert_eq!(eng.get_by_id(eid, lsn_hid), Some(5));
+
+        // T1 相当: snapshot (eid, lsn=5) で purge → slot が free list へ
+        assert!(eng.purge_sync_ops_row(eid, lsn_hid, 5), "T1 の purge が成立すること");
+        assert_eq!(eng.get_by_id(eid, lsn_hid), None);
+
+        // bridge 相当: 解放 slot を再利用して **同一 eid** に新 row (lsn = 900)
+        let reused = eng.entity_in("_sync_ops").unwrap();
+        assert_eq!(reused, eid, "前提: 解放 slot が再利用されて同じ eid になる");
+        eng.tie_to_by_id(reused, lsn_hid, 900);
+
+        // T2 相当: stale snapshot (lsn=5) のまま purge を試みる。
+        // 生存判定だけの実装はここで新 row を消してしまう。
+        assert!(
+            !eng.purge_sync_ops_row(eid, lsn_hid, 5),
+            "#221 ABA: stale snapshot が再利用後の row を purge した"
+        );
+        assert_eq!(
+            eng.get_by_id(eid, lsn_hid),
+            Some(900),
+            "#221 ABA: bridge されたばかりの row が silent に消えた"
+        );
+
+        // 正しい snapshot なら消せる (検証が過剰に厳しくないこと)。
+        assert!(eng.purge_sync_ops_row(eid, lsn_hid, 900));
+        assert_eq!(eng.get_by_id(eid, lsn_hid), None);
+    }
+}
+
+#[cfg(test)]
+mod reclaimed_floor_tests {
+    use super::*;
+
+    fn tmp_engine(tag: &str) -> Engine {
+        let path = format!(
+            "{}/enchudb-floor-{}-{}",
+            std::env::temp_dir().display(),
+            tag,
+            std::process::id()
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.tables"));
+        let mut eng = Engine::create_with_capacity(&path, 4096).unwrap();
+        eng.define_table("t", 100).unwrap();
+        eng.enable_sync_tables().unwrap();
+        eng
+    }
+
+    fn hlc(wall: u64) -> enchudb_oplog::Hlc {
+        enchudb_oplog::Hlc { wall, logical: 0, peer: 0 }
+    }
+
+    /// #216 (review): 無帰属 sentinel (`u32::MAX` = legacy scalar 由来) は
+    /// v2 entry と共存して**温存**され、 `sync_reclaimed_floors` は sentinel 込みで
+    /// Some を返す (None に落とすと legacy floor を持つ既存 DB で per-author 判定が
+    /// 一生有効化されない)。 scalar view は全 entry の max。
+    #[test]
+    fn sentinel_baseline_is_preserved_and_exposed() {
+        let eng = tmp_engine("sentinel");
+        eng.record_reclaimed_floors(&[(u32::MAX, hlc(100))]);
+        eng.record_reclaimed_floors(&[(1, hlc(50)), (2, hlc(200))]);
+
+        let floors = eng.sync_reclaimed_floors().expect("floor 記録済み");
+        assert!(
+            floors.contains(&(u32::MAX, hlc(100))),
+            "sentinel が消えた: {floors:?}"
+        );
+        assert!(floors.contains(&(1, hlc(50))) && floors.contains(&(2, hlc(200))));
+        assert_eq!(eng.sync_reclaimed_floor(), Some(hlc(200)), "scalar view = max");
+
+        // 単調 max merge: 古い値では下がらない
+        eng.record_reclaimed_floors(&[(2, hlc(150))]);
+        let floors = eng.sync_reclaimed_floors().unwrap();
+        assert!(floors.contains(&(2, hlc(200))), "floor が後退した: {floors:?}");
+    }
+}
 
 #[cfg(test)]
 mod layout_v9_tests {
@@ -10406,7 +12163,7 @@ mod cell_version_tests {
         let mut eng = Engine::create_with_capacity(&tmp(name), 1024).unwrap();
         eng.define_himo(himo, ValueType::Number, 0);
         let hid = eng.himo_id(himo).unwrap() as u16;
-        let eid = eng.entity();
+        let eid = eng.entity().unwrap();
         (eng, hid, eid)
     }
 
@@ -10494,7 +12251,7 @@ mod cell_version_tests {
         let mut eng = Engine::create_without_cell_version(&tmp("prev9_write"), 1024).unwrap();
         eng.define_himo("age", ValueType::Number, 0);
         let hid = eng.himo_id("age").unwrap() as u16;
-        let eid = eng.entity();
+        let eid = eng.entity().unwrap();
 
         assert!(eng.set_cell(eid, hid, 1, hlc(200, 1)));
         assert!(!eng.set_cell(eid, hid, 2, hlc(100, 1)), "古い HLC を採用した");
@@ -10593,13 +12350,13 @@ mod cell_version_tests {
         eng.define_himo("age", ValueType::Number, 0);
         let hid = eng.himo_id("age").unwrap() as u16;
 
-        let a = eng.entity();
-        let b = eng.entity(); // ここで max_entities (2) を使い切る
+        let a = eng.entity().unwrap();
+        let b = eng.entity().unwrap(); // ここで max_entities (2) を使い切る
         assert!(eng.set_cell(b, hid, 42, hlc(300, 1)));
         assert!(eng.set_tombstone(b, hlc(300, 1)));
         eng.delete(b);
 
-        let reused = eng.entity(); // free stack から b の slot を再利用
+        let reused = eng.entity().unwrap(); // free stack から b の slot を再利用
         assert_ne!(enchudb_oplog::eid_local(reused), enchudb_oplog::eid_local(a));
         assert_eq!(
             enchudb_oplog::eid_local(reused),
@@ -10674,7 +12431,7 @@ mod cell_version_tests {
     #[test]
     fn sync_local_tie_records_the_same_hlc_as_the_record() {
         let (eng, hid) = v9_with_wal("sync_tie", "age");
-        let eid = eng.entity();
+        let eid = eng.entity().unwrap();
         eng.tie_to(eid, "age", 42);
         eng.flush_writes();
 
@@ -10693,7 +12450,7 @@ mod cell_version_tests {
     #[test]
     fn sync_local_untie_advances_the_version() {
         let (eng, hid) = v9_with_wal("sync_untie", "age");
-        let eid = eng.entity();
+        let eid = eng.entity().unwrap();
         eng.tie_to(eid, "age", 42);
         let after_tie = eng.cell_hlc(eid, hid);
         eng.untie(eid, "age");
@@ -10710,7 +12467,7 @@ mod cell_version_tests {
     #[test]
     fn sync_local_delete_records_tombstone() {
         let (eng, _hid) = v9_with_wal("sync_delete", "age");
-        let eid = eng.entity();
+        let eid = eng.entity().unwrap();
         eng.tie_to(eid, "age", 42);
         assert_eq!(eng.tombstone_hlc(eid), Hlc::ZERO);
 
@@ -10731,7 +12488,7 @@ mod cell_version_tests {
     #[test]
     fn async_write_puts_the_same_hlc_on_cell_and_record() {
         let (eng, hid) = v9_with_wal("async_tie", "age");
-        let eid = eng.entity();
+        let eid = eng.entity().unwrap();
         eng.tie_async(eid, "age", 7);
         eng.tie_async(eid, "age", 8);
         eng.flush_writes();
@@ -10757,7 +12514,7 @@ mod cell_version_tests {
     #[test]
     fn async_untie_and_delete_are_versioned() {
         let (eng, hid) = v9_with_wal("async_untie", "age");
-        let eid = eng.entity();
+        let eid = eng.entity().unwrap();
         eng.tie_async(eid, "age", 7);
         eng.flush_writes();
         let after_tie = eng.cell_hlc(eid, hid);
@@ -10767,7 +12524,7 @@ mod cell_version_tests {
         assert!(eng.cell_hlc(eid, hid) > after_tie, "async untie が版数を進めていない");
         assert_eq!(eng.get(eid, "age"), None);
 
-        let eid2 = eng.entity();
+        let eid2 = eng.entity().unwrap();
         eng.tie_async(eid2, "age", 9);
         eng.delete_async(eid2);
         eng.flush_writes();
@@ -10788,8 +12545,8 @@ mod cell_version_tests {
             let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
             eng.define_himo("age", ValueType::Number, 0);
             let hid = eng.himo_id("age").unwrap() as u16;
-            let eid = eng.entity();
-            let other = eng.entity();
+            let eid = eng.entity().unwrap();
+            let other = eng.entity().unwrap();
             assert!(eng.has_cell_version(), "通常 create が v9 領域を確保していない");
             assert!(eng.set_cell(eid, hid, 42, hlc(500, 7)));
             assert!(eng.set_tombstone(other, hlc(600, 7)));
@@ -10805,7 +12562,7 @@ mod cell_version_tests {
 
         // 記憶が残っているので、 reopen 後も古い record は負ける
         assert!(
-            !eng.remote_tie_apply(eid, hid, 9, hlc(400, 7), None),
+            !eng.remote_tie_apply(eid, hid, 9, hlc(400, 7)),
             "reopen 後に古い record が勝った (版数が永続していない)",
         );
         assert_eq!(eng.get(eid, "age"), Some(42));
@@ -10833,7 +12590,7 @@ mod cell_version_tests {
         // 末尾寄りの eid ほど commit の外 — 手前だけ触って満足しないように広く書く。
         let mut eids = Vec::new();
         for i in 0..64u32 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie_to(e, "age", i);
             eids.push(e);
         }
@@ -10866,7 +12623,7 @@ mod cell_version_tests {
             let mut eng = Engine::create_without_cell_version(&path, 1024).unwrap();
             eng.define_himo("age", ValueType::Number, 0);
             let hid = eng.himo_id("age").unwrap() as u16;
-            let eid = eng.entity();
+            let eid = eng.entity().unwrap();
             eng.tie_to(eid, "age", 7);
             eng.flush().unwrap();
             (eid, hid)
@@ -10882,7 +12639,7 @@ mod cell_version_tests {
         );
         // 版数不明なので remote record は従来どおり適用される
         assert!(
-            eng.remote_tie_apply(eid, hid, 9, hlc(400, 7), None),
+            eng.remote_tie_apply(eid, hid, 9, hlc(400, 7)),
             "版数不明 cell への remote apply を止めた (既存 DB が同期不能になる)",
         );
         assert_eq!(eng.get(eid, "age"), Some(9));
@@ -10896,16 +12653,16 @@ mod cell_version_tests {
     #[test]
     fn tombstone_blocks_older_remote_tie() {
         let (eng, hid) = v9_with_wal("tomb_remote", "age");
-        let eid = eng.entity();
+        let eid = eng.entity().unwrap();
 
-        assert!(eng.remote_delete_apply(eid, hlc(1000, 1), None));
+        assert!(eng.remote_delete_apply(eid, hlc(1000, 1)));
         assert!(
-            !eng.remote_tie_apply(eid, hid, 5, hlc(900, 1), None),
+            !eng.remote_tie_apply(eid, hid, 5, hlc(900, 1)),
             "削除より古い Tie が蘇った",
         );
         assert_eq!(eng.get(eid, "age"), None);
         assert!(
-            eng.remote_tie_apply(eid, hid, 6, hlc(1100, 1), None),
+            eng.remote_tie_apply(eid, hid, 6, hlc(1100, 1)),
             "削除より新しい Tie が入らない",
         );
         assert_eq!(eng.get(eid, "age"), Some(6));
@@ -10915,17 +12672,17 @@ mod cell_version_tests {
     #[test]
     fn remote_apply_is_lww_without_any_sync_layer_help() {
         let (eng, hid) = v9_with_wal("remote_lww", "age");
-        let eid = eng.entity();
+        let eid = eng.entity().unwrap();
 
-        assert!(eng.remote_tie_apply(eid, hid, 1, hlc(200, 1), None));
-        assert!(!eng.remote_tie_apply(eid, hid, 2, hlc(100, 1), None), "古い record を適用した");
+        assert!(eng.remote_tie_apply(eid, hid, 1, hlc(200, 1)));
+        assert!(!eng.remote_tie_apply(eid, hid, 2, hlc(100, 1)), "古い record を適用した");
         assert_eq!(eng.get(eid, "age"), Some(1));
-        assert!(eng.remote_tie_apply(eid, hid, 3, hlc(300, 1), None));
+        assert!(eng.remote_tie_apply(eid, hid, 3, hlc(300, 1)));
         assert_eq!(eng.get(eid, "age"), Some(3));
         assert_eq!(eng.cell_hlc(eid, hid), hlc(300, 1), "remote の版数が cell に残っていない");
         // untie も同じ判定
-        assert!(!eng.remote_untie_apply(eid, hid, hlc(250, 1), None));
-        assert!(eng.remote_untie_apply(eid, hid, hlc(400, 1), None));
+        assert!(!eng.remote_untie_apply(eid, hid, hlc(250, 1)));
+        assert!(eng.remote_untie_apply(eid, hid, hlc(400, 1)));
         assert_eq!(eng.get(eid, "age"), None);
     }
 
@@ -10938,7 +12695,7 @@ mod cell_version_tests {
     #[test]
     fn local_write_still_wins_after_a_far_future_remote_hlc() {
         let (eng, hid) = v9_with_wal("clock_merge", "age");
-        let eid = eng.entity();
+        let eid = eng.entity().unwrap();
 
         // 10 年先の clock を持つ peer からの record
         let now_ms = std::time::SystemTime::now()
@@ -10946,7 +12703,7 @@ mod cell_version_tests {
             .unwrap()
             .as_millis() as u64;
         let far_future = Hlc { wall: now_ms + 10 * 365 * 24 * 3600 * 1000, logical: 0, peer: 9 };
-        assert!(eng.remote_tie_apply(eid, hid, 7, far_future, None));
+        assert!(eng.remote_tie_apply(eid, hid, 7, far_future));
         assert_eq!(eng.get(eid, "age"), Some(7));
 
         // 直後のローカル write が負けてはいけない
@@ -10974,8 +12731,8 @@ mod cell_version_tests {
         eng.define_himo("name", ValueType::Tag, 0);
         let eng = Engine::concurrentize_with_oplog(eng, 1024 * 1024).unwrap();
 
-        let e1 = eng.entity();
-        let e2 = eng.entity();
+        let e1 = eng.entity().unwrap();
+        let e2 = eng.entity().unwrap();
         // 同期経路: text tie は Vocab + Tie の 2 record を出す
         eng.tie_text_to(e1, "name", "alice");
         eng.tie_to(e1, "age", 30);
@@ -11009,7 +12766,7 @@ mod cell_version_tests {
         let hid = eng.himo_id("age").unwrap() as u16;
         let eng = Engine::concurrentize_with_oplog(eng, 1024 * 1024).unwrap();
 
-        let eid = eng.entity();
+        let eid = eng.entity().unwrap();
         eng.tie_to(eid, "age", 1);
         eng.tie_async(eid, "age", 2);
         eng.flush_writes();
@@ -11032,7 +12789,7 @@ mod cell_version_tests {
         let (mut eng, hid_a, e1) = v9_engine("per_cell", "a");
         eng.define_himo("b", ValueType::Number, 0);
         let hid_b = eng.himo_id("b").unwrap() as u16;
-        let e2 = eng.entity();
+        let e2 = eng.entity().unwrap();
 
         assert!(eng.set_cell(e1, hid_a, 1, hlc(300, 1)));
         assert!(eng.set_cell(e1, hid_b, 2, hlc(100, 1)), "himo a の版数が b を塞いだ");
@@ -11064,6 +12821,113 @@ mod tests {
         eng.query(conds).len()
     }
 
+    /// **fold の cursor 巻き戻しは、 巻き戻し前の `from` を握った in-flight transfer の
+    /// store に上書きされてはならない。**
+    ///
+    /// `transfer_oplog_to_sync_ops` は入口で `from` を読み、 最後に cursor を進める。
+    /// その間に fold (`try_reset` + `reset_sync_ops_offset`) が入ると、 素の store は
+    /// 巻き戻しを stale 値で上書きし、 cursor が head を追い越したまま固定する。
+    /// そうなると scan は永久に 0 件、 かつ `wal_fold_safe` が `offset >= head` を
+    /// 「追いつき済み」 と誤読して畳み続けるので、 新 ring の record は無言で恒久欠落する
+    /// (実測: 300 iter の stress で ~15% の run で 1 件消えた)。
+    #[test]
+    fn stale_transfer_store_cannot_clobber_a_fold_rewind() {
+        let path = tmp("bridge_cursor_clobber");
+        for suffix in ["", ".oplog", ".tables", ".crc", ".lock"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
+        {
+            let mut eng = Engine::create_standalone(&path).unwrap();
+            eng.define_table("rows", 1_000).unwrap();
+            eng.define_himo_in("rows", "val", ValueType::Number, 1_000).unwrap();
+            eng.enable_sync_tables().unwrap();
+            eng.flush().unwrap();
+        }
+        let eng = Engine::open_concurrent_with_oplog(&path, 4 * 1024 * 1024).unwrap();
+        eng.set_peer_id(1);
+        let hid = eng.himo_id("rows.val").unwrap() as u16;
+
+        // bridge を 1 回走らせて cursor を進める
+        let e = eng.entity_in("rows").unwrap();
+        eng.tie_async_by_id(e, hid, 7);
+        eng.oplog_sync().unwrap();
+        let advanced = eng.sync_ops_bridge_offset();
+        assert!(
+            advanced > enchudb_oplog::oplog::HEADER_SIZE as u64,
+            "premise: bridge が cursor を進めていること (offset={advanced})"
+        );
+
+        // fold の巻き戻しを再現
+        eng.reset_sync_ops_offset();
+        assert_eq!(
+            eng.sync_ops_bridge_offset(),
+            enchudb_oplog::oplog::HEADER_SIZE as u64,
+            "premise: 巻き戻しが効いていること"
+        );
+
+        // 巻き戻し前に読んだ `from` を握った transfer が cursor を進めようとする。
+        // trace で実際に観測されたのは records 空 (= from == committed_end) の path。
+        eng.advance_sync_ops_cursor(advanced, advanced);
+
+        assert_eq!(
+            eng.sync_ops_bridge_offset(),
+            enchudb_oplog::oplog::HEADER_SIZE as u64,
+            "stale store が fold の巻き戻しを上書きした (= 新 ring の record が恒久欠落する)"
+        );
+        assert_eq!(
+            eng.sync_ops_cursor_repairs(),
+            1,
+            "上書きを弾いたことが観測できること"
+        );
+        for suffix in ["", ".oplog", ".tables", ".crc", ".lock"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
+    }
+
+    /// **cursor が head を追い越した状態は 「畳んでよい」 ではなく 「不整合」。**
+    ///
+    /// `wal_fold_safe` は `offset >= head` で fold を許可していたため、 上の lost update で
+    /// 壊れた cursor を 「bridge 追いつき済み」 と読んで畳み続けていた。 追い越しは
+    /// 検出して畳まず、 ring 先頭へ巻き戻す (最悪 重複配布、 apply は冪等)。
+    #[test]
+    fn cursor_overtaking_head_blocks_the_fold_and_self_heals() {
+        let path = tmp("bridge_cursor_overtake");
+        for suffix in ["", ".oplog", ".tables", ".crc", ".lock"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
+        {
+            let mut eng = Engine::create_standalone(&path).unwrap();
+            eng.define_table("rows", 1_000).unwrap();
+            eng.define_himo_in("rows", "val", ValueType::Number, 1_000).unwrap();
+            eng.enable_sync_tables().unwrap();
+            eng.flush().unwrap();
+        }
+        let eng = Engine::open_concurrent_with_oplog(&path, 4 * 1024 * 1024).unwrap();
+        eng.set_peer_id(1);
+        let hid = eng.himo_id("rows.val").unwrap() as u16;
+        let e = eng.entity_in("rows").unwrap();
+        eng.tie_async_by_id(e, hid, 9);
+        eng.oplog_sync().unwrap();
+
+        let head = eng.oplog.as_ref().unwrap().head();
+        eng.sync_ops_offset
+            .store(head + 4096, std::sync::atomic::Ordering::Release);
+
+        assert!(
+            !eng.wal_fold_safe(),
+            "cursor が head を追い越しているのに fold を許可した"
+        );
+        assert_eq!(
+            eng.sync_ops_bridge_offset(),
+            enchudb_oplog::oplog::HEADER_SIZE as u64,
+            "追い越しを検出したら ring 先頭へ巻き戻すこと"
+        );
+        assert!(eng.sync_ops_cursor_repairs() >= 1, "修復が観測できること");
+        for suffix in ["", ".oplog", ".tables", ".crc", ".lock"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
+    }
+
     /// #128: 進捗の無い Retry 連発 (= crash 残骸の odd gen) では reader が
     /// hang せず **有限時間で None** に落ちること。 進捗検出付き retry loop
     /// (text_owned_by_id) の escape 経路の regression test。
@@ -11072,7 +12936,7 @@ mod tests {
         let dir = tmp("issue128_stall");
         let mut eng = Engine::create_growable(&dir).unwrap();
         eng.define_himo("body", ValueType::Leaf, 0);
-        let eid = eng.entity();
+        let eid = eng.entity().unwrap();
         eng.tie_text(eid, "body", "hello-leaf-body");
         assert_eq!(
             eng.get_text_owned(eid, "body").as_deref(),
@@ -11106,8 +12970,8 @@ mod tests {
         let dir = tmp("ent_create");
         let mut eng = Engine::create_standalone(&dir).unwrap();
         assert_eq!(eng.entity_count(), 0);
-        let e0 = eng.entity();
-        let e1 = eng.entity();
+        let e0 = eng.entity().unwrap();
+        let e1 = eng.entity().unwrap();
         assert_eq!(eng.entity_count(), 2);
         assert_eq!(eng.entities(), vec![e0, e1]);
         let _ = std::fs::remove_file(&dir);
@@ -11117,16 +12981,16 @@ mod tests {
     fn entity_delete_and_reuse() {
         let dir = tmp("ent_del");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        let e0 = eng.entity();
-        let e1 = eng.entity();
-        let e2 = eng.entity();
+        let e0 = eng.entity().unwrap();
+        let e1 = eng.entity().unwrap();
+        let e2 = eng.entity().unwrap();
 
         eng.delete(e1);
         assert_eq!(eng.entity_count(), 2);
         assert_eq!(eng.entities(), vec![e0, e2]);
 
         // 上限前は欠番（monotonic）— IDは再利用されない
-        let e3 = eng.entity();
+        let e3 = eng.entity().unwrap();
         assert_eq!(e3, 3); // e1(=1)ではなく新規ID
         assert_eq!(eng.entity_count(), 3);
         let _ = std::fs::remove_file(&dir);
@@ -11138,7 +13002,7 @@ mod tests {
     fn tie_text_roundtrip() {
         let dir = tmp("tie_text");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_text(e, "name", "田中");
         assert_eq!(eng.get_text(e, "name"), Some("田中".as_bytes()));
         let _ = std::fs::remove_file(&dir);
@@ -11148,7 +13012,7 @@ mod tests {
     fn tie_value_roundtrip() {
         let dir = tmp("tie_val");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "age", 30);
         assert_eq!(eng.get(e, "age"), Some(30));
         let _ = std::fs::remove_file(&dir);
@@ -11158,8 +13022,8 @@ mod tests {
     fn tie_entity_ref() {
         let dir = tmp("tie_eref");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        let parent = eng.entity();
-        let child = eng.entity();
+        let parent = eng.entity().unwrap();
+        let child = eng.entity().unwrap();
         eng.tie_ref(child, "company", parent);
         assert_eq!(eng.get(child, "company"), Some(parent as u32));
         eng.rebuild();
@@ -11172,7 +13036,7 @@ mod tests {
     fn tie_overwrite() {
         let dir = tmp("tie_ow");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "score", 100);
         eng.tie(e, "score", 200);
         assert_eq!(eng.get(e, "score"), Some(200));
@@ -11185,7 +13049,7 @@ mod tests {
     fn tie_value_zero() {
         let dir = tmp("tie_zero");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "level", 0);
         assert_eq!(eng.get(e, "level"), Some(0));
         assert_eq!(qc(&mut eng, &[("level", 0)]), 1);
@@ -11198,7 +13062,7 @@ mod tests {
     fn untie_removes_value() {
         let dir = tmp("untie");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "age", 30);
         eng.tie_text(e, "name", "X");
 
@@ -11215,7 +13079,7 @@ mod tests {
     fn delete_removes_all_ties() {
         let dir = tmp("del_ties");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "age", 30);
         eng.tie_text(e, "name", "田中");
 
@@ -11232,7 +13096,7 @@ mod tests {
     fn content_set_get() {
         let dir = tmp("content");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.content(e, "memo", b"hello");
         eng.content(e, "notes", "日本語".as_bytes());
         assert_eq!(eng.get_content(e, "memo"), Some(b"hello".as_ref()));
@@ -11247,7 +13111,7 @@ mod tests {
     fn himos_of_entity() {
         let dir = tmp("himos_of");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "age", 30);
         eng.tie_text(e, "name", "X");
         let h = eng.himos_of(e);
@@ -11261,7 +13125,7 @@ mod tests {
     fn himo_names_all() {
         let dir = tmp("himo_names");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "x", 1);
         eng.tie_text(e, "y", "a");
         eng.tie_ref(e, "z", e);
@@ -11279,11 +13143,11 @@ mod tests {
     fn query_single_condition() {
         let dir = tmp("q_single");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        let e0 = eng.entity();
+        let e0 = eng.entity().unwrap();
         eng.tie(e0, "age", 30);
-        let e1 = eng.entity();
+        let e1 = eng.entity().unwrap();
         eng.tie(e1, "age", 25);
-        let e2 = eng.entity();
+        let e2 = eng.entity().unwrap();
         eng.tie(e2, "age", 30);
 
         eng.rebuild();
@@ -11299,15 +13163,15 @@ mod tests {
         let dir = tmp("q_multi");
         let mut eng = Engine::create_standalone(&dir).unwrap();
 
-        let e0 = eng.entity();
+        let e0 = eng.entity().unwrap();
         eng.tie(e0, "age", 30);
         eng.tie(e0, "dept", 1);
 
-        let e1 = eng.entity();
+        let e1 = eng.entity().unwrap();
         eng.tie(e1, "age", 25);
         eng.tie(e1, "dept", 1);
 
-        let e2 = eng.entity();
+        let e2 = eng.entity().unwrap();
         eng.tie(e2, "age", 30);
         eng.tie(e2, "dept", 2);
 
@@ -11322,7 +13186,7 @@ mod tests {
     fn query_empty_result() {
         let dir = tmp("q_empty");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "age", 30);
         eng.rebuild();
         assert!(eng.query(&[("age", 99)]).is_empty());
@@ -11336,7 +13200,7 @@ mod tests {
         let dir = tmp("q_count");
         let mut eng = Engine::create_standalone(&dir).unwrap();
         for i in 0..10 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "bucket", i % 3);
         }
         eng.rebuild();
@@ -11355,11 +13219,11 @@ mod tests {
         let dir = tmp("lazy_cyl");
         let mut eng = Engine::create_standalone(&dir).unwrap();
 
-        let e0 = eng.entity();
+        let e0 = eng.entity().unwrap();
         eng.tie(e0, "age", 30);
         eng.tie(e0, "dept", 1);
 
-        let e1 = eng.entity();
+        let e1 = eng.entity().unwrap();
         eng.tie(e1, "age", 25);
         eng.tie(e1, "dept", 1);
 
@@ -11375,7 +13239,7 @@ mod tests {
         let dir = tmp("range");
         let mut eng = Engine::create_standalone(&dir).unwrap();
         for age in 20..=40 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "age", age);
         }
         eng.rebuild();
@@ -11393,7 +13257,7 @@ mod tests {
         let mut eng = Engine::create_standalone(&dir).unwrap();
 
         for age in 20..=40 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "age", age);
             eng.tie(e, "dept", 1);
         }
@@ -11426,11 +13290,11 @@ mod tests {
 
         {
             let mut eng = Engine::create_standalone(&dir).unwrap();
-            let e0 = eng.entity();
+            let e0 = eng.entity().unwrap();
             eng.tie(e0, "age", 25);
             eng.tie(e0, "dept", 1);
 
-            let e1 = eng.entity();
+            let e1 = eng.entity().unwrap();
             eng.tie(e1, "age", 30);
             eng.tie(e1, "dept", 1);
             eng.content(e1, "memo", b"hello");
@@ -11445,7 +13309,7 @@ mod tests {
         assert_eq!(eng.get_content(1, "memo"), Some(b"hello".as_ref()));
         assert_eq!(qc(&mut eng, &[("dept", 1), ("age", 30)]), 1);
 
-        let e2 = eng.entity();
+        let e2 = eng.entity().unwrap();
         eng.tie(e2, "age", 35);
         eng.tie(e2, "dept", 1);
         assert_eq!(qc(&mut eng, &[("dept", 1), ("age", 35)]), 1);
@@ -11459,7 +13323,7 @@ mod tests {
     fn vocab_id_lookup() {
         let dir = tmp("vocab");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_text(e, "city", "東京");
         eng.tie_text(e, "city2", "大阪");
 
@@ -11475,7 +13339,7 @@ mod tests {
     fn boundary_value_zero() {
         let dir = tmp("bnd_zero");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "x", 0);
         assert_eq!(eng.get(e, "x"), Some(0));
         assert_eq!(qc(&mut eng, &[("x", 0)]), 1);
@@ -11493,18 +13357,18 @@ mod tests {
         let mut eng = Engine::create_standalone(&dir).unwrap();
 
         let ts = 1_743_552_000u32;
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "ts", ts);
         assert_eq!(eng.get(e, "ts"), Some(ts));
         eng.rebuild();
         let result = eng.pull_raw("ts", ts);
         assert_eq!(result, vec![e]);
 
-        // v27 BucketCylinder は動的拡張するので、 u32::MAX-2 だと
+        // BucketCylinder は動的拡張するので、 u32::MAX-2 だと
         // バケット 40 億本分の Vec を確保してしまう。 ここでは代わりに
         // 100 万オーダーの「大きめ値」で検証する。
         let big = 1_000_000u32;
-        let e2 = eng.entity();
+        let e2 = eng.entity().unwrap();
         eng.tie(e2, "huge", big);
         assert_eq!(eng.get(e2, "huge"), Some(big));
         eng.rebuild();
@@ -11519,7 +13383,7 @@ mod tests {
         let dir = tmp("bnd_consec");
         let mut eng = Engine::create_standalone(&dir).unwrap();
         for v in 0..5u32 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "level", v);
         }
         for v in 0..5u32 {
@@ -11532,7 +13396,7 @@ mod tests {
     fn boundary_many_dims() {
         let dir = tmp("bnd_dims");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         for d in 0..20u32 {
             eng.tie(e, &format!("dim_{d}"), d * 10);
         }
@@ -11551,7 +13415,7 @@ mod tests {
         let mut eng = Engine::create_standalone(&dir).unwrap();
         let n = 1000u32;
         for i in 0..n {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "group", i % 5);
             eng.tie(e, "score", (i / 5) % 10);
         }
@@ -11578,7 +13442,7 @@ mod tests {
         let mut eng = Engine::create_standalone(&dir).unwrap();
         let n = 100u32;
         for _ in 0..n {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "val", 42);
         }
         assert_eq!(eng.query_count(&[("val", 42)]), 100);
@@ -11591,7 +13455,7 @@ mod tests {
         assert_eq!(eng.query_count(&[("val", 42)]), 0);
 
         for _ in 0..50 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "val", 42);
         }
         assert_eq!(eng.entity_count(), 50);
@@ -11607,7 +13471,7 @@ mod tests {
         {
             let mut eng = Engine::create_standalone(&dir).unwrap();
             for i in 0..100u32 {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie(e, "val", i % 10);
             }
             eng.rebuild();
@@ -11635,7 +13499,7 @@ mod tests {
         let mut eng = Engine::create_standalone(&dir).unwrap();
         let n = 1000u32;
         for i in 0..n {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "val", i % 10);
         }
         assert_eq!(eng.entity_count(), n);
@@ -11659,7 +13523,7 @@ mod tests {
 
         for c in 0..SCALE_COMPANIES {
             for e in 0..SCALE_PER_CO {
-                let eid = eng.entity();
+                let eid = eng.entity().unwrap();
                 eng.tie(eid, "age", e % SCALE_AGES);
                 eng.tie(eid, "dept", (e / SCALE_AGES) % SCALE_DEPTS);
                 eng.tie(eid, "company", c);
@@ -11750,7 +13614,7 @@ mod tests {
         assert_eq!(eng.query_count(&[("age", 30)]), before - 100);
 
         for _ in 0..100 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "age", 30);
         }
         assert_eq!(eng.query_count(&[("age", 30)]), before);
@@ -11815,7 +13679,7 @@ mod tests {
     fn commit_persists() {
         let dir = tmp("tx_commit");
         let mut eng = Engine::create_standalone(&dir).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "age", 30);
         eng.commit();
         eng.flush().unwrap();
@@ -11842,7 +13706,7 @@ mod tests {
         eng.define_himo("dept", ValueType::Number, 20);
 
         for i in 0..1000u32 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "age", i % 50);
             eng.tie(e, "dept", i % 8);
         }
@@ -11857,7 +13721,7 @@ mod tests {
         let dir = tmp("ps_zero");
         let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("level", ValueType::Number, 10);
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "level", 0);
         assert_eq!(eng.get(e, "level"), Some(0));
         assert_eq!(eng.query_count(&[("level", 0)]), 1);
@@ -11871,7 +13735,7 @@ mod tests {
         eng.define_himo("age", ValueType::Number, 100);
 
         for i in 0..100u32 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "age", i % 10);
             eng.tie_text(e, "city", if i < 50 { "東京" } else { "大阪" });
         }
@@ -11889,7 +13753,7 @@ mod tests {
             let mut eng = Engine::create_standalone(&dir).unwrap();
             eng.define_himo("score", ValueType::Number, 200);
             for i in 0..100u32 {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie(e, "score", i % 20);
             }
             assert_eq!(eng.query_count(&[("score", 5)]), 5);
@@ -11906,7 +13770,7 @@ mod tests {
         let dir = tmp("ps_untie");
         let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("age", ValueType::Number, 100);
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "age", 30);
         assert_eq!(eng.query_count(&[("age", 30)]), 1);
         eng.untie(e, "age");
@@ -11920,7 +13784,7 @@ mod tests {
         let dir = tmp("ps_ow");
         let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("score", ValueType::Number, 1000);
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "score", 100);
         eng.tie(e, "score", 200);
         assert_eq!(eng.get(e, "score"), Some(200));
@@ -11936,7 +13800,7 @@ mod tests {
         eng.define_himo("age", ValueType::Number, 100);
         eng.define_himo("dept", ValueType::Number, 20);
         for i in 0..100u32 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "age", i % 10);
             eng.tie(e, "dept", i % 5);
         }
@@ -11957,7 +13821,7 @@ mod tests {
         let dir = tmp("ps_bnd_max");
         let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("x", ValueType::Number, 10);
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "x", 10);
         assert_eq!(eng.get(e, "x"), Some(10));
         assert_eq!(eng.query_count(&[("x", 10)]), 1);
@@ -11970,7 +13834,7 @@ mod tests {
         let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("val", ValueType::Number, 100);
         for _ in 0..500u32 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "val", 42);
         }
         assert_eq!(eng.query_count(&[("val", 42)]), 500);
@@ -11981,7 +13845,7 @@ mod tests {
         assert_eq!(eng.query_count(&[("val", 42)]), 0);
 
         for _ in 0..200 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "val", 42);
         }
         assert_eq!(eng.entity_count(), 200);
@@ -11999,7 +13863,7 @@ mod tests {
 
         for c in 0..SCALE_COMPANIES {
             for e in 0..SCALE_PER_CO {
-                let eid = eng.entity();
+                let eid = eng.entity().unwrap();
                 eng.tie(eid, "age", e % SCALE_AGES);
                 eng.tie(eid, "dept", (e / SCALE_AGES) % SCALE_DEPTS);
                 eng.tie(eid, "company", c);
@@ -12076,7 +13940,7 @@ mod tests {
         for eid in &victims { eng.delete(*eid); }
         assert_eq!(eng.query_count(&[("age", 30)]), before - 100);
         for _ in 0..100 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "age", 30);
         }
         assert_eq!(eng.query_count(&[("age", 30)]), before);
@@ -12148,7 +14012,7 @@ mod tests {
         eng.define_himo("group", ValueType::Number, groups);
 
         for i in 0..n {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "age", i % ages);
             eng.tie(e, "dept", i % depts);
             eng.tie(e, "group", i % groups);
@@ -12180,7 +14044,7 @@ mod tests {
         // Phase 1: 1000 entity作成、nameだけtie
         let mut eng = Engine::create_standalone(&dir).unwrap();
         for i in 0..1000u32 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie_text(e, "name", &format!("company_{i}"));
         }
         eng.rebuild();
@@ -12219,12 +14083,12 @@ mod tests {
         let mut eng = Engine::create_with_capacity(&dir, 6_000_000).unwrap();
         // entity 0..99 を作成
         for i in 0..100u32 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie_text(e, "name", &format!("company_{i}"));
         }
         // entity 100..5_999_999 も作成（名前なし、eid空間を広げる）
         for _ in 100..1000 {
-            eng.entity();
+            eng.entity().unwrap();
         }
         eng.rebuild();
         eng.flush().unwrap();
@@ -12261,7 +14125,7 @@ mod tests {
         let dir = tmp("concurrent_basic");
         let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("age", ValueType::Number, 200);
-        let eids: Vec<u64> = (0..100).map(|_| eng.entity()).collect();
+        let eids: Vec<u64> = (0..100).map(|_| eng.entity().unwrap()).collect();
 
         let arc = Engine::concurrentize(eng);
         for (i, &e) in eids.iter().enumerate() {
@@ -12288,7 +14152,7 @@ mod tests {
         let dir = tmp("concurrent_mrw");
         let mut eng = Engine::create_standalone(&dir).unwrap();
         eng.define_himo("k", ValueType::Number, 16);
-        let eids: Vec<u64> = (0..1_000).map(|_| eng.entity()).collect();
+        let eids: Vec<u64> = (0..1_000).map(|_| eng.entity().unwrap()).collect();
         for (i, &e) in eids.iter().enumerate() {
             eng.tie(e, "k", (i as u32) % 16);
         }
@@ -12411,11 +14275,11 @@ mod tests {
         let id_b = eng.put_blob(&img_b).unwrap().unwrap();
         assert_ne!(id_a, id_b);
 
-        let e1 = eng.entity();
+        let e1 = eng.entity().unwrap();
         eng.tie_text(e1, "__blob_id", &id_a.to_hex());
-        let e2 = eng.entity();
+        let e2 = eng.entity().unwrap();
         eng.tie_text(e2, "__blob_id", &id_b.to_hex());
-        let e3 = eng.entity();
+        let e3 = eng.entity().unwrap();
         eng.tie_text(e3, "__blob_id", &id_a.to_hex()); // e1 と同じ画像
 
         eng.rebuild();
@@ -12457,7 +14321,7 @@ mod tests {
         eng.define_himo("age", ValueType::Number, 0);
         eng.define_himo("city", ValueType::Tag, 0);
         for i in 0..50u32 {
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "age", 20 + (i % 30));
             eng.tie_text(
                 e,
@@ -12485,7 +14349,7 @@ mod tests {
             // 50 rows of (uuid-like, timestamp) — matcha の notif_state
             // が捌くサイズ感。
             for i in 0..50u32 {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_text(e, "key", &format!("uuid-{:08x}", i));
                 eng.tie(e, "ts", 1_715_000_000 + i);
             }
@@ -12525,7 +14389,7 @@ mod tests {
         {
             let mut eng = Engine::create_standalone(&p).unwrap();
             eng.define_himo("v", ValueType::Number, 100);
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "v", 42);
             eng.flush().unwrap();
         }
@@ -12553,7 +14417,7 @@ mod tests {
             eng.flush().unwrap();
         }
         let mut eng = Engine::open_readonly(&p).unwrap();
-        let e = eng.entity(); // ← ここで panic
+        let e = eng.entity().unwrap(); // ← ここで panic
         eng.tie(e, "v", 1);
         let _ = std::fs::remove_file(&p);
     }
@@ -12566,7 +14430,7 @@ mod tests {
         {
             let mut eng = Engine::create_standalone(&p).unwrap();
             eng.define_himo("v", ValueType::Number, 100);
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie(e, "v", 42);
             eng.flush().unwrap(); // clean=true で確定
         }
@@ -12635,7 +14499,7 @@ mod tests {
             eng.define_himo("year", ValueType::Number, 100);
             eng.define_himo("name", ValueType::Tag, 0);
             eng.define_himo("self_ref", ValueType::Ref, 0);
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie_to(e, "year", 2026);
             eng.tie_text_to(e, "name", "alice");
             eng.tie_ref_to(e, "self_ref", e);
@@ -12650,7 +14514,7 @@ mod tests {
             let year_id = eng.himo_id("year").unwrap() as u16;
             let name_id = eng.himo_id("name").unwrap() as u16;
             let ref_id = eng.himo_id("self_ref").unwrap() as u16;
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie_to_by_id(e, year_id, 2026);
             eng.tie_text_to_by_id(e, name_id, "alice");
             eng.tie_ref_to_by_id(e, ref_id, e);
@@ -12677,7 +14541,7 @@ mod tests {
         let mut eng = Engine::create_standalone(&p).unwrap();
         eng.define_himo("year", ValueType::Number, 100);
         let year_id = eng.himo_id("year").unwrap() as u16;
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_to_by_id(e, year_id, 2026);
         assert_eq!(eng.query(&[("year", 2026)]).len(), 1);
         eng.untie_by_id(e, year_id);
@@ -12691,7 +14555,7 @@ mod tests {
         let p = tmp("by_id_oor");
         let mut eng = Engine::create_standalone(&p).unwrap();
         eng.define_himo("year", ValueType::Number, 100);
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         // himo_id = 99 だが define されたのは 1 つだけ (id=0)。
         // debug build では debug_assert! のメッセージ、 release では array indexing の
         // out-of-bounds panic で落ちる。 どちらでも panic することだけ確認。
@@ -12709,7 +14573,7 @@ mod tests {
             let mut eng = Engine::create_growable(&dir).unwrap();
             eng.define_himo("score", ValueType::Number, 0);
             for i in 0..10u32 {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie(e, "score", i * 10);
             }
             eng.flush().unwrap();
@@ -12796,7 +14660,7 @@ mod tests {
         let hid = eng
             .ensure_himo_dynamic("dyn_roundtrip", ValueType::Number, 0)
             .unwrap();
-        let e0 = eng.entity();
+        let e0 = eng.entity().unwrap();
         eng.tie_to_by_id(e0, hid, 42);
         assert_eq!(eng.get_by_id(e0, hid), Some(42));
 

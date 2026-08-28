@@ -5,7 +5,7 @@
 //! - `create_concurrent` (WAL 無し concurrent)
 //! - `get_entity` (全 himo 一括取得)
 //! - `tie_text_to` (&self text 書き込み)
-//! - `open_concurrent_replica` (v32 replica + concurrent writer)
+//! - `open_concurrent_replica` (replica + concurrent writer)
 
 use enchudb::{Engine, EntityValue, ValueType};
 use std::sync::Arc;
@@ -38,7 +38,7 @@ fn create_with_options_respects_capacity_hint() {
     let mut eng =
         Engine::create_with_options(&path, 1_000_000, Some(1024 * 1024)).unwrap();
     eng.define_himo("age", ValueType::Number, 100);
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie(e, "age", 42);
     assert_eq!(eng.get(e, "age"), Some(42));
     cleanup(&path);
@@ -57,7 +57,7 @@ fn create_full_with_cyl_all_options() {
     )
     .unwrap();
     eng.define_himo("v", ValueType::Number, 50);
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie(e, "v", 7);
     assert_eq!(eng.get(e, "v"), Some(7));
     cleanup(&path);
@@ -69,7 +69,7 @@ fn get_entity_returns_all_himos() {
     let mut eng = Engine::create_standalone(&path).unwrap();
     eng.define_himo("age", ValueType::Number, 100);
     eng.define_himo("city", ValueType::Tag, 0);
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie(e, "age", 30);
     eng.tie_text(e, "city", "東京");
 
@@ -87,7 +87,7 @@ fn get_entity_returns_all_himos() {
     }
 
     // empty entity returns empty vec
-    let e2 = eng.entity();
+    let e2 = eng.entity().unwrap();
     assert!(eng.get_entity(e2).is_empty());
 
     cleanup(&path);
@@ -99,7 +99,7 @@ fn create_concurrent_without_wal_accepts_tie_async() {
     let eng = Engine::create_concurrent(&path).unwrap();
     // 定義は Arc::get_mut 経由(テストでは要らないのでスキーマ無しで書き込みは panic)。
     // ここでは factory が Arc<Self> を返せることと entity が作れることのみ確認。
-    let _e = eng.entity();
+    let _e = eng.entity().unwrap();
     assert_eq!(eng.entity_count(), 1);
     cleanup(&path);
 }
@@ -111,7 +111,7 @@ fn tie_text_to_on_shared_arc() {
     eng.define_himo("name", ValueType::Tag, 0);
     let eng = Arc::new(eng);
 
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie_text_to(e, "name", "alice");
     assert_eq!(eng.get_text(e, "name"), Some(b"alice".as_ref()));
 
@@ -135,13 +135,13 @@ fn open_concurrent_replica_rejects_writes_and_syncs_via_remote() {
 
     // replica mode は書き込み API で panic するので、remote_*_apply を直接叩く
     let himo_id = eng.himo_id("v").unwrap() as u16;
-    eng.remote_tie_apply(enchudb_oplog::make_eid(1, 5), himo_id, 42, enchudb_oplog::Hlc::ZERO, None);
+    eng.remote_tie_apply(enchudb_oplog::make_eid(1, 5), himo_id, 42, enchudb_oplog::Hlc::ZERO);
     assert_eq!(eng.get(enchudb_oplog::make_eid(1, 5), "v"), Some(42));
 
     // set_replica_mode(false) で書き込み解放
     eng.set_replica_mode(false);
     assert!(!eng.is_replica());
-    let e = eng.entity();
+    let e = eng.entity().unwrap();
     eng.tie_async(e, "v", 99);
     eng.oplog_commit();
     eng.flush_writes();

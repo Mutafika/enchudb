@@ -1,6 +1,6 @@
-//! EnchuDB v27 EC サイト実用テスト。
+//! EnchuDB EC サイト実用テスト。
 //!
-//! 実行: `cargo test --features v27 --test ec_site -- --nocapture`
+//! 実行: `cargo test --test ec_site -- --nocapture`
 
 use enchudb::{Engine, ValueType};
 
@@ -86,7 +86,7 @@ fn populate(db: &mut Engine) -> EcData {
     // Products
     let mut products = Vec::with_capacity(N_PRODUCTS as usize);
     for _ in 0..N_PRODUCTS {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         db.tie(e, "type", TYPE_PRODUCT);
         db.tie(e, "category", rng.next_range(20));
         db.tie(e, "price_band", rng.next_range(10));
@@ -98,7 +98,7 @@ fn populate(db: &mut Engine) -> EcData {
     // Users
     let mut users = Vec::with_capacity(N_USERS as usize);
     for _ in 0..N_USERS {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         db.tie(e, "type", TYPE_USER);
         db.tie(e, "region", rng.next_range(10));
         db.tie(e, "membership", rng.next_range(4));
@@ -108,7 +108,7 @@ fn populate(db: &mut Engine) -> EcData {
     // Orders
     let mut orders = Vec::with_capacity(N_ORDERS as usize);
     for _ in 0..N_ORDERS {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         db.tie(e, "type", TYPE_ORDER);
         db.tie_ref(e, "user_ref", users[rng.next_range(N_USERS) as usize]);
         db.tie(e, "year", rng.next_range(5));       // 0=2022, 1=2023, ..., 4=2026
@@ -120,7 +120,7 @@ fn populate(db: &mut Engine) -> EcData {
     // OrderItems
     let mut order_items = Vec::with_capacity(N_ORDER_ITEMS as usize);
     for _ in 0..N_ORDER_ITEMS {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         db.tie(e, "type", TYPE_ORDER_ITEM);
         db.tie_ref(e, "order_ref", orders[rng.next_range(N_ORDERS) as usize]);
         db.tie_ref(e, "product_ref", products[rng.next_range(N_PRODUCTS) as usize]);
@@ -131,7 +131,7 @@ fn populate(db: &mut Engine) -> EcData {
     // Reviews
     let mut reviews = Vec::with_capacity(N_REVIEWS as usize);
     for _ in 0..N_REVIEWS {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         db.tie(e, "type", TYPE_REVIEW);
         db.tie_ref(e, "product_ref", products[rng.next_range(N_PRODUCTS) as usize]);
         db.tie_ref(e, "user_ref", users[rng.next_range(N_USERS) as usize]);
@@ -587,14 +587,14 @@ fn concurrent_order_creation() {
     let mut users = Vec::new();
     let mut rng = Xorshift32::new(99);
     for _ in 0..100 {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         db.tie(e, "type", TYPE_PRODUCT);
         db.tie(e, "category", rng.next_range(20));
         db.tie(e, "price_band", rng.next_range(10));
         products.push(e);
     }
     for _ in 0..50 {
-        let e = db.entity();
+        let e = db.entity().unwrap();
         db.tie(e, "type", TYPE_USER);
         db.tie(e, "region", rng.next_range(10));
         users.push(e);
@@ -615,7 +615,7 @@ fn concurrent_order_creation() {
             let mut rng = Xorshift32::new(1000 + thread_id);
             let mut created = Vec::new();
             for _ in 0..n_orders_per_thread {
-                let e = arc.entity();
+                let e = arc.entity().unwrap();
                 arc.tie_to(e, "type", TYPE_ORDER);
                 let user = users[rng.next_range(users.len() as u32) as usize];
                 arc.tie_ref_to(e, "user_ref", user);

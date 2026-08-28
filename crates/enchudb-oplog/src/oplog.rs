@@ -1,11 +1,11 @@
-//! Operation log (v28→v32) — append-only op stream for peer sync + audit + recovery.
+//! Operation log — append-only op stream for peer sync + audit + recovery.
 //!
 //! 0.6.0 で `enchudb-wal` から rename (issue #8)。 実態は write-ahead log では
 //! なく oplog (MongoDB oplog と同パターン): mmap が primary state、 oplog は
 //! 「何が起きたか」 の正準ストリーム。 wire format は v2 で不変、 在野の
 //! file magic は歴史的経緯で `EWAL` のまま (= 既存 file binary 互換のため)。
 //!
-//! # v32 レイアウト (oplog v2)
+//! # レイアウト (oplog v2)
 //!
 //! - **eid を u64 化**(分散の [peer|local] 合成 ID)
 //! - **HLC スロット**: `(wall:8, logical:4, peer:4)` 全順序用
@@ -202,7 +202,8 @@ pub fn resign_with_eid(
         | DecodedOp::Delete { .. }
         | DecodedOp::Content { .. }
         | DecodedOp::TieNamed { .. }
-        | DecodedOp::TieLeaf { .. } => {}
+        | DecodedOp::TieLeaf { .. }
+        | DecodedOp::TieRef { .. } => {}
         DecodedOp::Commit | DecodedOp::Vocab { .. } => return None,
     }
     let mut sb = rec.signed_bytes.clone();
@@ -227,6 +228,49 @@ pub fn resign_with_eid(
     Some(ResignedRecord { signed_bytes: sb, signature, pubkey_fp })
 }
 
+/// #183: `Tie` record を **`TieRef` (target 世界番号同乗) に書き換えて** re-sign する。
+///
+/// bridge が「Ref 値が translated foreign entity を指す self-authored write」を
+/// 発送するために使う。wire の `Tie.value` (u32) は元 entity の世界番号 (u64) を
+/// 運べないため、op ごと組み替える。`resign_with_eid` と同じく lsn / hlc /
+/// author_peer は**維持** (LWW identity 不変、変わるのは op 表現と宛名だけ)。
+///
+/// - `new_eid`: 行 eid (自行なら元のまま、translated 行なら世界番号へ書き戻し済みの値)
+/// - `target_world`: Ref が指す元 entity の世界番号 (`make_eid(owner, owner_local)`)
+/// - `Tie` 以外の op は None (TieNamed の Ref は従来どおり呼び元で skip)
+pub fn resign_as_tie_ref(
+    rec: &Record,
+    new_eid: u64,
+    target_world: u64,
+    keypair: Option<&crate::keys::Keypair>,
+) -> Option<ResignedRecord> {
+    let himo_id = match rec.op {
+        DecodedOp::Tie { himo_id, .. } => himo_id,
+        _ => return None,
+    };
+    let old = &rec.signed_bytes;
+    if old.len() < SIGNED_PAYLOAD_HEADER_SIZE {
+        return None;
+    }
+    // header は元 record から流用し、op_byte / payload_len / crc を差し替える
+    let mut sb = Vec::with_capacity(SIGNED_PAYLOAD_HEADER_SIZE + 20);
+    sb.extend_from_slice(&old[0..SIGNED_PAYLOAD_HEADER_SIZE]);
+    sb[3] = op_type::TIE_REF;
+    sb[4..8].copy_from_slice(&20u32.to_le_bytes());
+    // payload: eid(8) + himo_id(2) + pad(2) + target(8) — Tie と同じ 4-align 規約
+    sb.extend_from_slice(&new_eid.to_le_bytes());
+    sb.extend_from_slice(&himo_id.to_le_bytes());
+    sb.extend_from_slice(&[0u8; 2]);
+    sb.extend_from_slice(&target_world.to_le_bytes());
+    let crc = fnv1a(&sb[SIGNED_PAYLOAD_HEADER_SIZE..]);
+    sb[36..40].copy_from_slice(&crc.to_le_bytes());
+    let (signature, pubkey_fp) = match keypair {
+        Some(kp) => (kp.sign(&sb), kp.pubkey_fp()),
+        None => (ZERO_SIGNATURE, ZERO_PUBKEY_FP),
+    };
+    Some(ResignedRecord { signed_bytes: sb, signature, pubkey_fp })
+}
+
 /// WAL 初期サイズ(256MB、sparse なので実ディスク消費は書いた分のみ)。
 pub const DEFAULT_OPLOG_SIZE: usize = 256 * 1024 * 1024;
 
@@ -237,8 +281,8 @@ pub mod op_type {
     pub const DELETE: u8 = 2;
     pub const CONTENT: u8 = 3;
     pub const COMMIT: u8 = 4;
-    pub const SCHEMA: u8 = 5; // v32 予約(Phase D 以降で使う)
-    pub const VOCAB: u8 = 6;  // v33: text vid → bytes 対応を peer 間で運ぶ
+    pub const SCHEMA: u8 = 5; // 予約(Phase D 以降で使う)
+    pub const VOCAB: u8 = 6;  // text vid → bytes 対応を peer 間で運ぶ
     /// 0.9.0: himo を **名前で** 運ぶ Tie。 動的定義される content himo
     /// (`_c_{key}`) は peer 間で himo_id が揃わないため、 id ではなく
     /// full name を self-describing に運び、 受信側が ensure_himo_dynamic
@@ -249,6 +293,10 @@ pub mod op_type {
     /// himo は名前で運ぶ (content `_c_{key}` 等 動的 himo と同じ理由)。 受信側は
     /// ensure_himo_named → leaf.insert(bytes) → cell に offset を set する。
     pub const TIE_LEAF: u8 = 8;
+    /// #183: Ref 値の target を世界番号 (u64) 同乗で運ぶ Tie。bridge が
+    /// 「translated foreign entity への Ref write」を発送するときだけ合成する
+    /// (author のローカル oplog には現れない)。
+    pub const TIE_REF: u8 = 9;
 }
 
 /// WAL に書く所有型 op。 `Op` の owned 版で、 queue 渡し用 (consumer 側で
@@ -290,7 +338,7 @@ impl OwnedOp {
     }
 }
 
-/// WAL に書く op。eid は u64(v32)。
+/// WAL に書く op。eid は u64。
 #[derive(Debug, Clone)]
 pub enum Op<'a> {
     Tie { eid: u64, himo_id: u16, value: u32 },
@@ -298,7 +346,7 @@ pub enum Op<'a> {
     Delete { eid: u64 },
     Content { eid: u64, key: &'a str, data: &'a [u8] },
     Commit,
-    /// v33: text 文字列を peer 間で運ぶ。`vid` は author_peer ローカルの vocab ID。
+    /// text 文字列を peer 間で運ぶ。`vid` は author_peer ローカルの vocab ID。
     /// receiver 側は `(author_peer, vid) → local_vid` の mapping を持ち、
     /// 後続の Tie { value: vid } を受けたら local_vid に変換して適用する。
     Vocab { vid: u32, bytes: &'a [u8] },
@@ -306,6 +354,11 @@ pub enum Op<'a> {
     TieNamed { eid: u64, himo_name: &'a str, himo_kind: u8, value: u32 },
     /// 0.12.0 (#88): Leaf payload を bytes 同乗で運ぶ Tie (vid 無し、 himo は名前)。
     TieLeaf { eid: u64, himo_name: &'a str, himo_kind: u8, bytes: &'a [u8] },
+    /// #183/#209: Ref 値の target を世界番号 (u64) 同乗で運ぶ Tie。 bridge は
+    /// resign (byte patch) で合成するが、 relay の verbatim 転送 (#209) は受信
+    /// record からこの variant で `append_relayed` する。 layout は decode 側
+    /// (op_type::TIE_REF) と同一: eid(8) + himo_id(2) + pad(2) + target(8)。
+    TieRef { eid: u64, himo_id: u16, target: u64 },
 }
 
 impl<'a> Op<'a> {
@@ -323,6 +376,7 @@ impl<'a> Op<'a> {
             Op::TieNamed { himo_name, .. } => 16 + himo_name.len(),
             // eid(8) + kind(1) + pad(1) + name_len(2) + bytes_len(4) + name + bytes
             Op::TieLeaf { himo_name, bytes, .. } => 16 + himo_name.len() + bytes.len(),
+            Op::TieRef { .. } => 20, // eid(8) + himo_id(2) + pad(2) + target(8)
         }
     }
 
@@ -336,6 +390,7 @@ impl<'a> Op<'a> {
             Op::Vocab { .. } => op_type::VOCAB,
             Op::TieNamed { .. } => op_type::TIE_NAMED,
             Op::TieLeaf { .. } => op_type::TIE_LEAF,
+            Op::TieRef { .. } => op_type::TIE_REF,
         }
     }
 
@@ -397,6 +452,12 @@ impl<'a> Op<'a> {
                 let bo = 16 + himo_name.len();
                 buf[bo..bo + bytes.len()].copy_from_slice(bytes);
             }
+            Op::TieRef { eid, himo_id, target } => {
+                buf[0..8].copy_from_slice(&eid.to_le_bytes());
+                buf[8..10].copy_from_slice(&himo_id.to_le_bytes());
+                buf[10..12].copy_from_slice(&[0, 0]);
+                buf[12..20].copy_from_slice(&target.to_le_bytes());
+            }
         }
     }
 }
@@ -409,16 +470,24 @@ pub enum DecodedOp {
     Delete { eid: u64 },
     Content { eid: u64, key: String, data: Vec<u8> },
     Commit,
-    /// v33: peer 間で vocab の (vid, bytes) を運ぶ。`vid` は record の author_peer ローカル。
+    /// peer 間で vocab の (vid, bytes) を運ぶ。`vid` は record の author_peer ローカル。
     Vocab { vid: u32, bytes: Vec<u8> },
     /// 0.9.0: himo full name 付き Tie (動的 content himo 用)。
     TieNamed { eid: u64, himo_name: String, himo_kind: u8, value: u32 },
     /// 0.12.0 (#88): Leaf payload を bytes 同乗で運ぶ Tie (vid 無し)。
     TieLeaf { eid: u64, himo_name: String, himo_kind: u8, bytes: Vec<u8> },
+    /// #183: Ref 値を **target の世界番号 (u64) 同乗**で運ぶ Tie。
+    ///
+    /// wire の `Tie.value` (u32) は translated foreign target の元 entity
+    /// (世界番号) を表現できないため、bridge が発送時に `Tie` から書き換える。
+    /// author の**ローカル oplog にはこの op は現れない** (bridge 合成専用)。
+    /// 受信側は `target` を「産みの親」key (0.11 semantics) で ref target table
+    /// 空間の local eid へ翻訳する。
+    TieRef { eid: u64, himo_id: u16, target: u64 },
 }
 
 /// リカバリ結果の 1 レコード(HLC + 署名込み)。
-/// v32 Phase C: signature と pubkey_fp も含めて返し、Syncer/PubkeyStore で検証できる。
+/// signature と pubkey_fp も含めて返し、Syncer/PubkeyStore で検証できる。
 #[derive(Debug, Clone)]
 pub struct Record {
     pub lsn: u64,
@@ -478,13 +547,13 @@ pub struct OpLog {
     head: AtomicU64,
     checkpoint: AtomicU64,
     next_lsn: AtomicU64,
-    /// v32: HLC logical counter(wall が進まない時の tiebreaker 単調増加)。
+    /// HLC logical counter(wall が進まない時の tiebreaker 単調増加)。
     hlc_logical: std::sync::atomic::AtomicU32,
-    /// v32: 最後に書いた HLC wall(ms)。
+    /// 最後に書いた HLC wall(ms)。
     hlc_last_wall: AtomicU64,
-    /// v32: この OpLog を持つ peer の id(header には書かず Engine から設定)。
+    /// この OpLog を持つ peer の id(header には書かず Engine から設定)。
     peer_id: std::sync::atomic::AtomicU32,
-    /// v32 Phase C: ed25519 鍵ペア。set_keypair で設定。None なら署名は zeros。
+    /// ed25519 鍵ペア。set_keypair で設定。None なら署名は zeros。
     keypair: std::sync::RwLock<Option<std::sync::Arc<crate::keys::Keypair>>>,
     /// #75: 同一プロセス内 append の直列化。 flock は open file description
     /// 単位のため、 同じ File を共有するスレッド間では排他にならない (2 本目の
@@ -492,9 +561,9 @@ pub struct OpLog {
     /// write) と `next_hlc` はこの lock の下でのみ安全。 cross-process 排他は
     /// 従来通り flock が担う。
     append_lock: std::sync::Mutex<()>,
-    /// v30: append 中の writer 数。try_reset はこれが 0 のときだけ実行できる。
+    /// append 中の writer 数。try_reset はこれが 0 のときだけ実行できる。
     pending_writes: std::sync::atomic::AtomicU32,
-    /// v32: auto reset を許可するか。default false。
+    /// auto reset を許可するか。default false。
     /// true にすると consumer が head==checkpoint の tick で ring buffer を空に戻し
     /// 長期運用で WAL 容量を食い切らない動きになるが、audit/iter_committed/publish_since
     /// で読む前に消える race があるので opt-in。
@@ -732,7 +801,7 @@ impl OpLog {
 
     /// op を append。新しいレコードの LSN を返す。
     ///
-    /// v30: pending_writes カウンタで try_reset との race を防ぐ。
+    /// pending_writes カウンタで try_reset との race を防ぐ。
     /// writer は append 中 +1、完了時 -1。consumer reset は pending==0 時のみ。
     pub fn append(&self, op: Op<'_>) -> io::Result<u64> {
         self.append_with_hlc(op).map(|(lsn, _)| lsn)
@@ -915,6 +984,98 @@ impl OpLog {
         result.map(|(lsn, _)| lsn)
     }
 
+    /// #209: 受信 record を **byte 単位でそのまま** WAL に載せる relay append。
+    ///
+    /// `append_relayed` (op を再 encode) は署名対象領域 (fixed header 40B +
+    /// payload、**LSN を含む**) を自分の値で書き直すため、 author の署名と一致
+    /// しなくなる。 署名を素通しするには author が署名した bytes をそのまま格納
+    /// するしかない — `sb` は `WireRecord::signed_bytes` (= 元 record の
+    /// fixed header ‖ payload)、 disk 上の record は
+    /// `sb[0..40] ‖ signature(64) ‖ pubkey_fp(8) ‖ sb[40..]` として復元される。
+    ///
+    /// LSN も author のものが残る (自分の `next_lsn` は消費しない)。 WAL 内 LSN の
+    /// 単調性は relayed record では成立しないが、 recover / bridge / audit は
+    /// 位置ベース走査で LSN 単調性に依存しない。
+    ///
+    /// 検証: magic / version / len 整合 / payload CRC。 壊れた bytes は Err。
+    pub fn append_relayed_verbatim(
+        &self,
+        sb: &[u8],
+        signature: &[u8; 64],
+        pubkey_fp: &[u8; 8],
+    ) -> io::Result<u64> {
+        let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+        if sb.len() < SIGNED_PAYLOAD_HEADER_SIZE {
+            return Err(bad("relayed signed_bytes too short"));
+        }
+        if &sb[0..2] != REC_MAGIC {
+            return Err(bad("relayed signed_bytes: bad magic"));
+        }
+        if sb[2] != REC_VERSION {
+            return Err(bad("relayed signed_bytes: unsupported record version"));
+        }
+        let payload_len = u32::from_le_bytes(sb[4..8].try_into().unwrap()) as usize;
+        if sb.len() != SIGNED_PAYLOAD_HEADER_SIZE + payload_len {
+            return Err(bad("relayed signed_bytes: len field mismatch"));
+        }
+        let crc_stored = u32::from_le_bytes(sb[36..40].try_into().unwrap());
+        if fnv1a(&sb[SIGNED_PAYLOAD_HEADER_SIZE..]) != crc_stored {
+            return Err(bad("relayed signed_bytes: payload crc mismatch"));
+        }
+        let record_size = REC_HEADER_SIZE + payload_len;
+
+        let _guard = self.pending_guard(1);
+        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
+        #[cfg(not(target_arch = "wasm32"))]
+        let _lock = self.flock_exclusive()?;
+
+        // head 採番は append_inner と同じ規則 (mmap 上の永続値を真実とする)。
+        let offset = {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let mm = self.mmap_slice();
+                let on_disk = u64::from_le_bytes(mm[8..16].try_into().unwrap());
+                let cur = on_disk.max(self.head.load(Ordering::Acquire));
+                let new = cur + record_size as u64;
+                if new > self.capacity {
+                    return Err(self.wal_full_err());
+                }
+                self.head.store(new, Ordering::Release);
+                cur
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let cur = self.head.load(Ordering::Acquire);
+                let new = cur + record_size as u64;
+                if new > self.capacity {
+                    return Err(self.wal_full_err());
+                }
+                self.head.store(new, Ordering::Release);
+                cur
+            }
+        };
+
+        let mmap = self.mmap_mut_slice();
+        let off = offset as usize;
+        mmap[off..off + SIGNED_PAYLOAD_HEADER_SIZE]
+            .copy_from_slice(&sb[0..SIGNED_PAYLOAD_HEADER_SIZE]);
+        mmap[off + OFF_SIGNATURE..off + OFF_SIGNATURE + 64].copy_from_slice(signature);
+        mmap[off + OFF_PUBKEY_FP..off + OFF_PUBKEY_FP + 8].copy_from_slice(pubkey_fp);
+        mmap[off + REC_HEADER_SIZE..off + record_size]
+            .copy_from_slice(&sb[SIGNED_PAYLOAD_HEADER_SIZE..]);
+        // ファイルヘッダの head も更新
+        mmap[8..16].copy_from_slice(&(offset + record_size as u64).to_le_bytes());
+
+        // ローカル HLC clock を受信 HLC で merge (後退防止)
+        let hlc = Hlc {
+            wall: u64::from_le_bytes(sb[16..24].try_into().unwrap()),
+            logical: u32::from_le_bytes(sb[24..28].try_into().unwrap()),
+            peer: u32::from_le_bytes(sb[28..32].try_into().unwrap()),
+        };
+        self.merge_external_hlc(hlc);
+        Ok(u64::from_le_bytes(sb[8..16].try_into().unwrap()))
+    }
+
     /// request17 step 5: **受信 HLC でローカル clock を進める** (HLC の merge 規則)。
     ///
     /// これが無いと、 相手の wall clock が先行している間ずっと「自分が次に採番する
@@ -1056,10 +1217,10 @@ impl OpLog {
         Ok((lsn, hlc))
     }
 
-    /// v30: ring buffer reset。
+    /// ring buffer reset。
     /// head == checkpoint && pending_writes == 0 のときのみ実行可能。
     ///
-    /// fix: auto_reset ゲートを撤去。 元は v32 で「Syncer attached の engine は ring を
+    /// fix: auto_reset ゲートを撤去。 元は「Syncer attached の engine は ring を
     /// reset させない」ために入れた gate だが、 0.8.0 で sync publish path が `_sync_ops`
     /// 経由になり oplog ring を直接読まなくなった (sync.rs 参照) ので gate の存在理由は
     /// 消えていた。 にもかかわらず default が false のままだったため production では
@@ -1068,6 +1229,23 @@ impl OpLog {
     /// (head==checkpoint ⇒ body へ msync 済 && pending==0) を満たす領域は crash recovery
     /// にも sync にも不要なので、 無条件に畳んでよい。 `auto_reset` フラグは vestigial。
     pub fn try_reset(&self) -> bool {
+        self.try_reset_if(|| true)
+    }
+
+    /// `try_reset` の述語つき版。 `fold_safe` は **`append_lock` 保持中に、 fold の
+    /// 直前に**評価される。
+    ///
+    /// 呼び出し側が lock の外で 「畳んでよいか」 を判定してから `try_reset` を呼ぶと、
+    /// 判定と fold の間に他 thread の append + `advance_checkpoint` が割り込める
+    /// (check-then-act)。 その窓を通ると 「判定時は bridge 済みだったが fold 時には
+    /// 未 bridge record が居る」 状態で ring を畳んでしまい、 その record は WAL ごと
+    /// 消えて **sync から無言で欠落**する (engine の `wal_fold_safe` が防いでいる
+    /// はずのもの)。 述語を lock 下で再評価することで窓を閉じる。
+    ///
+    /// `fold_safe` は `append_lock` を保持したまま呼ばれるので、 この OpLog の
+    /// append 系 API を再入的に呼んではならない (`head` / `checkpoint` /
+    /// `pending_writes` の読みと scan 系は lock を取らないので安全)。
+    pub fn try_reset_if(&self, fold_safe: impl FnOnce() -> bool) -> bool {
         // #77-M8: append_lock で append と直列化。 旧実装は pending_writes
         // チェックと head CAS の間に窓があり、 その間に進入した append の
         // record が reset で head 外に落ちて喪失 + stale record 復活が起きた。
@@ -1077,6 +1255,8 @@ impl OpLog {
         let cp = self.checkpoint.load(Ordering::Acquire);
         if head != cp || head <= HEADER_SIZE as u64 { return false; }
         if self.pending_writes.load(Ordering::Acquire) > 0 { return false; }
+        // lock 下での再評価。 ここで false なら畳まない (= 未 bridge record を守る)。
+        if !fold_safe() { return false; }
         if self.head.compare_exchange(head, HEADER_SIZE as u64, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return false;
         }
@@ -1114,7 +1294,7 @@ impl OpLog {
 
     /// auto_reset を切り替え(Syncer attached の engine では false にする)。
     /// false にすると ring buffer reset が発火しなくなり、WAL は使い切るまで線形成長する。
-    /// v32 の sync 前に消える race を防ぐ用途。
+    /// record が peer sync 前に消える race を防ぐ用途。
     pub fn set_auto_reset(&self, enabled: bool) {
         self.auto_reset.store(enabled, Ordering::Release);
     }
@@ -1147,7 +1327,7 @@ impl OpLog {
         self.mmap_mut_slice()[16..24].copy_from_slice(&target.to_le_bytes());
     }
 
-    /// v32: HEADER_SIZE から head までを読んで、Commit で挟まれた全レコードを返す。
+    /// HEADER_SIZE から head までを読んで、Commit で挟まれた全レコードを返す。
     /// checkpoint 位置は無視(既に apply 済みの記録もまだ WAL file 上にあれば拾う)。
     /// Syncer.publish_since で使う。ring buffer reset 済みの記録は取れない。
     pub fn iter_committed(&self) -> Vec<Record> {
@@ -1494,6 +1674,12 @@ fn decode_op(op_byte: u8, payload: &[u8]) -> Option<DecodedOp> {
             if payload.len() < 8 + blen { return None; }
             let bytes = payload[8..8 + blen].to_vec();
             Some(DecodedOp::Vocab { vid, bytes })
+        }
+        op_type::TIE_REF if payload.len() >= 20 => {
+            let eid = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+            let himo_id = u16::from_le_bytes(payload[8..10].try_into().unwrap());
+            let target = u64::from_le_bytes(payload[12..20].try_into().unwrap());
+            Some(DecodedOp::TieRef { eid, himo_id, target })
         }
         _ => None,
     }

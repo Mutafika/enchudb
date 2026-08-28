@@ -14,7 +14,7 @@ fn main() {
 
     let t = Instant::now();
     for i in 0..n {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "age", i % 50);
         eng.tie(e, "dept", i % 8);
         eng.tie(e, "company", i % 100);
@@ -50,7 +50,7 @@ fn main() {
     let t = Instant::now();
     let write_n = 10_000u32;
     for i in 0..write_n {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "age", i % 50);
         eng.tie_text(e, "city", &format!("city_{}", i % 10));
     }
@@ -63,7 +63,7 @@ fn main() {
     }
     let read = t.elapsed();
 
-    eprintln!("=== v24 実用ベンチ (1M entities) ===");
+    eprintln!("=== 実用ベンチ (1M entities) ===");
     eprintln!("");
     eprintln!("--- 書き込み ---");
     eprintln!("バルク 1M                    : {:>6}ms", bulk_insert.as_millis());

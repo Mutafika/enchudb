@@ -54,7 +54,7 @@ fn make_pre_v9(path: &str) -> u16 {
     let hid = eng.himo_id("age").unwrap() as u16;
     assert!(!eng.has_cell_version(), "前提が崩れた: v9 領域を持っている");
     for i in 0..3u32 {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_to(e, "age", 100 + i);
     }
     eng.flush().unwrap();
@@ -183,7 +183,7 @@ fn already_v9_is_untouched() {
         let mut eng = Engine::create_with_capacity(&path, 4096).unwrap();
         eng.define_himo("age", ValueType::Number, 0);
         assert!(eng.has_cell_version());
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_to(e, "age", 7);
         eng.flush().unwrap();
     }
@@ -219,8 +219,8 @@ fn foreign_delete_records_land_in_the_new_tombstone_column() {
         assert!(!eng.has_cell_version(), "前提が崩れた");
 
         let t = eng.resolve_remote_eid(foreign, hid).expect("翻訳できない");
-        assert!(eng.remote_tie_apply(t, hid, 111, hlc(1000, 1), None));
-        assert!(eng.remote_delete_apply(t, hlc(2000, 1), None));
+        assert!(eng.remote_tie_apply(t, hid, 111, hlc(1000, 1)));
+        assert!(eng.remote_delete_apply(t, hlc(2000, 1)));
 
         eng.persist_tables().unwrap(); // .eidmap に tombstone が載る
         eng.flush().unwrap();
@@ -239,7 +239,7 @@ fn foreign_delete_records_land_in_the_new_tombstone_column() {
     );
     // 削除より古い Tie は弾かれる = 移行直後から効いている
     assert!(
-        !eng.remote_tie_apply(t, hid, 111, hlc(1500, 1), None),
+        !eng.remote_tie_apply(t, hid, 111, hlc(1500, 1)),
         "削除より古い Tie が通った",
     );
     drop(eng);

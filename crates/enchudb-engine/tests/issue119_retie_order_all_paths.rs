@@ -100,7 +100,7 @@ fn setup(tag: &str) -> (String, Engine, u64) {
     cleanup(&path);
     let mut eng = Engine::create_growable_opts(&path, GrowableOptions::default()).unwrap();
     eng.define_himo("body", ValueType::Leaf, 0);
-    let eid = eng.entity();
+    let eid = eng.entity().unwrap();
     eng.tie_text(eid, "body", "init-0000000000000000");
     (path, eng, eid)
 }
@@ -131,7 +131,7 @@ fn sync_apply_path_no_silent_none_or_torn() {
     let hid = eng.himo_id("body").unwrap() as u16;
     let eng = Arc::new(eng);
     let t = churn_and_read(eng, eid, bodies(), move |e, eid, s| {
-        e.remote_tieleaf_apply(eid, hid, s.as_bytes(), enchudb_oplog::Hlc::ZERO, None);
+        e.remote_tieleaf_apply(eid, hid, s.as_bytes(), enchudb_oplog::Hlc::ZERO);
     });
     assert_eq!(
         t.missing + t.corrupt,

@@ -1,4 +1,4 @@
-//! v28 WAL 統合テスト。プロセスクラッシュ / fsync 挙動 / リカバリを検証。
+//! oplog 統合テスト。プロセスクラッシュ / fsync 挙動 / リカバリを検証。
 
 use enchudb::{Engine, ValueType};
 use std::path::Path;
@@ -31,7 +31,7 @@ fn create_open_with_wal_roundtrip() {
     }
 
     let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
-    let e1 = eng.entity();
+    let e1 = eng.entity().unwrap();
     eng.tie_async(e1, "age", 30);
     eng.flush_writes();
     eng.oplog_commit();
@@ -64,7 +64,7 @@ fn recover_after_drop_without_flush() {
     // WAL 有効で書き込む → commit → fsync を待たずに drop(プロセスキル模擬)
     {
         let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_async(e, "tag", 7);
         eng.flush_writes();
         eng.oplog_commit();
@@ -94,14 +94,14 @@ fn uncommitted_writes_discarded_on_recovery() {
     // Commit 済みと未 Commit を混ぜて書く
     {
         let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
-        let e1 = eng.entity();
+        let e1 = eng.entity().unwrap();
         eng.tie_async(e1, "score", 100);
         eng.flush_writes();
         eng.oplog_commit();
         eng.oplog_sync().unwrap();
 
         // commit 無しで書く(これは recover で破棄される)
-        let e2 = eng.entity();
+        let e2 = eng.entity().unwrap();
         eng.tie_async(e2, "score", 999);
         eng.flush_writes();
         // oplog_commit 呼ばないまま drop
@@ -147,7 +147,7 @@ fn stats_snapshot() {
     }
     let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
     for i in 0..50u32 {
-        let ent = eng.entity();
+        let ent = eng.entity().unwrap();
         eng.tie_async(ent, "n", i);
     }
     eng.flush_writes();
@@ -176,7 +176,7 @@ fn content_async_roundtrip() {
     // content_async で書いて、sync して drop
     {
         let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_async(e, "tag", 3);
         eng.content_async(e, "memo", b"hello crash");
         eng.flush_writes();
@@ -202,7 +202,7 @@ fn auto_commit_on_shutdown() {
     // 手動 oplog_commit を呼ばずに drop → shutdown path が auto-commit
     {
         let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_async(e, "n", 42);
         eng.flush_writes();
         // ここで oplog_commit も oplog_sync も呼ばない → drop 時の auto-commit に委ねる
@@ -261,7 +261,7 @@ fn concurrent_writes_with_oplog() {
         let e = Arc::clone(&eng);
         handles.push(std::thread::spawn(move || {
             for i in 0..250 {
-                let ent = e.entity();
+                let ent = e.entity().unwrap();
                 e.tie_async(ent, "n", (t * 1000 + i) as u32);
             }
         }));

@@ -50,7 +50,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use enchudb_engine::engine::Engine;
+use enchudb_engine::engine::{Engine, RemoteApply};
 use enchudb_engine::hlc_store::HlcStore;
 use enchudb_engine::transport::{Transport, WireRecord};
 use enchudb_oplog::oplog::DecodedOp;
@@ -61,10 +61,15 @@ use crate::subscription::{AllRecords, SubscriptionFilter};
 pub struct Syncer {
     engine: Arc<Engine>,
     transport: Arc<dyn Transport>,
-    /// 各 peer から最後に pull した地点(HLC)。次回はここより後だけ取る。
+    /// 各 pull 先 (link) から最後に pull した地点。 #216: relay の stream は
+    /// 複数 author の merge で HLC 非単調なので、 cursor は **link × author** の
+    /// 2 段 map — author ごとの substream は relay を何 hop 挟んでも単調、 が
+    /// この粒度を健全にする不変式。 relay を使わない 1-hop 構成では
+    /// `{link: {author=link: hlc}}` の 1 entry で従来と同一挙動。
     /// `cursor_path` が設定されていれば update のたびにディスクに保存し、
     /// `Syncer::new` 時にロードして差分同期を継続する。
-    last_pulled: std::sync::Mutex<std::collections::HashMap<PeerId, Hlc>>,
+    last_pulled:
+        std::sync::Mutex<std::collections::HashMap<PeerId, std::collections::HashMap<PeerId, Hlc>>>,
     /// `last_pulled` の永続化先。 `None` ならメモリのみ。
     cursor_path: std::sync::RwLock<Option<PathBuf>>,
     /// Phase C: true なら署名検証を強制。未署名 or 検証失敗 op は reject。
@@ -74,6 +79,17 @@ pub struct Syncer {
     subscription_filter: std::sync::RwLock<Arc<dyn SubscriptionFilter>>,
     /// #9 foot-gun ガード: self_peer == 0 で foreign record を apply した事の一度だけ警告。
     warned_unconfigured_peer: std::sync::atomic::AtomicBool,
+    /// #216 observability: `pull_once` が `history_truncated` を返した回数。
+    /// 「単調増加しているのに bootstrap 成功が無い」= 回復経路が塞がっている
+    /// (state provider 不在等) の運用 signal。
+    truncated_pulls: std::sync::atomic::AtomicU64,
+    /// #216: 「truncated なのに transport が state を運べない (fetch_state = None)」
+    /// の一度だけ警告 — この構成では truncation が回復経路の無い行き止まりになる。
+    warned_no_state_provider: std::sync::atomic::AtomicBool,
+    /// #226: `serve_state` で state 配布に opt-in 済みか、 および既に provider を
+    /// 登録した author 一覧。 relay は pull のたびに新しい author を持ちうるので、
+    /// opt-in 済みなら差分を自動で登録し直す (app 側の儀式を増やさない)。
+    served_authors: std::sync::Mutex<Option<std::collections::HashSet<PeerId>>>,
     // 0.9.0: 旧 Content reorder buffer (`pending_ops`) は削除 — content は
     // TieNamed で運ばれ、 自力で entity 写像を作れるため退避が不要になった。
 }
@@ -121,9 +137,21 @@ pub struct SyncOutcome {
     pub rejected_signature: usize,
     /// Phase C: ACL で reject した op 数。
     pub rejected_acl: usize,
-    /// #78 (0.9.0): reject (署名/ACL) された record の最小 HLC。 pull cursor は
+    /// #210: **容量が足りず apply を拒否した op 数** (ディスク満杯 / content 天井)。
+    ///
+    /// 値は一切書いていないので、 [`SyncOutcome::skipped`] (= LWW で古い、 再配送不要)
+    /// とは意味が真逆で、 **空きが出てからの再配送が必要**。 そのため
+    /// [`SyncOutcome::min_rejected_hlc`] にも計上して cursor を止める。
+    ///
+    /// > 0 なら engine 側の `FaultKind::DiskSpace` / `ContentSpace` も同時に立っている。
+    pub rejected_capacity: usize,
+    /// #78 (0.9.0): reject された record の最小 HLC。 pull cursor は
     /// これを越えて前進しない — pubkey 登録との race 窓で reject された record が
     /// 永久に再配送されない silent gap を防ぐ (次回 pull で再検証される)。
+    ///
+    /// #210: 署名 / ACL に加えて **容量拒否** ([`SyncOutcome::rejected_capacity`]) も
+    /// ここに計上する。 どちらも 「今は入れられないが、 条件が変われば入る」 ので
+    /// cursor を越えさせてはいけない。
     pub min_rejected_hlc: Option<Hlc>,
     /// #140: **自分の cursor より新しい履歴が publisher 側で既に reclaim されていた**。
     ///
@@ -132,8 +160,31 @@ pub struct SyncOutcome {
     /// (部分履歴を全履歴として適用すると store が黙って不完全になる = #140)。
     ///
     /// `true` のとき **records は一切適用していない**。 caller は差分 pull を諦めて
-    /// bootstrap (= `GET /bootstrap` などによる snapshot 取得) からやり直す必要がある。
+    /// [`Syncer::bootstrap_pull`] (author が `serve_state` 済みの transport) か
+    /// `GET /bootstrap` (replica 型の snapshot 取得) からやり直す必要がある。
     pub history_truncated: bool,
+    /// #226: `history_truncated` を立てた **author** の一覧。
+    ///
+    /// relay 経由の pull は 1 本の link に複数 author の stream が乗るので、
+    /// 「link が truncated」 だけでは**どの author を bootstrap すればいいか**
+    /// 決まらない。 caller は各 author について
+    /// [`Syncer::bootstrap_pull_via`]`(link, author)` を呼ぶ。
+    ///
+    /// 空 かつ `history_truncated` = author を特定できない広域 truncation
+    /// (author 別 floor を運べない transport、 または legacy baseline 由来)。
+    /// この場合は link 自身 (= 1-hop 構成なら author) を bootstrap するしかない。
+    pub truncated_authors: Vec<PeerId>,
+}
+
+/// #140: [`Syncer::bootstrap_pull`] の結果。
+#[derive(Debug, Clone)]
+pub struct BootstrapOutcome {
+    /// state record 適用の内訳 (LWW 冪等なので再 bootstrap では applied が減る)。
+    pub outcome: SyncOutcome,
+    /// ghost sweep で削除した entity 数 (= state に現れなかった author の行)。
+    pub swept: usize,
+    /// state 合成時点の HLC。 適用後の pull cursor はここに揃っている。
+    pub as_of: Hlc,
 }
 
 /// `apply_one` の結果。
@@ -153,6 +204,19 @@ enum ApplyResult {
     /// あちらが正常系でも立つ背景値を持つのに対し、 こちらは定常 0 であるべき
     /// = 監視上の意味が逆だから ([`SyncOutcome::dropped_vocab`])。
     DroppedVocab,
+    /// #210: **容量が足りず apply を拒否した**。 値は書いていないので、
+    /// `SkippedOlder` (再配送不要) ではなく **cursor を止めて再配送させる**。
+    RejectedCapacity,
+}
+
+impl From<RemoteApply> for ApplyResult {
+    fn from(r: RemoteApply) -> Self {
+        match r {
+            RemoteApply::Applied => ApplyResult::Applied,
+            RemoteApply::Stale => ApplyResult::SkippedOlder,
+            RemoteApply::RejectedCapacity => ApplyResult::RejectedCapacity,
+        }
+    }
 }
 
 impl ApplyResult {
@@ -175,21 +239,38 @@ impl Syncer {
     /// WAL 有効な Engine を作るには `Engine::open_concurrent_with_oplog` /
     /// `Engine::create_concurrent_with_oplog` を使うこと。
     pub fn new(engine: Arc<Engine>, transport: Arc<dyn Transport>) -> Self {
-        let wal = engine.oplog_arc().unwrap_or_else(|| {
-            panic!(
+        match Self::try_new(engine, transport) {
+            Ok(s) => s,
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// [`Syncer::new`] の非 panic 版 (#59)。
+    ///
+    /// `new` の 2 つの前提 (WAL 有効 / sync tables 有効) は 「使い方の誤り」 なので
+    /// loud に止めるのが既定だが、 embedded DB を host app に埋め込む caller は
+    /// process を殺さずに判断したい。 前提を満たさなければ `Err` を返す。
+    pub fn try_new(
+        engine: Arc<Engine>,
+        transport: Arc<dyn Transport>,
+    ) -> Result<Self, String> {
+        let Some(wal) = engine.oplog_arc() else {
+            return Err(
                 "Syncer requires a WAL-enabled Engine. \
                  Use Engine::open_concurrent_with_oplog / create_concurrent_with_oplog \
                  instead of Engine::open / create."
-            )
-        });
+                    .to_string(),
+            );
+        };
         // 0.8.0: sync 配信の primary は `_sync_ops` 一本、 legacy oplog iter
         // fallback は撤去。 `Database::enable_sync()` (= `enable_sync_tables`) を
         // 呼んでない engine で Syncer を attach するのは fatal。
         if !engine.sync_tables_enabled() {
-            panic!(
+            return Err(
                 "Syncer requires sync tables (_sync_ops / _sync_peers). \
                  Call Database::enable_sync() / Engine::enable_sync_tables() before \
                  attaching Syncer."
+                    .to_string(),
             );
         }
         // 0.8.0: oplog auto_reset を OFF にする hack は撤去。 publish path が
@@ -205,6 +286,9 @@ impl Syncer {
             require_signature: std::sync::atomic::AtomicBool::new(false),
             subscription_filter: std::sync::RwLock::new(Arc::new(AllRecords)),
             warned_unconfigured_peer: std::sync::atomic::AtomicBool::new(false),
+            truncated_pulls: std::sync::atomic::AtomicU64::new(0),
+            warned_no_state_provider: std::sync::atomic::AtomicBool::new(false),
+            served_authors: std::sync::Mutex::new(None),
         };
         // request17 step 6: **v9 DB では hydrate しない**。
         //
@@ -219,7 +303,7 @@ impl Syncer {
         if !engine.has_cell_version() {
             syncer.hydrate_hlc_store(&engine);
         }
-        syncer
+        Ok(syncer)
     }
 
     /// `last_pulled` の永続化先を設定し、 既存ファイルから cursor をロードする。
@@ -236,20 +320,37 @@ impl Syncer {
         let mut guard = self.last_pulled.lock().unwrap();
         for line in s.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() != 4 {
-                continue;
-            }
-            let Ok(p) = parts[0].parse::<PeerId>() else { continue };
-            let Ok(wall) = parts[1].parse::<u64>() else { continue };
-            let Ok(logical) = parts[2].parse::<u32>() else { continue };
-            let Ok(peer) = parts[3].parse::<PeerId>() else { continue };
-            guard.insert(p, Hlc { wall, logical, peer });
+            // #216 v2 書式: `link author wall logical hlc_peer` (5 field)。
+            // legacy 4 field (`link wall logical hlc_peer`) は author=link の
+            // cursor として読む — 他 author は Hlc::ZERO 起点になり再配送されるが
+            // apply は LWW で冪等。 旧 scalar cursor が silent drop した relayed
+            // record は、 この再配送で自己修復される。
+            let (link, author, rest) = match parts.len() {
+                5 => {
+                    let Ok(l) = parts[0].parse::<PeerId>() else { continue };
+                    let Ok(a) = parts[1].parse::<PeerId>() else { continue };
+                    (l, a, &parts[2..])
+                }
+                4 => {
+                    let Ok(l) = parts[0].parse::<PeerId>() else { continue };
+                    (l, l, &parts[1..])
+                }
+                _ => continue,
+            };
+            let Ok(wall) = rest[0].parse::<u64>() else { continue };
+            let Ok(logical) = rest[1].parse::<u32>() else { continue };
+            let Ok(peer) = rest[2].parse::<PeerId>() else { continue };
+            guard
+                .entry(link)
+                .or_default()
+                .insert(author, Hlc { wall, logical, peer });
         }
     }
 
     /// `last_pulled` を atomic write でディスクに保存。 `cursor_path` 未設定なら no-op。
-    /// 書式: 1 行 1 エントリ、 `peer_id wall logical hlc_peer` (空白区切り)。
-    /// 失敗しても sync は続行 (cursor は次回ロードで古いまま、 multi-apply は LWW で吸収)。
+    /// 書式 (#216 v2): 1 行 1 エントリ、 `link author wall logical hlc_peer`
+    /// (空白区切り)。 失敗しても sync は続行 (cursor は次回ロードで古いまま、
+    /// multi-apply は LWW で吸収)。
     fn save_cursors(&self) {
         let path = match self.cursor_path.read().unwrap().clone() {
             Some(p) => p,
@@ -257,8 +358,13 @@ impl Syncer {
         };
         let guard = self.last_pulled.lock().unwrap();
         let mut buf = String::new();
-        for (p, h) in guard.iter() {
-            buf.push_str(&format!("{} {} {} {}\n", p, h.wall, h.logical, h.peer));
+        for (link, authors) in guard.iter() {
+            for (author, h) in authors.iter() {
+                buf.push_str(&format!(
+                    "{} {} {} {} {}\n",
+                    link, author, h.wall, h.logical, h.peer
+                ));
+            }
         }
         drop(guard);
         let tmp = path.with_extension("tmp");
@@ -314,13 +420,16 @@ impl Syncer {
             | DecodedOp::Delete { eid }
             | DecodedOp::Content { eid, .. }
             | DecodedOp::TieNamed { eid, .. }
-            | DecodedOp::TieLeaf { eid, .. } => engine.resolve_remote_eid_existing(*eid),
+            | DecodedOp::TieLeaf { eid, .. }
+            | DecodedOp::TieRef { eid, .. } => engine.resolve_remote_eid_existing(*eid),
             DecodedOp::Commit | DecodedOp::Vocab { .. } => None,
         }) else {
             return;
         };
         match &rec.op {
-            DecodedOp::Tie { himo_id, .. } | DecodedOp::Untie { himo_id, .. } => {
+            DecodedOp::Tie { himo_id, .. }
+            | DecodedOp::Untie { himo_id, .. }
+            | DecodedOp::TieRef { himo_id, .. } => {
                 store.try_set(local_eid, *himo_id, rec.hlc);
             }
             DecodedOp::Delete { .. } => {
@@ -359,16 +468,228 @@ impl Syncer {
         self.engine.ack_sync(peer, snapshot_lsn)
     }
 
+    /// #140: 自 engine の live state を transport に配布登録する (author 側)。
+    ///
+    /// 登録後、 truncated puller は `bootstrap_pull` で現在状態を取得できる。
+    /// provider は呼ばれるたびに `Engine::state_records` で合成する (常に最新)。
+    /// state を運べない transport (default 実装) では no-op。
+    ///
+    /// #216: relay / reclaim が回る topology では **実質必須** — reclaim は floor を
+    /// 上げ、 floor を跨いだ puller の唯一の回復経路が bootstrap になるため。
+    /// provider 不在だと `history_truncated` は回復経路の無い行き止まりになる
+    /// (`bootstrap_pull` が once-warn を出し、 `Syncer::truncated_pulls` で観測可)。
+    ///
+    /// #226: relay (gossip) なら、 自分が replica を持っている **他 author の分も**
+    /// 配布登録する。 relay topology では author に直接届かない follower の唯一の
+    /// 回復経路がこれ。 replica 発の batch は `complete: false` — relay が author の
+    /// live state を全部持っている保証は無い (途中から relay を始めた場合) ので、
+    /// 受信側の ghost sweep は走らせない。 **亡霊掃除は author 直 bootstrap の
+    /// 特権**として残る (relay 経由 bootstrap は内容だけ回復する)。
+    ///
+    /// 一度呼べば opt-in が残り、 以降 `pull_once` / `bootstrap_pull` で新しい
+    /// author を取り込むたびに自動で登録が追加される (app 側に儀式を増やさない)。
+    /// 何度呼んでも冪等。
+    pub fn serve_state(&self) {
+        {
+            let mut g = self.served_authors.lock().unwrap();
+            if g.is_none() {
+                *g = Some(std::collections::HashSet::new());
+            }
+        }
+        self.refresh_state_providers();
+    }
+
+    /// `serve_state` で opt-in 済みなら、 未登録の author 分の provider を張る。
+    /// opt-in していなければ no-op。
+    fn refresh_state_providers(&self) {
+        // pull ごとに呼ばれる。 opt-in していなければ engine に一切触れずに返す。
+        if self.served_authors.lock().unwrap().is_none() {
+            return;
+        }
+        let self_peer = self.engine.peer_id();
+        let mut authors: Vec<PeerId> = vec![self_peer];
+        // relay でない peer は他 author の行を転送しないので、 replica として
+        // 名乗らない (持っていても配送経路が無い)。
+        if self.engine.gossip_remote_apply() {
+            for a in self.engine.replicated_authors() {
+                if a != self_peer {
+                    authors.push(a);
+                }
+            }
+        }
+        let fresh: Vec<PeerId> = {
+            let mut g = self.served_authors.lock().unwrap();
+            let Some(seen) = g.as_mut() else { return };
+            authors.into_iter().filter(|a| seen.insert(*a)).collect()
+        };
+        for author in fresh {
+            // Weak 必須: transport は peer より長生きする。 強参照で capture すると、
+            // restart で drop したはずの engine (background consumer 込み) が provider の
+            // 中で生き続け、 同一 DB file を再 open した新 engine と並走して sidecar
+            // persist が衝突する (sunsu2 chaos の restart で実測)。
+            let engine = Arc::downgrade(&self.engine);
+            let is_self = author == self_peer;
+            self.transport.register_state_provider_for(
+                author,
+                self_peer,
+                Arc::new(move || {
+                    let eng = engine.upgrade()?;
+                    let (records, as_of) = eng.state_records_for(author);
+                    if !is_self && records.is_empty() {
+                        // 何も持っていない replica は None を返して次の候補に譲る。
+                        // 空 batch でも `Some` を返すと、 caller は「state を受け取った
+                        // = 回復した」と見なして truncation を解除してしまう。
+                        // (self の空 batch は「author に行が無い」の正しい表明なので別)
+                        return None;
+                    }
+                    Some(enchudb_engine::transport::StateBatch {
+                        records,
+                        as_of,
+                        complete: is_self,
+                    })
+                }),
+            );
+        }
+    }
+
+    /// #140: truncation からの復旧経路 — author の live state を取得して適用する。
+    ///
+    /// `pull_once` が `history_truncated` を返した peer に対して呼ぶ。
+    /// 1. `Transport::fetch_state(from)` で StateBatch 取得 (None = 運べない transport
+    ///    または author 未登録 → 復旧不能、 None を返す)
+    /// 2. 通常の apply 経路 (LWW、 冪等) で適用 + durable barrier
+    /// 3. **ghost sweep**: 自 store に居る author の行のうち state に現れなかった
+    ///    entity を削除 — author の現在状態に無い = author 側で削除済み。 truncated
+    ///    期間に tombstone を取り逃した亡霊 (#140 の原症状) をここで吸収する。
+    ///    sweep の Delete は自分の oplog にも載って伝播するが、 対象は「author が
+    ///    既に消した行」なので LWW 的に正しい方向にしか働かない
+    /// 4. cursor を `as_of` へ前進 (後退はさせない) — 以降は通常の差分 pull
+    pub fn bootstrap_pull(&self, from: PeerId) -> Option<BootstrapOutcome> {
+        self.bootstrap_pull_via(from, from)
+    }
+
+    /// #226: `link` 経由で `author` の state を bootstrap する — relay topology 用の
+    /// `bootstrap_pull` 一般形 (`bootstrap_pull(p)` = `bootstrap_pull_via(p, p)`)。
+    ///
+    /// author に直接 pull していない follower は cursor を `last_pulled[link][author]`
+    /// に持つ。 link と author を同一視したままだと、 bootstrap が誰も pull しない
+    /// link の下に cursor を書いてしまい **前進が効かない**。 ここを分けることで
+    /// 「relay から author の state をもらい、 以降は relay からの差分で追う」が成立する。
+    ///
+    /// `fetch_state` は author 名で引く (どの provider が応じるかは transport の
+    /// 責務 — `InMemoryTransport` は本人発を優先し、 次に replica 発)。
+    pub fn bootstrap_pull_via(&self, link: PeerId, author: PeerId) -> Option<BootstrapOutcome> {
+        let Some(batch) = self.transport.fetch_state(author) else {
+            // #216: この構成では truncation が回復経路の無い行き止まり — silent に
+            // しない。 relay topology (reclaim が回る構成) では author 側の
+            // `serve_state` 登録が実質必須。
+            if !self
+                .warned_no_state_provider
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                eprintln!(
+                    "[enchudb] sync: bootstrap_pull({author}) failed — the transport carries \
+                     no state for this peer (no serve_state provider?). History-truncated \
+                     pulls from it cannot recover; in relay/reclaim topologies serve_state \
+                     is effectively mandatory. (warned once)"
+                );
+            }
+            return None;
+        };
+        let gossip = self.engine.gossip_remote_apply();
+        let mut relay_accepted: Vec<usize> = Vec::new();
+        let outcome =
+            self.apply_records_impl(&batch.records, gossip.then_some(&mut relay_accepted));
+
+        // #209: relay が bootstrap で取った state も原型のまま relay stream へ —
+        // これで新規 relay も author の複製 + 配布点として立ち上がれる。
+        if gossip {
+            for &i in &relay_accepted {
+                let _ = self.engine.relay_record(&batch.records[i]);
+            }
+        }
+
+        // pull_once と同じ barrier: 派生 state (eidmap / vocabmap / tables) が
+        // durable になる前に cursor を進めない。
+        if outcome.applied > 0 && !self.persist_applied_state(link) {
+            return Some(BootstrapOutcome { outcome, swept: 0, as_of: batch.as_of });
+        }
+
+        let mut swept = 0usize;
+        if batch.complete {
+            let covered: std::collections::HashSet<u32> = batch
+                .records
+                .iter()
+                .filter_map(|r| match &r.op {
+                    DecodedOp::Tie { eid, .. }
+                    | DecodedOp::Untie { eid, .. }
+                    | DecodedOp::Delete { eid }
+                    | DecodedOp::Content { eid, .. }
+                    | DecodedOp::TieNamed { eid, .. }
+                    | DecodedOp::TieLeaf { eid, .. }
+                    | DecodedOp::TieRef { eid, .. } => Some(enchudb_oplog::eid_local(*eid)),
+                    DecodedOp::Commit | DecodedOp::Vocab { .. } => None,
+                })
+                .collect();
+            for (foreign_local, local) in self.engine.translated_locals_of(author) {
+                if !covered.contains(&foreign_local) {
+                    self.engine.delete(local as u64);
+                    swept += 1;
+                }
+            }
+        }
+
+        // cursor := max(現行, as_of)。 進んだら永続 + pull-as-ack (#149) も記録。
+        // #216: StateBatch は author 単一なので author の entry のみ前進させ、
+        // ack は author 別 cursor の vector を送る (pull_once と同じ)。
+        // #226: cursor が住むのは **link** の下 — 以降その author を追うのは link
+        // からの差分 pull なので、 author の下に書いても誰も見ない。
+        let self_peer = self.engine.peer_id();
+        let (advanced, cursors) = {
+            let mut guard = self.last_pulled.lock().unwrap();
+            let link_map = guard.entry(link).or_default();
+            let cur = link_map.entry(author).or_insert(Hlc::ZERO);
+            let advanced = if batch.as_of > *cur {
+                *cur = batch.as_of;
+                true
+            } else {
+                false
+            };
+            let cursors: Vec<(PeerId, Hlc)> = link_map.iter().map(|(a, h)| (*a, *h)).collect();
+            (advanced, cursors)
+        };
+        if advanced {
+            self.save_cursors();
+            // #227: relay なら下流の消化で丸めてから ack する。
+            let cursors = self.cap_ack_by_downstream(cursors);
+            self.transport.record_pull_ack_multi(link, self_peer, &cursors);
+        }
+        // #226: relay が bootstrap で新しい author を取り込んだ → その author の
+        // 配布元としても名乗る (opt-in 済みなら)。
+        self.refresh_state_providers();
+
+        Some(BootstrapOutcome { outcome, swept, as_of: batch.as_of })
+    }
+
     /// 指定 peer から未取得レコードを 1 回 pull して本体に apply。
     /// request4: `pull_as(self_peer, from, since)` 経由で broadcast log +
     /// (from, self_peer) targeted log を両方拾う。 partial sync 対応 transport
     /// (InMemoryTransport 等) では targeted 経由の per-peer record も受信できる。
     pub fn pull_once(&self, from: PeerId) -> SyncOutcome {
-        let since = {
+        // #216: cursor は link × author の vector — relay の stream は複数 author の
+        // merge で HLC 非単調なので、 scalar cursor は relay された古い HLC の
+        // record を永久に落とす (silent data loss)。 author substream は単調なので
+        // author 粒度の cursor が健全。
+        let since: Vec<(PeerId, Hlc)> = {
             let guard = self.last_pulled.lock().unwrap();
-            guard.get(&from).copied().unwrap_or(Hlc::ZERO)
+            guard
+                .get(&from)
+                .map(|m| m.iter().map(|(a, h)| (*a, *h)).collect())
+                .unwrap_or_default()
         };
         let self_peer = self.engine.peer_id();
+        let floors_multi = self.transport.history_floor_multi(from);
+        let floor = self.transport.history_floor(from);
 
         // #140: publisher が広告した履歴の下限より自分の cursor が古いなら、 差分では
         // 埋められない穴がある。 部分履歴をそのまま適用すると store が黙って不完全に
@@ -376,14 +697,134 @@ impl Syncer {
         // 適用せず** truncation を通知して caller に bootstrap を促す。
         //
         // cursor が floor 以上なら、 落ちた分は既に自分が consume 済みなので安全。
-        if let Some(floor) = self.transport.history_floor(from) {
-            if since < floor {
-                return SyncOutcome { history_truncated: true, ..SyncOutcome::default() };
+        //
+        // #216: author 別 floor が広告されていればそちらで判定する —
+        // `cursor[a] < effective_floor[a]` の author がいる時だけ truncation。
+        // scalar floor に対する min 判定は、 relay 混在 ring の定常運転 (relay 自身の
+        // row の cursor は古いまま、 中継分の reclaim で floor が上がる) で恒常
+        // false positive になる。 未知 author (cursor 無し = ZERO) の floor entry も
+        // truncation — その author の履歴の一部は受け取る前に消えている。
+        //
+        // `(u32::MAX, h)` entry = 無帰属 baseline (legacy scalar 由来、 全 author への
+        // 下限として畳み込む)。 これを分けずに scalar max へ落とすと、 legacy floor を
+        // 持つ既存 DB で per-author 判定が一生有効化されない (review 指摘)。
+        let baseline = floors_multi
+            .as_ref()
+            .and_then(|f| f.iter().find(|(a, _)| *a == u32::MAX).map(|(_, h)| *h))
+            .unwrap_or(Hlc::ZERO);
+        let mut truncated_authors: Vec<PeerId> = Vec::new();
+        let truncated_by_floor = if let Some(floors) = &floors_multi {
+            let cursor_of_a = |a: PeerId| {
+                since
+                    .iter()
+                    .find(|(p, _)| *p == a)
+                    .map(|(_, h)| *h)
+                    .unwrap_or(Hlc::ZERO)
+            };
+            let violates = |a: PeerId| {
+                let f = floors
+                    .iter()
+                    .find(|(p, _)| *p == a)
+                    .map(|(_, h)| *h)
+                    .unwrap_or(Hlc::ZERO);
+                cursor_of_a(a) < f.max(baseline)
+            };
+            // #226: どの author が穴を空けたかを caller に渡す — relay link には
+            // 複数 author の stream が乗るので、 bool だけでは bootstrap 対象が
+            // 決まらない。
+            for (a, _) in floors.iter().filter(|(a, _)| *a != u32::MAX) {
+                if violates(*a) && !truncated_authors.contains(a) {
+                    truncated_authors.push(*a);
+                }
             }
+            for (a, _) in since.iter() {
+                if violates(*a) && !truncated_authors.contains(a) {
+                    truncated_authors.push(*a);
+                }
+            }
+            // 初回 pull (cursor 無し) で reclaim 済み link → 従来どおり truncation
+            // (baseline-only の floor では上の走査対象が無いので明示する。 author を
+            // 特定できないので `truncated_authors` は空のまま = 広域 truncation)。
+            let fresh_puller = since.is_empty() && !floors.is_empty();
+            fresh_puller || !truncated_authors.is_empty()
+        } else if let Some(floor) = floor {
+            // scalar floor は author を判別できない → 広域 truncation。
+            let link_min = since.iter().map(|(_, h)| *h).min().unwrap_or(Hlc::ZERO);
+            link_min < floor
+        } else {
+            false
+        };
+        if truncated_by_floor {
+            self.truncated_pulls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return SyncOutcome {
+                history_truncated: true,
+                truncated_authors,
+                ..SyncOutcome::default()
+            };
         }
 
-        let records = self.transport.pull_as(self_peer, from, since);
-        let outcome = self.apply_records(&records);
+        let fetched = self.transport.pull_as_multi(self_peer, from, &since);
+        // #216: default 実装 transport (全量 fetch fallback) 向けの受信側 filter。
+        // per-author filter 済み transport (InMemory) では素通り。
+        let cursor_of = |author: PeerId| {
+            since
+                .iter()
+                .find(|(p, _)| *p == author)
+                .map(|(_, h)| *h)
+                .unwrap_or(Hlc::ZERO)
+        };
+        let records: Vec<WireRecord> = fetched
+            .into_iter()
+            .filter(|r| r.hlc > cursor_of(r.author_peer))
+            .collect();
+
+        // #216: 新 author の record が「reclaim 済みの link」に現れた場合、 その
+        // author の古い record は既に ring から落ちている可能性がある。 適用と
+        // cursor 前進は行った上で truncation を通知し、 app に当該 author の
+        // bootstrap を促す — 次回以降は author が map に載るので clean diff に戻る。
+        // 発火条件は 2 つ:
+        // - scalar floor しか無い link (author 別に判別できない → 保守的に全新 author)
+        // - author 別 floor に無帰属 baseline (legacy) がある link (baseline 以前の
+        //   purge は帰属不明 → 新 author の過去分が消えていても entry に現れない)
+        // author 別 floor のみ (baseline 無し) なら、 entry のある新 author は
+        // pre-fetch 判定が拾い、 entry の無い新 author は reclaim されていない =
+        // clean なので flag 不要。
+        let mut new_authors: Vec<PeerId> = Vec::new();
+        if (floors_multi.is_none() && floor.is_some()) || baseline > Hlc::ZERO {
+            for r in &records {
+                if !since.iter().any(|(p, _)| *p == r.author_peer)
+                    && !new_authors.contains(&r.author_peer)
+                {
+                    new_authors.push(r.author_peer);
+                }
+            }
+        }
+        let new_author_on_reclaimed_link = !new_authors.is_empty();
+        let gossip = self.engine.gossip_remote_apply();
+        let mut relay_accepted: Vec<usize> = Vec::new();
+        let mut outcome =
+            self.apply_records_impl(&records, gossip.then_some(&mut relay_accepted));
+        if new_author_on_reclaimed_link {
+            outcome.history_truncated = true;
+            // #226: この経路は author を特定できる (新規に現れた author そのもの)。
+            outcome.truncated_authors = new_authors;
+            self.truncated_pulls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // #209: relay (gossip) — accept した record を**原型のまま** (原 eid / 原
+        // value / 原 HLC / 原署名) 自分の WAL へ。 翻訳後の姿を relay すると
+        // direct 経路との混在で row 重複 / vocab 写像汚染になる。 append は
+        // barrier より前: crash で append が飛んでも cursor 未前進なら再 pull で
+        // 再適用+再判定される。 既知の狭い窓 (apply 済み・append 前の crash で
+        // 当該 record が relay stream から漏れる) は #209 に記録済み — 下流の
+        // 回収路は author 直 bootstrap。
+        if gossip {
+            for &i in &relay_accepted {
+                let _ = self.engine.relay_record(&records[i]);
+            }
+        }
 
         // **cursor は、 それが消費した state より先に durable になってはいけない。**
         //
@@ -415,27 +856,113 @@ impl Syncer {
         // record が永久に再配送されない silent gap を作っていた。 reject があった
         // 場合は「最小 reject HLC 未満の accepted record」までしか進めない
         // (= reject 分は次回 pull で再配送・再検証される)。
-        let target = match outcome.min_rejected_hlc {
-            None => records.iter().map(|r| r.hlc).max(),
-            Some(minrej) => records.iter().map(|r| r.hlc).filter(|h| *h < minrej).max(),
-        };
-        let advanced = if let Some(last) = target {
+        // #216: 前進は author 別。 minrej は batch 全体の scalar を全 author に
+        // 適用する (author を跨いで保守側に倒すだけ — reject は稀な例外経路)。
+        let mut advanced = false;
+        {
             let mut guard = self.last_pulled.lock().unwrap();
-            let cur = guard.get(&from).copied().unwrap_or(Hlc::ZERO);
-            if last > cur {
-                guard.insert(from, last);
-                true
-            } else {
-                false
+            let link = guard.entry(from).or_default();
+            for r in &records {
+                if let Some(minrej) = outcome.min_rejected_hlc {
+                    if r.hlc >= minrej {
+                        continue;
+                    }
+                }
+                let cur = link.entry(r.author_peer).or_insert(Hlc::ZERO);
+                if r.hlc > *cur {
+                    *cur = r.hlc;
+                    advanced = true;
+                }
             }
-        } else {
-            false
-        };
+        }
         if advanced {
             self.save_cursors();
         }
 
+        // #149: 確定 cursor を pull-as-ack として transport に記録する。 cursor は
+        // 上の durable barrier を通過した後にしか前進しないので、 そのまま
+        // 「ここまで消化済み」の到達証明として使える。 truncation / persist 失敗の
+        // early return はここに来ない (= 未消化の cursor を ack しない)。
+        // 空 pull でも既存 cursor を再記録する — author 側が ack 状態を失っても、
+        // pull が回っている限り watermark が自然回復する。
+        //
+        // #216: ack は author 別 cursor の **vector** をそのまま送る。 publisher 側は
+        // `ack_sync_up_to_cursors` の per-row 述語で消化を判定する — relay 混在
+        // ring では relayed row の消化は vector でしか証明できない (scalar min は
+        // 未知 author の row を消化済みと誤判定する over-ack)。 vector を運べない
+        // transport は default 実装が author=link の entry だけを scalar 経路に
+        // 落とす (保守側、 relay 経路の reclaim は回らない)。
+        let cursors: Vec<(PeerId, Hlc)> = {
+            let guard = self.last_pulled.lock().unwrap();
+            guard
+                .get(&from)
+                .map(|m| m.iter().map(|(a, h)| (*a, *h)).collect())
+                .unwrap_or_default()
+        };
+        let cursors = self.cap_ack_by_downstream(cursors);
+        if !cursors.is_empty() {
+            self.transport.record_pull_ack_multi(from, self_peer, &cursors);
+        }
+
+        // #226: relay が新しい author を取り込んだら、 その author の state 配布元
+        // としても名乗る (`serve_state` で opt-in 済みなら)。
+        self.refresh_state_providers();
+
         outcome
+    }
+
+    /// #227: **transitive watermark** — relay が上流に返す ack を、 自分の下流が
+    /// 消化し切った位置で丸める。
+    ///
+    /// pull-as-ack (#149) は「自分が apply した位置」を author に返す。 1-hop なら
+    /// それが消化証明そのものだが、 **relay では「配った」でしかない**。 reclaim の
+    /// 安全条件は「全 follower が apply し切った」なので、 relay が配った直後に
+    /// 恒久消失すると author は履歴を捨て、 下流は永久欠落する (#191 の裏返しで
+    /// 1 段深い)。
+    ///
+    /// `ack[a] = min(自分の cursor[a], 下流全員が消化し切った位置[a])`。 tree の
+    /// どの深さでも規則は同じ (「直接の下流の min」) なので、 hop を跨いで
+    /// transitive に成立する。 reclaim が遅れるのは正しいトレードオフ (ring 圧力は
+    /// 50% gate 側で調整する)。
+    ///
+    /// 丸めるのは **relay (gossip) の時だけ**:
+    /// - 非 relay は他 author の row を転送しないので、 下流がそれを待つはずが無い
+    /// - 下流ゼロ (`sync_delivered_cursors` = `None`) の葉ノードで丸めると、
+    ///   author の reclaim を永久に止める
+    ///
+    /// 既知の縮退 (どれも「欠落」ではなく「reclaim 遅延」側):
+    /// - SubscriptionFilter で一部 author しか見ない下流がいると、 その row で
+    ///   `ack_sync_prefix` が止まり watermark が上がらない → 上流への ack も
+    ///   上がらない。 根は #219
+    /// - 下流が恒久消失すると ack が固定される。 author 側で dead follower が
+    ///   watermark を固定するのと同じ性質で、 新しい露出ではない
+    /// - 「pull はしたが 1 件も消化していない下流」は `_sync_peers` に現れないので
+    ///   丸めが効かない (#227 に記録)。 受け皿は floor + bootstrap (#140/#226)
+    fn cap_ack_by_downstream(&self, cursors: Vec<(PeerId, Hlc)>) -> Vec<(PeerId, Hlc)> {
+        if !self.engine.gossip_remote_apply() {
+            return cursors;
+        }
+        let Some(delivered) = self.engine.sync_delivered_cursors() else {
+            return cursors;
+        };
+        cursors
+            .into_iter()
+            .map(|(author, hlc)| {
+                let d = delivered
+                    .iter()
+                    .find(|(p, _)| *p == author)
+                    .map(|(_, h)| *h)
+                    .unwrap_or(Hlc::ZERO);
+                (author, hlc.min(d))
+            })
+            .collect()
+    }
+
+    /// #216 observability: `pull_once` が `history_truncated` を返した累計回数。
+    /// 単調増加しているのに bootstrap 成功が無いなら、 回復経路が塞がっている
+    /// (state provider 不在、 または app が bootstrap を呼んでいない)。
+    pub fn truncated_pulls(&self) -> u64 {
+        self.truncated_pulls.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 適用した state を durable にする。 失敗したら `false` (= cursor を進めない)。
@@ -464,9 +991,65 @@ impl Syncer {
         *self.subscription_filter.write().unwrap() = filter;
     }
 
-    /// 自 peer の commit 済み ops を transport に publish。
-    /// `iter_committed` は checkpoint を無視して WAL 全体を列挙するので、
-    /// 既に本体に apply 済みでも WAL ring buffer 内にあれば拾える。
+    /// #149: transport に溜まった pull ack を消化し、 ring に圧力があれば reclaim を回す。
+    ///
+    /// puller が `pull_once` で記録した cursor (HLC) を `ack_sync_up_to_hlc` で
+    /// `_sync_peers.consumed_lsn` に写す (= watermark は常に最新)。 ただし
+    /// **reclaim は `_sync_ops` の使用率が 50% を超えている時だけ**呼ぶ。
+    ///
+    /// 履歴は容量が許す限り保持するのが正しい: reclaim すると floor が上がり、
+    /// **その author をまだ一度も pull していない follower** (作成直後 / 長期 offline)
+    /// は cursor < floor で truncation 行きになる。 bootstrap (#140) が受け皿だが、
+    /// 差分で追いつけるならその方が安いので、 reclaim は「容量管理」であって
+    /// 「消化済みの掃除」ではない。 eager に回すと、 round 1 個ずれて参加した
+    /// follower が即 bootstrap 送りになる (sunsu2 Phase 2 chaos で実測)。
+    ///
+    /// `publish_since` の冒頭から自動で呼ばれるので、 app は publish/pull を
+    /// 回すだけで良い。 publish しない caller (pull 専用 hub 等) が明示的に
+    /// 回せるよう pub。 戻り値は consumed_lsn が前進した peer 数。
+    pub fn absorb_pull_acks(&self) -> usize {
+        let self_peer = self.engine.peer_id();
+        let multi = self.transport.take_pull_acks_multi(self_peer);
+        let acks = self.transport.take_pull_acks(self_peer);
+        if multi.is_empty() && acks.is_empty() {
+            return 0;
+        }
+        let mut advanced = 0usize;
+        // #216: vector ack (author 別 cursor) — relay 混在 ring の完全形。
+        for (by, cursors) in multi {
+            if by == self_peer {
+                continue;
+            }
+            if let Ok(lsn) = self.engine.ack_sync_up_to_cursors(by, &cursors)
+                && lsn > 0
+            {
+                advanced += 1;
+            }
+        }
+        // scalar ack (vector を運べない transport の退化形) — self-author 行のみの
+        // 消化証明として #217 の prefix walk に乗る。
+        for (by, cursor) in acks {
+            // self row は sync_watermark から除外されるが、 そもそも作らない
+            if by == self_peer {
+                continue;
+            }
+            if let Ok(lsn) = self.engine.ack_sync_up_to_hlc(by, cursor)
+                && lsn > 0
+            {
+                advanced += 1;
+            }
+        }
+        if advanced > 0
+            && let Some(usage) = self.engine.table_eid_usage("_sync_ops")
+            && usage.live * 2 >= usage.capacity
+        {
+            self.engine.reclaim_sync_ops();
+        }
+        advanced
+    }
+
+    /// 自 peer の commit 済み ops を transport に publish
+    /// (source は `_sync_ops` ring — [`Syncer::collect_records_since`] 参照)。
     /// 戻り値は publish したレコード数 (重複カウントしない、 最終 broadcast/peer 別
     /// のいずれか単一経路で配信した数)。
     ///
@@ -475,6 +1058,9 @@ impl Syncer {
     /// 空なら **broadcast 経路** (= 旧 `publish_since` の挙動) にフォールバック。
     /// = 既存 caller (broadcast 前提) は API 不変で動く。
     pub fn publish_since(&self, since: Hlc) -> usize {
+        // #149: publish の beat で pull ack を消化して reclaim を回す。 absorb →
+        // advertise の順序が要: reclaim で上がった floor を同じ beat で広告する。
+        self.absorb_pull_acks();
         self.advertise_history_floor();
         let peers = self.transport.known_peers();
         if peers.is_empty() {
@@ -497,10 +1083,35 @@ impl Syncer {
 
     /// #140: 自分の `_sync_ops` が reclaim 済みなら、 配れる履歴の下限を transport に広告する。
     ///
-    /// 下限は「生存している record の最小 HLC」。 これより古い cursor を持つ puller は、
-    /// 差分では埋められない穴があるので bootstrap が要る。 reclaim が起きていなければ
+    /// #191: 下限は「reclaim で消えた record の最大 HLC」。 cursor >= floor の puller は
+    /// 消えた分を全部消化済みなので差分 pull を続けて良い。 cursor < floor の puller だけが
+    /// 差分で埋められない穴を持つ = bootstrap 対象。 reclaim が起きていなければ
     /// 何も広告しない (= 全履歴が配れる)。
     fn advertise_history_floor(&self) {
+        // #191: 以前の「生存 record の最小 HLC (空なら Hlc::MAX)」は、 消化完了直後の
+        // 正常な cursor (max_reclaimed <= cursor < min_alive) まで gap と誤認し、
+        // reclaim 1 回で既追従 follower 全員が bootstrap 行きになっていた。
+        //
+        // #216: author 別 floor があればそれも広告する (scalar は互換のため常に併記)。
+        // relay 混在 ring では scalar floor だけだと「author a の cursor は新しいのに
+        // author b の reclaim で恒常 truncation」の false positive が定常運転で出る。
+        if let Some(floors) = self.engine.sync_reclaimed_floors()
+            && !floors.is_empty()
+        {
+            self.transport
+                .set_history_floor_multi(self.engine.peer_id(), &floors);
+            if let Some(max) = floors.iter().map(|(_, h)| *h).max() {
+                self.transport.set_history_floor(self.engine.peer_id(), max);
+            }
+            return;
+        }
+        if let Some(floor) = self.engine.sync_reclaimed_floor() {
+            self.transport.set_history_floor(self.engine.peer_id(), floor);
+            return;
+        }
+        // fallback: fix 前に reclaim してから reopen した既存 DB (floor 未記録)。
+        // 正確な下限は失われているので過大側 (min alive / MAX) に倒す —
+        // silent gap より余分な bootstrap 誘導の方が安全。
         if !self.engine.sync_history_reclaimed() {
             return;
         }
@@ -509,8 +1120,6 @@ impl Syncer {
             .into_iter()
             .map(|r| r.hlc)
             .min();
-        // 生存 record が 1 件も無い = 全部 reclaim 済み。 どんな cursor でも追いつけないので
-        // 到達不能に高い下限 (Hlc::MAX) を広告する。
         let floor = floor.unwrap_or(Hlc { wall: u64::MAX, logical: u32::MAX, peer: u32::MAX });
         self.transport.set_history_floor(self.engine.peer_id(), floor);
     }
@@ -519,6 +1128,11 @@ impl Syncer {
     /// (= publish の primary source、 legacy oplog iter fallback は 0.8.0 で
     /// 撤去、 `Syncer::new` で `sync_tables_enabled` チェック済み)。
     fn collect_records_since(&self, since: Hlc) -> Vec<WireRecord> {
+        // #216: relay (gossip) の ring は HLC 非単調 — relayed record が原 HLC の
+        // まま後から乗るので、 scalar since での間引きは relayed 分を落とす。
+        // gossip 有効時は常に全量 collect し、 重複は transport 側の dedupe
+        // ((peer, hlc) 一意) に任せる。
+        let since = if self.engine.gossip_remote_apply() { Hlc::ZERO } else { since };
         let payloads = self.engine.pending_sync_ops(0);
         let mut out = Vec::with_capacity(payloads.len());
         for p in &payloads {
@@ -644,6 +1258,19 @@ impl Syncer {
     /// crash で「消費済みと言うが写像は無い」が確定し、 差分 pull では埋まらない。
     /// `pull_once` はこの順序を内側で守っている。
     pub fn apply_records(&self, records: &[WireRecord]) -> SyncOutcome {
+        self.apply_records_impl(records, None)
+    }
+
+    /// #209: `relay_accepted` が Some なら、 relay (gossip) すべき record の index を
+    /// 集める: **apply が accept (Applied) したものだけ** — LWW gate が cyclic
+    /// topology の echo を止める栓なので、 skip した record を relay してはいけない。
+    /// Commit (dedupe identity なし) と自 author の record (発信元に戻ってきた echo)
+    /// も除外する。
+    fn apply_records_impl(
+        &self,
+        records: &[WireRecord],
+        mut relay_accepted: Option<&mut Vec<usize>>,
+    ) -> SyncOutcome {
         let mut out = SyncOutcome::default();
         // #9 foot-gun ガード: self_peer 未設定 (= 0) で foreign record を apply すると、
         // author 0 == self 0 が `resolve_remote_eid` の identity 分岐に落ち、 翻訳されず
@@ -671,7 +1298,8 @@ impl Syncer {
                 out.min_rejected_hlc = Some(hlc);
             }
         };
-        for rec in records {
+        let self_peer = self.engine.peer_id();
+        for (idx, rec) in records.iter().enumerate() {
             out.received += 1;
 
             // ACL チェック(未定義なら全員通す)
@@ -699,10 +1327,24 @@ impl Syncer {
                 }
             }
             match self.apply_one(&store, rec) {
-                ApplyResult::Applied => out.applied += 1,
+                ApplyResult::Applied => {
+                    out.applied += 1;
+                    if let Some(list) = relay_accepted.as_deref_mut() {
+                        let relayable = !matches!(rec.op, DecodedOp::Commit)
+                            && rec.author_peer != self_peer;
+                        if relayable {
+                            list.push(idx);
+                        }
+                    }
+                }
                 ApplyResult::SkippedOlder => out.skipped += 1,
                 ApplyResult::Dropped => out.dropped_unresolved += 1,
                 ApplyResult::DroppedVocab => out.dropped_vocab += 1,
+                ApplyResult::RejectedCapacity => {
+                    // #210: 「今は容量が無い」 だけなので cursor を止めて再配送させる。
+                    out.rejected_capacity += 1;
+                    note_reject(&mut out, rec.hlc);
+                }
             }
         }
         out
@@ -715,17 +1357,6 @@ impl Syncer {
     //  buffered record が恒久喪失 / eviction が「最古」でなく任意 bucket を破棄)
 
     fn apply_one(&self, store: &HlcStore, rec: &WireRecord) -> ApplyResult {
-        // 受信した WireRecord の header フィールドを Engine::remote_*_apply の relayed 引数に
-        // そのまま渡す (gossip 経路で `OpLog::append_relayed` が元 HLC/author/署名を保持するため)。
-        #[inline]
-        fn relayed_header(rec: &WireRecord) -> enchudb_oplog::oplog::RelayedHeader {
-            enchudb_oplog::oplog::RelayedHeader {
-                hlc: rec.hlc,
-                author: rec.author_peer,
-                signature: rec.signature,
-                pubkey_fp: rec.pubkey_fp,
-            }
-        }
         match &rec.op {
             DecodedOp::Tie { eid, himo_id, value } => {
                 // #9: foreign eid を自分の eid 空間の local eid に翻訳 (初見なら払い出し)。
@@ -761,7 +1392,28 @@ impl Syncer {
                 // request17 step 5: LWW / tombstone の判定は engine (`set_cell`) の
                 // 内側だけ。 ここで判定して別関数で適用する形は、 呼び忘れれば黙って
                 // 壊れる (実際 ローカル write 経路がそうなっていた = #154/#160 の根)。
-                ApplyResult::from_lww(self.engine.remote_tie_apply(local_eid, *himo_id, value, rec.hlc, Some(relayed_header(rec))))
+                ApplyResult::from_lww(self.engine.remote_tie_apply(local_eid, *himo_id, value, rec.hlc))
+            }
+            DecodedOp::TieRef { eid, himo_id, target } => {
+                // #183: Ref 値の target を**世界番号 (u64) 同乗**で運ぶ Tie。author の
+                // bridge が「translated foreign entity への Ref write」を書き換えた形。
+                // 行 eid は通常の翻訳、target は「産みの親」key (0.11 semantics =
+                // eid_peer が author) で ref target table 空間の local eid へ翻訳する。
+                // 自分が target の産みの親なら identity、第三者 peer なら target 自身の
+                // Tie と同じ写像に収束する (resolve_remote_ref_value の key 空間共有)。
+                let local_eid = match self.engine.resolve_remote_eid(*eid, *himo_id) {
+                    Some(e) => e,
+                    None => return ApplyResult::Dropped,
+                };
+                let value = match self.engine.resolve_remote_ref_value(
+                    enchudb_oplog::eid_peer(*target),
+                    enchudb_oplog::eid_local(*target),
+                    *himo_id,
+                ) {
+                    Some(v) => v,
+                    None => return ApplyResult::Dropped,
+                };
+                ApplyResult::from_lww(self.engine.remote_tie_apply(local_eid, *himo_id, value, rec.hlc))
             }
             DecodedOp::Untie { eid, himo_id } => {
                 // #9: foreign eid を翻訳 (table-less なら確保先が無いので skip)。
@@ -770,7 +1422,7 @@ impl Syncer {
                     None => return ApplyResult::Dropped,
                 };
                 // #9: 写像ができたので退避中の Content を drain。
-                ApplyResult::from_lww(self.engine.remote_untie_apply(local_eid, *himo_id, rec.hlc, Some(relayed_header(rec))))
+                ApplyResult::from_lww(self.engine.remote_untie_apply(local_eid, *himo_id, rec.hlc))
             }
             DecodedOp::Delete { eid } => {
                 // #9: Delete は himo を持たず table を導けないので既存の翻訳のみ引く。
@@ -784,7 +1436,7 @@ impl Syncer {
                 // (v9 なら tombstone column に永続で) 記録する。 後続の古い HLC の
                 // Tie/Untie/Content は engine 側の tombstone 判定で skip され、
                 // 削除済み entity が復活しない。
-                ApplyResult::from_lww(self.engine.remote_delete_apply(local_eid, rec.hlc, Some(relayed_header(rec))))
+                ApplyResult::from_lww(self.engine.remote_delete_apply(local_eid, rec.hlc))
             }
             DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => {
                 // 0.9.0: 動的 himo (content 互換層の `_c_{key}`) は id が peer 間で
@@ -805,7 +1457,7 @@ impl Syncer {
                     Some(v) => v,
                     None => return ApplyResult::DroppedVocab,
                 };
-                ApplyResult::from_lww(self.engine.remote_tie_apply(local_eid, local_hid, value, rec.hlc, Some(relayed_header(rec))))
+                ApplyResult::from_lww(self.engine.remote_tie_apply(local_eid, local_hid, value, rec.hlc))
             }
             DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => {
                 // 0.12.0 (#88): Leaf payload を bytes 同乗で受信。 名前で himo 解決 →
@@ -818,7 +1470,7 @@ impl Syncer {
                     Some(e) => e,
                     None => return ApplyResult::Dropped,
                 };
-                ApplyResult::from_lww(self.engine.remote_tieleaf_apply(local_eid, local_hid, bytes, rec.hlc, Some(relayed_header(rec))))
+                ApplyResult::from(self.engine.remote_tieleaf_apply(local_eid, local_hid, bytes, rec.hlc))
             }
             DecodedOp::Content { eid, key, data } => {
                 // legacy (pre-0.9): 0.9.0 以降は content が TieNamed で運ばれるため、
@@ -833,11 +1485,18 @@ impl Syncer {
                 };
                 // legacy Content は cell を持たないので key 単位の LWW だけここに残す
                 // (tombstone 判定は engine 側 `remote_content_apply` が行う)。
-                let key_hash = enchudb_oplog::content_key_hash15(key);
-                if !store.try_set(local_eid, key_hash | 0x8000, rec.hlc) {
+                let slot = enchudb_oplog::content_key_hash15(key) | 0x8000;
+                // #210: HLC の記録は **apply が成功してから**。 先に `try_set` すると、
+                // 容量拒否で 1 byte も書けなかった record の HLC だけが残り、 空きが
+                // 出た後の再配送が 「新しくない」 と judge されて永久に入らなくなる。
+                if store.get(local_eid, slot).is_some_and(|cur| rec.hlc <= cur) {
                     return ApplyResult::SkippedOlder;
                 }
-                ApplyResult::from_lww(self.engine.remote_content_apply(local_eid, key, data, rec.hlc, Some(relayed_header(rec))))
+                let r = ApplyResult::from(self.engine.remote_content_apply(local_eid, key, data, rec.hlc));
+                if r == ApplyResult::Applied {
+                    store.try_set(local_eid, slot, rec.hlc);
+                }
+                r
             }
             DecodedOp::Commit => ApplyResult::Applied, // boundary marker、apply は不要
             DecodedOp::Vocab { vid, bytes } => {
@@ -850,7 +1509,7 @@ impl Syncer {
                 }
                 // author_peer の (vid, bytes) を受信。
                 // Engine 側の remote_vocab_apply に委譲 (peer 別 vid mapping を構築)。
-                self.engine.remote_vocab_apply(rec.author_peer, *vid, bytes, Some(relayed_header(rec)));
+                self.engine.remote_vocab_apply(rec.author_peer, *vid, bytes);
                 ApplyResult::Applied
             }
         }

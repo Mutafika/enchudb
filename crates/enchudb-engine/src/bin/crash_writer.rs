@@ -16,7 +16,7 @@
 //!   mmap_ahead          — 1 件書き込み + body_msync(mmap 強制 disk) → wal fsync
 //!                         せずに abort。 mmap > WAL の race を deterministic に
 //!                         再現する。 sync 整合性の known issue 検証用。
-//!   v32_signed_loop     — v32 署名付きで無限書き込み(親が kill する前提)。
+//!   signed_loop     — 署名付きで無限書き込み(親が kill する前提)。
 //!                         seed 固定の keypair で WAL に署名レコードを残す。
 
 fn main() {
@@ -36,7 +36,7 @@ fn main() {
     match scenario {
         "normal" => {
             for i in 0..count {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_async(e, "n", i);
             }
             eng.flush_writes();
@@ -44,7 +44,7 @@ fn main() {
         }
         "no_commit" => {
             for i in 0..count {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_async(e, "n", i);
             }
             eng.flush_writes();
@@ -53,7 +53,7 @@ fn main() {
         }
         "no_sync" => {
             for i in 0..count {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_async(e, "n", i);
             }
             eng.flush_writes();
@@ -64,7 +64,7 @@ fn main() {
         "abort_mid" => {
             let half = count / 2;
             for i in 0..half {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_async(e, "n", i);
             }
             eng.flush_writes();
@@ -74,7 +74,7 @@ fn main() {
             // 前半は確実に耐久化されている
             // ここから後半を書いて、fsync せずに abort
             for i in half..count {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_async(e, "n", i);
             }
             // abort()は Drop を走らせずにプロセス終了(SIGABRT 相当)
@@ -83,7 +83,7 @@ fn main() {
         "loop_writes" => {
             let mut i = 0u32;
             loop {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_async(e, "n", i % 1000);
                 i += 1;
                 if i % 1000 == 0 {
@@ -99,7 +99,7 @@ fn main() {
         }
         "sleep_after" => {
             for i in 0..count {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_async(e, "n", i);
             }
             eng.flush_writes();
@@ -120,14 +120,14 @@ fn main() {
             // 5. abort で Drop を skip (= consumer thread の周期 fsync も走らず)
             //
             // 結果: mmap disk = 新値、 WAL disk = 空。 再起動時に mmap だけ進んでる状態。
-            let e = eng.entity();
+            let e = eng.entity().unwrap();
             eng.tie_async(e, "n", 42);
             eng.flush_writes();
             eng.body_msync().unwrap();
             // ❗ wal.fsync 呼ばない。 consumer の auto-fsync を待たずに即 abort。
             std::process::abort();
         }
-        "v32_signed_loop" => {
+        "signed_loop" => {
             use enchudb_oplog::keys::Keypair;
             // seed 固定で親が pubkey を事前登録できるようにする
             let seed = [7u8; 32];
@@ -137,13 +137,20 @@ fn main() {
 
             let mut i = 0u32;
             loop {
-                let e = eng.entity();
+                let e = eng.entity().unwrap();
                 eng.tie_async(e, "n", i % 1000);
                 i += 1;
-                if i % 500 == 0 {
+                if i.is_multiple_of(500) {
                     eng.flush_writes();
                     eng.oplog_commit();
                     eng.oplog_sync().unwrap();
+                }
+                // #204: 進捗は sync 境界と独立に細かく出す。sync 直後にだけ print
+                // すると、親の kill が常に「全 record 適用済み = fold され得る窓」
+                // に同期してしまう。細かい print で親が sync 境界の直後 (fold が
+                // 走る前) に kill を刺せるようにする — residue が残る確率を上げる
+                // 部品で、決定化そのものは test 側の bounded retry が担う。
+                if i.is_multiple_of(50) {
                     println!("{}", i);
                 }
             }

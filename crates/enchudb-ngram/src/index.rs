@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn save_and_open_wide_eid() {
-        // v32 の peer_id を含む u64 eid でも round-trip する
+        // peer_id を含む u64 eid でも round-trip する
         let path = "/tmp/enchu_ngram_test_wide_eid.etxt";
         let _ = std::fs::remove_file(path);
 

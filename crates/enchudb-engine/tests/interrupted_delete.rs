@@ -55,13 +55,13 @@ fn open_with_row(path: &str) -> (Arc<Engine>, u64, u16, u16) {
     eng.define_himo("b", ValueType::Number, 0);
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, CAP).unwrap();
     eng.set_peer_id(PEER);
-    let eid = eng.entity();
+    let eid = eng.entity().unwrap();
     let ha = eng.himo_id("a").expect("himo a") as u16;
     let hb = eng.himo_id("b").expect("himo b") as u16;
     // remote 経路で書く = cell に版数が載る (local write でも載るが、 版数を
     // test 側で決め打ちしたいのでこちらを使う)。
-    assert!(eng.remote_tie_apply(eid, ha, 11, hlc(100), None));
-    assert!(eng.remote_tie_apply(eid, hb, 22, hlc(100), None));
+    assert!(eng.remote_tie_apply(eid, ha, 11, hlc(100)));
+    assert!(eng.remote_tie_apply(eid, hb, 22, hlc(100)));
     (eng, eid, ha, hb)
 }
 
@@ -114,7 +114,7 @@ fn redelivered_delete_finishes_a_half_applied_one() {
     // 同じ Delete がもう一度届く。 旧実装は tombstone が同値なので `false` を
     // 返して本体除去に到達しなかった。
     assert!(
-        eng.remote_delete_apply(eid, hlc(200), None),
+        eng.remote_delete_apply(eid, hlc(200)),
         "同じ版数の Delete が再配送されたら、 本体除去は冪等にやり直されるべき"
     );
     assert_eq!(eng.get(eid, "a"), None, "再配送された Delete で本体が落ちていない");
@@ -133,7 +133,7 @@ fn a_row_recreated_after_the_delete_survives() {
         let (eng, eid, ha, _) = open_with_row(&path);
         interrupt_delete_at_tombstone(&eng, eid, hlc(200));
         // 削除より後に作り直された cell (LWW 上は生きているのが正しい)。
-        assert!(eng.remote_tie_apply(eid, ha, 99, hlc(300), None));
+        assert!(eng.remote_tie_apply(eid, ha, 99, hlc(300)));
         eng.flush_writes();
         eng.oplog_sync().expect("durable");
         eid
@@ -159,11 +159,11 @@ fn a_stale_delete_does_not_wipe_a_newer_row() {
 
     let (eng, eid, ha, _) = open_with_row(&path);
     interrupt_delete_at_tombstone(&eng, eid, hlc(200));
-    assert!(eng.remote_tie_apply(eid, ha, 99, hlc(300), None));
+    assert!(eng.remote_tie_apply(eid, ha, 99, hlc(300)));
 
     // 既に記録した削除より **古い** Delete。 巻き戻してはいけない。
     assert!(
-        !eng.remote_delete_apply(eid, hlc(150), None),
+        !eng.remote_delete_apply(eid, hlc(150)),
         "記録済みの削除より古い Delete は不採用のはず"
     );
     assert_eq!(eng.get(eid, "a"), Some(99), "古い Delete が新しい行を消した");
@@ -180,11 +180,11 @@ fn redelivered_delete_keeps_cells_written_after_it() {
     let (eng, eid, ha, _) = open_with_row(&path);
     interrupt_delete_at_tombstone(&eng, eid, hlc(200));
     // 削除の後に作り直された cell。
-    assert!(eng.remote_tie_apply(eid, ha, 99, hlc(300), None));
+    assert!(eng.remote_tie_apply(eid, ha, 99, hlc(300)));
 
     // 同じ Delete (版数 200) の再配送。 冪等に本体を掃除するが、 **削除より後に
     // 書かれた cell まで巻き添えにしてはいけない**。
-    assert!(eng.remote_delete_apply(eid, hlc(200), None));
+    assert!(eng.remote_delete_apply(eid, hlc(200)));
     assert_eq!(
         eng.get(eid, "a"),
         Some(99),
@@ -221,7 +221,7 @@ fn a_migrated_row_whose_delete_was_interrupted_is_finished_too() {
         eng.define_himo("a", ValueType::Number, 0);
         eng.define_himo("b", ValueType::Number, 0);
         assert!(!eng.has_cell_version(), "前提が崩れた: v9 領域を持っている");
-        let eid = eng.entity();
+        let eid = eng.entity().unwrap();
         eng.tie_to(eid, "a", 11);
         eng.tie_to(eid, "b", 22);
         eng.flush().unwrap();
@@ -271,10 +271,10 @@ fn the_audit_count_excludes_rows_recreated_after_the_delete() {
     interrupt_delete_at_tombstone(&eng, broken, hlc(200));
 
     // (2) 削除の後に作り直された行 = 修復対象ではない。
-    let recreated = eng.entity();
-    assert!(eng.remote_tie_apply(recreated, ha, 1, hlc(100), None));
+    let recreated = eng.entity().unwrap();
+    assert!(eng.remote_tie_apply(recreated, ha, 1, hlc(100)));
     assert!(eng.set_tombstone(recreated, hlc(200)));
-    assert!(eng.remote_tie_apply(recreated, ha, 2, hlc(300), None));
+    assert!(eng.remote_tie_apply(recreated, ha, 2, hlc(300)));
 
     assert_eq!(
         eng.interrupted_delete_count(),

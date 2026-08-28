@@ -5,7 +5,7 @@
 //! let _ = std::fs::remove_file(&path);
 //! let mut db = enchudb_engine::Engine::create_standalone(&path).unwrap();
 //! db.define_himo("age", enchudb_engine::ValueType::Number, 100);
-//! let e = db.entity();
+//! let e = db.entity().unwrap();
 //! db.tie(e, "age", 30);
 //! db.tie_text(e, "city", "東京");
 //! db.rebuild();
@@ -57,7 +57,6 @@ pub mod vocabulary;
 pub mod leaf_store;
 pub mod entity_set;
 pub mod cylinder;
-pub mod cylinder_v27;
 pub mod himo_store;
 pub mod content_store;
 pub mod engine;
@@ -80,7 +79,7 @@ pub mod integrity;
 pub mod blob_store;
 pub mod sparse_copy;
 
-pub use engine::{Engine, EntityValue, SnapshotFiles, AuditFilter, MigrationStats, LeafScale, GrowableOptions};
+pub use engine::{Engine, EntityValue, SnapshotFiles, AuditFilter, MigrationStats, LeafScale, GrowableOptions, FaultKind, RemoteApply};
 pub use sparse_copy::copy_sparse;
 pub use engine::EngineStats;
 pub use himo_store::ValueType;

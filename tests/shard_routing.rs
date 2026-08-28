@@ -46,12 +46,12 @@ fn single_condition_routes_to_owner_peer() {
     let eng_b = make_sharded_peer(&pb, 2, &[("size", ValueType::Number)]);
 
     // A に entity 作って color=5 を tie
-    let e1 = eng_a.entity();
+    let e1 = eng_a.entity().unwrap();
     eng_a.tie_to(e1, "color", 5);
     eng_a.rebuild();
 
     // B に entity 作って size=10 を tie
-    let e2 = eng_b.entity();
+    let e2 = eng_b.entity().unwrap();
     eng_b.tie_to(e2, "size", 10);
     eng_b.rebuild();
 
@@ -149,11 +149,11 @@ fn two_condition_query_crosses_shards() {
     let eng_b = make_sharded_peer(&pb, 2, &[("size", ValueType::Number)]);
 
     // A に entity e_a で color=3、B に別 entity e_b で size=5
-    let e_a = eng_a.entity();
+    let e_a = eng_a.entity().unwrap();
     eng_a.tie_to(e_a, "color", 3);
     eng_a.rebuild();
 
-    let e_b = eng_b.entity();
+    let e_b = eng_b.entity().unwrap();
     eng_b.tie_to(e_b, "size", 5);
     eng_b.rebuild();
 
@@ -206,12 +206,12 @@ fn replicated_entity_matches_across_shards_via_sync() {
 
     // peer A の color column に entry
     let color_himo = eng_a.himo_id("color").unwrap() as u16;
-    eng_a.remote_tie_apply(shared_eid, color_himo, 3, enchudb_oplog::Hlc::ZERO, None);
+    eng_a.remote_tie_apply(shared_eid, color_himo, 3, enchudb_oplog::Hlc::ZERO);
     eng_a.rebuild();
 
     // peer B の size column に entry (同じ shared_local)
     let size_himo = eng_b.himo_id("size").unwrap() as u16;
-    eng_b.remote_tie_apply(shared_eid, size_himo, 5, enchudb_oplog::Hlc::ZERO, None);
+    eng_b.remote_tie_apply(shared_eid, size_himo, 5, enchudb_oplog::Hlc::ZERO);
     eng_b.rebuild();
 
     let transport = Arc::new(InMemoryShardTransport::new());
@@ -228,7 +228,7 @@ fn replicated_entity_matches_across_shards_via_sync() {
     // 現実装の制約: InMemoryShardTransport が peer_id を上位 32bit に composite するため、
     // peer 1 由来の eid = [1|42]、peer 2 由来の eid = [2|42] で別 u64 扱い、intersect 空。
     // 「共有 entity」を表現するには entity id そのものを normalize する合意が要る。
-    // → v34+ で「論理 eid (peer 0 のような root)」「peer 跨ぎ resolver」を追加する時に解消。
+    // → 将来「論理 eid (peer 0 のような root)」「peer 跨ぎ resolver」を追加する時に解消。
     assert_eq!(r.len(), 0, "current impl: cross-peer eid composition prevents shared-entity match");
 
     cleanup(&pa);

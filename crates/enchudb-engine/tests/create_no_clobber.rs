@@ -32,7 +32,7 @@ fn create_standalone_over_existing_is_already_exists() {
     let path = tmp("standalone");
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie(e, "age", 42);
         eng.flush().unwrap();
     } // drop → writer lock 解放
@@ -52,7 +52,7 @@ fn create_wal_variant_over_existing_is_already_exists() {
     let path = tmp("wal");
     {
         let eng = Engine::create(&path).unwrap();
-        let _e = eng.entity();
+        let _e = eng.entity().unwrap();
         eng.flush_writes();
     }
 

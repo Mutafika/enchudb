@@ -1,4 +1,4 @@
-//! v33 text sync E2E: tie_text_async が peer 間で正しく伝搬することを確認。
+//! text sync E2E: tie_text_async が peer 間で正しく伝搬することを確認。
 //!
 //! BUGS.md 層 2・3 の修正検証:
 //! - 層 2: `tie_text_async` は WAL に Vocab + Tie の 2 op を流す
@@ -12,7 +12,7 @@ use enchudb::sync::Syncer;
 use enchudb::transport::{InMemoryTransport, Transport};
 
 fn tmp(tag: &str) -> String {
-    let p = format!("/tmp/enchudb-v33-text-{}-{}", tag, std::process::id());
+    let p = format!("/tmp/enchudb-text-{}-{}", tag, std::process::id());
     for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", p, suffix));
     }
@@ -200,7 +200,7 @@ fn tie_ref_async_propagates_between_peers() {
     // ref だけ送っても target entity が B 側に無ければ翻訳できない。
     eng_a.tie_async(parent, &q("tag"), 7);
     eng_a.tie_ref_async(child, &q("parent"), parent);
-    eng_a.commit();  // v33: commit が WAL Commit marker も打つ
+    eng_a.commit();  // commit が WAL Commit marker も打つ
     eng_a.flush_writes();
     eng_a.oplog_sync().unwrap();
     // 0.8.0: publish の primary は `_sync_ops`。 background 転送待ちに
@@ -231,13 +231,13 @@ fn tie_ref_async_propagates_between_peers() {
 
 #[test]
 fn commit_also_writes_wal_marker_under_v33() {
-    // v33 で commit() が WAL Commit marker を打つ → publish_since が非ゼロを返す
+    // commit() が WAL Commit marker を打つ → publish_since が非ゼロを返す
     let pa = tmp("commit_a");
     let eng_a = make_peer(&pa, 1);
 
     let e = eng_a.entity_in(TABLE).unwrap();
     eng_a.tie_text_async(e, &q("name"), "Zed");
-    eng_a.commit();  // v33: oplog_commit 相当も行うはず
+    eng_a.commit();  // oplog_commit 相当も行うはず
     eng_a.flush_writes();
     eng_a.oplog_sync().unwrap();
     // 0.8.0: publish の primary は `_sync_ops`。 background 転送待ちに

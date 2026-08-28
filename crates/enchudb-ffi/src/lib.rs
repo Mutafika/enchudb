@@ -106,6 +106,9 @@ fn guard_i32(f: impl FnOnce() -> i32) -> i32 {
 // 注: result accessor (rows/cols/col_name/is_null/int/text/version/last_error) は
 // 全て bounds-check 済みの materialized data を読むだけで panic しないため、 engine に
 // 触れる 6 関数 (open/create/close/exec/query/result_free) のみ guard する。
+// #59: cell accessor は `rows[row][col]` の 2 段 index を `.get().and_then(.get())` に
+// 変えて 「row 長 == columns 長」 の暗黙の前提も外した (ragged row で panic すると
+// extern "C" 境界を unwind して UB)。
 
 // ────── DB lifecycle ──────
 
@@ -264,8 +267,12 @@ pub unsafe extern "C" fn enchudb_result_is_null(
 ) -> i32 {
     if r.is_null() { return 1; }
     let r = unsafe { &*r };
-    if row >= r.rows.len() || col >= r.columns.len() { return 1; }
-    matches!(r.rows[row][col], CellRepr::Null) as i32
+    // #59: row 長が columns 長と一致する保証を C 境界で前提にしない (ragged row で
+    // panic → extern "C" を unwind = UB)。 見つからなければ NULL 扱い。
+    match r.rows.get(row).and_then(|cells| cells.get(col)) {
+        Some(CellRepr::Null) | None => 1,
+        Some(_) => 0,
+    }
 }
 
 /// INTEGER として値を取得。NULL / TEXT セルは 0 を返す（is_null で先に確認推奨）。
@@ -277,9 +284,9 @@ pub unsafe extern "C" fn enchudb_result_int(
 ) -> i64 {
     if r.is_null() { return 0; }
     let r = unsafe { &*r };
-    if row >= r.rows.len() || col >= r.columns.len() { return 0; }
-    match &r.rows[row][col] {
-        CellRepr::Integer(n) => *n,
+    // #59: ragged row でも panic しない (extern "C" の unwind は UB)。
+    match r.rows.get(row).and_then(|cells| cells.get(col)) {
+        Some(CellRepr::Integer(n)) => *n,
         _ => 0,
     }
 }
@@ -294,9 +301,9 @@ pub unsafe extern "C" fn enchudb_result_text(
 ) -> *const c_char {
     if r.is_null() { return ptr::null(); }
     let r = unsafe { &*r };
-    if row >= r.rows.len() || col >= r.columns.len() { return ptr::null(); }
-    match &r.rows[row][col] {
-        CellRepr::Text(s) => s.as_ptr(),
+    // #59: ragged row でも panic しない (extern "C" の unwind は UB)。
+    match r.rows.get(row).and_then(|cells| cells.get(col)) {
+        Some(CellRepr::Text(s)) => s.as_ptr(),
         _ => ptr::null(),
     }
 }

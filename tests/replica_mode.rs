@@ -1,4 +1,4 @@
-//! v32: Read-only replica モードのテスト。
+//! Read-only replica モードのテスト。
 //!
 //! replica として開いた Engine は書き込み API が panic、sync 経由 (remote_*_apply) のみ通る。
 //! エッジ node の想定シナリオ: origin で書き、レプリカは pull で追従、ローカル書き込み不可。
@@ -10,7 +10,7 @@ use enchudb::sync::Syncer;
 use enchudb::transport::{InMemoryTransport, Transport};
 
 fn tmp(tag: &str) -> String {
-    let p = format!("/tmp/enchudb-v32-replica-{}-{}", tag, std::process::id());
+    let p = format!("/tmp/enchudb-replica-{}-{}", tag, std::process::id());
     for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", p, suffix));
     }
@@ -57,7 +57,7 @@ fn replica_rejects_entity_and_delete() {
     let eng = Arc::new(Engine::open_replica(&path).unwrap());
 
     let entity_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        eng.entity();
+        eng.entity().unwrap();
     }));
     assert!(entity_panic.is_err(), "entity() must panic on replica");
 
@@ -105,7 +105,7 @@ fn replica_allows_remote_apply_and_read() {
     // replica として「リモートから Tie が届いた」シミュレーション
     let eid = enchudb_oplog::make_eid(1, 7);
     let himo_id = eng.himo_id("val").unwrap();
-    eng.remote_tie_apply(eid, himo_id as u16, 42, enchudb_oplog::Hlc::ZERO, None);
+    eng.remote_tie_apply(eid, himo_id as u16, 42, enchudb_oplog::Hlc::ZERO);
 
     // 読めるはず
     let v = eng.get(eid, "val");
@@ -199,7 +199,7 @@ fn set_replica_mode_toggle() {
     eng.set_peer_id(1);
 
     // 初期: 書ける
-    let e1 = eng.entity();
+    let e1 = eng.entity().unwrap();
     eng.tie_to(e1, "val", 10);
     assert_eq!(eng.get(e1, "val"), Some(10));
 

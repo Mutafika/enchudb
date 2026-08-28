@@ -66,7 +66,7 @@ fn build_db(path: &str, vocab_knob: Option<u32>) {
     eng.define_himo("kind", ValueType::Tag, 0);
     eng.define_himo("num", ValueType::Number, 0);
     for i in 0..100_000u32 {
-        let e = eng.entity();
+        let e = eng.entity().unwrap();
         eng.tie_text(e, "kind", &format!("tag{}", i % 1000));
         eng.tie(e, "num", i);
     }

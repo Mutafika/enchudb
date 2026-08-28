@@ -316,9 +316,13 @@ impl Vocabulary {
         }
     }
 
+    /// 満杯なら **`u32::MAX` (予約 sentinel)** を返す (#59: panic しない)。
     pub fn get_or_insert(&self, value: &[u8]) -> u32 {
         if let Some(id) = self.lookup(value) { return id; }
         let id = self.insert(value);
+        if id == u32::MAX {
+            return u32::MAX;
+        }
         // 並列挿入の競合チェック: 別スレッドが先に同じ値を挿入した場合、先着のidを使う
         if let Some(winner) = self.lookup(value) {
             if winner != id { return winner; }
@@ -350,7 +354,11 @@ impl Vocabulary {
         let xm: &[u8] = self.index.slice();
         let h = fxhash(value);
         let mut idx = home_slot(h, self.index_cap); // #123
-        loop {
+        // #59: index が 100% 埋まると 「空 slot に当たる」 終了条件が成立せず、
+        // 素の `loop` は **永久に回る** (= 満杯が hang になる。 embedded DB としては
+        // panic と同じくらい悪い)。 走査上限を index_cap 回にする — 全 slot を見て
+        // 見つからなければ不在。
+        for _ in 0..self.index_cap as usize {
             let off = INDEX_HEADER + idx * INDEX_SLOT_SIZE;
             if xm[off] == 0 { return None; }
             let slot_hash = u64::from_le_bytes(xm[off + 1..off + 9].try_into().unwrap());
@@ -364,6 +372,8 @@ impl Vocabulary {
             }
             idx = ((idx as u64 + 1) & mask) as usize;
         }
+        // 全 slot 走査して空きも一致も無かった = index 満杯かつ不在。
+        None
     }
 
     /// 重複検査なしで常に新規 id を発行して append する。
@@ -371,31 +381,41 @@ impl Vocabulary {
     /// 既に同じ bytes が登録済みでも気にせず新 id を払い出す。index_insert は走るが、
     /// 既存スロットがあれば early-return するため index 領域は dedup される副作用がある
     /// (data/offsets のみ完全に増分)。
+    /// 今後 1 件も insert できないか (= 天井 hit)。
+    pub fn is_full(&self) -> bool {
+        self.count.load(Ordering::Relaxed) >= self.max_entries
+    }
+
+    /// 満杯なら **`u32::MAX` (予約 sentinel)** を返す (#59: panic しない)。
     pub fn insert(&self, value: &[u8]) -> u32 {
         let id = self.count.fetch_add(1, Ordering::Relaxed);
         // #122: vocab_max_entries が公開 knob になったので、 天井 hit を actionable に
         // する (#118 の `too many himos` と同じ扱い)。 既存 DB は header 焼き込みなので
         // 引き上げには rebuild が必要、 という点まで伝える。
-        assert!(
-            id < self.max_entries,
-            "vocabulary full: {} unique values exceeds vocab_max_entries {} — \
-             raise it via GrowableOptions {{ vocab_max_entries: Some(n), .. }} \
-             (header 焼き込みなので既存 DB は再作成が必要)",
-            id + 1,
-            self.max_entries,
-        );
+        // #59: 天井 hit は 「想定内だが続行不能」。 embedded DB は他人の process に
+        // 埋め込まれるので panic で host を殺してはいけない。 採番を巻き戻して
+        // **予約 sentinel `u32::MAX`** を返し、 呼び出し側 (Engine) が fault として
+        // 記録 + 報告し、 write を拒否する。 `u32::MAX` は元々 「無効値」 として
+        // engine 側の guard が見ている値なので、 新しい規約を増やしていない。
+        if id >= self.max_entries {
+            self.count.fetch_sub(1, Ordering::Relaxed);
+            return u32::MAX;
+        }
         let len = value.len() as u32;
         let offset = self.data_end.fetch_add(len, Ordering::Relaxed);
         // Growable backing: extend the file-backed window before
         // writing past the current commit. No-op for static backings.
         // We also grow the offsets region in case `id` advanced
         // past its committed footprint (offsets have id × 8 layout).
-        let _ = self
-            .data
-            .ensure_committed((offset + len) as usize);
-        let _ = self
-            .offsets
-            .ensure_committed(((id as usize) + 1) * 8);
+        // #167: commit を伸ばせなければ **書かずに諦める** (予約 sentinel を返す)。
+        // 未 commit page への書き込みは (ディスク満杯なら) SIGBUS でプロセスごと
+        // 落ちるので、 error を捨てて書き進めてはいけない。 採番は巻き戻す。
+        if self.data.ensure_committed((offset + len) as usize).is_err()
+            || self.offsets.ensure_committed(((id as usize) + 1) * 8).is_err()
+        {
+            self.count.fetch_sub(1, Ordering::Relaxed);
+            return u32::MAX;
+        }
         self.data.write_at(offset as usize, value);
         self.data.write_at(0, &MAGIC);
         let new_count = id + 1;
@@ -415,15 +435,31 @@ impl Vocabulary {
         self.offsets.write_at(off_pos, &offset.to_le_bytes());
         self.offsets.write_at(off_pos + 4, &len.to_le_bytes());
         self.offsets.mark_dirty(off_pos, 8);
-        self.index_insert(value, id);
+        // #59: index が満杯で登録できないなら 「vocab 満杯」 と同じ扱いにする
+        // (dedup が黙って壊れるより、 write を拒否させる方が安全)。 data/offsets に
+        // 書いた分は orphan になるが、 これは terminal な capacity 状態。
+        if !self.index_insert(value, id) {
+            return u32::MAX;
+        }
         id
     }
 
-    fn index_insert(&self, value: &[u8], id: u32) {
+    /// index に (hash, id) を登録する。 **index が満杯なら `false`** (#59)。
+    ///
+    /// 旧実装は空 slot が見つかるまで無条件に linear probe しており、 index が 100%
+    /// 埋まると永久に回った (= 満杯が hang)。 走査は index_cap 回で打ち切る。
+    /// 登録できなくても data/offsets 側の値は書けているので、 dedup が効かなくなる
+    /// だけで read は壊れない (呼び出し側が fault として報告する)。
+    fn index_insert(&self, value: &[u8], id: u32) -> bool {
         let mask = (self.index_cap - 1) as u64;
         let h = fxhash(value);
         let mut idx = home_slot(h, self.index_cap); // #123
+        let mut probes = 0usize;
         loop {
+            if probes >= self.index_cap as usize {
+                return false;
+            }
+            probes += 1;
             let off = INDEX_HEADER + idx * INDEX_SLOT_SIZE;
             // #83: slot flag は Region 経由の AtomicU8 で直接触る (`&mut [u8]` を
             // 実体化しない)。 hash/id の書込も write_at (raw ptr)。
@@ -436,7 +472,7 @@ impl Vocabulary {
                         self.index.write_at(off + 9, &id.to_le_bytes());
                         flag.store(1, Ordering::Release);
                         self.index.mark_dirty(off, INDEX_SLOT_SIZE);
-                        return;
+                        return true;
                     }
                     Err(_) => continue,
                 }
@@ -462,7 +498,7 @@ impl Vocabulary {
                 // 読み飛ばす (実 insert は vid < max_entries を保証 = 通常運用では常に
                 // 通過。 max_entries は不変で並行 insert を skip しない = dedup race 無)。
                 if vid < self.max_entries && self.get(vid) == value {
-                    return; // 本当の重複
+                    return true; // 本当の重複
                 }
                 // ハッシュ衝突 or 破損 slot → linear probe 続行
             }
@@ -497,7 +533,12 @@ impl Vocabulary {
     pub fn mark_index_clean(&self, clean: bool) {
         // data 領域は variable cluster (lazy commit) なので、 先頭 header を
         // 確実に commit してから書く。
-        let _ = self.data.ensure_committed(HEADER);
+        // #167: commit を伸ばせなければ flag を書かない (未 commit page への write は
+        // ディスク満杯なら SIGBUS)。 flag を落とせないと次回 open が rebuild する =
+        // 遅くなるだけで壊れない、 安全側。
+        if self.data.ensure_committed(HEADER).is_err() {
+            return;
+        }
         let val: u32 = if clean { 1 } else { 0 };
         self.data.write_at(CLEAN_FLAG_OFF, &val.to_le_bytes());
         self.clean_on_disk.store(clean, Ordering::Release); // #77-M1 キャッシュ追従
@@ -612,17 +653,45 @@ mod tests {
         );
     }
 
-    /// #122: 天井 hit のメッセージが「どの knob を上げればよいか」を示すこと
-    /// (#118 の `too many himos` と同じ actionable 化)。 knob を公開した以上、
-    /// 小さく見積もった consumer が原因の分からない panic を踏まないようにする。
+    /// #122 / #59: 天井 hit は **panic ではなく予約 sentinel `u32::MAX`** を返すこと。
+    ///
+    /// #122 は 「天井 hit のメッセージがどの knob を上げればよいか示すこと」 を
+    /// `#[should_panic]` で担保していた。 が #59 で方針が変わった — embedded DB は
+    /// 他人の process に埋め込まれるので、 「vocab が一杯」 という想定内事象で host を
+    /// 殺してはいけない。 actionable な案内は panic message ではなく
+    /// `Engine::record_fault` の warning + `Engine::fault_count(FaultKind::VocabSpace)`
+    /// で行う (`engine.rs` / `tests/issue59_no_host_kill.rs`)。
     #[test]
-    #[should_panic(expected = "vocab_max_entries")]
-    fn issue122_vocab_full_panic_names_the_knob() {
+    fn issue122_vocab_full_returns_sentinel_instead_of_panicking() {
         let r = make_regions(4, 8, 64 * 1024);
         let v = r.vocab_init(4, 8);
+        let ids: Vec<u32> = (0..8).map(|i| v.insert(format!("v{i}").as_bytes())).collect();
+        assert!(
+            ids.iter().any(|&id| id != u32::MAX),
+            "天井前の insert まで失敗している: {ids:?}"
+        );
+        assert!(
+            ids.contains(&u32::MAX),
+            "天井を越えたのに sentinel が返っていない (panic していた旧挙動?): {ids:?}"
+        );
+        assert!(v.is_full(), "is_full が天井を報告していない");
+    }
+
+    /// #59: index が 100% 埋まった状態の `lookup` が **有限時間で** 返ること。
+    ///
+    /// 旧実装の probe は 「空 slot に当たる」 だけが終了条件で、 満杯かつ不在の
+    /// 値を引くと永久に回った (= 満杯が hang。 embedded DB としては panic と同程度に
+    /// 悪い)。 index_cap 回で打ち切る。
+    #[test]
+    fn vocab_lookup_on_full_index_terminates() {
+        let r = make_regions(8, 8, 64 * 1024);
+        let v = r.vocab_init(8, 8);
+        // index_cap = 8 を埋める
         for i in 0..8 {
             v.insert(format!("v{i}").as_bytes());
         }
+        // 不在の値: 空 slot が無いので旧実装はここで無限ループした
+        assert_eq!(v.lookup(b"absent"), None);
     }
 
     /// #123 (F6): migration の途中で kill された状態 = **tombstone (flag = 3) が残った

@@ -12,7 +12,7 @@
 //!
 //! # 評価
 //!
-//! AND: 最も小さい候補集合を取って、他の条件で filter する（v24 の非 bitmap 戦略に近い）。
+//! AND: 最も小さい候補集合を取って、他の条件で filter する（engine 本体の非 bitmap 戦略に近い）。
 //! OR: 和集合。
 //! 評価結果は**ソート済み EntityId (u64) の Vec**として返す（後段の集合演算をしやすくするため）。
 
@@ -131,7 +131,7 @@ impl Filter {
 
             Filter::And(filters) => {
                 if filters.is_empty() { return all_alive.to_vec(); }
-                // 最小集合を起点に、残りで filter（v24 的戦略）
+                // 最小集合を起点に、残りで filter（minimum-slice pivot 戦略）
                 let mut sets: Vec<Vec<EntityId>> = filters.iter()
                     .map(|f| f.evaluate(db, all_alive))
                     .collect();
@@ -163,7 +163,7 @@ impl Filter {
 }
 
 fn pull_sorted(db: &Engine, field: &str, value: u32) -> Vec<EntityId> {
-    // enchudb は v27 feature 前提で依存している。pull_raw は &[EntityId] を返す。
+    // enchudb の pull_raw は &[EntityId] を返す。
     let mut v = db.pull_raw(field, value).to_vec();
     v.sort_unstable();
     v
