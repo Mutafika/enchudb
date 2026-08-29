@@ -23,34 +23,34 @@
 
 ## メインベンチ
 
-### 1. vs SQLite (1M entities) — schema 層
+### 1. vs SQLite / DuckDB / LMDB (1M entities) — schema 層
 
-組込 DB として SQLite と直接比較。 `examples/vs_sqlite.rs`。
+組込 DB と直接比較。 `examples/vs_db.rs` (4-way、 全部 in-process binding)。
 **schema 層** (`Database::create` + `table.where_eq` 等) で計測 — 公開 README が推奨するパス。
-aggregates (SUM / MIN / MAX / GROUP BY) は schema 層に未提供なので `db.engine()` に降りる
-(「declarative で書きつつ hot loop だけ engine 直叩き」の典型例)。
 
 ```bash
-cargo run --release --example vs_sqlite
+cargo run --release --example vs_db
 ```
 
-実測 (1,000,000 entities、 4 列: dept / status / salary / age、 全列に index):
+実測 2026-08-29 (M2 Max、 1,000,000 entities、 dept / status / salary / age 全列 index。
+0.25.1 (単一 file) と 0.26.0 v10 (directory) を同日に同条件で。 差は run 間の揺れの範囲):
 
-| クエリ | hits | EnchuDB (schema) | SQLite | 倍率 | per hit |
-|---|---:|---:|---:|---:|---:|
-| 1 条件 (dept=3) | 50K | 13.9 µs | 2.43 ms | **175x** | 0.28 ns |
-| 2 条件 (dept=0 AND status=1) | 50K | 237.9 µs | 53.18 ms | **224x** | 4.8 ns |
-| 3 条件 (dept=0 AND status=1 AND age=20) | 10K | 89.0 µs | 10.52 ms | **118x** | 8.9 ns |
-| 範囲 (age 30..40) | 220K | 12.06 ms | 12.34 ms | 1x | 55 ns |
-| COUNT (status=2) | 200K | 53.1 µs | 4.74 ms | **89x** | — |
-| SUM salary (dept=3) | 50K | 88.2 µs | 24.24 ms | **275x** | 1.8 ns |
-| SUM salary (全件) | 1M | 2.38 ms | 32.29 ms | **14x** | 2.4 ns |
-| GROUP BY dept SUM salary (全件 → 20 groups) | 1M scan | 13.81 ms | 397.44 ms | **29x** | 14 ns |
-| MIN/MAX salary (dept=5) | 50K | 188.9 µs | 20.00 ms | **106x** | 3.8 ns |
+| クエリ | hits | EnchuDB 0.25.1 | **EnchuDB v10** | SQLite | DuckDB | LMDB |
+|---|---:|---:|---:|---:|---:|---:|
+| point-by-PK | 1 | 195 ns | **153 ns** | 2.5 µs | 223 µs | 241 ns |
+| 1 条件 (dept=3) | 50K | 12.7 µs | **11.3 µs** | 1.81 ms | 1.63 ms | 533 µs |
+| 2 条件 (dept AND status) | 50K | 151 µs | **150 µs** | 41.1 ms | 1.76 ms | 19.2 ms |
+| 3 条件 (+ age) | 10K | 108 µs | **80 µs** | 8.67 ms | 1.08 ms | 27.4 ms |
+| 範囲 (age 30..40) | 220K | 491 µs | **480 µs** | 8.84 ms | 4.84 ms | 2.35 ms |
+| COUNT (status=2) | 200K | 38 µs | **44 µs** | 3.26 ms | 416 µs | 2.08 ms |
+| SUM salary (dept=3) | 50K | 63 µs | **66 µs** | 14.1 ms | 731 µs | 18.4 ms |
+| SUM salary (全件) | 1M | 59 µs | **60 µs** | 24.2 ms | 362 µs | 9.30 ms |
+| GROUP BY dept SUM (全件) | 20 | 642 µs | **665 µs** | 297 ms | 948 µs | 9.65 ms |
+| MIN/MAX salary (dept=5) | 50K | — | **143 µs** | 14.5 ms | 644 µs | 18.2 ms |
+| setup (1M insert) | — | 500 ms | **527 ms** | 4.8 s | 370 ms | 1.38 s |
 
-`per hit` は **結果サイズに対する latency**。 単純 `find` は 0.28 ns/hit
-(メモリ帯域に張り付いた memcpy 速度) — 「結果返却は memcpy 律速」の実証。 cylinder 交差や
-集計が入ると per-hit cost が増える。
+`multi_cond_scaling` (1M × 7 列、 谷カーブ) と `rag_compare` (enchudb-rag、 N=10K/100K) も
+0.25.1 と v10 で一致 (±3%)。
 
 挙動メモ:
 - **条件 AND は絞り込みが進むほど速い** (cylinder 交差): 3 条件 (10K hits, 89µs) は

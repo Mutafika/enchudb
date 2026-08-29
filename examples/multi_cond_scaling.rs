@@ -111,6 +111,7 @@ fn main() {
         );
     }
 
+    drop(db); // v10: DB は directory。 drop (sidecar 永続化) の後で消す
     let _ = enchudb::db_files::remove_db(&path);
 }
 

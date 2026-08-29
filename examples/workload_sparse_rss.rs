@@ -106,5 +106,6 @@ fn main() {
     println!("\ndb apparent size: {:.1} MB (physical {:.1} MB)", usage.apparent_mb(), usage.physical_mb());
     snap("end", t0);
 
+    drop(eng); // v10: DB は directory。 drop (sidecar 永続化) の後で消す
     let _ = enchudb::db_files::remove_db(&path);
 }

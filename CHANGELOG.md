@@ -170,6 +170,29 @@ query の +7% は **コード変更ではなく binary layout**: engine の全 s
 +0.4% で安定。 ±10% の「退行」 flag はこの bench では layout で出るので、 判断は
 `bench_compare` (query 系は 3 世代とも同じ) と lifecycle で行う。
 
+`examples/` のベンチ 15 本も 0.25.1 と v10 で同日に走らせた (表は `benches/README.md`):
+
+- **同等 (±5%)**: `vs_db` (vs SQLite / DuckDB / LMDB、 1M)、 `multi_cond_scaling`、 `rag_compare`、
+  `par_scan` の sum / count / group / histogram、 `workload_rss_*` の RSS (74 / 259 / 207 MB)、
+  `reopen_eager_rebuild` の create+populate (v10 の方が 10〜20% 速い)
+- **apparent size**: `workload_rss_1m` 2,457 MB → **27 MB**、 `workload_sparse_rss` 8,796 MB →
+  **134 MB**、 `workload_segmented_rss` 10,017 MB → **378 MB**
+- **file 数比例**: reopen 100 himo 0.46 → 2.6 ms、 200 himo 0.96 → 5.5 ms
+- **write 残り**: `workload_segmented_rss` の 23M tie insert 1.34〜1.42 s → 1.50〜1.52 s (+8〜12%)。
+  page fault 数は同じ (156 vs 163) なので lazy commit の per-op 判定 (`is_committed` /
+  `mark_dirty`、 ~2 ns/op) が正体。 eager DB には無かったコスト
+- **async 経路** (`write_ceiling` / `lockfree_engine_bench` = tie_async → oplog → consumer):
+  writer 1 本だけ drain -10〜25% (base 自体が run 間 ±10%)、 **writer 2 本以上は同等**。
+  oplog crate と `tie_async` は無変更で、 consumer 側の write が上記 -10% を引きずっている。
+  lockfree の readers=4 は 6.2〜6.3 → 5.0〜5.3 M/s (-17%)
+- **layout 感度の再現**: `par_scan_bench` の min_range / max_range (seq) が 7.4 → 11.4 ms (+55%)
+  に見えたが、 同じ処理を probe で切り出す / bench に 1 block 足して build し直すと 7.3 ms で
+  一致。 元 binary は再走しても 11.1 ms。 branchy な scan loop の配置依存
+- 走らなくなっていた example を直した: `open_profile` (同 process で `mem::forget` した writer
+  が registry に残り WouldBlock、 0.25.1 でも落ちる) は子 process で crash を模擬、
+  `schema_overhead_bench` は 0.25.1 では `size_hint` 枯渇で panic していたのが v10 の auto-grow で
+  通る、 DB を drop より先に消して warning を出す 5 本は drop を先に
+
 残っている v10 の固有コスト (どれも file 数 = himo 数に比例する 1 回きりの経路):
 `define_himo` ~60 µs/本、 open ~30 µs/本、 snapshot ~1 ms + α。 順次 write の残り -10% は
 grow 自体 (fstat / ftruncate / mmap ≈ 15 µs × 十数回) と page fault で、 1M 行規模では 3〜4 ms。

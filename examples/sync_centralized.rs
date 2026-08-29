@@ -88,6 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  transferred: {transferred} record(s)");
     println!("  current_sync_lsn: {}", arc_db.engine().current_sync_lsn());
 
+    drop(arc_db); // v10: DB は directory。 drop (sidecar 永続化) の後で消す
     let _ = enchudb::db_files::remove_db(&path);
     Ok(())
 }

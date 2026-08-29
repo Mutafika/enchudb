@@ -514,6 +514,7 @@ fn main() {
     // cleanup
     drop(rtxn);
     drop(env);
+    drop(edb); // v10: DB は directory。 drop (sidecar 永続化) の後で消す
     let _ = enchudb::db_files::remove_db(&enchu_path);
     let _ = std::fs::remove_file(sqlite_path);
     let _ = std::fs::remove_file(duck_path);
