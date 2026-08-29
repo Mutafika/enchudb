@@ -89,6 +89,9 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
 - **消費側 (tag 固定 v0.25.1 の app を `--config patch` で branch に差し替え、 repo の隔離 copy で)**:
   sinfo (schema 層経由の create / open / insert / query、 5 crate) **617 passed / 1 failed** —
   失敗は上記 `size_hint` 前提の 1 件のみ。 syncretic (sync / relay / bootstrap 経路、 44 test file) **184 passed / 0 failed**
+- kenning (v0.25.1 pin): 素の状態で 30 passed / 4 failed。 落ちた 4 本は全部 kenning 側の
+  1 ファイル前提 (`remove_file` で作り直し / dir の実消費 / cache prune / `is_dir` で dir と db を
+  振り分け) で、 5 箇所直すと **34 / 34**。 patch は enchudb の `notes/requests/kenning-v10.patch`
 - **実 data の end-to-end**: `~/.sinfo` (global store、 v8、 25,061 entity / 258 himo / 40 table) と
   sinfohub の project store (654 entity) を clonefile で隔離 → `enchu --migrate-v10` (13 秒 / 6 秒、
   10 GB apparent → 82 MB / 4.8 MB) → **v10 で build した `sf`** の project / fsck / module list /
