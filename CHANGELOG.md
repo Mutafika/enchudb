@@ -23,7 +23,11 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
   `entities.seg` / `himo/NNNN.seg` / `ver/NNNN.seg` … (`README` の File layout)。 既存 API の
   signature は不変、 path の意味だけ変わる
 - **v8 / v9 の 1 ファイル DB は開けない** (`InvalidData`: "is a single-file (v9 or older)
-  EnchuDB database … migrate it first")。 offline で 1 回:
+  EnchuDB database … migrate it first")。 **移行は片道ではない**: open は writer lock を取る
+  前に弾くので **src file を 1 byte も触らず**、 隣に sidecar も lock も作らない。
+  `migrate_v9_to_v10` も src を読むだけで別 path に作る (= 失敗したらやり直せる、 旧 binary で
+  そのまま開き直せる)。 v8 → v9 のような 「writer open で in-place に stamp」 は **無い**。
+  `tests/v10_legacy_open_is_read_only.rs` で hash / len / mtime / 隣接 file を gate。 offline で 1 回:
   ```rust
   enchudb::Engine::migrate_v9_to_v10("old.db", "new.db")?;  // new.db は directory、 old.db は不変
   ```
@@ -62,6 +66,12 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
 - reservation は create 時に決まる: unix は `max(max_entities, 2^28)` (仮想空間だけ)、 Windows は
   `max_entities` (= 伸ばせない。 `GrowableOptions::reserve_entities` で明示)。 migrate した DB は
   既定の reservation を得る
+  - ⚠️ **`max_entities()` を「不変の定数」として読んでいる箇所は意味が変わる。** 実例が 3 つ
+    報告されている: 監視の分母 (`fill% = 使用 / max_entities` → cap が伸びると **何も解放して
+    いないのに使用率が下がり、 逼迫時に警報が鳴り止む**)、 capacity profile の逆写像
+    (`cap → Scale` を突き合わせて復元する処理が誤判定する)、 「N 件で頭打ち」 を仕様として
+    書いたテスト。 cap を跨いで比較する処理は `reserve_entities()` (上限) か、 論理的な
+    上限値を consumer 側で別に持つこと
 - **table は `entity_in` の枯渇時に空き eid 空間から extent を自動で切り足す。** 従来の
   `exhausted` は cap まで尽きたときだけ (message に `grow_entity_cap` を添える)。
   `Engine::grow_table(name, extra)` で明示も可。 sidecar `tables` に `EXT1` block が増える
