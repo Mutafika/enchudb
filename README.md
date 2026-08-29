@@ -274,9 +274,11 @@ never syncs simply does not have them.
 **File descriptors.** A writer keeps one fd open per segment file (≈ number of himos + 10)
 for the lifetime of the handle — reopening on every growth step made macOS write the
 dirty pages back on each `close`, which cost 25% of sequential write throughput. Readers
-(`open_readonly`) keep no fds. If the process hits its soft `RLIMIT_NOFILE` (launchd gives
-GUI apps 256), enchudb raises the soft limit to the hard limit once and retries;
-`db_files::remove_db` / `disk_usage` are the helpers for deleting and measuring a DB.
+(`open_readonly`) keep no fds. Retained fds are budgeted: on first use enchudb raises the
+soft `RLIMIT_NOFILE` to the hard limit (launchd gives GUI apps 256) and keeps at most
+half of it; segments beyond the budget fall back to open-per-growth, so a hard limit of
+64 still works, just slower. `db_files::remove_db` / `disk_usage` are the helpers for
+deleting and measuring a DB.
 
 **Single-file databases (v8 / v9, up to 0.25.x) are not opened by this build.** Convert
 them once, offline, with

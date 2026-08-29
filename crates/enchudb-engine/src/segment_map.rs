@@ -87,6 +87,60 @@ fn open_with_fd_retry(open: impl Fn() -> io::Result<File>) -> io::Result<File> {
     }
 }
 
+/// writer が持ち続ける fd の予算 (process 全体)。 0 = 未初期化。 初回に soft limit を hard まで
+/// 上げてから **soft の半分** を予算にする (残り半分は app 自身と reader の都度 open 用)。
+/// 予算を超えた segment は fd を持たず、 grow のたびに open / close する (遅いが動く)。
+/// hard limit 64 の環境でも himo 定義が EMFILE で止まらないための上限。
+static FD_BUDGET: AtomicUsize = AtomicUsize::new(0);
+/// 現在保持している fd の数。
+static FD_RETAINED: AtomicUsize = AtomicUsize::new(0);
+const FD_BUDGET_MIN: usize = 8;
+const FD_BUDGET_MAX: usize = 8192;
+
+fn fd_budget() -> usize {
+    let cur = FD_BUDGET.load(Ordering::Relaxed);
+    if cur != 0 {
+        return cur;
+    }
+    let _ = raise_fd_limit();
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    let soft = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
+        lim.rlim_cur as usize
+    } else {
+        256
+    };
+    let budget = (soft / 2).clamp(FD_BUDGET_MIN, FD_BUDGET_MAX);
+    // 先に set_fd_budget された値があればそれを尊重
+    let _ = FD_BUDGET.compare_exchange(0, budget, Ordering::AcqRel, Ordering::Acquire);
+    FD_BUDGET.load(Ordering::Relaxed)
+}
+
+/// test / 診断用: 保持 fd の予算を明示する (0 は「次回 getrlimit で再計算」)。
+#[doc(hidden)]
+pub fn set_fd_budget(n: usize) {
+    FD_BUDGET.store(n, Ordering::Release);
+}
+
+/// 現在保持している fd の数 (診断用)。
+pub fn retained_fds() -> usize {
+    FD_RETAINED.load(Ordering::Relaxed)
+}
+
+/// 予算内なら fd 1 枠を取る (true)。 満杯なら false。
+fn try_reserve_fd_slot() -> bool {
+    let budget = fd_budget();
+    let mut cur = FD_RETAINED.load(Ordering::Relaxed);
+    loop {
+        if cur >= budget {
+            return false;
+        }
+        match FD_RETAINED.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(v) => cur = v,
+        }
+    }
+}
+
 /// RLIMIT_NOFILE の soft limit を上げる。 上がったら true。
 fn raise_fd_limit() -> bool {
     let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
@@ -141,8 +195,8 @@ pub struct SegmentMap {
     /// dirty page を書き戻す** (close = 暗黙の msync)。 grow のたびに open / close していた
     /// 旧実装は、 順次 write 中に同じ page を何度もディスクへ書き直していた (grow 1 回
     /// ~100 µs、 cold tie が 0.25.1 の eager DB 比 -25%)。 fd を持てば close は Drop の
-    /// 1 回だけ。 fd 数は segment 数 (≈ himo 数 + 10) で、 soft limit に当たったら
-    /// `raise_fd_limit` で上げて 1 回だけ retry する。
+    /// 1 回だけ。 保持する fd は process 全体で `fd_budget()` (soft limit の半分) まで。
+    /// 超えた分は `None` (都度 open)。 それでも EMFILE なら `raise_fd_limit` して 1 回 retry。
     file: Option<File>,
 }
 
@@ -244,8 +298,9 @@ impl SegmentMap {
             unsafe { libc::munmap(base, reserve) };
             return Err(e);
         }
-        // writer は fd を持ち続ける (struct doc 参照)。 reader は閉じる (mapping は生き続ける)。
-        let file = if readonly { None } else { Some(file) };
+        // writer は予算内なら fd を持ち続ける (struct doc 参照)。 reader と予算超過分は閉じる
+        // (mapping は生き続ける。 grow / refresh は都度 open する)。
+        let file = if !readonly && try_reserve_fd_slot() { Some(file) } else { None };
         Ok(Self {
             path,
             base: base as *mut u8,
@@ -396,6 +451,11 @@ impl SegmentMap {
         Ok(target)
     }
 
+    /// writer が fd を保持しているか (予算内で開いた segment だけ true)。
+    pub fn has_retained_fd(&self) -> bool {
+        self.file.is_some()
+    }
+
     pub fn base(&self) -> *mut u8 {
         self.base
     }
@@ -509,6 +569,9 @@ impl Drop for SegmentMap {
     fn drop(&mut self) {
         unsafe {
             libc::munmap(self.base as *mut _, self.reserved);
+        }
+        if self.file.take().is_some() {
+            FD_RETAINED.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -673,6 +736,34 @@ mod tests {
         m.flush_dirty().unwrap();
         m.flush_dirty().unwrap(); // clean なら no-op
         assert!(m.flush(0, 2 * MB).is_err(), "committed を越えた flush が通った");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn fd_budget_caps_retained_fds_and_growth_still_works() {
+        // 予算と保持数は process 全体で共有 (他 test が並走して増減する) ので、 絶対数ではなく
+        // 「予算無制限なら持つ / 予算 1 (< 既に持っている数) なら持たない」 で判定する。
+        let d = dir("fd_budget");
+        set_fd_budget(usize::MAX);
+        let a = SegmentMap::create(&d.join("a.seg"), 1 << 20, 4096).unwrap();
+        let b = SegmentMap::create(&d.join("b.seg"), 1 << 20, 4096).unwrap();
+        assert!(a.has_retained_fd() && b.has_retained_fd(), "予算内なら fd を持つ");
+        assert!(retained_fds() >= 2);
+        set_fd_budget(1);
+        let c = SegmentMap::create(&d.join("c.seg"), 1 << 20, 4096).unwrap();
+        assert!(!c.has_retained_fd(), "予算超過なら fd を持たない");
+        // fd 無しでも grow は都度 open で動く (write も含めて)
+        c.grow_to(64 * 1024).unwrap();
+        assert!(c.committed() >= 64 * 1024);
+        unsafe { *c.base().add(60 * 1024) = 7 };
+        c.flush_all().unwrap();
+        assert_eq!(std::fs::read(d.join("c.seg")).unwrap()[60 * 1024], 7);
+        let n = retained_fds();
+        drop(a);
+        assert!(retained_fds() <= n - 1 || retained_fds() < n, "Drop で枠が返る");
+        drop(b);
+        drop(c);
+        set_fd_budget(0);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

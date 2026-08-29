@@ -105,6 +105,9 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
   10 GB apparent → 82 MB / 4.8 MB) → **v10 で build した `sf`** の project / fsck / module list /
   tree / snap list / structure log / target list が、 **release 版 `sf 0.28.0` × 元の v8 copy と
   出力が byte 一致** (fsck の dangling snap pin ×10 も元から)
+- **sunsu2** (peer 分散 SNS 兼 sync 破壊試験機、 remote のみ、 `../enchudb` path 依存):
+  scratch に clone して branch を `../enchudb` に向け、 **22 passed / 0 failed** (Phase 0〜3、
+  24-peer Zipf chaos ~46 s、 real wire、 findings、 workload)。 source 変更なしで compile も通る
 - **Linux (OrbStack、 Ubuntu 26.04 arm64、 root=btrfs / /tmp=tmpfs)**: workspace 全走
   **1104 passed / 0 failed** (macOS と同数)。 実 DB fixture の migrate は tmpfs 4.4 MB / btrfs
   4.8 MB (seek で飛ばした範囲がそのまま穴、 `punch_holes` は no-op)、 別 process readonly test も pass
@@ -124,8 +127,10 @@ v10 で **最初に測った時点 (`b6d1c74`) は新しい page を踏む write
 直したもの (全部 `segment_map`):
 
 - **writer は segment の fd を持ち続ける** (reader は従来どおり都度 open、 fd を増やさない)。
-  fd 数 = segment 数 (≈ himo 数 + 10)。 GUI app は launchd 既定で soft limit 256 なので、
-  `EMFILE` なら `setrlimit` で hard (unlimited なら 10240) まで上げて 1 回だけ retry
+  保持は予算制: 初回に soft `RLIMIT_NOFILE` を hard (unlimited なら 10240) まで上げ、 その
+  **半分**まで保持、 超えた segment は都度 open (遅いが動く)。 `ulimit -Hn 64` でも himo 200 本の
+  DB を作れることを確認 (予算無しの初版は `define_himo` が EMFILE で panic した)。 それでも
+  EMFILE なら `raise_fd_limit` して 1 回 retry。 `segment_map::retained_fds()` で保持数を見られる
 - `mark_dirty` は page 単位に丸めて持つ (順次 write で cell ごとに `fetch_max` を踏まない)
 - commit の伸長は幾何級数 (×2、 最低 +64 KB、 1 回 16 MB まで)。 旧 「1 MB 超は +1 MB 線形」 は
   64 MB column で 60 回 grow していた。 伸びるのは apparent だけ
