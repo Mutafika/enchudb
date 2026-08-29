@@ -23,6 +23,7 @@ fn tmp_path(tag: &str) -> String {
 }
 
 fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     for suffix in ["", ".oplog", ".crc", ".db.lock", ".tables", ".tables.tmp"] {
         let _ = std::fs::remove_file(format!("{}{}", path, suffix));
     }

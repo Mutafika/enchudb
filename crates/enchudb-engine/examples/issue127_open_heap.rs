@@ -53,6 +53,7 @@ fn mb(n: usize) -> f64 {
 use enchudb_engine::{Engine, GrowableOptions, ValueType};
 
 fn build_db(path: &str, vocab_knob: Option<u32>) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
     for sfx in [".tables", ".crc", ".db.lock", ".oplog", ".schema", ".eidmap", ".vocabmap"] {
         let _ = std::fs::remove_file(format!("{}{}", path, sfx));

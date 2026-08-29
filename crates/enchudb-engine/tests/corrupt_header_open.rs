@@ -19,6 +19,7 @@ fn tmp(name: &str) -> String {
         std::process::id()
     ));
     let s = p.to_str().unwrap().to_string();
+    let _ = std::fs::remove_dir_all(&s); // v10: DB は directory
     for suffix in ["", ".oplog", ".crc", ".tables", ".eidmap", ".vocabmap", ".lock"] {
         let _ = std::fs::remove_file(format!("{s}{suffix}"));
     }
@@ -33,7 +34,9 @@ fn make_db(path: &str) {
 
 fn patch(path: &str, offset: u64, bytes: &[u8]) {
     use std::io::{Seek, SeekFrom, Write};
-    let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    // v10: header は `{path}/header.seg` (byte layout は旧 header と同じ)
+    let hp = format!("{path}/header.seg");
+    let mut f = std::fs::OpenOptions::new().write(true).open(hp).unwrap();
     f.seek(SeekFrom::Start(offset)).unwrap();
     f.write_all(bytes).unwrap();
     f.sync_all().unwrap();
@@ -60,6 +63,7 @@ fn legacy_crc_zero_with_intact_fields_still_opens() {
     let eng = Engine::open_standalone(&path).unwrap();
     assert_eq!(eng.entity_count(), 1);
     drop(eng);
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 
@@ -72,6 +76,7 @@ fn corrupt_himo_count_is_invalid_data() {
     patch(&path, H_HIMO_COUNT, &1_000_000u32.to_le_bytes());
     let err = expect_open_err(&path, "himo_count > max_himos");
     assert_eq!(err.kind(), ErrorKind::InvalidData, "got: {err}");
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 
@@ -83,6 +88,7 @@ fn corrupt_vocab_index_cap_zero_is_invalid_data() {
     patch(&path, H_VOCAB_INDEX_CAP, &0u32.to_le_bytes());
     let err = expect_open_err(&path, "vocab_index_cap == 0");
     assert_eq!(err.kind(), ErrorKind::InvalidData, "got: {err}");
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 
@@ -95,6 +101,7 @@ fn corrupt_vocab_data_size_huge_is_invalid_data() {
     patch(&path, H_VOCAB_DATA_SIZE, &u64::MAX.to_le_bytes());
     let err = expect_open_err(&path, "vocab_data_size huge");
     assert_eq!(err.kind(), ErrorKind::InvalidData, "got: {err}");
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 
@@ -107,5 +114,6 @@ fn corrupt_max_himos_huge_is_invalid_data() {
     patch(&path, H_MAX_HIMOS, &u32::MAX.to_le_bytes());
     let err = expect_open_err(&path, "max_himos huge");
     assert_eq!(err.kind(), ErrorKind::InvalidData, "got: {err}");
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }

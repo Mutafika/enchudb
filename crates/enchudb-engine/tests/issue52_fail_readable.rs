@@ -23,6 +23,7 @@ fn tmp_path(tag: &str) -> String {
 }
 
 fn cleanup_all(path: &str) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = fs::remove_file(path);
     let _ = fs::remove_file(format!("{}.oplog", path));
     let _ = fs::remove_file(format!("{}.tables", path));

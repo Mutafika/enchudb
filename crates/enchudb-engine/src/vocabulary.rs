@@ -249,6 +249,9 @@ impl Vocabulary {
         let index_cap = self.index_cap;
         let max_entries = self.max_entries;
         let Self { index, offsets, data, .. } = self;
+        // v10: rebuild は任意 slot に `&mut [u8]` で書くので index segment を全域 commit
+        // しておく (open 時 1 回、 index が dirty だった場合のみ)。
+        let _ = index.ensure_committed(index.len());
         Self::rebuild_index_into(offsets, data, count, index_cap, max_entries, index.as_mut_slice());
     }
 
@@ -461,6 +464,12 @@ impl Vocabulary {
             }
             probes += 1;
             let off = INDEX_HEADER + idx * INDEX_SLOT_SIZE;
+            // v10: index segment は書いた分だけ commit される (旧 fixed cluster の eager
+            // commit ではない)。 slot の atomic CAS は write なので、 触る前に伸ばす。
+            // 伸ばせない (#167) なら挿入失敗として返す (呼び側が満杯扱いする)。
+            if self.index.ensure_committed(off + INDEX_SLOT_SIZE).is_err() {
+                return false;
+            }
             // #83: slot flag は Region 経由の AtomicU8 で直接触る (`&mut [u8]` を
             // 実体化しない)。 hash/id の書込も write_at (raw ptr)。
             let flag = self.index.as_atomic_u8(off);

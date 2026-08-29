@@ -40,6 +40,7 @@ fn tmp(tag: &str) -> String {
 }
 
 fn cleanup(p: &str) {
+    let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
     for s in ["", ".oplog", ".tables", ".tables.tmp", ".crc", ".lock", ".db.lock", ".eidmap", ".vocabmap", ".schema"] {
         let _ = std::fs::remove_file(format!("{}{}", p, s));
     }

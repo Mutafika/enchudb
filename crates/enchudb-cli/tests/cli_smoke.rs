@@ -13,6 +13,7 @@ fn bin() -> std::path::PathBuf {
 fn tmp_db(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!("enchu_cli_smoke_{}_{}.db", name, std::process::id()));
+    let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
     let _ = std::fs::remove_file(&p);
     let _ = std::fs::remove_file(format!("{}.oplog", p.display()));
     let _ = std::fs::remove_file(format!("{}.lock", p.display()));
@@ -20,6 +21,7 @@ fn tmp_db(name: &str) -> std::path::PathBuf {
 }
 
 fn cleanup(path: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{}.oplog", path.display()));
     let _ = std::fs::remove_file(format!("{}.lock", path.display()));

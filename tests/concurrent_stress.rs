@@ -10,11 +10,13 @@ use std::time::{Duration, Instant};
 
 fn tmp(name: &str) -> String {
     let path = format!("/tmp/enchu_concurrent_stress_{name}.db");
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
     path
 }
 
 fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
 }
 

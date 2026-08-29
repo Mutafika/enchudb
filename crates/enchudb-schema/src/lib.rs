@@ -2323,6 +2323,7 @@ mod tests {
     #[test]
     fn create_table_and_insert() {
         let path = tmp("create_insert");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         {
             let mut db = Database::create(&path).unwrap();
@@ -2344,12 +2345,14 @@ mod tests {
             assert_eq!(users.entity(alice).get("name"), Some(Value::Text("Alice".into())));
             assert_eq!(users.entity(alice).get("age"), Some(Value::Number(30)));
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn where_eq_and_chain() {
         let path = tmp("where_eq");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         {
             let mut db = Database::create(&path).unwrap();
@@ -2372,12 +2375,14 @@ mod tests {
             let tokyo30 = users.where_eq("age", 30i64).where_eq("city", "Tokyo").find().unwrap();
             assert_eq!(tokyo30.len(), 1);
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn upsert_replaces_pk_row() {
         let path = tmp("upsert");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         {
             let mut db = Database::create(&path).unwrap();
@@ -2394,6 +2399,7 @@ mod tests {
             let ts = t.entity(rows[0]).get("ts");
             assert_eq!(ts, Some(Value::Number(200)));
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2403,6 +2409,7 @@ mod tests {
     #[test]
     fn concurrent_upsert_same_pk_does_not_duplicate() {
         let path = tmp("concurrent_upsert_pk");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         let db = {
             let mut db = Database::create(&path).unwrap();
@@ -2444,12 +2451,14 @@ mod tests {
             "concurrent upsert of same PK must produce exactly 1 row, got {}",
             rows.len()
         );
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn schema_persists_across_reopen() {
         let path = tmp("persist");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         {
             let mut db = Database::create(&path).unwrap();
@@ -2471,12 +2480,14 @@ mod tests {
             let name = users.entity(alice.unwrap()).get("name");
             assert_eq!(name, Some(Value::Text("Alice".into())));
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn delete_and_update() {
         let path = tmp("del_upd");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         {
             let mut db = Database::create(&path).unwrap();
@@ -2498,12 +2509,14 @@ mod tests {
             let remaining = t.all().find().unwrap();
             assert_eq!(remaining.len(), 1);
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn relation_ref_query() {
         let path = tmp("relation");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         {
             let mut db = Database::create(&path).unwrap();
@@ -2530,6 +2543,7 @@ mod tests {
             let staff = users.where_ref("company", ant_id).find().unwrap();
             assert_eq!(staff.len(), 2);
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2539,6 +2553,7 @@ mod tests {
         // table = 紐の束 declaration なので、 row 識別 marker は存在せず、
         // 抽出した himo_id だけで engine 直叩き write/read が schema find に揃う。
         let path = tmp("bindings");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         let mut db = Database::create(&path).unwrap();
         let _ = db.table("posts")
@@ -2581,6 +2596,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "alice row should be visible via schema find");
         assert_eq!(rows[0], e);
 
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2592,6 +2608,7 @@ mod tests {
         //   - reader (open_readonly) を 3 つ並行 open (lock 取らない)
         // 全部 同じ schema が見えること。
         let path = tmp("readonly_coexist");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}.oplog", path));
         let _ = std::fs::remove_file(format!("{}.lock", path));
@@ -2617,6 +2634,7 @@ mod tests {
         }
 
         drop((writer, r1, r2, r3));
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}.oplog", path));
         let _ = std::fs::remove_file(format!("{}.lock", path));
@@ -2629,7 +2647,9 @@ mod tests {
         // apparent も layout も比例して縮むことを確認する。
         let path_default = tmp("growable_cap_default");
         let path_capped = tmp("growable_cap_65k");
+        let _ = std::fs::remove_dir_all(&path_default); // v10: DB は directory
         let _ = std::fs::remove_file(&path_default);
+        let _ = std::fs::remove_dir_all(&path_capped); // v10: DB は directory
         let _ = std::fs::remove_file(&path_capped);
 
         {
@@ -2639,15 +2659,25 @@ mod tests {
             let _db = Database::create_growable_with_capacity(&path_capped, 65_536).unwrap();
         }
 
-        let size_default = std::fs::metadata(&path_default).unwrap().len();
-        let size_capped = std::fs::metadata(&path_capped).unwrap().len();
+        // v10 (request21): 本体は directory + segment で、 見かけ = 書いた分。 旧 test は
+        // 「default は 20 GB 以上に見える」 を固定していたが、 それ自体が消えた。 どちらも
+        // 数 MB 以下で、 capacity は見かけに効かないことを固定する。
+        fn dir_bytes(p: &str) -> u64 {
+            fn walk(p: &std::path::Path, acc: &mut u64) {
+                for e in std::fs::read_dir(p).unwrap().flatten() {
+                    if e.file_type().unwrap().is_dir() { walk(&e.path(), acc); } else { *acc += e.metadata().unwrap().len(); }
+                }
+            }
+            let mut acc = 0; walk(std::path::Path::new(p), &mut acc); acc
+        }
+        let size_default = dir_bytes(&path_default);
+        let size_capped = dir_bytes(&path_capped);
+        assert!(size_default < 64 * 1024 * 1024, "default apparent = {}", size_default);
+        assert!(size_capped < 64 * 1024 * 1024, "capped apparent = {}", size_capped);
 
-        // default は 20 GB 以上、 cap=65k は 2 GB 未満 (=10× 以上の差)
-        assert!(size_default > 20 * 1024 * 1024 * 1024, "default apparent = {}", size_default);
-        assert!(size_capped < 2 * 1024 * 1024 * 1024, "capped apparent = {}", size_capped);
-        assert!(size_default / size_capped > 10);
-
+        let _ = std::fs::remove_dir_all(&path_default); // v10: DB は directory
         let _ = std::fs::remove_file(&path_default);
+        let _ = std::fs::remove_dir_all(&path_capped); // v10: DB は directory
         let _ = std::fs::remove_file(&path_capped);
     }
 
@@ -2655,7 +2685,9 @@ mod tests {
     fn finish_with_wal_transitions_to_concurrent() {
         let path = tmp("finish_wal");
         let oplog_path = format!("{}.oplog", path);
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&oplog_path); // v10: DB は directory
         let _ = std::fs::remove_file(&oplog_path);
 
         let db_arc: Arc<Database> = {
@@ -2684,7 +2716,9 @@ mod tests {
         assert_eq!(h.join().unwrap(), 1);
 
         drop(db_arc);
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&oplog_path); // v10: DB は directory
         let _ = std::fs::remove_file(&oplog_path);
     }
 
@@ -2692,7 +2726,9 @@ mod tests {
     fn open_with_wal_recovers_writes() {
         let path = tmp("open_wal");
         let oplog_path = format!("{}.oplog", path);
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&oplog_path); // v10: DB は directory
         let _ = std::fs::remove_file(&oplog_path);
 
         // 1: build → finish_with_oplog → 書き込み → oplog_sync で durable
@@ -2717,13 +2753,16 @@ mod tests {
             assert_eq!(kv.entity(alpha.unwrap()).get("ts"), Some(Value::Number(1000)));
         }
 
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&oplog_path); // v10: DB は directory
         let _ = std::fs::remove_file(&oplog_path);
     }
 
     #[test]
     fn leaf_column_basic_write_read() {
         let path = tmp("leaf_basic");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         {
             let mut db = Database::create(&path).unwrap();
@@ -2748,6 +2787,7 @@ mod tests {
                 Some(Value::Text("今日の天気は晴れ。良い一日だった。".into()))
             );
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2756,6 +2796,7 @@ mod tests {
         // 同じ文字列を複数 entity の Leaf 列に書いた時、vocab_id が別であることを確認。
         // Tag なら同じ vocab_id を共有するが、Leaf は dedupe しない。
         let path = tmp("leaf_no_dedupe");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         {
             let mut db = Database::create(&path).unwrap();
@@ -2779,6 +2820,7 @@ mod tests {
             let v2 = eng.get(e2, "notes.memo").unwrap();
             assert_ne!(v1, v2, "Leaf は同じ文字列でも別 vocab_id を発行するべき");
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2786,6 +2828,7 @@ mod tests {
     fn tag_dedupes_but_leaf_does_not_in_same_db() {
         // 同じ DB で Tag と Leaf を比較。Tag は dedupe、Leaf は dedupe しない。
         let path = tmp("tag_vs_leaf");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         {
             let mut db = Database::create(&path).unwrap();
@@ -2811,12 +2854,14 @@ mod tests {
             let m2 = eng.get(e2, "items.memo").unwrap();
             assert_ne!(m1, m2, "Leaf は dedupe しないべき");
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn leaf_column_persists_across_reopen() {
         let path = tmp("leaf_persist");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         let e = {
             let mut db = Database::create(&path).unwrap();
@@ -2841,6 +2886,7 @@ mod tests {
                 Some(Value::Text("to be persisted".into()))
             );
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2849,6 +2895,7 @@ mod tests {
         // 0.7.0 Phase 3: enable_sync で _sync_ops / _sync_peers が engine に
         // 登録されること、 user-facing list_tables からは見えないことを確認。
         let path = tmp("sync_enable");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}.tables", path));
 
@@ -2884,6 +2931,7 @@ mod tests {
         // 2 度目の enable_sync は idempotent
         db.enable_sync().unwrap();
 
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2891,6 +2939,7 @@ mod tests {
     fn user_table_starting_with_underscore_rejected() {
         // 0.7.0 Phase 3: `_` 始まり名前は reserved 命名空間、 user 経路は弾く。
         let path = tmp("reserved_reject");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}.tables", path));
 
@@ -2903,6 +2952,7 @@ mod tests {
         assert!(err.contains("reserved") || err.contains("_"),
                 "error message should mention reserved namespace, got: {err}");
 
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 }

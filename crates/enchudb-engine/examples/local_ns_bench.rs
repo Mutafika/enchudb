@@ -11,6 +11,7 @@ use std::time::Instant;
 
 fn main() {
     let path = "/tmp/enchu_local_ns_bench.db";
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
 
     let mut eng = Engine::create_standalone(path).unwrap();
@@ -126,5 +127,6 @@ fn main() {
     eprintln!("");
     eprintln!("(= 大規模 result は Vec 構築 0.5 ns/eid 律速、 ns 性能は維持されてる)");
 
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
 }

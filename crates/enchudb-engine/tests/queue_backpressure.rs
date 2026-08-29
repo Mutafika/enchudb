@@ -11,6 +11,7 @@ use std::sync::Arc;
 #[test]
 fn small_queue_cap_does_not_hang() {
     let path = "/tmp/test_queue_backpressure.db";
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{path}.oplog"));
     let _ = std::fs::remove_file(format!("{path}.lock"));

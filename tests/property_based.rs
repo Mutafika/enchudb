@@ -20,6 +20,7 @@ fn fresh_db_path(tag: &str) -> String {
         tag,
         n
     );
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
     path
 }
@@ -126,6 +127,7 @@ proptest! {
             }
         }
 
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
@@ -151,6 +153,7 @@ proptest! {
             }
         }
 
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
@@ -193,6 +196,7 @@ proptest! {
             }
         }
 
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
@@ -229,6 +233,7 @@ proptest! {
             }
         }
 
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
@@ -255,6 +260,7 @@ proptest! {
         prop_assert_eq!(&q, &intersection,
             "query[a={}, b={}] != pull_raw(a) ∩ pull_raw(b)", a_val, b_val);
 
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 }

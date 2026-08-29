@@ -25,6 +25,7 @@ fn tmp(tag: &str) -> String {
             .unwrap()
             .as_nanos()
     );
+    let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
     for suffix in ["", ".oplog", ".tables", ".crc", ".lock", ".eidmap", ".vocabmap"] {
         let _ = std::fs::remove_file(format!("{p}{suffix}"));
     }

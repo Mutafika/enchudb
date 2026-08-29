@@ -149,6 +149,10 @@ impl ContentStore {
         let kh = Self::key_hash(key);
         let off = Self::index_offset(eid, kh);
         if off + 8 <= self.index.len() {
+            // v10: 未 commit の slot は zero page で既に 0。 書くと fault するので触らない。
+            if !self.index.is_committed(off + 8) {
+                return;
+            }
             self.index.fill_at(off, 8, 0);
             self.index.mark_dirty(off, 8);
         }

@@ -1,7 +1,7 @@
 //! Region — 単一 mmap ファイル内のスライス。 ロックなし。
 //!
 //! 通常モードでは `ptr + len` だけ持って raw deref する単純な view だが、
-//! `with_grower` で生成した Region は **GrowableMap への back-reference** と
+//! `with_grower` で生成した Region は **SegmentMap への back-reference** と
 //! **ファイル内オフセット** を保持し、 `ensure_committed(end)` で書き込み境界
 //! までの commit を要求できる。 store 側 (vocabulary / content_store / cylinder)
 //! が data_end を進める前に呼ぶのが期待されるパターン。
@@ -11,21 +11,20 @@ use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::growable_map::GrowableMap;
+use crate::segment_map::SegmentMap;
 
 pub struct Region {
     ptr: *mut u8,
     len: usize,
-    /// Optional growth backref. Set only for regions that live in
-    /// a `Backing::Growable` and may need to extend the file-backed
-    /// commit. `None` for static `MmapMut` / `Memory` backings (in
-    /// those, the whole reservation is already committed).
-    /// Not present on wasm32 (no `GrowableMap` there).
+    /// Optional growth backref (request21 / v10): region が載っている segment。
+    /// 未 commit 領域の read は zero page で 0 を返し、 write の前に
+    /// `ensure_committed` で file-backed commit を伸ばす。 `None` は `Memory`
+    /// backing (packed 1 blob、 全域 commit 済み)。 wasm32 には無い。
     #[cfg(not(target_arch = "wasm32"))]
-    grower: Option<Arc<GrowableMap>>,
+    grower: Option<Arc<SegmentMap>>,
     /// Offset of this region's start within the underlying file.
     /// Required to translate "end within region" → "end within file"
-    /// before calling `GrowableMap::grow_amortized`.
+    /// before calling `SegmentMap::grow_amortized`.
     #[cfg(not(target_arch = "wasm32"))]
     file_offset: usize,
 }
@@ -60,7 +59,7 @@ impl Region {
     /// 収まっていること (caller responsibility)。
     #[cfg(not(target_arch = "wasm32"))]
     pub unsafe fn with_grower(
-        grower: Arc<GrowableMap>,
+        grower: Arc<SegmentMap>,
         file_offset: usize,
         len: usize,
     ) -> Self {
@@ -71,6 +70,26 @@ impl Region {
             grower: Some(grower),
             file_offset,
         }
+    }
+
+    /// request21 (v10): segment 全体 (offset 0 から `len`) を region にする。
+    ///
+    /// # Safety
+    /// `len <= grower.reserved()` (caller responsibility)。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub unsafe fn from_segment(seg: Arc<SegmentMap>, len: usize) -> Self {
+        debug_assert!(len <= seg.reserved());
+        unsafe { Self::with_grower(seg, 0, len) }
+    }
+
+    /// 実際に file-backed で commit されている長さ (region 内)。 静的 backing は `len`。
+    /// CRC 計算や dump で 「予約全域 (zero page) を舐めない」 ために使う。
+    pub fn committed_len(&self) -> usize {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(g) = &self.grower {
+            return g.committed().saturating_sub(self.file_offset).min(self.len);
+        }
+        self.len
     }
 
     #[inline(always)]

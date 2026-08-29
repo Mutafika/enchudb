@@ -1,30 +1,15 @@
-//! `snapshot_export` が DB body の **穴を潰さない**こと。
+//! `snapshot_export` が DB を **肥大化させずに** 写すこと。
 //!
-//! # 何が壊れていたか
+//! v9 まで: 本体は sparse な巨大 1 ファイルで、 素の `std::fs::copy` は Linux で穴を 0 埋め
+//! して apparent 全量を物理化した (この test はそれを固定していた)。
 //!
-//! DB body は 「apparent は巨大、 実データはごく一部」 な sparse ファイル。
-//! 置いてあるだけなら穴は物理を消費しないが、 `std::fs::copy` は platform に
-//! よって挙動が違う — macOS は clonefile で穴を維持するのに対し、 **Linux は
-//! 穴を 0 で埋めて実際に書き出す**。
-//!
-//! そのため `snapshot_export` は Linux で apparent 全量を物理化していた。
-//! 既定 capacity の DB なら 1 回の snapshot で 24 GB を書く。 CI (ubuntu) が
-//! `No space left on device` で runner ごと落ちたのはこれが直接の原因。
-//!
-//! # この test について
-//!
-//! capacity は **わざと控えめ** (= apparent 1 GB 級) にしてある。 回帰したときに
-//! 「assert が落ちる」で済ませるためで、 実 DB 相当の capacity にすると回帰時に
-//! ディスクを食い潰して test runner ごと死ぬ (それが元の症状)。
-//!
-//! falsify: `snapshot_export` の `copy_sparse` を `std::fs::copy` に戻すと、
-//! Linux でこの test が落ちる。 macOS は `fs::copy` が元々穴を維持するので
-//! **落ちない — falsify は Linux で行うこと**。
-
+//! v10 (request21): 本体は directory + segment file 群で、 各 segment は書いた分しか
+//! 伸びない (unix は見かけも物理も)。 「穴を保つ」 という問題自体が消えたので、 この test は
+//! **snapshot の総サイズが source と同じで、 かつ予約 (旧 apparent) より桁違いに小さい**
+//! ことと、 中身が読めることを固定する。
 #![cfg(unix)]
 
 use enchudb_engine::{Engine, ValueType};
-use std::os::unix::fs::MetadataExt;
 
 fn tmp(tag: &str) -> String {
     format!(
@@ -39,27 +24,38 @@ fn tmp(tag: &str) -> String {
 }
 
 fn cleanup(path: &str) {
-    for s in ["", ".oplog", ".tables", ".tables.tmp", ".crc", ".lock", ".db.lock", ".eidmap", ".vocabmap", ".schema"] {
+    let _ = std::fs::remove_dir_all(path);
+    for s in [".oplog", ".tables", ".tables.tmp", ".crc", ".lock", ".db.lock", ".eidmap", ".vocabmap", ".schema"] {
         let _ = std::fs::remove_file(format!("{}{}", path, s));
     }
 }
 
-fn apparent(path: &str) -> u64 {
-    std::fs::metadata(path).unwrap().len()
-}
-
-fn physical(path: &str) -> u64 {
-    std::fs::metadata(path).unwrap().blocks() * 512
+/// directory 配下の file 長の合計 (= v10 の apparent)。
+fn dir_bytes(path: &str) -> u64 {
+    fn walk(p: &std::path::Path, acc: &mut u64) {
+        for e in std::fs::read_dir(p).unwrap() {
+            let e = e.unwrap();
+            if e.file_type().unwrap().is_dir() {
+                walk(&e.path(), acc);
+            } else {
+                *acc += e.metadata().unwrap().len();
+            }
+        }
+    }
+    let mut acc = 0;
+    walk(std::path::Path::new(path), &mut acc);
+    acc
 }
 
 #[test]
-fn snapshot_export_does_not_materialize_the_holes() {
+fn snapshot_export_does_not_bloat_the_copy() {
     let src = tmp("src");
     let dst = tmp("dst");
     cleanup(&src);
     cleanup(&dst);
 
-    let mut eng = Engine::create_with_capacity(&src, 512 * 1024).unwrap();
+    let cap = 512 * 1024u32;
+    let mut eng = Engine::create_with_capacity(&src, cap).unwrap();
     eng.define_himo("age", ValueType::Number, 0);
     let mut eids = Vec::new();
     for i in 0..1000u32 {
@@ -69,44 +65,23 @@ fn snapshot_export_does_not_materialize_the_holes() {
     }
     eng.flush().unwrap();
 
-    let src_apparent = apparent(&src);
+    let src_bytes = dir_bytes(&src);
+    // 旧 layout の apparent (cap 512K で数百 MB) より桁違いに小さいこと = segment 化の効果
     assert!(
-        src_apparent > 256 * 1024 * 1024,
-        "前提が崩れた: source が sparse な巨大ファイルでない ({} bytes)",
-        src_apparent,
-    );
-    assert!(
-        physical(&src) < src_apparent / 10,
-        "前提が崩れた: source 自体が既に密 (physical {} / apparent {})",
-        physical(&src),
-        src_apparent,
+        src_bytes < 32 * 1024 * 1024,
+        "v10 の source が旧 apparent 級に膨らんでいる ({} bytes)",
+        src_bytes,
     );
 
     eng.snapshot_export(&dst).expect("snapshot_export");
-
-    assert_eq!(apparent(&dst), src_apparent, "snapshot の apparent size が違う");
-
-    let phys = physical(&dst);
-    assert!(
-        phys < src_apparent / 10,
-        "snapshot が穴を潰している: physical {} bytes / apparent {} bytes \
-         (std::fs::copy は Linux で穴を 0 埋めする — copy_sparse を使うこと)",
-        phys,
-        src_apparent,
-    );
-
-    // 穴を飛ばしても中身は壊れていないこと。
+    let dst_bytes = dir_bytes(&dst);
+    assert_eq!(dst_bytes, src_bytes, "snapshot の総サイズが source と違う (肥大化 or 欠落)");
     drop(eng);
+
     let restored = Engine::open_standalone(&dst).expect("snapshot が open できない");
     for (i, &e) in eids.iter().enumerate() {
-        assert_eq!(
-            restored.get(e, "age"),
-            Some(i as u32),
-            "snapshot の中身が壊れている (eid #{})",
-            i,
-        );
+        assert_eq!(restored.get(e, "age"), Some(i as u32), "snapshot の中身が壊れている (eid #{})", i);
     }
-
     drop(restored);
     cleanup(&src);
     cleanup(&dst);

@@ -15,6 +15,7 @@ use enchudb::Engine;
 
 fn tmp(tag: &str) -> String {
     let p = format!("/tmp/enchudb-content-xp-{}-{}", tag, std::process::id());
+    let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
     let _ = std::fs::remove_file(&p);
     p
 }
@@ -46,6 +47,7 @@ fn drop_without_sync_persists_data_end() {
     assert_eq!(body1, Some(b"first process data".as_ref()));
     assert_eq!(body2, Some(b"second process data".as_ref()));
 
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 
@@ -77,5 +79,6 @@ fn many_short_lived_writes_do_not_corrupt() {
         );
     }
 
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }

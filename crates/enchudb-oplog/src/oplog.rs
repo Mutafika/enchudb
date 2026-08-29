@@ -1704,6 +1704,7 @@ mod tests {
     fn tmp(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!("enchudb-wal-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
         p
     }
@@ -1718,6 +1719,7 @@ mod tests {
         assert_eq!(lsn1, 1);
         assert_eq!(lsn2, 2);
         assert_eq!(lsn3, 3);
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
     }
 
@@ -1766,6 +1768,7 @@ mod tests {
             }
         }
         assert!(hit_full, "極小 capacity なら必ず満杯に到達して Err を返すはず");
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
     }
 
@@ -1797,6 +1800,7 @@ mod tests {
         // 後続の正常 append が通り、 pending も 0 に戻ることを確認。
         wal.append(Op::Tie { eid: 2, himo_id: 0, value: 2 }).unwrap();
         assert_eq!(wal.pending_writes(), 0);
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
     }
 
@@ -1818,6 +1822,7 @@ mod tests {
         // peer が 7 で記録されている
         assert_eq!(recs[0].hlc.peer, 7);
         assert_eq!(recs[0].author_peer, 7);
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
     }
 
@@ -1844,6 +1849,7 @@ mod tests {
             }
             _ => panic!(),
         }
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
     }
 
@@ -1867,6 +1873,7 @@ mod tests {
             }
             _ => panic!(),
         }
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
     }
 
@@ -1887,6 +1894,7 @@ mod tests {
         assert_eq!(sig, &[0u8; 64]);
         let pubkey_fp = &bytes[32 + OFF_PUBKEY_FP..32 + OFF_PUBKEY_FP + 8];
         assert_eq!(pubkey_fp, &[0u8; 8]);
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
     }
 
@@ -1929,6 +1937,7 @@ mod tests {
             }
             _ => panic!(),
         }
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
     }
 
@@ -1949,6 +1958,7 @@ mod tests {
             f.set_len(1024).unwrap();
         }
         assert!(OpLog::open(&p).is_err(), "v1 WAL should be rejected");
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
     }
 
@@ -1964,6 +1974,7 @@ mod tests {
 
         wal.reset_to_checkpoint();
         assert_eq!(wal.head(), head_after);
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
     }
 
@@ -1988,6 +1999,7 @@ mod tests {
         }
         for h in handles { h.join().unwrap(); }
         assert_eq!(wal.next_lsn(), 4001);
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
     }
 
@@ -2039,6 +2051,7 @@ mod tests {
         hlcs.dedup();
         assert_eq!(hlcs.len(), before, "HLC が重複発行された");
 
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
     }
 
@@ -2073,6 +2086,7 @@ mod tests {
         assert_eq!(tie_count, 200, "all Tie records should survive flock-serialized append, got {}", tie_count);
         // record header magic がどれも正常であることを暗黙検証 (recover 自身が壊れた
         // record を見つけたら panic / 早期 break する)
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
     }
 
@@ -2098,6 +2112,7 @@ mod tests {
         let lsn = wal.append(Op::Tie { eid: 999, himo_id: 0, value: 99 }).unwrap();
         assert!(lsn > 100);
 
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
     }
 
@@ -2126,6 +2141,7 @@ mod tests {
         assert_eq!(wal.head(), HEADER_SIZE as u64);
         assert_eq!(wal.checkpoint(), HEADER_SIZE as u64);
 
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
     }
 
@@ -2145,6 +2161,7 @@ mod tests {
             wal.advance_checkpoint(wal.head());
             wal.try_reset();
         }
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
     }
 
@@ -2157,6 +2174,7 @@ mod tests {
         wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
         let r = wal.append(Op::Tie { eid: 2, himo_id: 0, value: 2 });
         assert!(r.is_err());
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
     }
 
@@ -2186,6 +2204,7 @@ mod tests {
 
         let on_disk = tie_hlcs(&wal);
         assert_eq!(on_disk, vec![(lsn1, h1), (lsn2, h2)], "返した HLC が record と違う");
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
     }
 
@@ -2203,6 +2222,7 @@ mod tests {
         let lsn1 = wal.append_at_hlc(Op::Tie { eid: 1, himo_id: 0, value: 1 }, minted1).unwrap();
 
         assert_eq!(tie_hlcs(&wal), vec![(lsn2, minted2), (lsn1, minted1)]);
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
     }
 
@@ -2223,6 +2243,7 @@ mod tests {
             vec![(lsns[0], minted[0]), (lsns[1], minted[1])],
             "batch append が HLC を採番し直している",
         );
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
     }
 
@@ -2241,6 +2262,7 @@ mod tests {
         assert_eq!(on_disk.len(), 2);
         assert!(on_disk[0].1 < on_disk[1].1, "batch 内で HLC が単調増加していない");
         assert_ne!(on_disk[0].1, Hlc::ZERO, "HLC が採番されていない");
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
     }
 

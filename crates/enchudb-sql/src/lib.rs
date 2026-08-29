@@ -1062,6 +1062,7 @@ mod tests {
 
     fn fresh(name: &str) -> Database {
         let path = format!("/tmp/enchudb_sql_{name}.db");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         Database::create(&path).unwrap()
     }
@@ -1483,6 +1484,7 @@ mod tests {
     #[test]
     fn schema_persists_across_reopen() {
         let path = "/tmp/enchudb_sql_persist_basic.db";
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
         {
             let mut db = Database::create(path).unwrap();
@@ -1505,12 +1507,14 @@ mod tests {
             }
             _ => panic!(),
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn multi_table_schema_persists() {
         let path = "/tmp/enchudb_sql_persist_multi.db";
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
         {
             let mut db = Database::create(path).unwrap();
@@ -1547,6 +1551,7 @@ mod tests {
             }
             _ => panic!(),
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
     }
 
@@ -1585,6 +1590,7 @@ mod tests {
     fn open_existing_schema_data_visible_without_create_table() {
         // matcha 起動時のパターン: open するだけで既存 schema + データが見える
         let path = "/tmp/enchudb_sql_persist_no_create.db";
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
         {
             let mut db = Database::create(path).unwrap();
@@ -1605,6 +1611,7 @@ mod tests {
             }
             _ => panic!(),
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
     }
 
@@ -1644,6 +1651,7 @@ mod tests {
     fn leaf_persists_across_reopen() {
         // LEAF 列もスキーマ blob に含まれて永続化される。
         let path = "/tmp/enchudb-sql-test-leaf-persist.db";
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
         {
             let mut db = Database::create(path).unwrap();
@@ -1658,6 +1666,7 @@ mod tests {
             }
             _ => panic!(),
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
     }
 }

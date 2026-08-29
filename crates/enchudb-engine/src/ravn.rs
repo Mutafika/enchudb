@@ -348,6 +348,7 @@ mod tests {
 
     fn setup(name: &str) -> (Arc<Engine>, Ravn) {
         let path = format!("/tmp/enchu_ravn_{name}.db");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         let mut eng = Engine::create_standalone(&path).unwrap();
 

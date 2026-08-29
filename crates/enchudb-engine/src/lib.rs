@@ -42,23 +42,16 @@ pub(crate) mod append_vec;
 pub(crate) mod append_bucket;
 pub(crate) mod lockfree_cylinder;
 pub(crate) mod region;
-// growable backing は「虚仮アドレス予約 (PROT_NONE) → MAP_FIXED で貼り直す」
-// unix 固有の手を使う。 Windows の MapViewOfFileEx は空きアドレスにしかマップ
-// できないので同じ実装は使えない。 ただし **growable が要るのは create 時だけ**
-// (`Engine::open` は常に素の mmap backing で開き直す) なので、 Windows では
-// 構築不能な stub を置き、 eager な `create_with_capacity` 系を使う。
-#[cfg(all(not(target_arch = "wasm32"), unix))]
-pub mod growable_map;
-#[cfg(all(not(target_arch = "wasm32"), not(unix)))]
-#[path = "growable_map_stub.rs"]
-pub mod growable_map;
-// request21 (v10 Phase 0): 1 ファイル 1 予約の segment mmap。 unix は mmap/MAP_FIXED、
-// Windows は placeholder API (VirtualAlloc2 + MapViewOfFile3、 Win10 1803+)。
+// request21 (v10): 1 ファイル 1 予約の segment mmap。 unix は zero page 予約 + MAP_FIXED
+// commit、 Windows は sparse file の全域 map (placeholder API 版は後続)。 旧 growable_map
+// (1 ファイル固定 layout の commit 高水位、 unix 限定) はこれに置き換わって撤去。
 #[cfg(all(not(target_arch = "wasm32"), unix))]
 pub mod segment_map;
 #[cfg(all(not(target_arch = "wasm32"), windows))]
 #[path = "segment_map_windows.rs"]
 pub mod segment_map;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod segments;
 pub mod column;
 pub mod vocabulary;
 pub mod leaf_store;
@@ -88,6 +81,8 @@ pub mod sparse_copy;
 
 pub use engine::{Engine, EntityValue, SnapshotFiles, AuditFilter, MigrationStats, LeafScale, GrowableOptions, FaultKind, RemoteApply};
 pub use sparse_copy::copy_sparse;
+#[cfg(not(target_arch = "wasm32"))]
+pub use engine::copy_db_dir;
 pub use engine::EngineStats;
 pub use himo_store::ValueType;
 pub use cas::{CASStore, BlockHash};

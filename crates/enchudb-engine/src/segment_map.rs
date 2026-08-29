@@ -4,14 +4,20 @@
 //!
 //! v10 は DB 本体を region ごとの独立ファイル (segment) に分ける。 各 segment は
 //! この型 1 個で map され、 **他の segment とファイル長も address も共有しない**。
-//! `GrowableMap` (1 ファイル固定 layout の commit 高水位) が抱えていた
+//! 旧 `GrowableMap` (1 ファイル固定 layout の commit 高水位、 v10 で撤去) が抱えていた
 //! 「末尾 region を触ると手前が全部 commit される」 (#172) はファイル長が segment
 //! ごとになるので構造的に消える。
 //!
-//! # 設計 (= `GrowableMap` の一般化)
+//! # 設計 (= 旧 `GrowableMap` の一般化)
 //!
-//! - open 時に `reserve` byte の仮想アドレスを `PROT_NONE` で予約 (RAM / disk 0)。
+//! - open 時に `reserve` byte の仮想アドレスを **読み取り専用の anonymous zero page**
+//!   (`PROT_READ`, `MAP_ANON|MAP_PRIVATE|MAP_NORESERVE`) で予約する。 RAM / disk は 0
+//!   (実測: 1 TB 予約で RSS 増 0、 64 箇所 read で +1 MB = zero-fill page 分)。
 //!   **base は以後不動** — store が握る `Region` の生ポインタを無効化しない
+//! - **未 commit 領域の read は 0 を返す** (= 今の sparse mmap と同じ意味論)。 したがって
+//!   store の read path は無改修でよく、 **write path だけが `ensure_committed` を要る**
+//!   (未 commit page への write は SIGSEGV)。 これが `GrowableMap` の `PROT_NONE` 予約
+//!   (read も落ちる) との違いで、 request21 の 「store は無改修」 を成立させる要
 //! - ファイルの現在長までを `MAP_FIXED | MAP_SHARED` で予約の上に重ねる (= commit)
 //! - 伸長は writer だけ: `ftruncate` → 全 [0..new) を MAP_FIXED で貼り直す
 //!   (macOS が隣接 slice の MAP_FIXED を EINVAL にする quirk を避ける、 `GrowableMap` と同じ)
@@ -32,7 +38,36 @@ use std::ptr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use crate::growable_map::{align_up, free_bytes_for_fd, runtime_page_size};
+/// 実行時の hardware page size。 macOS Apple Silicon は **16 KB**、 Linux / macOS x86_64 は
+/// 4 KB。 msync の `addr` はこれで page-aligned である必要がある (4096 で揃えると
+/// Apple Silicon で EINVAL)。 起動時に sysconf で取って cache。
+pub(crate) fn runtime_page_size() -> usize {
+    use std::sync::atomic::AtomicUsize as A;
+    static CACHED: A = A::new(0);
+    let cur = CACHED.load(Ordering::Relaxed);
+    if cur != 0 {
+        return cur;
+    }
+    let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let ps = if v > 0 { v as usize } else { 4096 };
+    CACHED.store(ps, Ordering::Relaxed);
+    ps
+}
+
+pub(crate) fn align_up(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
+}
+
+/// fd の載っている filesystem で **非 root user が使える空き byte 数** (#167)。
+pub(crate) fn free_bytes_for_fd(fd: libc::c_int) -> io::Result<u64> {
+    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatvfs(fd, &mut vfs) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // f_frsize が 0 を返す filesystem があるので f_bsize に落ちる
+    let unit = if vfs.f_frsize != 0 { vfs.f_frsize as u64 } else { vfs.f_bsize as u64 };
+    Ok((vfs.f_bavail as u64).saturating_mul(unit))
+}
 
 /// #167: 伸長時に残す空き容量 margin (`GrowableMap` と同じ既定)。
 const SPACE_MARGIN: u64 = 32 * 1024 * 1024;
@@ -101,6 +136,11 @@ impl SegmentMap {
                 format!("segment {} is {len} bytes, larger than reservation {reserve}", path.display()),
             ));
         }
+        // file 長が page 境界に無い (unpack が data の末尾で切った等) と、 最終 page の EOF より
+        // 先への write が書き戻されない。 writer は page 境界まで伸ばしてから map する。
+        if !readonly && (len as u64) < committed as u64 {
+            file.set_len(committed as u64)?;
+        }
         Self::map_new(path.to_path_buf(), file, reserve, committed, readonly)
     }
 
@@ -120,12 +160,13 @@ impl SegmentMap {
         readonly: bool,
     ) -> io::Result<Self> {
         use std::os::unix::io::AsRawFd;
+        // zero page 予約: PROT_READ の anonymous mapping。 read は 0、 write は fault。
         let base = unsafe {
             libc::mmap(
                 ptr::null_mut(),
                 reserve,
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
                 -1,
                 0,
             )
@@ -475,6 +516,25 @@ mod tests {
                 assert_eq!(len, before[i], "触っていない segment {i} のファイル長が動いた");
             }
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// request21 の要 2: 未 commit 領域の read は fault せず 0 を返す (sparse mmap と同じ)。
+    /// store の read path を無改修で済ませる前提。
+    #[test]
+    fn reads_beyond_committed_are_zero_without_fault() {
+        let d = dir("zeroread");
+        let m = SegmentMap::create(&d.join("a.seg"), 64 * MB, 4096).unwrap();
+        let far = 50 * MB;
+        assert!(m.committed() < far);
+        assert_eq!(unsafe { *m.base().add(far) }, 0, "未 commit 領域が 0 でない");
+        // slice として読んでも同じ (Column::values_u32 相当)
+        let s = unsafe { std::slice::from_raw_parts(m.base(), 64 * MB) };
+        assert_eq!(s[far + 1], 0);
+        // その後 commit を伸ばして書けば見える
+        m.grow_to(far + 4096).unwrap();
+        unsafe { *m.base().add(far) = 9 };
+        assert_eq!(s[far], 9);
         let _ = std::fs::remove_dir_all(&d);
     }
 

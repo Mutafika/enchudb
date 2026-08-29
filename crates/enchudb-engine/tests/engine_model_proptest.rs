@@ -80,6 +80,7 @@ struct Model {
 }
 
 fn fresh() {
+    let _ = std::fs::remove_dir_all(&PATH); // v10: DB は directory
     for suf in ["", ".oplog", ".lock", ".tables"] {
         let _ = std::fs::remove_file(format!("{PATH}{suf}"));
     }

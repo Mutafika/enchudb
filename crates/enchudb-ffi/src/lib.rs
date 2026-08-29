@@ -366,6 +366,7 @@ mod tests {
 
     fn fresh(name: &str) -> *mut enchudb_db {
         let path = format!("/tmp/enchudb_ffi_{name}.db");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         let cpath = cstr(&path);
         let mut db: *mut enchudb_db = ptr::null_mut();

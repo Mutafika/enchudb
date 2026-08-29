@@ -4,6 +4,7 @@ use std::time::Instant;
 fn main() {
     let n = 1_000_000u32;
     let dir = "/tmp/enchu_bench_v24.db";
+    let _ = std::fs::remove_dir_all(&dir); // v10: DB は directory
     let _ = std::fs::remove_file(dir);
 
     let mut eng = Engine::create_standalone(dir).unwrap();
@@ -78,5 +79,6 @@ fn main() {
     eprintln!("--- 読み取り ({iters}回平均) ---");
     eprintln!("get + get_text               : {:>8.1}μs", read.as_micros() as f64 / iters as f64);
 
+    let _ = std::fs::remove_dir_all(&dir); // v10: DB は directory
     let _ = std::fs::remove_file(dir);
 }

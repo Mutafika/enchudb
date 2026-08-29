@@ -13,6 +13,7 @@ use std::sync::Arc;
 #[test]
 fn body_msync_handles_dirty_range_correctly() {
     let path = "/tmp/test_dirty_range_msync.db";
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{path}.oplog"));
     let _ = std::fs::remove_file(format!("{path}.lock"));
@@ -49,6 +50,7 @@ fn body_msync_handles_dirty_range_correctly() {
 #[test]
 fn oplog_sync_with_dirty_range() {
     let path = "/tmp/test_wal_sync_dirty.db";
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{path}.oplog"));
     let _ = std::fs::remove_file(format!("{path}.lock"));

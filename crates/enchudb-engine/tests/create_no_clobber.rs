@@ -13,6 +13,7 @@ fn tmp(name: &str) -> String {
     ));
     let s = p.to_str().unwrap().to_string();
     // 前回残骸を掃除 (DB 本体 + sidecar 群)
+    let _ = std::fs::remove_dir_all(&s); // v10: DB は directory
     for suffix in ["", ".oplog", ".crc", ".tables", ".eidmap", ".vocabmap", ".lock"] {
         let _ = std::fs::remove_file(format!("{s}{suffix}"));
     }
@@ -44,6 +45,7 @@ fn create_standalone_over_existing_is_already_exists() {
     let eng = Engine::open_standalone(&path).unwrap();
     assert_eq!(eng.entity_count(), 1);
     drop(eng);
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 
@@ -63,6 +65,7 @@ fn create_wal_variant_over_existing_is_already_exists() {
     let eng = Engine::open(&path).unwrap();
     assert_eq!(eng.entity_count(), 1);
     drop(eng);
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     for suffix in ["", ".oplog", ".crc", ".tables", ".eidmap", ".vocabmap"] {
         let _ = std::fs::remove_file(format!("{path}{suffix}"));
     }
@@ -78,6 +81,7 @@ fn create_growable_over_existing_is_already_exists() {
     assert_eq!(err.kind(), ErrorKind::AlreadyExists, "got: {err}");
     let err = expect_err(Engine::create_growable(&path), "growable over existing");
     assert_eq!(err.kind(), ErrorKind::AlreadyExists, "got: {err}");
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 
@@ -90,5 +94,6 @@ fn create_over_non_db_file_is_already_exists() {
     assert_eq!(err.kind(), ErrorKind::AlreadyExists, "got: {err}");
     let bytes = std::fs::read(&path).unwrap();
     assert_eq!(&bytes[..], b"precious user data, definitely not a DB");
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }

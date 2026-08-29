@@ -3,6 +3,7 @@ use enchudb::{Engine, ValueType, Ravn, RavnResult};
 
 fn db_path(tag: &str) -> String {
     let path = format!("/tmp/enchudb_ravn_{tag}.db");
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
     path
 }

@@ -203,12 +203,14 @@ mod tests {
         assert_eq!(loaded.get(RegionKind::Content), 0xbeef);
         assert_eq!(loaded.db_file_size, 1024);
 
+        let _ = std::fs::remove_dir_all(&tmp); // v10: DB は directory
         let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn missing_file_returns_none() {
         let path = std::env::temp_dir().join(format!("enchudb-crc-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         assert!(CrcTable::load(&path).unwrap().is_none());
     }

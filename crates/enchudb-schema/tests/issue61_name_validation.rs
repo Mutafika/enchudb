@@ -6,6 +6,7 @@ use enchudb_schema::Database;
 
 fn tmp(name: &str) -> String {
     let p = format!("/tmp/enchudb_issue61_{name}.db");
+    let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
     let _ = std::fs::remove_file(&p);
     let _ = std::fs::remove_file(format!("{p}.schema"));
     let _ = std::fs::remove_file(format!("{p}.tables"));

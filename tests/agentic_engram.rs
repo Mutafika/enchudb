@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 fn tmp(name: &str) -> String {
     let p = format!("/tmp/enchudb-engram-{}-{}", name, std::process::id());
+    let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
     let _ = std::fs::remove_file(&p);
     let _ = std::fs::remove_file(format!("{}.oplog", p));
     let _ = std::fs::remove_file(format!("{}.crc", p));
@@ -38,6 +39,7 @@ fn tmp(name: &str) -> String {
 }
 
 fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{}.oplog", path));
     let _ = std::fs::remove_file(format!("{}.crc", path));

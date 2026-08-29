@@ -25,6 +25,7 @@ const COL_TITLE: &str = "title";
 
 fn tmp(tag: &str) -> String {
     let p = format!("/tmp/enchudb-issue141-{}-{}", tag, std::process::id());
+    let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
     for suffix in ["", ".oplog", ".crc", ".tables", ".schema", ".eidmap", ".vocabmap", ".db.lock"] {
         let _ = std::fs::remove_file(format!("{}{}", p, suffix));
     }
@@ -32,6 +33,7 @@ fn tmp(tag: &str) -> String {
 }
 
 fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     for suffix in ["", ".oplog", ".crc", ".tables", ".schema", ".eidmap", ".vocabmap", ".db.lock"] {
         let _ = std::fs::remove_file(format!("{}{}", path, suffix));
     }

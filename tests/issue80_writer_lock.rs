@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 fn tmp(name: &str) -> String {
     let p = format!("/tmp/enchudb-issue80-{}-{}", name, std::process::id());
+    let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
     for suffix in ["", ".oplog", ".lock", ".crc", ".tables", ".eidmap", ".vocabmap"] {
         let _ = std::fs::remove_file(format!("{}{}", p, suffix));
     }

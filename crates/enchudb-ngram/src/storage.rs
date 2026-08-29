@@ -1045,6 +1045,7 @@ mod tests {
         std::fs::write(&path, &buf[..buf.len() - 5]).unwrap();
         let err = MappedIndex::open(&path).err().expect("truncated file must not load");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 

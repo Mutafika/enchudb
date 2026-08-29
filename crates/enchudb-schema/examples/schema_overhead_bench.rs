@@ -27,6 +27,7 @@ fn main() {
     let raw_path = "/tmp/sch_bench_raw.db";
     let sch_path = "/tmp/sch_bench_sch.db";
     for p in [raw_path, sch_path] {
+        let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(p);
         let _ = std::fs::remove_file(format!("{}.oplog", p));
     }
@@ -185,8 +186,10 @@ fn main() {
     println!("(_acc 抑止: s={} s2={} s3={} s4={} l={} l2={} l3={} l4={})",
         s, s2, s3, s4, l, l2, l3, l4);
 
+    let _ = std::fs::remove_dir_all(&raw_path); // v10: DB は directory
     let _ = std::fs::remove_file(raw_path);
     let _ = std::fs::remove_file(format!("{}.oplog", raw_path));
+    let _ = std::fs::remove_dir_all(&sch_path); // v10: DB は directory
     let _ = std::fs::remove_file(sch_path);
     let _ = std::fs::remove_file(format!("{}.oplog", sch_path));
 }

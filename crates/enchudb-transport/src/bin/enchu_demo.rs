@@ -161,6 +161,7 @@ fn cmd_replica(opts: &HashMap<String, String>) {
     // bootstrap: origin から DB を download
     if std::path::Path::new(&db).exists() {
         println!("[replica] removing existing {}", db);
+        let _ = std::fs::remove_dir_all(&db); // v10: DB は directory
         let _ = std::fs::remove_file(&db);
         let _ = std::fs::remove_file(format!("{}.oplog", db));
         let _ = std::fs::remove_file(format!("{}.crc", db));

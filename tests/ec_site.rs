@@ -8,11 +8,13 @@ use enchudb::{Engine, ValueType};
 
 fn db_path(tag: &str) -> String {
     let path = format!("/tmp/enchudb_ec_{}.db", tag);
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
     path
 }
 
 fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
 }
 

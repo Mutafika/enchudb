@@ -1636,6 +1636,7 @@ mod tests {
     }
 
     fn new_eng(path: &str, peer: PeerId) -> Arc<Engine> {
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(format!("{}.oplog", path));
         let _ = std::fs::remove_file(format!("{}.tables", path));
@@ -1677,6 +1678,7 @@ mod tests {
         assert_eq!(out2.applied, 0);
         assert_eq!(out2.skipped, 1);
 
+        let _ = std::fs::remove_dir_all(&path_a); // v10: DB は directory
         let _ = std::fs::remove_file(path_a);
     }
 
@@ -1743,6 +1745,7 @@ mod tests {
             Some(&b"REMOTE-VALUE"[..])
         );
 
+        let _ = std::fs::remove_dir_all(&path_a); // v10: DB は directory
         let _ = std::fs::remove_file(path_a);
     }
 
@@ -1770,6 +1773,7 @@ mod tests {
         let v = eng_a.get(local, "rows.val");
         assert_eq!(v, Some(42));
 
+        let _ = std::fs::remove_dir_all(&path_a); // v10: DB は directory
         let _ = std::fs::remove_file(path_a);
     }
 
@@ -1791,6 +1795,7 @@ mod tests {
         assert_eq!(out2.received, 1);
         assert_eq!(out2.applied, 1);
 
+        let _ = std::fs::remove_dir_all(&path_a); // v10: DB は directory
         let _ = std::fs::remove_file(path_a);
     }
 
@@ -1827,6 +1832,7 @@ mod tests {
         assert_eq!(recs_2.len(), recs_3.len(), "default filter should send same set to all peers");
         assert!(recs_2.iter().any(|r| matches!(r.op, DecodedOp::Tie { value: 42, .. })));
 
+        let _ = std::fs::remove_dir_all(&path_a); // v10: DB は directory
         let _ = std::fs::remove_file(path_a);
     }
 
@@ -1866,6 +1872,7 @@ mod tests {
         assert!(recs_3.iter().all(|r| !matches!(r.op, DecodedOp::Tie { value: 77, .. })),
             "peer 3 should not see value=77 (filter excludes)");
 
+        let _ = std::fs::remove_dir_all(&path_a); // v10: DB は directory
         let _ = std::fs::remove_file(path_a);
     }
 
@@ -1892,6 +1899,7 @@ mod tests {
         assert!(recs_5.iter().any(|r| matches!(r.op, DecodedOp::Tie { value: 99, .. })));
         assert!(recs_6.iter().all(|r| !matches!(r.op, DecodedOp::Tie { value: 99, .. })));
 
+        let _ = std::fs::remove_dir_all(&path_a); // v10: DB は directory
         let _ = std::fs::remove_file(path_a);
     }
 }
