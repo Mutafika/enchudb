@@ -32,6 +32,10 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
 - **sidecar は directory の中** (`{db}/tables` / `oplog` / `eidmap` / `vocabmap` / `crc` /
   `lock` / `schema`)。 `{db}.tables` のような隣置きは無い。 path 生成は
   `enchudb_engine::db_files` に集約 (schema / transport もこれを使う)
+  - ⚠️ **呼び出し側が DB root 直下に独自の file を置いていないか確認すること。** 上の 7 つと
+    名前が当たると壊れる。 実例: sinfo は CLI 直列化用の flock を `<db_dir>/lock` に置いており、
+    engine root を `<db_dir>` に素直化すると enchudb の `lock` と同じ file を掴んで即死する
+    (`<db_dir>/enchu.db` のような入れ子を維持していれば衝突しない)
 - `Engine::table_eid_range(name)` は **hull** (先頭 lo 〜 最後の hi) を返す。 auto-grow した
   table (下記) は間に他 table の eid を挟むので、 **scan は `table_eid_extents(name)`** で
 - **`define_table(name, size_hint)` の `size_hint` は硬い上限ではなくなった。** table が先頭
@@ -71,6 +75,14 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
 
 ### Fixed
 
+- **sidecar の mode が書き換えのたびに umask へ戻っていた。** `tables` / `eidmap` / `vocabmap` は
+  tmp write → rename で置き換わるので、 呼び出し側が `chmod 600` していても **rename で新しい
+  inode (0644) に化けていた**。 置き換え前の mode を tmp に写してから rename するようにした
+  (v9 以前からの挙動。 sinfo が「開くたびに 0600 を掛け直しているのに、 最後に書かれた sidecar
+  だけ 0644」という形で実測して判明。 新規作成時は従来どおり umask 依存)
+- **壊れた entity 領域で panic していた** (`bad entity set magic`)。 `EntitySet::load` が
+  `io::Result` を返すようになり、 `InvalidData` の Err になる (`corrupt_header_open` と同じ方針)。
+  v10 は `entities.seg` だけが欠ける / 短い状態が外から作れる (部分 copy、 rsync 中断)
 - **#243**: `enable_sync_tables()` は版数列 (`ver/*.seg`) と tombstone 列 (`tomb.seg`) を
   **その場で** 作る (独立 file なので mmap を張り替えずに足せる)。 「column は次の open から」
   の窓が消えた。 `Syncer::new` の hydrate 条件は crash 回収 / packed backing 用に残置
@@ -91,7 +103,10 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
 - 新規 test: `v10_dir_tests` (sidecar 配置 / copy / snapshot / migrate v8・v9・v7 拒否 /
   grow_entity_cap / free stack / table auto-grow / EXT1 永続 / 実 DB fixture)、
   `v10_cross_process_readonly` (別 process が readonly open、 後から足した himo も見える)、
-  `segment_map` (予約 / commit / refresh / ENOSPC)
+  `segment_map` (予約 / commit / refresh / ENOSPC)、
+  `v10_damage_probe` (segment 欠損 / truncate / sidecar 欠損を子 process で開いて、 signal 死・
+  panic しないこと)、 `v10_fd_budget` (`RLIMIT_NOFILE` を 64 / 128 / 512 に絞った子 process で
+  himo 200 本の DB を作り、 全値を読み直す)、 `sidecar_mode_preserved`
 - 実 DB: sinfohub の v8 `enchu.db` (clonefile した隔離 copy) を migrate → `open_readonly` で
   654 entity / 117 himo / 19 table を確認
 - **消費側 (tag 固定 v0.25.1 の app を `--config patch` で branch に差し替え、 repo の隔離 copy で)**:
@@ -100,7 +115,8 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
 - kenning (v0.25.1 pin): 素の状態で 30 passed / 4 failed。 落ちた 4 本は全部 kenning 側の
   1 ファイル前提 (`remove_file` で作り直し / dir の実消費 / cache prune / `is_dir` で dir と db を
   振り分け) で、 5 箇所直すと **34 / 34**。 patch は enchudb の `notes/requests/kenning-v10.patch`
-- **実 data の end-to-end**: `~/.sinfo` (global store、 v8、 25,061 entity / 258 himo / 40 table) と
+- **実 data の end-to-end**: `~/.sinfo/db` (v8、 25,061 entity / 258 himo / 40 table。 sinfo が 2026-08-08 に
+  per-project 化する前の旧 shared DB) と
   sinfohub の project store (654 entity) を clonefile で隔離 → `enchu --migrate-v10` (13 秒 / 6 秒、
   10 GB apparent → 82 MB / 4.8 MB) → **v10 で build した `sf`** の project / fsck / module list /
   tree / snap list / structure log / target list が、 **release 版 `sf 0.28.0` × 元の v8 copy と
@@ -207,6 +223,12 @@ grow 自体 (fstat / ftruncate / mmap ≈ 15 µs × 十数回) と page fault �
 - wasm `from_bytes` 経路は未確認 (packed 形式は v9 互換のまま)
 - 別 process の readonly reader は `grow_entity_cap` を次の open で見る
 - Windows の placeholder API (base 不動の予約) は未着手、 sparse whole-map で代用
+- **segment を外から truncate しても検出できない。** 「まだ触っていない region」 も 0 byte なので、
+  file 長だけでは切り詰めと区別できない (`himo/0000.seg` を 0 にすると open は通り、 その himo が
+  静かに空になる。 削除なら `NotFound` の Err)。 検出には header に per-segment の committed 長を
+  持つ必要がある。 同じ根で **「初期化が完了した DB か」 を consumer が判定する手段が無い**
+  (半端な directory も `Path::exists()` は true) — `Engine::exists(path)` の要望が来ている。
+  破損時に signal 死しないことは `tests/v10_damage_probe.rs` で gate 済み
 
 ## 0.25.1 — 2026-08-28
 
