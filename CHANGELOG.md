@@ -27,12 +27,22 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
   前に弾くので **src file を 1 byte も触らず**、 隣に sidecar も lock も作らない。
   `migrate_v9_to_v10` も src を読むだけで別 path に作る (= 失敗したらやり直せる、 旧 binary で
   そのまま開き直せる)。 v8 → v9 のような 「writer open で in-place に stamp」 は **無い**。
-  `tests/v10_legacy_open_is_read_only.rs` で hash / len / mtime / 隣接 file を gate。 offline で 1 回:
+  `tests/v10_legacy_open_is_read_only.rs` で hash / len / mtime / 隣接 file を gate。
+  - ⚠️ **逆向き (v9 以前の binary で v10 の DB を開く) は生の OS エラーになる**:
+    `Is a directory (os error 21)`。 版の不一致だと分からないので、 **binary の更新を DB の
+    移行より先に**行うこと。 特に 「PATH 上の旧 binary を subprocess で呼ぶ」 構成 (sinfo hub が
+    `sf` を呼ぶ形) は、 移行済みの DB に旧 binary が当たって止まる。 offline で 1 回:
   ```rust
   enchudb::Engine::migrate_v9_to_v10("old.db", "new.db")?;  // new.db は directory、 old.db は不変
   ```
   data の載っている範囲だけ写す (sparse を保つ)。 旧 sidecar (`old.db.tables` / `.oplog` /
   `.eidmap` / `.vocabmap` / `.schema` / `.crc`) は directory の中へ。 v7 以前は非対応
+  - 移行の前後で **`seal_integrity()` を通しておくことを勧める** (`.crc` を焼く)。 v10 は
+    「まだ書いていない segment」 も 0 byte なので、 **既定の open は segment の切り詰めを
+    検出できない**が、 封緘した DB は 0 byte / 部分 truncate / bit 反転を open 時の
+    `region CRC mismatch` で全部弾く (`tests/v10_segment_damage_matrix.rs`)。 退避する旧 DB と
+    移行先の両方を封緘しておけば、 「ロールバック用に残した DB が実は壊れていた」 を後から
+    検出できる。 全 region 走査なので秒オーダー、 常時オンにはしない前提の opt-in
 - **sidecar は directory の中** (`{db}/tables` / `oplog` / `eidmap` / `vocabmap` / `crc` /
   `lock` / `schema`)。 `{db}.tables` のような隣置きは無い。 path 生成は
   `enchudb_engine::db_files` に集約 (schema / transport もこれを使う)
@@ -46,6 +56,11 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
   range を使い切ると空き eid 空間から extent を自動で足す (下記)。 「N 件で `entity_in` が
   Err になる」 前提の test / 運用 (例: sinfo の `huge_scale_lifts_module_cap`、 enchudb 自身の
   `entity_in_returns_err_when_table_eid_range_exhausted`) は entity cap ごと尽きる shape に直す
+  - ⚠️ **`size_hint` を上限として読んでいる箇所が壊れる。** 実測された壊れ方: 監視ゲージの
+    分母に table の cap を使っていると、 **分子が分母を超えて 100% に張り付き、 まだ余裕が
+    あるのにゲージが意味を失う** (sinfo hub の `/admin/capacity` は `shard_cap("versions")` を
+    分母にしていて、 5,000 件が cap 2,000 の table に入った)。 上限として使えるのは
+    `reserve_entities()` (= 予約の天井) だけで、 それ以外は consumer 側で論理上限を別に持つこと
 - `Engine::migrate_file_v5_to_v6` / `_with_leaf` を撤去 (出力が 1 ファイルで v10 では開けない)。
   `migrate_bytes_v5_to_v6` と `MigrationStats` は残置
 - Windows: segment は sparse file を reservation 長で作る (`FSCTL_SET_SPARSE`)。 apparent は
@@ -66,12 +81,9 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
 - reservation は create 時に決まる: unix は `max(max_entities, 2^28)` (仮想空間だけ)、 Windows は
   `max_entities` (= 伸ばせない。 `GrowableOptions::reserve_entities` で明示)。 migrate した DB は
   既定の reservation を得る
-  - ⚠️ **`max_entities()` を「不変の定数」として読んでいる箇所は意味が変わる。** 実例が 3 つ
-    報告されている: 監視の分母 (`fill% = 使用 / max_entities` → cap が伸びると **何も解放して
-    いないのに使用率が下がり、 逼迫時に警報が鳴り止む**)、 capacity profile の逆写像
-    (`cap → Scale` を突き合わせて復元する処理が誤判定する)、 「N 件で頭打ち」 を仕様として
-    書いたテスト。 cap を跨いで比較する処理は `reserve_entities()` (上限) か、 論理的な
-    上限値を consumer 側で別に持つこと
+  - `max_entities()` は **table の auto-grow では動かない** (pool 内の空き eid から extent を
+    取るだけ)。 動くのは `grow_entity_cap` を明示的に呼んだ時だけ。 呼ぶ設計にするなら、
+    `cap → capacity profile` の逆写像で profile を復元している処理は誤判定しうる
 - **table は `entity_in` の枯渇時に空き eid 空間から extent を自動で切り足す。** 従来の
   `exhausted` は cap まで尽きたときだけ (message に `grow_entity_cap` を添える)。
   `Engine::grow_table(name, extra)` で明示も可。 sidecar `tables` に `EXT1` block が増える

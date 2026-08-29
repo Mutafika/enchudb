@@ -3860,7 +3860,10 @@ impl Engine {
         );
         report("ContentStore::load", &mut t, &mut p);
         let leaf = if layout.leaf_data_size > 0 {
-            Some(LeafStore::load(backing.region(SegmentKind::LeafData, &layout)))
+            Some(
+                LeafStore::load(backing.region(SegmentKind::LeafData, &layout))
+                    .map_err(|e| e.to_string())?,
+            )
         } else {
             None
         };
