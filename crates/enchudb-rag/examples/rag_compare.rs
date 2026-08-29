@@ -192,7 +192,7 @@ fn ns_to_us(ns: u128) -> f64 { ns as f64 / 1e3 }
 
 fn measure_enchu(ds: &Dataset, k: usize) -> Vec<Row> {
     let path = "/tmp/enchudb-rag-compare";
-    let _ = std::fs::remove_file(format!("{}.db", path));
+    let _ = enchudb::db_files::remove_db(format!("{}.db", path));
     let _ = std::fs::remove_file(format!("{}.vec", path));
 
     let mut store = RagStore::builder()

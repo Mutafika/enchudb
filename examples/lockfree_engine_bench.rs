@@ -59,9 +59,7 @@ fn rss_mb() -> u64 {
 }
 
 fn fresh(path: &str) {
-    for suf in ["", ".oplog", ".lock"] {
-        let _ = std::fs::remove_file(format!("{path}{suf}"));
-    }
+    let _ = enchudb::db_files::remove_db(&path);
 }
 
 /// entity cap は固定（growable は file 拡張のみ）。 scenario が作る総 entity 数を渡す。

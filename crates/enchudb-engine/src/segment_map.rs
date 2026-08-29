@@ -54,6 +54,54 @@ pub(crate) fn runtime_page_size() -> usize {
     ps
 }
 
+/// process 全体の grow 回数 / 所要時間 (bench / 診断用)。 grow は稀な経路なので atomic 2 本で十分。
+static GROW_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GROW_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct GrowTimer(std::time::Instant);
+impl GrowTimer {
+    fn start() -> Self {
+        Self(std::time::Instant::now())
+    }
+}
+impl Drop for GrowTimer {
+    fn drop(&mut self) {
+        GROW_COUNT.fetch_add(1, Ordering::Relaxed);
+        GROW_NANOS.fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+/// これまでの segment commit 伸長 (`grow_to`、 fast path を除く) の (回数, 合計 ns)。
+pub fn grow_stats() -> (u64, u64) {
+    (GROW_COUNT.load(Ordering::Relaxed), GROW_NANOS.load(Ordering::Relaxed))
+}
+
+/// `open` が EMFILE (process の fd soft limit) で落ちたら、 soft limit を hard limit
+/// (macOS の unlimited は `OPEN_MAX` 相当の 10240) まで上げて 1 回だけ retry する。
+/// GUI app は launchd 既定で soft 256 なので、 himo 250 本超の DB を writer で開くと
+/// ここを通る。 上げられなければ元の error をそのまま返す。
+fn open_with_fd_retry(open: impl Fn() -> io::Result<File>) -> io::Result<File> {
+    match open() {
+        Err(e) if e.raw_os_error() == Some(libc::EMFILE) && raise_fd_limit() => open(),
+        other => other,
+    }
+}
+
+/// RLIMIT_NOFILE の soft limit を上げる。 上がったら true。
+fn raise_fd_limit() -> bool {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return false;
+    }
+    const OPEN_MAX_FALLBACK: libc::rlim_t = 10240;
+    let target = if lim.rlim_max == libc::RLIM_INFINITY { OPEN_MAX_FALLBACK } else { lim.rlim_max };
+    if target <= lim.rlim_cur {
+        return false;
+    }
+    lim.rlim_cur = target;
+    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) == 0 }
+}
+
 pub(crate) fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
 }
@@ -87,6 +135,15 @@ pub struct SegmentMap {
     dirty_hi: AtomicUsize,
     space_margin: AtomicU64,
     space_denials: AtomicU64,
+    /// writer は fd を持ち続ける (reader は `None`、 refresh で都度 open)。
+    ///
+    /// macOS は **dirty な mmap page を持つ file を write fd で close すると、 その場で
+    /// dirty page を書き戻す** (close = 暗黙の msync)。 grow のたびに open / close していた
+    /// 旧実装は、 順次 write 中に同じ page を何度もディスクへ書き直していた (grow 1 回
+    /// ~100 µs、 cold tie が 0.25.1 の eager DB 比 -25%)。 fd を持てば close は Drop の
+    /// 1 回だけ。 fd 数は segment 数 (≈ himo 数 + 10) で、 soft limit に当たったら
+    /// `raise_fd_limit` で上げて 1 回だけ retry する。
+    file: Option<File>,
 }
 
 unsafe impl Send for SegmentMap {}
@@ -107,11 +164,9 @@ impl SegmentMap {
     /// 新規 segment file を作る。 既に存在すれば `AlreadyExists`。
     /// `initial` byte まで commit した状態で返す (page 切り上げ)。
     pub fn create(path: &Path, reserve: usize, initial: usize) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)?;
+        let file = open_with_fd_retry(|| {
+            OpenOptions::new().read(true).write(true).create_new(true).open(path)
+        })?;
         let ps = runtime_page_size();
         let reserve = align_up(reserve.max(ps), ps);
         let initial = align_up(initial.max(ps), ps);
@@ -125,7 +180,7 @@ impl SegmentMap {
     /// 既存 segment file を開く。 commit はファイルの現在長 (page 切り上げ)。
     /// `readonly` なら `PROT_READ` で貼り、 伸長 API は `PermissionDenied`。
     pub fn open(path: &Path, reserve: usize, readonly: bool) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(!readonly).open(path)?;
+        let file = open_with_fd_retry(|| OpenOptions::new().read(true).write(!readonly).open(path))?;
         let ps = runtime_page_size();
         let reserve = align_up(reserve.max(ps), ps);
         let len = file.metadata()?.len() as usize;
@@ -189,8 +244,8 @@ impl SegmentMap {
             unsafe { libc::munmap(base, reserve) };
             return Err(e);
         }
-        // fd はここで閉じる (mapping は生き続ける)。
-        drop(file);
+        // writer は fd を持ち続ける (struct doc 参照)。 reader は閉じる (mapping は生き続ける)。
+        let file = if readonly { None } else { Some(file) };
         Ok(Self {
             path,
             base: base as *mut u8,
@@ -202,6 +257,7 @@ impl SegmentMap {
             dirty_hi: AtomicUsize::new(0),
             space_margin: AtomicU64::new(SPACE_MARGIN),
             space_denials: AtomicU64::new(0),
+            file,
         })
     }
 
@@ -209,18 +265,24 @@ impl SegmentMap {
         OpenOptions::new().read(true).write(!self.readonly).open(&self.path)
     }
 
-    /// [0..end) を file-backed で貼り直す (lock 下で呼ぶこと)。
+    /// commit を `end` まで伸ばす: **伸びた分 [cur..end) だけ** file-backed で貼る
+    /// (lock 下で呼ぶこと)。 [0..cur) は既に file-backed なので触らない — 貼り直すと
+    /// 触った page が全部 unmap → 再 fault になり、 順次 write で cold tie が遅くなる。
     fn remap_to(&self, file: &File, end: usize) -> io::Result<()> {
         use std::os::unix::io::AsRawFd;
         debug_assert!(end <= self.reserved);
+        let cur = self.committed.load(Ordering::Acquire);
+        if end <= cur {
+            return Ok(());
+        }
         let r = unsafe {
             libc::mmap(
-                self.base as *mut _,
-                end,
+                self.base.add(cur) as *mut _,
+                end - cur,
                 Self::prot(self.readonly),
                 libc::MAP_FIXED | libc::MAP_SHARED,
                 file.as_raw_fd(),
-                0,
+                cur as libc::off_t,
             )
         };
         if r == libc::MAP_FAILED {
@@ -239,6 +301,7 @@ impl SegmentMap {
         if aligned <= self.committed.load(Ordering::Acquire) {
             return Ok(());
         }
+        let _t = GrowTimer::start();
         if self.readonly {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -256,7 +319,14 @@ impl SegmentMap {
                 format!("grow {aligned} exceeds reservation {} ({})", self.reserved, self.path.display()),
             ));
         }
-        let file = self.reopen()?;
+        let reopened;
+        let file: &File = match &self.file {
+            Some(f) => f,
+            None => {
+                reopened = self.reopen()?;
+                &reopened
+            }
+        };
         let file_len = file.metadata()?.len();
         if file_len < aligned as u64 {
             use std::os::unix::io::AsRawFd;
@@ -276,10 +346,15 @@ impl SegmentMap {
             }
             file.set_len(aligned as u64)?;
         }
-        self.remap_to(&file, aligned)
+        self.remap_to(file, aligned)
     }
 
-    /// amortized 伸長 (`GrowableMap::grow_amortized` と同じ hybrid 戦略)。
+    /// amortized 伸長: 幾何級数 (×2、 最低 +64 KB、 1 回の伸びは `MAX_GROW_STEP` = 16 MB まで)。
+    ///
+    /// grow 1 回は fstat / fstatfs / ftruncate / mmap で数十 µs なので回数を O(log n) に抑える。
+    /// 伸ばすのは **apparent** (sparse の見かけ) だけで、 physical は触った page 分しか増えない。
+    /// 旧 `GrowableMap` の 「1 MB 超は +1 MB 線形」 は 64 MB column で 60 回 grow していた。
+    /// step の上限は #167 の空き容量 guard (step 分の空きを要求) を緩めすぎないため。
     pub fn grow_amortized(&self, needed: usize) -> io::Result<()> {
         let ps = runtime_page_size();
         let cur = self.committed.load(Ordering::Acquire);
@@ -287,15 +362,10 @@ impl SegmentMap {
         if needed_aligned <= cur {
             return Ok(());
         }
-        const SMALL_THRESHOLD: usize = 1024 * 1024;
-        const LINEAR_CHUNK: usize = 1024 * 1024;
-        let target = if cur < SMALL_THRESHOLD {
-            let doubled = cur.saturating_mul(2).max(cur + 64 * 1024);
-            doubled.max(needed_aligned)
-        } else {
-            (cur + LINEAR_CHUNK).max(needed_aligned)
-        }
-        .min(self.reserved);
+        const MIN_GROW_STEP: usize = 64 * 1024;
+        const MAX_GROW_STEP: usize = 16 * 1024 * 1024;
+        let step = cur.max(MIN_GROW_STEP).min(MAX_GROW_STEP);
+        let target = cur.saturating_add(step).max(needed_aligned).min(self.reserved);
         if target < needed_aligned {
             return Err(io::Error::new(io::ErrorKind::OutOfMemory, "needed exceeds reservation"));
         }
@@ -307,7 +377,14 @@ impl SegmentMap {
     /// 戻り値は追従後の commit。
     pub fn refresh(&self) -> io::Result<usize> {
         let _g = self.grow_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let file = self.reopen()?;
+        let reopened;
+        let file: &File = match &self.file {
+            Some(f) => f,
+            None => {
+                reopened = self.reopen()?;
+                &reopened
+            }
+        };
         let len = file.metadata()?.len() as usize;
         let ps = runtime_page_size();
         let target = align_up(len.max(ps), ps).min(self.reserved);
@@ -315,7 +392,7 @@ impl SegmentMap {
         if target <= cur {
             return Ok(cur);
         }
-        self.remap_to(&file, target)?;
+        self.remap_to(file, target)?;
         Ok(target)
     }
 
@@ -394,19 +471,27 @@ impl SegmentMap {
         self.flush(0, self.committed())
     }
 
+    /// 書いた範囲を記録する (`flush_dirty` がその範囲だけ msync する)。
+    ///
+    /// 範囲は **page 単位に丸めて** 持つ。 msync はどうせ page 単位なので情報は落ちず、
+    /// 順次 write (tie を eid 順に並べる典型) で cell ごとに `fetch_max` を踏むのが
+    /// page 跨ぎの時だけになる (v10 は全 DB が segment 経由なので、 ここが 0.25.1 の
+    /// eager DB (= no-op) に対して write hot path の差分だった: 順次 tie 35 → 26 M/s)。
     #[inline]
     pub fn mark_dirty(&self, offset: usize, len: usize) {
         if len == 0 {
             return;
         }
-        let end = offset + len;
-        if self.dirty_lo.load(Ordering::Relaxed) <= offset
-            && self.dirty_hi.load(Ordering::Relaxed) >= end
+        let ps = runtime_page_size();
+        let lo = offset & !(ps - 1);
+        let hi = align_up(offset + len, ps);
+        if self.dirty_lo.load(Ordering::Relaxed) <= lo
+            && self.dirty_hi.load(Ordering::Relaxed) >= hi
         {
             return;
         }
-        self.dirty_lo.fetch_min(offset, Ordering::Release);
-        self.dirty_hi.fetch_max(end, Ordering::Release);
+        self.dirty_lo.fetch_min(lo, Ordering::Release);
+        self.dirty_hi.fetch_max(hi, Ordering::Release);
     }
 
     /// 直近 `mark_dirty` の範囲だけ msync して reset。

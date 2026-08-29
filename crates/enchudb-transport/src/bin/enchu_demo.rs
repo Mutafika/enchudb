@@ -161,10 +161,7 @@ fn cmd_replica(opts: &HashMap<String, String>) {
     // bootstrap: origin から DB を download
     if std::path::Path::new(&db).exists() {
         println!("[replica] removing existing {}", db);
-        let _ = std::fs::remove_dir_all(&db); // v10: DB は directory
-        let _ = std::fs::remove_file(&db);
-        let _ = std::fs::remove_file(format!("{}.oplog", db));
-        let _ = std::fs::remove_file(format!("{}.crc", db));
+        let _ = enchudb::db_files::remove_db(&db);
     }
 
     println!("[replica] bootstrapping from {}", origin_url);
@@ -175,8 +172,8 @@ fn cmd_replica(opts: &HashMap<String, String>) {
         std::process::exit(1);
     });
     let bootstrap_time = t0.elapsed();
-    let db_size = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
-    println!("[replica] bootstrapped in {:?} (file size {}MB, snapshot HLC {:?})",
+    let db_size = enchudb::db_files::disk_usage(&db).apparent;
+    println!("[replica] bootstrapped in {:?} (db apparent size {}MB, snapshot HLC {:?})",
         bootstrap_time, db_size / (1 << 20), initial_hlc);
 
     // replica として open

@@ -18,10 +18,7 @@ use enchudb::schema::{Database, Value};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("/tmp/enchudb-pattern-a-{}.ecdb", std::process::id());
-    let _ = std::fs::remove_file(&path);
-    for suf in &[".oplog", ".tables", ".crc", ".db.lock"] {
-        let _ = std::fs::remove_file(format!("{}{}", path, suf));
-    }
+    let _ = enchudb::db_files::remove_db(&path);
 
     // server DB を作る (= 全 tenant の table を 1 DB に持つ)。 build phase で
     // schema + sync を整え、 finish_with_oplog で concurrent + WAL モードに遷移。
@@ -91,9 +88,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  transferred: {transferred} record(s)");
     println!("  current_sync_lsn: {}", arc_db.engine().current_sync_lsn());
 
-    let _ = std::fs::remove_file(&path);
-    for suf in &[".oplog", ".tables", ".crc", ".db.lock"] {
-        let _ = std::fs::remove_file(format!("{}{}", path, suf));
-    }
+    let _ = enchudb::db_files::remove_db(&path);
     Ok(())
 }

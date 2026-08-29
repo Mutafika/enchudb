@@ -52,14 +52,14 @@ fn tmp(tag: &str) -> String {
             .unwrap()
             .as_nanos()
     );
-    for suffix in ["", ".oplog", ".crc"] {
-        let _ = std::fs::remove_file(format!("{}{}", p, suffix));
-    }
+    cleanup(&p);
     p
 }
 
+/// v10 の DB は directory (sidecar も中)。 v9 以前の `{path}.oplog` 等も念のため消す。
 fn cleanup(path: &str) {
-    for suffix in ["", ".oplog", ".crc"] {
+    let _ = std::fs::remove_dir_all(path);
+    for suffix in ["", ".oplog", ".crc", ".tables"] {
         let _ = std::fs::remove_file(format!("{}{}", path, suffix));
     }
 }
@@ -197,10 +197,7 @@ fn bench_snapshot_export(c: &mut Criterion) {
             |target| {
                 let files = eng.snapshot_export(black_box(&target)).unwrap();
                 black_box(&files);
-                // cleanup
-                for suffix in ["", ".oplog", ".crc"] {
-                    let _ = std::fs::remove_file(format!("{}{}", target, suffix));
-                }
+                cleanup(&target);
             },
             BatchSize::SmallInput,
         );
@@ -469,7 +466,6 @@ fn bench_scale_tables(c: &mut Criterion) {
     group2.finish();
 
     cleanup(&path);
-    let _ = std::fs::remove_file(format!("{}.tables", path));
 }
 
 // ─────────────────────────────────────────────────────────────

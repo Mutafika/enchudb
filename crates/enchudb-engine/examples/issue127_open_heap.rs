@@ -53,11 +53,7 @@ fn mb(n: usize) -> f64 {
 use enchudb_engine::{Engine, GrowableOptions, ValueType};
 
 fn build_db(path: &str, vocab_knob: Option<u32>) {
-    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
-    let _ = std::fs::remove_file(path);
-    for sfx in [".tables", ".crc", ".db.lock", ".oplog", ".schema", ".eidmap", ".vocabmap"] {
-        let _ = std::fs::remove_file(format!("{}{}", path, sfx));
-    }
+    let _ = enchudb_engine::db_files::remove_db(&path);
     let opts = GrowableOptions {
         max_entities: 1_000_000,
         vocab_max_entries: vocab_knob,
@@ -119,5 +115,5 @@ fn main() {
         println!();
     }
 
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = enchudb_engine::db_files::remove_db(&dir);
 }

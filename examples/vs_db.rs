@@ -49,13 +49,9 @@ fn main() {
     let sqlite_path = "/tmp/vs_db_sqlite.sqlite";
     let duck_path = "/tmp/vs_db_duck.duckdb";
     let lmdb_dir = "/tmp/vs_db_lmdb";
-    let _ = std::fs::remove_file(enchu_path);
+    let _ = enchudb::db_files::remove_db(&enchu_path);
     let _ = std::fs::remove_file(sqlite_path);
     let _ = std::fs::remove_file(duck_path);
-    let _ = std::fs::remove_file(format!("{}.oplog", enchu_path));
-    let _ = std::fs::remove_file(format!("{}.tables", enchu_path));
-    let _ = std::fs::remove_file(format!("{}.crc", enchu_path));
-    let _ = std::fs::remove_file(format!("{}.db.lock", enchu_path));
     let _ = std::fs::remove_dir_all(lmdb_dir);
 
     // ── EnchuDB セットアップ (schema 層) ──
@@ -518,13 +514,9 @@ fn main() {
     // cleanup
     drop(rtxn);
     drop(env);
-    let _ = std::fs::remove_file(enchu_path);
+    let _ = enchudb::db_files::remove_db(&enchu_path);
     let _ = std::fs::remove_file(sqlite_path);
     let _ = std::fs::remove_file(duck_path);
-    let _ = std::fs::remove_file(format!("{}.oplog", enchu_path));
-    let _ = std::fs::remove_file(format!("{}.tables", enchu_path));
-    let _ = std::fs::remove_file(format!("{}.crc", enchu_path));
-    let _ = std::fs::remove_file(format!("{}.db.lock", enchu_path));
     let _ = std::fs::remove_dir_all(lmdb_dir);
 }
 

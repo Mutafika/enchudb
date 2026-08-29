@@ -50,9 +50,7 @@ fn snap(label: &str, t0: Instant) {
 fn main() {
     let n: u32 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(5_000_000);
     let path = "/tmp/enchudb_workload_sparse.db";
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{}.crc", path));
-    let _ = std::fs::remove_file(format!("{}.oplog", path));
+    let _ = enchudb::db_files::remove_db(&path);
 
     let t0 = Instant::now();
     snap("baseline", t0);
@@ -104,11 +102,9 @@ fn main() {
         println!("  {:<8}: cardinality = {}", name, len);
     }
 
-    let meta = std::fs::metadata(path).unwrap();
-    println!("\nfile apparent size: {:.1} MB", meta.len() as f64 / 1024.0 / 1024.0);
+    let usage = enchudb::db_files::disk_usage(path);
+    println!("\ndb apparent size: {:.1} MB (physical {:.1} MB)", usage.apparent_mb(), usage.physical_mb());
     snap("end", t0);
 
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{}.crc", path));
-    let _ = std::fs::remove_file(format!("{}.oplog", path));
+    let _ = enchudb::db_files::remove_db(&path);
 }

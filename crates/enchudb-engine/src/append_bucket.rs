@@ -227,7 +227,8 @@ impl AppendBucket {
         f(slice)
     }
 
-    /// snapshot コピー（standalone 用、 内部で pin）。
+    /// snapshot コピー（test 用、 内部で pin）。
+    #[cfg(test)]
     pub fn read_to_vec(&self) -> Vec<u32> {
         let guard = epoch::pin();
         self.with_read(&guard, |s| s.to_vec())

@@ -2,7 +2,7 @@
 
 **Embedded graph engine with multi-condition AND in nanoseconds.**
 
-An embedded database built around a *himo* (紐, "cord")-based cylinder engine. Single-file mmap, and a LockFreeCylinder (value → eid buckets) makes the **lookup decision ns-scale** with lock-free concurrent reads. Returning results is memcpy-bound and proportional to result size (µs scale — the physical floor).
+An embedded database built around a *himo* (紐, "cord")-based cylinder engine. A directory of mmap-backed segment files (one per himo), and a LockFreeCylinder (value → eid buckets) makes the **lookup decision ns-scale** with lock-free concurrent reads. Returning results is memcpy-bound and proportional to result size (µs scale — the physical floor).
 
 On top of it you can stack **schema / SQL / FFI / full-text search / RAG / P2P sync / transport**, all in one workspace.
 
@@ -265,10 +265,18 @@ belongs to the DB lives inside it — `mv`, `rm -r` and `cp -r` move the whole t
 ```
 
 Every segment file is mapped on top of a large private reservation, so its base
-pointer never moves while it grows: a segment starts at 4 KB and is committed page by
-page as you write. The per-cell version regions are created by `enable_sync_tables()`
+pointer never moves while it grows: a segment starts at one page and its commit grows
+geometrically as you write (only the *apparent* size grows; blocks are allocated for the
+pages you touch). The per-cell version regions are created by `enable_sync_tables()`
 **immediately** (they are separate files, so nothing has to be remapped) and a DB that
 never syncs simply does not have them.
+
+**File descriptors.** A writer keeps one fd open per segment file (≈ number of himos + 10)
+for the lifetime of the handle — reopening on every growth step made macOS write the
+dirty pages back on each `close`, which cost 25% of sequential write throughput. Readers
+(`open_readonly`) keep no fds. If the process hits its soft `RLIMIT_NOFILE` (launchd gives
+GUI apps 256), enchudb raises the soft limit to the hard limit once and retries;
+`db_files::remove_db` / `disk_usage` are the helpers for deleting and measuring a DB.
 
 **Single-file databases (v8 / v9, up to 0.25.x) are not opened by this build.** Convert
 them once, offline, with

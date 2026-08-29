@@ -1226,6 +1226,25 @@ fn copy_db_dir_filtered(
     keep: &dyn Fn(&std::ffi::OsStr) -> bool,
 ) -> io::Result<()> {
     use crate::sparse_copy::copy_sparse;
+    // macOS / APFS: directory ごと 1 syscall で clone できる (file 単位の clonefile は
+    // 1 本 ~100 µs で、 himo 200 本の DB を snapshot すると 20 ms 超)。 clone 後に
+    // `keep` から漏れる top level entry (lock / sidecar 等) を消す。 dst が既にある /
+    // 別 volume / 非 APFS なら file 単位に落ちる。
+    #[cfg(target_os = "macos")]
+    if clone_dir_apfs(src, dst).is_ok() {
+        for entry in std::fs::read_dir(dst)? {
+            let entry = entry?;
+            if !keep(&entry.file_name()) {
+                let p = entry.path();
+                if entry.file_type()?.is_dir() {
+                    std::fs::remove_dir_all(&p)?;
+                } else {
+                    std::fs::remove_file(&p)?;
+                }
+            }
+        }
+        return Ok(());
+    }
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -1239,6 +1258,18 @@ fn copy_db_dir_filtered(
         } else {
             copy_sparse(&from, &to)?;
         }
+    }
+    Ok(())
+}
+
+/// APFS の `clonefile(2)` で directory を丸ごと clone する (dst は存在しないこと)。
+#[cfg(target_os = "macos")]
+fn clone_dir_apfs(src: &std::path::Path, dst: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let s = std::ffi::CString::new(src.as_os_str().as_bytes())?;
+    let d = std::ffi::CString::new(dst.as_os_str().as_bytes())?;
+    if unsafe { libc::clonefile(s.as_ptr(), d.as_ptr(), 0) } != 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -1456,13 +1487,11 @@ const FILE_VERSION_LEGACY_V9: u32 = 9;
 /// v8 (0.15.0〜0.18.x)。 v9 binary で writer open すると version stamp は 9 に上がる
 /// (layout は変わらない — v9 領域は `H_CELL_VERSION` flag で管理)。
 const FILE_VERSION_LEGACY_V8: u32 = 8;
-/// v7 (0.13.0〜0.14.x)。 writer open で v8 へ透過 migrate する (index も同時に VIX3 化)。
+/// v7 (0.13.0〜0.14.x)。 v10 は v8 以降しか migrate しないので、 「拒否される」 test でだけ使う。
+#[cfg(test)]
 const FILE_VERSION_LEGACY_V7: u32 = 7;
-/// v4 DB を後方互換で open する識別子。 v4 → v5 migrate は open 時透過。
-const FILE_VERSION_LEGACY_V5: u32 = 5;
-const FILE_VERSION_LEGACY_V4: u32 = 4;
-/// v6 (0.12.0, #88): byte-offset LeafStore。 v7 engine が read-through で open
-/// (leaf off_shift=0)。 v5→v6 migration の出力 version でもある。
+/// v6 (0.12.0, #88): byte-offset LeafStore。 `migrate_bytes_v5_to_v6` の出力 version
+/// (v4 / v5 の定数は v10 で撤去。 v7 以前の file は 0.25.x で v8 に上げてから v10 へ)。
 const FILE_VERSION_LEGACY_V6: u32 = 6;
 const HEADER_SIZE: usize = 4096;
 
@@ -1602,6 +1631,7 @@ const H_PEER_ID: usize = 68; // u32
 /// Backing kind flag (u32). 0 = EAGER (default, also legacy zero-fill), 1 = GROWABLE.
 /// 用途: `validate_file_size` で auto-extend を許すか strict check するかの分岐のみ。
 /// CRC 保護外。 accidental truncation 検出が目的、 adversarial tampering は対象外。
+#[allow(dead_code)] // v9 header の layout 記録 (offset 76 は予約のまま)。 v10 は backing 種別を持たない
 const H_BACKING_KIND: usize = 76; // u32
 /// v6 (0.12.0, #88): LeafStore data region size (u64)。 0 = leaf region 無し
 /// (pre-v6 DB)。 CRC 保護外 (H_PEER_ID / H_BACKING_KIND と同様、 破損は
@@ -1627,6 +1657,7 @@ fn default_reserve_entities(max_entities: u32) -> u32 {
     if cfg!(windows) { max_entities } else { max_entities.max(DEFAULT_RESERVE_ENTITIES) }
 }
 
+#[allow(dead_code)] // 同上 (v9 growable の識別値)
 const BACKING_KIND_GROWABLE: u32 = 1;
 const H_HIMO_TYPES: usize = 256;
 

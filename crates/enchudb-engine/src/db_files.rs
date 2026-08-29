@@ -8,6 +8,7 @@
 //! (`crate::segments::SegmentKind::rel_path`)。 両者は名前だけで区別できる。
 
 use std::ffi::OsStr;
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// WAL (`enchudb_oplog::OpLog`)。
@@ -75,6 +76,90 @@ fn with_suffix(p: &Path, sfx: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// v9 以前の writer lock (`{db_file}.db.lock`)。 `remove_db` の掃除用。
+fn legacy_lock_path_for(db_file: &str) -> PathBuf {
+    PathBuf::from(format!("{db_file}.db.lock"))
+}
+
+/// DB を丸ごと消す。 v10 の directory も、 legacy (v9 以前) の単一 file + `{path}.oplog` 等の
+/// sidecar も消す。 無ければ何もしない (Ok)。 example / test / tool の 「前回の残骸を掃除」 用。
+pub fn remove_db(db_path: impl AsRef<Path>) -> io::Result<()> {
+    let db = db_path.as_ref();
+    match std::fs::symlink_metadata(db) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(db)?,
+        Ok(_) => std::fs::remove_file(db)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let s = db.to_string_lossy();
+    for name in ALL {
+        ignore_not_found(std::fs::remove_file(legacy_path_for(&s, name)))?;
+    }
+    ignore_not_found(std::fs::remove_file(legacy_lock_path_for(&s)))
+}
+
+fn ignore_not_found(r: io::Result<()>) -> io::Result<()> {
+    match r {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// DB の disk 使用量 (bytes)。 `apparent` は見かけ (sparse の穴込み、 `ls -l` の合計)、
+/// `physical` は実際に block を持つ分 (`du` 相当。 unix は `st_blocks * 512`、 それ以外は
+/// apparent と同じ)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiskUsage {
+    pub apparent: u64,
+    pub physical: u64,
+}
+
+impl DiskUsage {
+    pub fn apparent_mb(&self) -> f64 {
+        self.apparent as f64 / (1024.0 * 1024.0)
+    }
+    pub fn physical_mb(&self) -> f64 {
+        self.physical as f64 / (1024.0 * 1024.0)
+    }
+}
+
+/// v10 directory (中身を再帰) または legacy 単一 file + sidecar の合計 disk 使用量。 無ければ 0。
+pub fn disk_usage(db_path: impl AsRef<Path>) -> DiskUsage {
+    let db = db_path.as_ref();
+    let mut u = DiskUsage::default();
+    accumulate_usage(db, &mut u);
+    let s = db.to_string_lossy();
+    for name in ALL {
+        accumulate_usage(&legacy_path_for(&s, name), &mut u);
+    }
+    u
+}
+
+fn accumulate_usage(p: &Path, u: &mut DiskUsage) {
+    let Ok(m) = std::fs::symlink_metadata(p) else { return };
+    if m.is_dir() {
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                accumulate_usage(&e.path(), u);
+            }
+        }
+    } else {
+        u.apparent += m.len();
+        u.physical += physical_bytes(&m);
+    }
+}
+
+#[cfg(unix)]
+fn physical_bytes(m: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    m.blocks() * 512
+}
+
+#[cfg(not(unix))]
+fn physical_bytes(m: &std::fs::Metadata) -> u64 {
+    m.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,5 +185,35 @@ mod tests {
         assert!(!is_copyable_entry(OsStr::new("lock")));
         assert!(!is_copyable_entry(OsStr::new("tables.tmp")));
         assert!(!is_copyable_entry(OsStr::new("a.bootstrap.packed")));
+    }
+
+    #[test]
+    fn remove_db_and_disk_usage_cover_dir_and_legacy_layout() {
+        let root = std::env::temp_dir().join(format!("enchu_db_files_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // v10 layout: directory
+        let v10 = root.join("v10.db");
+        std::fs::create_dir_all(v10.join("himo")).unwrap();
+        std::fs::write(v10.join("header.seg"), vec![1u8; 4096]).unwrap();
+        std::fs::write(v10.join("himo").join("0000.seg"), vec![2u8; 8192]).unwrap();
+        let u = disk_usage(&v10);
+        assert_eq!(u.apparent, 4096 + 8192);
+        assert!(u.physical >= u.apparent, "physical {} < apparent {}", u.physical, u.apparent);
+        remove_db(&v10).unwrap();
+        assert!(!v10.exists());
+        // legacy layout: file + sidecars
+        let v9 = root.join("v9.db");
+        let v9s = v9.to_string_lossy().to_string();
+        std::fs::write(&v9, vec![0u8; 100]).unwrap();
+        std::fs::write(legacy_path_for(&v9s, OPLOG), vec![0u8; 10]).unwrap();
+        std::fs::write(legacy_lock_path_for(&v9s), b"").unwrap();
+        assert_eq!(disk_usage(&v9).apparent, 110);
+        remove_db(&v9).unwrap();
+        assert!(!v9.exists() && !legacy_path_for(&v9s, OPLOG).exists() && !legacy_lock_path_for(&v9s).exists());
+        // 無いものを消しても Ok
+        remove_db(&v9).unwrap();
+        assert_eq!(disk_usage(&v9), DiskUsage::default());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

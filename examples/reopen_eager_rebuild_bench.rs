@@ -43,9 +43,7 @@ fn main() {
     let entities: u32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(100_000);
 
     let path = format!("/tmp/enchudb_reopen_bench_{}_{}.db", himos, entities);
-    for ext in &["", ".oplog", ".crc", ".lock"] {
-        let _ = std::fs::remove_file(format!("{path}{ext}"));
-    }
+    let _ = enchudb::db_files::remove_db(&path);
 
     println!("config: {} himos × {} entities", himos, entities);
     println!("rss(baseline) = {} MB", rss_mb());
@@ -109,7 +107,5 @@ fn main() {
     drop(eng);
 
     // ─── cleanup ───
-    for ext in &["", ".oplog", ".crc", ".lock"] {
-        let _ = std::fs::remove_file(format!("{path}{ext}"));
-    }
+    let _ = enchudb::db_files::remove_db(&path);
 }

@@ -26,6 +26,15 @@ use std::ptr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use memmap2::{MmapMut, MmapOptions};
+
+/// unix 版 (`segment_map::grow_stats`) との API parity。 Windows は grow に syscall が無い
+/// (reserve 全体を最初から map する) ので回数だけ数え、 時間は 0。
+static GROW_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// これまでの segment commit 伸長要求の (回数, 合計 ns)。
+pub fn grow_stats() -> (u64, u64) {
+    (GROW_COUNT.load(Ordering::Relaxed), 0)
+}
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
@@ -197,6 +206,7 @@ impl SegmentMap {
     }
 
     pub fn grow_amortized(&self, needed: usize) -> io::Result<()> {
+        GROW_COUNT.fetch_add(1, Ordering::Relaxed);
         self.grow_to(needed)
     }
 
@@ -259,17 +269,20 @@ impl SegmentMap {
         self.flush(0, self.map.len())
     }
 
+    /// unix 版と同じく page 単位に丸めて持つ (順次 write で cell ごとに RMW を踏まない)。
     #[inline]
     pub fn mark_dirty(&self, offset: usize, len: usize) {
         if len == 0 {
             return;
         }
-        let end = offset + len;
-        if self.dirty_lo.load(Ordering::Relaxed) <= offset && self.dirty_hi.load(Ordering::Relaxed) >= end {
+        const PAGE: usize = 4096;
+        let lo = offset & !(PAGE - 1);
+        let hi = (offset + len + PAGE - 1) & !(PAGE - 1);
+        if self.dirty_lo.load(Ordering::Relaxed) <= lo && self.dirty_hi.load(Ordering::Relaxed) >= hi {
             return;
         }
-        self.dirty_lo.fetch_min(offset, Ordering::Release);
-        self.dirty_hi.fetch_max(end, Ordering::Release);
+        self.dirty_lo.fetch_min(lo, Ordering::Release);
+        self.dirty_hi.fetch_max(hi, Ordering::Release);
     }
 
     pub fn flush_dirty(&self) -> io::Result<()> {

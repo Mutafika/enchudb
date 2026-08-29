@@ -20,10 +20,7 @@ fn open_or_create_local_db(device: &str)
     -> Result<Arc<enchudb::schema::Database>, Box<dyn std::error::Error>>
 {
     let path = format!("/tmp/enchudb-pattern-c-{}-{}.ecdb", device, std::process::id());
-    let _ = std::fs::remove_file(&path);
-    for suf in &[".oplog", ".tables", ".crc", ".db.lock"] {
-        let _ = std::fs::remove_file(format!("{}{}", path, suf));
-    }
+    let _ = enchudb::db_files::remove_db(&path);
 
     let mut db = Database::create(&path)?;
     let _ = db.table("notes")
@@ -42,10 +39,7 @@ fn open_or_create_local_db(device: &str)
 
 fn cleanup(device: &str) {
     let path = format!("/tmp/enchudb-pattern-c-{}-{}.ecdb", device, std::process::id());
-    let _ = std::fs::remove_file(&path);
-    for suf in &[".oplog", ".tables", ".crc", ".db.lock"] {
-        let _ = std::fs::remove_file(format!("{}{}", path, suf));
-    }
+    let _ = enchudb::db_files::remove_db(&path);
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

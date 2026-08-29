@@ -43,6 +43,14 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
 - Windows: segment は sparse file を reservation 長で作る (`FSCTL_SET_SPARSE`)。 apparent は
   reservation 分出る (physical は触った分)。 runtime 検証は未 (compile check のみ)
 
+### Added — 小物
+
+- `enchudb::db_files::remove_db(path)` / `disk_usage(path) -> DiskUsage { apparent, physical }`:
+  DB が directory になったので、 「前回の残骸を消す」 「サイズを測る」 を 1 行で。 legacy
+  (単一 file + `{path}.oplog` 等) も同じ関数で扱える。 examples / bin (30 本) は全部これに置換
+- `enchudb::segment_map::grow_stats() -> (回数, ns)`: segment commit 伸長の診断用 counter
+- `examples/v10_lifecycle_bench.rs` (上記「性能」参照)
+
 ### Added — entity cap と table の枠が伸びる (request20 案 B)
 
 - **`Engine::grow_entity_cap(&self, new_cap) -> io::Result<u32>`**: entity の上限を
@@ -78,8 +86,8 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
 
 ### 検証
 
-- workspace 全走 (`--test-threads=1`): Phase 2 時点 166 suites / 1097 passed / 0 failed
-  (Phase 3 の全走は下記 release 時に更新)
+- workspace 全走: Phase 2 時点 166 suites / 1097 passed / 0 failed、 性能修正 (fd 保持 /
+  grow 方針 / dir clone) 後 **166 suites / 1105 passed / 0 failed** (examples 30 本の build 込み)
 - 新規 test: `v10_dir_tests` (sidecar 配置 / copy / snapshot / migrate v8・v9・v7 拒否 /
   grow_entity_cap / free stack / table auto-grow / EXT1 永続 / 実 DB fixture)、
   `v10_cross_process_readonly` (別 process が readonly open、 後から足した himo も見える)、
@@ -101,6 +109,70 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
   **1104 passed / 0 failed** (macOS と同数)。 実 DB fixture の migrate は tmpfs 4.4 MB / btrfs
   4.8 MB (seek で飛ばした範囲がそのまま穴、 `punch_holes` は no-op)、 別 process readonly test も pass
 - Windows は `--target x86_64-pc-windows-msvc` の compile check のみ
+
+### 性能 — 0.25.1 との before / after (macOS 15 / Apple M2 Max / APFS、 `--release`)
+
+v10 で **最初に測った時点 (`b6d1c74`) は新しい page を踏む write が -25%** だった。 criterion
+(`benches/core`) の tie は同一 cell 連打なので拾えず、 `examples/v10_lifecycle_bench.rs`
+(create → define_himo ×200 → 順次 200k 行 × 3 tie → reopen → snapshot) でだけ出た。
+
+原因は `SegmentMap::grow_to` が commit を伸ばすたびに segment file を open / close していたこと。
+**macOS は dirty な mmap page を持つ file を write fd で close するとその場で書き戻す** (python
+実測: open だけ 0.6 µs、 ftruncate + mmap + 1 page write 後の close 49 µs、 engine では ~100 µs)。
+順次 write 中に同じ page を何度もディスクへ書き直していた (grow 41 回で 5.5 ms → fd 保持で 0.5 ms)。
+
+直したもの (全部 `segment_map`):
+
+- **writer は segment の fd を持ち続ける** (reader は従来どおり都度 open、 fd を増やさない)。
+  fd 数 = segment 数 (≈ himo 数 + 10)。 GUI app は launchd 既定で soft limit 256 なので、
+  `EMFILE` なら `setrlimit` で hard (unlimited なら 10240) まで上げて 1 回だけ retry
+- `mark_dirty` は page 単位に丸めて持つ (順次 write で cell ごとに `fetch_max` を踏まない)
+- commit の伸長は幾何級数 (×2、 最低 +64 KB、 1 回 16 MB まで)。 旧 「1 MB 超は +1 MB 線形」 は
+  64 MB column で 60 回 grow していた。 伸びるのは apparent だけ
+- `remap_to` は伸びた分 [cur, end) だけ貼る (全域を貼り直すと触った page が再 fault)
+- `snapshot_export` / `copy_db_dir` は APFS の `clonefile(2)` で **directory ごと 1 syscall** で
+  clone してから不要 entry (lock / sidecar) を消す。 file 単位 clone は 1 本 ~100 µs で、
+  himo 200 本の DB が 23 ms かかっていた (他 OS / 非 APFS / 別 volume は従来の file 単位)
+
+| lifecycle (1M cap、 himo 200、 200k 行 × 3 tie) | 0.25.1 | v10 `b6d1c74` | v10 修正後 |
+|---|---:|---:|---:|
+| `create_growable` 既定 capacity | 0.4 ms / **apparent 24,743 MB** / physical 0.1 MB | 1.1 ms / 0.2 MB / 0.1 MB | 1.1 ms / **0.2 MB** / 0.1 MB |
+| 空 DB の open | 8.1 ms | 7.5 ms | 6.4〜7.7 ms |
+| `define_himo` ×200 | 1.9 ms | 12.5 ms | 12.3 ms (segment file 作成 ~60 µs/本) |
+| 順次 write 200k × 3 tie | 16.9 ms (**35.5 M tie/s**) | 22.5 ms (26.0 M) | 18.8 ms (**32.0 M**) |
+| flush | 15〜18 ms | 12〜19 ms | 12.5〜13 ms |
+| 書いた後の apparent / physical | 2,969 MB / 5.6 MB | 7.1 MB / 7.0 MB | **7.1 MB / 7.0 MB** |
+| reopen (clean) | 1.0 ms | 6.2 ms | 5.7 ms (file 200 本の open + mmap、 ~30 µs/本) |
+| query (28,571 hits) | 1.7 ms | 1.65 ms | 1.7 ms |
+| `snapshot_export` | 1.2〜3.3 ms | 23〜33 ms | **1.6〜1.9 ms** |
+
+| `bench_compare` (1M entity、 3 回) | 0.25.1 | v10 `b6d1c74` | v10 修正後 |
+|---|---:|---:|---:|
+| bulk 1M 行 (4 tie/行、 tie_text 込み) | 150〜155 ms | 184〜187 ms | 173〜179 ms |
+| 1 条件 / 2 条件 / 4 条件 query | 5.3〜5.9 / 51〜52 / 52〜58 µs | 5.6〜5.8 / 50〜52 / 52〜55 µs | 5.6〜5.8 / 52〜55 / 56〜59 µs |
+
+criterion `benches/core` (`--baseline v0251`、 0.25.1 の tree を scratch に置いて `CRITERION_HOME` を共有):
+
+| group | 0.25.1 | v10 修正後 | Δ |
+|---|---:|---:|---:|
+| tie/plain_value (同一 cell) | 37.7 ns | 38.0 ns | 0% |
+| pull_raw/single_value | 88.2 ns | 89.7 ns | -3% (改善) |
+| audit/all_1k_records | 16.6 ns | 15.9 ns | -2% |
+| snapshot_export/small_db | 0.25 ms | 1.09 ms (修正前 2.4 ms) | +310% — file 数に比例、 backup 経路 |
+| scale_open / scale_tables_open (himo 50 の open + query) | 6.6 ms | 8.0〜8.3 ms | +24% — file 数に比例 |
+| churn_read/pull_untouched_value | 41.6 ns | 43.5 ns | +5% |
+| tie_async/wal_signed_off | 86 ns | 100 ns | +14〜21% (CI 83〜105 ns、 noisy) |
+| query/two_cond_and, scale*/query_within_table | 458 / 541 ns | 491 / 600 ns | +7〜9% — **binary layout 感度** (下記) |
+
+query の +7% は **コード変更ではなく binary layout**: engine の全 source を `b6d1c74` に戻すと
++0.3%、 そこへ **未使用の helper (`db_files::remove_db` / `disk_usage`) を足すだけで +3.3%**、
+更に本 fix (query 経路に触れない) を重ねると +7%。 0.25.1 自身を保存 baseline と比べる対照は
++0.4% で安定。 ±10% の「退行」 flag はこの bench では layout で出るので、 判断は
+`bench_compare` (query 系は 3 世代とも同じ) と lifecycle で行う。
+
+残っている v10 の固有コスト (どれも file 数 = himo 数に比例する 1 回きりの経路):
+`define_himo` ~60 µs/本、 open ~30 µs/本、 snapshot ~1 ms + α。 順次 write の残り -10% は
+grow 自体 (fstat / ftruncate / mmap ≈ 15 µs × 十数回) と page fault で、 1M 行規模では 3〜4 ms。
 
 ### 既知の残り
 

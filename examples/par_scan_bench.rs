@@ -24,9 +24,7 @@ fn tmp_path() -> String {
 }
 
 fn cleanup(path: &str) {
-    for suffix in ["", ".oplog", ".crc", ".db.lock", ".tables", ".tables.tmp", ".schema"] {
-        let _ = std::fs::remove_file(format!("{}{}", path, suffix));
-    }
+    let _ = enchudb::db_files::remove_db(&path);
 }
 
 fn fmt_ms(d: std::time::Duration) -> String {

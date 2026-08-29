@@ -147,8 +147,36 @@ criterion が ±10% 以上の劣化を自動で flag する。 CI に組み込�
 
 ## その他のベンチ (`examples/`)
 
+v10 (0.26.0) で DB は **directory** になった。 example の 「前回の残骸を掃除」 と 「disk 使用量」 は
+`enchudb::db_files::remove_db` / `disk_usage` (apparent / physical 両方) を使う。 単一 file 前提の
+`remove_file` / `metadata(path).len()` は書かないこと。
+
 | ファイル | 用途 |
 |---|---|
+| `bench_compare` (bin, `cargo run --release -p enchudb-engine --bin bench_compare`) | 1M entity の実用ベンチ (bulk write / rebuild / query / get) |
+| `v10_lifecycle_bench.rs` | **v10 必須**: create / define_himo / 順次 write (新 page) / reopen / snapshot / disk 使用量。 criterion の同一 cell tie では見えない grow・page fault のコストを拾う |
+| `batch_read_under_rebuild.rs` | double-buffer は concurrent rebuild 下で reader を守るか |
+| `bridge_scaling.rs` | oplog → `_sync_ops` bridge の scaling |
+| `dump.rs` | DB 内容ダンプツール (markdown / json) |
+| `group_sum_cap_probe.rs` | schema 層 (cardinality 0) の group_sum probe |
+| `growable_rss_repro.rs` | create_growable の起動 RSS / VSZ / teardown |
+| `lockfree_bucket_probe.rs` / `lockfree_engine_bench.rs` | #95 lock-free append bucket の PoC と出荷経路の実測 |
+| `multi_cond_scaling.rs` | 多条件 AND の谷カーブ |
+| `open_profile.rs` | open 経路の page reclaim を step 別に分解 |
+| `par_scan_bench.rs` | bulk column scan の seq vs par |
+| `reopen_eager_rebuild_bench.rs` | open 時の eager cylinder rebuild cost |
+| `sync_centralized.rs` / `sync_local_first.rs` / `sync_per_user.rs` | 0.7.0 sync pattern A / B / C の demo bench |
+| `verify_tax_probe.rs` | lazy-verify の read tax |
+| `vs_db.rs` | schema 層 EnchuDB vs SQLite vs DuckDB vs LMDB 4-way |
+| `workload_rss_1m.rs` / `workload_segmented_rss.rs` / `workload_sparse_rss.rs` | RSS / VSZ / disk 使用量のモデル検証 |
+| `write_ceiling_bench.rs` | single-consumer write ceiling |
+| `crates/enchudb-engine/examples/issue*_*.rs` | #88 / #92 / #116 / #127 の footprint 再現 harness |
+| `crates/enchudb-engine/examples/local_ns_bench.rs` | ns 級操作の分離計測 |
+| `crates/enchudb-schema/examples/schema_overhead_bench.rs` / `scope_demo.rs` | schema 層 / Scope の overhead |
+
+各ファイルの先頭コメントに目的・走り方が書いてある。
+
+---|---|
 | `agentic_workload_bench.rs` | LLM agent 風の高頻度 read/write mix |
 | `column_read_bench.rs` | Column 直読みパスのみ |
 | `dump.rs` | DB 内容ダンプツール |

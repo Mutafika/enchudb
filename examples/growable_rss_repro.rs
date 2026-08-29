@@ -94,9 +94,7 @@ fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "default".to_string());
 
     let path = "/tmp/enchudb_growable_rss_repro.db";
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{}.crc", path));
-    let _ = std::fs::remove_file(format!("{}.oplog", path));
+    let _ = enchudb::db_files::remove_db(&path);
 
     let t0 = Instant::now();
     let baseline_vsz = vsz_mb();
@@ -123,11 +121,12 @@ fn main() {
         }
         snap("after define_himo × 50", t0);
 
-        let meta = std::fs::metadata(path).unwrap();
+        let usage = enchudb::db_files::disk_usage(path);
         println!(
-            "file on-disk apparent size: {} bytes ({:.1} MB)",
-            meta.len(),
-            meta.len() as f64 / 1024.0 / 1024.0
+            "db on-disk apparent size: {} bytes ({:.1} MB, physical {:.1} MB)",
+            usage.apparent,
+            usage.apparent_mb(),
+            usage.physical_mb()
         );
         println!(
             "VSZ delta from baseline (= GrowableMap reserve): {} MB",
@@ -145,7 +144,5 @@ fn main() {
     }
 
     // file 削除
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{}.crc", path));
-    let _ = std::fs::remove_file(format!("{}.oplog", path));
+    let _ = enchudb::db_files::remove_db(&path);
 }
