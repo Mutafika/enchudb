@@ -245,7 +245,7 @@ fn byte_flip_wal_tail_truncated_silently() {
     }
 
     // WAL の末尾付近(最後のレコード周辺)を改竄
-    let oplog_path = format!("{}.oplog", path);
+    let oplog_path = format!("{}/oplog", path);
     let wal_size = std::fs::metadata(&oplog_path).unwrap().len();
     // head の手前 32 バイト付近(実際の WAL 末尾付近)を狙う
     // 厳密位置は wal.head() を読むのが正しいが、ざっくり最後の 1KB を狙う
@@ -298,7 +298,7 @@ fn truncate_wal_to_header_loses_uncommitted() {
     }
 
     // WAL を header サイズ(32B) にまで削る = 全レコード破棄
-    let oplog_path = format!("{}.oplog", path);
+    let oplog_path = format!("{}/oplog", path);
     truncate_to(&oplog_path, 32);
 
     // 0.9.0 (L1) 以降、 切り詰められた WAL は **黙って開かず loud に落ちる**。
@@ -389,9 +389,12 @@ fn fuzz_random_byte_flip_no_silent_corruption() {
             eng.oplog_sync().unwrap();
         }
 
-        // どのファイル? どのオフセット?
-        let which = next() % 2;
-        let target_path = if which == 0 { path.clone() } else { format!("{}.oplog", path) };
+        // どのファイル? どのオフセット? (v10: 本体は directory なので segment file を選ぶ)
+        let target_path = match next() % 3 {
+            0 => format!("{}/entities.seg", path),
+            1 => format!("{}/himo/0000.seg", path),
+            _ => format!("{}/oplog", path),
+        };
         let size = std::fs::metadata(&target_path).map(|m| m.len()).unwrap_or(0);
         if size == 0 { cleanup(&path); continue; }
         let offset = next() % size;

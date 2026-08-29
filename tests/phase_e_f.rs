@@ -90,7 +90,7 @@ fn snapshot_export_with_wal_includes_wal_file() {
         files.oplog.is_some(),
         "WAL を作ったので snapshot に含まれるべき"
     );
-    assert!(std::path::Path::new(&format!("{}.oplog", dst_path)).exists());
+    assert!(std::path::Path::new(&format!("{}/oplog", dst_path)).exists());
 
     drop(eng);
 

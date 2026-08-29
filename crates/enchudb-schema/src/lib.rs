@@ -75,7 +75,6 @@ use std::sync::Arc;
 // だったため撤去、 `.schema` sidecar に置き換えた (issue note: schema_meta_entity
 // は 0.7.0 の名残、 削除すべき)。 旧 DB 互換のため legacy blob 読み込み path も
 // 残してあり、 初回 open で `.schema` sidecar に migrate されて以降は新 path のみ。
-const SCHEMA_SIDECAR_EXT: &str = "schema";
 // legacy (= 0.6.x の blob entity) 互換読み込み path 用、 新規書き出しでは使わない。
 const LEGACY_SCHEMA_META_HIMO: &str = "__enchu_schema_meta__";
 const LEGACY_SCHEMA_MARKER: &str = "__enchu_schema_v1__";
@@ -1102,16 +1101,10 @@ impl Database {
     }
 }
 
-/// 0.8.7: `.schema` sidecar の path を返す。
+/// 0.8.7: schema sidecar の path を返す (v10: `{db}/schema`)。
 #[cfg(not(target_arch = "wasm32"))]
 fn schema_sidecar_path_for(db_path: &str) -> std::path::PathBuf {
-    let mut p = std::path::PathBuf::from(db_path);
-    let ext = match p.extension() {
-        Some(e) => format!("{}.{}", e.to_string_lossy(), SCHEMA_SIDECAR_EXT),
-        None => SCHEMA_SIDECAR_EXT.to_string(),
-    };
-    p.set_extension(ext);
-    p
+    enchudb_engine::db_files::path_for(db_path, enchudb_engine::db_files::SCHEMA)
 }
 
 /// 0.8.7: tables の serialize_schema 出力を `.schema` sidecar に atomic write。
@@ -1123,13 +1116,7 @@ fn persist_schema_to_sidecar(
 ) -> std::io::Result<()> {
     use std::io::Write;
     let sidecar = schema_sidecar_path_for(db_path);
-    let tmp = sidecar.with_extension(format!(
-        "{}.tmp",
-        sidecar
-            .extension()
-            .map(|e| e.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    ));
+    let tmp = enchudb_engine::db_files::tmp_path_for(&sidecar);
     let bytes = serialize_schema(tables);
     {
         let mut f = std::fs::OpenOptions::new()
@@ -1169,14 +1156,8 @@ fn load_schema_from_sidecar(db_path: &str) -> std::io::Result<Option<Vec<RawTabl
 #[cfg(not(target_arch = "wasm32"))]
 fn cleanup_schema_tmp(db_path: &str) {
     let sidecar = schema_sidecar_path_for(db_path);
-    // persist_schema_to_sidecar が使う tmp 名と合わせる (= `.schema.tmp`)。
-    let tmp = sidecar.with_extension(format!(
-        "{}.tmp",
-        sidecar
-            .extension()
-            .map(|e| e.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    ));
+    // persist_schema_to_sidecar が使う tmp 名と合わせる (= `schema.tmp`)。
+    let tmp = enchudb_engine::db_files::tmp_path_for(&sidecar);
     if tmp.exists() {
         if let Err(e) = std::fs::remove_file(&tmp) {
             eprintln!(
@@ -1198,7 +1179,7 @@ fn rename_corrupt_schema_sidecar(db_path: &str, err: &std::io::Error) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let backup = sidecar.with_extension(format!("schema.corrupt-{}", ts));
+    let backup = enchudb_engine::db_files::corrupt_backup_path_for(&sidecar, ts);
     eprintln!(
         "warning: schema sidecar parse failed ({}): renaming to {} and falling back to engine synthesize",
         err,

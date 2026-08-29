@@ -130,7 +130,7 @@ fn corrupt_eidmap_sidecar_falls_back_gracefully() {
     }
     // Corrupt the sidecar (bad magic).
     std::fs::write(
-        format!("{}.eidmap", path),
+        format!("{}/eidmap", path),
         b"GARBAGE-not-a-valid-eidmap-sidecar-xxxxxxxx",
     )
     .unwrap();
@@ -164,9 +164,9 @@ fn truncated_eidmap_sidecar_falls_back_gracefully() {
         drop(eng);
     }
     // Read the valid sidecar, then truncate it mid-entry (keep header, cut payload).
-    let full = std::fs::read(format!("{}.eidmap", path)).unwrap();
+    let full = std::fs::read(format!("{}/eidmap", path)).unwrap();
     assert!(full.len() > 12, "sidecar should have a header + at least one entry");
-    std::fs::write(format!("{}.eidmap", path), &full[..full.len() - 3]).unwrap();
+    std::fs::write(format!("{}/eidmap", path), &full[..full.len() - 3]).unwrap();
 
     let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
     assert_eq!(
@@ -292,7 +292,7 @@ fn huge_count_eidmap_sidecar_does_not_oom() {
     bytes.extend_from_slice(b"EIDM");
     bytes.extend_from_slice(&1u32.to_le_bytes());
     bytes.extend_from_slice(&u32::MAX.to_le_bytes());
-    std::fs::write(format!("{}.eidmap", path), &bytes).unwrap();
+    std::fs::write(format!("{}/eidmap", path), &bytes).unwrap();
 
     let eng = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
     assert_eq!(

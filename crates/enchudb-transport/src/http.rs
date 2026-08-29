@@ -280,13 +280,11 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Resu
             Some(s) => s,
             None => return send_response(&mut stream, 404, b"bootstrap not enabled"),
         };
-        let sfx = match &route["/bootstrap/".len()..] {
-            "eidmap" => ".eidmap",
-            "tables" => ".tables",
-            "vocabmap" => ".vocabmap",
-            _ => return send_response(&mut stream, 404, b"unknown sidecar"),
-        };
-        return match std::fs::read(format!("{}{}", src.db_path, sfx)) {
+        let name = &route["/bootstrap/".len()..];
+        if !enchudb::db_files::BOOTSTRAP.contains(&name) {
+            return send_response(&mut stream, 404, b"unknown sidecar");
+        }
+        return match std::fs::read(enchudb::db_files::path_for(&src.db_path, name)) {
             Ok(bytes) => send_response(&mut stream, 200, &bytes),
             Err(_) => send_response(&mut stream, 404, b"sidecar not present"),
         };
@@ -733,28 +731,30 @@ impl HttpTransport {
         }
         // packed DB なら directory に展開。 EnchuDB image でない (transport 単体で任意 file を
         // 運ぶ用途) なら受け取った file をそのまま `local_path` に置く。
-        match enchudb::Engine::unpack_to_dir(std::path::Path::new(&packed_path), local_path) {
+        let is_db = match enchudb::Engine::unpack_to_dir(std::path::Path::new(&packed_path), local_path) {
             Ok(()) => {
                 let _ = std::fs::remove_file(&packed_path);
+                true
             }
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 let _ = std::fs::remove_dir_all(local_path);
                 std::fs::rename(&packed_path, local_path)?;
+                false
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&packed_path);
                 return Err(e);
             }
-        }
+        };
 
-        // #78-H9: sidecar (.eidmap / .tables / .vocabmap) も取得。 .eidmap 無しの
-        // restore は再 sync で重複 entity / tombstone 喪失を起こし、 .vocabmap 無しでは
-        // 受信済み `Vocab` の写像が失われて後続 `Tie` を翻訳できない。 旧 server
-        // (route 未対応) からは 404 が返るので、 その場合は main body のみの旧挙動に
-        // fallback。
-        for (name, sfx) in [("eidmap", ".eidmap"), ("tables", ".tables"), ("vocabmap", ".vocabmap")] {
+        // #78-H9: sidecar (eidmap / tables / vocabmap) も取得して DB directory の中に置く
+        // (EnchuDB image でない file を運んだときは無い)。 eidmap 無しの restore は再 sync で
+        // 重複 entity / tombstone 喪失を起こし、 vocabmap 無しでは受信済み `Vocab` の写像が
+        // 失われて後続 `Tie` を翻訳できない。 旧 server (route 未対応) からは 404 が
+        // 返るので、 その場合は main body のみの旧挙動に fallback。
+        for name in enchudb::db_files::BOOTSTRAP.iter().filter(|_| is_db) {
             if let Ok((200, bytes)) = self.request("GET", &format!("/bootstrap/{name}"), b"") {
-                let sidecar_path = format!("{local_path}{sfx}");
+                let sidecar_path = enchudb::db_files::path_for(local_path, name);
                 let f = std::fs::File::create(&sidecar_path)?;
                 {
                     use std::io::Write as _;

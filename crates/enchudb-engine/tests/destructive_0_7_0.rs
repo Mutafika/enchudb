@@ -57,7 +57,7 @@ fn oplog_tail_garbage_is_dropped_on_reopen() {
     // oplog 末尾に garbage 64 byte 追記
     {
         use std::io::Write;
-        let oplog_path = format!("{}.oplog", path);
+        let oplog_path = format!("{}/oplog", path);
         let mut f = std::fs::OpenOptions::new()
             .write(true).append(true).open(&oplog_path).unwrap();
         f.write_all(&[0xDEu8; 64]).unwrap();
@@ -83,7 +83,7 @@ fn oplog_truncation_mid_record_recovers() {
     let path = tmp_path("oplog_trunc");
     cleanup(&path);
 
-    let oplog_path = format!("{}.oplog", path);
+    let oplog_path = format!("{}/oplog", path);
 
     // 10 件 tie
     {

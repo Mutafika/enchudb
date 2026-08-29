@@ -52,6 +52,7 @@ pub mod segment_map;
 pub mod segment_map;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod segments;
+pub mod db_files;
 pub mod column;
 pub mod vocabulary;
 pub mod leaf_store;

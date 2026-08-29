@@ -221,15 +221,15 @@ pub struct MigrationStats {
 }
 
 fn oplog_path_for(path: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(format!("{}.oplog", path))
+    crate::db_files::path_for(path, crate::db_files::OPLOG)
 }
 
-/// β-light step 7: table 定義 metadata の sidecar path。 `.tables`。
-/// 中身は binary encoded `TableDef` 配列、 atomic 書き換え (`.tables.tmp` →
-/// rename) で更新。 v4 DB は sidecar なし、 open 時は anonymous fallback。
+/// β-light step 7: table 定義 metadata の sidecar path (v10: `{db}/tables`)。
+/// 中身は binary encoded `TableDef` 配列、 atomic 書き換え (`tables.tmp` →
+/// rename) で更新。 不在なら open 時は anonymous fallback。
 #[cfg(not(target_arch = "wasm32"))]
 fn tables_path_for(path: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(format!("{}.tables", path))
+    crate::db_files::path_for(path, crate::db_files::TABLES)
 }
 
 /// β-light step 7: tables Vec を binary encode。
@@ -400,7 +400,7 @@ fn deserialize_tables(buf: &[u8]) -> Result<Vec<TableDef>, String> {
 #[cfg(not(target_arch = "wasm32"))]
 fn atomic_write_sidecar(sidecar: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
-    let tmp_path = std::path::PathBuf::from(format!("{}.tmp", sidecar.display()));
+    let tmp_path = crate::db_files::tmp_path_for(sidecar);
     {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -426,7 +426,7 @@ fn persist_tables_to_sidecar(db_path: &str, tables: &[TableDef]) -> io::Result<(
 #[cfg(not(target_arch = "wasm32"))]
 fn cleanup_tables_tmp(db_path: &str) {
     let sidecar = tables_path_for(db_path);
-    let tmp_path = sidecar.with_extension("tables.tmp");
+    let tmp_path = crate::db_files::tmp_path_for(&sidecar);
     if tmp_path.exists() {
         if let Err(e) = std::fs::remove_file(&tmp_path) {
             eprintln!(
@@ -453,7 +453,7 @@ fn rename_corrupt_sidecar(db_path: &str, kind: &str, err: &io::Error) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let backup = sidecar.with_extension(format!("{}.corrupt-{}", kind, ts));
+    let backup = crate::db_files::corrupt_backup_path_for(&sidecar, ts);
     eprintln!(
         "warning: {} sidecar parse failed ({}): renaming to {} (anonymous fallback)",
         kind,
@@ -490,7 +490,7 @@ fn load_tables_from_sidecar(db_path: &str) -> io::Result<Option<Vec<TableDef>>> 
 /// や旧 DB) なら open 時に空の translator で続行 (additive、 後方互換)。
 #[cfg(not(target_arch = "wasm32"))]
 fn eidmap_path_for(path: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(format!("{}.eidmap", path))
+    crate::db_files::path_for(path, crate::db_files::EIDMAP)
 }
 
 /// #9: eidmap sidecar の 1 entry。 `(author_peer, foreign_local, local, tombstone_hlc)`。
@@ -618,7 +618,7 @@ fn load_eidmap_from_sidecar(db_path: &str) -> io::Result<Option<Vec<EidmapEntry>
 /// 揃って初めて「pull cursor が消費した state」が disk 上で再構成できる。
 #[cfg(not(target_arch = "wasm32"))]
 fn vocabmap_path_for(path: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(format!("{}.vocabmap", path))
+    crate::db_files::path_for(path, crate::db_files::VOCABMAP)
 }
 
 /// vocabmap sidecar の 1 entry。 `(author_peer, remote_vid, local_vid)`。
@@ -702,10 +702,10 @@ fn load_vocabmap_from_sidecar(db_path: &str) -> io::Result<Option<Vec<VocabmapEn
     }
 }
 
-/// writer 排他用 sidecar の path。 `.db.lock`。
+/// writer 排他用 sidecar の path (v10: `{db}/lock`)。
 #[cfg(not(target_arch = "wasm32"))]
 fn writer_lock_path_for(path: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(format!("{}.lock", path))
+    crate::db_files::path_for(path, crate::db_files::LOCK)
 }
 
 /// `oplog_record_queue` (= bounded ArrayQueue) への blocking push。
@@ -780,12 +780,9 @@ impl Drop for WriterLock {
 /// open / create だけ呼ぶ。
 #[cfg(not(target_arch = "wasm32"))]
 fn acquire_writer_lock(path: &str) -> io::Result<WriterLock> {
+    // v10: lock は DB directory の中。 directory は create 側が作り、 open は存在を
+    // `check_db_dir` で確認済み (無い path に空 directory を残さない)。
     let lock_path = writer_lock_path_for(path);
-    if let Some(parent) = lock_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
     let f = OpenOptions::new()
         .create(true)
         .write(true)
@@ -819,17 +816,24 @@ fn acquire_writer_lock(path: &str) -> io::Result<WriterLock> {
 /// 存在する path への create は `AlreadyExists` で拒否する。
 /// 既存 DB を開くなら `Engine::open*`、 作り直すなら caller が明示的に削除すること。
 #[cfg(not(target_arch = "wasm32"))]
-fn ensure_create_target_absent(path: &str) -> io::Result<()> {
-    if std::path::Path::new(path).exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "database file already exists: \"{path}\" — refusing to overwrite. \
-                 use Engine::open* to open the existing DB, or remove the file first"
-            ),
-        ));
-    }
-    Ok(())
+/// v10: DB directory を作る。 `mkdir` の atomic 性で「既存を silent に潰さない」 (H11)
+/// と「同時 create の片方だけ勝つ」を兼ねる。 既存が file でも directory でも
+/// `AlreadyExists`。
+#[cfg(not(target_arch = "wasm32"))]
+fn create_db_dir(path: &str) -> io::Result<()> {
+    std::fs::create_dir(path).map_err(|e| {
+        if e.kind() == io::ErrorKind::AlreadyExists {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "database already exists: \"{path}\" — refusing to overwrite. \
+                     use Engine::open* to open the existing DB, or remove it first"
+                ),
+            )
+        } else {
+            e
+        }
+    })
 }
 
 /// v10: `[start, end)` の中で data が載っている最後の byte 位置 (SEEK_DATA / SEEK_HOLE)。
@@ -874,24 +878,89 @@ fn last_data_end(f: &std::fs::File, start: u64, end: u64) -> u64 {
     start
 }
 
+/// `[src_off, src_off+len)` を `dst_off` へ写す。 全 0 の block (4 KB) は書かずに seek で
+/// 飛ばし、 飛ばした範囲 (dst offset, len、 隣接は併合) を返す。 呼び出し側は **全 write と
+/// `set_len` の後**に `punch_holes` を呼ぶこと: Linux (ext4 / xfs) は seek で飛ばした範囲が
+/// そのまま穴になるが、 **APFS は write のたびに 16 MB 未満の gap を実体化する** ので、
+/// 後から `F_PUNCHHOLE` で抜くしかない (実 DB の migrate で 130 MB → 344 MB になった)。
+/// 粒度が 4 KB なのは hash index (vocab / himoreg / content) のように data が薄く散る
+/// region のため (1 MB 粒度だとほぼ全 chunk に非 0 が混ざる)。
 #[cfg(not(target_arch = "wasm32"))]
-fn copy_file_range(src: &mut std::fs::File, src_off: u64, dst: &mut std::fs::File, dst_off: u64, len: u64) -> io::Result<()> {
+fn copy_file_range(
+    src: &mut std::fs::File, src_off: u64, dst: &mut std::fs::File, dst_off: u64, len: u64,
+) -> io::Result<Vec<(u64, u64)>> {
     use std::io::{Read, Seek, SeekFrom, Write};
     src.seek(SeekFrom::Start(src_off))?;
     dst.seek(SeekFrom::Start(dst_off))?;
+    const BLOCK: usize = 4096;
+    let mut zero_runs: Vec<(u64, u64)> = Vec::new();
+    let mut push_zero = |off: u64, n: u64| match zero_runs.last_mut() {
+        Some((o, l)) if *o + *l == off => *l += n,
+        _ => zero_runs.push((off, n)),
+    };
     let mut remaining = len;
+    let mut pos = dst_off;
     let mut buf = vec![0u8; 1024 * 1024];
     while remaining > 0 {
         let n = remaining.min(buf.len() as u64) as usize;
         src.read_exact(&mut buf[..n])?;
-        // 全 0 の chunk は書かない (packed 側を sparse に保つ)
-        if buf[..n].iter().any(|b| *b != 0) {
-            dst.write_all(&buf[..n])?;
-        } else {
-            dst.seek(SeekFrom::Current(n as i64))?;
+        let mut i = 0;
+        while i < n {
+            let blk = BLOCK.min(n - i);
+            // 非 0 block の連続 run をまとめて 1 write
+            let mut j = i;
+            while j < n && buf[j..j + BLOCK.min(n - j)].iter().any(|b| *b != 0) {
+                j += BLOCK.min(n - j);
+            }
+            if j > i {
+                dst.write_all(&buf[i..j])?;
+                pos += (j - i) as u64;
+                i = j;
+                continue;
+            }
+            dst.seek(SeekFrom::Current(blk as i64))?;
+            push_zero(pos, blk as u64);
+            pos += blk as u64;
+            i += blk;
         }
         remaining -= n as u64;
     }
+    Ok(zero_runs)
+}
+
+/// `copy_file_range` が飛ばした全 0 範囲を穴に戻す (macOS / APFS の `F_PUNCHHOLE`)。
+/// 対応しない FS (HFS+ 等) では実体化したままにする = 失敗ではない。 他 OS では seek で
+/// 飛ばした範囲が既に穴なので no-op。 4 KB 未満の端数は punch できないので残す。
+#[cfg(target_os = "macos")]
+fn punch_holes(f: &std::fs::File, runs: &[(u64, u64)]) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    #[repr(C)]
+    struct FPunchHole {
+        fp_flags: u32,
+        reserved: u32,
+        fp_offset: libc::off_t,
+        fp_length: libc::off_t,
+    }
+    const F_PUNCHHOLE: libc::c_int = 99;
+    for &(off, len) in runs {
+        let len = len & !4095;
+        if len == 0 || off % 4096 != 0 {
+            continue;
+        }
+        let arg = FPunchHole { fp_flags: 0, reserved: 0, fp_offset: off as libc::off_t, fp_length: len as libc::off_t };
+        if unsafe { libc::fcntl(f.as_raw_fd(), F_PUNCHHOLE, &arg as *const FPunchHole) } < 0 {
+            let e = io::Error::last_os_error();
+            return match e.raw_os_error() {
+                Some(libc::ENOTSUP) | Some(libc::EINVAL) | Some(libc::ENOTTY) => Ok(()),
+                _ => Err(e),
+            };
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))]
+fn punch_holes(_f: &std::fs::File, _runs: &[(u64, u64)]) -> io::Result<()> {
     Ok(())
 }
 
@@ -928,6 +997,8 @@ impl Engine {
         let (layout, himo_count) = Self::read_header_layout(dir)?;
         let mut out = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(packed)?;
         out.set_len(layout.total_size as u64)?;
+        // seek で飛ばした全 0 range + region の未使用尾部。 最後にまとめて穴に戻す (APFS)。
+        let mut holes: Vec<(u64, u64)> = Vec::new();
         for kind in Self::segment_kinds_for(&layout, himo_count) {
             let p = std::path::Path::new(dir).join(kind.rel_path());
             let mut f = match std::fs::File::open(&p) {
@@ -936,15 +1007,21 @@ impl Engine {
                 Err(e) => return Err(e),
             };
             let len = f.metadata()?.len().min(layout.segment_size(kind) as u64);
-            copy_file_range(&mut f, 0, &mut out, layout.region_off(kind) as u64, len)?;
+            let off = layout.region_off(kind) as u64;
+            let size = layout.segment_size(kind) as u64;
+            holes.extend(copy_file_range(&mut f, 0, &mut out, off, len)?);
+            if size > len {
+                holes.push((off + len, size - len));
+            }
         }
+        punch_holes(&out, &holes)?;
         out.sync_all()?;
         Ok(layout.total_size as u64)
     }
 
-    /// v10: packed 1 ファイル (v9 の単一 file DB も可) を directory `dst` に展開する。
-    /// 各 region は data の載っている範囲だけ写す (sparse の穴は読まない)。 v9 の header は
-    /// version を 10 に打ち直す。 `dst` は存在してはいけない。
+    /// v10: packed 1 ファイル (v8 / v9 の単一 file DB も可) を directory `dst` に展開する。
+    /// 各 region は data の載っている範囲だけ写す (sparse の穴は読まない)。 v8 / v9 の header
+    /// は version を 10 に打ち直す。 `dst` は存在してはいけない。
     pub fn unpack_to_dir(packed: &std::path::Path, dst: &str) -> io::Result<()> {
         use std::io::{Read, Seek, SeekFrom, Write};
         let mut src = std::fs::File::open(packed)?;
@@ -971,9 +1048,13 @@ impl Engine {
             let end = off + size;
             let mut out = OpenOptions::new().write(true).create_new(true).open(dstp.join(kind.rel_path()))?;
             if kind == SegmentKind::Header {
-                let mut hdr = vec![0u8; layout.header_size];
+                // legacy (固定 4096) → v10 (可変長) は zero 拡張。 himo 表は先頭からの
+                // 固定 offset なので後ろを伸ばすだけでよい (CRC は先頭 64 byte のみ)。
+                let max_himos = u32::from_le_bytes(fixed[H_MAX_HIMOS..H_MAX_HIMOS + 4].try_into().unwrap());
+                let v10_size = header_size_for(max_himos);
+                let mut hdr = vec![0u8; v10_size.max(layout.header_size)];
                 src.seek(SeekFrom::Start(0))?;
-                src.read_exact(&mut hdr)?;
+                src.read_exact(&mut hdr[..layout.header_size])?;
                 if u32::from_le_bytes(hdr[H_VERSION..H_VERSION + 4].try_into().unwrap()) != FILE_VERSION {
                     hdr[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION.to_le_bytes());
                     write_header_crc(&mut hdr);
@@ -983,18 +1064,19 @@ impl Engine {
                 let used = last_data_end(&src, off, end);
                 // page 未満でも SegmentMap::open が page に揃える。 ここでは data の末尾まで。
                 let len = used.saturating_sub(off).max(4096.min(size));
-                copy_file_range(&mut src, off, &mut out, 0, len)?;
+                let holes = copy_file_range(&mut src, off, &mut out, 0, len)?;
                 out.set_len(len)?;
+                punch_holes(&out, &holes)?;
             }
             out.sync_all()?;
         }
         Ok(())
     }
 
-    /// v9 以前の **1 ファイル DB** を v10 の directory に移行する (offline)。 本体は
-    /// `unpack_to_dir`、 sidecar (`.tables` / `.eidmap` / `.vocabmap` / `.oplog` / `.schema`)
-    /// は `{dst}.xxx` に copy。 `.crc` は region 境界が変わらないので写すが、 疑わしければ
-    /// `seal_integrity` で打ち直すこと。 元は触らない。
+    /// v8 / v9 の **1 ファイル DB** を v10 の directory に移行する (offline)。 本体は
+    /// `unpack_to_dir`、 sidecar (`{src}.tables` / `.eidmap` / `.vocabmap` / `.oplog` /
+    /// `.schema`) は directory の中 (`{dst}/tables` …) に copy。 `.crc` は region 境界が
+    /// 変わらないので写すが、 疑わしければ `seal_integrity` で打ち直すこと。 元は触らない。
     pub fn migrate_v9_to_v10(src_file: &str, dst_dir: &str) -> io::Result<()> {
         let sp = std::path::Path::new(src_file);
         if !sp.is_file() {
@@ -1004,29 +1086,54 @@ impl Engine {
             ));
         }
         Self::unpack_to_dir(sp, dst_dir)?;
-        for sfx in [".tables", ".eidmap", ".vocabmap", ".oplog", ".schema", ".crc"] {
-            let from = format!("{src_file}{sfx}");
-            if std::path::Path::new(&from).exists() {
-                crate::sparse_copy::copy_sparse(std::path::Path::new(&from), std::path::Path::new(&format!("{dst_dir}{sfx}")))?;
+        for name in crate::db_files::ALL {
+            if name == crate::db_files::LOCK {
+                continue;
+            }
+            let from = crate::db_files::legacy_path_for(src_file, name);
+            if from.exists() {
+                crate::sparse_copy::copy_sparse(&from, &crate::db_files::path_for(dst_dir, name))?;
             }
         }
         Ok(())
     }
 }
 
-/// v10: DB directory を丸ごと写す (`snapshot_export` 用)。 segment file は
-/// `copy_sparse` で (unix は dense なので素の copy と同じ、 Windows の sparse segment は
-/// 穴を保つ)。 sub directory (`himo/` / `ver/`) も再帰。
+/// v10: DB directory を複製する (本体 segment + sidecar。 `lock` と `*.tmp` は除く)。
+/// 複製先は普通に `Engine::open*` できる。 segment file は `copy_sparse` で (unix は
+/// dense なので素の copy と同じ、 Windows の sparse segment は穴を保つ)。
+///
+/// **整合性は呼び出し側の責務**: writer が動いている DB の sidecar は本体より遅れて
+/// いることがある (consumer tick)。 整合した複製が要るなら `Engine::snapshot_export`。
 #[cfg(not(target_arch = "wasm32"))]
 pub fn copy_db_dir(src: &std::path::Path, dst: &std::path::Path) -> io::Result<()> {
+    copy_db_dir_filtered(src, dst, &crate::db_files::is_copyable_entry)
+}
+
+/// v10: DB 本体 (segment file と `himo/` / `ver/`) だけを写す。 sidecar は写さない。
+#[cfg(not(target_arch = "wasm32"))]
+pub fn copy_db_segments(src: &std::path::Path, dst: &std::path::Path) -> io::Result<()> {
+    copy_db_dir_filtered(src, dst, &crate::db_files::is_segment_entry)
+}
+
+/// top level の entry を `keep` で選び、 sub directory (`himo/` / `ver/`) は丸ごと再帰。
+#[cfg(not(target_arch = "wasm32"))]
+fn copy_db_dir_filtered(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    keep: &dyn Fn(&std::ffi::OsStr) -> bool,
+) -> io::Result<()> {
     use crate::sparse_copy::copy_sparse;
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
+        if !keep(&entry.file_name()) {
+            continue;
+        }
         let from = entry.path();
         let to = dst.join(entry.file_name());
         if entry.file_type()?.is_dir() {
-            copy_db_dir(&from, &to)?;
+            copy_db_dir_filtered(&from, &to, &|_| true)?;
         } else {
             copy_sparse(&from, &to)?;
         }
@@ -1713,6 +1820,27 @@ impl Layout {
         // false = pre-v9 DB、 または v9 を有効化していない create。
         cell_version: bool,
     ) -> Result<Self, String> {
+        Self::try_from_params_with_header(
+            max_entities, max_himos,
+            vocab_max_entries, vocab_index_cap, vocab_data_size,
+            himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
+            content_data_size, leaf_data_size, cyl_max_values,
+            cell_version,
+            header_size_for(max_himos),
+        )
+    }
+
+    /// `header_size` を外から与える版。 v10 は `header_size_for(max_himos)` (himo 表が
+    /// 溢れない可変長、 #246) だが、 **v8 / v9 の 1 ファイル DB は固定 4096** なので legacy
+    /// packed の parse はこちらで offset を出す (可変長で計算すると region が全部ずれる)。
+    fn try_from_params_with_header(
+        max_entities: u32, max_himos: u32,
+        vocab_max_entries: u32, vocab_index_cap: u32, vocab_data_size: usize,
+        himoreg_max_entries: u32, himoreg_index_cap: u32, himoreg_data_size: usize,
+        content_data_size: usize, leaf_data_size: usize, cyl_max_values: u32,
+        cell_version: bool,
+        header_size: usize,
+    ) -> Result<Self, String> {
         // EntitySet::region_size 内部の `(max_entities + 7)` が u32 で wrap しない
         // ガード。 この値の DB は create 時点で作れない (debug では overflow panic)。
         if max_entities > u32::MAX - 7 {
@@ -1741,7 +1869,6 @@ impl Layout {
         // を末尾に集める。 これで「ファイル末尾のみ伸びる」 monotonic
         // grow が実現でき、 sparse hole に頼らずに apparent size を
         // 実 usage に追従させられる (Phase B Step 1)。
-        let header_size = header_size_for(max_himos);
         let mut off = header_size;
 
         // ── 固定 cluster: 上限が max_entities / max_himos / *_cap で決まる ──
@@ -2513,8 +2640,8 @@ impl Engine {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        // H11: 既存 DB を silent truncate で破壊しない (lock 取得前に判定)。
-        ensure_create_target_absent(path)?;
+        // H11: 既存 DB を silent に破壊しない。 directory 作成 (atomic) → lock → segment。
+        create_db_dir(path)?;
         // writer lock を先に取る (= 他 writer が居れば block)。 create も書き込みなので必須。
         let writer_lock = acquire_writer_lock(path)?;
         let set = SegmentSet::create(
@@ -2846,6 +2973,7 @@ impl Engine {
     #[cfg(not(target_arch = "wasm32"))]
     fn open_internal(path: &str, verify_region_crc: bool, take_lock: bool, readonly: bool) -> io::Result<Self> {
         // open path: writer lock を mmap 前に取る (= 他 writer 居れば block)
+        Self::check_db_dir(path)?;
         let writer_lock = if take_lock {
             Some(acquire_writer_lock(path)?)
         } else {
@@ -3067,7 +3195,10 @@ impl Engine {
     /// (mmap する前)。 旧 1 ファイル DB (regular file) は明示的に弾いて Phase 2 の
     /// `migrate_v9_to_v10` へ誘導する。
     #[cfg(not(target_arch = "wasm32"))]
-    fn read_header_layout(path: &str) -> io::Result<(Layout, u32)> {
+    /// v10: `path` が DB directory として存在するか。 1 ファイル (v9 以前) なら migrate
+    /// への誘導、 無ければ `NotFound`。 writer lock を取る前に呼ぶ (無い path に lock file
+    /// だけ作らない)。
+    fn check_db_dir(path: &str) -> io::Result<()> {
         let p = std::path::Path::new(path);
         if p.is_file() {
             return Err(io::Error::new(
@@ -3084,22 +3215,31 @@ impl Engine {
                 format!("database directory not found: \"{path}\""),
             ));
         }
+        Ok(())
+    }
+
+    fn read_header_layout(path: &str) -> io::Result<(Layout, u32)> {
+        Self::check_db_dir(path)?;
+        let p = std::path::Path::new(path);
         let buf = SegmentSet::read_header(p, HEADER_SIZE)?;
         Self::parse_header(&buf, false).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// header bytes → `(Layout, himo_count)`。 magic / CRC / version / field の整合を検証する。
-    /// `allow_v9_packed` は `from_bytes` (packed 1 blob) 用: v9 の 1 ファイル layout は
-    /// packed v10 と byte 互換なので受け入れる。 directory open は v10 のみ。
-    fn parse_header(buf: &[u8], allow_v9_packed: bool) -> Result<(Layout, u32), String> {
+    /// `allow_legacy_packed` は `from_bytes` / `unpack_to_dir` (packed 1 blob) 用: v8 / v9 の
+    /// 1 ファイル layout は packed v10 と byte 互換なので受け入れる (v8 は版数列を持たず、
+    /// `H_CELL_VERSION` は予約 0)。 directory open は v10 のみ。
+    fn parse_header(buf: &[u8], allow_legacy_packed: bool) -> Result<(Layout, u32), String> {
         if buf.len() < HEADER_SIZE || buf[H_MAGIC..H_MAGIC + 4] != FILE_MAGIC {
             return Err("not an EnchuDB file".into());
         }
         let version = u32::from_le_bytes(buf[H_VERSION..H_VERSION + 4].try_into().unwrap());
-        if version != FILE_VERSION && !(allow_v9_packed && version == FILE_VERSION_LEGACY_V9) {
+        let legacy_packed = allow_legacy_packed
+            && (FILE_VERSION_LEGACY_V8..=FILE_VERSION_LEGACY_V9).contains(&version);
+        if version != FILE_VERSION && !legacy_packed {
             return Err(format!(
-                "unsupported EnchuDB file version {} (this build reads v{}; v9 and older single-file \
-                 databases must be migrated with Engine::migrate_v9_to_v10)",
+                "unsupported EnchuDB file version {} (this build reads v{}; v8 / v9 single-file \
+                 databases must be migrated with Engine::migrate_v9_to_v10, older ones are not supported)",
                 version, FILE_VERSION,
             ));
         }
@@ -3122,14 +3262,17 @@ impl Engine {
             content_data_size,
         )?;
         let leaf_data_size = u64::from_le_bytes(buf[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8].try_into().unwrap()) as usize;
-        let cell_version =
-            u32::from_le_bytes(buf[H_CELL_VERSION..H_CELL_VERSION + 4].try_into().unwrap()) != 0;
-        let layout = Layout::try_from_params(
+        let cell_version = version >= FILE_VERSION_LEGACY_V9
+            && u32::from_le_bytes(buf[H_CELL_VERSION..H_CELL_VERSION + 4].try_into().unwrap()) != 0;
+        // v8 / v9 の header は固定 4096 (himo 表は溢れ得た = #246)。 v10 は可変長。
+        let header_size = if version < FILE_VERSION { HEADER_SIZE } else { header_size_for(max_himos) };
+        let layout = Layout::try_from_params_with_header(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, leaf_data_size, cyl_max_values,
             cell_version,
+            header_size,
         )?;
         Ok((layout, himo_count))
     }
@@ -3325,73 +3468,10 @@ impl Engine {
         Ok((dst, stats))
     }
 
-    /// #88: v5 DB ファイル (`src_path`) を v6 に移送して `dst_path` に書く
-    /// (default leaf region size)。 `src_path` は不変。 詳細は
-    /// [`Self::migrate_file_v5_to_v6_with_leaf`]。
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn migrate_file_v5_to_v6(src_path: &str, dst_path: &str) -> Result<MigrationStats, String> {
-        Self::migrate_file_v5_to_v6_with_leaf(src_path, dst_path, DEFAULT_LEAF_DATA_SIZE)
-    }
-
-    /// #88: v5 DB ファイルを v6 に移送 (`dst_path` は `src_path` と別にすること)。
-    ///
-    /// - main DB (`.ecdb` 相当) を移送。 `.tables` sidecar は himo/table 構造を
-    ///   そのまま引き継ぐためコピーし、 reserved-table の Leaf himo は移送から
-    ///   除外して vocab に据え置く (reopen で `.tables` 復元 → `leaf_for()==None`
-    ///   と整合)。
-    /// - 旧 `.oplog` は **引き継がない** (dst の stale `.oplog` は削除)。 v5 の
-    ///   Leaf tie op は旧 wire 形 (`Vocab`+`TieNamed`) で、 移送後の cell と
-    ///   不整合になり reopen 時の replay が巻き戻すため。 dst は fresh oplog で
-    ///   開く (= main file の現在状態を checkpoint とみなす)。
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn migrate_file_v5_to_v6_with_leaf(
-        src_path: &str, dst_path: &str, leaf_data_size: usize,
-    ) -> Result<MigrationStats, String> {
-        let src = std::fs::read(src_path).map_err(|e| format!("read {src_path}: {e}"))?;
-        let skip = Self::reserved_leaf_himos_from_sidecar(src_path, &src);
-        let (dst, stats) = Self::migrate_bytes_v5_to_v6(src, leaf_data_size, &skip)?;
-
-        // atomic 書き: tmp → rename (途中 crash で half-written dst を残さない)。
-        let tmp = format!("{dst_path}.migrating");
-        std::fs::write(&tmp, &dst).map_err(|e| format!("write {tmp}: {e}"))?;
-        std::fs::rename(&tmp, dst_path).map_err(|e| format!("rename {tmp} -> {dst_path}: {e}"))?;
-
-        // himo/table 構造は不変なので `.tables` をコピー。 stale な dst sidecar は掃除。
-        if let Ok(t) = std::fs::read(tables_path_for(src_path)) {
-            let _ = std::fs::write(tables_path_for(dst_path), t);
-        } else {
-            let _ = std::fs::remove_file(tables_path_for(dst_path));
-        }
-        let _ = std::fs::remove_file(format!("{dst_path}.oplog"));
-        Ok(stats)
-    }
-
-    /// `.tables` sidecar から reserved-table 配下の `Leaf` himo id を集める
-    /// (migration の skip 集合)。 sidecar が無ければ空 (= 全 anonymous 相当)。
-    #[cfg(not(target_arch = "wasm32"))]
-    fn reserved_leaf_himos_from_sidecar(path: &str, src: &[u8]) -> Vec<u16> {
-        let tables = match load_tables_from_sidecar(path) {
-            Ok(Some(t)) => t,
-            _ => return Vec::new(),
-        };
-        let himo_count = u32::from_le_bytes(src[H_HIMO_COUNT..H_HIMO_COUNT + 4].try_into().unwrap()) as usize;
-        let mut out = Vec::new();
-        for t in &tables {
-            if !t.is_reserved() { continue; }
-            for &hid in t.himo_ids.read().unwrap().iter() {
-                let h = hid as usize;
-                if h < himo_count && ValueType::from_byte(src[H_HIMO_TYPES + h]) == ValueType::Leaf {
-                    out.push(hid as u16);
-                }
-            }
-        }
-        out
-    }
-
     fn load_from_backing(backing: Backing, readonly: bool) -> Result<Self, String> {
         let hdr: &[u8] = backing.header_mut(HEADER_SIZE);
-        let allow_v9_packed = backing.memory_len().is_some();
-        let (layout, himo_count) = Self::parse_header(hdr, allow_v9_packed)?;
+        let allow_legacy_packed = backing.memory_len().is_some();
+        let (layout, himo_count) = Self::parse_header(hdr, allow_legacy_packed)?;
         if let Some(n) = backing.memory_len() {
             if n < layout.total_size {
                 return Err(format!(
@@ -11410,28 +11490,20 @@ impl Engine {
             oplog: None,
             crc: None,
         };
-        // v10: 本体は directory。 segment file を 1 つずつ写す (Windows の sparse segment も
-        // 穴を穴のまま写せるよう copy_sparse を使う)。
-        copy_db_dir(std::path::Path::new(&self.path), std::path::Path::new(target))?;
+        // v10: 本体は directory。 segment file だけを 1 つずつ写す (Windows の sparse segment
+        // も穴を穴のまま写せるよう copy_sparse を使う)。 sidecar は下で個別に扱う。
+        copy_db_segments(std::path::Path::new(&self.path), std::path::Path::new(target))?;
 
-        let oplog_src = format!("{}.oplog", self.path);
-        if std::path::Path::new(&oplog_src).exists() {
-            let oplog_dst = format!("{}.oplog", target);
-            copy_sparse(
-                std::path::Path::new(&oplog_src),
-                std::path::Path::new(&oplog_dst),
-            )?;
-            files.oplog = Some(oplog_dst);
-        }
-
-        let crc_src = format!("{}.crc", self.path);
-        if std::path::Path::new(&crc_src).exists() {
-            let crc_dst = format!("{}.crc", target);
-            copy_sparse(
-                std::path::Path::new(&crc_src),
-                std::path::Path::new(&crc_dst),
-            )?;
-            files.crc = Some(crc_dst);
+        for (name, slot) in [
+            (crate::db_files::OPLOG, &mut files.oplog),
+            (crate::db_files::CRC, &mut files.crc),
+        ] {
+            let src = crate::db_files::path_for(&self.path, name);
+            if src.exists() {
+                let dst = crate::db_files::path_for(target, name);
+                copy_sparse(&src, &dst)?;
+                *slot = Some(dst.to_string_lossy().into_owned());
+            }
         }
 
         // #9 (H2): sidecar (.tables/.eidmap) は source を copy せず、 現在の in-memory
@@ -11442,20 +11514,17 @@ impl Engine {
         // (durability は copy と同じ page-cache level、 backup の fsync は呼び出し側責務)。
         // 0.7.0: .tables には reserved table `_sync_ops` / `_sync_peers` も含む。
         if !self.tables.is_empty() {
-            std::fs::write(format!("{}.tables", target), serialize_tables(&self.tables))?;
+            std::fs::write(tables_path_for(target), serialize_tables(&self.tables))?;
         }
         let eidmap_entries = self.eidmap_entries_with_tombstones();
         if !eidmap_entries.is_empty() {
-            std::fs::write(format!("{}.eidmap", target), serialize_eidmap(&eidmap_entries))?;
+            std::fs::write(eidmap_path_for(target), serialize_eidmap(&eidmap_entries))?;
         }
         // text 写像も同じ理由で in-memory から直接書き出す。 これが抜けると restore 後に
         // 受信済み `Vocab` の写像だけが失われ、 後続 `Tie` を翻訳できなくなる。
         let vocabmap_entries = self.peer_vocab_map_entries();
         if !vocabmap_entries.is_empty() {
-            std::fs::write(
-                format!("{}.vocabmap", target),
-                serialize_vocabmap(&vocabmap_entries),
-            )?;
+            std::fs::write(vocabmap_path_for(target), serialize_vocabmap(&vocabmap_entries))?;
         }
 
         Ok(files)
@@ -15161,5 +15230,208 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir); // v10: DB は directory
         let _ = std::fs::remove_file(&dir);
+    }
+}
+
+/// v10 Phase 2: sidecar の置き場 (DB directory の中) と 1 ファイル DB からの移行。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod v10_dir_tests {
+    use super::*;
+    use crate::db_files;
+
+    const LEGACY_TEST_MAX_HIMOS: u32 = 2048;
+
+    fn tmp(name: &str) -> String {
+        let path = format!("/tmp/enchu_v10dir_{name}.db");
+        for base in [path.clone(), format!("{path}.packed"), format!("{path}.dst"), format!("{path}.copy")] {
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_file(&base);
+            for n in db_files::ALL {
+                let _ = std::fs::remove_file(db_files::legacy_path_for(&base, n));
+            }
+        }
+        path
+    }
+
+    /// table 1 つ + himo `n` + entity 3 つを書いて tables を persist した WAL 付き DB。
+    fn seed(path: &str) -> Vec<(enchudb_oplog::EntityId, u32)> {
+        // max_himos 2048 → v10 の header は可変長 (12 KB)。 legacy 化するときに 4096 へ切り詰めて
+        // 「固定 4096 header の v8 / v9」 を再現する (実 DB = sinfohub の shape)。
+        let mut eng =
+            Engine::create_full(path, 1024, Some(1 << 20), Some(LEGACY_TEST_MAX_HIMOS), Some(1 << 20)).unwrap();
+        eng.define_table("widgets", 100).unwrap();
+        eng.define_himo_in("widgets", "n", ValueType::Number, 100).unwrap();
+        let mut rows = Vec::new();
+        for i in 0..3u32 {
+            let e = eng.entity_in("widgets").unwrap();
+            eng.tie(e, "widgets.n", 10 + i);
+            rows.push((e, 10 + i));
+        }
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        drop(eng);
+        // WAL 経路で一度開いて `oplog` を作る (standalone create は WAL を持たない)
+        let eng = Engine::open(path).unwrap();
+        eng.flush_writes();
+        drop(eng);
+        rows
+    }
+
+    fn assert_seeded(eng: &Engine, rows: &[(enchudb_oplog::EntityId, u32)]) {
+        assert_eq!(eng.entity_count(), rows.len() as u32);
+        for (e, v) in rows {
+            assert_eq!(eng.get(*e, "widgets.n"), Some(*v));
+        }
+        let tables: Vec<String> = eng.list_user_tables().into_iter().map(|t| t.1).collect();
+        assert!(tables.iter().any(|t| t == "widgets"), "tables: {tables:?}");
+    }
+
+    #[test]
+    fn sidecars_live_inside_db_dir() {
+        let path = tmp("inside");
+        let rows = seed(&path);
+        for n in [db_files::TABLES, db_files::OPLOG, db_files::LOCK] {
+            assert!(db_files::path_for(&path, n).exists(), "{n} should be inside the DB dir");
+            assert!(!db_files::legacy_path_for(&path, n).exists(), "{n} must not be beside the dir");
+        }
+        // reopen で同じ sidecar を読む
+        let eng = Engine::open(&path).unwrap();
+        assert_seeded(&eng, &rows);
+    }
+
+    #[test]
+    fn open_missing_dir_leaves_no_residue() {
+        let path = tmp("missing");
+        let err = Engine::open(&path).err().expect("open of a missing DB must fail");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        assert!(!std::path::Path::new(&path).exists(), "open must not create an empty DB dir");
+        // 1 ファイル (旧 format) は migrate への誘導
+        std::fs::write(&path, b"ECDB-not-really").unwrap();
+        let err = Engine::open(&path).err().unwrap();
+        assert!(err.to_string().contains("migrate_v9_to_v10"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn copy_db_dir_clones_sidecars_but_not_lock() {
+        let path = tmp("copy");
+        let rows = seed(&path);
+        let dst = format!("{path}.copy");
+        copy_db_dir(std::path::Path::new(&path), std::path::Path::new(&dst)).unwrap();
+        assert!(db_files::path_for(&dst, db_files::TABLES).exists());
+        assert!(db_files::path_for(&dst, db_files::OPLOG).exists());
+        assert!(!db_files::path_for(&dst, db_files::LOCK).exists(), "lock must not be cloned");
+        let eng = Engine::open(&dst).unwrap();
+        assert_seeded(&eng, &rows);
+        drop(eng);
+
+        let seg_only = format!("{path}.dst");
+        copy_db_segments(std::path::Path::new(&path), std::path::Path::new(&seg_only)).unwrap();
+        assert!(!db_files::path_for(&seg_only, db_files::TABLES).exists());
+        assert!(!db_files::path_for(&seg_only, db_files::OPLOG).exists());
+        assert!(std::path::Path::new(&seg_only).join("header.seg").exists());
+        assert!(std::path::Path::new(&seg_only).join("himo/0000.seg").exists());
+    }
+
+    #[test]
+    fn snapshot_export_puts_sidecars_in_target_dir() {
+        let path = tmp("snap");
+        let rows = seed(&path);
+        let eng = Engine::open(&path).unwrap();
+        let dst = format!("{path}.dst");
+        let files = eng.snapshot_export(&dst).unwrap();
+        drop(eng);
+        assert_eq!(files.oplog.as_deref(), Some(db_files::path_for(&dst, db_files::OPLOG).to_str().unwrap()));
+        assert!(db_files::path_for(&dst, db_files::TABLES).exists());
+        assert!(!db_files::path_for(&dst, db_files::LOCK).exists());
+        let eng = Engine::open(&dst).unwrap();
+        assert_seeded(&eng, &rows);
+    }
+
+    /// v10 DB を pack して header の version を `version` に書き戻し、 旧 sidecar 配置
+    /// (`{file}.tables` …) を作る = 旧 binary が残した 1 ファイル DB の再現。
+    fn make_legacy_single_file(path: &str, version: u32) -> String {
+        let packed = format!("{path}.packed");
+        Engine::pack_dir(path, std::path::Path::new(&packed)).unwrap();
+        // v10 packed (可変長 header) → legacy (固定 4096 header): header の余分を切り落とす
+        let v10_hs = header_size_for(LEGACY_TEST_MAX_HIMOS);
+        assert!(v10_hs > HEADER_SIZE, "test must exercise the variable-length header");
+        let bytes = std::fs::read(&packed).unwrap();
+        let mut legacy = Vec::with_capacity(bytes.len() - (v10_hs - HEADER_SIZE));
+        legacy.extend_from_slice(&bytes[..HEADER_SIZE]);
+        legacy.extend_from_slice(&bytes[v10_hs..]);
+        legacy[H_VERSION..H_VERSION + 4].copy_from_slice(&version.to_le_bytes());
+        if version < FILE_VERSION_LEGACY_V9 {
+            legacy[H_CELL_VERSION..H_CELL_VERSION + 4].copy_from_slice(&0u32.to_le_bytes());
+        }
+        write_header_crc(&mut legacy[..HEADER_SIZE]);
+        std::fs::write(&packed, &legacy).unwrap();
+        for n in [db_files::TABLES, db_files::OPLOG] {
+            std::fs::copy(db_files::path_for(path, n), db_files::legacy_path_for(&packed, n)).unwrap();
+        }
+        std::fs::write(db_files::legacy_path_for(&packed, db_files::SCHEMA), b"schema-bytes").unwrap();
+        packed
+    }
+
+    fn migrate_roundtrip(name: &str, version: u32) {
+        let path = tmp(name);
+        let rows = seed(&path);
+        let packed = make_legacy_single_file(&path, version);
+        let _ = std::fs::remove_dir_all(&path);
+
+        // 旧 1 ファイルはこの build では開けない
+        let err = Engine::open(&packed).err().unwrap();
+        assert!(err.to_string().contains("migrate_v9_to_v10"), "{err}");
+
+        let dst = format!("{path}.dst");
+        Engine::migrate_v9_to_v10(&packed, &dst).unwrap();
+        for n in [db_files::TABLES, db_files::OPLOG, db_files::SCHEMA] {
+            assert!(db_files::path_for(&dst, n).exists(), "{n} should be migrated into the dir");
+        }
+        assert_eq!(std::fs::read(db_files::path_for(&dst, db_files::SCHEMA)).unwrap(), b"schema-bytes");
+        assert!(!db_files::path_for(&dst, db_files::LOCK).exists());
+        let eng = Engine::open(&dst).unwrap();
+        assert_seeded(&eng, &rows);
+        assert!(!eng.has_cell_version());
+        // 元は不変
+        assert!(std::path::Path::new(&packed).is_file());
+        assert!(db_files::legacy_path_for(&packed, db_files::TABLES).exists());
+    }
+
+    #[test]
+    fn migrate_v9_single_file_to_dir() {
+        migrate_roundtrip("mig9", FILE_VERSION_LEGACY_V9);
+    }
+
+    #[test]
+    fn migrate_v8_single_file_to_dir() {
+        migrate_roundtrip("mig8", FILE_VERSION_LEGACY_V8);
+    }
+
+    #[test]
+    fn migrate_rejects_older_than_v8() {
+        let path = tmp("mig7");
+        seed(&path);
+        let packed = make_legacy_single_file(&path, FILE_VERSION_LEGACY_V7);
+        let err = Engine::migrate_v9_to_v10(&packed, &format!("{path}.dst")).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().contains("version 7"), "{err}");
+    }
+
+    /// 実 DB での確認用 (手動)。 `ENCHU_LEGACY_FIXTURE=/path/to/enchu.db` (1 ファイル、
+    /// sidecar は隣) を与えると migrate → open_readonly して要約を出す。 無指定なら no-op。
+    #[test]
+    fn migrate_real_fixture_if_provided() {
+        let Ok(src) = std::env::var("ENCHU_LEGACY_FIXTURE") else { return };
+        let dst = tmp("fixture") ;
+        let t0 = std::time::Instant::now();
+        Engine::migrate_v9_to_v10(&src, &dst).unwrap();
+        let eng = Engine::open_readonly(&dst).unwrap();
+        let tables: Vec<String> = eng.list_user_tables().into_iter().map(|t| t.1).collect();
+        eprintln!(
+            "[fixture] migrated in {:?}: entities={} himos={} tables={:?} cell_version={}",
+            t0.elapsed(), eng.entity_count(), eng.himo_count(), tables, eng.has_cell_version()
+        );
+        assert!(eng.entity_count() > 0);
     }
 }

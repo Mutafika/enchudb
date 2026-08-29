@@ -101,7 +101,7 @@ fn database_create_and_open_writes_schema_sidecar() {
     }
 
     // === .schema sidecar が存在 ===
-    let schema_sidecar = format!("{}.schema", path);
+    let schema_sidecar = format!("{}/schema", path);
     assert!(
         std::path::Path::new(&schema_sidecar).exists(),
         "schema sidecar should exist at {}",

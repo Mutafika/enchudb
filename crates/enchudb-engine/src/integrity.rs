@@ -177,9 +177,9 @@ pub fn fnv1a_slices(slices: &[&[u8]]) -> u32 {
     h
 }
 
-/// DB ファイルパスから対応する .crc ファイルパスを導出。
+/// DB directory から CRC table の path (`{db}/crc`) を導出。
 pub fn crc_path_for(db_path: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(format!("{}.crc", db_path))
+    crate::db_files::path_for(db_path, crate::db_files::CRC)
 }
 
 #[cfg(test)]

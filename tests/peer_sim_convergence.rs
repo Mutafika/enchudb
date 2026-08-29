@@ -180,8 +180,8 @@ fn eid_mapping_is_durable_without_clean_shutdown() {
     );
     eprintln!(
         "[crash] eidmap sidecar bytes: live={:?} copy={:?}",
-        std::fs::metadata(format!("{}.eidmap", sim.db_path(0))).map(|m| m.len()).ok(),
-        std::fs::metadata(format!("{}.crashcopy.eidmap", sim.db_path(0))).map(|m| m.len()).ok(),
+        std::fs::metadata(format!("{}/eidmap", sim.db_path(0))).map(|m| m.len()).ok(),
+        std::fs::metadata(format!("{}.crashcopy/eidmap", sim.db_path(0))).map(|m| m.len()).ok(),
     );
     let durable = crashed.resolve_remote_eid_existing(b.eid).is_some();
 
@@ -255,7 +255,7 @@ fn cursor_is_held_when_state_cannot_be_persisted() {
     let from_b = sim.peer_id(1);
 
     // `.eidmap` の atomic write を必ず失敗させる (tmp を open できない)。
-    let blocker = format!("{}.eidmap.tmp", sim.db_path(0));
+    let blocker = format!("{}/eidmap.tmp", sim.db_path(0));
     std::fs::create_dir_all(&blocker).unwrap();
 
     let b = sim.author_text(1, "name", "held");

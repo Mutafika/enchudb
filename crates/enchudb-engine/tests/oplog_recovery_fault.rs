@@ -61,14 +61,14 @@ fn copy_db(src: &str, dst: &str) {
     // v10: 本体は directory (segment file 群)。 丸ごと写す。
     enchudb_engine::copy_db_dir(Path::new(src), Path::new(dst)).expect("copy body");
     enchudb_engine::copy_sparse(
-        Path::new(&format!("{src}.oplog")),
-        Path::new(&format!("{dst}.oplog")),
+        Path::new(&format!("{src}/oplog")),
+        Path::new(&format!("{dst}/oplog")),
     )
     .expect("copy oplog");
 }
 
 fn oplog_len(path: &str) -> u64 {
-    std::fs::metadata(format!("{path}.oplog")).map(|m| m.len()).unwrap_or(0)
+    std::fs::metadata(format!("{path}/oplog")).map(|m| m.len()).unwrap_or(0)
 }
 
 /// reopen が graceful であることを確認し、 Ok だったかを返す（caller の vacuity guard 用）。
@@ -127,7 +127,7 @@ fn reopen_survives_oplog_truncation() {
         let new_len = full * pct / 100;
         let f = std::fs::OpenOptions::new()
             .write(true)
-            .open(format!("{path}.oplog"))
+            .open(format!("{path}/oplog"))
             .unwrap();
         f.set_len(new_len).unwrap();
         f.sync_all().unwrap();
@@ -161,7 +161,7 @@ fn reopen_recovers_with_zeroed_wal_tail() {
         use std::io::{Seek, SeekFrom, Write};
         let mut f = std::fs::OpenOptions::new()
             .write(true)
-            .open(format!("{path}.oplog"))
+            .open(format!("{path}/oplog"))
             .unwrap();
         f.seek(SeekFrom::Start(from)).unwrap();
         f.write_all(&vec![0u8; (full - from) as usize]).unwrap();
@@ -198,7 +198,7 @@ fn reopen_survives_oplog_byte_flips() {
         let mut f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(format!("{path}.oplog"))
+            .open(format!("{path}/oplog"))
             .unwrap();
         f.seek(SeekFrom::Start(off)).unwrap();
         let mut b = [0u8; 1];

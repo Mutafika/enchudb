@@ -25,7 +25,7 @@ fn phys(path: &str) -> u64 {
     }
     let mut total = 0;
     walk(std::path::Path::new(path), &mut total);
-    if let Ok(m) = std::fs::metadata(format!("{path}.oplog")) {
+    if let Ok(m) = std::fs::metadata(format!("{path}/oplog")) {
         total += m.blocks() * 512;
     }
     total

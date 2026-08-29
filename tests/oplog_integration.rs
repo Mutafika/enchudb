@@ -134,7 +134,7 @@ fn oplog_file_is_created() {
     }
     {
         let _eng = Engine::open_concurrent_with_oplog(&path, 1024 * 1024).unwrap();
-        assert!(Path::new(&format!("{}.oplog", path)).exists());
+        assert!(Path::new(&format!("{}/oplog", path)).exists());
     }
     cleanup(&path);
 }

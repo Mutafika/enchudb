@@ -130,21 +130,21 @@ impl SegmentSet {
         with_leaf: bool,
         cell_version: bool,
     ) -> io::Result<Self> {
-        std::fs::create_dir(dir).map_err(|e| {
-            if e.kind() == io::ErrorKind::AlreadyExists {
-                io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "database already exists: \"{}\" — refusing to overwrite (created concurrently?)",
-                        dir.display()
-                    ),
-                )
-            } else {
-                e
-            }
-        })?;
-        std::fs::create_dir(dir.join("himo"))?;
-        std::fs::create_dir(dir.join("ver"))?;
+        // directory 自体は呼び出し側が作る (`Engine` は `mkdir` の atomic 性で同時 create を
+        // 排他し、 その中に lock を置いてから来る)。 ここでは header.seg の有無で二重 create
+        // を拒む。
+        std::fs::create_dir_all(dir)?;
+        if Self::path_of(dir, SegmentKind::Header).exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "database already exists: \"{}\" — refusing to overwrite (created concurrently?)",
+                    dir.display()
+                ),
+            ));
+        }
+        std::fs::create_dir_all(dir.join("himo"))?;
+        std::fs::create_dir_all(dir.join("ver"))?;
         let mut fixed = HashMap::new();
         let mut kinds: Vec<SegmentKind> = vec![SegmentKind::Header];
         kinds.extend(SegmentKind::FIXED.iter().copied().filter(|k| with_leaf || *k != SegmentKind::LeafData));

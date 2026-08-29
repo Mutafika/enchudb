@@ -170,7 +170,7 @@ fn append_himos_after_seal_integrity() {
         // seal_integrity = flush + .crc 焼き
         eng.seal_integrity().unwrap();
         assert!(
-            std::path::Path::new(&format!("{}.crc", path)).exists(),
+            std::path::Path::new(&format!("{}/crc", path)).exists(),
             ".crc sidecar should exist after seal_integrity"
         );
     }
@@ -183,7 +183,7 @@ fn append_himos_after_seal_integrity() {
         }
         eng.flush().unwrap();
         assert!(
-            !std::path::Path::new(&format!("{}.crc", path)).exists(),
+            !std::path::Path::new(&format!("{}/crc", path)).exists(),
             "define_himo after seal_integrity must invalidate the stale .crc sidecar"
         );
     }

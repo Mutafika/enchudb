@@ -59,7 +59,7 @@ fn open_recovers_from_corrupt_schema_sidecar() {
     }
 
     // `.schema` を破損
-    let schema_path = format!("{}.schema", path);
+    let schema_path = format!("{}/schema", path);
     assert!(std::path::Path::new(&schema_path).exists(), ".schema should exist after build/drop");
     fs::write(&schema_path, b"!!!corrupted-schema-blob!!!").unwrap();
 
@@ -79,17 +79,12 @@ fn open_recovers_from_corrupt_schema_sidecar() {
         "articles should be recovered via engine synthesize"
     );
 
-    // .schema.corrupt-<ts> backup が存在
-    let parent = std::path::Path::new(&path).parent().unwrap_or(std::path::Path::new("/tmp"));
-    let stem = std::path::Path::new(&path).file_name().unwrap().to_string_lossy().to_string();
-    let backup_found = fs::read_dir(parent)
+    // schema.corrupt-<ts> backup が DB directory の中に存在 (v10)
+    let backup_found = fs::read_dir(&path)
         .unwrap()
         .flatten()
-        .any(|ent| {
-            let n = ent.file_name().to_string_lossy().to_string();
-            n.starts_with(&stem) && n.contains(".schema.corrupt-")
-        });
-    assert!(backup_found, "expected .schema.corrupt-<ts> backup file");
+        .any(|ent| ent.file_name().to_string_lossy().starts_with("schema.corrupt-"));
+    assert!(backup_found, "expected schema.corrupt-<ts> backup file");
 
     cleanup_all(&path);
 }
@@ -108,7 +103,7 @@ fn open_self_heals_stale_schema_tmp() {
     }
 
     // `.schema.tmp` 残骸を意図的に置く
-    let tmp: PathBuf = PathBuf::from(format!("{}.schema.tmp", path));
+    let tmp: PathBuf = PathBuf::from(format!("{}/schema.tmp", path));
     fs::write(&tmp, b"crashed persist residue").unwrap();
     assert!(tmp.exists());
 

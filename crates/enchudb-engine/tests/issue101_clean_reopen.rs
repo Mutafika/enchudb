@@ -36,12 +36,12 @@ fn copy_db(src: &str, dst: &str) {
     // v10: 本体は directory (segment file 群)。 丸ごと写す。
     enchudb_engine::copy_db_dir(Path::new(src), Path::new(dst)).expect("copy body");
     let _ = enchudb_engine::copy_sparse(
-        Path::new(&format!("{src}.oplog")),
-        Path::new(&format!("{dst}.oplog")),
+        Path::new(&format!("{src}/oplog")),
+        Path::new(&format!("{dst}/oplog")),
     );
     let _ = enchudb_engine::copy_sparse(
-        Path::new(&format!("{src}.tables")),
-        Path::new(&format!("{dst}.tables")),
+        Path::new(&format!("{src}/tables")),
+        Path::new(&format!("{dst}/tables")),
     );
 }
 

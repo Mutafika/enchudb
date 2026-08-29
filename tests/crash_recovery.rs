@@ -187,7 +187,7 @@ fn sigkill_during_signed_loop_preserves_synced_and_signatures() {
 
         // fold 前の ring を直接読む (file bytes は kill では消えない)
         let recs = enchudb_oplog::oplog::OpLog::open(std::path::Path::new(&format!(
-            "{path}.oplog"
+            "{path}/oplog"
         )))
         .unwrap()
         .iter_committed();
