@@ -126,9 +126,12 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
   grow_entity_cap / free stack / table auto-grow / EXT1 永続 / 実 DB fixture)、
   `v10_cross_process_readonly` (別 process が readonly open、 後から足した himo も見える)、
   `segment_map` (予約 / commit / refresh / ENOSPC)、
-  `v10_damage_probe` (segment 欠損 / truncate / sidecar 欠損を子 process で開いて、 signal 死・
-  panic しないこと)、 `v10_fd_budget` (`RLIMIT_NOFILE` を 64 / 128 / 512 に絞った子 process で
-  himo 200 本の DB を作り、 全値を読み直す)、 `sidecar_mode_preserved`
+  `v10_segment_damage_matrix` (全 segment × 削除 / 0 byte / half truncate × seal 有無 = 57 ケースを
+  子 process で開く。 signal 死・panic が無いこと、 seal 済みは黙って壊れないこと)、
+  `v10_crash_consistency` (書き込み中の SIGKILL × 6 round で、 再 open と flush 済みデータの残存)、
+  `v10_legacy_open_is_read_only` (v9 DB を open しても hash / mtime / 隣接 file が不変)、
+  `v10_fd_budget` (`RLIMIT_NOFILE` を 64 / 128 / 512 に絞った子 process で himo 200 本の DB を
+  作り、 全値を読み直す)、 `sidecar_mode_preserved`
 - 実 DB: sinfohub の v8 `enchu.db` (clonefile した隔離 copy) を migrate → `open_readonly` で
   654 entity / 117 himo / 19 table を確認
 - **消費側 (tag 固定 v0.25.1 の app を `--config patch` で branch に差し替え、 repo の隔離 copy で)**:
