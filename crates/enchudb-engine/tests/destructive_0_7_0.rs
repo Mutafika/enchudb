@@ -212,22 +212,32 @@ fn enable_sync_clamps_when_eid_space_is_tight() {
 }
 
 #[test]
-fn entity_in_returns_err_when_table_eid_range_exhausted() {
+fn entity_in_auto_grows_when_table_eid_range_exhausted() {
+    // v10 Phase 3 (request20 案 B): 先頭 range を使い切った table は、 entity cap に空きが
+    // ある限り末尾の空き eid 空間から extent を足して払い出し続ける。 Err になるのは cap ごと
+    // 尽きたときだけ (その shape は eid_capacity::a_full_table_still_accepts_deletes)。
     let path = tmp_path("table_full");
     cleanup(&path);
 
     let mut eng = Engine::create_with_capacity(&path, 65_536).unwrap();
-    eng.define_table("tiny", 4).unwrap();  // 4 row しか入らない table
+    eng.define_table("tiny", 4).unwrap();  // 先頭 range は 4 row
     eng.define_himo_in("tiny", "v", ValueType::Number, 0).unwrap();
+    eng.define_table("next", 4).unwrap();  // 直後に別 table = tiny は連続では伸びられない
 
-    // 4 件は OK
+    let mut ids = Vec::new();
     for _ in 0..4 {
-        eng.entity_in("tiny").unwrap();
+        ids.push(eng.entity_in("tiny").unwrap());
     }
-    // 5 件目は範囲外で Err
-    let result = eng.entity_in("tiny");
-    assert!(result.is_err(),
-            "5th entity_in on size=4 table should fail, got {:?}", result);
+    // 5 件目は先頭 range の外 = 新しい extent から
+    let fifth = eng.entity_in("tiny").expect("5th entity_in must auto-grow the table");
+    assert!(enchudb_oplog::eid_local(fifth) >= 8, "must land after table 'next' [4, 8): {fifth}");
+    let ext = eng.table_eid_extents("tiny").unwrap();
+    assert_eq!(ext[0], (0, 4));
+    assert_eq!(ext.len(), 2, "{ext:?}");
+    assert_eq!(eng.table_eid_usage("tiny").unwrap().live, 5);
+    // 新 extent の row にも書ける (validate_eid_for_himo が extent を見る)
+    eng.tie(fifth, "tiny.v", 42);
+    assert_eq!(eng.get(fifth, "tiny.v"), Some(42));
 
     cleanup(&path);
 }

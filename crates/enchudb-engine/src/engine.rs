@@ -300,6 +300,30 @@ fn serialize_tables(tables: &[TableDef]) -> Vec<u8> {
             out.extend_from_slice(&hid.to_le_bytes());
         }
     }
+    // v10 Phase 3 (request20 案 B): 追加 extent。 PKS1 と同じ末尾 optional block (version 据え置き)。
+    //   ext_magic: "EXT1" (4)
+    //   ext_count: u32                         (extent を持つ table の数)
+    //   [(table_index: u32, n: u32, [(lo: u32, hi: u32)] × n)] × ext_count
+    let ext: Vec<(u32, Vec<(u32, u32)>)> = tables
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| {
+            let e = t.extra.read().unwrap();
+            if e.is_empty() { None } else { Some((i as u32, e.clone())) }
+        })
+        .collect();
+    if !ext.is_empty() {
+        out.extend_from_slice(b"EXT1");
+        out.extend_from_slice(&(ext.len() as u32).to_le_bytes());
+        for (idx, extents) in ext {
+            out.extend_from_slice(&idx.to_le_bytes());
+            out.extend_from_slice(&(extents.len() as u32).to_le_bytes());
+            for (lo, hi) in extents {
+                out.extend_from_slice(&lo.to_le_bytes());
+                out.extend_from_slice(&hi.to_le_bytes());
+            }
+        }
+    }
     out
 }
 
@@ -363,6 +387,7 @@ fn deserialize_tables(buf: &[u8]) -> Result<Vec<TableDef>, String> {
             next_local,
             free_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             free_locals_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            extra: std::sync::RwLock::new(Vec::new()),
             pk_himo: None,
         });
     }
@@ -370,23 +395,59 @@ fn deserialize_tables(buf: &[u8]) -> Result<Vec<TableDef>, String> {
     // #141: optional PK trailer。 無ければ (= #141 以前が書いた sidecar) PK 無しのまま。
     // 壊れた trailer は「PK 情報が無い」扱いにするだけで、 sidecar 全体は有効とする
     // (PK は再 build で復元できる派生情報であって、 table 定義の本体ではない)。
-    if off + 8 <= buf.len() && &buf[off..off + 4] == b"PKS1" {
-        off += 4;
-        let pk_count = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
-        off += 4;
-        for _ in 0..pk_count {
-            if off + 8 > buf.len() {
-                break;
-            }
-            let idx = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+    // 末尾の optional block 群 (順不同、 未知の magic で打ち切り)
+    while off + 8 <= buf.len() {
+        let magic = &buf[off..off + 4];
+        if magic == b"PKS1" {
             off += 4;
-            let hid = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+            let pk_count = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
             off += 4;
-            if let Some(t) = tables.get_mut(idx) {
-                if hid <= u16::MAX as u32 {
-                    t.pk_himo = Some(hid as u16);
+            for _ in 0..pk_count {
+                if off + 8 > buf.len() {
+                    break;
+                }
+                let idx = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+                off += 4;
+                let hid = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+                off += 4;
+                if let Some(t) = tables.get_mut(idx) {
+                    if hid <= u16::MAX as u32 {
+                        t.pk_himo = Some(hid as u16);
+                    }
                 }
             }
+        } else if magic == b"EXT1" {
+            off += 4;
+            let ext_count = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+            off += 4;
+            for _ in 0..ext_count {
+                if off + 8 > buf.len() {
+                    return Err("tables sidecar: truncated (EXT1)".into());
+                }
+                let idx = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+                off += 4;
+                let n = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+                off += 4;
+                if off + n.saturating_mul(8) > buf.len() {
+                    return Err("tables sidecar: truncated (EXT1 extents)".into());
+                }
+                let mut extents = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let lo = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+                    off += 4;
+                    let hi = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+                    off += 4;
+                    if lo >= hi {
+                        return Err(format!("tables sidecar: bad extent [{lo}, {hi})"));
+                    }
+                    extents.push((lo, hi));
+                }
+                if let Some(t) = tables.get_mut(idx) {
+                    *t.extra.write().unwrap() = extents;
+                }
+            }
+        } else {
+            break;
         }
     }
     Ok(tables)
@@ -964,6 +1025,31 @@ fn punch_holes(_f: &std::fs::File, _runs: &[(u64, u64)]) -> io::Result<()> {
     Ok(())
 }
 
+/// `buf` を offset 0 から sparse に書く (全 0 の 4 KB block は穴)。 `copy_file_range` の
+/// in-memory 版。
+#[cfg(not(target_arch = "wasm32"))]
+fn write_sparse(out: &mut std::fs::File, buf: &[u8]) -> io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    const BLOCK: usize = 4096;
+    let mut holes: Vec<(u64, u64)> = Vec::new();
+    let mut i = 0;
+    while i < buf.len() {
+        let end = (i + BLOCK).min(buf.len());
+        if buf[i..end].iter().any(|b| *b != 0) {
+            out.seek(SeekFrom::Start(i as u64))?;
+            out.write_all(&buf[i..end])?;
+        } else {
+            match holes.last_mut() {
+                Some((o, l)) if *o + *l == i as u64 => *l += (end - i) as u64,
+                _ => holes.push((i as u64, (end - i) as u64)),
+            }
+        }
+        i = end;
+    }
+    out.set_len(buf.len() as u64)?;
+    punch_holes(out, &holes)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 impl Engine {
     /// v10: header (Layout / himo_count / cell_version) から、 directory に存在しうる segment の
@@ -1038,6 +1124,15 @@ impl Engine {
                 format!("packed file truncated: {} bytes (layout.total_size = {})", total, layout.total_size),
             ));
         }
+        // legacy (v8 / v9): reservation を既定まで広げ、 EntitySet を新 layout に組み直す
+        // (free stack の位置が bitset 容量で決まるので、 中身を動かす必要がある)
+        let src_version = u32::from_le_bytes(fixed[H_VERSION..H_VERSION + 4].try_into().unwrap());
+        let legacy = src_version != FILE_VERSION;
+        let new_reserve = if legacy {
+            default_reserve_entities(layout.max_entities)
+        } else {
+            layout.reserve_entities
+        };
         let dstp = std::path::Path::new(dst);
         std::fs::create_dir(dstp)?;
         std::fs::create_dir(dstp.join("himo"))?;
@@ -1055,11 +1150,18 @@ impl Engine {
                 let mut hdr = vec![0u8; v10_size.max(layout.header_size)];
                 src.seek(SeekFrom::Start(0))?;
                 src.read_exact(&mut hdr[..layout.header_size])?;
-                if u32::from_le_bytes(hdr[H_VERSION..H_VERSION + 4].try_into().unwrap()) != FILE_VERSION {
+                if legacy {
                     hdr[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION.to_le_bytes());
+                    hdr[H_RESERVE_ENTITIES..H_RESERVE_ENTITIES + 4].copy_from_slice(&new_reserve.to_le_bytes());
                     write_header_crc(&mut hdr);
                 }
                 out.write_all(&hdr)?;
+            } else if legacy && kind == SegmentKind::Entities {
+                let mut old = vec![0u8; size as usize];
+                src.seek(SeekFrom::Start(off))?;
+                src.read_exact(&mut old)?;
+                let new = EntitySet::relayout(&old, layout.max_entities, new_reserve);
+                write_sparse(&mut out, &new)?;
             } else {
                 let used = last_data_end(&src, off, end);
                 // page 未満でも SegmentMap::open が page に揃える。 ここでは data の末尾まで。
@@ -1453,6 +1555,9 @@ pub struct GrowableOptions {
     /// 値は内部で `next_power_of_two` に丸められ、 header に焼かれる (= 既存 DB は
     /// rebuild しないと変わらない、 `max_himos` と同じ性質)。
     pub vocab_max_entries: Option<u32>,
+    /// v10 Phase 3: entity の reservation (= `grow_entity_cap` の上限)。 `None` は既定
+    /// (unix: max(max_entities, 2^28)、 Windows: max_entities = 伸ばせない)。
+    pub reserve_entities: Option<u32>,
 }
 
 impl Default for GrowableOptions {
@@ -1466,6 +1571,7 @@ impl Default for GrowableOptions {
             leaf_data_size: None,
             leaf_scale: LeafScale::Gb16,
             vocab_max_entries: None,
+            reserve_entities: None,
         }
     }
 }
@@ -1506,6 +1612,20 @@ const H_LEAF_DATA_SIZE: usize = 80; // u64
 /// CRC 保護外 (H_LEAF_DATA_SIZE と同様) だが、 破損して 1 に化けても layout の
 /// total_size が file size を超えて open 時に `backing too small` で弾かれる。
 const H_CELL_VERSION: usize = 88; // u32
+/// v10 Phase 3 (request20): entity の reservation = `grow_entity_cap` で伸ばせる上限。 mmap の
+/// 予約長と EntitySet の bitset 容量がこれで決まる。 0 (v10 初期 / legacy) は `max_entities`。
+/// header CRC の範囲外 (grow で書き換えるのは `H_MAX_ENTITIES` だけ)。
+const H_RESERVE_ENTITIES: usize = 92; // u32
+
+/// v10 Phase 3: create 時の reservation 既定。 unix は仮想空間だけなので大きく取る (2^28 entity
+/// = Column 4 B で 1 GB / 版数 16 B で 4 GB の仮想)。 Windows は sparse file を reservation
+/// 長で作る (`segment_map_windows`) ので apparent に出る → cap と同値 (= 伸ばせない。 伸ばす
+/// なら `GrowableOptions::reserve_entities` で明示)。
+const DEFAULT_RESERVE_ENTITIES: u32 = 1 << 28;
+
+fn default_reserve_entities(max_entities: u32) -> u32 {
+    if cfg!(windows) { max_entities } else { max_entities.max(DEFAULT_RESERVE_ENTITIES) }
+}
 
 const BACKING_KIND_GROWABLE: u32 = 1;
 const H_HIMO_TYPES: usize = 256;
@@ -1740,13 +1860,23 @@ struct Layout {
     himo_slot_size: usize,
     cyl_max_values: u32,
     total_size: usize,
+    /// v10 Phase 3: 現在の entity 上限 (header `max_entities`)。 packed の region size はこれ基準。
+    max_entities: u32,
+    /// v10 Phase 3: entity の reservation (= `grow_entity_cap` の上限、 header offset 92)。
+    /// mmap の予約 (`segment_reserve`) と EntitySet の bitset 容量はこれ基準。 legacy は
+    /// `max_entities` と同値。
+    reserve_entities: u32,
+    content_index_reserve: usize,
+    himo_col_reserve: usize,
+    ver_col_reserve: usize,
+    tomb_reserve: usize,
 }
 
 impl Layout {
     /// #120: 上限超過 (align8 後の u32 data_end / total_size overflow) は
     /// **書く前に** Err で返す。 呼び元 (create 経路) は `io::ErrorKind::InvalidInput`
     /// に写して伝播すること — panic にすると caller が握れない。
-    fn compute(max_entities: u32, max_himos: u32, vocab_data_size: usize, content_data_size: Option<usize>, cyl_max_values: Option<u32>, leaf_data_size: Option<usize>, vocab_max_entries: Option<u32>, cell_version: bool) -> Result<Self, String> {
+    fn compute(max_entities: u32, max_himos: u32, vocab_data_size: usize, content_data_size: Option<usize>, cyl_max_values: Option<u32>, leaf_data_size: Option<usize>, vocab_max_entries: Option<u32>, cell_version: bool, reserve_entities: Option<u32>) -> Result<Self, String> {
         // #122: 既定は max_entities × 16 (上限 256 M)。 vocab の値の種類数は entity 数と
         // 相関しないので、 実測で分かっている consumer は GrowableOptions で明示する。
         let vocab_max_entries = match vocab_max_entries {
@@ -1768,6 +1898,7 @@ impl Layout {
             vocab_max_entries, vocab_data_size,
             content_data_size, cyl_max_values, leaf_data_size,
             cell_version,
+            reserve_entities,
         )
     }
 
@@ -1783,6 +1914,7 @@ impl Layout {
         leaf_data_size: Option<usize>,
         // v9 (request17-A): per-cell version column を持つか。
         cell_version: bool,
+        reserve_entities: Option<u32>,
     ) -> Result<Self, String> {
         let vocab_index_cap = vocab_max_entries.next_power_of_two();
         let himoreg_max_entries = max_himos.max(256);
@@ -1805,6 +1937,7 @@ impl Layout {
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, leaf_data_size, cyl_max_values,
             cell_version,
+            reserve_entities.unwrap_or_else(|| default_reserve_entities(max_entities)),
         )
     }
 
@@ -1819,6 +1952,7 @@ impl Layout {
         // v9 (request17-A): per-cell version column を持つか。
         // false = pre-v9 DB、 または v9 を有効化していない create。
         cell_version: bool,
+        reserve_entities: u32,
     ) -> Result<Self, String> {
         Self::try_from_params_with_header(
             max_entities, max_himos,
@@ -1827,6 +1961,7 @@ impl Layout {
             content_data_size, leaf_data_size, cyl_max_values,
             cell_version,
             header_size_for(max_himos),
+            reserve_entities,
         )
     }
 
@@ -1840,7 +1975,14 @@ impl Layout {
         content_data_size: usize, leaf_data_size: usize, cyl_max_values: u32,
         cell_version: bool,
         header_size: usize,
+        reserve_entities: u32,
     ) -> Result<Self, String> {
+        let reserve_entities = reserve_entities.max(max_entities);
+        if reserve_entities > u32::MAX - 7 {
+            return Err(format!(
+                "reserve_entities {} exceeds format limit — corrupt header?", reserve_entities,
+            ));
+        }
         // EntitySet::region_size 内部の `(max_entities + 7)` が u32 で wrap しない
         // ガード。 この値の DB は create 時点で作れない (debug では overflow panic)。
         if max_entities > u32::MAX - 7 {
@@ -1873,7 +2015,8 @@ impl Layout {
 
         // ── 固定 cluster: 上限が max_entities / max_himos / *_cap で決まる ──
         let entities_off = off;
-        let entities_size = align8(EntitySet::region_size(max_entities));
+        // v10: EntitySet の bitset は reservation 分の場所を取る (cap を伸ばしても offset 不動)
+        let entities_size = align8(EntitySet::region_size(reserve_entities));
         off = ck_add(off, entities_size)?;
 
         let vocab_offsets_off = off;
@@ -1996,6 +2139,11 @@ impl Layout {
             content_data_off, content_data_size,
             leaf_data_off, leaf_data_size,
             himo_base_off, himo_col_size, himo_cyl_size, himo_slot_size,
+            max_entities, reserve_entities,
+            content_index_reserve: align8(ContentStore::index_region_size_for(reserve_entities)),
+            himo_col_reserve: align8(Column::region_size(reserve_entities, 4)),
+            ver_col_reserve: align8(Column::region_size(reserve_entities, HLC_CELL_BYTES)),
+            tomb_reserve: align8(Column::region_size(reserve_entities, HLC_CELL_BYTES)),
             cyl_max_values,
             total_size: off,
         })
@@ -2053,6 +2201,19 @@ impl SegmentSizes for Layout {
             SegmentKind::Tomb => self.tomb_size,
             SegmentKind::Himo(_) => self.himo_col_size,
             SegmentKind::Ver(_) => self.ver_col_size,
+        }
+    }
+
+    /// v10 Phase 3: entity 比例の segment は reservation 分を予約する (cap を伸ばしても
+    /// base pointer が動かない)。 それ以外は size と同じ。
+    fn segment_reserve(&self, kind: SegmentKind) -> usize {
+        match kind {
+            SegmentKind::Entities => self.entities_size,
+            SegmentKind::ContentIndex => self.content_index_reserve,
+            SegmentKind::Himo(_) => self.himo_col_reserve,
+            SegmentKind::Ver(_) => self.ver_col_reserve,
+            SegmentKind::Tomb => self.tomb_reserve,
+            _ => self.segment_size(kind),
         }
     }
 }
@@ -2135,6 +2296,11 @@ pub(crate) struct TableDef {
     /// で空になったら false に戻す。 厳密な race は entity_in 内で mutex 取った
     /// あと再 check するので OK (= AtomicBool は fast path の hint)。
     pub free_locals_nonempty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// v10 Phase 3 (request20 案 B): 先頭 range (`eid_range_lo..hi`) の後に足した extent 群。
+    /// `entity_in` が先頭を使い切ると空き eid 空間から切り足す (auto-grow)。 local id は
+    /// 先頭 → extra の順に連結した offset (= `next_local` / `free_locals` はそのまま)。
+    /// grow しない table (常態) は空で、 hot path は先頭 range だけ見る。
+    pub extra: std::sync::RwLock<Vec<(u32, u32)>>,
     /// #141: この table の primary key を成す himo の id。 PK 未指定なら `None`。
     ///
     /// PK 自体は schema 層 (`TableBuilder::primary_key`) の概念だが、 **sync の
@@ -2161,12 +2327,85 @@ impl Clone for TableDef {
             // 側で coordinate する想定)。
             free_locals: self.free_locals.clone(),
             free_locals_nonempty: self.free_locals_nonempty.clone(),
+            extra: std::sync::RwLock::new(self.extra.read().unwrap().clone()),
             pk_himo: self.pk_himo,
         }
     }
 }
 
 impl TableDef {
+    /// anonymous table がまだ閉じていない (= 後続 table が無い) か。
+    #[inline]
+    fn is_open_ended(&self) -> bool {
+        self.eid_range_hi == u32::MAX
+    }
+
+    /// 全 extent (先頭 + `extra`)。 open-ended な anonymous は先頭 1 本。
+    pub fn extents(&self) -> Vec<(u32, u32)> {
+        let mut v = vec![(self.eid_range_lo, self.eid_range_hi)];
+        v.extend(self.extra.read().unwrap().iter().copied());
+        v
+    }
+
+    /// 払い出せる eid 総数。 open-ended は `u32::MAX`。
+    pub fn capacity(&self) -> u32 {
+        if self.is_open_ended() {
+            return u32::MAX;
+        }
+        let first = self.eid_range_hi - self.eid_range_lo;
+        self.extra.read().unwrap().iter().fold(first, |acc, (lo, hi)| acc.saturating_add(hi - lo))
+    }
+
+    /// 最後の extent の上限 (exclusive)。 次の table / extent はここから切る。
+    pub fn last_hi(&self) -> u32 {
+        self.extra.read().unwrap().last().map(|e| e.1).unwrap_or(self.eid_range_hi)
+    }
+
+    /// `global` (local eid) がこの table の extent のどれかに入るか。
+    #[inline]
+    pub fn contains(&self, global: u32) -> bool {
+        self.local_of(global).is_some()
+    }
+
+    /// global (local eid) → table 内 local offset。 先頭 range は lock 無し。
+    #[inline]
+    pub fn local_of(&self, global: u32) -> Option<u32> {
+        if global >= self.eid_range_lo && global < self.eid_range_hi {
+            return Some(global - self.eid_range_lo);
+        }
+        if self.is_open_ended() {
+            return None;
+        }
+        let extra = self.extra.read().unwrap();
+        let mut base = self.eid_range_hi - self.eid_range_lo;
+        for &(lo, hi) in extra.iter() {
+            if global >= lo && global < hi {
+                return Some(base + (global - lo));
+            }
+            base += hi - lo;
+        }
+        None
+    }
+
+    /// table 内 local offset → global (local eid)。 extent の外なら `None` (= 枯渇)。
+    #[inline]
+    pub fn global_of(&self, local: u32) -> Option<u32> {
+        let first = self.eid_range_hi.wrapping_sub(self.eid_range_lo);
+        if self.is_open_ended() || local < first {
+            return self.eid_range_lo.checked_add(local);
+        }
+        let extra = self.extra.read().unwrap();
+        let mut rel = local - first;
+        for &(lo, hi) in extra.iter() {
+            let len = hi - lo;
+            if rel < len {
+                return Some(lo + rel);
+            }
+            rel -= len;
+        }
+        None
+    }
+
     /// 起動時の anonymous table。 全 himo / entity の default 受け皿。
     /// `eid_range_hi == u32::MAX` の間は open-ended (旧 API で `entity()` が
     /// 呼べる)、 `define_table` で初めて非 anon table が切られた瞬間に
@@ -2182,6 +2421,7 @@ impl TableDef {
             free_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             free_locals_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // #141: PK は schema 層が build 後に `set_table_pk` で降ろす。
+            extra: std::sync::RwLock::new(Vec::new()),
             pk_himo: None,
         }
     }
@@ -2223,8 +2463,11 @@ pub struct Engine {
     last_fault_warn_ms: std::sync::atomic::AtomicU64,
     #[allow(dead_code)]
     path: String,
-    layout: Layout,
-    max_entities: u32,
+    layout: std::sync::RwLock<Layout>,
+    /// v10 Phase 3: 現在の entity 上限。 `grow_entity_cap` で伸びる (reservation まで)。
+    entity_cap: std::sync::atomic::AtomicU32,
+    /// v10 Phase 3: table extent の追加 (`grow_table` / auto-grow) を直列化する。
+    table_grow_lock: std::sync::Mutex<()>,
     max_himos: u32,
     vocab: Vocabulary,
     himo_reg: Vocabulary,
@@ -2607,7 +2850,7 @@ impl Engine {
         let off_shift = leaf_scale.map(|s| s.off_shift()).unwrap_or(DEFAULT_LEAF_OFF_SHIFT);
         let vds = vocab_data_size.unwrap_or(DEFAULT_VOCAB_DATA_SIZE);
         let max_himos = max_himos.unwrap_or(DEFAULT_MAX_HIMOS);
-        let layout = Layout::compute(max_entities, max_himos, vds, content_data_size, cyl_max_values, leaf_data_size, None, cell_version).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, vds, content_data_size, cyl_max_values, leaf_data_size, None, cell_version, None).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         // #90: 予約 leaf region が選んだ scale の cap を超えないか検証。
         let leaf_cap = cap_bytes_for_shift(off_shift);
         if layout.leaf_data_size as u64 > leaf_cap {
@@ -2656,6 +2899,7 @@ impl Engine {
         mmap[H_MAGIC..H_MAGIC + 4].copy_from_slice(&FILE_MAGIC);
             mmap[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION.to_le_bytes());
             mmap[H_MAX_ENTITIES..H_MAX_ENTITIES + 4].copy_from_slice(&max_entities.to_le_bytes());
+            mmap[H_RESERVE_ENTITIES..H_RESERVE_ENTITIES + 4].copy_from_slice(&layout.reserve_entities.to_le_bytes());
             mmap[H_MAX_HIMOS..H_MAX_HIMOS + 4].copy_from_slice(&max_himos.to_le_bytes());
             mmap[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&0u32.to_le_bytes());
             mmap[H_VOCAB_MAX_ENTRIES..H_VOCAB_MAX_ENTRIES + 4].copy_from_slice(&layout.vocab_max_entries.to_le_bytes());
@@ -2676,7 +2920,7 @@ impl Engine {
         }
         backing.flush_header(layout.header_size)?;
 
-        let entities = EntitySet::init(backing.region(SegmentKind::Entities, &layout), max_entities);
+        let entities = EntitySet::init(backing.region(SegmentKind::Entities, &layout), max_entities, layout.reserve_entities);
         let vocab = Vocabulary::init(
             backing.region(SegmentKind::VocabData, &layout),
             backing.region(SegmentKind::VocabOffsets, &layout),
@@ -2708,7 +2952,8 @@ impl Engine {
         };
 
         Ok(Self {
-            path: path.to_string(), layout, max_entities, max_himos,
+            path: path.to_string(), layout: std::sync::RwLock::new(layout), entity_cap: std::sync::atomic::AtomicU32::new(max_entities),
+            table_grow_lock: std::sync::Mutex::new(()), max_himos,
             vocab, himo_reg,
             himo_names: AppendVec::with_capacity(max_himos as usize),
             value_types: AppendVec::with_capacity(max_himos as usize),
@@ -2797,7 +3042,7 @@ impl Engine {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create_growable_with_capacity(path: &str, max_entities: u32) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
-        let layout = Layout::compute(max_entities, max_himos, DEFAULT_VOCAB_DATA_SIZE, None, None, None, None, false).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, DEFAULT_VOCAB_DATA_SIZE, None, None, None, None, false, None).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
     }
 
@@ -2808,7 +3053,7 @@ impl Engine {
     #[doc(hidden)]
     pub fn create_growable_with_cell_version(path: &str, max_entities: u32) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
-        let layout = Layout::compute(max_entities, max_himos, DEFAULT_VOCAB_DATA_SIZE, None, None, None, None, true).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, DEFAULT_VOCAB_DATA_SIZE, None, None, None, None, true, None).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
     }
 
@@ -2825,7 +3070,7 @@ impl Engine {
         vocab_data_size: usize,
     ) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
-        let layout = Layout::compute(max_entities, max_himos, vocab_data_size, None, None, None, None, false).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, vocab_data_size, None, None, None, None, false, None).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
     }
 
@@ -2843,7 +3088,7 @@ impl Engine {
     ) -> io::Result<Self> {
         let max_himos = DEFAULT_MAX_HIMOS;
         let vds = vocab_data_size.unwrap_or(DEFAULT_VOCAB_DATA_SIZE);
-        let layout = Layout::compute(max_entities, max_himos, vds, None, None, leaf_data_size, None, false).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let layout = Layout::compute(max_entities, max_himos, vds, None, None, leaf_data_size, None, false, None).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let leaf_cap = leaf_scale.cap_bytes();
         if layout.leaf_data_size as u64 > leaf_cap {
             return Err(io::Error::new(
@@ -2872,6 +3117,7 @@ impl Engine {
             opts.vocab_max_entries, // #122
             // request18: v9 領域は enable_sync_tables() が生やす (create では確保しない)
             false,
+            opts.reserve_entities,
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let leaf_cap = opts.leaf_scale.cap_bytes();
@@ -2926,6 +3172,7 @@ impl Engine {
             Some(64),         // cyl_max_values: small per-himo cylinders
             None,             // leaf_data: default
             false,            // v9 (request17): 未有効化
+            None,             // reserve_entities: 既定
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         Self::create_growable_full(path, layout, max_entities, max_himos, DEFAULT_LEAF_OFF_SHIFT)
@@ -3133,7 +3380,7 @@ impl Engine {
     /// `kind` の region の **commit 済み部分** を `&[u8]` で。 予約全域 (zero page) を
     /// 舐めないための CRC / dump 用。
     fn region_committed_bytes(&self, kind: SegmentKind) -> &[u8] {
-        let r = self.backing.region(kind, &self.layout);
+        let r = self.backing.region(kind, &*self.layout.read().unwrap());
         let n = r.committed_len();
         // SAFETY: mapping は self.backing が所有し self より長生きする。
         unsafe { std::slice::from_raw_parts(r.slice().as_ptr(), n) }
@@ -3141,7 +3388,7 @@ impl Engine {
 
     fn compute_region_crc_table(&self) -> crate::integrity::CrcTable {
         use crate::integrity::{CrcTable, RegionKind, fnv1a_region, fnv1a_slices};
-        let file_size = self.layout.total_size as u64;
+        let file_size = self.layout.read().unwrap().total_size as u64;
         let mut table = CrcTable::new(self.max_himos, file_size);
         for hid in 0..self.value_types.len() {
             let b = self.region_committed_bytes(SegmentKind::Himo(hid as u32));
@@ -3266,6 +3513,12 @@ impl Engine {
             && u32::from_le_bytes(buf[H_CELL_VERSION..H_CELL_VERSION + 4].try_into().unwrap()) != 0;
         // v8 / v9 の header は固定 4096 (himo 表は溢れ得た = #246)。 v10 は可変長。
         let header_size = if version < FILE_VERSION { HEADER_SIZE } else { header_size_for(max_himos) };
+        // v10 Phase 3: reservation。 legacy / 未設定 (0) は max_entities と同値 (= 伸ばせない)。
+        let reserve_entities = if version < FILE_VERSION {
+            max_entities
+        } else {
+            u32::from_le_bytes(buf[H_RESERVE_ENTITIES..H_RESERVE_ENTITIES + 4].try_into().unwrap()).max(max_entities)
+        };
         let layout = Layout::try_from_params_with_header(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
@@ -3273,6 +3526,7 @@ impl Engine {
             content_data_size, leaf_data_size, cyl_max_values,
             cell_version,
             header_size,
+            reserve_entities,
         )?;
         Ok((layout, himo_count))
     }
@@ -3285,21 +3539,24 @@ impl Engine {
     /// packed (`Memory`) backing は永続しないので flag に意味が無く、 no-op。
     #[cfg(not(target_arch = "wasm32"))]
     fn add_v9_regions_for_sync(&mut self) -> io::Result<()> {
-        if self.layout.has_cell_version() {
+        if self.layout.read().unwrap().has_cell_version() {
             return Ok(()); // 既に v9 (明示 create / 有効化済み)
         }
         if self.backing.memory_len().is_some() {
             return Ok(());
         }
-        let l = &self.layout;
+        let guard = self.layout.read().unwrap();
+        let l = &*guard;
         let v9 = Layout::try_from_params(
-            self.max_entities, self.max_himos,
+            self.max_entities(), self.max_himos,
             l.vocab_max_entries, l.vocab_index_cap, l.vocab_data_size,
             l.himoreg_max_entries, l.himoreg_index_cap, l.himoreg_data_size,
             l.content_data_size, l.leaf_data_size, l.cyl_max_values,
             true,
+            l.reserve_entities,
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        drop(guard);
 
         // 順序: segment file を作る → column を組む → header flag。 逆にすると flag だけ
         // 立った DB が crash で残り、 次の open が無い segment を探して失敗する。
@@ -3307,17 +3564,17 @@ impl Engine {
         for hid in 0..self.himos.len() {
             self.backing.ensure_ver(hid as u32, &v9)?;
         }
-        self.layout = v9;
+        *self.layout.write().unwrap() = v9;
         for hid in 0..self.himos.len() {
             let ver = ver_column_from_region(
-                self.backing.region(SegmentKind::Ver(hid as u32), &self.layout),
-                self.max_entities,
+                self.backing.region(SegmentKind::Ver(hid as u32), &*self.layout.read().unwrap()),
+                self.max_entities(),
             );
             let _ = self.ver_cols.push(ver);
         }
         self.tomb_col = Some(ver_column_from_region(
-            self.backing.region(SegmentKind::Tomb, &self.layout),
-            self.max_entities,
+            self.backing.region(SegmentKind::Tomb, &*self.layout.read().unwrap()),
+            self.max_entities(),
         ));
 
         let buf = self.backing.header_mut(HEADER_SIZE);
@@ -3389,6 +3646,7 @@ impl Engine {
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, leaf_data_size, cyl_max_values,
             false, // v9 (request17): 未有効化。 header から読むのは有効化と同時
+            max_entities,
         )?;
 
         // src が v5 layout 全域 (= leaf_data_off までのバイト列) をカバーしているか。
@@ -3612,7 +3870,8 @@ impl Engine {
         }
 
         let eng = Self {
-            path: String::new(), layout, max_entities, max_himos,
+            path: String::new(), layout: std::sync::RwLock::new(layout), entity_cap: std::sync::atomic::AtomicU32::new(max_entities),
+            table_grow_lock: std::sync::Mutex::new(()), max_himos,
             vocab, himo_reg,
             himo_names, value_types, himo_max_values,
             himos, ver_cols, tomb_col, entities, contents,
@@ -3984,7 +4243,7 @@ impl Engine {
             .tables
             .iter()
             .filter(|t| t.is_reserved())
-            .map(|t| (t.eid_range_lo, t.eid_range_hi))
+            .flat_map(|t| t.extents())
             .collect();
         let is_internal_eid = |eid: u64| -> bool {
             let local = enchudb_oplog::eid_local(eid);
@@ -4708,13 +4967,12 @@ impl Engine {
             .tables
             .iter()
             .find(|t| t.name == "_sync_ops")
-            .map(|t| (t.eid_range_lo, t.free_locals.clone(), t.free_locals_nonempty.clone()));
-        let local = enchudb_oplog::eid_local(eid);
+            .map(|t| (t.local_of(enchudb_oplog::eid_local(eid)), t.free_locals.clone(), t.free_locals_nonempty.clone()));
         match meta {
-            Some((lo, free_list, nonempty)) if local >= lo => {
+            Some((Some(local), free_list, nonempty)) => {
                 let mut list = free_list.lock().unwrap();
                 self.delete(eid);
-                list.push(local - lo);
+                list.push(local);
                 nonempty.store(true, std::sync::atomic::Ordering::Release);
             }
             _ => self.delete(eid),
@@ -5636,17 +5894,17 @@ impl Engine {
         let new_lo = self
             .tables
             .iter()
-            .map(|t| t.eid_range_hi)
+            .map(|t| t.last_hi())
             .max()
             .unwrap_or(0);
         let new_hi = new_lo
             .checked_add(size)
             .ok_or_else(|| "eid space overflow (u32::MAX)".to_string())?;
-        if new_hi > self.max_entities {
+        if new_hi > self.max_entities() {
             return Err(format!(
                 "table '{}' eid range [{}, {}) exceeds max_entities {} (remaining {}; see Engine::remaining_eid_capacity)",
-                name, new_lo, new_hi, self.max_entities,
-                self.max_entities.saturating_sub(new_lo),
+                name, new_lo, new_hi, self.max_entities(),
+                self.max_entities().saturating_sub(new_lo),
             ));
         }
 
@@ -5661,6 +5919,7 @@ impl Engine {
             free_locals: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             free_locals_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // #141: PK は schema 層が build 後に `set_table_pk` で降ろす。
+            extra: std::sync::RwLock::new(Vec::new()),
             pk_himo: None,
         });
         self.try_persist_tables();
@@ -5701,7 +5960,7 @@ impl Engine {
             if fl.is_empty() {
                 table.free_locals_nonempty.store(false, Ordering::Release);
             }
-            popped.map(|local| table.eid_range_lo + local)
+            popped.and_then(|local| table.global_of(local))
         } else {
             None
         };
@@ -5719,30 +5978,40 @@ impl Engine {
             return Ok(enchudb_oplog::make_eid(peer, global));
         }
 
-        // capacity check (= fetch_add 後の load で再 check して overflow 検出)
-        let table_size = table.eid_range_hi - table.eid_range_lo;
+        // capacity check (= fetch_add 後の変換で extent の外なら枯渇)
         let cur = table.next_local.fetch_add(1, Ordering::AcqRel);
-        if cur >= table_size {
-            // 0.18.2: `free_locals` は in-memory のみで reopen で消える。 reclaim 済み
-            // slot を持つ store を reopen すると、 range は「満杯」に見えるのに実際は
-            // 穴だらけで、 ここが恒久 Err になる。 `_sync_ops` ではこれが
-            // 「transfer が row を挿せない → 変更が sync から**無言で欠落**」として
-            // 実機発現した (ring ~25K 全 reclaim 後の reopen で bridge 全停止)。
-            // 枯渇時に一度 EntitySet の liveness から穴を再構築して自己修復する。
-            if self.rebuild_free_locals(tid) {
-                // 穴が見つかった — free list 経由で取り直す。 再帰は一段で止まる:
-                // 再構築後も枯渇なら fl が空のままなので次は Err に落ちる。
-                return self.entity_in(table_name);
+        let global = match table.global_of(cur) {
+            Some(g) => g,
+            None => {
+                // 0.18.2: `free_locals` は in-memory のみで reopen で消える。 reclaim 済み
+                // slot を持つ store を reopen すると、 range は「満杯」に見えるのに実際は
+                // 穴だらけで、 ここが恒久 Err になる。 `_sync_ops` ではこれが
+                // 「transfer が row を挿せない → 変更が sync から**無言で欠落**」として
+                // 実機発現した (ring ~25K 全 reclaim 後の reopen で bridge 全停止)。
+                // 枯渇時に一度 EntitySet の liveness から穴を再構築して自己修復する。
+                if self.rebuild_free_locals(tid) {
+                    // 穴が見つかった — free list 経由で取り直す。 再帰は一段で止まる:
+                    // 再構築後も枯渇なら fl が空のままなので次は grow / Err に落ちる。
+                    return self.entity_in(table_name);
+                }
+                // v10 Phase 3 (request20 案 B): 空き eid 空間があれば extent を切り足す。
+                match self.grow_table_extent_for(tid, cur) {
+                    Some(g) => g,
+                    None => {
+                        // 払出した分を rollback (= overflow 状態を維持しないため厳密には
+                        // 必要だが、 単調 monotone な next_local なので少々超過しても
+                        // 次回以降の check で確実に弾ける。 ここは error を返すのみ)。
+                        return Err(format!(
+                            "table '{}' eid range exhausted ({} eids reserved, entity cap {} — \
+                             Engine::grow_entity_cap to add room)",
+                            table_name,
+                            table.capacity(),
+                            self.max_entities(),
+                        ));
+                    }
+                }
             }
-            // 払出した分を rollback (= overflow 状態を維持しないため厳密には
-            // 必要だが、 単調 monotone な next_local なので少々超過しても
-            // 次回以降の check で確実に弾ける。 ここは error を返すのみ)。
-            return Err(format!(
-                "table '{}' eid range exhausted ({} eids reserved)",
-                table_name, table_size,
-            ));
-        }
-        let global = table.eid_range_lo + cur;
+        };
 
         // EntitySet で live mark + next_eid 前進 (CAS safe)
         self.entities.allocate_at(global);
@@ -5773,13 +6042,17 @@ impl Engine {
         if !fl.is_empty() {
             return true; // 別 thread が再構築済み
         }
-        let allocated = table
-            .next_local
-            .load(Ordering::Acquire)
-            .min(table.eid_range_hi - table.eid_range_lo);
-        for global in table.eid_range_lo..(table.eid_range_lo + allocated) {
-            if !self.entities.is_live(global) {
-                fl.push(global - table.eid_range_lo);
+        let allocated = table.next_local.load(Ordering::Acquire).min(table.capacity());
+        let mut local = 0u32;
+        'outer: for (lo, hi) in table.extents() {
+            for global in lo..hi {
+                if local >= allocated {
+                    break 'outer;
+                }
+                if !self.entities.is_live(global) {
+                    fl.push(local);
+                }
+                local += 1;
             }
         }
         let found = !fl.is_empty();
@@ -6047,7 +6320,76 @@ impl Engine {
     /// `sum_range` / `count_range` / `group_sum_range` に bind するのに使う。
     /// 未定義 table は None。
     pub fn table_eid_range(&self, name: &str) -> Option<(u32, u32)> {
-        self.tables.iter().find(|t| t.name == name).map(|t| (t.eid_range_lo, t.eid_range_hi))
+        self.tables.iter().find(|t| t.name == name).map(|t| (t.eid_range_lo, t.last_hi()))
+    }
+
+    /// v10 Phase 3 (request20 案 B): table の eid extent 一覧 (`[lo, hi)` の列、 払出順)。
+    /// auto-grow した table は 2 本以上になり、 間に他 table の eid が挟まる。 scan は
+    /// `table_eid_range` (= hull) ではなくこちらで。
+    pub fn table_eid_extents(&self, name: &str) -> Option<Vec<(u32, u32)>> {
+        self.tables.iter().find(|t| t.name == name).map(|t| t.extents())
+    }
+
+    /// v10 Phase 3 (request20): table の枠を `extra` 個明示的に足す (末尾の空き eid 空間から)。
+    /// 戻り値は新しい capacity。 空きが無ければ Err (`grow_entity_cap` で cap を伸ばす)。
+    /// `entity_in` は枯渇時に同じことを自動でやるので、 通常は呼ばなくてよい。
+    pub fn grow_table(&self, name: &str, extra: u32) -> Result<u32, String> {
+        let tid = self
+            .tables
+            .iter()
+            .position(|t| t.name == name)
+            .ok_or_else(|| format!("table '{}' not found", name))?;
+        if extra == 0 {
+            return Ok(self.tables[tid].capacity());
+        }
+        let _g = self.table_grow_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let got = self.push_table_extent_locked(tid, extra);
+        if got == 0 {
+            return Err(format!(
+                "table '{}': no free eid space (entity cap {} — Engine::grow_entity_cap)",
+                name,
+                self.max_entities(),
+            ));
+        }
+        Ok(self.tables[tid].capacity())
+    }
+
+    /// `entity_in` の枯渇時: `local` (払出済み offset) が入るまで extent を足す。 足せた
+    /// なら global を返す。 lock 下で再判定するので並行 thread の二重 grow はしない。
+    fn grow_table_extent_for(&self, tid: usize, local: u32) -> Option<u32> {
+        let table = &self.tables[tid];
+        if table.is_open_ended() {
+            return None;
+        }
+        let _g = self.table_grow_lock.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(g) = table.global_of(local) {
+            return Some(g); // 別 thread が足した
+        }
+        // 既定は先頭 range と同じ大きさ、 最低でも `local` が入る分
+        let first = table.eid_range_hi - table.eid_range_lo;
+        let need = local.saturating_sub(table.capacity()).saturating_add(1);
+        let got = self.push_table_extent_locked(tid, first.max(need).max(1));
+        if got < need {
+            return None;
+        }
+        table.global_of(local)
+    }
+
+    /// `table_grow_lock` 下で呼ぶ。 末尾の空き eid 空間から最大 `want` 個の extent を
+    /// 足し、 実際に足せた数を返す (空きが無ければ 0、 sidecar は persist)。
+    fn push_table_extent_locked(&self, tid: usize, want: u32) -> u32 {
+        let new_lo = self.tables.iter().map(|t| t.last_hi()).max().unwrap_or(0);
+        if new_lo == u32::MAX {
+            return 0; // anonymous が open-ended (= named table 無し) — ここには来ない
+        }
+        let avail = self.max_entities().saturating_sub(new_lo);
+        let size = want.min(avail);
+        if size == 0 {
+            return 0;
+        }
+        self.tables[tid].extra.write().unwrap().push((new_lo, new_lo + size));
+        self.try_persist_tables();
+        size
     }
 
     /// table の eid 枠の使用状況 (未定義 table は `None`)。
@@ -6057,12 +6399,12 @@ impl Engine {
     /// 削除まで流れなくなって回復不能になる (削除は枠を空ける唯一の手段)。
     pub fn table_eid_usage(&self, name: &str) -> Option<TableEidUsage> {
         let t = self.tables.iter().find(|t| t.name == name)?;
-        let capacity = t.eid_range_hi.saturating_sub(t.eid_range_lo);
+        let capacity = t.capacity();
         let allocated = t
             .next_local
             .load(std::sync::atomic::Ordering::Acquire)
             .min(capacity);
-        let live = self.entities.live_count_in(t.eid_range_lo, t.eid_range_hi);
+        let live = t.extents().into_iter().map(|(lo, hi)| self.entities.live_count_in(lo, hi)).sum::<u32>();
         Some(TableEidUsage { capacity, allocated, live, free: capacity.saturating_sub(live) })
     }
 
@@ -6080,11 +6422,11 @@ impl Engine {
             .tables
             .iter()
             .map(|t| {
-                if t.eid_range_hi == u32::MAX { self.entities.next_eid() } else { t.eid_range_hi }
+                if t.eid_range_hi == u32::MAX { self.entities.next_eid() } else { t.last_hi() }
             })
             .max()
             .unwrap_or(0);
-        self.max_entities.saturating_sub(used)
+        self.max_entities().saturating_sub(used)
     }
 
     /// request19: **local-only table の行を全部落とす** (snapshot / bootstrap の受け側用)。
@@ -6105,7 +6447,7 @@ impl Engine {
             .tables
             .iter()
             .filter(|t| t.is_reserved() && !is_engine_internal_table(&t.name))
-            .map(|t| (t.eid_range_lo, t.eid_range_hi))
+            .flat_map(|t| t.extents())
             .collect();
         if ranges.is_empty() {
             return 0;
@@ -6439,14 +6781,67 @@ impl Engine {
             if t.eid_range_hi == u32::MAX {
                 self.entities.next_eid()  // anonymous open-ended
             } else {
-                t.eid_range_hi
+                t.last_hi()
             }
         }).max().unwrap_or(0);
-        self.max_entities.saturating_sub(used)
+        self.max_entities().saturating_sub(used)
     }
     /// 0.7.0: 最大 entity 数 (= layout 確保時の上限)。 schema crate が
     /// size_hint を自動算出する用。
-    pub fn max_entities(&self) -> u32 { self.max_entities }
+    pub fn max_entities(&self) -> u32 { self.entity_cap.load(std::sync::atomic::Ordering::Relaxed) }
+
+    /// v10 Phase 3: entity の reservation (= `grow_entity_cap` で伸ばせる上限)。 create 時に
+    /// 決まり、 後から増やせない (`GrowableOptions::reserve_entities`)。
+    pub fn reserve_entities(&self) -> u32 { self.layout.read().unwrap().reserve_entities }
+
+    /// v10 Phase 3 (request20): entity の上限を `new_cap` に伸ばす。 縮めない (現在値以下なら
+    /// no-op で現在値を返す)。 `reserve_entities()` を超えると `InvalidInput`、 packed
+    /// (`from_bytes`) backing は `Unsupported`。 offset は動かないので既存 data はそのまま、
+    /// 伸びた分は次の `entity` / `entity_in` / `define_table` から使える。 header を書いて
+    /// flush するので reopen 後も残る。 別 process の readonly reader は次の open から。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn grow_entity_cap(&self, new_cap: u32) -> io::Result<u32> {
+        let cur = self.max_entities();
+        if new_cap <= cur {
+            return Ok(cur);
+        }
+        if self.backing.memory_len().is_some() {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "grow_entity_cap: packed (in-memory) backing"));
+        }
+        let mut layout = self.layout.write().unwrap();
+        if new_cap > layout.reserve_entities {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "grow_entity_cap: {new_cap} exceeds the reservation {} made at create \
+                     (GrowableOptions::reserve_entities)",
+                    layout.reserve_entities
+                ),
+            ));
+        }
+        let l = &*layout;
+        let grown = Layout::try_from_params_with_header(
+            new_cap, self.max_himos,
+            l.vocab_max_entries, l.vocab_index_cap, l.vocab_data_size,
+            l.himoreg_max_entries, l.himoreg_index_cap, l.himoreg_data_size,
+            l.content_data_size, l.leaf_data_size, l.cyl_max_values,
+            l.has_cell_version(),
+            l.header_size,
+            l.reserve_entities,
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        self.entities.grow(new_cap).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        // header が唯一の永続 truth (store は open 時に header から cap を受け取る)
+        {
+            let buf = self.backing.header_mut(l.header_size);
+            buf[H_MAX_ENTITIES..H_MAX_ENTITIES + 4].copy_from_slice(&new_cap.to_le_bytes());
+            write_header_crc(buf);
+        }
+        self.backing.flush_header(l.header_size)?;
+        self.entity_cap.store(new_cap, std::sync::atomic::Ordering::Release);
+        *layout = grown;
+        Ok(new_cap)
+    }
 
     // ──── peer_id ────
 
@@ -6572,7 +6967,7 @@ impl Engine {
     /// 有効化していない create では false で、 `cell_hlc` は常に `Hlc::ZERO`
     /// (= 版数不明) を返す (A-1 の漸進的移行)。
     pub fn has_cell_version(&self) -> bool {
-        self.layout.has_cell_version()
+        self.layout.read().unwrap().has_cell_version()
     }
 
     #[inline]
@@ -6669,7 +7064,7 @@ impl Engine {
     #[inline]
     fn cell_hlc_local(&self, local: u32, himo_id: u16) -> enchudb_oplog::Hlc {
         match self.ver_col(himo_id) {
-            Some(col) if local < self.max_entities => {
+            Some(col) if local < self.max_entities() => {
                 // growable backing: 未コミット page は read でも SIGBUS。
                 // #167: 伸ばせなければ **読まない** (ZERO 扱い)。 触れば落ちる。
                 if col.ensure_committed_for(local).is_err() {
@@ -6695,7 +7090,7 @@ impl Engine {
     #[inline]
     fn tombstone_hlc_local(&self, local: u32) -> enchudb_oplog::Hlc {
         match self.tomb_col.as_ref() {
-            Some(col) if local < self.max_entities => {
+            Some(col) if local < self.max_entities() => {
                 // #167: 伸ばせなければ読まない (未 commit page の read も SIGBUS)。
                 if col.ensure_committed_for(local).is_err() {
                     self.record_fault(
@@ -6816,7 +7211,7 @@ impl Engine {
     /// (既に載っている版数を消さない)。 v9 領域が無ければ no-op。
     #[inline]
     fn store_cell_hlc(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc) {
-        if hlc == enchudb_oplog::Hlc::ZERO || local >= self.max_entities {
+        if hlc == enchudb_oplog::Hlc::ZERO || local >= self.max_entities() {
             return;
         }
         match self.ver_col(himo_id) {
@@ -6889,7 +7284,7 @@ impl Engine {
         hlc: enchudb_oplog::Hlc,
     ) {
         let local = enchudb_oplog::eid_local(eid);
-        if hlc == enchudb_oplog::Hlc::ZERO || local >= self.max_entities {
+        if hlc == enchudb_oplog::Hlc::ZERO || local >= self.max_entities() {
             return;
         }
         if himo_id == u16::MAX {
@@ -7008,7 +7403,7 @@ impl Engine {
         // #166: 版数を消す **前** に翻訳写像を外す。 退避する tombstone は
         // まだ slot 上にあるので、 順序を逆にすると読めなくなる。
         self.evict_translation_for_reuse(local);
-        if local >= self.max_entities {
+        if local >= self.max_entities() {
             return;
         }
         // pre-v9: 版数は揮発 HlcStore にある。 sentinel (u16::MAX) が tombstone。
@@ -7298,7 +7693,7 @@ impl Engine {
         if !Self::accepts_hlc(self.tombstone_version_of(local), hlc) {
             return false;
         }
-        if hlc == enchudb_oplog::Hlc::ZERO || local >= self.max_entities {
+        if hlc == enchudb_oplog::Hlc::ZERO || local >= self.max_entities() {
             // 版数不明の delete は記録できないが、 「採用する」判定自体は
             // 変わらない = A-1 の現状維持。
             return true;
@@ -7980,9 +8375,9 @@ impl Engine {
             return;
         }
         assert!(
-            eid_local >= table.eid_range_lo && eid_local < table.eid_range_hi,
-            "tie eid {} not in himo's table '{}' eid_range [{}, {})",
-            eid_local, table.name, table.eid_range_lo, table.eid_range_hi,
+            table.contains(eid_local),
+            "tie eid {} not in himo's table '{}' eid extents {:?}",
+            eid_local, table.name, table.extents(),
         );
     }
 
@@ -8018,9 +8413,9 @@ impl Engine {
         }
         let target = &self.tables[target_tid];
         assert!(
-            target_eid >= target.eid_range_lo && target_eid < target.eid_range_hi,
-            "FK violation: Ref himo (id {}) points to eid {} outside target table '{}' range [{}, {})",
-            hid, target_eid, target.name, target.eid_range_lo, target.eid_range_hi,
+            target.contains(target_eid),
+            "FK violation: Ref himo (id {}) points to eid {} outside target table '{}' extents {:?}",
+            hid, target_eid, target.name, target.extents(),
         );
     }
 
@@ -8472,7 +8867,7 @@ impl Engine {
     fn table_name_of_local(&self, local: u32) -> Option<String> {
         for t in self.tables.iter() {
             if t.name.is_empty() { continue; }
-            if local >= t.eid_range_lo && local < t.eid_range_hi {
+            if t.contains(local) {
                 return Some(t.name.clone());
             }
         }
@@ -10494,27 +10889,27 @@ impl Engine {
 
         self.himo_reg.get_or_insert(himo.as_bytes());
 
-        let effective_mv = max_values.min(self.layout.cyl_max_values);
+        let effective_mv = max_values.min(self.layout.read().unwrap().cyl_max_values);
         // v10: himo 列 (と版数列) の segment file をここで作る。 crash で file だけ残った
         // 場合 (header の count 更新前) は SegmentSet 側が open で回収する。
         self.backing
-            .ensure_himo(hid as u32, &self.layout)
+            .ensure_himo(hid as u32, &*self.layout.read().unwrap())
             .map_err(|e| format!("cannot create himo segment {hid}: {e}"))?;
-        if self.layout.has_cell_version() {
+        if self.layout.read().unwrap().has_cell_version() {
             self.backing
-                .ensure_ver(hid as u32, &self.layout)
+                .ensure_ver(hid as u32, &*self.layout.read().unwrap())
                 .map_err(|e| format!("cannot create version segment {hid}: {e}"))?;
         }
 
         let hs = HimoStore::init(
-            self.backing.region(SegmentKind::Himo(hid as u32), &self.layout),
-            ht, effective_mv, self.max_entities,
+            self.backing.region(SegmentKind::Himo(hid as u32), &*self.layout.read().unwrap()),
+            ht, effective_mv, self.max_entities(),
         );
 
-        if self.layout.has_cell_version() {
+        if self.layout.read().unwrap().has_cell_version() {
             let ver = ver_column_from_region(
-                self.backing.region(SegmentKind::Ver(hid as u32), &self.layout),
-                self.max_entities,
+                self.backing.region(SegmentKind::Ver(hid as u32), &*self.layout.read().unwrap()),
+                self.max_entities(),
             );
             assert!(
                 self.ver_cols.push(ver).is_ok(),
@@ -10547,7 +10942,7 @@ impl Engine {
         // ヘッダにメタデータ書き込み (himo_def_lock 下、 reader は runtime に
         // この領域を読まないので &self からの直接書き込みで安全)
         let maxv_base = himo_maxv_base(self.max_himos);
-        let buf = self.backing.header_mut(self.layout.header_size);
+        let buf = self.backing.header_mut(self.layout.read().unwrap().header_size);
         buf[H_HIMO_TYPES + hid] = ht as u8;
         let mv_off = maxv_base + hid * 4;
         buf[mv_off..mv_off + 4].copy_from_slice(&max_values.to_le_bytes());
@@ -10871,10 +11266,12 @@ impl Engine {
     /// open でも安全 (disk は触らない)。 anonymous / reserved も含め全 table を見る。
     fn reconcile_next_local_from_bitmap(&self) {
         for i in 0..self.tables.len() {
-            let lo = self.tables[i].eid_range_lo;
-            let hi = self.tables[i].eid_range_hi;
-            if let Some(highest) = self.entities.highest_live_in(lo, hi) {
-                Self::advance_table_next_local_for(&self.tables, highest);
+            // extent は払出順なので後ろから見て最初に live が居る所が最大 local
+            for (lo, hi) in self.tables[i].extents().into_iter().rev() {
+                if let Some(highest) = self.entities.highest_live_in(lo, hi) {
+                    Self::advance_table_next_local_for(&self.tables, highest);
+                    break;
+                }
             }
         }
     }
@@ -10882,8 +11279,8 @@ impl Engine {
     fn advance_table_next_local_for(tables: &[TableDef], global: u32) {
         use std::sync::atomic::Ordering;
         for table in tables {
-            if global >= table.eid_range_lo && global < table.eid_range_hi {
-                let target = global - table.eid_range_lo + 1;
+            if let Some(local) = table.local_of(global) {
+                let target = local + 1;
                 let mut cur = table.next_local.load(Ordering::Relaxed);
                 while cur < target {
                     match table.next_local.compare_exchange_weak(
@@ -11036,7 +11433,7 @@ impl Engine {
         // 小 DB (max_entities が小さい) は queue も小さく、default 16M DB は従来
         // どおり 1M slot (挙動不変)。floor 4096 は burst 吸収の下限。
         let qc = queue_cap.unwrap_or_else(|| {
-            (eng.max_entities as usize).clamp(4096, crate::write_queue::DEFAULT_WRITE_QUEUE_CAP)
+            (eng.max_entities() as usize).clamp(4096, crate::write_queue::DEFAULT_WRITE_QUEUE_CAP)
         });
         let queue = Arc::new(WriteQueue::with_capacity(qc));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -12062,7 +12459,7 @@ impl Engine {
 
         let maxv_base = himo_maxv_base(self.max_himos);
         let hc = self.value_types.len() as u32;
-        let buf = self.backing.header_mut(self.layout.header_size);
+        let buf = self.backing.header_mut(self.layout.read().unwrap().header_size);
         for hid in 0..self.value_types.len() {
             buf[H_HIMO_TYPES + hid] = self.value_types[hid] as u8;
             let off = maxv_base + hid * 4;
@@ -12414,7 +12811,7 @@ mod layout_v9_tests {
     use super::*;
 
     fn base(cell_version: bool) -> Layout {
-        Layout::compute(1024, 16, 64 * 1024, None, None, None, None, cell_version).unwrap()
+        Layout::compute(1024, 16, 64 * 1024, None, None, None, None, cell_version, None).unwrap()
     }
 
     /// v9 を有効化していない layout は **pre-v9 と完全に同一**であること。
@@ -15255,10 +15652,26 @@ mod v10_dir_tests {
 
     /// table 1 つ + himo `n` + entity 3 つを書いて tables を persist した WAL 付き DB。
     fn seed(path: &str) -> Vec<(enchudb_oplog::EntityId, u32)> {
+        seed_with(path, None)
+    }
+
+    /// `reserve` = entity reservation (None は既定 = 2^28)。 legacy fixture を作るときは
+    /// `Some(cap)` (v8 / v9 は reservation の概念が無く、 EntitySet が cap 基準)。
+    fn seed_with(path: &str, reserve: Option<u32>) -> Vec<(enchudb_oplog::EntityId, u32)> {
         // max_himos 2048 → v10 の header は可変長 (12 KB)。 legacy 化するときに 4096 へ切り詰めて
         // 「固定 4096 header の v8 / v9」 を再現する (実 DB = sinfohub の shape)。
-        let mut eng =
-            Engine::create_full(path, 1024, Some(1 << 20), Some(LEGACY_TEST_MAX_HIMOS), Some(1 << 20)).unwrap();
+        let mut eng = Engine::create_growable_opts(
+            path,
+            GrowableOptions {
+                max_entities: 1024,
+                max_himos: LEGACY_TEST_MAX_HIMOS,
+                vocab_data_size: 1 << 20,
+                content_data_size: Some(1 << 20),
+                reserve_entities: reserve,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         eng.define_table("widgets", 100).unwrap();
         eng.define_himo_in("widgets", "n", ValueType::Number, 100).unwrap();
         let mut rows = Vec::new();
@@ -15375,7 +15788,7 @@ mod v10_dir_tests {
 
     fn migrate_roundtrip(name: &str, version: u32) {
         let path = tmp(name);
-        let rows = seed(&path);
+        let rows = seed_with(&path, Some(1024));
         let packed = make_legacy_single_file(&path, version);
         let _ = std::fs::remove_dir_all(&path);
 
@@ -15411,11 +15824,199 @@ mod v10_dir_tests {
     #[test]
     fn migrate_rejects_older_than_v8() {
         let path = tmp("mig7");
-        seed(&path);
+        seed_with(&path, Some(1024));
         let packed = make_legacy_single_file(&path, FILE_VERSION_LEGACY_V7);
         let err = Engine::migrate_v9_to_v10(&packed, &format!("{path}.dst")).err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
         assert!(err.to_string().contains("version 7"), "{err}");
+    }
+
+    fn tiny(path: &str, cap: u32, reserve: u32) -> Engine {
+        Engine::create_growable_opts(
+            path,
+            GrowableOptions {
+                max_entities: cap,
+                max_himos: 16,
+                vocab_data_size: 64 * 1024,
+                content_data_size: Some(64 * 1024),
+                reserve_entities: Some(reserve),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn fill(eng: &Engine) -> Vec<enchudb_oplog::EntityId> {
+        let mut v = Vec::new();
+        while let Ok(e) = eng.entity() {
+            v.push(e);
+        }
+        v
+    }
+
+    #[test]
+    fn grow_entity_cap_extends_allocation_and_persists() {
+        let path = tmp("grow");
+        let mut eng = tiny(&path, 16, 64);
+        eng.define_himo("n", ValueType::Number, 100);
+        assert_eq!((eng.max_entities(), eng.reserve_entities()), (16, 64));
+        let first = fill(&eng);
+        assert_eq!(first.len(), 16, "cap 16 must hand out exactly 16");
+        assert!(eng.entity().is_err(), "17th allocation must fail before grow");
+        for &e in &first {
+            eng.tie(e, "n", 1);
+        }
+
+        assert_eq!(eng.grow_entity_cap(40).unwrap(), 40);
+        assert_eq!(eng.grow_entity_cap(20).unwrap(), 40, "shrinking is a no-op");
+        let more = fill(&eng);
+        assert_eq!(more.len(), 24);
+        for &e in &more {
+            eng.tie(e, "n", 2);
+        }
+        let err = eng.grow_entity_cap(65).err().expect("beyond reservation must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(eng.grow_entity_cap(64).unwrap(), 64);
+        eng.flush().unwrap();
+        drop(eng);
+
+        let eng = Engine::open_standalone(&path).unwrap();
+        assert_eq!((eng.max_entities(), eng.reserve_entities()), (64, 64));
+        assert_eq!(eng.entity_count(), 40);
+        for &e in &first {
+            assert_eq!(eng.get(e, "n"), Some(1));
+        }
+        for &e in &more {
+            assert_eq!(eng.get(e, "n"), Some(2));
+        }
+        let rest = fill(&eng);
+        assert_eq!(rest.len(), 24, "grown cap survives reopen");
+    }
+
+    #[test]
+    fn free_stack_keeps_working_across_grow() {
+        let path = tmp("grow_free");
+        let eng = tiny(&path, 8, 32);
+        let ids = fill(&eng);
+        assert_eq!(ids.len(), 8);
+        eng.delete(ids[3]);
+        eng.delete(ids[5]);
+        assert_eq!(eng.grow_entity_cap(32).unwrap(), 32);
+        // 伸びた分 (24) + free stack から戻る 2
+        let got = fill(&eng);
+        assert_eq!(got.len(), 26);
+        assert!(got.contains(&ids[3]) && got.contains(&ids[5]), "freed slots must be reused: {got:?}");
+    }
+
+    #[test]
+    fn define_table_can_use_grown_cap() {
+        let path = tmp("grow_table");
+        let mut eng = tiny(&path, 8, 64);
+        eng.define_table("a", 8).unwrap();
+        let err = eng.define_table("b", 8).err().expect("no room for a second table at cap 8");
+        assert!(err.contains("max_entities"), "{err}");
+        eng.grow_entity_cap(64).unwrap();
+        eng.define_table("b", 8).unwrap();
+        let e = eng.entity_in("b").unwrap();
+        assert!(enchudb_oplog::eid_local(e) >= 8);
+    }
+
+    #[test]
+    fn migrated_legacy_db_gets_default_reservation_and_grows() {
+        let path = tmp("grow_mig");
+        let rows = seed_with(&path, Some(1024));
+        let packed = make_legacy_single_file(&path, FILE_VERSION_LEGACY_V9);
+        let _ = std::fs::remove_dir_all(&path);
+        let dst = format!("{path}.dst");
+        Engine::migrate_v9_to_v10(&packed, &dst).unwrap();
+        let eng = Engine::open(&dst).unwrap();
+        assert_seeded(&eng, &rows);
+        assert_eq!(eng.max_entities(), 1024);
+        assert_eq!(eng.reserve_entities(), default_reserve_entities(1024));
+        // EntitySet も relayout 済み (bitset 容量 = reservation) なので伸ばせる
+        eng.grow_entity_cap(4096).unwrap();
+        let n_before = eng.entity_count();
+        let mut got = 0;
+        for _ in 0..2000 {
+            eng.entity_in("widgets").ok();
+            got += 1;
+        }
+        assert!(got > 0);
+        assert!(eng.entity_count() > n_before);
+    }
+
+    #[test]
+    fn table_auto_grows_into_free_eid_space_and_persists() {
+        let path = tmp("tbl_grow");
+        let mut eng = tiny(&path, 64, 128);
+        eng.define_table("a", 4).unwrap();
+        eng.define_himo_in("a", "n", ValueType::Number, 100).unwrap();
+        // a の直後に b を切る = a は連続では伸びられず、 b の後ろに extent を足すしかない
+        eng.define_table("b", 4).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..10u32 {
+            let e = eng.entity_in("a").expect("auto-grow must hand out rows beyond the first range");
+            eng.tie(e, "a.n", i);
+            ids.push(e);
+        }
+        let ext = eng.table_eid_extents("a").unwrap();
+        assert_eq!(ext[0], (0, 4));
+        assert!(ext.len() >= 2, "{ext:?}");
+        assert_eq!(ext[1].0, 8, "second extent must start after table b [4, 8): {ext:?}");
+        let u = eng.table_eid_usage("a").unwrap();
+        assert_eq!(u.live, 10);
+        assert!(u.capacity >= 10);
+        assert_eq!(eng.table_eid_range("a").unwrap(), (0, ext.last().unwrap().1), "hull");
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        drop(eng);
+
+        let eng = Engine::open_standalone(&path).unwrap();
+        assert_eq!(eng.table_eid_extents("a").unwrap(), ext, "extents survive reopen (EXT1 block)");
+        for (i, &e) in ids.iter().enumerate() {
+            assert_eq!(eng.get(e, "a.n"), Some(i as u32));
+        }
+        // reopen 後の払出は live eid を再利用しない (next_local が bitmap から復元される)
+        let fresh = eng.entity_in("a").unwrap();
+        assert!(!ids.contains(&fresh), "live row handed out again after reopen");
+        // b は自分の range をそのまま使える
+        let b = eng.entity_in("b").unwrap();
+        assert!((4..8).contains(&enchudb_oplog::eid_local(b)));
+
+        // cap まで使い切ると exhausted、 cap を伸ばせば続く
+        while eng.entity_in("a").is_ok() {}
+        let err = eng.entity_in("a").unwrap_err();
+        assert!(err.contains("exhausted"), "{err}");
+        assert_eq!(eng.remaining_eid_capacity(), 0);
+        eng.grow_entity_cap(128).unwrap();
+        assert!(eng.entity_in("a").is_ok(), "after grow_entity_cap the table must auto-grow again");
+    }
+
+    #[test]
+    fn deleted_row_in_second_extent_is_reused() {
+        let path = tmp("tbl_grow_reuse");
+        let mut eng = tiny(&path, 64, 64);
+        eng.define_table("a", 2).unwrap();
+        eng.define_table("b", 2).unwrap();
+        let ids: Vec<_> = (0..6).map(|_| eng.entity_in("a").unwrap()).collect();
+        let victim = ids[4]; // 2 本目の extent に居る
+        assert!(enchudb_oplog::eid_local(victim) >= 4);
+        eng.delete(victim);
+        let again = eng.entity_in("a").unwrap();
+        assert_eq!(again, victim, "free slot in a later extent must be reused before growing");
+    }
+
+    #[test]
+    fn grow_table_explicit_and_exhaustion_message() {
+        let path = tmp("tbl_grow_explicit");
+        let mut eng = tiny(&path, 16, 16);
+        eng.define_table("a", 4).unwrap();
+        assert_eq!(eng.grow_table("a", 4).unwrap(), 8);
+        assert_eq!(eng.table_eid_extents("a").unwrap(), vec![(0, 4), (4, 8)]);
+        assert_eq!(eng.grow_table("a", 100).unwrap(), 16, "capped at the entity cap");
+        let err = eng.grow_table("a", 1).unwrap_err();
+        assert!(err.contains("grow_entity_cap"), "{err}");
+        assert!(eng.grow_table("nope", 1).is_err());
     }
 
     /// 実 DB での確認用 (手動)。 `ENCHU_LEGACY_FIXTURE=/path/to/enchu.db` (1 ファイル、

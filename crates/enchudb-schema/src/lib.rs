@@ -1619,19 +1619,42 @@ impl<'a> Table<'a> {
     // eids 配列を経由しない、 stored_slice を sequential に舐めるだけの
     // branchless tight loop が LLVM で NEON SIMD reduce に auto-vectorize する。
 
+    /// v10 Phase 3 (request20 案 B): table の eid extent。 auto-grow した table は複数本で、
+    /// 間に他 table の eid が挟まるので集計は extent ごとに回して束ねる (1 本なら従来どおり)。
+    fn eid_extents(&self) -> Vec<(u32, u32)> {
+        self.db.eng.table_eid_extents(&self.inner.name).unwrap_or_default()
+    }
+
+    /// group 集計を extent 横断で束ねる。 1 本ならそのまま (順序も engine のまま)。
+    fn merge_grouped<V: Copy>(
+        &self,
+        mut per_extent: impl FnMut(u32, u32) -> Vec<(u32, V)>,
+        combine: impl Fn(V, V) -> V,
+    ) -> Vec<(u32, V)> {
+        let ext = self.eid_extents();
+        if ext.len() <= 1 {
+            return ext.first().map(|&(lo, hi)| per_extent(lo, hi)).unwrap_or_default();
+        }
+        let mut acc: std::collections::BTreeMap<u32, V> = std::collections::BTreeMap::new();
+        for (lo, hi) in ext {
+            for (g, v) in per_extent(lo, hi) {
+                acc.entry(g).and_modify(|cur| *cur = combine(*cur, v)).or_insert(v);
+            }
+        }
+        acc.into_iter().collect()
+    }
+
     /// table 内の `col` の合計 (= SUM(col))。 1M rows / M2 Max で ~100µs
     /// (= DuckDB の `SELECT SUM(col) FROM table` の 5-6x 速い)。
     pub fn sum(&self, col: &str) -> u64 {
         let himo = format!("{}.{}", self.inner.name, col);
-        let Some((lo, hi)) = self.db.eng.table_eid_range(&self.inner.name) else { return 0; };
-        self.db.eng.sum_range(&himo, lo, hi)
+        self.eid_extents().into_iter().map(|(lo, hi)| self.db.eng.sum_range(&himo, lo, hi)).sum()
     }
 
     /// table 内の `col` に値が tie された row 数 (= COUNT(col))。
     pub fn count_col(&self, col: &str) -> u32 {
         let himo = format!("{}.{}", self.inner.name, col);
-        let Some((lo, hi)) = self.db.eng.table_eid_range(&self.inner.name) else { return 0; };
-        self.db.eng.count_range(&himo, lo, hi)
+        self.eid_extents().into_iter().map(|(lo, hi)| self.db.eng.count_range(&himo, lo, hi)).sum()
     }
 
     /// `group` でグループ化した上での `sum` 合計 (= SUM(sum) GROUP BY group)。
@@ -1640,8 +1663,7 @@ impl<'a> Table<'a> {
     pub fn group_sum(&self, group: &str, sum: &str) -> Vec<(u32, u64)> {
         let group_himo = format!("{}.{}", self.inner.name, group);
         let sum_himo = format!("{}.{}", self.inner.name, sum);
-        let Some((lo, hi)) = self.db.eng.table_eid_range(&self.inner.name) else { return vec![]; };
-        self.db.eng.group_sum_range(&group_himo, &sum_himo, lo, hi)
+        self.merge_grouped(|lo, hi| self.db.eng.group_sum_range(&group_himo, &sum_himo, lo, hi), |a, b| a + b)
     }
 
     // ──── 0.8.8 (#38): min / max / group_min / group_max / histogram ────
@@ -1652,31 +1674,27 @@ impl<'a> Table<'a> {
     /// table 内の `col` の最小値 (= MIN(col))。 全 missing なら None。
     pub fn min(&self, col: &str) -> Option<u32> {
         let himo = format!("{}.{}", self.inner.name, col);
-        let (lo, hi) = self.db.eng.table_eid_range(&self.inner.name)?;
-        self.db.eng.min_range(&himo, lo, hi)
+        self.eid_extents().into_iter().filter_map(|(lo, hi)| self.db.eng.min_range(&himo, lo, hi)).min()
     }
 
     /// table 内の `col` の最大値 (= MAX(col))。 全 missing なら None。
     pub fn max(&self, col: &str) -> Option<u32> {
         let himo = format!("{}.{}", self.inner.name, col);
-        let (lo, hi) = self.db.eng.table_eid_range(&self.inner.name)?;
-        self.db.eng.max_range(&himo, lo, hi)
+        self.eid_extents().into_iter().filter_map(|(lo, hi)| self.db.eng.max_range(&himo, lo, hi)).max()
     }
 
     /// `group` でグループ化した上での `val` 最小値 (= MIN(val) GROUP BY group)。
     pub fn group_min(&self, group: &str, val: &str) -> Vec<(u32, u32)> {
         let group_himo = format!("{}.{}", self.inner.name, group);
         let val_himo = format!("{}.{}", self.inner.name, val);
-        let Some((lo, hi)) = self.db.eng.table_eid_range(&self.inner.name) else { return vec![]; };
-        self.db.eng.group_min_range(&group_himo, &val_himo, lo, hi)
+        self.merge_grouped(|lo, hi| self.db.eng.group_min_range(&group_himo, &val_himo, lo, hi), |a, b| a.min(b))
     }
 
     /// `group` でグループ化した上での `val` 最大値 (= MAX(val) GROUP BY group)。
     pub fn group_max(&self, group: &str, val: &str) -> Vec<(u32, u32)> {
         let group_himo = format!("{}.{}", self.inner.name, group);
         let val_himo = format!("{}.{}", self.inner.name, val);
-        let Some((lo, hi)) = self.db.eng.table_eid_range(&self.inner.name) else { return vec![]; };
-        self.db.eng.group_max_range(&group_himo, &val_himo, lo, hi)
+        self.merge_grouped(|lo, hi| self.db.eng.group_max_range(&group_himo, &val_himo, lo, hi), |a, b| a.max(b))
     }
 
     /// table 内の `col` の値域 `[vmin, vmax]` を `n_buckets` 等分した頻度
@@ -1684,10 +1702,22 @@ impl<'a> Table<'a> {
     /// `n_buckets == 0` または `vmin > vmax` のときは空 Vec。
     pub fn histogram(&self, col: &str, vmin: u32, vmax: u32, n_buckets: u32) -> Vec<u32> {
         let himo = format!("{}.{}", self.inner.name, col);
-        let Some((lo, hi)) = self.db.eng.table_eid_range(&self.inner.name) else {
+        let ext = self.eid_extents();
+        if ext.is_empty() {
             return if n_buckets == 0 || vmin > vmax { vec![] } else { vec![0; n_buckets as usize] };
-        };
-        self.db.eng.histogram_range(&himo, lo, hi, vmin, vmax, n_buckets)
+        }
+        let mut acc: Vec<u32> = Vec::new();
+        for (lo, hi) in ext {
+            let h = self.db.eng.histogram_range(&himo, lo, hi, vmin, vmax, n_buckets);
+            if acc.is_empty() {
+                acc = h;
+            } else {
+                for (a, b) in acc.iter_mut().zip(h) {
+                    *a += b;
+                }
+            }
+        }
+        acc
     }
 }
 

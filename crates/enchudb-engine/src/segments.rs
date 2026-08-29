@@ -103,6 +103,12 @@ impl SegmentKind {
 /// kind → 予約サイズ (= 旧 layout の region size)。 engine の `Layout` が実装する。
 pub trait SegmentSizes {
     fn segment_size(&self, kind: SegmentKind) -> usize;
+
+    /// mmap の予約長。 既定は `segment_size` と同じ。 entity 比例の segment は cap を伸ばせる
+    /// よう reservation 分 (v10 Phase 3、 `Layout::segment_reserve`) を返す。
+    fn segment_reserve(&self, kind: SegmentKind) -> usize {
+        self.segment_size(kind)
+    }
 }
 
 /// create 時の初期 commit。 store の header (16〜64 B) が入れば足り、 あとは
@@ -155,12 +161,16 @@ impl SegmentSet {
             }
             // header は表 (himo 型 / max_values) が全域に散るので最初から全 commit
             let initial = if kind == SegmentKind::Header { size } else { INITIAL_COMMIT.min(size) };
-            let seg = SegmentMap::create(&Self::path_of(dir, kind), size, initial)?;
+            let seg = SegmentMap::create(&Self::path_of(dir, kind), sizes.segment_reserve(kind), initial)?;
             fixed.insert(kind, Arc::new(seg));
         }
         let tomb = if cell_version {
             let size = sizes.segment_size(SegmentKind::Tomb);
-            Some(Arc::new(SegmentMap::create(&Self::path_of(dir, SegmentKind::Tomb), size, INITIAL_COMMIT.min(size))?))
+            Some(Arc::new(SegmentMap::create(
+                &Self::path_of(dir, SegmentKind::Tomb),
+                sizes.segment_reserve(SegmentKind::Tomb),
+                INITIAL_COMMIT.min(size),
+            )?))
         } else {
             None
         };
@@ -185,7 +195,7 @@ impl SegmentSet {
     ) -> io::Result<Self> {
         let open_one = |kind: SegmentKind| -> io::Result<Arc<SegmentMap>> {
             let p = Self::path_of(dir, kind);
-            SegmentMap::open(&p, sizes.segment_size(kind), readonly)
+            SegmentMap::open(&p, sizes.segment_reserve(kind), readonly)
                 .map(Arc::new)
                 .map_err(|e| {
                     io::Error::new(

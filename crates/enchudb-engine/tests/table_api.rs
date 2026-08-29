@@ -147,7 +147,9 @@ fn entity_in_range_exhausted_errors() {
     let path = tmp_path("exhausted");
     cleanup(&path);
 
-    let mut eng = Engine::create_standalone(&path).unwrap();
+    // v10 Phase 3: 空き eid 空間があれば table は auto-grow する。 「枯渇」 は entity cap ごと
+    // 尽きた状態 (cap 3 に table 3) で作る。
+    let mut eng = Engine::create_with_capacity(&path, 3).unwrap();
     eng.define_table("tiny", 3).unwrap();
 
     let _ = eng.entity_in("tiny").unwrap();

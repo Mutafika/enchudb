@@ -100,10 +100,12 @@ fn table_eid_usage_counts_live_rows_and_free_slots() {
 /// 続け、 削除を流し切れば枠が戻る。
 #[test]
 fn a_full_table_still_accepts_deletes() {
+    // v10 Phase 3: 空き eid 空間があれば table は auto-grow するので、 「満杯」 は
+    // entity cap ごと使い切った状態 (cap 4 に table 4) で作る。
     let path = tmp_path("full");
     cleanup(&path);
 
-    let mut eng = Engine::create_with_capacity(&path, 1024).unwrap();
+    let mut eng = Engine::create_with_capacity(&path, 4).unwrap();
     eng.define_table("files", 4).unwrap();
     eng.define_himo_in("files", "n", ValueType::Number, 0).unwrap();
     let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();

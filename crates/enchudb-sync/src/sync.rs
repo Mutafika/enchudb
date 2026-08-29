@@ -316,11 +316,11 @@ impl Syncer {
         // サポートを落とす時にこの分岐ごと消える。
         //
         // request18: v9 DB でも **版数がまだ 1 つも載っていない**なら hydrate する。
-        // `enable_sync_tables()` の窓 (= 領域は生えたが column は次の open からで、
-        // 版数が揮発 store にしかなかったセッション) を経た DB がこれに当たり、
-        // ここで復元しないと陳腐 record が再 apply される (#154 の再来)。
-        // 一度でも版数が載れば `cell_versions_are_empty` は false になるので、
-        // 「v9 では hydrate しない」 は実質維持される。
+        // v10 では `enable_sync_tables()` が版数 segment をその場で作るので #243 の窓は
+        // 無いが、 「segment を作る前に crash した DB を次の open が回収した」 場合と
+        // packed (`from_bytes`) backing は同じ形になるので残す。 ここで復元しないと
+        // 陳腐 record が再 apply される (#154 の再来)。 一度でも版数が載れば
+        // `cell_versions_are_empty` は false になるので、 常態では走らない。
         if !engine.has_cell_version() || engine.cell_versions_are_empty() {
             syncer.hydrate_hlc_store(&engine);
         }
