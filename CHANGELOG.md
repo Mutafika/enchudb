@@ -97,6 +97,9 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
   10 GB apparent → 82 MB / 4.8 MB) → **v10 で build した `sf`** の project / fsck / module list /
   tree / snap list / structure log / target list が、 **release 版 `sf 0.28.0` × 元の v8 copy と
   出力が byte 一致** (fsck の dangling snap pin ×10 も元から)
+- **Linux (OrbStack、 Ubuntu 26.04 arm64、 root=btrfs / /tmp=tmpfs)**: workspace 全走
+  **1104 passed / 0 failed** (macOS と同数)。 実 DB fixture の migrate は tmpfs 4.4 MB / btrfs
+  4.8 MB (seek で飛ばした範囲がそのまま穴、 `punch_holes` は no-op)、 別 process readonly test も pass
 - Windows は `--target x86_64-pc-windows-msvc` の compile check のみ
 
 ### 既知の残り
