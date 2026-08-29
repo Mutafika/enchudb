@@ -108,25 +108,38 @@ impl EntitySet {
 
     /// 既存領域をロード。 `max_entities` は DB header の現在の上限。 bitset 容量は region
     /// 自身の header (offset 12) から。 0 (legacy) なら max_entities。
-    pub fn load(region: Region, max_entities: u32) -> Self {
+    ///
+    /// 壊れた region では **panic せず `InvalidData`** を返す (`corrupt_header_open` と同じ方針)。
+    /// v10 では `entities.seg` だけが欠けた / 短い状態が外から作れる (部分 copy、 rsync 中断)。
+    pub fn load(region: Region, max_entities: u32) -> std::io::Result<Self> {
         let mm = region.slice();
         if mm.len() < HEADER || mm[0..4] != MAGIC {
-            panic!("bad entity set magic");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "entity set region is corrupt or truncated (len {}, expected magic at 0)",
+                    mm.len()
+                ),
+            ));
         }
         let stored = u32::from_le_bytes(mm[12..16].try_into().unwrap());
         let bitset_cap = if stored == 0 { max_entities } else { stored };
-        assert!(
-            bitset_cap >= max_entities,
-            "entity set bitset_cap {bitset_cap} < max_entities {max_entities} — corrupt header?"
-        );
-        Self {
+        if bitset_cap < max_entities {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "entity set bitset_cap {bitset_cap} < max_entities {max_entities} — corrupt header?"
+                ),
+            ));
+        }
+        Ok(Self {
             region,
             max_entities: AtomicU32::new(max_entities),
             bitset_cap,
             bitset_offset: HEADER,
             free_offset: Self::free_offset_for(bitset_cap),
             free_lock: std::sync::Mutex::new(()),
-        }
+        })
     }
 
     /// bitset が持てる entity 数 (= `grow` の上限)。
