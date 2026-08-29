@@ -3,6 +3,100 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.26.0 — (unreleased、 branch `feat/v10-segments`)
+
+**on-disk format v10: DB は 1 ファイルから directory + region ごとの segment file 群に
+(breaking、 request21 / #173 の根治)。** 単一 file の固定 layout では 「見かけ 26 GB / sync で
+95 GB」 「entity cap も table の枠も create 時に固定」 が構造的に消せなかった。 v10 は region
+ごとに独立して伸びる file にし、 触った page だけ commit する。 実測 (macOS / APFS):
+
+| | 0.25 (1 ファイル) | 0.26 (directory) |
+|---|---|---|
+| 空 DB (既定 capacity) apparent | 26,482 MB | **6.3 MB** |
+| 同 `enable_sync_tables` 後 | 95,469 MB | **6.6 MB** |
+| 実 DB (sinfohub、 v8、 654 entity / 117 himo) physical | 130 MB (apparent 10 GB) | **4.8 MB** (migrate 5 秒) |
+| `create_growable` 100K ent 直後 (#172) | 1,229 MB | 数 MB |
+
+### Breaking
+
+- **`Engine::create* / open*` の path は directory になる。** 中身は `header.seg` /
+  `entities.seg` / `himo/NNNN.seg` / `ver/NNNN.seg` … (`README` の File layout)。 既存 API の
+  signature は不変、 path の意味だけ変わる
+- **v8 / v9 の 1 ファイル DB は開けない** (`InvalidData`: "is a single-file (v9 or older)
+  EnchuDB database … migrate it first")。 offline で 1 回:
+  ```rust
+  enchudb::Engine::migrate_v9_to_v10("old.db", "new.db")?;  // new.db は directory、 old.db は不変
+  ```
+  data の載っている範囲だけ写す (sparse を保つ)。 旧 sidecar (`old.db.tables` / `.oplog` /
+  `.eidmap` / `.vocabmap` / `.schema` / `.crc`) は directory の中へ。 v7 以前は非対応
+- **sidecar は directory の中** (`{db}/tables` / `oplog` / `eidmap` / `vocabmap` / `crc` /
+  `lock` / `schema`)。 `{db}.tables` のような隣置きは無い。 path 生成は
+  `enchudb_engine::db_files` に集約 (schema / transport もこれを使う)
+- `Engine::table_eid_range(name)` は **hull** (先頭 lo 〜 最後の hi) を返す。 auto-grow した
+  table (下記) は間に他 table の eid を挟むので、 **scan は `table_eid_extents(name)`** で
+- **`define_table(name, size_hint)` の `size_hint` は硬い上限ではなくなった。** table が先頭
+  range を使い切ると空き eid 空間から extent を自動で足す (下記)。 「N 件で `entity_in` が
+  Err になる」 前提の test / 運用 (例: sinfo の `huge_scale_lifts_module_cap`、 enchudb 自身の
+  `entity_in_returns_err_when_table_eid_range_exhausted`) は entity cap ごと尽きる shape に直す
+- `Engine::migrate_file_v5_to_v6` / `_with_leaf` を撤去 (出力が 1 ファイルで v10 では開けない)。
+  `migrate_bytes_v5_to_v6` と `MigrationStats` は残置
+- Windows: segment は sparse file を reservation 長で作る (`FSCTL_SET_SPARSE`)。 apparent は
+  reservation 分出る (physical は触った分)。 runtime 検証は未 (compile check のみ)
+
+### Added — entity cap と table の枠が伸びる (request20 案 B)
+
+- **`Engine::grow_entity_cap(&self, new_cap) -> io::Result<u32>`**: entity の上限を
+  `reserve_entities()` まで伸ばす。 header を書いて flush するので reopen 後も残る。 縮めない
+- reservation は create 時に決まる: unix は `max(max_entities, 2^28)` (仮想空間だけ)、 Windows は
+  `max_entities` (= 伸ばせない。 `GrowableOptions::reserve_entities` で明示)。 migrate した DB は
+  既定の reservation を得る
+- **table は `entity_in` の枯渇時に空き eid 空間から extent を自動で切り足す。** 従来の
+  `exhausted` は cap まで尽きたときだけ (message に `grow_entity_cap` を添える)。
+  `Engine::grow_table(name, extra)` で明示も可。 sidecar `tables` に `EXT1` block が増える
+  (末尾 optional、 `PKS1` と同方式)
+- `Engine::table_eid_extents(name)`、 `Engine::reserve_entities()`
+- `Engine::pack_dir(dir, file)` / `Engine::unpack_to_dir(file, dir)`: directory ⇄ packed 1 ファイル
+  (= 旧 v9 の 1 ファイル layout と byte 互換、 bootstrap 配布 / 転送 / `from_bytes` 用)
+- `enchudb_engine::copy_db_dir` (開ける複製: segment + sidecar、 lock と `*.tmp` 除く) /
+  `copy_db_segments` (本体のみ)。 `snapshot_export` の target も directory
+- `enchudb_engine::db_files` (sidecar 名と path helper)
+
+### Fixed
+
+- **#243**: `enable_sync_tables()` は版数列 (`ver/*.seg`) と tombstone 列 (`tomb.seg`) を
+  **その場で** 作る (独立 file なので mmap を張り替えずに足せる)。 「column は次の open から」
+  の窓が消えた。 `Syncer::new` の hydrate 条件は crash 回収 / packed backing 用に残置
+- **#246**: header は `max_himos` に応じた可変長 (`header_size_for`)。 `max_himos > 960` で
+  himo 表が 4096 byte を溢れて panic していた。 v8 / v9 の固定 4096 header は parse 側で切替
+- **#172**: growable の lazy commit が region 単位になり、 末尾 region に触っても手前が実体化しない
+- **#245**: Windows build (0.23.0 から壊れていた growable stub) を修正
+- APFS は write のたびに 16 MB 未満の gap を実体化する。 `pack_dir` / `unpack_to_dir` /
+  migrate は全 write 後に `F_PUNCHHOLE` で穴を戻す (無いと実 DB の migrate が 344 MB になった)
+- HTTP bootstrap: server は directory を `pack_dir` して配り、 client は `unpack_to_dir` で展開、
+  sidecar (`eidmap` / `tables` / `vocabmap`) は directory の中へ。 EnchuDB image でない file を運ぶ
+  用途は従来どおり (sidecar を取りに行かない)
+
+### 検証
+
+- workspace 全走 (`--test-threads=1`): Phase 2 時点 166 suites / 1097 passed / 0 failed
+  (Phase 3 の全走は下記 release 時に更新)
+- 新規 test: `v10_dir_tests` (sidecar 配置 / copy / snapshot / migrate v8・v9・v7 拒否 /
+  grow_entity_cap / free stack / table auto-grow / EXT1 永続 / 実 DB fixture)、
+  `v10_cross_process_readonly` (別 process が readonly open、 後から足した himo も見える)、
+  `segment_map` (予約 / commit / refresh / ENOSPC)
+- 実 DB: sinfohub の v8 `enchu.db` (clonefile した隔離 copy) を migrate → `open_readonly` で
+  654 entity / 117 himo / 19 table を確認
+- **消費側 (tag 固定 v0.25.1 の app を `--config patch` で branch に差し替え、 repo の隔離 copy で)**:
+  sinfo (schema 層経由の create / open / insert / query、 5 crate) **617 passed / 1 failed** —
+  失敗は上記 `size_hint` 前提の 1 件のみ。 syncretic (sync / relay / bootstrap 経路、 44 test file) **184 passed / 0 failed**
+- Windows は `--target x86_64-pc-windows-msvc` の compile check のみ
+
+### 既知の残り
+
+- wasm `from_bytes` 経路は未確認 (packed 形式は v9 互換のまま)
+- 別 process の readonly reader は `grow_entity_cap` を次の open で見る
+- Windows の placeholder API (base 不動の予約) は未着手、 sparse whole-map で代用
+
 ## 0.25.1 — 2026-08-28
 
 **sync ring から record が「黙って消える」経路を 2 件塞いだ patch。** 片方 (#235) は
