@@ -458,6 +458,10 @@ fn deserialize_tables(buf: &[u8]) -> Result<Vec<TableDef>, String> {
 /// `.tables` / `.eidmap` / `.vocabmap` が同じ手順を踏むので 1 箇所に寄せてある。
 /// tmp 名は `{sidecar}.tmp` (= sidecar ごとに別名) なので、 同時 persist しても
 /// 互いの tmp を踏まない。
+///
+/// rename は **新しい inode** を置くので、 呼び出し側が chmod した mode は放っておくと
+/// umask 由来 (典型的には 0644) に戻る。 consumer が DB を締めている前提を壊さないよう、
+/// 置き換え前の mode を tmp に写してから rename する (無ければ umask のまま)。
 #[cfg(not(target_arch = "wasm32"))]
 fn atomic_write_sidecar(sidecar: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
@@ -471,8 +475,27 @@ fn atomic_write_sidecar(sidecar: &std::path::Path, bytes: &[u8]) -> io::Result<(
         f.write_all(bytes)?;
         f.sync_all()?;
     }
+    inherit_mode(sidecar, &tmp_path);
     std::fs::rename(&tmp_path, sidecar)?;
     Ok(())
+}
+
+/// `from` が既にあればその mode を `to` に写す。 mode が取れない / 設定できない環境
+/// (Windows、 権限不足) では黙って諦める — 内容の永続化を mode の都合で失敗させない。
+#[cfg(not(target_arch = "wasm32"))]
+fn inherit_mode(from: &std::path::Path, to: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(md) = std::fs::metadata(from) {
+            let mode = md.permissions().mode() & 0o777;
+            let _ = std::fs::set_permissions(to, std::fs::Permissions::from_mode(mode));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (from, to);
+    }
 }
 
 /// β-light step 7: tables を sidecar に atomic 書き換え。 fsync まで含む。
@@ -3814,7 +3837,8 @@ impl Engine {
         let entities = EntitySet::load(
             backing.region(SegmentKind::Entities, &layout),
             max_entities,
-        );
+        )
+        .map_err(|e| e.to_string())?;
         report("EntitySet::load", &mut t, &mut p);
         let vocab = Vocabulary::load(
             backing.region(SegmentKind::VocabData, &layout),
