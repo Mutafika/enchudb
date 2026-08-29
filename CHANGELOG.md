@@ -89,6 +89,11 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
 - **消費側 (tag 固定 v0.25.1 の app を `--config patch` で branch に差し替え、 repo の隔離 copy で)**:
   sinfo (schema 層経由の create / open / insert / query、 5 crate) **617 passed / 1 failed** —
   失敗は上記 `size_hint` 前提の 1 件のみ。 syncretic (sync / relay / bootstrap 経路、 44 test file) **184 passed / 0 failed**
+- **実 data の end-to-end**: `~/.sinfo` (global store、 v8、 25,061 entity / 258 himo / 40 table) と
+  sinfohub の project store (654 entity) を clonefile で隔離 → `enchu --migrate-v10` (13 秒 / 6 秒、
+  10 GB apparent → 82 MB / 4.8 MB) → **v10 で build した `sf`** の project / fsck / module list /
+  tree / snap list / structure log / target list が、 **release 版 `sf 0.28.0` × 元の v8 copy と
+  出力が byte 一致** (fsck の dangling snap pin ×10 も元から)
 - Windows は `--target x86_64-pc-windows-msvc` の compile check のみ
 
 ### 既知の残り
