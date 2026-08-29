@@ -228,7 +228,7 @@ grow 自体 (fstat / ftruncate / mmap ≈ 15 µs × 十数回) と page fault �
   静かに空になる。 削除なら `NotFound` の Err)。 検出には header に per-segment の committed 長を
   持つ必要がある。 同じ根で **「初期化が完了した DB か」 を consumer が判定する手段が無い**
   (半端な directory も `Path::exists()` は true) — `Engine::exists(path)` の要望が来ている。
-  破損時に signal 死しないことは `tests/v10_damage_probe.rs` で gate 済み
+  破損時に signal 死しないことは `tests/v10_damage_probe.rs` で gate 済み。 設計は request22
 
 ## 0.25.1 — 2026-08-28
 
