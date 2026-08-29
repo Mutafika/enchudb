@@ -58,6 +58,20 @@ impl GrowableMap {
         match *self {}
     }
 
+    // #167 で本体に足された 3 本。 stub に無いと Windows で engine.rs が compile
+    // できない (0.23.0 〜 0.25.1 で実際に壊れていた)。
+    pub fn set_space_margin(&self, _bytes: u64) {
+        match *self {}
+    }
+
+    pub fn space_denials(&self) -> u64 {
+        match *self {}
+    }
+
+    pub fn free_bytes(&self) -> io::Result<u64> {
+        match *self {}
+    }
+
     pub fn flush_aligned(&self, _offset: usize, _len: usize) -> io::Result<()> {
         match *self {}
     }

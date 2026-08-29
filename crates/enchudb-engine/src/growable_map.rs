@@ -42,7 +42,7 @@ const PAGE_SIZE: usize = 4096;
 /// macOS x86_64 は 4 KB。 msync の `addr` 引数はこれで page-aligned である
 /// 必要があり、 4096 で揃えると Apple Silicon で EINVAL が出る (request3
 /// 実装時に踏んだ)。 起動時に sysconf で取って cache。
-fn runtime_page_size() -> usize {
+pub(crate) fn runtime_page_size() -> usize {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static CACHED: AtomicUsize = AtomicUsize::new(0);
     let cur = CACHED.load(Ordering::Relaxed);
@@ -479,7 +479,7 @@ impl Drop for GrowableMap {
     }
 }
 
-fn align_up(value: usize, align: usize) -> usize {
+pub(crate) fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
 }
 

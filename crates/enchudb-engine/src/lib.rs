@@ -52,6 +52,13 @@ pub mod growable_map;
 #[cfg(all(not(target_arch = "wasm32"), not(unix)))]
 #[path = "growable_map_stub.rs"]
 pub mod growable_map;
+// request21 (v10 Phase 0): 1 ファイル 1 予約の segment mmap。 unix は mmap/MAP_FIXED、
+// Windows は placeholder API (VirtualAlloc2 + MapViewOfFile3、 Win10 1803+)。
+#[cfg(all(not(target_arch = "wasm32"), unix))]
+pub mod segment_map;
+#[cfg(all(not(target_arch = "wasm32"), windows))]
+#[path = "segment_map_windows.rs"]
+pub mod segment_map;
 pub mod column;
 pub mod vocabulary;
 pub mod leaf_store;
