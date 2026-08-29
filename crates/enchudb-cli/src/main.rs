@@ -20,6 +20,9 @@ Usage:
   enchu <db> -e \"<query>\"          one-shot 実行
   enchu --create [<preset>] <db>   新規 DB 作成
   enchu --readonly <db>            read-only で開く (multi-process 安全)
+  enchu --migrate-v10 <old.db> <new.db>
+                                   v8 / v9 の 1 ファイル DB を v10 の directory に変換
+                                   (旧 DB と隣の sidecar は不変、 new.db は無いこと)
   enchu --help
 
 <preset>: --default | --compact | --growable | --tiny
@@ -132,6 +135,26 @@ fn open_engine(args: &Args) -> io::Result<Engine> {
 }
 
 fn run(argv: &[String]) -> Result<(), String> {
+    // v10: offline migration。 REPL とは独立の one-shot。
+    if argv.first().map(String::as_str) == Some("--migrate-v10") {
+        let (src, dst) = match (argv.get(1), argv.get(2)) {
+            (Some(s), Some(d)) if argv.len() == 3 => (s, d),
+            _ => return Err("usage: enchu --migrate-v10 <old.db> <new.db>".into()),
+        };
+        let t0 = std::time::Instant::now();
+        Engine::migrate_v9_to_v10(src, dst).map_err(|e| format!("migrate {src} -> {dst}: {e}"))?;
+        let eng = Engine::open_readonly(dst).map_err(|e| format!("open migrated {dst}: {e}"))?;
+        println!(
+            "migrated {src} -> {dst}/ in {:?}: entities={} himos={} tables={} cap={} reserve={}",
+            t0.elapsed(),
+            eng.entity_count(),
+            eng.himo_count(),
+            eng.list_user_tables().len(),
+            eng.max_entities(),
+            eng.reserve_entities(),
+        );
+        return Ok(());
+    }
     if argv.is_empty() {
         print!("{HELP}");
         return Ok(());
