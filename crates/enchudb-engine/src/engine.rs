@@ -10741,6 +10741,15 @@ impl Engine {
     pub(crate) fn vocab(&self) -> &Vocabulary { &self.vocab }
     pub fn himo_names(&self) -> &[String] { self.himo_names.as_slice() }
 
+    /// himo ごとの宣言 `max_values` (`define_himo` に渡した値)。
+    ///
+    /// open のコストはこれに比例する: `LockFreeCylinder` が himo ごとに
+    /// `min(max_values+1, DENSE_CAP)` 個の bucket を確保する (request23 案 F)。
+    /// 「open が遅い」 を調べる時に、 まずここが大きくないかを見る。
+    pub fn himo_max_values(&self) -> Vec<u32> {
+        (0..self.himo_max_values.len()).filter_map(|i| self.himo_max_values.get(i).copied()).collect()
+    }
+
     pub fn value_type(&self, himo: &str) -> Option<ValueType> {
         self.himo_id(himo).map(|idx| self.value_types[idx])
     }
