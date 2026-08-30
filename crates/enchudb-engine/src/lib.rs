@@ -41,6 +41,8 @@
 pub(crate) mod append_vec;
 pub(crate) mod append_bucket;
 pub(crate) mod lockfree_cylinder;
+/// dense 配列を伸ばした回数 (診断用、 request23)。 `segment_map::grow_stats` と同じ位置づけ。
+pub use lockfree_cylinder::dense_grow_count;
 pub(crate) mod region;
 // request21 (v10): 1 ファイル 1 予約の segment mmap。 unix は zero page 予約 + MAP_FIXED
 // commit、 Windows は sparse file の全域 map (placeholder API 版は後続)。 旧 growable_map

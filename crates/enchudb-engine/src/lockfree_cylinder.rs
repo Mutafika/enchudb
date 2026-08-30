@@ -29,6 +29,14 @@ pub const DENSE_CAP: u32 = 1 << 20;
 
 type DenseArr = Vec<Arc<AppendBucket>>;
 
+static DENSE_GROWS: AtomicUsize = AtomicUsize::new(0);
+
+/// dense 配列を伸ばした回数 (診断用)。 事前確保をどこで打ち切るかの判断材料
+/// (request23 案 F): 事前確保が十分なら 0 のまま、 打ち切ると通常経路になる。
+pub fn dense_grow_count() -> usize {
+    DENSE_GROWS.load(Ordering::Relaxed)
+}
+
 pub struct LockFreeCylinder {
     dense: Atomic<DenseArr>,
     sparse: Mutex<HashMap<u32, Arc<AppendBucket>>>,
@@ -196,6 +204,7 @@ impl LockFreeCylinder {
                 nv[value as usize].push_in(eid, &guard);
                 nv[value as usize].live_inc();
                 self.bump_stats(true, true); // 新 bucket は必ず空だった
+                DENSE_GROWS.fetch_add(1, Ordering::Relaxed);
                 self.dense.store(Owned::new(nv), Ordering::Release);
                 // SAFETY: 旧 array は全 reader が epoch 通過後に解放。
                 unsafe {
@@ -555,6 +564,71 @@ mod tests {
             bytes,
             bytes as f64 / min as f64
         );
+    }
+
+    /// dense の **成長中に reader が読む** 形。 事前確保 (`new(max_values)`) がある間は
+    /// 成長は 「宣言を超えた時」 しか起きないので、 この経路は実質踏まれていなかった。
+    /// 事前確保を打ち切る (request23 案 F) と **主経路になる**ので、 先に押さえる。
+    ///
+    /// writer が value を増やしながら insert → `dense.store(Owned::new(nv))` +
+    /// `defer_destroy(旧配列)` が繰り返し走る。 その間 reader は既に入れた value を読み続け、
+    /// **読めた eid が正しいこと** (別 value の eid が混ざらない / 壊れた値が出ない) を見る。
+    ///
+    /// 名前を `dense` で始めているのは CI の miri が
+    /// `lockfree_cylinder::tests::dense` で絞っているため (= この test も UB 検証に乗る)。
+    #[test]
+    fn dense_grows_while_readers_read() {
+        let c = Arc::new(LockFreeCylinder::new(0));
+        let n: u32 = if cfg!(miri) { 64 } else { 20_000 };
+        let ready = Arc::new(AtomicU32::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // writer: value を 0..n と増やしながら入れる (eid == value にしておく)。
+        let writer = {
+            let (c, ready) = (c.clone(), ready.clone());
+            std::thread::spawn(move || {
+                for v in 0..n {
+                    c.insert(v, v);
+                    ready.store(v + 1, Ordering::Release);
+                }
+            })
+        };
+
+        // reader: 既に入った範囲を読み続ける。 eid == value が守られていること。
+        let readers: Vec<_> = (0..3)
+            .map(|k| {
+                let (c, ready, stop) = (c.clone(), ready.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let mut seen = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let hi = ready.load(Ordering::Acquire);
+                        if hi == 0 {
+                            std::hint::spin_loop();
+                            continue;
+                        }
+                        let v = (seen.wrapping_mul(2654435761).wrapping_add(k) as u32) % hi;
+                        let got = c.read_to_vec(v);
+                        assert!(
+                            got.iter().all(|&e| e == v),
+                            "value {v} に別の eid が混ざった: {got:?}"
+                        );
+                        seen += 1;
+                    }
+                    seen
+                })
+            })
+            .collect();
+
+        writer.join().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let reads: u64 = readers.into_iter().map(|h| h.join().unwrap()).sum();
+
+        // 成長が終わった後、 全部が読めること (取りこぼしが無い)。
+        for v in 0..n {
+            assert_eq!(c.read_to_vec(v), vec![v], "value {v} が消えた");
+        }
+        assert_eq!(c.unique_count(), n, "unique_count が合わない");
+        assert!(reads > 0, "reader が 1 回も読めていない");
     }
 
     /// request12 レビュー指摘 (PR #103): fast path は「verify 判定の後に積まれた
