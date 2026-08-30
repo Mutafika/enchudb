@@ -162,6 +162,12 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
 
 ### 検証
 
+> **取得時点に注意。** 下の消費側の数字 (sinfo / syncretic / kenning / 実 data の `sf` 出力照合)
+> と Linux 全走は、 **segment manifest と `Engine::probe` を入れる前**の branch HEAD で取った
+> ものです。 その後 open / create / flush / `snapshot_export` / migrate に手が入っているので、
+> **release tag `v0.26.0` そのものを消費側で確かめたのは workspace 全走と sunsu2 だけ**です。
+> pin を動かす前に、 各 consumer で tag に対して回し直すこと。
+
 - workspace 全走: Phase 2 時点 166 suites / 1097 passed / 0 failed、 性能修正 (fd 保持 /
   grow 方針 / dir clone) 後 **166 suites / 1105 passed / 0 failed** (examples 30 本の build 込み)
 - 新規 test: `v10_dir_tests` (sidecar 配置 / copy / snapshot / migrate v8・v9・v7 拒否 /
@@ -190,8 +196,9 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
   tree / snap list / structure log / target list が、 **release 版 `sf 0.28.0` × 元の v8 copy と
   出力が byte 一致** (fsck の dangling snap pin ×10 も元から)
 - **sunsu2** (peer 分散 SNS 兼 sync 破壊試験機、 `../enchudb` path 依存): **22 passed / 0 failed**
-  (Phase 0〜3、 24-peer Zipf chaos 44 s、 real wire、 findings、 workload)。 sunsu2 側は
-  source 変更なしで compile も通る。 fd 保持 / grow 方針の修正 (`adc0da9`) 後に再走して同じ 22/0
+  (Phase 0〜3、 24-peer Zipf chaos 42 s、 real wire、 findings、 workload)。 sunsu2 側は
+  source 変更なしで compile も通る。 **release tag `v0.26.0` に対して再走して同じ 22/0**
+  (= segment manifest / `probe` を入れた後の状態で通っている唯一の消費側検証)
 - **Linux (OrbStack、 Ubuntu 26.04 arm64、 root=btrfs / /tmp=tmpfs)**: workspace 全走
   **1104 passed / 0 failed** (macOS と同数)。 実 DB fixture の migrate は tmpfs 4.4 MB / btrfs
   4.8 MB (seek で飛ばした範囲がそのまま穴、 `punch_holes` は no-op)、 別 process readonly test も pass
