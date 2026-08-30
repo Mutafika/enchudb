@@ -488,6 +488,32 @@ pub fn missing_segments(
         .collect()
 }
 
+static VERIFY_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static VERIFY_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct VerifyTimer(std::time::Instant);
+impl Drop for VerifyTimer {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        VERIFY_COUNT.fetch_add(1, Ordering::Relaxed);
+        VERIFY_NANOS.fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+/// これまでの `verify_manifest` (全 segment の stat) の (回数, 合計 ns)。 診断用。
+pub fn verify_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (VERIFY_COUNT.load(Ordering::Relaxed), VERIFY_NANOS.load(Ordering::Relaxed))
+}
+
+/// 診断 counter を 0 に戻す。
+#[doc(hidden)]
+pub fn reset_verify_stats() {
+    use std::sync::atomic::Ordering;
+    VERIFY_COUNT.store(0, Ordering::Relaxed);
+    VERIFY_NANOS.store(0, Ordering::Relaxed);
+}
+
 /// manifest の 1 行目。 将来 format を変えたら上げる。
 const MANIFEST_V1: &str = "enchudb-segments v1";
 /// 末尾標識 (`end <行数>`)。 途中で切れた manifest を 「無い」 扱いにするため。
@@ -600,6 +626,7 @@ fn parse_manifest(text: &str) -> Option<Vec<(String, u64)>> {
 }
 
 pub fn verify_manifest(dir: &Path) -> io::Result<Option<Vec<(String, u64)>>> {
+    let _t = VerifyTimer(std::time::Instant::now());
     let text = match std::fs::read_to_string(manifest_path(dir)) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),

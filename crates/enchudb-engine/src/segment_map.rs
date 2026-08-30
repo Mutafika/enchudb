@@ -64,6 +64,14 @@ impl GrowTimer {
         Self(std::time::Instant::now())
     }
 }
+struct OpenTimer(std::time::Instant);
+impl Drop for OpenTimer {
+    fn drop(&mut self) {
+        OPEN_COUNT.fetch_add(1, Ordering::Relaxed);
+        OPEN_NANOS.fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
 impl Drop for GrowTimer {
     fn drop(&mut self) {
         GROW_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -74,6 +82,27 @@ impl Drop for GrowTimer {
 /// これまでの segment commit 伸長 (`grow_to`、 fast path を除く) の (回数, 合計 ns)。
 pub fn grow_stats() -> (u64, u64) {
     (GROW_COUNT.load(Ordering::Relaxed), GROW_NANOS.load(Ordering::Relaxed))
+}
+
+static OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
+static OPEN_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// これまでの segment file の open (open + fstat + mmap ×2) の (回数, 合計 ns)。
+///
+/// v10 の open 代は **file 数に比例する定数**なので、 consumer 側の 「1 コマンド 1 process」
+/// 「1 process で N 個の DB」 という形だと効き方が大きい (request23)。 その内訳を
+/// `examples/open_cost_bench.rs` から観測するための counter。
+pub fn open_stats() -> (u64, u64) {
+    (OPEN_COUNT.load(Ordering::Relaxed), OPEN_NANOS.load(Ordering::Relaxed))
+}
+
+/// 診断 counter を 0 に戻す (bench が phase ごとに測るため)。
+#[doc(hidden)]
+pub fn reset_stats() {
+    OPEN_COUNT.store(0, Ordering::Relaxed);
+    OPEN_NANOS.store(0, Ordering::Relaxed);
+    GROW_COUNT.store(0, Ordering::Relaxed);
+    GROW_NANOS.store(0, Ordering::Relaxed);
 }
 
 /// `open` が EMFILE (process の fd soft limit) で落ちたら、 soft limit を hard limit
@@ -234,6 +263,7 @@ impl SegmentMap {
     /// 既存 segment file を開く。 commit はファイルの現在長 (page 切り上げ)。
     /// `readonly` なら `PROT_READ` で貼り、 伸長 API は `PermissionDenied`。
     pub fn open(path: &Path, reserve: usize, readonly: bool) -> io::Result<Self> {
+        let _t = OpenTimer(std::time::Instant::now());
         let file = open_with_fd_retry(|| OpenOptions::new().read(true).write(!readonly).open(path))?;
         let ps = runtime_page_size();
         let reserve = align_up(reserve.max(ps), ps);
