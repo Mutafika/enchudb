@@ -22,12 +22,12 @@ use enchudb_oplog::oplog::DecodedOp;
 
 fn tmp(tag: &str) -> String {
     let p = format!("/tmp/enchu_bench_dist_{}_{}", tag, std::process::id());
-    for s in ["", ".oplog", ".crc"] { let _ = std::fs::remove_file(format!("{}{}", p, s)); }
+    let _ = enchudb::db_files::remove_db(&p);
     p
 }
 
 fn cleanup(path: &str) {
-    for s in ["", ".oplog", ".crc"] { let _ = std::fs::remove_file(format!("{}{}", path, s)); }
+    let _ = enchudb::db_files::remove_db(&path);
 }
 
 fn percentile(sorted: &[u128], p: f64) -> u128 {
@@ -66,8 +66,8 @@ fn main() {
         let t = Instant::now();
         let _ = client.bootstrap_to(&replica_path).unwrap();
         let elapsed = t.elapsed();
-        let size = std::fs::metadata(&replica_path).unwrap().len();
-        println!("[bootstrap] {}MB sparse file in {:?} (logical size, only non-zero transmitted)",
+        let size = enchudb::db_files::disk_usage(&replica_path).apparent;
+        println!("[bootstrap] {}MB sparse db in {:?} (apparent size, only non-zero transmitted)",
             size / (1 << 20), elapsed);
     }
 

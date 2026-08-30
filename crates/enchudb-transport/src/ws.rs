@@ -714,6 +714,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         );
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         for suffix in ["", ".oplog", ".crc"] {
             let _ = std::fs::remove_file(format!("{}{}", path, suffix));
         }
@@ -771,6 +772,7 @@ mod tests {
         assert!(got_tie, "subscriber should receive Tie value=777 via adapter");
 
         drop(eng);
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         for suffix in ["", ".oplog", ".crc"] {
             let _ = std::fs::remove_file(format!("{}{}", path, suffix));
         }

@@ -115,9 +115,7 @@ fn main() {
     use std::io::Write;
     let _ = std::io::stdout().flush();
     let path = "/tmp/enchudb_workload_rss_1m.db";
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{}.crc", path));
-    let _ = std::fs::remove_file(format!("{}.oplog", path));
+    let _ = enchudb::db_files::remove_db(&path);
 
     let t0 = Instant::now();
     snap("baseline", t0);
@@ -167,11 +165,12 @@ fn main() {
     let q_ms = t_q.elapsed().as_millis();
     snap(&format!("after {} mixed query ({} ms, {} hits total)", q_iters, q_ms, total_hits), t0);
 
-    let meta = std::fs::metadata(path).unwrap();
+    let usage = enchudb::db_files::disk_usage(path);
     println!(
-        "\nfile apparent size: {:.1} MB  ({} bytes)",
-        meta.len() as f64 / 1024.0 / 1024.0,
-        meta.len(),
+        "\ndb apparent size: {:.1} MB  ({} bytes, physical {:.1} MB)",
+        usage.apparent_mb(),
+        usage.apparent,
+        usage.physical_mb()
     );
 
     let t_drop = Instant::now();
@@ -179,7 +178,5 @@ fn main() {
     let drop_ms = t_drop.elapsed().as_millis();
     snap(&format!("after drop ({} ms)", drop_ms), t0);
 
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{}.crc", path));
-    let _ = std::fs::remove_file(format!("{}.oplog", path));
+    let _ = enchudb::db_files::remove_db(&path);
 }

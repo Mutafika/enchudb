@@ -17,7 +17,7 @@ const ITER: u32 = 100;
 
 fn main() {
     let path = "/tmp/multi_cond_scaling.db";
-    let _ = std::fs::remove_file(path);
+    let _ = enchudb::db_files::remove_db(&path);
 
     let mut db = Database::create_growable_with_capacity(path, N + 1000).unwrap();
     {
@@ -111,7 +111,8 @@ fn main() {
         );
     }
 
-    let _ = std::fs::remove_file(path);
+    drop(db); // v10: DB は directory。 drop (sidecar 永続化) の後で消す
+    let _ = enchudb::db_files::remove_db(&path);
 }
 
 /// 簡易 xorshift PRNG。 deterministic な独立サンプリングが欲しい時用。

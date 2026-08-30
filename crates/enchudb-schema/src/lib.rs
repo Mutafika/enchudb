@@ -75,7 +75,6 @@ use std::sync::Arc;
 // だったため撤去、 `.schema` sidecar に置き換えた (issue note: schema_meta_entity
 // は 0.7.0 の名残、 削除すべき)。 旧 DB 互換のため legacy blob 読み込み path も
 // 残してあり、 初回 open で `.schema` sidecar に migrate されて以降は新 path のみ。
-const SCHEMA_SIDECAR_EXT: &str = "schema";
 // legacy (= 0.6.x の blob entity) 互換読み込み path 用、 新規書き出しでは使わない。
 const LEGACY_SCHEMA_META_HIMO: &str = "__enchu_schema_meta__";
 const LEGACY_SCHEMA_MARKER: &str = "__enchu_schema_v1__";
@@ -1102,16 +1101,10 @@ impl Database {
     }
 }
 
-/// 0.8.7: `.schema` sidecar の path を返す。
+/// 0.8.7: schema sidecar の path を返す (v10: `{db}/schema`)。
 #[cfg(not(target_arch = "wasm32"))]
 fn schema_sidecar_path_for(db_path: &str) -> std::path::PathBuf {
-    let mut p = std::path::PathBuf::from(db_path);
-    let ext = match p.extension() {
-        Some(e) => format!("{}.{}", e.to_string_lossy(), SCHEMA_SIDECAR_EXT),
-        None => SCHEMA_SIDECAR_EXT.to_string(),
-    };
-    p.set_extension(ext);
-    p
+    enchudb_engine::db_files::path_for(db_path, enchudb_engine::db_files::SCHEMA)
 }
 
 /// 0.8.7: tables の serialize_schema 出力を `.schema` sidecar に atomic write。
@@ -1123,13 +1116,7 @@ fn persist_schema_to_sidecar(
 ) -> std::io::Result<()> {
     use std::io::Write;
     let sidecar = schema_sidecar_path_for(db_path);
-    let tmp = sidecar.with_extension(format!(
-        "{}.tmp",
-        sidecar
-            .extension()
-            .map(|e| e.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    ));
+    let tmp = enchudb_engine::db_files::tmp_path_for(&sidecar);
     let bytes = serialize_schema(tables);
     {
         let mut f = std::fs::OpenOptions::new()
@@ -1169,14 +1156,8 @@ fn load_schema_from_sidecar(db_path: &str) -> std::io::Result<Option<Vec<RawTabl
 #[cfg(not(target_arch = "wasm32"))]
 fn cleanup_schema_tmp(db_path: &str) {
     let sidecar = schema_sidecar_path_for(db_path);
-    // persist_schema_to_sidecar が使う tmp 名と合わせる (= `.schema.tmp`)。
-    let tmp = sidecar.with_extension(format!(
-        "{}.tmp",
-        sidecar
-            .extension()
-            .map(|e| e.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    ));
+    // persist_schema_to_sidecar が使う tmp 名と合わせる (= `schema.tmp`)。
+    let tmp = enchudb_engine::db_files::tmp_path_for(&sidecar);
     if tmp.exists() {
         if let Err(e) = std::fs::remove_file(&tmp) {
             eprintln!(
@@ -1198,7 +1179,7 @@ fn rename_corrupt_schema_sidecar(db_path: &str, err: &std::io::Error) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let backup = sidecar.with_extension(format!("schema.corrupt-{}", ts));
+    let backup = enchudb_engine::db_files::corrupt_backup_path_for(&sidecar, ts);
     eprintln!(
         "warning: schema sidecar parse failed ({}): renaming to {} and falling back to engine synthesize",
         err,
@@ -1638,19 +1619,42 @@ impl<'a> Table<'a> {
     // eids 配列を経由しない、 stored_slice を sequential に舐めるだけの
     // branchless tight loop が LLVM で NEON SIMD reduce に auto-vectorize する。
 
+    /// v10 Phase 3 (request20 案 B): table の eid extent。 auto-grow した table は複数本で、
+    /// 間に他 table の eid が挟まるので集計は extent ごとに回して束ねる (1 本なら従来どおり)。
+    fn eid_extents(&self) -> Vec<(u32, u32)> {
+        self.db.eng.table_eid_extents(&self.inner.name).unwrap_or_default()
+    }
+
+    /// group 集計を extent 横断で束ねる。 1 本ならそのまま (順序も engine のまま)。
+    fn merge_grouped<V: Copy>(
+        &self,
+        mut per_extent: impl FnMut(u32, u32) -> Vec<(u32, V)>,
+        combine: impl Fn(V, V) -> V,
+    ) -> Vec<(u32, V)> {
+        let ext = self.eid_extents();
+        if ext.len() <= 1 {
+            return ext.first().map(|&(lo, hi)| per_extent(lo, hi)).unwrap_or_default();
+        }
+        let mut acc: std::collections::BTreeMap<u32, V> = std::collections::BTreeMap::new();
+        for (lo, hi) in ext {
+            for (g, v) in per_extent(lo, hi) {
+                acc.entry(g).and_modify(|cur| *cur = combine(*cur, v)).or_insert(v);
+            }
+        }
+        acc.into_iter().collect()
+    }
+
     /// table 内の `col` の合計 (= SUM(col))。 1M rows / M2 Max で ~100µs
     /// (= DuckDB の `SELECT SUM(col) FROM table` の 5-6x 速い)。
     pub fn sum(&self, col: &str) -> u64 {
         let himo = format!("{}.{}", self.inner.name, col);
-        let Some((lo, hi)) = self.db.eng.table_eid_range(&self.inner.name) else { return 0; };
-        self.db.eng.sum_range(&himo, lo, hi)
+        self.eid_extents().into_iter().map(|(lo, hi)| self.db.eng.sum_range(&himo, lo, hi)).sum()
     }
 
     /// table 内の `col` に値が tie された row 数 (= COUNT(col))。
     pub fn count_col(&self, col: &str) -> u32 {
         let himo = format!("{}.{}", self.inner.name, col);
-        let Some((lo, hi)) = self.db.eng.table_eid_range(&self.inner.name) else { return 0; };
-        self.db.eng.count_range(&himo, lo, hi)
+        self.eid_extents().into_iter().map(|(lo, hi)| self.db.eng.count_range(&himo, lo, hi)).sum()
     }
 
     /// `group` でグループ化した上での `sum` 合計 (= SUM(sum) GROUP BY group)。
@@ -1659,8 +1663,7 @@ impl<'a> Table<'a> {
     pub fn group_sum(&self, group: &str, sum: &str) -> Vec<(u32, u64)> {
         let group_himo = format!("{}.{}", self.inner.name, group);
         let sum_himo = format!("{}.{}", self.inner.name, sum);
-        let Some((lo, hi)) = self.db.eng.table_eid_range(&self.inner.name) else { return vec![]; };
-        self.db.eng.group_sum_range(&group_himo, &sum_himo, lo, hi)
+        self.merge_grouped(|lo, hi| self.db.eng.group_sum_range(&group_himo, &sum_himo, lo, hi), |a, b| a + b)
     }
 
     // ──── 0.8.8 (#38): min / max / group_min / group_max / histogram ────
@@ -1671,31 +1674,27 @@ impl<'a> Table<'a> {
     /// table 内の `col` の最小値 (= MIN(col))。 全 missing なら None。
     pub fn min(&self, col: &str) -> Option<u32> {
         let himo = format!("{}.{}", self.inner.name, col);
-        let (lo, hi) = self.db.eng.table_eid_range(&self.inner.name)?;
-        self.db.eng.min_range(&himo, lo, hi)
+        self.eid_extents().into_iter().filter_map(|(lo, hi)| self.db.eng.min_range(&himo, lo, hi)).min()
     }
 
     /// table 内の `col` の最大値 (= MAX(col))。 全 missing なら None。
     pub fn max(&self, col: &str) -> Option<u32> {
         let himo = format!("{}.{}", self.inner.name, col);
-        let (lo, hi) = self.db.eng.table_eid_range(&self.inner.name)?;
-        self.db.eng.max_range(&himo, lo, hi)
+        self.eid_extents().into_iter().filter_map(|(lo, hi)| self.db.eng.max_range(&himo, lo, hi)).max()
     }
 
     /// `group` でグループ化した上での `val` 最小値 (= MIN(val) GROUP BY group)。
     pub fn group_min(&self, group: &str, val: &str) -> Vec<(u32, u32)> {
         let group_himo = format!("{}.{}", self.inner.name, group);
         let val_himo = format!("{}.{}", self.inner.name, val);
-        let Some((lo, hi)) = self.db.eng.table_eid_range(&self.inner.name) else { return vec![]; };
-        self.db.eng.group_min_range(&group_himo, &val_himo, lo, hi)
+        self.merge_grouped(|lo, hi| self.db.eng.group_min_range(&group_himo, &val_himo, lo, hi), |a, b| a.min(b))
     }
 
     /// `group` でグループ化した上での `val` 最大値 (= MAX(val) GROUP BY group)。
     pub fn group_max(&self, group: &str, val: &str) -> Vec<(u32, u32)> {
         let group_himo = format!("{}.{}", self.inner.name, group);
         let val_himo = format!("{}.{}", self.inner.name, val);
-        let Some((lo, hi)) = self.db.eng.table_eid_range(&self.inner.name) else { return vec![]; };
-        self.db.eng.group_max_range(&group_himo, &val_himo, lo, hi)
+        self.merge_grouped(|lo, hi| self.db.eng.group_max_range(&group_himo, &val_himo, lo, hi), |a, b| a.max(b))
     }
 
     /// table 内の `col` の値域 `[vmin, vmax]` を `n_buckets` 等分した頻度
@@ -1703,10 +1702,22 @@ impl<'a> Table<'a> {
     /// `n_buckets == 0` または `vmin > vmax` のときは空 Vec。
     pub fn histogram(&self, col: &str, vmin: u32, vmax: u32, n_buckets: u32) -> Vec<u32> {
         let himo = format!("{}.{}", self.inner.name, col);
-        let Some((lo, hi)) = self.db.eng.table_eid_range(&self.inner.name) else {
+        let ext = self.eid_extents();
+        if ext.is_empty() {
             return if n_buckets == 0 || vmin > vmax { vec![] } else { vec![0; n_buckets as usize] };
-        };
-        self.db.eng.histogram_range(&himo, lo, hi, vmin, vmax, n_buckets)
+        }
+        let mut acc: Vec<u32> = Vec::new();
+        for (lo, hi) in ext {
+            let h = self.db.eng.histogram_range(&himo, lo, hi, vmin, vmax, n_buckets);
+            if acc.is_empty() {
+                acc = h;
+            } else {
+                for (a, b) in acc.iter_mut().zip(h) {
+                    *a += b;
+                }
+            }
+        }
+        acc
     }
 }
 
@@ -2323,6 +2334,7 @@ mod tests {
     #[test]
     fn create_table_and_insert() {
         let path = tmp("create_insert");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         {
             let mut db = Database::create(&path).unwrap();
@@ -2344,12 +2356,14 @@ mod tests {
             assert_eq!(users.entity(alice).get("name"), Some(Value::Text("Alice".into())));
             assert_eq!(users.entity(alice).get("age"), Some(Value::Number(30)));
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn where_eq_and_chain() {
         let path = tmp("where_eq");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         {
             let mut db = Database::create(&path).unwrap();
@@ -2372,12 +2386,14 @@ mod tests {
             let tokyo30 = users.where_eq("age", 30i64).where_eq("city", "Tokyo").find().unwrap();
             assert_eq!(tokyo30.len(), 1);
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn upsert_replaces_pk_row() {
         let path = tmp("upsert");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         {
             let mut db = Database::create(&path).unwrap();
@@ -2394,6 +2410,7 @@ mod tests {
             let ts = t.entity(rows[0]).get("ts");
             assert_eq!(ts, Some(Value::Number(200)));
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2403,6 +2420,7 @@ mod tests {
     #[test]
     fn concurrent_upsert_same_pk_does_not_duplicate() {
         let path = tmp("concurrent_upsert_pk");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         let db = {
             let mut db = Database::create(&path).unwrap();
@@ -2444,12 +2462,14 @@ mod tests {
             "concurrent upsert of same PK must produce exactly 1 row, got {}",
             rows.len()
         );
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn schema_persists_across_reopen() {
         let path = tmp("persist");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         {
             let mut db = Database::create(&path).unwrap();
@@ -2471,12 +2491,14 @@ mod tests {
             let name = users.entity(alice.unwrap()).get("name");
             assert_eq!(name, Some(Value::Text("Alice".into())));
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn delete_and_update() {
         let path = tmp("del_upd");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         {
             let mut db = Database::create(&path).unwrap();
@@ -2498,12 +2520,14 @@ mod tests {
             let remaining = t.all().find().unwrap();
             assert_eq!(remaining.len(), 1);
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn relation_ref_query() {
         let path = tmp("relation");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         {
             let mut db = Database::create(&path).unwrap();
@@ -2530,6 +2554,7 @@ mod tests {
             let staff = users.where_ref("company", ant_id).find().unwrap();
             assert_eq!(staff.len(), 2);
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2539,6 +2564,7 @@ mod tests {
         // table = 紐の束 declaration なので、 row 識別 marker は存在せず、
         // 抽出した himo_id だけで engine 直叩き write/read が schema find に揃う。
         let path = tmp("bindings");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         let mut db = Database::create(&path).unwrap();
         let _ = db.table("posts")
@@ -2581,6 +2607,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "alice row should be visible via schema find");
         assert_eq!(rows[0], e);
 
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2592,6 +2619,7 @@ mod tests {
         //   - reader (open_readonly) を 3 つ並行 open (lock 取らない)
         // 全部 同じ schema が見えること。
         let path = tmp("readonly_coexist");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}.oplog", path));
         let _ = std::fs::remove_file(format!("{}.lock", path));
@@ -2617,6 +2645,7 @@ mod tests {
         }
 
         drop((writer, r1, r2, r3));
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}.oplog", path));
         let _ = std::fs::remove_file(format!("{}.lock", path));
@@ -2629,7 +2658,9 @@ mod tests {
         // apparent も layout も比例して縮むことを確認する。
         let path_default = tmp("growable_cap_default");
         let path_capped = tmp("growable_cap_65k");
+        let _ = std::fs::remove_dir_all(&path_default); // v10: DB は directory
         let _ = std::fs::remove_file(&path_default);
+        let _ = std::fs::remove_dir_all(&path_capped); // v10: DB は directory
         let _ = std::fs::remove_file(&path_capped);
 
         {
@@ -2639,15 +2670,25 @@ mod tests {
             let _db = Database::create_growable_with_capacity(&path_capped, 65_536).unwrap();
         }
 
-        let size_default = std::fs::metadata(&path_default).unwrap().len();
-        let size_capped = std::fs::metadata(&path_capped).unwrap().len();
+        // v10 (request21): 本体は directory + segment で、 見かけ = 書いた分。 旧 test は
+        // 「default は 20 GB 以上に見える」 を固定していたが、 それ自体が消えた。 どちらも
+        // 数 MB 以下で、 capacity は見かけに効かないことを固定する。
+        fn dir_bytes(p: &str) -> u64 {
+            fn walk(p: &std::path::Path, acc: &mut u64) {
+                for e in std::fs::read_dir(p).unwrap().flatten() {
+                    if e.file_type().unwrap().is_dir() { walk(&e.path(), acc); } else { *acc += e.metadata().unwrap().len(); }
+                }
+            }
+            let mut acc = 0; walk(std::path::Path::new(p), &mut acc); acc
+        }
+        let size_default = dir_bytes(&path_default);
+        let size_capped = dir_bytes(&path_capped);
+        assert!(size_default < 64 * 1024 * 1024, "default apparent = {}", size_default);
+        assert!(size_capped < 64 * 1024 * 1024, "capped apparent = {}", size_capped);
 
-        // default は 20 GB 以上、 cap=65k は 2 GB 未満 (=10× 以上の差)
-        assert!(size_default > 20 * 1024 * 1024 * 1024, "default apparent = {}", size_default);
-        assert!(size_capped < 2 * 1024 * 1024 * 1024, "capped apparent = {}", size_capped);
-        assert!(size_default / size_capped > 10);
-
+        let _ = std::fs::remove_dir_all(&path_default); // v10: DB は directory
         let _ = std::fs::remove_file(&path_default);
+        let _ = std::fs::remove_dir_all(&path_capped); // v10: DB は directory
         let _ = std::fs::remove_file(&path_capped);
     }
 
@@ -2655,7 +2696,9 @@ mod tests {
     fn finish_with_wal_transitions_to_concurrent() {
         let path = tmp("finish_wal");
         let oplog_path = format!("{}.oplog", path);
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&oplog_path); // v10: DB は directory
         let _ = std::fs::remove_file(&oplog_path);
 
         let db_arc: Arc<Database> = {
@@ -2684,7 +2727,9 @@ mod tests {
         assert_eq!(h.join().unwrap(), 1);
 
         drop(db_arc);
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&oplog_path); // v10: DB は directory
         let _ = std::fs::remove_file(&oplog_path);
     }
 
@@ -2692,7 +2737,9 @@ mod tests {
     fn open_with_wal_recovers_writes() {
         let path = tmp("open_wal");
         let oplog_path = format!("{}.oplog", path);
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&oplog_path); // v10: DB は directory
         let _ = std::fs::remove_file(&oplog_path);
 
         // 1: build → finish_with_oplog → 書き込み → oplog_sync で durable
@@ -2717,13 +2764,16 @@ mod tests {
             assert_eq!(kv.entity(alpha.unwrap()).get("ts"), Some(Value::Number(1000)));
         }
 
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&oplog_path); // v10: DB は directory
         let _ = std::fs::remove_file(&oplog_path);
     }
 
     #[test]
     fn leaf_column_basic_write_read() {
         let path = tmp("leaf_basic");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         {
             let mut db = Database::create(&path).unwrap();
@@ -2748,6 +2798,7 @@ mod tests {
                 Some(Value::Text("今日の天気は晴れ。良い一日だった。".into()))
             );
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2756,6 +2807,7 @@ mod tests {
         // 同じ文字列を複数 entity の Leaf 列に書いた時、vocab_id が別であることを確認。
         // Tag なら同じ vocab_id を共有するが、Leaf は dedupe しない。
         let path = tmp("leaf_no_dedupe");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         {
             let mut db = Database::create(&path).unwrap();
@@ -2779,6 +2831,7 @@ mod tests {
             let v2 = eng.get(e2, "notes.memo").unwrap();
             assert_ne!(v1, v2, "Leaf は同じ文字列でも別 vocab_id を発行するべき");
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2786,6 +2839,7 @@ mod tests {
     fn tag_dedupes_but_leaf_does_not_in_same_db() {
         // 同じ DB で Tag と Leaf を比較。Tag は dedupe、Leaf は dedupe しない。
         let path = tmp("tag_vs_leaf");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         {
             let mut db = Database::create(&path).unwrap();
@@ -2811,12 +2865,14 @@ mod tests {
             let m2 = eng.get(e2, "items.memo").unwrap();
             assert_ne!(m1, m2, "Leaf は dedupe しないべき");
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn leaf_column_persists_across_reopen() {
         let path = tmp("leaf_persist");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         let e = {
             let mut db = Database::create(&path).unwrap();
@@ -2841,6 +2897,7 @@ mod tests {
                 Some(Value::Text("to be persisted".into()))
             );
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2849,6 +2906,7 @@ mod tests {
         // 0.7.0 Phase 3: enable_sync で _sync_ops / _sync_peers が engine に
         // 登録されること、 user-facing list_tables からは見えないことを確認。
         let path = tmp("sync_enable");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}.tables", path));
 
@@ -2884,6 +2942,7 @@ mod tests {
         // 2 度目の enable_sync は idempotent
         db.enable_sync().unwrap();
 
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2891,6 +2950,7 @@ mod tests {
     fn user_table_starting_with_underscore_rejected() {
         // 0.7.0 Phase 3: `_` 始まり名前は reserved 命名空間、 user 経路は弾く。
         let path = tmp("reserved_reject");
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}.tables", path));
 
@@ -2903,6 +2963,7 @@ mod tests {
         assert!(err.contains("reserved") || err.contains("_"),
                 "error message should mention reserved namespace, got: {err}");
 
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 }

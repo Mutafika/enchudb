@@ -280,13 +280,11 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Resu
             Some(s) => s,
             None => return send_response(&mut stream, 404, b"bootstrap not enabled"),
         };
-        let sfx = match &route["/bootstrap/".len()..] {
-            "eidmap" => ".eidmap",
-            "tables" => ".tables",
-            "vocabmap" => ".vocabmap",
-            _ => return send_response(&mut stream, 404, b"unknown sidecar"),
-        };
-        return match std::fs::read(format!("{}{}", src.db_path, sfx)) {
+        let name = &route["/bootstrap/".len()..];
+        if !enchudb::db_files::BOOTSTRAP.contains(&name) {
+            return send_response(&mut stream, 404, b"unknown sidecar");
+        }
+        return match std::fs::read(enchudb::db_files::path_for(&src.db_path, name)) {
             Ok(bytes) => send_response(&mut stream, 200, &bytes),
             Err(_) => send_response(&mut stream, 404, b"sidecar not present"),
         };
@@ -308,15 +306,33 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Resu
                 .max()
                 .unwrap_or(Hlc::ZERO)
         };
-        let mut file = match std::fs::File::open(&src.db_path) {
-            Ok(f) => f,
-            Err(_) => return send_response(&mut stream, 500, b"db file not readable"),
+        // v10: DB は directory (segment file 群)。 packed 1 ファイル (= 旧 v9 layout、 sparse) に
+        // 合成してから従来の sparse-v1 で流す。 wire format は不変 = 旧 client と互換。
+        // regular file (既に packed 済みの image / transport 単体 test の生 file) はそのまま流す。
+        let is_dir = std::path::Path::new(&src.db_path).is_dir();
+        let packed_path = if is_dir {
+            let pp = format!("{}.bootstrap.packed", src.db_path);
+            if let Err(e) = enchudb::Engine::pack_dir(&src.db_path, std::path::Path::new(&pp)) {
+                let _ = std::fs::remove_file(&pp);
+                return send_response(&mut stream, 500, format!("db pack failed: {e}").as_bytes());
+            }
+            pp
+        } else {
+            src.db_path.clone()
         };
-        let metadata = match file.metadata() {
-            Ok(m) => m,
+        let mut file = match std::fs::File::open(&packed_path) {
+            Ok(f) => f,
+            Err(_) => {
+                if is_dir {
+                    let _ = std::fs::remove_file(&packed_path);
+                }
+                return send_response(&mut stream, 500, b"db file not readable");
+            }
+        };
+        let size = match file.metadata() {
+            Ok(m) => m.len(),
             Err(_) => return send_response(&mut stream, 500, b"metadata failed"),
         };
-        let size = metadata.len();
         let header = format!(
             "HTTP/1.1 200 OK\r\nConnection: close\r\n\
              X-Enchu-Bootstrap-Format: sparse-v1\r\n\
@@ -325,7 +341,12 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io::Resu
             size, snapshot_hlc.wall, snapshot_hlc.logical, snapshot_hlc.peer
         );
         stream.write_all(header.as_bytes())?;
-        stream_sparse_file(&mut file, &mut stream, size)?;
+        let r = stream_sparse_file(&mut file, &mut stream, size);
+        drop(file);
+        if is_dir {
+            let _ = std::fs::remove_file(&packed_path);
+        }
+        r?;
         stream.flush()?;
         let _ = stream.shutdown(Shutdown::Write);
         return Ok(());
@@ -699,21 +720,41 @@ impl HttpTransport {
         let size = total_size
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no X-Enchu-Bootstrap-Size"))?;
 
-        let mut file = std::fs::File::create(local_path)?;
-        // extra_body (レスポンス body 冒頭ですでに読んでしまった分) と後続 stream を連結して decoder に渡す
-        let prepended = std::io::Cursor::new(extra_body).chain(stream);
-        let mut reader = prepended;
-        decode_sparse_stream(&mut reader, &mut file, size)?;
-        file.sync_all()?;
+        // v10: 受け取った packed image (= 旧 v9 layout) を一時 file に落とし、 directory に展開する。
+        let packed_path = format!("{local_path}.bootstrap.packed");
+        {
+            let mut file = std::fs::File::create(&packed_path)?;
+            let prepended = std::io::Cursor::new(extra_body).chain(stream);
+            let mut reader = prepended;
+            decode_sparse_stream(&mut reader, &mut file, size)?;
+            file.sync_all()?;
+        }
+        // packed DB なら directory に展開。 EnchuDB image でない (transport 単体で任意 file を
+        // 運ぶ用途) なら受け取った file をそのまま `local_path` に置く。
+        let is_db = match enchudb::Engine::unpack_to_dir(std::path::Path::new(&packed_path), local_path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&packed_path);
+                true
+            }
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                let _ = std::fs::remove_dir_all(local_path);
+                std::fs::rename(&packed_path, local_path)?;
+                false
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&packed_path);
+                return Err(e);
+            }
+        };
 
-        // #78-H9: sidecar (.eidmap / .tables / .vocabmap) も取得。 .eidmap 無しの
-        // restore は再 sync で重複 entity / tombstone 喪失を起こし、 .vocabmap 無しでは
-        // 受信済み `Vocab` の写像が失われて後続 `Tie` を翻訳できない。 旧 server
-        // (route 未対応) からは 404 が返るので、 その場合は main body のみの旧挙動に
-        // fallback。
-        for (name, sfx) in [("eidmap", ".eidmap"), ("tables", ".tables"), ("vocabmap", ".vocabmap")] {
+        // #78-H9: sidecar (eidmap / tables / vocabmap) も取得して DB directory の中に置く
+        // (EnchuDB image でない file を運んだときは無い)。 eidmap 無しの restore は再 sync で
+        // 重複 entity / tombstone 喪失を起こし、 vocabmap 無しでは受信済み `Vocab` の写像が
+        // 失われて後続 `Tie` を翻訳できない。 旧 server (route 未対応) からは 404 が
+        // 返るので、 その場合は main body のみの旧挙動に fallback。
+        for name in enchudb::db_files::BOOTSTRAP.iter().filter(|_| is_db) {
             if let Ok((200, bytes)) = self.request("GET", &format!("/bootstrap/{name}"), b"") {
-                let sidecar_path = format!("{local_path}{sfx}");
+                let sidecar_path = enchudb::db_files::path_for(local_path, name);
                 let f = std::fs::File::create(&sidecar_path)?;
                 {
                     use std::io::Write as _;
@@ -928,6 +969,7 @@ mod tests {
         let target = format!("/tmp/enchu_bootstrap_test_{}", std::process::id());
         let result = client.bootstrap_to(&target);
         assert!(result.is_err(), "bootstrap should 404 without src");
+        let _ = std::fs::remove_dir_all(&target); // v10: DB は directory
         let _ = std::fs::remove_file(&target);
     }
 
@@ -936,7 +978,9 @@ mod tests {
         // 元ファイルを作る (小さめ、sparse でない普通のファイル)
         let src = format!("/tmp/enchu_bootstrap_src_{}", std::process::id());
         let dst = format!("/tmp/enchu_bootstrap_dst_{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&src); // v10: DB は directory
         let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_dir_all(&dst); // v10: DB は directory
         let _ = std::fs::remove_file(&dst);
 
         std::fs::write(&src, b"enchu bootstrap test payload with some bytes\x00\x01\xff").unwrap();
@@ -958,7 +1002,9 @@ mod tests {
         let content = std::fs::read(&dst).unwrap();
         assert_eq!(content, b"enchu bootstrap test payload with some bytes\x00\x01\xff");
 
+        let _ = std::fs::remove_dir_all(&src); // v10: DB は directory
         let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_dir_all(&dst); // v10: DB は directory
         let _ = std::fs::remove_file(&dst);
     }
 
@@ -985,6 +1031,7 @@ mod tests {
 
         // decode
         let dst_path = format!("/tmp/enchu_sparse_rt_{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&dst_path); // v10: DB は directory
         let _ = std::fs::remove_file(&dst_path);
         let mut dst_file = std::fs::File::create(&dst_path).unwrap();
         let mut enc_cur = Cursor::new(encoded);
@@ -996,6 +1043,7 @@ mod tests {
         assert_eq!(got.len(), src_data.len());
         assert_eq!(got, src_data);
 
+        let _ = std::fs::remove_dir_all(&dst_path); // v10: DB は directory
         let _ = std::fs::remove_file(&dst_path);
     }
 
@@ -1006,7 +1054,9 @@ mod tests {
         use std::io::{Seek, SeekFrom};
         let src = format!("/tmp/enchu_bootstrap_sparse_src_{}", std::process::id());
         let dst = format!("/tmp/enchu_bootstrap_sparse_dst_{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&src); // v10: DB は directory
         let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_dir_all(&dst); // v10: DB は directory
         let _ = std::fs::remove_file(&dst);
 
         const HEAD_SIZE: usize = 256 * 1024;
@@ -1036,7 +1086,9 @@ mod tests {
         assert!(head[tail_offset..tail_offset + TAIL_SIZE].iter().all(|&b| b == b'B'));
         assert!(head[HEAD_SIZE..tail_offset].iter().all(|&b| b == 0));
 
+        let _ = std::fs::remove_dir_all(&src); // v10: DB は directory
         let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_dir_all(&dst); // v10: DB は directory
         let _ = std::fs::remove_file(&dst);
     }
 }

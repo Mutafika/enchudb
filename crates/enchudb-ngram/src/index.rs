@@ -423,6 +423,7 @@ mod tests {
     #[test]
     fn save_and_open() {
         let path = "/tmp/enchu_ngram_test_save.etxt";
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
 
         // 構築 → 保存
@@ -444,6 +445,7 @@ mod tests {
         assert_eq!(idx2.get_text(0), Some("国民は法の下に平等であって"));
         assert_eq!(idx2.get_text(99), None);
 
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
     }
 
@@ -451,6 +453,7 @@ mod tests {
     fn save_and_open_wide_eid() {
         // peer_id を含む u64 eid でも round-trip する
         let path = "/tmp/enchu_ngram_test_wide_eid.etxt";
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
 
         let mut idx = NgramIndex::new();
@@ -468,6 +471,7 @@ mod tests {
         let r = idx2.candidates("国民");
         assert_eq!(r, vec![peer1_local0]);
 
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
     }
 
@@ -479,6 +483,7 @@ mod tests {
     #[test]
     fn postings_only_candidates_no_text() {
         let path = "/tmp/enchu_ngram_postings_only.etxt";
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
 
         let mut idx = NgramIndex::new();
@@ -498,6 +503,7 @@ mod tests {
         let e = NgramIndex::open_mut(path).err().expect("postings-only は open_mut 不可");
         assert_eq!(e.kind(), io::ErrorKind::Unsupported);
 
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
     }
 
@@ -538,6 +544,7 @@ mod tests {
     #[test]
     fn open_mut_round_trip() {
         let path = "/tmp/enchu_ngram_test_open_mut.etxt";
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
 
         let mut idx = NgramIndex::new();
@@ -555,6 +562,7 @@ mod tests {
         assert_eq!(idx2.doc_count(), 3);
         assert!(idx2.candidates("民主").contains(&30));
 
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
     }
 }

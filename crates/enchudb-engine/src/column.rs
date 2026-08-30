@@ -135,6 +135,10 @@ impl Column {
     pub fn clear(&self, entity_id: u32) {
         let vs = self.value_size as usize;
         let off = HEADER + (entity_id as usize) * vs;
+        // v10: 未 commit の cell は zero page で既に 0 (= 未設定)。 書くと fault するので触らない。
+        if !self.region.is_committed(off + vs) {
+            return;
+        }
         self.region.fill_at(off, vs, 0);
         self.region.mark_dirty(off, vs);
     }

@@ -27,8 +27,7 @@ fn main() {
     let raw_path = "/tmp/sch_bench_raw.db";
     let sch_path = "/tmp/sch_bench_sch.db";
     for p in [raw_path, sch_path] {
-        let _ = std::fs::remove_file(p);
-        let _ = std::fs::remove_file(format!("{}.oplog", p));
+        let _ = enchudb_engine::db_files::remove_db(&p);
     }
 
     // ──── raw 構築 ────
@@ -185,8 +184,6 @@ fn main() {
     println!("(_acc 抑止: s={} s2={} s3={} s4={} l={} l2={} l3={} l4={})",
         s, s2, s3, s4, l, l2, l3, l4);
 
-    let _ = std::fs::remove_file(raw_path);
-    let _ = std::fs::remove_file(format!("{}.oplog", raw_path));
-    let _ = std::fs::remove_file(sch_path);
-    let _ = std::fs::remove_file(format!("{}.oplog", sch_path));
+    let _ = enchudb_engine::db_files::remove_db(&raw_path);
+    let _ = enchudb_engine::db_files::remove_db(&sch_path);
 }

@@ -21,9 +21,7 @@ use std::os::unix::fs::MetadataExt;
 const LIVE_VOCAB: usize = 5;
 
 fn cleanup(path: &str) {
-    for suf in ["", ".oplog", ".tables", ".crc", ".db.lock", ".eidmap", ".vocabmap"] {
-        let _ = std::fs::remove_file(format!("{path}{suf}"));
-    }
+    let _ = enchudb_engine::db_files::remove_db(&path);
 }
 
 /// enchu.db の物理サイズ (bytes) = st_blocks × 512。 sparse hole は数えない。

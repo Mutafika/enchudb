@@ -11,8 +11,7 @@ use std::time::Instant;
 fn main() {
     let n: u32 = 1_000_000;
     let path = "/tmp/gscap_probe.db";
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{}.oplog", path));
+    let _ = enchudb::db_files::remove_db(&path);
 
     let mut eng = Engine::create_growable_with_capacity(path, n + 100).unwrap();
     eng.define_himo("dept", ValueType::Number, 20); // dense cap 20 (schema 層は 0)
@@ -47,6 +46,5 @@ fn main() {
     println!("group_sum_range_par (par, DENSE cap=20): {:.1}µs", par as f64 / 1000.0);
     println!("(schema 層 cap=0 の HashMap path は ~5.2ms、 DuckDB は ~580µs)");
 
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{}.oplog", path));
+    let _ = enchudb::db_files::remove_db(&path);
 }

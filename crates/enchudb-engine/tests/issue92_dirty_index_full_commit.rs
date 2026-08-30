@@ -11,11 +11,22 @@ use enchudb_engine::{Engine, ValueType};
 
 /// enchu.db + .oplog の実割当バイト (st_blocks×512、sparse hole は数えない)。
 fn phys(path: &str) -> u64 {
-    let mut total = 0;
-    for suffix in ["", ".oplog"] {
-        if let Ok(m) = std::fs::metadata(format!("{path}{suffix}")) {
-            total += m.blocks() * 512;
+    // v10: 本体は directory。 配下の全 file の物理 block を足す。
+    fn walk(p: &std::path::Path, acc: &mut u64) {
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    walk(&e.path(), acc);
+                } else if let Ok(m) = e.metadata() {
+                    *acc += m.blocks() * 512;
+                }
+            }
         }
+    }
+    let mut total = 0;
+    walk(std::path::Path::new(path), &mut total);
+    if let Ok(m) = std::fs::metadata(format!("{path}/oplog")) {
+        total += m.blocks() * 512;
     }
     total
 }

@@ -40,6 +40,15 @@ libc = "0.2"
 # (wasm は単 thread なので意味なし)。
 rayon = "1"
 
+# request21 (v10): segment_map の Windows 版が使う sparse file API (FSCTL_SET_SPARSE)。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
+] }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # std::time panics on wasm32-unknown-unknown ("time not implemented"); web-time
 # shims Instant/SystemTime for the browser.

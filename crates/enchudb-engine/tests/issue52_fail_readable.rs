@@ -23,6 +23,7 @@ fn tmp_path(tag: &str) -> String {
 }
 
 fn cleanup_all(path: &str) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = fs::remove_file(path);
     let _ = fs::remove_file(format!("{}.oplog", path));
     let _ = fs::remove_file(format!("{}.tables", path));
@@ -55,7 +56,7 @@ fn open_recovers_from_corrupt_tables_sidecar() {
     }
 
     // sidecar を意図的に破損させる
-    let tables_path = format!("{}.tables", path);
+    let tables_path = format!("{}/tables", path);
     fs::write(&tables_path, b"GARBAGE-NOT-VALID-TABLES-SIDECAR").unwrap();
 
     // open: fix なし → InvalidData silently ignored、 widgets table 失われる
@@ -68,17 +69,12 @@ fn open_recovers_from_corrupt_tables_sidecar() {
         result.err()
     );
 
-    // .tables.corrupt-<ts> が作られたこと
-    let parent = std::path::Path::new(&path).parent().unwrap_or(std::path::Path::new("/tmp"));
-    let stem = std::path::Path::new(&path).file_name().unwrap().to_string_lossy().to_string();
-    let backup_found = fs::read_dir(parent)
+    // tables.corrupt-<ts> が DB directory の中に作られたこと (v10)
+    let backup_found = fs::read_dir(&path)
         .unwrap()
         .flatten()
-        .any(|ent| {
-            let n = ent.file_name().to_string_lossy().to_string();
-            n.starts_with(&stem) && n.contains(".tables.corrupt-")
-        });
-    assert!(backup_found, "expected .tables.corrupt-<ts> backup file");
+        .any(|ent| ent.file_name().to_string_lossy().starts_with("tables.corrupt-"));
+    assert!(backup_found, "expected tables.corrupt-<ts> backup file");
 
     // 元の `.tables` は今は anonymous tables の persist で上書きされてるはずなので OK
     cleanup_all(&path);
@@ -97,7 +93,7 @@ fn open_self_heals_stale_tables_tmp() {
     }
 
     // `.tables.tmp` 残骸を意図的に置く (= persist 途中で crash した shape)
-    let tmp_path: PathBuf = PathBuf::from(format!("{}.tables.tmp", path));
+    let tmp_path: PathBuf = PathBuf::from(format!("{}/tables.tmp", path));
     fs::write(&tmp_path, b"residual garbage from a crashed persist").unwrap();
     assert!(tmp_path.exists());
 

@@ -33,6 +33,7 @@ fn tmp(name: &str) -> String {
 }
 
 fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{}.oplog", path));
     let _ = std::fs::remove_file(format!("{}.crc", path));
@@ -102,7 +103,7 @@ fn mmap_ahead_of_wal_silent_sync_loss() {
 
     // WAL audit: 当該 op (Tie) は記録されてない (fsync 前に abort、 buffer のみ)
     // open_standalone は WAL を見ないので、 raw fs で WAL ファイル size 確認
-    let oplog_path = format!("{}.oplog", path);
+    let oplog_path = format!("{}/oplog", path);
     if let Ok(meta) = std::fs::metadata(&oplog_path) {
         // WAL ヘッダ分 + checkpoint marker (前 phase の flush 由来) は載っているが、
         // mmap_ahead での Tie op は載ってないことを確認するため、 WAL を open して
@@ -156,7 +157,7 @@ fn oplog_sync_closes_race_window() {
     let eids = eng.pull_raw("n", 0);
     assert!(!eids.is_empty(), "mmap should have value");
 
-    let oplog_path = format!("{}.oplog", path);
+    let oplog_path = format!("{}/oplog", path);
     let wal = enchudb_oplog::oplog::OpLog::open(std::path::Path::new(&oplog_path)).unwrap();
     let records = wal.recover();
     let has_tie = records

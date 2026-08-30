@@ -4,9 +4,14 @@
 //! AtomicU32 で next_eid を管理。ロック不要。
 //!
 //! Layout:
-//!   Header (16B): [magic:4][next_eid:AtomicU32][live_count:AtomicU32][reserved:4]
-//!   Bitset: ceil(max_entities / 8) bytes — bit=1 で live
+//!   Header (16B): [magic:4][next_eid:AtomicU32][live_count:AtomicU32][bitset_cap:u32]
+//!   Bitset: ceil(bitset_cap / 8) bytes — bit=1 で live
 //!   Free stack: [count:4][eid0:4][eid1:4]...
+//!
+//! v10 (request20 / request21 Phase 3): entity の上限 (`cap` = header の `max_entities`) は
+//! **伸ばせる**。 bitset は `bitset_cap` (= create 時の reservation、 header offset 12。 0 なら
+//! legacy = cap) 分の場所を最初から取り、 free stack はその後ろに固定する。 cap を伸ばしても
+//! offset は動かない。 bitset / free stack は触った page だけ commit する (lazy)。
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use crate::region::Region;
@@ -17,7 +22,10 @@ const FREE_STACK_MAX: u32 = 1_048_576;
 
 pub struct EntitySet {
     region: Region,
-    max_entities: u32,
+    /// 現在の上限 (exclusive)。 `grow` で伸びる。 bound check は全部ここを見る。
+    max_entities: AtomicU32,
+    /// bitset の物理容量 (= 伸ばせる上限)。 header offset 12。
+    bitset_cap: u32,
     bitset_offset: usize,
     free_offset: usize,
     /// #77-H7: free stack の push/pop 直列化。 push (count 読み → eid 書き →
@@ -31,15 +39,45 @@ unsafe impl Sync for EntitySet {}
 unsafe impl Send for EntitySet {}
 
 impl EntitySet {
-    pub fn region_size(max_entities: u32) -> usize {
-        let bitset_size = ((max_entities + 7) / 8) as usize;
-        // free_stack に積めるのは「これまで allocate された eid」 だけなので、
-        // 論理上限は max_entities。 FREE_STACK_MAX (= 1 M) は default preset
-        // (max_entities = 16 M) 想定の上限で、 tiny preset (max_entities =
-        // 1024) では 4 MB の無駄。 min を取ることで tiny で 4 KB まで縮む。
-        let free_cap = (FREE_STACK_MAX as usize).min(max_entities as usize);
-        let free_size = 4 + free_cap * 4;
-        HEADER + bitset_size + free_size
+    /// region の大きさ。 `bitset_cap` = bitset が持てる entity 数 (v10 は reservation、
+    /// legacy は max_entities)。
+    pub fn region_size(bitset_cap: u32) -> usize {
+        Self::free_offset_for(bitset_cap) + 4 + Self::free_cap_for(bitset_cap) as usize * 4
+    }
+
+    /// free stack に積める eid 数。 「これまで allocate された eid」 しか積めないので論理上限は
+    /// bitset_cap。 FREE_STACK_MAX (= 1 M) は default preset 想定の上限で、 tiny では 4 KB。
+    fn free_cap_for(bitset_cap: u32) -> u32 {
+        FREE_STACK_MAX.min(bitset_cap)
+    }
+
+    fn free_offset_for(bitset_cap: u32) -> usize {
+        let bitset_size = bitset_cap.div_ceil(8) as usize;
+        (HEADER + bitset_size + 3) & !3 // AtomicU32 alignment
+    }
+
+    /// legacy (v8 / v9、 free stack が `old_cap` 基準の位置にある) region を、 bitset 容量
+    /// `new_cap` の v10 layout に組み直す (migration 用、 in-memory)。 中身 (bit / free stack)
+    /// は同じ。
+    pub fn relayout(old: &[u8], old_cap: u32, new_cap: u32) -> Vec<u8> {
+        assert!(new_cap >= old_cap, "relayout: cannot shrink {old_cap} -> {new_cap}");
+        let old_bits = ((old_cap + 7) / 8) as usize;
+        let old_free = Self::free_offset_for(old_cap);
+        let old_free_cap = Self::free_cap_for(old_cap) as usize;
+        let mut out = vec![0u8; Self::region_size(new_cap)];
+        let hdr_end = HEADER.min(old.len());
+        out[..hdr_end].copy_from_slice(&old[..hdr_end]);
+        out[12..16].copy_from_slice(&new_cap.to_le_bytes());
+        let bits_end = (HEADER + old_bits).min(old.len());
+        if bits_end > HEADER {
+            out[HEADER..bits_end].copy_from_slice(&old[HEADER..bits_end]);
+        }
+        let new_free = Self::free_offset_for(new_cap);
+        let free_bytes = (4 + old_free_cap * 4).min(old.len().saturating_sub(old_free));
+        if free_bytes > 0 {
+            out[new_free..new_free + free_bytes].copy_from_slice(&old[old_free..old_free + free_bytes]);
+        }
+        out
     }
 
     /// 新規領域を初期化。
@@ -48,34 +86,77 @@ impl EntitySet {
     /// いる可能性があるため、 region 全体 (header + bitset + free stack)
     /// を init 時点で commit する。 EntitySet 全体は max_entities が
     /// 制限されてれば十分小さい (tiny preset で ~4 KB)。
-    pub fn init(region: Region, max_entities: u32) -> Self {
-        let bitset_offset = HEADER;
-        let bitset_size = ((max_entities + 7) / 8) as usize;
-        let free_offset = (bitset_offset + bitset_size + 3) & !3;
-        let region_total = Self::region_size(max_entities);
-
-        // #167: init 時の commit。 ここが失敗する = そもそも DB を作れない状況で、
-        // 直後の header write で気付く (領域は固定サイズの小領域)。 write 経路の
-        // ensure_committed は error を捨てないこと (`leaf_store` / `vocabulary` 参照)。
-        let _ = region.ensure_committed(region_total);
+    pub fn init(region: Region, max_entities: u32, bitset_cap: u32) -> Self {
+        let bitset_cap = bitset_cap.max(max_entities);
+        // #167: init 時の commit は header だけ。 bitset / free stack は触る page ごとに
+        // commit する (v10: reservation 分の場所を取るので、 全域 commit すると default で
+        // 36 MB が実体化する)。 失敗 = そもそも DB を作れない状況で、 直後の write で気付く。
+        let _ = region.ensure_committed(HEADER);
         region.write_at(0, &MAGIC);
+        region.write_at(12, &bitset_cap.to_le_bytes());
         // next_eid = 0, live_count = 0 (already zero from fresh region)
 
-        Self { region, max_entities, bitset_offset, free_offset,
-               free_lock: std::sync::Mutex::new(()) }
+        Self {
+            region,
+            max_entities: AtomicU32::new(max_entities),
+            bitset_cap,
+            bitset_offset: HEADER,
+            free_offset: Self::free_offset_for(bitset_cap),
+            free_lock: std::sync::Mutex::new(()),
+        }
     }
 
-    /// 既存領域をロード。
-    pub fn load(region: Region, max_entities: u32) -> Self {
+    /// 既存領域をロード。 `max_entities` は DB header の現在の上限。 bitset 容量は region
+    /// 自身の header (offset 12) から。 0 (legacy) なら max_entities。
+    ///
+    /// 壊れた region では **panic せず `InvalidData`** を返す (`corrupt_header_open` と同じ方針)。
+    /// v10 では `entities.seg` だけが欠けた / 短い状態が外から作れる (部分 copy、 rsync 中断)。
+    pub fn load(region: Region, max_entities: u32) -> std::io::Result<Self> {
         let mm = region.slice();
         if mm.len() < HEADER || mm[0..4] != MAGIC {
-            panic!("bad entity set magic");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "entity set region is corrupt or truncated (len {}, expected magic at 0)",
+                    mm.len()
+                ),
+            ));
         }
-        let bitset_offset = HEADER;
-        let bitset_size = ((max_entities + 7) / 8) as usize;
-        let free_offset = (bitset_offset + bitset_size + 3) & !3; // AtomicU32 alignment
-        Self { region, max_entities, bitset_offset, free_offset,
-               free_lock: std::sync::Mutex::new(()) }
+        let stored = u32::from_le_bytes(mm[12..16].try_into().unwrap());
+        let bitset_cap = if stored == 0 { max_entities } else { stored };
+        if bitset_cap < max_entities {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "entity set bitset_cap {bitset_cap} < max_entities {max_entities} — corrupt header?"
+                ),
+            ));
+        }
+        Ok(Self {
+            region,
+            max_entities: AtomicU32::new(max_entities),
+            bitset_cap,
+            bitset_offset: HEADER,
+            free_offset: Self::free_offset_for(bitset_cap),
+            free_lock: std::sync::Mutex::new(()),
+        })
+    }
+
+    /// bitset が持てる entity 数 (= `grow` の上限)。
+    pub fn bitset_cap(&self) -> u32 {
+        self.bitset_cap
+    }
+
+    /// 上限を `new_max` に伸ばす (縮めない)。 `bitset_cap` を超えると Err。 offset は
+    /// 動かないので、 既存の bit / free stack はそのまま。
+    pub fn grow(&self, new_max: u32) -> Result<(), String> {
+        if new_max > self.bitset_cap {
+            return Err(format!(
+                "entity cap {new_max} exceeds the reservation {} made at create", self.bitset_cap
+            ));
+        }
+        self.max_entities.fetch_max(new_max, Ordering::AcqRel);
+        Ok(())
     }
 
     fn next_eid_atomic(&self) -> &AtomicU32 {
@@ -88,9 +169,10 @@ impl EntitySet {
         unsafe { &*(mm.as_ptr().add(8) as *const AtomicU32) }
     }
 
-    /// 設定された entity 上限。
+    /// 現在の entity 上限 (exclusive)。
+    #[inline]
     pub fn max_entities(&self) -> u32 {
-        self.max_entities
+        self.max_entities.load(Ordering::Relaxed)
     }
 
     /// slot を払い出す。 **満杯 (max_entities 到達 + free stack 空) なら `None`**。
@@ -110,7 +192,7 @@ impl EntitySet {
     pub fn allocate_tracked(&self) -> Option<(u32, bool)> {
         // 高速パス: monotonic increment（欠番方式、ロックフリー）
         let eid = self.next_eid_atomic().fetch_add(1, Ordering::Relaxed);
-        if eid < self.max_entities {
+        if eid < self.max_entities() {
             self.set_bit(eid, true);
             self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
             // issue6 (perf 退化対策): writer hot path から mark_dirty を撤廃。
@@ -159,9 +241,13 @@ impl EntitySet {
         let fc = u32::from_le_bytes(
             self.region.slice()[free_count_off..free_count_off + 4].try_into().unwrap(),
         );
-        let free_cap = (FREE_STACK_MAX as usize).min(self.max_entities as usize) as u32;
+        let free_cap = Self::free_cap_for(self.bitset_cap);
         if fc < free_cap {
             let eid_off = self.free_offset + 4 + (fc as usize) * 4;
+            // v10: free stack は lazy commit。 失敗 (ENOSPC) なら積まずに欠番にする (安全側)。
+            if self.region.ensure_committed(eid_off + 4).is_err() {
+                return;
+            }
             self.region.write_at(eid_off, &eid.to_le_bytes());
             self.region.write_at(free_count_off, &(fc + 1).to_le_bytes());
         }
@@ -170,7 +256,7 @@ impl EntitySet {
 
     /// rollback用: 削除されたentityを復活させる。
     pub fn revive(&self, eid: u32) {
-        if eid >= self.max_entities { return; }
+        if eid >= self.max_entities() { return; }
         // bit 遷移で was-live を判定 (並行 revive の二重 count 防止)
         if !self.set_bit(eid, true) {
             self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
@@ -180,7 +266,7 @@ impl EntitySet {
     /// リモート peer から届いた eid を「存在する」ことにする。
     /// 既に live なら no-op。next_eid / live_count / live bitmap を整合的に更新する。
     pub fn ensure_live(&self, eid: u32) {
-        if eid >= self.max_entities { return; }
+        if eid >= self.max_entities() { return; }
         if self.set_bit(eid, true) { return; } // 既に live
         self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
         // next_eid は「これまで allocate した最大 +1」の概念。local を超えていたら進める。
@@ -192,7 +278,7 @@ impl EntitySet {
 
     #[inline]
     pub fn is_live(&self, eid: u32) -> bool {
-        if eid >= self.max_entities { return false; }
+        if eid >= self.max_entities() { return false; }
         let mm = self.region.slice();
         let byte_off = self.bitset_offset + (eid / 8) as usize;
         let bit = 1u8 << (eid % 8);
@@ -203,9 +289,20 @@ impl EntitySet {
     /// を返す。 旧実装の `mm[byte_off] |= bit` は非 atomic RMW で、 隣接 eid を
     /// 払い出された並行スレッドと同一バイトを書き合うと片方の bit が消えた。
     fn set_bit(&self, eid: u32, live: bool) -> bool {
-        if eid >= self.max_entities { return false; }
-        let mm = self.region.slice();
+        if eid >= self.max_entities() { return false; }
         let byte_off = self.bitset_offset + (eid / 8) as usize;
+        // v10: bitset は lazy commit。 未 commit の page は読むと 0 = 全部 dead なので、 消す
+        // 側 (live = false) は触らなくてよい。 立てる側の失敗 (ENOSPC) は「立たなかった」
+        // として false を返す (呼び出し側は live_count を進めない)。
+        if !self.region.is_committed(byte_off + 1) {
+            if !live {
+                return false;
+            }
+            if self.region.ensure_committed(byte_off + 1).is_err() {
+                return false;
+            }
+        }
+        let mm = self.region.slice();
         let byte = unsafe {
             &*(mm.as_ptr().add(byte_off) as *const std::sync::atomic::AtomicU8)
         };
@@ -227,7 +324,7 @@ impl EntitySet {
     /// を出すのに使う。 bitset を byte 単位で popcount するので 1M entity でも
     /// 128KB の線形走査で済む (呼ばれるのは診断時のみで hot path 外)。
     pub fn live_count_in(&self, lo: u32, hi: u32) -> u32 {
-        let hi = hi.min(self.max_entities);
+        let hi = hi.min(self.max_entities());
         if lo >= hi {
             return 0;
         }
@@ -266,7 +363,7 @@ impl EntitySet {
     /// なら top 数 byte で早期 exit する。 bitset は body に mmap 永続され `flush` で
     /// msync 済 = sidecar (next_local) が失われても ground truth はここに残る。
     pub fn highest_live_in(&self, lo: u32, hi: u32) -> Option<u32> {
-        let hi = hi.min(self.max_entities);
+        let hi = hi.min(self.max_entities());
         if lo >= hi {
             return None;
         }
@@ -304,9 +401,9 @@ impl EntitySet {
     /// [1M, 2M) のように互いに disjoint であれば、 並行 allocate_at は安全。
     pub fn allocate_at(&self, eid: u32) {
         assert!(
-            eid < self.max_entities,
+            eid < self.max_entities(),
             "allocate_at: eid {} exceeds max_entities {}",
-            eid, self.max_entities,
+            eid, self.max_entities(),
         );
         if !self.set_bit(eid, true) {
             self.live_count_atomic().fetch_add(1, Ordering::Relaxed);
@@ -351,7 +448,7 @@ mod tests {
         let buf: Box<[u8]> = vec![0u8; size].into_boxed_slice();
         let ptr = Box::leak(buf).as_mut_ptr();
         let region = unsafe { Region::new(ptr, size) };
-        Arc::new(EntitySet::init(region, max_entities))
+        Arc::new(EntitySet::init(region, max_entities, max_entities))
     }
 
     /// #77-H7 regression: 並行 allocate で隣接 eid の live bit が消えないこと。

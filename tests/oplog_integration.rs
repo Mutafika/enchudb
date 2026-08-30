@@ -6,12 +6,14 @@ use std::sync::Arc;
 
 fn tmp(name: &str) -> String {
     let p = format!("/tmp/enchudb-wal-it-{}-{}", name, std::process::id());
+    let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
     let _ = std::fs::remove_file(&p);
     let _ = std::fs::remove_file(format!("{}.oplog", p));
     p
 }
 
 fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{}.oplog", path));
 }
@@ -132,7 +134,7 @@ fn oplog_file_is_created() {
     }
     {
         let _eng = Engine::open_concurrent_with_oplog(&path, 1024 * 1024).unwrap();
-        assert!(Path::new(&format!("{}.oplog", path)).exists());
+        assert!(Path::new(&format!("{}/oplog", path)).exists());
     }
     cleanup(&path);
 }
@@ -228,7 +230,7 @@ fn header_crc_detects_corruption() {
     use std::io::{Read, Write, Seek, SeekFrom};
     use std::fs::OpenOptions;
     {
-        let mut f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let mut f = OpenOptions::new().read(true).write(true).open(format!("{path}/header.seg")).unwrap();
         f.seek(SeekFrom::Start(8)).unwrap();
         let mut b = [0u8; 1]; f.read_exact(&mut b).unwrap();
         f.seek(SeekFrom::Current(-1)).unwrap();

@@ -28,9 +28,7 @@ const DUR_SECS: u64 = 5;
 
 fn main() {
     let path = "/tmp/enchu_batch_read_probe.db";
-    for suf in ["", ".oplog", ".lock"] {
-        let _ = std::fs::remove_file(format!("{path}{suf}"));
-    }
+    let _ = enchudb::db_files::remove_db(&path);
 
     // build phase: 500K entity、 全部 a=7、 grp は 0..1000 に散らす (rebuild に仕事)
     let mut eng = Engine::create_growable_with_capacity(path, 8_000_000).unwrap();
@@ -163,7 +161,5 @@ fn main() {
         );
     }
 
-    for suf in ["", ".oplog", ".lock"] {
-        let _ = std::fs::remove_file(format!("{path}{suf}"));
-    }
+    let _ = enchudb::db_files::remove_db(&path);
 }

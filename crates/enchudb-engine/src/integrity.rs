@@ -177,9 +177,9 @@ pub fn fnv1a_slices(slices: &[&[u8]]) -> u32 {
     h
 }
 
-/// DB ファイルパスから対応する .crc ファイルパスを導出。
+/// DB directory から CRC table の path (`{db}/crc`) を導出。
 pub fn crc_path_for(db_path: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(format!("{}.crc", db_path))
+    crate::db_files::path_for(db_path, crate::db_files::CRC)
 }
 
 #[cfg(test)]
@@ -203,12 +203,14 @@ mod tests {
         assert_eq!(loaded.get(RegionKind::Content), 0xbeef);
         assert_eq!(loaded.db_file_size, 1024);
 
+        let _ = std::fs::remove_dir_all(&tmp); // v10: DB は directory
         let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn missing_file_returns_none() {
         let path = std::env::temp_dir().join(format!("enchudb-crc-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         assert!(CrcTable::load(&path).unwrap().is_none());
     }

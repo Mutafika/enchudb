@@ -42,6 +42,7 @@ fn tmp_path(tag: &str) -> String {
 }
 
 fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     for s in ["", ".oplog", ".tables", ".crc", ".lock", ".db.lock", ".eidmap", ".vocabmap", ".schema"] {
         let _ = std::fs::remove_file(format!("{}{}", path, s));
     }
@@ -153,9 +154,12 @@ fn tombstone_written_in_the_enable_sync_window_survives_reopen() {
         e.enable_sync_tables().unwrap();
         let b = Engine::concurrentize_with_oplog(e, 16 * 1024 * 1024).unwrap();
         b.set_peer_id(2);
+        // v10 (request21): `enable_sync_tables()` は版数列 segment をその場で生やすので
+        // 「窓」 は無い。 この test は 「有効化したセッションで受けた削除が reopen 後も効く」
+        // を固定する意味で残す (経路は column に直接載る)。
         assert!(
-            !b.has_cell_version(),
-            "前提が崩れた: このセッションは窓 (in-memory layout は pre-v9) のはず",
+            b.has_cell_version(),
+            "v10: enable_sync_tables 直後に版数列が無い (窓が復活している)",
         );
         let hid = b.himo_id("notes.note").unwrap() as u16;
 
@@ -175,7 +179,7 @@ fn tombstone_written_in_the_enable_sync_window_survives_reopen() {
         hid
     };
 
-    // reopen: ここで初めて version / tombstone column が生える (どちらも空)
+    // reopen: 版数列は有効化時点で生えているので、 窓で受けた削除がそのまま残っているはず
     let b2 = Engine::open_concurrent_with_oplog(&path, 16 * 1024 * 1024).unwrap();
     b2.set_peer_id(2);
     assert!(b2.has_cell_version(), "reopen で v9 化されていない");

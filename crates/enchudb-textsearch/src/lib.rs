@@ -395,6 +395,7 @@ mod tests {
     #[test]
     fn save_and_open() {
         let path = "/tmp/enchu_textsearch_test_save.etxt";
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
 
         let mut eng = TextSearch::new();
@@ -417,6 +418,7 @@ mod tests {
         assert_eq!(eng2.get_text(0), Some("国民は法の下に平等であって"));
         assert_eq!(eng2.get_text(99), None);
 
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
     }
 
@@ -435,6 +437,7 @@ mod tests {
             eng.index(eid, text);
         }
         let path = "/tmp/enchu_textsearch_postings_only.etxt";
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
         eng.save_postings_only(path).unwrap();
 
@@ -454,6 +457,7 @@ mod tests {
             .collect();
         assert_eq!(verified, vec![1]);
 
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
     }
 
@@ -477,6 +481,7 @@ mod tests {
     #[test]
     fn open_mut_round_trip() {
         let path = "/tmp/enchu_textsearch_test_open_mut.etxt";
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
 
         let mut eng = TextSearch::new();
@@ -493,6 +498,7 @@ mod tests {
         assert_eq!(eng2.doc_count(), 3);
         assert!(eng2.search("民主").contains(&30));
 
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);
     }
 }

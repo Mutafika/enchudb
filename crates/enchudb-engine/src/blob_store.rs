@@ -232,6 +232,7 @@ impl LocalBlobStore {
         };
         write_and_rename().map_err(|e| {
             // 失敗時は tmp を片付ける
+            let _ = std::fs::remove_dir_all(&tmp_path); // v10: DB は directory
             let _ = fs::remove_file(&tmp_path);
             BlobError::from(e)
         })

@@ -15,6 +15,7 @@ use std::sync::Arc;
 const CAP: usize = 8 * 1024 * 1024;
 
 fn fresh(path: &str) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     for suf in ["", ".oplog", ".lock", ".tables", ".crc"] {
         let _ = std::fs::remove_file(format!("{path}{suf}"));
     }
@@ -32,14 +33,15 @@ fn define_tag(eng: &Arc<Engine>, name: &str) {
 fn copy_db(src: &str, dst: &str) {
     use std::path::Path;
     fresh(dst);
-    enchudb_engine::copy_sparse(Path::new(src), Path::new(dst)).expect("copy body");
+    // v10: 本体は directory (segment file 群)。 丸ごと写す。
+    enchudb_engine::copy_db_dir(Path::new(src), Path::new(dst)).expect("copy body");
     let _ = enchudb_engine::copy_sparse(
-        Path::new(&format!("{src}.oplog")),
-        Path::new(&format!("{dst}.oplog")),
+        Path::new(&format!("{src}/oplog")),
+        Path::new(&format!("{dst}/oplog")),
     );
     let _ = enchudb_engine::copy_sparse(
-        Path::new(&format!("{src}.tables")),
-        Path::new(&format!("{dst}.tables")),
+        Path::new(&format!("{src}/tables")),
+        Path::new(&format!("{dst}/tables")),
     );
 }
 

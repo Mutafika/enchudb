@@ -31,6 +31,7 @@ fn tmp(name: &str) -> String {
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{}.oplog", path));
 }
@@ -199,7 +200,8 @@ fn byte_flip_header_magic_detected() {
     prepare_db(&path);
 
     // magic の 1 バイトを反転
-    flip_byte(&path, 0);
+    // v10: header は `{path}/header.seg`
+    flip_byte(&format!("{path}/header.seg"), 0);
 
     // open はエラー("not an EnchuDB file")
     let r = Engine::open_standalone(&path);
@@ -213,7 +215,7 @@ fn byte_flip_header_metadata_detected_by_crc() {
     prepare_db(&path);
 
     // max_entities(offset 8) を改竄 → CRC で検出
-    flip_byte(&path, 8);
+    flip_byte(&format!("{path}/header.seg"), 8);
 
     let r = Engine::open_standalone(&path);
     match r {
@@ -243,7 +245,7 @@ fn byte_flip_wal_tail_truncated_silently() {
     }
 
     // WAL の末尾付近(最後のレコード周辺)を改竄
-    let oplog_path = format!("{}.oplog", path);
+    let oplog_path = format!("{}/oplog", path);
     let wal_size = std::fs::metadata(&oplog_path).unwrap().len();
     // head の手前 32 バイト付近(実際の WAL 末尾付近)を狙う
     // 厳密位置は wal.head() を読むのが正しいが、ざっくり最後の 1KB を狙う
@@ -264,8 +266,10 @@ fn truncate_db_to_half_fails_to_open() {
     let path = tmp("truncate_half");
     prepare_db(&path);
 
-    let size = std::fs::metadata(&path).unwrap().len();
-    truncate_to(&path, size / 2);
+    // v10: header.seg を固定 field (4096 B) より短く切る → open は "too small" で拒否。
+    // (segment は page 単位なので Apple Silicon では 16 KB あり、 「半分」 では足りない)
+    let hp = format!("{path}/header.seg");
+    truncate_to(&hp, 2048);
 
     match Engine::open_standalone(&path) {
         Err(e) => {
@@ -294,7 +298,7 @@ fn truncate_wal_to_header_loses_uncommitted() {
     }
 
     // WAL を header サイズ(32B) にまで削る = 全レコード破棄
-    let oplog_path = format!("{}.oplog", path);
+    let oplog_path = format!("{}/oplog", path);
     truncate_to(&oplog_path, 32);
 
     // 0.9.0 (L1) 以降、 切り詰められた WAL は **黙って開かず loud に落ちる**。
@@ -385,9 +389,12 @@ fn fuzz_random_byte_flip_no_silent_corruption() {
             eng.oplog_sync().unwrap();
         }
 
-        // どのファイル? どのオフセット?
-        let which = next() % 2;
-        let target_path = if which == 0 { path.clone() } else { format!("{}.oplog", path) };
+        // どのファイル? どのオフセット? (v10: 本体は directory なので segment file を選ぶ)
+        let target_path = match next() % 3 {
+            0 => format!("{}/entities.seg", path),
+            1 => format!("{}/himo/0000.seg", path),
+            _ => format!("{}/oplog", path),
+        };
         let size = std::fs::metadata(&target_path).map(|m| m.len()).unwrap_or(0);
         if size == 0 { cleanup(&path); continue; }
         let offset = next() % size;
@@ -442,8 +449,8 @@ fn body_bit_flip_detected() {
     }
 
     // body 中盤の任意バイトを flip(himo column / vocab / content のいずれか)
-    let size = std::fs::metadata(&path).unwrap().len();
-    flip_byte(&path, size / 2);
+    // v10: body = himo 列 segment。 最初の cell (header 16B の直後) を反転 → 列 CRC が検出する
+    flip_byte(&format!("{path}/himo/0000.seg"), 16);
 
     // open は region CRC 不一致で失敗するはず
     match Engine::open_standalone(&path) {

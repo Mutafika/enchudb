@@ -11,6 +11,7 @@ use enchudb::transport::{InMemoryTransport, Transport};
 
 fn tmp(tag: &str) -> String {
     let p = format!("/tmp/enchudb-replica-{}-{}", tag, std::process::id());
+    let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
     for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", p, suffix));
     }
@@ -18,6 +19,7 @@ fn tmp(tag: &str) -> String {
 }
 
 fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", path, suffix));
     }

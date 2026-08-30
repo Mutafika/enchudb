@@ -23,34 +23,34 @@
 
 ## メインベンチ
 
-### 1. vs SQLite (1M entities) — schema 層
+### 1. vs SQLite / DuckDB / LMDB (1M entities) — schema 層
 
-組込 DB として SQLite と直接比較。 `examples/vs_sqlite.rs`。
+組込 DB と直接比較。 `examples/vs_db.rs` (4-way、 全部 in-process binding)。
 **schema 層** (`Database::create` + `table.where_eq` 等) で計測 — 公開 README が推奨するパス。
-aggregates (SUM / MIN / MAX / GROUP BY) は schema 層に未提供なので `db.engine()` に降りる
-(「declarative で書きつつ hot loop だけ engine 直叩き」の典型例)。
 
 ```bash
-cargo run --release --example vs_sqlite
+cargo run --release --example vs_db
 ```
 
-実測 (1,000,000 entities、 4 列: dept / status / salary / age、 全列に index):
+実測 2026-08-29 (M2 Max、 1,000,000 entities、 dept / status / salary / age 全列 index。
+0.25.1 (単一 file) と 0.26.0 v10 (directory) を同日に同条件で。 差は run 間の揺れの範囲):
 
-| クエリ | hits | EnchuDB (schema) | SQLite | 倍率 | per hit |
-|---|---:|---:|---:|---:|---:|
-| 1 条件 (dept=3) | 50K | 13.9 µs | 2.43 ms | **175x** | 0.28 ns |
-| 2 条件 (dept=0 AND status=1) | 50K | 237.9 µs | 53.18 ms | **224x** | 4.8 ns |
-| 3 条件 (dept=0 AND status=1 AND age=20) | 10K | 89.0 µs | 10.52 ms | **118x** | 8.9 ns |
-| 範囲 (age 30..40) | 220K | 12.06 ms | 12.34 ms | 1x | 55 ns |
-| COUNT (status=2) | 200K | 53.1 µs | 4.74 ms | **89x** | — |
-| SUM salary (dept=3) | 50K | 88.2 µs | 24.24 ms | **275x** | 1.8 ns |
-| SUM salary (全件) | 1M | 2.38 ms | 32.29 ms | **14x** | 2.4 ns |
-| GROUP BY dept SUM salary (全件 → 20 groups) | 1M scan | 13.81 ms | 397.44 ms | **29x** | 14 ns |
-| MIN/MAX salary (dept=5) | 50K | 188.9 µs | 20.00 ms | **106x** | 3.8 ns |
+| クエリ | hits | EnchuDB 0.25.1 | **EnchuDB v10** | SQLite | DuckDB | LMDB |
+|---|---:|---:|---:|---:|---:|---:|
+| point-by-PK | 1 | 195 ns | **153 ns** | 2.5 µs | 223 µs | 241 ns |
+| 1 条件 (dept=3) | 50K | 12.7 µs | **11.3 µs** | 1.81 ms | 1.63 ms | 533 µs |
+| 2 条件 (dept AND status) | 50K | 151 µs | **150 µs** | 41.1 ms | 1.76 ms | 19.2 ms |
+| 3 条件 (+ age) | 10K | 108 µs | **80 µs** | 8.67 ms | 1.08 ms | 27.4 ms |
+| 範囲 (age 30..40) | 220K | 491 µs | **480 µs** | 8.84 ms | 4.84 ms | 2.35 ms |
+| COUNT (status=2) | 200K | 38 µs | **44 µs** | 3.26 ms | 416 µs | 2.08 ms |
+| SUM salary (dept=3) | 50K | 63 µs | **66 µs** | 14.1 ms | 731 µs | 18.4 ms |
+| SUM salary (全件) | 1M | 59 µs | **60 µs** | 24.2 ms | 362 µs | 9.30 ms |
+| GROUP BY dept SUM (全件) | 20 | 642 µs | **665 µs** | 297 ms | 948 µs | 9.65 ms |
+| MIN/MAX salary (dept=5) | 50K | — | **143 µs** | 14.5 ms | 644 µs | 18.2 ms |
+| setup (1M insert) | — | 500 ms | **527 ms** | 4.8 s | 370 ms | 1.38 s |
 
-`per hit` は **結果サイズに対する latency**。 単純 `find` は 0.28 ns/hit
-(メモリ帯域に張り付いた memcpy 速度) — 「結果返却は memcpy 律速」の実証。 cylinder 交差や
-集計が入ると per-hit cost が増える。
+`multi_cond_scaling` (1M × 7 列、 谷カーブ) と `rag_compare` (enchudb-rag、 N=10K/100K) も
+0.25.1 と v10 で一致 (±3%)。
 
 挙動メモ:
 - **条件 AND は絞り込みが進むほど速い** (cylinder 交差): 3 条件 (10K hits, 89µs) は
@@ -147,8 +147,36 @@ criterion が ±10% 以上の劣化を自動で flag する。 CI に組み込�
 
 ## その他のベンチ (`examples/`)
 
+v10 (0.26.0) で DB は **directory** になった。 example の 「前回の残骸を掃除」 と 「disk 使用量」 は
+`enchudb::db_files::remove_db` / `disk_usage` (apparent / physical 両方) を使う。 単一 file 前提の
+`remove_file` / `metadata(path).len()` は書かないこと。
+
 | ファイル | 用途 |
 |---|---|
+| `bench_compare` (bin, `cargo run --release -p enchudb-engine --bin bench_compare`) | 1M entity の実用ベンチ (bulk write / rebuild / query / get) |
+| `v10_lifecycle_bench.rs` | **v10 必須**: create / define_himo / 順次 write (新 page) / reopen / snapshot / disk 使用量。 criterion の同一 cell tie では見えない grow・page fault のコストを拾う |
+| `batch_read_under_rebuild.rs` | double-buffer は concurrent rebuild 下で reader を守るか |
+| `bridge_scaling.rs` | oplog → `_sync_ops` bridge の scaling |
+| `dump.rs` | DB 内容ダンプツール (markdown / json) |
+| `group_sum_cap_probe.rs` | schema 層 (cardinality 0) の group_sum probe |
+| `growable_rss_repro.rs` | create_growable の起動 RSS / VSZ / teardown |
+| `lockfree_bucket_probe.rs` / `lockfree_engine_bench.rs` | #95 lock-free append bucket の PoC と出荷経路の実測 |
+| `multi_cond_scaling.rs` | 多条件 AND の谷カーブ |
+| `open_profile.rs` | open 経路の page reclaim を step 別に分解 |
+| `par_scan_bench.rs` | bulk column scan の seq vs par |
+| `reopen_eager_rebuild_bench.rs` | open 時の eager cylinder rebuild cost |
+| `sync_centralized.rs` / `sync_local_first.rs` / `sync_per_user.rs` | 0.7.0 sync pattern A / B / C の demo bench |
+| `verify_tax_probe.rs` | lazy-verify の read tax |
+| `vs_db.rs` | schema 層 EnchuDB vs SQLite vs DuckDB vs LMDB 4-way |
+| `workload_rss_1m.rs` / `workload_segmented_rss.rs` / `workload_sparse_rss.rs` | RSS / VSZ / disk 使用量のモデル検証 |
+| `write_ceiling_bench.rs` | single-consumer write ceiling |
+| `crates/enchudb-engine/examples/issue*_*.rs` | #88 / #92 / #116 / #127 の footprint 再現 harness |
+| `crates/enchudb-engine/examples/local_ns_bench.rs` | ns 級操作の分離計測 |
+| `crates/enchudb-schema/examples/schema_overhead_bench.rs` / `scope_demo.rs` | schema 層 / Scope の overhead |
+
+各ファイルの先頭コメントに目的・走り方が書いてある。
+
+---|---|
 | `agentic_workload_bench.rs` | LLM agent 風の高頻度 read/write mix |
 | `column_read_bench.rs` | Column 直読みパスのみ |
 | `dump.rs` | DB 内容ダンプツール |

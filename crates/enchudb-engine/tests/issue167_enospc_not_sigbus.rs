@@ -35,6 +35,7 @@ fn tmp(tag: &str) -> String {
             .unwrap()
             .as_nanos()
     );
+    let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
     for suf in ["", ".oplog", ".tables", ".crc", ".lock", ".eidmap", ".vocabmap"] {
         let _ = std::fs::remove_file(format!("{p}{suf}"));
     }
@@ -110,6 +111,7 @@ fn full_disk_rejects_writes_instead_of_sigbus() {
         "空きが戻ったのに書けない (拒否状態が sticky になっている)"
     );
 
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     for suf in ["", ".oplog", ".tables", ".crc", ".lock", ".eidmap", ".vocabmap"] {
         let _ = std::fs::remove_file(format!("{path}{suf}"));
     }

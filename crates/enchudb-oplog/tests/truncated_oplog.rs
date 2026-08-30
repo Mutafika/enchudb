@@ -15,6 +15,7 @@ fn tmp(name: &str) -> PathBuf {
         name,
         std::process::id()
     ));
+    let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
     let _ = std::fs::remove_file(&p);
     p
 }
@@ -50,6 +51,7 @@ fn reopen_intact_oplog_is_ok() {
     let wal = OpLog::open(&path).unwrap();
     let recs = wal.recover();
     assert_eq!(recs.len(), 1);
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 
@@ -65,6 +67,7 @@ fn truncated_oplog_open_is_invalid_data() {
     let err = expect_err(OpLog::open(&path), "truncated open");
     assert_eq!(err.kind(), ErrorKind::InvalidData, "got: {err}");
     assert!(err.to_string().contains("truncated"), "got: {err}");
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 
@@ -79,6 +82,7 @@ fn tiny_truncated_oplog_open_is_invalid_data() {
 
     let err = expect_err(OpLog::open(&path), "corrupt open");
     assert_eq!(err.kind(), ErrorKind::InvalidData, "got: {err}");
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 
@@ -91,6 +95,7 @@ fn corrupt_head_beyond_capacity_is_invalid_data() {
 
     let err = expect_err(OpLog::open(&path), "corrupt open");
     assert_eq!(err.kind(), ErrorKind::InvalidData, "got: {err}");
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 
@@ -103,5 +108,6 @@ fn corrupt_checkpoint_below_header_is_invalid_data() {
 
     let err = expect_err(OpLog::open(&path), "corrupt open");
     assert_eq!(err.kind(), ErrorKind::InvalidData, "got: {err}");
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }

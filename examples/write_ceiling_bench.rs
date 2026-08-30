@@ -30,9 +30,7 @@ fn parse_total() -> u32 {
 /// (push throughput, drain throughput) を返す。
 fn run(total: u32, writers: u32) -> (f64, f64) {
     let path = format!("/tmp/enchu_write_ceiling_{writers}.db");
-    for suf in ["", ".oplog", ".lock"] {
-        let _ = std::fs::remove_file(format!("{path}{suf}"));
-    }
+    let _ = enchudb::db_files::remove_db(&path);
 
     // build phase: himo を定義してから concurrent + oplog へ遷移
     let mut eng = Engine::create_growable_with_capacity(&path, total + 100).unwrap();
@@ -70,9 +68,7 @@ fn run(total: u32, writers: u32) -> (f64, f64) {
     let drain_tps = applied / drain_s;
 
     drop(eng);
-    for suf in ["", ".oplog", ".lock"] {
-        let _ = std::fs::remove_file(format!("{path}{suf}"));
-    }
+    let _ = enchudb::db_files::remove_db(&path);
     (push_tps, drain_tps)
 }
 

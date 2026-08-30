@@ -29,6 +29,7 @@ fn tmp_path(tag: &str) -> String {
 }
 
 fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     for suf in ["", ".oplog", ".tables", ".crc", ".db.lock", ".eidmap", ".vocabmap", ".schema"] {
         let _ = std::fs::remove_file(format!("{path}{suf}"));
     }
@@ -218,7 +219,7 @@ fn local_only_write_is_replayed_after_crash() {
 
     // crash 相当: WAL にだけ record を置く (body 未適用)。
     {
-        let wal = OpLog::open(std::path::Path::new(&format!("{path}.oplog"))).expect("open wal");
+        let wal = OpLog::open(std::path::Path::new(&format!("{path}/oplog"))).expect("open wal");
         let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), enchudb_oplog::eid_local(seen));
         wal.append_at_hlc(
             Op::Tie { eid: oplog_eid, himo_id: hid, value: 42 },

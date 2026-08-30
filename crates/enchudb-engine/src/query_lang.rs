@@ -476,6 +476,7 @@ mod tests {
 
     fn setup(name: &str) -> Engine {
         let dir = format!("/tmp/enchu_v24_ql_{name}.db");
+        let _ = std::fs::remove_dir_all(&dir); // v10: DB は directory
         let _ = std::fs::remove_file(&dir);
         let mut eng = Engine::create_standalone(&dir).unwrap();
 

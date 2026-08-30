@@ -147,20 +147,33 @@ impl LeafStore {
     /// 既存領域をロード。 `off_shift` は header (byte 8) から読む (v6 = 0)。
     /// free-list は空 (= 全空間を使用中扱い)。 呼び出し側が `rebuild_free_list(live)`
     /// を呼ぶまで reclaim は効かない (fresh append のみ)。
-    pub fn load(region: Region) -> Self {
+    ///
+    /// 壊れた region では **panic せず `InvalidData`** を返す (`corrupt_header_open` と
+    /// 同じ方針)。 v10 は `leaf.data.seg` だけが欠ける / 短い状態が外から作れる。
+    pub fn load(region: Region) -> std::io::Result<Self> {
         let mm = region.slice();
-        assert!(
-            mm.len() >= HEADER && (mm[0..4] == MAGIC || mm[0..4] == MAGIC_GEN),
-            "bad leaf store magic"
-        );
+        if mm.len() < HEADER || (mm[0..4] != MAGIC && mm[0..4] != MAGIC_GEN) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "leaf store region is corrupt or truncated (len {}, expected magic at 0)",
+                    mm.len()
+                ),
+            ));
+        }
         let off_shift = mm[SHIFT_OFF] as u32;
-        assert!(off_shift <= MAX_OFF_SHIFT, "leaf store corrupt: off_shift {}", off_shift);
-        Self {
+        if off_shift > MAX_OFF_SHIFT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("leaf store corrupt: off_shift {off_shift} > {MAX_OFF_SHIFT}"),
+            ));
+        }
+        Ok(Self {
             region,
             holes: Mutex::new(BTreeMap::new()),
             off_shift,
             gen_seq: std::sync::atomic::AtomicU32::new(0),
-        }
+        })
     }
 
     /// この store の cell offset shift (0 = byte / v6 互換、 2/3/4 = 16/32/64GB)。

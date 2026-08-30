@@ -29,6 +29,7 @@ fn tmp_path(tag: &str) -> String {
 }
 
 fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{}.oplog", path));
     let _ = std::fs::remove_file(format!("{}.tables", path));
@@ -100,7 +101,7 @@ fn database_create_and_open_writes_schema_sidecar() {
     }
 
     // === .schema sidecar が存在 ===
-    let schema_sidecar = format!("{}.schema", path);
+    let schema_sidecar = format!("{}/schema", path);
     assert!(
         std::path::Path::new(&schema_sidecar).exists(),
         "schema sidecar should exist at {}",

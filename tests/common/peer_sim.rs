@@ -271,7 +271,13 @@ impl PeerSim {
                 continue;
             }
             let suffix = &name[src_name.len()..];
-            let _ = std::fs::copy(entry.path(), format!("{}{}", dst, suffix));
+            let to = format!("{}{}", dst, suffix);
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                // v10: 本体は directory
+                let _ = enchudb_engine::copy_db_dir(&entry.path(), std::path::Path::new(&to));
+            } else {
+                let _ = std::fs::copy(entry.path(), to);
+            }
         }
         let eng = Engine::open_concurrent_with_oplog(&dst, OPLOG_CAPACITY).unwrap();
         eng.set_peer_id(self.peers[i].id);

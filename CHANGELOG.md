@@ -3,6 +3,295 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.26.0 — (unreleased、 branch `feat/v10-segments`)
+
+**on-disk format v10: DB は 1 ファイルから directory + region ごとの segment file 群に
+(breaking、 request21 / #173 の根治)。** 単一 file の固定 layout では 「見かけ 26 GB / sync で
+95 GB」 「entity cap も table の枠も create 時に固定」 が構造的に消せなかった。 v10 は region
+ごとに独立して伸びる file にし、 触った page だけ commit する。 実測 (macOS / APFS):
+
+| | 0.25 (1 ファイル) | 0.26 (directory) |
+|---|---|---|
+| 空 DB (既定 capacity) apparent | 26,482 MB | **6.3 MB** |
+| 同 `enable_sync_tables` 後 | 95,469 MB | **6.6 MB** |
+| 実 DB (sinfohub、 v8、 654 entity / 117 himo) physical | 130 MB (apparent 10 GB) | **4.8 MB** (migrate 5 秒) |
+| `create_growable` 100K ent 直後 (#172) | 1,229 MB | 数 MB |
+
+### Breaking
+
+- **`Engine::create* / open*` の path は directory になる。** 中身は `header.seg` /
+  `entities.seg` / `himo/NNNN.seg` / `ver/NNNN.seg` … (`README` の File layout)。 既存 API の
+  signature は不変、 path の意味だけ変わる
+- **v8 / v9 の 1 ファイル DB は開けない** (`InvalidData`: "is a single-file (v9 or older)
+  EnchuDB database … migrate it first")。 **移行は片道ではない**: open は writer lock を取る
+  前に弾くので **src file を 1 byte も触らず**、 隣に sidecar も lock も作らない。
+  `migrate_v9_to_v10` も src を読むだけで別 path に作る (= 失敗したらやり直せる、 旧 binary で
+  そのまま開き直せる)。 v8 → v9 のような 「writer open で in-place に stamp」 は **無い**。
+  `tests/v10_legacy_open_is_read_only.rs` で hash / len / mtime / 隣接 file を gate。
+  - ⚠️ **逆向き (v9 以前の binary で v10 の DB を開く) は生の OS エラーになる**:
+    `Is a directory (os error 21)`。 版の不一致だと分からないので、 **binary の更新を DB の
+    移行より先に**行うこと。 特に 「PATH 上の旧 binary を subprocess で呼ぶ」 構成 (sinfo hub が
+    `sf` を呼ぶ形) は、 移行済みの DB に旧 binary が当たって止まる。 offline で 1 回:
+  ```rust
+  enchudb::Engine::migrate_v9_to_v10("old.db", "new.db")?;  // new.db は directory、 old.db は不変
+  ```
+  data の載っている範囲だけ写す (sparse を保つ)。 旧 sidecar (`old.db.tables` / `.oplog` /
+  `.eidmap` / `.vocabmap` / `.schema` / `.crc`) は directory の中へ。 v7 以前は非対応
+  - 移行の前後で **`seal_integrity()` を通しておくことを勧める** (`.crc` を焼く)。 v10 は
+    「まだ書いていない segment」 も 0 byte なので、 **既定の open は segment の切り詰めを
+    検出できない**が、 封緘した DB は 0 byte / 部分 truncate / bit 反転を open 時の
+    `region CRC mismatch` で全部弾く (`tests/v10_segment_damage_matrix.rs`)。 退避する旧 DB と
+    移行先の両方を封緘しておけば、 「ロールバック用に残した DB が実は壊れていた」 を後から
+    検出できる。 全 region 走査なので秒オーダー、 常時オンにはしない前提の opt-in
+- **sidecar は directory の中** (`{db}/tables` / `oplog` / `eidmap` / `vocabmap` / `crc` /
+  `lock` / `schema` / `segments`)。 `{db}.tables` のような隣置きは無い。 path 生成は
+  `enchudb_engine::db_files` に集約 (schema / transport もこれを使う)
+  - ⚠️ **呼び出し側が DB root 直下に独自の file を置いていないか確認すること。** 上の 7 つと
+    名前が当たると壊れる (`lock` / `segments` は特に踏みやすい)。 実例: sinfo は CLI 直列化用の
+    flock を `<db_dir>/lock` に置いており、
+    engine root を `<db_dir>` に素直化すると enchudb の `lock` と同じ file を掴んで即死する
+    (`<db_dir>/enchu.db` のような入れ子を維持していれば衝突しない)
+- `Engine::table_eid_range(name)` は **hull** (先頭 lo 〜 最後の hi) を返す。 auto-grow した
+  table (下記) は間に他 table の eid を挟むので、 **scan は `table_eid_extents(name)`** で
+- **`define_table(name, size_hint)` の `size_hint` は硬い上限ではなくなった。** table が先頭
+  range を使い切ると空き eid 空間から extent を自動で足す (下記)。 「N 件で `entity_in` が
+  Err になる」 前提の test / 運用 (例: sinfo の `huge_scale_lifts_module_cap`、 enchudb 自身の
+  `entity_in_returns_err_when_table_eid_range_exhausted`) は entity cap ごと尽きる shape に直す
+  - ⚠️ **`size_hint` を上限として読んでいる箇所が壊れる。** 実測された壊れ方: 監視ゲージの
+    分母に table の cap を使っていると、 **分子が分母を超えて 100% に張り付き、 まだ余裕が
+    あるのにゲージが意味を失う** (sinfo hub の `/admin/capacity` は `shard_cap("versions")` を
+    分母にしていて、 5,000 件が cap 2,000 の table に入った)。 上限として使えるのは
+    `reserve_entities()` (= 予約の天井) だけで、 それ以外は consumer 側で論理上限を別に持つこと
+- `Engine::migrate_file_v5_to_v6` / `_with_leaf` を撤去 (出力が 1 ファイルで v10 では開けない)。
+  `migrate_bytes_v5_to_v6` と `MigrationStats` は残置
+- Windows: segment は sparse file を reservation 長で作る (`FSCTL_SET_SPARSE`)。 apparent は
+  reservation 分出る (physical は触った分)。 runtime 検証は未 (compile check のみ)
+
+### Added — 壊れた DB を黙って開かない (request22)
+
+- **`segments` sidecar (segment manifest)**: 「前回 flush 時点で各 segment が何 byte だったか」 を
+  記録し、 **open のたびに stat だけで検証**する。 v10 は 「まだ書いていない segment」 も 0 byte
+  なので、 これが無いと **切り詰められた segment と未使用の segment を区別できない** (`himo/0000.seg`
+  を 0 byte にしても open が通り、 その himo が静かに空になっていた)。 segment file は伸びるだけ
+  (`set_len` は grow と page 揃えにしか使わない) なので、 記録は下限として常に有効
+  - 検出の costs は stat 十数回。 `.crc` (`seal_integrity`) の全域走査とは別物で **常時オン**。
+    中身の書き換え (bit 反転) は依然 `.crc` の担当
+  - 書くのは flush の締めだけ、 かつ **長さが前回と変わっていなければ書かない** (sync 経路は
+    `body_msync` を毎回通る。 open 時に読んだ内容をキャッシュに載せるので、 何も書かずに
+    閉じた session は manifest を書き直さない)。 migrate / unpack は書いた実長から作り、
+    `snapshot_export` は複製元の manifest を写す
+  - **fsync しない**。 durability の記録ではなく 「前回 flush 時点の長さ」 のヒントで、
+    失われても検証を飛ばすだけ (segment は伸びるだけなので、 古い manifest も下限として有効)。
+    末尾に `end <行数>` を置き、 **書きかけ / 壊れた manifest は 「無い」 扱い**にする
+    (健全な DB を `Damaged` と誤判定する方が害が大きい)。 fsync していた初版は APFS の
+    fsync 1 回 ~8 ms が open / drop / snapshot の全部に乗って **open 2 倍・snapshot 8 倍**だった
+  - コスト (lifecycle bench、 A/B): 空 DB の open + drop **7.3〜8.1 → 7.7〜9.2 ms**、
+    `snapshot_export` **1.6〜2.7 → 2.5〜3.0 ms**、 順次 write は変化なし (31〜33 M tie/s)
+  - manifest が無い DB (手で組んだもの等) は検証を飛ばす
+- **`Engine::probe(path) -> DbState`** と **`Engine::exists(path) -> bool`**: open せずに path の
+  素性を言う。 `Missing` / `Ready` / `Incomplete` (create が途中で落ちた directory) /
+  `Damaged(理由)` / `SingleFileLegacy` (v8・v9 の 1 ファイル)。 v10 は DB が directory なので
+  consumer の `if path.exists() { open } else { create }` が半端な directory を既存 DB と誤認する
+  — その入口を sidecar 名に結合させずに塞ぐ (消費側 sinfo からの要望)
+  - 見るのは 3 段: header が読めるか → **header が指す segment が全部あるか** (mmap しない) →
+    manifest との長さ照合。 `create` は最後に manifest を書くので 「manifest が無い =
+    create が完了していない」 と言い切れ、 **segment 欠損が `Damaged` (後から消された) か
+    `Incomplete` (create 途中) か**を区別できる
+  - **`Ready` は 「開いてよい」 であって 「健全性が保証された」 ではない。** 見るのは header・
+    segment の実在・manifest との長さ照合だけで、 **中身は読まない**。 bit 反転 / 部分上書きの
+    検出は `seal_integrity()` で焼く `.crc` の役目 (層が違う)
+  - **`Incomplete` と `Damaged` は運用上の意味が違う**: 前者は 「まだ DB になっていない」
+    (commit されたデータは無い → 作り直してよい)、 後者は 「**あったデータが欠けている**」
+    (→ **消さない**。 backup からの復旧に回す)。 混同すると 「壊れた DB を作りかけと誤認して
+    消す」 が起きるので型で分けてある。 その方針上、 **segment は揃っていて manifest だけ
+    無い DB は `Ready`** (開けるし中身もある。 切り詰めの検出だけが効かない)
+  - **lock を取らず file も作らない** (stat と header の read だけ)。 writer が lock を握った
+    ままでも probe できる (readonly reader と同じ扱い) — `tests/v10_probe_db_state.rs` で gate
+
+### Added — 小物
+
+- `enchudb::db_files::remove_db(path)` / `disk_usage(path) -> DiskUsage { apparent, physical }`:
+  DB が directory になったので、 「前回の残骸を消す」 「サイズを測る」 を 1 行で。 legacy
+  (単一 file + `{path}.oplog` 等) も同じ関数で扱える。 examples / bin (30 本) は全部これに置換
+- `enchudb::segment_map::grow_stats() -> (回数, ns)`: segment commit 伸長の診断用 counter
+- `examples/v10_lifecycle_bench.rs` (上記「性能」参照)
+
+### Added — entity cap と table の枠が伸びる (request20 案 B)
+
+- **`Engine::grow_entity_cap(&self, new_cap) -> io::Result<u32>`**: entity の上限を
+  `reserve_entities()` まで伸ばす。 header を書いて flush するので reopen 後も残る。 縮めない
+- reservation は create 時に決まる: unix は `max(max_entities, 2^28)` (仮想空間だけ)、 Windows は
+  `max_entities` (= 伸ばせない。 `GrowableOptions::reserve_entities` で明示)。 migrate した DB は
+  既定の reservation を得る
+  - `max_entities()` は **table の auto-grow では動かない** (pool 内の空き eid から extent を
+    取るだけ)。 動くのは `grow_entity_cap` を明示的に呼んだ時だけ。 呼ぶ設計にするなら、
+    `cap → capacity profile` の逆写像で profile を復元している処理は誤判定しうる
+- **table は `entity_in` の枯渇時に空き eid 空間から extent を自動で切り足す。** 従来の
+  `exhausted` は cap まで尽きたときだけ (message に `grow_entity_cap` を添える)。
+  `Engine::grow_table(name, extra)` で明示も可。 sidecar `tables` に `EXT1` block が増える
+  (末尾 optional、 `PKS1` と同方式)
+- `Engine::table_eid_extents(name)`、 `Engine::reserve_entities()`
+- `Engine::pack_dir(dir, file)` / `Engine::unpack_to_dir(file, dir)`: directory ⇄ packed 1 ファイル
+  (= 旧 v9 の 1 ファイル layout と byte 互換、 bootstrap 配布 / 転送 / `from_bytes` 用)
+- `enchudb_engine::copy_db_dir` (開ける複製: segment + sidecar、 lock と `*.tmp` 除く) /
+  `copy_db_segments` (本体のみ)。 `snapshot_export` の target も directory
+- `enchudb_engine::db_files` (sidecar 名と path helper)
+
+### Fixed
+
+- **sidecar の mode が書き換えのたびに umask へ戻っていた。** `tables` / `eidmap` / `vocabmap` は
+  tmp write → rename で置き換わるので、 呼び出し側が `chmod 600` していても **rename で新しい
+  inode (0644) に化けていた**。 置き換え前の mode を tmp に写してから rename するようにした
+  (v9 以前からの挙動。 sinfo が「開くたびに 0600 を掛け直しているのに、 最後に書かれた sidecar
+  だけ 0644」という形で実測して判明。 新規作成時は従来どおり umask 依存)
+- **壊れた entity 領域で panic していた** (`bad entity set magic`)。 `EntitySet::load` が
+  `io::Result` を返すようになり、 `InvalidData` の Err になる (`corrupt_header_open` と同じ方針)。
+  v10 は `entities.seg` だけが欠ける / 短い状態が外から作れる (部分 copy、 rsync 中断)
+- **#243**: `enable_sync_tables()` は版数列 (`ver/*.seg`) と tombstone 列 (`tomb.seg`) を
+  **その場で** 作る (独立 file なので mmap を張り替えずに足せる)。 「column は次の open から」
+  の窓が消えた。 `Syncer::new` の hydrate 条件は crash 回収 / packed backing 用に残置
+- **#246**: header は `max_himos` に応じた可変長 (`header_size_for`)。 `max_himos > 960` で
+  himo 表が 4096 byte を溢れて panic していた。 v8 / v9 の固定 4096 header は parse 側で切替
+- **#172**: growable の lazy commit が region 単位になり、 末尾 region に触っても手前が実体化しない
+- **#245**: Windows build (0.23.0 から壊れていた growable stub) を修正
+- APFS は write のたびに 16 MB 未満の gap を実体化する。 `pack_dir` / `unpack_to_dir` /
+  migrate は全 write 後に `F_PUNCHHOLE` で穴を戻す (無いと実 DB の migrate が 344 MB になった)
+- HTTP bootstrap: server は directory を `pack_dir` して配り、 client は `unpack_to_dir` で展開、
+  sidecar (`eidmap` / `tables` / `vocabmap`) は directory の中へ。 EnchuDB image でない file を運ぶ
+  用途は従来どおり (sidecar を取りに行かない)
+
+### 検証
+
+- workspace 全走: Phase 2 時点 166 suites / 1097 passed / 0 failed、 性能修正 (fd 保持 /
+  grow 方針 / dir clone) 後 **166 suites / 1105 passed / 0 failed** (examples 30 本の build 込み)
+- 新規 test: `v10_dir_tests` (sidecar 配置 / copy / snapshot / migrate v8・v9・v7 拒否 /
+  grow_entity_cap / free stack / table auto-grow / EXT1 永続 / 実 DB fixture)、
+  `v10_cross_process_readonly` (別 process が readonly open、 後から足した himo も見える)、
+  `segment_map` (予約 / commit / refresh / ENOSPC)、
+  `v10_segment_damage_matrix` (全 segment × 削除 / 0 byte / half truncate × seal 有無 = 60 ケースを
+  子 process で開く。 **どのケースも 「黙って壊れる」 が無いこと** — 欠損 / 切り詰めは manifest が、
+  中身の書き換えは `.crc` が弾く)、 `v10_probe_db_state` (`probe` の 5 状態)、
+  `v10_crash_consistency` (書き込み中の SIGKILL × 6 round で、 再 open と flush 済みデータの残存)、
+  `v10_legacy_open_is_read_only` (v9 DB を open しても hash / mtime / 隣接 file が不変)、
+  `v10_fd_budget` (`RLIMIT_NOFILE` を 64 / 128 / 512 に絞った子 process で himo 200 本の DB を
+  作り、 全値を読み直す)、 `sidecar_mode_preserved`
+- 実 DB: sinfohub の v8 `enchu.db` (clonefile した隔離 copy) を migrate → `open_readonly` で
+  654 entity / 117 himo / 19 table を確認
+- **消費側 (tag 固定 v0.25.1 の app を `--config patch` で branch に差し替え、 repo の隔離 copy で)**:
+  sinfo (schema 層経由の create / open / insert / query、 5 crate) **617 passed / 1 failed** —
+  失敗は上記 `size_hint` 前提の 1 件のみ。 syncretic (sync / relay / bootstrap 経路、 44 test file) **184 passed / 0 failed**
+- kenning (v0.25.1 pin): 素の状態で 30 passed / 4 failed。 落ちた 4 本は全部 kenning 側の
+  1 ファイル前提 (`remove_file` で作り直し / dir の実消費 / cache prune / `is_dir` で dir と db を
+  振り分け) で、 5 箇所直すと **34 / 34**。 patch は enchudb の `notes/requests/kenning-v10.patch`
+- **実 data の end-to-end**: `~/.sinfo/db` (v8、 25,061 entity / 258 himo / 40 table。 sinfo が 2026-08-08 に
+  per-project 化する前の旧 shared DB) と
+  sinfohub の project store (654 entity) を clonefile で隔離 → `enchu --migrate-v10` (13 秒 / 6 秒、
+  10 GB apparent → 82 MB / 4.8 MB) → **v10 で build した `sf`** の project / fsck / module list /
+  tree / snap list / structure log / target list が、 **release 版 `sf 0.28.0` × 元の v8 copy と
+  出力が byte 一致** (fsck の dangling snap pin ×10 も元から)
+- **sunsu2** (peer 分散 SNS 兼 sync 破壊試験機、 `../enchudb` path 依存): **22 passed / 0 failed**
+  (Phase 0〜3、 24-peer Zipf chaos 44 s、 real wire、 findings、 workload)。 sunsu2 側は
+  source 変更なしで compile も通る。 fd 保持 / grow 方針の修正 (`adc0da9`) 後に再走して同じ 22/0
+- **Linux (OrbStack、 Ubuntu 26.04 arm64、 root=btrfs / /tmp=tmpfs)**: workspace 全走
+  **1104 passed / 0 failed** (macOS と同数)。 実 DB fixture の migrate は tmpfs 4.4 MB / btrfs
+  4.8 MB (seek で飛ばした範囲がそのまま穴、 `punch_holes` は no-op)、 別 process readonly test も pass
+- Windows は `--target x86_64-pc-windows-msvc` の compile check のみ
+
+### 性能 — 0.25.1 との before / after (macOS 15 / Apple M2 Max / APFS、 `--release`)
+
+v10 で **最初に測った時点 (`b6d1c74`) は新しい page を踏む write が -25%** だった。 criterion
+(`benches/core`) の tie は同一 cell 連打なので拾えず、 `examples/v10_lifecycle_bench.rs`
+(create → define_himo ×200 → 順次 200k 行 × 3 tie → reopen → snapshot) でだけ出た。
+
+原因は `SegmentMap::grow_to` が commit を伸ばすたびに segment file を open / close していたこと。
+**macOS は dirty な mmap page を持つ file を write fd で close するとその場で書き戻す** (python
+実測: open だけ 0.6 µs、 ftruncate + mmap + 1 page write 後の close 49 µs、 engine では ~100 µs)。
+順次 write 中に同じ page を何度もディスクへ書き直していた (grow 41 回で 5.5 ms → fd 保持で 0.5 ms)。
+
+直したもの (全部 `segment_map`):
+
+- **writer は segment の fd を持ち続ける** (reader は従来どおり都度 open、 fd を増やさない)。
+  保持は予算制: 初回に soft `RLIMIT_NOFILE` を hard (unlimited なら 10240) まで上げ、 その
+  **半分**まで保持、 超えた segment は都度 open (遅いが動く)。 `ulimit -Hn 64` でも himo 200 本の
+  DB を作れることを確認 (予算無しの初版は `define_himo` が EMFILE で panic した)。 それでも
+  EMFILE なら `raise_fd_limit` して 1 回 retry。 `segment_map::retained_fds()` で保持数を見られる
+- `mark_dirty` は page 単位に丸めて持つ (順次 write で cell ごとに `fetch_max` を踏まない)
+- commit の伸長は幾何級数 (×2、 最低 +64 KB、 1 回 16 MB まで)。 旧 「1 MB 超は +1 MB 線形」 は
+  64 MB column で 60 回 grow していた。 伸びるのは apparent だけ
+- `remap_to` は伸びた分 [cur, end) だけ貼る (全域を貼り直すと触った page が再 fault)
+- `snapshot_export` / `copy_db_dir` は APFS の `clonefile(2)` で **directory ごと 1 syscall** で
+  clone してから不要 entry (lock / sidecar) を消す。 file 単位 clone は 1 本 ~100 µs で、
+  himo 200 本の DB が 23 ms かかっていた (他 OS / 非 APFS / 別 volume は従来の file 単位)
+
+| lifecycle (1M cap、 himo 200、 200k 行 × 3 tie) | 0.25.1 | v10 `b6d1c74` | v10 修正後 |
+|---|---:|---:|---:|
+| `create_growable` 既定 capacity | 0.4 ms / **apparent 24,743 MB** / physical 0.1 MB | 1.1 ms / 0.2 MB / 0.1 MB | 1.1 ms / **0.2 MB** / 0.1 MB |
+| 空 DB の open | 8.1 ms | 7.5 ms | 6.4〜7.7 ms |
+| `define_himo` ×200 | 1.9 ms | 12.5 ms | 12.3 ms (segment file 作成 ~60 µs/本) |
+| 順次 write 200k × 3 tie | 16.9 ms (**35.5 M tie/s**) | 22.5 ms (26.0 M) | 18.8 ms (**32.0 M**) |
+| flush | 15〜18 ms | 12〜19 ms | 12.5〜13 ms |
+| 書いた後の apparent / physical | 2,969 MB / 5.6 MB | 7.1 MB / 7.0 MB | **7.1 MB / 7.0 MB** |
+| reopen (clean) | 1.0 ms | 6.2 ms | 5.7 ms (file 200 本の open + mmap、 ~30 µs/本) |
+| query (28,571 hits) | 1.7 ms | 1.65 ms | 1.7 ms |
+| `snapshot_export` | 1.2〜3.3 ms | 23〜33 ms | **1.6〜1.9 ms** |
+
+| `bench_compare` (1M entity、 3 回) | 0.25.1 | v10 `b6d1c74` | v10 修正後 |
+|---|---:|---:|---:|
+| bulk 1M 行 (4 tie/行、 tie_text 込み) | 150〜155 ms | 184〜187 ms | 173〜179 ms |
+| 1 条件 / 2 条件 / 4 条件 query | 5.3〜5.9 / 51〜52 / 52〜58 µs | 5.6〜5.8 / 50〜52 / 52〜55 µs | 5.6〜5.8 / 52〜55 / 56〜59 µs |
+
+criterion `benches/core` (`--baseline v0251`、 0.25.1 の tree を scratch に置いて `CRITERION_HOME` を共有):
+
+| group | 0.25.1 | v10 修正後 | Δ |
+|---|---:|---:|---:|
+| tie/plain_value (同一 cell) | 37.7 ns | 38.0 ns | 0% |
+| pull_raw/single_value | 88.2 ns | 89.7 ns | -3% (改善) |
+| audit/all_1k_records | 16.6 ns | 15.9 ns | -2% |
+| snapshot_export/small_db | 0.25 ms | 1.09 ms (修正前 2.4 ms) | +310% — file 数に比例、 backup 経路 |
+| scale_open / scale_tables_open (himo 50 の open + query) | 6.6 ms | 8.0〜8.3 ms | +24% — file 数に比例 |
+| churn_read/pull_untouched_value | 41.6 ns | 43.5 ns | +5% |
+| tie_async/wal_signed_off | 86 ns | 100 ns | +14〜21% (CI 83〜105 ns、 noisy) |
+| query/two_cond_and, scale*/query_within_table | 458 / 541 ns | 491 / 600 ns | +7〜9% — **binary layout 感度** (下記) |
+
+query の +7% は **コード変更ではなく binary layout**: engine の全 source を `b6d1c74` に戻すと
++0.3%、 そこへ **未使用の helper (`db_files::remove_db` / `disk_usage`) を足すだけで +3.3%**、
+更に本 fix (query 経路に触れない) を重ねると +7%。 0.25.1 自身を保存 baseline と比べる対照は
++0.4% で安定。 ±10% の「退行」 flag はこの bench では layout で出るので、 判断は
+`bench_compare` (query 系は 3 世代とも同じ) と lifecycle で行う。
+
+`examples/` のベンチ 15 本も 0.25.1 と v10 で同日に走らせた (表は `benches/README.md`):
+
+- **同等 (±5%)**: `vs_db` (vs SQLite / DuckDB / LMDB、 1M)、 `multi_cond_scaling`、 `rag_compare`、
+  `par_scan` の sum / count / group / histogram、 `workload_rss_*` の RSS (74 / 259 / 207 MB)、
+  `reopen_eager_rebuild` の create+populate (v10 の方が 10〜20% 速い)
+- **apparent size**: `workload_rss_1m` 2,457 MB → **27 MB**、 `workload_sparse_rss` 8,796 MB →
+  **134 MB**、 `workload_segmented_rss` 10,017 MB → **378 MB**
+- **file 数比例**: reopen 100 himo 0.46 → 2.6 ms、 200 himo 0.96 → 5.5 ms
+- **write 残り**: `workload_segmented_rss` の 23M tie insert 1.34〜1.42 s → 1.50〜1.52 s (+8〜12%)。
+  page fault 数は同じ (156 vs 163) なので lazy commit の per-op 判定 (`is_committed` /
+  `mark_dirty`、 ~2 ns/op) が正体。 eager DB には無かったコスト
+- **async 経路** (`write_ceiling` / `lockfree_engine_bench` = tie_async → oplog → consumer):
+  writer 1 本だけ drain -10〜25% (base 自体が run 間 ±10%)、 **writer 2 本以上は同等**。
+  oplog crate と `tie_async` は無変更で、 consumer 側の write が上記 -10% を引きずっている。
+  lockfree の readers=4 は 6.2〜6.3 → 5.0〜5.3 M/s (-17%)
+- **layout 感度の再現**: `par_scan_bench` の min_range / max_range (seq) が 7.4 → 11.4 ms (+55%)
+  に見えたが、 同じ処理を probe で切り出す / bench に 1 block 足して build し直すと 7.3 ms で
+  一致。 元 binary は再走しても 11.1 ms。 branchy な scan loop の配置依存
+- 走らなくなっていた example を直した: `open_profile` (同 process で `mem::forget` した writer
+  が registry に残り WouldBlock、 0.25.1 でも落ちる) は子 process で crash を模擬、
+  `schema_overhead_bench` は 0.25.1 では `size_hint` 枯渇で panic していたのが v10 の auto-grow で
+  通る、 DB を drop より先に消して warning を出す 5 本は drop を先に
+
+残っている v10 の固有コスト (どれも file 数 = himo 数に比例する 1 回きりの経路):
+`define_himo` ~60 µs/本、 open ~30 µs/本、 snapshot ~1 ms + α。 順次 write の残り -10% は
+grow 自体 (fstat / ftruncate / mmap ≈ 15 µs × 十数回) と page fault で、 1M 行規模では 3〜4 ms。
+
+### 既知の残り
+
+- wasm `from_bytes` 経路は未確認 (packed 形式は v9 互換のまま)
+- 別 process の readonly reader は `grow_entity_cap` を次の open で見る
+- Windows の placeholder API (base 不動の予約) は未着手、 sparse whole-map で代用
+
 ## 0.25.1 — 2026-08-28
 
 **sync ring から record が「黙って消える」経路を 2 件塞いだ patch。** 片方 (#235) は

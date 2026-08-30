@@ -43,9 +43,7 @@ fn env_usize(key: &str) -> Option<usize> {
 }
 
 fn cleanup(path: &str) {
-    for suf in ["", ".oplog", ".tables", ".crc", ".db.lock", ".eidmap", ".vocabmap", ".wal"] {
-        let _ = std::fs::remove_file(format!("{path}{suf}"));
-    }
+    let _ = enchudb_engine::db_files::remove_db(&path);
 }
 
 /// MODE=arrayqueue — issue の切り分け #2 を直接再現。

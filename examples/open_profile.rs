@@ -13,9 +13,16 @@ use std::time::Instant;
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "default".to_string());
     let path = format!("/tmp/enchudb_open_profile_{}.db", mode);
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(format!("{}.oplog", path));
-    let _ = std::fs::remove_file(format!("{}.crc", path));
+    if std::env::var_os("ENCHU_OPEN_PROFILE_CRASH_CHILD").is_some() {
+        // 親の Phase 3 から呼ばれる: 1 件書いて flush も Drop も通さず exit
+        // (disk 上の clean flag を 0 のまま残す = 次 open で rebuild を強制する)。
+        let mut eng = enchudb::Engine::open_standalone(&path).unwrap();
+        let e = eng.entity().unwrap();
+        eng.tie_text(e, "tag", "extra");
+        std::mem::forget(eng);
+        std::process::exit(0);
+    }
+    let _ = enchudb::db_files::remove_db(&path);
 
     // Phase 1: build a non-empty DB (count > 0 になるよう tag を insert)
     {
@@ -49,21 +56,21 @@ fn main() {
     drop(enchudb::Engine::open_standalone(&path).unwrap());
     eprintln!("[open_profile] total open wall-clock: {} ms", t0.elapsed().as_millis());
 
-    // Phase 3: crash 相当 (insert 後 flush 呼ばず forget) の状態を作って再 open
+    // Phase 3: crash 相当の状態を作って再 open。 同 process で `mem::forget` すると
+    // writer registry に残って次の open が WouldBlock になる (0.2x で入った in-process
+    // 排他) ので、 子 process で書いて Drop を通さず exit する。
     {
-        let mut eng = enchudb::Engine::open_standalone(&path).unwrap();
-        let e = eng.entity().unwrap();
-        eng.tie_text(e, "tag", "extra");
-        // Drop も flush も呼ばずに leak。 graceful close 経路を回避し、
-        // disk 上の clean flag を 0 のまま残す = 次 open で rebuild を強制する
-        std::mem::forget(eng);
+        let st = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(&mode)
+            .env("ENCHU_OPEN_PROFILE_CRASH_CHILD", "1")
+            .status()
+            .unwrap();
+        assert!(st.success(), "crash child failed");
     }
     eprintln!("=== reopen mode={} (dirty = simulated crash) ===", mode);
     let t0 = Instant::now();
     drop(enchudb::Engine::open_standalone(&path).unwrap());
     eprintln!("[open_profile] total open wall-clock: {} ms", t0.elapsed().as_millis());
 
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(format!("{}.oplog", path));
-    let _ = std::fs::remove_file(format!("{}.crc", path));
+    let _ = enchudb::db_files::remove_db(&path);
 }

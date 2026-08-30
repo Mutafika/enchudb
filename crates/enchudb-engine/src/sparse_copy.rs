@@ -216,7 +216,9 @@ mod tests {
             len,
         );
 
+        let _ = std::fs::remove_dir_all(&src); // v10: DB は directory
         let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_dir_all(&dst); // v10: DB は directory
         let _ = std::fs::remove_file(&dst);
     }
 
@@ -233,7 +235,9 @@ mod tests {
         assert!(read_all(&dst).iter().all(|&b| b == 0), "0 で埋まっていない");
         assert!(physical_bytes(&dst) < len / 100, "全部穴なのに物理を食っている");
 
+        let _ = std::fs::remove_dir_all(&src); // v10: DB は directory
         let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_dir_all(&dst); // v10: DB は directory
         let _ = std::fs::remove_file(&dst);
     }
 
@@ -248,7 +252,9 @@ mod tests {
         assert_eq!(copy_via_holes(&src, &dst).unwrap(), body.len() as u64);
         assert_eq!(read_all(&dst), body, "中身が一致しない");
 
+        let _ = std::fs::remove_dir_all(&src); // v10: DB は directory
         let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_dir_all(&dst); // v10: DB は directory
         let _ = std::fs::remove_file(&dst);
     }
 
@@ -262,7 +268,9 @@ mod tests {
         assert_eq!(copy_via_holes(&src, &dst).unwrap(), 0);
         assert_eq!(std::fs::metadata(&dst).unwrap().len(), 0);
 
+        let _ = std::fs::remove_dir_all(&src); // v10: DB は directory
         let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_dir_all(&dst); // v10: DB は directory
         let _ = std::fs::remove_file(&dst);
     }
 
@@ -278,7 +286,9 @@ mod tests {
         assert_eq!(read_all(&src), read_all(&dst));
         assert!(physical_bytes(&dst) < len / 100, "穴が潰れている");
 
+        let _ = std::fs::remove_dir_all(&src); // v10: DB は directory
         let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_dir_all(&dst); // v10: DB は directory
         let _ = std::fs::remove_file(&dst);
     }
 }

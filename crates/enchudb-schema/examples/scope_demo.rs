@@ -18,10 +18,7 @@ const ROWS_PER_TENANT: u32 = 10_000;
 const TENANTS: &[&str] = &["alice", "bob", "carol"];
 
 fn cleanup(path: &str) {
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{}.oplog", path));
-    let _ = std::fs::remove_file(format!("{}.tables", path));
-    let _ = std::fs::remove_file(format!("{}.crc", path));
+    let _ = enchudb_engine::db_files::remove_db(&path);
 }
 
 /// view に対する **app code**。 pattern A でも B でも同じものを呼ぶ。

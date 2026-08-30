@@ -22,10 +22,7 @@ use enchudb::schema::Database;
 
 fn open_or_create_user_db(user: &str) -> Result<Database, Box<dyn std::error::Error>> {
     let path = format!("/tmp/enchudb-pattern-b-{}-{}.ecdb", user, std::process::id());
-    let _ = std::fs::remove_file(&path);
-    for suf in &[".oplog", ".tables", ".crc", ".db.lock"] {
-        let _ = std::fs::remove_file(format!("{}{}", path, suf));
-    }
+    let _ = enchudb::db_files::remove_db(&path);
 
     let mut db = Database::create(&path)?;
     let _ = db.table("memos")
@@ -41,10 +38,7 @@ fn open_or_create_user_db(user: &str) -> Result<Database, Box<dyn std::error::Er
 
 fn cleanup(user: &str) {
     let path = format!("/tmp/enchudb-pattern-b-{}-{}.ecdb", user, std::process::id());
-    let _ = std::fs::remove_file(&path);
-    for suf in &[".oplog", ".tables", ".crc", ".db.lock"] {
-        let _ = std::fs::remove_file(format!("{}{}", path, suf));
-    }
+    let _ = enchudb::db_files::remove_db(&path);
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -144,6 +144,7 @@ fn default_n_output_is_byte_identical_to_v2() {
 #[test]
 fn with_n3_round_trip_through_file() {
     let path = tmp_path("n3");
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 
     let mut idx = NgramIndex::with_n(3).unwrap();
@@ -170,6 +171,7 @@ fn with_n3_round_trip_through_file() {
     assert_eq!(opened.candidates("存在しない語"), Vec::<u64>::new());
     assert_eq!(opened.get_text(30), Some(DOCS[2].1));
 
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 
@@ -240,6 +242,7 @@ fn query_shorter_than_n_yields_no_candidates() {
 #[test]
 fn rebuild_inherits_n_from_file() {
     let path = tmp_path("rebuild");
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 
     let mut idx = NgramIndex::with_n(3).unwrap();
@@ -261,6 +264,7 @@ fn rebuild_inherits_n_from_file() {
     reopened.write_to(&mut buf).unwrap();
     assert_eq!(NgramIndex::from_bytes(buf).unwrap().n(), 3);
 
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 

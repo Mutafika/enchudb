@@ -11,6 +11,7 @@ use std::collections::HashSet;
 // テストごとに独立した DB ファイルパス
 fn db_path(tag: &str) -> String {
     let path = format!("/tmp/enchudb_scen_{}.db", tag);
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
     path
 }
@@ -557,6 +558,7 @@ fn query_pair_empty_cell_fallback() {
     let result = db.query(&[("type_h", 1), ("board", 0), ("author", 5)]);
     assert_eq!(result.len(), 1);
 
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 
@@ -581,6 +583,7 @@ fn sum_basic() {
     assert_eq!(db.sum("cost", &[]), 0);
     assert_eq!(db.sum("nonexistent", &eids), 0);
 
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 
@@ -597,6 +600,7 @@ fn sum_skips_missing_values() {
 
     assert_eq!(db.sum("price", &[e1, e2, e3]), 80);
 
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 
@@ -628,6 +632,7 @@ fn group_sum_basic() {
     assert_eq!(p0, 300);  // 100 + 200
     assert_eq!(p1, 1200); // 300 + 400 + 500
 
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 
@@ -663,6 +668,7 @@ fn group_sum_with_query() {
     // 合計
     assert_eq!(db.sum("material_cost", &active), 6000);
 
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 
@@ -690,6 +696,7 @@ fn pull_range_basic() {
     let empty = db.pull_range("age", 50, 60);
     assert_eq!(empty.len(), 0);
 
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 
@@ -749,6 +756,7 @@ fn tie_date_and_range() {
     let none = db.pull_date_range("created", (2026, 5, 1), (2026, 5, 31));
     assert_eq!(none.len(), 0);
 
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 
@@ -773,6 +781,7 @@ fn date_with_sum() {
     let first_two = db.pull_date_range("date", (2026, 4, 1), (2026, 4, 2));
     assert_eq!(db.sum("sales", &first_two), 3000);
 
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 
@@ -815,6 +824,7 @@ fn aggregates() {
     assert_eq!(db.avg("nope", &eids), None);
     assert_eq!(db.count("nope", &eids), 0);
 
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }
 
@@ -833,5 +843,6 @@ fn aggregates_with_missing_values() {
     assert_eq!(db.avg("price", &[e1, e2, e3]), Some(200)); // (100+300)/2, e2 スキップ
     assert_eq!(db.count("price", &[e1, e2, e3]), 2);
 
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
 }

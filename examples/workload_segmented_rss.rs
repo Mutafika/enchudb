@@ -97,9 +97,7 @@ fn tables() -> Vec<(&'static str, Vec<(&'static str, u32)>)> {
 fn main() {
     let n: u32 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
     let path = "/tmp/enchudb_segmented_rss.db";
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{}.crc", path));
-    let _ = std::fs::remove_file(format!("{}.oplog", path));
+    let _ = enchudb::db_files::remove_db(&path);
 
     let tbls = tables();
     let total_himos: usize = tbls.iter().map(|(_, h)| h.len()).sum();
@@ -172,11 +170,10 @@ fn main() {
         "  実測 RSS との差分から実態を推定する\n"
     );
 
-    let meta = std::fs::metadata(path).unwrap();
-    println!("file apparent size: {:.1} MB", meta.len() as f64 / 1024.0 / 1024.0);
+    let usage = enchudb::db_files::disk_usage(path);
+    println!("db apparent size: {:.1} MB (physical {:.1} MB)", usage.apparent_mb(), usage.physical_mb());
     snap("end", t0);
 
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{}.crc", path));
-    let _ = std::fs::remove_file(format!("{}.oplog", path));
+    drop(eng); // v10: DB は directory。 drop (sidecar 永続化) の後で消す
+    let _ = enchudb::db_files::remove_db(&path);
 }

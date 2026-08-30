@@ -2,7 +2,7 @@
 
 **Embedded graph engine with multi-condition AND in nanoseconds.**
 
-An embedded database built around a *himo* (紐, "cord")-based cylinder engine. Single-file mmap, and a LockFreeCylinder (value → eid buckets) makes the **lookup decision ns-scale** with lock-free concurrent reads. Returning results is memcpy-bound and proportional to result size (µs scale — the physical floor).
+An embedded database built around a *himo* (紐, "cord")-based cylinder engine. A directory of mmap-backed segment files (one per himo), and a LockFreeCylinder (value → eid buckets) makes the **lookup decision ns-scale** with lock-free concurrent reads. Returning results is memcpy-bound and proportional to result size (µs scale — the physical floor).
 
 On top of it you can stack **schema / SQL / FFI / full-text search / RAG / P2P sync / transport**, all in one workspace.
 
@@ -240,36 +240,65 @@ Each sub-crate has its own `README.md` with details, and `docs/` holds architect
 
 ## File layout
 
+Since 0.26.0 (format v10) **a database is a directory**: one file per region, so each
+region grows independently and only what you write is materialised. Everything that
+belongs to the DB lives inside it — `mv`, `rm -r` and `cp -r` move the whole thing.
+
 ```
-{path}         main DB (mmap, FILE_VERSION 9; v4-v8 are read-compatible)
-{path}.oplog   oplog (when enabled; sparse file)
-{path}.lock    writer-exclusion sidecar (flock on writer open, released on close)
-{path}.crc     region CRC (only when seal_integrity is used)
-{path}.eidmap  foreign-eid translation + tombstones (only when syncing)
-<blob_root>/   BlobStore (separate directory, content-addressed, for offloading large blobs)
+{path}/                     the database (FILE_VERSION 10)
+  header.seg                header: capacities, himo table, flags
+  entities.seg              live bitmap + free stack
+  vocab.{data,offsets,index}.seg
+  himoreg.{data,offsets,index}.seg
+  content.{index,data}.seg
+  leaf.data.seg             LeafStore (variable-length text)
+  himo/NNNN.seg             one Column per himo (id = NNNN, never reused)
+  ver/NNNN.seg              per-cell HLC version column (syncing DBs only)
+  tomb.seg                  tombstone column (syncing DBs only)
+  oplog                     WAL (when enabled)
+  tables                    table definitions (+ PK / extent blocks)
+  eidmap, vocabmap          foreign-eid / vocab translation (only when syncing)
+  crc                       region CRC (only when seal_integrity is used)
+  schema                    enchudb-schema's table schema
+  lock                      writer exclusion (flock on writer open, released on close)
+<blob_root>/                BlobStore (separate directory, content-addressed)
 ```
 
-> **The v9 per-cell version regions belong to syncing databases only.** They are
-> allocated when `enable_sync_tables()` is called (and, as a fallback, when a writer
-> opens a database that already has the sync tables). A database that never syncs stays
-> at the v8 layout and pays nothing for them — that is a ~3.6x difference in apparent
-> size at default capacity. Version columns become readable on the *next* open after
-> `enable_sync_tables()`; during that first session versions are kept in memory, exactly
-> as pre-v9 builds behaved.
->
-> **Stamping a database as v9 is one-way, and older binaries can no longer open it.**
-> The layout itself does not change (the v9 regions are gated by a header flag) and no
-> data is moved, but there is no automatic demotion: shrinking the file would SIGBUS any
-> reader that has it mapped read-only from another process. To go back, use
-> `snapshot_export` into a freshly created database.
+Every segment file is mapped on top of a large private reservation, so its base
+pointer never moves while it grows: a segment starts at one page and its commit grows
+geometrically as you write (only the *apparent* size grows; blocks are allocated for the
+pages you touch). The per-cell version regions are created by `enable_sync_tables()`
+**immediately** (they are separate files, so nothing has to be remapped) and a DB that
+never syncs simply does not have them.
+
+**File descriptors.** A writer keeps one fd open per segment file (≈ number of himos + 10)
+for the lifetime of the handle — reopening on every growth step made macOS write the
+dirty pages back on each `close`, which cost 25% of sequential write throughput. Readers
+(`open_readonly`) keep no fds. Retained fds are budgeted: on first use enchudb raises the
+soft `RLIMIT_NOFILE` to the hard limit (launchd gives GUI apps 256) and keeps at most
+half of it; segments beyond the budget fall back to open-per-growth, so a hard limit of
+64 still works, just slower. `db_files::remove_db` / `disk_usage` are the helpers for
+deleting and measuring a DB.
+
+**Single-file databases (v8 / v9, up to 0.25.x) are not opened by this build.** Convert
+them once, offline, with
+
+```rust
+enchudb::Engine::migrate_v9_to_v10("old.db", "new.db")?;   // new.db is a directory
+```
+
+which copies only the data extents (a 10 GB-apparent v8 store becomes a few MB on
+disk) and moves the old `old.db.tables` / `.oplog` / `.schema` sidecars inside. The
+packed single-file layout is still produced by `Engine::pack_dir` for transfer /
+bootstrap and read back by `unpack_to_dir` / `from_bytes`.
 
 ## Disk space
 
-The main DB is a **sparse** file: the apparent size is fixed at create time from
-`max_entities` x `max_himos`, while physical usage only grows with what you actually
-write. A default-capacity store looks like ~26 GB in `ls -l` (~95 GB once sync is
-enabled and the v9 version columns are allocated) but costs a few hundred KB on disk.
-`df` does not move. This is by design — but it has three consequences worth knowing.
+Segment files are committed lazily: a fresh default-capacity store is ~6 MB in
+`du -sh` (it was 26 GB *apparent* as a single file up to 0.25, 95 GB with sync), and
+both apparent and physical size grow with what you actually write. On Windows the
+segments are sparse files sized to their reservation, so `dir` still shows the reserved
+size there. Three consequences remain worth knowing.
 
 **1. A full disk is refused, not crashed — but only on a best-effort basis.** Writes go
 through `mmap`, so when the kernel cannot allocate a block for a hole it raises
@@ -299,17 +328,17 @@ does `set_len`), so the failure surfaces later, at write time. **Provision for t
 apparent size, not the current physical usage** — "`df` says there is room" is not a
 safety property here.
 
-**2. Copying the DB can materialize every hole.** `std::fs::copy` preserves holes on
-macOS (APFS clones) but **fills them with zeros on Linux** — copying a default store
-there writes the full apparent size. Use `enchudb_engine::copy_sparse`, which walks
-`SEEK_DATA` / `SEEK_HOLE` and copies only the data ranges. `Engine::snapshot_export`
-already uses it.
+**2. Copying the DB.** Use `enchudb_engine::copy_db_dir` (a clone that opens: segments
+plus sidecars, minus the lock) or `Engine::snapshot_export` (a consistent copy). Both
+walk `SEEK_DATA` / `SEEK_HOLE` per file and copy only data. Note that **APFS fills any
+hole smaller than 16 MB on write**, so `pack_dir` / `unpack_to_dir` punch the zero
+ranges back out with `F_PUNCHHOLE` after writing; Linux keeps seek-created holes as is.
 
 **3. External backup tools have the same problem.** `rsync` without `--sparse`, naive
 `cp`, and apparent-size-based tools (Time Machine) will expand the file. Prefer
-`snapshot_export`, or pass the sparse-aware flags. If the apparent size itself is a
-problem for your environment, create with a smaller `max_entities` or use
-`create_growable_*`.
+`snapshot_export`, or pass the sparse-aware flags. If the reserved size is a problem
+(Windows), create with a smaller `max_entities` — since 0.26.0 the entity cap can be
+raised later with `grow_entity_cap`, up to the reservation chosen at create time.
 
 Note that `snapshot_export` does **not** fsync: the copy lands in the page cache, so a
 power loss right after can lose it. That is deliberate (it keeps snapshots fast by not
@@ -331,6 +360,8 @@ eng.entity();                                 // Result — Err when the eid spa
                                               // is closed (entity_in is the one to use
                                               // then). Same shape as entity_in().
 eng.fault_count(FaultKind::EntitySpace);      // refused: no eid slots left
+                                              // (grow_entity_cap raises the cap; tables
+                                              // auto-grow into free eid space first)
 eng.fault_count(FaultKind::VocabSpace);       // refused: vocab_max_entries reached
 eng.fault_count(FaultKind::ContentSpace);     // refused: content region full
 eng.fault_count(FaultKind::ValueOutOfRange);  // refused: value == u32::MAX (sentinel)
@@ -351,7 +382,7 @@ A SQLite-WAL-style model: **one writer process + unlimited readers**.
 | Write + read | `Engine::open_concurrent_with_oplog` / `Engine::open_standalone` | exclusive | 1 |
 | Read only | `Engine::open_readonly` / `Database::open_readonly` | none | unlimited |
 
-The writer holds `flock(LOCK_EX)` on the `.db.lock` sidecar for the engine's lifetime. A second writer blocks until the first is dropped (same as sqlite's default). Readonly opens take no lock, so they coexist with the writer; calling a write API on one panics so you notice immediately.
+The writer holds `flock(LOCK_EX)` on `{path}/lock` for the engine's lifetime. A second writer blocks until the first is dropped (same as sqlite's default). Readonly opens take no lock, so they coexist with the writer; calling a write API on one panics so you notice immediately.
 
 Reading variable-length text (`Leaf` / text himos) while a writer is live should go through `Engine::get_text_owned`, which returns an owned `Vec<u8>` via a per-slot gen-seqlock (the borrowing `get_text` is for single-threaded / quiesced access). This is what makes cross-process readonly reads of live text torn-read-safe ([#106](https://github.com/Mutafika/enchudb/issues/106) / [#113](https://github.com/Mutafika/enchudb/issues/113)).
 

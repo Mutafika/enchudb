@@ -20,6 +20,7 @@ fn tmp_path(tag: &str) -> String {
 }
 
 fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
     for ext in ["lock", "oplog", "schema", "tables"] {
         let _ = std::fs::remove_file(format!("{}.{}", path, ext));
@@ -33,7 +34,8 @@ fn cleanup(path: &str) {
 /// 通ってしまい、 OrbStack の Linux 実行で初めて露見した)。
 fn header_u32(path: &str, off: usize) -> u32 {
     use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path).expect("open db");
+    // v10: header は `{path}/header.seg`
+    let mut f = std::fs::File::open(format!("{path}/header.seg")).expect("open db");
     f.seek(SeekFrom::Start(off as u64)).expect("seek");
     let mut b = [0u8; 4];
     f.read_exact(&mut b).expect("read header word");
@@ -43,7 +45,7 @@ fn header_u32(path: &str, off: usize) -> u32 {
 /// header の 4 byte だけを seek して書く (同上の理由でファイル全体を読み書きしない)。
 fn write_header_u32(path: &str, off: usize, v: u32) {
     use std::io::{Seek, SeekFrom, Write};
-    let mut f = std::fs::OpenOptions::new().write(true).open(path).expect("open db rw");
+    let mut f = std::fs::OpenOptions::new().write(true).open(format!("{path}/header.seg")).expect("open db rw");
     f.seek(SeekFrom::Start(off as u64)).expect("seek");
     f.write_all(&v.to_le_bytes()).expect("write header word");
 }
@@ -113,50 +115,30 @@ fn default_keeps_legacy_multiplier() {
 /// (per-cell version の有無は別 header flag `H_CELL_VERSION` が持つ) ので、
 /// 既存 DB の layout は 1 byte も変わらない — その回帰は engine 側の
 /// `pre_v9_db_opens_and_behaves_as_before` が見ている。
-const CURRENT_FILE_VERSION: u32 = 9;
+const CURRENT_FILE_VERSION: u32 = 10;
 
+/// v10 (request21): directory format の header に旧 version (v7) が書かれていたら、
+/// 黙って upgrade せず **拒否**する。 v9 以前は 1 ファイル layout で、 directory の中に
+/// 旧 version の header が居ることは正規の経路では起きない (= 破損か手作業)。
+/// 旧 1 ファイル DB の取り込みは `migrate_v9_to_v10` (Phase 2) が担う。
 #[test]
-fn v7_db_upgrades_to_current_version_on_writer_open() {
+fn legacy_version_in_v10_header_is_rejected() {
     let path = tmp_path("v7upgrade");
     cleanup(&path);
-
     {
         let mut eng =
             Engine::create_growable_opts(&path, GrowableOptions::default()).expect("create");
         eng.define_himo("k", ValueType::Tag, 1024);
         drop(eng);
     }
-    assert_eq!(
-        header_u32(&path, H_VERSION),
-        CURRENT_FILE_VERSION,
-        "新規 create が現行 version でない",
-    );
-
-    // v7 を偽造する。 header CRC == 0 は「header CRC 導入以前の DB」として検証を通る経路なので、
-    // version を 7 に戻して CRC を 0 にすれば v7 DB として open される。
+    assert_eq!(header_u32(&path, H_VERSION), CURRENT_FILE_VERSION, "新規 create が現行 version でない");
     write_header_u32(&path, H_VERSION, 7);
     write_header_u32(&path, H_HEADER_CRC, 0);
     assert_eq!(header_u32(&path, H_VERSION), 7, "偽造に失敗");
-
-    // readonly open は据え置き (共有 mmap を書かない)。
-    {
-        let ro = Engine::open_readonly(&path).expect("v7 は legacy として open できること");
-        drop(ro);
-    }
-    assert_eq!(header_u32(&path, H_VERSION), 7, "readonly open が header を書き換えた");
-
-    // writer open で v8 へ上がる。
-    {
-        let w = Engine::open(&path).expect("v7 を writer open");
-        drop(w);
-    }
-    assert_eq!(
-        header_u32(&path, H_VERSION),
-        CURRENT_FILE_VERSION,
-        "writer open で現行 version へ migrate されていない (旧 binary が新 index を誤読する穴が残る)"
-    );
-
-    Engine::open(&path).expect("migrate 後も open できること");
+    let err = Engine::open_readonly(&path).err().expect("v7 header の v10 directory が open できてしまった");
+    let msg = err.to_string();
+    assert!(msg.contains("unsupported EnchuDB file version 7"), "error が version を言っていない: {msg}");
+    assert!(msg.contains("migrate"), "error が migration へ誘導していない: {msg}");
     cleanup(&path);
 }
 

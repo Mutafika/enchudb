@@ -128,6 +128,7 @@ proptest! {
         if let Ok(wal) = OpLog::open(&path) {
             let _ = wal.iter_committed();
         }
+        let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
     }
 }

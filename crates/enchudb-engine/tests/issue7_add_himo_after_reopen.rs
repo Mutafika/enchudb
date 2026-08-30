@@ -21,6 +21,7 @@ fn tmp_path(tag: &str) -> String {
 }
 
 fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{}.oplog", path));
     let _ = std::fs::remove_file(format!("{}.tables", path));
@@ -169,7 +170,7 @@ fn append_himos_after_seal_integrity() {
         // seal_integrity = flush + .crc 焼き
         eng.seal_integrity().unwrap();
         assert!(
-            std::path::Path::new(&format!("{}.crc", path)).exists(),
+            std::path::Path::new(&format!("{}/crc", path)).exists(),
             ".crc sidecar should exist after seal_integrity"
         );
     }
@@ -182,7 +183,7 @@ fn append_himos_after_seal_integrity() {
         }
         eng.flush().unwrap();
         assert!(
-            !std::path::Path::new(&format!("{}.crc", path)).exists(),
+            !std::path::Path::new(&format!("{}/crc", path)).exists(),
             "define_himo after seal_integrity must invalidate the stale .crc sidecar"
         );
     }

@@ -10,11 +10,13 @@ use std::sync::Arc;
 
 fn tmp(name: &str) -> String {
     let path = format!("/tmp/enchu_edge_{name}.db");
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(&path);
     path
 }
 
 fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
 }
 
@@ -364,7 +366,7 @@ fn file_version_mismatch() {
     {
         use std::fs::OpenOptions;
         use std::io::{Seek, SeekFrom, Write};
-        let mut f = OpenOptions::new().write(true).open(&path).unwrap();
+        let mut f = OpenOptions::new().write(true).open(format!("{path}/header.seg")).unwrap();
         f.seek(SeekFrom::Start(0)).unwrap();
         f.write_all(&[0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
         f.sync_all().unwrap();

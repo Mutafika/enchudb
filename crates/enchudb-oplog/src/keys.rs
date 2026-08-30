@@ -242,6 +242,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     fn load_or_create_persists_key() {
         let dir = std::env::temp_dir().join(format!("enchudb_key_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir); // v10: DB は directory
         let _ = std::fs::remove_file(&dir);
 
         let kp1 = Keypair::load_or_create(&dir).unwrap();
@@ -251,6 +252,7 @@ mod tests {
         let pk2 = kp2.public_bytes();
         assert_eq!(pk1, pk2, "load should return same key");
 
+        let _ = std::fs::remove_dir_all(&dir); // v10: DB は directory
         let _ = std::fs::remove_file(&dir);
     }
 

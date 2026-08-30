@@ -4,7 +4,7 @@ use std::time::Instant;
 fn main() {
     let n = 1_000_000u32;
     let dir = "/tmp/enchu_bench_v24.db";
-    let _ = std::fs::remove_file(dir);
+    let _ = enchudb_engine::db_files::remove_db(&dir);
 
     let mut eng = Engine::create_standalone(dir).unwrap();
     eng.define_himo("age", ValueType::Number, 50);
@@ -78,5 +78,7 @@ fn main() {
     eprintln!("--- 読み取り ({iters}回平均) ---");
     eprintln!("get + get_text               : {:>8.1}μs", read.as_micros() as f64 / iters as f64);
 
-    let _ = std::fs::remove_file(dir);
+    // v10: DB は directory。 drop (sidecar 永続化) より前に消すと warning が出るので先に drop。
+    drop(eng);
+    let _ = enchudb_engine::db_files::remove_db(&dir);
 }

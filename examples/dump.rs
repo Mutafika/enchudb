@@ -306,7 +306,7 @@ mod tests {
 
     fn tmp_db(name: &str) -> String {
         let p = format!("/tmp/enchudb_dump_test_{name}.db");
-        let _ = std::fs::remove_file(&p);
+        let _ = enchudb::db_files::remove_db(&p);
         p
     }
 
@@ -375,7 +375,7 @@ mod tests {
         assert!(out.contains("## post (PK: id) — 1 rows"));
         assert!(out.contains("Alice"));
         assert!(out.contains("Hello"));
-        std::fs::remove_file(&p).ok();
+        enchudb::db_files::remove_db(&p).ok();
     }
 
     #[test]
@@ -386,7 +386,7 @@ mod tests {
         let out = format_markdown(&db, &default_args(&p));
 
         assert!(out.contains("(Alice)"), "ref に対象 entity の表示名が併記されるべき:\n{out}");
-        std::fs::remove_file(&p).ok();
+        enchudb::db_files::remove_db(&p).ok();
     }
 
     #[test]
@@ -399,7 +399,7 @@ mod tests {
         assert!(out.contains("line1\\nline2"));
         // name = "Bob|pipe" → \| に escape
         assert!(out.contains("Bob\\|pipe"));
-        std::fs::remove_file(&p).ok();
+        enchudb::db_files::remove_db(&p).ok();
     }
 
     #[test]
@@ -412,7 +412,7 @@ mod tests {
         assert!(out.contains("name (Tag)"));
         assert!(out.contains("bio (Leaf)"));
         assert!(out.contains("author (Ref→user)"));
-        std::fs::remove_file(&p).ok();
+        enchudb::db_files::remove_db(&p).ok();
     }
 
     #[test]
@@ -425,7 +425,7 @@ mod tests {
 
         assert!(out.contains("## user"));
         assert!(!out.contains("## post"));
-        std::fs::remove_file(&p).ok();
+        enchudb::db_files::remove_db(&p).ok();
     }
 
     #[test]
@@ -441,7 +441,7 @@ mod tests {
         // 行データは出ない
         assert!(!out.contains("Alice"));
         assert!(!out.contains("Hello"));
-        std::fs::remove_file(&p).ok();
+        enchudb::db_files::remove_db(&p).ok();
     }
 
     #[test]
@@ -461,7 +461,7 @@ mod tests {
         assert!(out.contains("\"ref_to\":\"user\""));
         assert!(out.contains("\"is_pk\":true"));
         assert!(out.contains("\"Alice\""));
-        std::fs::remove_file(&p).ok();
+        enchudb::db_files::remove_db(&p).ok();
     }
 
     #[test]
@@ -474,7 +474,7 @@ mod tests {
 
         // JSON 内で \n エスケープされてる
         assert!(out.contains("\"line1\\nline2\""));
-        std::fs::remove_file(&p).ok();
+        enchudb::db_files::remove_db(&p).ok();
     }
 
     #[test]

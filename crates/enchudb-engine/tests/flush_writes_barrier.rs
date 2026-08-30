@@ -20,6 +20,7 @@ use std::sync::Arc;
 #[test]
 fn flush_writes_waits_for_all_ties_including_entity_created_path() {
     let path = "/tmp/test_flush_barrier.db";
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{path}.oplog"));
     let _ = std::fs::remove_file(format!("{path}.lock"));
@@ -83,6 +84,7 @@ fn flush_writes_waits_for_all_ties_including_entity_created_path() {
 #[test]
 fn oplog_sync_bridges_all_records_pushed_before_it() {
     let path = format!("/tmp/test_walq_barrier_{}.db", std::process::id());
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     for suffix in ["", ".oplog", ".tables", ".crc", ".lock"] {
         let _ = std::fs::remove_file(format!("{path}{suffix}"));
     }
@@ -125,6 +127,7 @@ fn oplog_sync_bridges_all_records_pushed_before_it() {
              (WAL queue barrier or transfer-before-reset broken)"
         );
     }
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     for suffix in ["", ".oplog", ".tables", ".crc", ".lock"] {
         let _ = std::fs::remove_file(format!("{path}{suffix}"));
     }

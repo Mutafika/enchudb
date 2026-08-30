@@ -175,7 +175,5 @@ fn main() {
 }
 
 fn cleanup(path: &str) {
-    for suf in ["", ".oplog", ".tables", ".crc", ".db.lock", ".eidmap", ".vocabmap"] {
-        let _ = std::fs::remove_file(format!("{path}{suf}"));
-    }
+    let _ = enchudb::db_files::remove_db(&path);
 }

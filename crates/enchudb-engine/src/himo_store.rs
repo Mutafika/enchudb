@@ -273,6 +273,10 @@ impl HimoStore {
     pub fn restore(&self, eid: u32, old_bytes: &[u8; 4]) {
         self.ensure_cylinder_built();
         let _w = self.write_lock.lock();
+        // v10: `set` と同じく、 書く cell まで segment の commit を伸ばす (#167: 伸ばせなければ書かない)。
+        if self.col().ensure_committed_for(eid).is_err() {
+            return;
+        }
         self.col().ensure_count(eid);
         let stored = u32::from_le_bytes(*old_bytes);
         let old = self.get_value(eid);

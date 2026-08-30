@@ -21,6 +21,7 @@ fn tmp(tag: &str) -> String {
 }
 
 fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     for suf in ["", ".tables", ".oplog", ".wal", ".crc", ".db.lock", ".eidmap", ".vocabmap", ".positions"] {
         let _ = std::fs::remove_file(format!("{path}{suf}"));
     }

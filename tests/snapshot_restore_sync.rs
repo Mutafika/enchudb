@@ -25,6 +25,7 @@ fn tmp(tag: &str) -> String {
             .unwrap()
             .as_nanos()
     );
+    let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
     for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", p, suffix));
     }
@@ -32,6 +33,7 @@ fn tmp(tag: &str) -> String {
 }
 
 fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
     for suffix in ["", ".oplog", ".crc"] {
         let _ = std::fs::remove_file(format!("{}{}", path, suffix));
     }
@@ -165,6 +167,7 @@ fn restored_replica_syncs_incremental_from_origin_after_snapshot() {
         eng.transfer_oplog_to_sync_ops();
 
         // snapshot(restored_path を上書き)
+        let _ = std::fs::remove_dir_all(&restored_path); // v10: DB は directory
         let _ = std::fs::remove_file(&restored_path);
         let _ = std::fs::remove_file(format!("{}.oplog", restored_path));
         eng.snapshot_export(&restored_path).unwrap();

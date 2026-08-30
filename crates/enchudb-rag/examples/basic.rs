@@ -5,7 +5,7 @@ use enchudb_rag::{Chunk, Embedder, Filter, HashEmbedder, Meta, Query, RagStore};
 fn main() {
     // 前回の残骸を掃除
     let path = "/tmp/enchudb-rag-basic";
-    let _ = std::fs::remove_file(format!("{}.db", path));
+    let _ = enchudb::db_files::remove_db(format!("{}.db", path));
     let _ = std::fs::remove_file(format!("{}.vec", path));
 
     let embedder = HashEmbedder::new(128);
