@@ -44,10 +44,11 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
     移行先の両方を封緘しておけば、 「ロールバック用に残した DB が実は壊れていた」 を後から
     検出できる。 全 region 走査なので秒オーダー、 常時オンにはしない前提の opt-in
 - **sidecar は directory の中** (`{db}/tables` / `oplog` / `eidmap` / `vocabmap` / `crc` /
-  `lock` / `schema`)。 `{db}.tables` のような隣置きは無い。 path 生成は
+  `lock` / `schema` / `segments`)。 `{db}.tables` のような隣置きは無い。 path 生成は
   `enchudb_engine::db_files` に集約 (schema / transport もこれを使う)
   - ⚠️ **呼び出し側が DB root 直下に独自の file を置いていないか確認すること。** 上の 7 つと
-    名前が当たると壊れる。 実例: sinfo は CLI 直列化用の flock を `<db_dir>/lock` に置いており、
+    名前が当たると壊れる (`lock` / `segments` は特に踏みやすい)。 実例: sinfo は CLI 直列化用の
+    flock を `<db_dir>/lock` に置いており、
     engine root を `<db_dir>` に素直化すると enchudb の `lock` と同じ file を掴んで即死する
     (`<db_dir>/enchu.db` のような入れ子を維持していれば衝突しない)
 - `Engine::table_eid_range(name)` は **hull** (先頭 lo 〜 最後の hi) を返す。 auto-grow した
@@ -65,6 +66,33 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
   `migrate_bytes_v5_to_v6` と `MigrationStats` は残置
 - Windows: segment は sparse file を reservation 長で作る (`FSCTL_SET_SPARSE`)。 apparent は
   reservation 分出る (physical は触った分)。 runtime 検証は未 (compile check のみ)
+
+### Added — 壊れた DB を黙って開かない (request22)
+
+- **`segments` sidecar (segment manifest)**: 「前回 flush 時点で各 segment が何 byte だったか」 を
+  記録し、 **open のたびに stat だけで検証**する。 v10 は 「まだ書いていない segment」 も 0 byte
+  なので、 これが無いと **切り詰められた segment と未使用の segment を区別できない** (`himo/0000.seg`
+  を 0 byte にしても open が通り、 その himo が静かに空になっていた)。 segment file は伸びるだけ
+  (`set_len` は grow と page 揃えにしか使わない) なので、 記録は下限として常に有効
+  - 検出の costs は stat 十数回。 `.crc` (`seal_integrity`) の全域走査とは別物で **常時オン**。
+    中身の書き換え (bit 反転) は依然 `.crc` の担当
+  - 書くのは flush の締めだけ、 かつ **長さが前回と変わっていなければ書かない** (sync 経路は
+    `body_msync` を毎回通る。 open 時に読んだ内容をキャッシュに載せるので、 何も書かずに
+    閉じた session は manifest を書き直さない)。 migrate / unpack は書いた実長から作り、
+    `snapshot_export` は複製元の manifest を写す
+  - **fsync しない**。 durability の記録ではなく 「前回 flush 時点の長さ」 のヒントで、
+    失われても検証を飛ばすだけ (segment は伸びるだけなので、 古い manifest も下限として有効)。
+    末尾に `end <行数>` を置き、 **書きかけ / 壊れた manifest は 「無い」 扱い**にする
+    (健全な DB を `Damaged` と誤判定する方が害が大きい)。 fsync していた初版は APFS の
+    fsync 1 回 ~8 ms が open / drop / snapshot の全部に乗って **open 2 倍・snapshot 8 倍**だった
+  - コスト (lifecycle bench、 A/B): 空 DB の open + drop **7.3〜8.1 → 7.7〜9.2 ms**、
+    `snapshot_export` **1.6〜2.7 → 2.5〜3.0 ms**、 順次 write は変化なし (31〜33 M tie/s)
+  - manifest が無い DB (手で組んだもの等) は検証を飛ばす
+- **`Engine::probe(path) -> DbState`** と **`Engine::exists(path) -> bool`**: open せずに path の
+  素性を言う。 `Missing` / `Ready` / `Incomplete` (create が途中で落ちた directory) /
+  `Damaged(理由)` / `SingleFileLegacy` (v8・v9 の 1 ファイル)。 v10 は DB が directory なので
+  consumer の `if path.exists() { open } else { create }` が半端な directory を既存 DB と誤認する
+  — その入口を sidecar 名に結合させずに塞ぐ (消費側 sinfo からの要望)
 
 ### Added — 小物
 
@@ -126,8 +154,9 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
   grow_entity_cap / free stack / table auto-grow / EXT1 永続 / 実 DB fixture)、
   `v10_cross_process_readonly` (別 process が readonly open、 後から足した himo も見える)、
   `segment_map` (予約 / commit / refresh / ENOSPC)、
-  `v10_segment_damage_matrix` (全 segment × 削除 / 0 byte / half truncate × seal 有無 = 57 ケースを
-  子 process で開く。 signal 死・panic が無いこと、 seal 済みは黙って壊れないこと)、
+  `v10_segment_damage_matrix` (全 segment × 削除 / 0 byte / half truncate × seal 有無 = 60 ケースを
+  子 process で開く。 **どのケースも 「黙って壊れる」 が無いこと** — 欠損 / 切り詰めは manifest が、
+  中身の書き換えは `.crc` が弾く)、 `v10_probe_db_state` (`probe` の 5 状態)、
   `v10_crash_consistency` (書き込み中の SIGKILL × 6 round で、 再 open と flush 済みデータの残存)、
   `v10_legacy_open_is_read_only` (v9 DB を open しても hash / mtime / 隣接 file が不変)、
   `v10_fd_budget` (`RLIMIT_NOFILE` を 64 / 128 / 512 に絞った子 process で himo 200 本の DB を
@@ -248,12 +277,6 @@ grow 自体 (fstat / ftruncate / mmap ≈ 15 µs × 十数回) と page fault �
 - wasm `from_bytes` 経路は未確認 (packed 形式は v9 互換のまま)
 - 別 process の readonly reader は `grow_entity_cap` を次の open で見る
 - Windows の placeholder API (base 不動の予約) は未着手、 sparse whole-map で代用
-- **segment を外から truncate しても検出できない。** 「まだ触っていない region」 も 0 byte なので、
-  file 長だけでは切り詰めと区別できない (`himo/0000.seg` を 0 にすると open は通り、 その himo が
-  静かに空になる。 削除なら `NotFound` の Err)。 検出には header に per-segment の committed 長を
-  持つ必要がある。 同じ根で **「初期化が完了した DB か」 を consumer が判定する手段が無い**
-  (半端な directory も `Path::exists()` は true) — `Engine::exists(path)` の要望が来ている。
-  破損時に signal 死しないことは `tests/v10_damage_probe.rs` で gate 済み。 設計は request22
 
 ## 0.25.1 — 2026-08-28
 

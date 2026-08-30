@@ -25,9 +25,12 @@ pub const CRC: &str = "crc";
 pub const LOCK: &str = "lock";
 /// `enchudb-schema` の schema 定義 (text)。
 pub const SCHEMA: &str = "schema";
+/// 各 segment の 「前回 flush 時点の file 長」 (`crate::segments::verify_manifest`)。
+/// 未使用 region も 0 byte な v10 で、 切り詰めを stat だけで検出するための記録。
+pub const SEGMENTS: &str = "segments";
 
 /// segment 以外に DB directory へ置かれ得る file 名の一覧 (migrate / copy 用)。
-pub const ALL: [&str; 7] = [OPLOG, TABLES, EIDMAP, VOCABMAP, CRC, LOCK, SCHEMA];
+pub const ALL: [&str; 8] = [OPLOG, TABLES, EIDMAP, VOCABMAP, CRC, LOCK, SCHEMA, SEGMENTS];
 
 /// HTTP bootstrap (`/bootstrap/{name}`) で本体と別に配る sidecar。 `.eidmap` 無しの
 /// restore は再 sync で重複 entity / tombstone 喪失、 `.vocabmap` 無しは受信済み `Vocab`

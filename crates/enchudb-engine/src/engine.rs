@@ -463,7 +463,7 @@ fn deserialize_tables(buf: &[u8]) -> Result<Vec<TableDef>, String> {
 /// umask 由来 (典型的には 0644) に戻る。 consumer が DB を締めている前提を壊さないよう、
 /// 置き換え前の mode を tmp に写してから rename する (無ければ umask のまま)。
 #[cfg(not(target_arch = "wasm32"))]
-fn atomic_write_sidecar(sidecar: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn atomic_write_sidecar(sidecar: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
     let tmp_path = crate::db_files::tmp_path_for(sidecar);
     {
@@ -1195,6 +1195,8 @@ impl Engine {
             }
             out.sync_all()?;
         }
+        // segment を直接書いたので manifest も実長から作る (以後の open が切り詰めを検出できる)。
+        crate::segments::write_manifest_from_dir(std::path::Path::new(dst))?;
         Ok(())
     }
 
@@ -1212,7 +1214,7 @@ impl Engine {
         }
         Self::unpack_to_dir(sp, dst_dir)?;
         for name in crate::db_files::ALL {
-            if name == crate::db_files::LOCK {
+            if name == crate::db_files::LOCK || name == crate::db_files::SEGMENTS {
                 continue;
             }
             let from = crate::db_files::legacy_path_for(src_file, name);
@@ -1220,6 +1222,8 @@ impl Engine {
                 crate::sparse_copy::copy_sparse(&from, &crate::db_files::path_for(dst_dir, name))?;
             }
         }
+        // v9 の隣には無いので、 書き終えた segment の実長から作る。
+        crate::segments::write_manifest_from_dir(std::path::Path::new(dst_dir))?;
         Ok(())
     }
 }
@@ -1324,6 +1328,21 @@ pub struct AuditFilter {
 /// v10 (request21): DB 本体は **directory + segment file 群** (`SegmentSet`)。
 /// wasm / packed 1 blob (`from_bytes`) は `Memory`。 どちらも `region(kind)` で
 /// store 用の `Region` を切る (Segments は segment 全体、 Memory は packed offset)。
+/// [`Engine::probe`] の結果。 open せずに path の素性を言う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DbState {
+    /// 何も無い (新規作成してよい)。
+    Missing,
+    /// v10 の DB directory で、 segment が揃っている。
+    Ready,
+    /// directory はあるが初期化が完了していない (create が途中で落ちた等)。
+    Incomplete,
+    /// segment が欠けている / 前回 flush より短い。 文字列は理由。
+    Damaged(String),
+    /// v8 / v9 の 1 ファイル DB。 `Engine::migrate_v9_to_v10` で移行する。
+    SingleFileLegacy,
+}
+
 enum Backing {
     #[cfg(not(target_arch = "wasm32"))]
     Segments(SegmentSet),
@@ -3517,6 +3536,37 @@ impl Engine {
             ));
         }
         Ok(())
+    }
+
+    /// open せずに `path` が EnchuDB として何であるかを判定する。
+    ///
+    /// v10 は DB が directory なので、 「create の途中で落ちた半端な directory」 も
+    /// `Path::exists()` は true を返す。 consumer が 「新規作成すべき」 と 「移行すべき」 と
+    /// 「壊れている」 を取り違えないための入口。 mmap も lock も取らない (stat だけ)。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn probe(path: impl AsRef<std::path::Path>) -> DbState {
+        let p = path.as_ref();
+        if p.is_file() {
+            return DbState::SingleFileLegacy;
+        }
+        if !p.is_dir() {
+            return DbState::Missing;
+        }
+        // header.seg が無い = create が完了していない。
+        if !p.join(crate::segments::SegmentKind::Header.rel_path()).is_file() {
+            return DbState::Incomplete;
+        }
+        // manifest が無い DB (手で組んだ / 古い v10 build) は 「壊れている」 とは言えない。
+        match crate::segments::verify_manifest(p) {
+            Ok(_) => DbState::Ready,
+            Err(e) => DbState::Damaged(e.to_string()),
+        }
+    }
+
+    /// `probe(path) == Ready` の糖衣。 「開ける DB がそこにあるか」 だけ聞きたい時に。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn exists(path: impl AsRef<std::path::Path>) -> bool {
+        matches!(Self::probe(path), DbState::Ready)
     }
 
     fn read_header_layout(path: &str) -> io::Result<(Layout, u32)> {
@@ -11817,7 +11867,11 @@ impl Engine {
         // v10: segment ごとに dirty range (Column::set 等が mark_dirty した範囲) だけ msync。
         // `mark_dirty` を通さない EntitySet / header は全域 (小さい固定 segment)。
         match &self.backing {
-            Backing::Segments(set) => set.flush_dirty_all(),
+            Backing::Segments(set) => {
+                set.flush_dirty_all()?;
+                // 「この時点の segment 長」 を記録する。 次の open で切り詰めを検出できる。
+                set.write_manifest()
+            }
             Backing::Memory(_) => Ok(()),
         }
     }
@@ -11980,6 +12034,17 @@ impl Engine {
         let vocabmap_entries = self.peer_vocab_map_entries();
         if !vocabmap_entries.is_empty() {
             std::fs::write(vocabmap_path_for(target), serialize_vocabmap(&vocabmap_entries))?;
+        }
+        // manifest が無いと snapshot だけ 「切り詰め検出の効かない DB」 になる。 複製は
+        // source と同じ長さなので source の manifest をそのまま写せる (記録は下限として
+        // 使うので、 複製中に source が伸びていても有害にならない)。 source に無い場合だけ
+        // 複製先を walk して作る。
+        {
+            let from = crate::db_files::path_for(&self.path, crate::db_files::SEGMENTS);
+            let to = crate::db_files::path_for(target, crate::db_files::SEGMENTS);
+            if std::fs::copy(&from, &to).is_err() {
+                crate::segments::write_manifest_from_dir(std::path::Path::new(target))?;
+            }
         }
 
         Ok(files)
@@ -12540,6 +12605,9 @@ impl Engine {
         self.vocab.mark_index_clean(true);
         self.himo_reg.mark_index_clean(true);
         self.backing.flush_to_disk()?;
+        if let Backing::Segments(set) = &self.backing {
+            set.write_manifest()?;
+        }
         Ok(())
     }
 

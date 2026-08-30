@@ -32,7 +32,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::region::Region;
 use crate::segment_map::SegmentMap;
@@ -121,6 +121,10 @@ pub struct SegmentSet {
     himo: RwLock<Vec<Arc<SegmentMap>>>,
     ver: RwLock<Vec<Arc<SegmentMap>>>,
     tomb: RwLock<Option<Arc<SegmentMap>>>,
+    /// 直前に書いた manifest の中身。 segment 長は grow でしか動かないので、 同じなら
+    /// 書き直さない (`body_msync` は sync 経路から毎回呼ばれる)。 Mutex は 「同時に
+    /// 2 本が manifest を書く」 のを止める役も兼ねる。
+    last_manifest: Mutex<Option<Vec<(String, u64)>>>,
 }
 
 impl SegmentSet {
@@ -180,6 +184,7 @@ impl SegmentSet {
             himo: RwLock::new(Vec::new()),
             ver: RwLock::new(Vec::new()),
             tomb: RwLock::new(tomb),
+            last_manifest: Mutex::new(None),
         })
     }
 
@@ -193,6 +198,7 @@ impl SegmentSet {
         cell_version: bool,
         readonly: bool,
     ) -> io::Result<Self> {
+        let known = verify_manifest(dir)?;
         let open_one = |kind: SegmentKind| -> io::Result<Arc<SegmentMap>> {
             let p = Self::path_of(dir, kind);
             SegmentMap::open(&p, sizes.segment_reserve(kind), readonly)
@@ -230,6 +236,7 @@ impl SegmentSet {
             himo: RwLock::new(himo),
             ver: RwLock::new(ver),
             tomb: RwLock::new(tomb),
+            last_manifest: Mutex::new(known),
         })
     }
 
@@ -409,4 +416,180 @@ impl SegmentSet {
             .map(|(k, s)| (k, s.file_len().unwrap_or(0), s.reserved()))
             .collect()
     }
+
+    /// 現在の segment 長を manifest sidecar (`segments`) に焼く。
+    ///
+    /// flush の最後に呼ぶ。 「この時点で各 segment はこの長さだった」 という記録で、
+    /// 次の open が **短くなっていないか** を stat だけで確かめられる。 segment file は
+    /// 伸びるだけ (`set_len` は grow と page 揃えにしか使わない) なので、 記録は下限として
+    /// 常に有効。
+    pub fn write_manifest(&self) -> io::Result<()> {
+        let mut lens: Vec<(String, u64)> = Vec::new();
+        for (k, sgm) in self.all() {
+            let rel = k.rel_path().to_string_lossy().to_string();
+            let len = sgm.file_len().map_err(|e| {
+                io::Error::new(e.kind(), format!("segments manifest: stat {rel}: {e}"))
+            })?;
+            lens.push((rel, len));
+        }
+        lens.sort();
+        // 書く必要があるか (= 前回から伸びたか) を lock 内で判定する。 sync 経路は
+        // `body_msync` を毎回通るが、 segment が伸びるのは稀。
+        let mut last = self.last_manifest.lock().unwrap();
+        if last.as_deref() == Some(lens.as_slice()) {
+            return Ok(());
+        }
+        write_manifest_entries(&self.dir, &lens).map_err(|e| {
+            io::Error::new(e.kind(), format!("segments manifest: {}: {e}", self.dir.display()))
+        })?;
+        *last = Some(lens);
+        Ok(())
+    }
+}
+
+/// manifest の 1 行目。 将来 format を変えたら上げる。
+const MANIFEST_V1: &str = "enchudb-segments v1";
+/// 末尾標識 (`end <行数>`)。 途中で切れた manifest を 「無い」 扱いにするため。
+const MANIFEST_END: &str = "end";
+
+fn manifest_path(dir: &Path) -> PathBuf {
+    dir.join(crate::db_files::SEGMENTS)
+}
+
+fn write_manifest_entries(dir: &Path, lens: &[(String, u64)]) -> io::Result<()> {
+    let mut out = String::from(MANIFEST_V1);
+    out.push('\n');
+    let mut sorted: Vec<&(String, u64)> = lens.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    for (rel, len) in &sorted {
+        out.push_str(rel);
+        out.push(' ');
+        out.push_str(&len.to_string());
+        out.push('\n');
+    }
+    // 末尾標識。 これが無い manifest は 「書きかけ」 とみなして検証を飛ばす
+    // (fsync しないので、 crash で中途半端な内容が残る可能性がある)。
+    out.push_str(&format!("{MANIFEST_END} {}\n", sorted.len()));
+    // tmp は書き手ごとに固有名 (別 process の writer が同じ dir を触っても奪い合わない)。
+    let path = manifest_path(dir);
+    let tmp = dir.join(format!(
+        "{}.{}.{:?}.tmp",
+        crate::db_files::SEGMENTS,
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let r = (|| -> io::Result<()> {
+        use std::io::Write;
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(out.as_bytes())?;
+            // **fsync しない**。 manifest は durability の記録ではなく 「前回 flush 時点の
+            // 長さ」 のヒントで、 失われても検証を飛ばすだけ (segment は伸びるだけなので、
+            // 古い manifest も下限として有効)。 APFS の fsync は 1 回 ~8 ms あり、 flush /
+            // drop / snapshot の全部に乗ると 2 倍以上遅くなる。 journaling FS では
+            // rename が durable なら先行する ftruncate も durable なので、 順序も保たれる。
+        }
+        if let Ok(md) = std::fs::metadata(&path) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &tmp,
+                    std::fs::Permissions::from_mode(md.permissions().mode() & 0o777),
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = md;
+        }
+        std::fs::rename(&tmp, &path)
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
+}
+
+/// directory を歩いて manifest を作り直す (migrate / unpack のように SegmentSet を
+/// 経由せずに segment を書いた後で使う)。
+pub fn write_manifest_from_dir(dir: &Path) -> io::Result<()> {
+    let mut lens = Vec::new();
+    collect_segments(dir, "", &mut lens)?;
+    write_manifest_entries(dir, &lens)
+}
+
+fn collect_segments(dir: &Path, prefix: &str, out: &mut Vec<(String, u64)>) -> io::Result<()> {
+    for e in std::fs::read_dir(dir)? {
+        let e = e?;
+        let name = e.file_name().to_string_lossy().to_string();
+        let rel = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+        let md = e.metadata()?;
+        if md.is_dir() {
+            collect_segments(&e.path(), &rel, out)?;
+        } else if name.ends_with(".seg") {
+            out.push((rel, md.len()));
+        }
+    }
+    Ok(())
+}
+
+/// manifest があれば、 記録より短い / 消えた segment が無いか確かめる。
+///
+/// v10 は 「まだ書いていない segment」 も 0 byte なので、 **file 長だけでは切り詰めと
+/// 区別が付かない**。 manifest はその区別を付けるためだけにある (`stat` を十数回するだけで、
+/// `.crc` (`seal_integrity`) のような全域走査は要らない)。 manifest が無い DB
+/// (v10 以前に作られたもの / 手で組んだもの) は検証を飛ばす。
+fn parse_manifest(text: &str) -> Option<Vec<(String, u64)>> {
+    let mut lines = text.lines();
+    if lines.next() != Some(MANIFEST_V1) {
+        return None;
+    }
+    let mut out = Vec::new();
+    for line in lines {
+        if let Some(rest) = line.strip_prefix(MANIFEST_END) {
+            // `end <行数>` が一致して初めて完全な manifest とみなす。
+            return match rest.trim().parse::<usize>() {
+                Ok(n) if n == out.len() => Some(out),
+                _ => None,
+            };
+        }
+        let (rel, len) = line.rsplit_once(' ')?;
+        out.push((rel.to_string(), len.parse().ok()?));
+    }
+    None // end 行が無い = 書きかけ
+}
+
+pub fn verify_manifest(dir: &Path) -> io::Result<Option<Vec<(String, u64)>>> {
+    let text = match std::fs::read_to_string(manifest_path(dir)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    // 壊れている / 途中で切れているなら 「無い」 と同じ扱い (検証を飛ばす)。 誤検知で
+    // 健全な DB を開けなくする方が害が大きい。
+    let Some(entries) = parse_manifest(&text) else { return Ok(None) };
+    for (rel, want) in &entries {
+        let want = *want;
+        let path = dir.join(rel);
+        match std::fs::metadata(&path) {
+            Ok(md) if md.len() >= want => {}
+            Ok(md) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "segment {rel} is truncated: {} bytes, was {want} at last flush \
+                         (partial copy or interrupted transfer?)",
+                        md.len()
+                    ),
+                ));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("segment {rel} is missing (was {want} bytes at last flush)"),
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Some(entries))
 }

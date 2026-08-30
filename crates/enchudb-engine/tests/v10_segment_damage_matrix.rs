@@ -12,9 +12,10 @@
 //!
 //! gate している不変条件:
 //! 1. **どの壊し方でも signal 死 / panic しない**
-//! 2. **`seal_integrity()` した DB は、 CRC が覆う region の破損を必ず `CleanErr` にする**
-//!    (= 封緘したバックアップは黙って壊れない)
-//! 3. seal していない DB で `SilentlyWrong` になる組合せの一覧を出す (既知の限界の可視化)
+//! 2. **どの壊し方でも `SilentlyWrong` にならない** (seal の有無を問わず)。 segment manifest
+//!    (`segments` sidecar) が 「前回 flush 時点の長さ」 を持っているので、 欠損と切り詰めは
+//!    open 時の stat だけで弾ける。 中身の書き換え (bit 反転) は `seal_integrity()` を焼いた
+//!    DB なら region CRC が弾く
 
 use enchudb_engine::{Engine, ValueType};
 use std::path::{Path, PathBuf};
@@ -230,10 +231,11 @@ fn damage_never_crashes_and_sealed_dbs_always_report() {
 
     // seal 済みの不変条件は 「CleanErr であること」 ではなく **「黙って壊れないこと」**。
     // 壊した箇所が commit 済み領域の未使用部だった場合は Correct が正しい答えなので。
-    let mut sealed_missed = vec![];
-    for (f, d, r) in &sealed {
+    // seal の有無を問わず 「黙って壊れる」 が無いこと。
+    let mut silent_any = vec![];
+    for (f, d, r) in plain.iter().chain(sealed.iter()) {
         if r.starts_with("SilentlyWrong") {
-            sealed_missed.push(format!("{f} {d:?}: {r}"));
+            silent_any.push(format!("{f} {d:?}: {r}"));
         }
     }
 
@@ -258,8 +260,8 @@ fn damage_never_crashes_and_sealed_dbs_always_report() {
 
     assert!(bad.is_empty(), "signal 死 / panic したケース:\n{}", bad.join("\n"));
     assert!(
-        sealed_missed.is_empty(),
-        "seal 済みなのに黙って壊れたケース (CRC 検証の穴):\n{}",
-        sealed_missed.join("\n")
+        silent_any.is_empty(),
+        "黙って壊れたケース (manifest / CRC 検証の穴):\n{}",
+        silent_any.join("\n")
     );
 }
