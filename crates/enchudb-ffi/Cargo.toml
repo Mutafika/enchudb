@@ -1,6 +1,6 @@
 [package]
 name = "enchudb-ffi"
-version = "0.25.1"
+version = "0.26.0"
 edition = "2024"
 rust-version = "1.89"   # std::fs::File::lock (#133 Windows 対応)
 description = "EnchuDB C ABI — 全言語から叩けるよう SQLite 風の C 関数を露出する凍結 layer。cdylib / staticlib ビルド対応。"

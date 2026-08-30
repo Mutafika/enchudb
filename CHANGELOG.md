@@ -3,7 +3,7 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
-## 0.26.0 — (unreleased、 branch `feat/v10-segments`)
+## 0.26.0 — 2026-08-30
 
 **on-disk format v10: DB は 1 ファイルから directory + region ごとの segment file 群に
 (breaking、 request21 / #173 の根治)。** 単一 file の固定 layout では 「見かけ 26 GB / sync で
