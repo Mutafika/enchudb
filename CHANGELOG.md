@@ -97,6 +97,9 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
     manifest との長さ照合。 `create` は最後に manifest を書くので 「manifest が無い =
     create が完了していない」 と言い切れ、 **segment 欠損が `Damaged` (後から消された) か
     `Incomplete` (create 途中) か**を区別できる
+  - **`Ready` は 「開いてよい」 であって 「健全性が保証された」 ではない。** 見るのは header・
+    segment の実在・manifest との長さ照合だけで、 **中身は読まない**。 bit 反転 / 部分上書きの
+    検出は `seal_integrity()` で焼く `.crc` の役目 (層が違う)
   - **`Incomplete` と `Damaged` は運用上の意味が違う**: 前者は 「まだ DB になっていない」
     (commit されたデータは無い → 作り直してよい)、 後者は 「**あったデータが欠けている**」
     (→ **消さない**。 backup からの復旧に回す)。 混同すると 「壊れた DB を作りかけと誤認して

@@ -1344,8 +1344,16 @@ pub enum DbState {
     Missing,
     /// v10 の DB directory で、 header が指す segment が揃っている。
     ///
-    /// `segments` manifest が無い DB もここに入る (開けるし中身もあるが、 切り詰めの
-    /// 検出だけが効かない)。
+    /// **`Ready` は 「開いてよい」 であって 「健全性が保証された」 ではない。** 見ているのは
+    /// header が読めること・segment が実在すること・`segments` manifest があればその長さ
+    /// 以上であること、 の 3 つだけで、 **中身は 1 byte も読んでいない**。 したがって:
+    ///
+    /// - `segments` manifest が無い DB も `Ready` になる (この場合は切り詰めの検出も効かない)
+    /// - segment の中身が書き換わっている (bit 反転 / 部分上書き) 場合は検出できない。
+    ///   それを見るのは `seal_integrity()` で焼く `.crc` の役目 (open 時に全 region を照合)
+    ///
+    /// backup を封緘したい / 転送後に中身まで確かめたいなら `probe` ではなく
+    /// `seal_integrity()` + `open` を使うこと。
     Ready,
     /// directory はあるが **DB になりきっていない** — `header.seg` が無い、 または
     /// header が指す segment が欠けていて manifest も無い (= create が途中で落ちた)。
