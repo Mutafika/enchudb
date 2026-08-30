@@ -178,14 +178,18 @@ impl SegmentSet {
         } else {
             None
         };
-        Ok(Self {
+        let set = Self {
             dir: dir.to_path_buf(),
             fixed,
             himo: RwLock::new(Vec::new()),
             ver: RwLock::new(Vec::new()),
             tomb: RwLock::new(tomb),
             last_manifest: Mutex::new(None),
-        })
+        };
+        // create の最後に manifest を書く。 これで 「manifest が無い = create が完了して
+        // いない」 と言い切れる (`Engine::probe` が Incomplete を返す根拠)。
+        set.write_manifest()?;
+        Ok(set)
     }
 
     /// 既存 DB directory を開く。 `himo_count` / `cell_version` / `with_leaf` は header
@@ -445,6 +449,43 @@ impl SegmentSet {
         *last = Some(lens);
         Ok(())
     }
+}
+
+/// header が指す segment file が全部あるか (mmap せずに存在だけ確認する)。
+///
+/// 「create が途中で落ちた directory」 と 「segment を消された DB」 を open 前に見分けるため。
+/// [`SegmentSet::open`] と同じ集合を、 同じ引数から数える。
+pub fn missing_segments(
+    dir: &Path,
+    sizes: &dyn SegmentSizes,
+    himo_count: u32,
+    with_leaf: bool,
+    cell_version: bool,
+) -> Vec<String> {
+    let mut want = vec![SegmentKind::Header];
+    for kind in SegmentKind::FIXED {
+        if kind == SegmentKind::LeafData && !with_leaf {
+            continue;
+        }
+        if sizes.segment_size(kind) == 0 {
+            continue;
+        }
+        want.push(kind);
+    }
+    for hid in 0..himo_count {
+        want.push(SegmentKind::Himo(hid));
+        if cell_version {
+            want.push(SegmentKind::Ver(hid));
+        }
+    }
+    if cell_version {
+        want.push(SegmentKind::Tomb);
+    }
+    want
+        .into_iter()
+        .filter(|k| !dir.join(k.rel_path()).is_file())
+        .map(|k| k.rel_path().to_string_lossy().to_string())
+        .collect()
 }
 
 /// manifest の 1 行目。 将来 format を変えたら上げる。

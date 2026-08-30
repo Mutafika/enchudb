@@ -74,6 +74,36 @@ fn probe_tells_missing_ready_incomplete_damaged_and_legacy_apart() {
     assert_eq!(Engine::probe(&torn), DbState::Ready, "行数不一致の manifest で Damaged にした");
     let _ = std::fs::remove_dir_all(&torn);
 
+    // header が指す segment が消えている: manifest があるなら 「後から消された」 = Damaged
+    let gone = base("segment_gone");
+    make_db(&gone);
+    std::fs::remove_file(Path::new(&gone).join("himo/0000.seg")).unwrap();
+    match Engine::probe(&gone) {
+        DbState::Damaged(why) => assert!(why.contains("missing segment"), "理由が不親切: {why}"),
+        other => panic!("Damaged を期待したが {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&gone);
+
+    // manifest ごと無い = create が完了していない (create の最後に manifest を書くので)
+    let half = base("half_created");
+    make_db(&half);
+    std::fs::remove_file(Path::new(&half).join("segments")).unwrap();
+    assert_eq!(Engine::probe(&half), DbState::Incomplete, "manifest 無しを Ready と言った");
+    let _ = std::fs::remove_dir_all(&half);
+
+    // writer が lock を握っている最中でも probe でき、 file を 1 つも増やさない
+    // (sinfo の local peer が readonly で覗く経路と競合しないこと)
+    let held = base("lock_held");
+    let mut eng = Engine::create_with_capacity(&held, 1024).unwrap();
+    eng.define_table("t", 100).unwrap();
+    eng.flush().unwrap();
+    let before: Vec<_> = std::fs::read_dir(&held).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(Engine::probe(&held), DbState::Ready, "writer が lock 中に probe できない");
+    let after: Vec<_> = std::fs::read_dir(&held).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(before.len(), after.len(), "probe が file を作った");
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&held);
+
     // SingleFileLegacy: v9 互換の 1 ファイル
     let src = base("legacy_src");
     make_db(&src);

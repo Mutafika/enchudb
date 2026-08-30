@@ -3552,11 +3552,36 @@ impl Engine {
         if !p.is_dir() {
             return DbState::Missing;
         }
-        // header.seg が無い = create が完了していない。
+        // header.seg が無い = create が header を書く前に落ちた。
         if !p.join(crate::segments::SegmentKind::Header.rel_path()).is_file() {
             return DbState::Incomplete;
         }
-        // manifest が無い DB (手で組んだ / 古い v10 build) は 「壊れている」 とは言えない。
+        // header が読めなければ、 directory の形はしているが DB ではない。
+        let (layout, himo_count) = match Self::read_header_layout(path.as_ref().to_str().unwrap_or("")) {
+            Ok(v) => v,
+            Err(e) => return DbState::Damaged(format!("header: {e}")),
+        };
+        // header が指す segment が揃っているか (mmap しない)。 manifest があるのに
+        // segment が欠けている = 後から消された (Damaged)、 manifest ごと無い = create の
+        // 途中 (Incomplete)。
+        let missing = crate::segments::missing_segments(
+            p,
+            &layout,
+            himo_count,
+            layout.leaf_data_size > 0,
+            layout.has_cell_version(),
+        );
+        let has_manifest = p.join(crate::db_files::SEGMENTS).is_file();
+        if !missing.is_empty() {
+            let why = format!("missing segment(s): {}", missing.join(", "));
+            return if has_manifest { DbState::Damaged(why) } else { DbState::Incomplete };
+        }
+        if !has_manifest {
+            // 完成しているが manifest が無い = flush を 1 度も通っていない (create 直後に
+            // 落ちた) か、 manifest を持たない古い build が作った DB。 開けはするので
+            // Ready とは言わず、 呼び出し側に判断を渡す。
+            return DbState::Incomplete;
+        }
         match crate::segments::verify_manifest(p) {
             Ok(_) => DbState::Ready,
             Err(e) => DbState::Damaged(e.to_string()),

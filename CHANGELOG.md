@@ -93,6 +93,12 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
   `Damaged(理由)` / `SingleFileLegacy` (v8・v9 の 1 ファイル)。 v10 は DB が directory なので
   consumer の `if path.exists() { open } else { create }` が半端な directory を既存 DB と誤認する
   — その入口を sidecar 名に結合させずに塞ぐ (消費側 sinfo からの要望)
+  - 見るのは 3 段: header が読めるか → **header が指す segment が全部あるか** (mmap しない) →
+    manifest との長さ照合。 `create` は最後に manifest を書くので 「manifest が無い =
+    create が完了していない」 と言い切れ、 **segment 欠損が `Damaged` (後から消された) か
+    `Incomplete` (create 途中) か**を区別できる
+  - **lock を取らず file も作らない** (stat と header の read だけ)。 writer が lock を握った
+    ままでも probe できる (readonly reader と同じ扱い) — `tests/v10_probe_db_state.rs` で gate
 
 ### Added — 小物
 
