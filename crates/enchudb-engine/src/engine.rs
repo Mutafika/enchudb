@@ -1329,15 +1329,31 @@ pub struct AuditFilter {
 /// wasm / packed 1 blob (`from_bytes`) は `Memory`。 どちらも `region(kind)` で
 /// store 用の `Region` を切る (Segments は segment 全体、 Memory は packed offset)。
 /// [`Engine::probe`] の結果。 open せずに path の素性を言う。
+///
+/// **`Incomplete` と `Damaged` は運用上の意味が違う**。 前者は 「まだ DB になっていない」、
+/// 後者は 「DB だったものが壊れている」。 混同すると 「壊れた DB を作りかけと誤認して
+/// 消す」 が起きるので型で分けてある:
+///
+/// | | 中身 | 普通の対応 |
+/// |---|---|---|
+/// | `Incomplete` | commit されたデータは無い | 作り直してよい |
+/// | `Damaged` | **あったデータが欠けている** | **消さない**。 backup からの復旧に回す |
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbState {
     /// 何も無い (新規作成してよい)。
     Missing,
-    /// v10 の DB directory で、 segment が揃っている。
+    /// v10 の DB directory で、 header が指す segment が揃っている。
+    ///
+    /// `segments` manifest が無い DB もここに入る (開けるし中身もあるが、 切り詰めの
+    /// 検出だけが効かない)。
     Ready,
-    /// directory はあるが初期化が完了していない (create が途中で落ちた等)。
+    /// directory はあるが **DB になりきっていない** — `header.seg` が無い、 または
+    /// header が指す segment が欠けていて manifest も無い (= create が途中で落ちた)。
+    /// commit されたデータは無いので作り直してよい。
     Incomplete,
-    /// segment が欠けている / 前回 flush より短い。 文字列は理由。
+    /// **完成していた DB が壊れている** — segment が欠けている / 前回 flush より短い /
+    /// header が読めない。 文字列は理由。 **消してはいけない** (欠けているのは中身であって、
+    /// 消すと復旧の手がかりごと失う)。
     Damaged(String),
     /// v8 / v9 の 1 ファイル DB。 `Engine::migrate_v9_to_v10` で移行する。
     SingleFileLegacy,
@@ -3577,10 +3593,11 @@ impl Engine {
             return if has_manifest { DbState::Damaged(why) } else { DbState::Incomplete };
         }
         if !has_manifest {
-            // 完成しているが manifest が無い = flush を 1 度も通っていない (create 直後に
-            // 落ちた) か、 manifest を持たない古い build が作った DB。 開けはするので
-            // Ready とは言わず、 呼び出し側に判断を渡す。
-            return DbState::Incomplete;
+            // segment は揃っていて manifest だけ無い = 開けるし中身もある (manifest を
+            // 消された / 持たない古い build が作った)。 **ここで Incomplete と言うと
+            // 「消して作り直してよい」 と読まれてデータを消しかねない**ので Ready。
+            // manifest が無い分、 切り詰めの検出だけが効かない。
+            return DbState::Ready;
         }
         match crate::segments::verify_manifest(p) {
             Ok(_) => DbState::Ready,

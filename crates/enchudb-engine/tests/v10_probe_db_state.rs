@@ -84,11 +84,20 @@ fn probe_tells_missing_ready_incomplete_damaged_and_legacy_apart() {
     }
     let _ = std::fs::remove_dir_all(&gone);
 
-    // manifest ごと無い = create が完了していない (create の最後に manifest を書くので)
+    // segment は揃っていて manifest だけ無い = 開けるし中身もある。 ここで Incomplete と
+    // 言うと 「消して作り直してよい」 と読まれてデータを消しかねないので Ready。
+    let no_manifest = base("no_manifest");
+    make_db(&no_manifest);
+    std::fs::remove_file(Path::new(&no_manifest).join("segments")).unwrap();
+    assert_eq!(Engine::probe(&no_manifest), DbState::Ready, "中身のある DB を Incomplete と言った");
+    let _ = std::fs::remove_dir_all(&no_manifest);
+
+    // segment が欠けていて manifest も無い = create の途中 (作り直してよい)
     let half = base("half_created");
     make_db(&half);
     std::fs::remove_file(Path::new(&half).join("segments")).unwrap();
-    assert_eq!(Engine::probe(&half), DbState::Incomplete, "manifest 無しを Ready と言った");
+    std::fs::remove_file(Path::new(&half).join("himo/0000.seg")).unwrap();
+    assert_eq!(Engine::probe(&half), DbState::Incomplete, "create 途中を Incomplete と言わない");
     let _ = std::fs::remove_dir_all(&half);
 
     // writer が lock を握っている最中でも probe でき、 file を 1 つも増やさない

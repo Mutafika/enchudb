@@ -97,6 +97,11 @@ EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階に�
     manifest との長さ照合。 `create` は最後に manifest を書くので 「manifest が無い =
     create が完了していない」 と言い切れ、 **segment 欠損が `Damaged` (後から消された) か
     `Incomplete` (create 途中) か**を区別できる
+  - **`Incomplete` と `Damaged` は運用上の意味が違う**: 前者は 「まだ DB になっていない」
+    (commit されたデータは無い → 作り直してよい)、 後者は 「**あったデータが欠けている**」
+    (→ **消さない**。 backup からの復旧に回す)。 混同すると 「壊れた DB を作りかけと誤認して
+    消す」 が起きるので型で分けてある。 その方針上、 **segment は揃っていて manifest だけ
+    無い DB は `Ready`** (開けるし中身もある。 切り詰めの検出だけが効かない)
   - **lock を取らず file も作らない** (stat と header の read だけ)。 writer が lock を握った
     ままでも probe できる (readonly reader と同じ扱い) — `tests/v10_probe_db_state.rs` で gate
 
