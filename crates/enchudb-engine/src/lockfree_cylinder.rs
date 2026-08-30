@@ -27,6 +27,10 @@ use std::sync::{Arc, Mutex};
 
 pub const DENSE_CAP: u32 = 1 << 20;
 
+/// `new(max_values)` が事前確保する bucket 数の上限 (request23 案 F)。
+/// これを超える分は `insert` の成長経路 (doubling) が必要になった時だけ確保する。
+const PREALLOC_CAP: usize = 64;
+
 type DenseArr = Vec<Arc<AppendBucket>>;
 
 static DENSE_GROWS: AtomicUsize = AtomicUsize::new(0);
@@ -64,10 +68,21 @@ unsafe impl Send for LockFreeCylinder {}
 
 impl LockFreeCylinder {
     pub fn new(max_values: u32) -> Self {
+        // 事前確保は `PREALLOC_CAP` 個までで打ち切る (request23 案 F)。
+        //
+        // 昔は `min(max_values+1, DENSE_CAP)` = 宣言した分を全部確保していたが、 これは
+        // **himo ごと・open のたび**に効くので、 大きく宣言した DB の open が
+        // `max_values` に比例して伸びていた (himo 117 / max_values 20,000 で open 103.7 ms)。
+        // dense は `insert` に成長経路 (doubling) を持っているので、 事前確保は純粋な
+        // 最適化であって無くても動く。 打ち切っても:
+        // - open は `max_values` 非依存になる (同条件で 103.7 → 5.5 ms)
+        // - write は変わらない (200k tie の実測で差なし、 実 consumer の sunsu2 でも同一)
+        // 低 cardinality 列 (`cardinality()` の想定用途) は `PREALLOC_CAP` 以内に収まるので、
+        // hint としての意味は残る。
         let hint = if max_values == 0 {
             0
         } else {
-            ((max_values as usize + 1).min(DENSE_CAP as usize)) as u32
+            ((max_values as usize + 1).min(PREALLOC_CAP)) as u32
         };
         let init: DenseArr = (0..hint).map(|_| Arc::new(AppendBucket::new())).collect();
         Self {
