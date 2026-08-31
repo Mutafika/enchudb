@@ -20,7 +20,24 @@ v10 は 1 region = 1 file なので、 DB を開くコストが **file 数に比
 | open 1 db (himo 16 / 30 file) | 0.975 ms | **0.517 ms** |
 | open 1 db (himo 48 / 62 file) | 2.124 ms | **0.873 ms** |
 | open 1 db (himo 200 / 214 file) | 7.556 ms | **1.436 ms** |
+| open 1 db (himo 96 / 110 file = `sf` の形) | 3.434 ms | **0.916 ms** |
 | 20 db を 1 process で逐次 open (himo 200) | 207.2 ms | **28.6 ms** |
+
+**消費側 (kenning、 250 rust file を index した実 DB、 48 himo) の実測**:
+
+| | v9 (0.25.1) | 0.26.0 | 0.26.1 |
+|---|---:|---:|---:|
+| `open_readonly` (median of 21) | 218 µs | 1853 µs | **567 µs** |
+| `across` 20 db 逐次 | 66.5 ms | 115.0 ms | **88.6 ms** |
+| `across` 20 db 並列 | 21.8 ms | 41.7 ms | **27.9 ms** |
+| `index` (35/48 himo に書く) | 426 ms | 434 ms | **426 ms** |
+| query 6 種 | — | +1.5〜1.8 ms | **+0.4〜0.9 ms** (`text` / `edges` は v9 同等) |
+
+v9 との残差 **~349 µs は現行 format の下限** — manifest 検証の stat (155 µs) と固定 segment
+14 本の open。 segment open の内訳は **`open(2)` が 77% / fstat 2% / anon mmap 9% /
+file mmap 12%** なので、 mmap を 1 回に畳んでも上限 9%、 `openat` 化は -6.5% しかない
+(どちらも計測して不採用)。 **「開かずに済ませる」 以外に手が無い**というのが D2 を
+採った理由で、 ここから先は file 数そのものを減らす format 変更 (0.27 の設計判断)。
 
 ### Performance — 触らない himo の segment は open しない (request23 D2)
 
