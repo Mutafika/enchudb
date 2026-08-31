@@ -3,6 +3,69 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.26.1 — 2026-09-01
+
+**v10 の open 代 (file 数に比例する定数) を畳んだ patch** (`[[request23]]`)。 on-disk format は
+**不変**、 migration 不要、 breaking なし、 公開 API の変更なし。 **0.26.0 を採用した
+consumer は上げること** — 特に **1 コマンド 1 process** の CLI (kenning / `sf`) と
+**1 process で複数 DB を開く**経路 (kenning の `across`、 hub の scope 群) に効く。
+
+v10 は 1 region = 1 file なので、 DB を開くコストが **file 数に比例する定数** (~25 µs/file) に
+なった。 中身とは無関係で空の DB でも同じだけ払う。 request21 の設計時に既知としていた
+コストだが、 **償却先の無い consumer がそれを毎回・db 数だけ払う**という効き方を
+過小評価していた (kenning 実測で open が v9 比 8.7x)。
+
+| entity 200 / max_values 1000 (macOS M2 Max) | 0.26.0 | 0.26.1 |
+|---|---:|---:|
+| open 1 db (himo 16 / 30 file) | 0.975 ms | **0.517 ms** |
+| open 1 db (himo 48 / 62 file) | 2.124 ms | **0.873 ms** |
+| open 1 db (himo 200 / 214 file) | 7.556 ms | **1.436 ms** |
+| 20 db を 1 process で逐次 open (himo 200) | 207.2 ms | **28.6 ms** |
+
+### Performance — 触らない himo の segment は open しない (request23 D2)
+
+kenning の実測では **1 コマンドが触る himo は 48 本中 2〜13 本** (全走査するコマンドはゼロ)。
+それでも 0.26.0 は open 時に全 himo の column を組んでいた。 **column を最初に触ったときに
+組み立てる**ようにして、 触らない himo は `open(2)` すら払わないようにした。
+
+- `SegmentSet` の himo / ver を遅延 slot に。 open は **mmap せず存在確認だけ**
+- `HimoStore.col` を `OnceLock` + 遅延 source に (`Backing::Segments` は `Arc<SegmentSet>` へ)
+- **安全性は 0.26.0 と同じ**: 欠けた segment / 前回 flush より短い segment は今までどおり
+  **open で落ちる**。 manifest は触らなかった himo も載せ続けるので、 次回 open の検証材料も
+  失わない。 gate は `tests/v10_lazy_himo_open.rs`
+- **効かない条件が 2 つある**: `.crc` を焼いた DB (`seal_integrity`) は open 時に全 region を
+  照合するので全部開く (封緘の契約どおり)。 sync 有効 DB の `ver` 列は
+  `cell_versions_are_empty` が全列を読むので eager のまま
+
+### Performance — cylinder の事前確保を 64 bucket で打ち切る
+
+`define_himo` の `max_values` は 「初期 bucket サイズのヒント」 だが、 `LockFreeCylinder::new`
+が **その数だけ bucket を事前確保**していたので、 open が `max_values` に比例していた。
+64 で打ち切る (超えた分は従来どおり insert 時に倍化) ようにした。
+
+| himo 117 の DB を open | 0.26.0 | 0.26.1 |
+|---|---:|---:|
+| `max_values` 20,000 で宣言 | 103.7 ms | **5.9 ms** |
+
+**ただしこの数字はベンチ側で `max_values` を大きく設定して作ったもので、 現行 consumer
+(kenning / `sf` / sunsu2) は全員 `max_values = 0` なので体感は変わらない。**
+「cardinality を宣言する利用者が出た時の保険」 として入れている。 成長経路自体は
+`lockfree_cylinder::tests::dense_grows_while_readers_read` で gate (CI の miri 対象)。
+
+### ⚠️ `[patch]` は version が変わると黙って無視される
+
+`[patch.crates-io]` / path override で enchudb を差し替えている構成は、 **enchudb 側の
+version が 0.26.0 → 0.26.1 に動いた時点で patch が効かなくなる** (cargo は
+「patch の version が要求と合わない」 と判断して黙って元の依存に戻す)。 build は通り、
+テストも通り、 **古い enchudb のまま動く**ので気づけない。 version を上げた側で必ず:
+
+```
+cargo update -p enchudb        # または Cargo.lock を消して解決し直す
+```
+
+`Cargo.toml` の `enchudb = { path = "..." }` (patch ではなく直接 path) を使っている構成
+(sunsu2 など) は影響を受けない。
+
 ## 0.26.0 — 2026-08-30
 
 **on-disk format v10: DB は 1 ファイルから directory + region ごとの segment file 群に
