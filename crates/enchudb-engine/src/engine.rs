@@ -16,6 +16,8 @@ use std::io;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::segments::{SegmentKind, SegmentSet, SegmentSizes};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Arc;
 
 // std::time::Instant panics on wasm32-unknown-unknown ("time not implemented").
 // load_from_backing's [open_profile] timer is on the wasm read path, so alias
@@ -1368,8 +1370,9 @@ pub enum DbState {
 }
 
 enum Backing {
+    /// request23 D2: `HimoStore` が自分の himo segment を遅延取得できるよう `Arc`。
     #[cfg(not(target_arch = "wasm32"))]
-    Segments(SegmentSet),
+    Segments(Arc<SegmentSet>),
     Memory(Vec<u8>),
 }
 
@@ -1384,6 +1387,19 @@ impl Backing {
                     layout.segment_size(kind),
                 )
             },
+        }
+    }
+
+    /// himo 1 本分の `HimoStore` を作る。 v10 (`Segments`) では column の mmap を
+    /// 最初の read/write まで遅らせる (request23 D2) — そのコマンドが触らない himo は
+    /// `open(2)` すら払わない。 `Memory` backing は既に全域が blob 上にあるので即解決。
+    fn himo_store(&self, hid: u32, layout: &Layout, ht: ValueType, max_values: u32) -> HimoStore {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Backing::Segments(set) => {
+                HimoStore::load_lazy(set.clone(), SegmentKind::Himo(hid), ht, max_values)
+            }
+            _ => HimoStore::load(self.region(SegmentKind::Himo(hid), layout), ht, max_values),
         }
     }
 
@@ -2990,7 +3006,7 @@ impl Engine {
             layout.leaf_data_size > 0,
             layout.has_cell_version(),
         )?;
-        let backing = Backing::Segments(set);
+        let backing = Backing::Segments(Arc::new(set));
         {
             let mmap = backing.header_mut(layout.header_size);
         mmap[H_MAGIC..H_MAGIC + 4].copy_from_slice(&FILE_MAGIC);
@@ -3335,7 +3351,7 @@ impl Engine {
             layout.has_cell_version(),
             false,
         )?;
-        let mut eng = Self::load_from_backing(Backing::Segments(set), readonly)
+        let mut eng = Self::load_from_backing(Backing::Segments(Arc::new(set)), readonly)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         eng.path = path.to_string();
         eng._writer_lock = writer_lock;
@@ -3987,10 +4003,7 @@ impl Engine {
             let name = String::from_utf8_lossy(name_bytes).to_string();
             let effective_mv = mv.min(cyl_max_values);
 
-            let hs = HimoStore::load(
-                backing.region(SegmentKind::Himo(hid as u32), &layout),
-                ht, effective_mv,
-            );
+            let hs = backing.himo_store(hid as u32, &layout, ht, effective_mv);
             if has_cell_version {
                 let _ = ver_cols.push(ver_column_from_region(
                     backing.region(SegmentKind::Ver(hid as u32), &layout),

@@ -32,6 +32,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::region::Region;
@@ -115,11 +116,28 @@ pub trait SegmentSizes {
 /// `ensure_committed` が書きに応じて伸ばす。
 const INITIAL_COMMIT: usize = 4096;
 
+/// himo / ver segment の遅延 slot (request23 D2)。
+///
+/// `map: None` = まだ mmap していない。 存在と長さは `open` が stat で確かめ済みで、
+/// mmap を後回しにしているだけ — 「欠けた DB を黙って開く」 ことにはならない。
+/// 未 mmap の segment は誰も書けないので、 `len` (open 時の file 長) は manifest を
+/// 書き直すときそのまま使える (stat し直す必要がない)。
+struct Slot {
+    map: Option<Arc<SegmentMap>>,
+    reserve: usize,
+    len: u64,
+}
+
 pub struct SegmentSet {
     dir: PathBuf,
     fixed: HashMap<SegmentKind, Arc<SegmentMap>>,
-    himo: RwLock<Vec<Arc<SegmentMap>>>,
-    ver: RwLock<Vec<Arc<SegmentMap>>>,
+    himo: RwLock<Vec<Slot>>,
+    ver: RwLock<Vec<Slot>>,
+    /// 遅延 mmap 時に使う open mode。 `open(readonly=true)` で開いた set は
+    /// あとから mmap する segment も readonly。
+    readonly: bool,
+    /// `set_space_margin` の現在値。 遅延 open した segment にも同じ余裕を効かせる。
+    space_margin: AtomicU64,
     tomb: RwLock<Option<Arc<SegmentMap>>>,
     /// 直前に書いた manifest の中身。 segment 長は grow でしか動かないので、 同じなら
     /// 書き直さない (`body_msync` は sync 経路から毎回呼ばれる)。 Mutex は 「同時に
@@ -183,6 +201,8 @@ impl SegmentSet {
             fixed,
             himo: RwLock::new(Vec::new()),
             ver: RwLock::new(Vec::new()),
+            readonly: false,
+            space_margin: AtomicU64::new(0),
             tomb: RwLock::new(tomb),
             last_manifest: Mutex::new(None),
         };
@@ -225,12 +245,39 @@ impl SegmentSet {
             }
             fixed.insert(kind, open_one(kind)?);
         }
+        // request23 D2: himo / ver は **mmap せず stat だけ** して slot に積む。
+        // 存在確認は open のまま (欠けていれば今までどおりここで落ちる) で、 実際に
+        // 触る himo だけ `segment()` が mmap する。 48 himo の DB で open ~1.2ms 減。
+        // manifest が既に stat 済みの segment は、 その長さをそのまま使う
+        // (`verify_manifest` が 「無い」 「短い」 を弾いた後なので二度見る必要がない)。
+        // manifest に載っていない segment だけここで stat する。
+        let known_len: HashMap<&str, u64> = known
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|(rel, len)| (rel.as_str(), *len))
+            .collect();
+        let stat_one = |kind: SegmentKind| -> io::Result<Slot> {
+            let reserve = sizes.segment_reserve(kind);
+            let rel = kind.rel_path();
+            if let Some(len) = known_len.get(rel.to_string_lossy().as_ref()) {
+                return Ok(Slot { map: None, reserve, len: *len });
+            }
+            let p = Self::path_of(dir, kind);
+            let len = std::fs::metadata(&p).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("segment {} ({}): {}", kind.name(), p.display(), e),
+                )
+            })?.len();
+            Ok(Slot { map: None, reserve, len })
+        };
         let mut himo = Vec::with_capacity(himo_count as usize);
         let mut ver = Vec::new();
         for hid in 0..himo_count {
-            himo.push(open_one(SegmentKind::Himo(hid))?);
+            himo.push(stat_one(SegmentKind::Himo(hid))?);
             if cell_version {
-                ver.push(open_one(SegmentKind::Ver(hid))?);
+                ver.push(stat_one(SegmentKind::Ver(hid))?);
             }
         }
         let tomb = if cell_version { Some(open_one(SegmentKind::Tomb)?) } else { None };
@@ -239,6 +286,8 @@ impl SegmentSet {
             fixed,
             himo: RwLock::new(himo),
             ver: RwLock::new(ver),
+            readonly,
+            space_margin: AtomicU64::new(0),
             tomb: RwLock::new(tomb),
             last_manifest: Mutex::new(known),
         })
@@ -266,11 +315,46 @@ impl SegmentSet {
 
     pub fn segment(&self, kind: SegmentKind) -> Option<Arc<SegmentMap>> {
         match kind {
-            SegmentKind::Himo(h) => self.himo.read().unwrap().get(h as usize).cloned(),
-            SegmentKind::Ver(h) => self.ver.read().unwrap().get(h as usize).cloned(),
+            SegmentKind::Himo(h) => self.lazy_slot(&self.himo, kind, h),
+            SegmentKind::Ver(h) => self.lazy_slot(&self.ver, kind, h),
             SegmentKind::Tomb => self.tomb.read().unwrap().clone(),
             other => self.fixed.get(&other).cloned(),
         }
+    }
+
+    /// slot がまだ mmap されていなければここで開く (初回だけ)。
+    ///
+    /// **開けなかったら panic する。** `region()` が infallible なので (column を触る
+    /// 149 箇所が `Result` を持たない)、 ここで握ると 「0 が返る壊れた DB」 になる。
+    /// open 時に存在と長さは確かめているので、 ここに来るのは 「その後に消された」 か
+    /// fd 枯渇 (= `SegmentMap::open` の retry でも足りない) のどちらか。
+    fn lazy_slot(&self, lock: &RwLock<Vec<Slot>>, kind: SegmentKind, h: u32) -> Option<Arc<SegmentMap>> {
+        let i = h as usize;
+        {
+            let v = lock.read().unwrap();
+            let slot = v.get(i)?;
+            if let Some(m) = &slot.map {
+                return Some(m.clone());
+            }
+        }
+        let mut v = lock.write().unwrap();
+        let slot = v.get_mut(i)?;
+        // double-check (read lock を落とした隙に別 thread が開いた可能性)
+        if let Some(m) = &slot.map {
+            return Some(m.clone());
+        }
+        let p = Self::path_of(&self.dir, kind);
+        let m = Arc::new(
+            SegmentMap::open(&p, slot.reserve, self.readonly).unwrap_or_else(|e| {
+                panic!("segment {} ({}) could not be opened on first use: {e}", kind.name(), p.display())
+            }),
+        );
+        let margin = self.space_margin.load(Ordering::Relaxed);
+        if margin > 0 {
+            m.set_space_margin(margin);
+        }
+        slot.map = Some(m.clone());
+        Some(m)
     }
 
     pub fn has(&self, kind: SegmentKind) -> bool {
@@ -310,7 +394,7 @@ impl SegmentSet {
                 format!("himo segment {hid} requested but only {} exist (ids must be sequential)", v.len()),
             ));
         }
-        v.push(self.create_or_open(SegmentKind::Himo(hid), size)?);
+        v.push(Slot { map: Some(self.create_or_open(SegmentKind::Himo(hid), size)?), reserve: size, len: 0 });
         Ok(())
     }
 
@@ -325,7 +409,7 @@ impl SegmentSet {
                 format!("ver segment {hid} requested but only {} exist (ids must be sequential)", v.len()),
             ));
         }
-        v.push(self.create_or_open(SegmentKind::Ver(hid), size)?);
+        v.push(Slot { map: Some(self.create_or_open(SegmentKind::Ver(hid), size)?), reserve: size, len: 0 });
         Ok(())
     }
 
@@ -346,15 +430,21 @@ impl SegmentSet {
         unsafe { std::slice::from_raw_parts_mut(seg.base(), len.min(seg.committed())) }
     }
 
-    /// 開いている全 segment を (kind, map) で列挙する。 CRC / stats / flush 用。
+    /// **今 mmap されている** 全 segment を (kind, map) で列挙する。 flush / refresh /
+    /// stats 用。 未 mmap の himo / ver は誰も書いていないので、 flush 対象でも
+    /// refresh 対象でもない (manifest だけは全 slot を見る → `write_manifest`)。
     pub fn all(&self) -> Vec<(SegmentKind, Arc<SegmentMap>)> {
         let mut out: Vec<(SegmentKind, Arc<SegmentMap>)> =
             self.fixed.iter().map(|(k, s)| (*k, s.clone())).collect();
         for (i, s) in self.himo.read().unwrap().iter().enumerate() {
-            out.push((SegmentKind::Himo(i as u32), s.clone()));
+            if let Some(m) = &s.map {
+                out.push((SegmentKind::Himo(i as u32), m.clone()));
+            }
         }
         for (i, s) in self.ver.read().unwrap().iter().enumerate() {
-            out.push((SegmentKind::Ver(i as u32), s.clone()));
+            if let Some(m) = &s.map {
+                out.push((SegmentKind::Ver(i as u32), m.clone()));
+            }
         }
         if let Some(t) = self.tomb.read().unwrap().as_ref() {
             out.push((SegmentKind::Tomb, t.clone()));
@@ -408,6 +498,7 @@ impl SegmentSet {
     }
 
     pub fn set_space_margin(&self, bytes: u64) {
+        self.space_margin.store(bytes, Ordering::Relaxed);
         for (_, s) in self.all() {
             s.set_space_margin(bytes);
         }
@@ -429,12 +520,29 @@ impl SegmentSet {
     /// 常に有効。
     pub fn write_manifest(&self) -> io::Result<()> {
         let mut lens: Vec<(String, u64)> = Vec::new();
-        for (k, sgm) in self.all() {
+        let mut push = |k: SegmentKind, sgm: Option<&Arc<SegmentMap>>, known: u64| -> io::Result<()> {
             let rel = k.rel_path().to_string_lossy().to_string();
-            let len = sgm.file_len().map_err(|e| {
-                io::Error::new(e.kind(), format!("segments manifest: stat {rel}: {e}"))
-            })?;
+            // 未 mmap の segment は誰も書けない = open 時の長さのまま (syscall 不要)
+            let len = match sgm {
+                Some(s) => s.file_len().map_err(|e| {
+                    io::Error::new(e.kind(), format!("segments manifest: stat {rel}: {e}"))
+                })?,
+                None => known,
+            };
             lens.push((rel, len));
+            Ok(())
+        };
+        for (k, s) in self.fixed.iter() {
+            push(*k, Some(s), 0)?;
+        }
+        for (i, s) in self.himo.read().unwrap().iter().enumerate() {
+            push(SegmentKind::Himo(i as u32), s.map.as_ref(), s.len)?;
+        }
+        for (i, s) in self.ver.read().unwrap().iter().enumerate() {
+            push(SegmentKind::Ver(i as u32), s.map.as_ref(), s.len)?;
+        }
+        if let Some(t) = self.tomb.read().unwrap().as_ref() {
+            push(SegmentKind::Tomb, Some(t), 0)?;
         }
         lens.sort();
         // 書く必要があるか (= 前回から伸びたか) を lock 内で判定する。 sync 経路は
