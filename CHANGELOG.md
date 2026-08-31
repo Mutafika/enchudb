@@ -83,6 +83,14 @@ cargo update -p enchudb        # または Cargo.lock を消して解決し直�
 `Cargo.toml` の `enchudb = { path = "..." }` (patch ではなく直接 path) を使っている構成
 (sunsu2 など) は影響を受けない。
 
+### 検証
+
+- workspace **173 suite / 1119 passed / 0 failed** (macOS M2 Max、 逐次単独実行)
+- gate は `tests/v10_lazy_himo_open.rs` の 3 本。 **反証済み** — 遅延を戻す / 存在確認を
+  外す / manifest を `all()` 由来に戻す、 のそれぞれで落ちることを確認している
+- 消費側 2 つで実測: **kenning** (実 DB) は open 1853 → 567 µs で **query に退化なし**、
+  **`sf`** は 「効かない条件」 2 つ (`.crc` / sync tables) のどちらにも該当せず全効果が出る側
+
 ## 0.26.0 — 2026-08-30
 
 **on-disk format v10: DB は 1 ファイルから directory + region ごとの segment file 群に
