@@ -3,6 +3,76 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.26.2 — 2026-09-01
+
+**docs only**。 コードの振る舞いは 0.26.1 から**一切変わっていない** (変更は CHANGELOG /
+rustdoc / bench example のみ)。 **既に 0.26.1 を使っている consumer が急いで上げる理由は無い** —
+次に版を動かすときで足りる。 この tag を切るのは、 **これから v10 を採用する consumer が pin
+した版の doc を読んで事故らないようにする**ため。
+
+0.26.0 / 0.26.1 を実際に採用した consumer (kenning / `sf`) から上がった落とし穴を、
+移行注意と rustdoc に反映した。 **どれも 1119 本 green のこちら側からは出せず、 消費側の
+指摘か、 その検証から出ている。**
+
+### Docs — `is_dir()` で db を取り違える (0.26.0 の移行注意に追記)
+
+v9 まで db は 1 ファイルだったので `Path::is_dir()` で 「directory = db ではない」 と振り分け
+られた。 **v10 の db は directory** なので db 自身がそちら側に落ちる。 実例: kenning の
+`update [repo] [db]` がこれを踏み、 **指定した db は更新されないまま、 db directory を索引した
+別 index が `~/.cache` に生えた** (build は通り exit 0、 stderr も無音)。 判別には
+[`Engine::probe`] を使うこと。 正しい式と、 `probe(p) != DbState::Missing` が**全 directory を
+db 判定にしてしまう**理由も併記した。
+
+### Docs — `DbState::Incomplete` の rustdoc がデータ損失を誘導していた
+
+`Incomplete` の doc は 「create が途中で落ちた」 だけを説明し 「**commit されたデータは無いので
+作り直してよい**」 と書いていた。 しかし `header.seg` を持たない directory は**すべて**
+`Incomplete` に来るので、 **db と無関係な普通の directory** (ユーザーの source repo など) も
+同じ variant になる。 素直に読んだ consumer が `remove_db()` を呼ぶと**実 directory を消しうる**。
+
+- 「作り直してよい」 → 「**db として作成してよい。 既存 directory を消してよいという意味では
+  ない**」 に修正
+- 判別の定石 `matches!(probe(p), Ready | Damaged(_) | SingleFileLegacy)` を `probe` の doc に明記
+- **振る舞いは変えていない。** 消費側が `probe(repo_root) == Incomplete` を前提にテストを固定
+  しており、 `DbState` は `#[non_exhaustive]` ではないので variant 追加は breaking。 型で分ける
+  なら 0.27
+
+### Docs — 0.26.1 の遅延 open が実際に何を変えたか (コスト model / fd)
+
+0.26.1 の節に追記:
+
+- **~20 µs/himo、 触った時に払う。** D2 は file 数ぶんのコストを消したのではなく 「全 himo ぶんを
+  open で」 から 「触った himo ぶんを初回タッチで」 に移した。 **行数には比例しない**
+  (`col()` は `OnceLock`)。 **全列を触ると eager より数 % 悪い**
+- **fd も触った本数ぶん保持する** (v9 は 0 本)。 **`open_readonly` でも保持する** — engine は
+  readonly でも segment を RW map で開くため。 上限は process 全体で `min(soft/2, 8192)`、
+  **超えても `EMFILE` にはならない** (劣化するのは書き込み側)
+- **移行直後の初回コマンドは page-in を払う** (実測 57 ms、 2 発目以降 5〜6 ms)
+
+### Added — `examples/open_split_bench.rs`
+
+`open_cost_bench` は 「開く → 小さな query 1 本 → 閉じる」 を 1 つの数字で出すので、 上記の
+コスト移動が見えなかった。 触る himo 数と行数の 2 軸で振る bench を足した。 **列名はループ外で
+事前生成する** — 中で `format!` すると String 割り当てが読みの数字に乗り、 1 列あたり十数 ns の
+計測が 3 倍に化ける (実際に一度誤った数字を consumer に渡した)。
+
+### 検証
+
+- workspace green、 CI 4 job (test stable / miri / loom / clippy) 全 pass
+- engine の変更は **doc comment のみ**。 `cargo clippy -p enchudb-engine --lib --tests` で
+  変更行域を指す警告ゼロ、 doc lint ゼロ
+
+### 既知の残ギャップ
+
+- **fd 保持を `readonly` から切り離せていない。** `SegmentMap` の `readonly` は
+  **prot (`PROT_READ`) / 伸長 API / fd 保持**の 3 つを兼務していて、 engine は
+  `SegmentSet::open(.., false)` をハードコードしている (readonly engine も RW map で開き、
+  「書かない」 は engine 側の契約)。 `readonly` を通すと mapping が `PROT_READ` になり、
+  seqlock の gen 等で SIGSEGV する。 直すなら `retain_fd` を別引数に切り出す必要があり、
+  **振る舞いの変更**なので docs-only の本 release には入れていない
+- **1 process で多数の DB を開く形 (hub) の RSS/open が未測定。** 遅延 himo で下がっている
+  見込みだが未確認
+
 ## 0.26.1 — 2026-09-01
 
 **v10 の open 代 (file 数に比例する定数) を畳んだ patch** (`[[request23]]`)。 on-disk format は
