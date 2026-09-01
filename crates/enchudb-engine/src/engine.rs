@@ -1338,8 +1338,23 @@ pub struct AuditFilter {
 ///
 /// | | 中身 | 普通の対応 |
 /// |---|---|---|
-/// | `Incomplete` | commit されたデータは無い | 作り直してよい |
+/// | `Incomplete` | commit されたデータは無い | **db として作成してよい** (下記、 既存 directory は消さない) |
 /// | `Damaged` | **あったデータが欠けている** | **消さない**。 backup からの復旧に回す |
+///
+/// **`Incomplete` は 「これは DB ではない」 であって 「壊れかけの DB」 ではない。**
+/// `header.seg` を持たない directory は**すべて**ここに来るので、 **db と何の関係も無い
+/// 普通の directory** (ユーザーの source repo など) も `Incomplete` を返す。 したがって:
+///
+/// - **`remove_db()` してよい、 とは限らない。** 「作り直してよい」 のは *そこに db を作る*
+///   ことであって、 既存の directory を消してよいという意味ではない
+/// - 「この path は db か」 を判別するなら **`Incomplete` を db 側に入れてはいけない**:
+///
+/// ```ignore
+/// // ○ 正しい
+/// matches!(Engine::probe(p), DbState::Ready | DbState::Damaged(_) | DbState::SingleFileLegacy)
+/// // × 全 directory が db 判定になる (Missing は 「path が存在しない」 だけの意味)
+/// Engine::probe(p) != DbState::Missing
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbState {
     /// 何も無い (新規作成してよい)。
@@ -1359,7 +1374,12 @@ pub enum DbState {
     Ready,
     /// directory はあるが **DB になりきっていない** — `header.seg` が無い、 または
     /// header が指す segment が欠けていて manifest も無い (= create が途中で落ちた)。
-    /// commit されたデータは無いので作り直してよい。
+    ///
+    /// **`header.seg` を持たない directory はすべてここに来る。** create が途中で落ちた
+    /// 残骸だけでなく、 **db と無関係な普通の directory** も同じ `Incomplete` になる
+    /// (この 2 つを `probe` は区別できない)。 commit されたデータが無いことは保証されるので
+    /// **そこに db を作ってよい**が、 **既存の directory を消してよいという意味ではない**。
+    /// 「db か否か」 の判別で db 側に入れると、 普通の directory を db と誤認する。
     Incomplete,
     /// **完成していた DB が壊れている** — segment が欠けている / 前回 flush より短い /
     /// header が読めない。 文字列は理由。 **消してはいけない** (欠けているのは中身であって、
@@ -3583,6 +3603,16 @@ impl Engine {
     /// v10 は DB が directory なので、 「create の途中で落ちた半端な directory」 も
     /// `Path::exists()` は true を返す。 consumer が 「新規作成すべき」 と 「移行すべき」 と
     /// 「壊れている」 を取り違えないための入口。 mmap も lock も取らない (stat だけ)。
+    ///
+    /// **`Path::is_dir()` で 「directory なら db ではない」 と振り分けている呼び出し側は
+    /// v10 で壊れる** (db 自身が directory になったため)。 判別はこれを使うこと:
+    ///
+    /// ```ignore
+    /// matches!(Engine::probe(p), DbState::Ready | DbState::Damaged(_) | DbState::SingleFileLegacy)
+    /// ```
+    ///
+    /// [`DbState::Incomplete`] を db 側に入れてはいけない — db と無関係な普通の directory も
+    /// そこに来る。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn probe(path: impl AsRef<std::path::Path>) -> DbState {
         let p = path.as_ref();
