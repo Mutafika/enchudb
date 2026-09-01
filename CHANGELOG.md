@@ -111,10 +111,17 @@ cargo update -p enchudb        # または Cargo.lock を消して解決し直�
 **固定 11 本 + 触った himo 1 本につき 1 本** — 12 列を触る形なら 1 DB あたり 23 本。 **1 process で
 多数の DB を開いたままにする consumer (hub の scope pool 等) は積む**ので:
 
+- ⚠️ **`open_readonly` でも保持する。** engine は readonly でも segment を **RW map** で開く
+  (「書かない」 は engine 側の契約) ので、 `SegmentMap` の reader 用 fd-close path は engine の
+  open からは通らない。 **readonly の DB を pool に貯める consumer も予算を消費する**
 - 保持数は **process 全体で `min(soft limit / 2, 8192)` が上限** (`raise_fd_limit()` で soft を
-  hard まで上げた後の値)。 **上限に達しても `EMFILE` にはならない** — 以後の segment は fd を
-  持たず都度 open になる (grow が遅くなるだけ。 **読みは mmap 済みなので fd は要らない**)。
-  実測: 予算 512 で 60 DB を開いても retained は 512 で頭打ち、 read は正常
+  hard まで上げた後の値)。 **上限に達しても `EMFILE` にはならない** — 予算を使い切った後の
+  segment は fd を持たずに動く (mapping は fd 無しで有効なので**読みは無影響**、 grow だけ
+  都度 open のぶん遅くなる)。 実測: 予算 512 で 60 DB を開いても retained は 512 で頭打ち、
+  read は正常
+  - したがって **多数の DB を開き続ける consumer で劣化として出るのは書き込み側**。 docker 既定
+    (soft 1024 → 予算 512) なら 23 fd/db で **~22 DB 分**が予算内。 それ以上開くなら
+    `LimitNOFILE` を上げる (予算は 8192 で頭打ち)
 - 現在の保持数は `enchudb_engine::segment_map::retained_fds()` で見られる。 予算を明示したい
   なら `set_fd_budget(n)`
 - gate は `tests/v10_fd_budget.rs` (子 process の `RLIMIT_NOFILE` を絞って himo 200 本を通す)
