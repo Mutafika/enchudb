@@ -114,8 +114,11 @@ fn missing_or_short_himo_segment_still_fails_open() {
     let path = tmp("short");
     build(&path);
     let victim = format!("{path}/himo/0031.seg");
+    // segment の最小長は page size (macOS aarch64 = 16 KiB、 Linux = 4 KiB) なので
+    // 絶対値で見ない。 manifest には前回 flush 時の file 長が載っているので、
+    // 半分にすれば page size に関係なく 「記録より短い」 になる。
     let len = std::fs::metadata(&victim).unwrap().len();
-    assert!(len > 4096);
+    assert!(len > 0, "segment が空 = test が空振り");
     std::fs::OpenOptions::new().write(true).open(&victim).unwrap().set_len(len / 2).unwrap();
     let err = match Engine::open_readonly(&path) { Ok(_) => panic!("open が成功してしまった"), Err(e) => e };
     assert!(
