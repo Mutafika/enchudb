@@ -11,12 +11,27 @@
 //! （lazy / conditional verify）。
 
 use parking_lot::Mutex;
-use std::cell::UnsafeCell;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::column::Column;
 use crate::lockfree_cylinder::LockFreeCylinder;
 use crate::region::Region;
+
+/// column region の取得元 (request23 D2)。
+///
+/// v10 の DB では himo 1 本 = file 1 本なので、 open 時に全 himo の column を作ると
+/// 「そのコマンドが触らない himo」 の分まで `open(2)` + `mmap` を払う。 kenning の
+/// 実測では 1 コマンドが触る himo は 48 本中 2〜13 本だった。 そこで column を
+/// **最初に触ったときに** 組み立てる。
+///
+/// segment の存在と長さは `SegmentSet::open` が stat で確かめているので、 遅らせても
+/// 「欠けた DB を黙って開く」 ことにはならない。
+#[cfg(not(target_arch = "wasm32"))]
+struct LazyCol {
+    set: std::sync::Arc<crate::segments::SegmentSet>,
+    kind: crate::segments::SegmentKind,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ValueType {
@@ -61,7 +76,11 @@ impl ValueType {
 const COMPACT_MIN_LEN: usize = 64;
 
 pub struct HimoStore {
-    col: UnsafeCell<Column>,
+    /// `load_lazy` で作った store では最初の `col()` まで空 (request23 D2)。
+    /// `init` / `load` は構築時に埋まる。
+    col: OnceLock<Column>,
+    #[cfg(not(target_arch = "wasm32"))]
+    lazy: Option<LazyCol>,
     cyl: LockFreeCylinder,
     pub value_type: ValueType,
     /// 初期 bucket サイズのヒント。0 は「ヒントなし、必要時に拡張」。値の上限ではない。
@@ -75,6 +94,34 @@ pub struct HimoStore {
     write_lock: Mutex<()>,
 }
 
+/// `col.get(eid)` の 4 byte を stored 形式の u32 で。
+///
+/// `col()` が (遅延解決のため) atomic load になったので、 **要素ごとに `self.col()` を
+/// 呼ぶとループ外に巻き上げられない**。 hot loop は `let col = self.col();` を 1 回だけ
+/// 取って、 この free 関数に渡すこと (request23 D2 の計測で sunsu2 phase2_chaos が
+/// 82.6s → 91.7s になった原因がこれだった)。
+#[inline(always)]
+fn stored_at(col: &Column, eid: u32) -> u32 {
+    u32::from_le_bytes(col.get(eid).try_into().unwrap())
+}
+
+/// `get_value` の col 受け取り版。
+#[inline(always)]
+fn value_at(col: &Column, eid: u32) -> Option<u32> {
+    if eid >= col.count() {
+        return None;
+    }
+    // #106: Acquire load。 writer の `store_u32_release` と対。
+    let stored = col.load_u32_acquire(eid);
+    if stored == 0 { None } else { Some(stored - 1) }
+}
+
+fn ready(col: Column) -> OnceLock<Column> {
+    let cell = OnceLock::new();
+    let _ = cell.set(col);
+    cell
+}
+
 // SAFETY: writer は write_lock で直列、 reader は lock-free（Cylinder は epoch +
 // Mutex(sparse)）。 Column の read は無同期（既知、 別 issue）。
 unsafe impl Sync for HimoStore {}
@@ -84,7 +131,9 @@ impl HimoStore {
     pub fn init(col_region: Region, ht: ValueType, max_values: u32, max_entities: u32) -> Self {
         let col = Column::init(col_region, 4, max_entities);
         Self {
-            col: UnsafeCell::new(col),
+            col: ready(col),
+            #[cfg(not(target_arch = "wasm32"))]
+            lazy: None,
             cyl: LockFreeCylinder::new(max_values),
             value_type: ht,
             max_values,
@@ -99,7 +148,9 @@ impl HimoStore {
     pub fn load(col_region: Region, ht: ValueType, max_values: u32) -> Self {
         let col = Column::load(col_region);
         Self {
-            col: UnsafeCell::new(col),
+            col: ready(col),
+            #[cfg(not(target_arch = "wasm32"))]
+            lazy: None,
             cyl: LockFreeCylinder::new(max_values),
             value_type: ht,
             max_values,
@@ -108,8 +159,49 @@ impl HimoStore {
         }
     }
 
+    /// `load` の遅延版 (request23 D2) — column region の mmap を最初の read/write
+    /// まで遅らせる。 触られなければ segment file は open すらされない。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_lazy(
+        set: std::sync::Arc<crate::segments::SegmentSet>,
+        kind: crate::segments::SegmentKind,
+        ht: ValueType,
+        max_values: u32,
+    ) -> Self {
+        Self {
+            col: OnceLock::new(),
+            lazy: Some(LazyCol { set, kind }),
+            cyl: LockFreeCylinder::new(max_values),
+            value_type: ht,
+            max_values,
+            cyl_built: AtomicBool::new(false),
+            write_lock: Mutex::new(()),
+        }
+    }
+
+    /// column への参照。 遅延 store では初回だけ segment を mmap する。
+    #[inline]
     fn col(&self) -> &Column {
-        unsafe { &*self.col.get() }
+        match self.col.get() {
+            Some(c) => c,
+            #[cfg(not(target_arch = "wasm32"))]
+            None => self.col_slow(),
+            #[cfg(target_arch = "wasm32")]
+            None => unreachable!("HimoStore column is not initialized"),
+        }
+    }
+
+    /// 遅延 column の初回組み立て。 競合しても `OnceLock` が 1 本に絞る
+    /// (負けた側の `Column::load` は header を読むだけで副作用が無い)。
+    #[cold]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn col_slow(&self) -> &Column {
+        let lazy = self
+            .lazy
+            .as_ref()
+            .expect("HimoStore column is neither loaded nor lazy");
+        self.col
+            .get_or_init(|| Column::load(lazy.set.region(lazy.kind)))
     }
 
     /// cylinder が未 build なら column から rebuild。lazy build の入口。
@@ -130,7 +222,7 @@ impl HimoStore {
         let col = self.col();
         let count = col.count();
         for eid in 0..count {
-            let stored = u32::from_le_bytes(col.get(eid).try_into().unwrap());
+            let stored = stored_at(col, eid);
             if stored != 0 {
                 self.cyl.insert(eid, stored - 1);
             }
@@ -146,11 +238,12 @@ impl HimoStore {
     pub fn set(&self, eid: u32, value: u32) -> bool {
         self.ensure_cylinder_built();
         let _w = self.write_lock.lock();
-        if self.col().ensure_committed_for(eid).is_err() {
+        let col = self.col();
+        if col.ensure_committed_for(eid).is_err() {
             return false;
         }
-        self.col().ensure_count(eid);
-        let old = self.get_value(eid);
+        col.ensure_count(eid);
+        let old = value_at(col, eid);
         if old == Some(value) {
             return true; // 冗長な re-tie = no-op（bucket に dup を作らない）
         }
@@ -162,7 +255,7 @@ impl HimoStore {
         }
         // #106: Release store。 leaf offset を publish する前に書いた LeafStore slot
         // (payload/gen) を、 offset を Acquire で読む reader が必ず観測できるようにする。
-        self.col().store_u32_release(eid, value + 1);
+        col.store_u32_release(eid, value + 1);
         self.cyl.insert(eid, value);
         // compaction は Column 更新の **後** (keep = value_eq が新状態を見るため)
         if let Some((o, (len, live))) = stale {
@@ -172,14 +265,15 @@ impl HimoStore {
     }
 
     pub fn remove(&self, eid: u32) {
-        if eid < self.col().count() {
+        let col = self.col();
+        if eid < col.count() {
             self.ensure_cylinder_built();
             let _w = self.write_lock.lock();
-            if let Some(o) = self.get_value(eid) {
+            if let Some(o) = value_at(col, eid) {
                 // 削除: 旧 bucket に stale が残る（Cylinder は触らない、verify で落とす）。
                 // flag → Column の順 (set と同じ)
                 let stale = self.cyl.note_stale(o);
-                self.col().clear(eid);
+                col.clear(eid);
                 if let Some((len, live)) = stale {
                     self.maybe_compact(o, len, live);
                 }
@@ -193,7 +287,8 @@ impl HimoStore {
     /// 次の trigger までに live 相当数の churn が必要)。
     fn maybe_compact(&self, value: u32, len: usize, live: u32) {
         if len >= COMPACT_MIN_LEN && (len - live as usize) * 2 >= len {
-            self.cyl.compact_bucket(value, |eid| self.value_eq(eid, value));
+            let col = self.col();
+            self.cyl.compact_bucket(value, |eid| stored_at(col, eid) == value + 1);
         }
     }
 
@@ -202,12 +297,13 @@ impl HimoStore {
     pub fn compact_now(&self) {
         self.ensure_cylinder_built();
         let _w = self.write_lock.lock();
+        let col = self.col();
         for v in self.cyl.unique_values() {
             // clean bucket (churn 痕なし) は組み直し不要 — 無条件 swap は巨大 himo で
             // write_lock の長期保持 + 旧 backing の epoch 滞留 (一時 ~2x RSS) を招く
             // (PR #103 レビュー)。write_lock 下なので flag 判定は正確。
             if self.cyl.bucket_needs_verify(v) {
-                self.cyl.compact_bucket(v, |eid| self.value_eq(eid, v));
+                self.cyl.compact_bucket(v, |eid| stored_at(col, eid) == v + 1);
             }
         }
     }
@@ -221,17 +317,9 @@ impl HimoStore {
     // ──── 読む（Column 直読み、Cylinder 非依存）────
 
     pub fn get_value(&self, eid: u32) -> Option<u32> {
-        if eid >= self.col().count() {
-            return None;
-        }
         // #106: Acquire load。 writer の `store_u32_release` と対で、 leaf offset を
         // 掴んだら対応する LeafStore slot の payload/gen も必ず観測できるようにする。
-        let stored = self.col().load_u32_acquire(eid);
-        if stored == 0 {
-            None
-        } else {
-            Some(stored - 1)
-        }
+        value_at(self.col(), eid)
     }
 
     /// SIMD 集計向け raw stored values への view（stored 形式: 0 = 未設定、N = 値 N-1）。
@@ -253,33 +341,35 @@ impl HimoStore {
                 out.push(0);
                 continue;
             }
-            out.push(u32::from_le_bytes(col.get(lid).try_into().unwrap()));
+            out.push(stored_at(col, lid));
         }
     }
 
     /// eid の現在値が value か（= lazy verify の primitive、Column 直読み）。
     #[inline(always)]
     pub fn value_eq(&self, eid: u32, value: u32) -> bool {
-        u32::from_le_bytes(self.col().get(eid).try_into().unwrap()) == value + 1
+        stored_at(self.col(), eid) == value + 1
     }
 
     pub fn get_raw_bytes(&self, eid: u32) -> [u8; 4] {
-        if eid >= self.col().count() {
+        let col = self.col();
+        if eid >= col.count() {
             return [0u8; 4];
         }
-        self.col().get(eid).try_into().unwrap()
+        col.get(eid).try_into().unwrap()
     }
 
     pub fn restore(&self, eid: u32, old_bytes: &[u8; 4]) {
         self.ensure_cylinder_built();
         let _w = self.write_lock.lock();
         // v10: `set` と同じく、 書く cell まで segment の commit を伸ばす (#167: 伸ばせなければ書かない)。
-        if self.col().ensure_committed_for(eid).is_err() {
+        let col = self.col();
+        if col.ensure_committed_for(eid).is_err() {
             return;
         }
-        self.col().ensure_count(eid);
+        col.ensure_count(eid);
         let stored = u32::from_le_bytes(*old_bytes);
-        let old = self.get_value(eid);
+        let old = value_at(col, eid);
         let new = if stored == 0 { None } else { Some(stored - 1) };
         if old == new {
             return; // 同値 restore = no-op (bytes も同一)
@@ -289,7 +379,7 @@ impl HimoStore {
             // flag → Column の順 (set と同じ、request12)
             stale = self.cyl.note_stale(o).map(|s| (o, s));
         }
-        self.col().set(eid, old_bytes);
+        col.set(eid, old_bytes);
         if let Some(n) = new {
             self.cyl.insert(eid, n);
         }
@@ -311,9 +401,10 @@ impl HimoStore {
             raw
         } else {
             // lazy verify: Column で現在値を確認、churn 由来の dup を除去
+            let col = self.col();
             let mut out: Vec<u32> = raw
                 .into_iter()
-                .filter(|&eid| self.value_eq(eid, value))
+                .filter(|&eid| stored_at(col, eid) == value + 1)
                 .collect();
             out.sort_unstable();
             out.dedup();
@@ -323,10 +414,11 @@ impl HimoStore {
 
     /// 値が tie された全 entity（= column 非ゼロ走査）。O(next_eid) で重い。
     pub fn entities_with_value(&self) -> Vec<u32> {
-        let count = self.col().count();
+        let col = self.col();
+        let count = col.count();
         let mut result = Vec::new();
         for eid in 0..count {
-            let stored = u32::from_le_bytes(self.col().get(eid).try_into().unwrap());
+            let stored = stored_at(col, eid);
             if stored != 0 {
                 result.push(eid);
             }
@@ -373,11 +465,12 @@ impl HimoStore {
     pub fn rebuild_cylinder(&self) {}
 
     pub fn scan(&self, value: u32) -> Vec<u32> {
-        let count = self.col().count();
+        let col = self.col();
+        let count = col.count();
         let target = value + 1;
         let mut result = Vec::new();
         for eid in 0..count {
-            let stored = u32::from_le_bytes(self.col().get(eid).try_into().unwrap());
+            let stored = stored_at(col, eid);
             if stored == target {
                 result.push(eid);
             }
