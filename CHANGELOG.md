@@ -107,6 +107,18 @@ cargo update -p enchudb        # または Cargo.lock を消して解決し直�
 - 行あたり 0.2 µs 前後 (12 列) = **1 列 十数 ns** は `get(eid, "名前")` の**文字列解決込み**。
   hot loop なら `himo_id(name)` で 1 回引いて **`get_by_id(eid, hid)`** を回すと落ちる
 
+**同じ理由で fd も触った本数ぶん保持する** (v9 は mmap 後に close していたので 0 本)。 実測で
+**固定 11 本 + 触った himo 1 本につき 1 本** — 12 列を触る形なら 1 DB あたり 23 本。 **1 process で
+多数の DB を開いたままにする consumer (hub の scope pool 等) は積む**ので:
+
+- 保持数は **process 全体で `min(soft limit / 2, 8192)` が上限** (`raise_fd_limit()` で soft を
+  hard まで上げた後の値)。 **上限に達しても `EMFILE` にはならない** — 以後の segment は fd を
+  持たず都度 open になる (grow が遅くなるだけ。 **読みは mmap 済みなので fd は要らない**)。
+  実測: 予算 512 で 60 DB を開いても retained は 512 で頭打ち、 read は正常
+- 現在の保持数は `enchudb_engine::segment_map::retained_fds()` で見られる。 予算を明示したい
+  なら `set_fd_budget(n)`
+- gate は `tests/v10_fd_budget.rs` (子 process の `RLIMIT_NOFILE` を絞って himo 200 本を通す)
+
 消費側の実例: `sf` の `read_project()` は 12 列を触る → 予測 0.24 ms に対し実測 0.279 ms。
 計測は `examples/open_split_bench.rs` (open / 読み / drop を分離)。
 
