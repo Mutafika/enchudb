@@ -83,6 +83,52 @@ cargo update -p enchudb        # または Cargo.lock を消して解決し直�
 `Cargo.toml` の `enchudb = { path = "..." }` (patch ではなく直接 path) を使っている構成
 (sunsu2 など) は影響を受けない。
 
+### コスト model — 「触った himo の本数 × ~20 µs」
+
+**D2 は file 数ぶんのコストを消したのではなく、 「全 himo ぶんを open で」 から 「触った himo
+ぶんを初回タッチで」 に移した。** open だけを見ると劇的に見えるが、 consumer が実際に払う額は
+**触る列の本数**で決まる。 3 段を分離した実測 (himo 117 / entity 9211 / min of 35、 µs):
+
+| 触る himo (1 行) | open | 最初の読み | drop | 計 |
+|---:|---:|---:|---:|---:|
+| 1 | 451.3 | 18.7 | 50.5 | **520.5** |
+| 12 (`sf` の形) | 447.6 | 225.4 | 108.2 | 781.2 |
+| 30 | 447.6 | 566.9 | 182.2 | 1196.8 |
+| 117 (全部) | 459.4 | 2266.7 | 673.9 | **3400.0** |
+| 参考: 0.26.0 (eager、 1 行) | 2655.4 | 0.0 | 584.4 | **3239.8** |
+
+- **~20 µs/himo** で、 これは file 1 本の open 定数そのもの。 drop も開いた本数に比例する
+- **行数には比例しない。** `col()` は `OnceLock` なので **Engine 1 つにつき himo 1 本 1 回**。
+  12 列で行を 1 → 1000 に振っても読みは 225 → 500 µs 程度 (= 固定ぶん + 行あたり 0.2 µs 前後)。
+  **一覧系ほど 1 行あたりに薄まる**
+- **全列を触ると eager より数 % 悪い** (117 本全部で 3400 µs vs eager 3240 µs)。 D2 は無条件の
+  改善ではなく 「**一部しか触らない形**」 への最適化。 kenning は 48 中 2〜13 本、 `sf` は
+  117 中 12 本
+- 行あたり 0.2 µs 前後 (12 列) = **1 列 十数 ns** は `get(eid, "名前")` の**文字列解決込み**。
+  hot loop なら `himo_id(name)` で 1 回引いて **`get_by_id(eid, hid)`** を回すと落ちる
+
+**同じ理由で fd も触った本数ぶん保持する** (v9 は mmap 後に close していたので 0 本)。 実測で
+**固定 11 本 + 触った himo 1 本につき 1 本** — 12 列を触る形なら 1 DB あたり 23 本。 **1 process で
+多数の DB を開いたままにする consumer (hub の scope pool 等) は積む**ので:
+
+- ⚠️ **`open_readonly` でも保持する。** engine は readonly でも segment を **RW map** で開く
+  (「書かない」 は engine 側の契約) ので、 `SegmentMap` の reader 用 fd-close path は engine の
+  open からは通らない。 **readonly の DB を pool に貯める consumer も予算を消費する**
+- 保持数は **process 全体で `min(soft limit / 2, 8192)` が上限** (`raise_fd_limit()` で soft を
+  hard まで上げた後の値)。 **上限に達しても `EMFILE` にはならない** — 予算を使い切った後の
+  segment は fd を持たずに動く (mapping は fd 無しで有効なので**読みは無影響**、 grow だけ
+  都度 open のぶん遅くなる)。 実測: 予算 512 で 60 DB を開いても retained は 512 で頭打ち、
+  read は正常
+  - したがって **多数の DB を開き続ける consumer で劣化として出るのは書き込み側**。 docker 既定
+    (soft 1024 → 予算 512) なら 23 fd/db で **~22 DB 分**が予算内。 それ以上開くなら
+    `LimitNOFILE` を上げる (予算は 8192 で頭打ち)
+- 現在の保持数は `enchudb_engine::segment_map::retained_fds()` で見られる。 予算を明示したい
+  なら `set_fd_budget(n)`
+- gate は `tests/v10_fd_budget.rs` (子 process の `RLIMIT_NOFILE` を絞って himo 200 本を通す)
+
+消費側の実例: `sf` の `read_project()` は 12 列を触る → 予測 0.24 ms に対し実測 0.279 ms。
+計測は `examples/open_split_bench.rs` (open / 読み / drop を分離)。
+
 ### 検証
 
 - workspace **173 suite / 1119 passed / 0 failed** (macOS M2 Max、 逐次単独実行)
@@ -125,6 +171,9 @@ cargo update -p enchudb        # または Cargo.lock を消して解決し直�
   ```
   data の載っている範囲だけ写す (sparse を保つ)。 旧 sidecar (`old.db.tables` / `.oplog` /
   `.eidmap` / `.vocabmap` / `.schema` / `.crc`) は directory の中へ。 v7 以前は非対応
+  - ⚠️ **移行直後の初回コマンドは page-in を払う。** segment が page cache に無いので、
+    実測で **1 発目だけ 57 ms** (2 発目以降は 5〜6 ms) というケースが出ている。 cold の
+    1 サンプルを掴むと 10x の regression に見えるので、 移行後の計測は 2 発目以降で取ること
   - 移行の前後で **`seal_integrity()` を通しておくことを勧める** (`.crc` を焼く)。 v10 は
     「まだ書いていない segment」 も 0 byte なので、 **既定の open は segment の切り詰めを
     検出できない**が、 封緘した DB は 0 byte / 部分 truncate / bit 反転を open 時の
@@ -139,6 +188,21 @@ cargo update -p enchudb        # または Cargo.lock を消して解決し直�
     flock を `<db_dir>/lock` に置いており、
     engine root を `<db_dir>` に素直化すると enchudb の `lock` と同じ file を掴んで即死する
     (`<db_dir>/enchu.db` のような入れ子を維持していれば衝突しない)
+  - ⚠️ **逆向きも踏む: 「directory なら db ではない」 と判別している呼び出し側が壊れる。**
+    v9 まで db は 1 ファイルだったので `Path::is_dir()` で 「directory = 別のもの」 と振り分け
+    られたが、 **v10 の db は directory** なので db 自身がそちら側に落ちる。 実例: kenning の
+    `update [repo] [db]` は位置引数を `is_dir()` で repo / db に振り分けており、 **指定した db が
+    更新されないまま、 db directory を索引した別 index が `~/.cache` に生えた** (build は通り
+    exit 0、 stderr も無音。 統合テストだけが捕まえ、 誤った index が 12 本溜まっていた)。
+    判別には **`Engine::probe()` を使うこと** — mmap も lock も取らず stat だけで
+    `Missing` / `Ready` / `Incomplete` / `Damaged` / `SingleFileLegacy` を返す:
+  ```rust
+  // 「この path は enchudb の db か」。 Incomplete を含めてはいけない (下記)
+  matches!(Engine::probe(p), DbState::Ready | DbState::Damaged(_) | DbState::SingleFileLegacy)
+  ```
+    **`Incomplete` は 「db でない普通の directory」 も返す** (`header.seg` が無い directory は
+    すべてここに来る) ので、 `probe(p) != DbState::Missing` と書くと **今度は全 directory が
+    db 判定になる**。 `Missing` は 「path が存在しない」 だけの意味
 - `Engine::table_eid_range(name)` は **hull** (先頭 lo 〜 最後の hi) を返す。 auto-grow した
   table (下記) は間に他 table の eid を挟むので、 **scan は `table_eid_extents(name)`** で
 - **`define_table(name, size_hint)` の `size_hint` は硬い上限ではなくなった。** table が先頭
