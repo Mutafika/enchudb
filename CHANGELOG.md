@@ -3,6 +3,49 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.26.5 — 2026-09-04
+
+**writer open の定数コストを畳んだ perf patch** (#255)。 on-disk format は**不変**、 migration
+不要、 breaking なし。 公開 API は観測用の `Engine::himos_with_cylinder_built()` が増えるだけ。
+**rw open する consumer は上げること** — 特に 1 コマンド 1 process の CLI (`sf` の書き込み系
+コマンド) は毎回払っていた。 readonly 側は 0.26.1 で片付いており、 これが writer open に残って
+いた最後の定数。
+
+### Performance — writer open が全 leaf himo の cylinder を eager build していた (#255)
+
+`Engine::open` (rw) は load 末尾で LeafStore の free-list を再構成する (free-list は非永続、
+#88)。 その live offset を `HimoStore::unique_values()` で集めていたため、 **leaf を持つ全 himo
+の in-memory index (cylinder) を open で組み、 drop でそれを free していた**。 0.26.1
+(request23 D2) で lazy にした HimoStore の効果が、 writer open ではこの 1 箇所で全部無効化
+されていた。 readonly open は同ブロックを通らないので速く、 `ENCHU_OPEN_PROFILE` も
+`HimoStore::load` の Δt しか出さないので計測の外だった。 消費側 (`sf`) の 「1 行書くだけで
+~350 ms、 うち ~250 ms が open + drop」 という stack sample 付きの報告で発覚。
+
+- `HimoStore::for_each_set_value` (raw cell の走査。 `ensure_cylinder_built` と同じ走査を
+  cylinder insert 抜きで行うので集合は同一) に替えた。 index は最初に触る列だけ組む
+- drop 側は build していない cylinder は free する物が無いので自然に縮む
+- 観測用 `Engine::himos_with_cylinder_built()` (open 直後は 0、 書いた列だけ増える。 `get` の
+  点読みは column 直読みなので組まない) と `HimoStore::cylinder_built()` を追加
+
+| `examples/rw_open_bench.rs` (release、 median) | 0.26.4 | 0.26.5 |
+|---|---:|---:|
+| sinfo 実 DB clone (9250 entity / 117 himo、 leaf 13 本) rw open | 158.7 ms | **4.1 ms** |
+| 同 rw drop | 92.7 ms | **11.4 ms** |
+| 同 open 直後に built な cylinder | 13 本 | **0 本** |
+| 合成 DB (leaf 59 本、 全 9211 entity に値) rw open | 2058 ms | **32 ms** |
+| 同 rw drop | 1609 ms | **11.8 ms** |
+| 参考: `open_readonly` (両 DB) | 0.5〜0.7 ms | 同 |
+
+**残差**: rw open 3〜4 ms = leaf 列の segment open + raw 走査 + free-list の walk、 drop ~10 ms =
+commit / persist / manifest (報告の内訳どおり)。 合成 DB の 32 ms は 59 列 × 9211 cell の走査と
+17 MB の leaf 領域 walk で、 free-list を lazy 化 (最初の leaf 確保時に再構成) すればさらに
+削れるが、 実 DB shape では効かないので今回は入れていない。
+
+**検証**: gate `tests/issue255_rw_open_lazy_cylinder.rs` 2 本 — rw open 直後に built な himo が
+0 本 (書いた列だけ 1 本ずつ増える) / reopen 後の free-list が同値 (live slot を配り直さず、
+空いた slot は再利用され footprint が伸びない)。 走査の `-1` を落とした版では後者が落ちる
+ことを確認。 engine 全 test 481 本 / sync 85 本 green。
+
 ## 0.26.4 — 2026-09-04
 
 **consumer が次の普通の操作で踏む地雷 3 件をまとめた patch** (#245 / #246 / #242)。 on-disk
