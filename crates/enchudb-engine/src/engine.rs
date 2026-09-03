@@ -8207,14 +8207,18 @@ impl Engine {
     /// v6 (#88): open 時に routed-Leaf の live cell offset を集めて LeafStore の
     /// free-list を再構成する (free-list は非永続 = store の派生)。 writable open の
     /// load 末尾で呼ぶ。 これが無いと過去 session で空いた slot が再利用されない。
+    ///
+    /// #255: 以前は `unique_values()` で集めていたが、 それは leaf を持つ**全 himo の
+    /// cylinder を build する** (= 0.26.1 で lazy にした HimoStore が writer open では
+    /// 全部 eager に戻る)。 raw cell の走査に替えて、 index は最初に触る列だけ組む。
     fn rebuild_leaf_free_list(&self) {
         let Some(leaf) = self.leaf.as_ref() else { return; };
         let mut live: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for hid in 0..self.himos.len() {
             if self.leaf_for(hid).is_some() {
-                for off in self.himos[hid].unique_values() {
+                self.himos[hid].for_each_set_value(|off| {
                     live.insert(off);
-                }
+                });
             }
         }
         leaf.rebuild_free_list(&live);
@@ -10828,6 +10832,13 @@ impl Engine {
     /// 「open が遅い」 を調べる時に、 まずここが大きくないかを見る。
     pub fn himo_max_values(&self) -> Vec<u32> {
         (0..self.himo_max_values.len()).filter_map(|i| self.himo_max_values.get(i).copied()).collect()
+    }
+
+    /// #255: cylinder (列ごとの in-memory index) が組まれている himo の本数。 open 直後は
+    /// readonly / rw とも 0 で、 列を最初に触ったときに 1 本ずつ増える。 「rw open が遅い」
+    /// を調べる時に、 open だけで増えていないかを見る (`himo_max_values` と同じ観測 API)。
+    pub fn himos_with_cylinder_built(&self) -> usize {
+        (0..self.himos.len()).filter(|&h| self.himos[h].cylinder_built()).count()
     }
 
     pub fn value_type(&self, himo: &str) -> Option<ValueType> {

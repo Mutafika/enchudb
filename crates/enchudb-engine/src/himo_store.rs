@@ -440,6 +440,28 @@ impl HimoStore {
         self.cyl.unique_values()
     }
 
+    /// #255: cylinder を**組まずに**、 column の設定済み cell の値を `f` に渡す (eid 順、
+    /// 重複あり)。 `ensure_cylinder_built` と同じ走査を cylinder insert 抜きで行うので、
+    /// 集めた集合は `unique_values()` と一致する。 writer open 時の LeafStore free-list
+    /// 再構成用 — 以前は `unique_values()` 経由で leaf を持つ全 himo の index を eager に
+    /// 組んでいた (117 himo / 9211 entity の DB で open +150 ms / drop +100 ms)。
+    ///
+    /// 走査は非 atomic な raw view (`values_u32`) なので、 **書き込みと並走しない場面**
+    /// (open 直後) でだけ使うこと。
+    pub fn for_each_set_value(&self, mut f: impl FnMut(u32)) {
+        let col = self.col();
+        for &stored in col.values_u32() {
+            if stored != 0 {
+                f(stored - 1);
+            }
+        }
+    }
+
+    /// cylinder (in-memory index) が組まれているか。 観測用 (#255 の gate)。
+    pub fn cylinder_built(&self) -> bool {
+        self.cyl_built.load(Ordering::Acquire)
+    }
+
     /// 総件数 (live 基準、churn があっても正確 — request12)。
     pub fn total(&self) -> usize {
         self.ensure_cylinder_built();
