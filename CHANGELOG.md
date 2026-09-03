@@ -3,6 +3,72 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.26.4 — 2026-09-04
+
+**consumer が次の普通の操作で踏む地雷 3 件をまとめた patch** (#245 / #246 / #242)。 on-disk
+format は**不変**、 migration 不要、 breaking なし。 公開 API は `Transport` に provided method
+が 1 つ増えるだけ (既存 impl は無改修で動く)。
+
+### Fixed — Windows build が 0.23.0〜0.25.1 で壊れていた (#245)
+
+#167 (0.23.0) が growable backing に足した 3 メソッドが非 unix stub に無く、 `--target
+x86_64-pc-windows-msvc` の `cargo check` が 5 版連続で落ちていた。 CI が unix のみで検出できず。
+**code 自体は 0.26.0 (v10 segment 化) で stub ごと置き換わって直っている** — 0.26.x を
+Windows で build する consumer (syncretic の Win 機) は 0.23.0 から上げれば通る。
+
+- 再発防止: CI に `check (windows cross)` job を追加。 ubuntu runner 上の cross `cargo check`
+  (link しないので target の std だけで通る) で core 5 crate (oplog / engine / schema / sql /
+  sync) を毎 push gate する
+
+### Fixed — 旧 1 ファイル layout で himo 表が entities region に食い込む DB を migrate が黙って通していた (#246)
+
+v8 / v9 の header は 4096 固定で entities region が 4096 から始まるのに、 himo 表 (型 1 B ×
+max_himos の後ろに max_values 4 B × max_himos) は **max_himos > 約 960 で 4096 を越える**。 旧
+engine は define / flush のたびに**定義済み hid まで**を書いていたので、 表の使用域が 4096 を
+越えた時点 (max_himos 2048 なら **449 本目の himo から**) で entities bitset / free list が himo
+メタデータで上書きされる = 存在しない entity が live に見える / free stack 破壊で既存 eid の
+再払い出し (data loss)。
+
+- v10 (0.26.0〜) の header は可変長 (`header_size_for`) なので **新規 DB では起きない**。
+  `max_himos > u16::MAX` の sanity check も 0.26.0 で入っている
+- 本 patch: **legacy (v8 / v9) の packed file を読む経路** (`migrate_v9_to_v10` /
+  `unpack_to_dir` / `from_bytes`) で、 himo 表の使用域 (`himo_maxv_base(max_himos) +
+  himo_count × 4`) が 4096 を越えていれば `InvalidData` で拒否する。 message は `#246` と
+  「entity 情報は既に壊れている、 旧 binary で export すること」 を明記。 **黙って壊れた v10 を
+  作らない**ための止血で、 復旧はしない (bitset の元の値は失われている)
+- 使用域が収まる DB (sinfohub の shape = max_himos 2048 / himo 117 本) は今まで通り通る。
+  gate は 448 本 (ちょうど 4096) が通り 449 本が拒否される境界 test
+
+**既知の残ギャップ**: 越境済み DB の救済手段は enchudb には無い。 himo_count が境界を越えて
+いても、 上書きされた bit が偶然 0 のままなら実害は無かった可能性があるが、 判定できないので
+一律拒否している。
+
+### Fixed — `Transport::pull_as_multi` の default 実装が cursor を運ばず、 直 pull 構成で `_sync_ops` の reclaim が止まる (#242)
+
+`Syncer::pull_once` は 0.23.1 (#216) から**常に** `pull_as_multi` を呼ぶが、 その default 実装は
+`pull_as(to, from, Hlc::ZERO)` = **cursor を transport に渡さない**。 request の cursor を到達証明
+として ack に写す transport (syncretic の HTTP gateway) では ack が前進せず、 `sync_watermark()`
+が 0 のまま `_sync_ops` が reclaim されない → #149 (0.22.0) が潰した backpressure が再発する。
+0.23.1 の release note は #216 を relay 構成の話として書いており、 直 pull 構成の transport
+実装者が「override しないと運用が壊れる」と読み取れなかった。
+
+- **`Transport::pull_as_multi_link_author(to, from, since)` を追加** (provided method)。 `since` の
+  vector を link author (`from`) の entry 1 本に畳んで scalar `pull_as` に渡す。 relay / gossip を
+  使わない直 pull 構成 (各 peer の `_sync_ops` に自分が author した record しか無い =
+  `gossip_remote_apply()` が false、 既定) では、 `pull_as_multi` の override をこの 1 行にする
+  だけで cursor が届く。 relay 混在 stream では他 author の cursor を捨てるので使わないこと
+  (per-author filter を実装する)
+- default 実装は据え置き (正しさ優先の全量 fetch) だが、 **初回に stderr へ 1 回だけ警告**する
+  (`[enchudb] warning: Transport::pull_as_multi is not overridden — …`)。 rustdoc も 「override
+  すれば効率が上がる」 から 「override しないと ack が前進しない」 に書き換えた
+- gate: helper が link author の cursor を `pull_as` に渡すこと / entry が無ければ ZERO /
+  default 実装が ZERO を渡すこと (症状の固定) の 3 本
+
+**既知の残ギャップ**: default 実装が cursor を落とす構造そのものは変えていない (scalar
+`pull_as` には cursor を 1 本しか渡せず、 relay 混在 stream で link author の cursor を渡すと
+他 author の record を落とす)。 直 pull 構成の transport は helper を、 relay 構成は
+per-author filter を、 それぞれ明示的に選ぶ必要がある。
+
 ## 0.26.3 — 2026-09-03
 
 **v9 → v10 migrate が「作ってから一度も開いていない DB」を拒否していた bug の patch** (#252)。
@@ -998,6 +1064,11 @@ native では 66 pass で素通りするので、 native だけ回している�
 green を確認)。 wasm の対象範囲を定義して CI で守る件は #230。
 
 ## 0.23.1 — 2026-08-28
+
+> **⚠️ `Transport` を自前実装している直 pull 構成は #242 (0.26.4) を読むこと** — この版から
+> `Syncer::pull_once` は常に `pull_as_multi` を呼ぶが、 その default 実装は **cursor を transport に
+> 渡さない** (`pull_as(…, Hlc::ZERO)`)。 request の cursor を ack に写す gateway では
+> `_sync_ops` の reclaim が止まる。 0.26.4 の `pull_as_multi_link_author` で 1 行 override できる。
 
 > **⚠️ relay / sync 用途では 0.25.1 へ (#235)** — この版は bridge が `_sync_ops` の `lsn` を
 > **payload より先に** tie するため、 走査 (`entities_with_himo(lsn_hid)`) に payload の無い row が
