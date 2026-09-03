@@ -3,6 +3,49 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.26.3 — 2026-09-03
+
+**v9 → v10 migrate が「作ってから一度も開いていない DB」を拒否していた bug の patch** (#252)。
+on-disk format は**不変**、 migration 不要、 breaking なし、 公開 API の変更なし。 **これから
+v10 移行を行う consumer (`sf migrate --v10` 等) は上げること**。 既に全 DB を v10 へ移行済みの
+consumer には影響しない (`unpack_to_dir` / `migrate_v9_to_v10` 以外は 0.26.2 と同一)。
+
+### Fixed — `migrate_v9_to_v10` が `layout.total_size` より短い v8 / v9 file を `packed file truncated` で拒否する (#252)
+
+v8 / v9 の engine は open 時に file を `layout.total_size` まで zero 拡張する。 そのため
+**作ってから一度も開いていない DB** は尾部 region (v8 なら layout 末尾の `leaf.data` 512 MiB)
+が未確保のまま = 旧 binary では正常に開けるのに、 0.26.0〜0.26.2 の `unpack_to_dir` は
+`total < layout.total_size` を即 Err にしていたので v10 へ移行できなかった。 sinfo の手元
+12 project 中 5 件がこれで停止 (mtime が per-project 化の瞬間のまま、 それ以降一度も open
+されていない DB だけ)。 「`status` は migrate しろと言い、 `migrate` は truncated で止まる」
+往復になるので、 consumer 側からは抜けられない。
+
+- legacy (v8 / v9) の packed file は **EOF 以降を穴 (全 0) として扱う** = 旧 engine の open と
+  同じ見え方。 必須は Header / Entities (必ず中身を読む region) が EOF 内にあることだけ。
+  各 region の読み取りは file 長で clamp し、 不足分は `set_len` の zero 拡張に任せる
+- v10 packed (`pack_dir` 産、 常に `total_size` 長) は**今まで通り** `total < total_size` を Err
+  (relay bootstrap の転送途中の切り詰め検出はそのまま)
+- error message は `packed file truncated: N bytes (required M, layout.total_size = T)` に
+  (`required` = Entities 末尾)
+
+**検証**:
+- gate 3 本 (engine lib): 短い v8 fixture の migrate がフルサイズと意味的同一 (共通 prefix
+  一致 + 長い方の尾部は全 0) で、 open 後の内容も一致 / Entities を跨ぐ本物の truncation は
+  Err のまま、 dst dir も残さない / v10 packed の短縮は Err のまま。 修正を外すと sinfo と
+  同じ error で落ちることを確認
+- 実 DB: sinfo が踏んだ project の v8 backup (10,446,254,152 bytes) を隔離コピーし、 片方を
+  失敗時と同じ 9,910,435,840 bytes に切り詰めて両方 migrate → **132 file 全て byte 一致**
+  (entities 278 / himos 117 / tables 19)
+- engine crate 全 test (464 本) green
+
+**既知の残ギャップ**:
+- 「短い file」 と 「本物の truncation」 は Entities より後ろでは区別できない (旧 engine も
+  区別していない)。 himo column の途中で切れた file は、 旧 engine と同じくその先を 0 として
+  読む
+- 回避策 (`os.truncate(path, layout.total_size)` で sparse に伸ばしてから migrate、 または
+  旧 binary で 1 回 open してから migrate) で移行済みの DB は本 fix と同じ結果になるので、
+  やり直し不要
+
 ## 0.26.2 — 2026-09-01
 
 **docs only**。 コードの振る舞いは 0.26.1 から**一切変わっていない** (変更は CHANGELOG /
