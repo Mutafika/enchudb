@@ -16467,6 +16467,7 @@ mod v10_dir_tests {
         assert!(rows.iter().any(|(e, _)| (1920..5664).contains(&enchudb_oplog::eid_local(*e))), "fixture must place entities under the overwritten bits");
         overwrite_legacy_maxv_table_with_zeros(&packed);
         let dst = format!("{packed}.dst");
+        let _ = std::fs::remove_dir_all(&dst); // `tmp()` は `.packed.dst` を掃除しない
         let err = Engine::migrate_v9_to_v10(&packed, &dst).err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
         assert!(err.to_string().contains("#257") && err.to_string().contains("live entity"), "{err}");
@@ -16495,9 +16496,11 @@ mod v10_dir_tests {
         let (packed, _rows) = legacy_fixture("mig257_fs_ng", 1024, 4096, 117, 200, 150);
         overwrite_legacy_maxv_table_with_zeros(&packed);
         let dst = format!("{packed}.dst");
+        let _ = std::fs::remove_dir_all(&dst);
         let err = Engine::migrate_v9_to_v10(&packed, &dst).err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
         assert!(err.to_string().contains("#257") && err.to_string().contains("free-stack"), "{err}");
+        assert!(!std::path::Path::new(&dst).exists());
     }
 
     /// max_values を宣言していた file は越えた範囲に非 0 が並ぶ = bit / entry が信用できない → 拒否。
@@ -16511,8 +16514,11 @@ mod v10_dir_tests {
             f.seek(SeekFrom::Start(himo_maxv_base(4096) as u64)).unwrap();
             f.write_all(&7u32.to_le_bytes()).unwrap();
         }
-        let err = Engine::migrate_v9_to_v10(&packed, &format!("{packed}.dst")).err().unwrap();
+        let dst = format!("{packed}.dst");
+        let _ = std::fs::remove_dir_all(&dst);
+        let err = Engine::migrate_v9_to_v10(&packed, &dst).err().unwrap();
         assert!(err.to_string().contains("#257") && err.to_string().contains("non-zero"), "{err}");
+        assert!(!std::path::Path::new(&dst).exists());
     }
 
     /// #252 の裏: v10 packed (`pack_dir` 産) は常に `total_size` 長なので、 短いものは
