@@ -398,16 +398,65 @@ pub trait Transport: Send + Sync {
     /// 古い record を落とさないための必須条件で、 「既知 author の min」への
     /// 短絡は同じ穴を一段下で再現する。
     ///
-    /// default 実装は `pull_as(to, from, Hlc::ZERO)` の全量 fetch — 正しさ優先の
-    /// fallback で、 既知分は受信側 (`Syncer::pull_once`) の author 別 filter が
-    /// 落とす。 効率が要る transport は per-author filter を override すること。
+    /// default 実装は `pull_as(to, from, Hlc::ZERO)` の全量 fetch。 データの正しさは
+    /// 保つ (既知分は受信側 `Syncer::pull_once` の author 別 filter が落とす) が、
+    /// **cursor を transport に運ばない**。 `Syncer::pull_once` は 0.23.1 (#216) から
+    /// **常にこの経路**を呼び、 scalar `pull_as` は Syncer からは呼ばれない。 そのため
+    /// request の cursor を到達証明として ack に写す transport (HTTP gateway 等) では、
+    /// **override しないと ack が前進せず `_sync_ops` の reclaim が止まり、 #149 の
+    /// backpressure が再発する** (#242)。 「override すれば効率が上がる」 ではなく
+    /// 「override しないと運用が壊れる」。 default 経路は初回に stderr へ 1 回だけ警告する。
+    ///
+    /// override の形は 2 つ:
+    /// - relay (gossip) を運ぶ transport: author ごとに cursor を引く per-author filter
+    ///   (`InMemoryTransport` / ws の実装)
+    /// - relay を使わない直 pull 構成 (各 peer の `_sync_ops` に自分が author した record
+    ///   しか無い): [`Transport::pull_as_multi_link_author`] を 1 行で呼ぶ
     fn pull_as_multi(
         &self,
         to: PeerId,
         from: PeerId,
         _since: &[(PeerId, Hlc)],
     ) -> Vec<WireRecord> {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[enchudb] warning: Transport::pull_as_multi is not overridden — the pull cursor is \
+                 not delivered to the transport (pull_as is called with Hlc::ZERO). if the server \
+                 derives acks from the request cursor, _sync_ops will never be reclaimed (#242). \
+                 override it with a per-author filter, or call pull_as_multi_link_author for a \
+                 direct-pull (no relay) link"
+            );
+        }
         self.pull_as(to, from, Hlc::ZERO)
+    }
+
+    /// #242: **直 pull 構成 (relay / gossip なし) 向け**の `pull_as_multi` 実装。 `since` の
+    /// vector を link author (`from`) の entry 1 本に畳んで scalar `pull_as` に渡す。
+    /// `from` の entry が無ければ `Hlc::ZERO` (= 全量)。
+    ///
+    /// これが正しいのは、 **`from` の `_sync_ops` に `from` 自身が author した record しか
+    /// 無い**とき (= `Engine::gossip_remote_apply()` が false、 3 constructor の既定)。 第三
+    /// author の record が relay されて混ざる stream では、 他 author の cursor を捨てるので
+    /// 使ってはいけない (per-author filter を実装すること)。
+    ///
+    /// ```ignore
+    /// fn pull_as_multi(&self, to: PeerId, from: PeerId, since: &[(PeerId, Hlc)]) -> Vec<WireRecord> {
+    ///     self.pull_as_multi_link_author(to, from, since)
+    /// }
+    /// ```
+    fn pull_as_multi_link_author(
+        &self,
+        to: PeerId,
+        from: PeerId,
+        since: &[(PeerId, Hlc)],
+    ) -> Vec<WireRecord> {
+        let cursor = since
+            .iter()
+            .find(|(p, _)| *p == from)
+            .map(|(_, h)| *h)
+            .unwrap_or(Hlc::ZERO);
+        self.pull_as(to, from, cursor)
     }
 
     /// #140: publisher が「自分の履歴は `floor` 以下が reclaim 済み」と広告する。
@@ -861,6 +910,62 @@ mod tests {
         let t = InMemoryTransport::new();
         let out = t.pull(42, Hlc::ZERO);
         assert!(out.is_empty());
+    }
+
+    /// #242: `pull_as` に渡された cursor を記録するだけの transport。 `pull_as_multi` は
+    /// link-author helper に委譲する (直 pull 構成の transport の形)。
+    struct LinkAuthorProbe(Mutex<Vec<(PeerId, PeerId, Hlc)>>);
+
+    impl Transport for LinkAuthorProbe {
+        fn pull(&self, _from: PeerId, _since: Hlc) -> Vec<WireRecord> {
+            Vec::new()
+        }
+        fn publish(&self, _peer: PeerId, _records: Vec<WireRecord>) {}
+        fn pull_as(&self, to: PeerId, from: PeerId, since: Hlc) -> Vec<WireRecord> {
+            self.0.lock().unwrap().push((to, from, since));
+            Vec::new()
+        }
+        fn pull_as_multi(&self, to: PeerId, from: PeerId, since: &[(PeerId, Hlc)]) -> Vec<WireRecord> {
+            self.pull_as_multi_link_author(to, from, since)
+        }
+    }
+
+    /// 同じく記録するだけだが `pull_as_multi` を override しない = default 実装のまま。
+    struct DefaultProbe(Mutex<Vec<(PeerId, PeerId, Hlc)>>);
+
+    impl Transport for DefaultProbe {
+        fn pull(&self, _from: PeerId, _since: Hlc) -> Vec<WireRecord> {
+            Vec::new()
+        }
+        fn publish(&self, _peer: PeerId, _records: Vec<WireRecord>) {}
+        fn pull_as(&self, to: PeerId, from: PeerId, since: Hlc) -> Vec<WireRecord> {
+            self.0.lock().unwrap().push((to, from, since));
+            Vec::new()
+        }
+    }
+
+    /// #242: 直 pull 構成向け helper は `since` を link author (`from`) の entry に畳んで
+    /// scalar `pull_as` に渡す。 entry が無ければ ZERO。
+    #[test]
+    fn pull_as_multi_link_author_carries_link_cursor() {
+        let t = LinkAuthorProbe(Mutex::new(Vec::new()));
+        let c3 = Hlc { wall: 300, logical: 1, peer: 3 };
+        let c7 = Hlc { wall: 700, logical: 0, peer: 7 };
+        t.pull_as_multi(1, 3, &[(7, c7), (3, c3)]);
+        t.pull_as_multi(1, 3, &[(7, c7)]);
+        let seen = t.0.lock().unwrap();
+        assert_eq!(seen[0], (1, 3, c3), "link author's cursor must reach pull_as");
+        assert_eq!(seen[1], (1, 3, Hlc::ZERO), "unknown link author falls back to ZERO");
+    }
+
+    /// #242 の症状の固定: default 実装は cursor を運ばない (ZERO で pull_as を呼ぶ)。
+    /// これが「override しないと ack が前進しない」の根拠。
+    #[test]
+    fn pull_as_multi_default_drops_cursor() {
+        let t = DefaultProbe(Mutex::new(Vec::new()));
+        let c3 = Hlc { wall: 300, logical: 1, peer: 3 };
+        t.pull_as_multi(1, 3, &[(3, c3)]);
+        assert_eq!(t.0.lock().unwrap()[0], (1, 3, Hlc::ZERO));
     }
 
     #[test]
