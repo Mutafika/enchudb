@@ -65,6 +65,28 @@ jobs:
       - name: loom model check
         run: cargo test -p enchudb-engine --test loom_append_publish --release
 
+  windows-check:
+    name: check (windows cross)
+    runs-on: ubuntu-latest
+    # #245: 非 unix stub (segment_map_windows 等) は unix CI では compile されず、 0.23.0〜0.25.1 の
+    # 5 版が Windows で build 不能のまま出た。 cross `cargo check` は target の std だけで通る
+    # (link しない) ので、 Windows runner 無しで型 / メソッドの欠落を gate できる。
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check (core crates, x86_64-pc-windows-msvc)
+        run: >
+          cargo check
+          --target x86_64-pc-windows-msvc
+          -p enchudb-oplog
+          -p enchudb-engine
+          -p enchudb-schema
+          -p enchudb-sql
+          -p enchudb-sync
+
   clippy:
     name: clippy
     runs-on: ubuntu-latest
