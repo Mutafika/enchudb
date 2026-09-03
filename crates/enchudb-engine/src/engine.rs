@@ -3728,6 +3728,23 @@ impl Engine {
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size,
         )?;
+        // #246: 旧 1 ファイル layout は header 4096 固定で entities region が 4096 から始まるのに、
+        // himo 表 (型 1 B × max_himos の後ろに max_values 4 B × max_himos) は max_himos > 約 960 で
+        // 4096 を越える。 旧 engine は define / flush のたびに **定義済み hid まで** を書いていた
+        // ので、 越えた分は entities bitset / free list に上書きされている = その file の entity
+        // 情報は既に壊れており、 migrate しても直らない。 黙って壊れた v10 を作らず拒否する。
+        if legacy_packed {
+            let used_end = himo_maxv_base(max_himos) + (himo_count as usize) * 4;
+            if used_end > HEADER_SIZE {
+                return Err(format!(
+                    "legacy header: himo table for {} himos (max_himos {}) ends at byte {} — past the \
+                     fixed {}-byte header and inside the entities region (#246). the entity bitset / \
+                     free list of this file were overwritten by himo metadata; migration cannot \
+                     recover it — export the data with the old binary instead",
+                    himo_count, max_himos, used_end, HEADER_SIZE,
+                ));
+            }
+        }
         let leaf_data_size = u64::from_le_bytes(buf[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8].try_into().unwrap()) as usize;
         let cell_version = version >= FILE_VERSION_LEGACY_V9
             && u32::from_le_bytes(buf[H_CELL_VERSION..H_CELL_VERSION + 4].try_into().unwrap()) != 0;
@@ -15906,6 +15923,12 @@ mod v10_dir_tests {
     /// `reserve` = entity reservation (None は既定 = 2^28)。 legacy fixture を作るときは
     /// `Some(cap)` (v8 / v9 は reservation の概念が無く、 EntitySet が cap 基準)。
     fn seed_with(path: &str, reserve: Option<u32>) -> Vec<(enchudb_oplog::EntityId, u32)> {
+        seed_padded(path, reserve, 0)
+    }
+
+    /// `seed_with` + himo 数が `min_himos` 本になるまで dummy himo を define する
+    /// (#246 の header 境界 fixture 用。 0 なら `seed_with` と同じ)。
+    fn seed_padded(path: &str, reserve: Option<u32>, min_himos: usize) -> Vec<(enchudb_oplog::EntityId, u32)> {
         // max_himos 2048 → v10 の header は可変長 (12 KB)。 legacy 化するときに 4096 へ切り詰めて
         // 「固定 4096 header の v8 / v9」 を再現する (実 DB = sinfohub の shape)。
         let mut eng = Engine::create_growable_opts(
@@ -15927,6 +15950,10 @@ mod v10_dir_tests {
             let e = eng.entity_in("widgets").unwrap();
             eng.tie(e, "widgets.n", 10 + i);
             rows.push((e, 10 + i));
+        }
+        while eng.himo_count() < min_himos {
+            let n = eng.himo_count();
+            eng.define_himo(&format!("pad{n}"), ValueType::Number, 0);
         }
         eng.flush().unwrap();
         eng.persist_tables().unwrap();
@@ -16165,6 +16192,38 @@ mod v10_dir_tests {
         let err = Engine::migrate_v9_to_v10(&packed, &dst).err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
         assert!(err.to_string().contains("truncated"), "{err}");
+        assert!(!std::path::Path::new(&dst).exists(), "failed migrate must not leave a dst dir");
+    }
+
+    /// #246: 旧 1 ファイル layout (header 4096 固定) で himo 表が entities region に食い込む
+    /// 境界。 max_himos 2048 では max_values 表が 2304 から始まるので、 定義済み himo が
+    /// 448 本まではちょうど 4096 に収まり、 449 本目から entities bitset を上書きしていた。
+    /// `himos` 本まで define した legacy file を migrate した結果を返す。
+    fn migrate_legacy_with_himos(name: &str, himos: usize) -> (String, io::Result<()>) {
+        let path = tmp(name);
+        seed_padded(&path, Some(1024), himos);
+        assert_eq!(Engine::open_readonly(&path).unwrap().himo_count(), himos);
+        let packed = make_legacy_single_file(&path, FILE_VERSION_LEGACY_V9);
+        let dst = format!("{path}.dst");
+        let r = Engine::migrate_v9_to_v10(&packed, &dst);
+        (dst, r)
+    }
+
+    #[test]
+    fn migrate_accepts_legacy_himo_table_that_fits_fixed_header() {
+        assert_eq!(himo_maxv_base(LEGACY_TEST_MAX_HIMOS) + 448 * 4, HEADER_SIZE, "boundary assumption");
+        let (dst, r) = migrate_legacy_with_himos("mig_himo448", 448);
+        r.unwrap();
+        let eng = Engine::open(&dst).unwrap();
+        assert_eq!(eng.himo_count(), 448);
+    }
+
+    #[test]
+    fn migrate_rejects_legacy_himo_table_overlapping_entities() {
+        let (dst, r) = migrate_legacy_with_himos("mig_himo449", 449);
+        let err = r.err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().contains("#246"), "{err}");
         assert!(!std::path::Path::new(&dst).exists(), "failed migrate must not leave a dst dir");
     }
 
