@@ -1133,6 +1133,13 @@ impl Engine {
     /// v10: packed 1 ファイル (v8 / v9 の単一 file DB も可) を directory `dst` に展開する。
     /// 各 region は data の載っている範囲だけ写す (sparse の穴は読まない)。 v8 / v9 の header
     /// は version を 10 に打ち直す。 `dst` は存在してはいけない。
+    ///
+    /// **file 長が `layout.total_size` より短いとき** (#252): v8 / v9 の engine は open 時に
+    /// `total_size` まで zero 拡張するので、 「作ってから一度も開いていない DB」 は尾部 region
+    /// (未定義 himo の slot 等) が未確保のまま = 旧 binary では正常に開ける。 legacy file では
+    /// **EOF 以降を穴 (全 0) として扱い**、 必ず中身を読む Header / Entities が EOF を跨ぐとき
+    /// だけ `packed file truncated` で拒否する。 v10 packed (`pack_dir` 産、 常に `total_size`
+    /// 長) は転送途中の切り詰めと区別が付かないので今まで通り `total < total_size` を Err。
     pub fn unpack_to_dir(packed: &std::path::Path, dst: &str) -> io::Result<()> {
         use std::io::{Read, Seek, SeekFrom, Write};
         let mut src = std::fs::File::open(packed)?;
@@ -1142,17 +1149,26 @@ impl Engine {
         })?;
         let (layout, himo_count) = Self::parse_header(&fixed, true)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let total = src.metadata()?.len();
-        if total < layout.total_size as u64 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("packed file truncated: {} bytes (layout.total_size = {})", total, layout.total_size),
-            ));
-        }
         // legacy (v8 / v9): reservation を既定まで広げ、 EntitySet を新 layout に組み直す
         // (free stack の位置が bitset 容量で決まるので、 中身を動かす必要がある)
         let src_version = u32::from_le_bytes(fixed[H_VERSION..H_VERSION + 4].try_into().unwrap());
         let legacy = src_version != FILE_VERSION;
+        let total = src.metadata()?.len();
+        // 必ず全域を読む region の末尾。 legacy はここまであれば残りは穴とみなせる (#252)。
+        let must_have = if legacy {
+            (layout.region_off(SegmentKind::Entities) + layout.segment_size(SegmentKind::Entities)) as u64
+        } else {
+            layout.total_size as u64
+        };
+        if total < must_have {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "packed file truncated: {} bytes (required {}, layout.total_size = {})",
+                    total, must_have, layout.total_size
+                ),
+            ));
+        }
         let new_reserve = if legacy {
             default_reserve_entities(layout.max_entities)
         } else {
@@ -1188,10 +1204,14 @@ impl Engine {
                 let new = EntitySet::relayout(&old, layout.max_entities, new_reserve);
                 write_sparse(&mut out, &new)?;
             } else {
-                let used = last_data_end(&src, off, end);
+                // EOF 以降は穴 (#252): 読む範囲を file 長で clamp し、 足りない分は set_len の
+                // zero 拡張に任せる (旧 engine が open 時にやっていたことと同じ見え方)。
+                let avail_end = end.min(total).max(off);
+                let used = last_data_end(&src, off, avail_end);
                 // page 未満でも SegmentMap::open が page に揃える。 ここでは data の末尾まで。
                 let len = used.saturating_sub(off).max(4096.min(size));
-                let holes = copy_file_range(&mut src, off, &mut out, 0, len)?;
+                let copy = len.min(avail_end - off);
+                let holes = copy_file_range(&mut src, off, &mut out, 0, copy)?;
                 out.set_len(len)?;
                 punch_holes(&out, &holes)?;
             }
@@ -16057,6 +16077,109 @@ mod v10_dir_tests {
         let err = Engine::migrate_v9_to_v10(&packed, &format!("{path}.dst")).err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
         assert!(err.to_string().contains("version 7"), "{err}");
+    }
+
+    /// directory 配下の全 file (相対 path → bytes)。 migrate 結果の byte 比較用。
+    fn dir_files(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        fn walk(base: &std::path::Path, dir: &std::path::Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(base, &p, out);
+                } else {
+                    let rel = p.strip_prefix(base).unwrap().to_string_lossy().to_string();
+                    out.insert(rel, std::fs::read(&p).unwrap());
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    /// #252: 作ってから一度も開いていない v8 / v9 DB は header の `total_size` より短い
+    /// (旧 engine は open 時に zero 拡張する)。 尾部を穴として扱い、 フルサイズの同内容を
+    /// migrate した結果と byte 一致すること。 切る位置は data の末尾より後ろ = 未定義 himo
+    /// slot の途中 (region が EOF を跨ぐ形と、 丸ごと EOF の外にある形の両方を通す)。
+    #[test]
+    fn migrate_accepts_legacy_file_shorter_than_total_size() {
+        let path = tmp("mig8_short");
+        let rows = seed_with(&path, Some(1024));
+        let packed = make_legacy_single_file(&path, FILE_VERSION_LEGACY_V8);
+        let _ = std::fs::remove_dir_all(&path);
+
+        let bytes = std::fs::read(&packed).unwrap();
+        let total_size = bytes.len() as u64;
+        let data_end = bytes.iter().rposition(|b| *b != 0).map(|i| i as u64 + 1).unwrap();
+        assert!(total_size - data_end > 1 << 20, "fixture must have a sparse tail (data_end {data_end} / total {total_size})");
+        let cut = data_end + 12_345;
+        let short = format!("{path}.copy");
+        std::fs::write(&short, &bytes[..cut as usize]).unwrap();
+        for n in [db_files::TABLES, db_files::OPLOG, db_files::SCHEMA] {
+            std::fs::copy(db_files::legacy_path_for(&packed, n), db_files::legacy_path_for(&short, n)).unwrap();
+        }
+
+        let dst_full = format!("{path}.dst");
+        let dst_short = format!("{path}.short.dst");
+        let _ = std::fs::remove_dir_all(&dst_short);
+        Engine::migrate_v9_to_v10(&packed, &dst_full).unwrap();
+        Engine::migrate_v9_to_v10(&short, &dst_short).unwrap();
+
+        // 意味的に同一: 共通 prefix が一致し、 長い方の尾部は全 0 (segment の長さは
+        // 「穴」 を SEEK_DATA が data と見るかどうか = fs 依存で揺れるので、 長さ自体は問わない。
+        // manifest はその長さの写しなので除外)。
+        let full = dir_files(std::path::Path::new(&dst_full));
+        let shortf = dir_files(std::path::Path::new(&dst_short));
+        assert_eq!(full.keys().collect::<Vec<_>>(), shortf.keys().collect::<Vec<_>>());
+        for (name, a) in &full {
+            if name == "segments" {
+                continue;
+            }
+            let b = &shortf[name];
+            let n = a.len().min(b.len());
+            assert!(a[..n] == b[..n], "{name}: common prefix differs between full-size and short migrate");
+            let tail = if a.len() > n { &a[n..] } else { &b[n..] };
+            assert!(tail.iter().all(|x| *x == 0), "{name}: tail beyond the shorter segment must be zero");
+        }
+
+        let eng = Engine::open(&dst_short).unwrap();
+        assert_seeded(&eng, &rows);
+        assert!(!eng.has_cell_version());
+        // 元は不変
+        assert_eq!(std::fs::metadata(&short).unwrap().len(), cut);
+        let _ = std::fs::remove_dir_all(&dst_short);
+    }
+
+    /// #252 の裏: 必ず中身を読む Entities region を EOF が跨ぐ本物の truncation は Err のまま。
+    #[test]
+    fn migrate_rejects_legacy_file_cut_inside_entities() {
+        let path = tmp("mig8_cut");
+        seed_with(&path, Some(1024));
+        let packed = make_legacy_single_file(&path, FILE_VERSION_LEGACY_V8);
+        let bytes = std::fs::read(&packed).unwrap();
+        let (layout, _) = Engine::parse_header(&bytes[..HEADER_SIZE], true).unwrap();
+        let ent_off = layout.region_off(SegmentKind::Entities) as u64;
+        let ent_size = layout.segment_size(SegmentKind::Entities) as u64;
+        OpenOptions::new().write(true).open(&packed).unwrap().set_len(ent_off + ent_size / 2).unwrap();
+        let dst = format!("{path}.dst");
+        let err = Engine::migrate_v9_to_v10(&packed, &dst).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().contains("truncated"), "{err}");
+        assert!(!std::path::Path::new(&dst).exists(), "failed migrate must not leave a dst dir");
+    }
+
+    /// #252 の裏: v10 packed (`pack_dir` 産) は常に `total_size` 長なので、 短いものは
+    /// 転送途中の切り詰めとして今まで通り Err。
+    #[test]
+    fn unpack_rejects_short_v10_packed() {
+        let path = tmp("pack_short");
+        seed_with(&path, Some(1024));
+        let packed = format!("{path}.packed");
+        let total = Engine::pack_dir(&path, std::path::Path::new(&packed)).unwrap();
+        OpenOptions::new().write(true).open(&packed).unwrap().set_len(total - 4096).unwrap();
+        let err = Engine::unpack_to_dir(std::path::Path::new(&packed), &format!("{path}.dst")).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().contains("truncated"), "{err}");
     }
 
     fn tiny(path: &str, cap: u32, reserve: u32) -> Engine {
