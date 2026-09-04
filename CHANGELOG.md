@@ -3,6 +3,42 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.26.7 — 2026-09-04
+
+**schema 層の rw open の定数コストを畳んだ perf patch** (#259、 kenning からの報告)。 on-disk
+format は**不変**、 breaking なし、 公開 API の変更なし。 **schema 層 (`enchudb-schema`) の
+`Database::open` (rw) を 1 コマンド 1 process で使う consumer は上げること** (kenning の
+増分 update 経路 / `sf` の書き込みコマンド)。 #255 (0.26.5) で engine 側の writer open は
+片付いていたが、 schema 層に relation 数に比例する定数が残っていた。
+
+### Performance — `define_ref_in` が idempotent な再登録でも `tables` sidecar を fsync していた (#259)
+
+`Database::open` → `load_schema` は sidecar から復元した各 relation を `define_ref_in` で
+engine に再登録する。 fk entry が既に登録済みでも末尾で無条件に `try_persist_tables()`
+(tmp → `sync_all` → rename) を呼んでいたため、 **relation 1 本につき fsync 1 回 (APFS ~6 ms)
+が rw open の定数コスト**になっていた。 書き込みゼロでも open 中に `tables` の mtime が動く
+ことで裏取り。 `define_table` / `define_himo_in` は既存なら persist 前に return するので、
+open 中に fsync を起こしていたのはここだけ。
+
+- persist を **entry を新規に push した時だけ**に (3 行)。 新規 himo なら (hid, target) は
+  `fk_refs` に無いので必ず push → persist される。 既存 entry は disk と一致済み
+- `defer_tables_persist` を open 経路で立てる案は、 open 後の user の `define_*` の即時
+  persist という既存の振る舞いを変えるので採らなかった
+
+| kenning の DB (3952 entity / 48 himo / relation 8 本) | 0.26.6 | 0.26.7 |
+|---|---:|---:|
+| `Database::open` (rw) | 42〜44 ms | **0.7〜1.0 ms** |
+| `Engine::open_standalone` (参考) | 0.7〜2 ms | 同 |
+| kenning tokio corpus: `update` (無変更) | 91 ms | **53 ms** |
+| kenning tokio corpus: 編集直後の query (rw open + 増分) | 123 ms | **80 ms** |
+
+**検証**: gate 3 本 — engine 層 (再登録で `tables` の mtime 不変 / 新規 relation は persist され
+reopen 後も残る) と schema 層 (relation 8 本の DB を rw open しても open 時点で `tables` 不変)。
+fix を外すと狙った 2 本だけが落ちる。
+
+**残る定数 (別 issue 候補)**: Drop 側の `persist_schema` が無変更でも `.schema` + `tables` +
+`eidmap` + `vocabmap` を fsync 付きで書き直していて ~15〜20 ms。 dirty tracking で消せる見込み。
+
 ## 0.26.6 — 2026-09-04
 
 **0.26.4 の #246 ガードが sf の v8 DB を全件誤拒否していた regression の patch** (#257)。
