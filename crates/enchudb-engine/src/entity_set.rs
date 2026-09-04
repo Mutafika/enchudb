@@ -18,6 +18,8 @@ use crate::region::Region;
 
 const MAGIC: [u8; 4] = [b'E', b'N', b'T', b'1'];
 const HEADER: usize = 16;
+/// region 先頭の header 長 (= bitset の開始 offset)。 migrate 側の検査用 (#257)。
+pub(crate) const HEADER_BYTES: usize = HEADER;
 const FREE_STACK_MAX: u32 = 1_048_576;
 
 pub struct EntitySet {
@@ -47,11 +49,11 @@ impl EntitySet {
 
     /// free stack に積める eid 数。 「これまで allocate された eid」 しか積めないので論理上限は
     /// bitset_cap。 FREE_STACK_MAX (= 1 M) は default preset 想定の上限で、 tiny では 4 KB。
-    fn free_cap_for(bitset_cap: u32) -> u32 {
+    pub(crate) fn free_cap_for(bitset_cap: u32) -> u32 {
         FREE_STACK_MAX.min(bitset_cap)
     }
 
-    fn free_offset_for(bitset_cap: u32) -> usize {
+    pub(crate) fn free_offset_for(bitset_cap: u32) -> usize {
         let bitset_size = bitset_cap.div_ceil(8) as usize;
         (HEADER + bitset_size + 3) & !3 // AtomicU32 alignment
     }

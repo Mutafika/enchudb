@@ -3,6 +3,53 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.26.6 — 2026-09-04
+
+**0.26.4 の #246 ガードが sf の v8 DB を全件誤拒否していた regression の patch** (#257)。
+on-disk format は**不変**、 breaking なし、 公開 API の変更なし。 **0.26.4 / 0.26.5 で
+v8 / v9 → v10 の migrate を行う consumer は上げること** (sf の DB は `max_himos 4096` なので
+全件この形)。 移行済みの DB には影響しない。
+
+### Fixed — `migrate_v9_to_v10` が sf の v8 DB (max_himos 4096 / himo 117 / max_values 全 0) を「壊れている」と誤判定する (#257)
+
+0.26.4 は 「legacy header の himo 表の使用域が固定 4096 を越えていれば entities region を
+壊している」 と決め打ちして拒否した。 しかし sf の実 file (max_entities 524288 / max_himos
+4096 / himo 117) では、 越えた max_values 表 (packed 4352..4820) は **bitset の eid 1920〜5663
+の live bit に 0 を書いただけ**で、 そこに live entity が無ければ実害が無い。 同じ file を
+0.26.3 で migrate した結果は健全 (sinfo: 移行後 3 日の実運用、 `sf fsck` 0 bad / 0 mismatch /
+0 dangling、 本番 hub も 7 scope 移行して無事故) だった。 gate の fixture も max_himos 2048
+(sinfohub の shape) だけで、 sf の 4096 を検体に含めていなかった (#252 と同じ教訓)。
+
+判定を **「越えた範囲の実バイトが何を壊したか」** に作り直した (`check_legacy_himo_table_overlap`、
+`migrate_v9_to_v10` / `unpack_to_dir` / `from_bytes` の legacy 経路で共通):
+
+- 越えた範囲を entities region の layout (`[ENT1 header 16 B][bitset][free stack]`) で分類
+- ENT1 header (next_eid / live_count) に掛かる → 拒否 (旧 engine でも開けない形)
+- 越えた範囲に非 0 byte がある (= max_values や型を宣言していた) → bit / entry が信用できない
+  ので拒否
+- bitset に掛かる (全 0) → その eid 範囲で **bit=0 なのに非 0 の cell が残っている himo** が
+  あれば live bit を消された entity がいる → 拒否。 無ければ通す (delete は全 cell を消して
+  から eid を free するので、 正しく死んだ entity の cell は 0)
+- free stack に掛かる (全 0) → `count` 未満の entry を潰していれば free 済み eid が失われ
+  id 0 が再払い出しされる → 拒否。 count 以降 (未使用) なら通す
+- 通した file の結果は 0.26.3 と同一 (判定は読むだけで、 展開は触っていない)
+- 拒否 message の案内を 「旧 binary で export」 (v10 を書けないので行き先が無い) から
+  「source data から新 binary で作り直す / 数字を添えて issue」 に
+
+**検証**:
+- sf の実 file 2 本 (enchudb-lp / sinfo repo の v8 backup の clonefile 隔離コピー) の migrate が
+  通り、 entity 数が ENT1 header の live_count と一致 (118 / 9239)
+- gate 5 本: sf shape (bitset に 0、 entity 無し) が通る / 同 shape で潰された bit の範囲に live
+  entity がいた file は拒否 / free stack に掛かる shape (max_entities 1024) の通過と拒否 /
+  max_values を宣言していた file は拒否。 既存の 449 本 test は 「ENT1 header に掛かる」 として
+  拒否のまま。 cell 検査と free stack 検査を外すと拒否 test が落ちることを確認
+- `from_bytes` の legacy 経路で、 header 外に出た max_values entry を index out of range で
+  panic していたのも 0 として読むように
+
+**既知の残ギャップ**: 潰された bit の範囲に 「値を 1 つも持たない live entity」 がいた場合は
+検出できない (cell が全 0 なので死んだ entity と区別が付かない)。 その entity は移行後に
+死んだ扱いになる (旧 engine でも flush のたびに同じことが起きていた)。
+
 ## 0.26.5 — 2026-09-04
 
 **writer open の定数コストを畳んだ perf patch** (#255)。 on-disk format は**不変**、 migration

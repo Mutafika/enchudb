@@ -1130,6 +1130,123 @@ impl Engine {
         Ok(layout.total_size as u64)
     }
 
+    /// #246 / #257: 旧 1 ファイル layout (header 4096 固定、 entities region が 4096 から) で
+    /// himo 表 (型 1 B × max_himos の後ろに max_values 4 B × max_himos) が 4096 を越えていた
+    /// file について、 **実害があるか** を判定する。 旧 engine は define / flush のたびに
+    /// 定義済み hid までを bounds check 無しで書いていたので、 越えた分は entities region
+    /// (`[ENT1 header 16 B][bitset][free stack]`) を上書きしている。
+    ///
+    /// 0.26.4 は 「越えていれば壊れている」 と決め打ちして拒否したが、 sf の実 file
+    /// (max_entities 524288 / max_himos 4096 / himo 117 / max_values 全 0) では **bitset の
+    /// eid 1920〜5663 の bit に 0 を書いただけ**で、 そこに live entity が無ければ実害が無い
+    /// (#257)。 ここでは越えた範囲を layout で分類し、 本当に何かを壊した場合だけ拒否する:
+    ///
+    /// - ENT1 header (next_eid / live_count) に掛かる → 拒否
+    /// - 越えた範囲に非 0 byte がある (= max_values や型を宣言していた) → bit / entry が
+    ///   信用できないので拒否
+    /// - bitset に掛かる (全 0) → その eid 範囲で **bit=0 なのに非 0 の cell が残っている**
+    ///   himo があれば live bit を消された entity がいる → 拒否 (delete は全 cell を消してから
+    ///   eid を free するので、 正しく死んだ entity の cell は 0)
+    /// - free stack に掛かる (全 0) → `count` 未満の entry を潰していれば、 free 済み eid が
+    ///   失われて id 0 が再払い出しされる → 拒否。 count 以降 (未使用) なら無害
+    ///
+    /// `read(off, buf)` は packed 絶対 offset からの読み。 EOF 以降は 0 (#252 と同じ扱い)。
+    fn check_legacy_himo_table_overlap(
+        layout: &Layout,
+        max_himos: u32,
+        himo_count: u32,
+        read: &mut dyn FnMut(u64, &mut [u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let hs = HEADER_SIZE as u64;
+        let hc = himo_count as usize;
+        let maxv_base = himo_maxv_base(max_himos) as u64;
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for (a, b) in [
+            (H_HIMO_TYPES as u64, (H_HIMO_TYPES + hc) as u64),
+            (maxv_base, maxv_base + 4 * hc as u64),
+        ] {
+            let a = a.max(hs);
+            if b > a {
+                ranges.push((a, b));
+            }
+        }
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        let reject = |why: String| {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "legacy DB cannot be migrated automatically: {why} (#257, max_himos {max_himos} / \
+                     himo_count {himo_count}). rebuild this DB from its source data with the new \
+                     binary (re-index / re-import), or open an issue with these numbers for a manual repair"
+                ),
+            ))
+        };
+        let ent = layout.region_off(SegmentKind::Entities) as u64;
+        let ent_end = ent + layout.segment_size(SegmentKind::Entities) as u64;
+        let cap = layout.max_entities;
+        let bitset_lo = ent + crate::entity_set::HEADER_BYTES as u64;
+        let bitset_hi = bitset_lo + cap.div_ceil(8) as u64;
+        let free_off = ent + EntitySet::free_offset_for(cap) as u64;
+        let mut eid_ranges: Vec<(u32, u32)> = Vec::new();
+        for (a, b) in ranges {
+            if a < bitset_lo {
+                return reject(format!("the himo table overwrote the entity-set header at bytes [{a}, {b})"));
+            }
+            if b > ent_end {
+                return reject(format!("the himo table extends past the entity region ([{a}, {b}) vs end {ent_end})"));
+            }
+            let mut buf = vec![0u8; (b - a) as usize];
+            read(a, &mut buf)?;
+            if let Some(i) = buf.iter().position(|x| *x != 0) {
+                return reject(format!(
+                    "the himo table wrote non-zero bytes (declared max_values / types) over the entity set \
+                     at [{a}, {b}) (first at {}) — live bits / free entries there cannot be trusted",
+                    a + i as u64
+                ));
+            }
+            let lo = a.max(bitset_lo);
+            let hi = b.min(bitset_hi);
+            if hi > lo {
+                let e0 = ((lo - bitset_lo) * 8) as u32;
+                let e1 = ((hi - bitset_lo) * 8).min(cap as u64) as u32;
+                eid_ranges.push((e0, e1));
+            }
+            let first_entry = free_off + 4;
+            let lo = a.max(first_entry);
+            if b > lo {
+                let mut cnt = [0u8; 4];
+                read(free_off, &mut cnt)?;
+                let count = u32::from_le_bytes(cnt) as u64;
+                let first_idx = (lo - first_entry) / 4;
+                if first_idx < count {
+                    return reject(format!(
+                        "the himo table overwrote free-stack entries {first_idx}.. (count {count}) at [{lo}, {b}) — \
+                         freed entity ids there are lost and would be re-issued as id 0"
+                    ));
+                }
+            }
+        }
+        // bit を 0 に潰された eid に値が残っていれば、 それは live だった entity。
+        for (lo, hi) in eid_ranges {
+            let n = (hi - lo) as usize;
+            let mut cells = vec![0u8; n * 4];
+            for hid in 0..hc {
+                let col = layout.region_off(SegmentKind::Himo(hid as u32)) as u64 + crate::column::HEADER_BYTES as u64;
+                read(col + lo as u64 * 4, &mut cells)?;
+                if let Some(i) = cells.chunks_exact(4).position(|c| c != [0, 0, 0, 0]) {
+                    return reject(format!(
+                        "entity {} still holds a value in himo {} but its live bit (bitset byte {}) was overwritten \
+                         with 0 by the himo table — a live entity was destroyed",
+                        lo + i as u32, hid, (lo as u64 + i as u64) / 8
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// v10: packed 1 ファイル (v8 / v9 の単一 file DB も可) を directory `dst` に展開する。
     /// 各 region は data の載っている範囲だけ写す (sparse の穴は読まない)。 v8 / v9 の header
     /// は version を 10 に打ち直す。 `dst` は存在してはいけない。
@@ -1154,6 +1271,19 @@ impl Engine {
         let src_version = u32::from_le_bytes(fixed[H_VERSION..H_VERSION + 4].try_into().unwrap());
         let legacy = src_version != FILE_VERSION;
         let total = src.metadata()?.len();
+        if legacy {
+            let max_himos = u32::from_le_bytes(fixed[H_MAX_HIMOS..H_MAX_HIMOS + 4].try_into().unwrap());
+            let mut read_at = |off: u64, buf: &mut [u8]| -> io::Result<()> {
+                buf.fill(0);
+                if off >= total {
+                    return Ok(());
+                }
+                let n = ((total - off) as usize).min(buf.len());
+                src.seek(SeekFrom::Start(off))?;
+                src.read_exact(&mut buf[..n])
+            };
+            Self::check_legacy_himo_table_overlap(&layout, max_himos, himo_count, &mut read_at)?;
+        }
         // 必ず全域を読む region の末尾。 legacy はここまであれば残りは穴とみなせる (#252)。
         let must_have = if legacy {
             (layout.region_off(SegmentKind::Entities) + layout.segment_size(SegmentKind::Entities)) as u64
@@ -3728,23 +3858,6 @@ impl Engine {
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size,
         )?;
-        // #246: 旧 1 ファイル layout は header 4096 固定で entities region が 4096 から始まるのに、
-        // himo 表 (型 1 B × max_himos の後ろに max_values 4 B × max_himos) は max_himos > 約 960 で
-        // 4096 を越える。 旧 engine は define / flush のたびに **定義済み hid まで** を書いていた
-        // ので、 越えた分は entities bitset / free list に上書きされている = その file の entity
-        // 情報は既に壊れており、 migrate しても直らない。 黙って壊れた v10 を作らず拒否する。
-        if legacy_packed {
-            let used_end = himo_maxv_base(max_himos) + (himo_count as usize) * 4;
-            if used_end > HEADER_SIZE {
-                return Err(format!(
-                    "legacy header: himo table for {} himos (max_himos {}) ends at byte {} — past the \
-                     fixed {}-byte header and inside the entities region (#246). the entity bitset / \
-                     free list of this file were overwritten by himo metadata; migration cannot \
-                     recover it — export the data with the old binary instead",
-                    himo_count, max_himos, used_end, HEADER_SIZE,
-                ));
-            }
-        }
         let leaf_data_size = u64::from_le_bytes(buf[H_LEAF_DATA_SIZE..H_LEAF_DATA_SIZE + 8].try_into().unwrap()) as usize;
         let cell_version = version >= FILE_VERSION_LEGACY_V9
             && u32::from_le_bytes(buf[H_CELL_VERSION..H_CELL_VERSION + 4].try_into().unwrap()) != 0;
@@ -3974,6 +4087,23 @@ impl Engine {
                     n, layout.total_size,
                 ));
             }
+            // #257: legacy blob は himo 表が entities region に食い込んでいることがある
+            let version = u32::from_le_bytes(hdr[H_VERSION..H_VERSION + 4].try_into().unwrap());
+            if version != FILE_VERSION {
+                let max_himos = u32::from_le_bytes(hdr[H_MAX_HIMOS..H_MAX_HIMOS + 4].try_into().unwrap());
+                let data: &[u8] = backing.header_mut(n);
+                let mut read_at = |off: u64, buf: &mut [u8]| -> io::Result<()> {
+                    buf.fill(0);
+                    let off = off as usize;
+                    if off < data.len() {
+                        let k = (data.len() - off).min(buf.len());
+                        buf[..k].copy_from_slice(&data[off..off + k]);
+                    }
+                    Ok(())
+                };
+                Self::check_legacy_himo_table_overlap(&layout, max_himos, himo_count, &mut read_at)
+                    .map_err(|e| e.to_string())?;
+            }
         }
         let max_entities = u32::from_le_bytes(hdr[H_MAX_ENTITIES..H_MAX_ENTITIES + 4].try_into().unwrap());
         let max_himos = u32::from_le_bytes(hdr[H_MAX_HIMOS..H_MAX_HIMOS + 4].try_into().unwrap());
@@ -3987,7 +4117,15 @@ impl Engine {
         for hid in 0..himo_count as usize {
             type_bytes.push(hdr[H_HIMO_TYPES + hid]);
             let mv_off = maxv_base + hid * 4;
-            maxv_values.push(u32::from_le_bytes(hdr[mv_off..mv_off + 4].try_into().unwrap()));
+            // #257: legacy (固定 4096 header) では max_values 表が header の外 (= entities
+            // region) に出ていることがある。 その分は 0 として読む (max_values は hint なので
+            // 落として構わない。 実バイトの検査は `check_legacy_himo_table_overlap`)。
+            let mv = if mv_off + 4 <= hdr.len() {
+                u32::from_le_bytes(hdr[mv_off..mv_off + 4].try_into().unwrap())
+            } else {
+                0
+            };
+            maxv_values.push(mv);
         }
 
         // ── page-reclaim instrumentation (issue2 調査) ──
@@ -16053,9 +16191,10 @@ mod v10_dir_tests {
         let packed = format!("{path}.packed");
         Engine::pack_dir(path, std::path::Path::new(&packed)).unwrap();
         // v10 packed (可変長 header) → legacy (固定 4096 header): header の余分を切り落とす
-        let v10_hs = header_size_for(LEGACY_TEST_MAX_HIMOS);
-        assert!(v10_hs > HEADER_SIZE, "test must exercise the variable-length header");
         let bytes = std::fs::read(&packed).unwrap();
+        let max_himos = u32::from_le_bytes(bytes[H_MAX_HIMOS..H_MAX_HIMOS + 4].try_into().unwrap());
+        let v10_hs = header_size_for(max_himos);
+        assert!(v10_hs > HEADER_SIZE, "test must exercise the variable-length header");
         let mut legacy = Vec::with_capacity(bytes.len() - (v10_hs - HEADER_SIZE));
         legacy.extend_from_slice(&bytes[..HEADER_SIZE]);
         legacy.extend_from_slice(&bytes[v10_hs..]);
@@ -16229,13 +16368,157 @@ mod v10_dir_tests {
         assert_eq!(eng.himo_count(), 448);
     }
 
+    /// max_himos 2048 で 449 本目の max_values entry は packed offset 4096 = ENT1 header の
+    /// magic に当たる。 header を潰した file は旧 engine でも開けないので、 一律拒否でよい。
     #[test]
-    fn migrate_rejects_legacy_himo_table_overlapping_entities() {
+    fn migrate_rejects_legacy_himo_table_overlapping_entity_header() {
         let (dst, r) = migrate_legacy_with_himos("mig_himo449", 449);
         let err = r.err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
-        assert!(err.to_string().contains("#246"), "{err}");
+        assert!(err.to_string().contains("#257") && err.to_string().contains("entity-set header"), "{err}");
         assert!(!std::path::Path::new(&dst).exists(), "failed migrate must not leave a dst dir");
+    }
+
+    /// #257 の fixture: `max_entities` / `max_himos` を指定し、 Number himo を `himos` 本、
+    /// entity を `entities` 個 (himo 0 に値付き) 作り、 先頭 `deletes` 個を delete して legacy
+    /// 1 ファイル化する。 戻り値は (packed path, 生き残った (eid, value))。
+    fn legacy_fixture(
+        name: &str, max_entities: u32, max_himos: u32, himos: usize, entities: u32, deletes: u32,
+    ) -> (String, Vec<(enchudb_oplog::EntityId, u32)>) {
+        let path = tmp(name);
+        let mut eng = Engine::create_growable_opts(
+            &path,
+            GrowableOptions {
+                max_entities,
+                max_himos,
+                vocab_data_size: 1 << 20,
+                content_data_size: Some(1 << 20),
+                leaf_data_size: Some(1 << 20),
+                reserve_entities: Some(max_entities),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        eng.define_table("t", max_entities).unwrap();
+        for h in 0..himos {
+            eng.define_himo_in("t", &format!("h{h}"), ValueType::Number, 0).unwrap();
+        }
+        let mut rows = Vec::new();
+        for i in 0..entities {
+            let e = eng.entity_in("t").unwrap();
+            eng.tie(e, "t.h0", 100 + i);
+            rows.push((e, 100 + i));
+        }
+        for (e, _) in rows.drain(..deletes as usize) {
+            eng.delete(e);
+        }
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        drop(eng);
+        let eng = Engine::open(&path).unwrap();
+        eng.flush_writes();
+        drop(eng);
+        let packed = make_legacy_single_file(&path, FILE_VERSION_LEGACY_V8);
+        let _ = std::fs::remove_dir_all(&path);
+        (packed, rows)
+    }
+
+    /// 旧 engine が max_values 表 (全 0) を書いた跡を再現する: packed offset
+    /// `[maxv_base, maxv_base + 4 × himo_count)` を 0 で潰す。
+    fn overwrite_legacy_maxv_table_with_zeros(packed: &str) -> (u64, u64) {
+        use std::io::{Seek, SeekFrom, Write};
+        let bytes = std::fs::read(packed).unwrap();
+        let max_himos = u32::from_le_bytes(bytes[H_MAX_HIMOS..H_MAX_HIMOS + 4].try_into().unwrap());
+        let himo_count = u32::from_le_bytes(bytes[H_HIMO_COUNT..H_HIMO_COUNT + 4].try_into().unwrap());
+        let a = himo_maxv_base(max_himos) as u64;
+        let b = a + 4 * himo_count as u64;
+        let mut f = OpenOptions::new().write(true).open(packed).unwrap();
+        f.seek(SeekFrom::Start(a)).unwrap();
+        f.write_all(&vec![0u8; (b - a) as usize]).unwrap();
+        (a, b)
+    }
+
+    /// sf の実 file shape (#257): max_himos 4096 / himo 117 / max_values 全 0。 max_values 表は
+    /// packed 4352..4820 = bitset の eid 1920〜5663 に 0 を書くが、 そこに entity が無ければ実害無し。
+    #[test]
+    fn migrate_accepts_sf_shape_zero_max_values_over_empty_bitset() {
+        let (packed, rows) = legacy_fixture("mig257_sf", 8192, 4096, 117, 300, 0);
+        assert!(rows.iter().all(|(e, _)| enchudb_oplog::eid_local(*e) < 1920), "fixture must keep entities below the overwritten bits");
+        let (a, b) = overwrite_legacy_maxv_table_with_zeros(&packed);
+        assert_eq!((a, b), (4352, 4820), "sf shape");
+        let dst = format!("{packed}.dst");
+        let _ = std::fs::remove_dir_all(&dst);
+        Engine::migrate_v9_to_v10(&packed, &dst).unwrap();
+        let eng = Engine::open(&dst).unwrap();
+        assert_eq!(eng.himo_count(), 117);
+        assert_eq!(eng.entity_count(), rows.len() as u32);
+        for (e, v) in &rows {
+            assert_eq!(eng.get(*e, "t.h0"), Some(*v));
+        }
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    /// 同 shape で、 潰された bit の範囲に live entity がいた file: cell に値が残っているのに
+    /// bit が 0 = live entity を消している → 拒否。
+    #[test]
+    fn migrate_rejects_sf_shape_when_overwritten_bits_held_live_entities() {
+        let (packed, rows) = legacy_fixture("mig257_live", 8192, 4096, 117, 3000, 0);
+        assert!(rows.iter().any(|(e, _)| (1920..5664).contains(&enchudb_oplog::eid_local(*e))), "fixture must place entities under the overwritten bits");
+        overwrite_legacy_maxv_table_with_zeros(&packed);
+        let dst = format!("{packed}.dst");
+        let _ = std::fs::remove_dir_all(&dst); // `tmp()` は `.packed.dst` を掃除しない
+        let err = Engine::migrate_v9_to_v10(&packed, &dst).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().contains("#257") && err.to_string().contains("live entity"), "{err}");
+        assert!(!std::path::Path::new(&dst).exists());
+    }
+
+    /// max_entities が小さいと bitset が短く、 max_values 表は free stack に掛かる
+    /// (max_entities 1024: bitset 128 B → entry 27〜144)。 free が無ければ (count 0) 無害。
+    #[test]
+    fn migrate_accepts_zero_max_values_over_unused_free_stack() {
+        let (packed, rows) = legacy_fixture("mig257_fs_ok", 1024, 4096, 117, 200, 0);
+        overwrite_legacy_maxv_table_with_zeros(&packed);
+        let dst = format!("{packed}.dst");
+        let _ = std::fs::remove_dir_all(&dst);
+        Engine::migrate_v9_to_v10(&packed, &dst).unwrap();
+        let eng = Engine::open(&dst).unwrap();
+        assert_eq!(eng.entity_count(), rows.len() as u32);
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    /// 同 shape で free stack に 150 entry (delete 150 個) があった file: entry 27〜144 が 0 に
+    /// 潰されて id 0 が再払い出しされる → 拒否。
+    #[test]
+    fn migrate_rejects_zero_max_values_over_used_free_stack() {
+        let (packed, _rows) = legacy_fixture("mig257_fs_ng", 1024, 4096, 117, 200, 150);
+        overwrite_legacy_maxv_table_with_zeros(&packed);
+        let dst = format!("{packed}.dst");
+        let _ = std::fs::remove_dir_all(&dst);
+        let err = Engine::migrate_v9_to_v10(&packed, &dst).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().contains("#257") && err.to_string().contains("free-stack"), "{err}");
+        assert!(!std::path::Path::new(&dst).exists());
+    }
+
+    /// max_values を宣言していた file は越えた範囲に非 0 が並ぶ = bit / entry が信用できない → 拒否。
+    #[test]
+    fn migrate_rejects_nonzero_max_values_over_entity_set() {
+        let (packed, _rows) = legacy_fixture("mig257_nz", 8192, 4096, 117, 300, 0);
+        // 旧 engine が max_values = 7 を書いた跡
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = OpenOptions::new().write(true).open(&packed).unwrap();
+            f.seek(SeekFrom::Start(himo_maxv_base(4096) as u64)).unwrap();
+            f.write_all(&7u32.to_le_bytes()).unwrap();
+        }
+        let dst = format!("{packed}.dst");
+        let _ = std::fs::remove_dir_all(&dst);
+        let err = Engine::migrate_v9_to_v10(&packed, &dst).err().unwrap();
+        assert!(err.to_string().contains("#257") && err.to_string().contains("non-zero"), "{err}");
+        assert!(!std::path::Path::new(&dst).exists());
     }
 
     /// #252 の裏: v10 packed (`pack_dir` 産) は常に `total_size` 長なので、 短いものは
