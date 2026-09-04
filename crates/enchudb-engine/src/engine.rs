@@ -8715,10 +8715,14 @@ impl Engine {
             self.himo_to_table[hid as usize].load(std::sync::atomic::Ordering::Relaxed);
         let entry = (hid, target_tid);
         let owner = &mut self.tables[owner_tid as usize];
+        // persist は entry を**新規に**足した時だけ。 idempotent な再登録 (schema crate の
+        // `load_schema` が rw open のたびに全 relation を通す) で毎回 sidecar を fsync すると、
+        // relation 数 × ~6 ms (APFS) が **open の定数コスト**になる (kenning: 8 本で ~50 ms、
+        // 書き込み 0 でも `tables` の mtime が動く)。 既存 entry なら disk と一致済み。
         if !owner.fk_refs.iter().any(|e| *e == entry) {
             owner.fk_refs.push(entry);
+            self.try_persist_tables();
         }
-        self.try_persist_tables();
         Ok(hid)
     }
 
