@@ -1659,54 +1659,6 @@ use crate::content_store::ContentStore;
 use crate::leaf_store::{LeafRead, LeafStore, cap_bytes_for_shift, MAX_OFF_SHIFT};
 use crate::column::Column;
 
-// ════════════════ ギャロッピング交差 ════════════════
-// 旧 query 経路で使っていた。将来再利用の余地あり。
-
-#[allow(dead_code)]
-#[inline]
-fn galloping_intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
-    let (small, big) = if a.len() <= b.len() { (a, b) } else { (b, a) };
-    if small.is_empty() { return vec![]; }
-    let mut result = Vec::with_capacity(small.len());
-    let mut lo = 0usize;
-    for &val in small {
-        lo = gallop_ge(big, val, lo);
-        if lo >= big.len() { break; }
-        if big[lo] == val { result.push(val); lo += 1; }
-    }
-    result
-}
-
-#[allow(dead_code)]
-#[inline]
-fn gallop_ge(big: &[u32], val: u32, lo: usize) -> usize {
-    let n = big.len();
-    if lo >= n { return n; }
-    if big[lo] >= val { return lo; }
-    let mut step = 1usize;
-    let mut hi = lo + step;
-    while hi < n && big[hi] < val { step *= 2; hi = (lo + step).min(n); }
-    let from = lo + step / 2;
-    let to = hi.min(n);
-    from + big[from..to].partition_point(|&x| x < val)
-}
-
-/// bitmap から set bit の entity ID を抽出。
-#[allow(dead_code)]
-#[inline]
-fn extract_bitmap(bitmap: &[u64]) -> Vec<u32> {
-    let mut result = Vec::new();
-    for (i, &word) in bitmap.iter().enumerate() {
-        let mut w = word;
-        while w != 0 {
-            let bit = w.trailing_zeros();
-            result.push((i * 64 + bit as usize) as u32);
-            w &= w - 1;
-        }
-    }
-    result
-}
-
 // ════════════════ ファイルレイアウト ════════════════
 
 const FILE_MAGIC: [u8; 4] = *b"ECDB";
@@ -2498,17 +2450,6 @@ impl SegmentSizes for Layout {
             SegmentKind::Tomb => self.tomb_reserve,
             _ => self.segment_size(kind),
         }
-    }
-}
-
-impl Layout {
-    #[allow(dead_code)]
-    fn himo_cyl_a_off(&self, hid: usize) -> usize {
-        self.himo_base_off + hid * self.himo_slot_size + self.himo_col_size
-    }
-    #[allow(dead_code)]
-    fn himo_cyl_b_off(&self, hid: usize) -> usize {
-        self.himo_base_off + hid * self.himo_slot_size + self.himo_col_size + self.himo_cyl_size
     }
 }
 
@@ -10963,8 +10904,6 @@ impl Engine {
         fields
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn vocab(&self) -> &Vocabulary { &self.vocab }
     pub fn himo_names(&self) -> &[String] { self.himo_names.as_slice() }
 
     /// himo ごとの宣言 `max_values` (`define_himo` に渡した値)。
@@ -11074,38 +11013,6 @@ impl Engine {
         // query_by_id / entities_with_himo と同じ make_eid(peer, e) で揃える。
         let peer = self.peer_id();
         out.into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect()
-    }
-
-    /// Cylinder 結果に delta を適用。
-    #[allow(dead_code)]
-    fn apply_delta(&self, himo_idx: usize, value: u32, cyl_result: &[u32], delta_eids: &[u32]) -> Vec<u32> {
-        let hs = &self.himos[himo_idx];
-
-        // delta の eid を集合にする（重複排除 + 高速lookup）
-        let mut dirty: Vec<u32> = delta_eids.to_vec();
-        dirty.sort_unstable();
-        dirty.dedup();
-
-        // Cylinder 結果から dirty eid を除外（Cylinder の値は古い可能性）
-        let mut result: Vec<u32> = if dirty.is_empty() {
-            cyl_result.to_vec()
-        } else {
-            cyl_result.iter()
-                .filter(|&&eid| dirty.binary_search(&eid).is_err())
-                .copied()
-                .collect()
-        };
-
-        // dirty eid を Column 直読みで補正
-        for &eid in &dirty {
-            if hs.get_value(eid) == Some(value) {
-                result.push(eid);
-            }
-        }
-
-        result.sort_unstable();
-        result.dedup();
-        result
     }
 
     pub fn query(&self, strings: &[(&str, u32)]) -> Vec<enchudb_oplog::EntityId> {
