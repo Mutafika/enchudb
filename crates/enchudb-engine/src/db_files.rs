@@ -163,6 +163,75 @@ fn physical_bytes(m: &std::fs::Metadata) -> u64 {
     m.len()
 }
 
+/// sidecar を atomic に置き換える (tmp write → fsync → rename)。 **内容が現行と
+/// 同じなら何も書かない** (#261)。
+///
+/// `tables` / `eidmap` / `vocabmap` / `schema` が同じ手順を踏むので 1 箇所に寄せてある。
+/// tmp 名は `{sidecar}.tmp` (= sidecar ごとに別名) なので、 同時 persist しても
+/// 互いの tmp を踏まない。
+///
+/// rename は **新しい inode** を置くので、 呼び出し側が chmod した mode は放っておくと
+/// umask 由来 (典型的には 0644) に戻る。 consumer が DB を締めている前提を壊さないよう、
+/// 置き換え前の mode を tmp に写してから rename する (無ければ umask のまま)。
+///
+/// #261: 「書き込みゼロで開いて閉じただけ」 の session でも `Database` / `Engine` の Drop が
+/// sidecar を書き直しており、 その fsync (APFS で ~6〜8 ms) が 1 コマンド 1 process の
+/// 消費側に定数として乗っていた。 dirty flag を各層に足す代わりに、 **書く直前に現行
+/// file と読み比べて同一なら skip** する。 memory 上の flag と違って別 process が
+/// 書き換えていた場合も検出でき、 「flag の立て忘れ = silent な永続化漏れ」 も起こらない。
+/// sidecar はどれも小さく page cache に載っているので、 比較の read は fsync より 3 桁安い。
+///
+/// 戻り値は **実際に書いたか** (false = 内容一致で skip)。
+#[cfg(not(target_arch = "wasm32"))]
+pub fn write_atomic_if_changed(sidecar: &Path, bytes: &[u8]) -> io::Result<bool> {
+    use std::io::Write;
+    if is_unchanged(sidecar, bytes) {
+        return Ok(false);
+    }
+    let tmp_path = tmp_path_for(sidecar);
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    inherit_mode(sidecar, &tmp_path);
+    std::fs::rename(&tmp_path, sidecar)?;
+    Ok(true)
+}
+
+/// 現行 sidecar が `bytes` と完全一致か。 不在 / 読めない / 長さ違いは false
+/// (= 書く方に倒す)。 長さを先に見るので、 違う内容で read が走ることはまず無い。
+#[cfg(not(target_arch = "wasm32"))]
+fn is_unchanged(sidecar: &Path, bytes: &[u8]) -> bool {
+    match std::fs::metadata(sidecar) {
+        Ok(md) if md.len() == bytes.len() as u64 => {}
+        _ => return false,
+    }
+    matches!(std::fs::read(sidecar), Ok(cur) if cur == bytes)
+}
+
+/// `from` が既にあればその mode を `to` に写す。 mode が取れない / 設定できない環境
+/// (Windows、 権限不足) では黙って諦める — 内容の永続化を mode の都合で失敗させない。
+#[cfg(not(target_arch = "wasm32"))]
+fn inherit_mode(from: &Path, to: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(md) = std::fs::metadata(from) {
+            let mode = md.permissions().mode() & 0o777;
+            let _ = std::fs::set_permissions(to, std::fs::Permissions::from_mode(mode));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (from, to);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +257,48 @@ mod tests {
         assert!(!is_copyable_entry(OsStr::new("lock")));
         assert!(!is_copyable_entry(OsStr::new("tables.tmp")));
         assert!(!is_copyable_entry(OsStr::new("a.bootstrap.packed")));
+    }
+
+    /// #261: 同一内容なら write ごと skip する (= fsync を払わない)。
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write_atomic_skips_identical_content() {
+        let root = std::env::temp_dir().join(format!("enchu_sidecar_gate_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let sc = root.join(TABLES);
+
+        // 不在 → 書く
+        assert!(write_atomic_if_changed(&sc, b"abc").unwrap());
+        assert_eq!(std::fs::read(&sc).unwrap(), b"abc");
+        let mtime = std::fs::metadata(&sc).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // 同一内容 → 書かない (mtime も動かない)
+        assert!(!write_atomic_if_changed(&sc, b"abc").unwrap());
+        assert_eq!(std::fs::metadata(&sc).unwrap().modified().unwrap(), mtime);
+        // tmp を残さない
+        assert!(!tmp_path_for(&sc).exists());
+
+        // 長さ同じ / 中身違い → 書く (長さ比較だけで済ませていないことの確認)
+        assert!(write_atomic_if_changed(&sc, b"abd").unwrap());
+        assert_eq!(std::fs::read(&sc).unwrap(), b"abd");
+        // 長さ違い → 書く
+        assert!(write_atomic_if_changed(&sc, b"abdefg").unwrap());
+        assert_eq!(std::fs::read(&sc).unwrap(), b"abdefg");
+
+        // skip でも mode は維持される (書かないので当然だが、 契約として固定)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sc, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(!write_atomic_if_changed(&sc, b"abdefg").unwrap());
+            assert_eq!(std::fs::metadata(&sc).unwrap().permissions().mode() & 0o777, 0o600);
+            // 書いた場合も rename 先の mode を引き継ぐ
+            assert!(write_atomic_if_changed(&sc, b"zzz").unwrap());
+            assert_eq!(std::fs::metadata(&sc).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
