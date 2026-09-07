@@ -1109,26 +1109,19 @@ fn schema_sidecar_path_for(db_path: &str) -> std::path::PathBuf {
 
 /// 0.8.7: tables の serialize_schema 出力を `.schema` sidecar に atomic write。
 /// tmp file → fsync → rename で crash-safe。
+///
+/// #261: 実体は engine 側の [`enchudb_engine::db_files::write_atomic_if_changed`] に
+/// 寄せた (同じ手順を 2 crate で書いていたのを 1 本に)。 内容が現行 `.schema` と同じ
+/// なら書かないので、 schema をいじらずに開いて閉じただけの rw session は fsync を
+/// 払わない。 戻り値は 「実際に書いたか」。
 #[cfg(not(target_arch = "wasm32"))]
 fn persist_schema_to_sidecar(
     db_path: &str,
     tables: &[Arc<TableInner>],
-) -> std::io::Result<()> {
-    use std::io::Write;
+) -> std::io::Result<bool> {
     let sidecar = schema_sidecar_path_for(db_path);
-    let tmp = enchudb_engine::db_files::tmp_path_for(&sidecar);
     let bytes = serialize_schema(tables);
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)?;
-        f.write_all(bytes.as_bytes())?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, &sidecar)?;
-    Ok(())
+    enchudb_engine::db_files::write_atomic_if_changed(&sidecar, bytes.as_bytes())
 }
 
 /// 0.8.7: `.schema` sidecar を読む。 不在は Ok(None)、 parse 失敗は Err。
