@@ -3,6 +3,59 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.26.8 — 2026-09-07
+
+**書き込みゼロの rw session が払っていた drop の定数コストを畳んだ perf patch** (#261、
+kenning からの報告)。 on-disk format は**不変**、 breaking なし、 公開 API は追加のみ
+(`db_files::write_atomic_if_changed`)。 **1 コマンド 1 process で `Database` / `Engine` を
+rw open する consumer は上げること** (kenning の増分 update、 `sf` の書き込み系)。
+0.26.7 の 「残る定数」 として挙げていたものがこれ。
+
+### Performance — 無変更でも Drop が sidecar を fsync 付きで書き直していた (#261)
+
+schema 層の `Database` (rw) を **1 byte も書かずに drop** しても 15〜21 ms 払っていた
+(engine 5〜10 / readonly 0.2)。 `impl Drop for Database` が無条件に `persist_schema()`
+→ `.schema` fsync + `Engine::flush()` を呼び、 さらに `Engine::drop` が
+`try_persist_tables` + `sync_and_mark_clean` を**もう一度**やる。 schema にも engine にも
+「open 以降に何か変えたか」 の情報が無く、 読んで閉じただけの session が sidecar の
+fsync (APFS ~6〜8 ms) を毎回払っていた。 #259 (0.26.7) で rw open が 0.8 ms になった後は、
+これが残る最大の定数だった。
+
+各層に dirty flag を足す代わりに、 **書く直前に現行 file と読み比べて同一なら skip** する
+(`db_files::write_atomic_if_changed`)。 flag より安全側:
+
+- 立て忘れによる silent な永続化漏れが原理的に起きない (#117 の失敗モード)
+- 別 process が sidecar を書き換えていた場合も検出できる
+- 「変えて戻した」 も正しく skip になる
+- 比較の read は page cache 上で、 fsync より 3 桁安い
+
+同時に、 tmp → fsync → rename の同じ手順を engine (`atomic_write_sidecar`) と schema
+(`persist_schema_to_sidecar`) の 2 crate に書いていたのを 1 本に寄せた。 副次的に `.schema`
+も mode 継承が効くようになる。 `finish_*` 経由 (ManuallyDrop) は別経路なので影響なし。
+
+| drop (実 DB の隔離コピー、 release、 median) | 0.26.7 | 0.26.8 |
+|---|---:|---:|
+| kenning (136 entity / 96 himo / 16 table): `Database::open` (rw、 書き込みなし) | 18.2 ms | **1.1 ms** |
+| kenning: `Engine::open_standalone` | 11.2 ms | **0.5 ms** |
+| sinfo (9282 entity / 117 himo / 19 table): `Database::open` (rw、 書き込みなし) | 20.7 ms | **1.6 ms** |
+| sinfo: `Engine::open_standalone` | 7.0 ms | **1.1 ms** |
+| 参考: `Database::open_readonly` (両者) | 0.3 ms | 0.2 ms |
+
+書き込みゼロの rw open → drop で `schema` / `tables` の mtime が動かなくなった (= 書き直して
+いない)。 目標だった 「readonly 並み (~1 ms)」 を満たす。
+
+**検証**: gate 2 系統 — `db_files` の単体 (不在 / 同一 / 同長異内容 / 異長 / mode 継承) と
+schema 層の統合 3 本 (書き込みゼロ session は sidecar 不変 / schema 変更は `schema` を書く /
+行追加は `tables` を書く)。 最後の 1 本は、 next_local が進むのに skip すると #117 と同じ
+silent 破壊になるため。 gate を無効化すると狙った 2 本だけが落ちる。 workspace 全体
+1140 tests green。 `examples/schema_drop_bench.rs` を追加 (#255 の `rw_open_bench` と同格、
+引数に DB path を渡せば既存 DB でも測れる)。
+
+**残る定数 (別 issue 候補)**: rw drop の 1.1〜1.6 ms は `sync_and_mark_clean` (msync ×2 +
+segment ごとの stat) が `Engine::flush()` と `Engine::drop` で 2 回走る分。 fsync が無いので
+桁が違う。 潰すには engine 側に 「open 以降に書いたか」 の追跡が要り、 それは write path
+全部に hook を刺す話 (= 刺し忘れが silent な永続化漏れ) なので、 別テーマとして分ける。
+
 ## 0.26.7 — 2026-09-04
 
 **schema 層の rw open の定数コストを畳んだ perf patch** (#259、 kenning からの報告)。 on-disk
