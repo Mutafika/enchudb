@@ -8704,8 +8704,24 @@ impl Engine {
 
     pub fn tie_text(&mut self, eid: enchudb_oplog::EntityId, himo: &str, value: &str) {
         self.check_writable();
-        let eid = enchudb_oplog::eid_local(eid);
         let hid = self.ensure_himo(himo, ValueType::Tag, 0);
+        self.tie_text_by_id(eid, hid as u16, value);
+    }
+
+    /// #264: `tie_text` の himo_id 直指定版 (build phase = `&mut self`)。
+    ///
+    /// `&self` 系の [`Engine::tie_text_to_by_id`] と違い、 **build phase の検証を保つ**:
+    /// `validate_eid_for_himo` は release でも効き、 `himo_is_in_engine_internal_table`
+    /// のような per-tie の追加判定も踏まない。 himo が未定義でも **定義しない** ので、
+    /// id は `define_himo*` / `himo_id(&str)` で先に取っておくこと。
+    ///
+    /// 名前 lookup ([`Engine::himo_id`]) は線形走査で、 定義順が良ければ数 ns。 #264 の
+    /// 実測では 72M tie のフルリビルドに対して合計 0.115 % で、 **性能のために乗り換える
+    /// 必要は無い**。 これがあるのは `&self` 系と API を揃えるため。
+    pub fn tie_text_by_id(&mut self, eid: enchudb_oplog::EntityId, himo_id: u16, value: &str) {
+        self.check_writable();
+        let eid = enchudb_oplog::eid_local(eid);
+        let hid = himo_id as usize;
         // β-light step 6: eid が himo の所属 table eid_range 内か
         self.validate_eid_for_himo(hid, eid);
         // v6 (#88): Leaf は LeafStore へ。 &mut self (build phase) は WAL emit しない
@@ -8732,7 +8748,10 @@ impl Engine {
         let vid = match self.value_types[hid] {
             ValueType::Tag => self.vocab.get_or_insert(value.as_bytes()),
             ValueType::Leaf => self.vocab.insert(value.as_bytes()),
-            ht => panic!("tie_text on non-text himo '{}': {:?}", himo, ht),
+            ht => panic!(
+                "tie_text on non-text himo '{}': {:?}",
+                self.himo_name_at(hid).unwrap_or("<unknown>"), ht
+            ),
         };
         if vid == u32::MAX {
             // #59: vocab 満杯 → `insert`/`get_or_insert` が予約 sentinel を返した。
@@ -8751,17 +8770,27 @@ impl Engine {
 
     pub fn tie(&mut self, eid: enchudb_oplog::EntityId, himo: &str, value: u32) {
         self.check_writable();
-        let eid = enchudb_oplog::eid_local(eid);
-        if value == u32::MAX {
-            // #59: sentinel 値は cell に入らない。 panic せず write を拒否 + 計上。
-            self.record_fault(
-                FaultKind::ValueOutOfRange,
-                "tie value == u32::MAX (sentinel reserved)",
-            );
+        // sentinel は himo を定義する前に弾く (拒否された write で himo が生えない)。
+        if self.reject_sentinel(value, "tie value == u32::MAX (sentinel reserved)") {
             return;
         }
         let hid = self.ensure_himo(himo, ValueType::Number, 0);
-        debug_assert!(self.value_types[hid] == ValueType::Number || self.value_types[hid] == ValueType::Ref, "tie on non-Value himo '{}'", himo);
+        self.tie_by_id(eid, hid as u16, value);
+    }
+
+    /// #264: `tie` の himo_id 直指定版 (build phase = `&mut self`)。
+    /// 契約は [`Engine::tie_text_by_id`] と同じ (検証を保つ / himo は定義しない)。
+    pub fn tie_by_id(&mut self, eid: enchudb_oplog::EntityId, himo_id: u16, value: u32) {
+        self.check_writable();
+        let eid = enchudb_oplog::eid_local(eid);
+        if self.reject_sentinel(value, "tie value == u32::MAX (sentinel reserved)") {
+            return;
+        }
+        let hid = himo_id as usize;
+        debug_assert!(
+            self.value_types[hid] == ValueType::Number || self.value_types[hid] == ValueType::Ref,
+            "tie on non-Value himo '{}'", self.himo_name_at(hid).unwrap_or("<unknown>")
+        );
         // β-light step 6: eid が himo の所属 table eid_range 内か
         self.validate_eid_for_himo(hid, eid);
         // β-light step 5: Ref himo は target_table の eid range を validate
@@ -8771,22 +8800,50 @@ impl Engine {
 
     pub fn tie_ref(&mut self, eid: enchudb_oplog::EntityId, himo: &str, target_eid: enchudb_oplog::EntityId) {
         self.check_writable();
-        let eid = enchudb_oplog::eid_local(eid);
-        let target_eid = enchudb_oplog::eid_local(target_eid);
-        if target_eid == u32::MAX {
-            self.record_fault(
-                FaultKind::ValueOutOfRange,
-                "tie_ref target_eid >= u32::MAX (sentinel reserved)",
-            );
+        // sentinel は himo を定義する前に弾く (拒否された write で himo が生えない)。
+        let target_local = enchudb_oplog::eid_local(target_eid);
+        if self.reject_sentinel(target_local, "tie_ref target_eid >= u32::MAX (sentinel reserved)") {
             return;
         }
         let hid = self.ensure_himo(himo, ValueType::Ref, 0);
-        debug_assert!(self.value_types[hid] == ValueType::Ref || self.value_types[hid] == ValueType::Number, "tie_ref on non-Ref himo '{}'", himo);
+        self.tie_ref_by_id(eid, hid as u16, target_eid);
+    }
+
+    /// #264: `tie_ref` の himo_id 直指定版 (build phase = `&mut self`)。
+    /// 契約は [`Engine::tie_text_by_id`] と同じ (検証を保つ / himo は定義しない)。
+    pub fn tie_ref_by_id(
+        &mut self,
+        eid: enchudb_oplog::EntityId,
+        himo_id: u16,
+        target_eid: enchudb_oplog::EntityId,
+    ) {
+        self.check_writable();
+        let eid = enchudb_oplog::eid_local(eid);
+        let target_eid = enchudb_oplog::eid_local(target_eid);
+        if self.reject_sentinel(target_eid, "tie_ref target_eid >= u32::MAX (sentinel reserved)") {
+            return;
+        }
+        let hid = himo_id as usize;
+        debug_assert!(
+            self.value_types[hid] == ValueType::Ref || self.value_types[hid] == ValueType::Number,
+            "tie_ref on non-Ref himo '{}'", self.himo_name_at(hid).unwrap_or("<unknown>")
+        );
         // β-light step 6: eid が himo の所属 table eid_range 内か
         self.validate_eid_for_himo(hid, eid);
         // β-light step 5: target_eid が target_table の eid range 内か
         self.validate_ref_tie(hid, target_eid);
         self.himos[hid].set(eid, target_eid);
+    }
+
+    /// #59: sentinel (`u32::MAX`) は cell に入らない。 panic せず write を拒否 + 計上して
+    /// true を返す (呼び出し側はそのまま return する)。 `tie` / `tie_ref` の名前版と
+    /// id 版で同じ判定を使うための共通化。
+    fn reject_sentinel(&self, value: u32, what: &str) -> bool {
+        if value != u32::MAX {
+            return false;
+        }
+        self.record_fault(FaultKind::ValueOutOfRange, what);
+        true
     }
 
     // ──── tie（定義済み紐、&self で並行書き込み可）────
@@ -8799,8 +8856,8 @@ impl Engine {
         self.tie_text_to_by_id(eid, hid, value);
     }
 
-    /// `tie_text_to` の himo_id 直指定版。 hot path で per-call の HashMap lookup を
-    /// 避けたい時に。 起動時に `himo_id(&str)` で解決して u16 を cache しておく。
+    /// `tie_text_to` の himo_id 直指定版。 hot path 用 (per-call の string lookup を消す)。
+    /// 起動時に `himo_id(&str)` で解決して u16 を cache しておく。
     pub fn tie_text_to_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: &str) {
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
@@ -11075,6 +11132,11 @@ impl Engine {
     // ──── himo 管理 ────
 
     /// 紐名 → インデックス。線形探索（紐数は高々数百）。
+    ///
+    /// #265: HashMap ではないので、 **コストは himo の定義順に依存する**
+    /// (`position` は先頭一致で返る)。 名前 lookup が効く hot path があるなら、
+    /// 頻度の高い himo を先に `define_himo` するだけで縮む。 それでも足りなければ
+    /// `*_by_id` 系に u16 を渡す。
     #[inline]
     pub fn himo_id(&self, himo: &str) -> Option<usize> {
         self.himo_names.iter().position(|n| n == himo)
@@ -12381,7 +12443,7 @@ impl Engine {
     }
 
     /// `tie_async` の himo_id 直指定版。 SNS の post / like 投入のように row/sec が KO
-    /// 単位の hot path 用 (per-call の `himo_id(&str)` HashMap lookup を消す)。
+    /// 単位の hot path 用 (per-call の `himo_id(&str)` string lookup を消す)。
     /// 起動時に `himo_id(&str)` で u16 を 1 回引いて cache し、 hot loop で繰り返し使う想定。
     pub fn tie_async_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: u32) {
         use std::sync::atomic::Ordering;
