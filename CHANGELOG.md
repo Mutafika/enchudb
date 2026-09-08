@@ -3,6 +3,48 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.26.9 — 2026-09-08
+
+**build phase の tie に `*_by_id` を足し、 `himo_id` の doc の嘘を直した patch** (#264 / #265、
+どちらも naruhodo からの報告)。 on-disk format は**不変**、 breaking なし、 公開 API は
+**追加のみ**。 既存 consumer は上げなくても壊れない — build phase (`&mut self`) で tie する
+consumer が API の対称性を必要とする場合だけ。
+
+### Added — build phase (`&mut self`) の tie に `*_by_id` (#264)
+
+`*_by_id` は `&self` 系 (`tie_to_by_id` / `tie_text_to_by_id` / `tie_ref_to_by_id`) にしか
+生えておらず、 build phase の consumer は毎 tie `ensure_himo(name)` → `himo_id` の線形走査を
+踏むしかなかった。 `&self` 系への移行は代替にならない — release で validate が消え
+(`&self` の by_id 系は `debug_assert` のみ)、 `himo_is_in_engine_internal_table` を毎 tie
+払うので節約分を払い直す。
+
+- `Engine::tie_by_id` / `Engine::tie_text_by_id` / `Engine::tie_ref_by_id` を追加
+- 既存の `tie` / `tie_text` / `tie_ref` はこれに委譲 (振る舞いは不変)
+
+**性能理由では入れていない。** 報告者の実測 (himo 40 本 / 72M tie の 422 s フルリビルド) で
+名前 lookup は合計 486 ms = **0.115 %**、 全 tie が末尾 himo と仮定した上界でも 0.41 %。
+`position` は先頭一致で返るので、 **hot な himo を先に `define_himo` するだけでほぼ消える**。
+入れた理由は API の対称性だけで、 doc にもそう書いた (性能目的と誤解されると、 `&self` 系へ
+移行するのと同じ間違いを誘発するため)。
+
+実装で 1 箇所だけ注意が要った: sentinel (`u32::MAX`) の拒否は **`ensure_himo` より前**で
+なければならない。 素直に 「名前解決 → 委譲」 にすると、 **拒否された write で himo が
+生えてしまう** (元の `tie` / `tie_ref` は sentinel check が `ensure_himo` の前にあった)。
+名前版 / id 版で同じ判定を使うため `reject_sentinel` に共通化した。
+
+### Docs — `himo_id` を HashMap lookup と書いていた (#265)
+
+`tie_text_to_by_id` / `tie_async_by_id` の doc が 「per-call の HashMap lookup を避ける」 と
+書いていたが、 実体は `himo_names.iter().position(..)` の線形走査。 **コスト見積りを誤らせる**
+(線形なら定義順で変わる、 HashMap なら変わらない) ので `tie_to_by_id` の文言に揃えた。
+併せて `himo_id` 本体の doc に帰結 (「コストは himo の定義順に依存する / 頻度の高い himo を
+先に define すれば縮む / それでも足りなければ `*_by_id`」) を明記。
+
+**検証**: `issue264_tie_by_id` 4 本 — 名前版との等価性 (Number / Tag / Leaf / Ref + re-tie の
+旧 offset free 経路)、 sentinel 拒否の等価性と 「拒否で himo が生えない」 (fault の二重計上 /
+欠落も見る)、 release でも効く `validate_ref_tie` / `validate_eid_for_himo`。 sentinel 判定を
+`ensure_himo` の後ろに移すと狙った 1 本だけが落ちる。 workspace 全体 1144 tests green。
+
 ## 0.26.8 — 2026-09-07
 
 **書き込みゼロの rw session が払っていた drop の定数コストを畳んだ perf patch** (#261、
