@@ -106,6 +106,14 @@ fn oplog_sync_bridges_every_record_under_scheduling_pressure() {
         oplog_checkpoint: u64,
         durable_lsn: u64,
         fold_race_saves: u64,
+        // #268: 「0 を返し続ける bridge」 のどの分岐かを、 落ちた瞬間に確定させる。
+        // 実機の 41 時間停止では fold_race_saves / cursor_repairs が両方 0 のままで、
+        // ここから先を切り分ける材料が engine に無かった。
+        bridge_cursor: u64,
+        bridge_empty_scans: u64,
+        bridge_last_from: u64,
+        bridge_last_committed_end: u64,
+        bridge_himo_lookup_failures: u64,
     }
 
     let mut missing: Vec<Miss> = Vec::new();
@@ -156,6 +164,11 @@ fn oplog_sync_bridges_every_record_under_scheduling_pressure() {
                 oplog_checkpoint: st.oplog_checkpoint,
                 durable_lsn: st.durable_lsn,
                 fold_race_saves: eng.fold_race_saves(),
+                bridge_cursor: eng.sync_ops_bridge_offset(),
+                bridge_empty_scans: eng.bridge_empty_scans(),
+                bridge_last_from: eng.bridge_last_from(),
+                bridge_last_committed_end: eng.bridge_last_committed_end(),
+                bridge_himo_lookup_failures: eng.bridge_himo_lookup_failures(),
             });
         }
     }
