@@ -560,6 +560,20 @@ const EIDMAP_VERSION: u32 = 3;
 /// `max_entities` は `u32::MAX` 未満なので実在 slot と衝突しない。
 const NO_LOCAL_SLOT: u32 = u32::MAX;
 
+/// #268: bridge の無言停止を 1 行警告するまでの連続空 scan 数。
+const BRIDGE_STALL_WARN_AFTER: u64 = 256;
+
+/// #268: 同じく、 警告までに episode が続いていなければならない実時間 (ms)。
+///
+/// **回数だけでは足りない**。 head は record 本体の書き込み **前** に bump されるので、
+/// 書き込み途中の batch を見ている間は 「head > cursor かつ空 scan」 が正常に起きる。
+/// commit は consumer thread の fsync 周期 (100 ms) で付く。 つまり異常かどうかは
+/// **経過時間**の問題で、 scan を何回回したかではない — host が tight loop で
+/// `transfer_oplog_to_sync_ops()` を叩けば、 正常な batch の途中でも 256 回は 1 秒未満で
+/// 埋まる (`bridge_counters_separate_a_quiet_bridge_from_a_stalled_one` で実際に踏んだ)。
+/// 実機の事象は 41 時間なので、 30 秒の下限で見落とすことはない。
+const BRIDGE_STALL_WARN_AFTER_MS: u64 = 30_000;
+
 fn serialize_eidmap(entries: &[EidmapEntry]) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + entries.len() * 28);
     out.extend_from_slice(b"EIDM");
@@ -2814,6 +2828,25 @@ pub struct Engine {
     /// bridge cursor が head を追い越した (= fold ↔ transfer の lost update) のを
     /// 検出して巻き戻した回数。 0 でないなら直列化が破れている。
     sync_ops_cursor_repairs: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// #268: bridge が `records.is_empty()` で 0 を返した **連続** 回数。 1 件でも
+    /// 転送できれば 0 に戻る。 `oplog_head()` が先にあるのにこれが伸び続ける状態が、
+    /// 実機で 41 時間の無言停止として出た形 (再起動で滞留 21,512 record が一括で出た)。
+    bridge_empty_scans: std::sync::atomic::AtomicU64,
+    /// #268: 直近 scan の入力 cursor。 「cursor が動いていない」 のか
+    /// 「cursor は動くが読めるものが無い」 のかを host 側で分けるため。
+    bridge_last_from: std::sync::atomic::AtomicU64,
+    /// #268: 直近 scan が読み切った commit 済み終端。 `bridge_last_from` に張り付いて
+    /// いれば、 scan が commit 済み領域を 1 byte も進めていない。
+    bridge_last_committed_end: std::sync::atomic::AtomicU64,
+    /// #268: `_sync_ops` の himo lookup に失敗して 0 を返した回数。 空 scan と並ぶ
+    /// もう一方の 「0 を返す」 経路で、 伸びていれば sync tables の定義が壊れている。
+    bridge_himo_lookup_failures: std::sync::atomic::AtomicU64,
+    /// #268: 無言停止の警告を 1 episode 1 行に抑えるラッチ。 転送が再開したら降ろす。
+    bridge_stall_warned: std::sync::atomic::AtomicBool,
+    /// #268: 連続空 scan が始まった時刻 (unix ms)。 0 = episode 中でない。
+    /// 「何回空だったか」 ではなく 「どれだけの間 head に追いつけていないか」 で
+    /// 判定するために要る (`BRIDGE_STALL_WARN_AFTER_MS` の doc)。
+    bridge_stall_since_ms: std::sync::atomic::AtomicU64,
     /// #217: ack prefix walk が dead row (payload 欠落 / decode 不能 = 構造的に
     /// 配送不能) を削除して越えた回数。 0 でないなら bridge が壊れた payload を
     /// 書いたことがある (要調査) — が、 ring を permanent blocker にはしない。
@@ -3185,6 +3218,12 @@ impl Engine {
             )),
             fold_race_saves: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            bridge_empty_scans: std::sync::atomic::AtomicU64::new(0),
+            bridge_last_from: std::sync::atomic::AtomicU64::new(0),
+            bridge_last_committed_end: std::sync::atomic::AtomicU64::new(0),
+            bridge_himo_lookup_failures: std::sync::atomic::AtomicU64::new(0),
+            bridge_stall_warned: std::sync::atomic::AtomicBool::new(false),
+            bridge_stall_since_ms: std::sync::atomic::AtomicU64::new(0),
             sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             state_records_dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ack_walk_resume: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -4192,6 +4231,12 @@ impl Engine {
             )),
             fold_race_saves: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sync_ops_cursor_repairs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            bridge_empty_scans: std::sync::atomic::AtomicU64::new(0),
+            bridge_last_from: std::sync::atomic::AtomicU64::new(0),
+            bridge_last_committed_end: std::sync::atomic::AtomicU64::new(0),
+            bridge_himo_lookup_failures: std::sync::atomic::AtomicU64::new(0),
+            bridge_stall_warned: std::sync::atomic::AtomicBool::new(false),
+            bridge_stall_since_ms: std::sync::atomic::AtomicU64::new(0),
             sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             state_records_dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ack_walk_resume: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -4478,14 +4523,31 @@ impl Engine {
                 records.len(),
             );
         }
+        // #268: 直近 scan の入出力を残す。 host 側が 「head は先にあるのに bridge が
+        // 0 を返し続ける」 を O(1) で判定できるようにするための観測点。
+        self.bridge_last_from.store(from, Ordering::Relaxed);
+        self.bridge_last_committed_end.store(committed_end, Ordering::Relaxed);
+
         if records.is_empty() {
+            let empties = self.bridge_empty_scans.fetch_add(1, Ordering::Relaxed) + 1;
+            self.warn_if_bridge_stalled(from, wal.head(), empties);
             // 空 commit group だけ読み進んだ場合も cursor は安全に前進できる
             self.advance_sync_ops_cursor(from, committed_end);
             return 0;
         }
+        self.bridge_empty_scans.store(0, Ordering::Relaxed);
+        self.bridge_stall_warned.store(false, Ordering::Relaxed);
+        self.bridge_stall_since_ms.store(0, Ordering::Relaxed);
 
         // himo_id を 1 度 lookup (= hot path での文字列引きを避ける)
-        let lsn_hid = match self.himo_id("_sync_ops.lsn") { Some(h) => h as u16, None => return 0 };
+        let lsn_hid = match self.himo_id("_sync_ops.lsn") {
+            Some(h) => h as u16,
+            // #268: 「0 を返す」 もう一方の経路。 空 scan と混ざると切り分けられない。
+            None => {
+                self.bridge_himo_lookup_failures.fetch_add(1, Ordering::Relaxed);
+                return 0;
+            }
+        };
         // #59: 直前の lsn は None を graceful に扱っているのに、 ここだけ unwrap で
         // panic していた (非対称)。 sync tables が部分定義な DB で host を殺す。
         let (Some(peer_id_hid), Some(op_type_hid), Some(hlc_wall_lo_hid), Some(payload_hid)) = (
@@ -4494,6 +4556,7 @@ impl Engine {
             self.himo_id("_sync_ops.hlc_wall_lo"),
             self.himo_id("_sync_ops.payload"),
         ) else {
+            self.bridge_himo_lookup_failures.fetch_add(1, Ordering::Relaxed);
             return 0;
         };
         let (peer_id_hid, op_type_hid, hlc_wall_lo_hid, payload_hid) = (
@@ -4904,6 +4967,105 @@ impl Engine {
     /// bridge cursor の現在値（観測用）。
     pub fn sync_ops_bridge_offset(&self) -> u64 {
         self.sync_ops_offset.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    // ──── #268: bridge の無言停止を host から検出するための観測値 ────
+    //
+    // 実機 (syncretic) で `transfer_oplog_to_sync_ops()` が 41 時間 0 を返し続け、
+    // 配布が完全に沈黙した。 再起動で cursor が ring 先頭に戻った瞬間に滞留 21,512
+    // record が一括で出たので、 record は commit 済みで WAL 上に在り、 **走行中の
+    // bridge だけが読めていなかった**。 既存の counter
+    // (`sync_ops_cursor_repairs` / `fold_race_saves`) は #196 の窓しか数えないので
+    // 両方 0 のまま。 host 側に 「head は先にあるのに bridge が進まない」 を
+    // O(1) で判定する材料が無かった。 以下はそのための素の値で、 判断は host に任せる。
+
+    /// WAL の現在 head（観測用）。 oplog 未使用なら 0。
+    ///
+    /// #268: `sync_ops_bridge_offset()` と並べて 「head は進んでいるのに cursor が
+    /// 動かない」 を host 側で判定するための片割れ。 head は record 本体の書き込み
+    /// **前**に bump されるので、 head > cursor は一時的には正常 (= 書き込み途中の
+    /// batch)。 異常かどうかは `bridge_empty_scans()` が伸び続けるかで見る。
+    pub fn oplog_head(&self) -> u64 {
+        self.oplog.as_ref().map_or(0, |w| w.head())
+    }
+
+    /// WAL の現在 checkpoint（観測用）。 oplog 未使用なら 0。
+    pub fn oplog_checkpoint(&self) -> u64 {
+        self.oplog.as_ref().map_or(0, |w| w.checkpoint())
+    }
+
+    /// bridge が空 scan で 0 を返した **連続** 回数（観測用）。 1 件でも転送できれば
+    /// 0 に戻る。 平常時も 0 と数回を行き来する (書き込みが無ければ空 scan は正常)。
+    ///
+    /// #268: 「配布が止まっている」 の判定は **これ単独ではできない**。
+    /// `oplog_head() > sync_ops_bridge_offset()` が続いた**まま**これが伸び続ける、
+    /// が異常の形。
+    pub fn bridge_empty_scans(&self) -> u64 {
+        self.bridge_empty_scans.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 直近 bridge scan の入力 cursor（観測用）。
+    pub fn bridge_last_from(&self) -> u64 {
+        self.bridge_last_from.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 直近 bridge scan が読み切った commit 済み終端（観測用）。
+    ///
+    /// #268: `bridge_last_from()` に張り付いていれば、 scan は commit 済み領域を
+    /// 1 byte も進めていない (= cursor が読むべき領域の外を指している疑い)。
+    pub fn bridge_last_committed_end(&self) -> u64 {
+        self.bridge_last_committed_end.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `_sync_ops` の himo lookup 失敗で bridge が 0 を返した回数（観測用）。
+    ///
+    /// #268: 空 scan と並ぶ 「0 を返す」 もう一方の経路。 平常時は 0。 伸びていれば
+    /// sync tables の定義が壊れている (= 空 scan の線ではない)。
+    pub fn bridge_himo_lookup_failures(&self) -> u64 {
+        self.bridge_himo_lookup_failures.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// unix epoch からの経過 ms。 時計が取れない環境では 0 (= episode の経過を
+    /// 測れないので警告は出ない、 安全側)。
+    fn unix_millis() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// #268: 「head は先にあるのに bridge が空を返し続けている」 を 1 episode 1 行だけ
+    /// 警告する。 転送が 1 件でも成立すればラッチが降りて、 次の episode でまた出る。
+    ///
+    /// host が観測値を配線していなくても、 次に踏んだときに**無音にならない**ことが目的。
+    /// 閾値の意味: head は record 本体を書く前に bump されるので、 書き込み途中の batch を
+    /// 見ている間は head > cursor かつ空 scan が正常。 consumer thread の fsync 周期
+    /// (100 ms) で commit が付くので、 それを十分に跨ぐ長さにしてある。
+    fn warn_if_bridge_stalled(&self, from: u64, head: u64, empties: u64) {
+        use std::sync::atomic::Ordering;
+        let now = Self::unix_millis();
+        // episode の開始時刻を 1 回だけ刻む (0 = 未開始)。 転送が成立すると 0 に戻る。
+        let _ = self.bridge_stall_since_ms.compare_exchange(
+            0, now, Ordering::Relaxed, Ordering::Relaxed,
+        );
+        if head <= from || empties < BRIDGE_STALL_WARN_AFTER {
+            return;
+        }
+        let since = self.bridge_stall_since_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(since) < BRIDGE_STALL_WARN_AFTER_MS {
+            return;
+        }
+        if self.bridge_stall_warned.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let stalled_ms = now.saturating_sub(since);
+        eprintln!(
+            "[enchudb] warning: sync bridge has returned 0 for {empties} consecutive scans over \
+             {stalled_ms} ms while the oplog head ({head}) is ahead of the bridge cursor ({from}) \
+             — records may be committed but unreachable from this cursor, and distribution is \
+             silently stalled (#268). Reopening the DB resets the cursor to the ring start and \
+             re-bridges them."
+        );
     }
 
     /// fold ↔ bridge の check-then-act を lock 下の再検証で弾いた回数（観測用）。
@@ -14079,6 +14241,162 @@ mod tests {
         for suffix in ["", ".oplog", ".tables", ".crc", ".lock"] {
             let _ = std::fs::remove_file(format!("{path}{suffix}"));
         }
+    }
+
+    /// 実時間 deadline 付きの収束待ち。 consumer thread が同じ bridge を回しているので、
+    /// 回数ではなく時間で待つ (= 遅いマシンで偽 fail しない)。
+    fn until(mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if cond() { return true; }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// #268: bridge が 0 を返し続けたときに、 host がそれを **異常として読める**こと。
+    ///
+    /// 実機 (syncretic) で `transfer_oplog_to_sync_ops()` が 41 時間 0 を返し続け、
+    /// 配布が沈黙した。 既存 counter は #196 の窓しか数えないので両方 0 のまま、
+    /// host には 「静かなのか壊れているのか」 を分ける材料が無かった。
+    ///
+    /// ここで見るのは **counter の意味**: 何も無ければ連続空 scan が伸び、 転送が
+    /// 成立したら 0 に戻り、 head / checkpoint / 直近 scan の入出力が読める。
+    /// 実機の race そのもの (commit 済み record が cursor から読めない) は狙って
+    /// 作れていないので、 これは 「起きたときに観測できる」 gate であって race の
+    /// 再現ではない。
+    ///
+    /// consumer thread が fsync 周期で同じ bridge を回しているため、 手動 transfer の
+    /// 戻り値は取り合いになる。 assert は **収束**で書く (consumer は助けにしかならない)。
+    #[test]
+    fn bridge_counters_separate_a_quiet_bridge_from_a_stalled_one() {
+        let path = tmp("bridge_observability");
+        let _ = std::fs::remove_dir_all(&path);
+        {
+            let mut eng = Engine::create_standalone(&path).unwrap();
+            eng.define_table("rows", 1_000).unwrap();
+            eng.define_himo_in("rows", "val", ValueType::Number, 1_000).unwrap();
+            eng.enable_sync_tables().unwrap();
+            eng.flush().unwrap();
+        }
+        let eng = Engine::open_concurrent_with_oplog(&path, 4 * 1024 * 1024).unwrap();
+        eng.set_peer_id(1);
+        let hid = eng.himo_id("rows.val").unwrap() as u16;
+
+        let e = eng.entity_in("rows").unwrap();
+        eng.tie_async_by_id(e, hid, 9);
+        // tie_async は queue 経由。 WAL append を待たずに Commit を打つと、 record が
+        // Commit の **後ろ** に並んで次の fsync まで commit されない (= 空 scan が続く)。
+        eng.flush_writes();
+        eng.oplog_sync().unwrap();
+
+        // WAL の位置が host から読めること (#268 で 「無い」 と言われた片割れ)
+        assert!(
+            eng.oplog_head() > enchudb_oplog::oplog::HEADER_SIZE as u64,
+            "head が観測できない",
+        );
+        assert!(eng.oplog_checkpoint() > 0, "checkpoint が観測できない");
+
+        // 1 件目が bridge されるまで待つ (consumer thread と手動 transfer のどちらでもよい)
+        assert!(
+            until(|| { eng.transfer_oplog_to_sync_ops(); eng.current_sync_lsn() > 0 }),
+            "record が bridge されない (lsn={}, head={}, cursor={}, empties={})",
+            eng.current_sync_lsn(), eng.oplog_head(),
+            eng.sync_ops_bridge_offset(), eng.bridge_empty_scans(),
+        );
+
+        // 何も無くなれば空 scan が連続回数として積まれる (= 「静か」 の形。 これ自体は正常)。
+        // 十分に積んでおくと、 後で 「戻った」 を余裕を持って観測できる。
+        const PEAK: u64 = 64;
+        assert!(
+            until(|| { eng.transfer_oplog_to_sync_ops(); eng.bridge_empty_scans() >= PEAK }),
+            "空 scan が連続回数として積まれていない (={})", eng.bridge_empty_scans(),
+        );
+        assert!(eng.bridge_last_committed_end() > 0, "直近 scan の終端が読めない");
+        assert!(
+            eng.bridge_last_from() <= eng.bridge_last_committed_end(),
+            "cursor が commit 済み終端を追い越して記録されている",
+        );
+        assert_eq!(
+            eng.bridge_himo_lookup_failures(), 0,
+            "健全な sync tables で himo lookup が失敗している",
+        );
+
+        // もう 1 件流す → 転送が成立した時点で連続回数は 0 に戻る
+        // もう 1 件流す → 転送が成立した時点で連続回数は 0 に戻る。
+        //
+        // **誰が運んだかは見ない**。 concurrent engine では consumer thread が fsync 周期で
+        // 同じ bridge を回しており、 手動 `transfer_oplog_to_sync_ops()` はまず勝てない
+        // (#268 の報告でも、 健全な時間帯ですら host 側は `transfer=0` を見ている)。
+        // よって 「自分の呼び出しが 1 を返すこと」 は gate にできない。 counter が PEAK から
+        // 落ちたことだけを見る — 落ちるのは転送が成立したときだけなので、 これで十分。
+        let lsn_before = eng.current_sync_lsn();
+        let e2 = eng.entity_in("rows").unwrap();
+        eng.tie_async_by_id(e2, hid, 10);
+        eng.flush_writes();
+        eng.oplog_sync().unwrap();
+        assert!(
+            until(|| { eng.transfer_oplog_to_sync_ops(); eng.bridge_empty_scans() < PEAK }),
+            "転送が成立しても連続空 scan がリセットされない (={})", eng.bridge_empty_scans(),
+        );
+        assert!(eng.current_sync_lsn() > lsn_before, "2 件目が bridge されていない");
+
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// #268: 無言停止の 1 行警告は 「head が先行」 かつ 「連続空 scan が閾値超え」 の
+    /// **両方**が要る。 head <= cursor (= 静かなだけ) では鳴らない — ここを落とすと
+    /// 平常運転で警告が出続けて、 本番の 1 行が埋もれる。
+    #[test]
+    fn stall_warning_needs_head_ahead_and_fires_once_per_episode() {
+        let path = tmp("bridge_stall_latch");
+        let _ = std::fs::remove_dir_all(&path);
+        let mut eng = Engine::create_standalone(&path).unwrap();
+        eng.define_table("rows", 1_000).unwrap();
+        eng.enable_sync_tables().unwrap();
+        use std::sync::atomic::Ordering;
+
+        // episode が始まったばかり = まだ鳴らない (回数が幾ら積まれていても)。
+        // host が tight loop で叩けば 256 回は 1 秒未満で埋まるので、 ここが要。
+        eng.warn_if_bridge_stalled(4096, 8192, BRIDGE_STALL_WARN_AFTER * 10);
+        assert!(
+            !eng.bridge_stall_warned.load(Ordering::Relaxed),
+            "始まったばかりの episode で警告が鳴っている (回数だけで判定している)",
+        );
+
+        // 以降は 「十分に長く続いている episode」 として扱う
+        let long_ago = Engine::unix_millis() - BRIDGE_STALL_WARN_AFTER_MS * 2;
+        let backdate = |eng: &Engine| eng.bridge_stall_since_ms.store(long_ago, Ordering::Relaxed);
+        backdate(&eng);
+
+        // head が cursor より後ろ / 同じ = 静かなだけ。 経過も回数も足りていても鳴らない
+        eng.warn_if_bridge_stalled(4096, 4096, BRIDGE_STALL_WARN_AFTER * 10);
+        assert!(!eng.bridge_stall_warned.load(Ordering::Relaxed), "静かなだけで警告が鳴っている");
+
+        // head は先行しているが、 まだ回数が閾値未満
+        backdate(&eng);
+        eng.warn_if_bridge_stalled(4096, 8192, BRIDGE_STALL_WARN_AFTER - 1);
+        assert!(!eng.bridge_stall_warned.load(Ordering::Relaxed), "閾値未満で警告が鳴っている");
+
+        // 3 つ揃って初めて鳴り、 1 episode 1 回だけ
+        backdate(&eng);
+        eng.warn_if_bridge_stalled(4096, 8192, BRIDGE_STALL_WARN_AFTER);
+        assert!(eng.bridge_stall_warned.load(Ordering::Relaxed), "停止しているのに警告が鳴らない");
+        // 転送再開でラッチと episode が降りる相当
+        eng.bridge_stall_warned.store(false, Ordering::Relaxed);
+        eng.bridge_stall_since_ms.store(0, Ordering::Relaxed);
+        eng.warn_if_bridge_stalled(4096, 8192, BRIDGE_STALL_WARN_AFTER);
+        assert!(
+            !eng.bridge_stall_warned.load(Ordering::Relaxed),
+            "次の episode が始まった瞬間に鳴っている (経過を見ていない)",
+        );
+        backdate(&eng);
+        eng.warn_if_bridge_stalled(4096, 8192, BRIDGE_STALL_WARN_AFTER);
+        assert!(eng.bridge_stall_warned.load(Ordering::Relaxed), "次の episode で鳴り直さない");
+
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     /// **cursor が head を追い越した状態は 「畳んでよい」 ではなく 「不整合」。**
