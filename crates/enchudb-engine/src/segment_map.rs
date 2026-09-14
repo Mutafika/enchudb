@@ -38,6 +38,16 @@ use std::ptr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+/// reservation を切り上げる単位。 **runtime の page size ではなく、 host が取りうる
+/// 最大の page size** を使う。 page size は host ごとに違い (Apple Silicon = 16 KiB /
+/// 大半の Linux = 4 KiB / 一部 arm64 Linux = 64 KiB)、 `create` は `initial.max(ps)` で
+/// 切り上げるので、 **16 KiB 機が作った segment は宣言 size が小さくてもファイルが 16 KiB**
+/// になる。 それを 4 KiB 機で開くと reservation が 4 KiB に丸まり 「file の方が大きい」 と
+/// 誤判定して**一切開けない** (#276)。 reservation は address space の予約でしかないので
+/// 多めに取る費用は無く、 これで DB は host 間で可搬になる。 「宣言 size より極端に大きい
+/// file は壊れている」 という検査は 64 KiB の余裕を挟んだまま残る。
+pub(crate) const RESERVE_ALIGN: usize = 64 * 1024;
+
 /// 実行時の hardware page size。 macOS Apple Silicon は **16 KB**、 Linux / macOS x86_64 は
 /// 4 KB。 msync の `addr` はこれで page-aligned である必要がある (4096 で揃えると
 /// Apple Silicon で EINVAL)。 起動時に sysconf で取って cache。
@@ -251,7 +261,8 @@ impl SegmentMap {
             OpenOptions::new().read(true).write(true).create_new(true).open(path)
         })?;
         let ps = runtime_page_size();
-        let reserve = align_up(reserve.max(ps), ps);
+        // open と同じ基準（`RESERVE_ALIGN`）。作る側と開く側で予約長が食い違わないように。
+        let reserve = align_up(reserve.max(ps), RESERVE_ALIGN);
         let initial = align_up(initial.max(ps), ps);
         if initial > reserve {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "initial > reserve"));
@@ -266,7 +277,8 @@ impl SegmentMap {
         let _t = OpenTimer(std::time::Instant::now());
         let file = open_with_fd_retry(|| OpenOptions::new().read(true).write(!readonly).open(path))?;
         let ps = runtime_page_size();
-        let reserve = align_up(reserve.max(ps), ps);
+        // ⚠ `ps` ではなく `RESERVE_ALIGN` で切り上げる — 別 page size の機械が作った DB を開くため。
+        let reserve = align_up(reserve.max(ps), RESERVE_ALIGN);
         let len = file.metadata()?.len() as usize;
         let committed = align_up(len.max(ps), ps);
         if committed > reserve {
@@ -738,6 +750,27 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::StorageFull);
         assert_eq!(m.space_denials(), 1);
         assert_eq!(m.file_len().unwrap(), runtime_page_size() as u64, "拒否したのにファイルが伸びた");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #276: **別 page size の機械が作った segment を開ける**こと。
+    /// 16 KiB page の機械は `create` の `initial.max(ps)` で最小 16 KiB のファイルを作る。
+    /// それを 4 KiB page の機械が開くと、 修正前は reservation が runtime page で 4 KiB に
+    /// 丸まって 「file の方が大きい」 と拒否していた (= 16K 機で焼いた DB が 4K 機で一切開かない)。
+    ///
+    /// runtime の page size は変えられないので **同じ形 = 宣言 size より大きいファイル**を
+    /// 直接置いて再現する。 サイズは 16 KiB ではなく `RESERVE_ALIGN` — 16 KiB だと
+    /// **16 KiB page の機械では修正前でも通ってしまい** (runtime page が既に覆う)、
+    /// 回帰テストとして機能しない。 `RESERVE_ALIGN` なら想定するどの page size でも
+    /// 修正前は必ず落ちる。
+    #[test]
+    fn open_accepts_segment_created_by_larger_page_host() {
+        let d = dir("crosspage");
+        let p = d.join("a.seg");
+        std::fs::write(&p, vec![0u8; RESERVE_ALIGN]).unwrap();
+        let m = SegmentMap::open(&p, 4096, true)
+            .expect("別 page size の機械が作った segment が開けない (#276)");
+        assert!(m.committed() >= RESERVE_ALIGN, "commit が file を覆っていない");
         let _ = std::fs::remove_dir_all(&d);
     }
 
