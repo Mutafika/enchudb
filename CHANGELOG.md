@@ -3,6 +3,49 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.26.11 — 2026-09-14
+
+**page size が違う機械の間で DB が可搬でなかったのを直した patch** (#276、 naruhodo からの報告)。
+on-disk format は**不変**、 migration 不要、 breaking なし、 公開 API の変更なし。
+**別 page size の機械へ DB を配る運用をするなら上げること** (Mac で焼いて Linux で配信する等)。
+既存 DB はそのまま開ける。
+
+### Fixed — 16 KiB page 機で焼いた DB が 4 KiB page 機で一切開けなかった (#276)
+
+`SegmentMap` の `create` / `open` が **runtime の page size** で mmap の reservation を
+切り上げていた。 page size は host ごとに違う (Apple Silicon 16 KiB / 大半の Linux 4 KiB /
+一部 arm64 Linux 64 KiB)、 かつ `create` は `initial.max(ps)` で切り上げるので、
+**16 KiB 機が作った segment は宣言 size が小さくてもファイルが 16 KiB** になる。 それを
+4 KiB 機で開くと reservation が 4 KiB に丸まり、 「file の方が大きい」 と誤判定して
+open が `InvalidData` で失敗していた。
+
+```
+segment /data/hourei.enchu/header.seg is 16384 bytes, larger than reservation 4096
+```
+
+`probe` は Ready を返す (形式は正常) ので、 権限 / ロックを疑う方向に誤誘導する
+エラーだった。 実 DB (naruhodo の統一ストア・55 segment) では宣言 size が 16 KiB 未満の
+**7 本**が該当していた。
+
+- reservation を runtime page ではなく host 非依存の定数 `RESERVE_ALIGN` (64 KiB) で
+  切り上げるようにした。 reservation は address space の予約でしかないので多めに取る費用は無い
+- `committed` の計算は runtime page のまま (実際の mmap / msync 単位なので正しい)
+- 守りたい不変条件は **「mmap 予約が file を覆う」** であって 「file が宣言 size 以下」 では
+  ない (後者は cap を伸ばした segment でも成り立たない)。 壊れた file を弾く検査は
+  64 KiB の余裕を挟んだまま残る
+- Windows 実装は元から allocation granularity (64 KiB) で切り上げており影響なし。
+  結果として **unix と Windows の基準が同じ値に揃った**
+
+**検証**: 実機 2 台で両方向を確認 — macOS arm64 (page 16384) で `create_full` した DB を
+Linux arm64 (page 4096) へ rsync して `open_readonly` が成功、 修正を巻き戻すと上記の
+エラーで失敗する。 逆方向 (Linux で作成 → macOS で open) も成功する (`committed` は常に
+EOF を含む page までなので、 mmap が EOF を越えた page を含むことはない)。
+回帰テスト `open_accepts_segment_created_by_larger_page_host` は修正を戻すと落ちる。
+
+naruhodo の 「Mac で焼いたストアを VPS (Linux) へ rsync して配信する」 運用は、 この bug の
+ために成立していなかった。 iOS は Apple Silicon と同じ 16 KiB page なので offline pack は
+偶然無事だったが、 64 KiB page の arm64 Linux が相手なら同じ形で壊れる。
+
 ## 0.26.10 — 2026-09-14
 
 **bulk load が誰も引かない逆索引を育てるのをやめた perf patch** (#270、 naruhodo からの報告)。
