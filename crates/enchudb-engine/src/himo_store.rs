@@ -10,7 +10,7 @@
 //! Cylinder を触らず（append-only）、 stale は read 側の Column verify で落とす
 //! （lazy / conditional verify）。
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -86,7 +86,9 @@ pub struct HimoStore {
     /// 初期 bucket サイズのヒント。0 は「ヒントなし、必要時に拡張」。値の上限ではない。
     pub max_values: u32,
     /// cylinder が column から populate 済みか。lazy rebuild 用。
-    /// `init`（新規 DB）では即 true（column 空）、`load`（既存 DB）では false で開始。
+    /// `init`（新規 DB）も `load`（既存 DB）も **false で開始**し、 最初に引かれた時に
+    /// `ensure_cylinder_built` が立てる。 #270 以降このフラグは「組み済みか」と
+    /// **「以後この索引を維持するか」** を兼ねる (= writer の gate、 `cyl_live` 参照)。
     cyl_built: AtomicBool,
     /// writer 直列化 lock。 lazy build と set/remove/restore が取る。
     /// reader (pull 系) は一切取らない。 同期 tie / schema commit の多 thread
@@ -138,9 +140,8 @@ impl HimoStore {
             value_type: ht,
             max_values,
             // 新規 column は空なので「組み済み」で始めてよいが、 **それだと bulk load が
-            // 誰も引かない index を育て続ける**(naruhodo のフルリビルドで 1.5GB / 2,856 万確保)。
-            // false で始めれば `set` は cylinder を触らず、 読み手が最初に `pull` した時点で
-            // `ensure_cylinder_built` が Column から組む(空でも正しく、 stale ゼロで組める)。
+            // 誰も引かない index を育て続ける** (#270: naruhodo のフルリビルドで 1.5GB /
+            // 2,856 万確保)。 false で始めれば writer は cylinder を触らない (`cyl_live`)。
             cyl_built: AtomicBool::new(false),
             write_lock: Mutex::new(()),
         }
@@ -233,23 +234,41 @@ impl HimoStore {
         self.cyl_built.store(true, Ordering::Release);
     }
 
+    /// 維持対象の cylinder。 **未 build なら `None`** = index 操作は丸ごと no-op (#270)。
+    ///
+    /// `cyl_built` は「組み済みか」と「以後この索引を維持するか」を兼ねる。 新規 himo は
+    /// `false` で始まる (`init`) ので、 bulk load (= `pull` を一度も引かない) は誰も使わない
+    /// index を育てない。 読み手が最初に引いた時点で `ensure_cylinder_built` が Column から
+    /// 組むので結果は同じ — むしろ stale ゼロで組み上がる。
+    ///
+    /// **判定は `write_lock` を取った後**でなければならない。 `ensure_cylinder_built` は
+    /// 同じ lock の中で scan → flag を立てるので、 `Some` を見たなら build は完了済み
+    /// (= writer が自分で index に入れる)、 `None` を見たなら build はまだ lock を取れて
+    /// いない (= その後の scan が此の write を拾う)。 どちらかが必ず入れるので取りこぼさない。
+    ///
+    /// lock の **前** に読むと壊れる: writer が `None` を読む → reader が lock を取り
+    /// **write 前の** Column を scan → flag を立てる → writer が lock を取り Column に
+    /// 書くが `None` なので index に入れない → その eid は `pull` から永久に消える
+    /// (silent lost row)。 `tests/loom_lazy_cylinder_build.rs` がその interleaving を
+    /// 全探索で検出する。
+    ///
+    /// **guard を引数に取るのはこの順序を型で強制するため** — 返り値の lifetime を guard に
+    /// 縛ってあるので、 lock の前に呼ぶことも、 guard を先に drop することもできない。
+    /// 観測用途 (`cyl_backing_bytes`) は race して良いので flag を直に読む。
+    #[inline]
+    fn cyl_live<'a>(&'a self, _w: &'a MutexGuard<'_, ()>) -> Option<&'a LockFreeCylinder> {
+        self.cyl_built.load(Ordering::Acquire).then_some(&self.cyl)
+    }
+
     // ──── ぶら下げる / 外す ────
 
     /// cell に値を書く。 **書けなかったら `false`** (#167: growable backing で
     /// commit を伸ばせない = ディスク満杯。 未 commit page に書くと SIGBUS になるので
     /// 書かずに諦める)。 戻り値を無視しても従来どおり動く。
     pub fn set(&self, eid: u32, value: u32) -> bool {
-        let _w = self.write_lock.lock();
-        // cylinder が **まだ組まれていないなら触らない**。 bulk load (ingest) は pull を
-        // 一度も引かないので、 書きながら育てた bucket は誰にも使われずに捨てられる
-        // (naruhodo のフルリビルドで insert 1,113 万回 = 543MB = 生存 heap の 55%)。
-        // 読み手が最初に pull した時点で `ensure_cylinder_built` が Column から組むので
-        // 結果は同じ — むしろ stale ゼロで組み上がる。
-        //
-        // 判定は **write_lock を取った後**に読むこと。 `ensure_cylinder_built` は同じ
-        // lock の中で scan → flag を立てるので、 ここで true を見たなら build は完了済み、
-        // false を見たなら build はまだ lock を取れていない = その後の scan が此の write を拾う。
-        let cyl_live = self.cyl_built.load(Ordering::Acquire);
+        let w = self.write_lock.lock();
+        // 未 build の cylinder は触らない (#270)。 順序契約は `cyl_live` 参照。
+        let cyl = self.cyl_live(&w);
         let col = self.col();
         if col.ensure_committed_for(eid).is_err() {
             return false;
@@ -260,18 +279,16 @@ impl HimoStore {
             return true; // 冗長な re-tie = no-op（bucket に dup を作らない）
         }
         let mut stale = None;
-        if cyl_live {
-            if let Some(o) = old {
-                // 値更新: 旧 value の bucket に stale が残る → その bucket の read は verify する。
-                // Column を書き換える **前** に flag を立てる (request12、順序契約は note_stale 参照)
-                stale = self.cyl.note_stale(o).map(|s| (o, s));
-            }
+        if let (Some(cyl), Some(o)) = (cyl, old) {
+            // 値更新: 旧 value の bucket に stale が残る → その bucket の read は verify する。
+            // Column を書き換える **前** に flag を立てる (request12、順序契約は note_stale 参照)
+            stale = cyl.note_stale(o).map(|s| (o, s));
         }
         // #106: Release store。 leaf offset を publish する前に書いた LeafStore slot
         // (payload/gen) を、 offset を Acquire で読む reader が必ず観測できるようにする。
         col.store_u32_release(eid, value + 1);
-        if cyl_live {
-            self.cyl.insert(eid, value);
+        if let Some(cyl) = cyl {
+            cyl.insert(eid, value);
         }
         // compaction は Column 更新の **後** (keep = value_eq が新状態を見るため)
         if let Some((o, (len, live))) = stale {
@@ -283,12 +300,12 @@ impl HimoStore {
     pub fn remove(&self, eid: u32) {
         let col = self.col();
         if eid < col.count() {
-            let _w = self.write_lock.lock();
-            let cyl_live = self.cyl_built.load(Ordering::Acquire); // set と同じ契約
+            let w = self.write_lock.lock();
+            let cyl = self.cyl_live(&w); // set と同じ契約
             if let Some(o) = value_at(col, eid) {
                 // 削除: 旧 bucket に stale が残る（Cylinder は触らない、verify で落とす）。
                 // flag → Column の順 (set と同じ)
-                let stale = if cyl_live { self.cyl.note_stale(o) } else { None };
+                let stale = cyl.and_then(|c| c.note_stale(o));
                 col.clear(eid);
                 if let Some((len, live)) = stale {
                     self.maybe_compact(o, len, live);
@@ -311,15 +328,20 @@ impl HimoStore {
     /// 全 bucket を Column 基準で即時 compaction する明示 API (運用/テスト用)。
     /// reader は停止しない (bucket ごとの epoch swap)。
     pub fn compact_now(&self) {
-        self.ensure_cylinder_built();
-        let _w = self.write_lock.lock();
+        // #270: 未 build なら掃除する stale が無いので **組まずに返す**。 ここで
+        // `ensure_cylinder_built` を呼ぶと、 掃除 API が index を丸ごと確保した上で
+        // 「stale ゼロ」を確認するだけになる (遅延構築は定義上 stale-free)。
+        let w = self.write_lock.lock();
+        let Some(cyl) = self.cyl_live(&w) else {
+            return;
+        };
         let col = self.col();
-        for v in self.cyl.unique_values() {
+        for v in cyl.unique_values() {
             // clean bucket (churn 痕なし) は組み直し不要 — 無条件 swap は巨大 himo で
             // write_lock の長期保持 + 旧 backing の epoch 滞留 (一時 ~2x RSS) を招く
             // (PR #103 レビュー)。write_lock 下なので flag 判定は正確。
-            if self.cyl.bucket_needs_verify(v) {
-                self.cyl.compact_bucket(v, |eid| stored_at(col, eid) == v + 1);
+            if cyl.bucket_needs_verify(v) {
+                cyl.compact_bucket(v, |eid| stored_at(col, eid) == v + 1);
             }
         }
     }
@@ -376,8 +398,10 @@ impl HimoStore {
     }
 
     pub fn restore(&self, eid: u32, old_bytes: &[u8; 4]) {
-        self.ensure_cylinder_built();
-        let _w = self.write_lock.lock();
+        let w = self.write_lock.lock();
+        // #270: set / remove と同じ gate。 ここで `ensure_cylinder_built` を呼ぶと、
+        // rollback 1 回で index が組まれて以後の bulk load 全体が維持モードに戻る。
+        let cyl = self.cyl_live(&w);
         // v10: `set` と同じく、 書く cell まで segment の commit を伸ばす (#167: 伸ばせなければ書かない)。
         let col = self.col();
         if col.ensure_committed_for(eid).is_err() {
@@ -391,13 +415,13 @@ impl HimoStore {
             return; // 同値 restore = no-op (bytes も同一)
         }
         let mut stale = None;
-        if let Some(o) = old {
+        if let (Some(cyl), Some(o)) = (cyl, old) {
             // flag → Column の順 (set と同じ、request12)
-            stale = self.cyl.note_stale(o).map(|s| (o, s));
+            stale = cyl.note_stale(o).map(|s| (o, s));
         }
         col.set(eid, old_bytes);
-        if let Some(n) = new {
-            self.cyl.insert(eid, n);
+        if let (Some(cyl), Some(n)) = (cyl, new) {
+            cyl.insert(eid, n);
         }
         if let Some((o, (len, live))) = stale {
             self.maybe_compact(o, len, live);
@@ -473,7 +497,8 @@ impl HimoStore {
         }
     }
 
-    /// cylinder (in-memory index) が組まれているか。 観測用 (#255 の gate)。
+    /// cylinder (in-memory index) が組まれているか = **writer が以後それを維持するか**
+    /// (#270)。 観測用 (#255 / #270 の gate)。
     pub fn cylinder_built(&self) -> bool {
         self.cyl_built.load(Ordering::Acquire)
     }
@@ -485,8 +510,11 @@ impl HimoStore {
     }
 
     /// Cylinder の eid backing 総 bytes（メモリ観測用、#95）。
+    /// **未 build なら組まずに 0** (#270) — 観測 API が観測対象を確保しないため。
     pub fn cyl_backing_bytes(&self) -> usize {
-        self.ensure_cylinder_built();
+        if !self.cyl_built.load(Ordering::Acquire) {
+            return 0;
+        }
         self.cyl.backing_bytes()
     }
 
@@ -517,4 +545,66 @@ impl HimoStore {
     }
 
     pub fn sync(&self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// heap buffer 上に static backing (grower 無し = 全 commit 済み) の store を作る。
+    /// leaf_store の `make_store` と同じ idiom。
+    fn make_store(max_entities: u32) -> HimoStore {
+        let bytes = 64 * 1024;
+        let buf: Box<[u8]> = vec![0u8; bytes].into_boxed_slice();
+        let ptr = Box::leak(buf).as_mut_ptr();
+        let region = unsafe { Region::new(ptr, bytes) };
+        HimoStore::init(region, ValueType::Number, 0, max_entities)
+    }
+
+    /// #270: **writer 3 経路 (`set` / `remove` / `restore`) はどれも cylinder を組まない**。
+    ///
+    /// `restore` は workspace 内に caller が無い (oplog rollback 用の pub API) ので、
+    /// gate 漏れを捕まえられるのはこの unit test だけ。 漏れると rollback 1 回で index が
+    /// 組まれ、 以後の bulk load 全体が維持モードに戻る (= #270 の 1.2GB が復活する)。
+    #[test]
+    fn writers_never_build_the_cylinder() {
+        let hs = make_store(64);
+        assert!(!hs.cylinder_built(), "init は未 build で始まる");
+
+        assert!(hs.set(0, 7));
+        assert!(hs.set(1, 7));
+        assert!(hs.set(2, 9));
+        assert!(!hs.cylinder_built(), "set が組んでいる");
+
+        hs.remove(2);
+        assert!(!hs.cylinder_built(), "remove が組んでいる");
+
+        // restore: eid 3 に「元は 7 だった」を書き戻す (stored = value + 1)。
+        hs.restore(3, &8u32.to_le_bytes());
+        assert!(!hs.cylinder_built(), "restore が組んでいる (#270 の gate 漏れ)");
+
+        // 組む前に書いた 3 本 (0/1 は set、 3 は restore) を遅延構築が全部拾う。
+        let mut got = hs.pull(7);
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1, 3], "遅延構築が write を取りこぼした");
+        assert!(hs.cylinder_built(), "pull で初めて組む");
+        assert!(hs.pull(9).is_empty(), "remove した値が残っている");
+
+        // 組んだ後は writer が維持する (= 従来どおり)。
+        assert!(hs.set(4, 7));
+        let mut got = hs.pull(7);
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1, 3, 4], "build 後の write が index に入っていない");
+    }
+
+    /// 観測 API が観測対象を確保しない (#270)。
+    #[test]
+    fn cyl_backing_bytes_does_not_build() {
+        let hs = make_store(64);
+        assert!(hs.set(0, 7));
+        assert_eq!(hs.cyl_backing_bytes(), 0, "未 build なら 0");
+        assert!(!hs.cylinder_built(), "観測が cylinder を組んでしまった");
+        let _ = hs.pull(7);
+        assert!(hs.cyl_backing_bytes() > 0, "build 後は実 backing を返す");
+    }
 }

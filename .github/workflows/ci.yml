@@ -62,8 +62,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: loom model check
+      - name: loom model check (AppendBucket publish)
         run: cargo test -p enchudb-engine --test loom_append_publish --release
+
+      # #270: lazy cylinder build と並行 write の取りこぼし窓。 窓が狭すぎて実コードの
+      # 統合テストでは踏めない (判定を lock の前に hoist した状態で issue95_lockfree_read
+      # 5 run / issue95_stress / engine_model_proptest / issue119_retie_order_all_paths /
+      # issue255_rw_open_lazy_cylinder が全 pass した)。 この model が唯一の gate。
+      - name: loom model check (lazy cylinder build)
+        run: cargo test -p enchudb-engine --test loom_lazy_cylinder_build --release
 
   windows-check:
     name: check (windows cross)
