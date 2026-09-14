@@ -6,7 +6,8 @@
 //! 9211 entity で open +150 ms / drop +100 ms)。 raw cell の走査に替えた。
 //!
 //! gate は 2 つ:
-//! 1. rw open 直後に cylinder が組まれている himo は 0 本 (readonly と同じ)。 列を触ると 1 本ずつ増える
+//! 1. rw open 直後に cylinder が組まれている himo は 0 本 (readonly と同じ)。
+//!    **#270 以降は書き込みでも組まれず**、 最初に `pull` した列だけが 1 本ずつ増える
 //! 2. 走査を替えても free-list の中身は同じ: reopen 後に **live slot は配り直されず**、
 //!    **空いた slot は再利用される** (footprint が伸びない)
 
@@ -65,8 +66,19 @@ fn rw_open_builds_no_cylinder_until_touched() {
     assert_eq!(rw.get(eids[0], "t.h1"), Some(1));
     assert_eq!(rw.get_text_owned(eids[0], "t.h0").as_deref(), Some(b"leaf value 0/0".as_slice()));
     assert_eq!(rw.himos_with_cylinder_built(), 0);
+    // #270: **書き込みも組まない**。 bulk load は pull を一度も引かないので、 書きながら
+    // 育てた index は誰にも使われずに捨てられる (naruhodo のフルリビルドで 1.5GB /
+    // 2,856 万確保)。 組むのは **最初に引かれた時**。
     rw.tie_to(eids[0], "t.h1", 5);
-    assert_eq!(rw.himos_with_cylinder_built(), 1);
+    assert_eq!(rw.himos_with_cylinder_built(), 0, "書き込みでは組まない (#270)");
+    // 遅延構築が **Column から** 組むので、 組む前に書いた値も落ちない。
+    // h1 の値は i + 1 なので 5 は i=4。 そこへ eids[0] を 5 に書き換えた = 2 件が正。
+    let mut got = rw.pull("t.h1", 5);
+    got.sort_unstable();
+    let mut want = vec![enchudb_oplog::eid_local(eids[0]), enchudb_oplog::eid_local(eids[4])];
+    want.sort_unstable();
+    assert_eq!(got, want, "遅延構築した cylinder が write を取りこぼしている (#270)");
+    assert_eq!(rw.himos_with_cylinder_built(), 1, "pull で初めて組む (#270)");
     drop(rw);
     let _ = enchudb_engine::db_files::remove_db(&path);
 }
