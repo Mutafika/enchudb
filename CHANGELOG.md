@@ -3,6 +3,85 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.26.10 — 2026-09-14
+
+**bulk load が誰も引かない逆索引を育てるのをやめた perf patch** (#270、 naruhodo からの報告)。
+on-disk format は**不変**、 migration 不要、 breaking なし、 公開 API の signature 変更なし。
+**大量に tie を書く consumer は上げること** — 特に 「書くだけで `pull` しない」 フルリビルド系。
+0.26.5 (#255) が **rw open** の eager build を畳んだのに対し、 これは **書き込み**に残っていた
+分を畳む。
+
+`himos_with_cylinder_built()` の値が変わるので、 これを見ている consumer は
+「Changed」 節を読むこと。
+
+### Performance — bulk load が誰も引かない cylinder を育てていた (#270)
+
+`HimoStore` の値→eid 逆索引 (`LockFreeCylinder`) を **書き込みのたびに維持**していた。
+bulk load は `pull` を一度も引かないので、 育てた index は**誰にも使われないまま drop で
+捨てられる**。
+
+根因は新規 himo の `cyl_built: AtomicBool::new(true)`。 「新規 column は空なので rebuild
+不要」 という判断自体は正しいが、 このフラグが **「組み済みか」と「以後この索引を維持するか」
+の二役**を兼ねているため、 空ストアへの bulk load が最初から維持モードに入っていた。
+`false` で始めれば writer は cylinder を触らず、 読み手が最初に `pull` した時点で
+`ensure_cylinder_built` が Column から組む — **結果は同じ**、 むしろ stale ゼロで組み上がる。
+
+| naruhodo フルリビルド (9,549 法令 / 辺 1,496 万 / 版 53,668 / tie 約 7,200 万) | 0.26.9 | 0.26.10 |
+|---|---:|---:|
+| **peak memory footprint** | 2.489 GB | **1.264 GB** (−49%) |
+| 峰の生存 heap | 2,073 MB | **598 MB** |
+| 峰の生存ブロック | 33,192,239 | **4,629,909** (−2,856 万) |
+| peak RSS | 6.56 GB | 5.80 GB |
+| real | 404.9 s | **385.5 s** (−19 s) |
+
+成果物は完全一致 (laws=9549 / nodes=988992 / 辺=14957318 / 判例=13949 / 版=53668、 etxt も
+grams=227726 / postings=69274511 / docs=494496)。 consumer 側の整合性検査 (本文復元 /
+施行日 / 版レール) も全数 0 件。 計測は macOS の peak memory footprint (anonymous+dirty)、
+A/B は背中合わせで両 run とも Docker Desktop 停止 (同一バイナリでも 8GB VM の有無で 0.43 GB
+振れるため)。
+
+### Changed — 書き込みは cylinder を組まなくなった (観測可能)
+
+読み取り結果は変わらない (組む前に書いた値も遅延構築が Column から拾う) が、 **index が
+組まれるタイミングが「最初の write」から「最初の `pull`」に動く**。
+
+- `Engine::himos_with_cylinder_built()` は **書き込みでは増えない**。 最初に引かれた列だけ
+  1 本ずつ増える (0.26.5 では `tie` した時点で 1 になっていた)
+- `Engine::himo_cyl_backing_bytes()` は未 build なら **組まずに 0** を返す
+  (観測 API が観測対象を確保しないため)
+- `Engine::compact_himo()` は未 build なら **組まずに返る**。 遅延構築は定義上 stale-free
+  なので掃除する物が無い (従来は index を丸ごと確保してから 「stale ゼロ」 を確認していた)
+- 初回 `pull` は Column 全走査を 1 回払う。 readonly open は #255 以来ずっとこの形なので、
+  rw がそれに揃った
+
+### Fixed — `restore` だけ gate が漏れていた
+
+`HimoStore::restore` (oplog rollback 用) が `ensure_cylinder_built` を呼び続けていたため、
+**rollback 1 回で index が組まれ、 以後の bulk load 全体が維持モードに戻る**穴があった。
+`set` / `remove` / `restore` の 3 経路を `cyl_live()` 1 本に集約して塞いだ。
+
+### 検証
+
+肝は 「フラグ判定は `write_lock` を取った**後**」 という順序契約。 破ると
+**silent lost row** になる (writer が false を読む → reader が write 前の Column を scan して
+flag を立てる → writer は index に入れない → その eid が `pull` から永久に消える)。
+
+- **型で強制**: `cyl_live` は guard を引数に取り、 返り値の lifetime を guard に縛る。
+  lock の前に呼ぶと `E0716`、 guard を先に drop すると `E0505` で **compile error**
+- **loom model** (`tests/loom_lazy_cylinder_build.rs`、 CI に step 追加): 全 interleaving を
+  探索。 判定を lock の前に hoist すると 2 本とも落ちる (single = index `[]` に対し期待
+  `[(0, 7)]`、 two = `[(0, 7)]` に対し期待 `[(0, 7), (1, 7)]` の非対称な取りこぼし)
+- **既存の統合テストはこの窓を踏めない**ことを確認済み。 実コードに同じ hoist を入れても
+  `issue95_lockfree_read` (5 run) / `issue95_stress` / `engine_model_proptest` /
+  `issue119_retie_order_all_paths` / `issue255_rw_open_lazy_cylinder` が全 pass した
+  = loom model が唯一の gate
+- `restore` は workspace 内に caller が無い pub API なので unit test
+  (`writers_never_build_the_cylinder`) で固定
+- 生成コード比較 (`d50518f` → `8942408`): `remove` は命令数 298 で完全同一、 `set` は
+  395 → 355 (−40) で acquire 側の同期命令は 1 個も増えていない
+
+workspace (oplog / engine / schema / sql / sync) **736 tests green**、 loom 4 green。
+
 ## 0.26.9 — 2026-09-08
 
 **build phase の tie に `*_by_id` を足し、 `himo_id` の doc の嘘を直した patch** (#264 / #265、
