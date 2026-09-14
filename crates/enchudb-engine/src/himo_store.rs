@@ -137,8 +137,11 @@ impl HimoStore {
             cyl: LockFreeCylinder::new(max_values),
             value_type: ht,
             max_values,
-            // 新規 column は空なので rebuild 不要、即 built 状態。
-            cyl_built: AtomicBool::new(true),
+            // 新規 column は空なので「組み済み」で始めてよいが、 **それだと bulk load が
+            // 誰も引かない index を育て続ける**(naruhodo のフルリビルドで 1.5GB / 2,856 万確保)。
+            // false で始めれば `set` は cylinder を触らず、 読み手が最初に `pull` した時点で
+            // `ensure_cylinder_built` が Column から組む(空でも正しく、 stale ゼロで組める)。
+            cyl_built: AtomicBool::new(false),
             write_lock: Mutex::new(()),
         }
     }
@@ -236,8 +239,17 @@ impl HimoStore {
     /// commit を伸ばせない = ディスク満杯。 未 commit page に書くと SIGBUS になるので
     /// 書かずに諦める)。 戻り値を無視しても従来どおり動く。
     pub fn set(&self, eid: u32, value: u32) -> bool {
-        self.ensure_cylinder_built();
         let _w = self.write_lock.lock();
+        // cylinder が **まだ組まれていないなら触らない**。 bulk load (ingest) は pull を
+        // 一度も引かないので、 書きながら育てた bucket は誰にも使われずに捨てられる
+        // (naruhodo のフルリビルドで insert 1,113 万回 = 543MB = 生存 heap の 55%)。
+        // 読み手が最初に pull した時点で `ensure_cylinder_built` が Column から組むので
+        // 結果は同じ — むしろ stale ゼロで組み上がる。
+        //
+        // 判定は **write_lock を取った後**に読むこと。 `ensure_cylinder_built` は同じ
+        // lock の中で scan → flag を立てるので、 ここで true を見たなら build は完了済み、
+        // false を見たなら build はまだ lock を取れていない = その後の scan が此の write を拾う。
+        let cyl_live = self.cyl_built.load(Ordering::Acquire);
         let col = self.col();
         if col.ensure_committed_for(eid).is_err() {
             return false;
@@ -248,15 +260,19 @@ impl HimoStore {
             return true; // 冗長な re-tie = no-op（bucket に dup を作らない）
         }
         let mut stale = None;
-        if let Some(o) = old {
-            // 値更新: 旧 value の bucket に stale が残る → その bucket の read は verify する。
-            // Column を書き換える **前** に flag を立てる (request12、順序契約は note_stale 参照)
-            stale = self.cyl.note_stale(o).map(|s| (o, s));
+        if cyl_live {
+            if let Some(o) = old {
+                // 値更新: 旧 value の bucket に stale が残る → その bucket の read は verify する。
+                // Column を書き換える **前** に flag を立てる (request12、順序契約は note_stale 参照)
+                stale = self.cyl.note_stale(o).map(|s| (o, s));
+            }
         }
         // #106: Release store。 leaf offset を publish する前に書いた LeafStore slot
         // (payload/gen) を、 offset を Acquire で読む reader が必ず観測できるようにする。
         col.store_u32_release(eid, value + 1);
-        self.cyl.insert(eid, value);
+        if cyl_live {
+            self.cyl.insert(eid, value);
+        }
         // compaction は Column 更新の **後** (keep = value_eq が新状態を見るため)
         if let Some((o, (len, live))) = stale {
             self.maybe_compact(o, len, live);
@@ -267,12 +283,12 @@ impl HimoStore {
     pub fn remove(&self, eid: u32) {
         let col = self.col();
         if eid < col.count() {
-            self.ensure_cylinder_built();
             let _w = self.write_lock.lock();
+            let cyl_live = self.cyl_built.load(Ordering::Acquire); // set と同じ契約
             if let Some(o) = value_at(col, eid) {
                 // 削除: 旧 bucket に stale が残る（Cylinder は触らない、verify で落とす）。
                 // flag → Column の順 (set と同じ)
-                let stale = self.cyl.note_stale(o);
+                let stale = if cyl_live { self.cyl.note_stale(o) } else { None };
                 col.clear(eid);
                 if let Some((len, live)) = stale {
                     self.maybe_compact(o, len, live);
