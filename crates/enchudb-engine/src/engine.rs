@@ -859,10 +859,31 @@ fn acquire_writer_lock(path: &str) -> io::Result<WriterLock> {
         ));
     }
     // std::fs::File::lock (Rust 1.89 安定化) は unix で flock、 Windows で
-    // LockFileEx に落ちる。 素の libc::flock は Windows に fd 自体が無く使えない。
-    if let Err(err) = f.lock() {
-        writer_registry().remove(&key);
-        return Err(err);
+    // LockFileEx に落ちる。 ただし std は対応 target を列挙で持っており、
+    // **Android (bionic) は `Unsupported`** を返す ("lock() not supported")。
+    // #280: その穴は `enchudb_oplog::filelock` が libc の flock で塞ぐ
+    // (WAL の append guard と同じ経路 = 意味論を 1 箇所に揃える)。
+    match enchudb_oplog::filelock::lock_exclusive(&f) {
+        Ok(enchudb_oplog::filelock::LockOutcome::Locked) => {}
+        // advisory lock を持たない FS (一部の FUSE / ネットワーク FS) では
+        // **プロセス間の排他を諦めて続行する**。 同一プロセスの二重 open は上の
+        // registry が止めるので、 1 app = 1 process の構成は安全側に倒れる。
+        // ここで落とすと platform / FS ごと使えなくなるため、 警告 1 回で開ける。
+        Ok(enchudb_oplog::filelock::LockOutcome::Unsupported) => {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[enchudb] warning: this filesystem has no advisory locks — opening \
+                     \"{path}\" WITHOUT cross-process writer exclusion. a second process \
+                     writing the same DB will corrupt it."
+                );
+            }
+        }
+        Err(err) => {
+            writer_registry().remove(&key);
+            return Err(err);
+        }
     }
     Ok(WriterLock { _file: f, key })
 }
@@ -14163,6 +14184,7 @@ mod cell_version_tests {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     fn tmp(name: &str) -> String {
