@@ -3,6 +3,49 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.26.12 — 2026-09-15
+
+**Android (bionic) で DB を一切開けなかったのを直した patch** (#280、 bisquit からの報告)。
+on-disk format は**不変**、 migration 不要、 breaking なし、 公開 API の変更なし。
+**Android 向けに配る consumer は上げること** (0.26.0〜0.26.11 は Android で使えない)。
+他 platform (iOS / macOS / Linux / Windows) は影響なし。
+
+### Fixed — Android で writer lock が取れず `Engine::open*` が全滅していた (#280)
+
+`std::fs::File::lock` (Rust 1.89 安定化) は対応 target を **列挙**で持っており、
+`target_os = "android"` はそこに無いため **`ErrorKind::Unsupported`** を返す
+("lock() not supported")。 0.26.0 (v10) で writer lock が **writer open の必須経路**に
+なったので、 Android では新規作成も既存 open も等しく失敗していた = 0.26.0 の regression。
+
+```
+uniffi.bisquit_ffi.BisquitException$Open: msg=open db: Io("lock() not supported")
+```
+
+bionic に flock(2) が無いわけではない (NDK の `sys/file.h` が API level の制約無しに
+宣言している)。 std の列挙漏れなので、 `Unsupported` のときだけ libc の flock を直接
+呼ぶ `filelock` (`enchudb-oplog`) を足し、 **open file description 単位 / blocking /
+close で解放** という意味論を他 platform と揃えたまま塞いだ。
+
+- **fcntl の record lock (`F_SETLKW`) は採らなかった**: 同じ file の別 fd を close した
+  だけでそのプロセスの lock が全部消え、 同一プロセス内では常に成功する (= 排他に
+  ならない)。 32bit target では `flock64` 構造体も要る。 呼び出し側 (engine の writer
+  lock / WAL の append guard) は flock の意味論を前提に書かれている
+- **WAL の append 経路も同じ穴だった**: `OpLog::flock_exclusive` は engine の writer lock
+  とは別の call site で、 engine 側だけ直しても **Android は open は通って最初の書き込みで
+  失敗する**。 unlock も同じ target で `Unsupported` を返すため、 放置すると一度取った
+  lock が永久に解放されず別プロセスの append が無限に待つ。 両方 `filelock` 経由に統一した
+- advisory lock を持たない file system (一部の FUSE / ネットワーク FS) では
+  `LockOutcome::Unsupported` を返し、 **警告 1 回で排他なしに続行**する。 ここで失敗させると
+  platform / FS ごと使えなくなるため。 同一プロセスの二重 open は従来どおり
+  `WRITER_LOCK_REGISTRY` が止めるので、 1 app = 1 process の構成は安全側に倒れる
+
+**検証**: bisquit の Android 実機 (SM-F966Z / arm64-v8a) でストア作成 → ペアリング → sync
+まで通過 (Mac 42 件 ↔ 端末 42 件で収束、 blob 転送も完了)。 回帰テスト
+`fallback_lock_excludes_other_fd_and_releases` は **別 fd から取れないこと** と
+**close / unlock で解放されること** の両方を固定しており、 no-op 実装にも fcntl 版にも
+差し替えると落ちる。 `cargo check` は aarch64-linux-android / armv7-linux-androideabi /
+x86_64-pc-windows-msvc で通過。
+
 ## 0.26.11 — 2026-09-14
 
 **page size が違う機械の間で DB が可搬でなかったのを直した patch** (#276、 naruhodo からの報告)。
