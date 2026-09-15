@@ -16,6 +16,8 @@ sha2 = "0.10"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 memmap2 = "0.9"
 
-# libc は unix 限定 (flock は std::fs::File::lock に移行済み)。
+# libc は unix 限定。 flock は std::fs::File::lock 経由だが、 std が対応 target を
+# 列挙で持つため Android (bionic) だけ Unsupported になる。 その穴を src/filelock.rs
+# が libc::flock で塞ぐ (#280)。
 [target.'cfg(all(not(target_arch = "wasm32"), unix))'.dependencies]
 libc = "0.2"

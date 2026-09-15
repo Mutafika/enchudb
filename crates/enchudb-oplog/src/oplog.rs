@@ -523,6 +523,10 @@ pub struct RelayedHeader {
 /// 排他 advisory lock 解放用 RAII guard。 drop で unlock する。
 /// `std::fs::File::lock` は unix で flock、 Windows で LockFileEx に落ちる
 /// (Rust 1.89 で安定化)。 素の `libc::flock` は Windows に fd 自体が無く使えない。
+/// #280: std が flock を持たない target (Android/bionic) は `crate::filelock`
+/// が libc の flock に落とす。 unlock も同じ経路を通す (std の `unlock` も
+/// 同じ target で `Unsupported` を返すため、 そのままでは **一度取った lock が
+/// 永久に解放されず、 別プロセスの append が無限に待つ**)。
 #[cfg(not(target_arch = "wasm32"))]
 struct OpLogLockGuard<'a> {
     file: &'a File,
@@ -531,7 +535,7 @@ struct OpLogLockGuard<'a> {
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for OpLogLockGuard<'_> {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = crate::filelock::unlock(self.file);
     }
 }
 
@@ -1547,7 +1551,11 @@ impl OpLog {
     /// 取得まで block する (典型的に数 µs〜ms)。 read 経路は lock 取らない。
     #[cfg(not(target_arch = "wasm32"))]
     fn flock_exclusive(&self) -> io::Result<OpLogLockGuard<'_>> {
-        self._file.lock()?;
+        // #280: advisory lock を持たない FS では **排他なしで続行**する
+        // (エラーにすると platform / FS ごと書き込み不能になる)。 同一プロセス内の
+        // 直列化は呼び出し側の `append_lock` が担うので、 単一プロセス構成
+        // (モバイル) は安全側に倒れる。 guard の unlock は no-op になる。
+        let _ = crate::filelock::lock_exclusive(&self._file)?;
         Ok(OpLogLockGuard { file: &self._file })
     }
 

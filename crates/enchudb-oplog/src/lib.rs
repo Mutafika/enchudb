@@ -33,6 +33,11 @@
 pub mod keys;
 pub mod oplog;
 
+/// #280: `std::fs::File::lock` が `Unsupported` を返す platform (Android/bionic)
+/// 向けの file lock 吸収。 engine の writer lock もここを通る。
+#[cfg(not(target_arch = "wasm32"))]
+pub mod filelock;
+
 /// Content key 用の簡易 hash → 15bit。MSB は LWW key namespace で占有。
 /// engine 側の recover hydrate と sync 側の apply_one で同じハッシュを使うため
 /// oplog crate に共通化してある。 変更すると HlcStore キーが分岐するので注意。
