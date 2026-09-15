@@ -14312,11 +14312,26 @@ mod tests {
         eng.flush_writes();
         eng.oplog_sync().unwrap();
 
-        // WAL の位置が host から読めること (#268 で 「無い」 と言われた片割れ)
+        // WAL の位置が host から読めること (#268 で 「無い」 と言われた片割れ)。
+        //
+        // #282: `head > HEADER_SIZE` は **bridge が終わるまでの間しか成り立たない**。
+        // consumer thread が record を bridge すると `try_reset_if` が発火して
+        // head = checkpoint = HEADER_SIZE に畳むため、 一発読みだと fold と競争して
+        // 割れる (CI で実際に割れた)。 このテストの他の assert と同じく **収束**で
+        // 書く: 「head が進んでいる」 か 「畳まれた (= bridge 済み = lsn が動いた)」
+        // のどちらかに落ち着けば、 host から WAL の位置が読めている。
         assert!(
-            eng.oplog_head() > enchudb_oplog::oplog::HEADER_SIZE as u64,
-            "head が観測できない",
+            until(|| {
+                eng.oplog_head() > enchudb_oplog::oplog::HEADER_SIZE as u64
+                    || eng.current_sync_lsn() > 0
+            }),
+            "head も lsn も動かない (head={}, checkpoint={}, lsn={})",
+            eng.oplog_head(),
+            eng.oplog_checkpoint(),
+            eng.current_sync_lsn(),
         );
+        // checkpoint は fold されても HEADER_SIZE に戻るだけで 0 にはならない
+        // (= fold と競争しないので一発読みのままでよい)。
         assert!(eng.oplog_checkpoint() > 0, "checkpoint が観測できない");
 
         // 1 件目が bridge されるまで待つ (consumer thread と手動 transfer のどちらでもよい)
