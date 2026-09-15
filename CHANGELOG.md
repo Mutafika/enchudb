@@ -3,6 +3,33 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.26.13 — 2026-09-15
+
+**テストのみの patch** (#282)。 product code の変更は無く、 **consumer が上げる理由は無い**
+(0.26.12 と生成物は同一)。 CI を赤くしていた flaky test を直しただけ。
+
+### Fixed — bridge_counters の head 観測が consumer の fold と競争して割れていた (#282)
+
+`engine::tests::bridge_counters_separate_a_quiet_bridge_from_a_stalled_one` の
+
+```rust
+assert!(eng.oplog_head() > enchudb_oplog::oplog::HEADER_SIZE as u64, "head が観測できない");
+```
+
+は **bridge が終わるまでの間しか成り立たない観測値**を一発で読んでいた。
+`open_concurrent_with_oplog` の consumer thread が record を bridge すると
+`OpLog::try_reset_if` が発火して head = checkpoint = HEADER_SIZE に畳むため、 consumer が
+先に回ったマシンでは割れる (#281 の CI で実際に発生、 同一 SHA の rerun では緑 = flaky)。
+append 自体は成功しており **product の failure ではない**。
+
+同テストの他の assert と同じ **収束**形 (「head が進んでいる」 か 「畳まれた
+(= bridge 済み = lsn が動いた)」 のどちらかに落ち着くまで待つ) にした。 どちらの終状態でも
+「host から WAL の位置が読める」 という #268 の意図は満たす。 `checkpoint > 0` は fold されても
+HEADER_SIZE に戻るだけで 0 にはならない (= fold と競争しない) ので一発読みのまま残した。
+
+**検証**: 修正前に 100% 落ちた条件 (assert 直前に `sleep(300ms)` を入れて consumer に fold の
+機会を与える) で通る。 単体 20 回連続で fail 0、 lib 全体 287 passed / 0 failed。
+
 ## 0.26.12 — 2026-09-15
 
 **Android (bionic) で DB を一切開けなかったのを直した patch** (#280、 bisquit からの報告)。
