@@ -501,6 +501,55 @@ pub struct Record {
     pub signed_bytes: Vec<u8>,
 }
 
+/// #268: scan が **なぜそこで止まったか**。
+///
+/// bridge cursor が進むのは Commit に到達したときだけなので、 「空 scan が続く」 の
+/// 原因は **cursor 位置の record が読めない** (`BadMagic` 以下) か **record は在るが
+/// Commit が付いていない** (`Head` + 未 commit 件数 > 0) の 2 つに割れる。 従来は
+/// どちらも 「0 件」 としか観測できず、 実機の恒久停止 (#268) を切り分けられなかった。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanStop {
+    /// head まで読み切った (= 打ち切りではない)。
+    Head,
+    /// record magic 不一致 = その offset に record が無い (未書き込み / 別用途)。
+    BadMagic,
+    /// record version 不一致。
+    BadVersion,
+    /// payload が file 末尾を越える (truncated)。
+    OutOfBounds,
+    /// payload CRC 不一致 (破損 tail)。
+    BadCrc,
+    /// 新しい version が書いた未知 op_type。
+    UndecodableOp,
+}
+
+impl ScanStop {
+    /// ログ / counter 用の短い識別子。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScanStop::Head => "reached-head",
+            ScanStop::BadMagic => "bad-magic",
+            ScanStop::BadVersion => "bad-version",
+            ScanStop::OutOfBounds => "out-of-bounds",
+            ScanStop::BadCrc => "bad-crc",
+            ScanStop::UndecodableOp => "undecodable-op",
+        }
+    }
+}
+
+/// `scan_from_offset` の結果。
+struct ScanOut {
+    /// Commit で閉じた group の record 群。
+    out: Vec<(Record, u64)>,
+    max_lsn: u64,
+    max_hlc: Hlc,
+    /// 最後に読み切った Commit の直後 offset (1 つも無ければ start_offset)。
+    committed_end: u64,
+    /// 末尾の **未 commit** batch (Commit で閉じられなかった分)。
+    tail: Vec<(Record, u64)>,
+    stop: ScanStop,
+}
+
 /// #152: scan の内部表現 `(Record, 終端 offset)` から offset を落とす。
 /// partial advance が要らない既存 caller 用。
 #[inline]
@@ -572,6 +621,9 @@ pub struct OpLog {
     /// 長期運用で WAL 容量を食い切らない動きになるが、audit/iter_committed/publish_since
     /// で読む前に消える race があるので opt-in。
     auto_reset: std::sync::atomic::AtomicBool,
+    /// #268: テスト用 fault injection。 残り回数ぶん Commit の append を満杯として
+    /// 失敗させる。 0 (既定) で何もしない。 `fail_next_commits` の doc を参照。
+    fail_next_commits: std::sync::atomic::AtomicU32,
 }
 
 unsafe impl Send for OpLog {}
@@ -672,6 +724,7 @@ impl OpLog {
             append_lock: std::sync::Mutex::new(()),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
+            fail_next_commits: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -737,6 +790,7 @@ impl OpLog {
             append_lock: std::sync::Mutex::new(()),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
+            fail_next_commits: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -763,6 +817,43 @@ impl OpLog {
     /// 現在の checkpoint(ここまで本体に反映済み)。
     #[inline]
     pub fn checkpoint(&self) -> u64 { self.checkpoint.load(Ordering::Acquire) }
+
+    /// **採番に使う head**。 native では mmap 上の永続値を真実とし、 process-local
+    /// atomic と突き合わせる — 別 process が直前に append していると `self.head` は
+    /// 古いため。
+    ///
+    /// #268: `append_dead` / `free_bytes` (= 「もう書けないか」 の観測) もこの値で
+    /// 判定する。 in-memory head だけを見ていた旧実装は、 **実際の append は満杯で
+    /// 失敗し続けているのに 「まだ余裕がある」 と答える**ことがあり、 その乖離は
+    /// `wal_fold_safe` の死区間例外 (= brick の唯一の出口) まで塞いでいた。
+    #[inline]
+    fn alloc_head(&self) -> u64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mm = self.mmap_slice();
+            let on_disk = u64::from_le_bytes(mm[8..16].try_into().unwrap());
+            on_disk.max(self.head.load(Ordering::Acquire))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.head.load(Ordering::Acquire)
+        }
+    }
+
+    /// `size` bytes を予約して開始 offset を返す。 **`append_lock` 保持下で呼ぶこと**。
+    ///
+    /// head は record 本体を書く **前** に bump される (scan は Commit で閉じた
+    /// group しか `out` に載せないので、 書き込み途中の領域が読まれることはない)。
+    #[inline]
+    fn alloc(&self, size: u64) -> io::Result<u64> {
+        let cur = self.alloc_head();
+        let new = cur + size;
+        if new > self.capacity {
+            return Err(self.wal_full_err());
+        }
+        self.head.store(new, Ordering::Release);
+        Ok(cur)
+    }
 
     /// 次に発行する LSN。
     #[inline]
@@ -885,30 +976,7 @@ impl OpLog {
         let _lock = self.flock_exclusive()?;
 
         // 一括 allocate
-        let start_offset = {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let mm = self.mmap_slice();
-                let on_disk = u64::from_le_bytes(mm[8..16].try_into().unwrap());
-                let cur = on_disk.max(self.head.load(Ordering::Acquire));
-                let new = cur + total as u64;
-                if new > self.capacity {
-                    return Err(self.wal_full_err());
-                }
-                self.head.store(new, Ordering::Release);
-                cur
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                let cur = self.head.load(Ordering::Acquire);
-                let new = cur + total as u64;
-                if new > self.capacity {
-                    return Err(self.wal_full_err());
-                }
-                self.head.store(new, Ordering::Release);
-                cur
-            }
-        };
+        let start_offset = self.alloc(total as u64)?;
 
         let mut lsns = Vec::with_capacity(records.len());
         let keypair = self.keypair.read().unwrap().clone();
@@ -1034,30 +1102,7 @@ impl OpLog {
         let _lock = self.flock_exclusive()?;
 
         // head 採番は append_inner と同じ規則 (mmap 上の永続値を真実とする)。
-        let offset = {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let mm = self.mmap_slice();
-                let on_disk = u64::from_le_bytes(mm[8..16].try_into().unwrap());
-                let cur = on_disk.max(self.head.load(Ordering::Acquire));
-                let new = cur + record_size as u64;
-                if new > self.capacity {
-                    return Err(self.wal_full_err());
-                }
-                self.head.store(new, Ordering::Release);
-                cur
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                let cur = self.head.load(Ordering::Acquire);
-                let new = cur + record_size as u64;
-                if new > self.capacity {
-                    return Err(self.wal_full_err());
-                }
-                self.head.store(new, Ordering::Release);
-                cur
-            }
-        };
+        let offset = self.alloc(record_size as u64)?;
 
         let mmap = self.mmap_mut_slice();
         let off = offset as usize;
@@ -1128,6 +1173,11 @@ impl OpLog {
             }
         });
 
+        // #268: テスト用 fault injection (既定では atomic load すら踏まない)。
+        if matches!(op, Op::Commit) && self.take_commit_fault() {
+            return Err(self.wal_full_err());
+        }
+
         // #75: 同一プロセス内は append_lock、 プロセス間は flock で直列化。
         // flock は open file description 単位なので、 同じ File を共有する
         // スレッド間では排他にならない — append_lock が必須。
@@ -1138,31 +1188,8 @@ impl OpLog {
         // ── head を mmap 上の値から読み直して採番 ──
         // 別 process が直前に append した場合、 self.head (process-local atomic) は
         // 古い値を持ってるので、 lock 中に mmap 上の永続値を真実とする。
-        let offset = {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let mm = self.mmap_slice();
-                let on_disk = u64::from_le_bytes(mm[8..16].try_into().unwrap());
-                let cur = on_disk.max(self.head.load(Ordering::Acquire));
-                let new = cur + record_size as u64;
-                if new > self.capacity {
-                    return Err(self.wal_full_err());
-                }
-                // append_lock + flock の両方を保持しているので単純 store で OK
-                self.head.store(new, Ordering::Release);
-                cur
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                let cur = self.head.load(Ordering::Acquire);
-                let new = cur + record_size as u64;
-                if new > self.capacity {
-                    return Err(self.wal_full_err());
-                }
-                self.head.store(new, Ordering::Release);
-                cur
-            }
-        };
+        // append_lock + flock の両方を保持しているので単純 store で OK。
+        let offset = self.alloc(record_size as u64)?;
 
         let lsn = self.next_lsn.fetch_add(1, Ordering::AcqRel);
         // relay 経路では受信 HLC/author/署名をそのまま乗せる (gossip 用)。
@@ -1284,16 +1311,19 @@ impl OpLog {
     /// **永久に未 commit** のまま残る（recovery からも sync bridge からも不可視）。
     /// その tail を「畳んでよい死区間」と判定するために使う
     /// （engine の `wal_fold_safe` 参照）。
+    ///
+    /// #268: 判定は `alloc` と同じ `alloc_head()` で行う。 in-memory head だけを
+    /// 見ていると、 別 fd の append で on-disk head だけが進んだ DB で
+    /// 「append は全滅しているのに append_dead() は false」 になり、
+    /// 出口 (fold の死区間例外) が閉じたまま無音で止まる。
     pub fn append_dead(&self) -> bool {
-        let head = self.head.load(Ordering::Acquire);
-        head + REC_HEADER_SIZE as u64 > self.capacity
+        self.alloc_head() + REC_HEADER_SIZE as u64 > self.capacity
     }
 
     /// 残り append 可能バイト数（観測用）。 `append_dead` と対で、 呼び出し側が
     /// 「WAL がどれだけ逼迫しているか」を可視化するのに使う。
     pub fn free_bytes(&self) -> u64 {
-        self.capacity
-            .saturating_sub(self.head.load(Ordering::Acquire))
+        self.capacity.saturating_sub(self.alloc_head())
     }
 
     /// auto_reset を切り替え(Syncer attached の engine では false にする)。
@@ -1306,6 +1336,29 @@ impl OpLog {
     /// auto_reset の現在値。
     pub fn auto_reset_enabled(&self) -> bool {
         self.auto_reset.load(Ordering::Acquire)
+    }
+
+    /// #268: **テスト専用** fault injection。 次の `n` 回の Commit append を
+    /// 「WAL 満杯」 として失敗させる。
+    ///
+    /// 「Commit が打てない」 状態は実機では満杯 / 別 fd の head 先行でしか起きず、
+    /// test から自然に作れない。 一方でそこは **恒久停止の入口** (閉じられない
+    /// group が checkpoint の後ろに取り残されると、 bridge からも recovery からも
+    /// 見えなくなる) なので、 gate を張れないままにしたくない。 判定は Commit の
+    /// append だけで行うので、 通常 record の append には分岐も atomic load も
+    /// 増えない。
+    #[doc(hidden)]
+    pub fn fail_next_commits(&self, n: u32) {
+        self.fail_next_commits.store(n, Ordering::Release);
+    }
+
+    /// fault injection の残数を 1 消費する。 消費できたら true。
+    fn take_commit_fault(&self) -> bool {
+        self.fail_next_commits
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                if n == 0 { None } else { Some(n - 1) }
+            })
+            .is_ok()
     }
 
     /// fsync(WAL 本体のみ)。consumer スレッドが定期実行。
@@ -1335,13 +1388,13 @@ impl OpLog {
     /// checkpoint 位置は無視(既に apply 済みの記録もまだ WAL file 上にあれば拾う)。
     /// Syncer.publish_since で使う。ring buffer reset 済みの記録は取れない。
     pub fn iter_committed(&self) -> Vec<Record> {
-        strip_offsets(self.scan_from_offset(HEADER_SIZE as u64).0)
+        strip_offsets(self.scan_from_offset(HEADER_SIZE as u64).out)
     }
 
     /// 指定 offset 以降の commit 済みレコードを返す。changefeed の差分発火用。
     /// `start_offset` は前回 emit 時の `wal.checkpoint()` を渡す想定。
     pub fn iter_committed_from(&self, start_offset: u64) -> Vec<Record> {
-        strip_offsets(self.scan_from_offset(start_offset).0)
+        strip_offsets(self.scan_from_offset(start_offset).out)
     }
 
     /// #152: `iter_committed_from_with_end` に **各 record の終端 offset** を添えた版。
@@ -1354,8 +1407,24 @@ impl OpLog {
     /// 必ず Commit で閉じられた group の一員なので、 再 scan は残りの record を読んでから
     /// その Commit に到達して flush する。
     pub fn iter_committed_from_with_offsets(&self, start_offset: u64) -> (Vec<(Record, u64)>, u64) {
-        let (out, _, _, committed_end, _) = self.scan_from_offset(start_offset);
-        (out, committed_end)
+        let s = self.scan_from_offset(start_offset);
+        (s.out, s.committed_end)
+    }
+
+    /// #268: `iter_committed_from_with_offsets` に **scan の診断**を添えた版。
+    ///
+    /// 返り値の 3 番目は 「読めたが Commit で閉じられていない record 数」、
+    /// 4 番目は 「scan がなぜ止まったか」。 bridge が 0 を返し続けるとき、
+    /// この 2 つで原因が 2 分される:
+    ///
+    /// - `(0, BadMagic | BadCrc | ..)` — cursor 位置の record が読めない
+    /// - `(n > 0, Head)` — record は在るが Commit が付いていない (= 閉じ待ち)
+    pub fn iter_committed_from_with_diag(
+        &self,
+        start_offset: u64,
+    ) -> (Vec<(Record, u64)>, u64, usize, ScanStop) {
+        let s = self.scan_from_offset(start_offset);
+        (s.out, s.committed_end, s.tail.len(), s.stop)
     }
 
     /// #77-H4: `iter_committed_from` + 「読み切った commit 済み group の終端
@@ -1364,8 +1433,8 @@ impl OpLog {
     /// bump されるため、 scan 後に `head()` を再読して cursor にすると、 scan が
     /// 書き込み途中 record で break した位置〜head 間の record を恒久 skip する。
     pub fn iter_committed_from_with_end(&self, start_offset: u64) -> (Vec<Record>, u64) {
-        let (out, _, _, committed_end, _) = self.scan_from_offset(start_offset);
-        (strip_offsets(out), committed_end)
+        let s = self.scan_from_offset(start_offset);
+        (strip_offsets(s.out), s.committed_end)
     }
 
     /// リカバリ: checkpoint から head までを読んで、Commit で挟まれたグループだけ返す。
@@ -1407,15 +1476,15 @@ impl OpLog {
     /// `recover` / `recover_with_tail` の共通部。 clock 復元 (#77-H5) はここだけで行う。
     fn recover_inner(&self) -> (Vec<Record>, Vec<Record>) {
         let start = self.checkpoint.load(Ordering::Acquire);
-        let (out, max_lsn, max_hlc, _, tail) = self.scan_from_offset(start);
-        if max_lsn > 0 {
-            self.next_lsn.store(max_lsn + 1, Ordering::Release);
+        let s = self.scan_from_offset(start);
+        if s.max_lsn > 0 {
+            self.next_lsn.store(s.max_lsn + 1, Ordering::Release);
         }
-        if max_hlc.wall > 0 {
-            self.hlc_last_wall.store(max_hlc.wall, Ordering::Release);
-            self.hlc_logical.store(max_hlc.logical, Ordering::Release);
+        if s.max_hlc.wall > 0 {
+            self.hlc_last_wall.store(s.max_hlc.wall, Ordering::Release);
+            self.hlc_logical.store(s.max_hlc.logical, Ordering::Release);
         }
-        (strip_offsets(out), strip_offsets(tail))
+        (strip_offsets(s.out), strip_offsets(s.tail))
     }
 
     /// 指定 offset から head までを Commit グループ単位で読む。共通実装。
@@ -1432,7 +1501,7 @@ impl OpLog {
     fn scan_from_offset(
         &self,
         start_offset: u64,
-    ) -> (Vec<(Record, u64)>, u64, Hlc, u64, Vec<(Record, u64)>) {
+    ) -> ScanOut {
         let mut out = Vec::new();
         let mut batch = Vec::new();
         let mut offset = start_offset;
@@ -1440,15 +1509,23 @@ impl OpLog {
         let head = self.head.load(Ordering::Acquire);
         let mut max_lsn = 0;
         let mut max_hlc = Hlc::ZERO;
+        // #268: 打ち切り理由。 while を抜け切れば「head まで読んだ」。
+        let mut stop = ScanStop::Head;
 
         let mmap = self.mmap_slice();
 
         while offset < head {
             let rec_end = (offset as usize) + REC_HEADER_SIZE;
-            if rec_end > mmap.len() { break; }
+            if rec_end > mmap.len() { stop = ScanStop::OutOfBounds; break; }
             let header = &mmap[offset as usize..rec_end];
-            if &header[OFF_MAGIC..OFF_MAGIC + 2] != REC_MAGIC { break; }
-            if header[OFF_VERSION] != REC_VERSION { break; }
+            if &header[OFF_MAGIC..OFF_MAGIC + 2] != REC_MAGIC {
+                stop = ScanStop::BadMagic;
+                break;
+            }
+            if header[OFF_VERSION] != REC_VERSION {
+                stop = ScanStop::BadVersion;
+                break;
+            }
 
             let op_byte = header[OFF_OP];
             let payload_len = u32::from_le_bytes(header[OFF_LEN..OFF_LEN + 4].try_into().unwrap()) as usize;
@@ -1466,10 +1543,13 @@ impl OpLog {
 
             let payload_off = rec_end;
             let payload_end = payload_off + payload_len;
-            if payload_end > mmap.len() { break; }
+            if payload_end > mmap.len() { stop = ScanStop::OutOfBounds; break; }
 
             let computed_crc = fnv1a(&mmap[payload_off..payload_end]);
-            if stored_crc != computed_crc { break; } // 破損 tail
+            if stored_crc != computed_crc {
+                stop = ScanStop::BadCrc; // 破損 tail
+                break;
+            }
 
             let payload_slice = &mmap[payload_off..payload_end];
             let op = decode_op(op_byte, payload_slice);
@@ -1519,6 +1599,7 @@ impl OpLog {
                             op_byte, offset,
                         );
                     }
+                    stop = ScanStop::UndecodableOp;
                     break;
                 }
             }
@@ -1527,7 +1608,7 @@ impl OpLog {
         }
 
         // 未 commit batch は `out` には混ぜず、 呼び手が選べるよう別枠で返す。
-        (out, max_lsn, max_hlc, committed_end, batch)
+        ScanOut { out, max_lsn, max_hlc, committed_end, tail: batch, stop }
     }
 
     /// head を checkpoint に戻す(WAL truncate 相当、uncommitted も全捨て)。
@@ -1611,6 +1692,7 @@ impl OpLog {
             append_lock: std::sync::Mutex::new(()),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
+            fail_next_commits: std::sync::atomic::AtomicU32::new(0),
         }
     }
 }
@@ -2281,5 +2363,109 @@ mod tests {
         let wal = OpLog::create(&p, 1024 * 1024).unwrap();
         let batch = vec![OwnedOp::Tie { eid: 1, himo_id: 0, value: 1 }];
         let _ = wal.append_many_with_hlcs(&batch, &[]);
+    }
+
+    /// #268: 「bridge が 0 を返し続ける」 の原因は 2 つに割れる — cursor 位置の
+    /// record が読めないのか、 record は在るが Commit が付いていないのか。
+    /// 従来はどちらも 「0 件」 としか見えず、 実機 26.4 時間の停止を後から特定
+    /// できなかった。 診断値がその 2 つを名指しで分けることを固定する。
+    #[test]
+    fn scan_diag_separates_unclosed_group_from_unreadable_cursor() {
+        let p = tmp("scan-diag");
+        let start = HEADER_SIZE as u64;
+        {
+            let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+            wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
+            wal.append(Op::Tie { eid: 2, himo_id: 0, value: 2 }).unwrap();
+
+            // ① Commit が付いていない = record は読めているが閉じていない
+            let (out, end, pending, stop) = wal.iter_committed_from_with_diag(start);
+            assert!(out.is_empty(), "未 commit の record が commit 済みとして出ている");
+            assert_eq!(end, start, "commit されていないのに cursor が進んでいる");
+            assert_eq!(pending, 2, "未 commit 件数が観測できない");
+            assert_eq!(stop, ScanStop::Head, "打ち切りではなく head まで読んだはず");
+
+            // 閉じれば同じ cursor から一括で出る (= 実機の 「復帰の瞬間に全部出る」)
+            wal.append(Op::Commit).unwrap();
+            let (out, end, pending, stop) = wal.iter_committed_from_with_diag(start);
+            assert_eq!(out.len(), 2, "Commit 後も record が出てこない");
+            assert!(end > start, "Commit を読んでも cursor 終端が進まない");
+            assert_eq!(pending, 0, "閉じたのに未 commit 件数が残っている");
+            assert_eq!(stop, ScanStop::Head);
+        }
+
+        // ② cursor 位置の record が読めない = 打ち切り。 pending は 0 のまま。
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = OpenOptions::new().write(true).open(&p).unwrap();
+            f.seek(SeekFrom::Start(start)).unwrap();
+            f.write_all(b"??").unwrap(); // record magic を潰す
+            f.flush().unwrap();
+        }
+        let wal = OpLog::open(&p).unwrap();
+        let (out, end, pending, stop) = wal.iter_committed_from_with_diag(start);
+        assert!(out.is_empty());
+        assert_eq!(end, start, "読めない位置を越えて cursor が進んでいる");
+        assert_eq!(pending, 0, "1 件も読めていないのに未 commit 件数が立っている");
+        assert_eq!(stop, ScanStop::BadMagic, "打ち切り理由が名指しされていない");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// #268: `append_dead()` は **実際の採番規則と同じ値**で判定しなければならない。
+    ///
+    /// 採番は `max(on-disk head, in-memory head)` を使うので、 別 fd が append した
+    /// 後の handle は 「in-memory head はまだ小さいが、 append は満杯で必ず失敗する」
+    /// 状態になる。 ここで `append_dead()` が false を返すと、 host の tripwire
+    /// (`wal_append_dead`) も fold の死区間例外 (= 唯一の出口) も揃って黙る。
+    #[test]
+    fn append_dead_agrees_with_a_real_append_failure_after_another_fd_filled_it() {
+        let p = tmp("append-dead-sync");
+        let cap = 1024;
+        let writer = OpLog::create(&p, cap).unwrap();
+        // 別 fd (= 別 open file description)。 この時点の in-memory head は HEADER_SIZE。
+        let stale = OpLog::open(&p).unwrap();
+        assert_eq!(stale.head(), HEADER_SIZE as u64);
+
+        while writer.append(Op::Commit).is_ok() {}
+        assert!(writer.append_dead(), "満杯にした本人が dead と言っていない");
+
+        assert_eq!(
+            stale.head(),
+            HEADER_SIZE as u64,
+            "前提が崩れている: stale handle の in-memory head が更新されている",
+        );
+        assert!(
+            stale.append(Op::Commit).is_err(),
+            "前提が崩れている: 満杯の WAL に append できてしまった",
+        );
+        assert!(
+            stale.append_dead(),
+            "append は必ず失敗するのに append_dead() が false (in-memory head だけを見ている)",
+        );
+        assert_eq!(
+            stale.free_bytes(),
+            writer.free_bytes(),
+            "同じ file なのに残量の答えが handle ごとに違う",
+        );
+        assert!(
+            stale.free_bytes() < REC_HEADER_SIZE as u64,
+            "record 1 本も入らない残量なのに free_bytes がそう言っていない ({})",
+            stale.free_bytes(),
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// #268: fault injection は **Commit だけ**を落とす (通常 record は素通し)。
+    #[test]
+    fn commit_fault_injection_fails_only_commits() {
+        let p = tmp("commit-fault");
+        let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+        wal.fail_next_commits(1);
+        assert!(wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).is_ok(), "通常 record まで落ちている");
+        assert!(wal.append(Op::Commit).is_err(), "Commit が落ちていない");
+        assert!(wal.append(Op::Commit).is_ok(), "残数 0 になっても落ち続けている");
+        let _ = std::fs::remove_file(&p);
     }
 }
