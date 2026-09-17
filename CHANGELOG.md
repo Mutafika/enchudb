@@ -3,6 +3,84 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.26.14 — 2026-09-18
+
+**sync 配布の恒久停止 (brick) を根治した patch** (#268)。 on-disk format は**不変**、
+migration 不要、 公開 API の削除・改名なし。 **sync tables を使う consumer は上げること** —
+0.26.13 以前は Commit marker の append が 1 度失敗するだけで、 **配布が再起動まで
+永久に止まる** 経路が残っている (実機で 26.4 時間の無音停止が発現)。
+
+### Fixed — Commit を打てなかったのに checkpoint を進めていた (#268)
+
+実機 (syncretic、 mac、 単一 writer) で bridge が 26.4 時間 0 を返し続け、 lsn が 859793 で
+凍結した。 #269 で入れた検出器が捉えた形は `cursor=32 (ring 先頭) / head=256` で、 254 件の
+警告すべてで cursor が 1 byte も動いていない。 その 224 byte は **Commit で閉じられていない
+group** だった。
+
+Commit の append は engine 内の 5 箇所すべてが `let _ = wal.append(Op::Commit)` で、
+**失敗しても直後の `advance_checkpoint(head)` を無条件に実行**していた。 1 回でも失敗すると:
+
+- group は閉じられないので **bridge は永久に 0** (`out` に載るのは Commit で閉じた record だけ)
+- checkpoint がその group を越えるので **recovery からも見えない**
+- `head == checkpoint` になり、 周期 fsync の `head > checkpoint` が false =
+  **Commit を打ち直すこともしない**
+
+三つ目が効いて **自力では二度と抜けられない**。 5 箇所を `append_commit_marker()` に一本化し、
+戻り値で checkpoint 前進を決めるようにした。 据え置けば `head > checkpoint` が残るので次の
+tick が Commit を打ち直す = 一過性の要因なら **再起動せず自力で復帰する**。 例外は死区間
+(`append_dead` = Commit 1 個も入らない) で、 こちらは二度と閉じられないので従来どおり進めて
+fold に任せる。
+
+### Fixed — WAL 満杯時に writer thread が `yield_now` で spin し続けていた (#268)
+
+WAL append が失敗したとき内部の `wal_append_count` を進め忘れていたため、 満杯の WAL では
+`flush_writes()` の barrier (`wal_appended >= wal_pushed`) が永久に成立しなかった。
+**sleep も mutex 待ちも panic も無いので thread dump には 「待っている」 とすら映らない** —
+報告にあった 「30 本のスレッドの中に publish ループが居ない / 1 秒 sleep がどこにも無い /
+panic 0 件 / mutex 待ち 0 件」 はこの形。 barrier の意味は 「queue に残っていない」 であって
+失敗 record の再送ではないので、 失敗時も進めるのが正しい。
+
+### Fixed — `append_dead()` / `free_bytes()` が handle ごとに違う答えを返していた (#268)
+
+採番は `max(on-disk head, in-memory head)` なのに、 判定は in-memory head だけを見ていた。
+別 fd が WAL を埋めた後の handle では **「append は必ず失敗するのに `append_dead()` は false」**
+になり、 consumer の tripwire も **fold の死区間例外 (= 満杯 brick の唯一の出口)** も揃って
+黙る。 採番と同じ基準に揃えた。
+
+### Changed — `oplog_sync()` が Commit 失敗時に `Err` を返す
+
+**挙動変更**。 これまでは Commit marker を打てなくても `Ok(())` を返しており、 それが
+「`oplog_sync()` は成功したのに配布されない」 の正体だった。 打てなかった場合は直前に push
+された record が commit されないまま = `_sync_ops` にも recovery にも出ないので、 `Err` を返す。
+
+**例外: WAL 満杯 (`append_dead`) は従来どおり `Ok`。** Commit は payload 0 =
+`REC_HEADER_SIZE` ちょうどなので 「容量起因の Commit 失敗」 と `append_dead()` は同値であり、
+そこで `Err` を返すと **満杯という設計上の自己回復経路 (checkpoint 前進 → fold) に居るだけの
+呼び出し側が Err を受ける**ことになる。 満杯を踏むだけで `oplog_sync()` が失敗する、
+とはならない。
+
+### Added — 停止の 「形」 を O(1) で切り分ける観測点 (#268、 #269 の続き)
+
+| API | 何が分かるか |
+|---|---|
+| `bridge_last_scan_stop()` | 直近 scan がなぜ止まったか (`reached-head` / `bad-magic` / `bad-version` / `out-of-bounds` / `bad-crc` / `undecodable-op`) |
+| `bridge_pending_records()` | 読めたが **Commit で閉じられていない** record 数 |
+| `wal_commit_failures()` | Commit marker の append が失敗した回数 |
+| `wal_dropped_records()` | append 失敗で sync 経路から落ちた record の **累計** |
+
+前 2 つで空 scan の原因が 2 分される — `(pending = 0, bad-magic 等)` = **cursor 位置の record が
+読めない** / `(pending > 0, reached-head)` = **record は在るが Commit が付いていない**。
+停止警告もその形を名指しし、 `checkpoint` と未 commit 件数を本文に含めるようにした。 record
+drop はこれまで warn-once の 1 行だけ (26 時間の停止でもログに 1 行) で、 報告者が grep で
+見つけられなかったので累計を数える。
+
+`OpLog::fail_next_commits(n)` (`#[doc(hidden)]`) も追加。 Commit だけを落とす test 用 fault
+injection で、 通常 record の append には分岐も atomic load も増えない。
+
+**検証**: 新規 5 本 + workspace 全体 1156 passed / 0 failed / 35 ignored
+(181 テストバイナリ、 `--test-threads=1`)。 CI は test (stable) / miri / loom / clippy /
+windows cross すべて green。
+
 ## 0.26.13 — 2026-09-15
 
 **テストのみの patch** (#282)。 product code の変更は無く、 **consumer が上げる理由は無い**
