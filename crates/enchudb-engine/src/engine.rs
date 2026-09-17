@@ -2862,6 +2862,22 @@ pub struct Engine {
     /// #268: `_sync_ops` の himo lookup に失敗して 0 を返した回数。 空 scan と並ぶ
     /// もう一方の 「0 を返す」 経路で、 伸びていれば sync tables の定義が壊れている。
     bridge_himo_lookup_failures: std::sync::atomic::AtomicU64,
+    /// #268: 直近 scan が **なぜ止まったか** (`ScanStop::as_str` の識別子)。
+    /// 空 scan が続くとき、 `bridge_pending_records` と対で原因が 2 分される:
+    /// 「cursor 位置の record が読めない」 か 「record は在るが Commit が無い」 か。
+    bridge_last_scan_stop: std::sync::Mutex<&'static str>,
+    /// #268: 直近 scan が読めたが **Commit で閉じられていなかった** record 数。
+    /// > 0 かつ空 scan が続く = 閉じの Commit が打てていない (`wal_commit_failures`)。
+    bridge_pending_records: std::sync::atomic::AtomicU64,
+    /// #268: WAL append が失敗して **sync 経路から落ちた record 数**。 table 本体には
+    /// 適用済みなので、 ローカルは正常に見えたまま配布だけが欠ける。 旧実装は
+    /// warn-once の 1 行だけで、 26 時間の停止でもログに 1 行しか残らなかった。
+    wal_dropped_records: std::sync::atomic::AtomicU64,
+    /// #268: Commit marker の append が失敗した回数。 失敗すると直前の record 群は
+    /// **閉じられない group** として残り、 bridge からも recovery からも見えなくなる。
+    wal_commit_failures: std::sync::atomic::AtomicU64,
+    /// #268: append 失敗の警告を 1 episode 1 行に抑えるラッチ。 成功したら降ろす。
+    wal_append_warned: std::sync::atomic::AtomicBool,
     /// #268: 無言停止の警告を 1 episode 1 行に抑えるラッチ。 転送が再開したら降ろす。
     bridge_stall_warned: std::sync::atomic::AtomicBool,
     /// #268: 連続空 scan が始まった時刻 (unix ms)。 0 = episode 中でない。
@@ -3243,6 +3259,11 @@ impl Engine {
             bridge_last_from: std::sync::atomic::AtomicU64::new(0),
             bridge_last_committed_end: std::sync::atomic::AtomicU64::new(0),
             bridge_himo_lookup_failures: std::sync::atomic::AtomicU64::new(0),
+            bridge_last_scan_stop: std::sync::Mutex::new("none"),
+            bridge_pending_records: std::sync::atomic::AtomicU64::new(0),
+            wal_dropped_records: std::sync::atomic::AtomicU64::new(0),
+            wal_commit_failures: std::sync::atomic::AtomicU64::new(0),
+            wal_append_warned: std::sync::atomic::AtomicBool::new(false),
             bridge_stall_warned: std::sync::atomic::AtomicBool::new(false),
             bridge_stall_since_ms: std::sync::atomic::AtomicU64::new(0),
             sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -4256,6 +4277,11 @@ impl Engine {
             bridge_last_from: std::sync::atomic::AtomicU64::new(0),
             bridge_last_committed_end: std::sync::atomic::AtomicU64::new(0),
             bridge_himo_lookup_failures: std::sync::atomic::AtomicU64::new(0),
+            bridge_last_scan_stop: std::sync::Mutex::new("none"),
+            bridge_pending_records: std::sync::atomic::AtomicU64::new(0),
+            wal_dropped_records: std::sync::atomic::AtomicU64::new(0),
+            wal_commit_failures: std::sync::atomic::AtomicU64::new(0),
+            wal_append_warned: std::sync::atomic::AtomicBool::new(false),
             bridge_stall_warned: std::sync::atomic::AtomicBool::new(false),
             bridge_stall_since_ms: std::sync::atomic::AtomicU64::new(0),
             sync_dead_rows_purged: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -4535,23 +4561,32 @@ impl Engine {
         // 「処理し切った最後の record の終端」まで cursor を進める (partial advance)
         // ため。 これが無いと group 全体を retry することになり、 backlog が ring 容量を
         // 超えると先頭 K 件を永久に再挿入し続けて進行しない。
-        let (records, committed_end) = wal.iter_committed_from_with_offsets(from);
+        let (records, committed_end, pending, stop) = wal.iter_committed_from_with_diag(from);
         if trace {
             eprintln!(
-                "[bridge] scan from={from} committed_end={committed_end} head={} cp={} records={}",
+                "[bridge] scan from={from} committed_end={committed_end} head={} cp={} \
+                 records={} pending={pending} stop={}",
                 wal.head(),
                 wal.checkpoint(),
                 records.len(),
+                stop.as_str(),
             );
         }
         // #268: 直近 scan の入出力を残す。 host 側が 「head は先にあるのに bridge が
         // 0 を返し続ける」 を O(1) で判定できるようにするための観測点。
         self.bridge_last_from.store(from, Ordering::Relaxed);
         self.bridge_last_committed_end.store(committed_end, Ordering::Relaxed);
+        // #268: 「なぜ 0 だったか」。 空 scan の 2 つの原因を分ける唯一の材料。
+        *self
+            .bridge_last_scan_stop
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = stop.as_str();
+        self.bridge_pending_records
+            .store(pending as u64, Ordering::Relaxed);
 
         if records.is_empty() {
             let empties = self.bridge_empty_scans.fetch_add(1, Ordering::Relaxed) + 1;
-            self.warn_if_bridge_stalled(from, wal.head(), empties);
+            self.warn_if_bridge_stalled(from, wal.head(), wal.checkpoint(), empties, pending, stop);
             // 空 commit group だけ読み進んだ場合も cursor は安全に前進できる
             self.advance_sync_ops_cursor(from, committed_end);
             return 0;
@@ -5046,6 +5081,90 @@ impl Engine {
         self.bridge_himo_lookup_failures.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// 直近 bridge scan が **なぜ止まったか**（観測用）。 `reached-head` /
+    /// `bad-magic` / `bad-version` / `out-of-bounds` / `bad-crc` /
+    /// `undecodable-op`、 まだ 1 度も scan していなければ `none`。
+    ///
+    /// #268: `bridge_pending_records()` と対で、 空 scan が続く原因が 2 分される。
+    /// `reached-head` かつ pending > 0 なら 「record は在るが Commit が付いていない」、
+    /// それ以外なら 「cursor 位置の record が読めない」。
+    pub fn bridge_last_scan_stop(&self) -> &'static str {
+        *self
+            .bridge_last_scan_stop
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// 直近 bridge scan が読めたが **Commit で閉じられていなかった** record 数（観測用）。
+    ///
+    /// #268: 空 scan が続くまま > 0 なら、 閉じの Commit が打てていない
+    /// (`wal_commit_failures()` を併せて見る)。
+    pub fn bridge_pending_records(&self) -> u64 {
+        self.bridge_pending_records.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// WAL append 失敗で **sync 経路から落ちた record 数**（観測用）。 平常時は 0。
+    ///
+    /// #268: 落ちた record も table 本体には適用済みなので、 ローカルは正常に見えた
+    /// まま配布だけが欠ける。 0 でなければ 「その差分は peer に永久に届かない」。
+    pub fn wal_dropped_records(&self) -> u64 {
+        self.wal_dropped_records.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Commit marker の append が失敗した回数（観測用）。 平常時は 0。
+    ///
+    /// #268: 失敗すると直前の record 群は **閉じられない group** として残り、
+    /// bridge (Commit まで読まないと `out` に載せない) からも recovery
+    /// (checkpoint より前は見ない) からも見えなくなる。
+    pub fn wal_commit_failures(&self) -> u64 {
+        self.wal_commit_failures.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #268: Commit marker を打つ。 失敗を握り潰さないための唯一の入口。
+    ///
+    /// 旧実装は全 5 箇所が `let _ = wal.append(Op::Commit)` で、 失敗しても
+    /// **checkpoint だけが head まで進んでいた**。 そうなると
+    /// 「commit されていない record 群が checkpoint の後ろに取り残される」 =
+    /// bridge からも recovery からも二度と見えない、 という自己修復不能の状態になる。
+    /// 呼び出し側は戻り値を見て **checkpoint を進めるかどうか**を決めること。
+    pub(crate) fn append_commit_marker(
+        &self,
+        wal: &enchudb_oplog::oplog::OpLog,
+    ) -> std::io::Result<()> {
+        use std::sync::atomic::Ordering;
+        match wal.append(enchudb_oplog::oplog::Op::Commit) {
+            Ok(_) => {
+                self.wal_append_warned.store(false, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => {
+                self.wal_commit_failures.fetch_add(1, Ordering::Relaxed);
+                if !self.wal_append_warned.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[enchudb] warning: WAL commit marker append failed ({e}) — the current \
+                         record group cannot be closed, so those records stay invisible to both \
+                         sync and recovery until an append succeeds again (#268)"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// #268: WAL append 失敗で record を落としたことを数える (+ 1 episode 1 行の警告)。
+    pub(crate) fn note_wal_records_dropped(&self, dropped: usize, err: &std::io::Error) {
+        use std::sync::atomic::Ordering;
+        self.wal_dropped_records
+            .fetch_add(dropped as u64, Ordering::Relaxed);
+        if !self.wal_append_warned.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[enchudb] warning: WAL append failed ({err}) — {dropped} record(s) dropped from \
+                 the sync path (tables are still updated locally). Cumulative count is available \
+                 as wal_dropped_records() (#268)"
+            );
+        }
+    }
+
     /// unix epoch からの経過 ms。 時計が取れない環境では 0 (= episode の経過を
     /// 測れないので警告は出ない、 安全側)。
     fn unix_millis() -> u64 {
@@ -5062,7 +5181,15 @@ impl Engine {
     /// 閾値の意味: head は record 本体を書く前に bump されるので、 書き込み途中の batch を
     /// 見ている間は head > cursor かつ空 scan が正常。 consumer thread の fsync 周期
     /// (100 ms) で commit が付くので、 それを十分に跨ぐ長さにしてある。
-    fn warn_if_bridge_stalled(&self, from: u64, head: u64, empties: u64) {
+    fn warn_if_bridge_stalled(
+        &self,
+        from: u64,
+        head: u64,
+        checkpoint: u64,
+        empties: u64,
+        pending: usize,
+        stop: enchudb_oplog::oplog::ScanStop,
+    ) {
         use std::sync::atomic::Ordering;
         let now = Self::unix_millis();
         // episode の開始時刻を 1 回だけ刻む (0 = 未開始)。 転送が成立すると 0 に戻る。
@@ -5080,12 +5207,22 @@ impl Engine {
             return;
         }
         let stalled_ms = now.saturating_sub(since);
+        // #268: どちらの形かをここで名指しする。 実機で 「head > cursor / 空 scan」 は
+        // 取れたが、 その先 (cursor 位置が読めないのか、 Commit が付かないのか) を
+        // 分ける材料が無く、 26.4 時間の episode の原因を後から特定できなかった。
+        let shape = if pending > 0 {
+            "records are sitting in an unclosed group (no Commit marker) — the commit append \
+             is failing or never runs"
+        } else {
+            "no readable record at the cursor"
+        };
         eprintln!(
             "[enchudb] warning: sync bridge has returned 0 for {empties} consecutive scans over \
              {stalled_ms} ms while the oplog head ({head}) is ahead of the bridge cursor ({from}) \
-             — records may be committed but unreachable from this cursor, and distribution is \
-             silently stalled (#268). Reopening the DB resets the cursor to the ring start and \
-             re-bridges them."
+             [checkpoint={checkpoint}, scan stopped: {}, {pending} record(s) read but not closed \
+             by a Commit] — {shape}; distribution is silently stalled (#268). Reopening the DB \
+             resets the cursor to the ring start and re-bridges them.",
+            stop.as_str(),
         );
     }
 
@@ -9379,7 +9516,8 @@ impl Engine {
     /// v4: undo ログ廃止に伴い、 rollback API も廃止 (詳細は CLAUDE.md / lib.rs)。
     pub fn commit(&self) {
         if let Some(wal) = self.oplog.as_ref() {
-            let _ = wal.append(enchudb_oplog::oplog::Op::Commit);
+            // #268: 失敗は数えて警告する (戻り値が無いので伝播はできない)。
+            let _ = self.append_commit_marker(wal);
         }
     }
 
@@ -12006,10 +12144,6 @@ impl Engine {
                 let engine: &Engine = unsafe { &*(engine_addr as *const Engine) };
                 let fsync_interval = Duration::from_millis(100);
                 let mut last_fsync = Instant::now();
-                // WAL append 失敗（満杯等）の warn-once。 失敗した record は table
-                // 本体には apply 済みだが sync には二度と流れない — これが無音だと
-                // 「配布だけが死んでいる」を誰も観測できない（実機発現）。
-                let mut warned_wal_append = false;
 
                 loop {
                     let mut drained_any = false;
@@ -12033,17 +12167,23 @@ impl Engine {
                                 Ok(_) => {
                                     wal_append_count_for_thread
                                         .fetch_add(batch.len() as u64, Ordering::Release);
+                                    // #268: 次の episode でまた 1 行出せるよう戻す。
+                                    engine.wal_append_warned.store(false, Ordering::Relaxed);
                                 }
                                 Err(e) => {
-                                    if !warned_wal_append {
-                                        warned_wal_append = true;
-                                        eprintln!(
-                                            "[enchudb] warning: WAL append failed ({e}) — \
-                                             {} record(s) dropped from the sync path \
-                                             (tables are still updated locally)",
-                                            batch.len()
-                                        );
-                                    }
+                                    // #268: warn-once だけだと 26 時間の停止でも
+                                    // ログに 1 行しか残らない。 累計を数える。
+                                    engine.note_wal_records_dropped(batch.len(), &e);
+                                    // #268: **失敗しても barrier は進める**。 barrier の
+                                    // 意味は 「queue に残っていない」 であり、 失敗 record の
+                                    // 再送は無い (すぐ上の doc コメントの通り)。 進めないと
+                                    // `flush_writes()` が `wal_appended >= wal_pushed` を
+                                    // 永久に待って **yield spin** し、 WAL が満杯の DB では
+                                    // 全 writer thread がそこで固まる。 sleep も mutex 待ちも
+                                    // panic も無いので、 thread dump にも 「待っている」 とは
+                                    // 映らない (実機の 「publish スレッドが消えた」)。
+                                    wal_append_count_for_thread
+                                        .fetch_add(batch.len() as u64, Ordering::Release);
                                 }
                             }
                             drained_any = true;
@@ -12061,7 +12201,7 @@ impl Engine {
                     if let Some(wal) = oplog_for_thread.as_ref() {
                         if last_fsync.elapsed() >= fsync_interval {
                             if wal.head() > wal.checkpoint() {
-                                let _ = wal.append(enchudb_oplog::oplog::Op::Commit);
+                                let committed = engine.append_commit_marker(wal).is_ok();
                                 // #77-H3: checkpoint の上限は「今回の fsync/msync に
                                 // 含まれることが確定した位置」= Commit append 直後の
                                 // head。 msync 後に head を再読すると、 その間に
@@ -12077,7 +12217,17 @@ impl Engine {
                                 // (= 直後に process kill されても次 open で sidecar
                                 // の next_local が oplog の進行と整合する)。
                                 engine.try_persist_tables();
-                                wal.advance_checkpoint(durable_head);
+                                // #268: Commit が打てなかったら checkpoint を進めない。
+                                // 進めると未 commit group が checkpoint の後ろに取り残され、
+                                // bridge からも recovery からも永久に見えなくなる (実機で
+                                // 26.4 時間の無言停止)。 据え置けば head > checkpoint が
+                                // 残るので **次の tick が Commit を打ち直す** = 満杯等の
+                                // 一過性要因なら自力で回復する。 例外は死区間
+                                // (append_dead = Commit 1 個すら入らない) で、 こちらは
+                                // 二度と閉じられないので従来どおり進めて fold に任せる。
+                                if committed || wal.append_dead() {
+                                    wal.advance_checkpoint(durable_head);
+                                }
                                 durable_lsn_for_thread.store(durable_lsn, Ordering::Release);
 
                                 // 0.8.0: sync 並走の解消 — durable 化した record を
@@ -12166,16 +12316,11 @@ impl Engine {
                                             .fetch_add(batch.len() as u64, Ordering::Release);
                                     }
                                     Err(e) => {
-                                        // shutdown 経路は一度しか通らないので gate の
-                                        // 再セットは不要（main loop 側と共有の warn-once）
-                                        if !warned_wal_append {
-                                            eprintln!(
-                                                "[enchudb] warning: WAL append failed ({e}) — \
-                                                 {} record(s) dropped from the sync path \
-                                                 (tables are still updated locally)",
-                                                batch.len()
-                                            );
-                                        }
+                                        engine.note_wal_records_dropped(batch.len(), &e);
+                                        // #268: shutdown 経路でも barrier は進める
+                                        // (理由は main loop 側の同じ分岐を参照)。
+                                        wal_append_count_for_thread
+                                            .fetch_add(batch.len() as u64, Ordering::Release);
                                     }
                                 }
                             }
@@ -12186,7 +12331,7 @@ impl Engine {
                         }
                         // shutdown 時の最終 Commit + 順序付き同期
                         if let Some(wal) = oplog_for_thread.as_ref() {
-                            let _ = wal.append(enchudb_oplog::oplog::Op::Commit);
+                            let committed = engine.append_commit_marker(wal).is_ok();
                             let durable_head = wal.head(); // #77-H3: msync 前に snapshot
                             let _ = wal.fsync();
                             let _ = engine.body_msync();
@@ -12197,7 +12342,11 @@ impl Engine {
                             // 経路では oplog checkpoint も進めてしまうので、 ここで
                             // sidecar を確実に固める必要がある。
                             engine.try_persist_tables();
-                            wal.advance_checkpoint(durable_head);
+                            // #268: Commit が打てなかったら checkpoint は据え置く
+                            // (理由は周期 fsync 側の同じ分岐を参照)。
+                            if committed || wal.append_dead() {
+                                wal.advance_checkpoint(durable_head);
+                            }
                             // 0.8.0: shutdown 時も最終 sync 転送 (drop で残った record も
                             // _sync_ops に bridge し切ってから抜ける)
                             if engine.sync_tables_enabled() {
@@ -12283,18 +12432,31 @@ impl Engine {
 
     /// 強制同期: Commit marker 挿入 → WAL fsync → body msync → checkpoint 前進。
     /// Sync mode 相当の待ち。
+    ///
+    /// #268: Commit marker が打てなかった場合、 直前に push された record は
+    /// **commit されないまま** = `_sync_ops` にも recovery にも出ないので `Err` を返す。
+    /// 例外は WAL 満杯 (`append_dead`) で、 こちらは fold が畳んで回復する設計上の
+    /// 経路なので従来どおり `Ok`。 落ちた分は `wal_dropped_records()` /
+    /// `wal_commit_failures()` で数えられる。
     pub fn oplog_sync(&self) -> io::Result<()> {
         use std::sync::atomic::Ordering;
         self.flush_writes();
         if let Some(wal) = self.oplog.as_ref() {
-            let _ = wal.append(enchudb_oplog::oplog::Op::Commit);
+            // #268: 失敗を握り潰さない。 ここで Commit が打てていないと、 直前に
+            // push された record は commit されないまま = `_sync_ops` に出て来ない。
+            // それを `Ok(())` で返すのが 「oplog_sync() は成功したのに配布されない」
+            // の正体だったので、 呼び出し側に伝える (死区間を除く。 下の `commit_res?`)。
+            let commit_res = self.append_commit_marker(wal);
             // #77-H3: checkpoint 上限と durable_lsn は Commit append 直後に
             // snapshot (msync 後の再読は未同期 record まで checkpoint してしまう)
             let durable_head = wal.head();
             let durable_lsn = wal.next_lsn().saturating_sub(1);
             wal.fsync()?;
             self.body_msync()?;
-            wal.advance_checkpoint(durable_head);
+            // #268: Commit 失敗時に checkpoint を進めない理由は consumer tick と同じ。
+            if commit_res.is_ok() || wal.append_dead() {
+                wal.advance_checkpoint(durable_head);
+            }
             self.durable_lsn.store(durable_lsn, Ordering::Release);
             // 0.9.0: checkpoint を進めたら bridge も追いつかせる。 consumer tick の
             // try_reset は head==checkpoint の ring を無条件に畳むため、 ここで
@@ -12313,6 +12475,18 @@ impl Engine {
             // changefeed: durable 化したので listener へ即時 push
             // (consumer の 100ms tick を待たず caller スレッドで発火)
             Self::fire_change_listeners(wal, &self.change_listeners, &self.change_emit_offset);
+            // #268: transfer / listener まで済ませてから失敗を返す (打てた分は配る)。
+            //
+            // ただし **死区間 (`append_dead`) では返さない**。 Commit は payload 0 =
+            // REC_HEADER_SIZE ちょうどなので 「容量起因の Commit 失敗」 と
+            // `append_dead()` は同値で、 ここで返すと 「WAL 満杯」 という *設計上の
+            // 自己回復経路* (checkpoint を進める → fold が畳む。 `wal_full_fold`
+            // 参照、 実運用で発現済み) に居るだけの呼び出し側が Err を受けることに
+            // なる。 落ちた分は `wal_dropped_records()` / `wal_commit_failures()` で
+            // 観測できるので、 ここで伝えるのは **畳んでも消えない失敗** だけでよい。
+            if !wal.append_dead() {
+                commit_res?;
+            }
         }
         Ok(())
     }
@@ -12922,7 +13096,8 @@ impl Engine {
     /// Sync モードでは commit 完了まで待つ。
     pub fn oplog_commit(&self) {
         if let Some(wal) = self.oplog.as_ref() {
-            let _ = wal.append(enchudb_oplog::oplog::Op::Commit);
+            // #268: 失敗は数えて警告する (戻り値が無いので伝播はできない)。
+            let _ = self.append_commit_marker(wal);
         }
     }
 
@@ -14394,9 +14569,18 @@ mod tests {
         eng.enable_sync_tables().unwrap();
         use std::sync::atomic::Ordering;
 
+        // cursor は 4096 固定。 診断値 (checkpoint / 未 commit 件数 / 打ち切り理由) は
+        // 警告文にしか効かないので、 ラッチの検証では固定値でよい。
+        let warn = |eng: &Engine, head: u64, empties: u64| {
+            eng.warn_if_bridge_stalled(
+                4096, head, 4096, empties, 0,
+                enchudb_oplog::oplog::ScanStop::BadMagic,
+            )
+        };
+
         // episode が始まったばかり = まだ鳴らない (回数が幾ら積まれていても)。
         // host が tight loop で叩けば 256 回は 1 秒未満で埋まるので、 ここが要。
-        eng.warn_if_bridge_stalled(4096, 8192, BRIDGE_STALL_WARN_AFTER * 10);
+        warn(&eng, 8192, BRIDGE_STALL_WARN_AFTER * 10);
         assert!(
             !eng.bridge_stall_warned.load(Ordering::Relaxed),
             "始まったばかりの episode で警告が鳴っている (回数だけで判定している)",
@@ -14408,28 +14592,28 @@ mod tests {
         backdate(&eng);
 
         // head が cursor より後ろ / 同じ = 静かなだけ。 経過も回数も足りていても鳴らない
-        eng.warn_if_bridge_stalled(4096, 4096, BRIDGE_STALL_WARN_AFTER * 10);
+        warn(&eng, 4096, BRIDGE_STALL_WARN_AFTER * 10);
         assert!(!eng.bridge_stall_warned.load(Ordering::Relaxed), "静かなだけで警告が鳴っている");
 
         // head は先行しているが、 まだ回数が閾値未満
         backdate(&eng);
-        eng.warn_if_bridge_stalled(4096, 8192, BRIDGE_STALL_WARN_AFTER - 1);
+        warn(&eng, 8192, BRIDGE_STALL_WARN_AFTER - 1);
         assert!(!eng.bridge_stall_warned.load(Ordering::Relaxed), "閾値未満で警告が鳴っている");
 
         // 3 つ揃って初めて鳴り、 1 episode 1 回だけ
         backdate(&eng);
-        eng.warn_if_bridge_stalled(4096, 8192, BRIDGE_STALL_WARN_AFTER);
+        warn(&eng, 8192, BRIDGE_STALL_WARN_AFTER);
         assert!(eng.bridge_stall_warned.load(Ordering::Relaxed), "停止しているのに警告が鳴らない");
         // 転送再開でラッチと episode が降りる相当
         eng.bridge_stall_warned.store(false, Ordering::Relaxed);
         eng.bridge_stall_since_ms.store(0, Ordering::Relaxed);
-        eng.warn_if_bridge_stalled(4096, 8192, BRIDGE_STALL_WARN_AFTER);
+        warn(&eng, 8192, BRIDGE_STALL_WARN_AFTER);
         assert!(
             !eng.bridge_stall_warned.load(Ordering::Relaxed),
             "次の episode が始まった瞬間に鳴っている (経過を見ていない)",
         );
         backdate(&eng);
-        eng.warn_if_bridge_stalled(4096, 8192, BRIDGE_STALL_WARN_AFTER);
+        warn(&eng, 8192, BRIDGE_STALL_WARN_AFTER);
         assert!(eng.bridge_stall_warned.load(Ordering::Relaxed), "次の episode で鳴り直さない");
 
         drop(eng);
