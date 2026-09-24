@@ -977,7 +977,8 @@ fn count_subscriptions_match_oracle() {
 
 fn run_counts(path: &str) {
     let mut db = Database::create_growable_tiny(path).unwrap();
-    db.table("companies").number("id").tag("city").primary_key("id").build().unwrap();
+    db.table("regions").number("id").tag("name").primary_key("id").build().unwrap();
+    db.table("companies").number("id").tag("city").ref_to("region", "regions").primary_key("id").build().unwrap();
     db.table("users")
         .number("id")
         .number("age")
@@ -988,10 +989,23 @@ fn run_counts(path: &str) {
         .unwrap();
     let users_t = db.get_table("users").unwrap();
     let companies_t = db.get_table("companies").unwrap();
+    let regions_t = db.get_table("regions").unwrap();
     let cities = ["Tokyo", "Osaka", "Kyoto", "Nagoya"];
+    let names = ["Kanto", "Kansai", "Chubu"];
     let mut rng = Rng(0xc0c0_1234_abcd_0001);
+    let regions: Vec<u64> = (0..4i64)
+        .map(|i| regions_t.insert().set("id", i).set("name", names[(i % 3) as usize]).commit().unwrap())
+        .collect();
     let mut companies: Vec<u64> = (0..8i64)
-        .map(|i| companies_t.insert().set("id", i).set("city", cities[(i % 4) as usize]).commit().unwrap())
+        .map(|i| {
+            companies_t
+                .insert()
+                .set("id", i)
+                .set("city", cities[(i % 4) as usize])
+                .set("region", Value::Ref(regions[(i % 4) as usize]))
+                .commit()
+                .unwrap()
+        })
         .collect();
     let mut users: Vec<u64> = (0..160i64)
         .map(|i| {
@@ -1011,6 +1025,8 @@ fn run_counts(path: &str) {
     let home = move |e: u64| get_text(u, e, "city");
     let company = move |e: u64| get_ref(u, e, "company");
     let work = move |e: u64| company(e).and_then(|x| get_text(c, x, "city"));
+    let rg = &regions_t;
+    let region = move |e: u64| company(e).and_then(|x| get_ref(c, x, "region")).and_then(|r| get_text(rg, r, "name"));
 
     type Cond<'a> = Box<dyn Fn(u64) -> bool + 'a>;
     type Key<'a> = Box<dyn Fn(u64) -> Option<Value> + 'a>;
@@ -1050,6 +1066,12 @@ fn run_counts(path: &str) {
                 Box::new(move |e| age(e).is_some_and(|v| k as i64 <= v && v <= k as i64 + 8)),
                 Box::new(move |e| work(e).map(Value::Text)),
             ),
+            5 => (
+                format!("age > {k} by company.region.name"),
+                u.all().where_gt("age", k).subscribe_counts("company.region.name").unwrap(),
+                Box::new(move |e| age(e).is_some_and(|v| v > k as i64)),
+                Box::new(move |e| region(e).map(Value::Text)),
+            ),
             _ => (
                 format!("city = {a} by company"),
                 u.where_eq("city", a).subscribe_counts("company").unwrap(),
@@ -1059,7 +1081,7 @@ fn run_counts(path: &str) {
         };
         CSub { name, q, seen: Default::default(), cond, key }
     };
-    let mut subs: Vec<CSub> = (0..25).map(|i| make(i % 5, &mut rng)).collect();
+    let mut subs: Vec<CSub> = (0..30).map(|i| make(i % 6, &mut rng)).collect();
 
     let check = |subs: &mut Vec<CSub>, users: &[u64], step: usize| {
         for s in subs.iter_mut() {
@@ -1094,7 +1116,16 @@ fn run_counts(path: &str) {
 
     let mut next_id = 1000i64;
     for step in 1..1200 {
-        match rng.below(7) {
+        match rng.below(9) {
+            7 => {
+                let x = regions[rng.below(regions.len() as u64) as usize];
+                regions_t.entity(x).set("name", names[rng.below(3) as usize]).commit().unwrap();
+            }
+            8 => {
+                let x = companies[rng.below(companies.len() as u64) as usize];
+                let r = regions[rng.below(regions.len() as u64) as usize];
+                companies_t.entity(x).set("region", Value::Ref(r)).commit().unwrap();
+            }
             0 | 1 => {
                 let e = users[rng.below(users.len() as u64) as usize];
                 users_t.entity(e).set("age", rng.below(30) as i64).commit().unwrap();
@@ -1128,14 +1159,19 @@ fn run_counts(path: &str) {
             _ => {
                 let i = rng.below(companies.len() as u64) as usize;
                 companies_t.entity(companies[i]).delete().unwrap();
-                companies[i] =
-                    companies_t.insert().set("id", next_id).set("city", cities[rng.below(4) as usize]).commit().unwrap();
+                companies[i] = companies_t
+                    .insert()
+                    .set("id", next_id)
+                    .set("city", cities[rng.below(4) as usize])
+                    .set("region", Value::Ref(regions[rng.below(regions.len() as u64) as usize]))
+                    .commit()
+                    .unwrap();
                 next_id += 1;
             }
         }
         if step % 5 == 0 {
             let i = rng.below(subs.len() as u64) as usize;
-            let kind = rng.below(5);
+            let kind = rng.below(6);
             subs[i] = make(kind, &mut rng);
         }
         if step % 3 == 0 {

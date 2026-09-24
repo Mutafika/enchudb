@@ -89,8 +89,11 @@
 //! 所で動かすので、 登録と並行した書き込みでも件数と記録が食い違わない。 同じ鍵の集計の購読は件数を
 //! 共有し、 購読ごとには 「動いた group」 と 「最後に渡した件数」 だけを持つ。
 //!
-//! group の列が ref の先 (`company.city`) なら、 会社の移転は配下の根を評価し直して 1 件ずつ
-//! 件数を移す (配下の数に比例)。
+//! group の列が ref の先 (`company.city`) なら、 根は group の値でなく 1 段目の先 (会社) を
+//! 記録し、 件数は 「会社ごとに、 その会社を指して数えている根の数と、 今数えている group」 の
+//! 部分和で持つ (`Partial`)。 会社の所在地が変わったら部分和をまとめて移す = 配下が何人でも
+//! O(鍵の数)。 根が出入りした時はその会社の今の group で数える。 登録時に 1 段目の先にも印を
+//! 付けて記録を作る (記録の無い会社が最初に変わると配下を全部評価し直すことになるので)。
 //!
 //! # 状態の大きさ
 //!
@@ -1454,6 +1457,16 @@ struct Settled {
     dormant: Vec<usize>,
     /// changed が空でない (かもしれない) member。 `LiveRegistry::poll_all` はここだけを見る。
     ready: Vec<usize>,
+    /// 集計の部分和 (`Family::partial`): 1 段目の先の entity → その entity を指して数えられている根。
+    partial: std::collections::BTreeMap<u32, Partial>,
+}
+
+/// 集計で 1 段目の先の entity `t` (会社) を指している根の部分和。
+struct Partial {
+    /// `t` の根を今数えている group の値。
+    g: u32,
+    /// 根の鍵 id → その鍵で `t` を指して数えている根の数。
+    n: Vec<(u32, u64)>,
 }
 
 /// 根の答えの当て方。
@@ -1536,6 +1549,83 @@ impl Settled {
             members: Vec::new(),
             dormant: Vec::new(),
             ready: Vec::new(),
+            partial: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// 根の鍵 `k` の group `g` の件数を `d` 動かし、 鍵の member に 「g が動いた」 を積む。
+    fn bump_group(keys: &mut [RootKey], members: &mut [Option<Member>], k: u32, g: u32, d: i64) {
+        let Ok(i) = keys.binary_search_by_key(&k, |x| x.id) else { return };
+        let rk = &mut keys[i];
+        let c = rk.groups.entry(g).or_insert(0);
+        *c = c.wrapping_add_signed(d);
+        if *c == 0 {
+            rk.groups.remove(&g);
+        }
+        for &slot in &rk.members {
+            if let Some(gs) = members[slot].as_mut().and_then(|m| m.grp.as_mut()) {
+                gs.changed.add(g);
+            }
+        }
+    }
+
+    /// 1 段目の先 `t` の group の値が `g` になった: `t` を指して数えている根を全部まとめて移す
+    /// (根を 1 件ずつ評価しない)。
+    fn move_partial(&mut self, t: u32, g: u32) {
+        let Settled { partial, keys, members, .. } = self;
+        let Some(p) = partial.get_mut(&t) else { return };
+        if p.g == g {
+            return;
+        }
+        for &(k, n) in &p.n {
+            Settled::bump_group(keys, members, k, p.g, -(n as i64));
+            Settled::bump_group(keys, members, k, g, n as i64);
+        }
+        p.g = g;
+    }
+
+    /// 集計の部分和の family で、 根 `eid` の答えを `now` (鍵, 1 段目の先 `t`) にする。 `g` = 今の
+    /// `t` の group の値 (`t` の部分和がまだ無い時だけ使う)。
+    ///
+    /// `t` の根は常に部分和の `g` で数える (評価で読んだ値とずれていても — ずれるのは `t` より
+    /// 下が書き換わった時で、 その印で `t` を評価し直した時に `move_partial` が全部移す)。
+    fn apply_root_partial(&mut self, eid: u32, now: Option<Ans>, g: u32) {
+        let was = self.root(eid);
+        if was == now {
+            return;
+        }
+        self.recs[0].set_root(eid, now.map(|a| a.0));
+        self.vals[0].put(eid, now.map_or(0, |a| a.1 + 1));
+        let Settled { partial, keys, members, .. } = self;
+        if let Some((k, t)) = was {
+            if let Ok(i) = keys.binary_search_by_key(&k, |x| x.id) {
+                keys[i].count -= 1;
+            }
+            if let Some(p) = partial.get_mut(&t) {
+                let pg = p.g;
+                if let Some(j) = p.n.iter().position(|x| x.0 == k) {
+                    p.n[j].1 -= 1;
+                    if p.n[j].1 == 0 {
+                        p.n.swap_remove(j);
+                    }
+                }
+                if p.n.is_empty() {
+                    partial.remove(&t);
+                }
+                Settled::bump_group(keys, members, k, pg, -1);
+            }
+        }
+        if let Some((k, t)) = now {
+            if let Ok(i) = keys.binary_search_by_key(&k, |x| x.id) {
+                keys[i].count += 1;
+            }
+            let p = partial.entry(t).or_insert_with(|| Partial { g, n: Vec::new() });
+            match p.n.iter_mut().find(|x| x.0 == k) {
+                Some(x) => x.1 += 1,
+                None => p.n.push((k, 1)),
+            }
+            let pg = p.g;
+            Settled::bump_group(keys, members, k, pg, 1);
         }
     }
 
@@ -1649,6 +1739,10 @@ pub(crate) struct Family {
     range: Option<(usize, u16)>,
     /// 運ぶ値が集計の group の列 (帯で刈り込まず、 値が変わるたびに運ぶ)。
     group: bool,
+    /// 集計で group の列が根でない時: 根の子のうち道の上の節 (1 段目)。 根は group の値でなく
+    /// 1 段目の先の entity を記録し、 件数は 1 段目の先ごとの部分和で持つ — 1 段目の先の group の
+    /// 値が変わっても根を評価せず部分和を移すだけ (`Settled::move_partial`)。
+    partial: Option<usize>,
     /// 節ごと: 範囲の穴の節から根への道の上か (その節の答えは範囲の値を運ぶ)。
     on_path: Vec<bool>,
 }
@@ -1704,6 +1798,7 @@ impl Family {
         }
         routes.sort_unstable();
         routes.dedup();
+        let nodes_partial = nodes[0].children.iter().copied().find(|&c| on_path[c]);
         let n = nodes.len();
         let widths: Vec<usize> = nodes.iter().map(|x| x.key_len).collect();
         Self {
@@ -1718,6 +1813,7 @@ impl Family {
             dirty: AtomicU32::new(0),
             settled: Mutex::new(Settled::new(&widths)),
             expand_always: AtomicBool::new(false),
+            partial: if group { nodes_partial } else { None },
             range,
             group,
             on_path,
@@ -1901,6 +1997,14 @@ impl Family {
             let gone = n == 0 && s.tables[0].find(&buf).is_none();
             if let Some(i) = gone.then(|| s.keys.binary_search_by_key(&ids[0], |k| k.id).ok()).flatten() {
                 s.keys.remove(i);
+                // 外れた鍵の部分和 (根の記録には外れた鍵の id が残るが、 部分和に無ければ動かさない)
+                if self.partial.is_some() {
+                    let k = ids[0];
+                    s.partial.retain(|_, p| {
+                        p.n.retain(|x| x.0 != k);
+                        !p.n.is_empty()
+                    });
+                }
             }
         }
     }
@@ -2046,6 +2150,16 @@ impl Family {
                             g.changed.add(v);
                         }
                     }
+                    // 部分和の節 (1 段目) の entity にも印を付けて記録を作っておく。 根の評価は子の記録が
+                    // 無いと子を評価し直すだけで記録しない (記録は印を消費した時だけ書く) ので、 記録の無い
+                    // 1 段目の先は最初に書き換わった時に 「前が不明」 = 配下の根を全部評価し直す (hacg で
+                    // 大きな市区町村の最初の都道府県変更が ms 級)。 登録の時に 1 回払っておく
+                    if let Some(c1) = self.partial {
+                        let mut ts: Vec<u32> = roots.iter().filter_map(|&e| r.cell(self.nodes[c1].via, e)).collect();
+                        ts.sort_unstable();
+                        ts.dedup();
+                        self.push_marks(c1, ts);
+                    }
                     self.push_marks(0, roots);
                     continue;
                 }
@@ -2110,7 +2224,7 @@ impl Family {
         // 記録」 と分かっているので、 評価で ref と子の記録を読み直さない (会社 1 社の移転で配下
         // 数十万人が動く時、 1 人あたりの評価がほぼ根自身の条件だけになる)
         let single_child = (self.nodes[0].children.len() == 1).then(|| self.nodes[0].children[0]);
-        let mut via_child: Vec<(Option<Ans>, Vec<u32>)> = Vec::new();
+        let mut via_child: Vec<(Option<Ans>, u32, Vec<u32>)> = Vec::new();
         let root_plain = self.nodes[0].local.is_empty() && self.nodes[0].holes.is_empty() && self.nodes[0].range.is_none();
         for &n in &self.order {
             let mut list = std::mem::take(&mut work[n]);
@@ -2118,20 +2232,31 @@ impl Family {
             list.dedup();
             if n == 0 {
                 let mut cache = KeyCache::default();
-                for (ans, ents) in via_child.drain(..) {
+                for (ans, t, ents) in via_child.drain(..) {
                     let known = Some((single_child.unwrap_or(usize::MAX), ans));
                     // 根自身に条件も穴も無ければ答えは子の答えだけで決まる = 全員同じ
                     let same = root_plain.then(|| self.eval_known(r, s, 0, 0, known));
                     for e in ents {
                         let now = same.unwrap_or_else(|| self.eval_known(r, s, 0, e, known));
-                        s.apply_root_cached(e, now, mode, &mut cache);
+                        match self.partial {
+                            Some(_) => s.apply_root_partial(e, now.map(|a| (a.0, t)), now.map_or(0, |a| a.1)),
+                            None => s.apply_root_cached(e, now, mode, &mut cache),
+                        }
                     }
                 }
                 // 印の付いた根 (ref や根の条件の紐が書かれた) は全部読み直し、 上の近道より後に
                 // 当てる (逆引きの後に ref が書き換わった根は、 こちらの今の Column の答えが勝つ)
                 for e in list {
                     let now = self.eval(r, s, 0, e);
-                    s.apply_root_cached(e, now, mode, &mut cache);
+                    match self.partial {
+                        Some(c1) => {
+                            let g = now.map_or(0, |a| a.1);
+                            let t = now.and_then(|_| r.cell(self.nodes[c1].via, e));
+                            let now = now.and_then(|a| Some((a.0, t?)));
+                            s.apply_root_partial(e, now, g);
+                        }
+                        None => s.apply_root_cached(e, now, mode, &mut cache),
+                    }
                 }
                 continue;
             }
@@ -2143,18 +2268,26 @@ impl Family {
                 if path {
                     s.vals[n].put(e, now.map_or(0, |a| a.1 + 1));
                 }
-                // 範囲の値は帯が変わった時だけ運ぶ (帯の中の違いはどの member にも区別が付かない)
+                // 範囲の値は帯が変わった時だけ運ぶ (帯の中の違いはどの member にも区別が付かない)。
+                // 集計の部分和の節では group の値は運ばない (部分和を移す)
+                let partial_node = self.partial == Some(n);
                 let changed = match (prev, now) {
                     (Some(Some((pi, pv))), Some((ni, nv))) => {
-                        pi != ni || (path && if self.group { pv != nv } else { !s.slabs.same(pv, nv) })
+                        pi != ni
+                            || (path
+                                && !partial_node
+                                && if self.group { pv != nv } else { !s.slabs.same(pv, nv) })
                     }
                     (Some(None), None) => false,
                     _ => true,
                 };
+                if partial_node && let Some((_, nv)) = now {
+                    s.move_partial(e, nv);
+                }
                 if always || changed {
                     let up = r.pull(via, e);
                     if parent == 0 && single_child == Some(n) {
-                        via_child.push((now, up));
+                        via_child.push((now, e, up));
                     } else {
                         work[parent].extend(up);
                     }
