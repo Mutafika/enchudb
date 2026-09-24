@@ -106,8 +106,10 @@
 //! 要素 (境界)** だけを持ち、 根が順序に入る / 出る時に境界の前後 1 つずつを出し入れする
 //! (`RootKey::order_insert` / `order_remove`、 O(log n))。 k の違う購読も同じ family・同じ順序を
 //! 共有する。 差分は普通の購読と同じく集合 (先頭 k 件) への出入り、 並びは `ranked`。
-//! 並びの列に値の無い entity は入らない。 並びの列が ref の先なら、 会社の値の変化は配下の根を
-//! 1 件ずつ順序の中で動かす (配下の数に比例)。
+//! 並びの列に値の無い entity は入らない。 並びの列が ref の先なら、 根は 1 段目の先 (会社) を記録し、
+//! 順序は 「会社を値の順に並べ、 会社ごとに根を eid の順に持つ」 塊 (`OrderIndex::Blocks`、 全体の
+//! 順序は (値, eid) のまま)。 会社の値が変わったら塊を付け替え、 境界を 「上位に居た / 入る配下の数」
+//! だけ動かす (`RootKey::move_block`) — 上位 k 件から遠い会社の変化は O(log)。
 //!
 //! # 状態の大きさ
 //!
@@ -1546,6 +1548,28 @@ struct Settled {
     fresh: Vec<usize>,
     /// 次の settle は答えが変わらなくても展開する (`fresh` の初回の報告のため)。
     force: bool,
+    /// 上位 k 件で並びの列が根でない family (`Family::order_part`): 根の記録は (鍵, 1 段目の先) で、
+    /// 並びの値は `opart` から引く。
+    order_view: Option<()>,
+    /// 1 段目の先 → (今の並びの値, その先の根が居る鍵)。
+    opart: std::collections::BTreeMap<u32, OrderPart>,
+}
+
+/// 上位 k 件の塊 (1 段目の先 = 会社) の値と、 塊のある鍵。
+struct OrderPart {
+    v: u32,
+    keys: Vec<u32>,
+}
+
+/// member の条件に当てる根の答え (鍵, 範囲 / 並びの値)。 並びの列が根でない上位 k 件では記録の
+/// 1 段目の先を今の並びの値に引き直す。
+#[inline]
+fn view_at(recs: &[KeyStore], vals: &[Words], opart: &std::collections::BTreeMap<u32, OrderPart>, ov: Option<()>, e: u32) -> Option<Ans> {
+    let a = root_at(recs, vals, e)?;
+    match ov {
+        Some(()) => Some((a.0, opart.get(&a.1).map_or(0, |p| p.v))),
+        None => Some(a),
+    }
 }
 
 /// 集計で 1 段目の先の entity `t` (会社) を指している根の部分和。
@@ -1601,7 +1625,144 @@ struct RootKey {
     /// 集計の family: group の値 → その値の根の数 (0 の group は載せない)。
     groups: std::collections::BTreeMap<u32, u64>,
     /// 上位 k 件の family: この鍵の根を (並びの値 (降順は反転), eid) の昇順で。
-    order: std::collections::BTreeSet<(u32, u32)>,
+    order: OrderIndex,
+}
+
+/// 上位 k 件の順序 ((並びの値, eid) の昇順)。
+enum OrderIndex {
+    /// 根ごとに値を持つ。
+    Flat(std::collections::BTreeSet<(u32, u32)>),
+    /// 並びの列が ref の先の時: 1 段目の先 (会社) を値の順に並べ、 会社ごとに根を eid の昇順で持つ。
+    /// 全体の順序は (会社の値, 根の eid) = `Flat` と同じ。 会社の値が変わっても会社 1 つを付け替える
+    /// だけで、 配下の根を 1 件ずつ動かさない (`RootKey::move_block`)。
+    Blocks(Blocks),
+}
+
+#[derive(Default)]
+struct Blocks {
+    /// (会社の値, 会社)。 根の居る会社だけ。
+    by_val: std::collections::BTreeSet<(u32, u32)>,
+    /// 会社 → その会社を指す根 (昇順)。
+    rows: std::collections::BTreeMap<u32, Vec<u32>>,
+    len: usize,
+}
+
+impl Blocks {
+    /// 値 `v` の会社の根の列。
+    fn at(&self, v: u32) -> impl Iterator<Item = &Vec<u32>> {
+        self.by_val.range((v, 0)..=(v, u32::MAX)).filter_map(|(_, t)| self.rows.get(t))
+    }
+
+    fn succ(&self, x: (u32, u32)) -> Option<(u32, u32)> {
+        let same = self.at(x.0).filter_map(|r| r.get(r.partition_point(|&e| e <= x.1)).copied()).min();
+        if let Some(e) = same {
+            return Some((x.0, e));
+        }
+        let v = self.by_val.range((x.0.checked_add(1)?, 0)..).next()?.0;
+        self.at(v).filter_map(|r| r.first().copied()).min().map(|e| (v, e))
+    }
+
+    fn pred(&self, x: (u32, u32)) -> Option<(u32, u32)> {
+        let same = self.at(x.0).filter_map(|r| r.partition_point(|&e| e < x.1).checked_sub(1).map(|i| r[i])).max();
+        if let Some(e) = same {
+            return Some((x.0, e));
+        }
+        let v = self.by_val.range(..(x.0, 0)).next_back()?.0;
+        self.at(v).filter_map(|r| r.last().copied()).max().map(|e| (v, e))
+    }
+
+    fn first(&self) -> Option<(u32, u32)> {
+        let v = self.by_val.first()?.0;
+        self.at(v).filter_map(|r| r.first().copied()).min().map(|e| (v, e))
+    }
+
+    fn last(&self) -> Option<(u32, u32)> {
+        let v = self.by_val.last()?.0;
+        self.at(v).filter_map(|r| r.last().copied()).max().map(|e| (v, e))
+    }
+}
+
+impl OrderIndex {
+    /// `x` を足す (`t` = 1 段目の先、 `Blocks` の時だけ使う)。
+    fn insert(&mut self, x: (u32, u32), t: u32) {
+        match self {
+            OrderIndex::Flat(s) => {
+                s.insert(x);
+            }
+            OrderIndex::Blocks(b) => {
+                b.by_val.insert((x.0, t));
+                let r = b.rows.entry(t).or_default();
+                if let Err(p) = r.binary_search(&x.1) {
+                    r.insert(p, x.1);
+                    b.len += 1;
+                }
+            }
+        }
+    }
+
+    /// `x` を外す。 あったら true。
+    fn remove(&mut self, x: (u32, u32), t: u32) -> bool {
+        match self {
+            OrderIndex::Flat(s) => s.remove(&x),
+            OrderIndex::Blocks(b) => {
+                let Some(r) = b.rows.get_mut(&t) else { return false };
+                let Ok(p) = r.binary_search(&x.1) else { return false };
+                r.remove(p);
+                b.len -= 1;
+                if r.is_empty() {
+                    b.rows.remove(&t);
+                    b.by_val.remove(&(x.0, t));
+                }
+                true
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            OrderIndex::Flat(s) => s.len(),
+            OrderIndex::Blocks(b) => b.len,
+        }
+    }
+
+    fn last(&self) -> Option<(u32, u32)> {
+        match self {
+            OrderIndex::Flat(s) => s.last().copied(),
+            OrderIndex::Blocks(b) => b.last(),
+        }
+    }
+
+    /// `x` より後の最初の要素。
+    fn succ(&self, x: (u32, u32)) -> Option<(u32, u32)> {
+        match self {
+            OrderIndex::Flat(s) => s.range((std::ops::Bound::Excluded(x), std::ops::Bound::Unbounded)).next().copied(),
+            OrderIndex::Blocks(b) => b.succ(x),
+        }
+    }
+
+    /// `x` より前の最後の要素。
+    fn pred(&self, x: (u32, u32)) -> Option<(u32, u32)> {
+        match self {
+            OrderIndex::Flat(s) => s.range(..x).next_back().copied(),
+            OrderIndex::Blocks(b) => b.pred(x),
+        }
+    }
+
+    /// 先頭 `k` 個。
+    fn first_k(&self, k: usize) -> Vec<(u32, u32)> {
+        match self {
+            OrderIndex::Flat(s) => s.iter().take(k).copied().collect(),
+            OrderIndex::Blocks(b) => {
+                let mut out = Vec::with_capacity(k.min(b.len));
+                let mut cur = b.first();
+                while let Some(x) = cur.filter(|_| out.len() < k) {
+                    out.push(x);
+                    cur = b.succ(x);
+                }
+                out
+            }
+        }
+    }
 }
 
 impl RootKey {
@@ -1612,13 +1773,13 @@ impl RootKey {
             count: 0,
             ivs: None,
             groups: std::collections::BTreeMap::new(),
-            order: std::collections::BTreeSet::new(),
+            order: OrderIndex::Flat(std::collections::BTreeSet::new()),
         }
     }
 
-    /// 順序に `x` を足し、 各 member の境界を動かして出入りに印を付ける。
-    fn order_insert(&mut self, x: (u32, u32), members: &mut [Option<Member>], ready: &mut Vec<usize>) {
-        self.order.insert(x);
+    /// 順序に `x` を足し、 各 member の境界を動かして出入りに印を付ける (`t` = 1 段目の先)。
+    fn order_insert(&mut self, x: (u32, u32), t: u32, members: &mut [Option<Member>], ready: &mut Vec<usize>) {
+        self.order.insert(x, t);
         let len = self.order.len();
         for &slot in &self.members {
             let Some(m) = members[slot].as_mut() else { continue };
@@ -1628,14 +1789,14 @@ impl RootKey {
                 None => {
                     m.note(slot, ready, x.1, false);
                     if len == tk.k {
-                        tk.th = self.order.last().copied();
+                        tk.th = self.order.last();
                     }
                 }
                 // 境界より前に入ったら、 境界の要素が押し出され、 その 1 つ前が新しい境界
                 Some(th) if x < th => {
                     m.note(slot, ready, x.1, false);
                     m.note(slot, ready, th.1, false);
-                    tk.th = self.order.range(..th).next_back().copied();
+                    tk.th = self.order.pred(th);
                 }
                 Some(_) => {}
             }
@@ -1644,8 +1805,8 @@ impl RootKey {
     }
 
     /// 順序から `x` を外し、 各 member の境界を動かして出入りに印を付ける。
-    fn order_remove(&mut self, x: (u32, u32), members: &mut [Option<Member>], ready: &mut Vec<usize>) {
-        if !self.order.remove(&x) {
+    fn order_remove(&mut self, x: (u32, u32), t: u32, members: &mut [Option<Member>], ready: &mut Vec<usize>) {
+        if !self.order.remove(x, t) {
             return;
         }
         for &slot in &self.members {
@@ -1656,13 +1817,107 @@ impl RootKey {
                 // 境界以前が抜けたら、 境界の次が入って新しい境界 (次が無ければ k 個未満 = 全部)
                 Some(th) if x <= th => {
                     m.note(slot, ready, x.1, false);
-                    let next = self.order.range((std::ops::Bound::Excluded(th), std::ops::Bound::Unbounded)).next().copied();
+                    let next = self.order.succ(th);
                     if let Some(n) = next {
                         m.note(slot, ready, n.1, false);
                     }
                     tk.th = next;
                 }
                 Some(_) => {}
+            }
+            m.topk = Some(tk);
+        }
+    }
+
+    /// 会社 `t` (`Blocks`) の値が `v1` → `v2` になった: 会社 1 つを付け替え、 各 member の境界を
+    /// 動かす。 触るのは上位 k 件に居た / 入る配下と境界の前後だけ (出力の数 × log)。 上位 k 件から
+    /// 遠い会社の変化は O(log)。
+    fn move_block(&mut self, t: u32, v1: u32, v2: u32, members: &mut [Option<Member>], ready: &mut Vec<usize>) {
+        let OrderIndex::Blocks(b) = &mut self.order else { return };
+        let Some(rows) = b.rows.remove(&t) else { return };
+        b.by_val.remove(&(v1, t));
+        b.len -= rows.len();
+        // 外す: 境界以前に居た c1 人が抜け、 境界が c1 個後ろへ
+        let le = |v: u32, th: (u32, u32)| {
+            if v < th.0 {
+                rows.len()
+            } else if v > th.0 {
+                0
+            } else {
+                rows.partition_point(|&e| e <= th.1)
+            }
+        };
+        for &slot in &self.members {
+            let Some(m) = members[slot].as_mut() else { continue };
+            let Some(mut tk) = m.topk else { continue };
+            let Some(mut th) = tk.th else { continue }; // k 個未満 = 全部居る、 付け替えても変わらない
+            let c1 = le(v1, th);
+            for &e in &rows[..c1] {
+                m.note(slot, ready, e, false);
+            }
+            let mut next = Some(th);
+            for _ in 0..c1 {
+                next = b.succ(th);
+                match next {
+                    Some(n) => {
+                        m.note(slot, ready, n.1, false);
+                        th = n;
+                    }
+                    None => break,
+                }
+            }
+            tk.th = next;
+            m.topk = Some(tk);
+        }
+        // 付ける: 境界より前に入る m 人が入り、 境界が m 個前へ (押し出された分が抜ける)
+        b.by_val.insert((v2, t));
+        b.len += rows.len();
+        let n = b.len;
+        let placed = rows.clone();
+        b.rows.insert(t, rows);
+        let lt = |v: u32, th: (u32, u32)| {
+            if v < th.0 {
+                placed.len()
+            } else if v > th.0 {
+                0
+            } else {
+                placed.partition_point(|&e| e < th.1)
+            }
+        };
+        for &slot in &self.members {
+            let Some(m) = members[slot].as_mut() else { continue };
+            let Some(mut tk) = m.topk else { continue };
+            match tk.th {
+                None => {
+                    // 付ける前は k 個未満: 全員入り、 k 個を超えたら k 番目より後が抜ける
+                    for &e in &placed {
+                        m.note(slot, ready, e, false);
+                    }
+                    if n >= tk.k {
+                        let first = self.order.first_k(tk.k);
+                        let th = first[tk.k - 1];
+                        let mut cur = self.order.succ(th);
+                        while let Some(x) = cur {
+                            m.note(slot, ready, x.1, false);
+                            cur = self.order.succ(x);
+                        }
+                        tk.th = Some(th);
+                    }
+                }
+                Some(mut th) => {
+                    let c2 = lt(v2, th);
+                    for &e in &placed[..c2] {
+                        m.note(slot, ready, e, false);
+                    }
+                    for _ in 0..c2 {
+                        m.note(slot, ready, th.1, false);
+                        match self.order.pred(th) {
+                            Some(p) => th = p,
+                            None => break,
+                        }
+                    }
+                    tk.th = Some(th);
+                }
             }
             m.topk = Some(tk);
         }
@@ -1702,6 +1957,67 @@ impl Settled {
             partial: std::collections::BTreeMap::new(),
             fresh: Vec::new(),
             force: false,
+            order_view: None,
+            opart: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[inline]
+    fn view(&self, e: u32) -> Option<Ans> {
+        view_at(&self.recs, &self.vals, &self.opart, self.order_view, e)
+    }
+
+    /// 上位 k 件の塊の family: 根 `eid` の答えを `now` (鍵, 1 段目の先 `t`) にする。 `v` = 今の
+    /// `t` の並びの値 (`t` の塊がまだ無い時だけ使う。 ずれは `t` の評価し直しで `move_order` が直す)。
+    fn apply_root_order_part(&mut self, eid: u32, now: Option<Ans>, v: u32, desc: bool) {
+        let was = self.root(eid);
+        if was == now {
+            return;
+        }
+        self.recs[0].set_root(eid, now.map(|a| a.0));
+        self.vals[0].put(eid, now.map_or(0, |a| a.1 + 1));
+        let Settled { keys, members, ready, opart, .. } = self;
+        if let Some((k, t)) = was
+            && let Ok(i) = keys.binary_search_by_key(&k, |x| x.id)
+        {
+            let tv = opart.get(&t).map_or(0, |p| p.v);
+            let rk = &mut keys[i];
+            rk.count -= 1;
+            rk.order_remove((order_val(tv, desc), eid), t, members, ready);
+            let gone = matches!(&rk.order, OrderIndex::Blocks(b) if !b.rows.contains_key(&t));
+            if gone && let Some(p) = opart.get_mut(&t) {
+                p.keys.retain(|&x| x != k);
+                if p.keys.is_empty() {
+                    opart.remove(&t);
+                }
+            }
+        }
+        if let Some((k, t)) = now
+            && let Ok(i) = keys.binary_search_by_key(&k, |x| x.id)
+        {
+            let p = opart.entry(t).or_insert_with(|| OrderPart { v, keys: Vec::new() });
+            if !p.keys.contains(&k) {
+                p.keys.push(k);
+            }
+            let tv = p.v;
+            let rk = &mut keys[i];
+            rk.count += 1;
+            rk.order_insert((order_val(tv, desc), eid), t, members, ready);
+        }
+    }
+
+    /// 1 段目の先 `t` の並びの値が `v` になった: 塊を全部の鍵で付け替える (配下の根を評価しない)。
+    fn move_order(&mut self, t: u32, v: u32, desc: bool) {
+        let Settled { keys, members, ready, opart, .. } = self;
+        let Some(p) = opart.get_mut(&t) else { return };
+        if p.v == v {
+            return;
+        }
+        let old = std::mem::replace(&mut p.v, v);
+        for &k in &p.keys {
+            if let Ok(i) = keys.binary_search_by_key(&k, |x| x.id) {
+                keys[i].move_block(t, order_val(old, desc), order_val(v, desc), members, ready);
+            }
         }
     }
 
@@ -1817,10 +2133,10 @@ impl Settled {
                 let x = (order_val(v, desc), eid);
                 if enter {
                     rk.count += 1;
-                    rk.order_insert(x, members, ready);
+                    rk.order_insert(x, 0, members, ready);
                 } else {
                     rk.count -= 1;
-                    rk.order_remove(x, members, ready);
+                    rk.order_remove(x, 0, members, ready);
                 }
             }
             return;
@@ -1949,6 +2265,9 @@ pub(crate) struct Family {
     /// 1 段目の先の entity を記録し、 件数は 1 段目の先ごとの部分和で持つ — 1 段目の先の group の
     /// 値が変わっても根を評価せず部分和を移すだけ (`Settled::move_partial`)。
     partial: Option<usize>,
+    /// 上位 k 件で並びの列が根でない時: 根の子のうち道の上の節 (1 段目)。 根は 1 段目の先の entity を
+    /// 記録し、 順序は会社ごとの塊 (`OrderIndex::Blocks`) — 会社の値が変わっても塊を付け替えるだけ。
+    order_part: Option<usize>,
     /// 節ごと: 範囲の穴の節から根への道の上か (その節の答えは範囲の値を運ぶ)。
     on_path: Vec<bool>,
 }
@@ -2060,9 +2379,16 @@ impl Family {
                 .map(|_| Shard(Mutex::new(Pending { nodes: (0..n).map(|_| Marks::default()).collect(), freed: Marks::default() })))
                 .collect(),
             dirty: AtomicU32::new(0),
-            settled: Mutex::new(Settled::new(&widths)),
+            settled: Mutex::new({
+                let mut st = Settled::new(&widths);
+                if matches!(kind, CarryKind::Order(_)) && nodes_partial.is_some() {
+                    st.order_view = Some(());
+                }
+                st
+            }),
             expand_always: AtomicBool::new(false),
             partial: if kind == CarryKind::Group { nodes_partial } else { None },
+            order_part: if matches!(kind, CarryKind::Order(_)) { nodes_partial } else { None },
             range,
             kind,
             on_path,
@@ -2242,7 +2568,11 @@ impl Family {
         if s.key(ids[0]).is_none() {
             // id は昇順に振られるので末尾に足せば並びが保たれる
             debug_assert!(s.keys.last().is_none_or(|k| k.id < ids[0]));
-            s.keys.push(RootKey::new(ids[0]));
+            let mut rk = RootKey::new(ids[0]);
+            if self.order_part.is_some() {
+                rk.order = OrderIndex::Blocks(Blocks::default());
+            }
+            s.keys.push(rk);
         }
         ids[0]
     }
@@ -2267,6 +2597,13 @@ impl Family {
                     s.partial.retain(|_, p| {
                         p.n.retain(|x| x.0 != k);
                         !p.n.is_empty()
+                    });
+                }
+                if self.order_part.is_some() {
+                    let k = ids[0];
+                    s.opart.retain(|_, p| {
+                        p.keys.retain(|&x| x != k);
+                        !p.keys.is_empty()
                     });
                 }
             }
@@ -2455,9 +2792,16 @@ impl Family {
             }
         } else if let Some(tk) = m.topk.as_mut() {
             // 上位 k 件: 境界 = 鍵の順序の k 番目、 先頭 k 個を初回の報告に積む (新しい鍵なら
-            // 順序は空で、 候補を評価した時の遷移が境界を動かす)
+            // 順序は空で、 候補を評価した時の遷移が境界を動かす)。 塊の family は集計と同じく 1 段目の
+            // 先にも印を付けて記録を作る
+            if let Some(c1) = self.order_part {
+                let mut ts: Vec<u32> = roots.iter().filter_map(|&e| r.cell(self.nodes[c1].via, e)).collect();
+                ts.sort_unstable();
+                ts.dedup();
+                self.push_marks(c1, ts);
+            }
             if let Ok(i) = keys.binary_search_by_key(&id, |k| k.id) {
-                let first: Vec<(u32, u32)> = keys[i].order.iter().take(tk.k).copied().collect();
+                let first: Vec<(u32, u32)> = keys[i].order.first_k(tk.k);
                 tk.th = (first.len() == tk.k).then(|| first[tk.k - 1]);
                 for x in first {
                     m.note(slot, ready, x.1, false);
@@ -2542,9 +2886,12 @@ impl Family {
                     let same = root_plain.then(|| self.eval_known(r, s, 0, 0, known));
                     for e in ents {
                         let now = same.unwrap_or_else(|| self.eval_known(r, s, 0, e, known));
-                        match self.partial {
-                            Some(_) => s.apply_root_partial(e, now.map(|a| (a.0, t)), now.map_or(0, |a| a.1)),
-                            None => s.apply_root_cached(e, now, mode, &mut cache, &fresh),
+                        match (self.partial, self.order_part, mode) {
+                            (Some(_), _, _) => s.apply_root_partial(e, now.map(|a| (a.0, t)), now.map_or(0, |a| a.1)),
+                            (_, Some(_), RootMode::Ordered(desc)) => {
+                                s.apply_root_order_part(e, now.map(|a| (a.0, t)), now.map_or(0, |a| a.1), desc)
+                            }
+                            _ => s.apply_root_cached(e, now, mode, &mut cache, &fresh),
                         }
                     }
                 }
@@ -2552,14 +2899,17 @@ impl Family {
                 // 当てる (逆引きの後に ref が書き換わった根は、 こちらの今の Column の答えが勝つ)
                 for e in list {
                     let now = self.eval(r, s, 0, e);
-                    match self.partial {
-                        Some(c1) => {
+                    match (self.partial.or(self.order_part), mode) {
+                        (Some(c1), _) => {
                             let g = now.map_or(0, |a| a.1);
                             let t = now.and_then(|_| r.cell(self.nodes[c1].via, e));
                             let now = now.and_then(|a| Some((a.0, t?)));
-                            s.apply_root_partial(e, now, g);
+                            match mode {
+                                RootMode::Ordered(desc) => s.apply_root_order_part(e, now, g, desc),
+                                _ => s.apply_root_partial(e, now, g),
+                            }
                         }
-                        None => s.apply_root_cached(e, now, mode, &mut cache, &fresh),
+                        (None, _) => s.apply_root_cached(e, now, mode, &mut cache, &fresh),
                     }
                 }
                 continue;
@@ -2574,7 +2924,7 @@ impl Family {
                 }
                 // 範囲の値は帯が変わった時だけ運ぶ (帯の中の違いはどの member にも区別が付かない)。
                 // 集計の部分和の節では group の値は運ばない (部分和を移す)
-                let partial_node = self.partial == Some(n);
+                let partial_node = self.partial == Some(n) || self.order_part == Some(n);
                 let changed = match (prev, now) {
                     (Some(Some((pi, pv))), Some((ni, nv))) => {
                         pi != ni
@@ -2586,7 +2936,10 @@ impl Family {
                     _ => true,
                 };
                 if partial_node && let Some((_, nv)) = now {
-                    s.move_partial(e, nv);
+                    match mode {
+                        RootMode::Ordered(desc) => s.move_order(e, nv, desc),
+                        _ => s.move_partial(e, nv),
+                    }
                 }
                 if always || force || changed {
                     let up = r.pull(via, e);
@@ -2879,11 +3232,11 @@ impl LiveRegistry {
         for f in fams {
             let mut guard = f.settled.lock();
             f.settle(r, &mut guard);
-            let Settled { recs, vals, members, ready, .. } = &mut *guard;
+            let Settled { recs, vals, members, ready, opart, order_view, .. } = &mut *guard;
             for slot in std::mem::take(ready) {
                 if let Some(m) = members[slot].as_mut() {
                     let union = m.union.as_ref().map(|(w, i)| (w.upgrade(), *i));
-                    let d = m.drain(|e| root_at(recs, vals, e), if union.is_some() { 0 } else { peer });
+                    let d = m.drain(|e| view_at(recs, vals, opart, *order_view, e), if union.is_some() { 0 } else { peer });
                     match union {
                         Some((Some(u), i)) if !d.is_empty() => branch.push((u, i, d)),
                         Some(_) => {}
@@ -3028,9 +3381,9 @@ impl Union {
         for (i, (f, slot)) in self.branches.iter().enumerate() {
             let mut g = f.settled.lock();
             f.settle(r, &mut g);
-            let Settled { recs, vals, members, .. } = &mut *g;
+            let Settled { recs, vals, members, opart, order_view, .. } = &mut *g;
             if let Some(m) = members[*slot].as_mut() {
-                ds.push((i, m.drain(|e| root_at(recs, vals, e), 0)));
+                ds.push((i, m.drain(|e| view_at(recs, vals, opart, *order_view, e), 0)));
             }
         }
         let mut st = self.state.lock();
@@ -3115,9 +3468,9 @@ impl LiveQuery {
             Kind::One { family, slot } => {
                 let mut guard = family.settled.lock();
                 family.settle(r, &mut guard);
-                let Settled { recs, vals, members, .. } = &mut *guard;
+                let Settled { recs, vals, members, opart, order_view, .. } = &mut *guard;
                 match members[*slot].as_mut() {
-                    Some(m) => m.drain(|e| root_at(recs, vals, e), peer),
+                    Some(m) => m.drain(|e| view_at(recs, vals, opart, *order_view, e), peer),
                     None => LiveDelta::default(),
                 }
             }
@@ -3184,7 +3537,7 @@ impl LiveQuery {
     fn ranked_in(s: &Settled, m: &Member, k: u32) -> Vec<u32> {
         let Some(tk) = m.topk else { return Vec::new() };
         match s.keys.binary_search_by_key(&k, |x| x.id) {
-            Ok(i) => s.keys[i].order.iter().take(tk.k).map(|x| x.1).collect(),
+            Ok(i) => s.keys[i].order.first_k(tk.k).into_iter().map(|x| x.1).collect(),
             Err(_) => Vec::new(),
         }
     }
@@ -3209,7 +3562,7 @@ impl LiveQuery {
         };
         let mut s = family.settled.lock();
         family.settle(eng, &mut s);
-        s.members[slot].as_ref().is_some_and(|m| m.has(e, s.root(e)))
+        s.members[slot].as_ref().is_some_and(|m| m.has(e, s.view(e)))
     }
 
     /// 現在の結果全体 (eid 昇順)。 poll の状態は変えない。
