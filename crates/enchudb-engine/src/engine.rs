@@ -11489,6 +11489,33 @@ impl Engine {
         group_path: Vec<u16>,
         group_himo: u16,
     ) -> std::io::Result<crate::live::LiveCounts> {
+        self.subscribe_agg(preds, group_path, group_himo, None)
+    }
+
+    /// [`subscribe_counts`](Self::subscribe_counts) に加えて、 group ごとに根の紐 `sum_himo` の値の和も
+    /// 持つ (live の `GROUP BY .. SUM(col)`、 [`LiveCounts::poll_sums`](crate::live::LiveCounts::poll_sums))。
+    /// 値の無い entity は件数に入り、 合計には 0 として足す (SQL の `COUNT(*)` / `SUM`)。 `sum_himo` は
+    /// Number の紐。 平均は合計 / 件数。
+    pub fn subscribe_sums(
+        &self,
+        preds: Vec<crate::live::LivePred>,
+        group_path: Vec<u16>,
+        group_himo: u16,
+        sum_himo: u16,
+    ) -> std::io::Result<crate::live::LiveCounts> {
+        if sum_himo as usize >= self.himos.len() || self.value_type_at(sum_himo as usize) != Some(ValueType::Number) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "sum himo is not a Number himo"));
+        }
+        self.subscribe_agg(preds, group_path, group_himo, Some(sum_himo))
+    }
+
+    fn subscribe_agg(
+        &self,
+        preds: Vec<crate::live::LivePred>,
+        group_path: Vec<u16>,
+        group_himo: u16,
+        sum_himo: Option<u16>,
+    ) -> std::io::Result<crate::live::LiveCounts> {
         let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, m.to_string());
         self.validate_live_preds(&preds)?;
         if group_himo as usize >= self.himos.len() || group_path.iter().any(|&h| h as usize >= self.himos.len()) {
@@ -11510,7 +11537,7 @@ impl Engine {
             let _ = self.himos[h as usize].slice_len(0);
         }
         // 登録手順は subscribe と同じ (route → barrier → 初期候補)
-        let q = self.live.register_counts(branches, (group_path, group_himo)).map_err(|m| bad(&m))?;
+        let q = self.live.register_counts(branches, (group_path, group_himo), sum_himo).map_err(|m| bad(&m))?;
         for h in q.himos() {
             self.himos[h as usize].write_barrier();
         }

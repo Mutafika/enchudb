@@ -99,6 +99,11 @@
 //! O(鍵の数)。 根が出入りした時はその会社の今の group で数える。 登録時に 1 段目の先にも印を
 //! 付けて記録を作る (記録の無い会社が最初に変わると配下を全部評価し直すことになるので)。
 //!
+//! 合計も持つ購読 ([`Engine::subscribe_sums`](crate::engine::Engine::subscribe_sums)) は、 件数と
+//! 同じ所で根の列の値の和も動かす ([`Agg`])。 根が今数えている値は `Settled::summand` に持ち (出る時に
+//! 引く値)、 合計の列に根への route を張る — 値が書き換わった根は答えが同じでも数え直す。 部分和も
+//! (件数, 合計) で持つので、 会社の所在地が変わった時に移すのは変わらず O(鍵の数)。
+//!
 //! # 上位 k 件の購読 ([`Engine::subscribe_top`](crate::engine::Engine::subscribe_top))
 //!
 //! 並びの列も 「値を根まで運ぶ穴」 にし (値が変わるたびに運ぶ)、 根の鍵ごとに (並びの値, eid) の
@@ -1121,8 +1126,9 @@ enum HoleVal {
     Ids(Vec<u32>),
     Text(String),
     Range(u32, u32),
-    /// 集計の group の列 ([`LiveCounts`])。 値は持たない (全ての値が group)。
-    Group,
+    /// 集計の group の列 ([`LiveCounts`])。 値は持たない (全ての値が group)。 中身は合計する根の列
+    /// (紐 + 1、 0 = 合計しない — 件数だけ)。
+    Group(u32),
     /// 上位 k 件の購読の並びの列 (`true` = 降順)。 k は member ごと ([`Engine::subscribe_top`](crate::engine::Engine::subscribe_top))。
     Order(bool),
 }
@@ -1209,6 +1215,7 @@ fn canonical(preds: Vec<LivePred>, carry: Option<(Vec<u16>, u16, HoleVal)>) -> (
         sig.extend(path.iter().map(|&x| x as u32));
         match hv {
             HoleVal::Order(desc) => sig.extend([7, h as u32, desc as u32]),
+            HoleVal::Group(sum) => sig.extend([6, h as u32, sum]),
             _ => sig.extend([6, h as u32]),
         }
         flats.push(Flat { path, sig, leaf: Leaf::Hole(h, hv) });
@@ -1312,7 +1319,7 @@ fn build_tree(flats: Vec<Flat>) -> Vec<Node> {
             };
         }
         match f.leaf {
-            Leaf::Hole(h, HoleVal::Range(..) | HoleVal::Group | HoleVal::Order(_)) => {
+            Leaf::Hole(h, HoleVal::Range(..) | HoleVal::Group(_) | HoleVal::Order(_)) => {
                 nodes[cur].range = Some((h, slot));
                 slot += 1;
             }
@@ -1412,24 +1419,50 @@ impl TopK {
     }
 }
 
+/// group 1 つの集計: 根の数と、 合計する列の値の和 (値の無い根は 0 として足す = SQL の SUM)。
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Agg {
+    pub count: u64,
+    pub sum: u64,
+}
+
+impl Agg {
+    #[inline]
+    fn one(x: u32) -> Agg {
+        Agg { count: 1, sum: x as u64 }
+    }
+
+    #[inline]
+    fn add(&mut self, o: Agg) {
+        self.count = self.count.wrapping_add(o.count);
+        self.sum = self.sum.wrapping_add(o.sum);
+    }
+
+    #[inline]
+    fn sub(&mut self, o: Agg) {
+        self.count = self.count.wrapping_sub(o.count);
+        self.sum = self.sum.wrapping_sub(o.sum);
+    }
+}
+
 /// 集計の購読 1 本ぶんの報告状態。 件数そのものは根の鍵が持ち (同じ鍵の購読で共有)、 ここは
 /// 「どの group の件数が動いたか」 と 「最後に渡した件数」 だけ。
 #[derive(Default)]
 struct GroupState {
     changed: Marks,
-    reported: std::collections::BTreeMap<u32, u64>,
+    reported: std::collections::BTreeMap<u32, Agg>,
 }
 
 impl GroupState {
-    /// 動いた group の今の件数 (最後に渡した件数と違うものだけ、 値の昇順。 0 = group が消えた)。
-    fn drain(&mut self, groups: &std::collections::BTreeMap<u32, u64>) -> Vec<(u32, u64)> {
+    /// 動いた group の今の集計 (最後に渡したものと違うものだけ、 値の昇順。 件数 0 = group が消えた)。
+    fn drain(&mut self, groups: &std::collections::BTreeMap<u32, Agg>) -> Vec<(u32, Agg)> {
         let mut out = Vec::new();
         for v in self.changed.take() {
-            let now = groups.get(&v).copied().unwrap_or(0);
-            let was = self.reported.get(&v).copied().unwrap_or(0);
+            let now = groups.get(&v).copied().unwrap_or_default();
+            let was = self.reported.get(&v).copied().unwrap_or_default();
             if now != was {
                 out.push((v, now));
-                if now == 0 {
+                if now.count == 0 {
                     self.reported.remove(&v);
                 } else {
                     self.reported.insert(v, now);
@@ -1558,6 +1591,8 @@ struct Settled {
     fresh: Vec<usize>,
     /// 次の settle は答えが変わらなくても展開する (`fresh` の初回の報告のため)。
     force: bool,
+    /// 合計する列のある集計の family: 根ごとに、 今数えている合計の値 (`Family::sum`)。
+    summand: Words,
     /// 上位 k 件で並びの列が根でない family (`Family::order_part`): 根の記録は (鍵, 1 段目の先) で、
     /// 並びの値は `opart` から引く。
     order_view: Option<()>,
@@ -1586,8 +1621,8 @@ fn view_at(recs: &[KeyStore], vals: &[Words], opart: &std::collections::BTreeMap
 struct Partial {
     /// `t` の根を今数えている group の値。
     g: u32,
-    /// 根の鍵 id → その鍵で `t` を指して数えている根の数。
-    n: Vec<(u32, u64)>,
+    /// 根の鍵 id → その鍵で `t` を指して数えている根の集計。
+    n: Vec<(u32, Agg)>,
 }
 
 /// 根の答えの当て方。
@@ -1632,8 +1667,8 @@ struct RootKey {
     count: usize,
     /// 範囲の穴のある family: member の範囲の索引 (member が変わったら None に戻して作り直す)。
     ivs: Option<Ivs>,
-    /// 集計の family: group の値 → その値の根の数 (0 の group は載せない)。
-    groups: std::collections::BTreeMap<u32, u64>,
+    /// 集計の family: group の値 → その値の根の集計 (根の数 0 の group は載せない)。
+    groups: std::collections::BTreeMap<u32, Agg>,
     /// 上位 k 件の family: この鍵の根を (並びの値 (降順は反転), eid) の昇順で。
     order: OrderIndex,
 }
@@ -2062,6 +2097,7 @@ impl Settled {
             partial: std::collections::BTreeMap::new(),
             fresh: Vec::new(),
             force: false,
+            summand: Words::default(),
             order_view: None,
             opart: std::collections::BTreeMap::new(),
         }
@@ -2124,13 +2160,17 @@ impl Settled {
         }
     }
 
-    /// 根の鍵 `k` の group `g` の件数を `d` 動かし、 鍵の member に 「g が動いた」 を積む。
-    fn bump_group(keys: &mut [RootKey], members: &mut [Option<Member>], k: u32, g: u32, d: i64) {
+    /// 根の鍵 `k` の group `g` に `d` を足す (`add` = false なら引く)。 鍵の member に 「g が動いた」 を積む。
+    fn bump_group(keys: &mut [RootKey], members: &mut [Option<Member>], k: u32, g: u32, d: Agg, add: bool) {
         let Ok(i) = keys.binary_search_by_key(&k, |x| x.id) else { return };
         let rk = &mut keys[i];
-        let c = rk.groups.entry(g).or_insert(0);
-        *c = c.wrapping_add_signed(d);
-        if *c == 0 {
+        let c = rk.groups.entry(g).or_default();
+        if add {
+            c.add(d);
+        } else {
+            c.sub(d);
+        }
+        if c.count == 0 {
             rk.groups.remove(&g);
         }
         for &slot in &rk.members {
@@ -2149,8 +2189,8 @@ impl Settled {
             return;
         }
         for &(k, n) in &p.n {
-            Settled::bump_group(keys, members, k, p.g, -(n as i64));
-            Settled::bump_group(keys, members, k, g, n as i64);
+            Settled::bump_group(keys, members, k, p.g, n, false);
+            Settled::bump_group(keys, members, k, g, n, true);
         }
         p.g = g;
     }
@@ -2160,13 +2200,18 @@ impl Settled {
     ///
     /// `t` の根は常に部分和の `g` で数える (評価で読んだ値とずれていても — ずれるのは `t` より
     /// 下が書き換わった時で、 その印で `t` を評価し直した時に `move_partial` が全部移す)。
-    fn apply_root_partial(&mut self, eid: u32, now: Option<Ans>, g: u32) {
+    ///
+    /// `x` = 根の合計する列の今の値 (合計しない family では 0)。
+    fn apply_root_partial(&mut self, eid: u32, now: Option<Ans>, g: u32, x: u32) {
         let was = self.root(eid);
-        if was == now {
+        let wx = self.summand.get(eid);
+        let x = if now.is_some() { x } else { 0 };
+        if was == now && wx == x {
             return;
         }
         self.recs[0].set_root(eid, now.map(|a| a.0));
         self.vals[0].put(eid, now.map_or(0, |a| a.1 + 1));
+        self.summand.put(eid, x);
         let Settled { partial, keys, members, .. } = self;
         if let Some((k, t)) = was {
             if let Ok(i) = keys.binary_search_by_key(&k, |x| x.id) {
@@ -2175,15 +2220,15 @@ impl Settled {
             if let Some(p) = partial.get_mut(&t) {
                 let pg = p.g;
                 if let Some(j) = p.n.iter().position(|x| x.0 == k) {
-                    p.n[j].1 -= 1;
-                    if p.n[j].1 == 0 {
+                    p.n[j].1.sub(Agg::one(wx));
+                    if p.n[j].1.count == 0 {
                         p.n.swap_remove(j);
                     }
                 }
                 if p.n.is_empty() {
                     partial.remove(&t);
                 }
-                Settled::bump_group(keys, members, k, pg, -1);
+                Settled::bump_group(keys, members, k, pg, Agg::one(wx), false);
             }
         }
         if let Some((k, t)) = now {
@@ -2191,12 +2236,12 @@ impl Settled {
                 keys[i].count += 1;
             }
             let p = partial.entry(t).or_insert_with(|| Partial { g, n: Vec::new() });
-            match p.n.iter_mut().find(|x| x.0 == k) {
-                Some(x) => x.1 += 1,
-                None => p.n.push((k, 1)),
+            match p.n.iter_mut().find(|y| y.0 == k) {
+                Some(y) => y.1.add(Agg::one(x)),
+                None => p.n.push((k, Agg::one(x))),
             }
             let pg = p.g;
-            Settled::bump_group(keys, members, k, pg, 1);
+            Settled::bump_group(keys, members, k, pg, Agg::one(x), true);
         }
     }
 
@@ -2208,7 +2253,9 @@ impl Settled {
     /// 根 `eid` の答えを `now` にし、 出入りした member に印を付ける (集計の family では group の
     /// 件数を動かす)。
     #[inline]
-    fn apply_root_cached(&mut self, eid: u32, now: Option<Ans>, mode: RootMode, cache: &mut KeyCache, fresh: &[usize]) {
+    ///
+    /// `x` = 根の合計する列の今の値 (集計で合計する family 以外は 0)。
+    fn apply_root_cached(&mut self, eid: u32, now: Option<Ans>, x: u32, mode: RootMode, cache: &mut KeyCache, fresh: &[usize]) {
         let was = self.root(eid);
         // 既にある鍵に加わったばかりの member: 集合に居る根を初回の報告に積む (遷移しない根も)
         if now.is_some() {
@@ -2218,9 +2265,11 @@ impl Settled {
                 }
             }
         }
-        if was == now {
+        let (wx, x) = (self.summand.get(eid), if now.is_some() { x } else { 0 });
+        if was == now && wx == x {
             return;
         }
+        self.summand.put(eid, x);
         self.recs[0].set_root(eid, now.map(|a| a.0));
         if mode != RootMode::Plain {
             self.vals[0].put(eid, now.map_or(0, |a| a.1 + 1));
@@ -2244,17 +2293,17 @@ impl Settled {
             return;
         }
         if mode == RootMode::Grouped {
-            for (k, ans, enter) in [(iw, was, false), (inw, now, true)] {
+            for (k, ans, y, enter) in [(iw, was, wx, false), (inw, now, x, true)] {
                 let (Some(i), Some((_, v))) = (k, ans) else { continue };
                 let rk = &mut keys[i];
-                let c = rk.groups.entry(v).or_insert(0);
+                let c = rk.groups.entry(v).or_default();
                 if enter {
                     rk.count += 1;
-                    *c += 1;
+                    c.add(Agg::one(y));
                 } else {
                     rk.count -= 1;
-                    *c -= 1;
-                    if *c == 0 {
+                    c.sub(Agg::one(y));
+                    if c.count == 0 {
                         rk.groups.remove(&v);
                     }
                 }
@@ -2372,6 +2421,8 @@ pub(crate) struct Family {
     order_part: Option<usize>,
     /// 節ごと: 範囲の穴の節から根への道の上か (その節の答えは範囲の値を運ぶ)。
     on_path: Vec<bool>,
+    /// 集計で group ごとに値の和も持つ根の列 (`Settled::summand`)。 根に route を張る。
+    sum: Option<u16>,
 }
 
 /// 穴の値を解決して鍵の組 (穴の値の並び) を返す。 `In` の穴は値の数だけ組が増える (組の掛け算)。
@@ -2383,7 +2434,7 @@ fn resolve(r: &impl CellReader, key: &[HoleVal]) -> Option<Vec<Vec<u32>>> {
             HoleVal::Id(x) => vec![*x],
             HoleVal::Ids(xs) => xs.clone(),
             HoleVal::Text(t) => vec![r.vocab_lookup(t)?],
-            HoleVal::Range(..) | HoleVal::Group | HoleVal::Order(_) => vec![0],
+            HoleVal::Range(..) | HoleVal::Group(_) | HoleVal::Order(_) => vec![0],
         };
         out = if choices.len() == 1 {
             out.into_iter().map(|mut t| {
@@ -2433,11 +2484,15 @@ impl Family {
         let kind = flats
             .iter()
             .find_map(|f| match f.leaf {
-                Leaf::Hole(_, HoleVal::Group) => Some(CarryKind::Group),
+                Leaf::Hole(_, HoleVal::Group(_)) => Some(CarryKind::Group),
                 Leaf::Hole(_, HoleVal::Order(desc)) => Some(CarryKind::Order(desc)),
                 _ => None,
             })
             .unwrap_or(CarryKind::Range);
+        let sum = flats.iter().find_map(|f| match f.leaf {
+            Leaf::Hole(_, HoleVal::Group(x)) if x > 0 => Some((x - 1) as u16),
+            _ => None,
+        });
         let nodes = build_tree(flats);
         let mut order: Vec<usize> = (0..nodes.len()).collect();
         order.sort_by_key(|&n| std::cmp::Reverse(nodes[n].depth));
@@ -2465,6 +2520,9 @@ impl Family {
                 }
                 n = nodes[n].parent;
             }
+        }
+        if let Some(h) = sum {
+            routes.push((h, 0));
         }
         routes.sort_unstable();
         routes.dedup();
@@ -2494,6 +2552,7 @@ impl Family {
             range,
             kind,
             on_path,
+            sum,
         }
     }
 
@@ -2540,7 +2599,7 @@ impl Family {
     ) -> usize {
         let mut s = self.settled.lock();
         let first = alts.first().map(Vec::as_slice).unwrap_or_default();
-        let grp = first.contains(&HoleVal::Group).then(GroupState::default);
+        let grp = first.iter().any(|v| matches!(v, HoleVal::Group(_))).then(GroupState::default);
         let order_desc = first.iter().any(|v| matches!(v, HoleVal::Order(true)));
         let range = range_of(first);
         let topk = limit.map(|k| TopK { k, th: None });
@@ -2969,6 +3028,8 @@ impl Family {
         // 数十万人が動く時、 1 人あたりの評価がほぼ根自身の条件だけになる)
         let single_child = (self.nodes[0].children.len() == 1).then(|| self.nodes[0].children[0]);
         let mut via_child: Vec<(Option<Ans>, u32, Vec<u32>)> = Vec::new();
+        // 合計する列の今の値 (合計しない family では読まない)
+        let summand = |e: u32| self.sum.and_then(|h| r.cell(h, e)).unwrap_or(0);
         let root_plain = self.nodes[0].local.is_empty() && self.nodes[0].holes.is_empty() && self.nodes[0].range.is_none();
         for &n in &self.order {
             let mut list = std::mem::take(&mut work[n]);
@@ -2983,11 +3044,11 @@ impl Family {
                     for e in ents {
                         let now = same.unwrap_or_else(|| self.eval_known(r, s, 0, e, known));
                         match (self.partial, self.order_part, mode) {
-                            (Some(_), _, _) => s.apply_root_partial(e, now.map(|a| (a.0, t)), now.map_or(0, |a| a.1)),
+                            (Some(_), _, _) => s.apply_root_partial(e, now.map(|a| (a.0, t)), now.map_or(0, |a| a.1), summand(e)),
                             (_, Some(_), RootMode::Ordered(desc)) => {
                                 s.apply_root_order_part(e, now.map(|a| (a.0, t)), now.map_or(0, |a| a.1), desc)
                             }
-                            _ => s.apply_root_cached(e, now, mode, &mut cache, &fresh),
+                            _ => s.apply_root_cached(e, now, summand(e), mode, &mut cache, &fresh),
                         }
                     }
                 }
@@ -3002,10 +3063,10 @@ impl Family {
                             let now = now.and_then(|a| Some((a.0, t?)));
                             match mode {
                                 RootMode::Ordered(desc) => s.apply_root_order_part(e, now, g, desc),
-                                _ => s.apply_root_partial(e, now, g),
+                                _ => s.apply_root_partial(e, now, g, summand(e)),
                             }
                         }
-                        (None, _) => s.apply_root_cached(e, now, mode, &mut cache, &fresh),
+                        (None, _) => s.apply_root_cached(e, now, summand(e), mode, &mut cache, &fresh),
                     }
                 }
                 continue;
@@ -3229,12 +3290,15 @@ impl LiveRegistry {
     /// 集計の購読を登録する: `branches` (`Or` 展開済み) の結果を `group` (ref の道 + 紐) の値ごとに
     /// 数える。 枝は全部同じ形であること (鍵を複数持つ 1 つの member に束ねる — 根の鍵は 1 つなので
     /// group の件数は鍵ごとの和)。 形の違う枝があれば Err。
+    /// `sum` = 根の列 (group ごとに値の和も持つ、 [`LiveCounts::poll_sums`])。
     pub(crate) fn register_counts(
         self: &Arc<Self>,
         branches: Vec<Vec<LivePred>>,
         group: (Vec<u16>, u16),
+        sum: Option<u16>,
     ) -> Result<LiveCounts, String> {
-        let (sig, flats, alts) = one_shape(branches, (group.0, group.1, HoleVal::Group), "subscribe_counts")?;
+        let carry = HoleVal::Group(sum.map_or(0, |h| h as u32 + 1));
+        let (sig, flats, alts) = one_shape(branches, (group.0, group.1, carry), "subscribe_counts")?;
         let id = self.next_member_id.fetch_add(1, Ordering::Relaxed);
         let (family, slot) = self.register_alts(id, sig, flats, alts, false, None, None);
         Ok(LiveCounts { family, slot, id, registry: self.clone() })
@@ -3755,7 +3819,7 @@ impl LiveCounts {
     }
 
     /// settle して `f(この購読の報告状態, 鍵の group の件数, 鍵の件数)`。
-    fn with<T>(&self, r: &impl CellReader, f: impl FnOnce(&mut GroupState, &std::collections::BTreeMap<u32, u64>, usize) -> T) -> T {
+    fn with<T>(&self, r: &impl CellReader, f: impl FnOnce(&mut GroupState, &std::collections::BTreeMap<u32, Agg>, usize) -> T) -> T {
         let mut guard = self.family.settled.lock();
         self.family.settle(r, &mut guard);
         let Settled { members, keys, .. } = &mut *guard;
@@ -3771,7 +3835,7 @@ impl LiveCounts {
                 merged = std::collections::BTreeMap::new();
                 for &i in many {
                     for (&v, &c) in &keys[i].groups {
-                        *merged.entry(v).or_insert(0) += c;
+                        merged.entry(v).or_insert_with(Agg::default).add(c);
                     }
                 }
                 (&merged, many.iter().map(|&i| keys[i].count).sum())
@@ -3784,29 +3848,47 @@ impl LiveCounts {
     }
 
     /// 前回 poll から件数が変わった group と今の件数 (値の昇順、 0 = group が消えた)。 値は
-    /// `query_by_id` と同じ (Number は値、 Tag は vocab id、 Ref は local eid)。
+    /// `query_by_id` と同じ (Number は値、 Tag は vocab id、 Ref は local eid)。 合計も持つ購読
+    /// (`Engine::subscribe_sums`) では合計だけが動いた group も今の件数で届く ([`poll_sums`](Self::poll_sums))。
     pub fn poll(&self, eng: &crate::engine::Engine) -> Vec<(u32, u64)> {
+        self.check_engine(eng);
+        self.poll_with(eng).into_iter().map(|(v, a)| (v, a.count)).collect()
+    }
+
+    /// `poll` の、 件数と合計の両方を返す版 (前回 poll から件数か合計が動いた group、 件数 0 = group が
+    /// 消えた)。 `poll` と報告状態を共有する。 合計しない購読では合計は 0。
+    pub fn poll_sums(&self, eng: &crate::engine::Engine) -> Vec<(u32, Agg)> {
         self.check_engine(eng);
         self.poll_with(eng)
     }
 
-    pub(crate) fn poll_with(&self, r: &impl CellReader) -> Vec<(u32, u64)> {
+    pub(crate) fn poll_with(&self, r: &impl CellReader) -> Vec<(u32, Agg)> {
         self.with(r, |g, groups, _| g.drain(groups))
     }
 
     /// group `value` の今の件数 (poll の状態は変えない)。
     pub fn get(&self, eng: &crate::engine::Engine, value: u32) -> u64 {
+        self.get_agg(eng, value).count
+    }
+
+    /// group `value` の今の件数と合計 (poll の状態は変えない)。
+    pub fn get_agg(&self, eng: &crate::engine::Engine, value: u32) -> Agg {
         self.check_engine(eng);
-        self.with(eng, |_, groups, _| groups.get(&value).copied().unwrap_or(0))
+        self.with(eng, |_, groups, _| groups.get(&value).copied().unwrap_or_default())
     }
 
     /// 今の全 group と件数 (値の昇順)。
     pub fn all(&self, eng: &crate::engine::Engine) -> Vec<(u32, u64)> {
+        self.all_sums(eng).into_iter().map(|(v, a)| (v, a.count)).collect()
+    }
+
+    /// 今の全 group と件数・合計 (値の昇順)。
+    pub fn all_sums(&self, eng: &crate::engine::Engine) -> Vec<(u32, Agg)> {
         self.check_engine(eng);
         self.all_with(eng)
     }
 
-    pub(crate) fn all_with(&self, r: &impl CellReader) -> Vec<(u32, u64)> {
+    pub(crate) fn all_with(&self, r: &impl CellReader) -> Vec<(u32, Agg)> {
         self.with(r, |_, groups, _| groups.iter().map(|(&v, &c)| (v, c)).collect())
     }
 

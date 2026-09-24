@@ -1894,6 +1894,22 @@ impl LiveCounts {
         self.inner.poll(&self.eng).into_iter().map(|(v, n)| (self.value(v), n)).collect()
     }
 
+    /// `poll` の、 件数と合計の両方を返す版 ([`Query::subscribe_sums`] の購読。 件数か合計が動いた
+    /// group、 件数 0 = group が消えた)。 `poll` と報告状態を共有する。 合計しない購読では合計は 0。
+    pub fn poll_sums(&self) -> Vec<(Value, u64, u64)> {
+        self.inner.poll_sums(&self.eng).into_iter().map(|(v, a)| (self.value(v), a.count, a.sum)).collect()
+    }
+
+    /// group `value` の今の合計 ([`Query::subscribe_sums`] の購読)。
+    pub fn get_sum(&self, value: &Value) -> u64 {
+        self.raw(value).map_or(0, |v| self.inner.get_agg(&self.eng, v).sum)
+    }
+
+    /// 今の全 group と件数・合計。
+    pub fn all_sums(&self) -> Vec<(Value, u64, u64)> {
+        self.inner.all_sums(&self.eng).into_iter().map(|(v, a)| (self.value(v), a.count, a.sum)).collect()
+    }
+
     /// group `value` の今の件数。
     pub fn get(&self, value: &Value) -> u64 {
         self.raw(value).map_or(0, |v| self.inner.get(&self.eng, v))
@@ -2364,6 +2380,31 @@ impl<'a> Query<'a> {
     /// - `col` が Leaf 列 (row ごとに固有の文字列)、 `limit` 付き、 形の違う枝の `or` は `BadValue`
     ///   (`where_in` や同じ形の `or` (`city = A OR city = B`) は可)
     pub fn subscribe_counts(self, col: &str) -> Result<LiveCounts, SchemaError> {
+        self.subscribe_agg(col, None)
+    }
+
+    /// [`subscribe_counts`](Self::subscribe_counts) に加えて、 group ごとに列 `sum_col` の値の和も持つ
+    /// (live の `GROUP BY col` + `COUNT(*)` + `SUM(sum_col)`)。 平均は合計 / 件数。
+    ///
+    /// ```ignore
+    /// let pay = users.where_eq("status", "active").subscribe_sums("company.city", "salary")?;
+    /// for (city, n, total) in pay.poll_sums() { /* 件数か合計が変わった city */ }
+    /// ```
+    ///
+    /// - `sum_col` はこの table の Number 列 (ref をたどる列は不可)。 値の無い row は件数に入り、
+    ///   合計には 0 として足す (SQL の `SUM` と同じく NULL を無視)
+    /// - 合計の列の書き換えも届く (row の出入りが無くても)
+    pub fn subscribe_sums(self, col: &str, sum_col: &str) -> Result<LiveCounts, SchemaError> {
+        let cd = self
+            .table
+            .col(sum_col)
+            .filter(|c| c.ty == ColumnType::Number)
+            .ok_or_else(|| SchemaError::BadValue(format!("subscribe_sums: {sum_col} is not a Number column of this table")))?;
+        let h = cd.himo_id;
+        self.subscribe_agg(col, Some(h))
+    }
+
+    fn subscribe_agg(self, col: &str, sum: Option<u16>) -> Result<LiveCounts, SchemaError> {
         if self.limit.is_some() {
             return Err(SchemaError::BadValue("subscribe_counts: limit is not supported".into()));
         }
@@ -2379,9 +2420,11 @@ impl<'a> Query<'a> {
                 "subscribe: where_eq on an unknown column or with a mismatched value type".into(),
             )
         })?;
-        let inner = eng
-            .subscribe_counts(preds, path, cd.himo_id)
-            .map_err(|e| SchemaError::BadValue(e.to_string()))?;
+        let inner = match sum {
+            Some(h) => eng.subscribe_sums(preds, path, cd.himo_id, h),
+            None => eng.subscribe_counts(preds, path, cd.himo_id),
+        }
+        .map_err(|e| SchemaError::BadValue(e.to_string()))?;
         Ok(LiveCounts { inner, eng, ty: cd.ty })
     }
 

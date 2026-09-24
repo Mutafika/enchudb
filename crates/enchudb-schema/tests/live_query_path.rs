@@ -1002,6 +1002,7 @@ fn run_counts(path: &str) {
     db.table("users")
         .number("id")
         .number("age")
+        .number("salary")
         .tag("city")
         .ref_to("company", "companies")
         .primary_key("id")
@@ -1037,11 +1038,15 @@ fn run_counts(path: &str) {
             if i % 13 != 0 {
                 b = b.set("city", cities[(i % 3) as usize]);
             }
+            if i % 7 != 0 {
+                b = b.set("salary", (i * 13) % 100);
+            }
             b.commit().unwrap()
         })
         .collect();
     let (u, c) = (&users_t, &companies_t);
     let age = move |e: u64| get_num(u, e, "age");
+    let salary = move |e: u64| get_num(u, e, "salary").unwrap_or(0) as u64;
     let home = move |e: u64| get_text(u, e, "city");
     let company = move |e: u64| get_ref(u, e, "company");
     let work = move |e: u64| company(e).and_then(|x| get_text(c, x, "city"));
@@ -1053,7 +1058,10 @@ fn run_counts(path: &str) {
     struct CSub<'a> {
         name: String,
         q: enchudb_schema::LiveCounts,
-        seen: std::collections::BTreeMap<String, u64>,
+        /// group → (件数, 合計)
+        seen: std::collections::BTreeMap<String, (u64, u64)>,
+        /// salary の合計も持つ購読 (subscribe_sums)
+        sum: bool,
         cond: Cond<'a>,
         key: Key<'a>,
     }
@@ -1061,28 +1069,32 @@ fn run_counts(path: &str) {
     let make = |kind: u64, rng: &mut Rng| -> CSub {
         let a = cities[rng.below(4) as usize];
         let k = rng.below(30) as u32;
+        let sum = rng.below(2) == 0;
+        let agg = |q: enchudb_schema::Query, col: &str| {
+            if sum { q.subscribe_sums(col, "salary") } else { q.subscribe_counts(col) }.unwrap()
+        };
         let (name, q, cond, key): (String, enchudb_schema::LiveCounts, Cond, Key) = match kind {
             0 => (
                 "all by city".into(),
-                u.all().subscribe_counts("city").unwrap(),
+                agg(u.all(), "city"),
                 Box::new(move |e| age(e).is_some() || home(e).is_some() || company(e).is_some()),
                 Box::new(move |e| home(e).map(Value::Text)),
             ),
             1 => (
                 format!("age > {k} by company.city"),
-                u.all().where_gt("age", k).subscribe_counts("company.city").unwrap(),
+                agg(u.all().where_gt("age", k), "company.city"),
                 Box::new(move |e| age(e).is_some_and(|v| v > k as i64)),
                 Box::new(move |e| work(e).map(Value::Text)),
             ),
             2 => (
                 format!("company.city = {a} by age"),
-                u.where_eq("company.city", a).subscribe_counts("age").unwrap(),
+                agg(u.where_eq("company.city", a), "age"),
                 Box::new(move |e| work(e).as_deref() == Some(a)),
                 Box::new(move |e| age(e).map(Value::Number)),
             ),
             3 => (
                 format!("age in [{k}, {}] by company.city", k + 8),
-                u.where_range("age", k, k + 8).subscribe_counts("company.city").unwrap(),
+                agg(u.where_range("age", k, k + 8), "company.city"),
                 Box::new(move |e| age(e).is_some_and(|v| k as i64 <= v && v <= k as i64 + 8)),
                 Box::new(move |e| work(e).map(Value::Text)),
             ),
@@ -1091,7 +1103,7 @@ fn run_counts(path: &str) {
                 let v2 = vs.clone();
                 (
                     format!("age IN {vs:?} by company.city"),
-                    u.where_in("age", &vs).subscribe_counts("company.city").unwrap(),
+                    agg(u.where_in("age", &vs), "company.city"),
                     Box::new(move |e| age(e).is_some_and(|x| v2.contains(&(x as u32)))),
                     Box::new(move |e| work(e).map(Value::Text)),
                 )
@@ -1100,25 +1112,26 @@ fn run_counts(path: &str) {
                 let b = cities[rng.below(4) as usize];
                 (
                     format!("company.city = {a} OR company.city = {b} by age"),
-                    u.where_eq("company.city", a).or(u.where_eq("company.city", b)).subscribe_counts("age").unwrap(),
+                    agg(u.where_eq("company.city", a).or(u.where_eq("company.city", b)), "age"),
                     Box::new(move |e| work(e).is_some_and(|w| w == a || w == b)),
                     Box::new(move |e| age(e).map(Value::Number)),
                 )
             }
             5 => (
                 format!("age > {k} by company.region.name"),
-                u.all().where_gt("age", k).subscribe_counts("company.region.name").unwrap(),
+                agg(u.all().where_gt("age", k), "company.region.name"),
                 Box::new(move |e| age(e).is_some_and(|v| v > k as i64)),
                 Box::new(move |e| region(e).map(Value::Text)),
             ),
             _ => (
                 format!("city = {a} by company"),
-                u.where_eq("city", a).subscribe_counts("company").unwrap(),
+                agg(u.where_eq("city", a), "company"),
                 Box::new(move |e| home(e).as_deref() == Some(a)),
                 Box::new(move |e| company(e).map(Value::Ref)),
             ),
         };
-        CSub { name, q, seen: Default::default(), cond, key }
+        let name = if sum { format!("{name} sum salary") } else { name };
+        CSub { name, q, seen: Default::default(), sum, cond, key }
     };
     let mut subs: Vec<CSub> = (0..40).map(|i| make(i % 8, &mut rng)).collect();
     // 形の違う枝の Or は集計できない
@@ -1126,30 +1139,42 @@ fn run_counts(path: &str) {
 
     let check = |subs: &mut Vec<CSub>, users: &[u64], step: usize| {
         for s in subs.iter_mut() {
-            for (v, n) in s.q.poll() {
+            let got: Vec<(Value, u64, u64)> = if s.sum {
+                s.q.poll_sums()
+            } else {
+                s.q.poll().into_iter().map(|(v, n)| (v, n, 0)).collect()
+            };
+            for (v, n, t) in got {
                 if n == 0 {
                     assert!(s.seen.remove(&show(&v)).is_some(), "[{}] 知らない group の 0", s.name);
                 } else {
-                    assert_ne!(s.seen.insert(show(&v), n), Some(n), "[{}] 件数の変わらない group を報告", s.name);
+                    assert_ne!(s.seen.insert(show(&v), (n, t)), Some((n, t)), "[{}] 変わらない group を報告", s.name);
                 }
             }
-            let mut want: std::collections::BTreeMap<String, u64> = Default::default();
+            let mut want: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
             for &e in users {
                 if (s.cond)(e)
                     && let Some(k) = (s.key)(e)
                 {
-                    *want.entry(show(&k)).or_insert(0) += 1;
+                    let w = want.entry(show(&k)).or_insert((0, 0));
+                    w.0 += 1;
+                    if s.sum {
+                        w.1 += salary(e);
+                    }
                 }
             }
-            assert_eq!(s.seen, want, "[{}] step {step}: 積分 != 手で数えた件数", s.name);
-            assert!(s.q.poll().is_empty(), "[{}] step {step}: 受け取り済みの件数がまた届く", s.name);
-            let all: std::collections::BTreeMap<String, u64> = s.q.all().into_iter().map(|(v, n)| (show(&v), n)).collect();
-            assert_eq!(all, want, "[{}] step {step}: all", s.name);
-            assert_eq!(s.q.total() as u64, want.values().sum::<u64>(), "[{}] step {step}: total", s.name);
+            assert_eq!(s.seen, want, "[{}] step {step}: 積分 != 手で数えた件数 / 合計", s.name);
+            assert!(s.q.poll_sums().is_empty(), "[{}] step {step}: 受け取り済みの集計がまた届く", s.name);
+            let all: std::collections::BTreeMap<String, (u64, u64)> =
+                s.q.all_sums().into_iter().map(|(v, n, t)| (show(&v), (n, t))).collect();
+            assert_eq!(all, want, "[{}] step {step}: all_sums", s.name);
+            let counts: std::collections::BTreeMap<String, u64> = s.q.all().into_iter().map(|(v, n)| (show(&v), n)).collect();
+            assert_eq!(counts, want.iter().map(|(k, w)| (k.clone(), w.0)).collect(), "[{}] step {step}: all", s.name);
+            assert_eq!(s.q.total() as u64, want.values().map(|w| w.0).sum::<u64>(), "[{}] step {step}: total", s.name);
             if let Some(e) = users.iter().copied().find(|&e| (s.cond)(e))
                 && let Some(k) = (s.key)(e)
             {
-                assert_eq!(s.q.get(&k), want[&show(&k)], "[{}] step {step}: get", s.name);
+                assert_eq!((s.q.get(&k), s.q.get_sum(&k)), want[&show(&k)], "[{}] step {step}: get", s.name);
             }
         }
     };
@@ -1157,7 +1182,15 @@ fn run_counts(path: &str) {
 
     let mut next_id = 1000i64;
     for step in 1..1200 {
-        match rng.below(9) {
+        match rng.below(11) {
+            9 => {
+                let e = users[rng.below(users.len() as u64) as usize];
+                users_t.entity(e).set("salary", rng.below(100) as i64).commit().unwrap();
+            }
+            10 => {
+                let e = users[rng.below(users.len() as u64) as usize];
+                db.engine().untie(e, "users.salary");
+            }
             7 => {
                 let x = regions[rng.below(regions.len() as u64) as usize];
                 regions_t.entity(x).set("name", names[rng.below(3) as usize]).commit().unwrap();

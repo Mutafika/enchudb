@@ -468,6 +468,7 @@ fn new_kinds_under_concurrent_writes() {
         let range = eng.subscribe(vec![LivePred::Range { himo_id: age, lo: 10, hi: 20 }]).unwrap();
         let range_via = eng.subscribe(vec![via(LivePred::Range { himo_id: revenue, lo: 10, hi: 30 })]).unwrap();
         let counts = eng.subscribe_counts(vec![LivePred::Present { himo_id: age }], vec![company], city).unwrap();
+        let sums = eng.subscribe_sums(vec![LivePred::Range { himo_id: age, lo: 0, hi: 25 }], vec![company], city, score).unwrap();
         let top = eng.subscribe_top(vec![LivePred::Present { himo_id: score }], vec![], score, false, 15).unwrap();
         let top_via = eng.subscribe_top(vec![LivePred::Present { himo_id: age }], vec![company], revenue, true, 20).unwrap();
         let top_in = eng
@@ -476,6 +477,7 @@ fn new_kinds_under_concurrent_writes() {
         let qs: [&LiveQuery; 6] = [&or, &range, &range_via, &top, &top_via, &top_in];
         let mut seen: Vec<BTreeSet<u64>> = vec![BTreeSet::new(); qs.len()];
         let mut groups: std::collections::BTreeMap<u32, u64> = Default::default();
+        let mut sum_groups: std::collections::BTreeMap<u32, enchudb_engine::Agg> = Default::default();
         let absorb = |seen: &mut Vec<BTreeSet<u64>>, eng: &Engine| {
             for (id, d) in eng.poll_live() {
                 let i = qs.iter().position(|q| q.id() == id).expect("知らない購読の id");
@@ -500,6 +502,9 @@ fn new_kinds_under_concurrent_writes() {
             for (v, c) in counts.poll(&eng) {
                 if c == 0 { groups.remove(&v); } else { groups.insert(v, c); }
             }
+            for (v, a) in sums.poll_sums(&eng) {
+                if a.count == 0 { sum_groups.remove(&v); } else { sum_groups.insert(v, a); }
+            }
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         for w in writers {
@@ -508,6 +513,9 @@ fn new_kinds_under_concurrent_writes() {
         absorb(&mut seen, &eng);
         for (v, c) in counts.poll(&eng) {
             if c == 0 { groups.remove(&v); } else { groups.insert(v, c); }
+        }
+        for (v, a) in sums.poll_sums(&eng) {
+            if a.count == 0 { sum_groups.remove(&v); } else { sum_groups.insert(v, a); }
         }
 
         let has_age = |e: u64, lo: u32, hi: u32| get(&eng, e, "age").is_some_and(|a| lo <= a && a <= hi);
@@ -545,6 +553,15 @@ fn new_kinds_under_concurrent_writes() {
         }
         assert_eq!(groups, want_groups, "round {round}: [counts] 積分 != 手で数えた件数");
         assert_eq!(counts.all(&eng), want_groups.into_iter().collect::<Vec<_>>(), "round {round}: [counts] all");
+        let mut want_sums: std::collections::BTreeMap<u32, enchudb_engine::Agg> = Default::default();
+        for &e in &users {
+            if get(&eng, e, "age").is_some_and(|a| a <= 25) && let Some(c) = city_of(e) {
+                let w = want_sums.entry(c).or_default();
+                w.count += 1;
+                w.sum += get(&eng, e, "score").unwrap_or(0) as u64;
+            }
+        }
+        assert_eq!(sum_groups, want_sums, "round {round}: [sums] 積分 != 手で数えた件数 / 合計");
     }
     drop(eng);
     cleanup(&path);
