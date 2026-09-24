@@ -147,6 +147,48 @@ let rows = kv.where_eq("key", "k1").find()?;
 assert_eq!(rows.len(), 1);
 ```
 
+## live query (結果の購読)
+
+`find()` を呼び直して差分を自分で取る代わりに、 query を 1 回購読して **差分** を poll する。
+
+```rust
+let tokyo = users.where_eq("city", "Tokyo").subscribe()?;   // LiveQuery
+
+let first = tokyo.poll();   // 登録時点で当てはまる全 row が added
+users.insert().set("id", 9i64).set("city", "Tokyo").commit()?;
+let d = tokyo.poll();       // d.added == [新しい row]、 d.removed == []
+tokyo.count();              // 今の件数 (find()?.len() と同じ)
+tokyo.contains(row);        // 今の結果に入っているか
+tokyo.members();            // 今の結果全体
+```
+
+- 結果集合は空から始まり、 `poll()` の差分を **removed → added の順** に積めば、 常にその時点の
+  `find()` と同じ集合になる。 poll の間に打ち消し合った変化 (入って出た row) は出ない
+- local の書き込み (同期 / 非同期)、 sync で他 peer から届いた row、 削除のどの経路でも届く
+- 追うのは **row の出入り**だけ。 結果に入ったままの row の中身の変化 (条件に無い列の更新など)
+  は届かないので、 中身は poll 後に読む
+- 同じ eid が `removed` と `added` の両方に出たら 「出て、 別物として入り直した」 (削除 slot の
+  再利用など)。 キャッシュしているなら読み直す
+- 条件は `find()` と同じ (`where_eq` / `where_ref` / `where_in` / `where_range` / `where_gt` 系、
+  `all()`)。 まだ誰も書いていない文字列への `where_eq` も、 後から書かれた時点で一致する
+- `find()` なら黙って 0 件になる条件 (未知の列 / 型の合わない値の `where_eq`) と `limit` は
+  `BadValue` を返す
+- `poll()` / `members()` が返す eid は `find()` と同じ形 (peer prefix 付き)
+- 購読はメモリ上にだけある。 reopen 後は購読し直し、 その初回 `poll()` は今の結果全体を
+  added で返す。 added を 「前回以降の新着」 として扱うなら、 処理済みの記録は app 側で永続化する
+- 条件の列が書かれた時点で row は結果に入るので、 他 thread の insert (列を 1 本ずつ書く) や
+  sync の pull の **途中で** poll すると、 残りの列がまだ書かれていない row が added に出うる。
+  書き込み呼び出し (`commit()` / `pull_once()`) が返った後の poll なら row は揃っている
+- `LiveDelta::is_empty()` で空判定、 `LiveQuery::is_dirty()` で 「poll すれば何か出るか」 を
+  lock 1 回で見られる
+- 返り値を drop すると購読解除。 `Database` を借用しないので struct に持てる、 別 thread から
+  poll してよい
+- 購読 0 本なら書き込みコストは従来と同じ (atomic load 1 回)。 購読は **条件の列が書かれた row
+  だけ** を書き込み thread で評価し直す (実測で購読中の列への write 1 回あたり +25ns 程度)
+
+engine 直叩きは `Engine::subscribe(Vec<LivePred>)`。 仕組みと正しさの根拠は
+`enchudb_engine::live` の module doc。
+
 ## Scope — table 名前空間の prefix レンズ (旧 TenantView)
 
 `Database::scope(name)` で取り出す **table 名前空間のレンズ**。 内部で table 名に `{name}.` prefix を被せるだけで、 storage layout は変えない。 deployment が centralized (1 DB に複数 tenant) か distributed (per-user DB ファイル) かに関係なく **同じ app code が動く** ようにする抽象。 multi-tenant はこの機構のユースケースの 1 つ (rename 経緯は [issue #24](https://github.com/Mutafika/enchudb/issues/24))。

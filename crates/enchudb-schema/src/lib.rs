@@ -66,6 +66,7 @@ use enchudb_engine::{Engine, ValueType};
 /// (`enchudb_schema::GrowableOptions` / `LeafScale` で使えるように)。
 pub use enchudb_engine::engine::TableEidUsage;
 pub use enchudb_engine::{GrowableOptions, LeafScale};
+pub use enchudb_engine::{LiveDelta, LiveQuery};
 use enchudb_oplog::EntityId;
 use std::sync::Arc;
 
@@ -1980,6 +1981,82 @@ impl<'a> Query<'a> {
 
         if let Some(n) = self.limit { candidates.truncate(n); }
         Ok(candidates)
+    }
+
+    /// この条件の **結果集合を購読する** (live query)。 以降の書き込みで結果が変わった分
+    /// だけを [`LiveQuery::poll`] が返す。 `find()` を毎回呼び直す代わりに使う。
+    ///
+    /// ```ignore
+    /// let tokyo = users.where_eq("city", "Tokyo").subscribe()?;
+    /// let first = tokyo.poll();   // 登録時点の全件が added
+    /// users.insert().set("id", 9i64).set("city", "Tokyo").commit()?;
+    /// let d = tokyo.poll();       // d.added == [新しい row]
+    /// tokyo.count();              // 今の件数 (find().len() と同じ)
+    /// ```
+    ///
+    /// - 結果集合は空から始まり、 `poll()` の差分 (removed → added の順) を積めば常に
+    ///   その時点の `find()` と同じ集合になる。 初回 `poll()` は登録時点の全件を返す
+    /// - local の書き込みも sync で届いた他 peer の書き込みも同じように届く
+    /// - 追うのは **row の出入り**だけ。 結果に入ったままの row の中身の変化 (条件に無い
+    ///   列の更新など) は届かないので、 中身は poll 後に読む
+    /// - 返り値を drop すると購読解除。 `Database` を借用しないので struct に持てる
+    /// - 条件は `find()` と同じ (`where_eq` / `where_ref` / `where_in` / `where_range` /
+    ///   `where_gt` 系、 条件なし = table の全 row)。 まだ誰も書いていない文字列への
+    ///   `where_eq` も、 後から書かれた時点で一致する
+    ///
+    /// `limit` 付き、 または未知の列 / 型の合わない値の `where_eq` は `BadValue`
+    /// (`find()` なら常に 0 件になる条件 — 購読では書き間違いとして返す)。
+    pub fn subscribe(self) -> Result<LiveQuery, SchemaError> {
+        use enchudb_engine::LivePred;
+        if self.limit.is_some() {
+            return Err(SchemaError::BadValue("subscribe: limit is not supported".into()));
+        }
+        let eng = self.db.engine();
+        let hid_of = |name: &str| -> Result<u16, SchemaError> {
+            eng.himo_id(name)
+                .map(|h| h as u16)
+                .ok_or_else(|| SchemaError::Internal(format!("himo not found: {name}")))
+        };
+        let mut preds = Vec::with_capacity(self.preds.len().max(1));
+        for p in self.preds {
+            match p {
+                Predicate::Eq(h, _) if h == u16::MAX => {
+                    return Err(SchemaError::BadValue(
+                        "subscribe: where_eq on an unknown column or with a mismatched value type".into(),
+                    ));
+                }
+                Predicate::Eq(h, v) => preds.push(LivePred::Eq { himo_id: h, value: v }),
+                Predicate::EqText(h, text) => preds.push(LivePred::EqText { himo_id: h, text }),
+                Predicate::In(h, values) => preds.push(LivePred::In { himo_id: h, values }),
+                Predicate::Range { himo_name, lo, hi } => {
+                    preds.push(LivePred::Range { himo_id: hid_of(&himo_name)?, lo, hi })
+                }
+                Predicate::Cmp { himo_name, op, against } => {
+                    // 値は u32::MAX 未満 (sentinel 予約) なので上端は u32::MAX - 1。
+                    // 空区間 (`> 最大値` / `< 0`) は lo > hi の Range = 常に偽 (find と同じ 0 件)。
+                    const TOP: u32 = u32::MAX - 1;
+                    let (lo, hi) = match op {
+                        RangeOp::Gt => (against.saturating_add(1), TOP),
+                        RangeOp::Ge => (against, TOP),
+                        RangeOp::Lt => match against.checked_sub(1) {
+                            Some(h) => (0, h),
+                            None => (1, 0),
+                        },
+                        RangeOp::Le => (0, against),
+                    };
+                    preds.push(LivePred::Range { himo_id: hid_of(&himo_name)?, lo, hi });
+                }
+            }
+        }
+        if preds.is_empty() {
+            // `.all()` 系 — find() と同じ代表 column (PK or 先頭列) を持つ全 row
+            let rep = self.table.pk
+                .or_else(|| if self.table.cols.is_empty() { None } else { Some(0) })
+                .map(|i| self.table.cols[i].himo_id)
+                .ok_or_else(|| SchemaError::BadValue("subscribe: table has no columns".into()))?;
+            preds.push(LivePred::Present { himo_id: rep });
+        }
+        eng.subscribe(preds).map_err(|e| SchemaError::Io(e.to_string()))
     }
 
     // ──── 0.8.10 (#43): Query 終端の集計 chain API ────

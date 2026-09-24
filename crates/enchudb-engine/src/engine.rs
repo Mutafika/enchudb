@@ -2790,6 +2790,9 @@ pub struct Engine {
     durable_lsn: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// この Engine を所有する peer の id。分散時 eid の上位 32bit。
     peer_id: std::sync::atomic::AtomicU32,
+    /// live query (クエリ購読) の route。 Column 書き込みが `live_set` / `live_remove`
+    /// 経由で通知する (`crate::live` module doc)。
+    live: std::sync::Arc<crate::live::LiveRegistry>,
     /// LWW 用に (eid, himo) → 最後の HLC を記録。
     hlc_store: std::sync::Arc<crate::hlc_store::HlcStore>,
     /// request18: `sync_tables_enabled()` の cache。 本体は `has_reserved_table`
@@ -3235,6 +3238,7 @@ impl Engine {
             hlc_mint_lock: parking_lot::Mutex::new(()),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
+            live: std::sync::Arc::new(crate::live::LiveRegistry::new(0)),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             sync_tables_on: std::sync::atomic::AtomicBool::new(false),
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
@@ -4253,6 +4257,7 @@ impl Engine {
             hlc_mint_lock: parking_lot::Mutex::new(()),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
+            live: std::sync::Arc::new(crate::live::LiveRegistry::new(0)),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             sync_tables_on: std::sync::atomic::AtomicBool::new(false),
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
@@ -4310,6 +4315,7 @@ impl Engine {
             let hdr = eng.backing.header_mut(HEADER_SIZE);
             let peer = u32::from_le_bytes(hdr[H_PEER_ID..H_PEER_ID + 4].try_into().unwrap());
             eng.peer_id.store(peer, std::sync::atomic::Ordering::Release);
+            eng.live.set_peer(peer);
         }
 
         eng.rebuild();
@@ -7055,7 +7061,7 @@ impl Engine {
             // 版数を進めずに落とす — local-only なので LWW の相手が居ない。
             for hid in 0..self.himos.len() {
                 self.free_leaf_cell(local, hid);
-                self.himos[hid].remove(local);
+                self.live_remove(hid, local);
             }
             self.entities.free(local);
             cleared += 1;
@@ -7444,6 +7450,7 @@ impl Engine {
     /// 起動時に 1 回だけ呼ぶ想定。
     pub fn set_peer_id(&self, peer: enchudb_oplog::PeerId) {
         self.peer_id.store(peer, std::sync::atomic::Ordering::Release);
+        self.live.set_peer(peer);
         // mmap の header に即書き込み(CRC 保護外なので再計算不要)
         self.backing.header_mut(HEADER_SIZE)[H_PEER_ID..H_PEER_ID + 4]
             .copy_from_slice(&peer.to_le_bytes());
@@ -7917,6 +7924,25 @@ impl Engine {
         self.set_cell_local(enchudb_oplog::eid_local(eid), himo_id, value, hlc)
     }
 
+    /// Column 書き込みの唯一の入口 (live query 通知込み)。 **engine 内で `himos[..].set`
+    /// を直に呼ばないこと** — 呼ぶと live query がその書き込みを取りこぼす。
+    /// 通知は `HimoStore::set` が write_lock を離した **後** (`crate::live` の lock 順序)。
+    #[inline]
+    fn live_set(&self, hid: usize, local: u32, value: u32) -> bool {
+        let ok = self.himos[hid].set(local, value);
+        if ok {
+            self.live.touch(self, hid as u16, local);
+        }
+        ok
+    }
+
+    /// `live_set` の外す版。 `himos[..].remove` を直に呼ばないこと (同上)。
+    #[inline]
+    fn live_remove(&self, hid: usize, local: u32) {
+        self.himos[hid].remove(local);
+        self.live.touch(self, hid as u16, local);
+    }
+
     /// `set_cell` の local eid 版 (engine 内の write 経路用。 `check_writable` と
     /// himo_id の範囲チェックは呼び元が済ませている — 範囲外は他の write 経路と
     /// 同じく `himos[hid]` の panic になる)。
@@ -7924,7 +7950,7 @@ impl Engine {
         if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
-        self.himos[himo_id as usize].set(local, value);
+        self.live_set(himo_id as usize, local, value);
         self.store_cell_hlc(local, himo_id, hlc);
         true
     }
@@ -7951,7 +7977,7 @@ impl Engine {
         if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
-        self.himos[himo_id as usize].remove(local);
+        self.live_remove(himo_id as usize, local);
         self.store_cell_hlc(local, himo_id, hlc);
         true
     }
@@ -7964,7 +7990,7 @@ impl Engine {
             return false;
         }
         self.free_leaf_cell(local, himo_id as usize);
-        self.himos[himo_id as usize].remove(local);
+        self.live_remove(himo_id as usize, local);
         self.store_cell_hlc(local, himo_id, hlc);
         true
     }
@@ -8265,7 +8291,7 @@ impl Engine {
                 continue;
             }
             self.free_leaf_cell(local, hid);
-            self.himos[hid].remove(local);
+            self.live_remove(hid, local);
         }
         if !survivor {
             self.entities.free(local);
@@ -9060,7 +9086,7 @@ impl Engine {
                 );
                 return;
             }
-            self.himos[hid].set(eid, off);
+            self.live_set(hid, eid, off);
             if let Some(old) = old { leaf.free(old); }
             return;
         }
@@ -9085,7 +9111,7 @@ impl Engine {
             );
             return;
         }
-        self.himos[hid].set(eid, vid);
+        self.live_set(hid, eid, vid);
     }
 
     pub fn tie(&mut self, eid: enchudb_oplog::EntityId, himo: &str, value: u32) {
@@ -9115,7 +9141,7 @@ impl Engine {
         self.validate_eid_for_himo(hid, eid);
         // β-light step 5: Ref himo は target_table の eid range を validate
         self.validate_ref_tie(hid, value);
-        self.himos[hid].set(eid, value);
+        self.live_set(hid, eid, value);
     }
 
     pub fn tie_ref(&mut self, eid: enchudb_oplog::EntityId, himo: &str, target_eid: enchudb_oplog::EntityId) {
@@ -9152,7 +9178,7 @@ impl Engine {
         self.validate_eid_for_himo(hid, eid);
         // β-light step 5: target_eid が target_table の eid range 内か
         self.validate_ref_tie(hid, target_eid);
-        self.himos[hid].set(eid, target_eid);
+        self.live_set(hid, eid, target_eid);
     }
 
     /// #59: sentinel (`u32::MAX`) は cell に入らない。 panic せず write を拒否 + 計上して
@@ -11355,6 +11381,74 @@ impl Engine {
         self.query_u32(strings).into_iter().map(|e| e as enchudb_oplog::EntityId).collect()
     }
 
+    /// live query (クエリ購読) を登録する。 条件 (`preds`、 同一 entity の AND) に当てはまる
+    /// entity 集合の **差分** を [`LiveQuery::poll`](crate::live::LiveQuery::poll) で受け取れる。
+    ///
+    /// ```ignore
+    /// let age = eng.himo_id("age").unwrap() as u16;
+    /// let q = eng.subscribe(vec![LivePred::Eq { himo_id: age, value: 30 }])?;
+    /// let first = q.poll();          // 登録時点の age=30 全員が added
+    /// eng.tie_to(e, "age", 30);
+    /// let d = q.poll();              // d.added == [e]
+    /// ```
+    ///
+    /// ぶら下げる / 外す / 削除のどの経路 (local の同期・非同期 write、 build phase の
+    /// `tie`、 sync の remote apply、 oplog replay) で集合が変わっても届く。 購読が 0 本の
+    /// 間の書き込みコストは atomic load 1 回。 返り値を drop すると購読解除。
+    ///
+    /// 追うのは **集合への出入り**だけで、 集合に居る entity の中身の変化は追わない。
+    /// 詳細な semantics と正しさの根拠は `crate::live` の module doc。
+    ///
+    /// `preds` が空、 または存在しない `himo_id` を含むと `InvalidInput`。
+    pub fn subscribe(
+        &self,
+        preds: Vec<crate::live::LivePred>,
+    ) -> std::io::Result<crate::live::LiveQuery> {
+        use crate::live::LivePred;
+        if preds.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "subscribe: preds is empty (use LivePred::Present for \"every entity with this himo\")",
+            ));
+        }
+        let himo_count = self.himos.len();
+        if let Some(p) = preds.iter().find(|p| p.himo_id() as usize >= himo_count) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("subscribe: unknown himo_id {}", p.himo_id()),
+            ));
+        }
+        // 初期集合の候補: index で引ける条件を優先 (Eq / EqText / In)、 無ければ
+        // Range / Present の himo を持つ全 entity。 候補は後で全条件で評価し直す。
+        let seed_pred = preds
+            .iter()
+            .find(|p| matches!(p, LivePred::Eq { .. } | LivePred::EqText { .. } | LivePred::In { .. }))
+            .or_else(|| preds.first())
+            .cloned()
+            .expect("preds is non-empty");
+
+        // 登録手順 (順序が正しさの根拠、 `crate::live` module doc):
+        // 1. route に載せる  2. 条件の各 himo の write_lock で barrier  3. 初期集合を走査
+        let q = self.live.register(preds);
+        for &h in q.himos() {
+            self.himos[h as usize].write_barrier();
+        }
+        let candidates: Vec<enchudb_oplog::EntityId> = match seed_pred {
+            LivePred::Eq { himo_id, value } => self.query_by_id(&[(himo_id, value)]),
+            LivePred::EqText { himo_id, text } => match self.vocab_id(&text) {
+                Some(vid) => self.query_by_id(&[(himo_id, vid)]),
+                // 誰もぶら下げていない文字列 = 今は 0 件 (以降は touch が拾う)
+                None => Vec::new(),
+            },
+            LivePred::In { himo_id, values } => self.pull_in_by_id(himo_id, &values),
+            LivePred::Range { himo_id, .. } | LivePred::Present { himo_id } => {
+                self.entities_with_himo(himo_id)
+            }
+        };
+        q.seed(self, candidates.into_iter().map(enchudb_oplog::eid_local));
+        Ok(q)
+    }
+
     /// schema 層用: himo_id を pre-resolve 済みの場合の高速 path。 名前 lookup を完全に skip。
     /// 同一 entity の AND 条件として扱う。 himo_id が範囲外なら空 Vec。
     pub fn query_by_id(&self, conds: &[(u16, u32)]) -> Vec<enchudb_oplog::EntityId> {
@@ -12772,7 +12866,7 @@ impl Engine {
                 }
                 for hid in 0..self.himos.len() {
                     self.free_leaf_cell(eid, hid);
-                    self.himos[hid].remove(eid);
+                    self.live_remove(hid, eid);
                 }
                 self.entities.free(eid);
             }
@@ -13234,6 +13328,16 @@ impl Engine {
         self.flush()?;
         self.persist_region_crcs()?;
         Ok(())
+    }
+}
+
+impl crate::live::CellReader for Engine {
+    #[inline]
+    fn cell(&self, himo_id: u16, eid: u32) -> Option<u32> {
+        self.himos.get(himo_id as usize)?.get_value(eid)
+    }
+    fn vocab_lookup(&self, text: &str) -> Option<u32> {
+        self.vocab_id(text)
     }
 }
 

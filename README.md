@@ -80,6 +80,31 @@ Apps that store lots of large text (`Leaf` himos — article bodies, tool output
 
 See [`crates/enchudb-schema/README.md`](./crates/enchudb-schema/README.md) for the full API.
 
+### Live queries (subscribe to a result set)
+
+Instead of re-running `find()` to see what changed, subscribe to the query once and poll the **difference**:
+
+```rust
+let tokyo = users.where_eq("city", "Tokyo").subscribe()?;
+
+let first = tokyo.poll();          // everything that matches right now, as `added`
+users.insert().set("id", 9i64).set("city", "Tokyo").commit()?;
+let d = tokyo.poll();              // d.added == [the new row], d.removed == []
+tokyo.count();                     // current size, same as find()?.len()
+```
+
+- The result set starts empty. Applying each `poll()` (first `removed`, then `added`) keeps you equal to what `find()` would return at that moment. Changes that cancel out between two polls (a row entering and leaving) are not reported.
+- Every write path is covered: local writes (sync and async), rows that arrive from other peers through sync, and deletes.
+- It tracks **which rows are in the result**, not their contents. A row that stays in the result while an unrelated column changes is not reported, so read the contents after polling.
+- The conditions are the same as `find()`: `where_eq` / `where_ref` / `where_in` / `where_range` / `where_gt`-family, or `all()`. `where_eq` on a string that nobody has written yet starts matching once someone does.
+- `poll()` returns entity ids in the same form as `find()` (with the peer prefix).
+- A subscription lives in memory only. After a reopen you subscribe again, and the first `poll()` returns the whole current result as `added`. If you treat `added` as "new since last time", keep your own persisted record of what you already processed.
+- A row can show up in `added` before the rest of its columns are written, if you poll while another thread is inserting it (an insert writes its columns one by one) or while a sync pull is still applying it. Once the write call has returned (`commit()`, `pull_once()`), a poll sees the complete row.
+- Drop the returned `LiveQuery` to unsubscribe. It does not borrow the `Database`, so you can keep it in a struct and poll it from another thread.
+- With no subscriptions, a write costs the same as before (one atomic load). A subscription only re-checks the rows whose condition columns were written. The re-check is done in the writer thread, so a subscription on a hot column adds roughly 25 ns to each write of that column.
+
+The engine-level API is `Engine::subscribe(Vec<LivePred>)`.
+
 ### Engine layer (for graph ops / custom dispatch)
 
 ```rust
