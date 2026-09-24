@@ -11473,6 +11473,43 @@ impl Engine {
         Ok(crate::live::GroupedLiveQuery::new(q, via, filter))
     }
 
+    /// 条件 `preds` に当てはまる entity を、 ref の道 `group_path` をたどった先の紐 `group_himo` の
+    /// 値ごとに数えた件数を購読する ([`crate::live::LiveCounts`])。 `group_path` が空なら根の紐。
+    /// `preds` に `Or` は不可 (`InvalidInput`)。
+    pub fn subscribe_counts(
+        &self,
+        preds: Vec<crate::live::LivePred>,
+        group_path: Vec<u16>,
+        group_himo: u16,
+    ) -> std::io::Result<crate::live::LiveCounts> {
+        let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, m.to_string());
+        self.validate_live_preds(&preds)?;
+        if group_himo as usize >= self.himos.len() || group_path.iter().any(|&h| h as usize >= self.himos.len()) {
+            return Err(bad("unknown group himo"));
+        }
+        if group_path.iter().any(|&h| self.value_type_at(h as usize) != Some(ValueType::Ref)) {
+            return Err(bad("group path himo is not a Ref himo"));
+        }
+        let mut branches = crate::live::dnf(preds).map_err(|m| bad(&m))?;
+        if branches.len() != 1 {
+            return Err(bad("subscribe_counts does not support Or"));
+        }
+        let preds = branches.pop().unwrap_or_default();
+        let mut refs: Vec<u16> = preds.iter().flat_map(|p| p.ref_himos()).chain(group_path.iter().copied()).collect();
+        refs.sort_unstable();
+        refs.dedup();
+        for h in refs {
+            let _ = self.himos[h as usize].slice_len(0);
+        }
+        // 登録手順は subscribe と同じ (route → barrier → 初期候補)
+        let q = self.live.register_counts(preds, (group_path, group_himo));
+        for h in q.himos() {
+            self.himos[h as usize].write_barrier();
+        }
+        q.seed(self);
+        Ok(q)
+    }
+
     /// この engine の全購読について、 前回 poll から出入りのあったものだけの差分を返す
     /// (`(LiveQuery::id, 差分)`、 id 昇順)。 購読を 1 本ずつ `poll` する代わりに使うと、 コストが
     /// 購読の数でなく出入りの数に比例する (購読が数千本ある時向け)。 各購読の `poll` と報告

@@ -1857,6 +1857,65 @@ impl std::fmt::Debug for LiveQuery {
     }
 }
 
+/// [`Query::subscribe_counts`] の戻り値。 group の値ごとの件数を購読する。 drop で購読解除、
+/// `Database` を借用しない。
+pub struct LiveCounts {
+    inner: enchudb_engine::LiveCounts,
+    eng: Arc<Engine>,
+    ty: ColumnType,
+}
+
+impl LiveCounts {
+    fn value(&self, v: u32) -> Value {
+        match self.ty {
+            ColumnType::Number => Value::Number(v as i64),
+            ColumnType::Ref => Value::Ref(enchudb_oplog::make_eid(self.eng.peer_id(), v)),
+            ColumnType::Tag | ColumnType::Leaf => Value::Text(String::from_utf8_lossy(self.eng.vocab_text(v)).into_owned()),
+        }
+    }
+
+    fn raw(&self, v: &Value) -> Option<u32> {
+        match (self.ty, v) {
+            (ColumnType::Number, Value::Number(n)) => u32::try_from(*n).ok(),
+            (ColumnType::Ref, Value::Ref(e)) => Some(enchudb_oplog::eid_local(*e)),
+            (ColumnType::Tag, Value::Text(t)) => self.eng.vocab_id(t),
+            _ => None,
+        }
+    }
+
+    /// 前回 poll から件数が変わった group と今の件数 (0 = その group の row が居なくなった)。
+    /// 値で上書きして積めば常に今の件数。 初回は登録時点の全 group。 並びは値の内部表現の順。
+    pub fn poll(&self) -> Vec<(Value, u64)> {
+        self.inner.poll(&self.eng).into_iter().map(|(v, n)| (self.value(v), n)).collect()
+    }
+
+    /// group `value` の今の件数。
+    pub fn get(&self, value: &Value) -> u64 {
+        self.raw(value).map_or(0, |v| self.inner.get(&self.eng, v))
+    }
+
+    /// 今の全 group と件数。
+    pub fn all(&self) -> Vec<(Value, u64)> {
+        self.inner.all(&self.eng).into_iter().map(|(v, n)| (self.value(v), n)).collect()
+    }
+
+    /// 全 group の件数の和 (= 条件に当てはまり、 group の列に値のある row の数)。
+    pub fn total(&self) -> usize {
+        self.inner.total(&self.eng)
+    }
+
+    /// engine 内で一意な購読 id。
+    pub fn id(&self) -> u64 {
+        self.inner.id()
+    }
+}
+
+impl std::fmt::Debug for LiveCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
 /// [`Query::subscribe_grouped`] の戻り値。 結果を ref の先の row (group) 単位で持つ購読。
 /// drop で購読解除、 `Database` を借用しない。
 pub struct GroupedLiveQuery {
@@ -2220,6 +2279,39 @@ impl<'a> Query<'a> {
         })?;
         let inner = eng.subscribe_grouped(preds).map_err(|e| SchemaError::BadValue(e.to_string()))?;
         Ok(GroupedLiveQuery { inner, eng })
+    }
+
+    /// この条件の結果を **列 `col` の値ごとに数えた件数** を購読する (live の `GROUP BY col` +
+    /// `COUNT(*)`)。 `col` は `"company.city"` のように ref 列をたどってもよい。
+    ///
+    /// ```ignore
+    /// let by_city = users.where_eq("status", "active").subscribe_counts("company.city")?;
+    /// for (city, n) in by_city.poll() { /* 件数が変わった city と今の件数 (0 = 居なくなった) */ }
+    /// by_city.get(&Value::Text("Tokyo".into()));
+    /// ```
+    ///
+    /// - `col` に値の無い row は数えない (NULL の group は無い)
+    /// - `col` が Leaf 列 (row ごとに固有の文字列)、 条件に `or` / `limit` がある時は `BadValue`
+    pub fn subscribe_counts(self, col: &str) -> Result<LiveCounts, SchemaError> {
+        if self.limit.is_some() {
+            return Err(SchemaError::BadValue("subscribe_counts: limit is not supported".into()));
+        }
+        let (path, cd) = self
+            .resolve_col(col)
+            .ok_or_else(|| SchemaError::BadValue(format!("subscribe_counts: unknown column {col}")))?;
+        if cd.ty == ColumnType::Leaf {
+            return Err(SchemaError::BadValue("subscribe_counts: cannot group by a Leaf column".into()));
+        }
+        let eng = self.db.arc_engine();
+        let preds = self.live_preds()?.ok_or_else(|| {
+            SchemaError::BadValue(
+                "subscribe: where_eq on an unknown column or with a mismatched value type".into(),
+            )
+        })?;
+        let inner = eng
+            .subscribe_counts(preds, path, cd.himo_id)
+            .map_err(|e| SchemaError::BadValue(e.to_string()))?;
+        Ok(LiveCounts { inner, eng, ty: cd.ty })
     }
 
     /// ablation / 計測用: engine の `subscribe_expand_always` で購読する (結果は `subscribe`

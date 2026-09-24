@@ -81,6 +81,17 @@
 //! (社員) への条件」 の組で、 差分は会社の eid、 社員は必要な時に常設の逆引き索引から引く。 会社の
 //! 所在地を 1 個書き換えた時の差分は会社 1 件 (配下が何人でも O(1))、 社員の付け替えは印を付けない。
 //!
+//! # 集計の購読 ([`LiveCounts`])
+//!
+//! 結果を group の列の値ごとに数えた件数の live 版。 group の列を 「値を根まで運ぶ穴」 にする
+//! (範囲の穴と同じ道。 ただし帯で刈り込まず、 値が変わるたびに運ぶ)。 件数は根の鍵ごとに
+//! `値 → 件数` で持ち、 根の答えが変わった時に旧値の件数を減らして新値の件数を増やす — 記録と同じ
+//! 所で動かすので、 登録と並行した書き込みでも件数と記録が食い違わない。 同じ鍵の集計の購読は件数を
+//! 共有し、 購読ごとには 「動いた group」 と 「最後に渡した件数」 だけを持つ。
+//!
+//! group の列が ref の先 (`company.city`) なら、 会社の移転は配下の根を評価し直して 1 件ずつ
+//! 件数を移す (配下の数に比例)。
+//!
 //! # 状態の大きさ
 //!
 //! member ごとの状態 (最後に報告した集合など) は、 疎なうちは要素数に比例する集合 (roaring と
@@ -1085,6 +1096,8 @@ enum HoleVal {
     Id(u32),
     Text(String),
     Range(u32, u32),
+    /// 集計の group の列 ([`LiveCounts`])。 値は持たない (全ての値が group)。
+    Group,
 }
 
 enum Leaf {
@@ -1145,14 +1158,24 @@ fn flatten(p: LivePred, path: &mut Vec<u16>, out: &mut Vec<Flat>) {
 /// `Range` を穴にするのは正規形で最初の 1 本だけ (範囲の穴が 2 本あると、 member の範囲が
 /// 多次元の箱になり、 根での振り分けが 1 次元の区間の索引で済まなくなる)。 残りは値を固定した
 /// 条件 = 範囲が違えば別の family。
-fn canonical(preds: Vec<LivePred>) -> (Vec<u32>, Vec<Flat>, Vec<HoleVal>) {
+///
+/// `group` (集計の group の列: ref の道 + 紐) があれば、 その列を値を運ぶ穴にする (範囲の穴は
+/// 作らない — 根まで運ぶ値は 1 つ)。
+fn canonical(preds: Vec<LivePred>, group: Option<(Vec<u16>, u16)>) -> (Vec<u32>, Vec<Flat>, Vec<HoleVal>) {
     let mut flats = Vec::new();
     for p in preds {
         flatten(p, &mut Vec::new(), &mut flats);
     }
+    let grouped = group.is_some();
+    if let Some((path, h)) = group {
+        let mut sig = vec![path.len() as u32];
+        sig.extend(path.iter().map(|&x| x as u32));
+        sig.extend([6, h as u32]);
+        flats.push(Flat { path, sig, leaf: Leaf::Hole(h, HoleVal::Group) });
+    }
     let order = |a: &Flat, b: &Flat| a.sig.cmp(&b.sig).then_with(|| a.hole().cmp(&b.hole()));
     flats.sort_by(order);
-    let mut first = true;
+    let mut first = !grouped;
     for f in &mut flats {
         if let Leaf::Hole(h, HoleVal::Range(lo, hi)) = f.leaf {
             if !first {
@@ -1223,7 +1246,7 @@ fn build_tree(flats: Vec<Flat>) -> Vec<Node> {
             };
         }
         match f.leaf {
-            Leaf::Hole(h, HoleVal::Range(..)) => {
+            Leaf::Hole(h, HoleVal::Range(..) | HoleVal::Group) => {
                 nodes[cur].range = Some((h, slot));
                 slot += 1;
             }
@@ -1296,6 +1319,36 @@ struct Member {
     queued: bool,
     /// `Or` の購読の枝なら、 その購読と枝の番号 (差分は呼び手でなくこちらに積む)。
     union: Option<(std::sync::Weak<Union>, usize)>,
+    /// 集計の購読 ([`LiveCounts`]) なら group の報告状態 (entity の出入りは積まない)。
+    grp: Option<GroupState>,
+}
+
+/// 集計の購読 1 本ぶんの報告状態。 件数そのものは根の鍵が持ち (同じ鍵の購読で共有)、 ここは
+/// 「どの group の件数が動いたか」 と 「最後に渡した件数」 だけ。
+#[derive(Default)]
+struct GroupState {
+    changed: Marks,
+    reported: std::collections::BTreeMap<u32, u64>,
+}
+
+impl GroupState {
+    /// 動いた group の今の件数 (最後に渡した件数と違うものだけ、 値の昇順。 0 = group が消えた)。
+    fn drain(&mut self, groups: &std::collections::BTreeMap<u32, u64>) -> Vec<(u32, u64)> {
+        let mut out = Vec::new();
+        for v in self.changed.take() {
+            let now = groups.get(&v).copied().unwrap_or(0);
+            let was = self.reported.get(&v).copied().unwrap_or(0);
+            if now != was {
+                out.push((v, now));
+                if now == 0 {
+                    self.reported.remove(&v);
+                } else {
+                    self.reported.insert(v, now);
+                }
+            }
+        }
+        out
+    }
 }
 
 impl Member {
@@ -1403,6 +1456,17 @@ struct Settled {
     ready: Vec<usize>,
 }
 
+/// 根の答えの当て方。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RootMode {
+    /// 根の鍵が一致すれば member の集合に居る。
+    Plain,
+    /// 範囲の穴: 鍵が一致し、 値が member の範囲に入れば居る。
+    Ranged,
+    /// 集計: 鍵ごと・値 (group) ごとの件数を数える。
+    Grouped,
+}
+
 /// 鍵 id → `Settled::keys` の添字の直近 2 件 (`apply_root_cached`)。 `keys` が変わる
 /// (install / uninstall) をまたいで使わないこと。
 #[derive(Default)]
@@ -1432,11 +1496,13 @@ struct RootKey {
     count: usize,
     /// 範囲の穴のある family: member の範囲の索引 (member が変わったら None に戻して作り直す)。
     ivs: Option<Ivs>,
+    /// 集計の family: group の値 → その値の根の数 (0 の group は載せない)。
+    groups: std::collections::BTreeMap<u32, u64>,
 }
 
 impl RootKey {
     fn new(id: u32) -> Self {
-        RootKey { id, members: Vec::new(), count: 0, ivs: None }
+        RootKey { id, members: Vec::new(), count: 0, ivs: None, groups: std::collections::BTreeMap::new() }
     }
 
     /// 範囲の索引を (無ければ作って) 返す。
@@ -1478,21 +1544,45 @@ impl Settled {
         root_at(&self.recs, &self.vals, e)
     }
 
-    /// 根 `eid` の答えを `now` にし、 出入りした member に印を付ける。 `ranged` = family に
-    /// 範囲の穴がある (根の鍵を共有する member でも、 範囲によって居る / 居ないが分かれる)。
+    /// 根 `eid` の答えを `now` にし、 出入りした member に印を付ける (集計の family では group の
+    /// 件数を動かす)。
     #[inline]
-    fn apply_root_cached(&mut self, eid: u32, now: Option<Ans>, ranged: bool, cache: &mut KeyCache) {
+    fn apply_root_cached(&mut self, eid: u32, now: Option<Ans>, mode: RootMode, cache: &mut KeyCache) {
         let was = self.root(eid);
         if was == now {
             return;
         }
         self.recs[0].set_root(eid, now.map(|a| a.0));
-        if ranged {
+        if mode != RootMode::Plain {
             self.vals[0].put(eid, now.map_or(0, |a| a.1 + 1));
         }
+        let ranged = mode == RootMode::Ranged;
         let Settled { keys, members, ready, .. } = self;
         let iw = was.and_then(|a| cache.find(keys, a.0));
         let inw = now.and_then(|a| cache.find(keys, a.0));
+        if mode == RootMode::Grouped {
+            for (k, ans, enter) in [(iw, was, false), (inw, now, true)] {
+                let (Some(i), Some((_, v))) = (k, ans) else { continue };
+                let rk = &mut keys[i];
+                let c = rk.groups.entry(v).or_insert(0);
+                if enter {
+                    rk.count += 1;
+                    *c += 1;
+                } else {
+                    rk.count -= 1;
+                    *c -= 1;
+                    if *c == 0 {
+                        rk.groups.remove(&v);
+                    }
+                }
+                for &slot in &rk.members {
+                    if let Some(g) = members[slot].as_mut().and_then(|m| m.grp.as_mut()) {
+                        g.changed.add(v);
+                    }
+                }
+            }
+            return;
+        }
         if let (Some(i), Some(j), Some((_, a)), Some((_, b))) = (iw, inw, was, now)
             && i == j
         {
@@ -1555,8 +1645,10 @@ pub(crate) struct Family {
     settled: Mutex<Settled>,
     /// ablation 用: 真偽 (鍵) が変わらなくても常に展開する。
     expand_always: AtomicBool,
-    /// 範囲の穴: (節, 紐)。
+    /// 値を根まで運ぶ穴 (範囲の穴か集計の group の列): (節, 紐)。
     range: Option<(usize, u16)>,
+    /// 運ぶ値が集計の group の列 (帯で刈り込まず、 値が変わるたびに運ぶ)。
+    group: bool,
     /// 節ごと: 範囲の穴の節から根への道の上か (その節の答えは範囲の値を運ぶ)。
     on_path: Vec<bool>,
 }
@@ -1567,7 +1659,7 @@ fn resolve(r: &impl CellReader, key: &[HoleVal]) -> Option<Vec<u32>> {
         .map(|v| match v {
             HoleVal::Id(x) => Some(*x),
             HoleVal::Text(t) => r.vocab_lookup(t),
-            HoleVal::Range(..) => Some(0),
+            HoleVal::Range(..) | HoleVal::Group => Some(0),
         })
         .collect()
 }
@@ -1581,6 +1673,7 @@ fn range_of(key: &[HoleVal]) -> Option<(u32, u32)> {
 
 impl Family {
     fn new(id: u64, sig: Vec<u32>, flats: Vec<Flat>) -> Self {
+        let group = flats.iter().any(|f| matches!(f.leaf, Leaf::Hole(_, HoleVal::Group)));
         let nodes = build_tree(flats);
         let mut order: Vec<usize> = (0..nodes.len()).collect();
         order.sort_by_key(|&n| std::cmp::Reverse(nodes[n].depth));
@@ -1626,6 +1719,7 @@ impl Family {
             settled: Mutex::new(Settled::new(&widths)),
             expand_always: AtomicBool::new(false),
             range,
+            group,
             on_path,
         }
     }
@@ -1666,6 +1760,7 @@ impl Family {
 
     fn add_member(&self, id: u64, key: Vec<HoleVal>, union: Option<(std::sync::Weak<Union>, usize)>) -> usize {
         let mut s = self.settled.lock();
+        let grp = key.contains(&HoleVal::Group).then(GroupState::default);
         let m = Member {
             id,
             key,
@@ -1676,6 +1771,7 @@ impl Family {
             left: Marks::default(),
             changed: Marks::default(),
             queued: false,
+            grp,
             union,
         };
         let slot = match s.members.iter().position(Option::is_none) {
@@ -1733,7 +1829,7 @@ impl Family {
         let mut v = 0;
         if let Some((h, _)) = node.range {
             v = r.cell(h, e)?;
-            if !s.slabs.covered(v) {
+            if !self.group && !s.slabs.covered(v) {
                 return None;
             }
         }
@@ -1938,11 +2034,21 @@ impl Family {
                 rk.members.push(slot);
                 rk.ivs = None;
             }
-            let Settled { members, ready, recs, vals: rvals, .. } = &mut *s;
+            let Settled { members, ready, recs, vals: rvals, keys, .. } = &mut *s;
             if let Some(m) = members[slot].as_mut() {
                 m.root_key = Some(id);
                 m.range = range;
                 m.vals = vals;
+                if let Some(g) = m.grp.as_mut() {
+                    // 集計: 件数は鍵が持つ。 既にある鍵なら今の group を全部初回の報告に積む
+                    if let Ok(i) = keys.binary_search_by_key(&id, |k| k.id) {
+                        for &v in keys[i].groups.keys() {
+                            g.changed.add(v);
+                        }
+                    }
+                    self.push_marks(0, roots);
+                    continue;
+                }
                 // 新しい鍵なら今その鍵の根は居ない — 候補を評価した時の遷移 (apply_root) が
                 // この member に届く。 既にある鍵 (同じ条件の購読が他に居る / 居た) なら、 今その鍵の
                 // 根はもう遷移しないので、 ここで初回の報告に積む。 候補 (上位集合) を全部積むと、
@@ -1995,7 +2101,11 @@ impl Family {
             }
         }
         let always = self.expand_always.load(Ordering::Relaxed);
-        let ranged = self.range.is_some();
+        let mode = match (self.range.is_some(), self.group) {
+            (false, _) => RootMode::Plain,
+            (true, false) => RootMode::Ranged,
+            (true, true) => RootMode::Grouped,
+        };
         // 根の子が 1 本なら、 その子の entity から逆引きした根は 「子の答え = その entity の新しい
         // 記録」 と分かっているので、 評価で ref と子の記録を読み直さない (会社 1 社の移転で配下
         // 数十万人が動く時、 1 人あたりの評価がほぼ根自身の条件だけになる)
@@ -2014,14 +2124,14 @@ impl Family {
                     let same = root_plain.then(|| self.eval_known(r, s, 0, 0, known));
                     for e in ents {
                         let now = same.unwrap_or_else(|| self.eval_known(r, s, 0, e, known));
-                        s.apply_root_cached(e, now, ranged, &mut cache);
+                        s.apply_root_cached(e, now, mode, &mut cache);
                     }
                 }
                 // 印の付いた根 (ref や根の条件の紐が書かれた) は全部読み直し、 上の近道より後に
                 // 当てる (逆引きの後に ref が書き換わった根は、 こちらの今の Column の答えが勝つ)
                 for e in list {
                     let now = self.eval(r, s, 0, e);
-                    s.apply_root_cached(e, now, ranged, &mut cache);
+                    s.apply_root_cached(e, now, mode, &mut cache);
                 }
                 continue;
             }
@@ -2035,7 +2145,9 @@ impl Family {
                 }
                 // 範囲の値は帯が変わった時だけ運ぶ (帯の中の違いはどの member にも区別が付かない)
                 let changed = match (prev, now) {
-                    (Some(Some((pi, pv))), Some((ni, nv))) => pi != ni || (path && !s.slabs.same(pv, nv)),
+                    (Some(Some((pi, pv))), Some((ni, nv))) => {
+                        pi != ni || (path && if self.group { pv != nv } else { !s.slabs.same(pv, nv) })
+                    }
                     (Some(None), None) => false,
                     _ => true,
                 };
@@ -2062,7 +2174,7 @@ pub(crate) fn find_once(r: &impl CellReader, branches: Vec<Vec<LivePred>>) -> Ve
 }
 
 fn find_branch(r: &impl CellReader, preds: Vec<LivePred>) -> Vec<u32> {
-    let (sig, flats, key) = canonical(preds);
+    let (sig, flats, key) = canonical(preds, None);
     let fam = Family::new(0, sig, flats);
     let Some(vals) = resolve(r, &key) else { return Vec::new() };
     let range = range_of(&key);
@@ -2082,6 +2194,7 @@ fn find_branch(r: &impl CellReader, preds: Vec<LivePred>) -> Vec<u32> {
         changed: Marks::default(),
         queued: false,
         union: None,
+        grp: None,
     };
     let roots = fam.walk(r, &vals, range);
     roots.into_iter().filter(|&e| m.has(fam.eval(r, &s, 0, e))).collect()
@@ -2216,8 +2329,15 @@ impl LiveRegistry {
     /// `expand_always` (ablation / 計測用) の購読は、 同じ形でも既定の購読とは別の family になる。
     pub(crate) fn register(self: &Arc<Self>, preds: Vec<LivePred>, expand_always: bool) -> LiveQuery {
         let id = self.next_member_id.fetch_add(1, Ordering::Relaxed);
-        let (family, slot) = self.register_member(id, preds, expand_always, None);
+        let (family, slot) = self.register_member(id, preds, None, expand_always, None);
         LiveQuery { kind: Kind::One { family, slot }, id, registry: self.clone() }
+    }
+
+    /// 集計の購読を登録する: `preds` の結果を `group` (ref の道 + 紐) の値ごとに数える。
+    pub(crate) fn register_counts(self: &Arc<Self>, preds: Vec<LivePred>, group: (Vec<u16>, u16)) -> LiveCounts {
+        let id = self.next_member_id.fetch_add(1, Ordering::Relaxed);
+        let (family, slot) = self.register_member(id, preds, Some(group), false, None);
+        LiveCounts { family, slot, id, registry: self.clone() }
     }
 
     /// `Or` の購読を登録する: 枝 (AND) ごとに member を登録し、 枝の差分を積む [`Union`] に束ねる。
@@ -2231,7 +2351,7 @@ impl LiveRegistry {
                 .enumerate()
                 .map(|(i, b)| {
                     let bid = self.next_member_id.fetch_add(1, Ordering::Relaxed);
-                    self.register_member(bid, b, expand_always, Some((w.clone(), i)))
+                    self.register_member(bid, b, None, expand_always, Some((w.clone(), i)))
                 })
                 .collect(),
             state: Mutex::new(UnionState::new(n)),
@@ -2243,10 +2363,11 @@ impl LiveRegistry {
         &self,
         id: u64,
         preds: Vec<LivePred>,
+        group: Option<(Vec<u16>, u16)>,
         expand_always: bool,
         union: Option<(std::sync::Weak<Union>, usize)>,
     ) -> (Arc<Family>, usize) {
-        let (mut sig, flats, key) = canonical(preds);
+        let (mut sig, flats, key) = canonical(preds, group);
         sig.insert(0, expand_always as u32);
         let _edit = self.edit.lock();
         let family = match self.families().into_iter().find(|f| f.sig == sig) {
@@ -2628,6 +2749,113 @@ impl std::fmt::Debug for LiveQuery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let branches = self.parts().len();
         f.debug_struct("LiveQuery").field("id", &self.id).field("branches", &branches).finish()
+    }
+}
+
+// ─────────────────────────── 集計の購読 ───────────────────────────
+
+/// 条件に当てはまる entity を **group の列の値ごとに数えた件数** の live 版
+/// ([`Engine::subscribe_counts`](crate::engine::Engine::subscribe_counts))。
+///
+/// 例: 「営業中の法人の都道府県別の件数」。 [`poll`](Self::poll) は前回から件数が変わった group と
+/// 今の件数 (0 = その group が消えた) を返す。 積分 = 値で上書き。 初回は登録時点の全 group。
+///
+/// - group の列は ref の先でもよい (`company.city` ごと)。 会社の所在地が変わると配下の件数が
+///   まとめて移る (社員を 1 人ずつ報告しない)
+/// - group の列に値の無い entity は数えない (SQL の `GROUP BY` の NULL の group は無い)
+/// - 件数は同じ条件の集計の購読どうしで共有する (条件の値だけ違う購読は同じ family)
+pub struct LiveCounts {
+    family: Arc<Family>,
+    slot: usize,
+    id: u64,
+    registry: Arc<LiveRegistry>,
+}
+
+impl LiveCounts {
+    pub(crate) fn himos(&self) -> Vec<u16> {
+        let mut hs: Vec<u16> = self.family.routes.iter().map(|&(h, _)| h).collect();
+        hs.sort_unstable();
+        hs.dedup();
+        hs
+    }
+
+    pub(crate) fn seed(&self, r: &impl CellReader) {
+        let mut s = self.family.settled.lock();
+        self.family.activate(r, &mut s);
+    }
+
+    fn check_engine(&self, r: &crate::engine::Engine) {
+        assert!(
+            Arc::ptr_eq(&self.registry, r.live_registry()),
+            "LiveCounts: 購読した engine とは別の engine が渡された"
+        );
+    }
+
+    /// settle して `f(この購読の報告状態, 鍵の group の件数, 鍵の件数)`。
+    fn with<T>(&self, r: &impl CellReader, f: impl FnOnce(&mut GroupState, &std::collections::BTreeMap<u32, u64>, usize) -> T) -> T {
+        let mut guard = self.family.settled.lock();
+        self.family.settle(r, &mut guard);
+        let Settled { members, keys, .. } = &mut *guard;
+        let Some(m) = members[self.slot].as_mut() else { return f(&mut GroupState::default(), &Default::default(), 0) };
+        let empty = std::collections::BTreeMap::new();
+        let (groups, count) = match m.root_key.and_then(|k| keys.binary_search_by_key(&k, |x| x.id).ok()) {
+            Some(i) => (&keys[i].groups, keys[i].count),
+            None => (&empty, 0),
+        };
+        match m.grp.as_mut() {
+            Some(g) => f(g, groups, count),
+            None => f(&mut GroupState::default(), groups, count),
+        }
+    }
+
+    /// 前回 poll から件数が変わった group と今の件数 (値の昇順、 0 = group が消えた)。 値は
+    /// `query_by_id` と同じ (Number は値、 Tag は vocab id、 Ref は local eid)。
+    pub fn poll(&self, eng: &crate::engine::Engine) -> Vec<(u32, u64)> {
+        self.check_engine(eng);
+        self.poll_with(eng)
+    }
+
+    pub(crate) fn poll_with(&self, r: &impl CellReader) -> Vec<(u32, u64)> {
+        self.with(r, |g, groups, _| g.drain(groups))
+    }
+
+    /// group `value` の今の件数 (poll の状態は変えない)。
+    pub fn get(&self, eng: &crate::engine::Engine, value: u32) -> u64 {
+        self.check_engine(eng);
+        self.with(eng, |_, groups, _| groups.get(&value).copied().unwrap_or(0))
+    }
+
+    /// 今の全 group と件数 (値の昇順)。
+    pub fn all(&self, eng: &crate::engine::Engine) -> Vec<(u32, u64)> {
+        self.check_engine(eng);
+        self.all_with(eng)
+    }
+
+    pub(crate) fn all_with(&self, r: &impl CellReader) -> Vec<(u32, u64)> {
+        self.with(r, |_, groups, _| groups.iter().map(|(&v, &c)| (v, c)).collect())
+    }
+
+    /// 全 group の件数の和 (= 条件に当てはまり、 group の列に値のある entity の数)。
+    pub fn total(&self, eng: &crate::engine::Engine) -> usize {
+        self.check_engine(eng);
+        self.with(eng, |_, _, count| count)
+    }
+
+    /// engine 内で一意な購読 id。
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl Drop for LiveCounts {
+    fn drop(&mut self) {
+        self.registry.unregister(&self.family, self.slot);
+    }
+}
+
+impl std::fmt::Debug for LiveCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveCounts").field("id", &self.id).finish()
     }
 }
 
