@@ -1835,6 +1835,11 @@ impl LiveQuery {
         self.inner.members(&self.eng)
     }
 
+    /// `order_by(..).limit(k)` の購読: 今の先頭 k 件を並びの順に (先頭が 1 位)。 他は `members` と同じ。
+    pub fn ranked(&self) -> Vec<EntityId> {
+        self.inner.ranked(&self.eng)
+    }
+
     /// 未 poll の変化がありうるか (false なら `poll` は空)。 評価しないので軽い。
     pub fn is_dirty(&self) -> bool {
         self.inner.is_dirty()
@@ -1989,11 +1994,39 @@ pub struct Query<'a> {
     table: Arc<TableInner>,
     preds: Vec<Predicate>,
     limit: Option<usize>,
+    /// 並びの列と降順か (`order_by` / `order_by_desc`)。
+    order: Option<(String, bool)>,
 }
 
 impl<'a> Query<'a> {
     fn new(db: &'a Database, table: Arc<TableInner>) -> Self {
-        Self { db, table, preds: Vec::new(), limit: None }
+        Self { db, table, preds: Vec::new(), limit: None, order: None }
+    }
+
+    /// 結果を列 `col` の値の昇順に並べる (同じ値は eid の昇順)。 `col` は ref 列をたどってもよい。
+    /// **`col` に値の無い row は結果から外れる** (SQL の NULLS FIRST / LAST ではない)。
+    /// `limit` と組むと `subscribe` が先頭 k 件の購読 (live の `ORDER BY .. LIMIT`) になる。
+    pub fn order_by(mut self, col: &str) -> Self {
+        self.order = Some((col.to_string(), false));
+        self
+    }
+
+    /// `order_by` の降順。
+    pub fn order_by_desc(mut self, col: &str) -> Self {
+        self.order = Some((col.to_string(), true));
+        self
+    }
+
+    /// 並びの列を (ref の道, himo_id) に。
+    fn order_col(&self) -> Result<Option<(Vec<u16>, u16, bool)>, SchemaError> {
+        let Some((col, desc)) = &self.order else { return Ok(None) };
+        let (path, cd) = self
+            .resolve_col(col)
+            .ok_or_else(|| SchemaError::BadValue(format!("order_by: unknown column {col}")))?;
+        if cd.ty == ColumnType::Leaf {
+            return Err(SchemaError::BadValue("order_by: cannot order by a Leaf column".into()));
+        }
+        Ok(Some((path, cd.himo_id, *desc)))
     }
 
     /// 列名を解決する。 `"a.b.c"` は ref 列 `a`、 `b` を順にたどった先の table の列 `c`
@@ -2119,7 +2152,34 @@ impl<'a> Query<'a> {
         Ok(self.find()?.into_iter().next())
     }
 
-    pub fn find(self) -> Result<Vec<EntityId>, SchemaError> {
+    pub fn find(mut self) -> Result<Vec<EntityId>, SchemaError> {
+        let Some((path, himo, desc)) = self.order_col()? else { return self.find_set() };
+        // 並べてから切る: 集合は limit 無しで取り、 並びの値 (ref の道をたどった先) で並べる
+        let limit = self.limit.take();
+        self.order = None;
+        let eng = self.db.engine();
+        let mut keyed: Vec<((u32, u32), EntityId)> = self
+            .find_set()?
+            .into_iter()
+            .filter_map(|e| {
+                let mut cur = e;
+                for &h in &path {
+                    cur = eng.get_by_id(cur, h)? as EntityId;
+                }
+                let v = eng.get_by_id(cur, himo)?;
+                let v = if desc { u32::MAX - v } else { v };
+                Some(((v, enchudb_oplog::eid_local(e)), e))
+            })
+            .collect();
+        keyed.sort_unstable_by_key(|x| x.0);
+        let mut out: Vec<EntityId> = keyed.into_iter().map(|x| x.1).collect();
+        if let Some(n) = limit {
+            out.truncate(n);
+        }
+        Ok(out)
+    }
+
+    fn find_set(self) -> Result<Vec<EntityId>, SchemaError> {
         let eng = self.db.engine();
         eng.rebuild();
 
@@ -2245,8 +2305,10 @@ impl<'a> Query<'a> {
     /// `limit` 付き、 または未知の列 / 型の合わない値の `where_eq` は `BadValue`
     /// (`find()` なら常に 0 件になる条件 — 購読では書き間違いとして返す)。
     pub fn subscribe(self) -> Result<LiveQuery, SchemaError> {
-        if self.limit.is_some() {
-            return Err(SchemaError::BadValue("subscribe: limit is not supported".into()));
+        let order = self.order_col()?;
+        let limit = self.limit;
+        if limit.is_some() && order.is_none() {
+            return Err(SchemaError::BadValue("subscribe: limit needs order_by".into()));
         }
         let eng = self.db.arc_engine();
         let preds = self.live_preds()?.ok_or_else(|| {
@@ -2254,7 +2316,12 @@ impl<'a> Query<'a> {
                 "subscribe: where_eq on an unknown column or with a mismatched value type".into(),
             )
         })?;
-        let inner = eng.subscribe(preds).map_err(|e| SchemaError::Io(e.to_string()))?;
+        let inner = match (order, limit) {
+            (Some((path, himo, desc)), Some(k)) => {
+                eng.subscribe_top(preds, path, himo, desc, k).map_err(|e| SchemaError::BadValue(e.to_string()))?
+            }
+            _ => eng.subscribe(preds).map_err(|e| SchemaError::Io(e.to_string()))?,
+        };
         Ok(LiveQuery { inner, eng })
     }
 

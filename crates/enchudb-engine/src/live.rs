@@ -95,6 +95,16 @@
 //! O(鍵の数)。 根が出入りした時はその会社の今の group で数える。 登録時に 1 段目の先にも印を
 //! 付けて記録を作る (記録の無い会社が最初に変わると配下を全部評価し直すことになるので)。
 //!
+//! # 上位 k 件の購読 ([`Engine::subscribe_top`](crate::engine::Engine::subscribe_top))
+//!
+//! 並びの列も 「値を根まで運ぶ穴」 にし (値が変わるたびに運ぶ)、 根の鍵ごとに (並びの値, eid) の
+//! 順序 (`RootKey::order`、 降順は値を反転して昇順で持つ) を持つ。 購読ごとには k と **k 番目の
+//! 要素 (境界)** だけを持ち、 根が順序に入る / 出る時に境界の前後 1 つずつを出し入れする
+//! (`RootKey::order_insert` / `order_remove`、 O(log n))。 k の違う購読も同じ family・同じ順序を
+//! 共有する。 差分は普通の購読と同じく集合 (先頭 k 件) への出入り、 並びは `ranked`。
+//! 並びの列に値の無い entity は入らない。 並びの列が ref の先なら、 会社の値の変化は配下の根を
+//! 1 件ずつ順序の中で動かす (配下の数に比例)。
+//!
 //! # 状態の大きさ
 //!
 //! member ごとの状態 (最後に報告した集合など) は、 疎なうちは要素数に比例する集合 (roaring と
@@ -1101,6 +1111,19 @@ enum HoleVal {
     Range(u32, u32),
     /// 集計の group の列 ([`LiveCounts`])。 値は持たない (全ての値が group)。
     Group,
+    /// 上位 k 件の購読の並びの列 (`true` = 降順)。 k は member ごと ([`Engine::subscribe_top`](crate::engine::Engine::subscribe_top))。
+    Order(bool),
+}
+
+/// 根まで運ぶ値の種類 (family に高々 1 つ)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CarryKind {
+    /// 範囲の穴: 帯が変わった時だけ運ぶ。
+    Range,
+    /// 集計の group の列: 値が変わるたびに運ぶ。
+    Group,
+    /// 上位 k 件の並びの列 (`true` = 降順): 値が変わるたびに運ぶ。
+    Order(bool),
 }
 
 enum Leaf {
@@ -1162,19 +1185,22 @@ fn flatten(p: LivePred, path: &mut Vec<u16>, out: &mut Vec<Flat>) {
 /// 多次元の箱になり、 根での振り分けが 1 次元の区間の索引で済まなくなる)。 残りは値を固定した
 /// 条件 = 範囲が違えば別の family。
 ///
-/// `group` (集計の group の列: ref の道 + 紐) があれば、 その列を値を運ぶ穴にする (範囲の穴は
-/// 作らない — 根まで運ぶ値は 1 つ)。
-fn canonical(preds: Vec<LivePred>, group: Option<(Vec<u16>, u16)>) -> (Vec<u32>, Vec<Flat>, Vec<HoleVal>) {
+/// `carry` (集計の group の列 / 上位 k 件の並びの列: ref の道 + 紐 + `HoleVal::Group` か
+/// `HoleVal::Order`) があれば、 その列を値を運ぶ穴にする (範囲の穴は作らない — 根まで運ぶ値は 1 つ)。
+fn canonical(preds: Vec<LivePred>, carry: Option<(Vec<u16>, u16, HoleVal)>) -> (Vec<u32>, Vec<Flat>, Vec<HoleVal>) {
     let mut flats = Vec::new();
     for p in preds {
         flatten(p, &mut Vec::new(), &mut flats);
     }
-    let grouped = group.is_some();
-    if let Some((path, h)) = group {
+    let grouped = carry.is_some();
+    if let Some((path, h, hv)) = carry {
         let mut sig = vec![path.len() as u32];
         sig.extend(path.iter().map(|&x| x as u32));
-        sig.extend([6, h as u32]);
-        flats.push(Flat { path, sig, leaf: Leaf::Hole(h, HoleVal::Group) });
+        match hv {
+            HoleVal::Order(desc) => sig.extend([7, h as u32, desc as u32]),
+            _ => sig.extend([6, h as u32]),
+        }
+        flats.push(Flat { path, sig, leaf: Leaf::Hole(h, hv) });
     }
     let order = |a: &Flat, b: &Flat| a.sig.cmp(&b.sig).then_with(|| a.hole().cmp(&b.hole()));
     flats.sort_by(order);
@@ -1249,7 +1275,7 @@ fn build_tree(flats: Vec<Flat>) -> Vec<Node> {
             };
         }
         match f.leaf {
-            Leaf::Hole(h, HoleVal::Range(..) | HoleVal::Group) => {
+            Leaf::Hole(h, HoleVal::Range(..) | HoleVal::Group | HoleVal::Order(_)) => {
                 nodes[cur].range = Some((h, slot));
                 slot += 1;
             }
@@ -1324,6 +1350,25 @@ struct Member {
     union: Option<(std::sync::Weak<Union>, usize)>,
     /// 集計の購読 ([`LiveCounts`]) なら group の報告状態 (entity の出入りは積まない)。
     grp: Option<GroupState>,
+    /// 上位 k 件の購読なら k と境界。
+    topk: Option<TopK>,
+    /// 上位 k 件の並びが降順か。
+    order_desc: bool,
+}
+
+/// 上位 k 件の購読の境界。 鍵の順序 (`RootKey::order`、 (並びの値, eid) の昇順。 降順の購読は
+/// 値を反転して持つ) の先頭 k 個が集合。 `th` = k 番目の要素 (要素が k 個未満なら None = 全部)。
+#[derive(Clone, Copy)]
+struct TopK {
+    k: usize,
+    th: Option<(u32, u32)>,
+}
+
+impl TopK {
+    #[inline]
+    fn holds(&self, x: (u32, u32)) -> bool {
+        self.th.is_none_or(|th| x <= th)
+    }
 }
 
 /// 集計の購読 1 本ぶんの報告状態。 件数そのものは根の鍵が持ち (同じ鍵の購読で共有)、 ここは
@@ -1357,8 +1402,8 @@ impl GroupState {
 impl Member {
     /// 根の答えが `rec` の entity がこの member の集合に居るか。
     #[inline]
-    fn has(&self, rec: Option<Ans>) -> bool {
-        Member::probe(self.root_key, self.range)(rec)
+    fn has(&self, e: u32, rec: Option<Ans>) -> bool {
+        Member::probe(self.root_key, self.range, self.topk.map(|t| (t, self.order_desc)))(e, rec)
     }
 
     /// `eid` の出入りを記録し、 changed が空でなくなったら family の `ready` に載せる。
@@ -1377,18 +1422,27 @@ impl Member {
     /// changed を消費して差分を返し、 報告済みの集合を進める。 `root` = 根の答え。
     fn drain(&mut self, root: impl Fn(u32) -> Option<Ans>, peer: u32) -> LiveDelta {
         self.queued = false;
-        let (key, range) = (self.root_key, self.range);
-        let probe = Member::probe(key, range);
-        drain_marks(&mut self.changed, &mut self.left, &mut self.reported, |e| probe(root(e)), peer)
+        let probe = Member::probe(self.root_key, self.range, self.topk.map(|t| (t, self.order_desc)));
+        drain_marks(&mut self.changed, &mut self.left, &mut self.reported, |e| probe(e, root(e)), peer)
     }
 
     /// `has` の、 member を借用しない版。
-    fn probe(key: Option<u32>, range: Option<(u32, u32)>) -> impl Fn(Option<Ans>) -> bool {
-        move |rec| match (key, rec) {
-            (Some(k), Some((id, v))) => k == id && range.is_none_or(|(lo, hi)| lo <= v && v <= hi),
+    fn probe(key: Option<u32>, range: Option<(u32, u32)>, topk: Option<(TopK, bool)>) -> impl Fn(u32, Option<Ans>) -> bool {
+        move |e, rec| match (key, rec) {
+            (Some(k), Some((id, v))) => {
+                k == id
+                    && range.is_none_or(|(lo, hi)| lo <= v && v <= hi)
+                    && topk.is_none_or(|(t, desc)| t.holds((order_val(v, desc), e)))
+            }
             _ => false,
         }
     }
+}
+
+/// 並びの値を鍵の順序に載せる形に (降順は反転して昇順で持つ)。
+#[inline]
+fn order_val(v: u32, desc: bool) -> u32 {
+    if desc { u32::MAX - v } else { v }
 }
 
 /// changed を消費して差分を返し、 報告済みの集合を進める (member と `Or` の購読で共通)。
@@ -1478,6 +1532,8 @@ enum RootMode {
     Ranged,
     /// 集計: 鍵ごと・値 (group) ごとの件数を数える。
     Grouped,
+    /// 上位 k 件: 鍵ごとに (値, eid) の順序を持ち、 member ごとの k 番目を動かす (`true` = 降順)。
+    Ordered(bool),
 }
 
 /// 鍵 id → `Settled::keys` の添字の直近 2 件 (`apply_root_cached`)。 `keys` が変わる
@@ -1511,11 +1567,72 @@ struct RootKey {
     ivs: Option<Ivs>,
     /// 集計の family: group の値 → その値の根の数 (0 の group は載せない)。
     groups: std::collections::BTreeMap<u32, u64>,
+    /// 上位 k 件の family: この鍵の根を (並びの値 (降順は反転), eid) の昇順で。
+    order: std::collections::BTreeSet<(u32, u32)>,
 }
 
 impl RootKey {
     fn new(id: u32) -> Self {
-        RootKey { id, members: Vec::new(), count: 0, ivs: None, groups: std::collections::BTreeMap::new() }
+        RootKey {
+            id,
+            members: Vec::new(),
+            count: 0,
+            ivs: None,
+            groups: std::collections::BTreeMap::new(),
+            order: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// 順序に `x` を足し、 各 member の境界を動かして出入りに印を付ける。
+    fn order_insert(&mut self, x: (u32, u32), members: &mut [Option<Member>], ready: &mut Vec<usize>) {
+        self.order.insert(x);
+        let len = self.order.len();
+        for &slot in &self.members {
+            let Some(m) = members[slot].as_mut() else { continue };
+            let Some(mut tk) = m.topk else { continue };
+            match tk.th {
+                // 入れる前は k 個未満 = x は入る。 k 個になったら境界 = 最後
+                None => {
+                    m.note(slot, ready, x.1, false);
+                    if len == tk.k {
+                        tk.th = self.order.last().copied();
+                    }
+                }
+                // 境界より前に入ったら、 境界の要素が押し出され、 その 1 つ前が新しい境界
+                Some(th) if x < th => {
+                    m.note(slot, ready, x.1, false);
+                    m.note(slot, ready, th.1, false);
+                    tk.th = self.order.range(..th).next_back().copied();
+                }
+                Some(_) => {}
+            }
+            m.topk = Some(tk);
+        }
+    }
+
+    /// 順序から `x` を外し、 各 member の境界を動かして出入りに印を付ける。
+    fn order_remove(&mut self, x: (u32, u32), members: &mut [Option<Member>], ready: &mut Vec<usize>) {
+        if !self.order.remove(&x) {
+            return;
+        }
+        for &slot in &self.members {
+            let Some(m) = members[slot].as_mut() else { continue };
+            let Some(mut tk) = m.topk else { continue };
+            match tk.th {
+                None => m.note(slot, ready, x.1, false),
+                // 境界以前が抜けたら、 境界の次が入って新しい境界 (次が無ければ k 個未満 = 全部)
+                Some(th) if x <= th => {
+                    m.note(slot, ready, x.1, false);
+                    let next = self.order.range((std::ops::Bound::Excluded(th), std::ops::Bound::Unbounded)).next().copied();
+                    if let Some(n) = next {
+                        m.note(slot, ready, n.1, false);
+                    }
+                    tk.th = next;
+                }
+                Some(_) => {}
+            }
+            m.topk = Some(tk);
+        }
     }
 
     /// 範囲の索引を (無ければ作って) 返す。
@@ -1650,6 +1767,21 @@ impl Settled {
         let Settled { keys, members, ready, .. } = self;
         let iw = was.and_then(|a| cache.find(keys, a.0));
         let inw = now.and_then(|a| cache.find(keys, a.0));
+        if let RootMode::Ordered(desc) = mode {
+            for (k, ans, enter) in [(iw, was, false), (inw, now, true)] {
+                let (Some(i), Some((_, v))) = (k, ans) else { continue };
+                let rk = &mut keys[i];
+                let x = (order_val(v, desc), eid);
+                if enter {
+                    rk.count += 1;
+                    rk.order_insert(x, members, ready);
+                } else {
+                    rk.count -= 1;
+                    rk.order_remove(x, members, ready);
+                }
+            }
+            return;
+        }
         if mode == RootMode::Grouped {
             for (k, ans, enter) in [(iw, was, false), (inw, now, true)] {
                 let (Some(i), Some((_, v))) = (k, ans) else { continue };
@@ -1737,8 +1869,8 @@ pub(crate) struct Family {
     expand_always: AtomicBool,
     /// 値を根まで運ぶ穴 (範囲の穴か集計の group の列): (節, 紐)。
     range: Option<(usize, u16)>,
-    /// 運ぶ値が集計の group の列 (帯で刈り込まず、 値が変わるたびに運ぶ)。
-    group: bool,
+    /// 運ぶ値の種類 (`range` が Some の時だけ意味がある)。
+    kind: CarryKind,
     /// 集計で group の列が根でない時: 根の子のうち道の上の節 (1 段目)。 根は group の値でなく
     /// 1 段目の先の entity を記録し、 件数は 1 段目の先ごとの部分和で持つ — 1 段目の先の group の
     /// 値が変わっても根を評価せず部分和を移すだけ (`Settled::move_partial`)。
@@ -1753,7 +1885,7 @@ fn resolve(r: &impl CellReader, key: &[HoleVal]) -> Option<Vec<u32>> {
         .map(|v| match v {
             HoleVal::Id(x) => Some(*x),
             HoleVal::Text(t) => r.vocab_lookup(t),
-            HoleVal::Range(..) | HoleVal::Group => Some(0),
+            HoleVal::Range(..) | HoleVal::Group | HoleVal::Order(_) => Some(0),
         })
         .collect()
 }
@@ -1767,7 +1899,14 @@ fn range_of(key: &[HoleVal]) -> Option<(u32, u32)> {
 
 impl Family {
     fn new(id: u64, sig: Vec<u32>, flats: Vec<Flat>) -> Self {
-        let group = flats.iter().any(|f| matches!(f.leaf, Leaf::Hole(_, HoleVal::Group)));
+        let kind = flats
+            .iter()
+            .find_map(|f| match f.leaf {
+                Leaf::Hole(_, HoleVal::Group) => Some(CarryKind::Group),
+                Leaf::Hole(_, HoleVal::Order(desc)) => Some(CarryKind::Order(desc)),
+                _ => None,
+            })
+            .unwrap_or(CarryKind::Range);
         let nodes = build_tree(flats);
         let mut order: Vec<usize> = (0..nodes.len()).collect();
         order.sort_by_key(|&n| std::cmp::Reverse(nodes[n].depth));
@@ -1813,9 +1952,9 @@ impl Family {
             dirty: AtomicU32::new(0),
             settled: Mutex::new(Settled::new(&widths)),
             expand_always: AtomicBool::new(false),
-            partial: if group { nodes_partial } else { None },
+            partial: if kind == CarryKind::Group { nodes_partial } else { None },
             range,
-            group,
+            kind,
             on_path,
         }
     }
@@ -1854,9 +1993,17 @@ impl Family {
         s.members[slot].as_ref().is_some_and(|m| !m.changed.is_empty() || s.dormant.contains(&slot))
     }
 
-    fn add_member(&self, id: u64, key: Vec<HoleVal>, union: Option<(std::sync::Weak<Union>, usize)>) -> usize {
+    fn add_member(
+        &self,
+        id: u64,
+        key: Vec<HoleVal>,
+        union: Option<(std::sync::Weak<Union>, usize)>,
+        limit: Option<usize>,
+    ) -> usize {
         let mut s = self.settled.lock();
         let grp = key.contains(&HoleVal::Group).then(GroupState::default);
+        let order_desc = key.iter().any(|v| matches!(v, HoleVal::Order(true)));
+        let topk = limit.map(|k| TopK { k, th: None });
         let m = Member {
             id,
             key,
@@ -1868,6 +2015,8 @@ impl Family {
             changed: Marks::default(),
             queued: false,
             grp,
+            topk,
+            order_desc,
             union,
         };
         let slot = match s.members.iter().position(Option::is_none) {
@@ -1925,7 +2074,7 @@ impl Family {
         let mut v = 0;
         if let Some((h, _)) = node.range {
             v = r.cell(h, e)?;
-            if !self.group && !s.slabs.covered(v) {
+            if self.kind == CarryKind::Range && !s.slabs.covered(v) {
                 return None;
             }
         }
@@ -2163,13 +2312,26 @@ impl Family {
                     self.push_marks(0, roots);
                     continue;
                 }
+                if let Some(tk) = m.topk.as_mut() {
+                    // 上位 k 件: 境界 = 鍵の順序の k 番目、 先頭 k 個を初回の報告に積む (新しい鍵なら
+                    // 順序は空で、 候補を評価した時の遷移が境界を動かす)
+                    if let Ok(i) = keys.binary_search_by_key(&id, |k| k.id) {
+                        let first: Vec<(u32, u32)> = keys[i].order.iter().take(tk.k).copied().collect();
+                        tk.th = (first.len() == tk.k).then(|| first[tk.k - 1]);
+                        for x in first {
+                            m.note(slot, ready, x.1, false);
+                        }
+                    }
+                    self.push_marks(0, roots);
+                    continue;
+                }
                 // 新しい鍵なら今その鍵の根は居ない — 候補を評価した時の遷移 (apply_root) が
                 // この member に届く。 既にある鍵 (同じ条件の購読が他に居る / 居た) なら、 今その鍵の
                 // 根はもう遷移しないので、 ここで初回の報告に積む。 候補 (上位集合) を全部積むと、
                 // 購読を一度に多数張った時に 購読数 × 候補数 の一時メモリになる
                 if !new_key {
                     for &e in &roots {
-                        if m.has(root_at(recs, rvals, e)) {
+                        if m.has(e, root_at(recs, rvals, e)) {
                             m.note(slot, ready, e, false);
                         }
                     }
@@ -2215,10 +2377,11 @@ impl Family {
             }
         }
         let always = self.expand_always.load(Ordering::Relaxed);
-        let mode = match (self.range.is_some(), self.group) {
+        let mode = match (self.range.is_some(), self.kind) {
             (false, _) => RootMode::Plain,
-            (true, false) => RootMode::Ranged,
-            (true, true) => RootMode::Grouped,
+            (true, CarryKind::Range) => RootMode::Ranged,
+            (true, CarryKind::Group) => RootMode::Grouped,
+            (true, CarryKind::Order(desc)) => RootMode::Ordered(desc),
         };
         // 根の子が 1 本なら、 その子の entity から逆引きした根は 「子の答え = その entity の新しい
         // 記録」 と分かっているので、 評価で ref と子の記録を読み直さない (会社 1 社の移転で配下
@@ -2276,7 +2439,7 @@ impl Family {
                         pi != ni
                             || (path
                                 && !partial_node
-                                && if self.group { pv != nv } else { !s.slabs.same(pv, nv) })
+                                && if self.kind == CarryKind::Range { !s.slabs.same(pv, nv) } else { pv != nv })
                     }
                     (Some(None), None) => false,
                     _ => true,
@@ -2328,9 +2491,11 @@ fn find_branch(r: &impl CellReader, preds: Vec<LivePred>) -> Vec<u32> {
         queued: false,
         union: None,
         grp: None,
+        topk: None,
+        order_desc: false,
     };
     let roots = fam.walk(r, &vals, range);
-    roots.into_iter().filter(|&e| m.has(fam.eval(r, &s, 0, e))).collect()
+    roots.into_iter().filter(|&e| m.has(e, fam.eval(r, &s, 0, e))).collect()
 }
 
 type Route = (Arc<Family>, usize);
@@ -2462,14 +2627,22 @@ impl LiveRegistry {
     /// `expand_always` (ablation / 計測用) の購読は、 同じ形でも既定の購読とは別の family になる。
     pub(crate) fn register(self: &Arc<Self>, preds: Vec<LivePred>, expand_always: bool) -> LiveQuery {
         let id = self.next_member_id.fetch_add(1, Ordering::Relaxed);
-        let (family, slot) = self.register_member(id, preds, None, expand_always, None);
+        let (family, slot) = self.register_member(id, preds, None, expand_always, None, None);
+        LiveQuery { kind: Kind::One { family, slot }, id, registry: self.clone() }
+    }
+
+    /// 上位 k 件の購読を登録する: `preds` の結果を `order` (ref の道 + 紐 + 降順か) で並べた先頭 `limit` 件。
+    pub(crate) fn register_top(self: &Arc<Self>, preds: Vec<LivePred>, order: (Vec<u16>, u16, bool), limit: usize) -> LiveQuery {
+        let id = self.next_member_id.fetch_add(1, Ordering::Relaxed);
+        let carry = (order.0, order.1, HoleVal::Order(order.2));
+        let (family, slot) = self.register_member(id, preds, Some(carry), false, None, Some(limit));
         LiveQuery { kind: Kind::One { family, slot }, id, registry: self.clone() }
     }
 
     /// 集計の購読を登録する: `preds` の結果を `group` (ref の道 + 紐) の値ごとに数える。
     pub(crate) fn register_counts(self: &Arc<Self>, preds: Vec<LivePred>, group: (Vec<u16>, u16)) -> LiveCounts {
         let id = self.next_member_id.fetch_add(1, Ordering::Relaxed);
-        let (family, slot) = self.register_member(id, preds, Some(group), false, None);
+        let (family, slot) = self.register_member(id, preds, Some((group.0, group.1, HoleVal::Group)), false, None, None);
         LiveCounts { family, slot, id, registry: self.clone() }
     }
 
@@ -2484,7 +2657,7 @@ impl LiveRegistry {
                 .enumerate()
                 .map(|(i, b)| {
                     let bid = self.next_member_id.fetch_add(1, Ordering::Relaxed);
-                    self.register_member(bid, b, None, expand_always, Some((w.clone(), i)))
+                    self.register_member(bid, b, None, expand_always, Some((w.clone(), i)), None)
                 })
                 .collect(),
             state: Mutex::new(UnionState::new(n)),
@@ -2496,11 +2669,12 @@ impl LiveRegistry {
         &self,
         id: u64,
         preds: Vec<LivePred>,
-        group: Option<(Vec<u16>, u16)>,
+        carry: Option<(Vec<u16>, u16, HoleVal)>,
         expand_always: bool,
         union: Option<(std::sync::Weak<Union>, usize)>,
+        limit: Option<usize>,
     ) -> (Arc<Family>, usize) {
-        let (mut sig, flats, key) = canonical(preds, group);
+        let (mut sig, flats, key) = canonical(preds, carry);
         sig.insert(0, expand_always as u32);
         let _edit = self.edit.lock();
         let family = match self.families().into_iter().find(|f| f.sig == sig) {
@@ -2524,7 +2698,7 @@ impl LiveRegistry {
                 f
             }
         };
-        let slot = family.add_member(id, key, union);
+        let slot = family.add_member(id, key, union, limit);
         (family, slot)
     }
 
@@ -2816,11 +2990,37 @@ impl LiveQuery {
         family.settle(r, &mut s);
         let Some(m) = s.members[slot].as_ref() else { return 0 };
         let Some(k) = m.root_key else { return 0 };
+        if let Some(tk) = m.topk {
+            return s.keys.binary_search_by_key(&k, |x| x.id).map_or(0, |i| s.keys[i].order.len().min(tk.k));
+        }
         if m.range.is_some() {
             // 根の鍵を範囲の違う member と共有するので、 鍵ごとの件数は使えない
-            return s.recs[0].with_key(k).into_iter().filter(|&e| m.has(s.root(e))).count();
+            return s.recs[0].with_key(k).into_iter().filter(|&e| m.has(e, s.root(e))).count();
         }
         s.keys.binary_search_by_key(&k, |x| x.id).map_or(0, |i| s.keys[i].count)
+    }
+
+    /// 上位 k 件の購読: 今の集合を並びの順に (先頭が 1 位)。 他の購読は `members` と同じ (eid 昇順)。
+    pub fn ranked(&self, eng: &crate::engine::Engine) -> Vec<EntityId> {
+        self.check_engine(eng);
+        let peer = self.registry.peer.load(Ordering::Acquire);
+        let Kind::One { family, slot } = &self.kind else { return self.members(eng) };
+        let mut s = family.settled.lock();
+        family.settle(eng, &mut s);
+        let Some(m) = s.members[*slot].as_ref() else { return Vec::new() };
+        let (Some(k), Some(_)) = (m.root_key, m.topk) else {
+            drop(s);
+            return self.members(eng);
+        };
+        Self::ranked_in(&s, m, k).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect()
+    }
+
+    fn ranked_in(s: &Settled, m: &Member, k: u32) -> Vec<u32> {
+        let Some(tk) = m.topk else { return Vec::new() };
+        match s.keys.binary_search_by_key(&k, |x| x.id) {
+            Ok(i) => s.keys[i].order.iter().take(tk.k).map(|x| x.1).collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// `Or` の購読の枝を settle して積む。 積んだ差分は `poll_all` が拾えるように登録する。
@@ -2843,7 +3043,7 @@ impl LiveQuery {
         };
         let mut s = family.settled.lock();
         family.settle(eng, &mut s);
-        s.members[slot].as_ref().is_some_and(|m| m.has(s.root(e)))
+        s.members[slot].as_ref().is_some_and(|m| m.has(e, s.root(e)))
     }
 
     /// 現在の結果全体 (eid 昇順)。 poll の状態は変えない。
@@ -2861,10 +3061,15 @@ impl LiveQuery {
         family.settle(eng, &mut s);
         let Some(m) = s.members[slot].as_ref() else { return Vec::new() };
         let Some(k) = m.root_key else { return Vec::new() };
+        if m.topk.is_some() {
+            let mut out: Vec<EntityId> = Self::ranked_in(&s, m, k).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect();
+            out.sort_unstable();
+            return out;
+        }
         s.recs[0]
             .with_key(k)
             .into_iter()
-            .filter(|&e| m.has(s.root(e)))
+            .filter(|&e| m.has(e, s.root(e)))
             .map(|e| enchudb_oplog::make_eid(peer, e))
             .collect()
     }

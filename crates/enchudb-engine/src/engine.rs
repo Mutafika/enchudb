@@ -11510,6 +11510,48 @@ impl Engine {
         Ok(q)
     }
 
+    /// 条件 `preds` に当てはまる entity を、 ref の道 `order_path` をたどった先の紐 `order_himo` の
+    /// 値で並べた **先頭 `limit` 件** を購読する (live の `ORDER BY .. LIMIT`)。 差分は普通の購読と
+    /// 同じく先頭 `limit` 件への出入り、 並びは [`LiveQuery::ranked`](crate::live::LiveQuery::ranked)。
+    /// 同じ値は eid の昇順。 並びの列に値の無い entity は入らない。 `Or` と `limit == 0` は `InvalidInput`。
+    pub fn subscribe_top(
+        &self,
+        preds: Vec<crate::live::LivePred>,
+        order_path: Vec<u16>,
+        order_himo: u16,
+        desc: bool,
+        limit: usize,
+    ) -> std::io::Result<crate::live::LiveQuery> {
+        let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, m.to_string());
+        if limit == 0 {
+            return Err(bad("subscribe_top: limit must be at least 1"));
+        }
+        self.validate_live_preds(&preds)?;
+        if order_himo as usize >= self.himos.len() || order_path.iter().any(|&h| h as usize >= self.himos.len()) {
+            return Err(bad("unknown order himo"));
+        }
+        if order_path.iter().any(|&h| self.value_type_at(h as usize) != Some(ValueType::Ref)) {
+            return Err(bad("order path himo is not a Ref himo"));
+        }
+        let mut branches = crate::live::dnf(preds).map_err(|m| bad(&m))?;
+        if branches.len() != 1 {
+            return Err(bad("subscribe_top does not support Or"));
+        }
+        let preds = branches.pop().unwrap_or_default();
+        let mut refs: Vec<u16> = preds.iter().flat_map(|p| p.ref_himos()).chain(order_path.iter().copied()).collect();
+        refs.sort_unstable();
+        refs.dedup();
+        for h in refs {
+            let _ = self.himos[h as usize].slice_len(0);
+        }
+        let q = self.live.register_top(preds, (order_path, order_himo, desc), limit);
+        for h in q.himos() {
+            self.himos[h as usize].write_barrier();
+        }
+        q.seed(self);
+        Ok(q)
+    }
+
     /// この engine の全購読について、 前回 poll から出入りのあったものだけの差分を返す
     /// (`(LiveQuery::id, 差分)`、 id 昇順)。 購読を 1 本ずつ `poll` する代わりに使うと、 コストが
     /// 購読の数でなく出入りの数に比例する (購読が数千本ある時向け)。 各購読の `poll` と報告

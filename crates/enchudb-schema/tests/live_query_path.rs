@@ -1180,3 +1180,203 @@ fn run_counts(path: &str) {
     }
     check(&mut subs, &users, 1_000_001);
 }
+
+/// `order_by(..).limit(k).subscribe()` (先頭 k 件の購読) の積分・`ranked()`・`count()`・`find()` が、
+/// 手で並べて切った結果と一致すること。 値の重なりが多い (同じ値は eid の昇順)。
+///
+/// - 根の列で並べる (昇順 / 降順)、 ref の先の列で並べる (会社の売上が変わると配下の順位がまとめて動く)
+/// - 条件も ref の先・範囲・値の穴、 k は 1〜12、 同じ条件で k の違う購読が同じ family を共有する
+#[test]
+fn top_k_subscriptions_match_oracle() {
+    let path = tmp_path("topk");
+    cleanup(&path);
+    run_top(&path);
+    cleanup(&path);
+}
+
+fn run_top(path: &str) {
+    let mut db = Database::create_growable_tiny(path).unwrap();
+    db.table("companies").number("id").tag("city").number("revenue").primary_key("id").build().unwrap();
+    db.table("users")
+        .number("id")
+        .number("age")
+        .tag("city")
+        .ref_to("company", "companies")
+        .primary_key("id")
+        .build()
+        .unwrap();
+    let users_t = db.get_table("users").unwrap();
+    let companies_t = db.get_table("companies").unwrap();
+    let cities = ["Tokyo", "Osaka", "Kyoto"];
+    let mut rng = Rng(0x70b0_70b0_1111_2222);
+    let mut companies: Vec<u64> = (0..10i64)
+        .map(|i| {
+            companies_t
+                .insert()
+                .set("id", i)
+                .set("city", cities[(i % 3) as usize])
+                .set("revenue", (i * 37) % 50)
+                .commit()
+                .unwrap()
+        })
+        .collect();
+    let mut users: Vec<u64> = (0..150i64)
+        .map(|i| {
+            let mut b = users_t
+                .insert()
+                .set("id", i)
+                .set("city", cities[(i % 3) as usize])
+                .set("company", Value::Ref(companies[(i % 10) as usize]));
+            if i % 9 != 0 {
+                b = b.set("age", (i * 7) % 30);
+            }
+            b.commit().unwrap()
+        })
+        .collect();
+    let (u, c) = (&users_t, &companies_t);
+    let age = move |e: u64| get_num(u, e, "age");
+    let home = move |e: u64| get_text(u, e, "city");
+    let company = move |e: u64| get_ref(u, e, "company");
+    let work = move |e: u64| company(e).and_then(|x| get_text(c, x, "city"));
+    let revenue = move |e: u64| company(e).and_then(|x| get_num(c, x, "revenue"));
+
+    type Cond<'a> = Box<dyn Fn(u64) -> bool + 'a>;
+    type OrderKey<'a> = Box<dyn Fn(u64) -> Option<i64> + 'a>;
+    type Q<'a> = Box<dyn Fn() -> enchudb_schema::Query<'a> + 'a>;
+    struct TSub<'a> {
+        name: String,
+        q: LiveQuery,
+        query: Q<'a>,
+        seen: BTreeSet<u64>,
+        cond: Cond<'a>,
+        key: OrderKey<'a>,
+        desc: bool,
+        k: usize,
+    }
+    let make = |kind: u64, rng: &mut Rng| -> TSub {
+        let a = cities[rng.below(3) as usize];
+        let x = rng.below(30) as u32;
+        let k = 1 + rng.below(12) as usize;
+        let (name, query, cond, key, desc): (String, Q, Cond, OrderKey, bool) = match kind {
+            0 => (
+                format!("all order by age limit {k}"),
+                Box::new(move || u.all().order_by("age").limit(k)),
+                Box::new(|_| true),
+                Box::new(age),
+                false,
+            ),
+            1 => (
+                format!("city = {a} order by age desc limit {k}"),
+                Box::new(move || u.where_eq("city", a).order_by_desc("age").limit(k)),
+                Box::new(move |e| home(e).as_deref() == Some(a)),
+                Box::new(age),
+                true,
+            ),
+            2 => (
+                format!("age > {x} order by company.revenue limit {k}"),
+                Box::new(move || u.all().where_gt("age", x).order_by("company.revenue").limit(k)),
+                Box::new(move |e| age(e).is_some_and(|v| v > x as i64)),
+                Box::new(revenue),
+                false,
+            ),
+            _ => (
+                format!("company.city = {a} order by company.revenue desc limit {k}"),
+                Box::new(move || u.where_eq("company.city", a).order_by_desc("company.revenue").limit(k)),
+                Box::new(move |e| work(e).as_deref() == Some(a)),
+                Box::new(revenue),
+                true,
+            ),
+        };
+        let q = query().subscribe().unwrap();
+        TSub { name, q, query, seen: BTreeSet::new(), cond, key, desc, k }
+    };
+    let mut subs: Vec<TSub> = (0..24).map(|i| make(i % 4, &mut rng)).collect();
+
+    let check = |subs: &mut Vec<TSub>, users: &[u64], step: usize| {
+        if !step.is_multiple_of(2) {
+            for (id, d) in db.poll_live() {
+                let s = subs.iter_mut().find(|s| s.q.id() == id).expect("生きている購読の id");
+                integrate(&mut s.seen, d);
+            }
+        }
+        for s in subs.iter_mut() {
+            if step.is_multiple_of(2) {
+                integrate(&mut s.seen, s.q.poll());
+            }
+            let mut want: Vec<(i64, u32, u64)> = users
+                .iter()
+                .copied()
+                .filter(|&e| (s.cond)(e))
+                .filter_map(|e| (s.key)(e).map(|v| (if s.desc { -v } else { v }, (e & 0xFFFF_FFFF) as u32, e)))
+                .collect();
+            want.sort_unstable();
+            want.truncate(s.k);
+            let ranked: Vec<u64> = want.iter().map(|x| x.2).collect();
+            let set: BTreeSet<u64> = ranked.iter().copied().collect();
+            assert_eq!(s.seen, set, "[{}] step {step}: 積分 != 手で並べて切った結果", s.name);
+            assert_eq!(s.q.ranked(), ranked, "[{}] step {step}: ranked", s.name);
+            assert_eq!(s.q.count(), ranked.len(), "[{}] step {step}: count", s.name);
+            assert!(s.q.poll().is_empty(), "[{}] step {step}: 受け取り済みの差分がまた届く", s.name);
+            assert_eq!((s.query)().find().unwrap(), ranked, "[{}] step {step}: find", s.name);
+        }
+    };
+    check(&mut subs, &users, 0);
+
+    let mut next_id = 1000i64;
+    for step in 1..1500 {
+        match rng.below(8) {
+            0..=2 => {
+                let e = users[rng.below(users.len() as u64) as usize];
+                users_t.entity(e).set("age", rng.below(30) as i64).commit().unwrap();
+            }
+            3 => {
+                let x = companies[rng.below(companies.len() as u64) as usize];
+                companies_t.entity(x).set("revenue", rng.below(50) as i64).commit().unwrap();
+            }
+            4 => {
+                let e = users[rng.below(users.len() as u64) as usize];
+                let x = companies[rng.below(companies.len() as u64) as usize];
+                users_t.entity(e).set("company", Value::Ref(x)).commit().unwrap();
+            }
+            5 => {
+                let x = companies[rng.below(companies.len() as u64) as usize];
+                companies_t.entity(x).set("city", cities[rng.below(3) as usize]).commit().unwrap();
+            }
+            6 => {
+                let i = rng.below(users.len() as u64) as usize;
+                users_t.entity(users[i]).delete().unwrap();
+                users[i] = users_t
+                    .insert()
+                    .set("id", next_id)
+                    .set("age", rng.below(30) as i64)
+                    .set("city", cities[rng.below(3) as usize])
+                    .set("company", Value::Ref(companies[rng.below(companies.len() as u64) as usize]))
+                    .commit()
+                    .unwrap();
+                next_id += 1;
+            }
+            _ => {
+                let i = rng.below(companies.len() as u64) as usize;
+                companies_t.entity(companies[i]).delete().unwrap();
+                companies[i] = companies_t
+                    .insert()
+                    .set("id", next_id)
+                    .set("city", cities[rng.below(3) as usize])
+                    .set("revenue", rng.below(50) as i64)
+                    .commit()
+                    .unwrap();
+                next_id += 1;
+            }
+        }
+        if step % 5 == 0 {
+            let i = rng.below(subs.len() as u64) as usize;
+            let kind = rng.below(4);
+            subs[i] = make(kind, &mut rng);
+        }
+        if step % 3 == 0 {
+            check(&mut subs, &users, step);
+        }
+    }
+    check(&mut subs, &users, 1_000_001);
+    check(&mut subs, &users, 1_000_002);
+}
