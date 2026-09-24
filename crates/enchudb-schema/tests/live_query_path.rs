@@ -775,3 +775,187 @@ fn run_range(path: &str) {
     check(&mut subs, &users, 1_000_002);
     assert!(hits[..4].iter().all(|&h| h > 0), "当たらなかった種類がある: {hits:?}");
 }
+
+/// `Query::or` の購読 (engine 内では枝ごとに family の member、 枝の差分を積んで和を取る) が、
+/// 張り替え・行の入れ替え (slot 再利用) を混ぜても手でたどった結果と一致すること。 `find()` も比べる。
+///
+/// - 同じ形の枝 (`city = A OR city = B`、 同じ family の 2 member)、 形の違う枝 (`city OR age > k`)
+/// - ref の先の枝、 `(a OR b) AND c`、 両方の枝に居る row (片方から出ても残る)、 `all().or(..)`
+#[test]
+fn or_subscriptions_match_oracle() {
+    let path = tmp_path("or");
+    cleanup(&path);
+    run_or(&path);
+    cleanup(&path);
+}
+
+fn run_or(path: &str) {
+    let mut db = Database::create_growable_tiny(path).unwrap();
+    db.table("companies").number("id").tag("city").primary_key("id").build().unwrap();
+    db.table("users")
+        .number("id")
+        .number("age")
+        .tag("city")
+        .ref_to("company", "companies")
+        .primary_key("id")
+        .build()
+        .unwrap();
+    let users_t = db.get_table("users").unwrap();
+    let companies_t = db.get_table("companies").unwrap();
+    let cities = ["Tokyo", "Osaka", "Kyoto", "Nagoya"];
+    let mut rng = Rng(0x0a0b_0c0d_1234_5678);
+    let mut companies: Vec<u64> = (0..8i64)
+        .map(|i| companies_t.insert().set("id", i).set("city", cities[(i % 4) as usize]).commit().unwrap())
+        .collect();
+    let mut users: Vec<u64> = (0..160i64)
+        .map(|i| {
+            users_t
+                .insert()
+                .set("id", i)
+                .set("age", (i * 7) % 60)
+                .set("city", cities[(i % 3) as usize])
+                .set("company", Value::Ref(companies[(i % 8) as usize]))
+                .commit()
+                .unwrap()
+        })
+        .collect();
+    let (u, c) = (&users_t, &companies_t);
+    let age = move |e: u64| get_num(u, e, "age");
+    let home = move |e: u64| get_text(u, e, "city");
+    let work = move |e: u64| get_ref(u, e, "company").and_then(|x| get_text(c, x, "city"));
+    let is = |v: Option<String>, s: &str| v.as_deref() == Some(s);
+
+    type OrOracle<'a> = Box<dyn Fn(u64) -> bool + 'a>;
+    type OrQuery<'a> = Box<dyn Fn() -> enchudb_schema::Query<'a> + 'a>;
+    struct OSub<'a> {
+        name: String,
+        q: LiveQuery,
+        query: OrQuery<'a>,
+        seen: BTreeSet<u64>,
+        oracle: OrOracle<'a>,
+    }
+    let make = |kind: u64, rng: &mut Rng| -> OSub {
+        let a = cities[rng.below(4) as usize];
+        let b = cities[rng.below(4) as usize];
+        let k = rng.below(60) as u32;
+        let (name, query, oracle): (String, OrQuery, OrOracle) = match kind {
+            0 => (
+                format!("city = {a} OR city = {b}"),
+                Box::new(move || u.where_eq("city", a).or(u.where_eq("city", b))),
+                Box::new(move |e| is(home(e), a) || is(home(e), b)),
+            ),
+            1 => (
+                format!("city = {a} OR age > {k}"),
+                Box::new(move || u.where_eq("city", a).or(u.all().where_gt("age", k))),
+                Box::new(move |e| is(home(e), a) || age(e).is_some_and(|v| v > k as i64)),
+            ),
+            2 => (
+                format!("company.city = {a} OR city = {b}"),
+                Box::new(move || u.where_eq("company.city", a).or(u.where_eq("city", b))),
+                Box::new(move |e| is(work(e), a) || is(home(e), b)),
+            ),
+            3 => (
+                format!("(company.city = {a} OR company.city = {b}) AND age <= {k}"),
+                Box::new(move || u.where_eq("company.city", a).or(u.where_eq("company.city", b)).where_le("age", k)),
+                Box::new(move |e| (is(work(e), a) || is(work(e), b)) && age(e).is_some_and(|v| v <= k as i64)),
+            ),
+            4 => (
+                // 同じ row が両方の枝に居やすい: 住所と勤務先が同じ都市
+                format!("city = {a} OR company.city = {a}"),
+                Box::new(move || u.where_eq("city", a).or(u.where_eq("company.city", a))),
+                Box::new(move |e| is(home(e), a) || is(work(e), a)),
+            ),
+            _ => (
+                format!("all OR city = {a}"),
+                Box::new(move || u.all().or(u.where_eq("city", a))),
+                Box::new(move |e| age(e).is_some() || is(home(e), a)),
+            ),
+        };
+        let q = query().subscribe().unwrap();
+        OSub { name, q, query, seen: BTreeSet::new(), oracle }
+    };
+    let mut subs: Vec<OSub> = (0..30).map(|i| make(i % 6, &mut rng)).collect();
+
+    let check = |subs: &mut Vec<OSub>, users: &[u64], step: usize| {
+        if step % 4 == 1 {
+            // count が枝の差分を積んだ後でも poll_live に届く
+            for s in subs.iter() {
+                s.q.count();
+            }
+        }
+        if !step.is_multiple_of(2) {
+            let deltas = db.poll_live();
+            assert!(deltas.windows(2).all(|w| w[0].0 < w[1].0), "id 昇順・重複なし");
+            for (id, d) in deltas {
+                assert!(!d.is_empty(), "空の差分は返さない");
+                let s = subs.iter_mut().find(|s| s.q.id() == id).expect("生きている購読の id (枝の id が漏れた)");
+                integrate(&mut s.seen, d);
+            }
+        }
+        for s in subs.iter_mut() {
+            if step.is_multiple_of(2) {
+                integrate(&mut s.seen, s.q.poll());
+            }
+            let want: BTreeSet<u64> = users.iter().copied().filter(|&e| (s.oracle)(e)).collect();
+            assert_eq!(s.seen, want, "[{}] step {step}: 積分 != 手でたどった結果", s.name);
+            assert!(s.q.poll().is_empty(), "[{}] step {step}: 受け取り済みの差分がまた届く", s.name);
+            assert_eq!(s.q.count(), want.len(), "[{}] step {step}: count", s.name);
+            let found: BTreeSet<u64> = (s.query)().find().unwrap().into_iter().collect();
+            assert_eq!(found, want, "[{}] step {step}: find", s.name);
+        }
+    };
+    check(&mut subs, &users, 0);
+
+    let mut next_id = 1000i64;
+    for step in 1..1200 {
+        match rng.below(7) {
+            0 | 1 => {
+                let e = users[rng.below(users.len() as u64) as usize];
+                users_t.entity(e).set("age", rng.below(60) as i64).commit().unwrap();
+            }
+            2 => {
+                let e = users[rng.below(users.len() as u64) as usize];
+                users_t.entity(e).set("city", cities[rng.below(4) as usize]).commit().unwrap();
+            }
+            3 => {
+                let x = companies[rng.below(companies.len() as u64) as usize];
+                companies_t.entity(x).set("city", cities[rng.below(4) as usize]).commit().unwrap();
+            }
+            4 => {
+                let e = users[rng.below(users.len() as u64) as usize];
+                let x = companies[rng.below(companies.len() as u64) as usize];
+                users_t.entity(e).set("company", Value::Ref(x)).commit().unwrap();
+            }
+            5 => {
+                let i = rng.below(users.len() as u64) as usize;
+                users_t.entity(users[i]).delete().unwrap();
+                users[i] = users_t
+                    .insert()
+                    .set("id", next_id)
+                    .set("age", rng.below(60) as i64)
+                    .set("city", cities[rng.below(4) as usize])
+                    .set("company", Value::Ref(companies[rng.below(companies.len() as u64) as usize]))
+                    .commit()
+                    .unwrap();
+                next_id += 1;
+            }
+            _ => {
+                let i = rng.below(companies.len() as u64) as usize;
+                companies_t.entity(companies[i]).delete().unwrap();
+                companies[i] =
+                    companies_t.insert().set("id", next_id).set("city", cities[rng.below(4) as usize]).commit().unwrap();
+                next_id += 1;
+            }
+        }
+        if step % 5 == 0 {
+            let i = rng.below(subs.len() as u64) as usize;
+            let kind = rng.below(6);
+            subs[i] = make(kind, &mut rng);
+        }
+        if step % 3 == 0 {
+            check(&mut subs, &users, step);
+        }
+    }
+    check(&mut subs, &users, 1_000_001);
+    check(&mut subs, &users, 1_000_002);
+}

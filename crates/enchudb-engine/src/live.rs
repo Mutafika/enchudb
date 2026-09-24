@@ -16,6 +16,11 @@
 //! `Via` は同じ ref の並びを共有するものが 1 本の道にまとまり、 購読は **ref の木** になる
 //! (根 = `x0`、 枝 = ref 紐、 各節 = その先の entity への条件)。
 //!
+//! `Or` は AND の OR (枝) に展開し (`Via` の中の `Or` は外に出す)、 枝ごとに AND の購読を張る。
+//! `Or` の購読は枝の差分を枝ごとの集合に積み、 「どの枝にも居ない ↔ どれかに居る」 をまたいだら出入り
+//! (`Union`)。 同じ形の枝 (`city = 東京 OR city = 大阪`) は同じ family の member なので、
+//! 書き込みのコストは AND の購読と変わらない。
+//!
 //! # 仕組み — 書き込みで印、 poll で展開
 //!
 //! ref は 「その entity からは 1 本だけ」 (関数従属) なので、 会社の所在地の値は会社の entity に
@@ -162,7 +167,14 @@ pub enum LivePred {
     /// ref 紐 `path` を順にたどった先の entity で `pred` が真。 ref が張られていない / 先の
     /// entity に値が無ければ偽。 `path` の紐は全部 Ref 型であること。
     Via { path: Vec<u16>, pred: Box<LivePred> },
+    /// 枝のどれかが真 (各枝は条件の AND)。 `Via` の中にも書ける (`company.city = 東京 OR
+    /// company.city = 大阪` = `Via { company, Or([[city = 東京], [city = 大阪]]) }`)。 枝も枝の中の
+    /// AND も空は不可。 展開した枝 (AND の OR に直した数) は [`MAX_BRANCHES`] まで。
+    Or(Vec<Vec<LivePred>>),
 }
+
+/// `Or` を AND の OR に展開した枝の数の上限 (`(a OR b) AND (c OR d) AND ...` は枝が掛け算で増える)。
+pub const MAX_BRANCHES: usize = 64;
 
 impl LivePred {
     /// 条件に出てくる全ての紐 (ref の道を含む)。
@@ -183,19 +195,84 @@ impl LivePred {
                 out.extend_from_slice(path);
                 pred.collect_himos(out);
             }
+            LivePred::Or(branches) => {
+                for p in branches.iter().flatten() {
+                    p.collect_himos(out);
+                }
+            }
         }
     }
 
     /// ref の道 (`Via` の `path`) に出てくる紐。 engine が Ref 型かを検証する用。
     pub fn ref_himos(&self) -> Vec<u16> {
         let mut out = Vec::new();
-        let mut p = self;
-        while let LivePred::Via { path, pred } = p {
-            out.extend_from_slice(path);
-            p = pred;
-        }
+        self.collect_ref_himos(&mut out);
         out
     }
+
+    fn collect_ref_himos(&self, out: &mut Vec<u16>) {
+        match self {
+            LivePred::Via { path, pred } => {
+                out.extend_from_slice(path);
+                pred.collect_ref_himos(out);
+            }
+            LivePred::Or(branches) => {
+                for p in branches.iter().flatten() {
+                    p.collect_ref_himos(out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 条件 (AND) を `Or` の無い AND の OR (枝) に展開する。 `Via` の中の `Or` は外に出す
+/// (`Via(p, a OR b)` = `Via(p, a) OR Via(p, b)`)。
+pub(crate) fn dnf(preds: Vec<LivePred>) -> Result<Vec<Vec<LivePred>>, String> {
+    let mut out: Vec<Vec<LivePred>> = vec![Vec::new()];
+    for p in preds {
+        let alts = alternatives(p)?;
+        let mut next = Vec::with_capacity(out.len() * alts.len());
+        for base in &out {
+            for alt in &alts {
+                let mut b = base.clone();
+                b.extend(alt.iter().cloned());
+                next.push(b);
+            }
+        }
+        if next.len() > MAX_BRANCHES {
+            return Err(format!("Or expands to more than {MAX_BRANCHES} branches"));
+        }
+        out = next;
+    }
+    Ok(out)
+}
+
+/// 条件 1 個の選択肢 (それぞれ AND)。
+fn alternatives(p: LivePred) -> Result<Vec<Vec<LivePred>>, String> {
+    Ok(match p {
+        LivePred::Or(branches) => {
+            if branches.is_empty() {
+                return Err("Or with no branches".into());
+            }
+            let mut out = Vec::new();
+            for b in branches {
+                if b.is_empty() {
+                    return Err("Or with an empty branch".into());
+                }
+                out.extend(dnf(b)?);
+                if out.len() > MAX_BRANCHES {
+                    return Err(format!("Or expands to more than {MAX_BRANCHES} branches"));
+                }
+            }
+            out
+        }
+        LivePred::Via { path, pred } => alternatives(*pred)?
+            .into_iter()
+            .map(|conj| conj.into_iter().map(|q| LivePred::Via { path: path.clone(), pred: Box::new(q) }).collect())
+            .collect(),
+        leaf => vec![vec![leaf]],
+    })
 }
 
 /// [`LiveQuery::poll`] の戻り値。 前回 poll からの結果集合の差分。
@@ -1053,6 +1130,7 @@ fn flatten(p: LivePred, path: &mut Vec<u16>, out: &mut Vec<Flat>) {
             (t, Leaf::Fixed(Pred::In(himo_id, values)))
         }
         LivePred::Present { himo_id } => (vec![3, himo_id as u32], Leaf::Fixed(Pred::Present(himo_id))),
+        LivePred::Or(_) => unreachable!("Or は dnf で枝に展開してから flatten する"),
     };
     let mut sig = Vec::with_capacity(1 + path.len() + tail.len());
     sig.push(path.len() as u32);
@@ -1216,16 +1294,15 @@ struct Member {
     changed: Marks,
     /// family の `ready` に載っているか。
     queued: bool,
+    /// `Or` の購読の枝なら、 その購読と枝の番号 (差分は呼び手でなくこちらに積む)。
+    union: Option<(std::sync::Weak<Union>, usize)>,
 }
 
 impl Member {
     /// 根の答えが `rec` の entity がこの member の集合に居るか。
     #[inline]
     fn has(&self, rec: Option<Ans>) -> bool {
-        match (self.root_key, rec) {
-            (Some(k), Some((id, v))) => k == id && self.range.is_none_or(|(lo, hi)| lo <= v && v <= hi),
-            _ => false,
-        }
+        Member::probe(self.root_key, self.range)(rec)
     }
 
     /// `eid` の出入りを記録し、 changed が空でなくなったら family の `ready` に載せる。
@@ -1243,35 +1320,51 @@ impl Member {
 
     /// changed を消費して差分を返し、 報告済みの集合を進める。 `root` = 根の答え。
     fn drain(&mut self, root: impl Fn(u32) -> Option<Ans>, peer: u32) -> LiveDelta {
-        let mut delta = LiveDelta::default();
         self.queued = false;
-        if self.changed.is_empty() {
-            return delta;
-        }
-        // changed も left も昇順なので、 left は突き合わせで引く
-        let left_set = self.left.take();
-        let mut li = 0;
-        for eid in self.changed.take() {
-            let now = self.has(root(eid));
-            let was = self.reported.get(eid);
-            while li < left_set.len() && left_set[li] < eid {
-                li += 1;
-            }
-            let left = left_set.get(li) == Some(&eid);
-            let e = enchudb_oplog::make_eid(peer, eid);
-            match (was, now) {
-                (false, true) => delta.added.push(e),
-                (true, false) => delta.removed.push(e),
-                (true, true) if left => {
-                    delta.removed.push(e);
-                    delta.added.push(e);
-                }
-                _ => {}
-            }
-            self.reported.put(eid, now);
-        }
-        delta
+        let (key, range) = (self.root_key, self.range);
+        let probe = Member::probe(key, range);
+        drain_marks(&mut self.changed, &mut self.left, &mut self.reported, |e| probe(root(e)), peer)
     }
+
+    /// `has` の、 member を借用しない版。
+    fn probe(key: Option<u32>, range: Option<(u32, u32)>) -> impl Fn(Option<Ans>) -> bool {
+        move |rec| match (key, rec) {
+            (Some(k), Some((id, v))) => k == id && range.is_none_or(|(lo, hi)| lo <= v && v <= hi),
+            _ => false,
+        }
+    }
+}
+
+/// changed を消費して差分を返し、 報告済みの集合を進める (member と `Or` の購読で共通)。
+/// `now(e)` = 今集合に居るか。 `left` に居る eid は、 報告済みで今も居ても 「出て入り直した」。
+fn drain_marks(changed: &mut Marks, left: &mut Marks, reported: &mut Bits, now: impl Fn(u32) -> bool, peer: u32) -> LiveDelta {
+    let mut delta = LiveDelta::default();
+    if changed.is_empty() {
+        return delta;
+    }
+    // changed も left も昇順なので、 left は突き合わせで引く
+    let left_set = left.take();
+    let mut li = 0;
+    for eid in changed.take() {
+        let now = now(eid);
+        let was = reported.get(eid);
+        while li < left_set.len() && left_set[li] < eid {
+            li += 1;
+        }
+        let left = left_set.get(li) == Some(&eid);
+        let e = enchudb_oplog::make_eid(peer, eid);
+        match (was, now) {
+            (false, true) => delta.added.push(e),
+            (true, false) => delta.removed.push(e),
+            (true, true) if left => {
+                delta.removed.push(e);
+                delta.added.push(e);
+            }
+            _ => {}
+        }
+        reported.put(eid, now);
+    }
+    delta
 }
 
 /// 節 `n` の記録 (`None` = 不明)。 範囲の値は `vals` に `v + 1` で持つ (0 = なし)。
@@ -1562,7 +1655,16 @@ impl Family {
         }
     }
 
-    fn add_member(&self, id: u64, key: Vec<HoleVal>) -> usize {
+    /// member `slot` に未 poll の変化がありうるか (評価しない)。
+    fn member_dirty(&self, slot: usize) -> bool {
+        if self.dirty.load(Ordering::Acquire) != 0 {
+            return true;
+        }
+        let s = self.settled.lock();
+        s.members[slot].as_ref().is_some_and(|m| !m.changed.is_empty() || s.dormant.contains(&slot))
+    }
+
+    fn add_member(&self, id: u64, key: Vec<HoleVal>, union: Option<(std::sync::Weak<Union>, usize)>) -> usize {
         let mut s = self.settled.lock();
         let m = Member {
             id,
@@ -1574,6 +1676,7 @@ impl Family {
             left: Marks::default(),
             changed: Marks::default(),
             queued: false,
+            union,
         };
         let slot = match s.members.iter().position(Option::is_none) {
             Some(i) => {
@@ -1949,8 +2052,16 @@ impl Family {
     }
 }
 
-/// 購読せずに条件を 1 回だけ評価する (`Engine::find_by`)。 候補を数えて全条件で評価するだけ。
-pub(crate) fn find_once(r: &impl CellReader, preds: Vec<LivePred>) -> Vec<u32> {
+/// 購読せずに条件を 1 回だけ評価する (`Engine::find_by`)。 枝 (`dnf` の結果) ごとに候補を
+/// 数えて全条件で評価し、 和を取る。
+pub(crate) fn find_once(r: &impl CellReader, branches: Vec<Vec<LivePred>>) -> Vec<u32> {
+    let mut out: Vec<u32> = branches.into_iter().flat_map(|b| find_branch(r, b)).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn find_branch(r: &impl CellReader, preds: Vec<LivePred>) -> Vec<u32> {
     let (sig, flats, key) = canonical(preds);
     let fam = Family::new(0, sig, flats);
     let Some(vals) = resolve(r, &key) else { return Vec::new() };
@@ -1970,6 +2081,7 @@ pub(crate) fn find_once(r: &impl CellReader, preds: Vec<LivePred>) -> Vec<u32> {
         left: Marks::default(),
         changed: Marks::default(),
         queued: false,
+        union: None,
     };
     let roots = fam.walk(r, &vals, range);
     roots.into_iter().filter(|&e| m.has(fam.eval(r, &s, 0, e))).collect()
@@ -1996,6 +2108,9 @@ pub(crate) struct LiveRegistry {
     snap: epoch::Atomic<Snapshot>,
     /// 登録・解除 (snapshot の作り直し) を 1 本ずつにする。
     edit: Mutex<()>,
+    /// 枝の差分を積んだが呼び手にまだ渡していない `Or` の購読 (`count` などが積んだ分。
+    /// `poll_all` が拾う)。
+    ready_unions: Mutex<Vec<Arc<Union>>>,
     next_id: AtomicUsize,
     next_member_id: std::sync::atomic::AtomicU64,
     /// poll が返す EntityId の peer prefix (`Engine::set_peer_id` が追従させる)。
@@ -2020,6 +2135,7 @@ impl LiveRegistry {
             active: AtomicUsize::new(0),
             snap: epoch::Atomic::null(),
             edit: Mutex::new(()),
+            ready_unions: Mutex::new(Vec::new()),
             next_id: AtomicUsize::new(0),
             next_member_id: std::sync::atomic::AtomicU64::new(0),
             peer: AtomicU32::new(peer),
@@ -2099,6 +2215,37 @@ impl LiveRegistry {
     ///
     /// `expand_always` (ablation / 計測用) の購読は、 同じ形でも既定の購読とは別の family になる。
     pub(crate) fn register(self: &Arc<Self>, preds: Vec<LivePred>, expand_always: bool) -> LiveQuery {
+        let id = self.next_member_id.fetch_add(1, Ordering::Relaxed);
+        let (family, slot) = self.register_member(id, preds, expand_always, None);
+        LiveQuery { kind: Kind::One { family, slot }, id, registry: self.clone() }
+    }
+
+    /// `Or` の購読を登録する: 枝 (AND) ごとに member を登録し、 枝の差分を積む [`Union`] に束ねる。
+    pub(crate) fn register_any(self: &Arc<Self>, branches: Vec<Vec<LivePred>>, expand_always: bool) -> LiveQuery {
+        let id = self.next_member_id.fetch_add(1, Ordering::Relaxed);
+        let n = branches.len();
+        let u = Arc::new_cyclic(|w| Union {
+            id,
+            branches: branches
+                .into_iter()
+                .enumerate()
+                .map(|(i, b)| {
+                    let bid = self.next_member_id.fetch_add(1, Ordering::Relaxed);
+                    self.register_member(bid, b, expand_always, Some((w.clone(), i)))
+                })
+                .collect(),
+            state: Mutex::new(UnionState::new(n)),
+        });
+        LiveQuery { kind: Kind::Any(u), id, registry: self.clone() }
+    }
+
+    fn register_member(
+        &self,
+        id: u64,
+        preds: Vec<LivePred>,
+        expand_always: bool,
+        union: Option<(std::sync::Weak<Union>, usize)>,
+    ) -> (Arc<Family>, usize) {
         let (mut sig, flats, key) = canonical(preds);
         sig.insert(0, expand_always as u32);
         let _edit = self.edit.lock();
@@ -2123,9 +2270,8 @@ impl LiveRegistry {
                 f
             }
         };
-        let id = self.next_member_id.fetch_add(1, Ordering::Relaxed);
-        let slot = family.add_member(id, key);
-        LiveQuery { family, slot, id, registry: self.clone() }
+        let slot = family.add_member(id, key, union);
+        (family, slot)
     }
 
     /// 前回の poll から出入りのあった全購読の差分 (`(LiveQuery::id, 差分)`、 id 昇順)。 各購読の
@@ -2135,17 +2281,39 @@ impl LiveRegistry {
         let peer = self.peer.load(Ordering::Acquire);
         let fams = self.families();
         let mut out = Vec::new();
+        // `Or` の枝の差分 (呼び手でなく枝の購読に積む)
+        let mut branch: Vec<(Arc<Union>, usize, LiveDelta)> = Vec::new();
         for f in fams {
             let mut guard = f.settled.lock();
             f.settle(r, &mut guard);
             let Settled { recs, vals, members, ready, .. } = &mut *guard;
             for slot in std::mem::take(ready) {
                 if let Some(m) = members[slot].as_mut() {
-                    let d = m.drain(|e| root_at(recs, vals, e), peer);
-                    if !d.is_empty() {
-                        out.push((m.id, d));
+                    let union = m.union.as_ref().map(|(w, i)| (w.upgrade(), *i));
+                    let d = m.drain(|e| root_at(recs, vals, e), if union.is_some() { 0 } else { peer });
+                    match union {
+                        Some((Some(u), i)) if !d.is_empty() => branch.push((u, i, d)),
+                        Some(_) => {}
+                        None if !d.is_empty() => out.push((m.id, d)),
+                        None => {}
                     }
                 }
+            }
+        }
+        // family の lock を離してから Or の購読の lock を取る (Or 側は Or → family の順に取らない)
+        branch.extend(std::mem::take(&mut *self.ready_unions.lock()).into_iter().map(|u| (u, 0, LiveDelta::default())));
+        branch.sort_by_key(|(u, _, _)| u.id);
+        let mut i = 0;
+        while i < branch.len() {
+            let u = branch[i].0.clone();
+            let mut st = u.state.lock();
+            while i < branch.len() && branch[i].0.id == u.id {
+                st.absorb(branch[i].1, std::mem::take(&mut branch[i].2));
+                i += 1;
+            }
+            let d = st.drain(peer);
+            if !d.is_empty() {
+                out.push((u.id, d));
             }
         }
         out.sort_unstable_by_key(|(id, _)| *id);
@@ -2167,22 +2335,152 @@ impl LiveRegistry {
     }
 }
 
+/// `Or` の購読: 枝 (AND の購読、 family の member) の差分を積んで、 どれかの枝に居る entity の
+/// 集合を持つ。 枝ごとに枝に居る entity を持ち、 どの枝にも居ない ↔ どれかに居る をまたいだら出入り。
+///
+/// 枝の差分は枝の member の報告状態として 1 回だけ流れる (このこちら側で積む)。 同じ枝の差分に
+/// 同じ eid が removed と added の両方で来たら (枝で出て入り直した = slot 再利用など)、 この購読
+/// でも出て入り直したとして扱う。
+pub(crate) struct Union {
+    id: u64,
+    branches: Vec<(Arc<Family>, usize)>,
+    state: Mutex<UnionState>,
+}
+
+struct UnionState {
+    /// 枝ごと: 枝の報告状態で枝に居る entity (枝の差分を積んだもの)。 entity ごとの数を配列で
+    /// 持つと entity 空間の広さに比例する (結果が散らばると購読 1 本で page を全部確保する) —
+    /// 疎な集合を枝の数だけ持てば結果の大きさに比例する。
+    branches: Vec<Bits>,
+    /// どれかの枝に居る entity の数。
+    size: usize,
+    reported: Bits,
+    left: Marks,
+    changed: Marks,
+    /// `LiveRegistry::ready_unions` に載っているか。
+    queued: bool,
+}
+
+impl UnionState {
+    fn new(n: usize) -> Self {
+        UnionState {
+            branches: (0..n).map(|_| Bits::default()).collect(),
+            size: 0,
+            reported: Bits::default(),
+            left: Marks::default(),
+            changed: Marks::default(),
+            queued: false,
+        }
+    }
+
+    /// どれかの枝に居るか。
+    #[inline]
+    fn has(&self, e: u32) -> bool {
+        self.branches.iter().any(|b| b.get(e))
+    }
+
+    /// 枝 `b` の差分 (eid は local) を積む。
+    fn absorb(&mut self, b: usize, d: LiveDelta) {
+        let (mut ai, mut ri) = (0, 0);
+        // 同じ枝で removed と added の両方 = 出て入り直した (両方昇順)
+        while ai < d.added.len() && ri < d.removed.len() {
+            match d.added[ai].cmp(&d.removed[ri]) {
+                std::cmp::Ordering::Less => ai += 1,
+                std::cmp::Ordering::Greater => ri += 1,
+                std::cmp::Ordering::Equal => {
+                    self.left.add(d.added[ai] as u32);
+                    ai += 1;
+                    ri += 1;
+                }
+            }
+        }
+        for (list, on) in [(&d.removed, false), (&d.added, true)] {
+            for &e in list {
+                let e = e as u32;
+                let was = self.has(e);
+                self.branches[b].put(e, on);
+                let now = self.has(e);
+                if was != now {
+                    if now {
+                        self.size += 1;
+                    } else {
+                        self.size -= 1;
+                    }
+                }
+                self.changed.add(e);
+            }
+        }
+    }
+
+    fn drain(&mut self, peer: u32) -> LiveDelta {
+        self.queued = false;
+        let branches = &self.branches;
+        drain_marks(&mut self.changed, &mut self.left, &mut self.reported, |e| branches.iter().any(|b| b.get(e)), peer)
+    }
+
+    /// どれかの枝に居る entity (昇順)。
+    fn members(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = self.branches.iter().flat_map(|b| b.iter()).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
+impl Union {
+    /// 枝を全部 settle して差分を積む。 family の lock と自分の lock を同時に持たない
+    /// (`poll_all` は family → 自分 の順に取るので、 逆順に重ねると deadlock)。
+    fn settle(self: &Arc<Self>, r: &impl CellReader) -> parking_lot::MutexGuard<'_, UnionState> {
+        let mut ds = Vec::with_capacity(self.branches.len());
+        for (i, (f, slot)) in self.branches.iter().enumerate() {
+            let mut g = f.settled.lock();
+            f.settle(r, &mut g);
+            let Settled { recs, vals, members, .. } = &mut *g;
+            if let Some(m) = members[*slot].as_mut() {
+                ds.push((i, m.drain(|e| root_at(recs, vals, e), 0)));
+            }
+        }
+        let mut st = self.state.lock();
+        for (i, d) in ds {
+            st.absorb(i, d);
+        }
+        st
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.branches.iter().any(|(f, slot)| f.member_dirty(*slot)) || !self.state.lock().changed.is_empty()
+    }
+}
+
+enum Kind {
+    /// AND の購読 = family の member 1 つ。
+    One { family: Arc<Family>, slot: usize },
+    /// `Or` を含む購読。
+    Any(Arc<Union>),
+}
+
 /// 登録済みの live query。 drop で購読解除。
 ///
 /// 評価は engine の索引を引くので、 読み出し系 (`poll` / `count` / `contains` / `members`)
 /// は購読した engine を引数に取る (schema 層の `LiveQuery` は engine を抱えていて引数不要)。
 /// engine を借用しないので struct に入れて持ち回れる。 `Send + Sync`。
 pub struct LiveQuery {
-    family: Arc<Family>,
-    slot: usize,
+    kind: Kind,
     id: u64,
     registry: Arc<LiveRegistry>,
 }
 
 impl LiveQuery {
+    fn parts(&self) -> Vec<(&Arc<Family>, usize)> {
+        match &self.kind {
+            Kind::One { family, slot } => vec![(family, *slot)],
+            Kind::Any(u) => u.branches.iter().map(|(f, s)| (f, *s)).collect(),
+        }
+    }
+
     /// 条件に出てくる全ての紐 (engine の barrier 用)。
     pub(crate) fn himos(&self) -> Vec<u16> {
-        let mut hs: Vec<u16> = self.family.routes.iter().map(|&(h, _)| h).collect();
+        let mut hs: Vec<u16> = self.parts().into_iter().flat_map(|(f, _)| f.routes.iter().map(|&(h, _)| h)).collect();
         hs.sort_unstable();
         hs.dedup();
         hs
@@ -2192,8 +2490,10 @@ impl LiveQuery {
     /// 根は、 barrier 後の書き込みなら印が、 barrier 前の書き込みなら候補の走査が拾っている。
     /// 呼ばなくても最初の poll が有効化する。
     pub(crate) fn seed(&self, r: &impl CellReader) {
-        let mut s = self.family.settled.lock();
-        self.family.activate(r, &mut s);
+        for (f, _) in self.parts() {
+            let mut s = f.settled.lock();
+            f.activate(r, &mut s);
+        }
     }
 
     fn check_engine(&self, r: &crate::engine::Engine) {
@@ -2218,16 +2518,21 @@ impl LiveQuery {
 
     pub(crate) fn poll_with(&self, r: &impl CellReader) -> LiveDelta {
         let peer = self.registry.peer.load(Ordering::Acquire);
-        let mut guard = self.family.settled.lock();
-        self.family.settle(r, &mut guard);
-        let Settled { recs, vals, members, .. } = &mut *guard;
-        match members[self.slot].as_mut() {
-            Some(m) => m.drain(|e| root_at(recs, vals, e), peer),
-            None => LiveDelta::default(),
+        match &self.kind {
+            Kind::One { family, slot } => {
+                let mut guard = family.settled.lock();
+                family.settle(r, &mut guard);
+                let Settled { recs, vals, members, .. } = &mut *guard;
+                match members[*slot].as_mut() {
+                    Some(m) => m.drain(|e| root_at(recs, vals, e), peer),
+                    None => LiveDelta::default(),
+                }
+            }
+            Kind::Any(u) => u.settle(r).drain(peer),
         }
     }
 
-    /// engine 内で一意な購読 id。 [`Engine::poll_live`](crate::engine::Engine::poll_live)(crate::engine::Engine::poll_live) の
+    /// engine 内で一意な購読 id。 [`Engine::poll_live`](crate::engine::Engine::poll_live) の
     /// 差分がどの購読のものかを表す。
     pub fn id(&self) -> u64 {
         self.id
@@ -2235,11 +2540,10 @@ impl LiveQuery {
 
     /// 未 poll の変化がありうるか (false なら `poll` は空を返す)。 評価はしないので軽い。
     pub fn is_dirty(&self) -> bool {
-        if self.family.dirty.load(Ordering::Acquire) != 0 {
-            return true;
+        match &self.kind {
+            Kind::One { family, slot } => family.member_dirty(*slot),
+            Kind::Any(u) => u.is_dirty(),
         }
-        let s = self.family.settled.lock();
-        s.members[self.slot].as_ref().is_some_and(|m| !m.changed.is_empty() || s.dormant.contains(&self.slot))
     }
 
     /// 現在の結果件数 (poll 済みかどうかに関係なく、 今 find したら返る件数)。 O(1)。 ただし
@@ -2250,9 +2554,13 @@ impl LiveQuery {
     }
 
     pub(crate) fn count_with(&self, r: &impl CellReader) -> usize {
-        let mut s = self.family.settled.lock();
-        self.family.settle(r, &mut s);
-        let Some(m) = s.members[self.slot].as_ref() else { return 0 };
+        let (family, slot) = match &self.kind {
+            Kind::One { family, slot } => (family, *slot),
+            Kind::Any(u) => return self.settle_union(u, r).size,
+        };
+        let mut s = family.settled.lock();
+        family.settle(r, &mut s);
+        let Some(m) = s.members[slot].as_ref() else { return 0 };
         let Some(k) = m.root_key else { return 0 };
         if m.range.is_some() {
             // 根の鍵を範囲の違う member と共有するので、 鍵ごとの件数は使えない
@@ -2261,21 +2569,43 @@ impl LiveQuery {
         s.keys.binary_search_by_key(&k, |x| x.id).map_or(0, |i| s.keys[i].count)
     }
 
+    /// `Or` の購読の枝を settle して積む。 積んだ差分は `poll_all` が拾えるように登録する。
+    fn settle_union<'u>(&self, u: &'u Arc<Union>, r: &impl CellReader) -> parking_lot::MutexGuard<'u, UnionState> {
+        let mut st = u.settle(r);
+        if !st.changed.is_empty() && !st.queued {
+            st.queued = true;
+            self.registry.ready_unions.lock().push(u.clone());
+        }
+        st
+    }
+
     /// `eid` が現在の結果に含まれるか。
     pub fn contains(&self, eng: &crate::engine::Engine, eid: EntityId) -> bool {
         self.check_engine(eng);
-        let mut s = self.family.settled.lock();
-        self.family.settle(eng, &mut s);
-        s.members[self.slot].as_ref().is_some_and(|m| m.has(s.root(enchudb_oplog::eid_local(eid))))
+        let e = enchudb_oplog::eid_local(eid);
+        let (family, slot) = match &self.kind {
+            Kind::One { family, slot } => (family, *slot),
+            Kind::Any(u) => return self.settle_union(u, eng).has(e),
+        };
+        let mut s = family.settled.lock();
+        family.settle(eng, &mut s);
+        s.members[slot].as_ref().is_some_and(|m| m.has(s.root(e)))
     }
 
     /// 現在の結果全体 (eid 昇順)。 poll の状態は変えない。
     pub fn members(&self, eng: &crate::engine::Engine) -> Vec<EntityId> {
         self.check_engine(eng);
         let peer = self.registry.peer.load(Ordering::Acquire);
-        let mut s = self.family.settled.lock();
-        self.family.settle(eng, &mut s);
-        let Some(m) = s.members[self.slot].as_ref() else { return Vec::new() };
+        let (family, slot) = match &self.kind {
+            Kind::One { family, slot } => (family, *slot),
+            Kind::Any(u) => {
+                let st = self.settle_union(u, eng);
+                return st.members().into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect();
+            }
+        };
+        let mut s = family.settled.lock();
+        family.settle(eng, &mut s);
+        let Some(m) = s.members[slot].as_ref() else { return Vec::new() };
         let Some(k) = m.root_key else { return Vec::new() };
         s.recs[0]
             .with_key(k)
@@ -2288,16 +2618,18 @@ impl LiveQuery {
 
 impl Drop for LiveQuery {
     fn drop(&mut self) {
-        self.registry.unregister(&self.family, self.slot);
+        for (f, slot) in self.parts() {
+            self.registry.unregister(f, slot);
+        }
     }
 }
 
 impl std::fmt::Debug for LiveQuery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LiveQuery").field("id", &self.id).field("nodes", &self.family.nodes.len()).finish()
+        let branches = self.parts().len();
+        f.debug_struct("LiveQuery").field("id", &self.id).field("branches", &branches).finish()
     }
 }
-
 
 // ─────────────────────────── 会社単位の購読 ───────────────────────────
 
@@ -2323,6 +2655,7 @@ pub(crate) fn split_grouped(preds: Vec<LivePred>) -> Result<(u16, Vec<LivePred>,
                 }
                 inner.push(if rest.is_empty() { *pred } else { LivePred::Via { path: rest.to_vec(), pred } });
             }
+            LivePred::Or(_) => return Err("grouped subscription does not support Or".into()),
             leaf => filter.push(leaf),
         }
     }
@@ -2342,7 +2675,7 @@ fn matches_leaf(r: &impl CellReader, p: &LivePred, e: u32) -> bool {
         LivePred::Range { himo_id, lo, hi } => matches!(r.cell(*himo_id, e), Some(v) if *lo <= v && v <= *hi),
         LivePred::In { himo_id, values } => matches!(r.cell(*himo_id, e), Some(v) if values.contains(&v)),
         LivePred::Present { himo_id } => r.cell(*himo_id, e).is_some(),
-        LivePred::Via { .. } => false,
+        LivePred::Via { .. } | LivePred::Or(_) => false,
     }
 }
 
@@ -2732,6 +3065,66 @@ mod tests {
         assert_eq!(b.poll_with(&f).removed, vec![1]);
         assert!(a.poll_with(&f).is_empty());
         assert_eq!((a.count_with(&f), b.count_with(&f)), (1, 0));
+    }
+
+    #[test]
+    fn dnf_distributes_via_and_multiplies() {
+        let eq = |h, v| LivePred::Eq { himo_id: h, value: v };
+        let or = |a, b| LivePred::Or(vec![vec![a], vec![b]]);
+        // Via(1, a OR b) AND (c OR d) = 4 枝、 Via は枝の中に配られる
+        let b = dnf(vec![LivePred::Via { path: vec![1], pred: Box::new(or(eq(2, 0), eq(2, 1))) }, or(eq(3, 0), eq(3, 1))]).unwrap();
+        assert_eq!(b.len(), 4);
+        assert!(b.iter().all(|c| c.len() == 2 && matches!(&c[0], LivePred::Via { path, pred } if path == &vec![1] && matches!(**pred, LivePred::Eq { himo_id: 2, .. }))));
+        // 7 個の OR (2 択) の AND = 128 枝 > 上限
+        assert!(dnf((0..7).map(|h| or(eq(h, 0), eq(h, 1))).collect()).is_err());
+        assert!(dnf((0..6).map(|h| or(eq(h, 0), eq(h, 1))).collect()).is_ok());
+        assert!(dnf(vec![LivePred::Or(vec![])]).is_err());
+        assert!(dnf(vec![LivePred::Or(vec![vec![]])]).is_err());
+    }
+
+    /// `Or`: 両方の枝に居る entity は片方から出ても残り、 両方から出たら出る。 差分は枝の id でなく
+    /// `Or` の購読の id で届き、 `count` が先に枝の差分を積んでも `poll_all` に届く。
+    #[test]
+    fn or_counts_rows_held_by_several_branches() {
+        let reg = Arc::new(LiveRegistry::new(0));
+        let f = Mutex::new(Fake::default());
+        let q = reg.register_any(
+            vec![vec![LivePred::Eq { himo_id: 0, value: 1 }], vec![LivePred::Eq { himo_id: 1, value: 1 }]],
+            false,
+        );
+        write(&reg, &f, 0, 7, Some(1));
+        write(&reg, &f, 1, 7, Some(1));
+        assert_eq!(q.poll_with(&f), LiveDelta { added: vec![7], removed: vec![] });
+        write(&reg, &f, 0, 7, Some(2));
+        assert!(q.poll_with(&f).is_empty(), "もう片方の枝に居るのに出た");
+        assert_eq!(q.count_with(&f), 1);
+        write(&reg, &f, 1, 7, None);
+        // count が枝の差分を積む → poll_all は Or の購読の id で返す (枝の id は出さない)
+        assert_eq!(q.count_with(&f), 0);
+        assert_eq!(reg.poll_all(&f), vec![(q.id(), LiveDelta { added: vec![], removed: vec![7] })]);
+        write(&reg, &f, 1, 8, Some(1));
+        assert_eq!(reg.poll_all(&f), vec![(q.id(), LiveDelta { added: vec![8], removed: vec![] })]);
+        assert!(q.poll_with(&f).is_empty());
+    }
+
+    /// `Or`: 報告済みの entity の slot が解放されて同じ eid で入り直したら removed + added
+    /// (枝がそう報告するのを、 枝の数が 1 のまま = 0 をまたがなくても伝える)。
+    #[test]
+    fn or_reports_reentry_of_freed_slot() {
+        let reg = Arc::new(LiveRegistry::new(0));
+        let f = Mutex::new(Fake::default());
+        let q = reg.register_any(
+            vec![vec![LivePred::Eq { himo_id: 0, value: 1 }], vec![LivePred::Eq { himo_id: 1, value: 1 }]],
+            false,
+        );
+        write(&reg, &f, 0, 3, Some(1));
+        assert_eq!(q.poll_with(&f).added, vec![3]);
+        write(&reg, &f, 0, 3, None);
+        reg.freed(3);
+        write(&reg, &f, 0, 3, Some(1));
+        assert_eq!(q.poll_with(&f), LiveDelta { added: vec![3], removed: vec![3] });
+        drop(q);
+        assert!(reg.families().is_empty());
     }
 
     /// `Bits` (roaring の疎 ↔ bitmap chunk、 roaring ↔ 平らな bitset の切り替え込み) が

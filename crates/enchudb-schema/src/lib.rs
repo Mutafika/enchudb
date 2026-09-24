@@ -1921,6 +1921,8 @@ enum Predicate {
     In(u16, Vec<u32>),
     /// ref 列を順にたどった先の table の列への条件 (`where_eq("company.city", ..)`)。
     Via(Vec<u16>, Box<Predicate>),
+    /// 枝 (条件の AND) のどれか (`Query::or`)。
+    Or(Vec<Vec<Predicate>>),
 }
 
 pub struct Query<'a> {
@@ -2025,6 +2027,25 @@ impl<'a> Query<'a> {
         self
     }
 
+    /// この条件 **または** `other` の条件 (同じ table への query)。 `a.or(b).where_eq(..)` は
+    /// `(a OR b) AND ..`。 find / count / subscribe のどれでも使える。 `limit` は `self` のものを使う。
+    ///
+    /// ```ignore
+    /// let q = users.where_eq("city", "Tokyo").or(users.where_gt("age", 60));
+    /// let live = q.subscribe()?;   // 東京在住 または 61 歳以上
+    /// ```
+    ///
+    /// 別の table の query を渡すと `find` / `subscribe` が `BadValue`。
+    pub fn or(mut self, other: Query<'a>) -> Self {
+        if !Arc::ptr_eq(&self.table, &other.table) {
+            self.preds = vec![Predicate::Or(Vec::new())];
+            return self;
+        }
+        let mine = std::mem::take(&mut self.preds);
+        self.preds.push(Predicate::Or(vec![mine, other.preds]));
+        self
+    }
+
     pub fn limit(mut self, n: usize) -> Self {
         self.limit = Some(n);
         self
@@ -2045,7 +2066,7 @@ impl<'a> Query<'a> {
 
         // ref をたどる条件 (`"company.city"`) を含むなら engine の live 条件評価に任せる
         // (候補を索引で引いて ref の逆引きで遡り、 全条件で評価)
-        if self.preds.iter().any(|p| matches!(p, Predicate::Via(..))) {
+        if self.preds.iter().any(|p| matches!(p, Predicate::Via(..) | Predicate::Or(_))) {
             let limit = self.limit;
             let Some(preds) = self.live_preds()? else { return Ok(Vec::new()) };
             let mut out = eng.find_by(preds).map_err(|e| SchemaError::Io(e.to_string()))?;
@@ -2081,7 +2102,7 @@ impl<'a> Query<'a> {
                 }
                 Predicate::Range { himo_name, lo, hi } => range_preds.push((himo_name, lo, hi)),
                 Predicate::Cmp { himo_name, op, against } => cmp_preds.push((himo_name, op, against)),
-                Predicate::Via(..) => unreachable!("Via は find の先頭で find_by に回している"),
+                Predicate::Via(..) | Predicate::Or(_) => unreachable!("Via / Or は find の先頭で find_by に回している"),
             }
         }
         if empty { return Ok(Vec::new()); }
@@ -2223,7 +2244,7 @@ impl<'a> Query<'a> {
     fn live_preds(self) -> Result<Option<Vec<enchudb_engine::LivePred>>, SchemaError> {
         use enchudb_engine::LivePred;
         let eng = self.db.engine();
-        fn conv(eng: &Engine, p: Predicate) -> Result<Option<LivePred>, SchemaError> {
+        fn conv(eng: &Engine, p: Predicate, rep: Option<u16>) -> Result<Option<LivePred>, SchemaError> {
             let hid_of = |name: &str| -> Result<u16, SchemaError> {
                 eng.himo_id(name)
                     .map(|h| h as u16)
@@ -2250,28 +2271,48 @@ impl<'a> Query<'a> {
                     };
                     LivePred::Range { himo_id: hid_of(&himo_name)?, lo, hi }
                 }
-                Predicate::Via(path, inner) => match conv(eng, *inner)? {
+                Predicate::Via(path, inner) => match conv(eng, *inner, rep)? {
                     Some(pred) => LivePred::Via { path, pred: Box::new(pred) },
                     None => return Ok(None),
                 },
+                Predicate::Or(branches) => {
+                    if branches.is_empty() {
+                        return Err(SchemaError::BadValue("or: queries on different tables".into()));
+                    }
+                    // 常に 0 件になる枝 (未知の列など) は落とす。 全部落ちたら全体が 0 件
+                    let mut out = Vec::new();
+                    for b in branches {
+                        if let Some(conj) = conv_all(eng, b, rep)? {
+                            out.push(conj);
+                        }
+                    }
+                    if out.is_empty() {
+                        return Ok(None);
+                    }
+                    LivePred::Or(out)
+                }
             }))
         }
-        let mut preds = Vec::with_capacity(self.preds.len().max(1));
-        for p in self.preds {
-            match conv(eng, p)? {
-                Some(lp) => preds.push(lp),
-                None => return Ok(None),
+        /// AND 1 つ分。 `None` = 常に 0 件。 条件なし (`.all()`) は table の全 row = 代表列を持つ row。
+        fn conv_all(eng: &Engine, preds: Vec<Predicate>, rep: Option<u16>) -> Result<Option<Vec<LivePred>>, SchemaError> {
+            let mut out = Vec::with_capacity(preds.len().max(1));
+            for p in preds {
+                match conv(eng, p, rep)? {
+                    Some(lp) => out.push(lp),
+                    None => return Ok(None),
+                }
             }
+            if out.is_empty() {
+                let rep = rep.ok_or_else(|| SchemaError::BadValue("subscribe: table has no columns".into()))?;
+                out.push(LivePred::Present { himo_id: rep });
+            }
+            Ok(Some(out))
         }
-        if preds.is_empty() {
-            // `.all()` 系 — find() と同じ代表 column (PK or 先頭列) を持つ全 row
-            let rep = self.table.pk
-                .or_else(|| if self.table.cols.is_empty() { None } else { Some(0) })
-                .map(|i| self.table.cols[i].himo_id)
-                .ok_or_else(|| SchemaError::BadValue("subscribe: table has no columns".into()))?;
-            preds.push(LivePred::Present { himo_id: rep });
-        }
-        Ok(Some(preds))
+        // `.all()` 系 — find() と同じ代表 column (PK or 先頭列) を持つ全 row
+        let rep = self.table.pk
+            .or_else(|| if self.table.cols.is_empty() { None } else { Some(0) })
+            .map(|i| self.table.cols[i].himo_id);
+        conv_all(eng, self.preds, rep)
     }
 
     // ──── 0.8.10 (#43): Query 終端の集計 chain API ────

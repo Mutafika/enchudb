@@ -11432,10 +11432,12 @@ impl Engine {
         expand_always: bool,
     ) -> std::io::Result<crate::live::LiveQuery> {
         self.validate_live_preds(&preds)?;
+        let mut branches = crate::live::dnf(preds)
+            .map_err(|m| std::io::Error::new(std::io::ErrorKind::InvalidInput, m))?;
         // ref の逆引き索引 (Cylinder) は初めて引いた時に組まれる。 poll の展開は ref を逆に
         // たどるので、 ここで組んでおかないと 「最初にその ref の先が書き換わった poll」 が組む
         // 時間 (user 100 万で ~10 ms) を払う。 購読の登録時に払う方が読める
-        let mut refs: Vec<u16> = preds.iter().flat_map(|p| p.ref_himos()).collect();
+        let mut refs: Vec<u16> = branches.iter().flatten().flat_map(|p| p.ref_himos()).collect();
         refs.sort_unstable();
         refs.dedup();
         for h in refs {
@@ -11444,7 +11446,11 @@ impl Engine {
 
         // 登録手順 (順序が正しさの根拠、 `crate::live` module doc):
         // 1. route に載せる  2. 条件の全紐の write_lock で barrier  3. 初期候補に印
-        let q = self.live.register(preds, expand_always);
+        let q = if branches.len() == 1 {
+            self.live.register(branches.pop().unwrap_or_default(), expand_always)
+        } else {
+            self.live.register_any(branches, expand_always)
+        };
         for h in q.himos() {
             self.himos[h as usize].write_barrier();
         }
@@ -11482,8 +11488,10 @@ impl Engine {
         preds: Vec<crate::live::LivePred>,
     ) -> std::io::Result<Vec<enchudb_oplog::EntityId>> {
         self.validate_live_preds(&preds)?;
+        let branches = crate::live::dnf(preds)
+            .map_err(|m| std::io::Error::new(std::io::ErrorKind::InvalidInput, m))?;
         let peer = self.peer_id();
-        Ok(crate::live::find_once(self, preds)
+        Ok(crate::live::find_once(self, branches)
             .into_iter()
             .map(|e| enchudb_oplog::make_eid(peer, e))
             .collect())
