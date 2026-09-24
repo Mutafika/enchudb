@@ -11434,6 +11434,13 @@ impl Engine {
         self.validate_live_preds(&preds)?;
         let mut branches = crate::live::dnf(preds)
             .map_err(|m| std::io::Error::new(std::io::ErrorKind::InvalidInput, m))?;
+        let keys: usize = branches.iter().map(|b| crate::live::key_count(b)).fold(0, usize::saturating_add);
+        if keys > crate::live::MAX_KEYS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("In / Or expand to {keys} keys (max {})", crate::live::MAX_KEYS),
+            ));
+        }
         // ref の逆引き索引 (Cylinder) は初めて引いた時に組まれる。 poll の展開は ref を逆に
         // たどるので、 ここで組んでおかないと 「最初にその ref の先が書き換わった poll」 が組む
         // 時間 (user 100 万で ~10 ms) を払う。 購読の登録時に払う方が読める

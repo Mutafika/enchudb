@@ -483,11 +483,11 @@ fn new_kinds_under_concurrent_writes() {
         let mut n = 0u64;
         while t0.elapsed() < std::time::Duration::from_millis(40) {
             n += 1;
-            if n % 3 == 0 {
+            if n.is_multiple_of(3) {
                 // count / ranked が先に settle して積んだ分も poll_live に届く
                 let _ = (or.count(&eng), top.ranked(&eng), counts.total(&eng));
             }
-            if n % 2 == 0 {
+            if n.is_multiple_of(2) {
                 absorb(&mut seen, &eng);
             } else {
                 for (i, q) in qs.iter().enumerate() {

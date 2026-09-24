@@ -865,6 +865,26 @@ fn run_or(path: &str) {
                 Box::new(move || u.where_eq("city", a).or(u.where_eq("company.city", a))),
                 Box::new(move |e| is(home(e), a) || is(work(e), a)),
             ),
+            6 => {
+                let vs: Vec<u32> = (0..3).map(|_| rng.below(60) as u32).collect();
+                let v2 = vs.clone();
+                (
+                    format!("age IN {vs:?} OR city = {a}"),
+                    Box::new(move || u.where_in("age", &vs).or(u.where_eq("city", a))),
+                    Box::new(move |e| age(e).is_some_and(|x| v2.contains(&(x as u32))) || is(home(e), a)),
+                )
+            }
+            7 => {
+                let vs: Vec<u32> = (0..4).map(|_| rng.below(60) as u32).collect();
+                let x = rng.below(60) as u32;
+                let v2 = vs.clone();
+                (
+                    // 同じ形 (age の値の穴) = 鍵を複数持つ member 1 つ
+                    format!("age IN {vs:?} OR age = {x}"),
+                    Box::new(move || u.where_in("age", &vs).or(u.where_eq("age", x as i64))),
+                    Box::new(move |e| age(e).is_some_and(|y| v2.contains(&(y as u32)) || y == x as i64)),
+                )
+            }
             _ => (
                 format!("all OR city = {a}"),
                 Box::new(move || u.all().or(u.where_eq("city", a))),
@@ -874,7 +894,7 @@ fn run_or(path: &str) {
         let q = query().subscribe().unwrap();
         OSub { name, q, query, seen: BTreeSet::new(), oracle }
     };
-    let mut subs: Vec<OSub> = (0..30).map(|i| make(i % 6, &mut rng)).collect();
+    let mut subs: Vec<OSub> = (0..40).map(|i| make(i % 8, &mut rng)).collect();
 
     let check = |subs: &mut Vec<OSub>, users: &[u64], step: usize| {
         if step % 4 == 1 {
@@ -949,7 +969,7 @@ fn run_or(path: &str) {
         }
         if step % 5 == 0 {
             let i = rng.below(subs.len() as u64) as usize;
-            let kind = rng.below(6);
+            let kind = rng.below(8);
             subs[i] = make(kind, &mut rng);
         }
         if step % 3 == 0 {
