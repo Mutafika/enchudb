@@ -70,10 +70,10 @@ fn full_scan(eng: &Engine, max_eid: u64, f: &dyn Fn(&Engine, u64) -> bool) -> BT
 
 fn check(eng: &Engine, subs: &mut [Sub], max_eid: u64, step: usize) {
     for s in subs.iter_mut() {
-        integrate(&mut s.seen, s.q.poll());
+        integrate(&mut s.seen, s.q.poll(eng));
         let want = full_scan(eng, max_eid, &*s.oracle);
         assert_eq!(s.seen, want, "[{}] step {step}: 積分結果 != 全件走査", s.name);
-        assert_eq!(s.q.count(), want.len(), "[{}] step {step}: count", s.name);
+        assert_eq!(s.q.count(eng), want.len(), "[{}] step {step}: count", s.name);
     }
 }
 
@@ -230,13 +230,13 @@ fn reused_slot_is_reported_as_leave_and_reenter() {
     let e = eng.entity().unwrap();
     eng.tie(e, "age", 30);
     let q = eng.subscribe(vec![LivePred::Eq { himo_id: age, value: 30 }]).unwrap();
-    assert_eq!(q.poll().added, vec![e]);
+    assert_eq!(q.poll(&eng).added, vec![e]);
 
     eng.delete(e);
     let n = eng.entity().unwrap();
     assert_eq!(n, e, "前提: 容量 1 なら削除した slot が再利用される");
     eng.tie(n, "age", 30);
-    let d = q.poll();
+    let d = q.poll(&eng);
     assert_eq!(d.removed, vec![e]);
     assert_eq!(d.added, vec![e]);
     drop(q);
@@ -285,14 +285,14 @@ fn subscribe_while_writing_loses_nothing() {
         let q = eng.subscribe(vec![LivePred::Eq { himo_id: age, value: 1 }]).unwrap();
         let mut seen = BTreeSet::new();
         for _ in 0..5 {
-            integrate(&mut seen, q.poll());
+            integrate(&mut seen, q.poll(&eng));
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         for w in writers {
             w.join().unwrap();
         }
-        integrate(&mut seen, q.poll());
+        integrate(&mut seen, q.poll(&eng));
         let want: BTreeSet<u64> = eids.iter().copied().filter(|&e| eng.get(e, "age") == Some(1)).collect();
         assert_eq!(seen, want, "round {round}: 登録と並行した書き込みの取りこぼし");
     }
@@ -308,6 +308,91 @@ fn rejects_empty_and_unknown_himo() {
     eng.define_himo("age", ValueType::Number, 100);
     assert!(eng.subscribe(vec![]).is_err());
     assert!(eng.subscribe(vec![LivePred::Present { himo_id: 999 }]).is_err());
+    drop(eng);
+    cleanup(&path);
+}
+
+/// ref をたどる購読 (user → company → city) を、 hub の値の往復と ref の付け替えを並行で
+/// 書きながら poll し続け、 writer 停止後の積分 == 手でたどった結果を確かめる。
+///
+/// 「真偽の記録値を不明に戻す」 ルール (live.rs module doc) の **決定論の gate は
+/// `live::tests::concurrent_flip_and_back_is_not_swallowed`**。 これは実スレッドでの
+/// end-to-end の形を見る。 ルールを外すとこの test も落ちる (実測 release で 10 run 中 10 回。
+/// 行って戻る書き込みを 3 thread で回しているので、 実スレッド上でも競合は十分起きる)。
+#[test]
+fn via_subscription_under_concurrent_flips() {
+    let path = tmp_path("via_race");
+    cleanup(&path);
+    let mut eng = Engine::create_growable_opts(&path, GrowableOptions::default()).unwrap();
+    eng.define_himo("company", ValueType::Ref, 0);
+    eng.define_himo("city", ValueType::Number, 4);
+    let company = eng.himo_id("company").unwrap() as u16;
+    let city = eng.himo_id("city").unwrap() as u16;
+    let hubs: Vec<u64> = (0..8).map(|_| eng.entity().unwrap()).collect();
+    let users: Vec<u64> = (0..400).map(|_| eng.entity().unwrap()).collect();
+    for (i, &h) in hubs.iter().enumerate() {
+        eng.tie(h, "city", (i % 2) as u32);
+    }
+    for (i, &u) in users.iter().enumerate() {
+        eng.tie(u, "company", enchudb_oplog::eid_local(hubs[i % hubs.len()]));
+    }
+    let eng = Engine::concurrentize(eng);
+    let oracle = |eng: &Engine| -> BTreeSet<u64> {
+        users
+            .iter()
+            .copied()
+            .filter(|&u| {
+                let Some(c) = eng.get(u, "company") else { return false };
+                eng.get(enchudb_oplog::make_eid(eng.peer_id(), c), "city") == Some(1)
+            })
+            .collect()
+    };
+    let pred = || vec![LivePred::Via { path: vec![company], pred: Box::new(LivePred::Eq { himo_id: city, value: 1 }) }];
+
+    for round in 0..20u64 {
+        let fast = eng.subscribe(pred()).unwrap();
+        let naive = eng.subscribe_expand_always(pred()).unwrap();
+        let (mut seen_fast, mut seen_naive) = (BTreeSet::new(), BTreeSet::new());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0..3u64)
+            .map(|t| {
+                let eng = eng.clone();
+                let (hubs, users) = (hubs.clone(), users.clone());
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut rng = Rng(0xabcd_ef01_2345_6789 ^ (round * 3 + t + 1));
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let h = hubs[rng.below(hubs.len() as u64) as usize];
+                        if rng.below(3) == 0 {
+                            let u = users[rng.below(users.len() as u64) as usize];
+                            eng.tie_to(u, "company", enchudb_oplog::eid_local(h));
+                        } else {
+                            // 行って戻る: 1 → 0 → 1 を素早く
+                            eng.tie_to(h, "city", 0);
+                            eng.tie_to(h, "city", 1);
+                            if rng.below(2) == 0 {
+                                eng.tie_to(h, "city", 0);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_millis(40) {
+            integrate(&mut seen_fast, fast.poll(&eng));
+            integrate(&mut seen_naive, naive.poll(&eng));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for w in writers {
+            w.join().unwrap();
+        }
+        integrate(&mut seen_fast, fast.poll(&eng));
+        integrate(&mut seen_naive, naive.poll(&eng));
+        let want = oracle(&eng);
+        assert_eq!(seen_naive, want, "round {round}: 常に展開 != 手でたどった結果");
+        assert_eq!(seen_fast, want, "round {round}: 既定 (真偽が変わった時だけ展開) != 手でたどった結果");
+    }
     drop(eng);
     cleanup(&path);
 }

@@ -7063,7 +7063,7 @@ impl Engine {
                 self.free_leaf_cell(local, hid);
                 self.live_remove(hid, local);
             }
-            self.entities.free(local);
+            self.live_free(local);
             cleared += 1;
         }
         // 払い出し位置も戻す (= 空の table として始める)。
@@ -7931,16 +7931,24 @@ impl Engine {
     fn live_set(&self, hid: usize, local: u32, value: u32) -> bool {
         let ok = self.himos[hid].set(local, value);
         if ok {
-            self.live.touch(self, hid as u16, local);
+            self.live.touch(hid as u16, local);
         }
         ok
+    }
+
+    /// entity slot の解放 (live query 通知込み)。 `entities.free` を直に呼ばないこと —
+    /// 呼ぶと slot 再利用で別 entity になったことを live query が呼び手に伝えられない。
+    #[inline]
+    fn live_free(&self, local: u32) {
+        self.entities.free(local);
+        self.live.freed(local);
     }
 
     /// `live_set` の外す版。 `himos[..].remove` を直に呼ばないこと (同上)。
     #[inline]
     fn live_remove(&self, hid: usize, local: u32) {
         self.himos[hid].remove(local);
-        self.live.touch(self, hid as u16, local);
+        self.live.touch(hid as u16, local);
     }
 
     /// `set_cell` の local eid 版 (engine 内の write 経路用。 `check_writable` と
@@ -8248,7 +8256,7 @@ impl Engine {
                 // tombstone は durable、 cell も落ちきっているのに live 登録だけ
                 // 残った形 (= (2) と (3) の間で落ちた)。 slot を返す。
                 if repair {
-                    self.entities.free(local);
+                    self.live_free(local);
                 }
                 repaired += 1;
                 continue;
@@ -8294,7 +8302,7 @@ impl Engine {
             self.live_remove(hid, local);
         }
         if !survivor {
-            self.entities.free(local);
+            self.live_free(local);
         }
     }
 
@@ -11404,49 +11412,109 @@ impl Engine {
         &self,
         preds: Vec<crate::live::LivePred>,
     ) -> std::io::Result<crate::live::LiveQuery> {
-        use crate::live::LivePred;
+        self.subscribe_inner(preds, false)
+    }
+
+    /// ablation / 計測用: 根でない節で鍵 (真偽) が変わらなくても常に親へ展開する購読
+    /// (最適化を切った素朴版)。 結果は `subscribe` と同じで、 poll のコストだけが変わる。
+    /// 同じ条件の `subscribe` とは状態を共有しない。
+    #[doc(hidden)]
+    pub fn subscribe_expand_always(
+        &self,
+        preds: Vec<crate::live::LivePred>,
+    ) -> std::io::Result<crate::live::LiveQuery> {
+        self.subscribe_inner(preds, true)
+    }
+
+    fn subscribe_inner(
+        &self,
+        preds: Vec<crate::live::LivePred>,
+        expand_always: bool,
+    ) -> std::io::Result<crate::live::LiveQuery> {
+        self.validate_live_preds(&preds)?;
+        // ref の逆引き索引 (Cylinder) は初めて引いた時に組まれる。 poll の展開は ref を逆に
+        // たどるので、 ここで組んでおかないと 「最初にその ref の先が書き換わった poll」 が組む
+        // 時間 (user 100 万で ~10 ms) を払う。 購読の登録時に払う方が読める
+        let mut refs: Vec<u16> = preds.iter().flat_map(|p| p.ref_himos()).collect();
+        refs.sort_unstable();
+        refs.dedup();
+        for h in refs {
+            let _ = self.himos[h as usize].slice_len(0);
+        }
+
+        // 登録手順 (順序が正しさの根拠、 `crate::live` module doc):
+        // 1. route に載せる  2. 条件の全紐の write_lock で barrier  3. 初期候補に印
+        let q = self.live.register(preds, expand_always);
+        for h in q.himos() {
+            self.himos[h as usize].write_barrier();
+        }
+        q.seed(self);
+        Ok(q)
+    }
+
+    /// ref をたどる条件を **group (ref の 1 段目の先の entity) 単位** で購読する
+    /// ([`crate::live::GroupedLiveQuery`])。 差分は group の eid、 根 (社員など) は group から
+    /// 必要な時に逆引きする。 全ての `Via` が同じ ref 紐から始まること、 `Via` が 1 本以上あること。
+    /// `Via` 以外の条件は根への条件として `members` / `count` で絞る。
+    pub fn subscribe_grouped(
+        &self,
+        preds: Vec<crate::live::LivePred>,
+    ) -> std::io::Result<crate::live::GroupedLiveQuery> {
+        self.validate_live_preds(&preds)?;
+        let (via, inner, filter) = crate::live::split_grouped(preds)
+            .map_err(|m| std::io::Error::new(std::io::ErrorKind::InvalidInput, m))?;
+        let q = self.subscribe_inner(inner, false)?;
+        Ok(crate::live::GroupedLiveQuery::new(q, via, filter))
+    }
+
+    /// この engine の全購読について、 前回 poll から出入りのあったものだけの差分を返す
+    /// (`(LiveQuery::id, 差分)`、 id 昇順)。 購読を 1 本ずつ `poll` する代わりに使うと、 コストが
+    /// 購読の数でなく出入りの数に比例する (購読が数千本ある時向け)。 各購読の `poll` と報告
+    /// 状態を共有するので、 同じ差分はどちらか一方にだけ届く。
+    pub fn poll_live(&self) -> Vec<(u64, crate::live::LiveDelta)> {
+        self.live.poll_all(self)
+    }
+
+    /// `LivePred` の条件 (ref をたどる `Via` を含む) を **購読せずに 1 回だけ** 評価する。
+    /// 結果は eid 昇順、 形は `query_by_id` と同じ (peer prefix 付き)。 検証は `subscribe` と同じ。
+    pub fn find_by(
+        &self,
+        preds: Vec<crate::live::LivePred>,
+    ) -> std::io::Result<Vec<enchudb_oplog::EntityId>> {
+        self.validate_live_preds(&preds)?;
+        let peer = self.peer_id();
+        Ok(crate::live::find_once(self, preds)
+            .into_iter()
+            .map(|e| enchudb_oplog::make_eid(peer, e))
+            .collect())
+    }
+
+    fn validate_live_preds(&self, preds: &[crate::live::LivePred]) -> std::io::Result<()> {
+        let bad = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg);
         if preds.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "subscribe: preds is empty (use LivePred::Present for \"every entity with this himo\")",
+            return Err(bad(
+                "live preds are empty (use LivePred::Present for \"every entity with this himo\")".into(),
             ));
         }
         let himo_count = self.himos.len();
-        if let Some(p) = preds.iter().find(|p| p.himo_id() as usize >= himo_count) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("subscribe: unknown himo_id {}", p.himo_id()),
-            ));
-        }
-        // 初期集合の候補: index で引ける条件を優先 (Eq / EqText / In)、 無ければ
-        // Range / Present の himo を持つ全 entity。 候補は後で全条件で評価し直す。
-        let seed_pred = preds
-            .iter()
-            .find(|p| matches!(p, LivePred::Eq { .. } | LivePred::EqText { .. } | LivePred::In { .. }))
-            .or_else(|| preds.first())
-            .cloned()
-            .expect("preds is non-empty");
-
-        // 登録手順 (順序が正しさの根拠、 `crate::live` module doc):
-        // 1. route に載せる  2. 条件の各 himo の write_lock で barrier  3. 初期集合を走査
-        let q = self.live.register(preds);
-        for &h in q.himos() {
-            self.himos[h as usize].write_barrier();
-        }
-        let candidates: Vec<enchudb_oplog::EntityId> = match seed_pred {
-            LivePred::Eq { himo_id, value } => self.query_by_id(&[(himo_id, value)]),
-            LivePred::EqText { himo_id, text } => match self.vocab_id(&text) {
-                Some(vid) => self.query_by_id(&[(himo_id, vid)]),
-                // 誰もぶら下げていない文字列 = 今は 0 件 (以降は touch が拾う)
-                None => Vec::new(),
-            },
-            LivePred::In { himo_id, values } => self.pull_in_by_id(himo_id, &values),
-            LivePred::Range { himo_id, .. } | LivePred::Present { himo_id } => {
-                self.entities_with_himo(himo_id)
+        for p in preds {
+            if let Some(h) = p.himos().into_iter().find(|&h| h as usize >= himo_count) {
+                return Err(bad(format!("unknown himo_id {h}")));
             }
-        };
-        q.seed(self, candidates.into_iter().map(enchudb_oplog::eid_local));
-        Ok(q)
+            if let Some(h) = p
+                .ref_himos()
+                .into_iter()
+                .find(|&h| self.value_type_at(h as usize) != Some(ValueType::Ref))
+            {
+                return Err(bad(format!("Via path himo {h} is not a Ref himo")));
+            }
+        }
+        Ok(())
+    }
+
+    /// `LiveQuery` が 「購読した engine か」 を確かめる用。
+    pub(crate) fn live_registry(&self) -> &std::sync::Arc<crate::live::LiveRegistry> {
+        &self.live
     }
 
     /// schema 層用: himo_id を pre-resolve 済みの場合の高速 path。 名前 lookup を完全に skip。
@@ -12868,7 +12936,7 @@ impl Engine {
                     self.free_leaf_cell(eid, hid);
                     self.live_remove(hid, eid);
                 }
-                self.entities.free(eid);
+                self.live_free(eid);
             }
             Op::EntityCreated { local: _ } => {
                 // v4 (undo 廃止) 以降は no-op。 `entity()` で local slot は writer
@@ -13338,6 +13406,34 @@ impl crate::live::CellReader for Engine {
     }
     fn vocab_lookup(&self, text: &str) -> Option<u32> {
         self.vocab_id(text)
+    }
+    fn pull(&self, himo_id: u16, value: u32) -> Vec<u32> {
+        match self.himos.get(himo_id as usize) {
+            Some(h) => h.pull(value),
+            None => Vec::new(),
+        }
+    }
+    fn with_himo(&self, himo_id: u16) -> Vec<u32> {
+        match self.himos.get(himo_id as usize) {
+            Some(h) => h.entities_with_value(),
+            None => Vec::new(),
+        }
+    }
+    fn pull_len(&self, himo_id: u16, value: u32) -> usize {
+        self.himos.get(himo_id as usize).map_or(0, |h| h.slice_len(value))
+    }
+    fn pull_range(&self, himo_id: u16, lo: u32, hi: u32) -> Vec<u32> {
+        let Some(h) = self.himos.get(himo_id as usize) else { return Vec::new() };
+        if lo > hi {
+            return Vec::new();
+        }
+        // 狭い範囲は値ごとに引く。 広い範囲は入っている値を列挙して範囲内の値だけ引く
+        // (unique_values は churn 後の stale 値を含む上位集合、 pull が Column で確かめる)
+        if hi - lo < 4096 {
+            (lo..=hi).flat_map(|v| h.pull(v)).collect()
+        } else {
+            h.unique_values().into_iter().filter(|v| (lo..=hi).contains(v)).flat_map(|v| h.pull(v)).collect()
+        }
     }
 }
 
