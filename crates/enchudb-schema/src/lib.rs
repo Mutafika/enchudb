@@ -2302,7 +2302,10 @@ impl<'a> Query<'a> {
     ///   `where_gt` 系、 条件なし = table の全 row)。 まだ誰も書いていない文字列への
     ///   `where_eq` も、 後から書かれた時点で一致する
     ///
-    /// `limit` 付き、 または未知の列 / 型の合わない値の `where_eq` は `BadValue`
+    /// `order_by` + `limit` は先頭 k 件の購読 (差分は先頭 k 件への出入り、 並びは `ranked`)。
+    /// `where_in` / 枝が同じ形の `or` も使える (形の違う枝の `or` は `BadValue`)。
+    ///
+    /// `order_by` 無しの `limit`、 または未知の列 / 型の合わない値の `where_eq` は `BadValue`
     /// (`find()` なら常に 0 件になる条件 — 購読では書き間違いとして返す)。
     pub fn subscribe(self) -> Result<LiveQuery, SchemaError> {
         let order = self.order_col()?;

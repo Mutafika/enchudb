@@ -470,7 +470,10 @@ fn new_kinds_under_concurrent_writes() {
         let counts = eng.subscribe_counts(vec![LivePred::Present { himo_id: age }], vec![company], city).unwrap();
         let top = eng.subscribe_top(vec![LivePred::Present { himo_id: score }], vec![], score, false, 15).unwrap();
         let top_via = eng.subscribe_top(vec![LivePred::Present { himo_id: age }], vec![company], revenue, true, 20).unwrap();
-        let qs: [&LiveQuery; 5] = [&or, &range, &range_via, &top, &top_via];
+        let top_in = eng
+            .subscribe_top(vec![via(LivePred::In { himo_id: city, values: vec![0, 2] })], vec![], score, true, 10)
+            .unwrap();
+        let qs: [&LiveQuery; 6] = [&or, &range, &range_via, &top, &top_via, &top_in];
         let mut seen: Vec<BTreeSet<u64>> = vec![BTreeSet::new(); qs.len()];
         let mut groups: std::collections::BTreeMap<u32, u64> = Default::default();
         let absorb = |seen: &mut Vec<BTreeSet<u64>>, eng: &Engine| {
@@ -527,8 +530,9 @@ fn new_kinds_under_concurrent_writes() {
             set(&|e| rev_of(e).is_some_and(|r| (10..=30).contains(&r))),
             top_k(&|e| get(&eng, e, "score"), &|_| true, false, 15),
             top_k(&rev_of, &|e| get(&eng, e, "age").is_some(), true, 20),
+            top_k(&|e| get(&eng, e, "score"), &|e| matches!(city_of(e), Some(0 | 2)), true, 10),
         ];
-        let names = ["or", "range", "range via", "top", "top via"];
+        let names = ["or", "range", "range via", "top", "top via", "top in"];
         for i in 0..qs.len() {
             assert_eq!(seen[i], want[i], "round {round}: [{}] 積分 != 手で数えた結果", names[i]);
             assert_eq!(qs[i].count(&eng), want[i].len(), "round {round}: [{}] count", names[i]);

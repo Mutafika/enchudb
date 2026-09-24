@@ -104,12 +104,13 @@
 //! 並びの列も 「値を根まで運ぶ穴」 にし (値が変わるたびに運ぶ)、 根の鍵ごとに (並びの値, eid) の
 //! 順序 (`RootKey::order`、 降順は値を反転して昇順で持つ) を持つ。 購読ごとには k と **k 番目の
 //! 要素 (境界)** だけを持ち、 根が順序に入る / 出る時に境界の前後 1 つずつを出し入れする
-//! (`RootKey::order_insert` / `order_remove`、 O(log n))。 k の違う購読も同じ family・同じ順序を
-//! 共有する。 差分は普通の購読と同じく集合 (先頭 k 件) への出入り、 並びは `ranked`。
+//! (`order_insert` / `order_remove`、 O(log n))。 k の違う購読も同じ family・同じ順序を
+//! 共有する。 `In` / 同じ形の `Or` の購読は鍵を複数持ち、 境界は鍵たちの順序の和 (根の鍵は 1 つなので
+//! 素な和) の上で動かす (`OrderView`、 前後の 1 つ = 鍵ごとの前後の最小 / 最大)。 差分は普通の購読と同じく集合 (先頭 k 件) への出入り、 並びは `ranked`。
 //! 並びの列に値の無い entity は入らない。 並びの列が ref の先なら、 根は 1 段目の先 (会社) を記録し、
 //! 順序は 「会社を値の順に並べ、 会社ごとに根を eid の順に持つ」 塊 (`OrderIndex::Blocks`、 全体の
 //! 順序は (値, eid) のまま)。 会社の値が変わったら塊を付け替え、 境界を 「上位に居た / 入る配下の数」
-//! だけ動かす (`RootKey::move_block`) — 上位 k 件から遠い会社の変化は O(log)。
+//! だけ動かす (`move_block`) — 上位 k 件から遠い会社の変化は O(log)。
 //!
 //! # 状態の大きさ
 //!
@@ -1092,15 +1093,13 @@ impl Ivs {
 /// 値を固定した単一紐条件 (家族の形の一部)。
 enum Pred {
     Range(u16, u32, u32),
-    /// sort + dedup 済み。
-    In(u16, Vec<u32>),
     Present(u16),
 }
 
 impl Pred {
     fn himo(&self) -> u16 {
         match self {
-            Pred::Range(h, ..) | Pred::In(h, _) | Pred::Present(h) => *h,
+            Pred::Range(h, ..) | Pred::Present(h) => *h,
         }
     }
 
@@ -1108,7 +1107,6 @@ impl Pred {
     fn matches(&self, r: &impl CellReader, eid: u32) -> bool {
         match self {
             Pred::Range(h, lo, hi) => matches!(r.cell(*h, eid), Some(v) if *lo <= v && v <= *hi),
-            Pred::In(h, vs) => matches!(r.cell(*h, eid), Some(v) if vs.binary_search(&v).is_ok()),
             Pred::Present(h) => r.cell(*h, eid).is_some(),
         }
     }
@@ -1175,8 +1173,7 @@ fn flatten(p: LivePred, path: &mut Vec<u16>, out: &mut Vec<Flat>) {
         LivePred::EqText { himo_id, text } => (vec![0, himo_id as u32], Leaf::Hole(himo_id, HoleVal::Text(text))),
         // 範囲の穴。 2 本目以降は canonical が値を固定した条件に戻す
         LivePred::Range { himo_id, lo, hi } => (vec![1, himo_id as u32], Leaf::Hole(himo_id, HoleVal::Range(lo, hi))),
-        // 値の穴の選択肢 (`Eq` と同じ形 = `city = A` と `city IN (A, B)` は同じ family)。 集計と
-        // 上位 k 件の family では canonical が値を固定した条件に戻す
+        // 値の穴の選択肢 (`Eq` と同じ形 = `city = A` と `city IN (A, B)` は同じ family)
         LivePred::In { himo_id, mut values } => {
             values.sort_unstable();
             values.dedup();
@@ -1207,7 +1204,6 @@ fn canonical(preds: Vec<LivePred>, carry: Option<(Vec<u16>, u16, HoleVal)>) -> (
         flatten(p, &mut Vec::new(), &mut flats);
     }
     let grouped = carry.is_some();
-    let ordered = matches!(carry, Some((_, _, HoleVal::Order(_))));
     if let Some((path, h, hv)) = carry {
         let mut sig = vec![path.len() as u32];
         sig.extend(path.iter().map(|&x| x as u32));
@@ -1221,15 +1217,6 @@ fn canonical(preds: Vec<LivePred>, carry: Option<(Vec<u16>, u16, HoleVal)>) -> (
     flats.sort_by(order);
     let mut first = !grouped;
     for f in &mut flats {
-        // 上位 k 件の member は鍵を 1 つだけ持つ (順序は鍵ごと) — In は値を固定した条件に (集計は鍵を
-        // 複数持てる: 根の鍵は 1 つなので group の件数は鍵ごとの和)
-        if ordered && let Leaf::Hole(h, HoleVal::Ids(vs)) = &f.leaf {
-            let (h, vs) = (*h, vs.clone());
-            f.sig.truncate(1 + f.path.len());
-            f.sig.extend([2, h as u32, vs.len() as u32]);
-            f.sig.extend_from_slice(&vs);
-            f.leaf = Leaf::Fixed(Pred::In(h, vs));
-        }
         if let Leaf::Hole(h, HoleVal::Range(lo, hi)) = f.leaf {
             if !first {
                 f.sig.truncate(1 + f.path.len());
@@ -1247,6 +1234,32 @@ fn canonical(preds: Vec<LivePred>, carry: Option<(Vec<u16>, u16, HoleVal)>) -> (
     }
     let key = flats.iter().filter_map(|f| f.hole().cloned()).collect();
     (sig, flats, key)
+}
+
+/// 束ねた形: (形, 条件, 枝ごとの鍵の選択肢)。
+type Shape = (Vec<u32>, Vec<Flat>, Vec<Vec<HoleVal>>);
+
+/// 枝 (`Or` 展開済み) を運ぶ穴 `carry` 付きで 1 つの形に束ねる: (形, 条件, 枝ごとの鍵の選択肢)。
+/// 形の違う枝があれば Err (集計 / 上位 k 件は鍵を複数持つ 1 つの member にしかできない)。
+fn one_shape(
+    branches: Vec<Vec<LivePred>>,
+    carry: (Vec<u16>, u16, HoleVal),
+    what: &str,
+) -> Result<Shape, String> {
+    let mut shape: Option<(Vec<u32>, Vec<Flat>)> = None;
+    let mut alts = Vec::new();
+    for b in branches {
+        let (mut sig, flats, key) = canonical(b, Some(carry.clone()));
+        sig.insert(0, 0);
+        match &shape {
+            Some((s0, _)) if *s0 != sig => return Err(format!("{what}: Or branches must have the same shape")),
+            Some(_) => {}
+            None => shape = Some((sig, flats)),
+        }
+        alts.push(key);
+    }
+    let (sig, flats) = shape.ok_or(format!("{what}: no condition"))?;
+    Ok((sig, flats, alts))
 }
 
 /// 購読の木の節。 節 0 が根 (`x0`)。
@@ -1432,11 +1445,6 @@ impl Member {
     #[inline]
     fn has(&self, e: u32, rec: Option<Ans>) -> bool {
         Member::probe(&self.root_keys, self.range, self.topk.map(|t| (t, self.order_desc)))(e, rec)
-    }
-
-    /// 鍵を 1 つしか持たない member (集計 / 上位 k 件) の鍵。
-    fn key(&self) -> Option<u32> {
-        self.root_keys.first().copied()
     }
 
     /// `eid` の出入りを記録し、 changed が空でなくなったら family の `ready` に載せる。
@@ -1727,6 +1735,13 @@ impl OrderIndex {
         }
     }
 
+    fn first(&self) -> Option<(u32, u32)> {
+        match self {
+            OrderIndex::Flat(s) => s.first().copied(),
+            OrderIndex::Blocks(b) => b.first(),
+        }
+    }
+
     fn last(&self) -> Option<(u32, u32)> {
         match self {
             OrderIndex::Flat(s) => s.last().copied(),
@@ -1779,87 +1794,171 @@ impl RootKey {
         }
     }
 
-    /// 順序に `x` を足し、 各 member の境界を動かして出入りに印を付ける (`t` = 1 段目の先)。
-    fn order_insert(&mut self, x: (u32, u32), t: u32, members: &mut [Option<Member>], ready: &mut Vec<usize>) {
-        self.order.insert(x, t);
-        let len = self.order.len();
-        for &slot in &self.members {
-            let Some(m) = members[slot].as_mut() else { continue };
-            let Some(mut tk) = m.topk else { continue };
-            match tk.th {
-                // 入れる前は k 個未満 = x は入る。 k 個になったら境界 = 最後
-                None => {
-                    m.note(slot, ready, x.1, false);
-                    if len == tk.k {
-                        tk.th = self.order.last();
-                    }
-                }
-                // 境界より前に入ったら、 境界の要素が押し出され、 その 1 つ前が新しい境界
-                Some(th) if x < th => {
-                    m.note(slot, ready, x.1, false);
-                    m.note(slot, ready, th.1, false);
-                    tk.th = self.order.pred(th);
-                }
-                Some(_) => {}
-            }
-            m.topk = Some(tk);
+}
+
+/// member から見た順序: member の鍵たちの順序の和 (根の鍵は 1 つなので素な和)。 鍵 1 つならその順序。
+enum OrderView<'a> {
+    One(&'a OrderIndex),
+    Many(Vec<&'a OrderIndex>),
+}
+
+impl<'a> OrderView<'a> {
+    /// member `m` の順序 (鍵の無い member は空)。
+    fn of(keys: &'a [RootKey], m: &Member) -> OrderView<'a> {
+        OrderView::of_ids(keys, &m.root_keys)
+    }
+
+    /// 鍵 id `ids` の順序の和。
+    fn of_ids(keys: &'a [RootKey], ids: &[u32]) -> OrderView<'a> {
+        let find = |k: &u32| keys.binary_search_by_key(k, |x| x.id).ok().map(|i| &keys[i].order);
+        match ids {
+            [k] => match find(k) {
+                Some(o) => OrderView::One(o),
+                None => OrderView::Many(Vec::new()),
+            },
+            ks => OrderView::Many(ks.iter().filter_map(find).collect()),
         }
     }
 
-    /// 順序から `x` を外し、 各 member の境界を動かして出入りに印を付ける。
-    fn order_remove(&mut self, x: (u32, u32), t: u32, members: &mut [Option<Member>], ready: &mut Vec<usize>) {
-        if !self.order.remove(x, t) {
-            return;
-        }
-        for &slot in &self.members {
-            let Some(m) = members[slot].as_mut() else { continue };
-            let Some(mut tk) = m.topk else { continue };
-            match tk.th {
-                None => m.note(slot, ready, x.1, false),
-                // 境界以前が抜けたら、 境界の次が入って新しい境界 (次が無ければ k 個未満 = 全部)
-                Some(th) if x <= th => {
-                    m.note(slot, ready, x.1, false);
-                    let next = self.order.succ(th);
-                    if let Some(n) = next {
-                        m.note(slot, ready, n.1, false);
-                    }
-                    tk.th = next;
-                }
-                Some(_) => {}
-            }
-            m.topk = Some(tk);
+    fn len(&self) -> usize {
+        match self {
+            OrderView::One(o) => o.len(),
+            OrderView::Many(os) => os.iter().map(|o| o.len()).sum(),
         }
     }
 
-    /// 会社 `t` (`Blocks`) の値が `v1` → `v2` になった: 会社 1 つを付け替え、 各 member の境界を
-    /// 動かす。 触るのは上位 k 件に居た / 入る配下と境界の前後だけ (出力の数 × log)。 上位 k 件から
-    /// 遠い会社の変化は O(log)。
-    fn move_block(&mut self, t: u32, v1: u32, v2: u32, members: &mut [Option<Member>], ready: &mut Vec<usize>) {
-        let OrderIndex::Blocks(b) = &mut self.order else { return };
-        let Some(rows) = b.rows.remove(&t) else { return };
-        b.by_val.remove(&(v1, t));
-        b.len -= rows.len();
-        // 外す: 境界以前に居た c1 人が抜け、 境界が c1 個後ろへ
-        let le = |v: u32, th: (u32, u32)| {
-            if v < th.0 {
-                rows.len()
-            } else if v > th.0 {
-                0
-            } else {
-                rows.partition_point(|&e| e <= th.1)
+    fn first(&self) -> Option<(u32, u32)> {
+        match self {
+            OrderView::One(o) => o.first(),
+            OrderView::Many(os) => os.iter().filter_map(|o| o.first()).min(),
+        }
+    }
+
+    fn last(&self) -> Option<(u32, u32)> {
+        match self {
+            OrderView::One(o) => o.last(),
+            OrderView::Many(os) => os.iter().filter_map(|o| o.last()).max(),
+        }
+    }
+
+    fn succ(&self, x: (u32, u32)) -> Option<(u32, u32)> {
+        match self {
+            OrderView::One(o) => o.succ(x),
+            OrderView::Many(os) => os.iter().filter_map(|o| o.succ(x)).min(),
+        }
+    }
+
+    fn pred(&self, x: (u32, u32)) -> Option<(u32, u32)> {
+        match self {
+            OrderView::One(o) => o.pred(x),
+            OrderView::Many(os) => os.iter().filter_map(|o| o.pred(x)).max(),
+        }
+    }
+
+    /// 先頭 `k` 個。
+    fn first_k(&self, k: usize) -> Vec<(u32, u32)> {
+        if let OrderView::One(o) = self {
+            return o.first_k(k);
+        }
+        let mut out = Vec::with_capacity(k.min(self.len()));
+        let mut cur = self.first();
+        while let Some(x) = cur.filter(|_| out.len() < k) {
+            out.push(x);
+            cur = self.succ(x);
+        }
+        out
+    }
+}
+
+/// 鍵 `i` の順序に `x` を足し、 鍵の各 member の境界を動かして出入りに印を付ける (`t` = 1 段目の先)。
+fn order_insert(keys: &mut [RootKey], i: usize, x: (u32, u32), t: u32, members: &mut [Option<Member>], ready: &mut Vec<usize>) {
+    keys[i].order.insert(x, t);
+    let keys = &*keys;
+    for &slot in &keys[i].members {
+        let Some(m) = members[slot].as_mut() else { continue };
+        let Some(mut tk) = m.topk else { continue };
+        let view = OrderView::of(keys, m);
+        match tk.th {
+            // 入れる前は k 個未満 = x は入る。 k 個になったら境界 = 最後
+            None => {
+                m.note(slot, ready, x.1, false);
+                if view.len() == tk.k {
+                    tk.th = view.last();
+                }
             }
-        };
-        for &slot in &self.members {
+            // 境界より前に入ったら、 境界の要素が押し出され、 その 1 つ前が新しい境界
+            Some(th) if x < th => {
+                m.note(slot, ready, x.1, false);
+                m.note(slot, ready, th.1, false);
+                tk.th = view.pred(th);
+            }
+            Some(_) => {}
+        }
+        m.topk = Some(tk);
+    }
+}
+
+/// 鍵 `i` の順序から `x` を外し、 鍵の各 member の境界を動かして出入りに印を付ける。
+fn order_remove(keys: &mut [RootKey], i: usize, x: (u32, u32), t: u32, members: &mut [Option<Member>], ready: &mut Vec<usize>) {
+    if !keys[i].order.remove(x, t) {
+        return;
+    }
+    let keys = &*keys;
+    for &slot in &keys[i].members {
+        let Some(m) = members[slot].as_mut() else { continue };
+        let Some(mut tk) = m.topk else { continue };
+        match tk.th {
+            None => m.note(slot, ready, x.1, false),
+            // 境界以前が抜けたら、 境界の次が入って新しい境界 (次が無ければ k 個未満 = 全部)
+            Some(th) if x <= th => {
+                m.note(slot, ready, x.1, false);
+                let next = OrderView::of(keys, m).succ(th);
+                if let Some(n) = next {
+                    m.note(slot, ready, n.1, false);
+                }
+                tk.th = next;
+            }
+            Some(_) => {}
+        }
+        m.topk = Some(tk);
+    }
+}
+
+/// 鍵 `i` の会社 `t` (`Blocks`) の値が `v1` → `v2` になった: 会社 1 つを付け替え、 鍵の各 member の
+/// 境界を動かす。 触るのは上位 k 件に居た / 入る配下と境界の前後だけ (出力の数 × log)。 上位 k 件から
+/// 遠い会社の変化は O(log)。
+fn move_block(keys: &mut [RootKey], i: usize, t: u32, v1: u32, v2: u32, members: &mut [Option<Member>], ready: &mut Vec<usize>) {
+    let OrderIndex::Blocks(b) = &mut keys[i].order else { return };
+    let Some(rows) = b.rows.remove(&t) else { return };
+    b.by_val.remove(&(v1, t));
+    b.len -= rows.len();
+    // 外す: 境界以前に居た c1 人が抜け、 境界が c1 個後ろへ
+    let le = |v: u32, th: (u32, u32)| {
+        if v < th.0 {
+            rows.len()
+        } else if v > th.0 {
+            0
+        } else {
+            rows.partition_point(|&e| e <= th.1)
+        }
+    };
+    {
+        let keys = &*keys;
+        for &slot in &keys[i].members {
             let Some(m) = members[slot].as_mut() else { continue };
             let Some(mut tk) = m.topk else { continue };
             let Some(mut th) = tk.th else { continue }; // k 個未満 = 全部居る、 付け替えても変わらない
             let c1 = le(v1, th);
+            if c1 == 0 {
+                continue;
+            }
             for &e in &rows[..c1] {
                 m.note(slot, ready, e, false);
             }
+            let view = OrderView::of(keys, m);
             let mut next = Some(th);
             for _ in 0..c1 {
-                next = b.succ(th);
+                next = view.succ(th);
                 match next {
                     Some(n) => {
                         m.note(slot, ready, n.1, false);
@@ -1871,60 +1970,64 @@ impl RootKey {
             tk.th = next;
             m.topk = Some(tk);
         }
-        // 付ける: 境界より前に入る m 人が入り、 境界が m 個前へ (押し出された分が抜ける)
-        b.by_val.insert((v2, t));
-        b.len += rows.len();
-        let n = b.len;
-        let placed = rows.clone();
-        b.rows.insert(t, rows);
-        let lt = |v: u32, th: (u32, u32)| {
-            if v < th.0 {
-                placed.len()
-            } else if v > th.0 {
-                0
-            } else {
-                placed.partition_point(|&e| e < th.1)
-            }
-        };
-        for &slot in &self.members {
-            let Some(m) = members[slot].as_mut() else { continue };
-            let Some(mut tk) = m.topk else { continue };
-            match tk.th {
-                None => {
-                    // 付ける前は k 個未満: 全員入り、 k 個を超えたら k 番目より後が抜ける
-                    for &e in &placed {
-                        m.note(slot, ready, e, false);
-                    }
-                    if n >= tk.k {
-                        let first = self.order.first_k(tk.k);
-                        let th = first[tk.k - 1];
-                        let mut cur = self.order.succ(th);
-                        while let Some(x) = cur {
-                            m.note(slot, ready, x.1, false);
-                            cur = self.order.succ(x);
-                        }
-                        tk.th = Some(th);
-                    }
+    }
+    // 付ける: 境界より前に入る m 人が入り、 境界が m 個前へ (押し出された分が抜ける)
+    let OrderIndex::Blocks(b) = &mut keys[i].order else { return };
+    b.by_val.insert((v2, t));
+    b.len += rows.len();
+    let placed = rows.clone();
+    b.rows.insert(t, rows);
+    let lt = |v: u32, th: (u32, u32)| {
+        if v < th.0 {
+            placed.len()
+        } else if v > th.0 {
+            0
+        } else {
+            placed.partition_point(|&e| e < th.1)
+        }
+    };
+    let keys = &*keys;
+    for &slot in &keys[i].members {
+        let Some(m) = members[slot].as_mut() else { continue };
+        let Some(mut tk) = m.topk else { continue };
+        let view = OrderView::of(keys, m);
+        match tk.th {
+            None => {
+                // 付ける前は k 個未満: 全員入り、 k 個を超えたら k 番目より後が抜ける
+                for &e in &placed {
+                    m.note(slot, ready, e, false);
                 }
-                Some(mut th) => {
-                    let c2 = lt(v2, th);
-                    for &e in &placed[..c2] {
-                        m.note(slot, ready, e, false);
-                    }
-                    for _ in 0..c2 {
-                        m.note(slot, ready, th.1, false);
-                        match self.order.pred(th) {
-                            Some(p) => th = p,
-                            None => break,
-                        }
+                if view.len() >= tk.k {
+                    let first = view.first_k(tk.k);
+                    let th = first[tk.k - 1];
+                    let mut cur = view.succ(th);
+                    while let Some(x) = cur {
+                        m.note(slot, ready, x.1, false);
+                        cur = view.succ(x);
                     }
                     tk.th = Some(th);
                 }
             }
-            m.topk = Some(tk);
+            Some(mut th) => {
+                let c2 = lt(v2, th);
+                for &e in &placed[..c2] {
+                    m.note(slot, ready, e, false);
+                }
+                for _ in 0..c2 {
+                    m.note(slot, ready, th.1, false);
+                    match view.pred(th) {
+                        Some(p) => th = p,
+                        None => break,
+                    }
+                }
+                tk.th = Some(th);
+            }
         }
+        m.topk = Some(tk);
     }
+}
 
+impl RootKey {
     /// 範囲の索引を (無ければ作って) 返す。
     fn ivs(&mut self, members: &[Option<Member>]) -> &Ivs {
         self.ivs.get_or_insert_with(|| {
@@ -1983,10 +2086,9 @@ impl Settled {
             && let Ok(i) = keys.binary_search_by_key(&k, |x| x.id)
         {
             let tv = opart.get(&t).map_or(0, |p| p.v);
-            let rk = &mut keys[i];
-            rk.count -= 1;
-            rk.order_remove((order_val(tv, desc), eid), t, members, ready);
-            let gone = matches!(&rk.order, OrderIndex::Blocks(b) if !b.rows.contains_key(&t));
+            keys[i].count -= 1;
+            order_remove(keys, i, (order_val(tv, desc), eid), t, members, ready);
+            let gone = matches!(&keys[i].order, OrderIndex::Blocks(b) if !b.rows.contains_key(&t));
             if gone && let Some(p) = opart.get_mut(&t) {
                 p.keys.retain(|&x| x != k);
                 if p.keys.is_empty() {
@@ -2002,9 +2104,8 @@ impl Settled {
                 p.keys.push(k);
             }
             let tv = p.v;
-            let rk = &mut keys[i];
-            rk.count += 1;
-            rk.order_insert((order_val(tv, desc), eid), t, members, ready);
+            keys[i].count += 1;
+            order_insert(keys, i, (order_val(tv, desc), eid), t, members, ready);
         }
     }
 
@@ -2018,7 +2119,7 @@ impl Settled {
         let old = std::mem::replace(&mut p.v, v);
         for &k in &p.keys {
             if let Ok(i) = keys.binary_search_by_key(&k, |x| x.id) {
-                keys[i].move_block(t, order_val(old, desc), order_val(v, desc), members, ready);
+                move_block(keys, i, t, order_val(old, desc), order_val(v, desc), members, ready);
             }
         }
     }
@@ -2131,14 +2232,13 @@ impl Settled {
         if let RootMode::Ordered(desc) = mode {
             for (k, ans, enter) in [(iw, was, false), (inw, now, true)] {
                 let (Some(i), Some((_, v))) = (k, ans) else { continue };
-                let rk = &mut keys[i];
                 let x = (order_val(v, desc), eid);
                 if enter {
-                    rk.count += 1;
-                    rk.order_insert(x, 0, members, ready);
+                    keys[i].count += 1;
+                    order_insert(keys, i, x, 0, members, ready);
                 } else {
-                    rk.count -= 1;
-                    rk.order_remove(x, 0, members, ready);
+                    keys[i].count -= 1;
+                    order_remove(keys, i, x, 0, members, ready);
                 }
             }
             return;
@@ -2628,14 +2728,6 @@ impl Family {
                 Some((n, r.pull_range(h, lo, hi)))
             })
             .or_else(|| {
-                self.order.iter().rev().find_map(|&n| {
-                    self.nodes[n].local.iter().find_map(|p| match p {
-                        Pred::In(h, vs) => Some((n, vs.iter().flat_map(|&v| r.pull(*h, v)).collect())),
-                        _ => None,
-                    })
-                })
-            })
-            .or_else(|| {
                 self.order.iter().rev().find_map(|&n| self.nodes[n].local.first().map(|p| (n, r.with_himo(p.himo()))))
             });
         let Some((n, ents)) = pick else { return Vec::new() };
@@ -2802,12 +2894,14 @@ impl Family {
                 ts.dedup();
                 self.push_marks(c1, ts);
             }
-            if let Ok(i) = keys.binary_search_by_key(&id, |k| k.id) {
-                let first: Vec<(u32, u32)> = keys[i].order.first_k(tk.k);
-                tk.th = (first.len() == tk.k).then(|| first[tk.k - 1]);
-                for x in first {
-                    m.note(slot, ready, x.1, false);
-                }
+            // 鍵を複数持つ member (In / 同じ形の Or) は鍵たちの順序の和の先頭 k 個。 足す前の先頭 k 個から
+            // 押し出される分に印は要らない: 鍵を足すのは dormant の有効化 (settle の頭) だけで、 足す鍵の
+            // 順序が空でないのは同じ有効化で足す鍵 (他の購読が持つ鍵) の時だけ = 足す前の先頭 k 個の印は
+            // まだ poll されずに残っている (後から vocab に現れた text の鍵は必ず新しい鍵 = 順序は空)
+            let first = OrderView::of_ids(keys, &m.root_keys).first_k(tk.k);
+            tk.th = (first.len() == tk.k).then(|| first[tk.k - 1]);
+            for x in first {
+                m.note(slot, ready, x.1, false);
             }
         } else if !new_key {
             // 新しい鍵なら今その鍵の根は居ない — 候補を評価した時の遷移 (apply_root) が
@@ -3117,35 +3211,30 @@ impl LiveRegistry {
         LiveQuery { kind: Kind::One { family, slot }, id, registry: self.clone() }
     }
 
-    /// 上位 k 件の購読を登録する: `preds` の結果を `order` (ref の道 + 紐 + 降順か) で並べた先頭 `limit` 件。
-    pub(crate) fn register_top(self: &Arc<Self>, preds: Vec<LivePred>, order: (Vec<u16>, u16, bool), limit: usize) -> LiveQuery {
+    /// 上位 k 件の購読を登録する: `branches` (`Or` 展開済み) の結果を `order` (ref の道 + 紐 + 降順か)
+    /// で並べた先頭 `limit` 件。 枝は全部同じ形であること (鍵を複数持つ 1 つの member に束ね、 鍵たちの
+    /// 順序の和の先頭 k 個を持つ)。 形の違う枝があれば Err。
+    pub(crate) fn register_top(
+        self: &Arc<Self>,
+        branches: Vec<Vec<LivePred>>,
+        order: (Vec<u16>, u16, bool),
+        limit: usize,
+    ) -> Result<LiveQuery, String> {
+        let (sig, flats, alts) = one_shape(branches, (order.0, order.1, HoleVal::Order(order.2)), "subscribe_top")?;
         let id = self.next_member_id.fetch_add(1, Ordering::Relaxed);
-        let carry = (order.0, order.1, HoleVal::Order(order.2));
-        let (family, slot) = self.register_member(id, preds, Some(carry), false, None, Some(limit));
-        LiveQuery { kind: Kind::One { family, slot }, id, registry: self.clone() }
+        let (family, slot) = self.register_alts(id, sig, flats, alts, false, None, Some(limit));
+        Ok(LiveQuery { kind: Kind::One { family, slot }, id, registry: self.clone() })
     }
 
-    /// 集計の購読を登録する: `preds` の結果を `group` (ref の道 + 紐) の値ごとに数える。
-    /// 枝 (`Or` 展開済み) は全部同じ形であること (鍵を複数持つ 1 つの member に束ねる — 根の鍵は 1 つ
-    /// なので group の件数は鍵ごとの和)。 形の違う枝があれば Err。
+    /// 集計の購読を登録する: `branches` (`Or` 展開済み) の結果を `group` (ref の道 + 紐) の値ごとに
+    /// 数える。 枝は全部同じ形であること (鍵を複数持つ 1 つの member に束ねる — 根の鍵は 1 つなので
+    /// group の件数は鍵ごとの和)。 形の違う枝があれば Err。
     pub(crate) fn register_counts(
         self: &Arc<Self>,
         branches: Vec<Vec<LivePred>>,
         group: (Vec<u16>, u16),
     ) -> Result<LiveCounts, String> {
-        let mut shape: Option<(Vec<u32>, Vec<Flat>)> = None;
-        let mut alts = Vec::new();
-        for b in branches {
-            let (mut sig, flats, key) = canonical(b, Some((group.0.clone(), group.1, HoleVal::Group)));
-            sig.insert(0, 0);
-            match &shape {
-                Some((s0, _)) if *s0 != sig => return Err("subscribe_counts: Or branches must have the same shape".into()),
-                Some(_) => {}
-                None => shape = Some((sig, flats)),
-            }
-            alts.push(key);
-        }
-        let (sig, flats) = shape.ok_or("subscribe_counts: no condition")?;
+        let (sig, flats, alts) = one_shape(branches, (group.0, group.1, HoleVal::Group), "subscribe_counts")?;
         let id = self.next_member_id.fetch_add(1, Ordering::Relaxed);
         let (family, slot) = self.register_alts(id, sig, flats, alts, false, None, None);
         Ok(LiveCounts { family, slot, id, registry: self.clone() })
@@ -3530,7 +3619,7 @@ impl LiveQuery {
         let Some(m) = s.members[slot].as_ref() else { return 0 };
         let find = |k: &u32| s.keys.binary_search_by_key(k, |x| x.id).ok();
         if let Some(tk) = m.topk {
-            return m.key().and_then(|k| find(&k)).map_or(0, |i| s.keys[i].order.len().min(tk.k));
+            return OrderView::of(&s.keys, m).len().min(tk.k);
         }
         if m.range.is_some() {
             // 根の鍵を範囲の違う member と共有するので、 鍵ごとの件数は使えない
@@ -3548,19 +3637,16 @@ impl LiveQuery {
         let mut s = family.settled.lock();
         family.settle(eng, &mut s);
         let Some(m) = s.members[*slot].as_ref() else { return Vec::new() };
-        let (Some(k), Some(_)) = (m.key(), m.topk) else {
+        if m.topk.is_none() {
             drop(s);
             return self.members(eng);
-        };
-        Self::ranked_in(&s, m, k).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect()
+        }
+        Self::ranked_in(&s, m).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect()
     }
 
-    fn ranked_in(s: &Settled, m: &Member, k: u32) -> Vec<u32> {
+    fn ranked_in(s: &Settled, m: &Member) -> Vec<u32> {
         let Some(tk) = m.topk else { return Vec::new() };
-        match s.keys.binary_search_by_key(&k, |x| x.id) {
-            Ok(i) => s.keys[i].order.first_k(tk.k).into_iter().map(|x| x.1).collect(),
-            Err(_) => Vec::new(),
-        }
+        OrderView::of(&s.keys, m).first_k(tk.k).into_iter().map(|x| x.1).collect()
     }
 
     /// `Or` の購読の枝を settle して積む。 積んだ差分は `poll_all` が拾えるように登録する。
@@ -3600,8 +3686,8 @@ impl LiveQuery {
         let mut s = family.settled.lock();
         family.settle(eng, &mut s);
         let Some(m) = s.members[slot].as_ref() else { return Vec::new() };
-        if let (Some(k), Some(_)) = (m.key(), m.topk) {
-            let mut out: Vec<EntityId> = Self::ranked_in(&s, m, k).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect();
+        if m.topk.is_some() {
+            let mut out: Vec<EntityId> = Self::ranked_in(&s, m).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect();
             out.sort_unstable();
             return out;
         }

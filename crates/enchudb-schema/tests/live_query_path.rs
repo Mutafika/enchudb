@@ -1320,6 +1320,27 @@ fn run_top(path: &str) {
                 Box::new(revenue),
                 false,
             ),
+            4 => {
+                let vs: Vec<u32> = (0..1 + rng.below(4)).map(|_| rng.below(30) as u32).collect();
+                let set = vs.clone();
+                (
+                    format!("age in {vs:?} order by company.revenue limit {k}"),
+                    Box::new(move || u.where_in("age", &vs).order_by("company.revenue").limit(k)),
+                    Box::new(move |e| age(e).is_some_and(|v| set.contains(&(v as u32)))),
+                    Box::new(revenue),
+                    false,
+                )
+            }
+            5 => {
+                let b = cities[rng.below(3) as usize];
+                (
+                    format!("(company.city = {a} or company.city = {b}) order by age desc limit {k}"),
+                    Box::new(move || u.where_eq("company.city", a).or(u.where_eq("company.city", b)).order_by_desc("age").limit(k)),
+                    Box::new(move |e| work(e).is_some_and(|w| w == a || w == b)),
+                    Box::new(age),
+                    true,
+                )
+            }
             _ => (
                 format!("company.city = {a} order by company.revenue desc limit {k}"),
                 Box::new(move || u.where_eq("company.city", a).order_by_desc("company.revenue").limit(k)),
@@ -1331,7 +1352,9 @@ fn run_top(path: &str) {
         let q = query().subscribe().unwrap();
         TSub { name, q, query, seen: BTreeSet::new(), cond, key, desc, k }
     };
-    let mut subs: Vec<TSub> = (0..24).map(|i| make(i % 4, &mut rng)).collect();
+    let mut subs: Vec<TSub> = (0..30).map(|i| make(i % 6, &mut rng)).collect();
+    // 形の違う枝の Or は上位 k 件にできない
+    assert!(u.where_eq("city", "Tokyo").or(u.all().where_gt("age", 3)).order_by("age").limit(3).subscribe().is_err());
 
     let check = |subs: &mut Vec<TSub>, users: &[u64], step: usize| {
         if !step.is_multiple_of(2) {
@@ -1411,7 +1434,7 @@ fn run_top(path: &str) {
         }
         if step % 5 == 0 {
             let i = rng.below(subs.len() as u64) as usize;
-            let kind = rng.below(4);
+            let kind = rng.below(6);
             subs[i] = make(kind, &mut rng);
         }
         if step % 3 == 0 {

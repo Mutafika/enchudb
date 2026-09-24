@@ -11521,7 +11521,8 @@ impl Engine {
     /// 条件 `preds` に当てはまる entity を、 ref の道 `order_path` をたどった先の紐 `order_himo` の
     /// 値で並べた **先頭 `limit` 件** を購読する (live の `ORDER BY .. LIMIT`)。 差分は普通の購読と
     /// 同じく先頭 `limit` 件への出入り、 並びは [`LiveQuery::ranked`](crate::live::LiveQuery::ranked)。
-    /// 同じ値は eid の昇順。 並びの列に値の無い entity は入らない。 `Or` と `limit == 0` は `InvalidInput`。
+    /// 同じ値は eid の昇順。 並びの列に値の無い entity は入らない。 `In` / 枝が全部同じ形の `Or` は
+    /// 1 つの購読に束ねる (鍵ごとの順序の和の先頭 `limit` 件)。 形の違う枝の `Or` と `limit == 0` は `InvalidInput`。
     pub fn subscribe_top(
         &self,
         preds: Vec<crate::live::LivePred>,
@@ -11541,18 +11542,19 @@ impl Engine {
         if order_path.iter().any(|&h| self.value_type_at(h as usize) != Some(ValueType::Ref)) {
             return Err(bad("order path himo is not a Ref himo"));
         }
-        let mut branches = crate::live::dnf(preds).map_err(|m| bad(&m))?;
-        if branches.len() != 1 {
-            return Err(bad("subscribe_top does not support Or"));
+        let branches = crate::live::dnf(preds).map_err(|m| bad(&m))?;
+        let keys: usize = branches.iter().map(|b| crate::live::key_count(b)).fold(0, usize::saturating_add);
+        if keys > crate::live::MAX_KEYS {
+            return Err(bad("In / Or expand to too many keys"));
         }
-        let preds = branches.pop().unwrap_or_default();
-        let mut refs: Vec<u16> = preds.iter().flat_map(|p| p.ref_himos()).chain(order_path.iter().copied()).collect();
+        let mut refs: Vec<u16> =
+            branches.iter().flatten().flat_map(|p| p.ref_himos()).chain(order_path.iter().copied()).collect();
         refs.sort_unstable();
         refs.dedup();
         for h in refs {
             let _ = self.himos[h as usize].slice_len(0);
         }
-        let q = self.live.register_top(preds, (order_path, order_himo, desc), limit);
+        let q = self.live.register_top(branches, (order_path, order_himo, desc), limit).map_err(|m| bad(&m))?;
         for h in q.himos() {
             self.himos[h as usize].write_barrier();
         }
