@@ -1207,6 +1207,7 @@ fn canonical(preds: Vec<LivePred>, carry: Option<(Vec<u16>, u16, HoleVal)>) -> (
         flatten(p, &mut Vec::new(), &mut flats);
     }
     let grouped = carry.is_some();
+    let ordered = matches!(carry, Some((_, _, HoleVal::Order(_))));
     if let Some((path, h, hv)) = carry {
         let mut sig = vec![path.len() as u32];
         sig.extend(path.iter().map(|&x| x as u32));
@@ -1220,8 +1221,9 @@ fn canonical(preds: Vec<LivePred>, carry: Option<(Vec<u16>, u16, HoleVal)>) -> (
     flats.sort_by(order);
     let mut first = !grouped;
     for f in &mut flats {
-        // 集計 / 上位 k 件の member は鍵を 1 つだけ持つ (件数・順序は鍵ごと) — In は値を固定した条件に
-        if grouped && let Leaf::Hole(h, HoleVal::Ids(vs)) = &f.leaf {
+        // 上位 k 件の member は鍵を 1 つだけ持つ (順序は鍵ごと) — In は値を固定した条件に (集計は鍵を
+        // 複数持てる: 根の鍵は 1 つなので group の件数は鍵ごとの和)
+        if ordered && let Leaf::Hole(h, HoleVal::Ids(vs)) = &f.leaf {
             let (h, vs) = (*h, vs.clone());
             f.sig.truncate(1 + f.path.len());
             f.sig.extend([2, h as u32, vs.len() as u32]);
@@ -3124,10 +3126,29 @@ impl LiveRegistry {
     }
 
     /// 集計の購読を登録する: `preds` の結果を `group` (ref の道 + 紐) の値ごとに数える。
-    pub(crate) fn register_counts(self: &Arc<Self>, preds: Vec<LivePred>, group: (Vec<u16>, u16)) -> LiveCounts {
+    /// 枝 (`Or` 展開済み) は全部同じ形であること (鍵を複数持つ 1 つの member に束ねる — 根の鍵は 1 つ
+    /// なので group の件数は鍵ごとの和)。 形の違う枝があれば Err。
+    pub(crate) fn register_counts(
+        self: &Arc<Self>,
+        branches: Vec<Vec<LivePred>>,
+        group: (Vec<u16>, u16),
+    ) -> Result<LiveCounts, String> {
+        let mut shape: Option<(Vec<u32>, Vec<Flat>)> = None;
+        let mut alts = Vec::new();
+        for b in branches {
+            let (mut sig, flats, key) = canonical(b, Some((group.0.clone(), group.1, HoleVal::Group)));
+            sig.insert(0, 0);
+            match &shape {
+                Some((s0, _)) if *s0 != sig => return Err("subscribe_counts: Or branches must have the same shape".into()),
+                Some(_) => {}
+                None => shape = Some((sig, flats)),
+            }
+            alts.push(key);
+        }
+        let (sig, flats) = shape.ok_or("subscribe_counts: no condition")?;
         let id = self.next_member_id.fetch_add(1, Ordering::Relaxed);
-        let (family, slot) = self.register_member(id, preds, Some((group.0, group.1, HoleVal::Group)), false, None, None);
-        LiveCounts { family, slot, id, registry: self.clone() }
+        let (family, slot) = self.register_alts(id, sig, flats, alts, false, None, None);
+        Ok(LiveCounts { family, slot, id, registry: self.clone() })
     }
 
     /// `Or` の購読を登録する。 形 (と範囲の穴の範囲) が同じ枝は鍵を複数持つ 1 つの member に束ね
@@ -3654,9 +3675,21 @@ impl LiveCounts {
         let Settled { members, keys, .. } = &mut *guard;
         let Some(m) = members[self.slot].as_mut() else { return f(&mut GroupState::default(), &Default::default(), 0) };
         let empty = std::collections::BTreeMap::new();
-        let (groups, count) = match m.key().and_then(|k| keys.binary_search_by_key(&k, |x| x.id).ok()) {
-            Some(i) => (&keys[i].groups, keys[i].count),
-            None => (&empty, 0),
+        let mut merged;
+        let found: Vec<usize> = m.root_keys.iter().filter_map(|&k| keys.binary_search_by_key(&k, |x| x.id).ok()).collect();
+        // 鍵が 1 つならその件数を、 複数 (In / 同じ形の Or) なら鍵ごとの和 (根の鍵は 1 つ = 重複しない)
+        let (groups, count) = match found.as_slice() {
+            [] => (&empty, 0),
+            [i] => (&keys[*i].groups, keys[*i].count),
+            many => {
+                merged = std::collections::BTreeMap::new();
+                for &i in many {
+                    for (&v, &c) in &keys[i].groups {
+                        *merged.entry(v).or_insert(0) += c;
+                    }
+                }
+                (&merged, many.iter().map(|&i| keys[i].count).sum())
+            }
         };
         match m.grp.as_mut() {
             Some(g) => f(g, groups, count),

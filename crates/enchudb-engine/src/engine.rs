@@ -11482,7 +11482,7 @@ impl Engine {
 
     /// 条件 `preds` に当てはまる entity を、 ref の道 `group_path` をたどった先の紐 `group_himo` の
     /// 値ごとに数えた件数を購読する ([`crate::live::LiveCounts`])。 `group_path` が空なら根の紐。
-    /// `preds` に `Or` は不可 (`InvalidInput`)。
+    /// `Or` は枝が全部同じ形の時だけ (`city = A OR city = B`、 `In` と同じ)、 違えば `InvalidInput`。
     pub fn subscribe_counts(
         &self,
         preds: Vec<crate::live::LivePred>,
@@ -11497,19 +11497,20 @@ impl Engine {
         if group_path.iter().any(|&h| self.value_type_at(h as usize) != Some(ValueType::Ref)) {
             return Err(bad("group path himo is not a Ref himo"));
         }
-        let mut branches = crate::live::dnf(preds).map_err(|m| bad(&m))?;
-        if branches.len() != 1 {
-            return Err(bad("subscribe_counts does not support Or"));
+        let branches = crate::live::dnf(preds).map_err(|m| bad(&m))?;
+        let keys: usize = branches.iter().map(|b| crate::live::key_count(b)).fold(0, usize::saturating_add);
+        if keys > crate::live::MAX_KEYS {
+            return Err(bad("In / Or expand to too many keys"));
         }
-        let preds = branches.pop().unwrap_or_default();
-        let mut refs: Vec<u16> = preds.iter().flat_map(|p| p.ref_himos()).chain(group_path.iter().copied()).collect();
+        let mut refs: Vec<u16> =
+            branches.iter().flatten().flat_map(|p| p.ref_himos()).chain(group_path.iter().copied()).collect();
         refs.sort_unstable();
         refs.dedup();
         for h in refs {
             let _ = self.himos[h as usize].slice_len(0);
         }
         // 登録手順は subscribe と同じ (route → barrier → 初期候補)
-        let q = self.live.register_counts(preds, (group_path, group_himo));
+        let q = self.live.register_counts(branches, (group_path, group_himo)).map_err(|m| bad(&m))?;
         for h in q.himos() {
             self.himos[h as usize].write_barrier();
         }

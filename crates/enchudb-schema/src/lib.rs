@@ -2358,7 +2358,8 @@ impl<'a> Query<'a> {
     /// ```
     ///
     /// - `col` に値の無い row は数えない (NULL の group は無い)
-    /// - `col` が Leaf 列 (row ごとに固有の文字列)、 条件に `or` / `limit` がある時は `BadValue`
+    /// - `col` が Leaf 列 (row ごとに固有の文字列)、 `limit` 付き、 形の違う枝の `or` は `BadValue`
+    ///   (`where_in` や同じ形の `or` (`city = A OR city = B`) は可)
     pub fn subscribe_counts(self, col: &str) -> Result<LiveCounts, SchemaError> {
         if self.limit.is_some() {
             return Err(SchemaError::BadValue("subscribe_counts: limit is not supported".into()));
