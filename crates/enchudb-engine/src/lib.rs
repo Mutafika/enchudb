@@ -61,6 +61,7 @@ pub mod leaf_store;
 pub mod entity_set;
 pub mod cylinder;
 pub mod himo_store;
+pub mod sparse_runs;
 pub mod content_store;
 pub mod engine;
 pub mod query_lang;

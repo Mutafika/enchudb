@@ -351,7 +351,19 @@ impl HimoStore {
         if let Some((o, (len, live))) = stale {
             self.maybe_compact(o, len, live);
         }
+        if let Some(cyl) = cyl {
+            self.maybe_compact_sparse(cyl);
+        }
         true
+    }
+
+    /// sparse (大きな値の run) の古い entry が半分を超えたら Column 基準で組み直す。 write_lock 下・
+    /// Column 更新後に。 償却 O(1) / write (組み直すたびに古い entry は 0 に戻る)。
+    fn maybe_compact_sparse(&self, cyl: &LockFreeCylinder) {
+        if cyl.sparse_needs_compact() {
+            let col = self.col();
+            cyl.compact_sparse(|v, eid| stored_at(col, eid) == v + 1);
+        }
     }
 
     /// write_lock を 1 度取って離すだけ。 これより前に lock を離した書き込みは全て見える
@@ -372,6 +384,9 @@ impl HimoStore {
                 col.clear(eid);
                 if let Some((len, live)) = stale {
                     self.maybe_compact(o, len, live);
+                }
+                if let Some(cyl) = cyl {
+                    self.maybe_compact_sparse(cyl);
                 }
             }
         }
@@ -399,7 +414,10 @@ impl HimoStore {
             return;
         };
         let col = self.col();
-        for v in cyl.unique_values() {
+        if cyl.sparse_churned() {
+            cyl.compact_sparse(|v, eid| stored_at(col, eid) == v + 1);
+        }
+        for v in cyl.unique_values().into_iter().filter(|&v| v < crate::lockfree_cylinder::DENSE_CAP as u64) {
             // clean bucket (churn 痕なし) は組み直し不要 — 無条件 swap は巨大 himo で
             // write_lock の長期保持 + 旧 backing の epoch 滞留 (一時 ~2x RSS) を招く
             // (PR #103 レビュー)。write_lock 下なので flag 判定は正確。
@@ -410,9 +428,20 @@ impl HimoStore {
     }
 
     /// 現在の unique 値数 (live 基準、churn があっても正確 — request12)。
+    ///
+    /// dense (値 < `DENSE_CAP`) の分は O(1)。 大きな値 (`SparseRuns`) の分は値ごとの件数を持たないので、
+    /// Column と突き合わせて数える (O(大きな値の entry 数)) — 値の種類が多い列 (時刻 / 64 bit ID) で
+    /// 書き込みのたびに値ごとの数を保つより、 呼ばれた時に数える方が安い。
     pub fn unique_count(&self) -> u32 {
         self.ensure_cylinder_built();
-        self.cyl.unique_live()
+        let col = self.col();
+        let mut sparse = self.cyl.sparse_range(0, u64::MAX);
+        sparse.retain(|&(v, eid)| stored_at(col, eid) == v + 1);
+        let mut vals: Vec<u64> = sparse.into_iter().map(|p| p.0).collect();
+        vals.dedup(); // run ごとに値の順なので、 並べ直してから
+        vals.sort_unstable();
+        vals.dedup();
+        self.cyl.unique_live() + vals.len() as u32
     }
 
     // ──── 読む（Column 直読み、Cylinder 非依存）────
@@ -505,6 +534,9 @@ impl HimoStore {
         if let Some((o, (len, live))) = stale {
             self.maybe_compact(o, len, live);
         }
+        if let Some(cyl) = cyl {
+            self.maybe_compact_sparse(cyl);
+        }
     }
 
     // ──── 引く ────
@@ -551,6 +583,10 @@ impl HimoStore {
     /// 最小スライスを正しく選べる。
     pub fn slice_len(&self, value: impl CellValue) -> usize {
         let Some(value) = value.cell_value() else { return 0 };
+        if value >= crate::lockfree_cylinder::DENSE_CAP as u64 {
+            // 大きな値は件数を持たない: 引いて数える (値の種類が多い列では 1 値あたりの件数は小さい)
+            return self.pull(value).len();
+        }
         self.ensure_cylinder_built();
         self.cyl.slice_len_live(value)
     }
@@ -686,6 +722,71 @@ mod tests {
         let mut got = hs.pull(7);
         got.sort_unstable();
         assert_eq!(got, vec![0, 1, 3, 4], "build 後の write が index に入っていない");
+    }
+
+    fn make_store64(max_entities: u32) -> HimoStore {
+        let bytes = 16 + max_entities as usize * 8 + 64;
+        let buf: Box<[u8]> = vec![0u8; bytes].into_boxed_slice();
+        let ptr = Box::leak(buf).as_mut_ptr();
+        let region = unsafe { Region::new(ptr, bytes) };
+        HimoStore::init(region, ValueType::Number64, 0, max_entities)
+    }
+
+    /// 大きな値 (sparse run) と小さな値 (dense bucket) を混ぜた書き込み / 書き換え / 削除の後でも、
+    /// `pull` / `slice_len` / `unique_count` / `total` が Column の中身と一致する。 sparse の古い entry
+    /// が半分を超えるたびに組み直される (件数が膨らまない) こと。
+    #[test]
+    fn sparse_runs_stay_exact_under_churn() {
+        const N: u32 = 400;
+        let hs = make_store64(N);
+        let mut cells: Vec<Option<u64>> = vec![None; N as usize];
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let vals = [3u64, 9, crate::lockfree_cylinder::DENSE_CAP as u64 + 1, 1 << 33, 1 << 40, u64::MAX - 2];
+        let _ = hs.pull(0u32); // 索引を組んでから (以後 writer が維持する)
+        for step in 0..20_000 {
+            let e = (next() % N as u64) as u32;
+            match next() % 5 {
+                0 => {
+                    hs.remove(e);
+                    cells[e as usize] = None;
+                }
+                1 => {
+                    // restore: 別の値の stored 形式を書き戻す
+                    let v = vals[(next() % vals.len() as u64) as usize];
+                    hs.restore(e, v + 1);
+                    cells[e as usize] = Some(v);
+                }
+                _ => {
+                    let v = vals[(next() % vals.len() as u64) as usize];
+                    assert!(hs.set(e, v));
+                    cells[e as usize] = Some(v);
+                }
+            }
+            if step % 997 == 0 || step == 19_999 {
+                for &v in &vals {
+                    let want: Vec<u32> = (0..N).filter(|&i| cells[i as usize] == Some(v)).collect();
+                    // dense の bucket は verify が要らない時は追記順で返す (並びは約束しない)
+                    let mut got = hs.pull(v);
+                    got.sort_unstable();
+                    assert_eq!(got, want, "step {step}: pull {v}");
+                    assert_eq!(hs.slice_len(v), want.len(), "step {step}: slice_len {v}");
+                }
+                let distinct = vals.iter().filter(|&&v| cells.contains(&Some(v))).count();
+                assert_eq!(hs.unique_count() as usize, distinct, "step {step}: unique_count");
+                assert_eq!(hs.total(), cells.iter().filter(|c| c.is_some()).count(), "step {step}: total");
+            }
+        }
+        // 古い entry が溜まり続けていない (組み直しが効いている)
+        assert!(hs.cyl.sparse_range(0, u64::MAX).len() < 3 * N as usize, "sparse の entry が膨らんでいる");
+        hs.compact_now();
+        let live = cells.iter().filter(|c| c.is_some_and(|v| v >= crate::lockfree_cylinder::DENSE_CAP as u64)).count();
+        assert_eq!(hs.cyl.sparse_range(0, u64::MAX).len(), live, "compact_now 後に古い entry が残る");
     }
 
     /// 観測 API が観測対象を確保しない (#270)。
