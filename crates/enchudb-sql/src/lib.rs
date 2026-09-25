@@ -715,7 +715,11 @@ impl Database {
                     }
                     *n as u64
                 }
-                (SqlType::BigInt, Value::Integer(n)) => big_raw(*n)?,
+                // 列に入らない値 (i64::MAX) を持つ row は無い = マッチなし (エラーにしない)
+                (SqlType::BigInt, Value::Integer(n)) => match big_raw(*n) {
+                    Ok(raw) => raw,
+                    Err(_) => return Ok(Vec::new()),
+                },
                 (SqlType::Text, Value::Text(s)) => match self.eng.vocab_id(s) {
                     Some(id) => id as u64,
                     None => return Ok(Vec::new()), // 未知 vocab はマッチなし
@@ -1188,6 +1192,10 @@ mod tests {
             db.execute("INSERT INTO t VALUES (-9223372036854775808, 9223372036854775806, 7)").unwrap();
             db.execute("INSERT INTO t VALUES (3, -1, 0)").unwrap();
             assert!(db.execute("INSERT INTO t VALUES (4, 9223372036854775807, 0)").is_err(), "i64::MAX は入らない");
+            // 入らない値の検索はエラーでなく 0 件 (SQLite で動くクエリが落ちない)
+            assert_eq!(ints(&mut db, "SELECT id FROM t WHERE at = 9223372036854775807"), Vec::<i64>::new());
+            assert_eq!(ints(&mut db, "SELECT id FROM t WHERE id = 9223372036854775807"), Vec::<i64>::new());
+            db.execute("DELETE FROM t WHERE id = 9223372036854775807").unwrap();
             assert_eq!(ints(&mut db, "SELECT at FROM t WHERE id = -1"), vec![1_790_000_000_123]);
             assert_eq!(ints(&mut db, "SELECT id FROM t WHERE at > 1790000000000 ORDER BY at"), vec![-1, i64::MIN]);
             assert_eq!(ints(&mut db, "SELECT s FROM t WHERE s < 0"), vec![-5]);
