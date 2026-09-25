@@ -3586,6 +3586,346 @@ impl LiveUnder {
     }
 }
 
+// ─────────────────────────── 到達 (辺の table をたどる再帰) ───────────────────────────
+
+/// [`Query::reachable`] の戻り値。 辺の table をたどって届く row を引く / 購読する。
+pub struct ReachQuery<'a> {
+    rows: Query<'a>,
+    edges: Query<'a>,
+    src_col: String,
+    dst_col: String,
+    seeds: Query<'a>,
+}
+
+/// 到達の計画。
+struct ReachPlan {
+    /// 結果を絞る条件
+    filter: Vec<enchudb_engine::LivePred>,
+    /// seed の条件
+    seeds: Vec<enchudb_engine::LivePred>,
+    /// 辺の row の条件
+    edges: Vec<enchudb_engine::LivePred>,
+    /// 辺の (始点, 終点) の ref 列
+    src: u16,
+    dst: u16,
+}
+
+impl<'a> ReachQuery<'a> {
+    fn plan(self) -> Result<Option<ReachPlan>, SchemaError> {
+        let bad = |m: String| Err(SchemaError::BadValue(m));
+        let (rows, edges, seeds) = (self.rows, self.edges, self.seeds);
+        for q in [&rows, &edges, &seeds] {
+            if q.limit.is_some() || q.order.is_some() {
+                return bad("reachable: limit / order_by are not supported".into());
+            }
+        }
+        let t = &rows.table;
+        if !Arc::ptr_eq(t, &seeds.table) {
+            return bad(format!("reachable: seeds must be a query on {}", t.name));
+        }
+        let e = &edges.table;
+        let col = |name: &str| -> Result<u16, SchemaError> {
+            let cd = e.col(name).cloned();
+            let points = cd.as_ref().is_some_and(|c| c.ty == ColumnType::Ref)
+                && e.relations.iter().any(|r| r.from_col.eq_ignore_ascii_case(name) && r.to_table.eq_ignore_ascii_case(&t.name));
+            match cd.filter(|_| points) {
+                Some(c) => Ok(c.himo_id),
+                None => Err(SchemaError::BadValue(format!("reachable: {name} is not a ref column of {} pointing to {}", e.name, t.name))),
+            }
+        };
+        let (src, dst) = (col(&self.src_col)?, col(&self.dst_col)?);
+        let (Some(filter), Some(sd), Some(ed)) = (rows.live_preds()?, seeds.live_preds()?, edges.live_preds()?) else { return Ok(None) };
+        Ok(Some(ReachPlan { filter, seeds: sd, edges: ed, src, dst }))
+    }
+
+    /// 今届く row (昇順)。
+    pub fn find(self) -> Result<Vec<EntityId>, SchemaError> {
+        let eng = self.rows.db.arc_engine();
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let Some(p) = self.plan()? else { return Ok(Vec::new()) };
+        let peer = eng.peer_id();
+        let local = |e: EntityId| enchudb_oplog::eid_local(e);
+        let mut add = Vec::new();
+        for e in eng.find_by(p.edges).map_err(io)? {
+            if let (Some(s), Some(d)) = (eng.get_by_id(e, p.src), eng.get_by_id(e, p.dst)) {
+                add.push((s as u32, d as u32, local(e)));
+            }
+        }
+        let seeds: Vec<u32> = eng.find_by(p.seeds).map_err(io)?.into_iter().map(local).collect();
+        let mut g = Graph::default();
+        g.update(&[], &add, &[], &seeds);
+        let mut out: Vec<EntityId> =
+            eng.find_by(p.filter).map_err(io)?.into_iter().filter(|&e| g.reached(local(e))).map(|e| enchudb_oplog::make_eid(peer, local(e))).collect();
+        out.sort_unstable();
+        Ok(out)
+    }
+
+    /// 今届く row の数。
+    pub fn count(self) -> Result<usize, SchemaError> {
+        Ok(self.find()?.len())
+    }
+
+    /// 届く row の出入りを購読する。 初回 poll は登録時点の全部が `added`。 辺の row の出入り・付け替え、 seed の出入り、
+    /// この query の条件の変化で届く。
+    pub fn subscribe(self) -> Result<LiveReach, SchemaError> {
+        let eng = self.rows.db.arc_engine();
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let state = std::sync::Mutex::new(ReachState::default());
+        let Some(p) = self.plan()? else { return Ok(LiveReach { eng, live: None, state }) };
+        let src = eng.subscribe_keyed(p.edges.clone(), Vec::new(), p.src).map_err(io)?;
+        let dst = eng.subscribe_keyed(p.edges, Vec::new(), p.dst).map_err(io)?;
+        let seeds = eng.subscribe(p.seeds).map_err(io)?;
+        let filter = eng.subscribe(p.filter).map_err(io)?;
+        Ok(LiveReach { eng, live: Some(ReachLive { src, dst, seeds, filter }), state })
+    }
+}
+
+/// 辺 (始点, 終点, 辺の row) と seed、 届く row と、 その row を届かせている辺の始点 (支え)。 row は local eid。
+///
+/// 支えは seed か届く row で、 支えをたどると必ず seed に着く (支えの森、 輪にならない)。 seed 自身も、 辺をたどって
+/// 戻ってくれば届く。 支えを付け替える時は、 新しい支えから支えをたどって、 自分を通らずに seed に着くことを確かめる
+/// (たどる長さは支えの森の深さ、 探している row は支えを外してあるので、 自分を通る鎖は seed に着かない)。 辺を足しても、 既に届く row の支えは変えない。
+///
+/// 1 回の poll で、 辺と seed を消して足し (置くだけ)、 支えの辺が消えた row と外れた seed が支えていた row の支えを
+/// 外して探し直す: 元の支え → 入ってくる辺の始点の順に、 seed に着く支えを探す (付け替えた辺の新しい始点も候補、
+/// 見つかればその先は見ない)。 見つからない row は外し、 その row が支えていた row も探し直す。 最後に、 外した
+/// row のうち届く支えを持つもの・足した辺の先・入った seed の先から幅優先に広げる。
+#[derive(Default)]
+struct Graph {
+    out: std::collections::BTreeSet<(u32, u32, u32)>,
+    inn: std::collections::BTreeSet<(u32, u32, u32)>,
+    seed: std::collections::BTreeSet<u32>,
+    /// 届く row → 支え
+    sup: std::collections::BTreeMap<u32, u32>,
+    /// (支え, 支えられている row)
+    kids: std::collections::BTreeSet<(u32, u32)>,
+}
+
+impl Graph {
+    fn outs(&self, x: u32) -> impl Iterator<Item = u32> + '_ {
+        self.out.range((x, 0, 0)..=(x, u32::MAX, u32::MAX)).map(|t| t.1)
+    }
+
+    fn ins(&self, x: u32) -> impl Iterator<Item = u32> + '_ {
+        self.inn.range((x, 0, 0)..=(x, u32::MAX, u32::MAX)).map(|t| t.1)
+    }
+
+    fn reached(&self, x: u32) -> bool {
+        self.sup.contains_key(&x)
+    }
+
+    /// w から辺を出して届かせられるか (seed か、 届く row)。
+    fn source(&self, w: u32) -> bool {
+        self.seed.contains(&w) || self.sup.contains_key(&w)
+    }
+
+    /// w が支えになれるか: w から支えをたどって seed に着く。 支えを探している row (支えを外してある) を通る鎖は着かない
+    /// ので、 探している row 自身を通る鎖 (輪) も着かない。 鎖は輪にならないので必ず止まる。
+    fn chain_ok(&self, mut w: u32) -> bool {
+        loop {
+            if self.seed.contains(&w) {
+                return true;
+            }
+            match self.sup.get(&w) {
+                Some(&p) => w = p,
+                None => return false,
+            }
+        }
+    }
+
+    fn set_sup(&mut self, x: u32, w: u32) {
+        self.sup.insert(x, w);
+        self.kids.insert((w, x));
+    }
+
+    /// x の支えを外して `pending` に積む (支えていなければ何もしない)。
+    fn unhook(&mut self, x: u32, pending: &mut Vec<(u32, u32)>) {
+        if let Some(old) = self.sup.remove(&x) {
+            self.kids.remove(&(old, x));
+            pending.push((x, old));
+        }
+    }
+
+    /// 辺を `del` だけ消して `add` だけ足し、 seed を `unseed` だけ外して `seed` だけ入れる。 届くかが変わりうる row を返す。
+    fn update(&mut self, del: &[(u32, u32, u32)], add: &[(u32, u32, u32)], unseed: &[u32], seed: &[u32]) -> Vec<u32> {
+        // 1. 辺と seed を消して足す (置くだけ)。 支えの辺が消えた row と、 外れた seed が支えていた row を覚える
+        let mut roots: Vec<u32> = Vec::new();
+        for &(s, d, r) in del {
+            if self.out.remove(&(s, d, r)) {
+                self.inn.remove(&(d, s, r));
+                if self.sup.get(&d) == Some(&s) && self.out.range((s, d, 0)..=(s, d, u32::MAX)).next().is_none() {
+                    roots.push(d);
+                }
+            }
+        }
+        for &s in unseed {
+            if self.seed.remove(&s) {
+                roots.extend(self.kids.range((s, 0)..=(s, u32::MAX)).map(|k| k.1));
+            }
+        }
+        for &(s, d, r) in add {
+            if self.out.insert((s, d, r)) {
+                self.inn.insert((d, s, r));
+            }
+        }
+        let fresh: Vec<u32> = seed.iter().copied().filter(|&s| self.seed.insert(s)).collect();
+        // 2. 支えを探し直す (探している間は、 その row を通る鎖は seed に着かない)
+        let mut pending: Vec<(u32, u32)> = Vec::new();
+        for x in roots {
+            self.unhook(x, &mut pending);
+        }
+        let mut gone: Vec<u32> = Vec::new();
+        while let Some((x, old)) = pending.pop() {
+            let has_old = self.out.range((old, x, 0)..=(old, x, u32::MAX)).next().is_some();
+            let alt = if has_old && self.chain_ok(old) { Some(old) } else { self.ins(x).find(|&w| w != old && self.chain_ok(w)) };
+            match alt {
+                Some(w) => self.set_sup(x, w),
+                None => {
+                    gone.push(x);
+                    let kids: Vec<u32> = self.kids.range((x, 0)..=(x, u32::MAX)).map(|k| k.1).collect();
+                    for y in kids {
+                        self.unhook(y, &mut pending);
+                    }
+                }
+            }
+        }
+        // 3. 広げる: 外した row のうち届く支えを持つもの、 足した辺の先、 入った seed の先から (幅優先)
+        let mut queue: std::collections::VecDeque<(u32, u32)> = std::collections::VecDeque::new();
+        for &x in &gone {
+            if let Some(w) = self.ins(x).find(|&w| self.source(w)) {
+                queue.push_back((w, x));
+            }
+        }
+        for &(s, d, _) in add {
+            queue.push_back((s, d));
+        }
+        for &s in &fresh {
+            queue.extend(self.outs(s).map(|y| (s, y)));
+        }
+        let mut touched = gone;
+        while let Some((w, x)) = queue.pop_front() {
+            if self.reached(x) || !self.source(w) {
+                continue;
+            }
+            self.set_sup(x, w);
+            touched.push(x);
+            let next: Vec<u32> = self.outs(x).filter(|&y| !self.reached(y)).collect();
+            queue.extend(next.into_iter().map(|y| (x, y)));
+        }
+        touched
+    }
+}
+
+/// 到達の購読の元。
+struct ReachLive {
+    /// 辺の row の始点 / 終点の鍵付きの購読
+    src: enchudb_engine::LiveKeyed,
+    dst: enchudb_engine::LiveKeyed,
+    seeds: enchudb_engine::LiveQuery,
+    filter: enchudb_engine::LiveQuery,
+}
+
+/// 到達の購読の状態。
+#[derive(Default)]
+struct ReachState {
+    graph: Graph,
+    /// 辺の row → 始点 / 終点
+    src_of: std::collections::BTreeMap<u32, u32>,
+    dst_of: std::collections::BTreeMap<u32, u32>,
+    /// この query の条件を満たす row。
+    filt: std::collections::BTreeSet<u32>,
+    /// 最後に渡した row。
+    reported: std::collections::BTreeSet<u32>,
+}
+
+/// [`ReachQuery::subscribe`] の戻り値。 辺の table をたどって届く row の出入りを購読する。
+pub struct LiveReach {
+    eng: Arc<Engine>,
+    live: Option<ReachLive>,
+    state: std::sync::Mutex<ReachState>,
+}
+
+impl LiveReach {
+    /// 前回 poll からの差分 (昇順)。 同じ row が両方に居たら 「消えて、 別物として入り直した」。
+    pub fn poll(&self) -> LiveDelta {
+        use std::collections::BTreeSet;
+        let Some(lv) = &self.live else { return LiveDelta::default() };
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let ReachState { graph, src_of, dst_of, filt, reported } = &mut *st;
+        let peer = self.eng.peer_id();
+        let local = |e: EntityId| enchudb_oplog::eid_local(e);
+        let (dsrc, ddst, ds, df) = (lv.src.poll(&self.eng), lv.dst.poll(&self.eng), lv.seeds.poll(&self.eng), lv.filter.poll(&self.eng));
+        // 辺の row の (始点, 終点) の前後
+        let rows: BTreeSet<u32> = [&dsrc, &ddst].iter().flat_map(|k| k.removed.iter().chain(k.added.iter()).map(|x| local(x.0))).collect();
+        let before: Vec<(u32, Option<u32>, Option<u32>)> = rows.iter().map(|&r| (r, src_of.get(&r).copied(), dst_of.get(&r).copied())).collect();
+        for (k, map) in [(&dsrc, &mut *src_of), (&ddst, &mut *dst_of)] {
+            for (e, _) in &k.removed {
+                map.remove(&local(*e));
+            }
+            for &(e, v) in &k.added {
+                map.insert(local(e), v as u32);
+            }
+        }
+        let (mut del, mut add) = (Vec::new(), Vec::new());
+        for (r, s0, d0) in before {
+            let (s1, d1) = (src_of.get(&r).copied(), dst_of.get(&r).copied());
+            if (s0, d0) == (s1, d1) {
+                continue;
+            }
+            if let (Some(s), Some(d)) = (s0, d0) {
+                del.push((s, d, r));
+            }
+            if let (Some(s), Some(d)) = (s1, d1) {
+                add.push((s, d, r));
+            }
+        }
+        let unseed: Vec<u32> = ds.removed.iter().map(|&e| local(e)).collect();
+        let seed: Vec<u32> = ds.added.iter().map(|&e| local(e)).collect();
+        let mut touched = graph.update(&del, &add, &unseed, &seed);
+        // 入り直した row (eid の使い回し) は別物: 答えが同じでも出て入り直す
+        let rs: BTreeSet<EntityId> = df.removed.iter().copied().collect();
+        let reborn: BTreeSet<u32> = df.added.iter().filter(|e| rs.contains(e)).map(|&e| local(e)).collect();
+        for &e in &df.removed {
+            filt.remove(&local(e));
+            touched.push(local(e));
+        }
+        for &e in &df.added {
+            filt.insert(local(e));
+            touched.push(local(e));
+        }
+        touched.sort_unstable();
+        touched.dedup();
+        let mut d = LiveDelta::default();
+        for x in touched {
+            let now = graph.reached(x) && filt.contains(&x);
+            let was = reported.contains(&x);
+            let e = enchudb_oplog::make_eid(peer, x);
+            match (was, now) {
+                (false, true) => {
+                    reported.insert(x);
+                    d.added.push(e);
+                }
+                (true, false) => {
+                    reported.remove(&x);
+                    d.removed.push(e);
+                }
+                (true, true) if reborn.contains(&x) => {
+                    d.removed.push(e);
+                    d.added.push(e);
+                }
+                _ => {}
+            }
+        }
+        d
+    }
+}
+
+impl std::fmt::Debug for LiveReach {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveReach").finish_non_exhaustive()
+    }
+}
+
 impl std::fmt::Debug for LiveUnder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LiveUnder").finish_non_exhaustive()
@@ -3998,6 +4338,23 @@ impl<'a> Query<'a> {
     /// - 付け替え 1 回・seed の出入り 1 回のコストは階層の深さに比例 (配下の数によらない)
     pub fn above(self, ref_col: &str, seeds: Query<'a>) -> UnderQuery<'a> {
         UnderQuery { rows: self, seeds, ref_col: ref_col.to_string(), up: true }
+    }
+
+    /// 辺の table (`edges`、 始点 `src_col` と終点 `dst_col` がどちらもこの table を指す ref 列) を何本たどっても `seeds` の row から
+    /// 届く row のうち、 この query の条件を満たすもの (SQL の再帰 CTE でグラフをたどる形、 親が複数あってよい)。
+    ///
+    /// ```ignore
+    /// // Alice から follow を何段たどっても届く人
+    /// let q = users.all().reachable(follows.all(), "from", "to", users.where_eq("name", "Alice"));
+    /// let live = q.subscribe()?;   // follow の増減・付け替えで届く人が出入りする
+    /// ```
+    ///
+    /// - 辺は 1 本以上たどる (seed 自身は、 辺をたどって戻ってこなければ入らない)。 輪があってよい
+    /// - 辺の query の条件 (`follows.where_eq("kind", "friend")` など) を満たす辺だけをたどる。 たどる途中の row は
+    ///   この query の条件を問わない (条件は結果を絞るだけ)
+    /// - 辺が消えた時は支えを失った row の段だけを決め直す。 橋になっていた辺を消すと、 その先の全部を決め直す
+    pub fn reachable(self, edges: Query<'a>, src_col: &str, dst_col: &str, seeds: Query<'a>) -> ReachQuery<'a> {
+        ReachQuery { rows: self, edges, src_col: src_col.to_string(), dst_col: dst_col.to_string(), seeds }
     }
 
     /// この query の row と `other` (別の table への query) の row のうち、 この row の列 `my_col` の値と `other` の
