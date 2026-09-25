@@ -3107,6 +3107,246 @@ fn kept_ids(dl: &Keyed<u32>, dc: &Keyed<EntityId>) -> std::collections::BTreeSet
     out
 }
 
+// ─────────────────────────── 再帰 (階層の配下) ───────────────────────────
+
+/// [`Query::under`] の戻り値。 階層の配下の row を引く / 購読する。
+pub struct UnderQuery<'a> {
+    rows: Query<'a>,
+    seeds: Query<'a>,
+    ref_col: String,
+}
+
+/// 配下の計画: (結果を絞る条件, seed の条件, table の全 row の条件, ref 列)。
+type UnderPlan = (Vec<enchudb_engine::LivePred>, Vec<enchudb_engine::LivePred>, Vec<enchudb_engine::LivePred>, u16);
+
+impl<'a> UnderQuery<'a> {
+    fn plan(self) -> Result<Option<UnderPlan>, SchemaError> {
+        let bad = |m: String| Err(SchemaError::BadValue(m));
+        let (rows, seeds) = (self.rows, self.seeds);
+        if rows.limit.is_some() || rows.order.is_some() || seeds.limit.is_some() || seeds.order.is_some() {
+            return bad("under: limit / order_by are not supported".into());
+        }
+        if !Arc::ptr_eq(&rows.table, &seeds.table) {
+            return bad(format!("under: seeds must be a query on {}", rows.table.name));
+        }
+        let t = &rows.table;
+        let cd = t.col(&self.ref_col).cloned();
+        let points = cd.as_ref().is_some_and(|c| c.ty == ColumnType::Ref)
+            && t.relations.iter().any(|r| r.from_col.eq_ignore_ascii_case(&self.ref_col) && r.to_table.eq_ignore_ascii_case(&t.name));
+        let Some(cd) = cd.filter(|_| points) else {
+            return bad(format!("under: {} is not a ref column of {} pointing to itself", self.ref_col, t.name));
+        };
+        let all = Query::new(rows.db, t.clone());
+        let (Some(f), Some(sd), Some(a)) = (rows.live_preds()?, seeds.live_preds()?, all.live_preds()?) else { return Ok(None) };
+        Ok(Some((f, sd, a, cd.himo_id)))
+    }
+
+    /// 今の配下の row (昇順)。
+    pub fn find(self) -> Result<Vec<EntityId>, SchemaError> {
+        let eng = self.rows.db.arc_engine();
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let Some((f, sd, a, via)) = self.plan()? else { return Ok(Vec::new()) };
+        let peer = eng.peer_id();
+        let local = |e: EntityId| enchudb_oplog::eid_local(e);
+        let mut tree = Tree::default();
+        for e in eng.find_by(a).map_err(io)? {
+            if let Some(p) = eng.get_by_id(e, via) {
+                tree.set_parent(local(e), Some(p as u32));
+            }
+        }
+        tree.seed = eng.find_by(sd).map_err(io)?.into_iter().map(local).collect();
+        let mut out: Vec<EntityId> =
+            eng.find_by(f).map_err(io)?.into_iter().filter(|&e| tree.walk(local(e))).map(|e| enchudb_oplog::make_eid(peer, local(e))).collect();
+        out.sort_unstable();
+        Ok(out)
+    }
+
+    /// 今の配下の row の数。
+    pub fn count(self) -> Result<usize, SchemaError> {
+        Ok(self.find()?.len())
+    }
+
+    /// 配下の row の出入りを購読する。 初回 poll は登録時点の全部が `added`。 親の付け替え (異動・部署の移動)、
+    /// seed の出入り、 この query の条件の変化で届く。 付け替えで配下の答えが変わらない row の下は見に行かない。
+    pub fn subscribe(self) -> Result<LiveUnder, SchemaError> {
+        let eng = self.rows.db.arc_engine();
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let Some((f, sd, a, via)) = self.plan()? else {
+            return Ok(LiveUnder { eng, live: None, state: Default::default() });
+        };
+        let parents = eng.subscribe_keyed(a, Vec::new(), via).map_err(io)?;
+        let seeds = eng.subscribe(sd).map_err(io)?;
+        let filter = eng.subscribe(f).map_err(io)?;
+        Ok(LiveUnder { eng, live: Some((parents, seeds, filter)), state: Default::default() })
+    }
+}
+
+/// 階層 (子 → 親) と seed、 配下の答え。 row は local eid。
+#[derive(Default)]
+struct Tree {
+    parent: std::collections::BTreeMap<u32, u32>,
+    children: std::collections::BTreeSet<(u32, u32)>,
+    seed: std::collections::BTreeSet<u32>,
+    /// 配下である row (答えが真)。
+    under: std::collections::BTreeSet<u32>,
+}
+
+impl Tree {
+    fn set_parent(&mut self, c: u32, p: Option<u32>) {
+        if let Some(old) = self.parent.remove(&c) {
+            self.children.remove(&(old, c));
+        }
+        if let Some(p) = p {
+            self.parent.insert(c, p);
+            self.children.insert((p, c));
+        }
+    }
+
+    /// 親をたどって seed に着くか (根 / 輪に着いたら偽)。 階層の深さに比例。
+    fn walk(&self, r: u32) -> bool {
+        let mut cur = r;
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(&p) = self.parent.get(&cur) {
+            if self.seed.contains(&p) {
+                return true;
+            }
+            if p == r || !seen.insert(p) {
+                return false;
+            }
+            cur = p;
+        }
+        false
+    }
+
+    /// `roots` の答えを親をたどって決め直し、 答えが変わった row の子へ下向きに伝える (子の答え = 親が seed か配下か)。
+    /// 答えが変わった row を返す。
+    fn settle(&mut self, roots: impl IntoIterator<Item = u32>) -> Vec<u32> {
+        let mut changed = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        for r in roots {
+            let now = self.walk(r);
+            if now != self.under.contains(&r) {
+                if now { self.under.insert(r) } else { self.under.remove(&r) };
+                changed.push(r);
+                queue.push_back(r);
+            }
+        }
+        while let Some(x) = queue.pop_front() {
+            let v = self.seed.contains(&x) || self.under.contains(&x);
+            let kids: Vec<u32> = self.children.range((x, 0)..=(x, u32::MAX)).map(|k| k.1).collect();
+            for c in kids {
+                if v != self.under.contains(&c) {
+                    if v { self.under.insert(c) } else { self.under.remove(&c) };
+                    changed.push(c);
+                    queue.push_back(c);
+                }
+            }
+        }
+        changed
+    }
+}
+
+/// 配下の購読の状態。
+#[derive(Default)]
+struct UnderState {
+    tree: Tree,
+    /// この query の条件を満たす row。
+    filt: std::collections::BTreeSet<u32>,
+    /// 最後に渡した row。
+    reported: std::collections::BTreeSet<u32>,
+}
+
+/// [`UnderQuery::subscribe`] の戻り値。 階層の配下の row の出入りを購読する。
+pub struct LiveUnder {
+    eng: Arc<Engine>,
+    /// (親の ref の鍵付きの購読, seed, 結果を絞る条件)
+    live: Option<(enchudb_engine::LiveKeyed, enchudb_engine::LiveQuery, enchudb_engine::LiveQuery)>,
+    state: std::sync::Mutex<UnderState>,
+}
+
+impl LiveUnder {
+    /// 前回 poll からの差分 (昇順)。 同じ row が両方に居たら 「消えて、 別物として入り直した」。
+    pub fn poll(&self) -> LiveDelta {
+        use std::collections::BTreeSet;
+        let Some((parents, seeds, filter)) = &self.live else { return LiveDelta::default() };
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let UnderState { tree, filt, reported } = &mut *st;
+        let peer = self.eng.peer_id();
+        let local = |e: EntityId| enchudb_oplog::eid_local(e);
+        let (dp, ds, df) = (parents.poll(&self.eng), seeds.poll(&self.eng), filter.poll(&self.eng));
+        // 入り直した row (eid の使い回し) は別物: 答えが同じでも出て入り直す
+        let mut reborn: BTreeSet<u32> = dp.reentered.iter().map(|&e| local(e)).collect();
+        let rs: BTreeSet<EntityId> = df.removed.iter().copied().collect();
+        reborn.extend(df.added.iter().filter(|e| rs.contains(e)).map(|&e| local(e)));
+        // 答えを決め直す row: 親が変わった row と、 seed の出入りした row の子
+        let mut roots: BTreeSet<u32> = BTreeSet::new();
+        for (e, _) in &dp.removed {
+            roots.insert(local(*e));
+        }
+        for (e, _) in &dp.added {
+            roots.insert(local(*e));
+        }
+        // 外れた ref (付け替えは added で上書き)
+        let readded: BTreeSet<EntityId> = dp.added.iter().map(|x| x.0).collect();
+        for (e, _) in &dp.removed {
+            if !readded.contains(e) {
+                tree.set_parent(local(*e), None);
+            }
+        }
+        for &(e, p) in &dp.added {
+            tree.set_parent(local(e), Some(p as u32));
+        }
+        for &e in &ds.removed {
+            tree.seed.remove(&local(e));
+        }
+        for &e in &ds.added {
+            tree.seed.insert(local(e));
+        }
+        for &e in ds.removed.iter().chain(ds.added.iter()) {
+            let x = local(e);
+            roots.extend(tree.children.range((x, 0)..=(x, u32::MAX)).map(|k| k.1));
+        }
+        let mut touched: BTreeSet<u32> = tree.settle(roots).into_iter().collect();
+        for &e in &df.removed {
+            filt.remove(&local(e));
+            touched.insert(local(e));
+        }
+        for &e in &df.added {
+            filt.insert(local(e));
+            touched.insert(local(e));
+        }
+        touched.extend(reborn.iter().copied());
+        let mut d = LiveDelta::default();
+        for x in touched {
+            let now = tree.under.contains(&x) && filt.contains(&x);
+            let was = reported.contains(&x);
+            let e = enchudb_oplog::make_eid(peer, x);
+            match (was, now) {
+                (false, true) => {
+                    reported.insert(x);
+                    d.added.push(e);
+                }
+                (true, false) => {
+                    reported.remove(&x);
+                    d.removed.push(e);
+                }
+                (true, true) if reborn.contains(&x) => {
+                    d.removed.push(e);
+                    d.added.push(e);
+                }
+                _ => {}
+            }
+        }
+        d
+    }
+}
+
+impl std::fmt::Debug for LiveUnder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveUnder").finish_non_exhaustive()
+    }
+}
+
 impl std::fmt::Debug for LiveMultiJoin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LiveMultiJoin").field("steps", &self.steps.len()).finish_non_exhaustive()
@@ -3482,6 +3722,23 @@ impl<'a> Query<'a> {
     /// `ref_col` はこの table の ref 列で、 `other` の table を指すこと (違えば `find` / `subscribe` が `BadValue`)。
     pub fn join_ref(self, ref_col: &str, other: Query<'a>) -> JoinQuery<'a> {
         JoinQuery { left: self, right: other, on: JoinOn::Ref(ref_col.to_string()) }
+    }
+
+    /// 階層 (この table が自分を指す ref 列 `ref_col`、 上司 / 親部署 / 親カテゴリ …) で、 `seeds` (同じ table への
+    /// query) の row の **配下** (何段下でも、 seed 自身は含まない) の row のうち、 この query の条件を満たすもの
+    /// (SQL の再帰 CTE `WITH RECURSIVE`)。
+    ///
+    /// ```ignore
+    /// // Alice の配下全員 (何段下でも)
+    /// let q = employees.all().under("manager", employees.where_eq("name", "Alice"));
+    /// q.find()?;
+    /// let live = q.subscribe()?;   // 付け替え (異動・部署の移動) で配下が丸ごと出入りする
+    /// ```
+    ///
+    /// - たどる階層は table の全 row (この query の条件は結果を絞るだけ)。 ref が輪になっていても、 seed に着かなければ配下でない
+    /// - `ref_col` はこの table を指す ref 列、 `seeds` は同じ table への query (違えば `find` / `subscribe` が `BadValue`)
+    pub fn under(self, ref_col: &str, seeds: Query<'a>) -> UnderQuery<'a> {
+        UnderQuery { rows: self, seeds, ref_col: ref_col.to_string() }
     }
 
     /// この query の row と `other` (別の table への query) の row のうち、 この row の列 `my_col` の値と `other` の
