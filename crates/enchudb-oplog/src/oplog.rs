@@ -600,10 +600,11 @@ pub struct OpLog {
     head: AtomicU64,
     checkpoint: AtomicU64,
     next_lsn: AtomicU64,
-    /// HLC logical counter(wall が進まない時の tiebreaker 単調増加)。
-    hlc_logical: std::sync::atomic::AtomicU32,
-    /// 最後に書いた HLC wall(ms)。
-    hlc_last_wall: AtomicU64,
+    /// 最後に払い出した HLC の (wall(ms), logical)。 logical は wall が進まない時の tiebreaker。
+    /// 2 つを 1 つの lock で読み書きする: 別々の atomic だと、 同じ ms の中では wall の CAS が
+    /// 同じ値への CAS になって必ず成功し、 並行した採番が同じ logical を読んで同じ HLC を払い出す
+    /// (同期経路の `append` と async 経路の `mint_hlc` は別の lock の中から呼ばれる)。
+    hlc_state: std::sync::Mutex<(u64, u32)>,
     /// この OpLog を持つ peer の id(header には書かず Engine から設定)。
     peer_id: std::sync::atomic::AtomicU32,
     /// ed25519 鍵ペア。set_keypair で設定。None なら署名は zeros。
@@ -717,8 +718,7 @@ impl OpLog {
             head: AtomicU64::new(HEADER_SIZE as u64),
             checkpoint: AtomicU64::new(HEADER_SIZE as u64),
             next_lsn: AtomicU64::new(1),
-            hlc_logical: std::sync::atomic::AtomicU32::new(0),
-            hlc_last_wall: AtomicU64::new(0),
+            hlc_state: std::sync::Mutex::new((0, 0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
             append_lock: std::sync::Mutex::new(()),
@@ -783,8 +783,7 @@ impl OpLog {
             head: AtomicU64::new(head),
             checkpoint: AtomicU64::new(checkpoint),
             next_lsn: AtomicU64::new(1),
-            hlc_logical: std::sync::atomic::AtomicU32::new(0),
-            hlc_last_wall: AtomicU64::new(0),
+            hlc_state: std::sync::Mutex::new((0, 0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
             append_lock: std::sync::Mutex::new(()),
@@ -864,21 +863,10 @@ impl OpLog {
     fn next_hlc(&self) -> Hlc {
         let peer = self.peer_id.load(Ordering::Acquire);
         let now = current_wall_ms();
-        loop {
-            let last = self.hlc_last_wall.load(Ordering::Acquire);
-            let logical = self.hlc_logical.load(Ordering::Acquire);
-            let (new_wall, new_logical) = if now > last {
-                (now, 0u32)
-            } else {
-                (last, logical.wrapping_add(1))
-            };
-            // last_wall, logical を同時更新(CAS 的に)
-            if self.hlc_last_wall.compare_exchange(last, new_wall, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                self.hlc_logical.store(new_logical, Ordering::Release);
-                return Hlc { wall: new_wall, logical: new_logical, peer };
-            }
-            // race したらリトライ
-        }
+        let mut st = self.hlc_state.lock().unwrap_or_else(|p| p.into_inner());
+        let (last, logical) = *st;
+        *st = if now > last { (now, 0) } else { (last, logical.wrapping_add(1)) };
+        Hlc { wall: st.0, logical: st.1, peer }
     }
 
     /// request17-A3: HLC を **1 個だけ先に払い出す**。 採番したら clock は進むので、
@@ -1136,20 +1124,9 @@ impl OpLog {
     }
 
     fn merge_external_hlc(&self, recv: Hlc) {
-        loop {
-            let last_wall = self.hlc_last_wall.load(Ordering::Acquire);
-            let last_logical = self.hlc_logical.load(Ordering::Acquire);
-            if recv.wall < last_wall || (recv.wall == last_wall && recv.logical <= last_logical) {
-                return;
-            }
-            if self
-                .hlc_last_wall
-                .compare_exchange(last_wall, recv.wall, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                self.hlc_logical.store(recv.logical, Ordering::Release);
-                return;
-            }
+        let mut st = self.hlc_state.lock().unwrap_or_else(|p| p.into_inner());
+        if (recv.wall, recv.logical) > *st {
+            *st = (recv.wall, recv.logical);
         }
     }
 
@@ -1481,8 +1458,7 @@ impl OpLog {
             self.next_lsn.store(s.max_lsn + 1, Ordering::Release);
         }
         if s.max_hlc.wall > 0 {
-            self.hlc_last_wall.store(s.max_hlc.wall, Ordering::Release);
-            self.hlc_logical.store(s.max_hlc.logical, Ordering::Release);
+            *self.hlc_state.lock().unwrap_or_else(|p| p.into_inner()) = (s.max_hlc.wall, s.max_hlc.logical);
         }
         (strip_offsets(s.out), strip_offsets(s.tail))
     }
@@ -1685,8 +1661,7 @@ impl OpLog {
             head: AtomicU64::new(HEADER_SIZE as u64),
             checkpoint: AtomicU64::new(HEADER_SIZE as u64),
             next_lsn: AtomicU64::new(1),
-            hlc_logical: std::sync::atomic::AtomicU32::new(0),
-            hlc_last_wall: AtomicU64::new(0),
+            hlc_state: std::sync::Mutex::new((0, 0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
             append_lock: std::sync::Mutex::new(()),
@@ -2313,6 +2288,38 @@ mod tests {
 
         assert_eq!(tie_hlcs(&wal), vec![(lsn2, minted2), (lsn1, minted1)]);
         let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 並行した採番 (同期経路の `append` と async 経路の `mint_hlc` が混ざる) でも HLC は重複しない。
+    /// 同じ HLC の record は relay の (peer, hlc) の重複除去で落ち、 `hlc > cursor` の cursor でも
+    /// 読み飛ばされる。
+    #[test]
+    fn concurrent_hlcs_are_unique() {
+        let p = tmp("concurrent_hlcs");
+        let wal = std::sync::Arc::new(OpLog::create(&p, 64 * 1024 * 1024).unwrap());
+        let hs: Vec<_> = (0..8u64)
+            .map(|t| {
+                let w = wal.clone();
+                std::thread::spawn(move || {
+                    (0..20_000u64)
+                        .map(|i| {
+                            if t % 2 == 0 {
+                                w.mint_hlc()
+                            } else {
+                                w.append_with_hlc(Op::Tie { eid: i, himo_id: 0, value: 1 }).unwrap().1
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut all: Vec<_> = hs.into_iter().flat_map(|h| h.join().unwrap()).map(|h| h.cmp_key()).collect();
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), n, "同じ HLC が {} 回払い出された", n - all.len());
+        let _ = std::fs::remove_dir_all(&p);
         let _ = std::fs::remove_file(&p);
     }
 
