@@ -4977,6 +4977,13 @@ impl LiveKeyed {
         }
     }
 
+    /// 最後の poll までに `eid` について渡した鍵 (集合に居なければ None)。 poll はしない。
+    pub fn reported_key(&self, eid: EntityId) -> Option<u64> {
+        let guard = self.family.settled.lock();
+        let m = guard.members[self.slot].as_ref()?;
+        m.keyed.as_ref()?.reported.get(enchudb_oplog::eid_local(eid)).checked_sub(1)
+    }
+
     /// engine 内で一意な購読 id。
     pub fn id(&self) -> u64 {
         self.id

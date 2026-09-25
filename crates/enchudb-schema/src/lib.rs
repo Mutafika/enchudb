@@ -2204,8 +2204,9 @@ pub struct PairDelta {
 
 /// 組の計画: 左右の engine の条件と鍵。
 enum JoinPlan {
-    /// ref で結ぶ: 左の条件 + 右の条件を ref の先に置いたもの、 鍵 = ref 列。
-    Ref { preds: Vec<enchudb_engine::LivePred>, via: u16 },
+    /// ref で結ぶ: 左の条件 + 右の条件を ref の先に置いたもの、 鍵 = ref 列。 `right` = 右の table の全 row (row の作り直しを
+    /// 見るだけ。 右の条件で購読すると右の列の書き換えのたびに評価が走る)。
+    Ref { preds: Vec<enchudb_engine::LivePred>, via: u16, right: Vec<enchudb_engine::LivePred> },
     /// 値で結ぶ: 左の条件と鍵 (ref の道 + 列)、 右の条件と鍵の列。
     Eq { left: Vec<enchudb_engine::LivePred>, path: Vec<u16>, left_key: u16, right: Vec<enchudb_engine::LivePred>, right_key: u16 },
 }
@@ -2227,9 +2228,10 @@ impl<'a> JoinQuery<'a> {
                 let Some(cd) = cd.filter(|_| points) else {
                     return bad(format!("join_ref: {col} is not a ref column of {} pointing to {}", self.left.table.name, self.right.table.name));
                 };
-                let (Some(mut l), Some(r)) = (self.left.live_preds()?, self.right.live_preds()?) else { return Ok(None) };
+                let all = Query::new(self.right.db, self.right.table.clone());
+                let (Some(mut l), Some(r), Some(rows)) = (self.left.live_preds()?, self.right.live_preds()?, all.live_preds()?) else { return Ok(None) };
                 l.extend(r.into_iter().map(|p| enchudb_engine::LivePred::Via { path: vec![cd.himo_id], pred: Box::new(p) }));
-                Ok(Some(JoinPlan::Ref { preds: l, via: cd.himo_id }))
+                Ok(Some(JoinPlan::Ref { preds: l, via: cd.himo_id, right: rows }))
             }
             JoinOn::Eq(my, their) => {
                 let Some((path, mine)) = self.left.resolve_col(my) else { return bad(format!("join_eq: unknown column {my}")) };
@@ -2371,7 +2373,7 @@ impl<'a> JoinQuery<'a> {
         };
         let mut out = Vec::new();
         match plan {
-            JoinPlan::Ref { preds, via } => {
+            JoinPlan::Ref { preds, via, .. } => {
                 for a in eng.find_by(preds).map_err(io)? {
                     if let Some(k) = key(a, &[], via) {
                         out.push((a, enchudb_oplog::make_eid(peer, k as u32)));
@@ -2408,7 +2410,9 @@ impl<'a> JoinQuery<'a> {
         let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
         let inner = match self.plan()? {
             None => JoinLive::Empty,
-            Some(JoinPlan::Ref { preds, via }) => JoinLive::Ref(eng.subscribe_keyed(preds, Vec::new(), via).map_err(io)?),
+            Some(JoinPlan::Ref { preds, via, right }) => {
+                JoinLive::Ref { left: eng.subscribe_keyed(preds, Vec::new(), via).map_err(io)?, right: eng.subscribe(right).map_err(io)?, via }
+            }
             Some(JoinPlan::Eq { left, path, left_key, right, right_key }) => JoinLive::Eq {
                 left: eng.subscribe_keyed(left, path, left_key).map_err(io)?,
                 right: eng.subscribe_keyed(right, Vec::new(), right_key).map_err(io)?,
@@ -2428,7 +2432,8 @@ struct Buckets {
 
 enum JoinLive {
     Empty,
-    Ref(enchudb_engine::LiveKeyed),
+    /// 左の鍵付きの購読 (鍵 = ref 列)、 右の table の全 row の購読 (作り直しを見るだけ)、 ref 列。
+    Ref { left: enchudb_engine::LiveKeyed, right: enchudb_engine::LiveQuery, via: u16 },
     Eq { left: enchudb_engine::LiveKeyed, right: enchudb_engine::LiveKeyed, state: std::sync::Mutex<Buckets> },
 }
 
@@ -2448,12 +2453,28 @@ impl LiveJoin {
         let mut d = PairDelta::default();
         match &self.inner {
             JoinLive::Empty => {}
-            JoinLive::Ref(q) => {
+            JoinLive::Ref { left, right, via } => {
                 let peer = self.eng.peer_id();
-                let kd = q.poll(&self.eng);
+                let (kd, dr) = (left.poll(&self.eng), right.poll(&self.eng));
+                // 作り直した右の row (消した row の eid が別の row になった): 左の row は同じ鍵で集合に居続けるので
+                // 鍵付きの購読の差分に出ないが、 組の右は別物 → 居続けた組も出て入り直す
+                let rs: std::collections::BTreeSet<EntityId> = dr.removed.iter().copied().collect();
+                let reborn: Vec<EntityId> = dr.added.iter().copied().filter(|b| rs.contains(b)).collect();
+                if !reborn.is_empty() {
+                    let moved: std::collections::BTreeSet<EntityId> = kd.removed.iter().chain(kd.added.iter()).map(|x| x.0).collect();
+                    for b in reborn {
+                        let k = enchudb_oplog::eid_local(b);
+                        for a in self.eng.query_by_id(&[(*via, k)]) {
+                            if !moved.contains(&a) && left.reported_key(a) == Some(k as u64) {
+                                d.removed.push((a, b));
+                                d.added.push((a, b));
+                            }
+                        }
+                    }
+                }
                 let pair = |(a, k): (EntityId, u64)| (a, enchudb_oplog::make_eid(peer, k as u32));
-                d.removed = kd.removed.into_iter().map(pair).collect();
-                d.added = kd.added.into_iter().map(pair).collect();
+                d.removed.extend(kd.removed.into_iter().map(pair));
+                d.added.extend(kd.added.into_iter().map(pair));
             }
             JoinLive::Eq { left, right, state } => {
                 let (dl, dr) = (left.poll(&self.eng), right.poll(&self.eng));
