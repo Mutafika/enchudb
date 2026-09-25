@@ -84,3 +84,35 @@ fn number64_values_sync_whole() {
     cleanup(&pa);
     cleanup(&pb);
 }
+
+/// #140 の bootstrap (live state の転写) でも 64 bit の値が切り詰められずに届く。
+#[test]
+fn number64_values_survive_state_bootstrap() {
+    let (pa, pb) = (tmp_path("boot-a"), tmp_path("boot-b"));
+    let (a, b) = (make_engine(&pa, 1), make_engine(&pb, 2));
+    let vals = [3u64, u32::MAX as u64 + 1, 1 << 40, u64::MAX - 1];
+    for (i, &v) in vals.iter().enumerate() {
+        let e = a.entity_in("t").unwrap();
+        a.tie_to(e, "t.n", i as u32);
+        a.tie_to(e, "t.ts", v);
+    }
+    let mem = Arc::new(InMemoryTransport::new());
+    mem.register_peer(1);
+    mem.register_peer(2);
+    let transport: Arc<dyn Transport> = mem;
+    let (sa, sb) = (Syncer::new(a.clone(), transport.clone()), Syncer::new(b.clone(), transport.clone()));
+    a.oplog_commit();
+    a.flush_writes();
+    sa.serve_state();
+    let boot = sb.bootstrap_pull(1).expect("serve_state 済み");
+    assert!(boot.outcome.applied > 0, "{boot:?}");
+    b.flush_writes();
+    for (i, &v) in vals.iter().enumerate() {
+        let got = b.pull_raw("t.n", i as u32);
+        assert_eq!(got.len(), 1, "row {i} が届いていない");
+        assert_eq!(b.get(got[0], "t.ts"), Some(v), "row {i}");
+    }
+    drop((sa, sb, a, b));
+    cleanup(&pa);
+    cleanup(&pb);
+}
