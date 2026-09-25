@@ -54,6 +54,14 @@ fn value_join_needs_columns_of_the_same_type() {
     // 否定・ref の先・中身の中でも
     let not = vec![LivePred::Present { himo_id: id("u.city") }, LivePred::Not(Box::new(q(id("u.city"), id("s.zip")).remove(0)))];
     assert!(eng.subscribe(not).is_err(), "否定の中");
+    // 件数の閾値 (CountAtLeast) も同じ検査。 min 0 は断る
+    let count = |mine: u16, theirs: u16, min: u64| {
+        vec![LivePred::CountAtLeast { via: theirs, mine: Some(mine), min, preds: vec![LivePred::Present { himo_id: theirs }] }]
+    };
+    assert!(eng.subscribe(count(id("u.city"), id("s.city"), 2)).is_ok());
+    assert!(eng.subscribe(count(id("u.city"), id("s.zip"), 2)).is_err(), "CountAtLeast: Tag と Number");
+    assert!(eng.subscribe(count(id("u.city"), id("s.city"), 0)).is_err(), "CountAtLeast: min 0");
+    assert!(eng.find_by(count(id("u.city"), id("s.city"), 0)).is_err(), "CountAtLeast: min 0 (find)");
     drop(eng);
     cleanup(&path);
 }
@@ -112,11 +120,16 @@ fn value_join_under_concurrent_writes() {
         let none_q = eng
             .subscribe(vec![LivePred::Present { himo_id: ucity }, LivePred::Not(Box::new(join(false)))])
             .unwrap();
+        // 開いた店が 2 軒以上ある街の住人 (件数の閾値)
+        let two = || vec![LivePred::CountAtLeast { via: scity, mine: Some(ucity), min: 2, preds: vec![LivePred::Eq { himo_id: sopen, value: 1 }] }];
+        let two_q = eng.subscribe(two()).unwrap();
+        let mut two_seen = BTreeSet::new();
         let (mut open_seen, mut none_seen) = (BTreeSet::new(), BTreeSet::new());
         let t0 = std::time::Instant::now();
         while t0.elapsed() < std::time::Duration::from_millis(40) {
             integrate(&mut open_seen, open_q.poll(&eng));
             integrate(&mut none_seen, none_q.poll(&eng));
+            integrate(&mut two_seen, two_q.poll(&eng));
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         for w in writers {
@@ -124,6 +137,15 @@ fn value_join_under_concurrent_writes() {
         }
         integrate(&mut open_seen, open_q.poll(&eng));
         integrate(&mut none_seen, none_q.poll(&eng));
+        integrate(&mut two_seen, two_q.poll(&eng));
+        let shops_at = |v: u64| {
+            shops.iter().filter(|&&s| eng.get(s, "s.city") == Some(v) && eng.get(s, "s.open") == Some(1)).count()
+        };
+        let want_two: BTreeSet<u64> =
+            users.iter().copied().filter(|&u| eng.get(u, "u.city").is_some_and(|v| shops_at(v) >= 2)).collect();
+        assert_eq!(two_seen, want_two, "round {round}: 開いた店が 2 軒以上ある街の住人");
+        let found_two: BTreeSet<u64> = eng.find_by(two()).unwrap().into_iter().collect();
+        assert_eq!(found_two, want_two, "round {round}: find_by (2 軒以上)");
         let shop_at = |v: u64, open: bool| {
             shops.iter().any(|&s| eng.get(s, "s.city") == Some(v) && (!open || eng.get(s, "s.open") == Some(1)))
         };

@@ -2025,6 +2025,63 @@ impl std::fmt::Debug for LiveCounts {
     }
 }
 
+/// [`LiveHaving::poll`] の戻り値。 件数が閾値をまたいだ group の値。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct HavingDelta {
+    /// 件数が閾値以上になった group。
+    pub added: Vec<Value>,
+    /// 件数が閾値未満になった group (0 件になったものも)。 適用順は removed → added。
+    pub removed: Vec<Value>,
+}
+
+/// [`Query::subscribe_having`] の戻り値。 件数が閾値以上の group の集合を購読する (live の `GROUP BY col
+/// HAVING COUNT(*) >= n`)。 drop で購読解除、 `Database` を借用しない。
+pub struct LiveHaving {
+    counts: LiveCounts,
+    min: u64,
+    /// 閾値以上として報告済みの group (engine の値)。
+    have: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+}
+
+impl LiveHaving {
+    /// 前回 poll から件数が閾値をまたいだ group。 初回は登録時点で閾値以上の全 group が `added`。
+    /// 積分した集合 = 今閾値以上の group。 書き込み 1 回あたりのコストは group の数によらない。
+    pub fn poll(&self) -> HavingDelta {
+        let mut have = self.have.lock().unwrap_or_else(|p| p.into_inner());
+        let mut d = HavingDelta::default();
+        for (g, n) in self.counts.inner.poll(&self.counts.eng) {
+            let now = n >= self.min;
+            if now && have.insert(g) {
+                d.added.push(self.counts.value(g));
+            } else if !now && have.remove(&g) {
+                d.removed.push(self.counts.value(g));
+            }
+        }
+        d
+    }
+
+    /// 今件数が閾値以上の group。
+    pub fn groups(&self) -> Vec<Value> {
+        self.counts.inner.all(&self.counts.eng).into_iter().filter(|&(_, n)| n >= self.min).map(|(g, _)| self.counts.value(g)).collect()
+    }
+
+    /// group `value` の今の件数 (閾値未満でも)。
+    pub fn count(&self, value: &Value) -> u64 {
+        self.counts.get(value)
+    }
+
+    /// engine 内で一意な購読 id。
+    pub fn id(&self) -> u64 {
+        self.counts.id()
+    }
+}
+
+impl std::fmt::Debug for LiveHaving {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveHaving").field("min", &self.min).field("counts", &self.counts).finish()
+    }
+}
+
 /// 購読の束 ([`Database::live_group`])。 束を drop しても購読はそのまま (差分は各購読の `poll` で受け取れ、
 /// 他の束に入れ直してもよい)。
 pub struct LiveGroup {
@@ -2124,11 +2181,11 @@ enum Predicate {
     /// 単一列の条件 (Eq / EqText / In / Present) が偽 (値の無い row も真)。
     Not(Box<Predicate>),
     /// 別の table の row がこの row を ref 列 (himo `via`) で指していて、 条件 (engine の条件に写し済み、
-    /// None = 常に 0 件) を満たすものがある。
-    Exists { via: u16, preds: Option<Vec<enchudb_engine::LivePred>> },
+    /// None = 常に 0 件) を満たすものが `min` 個以上ある (`where_exists` は 1)。
+    Exists { via: u16, min: u64, preds: Option<Vec<enchudb_engine::LivePred>> },
     /// 別の table の row のうち、 列 (himo `theirs`) の値がこの row の列 (himo `mine`) の値と等しく、 条件を
-    /// 満たすものがある (値で結ぶ準結合)。
-    ExistsEq { mine: u16, theirs: u16, preds: Option<Vec<enchudb_engine::LivePred>> },
+    /// 満たすものが `min` 個以上ある (値で結ぶ準結合)。
+    ExistsEq { mine: u16, theirs: u16, min: u64, preds: Option<Vec<enchudb_engine::LivePred>> },
 }
 
 pub struct Query<'a> {
@@ -2363,7 +2420,7 @@ impl<'a> Query<'a> {
     /// `via_col` は `sub` の table の ref 列で、 この table を指すこと (違えば常に 0 件)。 find / count /
     /// subscribe のどれでも使える。 購読では、 指している row の出入り・中身の変化も届く。
     pub fn where_exists(mut self, sub: Query<'a>, via_col: &str) -> Self {
-        let p = self.exists_pred(sub, via_col);
+        let p = self.exists_pred(sub, via_col, 1);
         match p {
             Some(p) => self.preds.push(p),
             None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
@@ -2373,7 +2430,7 @@ impl<'a> Query<'a> {
 
     /// [`where_exists`](Self::where_exists) の否定: 指している row が 1 つも無い (SQL の `NOT EXISTS`)。
     pub fn where_not_exists(mut self, sub: Query<'a>, via_col: &str) -> Self {
-        let p = self.exists_pred(sub, via_col);
+        let p = self.exists_pred(sub, via_col, 1);
         match p {
             Some(p) => self.preds.push(Predicate::Not(Box::new(p))),
             None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
@@ -2408,7 +2465,7 @@ impl<'a> Query<'a> {
     /// }
     /// ```
     pub fn where_exists_eq(mut self, my_col: &str, sub: Query<'a>, their_col: &str) -> Self {
-        match self.exists_eq_pred(my_col, sub, their_col) {
+        match self.exists_eq_pred(my_col, sub, their_col, 1) {
             Some((path, p)) => self.push_at(path, p),
             None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
         }
@@ -2418,7 +2475,7 @@ impl<'a> Query<'a> {
     /// [`where_exists_eq`](Self::where_exists_eq) の否定: 値の等しい row が 1 つも無い (SQL の `NOT EXISTS`)。
     /// この row の列に値が無ければ真 (SQL と同じ)。
     pub fn where_not_exists_eq(mut self, my_col: &str, sub: Query<'a>, their_col: &str) -> Self {
-        match self.exists_eq_pred(my_col, sub, their_col) {
+        match self.exists_eq_pred(my_col, sub, their_col, 1) {
             Some((path, p)) => {
                 if !path.is_empty() {
                     // 1 段目の ref に値がある (where_ne と同じ)
@@ -2431,19 +2488,86 @@ impl<'a> Query<'a> {
         self
     }
 
+    /// `sub` (別の table への query) の row のうち、 ref 列 `via_col` でこの row を指しているものが **`n` 個以上**
+    /// ある (SQL の `HAVING COUNT(*) >= n`、 [`where_exists`](Self::where_exists) の件数版)。
+    ///
+    /// ```ignore
+    /// // 30 歳より上の社員が 50 人以上いる会社
+    /// let q = companies.all().where_count_ge(users.all().where_gt("age", 30i64), "company", 50);
+    /// ```
+    ///
+    /// find / count / subscribe のどれでも使える。 購読では、 数えている row の出入り・中身の変化で件数が
+    /// `n` をまたいだ row が出入りする (書き込み 1 回あたり、 またいだ group の数に比例)。 `n == 0` は常に真
+    /// (条件を足さない)。 `via_col` の条件は [`where_exists`](Self::where_exists) と同じ。
+    pub fn where_count_ge(mut self, sub: Query<'a>, via_col: &str, n: u64) -> Self {
+        if n == 0 {
+            return self;
+        }
+        match self.exists_pred(sub, via_col, n) {
+            Some(p) => self.preds.push(p),
+            None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
+        }
+        self
+    }
+
+    /// [`where_count_ge`](Self::where_count_ge) の否定: 指している row が `n` 個未満 (0 個も含む、 SQL の
+    /// `HAVING COUNT(*) < n` に 0 件の row を足したもの)。 `n == 0` は常に偽。
+    pub fn where_count_lt(mut self, sub: Query<'a>, via_col: &str, n: u64) -> Self {
+        match self.exists_pred(sub, via_col, n).filter(|_| n > 0) {
+            Some(p) => self.preds.push(Predicate::Not(Box::new(p))),
+            None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
+        }
+        self
+    }
+
+    /// `sub` の row のうち、 列 `their_col` の値がこの row の列 `my_col` の値と等しいものが **`n` 個以上** ある
+    /// ([`where_exists_eq`](Self::where_exists_eq) の件数版)。
+    ///
+    /// ```ignore
+    /// // 開いた店が 3 軒以上ある街に住む user
+    /// let q = users.all().where_value_count_ge("city", shops.where_eq("open", 1i64), "city", 3);
+    /// ```
+    ///
+    /// 列の条件は [`where_exists_eq`](Self::where_exists_eq) と同じ。 `n == 0` は常に真 (条件を足さない)。
+    pub fn where_value_count_ge(mut self, my_col: &str, sub: Query<'a>, their_col: &str, n: u64) -> Self {
+        if n == 0 {
+            return self;
+        }
+        match self.exists_eq_pred(my_col, sub, their_col, n) {
+            Some((path, p)) => self.push_at(path, p),
+            None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
+        }
+        self
+    }
+
+    /// [`where_value_count_ge`](Self::where_value_count_ge) の否定: 値の等しい row が `n` 個未満 (0 個も含む)。
+    /// この row の列に値が無ければ真 ([`where_not_exists_eq`](Self::where_not_exists_eq) と同じ)。 `n == 0` は常に偽。
+    pub fn where_value_count_lt(mut self, my_col: &str, sub: Query<'a>, their_col: &str, n: u64) -> Self {
+        match self.exists_eq_pred(my_col, sub, their_col, n).filter(|_| n > 0) {
+            Some((path, p)) => {
+                if !path.is_empty() {
+                    self.preds.push(Predicate::Present(path[0]));
+                }
+                self.push_at(path, Predicate::Not(Box::new(p)))
+            }
+            None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
+        }
+        self
+    }
+
     /// `where_exists_eq` の条件と、 自分の列までの ref の道。 列が無い / 型が違う / Leaf / Ref なら None。
-    fn exists_eq_pred(&self, my_col: &str, sub: Query<'a>, their_col: &str) -> Option<(Vec<u16>, Predicate)> {
+    fn exists_eq_pred(&self, my_col: &str, sub: Query<'a>, their_col: &str, min: u64) -> Option<(Vec<u16>, Predicate)> {
         let (path, mine) = self.resolve_col(my_col)?;
         let (theirs_ty, theirs) = sub.table.col(their_col).map(|c| (c.ty, c.himo_id))?;
         if mine.ty != theirs_ty || matches!(mine.ty, ColumnType::Leaf | ColumnType::Ref) {
             return None;
         }
         let preds = sub.live_preds().ok()?;
-        Some((path, Predicate::ExistsEq { mine: mine.himo_id, theirs, preds }))
+        Some((path, Predicate::ExistsEq { mine: mine.himo_id, theirs, min, preds }))
     }
 
     /// `where_exists` の条件。 `via_col` がこの table を指す ref 列でなければ None。
-    fn exists_pred(&self, sub: Query<'a>, via_col: &str) -> Option<Predicate> {
+    fn exists_pred(&self, sub: Query<'a>, via_col: &str, min: u64) -> Option<Predicate> {
         let cd = sub.table.col(via_col)?;
         let points_here = cd.ty == ColumnType::Ref
             && sub.table.relations.iter().any(|r| {
@@ -2454,7 +2578,7 @@ impl<'a> Query<'a> {
         }
         let via = cd.himo_id;
         let preds = sub.live_preds().ok()?;
-        Some(Predicate::Exists { via, preds })
+        Some(Predicate::Exists { via, min, preds })
     }
 
     /// `col` に値がある (SQL の `col IS NOT NULL`)。
@@ -2703,6 +2827,26 @@ impl<'a> Query<'a> {
         self.subscribe_agg(col, None)
     }
 
+    /// この条件の結果を列 `col` の値で group 分けし、 **件数が `n` 以上の group** を購読する (live の
+    /// `GROUP BY col HAVING COUNT(*) >= n`)。 差分は閾値をまたいだ group の値。
+    ///
+    /// ```ignore
+    /// // 開いた店が 3 軒以上ある街
+    /// let busy = shops.where_eq("open", 1i64).subscribe_having("city", 3)?;
+    /// for city in busy.poll().added { /* 3 軒以上になった街 */ }
+    /// ```
+    ///
+    /// - group の row を引きたい時は [`where_count_ge`](Self::where_count_ge) (ref で指されている row) /
+    ///   [`where_value_count_ge`](Self::where_value_count_ge) (値の等しい row) で条件にする
+    /// - `col` の条件は [`subscribe_counts`](Self::subscribe_counts) と同じ。 `n == 0` は `BadValue`
+    pub fn subscribe_having(self, col: &str, n: u64) -> Result<LiveHaving, SchemaError> {
+        if n == 0 {
+            return Err(SchemaError::BadValue("subscribe_having: n must be at least 1".into()));
+        }
+        let counts = self.subscribe_agg(col, None)?;
+        Ok(LiveHaving { counts, min: n, have: Default::default() })
+    }
+
     /// [`subscribe_counts`](Self::subscribe_counts) に加えて、 group ごとに列 `sum_col` の値の和も持つ
     /// (live の `GROUP BY col` + `COUNT(*)` + `SUM(sum_col)`)。 平均は合計 / 件数。
     ///
@@ -2788,12 +2932,14 @@ impl<'a> Query<'a> {
                     None => return Ok(None),
                 },
                 Predicate::Present(h) => LivePred::Present { himo_id: h },
-                Predicate::Exists { via, preds } => match preds {
-                    Some(preds) => LivePred::Exists { via, preds },
+                Predicate::Exists { via, min, preds } => match preds {
+                    Some(preds) if min == 1 => LivePred::Exists { via, preds },
+                    Some(preds) => LivePred::CountAtLeast { via, mine: None, min, preds },
                     None => return Ok(None),
                 },
-                Predicate::ExistsEq { mine, theirs, preds } => match preds {
-                    Some(preds) => LivePred::ExistsEq { mine, theirs, preds },
+                Predicate::ExistsEq { mine, theirs, min, preds } => match preds {
+                    Some(preds) if min == 1 => LivePred::ExistsEq { mine, theirs, preds },
+                    Some(preds) => LivePred::CountAtLeast { via: theirs, mine: Some(mine), min, preds },
                     None => return Ok(None),
                 },
                 Predicate::Not(inner) => match conv(eng, *inner, rep)? {
@@ -2837,7 +2983,7 @@ impl<'a> Query<'a> {
             // ref もある)
             fn own(p: &LivePred) -> bool {
                 match p {
-                    LivePred::Not(_) | LivePred::Exists { .. } => false,
+                    LivePred::Not(_) | LivePred::Exists { .. } | LivePred::CountAtLeast { mine: None, .. } => false,
                     // 自分の ref 列に値がある (中身が否定でも)
                     LivePred::Via { .. } => true,
                     LivePred::Or(bs) => bs.iter().all(|b| b.iter().any(own)),
