@@ -11827,6 +11827,13 @@ impl Engine {
             {
                 return Err(bad(format!("Via path himo {h} is not a Ref himo")));
             }
+            if let Some(h) = p
+                .sum_himos()
+                .into_iter()
+                .find(|&h| !matches!(self.value_type_at(h as usize), Some(ValueType::Number | ValueType::Number64)))
+            {
+                return Err(bad(format!("SumAtLeast sums himo {h}, which is not a Number / Number64 himo")));
+            }
             // 値で結ぶ列は同じ型 (Tag どうしは vocab id が共通)。 Leaf は値ごとに別の id なので結べない
             for (mine, theirs) in p.value_joins() {
                 let (a, b) = (self.value_type_at(mine as usize), self.value_type_at(theirs as usize));

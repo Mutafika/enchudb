@@ -162,3 +162,64 @@ fn value_join_under_concurrent_writes() {
     drop(eng);
     cleanup(&path);
 }
+
+/// 和の閾値 (`SumAtLeast`): 和の列の書き換え・外しで和が閾値をまたぐと出入りし、 指されている entity の削除で
+/// 出る。 行の無い group は偽 (min が 0 以下でも)。
+#[test]
+fn sum_threshold_follows_the_summed_column() {
+    let path = tmp_path("sum");
+    cleanup(&path);
+    let mut eng = Engine::create_growable_opts(&path, GrowableOptions::default()).unwrap();
+    eng.define_himo("c.name", ValueType::Number, 0);
+    eng.define_himo("u.company", ValueType::Ref, 0);
+    eng.define_himo("u.salary", ValueType::Number, 0);
+    let co = eng.entity().unwrap();
+    let empty = eng.entity().unwrap();
+    eng.tie(co, "c.name", 1u32);
+    eng.tie(empty, "c.name", 2u32);
+    let (a, b) = (eng.entity().unwrap(), eng.entity().unwrap());
+    for (e, s) in [(a, 1u32), (b, 5u32)] {
+        eng.tie(e, "u.company", co as u32);
+        eng.tie(e, "u.salary", s);
+    }
+    let id = |h: &str| eng.himo_id(h).unwrap() as u16;
+    let (name, comp, sal) = (id("c.name"), id("u.company"), id("u.salary"));
+    let eng = Engine::concurrentize(eng);
+    let pred = |min: i128| {
+        vec![
+            LivePred::Present { himo_id: name },
+            LivePred::SumAtLeast { via: comp, mine: None, sum_himo: sal, min, signed: false, preds: vec![LivePred::Present { himo_id: comp }] },
+        ]
+    };
+    let q = eng.subscribe(pred(3)).unwrap();
+    assert_eq!(q.poll(&eng).added, vec![co], "1 + 5 >= 3");
+    eng.tie_to(b, "u.salary", 0u32);
+    assert_eq!(q.poll(&eng).removed, vec![co], "1 + 0 < 3");
+    eng.tie_to(b, "u.salary", 9u32);
+    assert_eq!(q.poll(&eng).added, vec![co]);
+    eng.untie(b, "u.salary");
+    assert_eq!(q.poll(&eng).removed, vec![co], "値の無い row は 0 として足す");
+    assert_eq!(eng.find_by(pred(1)).unwrap(), vec![co]);
+    // 行の無い group (社員の居ない会社) は min <= 0 でも入らない
+    assert_eq!(eng.find_by(pred(0)).unwrap(), vec![co]);
+    assert_eq!(eng.find_by(pred(-5)).unwrap(), vec![co]);
+    let q0 = eng.subscribe(pred(0)).unwrap();
+    assert_eq!(q0.poll(&eng).added, vec![co]);
+    // 社員が全員抜けた = 行の無い group は min 0 でも偽
+    eng.untie(a, "u.company");
+    eng.untie(b, "u.company");
+    assert_eq!(q0.poll(&eng).removed, vec![co], "行の無い group");
+    eng.tie_to(a, "u.company", co as u32);
+    assert_eq!(q0.poll(&eng).added, vec![co]);
+    eng.delete(co);
+    assert_eq!(q0.poll(&eng).removed, vec![co], "指されている entity の削除");
+    // 和の列は Number / Number64
+    let bad = vec![
+        LivePred::Present { himo_id: name },
+        LivePred::SumAtLeast { via: comp, mine: None, sum_himo: comp, min: 1, signed: false, preds: vec![LivePred::Present { himo_id: comp }] },
+    ];
+    assert!(eng.subscribe(bad).is_err(), "Ref の列は足せない");
+    drop((q, q0));
+    drop(eng);
+    cleanup(&path);
+}
