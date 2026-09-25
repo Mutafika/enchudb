@@ -492,7 +492,7 @@ mod tests {
         WireRecord::unsigned(
             Hlc { wall, logical: 0, peer },
             peer,
-            DecodedOp::Tie { eid, himo_id: 0, value },
+            DecodedOp::Tie { eid, himo_id: 0, value: value as u64 },
         )
     }
 

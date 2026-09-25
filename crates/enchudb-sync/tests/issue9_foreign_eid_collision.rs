@@ -288,7 +288,7 @@ fn cross_peer_ref_value_is_translated() {
         .get(u_eid, "users.company")
         .expect("user should have a company ref");
     assert_eq!(
-        ref_val, c_local,
+        ref_val, u64::from(c_local),
         "cross-peer ref must be translated to B's local company eid (got {}, want {}); \
          untranslated it would point at B's own company {}",
         ref_val,

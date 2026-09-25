@@ -67,7 +67,7 @@ fn ring_map(eng: &Arc<Engine>) -> HashMap<u64, u32> {
     let lsn_hid = eng.himo_id("_sync_ops.lsn").unwrap() as u16;
     eng.entities_with_himo(lsn_hid)
         .into_iter()
-        .filter_map(|eid| eng.get_by_id(eid, lsn_hid).map(|lsn| (eid, lsn)))
+        .filter_map(|eid| eng.get_by_id(eid, lsn_hid).map(|lsn| (eid, lsn as u32)))
         .collect()
 }
 

@@ -331,7 +331,7 @@ fn ref_value_to_replica_propagates_as_tie_ref() {
         .resolve_remote_eid_existing(c_a)
         .expect("#183: the ref target must be allocated on C from the world number");
     assert_eq!(
-        eng_c.get(u_c, "users.company").map(|v| v as u64),
+        eng_c.get(u_c, "users.company"),
         Some(enchudb_oplog::eid_local(c_on_c) as u64),
         "#183: the ref must arrive on C and point at C's local for A's company"
     );
@@ -352,14 +352,14 @@ fn ref_value_to_replica_propagates_as_tie_ref() {
         .resolve_remote_eid_existing(u_b)
         .expect("B's user must arrive on A");
     assert_eq!(
-        eng_a.get(u_on_a, "users.company").map(|v| v as u64),
+        eng_a.get(u_on_a, "users.company"),
         Some(enchudb_oplog::eid_local(c_a) as u64),
         "#183: on the author of the target, the ref must resolve to the original entity"
     );
 
     // B のローカルでも ref は従来どおり生きている。
     assert_eq!(
-        eng_b.get(u_b, "users.company").map(|v| v as u64),
+        eng_b.get(u_b, "users.company"),
         Some(enchudb_oplog::eid_local(c_replica) as u64),
         "the ref stays usable locally on B"
     );

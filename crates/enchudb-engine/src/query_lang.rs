@@ -209,7 +209,7 @@ fn eval_conds(eng: &Engine, conds: &[Cond]) -> Vec<enchudb_oplog::EntityId> {
             if skip_first_range && !skipped { skipped = true; continue; }
             let h = h.clone();
             let lo = *lo; let hi = *hi;
-            eids.retain(|&eid| eng.get(eid, &h).map_or(false, |v| v >= lo && v <= hi));
+            eids.retain(|&eid| eng.get(eid, &h).map_or(false, |v| v >= lo as u64 && v <= hi as u64));
         }
     }
     eids

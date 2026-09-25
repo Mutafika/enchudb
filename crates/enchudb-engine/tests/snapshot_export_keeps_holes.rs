@@ -80,7 +80,7 @@ fn snapshot_export_does_not_bloat_the_copy() {
 
     let restored = Engine::open_standalone(&dst).expect("snapshot が open できない");
     for (i, &e) in eids.iter().enumerate() {
-        assert_eq!(restored.get(e, "age"), Some(i as u32), "snapshot の中身が壊れている (eid #{})", i);
+        assert_eq!(restored.get(e, "age"), Some(i as u64), "snapshot の中身が壊れている (eid #{})", i);
     }
     drop(restored);
     cleanup(&src);

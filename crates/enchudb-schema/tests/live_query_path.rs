@@ -1080,7 +1080,7 @@ fn run_counts(path: &str) {
         name: String,
         q: enchudb_schema::LiveCounts,
         /// group → (件数, 合計)
-        seen: std::collections::BTreeMap<String, (u64, u64)>,
+        seen: std::collections::BTreeMap<String, (u64, i128)>,
         /// salary の合計も持つ購読 (subscribe_sums)
         sum: bool,
         cond: Cond<'a>,
@@ -1160,7 +1160,7 @@ fn run_counts(path: &str) {
 
     let check = |subs: &mut Vec<CSub>, users: &[u64], step: usize| {
         for s in subs.iter_mut() {
-            let got: Vec<(Value, u64, u64)> = if s.sum {
+            let got: Vec<(Value, u64, i128)> = if s.sum {
                 s.q.poll_sums()
             } else {
                 s.q.poll().into_iter().map(|(v, n)| (v, n, 0)).collect()
@@ -1172,7 +1172,7 @@ fn run_counts(path: &str) {
                     assert_ne!(s.seen.insert(show(&v), (n, t)), Some((n, t)), "[{}] 変わらない group を報告", s.name);
                 }
             }
-            let mut want: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
+            let mut want: std::collections::BTreeMap<String, (u64, i128)> = Default::default();
             for &e in users {
                 if (s.cond)(e)
                     && let Some(k) = (s.key)(e)
@@ -1180,13 +1180,13 @@ fn run_counts(path: &str) {
                     let w = want.entry(show(&k)).or_insert((0, 0));
                     w.0 += 1;
                     if s.sum {
-                        w.1 += salary(e);
+                        w.1 += salary(e) as i128;
                     }
                 }
             }
             assert_eq!(s.seen, want, "[{}] step {step}: 積分 != 手で数えた件数 / 合計", s.name);
             assert!(s.q.poll_sums().is_empty(), "[{}] step {step}: 受け取り済みの集計がまた届く", s.name);
-            let all: std::collections::BTreeMap<String, (u64, u64)> =
+            let all: std::collections::BTreeMap<String, (u64, i128)> =
                 s.q.all_sums().into_iter().map(|(v, n, t)| (show(&v), (n, t))).collect();
             assert_eq!(all, want, "[{}] step {step}: all_sums", s.name);
             let counts: std::collections::BTreeMap<String, u64> = s.q.all().into_iter().map(|(v, n)| (show(&v), n)).collect();
@@ -1504,4 +1504,372 @@ fn run_top(path: &str) {
     }
     check(&mut subs, &users, 1_000_001);
     check(&mut subs, &users, 1_000_002);
+}
+
+/// 否定 (`where_ne` / `where_not_in` / `where_null` / `where_not_null`、 ref の先の列も、 `or` との組み合わせも)
+/// の購読の積分・`count()`・`find()` が、 手で数えた結果と一致すること。 値を外す (untie) 書き込み・ref の
+/// 付け替え / 外し・row と会社の削除を混ぜる (否定は 「値が無い」 への遷移で真になる)。
+#[test]
+fn not_subscriptions_match_oracle() {
+    let path = tmp_path("not");
+    cleanup(&path);
+    run_not(&path);
+    cleanup(&path);
+}
+
+fn run_not(path: &str) {
+    let mut db = Database::create_growable_tiny(path).unwrap();
+    db.table("companies").number("id").tag("city").primary_key("id").build().unwrap();
+    db.table("users")
+        .number("id")
+        .number("age")
+        .tag("city")
+        .ref_to("company", "companies")
+        .primary_key("id")
+        .build()
+        .unwrap();
+    let users_t = db.get_table("users").unwrap();
+    let companies_t = db.get_table("companies").unwrap();
+    let cities = ["Tokyo", "Osaka", "Kyoto"];
+    let mut rng = Rng(0x0707_0707_1234_5678);
+    let mut companies: Vec<u64> = (0..8i64)
+        .map(|i| {
+            let mut b = companies_t.insert().set("id", i);
+            if i % 4 != 0 {
+                b = b.set("city", cities[(i % 3) as usize]);
+            }
+            b.commit().unwrap()
+        })
+        .collect();
+    let mut users: Vec<u64> = (0..120i64)
+        .map(|i| {
+            let mut b = users_t.insert().set("id", i);
+            if i % 5 != 0 {
+                b = b.set("age", (i * 7) % 20);
+            }
+            if i % 7 != 0 {
+                b = b.set("city", cities[(i % 3) as usize]);
+            }
+            if i % 9 != 0 {
+                b = b.set("company", Value::Ref(companies[(i % 8) as usize]));
+            }
+            b.commit().unwrap()
+        })
+        .collect();
+    let (u, c) = (&users_t, &companies_t);
+    let age = move |e: u64| get_num(u, e, "age");
+    let home = move |e: u64| get_text(u, e, "city");
+    let company = move |e: u64| get_ref(u, e, "company");
+    let work = move |e: u64| company(e).map(|x| get_text(c, x, "city"));
+
+    type Cond<'a> = Box<dyn Fn(u64) -> bool + 'a>;
+    type Q<'a> = Box<dyn Fn() -> enchudb_schema::Query<'a> + 'a>;
+    struct NSub<'a> {
+        name: String,
+        q: LiveQuery,
+        query: Q<'a>,
+        seen: BTreeSet<u64>,
+        cond: Cond<'a>,
+    }
+    let make = |kind: u64, rng: &mut Rng| -> NSub {
+        let a = cities[rng.below(3) as usize];
+        let x = rng.below(20) as u32;
+        let vs: Vec<u32> = (0..1 + rng.below(3)).map(|_| rng.below(20) as u32).collect();
+        let (name, query, cond): (String, Q, Cond) = match kind {
+            0 => (format!("city != {a}"), Box::new(move || u.all().where_ne("city", a)), Box::new(move |e| home(e).is_some_and(|h| h != a))),
+            1 => {
+                let v2 = vs.clone();
+                (
+                    format!("age not in {vs:?}"),
+                    Box::new(move || u.all().where_not_in("age", &vs)),
+                    Box::new(move |e| age(e).is_some_and(|g| !v2.contains(&(g as u32)))),
+                )
+            }
+            2 => ("age is null".into(), Box::new(move || u.all().where_null("age")), Box::new(move |e| age(e).is_none())),
+            3 => (
+                format!("company.city != {a}"),
+                Box::new(move || u.all().where_ne("company.city", a)),
+                Box::new(move |e| matches!(work(e), Some(Some(w)) if w != a)),
+            ),
+            4 => (
+                "company.city is null".into(),
+                Box::new(move || u.all().where_null("company.city")),
+                Box::new(move |e| matches!(work(e), Some(None))),
+            ),
+            5 => (
+                format!("age is null or city = {a}"),
+                Box::new(move || u.all().where_null("age").or(u.where_eq("city", a))),
+                Box::new(move |e| age(e).is_none() || home(e).as_deref() == Some(a)),
+            ),
+            6 => (
+                format!("age is not null and city != {a}"),
+                Box::new(move || u.all().where_not_null("age").where_ne("city", a)),
+                Box::new(move |e| age(e).is_some() && home(e).is_some_and(|h| h != a)),
+            ),
+            _ => (
+                format!("company.city != {a} and age > {x}"),
+                Box::new(move || u.all().where_ne("company.city", a).where_gt("age", x)),
+                Box::new(move |e| matches!(work(e), Some(Some(w)) if w != a) && age(e).is_some_and(|g| g > x as i64)),
+            ),
+        };
+        let q = query().subscribe().unwrap();
+        NSub { name, q, query, seen: BTreeSet::new(), cond }
+    };
+    let mut subs: Vec<NSub> = (0..32).map(|i| make(i % 8, &mut rng)).collect();
+    let group = db.live_group();
+    let check = |subs: &mut Vec<NSub>, users: &[u64], step: usize| {
+        if step % 2 == 1 {
+            for s in subs.iter() {
+                group.add(&s.q);
+            }
+            for (id, d) in group.poll() {
+                let s = subs.iter_mut().find(|s| s.q.id() == id).expect("生きている購読の id");
+                integrate(&mut s.seen, d);
+            }
+        }
+        for s in subs.iter_mut() {
+            if step.is_multiple_of(2) {
+                integrate(&mut s.seen, s.q.poll());
+            }
+            let want: BTreeSet<u64> = users.iter().copied().filter(|&e| (s.cond)(e)).collect();
+            assert_eq!(s.seen, want, "[{}] step {step}: 積分 != 手で数えた結果", s.name);
+            assert_eq!(s.q.count(), want.len(), "[{}] step {step}: count", s.name);
+            let found: BTreeSet<u64> = (s.query)().find().unwrap().into_iter().collect();
+            assert_eq!(found, want, "[{}] step {step}: find", s.name);
+        }
+    };
+    check(&mut subs, &users, 0);
+    let eng = db.engine();
+    let mut next_id = 1000i64;
+    for step in 1..1500 {
+        let e = users[rng.below(users.len() as u64) as usize];
+        match rng.below(10) {
+            0 => users_t.entity(e).set("age", rng.below(20) as i64).commit().unwrap(),
+            1 => eng.untie(e, "users.age"),
+            2 => users_t.entity(e).set("city", cities[rng.below(3) as usize]).commit().unwrap(),
+            3 => eng.untie(e, "users.city"),
+            4 => {
+                let x = companies[rng.below(companies.len() as u64) as usize];
+                users_t.entity(e).set("company", Value::Ref(x)).commit().unwrap();
+            }
+            5 => eng.untie(e, "users.company"),
+            6 => {
+                let x = companies[rng.below(companies.len() as u64) as usize];
+                if rng.below(3) == 0 {
+                    eng.untie(x, "companies.city");
+                } else {
+                    companies_t.entity(x).set("city", cities[rng.below(3) as usize]).commit().unwrap();
+                }
+            }
+            7 => {
+                let i = rng.below(users.len() as u64) as usize;
+                users_t.entity(users[i]).delete().unwrap();
+                let mut b = users_t.insert().set("id", next_id);
+                if rng.below(2) == 0 {
+                    b = b.set("age", rng.below(20) as i64);
+                }
+                if rng.below(2) == 0 {
+                    b = b.set("city", cities[rng.below(3) as usize]);
+                }
+                users[i] = b.commit().unwrap();
+                next_id += 1;
+            }
+            8 => {
+                let i = rng.below(companies.len() as u64) as usize;
+                companies_t.entity(companies[i]).delete().unwrap();
+                companies[i] = companies_t.insert().set("id", next_id).commit().unwrap();
+                next_id += 1;
+            }
+            _ => {}
+        }
+        if step % 5 == 0 {
+            let i = rng.below(subs.len() as u64) as usize;
+            let kind = rng.below(8);
+            subs[i] = make(kind, &mut rng);
+        }
+        if step % 3 == 0 {
+            check(&mut subs, &users, step);
+        }
+    }
+    check(&mut subs, &users, 1_000_001);
+    check(&mut subs, &users, 1_000_002);
+    // 否定だけの枝は engine が断る (schema は代表列を足すので通る)
+    assert!(u.all().where_null("age").subscribe().is_ok());
+}
+
+/// `where_exists` / `where_not_exists` (指している row が 1 つ以上ある / 1 つも無い) の購読の積分・`count()`・
+/// `find()` が、 手で数えた結果と一致すること。 中身の条件に否定・ref の道も、 外側に `or` も。 指している
+/// row の中身の変化・付け替え・外し・削除と、 指されている row の削除を混ぜる。
+#[test]
+fn exists_subscriptions_match_oracle() {
+    let path = tmp_path("exists");
+    cleanup(&path);
+    run_exists(&path);
+    cleanup(&path);
+}
+
+fn run_exists(path: &str) {
+    let mut db = Database::create_growable_tiny(path).unwrap();
+    db.table("companies").number("id").tag("city").primary_key("id").build().unwrap();
+    db.table("users")
+        .number("id")
+        .number("age")
+        .tag("city")
+        .ref_to("company", "companies")
+        .primary_key("id")
+        .build()
+        .unwrap();
+    let users_t = db.get_table("users").unwrap();
+    let companies_t = db.get_table("companies").unwrap();
+    let cities = ["Tokyo", "Osaka", "Kyoto"];
+    let mut rng = Rng(0xe815_7515_0000_0001);
+    let mut companies: Vec<u64> = (0..12i64)
+        .map(|i| companies_t.insert().set("id", i).set("city", cities[(i % 3) as usize]).commit().unwrap())
+        .collect();
+    let mut users: Vec<u64> = (0..60i64)
+        .map(|i| {
+            let mut b = users_t.insert().set("id", i).set("city", cities[(i % 3) as usize]);
+            if i % 5 != 0 {
+                b = b.set("age", (i * 7) % 40);
+            }
+            // 会社は前半 8 社にだけ (残りは誰も指していない)
+            if i % 6 != 0 {
+                b = b.set("company", Value::Ref(companies[(i % 8) as usize]));
+            }
+            b.commit().unwrap()
+        })
+        .collect();
+    let (u, c) = (&users_t, &companies_t);
+    let age = move |e: u64| get_num(u, e, "age");
+    let home = move |e: u64| get_text(u, e, "city");
+    let company = move |e: u64| get_ref(u, e, "company");
+    let ccity = move |x: u64| get_text(c, x, "city");
+
+    type Cond<'a> = Box<dyn Fn(u64, &[u64]) -> bool + 'a>;
+    type Q<'a> = Box<dyn Fn() -> enchudb_schema::Query<'a> + 'a>;
+    struct ESub<'a> {
+        name: String,
+        q: LiveQuery,
+        query: Q<'a>,
+        seen: BTreeSet<u64>,
+        /// (会社, 全社員) → 入るか
+        cond: Cond<'a>,
+    }
+    let make = |kind: u64, rng: &mut Rng| -> ESub {
+        let a = cities[rng.below(3) as usize];
+        let b = cities[rng.below(3) as usize];
+        let x = rng.below(40) as u32;
+        let staff = move |co: u64, us: &[u64]| -> Vec<u64> { us.iter().copied().filter(|&e| company(e) == Some(co)).collect() };
+        let (name, query, cond): (String, Q, Cond) = match kind {
+            0 => (
+                format!("exists user age > {x}"),
+                Box::new(move || c.all().where_exists(u.all().where_gt("age", x), "company")),
+                Box::new(move |co, us| staff(co, us).iter().any(|&e| age(e).is_some_and(|g| g > x as i64))),
+            ),
+            1 => (
+                "not exists user".into(),
+                Box::new(move || c.all().where_not_exists(u.all(), "company")),
+                Box::new(move |co, us| staff(co, us).is_empty()),
+            ),
+            2 => (
+                format!("city = {a} and exists user city = {b}"),
+                Box::new(move || c.where_eq("city", a).where_exists(u.where_eq("city", b), "company")),
+                Box::new(move |co, us| ccity(co).as_deref() == Some(a) && staff(co, us).iter().any(|&e| home(e).as_deref() == Some(b))),
+            ),
+            3 => (
+                "not exists user age is null".into(),
+                Box::new(move || c.all().where_not_exists(u.all().where_null("age"), "company")),
+                Box::new(move |co, us| !staff(co, us).iter().any(|&e| age(e).is_none())),
+            ),
+            4 => (
+                format!("exists user where company.city = {a}"),
+                Box::new(move || c.all().where_exists(u.where_eq("company.city", a), "company")),
+                Box::new(move |co, us| ccity(co).as_deref() == Some(a) && !staff(co, us).is_empty()),
+            ),
+            _ => (
+                format!("exists user age > {x} or city = {a}"),
+                Box::new(move || c.all().where_exists(u.all().where_gt("age", x), "company").or(c.where_eq("city", a))),
+                Box::new(move |co, us| {
+                    ccity(co).as_deref() == Some(a) || staff(co, us).iter().any(|&e| age(e).is_some_and(|g| g > x as i64))
+                }),
+            ),
+        };
+        let q = query().subscribe().unwrap();
+        ESub { name, q, query, seen: BTreeSet::new(), cond }
+    };
+    let mut subs: Vec<ESub> = (0..24).map(|i| make(i % 6, &mut rng)).collect();
+    let group = db.live_group();
+    let check = |subs: &mut Vec<ESub>, users: &[u64], companies: &[u64], step: usize| {
+        if step % 2 == 1 {
+            for s in subs.iter() {
+                group.add(&s.q);
+            }
+            for (id, d) in group.poll() {
+                let s = subs.iter_mut().find(|s| s.q.id() == id).expect("生きている購読の id");
+                integrate(&mut s.seen, d);
+            }
+        }
+        for s in subs.iter_mut() {
+            if step.is_multiple_of(2) {
+                integrate(&mut s.seen, s.q.poll());
+            }
+            let want: BTreeSet<u64> = companies.iter().copied().filter(|&co| (s.cond)(co, users)).collect();
+            assert_eq!(s.seen, want, "[{}] step {step}: 積分 != 手で数えた結果", s.name);
+            assert_eq!(s.q.count(), want.len(), "[{}] step {step}: count", s.name);
+            let found: BTreeSet<u64> = (s.query)().find().unwrap().into_iter().collect();
+            assert_eq!(found, want, "[{}] step {step}: find", s.name);
+        }
+    };
+    check(&mut subs, &users, &companies, 0);
+    let eng = db.engine();
+    let mut next_id = 1000i64;
+    for step in 1..1500 {
+        let e = users[rng.below(users.len() as u64) as usize];
+        match rng.below(10) {
+            0 | 1 => users_t.entity(e).set("age", rng.below(40) as i64).commit().unwrap(),
+            2 => eng.untie(e, "users.age"),
+            3 => users_t.entity(e).set("city", cities[rng.below(3) as usize]).commit().unwrap(),
+            4 | 5 => {
+                let x = companies[rng.below(companies.len() as u64) as usize];
+                users_t.entity(e).set("company", Value::Ref(x)).commit().unwrap();
+            }
+            6 => eng.untie(e, "users.company"),
+            7 => {
+                let i = rng.below(users.len() as u64) as usize;
+                users_t.entity(users[i]).delete().unwrap();
+                let mut b = users_t.insert().set("id", next_id).set("city", cities[rng.below(3) as usize]);
+                if rng.below(2) == 0 {
+                    b = b.set("age", rng.below(40) as i64);
+                }
+                if rng.below(3) != 0 {
+                    b = b.set("company", Value::Ref(companies[rng.below(companies.len() as u64) as usize]));
+                }
+                users[i] = b.commit().unwrap();
+                next_id += 1;
+            }
+            8 => {
+                let x = companies[rng.below(companies.len() as u64) as usize];
+                companies_t.entity(x).set("city", cities[rng.below(3) as usize]).commit().unwrap();
+            }
+            _ => {
+                // 会社を消して作り直す (指していた社員の ref は宙に浮く)
+                let i = rng.below(companies.len() as u64) as usize;
+                companies_t.entity(companies[i]).delete().unwrap();
+                companies[i] = companies_t.insert().set("id", next_id).set("city", cities[rng.below(3) as usize]).commit().unwrap();
+                next_id += 1;
+            }
+        }
+        if step % 5 == 0 {
+            let i = rng.below(subs.len() as u64) as usize;
+            let kind = rng.below(6);
+            subs[i] = make(kind, &mut rng);
+        }
+        if step % 3 == 0 {
+            check(&mut subs, &users, &companies, step);
+        }
+    }
+    check(&mut subs, &users, &companies, 1_000_001);
+    check(&mut subs, &users, &companies, 1_000_002);
+    // 指していない ref 列 / 別の table を指す列は常に 0 件
+    assert_eq!(c.all().where_exists(u.all(), "city").count().unwrap(), 0);
 }

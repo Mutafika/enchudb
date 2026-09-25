@@ -20,6 +20,7 @@ fn col_type_label(ty: ColumnType) -> &'static str {
         ColumnType::Number => "Num",
         ColumnType::Leaf => "Leaf",
         ColumnType::Ref => "Ref",
+        ColumnType::BigInt => "BigInt",
     }
 }
 

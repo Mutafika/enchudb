@@ -74,8 +74,8 @@ fn ring_rows(eng: &Arc<Engine>) -> Vec<(u32, PeerId, Hlc)> {
     let payload_hid = eng.himo_id("_sync_ops.payload").unwrap() as u16;
     let mut out = Vec::new();
     for eid in eng.entities_with_himo(lsn_hid) {
-        let Some(lsn) = eng.get_by_id(eid, lsn_hid) else { continue };
-        let Some(vid) = eng.get_by_id(eid, payload_hid) else { continue };
+        let Some(lsn) = eng.get_by_id(eid, lsn_hid).map(|l| l as u32) else { continue };
+        let Some(vid) = eng.get_by_id(eid, payload_hid).map(|v| v as u32) else { continue };
         let bytes = eng.vocab_text(vid).to_vec();
         let Some(rec) = enchudb_oplog::oplog::decode_sync_ops_payload(&bytes) else { continue };
         out.push((lsn, rec.author_peer, rec.hlc));

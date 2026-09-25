@@ -94,7 +94,7 @@ fn writes_to_a_local_only_table_are_not_bridged() {
         "local-only table の write が `_sync_ops` に流れている (peer に配られてしまう)"
     );
     // 配らないだけで、 自分では読めること。
-    assert_eq!(eng.get(seen, "_seen.n"), Some(LOCAL_MARKER));
+    assert_eq!(eng.get(seen, "_seen.n"), Some(u64::from(LOCAL_MARKER)));
 
     cleanup(&path);
 }

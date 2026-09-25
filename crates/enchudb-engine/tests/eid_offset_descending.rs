@@ -77,7 +77,7 @@ fn descending_eid_tie_does_not_explode() {
     // 個別 get も正しい
     for &eid in eids.iter().step_by(1000) {
         let want = (enchudb_oplog::eid_local(eid) % 10) as u32;
-        assert_eq!(eng.get(eid, "v"), Some(want), "eid={eid}");
+        assert_eq!(eng.get(eid, "v"), Some(u64::from(want)), "eid={eid}");
     }
 
     drop(eng);

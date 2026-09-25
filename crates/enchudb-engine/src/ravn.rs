@@ -8,7 +8,7 @@ pub struct Ravn {
 pub enum RavnResult {
     Entities(Vec<enchudb_oplog::EntityId>),
     Count(usize),
-    Values(Vec<(enchudb_oplog::EntityId, Vec<Option<u32>>)>),
+    Values(Vec<(enchudb_oplog::EntityId, Vec<Option<u64>>)>),
     Error(String),
 }
 
@@ -32,7 +32,7 @@ impl Ravn {
         &self.engine
     }
 
-    pub fn path(&self, eid: enchudb_oplog::EntityId, steps: &[&str]) -> Option<u32> {
+    pub fn path(&self, eid: enchudb_oplog::EntityId, steps: &[&str]) -> Option<u64> {
         if steps.is_empty() { return None; }
         let mut current: enchudb_oplog::EntityId = eid;
         for (i, step) in steps.iter().enumerate() {
@@ -107,7 +107,7 @@ impl Ravn {
     /// entity 集合を「`himo == value` を満たすもの」だけに絞る。
     pub fn filter_by(&self, eids: &[enchudb_oplog::EntityId], himo: &str, value: u32) -> Vec<enchudb_oplog::EntityId> {
         eids.iter()
-            .filter(|&&e| self.engine.get(e, himo) == Some(value))
+            .filter(|&&e| self.engine.get(e, himo) == Some(value as u64))
             .copied()
             .collect()
     }
@@ -118,9 +118,9 @@ impl Ravn {
         self.filter_by(eids, himo, vid)
     }
 
-    /// entity 集合から himo の値(u32)を抽出。
+    /// entity 集合から himo の値を抽出。
     /// None は除外。
-    pub fn extract(&self, eids: &[enchudb_oplog::EntityId], himo: &str) -> Vec<u32> {
+    pub fn extract(&self, eids: &[enchudb_oplog::EntityId], himo: &str) -> Vec<u64> {
         eids.iter()
             .filter_map(|&e| self.engine.get(e, himo))
             .collect()
@@ -140,10 +140,10 @@ impl Ravn {
             .collect()
     }
 
-    pub fn select(&self, conds: &[(&str, u32)], fields: &[&str]) -> Vec<(enchudb_oplog::EntityId, Vec<Option<u32>>)> {
+    pub fn select(&self, conds: &[(&str, u32)], fields: &[&str]) -> Vec<(enchudb_oplog::EntityId, Vec<Option<u64>>)> {
         let eids = self.engine.query(conds);
         eids.iter().map(|&eid| {
-            let values: Vec<Option<u32>> = fields.iter()
+            let values: Vec<Option<u64>> = fields.iter()
                 .map(|f| self.engine.get(eid, f))
                 .collect();
             (eid, values)
@@ -228,8 +228,8 @@ impl Ravn {
                         return RavnResult::Error("select: no fields specified".into());
                     }
                     let fields: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                    let rows: Vec<(enchudb_oplog::EntityId, Vec<Option<u32>>)> = eids.iter().map(|&eid| {
-                        let vals: Vec<Option<u32>> = fields.iter()
+                    let rows: Vec<(enchudb_oplog::EntityId, Vec<Option<u64>>)> = eids.iter().map(|&eid| {
+                        let vals: Vec<Option<u64>> = fields.iter()
                             .map(|f| self.engine.get(eid, f))
                             .collect();
                         (eid, vals)
@@ -241,7 +241,7 @@ impl Ravn {
                         return RavnResult::Error("get: no himo specified".into());
                     }
                     let himo = args[0].as_str();
-                    let rows: Vec<(enchudb_oplog::EntityId, Vec<Option<u32>>)> = eids.iter().map(|&eid| {
+                    let rows: Vec<(enchudb_oplog::EntityId, Vec<Option<u64>>)> = eids.iter().map(|&eid| {
                         (eid, vec![self.engine.get(eid, himo)])
                     }).collect();
                     return RavnResult::Values(rows);

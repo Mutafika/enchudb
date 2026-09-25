@@ -83,7 +83,10 @@ const LEGACY_SCHEMA_BLOB_HIMO: &str = "__enchu_schema_blob";
 
 /// 列の型。
 ///
-/// - `Number` — inline 数値 (ValueType::Number)
+/// - `Number` — inline 数値 (ValueType::Number)。 0 以上 `u32::MAX` 未満
+/// - `BigInt` — 64 bit 整数 (ValueType::Number64)。 負の数、 ms / µs の時刻、 64 bit の ID。 値域は
+///   [`BIGINT_MIN`]`..=`[`BIGINT_MAX`] (`i64::MAX` だけは空の印と重なるので使えない)。 engine には大小の順を
+///   保つ符号化 (`v ^ 2^63`) の u64 で置くので、 範囲・並び・上位 k 件がそのまま効く
 /// - `Tag` — 共有タグ、vocab 経由 (ValueType::Tag)。enum / カテゴリ / 名前など引かれる値向き
 /// - `Leaf` — 終端タグ、FreeStore 経由 (ValueType::Leaf)。備考 / 本文など引かれない自由記述向き
 /// - `Ref` — 他テーブル entity への参照 (ValueType::Ref)
@@ -93,12 +96,59 @@ pub enum ColumnType {
     Tag,
     Leaf,
     Ref,
+    BigInt,
+}
+
+/// `ColumnType::BigInt` の最小値。
+pub const BIGINT_MIN: i64 = i64::MIN;
+/// `ColumnType::BigInt` の最大値 (`i64::MAX` は符号化すると engine の空の印 `u64::MAX` になる)。
+pub const BIGINT_MAX: i64 = i64::MAX - 1;
+
+/// BigInt の値 → engine の u64 (大小の順を保つ: 符号 bit を反転)。 値域外 (`i64::MAX`) は None。
+fn big_raw(v: i64) -> Option<u64> {
+    (v <= BIGINT_MAX).then_some((v as u64) ^ (1 << 63))
+}
+
+/// engine の u64 → BigInt の値。
+fn big_val(raw: u64) -> i64 {
+    (raw ^ (1 << 63)) as i64
+}
+
+/// 範囲の条件の値 (整数だけ)。
+fn num(v: Value) -> Option<i64> {
+    match v {
+        Value::Number(n) => Some(n),
+        _ => None,
+    }
+}
+
+/// 列 `cd` への等値の値 → engine の値。 列の値域に入らない / 型が合わなければ None (Tag は vocab を引く
+/// 呼び側で)。
+fn eq_raw(cd: &ColumnInner, v: &Value) -> Option<u64> {
+    match (cd.ty, v) {
+        (ColumnType::Number, Value::Number(n)) if *n >= 0 && (*n as u64) < u32::MAX as u64 => Some(*n as u64),
+        (ColumnType::BigInt, Value::Number(n)) => big_raw(*n),
+        (ColumnType::Ref, Value::Ref(eid)) => Some(enchudb_oplog::eid_local(*eid) as u64),
+        _ => None,
+    }
+}
+
+/// `where_in` / `where_not_in` の値 (u32) → engine の値 (昇順・重複なし)。
+fn in_raw(cd: &ColumnInner, values: &[u32]) -> Vec<u64> {
+    let mut raw: Vec<u64> = values
+        .iter()
+        .map(|&v| if cd.ty == ColumnType::BigInt { big_raw(v as i64).expect("u32 は値域内") } else { v as u64 })
+        .collect();
+    raw.sort_unstable();
+    raw.dedup();
+    raw
 }
 
 impl ColumnType {
     fn value_type(self) -> ValueType {
         match self {
             ColumnType::Number => ValueType::Number,
+            ColumnType::BigInt => ValueType::Number64,
             ColumnType::Tag => ValueType::Tag,
             ColumnType::Leaf => ValueType::Leaf,
             ColumnType::Ref => ValueType::Ref,
@@ -112,6 +162,7 @@ impl ColumnType {
             ColumnType::Tag => "T",
             ColumnType::Leaf => "L",
             ColumnType::Ref => "R",
+            ColumnType::BigInt => "B",
         }
     }
     fn from_tag(s: &str) -> Option<Self> {
@@ -120,6 +171,7 @@ impl ColumnType {
             "T" => Some(ColumnType::Tag),
             "L" => Some(ColumnType::Leaf),
             "R" => Some(ColumnType::Ref),
+            "B" => Some(ColumnType::BigInt),
             _ => None,
         }
     }
@@ -1093,6 +1145,7 @@ impl Database {
                     ValueType::Tag => ColumnType::Tag,
                     ValueType::Leaf => ColumnType::Leaf,
                     ValueType::Ref => ColumnType::Ref,
+                    ValueType::Number64 => ColumnType::BigInt,
                 };
                 cols.push((col_name.to_string(), ty));
             }
@@ -1320,6 +1373,8 @@ impl<'a> TableBuilder<'a> {
     /// 終端タグ列 (ValueType::Leaf、FreeStore 経由 / dedupe なし)。
     /// 備考・メモ・本文など、引かれない自由記述に向く。
     pub fn leaf(self, name: &str) -> Self { self.column(name, ColumnType::Leaf) }
+    /// 64 bit 整数列 ([`ColumnType::BigInt`])。 負の数、 ms / µs の時刻、 64 bit の ID 向き。
+    pub fn bigint(self, name: &str) -> Self { self.column(name, ColumnType::BigInt) }
 
     /// 直前に宣言した列の cardinality hint (= distinct 値数の目安) を設定する。
     /// `BucketCylinder` の初期 size hint になると同時に、 **この列を group key に
@@ -1573,8 +1628,8 @@ impl<'a> Table<'a> {
         Query::new(self.db, self.inner.clone()).where_eq(col, val)
     }
 
-    /// `WHERE col >= lo AND col <= hi` 範囲 query 開始 (inclusive)。
-    pub fn where_range(&self, col: &str, lo: u32, hi: u32) -> Query<'a> {
+    /// `WHERE col >= lo AND col <= hi` 範囲 query 開始 (inclusive)。 `lo` / `hi` は整数 (u32 / i32 / i64)。
+    pub fn where_range<V: Into<Value>>(&self, col: &str, lo: V, hi: V) -> Query<'a> {
         Query::new(self.db, self.inner.clone()).where_range(col, lo, hi)
     }
 
@@ -1768,11 +1823,11 @@ impl<'a> RowBuilder<'a> {
                     .map(|(_, v)| *v);
                 if let Some(pk_v) = pk_value {
                     let pk_raw = value_to_raw_for_query(eng, pk_col, pk_v)?;
-                    if pk_raw != u32::MAX {
+                    if pk_raw != u64::MAX {
                         eng.rebuild();
                         // pk_col.himo_id は table 名 prefix 済み (`emp.pk_col`) なので
                         // 他テーブルと衝突しない → marker cond は不要。
-                        let found = eng.query_by_id(&[
+                        let found = eng.query_by_id64(&[
                             (pk_col.himo_id, pk_raw),
                         ]);
                         target_eid = found.into_iter().next();
@@ -1869,46 +1924,78 @@ pub struct LiveCounts {
     inner: enchudb_engine::LiveCounts,
     eng: Arc<Engine>,
     ty: ColumnType,
+    /// 合計の列が BigInt (engine の合計を元の値に戻す)。
+    sum_big: bool,
+    /// group ごとに最後に渡した (件数, 合計)。 engine は 「合計に足した件数」 (`Agg::summed`) が動いただけの
+    /// group も報告する (値 0 ↔ 値なし) が、 ここから見える (件数, 合計) が同じなら渡さない。
+    last: std::sync::Mutex<std::collections::BTreeMap<u64, (u64, i128)>>,
 }
 
 impl LiveCounts {
-    fn value(&self, v: u32) -> Value {
+    // engine の group の値は u64。 schema の列 (Number / Ref / Tag / Leaf) の値は u32 に収まる
+    fn value(&self, v: u64) -> Value {
         match self.ty {
             ColumnType::Number => Value::Number(v as i64),
-            ColumnType::Ref => Value::Ref(enchudb_oplog::make_eid(self.eng.peer_id(), v)),
-            ColumnType::Tag | ColumnType::Leaf => Value::Text(String::from_utf8_lossy(self.eng.vocab_text(v)).into_owned()),
+            ColumnType::BigInt => Value::Number(big_val(v)),
+            ColumnType::Ref => Value::Ref(enchudb_oplog::make_eid(self.eng.peer_id(), v as u32)),
+            ColumnType::Tag | ColumnType::Leaf => Value::Text(String::from_utf8_lossy(self.eng.vocab_text(v as u32)).into_owned()),
         }
     }
 
-    fn raw(&self, v: &Value) -> Option<u32> {
+    fn raw(&self, v: &Value) -> Option<u64> {
         match (self.ty, v) {
-            (ColumnType::Number, Value::Number(n)) => u32::try_from(*n).ok(),
-            (ColumnType::Ref, Value::Ref(e)) => Some(enchudb_oplog::eid_local(*e)),
-            (ColumnType::Tag, Value::Text(t)) => self.eng.vocab_id(t),
+            (ColumnType::Number, Value::Number(n)) => u32::try_from(*n).ok().map(u64::from),
+            (ColumnType::BigInt, Value::Number(n)) => big_raw(*n),
+            (ColumnType::Ref, Value::Ref(e)) => Some(enchudb_oplog::eid_local(*e) as u64),
+            (ColumnType::Tag, Value::Text(t)) => self.eng.vocab_id(t).map(u64::from),
             _ => None,
+        }
+    }
+
+    /// engine の合計を元の値の合計に。 BigInt は 1 件ごとに `v + 2^63` で載っているので、 値を足した件数
+    /// (`summed`) × 2^63 を引く。
+    fn sum_of(&self, a: enchudb_engine::Agg) -> i128 {
+        if self.sum_big {
+            a.sum as i128 - ((a.summed as i128) << 63)
+        } else {
+            a.sum as i128
         }
     }
 
     /// 前回 poll から件数が変わった group と今の件数 (0 = その group の row が居なくなった)。
     /// 値で上書きして積めば常に今の件数。 初回は登録時点の全 group。 並びは値の内部表現の順。
     pub fn poll(&self) -> Vec<(Value, u64)> {
-        self.inner.poll(&self.eng).into_iter().map(|(v, n)| (self.value(v), n)).collect()
+        self.poll_raw().into_iter().map(|(v, n, _)| (v, n)).collect()
+    }
+
+    /// engine の報告のうち、 (件数, 合計) が最後に渡したものと違う group だけ (件数 0 = 消えた)。
+    fn poll_raw(&self) -> Vec<(Value, u64, i128)> {
+        let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out = Vec::new();
+        for (v, a) in self.inner.poll_sums(&self.eng) {
+            let now = (a.count, self.sum_of(a));
+            let changed = if a.count == 0 { last.remove(&v).is_some() } else { last.insert(v, now) != Some(now) };
+            if changed {
+                out.push((self.value(v), now.0, now.1));
+            }
+        }
+        out
     }
 
     /// `poll` の、 件数と合計の両方を返す版 ([`Query::subscribe_sums`] の購読。 件数か合計が動いた
     /// group、 件数 0 = group が消えた)。 `poll` と報告状態を共有する。 合計しない購読では合計は 0。
-    pub fn poll_sums(&self) -> Vec<(Value, u64, u64)> {
-        self.inner.poll_sums(&self.eng).into_iter().map(|(v, a)| (self.value(v), a.count, a.sum)).collect()
+    pub fn poll_sums(&self) -> Vec<(Value, u64, i128)> {
+        self.poll_raw()
     }
 
     /// group `value` の今の合計 ([`Query::subscribe_sums`] の購読)。
-    pub fn get_sum(&self, value: &Value) -> u64 {
-        self.raw(value).map_or(0, |v| self.inner.get_agg(&self.eng, v).sum)
+    pub fn get_sum(&self, value: &Value) -> i128 {
+        self.raw(value).map_or(0, |v| self.sum_of(self.inner.get_agg(&self.eng, v)))
     }
 
     /// 今の全 group と件数・合計。
-    pub fn all_sums(&self) -> Vec<(Value, u64, u64)> {
-        self.inner.all_sums(&self.eng).into_iter().map(|(v, a)| (self.value(v), a.count, a.sum)).collect()
+    pub fn all_sums(&self) -> Vec<(Value, u64, i128)> {
+        self.inner.all_sums(&self.eng).into_iter().map(|(v, a)| (self.value(v), a.count, self.sum_of(a))).collect()
     }
 
     /// group `value` の今の件数。
@@ -2021,20 +2108,24 @@ impl std::fmt::Debug for GroupedLiveQuery {
 
 // ─────────────────────────── Query ───────────────────────────
 
-#[derive(Clone, Copy, Debug)]
-enum RangeOp { Gt, Ge, Lt, Le }
-
+/// 条件。 値は engine の u64 (Number は値、 BigInt は符号化した値、 Ref は local eid、 Tag は vocab id)。
 enum Predicate {
     /// himo_id == u16::MAX は「未知 col / 型不一致 → 結果 0 件」 sentinel。
-    Eq(u16, u32),
+    Eq(u16, u64),
     EqText(u16, String),
-    Range { himo_name: String, lo: u32, hi: u32 },
-    Cmp { himo_name: String, op: RangeOp, against: u32 },
-    In(u16, Vec<u32>),
+    Range { himo_name: String, lo: u64, hi: u64 },
+    In(u16, Vec<u64>),
     /// ref 列を順にたどった先の table の列への条件 (`where_eq("company.city", ..)`)。
     Via(Vec<u16>, Box<Predicate>),
     /// 枝 (条件の AND) のどれか (`Query::or`)。
     Or(Vec<Vec<Predicate>>),
+    /// 列に値がある。
+    Present(u16),
+    /// 単一列の条件 (Eq / EqText / In / Present) が偽 (値の無い row も真)。
+    Not(Box<Predicate>),
+    /// 別の table の row がこの row を ref 列 (himo `via`) で指していて、 条件 (engine の条件に写し済み、
+    /// None = 常に 0 件) を満たすものがある。
+    Exists { via: u16, preds: Option<Vec<enchudb_engine::LivePred>> },
 }
 
 pub struct Query<'a> {
@@ -2113,56 +2204,200 @@ impl<'a> Query<'a> {
     pub fn where_eq<V: Into<Value>>(mut self, col: &str, val: V) -> Self {
         let v = val.into();
         match self.resolve_col(col) {
-            None => self.preds.push(Predicate::Eq(u16::MAX, u32::MAX)), // unknown col → empty
+            None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)), // unknown col → empty
             Some((path, cd)) => {
                 let p = match (cd.ty, v) {
-                    (ColumnType::Tag, Value::Text(s)) => Predicate::EqText(cd.himo_id, s),
-                    (ColumnType::Number, Value::Number(n)) if n >= 0 && (n as u64) < u32::MAX as u64 => {
-                        Predicate::Eq(cd.himo_id, n as u32)
-                    }
-                    (ColumnType::Ref, Value::Ref(eid)) => Predicate::Eq(cd.himo_id, eid as u32),
-                    _ => Predicate::Eq(u16::MAX, u32::MAX), // type mismatch → empty
+                    (ColumnType::Tag, Value::Text(s)) => Some(Predicate::EqText(cd.himo_id, s)),
+                    (_, v) => eq_raw(&cd, &v).map(|raw| Predicate::Eq(cd.himo_id, raw)),
                 };
-                if matches!(p, Predicate::Eq(u16::MAX, _)) {
-                    self.preds.push(p);
-                } else {
-                    self.push_at(path, p);
+                match p {
+                    Some(p) => self.push_at(path, p),
+                    None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)), // 値域外 / 型不一致 → empty
                 }
             }
         }
         self
     }
 
-    pub fn where_range(mut self, col: &str, lo: u32, hi: u32) -> Self {
-        if let Some((path, cd)) = self.resolve_col(col) {
-            self.push_at(path, Predicate::Range { himo_name: cd.himo_name, lo, hi });
-        } else {
-            self.preds.push(Predicate::Eq(u16::MAX, u32::MAX));
+    /// `col` の値が `lo..=hi` (両端を含む、 i64)。 列の値域で切る (Number は 0 以上 `u32::MAX` 未満、 BigInt は
+    /// [`BIGINT_MIN`]`..=`[`BIGINT_MAX`])。 空の区間は常に偽の範囲 (購読でも書き間違い扱いにしない)。 未知の列は
+    /// `unknown_empty` なら常に 0 件、 でなければ条件を足さない (`where_gt` 系の従来の挙動)。
+    fn push_range(&mut self, col: &str, lo: Option<i64>, hi: Option<i64>, unknown_empty: bool) {
+        let Some((path, cd)) = self.resolve_col(col) else {
+            if unknown_empty {
+                self.preds.push(Predicate::Eq(u16::MAX, u64::MAX));
+            }
+            return;
+        };
+        let (lo, hi) = match cd.ty {
+            ColumnType::BigInt => {
+                let (l, h) = (lo.unwrap_or(BIGINT_MIN), hi.unwrap_or(BIGINT_MAX).min(BIGINT_MAX));
+                if l > h { (1, 0) } else { (big_raw(l).expect("値域内"), big_raw(h).expect("値域内")) }
+            }
+            _ => {
+                let top = u32::MAX as i64 - 1;
+                let (l, h) = (lo.unwrap_or(0).max(0), hi.unwrap_or(top).min(top));
+                if l > h { (1, 0) } else { (l as u64, h as u64) }
+            }
+        };
+        self.push_at(path, Predicate::Range { himo_name: cd.himo_name, lo, hi });
+    }
+
+    /// `col` の値が `lo` 以上 `hi` 以下。 `lo` / `hi` は整数 (u32 / i32 / i64)。
+    pub fn where_range<V: Into<Value>>(mut self, col: &str, lo: V, hi: V) -> Self {
+        match (num(lo.into()), num(hi.into())) {
+            (Some(lo), Some(hi)) => self.push_range(col, Some(lo), Some(hi), true),
+            _ => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
         }
         self
     }
 
-    fn push_cmp(&mut self, col: &str, op: RangeOp, against: u32) {
-        if let Some((path, cd)) = self.resolve_col(col) {
-            self.push_at(path, Predicate::Cmp { himo_name: cd.himo_name, op, against });
+    fn push_cmp(mut self, col: &str, against: Value, f: impl FnOnce(i64) -> (Option<i64>, Option<i64>)) -> Self {
+        match num(against) {
+            Some(a) => {
+                let (lo, hi) = f(a);
+                self.push_range(col, lo, hi, false);
+            }
+            None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
         }
+        self
     }
 
-    pub fn where_gt(mut self, col: &str, against: u32) -> Self { self.push_cmp(col, RangeOp::Gt, against); self }
-    pub fn where_ge(mut self, col: &str, against: u32) -> Self { self.push_cmp(col, RangeOp::Ge, against); self }
-    pub fn where_lt(mut self, col: &str, against: u32) -> Self { self.push_cmp(col, RangeOp::Lt, against); self }
-    pub fn where_le(mut self, col: &str, against: u32) -> Self { self.push_cmp(col, RangeOp::Le, against); self }
+    /// `col` の値が `against` より大きい。 `against` は整数 (u32 / i32 / i64、 BigInt 列なら i64 の値域)。
+    pub fn where_gt<V: Into<Value>>(self, col: &str, against: V) -> Self {
+        self.push_cmp(col, against.into(), |a| match a.checked_add(1) {
+            Some(lo) => (Some(lo), None),
+            None => (Some(1), Some(0)),
+        })
+    }
+    pub fn where_ge<V: Into<Value>>(self, col: &str, against: V) -> Self {
+        self.push_cmp(col, against.into(), |a| (Some(a), None))
+    }
+    pub fn where_lt<V: Into<Value>>(self, col: &str, against: V) -> Self {
+        self.push_cmp(col, against.into(), |a| match a.checked_sub(1) {
+            Some(hi) => (None, Some(hi)),
+            None => (Some(1), Some(0)),
+        })
+    }
+    pub fn where_le<V: Into<Value>>(self, col: &str, against: V) -> Self {
+        self.push_cmp(col, against.into(), |a| (None, Some(a)))
+    }
 
     pub fn where_ref(mut self, col: &str, target: EntityId) -> Self {
         if let Some((path, cd)) = self.resolve_col(col) {
-            self.push_at(path, Predicate::Eq(cd.himo_id, target as u32));
+            self.push_at(path, Predicate::Eq(cd.himo_id, enchudb_oplog::eid_local(target) as u64));
         }
         self
     }
 
+    /// `col` の値が `values` のどれか (Number / BigInt / Ref の列、 値は u32)。
     pub fn where_in(mut self, col: &str, values: &[u32]) -> Self {
         if let Some((path, cd)) = self.resolve_col(col) {
-            self.push_at(path, Predicate::In(cd.himo_id, values.to_vec()));
+            let raw = in_raw(&cd, values);
+            self.push_at(path, Predicate::In(cd.himo_id, raw));
+        }
+        self
+    }
+
+    /// `col` に値があり、 `val` と違う (SQL の `col <> val` — 値の無い row は入らない、 入れたい時は
+    /// `.or(t.where_null(col))`)。 `col` は ref 列をたどってもよい (`"company.city"` = 会社があり、 その
+    /// city に値があって `val` でない)。 型の合わない値は 「値があれば真」。
+    pub fn where_ne<V: Into<Value>>(mut self, col: &str, val: V) -> Self {
+        let v = val.into();
+        let Some((path, cd)) = self.resolve_col(col) else {
+            self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)); // unknown col → empty
+            return self;
+        };
+        let inner = match (cd.ty, v) {
+            (ColumnType::Tag, Value::Text(s)) => Some(Predicate::EqText(cd.himo_id, s)),
+            (_, v) => eq_raw(&cd, &v).map(|raw| Predicate::Eq(cd.himo_id, raw)),
+        };
+        self.push_at(path.clone(), Predicate::Present(cd.himo_id));
+        if let Some(p) = inner {
+            self.push_at(path, Predicate::Not(Box::new(p)));
+        }
+        self
+    }
+
+    /// `col` に値があり、 `values` のどれでもない (SQL の `col NOT IN (..)`、 値の無い row は入らない)。
+    pub fn where_not_in(mut self, col: &str, values: &[u32]) -> Self {
+        let Some((path, cd)) = self.resolve_col(col) else {
+            self.preds.push(Predicate::Eq(u16::MAX, u64::MAX));
+            return self;
+        };
+        self.push_at(path.clone(), Predicate::Present(cd.himo_id));
+        let raw = in_raw(&cd, values);
+        self.push_at(path, Predicate::Not(Box::new(Predicate::In(cd.himo_id, raw))));
+        self
+    }
+
+    /// `col` に値が無い (SQL の `col IS NULL`)。 ref をたどる列 (`"company.city"`) は 「会社はあって、
+    /// その city に値が無い」 (会社の無い row は入らない)。 否定だけでは候補を引けないので、 他に条件が
+    /// 無ければ table の代表列を持つ全 row から絞る。
+    pub fn where_null(mut self, col: &str) -> Self {
+        let Some((path, cd)) = self.resolve_col(col) else {
+            self.preds.push(Predicate::Eq(u16::MAX, u64::MAX));
+            return self;
+        };
+        if !path.is_empty() {
+            // 会社があること (1 段目の ref に値がある) を AND
+            self.preds.push(Predicate::Present(path[0]));
+        }
+        self.push_at(path, Predicate::Not(Box::new(Predicate::Present(cd.himo_id))));
+        self
+    }
+
+    /// `sub` (別の table への query) の row のうち、 ref 列 `via_col` でこの row を指しているものが 1 つ以上
+    /// ある (SQL の `EXISTS (SELECT .. FROM sub WHERE sub.via_col = this.id AND ..)`)。
+    ///
+    /// ```ignore
+    /// // 30 歳より上の社員が居る会社
+    /// let q = companies.all().where_exists(users.all().where_gt("age", 30), "company");
+    /// // いいねが 1 つも無い投稿
+    /// let q = posts.all().where_not_exists(likes.all(), "target");
+    /// ```
+    ///
+    /// `via_col` は `sub` の table の ref 列で、 この table を指すこと (違えば常に 0 件)。 find / count /
+    /// subscribe のどれでも使える。 購読では、 指している row の出入り・中身の変化も届く。
+    pub fn where_exists(mut self, sub: Query<'a>, via_col: &str) -> Self {
+        let p = self.exists_pred(sub, via_col);
+        match p {
+            Some(p) => self.preds.push(p),
+            None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
+        }
+        self
+    }
+
+    /// [`where_exists`](Self::where_exists) の否定: 指している row が 1 つも無い (SQL の `NOT EXISTS`)。
+    pub fn where_not_exists(mut self, sub: Query<'a>, via_col: &str) -> Self {
+        let p = self.exists_pred(sub, via_col);
+        match p {
+            Some(p) => self.preds.push(Predicate::Not(Box::new(p))),
+            None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
+        }
+        self
+    }
+
+    /// `where_exists` の条件。 `via_col` がこの table を指す ref 列でなければ None。
+    fn exists_pred(&self, sub: Query<'a>, via_col: &str) -> Option<Predicate> {
+        let cd = sub.table.col(via_col)?;
+        let points_here = cd.ty == ColumnType::Ref
+            && sub.table.relations.iter().any(|r| {
+                r.from_col.eq_ignore_ascii_case(via_col) && r.to_table.eq_ignore_ascii_case(&self.table.name)
+            });
+        if !points_here {
+            return None;
+        }
+        let via = cd.himo_id;
+        let preds = sub.live_preds().ok()?;
+        Some(Predicate::Exists { via, preds })
+    }
+
+    /// `col` に値がある (SQL の `col IS NOT NULL`)。
+    pub fn where_not_null(mut self, col: &str) -> Self {
+        match self.resolve_col(col) {
+            Some((path, cd)) => self.push_at(path, Predicate::Present(cd.himo_id)),
+            None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
         }
         self
     }
@@ -2206,7 +2441,8 @@ impl<'a> Query<'a> {
         let limit = self.limit.take();
         self.order = None;
         let eng = self.db.engine();
-        let mut keyed: Vec<((u32, u32), EntityId)> = self
+        // 並びは engine の値 (BigInt の符号化は大小の順を保つ)
+        let mut keyed: Vec<((u64, u32), EntityId)> = self
             .find_set()?
             .into_iter()
             .filter_map(|e| {
@@ -2215,7 +2451,7 @@ impl<'a> Query<'a> {
                     cur = eng.get_by_id(cur, h)? as EntityId;
                 }
                 let v = eng.get_by_id(cur, himo)?;
-                let v = if desc { u32::MAX - v } else { v };
+                let v = if desc { u64::MAX - v } else { v };
                 Some(((v, enchudb_oplog::eid_local(e)), e))
             })
             .collect();
@@ -2233,7 +2469,9 @@ impl<'a> Query<'a> {
 
         // ref をたどる条件 (`"company.city"`) を含むなら engine の live 条件評価に任せる
         // (候補を索引で引いて ref の逆引きで遡り、 全条件で評価)
-        if self.preds.iter().any(|p| matches!(p, Predicate::Via(..) | Predicate::Or(_))) {
+        if self.preds.iter().any(|p| {
+            matches!(p, Predicate::Via(..) | Predicate::Or(_) | Predicate::Not(_) | Predicate::Present(_) | Predicate::Exists { .. })
+        }) {
             let limit = self.limit;
             let Some(preds) = self.live_preds()? else { return Ok(Vec::new()) };
             let mut out = eng.find_by(preds).map_err(|e| SchemaError::Io(e.to_string()))?;
@@ -2243,14 +2481,13 @@ impl<'a> Query<'a> {
             return Ok(out);
         }
 
-        // 1. Eq / EqText / In を engine 側 query に折り込む。 Range / Cmp は post-filter。
+        // 1. Eq / EqText / In を engine 側 query に折り込む。 Range は post-filter。
         // column 名は `{table}.{col}` で prefix されてて他テーブルと共有しない設計
         // (case 1: column 名空間分離)。 marker cond は不要。
-        let mut eq_conds: Vec<(u16, u32)> = Vec::with_capacity(self.preds.len());
+        let mut eq_conds: Vec<(u16, u64)> = Vec::with_capacity(self.preds.len());
 
-        let mut in_pred: Option<(u16, Vec<u32>)> = None;
-        let mut range_preds: Vec<(String, u32, u32)> = Vec::new();
-        let mut cmp_preds: Vec<(String, RangeOp, u32)> = Vec::new();
+        let mut in_pred: Option<(u16, Vec<u64>)> = None;
+        let mut range_preds: Vec<(String, u64, u64)> = Vec::new();
         let mut empty = false;
 
         for p in self.preds {
@@ -2258,7 +2495,7 @@ impl<'a> Query<'a> {
                 Predicate::Eq(h, _) if h == u16::MAX => { empty = true; }
                 Predicate::Eq(h, v) => eq_conds.push((h, v)),
                 Predicate::EqText(h, s) => match eng.vocab_id(&s) {
-                    Some(vid) => eq_conds.push((h, vid)),
+                    Some(vid) => eq_conds.push((h, vid as u64)),
                     None => empty = true,
                 },
                 Predicate::In(h, vs) => {
@@ -2268,8 +2505,9 @@ impl<'a> Query<'a> {
                     in_pred = Some((h, vs));
                 }
                 Predicate::Range { himo_name, lo, hi } => range_preds.push((himo_name, lo, hi)),
-                Predicate::Cmp { himo_name, op, against } => cmp_preds.push((himo_name, op, against)),
-                Predicate::Via(..) | Predicate::Or(_) => unreachable!("Via / Or は find の先頭で find_by に回している"),
+                Predicate::Via(..) | Predicate::Or(_) | Predicate::Not(_) | Predicate::Present(_) | Predicate::Exists { .. } => {
+                    unreachable!("Via / Or / Not / Present / Exists は find の先頭で find_by に回している")
+                }
             }
         }
         if empty { return Ok(Vec::new()); }
@@ -2284,16 +2522,16 @@ impl<'a> Query<'a> {
         //      case 1 設計では「table の row」 = 「table の column を 1 つ以上 tie してる entity」、
         //      厳密には全 column union だが、 代表 column slice で実用上十分。
         let mut candidates = if !eq_conds.is_empty() {
-            let mut c = eng.query_by_id(&eq_conds);
+            let mut c = eng.query_by_id64(&eq_conds);
             // 3. IN は候補集合への set-membership filter として intersect
-            //    (pull_in_by_id の結果は sort + dedup 済み)
+            //    (pull_in_by_id64 の結果は sort + dedup 済み)
             if let Some((h, vs)) = in_pred {
-                let in_sorted = eng.pull_in_by_id(h, &vs);
+                let in_sorted = eng.pull_in_by_id64(h, &vs);
                 c.retain(|e| in_sorted.binary_search(e).is_ok());
             }
             c
         } else if let Some((h, vs)) = in_pred {
-            eng.pull_in_by_id(h, &vs)
+            eng.pull_in_by_id64(h, &vs)
         } else {
             let representative_hid = self.table.pk
                 .or_else(|| if self.table.cols.is_empty() { None } else { Some(0) })
@@ -2304,24 +2542,10 @@ impl<'a> Query<'a> {
             }
         };
 
-        // 4. post-filter range / cmp predicates (Column 直読み)
-        if !range_preds.is_empty() || !cmp_preds.is_empty() {
+        // 4. post-filter range predicates (Column 直読み、 engine の値で比べる)
+        if !range_preds.is_empty() {
             candidates.retain(|&eid| {
-                for (h, lo, hi) in &range_preds {
-                    let v = match eng.get(eid, h) { Some(v) => v, None => return false };
-                    if v < *lo || v > *hi { return false; }
-                }
-                for (h, op, against) in &cmp_preds {
-                    let v = match eng.get(eid, h) { Some(v) => v, None => return false };
-                    let ok = match op {
-                        RangeOp::Gt => v > *against,
-                        RangeOp::Ge => v >= *against,
-                        RangeOp::Lt => v < *against,
-                        RangeOp::Le => v <= *against,
-                    };
-                    if !ok { return false; }
-                }
-                true
+                range_preds.iter().all(|(h, lo, hi)| eng.get(eid, h).is_some_and(|v| *lo <= v && v <= *hi))
             });
         }
 
@@ -2430,13 +2654,14 @@ impl<'a> Query<'a> {
         let cd = self
             .table
             .col(sum_col)
-            .filter(|c| c.ty == ColumnType::Number)
-            .ok_or_else(|| SchemaError::BadValue(format!("subscribe_sums: {sum_col} is not a Number column of this table")))?;
+            .filter(|c| matches!(c.ty, ColumnType::Number | ColumnType::BigInt))
+            .ok_or_else(|| SchemaError::BadValue(format!("subscribe_sums: {sum_col} is not a Number / BigInt column of this table")))?;
+        let big = cd.ty == ColumnType::BigInt;
         let h = cd.himo_id;
-        self.subscribe_agg(col, Some(h))
+        self.subscribe_agg(col, Some((h, big)))
     }
 
-    fn subscribe_agg(self, col: &str, sum: Option<u16>) -> Result<LiveCounts, SchemaError> {
+    fn subscribe_agg(self, col: &str, sum: Option<(u16, bool)>) -> Result<LiveCounts, SchemaError> {
         if self.limit.is_some() {
             return Err(SchemaError::BadValue("subscribe_counts: limit is not supported".into()));
         }
@@ -2453,11 +2678,11 @@ impl<'a> Query<'a> {
             )
         })?;
         let inner = match sum {
-            Some(h) => eng.subscribe_sums(preds, path, cd.himo_id, h),
+            Some((h, _)) => eng.subscribe_sums(preds, path, cd.himo_id, h),
             None => eng.subscribe_counts(preds, path, cd.himo_id),
         }
         .map_err(|e| SchemaError::BadValue(e.to_string()))?;
-        Ok(LiveCounts { inner, eng, ty: cd.ty })
+        Ok(LiveCounts { inner, eng, ty: cd.ty, sum_big: sum.is_some_and(|s| s.1), last: Default::default() })
     }
 
     /// ablation / 計測用: engine の `subscribe_expand_always` で購読する (結果は `subscribe`
@@ -2494,24 +2719,22 @@ impl<'a> Query<'a> {
                 Predicate::EqText(h, text) => LivePred::EqText { himo_id: h, text },
                 Predicate::In(h, values) => LivePred::In { himo_id: h, values },
                 Predicate::Range { himo_name, lo, hi } => LivePred::Range { himo_id: hid_of(&himo_name)?, lo, hi },
-                Predicate::Cmp { himo_name, op, against } => {
-                    // 値は u32::MAX 未満 (sentinel 予約) なので上端は u32::MAX - 1。
-                    // 空区間 (`> 最大値` / `< 0`) は lo > hi の Range = 常に偽 (find と同じ 0 件)。
-                    const TOP: u32 = u32::MAX - 1;
-                    let (lo, hi) = match op {
-                        RangeOp::Gt => (against.saturating_add(1), TOP),
-                        RangeOp::Ge => (against, TOP),
-                        RangeOp::Lt => match against.checked_sub(1) {
-                            Some(h) => (0, h),
-                            None => (1, 0),
-                        },
-                        RangeOp::Le => (0, against),
-                    };
-                    LivePred::Range { himo_id: hid_of(&himo_name)?, lo, hi }
-                }
                 Predicate::Via(path, inner) => match conv(eng, *inner, rep)? {
                     Some(pred) => LivePred::Via { path, pred: Box::new(pred) },
                     None => return Ok(None),
+                },
+                Predicate::Present(h) => LivePred::Present { himo_id: h },
+                Predicate::Exists { via, preds } => match preds {
+                    Some(preds) => LivePred::Exists { via, preds },
+                    None => return Ok(None),
+                },
+                Predicate::Not(inner) => match conv(eng, *inner, rep)? {
+                    Some(pred) => LivePred::Not(Box::new(pred)),
+                    // 中身が常に偽 (未知の値など) = 否定は常に真: 条件を足さない (代表列を持つ row)
+                    None => {
+                        let rep = rep.ok_or_else(|| SchemaError::BadValue("subscribe: table has no columns".into()))?;
+                        LivePred::Present { himo_id: rep }
+                    }
                 },
                 Predicate::Or(branches) => {
                     if branches.is_empty() {
@@ -2540,7 +2763,20 @@ impl<'a> Query<'a> {
                     None => return Ok(None),
                 }
             }
-            if out.is_empty() {
+            // この table の row であることを保証する条件 (自分の列に値がある / 自分の ref 列をたどる) が無ければ
+            // (`.all()` / 否定だけ / `where_exists` だけ)、 代表列を持つ row = table の全 row から絞る。
+            // `Exists` は 「指されている entity」 なので table の row とは限らない (削除済みの row を指したままの
+            // ref もある)
+            fn own(p: &LivePred) -> bool {
+                match p {
+                    LivePred::Not(_) | LivePred::Exists { .. } => false,
+                    // 自分の ref 列に値がある (中身が否定でも)
+                    LivePred::Via { .. } => true,
+                    LivePred::Or(bs) => bs.iter().all(|b| b.iter().any(own)),
+                    _ => true,
+                }
+            }
+            if !out.iter().any(own) {
                 let rep = rep.ok_or_else(|| SchemaError::BadValue("subscribe: table has no columns".into()))?;
                 out.push(LivePred::Present { himo_id: rep });
             }
@@ -2563,16 +2799,65 @@ impl<'a> Query<'a> {
     // (= 64k 閾値で seq fallback) を呼ぶだけの薄い wrapper。 col 名は
     // `{table}.{col}` で prefix された himo 名に解決。
 
+    /// u32 の集計 (`sum` / `min` / `max` / `group_*` / `histogram`) の列。 BigInt は `BadValue` — 64 bit の値は
+    /// [`sum_i128`](Self::sum_i128) / [`min_i64`](Self::min_i64) / [`max_i64`](Self::max_i64) で。
     fn resolve_himo(&self, col: &str) -> Result<String, SchemaError> {
-        self.table.col(col)
-            .map(|cd| cd.himo_name.clone())
-            .ok_or_else(|| SchemaError::BadValue(format!("unknown col: {}", col)))
+        let cd = self.table.col(col).ok_or_else(|| SchemaError::BadValue(format!("unknown col: {}", col)))?;
+        if cd.ty == ColumnType::BigInt {
+            return Err(SchemaError::BadValue(format!("{col} is a BigInt column (use sum_i128 / min_i64 / max_i64)")));
+        }
+        Ok(cd.himo_name.clone())
+    }
+
+    /// 64 bit の集計の列: (紐名, BigInt か)。 Number / BigInt の列だけ。
+    fn resolve_num(&self, col: &str) -> Result<(String, bool), SchemaError> {
+        match self.table.col(col) {
+            Some(cd) if matches!(cd.ty, ColumnType::Number | ColumnType::BigInt) => {
+                Ok((cd.himo_name.clone(), cd.ty == ColumnType::BigInt))
+            }
+            Some(_) => Err(SchemaError::BadValue(format!("{col} is not a Number / BigInt column"))),
+            None => Err(SchemaError::BadValue(format!("unknown col: {}", col))),
+        }
+    }
+
+    /// sub-set 内の `col` の合計 (Number / BigInt、 負の数も)。 値の無い row は足さない。
+    pub fn sum_i128(self, col: &str) -> Result<i128, SchemaError> {
+        let (himo, big) = self.resolve_num(col)?;
+        let db = self.db;
+        let eids = self.find()?;
+        let raw = db.eng.sum64(&himo, &eids) as i128;
+        if !big {
+            return Ok(raw);
+        }
+        // BigInt は 1 件ごとに v + 2^63 で載っている
+        let n = db.eng.count(&himo, &eids) as i128;
+        Ok(raw - (n << 63))
+    }
+
+    /// sub-set 内の `col` の最小値 (Number / BigInt)。
+    pub fn min_i64(self, col: &str) -> Result<Option<i64>, SchemaError> {
+        let (himo, big) = self.resolve_num(col)?;
+        let db = self.db;
+        let eids = self.find()?;
+        Ok(db.eng.min64(&himo, &eids).map(|v| if big { big_val(v) } else { v as i64 }))
+    }
+
+    /// sub-set 内の `col` の最大値 (Number / BigInt)。
+    pub fn max_i64(self, col: &str) -> Result<Option<i64>, SchemaError> {
+        let (himo, big) = self.resolve_num(col)?;
+        let db = self.db;
+        let eids = self.find()?;
+        Ok(db.eng.max64(&himo, &eids).map(|v| if big { big_val(v) } else { v as i64 }))
     }
 
     /// sub-set 内で `col` が tie された entity 数 (= `SELECT COUNT(col) WHERE ...`)。
-    /// 既存 `count()` は entity 数、 こちらは特定 column の non-missing 数。
+    /// 既存 `count()` は entity 数、 こちらは特定 column の non-missing 数。 どの型の列でも。
     pub fn count_col(self, col: &str) -> Result<u32, SchemaError> {
-        let himo = self.resolve_himo(col)?;
+        let himo = self
+            .table
+            .col(col)
+            .map(|cd| cd.himo_name.clone())
+            .ok_or_else(|| SchemaError::BadValue(format!("unknown col: {}", col)))?;
         let db = self.db;
         let eids = self.find()?;
         Ok(db.eng.count_eids_par(&himo, &eids))
@@ -2657,12 +2942,13 @@ impl<'a> EntityRef<'a> {
         let eng = self.db.engine();
         match cd.ty {
             ColumnType::Number => eng.get(self.eid, &cd.himo_name).map(|v| Value::Number(v as i64)),
+            ColumnType::BigInt => eng.get_by_id(self.eid, cd.himo_id).map(|v| Value::Number(big_val(v))),
             // #184: storage の Ref 値は u32 (local 部) なので、素 cast すると find() /
             // commit() が返す full eid (peer prefix 付き) と食い違う。Ref は必ず自 DB 内
             // entity (翻訳済み foreign 含む = 自 prefix) を指すので自 peer_id で復元する。
             ColumnType::Ref => eng
                 .get(self.eid, &cd.himo_name)
-                .map(|v| Value::Ref(enchudb_oplog::make_eid(eng.peer_id(), v))),
+                .map(|v| Value::Ref(enchudb_oplog::make_eid(eng.peer_id(), v as u32))),
             // #119: 借用返しの `get_text` は writer 稼働中に seqlock verify を通らず torn
             // bytes を掴む (= from_utf8 が失敗して silent に None を返す)。 元々即コピーして
             // いるので、 verify 付きの owned 版に寄せてもコピー回数は変わらない。
@@ -2722,20 +3008,24 @@ impl<'a> EntityUpdate<'a> {
 
 /// query 等値判定用の raw u32 化。 Text 列は vocab を引き、 未登録なら
 /// `u32::MAX` を返す (caller 側で「結果 0 件」 として扱う前提)。
-fn value_to_raw_for_query(eng: &Engine, cd: &ColumnInner, v: &Value) -> Result<u32, SchemaError> {
+/// `u64::MAX` = 一致する row は無い (まだ vocab に無い文字列 / Leaf)。
+fn value_to_raw_for_query(eng: &Engine, cd: &ColumnInner, v: &Value) -> Result<u64, SchemaError> {
     match (cd.ty, v) {
         (_, Value::Null) => Err(SchemaError::BadValue("Null is not a queryable value".into())),
         (ColumnType::Number, Value::Number(n)) => {
             if *n < 0 || (*n as u64) >= u32::MAX as u64 {
                 return Err(SchemaError::BadValue(format!("integer out of u32 range: {n}")));
             }
-            Ok(*n as u32)
+            Ok(*n as u64)
         }
-        (ColumnType::Tag, Value::Text(s)) => Ok(eng.vocab_id(s).unwrap_or(u32::MAX)),
+        (ColumnType::BigInt, Value::Number(n)) => {
+            big_raw(*n).ok_or_else(|| SchemaError::BadValue(format!("integer out of BigInt range: {n}")))
+        }
+        (ColumnType::Tag, Value::Text(s)) => Ok(eng.vocab_id(s).map_or(u64::MAX, u64::from)),
         // Leaf は dedupe しないので等値クエリは原理的に成立しない (毎回別 vid)。
-        // 念のため `u32::MAX` を返してクエリ結果 0 件にする。
-        (ColumnType::Leaf, Value::Text(_)) => Ok(u32::MAX),
-        (ColumnType::Ref, Value::Ref(eid)) => Ok(*eid as u32),
+        // 念のため `u64::MAX` を返してクエリ結果 0 件にする。
+        (ColumnType::Leaf, Value::Text(_)) => Ok(u64::MAX),
+        (ColumnType::Ref, Value::Ref(eid)) => Ok(enchudb_oplog::eid_local(*eid) as u64),
         (t, v) => Err(SchemaError::TypeMismatch(format!("{t:?} vs {v:?}"))),
     }
 }
@@ -2752,6 +3042,11 @@ fn tie_value(eng: &Engine, eid: EntityId, cd: &ColumnInner, v: &Value) -> Result
                 return Err(SchemaError::BadValue(format!("integer out of u32 range: {n}")));
             }
             eng.tie_to_by_id(eid, cd.himo_id, *n as u32);
+            Ok(())
+        }
+        (ColumnType::BigInt, Value::Number(n)) => {
+            let raw = big_raw(*n).ok_or_else(|| SchemaError::BadValue(format!("integer out of BigInt range: {n}")))?;
+            eng.tie_to_by_id(eid, cd.himo_id, raw);
             Ok(())
         }
         (ColumnType::Tag, Value::Text(s)) | (ColumnType::Leaf, Value::Text(s)) => {

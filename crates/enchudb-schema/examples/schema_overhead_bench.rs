@@ -94,7 +94,7 @@ fn main() {
     let t = Instant::now();
     let mut s = 0u64;
     for _ in 0..iters_pt {
-        if let Some(v) = eng.get(target_raw, "user_id") { s = s.wrapping_add(v as u64); }
+        if let Some(v) = eng.get(target_raw, "user_id") { s = s.wrapping_add(v); }
     }
     let q1_raw_name = t.elapsed().as_nanos() as f64 / iters_pt as f64;
 
@@ -102,7 +102,7 @@ fn main() {
     let t = Instant::now();
     let mut s2 = 0u64;
     for _ in 0..iters_pt {
-        if let Some(v) = eng.get_by_id(target_raw, user_hid_r) { s2 = s2.wrapping_add(v as u64); }
+        if let Some(v) = eng.get_by_id(target_raw, user_hid_r) { s2 = s2.wrapping_add(v); }
     }
     let q1_raw_id = t.elapsed().as_nanos() as f64 / iters_pt as f64;
 
@@ -121,7 +121,7 @@ fn main() {
     let mut s4 = 0u64;
     for _ in 0..iters_pt {
         if let Some(v) = eng_sch.get_by_id(target_sch, user_hid_s) {
-            s4 = s4.wrapping_add(v as u64);
+            s4 = s4.wrapping_add(v);
         }
     }
     let q1_sch_id = t.elapsed().as_nanos() as f64 / iters_pt as f64;

@@ -115,7 +115,7 @@ proptest! {
 
         // shadow にある値はすべて db から read できる
         for (&(e, h), &v) in &shadow {
-            prop_assert_eq!(db.get(e as u64, himo_name(h)), Some(v),
+            prop_assert_eq!(db.get(e as u64, himo_name(h)), Some(u64::from(v)),
                 "expected get(eid={}, himo={}) = Some({})", e, himo_name(h), v);
         }
 

@@ -215,7 +215,7 @@ fn cmd_publish(opts: &HashMap<String, String>) {
     let rec = WireRecord::unsigned(
         Hlc { wall: hlc_wall, logical: 0, peer },
         peer,
-        DecodedOp::Tie { eid, himo_id, value },
+        DecodedOp::Tie { eid, himo_id, value: value as u64 },
     );
 
     let client = HttpTransport::new(origin_url);

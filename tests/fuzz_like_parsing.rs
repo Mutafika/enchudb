@@ -64,7 +64,7 @@ proptest! {
         let orig = WireRecord::unsigned(
             Hlc { wall, logical, peer },
             peer,
-            DecodedOp::Tie { eid, himo_id, value },
+            DecodedOp::Tie { eid, himo_id, value: value as u64 },
         );
         let enc = orig.encode();
         let (dec, _) = WireRecord::decode(&enc).expect("encode -> decode should roundtrip");
