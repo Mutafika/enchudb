@@ -2230,6 +2230,8 @@ enum RootMode {
     Ranged,
     /// 集計: 鍵ごと・値 (group) ごとの件数を数える。
     Grouped,
+    /// 鍵付きの購読: 値 (鍵) の変化を entity の印にするだけ (group ごとの件数は読む人が居ないので数えない)。
+    Keyed,
     /// 上位 k 件: 鍵ごとに (値, eid) の順序を持ち、 member ごとの k 番目を動かす (`true` = 降順)。
     Ordered(bool),
 }
@@ -2998,6 +3000,24 @@ impl Settled {
             }
             return;
         }
+        if mode == RootMode::Keyed {
+            // 出入りも鍵の変化も entity の印 (旧鍵と新鍵の両方の member に)
+            for (k, ans, enter) in [(iw, was, false), (inw, now, true)] {
+                let (Some(i), Some(_)) = (k, ans) else { continue };
+                let rk = &mut keys[i];
+                if enter {
+                    rk.count += 1;
+                } else {
+                    rk.count -= 1;
+                }
+                for &slot in &rk.members {
+                    if let Some(m) = members[slot].as_mut() {
+                        m.note(slot, ready, eid, false);
+                    }
+                }
+            }
+            return;
+        }
         if mode == RootMode::Grouped {
             for (k, ans, y, enter) in [(iw, was, wx, false), (inw, now, x, true)] {
                 let (Some(i), Some((_, v))) = (k, ans) else { continue };
@@ -3127,6 +3147,8 @@ pub(crate) struct Family {
     /// 1 段目の先の entity を記録し、 件数は 1 段目の先ごとの部分和で持つ — 1 段目の先の group の
     /// 値が変わっても根を評価せず部分和を移すだけ (`Settled::move_partial`)。
     partial: Option<usize>,
+    /// 鍵付きの購読の family (形の署名に `KEYED` が入るので、 集計の購読とは混ざらない)。
+    keyed: bool,
     /// 上位 k 件で並びの列が根でない時: 根の子のうち道の上の節 (1 段目)。 根は 1 段目の先の entity を
     /// 記録し、 順序は会社ごとの塊 (`OrderIndex::Blocks`) — 会社の値が変わっても塊を付け替えるだけ。
     order_part: Option<usize>,
@@ -3301,6 +3323,7 @@ impl Family {
             }),
             expand_always: AtomicBool::new(false),
             partial: if kind == CarryKind::Group && !keyed { nodes_partial } else { None },
+            keyed,
             order_part: if matches!(kind, CarryKind::Order(_)) { nodes_partial } else { None },
             range,
             kind,
@@ -3847,6 +3870,7 @@ impl Family {
         let mode = match (self.range.is_some(), self.kind) {
             (false, _) => RootMode::Plain,
             (true, CarryKind::Range) => RootMode::Ranged,
+            (true, CarryKind::Group) if self.keyed => RootMode::Keyed,
             (true, CarryKind::Group) => RootMode::Grouped,
             (true, CarryKind::Order(desc)) => RootMode::Ordered(desc),
         };

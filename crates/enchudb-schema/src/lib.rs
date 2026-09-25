@@ -3107,13 +3107,15 @@ fn kept_ids(dl: &Keyed<u32>, dc: &Keyed<EntityId>) -> std::collections::BTreeSet
     out
 }
 
-// ─────────────────────────── 再帰 (階層の配下) ───────────────────────────
+// ─────────────────────────── 再帰 (階層の配下 / 上) ───────────────────────────
 
-/// [`Query::under`] の戻り値。 階層の配下の row を引く / 購読する。
+/// [`Query::under`] / [`Query::above`] の戻り値。 階層の配下 (または上) の row を引く / 購読する。
 pub struct UnderQuery<'a> {
     rows: Query<'a>,
     seeds: Query<'a>,
     ref_col: String,
+    /// 上向き (seed の上司をたどる、 [`Query::above`])
+    up: bool,
 }
 
 /// 配下の計画: (結果を絞る条件, seed の条件, table の全 row の条件, ref 列)。
@@ -3123,61 +3125,69 @@ impl<'a> UnderQuery<'a> {
     fn plan(self) -> Result<Option<UnderPlan>, SchemaError> {
         let bad = |m: String| Err(SchemaError::BadValue(m));
         let (rows, seeds) = (self.rows, self.seeds);
+        let what = if self.up { "above" } else { "under" };
         if rows.limit.is_some() || rows.order.is_some() || seeds.limit.is_some() || seeds.order.is_some() {
-            return bad("under: limit / order_by are not supported".into());
+            return bad(format!("{what}: limit / order_by are not supported"));
         }
         if !Arc::ptr_eq(&rows.table, &seeds.table) {
-            return bad(format!("under: seeds must be a query on {}", rows.table.name));
+            return bad(format!("{what}: seeds must be a query on {}", rows.table.name));
         }
         let t = &rows.table;
         let cd = t.col(&self.ref_col).cloned();
         let points = cd.as_ref().is_some_and(|c| c.ty == ColumnType::Ref)
             && t.relations.iter().any(|r| r.from_col.eq_ignore_ascii_case(&self.ref_col) && r.to_table.eq_ignore_ascii_case(&t.name));
         let Some(cd) = cd.filter(|_| points) else {
-            return bad(format!("under: {} is not a ref column of {} pointing to itself", self.ref_col, t.name));
+            return bad(format!("{what}: {} is not a ref column of {} pointing to itself", self.ref_col, t.name));
         };
         let all = Query::new(rows.db, t.clone());
         let (Some(f), Some(sd), Some(a)) = (rows.live_preds()?, seeds.live_preds()?, all.live_preds()?) else { return Ok(None) };
         Ok(Some((f, sd, a, cd.himo_id)))
     }
 
-    /// 今の配下の row (昇順)。
+    /// 今の配下 (または上) の row (昇順)。
     pub fn find(self) -> Result<Vec<EntityId>, SchemaError> {
         let eng = self.rows.db.arc_engine();
         let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let up = self.up;
         let Some((f, sd, a, via)) = self.plan()? else { return Ok(Vec::new()) };
         let peer = eng.peer_id();
         let local = |e: EntityId| enchudb_oplog::eid_local(e);
-        let mut tree = Tree::default();
+        let mut h = Hier::new(up);
         for e in eng.find_by(a).map_err(io)? {
             if let Some(p) = eng.get_by_id(e, via) {
-                tree.set_parent(local(e), Some(p as u32));
+                h.link(local(e), p as u32, &mut Default::default());
             }
         }
-        tree.seed = eng.find_by(sd).map_err(io)?.into_iter().map(local).collect();
+        let mut touched = Vec::new();
+        for e in eng.find_by(sd).map_err(io)? {
+            h.set_seed(local(e), true, &mut touched);
+        }
         let mut out: Vec<EntityId> =
-            eng.find_by(f).map_err(io)?.into_iter().filter(|&e| tree.walk(local(e))).map(|e| enchudb_oplog::make_eid(peer, local(e))).collect();
+            eng.find_by(f).map_err(io)?.into_iter().filter(|&e| h.find_answer(local(e))).map(|e| enchudb_oplog::make_eid(peer, local(e))).collect();
         out.sort_unstable();
         Ok(out)
     }
 
-    /// 今の配下の row の数。
+    /// 今の配下 (または上) の row の数。
     pub fn count(self) -> Result<usize, SchemaError> {
         Ok(self.find()?.len())
     }
 
-    /// 配下の row の出入りを購読する。 初回 poll は登録時点の全部が `added`。 親の付け替え (異動・部署の移動)、
-    /// seed の出入り、 この query の条件の変化で届く。 付け替えで配下の答えが変わらない row の下は見に行かない。
+    /// 配下 (または上) の row の出入りを購読する。 初回 poll は登録時点の全部が `added`。 親の付け替え (異動・部署の移動)、
+    /// seed の出入り、 この query の条件の変化で届く。 下向きは、 付け替えで配下の答えが変わらない row の下は見に行かない。
+    /// 上向きは、 付け替え 1 回・seed の出入り 1 回が階層の深さに比例。
     pub fn subscribe(self) -> Result<LiveUnder, SchemaError> {
         let eng = self.rows.db.arc_engine();
         let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let up = self.up;
+        let state = std::sync::Mutex::new(UnderState { hier: Hier::new(up), filt: Default::default(), reported: Default::default() });
         let Some((f, sd, a, via)) = self.plan()? else {
-            return Ok(LiveUnder { eng, live: None, state: Default::default() });
+            return Ok(LiveUnder { eng, live: None, state });
         };
         let parents = eng.subscribe_keyed(a, Vec::new(), via).map_err(io)?;
         let seeds = eng.subscribe(sd).map_err(io)?;
         let filter = eng.subscribe(f).map_err(io)?;
-        Ok(LiveUnder { eng, live: Some((parents, seeds, filter)), state: Default::default() })
+        Ok(LiveUnder { eng, live: Some((parents, seeds, filter)), state })
     }
 }
 
@@ -3246,17 +3256,278 @@ impl Tree {
     }
 }
 
-/// 配下の購読の状態。
+/// 上向き (seed の上司全員) の状態。 row x の `sub[x]` = x 自身か x の下 (何段下でも) に居る seed の数。 輪の上の row は、
+/// 輪につながる全員 (輪と、 輪にぶら下がる木) の seed の数。 x が答え ⇔ `sub[x]` が x 自身の seed を除いて 1 以上。
+///
+/// 付け替えは 「切る」 と 「つなぐ」 に分ける。 切る時は旧い親から上へ `sub[c]` を引き、 つなぐ時は新しい親から上へ足す
+/// (上へは輪を 1 周したら止まる)。 輪の上の row は 「自分と、 自分にぶら下がる木の seed の数」 (`own`) も持つ。 輪の上の
+/// row を切ると輪が c を根とする鎖にほどけるので、 鎖の `sub` を `own` から数え直す。 つないで輪ができたら (新しい親が
+/// c の下に居る)、 輪の row の `own` は道の隣どうしの `sub` の差、 `sub` は c の木の seed の数。 子の一覧は持たない。
 #[derive(Default)]
+struct Above {
+    parent: std::collections::BTreeMap<u32, u32>,
+    seed: std::collections::BTreeSet<u32>,
+    sub: std::collections::BTreeMap<u32, u64>,
+    /// 輪の上の row の own (0 は持たない)。
+    own: std::collections::BTreeMap<u32, u64>,
+}
+
+impl Above {
+    fn sub(&self, x: u32) -> u64 {
+        self.sub.get(&x).copied().unwrap_or(0)
+    }
+
+    fn put(&mut self, x: u32, v: u64, touched: &mut Vec<u32>) {
+        use std::collections::btree_map::Entry;
+        match self.sub.entry(x) {
+            Entry::Occupied(mut o) if *o.get() != v => {
+                touched.push(x);
+                if v == 0 {
+                    o.remove();
+                } else {
+                    o.insert(v);
+                }
+            }
+            Entry::Vacant(o) if v != 0 => {
+                touched.push(x);
+                o.insert(v);
+            }
+            _ => {}
+        }
+    }
+
+    /// x と、 x から親をたどった row (輪を 1 周したら止まる)。 輪に着いたら、 輪に入った row も返す。
+    fn up_from(&self, x: u32) -> (Vec<u32>, Option<u32>) {
+        let mut out = vec![x];
+        // 輪の検出: 浅いうちは道を線形に見る (階層は普通浅い)、 深くなったら集合に
+        let mut seen: Option<std::collections::BTreeSet<u32>> = None;
+        let mut cur = x;
+        while let Some(&p) = self.parent.get(&cur) {
+            let again = match seen.as_mut() {
+                Some(set) => !set.insert(p),
+                None if out.len() < 32 => out.contains(&p),
+                None => {
+                    let mut set: std::collections::BTreeSet<u32> = out.iter().copied().collect();
+                    let again = !set.insert(p);
+                    seen = Some(set);
+                    again
+                }
+            };
+            if again {
+                return (out, Some(p));
+            }
+            out.push(p);
+            cur = p;
+        }
+        (out, None)
+    }
+
+    /// x から上の全員に ±k。
+    fn shift(&mut self, x: u32, k: u64, add: bool, touched: &mut Vec<u32>) {
+        if k == 0 {
+            return;
+        }
+        let (path, entry) = self.up_from(x);
+        for y in path {
+            let v = if add { self.sub(y) + k } else { self.sub(y) - k };
+            self.put(y, v, touched);
+        }
+        if let Some(r) = entry {
+            let o = self.own.get(&r).copied().unwrap_or(0);
+            let o = if add { o + k } else { o - k };
+            if o == 0 { self.own.remove(&r) } else { self.own.insert(r, o) };
+        }
+    }
+
+    fn set_seed(&mut self, s: u32, on: bool, touched: &mut Vec<u32>) {
+        if self.seed.contains(&s) == on {
+            return;
+        }
+        if on { self.seed.insert(s) } else { self.seed.remove(&s) };
+        touched.push(s);
+        self.shift(s, 1, on, touched);
+    }
+
+    fn cut(&mut self, c: u32, touched: &mut Vec<u32>) {
+        let Some(p) = self.parent.remove(&c) else { return };
+        let k = self.sub(c);
+        if k == 0 {
+            // c の下にも (輪なら、 つながる全員にも) seed が居ない: 誰の数も変わらない
+            return;
+        }
+        let (path, _) = self.up_from(p);
+        if path.last() != Some(&c) {
+            self.shift(p, k, false, touched);
+            return;
+        }
+        // c は輪の上だった: 輪 (p → … → c) が c を根とする鎖にほどける。 p が一番下
+        let mut acc = 0;
+        for y in path {
+            acc += self.own.remove(&y).unwrap_or(0);
+            self.put(y, acc, touched);
+        }
+    }
+
+    /// c の親を `to` にする。 下に seed の居ない row (ほとんど) は親の表を 1 回引くだけ。
+    fn reparent(&mut self, c: u32, to: Option<u32>, touched: &mut Vec<u32>) {
+        use std::collections::btree_map::Entry;
+        if self.sub(c) == 0 {
+            // c の下にも (輪なら、 つながる全員にも) seed が居ない: 誰の数も変わらない。 輪ができても c の木なので 0 のまま
+            match (self.parent.entry(c), to) {
+                (Entry::Occupied(mut o), Some(q)) => {
+                    o.insert(q);
+                }
+                (Entry::Occupied(o), None) => {
+                    o.remove();
+                }
+                (Entry::Vacant(v), Some(q)) => {
+                    v.insert(q);
+                }
+                (Entry::Vacant(_), None) => {}
+            }
+            return;
+        }
+        if self.parent.get(&c).copied() == to {
+            return;
+        }
+        self.cut(c, touched);
+        if let Some(q) = to {
+            self.link(c, q, touched);
+        }
+    }
+
+    /// 根 c を q の子にする。
+    fn link(&mut self, c: u32, q: u32, touched: &mut Vec<u32>) {
+        let k = self.sub(c);
+        let (path, _) = if k == 0 { (Vec::new(), None) } else { self.up_from(q) };
+        self.parent.insert(c, q);
+        if k == 0 {
+            // 足す seed が無い (輪ができても、 つながる全員が c の木なので 0 のまま)
+            return;
+        }
+        if path.last() != Some(&c) {
+            self.shift(q, k, true, touched);
+            return;
+        }
+        // 輪ができた (q → … → c → q): 輪の row の own は道の隣どうしの sub の差、 sub は c の木 (= つながる全員) の seed の数
+        let mut below = 0;
+        for &y in &path {
+            let s = self.sub(y);
+            if s > below {
+                self.own.insert(y, s - below);
+            }
+            below = s;
+        }
+        for &y in &path {
+            self.put(y, k, touched);
+        }
+    }
+}
+
+/// 階層の向きごとの状態。
+enum Hier {
+    Down(Tree),
+    Up(Above),
+}
+
+impl Hier {
+    fn new(up: bool) -> Hier {
+        if up { Hier::Up(Above::default()) } else { Hier::Down(Tree::default()) }
+    }
+
+    /// 根 c の親を p にする (find の組み立て用)。
+    fn link(&mut self, c: u32, p: u32, touched: &mut Vec<u32>) {
+        match self {
+            Hier::Down(t) => t.set_parent(c, Some(p)),
+            Hier::Up(a) => a.link(c, p, touched),
+        }
+    }
+
+    fn set_seed(&mut self, s: u32, on: bool, touched: &mut Vec<u32>) {
+        match self {
+            Hier::Down(t) => {
+                if on { t.seed.insert(s) } else { t.seed.remove(&s) };
+            }
+            Hier::Up(a) => a.set_seed(s, on, touched),
+        }
+    }
+
+    /// find 用の答え (下向きは親をたどる)。
+    fn find_answer(&self, x: u32) -> bool {
+        match self {
+            Hier::Down(t) => t.walk(x),
+            Hier::Up(a) => a.sub(x) > u64::from(a.seed.contains(&x)),
+        }
+    }
+
+    /// 購読で持っている答え。
+    fn answer(&self, x: u32) -> bool {
+        match self {
+            Hier::Down(t) => t.under.contains(&x),
+            Hier::Up(a) => a.sub(x) > u64::from(a.seed.contains(&x)),
+        }
+    }
+
+    /// 親の付け替えと seed の出入りを当てて、 答えが変わりうる row を返す。
+    fn apply(&mut self, dp: &enchudb_engine::KeyedDelta, ds: &LiveDelta) -> Vec<u32> {
+        use std::collections::BTreeSet;
+        let local = |e: EntityId| enchudb_oplog::eid_local(e);
+        // 外れた ref (付け替えは added で上書き)
+        let mut readded: Vec<EntityId> = dp.added.iter().map(|x| x.0).collect();
+        readded.sort_unstable();
+        let cut: Vec<u32> = dp.removed.iter().filter(|(e, _)| readded.binary_search(e).is_err()).map(|(e, _)| local(*e)).collect();
+        match self {
+            Hier::Down(tree) => {
+                // 答えを決め直す row: 親が変わった row と、 seed の出入りした row の子
+                let mut roots: BTreeSet<u32> = dp.removed.iter().chain(dp.added.iter()).map(|(e, _)| local(*e)).collect();
+                for &c in &cut {
+                    tree.set_parent(c, None);
+                }
+                for &(e, p) in &dp.added {
+                    tree.set_parent(local(e), Some(p as u32));
+                }
+                for &e in &ds.removed {
+                    tree.seed.remove(&local(e));
+                }
+                for &e in &ds.added {
+                    tree.seed.insert(local(e));
+                }
+                for &e in ds.removed.iter().chain(ds.added.iter()) {
+                    let x = local(e);
+                    roots.extend(tree.children.range((x, 0)..=(x, u32::MAX)).map(|k| k.1));
+                }
+                tree.settle(roots)
+            }
+            Hier::Up(a) => {
+                let mut touched = Vec::new();
+                for &c in &cut {
+                    a.reparent(c, None, &mut touched);
+                }
+                for &(e, p) in &dp.added {
+                    a.reparent(local(e), Some(p as u32), &mut touched);
+                }
+                for &e in &ds.removed {
+                    a.set_seed(local(e), false, &mut touched);
+                }
+                for &e in &ds.added {
+                    a.set_seed(local(e), true, &mut touched);
+                }
+                touched
+            }
+        }
+    }
+}
+
+/// 配下の購読の状態。
 struct UnderState {
-    tree: Tree,
+    hier: Hier,
     /// この query の条件を満たす row。
     filt: std::collections::BTreeSet<u32>,
     /// 最後に渡した row。
     reported: std::collections::BTreeSet<u32>,
 }
 
-/// [`UnderQuery::subscribe`] の戻り値。 階層の配下の row の出入りを購読する。
+/// [`UnderQuery::subscribe`] の戻り値。 階層の配下 (または上) の row の出入りを購読する。
 pub struct LiveUnder {
     eng: Arc<Engine>,
     /// (親の ref の鍵付きの購読, seed, 結果を絞る条件)
@@ -3270,7 +3541,7 @@ impl LiveUnder {
         use std::collections::BTreeSet;
         let Some((parents, seeds, filter)) = &self.live else { return LiveDelta::default() };
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let UnderState { tree, filt, reported } = &mut *st;
+        let UnderState { hier, filt, reported } = &mut *st;
         let peer = self.eng.peer_id();
         let local = |e: EntityId| enchudb_oplog::eid_local(e);
         let (dp, ds, df) = (parents.poll(&self.eng), seeds.poll(&self.eng), filter.poll(&self.eng));
@@ -3278,47 +3549,21 @@ impl LiveUnder {
         let mut reborn: BTreeSet<u32> = dp.reentered.iter().map(|&e| local(e)).collect();
         let rs: BTreeSet<EntityId> = df.removed.iter().copied().collect();
         reborn.extend(df.added.iter().filter(|e| rs.contains(e)).map(|&e| local(e)));
-        // 答えを決め直す row: 親が変わった row と、 seed の出入りした row の子
-        let mut roots: BTreeSet<u32> = BTreeSet::new();
-        for (e, _) in &dp.removed {
-            roots.insert(local(*e));
-        }
-        for (e, _) in &dp.added {
-            roots.insert(local(*e));
-        }
-        // 外れた ref (付け替えは added で上書き)
-        let readded: BTreeSet<EntityId> = dp.added.iter().map(|x| x.0).collect();
-        for (e, _) in &dp.removed {
-            if !readded.contains(e) {
-                tree.set_parent(local(*e), None);
-            }
-        }
-        for &(e, p) in &dp.added {
-            tree.set_parent(local(e), Some(p as u32));
-        }
-        for &e in &ds.removed {
-            tree.seed.remove(&local(e));
-        }
-        for &e in &ds.added {
-            tree.seed.insert(local(e));
-        }
-        for &e in ds.removed.iter().chain(ds.added.iter()) {
-            let x = local(e);
-            roots.extend(tree.children.range((x, 0)..=(x, u32::MAX)).map(|k| k.1));
-        }
-        let mut touched: BTreeSet<u32> = tree.settle(roots).into_iter().collect();
+        let mut touched = hier.apply(&dp, &ds);
         for &e in &df.removed {
             filt.remove(&local(e));
-            touched.insert(local(e));
+            touched.push(local(e));
         }
         for &e in &df.added {
             filt.insert(local(e));
-            touched.insert(local(e));
+            touched.push(local(e));
         }
         touched.extend(reborn.iter().copied());
+        touched.sort_unstable();
+        touched.dedup();
         let mut d = LiveDelta::default();
         for x in touched {
-            let now = tree.under.contains(&x) && filt.contains(&x);
+            let now = hier.answer(x) && filt.contains(&x);
             let was = reported.contains(&x);
             let e = enchudb_oplog::make_eid(peer, x);
             match (was, now) {
@@ -3738,7 +3983,21 @@ impl<'a> Query<'a> {
     /// - たどる階層は table の全 row (この query の条件は結果を絞るだけ)。 ref が輪になっていても、 seed に着かなければ配下でない
     /// - `ref_col` はこの table を指す ref 列、 `seeds` は同じ table への query (違えば `find` / `subscribe` が `BadValue`)
     pub fn under(self, ref_col: &str, seeds: Query<'a>) -> UnderQuery<'a> {
-        UnderQuery { rows: self, seeds, ref_col: ref_col.to_string() }
+        UnderQuery { rows: self, seeds, ref_col: ref_col.to_string(), up: false }
+    }
+
+    /// [`Query::under`] の上向き: `seeds` の row の **上** (上司の上司 … 何段上でも、 seed 自身は含まない) の row のうち、
+    /// この query の条件を満たすもの (SQL の再帰 CTE で祖先をたどる形)。
+    ///
+    /// ```ignore
+    /// // Alice の上司全員 (何段上でも)
+    /// employees.all().above("manager", employees.where_eq("name", "Alice")).subscribe()?;
+    /// ```
+    ///
+    /// - ref が輪になっている時、 輪の row は 「輪とそこにぶら下がる row の seed (自分を除く)」 の上。 輪は 1 周で止まる
+    /// - 付け替え 1 回・seed の出入り 1 回のコストは階層の深さに比例 (配下の数によらない)
+    pub fn above(self, ref_col: &str, seeds: Query<'a>) -> UnderQuery<'a> {
+        UnderQuery { rows: self, seeds, ref_col: ref_col.to_string(), up: true }
     }
 
     /// この query の row と `other` (別の table への query) の row のうち、 この row の列 `my_col` の値と `other` の
