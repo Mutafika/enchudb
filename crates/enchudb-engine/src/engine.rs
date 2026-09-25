@@ -9430,6 +9430,38 @@ impl Engine {
         self.tie_to_by_id(eid, hid, value);
     }
 
+    /// 2 本の紐 `a` / `b` に 1 つの値の半分ずつを書く (上位 / 下位に分けた 64 bit 値など)。 2 本の
+    /// record は続いた HLC で載る ([`OpLog::append_run`](enchudb_oplog::oplog::OpLog::append_run)) ので、
+    /// 他の peer の同じ組の書き込みと cell ごとの LWW で混ざらない (片方だけ相手の値、 にならない)。
+    /// 値は `(himo_id, value)`、 `u32::MAX` は `tie_to_by_id` と同じく拒否 (両方とも書かない)。
+    pub fn tie_pair_to_by_id(&self, eid: enchudb_oplog::EntityId, a: (u16, u32), b: (u16, u32)) {
+        self.check_writable();
+        let eid = enchudb_oplog::eid_local(eid);
+        if a.1 == u32::MAX || b.1 == u32::MAX {
+            self.record_fault(FaultKind::ValueOutOfRange, "tie value == u32::MAX (sentinel reserved)");
+            return;
+        }
+        let reserved = self.himo_is_in_engine_internal_table(a.0 as usize);
+        debug_assert_eq!(reserved, self.himo_is_in_engine_internal_table(b.0 as usize));
+        let hlcs = match self.oplog.as_ref() {
+            Some(wal) if !reserved => {
+                let oplog_eid = self.oplog_eid(eid);
+                let recs = [
+                    enchudb_oplog::oplog::OwnedOp::Tie { eid: oplog_eid, himo_id: a.0, value: a.1 },
+                    enchudb_oplog::oplog::OwnedOp::Tie { eid: oplog_eid, himo_id: b.0, value: b.1 },
+                ];
+                // append 失敗 (WAL 満杯) は `append_local_op` と同じく版数不明で本体にだけ書く
+                wal.append_run(&recs).map_or([enchudb_oplog::Hlc::ZERO; 2], |v| [v[0].1, v[1].1])
+            }
+            _ => [enchudb_oplog::Hlc::ZERO; 2],
+        };
+        for ((himo_id, value), hlc) in [a, b].into_iter().zip(hlcs) {
+            if !self.set_cell_local(eid, himo_id, value, hlc) {
+                self.warn_local_write_rejected(eid, himo_id, hlc);
+            }
+        }
+    }
+
     /// `tie_to` の himo_id 直指定版。 hot path 用 (string lookup を避ける)。
     pub fn tie_to_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: u32) {
         self.check_writable();

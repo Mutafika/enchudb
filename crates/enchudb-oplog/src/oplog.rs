@@ -588,6 +588,17 @@ impl Drop for OpLogLockGuard<'_> {
     }
 }
 
+/// append 系の record に載せる HLC。
+#[derive(Clone, Copy)]
+enum Mint<'a> {
+    /// record ごとに採番する。
+    Each,
+    /// request17-A3: 採番済み (index 対応、 採番し直さない)。
+    Given(&'a [Hlc]),
+    /// 全 record に続いた HLC を 1 回で採番する (`append_run`)。
+    Run,
+}
+
 pub struct OpLog {
     #[cfg(not(target_arch = "wasm32"))]
     _file: File,
@@ -861,12 +872,20 @@ impl OpLog {
     /// 次の HLC を払い出す。
     /// wall が前回より進んでいれば logical=0 にリセット、同じ/戻っていれば logical+1。
     fn next_hlc(&self) -> Hlc {
+        self.next_hlc_run(1)[0]
+    }
+
+    /// 続いた HLC を `n` 個まとめて払い出す: 同じ wall で logical が 1 ずつ増える (間に他の採番が
+    /// 入らない)。
+    fn next_hlc_run(&self, n: usize) -> Vec<Hlc> {
         let peer = self.peer_id.load(Ordering::Acquire);
         let now = current_wall_ms();
         let mut st = self.hlc_state.lock().unwrap_or_else(|p| p.into_inner());
         let (last, logical) = *st;
-        *st = if now > last { (now, 0) } else { (last, logical.wrapping_add(1)) };
-        Hlc { wall: st.0, logical: st.1, peer }
+        let (wall, first) = if now > last { (now, 0) } else { (last, logical.wrapping_add(1)) };
+        let out: Vec<Hlc> = (0..n as u32).map(|i| Hlc { wall, logical: first.wrapping_add(i), peer }).collect();
+        *st = (wall, first.wrapping_add(n as u32 - 1));
+        out
     }
 
     /// request17-A3: HLC を **1 個だけ先に払い出す**。 採番したら clock は進むので、
@@ -921,7 +940,19 @@ impl OpLog {
     /// consumer thread が queue を drain して呼ぶことで flock コストを償却できる。
     /// 戻り値は各 record の LSN (順序対応)。
     pub fn append_many(&self, records: &[OwnedOp]) -> io::Result<Vec<u64>> {
-        self.append_many_impl(records, None)
+        self.append_many_impl(records, Mint::Each).map(|v| v.into_iter().map(|(lsn, _)| lsn).collect())
+    }
+
+    /// `records` を **続いた HLC** (同じ wall、 logical が 1 ずつ増える) で連続 append し、 各 record の
+    /// (LSN, HLC) を返す。 複数の cell で 1 つの値を表す書き込み (上位 / 下位に分けた 64 bit 値) 用。
+    ///
+    /// cell ごとの LWW で、 別の peer の同じ組の書き込みと混ざらない: 混ざるのは相手の組
+    /// `(b1, b2)` が自分の組 `(a1, a2)` の内側に入った (`a1 < b1`、 `b2 < a2`) 時だけ。 wall が違えば
+    /// どちらかの組が丸ごと大きく、 wall が同じなら logical が連続しているので `a1 < b1` と
+    /// `b2 < a2` は peer の比較で逆向きになり両立しない。 採番は append の直列化の内側で行うので、
+    /// WAL 上の並びも HLC 順のまま。
+    pub fn append_run(&self, records: &[OwnedOp]) -> io::Result<Vec<(u64, Hlc)>> {
+        self.append_many_impl(records, Mint::Run)
     }
 
     /// request17-A3: `append_many` の **HLC 事前採番**版。 `hlcs[i]` が `records[i]` の
@@ -936,10 +967,10 @@ impl OpLog {
             "append_many_with_hlcs: records {} と hlcs {} の数が違う",
             records.len(), hlcs.len(),
         );
-        self.append_many_impl(records, Some(hlcs))
+        self.append_many_impl(records, Mint::Given(hlcs)).map(|v| v.into_iter().map(|(lsn, _)| lsn).collect())
     }
 
-    fn append_many_impl(&self, records: &[OwnedOp], hlcs: Option<&[Hlc]>) -> io::Result<Vec<u64>> {
+    fn append_many_impl(&self, records: &[OwnedOp], hlcs: Mint<'_>) -> io::Result<Vec<(u64, Hlc)>> {
         if records.is_empty() { return Ok(Vec::new()); }
         let sizes: Vec<usize> = records.iter()
             .map(|r| REC_HEADER_SIZE + r.as_op().payload_size())
@@ -955,13 +986,16 @@ impl OpLog {
         records: &[OwnedOp],
         sizes: &[usize],
         total: usize,
-        // request17-A3: Some なら採番せず与えられた HLC を載せる (index 対応)。
-        hlcs: Option<&[Hlc]>,
-    ) -> io::Result<Vec<u64>> {
+        hlcs: Mint<'_>,
+    ) -> io::Result<Vec<(u64, Hlc)>> {
         // #75: 同一プロセス内の直列化 (flock は同一 fd 共有スレッド間で no-op)
         let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
         #[cfg(not(target_arch = "wasm32"))]
         let _lock = self.flock_exclusive()?;
+        let run = match hlcs {
+            Mint::Run => self.next_hlc_run(records.len()),
+            _ => Vec::new(),
+        };
 
         // 一括 allocate
         let start_offset = self.alloc(total as u64)?;
@@ -978,8 +1012,9 @@ impl OpLog {
             // request17-A3: 事前採番された HLC があればそれを使う (採番し直すと
             // cell の version column と record の HLC がずれる)。
             let hlc = match hlcs {
-                Some(h) => h[i],
-                None => self.next_hlc(),
+                Mint::Given(h) => h[i],
+                Mint::Run => run[i],
+                Mint::Each => self.next_hlc(),
             };
             let author_peer = hlc.peer;
 
@@ -1014,7 +1049,7 @@ impl OpLog {
             header[OFF_SIGNATURE..OFF_SIGNATURE + 64].copy_from_slice(&signature);
             header[OFF_PUBKEY_FP..OFF_PUBKEY_FP + 8].copy_from_slice(&pubkey_fp);
 
-            lsns.push(lsn);
+            lsns.push((lsn, hlc));
             offset += record_size as u64;
         }
 
@@ -2319,6 +2354,41 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), n, "同じ HLC が {} 回払い出された", n - all.len());
+        let _ = std::fs::remove_dir_all(&p);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// `append_run` の record は続いた HLC (同じ wall、 logical が 1 ずつ) — 並行した採番が間に入らない。
+    /// WAL 上でも続いた LSN に HLC 順で並ぶ。
+    #[test]
+    fn append_run_hlcs_are_consecutive() {
+        let p = tmp("append_run");
+        let wal = std::sync::Arc::new(OpLog::create(&p, 64 * 1024 * 1024).unwrap());
+        let hs: Vec<_> = (0..8u64)
+            .map(|t| {
+                let w = wal.clone();
+                std::thread::spawn(move || {
+                    let mut runs = Vec::new();
+                    for i in 0..10_000u64 {
+                        if t % 2 == 0 {
+                            w.mint_hlc();
+                        } else {
+                            let recs = [
+                                OwnedOp::Tie { eid: i, himo_id: 0, value: 1 },
+                                OwnedOp::Tie { eid: i, himo_id: 1, value: 2 },
+                            ];
+                            runs.push(w.append_run(&recs).unwrap());
+                        }
+                    }
+                    runs
+                })
+            })
+            .collect();
+        for run in hs.into_iter().flat_map(|h| h.join().unwrap()) {
+            let [(l0, a), (l1, b)] = [run[0], run[1]];
+            assert_eq!(l1, l0 + 1, "組の record が続いた LSN でない");
+            assert_eq!((b.wall, b.logical), (a.wall, a.logical + 1), "組の HLC が続いていない: {a:?} {b:?}");
+        }
         let _ = std::fs::remove_dir_all(&p);
         let _ = std::fs::remove_file(&p);
     }
