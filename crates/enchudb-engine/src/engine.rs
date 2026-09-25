@@ -11342,7 +11342,8 @@ impl Engine {
         self.tie(eid, himo, Self::date_to_days(year, month, day));
     }
 
-    /// epoch 日数から (year, month, day) を返す
+    /// epoch 日数から (year, month, day) を返す。 値が無い時と、 64 bit 列の値が日付でない
+    /// (u32 を超える日数 = 約 1,170 万年より先、 年が u32 に入らない) 時は None
     pub fn get_date(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Option<(u32, u32, u32)> {
         self.get(eid, himo).and_then(|d| u32::try_from(d).ok()).map(Self::days_to_date)
     }
