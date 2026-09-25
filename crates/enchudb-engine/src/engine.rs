@@ -11589,12 +11589,11 @@ impl Engine {
         Ok(q)
     }
 
-    /// この engine の全購読について、 前回 poll から出入りのあったものだけの差分を返す
-    /// (`(LiveQuery::id, 差分)`、 id 昇順)。 購読を 1 本ずつ `poll` する代わりに使うと、 コストが
-    /// 購読の数でなく出入りの数に比例する (購読が数千本ある時向け)。 各購読の `poll` と報告
-    /// 状態を共有するので、 同じ差分はどちらか一方にだけ届く。
-    pub fn poll_live(&self) -> Vec<(u64, crate::live::LiveDelta)> {
-        self.live.poll_all(self)
+    /// 購読の束を作る。 束に [`add`](crate::live::LiveGroup::add) した購読のうち、 出入りのあったものの
+    /// 差分だけを [`poll`](crate::live::LiveGroup::poll) でまとめて受け取れる (コストは出入りの数に比例)。
+    /// 束に入れていない購読の差分は取り出さない (同じ engine を使う他の部品の購読を横取りしない)。
+    pub fn live_group(&self) -> crate::live::LiveGroup {
+        crate::live::LiveGroup::new(&self.live)
     }
 
     /// `LivePred` の条件 (ref をたどる `Via` を含む) を **購読せずに 1 回だけ** 評価する。

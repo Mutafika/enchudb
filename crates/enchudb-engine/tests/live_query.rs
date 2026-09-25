@@ -398,7 +398,7 @@ fn via_subscription_under_concurrent_flips() {
 }
 
 /// 新しい種類の購読 (Or / 範囲の穴 / 集計 / 上位 k 件、 ref の先を含む) を **書き込みと並行して
-/// 登録し**、 書き込み 4 thread + `poll_live` / 個別 poll / count を並行で回した後、 writer 停止後の
+/// 登録し**、 書き込み 4 thread + 束の poll / 個別 poll / count を並行で回した後、 writer 停止後の
 /// 積分が手で数えた結果と一致すること。 lock 順 (Or の購読は family の lock を離してから自分を取る)
 /// を破ると deadlock で止まる形でもある。
 ///
@@ -478,8 +478,12 @@ fn new_kinds_under_concurrent_writes() {
         let mut seen: Vec<BTreeSet<u64>> = vec![BTreeSet::new(); qs.len()];
         let mut groups: std::collections::BTreeMap<u32, u64> = Default::default();
         let mut sum_groups: std::collections::BTreeMap<u32, enchudb_engine::Agg> = Default::default();
+        let group = eng.live_group();
+        for q in qs {
+            group.add(q);
+        }
         let absorb = |seen: &mut Vec<BTreeSet<u64>>, eng: &Engine| {
-            for (id, d) in eng.poll_live() {
+            for (id, d) in group.poll(eng) {
                 let i = qs.iter().position(|q| q.id() == id).expect("知らない購読の id");
                 integrate(&mut seen[i], d);
             }
@@ -489,7 +493,7 @@ fn new_kinds_under_concurrent_writes() {
         while t0.elapsed() < std::time::Duration::from_millis(40) {
             n += 1;
             if n.is_multiple_of(3) {
-                // count / ranked が先に settle して積んだ分も poll_live に届く
+                // count / ranked が先に settle して積んだ分も束の poll に届く
                 let _ = (or.count(&eng), top.ranked(&eng), counts.total(&eng));
             }
             if n.is_multiple_of(2) {

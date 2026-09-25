@@ -571,11 +571,12 @@ impl Database {
     /// `Arc<Engine>` を clone して返す。 engine 直接アクセス / 他 component との共有用。
     pub fn arc_engine(&self) -> Arc<Engine> { self.eng.clone() }
 
-    /// 全購読 ([`Query::subscribe`]) のうち、 前回 poll から出入りのあったものだけの差分
-    /// (`(LiveQuery::id, 差分)`、 id 昇順)。 購読を 1 本ずつ `poll` する代わりに使うと、 コストが
-    /// 購読の数でなく出入りの数に比例する (購読が数千本ある時向け)。 各購読の `poll` と報告
-    /// 状態を共有するので、 同じ差分はどちらか一方にだけ届く。
-    pub fn poll_live(&self) -> Vec<(u64, LiveDelta)> { self.eng.poll_live() }
+    /// 購読の束を作る。 束に [`LiveGroup::add`] した購読のうち、 前回から出入りのあったものの差分だけを
+    /// [`LiveGroup::poll`] でまとめて受け取る (コストは購読の数でなく出入りの数に比例、 購読が数千本
+    /// ある時向け)。 束に入れていない購読 (同じ `Database` を使う他の部品が持つもの) の差分は取り出さない。
+    pub fn live_group(&self) -> LiveGroup {
+        LiveGroup { inner: self.eng.live_group(), eng: self.eng.clone() }
+    }
 
     /// build phase 用、 `Arc<Engine>` が他に共有されていない (count = 1) 時のみ
     /// `&mut Engine` を返す。 concurrent モード遷移後は常に None。
@@ -1845,7 +1846,7 @@ impl LiveQuery {
         self.inner.is_dirty()
     }
 
-    /// engine 内で一意な購読 id ([`Database::poll_live`] の差分の宛先)。
+    /// engine 内で一意な購読 id ([`LiveGroup::poll`] の差分の宛先)。
     pub fn id(&self) -> u64 {
         self.inner.id()
     }
@@ -1937,6 +1938,37 @@ impl std::fmt::Debug for LiveCounts {
     }
 }
 
+/// 購読の束 ([`Database::live_group`])。 束を drop しても購読はそのまま (差分は各購読の `poll` で受け取れ、
+/// 他の束に入れ直してもよい)。
+pub struct LiveGroup {
+    inner: enchudb_engine::LiveGroup,
+    eng: Arc<Engine>,
+}
+
+impl LiveGroup {
+    /// 購読をこの束に入れる (購読は 1 つの束にしか入らない、 後から入れた束に移る)。
+    pub fn add(&self, q: &LiveQuery) {
+        self.inner.add(&q.inner);
+    }
+
+    /// 会社単位の購読を入れる (差分は group の eid)。
+    pub fn add_grouped(&self, q: &GroupedLiveQuery) {
+        self.inner.add_grouped(&q.inner);
+    }
+
+    /// 束の購読のうち、 前回から出入りのあったものの差分 (`(LiveQuery::id, 差分)`、 id 昇順)。 各購読の
+    /// `poll` と報告状態を共有するので、 同じ差分はどちらか一方にだけ届く。
+    pub fn poll(&self) -> Vec<(u64, LiveDelta)> {
+        self.inner.poll(&self.eng)
+    }
+}
+
+impl std::fmt::Debug for LiveGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
 /// [`Query::subscribe_grouped`] の戻り値。 結果を ref の先の row (group) 単位で持つ購読。
 /// drop で購読解除、 `Database` を借用しない。
 pub struct GroupedLiveQuery {
@@ -1975,7 +2007,7 @@ impl GroupedLiveQuery {
         self.inner.is_dirty()
     }
 
-    /// engine 内で一意な購読 id ([`Database::poll_live`] の差分の宛先。 差分は group の eid)。
+    /// engine 内で一意な購読 id ([`LiveGroup::poll`] の差分の宛先。 差分は group の eid)。
     pub fn id(&self) -> u64 {
         self.inner.id()
     }

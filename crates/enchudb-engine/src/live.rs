@@ -28,7 +28,7 @@
 //!
 //! 1. **書き込み** — Column の `(himo, eid)` を書いたら、 その紐を条件 (または枝) に持つ節に
 //!    `eid` の印を付けるだけ (O(1)、 評価しない)
-//! 2. **poll** (と `count` / `contains` / `members` / [`Engine::poll_live`](crate::engine::Engine::poll_live)) — 深い節から順に、
+//! 2. **poll** (と `count` / `contains` / `members` / [`LiveGroup::poll`]) — 深い節から順に、
 //!    印の付いた entity を **現在の Column 状態で** 評価し直す。 根でない節は 「その entity から
 //!    下の部分条件の答え」 を節ごとに記録し、 **答えが変わった entity だけ** を ref 紐の常設
 //!    逆引き索引 (その entity を指している親) で 1 段上に展開して印を付ける。 根では結果集合を
@@ -53,7 +53,7 @@
 //!   値の並びを id にしたもの、 偽 = なし)。 根の鍵が member の鍵と一致する根がその member の結果
 //! - 鍵の表には member の鍵の射影だけを載せる。 購読の無い値は表に無い = 偽 と同じに扱うので、
 //!   購読の無い値どうしの書き換え (東京だけを購読している時の 京都 → 大阪) は展開しない
-//! - 書き込み 1 回のコストは購読の数によらない。 [`Engine::poll_live`](crate::engine::Engine::poll_live) は出入りのあった member
+//! - 書き込み 1 回のコストは購読の数によらない。 [`LiveGroup::poll`] は出入りのあった member
 //!   だけを返す (購読を 1 本ずつ poll すると、 その呼び出し自体が購読の数に比例する)
 //! - 鍵の表には **今居る** member の鍵だけを載せる (使っている member の数を数えて 0 で外す)。
 //!   購読を張り替え続けても表・状態は伸びない。 鍵の id は使い回さない
@@ -184,7 +184,7 @@
 
 use crossbeam_epoch as epoch;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use enchudb_oplog::EntityId;
@@ -1402,6 +1402,9 @@ struct Member {
     topk: Option<TopK>,
     /// 上位 k 件の並びが降順か。
     order_desc: bool,
+    /// 入っている [`LiveGroup`] の id (0 = どこにも入っていない)。 group の poll はこの値が同じ member
+    /// だけを取り出し、 他は ready に残す (他の部品が持つ購読の差分を横取りしない)。
+    group: u64,
 }
 
 /// 上位 k 件の購読の境界。 鍵の順序 (`RootKey::order`、 (並びの値, eid) の昇順。 降順の購読は
@@ -1583,7 +1586,7 @@ struct Settled {
     members: Vec<Option<Member>>,
     /// 未有効化の member (登録直後 / text が vocab にまだ無い)。
     dormant: Vec<usize>,
-    /// changed が空でない (かもしれない) member。 `LiveRegistry::poll_all` はここだけを見る。
+    /// changed が空でない (かもしれない) member。 `LiveRegistry::poll_group` はここだけを見る。
     ready: Vec<usize>,
     /// 集計の部分和 (`Family::partial`): 1 段目の先の entity → その entity を指して数えられている根。
     partial: std::collections::BTreeMap<u32, Partial>,
@@ -2618,6 +2621,7 @@ impl Family {
             topk,
             order_desc,
             union,
+            group: 0,
         };
         let slot = match s.members.iter().position(Option::is_none) {
             Some(i) => {
@@ -3161,10 +3165,12 @@ pub(crate) struct LiveRegistry {
     /// 登録・解除 (snapshot の作り直し) を 1 本ずつにする。
     edit: Mutex<()>,
     /// 枝の差分を積んだが呼び手にまだ渡していない `Or` の購読 (`count` などが積んだ分。
-    /// `poll_all` が拾う)。
+    /// `poll_group` が拾う)。
     ready_unions: Mutex<Vec<Arc<Union>>>,
     next_id: AtomicUsize,
     next_member_id: std::sync::atomic::AtomicU64,
+    /// [`LiveGroup`] の id (1 から、 0 = どこにも入っていない)。
+    next_group: AtomicU64,
     /// poll が返す EntityId の peer prefix (`Engine::set_peer_id` が追従させる)。
     peer: AtomicU32,
 }
@@ -3190,6 +3196,7 @@ impl LiveRegistry {
             ready_unions: Mutex::new(Vec::new()),
             next_id: AtomicUsize::new(0),
             next_member_id: std::sync::atomic::AtomicU64::new(0),
+            next_group: AtomicU64::new(1),
             peer: AtomicU32::new(peer),
         }
     }
@@ -3338,6 +3345,7 @@ impl LiveRegistry {
                 })
                 .collect(),
             state: Mutex::new(UnionState::new(n)),
+            group: AtomicU64::new(0),
         });
         LiveQuery { kind: Kind::Any(u), id, registry: self.clone() }
     }
@@ -3397,31 +3405,40 @@ impl LiveRegistry {
     /// 前回の poll から出入りのあった全購読の差分 (`(LiveQuery::id, 差分)`、 id 昇順)。 各購読の
     /// `poll` と同じ報告状態を進める (どちらで受け取っても差分は 1 回だけ届く)。 コストは
     /// family 数 + 出入りの数で、 購読の数によらない。
-    pub(crate) fn poll_all(&self, r: &impl CellReader) -> Vec<(u64, LiveDelta)> {
+    /// group `gid` の購読のうち、 前回から出入りのあったものの差分 (`(id, 差分)`、 id 昇順)。 他の
+    /// group / どこにも入っていない購読の差分は取り出さずに残す。
+    pub(crate) fn poll_group(&self, r: &impl CellReader, gid: u64) -> Vec<(u64, LiveDelta)> {
         let peer = self.peer.load(Ordering::Acquire);
         let fams = self.families();
         let mut out = Vec::new();
-        // `Or` の枝の差分 (呼び手でなく枝の購読に積む)
+        // `Or` の枝の差分 (呼び手でなく枝の購読に積む — Or の購読がどの group でも枝は積んでおく)
         let mut branch: Vec<(Arc<Union>, usize, LiveDelta)> = Vec::new();
         for f in fams {
             let mut guard = f.settled.lock();
             f.settle(r, &mut guard);
             let Settled { recs, vals, members, ready, opart, order_view, .. } = &mut *guard;
             for slot in std::mem::take(ready) {
-                if let Some(m) = members[slot].as_mut() {
-                    let union = m.union.as_ref().map(|(w, i)| (w.upgrade(), *i));
-                    let d = m.drain(|e| view_at(recs, vals, opart, *order_view, e), if union.is_some() { 0 } else { peer });
-                    match union {
-                        Some((Some(u), i)) if !d.is_empty() => branch.push((u, i, d)),
-                        Some(_) => {}
-                        None if !d.is_empty() => out.push((m.id, d)),
-                        None => {}
-                    }
+                let Some(m) = members[slot].as_mut() else { continue };
+                let union = m.union.as_ref().map(|(w, i)| (w.upgrade(), *i));
+                if union.is_none() && m.group != gid {
+                    // 別の持ち主の購読: 印は残したまま (queued のまま) ready に戻す
+                    ready.push(slot);
+                    continue;
+                }
+                let d = m.drain(|e| view_at(recs, vals, opart, *order_view, e), if union.is_some() { 0 } else { peer });
+                match union {
+                    Some((Some(u), i)) if !d.is_empty() => branch.push((u, i, d)),
+                    Some(_) => {}
+                    None if !d.is_empty() => out.push((m.id, d)),
+                    None => {}
                 }
             }
         }
         // family の lock を離してから Or の購読の lock を取る (Or 側は Or → family の順に取らない)
-        branch.extend(std::mem::take(&mut *self.ready_unions.lock()).into_iter().map(|u| (u, 0, LiveDelta::default())));
+        let (mine, others): (Vec<Arc<Union>>, Vec<Arc<Union>>) =
+            std::mem::take(&mut *self.ready_unions.lock()).into_iter().partition(|u| u.group.load(Ordering::Acquire) == gid);
+        self.ready_unions.lock().extend(others);
+        branch.extend(mine.into_iter().map(|u| (u, 0, LiveDelta::default())));
         branch.sort_by_key(|(u, _, _)| u.id);
         let mut i = 0;
         while i < branch.len() {
@@ -3430,6 +3447,14 @@ impl LiveRegistry {
             while i < branch.len() && branch[i].0.id == u.id {
                 st.absorb(branch[i].1, std::mem::take(&mut branch[i].2));
                 i += 1;
+            }
+            if u.group.load(Ordering::Acquire) != gid {
+                // 積んだ枝の差分は別の持ち主の Or の購読のもの: その poll / group に届くよう載せておく
+                if !st.changed.is_empty() && !st.queued {
+                    st.queued = true;
+                    self.ready_unions.lock().push(u.clone());
+                }
+                continue;
             }
             let d = st.drain(peer);
             if !d.is_empty() {
@@ -3465,6 +3490,8 @@ pub(crate) struct Union {
     id: u64,
     branches: Vec<(Arc<Family>, usize)>,
     state: Mutex<UnionState>,
+    /// 入っている [`LiveGroup`] の id (0 = どこにも)。
+    group: AtomicU64,
 }
 
 struct UnionState {
@@ -3549,7 +3576,7 @@ impl UnionState {
 
 impl Union {
     /// 枝を全部 settle して差分を積む。 family の lock と自分の lock を同時に持たない
-    /// (`poll_all` は family → 自分 の順に取るので、 逆順に重ねると deadlock)。
+    /// (`poll_group` は family → 自分 の順に取るので、 逆順に重ねると deadlock)。
     fn settle(self: &Arc<Self>, r: &impl CellReader) -> parking_lot::MutexGuard<'_, UnionState> {
         let mut ds = Vec::with_capacity(self.branches.len());
         for (i, (f, slot)) in self.branches.iter().enumerate() {
@@ -3652,7 +3679,7 @@ impl LiveQuery {
         }
     }
 
-    /// engine 内で一意な購読 id。 [`Engine::poll_live`](crate::engine::Engine::poll_live) の
+    /// engine 内で一意な購読 id。 [`LiveGroup::poll`] の
     /// 差分がどの購読のものかを表す。
     pub fn id(&self) -> u64 {
         self.id
@@ -3713,7 +3740,7 @@ impl LiveQuery {
         OrderView::of(&s.keys, m).first_k(tk.k).into_iter().map(|x| x.1).collect()
     }
 
-    /// `Or` の購読の枝を settle して積む。 積んだ差分は `poll_all` が拾えるように登録する。
+    /// `Or` の購読の枝を settle して積む。 積んだ差分は `poll_group` が拾えるように登録する。
     fn settle_union<'u>(&self, u: &'u Arc<Union>, r: &impl CellReader) -> parking_lot::MutexGuard<'u, UnionState> {
         let mut st = u.settle(r);
         if !st.changed.is_empty() && !st.queued {
@@ -3761,6 +3788,60 @@ impl LiveQuery {
             .filter(|&e| m.has(e, s.root(e)))
             .map(|e| enchudb_oplog::make_eid(peer, e))
             .collect()
+    }
+}
+
+/// 購読の束 ([`Engine::live_group`](crate::engine::Engine::live_group))。 [`add`](Self::add) した購読の
+/// うち、 前回から出入りのあったものの差分だけを [`poll`](Self::poll) でまとめて受け取る。 コストは購読の
+/// 数でなく出入りの数に比例する (購読が数千本ある時向け)。
+///
+/// 束に入れていない購読 (同じ engine を使う他の部品が持つもの) の差分は取り出さない — engine 全体の
+/// 差分を 1 か所で取ると、 他の部品が自分の購読の `poll` で受け取るはずの差分を横取りしてしまう。
+/// 束に入れた購読の `poll` も使えるが、 報告状態を共有するので同じ差分はどちらか一方にだけ届く。
+/// 購読は 1 つの束にしか入らない (後から入れた束に移る)。
+pub struct LiveGroup {
+    id: u64,
+    registry: Arc<LiveRegistry>,
+}
+
+impl LiveGroup {
+    pub(crate) fn new(registry: &Arc<LiveRegistry>) -> Self {
+        LiveGroup { id: registry.next_group.fetch_add(1, Ordering::Relaxed), registry: registry.clone() }
+    }
+
+    /// 購読 `q` をこの束に入れる。 以降の差分は [`poll`](Self::poll) にも届く。
+    pub fn add(&self, q: &LiveQuery) {
+        assert!(Arc::ptr_eq(&self.registry, &q.registry), "LiveGroup: 別の engine の購読は入れられない");
+        match &q.kind {
+            Kind::One { family, slot } => {
+                if let Some(m) = family.settled.lock().members[*slot].as_mut() {
+                    m.group = self.id;
+                }
+            }
+            Kind::Any(u) => u.group.store(self.id, Ordering::Release),
+        }
+    }
+
+    /// 会社単位の購読を入れる (差分は group の eid)。
+    pub fn add_grouped(&self, q: &GroupedLiveQuery) {
+        self.add(&q.inner);
+    }
+
+    /// 束の購読のうち、 前回から出入りのあったものの差分 (`(LiveQuery::id, 差分)`、 id 昇順)。
+    pub fn poll(&self, eng: &crate::engine::Engine) -> Vec<(u64, LiveDelta)> {
+        assert!(Arc::ptr_eq(&self.registry, eng.live_registry()), "LiveGroup: 作った engine とは別の engine が渡された");
+        self.registry.poll_group(eng, self.id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poll_with(&self, r: &impl CellReader) -> Vec<(u64, LiveDelta)> {
+        self.registry.poll_group(r, self.id)
+    }
+}
+
+impl std::fmt::Debug for LiveGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveGroup").field("id", &self.id).finish()
     }
 }
 
@@ -4042,7 +4123,7 @@ impl GroupedLiveQuery {
         self.inner.is_dirty()
     }
 
-    /// engine 内で一意な購読 id (`Engine::poll_live` の差分の宛先。 差分は group の eid)。
+    /// engine 内で一意な購読 id (`LiveGroup::poll` の差分の宛先。 差分は group の eid)。
     pub fn id(&self) -> u64 {
         self.inner.id()
     }
@@ -4368,7 +4449,7 @@ mod tests {
     }
 
     /// `Or`: 両方の枝に居る entity は片方から出ても残り、 両方から出たら出る。 差分は枝の id でなく
-    /// `Or` の購読の id で届き、 `count` が先に枝の差分を積んでも `poll_all` に届く。
+    /// `Or` の購読の id で届き、 `count` が先に枝の差分を積んでも束の poll に届く。
     #[test]
     fn or_counts_rows_held_by_several_branches() {
         let reg = Arc::new(LiveRegistry::new(0));
@@ -4384,12 +4465,47 @@ mod tests {
         assert!(q.poll_with(&f).is_empty(), "もう片方の枝に居るのに出た");
         assert_eq!(q.count_with(&f), 1);
         write(&reg, &f, 1, 7, None);
-        // count が枝の差分を積む → poll_all は Or の購読の id で返す (枝の id は出さない)
+        let g = LiveGroup::new(&reg);
+        g.add(&q);
+        // count が枝の差分を積む → 束の poll は Or の購読の id で返す (枝の id は出さない)
         assert_eq!(q.count_with(&f), 0);
-        assert_eq!(reg.poll_all(&f), vec![(q.id(), LiveDelta { added: vec![], removed: vec![7] })]);
+        assert_eq!(g.poll_with(&f), vec![(q.id(), LiveDelta { added: vec![], removed: vec![7] })]);
         write(&reg, &f, 1, 8, Some(1));
-        assert_eq!(reg.poll_all(&f), vec![(q.id(), LiveDelta { added: vec![8], removed: vec![] })]);
+        assert_eq!(g.poll_with(&f), vec![(q.id(), LiveDelta { added: vec![8], removed: vec![] })]);
         assert!(q.poll_with(&f).is_empty());
+    }
+
+    /// 束の poll は、 束に入れていない購読 (他の部品が持つもの) の差分を取り出さない — 同じ family の
+    /// member でも、 Or の購読の枝でも。 束に入れていない購読は自分の poll で全部受け取れる。
+    #[test]
+    fn group_poll_leaves_other_subscriptions_alone() {
+        let reg = Arc::new(LiveRegistry::new(0));
+        let f = Mutex::new(Fake::default());
+        let eq = |v| vec![LivePred::Eq { himo_id: 0, value: v }];
+        let mine = reg.register(eq(1), false);
+        let theirs = reg.register(eq(1), false); // 同じ family・同じ鍵
+        let their_or = reg.register_any(vec![eq(1), vec![LivePred::Eq { himo_id: 1, value: 1 }]], false);
+        let g = LiveGroup::new(&reg);
+        g.add(&mine);
+        write(&reg, &f, 0, 7, Some(1));
+        write(&reg, &f, 1, 8, Some(1));
+        assert_eq!(g.poll_with(&f), vec![(mine.id(), LiveDelta { added: vec![7], removed: vec![] })]);
+        assert!(g.poll_with(&f).is_empty());
+        assert_eq!(theirs.poll_with(&f).added, vec![7], "束の poll が他の購読の差分を取り出した");
+        assert_eq!(their_or.poll_with(&f).added, vec![7, 8], "束の poll が他の Or の購読の差分を取り出した");
+        // 他の束も互いに干渉しない
+        let g2 = LiveGroup::new(&reg);
+        g2.add(&theirs);
+        write(&reg, &f, 0, 9, Some(1));
+        assert_eq!(g.poll_with(&f), vec![(mine.id(), LiveDelta { added: vec![9], removed: vec![] })]);
+        assert_eq!(g2.poll_with(&f), vec![(theirs.id(), LiveDelta { added: vec![9], removed: vec![] })]);
+        assert_eq!(their_or.poll_with(&f).added, vec![9]);
+        // 別の束の poll が Or の枝の差分を先に積んでも、 Or の購読の束に届く
+        let g3 = LiveGroup::new(&reg);
+        g3.add(&their_or);
+        write(&reg, &f, 1, 10, Some(1));
+        assert!(g.poll_with(&f).is_empty());
+        assert_eq!(g3.poll_with(&f), vec![(their_or.id(), LiveDelta { added: vec![10], removed: vec![] })]);
     }
 
     /// `Or`: 報告済みの entity の slot が解放されて同じ eid で入り直したら removed + added

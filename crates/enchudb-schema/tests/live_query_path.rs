@@ -493,10 +493,17 @@ fn run_family(path: &str) {
     subs.push(make(0, 0, 0));
     subs.push(make(1, 1, 1));
 
-    // 奇数回は Database::poll_live (出入りのあった購読だけ) で受け取り、 偶数回は 1 本ずつ poll
+    // 奇数回は束の poll (出入りのあった購読だけ) で受け取り、 偶数回は 1 本ずつ poll
+    // 購読は束に入れて束の poll で受け取る (入れ直しは何度でもよい)
+    let group = db.live_group();
     let check = |subs: &mut Vec<FamSub>, users: &[u64], step: usize| {
         if !step.is_multiple_of(2) {
-            let deltas = db.poll_live();
+            let deltas = {
+                for s in subs.iter() {
+                    group.add(&s.q);
+                }
+                group.poll()
+            };
             assert!(deltas.windows(2).all(|w| w[0].0 < w[1].0), "id 昇順・重複なし");
             for (id, d) in deltas {
                 assert!(!d.is_empty(), "空の差分は返さない");
@@ -687,9 +694,16 @@ fn run_range(path: &str) {
     };
     let mut subs: Vec<RSub> = (0..42).map(|i| make(i % 7, &mut rng)).collect();
 
+    // 購読は束に入れて束の poll で受け取る (入れ直しは何度でもよい)
+    let group = db.live_group();
     let check = |subs: &mut Vec<RSub>, users: &[u64], step: usize| {
         if !step.is_multiple_of(2) {
-            for (id, d) in db.poll_live() {
+            for (id, d) in {
+                for s in subs.iter() {
+                    group.add(&s.q);
+                }
+                group.poll()
+            } {
                 let s = subs.iter_mut().find(|s| s.q.id() == id).expect("生きている購読の id");
                 integrate(&mut s.seen, d);
             }
@@ -896,15 +910,22 @@ fn run_or(path: &str) {
     };
     let mut subs: Vec<OSub> = (0..40).map(|i| make(i % 8, &mut rng)).collect();
 
+    // 購読は束に入れて束の poll で受け取る (入れ直しは何度でもよい)
+    let group = db.live_group();
     let check = |subs: &mut Vec<OSub>, users: &[u64], step: usize| {
         if step % 4 == 1 {
-            // count が枝の差分を積んだ後でも poll_live に届く
+            // count が枝の差分を積んだ後でも束の poll に届く
             for s in subs.iter() {
                 s.q.count();
             }
         }
         if !step.is_multiple_of(2) {
-            let deltas = db.poll_live();
+            let deltas = {
+                for s in subs.iter() {
+                    group.add(&s.q);
+                }
+                group.poll()
+            };
             assert!(deltas.windows(2).all(|w| w[0].0 < w[1].0), "id 昇順・重複なし");
             for (id, d) in deltas {
                 assert!(!d.is_empty(), "空の差分は返さない");
@@ -1389,9 +1410,16 @@ fn run_top(path: &str) {
     // 形の違う枝の Or は上位 k 件にできない
     assert!(u.where_eq("city", "Tokyo").or(u.all().where_gt("age", 3)).order_by("age").limit(3).subscribe().is_err());
 
+    // 購読は束に入れて束の poll で受け取る (入れ直しは何度でもよい)
+    let group = db.live_group();
     let check = |subs: &mut Vec<TSub>, users: &[u64], step: usize| {
         if !step.is_multiple_of(2) {
-            for (id, d) in db.poll_live() {
+            for (id, d) in {
+                for s in subs.iter() {
+                    group.add(&s.q);
+                }
+                group.poll()
+            } {
                 let s = subs.iter_mut().find(|s| s.q.id() == id).expect("生きている購読の id");
                 integrate(&mut s.seen, d);
             }
