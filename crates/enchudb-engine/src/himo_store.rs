@@ -417,7 +417,7 @@ impl HimoStore {
         if cyl.sparse_churned() {
             cyl.compact_sparse(|v, eid| stored_at(col, eid) == v + 1);
         }
-        for v in cyl.unique_values().into_iter().filter(|&v| v < crate::lockfree_cylinder::DENSE_CAP as u64) {
+        for v in cyl.unique_values().into_iter().filter(|&v| crate::lockfree_cylinder::is_dense(v)) {
             // clean bucket (churn 痕なし) は組み直し不要 — 無条件 swap は巨大 himo で
             // write_lock の長期保持 + 旧 backing の epoch 滞留 (一時 ~2x RSS) を招く
             // (PR #103 レビュー)。write_lock 下なので flag 判定は正確。
@@ -614,7 +614,7 @@ impl HimoStore {
     /// 最小スライスを正しく選べる。
     pub fn slice_len(&self, value: impl CellValue) -> usize {
         let Some(value) = value.cell_value() else { return 0 };
-        if value >= crate::lockfree_cylinder::DENSE_CAP as u64 {
+        if !crate::lockfree_cylinder::is_dense(value) {
             // 大きな値は件数を持たない: 引いて数える (値の種類が多い列では 1 値あたりの件数は小さい)
             return self.pull(value).len();
         }
