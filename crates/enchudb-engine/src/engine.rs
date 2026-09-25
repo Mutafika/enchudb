@@ -1098,18 +1098,11 @@ impl Engine {
 
     /// v10: DB directory を **packed 1 ファイル** (= 旧 v9 の 1 ファイル layout と byte 互換、
     /// sparse) に書き出す。 relay の bootstrap 配布 / 転送 / wasm (`from_bytes`) 用。
-    /// 戻り値は packed の総サイズ (= `layout.total_size`、 見かけ)。
+    /// 戻り値は packed の総サイズ (= `layout.packed_size()`、 見かけ)。
     pub fn pack_dir(dir: &str, packed: &std::path::Path) -> io::Result<u64> {
         let (layout, himo_count) = Self::read_header_layout(dir)?;
-        if layout.wide.iter().any(|&w| w) {
-            // packed は紐ごとに固定の 4B slot。 64 bit 列を詰めると列が化ける
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "pack_dir: a database with 64-bit columns (Number64) cannot be packed",
-            ));
-        }
         let mut out = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(packed)?;
-        out.set_len(layout.total_size as u64)?;
+        out.set_len(layout.packed_size() as u64)?;
         // seek で飛ばした全 0 range + region の未使用尾部。 最後にまとめて穴に戻す (APFS)。
         let mut holes: Vec<(u64, u64)> = Vec::new();
         for kind in Self::segment_kinds_for(&layout, himo_count) {
@@ -1129,7 +1122,7 @@ impl Engine {
         }
         punch_holes(&out, &holes)?;
         out.sync_all()?;
-        Ok(layout.total_size as u64)
+        Ok(layout.packed_size() as u64)
     }
 
     /// #246 / #257: 旧 1 ファイル layout (header 4096 固定、 entities region が 4096 から) で
@@ -1266,8 +1259,15 @@ impl Engine {
         src.read_exact(&mut fixed).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, format!("packed header too small: {e}"))
         })?;
-        let (layout, himo_count) = Self::parse_header(&fixed, true)
+        let (mut layout, himo_count) = Self::parse_header(&fixed, true)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        // 型 byte の表は先頭 4096 byte を超えうる。 64 bit 列の置き場所 (packed の末尾) は表全体から
+        if layout.header_size > fixed.len() {
+            let mut full = vec![0u8; layout.header_size];
+            src.seek(SeekFrom::Start(0))?;
+            src.read_exact(&mut full)?;
+            layout.load_wide(&full, himo_count);
+        }
         // legacy (v8 / v9): reservation を既定まで広げ、 EntitySet を新 layout に組み直す
         // (free stack の位置が bitset 容量で決まるので、 中身を動かす必要がある)
         let src_version = u32::from_le_bytes(fixed[H_VERSION..H_VERSION + 4].try_into().unwrap());
@@ -1290,14 +1290,14 @@ impl Engine {
         let must_have = if legacy {
             (layout.region_off(SegmentKind::Entities) + layout.segment_size(SegmentKind::Entities)) as u64
         } else {
-            layout.total_size as u64
+            layout.packed_size() as u64
         };
         if total < must_have {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "packed file truncated: {} bytes (required {}, layout.total_size = {})",
-                    total, must_have, layout.total_size
+                    "packed file truncated: {} bytes (required {}, layout.packed_size = {})",
+                    total, must_have, layout.packed_size()
                 ),
             ));
         }
@@ -2114,7 +2114,7 @@ struct Layout {
     himo_col_size64: usize,
     himo_col_reserve64: usize,
     /// 紐ごとに 64 bit 列か (header の型 byte = `ValueType::Number64` から復元、 define で足す)。
-    /// 足りない添字は u32 の列。 packed (Memory) backing は 64 bit 列を持てない (固定 slot)。
+    /// 足りない添字は u32 の列。 packed 形式では 64 bit 列は `total_size` の後ろ (`packed_size`)。
     wide: Vec<bool>,
     ver_col_reserve: usize,
     tomb_reserve: usize,
@@ -2403,6 +2403,12 @@ impl Layout {
     fn himo_col_off(&self, hid: usize) -> usize {
         self.himo_base_off + hid * self.himo_slot_size
     }
+    /// packed 形式の総サイズ。 64 bit 列は紐ごとの固定 slot (4B 幅) に入らないので、 `total_size` の
+    /// 後ろに紐の番号の順で `himo_col_size64` ずつ並べる (どの紐が 64 bit かは header の型 byte で決まる)。
+    fn packed_size(&self) -> usize {
+        self.total_size + self.wide.iter().filter(|&&w| w).count() * self.himo_col_size64
+    }
+
     /// 紐 `hid` が 64 bit 列か。
     fn is_wide(&self, hid: u32) -> bool {
         self.wide.get(hid as usize).copied().unwrap_or(false)
@@ -2451,6 +2457,10 @@ impl Layout {
             SegmentKind::ContentData => self.content_data_off,
             SegmentKind::LeafData => self.leaf_data_off,
             SegmentKind::Tomb => self.tomb_off,
+            SegmentKind::Himo(h) if self.is_wide(h) => {
+                let rank = self.wide.iter().take(h as usize).filter(|&&w| w).count();
+                self.total_size + rank * self.himo_col_size64
+            }
             SegmentKind::Himo(h) => self.himo_col_off(h as usize),
             SegmentKind::Ver(h) => self.ver_col_off(h as usize),
         }
@@ -4120,12 +4130,16 @@ impl Engine {
     fn load_from_backing(backing: Backing, readonly: bool) -> Result<Self, String> {
         let hdr: &[u8] = backing.header_mut(HEADER_SIZE);
         let allow_legacy_packed = backing.memory_len().is_some();
-        let (layout, himo_count) = Self::parse_header(hdr, allow_legacy_packed)?;
+        let (mut layout, himo_count) = Self::parse_header(hdr, allow_legacy_packed)?;
         if let Some(n) = backing.memory_len() {
-            if n < layout.total_size {
+            // 64 bit 列の置き場所 (packed の末尾) は型 byte の表全体から (表は 4096 byte を超えうる)
+            if layout.header_size > HEADER_SIZE && n >= layout.header_size {
+                layout.load_wide(backing.header_mut(layout.header_size), himo_count);
+            }
+            if n < layout.packed_size() {
                 return Err(format!(
-                    "backing too small: {} bytes (layout.total_size = {}) — truncated file?",
-                    n, layout.total_size,
+                    "backing too small: {} bytes (layout.packed_size = {}) — truncated file?",
+                    n, layout.packed_size(),
                 ));
             }
             // #257: legacy blob は himo 表が entities region に食い込んでいることがある
@@ -11971,9 +11985,10 @@ impl Engine {
         }
 
         let wide = ht == ValueType::Number64;
-        if wide && self.backing.memory_len().is_some() {
-            // packed は紐ごとに固定の slot (4B 幅) なので 8B の列を置けない
-            return Err("64-bit columns (Number64) need a file-backed (directory) database".into());
+        if wide && self.backing.memory_len().is_some() && !self.layout.read().unwrap().is_wide(hid as u32) {
+            // packed の 64 bit 列は blob の末尾に置く (`packed_size`)。 blob は伸ばせないので、 新しく作るのは
+            // directory の DB で (既に 64 bit 列を持つ packed は開ける)
+            return Err("new 64-bit columns (Number64) need a file-backed (directory) database".into());
         }
 
         self.himo_reg.get_or_insert(himo.as_bytes());

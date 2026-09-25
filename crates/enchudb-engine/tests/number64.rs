@@ -524,3 +524,117 @@ fn live_queries_on_64_bit_columns_match_oracle() {
     drop(eng);
     let _ = db_files::remove_db(&p);
 }
+
+/// 64 bit 列を u32 の列の間に挟んだ DB (容量の端の eid まで書く)。 戻り値は (eid, u32 の値, 64 bit の値) の組。
+fn mixed_db(p: &str) -> Vec<(u64, u32, u64, u64)> {
+    let mut eng = Engine::create_with_capacity(p, 4096).unwrap();
+    eng.define_table("t", 3900).unwrap();
+    eng.define_himo_in("t", "a", ValueType::Number, 0).unwrap();
+    eng.define_himo_in("t", "ts", ValueType::Number64, 0).unwrap();
+    eng.define_himo_in("t", "b", ValueType::Number, 0).unwrap();
+    eng.define_himo_in("t", "id", ValueType::Number64, 0).unwrap();
+    let es: Vec<u64> = (0..3900).map(|_| eng.entity_in("t").unwrap()).collect();
+    let rows: Vec<(u64, u32, u64, u64)> = es
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % 97 == 0 || *i == es.len() - 1)
+        .map(|(i, &e)| (e, i as u32, (1u64 << 40) + i as u64, u64::MAX - 1 - i as u64))
+        .collect();
+    for &(e, a, ts, id) in &rows {
+        eng.tie(e, "t.a", a);
+        eng.tie(e, "t.ts", ts);
+        eng.tie(e, "t.b", a + 1);
+        eng.tie(e, "t.id", id);
+    }
+    eng.flush().unwrap();
+    rows
+}
+
+fn assert_mixed(eng: &Engine, rows: &[(u64, u32, u64, u64)], what: &str) {
+    for &(e, a, ts, id) in rows {
+        assert_eq!(eng.get(e, "t.a"), Some(a as u64), "{what}: t.a");
+        assert_eq!(eng.get(e, "t.ts"), Some(ts), "{what}: t.ts");
+        assert_eq!(eng.get(e, "t.b"), Some(a as u64 + 1), "{what}: t.b");
+        assert_eq!(eng.get(e, "t.id"), Some(id), "{what}: t.id");
+        assert_eq!(eng.pull_raw("t.id", id), vec![enchudb_oplog::eid_local(e) as u64], "{what}: 索引");
+    }
+}
+
+/// 64 bit 列を持つ DB も packed 1 ファイルに詰めて (`pack_dir`) 展開 (`unpack_to_dir`) できる
+/// (relay の `GET /bootstrap` の経路)。 64 bit 列は packed の末尾に紐の番号の順で並ぶ。
+#[test]
+fn packed_round_trip_keeps_64_bit_columns() {
+    let (p, packed, back) = (tmp("pack-src"), tmp("pack-file"), tmp("pack-back"));
+    let rows = mixed_db(&p);
+    let size = Engine::pack_dir(&p, std::path::Path::new(&packed)).unwrap();
+    assert_eq!(std::fs::metadata(&packed).unwrap().len(), size);
+    Engine::unpack_to_dir(std::path::Path::new(&packed), &back).unwrap();
+    let eng = Engine::open_standalone(&back).unwrap();
+    assert_mixed(&eng, &rows, "unpack");
+    assert_eq!(file_version(&back), 11);
+    // 詰めた 1 ファイルが切れていれば断る (末尾の 64 bit 列の分も要る)
+    let f = std::fs::OpenOptions::new().write(true).open(&packed).unwrap();
+    f.set_len(size - 8).unwrap();
+    let back2 = tmp("pack-back2");
+    assert!(Engine::unpack_to_dir(std::path::Path::new(&packed), &back2).is_err(), "切れた packed");
+    drop(eng);
+    for x in [&p, &back, &back2] {
+        let _ = db_files::remove_db(x);
+    }
+    let _ = std::fs::remove_file(&packed);
+}
+
+/// packed の blob を Memory backing (`from_bytes`、 wasm の入口) で開くと 64 bit 列が読め、 書ける。
+/// 新しい 64 bit 列は blob を伸ばせないので断る。
+#[test]
+fn memory_backing_opens_packed_64_bit_columns() {
+    let (p, packed) = (tmp("mem-src"), tmp("mem-file"));
+    let rows = mixed_db(&p);
+    Engine::pack_dir(&p, std::path::Path::new(&packed)).unwrap();
+    let bytes = std::fs::read(&packed).unwrap();
+    let mut eng = Engine::from_bytes(bytes.clone()).unwrap();
+    assert_mixed(&eng, &rows, "from_bytes");
+    let (e, ..) = rows[1];
+    eng.tie(e, "t.id", 1u64 << 50);
+    assert_eq!(eng.get(e, "t.id"), Some(1 << 50));
+    assert_eq!(eng.get(e, "t.b"), Some(rows[1].1 as u64 + 1), "隣の u32 の列が化けない");
+    assert!(eng.define_himo_in("t", "new64", ValueType::Number64, 0).is_err(), "新しい 64 bit 列は断る");
+    assert!(Engine::from_bytes(bytes[..bytes.len() - 8].to_vec()).is_err(), "切れた blob");
+    drop(eng);
+    let _ = db_files::remove_db(&p);
+    let _ = std::fs::remove_file(&packed);
+}
+
+/// 紐が 3840 本を超えると型 byte の表が header の先頭 4096 byte の外に出る。 そこにある 64 bit 列も
+/// packed の末尾に置かれ、 展開 / Memory backing が表全体から見つける。
+#[test]
+fn packed_finds_64_bit_columns_past_the_first_header_page() {
+    let (p, packed, back) = (tmp("bighdr-src"), tmp("bighdr-file"), tmp("bighdr-back"));
+    let opts = enchudb_engine::GrowableOptions { max_entities: 1024, max_himos: 4096, ..Default::default() };
+    let (e, v) = {
+        let mut eng = Engine::create_growable_opts(&p, opts).unwrap();
+        for i in 0..3845 {
+            eng.define_himo(&format!("h{i}"), ValueType::Number, 0);
+        }
+        eng.define_himo("late64", ValueType::Number64, 0);
+        let e = eng.entity().unwrap();
+        eng.tie(e, "h3844", 5u32);
+        eng.tie(e, "late64", u64::MAX - 9);
+        eng.flush().unwrap();
+        (e, u64::MAX - 9)
+    };
+    Engine::pack_dir(&p, std::path::Path::new(&packed)).unwrap();
+    Engine::unpack_to_dir(std::path::Path::new(&packed), &back).unwrap();
+    let eng = Engine::open_standalone(&back).unwrap();
+    assert_eq!(eng.get(e, "late64"), Some(v), "unpack");
+    assert_eq!(eng.get(e, "h3844"), Some(5));
+    drop(eng);
+    let mem = Engine::from_bytes(std::fs::read(&packed).unwrap()).unwrap();
+    assert_eq!(mem.get(e, "late64"), Some(v), "from_bytes");
+    assert_eq!(mem.get(e, "h3844"), Some(5));
+    drop(mem);
+    for x in [&p, &back] {
+        let _ = db_files::remove_db(x);
+    }
+    let _ = std::fs::remove_file(&packed);
+}
