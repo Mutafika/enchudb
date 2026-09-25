@@ -2039,6 +2039,9 @@ enum Predicate {
     Present(u16),
     /// 単一列の条件 (Eq / EqText / In / Present) が偽 (値の無い row も真)。
     Not(Box<Predicate>),
+    /// 別の table の row がこの row を ref 列 (himo `via`) で指していて、 条件 (engine の条件に写し済み、
+    /// None = 常に 0 件) を満たすものがある。
+    Exists { via: u16, preds: Option<Vec<enchudb_engine::LivePred>> },
 }
 
 pub struct Query<'a> {
@@ -2222,6 +2225,52 @@ impl<'a> Query<'a> {
         self
     }
 
+    /// `sub` (別の table への query) の row のうち、 ref 列 `via_col` でこの row を指しているものが 1 つ以上
+    /// ある (SQL の `EXISTS (SELECT .. FROM sub WHERE sub.via_col = this.id AND ..)`)。
+    ///
+    /// ```ignore
+    /// // 30 歳より上の社員が居る会社
+    /// let q = companies.all().where_exists(users.all().where_gt("age", 30), "company");
+    /// // いいねが 1 つも無い投稿
+    /// let q = posts.all().where_not_exists(likes.all(), "target");
+    /// ```
+    ///
+    /// `via_col` は `sub` の table の ref 列で、 この table を指すこと (違えば常に 0 件)。 find / count /
+    /// subscribe のどれでも使える。 購読では、 指している row の出入り・中身の変化も届く。
+    pub fn where_exists(mut self, sub: Query<'a>, via_col: &str) -> Self {
+        let p = self.exists_pred(sub, via_col);
+        match p {
+            Some(p) => self.preds.push(p),
+            None => self.preds.push(Predicate::Eq(u16::MAX, u32::MAX)),
+        }
+        self
+    }
+
+    /// [`where_exists`](Self::where_exists) の否定: 指している row が 1 つも無い (SQL の `NOT EXISTS`)。
+    pub fn where_not_exists(mut self, sub: Query<'a>, via_col: &str) -> Self {
+        let p = self.exists_pred(sub, via_col);
+        match p {
+            Some(p) => self.preds.push(Predicate::Not(Box::new(p))),
+            None => self.preds.push(Predicate::Eq(u16::MAX, u32::MAX)),
+        }
+        self
+    }
+
+    /// `where_exists` の条件。 `via_col` がこの table を指す ref 列でなければ None。
+    fn exists_pred(&self, sub: Query<'a>, via_col: &str) -> Option<Predicate> {
+        let cd = sub.table.col(via_col)?;
+        let points_here = cd.ty == ColumnType::Ref
+            && sub.table.relations.iter().any(|r| {
+                r.from_col.eq_ignore_ascii_case(via_col) && r.to_table.eq_ignore_ascii_case(&self.table.name)
+            });
+        if !points_here {
+            return None;
+        }
+        let via = cd.himo_id;
+        let preds = sub.live_preds().ok()?;
+        Some(Predicate::Exists { via, preds })
+    }
+
     /// `col` に値がある (SQL の `col IS NOT NULL`)。
     pub fn where_not_null(mut self, col: &str) -> Self {
         match self.resolve_col(col) {
@@ -2297,7 +2346,9 @@ impl<'a> Query<'a> {
 
         // ref をたどる条件 (`"company.city"`) を含むなら engine の live 条件評価に任せる
         // (候補を索引で引いて ref の逆引きで遡り、 全条件で評価)
-        if self.preds.iter().any(|p| matches!(p, Predicate::Via(..) | Predicate::Or(_) | Predicate::Not(_) | Predicate::Present(_))) {
+        if self.preds.iter().any(|p| {
+            matches!(p, Predicate::Via(..) | Predicate::Or(_) | Predicate::Not(_) | Predicate::Present(_) | Predicate::Exists { .. })
+        }) {
             let limit = self.limit;
             let Some(preds) = self.live_preds()? else { return Ok(Vec::new()) };
             let mut out = eng.find_by(preds).map_err(|e| SchemaError::Io(e.to_string()))?;
@@ -2333,8 +2384,8 @@ impl<'a> Query<'a> {
                 }
                 Predicate::Range { himo_name, lo, hi } => range_preds.push((himo_name, lo, hi)),
                 Predicate::Cmp { himo_name, op, against } => cmp_preds.push((himo_name, op, against)),
-                Predicate::Via(..) | Predicate::Or(_) | Predicate::Not(_) | Predicate::Present(_) => {
-                    unreachable!("Via / Or / Not / Present は find の先頭で find_by に回している")
+                Predicate::Via(..) | Predicate::Or(_) | Predicate::Not(_) | Predicate::Present(_) | Predicate::Exists { .. } => {
+                    unreachable!("Via / Or / Not / Present / Exists は find の先頭で find_by に回している")
                 }
             }
         }
@@ -2580,6 +2631,10 @@ impl<'a> Query<'a> {
                     None => return Ok(None),
                 },
                 Predicate::Present(h) => LivePred::Present { himo_id: h },
+                Predicate::Exists { via, preds } => match preds {
+                    Some(preds) => LivePred::Exists { via, preds },
+                    None => return Ok(None),
+                },
                 Predicate::Not(inner) => match conv(eng, *inner, rep)? {
                     Some(pred) => LivePred::Not(Box::new(pred)),
                     // 中身が常に偽 (未知の値など) = 否定は常に真: 条件を足さない (代表列を持つ row)
@@ -2615,16 +2670,20 @@ impl<'a> Query<'a> {
                     None => return Ok(None),
                 }
             }
-            // 条件なし (`.all()`) / 否定だけ (`where_null`) は table の全 row = 代表列を持つ row から
-            fn positive(p: &LivePred) -> bool {
+            // この table の row であることを保証する条件 (自分の列に値がある / 自分の ref 列をたどる) が無ければ
+            // (`.all()` / 否定だけ / `where_exists` だけ)、 代表列を持つ row = table の全 row から絞る。
+            // `Exists` は 「指されている entity」 なので table の row とは限らない (削除済みの row を指したままの
+            // ref もある)
+            fn own(p: &LivePred) -> bool {
                 match p {
-                    LivePred::Not(_) => false,
-                    LivePred::Via { pred, .. } => positive(pred),
-                    LivePred::Or(bs) => bs.iter().all(|b| b.iter().any(positive)),
+                    LivePred::Not(_) | LivePred::Exists { .. } => false,
+                    // 自分の ref 列に値がある (中身が否定でも)
+                    LivePred::Via { .. } => true,
+                    LivePred::Or(bs) => bs.iter().all(|b| b.iter().any(own)),
                     _ => true,
                 }
             }
-            if !out.iter().any(positive) {
+            if !out.iter().any(own) {
                 let rep = rep.ok_or_else(|| SchemaError::BadValue("subscribe: table has no columns".into()))?;
                 out.push(LivePred::Present { himo_id: rep });
             }
