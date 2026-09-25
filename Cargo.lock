@@ -1023,6 +1023,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "enchudb-connect"
+version = "0.26.14"
+dependencies = [
+ "enchudb-engine",
+ "enchudb-oplog",
+ "enchudb-schema",
+ "serde_json",
+]
+
+[[package]]
 name = "enchudb-engine"
 version = "0.26.14"
 dependencies = [

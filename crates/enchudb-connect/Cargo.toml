@@ -1,0 +1,15 @@
+[package]
+name = "enchudb-connect"
+version = "0.26.14"
+edition = "2024"
+rust-version = "1.89"
+description = "enchudb の外との入口と出口 — 外から流れてくる行の変更を取り込み、 live 購読の差分を外へ流す。 Kafka などのアダプタはこの上に載る。"
+license-file = "LICENSE.md"
+authors = ["mutafika"]
+repository = "https://github.com/mutafika/enchudb"
+
+[dependencies]
+enchudb-schema = { path = "../enchudb-schema" }
+enchudb-engine = { path = "../enchudb-engine" }
+enchudb-oplog = { path = "../enchudb-oplog" }
+serde_json = "1"
