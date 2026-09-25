@@ -564,6 +564,37 @@ impl HimoStore {
         }
     }
 
+    /// 値が `lo..=hi` の entity (eid の昇順・重複なし)。 索引の範囲 (dense は bucket を範囲の分、 大きな値は
+    /// run の二分探索) を Column の現在値で確かめる。
+    pub fn pull_range(&self, lo: u64, hi: u64) -> Vec<u32> {
+        if lo > hi {
+            return Vec::new();
+        }
+        self.ensure_cylinder_built();
+        let col = self.col();
+        let mut out = self.cyl.range_raw(lo, hi);
+        out.retain(|&eid| {
+            let s = stored_at(col, eid);
+            // stored = 値 + 1 (0 = 未設定)
+            s != 0 && lo < s && s - 1 <= hi
+        });
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// eid `lo..hi` の値 (`None` = 未設定)。 64 bit 列でも読める集計用の走査 (u32 の SIMD 経路の代わり)。
+    pub fn for_each_in(&self, lo: u32, hi: u32, mut f: impl FnMut(u32, u64)) {
+        let col = self.col();
+        let end = hi.min(col.count());
+        for eid in lo..end {
+            let s = stored_at(col, eid);
+            if s != 0 {
+                f(eid, s - 1);
+            }
+        }
+    }
+
     /// 値が tie された全 entity（= column 非ゼロ走査）。O(next_eid) で重い。
     pub fn entities_with_value(&self) -> Vec<u32> {
         let col = self.col();

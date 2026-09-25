@@ -253,3 +253,82 @@ fn recovery_replays_wide_values() {
     drop(eng);
     let _ = db_files::remove_db(&p);
 }
+
+/// 範囲 (`pull_range`) と 64 bit の集計が、 書き換え / 外す / 削除の後でも素朴に数えた結果と一致する。
+/// 値は dense (< 2^20) と大きな値 (run) を混ぜ、 範囲は両方をまたぐものも。
+#[test]
+fn ranges_and_64_bit_aggregates_match_oracle() {
+    let p = tmp("range");
+    let mut eng = Engine::create_with_capacity(&p, 4096).unwrap();
+    eng.define_table("t", 3000).unwrap();
+    eng.define_himo_in("t", "ts", ValueType::Number64, 0).unwrap();
+    eng.define_himo_in("t", "n", ValueType::Number, 0).unwrap();
+    let mut x = 0x0bad_5eed_u64;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let pick = |r: u64| -> u64 {
+        match r % 4 {
+            0 => r % 50,                        // dense
+            1 => (1 << 20) + r % 3000,          // dense の境目の先
+            2 => (1u64 << 40) + (r >> 8) % 5000, // 大きな値
+            _ => u64::MAX - 2 - r % 100,        // 上端
+        }
+    };
+    let es: Vec<u64> = (0..2000).map(|_| eng.entity_in("t").unwrap()).collect();
+    let mut cells: Vec<Option<u64>> = vec![None; es.len()];
+    let mut ncells: Vec<Option<u32>> = vec![None; es.len()];
+    let _ = eng.pull_raw("t.ts", 0u32); // 索引を組んで以後維持させる
+    for step in 0..6000 {
+        let i = (next() % es.len() as u64) as usize;
+        match next() % 6 {
+            0 => {
+                eng.untie(es[i], "t.ts");
+                cells[i] = None;
+            }
+            _ => {
+                let v = pick(next());
+                eng.tie(es[i], "t.ts", v);
+                cells[i] = Some(v);
+                let n = (next() % 1_000_000) as u32 + (1 << 20);
+                eng.tie(es[i], "t.n", n); // u32 の列の大きな値 (run)
+                ncells[i] = Some(n);
+            }
+        }
+        if step % 200 == 0 {
+            let (a, b) = (pick(next()), pick(next()));
+            let (lo, hi) = (a.min(b), a.max(b));
+            let want: Vec<u64> = es.iter().zip(&cells).filter(|(_, c)| c.is_some_and(|v| lo <= v && v <= hi)).map(|(&e, _)| enchudb_oplog::eid_local(e) as u64).collect();
+            assert_eq!(eng.pull_range("t.ts", lo, hi), want, "step {step}: pull_range {lo}..={hi}");
+            let (a, b) = ((next() % 1_000_000) as u32 + (1 << 20), (next() % 1_000_000) as u32 + (1 << 20));
+            let (nlo, nhi) = (a.min(b), a.max(b));
+            let want: Vec<u64> = es.iter().zip(&ncells).filter(|(_, c)| c.is_some_and(|v| nlo <= v && v <= nhi)).map(|(&e, _)| enchudb_oplog::eid_local(e) as u64).collect();
+            assert_eq!(eng.pull_range("t.n", nlo, nhi), want, "step {step}: u32 列の pull_range");
+            let set: Vec<u64> = es.iter().step_by(3).copied().collect();
+            let vals: Vec<u64> = es.iter().zip(&cells).step_by(3).filter_map(|(_, c)| *c).collect();
+            assert_eq!(eng.sum64("t.ts", &set), vals.iter().map(|&v| v as u128).sum::<u128>(), "step {step}: sum64");
+            assert_eq!(eng.min64("t.ts", &set), vals.iter().copied().min(), "step {step}: min64");
+            assert_eq!(eng.max64("t.ts", &set), vals.iter().copied().max(), "step {step}: max64");
+            let all: Vec<u64> = cells.iter().filter_map(|c| *c).collect();
+            let (n, sum, mn, mx) = eng.stats_range64("t.ts", 0, u32::MAX);
+            assert_eq!((n as usize, sum), (all.len(), all.iter().map(|&v| v as u128).sum::<u128>()), "step {step}: stats_range64");
+            assert_eq!((mn, mx), (all.iter().copied().min(), all.iter().copied().max()));
+        }
+    }
+    // 1 値だけの範囲 = 等値 (範囲の両端の bucket / run を落とさない)
+    let mut present: Vec<u64> = cells.iter().filter_map(|c| *c).collect();
+    present.sort_unstable();
+    present.dedup();
+    for &v in &present {
+        let mut eq = eng.pull_raw("t.ts", v);
+        eq.sort_unstable();
+        assert_eq!(eng.pull_range("t.ts", v, v), eq, "pull_range {v}..={v}");
+    }
+    // 空の範囲 / 逆順
+    assert!(eng.pull_range("t.ts", 10u64, 9u64).is_empty());
+    drop(eng);
+    let _ = db_files::remove_db(&p);
+}

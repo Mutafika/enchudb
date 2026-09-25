@@ -11267,16 +11267,44 @@ impl Engine {
     // ──── 範囲クエリ ────
 
     /// 範囲内の全値に合致する entity を返す（min..=max）
-    pub fn pull_range(&self, himo: &str, min: u32, max: u32) -> Vec<enchudb_oplog::EntityId> {
+    /// 値が `min..=max` の entity (両端を含む)。 64 bit 列にも使える。 索引の範囲を引いて Column で
+    /// 確かめる (値を 1 つずつ引かない — 広い範囲 / 64 bit の範囲でも範囲内の件数に比例)。 結果は eid の昇順。
+    pub fn pull_range(&self, himo: &str, min: impl CellValue, max: impl CellValue) -> Vec<enchudb_oplog::EntityId> {
         let idx = match self.himo_id(himo) { Some(h) => h, None => return vec![] };
-        let hs = &self.himos[idx];
-        let mut result = Vec::new();
-        for v in min..=max {
-            for local in &hs.pull(v) {
-                result.push(*local as enchudb_oplog::EntityId);
-            }
-        }
-        result
+        let (Some(min), Some(max)) = (min.cell_value(), max.cell_value()) else { return vec![] };
+        self.himos[idx].pull_range(min, max).into_iter().map(|e| e as enchudb_oplog::EntityId).collect()
+    }
+
+    /// 64 bit の合計 (どの列でも。 u64 の和が溢れないよう u128)。 値の無い entity は数えない。
+    pub fn sum64(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> u128 {
+        let Some(hid) = self.himo_id(himo) else { return 0 };
+        let hs = &self.himos[hid];
+        eids.iter().filter_map(|&e| hs.get_value(enchudb_oplog::eid_local(e))).map(|v| v as u128).sum()
+    }
+
+    /// 64 bit の最小値 (どの列でも)。
+    pub fn min64(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u64> {
+        let hs = &self.himos[self.himo_id(himo)?];
+        eids.iter().filter_map(|&e| hs.get_value(enchudb_oplog::eid_local(e))).min()
+    }
+
+    /// 64 bit の最大値 (どの列でも)。
+    pub fn max64(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u64> {
+        let hs = &self.himos[self.himo_id(himo)?];
+        eids.iter().filter_map(|&e| hs.get_value(enchudb_oplog::eid_local(e))).max()
+    }
+
+    /// eid の範囲 `lo..hi` での 64 bit の (件数, 合計, 最小, 最大) (table の全 row の集計用、 どの列でも)。
+    pub fn stats_range64(&self, himo: &str, lo: u32, hi: u32) -> (u64, u128, Option<u64>, Option<u64>) {
+        let Some(hid) = self.himo_id(himo) else { return (0, 0, None, None) };
+        let (mut n, mut sum, mut min, mut max) = (0u64, 0u128, None::<u64>, None::<u64>);
+        self.himos[hid].for_each_in(lo, hi, |_, v| {
+            n += 1;
+            sum += v as u128;
+            min = Some(min.map_or(v, |m| m.min(v)));
+            max = Some(max.map_or(v, |m| m.max(v)));
+        });
+        (n, sum, min, max)
     }
 
     // ──── 日付ヘルパー ────
@@ -13691,13 +13719,8 @@ impl crate::live::CellReader for Engine {
         if lo > hi {
             return Vec::new();
         }
-        // 狭い範囲は値ごとに引く。 広い範囲は入っている値を列挙して範囲内の値だけ引く
-        // (unique_values は churn 後の stale 値を含む上位集合、 pull が Column で確かめる)
-        if hi - lo < 4096 {
-            (lo..=hi).flat_map(|v| h.pull(v)).collect()
-        } else {
-            h.unique_values().into_iter().filter(|v| (lo as u64..=hi as u64).contains(v)).flat_map(|v| h.pull(v)).collect()
-        }
+        // 索引の範囲を引いて Column で確かめる (dense は範囲の bucket、 大きな値は run の二分探索)
+        h.pull_range(lo as u64, hi as u64)
     }
 }
 

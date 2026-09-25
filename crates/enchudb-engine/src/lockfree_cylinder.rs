@@ -204,6 +204,31 @@ impl LockFreeCylinder {
         removed
     }
 
+    /// 値が `lo..=hi` の entry の eid (古い entry・重複込み、 呼び側が Column で verify する)。 dense は
+    /// 範囲の bucket を順に、 sparse は run を二分探索で。
+    pub fn range_raw(&self, lo: u64, hi: u64) -> Vec<u32> {
+        let mut out = Vec::new();
+        if lo > hi {
+            return out;
+        }
+        if lo < DENSE_CAP as u64 {
+            let guard = epoch::pin();
+            let arr = self.dense.load(Ordering::Acquire, &guard);
+            // SAFETY: dense は常に非 null。
+            let vec = unsafe { arr.deref() };
+            if !vec.is_empty() {
+                let end = hi.min(vec.len() as u64 - 1);
+                for v in lo..=end {
+                    vec[v as usize].with_read(&guard, |s| out.extend_from_slice(s));
+                }
+            }
+        }
+        if hi >= DENSE_CAP as u64 {
+            out.extend(self.sparse.range(lo.max(DENSE_CAP as u64), hi));
+        }
+        out
+    }
+
     /// sparse の entry を `lo..=hi` で `(値, eid)` (古い entry 込み)。
     pub fn sparse_range(&self, lo: u64, hi: u64) -> Vec<(u64, u32)> {
         self.sparse.range_pairs(lo.max(DENSE_CAP as u64), hi)
