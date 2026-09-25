@@ -238,6 +238,11 @@ pub enum LivePred {
     /// 満たすものが 1 つ以上ある (SQL の `EXISTS (SELECT .. WHERE x.via = this AND ..)`)。
     /// `Not(Exists)` = 1 つも無い。 中の件数は `via` で group 分けした集計の購読が持つ。
     Exists { via: u16, preds: Vec<LivePred> },
+    /// この entity の `mine` 列の値と、 `theirs` 列の値が等しい entity のうち、 `preds` を満たすものが 1 つ
+    /// 以上ある (値で結ぶ準結合、 SQL の `EXISTS (SELECT .. WHERE x.theirs = this.mine AND ..)`)。 `mine` と
+    /// `theirs` は同じ型の列 (Tag どうしは vocab id が共通)。 `Not(ExistsEq)` = 1 つも無い。 中の件数は
+    /// `theirs` の値で group 分けした集計の購読が持つ。
+    ExistsEq { mine: u16, theirs: u16, preds: Vec<LivePred> },
     /// 枝のどれかが真 (各枝は条件の AND)。 `Via` の中にも書ける (`company.city = 東京 OR
     /// company.city = 大阪` = `Via { company, Or([[city = 東京], [city = 大阪]]) }`)。 枝も枝の中の
     /// AND も空は不可。 展開した枝 (AND の OR に直した数) は [`MAX_BRANCHES`] まで。
@@ -273,6 +278,13 @@ impl LivePred {
                     p.collect_himos(out);
                 }
             }
+            LivePred::ExistsEq { mine, theirs, preds } => {
+                out.push(*mine);
+                out.push(*theirs);
+                for p in preds {
+                    p.collect_himos(out);
+                }
+            }
             LivePred::Or(branches) => {
                 for p in branches.iter().flatten() {
                     p.collect_himos(out);
@@ -288,6 +300,26 @@ impl LivePred {
         out
     }
 
+    /// 条件に出てくる値で結ぶ組 `(mine, theirs)` (`ExistsEq`、 中身の中も)。
+    pub fn value_joins(&self) -> Vec<(u16, u16)> {
+        let mut out = Vec::new();
+        self.collect_value_joins(&mut out);
+        out
+    }
+
+    fn collect_value_joins(&self, out: &mut Vec<(u16, u16)>) {
+        match self {
+            LivePred::Via { pred, .. } | LivePred::Not(pred) => pred.collect_value_joins(out),
+            LivePred::Exists { preds, .. } => preds.iter().for_each(|p| p.collect_value_joins(out)),
+            LivePred::ExistsEq { mine, theirs, preds } => {
+                out.push((*mine, *theirs));
+                preds.iter().for_each(|p| p.collect_value_joins(out));
+            }
+            LivePred::Or(bs) => bs.iter().flatten().for_each(|p| p.collect_value_joins(out)),
+            _ => {}
+        }
+    }
+
     fn collect_ref_himos(&self, out: &mut Vec<u16>) {
         match self {
             LivePred::Via { path, pred } => {
@@ -297,6 +329,11 @@ impl LivePred {
             LivePred::Not(p) => p.collect_ref_himos(out),
             LivePred::Exists { via, preds } => {
                 out.push(*via);
+                for p in preds {
+                    p.collect_ref_himos(out);
+                }
+            }
+            LivePred::ExistsEq { preds, .. } => {
                 for p in preds {
                     p.collect_ref_himos(out);
                 }
@@ -393,11 +430,19 @@ fn alternatives(p: LivePred) -> Result<Vec<Vec<LivePred>>, String> {
                 check_exists(via, &preds)?;
                 vec![vec![LivePred::Not(Box::new(LivePred::Exists { via, preds }))]]
             }
+            LivePred::ExistsEq { mine, theirs, preds } => {
+                check_exists(theirs, &preds)?;
+                vec![vec![LivePred::Not(Box::new(LivePred::ExistsEq { mine, theirs, preds }))]]
+            }
             leaf => vec![vec![LivePred::Not(Box::new(leaf))]],
         },
         LivePred::Exists { via, preds } => {
             check_exists(via, &preds)?;
             vec![vec![LivePred::Exists { via, preds }]]
+        }
+        LivePred::ExistsEq { mine, theirs, preds } => {
+            check_exists(theirs, &preds)?;
+            vec![vec![LivePred::ExistsEq { mine, theirs, preds }]]
         }
         leaf => vec![vec![leaf]],
     })
@@ -1272,18 +1317,59 @@ enum Pred {
     Text(u16, String, std::sync::OnceLock<u32>),
     /// 中身が偽 (値が無い entity も真)。
     Not(Box<Pred>),
-    /// この entity を `via` で指し `preds` を満たす entity がある (`LivePred::Exists`)。 `idx` = family の
-    /// `exists` / `Settled::exists` の添字 (`number_exists` が振る)。
-    Exists { via: u16, preds: Vec<LivePred>, idx: usize },
+    /// この entity を `via` で指し `preds` を満たす entity がある (`LivePred::Exists`、 `mine` = None)、 または
+    /// この entity の `mine` 列の値を `via` 列に持ち `preds` を満たす entity がある (`LivePred::ExistsEq`)。
+    /// `idx` = family の `exists` / `Settled::exists` の添字 (`number_exists` が振る)。
+    Exists { via: u16, mine: Option<u16>, preds: Vec<LivePred>, idx: usize },
+}
+
+/// `Exists` の件数が 1 以上の group: 指されている entity (`Eids`)、 値で結ぶ時は値 (`Vals`、 64 bit の値もある)。
+enum ExSet {
+    Eids(Bits),
+    Vals(std::collections::BTreeSet<u64>),
+}
+
+impl ExSet {
+    fn new(by_value: bool) -> Self {
+        if by_value { ExSet::Vals(Default::default()) } else { ExSet::Eids(Bits::default()) }
+    }
+
+    #[inline]
+    fn has(&self, g: u64) -> bool {
+        match self {
+            ExSet::Eids(b) => u32::try_from(g).is_ok_and(|e| b.get(e)),
+            ExSet::Vals(s) => s.contains(&g),
+        }
+    }
+
+    fn put(&mut self, g: u64, on: bool) {
+        match self {
+            ExSet::Eids(b) => b.put(g as u32, on),
+            ExSet::Vals(s) => {
+                if on {
+                    s.insert(g);
+                } else {
+                    s.remove(&g);
+                }
+            }
+        }
+    }
+
+    fn groups(&self) -> Vec<u64> {
+        match self {
+            ExSet::Eids(b) => b.iter().map(u64::from).collect(),
+            ExSet::Vals(s) => s.iter().copied().collect(),
+        }
+    }
 }
 
 impl Pred {
-    /// route を張る紐 (`Exists` は無し — 変化は集計の購読から来る)。
+    /// route を張る紐 (`Exists` は値で結ぶ時の自分の列だけ — 中身の変化は集計の購読から来る)。
     fn himo(&self) -> Option<u16> {
         match self {
             Pred::Range(h, ..) | Pred::Present(h) | Pred::In(h, _) | Pred::Text(h, ..) => Some(*h),
             Pred::Not(p) => p.himo(),
-            Pred::Exists { .. } => None,
+            Pred::Exists { mine, .. } => *mine,
         }
     }
 
@@ -1294,7 +1380,7 @@ impl Pred {
 
     /// `ex` = `Settled::exists` (`Exists` の件数が 1 以上の entity)。
     #[inline]
-    fn matches(&self, r: &impl CellReader, ex: &[Bits], eid: u32) -> bool {
+    fn matches(&self, r: &impl CellReader, ex: &[ExSet], eid: u32) -> bool {
         match self {
             Pred::Range(h, lo, hi) => matches!(r.cell(*h, eid), Some(v) if *lo <= v && v <= *hi),
             Pred::Present(h) => r.cell(*h, eid).is_some(),
@@ -1310,7 +1396,8 @@ impl Pred {
                 r.cell(*h, eid) == Some(id as u64)
             }
             Pred::Not(p) => !p.matches(r, ex, eid),
-            Pred::Exists { idx, .. } => ex[*idx].get(eid),
+            Pred::Exists { idx, mine: None, .. } => ex[*idx].has(eid as u64),
+            Pred::Exists { idx, mine: Some(m), .. } => r.cell(*m, eid).is_some_and(|v| ex[*idx].has(v)),
         }
     }
 }
@@ -1386,12 +1473,17 @@ fn flatten(p: LivePred, path: &mut Vec<u16>, out: &mut Vec<Flat>) {
         LivePred::Present { himo_id } => (vec![3, himo_id as u64], Leaf::Fixed(Pred::Present(himo_id))),
         // 否定は値を固定した条件 (値ごとに別の family)。 形の符号に中身の値まで入れる
         LivePred::Exists { via, preds } => {
-            let (t, p) = exists_leaf(via, preds);
+            let (t, p) = exists_leaf(via, None, preds);
+            (t, Leaf::Fixed(p))
+        }
+        LivePred::ExistsEq { mine, theirs, preds } => {
+            let (t, p) = exists_leaf(theirs, Some(mine), preds);
             (t, Leaf::Fixed(p))
         }
         LivePred::Not(inner) => {
             let (tail, p) = match *inner {
-                LivePred::Exists { via, preds } => exists_leaf(via, preds),
+                LivePred::Exists { via, preds } => exists_leaf(via, None, preds),
+                LivePred::ExistsEq { mine, theirs, preds } => exists_leaf(theirs, Some(mine), preds),
                 LivePred::Eq { himo_id, value } => (vec![0, himo_id as u64, value], Pred::In(himo_id, vec![value])),
                 LivePred::In { himo_id, mut values } => {
                     values.sort_unstable();
@@ -1422,22 +1514,23 @@ fn flatten(p: LivePred, path: &mut Vec<u16>, out: &mut Vec<Flat>) {
     out.push(Flat { path: path.clone(), sig, leaf });
 }
 
-/// `Exists` の形の符号と条件 (中身の条件まで符号に入れる = 中身が違えば別の family)。
-fn exists_leaf(via: u16, preds: Vec<LivePred>) -> (Vec<u64>, Pred) {
+/// `Exists` の形の符号と条件 (中身の条件まで符号に入れる = 中身が違えば別の family)。 `mine` = 値で結ぶ時の
+/// 自分の列 (None = `via` で指されている)。
+fn exists_leaf(via: u16, mine: Option<u16>, preds: Vec<LivePred>) -> (Vec<u64>, Pred) {
     let text = format!("{preds:?}");
-    let mut t = vec![9, via as u64, text.len() as u64];
+    let mut t = vec![9, via as u64, mine.map_or(0, |m| m as u64 + 1), text.len() as u64];
     t.extend(text.bytes().map(u64::from));
-    (t, Pred::Exists { via, preds, idx: usize::MAX })
+    (t, Pred::Exists { via, mine, preds, idx: usize::MAX })
 }
 
-/// 条件の中の `Exists` に添字を振り、 (via, 中身) を添字の順に返す。
-fn number_exists(flats: &mut [Flat]) -> Vec<(u16, Vec<LivePred>)> {
-    fn visit(p: &mut Pred, out: &mut Vec<(u16, Vec<LivePred>)>) {
+/// 条件の中の `Exists` に添字を振り、 (via, mine, 中身) を添字の順に返す。
+fn number_exists(flats: &mut [Flat]) -> Vec<(u16, Option<u16>, Vec<LivePred>)> {
+    fn visit(p: &mut Pred, out: &mut Vec<(u16, Option<u16>, Vec<LivePred>)>) {
         match p {
             Pred::Not(q) => visit(q, out),
-            Pred::Exists { via, preds, idx } => {
+            Pred::Exists { via, mine, preds, idx } => {
                 *idx = out.len();
-                out.push((*via, preds.clone()));
+                out.push((*via, *mine, preds.clone()));
             }
             _ => {}
         }
@@ -1864,7 +1957,7 @@ struct Settled {
     summand: ValWords,
     /// `Exists` ごと: 指している entity (中身を満たすもの) が 1 つ以上ある entity。 `Family::exists` の
     /// 集計の購読の差分で動かす。
-    exists: Vec<Bits>,
+    exists: Vec<ExSet>,
     /// 上位 k 件で並びの列が根でない family (`Family::order_part`): 根の記録は (鍵, 1 段目の先) で、
     /// 並びの値は `opart` から引く。
     order_view: Option<()>,
@@ -2806,10 +2899,10 @@ pub(crate) struct Family {
     on_path: Vec<bool>,
     /// 集計で group ごとに値の和も持つ根の列 (`Settled::summand`)。 根に route を張る。
     sum: Option<u16>,
-    /// `Exists` ごと: 中身の件数を `via` の値 (指されている entity) ごとに持つ集計の購読と、 `Exists` の
-    /// ある節。 family が要らなくなったら `LiveRegistry::unregister` が edit lock の外で drop する
+    /// `Exists` ごと: 中身の件数を `via` の値 (指されている entity、 値で結ぶ時は値) ごとに持つ集計の購読と、
+    /// `Exists` のある節と、 値で結ぶ時の自分の列。 family が要らなくなったら `LiveRegistry::unregister` が edit lock の外で drop する
     /// (drop は集計の購読の解除 = edit lock を取る)。
-    exists: Mutex<Vec<(LiveCounts, usize)>>,
+    exists: Mutex<Vec<(LiveCounts, usize, Option<u16>)>>,
 }
 
 /// 穴の値を解決して鍵の組 (穴の値の並び) を返す。 `In` の穴は値の数だけ組が増える (組の掛け算)。
@@ -2883,12 +2976,12 @@ impl Family {
         });
         let nodes = build_tree(flats);
         // `Exists` の添字 → 節
-        let mut ex_node = vec![0usize; exists.len()];
-        fn find_ex(p: &Pred, n: usize, out: &mut [usize]) {
+        let mut ex_node = vec![(0usize, None); exists.len()];
+        fn find_ex(p: &Pred, n: usize, out: &mut [(usize, Option<u16>)]) {
             match p {
                 Pred::Not(q) => find_ex(q, n, out),
                 // 1 回だけの評価 (`find_branch`) は集計の購読を持たない
-                Pred::Exists { idx, .. } if *idx < out.len() => out[*idx] = n,
+                Pred::Exists { idx, mine, .. } if *idx < out.len() => out[*idx] = (n, *mine),
                 _ => {}
             }
         }
@@ -2897,8 +2990,9 @@ impl Family {
                 find_ex(p, i, &mut ex_node);
             }
         }
-        let n_exists = exists.len();
-        let exists: Vec<(LiveCounts, usize)> = exists.into_iter().zip(ex_node).collect();
+        let ex_by_value: Vec<bool> = ex_node.iter().map(|x| x.1.is_some()).collect();
+        let exists: Vec<(LiveCounts, usize, Option<u16>)> =
+            exists.into_iter().zip(ex_node).map(|(c, (n, mine))| (c, n, mine)).collect();
         let mut order: Vec<usize> = (0..nodes.len()).collect();
         order.sort_by_key(|&n| std::cmp::Reverse(nodes[n].depth));
         let mut routes = Vec::new();
@@ -2948,7 +3042,7 @@ impl Family {
             dirty: AtomicU32::new(0),
             settled: Mutex::new({
                 let mut st = Settled::new(&widths);
-                st.exists = (0..n_exists).map(|_| Bits::default()).collect();
+                st.exists = ex_by_value.iter().map(|&v| ExSet::new(v)).collect();
                 if matches!(kind, CarryKind::Order(_)) && nodes_partial.is_some() {
                     st.order_view = Some(());
                 }
@@ -3185,7 +3279,7 @@ impl Family {
     /// 索引を引いて根まで遡る (結果の根は全ての穴で値が一致するので、 どの穴から遡っても漏れない)。
     /// 無ければ範囲の穴の範囲、 それも無ければ索引で引ける条件 (無ければ条件の紐を持つ全 entity)
     /// から遡る。
-    fn walk(&self, r: &impl CellReader, vals: &[u64], range: Option<(u64, u64)>, ex: &[Bits]) -> Vec<u32> {
+    fn walk(&self, r: &impl CellReader, vals: &[u64], range: Option<(u64, u64)>, ex: &[ExSet]) -> Vec<u32> {
         let hole = self
             .order
             .iter()
@@ -3200,8 +3294,11 @@ impl Family {
                 self.order.iter().rev().find_map(|&n| {
                     self.nodes[n].local.iter().find(|p| p.positive()).map(|p| {
                         let ents = match (p, p.himo()) {
-                            // 指している entity がある = 件数が 1 以上の entity
-                            (Pred::Exists { idx, .. }, _) => ex[*idx].iter().collect(),
+                            // 指している entity がある = 件数が 1 以上の entity (値で結ぶ時はその値を持つ entity)
+                            (Pred::Exists { idx, mine: None, .. }, _) => ex[*idx].groups().into_iter().map(|g| g as u32).collect(),
+                            (Pred::Exists { idx, mine: Some(m), .. }, _) => {
+                                ex[*idx].groups().into_iter().flat_map(|v| r.pull(*m, v)).collect()
+                            }
                             (_, Some(h)) => r.with_himo(h),
                             (_, None) => Vec::new(),
                         };
@@ -3405,15 +3502,17 @@ impl Family {
     fn poll_exists(&self, r: &impl CellReader, s: &mut Settled) -> Vec<(usize, Vec<u32>)> {
         let ex = self.exists.lock();
         let mut out = Vec::new();
-        for (i, (counts, node)) in ex.iter().enumerate() {
+        for (i, (counts, node, mine)) in ex.iter().enumerate() {
             let mut flipped = Vec::new();
             for (g, a) in counts.poll_with(r) {
-                // group は ref の列 (指している entity)
-                let g = g as u32;
+                // group は ref の列 (指している entity)、 値で結ぶ時は値 = その値を持つ entity 全部が動く
                 let now = a.count > 0;
-                if s.exists[i].get(g) != now {
+                if s.exists[i].has(g) != now {
                     s.exists[i].put(g, now);
-                    flipped.push(g);
+                    match mine {
+                        None => flipped.push(g as u32),
+                        Some(m) => flipped.extend(r.pull(*m, g)),
+                    }
                 }
             }
             if !flipped.is_empty() {
@@ -3426,7 +3525,7 @@ impl Family {
     /// この family と、 `Exists` の集計の購読 (入れ子も) が route を張る紐。
     fn all_himos(&self) -> Vec<u16> {
         let mut hs: Vec<u16> = self.routes.iter().map(|&(h, _)| h).collect();
-        for (c, _) in self.exists.lock().iter() {
+        for (c, ..) in self.exists.lock().iter() {
             hs.extend(c.himos());
         }
         hs
@@ -3434,7 +3533,7 @@ impl Family {
 
     /// 有効化 (`Exists` の集計の購読を先に)。
     fn seed(&self, r: &impl CellReader) {
-        for (c, _) in self.exists.lock().iter() {
+        for (c, ..) in self.exists.lock().iter() {
             c.seed(r);
         }
         let mut s = self.settled.lock();
@@ -3443,7 +3542,7 @@ impl Family {
 
     /// `Exists` の集計の購読に未 poll の変化がありうるか。
     fn exists_dirty(&self) -> bool {
-        self.exists.lock().iter().any(|(c, _)| c.is_dirty())
+        self.exists.lock().iter().any(|(c, ..)| c.is_dirty())
     }
 
     /// 印を消費して評価し直す。 深い節から: 答えが変わった entity を親へ展開、 根で集合を更新。
@@ -3600,15 +3699,19 @@ fn find_branch(r: &impl CellReader, preds: Vec<LivePred>) -> Vec<u32> {
     let Some(tuples) = resolve(r, &key) else { return Vec::new() };
     let range = range_of(&key);
     let mut s = Settled::new(&fam.nodes.iter().map(|x| x.key_len).collect::<Vec<_>>());
-    // `Exists`: 中身を満たす entity を 1 回引き、 それが指している entity に印
+    // `Exists`: 中身を満たす entity を 1 回引き、 それが指している entity (値で結ぶ時はその値) に印
     s.exists = specs
         .into_iter()
-        .map(|(via, preds)| {
-            let mut b = Bits::default();
+        .map(|(via, mine, preds)| {
+            let mut b = ExSet::new(mine.is_some());
             let kids = dnf(preds).map(|bs| find_once(r, bs)).unwrap_or_default();
             for x in kids {
-                if let Some(t) = r.ref_cell(via, x) {
-                    b.put(t, true);
+                let g = match mine {
+                    None => r.ref_cell(via, x).map(u64::from),
+                    Some(_) => r.cell(via, x),
+                };
+                if let Some(g) = g {
+                    b.put(g, true);
                 }
             }
             b
@@ -3866,7 +3969,7 @@ impl LiveRegistry {
         // 既にあって使わなかった分は、 edit lock を離してから drop する
         let mut exists: Vec<LiveCounts> = specs
             .into_iter()
-            .map(|(via, preds)| {
+            .map(|(via, _, preds)| {
                 let branches = dnf(preds).expect("Exists の中身は dnf (check_exists) で検査済み");
                 self.register_counts(branches, (Vec::new(), via), None).expect("check_exists で検査済み")
             })
@@ -4568,6 +4671,12 @@ fn matches_leaf(r: &impl CellReader, p: &LivePred, e: u32) -> bool {
         LivePred::Exists { via, preds } => {
             let kids: Vec<u32> = dnf(preds.clone()).map(|bs| find_once(r, bs)).unwrap_or_default();
             r.pull(*via, e as u64).into_iter().any(|x| kids.binary_search(&x).is_ok())
+        }
+        // 自分の値を持つ entity を引いて中身を 1 回評価
+        LivePred::ExistsEq { mine, theirs, preds } => {
+            let Some(v) = r.cell(*mine, e) else { return false };
+            let kids: Vec<u32> = dnf(preds.clone()).map(|bs| find_once(r, bs)).unwrap_or_default();
+            r.pull(*theirs, v).into_iter().any(|x| kids.binary_search(&x).is_ok())
         }
         LivePred::Via { .. } | LivePred::Or(_) => false,
     }

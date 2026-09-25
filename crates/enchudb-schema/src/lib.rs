@@ -2126,6 +2126,9 @@ enum Predicate {
     /// 別の table の row がこの row を ref 列 (himo `via`) で指していて、 条件 (engine の条件に写し済み、
     /// None = 常に 0 件) を満たすものがある。
     Exists { via: u16, preds: Option<Vec<enchudb_engine::LivePred>> },
+    /// 別の table の row のうち、 列 (himo `theirs`) の値がこの row の列 (himo `mine`) の値と等しく、 条件を
+    /// 満たすものがある (値で結ぶ準結合)。
+    ExistsEq { mine: u16, theirs: u16, preds: Option<Vec<enchudb_engine::LivePred>> },
 }
 
 pub struct Query<'a> {
@@ -2378,6 +2381,56 @@ impl<'a> Query<'a> {
         self
     }
 
+    /// `sub` (別の table への query) の row のうち、 列 `their_col` の値がこの row の列 `my_col` の値と等しい
+    /// ものが 1 つ以上ある (値で結ぶ準結合、 SQL の `EXISTS (SELECT .. FROM sub WHERE sub.their_col =
+    /// this.my_col AND ..)`)。
+    ///
+    /// ```ignore
+    /// // 営業中の店がある街に住む user
+    /// let q = users.all().where_exists_eq("city", shops.where_eq("open", 1i64), "city");
+    /// // 会社の所在地に店が 1 軒も無い社員 (自分の列は ref の先でもよい)
+    /// let q = users.all().where_not_exists_eq("company.city", shops.all(), "city");
+    /// ```
+    ///
+    /// 2 つの列は同じ型 (Tag / Number / BigInt どうし) であること (違えば常に 0 件)。 ref でつなぐ時は
+    /// [`where_exists`](Self::where_exists)。 find / count / subscribe のどれでも使える。 購読では、 この row の
+    /// 列の書き換えも、 `sub` の row の出入り・中身の変化も届く (値の row が 0 件 ↔ 1 件以上をまたぐと、 その値を
+    /// 持つ row がまとめて出入りする)。
+    pub fn where_exists_eq(mut self, my_col: &str, sub: Query<'a>, their_col: &str) -> Self {
+        match self.exists_eq_pred(my_col, sub, their_col) {
+            Some((path, p)) => self.push_at(path, p),
+            None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
+        }
+        self
+    }
+
+    /// [`where_exists_eq`](Self::where_exists_eq) の否定: 値の等しい row が 1 つも無い (SQL の `NOT EXISTS`)。
+    /// この row の列に値が無ければ真 (SQL と同じ)。
+    pub fn where_not_exists_eq(mut self, my_col: &str, sub: Query<'a>, their_col: &str) -> Self {
+        match self.exists_eq_pred(my_col, sub, their_col) {
+            Some((path, p)) => {
+                if !path.is_empty() {
+                    // 1 段目の ref に値がある (where_ne と同じ)
+                    self.preds.push(Predicate::Present(path[0]));
+                }
+                self.push_at(path, Predicate::Not(Box::new(p)))
+            }
+            None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
+        }
+        self
+    }
+
+    /// `where_exists_eq` の条件と、 自分の列までの ref の道。 列が無い / 型が違う / Leaf / Ref なら None。
+    fn exists_eq_pred(&self, my_col: &str, sub: Query<'a>, their_col: &str) -> Option<(Vec<u16>, Predicate)> {
+        let (path, mine) = self.resolve_col(my_col)?;
+        let (theirs_ty, theirs) = sub.table.col(their_col).map(|c| (c.ty, c.himo_id))?;
+        if mine.ty != theirs_ty || matches!(mine.ty, ColumnType::Leaf | ColumnType::Ref) {
+            return None;
+        }
+        let preds = sub.live_preds().ok()?;
+        Some((path, Predicate::ExistsEq { mine: mine.himo_id, theirs, preds }))
+    }
+
     /// `where_exists` の条件。 `via_col` がこの table を指す ref 列でなければ None。
     fn exists_pred(&self, sub: Query<'a>, via_col: &str) -> Option<Predicate> {
         let cd = sub.table.col(via_col)?;
@@ -2470,7 +2523,7 @@ impl<'a> Query<'a> {
         // ref をたどる条件 (`"company.city"`) を含むなら engine の live 条件評価に任せる
         // (候補を索引で引いて ref の逆引きで遡り、 全条件で評価)
         if self.preds.iter().any(|p| {
-            matches!(p, Predicate::Via(..) | Predicate::Or(_) | Predicate::Not(_) | Predicate::Present(_) | Predicate::Exists { .. })
+            matches!(p, Predicate::Via(..) | Predicate::Or(_) | Predicate::Not(_) | Predicate::Present(_) | Predicate::Exists { .. } | Predicate::ExistsEq { .. })
         }) {
             let limit = self.limit;
             let Some(preds) = self.live_preds()? else { return Ok(Vec::new()) };
@@ -2505,7 +2558,7 @@ impl<'a> Query<'a> {
                     in_pred = Some((h, vs));
                 }
                 Predicate::Range { himo_name, lo, hi } => range_preds.push((himo_name, lo, hi)),
-                Predicate::Via(..) | Predicate::Or(_) | Predicate::Not(_) | Predicate::Present(_) | Predicate::Exists { .. } => {
+                Predicate::Via(..) | Predicate::Or(_) | Predicate::Not(_) | Predicate::Present(_) | Predicate::Exists { .. } | Predicate::ExistsEq { .. } => {
                     unreachable!("Via / Or / Not / Present / Exists は find の先頭で find_by に回している")
                 }
             }
@@ -2726,6 +2779,10 @@ impl<'a> Query<'a> {
                 Predicate::Present(h) => LivePred::Present { himo_id: h },
                 Predicate::Exists { via, preds } => match preds {
                     Some(preds) => LivePred::Exists { via, preds },
+                    None => return Ok(None),
+                },
+                Predicate::ExistsEq { mine, theirs, preds } => match preds {
+                    Some(preds) => LivePred::ExistsEq { mine, theirs, preds },
                     None => return Ok(None),
                 },
                 Predicate::Not(inner) => match conv(eng, *inner, rep)? {

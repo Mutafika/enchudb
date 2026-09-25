@@ -1,0 +1,142 @@
+//! 値で結ぶ準結合 (`LivePred::ExistsEq`) の engine 直の検査: 書き込みと並行した登録・poll の後、 積分した
+//! 集合が総当たりの結果と一致する。 型の違う列 / Leaf を結ぶ購読は断る。
+
+use enchudb_engine::{Engine, GrowableOptions, LiveDelta, LivePred, ValueType};
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+fn tmp_path(tag: &str) -> String {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    format!("/tmp/live_join_{}_{}_{}.enchu", tag, std::process::id(), nanos)
+}
+
+fn cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(path);
+    let _ = std::fs::remove_file(path);
+    for ext in ["lock", "oplog", "schema", "tables"] {
+        let _ = std::fs::remove_file(format!("{}.{}", path, ext));
+    }
+}
+
+struct Rng(u64);
+impl Rng {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) % n
+    }
+}
+
+fn integrate(set: &mut BTreeSet<u64>, d: LiveDelta) {
+    for e in d.removed {
+        assert!(set.remove(&e), "removed に未報告の eid {e}");
+    }
+    for e in d.added {
+        assert!(set.insert(e), "added に報告済みの eid {e}");
+    }
+}
+
+/// 値で結ぶ列は同じ型で Leaf でないこと。
+#[test]
+fn value_join_needs_columns_of_the_same_type() {
+    let path = tmp_path("types");
+    cleanup(&path);
+    let mut eng = Engine::create_growable_opts(&path, GrowableOptions::default()).unwrap();
+    for (h, t) in [("u.city", ValueType::Tag), ("s.city", ValueType::Tag), ("s.zip", ValueType::Number), ("u.note", ValueType::Leaf), ("s.note", ValueType::Leaf)] {
+        eng.define_himo(h, t, 0);
+    }
+    let id = |h: &str| eng.himo_id(h).unwrap() as u16;
+    let q = |mine: u16, theirs: u16| vec![LivePred::ExistsEq { mine, theirs, preds: vec![LivePred::Present { himo_id: theirs }] }];
+    assert!(eng.subscribe(q(id("u.city"), id("s.city"))).is_ok());
+    assert!(eng.subscribe(q(id("u.city"), id("s.zip"))).is_err(), "Tag と Number");
+    assert!(eng.subscribe(q(id("u.note"), id("s.note"))).is_err(), "Leaf");
+    // 否定・ref の先・中身の中でも
+    let not = vec![LivePred::Present { himo_id: id("u.city") }, LivePred::Not(Box::new(q(id("u.city"), id("s.zip")).remove(0)))];
+    assert!(eng.subscribe(not).is_err(), "否定の中");
+    drop(eng);
+    cleanup(&path);
+}
+
+/// 書き込み (住人の街・店の街・店の開閉) と並行して登録・poll し、 止めた後の積分が総当たりと一致する。
+#[test]
+fn value_join_under_concurrent_writes() {
+    let path = tmp_path("race");
+    cleanup(&path);
+    let mut eng = Engine::create_growable_opts(&path, GrowableOptions::default()).unwrap();
+    for h in ["u.city", "s.city", "s.open"] {
+        eng.define_himo(h, ValueType::Number, 0);
+    }
+    let id = |eng: &Engine, h: &str| eng.himo_id(h).unwrap() as u16;
+    let (ucity, scity, sopen) = (id(&eng, "u.city"), id(&eng, "s.city"), id(&eng, "s.open"));
+    let users: Vec<u64> = (0..500).map(|_| eng.entity().unwrap()).collect();
+    let shops: Vec<u64> = (0..30).map(|_| eng.entity().unwrap()).collect();
+    for (i, &u) in users.iter().enumerate() {
+        eng.tie(u, "u.city", (i % 8) as u32);
+    }
+    for (i, &s) in shops.iter().enumerate() {
+        eng.tie(s, "s.city", (i % 6) as u32);
+        eng.tie(s, "s.open", (i % 2) as u32);
+    }
+    let eng = Engine::concurrentize(eng);
+    let join = |open: bool| LivePred::ExistsEq {
+        mine: ucity,
+        theirs: scity,
+        preds: if open { vec![LivePred::Eq { himo_id: sopen, value: 1 }] } else { vec![LivePred::Present { himo_id: scity }] },
+    };
+    for round in 0..10u64 {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0..4u64)
+            .map(|t| {
+                let eng = eng.clone();
+                let (users, shops) = (users.clone(), shops.clone());
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut rng = Rng(0x10e1_0000_0000_0001 ^ (round * 4 + t + 1));
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let u = users[rng.below(users.len() as u64) as usize];
+                        let s = shops[rng.below(shops.len() as u64) as usize];
+                        match rng.below(6) {
+                            0 | 1 => eng.tie_to(u, "u.city", rng.below(8) as u32),
+                            2 => eng.tie_to(s, "s.city", rng.below(8) as u32),
+                            3 if rng.below(8) == 0 => eng.untie(u, "u.city"),
+                            _ => eng.tie_to(s, "s.open", rng.below(2) as u32),
+                        }
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        // 書き込みと並行して登録: 開いた店がある街の住人 / 店が 1 軒も無い街の住人
+        let open_q = eng.subscribe(vec![join(true)]).unwrap();
+        let none_q = eng
+            .subscribe(vec![LivePred::Present { himo_id: ucity }, LivePred::Not(Box::new(join(false)))])
+            .unwrap();
+        let (mut open_seen, mut none_seen) = (BTreeSet::new(), BTreeSet::new());
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_millis(40) {
+            integrate(&mut open_seen, open_q.poll(&eng));
+            integrate(&mut none_seen, none_q.poll(&eng));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for w in writers {
+            w.join().unwrap();
+        }
+        integrate(&mut open_seen, open_q.poll(&eng));
+        integrate(&mut none_seen, none_q.poll(&eng));
+        let shop_at = |v: u64, open: bool| {
+            shops.iter().any(|&s| eng.get(s, "s.city") == Some(v) && (!open || eng.get(s, "s.open") == Some(1)))
+        };
+        let want_open: BTreeSet<u64> =
+            users.iter().copied().filter(|&u| eng.get(u, "u.city").is_some_and(|v| shop_at(v, true))).collect();
+        let want_none: BTreeSet<u64> =
+            users.iter().copied().filter(|&u| eng.get(u, "u.city").is_some_and(|v| !shop_at(v, false))).collect();
+        assert_eq!(open_seen, want_open, "round {round}: 開いた店がある街の住人");
+        assert_eq!(none_seen, want_none, "round {round}: 店が無い街の住人");
+        assert_eq!(open_q.count(&eng), want_open.len());
+        let found: BTreeSet<u64> = eng.find_by(vec![join(true)]).unwrap().into_iter().collect();
+        assert_eq!(found, want_open, "round {round}: find_by");
+    }
+    drop(eng);
+    cleanup(&path);
+}
