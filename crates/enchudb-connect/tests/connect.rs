@@ -226,3 +226,57 @@ fn ingest_needs_prepare() {
     drop(db);
     cleanup(&path);
 }
+
+/// BigInt 列 (i64: 負の数 / ms の時刻 / 64 bit の ID) を取り込み、 主キー / ref の先 / 書き出しで同じ値。
+/// 合計が i64 に入らない時は 10 進の文字列で出す (panic しない)。
+#[test]
+fn bigint_columns_ingest_and_export() {
+    let path = tmp("bigint");
+    let mut db = Database::create_growable_tiny(&path).unwrap();
+    db.table("events").bigint("id").bigint("at").tag("kind").primary_key("id").build().unwrap();
+    db.table("logs").number("id").ref_to("ev", "events").primary_key("id").build().unwrap();
+    prepare(&mut db).unwrap();
+    let events = db.get_table("events").unwrap();
+    let mut ex = LiveExport::new(&db);
+    ex.add("ev", "events", events.all().subscribe().unwrap()).unwrap();
+    ex.add_counts("by_kind", events.all().subscribe_sums("kind", "at").unwrap());
+    let ing = Ingest::new(&db, JsonRows).unwrap();
+    let big = 9_223_372_036_854_775_000i64;
+    let r = ing.apply(&msgs(&[
+        json!({"table": "events", "row": {"id": -1, "at": 1_790_000_000_123i64, "kind": "a"}}),
+        json!({"table": "events", "row": {"id": "9223372036854775806", "at": -5, "kind": "b"}}),
+        json!({"table": "events", "row": {"id": 3, "at": i64::MIN, "kind": "c"}}),
+        json!({"table": "events", "row": {"id": -1, "at": 7}}),
+        json!({"table": "events", "row": {"id": 4, "at": i64::MAX}}),
+        json!({"table": "events", "op": "delete", "key": 3}),
+        json!({"table": "logs", "row": {"id": 1, "ev": -1}}),
+        json!({"table": "logs", "row": {"id": 2, "ev": -42}}),
+        json!({"table": "events", "row": {"id": 5, "at": big, "kind": "z"}}),
+        json!({"table": "events", "row": {"id": 6, "at": big, "kind": "z"}}),
+        json!({"table": "events", "row": {"id": 7, "at": big, "kind": "z"}}),
+    ]));
+    assert_eq!(r.rejected.iter().map(|x| x.0.offset).collect::<Vec<_>>(), vec![4], "i64::MAX だけ弾く: {:?}", r.rejected);
+    let ev = |id: i64| events.where_eq("id", id).find_one().unwrap();
+    let at = |id: i64| events.entity(ev(id).unwrap()).get("at");
+    assert_eq!(at(-1), Some(Value::Number(7)), "主キー -1 の書き換えが別 row になった");
+    assert_eq!(at(i64::MAX - 1), Some(Value::Number(-5)));
+    assert_eq!(ev(3), None);
+    assert_eq!(events.all().count().unwrap(), 6, "-1 / MAX-1 / 5 / 6 / 7 と ref で作った -42");
+    let logs = db.get_table("logs").unwrap();
+    let log_ev = |id: i64| logs.entity(logs.where_eq("id", id).find_one().unwrap().unwrap()).get("ev");
+    assert_eq!(log_ev(1), Some(Value::Ref(ev(-1).unwrap())));
+    assert_eq!(log_ev(2), Some(Value::Ref(ev(-42).unwrap())), "まだ無い参照先は主キーだけの row");
+    let out = Topic::new("out");
+    ex.pump(&mut out.sink()).unwrap();
+    let got = payloads(&out);
+    let row = |id: i64| got.iter().find(|p| p["sub"] == "ev" && p["key"] == json!(id)).cloned();
+    assert_eq!(row(-1).unwrap()["row"], json!({"id": -1, "at": 7, "kind": "a"}));
+    assert_eq!(row(i64::MAX - 1).unwrap()["row"], json!({"id": i64::MAX - 1, "at": -5, "kind": "b"}));
+    let sum = |k: &str| got.iter().find(|p| p["sub"] == "by_kind" && p["group"] == k).map(|p| p["sum"].clone());
+    assert_eq!(sum("a"), Some(json!(7)));
+    assert_eq!(sum("b"), Some(json!(-5)));
+    assert_eq!(sum("z"), Some(json!((big as i128 * 3).to_string())), "i64 / u64 に入らない合計は文字列");
+    drop(ex);
+    drop(db);
+    cleanup(&path);
+}

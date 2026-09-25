@@ -109,6 +109,11 @@ fn big_raw(v: i64) -> Option<u64> {
     (v <= BIGINT_MAX).then_some((v as u64) ^ (1 << 63))
 }
 
+/// BigInt の値の engine 上の値 (`Engine::query_by_id64` などで索引を直接引く時用)。 値域外 (`i64::MAX`) は None。
+pub fn bigint_raw(v: i64) -> Option<u64> {
+    big_raw(v)
+}
+
 /// engine の u64 → BigInt の値。
 fn big_val(raw: u64) -> i64 {
     (raw ^ (1 << 63)) as i64

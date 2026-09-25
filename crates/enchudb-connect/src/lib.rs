@@ -247,19 +247,24 @@ impl<'a, D: Decoder> Ingest<'a, D> {
     fn lookup(&self, table: &str, m: &Meta, k: &Value) -> Result<Option<u64>, String> {
         let eng = self.db.engine();
         let raw = match (m.pk.ty, k) {
-            (ColumnType::Number, Value::Number(n)) => *n as u32,
-            // vocab に無い text = その主キーの row は無い
-            (ColumnType::Tag, Value::Text(s)) => match eng.vocab_id(s) {
-                Some(v) => v,
+            (ColumnType::Number, Value::Number(n)) => *n as u64,
+            // 値域の外 (i64::MAX) の主キーの row は無い
+            (ColumnType::BigInt, Value::Number(n)) => match enchudb_schema::bigint_raw(*n) {
+                Some(raw) => raw,
                 None => return Ok(None),
             },
-            (ColumnType::Ref, Value::Ref(e)) => enchudb_oplog::eid_local(*e),
+            // vocab に無い text = その主キーの row は無い
+            (ColumnType::Tag, Value::Text(s)) => match eng.vocab_id(s) {
+                Some(v) => v as u64,
+                None => return Ok(None),
+            },
+            (ColumnType::Ref, Value::Ref(e)) => enchudb_oplog::eid_local(*e) as u64,
             _ => {
                 let t = self.db.get_table(table).ok_or(format!("unknown table {table}"))?;
                 return t.where_eq(&m.pk.name, k.clone()).find_one().map_err(|e| format!("{e:?}"));
             }
         };
-        Ok(eng.query_by_id(&[(m.pk_himo, raw)]).into_iter().next())
+        Ok(eng.query_by_id64(&[(m.pk_himo, raw)]).into_iter().next())
     }
 
     fn offsets(&self) -> Table<'a> {
@@ -390,6 +395,15 @@ impl<'a, D: Decoder> Ingest<'a, D> {
                 }
                 Value::Number(n as i64)
             }
+            ColumnType::BigInt => {
+                let n = match v {
+                    Json::Number(n) => n.as_i64().ok_or_else(bad)?,
+                    Json::String(s) => s.trim().parse::<i64>().map_err(|_| bad())?,
+                    _ => return Err(bad()),
+                };
+                // 値域 (i64::MAX を除く) は書き込みで schema が確かめる
+                Value::Number(n)
+            }
             ColumnType::Tag | ColumnType::Leaf => match v {
                 Json::String(s) => Value::Text(s.clone()),
                 Json::Number(_) | Json::Bool(_) => Value::Text(v.to_string()),
@@ -487,7 +501,7 @@ impl<'a> LiveExport<'a> {
                 Sub::Counts { name, q } => {
                     for (v, n, s) in q.poll_sums() {
                         let g = value_json(self.db, None, &v);
-                        out.push(msg(name, &g, serde_json::json!({ "sub": name, "group": g, "count": n, "sum": s })));
+                        out.push(msg(name, &g, serde_json::json!({ "sub": name, "group": g, "count": n, "sum": sum_json(s) })));
                     }
                 }
             }
@@ -516,6 +530,17 @@ fn row_json(db: &Database, t: &Table, e: u64) -> (Json, Json) {
         row.insert(c.name, j);
     }
     (key, Json::Object(row))
+}
+
+/// 合計 (i128) を JSON に。 i64 / u64 に入れば数、 入らなければ (BigInt の列の大きな合計) 10 進の文字列。
+fn sum_json(s: i128) -> Json {
+    if let Ok(n) = i64::try_from(s) {
+        Json::from(n)
+    } else if let Ok(n) = u64::try_from(s) {
+        Json::from(n)
+    } else {
+        Json::from(s.to_string())
+    }
 }
 
 /// 値を JSON に。 `ref_to` があれば ref は参照先の主キー (無ければ eid の数)。
