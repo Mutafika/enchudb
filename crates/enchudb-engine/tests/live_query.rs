@@ -562,7 +562,10 @@ fn new_kinds_under_concurrent_writes() {
             if get(&eng, e, "age").is_some_and(|a| a <= 25) && let Some(c) = city_of(e) {
                 let w = want_sums.entry(c as u64).or_default();
                 w.count += 1;
-                w.sum += get(&eng, e, "score").unwrap_or(0) as u128;
+                if let Some(sc) = get(&eng, e, "score") {
+                    w.sum += sc as u128;
+                    w.summed += 1;
+                }
             }
         }
         assert_eq!(sum_groups, want_sums, "round {round}: [sums] 積分 != 手で数えた件数 / 合計");

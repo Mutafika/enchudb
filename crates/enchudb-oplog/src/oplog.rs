@@ -1864,7 +1864,7 @@ mod tests {
         let wal = OpLog::create(&p, HEADER_SIZE + 256).unwrap();
         let mut hit_full = false;
         for i in 0..10_000u64 {
-            match wal.append(Op::Tie { eid: i, himo_id: 0, value: i as u64 }) {
+            match wal.append(Op::Tie { eid: i, himo_id: 0, value: i }) {
                 Ok(_) => {}
                 Err(e) => {
                     assert_eq!(e.kind(), io::ErrorKind::OutOfMemory, "full は OutOfMemory で返る");
@@ -2098,7 +2098,7 @@ mod tests {
                     w.append(Op::Tie {
                         eid: t * 10000 + i,
                         himo_id: 0,
-                        value: i as u64,
+                        value: i,
                     }).unwrap();
                 }
             }));
@@ -2129,7 +2129,7 @@ mod tests {
                     w.append(Op::Tie {
                         eid: t * 10_000 + i,
                         himo_id: 0,
-                        value: i as u64,
+                        value: i,
                     }).unwrap();
                 }
             }));

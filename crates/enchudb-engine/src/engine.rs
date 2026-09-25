@@ -10919,8 +10919,10 @@ impl Engine {
         let hs = &self.himos[hid];
         let mut result: Vec<u32> = Vec::new();
         for &eid in eids {
-            if let Some(v) = hs.get_value32(enchudb_oplog::eid_local(eid)) {
-                if !result.contains(&v) { result.push(v); }
+            if let Some(v) = hs.get_value32(enchudb_oplog::eid_local(eid))
+                && !result.contains(&v)
+            {
+                result.push(v);
             }
         }
         result
@@ -10971,7 +10973,8 @@ impl Engine {
         use rayon::prelude::*;
         let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
         let hs = &self.himos[hid];
-        if eids.len() < Self::PAR_RANGE_THRESHOLD {
+        // 64 bit 列は u32 の生の配列を持たない (件数は幅によらない数え方で)
+        if eids.len() < Self::PAR_RANGE_THRESHOLD || hs.value_type == ValueType::Number64 {
             return self.count(himo, eids);
         }
         let values = hs.stored_slice();
@@ -11508,7 +11511,14 @@ impl Engine {
         self.pull_in_by_idx(idx, values)
     }
 
-    fn pull_in_by_idx(&self, idx: usize, values: &[u32]) -> Vec<enchudb_oplog::EntityId> {
+    /// `pull_in_by_id` の 64 bit 値版。
+    pub fn pull_in_by_id64(&self, himo_id: u16, values: &[u64]) -> Vec<enchudb_oplog::EntityId> {
+        let idx = himo_id as usize;
+        if idx >= self.himos.len() { return Vec::new(); }
+        self.pull_in_by_idx(idx, values)
+    }
+
+    fn pull_in_by_idx<V: CellValue>(&self, idx: usize, values: &[V]) -> Vec<enchudb_oplog::EntityId> {
         if values.is_empty() { return Vec::new(); }
         let mut out: Vec<u32> = Vec::new();
         for &v in values {

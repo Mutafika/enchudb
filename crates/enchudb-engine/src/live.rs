@@ -1678,30 +1678,39 @@ impl TopK {
     }
 }
 
-/// group 1 つの集計: 根の数と、 合計する列の値の和 (値の無い根は 0 として足す = SQL の SUM)。
+/// group 1 つの集計: 根の数と、 合計する列の値の和 (値の無い根は足さない = SQL の SUM)。
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Agg {
     pub count: u64,
     /// 合計 (64 bit の値を足しても溢れないよう u128)。
     pub sum: u128,
+    /// 合計の列に値のある根の数 (`sum` に足した数)。 値を符号化して載せる列 (schema の BigInt) が
+    /// 合計を元の値に戻すのに使う。
+    pub summed: u64,
 }
 
 impl Agg {
+    /// 根 1 つ。 `stored` = 合計する列の値 + 1 (0 = 値が無い)。
     #[inline]
-    fn one(x: u64) -> Agg {
-        Agg { count: 1, sum: x as u128 }
+    fn one(stored: u64) -> Agg {
+        match stored {
+            0 => Agg { count: 1, sum: 0, summed: 0 },
+            s => Agg { count: 1, sum: (s - 1) as u128, summed: 1 },
+        }
     }
 
     #[inline]
     fn add(&mut self, o: Agg) {
         self.count = self.count.wrapping_add(o.count);
         self.sum = self.sum.wrapping_add(o.sum);
+        self.summed = self.summed.wrapping_add(o.summed);
     }
 
     #[inline]
     fn sub(&mut self, o: Agg) {
         self.count = self.count.wrapping_sub(o.count);
         self.sum = self.sum.wrapping_sub(o.sum);
+        self.summed = self.summed.wrapping_sub(o.summed);
     }
 }
 
@@ -1851,7 +1860,7 @@ struct Settled {
     fresh: Vec<usize>,
     /// 次の settle は答えが変わらなくても展開する (`fresh` の初回の報告のため)。
     force: bool,
-    /// 合計する列のある集計の family: 根ごとに、 今数えている合計の値 (`Family::sum`)。
+    /// 合計する列のある集計の family: 根ごとに、 今数えている合計の値 + 1 (0 = 値が無い、 `Family::sum`)。
     summand: ValWords,
     /// `Exists` ごと: 指している entity (中身を満たすもの) が 1 つ以上ある entity。 `Family::exists` の
     /// 集計の購読の差分で動かす。
@@ -3385,7 +3394,8 @@ impl Family {
         let single_child = (self.nodes[0].children.len() == 1).then(|| self.nodes[0].children[0]);
         let mut via_child: Vec<(Option<Ans>, u32, Vec<u32>)> = Vec::new();
         // 合計する列の今の値 (合計しない family では読まない)
-        let summand = |e: u32| self.sum.and_then(|h| r.cell(h, e)).unwrap_or(0);
+        // 合計する列の値 + 1 (0 = 値が無い)。 `Settled::summand` もこの形で持つ
+        let summand = |e: u32| self.sum.and_then(|h| r.cell(h, e)).map_or(0, |v| v + 1);
         let root_plain = self.nodes[0].local.is_empty() && self.nodes[0].holes.is_empty() && self.nodes[0].range.is_none();
         for &n in &self.order {
             let mut list = std::mem::take(&mut work[n]);
