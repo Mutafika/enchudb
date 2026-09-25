@@ -476,8 +476,8 @@ fn new_kinds_under_concurrent_writes() {
             .unwrap();
         let qs: [&LiveQuery; 6] = [&or, &range, &range_via, &top, &top_via, &top_in];
         let mut seen: Vec<BTreeSet<u64>> = vec![BTreeSet::new(); qs.len()];
-        let mut groups: std::collections::BTreeMap<u32, u64> = Default::default();
-        let mut sum_groups: std::collections::BTreeMap<u32, enchudb_engine::Agg> = Default::default();
+        let mut groups: std::collections::BTreeMap<u64, u64> = Default::default();
+        let mut sum_groups: std::collections::BTreeMap<u64, enchudb_engine::Agg> = Default::default();
         let group = eng.live_group();
         for q in qs {
             group.add(q);
@@ -549,20 +549,20 @@ fn new_kinds_under_concurrent_writes() {
             assert_eq!(seen[i], want[i], "round {round}: [{}] 積分 != 手で数えた結果", names[i]);
             assert_eq!(qs[i].count(&eng), want[i].len(), "round {round}: [{}] count", names[i]);
         }
-        let mut want_groups: std::collections::BTreeMap<u32, u64> = Default::default();
+        let mut want_groups: std::collections::BTreeMap<u64, u64> = Default::default();
         for &e in &users {
             if get(&eng, e, "age").is_some() && let Some(c) = city_of(e) {
-                *want_groups.entry(c).or_insert(0) += 1;
+                *want_groups.entry(c as u64).or_insert(0) += 1;
             }
         }
         assert_eq!(groups, want_groups, "round {round}: [counts] 積分 != 手で数えた件数");
         assert_eq!(counts.all(&eng), want_groups.into_iter().collect::<Vec<_>>(), "round {round}: [counts] all");
-        let mut want_sums: std::collections::BTreeMap<u32, enchudb_engine::Agg> = Default::default();
+        let mut want_sums: std::collections::BTreeMap<u64, enchudb_engine::Agg> = Default::default();
         for &e in &users {
             if get(&eng, e, "age").is_some_and(|a| a <= 25) && let Some(c) = city_of(e) {
-                let w = want_sums.entry(c).or_default();
+                let w = want_sums.entry(c as u64).or_default();
                 w.count += 1;
-                w.sum += get(&eng, e, "score").unwrap_or(0) as u64;
+                w.sum += get(&eng, e, "score").unwrap_or(0) as u128;
             }
         }
         assert_eq!(sum_groups, want_sums, "round {round}: [sums] 積分 != 手で数えた件数 / 合計");

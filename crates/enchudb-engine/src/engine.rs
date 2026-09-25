@@ -11640,8 +11640,10 @@ impl Engine {
         group_himo: u16,
         sum_himo: u16,
     ) -> std::io::Result<crate::live::LiveCounts> {
-        if sum_himo as usize >= self.himos.len() || self.value_type_at(sum_himo as usize) != Some(ValueType::Number) {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "sum himo is not a Number himo"));
+        if sum_himo as usize >= self.himos.len()
+            || !matches!(self.value_type_at(sum_himo as usize), Some(ValueType::Number | ValueType::Number64))
+        {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "sum himo is not a Number / Number64 himo"));
         }
         self.subscribe_agg(preds, group_path, group_himo, Some(sum_himo))
     }
@@ -11660,9 +11662,6 @@ impl Engine {
         }
         if group_path.iter().any(|&h| self.value_type_at(h as usize) != Some(ValueType::Ref)) {
             return Err(bad("group path himo is not a Ref himo"));
-        }
-        if self.is_wide_himo(group_himo) || sum_himo.is_some_and(|h| self.is_wide_himo(h)) {
-            return Err(bad("group / sum on a 64-bit column is not supported yet"));
         }
         let branches = crate::live::dnf(preds).map_err(|m| bad(&m))?;
         let keys: usize = branches.iter().map(|b| crate::live::key_count(b)).fold(0, usize::saturating_add);
@@ -11705,9 +11704,6 @@ impl Engine {
         self.validate_live_preds(&preds)?;
         if order_himo as usize >= self.himos.len() || order_path.iter().any(|&h| h as usize >= self.himos.len()) {
             return Err(bad("unknown order himo"));
-        }
-        if self.is_wide_himo(order_himo) {
-            return Err(bad("subscribe_top: ordering by a 64-bit column is not supported yet"));
         }
         if order_path.iter().any(|&h| self.value_type_at(h as usize) != Some(ValueType::Ref)) {
             return Err(bad("order path himo is not a Ref himo"));
@@ -11755,11 +11751,6 @@ impl Engine {
             .collect())
     }
 
-    /// 紐 `h` が 64 bit 列 (`ValueType::Number64`) か。
-    fn is_wide_himo(&self, h: u16) -> bool {
-        self.value_type_at(h as usize) == Some(ValueType::Number64)
-    }
-
     fn validate_live_preds(&self, preds: &[crate::live::LivePred]) -> std::io::Result<()> {
         let bad = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg);
         if preds.is_empty() {
@@ -11771,9 +11762,6 @@ impl Engine {
         for p in preds {
             if let Some(h) = p.himos().into_iter().find(|&h| h as usize >= himo_count) {
                 return Err(bad(format!("unknown himo_id {h}")));
-            }
-            if let Some(h) = p.himos().into_iter().find(|&h| self.is_wide_himo(h)) {
-                return Err(bad(format!("himo {h} is a 64-bit column (live queries on 64-bit columns are not supported yet)")));
             }
             if let Some(h) = p
                 .ref_himos()
@@ -13693,13 +13681,13 @@ impl Engine {
 
 impl crate::live::CellReader for Engine {
     #[inline]
-    fn cell(&self, himo_id: u16, eid: u32) -> Option<u32> {
-        self.himos.get(himo_id as usize)?.get_value32(eid)
+    fn cell(&self, himo_id: u16, eid: u32) -> Option<u64> {
+        self.himos.get(himo_id as usize)?.get_value(eid)
     }
     fn vocab_lookup(&self, text: &str) -> Option<u32> {
         self.vocab_id(text)
     }
-    fn pull(&self, himo_id: u16, value: u32) -> Vec<u32> {
+    fn pull(&self, himo_id: u16, value: u64) -> Vec<u32> {
         match self.himos.get(himo_id as usize) {
             Some(h) => h.pull(value),
             None => Vec::new(),
@@ -13711,16 +13699,13 @@ impl crate::live::CellReader for Engine {
             None => Vec::new(),
         }
     }
-    fn pull_len(&self, himo_id: u16, value: u32) -> usize {
+    fn pull_len(&self, himo_id: u16, value: u64) -> usize {
         self.himos.get(himo_id as usize).map_or(0, |h| h.slice_len(value))
     }
-    fn pull_range(&self, himo_id: u16, lo: u32, hi: u32) -> Vec<u32> {
+    fn pull_range(&self, himo_id: u16, lo: u64, hi: u64) -> Vec<u32> {
         let Some(h) = self.himos.get(himo_id as usize) else { return Vec::new() };
-        if lo > hi {
-            return Vec::new();
-        }
         // 索引の範囲を引いて Column で確かめる (dense は範囲の bucket、 大きな値は run の二分探索)
-        h.pull_range(lo as u64, hi as u64)
+        h.pull_range(lo, hi)
     }
 }
 

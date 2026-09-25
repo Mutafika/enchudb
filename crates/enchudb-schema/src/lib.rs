@@ -1874,21 +1874,27 @@ pub struct LiveCounts {
 }
 
 impl LiveCounts {
-    fn value(&self, v: u32) -> Value {
+    // engine の group の値は u64。 schema の列 (Number / Ref / Tag / Leaf) の値は u32 に収まる
+    fn value(&self, v: u64) -> Value {
         match self.ty {
             ColumnType::Number => Value::Number(v as i64),
-            ColumnType::Ref => Value::Ref(enchudb_oplog::make_eid(self.eng.peer_id(), v)),
-            ColumnType::Tag | ColumnType::Leaf => Value::Text(String::from_utf8_lossy(self.eng.vocab_text(v)).into_owned()),
+            ColumnType::Ref => Value::Ref(enchudb_oplog::make_eid(self.eng.peer_id(), v as u32)),
+            ColumnType::Tag | ColumnType::Leaf => Value::Text(String::from_utf8_lossy(self.eng.vocab_text(v as u32)).into_owned()),
         }
     }
 
-    fn raw(&self, v: &Value) -> Option<u32> {
+    fn raw(&self, v: &Value) -> Option<u64> {
         match (self.ty, v) {
-            (ColumnType::Number, Value::Number(n)) => u32::try_from(*n).ok(),
-            (ColumnType::Ref, Value::Ref(e)) => Some(enchudb_oplog::eid_local(*e)),
-            (ColumnType::Tag, Value::Text(t)) => self.eng.vocab_id(t),
+            (ColumnType::Number, Value::Number(n)) => u32::try_from(*n).ok().map(u64::from),
+            (ColumnType::Ref, Value::Ref(e)) => Some(enchudb_oplog::eid_local(*e) as u64),
+            (ColumnType::Tag, Value::Text(t)) => self.eng.vocab_id(t).map(u64::from),
             _ => None,
         }
+    }
+
+    /// engine の合計 (u128) を u64 に。 u32 の列の値の合計は u64 に収まる (収まらなければ飽和)。
+    fn sum64(s: u128) -> u64 {
+        u64::try_from(s).unwrap_or(u64::MAX)
     }
 
     /// 前回 poll から件数が変わった group と今の件数 (0 = その group の row が居なくなった)。
@@ -1900,17 +1906,17 @@ impl LiveCounts {
     /// `poll` の、 件数と合計の両方を返す版 ([`Query::subscribe_sums`] の購読。 件数か合計が動いた
     /// group、 件数 0 = group が消えた)。 `poll` と報告状態を共有する。 合計しない購読では合計は 0。
     pub fn poll_sums(&self) -> Vec<(Value, u64, u64)> {
-        self.inner.poll_sums(&self.eng).into_iter().map(|(v, a)| (self.value(v), a.count, a.sum)).collect()
+        self.inner.poll_sums(&self.eng).into_iter().map(|(v, a)| (self.value(v), a.count, Self::sum64(a.sum))).collect()
     }
 
     /// group `value` の今の合計 ([`Query::subscribe_sums`] の購読)。
     pub fn get_sum(&self, value: &Value) -> u64 {
-        self.raw(value).map_or(0, |v| self.inner.get_agg(&self.eng, v).sum)
+        self.raw(value).map_or(0, |v| Self::sum64(self.inner.get_agg(&self.eng, v).sum))
     }
 
     /// 今の全 group と件数・合計。
     pub fn all_sums(&self) -> Vec<(Value, u64, u64)> {
-        self.inner.all_sums(&self.eng).into_iter().map(|(v, a)| (self.value(v), a.count, a.sum)).collect()
+        self.inner.all_sums(&self.eng).into_iter().map(|(v, a)| (self.value(v), a.count, Self::sum64(a.sum))).collect()
     }
 
     /// group `value` の今の件数。
@@ -2609,10 +2615,10 @@ impl<'a> Query<'a> {
             };
             Ok(Some(match p {
                 Predicate::Eq(h, _) if h == u16::MAX => return Ok(None),
-                Predicate::Eq(h, v) => LivePred::Eq { himo_id: h, value: v },
+                Predicate::Eq(h, v) => LivePred::Eq { himo_id: h, value: v as u64 },
                 Predicate::EqText(h, text) => LivePred::EqText { himo_id: h, text },
-                Predicate::In(h, values) => LivePred::In { himo_id: h, values },
-                Predicate::Range { himo_name, lo, hi } => LivePred::Range { himo_id: hid_of(&himo_name)?, lo, hi },
+                Predicate::In(h, values) => LivePred::In { himo_id: h, values: values.into_iter().map(u64::from).collect() },
+                Predicate::Range { himo_name, lo, hi } => LivePred::Range { himo_id: hid_of(&himo_name)?, lo: lo as u64, hi: hi as u64 },
                 Predicate::Cmp { himo_name, op, against } => {
                     // 値は u32::MAX 未満 (sentinel 予約) なので上端は u32::MAX - 1。
                     // 空区間 (`> 最大値` / `< 0`) は lo > hi の Range = 常に偽 (find と同じ 0 件)。
@@ -2626,7 +2632,7 @@ impl<'a> Query<'a> {
                         },
                         RangeOp::Le => (0, against),
                     };
-                    LivePred::Range { himo_id: hid_of(&himo_name)?, lo, hi }
+                    LivePred::Range { himo_id: hid_of(&himo_name)?, lo: lo as u64, hi: hi as u64 }
                 }
                 Predicate::Via(path, inner) => match conv(eng, *inner, rep)? {
                     Some(pred) => LivePred::Via { path, pred: Box::new(pred) },
