@@ -2243,6 +2243,98 @@ impl<'a> JoinQuery<'a> {
         }
     }
 
+    /// 組を列 `col` の値ごとに数えた件数を購読する (live の `SELECT col, COUNT(*) FROM a JOIN b .. GROUP BY col`)。
+    /// 戻り値の API は [`LiveCounts`] と同じ (`poll` / `get` / `all` …)。
+    ///
+    /// ```ignore
+    /// // 公開済みの投稿の数を作者の街ごとに (ref の組は左の列で、 右の列も ref をたどって書ける)
+    /// let by_city = posts.where_eq("published", 1i64).join_ref("author", users.all()).subscribe_counts("author.city")?;
+    /// // 住人 × 開いた店の組の数を街ごとに (値の組は結ぶ列でだけ group にできる)
+    /// let per_city = users.all().join_eq("city", shops.where_eq("open", 1i64), "city").subscribe_counts("city")?;
+    /// ```
+    ///
+    /// - `join_ref` の組: `col` は左の table の列 (`"author.city"` のように ref をたどってもよい)。 組は左の row と
+    ///   1 対 1 なので、 左の row を数える集計の購読と同じコスト
+    /// - `join_eq` の組: `col` は結ぶ左の列 (`my_col`) だけ。 件数は鍵ごとの 「左の数 × 右の数」
+    pub fn subscribe_counts(self, col: &str) -> Result<LiveJoinCounts, SchemaError> {
+        self.subscribe_agg(col, None)
+    }
+
+    /// [`subscribe_counts`](Self::subscribe_counts) に加えて組ごとの列 `sum_col` の値の和も持つ (`SUM(sum_col)`)。
+    ///
+    /// - `join_ref`: `sum_col` は左の table の Number / BigInt 列
+    /// - `join_eq`: `sum_col` は左の table の列、 右の列は `"{右の table}.{列}"` (`"shops.rev"`)。 和は鍵ごとに
+    ///   「左の和 × 右の数」 / 「左の数 × 右の和」
+    pub fn subscribe_sums(self, col: &str, sum_col: &str) -> Result<LiveJoinCounts, SchemaError> {
+        self.subscribe_agg(col, Some(sum_col))
+    }
+
+    fn subscribe_agg(self, col: &str, sum_col: Option<&str>) -> Result<LiveJoinCounts, SchemaError> {
+        let bad = |m: String| SchemaError::BadValue(m);
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let eng = self.left.db.arc_engine();
+        let num = |t: &TableInner, c: &str| t.col(c).filter(|c| matches!(c.ty, ColumnType::Number | ColumnType::BigInt)).cloned();
+        match &self.on {
+            JoinOn::Ref(_) => {
+                let (path, cd) = self.left.resolve_col(col).ok_or_else(|| bad(format!("join subscribe_counts: unknown column {col}")))?;
+                if cd.ty == ColumnType::Leaf {
+                    return Err(bad("join subscribe_counts: cannot group by a Leaf column".into()));
+                }
+                let sum = match sum_col {
+                    Some(sc) => Some(num(&self.left.table, sc).ok_or_else(|| {
+                        bad(format!("join subscribe_sums: {sc} is not a Number / BigInt column of {}", self.left.table.name))
+                    })?),
+                    None => None,
+                };
+                let Some(JoinPlan::Ref { preds, .. }) = self.plan()? else {
+                    return Err(bad("join subscribe_counts: the join never matches (unknown value)".into()));
+                };
+                let inner = match &sum {
+                    Some(s) => eng.subscribe_sums(preds, path, cd.himo_id, s.himo_id),
+                    None => eng.subscribe_counts(preds, path, cd.himo_id),
+                }
+                .map_err(io)?;
+                let sum_big = sum.is_some_and(|s| s.ty == ColumnType::BigInt);
+                Ok(LiveJoinCounts(JoinCounts::Rows(LiveCounts { inner, eng, ty: cd.ty, sum_big, last: Default::default() })))
+            }
+            JoinOn::Eq(my, _) => {
+                if !col.eq_ignore_ascii_case(my) {
+                    return Err(bad(format!("join subscribe_counts: a join_eq groups only by its join column {my}")));
+                }
+                let right_name = self.right.table.name.clone();
+                // 和の列: "{右の table}.{列}" は右、 他は左
+                let side = match sum_col {
+                    None => None,
+                    Some(sc) => match sc.split_once('.').filter(|(t, _)| t.eq_ignore_ascii_case(&right_name)) {
+                        Some((_, c)) => Some((true, num(&self.right.table, c).ok_or_else(|| bad(format!("join subscribe_sums: {sc} is not a Number / BigInt column")))?)),
+                        None => Some((false, num(&self.left.table, sc).ok_or_else(|| bad(format!("join subscribe_sums: {sc} is not a Number / BigInt column")))?)),
+                    },
+                };
+                let ty = self.left.resolve_col(my).map(|(_, c)| c.ty).ok_or_else(|| bad(format!("join_eq: unknown column {my}")))?;
+                let Some(JoinPlan::Eq { left, path, left_key, right, right_key }) = self.plan()? else {
+                    return Err(bad("join subscribe_counts: the join never matches (unknown value)".into()));
+                };
+                let counts = |preds, path, key, sum: Option<&ColumnInner>| -> Result<LiveCounts, SchemaError> {
+                    let inner = match sum {
+                        Some(s) => eng.subscribe_sums(preds, path, key, s.himo_id),
+                        None => eng.subscribe_counts(preds, path, key),
+                    }
+                    .map_err(io)?;
+                    let sum_big = sum.is_some_and(|s| s.ty == ColumnType::BigInt);
+                    Ok(LiveCounts { inner, eng: eng.clone(), ty, sum_big, last: Default::default() })
+                };
+                let lsum = side.as_ref().filter(|s| !s.0).map(|s| &s.1);
+                let rsum = side.as_ref().filter(|s| s.0).map(|s| &s.1);
+                Ok(LiveJoinCounts(JoinCounts::Product {
+                    left: counts(left, path, left_key, lsum)?,
+                    right: counts(right, Vec::new(), right_key, rsum)?,
+                    sum_right: side.as_ref().map(|s| s.0),
+                    last: Default::default(),
+                }))
+            }
+        }
+    }
+
     /// 今の組 (昇順)。
     pub fn find(self) -> Result<Vec<(EntityId, EntityId)>, SchemaError> {
         let eng = self.left.db.arc_engine();
@@ -2423,6 +2515,113 @@ fn take(m: &mut std::collections::BTreeMap<u64, std::collections::BTreeSet<Entit
         if s.is_empty() {
             m.remove(&k);
         }
+    }
+}
+
+/// [`JoinQuery::subscribe_counts`] / [`JoinQuery::subscribe_sums`] の戻り値。 組を group ごとに数えた件数 (と和)
+/// を購読する。 API は [`LiveCounts`] と同じ。
+pub struct LiveJoinCounts(JoinCounts);
+
+enum JoinCounts {
+    /// ref の組 = 左の row の集計。
+    Rows(LiveCounts),
+    /// 値の組 = 鍵ごとの左右の集計の積。
+    Product {
+        left: LiveCounts,
+        right: LiveCounts,
+        /// 和の列が右 (true) / 左 (false) / 和なし (None)。
+        sum_right: Option<bool>,
+        /// 鍵ごとに最後に渡した (件数, 和)。
+        last: std::sync::Mutex<std::collections::BTreeMap<u64, (u64, i128)>>,
+    },
+}
+
+impl LiveJoinCounts {
+    /// 鍵 `k` の今の組の (件数, 和)。
+    fn product(left: &LiveCounts, right: &LiveCounts, sum_right: Option<bool>, k: u64) -> (u64, i128) {
+        let (l, r) = (left.inner.get_agg(&left.eng, k), right.inner.get_agg(&right.eng, k));
+        let n = l.count * r.count;
+        let sum = match sum_right {
+            None => 0,
+            Some(false) => left.sum_of(l) * r.count as i128,
+            Some(true) => l.count as i128 * right.sum_of(r),
+        };
+        (n, sum)
+    }
+
+    /// 前回 poll から件数か和が変わった group と今の (件数, 和) (件数 0 = group が消えた)。 積分 = 値で上書き。
+    pub fn poll_sums(&self) -> Vec<(Value, u64, i128)> {
+        match &self.0 {
+            JoinCounts::Rows(c) => c.poll_sums(),
+            JoinCounts::Product { left, right, sum_right, last } => {
+                let mut last = last.lock().unwrap_or_else(|p| p.into_inner());
+                let mut keys: Vec<u64> = left.inner.poll_sums(&left.eng).into_iter().map(|x| x.0).collect();
+                keys.extend(right.inner.poll_sums(&right.eng).into_iter().map(|x| x.0));
+                keys.sort_unstable();
+                keys.dedup();
+                let mut out = Vec::new();
+                for k in keys {
+                    let now = Self::product(left, right, *sum_right, k);
+                    let changed = if now.0 == 0 { last.remove(&k).is_some() } else { last.insert(k, now) != Some(now) };
+                    if changed {
+                        out.push((left.value(k), now.0, now.1));
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// `poll_sums` の件数だけの版 (報告状態を共有する)。
+    pub fn poll(&self) -> Vec<(Value, u64)> {
+        self.poll_sums().into_iter().map(|(v, n, _)| (v, n)).collect()
+    }
+
+    /// 今の全 group と (件数, 和)。
+    pub fn all_sums(&self) -> Vec<(Value, u64, i128)> {
+        match &self.0 {
+            JoinCounts::Rows(c) => c.all_sums(),
+            JoinCounts::Product { left, right, sum_right, .. } => left
+                .inner
+                .all_sums(&left.eng)
+                .into_iter()
+                .filter_map(|(k, _)| {
+                    let (n, sum) = Self::product(left, right, *sum_right, k);
+                    (n > 0).then(|| (left.value(k), n, sum))
+                })
+                .collect(),
+        }
+    }
+
+    /// 今の全 group と件数。
+    pub fn all(&self) -> Vec<(Value, u64)> {
+        self.all_sums().into_iter().map(|(v, n, _)| (v, n)).collect()
+    }
+
+    /// group `value` の今の件数。
+    pub fn get(&self, value: &Value) -> u64 {
+        match &self.0 {
+            JoinCounts::Rows(c) => c.get(value),
+            JoinCounts::Product { left, right, sum_right, .. } => {
+                left.raw(value).map_or(0, |k| Self::product(left, right, *sum_right, k).0)
+            }
+        }
+    }
+
+    /// group `value` の今の和。
+    pub fn get_sum(&self, value: &Value) -> i128 {
+        match &self.0 {
+            JoinCounts::Rows(c) => c.get_sum(value),
+            JoinCounts::Product { left, right, sum_right, .. } => {
+                left.raw(value).map_or(0, |k| Self::product(left, right, *sum_right, k).1)
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for LiveJoinCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveJoinCounts").finish_non_exhaustive()
     }
 }
 
