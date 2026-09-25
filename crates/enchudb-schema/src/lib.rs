@@ -2396,6 +2396,17 @@ impl<'a> Query<'a> {
     /// [`where_exists`](Self::where_exists)。 find / count / subscribe のどれでも使える。 購読では、 この row の
     /// 列の書き換えも、 `sub` の row の出入り・中身の変化も届く (値の row が 0 件 ↔ 1 件以上をまたぐと、 その値を
     /// 持つ row がまとめて出入りする)。
+    ///
+    /// 1 つの値を持つ row が多い (1 街に 1 万人) なら、 row 単位の購読は値 1 つの出入りで 1 万件の差分になる。
+    /// 値 (街) 単位の差分でよければ、 `sub` 側を値ごとに数える購読で足りる (書き込み 1 回 O(1)、 row は引く時に):
+    ///
+    /// ```ignore
+    /// let open = shops.where_eq("open", 1i64).subscribe_counts("city")?;
+    /// for (city, n) in open.poll() {
+    ///     // n == 0: その街から開いた店が消えた。 前回まで 0 だった街の n >= 1: 開いた店ができた
+    ///     let people = users.where_eq("city", city).find()?;   // 住人は引いた時点の中身
+    /// }
+    /// ```
     pub fn where_exists_eq(mut self, my_col: &str, sub: Query<'a>, their_col: &str) -> Self {
         match self.exists_eq_pred(my_col, sub, their_col) {
             Some((path, p)) => self.push_at(path, p),

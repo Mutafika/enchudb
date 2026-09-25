@@ -211,6 +211,24 @@ fn run(path: &str) {
         }
     };
     check(&mut subs, &users, &shops, 0);
+    // 街単位 (`where_exists_eq` の doc の書き方): 開いた店の街ごとの件数を購読し、 0 ↔ 1 以上をまたいだ街を積む。
+    // 積んだ街の住人を引いた集合が 「city に開いた店」 と一致する
+    let hub = s.where_eq("open", 1i64).subscribe_counts("city").unwrap();
+    let mut hubs: BTreeSet<String> = BTreeSet::new();
+    let check_hub = |hubs: &mut BTreeSet<String>, users: &[u64], shops: &[u64], step: usize| {
+        for (city, n) in hub.poll() {
+            let Value::Text(city) = city else { panic!("city is a Tag column") };
+            if n == 0 {
+                assert!(hubs.remove(&city), "step {step}: 開いた店の無かった街 {city} が消えた");
+            } else {
+                hubs.insert(city);
+            }
+        }
+        let got: BTreeSet<u64> = hubs.iter().flat_map(|c| u.where_eq("city", c.as_str()).find().unwrap()).collect();
+        let want: BTreeSet<u64> = users.iter().copied().filter(|&e| any_shop(shops, "city", uv(e, "city"), &open)).collect();
+        assert_eq!(got, want, "step {step}: 街単位の購読から引いた住人");
+    };
+    check_hub(&mut hubs, &users, &shops, 0);
     let eng = db.engine();
     let mut next_id = 5000i64;
     for step in 1..1500 {
@@ -263,6 +281,7 @@ fn run(path: &str) {
         }
         if step % 3 == 0 {
             check(&mut subs, &users, &shops, step);
+            check_hub(&mut hubs, &users, &shops, step);
         }
     }
     check(&mut subs, &users, &shops, 1_000_001);
