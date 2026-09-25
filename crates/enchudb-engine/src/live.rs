@@ -1949,11 +1949,120 @@ struct RootKey {
 /// 上位 k 件の順序 ((並びの値, eid) の昇順)。
 enum OrderIndex {
     /// 根ごとに値を持つ。
-    Flat(std::collections::BTreeSet<(u64, u32)>),
+    Flat(FlatSet),
     /// 並びの列が ref の先の時: 1 段目の先 (会社) を値の順に並べ、 会社ごとに根を eid の昇順で持つ。
     /// 全体の順序は (会社の値, 根の eid) = `Flat` と同じ。 会社の値が変わっても会社 1 つを付け替える
     /// だけで、 配下の根を 1 件ずつ動かさない (`RootKey::move_block`)。
     Blocks(Blocks),
+}
+
+/// `(並びの値, eid)` の昇順の集合。 値が基準 (`base`) から 2^32 未満の間は `(値 - base) << 32 | eid` の
+/// u64 1 つ (8 B) で持ち、 外れる値が来たら組 (16 B) に作り直す (u32 の列の索引を u64 化前の大きさに保つ)。
+/// 基準は最初の値で決める: 昇順の u32 の値は 0、 降順 (`u64::MAX - v`) の u32 の値は `u64::MAX - u32::MAX`。
+enum FlatSet {
+    Narrow { base: u64, set: std::collections::BTreeSet<u64> },
+    Wide(std::collections::BTreeSet<(u64, u32)>),
+}
+
+const NARROW_HI: u64 = u64::MAX - u32::MAX as u64;
+
+impl FlatSet {
+    fn new() -> Self {
+        FlatSet::Narrow { base: 0, set: std::collections::BTreeSet::new() }
+    }
+
+    /// 詰めた形 (`base` の窓に入らなければ None)。
+    #[inline]
+    fn pack(base: u64, x: (u64, u32)) -> Option<u64> {
+        let d = x.0.checked_sub(base)?;
+        (d <= u32::MAX as u64).then_some((d << 32) | x.1 as u64)
+    }
+
+    #[inline]
+    fn unpack(base: u64, k: u64) -> (u64, u32) {
+        (base + (k >> 32), k as u32)
+    }
+
+    fn insert(&mut self, x: (u64, u32)) {
+        if let FlatSet::Narrow { base, set } = self {
+            if set.is_empty() {
+                *base = if x.0 >= NARROW_HI { NARROW_HI } else { 0 };
+            }
+            if let Some(k) = Self::pack(*base, x) {
+                set.insert(k);
+                return;
+            }
+            let b = *base;
+            *self = FlatSet::Wide(set.iter().map(|&k| Self::unpack(b, k)).collect());
+        }
+        let FlatSet::Wide(w) = self else { unreachable!("widened above") };
+        w.insert(x);
+    }
+
+    fn remove(&mut self, x: (u64, u32)) -> bool {
+        match self {
+            FlatSet::Narrow { base, set } => Self::pack(*base, x).is_some_and(|k| set.remove(&k)),
+            FlatSet::Wide(w) => w.remove(&x),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            FlatSet::Narrow { set, .. } => set.len(),
+            FlatSet::Wide(w) => w.len(),
+        }
+    }
+
+    fn first(&self) -> Option<(u64, u32)> {
+        match self {
+            FlatSet::Narrow { base, set } => set.first().map(|&k| Self::unpack(*base, k)),
+            FlatSet::Wide(w) => w.first().copied(),
+        }
+    }
+
+    fn last(&self) -> Option<(u64, u32)> {
+        match self {
+            FlatSet::Narrow { base, set } => set.last().map(|&k| Self::unpack(*base, k)),
+            FlatSet::Wide(w) => w.last().copied(),
+        }
+    }
+
+    /// `x` より後の最初の要素 (`x` は集合に無くてよい)。
+    fn succ(&self, x: (u64, u32)) -> Option<(u64, u32)> {
+        match self {
+            FlatSet::Narrow { base, set } => {
+                if x.0 < *base {
+                    return self.first();
+                }
+                let k = Self::pack(*base, x)?; // 窓より上 = 後ろに要素は無い
+                set.range((std::ops::Bound::Excluded(k), std::ops::Bound::Unbounded)).next().map(|&k| Self::unpack(*base, k))
+            }
+            FlatSet::Wide(w) => w.range((std::ops::Bound::Excluded(x), std::ops::Bound::Unbounded)).next().copied(),
+        }
+    }
+
+    /// `x` より前の最後の要素 (`x` は集合に無くてよい)。
+    fn pred(&self, x: (u64, u32)) -> Option<(u64, u32)> {
+        match self {
+            FlatSet::Narrow { base, set } => {
+                if x.0 < *base {
+                    return None;
+                }
+                match Self::pack(*base, x) {
+                    Some(k) => set.range(..k).next_back().map(|&k| Self::unpack(*base, k)),
+                    None => self.last(), // 窓より上 = 全部が前
+                }
+            }
+            FlatSet::Wide(w) => w.range(..x).next_back().copied(),
+        }
+    }
+
+    fn first_k(&self, k: usize) -> Vec<(u64, u32)> {
+        match self {
+            FlatSet::Narrow { base, set } => set.iter().take(k).map(|&x| Self::unpack(*base, x)).collect(),
+            FlatSet::Wide(w) => w.iter().take(k).copied().collect(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -2004,9 +2113,7 @@ impl OrderIndex {
     /// `x` を足す (`t` = 1 段目の先、 `Blocks` の時だけ使う)。
     fn insert(&mut self, x: (u64, u32), t: u32) {
         match self {
-            OrderIndex::Flat(s) => {
-                s.insert(x);
-            }
+            OrderIndex::Flat(s) => s.insert(x),
             OrderIndex::Blocks(b) => {
                 b.by_val.insert((x.0, t));
                 let r = b.rows.entry(t).or_default();
@@ -2021,7 +2128,7 @@ impl OrderIndex {
     /// `x` を外す。 あったら true。
     fn remove(&mut self, x: (u64, u32), t: u32) -> bool {
         match self {
-            OrderIndex::Flat(s) => s.remove(&x),
+            OrderIndex::Flat(s) => s.remove(x),
             OrderIndex::Blocks(b) => {
                 let Some(r) = b.rows.get_mut(&t) else { return false };
                 let Ok(p) = r.binary_search(&x.1) else { return false };
@@ -2045,14 +2152,14 @@ impl OrderIndex {
 
     fn first(&self) -> Option<(u64, u32)> {
         match self {
-            OrderIndex::Flat(s) => s.first().copied(),
+            OrderIndex::Flat(s) => s.first(),
             OrderIndex::Blocks(b) => b.first(),
         }
     }
 
     fn last(&self) -> Option<(u64, u32)> {
         match self {
-            OrderIndex::Flat(s) => s.last().copied(),
+            OrderIndex::Flat(s) => s.last(),
             OrderIndex::Blocks(b) => b.last(),
         }
     }
@@ -2060,7 +2167,7 @@ impl OrderIndex {
     /// `x` より後の最初の要素。
     fn succ(&self, x: (u64, u32)) -> Option<(u64, u32)> {
         match self {
-            OrderIndex::Flat(s) => s.range((std::ops::Bound::Excluded(x), std::ops::Bound::Unbounded)).next().copied(),
+            OrderIndex::Flat(s) => s.succ(x),
             OrderIndex::Blocks(b) => b.succ(x),
         }
     }
@@ -2068,7 +2175,7 @@ impl OrderIndex {
     /// `x` より前の最後の要素。
     fn pred(&self, x: (u64, u32)) -> Option<(u64, u32)> {
         match self {
-            OrderIndex::Flat(s) => s.range(..x).next_back().copied(),
+            OrderIndex::Flat(s) => s.pred(x),
             OrderIndex::Blocks(b) => b.pred(x),
         }
     }
@@ -2076,7 +2183,7 @@ impl OrderIndex {
     /// 先頭 `k` 個。
     fn first_k(&self, k: usize) -> Vec<(u64, u32)> {
         match self {
-            OrderIndex::Flat(s) => s.iter().take(k).copied().collect(),
+            OrderIndex::Flat(s) => s.first_k(k),
             OrderIndex::Blocks(b) => {
                 let mut out = Vec::with_capacity(k.min(b.len));
                 let mut cur = b.first();
@@ -2098,7 +2205,7 @@ impl RootKey {
             count: 0,
             ivs: None,
             groups: std::collections::BTreeMap::new(),
-            order: OrderIndex::Flat(std::collections::BTreeSet::new()),
+            order: OrderIndex::Flat(FlatSet::new()),
         }
     }
 
@@ -4735,6 +4842,53 @@ mod tests {
     /// 無い = hub の記録は 「偽」。 その値を後から購読すると、 記録した 「偽」 は今は真 — 記録を
     /// 直さないと、 hub が別の (購読の無い) 値に移った時に 「偽 → 偽」 で展開されず、 配下が
     /// 後から加わった購読に残り続ける。
+    /// 上位 k 件の順序 (`FlatSet`) は BTreeSet<(値, eid)> と同じ答えを返す: u32 の値は昇順 / 降順とも 8 B で
+    /// 持ち、 窓 (基準から 2^32) の外の値が来たら組に作り直す。 問いの `x` は窓の下 / 中 / 上のどれでも。
+    #[test]
+    fn flat_set_matches_btreeset() {
+        let mut seed = 7u64;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed >> 11
+        };
+        for case in 0..4 {
+            let mut f = FlatSet::new();
+            let mut o: std::collections::BTreeSet<(u64, u32)> = std::collections::BTreeSet::new();
+            // 0: 昇順の u32 の値、 1: 降順の u32 の値、 2: 途中で大きな値が来る、 3: 降順に大きな値
+            let val = |r: u64, i: usize| -> u64 {
+                let v = r % 5000;
+                match case {
+                    0 => v,
+                    1 => u64::MAX - v,
+                    2 => if i == 300 { 1 << 40 } else { v },
+                    _ => if i == 300 { u64::MAX - (1 << 40) } else { u64::MAX - v },
+                }
+            };
+            for i in 0..600 {
+                // 窓の端: 降順の値 0 (= u64::MAX) は基準 + u32::MAX ちょうど
+                let x = if i == 0 { (val(0, 0), 1) } else { (val(rnd(), i), (rnd() % 64) as u32) };
+                if i != 300 && rnd() % 3 == 0 && !o.is_empty() {
+                    let y = *o.iter().nth((rnd() as usize) % o.len()).unwrap();
+                    assert_eq!(f.remove(y), o.remove(&y));
+                } else {
+                    f.insert(x);
+                    o.insert(x);
+                }
+                assert!(!f.remove((x.0 ^ (1 << 63), x.1)) || o.remove(&(x.0 ^ (1 << 63), x.1)), "無い要素を外した");
+                assert_eq!(f.len(), o.len());
+                assert_eq!(f.first(), o.first().copied());
+                assert_eq!(f.last(), o.last().copied());
+                for q in [x, (0, 0), (u64::MAX, u32::MAX), (5000, 0), (u64::MAX - 5000, 0), (1 << 40, 3), (NARROW_HI - 1, 9)] {
+                    assert_eq!(f.succ(q), o.range((std::ops::Bound::Excluded(q), std::ops::Bound::Unbounded)).next().copied(), "succ {q:?}");
+                    assert_eq!(f.pred(q), o.range(..q).next_back().copied(), "pred {q:?}");
+                }
+                assert_eq!(f.first_k(5), o.iter().take(5).copied().collect::<Vec<_>>());
+            }
+            let narrow = matches!(f, FlatSet::Narrow { .. });
+            assert_eq!(narrow, case < 2, "case {case}: u32 の値だけなら 8 B のまま、 窓の外の値で組に");
+        }
+    }
+
     #[test]
     fn late_range_member_forgets_stale_64_bit_values_in_the_last_band() {
         // ref の先の範囲の穴: 値が同じ帯の中で動いても展開しない (根の記録は古い値のまま)。 後から張った範囲が
