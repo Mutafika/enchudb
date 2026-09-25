@@ -2468,6 +2468,8 @@ enum JoinLive {
     /// 左の鍵付きの購読 (鍵 = ref 列)、 右の table の全 row の購読 (作り直しを見るだけ)、 ref 列。
     Ref { left: enchudb_engine::LiveKeyed, right: enchudb_engine::LiveQuery, via: u16 },
     Eq { left: enchudb_engine::LiveKeyed, right: enchudb_engine::LiveKeyed, state: std::sync::Mutex<Buckets> },
+    /// LAG: group の鍵付きの購読 (None = group なし)、 並びの鍵付きの購読。
+    Lag { part: Option<enchudb_engine::LiveKeyed>, order: enchudb_engine::LiveKeyed, state: std::sync::Mutex<LagState> },
     /// 左の値の鍵付きの購読、 右の始点 / 終点の鍵付きの購読。
     Range { left: enchudb_engine::LiveKeyed, lo: enchudb_engine::LiveKeyed, hi: enchudb_engine::LiveKeyed, state: std::sync::Mutex<RangeState> },
 }
@@ -2697,6 +2699,11 @@ impl LiveJoin {
                         d.added.extend(as_.iter().filter(|&&a| !keep(a, b)).map(|&a| (a, b)));
                     }
                 }
+            }
+            JoinLive::Lag { part, order, state } => {
+                let dp = part.as_ref().map(|q| q.poll(&self.eng));
+                let dord = order.poll(&self.eng);
+                d = state.lock().unwrap_or_else(|p| p.into_inner()).apply(dp.as_ref(), &dord);
             }
             JoinLive::Range { left, lo, hi, state } => {
                 let (dl, dlo, dhi) = (left.poll(&self.eng), lo.poll(&self.eng), hi.poll(&self.eng));
@@ -3318,6 +3325,223 @@ fn kept_ids(dl: &Keyed<u32>, dc: &Keyed<EntityId>) -> std::collections::BTreeSet
         }
     }
     out
+}
+
+// ─────────────────────────── window: 1 つ前の row (LAG) ───────────────────────────
+
+/// [`Query::lag`] / [`Query::lag_all`] の戻り値。 同じ group の中で並びが 1 つ前の row との組を引く / 購読する。
+pub struct LagQuery<'a> {
+    rows: Query<'a>,
+    /// group の列 (None = 結果全体で 1 つの group)
+    part: Option<String>,
+    order: String,
+}
+
+/// LAG の計画: 条件、 group の鍵 (ref の道 + 列)、 並びの鍵 (ref の道 + 列)。
+type LagPlan = (Vec<enchudb_engine::LivePred>, Option<(Vec<u16>, u16)>, (Vec<u16>, u16));
+
+impl<'a> LagQuery<'a> {
+    fn plan(self) -> Result<Option<LagPlan>, SchemaError> {
+        let bad = |m: String| Err(SchemaError::BadValue(m));
+        if self.rows.limit.is_some() || self.rows.order.is_some() {
+            return bad("lag: limit / order_by are not supported (the order is the lag's own)".into());
+        }
+        let part = match &self.part {
+            None => None,
+            Some(p) => match self.rows.resolve_col(p) {
+                Some((path, c)) if c.ty != ColumnType::Leaf => Some((path, c.himo_id)),
+                _ => return bad(format!("lag: {p} is not a column to group by (unknown or Leaf)")),
+            },
+        };
+        let order = match self.rows.resolve_col(&self.order) {
+            Some((path, c)) if matches!(c.ty, ColumnType::Number | ColumnType::BigInt) => (path, c.himo_id),
+            _ => return bad(format!("lag: {} is not a Number / BigInt column to order by", self.order)),
+        };
+        let Some(preds) = self.rows.live_preds()? else { return Ok(None) };
+        Ok(Some((preds, part, order)))
+    }
+
+    /// 今の組 `(row, 1 つ前の row)` (row の昇順)。 group の先頭の row は組にならない。
+    pub fn find(self) -> Result<Vec<(EntityId, EntityId)>, SchemaError> {
+        let eng = self.rows.db.arc_engine();
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let Some((preds, part, (opath, oh))) = self.plan()? else { return Ok(Vec::new()) };
+        let peer = eng.peer_id();
+        let key = |e: EntityId, path: &[u16], h: u16| -> Option<u64> {
+            let mut cur = e;
+            for &p in path {
+                cur = enchudb_oplog::make_eid(peer, eng.get_by_id(cur, p)? as u32);
+            }
+            eng.get_by_id(cur, h)
+        };
+        let mut rows: Vec<(u64, u64, EntityId)> = Vec::new();
+        for e in eng.find_by(preds).map_err(io)? {
+            let p = match &part {
+                None => Some(0),
+                Some((path, h)) => key(e, path, *h),
+            };
+            if let (Some(p), Some(o)) = (p, key(e, &opath, oh)) {
+                rows.push((p, o, e));
+            }
+        }
+        rows.sort_unstable();
+        let mut out: Vec<(EntityId, EntityId)> = rows.windows(2).filter(|w| w[0].0 == w[1].0).map(|w| (w[1].2, w[0].2)).collect();
+        out.sort_unstable();
+        Ok(out)
+    }
+
+    /// 今の組の数。
+    pub fn count(self) -> Result<usize, SchemaError> {
+        Ok(self.find()?.len())
+    }
+
+    /// 組 `(row, 1 つ前の row)` を購読する (`LiveJoin`、 poll は `PairDelta`)。 初回 poll は登録時点の全部の組が `added`。
+    /// row の出入り・group / 並びの列の書き換え (ref の先の値も) で届く。 書き込み 1 回で動く組は高々 3 つずつ
+    /// (抜けた所の前後がつながり、 入った所の前後が切れる)。
+    pub fn subscribe(self) -> Result<LiveJoin, SchemaError> {
+        let eng = self.rows.db.arc_engine();
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let inner = match self.plan()? {
+            None => JoinLive::Empty,
+            Some((preds, part, (opath, oh))) => JoinLive::Lag {
+                part: match part {
+                    Some((path, h)) => Some(eng.subscribe_keyed(preds.clone(), path, h).map_err(io)?),
+                    None => None,
+                },
+                order: eng.subscribe_keyed(preds, opath, oh).map_err(io)?,
+                state: Default::default(),
+            },
+        };
+        Ok(LiveJoin { inner, eng })
+    }
+}
+
+/// LAG の購読の状態。
+#[derive(Default)]
+struct LagState {
+    /// row → (group, 並びの値)。 group の無い LAG は group を 0 で持つ
+    vals: std::collections::BTreeMap<EntityId, (Option<u64>, Option<u64>)>,
+    /// (group, 並びの値, row)
+    seq: std::collections::BTreeSet<(u64, u64, EntityId)>,
+    /// 最後に渡した 1 つ前の row
+    prev_of: std::collections::BTreeMap<EntityId, EntityId>,
+}
+
+/// 並びの中の位置 (group, 並びの値, row)。
+type LagPos = (u64, u64, EntityId);
+
+impl LagState {
+    fn next(&self, at: LagPos) -> Option<LagPos> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.seq.range((Excluded(at), Unbounded)).next().filter(|n| n.0 == at.0).copied()
+    }
+
+    fn prev(&self, at: LagPos) -> Option<EntityId> {
+        self.seq.range(..at).next_back().filter(|n| n.0 == at.0).map(|n| n.2)
+    }
+
+    /// 差分を当てて組の差分を返す。 1 つ前が変わりうる row = 動いた row と、 動く前 / 後の位置の直後の row。
+    /// それぞれの今の 1 つ前を渡し済みのものと比べる (作り直した row が組のどちらかに居れば、 同じでも出て入り直す)。
+    /// 動いた row の値は鍵付きの購読の差分 (eid の昇順) を二分探索で引き、 値の表は row ごとに 1 回だけ引く。
+    fn apply(&mut self, dp: Option<&enchudb_engine::KeyedDelta>, dord: &enchudb_engine::KeyedDelta) -> PairDelta {
+        use std::collections::btree_map::Entry;
+        let deltas: Vec<&enchudb_engine::KeyedDelta> = dp.into_iter().chain(std::iter::once(dord)).collect();
+        let mut moved: Vec<EntityId> = deltas.iter().flat_map(|k| k.removed.iter().chain(k.added.iter()).map(|x| x.0)).collect();
+        moved.sort_unstable();
+        moved.dedup();
+        let mut reborn: Vec<EntityId> = deltas.iter().flat_map(|k| k.reentered.iter().copied()).collect();
+        reborn.sort_unstable();
+        let is_reborn = |e: EntityId| reborn.binary_search(&e).is_ok();
+        // 列の新しい値: added に居ればその値、 removed だけに居れば無し、 どちらにも居なければ元のまま
+        let step = |k: &enchudb_engine::KeyedDelta, e: EntityId, old: Option<u64>| -> Option<u64> {
+            match k.added.binary_search_by_key(&e, |x| x.0) {
+                Ok(i) => Some(k.added[i].1),
+                Err(_) if k.removed.binary_search_by_key(&e, |x| x.0).is_ok() => None,
+                Err(_) => old,
+            }
+        };
+        let pos = |e: EntityId, v: (Option<u64>, Option<u64>)| Some((v.0?, v.1?, e));
+        // (row, 動く前の位置, 動いた後の位置)
+        let mut ups: Vec<(EntityId, Option<LagPos>, Option<LagPos>)> = Vec::with_capacity(moved.len());
+        for &e in &moved {
+            let next = |old: (Option<u64>, Option<u64>)| {
+                let p = match dp {
+                    Some(k) => step(k, e, old.0),
+                    None => Some(0),
+                };
+                (p, step(dord, e, old.1))
+            };
+            let (old, new) = match self.vals.entry(e) {
+                Entry::Occupied(mut o) => {
+                    let old = *o.get();
+                    let new = next(old);
+                    if new == (None, None) {
+                        o.remove();
+                    } else {
+                        *o.get_mut() = new;
+                    }
+                    (old, new)
+                }
+                Entry::Vacant(v) => {
+                    let new = next((None, None));
+                    if new != (None, None) {
+                        v.insert(new);
+                    }
+                    ((None, None), new)
+                }
+            };
+            ups.push((e, pos(e, old), pos(e, new)));
+        }
+        // 1 つ前が変わりうる row と、 その今の位置 (動いた row は動いた後の位置で上書きする)
+        let mut touched: Vec<(EntityId, Option<LagPos>)> = Vec::new();
+        for &(_, old, _) in &ups {
+            if let Some(n) = old.and_then(|at| self.next(at)) {
+                touched.push((n.2, Some(n)));
+            }
+        }
+        for &(_, old, _) in &ups {
+            if let Some(at) = old {
+                self.seq.remove(&at);
+            }
+        }
+        for &(_, _, new) in &ups {
+            if let Some(at) = new {
+                self.seq.insert(at);
+            }
+        }
+        for &(_, _, new) in &ups {
+            if let Some(n) = new.and_then(|at| self.next(at)) {
+                touched.push((n.2, Some(n)));
+            }
+        }
+        touched.retain(|t| moved.binary_search(&t.0).is_err());
+        touched.extend(ups.iter().map(|&(e, _, new)| (e, new)));
+        touched.sort_unstable_by_key(|t| t.0);
+        touched.dedup_by_key(|t| t.0);
+        let mut d = PairDelta::default();
+        for (x, at) in touched {
+            let now = at.and_then(|at| self.prev(at));
+            let again = is_reborn(x) || now.is_some_and(is_reborn);
+            match (self.prev_of.entry(x), now) {
+                (Entry::Occupied(o), _) if Some(*o.get()) == now && !again => {}
+                (Entry::Vacant(_), None) => {}
+                (Entry::Occupied(mut o), Some(n)) => {
+                    d.removed.push((x, *o.get()));
+                    d.added.push((x, n));
+                    o.insert(n);
+                }
+                (Entry::Occupied(o), None) => {
+                    d.removed.push((x, *o.get()));
+                    o.remove();
+                }
+                (Entry::Vacant(v), Some(n)) => {
+                    d.added.push((x, n));
+                    v.insert(n);
+                }
+            }
+        }
+        d
+    }
 }
 
 // ─────────────────────────── 再帰 (階層の配下 / 上) ───────────────────────────
@@ -4602,6 +4826,27 @@ impl<'a> Query<'a> {
     /// - `subscribe_counts` / 3 つ以上の table の組 (`then_*`) はまだ (`BadValue`)
     pub fn join_range(self, my_col: &str, other: Query<'a>, lo_col: &str, hi_col: &str) -> JoinQuery<'a> {
         JoinQuery { left: self, right: other, on: JoinOn::Range(my_col.to_string(), lo_col.to_string(), hi_col.to_string()) }
+    }
+
+    /// この query の row を列 `part_col` の値で group に分け、 group の中で列 `order_col` の順に並べた時の、 各 row と
+    /// **1 つ前の row** の組 (window 関数 `LAG(..) OVER (PARTITION BY part_col ORDER BY order_col)`)。 同じ値は eid の昇順。
+    ///
+    /// ```ignore
+    /// // user ごとに、 各イベントと 1 つ前のイベント (間隔・変化を見る)
+    /// let live = events.all().lag("user", "at").subscribe()?;   // PairDelta: (イベント, 1 つ前のイベント)
+    /// ```
+    ///
+    /// - group の先頭の row は組にならない。 1 つ後 (`LEAD`) は組を裏返す
+    /// - `part_col` は Tag / Number / BigInt / Ref (ref の先でもよい)、 `order_col` は Number / BigInt (ref の先でもよい)。
+    ///   値の無い row は並ばない
+    /// - 書き込み 1 回で動く組は高々 3 つずつ (抜けた所の前後がつながり、 入った所の前後が切れる)
+    pub fn lag(self, part_col: &str, order_col: &str) -> LagQuery<'a> {
+        LagQuery { rows: self, part: Some(part_col.to_string()), order: order_col.to_string() }
+    }
+
+    /// [`Query::lag`] の group なし版 (結果全体を `order_col` の順に並べる)。
+    pub fn lag_all(self, order_col: &str) -> LagQuery<'a> {
+        LagQuery { rows: self, part: None, order: order_col.to_string() }
     }
 
     /// `sub` (別の table への query) の row のうち、 ref 列 `via_col` でこの row を指しているものが **`n` 個以上**
