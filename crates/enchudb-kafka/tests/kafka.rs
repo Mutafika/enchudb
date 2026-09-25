@@ -133,3 +133,92 @@ fn kafka_in_live_out_and_resume() {
         let _ = std::fs::remove_file(format!("{path}{s}"));
     }
 }
+
+/// BigInt 列 (ms の時刻 / 負の主キー / 10 進の文字列) を Kafka から取り込み、 live の差分と合計 (u64 を
+/// 超える合計は 10 進の文字列) を Kafka へ。 開き直しても値と読んだ位置が残る。
+#[test]
+fn kafka_bigint_round_trip() {
+    let Some(brokers) = brokers() else { return };
+    let tag = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+    let (tin, tout) = (format!("enchu-big-in-{tag}"), format!("enchu-big-out-{tag}"));
+    ensure_topic(brokers.clone(), &tin, 3, 1).unwrap();
+    ensure_topic(brokers.clone(), &tout, 3, 1).unwrap();
+    let big = 9_223_372_036_854_775_000i64;
+    let t0 = 1_790_000_000_000i64;
+    let mut rows: Vec<(String, Json)> = (0..100i64).map(|i| (format!("{}", -i - 1), json!({"id": -i - 1, "at": t0 + i, "kind": "ms"}))).collect();
+    rows.push(("min".into(), json!({"id": "9223372036854775806", "at": i64::MIN, "kind": "edge"})));
+    rows.extend((0..3i64).map(|i| (format!("z{i}"), json!({"id": 1000 + i, "at": big, "kind": "z"}))));
+    // 同じ key の 2 通目 (後勝ち)
+    rows.push(("-1".into(), json!({"id": -1, "at": -7})));
+    let mut sink = KafkaSink::connect(brokers.clone(), &tin).unwrap();
+    let msgs: Vec<OutMessage> = rows
+        .iter()
+        .map(|(k, row)| OutMessage { key: k.clone().into_bytes(), payload: json!({"table": "events", "row": row}).to_string().into_bytes() })
+        .collect();
+    sink.send(&msgs).unwrap();
+
+    let path = format!("/tmp/enchu-kafka-big-{tag}.db");
+    let mut db = Database::create_growable_with_capacity(&path, 4096).unwrap();
+    db.table("events").bigint("id").bigint("at").tag("kind").primary_key("id").build().unwrap();
+    prepare(&mut db).unwrap();
+    let events = db.get_table("events").unwrap();
+    let mut ex = LiveExport::new(&db);
+    ex.add("ms", "events", events.where_eq("kind", "ms").subscribe().unwrap()).unwrap();
+    ex.add_counts("by_kind", events.all().subscribe_sums("kind", "at").unwrap());
+    let mut out = KafkaSink::connect(brokers.clone(), &tout).unwrap();
+    {
+        let ing = Ingest::new(&db, JsonRows).unwrap();
+        let mut src = KafkaSource::connect(brokers.clone(), &tin).unwrap();
+        ing.resume(&mut src).unwrap();
+        assert_eq!(ingest_all(&ing, &mut src, rows.len()), (rows.len(), 0));
+        ex.pump(&mut out).unwrap();
+    }
+    let at = |db: &Database, id: i64| {
+        let t = db.get_table("events").unwrap();
+        t.entity(t.where_eq("id", id).find_one().unwrap().unwrap()).get("at")
+    };
+    use enchudb_schema::Value;
+    assert_eq!(at(&db, -1), Some(Value::Number(-7)), "同じ key の後の値が勝っていない");
+    assert_eq!(at(&db, -100), Some(Value::Number(t0 + 99)));
+    assert_eq!(at(&db, i64::MAX - 1), Some(Value::Number(i64::MIN)));
+
+    // 出口: 行は主キーと ms の時刻のまま、 合計は u64 を超えれば文字列
+    let mut read = KafkaSource::connect(brokers.clone(), &tout).unwrap();
+    let (mut added, mut sums) = (std::collections::BTreeMap::new(), std::collections::BTreeMap::new());
+    for _ in 0..100 {
+        for m in read.fetch(1000).unwrap() {
+            let p: Json = serde_json::from_slice(m.payload.as_deref().unwrap()).unwrap();
+            if p["sub"] == "ms" {
+                added.insert(p["key"].as_i64().unwrap(), p["row"]["at"].clone());
+            } else {
+                sums.insert(p["group"].as_str().unwrap().to_string(), p["sum"].clone());
+            }
+        }
+        if added.len() >= 100 && sums.len() >= 3 {
+            break;
+        }
+    }
+    assert_eq!(added.len(), 100);
+    assert_eq!(added[&-1], json!(-7));
+    assert_eq!(added[&-50], json!(t0 + 49));
+    assert_eq!(sums["z"], json!((big as i128 * 3).to_string()), "u64 を超える合計");
+    assert_eq!(sums["edge"], json!(i64::MIN));
+    let ms_sum: i64 = (1..100i64).map(|i| t0 + i).sum::<i64>() - 7;
+    assert_eq!(sums["ms"], json!(ms_sum));
+    drop(ex);
+    drop(db);
+
+    // 開き直し: 値が残り、 先頭から読み直しても当てた位置は飛ばす
+    let db = Database::open(&path).unwrap();
+    assert_eq!(at(&db, -1), Some(Value::Number(-7)));
+    assert_eq!(at(&db, 1002), Some(Value::Number(big)));
+    let ing = Ingest::new(&db, JsonRows).unwrap();
+    let mut again = KafkaSource::connect(brokers.clone(), &tin).unwrap();
+    assert_eq!(ingest_all(&ing, &mut again, rows.len()), (0, rows.len()));
+    drop(ing);
+    drop(db);
+    for s in ["", ".oplog", ".tables", ".eidmap"] {
+        let _ = std::fs::remove_file(format!("{path}{s}"));
+    }
+    let _ = std::fs::remove_dir_all(&path);
+}
