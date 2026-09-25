@@ -1,0 +1,19 @@
+[package]
+name = "enchudb-kafka"
+version = "0.26.14"
+edition = "2024"
+rust-version = "1.89"
+description = "enchudb-connect の Kafka アダプタ (Redpanda など Kafka 互換も)。 純 Rust (rskafka)、 C のライブラリ不要。"
+license-file = "LICENSE.md"
+authors = ["mutafika"]
+repository = "https://github.com/mutafika/enchudb"
+
+[dependencies]
+enchudb-connect = { path = "../enchudb-connect" }
+rskafka = "0.6"
+tokio = { version = "1", features = ["rt"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+enchudb-schema = { path = "../enchudb-schema" }
+serde_json = "1"
