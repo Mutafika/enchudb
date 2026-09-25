@@ -2450,7 +2450,7 @@ impl<'a> Query<'a> {
                 for &h in &path {
                     cur = eng.get_by_id(cur, h)? as EntityId;
                 }
-                let v = eng.get_by_id64(cur, himo)?;
+                let v = eng.get_by_id(cur, himo)?;
                 let v = if desc { u64::MAX - v } else { v };
                 Some(((v, enchudb_oplog::eid_local(e)), e))
             })
@@ -2545,7 +2545,7 @@ impl<'a> Query<'a> {
         // 4. post-filter range predicates (Column 直読み、 engine の値で比べる)
         if !range_preds.is_empty() {
             candidates.retain(|&eid| {
-                range_preds.iter().all(|(h, lo, hi)| eng.get64(eid, h).is_some_and(|v| *lo <= v && v <= *hi))
+                range_preds.iter().all(|(h, lo, hi)| eng.get(eid, h).is_some_and(|v| *lo <= v && v <= *hi))
             });
         }
 
@@ -2942,13 +2942,13 @@ impl<'a> EntityRef<'a> {
         let eng = self.db.engine();
         match cd.ty {
             ColumnType::Number => eng.get(self.eid, &cd.himo_name).map(|v| Value::Number(v as i64)),
-            ColumnType::BigInt => eng.get_by_id64(self.eid, cd.himo_id).map(|v| Value::Number(big_val(v))),
+            ColumnType::BigInt => eng.get_by_id(self.eid, cd.himo_id).map(|v| Value::Number(big_val(v))),
             // #184: storage の Ref 値は u32 (local 部) なので、素 cast すると find() /
             // commit() が返す full eid (peer prefix 付き) と食い違う。Ref は必ず自 DB 内
             // entity (翻訳済み foreign 含む = 自 prefix) を指すので自 peer_id で復元する。
             ColumnType::Ref => eng
                 .get(self.eid, &cd.himo_name)
-                .map(|v| Value::Ref(enchudb_oplog::make_eid(eng.peer_id(), v))),
+                .map(|v| Value::Ref(enchudb_oplog::make_eid(eng.peer_id(), v as u32))),
             // #119: 借用返しの `get_text` は writer 稼働中に seqlock verify を通らず torn
             // bytes を掴む (= from_utf8 が失敗して silent に None を返す)。 元々即コピーして
             // いるので、 verify 付きの owned 版に寄せてもコピー回数は変わらない。

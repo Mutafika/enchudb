@@ -343,7 +343,7 @@ fn via_subscription_under_concurrent_flips() {
             .copied()
             .filter(|&u| {
                 let Some(c) = eng.get(u, "company") else { return false };
-                eng.get(enchudb_oplog::make_eid(eng.peer_id(), c), "city") == Some(1)
+                eng.get(enchudb_oplog::make_eid(eng.peer_id(), c as u32), "city") == Some(1)
             })
             .collect()
     };
@@ -429,7 +429,7 @@ fn new_kinds_under_concurrent_writes() {
     let eng = Engine::concurrentize(eng);
     let via = |p: LivePred| LivePred::Via { path: vec![company], pred: Box::new(p) };
     let get = |eng: &Engine, e: u64, h: &str| eng.get(e, h);
-    let co = |eng: &Engine, e: u64| get(eng, e, "company").map(|c| enchudb_oplog::make_eid(eng.peer_id(), c));
+    let co = |eng: &Engine, e: u64| get(eng, e, "company").map(|c| enchudb_oplog::make_eid(eng.peer_id(), c as u32));
 
     for round in 0..10u64 {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -522,16 +522,16 @@ fn new_kinds_under_concurrent_writes() {
             if a.count == 0 { sum_groups.remove(&v); } else { sum_groups.insert(v, a); }
         }
 
-        let has_age = |e: u64, lo: u32, hi: u32| get(&eng, e, "age").is_some_and(|a| lo <= a && a <= hi);
+        let has_age = |e: u64, lo: u64, hi: u64| get(&eng, e, "age").is_some_and(|a| lo <= a && a <= hi);
         let city_of = |e: u64| co(&eng, e).and_then(|c| get(&eng, c, "city"));
         let rev_of = |e: u64| co(&eng, e).and_then(|c| get(&eng, c, "revenue"));
         let set = |f: &dyn Fn(u64) -> bool| users.iter().copied().filter(|&e| f(e)).collect::<BTreeSet<u64>>();
-        let top_k = |key: &dyn Fn(u64) -> Option<u32>, keep: &dyn Fn(u64) -> bool, desc: bool, k: usize| {
-            let mut v: Vec<(u32, u64)> = users
+        let top_k = |key: &dyn Fn(u64) -> Option<u64>, keep: &dyn Fn(u64) -> bool, desc: bool, k: usize| {
+            let mut v: Vec<(u64, u64)> = users
                 .iter()
                 .copied()
                 .filter(|&e| keep(e))
-                .filter_map(|e| key(e).map(|x| (if desc { u32::MAX - x } else { x }, e)))
+                .filter_map(|e| key(e).map(|x| (if desc { u64::MAX - x } else { x }, e)))
                 .collect();
             v.sort_unstable();
             v.into_iter().take(k).map(|x| x.1).collect::<BTreeSet<u64>>()
@@ -552,7 +552,7 @@ fn new_kinds_under_concurrent_writes() {
         let mut want_groups: std::collections::BTreeMap<u64, u64> = Default::default();
         for &e in &users {
             if get(&eng, e, "age").is_some() && let Some(c) = city_of(e) {
-                *want_groups.entry(c as u64).or_insert(0) += 1;
+                *want_groups.entry(c).or_insert(0) += 1;
             }
         }
         assert_eq!(groups, want_groups, "round {round}: [counts] 積分 != 手で数えた件数");
@@ -560,7 +560,7 @@ fn new_kinds_under_concurrent_writes() {
         let mut want_sums: std::collections::BTreeMap<u64, enchudb_engine::Agg> = Default::default();
         for &e in &users {
             if get(&eng, e, "age").is_some_and(|a| a <= 25) && let Some(c) = city_of(e) {
-                let w = want_sums.entry(c as u64).or_default();
+                let w = want_sums.entry(c).or_default();
                 w.count += 1;
                 if let Some(sc) = get(&eng, e, "score") {
                     w.sum += sc as u128;

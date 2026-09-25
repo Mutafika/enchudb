@@ -244,7 +244,7 @@ impl RagStore {
     }
 
     /// メタ値を取得（Value/Ref は u32、Symbol も vocab_id）。
-    pub fn meta_value(&self, eid: EntityId, field: &str) -> Option<u32> {
+    pub fn meta_value(&self, eid: EntityId, field: &str) -> Option<u64> {
         self.db.get(eid, field)
     }
 

@@ -35,10 +35,8 @@ fn values_beyond_u32_round_trip_and_are_pulled() {
         eng.tie(e, "t.n", (i % 2) as u32);
     }
     for (&e, &v) in es.iter().zip(BIG.iter()) {
-        assert_eq!(eng.get64(e, "t.ts"), Some(v), "get64");
-        assert_eq!(eng.get_by_id64(e, ts), Some(v), "get_by_id64");
-        // u32 の get は収まる時だけ (切り詰めない)
-        assert_eq!(eng.get(e, "t.ts"), u32::try_from(v).ok(), "get (u32)");
+        assert_eq!(eng.get(e, "t.ts"), Some(v), "get");
+        assert_eq!(eng.get_by_id(e, ts), Some(v), "get_by_id");
         assert_eq!(eng.pull_raw("t.ts", v), vec![enchudb_oplog::eid_local(e) as u64], "pull_raw {v}");
     }
     // 下位 32 bit が同じ別の値に当たらない
@@ -52,13 +50,13 @@ fn values_beyond_u32_round_trip_and_are_pulled() {
     let far = (0..2600).map(|_| eng.entity_in("t").unwrap()).last().unwrap();
     assert!(enchudb_oplog::eid_local(far) > 2100, "端の entity になっていない: {far}");
     eng.tie_by_id(far, ts, u64::MAX - 2);
-    assert_eq!(eng.get64(far, "t.ts"), Some(u64::MAX - 2), "容量の端の cell");
+    assert_eq!(eng.get(far, "t.ts"), Some(u64::MAX - 2), "容量の端の cell");
     // 書き換え / 外す / 削除
     eng.tie_by_id(es[4], ts, 1u64 << 41);
     assert!(eng.pull_raw("t.ts", 1u64 << 40).is_empty(), "旧値の bucket に残っている");
     assert_eq!(eng.pull_raw("t.ts", 1u64 << 41), vec![enchudb_oplog::eid_local(es[4]) as u64]);
     eng.untie(es[5], "t.ts");
-    assert_eq!(eng.get64(es[5], "t.ts"), None);
+    assert_eq!(eng.get(es[5], "t.ts"), None);
     eng.delete(es[3]);
     assert!(eng.pull_raw("t.ts", u32::MAX as u64 + 1).is_empty());
     drop(eng);
@@ -82,8 +80,8 @@ fn values_that_do_not_fit_are_rejected_with_a_fault() {
     eng.tie_by_id(e, n, u32::MAX as u64 + 5); // u32 の列に大きな値
     eng.tie(e, "t.n", -1i64); // 負の数
     assert_eq!(eng.fault_count(FaultKind::ValueOutOfRange), before + 4);
-    assert_eq!(eng.get64(e, "t.ts"), Some(7), "拒否した値で cell が変わった");
-    assert_eq!(eng.get64(e, "t.n"), Some(7), "拒否した値で cell が変わった");
+    assert_eq!(eng.get(e, "t.ts"), Some(7), "拒否した値で cell が変わった");
+    assert_eq!(eng.get(e, "t.n"), Some(7), "拒否した値で cell が変わった");
     drop(eng);
     let _ = db_files::remove_db(&p);
 }
@@ -117,11 +115,11 @@ fn reopen_keeps_values_and_only_wide_dbs_become_v11() {
     let eng = Engine::open_standalone(&p).unwrap();
     for (i, &v) in BIG.iter().enumerate() {
         let e = eng.pull_raw("t.n", i as u32)[0];
-        assert_eq!(eng.get64(e, "t.ts"), Some(v), "reopen 後の値");
+        assert_eq!(eng.get(e, "t.ts"), Some(v), "reopen 後の値");
         assert_eq!(eng.pull_raw("t.ts", v), vec![e], "reopen 後の索引");
     }
     let far = eng.pull_raw("t.n", 999u32)[0];
-    assert_eq!(eng.get64(far, "t.ts"), Some(u64::MAX - 2), "reopen 後の容量の端の cell");
+    assert_eq!(eng.get(far, "t.ts"), Some(u64::MAX - 2), "reopen 後の容量の端の cell");
     drop(eng);
     let _ = db_files::remove_db(&p);
     let _ = db_files::remove_db(&q);
@@ -139,8 +137,8 @@ fn concurrent_writes_go_through_the_oplog() {
     eng.flush_writes();
     eng.oplog_commit();
     eng.oplog_sync().unwrap();
-    assert_eq!(eng.get64(a, "ts"), Some(1 << 50));
-    assert_eq!(eng.get64(b, "ts"), Some((1 << 50) + 1));
+    assert_eq!(eng.get(a, "ts"), Some(1 << 50));
+    assert_eq!(eng.get(b, "ts"), Some((1 << 50) + 1));
     // 監査で読める record は 64 bit のまま
     let vals: Vec<u64> = eng
         .audit(&Default::default())
@@ -208,14 +206,14 @@ fn wide_segments_are_sized_for_8_byte_cells() {
         let far = (0..30_000).map(|_| eng.entity_in("t").unwrap()).last().unwrap();
         assert!(enchudb_oplog::eid_local(far) > 20_000);
         eng.tie(far, "t.ts", far_v);
-        assert_eq!(eng.get64(far, "t.ts"), Some(far_v));
+        assert_eq!(eng.get(far, "t.ts"), Some(far_v));
         eng.flush().unwrap();
         far
     };
     let mut eng = Engine::open_standalone(&p).unwrap();
-    assert_eq!(eng.get64(far, "t.ts"), Some(far_v), "reopen 後の上限の端の cell");
+    assert_eq!(eng.get(far, "t.ts"), Some(far_v), "reopen 後の上限の端の cell");
     eng.tie(far, "t.ts", far_v - 1);
-    assert_eq!(eng.get64(far, "t.ts"), Some(far_v - 1));
+    assert_eq!(eng.get(far, "t.ts"), Some(far_v - 1));
     drop(eng);
     let _ = db_files::remove_db(&p);
 }
@@ -247,7 +245,7 @@ fn recovery_replays_wide_values() {
             .unwrap();
     }
     let eng = Engine::open_concurrent_with_oplog(&p, CAP).unwrap();
-    assert_eq!(eng.get64(e, "v"), Some(big), "recovery が 64 bit の値を入れていない");
+    assert_eq!(eng.get(e, "v"), Some(big), "recovery が 64 bit の値を入れていない");
     drop(eng);
     let _ = db_files::remove_db(&p);
 }
@@ -447,8 +445,8 @@ fn live_queries_on_64_bit_columns_match_oracle() {
         if step % 25 != 0 {
             continue;
         }
-        let tsv = |e: u64| eng.get_by_id64(e, ts);
-        let bigv = |e: u64| eng.get_by_id(e, co).and_then(|c| eng.get_by_id64(c as u64, big));
+        let tsv = |e: u64| eng.get_by_id(e, ts);
+        let bigv = |e: u64| eng.get_by_id(e, co).and_then(|c| eng.get_by_id(c, big));
         let has_n = |e: u64| eng.get_by_id(e, n).is_some();
         let set = |f: &dyn Fn(u64) -> bool| alive.iter().copied().filter(|&e| f(e)).collect::<BTreeSet<u64>>();
         let want = [
@@ -501,7 +499,7 @@ fn live_queries_on_64_bit_columns_match_oracle() {
         let mut ws: BTreeMap<u64, (u64, u128)> = BTreeMap::new();
         for &e in &alive {
             if let Some(g) = eng.get_by_id(e, n) {
-                let w = ws.entry(g as u64).or_default();
+                let w = ws.entry(g).or_default();
                 w.0 += 1;
                 w.1 += tsv(e).unwrap_or(0) as u128;
             }

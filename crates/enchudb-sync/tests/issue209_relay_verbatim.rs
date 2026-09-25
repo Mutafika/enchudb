@@ -97,7 +97,7 @@ fn relay_cycle(relay_eng: &Arc<Engine>, relay_sync: &Syncer, from: PeerId) {
     relay_sync.publish_since(Hlc::ZERO);
 }
 
-fn note_row(eng: &Arc<Engine>, i: u32) -> Option<(u64, Vec<u8>, Vec<u8>, Option<u32>)> {
+fn note_row(eng: &Arc<Engine>, i: u32) -> Option<(u64, Vec<u8>, Vec<u8>, Option<u64>)> {
     let rows = eng.pull_raw("notes.note", i);
     if rows.len() != 1 {
         panic!("note {i}: {} rows (重複 or 欠落): {rows:?}", rows.len());
@@ -106,7 +106,7 @@ fn note_row(eng: &Arc<Engine>, i: u32) -> Option<(u64, Vec<u8>, Vec<u8>, Option<
     let city = eng.get_text_owned(e, "notes.city")?;
     let body = eng.get_text_owned(e, "notes.body")?;
     let parent_note =
-        eng.get(e, "notes.parent").and_then(|p| eng.get(p as u64, "notes.note"));
+        eng.get(e, "notes.parent").and_then(|p| eng.get(p, "notes.note"));
     Some((e, city, body, parent_note))
 }
 

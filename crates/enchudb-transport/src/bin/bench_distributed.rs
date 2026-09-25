@@ -192,7 +192,7 @@ fn main() {
     for i in 0..iters {
         let eid = enchudb_oplog::make_eid(1, WARMUP_BASE + (i as u32 % WARMUP_COUNT));
         if let Some(v) = replica.get(eid, "val") {
-            checksum = checksum.wrapping_add(v as u64);
+            checksum = checksum.wrapping_add(v);
         }
     }
     let elapsed = t.elapsed();
@@ -217,7 +217,7 @@ fn main() {
     for i in 0..iters {
         let eid = enchudb_oplog::make_eid(1, WARMUP_BASE + (i as u32 % WARMUP_COUNT));
         if let Some(v) = origin_ro.get(eid, "val") {
-            _sum = _sum.wrapping_add(v as u64);
+            _sum = _sum.wrapping_add(v);
         }
     }
     let el2 = t.elapsed();

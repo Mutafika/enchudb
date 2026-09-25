@@ -1019,7 +1019,7 @@ fn read_value(eng: &Engine, eid: EntityId, cd: &ColDef) -> Value {
             Some(n) => Value::Integer(n as i64),
             None => Value::Null,
         },
-        SqlType::BigInt => match eng.get64(eid, &cd.himo) {
+        SqlType::BigInt => match eng.get(eid, &cd.himo) {
             Some(raw) => Value::Integer((raw ^ (1 << 63)) as i64),
             None => Value::Null,
         },

@@ -50,7 +50,7 @@ fn q(himo: &str) -> String {
 }
 
 /// 受信側で foreign eid を翻訳して読む (#9)。
-fn get_remote(eng: &Engine, foreign_eid: u64, himo: &str) -> Option<u32> {
+fn get_remote(eng: &Engine, foreign_eid: u64, himo: &str) -> Option<u64> {
     let hid = eng.himo_id(&q(himo)).unwrap() as u16;
     let local = eng.resolve_remote_eid(foreign_eid, hid)?;
     eng.get(local, &q(himo))
@@ -119,7 +119,7 @@ fn snapshot_restore_recovers_signed_wal_state() {
     // 「書いた entity 数」とは一致しない (10 tie → +10)。 実データで検証する。
     assert_eq!(eids.len(), 10);
     for (i, &e) in eids.iter().enumerate() {
-        assert_eq!(restored.get(e, &q("val")), Some(i as u32));
+        assert_eq!(restored.get(e, &q("val")), Some(i as u64));
     }
 
     // WAL レコードの署名も保持
@@ -194,7 +194,7 @@ fn restored_replica_syncs_incremental_from_origin_after_snapshot() {
     // entity_count() は `_sync_ops` 分を含むので使わない (上と同じ理由)。
     assert_eq!(snap_eids.len(), 5);
     for (i, &e) in snap_eids.iter().enumerate() {
-        assert_eq!(restored.get(e, &q("val")), Some(i as u32 * 10));
+        assert_eq!(restored.get(e, &q("val")), Some(u64::from(i as u32 * 10)));
     }
 
     // origin が追加書き込み

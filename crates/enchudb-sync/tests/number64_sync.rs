@@ -77,7 +77,7 @@ fn number64_values_sync_whole() {
         let got: Vec<u64> = b.pull_raw("t.n", i as u32);
         assert_eq!(got.len(), 1, "row {i} が届いていない");
         let e = got[0];
-        assert_eq!(b.get64(e, "t.ts"), Some(v), "t.ts row {i}");
+        assert_eq!(b.get(e, "t.ts"), Some(v), "t.ts row {i}");
         assert_eq!(b.pull_raw("t.ts", v), vec![e], "受け手の索引 row {i}");
     }
     drop((sa, sb, a, b));

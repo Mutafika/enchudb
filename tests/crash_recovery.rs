@@ -118,7 +118,7 @@ fn signed_wal_records_survive_reopen() {
     // 本体への apply も復元されている
     assert_eq!(eng.entity_count(), 50);
     for i in 0..50u64 {
-        assert_eq!(eng.get(i, "n"), Some(i as u32));
+        assert_eq!(eng.get(i, "n"), Some(i));
     }
 
     drop(eng);

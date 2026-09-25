@@ -48,7 +48,7 @@ fn q(himo: &str) -> String {
 }
 
 /// 受信側で foreign eid を翻訳して読む (#9)。
-fn get_remote(eng: &Engine, foreign_eid: u64, himo: &str) -> Option<u32> {
+fn get_remote(eng: &Engine, foreign_eid: u64, himo: &str) -> Option<u64> {
     let hid = eng.himo_id(&q(himo)).unwrap() as u16;
     let local = eng.resolve_remote_eid(foreign_eid, hid)?;
     eng.get(local, &q(himo))

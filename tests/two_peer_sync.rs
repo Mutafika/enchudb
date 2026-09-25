@@ -71,7 +71,7 @@ fn hid(eng: &Engine, himo: &str) -> u16 {
 /// 受信側で foreign eid を自分の eid 空間へ翻訳して読む (#9)。
 /// `Syncer::apply_one` が `resolve_remote_eid` で翻訳して格納するので、
 /// 送信側の eid のままでは読めない。
-fn get_remote(eng: &Engine, foreign_eid: u64, himo: &str) -> Option<u32> {
+fn get_remote(eng: &Engine, foreign_eid: u64, himo: &str) -> Option<u64> {
     let local = eng.resolve_remote_eid(foreign_eid, hid(eng, himo))?;
     eng.get(local, &q(himo))
 }
@@ -277,7 +277,7 @@ fn e2e_multiple_writes_published_and_pulled() {
     assert!(out.applied >= 10);
 
     for (i, &eid) in eids.iter().enumerate() {
-        assert_eq!(get_remote(&eng_b, eid, "val"), Some(i as u32));
+        assert_eq!(get_remote(&eng_b, eid, "val"), Some(i as u64));
     }
 
     cleanup(&pa);

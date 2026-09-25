@@ -145,7 +145,7 @@ fn verify(
                 Kind::Num => {
                     let got = eng.get(eid, hname);
                     let want = exp.map(|v| match v {
-                        Val::Num(n) => *n,
+                        Val::Num(n) => u64::from(*n),
                         Val::Txt(_) => unreachable!(),
                     });
                     prop_assert_eq!(got, want, "get(e{}, {}) mismatch", e, hname);

@@ -153,7 +153,7 @@ fn max_value_is_rejected_without_panicking() {
 
     // 拒否がその紐を壊していないこと — 正常値は通る。
     eng.tie(e, "x", u32::MAX - 1);
-    assert_eq!(eng.get(e, "x"), Some(u32::MAX - 1));
+    assert_eq!(eng.get(e, "x"), Some(u64::from(u32::MAX - 1)));
     cleanup(&path);
 }
 
@@ -290,7 +290,7 @@ fn ref_self_reference() {
     let mut eng = Engine::create_standalone(&path).unwrap();
     let e = eng.entity().unwrap();
     eng.tie_ref(e, "self", e);
-    assert_eq!(eng.get(e, "self"), Some(e as u32));
+    assert_eq!(eng.get(e, "self"), Some(e as u64));
     assert!(eng.pull_raw("self", e as u32).contains(&e));
     cleanup(&path);
 }

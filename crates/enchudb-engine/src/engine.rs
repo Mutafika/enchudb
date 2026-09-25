@@ -4556,7 +4556,7 @@ impl Engine {
         if let Some(lsn_hid) = self.himo_id("_sync_ops.lsn") {
             let hid = lsn_hid as u16;
             for eid in self.entities_with_himo(hid) {
-                if let Some(l) = self.get_by_id(eid, hid) {
+                if let Some(l) = self.get_by_id32(eid, hid) {
                     if l > max_lsn { max_lsn = l; }
                 }
             }
@@ -4564,7 +4564,7 @@ impl Engine {
         if let Some(cons_hid) = self.himo_id("_sync_peers.consumed_lsn") {
             let hid = cons_hid as u16;
             for eid in self.entities_with_himo(hid) {
-                if let Some(l) = self.get_by_id(eid, hid) {
+                if let Some(l) = self.get_by_id32(eid, hid) {
                     if l > max_lsn { max_lsn = l; }
                 }
             }
@@ -5456,7 +5456,7 @@ impl Engine {
         let mut rows: Vec<(u32, u64)> = self
             .entities_with_himo(lsn_hid)
             .into_iter()
-            .filter_map(|eid| self.get_by_id(eid, lsn_hid).map(|lsn| (lsn, eid)))
+            .filter_map(|eid| self.get_by_id32(eid, lsn_hid).map(|lsn| (lsn, eid)))
             .filter(|(lsn, _)| *lsn > start)
             .collect();
         rows.sort_by_key(|r| r.0);
@@ -5478,7 +5478,7 @@ impl Engine {
         let mut known_authors: Option<std::collections::HashSet<u32>> = None;
         for (lsn, eid) in rows.iter() {
             let decoded = self
-                .get_by_id(*eid, payload_hid)
+                .get_by_id32(*eid, payload_hid)
                 .map(|vid| self.vocab.get(vid).to_vec())
                 .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b));
             match decoded {
@@ -5618,7 +5618,7 @@ impl Engine {
         expected_lsn: u32,
     ) -> bool {
         let _guard = self.sync_ops_purge_lock.lock().unwrap();
-        if self.get_by_id(eid, lsn_hid) != Some(expected_lsn) {
+        if self.get_by_id32(eid, lsn_hid) != Some(expected_lsn) {
             return false;
         }
         let meta = self
@@ -5645,7 +5645,7 @@ impl Engine {
         self.query_by_id(&[(peer_id_hid as u16, peer)])
             .into_iter()
             .next()
-            .and_then(|eid| self.get_by_id(eid, consumed_lsn_hid as u16))
+            .and_then(|eid| self.get_by_id32(eid, consumed_lsn_hid as u16))
             .unwrap_or(0)
     }
 
@@ -5723,7 +5723,7 @@ impl Engine {
     ) -> (u32, enchudb_oplog::Hlc) {
         let author = self
             .himo_id("_sync_ops.peer_id")
-            .and_then(|h| self.get_by_id(eid, h as u16))
+            .and_then(|h| self.get_by_id32(eid, h as u16))
             .filter(|a| known_authors.contains(a))
             .unwrap_or(u32::MAX);
         (author, self.mint_local_hlc())
@@ -5760,7 +5760,7 @@ impl Engine {
             return set;
         };
         for eid in self.entities_with_himo(lsn_hid as u16) {
-            let Some(vid) = self.get_by_id(eid, payload_hid as u16) else { continue };
+            let Some(vid) = self.get_by_id32(eid, payload_hid as u16) else { continue };
             let bytes = self.vocab.get(vid).to_vec();
             if let Some(rec) = enchudb_oplog::oplog::decode_sync_ops_payload(&bytes) {
                 set.insert(rec.author_peer);
@@ -5804,7 +5804,7 @@ impl Engine {
         let self_peer = self.peer_id();
         // 下流 (self を除く登録済み peer) が 1 つも無ければ判定材料が無い。
         let has_downstream = self.entities_with_himo(peer_id_hid).into_iter().any(|eid| {
-            match self.get_by_id(eid, peer_id_hid) {
+            match self.get_by_id32(eid, peer_id_hid) {
                 Some(pid) => self_peer == 0 || pid != self_peer,
                 None => false,
             }
@@ -5836,12 +5836,12 @@ impl Engine {
             && let Some(payload_hid) = self.himo_id("_sync_ops.payload")
         {
             for eid in self.entities_with_himo(lsn_hid as u16) {
-                let Some(lsn) = self.get_by_id(eid, lsn_hid as u16) else { continue };
+                let Some(lsn) = self.get_by_id32(eid, lsn_hid as u16) else { continue };
                 if lsn > watermark {
                     continue;
                 }
                 if let Some(rec) = self
-                    .get_by_id(eid, payload_hid as u16)
+                    .get_by_id32(eid, payload_hid as u16)
                     .map(|vid| self.vocab.get(vid).to_vec())
                     .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b))
                 {
@@ -5872,11 +5872,11 @@ impl Engine {
         let mut counted = false;
         for eid in peer_rows {
             if self_peer != 0 {
-                if let Some(pid) = self.get_by_id(eid, peer_id_hid as u16) {
+                if let Some(pid) = self.get_by_id32(eid, peer_id_hid as u16) {
                     if pid == self_peer { continue; }
                 }
             }
-            if let Some(v) = self.get_by_id(eid, consumed_lsn_hid as u16) {
+            if let Some(v) = self.get_by_id32(eid, consumed_lsn_hid as u16) {
                 counted = true;
                 if v < min_lsn { min_lsn = v; }
             }
@@ -5925,12 +5925,12 @@ impl Engine {
         let mut dead_raw_authors: Vec<u32> = Vec::new();
         let dead_peer_id_hid = self.himo_id("_sync_ops.peer_id").map(|h| h as u16);
         for eid in rows {
-            let Some(lsn) = self.get_by_id(eid, lsn_hid_u16) else { continue };
+            let Some(lsn) = self.get_by_id32(eid, lsn_hid_u16) else { continue };
             if lsn >= watermark {
                 continue;
             }
             let decoded = payload_hid
-                .and_then(|h| self.get_by_id(eid, h))
+                .and_then(|h| self.get_by_id32(eid, h))
                 .map(|vid| self.vocab.get(vid).to_vec())
                 .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b));
             if decoded.is_none() && lsn >= inflight_lsn {
@@ -5949,7 +5949,7 @@ impl Engine {
                 }
                 None => dead_raw_authors.push(
                     dead_peer_id_hid
-                        .and_then(|h| self.get_by_id(eid, h))
+                        .and_then(|h| self.get_by_id32(eid, h))
                         .unwrap_or(u32::MAX),
                 ),
             }
@@ -6040,7 +6040,7 @@ impl Engine {
         }
         let hid = self.himo_id("_sync_peers.reclaimed_floor")? as u16;
         let row = self.entities_with_himo(hid).into_iter().next()?;
-        let vid = self.get_by_id(row, hid)?;
+        let vid = self.get_by_id32(row, hid)?;
         let bytes = self.vocab.get(vid).to_vec();
         let hlc_at = |b: &[u8]| -> Option<enchudb_oplog::Hlc> {
             Some(enchudb_oplog::Hlc {
@@ -6265,7 +6265,7 @@ impl Engine {
                     let Some(&foreign_local) = foreign.get(&local) else { continue };
                     enchudb_oplog::make_eid(author, foreign_local)
                 };
-                let Some(wide) = self.get_by_id64(eid, himo_id) else { continue };
+                let Some(wide) = self.get_by_id(eid, himo_id) else { continue };
                 // Number64 以外の列は u32 (vid / local eid / leaf offset)
                 let value = wide as u32;
                 let mut hlc = self.version_of(local, himo_id);
@@ -6460,7 +6460,7 @@ impl Engine {
         let lsn_hid = self.himo_id("_sync_ops.lsn")? as u16;
         let mut min_lsn: Option<u32> = None;
         for eid in self.entities_with_himo(lsn_hid) {
-            if let Some(l) = self.get_by_id(eid, lsn_hid) {
+            if let Some(l) = self.get_by_id32(eid, lsn_hid) {
                 min_lsn = Some(match min_lsn {
                     Some(m) if m <= l => m,
                     _ => l,
@@ -6483,12 +6483,12 @@ impl Engine {
         let rows = self.entities_with_himo(lsn_hid_u16);
         let mut pairs: Vec<(u32, Vec<u8>)> = Vec::new();
         for eid in rows {
-            let lsn = match self.get_by_id(eid, lsn_hid_u16) {
+            let lsn = match self.get_by_id32(eid, lsn_hid_u16) {
                 Some(l) => l,
                 None => continue,
             };
             if lsn <= since_lsn { continue; }
-            let payload_vid = match self.get_by_id(eid, payload_hid_u16) {
+            let payload_vid = match self.get_by_id32(eid, payload_hid_u16) {
                 Some(v) => v,
                 None => continue,
             };
@@ -9730,7 +9730,7 @@ impl Engine {
         let local = enchudb_oplog::eid_local(eid);
         // 新経路 (`_c_{key}` Leaf himo) 優先
         if let Some(hid) = self.content_himo_id(local, key) {
-            if let Some(vid) = self.get_by_id(eid, hid) {
+            if let Some(vid) = self.get_by_id32(eid, hid) {
                 return Some(self.text_value(hid as usize, vid));
             }
         }
@@ -9939,15 +9939,8 @@ impl Engine {
         }
     }
 
-    ///
-    /// 64 bit 列 (`ValueType::Number64`) は値が u32 に収まる時だけ返す (収まらなければ None —
-    /// 切り詰めない)。 64 bit 列は [`get64`](Self::get64) で読む。
-    pub fn get(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Option<u32> {
-        self.get64(eid, himo).and_then(|v| u32::try_from(v).ok())
-    }
-
-    /// `get` の 64 bit 版 (どの列でも読める)。
-    pub fn get64(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Option<u64> {
+    /// entity の紐の値。 列の幅によらず u64 (u32 の列の値もそのまま広げて返す)。
+    pub fn get(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Option<u64> {
         let eid = enchudb_oplog::eid_local(eid);
         let hid = self.himo_id(himo)?;
         self.himos[hid].get_value(eid)
@@ -9955,14 +9948,15 @@ impl Engine {
 
     /// `get` の bindings 版。 schema 等で `himo_id` を起動時に pre-resolve した hot path 用。
     /// 名前 lookup (= himo_names の線形検索) が無くなるので point lookup が最速。
-    pub fn get_by_id(&self, eid: enchudb_oplog::EntityId, hid: u16) -> Option<u32> {
-        self.get_by_id64(eid, hid).and_then(|v| u32::try_from(v).ok())
-    }
-
-    /// `get_by_id` の 64 bit 版 (どの列でも読める)。
-    pub fn get_by_id64(&self, eid: enchudb_oplog::EntityId, hid: u16) -> Option<u64> {
+    pub fn get_by_id(&self, eid: enchudb_oplog::EntityId, hid: u16) -> Option<u64> {
         let eid = enchudb_oplog::eid_local(eid);
         self.himos.get(hid as usize)?.get_value(eid)
+    }
+
+    /// u32 の列 (vocab id / ref / engine 内部の table の列) を u32 で読む。 64 bit 列で panic。
+    pub(crate) fn get_by_id32(&self, eid: enchudb_oplog::EntityId, hid: u16) -> Option<u32> {
+        let eid = enchudb_oplog::eid_local(eid);
+        self.himos.get(hid as usize)?.get_value32(eid)
     }
 
     /// `get_by_id` の bulk 版。 同 himo の N entity を一括 column scan で `out` に append。
@@ -11350,7 +11344,7 @@ impl Engine {
 
     /// epoch 日数から (year, month, day) を返す
     pub fn get_date(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Option<(u32, u32, u32)> {
-        self.get(eid, himo).map(Self::days_to_date)
+        self.get(eid, himo).and_then(|d| u32::try_from(d).ok()).map(Self::days_to_date)
     }
 
     /// 日付範囲で pull_range
@@ -15250,7 +15244,7 @@ mod tests {
         let parent = eng.entity().unwrap();
         let child = eng.entity().unwrap();
         eng.tie_ref(child, "company", parent);
-        assert_eq!(eng.get(child, "company"), Some(parent as u32));
+        assert_eq!(eng.get(child, "company"), Some(parent as u64));
         eng.rebuild();
         let result = eng.pull_raw("company", parent as u32);
         assert_eq!(result, vec![child]);
@@ -15602,7 +15596,7 @@ mod tests {
         let ts = 1_743_552_000u32;
         let e = eng.entity().unwrap();
         eng.tie(e, "ts", ts);
-        assert_eq!(eng.get(e, "ts"), Some(ts));
+        assert_eq!(eng.get(e, "ts"), Some(u64::from(ts)));
         eng.rebuild();
         let result = eng.pull_raw("ts", ts);
         assert_eq!(result, vec![e]);
@@ -15613,7 +15607,7 @@ mod tests {
         let big = 1_000_000u32;
         let e2 = eng.entity().unwrap();
         eng.tie(e2, "huge", big);
-        assert_eq!(eng.get(e2, "huge"), Some(big));
+        assert_eq!(eng.get(e2, "huge"), Some(u64::from(big)));
         eng.rebuild();
         let result2 = eng.pull_raw("huge", big);
         assert_eq!(result2, vec![e2]);
@@ -15646,7 +15640,7 @@ mod tests {
             eng.tie(e, &format!("dim_{d}"), d * 10);
         }
         for d in 0..20u32 {
-            assert_eq!(eng.get(e, &format!("dim_{d}")), Some(d * 10));
+            assert_eq!(eng.get(e, &format!("dim_{d}")), Some(u64::from(d * 10)));
         }
         assert_eq!(eng.himos_of(e).len(), 20);
         let _ = std::fs::remove_dir_all(&dir); // v10: DB は directory
@@ -16307,7 +16301,7 @@ mod tests {
         assert_eq!(eng.query_count(&[("age", 30), ("dept", 10), ("group", 30)]), (n / groups) as usize);
 
         assert_eq!(eng.get(50, "age"), Some(50));
-        assert_eq!(eng.get(50, "dept"), Some(50 % depts));
+        assert_eq!(eng.get(50, "dept"), Some(u64::from(50 % depts)));
 
         let victims: Vec<u64> = eng.query(&[("age", 99)]).into_iter().take(1000).collect();
         for &eid in &victims { eng.delete(eid); }
@@ -17069,7 +17063,7 @@ mod v10_dir_tests {
     fn assert_seeded(eng: &Engine, rows: &[(enchudb_oplog::EntityId, u32)]) {
         assert_eq!(eng.entity_count(), rows.len() as u32);
         for (e, v) in rows {
-            assert_eq!(eng.get(*e, "widgets.n"), Some(*v));
+            assert_eq!(eng.get(*e, "widgets.n"), Some(u64::from(*v)));
         }
         let tables: Vec<String> = eng.list_user_tables().into_iter().map(|t| t.1).collect();
         assert!(tables.iter().any(|t| t == "widgets"), "tables: {tables:?}");
@@ -17405,7 +17399,7 @@ mod v10_dir_tests {
         assert_eq!(eng.himo_count(), 117);
         assert_eq!(eng.entity_count(), rows.len() as u32);
         for (e, v) in &rows {
-            assert_eq!(eng.get(*e, "t.h0"), Some(*v));
+            assert_eq!(eng.get(*e, "t.h0"), Some(u64::from(*v)));
         }
         drop(eng);
         let _ = std::fs::remove_dir_all(&dst);
@@ -17630,7 +17624,7 @@ mod v10_dir_tests {
         let eng = Engine::open_standalone(&path).unwrap();
         assert_eq!(eng.table_eid_extents("a").unwrap(), ext, "extents survive reopen (EXT1 block)");
         for (i, &e) in ids.iter().enumerate() {
-            assert_eq!(eng.get(e, "a.n"), Some(i as u32));
+            assert_eq!(eng.get(e, "a.n"), Some(i as u64));
         }
         // reopen 後の払出は live eid を再利用しない (next_local が bitmap から復元される)
         let fresh = eng.entity_in("a").unwrap();
