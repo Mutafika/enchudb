@@ -95,7 +95,7 @@ fn wal_full_mid_group_folds_after_bridge_drains() {
     let mut v = 0u32;
     loop {
         while wal.free_bytes() >= 240 + 400 {
-            wal.append(Op::Tie { eid: e, himo_id: note_hid, value: v }).unwrap();
+            wal.append(Op::Tie { eid: e, himo_id: note_hid, value: v as u64 }).unwrap();
             wal.append(Op::Commit).unwrap();
             v += 1;
         }
@@ -115,7 +115,7 @@ fn wal_full_mid_group_folds_after_bridge_drains() {
     // 112 バイト未満（= Commit も入らない）へ落とす。 閉じの Commit は満杯で
     // 失敗する = 孤児 group 確定。
     while wal.free_bytes() >= 128 + 168 {
-        wal.append(Op::Tie { eid: e, himo_id: note_hid, value: v }).unwrap();
+        wal.append(Op::Tie { eid: e, himo_id: note_hid, value: v as u64 }).unwrap();
         v += 1;
     }
     let free = wal.free_bytes(); // ∈ [168, 296)

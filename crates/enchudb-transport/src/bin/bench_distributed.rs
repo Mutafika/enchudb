@@ -118,7 +118,7 @@ fn main() {
         let wall = 1_000 + i * 10; // HLC は単調増、seen の取り違えを防ぐ
         let rec = WireRecord::unsigned(
             Hlc { wall, logical: 0, peer: 1 }, 1,
-            DecodedOp::Tie { eid, himo_id, value: (i as u32) + 1 },
+            DecodedOp::Tie { eid, himo_id, value: ((i as u32) + 1) as u64 },
         );
 
         let t0 = Instant::now();
@@ -165,7 +165,7 @@ fn main() {
                 let wall = 100_000 + (i as u64) * 10;
                 batch.push(WireRecord::unsigned(
                     Hlc { wall, logical: 0, peer: 1 }, 1,
-                    DecodedOp::Tie { eid, himo_id, value: i + 1 },
+                    DecodedOp::Tie { eid, himo_id, value: (i + 1) as u64 },
                 ));
             }
             pub_t.publish(1, batch);

@@ -90,7 +90,7 @@ pub use sparse_copy::copy_sparse;
 #[cfg(not(target_arch = "wasm32"))]
 pub use engine::copy_db_dir;
 pub use engine::EngineStats;
-pub use himo_store::ValueType;
+pub use himo_store::{CellValue, ValueType};
 pub use cas::{CASStore, BlockHash};
 pub use ravn::{Ravn, RavnResult};
 

@@ -42,6 +42,7 @@
 //! ヘッダ固定部: 2+1+1+4+8 + 8+4+4 + 4 + 4 + 64 + 8 = **112B / record**
 //!
 //! Tie payload(v2):    [eid: 8B][himo_id: 2B][_pad: 2B][value: 4B]  = 16B
+//! Tie64 payload:      [eid: 8B][himo_id: 2B][_pad: 6B][value: 8B]  = 24B (値が u32 に入らない時)
 //! Untie payload(v2):  [eid: 8B][himo_id: 2B][_pad: 6B]             = 16B
 //! Delete payload(v2): [eid: 8B]                                     = 8B
 //! Content payload(v2):[eid: 8B][key_len: 2B][_pad: 2B][data_len: 4B][key][data]
@@ -297,13 +298,18 @@ pub mod op_type {
     /// 「translated foreign entity への Ref write」を発送するときだけ合成する
     /// (author のローカル oplog には現れない)。
     pub const TIE_REF: u8 = 9;
+    /// FILE_VERSION 11: 値が u32 に入らない Tie (64 bit 列)。 payload 24B。 値が u32 に入る Tie は
+    /// 列の幅によらず `TIE` のまま (decode 後はどちらも `DecodedOp::Tie { value: u64 }`)。
+    pub const TIE64: u8 = 10;
+    /// `TIE_NAMED` の 64 bit 値版: eid(8) + value(8) + kind(1) + pad(1) + name_len(2) + name。
+    pub const TIE_NAMED64: u8 = 11;
 }
 
 /// WAL に書く所有型 op。 `Op` の owned 版で、 queue 渡し用 (consumer 側で
 /// batch して `append_many` に流す経路で使う)。
 #[derive(Debug, Clone)]
 pub enum OwnedOp {
-    Tie { eid: u64, himo_id: u16, value: u32 },
+    Tie { eid: u64, himo_id: u16, value: u64 },
     Untie { eid: u64, himo_id: u16 },
     Delete { eid: u64 },
     Content { eid: u64, key: String, data: Vec<u8> },
@@ -311,7 +317,7 @@ pub enum OwnedOp {
     Vocab { vid: u32, bytes: Vec<u8> },
     /// 0.9.0: himo を full name で運ぶ Tie (content 互換層用)。
     /// `himo_kind` は ValueType の生 u8 (受信側の ensure 用)。
-    TieNamed { eid: u64, himo_name: String, himo_kind: u8, value: u32 },
+    TieNamed { eid: u64, himo_name: String, himo_kind: u8, value: u64 },
     /// 0.12.0 (#88): Leaf payload を bytes 同乗で運ぶ (vid 無し、 himo は名前)。
     TieLeaf { eid: u64, himo_name: String, himo_kind: u8, bytes: Vec<u8> },
 }
@@ -341,7 +347,7 @@ impl OwnedOp {
 /// WAL に書く op。eid は u64。
 #[derive(Debug, Clone)]
 pub enum Op<'a> {
-    Tie { eid: u64, himo_id: u16, value: u32 },
+    Tie { eid: u64, himo_id: u16, value: u64 },
     Untie { eid: u64, himo_id: u16 },
     Delete { eid: u64 },
     Content { eid: u64, key: &'a str, data: &'a [u8] },
@@ -351,7 +357,7 @@ pub enum Op<'a> {
     /// 後続の Tie { value: vid } を受けたら local_vid に変換して適用する。
     Vocab { vid: u32, bytes: &'a [u8] },
     /// 0.9.0: himo を full name で運ぶ Tie。 動的 himo (content `_c_{key}`) 用。
-    TieNamed { eid: u64, himo_name: &'a str, himo_kind: u8, value: u32 },
+    TieNamed { eid: u64, himo_name: &'a str, himo_kind: u8, value: u64 },
     /// 0.12.0 (#88): Leaf payload を bytes 同乗で運ぶ Tie (vid 無し、 himo は名前)。
     TieLeaf { eid: u64, himo_name: &'a str, himo_kind: u8, bytes: &'a [u8] },
     /// #183/#209: Ref 値の target を世界番号 (u64) 同乗で運ぶ Tie。 bridge は
@@ -366,6 +372,7 @@ impl<'a> Op<'a> {
     #[inline]
     fn payload_size(&self) -> usize {
         match self {
+            Op::Tie { value, .. } if *value > u32::MAX as u64 => 24, // eid(8) + himo_id(2) + pad(6) + value(8)
             Op::Tie { .. } => 16,       // eid(8) + himo_id(2) + pad(2) + value(4)
             Op::Untie { .. } => 16,     // eid(8) + himo_id(2) + pad(6)
             Op::Delete { .. } => 8,     // eid(8)
@@ -373,6 +380,7 @@ impl<'a> Op<'a> {
             Op::Commit => 0,
             Op::Vocab { bytes, .. } => 4 + 4 + bytes.len(), // vid(4) + len(4) + bytes
             // eid(8) + value(4) + kind(1) + pad(1) + name_len(2) + name
+            Op::TieNamed { himo_name, value, .. } if *value > u32::MAX as u64 => 20 + himo_name.len(),
             Op::TieNamed { himo_name, .. } => 16 + himo_name.len(),
             // eid(8) + kind(1) + pad(1) + name_len(2) + bytes_len(4) + name + bytes
             Op::TieLeaf { himo_name, bytes, .. } => 16 + himo_name.len() + bytes.len(),
@@ -382,12 +390,14 @@ impl<'a> Op<'a> {
 
     fn op_byte(&self) -> u8 {
         match self {
+            Op::Tie { value, .. } if *value > u32::MAX as u64 => op_type::TIE64,
             Op::Tie { .. } => op_type::TIE,
             Op::Untie { .. } => op_type::UNTIE,
             Op::Delete { .. } => op_type::DELETE,
             Op::Content { .. } => op_type::CONTENT,
             Op::Commit => op_type::COMMIT,
             Op::Vocab { .. } => op_type::VOCAB,
+            Op::TieNamed { value, .. } if *value > u32::MAX as u64 => op_type::TIE_NAMED64,
             Op::TieNamed { .. } => op_type::TIE_NAMED,
             Op::TieLeaf { .. } => op_type::TIE_LEAF,
             Op::TieRef { .. } => op_type::TIE_REF,
@@ -396,11 +406,17 @@ impl<'a> Op<'a> {
 
     fn write_payload(&self, buf: &mut [u8]) {
         match self {
+            Op::Tie { eid, himo_id, value } if *value > u32::MAX as u64 => {
+                buf[0..8].copy_from_slice(&eid.to_le_bytes());
+                buf[8..10].copy_from_slice(&himo_id.to_le_bytes());
+                buf[10..16].copy_from_slice(&[0u8; 6]);
+                buf[16..24].copy_from_slice(&value.to_le_bytes());
+            }
             Op::Tie { eid, himo_id, value } => {
                 buf[0..8].copy_from_slice(&eid.to_le_bytes());
                 buf[8..10].copy_from_slice(&himo_id.to_le_bytes());
                 buf[10..12].copy_from_slice(&[0, 0]);
-                buf[12..16].copy_from_slice(&value.to_le_bytes());
+                buf[12..16].copy_from_slice(&(*value as u32).to_le_bytes());
             }
             Op::Untie { eid, himo_id } => {
                 buf[0..8].copy_from_slice(&eid.to_le_bytes());
@@ -429,10 +445,20 @@ impl<'a> Op<'a> {
                 buf[4..8].copy_from_slice(&blen.to_le_bytes());
                 buf[8..8 + bytes.len()].copy_from_slice(bytes);
             }
+            Op::TieNamed { eid, himo_name, himo_kind, value } if *value > u32::MAX as u64 => {
+                assert!(himo_name.len() <= u16::MAX as usize, "himo name too long");
+                buf[0..8].copy_from_slice(&eid.to_le_bytes());
+                buf[8..16].copy_from_slice(&value.to_le_bytes());
+                buf[16] = *himo_kind;
+                buf[17] = 0;
+                let nlen = himo_name.len() as u16;
+                buf[18..20].copy_from_slice(&nlen.to_le_bytes());
+                buf[20..20 + himo_name.len()].copy_from_slice(himo_name.as_bytes());
+            }
             Op::TieNamed { eid, himo_name, himo_kind, value } => {
                 assert!(himo_name.len() <= u16::MAX as usize, "himo name too long");
                 buf[0..8].copy_from_slice(&eid.to_le_bytes());
-                buf[8..12].copy_from_slice(&value.to_le_bytes());
+                buf[8..12].copy_from_slice(&(*value as u32).to_le_bytes());
                 buf[12] = *himo_kind;
                 buf[13] = 0;
                 let nlen = himo_name.len() as u16;
@@ -465,7 +491,7 @@ impl<'a> Op<'a> {
 /// デコード後の op(読み戻し用、所有型)。
 #[derive(Debug, Clone)]
 pub enum DecodedOp {
-    Tie { eid: u64, himo_id: u16, value: u32 },
+    Tie { eid: u64, himo_id: u16, value: u64 },
     Untie { eid: u64, himo_id: u16 },
     Delete { eid: u64 },
     Content { eid: u64, key: String, data: Vec<u8> },
@@ -473,7 +499,7 @@ pub enum DecodedOp {
     /// peer 間で vocab の (vid, bytes) を運ぶ。`vid` は record の author_peer ローカル。
     Vocab { vid: u32, bytes: Vec<u8> },
     /// 0.9.0: himo full name 付き Tie (動的 content himo 用)。
-    TieNamed { eid: u64, himo_name: String, himo_kind: u8, value: u32 },
+    TieNamed { eid: u64, himo_name: String, himo_kind: u8, value: u64 },
     /// 0.12.0 (#88): Leaf payload を bytes 同乗で運ぶ Tie (vid 無し)。
     TieLeaf { eid: u64, himo_name: String, himo_kind: u8, bytes: Vec<u8> },
     /// #183: Ref 値を **target の世界番号 (u64) 同乗**で運ぶ Tie。
@@ -1692,7 +1718,13 @@ fn decode_op(op_byte: u8, payload: &[u8]) -> Option<DecodedOp> {
         op_type::TIE if payload.len() >= 16 => {
             let eid = u64::from_le_bytes(payload[0..8].try_into().unwrap());
             let himo_id = u16::from_le_bytes(payload[8..10].try_into().unwrap());
-            let value = u32::from_le_bytes(payload[12..16].try_into().unwrap());
+            let value = u32::from_le_bytes(payload[12..16].try_into().unwrap()) as u64;
+            Some(DecodedOp::Tie { eid, himo_id, value })
+        }
+        op_type::TIE64 if payload.len() >= 24 => {
+            let eid = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+            let himo_id = u16::from_le_bytes(payload[8..10].try_into().unwrap());
+            let value = u64::from_le_bytes(payload[16..24].try_into().unwrap());
             Some(DecodedOp::Tie { eid, himo_id, value })
         }
         op_type::UNTIE if payload.len() >= 16 => {
@@ -1716,11 +1748,20 @@ fn decode_op(op_byte: u8, payload: &[u8]) -> Option<DecodedOp> {
         op_type::COMMIT => Some(DecodedOp::Commit),
         op_type::TIE_NAMED if payload.len() >= 16 => {
             let eid = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-            let value = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+            let value = u32::from_le_bytes(payload[8..12].try_into().unwrap()) as u64;
             let himo_kind = payload[12];
             let nlen = u16::from_le_bytes(payload[14..16].try_into().unwrap()) as usize;
             if payload.len() < 16 + nlen { return None; }
             let himo_name = String::from_utf8(payload[16..16 + nlen].to_vec()).ok()?;
+            Some(DecodedOp::TieNamed { eid, himo_name, himo_kind, value })
+        }
+        op_type::TIE_NAMED64 if payload.len() >= 20 => {
+            let eid = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+            let value = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+            let himo_kind = payload[16];
+            let nlen = u16::from_le_bytes(payload[18..20].try_into().unwrap()) as usize;
+            if payload.len() < 20 + nlen { return None; }
+            let himo_name = String::from_utf8(payload[20..20 + nlen].to_vec()).ok()?;
             Some(DecodedOp::TieNamed { eid, himo_name, himo_kind, value })
         }
         op_type::TIE_LEAF if payload.len() >= 16 => {
@@ -1823,7 +1864,7 @@ mod tests {
         let wal = OpLog::create(&p, HEADER_SIZE + 256).unwrap();
         let mut hit_full = false;
         for i in 0..10_000u64 {
-            match wal.append(Op::Tie { eid: i, himo_id: 0, value: i as u32 }) {
+            match wal.append(Op::Tie { eid: i, himo_id: 0, value: i as u64 }) {
                 Ok(_) => {}
                 Err(e) => {
                     assert_eq!(e.kind(), io::ErrorKind::OutOfMemory, "full は OutOfMemory で返る");
@@ -2057,7 +2098,7 @@ mod tests {
                     w.append(Op::Tie {
                         eid: t * 10000 + i,
                         himo_id: 0,
-                        value: i as u32,
+                        value: i as u64,
                     }).unwrap();
                 }
             }));
@@ -2088,7 +2129,7 @@ mod tests {
                     w.append(Op::Tie {
                         eid: t * 10_000 + i,
                         himo_id: 0,
-                        value: i as u32,
+                        value: i as u64,
                     }).unwrap();
                 }
             }));
@@ -2136,9 +2177,9 @@ mod tests {
         // 交互に append、 lock が無いと head が両 instance で衝突
         for i in 0..200u32 {
             if i % 2 == 0 {
-                wal_a.append(Op::Tie { eid: i as u64, himo_id: 0, value: i }).unwrap();
+                wal_a.append(Op::Tie { eid: i as u64, himo_id: 0, value: i as u64 }).unwrap();
             } else {
-                wal_b.append(Op::Tie { eid: i as u64, himo_id: 1, value: i }).unwrap();
+                wal_b.append(Op::Tie { eid: i as u64, himo_id: 1, value: i as u64 }).unwrap();
             }
         }
         wal_a.append(Op::Commit).unwrap();
@@ -2161,7 +2202,7 @@ mod tests {
         let wal = OpLog::create(&p, 1024 * 1024).unwrap();
         wal.set_auto_reset(true);
         for i in 0..100u32 {
-            wal.append(Op::Tie { eid: i as u64, himo_id: 0, value: i }).unwrap();
+            wal.append(Op::Tie { eid: i as u64, himo_id: 0, value: i as u64 }).unwrap();
         }
         wal.append(Op::Commit).unwrap();
         let head_before = wal.head();
@@ -2192,7 +2233,7 @@ mod tests {
         let wal = OpLog::create(&p, 1024 * 1024).unwrap();
         // ※ set_auto_reset(true) は意図的に呼ばない (本番と同じ初期状態)。
         for i in 0..100u32 {
-            wal.append(Op::Tie { eid: i as u64, himo_id: 0, value: i }).unwrap();
+            wal.append(Op::Tie { eid: i as u64, himo_id: 0, value: i as u64 }).unwrap();
         }
         wal.append(Op::Commit).unwrap();
         let head_before = wal.head();
@@ -2220,7 +2261,7 @@ mod tests {
         for batch in 0..50u32 {
             for i in 0..100u32 {
                 let v = batch * 100 + i;
-                wal.append(Op::Tie { eid: v as u64, himo_id: 0, value: v }).unwrap();
+                wal.append(Op::Tie { eid: v as u64, himo_id: 0, value: v as u64 }).unwrap();
             }
             wal.append(Op::Commit).unwrap();
             wal.advance_checkpoint(wal.head());
@@ -2288,6 +2329,29 @@ mod tests {
 
         assert_eq!(tie_hlcs(&wal), vec![(lsn2, minted2), (lsn1, minted1)]);
         let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// u32 に入らない値の Tie / TieNamed (FILE_VERSION 11) は TIE64 / TIE_NAMED64 で載り、 u64 のまま
+    /// 読み戻せる。 入る値は従来の TIE / TIE_NAMED (16B) のまま。
+    #[test]
+    fn wide_tie_values_round_trip() {
+        let p = tmp("tie64");
+        let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+        let vals = [7u64, u32::MAX as u64, u32::MAX as u64 + 1, 1 << 40, u64::MAX - 1];
+        for (i, &v) in vals.iter().enumerate() {
+            wal.append(Op::Tie { eid: i as u64, himo_id: 3, value: v }).unwrap();
+            wal.append(Op::TieNamed { eid: i as u64, himo_name: "_c_big", himo_kind: 4, value: v }).unwrap();
+        }
+        wal.append(Op::Commit).unwrap();
+        let recs = wal.iter_committed();
+        let ties: Vec<u64> = recs.iter().filter_map(|r| match r.op { DecodedOp::Tie { value, .. } => Some(value), _ => None }).collect();
+        let named: Vec<u64> = recs.iter().filter_map(|r| match r.op { DecodedOp::TieNamed { value, .. } => Some(value), _ => None }).collect();
+        assert_eq!(ties, vals);
+        assert_eq!(named, vals);
+        assert_eq!(Op::Tie { eid: 0, himo_id: 0, value: u32::MAX as u64 }.op_byte(), op_type::TIE, "入る値は従来の形式");
+        assert_eq!(Op::Tie { eid: 0, himo_id: 0, value: u32::MAX as u64 + 1 }.op_byte(), op_type::TIE64);
+        let _ = std::fs::remove_dir_all(&p);
         let _ = std::fs::remove_file(&p);
     }
 

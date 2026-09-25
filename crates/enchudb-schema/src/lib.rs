@@ -1093,6 +1093,8 @@ impl Database {
                     ValueType::Tag => ColumnType::Tag,
                     ValueType::Leaf => ColumnType::Leaf,
                     ValueType::Ref => ColumnType::Ref,
+                    // 64 bit 列の列型は schema にまだ無い (段階 E)。 u32 の Number として拾うと値が化ける
+                    ValueType::Number64 => continue,
                 };
                 cols.push((col_name.to_string(), ty));
             }

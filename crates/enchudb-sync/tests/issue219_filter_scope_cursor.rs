@@ -80,7 +80,7 @@ impl SubscriptionFilter for DropNoteValue {
         if d == NONE {
             return true;
         }
-        !matches!(&record.op, DecodedOp::Tie { value, .. } if *value == d)
+        !matches!(&record.op, DecodedOp::Tie { value, .. } if *value == d as u64)
     }
 }
 
@@ -89,7 +89,7 @@ fn hlc_of_note(eng: &Arc<Engine>, v: u32) -> Hlc {
     eng.pending_sync_ops(0)
         .iter()
         .filter_map(|p| enchudb_oplog::oplog::decode_sync_ops_payload(p))
-        .find(|r| matches!(&r.op, DecodedOp::Tie { value, .. } if *value == v))
+        .find(|r| matches!(&r.op, DecodedOp::Tie { value, .. } if *value == v as u64))
         .map(|r| r.hlc)
         .expect("note が ring にある")
 }

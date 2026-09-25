@@ -113,6 +113,23 @@ impl Column {
         self.region.as_atomic_u32(off).load(Ordering::Acquire)
     }
 
+    /// 64 bit 列の cell を Release で書く (`store_u32_release` の 8B 版)。 value_size==8 前提。
+    #[inline]
+    pub fn store_u64_release(&self, entity_id: u32, v: u64) {
+        debug_assert_eq!(self.value_size, 8);
+        let off = HEADER + (entity_id as usize) * 8;
+        self.region.as_atomic_u64(off).store(v, Ordering::Release);
+        self.region.mark_dirty(off, 8);
+    }
+
+    /// 64 bit 列の cell を Acquire で読む。 value_size==8 前提。
+    #[inline]
+    pub fn load_u64_acquire(&self, entity_id: u32) -> u64 {
+        debug_assert_eq!(self.value_size, 8);
+        let off = HEADER + (entity_id as usize) * 8;
+        self.region.as_atomic_u64(off).load(Ordering::Acquire)
+    }
+
     /// 0.8.6: u32 packed value slice。 SIMD 集計 / 全件 scan 用の fast path。
     /// `value_size == 4` (= Number / Tag / Leaf 等の通常 himo) でのみ意味あり。
     /// 戻り値の長さは `count()`、 stored 形式 (= 0 = 未設定、 N = 値 N-1)。
@@ -121,7 +138,8 @@ impl Column {
     /// アライン安全。 LE 前提 (aarch64 / x86_64 等の supported target で OK)。
     #[inline]
     pub fn values_u32(&self) -> &[u32] {
-        debug_assert_eq!(self.value_size, 4, "values_u32 requires value_size == 4");
+        // 64 bit 列を 4B ずつ読むと値が化ける (黙った破損) ので release でも止める
+        assert_eq!(self.value_size, 4, "values_u32 requires value_size == 4");
         let n = self.count() as usize;
         let mm = self.region.slice();
         // SAFETY: HEADER (16) は u32 アラインで、 mmap region は page-aligned。

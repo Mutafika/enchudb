@@ -128,7 +128,7 @@ fn oplog_sync_bridges_every_record_under_scheduling_pressure() {
                 Some(rec) if matches!(
                     rec.op,
                     enchudb_oplog::oplog::DecodedOp::Tie { value, himo_id, .. }
-                        if value == i && himo_id == val_hid
+                        if value == i as u64 && himo_id == val_hid
                 )
             )
         });
@@ -146,7 +146,7 @@ fn oplog_sync_bridges_every_record_under_scheduling_pressure() {
                         Some(rec) if matches!(
                             rec.op,
                             enchudb_oplog::oplog::DecodedOp::Tie { value, himo_id, .. }
-                                if value == i && himo_id == val_hid
+                                if value == i as u64 && himo_id == val_hid
                         )
                     )
                 });
