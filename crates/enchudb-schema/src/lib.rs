@@ -2185,6 +2185,8 @@ enum JoinOn {
     Ref(String),
     /// 左の列 (ref の先でもよい) と右の列の値が等しい。
     Eq(String, String),
+    /// 左の列 (ref の先でもよい) の値が右の 2 つの列の値の間 (両端を含む)。
+    Range(String, String, String),
 }
 
 /// [`Query::join_ref`] / [`Query::join_eq`] の戻り値。 2 つの table の row の組を引く / 購読する。
@@ -2209,6 +2211,8 @@ enum JoinPlan {
     Ref { preds: Vec<enchudb_engine::LivePred>, via: u16, right: Vec<enchudb_engine::LivePred> },
     /// 値で結ぶ: 左の条件と鍵 (ref の道 + 列)、 右の条件と鍵の列。
     Eq { left: Vec<enchudb_engine::LivePred>, path: Vec<u16>, left_key: u16, right: Vec<enchudb_engine::LivePred>, right_key: u16 },
+    /// 範囲で結ぶ: 左の条件と値 (ref の道 + 列)、 右の条件と始点 / 終点の列。
+    Range { left: Vec<enchudb_engine::LivePred>, path: Vec<u16>, left_key: u16, right: Vec<enchudb_engine::LivePred>, lo: u16, hi: u16 },
 }
 
 impl<'a> JoinQuery<'a> {
@@ -2241,6 +2245,17 @@ impl<'a> JoinQuery<'a> {
                 }
                 let (Some(l), Some(r)) = (self.left.live_preds()?, self.right.live_preds()?) else { return Ok(None) };
                 Ok(Some(JoinPlan::Eq { left: l, path, left_key: mine.himo_id, right: r, right_key: theirs.himo_id }))
+            }
+            JoinOn::Range(my, lo, hi) => {
+                let Some((path, mine)) = self.left.resolve_col(my) else { return bad(format!("join_range: unknown column {my}")) };
+                let (Some(lo), Some(hi)) = (self.right.table.col(lo).cloned(), self.right.table.col(hi).cloned()) else {
+                    return bad(format!("join_range: unknown column {lo} / {hi} of {}", self.right.table.name));
+                };
+                if !matches!(mine.ty, ColumnType::Number | ColumnType::BigInt) || lo.ty != mine.ty || hi.ty != mine.ty {
+                    return bad(format!("join_range: {my} and the range columns must all be Number or all be BigInt"));
+                }
+                let (Some(l), Some(r)) = (self.left.live_preds()?, self.right.live_preds()?) else { return Ok(None) };
+                Ok(Some(JoinPlan::Range { left: l, path, left_key: mine.himo_id, right: r, lo: lo.himo_id, hi: hi.himo_id }))
             }
         }
     }
@@ -2319,6 +2334,7 @@ impl<'a> JoinQuery<'a> {
                 let sum_big = sum.is_some_and(|s| s.ty == ColumnType::BigInt);
                 Ok(LiveJoinCounts(JoinCounts::Rows(LiveCounts { inner, eng, ty: cd.ty, sum_big, last: Default::default() })))
             }
+            JoinOn::Range(..) => Err(bad("join subscribe_counts: not supported for join_range yet".into())),
             JoinOn::Eq(my, _) => {
                 if !col.eq_ignore_ascii_case(my) {
                     return Err(bad(format!("join subscribe_counts: a join_eq groups only by its join column {my}")));
@@ -2393,6 +2409,17 @@ impl<'a> JoinQuery<'a> {
                     }
                 }
             }
+            JoinPlan::Range { left, path, left_key, right, lo, hi } => {
+                let mut points: Vec<(u64, EntityId)> =
+                    eng.find_by(left).map_err(io)?.into_iter().filter_map(|a| key(a, &path, left_key).map(|v| (v, a))).collect();
+                points.sort_unstable();
+                for b in eng.find_by(right).map_err(io)? {
+                    if let (Some(l), Some(h)) = (key(b, &[], lo), key(b, &[], hi)) {
+                        let from = points.partition_point(|p| p.0 < l);
+                        out.extend(points[from..].iter().take_while(|p| p.0 <= h).map(|p| (p.1, b)));
+                    }
+                }
+            }
         }
         out.sort_unstable();
         Ok(out)
@@ -2418,6 +2445,12 @@ impl<'a> JoinQuery<'a> {
                 right: eng.subscribe_keyed(right, Vec::new(), right_key).map_err(io)?,
                 state: Default::default(),
             },
+            Some(JoinPlan::Range { left, path, left_key, right, lo, hi }) => JoinLive::Range {
+                left: eng.subscribe_keyed(left, path, left_key).map_err(io)?,
+                lo: eng.subscribe_keyed(right.clone(), Vec::new(), lo).map_err(io)?,
+                hi: eng.subscribe_keyed(right, Vec::new(), hi).map_err(io)?,
+                state: Default::default(),
+            },
         };
         Ok(LiveJoin { inner, eng })
     }
@@ -2435,6 +2468,160 @@ enum JoinLive {
     /// 左の鍵付きの購読 (鍵 = ref 列)、 右の table の全 row の購読 (作り直しを見るだけ)、 ref 列。
     Ref { left: enchudb_engine::LiveKeyed, right: enchudb_engine::LiveQuery, via: u16 },
     Eq { left: enchudb_engine::LiveKeyed, right: enchudb_engine::LiveKeyed, state: std::sync::Mutex<Buckets> },
+    /// 左の値の鍵付きの購読、 右の始点 / 終点の鍵付きの購読。
+    Range { left: enchudb_engine::LiveKeyed, lo: enchudb_engine::LiveKeyed, hi: enchudb_engine::LiveKeyed, state: std::sync::Mutex<RangeState> },
+}
+
+/// 範囲で結ぶ組の区間の索引。 区間 `[lo, hi]` を長さの桁 (`hi - lo` の 2 進の桁数) ごとに、 始点の順に持つ。 値 v を
+/// 含む区間は、 桁 c の区間なら始点が `[v - (2^c - 1), v]` に居るので、 桁ごとに 1 回の範囲引きで見つかる
+/// (範囲に居て v に届かない区間は、 その桁の中で始点が v の手前 2^(c-1) 以内の短いものだけ)。
+#[derive(Default)]
+struct Intervals {
+    /// 桁ごとの (始点, row, 終点)
+    by_len: Vec<std::collections::BTreeSet<(u64, EntityId, u64)>>,
+}
+
+impl Intervals {
+    fn class(lo: u64, hi: u64) -> usize {
+        (u64::BITS - (hi - lo).leading_zeros()) as usize
+    }
+
+    fn insert(&mut self, r: EntityId, lo: u64, hi: u64) {
+        let c = Self::class(lo, hi);
+        if self.by_len.len() <= c {
+            self.by_len.resize_with(c + 1, Default::default);
+        }
+        self.by_len[c].insert((lo, r, hi));
+    }
+
+    fn remove(&mut self, r: EntityId, lo: u64, hi: u64) {
+        if let Some(s) = self.by_len.get_mut(Self::class(lo, hi)) {
+            s.remove(&(lo, r, hi));
+        }
+    }
+
+    /// v を含む区間 (row, 始点, 終点)。
+    fn stab(&self, v: u64, mut f: impl FnMut(EntityId, u64, u64)) {
+        for (c, s) in self.by_len.iter().enumerate() {
+            if s.is_empty() {
+                continue;
+            }
+            let span = if c == 0 { 0 } else { (1u64 << (c - 1).min(63)).saturating_mul(2) - 1 };
+            for &(lo, r, hi) in s.range((v.saturating_sub(span), 0, 0)..=(v, EntityId::MAX, u64::MAX)) {
+                if hi >= v {
+                    f(r, lo, hi);
+                }
+            }
+        }
+    }
+}
+
+/// 右の row の区間の変化: (旧区間, 新区間, 作り直したか)。 区間は (始点, 終点)、 None = 組にならない。
+type IvChange = (Option<(u64, u64)>, Option<(u64, u64)>, bool);
+
+/// 範囲で結ぶ組の状態 (最後に渡した組の元)。
+#[derive(Default)]
+struct RangeState {
+    /// 左の (値, row)
+    points: std::collections::BTreeSet<(u64, EntityId)>,
+    /// 右の row の始点 / 終点 (値のある row)
+    lo_of: std::collections::BTreeMap<EntityId, u64>,
+    hi_of: std::collections::BTreeMap<EntityId, u64>,
+    ivs: Intervals,
+}
+
+impl RangeState {
+    fn iv(&self, r: EntityId) -> Option<(u64, u64)> {
+        match (self.lo_of.get(&r), self.hi_of.get(&r)) {
+            (Some(&lo), Some(&hi)) if lo <= hi => Some((lo, hi)),
+            _ => None,
+        }
+    }
+
+    /// 差分を当てて組の差分を返す。 抜く側は抜く前の相手と、 足す側は足した後の相手と組む (同じ組を 2 度数えない):
+    /// 左の removed × 旧区間 → 旧区間 × (左 − 左の removed) → 左の added × (区間 − 旧区間) → 新区間 × 新しい左。
+    /// 居続ける組 (どちらの row も作り直していなくて、 動く前も後も組になる) は、 それぞれの段で出さない
+    /// (出してから打ち消すと、 まとめた poll で抜く組を全部集合に入れることになる)。
+    fn apply(&mut self, dl: &enchudb_engine::KeyedDelta, dlo: &enchudb_engine::KeyedDelta, dhi: &enchudb_engine::KeyedDelta) -> PairDelta {
+        use std::collections::{BTreeMap, BTreeSet};
+        let within = |iv: Option<(u64, u64)>, v: u64| iv.is_some_and(|(lo, hi)| lo <= v && v <= hi);
+        let mut d = PairDelta::default();
+        // 左: 動く前 / 後の値 (作り直した row は別物 = 居続けない)。 鍵付きの購読の差分は eid の昇順なので二分探索で引く
+        // (まとめた poll では点ごとに引くので、 木より速い)
+        debug_assert!(dl.removed.is_sorted_by_key(|x| x.0) && dl.added.is_sorted_by_key(|x| x.0) && dl.reentered.is_sorted());
+        let find = |xs: &[(EntityId, u64)], a: EntityId| xs.binary_search_by_key(&a, |x| x.0).ok().map(|i| xs[i].1);
+        let reborn = |a: EntityId| dl.reentered.binary_search(&a).is_ok();
+        let old_v = |a: EntityId| find(&dl.removed, a).filter(|_| !reborn(a));
+        let new_v = |a: EntityId| find(&dl.added, a).filter(|_| !reborn(a));
+        // 右: 区間の変わった (か作り直した) row の (旧区間, 新区間, 作り直したか)
+        let rows: BTreeSet<EntityId> = [dlo, dhi].iter().flat_map(|k| k.removed.iter().chain(k.added.iter()).map(|x| x.0)).collect();
+        let reborn_r: BTreeSet<EntityId> = dlo.reentered.iter().chain(dhi.reentered.iter()).copied().collect();
+        let before: Vec<(EntityId, Option<(u64, u64)>)> = rows.iter().map(|&r| (r, self.iv(r))).collect();
+        for (k, map) in [(dlo, &mut self.lo_of), (dhi, &mut self.hi_of)] {
+            for (e, _) in &k.removed {
+                map.remove(e);
+            }
+            for &(e, v) in &k.added {
+                map.insert(e, v);
+            }
+        }
+        let changed: BTreeMap<EntityId, IvChange> = before
+            .into_iter()
+            .map(|(r, old)| (r, (old, self.iv(r), reborn_r.contains(&r))))
+            .filter(|(_, (old, new, re))| old != new || *re)
+            .collect();
+        // 1. 左の removed × 旧区間 (居続ける: 左が動いた先も、 右の今の区間に入る)
+        for &(a, v) in &dl.removed {
+            let nv = new_v(a);
+            self.ivs.stab(v, |r, lo, hi| {
+                let stays = nv.is_some_and(|nv| match changed.get(&r) {
+                    None => lo <= nv && nv <= hi,
+                    Some(&(_, new, re)) => !re && within(new, nv),
+                });
+                if !stays {
+                    d.removed.push((a, r));
+                }
+            });
+            self.points.remove(&(v, a));
+        }
+        // 2. 旧区間 × 残った左 (居続ける: 新区間にも入る)
+        for (&r, &(old, new, re)) in &changed {
+            if let Some((lo, hi)) = old {
+                d.removed.extend(self.points.range((lo, 0)..=(hi, EntityId::MAX)).filter(|&&(v, _)| re || !within(new, v)).map(|&(_, a)| (a, r)));
+                self.ivs.remove(r, lo, hi);
+            }
+        }
+        // 3. 左の added × 変わらない区間 (居続ける: 左が動く前の値も入る)
+        for &(a, v) in &dl.added {
+            self.points.insert((v, a));
+            let ov = old_v(a);
+            self.ivs.stab(v, |r, lo, hi| {
+                if !ov.is_some_and(|ov| lo <= ov && ov <= hi) {
+                    d.added.push((a, r));
+                }
+            });
+        }
+        // 4. 新区間 × 新しい左 (居続ける: 動かなかった左は旧区間にも入る、 動いた左は動く前の値が旧区間に入る)
+        for (&r, &(old, new, re)) in &changed {
+            if let Some((lo, hi)) = new {
+                d.added.extend(
+                    self.points
+                        .range((lo, 0)..=(hi, EntityId::MAX))
+                        .filter(|&&(v, a)| {
+                            re || match find(&dl.added, a) {
+                                // 動かなかった左
+                                None => !within(old, v),
+                                // 作り直した左 / 入ってきた左 (動く前の値なし) / 動いた左
+                                Some(_) => old_v(a).is_none_or(|ov| !within(old, ov)),
+                            }
+                        })
+                        .map(|&(_, a)| (a, r)),
+                );
+                self.ivs.insert(r, lo, hi);
+            }
+        }
+        d
+    }
 }
 
 /// [`JoinQuery::subscribe`] の戻り値。 組の出入りを購読する。
@@ -2510,6 +2697,10 @@ impl LiveJoin {
                         d.added.extend(as_.iter().filter(|&&a| !keep(a, b)).map(|&a| (a, b)));
                     }
                 }
+            }
+            JoinLive::Range { left, lo, hi, state } => {
+                let (dl, dlo, dhi) = (left.poll(&self.eng), lo.poll(&self.eng), hi.poll(&self.eng));
+                d = state.lock().unwrap_or_else(|p| p.into_inner()).apply(&dl, &dlo, &dhi);
             }
         }
         // 並べない (順不同): batch で書いてから poll すると組は右の row ごとの run が入り組み、 並べるだけで
@@ -2753,6 +2944,7 @@ impl<'a> MultiJoin<'a> {
                     };
                     steps.push(StepPlan { parent: p, key_path: Vec::new(), key_himo: cd.himo_id, child_key: None });
                 }
+                JoinOn::Range(..) => return bad("join: join_range is not supported in joins of 3 or more tables yet".into()),
                 JoinOn::Eq(my, their) => {
                     let Some((path, mine)) = parent.resolve_col(my) else { return bad(format!("join: unknown column {my}")) };
                     let Some(theirs) = child.table.col(their).cloned() else { return bad(format!("join: unknown column {their}")) };
@@ -4390,6 +4582,26 @@ impl<'a> Query<'a> {
     /// 1 つの値に両側が大勢いると組は掛け算で増える (街に住人 1 万 × 店 10 = 組 10 万、 店 1 軒の出入りで組 1 万)。
     pub fn join_eq(self, my_col: &str, other: Query<'a>, their_col: &str) -> JoinQuery<'a> {
         JoinQuery { left: self, right: other, on: JoinOn::Eq(my_col.to_string(), their_col.to_string()) }
+    }
+
+    /// この query の row と `other` (別の table への query) の row のうち、 この row の列 `my_col` の値が `other` の
+    /// 列 `lo_col` と `hi_col` の値の間 (両端を含む) にあるものの **組** (範囲で結ぶ JOIN、 SQL の
+    /// `JOIN .. ON a.my_col BETWEEN b.lo_col AND b.hi_col`)。
+    ///
+    /// ```ignore
+    /// // イベントと、 その時刻を含むセッションの組
+    /// let q = events.all().join_range("at", sessions.all(), "start", "end");
+    /// q.find()?;                 // Vec<(イベント, セッション)>
+    /// let live = q.subscribe()?; // イベントの時刻・セッションの始点 / 終点の書き換えで組が出入りする
+    /// ```
+    ///
+    /// - 3 つの列は全部 Number か全部 BigInt (違えば `BadValue`)。 `my_col` は ref の先でもよい (`"company.founded"`)
+    /// - 始点 > 終点の row・値の無い row は組にならない
+    /// - 組の購読は左の値と右の区間を持つ (メモリは両側の結果に比例)。 区間の書き換え 1 回で、 旧区間と新区間に居る
+    ///   左の row の数だけ組が動く (両方に居る row の組は居続ける)
+    /// - `subscribe_counts` / 3 つ以上の table の組 (`then_*`) はまだ (`BadValue`)
+    pub fn join_range(self, my_col: &str, other: Query<'a>, lo_col: &str, hi_col: &str) -> JoinQuery<'a> {
+        JoinQuery { left: self, right: other, on: JoinOn::Range(my_col.to_string(), lo_col.to_string(), hi_col.to_string()) }
     }
 
     /// `sub` (別の table への query) の row のうち、 ref 列 `via_col` でこの row を指しているものが **`n` 個以上**
