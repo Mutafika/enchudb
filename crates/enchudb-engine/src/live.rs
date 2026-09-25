@@ -85,6 +85,13 @@
 //! (社員) への条件」 の組で、 差分は会社の eid、 社員は必要な時に常設の逆引き索引から引く。 会社の
 //! 所在地を 1 個書き換えた時の差分は会社 1 件 (配下が何人でも O(1))、 社員の付け替えは印を付けない。
 //!
+//! # 否定 ([`LivePred::Not`])
+//!
+//! 単一紐の条件の否定は節の値を固定した条件 (`Pred::Not`、 値ごとに別の family)。 値が無い entity も真
+//! (`Not(Present)` = IS NULL)。 route は中身の紐に張るので、 値が外れた (untie) 時の印で真になる。
+//! 否定は索引から候補を引けないので、 登録時の候補 (`walk`) は否定でない条件から引き、 否定だけの
+//! 枝は `dnf` が断る (schema 層は table の代表列の `Present` を足す)。
+//!
 //! # 集計の購読 ([`LiveCounts`])
 //!
 //! 結果を group の列の値ごとに数えた件数の live 版。 group の列を 「値を根まで運ぶ穴」 にする
@@ -209,6 +216,12 @@ pub enum LivePred {
     /// ref 紐 `path` を順にたどった先の entity で `pred` が真。 ref が張られていない / 先の
     /// entity に値が無ければ偽。 `path` の紐は全部 Ref 型であること。
     Via { path: Vec<u16>, pred: Box<LivePred> },
+    /// 単一紐の条件 (`Eq` / `EqText` / `In` / `Range` / `Present`) が偽 — **値が無い entity も真**
+    /// (`Not(Present)` = 値が無い、 `Not(Eq)` = 値が無いか違う)。 ref の先の列には `Via` の中に書く
+    /// (`Via { company, Not(city = 東京) }` = 会社はあって、 その会社の city が東京でない)。
+    /// 否定は候補を引けないので、 枝 (AND) ごとに否定でない条件が 1 つ以上要る。 否定の中身は
+    /// family で束ねない (値ごとに別の family)。
+    Not(Box<LivePred>),
     /// 枝のどれかが真 (各枝は条件の AND)。 `Via` の中にも書ける (`company.city = 東京 OR
     /// company.city = 大阪` = `Via { company, Or([[city = 東京], [city = 大阪]]) }`)。 枝も枝の中の
     /// AND も空は不可。 展開した枝 (AND の OR に直した数) は [`MAX_BRANCHES`] まで。
@@ -237,6 +250,7 @@ impl LivePred {
                 out.extend_from_slice(path);
                 pred.collect_himos(out);
             }
+            LivePred::Not(p) => p.collect_himos(out),
             LivePred::Or(branches) => {
                 for p in branches.iter().flatten() {
                     p.collect_himos(out);
@@ -271,6 +285,27 @@ impl LivePred {
 /// 条件 (AND) を `Or` の無い AND の OR (枝) に展開する。 `Via` の中の `Or` は外に出す
 /// (`Via(p, a OR b)` = `Via(p, a) OR Via(p, b)`)。
 pub(crate) fn dnf(preds: Vec<LivePred>) -> Result<Vec<Vec<LivePred>>, String> {
+    let out = dnf_inner(preds)?;
+    // 否定は候補 (索引から引く entity) を作れないので、 どの枝にも否定でない条件が要る
+    if let Some(b) = out.iter().find(|b| !b.iter().any(LivePred::positive)) {
+        return Err(format!("a branch has only Not conditions ({b:?}) — add a positive condition (e.g. Present)"));
+    }
+    Ok(out)
+}
+
+impl LivePred {
+    /// 否定でない条件を含むか (`Via` の中まで)。
+    fn positive(&self) -> bool {
+        match self {
+            LivePred::Not(_) => false,
+            LivePred::Via { pred, .. } => pred.positive(),
+            LivePred::Or(bs) => bs.iter().all(|b| b.iter().any(LivePred::positive)),
+            _ => true,
+        }
+    }
+}
+
+fn dnf_inner(preds: Vec<LivePred>) -> Result<Vec<Vec<LivePred>>, String> {
     let mut out: Vec<Vec<LivePred>> = vec![Vec::new()];
     for p in preds {
         let alts = alternatives(p)?;
@@ -302,7 +337,7 @@ fn alternatives(p: LivePred) -> Result<Vec<Vec<LivePred>>, String> {
                 if b.is_empty() {
                     return Err("Or with an empty branch".into());
                 }
-                out.extend(dnf(b)?);
+                out.extend(dnf_inner(b)?);
                 if out.len() > MAX_BRANCHES {
                     return Err(format!("Or expands to more than {MAX_BRANCHES} branches"));
                 }
@@ -313,6 +348,12 @@ fn alternatives(p: LivePred) -> Result<Vec<Vec<LivePred>>, String> {
             .into_iter()
             .map(|conj| conj.into_iter().map(|q| LivePred::Via { path: path.clone(), pred: Box::new(q) }).collect())
             .collect(),
+        LivePred::Not(inner) => match *inner {
+            LivePred::Via { .. } | LivePred::Or(_) | LivePred::Not(_) => {
+                return Err("Not wraps a single-column condition (write Via { path, Not(..) } for a column behind a ref)".into());
+            }
+            leaf => vec![vec![LivePred::Not(Box::new(leaf))]],
+        },
         leaf => vec![vec![leaf]],
     })
 }
@@ -1099,13 +1140,25 @@ impl Ivs {
 enum Pred {
     Range(u16, u32, u32),
     Present(u16),
+    /// 値が並びのどれか (昇順・重複なし)。 否定の中身にだけ使う (肯定の `In` は値の穴)。
+    In(u16, Vec<u32>),
+    /// Tag の値が文字列 (vocab に現れたら id を覚える)。 否定の中身にだけ使う。
+    Text(u16, String, std::sync::OnceLock<u32>),
+    /// 中身が偽 (値が無い entity も真)。
+    Not(Box<Pred>),
 }
 
 impl Pred {
     fn himo(&self) -> u16 {
         match self {
-            Pred::Range(h, ..) | Pred::Present(h) => *h,
+            Pred::Range(h, ..) | Pred::Present(h) | Pred::In(h, _) | Pred::Text(h, ..) => *h,
+            Pred::Not(p) => p.himo(),
         }
+    }
+
+    /// 索引から候補を引ける (否定でない) か。
+    fn positive(&self) -> bool {
+        !matches!(self, Pred::Not(_))
     }
 
     #[inline]
@@ -1113,6 +1166,18 @@ impl Pred {
         match self {
             Pred::Range(h, lo, hi) => matches!(r.cell(*h, eid), Some(v) if *lo <= v && v <= *hi),
             Pred::Present(h) => r.cell(*h, eid).is_some(),
+            Pred::In(h, vs) => matches!(r.cell(*h, eid), Some(v) if vs.binary_search(&v).is_ok()),
+            Pred::Text(h, t, id) => {
+                let id = match id.get() {
+                    Some(&x) => x,
+                    None => match r.vocab_lookup(t) {
+                        Some(x) => *id.get_or_init(|| x),
+                        None => return false,
+                    },
+                };
+                r.cell(*h, eid) == Some(id)
+            }
+            Pred::Not(p) => !p.matches(r, eid),
         }
     }
 }
@@ -1186,6 +1251,30 @@ fn flatten(p: LivePred, path: &mut Vec<u16>, out: &mut Vec<Flat>) {
             (vec![0, himo_id as u32], Leaf::Hole(himo_id, HoleVal::Ids(values)))
         }
         LivePred::Present { himo_id } => (vec![3, himo_id as u32], Leaf::Fixed(Pred::Present(himo_id))),
+        // 否定は値を固定した条件 (値ごとに別の family)。 形の符号に中身の値まで入れる
+        LivePred::Not(inner) => {
+            let (tail, p) = match *inner {
+                LivePred::Eq { himo_id, value } => (vec![0, himo_id as u32, value], Pred::In(himo_id, vec![value])),
+                LivePred::In { himo_id, mut values } => {
+                    values.sort_unstable();
+                    values.dedup();
+                    let mut t = vec![0, himo_id as u32];
+                    t.extend_from_slice(&values);
+                    (t, Pred::In(himo_id, values))
+                }
+                LivePred::EqText { himo_id, text } => {
+                    let mut t = vec![1, himo_id as u32, text.len() as u32];
+                    t.extend(text.bytes().map(u32::from));
+                    (t, Pred::Text(himo_id, text, std::sync::OnceLock::new()))
+                }
+                LivePred::Range { himo_id, lo, hi } => (vec![2, himo_id as u32, lo, hi], Pred::Range(himo_id, lo, hi)),
+                LivePred::Present { himo_id } => (vec![3, himo_id as u32], Pred::Present(himo_id)),
+                other => unreachable!("dnf が単一紐の否定だけを通す: {other:?}"),
+            };
+            let mut t = vec![8, tail.len() as u32];
+            t.extend(tail);
+            (t, Leaf::Fixed(Pred::Not(Box::new(p))))
+        }
         LivePred::Or(_) => unreachable!("Or は dnf で枝に展開してから flatten する"),
     };
     let mut sig = Vec::with_capacity(1 + path.len() + tail.len());
@@ -2791,7 +2880,9 @@ impl Family {
                 Some((n, r.pull_range(h, lo, hi)))
             })
             .or_else(|| {
-                self.order.iter().rev().find_map(|&n| self.nodes[n].local.first().map(|p| (n, r.with_himo(p.himo()))))
+                self.order.iter().rev().find_map(|&n| {
+                    self.nodes[n].local.iter().find(|p| p.positive()).map(|p| (n, r.with_himo(p.himo())))
+                })
             });
         let Some((n, ents)) = pick else { return Vec::new() };
         let (_, mut ents) = self.climb(r, n, ents, 0, |_, _| {});
@@ -4041,6 +4132,7 @@ fn matches_leaf(r: &impl CellReader, p: &LivePred, e: u32) -> bool {
         LivePred::Range { himo_id, lo, hi } => matches!(r.cell(*himo_id, e), Some(v) if *lo <= v && v <= *hi),
         LivePred::In { himo_id, values } => matches!(r.cell(*himo_id, e), Some(v) if values.contains(&v)),
         LivePred::Present { himo_id } => r.cell(*himo_id, e).is_some(),
+        LivePred::Not(p) => !matches_leaf(r, p, e),
         LivePred::Via { .. } | LivePred::Or(_) => false,
     }
 }
@@ -4473,6 +4565,37 @@ mod tests {
         write(&reg, &f, 1, 8, Some(1));
         assert_eq!(g.poll_with(&f), vec![(q.id(), LiveDelta { added: vec![8], removed: vec![] })]);
         assert!(q.poll_with(&f).is_empty());
+    }
+
+    /// 否定だけの節からは候補を引かない: 根に条件が無く、 否定だけの節 (ref 0 の先に値が無い) が肯定の節
+    /// (ref 1 の先に値がある) より先に訪れられる形でも、 候補は肯定の節から引く。
+    #[test]
+    fn candidates_come_from_positive_conditions() {
+        // 節を訪れる順は ref の紐の番号で決まるので、 両方の割り当てで
+        for (pos, neg) in [(1u16, 0u16), (0, 1)] {
+            let reg = Arc::new(LiveRegistry::new(0));
+            let f = Mutex::new(Fake::default());
+            // 張る前の中身 (登録時の候補を引く = walk を通る)
+            write(&reg, &f, 2, 10, Some(5)); // 10 は値がある
+            write(&reg, &f, pos, 1, Some(10));
+            write(&reg, &f, neg, 1, Some(20)); // 20 には値が無い
+            let q = reg.register(
+                vec![
+                    LivePred::Via { path: vec![pos], pred: Box::new(LivePred::Present { himo_id: 2 }) },
+                    LivePred::Via { path: vec![neg], pred: Box::new(LivePred::Not(Box::new(LivePred::Present { himo_id: 3 }))) },
+                ],
+                false,
+            );
+            q.seed(&f);
+            assert_eq!(q.poll_with(&f).added, vec![1], "肯定の節 = ref {pos}");
+            write(&reg, &f, 3, 20, Some(7));
+            assert_eq!(q.poll_with(&f).removed, vec![1], "否定の先に値が入ったのに出ない");
+            write(&reg, &f, 3, 20, None);
+            assert_eq!(q.poll_with(&f).added, vec![1], "否定の先の値が外れたのに入らない");
+        }
+        // 否定だけの枝は断る
+        assert!(dnf(vec![LivePred::Not(Box::new(LivePred::Present { himo_id: 3 }))]).is_err());
+        assert!(dnf(vec![LivePred::Not(Box::new(LivePred::Via { path: vec![0], pred: Box::new(LivePred::Present { himo_id: 2 }) }))]).is_err());
     }
 
     /// 束の poll は、 束に入れていない購読 (他の部品が持つもの) の差分を取り出さない — 同じ family の
