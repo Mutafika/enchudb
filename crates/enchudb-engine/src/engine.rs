@@ -11703,6 +11703,44 @@ impl Engine {
         Ok(q)
     }
 
+    /// 条件 `preds` に当てはまる entity を、 ref の道 `key_path` をたどった先の紐 `key_himo` の値 (鍵) と一緒に
+    /// 購読する ([`crate::live::LiveKeyed`])。 差分は `(entity, 鍵)` の出入りで、 集合に居る entity の鍵が変わっても
+    /// 届く (普通の購読は出入りだけ)。 組を返す JOIN の片側。 `Or` は枝が全部同じ形の時だけ。
+    pub fn subscribe_keyed(
+        &self,
+        preds: Vec<crate::live::LivePred>,
+        key_path: Vec<u16>,
+        key_himo: u16,
+    ) -> std::io::Result<crate::live::LiveKeyed> {
+        let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, m.to_string());
+        self.validate_live_preds(&preds)?;
+        if key_himo as usize >= self.himos.len() || key_path.iter().any(|&h| h as usize >= self.himos.len()) {
+            return Err(bad("unknown key himo"));
+        }
+        if key_path.iter().any(|&h| self.value_type_at(h as usize) != Some(ValueType::Ref)) {
+            return Err(bad("key path himo is not a Ref himo"));
+        }
+        let branches = crate::live::dnf(preds).map_err(|m| bad(&m))?;
+        let keys: usize = branches.iter().map(|b| crate::live::key_count(b)).fold(0, usize::saturating_add);
+        if keys > crate::live::MAX_KEYS {
+            return Err(bad("In / Or expand to too many keys"));
+        }
+        let mut refs: Vec<u16> =
+            branches.iter().flatten().flat_map(|p| p.ref_himos()).chain(key_path.iter().copied()).collect();
+        refs.sort_unstable();
+        refs.dedup();
+        for h in refs {
+            let _ = self.himos[h as usize].slice_len(0);
+        }
+        // 登録手順は subscribe と同じ (route → barrier → 初期候補)
+        let q = self.live.register_keyed(branches, (key_path, key_himo)).map_err(|m| bad(&m))?;
+        for h in q.himos() {
+            self.himos[h as usize].write_barrier();
+        }
+        q.seed(self);
+        Ok(q)
+    }
+
     /// 条件 `preds` に当てはまる entity を、 ref の道 `order_path` をたどった先の紐 `order_himo` の
     /// 値で並べた **先頭 `limit` 件** を購読する (live の `ORDER BY .. LIMIT`)。 差分は普通の購読と
     /// 同じく先頭 `limit` 件への出入り、 並びは [`LiveQuery::ranked`](crate::live::LiveQuery::ranked)。
@@ -11788,6 +11826,20 @@ impl Engine {
                 .find(|&h| self.value_type_at(h as usize) != Some(ValueType::Ref))
             {
                 return Err(bad(format!("Via path himo {h} is not a Ref himo")));
+            }
+            if let Some(h) = p
+                .sum_himos()
+                .into_iter()
+                .find(|&h| !matches!(self.value_type_at(h as usize), Some(ValueType::Number | ValueType::Number64)))
+            {
+                return Err(bad(format!("SumAtLeast sums himo {h}, which is not a Number / Number64 himo")));
+            }
+            // 値で結ぶ列は同じ型 (Tag どうしは vocab id が共通)。 Leaf は値ごとに別の id なので結べない
+            for (mine, theirs) in p.value_joins() {
+                let (a, b) = (self.value_type_at(mine as usize), self.value_type_at(theirs as usize));
+                if a != b || a == Some(ValueType::Leaf) {
+                    return Err(bad(format!("ExistsEq joins himo {mine} ({a:?}) with himo {theirs} ({b:?}) — they must have the same non-Leaf type")));
+                }
             }
         }
         Ok(())

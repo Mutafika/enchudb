@@ -2025,6 +2025,78 @@ impl std::fmt::Debug for LiveCounts {
     }
 }
 
+/// [`LiveHaving::poll`] の戻り値。 件数が閾値をまたいだ group の値。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct HavingDelta {
+    /// 件数が閾値以上になった group。
+    pub added: Vec<Value>,
+    /// 件数が閾値未満になった group (0 件になったものも)。 適用順は removed → added。
+    pub removed: Vec<Value>,
+}
+
+/// [`Query::subscribe_having`] の戻り値。 件数が閾値以上の group の集合を購読する (live の `GROUP BY col
+/// HAVING COUNT(*) >= n`)。 drop で購読解除、 `Database` を借用しない。
+pub struct LiveHaving {
+    counts: LiveCounts,
+    th: HavingTh,
+    /// 閾値以上として報告済みの group (engine の値)。
+    have: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+}
+
+/// [`LiveHaving`] の閾値。
+#[derive(Clone, Copy, Debug)]
+enum HavingTh {
+    Count(u64),
+    /// 件数が 1 以上で和が閾値以上。
+    Sum(i128),
+}
+
+impl LiveHaving {
+    fn holds(&self, a: enchudb_engine::Agg) -> bool {
+        match self.th {
+            HavingTh::Count(min) => a.count >= min,
+            HavingTh::Sum(min) => a.count > 0 && self.counts.sum_of(a) >= min,
+        }
+    }
+
+    /// 前回 poll から件数が閾値をまたいだ group。 初回は登録時点で閾値以上の全 group が `added`。
+    /// 積分した集合 = 今閾値以上の group。 書き込み 1 回あたりのコストは group の数によらない。
+    pub fn poll(&self) -> HavingDelta {
+        let mut have = self.have.lock().unwrap_or_else(|p| p.into_inner());
+        let mut d = HavingDelta::default();
+        for (g, a) in self.counts.inner.poll_sums(&self.counts.eng) {
+            let now = self.holds(a);
+            if now && have.insert(g) {
+                d.added.push(self.counts.value(g));
+            } else if !now && have.remove(&g) {
+                d.removed.push(self.counts.value(g));
+            }
+        }
+        d
+    }
+
+    /// 今件数が閾値以上の group。
+    pub fn groups(&self) -> Vec<Value> {
+        self.counts.inner.all_sums(&self.counts.eng).into_iter().filter(|&(_, a)| self.holds(a)).map(|(g, _)| self.counts.value(g)).collect()
+    }
+
+    /// group `value` の今の件数 (閾値未満でも)。
+    pub fn count(&self, value: &Value) -> u64 {
+        self.counts.get(value)
+    }
+
+    /// engine 内で一意な購読 id。
+    pub fn id(&self) -> u64 {
+        self.counts.id()
+    }
+}
+
+impl std::fmt::Debug for LiveHaving {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveHaving").field("th", &self.th).field("counts", &self.counts).finish()
+    }
+}
+
 /// 購読の束 ([`Database::live_group`])。 束を drop しても購読はそのまま (差分は各購読の `poll` で受け取れ、
 /// 他の束に入れ直してもよい)。
 pub struct LiveGroup {
@@ -2106,6 +2178,2568 @@ impl std::fmt::Debug for GroupedLiveQuery {
     }
 }
 
+// ─────────────────────────── JOIN (組) ───────────────────────────
+
+enum JoinOn {
+    /// 左の ref 列が右の row を指す。
+    Ref(String),
+    /// 左の列 (ref の先でもよい) と右の列の値が等しい。
+    Eq(String, String),
+    /// 左の列 (ref の先でもよい) の値が右の 2 つの列の値の間 (両端を含む)。
+    Range(String, String, String),
+}
+
+/// [`Query::join_ref`] / [`Query::join_eq`] の戻り値。 2 つの table の row の組を引く / 購読する。
+pub struct JoinQuery<'a> {
+    left: Query<'a>,
+    right: Query<'a>,
+    on: JoinOn,
+}
+
+/// [`LiveJoin::poll`] の戻り値。 前回 poll からの組の差分 (**順不同**、 同じ組は各リストに高々 1 回)。 適用順は
+/// removed → added。 同じ組が両方に居たら 「消えて、 別物として入り直した」 (削除された row の eid が使い回された)。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PairDelta {
+    pub added: Vec<(EntityId, EntityId)>,
+    pub removed: Vec<(EntityId, EntityId)>,
+}
+
+/// 組の計画: 左右の engine の条件と鍵。
+enum JoinPlan {
+    /// ref で結ぶ: 左の条件 + 右の条件を ref の先に置いたもの、 鍵 = ref 列。 `right` = 右の table の全 row (row の作り直しを
+    /// 見るだけ。 右の条件で購読すると右の列の書き換えのたびに評価が走る)。
+    Ref { preds: Vec<enchudb_engine::LivePred>, via: u16, right: Vec<enchudb_engine::LivePred> },
+    /// 値で結ぶ: 左の条件と鍵 (ref の道 + 列)、 右の条件と鍵の列。
+    Eq { left: Vec<enchudb_engine::LivePred>, path: Vec<u16>, left_key: u16, right: Vec<enchudb_engine::LivePred>, right_key: u16 },
+    /// 範囲で結ぶ: 左の条件と値 (ref の道 + 列)、 右の条件と始点 / 終点の列。
+    Range { left: Vec<enchudb_engine::LivePred>, path: Vec<u16>, left_key: u16, right: Vec<enchudb_engine::LivePred>, lo: u16, hi: u16 },
+}
+
+impl<'a> JoinQuery<'a> {
+    /// 左右の条件を engine の条件に写す。 `None` = 常に 0 組 (未知の値の where_eq など)。
+    fn plan(self) -> Result<Option<JoinPlan>, SchemaError> {
+        let bad = |m: String| Err(SchemaError::BadValue(m));
+        if self.left.limit.is_some() || self.right.limit.is_some() || self.left.order.is_some() || self.right.order.is_some() {
+            return bad("join: limit / order_by are not supported".into());
+        }
+        match &self.on {
+            JoinOn::Ref(col) => {
+                let cd = self.left.table.col(col).cloned();
+                let points = cd.as_ref().is_some_and(|c| c.ty == ColumnType::Ref)
+                    && self.left.table.relations.iter().any(|r| {
+                        r.from_col.eq_ignore_ascii_case(col) && r.to_table.eq_ignore_ascii_case(&self.right.table.name)
+                    });
+                let Some(cd) = cd.filter(|_| points) else {
+                    return bad(format!("join_ref: {col} is not a ref column of {} pointing to {}", self.left.table.name, self.right.table.name));
+                };
+                let all = Query::new(self.right.db, self.right.table.clone());
+                let (Some(mut l), Some(r), Some(rows)) = (self.left.live_preds()?, self.right.live_preds()?, all.live_preds()?) else { return Ok(None) };
+                l.extend(r.into_iter().map(|p| enchudb_engine::LivePred::Via { path: vec![cd.himo_id], pred: Box::new(p) }));
+                Ok(Some(JoinPlan::Ref { preds: l, via: cd.himo_id, right: rows }))
+            }
+            JoinOn::Eq(my, their) => {
+                let Some((path, mine)) = self.left.resolve_col(my) else { return bad(format!("join_eq: unknown column {my}")) };
+                let Some(theirs) = self.right.table.col(their).cloned() else { return bad(format!("join_eq: unknown column {their}")) };
+                if mine.ty != theirs.ty || matches!(mine.ty, ColumnType::Leaf | ColumnType::Ref) {
+                    return bad(format!("join_eq: {my} ({:?}) and {their} ({:?}) must have the same Tag / Number / BigInt type", mine.ty, theirs.ty));
+                }
+                let (Some(l), Some(r)) = (self.left.live_preds()?, self.right.live_preds()?) else { return Ok(None) };
+                Ok(Some(JoinPlan::Eq { left: l, path, left_key: mine.himo_id, right: r, right_key: theirs.himo_id }))
+            }
+            JoinOn::Range(my, lo, hi) => {
+                let Some((path, mine)) = self.left.resolve_col(my) else { return bad(format!("join_range: unknown column {my}")) };
+                let (Some(lo), Some(hi)) = (self.right.table.col(lo).cloned(), self.right.table.col(hi).cloned()) else {
+                    return bad(format!("join_range: unknown column {lo} / {hi} of {}", self.right.table.name));
+                };
+                if !matches!(mine.ty, ColumnType::Number | ColumnType::BigInt) || lo.ty != mine.ty || hi.ty != mine.ty {
+                    return bad(format!("join_range: {my} and the range columns must all be Number or all be BigInt"));
+                }
+                let (Some(l), Some(r)) = (self.left.live_preds()?, self.right.live_preds()?) else { return Ok(None) };
+                Ok(Some(JoinPlan::Range { left: l, path, left_key: mine.himo_id, right: r, lo: lo.himo_id, hi: hi.himo_id }))
+            }
+        }
+    }
+
+    /// この組の table `from` の row と、 その ref 列 `ref_col` が指す `other` の row をさらにつなぐ (3 つ以上の table の
+    /// 組、 [`MultiJoin`])。 `from` は組に居る table の名前。
+    ///
+    /// ```ignore
+    /// // (投稿, 作者, 作者の会社, 会社の街の開いた店)
+    /// let q = posts.all()
+    ///     .join_ref("author", users.all())
+    ///     .then_ref("users", "company", companies.all())
+    ///     .then_eq("companies", "city", shops.where_eq("open", 1i64), "city");
+    /// ```
+    pub fn then_ref(self, from: &str, ref_col: &str, other: Query<'a>) -> MultiJoin<'a> {
+        MultiJoin::from_pair(self).then_ref(from, ref_col, other)
+    }
+
+    /// この組の table `from` の row の列 `my_col` (ref の先でもよい) と、 `other` の列 `their_col` の値が等しい row を
+    /// さらにつなぐ ([`MultiJoin`])。
+    pub fn then_eq(self, from: &str, my_col: &str, other: Query<'a>, their_col: &str) -> MultiJoin<'a> {
+        MultiJoin::from_pair(self).then_eq(from, my_col, other, their_col)
+    }
+
+    /// 組を列 `col` の値ごとに数えた件数を購読する (live の `SELECT col, COUNT(*) FROM a JOIN b .. GROUP BY col`)。
+    /// 戻り値の API は [`LiveCounts`] と同じ (`poll` / `get` / `all` …)。
+    ///
+    /// ```ignore
+    /// // 公開済みの投稿の数を作者の街ごとに (ref の組は左の列で、 右の列も ref をたどって書ける)
+    /// let by_city = posts.where_eq("published", 1i64).join_ref("author", users.all()).subscribe_counts("author.city")?;
+    /// // 住人 × 開いた店の組の数を街ごとに (値の組は結ぶ列でだけ group にできる)
+    /// let per_city = users.all().join_eq("city", shops.where_eq("open", 1i64), "city").subscribe_counts("city")?;
+    /// ```
+    ///
+    /// - `join_ref` の組: `col` は左の table の列 (`"author.city"` のように ref をたどってもよい)。 組は左の row と
+    ///   1 対 1 なので、 左の row を数える集計の購読と同じコスト
+    /// - `join_eq` の組: `col` は結ぶ左の列 (`my_col`) だけ。 件数は鍵ごとの 「左の数 × 右の数」
+    pub fn subscribe_counts(self, col: &str) -> Result<LiveJoinCounts, SchemaError> {
+        self.subscribe_agg(col, None)
+    }
+
+    /// [`subscribe_counts`](Self::subscribe_counts) に加えて組ごとの列 `sum_col` の値の和も持つ (`SUM(sum_col)`)。
+    ///
+    /// - `join_ref`: `sum_col` は左の table の Number / BigInt 列
+    /// - `join_eq`: `sum_col` は左の table の列、 右の列は `"{右の table}.{列}"` (`"shops.rev"`)。 和は鍵ごとに
+    ///   「左の和 × 右の数」 / 「左の数 × 右の和」
+    pub fn subscribe_sums(self, col: &str, sum_col: &str) -> Result<LiveJoinCounts, SchemaError> {
+        self.subscribe_agg(col, Some(sum_col))
+    }
+
+    fn subscribe_agg(self, col: &str, sum_col: Option<&str>) -> Result<LiveJoinCounts, SchemaError> {
+        let bad = |m: String| SchemaError::BadValue(m);
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let eng = self.left.db.arc_engine();
+        let num = |t: &TableInner, c: &str| t.col(c).filter(|c| matches!(c.ty, ColumnType::Number | ColumnType::BigInt)).cloned();
+        match &self.on {
+            JoinOn::Ref(_) => {
+                let (path, cd) = self.left.resolve_col(col).ok_or_else(|| bad(format!("join subscribe_counts: unknown column {col}")))?;
+                if cd.ty == ColumnType::Leaf {
+                    return Err(bad("join subscribe_counts: cannot group by a Leaf column".into()));
+                }
+                let sum = match sum_col {
+                    Some(sc) => Some(num(&self.left.table, sc).ok_or_else(|| {
+                        bad(format!("join subscribe_sums: {sc} is not a Number / BigInt column of {}", self.left.table.name))
+                    })?),
+                    None => None,
+                };
+                let Some(JoinPlan::Ref { preds, .. }) = self.plan()? else {
+                    return Err(bad("join subscribe_counts: the join never matches (unknown value)".into()));
+                };
+                let inner = match &sum {
+                    Some(s) => eng.subscribe_sums(preds, path, cd.himo_id, s.himo_id),
+                    None => eng.subscribe_counts(preds, path, cd.himo_id),
+                }
+                .map_err(io)?;
+                let sum_big = sum.is_some_and(|s| s.ty == ColumnType::BigInt);
+                Ok(LiveJoinCounts(JoinCounts::Rows(LiveCounts { inner, eng, ty: cd.ty, sum_big, last: Default::default() })))
+            }
+            JoinOn::Range(..) => Err(bad("join subscribe_counts: not supported for join_range yet".into())),
+            JoinOn::Eq(my, _) => {
+                if !col.eq_ignore_ascii_case(my) {
+                    return Err(bad(format!("join subscribe_counts: a join_eq groups only by its join column {my}")));
+                }
+                let right_name = self.right.table.name.clone();
+                // 和の列: "{右の table}.{列}" は右、 他は左
+                let side = match sum_col {
+                    None => None,
+                    Some(sc) => match sc.split_once('.').filter(|(t, _)| t.eq_ignore_ascii_case(&right_name)) {
+                        Some((_, c)) => Some((true, num(&self.right.table, c).ok_or_else(|| bad(format!("join subscribe_sums: {sc} is not a Number / BigInt column")))?)),
+                        None => Some((false, num(&self.left.table, sc).ok_or_else(|| bad(format!("join subscribe_sums: {sc} is not a Number / BigInt column")))?)),
+                    },
+                };
+                let ty = self.left.resolve_col(my).map(|(_, c)| c.ty).ok_or_else(|| bad(format!("join_eq: unknown column {my}")))?;
+                let Some(JoinPlan::Eq { left, path, left_key, right, right_key }) = self.plan()? else {
+                    return Err(bad("join subscribe_counts: the join never matches (unknown value)".into()));
+                };
+                let counts = |preds, path, key, sum: Option<&ColumnInner>| -> Result<LiveCounts, SchemaError> {
+                    let inner = match sum {
+                        Some(s) => eng.subscribe_sums(preds, path, key, s.himo_id),
+                        None => eng.subscribe_counts(preds, path, key),
+                    }
+                    .map_err(io)?;
+                    let sum_big = sum.is_some_and(|s| s.ty == ColumnType::BigInt);
+                    Ok(LiveCounts { inner, eng: eng.clone(), ty, sum_big, last: Default::default() })
+                };
+                let lsum = side.as_ref().filter(|s| !s.0).map(|s| &s.1);
+                let rsum = side.as_ref().filter(|s| s.0).map(|s| &s.1);
+                Ok(LiveJoinCounts(JoinCounts::Product {
+                    left: counts(left, path, left_key, lsum)?,
+                    right: counts(right, Vec::new(), right_key, rsum)?,
+                    sum_right: side.as_ref().map(|s| s.0),
+                    last: Default::default(),
+                }))
+            }
+        }
+    }
+
+    /// 今の組 (昇順)。
+    pub fn find(self) -> Result<Vec<(EntityId, EntityId)>, SchemaError> {
+        let eng = self.left.db.arc_engine();
+        let Some(plan) = self.plan()? else { return Ok(Vec::new()) };
+        let peer = eng.peer_id();
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        // entity の鍵 (ref の道をたどった先の列の値)
+        let key = |e: EntityId, path: &[u16], h: u16| -> Option<u64> {
+            let mut cur = e;
+            for &p in path {
+                cur = enchudb_oplog::make_eid(peer, eng.get_by_id(cur, p)? as u32);
+            }
+            eng.get_by_id(cur, h)
+        };
+        let mut out = Vec::new();
+        match plan {
+            JoinPlan::Ref { preds, via, .. } => {
+                for a in eng.find_by(preds).map_err(io)? {
+                    if let Some(k) = key(a, &[], via) {
+                        out.push((a, enchudb_oplog::make_eid(peer, k as u32)));
+                    }
+                }
+            }
+            JoinPlan::Eq { left, path, left_key, right, right_key } => {
+                let mut by_key: std::collections::BTreeMap<u64, Vec<EntityId>> = std::collections::BTreeMap::new();
+                for b in eng.find_by(right).map_err(io)? {
+                    if let Some(k) = key(b, &[], right_key) {
+                        by_key.entry(k).or_default().push(b);
+                    }
+                }
+                for a in eng.find_by(left).map_err(io)? {
+                    if let Some(bs) = key(a, &path, left_key).and_then(|k| by_key.get(&k)) {
+                        out.extend(bs.iter().map(|&b| (a, b)));
+                    }
+                }
+            }
+            JoinPlan::Range { left, path, left_key, right, lo, hi } => {
+                let mut points: Vec<(u64, EntityId)> =
+                    eng.find_by(left).map_err(io)?.into_iter().filter_map(|a| key(a, &path, left_key).map(|v| (v, a))).collect();
+                points.sort_unstable();
+                for b in eng.find_by(right).map_err(io)? {
+                    if let (Some(l), Some(h)) = (key(b, &[], lo), key(b, &[], hi)) {
+                        let from = points.partition_point(|p| p.0 < l);
+                        out.extend(points[from..].iter().take_while(|p| p.0 <= h).map(|p| (p.1, b)));
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        Ok(out)
+    }
+
+    /// 今の組の数。
+    pub fn count(self) -> Result<usize, SchemaError> {
+        Ok(self.find()?.len())
+    }
+
+    /// 組を購読する。 初回 poll は登録時点の全部の組が `added`。 どちらの table の row の出入り・結ぶ列の
+    /// 書き換え (ref の付け替え、 ref の先の値の変化も) でも届く。 drop で購読解除、 `Database` を借用しない。
+    pub fn subscribe(self) -> Result<LiveJoin, SchemaError> {
+        let eng = self.left.db.arc_engine();
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let inner = match self.plan()? {
+            None => JoinLive::Empty,
+            Some(JoinPlan::Ref { preds, via, right }) => {
+                JoinLive::Ref { left: eng.subscribe_keyed(preds, Vec::new(), via).map_err(io)?, right: eng.subscribe(right).map_err(io)?, via }
+            }
+            Some(JoinPlan::Eq { left, path, left_key, right, right_key }) => JoinLive::Eq {
+                left: eng.subscribe_keyed(left, path, left_key).map_err(io)?,
+                right: eng.subscribe_keyed(right, Vec::new(), right_key).map_err(io)?,
+                state: Default::default(),
+            },
+            Some(JoinPlan::Range { left, path, left_key, right, lo, hi }) => JoinLive::Range {
+                left: eng.subscribe_keyed(left, path, left_key).map_err(io)?,
+                lo: eng.subscribe_keyed(right.clone(), Vec::new(), lo).map_err(io)?,
+                hi: eng.subscribe_keyed(right, Vec::new(), hi).map_err(io)?,
+                state: Default::default(),
+            },
+        };
+        Ok(LiveJoin { inner, eng })
+    }
+}
+
+/// 値で結ぶ組の、 鍵ごとの左右の row (最後に渡した組の元)。
+#[derive(Default)]
+struct Buckets {
+    left: std::collections::BTreeMap<u64, std::collections::BTreeSet<EntityId>>,
+    right: std::collections::BTreeMap<u64, std::collections::BTreeSet<EntityId>>,
+}
+
+enum JoinLive {
+    Empty,
+    /// 左の鍵付きの購読 (鍵 = ref 列)、 右の table の全 row の購読 (作り直しを見るだけ)、 ref 列。
+    Ref { left: enchudb_engine::LiveKeyed, right: enchudb_engine::LiveQuery, via: u16 },
+    Eq { left: enchudb_engine::LiveKeyed, right: enchudb_engine::LiveKeyed, state: std::sync::Mutex<Buckets> },
+    /// LAG: group の鍵付きの購読 (None = group なし)、 並びの鍵付きの購読。
+    Lag { part: Option<enchudb_engine::LiveKeyed>, order: enchudb_engine::LiveKeyed, state: std::sync::Mutex<LagState> },
+    /// 左の値の鍵付きの購読、 右の始点 / 終点の鍵付きの購読。
+    Range { left: enchudb_engine::LiveKeyed, lo: enchudb_engine::LiveKeyed, hi: enchudb_engine::LiveKeyed, state: std::sync::Mutex<RangeState> },
+}
+
+/// 範囲で結ぶ組の区間の索引。 区間 `[lo, hi]` を長さの桁 (`hi - lo` の 2 進の桁数) ごとに、 始点の順に持つ。 値 v を
+/// 含む区間は、 桁 c の区間なら始点が `[v - (2^c - 1), v]` に居るので、 桁ごとに 1 回の範囲引きで見つかる
+/// (範囲に居て v に届かない区間は、 その桁の中で始点が v の手前 2^(c-1) 以内の短いものだけ)。
+#[derive(Default)]
+struct Intervals {
+    /// 桁ごとの (始点, row, 終点)
+    by_len: Vec<std::collections::BTreeSet<(u64, EntityId, u64)>>,
+}
+
+impl Intervals {
+    fn class(lo: u64, hi: u64) -> usize {
+        (u64::BITS - (hi - lo).leading_zeros()) as usize
+    }
+
+    fn insert(&mut self, r: EntityId, lo: u64, hi: u64) {
+        let c = Self::class(lo, hi);
+        if self.by_len.len() <= c {
+            self.by_len.resize_with(c + 1, Default::default);
+        }
+        self.by_len[c].insert((lo, r, hi));
+    }
+
+    fn remove(&mut self, r: EntityId, lo: u64, hi: u64) {
+        if let Some(s) = self.by_len.get_mut(Self::class(lo, hi)) {
+            s.remove(&(lo, r, hi));
+        }
+    }
+
+    /// v を含む区間 (row, 始点, 終点)。
+    fn stab(&self, v: u64, mut f: impl FnMut(EntityId, u64, u64)) {
+        for (c, s) in self.by_len.iter().enumerate() {
+            if s.is_empty() {
+                continue;
+            }
+            let span = if c == 0 { 0 } else { (1u64 << (c - 1).min(63)).saturating_mul(2) - 1 };
+            for &(lo, r, hi) in s.range((v.saturating_sub(span), 0, 0)..=(v, EntityId::MAX, u64::MAX)) {
+                if hi >= v {
+                    f(r, lo, hi);
+                }
+            }
+        }
+    }
+}
+
+/// 右の row の区間の変化: (旧区間, 新区間, 作り直したか)。 区間は (始点, 終点)、 None = 組にならない。
+type IvChange = (Option<(u64, u64)>, Option<(u64, u64)>, bool);
+
+/// 範囲で結ぶ組の状態 (最後に渡した組の元)。
+#[derive(Default)]
+struct RangeState {
+    /// 左の (値, row)
+    points: std::collections::BTreeSet<(u64, EntityId)>,
+    ivs: Intervals,
+}
+
+/// 始点 / 終点から区間 (始点 > 終点 / 値の無い row は None)。
+fn interval(lo: Option<u64>, hi: Option<u64>) -> Option<(u64, u64)> {
+    match (lo, hi) {
+        (Some(lo), Some(hi)) if lo <= hi => Some((lo, hi)),
+        _ => None,
+    }
+}
+
+impl RangeState {
+
+    /// 差分を当てて組の差分を返す。 抜く側は抜く前の相手と、 足す側は足した後の相手と組む (同じ組を 2 度数えない):
+    /// 左の removed × 旧区間 → 旧区間 × (左 − 左の removed) → 左の added × (区間 − 旧区間) → 新区間 × 新しい左。
+    /// 居続ける組 (どちらの row も作り直していなくて、 動く前も後も組になる) は、 それぞれの段で出さない
+    /// (出してから打ち消すと、 まとめた poll で抜く組を全部集合に入れることになる)。
+    ///
+    /// 右の row の区間の前後は、 始点 / 終点の鍵付きの購読の差分と渡し済みの鍵 (`now` = 差分に出た row ごとの (始点, 終点)) から。
+    fn apply(
+        &mut self,
+        dl: &enchudb_engine::KeyedDelta,
+        dlo: &enchudb_engine::KeyedDelta,
+        dhi: &enchudb_engine::KeyedDelta,
+        now: &[(EntityId, Option<u64>, Option<u64>)],
+    ) -> PairDelta {
+        use std::collections::{BTreeMap, BTreeSet};
+        let within = |iv: Option<(u64, u64)>, v: u64| iv.is_some_and(|(lo, hi)| lo <= v && v <= hi);
+        let mut d = PairDelta::default();
+        // 左: 動く前 / 後の値 (作り直した row は別物 = 居続けない)。 鍵付きの購読の差分は eid の昇順なので二分探索で引く
+        // (まとめた poll では点ごとに引くので、 木より速い)
+        debug_assert!(dl.removed.is_sorted_by_key(|x| x.0) && dl.added.is_sorted_by_key(|x| x.0) && dl.reentered.is_sorted());
+        let find = |xs: &[(EntityId, u64)], a: EntityId| xs.binary_search_by_key(&a, |x| x.0).ok().map(|i| xs[i].1);
+        let reborn = |a: EntityId| dl.reentered.binary_search(&a).is_ok();
+        let old_v = |a: EntityId| find(&dl.removed, a).filter(|_| !reborn(a));
+        let new_v = |a: EntityId| find(&dl.added, a).filter(|_| !reborn(a));
+        // 右: 区間の変わった (か作り直した) row の (旧区間, 新区間, 作り直したか)
+        let reborn_r: BTreeSet<EntityId> = dlo.reentered.iter().chain(dhi.reentered.iter()).copied().collect();
+        let changed: BTreeMap<EntityId, IvChange> = now
+            .iter()
+            .map(|&(r, lo, hi)| (r, (interval(key_before(dlo, r, lo), key_before(dhi, r, hi)), interval(lo, hi), reborn_r.contains(&r))))
+            .filter(|(_, (old, new, re))| old != new || *re)
+            .collect();
+        // 1. 左の removed × 旧区間 (居続ける: 左が動いた先も、 右の今の区間に入る)
+        for &(a, v) in &dl.removed {
+            let nv = new_v(a);
+            self.ivs.stab(v, |r, lo, hi| {
+                let stays = nv.is_some_and(|nv| match changed.get(&r) {
+                    None => lo <= nv && nv <= hi,
+                    Some(&(_, new, re)) => !re && within(new, nv),
+                });
+                if !stays {
+                    d.removed.push((a, r));
+                }
+            });
+            self.points.remove(&(v, a));
+        }
+        // 2. 旧区間 × 残った左 (居続ける: 新区間にも入る)
+        for (&r, &(old, new, re)) in &changed {
+            if let Some((lo, hi)) = old {
+                d.removed.extend(self.points.range((lo, 0)..=(hi, EntityId::MAX)).filter(|&&(v, _)| re || !within(new, v)).map(|&(_, a)| (a, r)));
+                self.ivs.remove(r, lo, hi);
+            }
+        }
+        // 3. 左の added × 変わらない区間 (居続ける: 左が動く前の値も入る)
+        for &(a, v) in &dl.added {
+            self.points.insert((v, a));
+            let ov = old_v(a);
+            self.ivs.stab(v, |r, lo, hi| {
+                if !ov.is_some_and(|ov| lo <= ov && ov <= hi) {
+                    d.added.push((a, r));
+                }
+            });
+        }
+        // 4. 新区間 × 新しい左 (居続ける: 動かなかった左は旧区間にも入る、 動いた左は動く前の値が旧区間に入る)
+        for (&r, &(old, new, re)) in &changed {
+            if let Some((lo, hi)) = new {
+                d.added.extend(
+                    self.points
+                        .range((lo, 0)..=(hi, EntityId::MAX))
+                        .filter(|&&(v, a)| {
+                            re || match find(&dl.added, a) {
+                                // 動かなかった左
+                                None => !within(old, v),
+                                // 作り直した左 / 入ってきた左 (動く前の値なし) / 動いた左
+                                Some(_) => old_v(a).is_none_or(|ov| !within(old, ov)),
+                            }
+                        })
+                        .map(|&(_, a)| (a, r)),
+                );
+                self.ivs.insert(r, lo, hi);
+            }
+        }
+        d
+    }
+}
+
+/// [`JoinQuery::subscribe`] の戻り値。 組の出入りを購読する。
+///
+/// - ref で結ぶ組は左の row 1 つにつき高々 1 つ: 書き込み 1 回のコストは普通の購読と同じ
+/// - 値で結ぶ組は、 片側の row 1 つの出入り / 鍵の変化で、 同じ鍵のもう片側の row の数だけ組が動く。 左右の
+///   row を鍵ごとに持つ (メモリは両側の結果の大きさに比例)
+pub struct LiveJoin {
+    inner: JoinLive,
+    eng: Arc<Engine>,
+}
+
+impl LiveJoin {
+    /// 前回 poll からの組の差分。
+    pub fn poll(&self) -> PairDelta {
+        let mut d = PairDelta::default();
+        match &self.inner {
+            JoinLive::Empty => {}
+            JoinLive::Ref { left, right, via } => {
+                let peer = self.eng.peer_id();
+                let (kd, dr) = (left.poll(&self.eng), right.poll(&self.eng));
+                // 作り直した右の row (消した row の eid が別の row になった): 左の row は同じ鍵で集合に居続けるので
+                // 鍵付きの購読の差分に出ないが、 組の右は別物 → 居続けた組も出て入り直す
+                let rs: std::collections::BTreeSet<EntityId> = dr.removed.iter().copied().collect();
+                let reborn: Vec<EntityId> = dr.added.iter().copied().filter(|b| rs.contains(b)).collect();
+                if !reborn.is_empty() {
+                    let moved: std::collections::BTreeSet<EntityId> = kd.removed.iter().chain(kd.added.iter()).map(|x| x.0).collect();
+                    for b in reborn {
+                        let k = enchudb_oplog::eid_local(b);
+                        for a in self.eng.query_by_id(&[(*via, k)]) {
+                            if !moved.contains(&a) && left.reported_key(a) == Some(k as u64) {
+                                d.removed.push((a, b));
+                                d.added.push((a, b));
+                            }
+                        }
+                    }
+                }
+                let pair = |(a, k): (EntityId, u64)| (a, enchudb_oplog::make_eid(peer, k as u32));
+                d.removed.extend(kd.removed.into_iter().map(pair));
+                d.added.extend(kd.added.into_iter().map(pair));
+            }
+            JoinLive::Eq { left, right, state } => {
+                let (dl, dr) = (left.poll(&self.eng), right.poll(&self.eng));
+                let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
+                let Buckets { left: lb, right: rb } = &mut *st;
+                // 左右が同じ鍵から同じ鍵へ一緒に移った組 (居続けている = 出さない)
+                let kept = kept_pairs(&dl, &dr);
+                let keep = |a: EntityId, b: EntityId| !kept.is_empty() && kept.contains(&(a, b));
+                // 抜く側は抜く前の相手と、 足す側は足した後の相手と組む (同じ組を 2 度数えない):
+                // 左の removed × 旧右 → 右の removed × (左 − 左の removed) → 左の added × (右 − 右の removed) →
+                // 右の added × 新左
+                for &(a, k) in &dl.removed {
+                    if let Some(bs) = rb.get(&k) {
+                        d.removed.extend(bs.iter().filter(|&&b| !keep(a, b)).map(|&b| (a, b)));
+                    }
+                    take(lb, k, a);
+                }
+                for &(b, k) in &dr.removed {
+                    if let Some(as_) = lb.get(&k) {
+                        d.removed.extend(as_.iter().filter(|&&a| !keep(a, b)).map(|&a| (a, b)));
+                    }
+                    take(rb, k, b);
+                }
+                for &(a, k) in &dl.added {
+                    lb.entry(k).or_default().insert(a);
+                    if let Some(bs) = rb.get(&k) {
+                        d.added.extend(bs.iter().filter(|&&b| !keep(a, b)).map(|&b| (a, b)));
+                    }
+                }
+                for &(b, k) in &dr.added {
+                    rb.entry(k).or_default().insert(b);
+                    if let Some(as_) = lb.get(&k) {
+                        d.added.extend(as_.iter().filter(|&&a| !keep(a, b)).map(|&a| (a, b)));
+                    }
+                }
+            }
+            JoinLive::Lag { part, order, state } => {
+                let dp = part.as_ref().map(|q| q.poll(&self.eng));
+                let dord = order.poll(&self.eng);
+                let mut rows: Vec<EntityId> =
+                    dp.iter().chain(std::iter::once(&dord)).flat_map(|k| k.removed.iter().chain(k.added.iter()).map(|x| x.0)).collect();
+                rows.sort_unstable();
+                rows.dedup();
+                let ps = match part {
+                    Some(q) => q.reported_keys(&rows),
+                    None => vec![Some(0); rows.len()],
+                };
+                let os = order.reported_keys(&rows);
+                let now: Vec<(EntityId, Option<u64>, Option<u64>)> = rows.iter().enumerate().map(|(i, &r)| (r, ps[i], os[i])).collect();
+                d = state.lock().unwrap_or_else(|p| p.into_inner()).apply(dp.as_ref(), &dord, &now);
+            }
+            JoinLive::Range { left, lo, hi, state } => {
+                let (dl, dlo, dhi) = (left.poll(&self.eng), lo.poll(&self.eng), hi.poll(&self.eng));
+                let mut rows: Vec<EntityId> = [&dlo, &dhi].iter().flat_map(|k| k.removed.iter().chain(k.added.iter()).map(|x| x.0)).collect();
+                rows.sort_unstable();
+                rows.dedup();
+                let (los, his) = (lo.reported_keys(&rows), hi.reported_keys(&rows));
+                let now: Vec<(EntityId, Option<u64>, Option<u64>)> = rows.iter().enumerate().map(|(i, &r)| (r, los[i], his[i])).collect();
+                d = state.lock().unwrap_or_else(|p| p.into_inner()).apply(&dl, &dlo, &dhi, &now);
+            }
+        }
+        // 並べない (順不同): batch で書いてから poll すると組は右の row ごとの run が入り組み、 並べるだけで
+        // poll の半分を使う。 積むのに順は要らない
+        d
+    }
+}
+
+/// 左右の row が同じ poll の中で同じ鍵から同じ鍵へ一緒に移った組 (旧鍵の組を抜いて新鍵の組を足す形になるが、
+/// 組は居続けている)。 移った row = `removed` と `added` の両方に居て入り直していない row。 入り直した row
+/// (eid の使い回し) の組は別物なので含めない。
+fn kept_pairs(dl: &enchudb_engine::KeyedDelta, dr: &enchudb_engine::KeyedDelta) -> std::collections::BTreeSet<(EntityId, EntityId)> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut out = BTreeSet::new();
+    // row → (旧鍵, 新鍵)
+    let moves = |k: &enchudb_engine::KeyedDelta| -> BTreeMap<EntityId, (u64, u64)> {
+        if k.removed.is_empty() || k.added.is_empty() {
+            return BTreeMap::new();
+        }
+        let re: BTreeSet<EntityId> = k.reentered.iter().copied().collect();
+        let old: BTreeMap<EntityId, u64> = k.removed.iter().copied().collect();
+        k.added.iter().filter(|(e, _)| !re.contains(e)).filter_map(|&(e, n)| old.get(&e).map(|&o| (e, (o, n)))).collect()
+    };
+    let ml = moves(dl);
+    if ml.is_empty() {
+        return out;
+    }
+    let mut by_move: BTreeMap<(u64, u64), Vec<EntityId>> = BTreeMap::new();
+    for (b, m) in moves(dr) {
+        by_move.entry(m).or_default().push(b);
+    }
+    for (a, m) in ml {
+        if let Some(bs) = by_move.get(&m) {
+            out.extend(bs.iter().map(|&b| (a, b)));
+        }
+    }
+    out
+}
+
+/// 鍵 `k` の組から `e` を抜く (空になった鍵は消す)。
+fn take(m: &mut std::collections::BTreeMap<u64, std::collections::BTreeSet<EntityId>>, k: u64, e: EntityId) {
+    if let Some(s) = m.get_mut(&k) {
+        s.remove(&e);
+        if s.is_empty() {
+            m.remove(&k);
+        }
+    }
+}
+
+/// [`JoinQuery::subscribe_counts`] / [`JoinQuery::subscribe_sums`] の戻り値。 組を group ごとに数えた件数 (と和)
+/// を購読する。 API は [`LiveCounts`] と同じ。
+pub struct LiveJoinCounts(JoinCounts);
+
+enum JoinCounts {
+    /// ref の組 = 左の row の集計。
+    Rows(LiveCounts),
+    /// 値の組 = 鍵ごとの左右の集計の積。
+    Product {
+        left: LiveCounts,
+        right: LiveCounts,
+        /// 和の列が右 (true) / 左 (false) / 和なし (None)。
+        sum_right: Option<bool>,
+        /// 鍵ごとに最後に渡した (件数, 和)。
+        last: std::sync::Mutex<std::collections::BTreeMap<u64, (u64, i128)>>,
+    },
+}
+
+impl LiveJoinCounts {
+    /// 鍵 `k` の今の組の (件数, 和)。
+    fn product(left: &LiveCounts, right: &LiveCounts, sum_right: Option<bool>, k: u64) -> (u64, i128) {
+        let (l, r) = (left.inner.get_agg(&left.eng, k), right.inner.get_agg(&right.eng, k));
+        let n = l.count * r.count;
+        let sum = match sum_right {
+            None => 0,
+            Some(false) => left.sum_of(l) * r.count as i128,
+            Some(true) => l.count as i128 * right.sum_of(r),
+        };
+        (n, sum)
+    }
+
+    /// 前回 poll から件数か和が変わった group と今の (件数, 和) (件数 0 = group が消えた)。 積分 = 値で上書き。
+    pub fn poll_sums(&self) -> Vec<(Value, u64, i128)> {
+        match &self.0 {
+            JoinCounts::Rows(c) => c.poll_sums(),
+            JoinCounts::Product { left, right, sum_right, last } => {
+                let mut last = last.lock().unwrap_or_else(|p| p.into_inner());
+                let mut keys: Vec<u64> = left.inner.poll_sums(&left.eng).into_iter().map(|x| x.0).collect();
+                keys.extend(right.inner.poll_sums(&right.eng).into_iter().map(|x| x.0));
+                keys.sort_unstable();
+                keys.dedup();
+                let mut out = Vec::new();
+                for k in keys {
+                    let now = Self::product(left, right, *sum_right, k);
+                    let changed = if now.0 == 0 { last.remove(&k).is_some() } else { last.insert(k, now) != Some(now) };
+                    if changed {
+                        out.push((left.value(k), now.0, now.1));
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// `poll_sums` の件数だけの版 (報告状態を共有する)。
+    pub fn poll(&self) -> Vec<(Value, u64)> {
+        self.poll_sums().into_iter().map(|(v, n, _)| (v, n)).collect()
+    }
+
+    /// 今の全 group と (件数, 和)。
+    pub fn all_sums(&self) -> Vec<(Value, u64, i128)> {
+        match &self.0 {
+            JoinCounts::Rows(c) => c.all_sums(),
+            JoinCounts::Product { left, right, sum_right, .. } => left
+                .inner
+                .all_sums(&left.eng)
+                .into_iter()
+                .filter_map(|(k, _)| {
+                    let (n, sum) = Self::product(left, right, *sum_right, k);
+                    (n > 0).then(|| (left.value(k), n, sum))
+                })
+                .collect(),
+        }
+    }
+
+    /// 今の全 group と件数。
+    pub fn all(&self) -> Vec<(Value, u64)> {
+        self.all_sums().into_iter().map(|(v, n, _)| (v, n)).collect()
+    }
+
+    /// group `value` の今の件数。
+    pub fn get(&self, value: &Value) -> u64 {
+        match &self.0 {
+            JoinCounts::Rows(c) => c.get(value),
+            JoinCounts::Product { left, right, sum_right, .. } => {
+                left.raw(value).map_or(0, |k| Self::product(left, right, *sum_right, k).0)
+            }
+        }
+    }
+
+    /// group `value` の今の和。
+    pub fn get_sum(&self, value: &Value) -> i128 {
+        match &self.0 {
+            JoinCounts::Rows(c) => c.get_sum(value),
+            JoinCounts::Product { left, right, sum_right, .. } => {
+                left.raw(value).map_or(0, |k| Self::product(left, right, *sum_right, k).1)
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for LiveJoinCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveJoinCounts").finish_non_exhaustive()
+    }
+}
+
+// ─────────────────────────── 3 つ以上の table の組 ───────────────────────────
+
+/// 組の 1 つの段: 組に居る table (`parent` 番目) の row に、 新しい table の row をつなぐ。
+struct Edge {
+    /// つなぐ先の組の位置 (None = `from` の table が組に居ない)。
+    parent: Option<usize>,
+    on: JoinOn,
+}
+
+/// [`JoinQuery::then_ref`] / [`JoinQuery::then_eq`] の戻り値。 3 つ以上の table の row の組 (tuple) を引く / 購読する。
+/// 組の並びは table をつないだ順 (最初の 2 つ、 then_* で足した順)。
+pub struct MultiJoin<'a> {
+    comps: Vec<Query<'a>>,
+    edges: Vec<Edge>,
+}
+
+/// [`LiveMultiJoin::poll`] の戻り値。 前回 poll からの組の差分 (**順不同**)。 適用順は removed → added。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TupleDelta {
+    pub added: Vec<Vec<EntityId>>,
+    pub removed: Vec<Vec<EntityId>>,
+}
+
+/// 段の計画: 親の row の鍵 (ref の道, 列) と、 子の鍵 (None = 子の eid そのもの = ref で指される、 Some = 子の列)。
+struct StepPlan {
+    parent: usize,
+    key_path: Vec<u16>,
+    key_himo: u16,
+    child_key: Option<u16>,
+}
+
+/// (各 table の条件, 段の計画)。
+type MultiPlan = (Vec<Vec<enchudb_engine::LivePred>>, Vec<StepPlan>);
+
+impl<'a> MultiJoin<'a> {
+    fn from_pair(j: JoinQuery<'a>) -> Self {
+        MultiJoin { comps: vec![j.left, j.right], edges: vec![Edge { parent: Some(0), on: j.on }] }
+    }
+
+    fn comp(&self, table: &str) -> Option<usize> {
+        let mut hits = self.comps.iter().enumerate().filter(|(_, q)| q.table.name.eq_ignore_ascii_case(table)).map(|(i, _)| i);
+        let first = hits.next();
+        // 同じ table が 2 度居たら どちらか決められない
+        if hits.next().is_some() { None } else { first }
+    }
+
+    /// 組の table `from` の row の ref 列 `ref_col` が指す `other` の row をつなぐ。
+    pub fn then_ref(mut self, from: &str, ref_col: &str, other: Query<'a>) -> Self {
+        let parent = self.comp(from);
+        self.comps.push(other);
+        self.edges.push(Edge { parent, on: JoinOn::Ref(ref_col.to_string()) });
+        self
+    }
+
+    /// 組の table `from` の row の列 `my_col` と `other` の列 `their_col` の値が等しい row をつなぐ。
+    pub fn then_eq(mut self, from: &str, my_col: &str, other: Query<'a>, their_col: &str) -> Self {
+        let parent = self.comp(from);
+        self.comps.push(other);
+        self.edges.push(Edge { parent, on: JoinOn::Eq(my_col.to_string(), their_col.to_string()) });
+        self
+    }
+
+    /// 各 table の条件と段の計画。 `None` = 常に 0 組。
+    fn plan(self) -> Result<Option<MultiPlan>, SchemaError> {
+        let bad = |m: String| Err(SchemaError::BadValue(m));
+        if self.comps.iter().any(|q| q.limit.is_some() || q.order.is_some()) {
+            return bad("join: limit / order_by are not supported".into());
+        }
+        let mut steps = Vec::new();
+        for (k, e) in self.edges.iter().enumerate() {
+            let child = &self.comps[k + 1];
+            let Some(p) = e.parent.filter(|&p| p <= k) else {
+                return bad(format!("join: the table to join from is not (uniquely) in the tuple (step {})", k + 1));
+            };
+            let parent = &self.comps[p];
+            match &e.on {
+                JoinOn::Ref(col) => {
+                    let cd = parent.table.col(col).cloned();
+                    let points = cd.as_ref().is_some_and(|c| c.ty == ColumnType::Ref)
+                        && parent.table.relations.iter().any(|r| {
+                            r.from_col.eq_ignore_ascii_case(col) && r.to_table.eq_ignore_ascii_case(&child.table.name)
+                        });
+                    let Some(cd) = cd.filter(|_| points) else {
+                        return bad(format!("join: {col} is not a ref column of {} pointing to {}", parent.table.name, child.table.name));
+                    };
+                    steps.push(StepPlan { parent: p, key_path: Vec::new(), key_himo: cd.himo_id, child_key: None });
+                }
+                JoinOn::Range(..) => return bad("join: join_range is not supported in joins of 3 or more tables yet".into()),
+                JoinOn::Eq(my, their) => {
+                    let Some((path, mine)) = parent.resolve_col(my) else { return bad(format!("join: unknown column {my}")) };
+                    let Some(theirs) = child.table.col(their).cloned() else { return bad(format!("join: unknown column {their}")) };
+                    if mine.ty != theirs.ty || matches!(mine.ty, ColumnType::Leaf | ColumnType::Ref) {
+                        return bad(format!("join: {my} ({:?}) and {their} ({:?}) must have the same Tag / Number / BigInt type", mine.ty, theirs.ty));
+                    }
+                    steps.push(StepPlan { parent: p, key_path: path, key_himo: mine.himo_id, child_key: Some(theirs.himo_id) });
+                }
+            }
+        }
+        let mut preds = Vec::with_capacity(self.comps.len());
+        for q in self.comps {
+            match q.live_preds()? {
+                Some(p) => preds.push(p),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some((preds, steps)))
+    }
+
+    /// 今の組 (昇順)。
+    pub fn find(self) -> Result<Vec<Vec<EntityId>>, SchemaError> {
+        let eng = self.comps[0].db.arc_engine();
+        let Some((preds, steps)) = self.plan()? else { return Ok(Vec::new()) };
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let peer = eng.peer_id();
+        let key = |e: EntityId, path: &[u16], h: u16| -> Option<u64> {
+            let mut cur = e;
+            for &p in path {
+                cur = enchudb_oplog::make_eid(peer, eng.get_by_id(cur, p)? as u32);
+            }
+            eng.get_by_id(cur, h)
+        };
+        let mut rows = Vec::with_capacity(preds.len());
+        for p in preds {
+            rows.push(eng.find_by(p).map_err(io)?);
+        }
+        let mut tuples: Vec<Vec<EntityId>> = rows[0].iter().map(|&e| vec![e]).collect();
+        for (k, st) in steps.iter().enumerate() {
+            let mut by_key: std::collections::BTreeMap<u64, Vec<EntityId>> = std::collections::BTreeMap::new();
+            for &c in &rows[k + 1] {
+                let kk = match st.child_key {
+                    None => Some(enchudb_oplog::eid_local(c) as u64),
+                    Some(h) => key(c, &[], h),
+                };
+                if let Some(kk) = kk {
+                    by_key.entry(kk).or_default().push(c);
+                }
+            }
+            let mut next = Vec::new();
+            for t in tuples {
+                if let Some(cs) = key(t[st.parent], &st.key_path, st.key_himo).and_then(|kk| by_key.get(&kk)) {
+                    for &c in cs {
+                        let mut u = t.clone();
+                        u.push(c);
+                        next.push(u);
+                    }
+                }
+            }
+            tuples = next;
+        }
+        tuples.sort_unstable();
+        Ok(tuples)
+    }
+
+    /// 今の組の数。
+    pub fn count(self) -> Result<usize, SchemaError> {
+        Ok(self.find()?.len())
+    }
+
+    /// 組を購読する。 初回 poll は登録時点の全部の組が `added`。 どの table の row の出入り・つなぐ列の書き換え
+    /// (ref の付け替え、 ref の先の値の変化も) でも届く。 drop で購読解除、 `Database` を借用しない。
+    ///
+    /// 段ごとに、 親の row の鍵を鍵付きの購読で、 子の row を購読で追い、 前の段の組を親の row の今の鍵で束ねて子と
+    /// 組む (差分の JOIN: 抜く側は抜く前の相手と、 足す側は足した後の相手と)。 メモリは各段の組の数に比例。
+    pub fn subscribe(self) -> Result<LiveMultiJoin, SchemaError> {
+        let eng = self.comps[0].db.arc_engine();
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let Some((preds, steps)) = self.plan()? else {
+            return Ok(LiveMultiJoin { eng, root: None, steps: Vec::new(), state: Default::default() });
+        };
+        let root = eng.subscribe(preds[0].clone()).map_err(io)?;
+        let mut live = Vec::with_capacity(steps.len());
+        for (k, st) in steps.into_iter().enumerate() {
+            let parent_key = eng.subscribe_keyed(preds[st.parent].clone(), st.key_path, st.key_himo).map_err(io)?;
+            let child = match st.child_key {
+                None => ChildStream::Rows(eng.subscribe(preds[k + 1].clone()).map_err(io)?),
+                Some(h) => ChildStream::Keyed(eng.subscribe_keyed(preds[k + 1].clone(), Vec::new(), h).map_err(io)?),
+            };
+            live.push(LiveStep { parent: st.parent, parent_key, child });
+        }
+        let n = live.len();
+        let state = ((0..=n).map(|_| Arena::default()).collect(), (0..n).map(|_| StepState::default()).collect());
+        Ok(LiveMultiJoin { eng, root: Some(root), steps: live, state: std::sync::Mutex::new(state) })
+    }
+}
+
+/// 段の子の row の流れ。
+enum ChildStream {
+    /// ref で指される子: 出入りだけ (鍵 = 子の local eid)。
+    Rows(enchudb_engine::LiveQuery),
+    /// 値でつなぐ子: 鍵付き。
+    Keyed(enchudb_engine::LiveKeyed),
+}
+
+struct LiveStep {
+    parent: usize,
+    parent_key: enchudb_engine::LiveKeyed,
+    child: ChildStream,
+}
+
+/// 組の段ごとの置き場。 段 k の組 = (段 k-1 の組の番号, 足した row) を 1 回だけ持ち、 番号で指す (組を複製しない)。
+/// 消えた組の番号は poll が終わってから空ける (同じ poll の後の段がまだ組の中身を読む)。
+#[derive(Default)]
+struct Arena {
+    prev: Vec<u32>,
+    row: Vec<EntityId>,
+    free: Vec<u32>,
+    /// (段 k-1 の組の番号, row) を 1 つの u128 に詰めた鍵 → 番号 (比較 1 回で済む)。
+    index: std::collections::BTreeMap<u128, u32>,
+    /// この poll で消えた番号 (poll の終わりに `free` へ)。
+    dead: Vec<u32>,
+}
+
+#[inline]
+fn pack(prev: u32, row: EntityId) -> u128 {
+    ((prev as u128) << 64) | row as u128
+}
+
+/// 段 0 の組の 「前の段の組」 の番号。
+const ROOT: u32 = u32::MAX;
+
+impl Arena {
+    fn alloc(&mut self, prev: u32, row: EntityId) -> u32 {
+        let id = match self.free.pop() {
+            Some(i) => {
+                self.prev[i as usize] = prev;
+                self.row[i as usize] = row;
+                i
+            }
+            None => {
+                self.prev.push(prev);
+                self.row.push(row);
+                (self.prev.len() - 1) as u32
+            }
+        };
+        self.index.insert(pack(prev, row), id);
+        id
+    }
+
+    /// 組 (prev, row) を消す (番号は poll の終わりまで読める)。
+    fn kill(&mut self, prev: u32, row: EntityId) -> Option<u32> {
+        let id = self.index.remove(&pack(prev, row))?;
+        self.dead.push(id);
+        Some(id)
+    }
+}
+
+/// 段 `level` の組 `id` の位置 `pos` の row。
+fn row_at(arenas: &[Arena], mut level: usize, mut id: u32, pos: usize) -> EntityId {
+    while level > pos {
+        id = arenas[level].prev[id as usize];
+        level -= 1;
+    }
+    arenas[level].row[id as usize]
+}
+
+/// 段 `level` の組 `id` の中身。
+fn tuple_at(arenas: &[Arena], level: usize, id: u32) -> Vec<EntityId> {
+    (0..=level).map(|pos| row_at(arenas, level, id, pos)).collect()
+}
+
+/// 段の状態 (最後に渡した組の元)。 集合は (鍵, 番号) の組を 1 本の木で持つ (鍵ごとの小さな木を作らない)。
+#[derive(Default)]
+struct StepState {
+    /// (親の row, 前の段の組の番号)。
+    by_row: std::collections::BTreeSet<(EntityId, u32)>,
+    /// 親の row の鍵。
+    pkey: std::collections::BTreeMap<EntityId, u64>,
+    /// (鍵, 前の段の組の番号) (親の row に鍵のある組)。
+    kl: std::collections::BTreeSet<(u64, u32)>,
+    /// (鍵, 子の row)。
+    right: std::collections::BTreeSet<(u64, EntityId)>,
+}
+
+/// 組の番号の差分。
+#[derive(Default)]
+struct IdDelta {
+    removed: Vec<u32>,
+    added: Vec<u32>,
+}
+
+/// 鍵付きの差分 (組の番号 / row → 鍵) と、 入り直したもの。
+struct Keyed<T> {
+    removed: Vec<(T, u64)>,
+    added: Vec<(T, u64)>,
+    reentered: std::collections::BTreeSet<T>,
+}
+
+/// [`MultiJoin::subscribe`] の戻り値。 3 つ以上の table の組の出入りを購読する。
+pub struct LiveMultiJoin {
+    eng: Arc<Engine>,
+    root: Option<enchudb_engine::LiveQuery>,
+    steps: Vec<LiveStep>,
+    state: std::sync::Mutex<(Vec<Arena>, Vec<StepState>)>,
+}
+
+impl LiveMultiJoin {
+    /// 前回 poll からの組の差分。
+    pub fn poll(&self) -> TupleDelta {
+        let Some(root) = &self.root else { return TupleDelta::default() };
+        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let (arenas, states) = &mut *guard;
+        let d0 = root.poll(&self.eng);
+        let mut d = IdDelta::default();
+        // 段 0: row そのもの (消えて入り直した row は別の番号になる)
+        for e in d0.removed {
+            d.removed.extend(arenas[0].kill(ROOT, e));
+        }
+        for e in d0.added {
+            d.added.push(arenas[0].alloc(ROOT, e));
+        }
+        for (k, (step, st)) in self.steps.iter().zip(states.iter_mut()).enumerate() {
+            let (done, rest) = arenas.split_at_mut(k + 1);
+            d = step.step(&self.eng, st, done, &mut rest[0], d);
+        }
+        let last = arenas.len() - 1;
+        let out = TupleDelta {
+            removed: d.removed.iter().map(|&id| tuple_at(arenas, last, id)).collect(),
+            added: d.added.iter().map(|&id| tuple_at(arenas, last, id)).collect(),
+        };
+        for a in arenas.iter_mut() {
+            let dead = std::mem::take(&mut a.dead);
+            a.free.extend(dead);
+        }
+        out
+    }
+}
+
+impl LiveStep {
+    /// 段 k (前の段 = `prev[k]`、 新しい段 = `next`) の差分。
+    fn step(&self, eng: &Engine, st: &mut StepState, prev: &[Arena], next: &mut Arena, dleft: IdDelta) -> IdDelta {
+        use std::collections::BTreeSet;
+        let (p, lv) = (self.parent, prev.len() - 1);
+        let row = |t: u32| row_at(prev, lv, t, p);
+        let dp = self.parent_key.poll(eng);
+        let dc: Keyed<EntityId> = match &self.child {
+            ChildStream::Rows(q) => {
+                let d = q.poll(eng);
+                let key = |e: EntityId| enchudb_oplog::eid_local(e) as u64;
+                let rs: BTreeSet<EntityId> = d.removed.iter().copied().collect();
+                Keyed {
+                    reentered: d.added.iter().copied().filter(|e| rs.contains(e)).collect(),
+                    removed: d.removed.into_iter().map(|e| (e, key(e))).collect(),
+                    added: d.added.into_iter().map(|e| (e, key(e))).collect(),
+                }
+            }
+            ChildStream::Keyed(q) => {
+                let d = q.poll(eng);
+                Keyed { reentered: d.reentered.into_iter().collect(), removed: d.removed, added: d.added }
+            }
+        };
+        // ── 前の段の組の鍵付きの差分 (組の出入り + 親の row の鍵の変化)。 番号は出入りのたびに新しいので、 同じ番号が
+        // removed と added の両方に来ることは無い (入り直した組は別の番号)
+        let gone: BTreeSet<u32> = dleft.removed.iter().copied().collect();
+        let born: BTreeSet<u32> = dleft.added.iter().copied().collect();
+        let mut affected: BTreeSet<u32> = gone.union(&born).copied().collect();
+        for r in dp.removed.iter().chain(dp.added.iter()).map(|x| x.0) {
+            affected.extend(st.by_row.range((r, 0)..=(r, u32::MAX)).map(|x| x.1));
+        }
+        // 親の row が入り直した (eid の使い回し) なら、 その row を含む組は別物
+        let re_rows: BTreeSet<EntityId> = dp.reentered.iter().copied().collect();
+        let old: Vec<(u32, EntityId, Option<u64>)> = affected
+            .iter()
+            .map(|&t| {
+                let r = row(t);
+                (t, r, if born.contains(&t) { None } else { st.pkey.get(&r).copied() })
+            })
+            .collect();
+        for &t in &dleft.removed {
+            st.by_row.remove(&(row(t), t));
+        }
+        for &t in &dleft.added {
+            st.by_row.insert((row(t), t));
+        }
+        for (r, _) in &dp.removed {
+            st.pkey.remove(r);
+        }
+        for &(r, k) in &dp.added {
+            st.pkey.insert(r, k);
+        }
+        let mut dl: Keyed<u32> = Keyed { removed: Vec::new(), added: Vec::new(), reentered: BTreeSet::new() };
+        for (t, r, was) in old {
+            let now = if gone.contains(&t) { None } else { st.pkey.get(&r).copied() };
+            let re = re_rows.contains(&r);
+            if was == now && !re {
+                continue;
+            }
+            if let Some(w) = was {
+                dl.removed.push((t, w));
+            }
+            if let Some(n) = now {
+                dl.added.push((t, n));
+            }
+            if re && was.is_some() && now.is_some() {
+                dl.reentered.insert(t);
+            }
+        }
+        // ── 前の段の組 × 子の row (値で結ぶ 2 つの table の組と同じ手順): 抜く側は抜く前の相手と、 足す側は足した後の相手と
+        let kept = kept_ids(&dl, &dc);
+        let keep = |t: u32, c: EntityId| !kept.is_empty() && kept.contains(&(t, c));
+        let mut out = IdDelta::default();
+        for &(t, k) in &dl.removed {
+            for &(_, c) in st.right.range((k, 0)..=(k, u64::MAX)) {
+                if !keep(t, c) {
+                    out.removed.extend(next.kill(t, c));
+                }
+            }
+            st.kl.remove(&(k, t));
+        }
+        for &(c, k) in &dc.removed {
+            for &(_, t) in st.kl.range((k, 0)..=(k, u32::MAX)) {
+                if !keep(t, c) {
+                    out.removed.extend(next.kill(t, c));
+                }
+            }
+            st.right.remove(&(k, c));
+        }
+        for &(t, k) in &dl.added {
+            st.kl.insert((k, t));
+            for &(_, c) in st.right.range((k, 0)..=(k, u64::MAX)) {
+                if !keep(t, c) {
+                    out.added.push(next.alloc(t, c));
+                }
+            }
+        }
+        for &(c, k) in &dc.added {
+            st.right.insert((k, c));
+            for &(_, t) in st.kl.range((k, 0)..=(k, u32::MAX)) {
+                if !keep(t, c) {
+                    out.added.push(next.alloc(t, c));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// 前の段の組と子の row が同じ poll の中で同じ鍵から同じ鍵へ一緒に移った組 (居続けている = 出さない)。
+fn kept_ids(dl: &Keyed<u32>, dc: &Keyed<EntityId>) -> std::collections::BTreeSet<(u32, EntityId)> {
+    use std::collections::{BTreeMap, BTreeSet};
+    fn moves<T: Ord + Copy>(k: &Keyed<T>) -> BTreeMap<T, (u64, u64)> {
+        if k.removed.is_empty() || k.added.is_empty() {
+            return BTreeMap::new();
+        }
+        let old: BTreeMap<T, u64> = k.removed.iter().copied().collect();
+        k.added.iter().filter(|(e, _)| !k.reentered.contains(e)).filter_map(|&(e, n)| old.get(&e).map(|&o| (e, (o, n)))).collect()
+    }
+    let mut out = BTreeSet::new();
+    let ml = moves(dl);
+    if ml.is_empty() {
+        return out;
+    }
+    let mut by_move: BTreeMap<(u64, u64), Vec<EntityId>> = BTreeMap::new();
+    for (c, m) in moves(dc) {
+        by_move.entry(m).or_default().push(c);
+    }
+    for (t, m) in ml {
+        if let Some(cs) = by_move.get(&m) {
+            out.extend(cs.iter().map(|&c| (t, c)));
+        }
+    }
+    out
+}
+
+// ─────────────────────────── window: 1 つ前の row (LAG) ───────────────────────────
+
+/// [`Query::lag`] / [`Query::lag_all`] の戻り値。 同じ group の中で並びが 1 つ前の row との組を引く / 購読する。
+pub struct LagQuery<'a> {
+    rows: Query<'a>,
+    /// group の列 (None = 結果全体で 1 つの group)
+    part: Option<String>,
+    order: String,
+}
+
+/// LAG の計画: 条件、 group の鍵 (ref の道 + 列)、 並びの鍵 (ref の道 + 列)。
+type LagPlan = (Vec<enchudb_engine::LivePred>, Option<(Vec<u16>, u16)>, (Vec<u16>, u16));
+
+impl<'a> LagQuery<'a> {
+    fn plan(self) -> Result<Option<LagPlan>, SchemaError> {
+        let bad = |m: String| Err(SchemaError::BadValue(m));
+        if self.rows.limit.is_some() || self.rows.order.is_some() {
+            return bad("lag: limit / order_by are not supported (the order is the lag's own)".into());
+        }
+        let part = match &self.part {
+            None => None,
+            Some(p) => match self.rows.resolve_col(p) {
+                Some((path, c)) if c.ty != ColumnType::Leaf => Some((path, c.himo_id)),
+                _ => return bad(format!("lag: {p} is not a column to group by (unknown or Leaf)")),
+            },
+        };
+        let order = match self.rows.resolve_col(&self.order) {
+            Some((path, c)) if matches!(c.ty, ColumnType::Number | ColumnType::BigInt) => (path, c.himo_id),
+            _ => return bad(format!("lag: {} is not a Number / BigInt column to order by", self.order)),
+        };
+        let Some(preds) = self.rows.live_preds()? else { return Ok(None) };
+        Ok(Some((preds, part, order)))
+    }
+
+    /// 今の組 `(row, 1 つ前の row)` (row の昇順)。 group の先頭の row は組にならない。
+    pub fn find(self) -> Result<Vec<(EntityId, EntityId)>, SchemaError> {
+        let eng = self.rows.db.arc_engine();
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let Some((preds, part, (opath, oh))) = self.plan()? else { return Ok(Vec::new()) };
+        let peer = eng.peer_id();
+        let key = |e: EntityId, path: &[u16], h: u16| -> Option<u64> {
+            let mut cur = e;
+            for &p in path {
+                cur = enchudb_oplog::make_eid(peer, eng.get_by_id(cur, p)? as u32);
+            }
+            eng.get_by_id(cur, h)
+        };
+        let mut rows: Vec<(u64, u64, EntityId)> = Vec::new();
+        for e in eng.find_by(preds).map_err(io)? {
+            let p = match &part {
+                None => Some(0),
+                Some((path, h)) => key(e, path, *h),
+            };
+            if let (Some(p), Some(o)) = (p, key(e, &opath, oh)) {
+                rows.push((p, o, e));
+            }
+        }
+        rows.sort_unstable();
+        let mut out: Vec<(EntityId, EntityId)> = rows.windows(2).filter(|w| w[0].0 == w[1].0).map(|w| (w[1].2, w[0].2)).collect();
+        out.sort_unstable();
+        Ok(out)
+    }
+
+    /// 今の組の数。
+    pub fn count(self) -> Result<usize, SchemaError> {
+        Ok(self.find()?.len())
+    }
+
+    /// 組 `(row, 1 つ前の row)` を購読する (`LiveJoin`、 poll は `PairDelta`)。 初回 poll は登録時点の全部の組が `added`。
+    /// row の出入り・group / 並びの列の書き換え (ref の先の値も) で届く。 書き込み 1 回で動く組は高々 3 つずつ
+    /// (抜けた所の前後がつながり、 入った所の前後が切れる)。
+    pub fn subscribe(self) -> Result<LiveJoin, SchemaError> {
+        let eng = self.rows.db.arc_engine();
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let inner = match self.plan()? {
+            None => JoinLive::Empty,
+            Some((preds, part, (opath, oh))) => JoinLive::Lag {
+                part: match part {
+                    Some((path, h)) => Some(eng.subscribe_keyed(preds.clone(), path, h).map_err(io)?),
+                    None => None,
+                },
+                order: eng.subscribe_keyed(preds, opath, oh).map_err(io)?,
+                state: Default::default(),
+            },
+        };
+        Ok(LiveJoin { inner, eng })
+    }
+}
+
+/// LAG の購読の状態。
+#[derive(Default)]
+struct LagState {
+    /// (group, 並びの値, row)
+    seq: std::collections::BTreeSet<(u64, u64, EntityId)>,
+    /// 最後に渡した 1 つ前の row
+    prev_of: std::collections::BTreeMap<EntityId, EntityId>,
+}
+
+/// 並びの中の位置 (group, 並びの値, row)。
+type LagPos = (u64, u64, EntityId);
+
+impl LagState {
+    fn next(&self, at: LagPos) -> Option<LagPos> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.seq.range((Excluded(at), Unbounded)).next().filter(|n| n.0 == at.0).copied()
+    }
+
+    fn prev(&self, at: LagPos) -> Option<EntityId> {
+        self.seq.range(..at).next_back().filter(|n| n.0 == at.0).map(|n| n.2)
+    }
+
+    /// 差分を当てて組の差分を返す。 1 つ前が変わりうる row = 動いた row と、 動く前 / 後の位置の直後の row。
+    /// それぞれの今の 1 つ前を渡し済みのものと比べる (作り直した row が組のどちらかに居れば、 同じでも出て入り直す)。
+    /// 動いた row の値の後 = 鍵付きの購読が渡し済みの鍵 (`now` = 動いた row ごとの (group, 並び)、 row の昇順、 group の無い
+    /// LAG は group 0)、 前 = 差分の removed か、 動いていなければ後と同じ。
+    fn apply(
+        &mut self,
+        dp: Option<&enchudb_engine::KeyedDelta>,
+        dord: &enchudb_engine::KeyedDelta,
+        now: &[(EntityId, Option<u64>, Option<u64>)],
+    ) -> PairDelta {
+        use std::collections::btree_map::Entry;
+        let deltas: Vec<&enchudb_engine::KeyedDelta> = dp.into_iter().chain(std::iter::once(dord)).collect();
+        let moved: Vec<EntityId> = now.iter().map(|x| x.0).collect();
+        let mut reborn: Vec<EntityId> = deltas.iter().flat_map(|k| k.reentered.iter().copied()).collect();
+        reborn.sort_unstable();
+        let is_reborn = |e: EntityId| reborn.binary_search(&e).is_ok();
+        let pos = |e: EntityId, p: Option<u64>, o: Option<u64>| Some((p?, o?, e));
+        // (row, 動く前の位置, 動いた後の位置)
+        let ups: Vec<(EntityId, Option<LagPos>, Option<LagPos>)> = now
+            .iter()
+            .map(|&(e, p, o)| {
+                let p0 = match dp {
+                    Some(k) => key_before(k, e, p),
+                    None => p,
+                };
+                (e, pos(e, p0, key_before(dord, e, o)), pos(e, p, o))
+            })
+            .collect();
+        // 1 つ前が変わりうる row と、 その今の位置 (動いた row は動いた後の位置で上書きする)
+        let mut touched: Vec<(EntityId, Option<LagPos>)> = Vec::new();
+        for &(_, old, _) in &ups {
+            if let Some(n) = old.and_then(|at| self.next(at)) {
+                touched.push((n.2, Some(n)));
+            }
+        }
+        for &(_, old, _) in &ups {
+            if let Some(at) = old {
+                self.seq.remove(&at);
+            }
+        }
+        for &(_, _, new) in &ups {
+            if let Some(at) = new {
+                self.seq.insert(at);
+            }
+        }
+        for &(_, _, new) in &ups {
+            if let Some(n) = new.and_then(|at| self.next(at)) {
+                touched.push((n.2, Some(n)));
+            }
+        }
+        touched.retain(|t| moved.binary_search(&t.0).is_err());
+        touched.extend(ups.iter().map(|&(e, _, new)| (e, new)));
+        touched.sort_unstable_by_key(|t| t.0);
+        touched.dedup_by_key(|t| t.0);
+        let mut d = PairDelta::default();
+        for (x, at) in touched {
+            let now = at.and_then(|at| self.prev(at));
+            let again = is_reborn(x) || now.is_some_and(is_reborn);
+            match (self.prev_of.entry(x), now) {
+                (Entry::Occupied(o), _) if Some(*o.get()) == now && !again => {}
+                (Entry::Vacant(_), None) => {}
+                (Entry::Occupied(mut o), Some(n)) => {
+                    d.removed.push((x, *o.get()));
+                    d.added.push((x, n));
+                    o.insert(n);
+                }
+                (Entry::Occupied(o), None) => {
+                    d.removed.push((x, *o.get()));
+                    o.remove();
+                }
+                (Entry::Vacant(v), Some(n)) => {
+                    d.added.push((x, n));
+                    v.insert(n);
+                }
+            }
+        }
+        d
+    }
+}
+
+// ─────────────────────────── 再帰 (階層の配下 / 上) ───────────────────────────
+
+/// [`Query::under`] / [`Query::above`] の戻り値。 階層の配下 (または上) の row を引く / 購読する。
+pub struct UnderQuery<'a> {
+    rows: Query<'a>,
+    seeds: Query<'a>,
+    ref_col: String,
+    /// 上向き (seed の上司をたどる、 [`Query::above`])
+    up: bool,
+}
+
+/// 配下の計画: (結果を絞る条件, seed の条件, table の全 row の条件, ref 列)。
+type UnderPlan = (Vec<enchudb_engine::LivePred>, Vec<enchudb_engine::LivePred>, Vec<enchudb_engine::LivePred>, u16);
+
+impl<'a> UnderQuery<'a> {
+    fn plan(self) -> Result<Option<UnderPlan>, SchemaError> {
+        let bad = |m: String| Err(SchemaError::BadValue(m));
+        let (rows, seeds) = (self.rows, self.seeds);
+        let what = if self.up { "above" } else { "under" };
+        if rows.limit.is_some() || rows.order.is_some() || seeds.limit.is_some() || seeds.order.is_some() {
+            return bad(format!("{what}: limit / order_by are not supported"));
+        }
+        if !Arc::ptr_eq(&rows.table, &seeds.table) {
+            return bad(format!("{what}: seeds must be a query on {}", rows.table.name));
+        }
+        let t = &rows.table;
+        let cd = t.col(&self.ref_col).cloned();
+        let points = cd.as_ref().is_some_and(|c| c.ty == ColumnType::Ref)
+            && t.relations.iter().any(|r| r.from_col.eq_ignore_ascii_case(&self.ref_col) && r.to_table.eq_ignore_ascii_case(&t.name));
+        let Some(cd) = cd.filter(|_| points) else {
+            return bad(format!("{what}: {} is not a ref column of {} pointing to itself", self.ref_col, t.name));
+        };
+        let all = Query::new(rows.db, t.clone());
+        let (Some(f), Some(sd), Some(a)) = (rows.live_preds()?, seeds.live_preds()?, all.live_preds()?) else { return Ok(None) };
+        Ok(Some((f, sd, a, cd.himo_id)))
+    }
+
+    /// 今の配下 (または上) の row (昇順)。
+    pub fn find(self) -> Result<Vec<EntityId>, SchemaError> {
+        let eng = self.rows.db.arc_engine();
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let up = self.up;
+        let Some((f, sd, a, via)) = self.plan()? else { return Ok(Vec::new()) };
+        let peer = eng.peer_id();
+        let local = |e: EntityId| enchudb_oplog::eid_local(e);
+        let col_parent = |x: u32| eng.get_by_id(enchudb_oplog::make_eid(peer, x), via).map(|p| p as u32);
+        let refs = HierRef { parent: &col_parent };
+        let mut memo = Some(std::collections::BTreeMap::new());
+        let mut h = Hier::new(up);
+        if let Hier::Up(ab) = &mut h {
+            // 上向きは子から数を積むので、 親の表を組み立てる (下向きは親を engine から読む)
+            for e in eng.find_by(a).map_err(io)? {
+                if let Some(p) = eng.get_by_id(e, via) {
+                    ab.parent.insert(local(e), p as u32);
+                }
+            }
+            ab.seed.extend(eng.find_by(sd).map_err(io)?.into_iter().map(local));
+            ab.rebuild();
+        } else {
+            let mut touched = Vec::new();
+            for e in eng.find_by(sd).map_err(io)? {
+                h.set_seed(local(e), true, &mut touched);
+            }
+        }
+        let mut out: Vec<EntityId> = eng
+            .find_by(f)
+            .map_err(io)?
+            .into_iter()
+            .filter(|&e| h.find_answer(local(e), &refs, &mut memo))
+            .map(|e| enchudb_oplog::make_eid(peer, local(e)))
+            .collect();
+        out.sort_unstable();
+        Ok(out)
+    }
+
+    /// 今の配下 (または上) の row の数。
+    pub fn count(self) -> Result<usize, SchemaError> {
+        Ok(self.find()?.len())
+    }
+
+    /// 配下 (または上) の row の出入りを購読する。 初回 poll は登録時点の全部が `added`。 親の付け替え (異動・部署の移動)、
+    /// seed の出入り、 この query の条件の変化で届く。 下向きは、 付け替えで配下の答えが変わらない row の下は見に行かない。
+    /// 上向きは、 seed の出入り・葉の付け替えが答えの変わる row の数に比例 (深さによらない)、 子の居る row の付け替えは深さに比例。
+    pub fn subscribe(self) -> Result<LiveUnder, SchemaError> {
+        let eng = self.rows.db.arc_engine();
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let up = self.up;
+        let state = std::sync::Mutex::new(UnderState { hier: Hier::new(up), filt: Default::default(), reported: Default::default() });
+        let Some((f, sd, a, via)) = self.plan()? else {
+            return Ok(LiveUnder { eng, live: None, state });
+        };
+        let parents = eng.subscribe_keyed(a, Vec::new(), via).map_err(io)?;
+        let seeds = eng.subscribe(sd).map_err(io)?;
+        let filter = eng.subscribe(f).map_err(io)?;
+        Ok(LiveUnder { eng, live: Some((parents, seeds, filter)), state })
+    }
+}
+
+/// 階層の親を引く。 購読では、 親の ref の鍵付きの購読が渡し済みの鍵 (= 当てた差分の状態) から引く。 engine の列を
+/// 直読みすると poll より後の書き込みが見え、 書いて戻した (x → y → x) row は差分が出ないので、 途中の y を通って決めた
+/// 答えが直らない (並行テストで 20 回に 3 回、 書き終わった後も結果に余分な row が残った)。 find は列を直読みする。
+///
+/// 子は引かない: ref 列の値で引くと、 その列の Cylinder が無ければ全 row で組まれ (#270 の lazy build)、 以後その列の
+/// 書き込みごとに維持される (試した版: 社員 100 万で RSS +45 MB、 1 万件まとめ -4%)。 子は当てた差分から持つ。
+struct HierRef<'e> {
+    parent: &'e dyn Fn(u32) -> Option<u32>,
+}
+
+impl HierRef<'_> {
+    fn parent(&self, x: u32) -> Option<u32> {
+        (self.parent)(x)
+    }
+}
+
+/// 下向きの seed と配下の答え。 row は local eid。 親は持たず鍵付きの購読から引く ([`HierRef`])、 子は当てた差分から持つ。
+#[derive(Default)]
+struct Tree {
+    /// (親, 子)
+    children: Adj<u32>,
+    seed: RowSet,
+    /// 配下である row (答えが真)。
+    under: RowSet,
+}
+
+impl Tree {
+    /// r の答え (親をたどって seed に着くか) を、 この poll で既に決めた答え (`memo`) を使って決める。 たどった道の row の
+    /// 答えも `memo` に残す — 根が多い poll (最初の poll は全 row が根) でも、 どの row も 1 回しかたどらない (row ごとに
+    /// 上までたどると row 数 × 深さ: 深さ 10 万の一本道で最初の poll が返らなかった)。 輪 (seed を含まない) の row は偽。
+    fn resolve(&self, r: u32, h: &HierRef, memo: &mut Option<std::collections::BTreeMap<u32, bool>>) -> bool {
+        if let Some(&a) = memo.as_ref().and_then(|m| m.get(&r)) {
+            return a;
+        }
+        let mut path = vec![r];
+        // 輪の検出: 浅いうちは道を線形に見る、 深くなったら集合に
+        let mut on_path: Option<std::collections::BTreeSet<u32>> = None;
+        let mut cur = r;
+        // 道の一番上 (cur) の答え
+        let top = loop {
+            match h.parent(cur) {
+                None => break false,
+                Some(p) if self.seed.contains(p) => break true,
+                Some(p) => {
+                    if let Some(&a) = memo.as_ref().and_then(|m| m.get(&p)) {
+                        break a;
+                    }
+                    let again = match on_path.as_mut() {
+                        Some(set) => !set.insert(p),
+                        None if path.len() < 32 => path.contains(&p),
+                        None => {
+                            let mut set: std::collections::BTreeSet<u32> = path.iter().copied().collect();
+                            let again = !set.insert(p);
+                            on_path = Some(set);
+                            again
+                        }
+                    };
+                    if again {
+                        // 輪 (道の上に seed が無い): 輪の row も、 輪に入る道の row も偽
+                        break false;
+                    }
+                    path.push(p);
+                    cur = p;
+                }
+            }
+        };
+        // 道の row の親は seed でない (seed に着いたら止まる) ので、 道の row は全部 top と同じ答え
+        if let Some(m) = memo.as_mut() {
+            for x in path {
+                m.insert(x, top);
+            }
+        }
+        top
+    }
+
+    /// `roots` の答えを親をたどって決め直し、 答えが変わった row の子へ下向きに伝える (子の答え = 親が seed か配下か)。
+    /// 答えが変わった row を返す。
+    fn settle(&mut self, roots: impl IntoIterator<Item = u32>, h: &HierRef) -> Vec<u32> {
+        let mut changed = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        // 葉 (子の無い row) の根は輪に入れない (自分の下に何も無い) ので、 答え = 親が seed か配下か を 1 回見るだけ。
+        // 親の答えは、 葉でない根を決め直して下へ伝えた後なら最新 (親の上の変化は全部葉でない根か seed の出入りの子)
+        let (leaves, inner): (Vec<u32>, Vec<u32>) = roots.into_iter().partition(|&r| self.children.get(r).is_empty());
+        // 道の途中の row の答えは、 その上の根を決め直して下へ伝えれば揃うので、 比べるのは根だけ。 覚えるのは根が 2 つ以上の時だけ
+        let mut memo = (inner.len() > 1).then(std::collections::BTreeMap::new);
+        for r in inner {
+            let now = self.resolve(r, h, &mut memo);
+            if now != self.under.contains(r) {
+                if now { self.under.insert(r) } else { self.under.remove(r) };
+                changed.push(r);
+                queue.push_back(r);
+            }
+        }
+        while let Some(x) = queue.pop_front() {
+            let v = self.seed.contains(x) || self.under.contains(x);
+            let kids: Vec<u32> = self.children.get(x).to_vec();
+            for c in kids {
+                if v != self.under.contains(c) {
+                    if v { self.under.insert(c) } else { self.under.remove(c) };
+                    changed.push(c);
+                    queue.push_back(c);
+                }
+            }
+        }
+        for r in leaves {
+            let now = h.parent(r).is_some_and(|p| self.seed.contains(p) || self.under.contains(p));
+            if now != self.under.contains(r) {
+                if now { self.under.insert(r) } else { self.under.remove(r) };
+                changed.push(r);
+            }
+        }
+        changed
+    }
+}
+
+/// 上向き (seed の上司全員) の状態。 x の答え = x の下 (何段下でも) に seed が居る。 row ごとに 「子のうち、 seed か答えが
+/// 真の子の数」 (`cnt`) を持ち、 答え = `cnt` が 1 以上。 子の真偽が変わったら親の `cnt` を動かし、 親の答えが変わった時
+/// だけ更に上へ伝える (伝わるのは答えが変わる row の数だけ、 深さによらない)。
+///
+/// 数で持つと輪が自分を支える (輪の row どうしが数え合って、 seed が居なくなっても真のまま)。 真の row の居る輪は覚えておき、
+/// 輪の row の `cnt` には輪の外の子だけを数え、 輪ごとに 「輪の row の `cnt` と輪の上の seed の和」 (`cyc_sum`) を持つ。 輪の
+/// row は輪につながる全員の上なので、 答え = `cyc_sum` が自分の seed を除いて 1 以上。 輪の row の親は輪の row なので、 輪から
+/// 上へは伝わらない。 seed につながらない輪は覚えなくてよい (全員 0 で、 数え合う数が無い)。
+///
+/// 輪が真になるのは (1) 伝える途中で、 この回に真にした row (か伝え始めた row) に戻った時、 (2) 下に seed の居る row を
+/// 自分の下へ付け替えた時 (新しい親の側は既に真なので、 伝えるのが途中で止まる)。 (1) は伝える道で見つかり、 (2) だけ新しい
+/// 親から上へたどる (深さに比例)。 下に seed の居ない row の付け替え (ほとんど) は親の表を 1 回書くだけ。
+#[derive(Default)]
+struct Above {
+    parent: RowMap,
+    seed: std::collections::BTreeSet<u32>,
+    /// 子 (輪の row は輪の外の子) のうち seed か答えが真の数 (0 は持たない)。
+    cnt: RowMap,
+    /// 覚えている輪の row → 輪の番号。
+    cyc_of: std::collections::BTreeMap<u32, u32>,
+    /// 輪の番号 → 輪の row の `cnt` と輪の上の seed の和。
+    cyc_sum: std::collections::BTreeMap<u32, u64>,
+    next_cyc: u32,
+}
+
+/// たどった row の列と、 それに居るかの判定 (浅いうちは列を線形に見る、 長くなったら集合に)。
+struct Trail {
+    rows: Vec<u32>,
+    set: Option<std::collections::BTreeSet<u32>>,
+}
+
+impl Trail {
+    fn new(x: u32) -> Trail {
+        Trail { rows: vec![x], set: None }
+    }
+
+    fn contains(&self, x: u32) -> bool {
+        match &self.set {
+            Some(s) => s.contains(&x),
+            None => self.rows.contains(&x),
+        }
+    }
+
+    fn push(&mut self, x: u32) {
+        self.rows.push(x);
+        match self.set.as_mut() {
+            Some(s) => {
+                s.insert(x);
+            }
+            None if self.rows.len() > 32 => self.set = Some(self.rows.iter().copied().collect()),
+            None => {}
+        }
+    }
+}
+
+impl Above {
+    fn cnt(&self, x: u32) -> u64 {
+        self.cnt.get(x).map_or(0, u64::from)
+    }
+
+    fn answer(&self, x: u32) -> bool {
+        match self.cyc_of.get(&x) {
+            Some(id) => self.cyc_sum[id] > u64::from(self.seed.contains(&x)),
+            None => self.cnt(x) > 0,
+        }
+    }
+
+    /// 親へ見せる真偽 (輪の外の row だけ)。
+    fn hot(&self, x: u32) -> bool {
+        self.seed.contains(&x) || self.cnt(x) > 0
+    }
+
+    fn add_cnt(&mut self, x: u32, add: bool) -> (u64, u64) {
+        let old = self.cnt(x);
+        let new = if add { old + 1 } else { old - 1 };
+        if new == 0 { self.cnt.remove(x) } else { self.cnt.insert(x, u32::try_from(new).expect("子の数")) };
+        (old, new)
+    }
+
+    /// 輪の row (x から親をたどって x に戻るまで)。
+    fn cycle(&self, x: u32) -> Vec<u32> {
+        let mut out = vec![x];
+        let mut cur = self.parent.get(x).expect("輪の row の親");
+        while cur != x {
+            out.push(cur);
+            cur = self.parent.get(cur).expect("輪の row の親");
+        }
+        out
+    }
+
+    /// 輪の和を ±1。 和が 0 / 1 をまたぐと輪の row の答えが変わりうる (1 は、 seed がその row 自身だけの時)。
+    fn add_cyc(&mut self, x: u32, id: u32, add: bool, touched: &mut Vec<u32>) {
+        let s = self.cyc_sum.get_mut(&id).expect("輪の和");
+        let old = *s;
+        *s = if add { old + 1 } else { old - 1 };
+        if old.min(*s) <= 1 {
+            touched.extend(self.cycle(x));
+        }
+    }
+
+    /// 輪 (`rows` の順に、 各 row の親が次の row、 最後の row の親が最初の row) を覚える。 各 row の `cnt` は輪の上の子
+    /// (1 つ前の row) の分を含まないこと。
+    fn remember(&mut self, rows: &[u32], touched: &mut Vec<u32>) {
+        let id = self.next_cyc;
+        self.next_cyc += 1;
+        let mut sum = 0;
+        for &y in rows {
+            sum += self.cnt(y) + u64::from(self.seed.contains(&y));
+            self.cyc_of.insert(y, id);
+        }
+        self.cyc_sum.insert(id, sum);
+        touched.extend_from_slice(rows);
+    }
+
+    /// x0 の親へ見せる真偽が変わった: 親の `cnt` を ±1 して、 答えが変わったら上へ伝える。 足す時、 この回に真にした row
+    /// (か x0) に戻ったら輪: 戻った所から先の row が輪で、 輪の上の子の分を引いて覚える。 引く時は輪に入らない (真の row の
+    /// 居る輪は覚えてある)。
+    fn bump(&mut self, x0: u32, add: bool, touched: &mut Vec<u32>) {
+        let Some(p) = self.parent.get(x0) else { return };
+        let mut trail = Trail::new(x0);
+        let mut x = p;
+        loop {
+            if let Some(&id) = self.cyc_of.get(&x) {
+                self.add_cnt(x, add);
+                self.add_cyc(x, id, add, touched);
+                return;
+            }
+            if add && trail.contains(x) {
+                let at = trail.rows.iter().position(|&y| y == x).expect("たどった row");
+                let rows = trail.rows.split_off(at);
+                for &y in &rows[1..] {
+                    self.add_cnt(y, false);
+                }
+                self.remember(&rows, touched);
+                return;
+            }
+            let (old, new) = self.add_cnt(x, add);
+            if (old > 0) == (new > 0) {
+                return;
+            }
+            touched.push(x);
+            if self.seed.contains(&x) {
+                return;
+            }
+            trail.push(x);
+            match self.parent.get(x) {
+                Some(p) => x = p,
+                None => return,
+            }
+        }
+    }
+
+    fn set_seed(&mut self, s: u32, on: bool, touched: &mut Vec<u32>) {
+        if self.seed.contains(&s) == on {
+            return;
+        }
+        if on { self.seed.insert(s) } else { self.seed.remove(&s) };
+        touched.push(s);
+        if let Some(&id) = self.cyc_of.get(&s) {
+            self.add_cyc(s, id, on, touched);
+        } else if self.cnt(s) == 0 {
+            self.bump(s, on, touched);
+        }
+    }
+
+    /// c を親から外す。 c が覚えた輪の上なら、 輪が c を根とする鎖にほどける。
+    fn cut(&mut self, c: u32, touched: &mut Vec<u32>) {
+        let Some(id) = self.cyc_of.remove(&c) else {
+            if self.hot(c) {
+                self.bump(c, false, touched);
+            }
+            self.parent.remove(c);
+            return;
+        };
+        let p = self.parent.remove(c).expect("輪の row の親");
+        self.cyc_sum.remove(&id);
+        // 鎖は p (一番下) から c まで。 下から数え直す
+        let mut chain = vec![p];
+        let mut cur = p;
+        while cur != c {
+            cur = self.parent.get(cur).expect("輪の row の親");
+            chain.push(cur);
+        }
+        let mut below = false;
+        for y in chain {
+            self.cyc_of.remove(&y);
+            if below {
+                self.add_cnt(y, true);
+            }
+            below = self.hot(y);
+            touched.push(y);
+        }
+    }
+
+    /// 根 c を q の子にする。
+    fn link(&mut self, c: u32, q: u32, touched: &mut Vec<u32>) {
+        self.parent.insert(c, q);
+        if !self.hot(c) {
+            // 輪ができても seed につながらない (c の木に seed が居ない)
+            return;
+        }
+        if self.cnt(c) > 0 {
+            // c の下に seed が居る: q が c の下なら、 q の側は既に真で伝えるのが c まで届かないので、 たどって確かめる。
+            // 道の途中で (覚えていない、 seed につながらない) 輪に入ったら c には着かない
+            let mut trail = Trail::new(q);
+            let mut cur = q;
+            while cur != c && !self.cyc_of.contains_key(&cur) {
+                match self.parent.get(cur) {
+                    Some(p) if !trail.contains(p) => {
+                        trail.push(p);
+                        cur = p;
+                    }
+                    _ => break,
+                }
+            }
+            if cur == c {
+                // 輪 (q → … → c → q): 輪の row の cnt から輪の上の子 (道の 1 つ下) の分を引く
+                let rows = trail.rows;
+                let hots: Vec<bool> = rows.iter().map(|&y| self.hot(y)).collect();
+                for i in 1..rows.len() {
+                    if hots[i - 1] {
+                        self.add_cnt(rows[i], false);
+                    }
+                }
+                self.remember(&rows, touched);
+                return;
+            }
+        }
+        self.bump(c, true, touched);
+    }
+
+    /// c の親を `to` にする。 下に seed の居ない輪の外の row (ほとんど) は親の表を 1 回書くだけ。
+    fn reparent(&mut self, c: u32, to: Option<u32>, touched: &mut Vec<u32>) {
+        if !self.hot(c) && !self.cyc_of.contains_key(&c) {
+            match to {
+                Some(q) => self.parent.insert(c, q),
+                None => self.parent.remove(c),
+            };
+            return;
+        }
+        if self.parent.get(c) == to {
+            return;
+        }
+        self.cut(c, touched);
+        if let Some(q) = to {
+            self.link(c, q, touched);
+        }
+    }
+
+    /// 親の表と seed から全部組み直す (最初の poll / find / 大きい batch)。 seed を 1 つずつ足す (どの row も 0 → 1 は 1 回
+    /// なので全体で row の数に比例)。 答えが真だった row と真になった row を返す。
+    fn rebuild(&mut self) -> Vec<u32> {
+        let mut touched: Vec<u32> = self.cnt.keys().chain(self.cyc_of.keys().copied()).filter(|&x| self.answer(x)).collect();
+        let seeds = std::mem::take(&mut self.seed);
+        self.cnt.clear();
+        self.cyc_of.clear();
+        self.cyc_sum.clear();
+        let mut scratch = Vec::new();
+        for s in seeds {
+            self.set_seed(s, true, &mut scratch);
+        }
+        touched.extend(self.cnt.keys().chain(self.cyc_of.keys().copied()).filter(|&x| self.answer(x)));
+        touched
+    }
+}
+
+/// 階層の向きごとの状態。
+enum Hier {
+    Down(Tree),
+    Up(Above),
+}
+
+impl Hier {
+    fn new(up: bool) -> Hier {
+        if up { Hier::Up(Above::default()) } else { Hier::Down(Tree::default()) }
+    }
+
+    fn set_seed(&mut self, s: u32, on: bool, touched: &mut Vec<u32>) {
+        match self {
+            Hier::Down(t) => {
+                if on { t.seed.insert(s) } else { t.seed.remove(s) };
+            }
+            Hier::Up(a) => a.set_seed(s, on, touched),
+        }
+    }
+
+    /// find 用の答え (下向きは親をたどる、 `memo` = たどって決めた答え)。
+    fn find_answer(&self, x: u32, h: &HierRef, memo: &mut Option<std::collections::BTreeMap<u32, bool>>) -> bool {
+        match self {
+            Hier::Down(t) => t.resolve(x, h, memo),
+            Hier::Up(a) => a.answer(x),
+        }
+    }
+
+    /// 購読で持っている答え。
+    fn answer(&self, x: u32) -> bool {
+        match self {
+            Hier::Down(t) => t.under.contains(x),
+            Hier::Up(a) => a.answer(x),
+        }
+    }
+
+    /// 親の付け替えと seed の出入りを当てて、 答えが変わりうる row を返す。
+    fn apply(&mut self, dp: &enchudb_engine::KeyedDelta, ds: &LiveDelta, h: &HierRef) -> Vec<u32> {
+        use std::collections::BTreeSet;
+        let local = |e: EntityId| enchudb_oplog::eid_local(e);
+        // 外れた ref (付け替えは added で上書き)
+        let mut readded: Vec<EntityId> = dp.added.iter().map(|x| x.0).collect();
+        readded.sort_unstable();
+        let cut: Vec<u32> = dp.removed.iter().filter(|(e, _)| readded.binary_search(e).is_err()).map(|(e, _)| local(*e)).collect();
+        match self {
+            Hier::Down(tree) => {
+                // 答えを決め直す row: 親が変わった row と、 seed の出入りした row の子
+                let mut roots: BTreeSet<u32> = dp.removed.iter().chain(dp.added.iter()).map(|(e, _)| local(*e)).collect();
+                for &(e, p) in &dp.removed {
+                    tree.children.remove(p as u32, local(e));
+                }
+                for &(e, p) in &dp.added {
+                    tree.children.insert(p as u32, local(e));
+                }
+                for &e in &ds.removed {
+                    tree.seed.remove(local(e));
+                }
+                for &e in &ds.added {
+                    tree.seed.insert(local(e));
+                }
+                for &e in ds.removed.iter().chain(ds.added.iter()) {
+                    let x = local(e);
+                    roots.extend(tree.children.get(x).iter().copied());
+                }
+                tree.settle(roots, h)
+            }
+            Hier::Up(a) => {
+                let mut touched = Vec::new();
+                // 付け替えが多い (最初の poll は全 row) 時は組み直す: 子の居る row の付け替えは 1 回ずつだと深さに比例
+                if (cut.len() + dp.added.len()) * 8 > a.parent.len() {
+                    for &c in &cut {
+                        a.parent.remove(c);
+                    }
+                    for &(e, p) in &dp.added {
+                        a.parent.insert(local(e), p as u32);
+                    }
+                    for &e in &ds.removed {
+                        a.seed.remove(&local(e));
+                        touched.push(local(e));
+                    }
+                    for &e in &ds.added {
+                        a.seed.insert(local(e));
+                        touched.push(local(e));
+                    }
+                    touched.extend(a.rebuild());
+                    return touched;
+                }
+                for &c in &cut {
+                    a.reparent(c, None, &mut touched);
+                }
+                for &(e, p) in &dp.added {
+                    a.reparent(local(e), Some(p as u32), &mut touched);
+                }
+                for &e in &ds.removed {
+                    a.set_seed(local(e), false, &mut touched);
+                }
+                for &e in &ds.added {
+                    a.set_seed(local(e), true, &mut touched);
+                }
+                touched
+            }
+        }
+    }
+}
+
+/// 配下の購読の状態。
+struct UnderState {
+    hier: Hier,
+    /// この query の条件を満たす row。
+    filt: RowSet,
+    /// 最後に渡した row。
+    reported: RowSet,
+}
+
+/// [`UnderQuery::subscribe`] の戻り値。 階層の配下 (または上) の row の出入りを購読する。
+pub struct LiveUnder {
+    eng: Arc<Engine>,
+    /// (親の ref の鍵付きの購読, seed, 結果を絞る条件)
+    live: Option<(enchudb_engine::LiveKeyed, enchudb_engine::LiveQuery, enchudb_engine::LiveQuery)>,
+    state: std::sync::Mutex<UnderState>,
+}
+
+impl LiveUnder {
+    /// 前回 poll からの差分 (昇順)。 同じ row が両方に居たら 「消えて、 別物として入り直した」。
+    pub fn poll(&self) -> LiveDelta {
+        use std::collections::BTreeSet;
+        let Some((parents, seeds, filter)) = &self.live else { return LiveDelta::default() };
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let UnderState { hier, filt, reported } = &mut *st;
+        let peer = self.eng.peer_id();
+        let local = |e: EntityId| enchudb_oplog::eid_local(e);
+        let (dp, ds, df) = (parents.poll(&self.eng), seeds.poll(&self.eng), filter.poll(&self.eng));
+        // 入り直した row (eid の使い回し) は別物: 答えが同じでも出て入り直す
+        let mut reborn: BTreeSet<u32> = dp.reentered.iter().map(|&e| local(e)).collect();
+        let rs: BTreeSet<EntityId> = df.removed.iter().copied().collect();
+        reborn.extend(df.added.iter().filter(|e| rs.contains(e)).map(|&e| local(e)));
+        let mut touched = parents.with_reported(|get| {
+            let parent = |x: u32| get(enchudb_oplog::make_eid(peer, x)).map(|p| p as u32);
+            hier.apply(&dp, &ds, &HierRef { parent: &parent })
+        });
+        for &e in &df.removed {
+            filt.remove(local(e));
+            touched.push(local(e));
+        }
+        for &e in &df.added {
+            filt.insert(local(e));
+            touched.push(local(e));
+        }
+        touched.extend(reborn.iter().copied());
+        touched.sort_unstable();
+        touched.dedup();
+        let mut d = LiveDelta::default();
+        for x in touched {
+            let now = hier.answer(x) && filt.contains(x);
+            let was = reported.contains(x);
+            let e = enchudb_oplog::make_eid(peer, x);
+            match (was, now) {
+                (false, true) => {
+                    reported.insert(x);
+                    d.added.push(e);
+                }
+                (true, false) => {
+                    reported.remove(x);
+                    d.removed.push(e);
+                }
+                (true, true) if reborn.contains(&x) => {
+                    d.removed.push(e);
+                    d.added.push(e);
+                }
+                _ => {}
+            }
+        }
+        d
+    }
+}
+
+// ─────────────────────────── 到達 (辺の table をたどる再帰) ───────────────────────────
+
+/// [`Query::reachable`] の戻り値。 辺の table をたどって届く row を引く / 購読する。
+pub struct ReachQuery<'a> {
+    rows: Query<'a>,
+    edges: Query<'a>,
+    src_col: String,
+    dst_col: String,
+    seeds: Query<'a>,
+}
+
+/// 到達の計画。
+struct ReachPlan {
+    /// 結果を絞る条件
+    filter: Vec<enchudb_engine::LivePred>,
+    /// seed の条件
+    seeds: Vec<enchudb_engine::LivePred>,
+    /// 辺の row の条件
+    edges: Vec<enchudb_engine::LivePred>,
+    /// 辺の (始点, 終点) の ref 列
+    src: u16,
+    dst: u16,
+}
+
+impl<'a> ReachQuery<'a> {
+    fn plan(self) -> Result<Option<ReachPlan>, SchemaError> {
+        let bad = |m: String| Err(SchemaError::BadValue(m));
+        let (rows, edges, seeds) = (self.rows, self.edges, self.seeds);
+        for q in [&rows, &edges, &seeds] {
+            if q.limit.is_some() || q.order.is_some() {
+                return bad("reachable: limit / order_by are not supported".into());
+            }
+        }
+        let t = &rows.table;
+        if !Arc::ptr_eq(t, &seeds.table) {
+            return bad(format!("reachable: seeds must be a query on {}", t.name));
+        }
+        let e = &edges.table;
+        let col = |name: &str| -> Result<u16, SchemaError> {
+            let cd = e.col(name).cloned();
+            let points = cd.as_ref().is_some_and(|c| c.ty == ColumnType::Ref)
+                && e.relations.iter().any(|r| r.from_col.eq_ignore_ascii_case(name) && r.to_table.eq_ignore_ascii_case(&t.name));
+            match cd.filter(|_| points) {
+                Some(c) => Ok(c.himo_id),
+                None => Err(SchemaError::BadValue(format!("reachable: {name} is not a ref column of {} pointing to {}", e.name, t.name))),
+            }
+        };
+        let (src, dst) = (col(&self.src_col)?, col(&self.dst_col)?);
+        let (Some(filter), Some(sd), Some(ed)) = (rows.live_preds()?, seeds.live_preds()?, edges.live_preds()?) else { return Ok(None) };
+        Ok(Some(ReachPlan { filter, seeds: sd, edges: ed, src, dst }))
+    }
+
+    /// 今届く row (昇順)。
+    pub fn find(self) -> Result<Vec<EntityId>, SchemaError> {
+        let eng = self.rows.db.arc_engine();
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let Some(p) = self.plan()? else { return Ok(Vec::new()) };
+        let peer = eng.peer_id();
+        let local = |e: EntityId| enchudb_oplog::eid_local(e);
+        let mut add = Vec::new();
+        for e in eng.find_by(p.edges).map_err(io)? {
+            if let (Some(s), Some(d)) = (eng.get_by_id(e, p.src), eng.get_by_id(e, p.dst)) {
+                add.push((s as u32, d as u32, local(e)));
+            }
+        }
+        let seeds: Vec<u32> = eng.find_by(p.seeds).map_err(io)?.into_iter().map(local).collect();
+        let mut g = Graph::default();
+        g.update(&[], &add, &[], &seeds);
+        let mut out: Vec<EntityId> =
+            eng.find_by(p.filter).map_err(io)?.into_iter().filter(|&e| g.reached(local(e))).map(|e| enchudb_oplog::make_eid(peer, local(e))).collect();
+        out.sort_unstable();
+        Ok(out)
+    }
+
+    /// 今届く row の数。
+    pub fn count(self) -> Result<usize, SchemaError> {
+        Ok(self.find()?.len())
+    }
+
+    /// 届く row の出入りを購読する。 初回 poll は登録時点の全部が `added`。 辺の row の出入り・付け替え、 seed の出入り、
+    /// この query の条件の変化で届く。
+    pub fn subscribe(self) -> Result<LiveReach, SchemaError> {
+        let eng = self.rows.db.arc_engine();
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let state = std::sync::Mutex::new(ReachState::default());
+        let Some(p) = self.plan()? else { return Ok(LiveReach { eng, live: None, state }) };
+        let src = eng.subscribe_keyed(p.edges.clone(), Vec::new(), p.src).map_err(io)?;
+        let dst = eng.subscribe_keyed(p.edges, Vec::new(), p.dst).map_err(io)?;
+        let seeds = eng.subscribe(p.seeds).map_err(io)?;
+        let filter = eng.subscribe(p.filter).map_err(io)?;
+        Ok(LiveReach { eng, live: Some(ReachLive { src, dst, seeds, filter }), state })
+    }
+}
+
+/// 辺 (始点, 終点, 辺の row) と seed、 届く row と、 その row を届かせている辺の始点 (支え)。 row は local eid。
+///
+/// 支えは seed か届く row で、 支えをたどると必ず seed に着く (支えの森、 輪にならない)。 seed 自身も、 辺をたどって
+/// 戻ってくれば届く。 支えを付け替える時は、 新しい支えから支えをたどって、 自分を通らずに seed に着くことを確かめる
+/// (たどる長さは支えの森の深さ、 探している row は支えを外してあるので、 自分を通る鎖は seed に着かない)。 辺を足しても、 既に届く row の支えは変えない。
+///
+/// 1 回の poll で、 辺と seed を消して足し (置くだけ)、 支えの辺が消えた row と外れた seed が支えていた row の支えを
+/// 外して探し直す: 元の支え → 入ってくる辺の始点の順に、 seed に着く支えを探す (付け替えた辺の新しい始点も候補、
+/// 見つかればその先は見ない)。 見つからない row は外し、 その row が支えていた row も探し直す。 最後に、 外した
+/// row のうち届く支えを持つもの・足した辺の先・入った seed の先から幅優先に広げる。
+///
+/// 支えられている row の一覧は持たない: 支えは辺の始点なので、 x が支える row = x から出る辺の先で支えが x のもの。
+#[derive(Default)]
+struct Graph {
+    /// 始点 → (終点, 辺の row)
+    out: Adj,
+    /// 終点 → (始点, 辺の row)
+    inn: Adj,
+    seed: std::collections::BTreeSet<u32>,
+    /// 届く row → 支え
+    sup: RowMap,
+}
+
+/// local eid → u32 の表。 4096 row ずつのページで、 触ったページだけ持つ。 到達の支えは 1 回の poll で 10 万 row 規模を
+/// 書き換え、 BTreeMap の出し入れがプロファイルの上位だった (row は table の範囲の local eid なので、 ページは詰まる)。
+#[derive(Default)]
+struct RowMap {
+    pages: Vec<Option<Box<[u32]>>>,
+    len: usize,
+}
+
+impl RowMap {
+    /// 値の無い印。
+    const NONE: u32 = u32::MAX;
+    const BITS: u32 = 12;
+
+    fn slot(x: u32) -> (usize, usize) {
+        ((x >> Self::BITS) as usize, (x & ((1 << Self::BITS) - 1)) as usize)
+    }
+
+    fn get(&self, x: u32) -> Option<u32> {
+        let (p, i) = Self::slot(x);
+        let v = self.pages.get(p)?.as_ref()?[i];
+        (v != Self::NONE).then_some(v)
+    }
+
+    fn contains(&self, x: u32) -> bool {
+        self.get(x).is_some()
+    }
+
+    fn insert(&mut self, x: u32, v: u32) -> Option<u32> {
+        debug_assert!(v != Self::NONE);
+        let (p, i) = Self::slot(x);
+        if self.pages.len() <= p {
+            self.pages.resize_with(p + 1, || None);
+        }
+        let page = self.pages[p].get_or_insert_with(|| vec![Self::NONE; 1 << Self::BITS].into_boxed_slice());
+        let old = std::mem::replace(&mut page[i], v);
+        if old == Self::NONE {
+            self.len += 1;
+            None
+        } else {
+            Some(old)
+        }
+    }
+
+    fn remove(&mut self, x: u32) -> Option<u32> {
+        let (p, i) = Self::slot(x);
+        let page = self.pages.get_mut(p)?.as_mut()?;
+        let old = std::mem::replace(&mut page[i], Self::NONE);
+        (old != Self::NONE).then(|| {
+            self.len -= 1;
+            old
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// 値の在る row (昇順)。 ページを全部なめる (組み直し用)。
+    fn keys(&self) -> impl Iterator<Item = u32> + '_ {
+        self.pages.iter().enumerate().filter_map(|(p, q)| q.as_ref().map(|q| (p, q))).flat_map(|(p, q)| {
+            q.iter().enumerate().filter(|&(_, &v)| v != Self::NONE).map(move |(i, _)| ((p as u32) << Self::BITS) | i as u32)
+        })
+    }
+
+    fn clear(&mut self) {
+        self.pages.clear();
+        self.len = 0;
+    }
+}
+
+/// local eid → (相手, 辺の row) の昇順の並び (4096 row ずつのページ)。 到達の辺の索引: 届く row を広げるたびに出る辺を
+/// 引くので、 BTreeSet の (始点, 終点, 辺) の範囲引きより、 row の並びを 1 回引く方が速い。
+struct Adj<T = (u32, u32)> {
+    pages: Vec<Option<Box<[Vec<T>]>>>,
+}
+
+impl<T> Default for Adj<T> {
+    fn default() -> Self {
+        Adj { pages: Vec::new() }
+    }
+}
+
+impl Adj<(u32, u32)> {
+    /// x から o への辺が在るか。
+    fn has(&self, x: u32, o: u32) -> bool {
+        let v = self.get(x);
+        let i = v.partition_point(|&(a, _)| a < o);
+        v.get(i).is_some_and(|&(a, _)| a == o)
+    }
+}
+
+impl<T: Ord + Copy> Adj<T> {
+    const BITS: u32 = 12;
+
+    fn slot(x: u32) -> (usize, usize) {
+        ((x >> Self::BITS) as usize, (x & ((1 << Self::BITS) - 1)) as usize)
+    }
+
+    fn get(&self, x: u32) -> &[T] {
+        let (p, i) = Self::slot(x);
+        match self.pages.get(p).and_then(|q| q.as_ref()) {
+            Some(q) => &q[i],
+            None => &[],
+        }
+    }
+
+    fn insert(&mut self, x: u32, e: T) -> bool {
+        let (p, i) = Self::slot(x);
+        if self.pages.len() <= p {
+            self.pages.resize_with(p + 1, || None);
+        }
+        let v = &mut self.pages[p].get_or_insert_with(|| (0..1 << Self::BITS).map(|_| Vec::new()).collect())[i];
+        match v.binary_search(&e) {
+            Ok(_) => false,
+            Err(j) => {
+                if v.len() < 4 {
+                    // 辺の少ない row (ほとんど) は詰めて持つ
+                    v.reserve_exact(1);
+                }
+                v.insert(j, e);
+                true
+            }
+        }
+    }
+
+    fn remove(&mut self, x: u32, e: T) -> bool {
+        let (p, i) = Self::slot(x);
+        let Some(v) = self.pages.get_mut(p).and_then(|q| q.as_mut()).map(|q| &mut q[i]) else { return false };
+        match v.binary_search(&e) {
+            Ok(j) => {
+                v.remove(j);
+                if v.is_empty() {
+                    *v = Vec::new();
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// local eid の集合 (4096 row ずつのビットのページ、 触ったページだけ持つ)。 購読の 「条件を満たす row」 は table の
+/// 全 row になりうる (100 万 row で BTreeSet は数十 MB、 ビットなら 128 KB) し、 poll ごとに出入りした row の数だけ引く。
+#[derive(Default)]
+struct RowSet {
+    pages: Vec<Option<Box<[u64]>>>,
+}
+
+impl RowSet {
+    const BITS: u32 = 12;
+
+    fn slot(x: u32) -> (usize, usize, u64) {
+        ((x >> Self::BITS) as usize, ((x >> 6) & ((1 << (Self::BITS - 6)) - 1)) as usize, 1 << (x & 63))
+    }
+
+    fn contains(&self, x: u32) -> bool {
+        let (p, w, b) = Self::slot(x);
+        self.pages.get(p).and_then(|q| q.as_ref()).is_some_and(|q| q[w] & b != 0)
+    }
+
+    /// 無かったら true。
+    fn insert(&mut self, x: u32) -> bool {
+        let (p, w, b) = Self::slot(x);
+        if self.pages.len() <= p {
+            self.pages.resize_with(p + 1, || None);
+        }
+        let q = self.pages[p].get_or_insert_with(|| vec![0; 1 << (Self::BITS - 6)].into_boxed_slice());
+        let new = q[w] & b == 0;
+        q[w] |= b;
+        new
+    }
+
+    /// 在ったら true。
+    fn remove(&mut self, x: u32) -> bool {
+        let (p, w, b) = Self::slot(x);
+        match self.pages.get_mut(p).and_then(|q| q.as_mut()) {
+            Some(q) => {
+                let had = q[w] & b != 0;
+                q[w] &= !b;
+                had
+            }
+            None => false,
+        }
+    }
+}
+
+impl Graph {
+    fn outs(&self, x: u32) -> impl Iterator<Item = u32> + '_ {
+        self.out.get(x).iter().map(|t| t.0)
+    }
+
+    fn ins(&self, x: u32) -> impl Iterator<Item = u32> + '_ {
+        self.inn.get(x).iter().map(|t| t.0)
+    }
+
+    fn reached(&self, x: u32) -> bool {
+        self.sup.contains(x)
+    }
+
+    /// x が支えている row。
+    fn kids(&self, x: u32) -> Vec<u32> {
+        let mut v: Vec<u32> = self.outs(x).filter(|&y| self.sup.get(y) == Some(x)).collect();
+        v.dedup();
+        v
+    }
+
+    /// w から辺を出して届かせられるか (seed か、 届く row)。
+    fn source(&self, w: u32) -> bool {
+        self.seed.contains(&w) || self.sup.contains(w)
+    }
+
+    /// w が支えになれるか: w から支えをたどって seed に着く。 支えを探している row (支えを外してある) を通る鎖は着かない
+    /// ので、 探している row 自身を通る鎖 (輪) も着かない。 鎖は輪にならないので、 届く row の数より長くはならない —
+    /// 超えたら支えの森が壊れている: debug では panic (止まらずに気づく)、 release では着かない側 (外して広げ直す) に倒す。
+    fn chain_ok(&self, mut w: u32) -> bool {
+        for _ in 0..=self.sup.len() {
+            if self.seed.contains(&w) {
+                return true;
+            }
+            match self.sup.get(w) {
+                Some(p) => w = p,
+                None => return false,
+            }
+        }
+        debug_assert!(false, "到達: 支えの鎖が輪になっている (row {w})");
+        false
+    }
+
+    fn set_sup(&mut self, x: u32, w: u32) {
+        self.sup.insert(x, w);
+    }
+
+    /// x の支えを外して `pending` に積む (支えていなければ何もしない)。
+    fn unhook(&mut self, x: u32, pending: &mut Vec<(u32, u32)>) {
+        if let Some(old) = self.sup.remove(x) {
+            pending.push((x, old));
+        }
+    }
+
+    /// 辺を `del` だけ消して `add` だけ足し、 seed を `unseed` だけ外して `seed` だけ入れる。 届くかが変わりうる row を返す。
+    fn update(&mut self, del: &[(u32, u32, u32)], add: &[(u32, u32, u32)], unseed: &[u32], seed: &[u32]) -> Vec<u32> {
+        // 1. 辺と seed を消して足す (置くだけ)。 支えの辺が消えた row と、 外れた seed が支えていた row を覚える
+        let mut roots: Vec<u32> = Vec::new();
+        for &(s, d, r) in del {
+            if self.out.remove(s, (d, r)) {
+                self.inn.remove(d, (s, r));
+                if self.sup.get(d) == Some(s) && !self.out.has(s, d) {
+                    roots.push(d);
+                }
+            }
+        }
+        for &s in unseed {
+            if self.seed.remove(&s) {
+                roots.extend(self.kids(s));
+            }
+        }
+        for &(s, d, r) in add {
+            if self.out.insert(s, (d, r)) {
+                self.inn.insert(d, (s, r));
+            }
+        }
+        let fresh: Vec<u32> = seed.iter().copied().filter(|&s| self.seed.insert(s)).collect();
+        // 2. 支えを探し直す (探している間は、 その row を通る鎖は seed に着かない)
+        let mut pending: Vec<(u32, u32)> = Vec::new();
+        for x in roots {
+            self.unhook(x, &mut pending);
+        }
+        let mut gone: Vec<u32> = Vec::new();
+        while let Some((x, old)) = pending.pop() {
+            let has_old = self.out.has(old, x);
+            let alt = if has_old && self.chain_ok(old) { Some(old) } else { self.ins(x).find(|&w| w != old && self.chain_ok(w)) };
+            match alt {
+                Some(w) => self.set_sup(x, w),
+                None => {
+                    gone.push(x);
+                    for y in self.kids(x) {
+                        self.unhook(y, &mut pending);
+                    }
+                }
+            }
+        }
+        // 3. 広げる: 外した row のうち届く支えを持つもの、 足した辺の先、 入った seed の先から (幅優先)
+        let mut queue: std::collections::VecDeque<(u32, u32)> = std::collections::VecDeque::new();
+        for &x in &gone {
+            if let Some(w) = self.ins(x).find(|&w| self.source(w)) {
+                queue.push_back((w, x));
+            }
+        }
+        for &(s, d, _) in add {
+            queue.push_back((s, d));
+        }
+        for &s in &fresh {
+            queue.extend(self.outs(s).map(|y| (s, y)));
+        }
+        let mut touched = gone;
+        while let Some((w, x)) = queue.pop_front() {
+            if self.reached(x) || !self.source(w) {
+                continue;
+            }
+            self.set_sup(x, w);
+            touched.push(x);
+            let next: Vec<u32> = self.outs(x).filter(|&y| !self.reached(y)).collect();
+            queue.extend(next.into_iter().map(|y| (x, y)));
+        }
+        touched
+    }
+}
+
+/// 鍵付きの購読の差分 `k` を当てる前の、 row `e` の鍵。 `now` = 当てた後 (渡し済みの鍵)。 差分は eid の昇順。
+fn key_before(k: &enchudb_engine::KeyedDelta, e: EntityId, now: Option<u64>) -> Option<u64> {
+    match k.removed.binary_search_by_key(&e, |x| x.0) {
+        Ok(i) => Some(k.removed[i].1),
+        Err(_) if k.added.binary_search_by_key(&e, |x| x.0).is_ok() => None,
+        Err(_) => now,
+    }
+}
+
+/// 到達の購読の元。
+struct ReachLive {
+    /// 辺の row の始点 / 終点の鍵付きの購読
+    src: enchudb_engine::LiveKeyed,
+    dst: enchudb_engine::LiveKeyed,
+    seeds: enchudb_engine::LiveQuery,
+    filter: enchudb_engine::LiveQuery,
+}
+
+/// 到達の購読の状態。
+#[derive(Default)]
+struct ReachState {
+    graph: Graph,
+    /// この query の条件を満たす row。
+    filt: RowSet,
+    /// 最後に渡した row。
+    reported: RowSet,
+}
+
+/// [`ReachQuery::subscribe`] の戻り値。 辺の table をたどって届く row の出入りを購読する。
+pub struct LiveReach {
+    eng: Arc<Engine>,
+    live: Option<ReachLive>,
+    state: std::sync::Mutex<ReachState>,
+}
+
+impl LiveReach {
+    /// 前回 poll からの差分 (昇順)。 同じ row が両方に居たら 「消えて、 別物として入り直した」。
+    pub fn poll(&self) -> LiveDelta {
+        use std::collections::BTreeSet;
+        let Some(lv) = &self.live else { return LiveDelta::default() };
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let ReachState { graph, filt, reported } = &mut *st;
+        let peer = self.eng.peer_id();
+        let local = |e: EntityId| enchudb_oplog::eid_local(e);
+        let (dsrc, ddst, ds, df) = (lv.src.poll(&self.eng), lv.dst.poll(&self.eng), lv.seeds.poll(&self.eng), lv.filter.poll(&self.eng));
+        // 辺の row の (始点, 終点) の前後。 後 = 鍵付きの購読が渡し済みの鍵、 前 = 差分の removed か、 動いていなければ後と同じ
+        let mut rows: Vec<EntityId> = [&dsrc, &ddst].iter().flat_map(|k| k.removed.iter().chain(k.added.iter()).map(|x| x.0)).collect();
+        rows.sort_unstable();
+        rows.dedup();
+        let (s_now, d_now) = (lv.src.reported_keys(&rows), lv.dst.reported_keys(&rows));
+        let (mut del, mut add) = (Vec::new(), Vec::new());
+        for (i, &e) in rows.iter().enumerate() {
+            let (s1, d1) = (s_now[i], d_now[i]);
+            let (s0, d0) = (key_before(&dsrc, e, s1), key_before(&ddst, e, d1));
+            if (s0, d0) == (s1, d1) {
+                continue;
+            }
+            let r = local(e);
+            if let (Some(s), Some(d)) = (s0, d0) {
+                del.push((s as u32, d as u32, r));
+            }
+            if let (Some(s), Some(d)) = (s1, d1) {
+                add.push((s as u32, d as u32, r));
+            }
+        }
+        let unseed: Vec<u32> = ds.removed.iter().map(|&e| local(e)).collect();
+        let seed: Vec<u32> = ds.added.iter().map(|&e| local(e)).collect();
+        let mut touched = graph.update(&del, &add, &unseed, &seed);
+        // 入り直した row (eid の使い回し) は別物: 答えが同じでも出て入り直す
+        let rs: BTreeSet<EntityId> = df.removed.iter().copied().collect();
+        let reborn: BTreeSet<u32> = df.added.iter().filter(|e| rs.contains(e)).map(|&e| local(e)).collect();
+        for &e in &df.removed {
+            filt.remove(local(e));
+            touched.push(local(e));
+        }
+        for &e in &df.added {
+            filt.insert(local(e));
+            touched.push(local(e));
+        }
+        touched.sort_unstable();
+        touched.dedup();
+        let mut d = LiveDelta::default();
+        for x in touched {
+            let now = graph.reached(x) && filt.contains(x);
+            let was = reported.contains(x);
+            let e = enchudb_oplog::make_eid(peer, x);
+            match (was, now) {
+                (false, true) => {
+                    reported.insert(x);
+                    d.added.push(e);
+                }
+                (true, false) => {
+                    reported.remove(x);
+                    d.removed.push(e);
+                }
+                (true, true) if reborn.contains(&x) => {
+                    d.removed.push(e);
+                    d.added.push(e);
+                }
+                _ => {}
+            }
+        }
+        d
+    }
+}
+
+impl std::fmt::Debug for LiveReach {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveReach").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for LiveUnder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveUnder").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for LiveMultiJoin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveMultiJoin").field("steps", &self.steps.len()).finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for LiveJoin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveJoin").finish_non_exhaustive()
+    }
+}
+
 // ─────────────────────────── Query ───────────────────────────
 
 /// 条件。 値は engine の u64 (Number は値、 BigInt は符号化した値、 Ref は local eid、 Tag は vocab id)。
@@ -2124,8 +4758,36 @@ enum Predicate {
     /// 単一列の条件 (Eq / EqText / In / Present) が偽 (値の無い row も真)。
     Not(Box<Predicate>),
     /// 別の table の row がこの row を ref 列 (himo `via`) で指していて、 条件 (engine の条件に写し済み、
-    /// None = 常に 0 件) を満たすものがある。
-    Exists { via: u16, preds: Option<Vec<enchudb_engine::LivePred>> },
+    /// None = 常に 0 件) を満たすものが `min` 個以上ある (`where_exists` は 1)。
+    Exists { via: u16, th: Th, preds: Option<Vec<enchudb_engine::LivePred>> },
+    /// 別の table の row のうち、 列 (himo `theirs`) の値がこの row の列 (himo `mine`) の値と等しく、 条件を
+    /// 満たすものが `min` 個以上ある (値で結ぶ準結合)。
+    ExistsEq { mine: u16, theirs: u16, th: Th, preds: Option<Vec<enchudb_engine::LivePred>> },
+}
+
+/// 存在の条件の閾値 (engine の `CountAtLeast` / `SumAtLeast`)。
+#[derive(Clone, Copy, Debug)]
+enum Th {
+    Count(u64),
+    /// 和の列 (himo)、 閾値、 BigInt (値を 2^63 ずらして載せる列) か。
+    Sum(u16, i128, bool),
+}
+
+/// `where_*` の閾値の指定 (和の列はまだ名前)。
+enum ThSpec<'s> {
+    Count(u64),
+    Sum(&'s str, i128),
+}
+
+/// 閾値の指定を解決する。 和の列が `table` の Number / BigInt 列でなければ None。
+fn th_of(table: &TableInner, spec: ThSpec) -> Option<Th> {
+    match spec {
+        ThSpec::Count(n) => Some(Th::Count(n)),
+        ThSpec::Sum(col, n) => {
+            let cd = table.col(col).filter(|c| matches!(c.ty, ColumnType::Number | ColumnType::BigInt))?;
+            Some(Th::Sum(cd.himo_id, n, cd.ty == ColumnType::BigInt))
+        }
+    }
 }
 
 pub struct Query<'a> {
@@ -2360,7 +5022,7 @@ impl<'a> Query<'a> {
     /// `via_col` は `sub` の table の ref 列で、 この table を指すこと (違えば常に 0 件)。 find / count /
     /// subscribe のどれでも使える。 購読では、 指している row の出入り・中身の変化も届く。
     pub fn where_exists(mut self, sub: Query<'a>, via_col: &str) -> Self {
-        let p = self.exists_pred(sub, via_col);
+        let p = self.exists_pred(sub, via_col, ThSpec::Count(1));
         match p {
             Some(p) => self.preds.push(p),
             None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
@@ -2370,7 +5032,7 @@ impl<'a> Query<'a> {
 
     /// [`where_exists`](Self::where_exists) の否定: 指している row が 1 つも無い (SQL の `NOT EXISTS`)。
     pub fn where_not_exists(mut self, sub: Query<'a>, via_col: &str) -> Self {
-        let p = self.exists_pred(sub, via_col);
+        let p = self.exists_pred(sub, via_col, ThSpec::Count(1));
         match p {
             Some(p) => self.preds.push(Predicate::Not(Box::new(p))),
             None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
@@ -2378,8 +5040,311 @@ impl<'a> Query<'a> {
         self
     }
 
+    /// `sub` (別の table への query) の row のうち、 列 `their_col` の値がこの row の列 `my_col` の値と等しい
+    /// ものが 1 つ以上ある (値で結ぶ準結合、 SQL の `EXISTS (SELECT .. FROM sub WHERE sub.their_col =
+    /// this.my_col AND ..)`)。
+    ///
+    /// ```ignore
+    /// // 営業中の店がある街に住む user
+    /// let q = users.all().where_exists_eq("city", shops.where_eq("open", 1i64), "city");
+    /// // 会社の所在地に店が 1 軒も無い社員 (自分の列は ref の先でもよい)
+    /// let q = users.all().where_not_exists_eq("company.city", shops.all(), "city");
+    /// ```
+    ///
+    /// 2 つの列は同じ型 (Tag / Number / BigInt どうし) であること (違えば常に 0 件)。 ref でつなぐ時は
+    /// [`where_exists`](Self::where_exists)。 find / count / subscribe のどれでも使える。 購読では、 この row の
+    /// 列の書き換えも、 `sub` の row の出入り・中身の変化も届く (値の row が 0 件 ↔ 1 件以上をまたぐと、 その値を
+    /// 持つ row がまとめて出入りする)。
+    ///
+    /// 1 つの値を持つ row が多い (1 街に 1 万人) なら、 row 単位の購読は値 1 つの出入りで 1 万件の差分になる。
+    /// 値 (街) 単位の差分でよければ、 `sub` 側を値ごとに数える購読で足りる (書き込み 1 回 O(1)、 row は引く時に):
+    ///
+    /// ```ignore
+    /// let open = shops.where_eq("open", 1i64).subscribe_counts("city")?;
+    /// for (city, n) in open.poll() {
+    ///     // n == 0: その街から開いた店が消えた。 前回まで 0 だった街の n >= 1: 開いた店ができた
+    ///     let people = users.where_eq("city", city).find()?;   // 住人は引いた時点の中身
+    /// }
+    /// ```
+    pub fn where_exists_eq(mut self, my_col: &str, sub: Query<'a>, their_col: &str) -> Self {
+        match self.exists_eq_pred(my_col, sub, their_col, ThSpec::Count(1)) {
+            Some((path, p)) => self.push_at(path, p),
+            None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
+        }
+        self
+    }
+
+    /// [`where_exists_eq`](Self::where_exists_eq) の否定: 値の等しい row が 1 つも無い (SQL の `NOT EXISTS`)。
+    /// この row の列に値が無ければ真 (SQL と同じ)。
+    pub fn where_not_exists_eq(mut self, my_col: &str, sub: Query<'a>, their_col: &str) -> Self {
+        match self.exists_eq_pred(my_col, sub, their_col, ThSpec::Count(1)) {
+            Some((path, p)) => {
+                if !path.is_empty() {
+                    // 1 段目の ref に値がある (where_ne と同じ)
+                    self.preds.push(Predicate::Present(path[0]));
+                }
+                self.push_at(path, Predicate::Not(Box::new(p)))
+            }
+            None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
+        }
+        self
+    }
+
+    /// この query の row と、 ref 列 `ref_col` で指している `other` (別の table への query) の row の **組** (JOIN)。
+    /// 結果は `(この row, 指している row)`、 この row 1 つにつき組は高々 1 つ。
+    ///
+    /// ```ignore
+    /// // 公開済みの投稿と、 その作者 (日本の user) の組
+    /// let q = posts.where_eq("published", 1i64).join_ref("author", users.where_eq("country", "JP"));
+    /// q.find()?;                     // Vec<(post, user)>
+    /// let live = q.subscribe()?;     // 組の出入り (投稿の作者の付け替えも、 作者の条件の変化も届く)
+    /// ```
+    ///
+    /// `ref_col` はこの table の ref 列で、 `other` の table を指すこと (違えば `find` / `subscribe` が `BadValue`)。
+    pub fn join_ref(self, ref_col: &str, other: Query<'a>) -> JoinQuery<'a> {
+        JoinQuery { left: self, right: other, on: JoinOn::Ref(ref_col.to_string()) }
+    }
+
+    /// 階層 (この table が自分を指す ref 列 `ref_col`、 上司 / 親部署 / 親カテゴリ …) で、 `seeds` (同じ table への
+    /// query) の row の **配下** (何段下でも、 seed 自身は含まない) の row のうち、 この query の条件を満たすもの
+    /// (SQL の再帰 CTE `WITH RECURSIVE`)。
+    ///
+    /// ```ignore
+    /// // Alice の配下全員 (何段下でも)
+    /// let q = employees.all().under("manager", employees.where_eq("name", "Alice"));
+    /// q.find()?;
+    /// let live = q.subscribe()?;   // 付け替え (異動・部署の移動) で配下が丸ごと出入りする
+    /// ```
+    ///
+    /// - たどる階層は table の全 row (この query の条件は結果を絞るだけ)。 ref が輪になっていても、 seed に着かなければ配下でない
+    /// - `ref_col` はこの table を指す ref 列、 `seeds` は同じ table への query (違えば `find` / `subscribe` が `BadValue`)
+    pub fn under(self, ref_col: &str, seeds: Query<'a>) -> UnderQuery<'a> {
+        UnderQuery { rows: self, seeds, ref_col: ref_col.to_string(), up: false }
+    }
+
+    /// [`Query::under`] の上向き: `seeds` の row の **上** (上司の上司 … 何段上でも、 seed 自身は含まない) の row のうち、
+    /// この query の条件を満たすもの (SQL の再帰 CTE で祖先をたどる形)。
+    ///
+    /// ```ignore
+    /// // Alice の上司全員 (何段上でも)
+    /// employees.all().above("manager", employees.where_eq("name", "Alice")).subscribe()?;
+    /// ```
+    ///
+    /// - ref が輪になっている時、 輪の row は 「輪とそこにぶら下がる row の seed (自分を除く)」 の上。 輪は 1 周で止まる
+    /// - seed の出入り・葉 (部下の居ない row) の付け替えのコストは答えが変わる row の数に比例 (深さ・配下の数によらない)。
+    ///   部下の居る row の付け替えは、 輪ができるかを見るので深さに比例
+    pub fn above(self, ref_col: &str, seeds: Query<'a>) -> UnderQuery<'a> {
+        UnderQuery { rows: self, seeds, ref_col: ref_col.to_string(), up: true }
+    }
+
+    /// 辺の table (`edges`、 始点 `src_col` と終点 `dst_col` がどちらもこの table を指す ref 列) を何本たどっても `seeds` の row から
+    /// 届く row のうち、 この query の条件を満たすもの (SQL の再帰 CTE でグラフをたどる形、 親が複数あってよい)。
+    ///
+    /// ```ignore
+    /// // Alice から follow を何段たどっても届く人
+    /// let q = users.all().reachable(follows.all(), "from", "to", users.where_eq("name", "Alice"));
+    /// let live = q.subscribe()?;   // follow の増減・付け替えで届く人が出入りする
+    /// ```
+    ///
+    /// - 辺は 1 本以上たどる (seed 自身は、 辺をたどって戻ってこなければ入らない)。 輪があってよい
+    /// - 辺の query の条件 (`follows.where_eq("kind", "friend")` など) を満たす辺だけをたどる。 たどる途中の row は
+    ///   この query の条件を問わない (条件は結果を絞るだけ)
+    /// - 辺が消えた時は支えを失った row の段だけを決め直す。 橋になっていた辺を消すと、 その先の全部を決め直す
+    pub fn reachable(self, edges: Query<'a>, src_col: &str, dst_col: &str, seeds: Query<'a>) -> ReachQuery<'a> {
+        ReachQuery { rows: self, edges, src_col: src_col.to_string(), dst_col: dst_col.to_string(), seeds }
+    }
+
+    /// この query の row と `other` (別の table への query) の row のうち、 この row の列 `my_col` の値と `other` の
+    /// 列 `their_col` の値が等しいものの **組** (値で結ぶ JOIN、 SQL の `JOIN .. ON a.my_col = b.their_col`)。
+    ///
+    /// ```ignore
+    /// // 住人と、 住む街の開いた店の組
+    /// let q = users.all().join_eq("city", shops.where_eq("open", 1i64), "city");
+    /// ```
+    ///
+    /// `my_col` は ref の先でもよい (`"company.city"`)。 2 つの列は同じ型 (Tag / Number / BigInt、 違えば `BadValue`)。
+    /// 1 つの値に両側が大勢いると組は掛け算で増える (街に住人 1 万 × 店 10 = 組 10 万、 店 1 軒の出入りで組 1 万)。
+    pub fn join_eq(self, my_col: &str, other: Query<'a>, their_col: &str) -> JoinQuery<'a> {
+        JoinQuery { left: self, right: other, on: JoinOn::Eq(my_col.to_string(), their_col.to_string()) }
+    }
+
+    /// この query の row と `other` (別の table への query) の row のうち、 この row の列 `my_col` の値が `other` の
+    /// 列 `lo_col` と `hi_col` の値の間 (両端を含む) にあるものの **組** (範囲で結ぶ JOIN、 SQL の
+    /// `JOIN .. ON a.my_col BETWEEN b.lo_col AND b.hi_col`)。
+    ///
+    /// ```ignore
+    /// // イベントと、 その時刻を含むセッションの組
+    /// let q = events.all().join_range("at", sessions.all(), "start", "end");
+    /// q.find()?;                 // Vec<(イベント, セッション)>
+    /// let live = q.subscribe()?; // イベントの時刻・セッションの始点 / 終点の書き換えで組が出入りする
+    /// ```
+    ///
+    /// - 3 つの列は全部 Number か全部 BigInt (違えば `BadValue`)。 `my_col` は ref の先でもよい (`"company.founded"`)
+    /// - 始点 > 終点の row・値の無い row は組にならない
+    /// - 組の購読は左の値と右の区間を持つ (メモリは両側の結果に比例)。 区間の書き換え 1 回で、 旧区間と新区間に居る
+    ///   左の row の数だけ組が動く (両方に居る row の組は居続ける)
+    /// - `subscribe_counts` / 3 つ以上の table の組 (`then_*`) はまだ (`BadValue`)
+    pub fn join_range(self, my_col: &str, other: Query<'a>, lo_col: &str, hi_col: &str) -> JoinQuery<'a> {
+        JoinQuery { left: self, right: other, on: JoinOn::Range(my_col.to_string(), lo_col.to_string(), hi_col.to_string()) }
+    }
+
+    /// この query の row を列 `part_col` の値で group に分け、 group の中で列 `order_col` の順に並べた時の、 各 row と
+    /// **1 つ前の row** の組 (window 関数 `LAG(..) OVER (PARTITION BY part_col ORDER BY order_col)`)。 同じ値は eid の昇順。
+    ///
+    /// ```ignore
+    /// // user ごとに、 各イベントと 1 つ前のイベント (間隔・変化を見る)
+    /// let live = events.all().lag("user", "at").subscribe()?;   // PairDelta: (イベント, 1 つ前のイベント)
+    /// ```
+    ///
+    /// - group の先頭の row は組にならない。 1 つ後 (`LEAD`) は組を裏返す
+    /// - `part_col` は Tag / Number / BigInt / Ref (ref の先でもよい)、 `order_col` は Number / BigInt (ref の先でもよい)。
+    ///   値の無い row は並ばない
+    /// - 書き込み 1 回で動く組は高々 3 つずつ (抜けた所の前後がつながり、 入った所の前後が切れる)
+    pub fn lag(self, part_col: &str, order_col: &str) -> LagQuery<'a> {
+        LagQuery { rows: self, part: Some(part_col.to_string()), order: order_col.to_string() }
+    }
+
+    /// [`Query::lag`] の group なし版 (結果全体を `order_col` の順に並べる)。
+    pub fn lag_all(self, order_col: &str) -> LagQuery<'a> {
+        LagQuery { rows: self, part: None, order: order_col.to_string() }
+    }
+
+    /// `sub` (別の table への query) の row のうち、 ref 列 `via_col` でこの row を指しているものが **`n` 個以上**
+    /// ある (SQL の `HAVING COUNT(*) >= n`、 [`where_exists`](Self::where_exists) の件数版)。
+    ///
+    /// ```ignore
+    /// // 30 歳より上の社員が 50 人以上いる会社
+    /// let q = companies.all().where_count_ge(users.all().where_gt("age", 30i64), "company", 50);
+    /// ```
+    ///
+    /// find / count / subscribe のどれでも使える。 購読では、 数えている row の出入り・中身の変化で件数が
+    /// `n` をまたいだ row が出入りする (書き込み 1 回あたり、 またいだ group の数に比例)。 `n == 0` は常に真
+    /// (条件を足さない)。 `via_col` の条件は [`where_exists`](Self::where_exists) と同じ。
+    pub fn where_count_ge(mut self, sub: Query<'a>, via_col: &str, n: u64) -> Self {
+        if n == 0 {
+            return self;
+        }
+        match self.exists_pred(sub, via_col, ThSpec::Count(n)) {
+            Some(p) => self.preds.push(p),
+            None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
+        }
+        self
+    }
+
+    /// [`where_count_ge`](Self::where_count_ge) の否定: 指している row が `n` 個未満 (0 個も含む、 SQL の
+    /// `HAVING COUNT(*) < n` に 0 件の row を足したもの)。 `n == 0` は常に偽。
+    pub fn where_count_lt(mut self, sub: Query<'a>, via_col: &str, n: u64) -> Self {
+        match self.exists_pred(sub, via_col, ThSpec::Count(n)).filter(|_| n > 0) {
+            Some(p) => self.preds.push(Predicate::Not(Box::new(p))),
+            None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
+        }
+        self
+    }
+
+    /// `sub` の row のうち、 列 `their_col` の値がこの row の列 `my_col` の値と等しいものが **`n` 個以上** ある
+    /// ([`where_exists_eq`](Self::where_exists_eq) の件数版)。
+    ///
+    /// ```ignore
+    /// // 開いた店が 3 軒以上ある街に住む user
+    /// let q = users.all().where_value_count_ge("city", shops.where_eq("open", 1i64), "city", 3);
+    /// ```
+    ///
+    /// 列の条件は [`where_exists_eq`](Self::where_exists_eq) と同じ。 `n == 0` は常に真 (条件を足さない)。
+    pub fn where_value_count_ge(mut self, my_col: &str, sub: Query<'a>, their_col: &str, n: u64) -> Self {
+        if n == 0 {
+            return self;
+        }
+        match self.exists_eq_pred(my_col, sub, their_col, ThSpec::Count(n)) {
+            Some((path, p)) => self.push_at(path, p),
+            None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
+        }
+        self
+    }
+
+    /// [`where_value_count_ge`](Self::where_value_count_ge) の否定: 値の等しい row が `n` 個未満 (0 個も含む)。
+    /// この row の列に値が無ければ真 ([`where_not_exists_eq`](Self::where_not_exists_eq) と同じ)。 `n == 0` は常に偽。
+    pub fn where_value_count_lt(mut self, my_col: &str, sub: Query<'a>, their_col: &str, n: u64) -> Self {
+        match self.exists_eq_pred(my_col, sub, their_col, ThSpec::Count(n)).filter(|_| n > 0) {
+            Some((path, p)) => {
+                if !path.is_empty() {
+                    self.preds.push(Predicate::Present(path[0]));
+                }
+                self.push_at(path, Predicate::Not(Box::new(p)))
+            }
+            None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
+        }
+        self
+    }
+
+    /// `sub` (別の table への query) の row のうち、 ref 列 `via_col` でこの row を指しているものが 1 つ以上あり、
+    /// その列 `sum_col` の値の和が **`n` 以上** (SQL の `HAVING SUM(sum_col) >= n`)。
+    ///
+    /// ```ignore
+    /// // 注文の合計金額が 100 万以上の顧客
+    /// let q = customers.all().where_sum_ge(orders.where_eq("status", "paid"), "customer", "amount", 1_000_000);
+    /// ```
+    ///
+    /// - `sum_col` は `sub` の table の Number / BigInt 列 (違えば常に 0 件)。 値の無い row は 0 として足す
+    /// - 指している row が 1 つも無い row は入らない (SQL と同じく、 行の無い group の和は NULL)
+    /// - find / count / subscribe のどれでも。 購読では、 数えている row の出入り・和の列の書き換えで和が `n` を
+    ///   またいだ row が出入りする
+    pub fn where_sum_ge(mut self, sub: Query<'a>, via_col: &str, sum_col: &str, n: i64) -> Self {
+        match self.exists_pred(sub, via_col, ThSpec::Sum(sum_col, n as i128)) {
+            Some(p) => self.preds.push(p),
+            None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
+        }
+        self
+    }
+
+    /// [`where_sum_ge`](Self::where_sum_ge) の否定: 指している row が無いか、 和が `n` 未満。
+    pub fn where_sum_lt(mut self, sub: Query<'a>, via_col: &str, sum_col: &str, n: i64) -> Self {
+        match self.exists_pred(sub, via_col, ThSpec::Sum(sum_col, n as i128)) {
+            Some(p) => self.preds.push(Predicate::Not(Box::new(p))),
+            // 列が不正は常に 0 件 (他の where_* と同じ)
+            None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
+        }
+        self
+    }
+
+    /// `sub` の row のうち、 列 `their_col` の値がこの row の列 `my_col` の値と等しいものが 1 つ以上あり、 その列
+    /// `sum_col` の和が **`n` 以上** ([`where_value_count_ge`](Self::where_value_count_ge) の和の版)。
+    pub fn where_value_sum_ge(mut self, my_col: &str, sub: Query<'a>, their_col: &str, sum_col: &str, n: i64) -> Self {
+        match self.exists_eq_pred(my_col, sub, their_col, ThSpec::Sum(sum_col, n as i128)) {
+            Some((path, p)) => self.push_at(path, p),
+            None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
+        }
+        self
+    }
+
+    /// [`where_value_sum_ge`](Self::where_value_sum_ge) の否定: 値の等しい row が無いか、 和が `n` 未満。 この row の
+    /// 列に値が無ければ真。
+    pub fn where_value_sum_lt(mut self, my_col: &str, sub: Query<'a>, their_col: &str, sum_col: &str, n: i64) -> Self {
+        match self.exists_eq_pred(my_col, sub, their_col, ThSpec::Sum(sum_col, n as i128)) {
+            Some((path, p)) => {
+                if !path.is_empty() {
+                    self.preds.push(Predicate::Present(path[0]));
+                }
+                self.push_at(path, Predicate::Not(Box::new(p)))
+            }
+            None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
+        }
+        self
+    }
+
+    /// `where_exists_eq` の条件と、 自分の列までの ref の道。 列が無い / 型が違う / Leaf / Ref なら None。
+    fn exists_eq_pred(&self, my_col: &str, sub: Query<'a>, their_col: &str, th: ThSpec) -> Option<(Vec<u16>, Predicate)> {
+        let (path, mine) = self.resolve_col(my_col)?;
+        let (theirs_ty, theirs) = sub.table.col(their_col).map(|c| (c.ty, c.himo_id))?;
+        if mine.ty != theirs_ty || matches!(mine.ty, ColumnType::Leaf | ColumnType::Ref) {
+            return None;
+        }
+        let th = th_of(&sub.table, th)?;
+        let preds = sub.live_preds().ok()?;
+        Some((path, Predicate::ExistsEq { mine: mine.himo_id, theirs, th, preds }))
+    }
+
     /// `where_exists` の条件。 `via_col` がこの table を指す ref 列でなければ None。
-    fn exists_pred(&self, sub: Query<'a>, via_col: &str) -> Option<Predicate> {
+    fn exists_pred(&self, sub: Query<'a>, via_col: &str, th: ThSpec) -> Option<Predicate> {
         let cd = sub.table.col(via_col)?;
         let points_here = cd.ty == ColumnType::Ref
             && sub.table.relations.iter().any(|r| {
@@ -2389,8 +5354,9 @@ impl<'a> Query<'a> {
             return None;
         }
         let via = cd.himo_id;
+        let th = th_of(&sub.table, th)?;
         let preds = sub.live_preds().ok()?;
-        Some(Predicate::Exists { via, preds })
+        Some(Predicate::Exists { via, th, preds })
     }
 
     /// `col` に値がある (SQL の `col IS NOT NULL`)。
@@ -2470,7 +5436,7 @@ impl<'a> Query<'a> {
         // ref をたどる条件 (`"company.city"`) を含むなら engine の live 条件評価に任せる
         // (候補を索引で引いて ref の逆引きで遡り、 全条件で評価)
         if self.preds.iter().any(|p| {
-            matches!(p, Predicate::Via(..) | Predicate::Or(_) | Predicate::Not(_) | Predicate::Present(_) | Predicate::Exists { .. })
+            matches!(p, Predicate::Via(..) | Predicate::Or(_) | Predicate::Not(_) | Predicate::Present(_) | Predicate::Exists { .. } | Predicate::ExistsEq { .. })
         }) {
             let limit = self.limit;
             let Some(preds) = self.live_preds()? else { return Ok(Vec::new()) };
@@ -2505,7 +5471,7 @@ impl<'a> Query<'a> {
                     in_pred = Some((h, vs));
                 }
                 Predicate::Range { himo_name, lo, hi } => range_preds.push((himo_name, lo, hi)),
-                Predicate::Via(..) | Predicate::Or(_) | Predicate::Not(_) | Predicate::Present(_) | Predicate::Exists { .. } => {
+                Predicate::Via(..) | Predicate::Or(_) | Predicate::Not(_) | Predicate::Present(_) | Predicate::Exists { .. } | Predicate::ExistsEq { .. } => {
                     unreachable!("Via / Or / Not / Present / Exists は find の先頭で find_by に回している")
                 }
             }
@@ -2639,6 +5605,39 @@ impl<'a> Query<'a> {
         self.subscribe_agg(col, None)
     }
 
+    /// この条件の結果を列 `col` の値で group 分けし、 **件数が `n` 以上の group** を購読する (live の
+    /// `GROUP BY col HAVING COUNT(*) >= n`)。 差分は閾値をまたいだ group の値。
+    ///
+    /// ```ignore
+    /// // 開いた店が 3 軒以上ある街
+    /// let busy = shops.where_eq("open", 1i64).subscribe_having("city", 3)?;
+    /// for city in busy.poll().added { /* 3 軒以上になった街 */ }
+    /// ```
+    ///
+    /// - group の row を引きたい時は [`where_count_ge`](Self::where_count_ge) (ref で指されている row) /
+    ///   [`where_value_count_ge`](Self::where_value_count_ge) (値の等しい row) で条件にする
+    /// - `col` の条件は [`subscribe_counts`](Self::subscribe_counts) と同じ。 `n == 0` は `BadValue`
+    pub fn subscribe_having(self, col: &str, n: u64) -> Result<LiveHaving, SchemaError> {
+        if n == 0 {
+            return Err(SchemaError::BadValue("subscribe_having: n must be at least 1".into()));
+        }
+        let counts = self.subscribe_agg(col, None)?;
+        Ok(LiveHaving { counts, th: HavingTh::Count(n), have: Default::default() })
+    }
+
+    /// この条件の結果を列 `col` の値で group 分けし、 **列 `sum_col` の和が `n` 以上の group** を購読する (live の
+    /// `GROUP BY col HAVING SUM(sum_col) >= n`、 行の無い group は入らない)。 差分は閾値をまたいだ group の値。
+    /// `sum_col` の条件は [`subscribe_sums`](Self::subscribe_sums) と同じ。
+    ///
+    /// ```ignore
+    /// // 支払い済みの注文の合計が 100 万以上の地域
+    /// let big = orders.where_eq("status", "paid").subscribe_having_sum("region", "amount", 1_000_000)?;
+    /// ```
+    pub fn subscribe_having_sum(self, col: &str, sum_col: &str, n: i64) -> Result<LiveHaving, SchemaError> {
+        let counts = self.subscribe_sums(col, sum_col)?;
+        Ok(LiveHaving { counts, th: HavingTh::Sum(n as i128), have: Default::default() })
+    }
+
     /// [`subscribe_counts`](Self::subscribe_counts) に加えて、 group ごとに列 `sum_col` の値の和も持つ
     /// (live の `GROUP BY col` + `COUNT(*)` + `SUM(sum_col)`)。 平均は合計 / 件数。
     ///
@@ -2706,6 +5705,15 @@ impl<'a> Query<'a> {
     /// `where_eq`)。 条件なし = table の全 row (`find()` と同じ代表列)。
     fn live_preds(self) -> Result<Option<Vec<enchudb_engine::LivePred>>, SchemaError> {
         use enchudb_engine::LivePred;
+        /// 閾値を engine の条件に (件数 1 は `Exists` / `ExistsEq`)。
+        fn th_pred(via: u16, mine: Option<u16>, th: Th, preds: Vec<LivePred>) -> LivePred {
+            match (th, mine) {
+                (Th::Count(1), None) => LivePred::Exists { via, preds },
+                (Th::Count(1), Some(mine)) => LivePred::ExistsEq { mine, theirs: via, preds },
+                (Th::Count(min), _) => LivePred::CountAtLeast { via, mine, min, preds },
+                (Th::Sum(sum_himo, min, signed), _) => LivePred::SumAtLeast { via, mine, sum_himo, min, signed, preds },
+            }
+        }
         let eng = self.db.engine();
         fn conv(eng: &Engine, p: Predicate, rep: Option<u16>) -> Result<Option<LivePred>, SchemaError> {
             let hid_of = |name: &str| -> Result<u16, SchemaError> {
@@ -2724,8 +5732,12 @@ impl<'a> Query<'a> {
                     None => return Ok(None),
                 },
                 Predicate::Present(h) => LivePred::Present { himo_id: h },
-                Predicate::Exists { via, preds } => match preds {
-                    Some(preds) => LivePred::Exists { via, preds },
+                Predicate::Exists { via, th, preds } => match preds {
+                    Some(preds) => th_pred(via, None, th, preds),
+                    None => return Ok(None),
+                },
+                Predicate::ExistsEq { mine, theirs, th, preds } => match preds {
+                    Some(preds) => th_pred(theirs, Some(mine), th, preds),
                     None => return Ok(None),
                 },
                 Predicate::Not(inner) => match conv(eng, *inner, rep)? {
@@ -2769,7 +5781,10 @@ impl<'a> Query<'a> {
             // ref もある)
             fn own(p: &LivePred) -> bool {
                 match p {
-                    LivePred::Not(_) | LivePred::Exists { .. } => false,
+                    LivePred::Not(_)
+                    | LivePred::Exists { .. }
+                    | LivePred::CountAtLeast { mine: None, .. }
+                    | LivePred::SumAtLeast { mine: None, .. } => false,
                     // 自分の ref 列に値がある (中身が否定でも)
                     LivePred::Via { .. } => true,
                     LivePred::Or(bs) => bs.iter().all(|b| b.iter().any(own)),

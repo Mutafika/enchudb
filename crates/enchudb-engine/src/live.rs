@@ -103,6 +103,20 @@
 //! 否定と同じく候補を引けない。 集計の購読は編集の lock の外で作り、 外で捨てる (作る・捨てる時に
 //! registry の lock を取るので)。
 //!
+//! 値で結ぶ存在 ([`LivePred::ExistsEq`]) は group が自分の列の値 (`Settled::exists` は値の集合)、 件数の閾値
+//! ([`LivePred::CountAtLeast`]、 `HAVING COUNT(*) >= min`) は 「1 以上」 を 「`min` 以上」 にしただけ。 dnf が
+//! 3 つとも `CountAtLeast` に揃える (`Exists` = `min: 1`)。 `min` は形の符号に入る (閾値が違えば別の family、
+//! 中身の集計の購読は共有)。 和の閾値 ([`LivePred::SumAtLeast`]、 `HAVING SUM(col) >= min`) は中身の集計の購読に
+//! 和の列を持たせ、 「件数が 1 以上で和が `min` 以上」 で判定する (内部の `Threshold`)。
+//!
+//! # 鍵付きの購読 ([`LiveKeyed`])
+//!
+//! 集合への出入りに加えて、 集合に居る entity の鍵 (列の値、 ref の先でもよい) の変化も差分に出す。 集計の
+//! 購読と同じく鍵の列を 「値を根まで運ぶ穴」 (`HoleVal::Group(KEYED)`) にし、 根の答え (鍵 id, 値) が
+//! 変わった entity を member の印に積む (出入りの印と同じ `changed` / `left`)。 取り出す時に今の値と報告済みの
+//! 値 (`KeyedState`) を比べる。 1 段目の部分和 (会社の所在地を配下を評価せずに移す) は使わない — 配下の
+//! 1 人ずつの鍵の変化を出すため。 組を返す JOIN (schema の `join_ref` / `join_eq`) の片側。
+//!
 //! # 集計の購読 ([`LiveCounts`])
 //!
 //! 結果を group の列の値ごとに数えた件数の live 版。 group の列を 「値を根まで運ぶ穴」 にする
@@ -238,6 +252,21 @@ pub enum LivePred {
     /// 満たすものが 1 つ以上ある (SQL の `EXISTS (SELECT .. WHERE x.via = this AND ..)`)。
     /// `Not(Exists)` = 1 つも無い。 中の件数は `via` で group 分けした集計の購読が持つ。
     Exists { via: u16, preds: Vec<LivePred> },
+    /// この entity の `mine` 列の値と、 `theirs` 列の値が等しい entity のうち、 `preds` を満たすものが 1 つ
+    /// 以上ある (値で結ぶ準結合、 SQL の `EXISTS (SELECT .. WHERE x.theirs = this.mine AND ..)`)。 `mine` と
+    /// `theirs` は同じ型の列 (Tag どうしは vocab id が共通)。 `Not(ExistsEq)` = 1 つも無い。 中の件数は
+    /// `theirs` の値で group 分けした集計の購読が持つ。
+    ExistsEq { mine: u16, theirs: u16, preds: Vec<LivePred> },
+    /// `preds` を満たす entity が **`min` 個以上** ある (SQL の `HAVING COUNT(*) >= min`)。 `mine` = None なら
+    /// この entity を ref 紐 `via` で指している entity を数える (`Exists` の件数版)、 `Some(m)` ならこの entity の
+    /// `m` 列の値を `via` 列に持つ entity を数える (`ExistsEq` の件数版)。 `min` は 1 以上 (`Exists` = `min: 1`)。
+    /// `Not(CountAtLeast)` = `min` 個未満 (0 個も含む)。
+    CountAtLeast { via: u16, mine: Option<u16>, min: u64, preds: Vec<LivePred> },
+    /// `preds` を満たす entity が 1 つ以上あり、 その `sum_himo` の値の和が **`min` 以上** (SQL の `HAVING SUM(col) >= min`、
+    /// 行の無い group は SQL と同じく偽)。 `via` / `mine` は `CountAtLeast` と同じ。 値の無い entity は 0 として足す。
+    /// `signed` = 値を 2^63 ずらして載せる列 (schema の BigInt、 `v ^ 2^63`) — 和を元の値の和に戻して比べる。
+    /// `Not(SumAtLeast)` = 1 つも無いか、 和が `min` 未満。
+    SumAtLeast { via: u16, mine: Option<u16>, sum_himo: u16, min: i128, signed: bool, preds: Vec<LivePred> },
     /// 枝のどれかが真 (各枝は条件の AND)。 `Via` の中にも書ける (`company.city = 東京 OR
     /// company.city = 大阪` = `Via { company, Or([[city = 東京], [city = 大阪]]) }`)。 枝も枝の中の
     /// AND も空は不可。 展開した枝 (AND の OR に直した数) は [`MAX_BRANCHES`] まで。
@@ -273,6 +302,28 @@ impl LivePred {
                     p.collect_himos(out);
                 }
             }
+            LivePred::ExistsEq { mine, theirs, preds } => {
+                out.push(*mine);
+                out.push(*theirs);
+                for p in preds {
+                    p.collect_himos(out);
+                }
+            }
+            LivePred::CountAtLeast { via, mine, preds, .. } => {
+                out.push(*via);
+                out.extend(*mine);
+                for p in preds {
+                    p.collect_himos(out);
+                }
+            }
+            LivePred::SumAtLeast { via, mine, sum_himo, preds, .. } => {
+                out.push(*via);
+                out.push(*sum_himo);
+                out.extend(*mine);
+                for p in preds {
+                    p.collect_himos(out);
+                }
+            }
             LivePred::Or(branches) => {
                 for p in branches.iter().flatten() {
                     p.collect_himos(out);
@@ -288,6 +339,53 @@ impl LivePred {
         out
     }
 
+    /// 条件に出てくる和の列 (`SumAtLeast` の `sum_himo`、 中身の中も)。 engine が Number / Number64 かを検証する用。
+    pub fn sum_himos(&self) -> Vec<u16> {
+        fn walk(p: &LivePred, out: &mut Vec<u16>) {
+            match p {
+                LivePred::Via { pred, .. } | LivePred::Not(pred) => walk(pred, out),
+                LivePred::Exists { preds, .. } | LivePred::ExistsEq { preds, .. } | LivePred::CountAtLeast { preds, .. } => {
+                    preds.iter().for_each(|q| walk(q, out))
+                }
+                LivePred::SumAtLeast { sum_himo, preds, .. } => {
+                    out.push(*sum_himo);
+                    preds.iter().for_each(|q| walk(q, out));
+                }
+                LivePred::Or(bs) => bs.iter().flatten().for_each(|q| walk(q, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(self, &mut out);
+        out
+    }
+
+    /// 条件に出てくる値で結ぶ組 `(mine, theirs)` (`ExistsEq`、 中身の中も)。
+    pub fn value_joins(&self) -> Vec<(u16, u16)> {
+        let mut out = Vec::new();
+        self.collect_value_joins(&mut out);
+        out
+    }
+
+    fn collect_value_joins(&self, out: &mut Vec<(u16, u16)>) {
+        match self {
+            LivePred::Via { pred, .. } | LivePred::Not(pred) => pred.collect_value_joins(out),
+            LivePred::Exists { preds, .. } => preds.iter().for_each(|p| p.collect_value_joins(out)),
+            LivePred::ExistsEq { mine, theirs, preds } => {
+                out.push((*mine, *theirs));
+                preds.iter().for_each(|p| p.collect_value_joins(out));
+            }
+            LivePred::CountAtLeast { via, mine, preds, .. } | LivePred::SumAtLeast { via, mine, preds, .. } => {
+                if let Some(m) = mine {
+                    out.push((*m, *via));
+                }
+                preds.iter().for_each(|p| p.collect_value_joins(out));
+            }
+            LivePred::Or(bs) => bs.iter().flatten().for_each(|p| p.collect_value_joins(out)),
+            _ => {}
+        }
+    }
+
     fn collect_ref_himos(&self, out: &mut Vec<u16>) {
         match self {
             LivePred::Via { path, pred } => {
@@ -297,6 +395,19 @@ impl LivePred {
             LivePred::Not(p) => p.collect_ref_himos(out),
             LivePred::Exists { via, preds } => {
                 out.push(*via);
+                for p in preds {
+                    p.collect_ref_himos(out);
+                }
+            }
+            LivePred::ExistsEq { preds, .. } => {
+                for p in preds {
+                    p.collect_ref_himos(out);
+                }
+            }
+            LivePred::CountAtLeast { via, mine, preds, .. } | LivePred::SumAtLeast { via, mine, preds, .. } => {
+                if mine.is_none() {
+                    out.push(*via);
+                }
                 for p in preds {
                     p.collect_ref_himos(out);
                 }
@@ -362,6 +473,25 @@ fn check_exists(via: u16, preds: &[LivePred]) -> Result<(), String> {
     one_shape(dnf(preds.to_vec())?, (Vec::new(), via, HoleVal::Group(0)), "Exists").map(|_| ())
 }
 
+/// `Exists` / `ExistsEq` を `CountAtLeast` (`min: 1`) に揃え、 中身を検査する (dnf の後は `CountAtLeast` だけ)。
+fn count_at_least(p: LivePred) -> Result<LivePred, String> {
+    let (via, mine, min, preds) = match p {
+        LivePred::Exists { via, preds } => (via, None, 1, preds),
+        LivePred::ExistsEq { mine, theirs, preds } => (theirs, Some(mine), 1, preds),
+        LivePred::CountAtLeast { via, mine, min, preds } => (via, mine, min, preds),
+        LivePred::SumAtLeast { via, mine, sum_himo, min, signed, preds } => {
+            check_exists(via, &preds)?;
+            return Ok(LivePred::SumAtLeast { via, mine, sum_himo, min, signed, preds });
+        }
+        other => return Ok(other),
+    };
+    if min == 0 {
+        return Err("CountAtLeast needs min >= 1 (min 0 is always true)".into());
+    }
+    check_exists(via, &preds)?;
+    Ok(LivePred::CountAtLeast { via, mine, min, preds })
+}
+
 /// 条件 1 個の選択肢 (それぞれ AND)。
 fn alternatives(p: LivePred) -> Result<Vec<Vec<LivePred>>, String> {
     Ok(match p {
@@ -389,15 +519,13 @@ fn alternatives(p: LivePred) -> Result<Vec<Vec<LivePred>>, String> {
             LivePred::Via { .. } | LivePred::Or(_) | LivePred::Not(_) => {
                 return Err("Not wraps a single-column condition (write Via { path, Not(..) } for a column behind a ref)".into());
             }
-            LivePred::Exists { via, preds } => {
-                check_exists(via, &preds)?;
-                vec![vec![LivePred::Not(Box::new(LivePred::Exists { via, preds }))]]
+            p @ (LivePred::Exists { .. } | LivePred::ExistsEq { .. } | LivePred::CountAtLeast { .. } | LivePred::SumAtLeast { .. }) => {
+                vec![vec![LivePred::Not(Box::new(count_at_least(p)?))]]
             }
             leaf => vec![vec![LivePred::Not(Box::new(leaf))]],
         },
-        LivePred::Exists { via, preds } => {
-            check_exists(via, &preds)?;
-            vec![vec![LivePred::Exists { via, preds }]]
+        p @ (LivePred::Exists { .. } | LivePred::ExistsEq { .. } | LivePred::CountAtLeast { .. } | LivePred::SumAtLeast { .. }) => {
+            vec![vec![count_at_least(p)?]]
         }
         leaf => vec![vec![leaf]],
     })
@@ -800,7 +928,8 @@ impl ValWords {
 
 /// 印リスト。 追記するだけで、 重複は取り出す時 (と溜まりすぎた時) に畳む — 印は poll の
 /// たびに空になる一時的な集合なので、 付けるたびに整列した集合へ挿入するより安い。 大きさは
-/// 印の付いた entity の数の高々 2 倍 + 定数。
+/// 印の付いた entity の数の高々 4 倍 + 16384 (途中で畳む回数を減らす。 畳むたびに全体を整列するので、
+/// 2 倍 + 64 では 1 回の poll の印 1000 件を 4〜5 回分整列していた)。
 /// 中身は eid (既定) か、 集計の group の値 (u64)。
 struct Marks<T = u32> {
     list: Vec<T>,
@@ -814,17 +943,65 @@ impl<T> Default for Marks<T> {
     }
 }
 
-impl<T: Ord + Copy> Marks<T> {
+/// 印の整列。 eid (u32) は基数 sort — 印は 「会社 1 社の配下」 のような eid の飛んだ昇順の run が
+/// 入り組んだ連なりになり、 比較 sort では run の併合に log(run 数) 段かかる (batch で書いてから poll
+/// すると run が増える)。
+trait MarkKey: Ord + Copy {
+    fn sort(list: &mut Vec<Self>);
+}
+
+impl MarkKey for u64 {
+    fn sort(list: &mut Vec<u64>) {
+        list.sort_unstable();
+    }
+}
+
+impl MarkKey for u32 {
+    fn sort(list: &mut Vec<u32>) {
+        if list.len() < 256 {
+            list.sort_unstable();
+            return;
+        }
+        if list.is_sorted() {
+            return;
+        }
+        // 下の桁 (8 bit) から 4 回の安定な振り分け。 全部が同じ桁の回は飛ばす (eid の上位は揃いやすい)
+        let mut buf = vec![0u32; list.len()];
+        for shift in [0u32, 8, 16, 24] {
+            let mut count = [0usize; 256];
+            for &x in list.iter() {
+                count[((x >> shift) & 0xff) as usize] += 1;
+            }
+            if count.contains(&list.len()) {
+                continue;
+            }
+            let mut at = 0;
+            for c in count.iter_mut() {
+                let n = *c;
+                *c = at;
+                at += n;
+            }
+            for &x in list.iter() {
+                let d = &mut count[((x >> shift) & 0xff) as usize];
+                buf[*d] = x;
+                *d += 1;
+            }
+            std::mem::swap(list, &mut buf);
+        }
+    }
+}
+
+impl<T: MarkKey> Marks<T> {
     #[inline]
     fn add(&mut self, eid: T) {
         self.list.push(eid);
-        if self.list.len() > 2 * self.clean + 64 {
+        if self.list.len() > 4 * self.clean + 16384 {
             self.compact();
         }
     }
 
     fn compact(&mut self) {
-        self.list.sort_unstable();
+        T::sort(&mut self.list);
         self.list.dedup();
         self.clean = self.list.len();
     }
@@ -1272,18 +1449,98 @@ enum Pred {
     Text(u16, String, std::sync::OnceLock<u32>),
     /// 中身が偽 (値が無い entity も真)。
     Not(Box<Pred>),
-    /// この entity を `via` で指し `preds` を満たす entity がある (`LivePred::Exists`)。 `idx` = family の
-    /// `exists` / `Settled::exists` の添字 (`number_exists` が振る)。
-    Exists { via: u16, preds: Vec<LivePred>, idx: usize },
+    /// この entity を `via` で指し `preds` を満たす entity がある (`LivePred::Exists`、 `mine` = None)、 または
+    /// この entity の `mine` 列の値を `via` 列に持ち `preds` を満たす entity がある (`LivePred::ExistsEq`)。
+    /// `idx` = family の `exists` / `Settled::exists` の添字 (`number_exists` が振る)。
+    /// `th` を満たす group だけが真 (`LivePred::CountAtLeast` / `SumAtLeast`)。
+    Exists { via: u16, mine: Option<u16>, th: Threshold, preds: Vec<LivePred>, idx: usize },
+}
+
+/// `Exists` の group が真になる閾値。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Threshold {
+    /// 件数が `min` 以上 (`Exists` = 1)。
+    Count(u64),
+    /// 件数が 1 以上で、 `himo` の値の和が `min` 以上 (`signed` = 値を 2^63 ずらして載せる列)。
+    Sum { himo: u16, min: i128, signed: bool },
+}
+
+impl Threshold {
+    #[inline]
+    fn holds(&self, a: Agg) -> bool {
+        match *self {
+            Threshold::Count(min) => a.count >= min,
+            Threshold::Sum { min, signed, .. } => {
+                let sum = if signed { a.sum as i128 - ((a.summed as i128) << 63) } else { a.sum as i128 };
+                a.count > 0 && sum >= min
+            }
+        }
+    }
+
+    /// 集計の購読で和も持つ列。
+    fn sum_himo(&self) -> Option<u16> {
+        match *self {
+            Threshold::Count(_) => None,
+            Threshold::Sum { himo, .. } => Some(himo),
+        }
+    }
+
+    /// 形の符号に入れる値 (閾値が違えば別の family)。
+    fn sig(&self) -> [u64; 4] {
+        match *self {
+            Threshold::Count(min) => [0, min, 0, 0],
+            Threshold::Sum { himo, min, signed } => [1 + signed as u64, himo as u64, min as u64, (min >> 64) as u64],
+        }
+    }
+}
+
+/// `Exists` の件数が `min` 以上の group: 指されている entity (`Eids`)、 値で結ぶ時は値 (`Vals`、 64 bit の値もある)。
+enum ExSet {
+    Eids(Bits),
+    Vals(std::collections::BTreeSet<u64>),
+}
+
+impl ExSet {
+    fn new(by_value: bool) -> Self {
+        if by_value { ExSet::Vals(Default::default()) } else { ExSet::Eids(Bits::default()) }
+    }
+
+    #[inline]
+    fn has(&self, g: u64) -> bool {
+        match self {
+            ExSet::Eids(b) => u32::try_from(g).is_ok_and(|e| b.get(e)),
+            ExSet::Vals(s) => s.contains(&g),
+        }
+    }
+
+    fn put(&mut self, g: u64, on: bool) {
+        match self {
+            ExSet::Eids(b) => b.put(g as u32, on),
+            ExSet::Vals(s) => {
+                if on {
+                    s.insert(g);
+                } else {
+                    s.remove(&g);
+                }
+            }
+        }
+    }
+
+    fn groups(&self) -> Vec<u64> {
+        match self {
+            ExSet::Eids(b) => b.iter().map(u64::from).collect(),
+            ExSet::Vals(s) => s.iter().copied().collect(),
+        }
+    }
 }
 
 impl Pred {
-    /// route を張る紐 (`Exists` は無し — 変化は集計の購読から来る)。
+    /// route を張る紐 (`Exists` は値で結ぶ時の自分の列だけ — 中身の変化は集計の購読から来る)。
     fn himo(&self) -> Option<u16> {
         match self {
             Pred::Range(h, ..) | Pred::Present(h) | Pred::In(h, _) | Pred::Text(h, ..) => Some(*h),
             Pred::Not(p) => p.himo(),
-            Pred::Exists { .. } => None,
+            Pred::Exists { mine, .. } => *mine,
         }
     }
 
@@ -1294,7 +1551,7 @@ impl Pred {
 
     /// `ex` = `Settled::exists` (`Exists` の件数が 1 以上の entity)。
     #[inline]
-    fn matches(&self, r: &impl CellReader, ex: &[Bits], eid: u32) -> bool {
+    fn matches(&self, r: &impl CellReader, ex: &[ExSet], eid: u32) -> bool {
         match self {
             Pred::Range(h, lo, hi) => matches!(r.cell(*h, eid), Some(v) if *lo <= v && v <= *hi),
             Pred::Present(h) => r.cell(*h, eid).is_some(),
@@ -1310,7 +1567,8 @@ impl Pred {
                 r.cell(*h, eid) == Some(id as u64)
             }
             Pred::Not(p) => !p.matches(r, ex, eid),
-            Pred::Exists { idx, .. } => ex[*idx].get(eid),
+            Pred::Exists { idx, mine: None, .. } => ex[*idx].has(eid as u64),
+            Pred::Exists { idx, mine: Some(m), .. } => r.cell(*m, eid).is_some_and(|v| ex[*idx].has(v)),
         }
     }
 }
@@ -1385,13 +1643,16 @@ fn flatten(p: LivePred, path: &mut Vec<u16>, out: &mut Vec<Flat>) {
         }
         LivePred::Present { himo_id } => (vec![3, himo_id as u64], Leaf::Fixed(Pred::Present(himo_id))),
         // 否定は値を固定した条件 (値ごとに別の family)。 形の符号に中身の値まで入れる
-        LivePred::Exists { via, preds } => {
-            let (t, p) = exists_leaf(via, preds);
+        // dnf が `CountAtLeast` に揃えるが、 registry へ直に渡された条件 (dnf を通らない) も同じに
+        p @ (LivePred::Exists { .. } | LivePred::ExistsEq { .. } | LivePred::CountAtLeast { .. } | LivePred::SumAtLeast { .. }) => {
+            let (t, p) = exists_of(p);
             (t, Leaf::Fixed(p))
         }
         LivePred::Not(inner) => {
             let (tail, p) = match *inner {
-                LivePred::Exists { via, preds } => exists_leaf(via, preds),
+                p @ (LivePred::Exists { .. } | LivePred::ExistsEq { .. } | LivePred::CountAtLeast { .. } | LivePred::SumAtLeast { .. }) => {
+                    exists_of(p)
+                }
                 LivePred::Eq { himo_id, value } => (vec![0, himo_id as u64, value], Pred::In(himo_id, vec![value])),
                 LivePred::In { himo_id, mut values } => {
                     values.sort_unstable();
@@ -1422,22 +1683,38 @@ fn flatten(p: LivePred, path: &mut Vec<u16>, out: &mut Vec<Flat>) {
     out.push(Flat { path: path.clone(), sig, leaf });
 }
 
-/// `Exists` の形の符号と条件 (中身の条件まで符号に入れる = 中身が違えば別の family)。
-fn exists_leaf(via: u16, preds: Vec<LivePred>) -> (Vec<u64>, Pred) {
+/// `Exists` の形の符号と条件 (中身の条件と `min` まで符号に入れる = 違えば別の family)。 `mine` = 値で結ぶ時の
+/// 自分の列 (None = `via` で指されている)。
+fn exists_leaf(via: u16, mine: Option<u16>, th: Threshold, preds: Vec<LivePred>) -> (Vec<u64>, Pred) {
     let text = format!("{preds:?}");
-    let mut t = vec![9, via as u64, text.len() as u64];
+    let mut t = vec![9, via as u64, mine.map_or(0, |m| m as u64 + 1)];
+    t.extend(th.sig());
+    t.push(text.len() as u64);
     t.extend(text.bytes().map(u64::from));
-    (t, Pred::Exists { via, preds, idx: usize::MAX })
+    (t, Pred::Exists { via, mine, th, preds, idx: usize::MAX })
 }
 
-/// 条件の中の `Exists` に添字を振り、 (via, 中身) を添字の順に返す。
-fn number_exists(flats: &mut [Flat]) -> Vec<(u16, Vec<LivePred>)> {
-    fn visit(p: &mut Pred, out: &mut Vec<(u16, Vec<LivePred>)>) {
+/// 存在 / 件数 / 和の条件の形の符号と条件 (dnf を通らない条件も同じに扱う)。
+fn exists_of(p: LivePred) -> (Vec<u64>, Pred) {
+    match p {
+        LivePred::Exists { via, preds } => exists_leaf(via, None, Threshold::Count(1), preds),
+        LivePred::ExistsEq { mine, theirs, preds } => exists_leaf(theirs, Some(mine), Threshold::Count(1), preds),
+        LivePred::CountAtLeast { via, mine, min, preds } => exists_leaf(via, mine, Threshold::Count(min), preds),
+        LivePred::SumAtLeast { via, mine, sum_himo, min, signed, preds } => {
+            exists_leaf(via, mine, Threshold::Sum { himo: sum_himo, min, signed }, preds)
+        }
+        other => unreachable!("存在の条件でない: {other:?}"),
+    }
+}
+
+/// 条件の中の `Exists` に添字を振り、 (via, mine, 閾値, 中身) を添字の順に返す。
+fn number_exists(flats: &mut [Flat]) -> Vec<(u16, Option<u16>, Threshold, Vec<LivePred>)> {
+    fn visit(p: &mut Pred, out: &mut Vec<(u16, Option<u16>, Threshold, Vec<LivePred>)>) {
         match p {
             Pred::Not(q) => visit(q, out),
-            Pred::Exists { via, preds, idx } => {
+            Pred::Exists { via, mine, th, preds, idx } => {
                 *idx = out.len();
-                out.push((*via, preds.clone()));
+                out.push((*via, *mine, *th, preds.clone()));
             }
             _ => {}
         }
@@ -1654,6 +1931,8 @@ struct Member {
     union: Option<(std::sync::Weak<Union>, usize)>,
     /// 集計の購読 ([`LiveCounts`]) なら group の報告状態 (entity の出入りは積まない)。
     grp: Option<GroupState>,
+    /// 鍵付きの購読 ([`LiveKeyed`]) なら報告済みの鍵。 出入りと鍵の変化は `changed` / `left` に積む。
+    keyed: Option<KeyedState>,
     /// 上位 k 件の購読なら k と境界。
     topk: Option<TopK>,
     /// 上位 k 件の並びが降順か。
@@ -1714,6 +1993,15 @@ impl Agg {
     }
 }
 
+/// `HoleVal::Group` の印: 鍵付きの購読 ([`LiveKeyed`]、 合計の列の代わり)。
+const KEYED: u32 = u32::MAX;
+
+/// 鍵付きの購読 1 本ぶんの報告状態: 最後に渡した各 entity の鍵 (`v + 1`、 0 = 渡していない)。
+#[derive(Default)]
+struct KeyedState {
+    reported: ValWords,
+}
+
 /// 集計の購読 1 本ぶんの報告状態。 件数そのものは根の鍵が持ち (同じ鍵の購読で共有)、 ここは
 /// 「どの group の件数が動いたか」 と 「最後に渡した件数」 だけ。
 #[derive(Default)]
@@ -1767,6 +2055,41 @@ impl Member {
         self.queued = false;
         let probe = Member::probe(&self.root_keys, self.range, self.topk.map(|t| (t, self.order_desc)));
         drain_marks(&mut self.changed, &mut self.left, &mut self.reported, |e| probe(e, root(e)), peer)
+    }
+
+    /// 鍵付きの購読: changed を消費して `(eid, 鍵)` の差分を返す。 `root` = 根の答え (値 = 鍵)。 `left` に居る eid
+    /// は、 報告済みで今も居ても 「出て入り直した」 (鍵が同じでも removed + added)。
+    fn drain_keyed(&mut self, root: impl Fn(u32) -> Option<Ans>, peer: u32) -> KeyedDelta {
+        self.queued = false;
+        let mut delta = KeyedDelta::default();
+        let probe = Member::probe(&self.root_keys, self.range, None);
+        let Some(ks) = self.keyed.as_mut() else { return delta };
+        let left_set = self.left.take();
+        let mut li = 0;
+        for eid in self.changed.take() {
+            let a = root(eid);
+            let now = a.filter(|_| probe(eid, a)).map(|a| a.1);
+            let was = ks.reported.get(eid).checked_sub(1);
+            while li < left_set.len() && left_set[li] < eid {
+                li += 1;
+            }
+            let left = left_set.get(li) == Some(&eid);
+            if was == now && !left {
+                continue;
+            }
+            let e = enchudb_oplog::make_eid(peer, eid);
+            if let Some(w) = was {
+                delta.removed.push((e, w));
+            }
+            if let Some(n) = now {
+                delta.added.push((e, n));
+            }
+            if left && was.is_some() && now.is_some() {
+                delta.reentered.push(e);
+            }
+            ks.reported.put(eid, now.map_or(0, |n| n + 1));
+        }
+        delta
     }
 
     /// `has` の、 member 全体を借用しない版。
@@ -1864,7 +2187,7 @@ struct Settled {
     summand: ValWords,
     /// `Exists` ごと: 指している entity (中身を満たすもの) が 1 つ以上ある entity。 `Family::exists` の
     /// 集計の購読の差分で動かす。
-    exists: Vec<Bits>,
+    exists: Vec<ExSet>,
     /// 上位 k 件で並びの列が根でない family (`Family::order_part`): 根の記録は (鍵, 1 段目の先) で、
     /// 並びの値は `opart` から引く。
     order_view: Option<()>,
@@ -1907,6 +2230,8 @@ enum RootMode {
     Ranged,
     /// 集計: 鍵ごと・値 (group) ごとの件数を数える。
     Grouped,
+    /// 鍵付きの購読: 値 (鍵) の変化を entity の印にするだけ (group ごとの件数は読む人が居ないので数えない)。
+    Keyed,
     /// 上位 k 件: 鍵ごとに (値, eid) の順序を持ち、 member ごとの k 番目を動かす (`true` = 降順)。
     Ordered(bool),
 }
@@ -2675,6 +3000,24 @@ impl Settled {
             }
             return;
         }
+        if mode == RootMode::Keyed {
+            // 出入りも鍵の変化も entity の印 (旧鍵と新鍵の両方の member に)
+            for (k, ans, enter) in [(iw, was, false), (inw, now, true)] {
+                let (Some(i), Some(_)) = (k, ans) else { continue };
+                let rk = &mut keys[i];
+                if enter {
+                    rk.count += 1;
+                } else {
+                    rk.count -= 1;
+                }
+                for &slot in &rk.members {
+                    if let Some(m) = members[slot].as_mut() {
+                        m.note(slot, ready, eid, false);
+                    }
+                }
+            }
+            return;
+        }
         if mode == RootMode::Grouped {
             for (k, ans, y, enter) in [(iw, was, wx, false), (inw, now, x, true)] {
                 let (Some(i), Some((_, v))) = (k, ans) else { continue };
@@ -2691,8 +3034,13 @@ impl Settled {
                     }
                 }
                 for &slot in &rk.members {
-                    if let Some(g) = members[slot].as_mut().and_then(|m| m.grp.as_mut()) {
-                        g.changed.add(v);
+                    if let Some(m) = members[slot].as_mut() {
+                        match (m.grp.as_mut(), m.keyed.is_some()) {
+                            (Some(g), _) => g.changed.add(v),
+                            // 鍵付き: 出入りも鍵の変化も entity の印 (旧鍵と新鍵の両方の member に)
+                            (None, true) => m.note(slot, ready, eid, false),
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -2799,6 +3147,8 @@ pub(crate) struct Family {
     /// 1 段目の先の entity を記録し、 件数は 1 段目の先ごとの部分和で持つ — 1 段目の先の group の
     /// 値が変わっても根を評価せず部分和を移すだけ (`Settled::move_partial`)。
     partial: Option<usize>,
+    /// 鍵付きの購読の family (形の署名に `KEYED` が入るので、 集計の購読とは混ざらない)。
+    keyed: bool,
     /// 上位 k 件で並びの列が根でない時: 根の子のうち道の上の節 (1 段目)。 根は 1 段目の先の entity を
     /// 記録し、 順序は会社ごとの塊 (`OrderIndex::Blocks`) — 会社の値が変わっても塊を付け替えるだけ。
     order_part: Option<usize>,
@@ -2806,10 +3156,21 @@ pub(crate) struct Family {
     on_path: Vec<bool>,
     /// 集計で group ごとに値の和も持つ根の列 (`Settled::summand`)。 根に route を張る。
     sum: Option<u16>,
-    /// `Exists` ごと: 中身の件数を `via` の値 (指されている entity) ごとに持つ集計の購読と、 `Exists` の
-    /// ある節。 family が要らなくなったら `LiveRegistry::unregister` が edit lock の外で drop する
+    /// `Exists` ごとの集計の購読。 family が要らなくなったら `LiveRegistry::unregister` が edit lock の外で drop する
     /// (drop は集計の購読の解除 = edit lock を取る)。
-    exists: Mutex<Vec<(LiveCounts, usize)>>,
+    exists: Mutex<Vec<ExistsSub>>,
+}
+
+/// family の `Exists` 1 つ分。
+struct ExistsSub {
+    /// 中身の件数を `via` の値 (指されている entity、 値で結ぶ時は値) ごとに持つ集計の購読。
+    counts: LiveCounts,
+    /// `Exists` のある節。
+    node: usize,
+    /// 値で結ぶ時の自分の列。
+    mine: Option<u16>,
+    /// 真になる閾値。
+    th: Threshold,
 }
 
 /// 穴の値を解決して鍵の組 (穴の値の並び) を返す。 `In` の穴は値の数だけ組が増える (組の掛け算)。
@@ -2878,17 +3239,19 @@ impl Family {
             })
             .unwrap_or(CarryKind::Range);
         let sum = flats.iter().find_map(|f| match f.leaf {
-            Leaf::Hole(_, HoleVal::Group(x)) if x > 0 => Some((x - 1) as u16),
+            Leaf::Hole(_, HoleVal::Group(x)) if x > 0 && x != KEYED => Some((x - 1) as u16),
             _ => None,
         });
+        // 鍵付きの購読は根ごとの鍵の変化を報告するので、 1 段目の部分和 (根を評価しない移し替え) は使わない
+        let keyed = flats.iter().any(|f| matches!(f.leaf, Leaf::Hole(_, HoleVal::Group(KEYED))));
         let nodes = build_tree(flats);
         // `Exists` の添字 → 節
-        let mut ex_node = vec![0usize; exists.len()];
-        fn find_ex(p: &Pred, n: usize, out: &mut [usize]) {
+        let mut ex_node = vec![(0usize, None, Threshold::Count(1)); exists.len()];
+        fn find_ex(p: &Pred, n: usize, out: &mut [(usize, Option<u16>, Threshold)]) {
             match p {
                 Pred::Not(q) => find_ex(q, n, out),
                 // 1 回だけの評価 (`find_branch`) は集計の購読を持たない
-                Pred::Exists { idx, .. } if *idx < out.len() => out[*idx] = n,
+                Pred::Exists { idx, mine, th, .. } if *idx < out.len() => out[*idx] = (n, *mine, *th),
                 _ => {}
             }
         }
@@ -2897,8 +3260,12 @@ impl Family {
                 find_ex(p, i, &mut ex_node);
             }
         }
-        let n_exists = exists.len();
-        let exists: Vec<(LiveCounts, usize)> = exists.into_iter().zip(ex_node).collect();
+        let ex_by_value: Vec<bool> = ex_node.iter().map(|x| x.1.is_some()).collect();
+        let exists: Vec<ExistsSub> = exists
+            .into_iter()
+            .zip(ex_node)
+            .map(|(counts, (node, mine, th))| ExistsSub { counts, node, mine, th })
+            .collect();
         let mut order: Vec<usize> = (0..nodes.len()).collect();
         order.sort_by_key(|&n| std::cmp::Reverse(nodes[n].depth));
         let mut routes = Vec::new();
@@ -2948,14 +3315,15 @@ impl Family {
             dirty: AtomicU32::new(0),
             settled: Mutex::new({
                 let mut st = Settled::new(&widths);
-                st.exists = (0..n_exists).map(|_| Bits::default()).collect();
+                st.exists = ex_by_value.iter().map(|&v| ExSet::new(v)).collect();
                 if matches!(kind, CarryKind::Order(_)) && nodes_partial.is_some() {
                     st.order_view = Some(());
                 }
                 st
             }),
             expand_always: AtomicBool::new(false),
-            partial: if kind == CarryKind::Group { nodes_partial } else { None },
+            partial: if kind == CarryKind::Group && !keyed { nodes_partial } else { None },
+            keyed,
             order_part: if matches!(kind, CarryKind::Order(_)) { nodes_partial } else { None },
             range,
             kind,
@@ -3008,7 +3376,8 @@ impl Family {
     ) -> usize {
         let mut s = self.settled.lock();
         let first = alts.first().map(Vec::as_slice).unwrap_or_default();
-        let grp = first.iter().any(|v| matches!(v, HoleVal::Group(_))).then(GroupState::default);
+        let keyed = first.iter().any(|v| matches!(v, HoleVal::Group(KEYED))).then(KeyedState::default);
+        let grp = first.iter().any(|v| matches!(v, HoleVal::Group(x) if *x != KEYED)).then(GroupState::default);
         let order_desc = first.iter().any(|v| matches!(v, HoleVal::Order(true)));
         let range = range_of(first);
         let topk = limit.map(|k| TopK { k, th: None });
@@ -3024,6 +3393,7 @@ impl Family {
             changed: Marks::default(),
             queued: false,
             grp,
+            keyed,
             topk,
             order_desc,
             union,
@@ -3185,7 +3555,7 @@ impl Family {
     /// 索引を引いて根まで遡る (結果の根は全ての穴で値が一致するので、 どの穴から遡っても漏れない)。
     /// 無ければ範囲の穴の範囲、 それも無ければ索引で引ける条件 (無ければ条件の紐を持つ全 entity)
     /// から遡る。
-    fn walk(&self, r: &impl CellReader, vals: &[u64], range: Option<(u64, u64)>, ex: &[Bits]) -> Vec<u32> {
+    fn walk(&self, r: &impl CellReader, vals: &[u64], range: Option<(u64, u64)>, ex: &[ExSet]) -> Vec<u32> {
         let hole = self
             .order
             .iter()
@@ -3200,8 +3570,11 @@ impl Family {
                 self.order.iter().rev().find_map(|&n| {
                     self.nodes[n].local.iter().find(|p| p.positive()).map(|p| {
                         let ents = match (p, p.himo()) {
-                            // 指している entity がある = 件数が 1 以上の entity
-                            (Pred::Exists { idx, .. }, _) => ex[*idx].iter().collect(),
+                            // 指している entity がある = 件数が 1 以上の entity (値で結ぶ時はその値を持つ entity)
+                            (Pred::Exists { idx, mine: None, .. }, _) => ex[*idx].groups().into_iter().map(|g| g as u32).collect(),
+                            (Pred::Exists { idx, mine: Some(m), .. }, _) => {
+                                ex[*idx].groups().into_iter().flat_map(|v| r.pull(*m, v)).collect()
+                            }
                             (_, Some(h)) => r.with_himo(h),
                             (_, None) => Vec::new(),
                         };
@@ -3399,21 +3772,23 @@ impl Family {
         self.push_marks(0, roots);
     }
 
-    /// `Exists` の集計の購読の差分を取り、 件数が 1 以上の entity を更新する。 真偽の変わった entity を
+    /// `Exists` の集計の購読の差分を取り、 件数が `min` 以上の entity を更新する。 真偽の変わった entity を
     /// 節ごとに返す (その節で評価し直す)。 集計の family の lock はこの family の lock の中で取る
     /// (中身の `Exists` はさらに内側 = lock の順は入れ子の深さの順で、 輪にならない)。
     fn poll_exists(&self, r: &impl CellReader, s: &mut Settled) -> Vec<(usize, Vec<u32>)> {
         let ex = self.exists.lock();
         let mut out = Vec::new();
-        for (i, (counts, node)) in ex.iter().enumerate() {
+        for (i, ExistsSub { counts, node, mine, th }) in ex.iter().enumerate() {
             let mut flipped = Vec::new();
             for (g, a) in counts.poll_with(r) {
-                // group は ref の列 (指している entity)
-                let g = g as u32;
-                let now = a.count > 0;
-                if s.exists[i].get(g) != now {
+                // group は ref の列 (指している entity)、 値で結ぶ時は値 = その値を持つ entity 全部が動く
+                let now = th.holds(a);
+                if s.exists[i].has(g) != now {
                     s.exists[i].put(g, now);
-                    flipped.push(g);
+                    match mine {
+                        None => flipped.push(g as u32),
+                        Some(m) => flipped.extend(r.pull(*m, g)),
+                    }
                 }
             }
             if !flipped.is_empty() {
@@ -3426,16 +3801,16 @@ impl Family {
     /// この family と、 `Exists` の集計の購読 (入れ子も) が route を張る紐。
     fn all_himos(&self) -> Vec<u16> {
         let mut hs: Vec<u16> = self.routes.iter().map(|&(h, _)| h).collect();
-        for (c, _) in self.exists.lock().iter() {
-            hs.extend(c.himos());
+        for x in self.exists.lock().iter() {
+            hs.extend(x.counts.himos());
         }
         hs
     }
 
     /// 有効化 (`Exists` の集計の購読を先に)。
     fn seed(&self, r: &impl CellReader) {
-        for (c, _) in self.exists.lock().iter() {
-            c.seed(r);
+        for x in self.exists.lock().iter() {
+            x.counts.seed(r);
         }
         let mut s = self.settled.lock();
         self.activate(r, &mut s);
@@ -3443,7 +3818,7 @@ impl Family {
 
     /// `Exists` の集計の購読に未 poll の変化がありうるか。
     fn exists_dirty(&self) -> bool {
-        self.exists.lock().iter().any(|(c, _)| c.is_dirty())
+        self.exists.lock().iter().any(|x| x.counts.is_dirty())
     }
 
     /// 印を消費して評価し直す。 深い節から: 答えが変わった entity を親へ展開、 根で集合を更新。
@@ -3482,7 +3857,10 @@ impl Family {
             if let Some(i) = s.recs[0].key(e).and_then(|k| s.keys.binary_search_by_key(&k, |x| x.id).ok()) {
                 let Settled { keys, members, ready, .. } = &mut *s;
                 for &slot in &keys[i].members {
-                    if let Some(m) = members[slot].as_mut().filter(|m| m.reported.get(e)) {
+                    if let Some(m) = members[slot]
+                        .as_mut()
+                        .filter(|m| m.reported.get(e) || m.keyed.as_ref().is_some_and(|k| k.reported.get(e) > 0))
+                    {
                         m.note(slot, ready, e, true);
                     }
                 }
@@ -3492,6 +3870,7 @@ impl Family {
         let mode = match (self.range.is_some(), self.kind) {
             (false, _) => RootMode::Plain,
             (true, CarryKind::Range) => RootMode::Ranged,
+            (true, CarryKind::Group) if self.keyed => RootMode::Keyed,
             (true, CarryKind::Group) => RootMode::Grouped,
             (true, CarryKind::Order(desc)) => RootMode::Ordered(desc),
         };
@@ -3600,15 +3979,28 @@ fn find_branch(r: &impl CellReader, preds: Vec<LivePred>) -> Vec<u32> {
     let Some(tuples) = resolve(r, &key) else { return Vec::new() };
     let range = range_of(&key);
     let mut s = Settled::new(&fam.nodes.iter().map(|x| x.key_len).collect::<Vec<_>>());
-    // `Exists`: 中身を満たす entity を 1 回引き、 それが指している entity に印
+    // `Exists`: 中身を満たす entity を 1 回引き、 それが指している entity (値で結ぶ時はその値) ごとに数えて、
+    // `min` 以上の group に印
     s.exists = specs
         .into_iter()
-        .map(|(via, preds)| {
-            let mut b = Bits::default();
+        .map(|(via, mine, th, preds)| {
             let kids = dnf(preds).map(|bs| find_once(r, bs)).unwrap_or_default();
-            for x in kids {
-                if let Some(t) = r.ref_cell(via, x) {
-                    b.put(t, true);
+            // (group, 和の列の値 + 1 (0 = 値が無い))
+            let mut gs: Vec<(u64, u64)> = kids
+                .into_iter()
+                .filter_map(|x| {
+                    let g = match mine {
+                        None => r.ref_cell(via, x).map(u64::from),
+                        Some(_) => r.cell(via, x),
+                    }?;
+                    Some((g, th.sum_himo().and_then(|h| r.cell(h, x)).map_or(0, |v| v + 1)))
+                })
+                .collect();
+            gs.sort_unstable();
+            let mut b = ExSet::new(mine.is_some());
+            for run in gs.chunk_by(|a, b| a.0 == b.0) {
+                if th.holds(agg_of(run.iter().map(|x| x.1))) {
+                    b.put(run[0].0, true);
                 }
             }
             b
@@ -3795,6 +4187,15 @@ impl LiveRegistry {
         Ok(LiveCounts { family, slot, id, registry: self.clone() })
     }
 
+    /// 鍵付きの購読を登録する: `branches` の結果を、 各 entity の `key` (ref の道 + 紐) の値と一緒に持つ。
+    /// 枝は全部同じ形であること (`register_counts` と同じ)。
+    pub(crate) fn register_keyed(self: &Arc<Self>, branches: Vec<Vec<LivePred>>, key: (Vec<u16>, u16)) -> Result<LiveKeyed, String> {
+        let (sig, flats, alts) = one_shape(branches, (key.0, key.1, HoleVal::Group(KEYED)), "subscribe_keyed")?;
+        let id = self.next_member_id.fetch_add(1, Ordering::Relaxed);
+        let (family, slot) = self.register_alts(id, sig, flats, alts, false, None, None);
+        Ok(LiveKeyed { family, slot, id, registry: self.clone() })
+    }
+
     /// `Or` の購読を登録する。 形 (と範囲の穴の範囲) が同じ枝は鍵を複数持つ 1 つの member に束ね
     /// (`city = A OR city = B` = 鍵 2 つの member 1 つ = AND の購読と同じコスト)、 束ねた member が
     /// 2 つ以上なら、 member の差分を積む [`Union`] にする。
@@ -3866,9 +4267,9 @@ impl LiveRegistry {
         // 既にあって使わなかった分は、 edit lock を離してから drop する
         let mut exists: Vec<LiveCounts> = specs
             .into_iter()
-            .map(|(via, preds)| {
+            .map(|(via, _, th, preds)| {
                 let branches = dnf(preds).expect("Exists の中身は dnf (check_exists) で検査済み");
-                self.register_counts(branches, (Vec::new(), via), None).expect("check_exists で検査済み")
+                self.register_counts(branches, (Vec::new(), via), th.sum_himo()).expect("check_exists で検査済み")
             })
             .collect();
         let (family, slot) = self.register_alts_locked(id, sig, flats, &mut exists, alts, expand_always, union, limit);
@@ -4519,6 +4920,108 @@ impl std::fmt::Debug for LiveCounts {
     }
 }
 
+// ─────────────────────────── 鍵付きの購読 ───────────────────────────
+
+/// [`LiveKeyed::poll`] の戻り値。 前回 poll からの `(entity, 鍵)` の差分 (eid 昇順)。 積分 = `removed` を
+/// 抜いて `added` を足す。 鍵が変わった entity は旧鍵で `removed`、 新鍵で `added` に居る。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeyedDelta {
+    pub added: Vec<(EntityId, u64)>,
+    pub removed: Vec<(EntityId, u64)>,
+    /// 報告済みの entity が削除され、 同じ eid が別の entity として入り直したもの (昇順)。 `removed` と `added`
+    /// の両方に居る eid のうち、 鍵が変わっただけのものと区別する用。
+    pub reentered: Vec<EntityId>,
+}
+
+/// 条件に当てはまる entity を、 **その entity の鍵の列 (ref の先でもよい) の値と一緒に** 持つ live 版
+/// ([`Engine::subscribe_keyed`](crate::engine::Engine::subscribe_keyed))。 普通の購読は集合への出入りしか
+/// 追わないが、 これは集合に居る entity の鍵の変化も差分に出す — 組を返す JOIN の片側。
+///
+/// - 鍵の列に値の無い entity は入らない
+/// - 鍵が ref の先 (`company.city`) なら、 会社の所在地が変わると配下が全員 (旧鍵 → 新鍵で) 届く
+///   (集計の購読のような部分和の移し替えはしない)
+/// - 値は `query_by_id64` と同じ (Number は値、 Tag は vocab id、 Ref は local eid)
+pub struct LiveKeyed {
+    family: Arc<Family>,
+    slot: usize,
+    id: u64,
+    registry: Arc<LiveRegistry>,
+}
+
+impl LiveKeyed {
+    pub(crate) fn himos(&self) -> Vec<u16> {
+        let mut hs: Vec<u16> = self.family.all_himos();
+        hs.sort_unstable();
+        hs.dedup();
+        hs
+    }
+
+    pub(crate) fn seed(&self, r: &impl CellReader) {
+        self.family.seed(r);
+    }
+
+    /// 前回 poll からの差分。 初回は登録時点の全 `(entity, 鍵)` が `added`。
+    pub fn poll(&self, eng: &crate::engine::Engine) -> KeyedDelta {
+        assert!(Arc::ptr_eq(&self.registry, eng.live_registry()), "LiveKeyed: 購読した engine とは別の engine が渡された");
+        self.poll_with(eng)
+    }
+
+    pub(crate) fn poll_with(&self, r: &impl CellReader) -> KeyedDelta {
+        let peer = self.registry.peer.load(Ordering::Acquire);
+        let mut guard = self.family.settled.lock();
+        self.family.settle(r, &mut guard);
+        let Settled { recs, vals, members, .. } = &mut *guard;
+        match members[self.slot].as_mut() {
+            Some(m) => m.drain_keyed(|e| root_at(recs, vals, e), peer),
+            None => KeyedDelta::default(),
+        }
+    }
+
+    /// 最後の poll までに `eid` について渡した鍵 (集合に居なければ None)。 poll はしない。
+    pub fn reported_key(&self, eid: EntityId) -> Option<u64> {
+        let guard = self.family.settled.lock();
+        let m = guard.members[self.slot].as_ref()?;
+        m.keyed.as_ref()?.reported.get(enchudb_oplog::eid_local(eid)).checked_sub(1)
+    }
+
+    /// 渡し済みの鍵を引く関数を `f` に渡す (その間ロックを持つ)。 引く回数が多く、 まとめて渡せない時用 (親をたどる等)。
+    pub fn with_reported<R>(&self, f: impl FnOnce(&dyn Fn(EntityId) -> Option<u64>) -> R) -> R {
+        let guard = self.family.settled.lock();
+        let ks = guard.members[self.slot].as_ref().and_then(|m| m.keyed.as_ref());
+        let get = |e: EntityId| ks.and_then(|k| k.reported.get(enchudb_oplog::eid_local(e)).checked_sub(1));
+        f(&get)
+    }
+
+    /// [`reported_key`](Self::reported_key) をまとめて (ロック 1 回)。 `eids` と同じ順。
+    pub fn reported_keys(&self, eids: &[EntityId]) -> Vec<Option<u64>> {
+        let guard = self.family.settled.lock();
+        let Some(ks) = guard.members[self.slot].as_ref().and_then(|m| m.keyed.as_ref()) else { return vec![None; eids.len()] };
+        eids.iter().map(|&e| ks.reported.get(enchudb_oplog::eid_local(e)).checked_sub(1)).collect()
+    }
+
+    /// engine 内で一意な購読 id。
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// 未 poll の変化がありうるか (評価しない)。
+    pub fn is_dirty(&self) -> bool {
+        self.family.member_dirty(self.slot)
+    }
+}
+
+impl Drop for LiveKeyed {
+    fn drop(&mut self) {
+        self.registry.unregister(&self.family, self.slot);
+    }
+}
+
+impl std::fmt::Debug for LiveKeyed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveKeyed").field("id", &self.id).finish()
+    }
+}
+
 // ─────────────────────────── 会社単位の購読 ───────────────────────────
 
 /// `Via` を含む条件を 「ref の 1 段目の先 (group) への購読」 + 「根への条件」 に分ける。
@@ -4553,6 +5056,26 @@ pub(crate) fn split_grouped(preds: Vec<LivePred>) -> Result<(u16, Vec<LivePred>,
     }
 }
 
+/// 根の数と和の列の値 (`値 + 1`、 0 = 値が無い) から集計を作る。
+fn agg_of(stored: impl Iterator<Item = u64>) -> Agg {
+    let mut a = Agg::default();
+    for x in stored {
+        a.add(Agg::one(x));
+    }
+    a
+}
+
+/// 紐 `via` に値 `g` を持つ entity のうち、 `preds` を満たすものの集計 (和の列は `sum`)。
+fn agg_matches(r: &impl CellReader, via: u16, g: u64, preds: &[LivePred], sum: Option<u16>) -> Agg {
+    let kids: Vec<u32> = dnf(preds.to_vec()).map(|bs| find_once(r, bs)).unwrap_or_default();
+    agg_of(
+        r.pull(via, g)
+            .into_iter()
+            .filter(|x| kids.binary_search(x).is_ok())
+            .map(|x| sum.and_then(|h| r.cell(h, x)).map_or(0, |v| v + 1)),
+    )
+}
+
 /// 根への単一紐条件 (`Via` 以外) を 1 entity に当てる。
 fn matches_leaf(r: &impl CellReader, p: &LivePred, e: u32) -> bool {
     match p {
@@ -4564,10 +5087,15 @@ fn matches_leaf(r: &impl CellReader, p: &LivePred, e: u32) -> bool {
         LivePred::In { himo_id, values } => matches!(r.cell(*himo_id, e), Some(v) if values.contains(&v)),
         LivePred::Present { himo_id } => r.cell(*himo_id, e).is_some(),
         LivePred::Not(p) => !matches_leaf(r, p, e),
-        // 指している entity を逆引きして中身を 1 回評価 (会社単位の購読の根への条件用)
-        LivePred::Exists { via, preds } => {
-            let kids: Vec<u32> = dnf(preds.clone()).map(|bs| find_once(r, bs)).unwrap_or_default();
-            r.pull(*via, e as u64).into_iter().any(|x| kids.binary_search(&x).is_ok())
+        // 指している entity (値で結ぶ時は自分の値を持つ entity) を引いて中身を 1 回評価し、 数える
+        // (会社単位の購読の根への条件用)
+        p @ (LivePred::Exists { .. } | LivePred::ExistsEq { .. } | LivePred::CountAtLeast { .. } | LivePred::SumAtLeast { .. }) => {
+            let Pred::Exists { via, mine, th, preds, .. } = exists_of(p.clone()).1 else { return false };
+            let g = match mine {
+                None => Some(e as u64),
+                Some(m) => r.cell(m, e),
+            };
+            g.is_some_and(|g| th.holds(agg_matches(r, via, g, &preds, th.sum_himo())))
         }
         LivePred::Via { .. } | LivePred::Or(_) => false,
     }
@@ -4886,6 +5414,36 @@ mod tests {
             }
             let narrow = matches!(f, FlatSet::Narrow { .. });
             assert_eq!(narrow, case < 2, "case {case}: u32 の値だけなら 8 B のまま、 窓の外の値で組に");
+        }
+    }
+
+    /// 印の整列 (u32 は基数 sort) は sort_unstable + dedup と同じ集合を返す: 入り組んだ昇順の run、 上位
+    /// の桁が揃った値 / 散った値、 重複、 整列済み、 短い列。 途中で畳む閾値をまたぐ量も入れる。
+    #[test]
+    fn marks_take_sorts_and_dedups() {
+        let mut seed = 11u64;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        for case in 0..40 {
+            let n = [0, 1, 200, 300, 5000, 40_000][case % 6];
+            let input: Vec<u32> = match case / 6 % 4 {
+                // 会社 c の配下 = c, c + 1000, c + 2000, .. の run を入り組ませる
+                0 => (0..n as u32).map(|i| (i % 7) + 1000 * (i / 7) + (rnd() % 3)).collect(),
+                1 => (0..n).map(|_| rnd()).collect(),
+                2 => (0..n).map(|_| rnd() % 50).collect(),
+                _ => (0..n as u32).collect(),
+            };
+            let mut m: Marks = Marks::default();
+            for &x in &input {
+                m.add(x);
+            }
+            let mut want = input.clone();
+            want.sort_unstable();
+            want.dedup();
+            assert_eq!(m.take(), want, "case {case}");
+            assert!(m.is_empty());
         }
     }
 
