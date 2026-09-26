@@ -61,15 +61,19 @@ fn under_matches_oracle() {
     cleanup(&path);
 }
 
+/// row の数 (table の枠を埋める数: 作り直しで必ず同じ eid が使い回される)。
+const SIZE: i64 = 64;
+
 fn run(path: &str) {
-    let mut db = Database::create_growable_tiny(path).unwrap();
+    // slot の再利用 (同じ eid が別の row になる) は table の枠が埋まってからだけ — 容量を小さくし、 row の数を枠に合わせて起こす
+    let mut db = Database::create_with_capacity(path, 128).unwrap();
     db.table("emps").number("id").number("dept").number("age").ref_to("boss", "emps").primary_key("id").build().unwrap();
     let et = db.get_table("emps").unwrap();
     let t = &et;
     let mut rng = Rng(0x7ee5_0000_0000_0001);
     // 最初は木 (上司は自分より前の人)
     let mut emps: Vec<u64> = Vec::new();
-    for i in 0..40i64 {
+    for i in 0..SIZE {
         let mut b = t.insert().set("id", i).set("dept", rng.below(4) as i64).set("age", rng.below(50) as i64);
         if i > 0 && rng.below(8) != 0 {
             b = b.set("boss", Value::Ref(emps[rng.below(i as u64) as usize]));
@@ -177,17 +181,27 @@ fn run(path: &str) {
         Sub { name, live, query, seen: BTreeSet::new(), seed, keep, up: (3..=5).contains(&kind) }
     };
     let mut subs: Vec<Sub> = (0..12).map(|i| make(i % 6, &mut rng, &emps)).collect();
-    let check = |subs: &mut Vec<Sub>, emps: &[u64], step: usize| {
+    // reborn = 前回の check から作り直した row の eid。 前も後も結果に居るなら 「出て入り直した」 として届くこと
+    let check = |subs: &mut Vec<Sub>, emps: &[u64], reborn: &mut BTreeSet<u64>, step: usize| {
         for s in subs.iter_mut() {
-            integrate(&mut s.seen, s.live.poll());
+            let before = s.seen.clone();
+            let d = s.live.poll();
+            let (rm, ad): (BTreeSet<u64>, BTreeSet<u64>) = (d.removed.iter().copied().collect(), d.added.iter().copied().collect());
+            integrate(&mut s.seen, d);
             let want = oracle(emps, &s.seed, &s.keep, s.up);
+            for x in reborn.iter().filter(|x| before.contains(x) && want.contains(x)) {
+                assert!(rm.contains(x) && ad.contains(x), "[{}] step {step}: 作り直した row {x} が入り直していない", s.name);
+            }
             assert_eq!(s.seen, want, "[{}] step {step}: 積分 != 総当たり", s.name);
             let found: BTreeSet<u64> = (s.query)().find().unwrap().into_iter().collect();
             assert_eq!(found, want, "[{}] step {step}: find", s.name);
             assert_eq!((s.query)().count().unwrap(), want.len(), "[{}] step {step}: count", s.name);
         }
+        reborn.clear();
     };
-    check(&mut subs, &emps, 0);
+    let mut reborn = BTreeSet::new();
+    let mut reborn_seen = 0;
+    check(&mut subs, &emps, &mut reborn, 0);
     let eng = db.engine();
     let mut next_id = 1000i64;
     for step in 1..1500 {
@@ -208,6 +222,10 @@ fn run(path: &str) {
                     nb = nb.set("boss", Value::Ref(b));
                 }
                 emps[i] = nb.commit().unwrap();
+                if emps[i] == e {
+                    reborn.insert(e);
+                    reborn_seen += 1;
+                }
                 next_id += 1;
             }
             _ => {
@@ -223,10 +241,11 @@ fn run(path: &str) {
             subs[i] = make(rng.below(6), &mut rng, &emps);
         }
         if step % 3 == 0 {
-            check(&mut subs, &emps, step);
+            check(&mut subs, &emps, &mut reborn, step);
         }
     }
-    check(&mut subs, &emps, 1_000_001);
+    check(&mut subs, &emps, &mut reborn, 1_000_001);
+    assert!(reborn_seen > 50, "eid の使い回しが起きていない ({reborn_seen})");
     // 自分の table を指す ref 列でない / seed が別の table なら BadValue
     assert!(t.all().under("dept", t.all()).find().is_err());
     assert!(t.all().above("dept", t.all()).subscribe().is_err());
