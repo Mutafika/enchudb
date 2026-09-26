@@ -706,12 +706,11 @@ impl Database {
         q.push((TABLE_MARKER_HIMO.to_string(), table_vid as u64));
         for (cd, v) in &eq_preds {
             let raw = match (cd.ty, v) {
-                (SqlType::Integer, Value::Integer(n)) => {
-                    if *n < 0 || *n >= u32::MAX as i64 {
-                        return Err(SqlError::BadValue(format!("integer out of u32 range: {n}")));
-                    }
-                    *n as u64
-                }
+                // #298: 列に入らない値を持つ row は無い = マッチなし (書き込みと違ってエラーにしない)
+                (SqlType::Integer, Value::Integer(n)) => match u32::try_from(*n) {
+                    Ok(v) if v != u32::MAX => v as u64,
+                    _ => return Ok(Vec::new()),
+                },
                 (SqlType::BigInt, Value::Integer(n)) => big_raw(*n)?,
                 (SqlType::Text, Value::Text(s)) => match self.eng.vocab_id(s) {
                     Some(id) => id as u64,
@@ -1192,6 +1191,22 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    /// INTEGER 列 (u32) に入らない値の等値検索は、 エラーでなく 0 件 (その値を持つ row は無い)。
+    #[test]
+    fn eq_with_value_out_of_integer_range_matches_nothing() {
+        let mut db = fresh("eq_out_of_range");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 5)").unwrap();
+        for q in ["SELECT id FROM t WHERE n = 4294967295", "SELECT id FROM t WHERE n = 99999999999"] {
+            match db.execute(q) {
+                Ok(Output::Rows { rows, .. }) => assert!(rows.is_empty(), "{q}: {rows:?}"),
+                o => panic!("{q}: {o:?}"),
+            }
+        }
+        db.execute("DELETE FROM t WHERE n = 4294967295").unwrap();
+        assert!(db.execute("INSERT INTO t VALUES (2, 4294967295)").is_err(), "書き込みは今どおり弾く");
     }
 
     #[test]
