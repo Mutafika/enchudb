@@ -2243,6 +2243,26 @@ impl<'a> JoinQuery<'a> {
         }
     }
 
+    /// この組の table `from` の row と、 その ref 列 `ref_col` が指す `other` の row をさらにつなぐ (3 つ以上の table の
+    /// 組、 [`MultiJoin`])。 `from` は組に居る table の名前。
+    ///
+    /// ```ignore
+    /// // (投稿, 作者, 作者の会社, 会社の街の開いた店)
+    /// let q = posts.all()
+    ///     .join_ref("author", users.all())
+    ///     .then_ref("users", "company", companies.all())
+    ///     .then_eq("companies", "city", shops.where_eq("open", 1i64), "city");
+    /// ```
+    pub fn then_ref(self, from: &str, ref_col: &str, other: Query<'a>) -> MultiJoin<'a> {
+        MultiJoin::from_pair(self).then_ref(from, ref_col, other)
+    }
+
+    /// この組の table `from` の row の列 `my_col` (ref の先でもよい) と、 `other` の列 `their_col` の値が等しい row を
+    /// さらにつなぐ ([`MultiJoin`])。
+    pub fn then_eq(self, from: &str, my_col: &str, other: Query<'a>, their_col: &str) -> MultiJoin<'a> {
+        MultiJoin::from_pair(self).then_eq(from, my_col, other, their_col)
+    }
+
     /// 組を列 `col` の値ごとに数えた件数を購読する (live の `SELECT col, COUNT(*) FROM a JOIN b .. GROUP BY col`)。
     /// 戻り値の API は [`LiveCounts`] と同じ (`poll` / `get` / `all` …)。
     ///
@@ -2622,6 +2642,474 @@ impl LiveJoinCounts {
 impl std::fmt::Debug for LiveJoinCounts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LiveJoinCounts").finish_non_exhaustive()
+    }
+}
+
+// ─────────────────────────── 3 つ以上の table の組 ───────────────────────────
+
+/// 組の 1 つの段: 組に居る table (`parent` 番目) の row に、 新しい table の row をつなぐ。
+struct Edge {
+    /// つなぐ先の組の位置 (None = `from` の table が組に居ない)。
+    parent: Option<usize>,
+    on: JoinOn,
+}
+
+/// [`JoinQuery::then_ref`] / [`JoinQuery::then_eq`] の戻り値。 3 つ以上の table の row の組 (tuple) を引く / 購読する。
+/// 組の並びは table をつないだ順 (最初の 2 つ、 then_* で足した順)。
+pub struct MultiJoin<'a> {
+    comps: Vec<Query<'a>>,
+    edges: Vec<Edge>,
+}
+
+/// [`LiveMultiJoin::poll`] の戻り値。 前回 poll からの組の差分 (**順不同**)。 適用順は removed → added。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TupleDelta {
+    pub added: Vec<Vec<EntityId>>,
+    pub removed: Vec<Vec<EntityId>>,
+}
+
+/// 段の計画: 親の row の鍵 (ref の道, 列) と、 子の鍵 (None = 子の eid そのもの = ref で指される、 Some = 子の列)。
+struct StepPlan {
+    parent: usize,
+    key_path: Vec<u16>,
+    key_himo: u16,
+    child_key: Option<u16>,
+}
+
+/// (各 table の条件, 段の計画)。
+type MultiPlan = (Vec<Vec<enchudb_engine::LivePred>>, Vec<StepPlan>);
+
+impl<'a> MultiJoin<'a> {
+    fn from_pair(j: JoinQuery<'a>) -> Self {
+        MultiJoin { comps: vec![j.left, j.right], edges: vec![Edge { parent: Some(0), on: j.on }] }
+    }
+
+    fn comp(&self, table: &str) -> Option<usize> {
+        let mut hits = self.comps.iter().enumerate().filter(|(_, q)| q.table.name.eq_ignore_ascii_case(table)).map(|(i, _)| i);
+        let first = hits.next();
+        // 同じ table が 2 度居たら どちらか決められない
+        if hits.next().is_some() { None } else { first }
+    }
+
+    /// 組の table `from` の row の ref 列 `ref_col` が指す `other` の row をつなぐ。
+    pub fn then_ref(mut self, from: &str, ref_col: &str, other: Query<'a>) -> Self {
+        let parent = self.comp(from);
+        self.comps.push(other);
+        self.edges.push(Edge { parent, on: JoinOn::Ref(ref_col.to_string()) });
+        self
+    }
+
+    /// 組の table `from` の row の列 `my_col` と `other` の列 `their_col` の値が等しい row をつなぐ。
+    pub fn then_eq(mut self, from: &str, my_col: &str, other: Query<'a>, their_col: &str) -> Self {
+        let parent = self.comp(from);
+        self.comps.push(other);
+        self.edges.push(Edge { parent, on: JoinOn::Eq(my_col.to_string(), their_col.to_string()) });
+        self
+    }
+
+    /// 各 table の条件と段の計画。 `None` = 常に 0 組。
+    fn plan(self) -> Result<Option<MultiPlan>, SchemaError> {
+        let bad = |m: String| Err(SchemaError::BadValue(m));
+        if self.comps.iter().any(|q| q.limit.is_some() || q.order.is_some()) {
+            return bad("join: limit / order_by are not supported".into());
+        }
+        let mut steps = Vec::new();
+        for (k, e) in self.edges.iter().enumerate() {
+            let child = &self.comps[k + 1];
+            let Some(p) = e.parent.filter(|&p| p <= k) else {
+                return bad(format!("join: the table to join from is not (uniquely) in the tuple (step {})", k + 1));
+            };
+            let parent = &self.comps[p];
+            match &e.on {
+                JoinOn::Ref(col) => {
+                    let cd = parent.table.col(col).cloned();
+                    let points = cd.as_ref().is_some_and(|c| c.ty == ColumnType::Ref)
+                        && parent.table.relations.iter().any(|r| {
+                            r.from_col.eq_ignore_ascii_case(col) && r.to_table.eq_ignore_ascii_case(&child.table.name)
+                        });
+                    let Some(cd) = cd.filter(|_| points) else {
+                        return bad(format!("join: {col} is not a ref column of {} pointing to {}", parent.table.name, child.table.name));
+                    };
+                    steps.push(StepPlan { parent: p, key_path: Vec::new(), key_himo: cd.himo_id, child_key: None });
+                }
+                JoinOn::Eq(my, their) => {
+                    let Some((path, mine)) = parent.resolve_col(my) else { return bad(format!("join: unknown column {my}")) };
+                    let Some(theirs) = child.table.col(their).cloned() else { return bad(format!("join: unknown column {their}")) };
+                    if mine.ty != theirs.ty || matches!(mine.ty, ColumnType::Leaf | ColumnType::Ref) {
+                        return bad(format!("join: {my} ({:?}) and {their} ({:?}) must have the same Tag / Number / BigInt type", mine.ty, theirs.ty));
+                    }
+                    steps.push(StepPlan { parent: p, key_path: path, key_himo: mine.himo_id, child_key: Some(theirs.himo_id) });
+                }
+            }
+        }
+        let mut preds = Vec::with_capacity(self.comps.len());
+        for q in self.comps {
+            match q.live_preds()? {
+                Some(p) => preds.push(p),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some((preds, steps)))
+    }
+
+    /// 今の組 (昇順)。
+    pub fn find(self) -> Result<Vec<Vec<EntityId>>, SchemaError> {
+        let eng = self.comps[0].db.arc_engine();
+        let Some((preds, steps)) = self.plan()? else { return Ok(Vec::new()) };
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let peer = eng.peer_id();
+        let key = |e: EntityId, path: &[u16], h: u16| -> Option<u64> {
+            let mut cur = e;
+            for &p in path {
+                cur = enchudb_oplog::make_eid(peer, eng.get_by_id(cur, p)? as u32);
+            }
+            eng.get_by_id(cur, h)
+        };
+        let mut rows = Vec::with_capacity(preds.len());
+        for p in preds {
+            rows.push(eng.find_by(p).map_err(io)?);
+        }
+        let mut tuples: Vec<Vec<EntityId>> = rows[0].iter().map(|&e| vec![e]).collect();
+        for (k, st) in steps.iter().enumerate() {
+            let mut by_key: std::collections::BTreeMap<u64, Vec<EntityId>> = std::collections::BTreeMap::new();
+            for &c in &rows[k + 1] {
+                let kk = match st.child_key {
+                    None => Some(enchudb_oplog::eid_local(c) as u64),
+                    Some(h) => key(c, &[], h),
+                };
+                if let Some(kk) = kk {
+                    by_key.entry(kk).or_default().push(c);
+                }
+            }
+            let mut next = Vec::new();
+            for t in tuples {
+                if let Some(cs) = key(t[st.parent], &st.key_path, st.key_himo).and_then(|kk| by_key.get(&kk)) {
+                    for &c in cs {
+                        let mut u = t.clone();
+                        u.push(c);
+                        next.push(u);
+                    }
+                }
+            }
+            tuples = next;
+        }
+        tuples.sort_unstable();
+        Ok(tuples)
+    }
+
+    /// 今の組の数。
+    pub fn count(self) -> Result<usize, SchemaError> {
+        Ok(self.find()?.len())
+    }
+
+    /// 組を購読する。 初回 poll は登録時点の全部の組が `added`。 どの table の row の出入り・つなぐ列の書き換え
+    /// (ref の付け替え、 ref の先の値の変化も) でも届く。 drop で購読解除、 `Database` を借用しない。
+    ///
+    /// 段ごとに、 親の row の鍵を鍵付きの購読で、 子の row を購読で追い、 前の段の組を親の row の今の鍵で束ねて子と
+    /// 組む (差分の JOIN: 抜く側は抜く前の相手と、 足す側は足した後の相手と)。 メモリは各段の組の数に比例。
+    pub fn subscribe(self) -> Result<LiveMultiJoin, SchemaError> {
+        let eng = self.comps[0].db.arc_engine();
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let Some((preds, steps)) = self.plan()? else {
+            return Ok(LiveMultiJoin { eng, root: None, steps: Vec::new(), state: Default::default() });
+        };
+        let root = eng.subscribe(preds[0].clone()).map_err(io)?;
+        let mut live = Vec::with_capacity(steps.len());
+        for (k, st) in steps.into_iter().enumerate() {
+            let parent_key = eng.subscribe_keyed(preds[st.parent].clone(), st.key_path, st.key_himo).map_err(io)?;
+            let child = match st.child_key {
+                None => ChildStream::Rows(eng.subscribe(preds[k + 1].clone()).map_err(io)?),
+                Some(h) => ChildStream::Keyed(eng.subscribe_keyed(preds[k + 1].clone(), Vec::new(), h).map_err(io)?),
+            };
+            live.push(LiveStep { parent: st.parent, parent_key, child });
+        }
+        let n = live.len();
+        let state = ((0..=n).map(|_| Arena::default()).collect(), (0..n).map(|_| StepState::default()).collect());
+        Ok(LiveMultiJoin { eng, root: Some(root), steps: live, state: std::sync::Mutex::new(state) })
+    }
+}
+
+/// 段の子の row の流れ。
+enum ChildStream {
+    /// ref で指される子: 出入りだけ (鍵 = 子の local eid)。
+    Rows(enchudb_engine::LiveQuery),
+    /// 値でつなぐ子: 鍵付き。
+    Keyed(enchudb_engine::LiveKeyed),
+}
+
+struct LiveStep {
+    parent: usize,
+    parent_key: enchudb_engine::LiveKeyed,
+    child: ChildStream,
+}
+
+/// 組の段ごとの置き場。 段 k の組 = (段 k-1 の組の番号, 足した row) を 1 回だけ持ち、 番号で指す (組を複製しない)。
+/// 消えた組の番号は poll が終わってから空ける (同じ poll の後の段がまだ組の中身を読む)。
+#[derive(Default)]
+struct Arena {
+    prev: Vec<u32>,
+    row: Vec<EntityId>,
+    free: Vec<u32>,
+    /// (段 k-1 の組の番号, row) を 1 つの u128 に詰めた鍵 → 番号 (比較 1 回で済む)。
+    index: std::collections::BTreeMap<u128, u32>,
+    /// この poll で消えた番号 (poll の終わりに `free` へ)。
+    dead: Vec<u32>,
+}
+
+#[inline]
+fn pack(prev: u32, row: EntityId) -> u128 {
+    ((prev as u128) << 64) | row as u128
+}
+
+/// 段 0 の組の 「前の段の組」 の番号。
+const ROOT: u32 = u32::MAX;
+
+impl Arena {
+    fn alloc(&mut self, prev: u32, row: EntityId) -> u32 {
+        let id = match self.free.pop() {
+            Some(i) => {
+                self.prev[i as usize] = prev;
+                self.row[i as usize] = row;
+                i
+            }
+            None => {
+                self.prev.push(prev);
+                self.row.push(row);
+                (self.prev.len() - 1) as u32
+            }
+        };
+        self.index.insert(pack(prev, row), id);
+        id
+    }
+
+    /// 組 (prev, row) を消す (番号は poll の終わりまで読める)。
+    fn kill(&mut self, prev: u32, row: EntityId) -> Option<u32> {
+        let id = self.index.remove(&pack(prev, row))?;
+        self.dead.push(id);
+        Some(id)
+    }
+}
+
+/// 段 `level` の組 `id` の位置 `pos` の row。
+fn row_at(arenas: &[Arena], mut level: usize, mut id: u32, pos: usize) -> EntityId {
+    while level > pos {
+        id = arenas[level].prev[id as usize];
+        level -= 1;
+    }
+    arenas[level].row[id as usize]
+}
+
+/// 段 `level` の組 `id` の中身。
+fn tuple_at(arenas: &[Arena], level: usize, id: u32) -> Vec<EntityId> {
+    (0..=level).map(|pos| row_at(arenas, level, id, pos)).collect()
+}
+
+/// 段の状態 (最後に渡した組の元)。 集合は (鍵, 番号) の組を 1 本の木で持つ (鍵ごとの小さな木を作らない)。
+#[derive(Default)]
+struct StepState {
+    /// (親の row, 前の段の組の番号)。
+    by_row: std::collections::BTreeSet<(EntityId, u32)>,
+    /// 親の row の鍵。
+    pkey: std::collections::BTreeMap<EntityId, u64>,
+    /// (鍵, 前の段の組の番号) (親の row に鍵のある組)。
+    kl: std::collections::BTreeSet<(u64, u32)>,
+    /// (鍵, 子の row)。
+    right: std::collections::BTreeSet<(u64, EntityId)>,
+}
+
+/// 組の番号の差分。
+#[derive(Default)]
+struct IdDelta {
+    removed: Vec<u32>,
+    added: Vec<u32>,
+}
+
+/// 鍵付きの差分 (組の番号 / row → 鍵) と、 入り直したもの。
+struct Keyed<T> {
+    removed: Vec<(T, u64)>,
+    added: Vec<(T, u64)>,
+    reentered: std::collections::BTreeSet<T>,
+}
+
+/// [`MultiJoin::subscribe`] の戻り値。 3 つ以上の table の組の出入りを購読する。
+pub struct LiveMultiJoin {
+    eng: Arc<Engine>,
+    root: Option<enchudb_engine::LiveQuery>,
+    steps: Vec<LiveStep>,
+    state: std::sync::Mutex<(Vec<Arena>, Vec<StepState>)>,
+}
+
+impl LiveMultiJoin {
+    /// 前回 poll からの組の差分。
+    pub fn poll(&self) -> TupleDelta {
+        let Some(root) = &self.root else { return TupleDelta::default() };
+        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let (arenas, states) = &mut *guard;
+        let d0 = root.poll(&self.eng);
+        let mut d = IdDelta::default();
+        // 段 0: row そのもの (消えて入り直した row は別の番号になる)
+        for e in d0.removed {
+            d.removed.extend(arenas[0].kill(ROOT, e));
+        }
+        for e in d0.added {
+            d.added.push(arenas[0].alloc(ROOT, e));
+        }
+        for (k, (step, st)) in self.steps.iter().zip(states.iter_mut()).enumerate() {
+            let (done, rest) = arenas.split_at_mut(k + 1);
+            d = step.step(&self.eng, st, done, &mut rest[0], d);
+        }
+        let last = arenas.len() - 1;
+        let out = TupleDelta {
+            removed: d.removed.iter().map(|&id| tuple_at(arenas, last, id)).collect(),
+            added: d.added.iter().map(|&id| tuple_at(arenas, last, id)).collect(),
+        };
+        for a in arenas.iter_mut() {
+            let dead = std::mem::take(&mut a.dead);
+            a.free.extend(dead);
+        }
+        out
+    }
+}
+
+impl LiveStep {
+    /// 段 k (前の段 = `prev[k]`、 新しい段 = `next`) の差分。
+    fn step(&self, eng: &Engine, st: &mut StepState, prev: &[Arena], next: &mut Arena, dleft: IdDelta) -> IdDelta {
+        use std::collections::BTreeSet;
+        let (p, lv) = (self.parent, prev.len() - 1);
+        let row = |t: u32| row_at(prev, lv, t, p);
+        let dp = self.parent_key.poll(eng);
+        let dc: Keyed<EntityId> = match &self.child {
+            ChildStream::Rows(q) => {
+                let d = q.poll(eng);
+                let key = |e: EntityId| enchudb_oplog::eid_local(e) as u64;
+                let rs: BTreeSet<EntityId> = d.removed.iter().copied().collect();
+                Keyed {
+                    reentered: d.added.iter().copied().filter(|e| rs.contains(e)).collect(),
+                    removed: d.removed.into_iter().map(|e| (e, key(e))).collect(),
+                    added: d.added.into_iter().map(|e| (e, key(e))).collect(),
+                }
+            }
+            ChildStream::Keyed(q) => {
+                let d = q.poll(eng);
+                Keyed { reentered: d.reentered.into_iter().collect(), removed: d.removed, added: d.added }
+            }
+        };
+        // ── 前の段の組の鍵付きの差分 (組の出入り + 親の row の鍵の変化)。 番号は出入りのたびに新しいので、 同じ番号が
+        // removed と added の両方に来ることは無い (入り直した組は別の番号)
+        let gone: BTreeSet<u32> = dleft.removed.iter().copied().collect();
+        let born: BTreeSet<u32> = dleft.added.iter().copied().collect();
+        let mut affected: BTreeSet<u32> = gone.union(&born).copied().collect();
+        for r in dp.removed.iter().chain(dp.added.iter()).map(|x| x.0) {
+            affected.extend(st.by_row.range((r, 0)..=(r, u32::MAX)).map(|x| x.1));
+        }
+        // 親の row が入り直した (eid の使い回し) なら、 その row を含む組は別物
+        let re_rows: BTreeSet<EntityId> = dp.reentered.iter().copied().collect();
+        let old: Vec<(u32, EntityId, Option<u64>)> = affected
+            .iter()
+            .map(|&t| {
+                let r = row(t);
+                (t, r, if born.contains(&t) { None } else { st.pkey.get(&r).copied() })
+            })
+            .collect();
+        for &t in &dleft.removed {
+            st.by_row.remove(&(row(t), t));
+        }
+        for &t in &dleft.added {
+            st.by_row.insert((row(t), t));
+        }
+        for (r, _) in &dp.removed {
+            st.pkey.remove(r);
+        }
+        for &(r, k) in &dp.added {
+            st.pkey.insert(r, k);
+        }
+        let mut dl: Keyed<u32> = Keyed { removed: Vec::new(), added: Vec::new(), reentered: BTreeSet::new() };
+        for (t, r, was) in old {
+            let now = if gone.contains(&t) { None } else { st.pkey.get(&r).copied() };
+            let re = re_rows.contains(&r);
+            if was == now && !re {
+                continue;
+            }
+            if let Some(w) = was {
+                dl.removed.push((t, w));
+            }
+            if let Some(n) = now {
+                dl.added.push((t, n));
+            }
+            if re && was.is_some() && now.is_some() {
+                dl.reentered.insert(t);
+            }
+        }
+        // ── 前の段の組 × 子の row (値で結ぶ 2 つの table の組と同じ手順): 抜く側は抜く前の相手と、 足す側は足した後の相手と
+        let kept = kept_ids(&dl, &dc);
+        let keep = |t: u32, c: EntityId| !kept.is_empty() && kept.contains(&(t, c));
+        let mut out = IdDelta::default();
+        for &(t, k) in &dl.removed {
+            for &(_, c) in st.right.range((k, 0)..=(k, u64::MAX)) {
+                if !keep(t, c) {
+                    out.removed.extend(next.kill(t, c));
+                }
+            }
+            st.kl.remove(&(k, t));
+        }
+        for &(c, k) in &dc.removed {
+            for &(_, t) in st.kl.range((k, 0)..=(k, u32::MAX)) {
+                if !keep(t, c) {
+                    out.removed.extend(next.kill(t, c));
+                }
+            }
+            st.right.remove(&(k, c));
+        }
+        for &(t, k) in &dl.added {
+            st.kl.insert((k, t));
+            for &(_, c) in st.right.range((k, 0)..=(k, u64::MAX)) {
+                if !keep(t, c) {
+                    out.added.push(next.alloc(t, c));
+                }
+            }
+        }
+        for &(c, k) in &dc.added {
+            st.right.insert((k, c));
+            for &(_, t) in st.kl.range((k, 0)..=(k, u32::MAX)) {
+                if !keep(t, c) {
+                    out.added.push(next.alloc(t, c));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// 前の段の組と子の row が同じ poll の中で同じ鍵から同じ鍵へ一緒に移った組 (居続けている = 出さない)。
+fn kept_ids(dl: &Keyed<u32>, dc: &Keyed<EntityId>) -> std::collections::BTreeSet<(u32, EntityId)> {
+    use std::collections::{BTreeMap, BTreeSet};
+    fn moves<T: Ord + Copy>(k: &Keyed<T>) -> BTreeMap<T, (u64, u64)> {
+        if k.removed.is_empty() || k.added.is_empty() {
+            return BTreeMap::new();
+        }
+        let old: BTreeMap<T, u64> = k.removed.iter().copied().collect();
+        k.added.iter().filter(|(e, _)| !k.reentered.contains(e)).filter_map(|&(e, n)| old.get(&e).map(|&o| (e, (o, n)))).collect()
+    }
+    let mut out = BTreeSet::new();
+    let ml = moves(dl);
+    if ml.is_empty() {
+        return out;
+    }
+    let mut by_move: BTreeMap<(u64, u64), Vec<EntityId>> = BTreeMap::new();
+    for (c, m) in moves(dc) {
+        by_move.entry(m).or_default().push(c);
+    }
+    for (t, m) in ml {
+        if let Some(cs) = by_move.get(&m) {
+            out.extend(cs.iter().map(|&c| (t, c)));
+        }
+    }
+    out
+}
+
+impl std::fmt::Debug for LiveMultiJoin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveMultiJoin").field("steps", &self.steps.len()).finish_non_exhaustive()
     }
 }
 
