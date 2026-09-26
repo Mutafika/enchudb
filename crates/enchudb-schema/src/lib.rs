@@ -4127,9 +4127,9 @@ impl Hier {
 struct UnderState {
     hier: Hier,
     /// この query の条件を満たす row。
-    filt: std::collections::BTreeSet<u32>,
+    filt: RowSet,
     /// 最後に渡した row。
-    reported: std::collections::BTreeSet<u32>,
+    reported: RowSet,
 }
 
 /// [`UnderQuery::subscribe`] の戻り値。 階層の配下 (または上) の row の出入りを購読する。
@@ -4159,7 +4159,7 @@ impl LiveUnder {
             hier.apply(&dp, &ds, &HierRef { parent: &parent })
         });
         for &e in &df.removed {
-            filt.remove(&local(e));
+            filt.remove(local(e));
             touched.push(local(e));
         }
         for &e in &df.added {
@@ -4171,8 +4171,8 @@ impl LiveUnder {
         touched.dedup();
         let mut d = LiveDelta::default();
         for x in touched {
-            let now = hier.answer(x) && filt.contains(&x);
-            let was = reported.contains(&x);
+            let now = hier.answer(x) && filt.contains(x);
+            let was = reported.contains(x);
             let e = enchudb_oplog::make_eid(peer, x);
             match (was, now) {
                 (false, true) => {
@@ -4180,7 +4180,7 @@ impl LiveUnder {
                     d.added.push(e);
                 }
                 (true, false) => {
-                    reported.remove(&x);
+                    reported.remove(x);
                     d.removed.push(e);
                 }
                 (true, true) if reborn.contains(&x) => {
@@ -4298,33 +4298,209 @@ impl<'a> ReachQuery<'a> {
 /// 外して探し直す: 元の支え → 入ってくる辺の始点の順に、 seed に着く支えを探す (付け替えた辺の新しい始点も候補、
 /// 見つかればその先は見ない)。 見つからない row は外し、 その row が支えていた row も探し直す。 最後に、 外した
 /// row のうち届く支えを持つもの・足した辺の先・入った seed の先から幅優先に広げる。
+///
+/// 支えられている row の一覧は持たない: 支えは辺の始点なので、 x が支える row = x から出る辺の先で支えが x のもの。
 #[derive(Default)]
 struct Graph {
-    out: std::collections::BTreeSet<(u32, u32, u32)>,
-    inn: std::collections::BTreeSet<(u32, u32, u32)>,
+    /// 始点 → (終点, 辺の row)
+    out: Adj,
+    /// 終点 → (始点, 辺の row)
+    inn: Adj,
     seed: std::collections::BTreeSet<u32>,
     /// 届く row → 支え
-    sup: std::collections::BTreeMap<u32, u32>,
-    /// (支え, 支えられている row)
-    kids: std::collections::BTreeSet<(u32, u32)>,
+    sup: RowMap,
+}
+
+/// local eid → u32 の表。 4096 row ずつのページで、 触ったページだけ持つ。 到達の支えは 1 回の poll で 10 万 row 規模を
+/// 書き換え、 BTreeMap の出し入れがプロファイルの上位だった (row は table の範囲の local eid なので、 ページは詰まる)。
+#[derive(Default)]
+struct RowMap {
+    pages: Vec<Option<Box<[u32]>>>,
+    len: usize,
+}
+
+impl RowMap {
+    /// 値の無い印。
+    const NONE: u32 = u32::MAX;
+    const BITS: u32 = 12;
+
+    fn slot(x: u32) -> (usize, usize) {
+        ((x >> Self::BITS) as usize, (x & ((1 << Self::BITS) - 1)) as usize)
+    }
+
+    fn get(&self, x: u32) -> Option<u32> {
+        let (p, i) = Self::slot(x);
+        let v = self.pages.get(p)?.as_ref()?[i];
+        (v != Self::NONE).then_some(v)
+    }
+
+    fn contains(&self, x: u32) -> bool {
+        self.get(x).is_some()
+    }
+
+    fn insert(&mut self, x: u32, v: u32) -> Option<u32> {
+        debug_assert!(v != Self::NONE);
+        let (p, i) = Self::slot(x);
+        if self.pages.len() <= p {
+            self.pages.resize_with(p + 1, || None);
+        }
+        let page = self.pages[p].get_or_insert_with(|| vec![Self::NONE; 1 << Self::BITS].into_boxed_slice());
+        let old = std::mem::replace(&mut page[i], v);
+        if old == Self::NONE {
+            self.len += 1;
+            None
+        } else {
+            Some(old)
+        }
+    }
+
+    fn remove(&mut self, x: u32) -> Option<u32> {
+        let (p, i) = Self::slot(x);
+        let page = self.pages.get_mut(p)?.as_mut()?;
+        let old = std::mem::replace(&mut page[i], Self::NONE);
+        (old != Self::NONE).then(|| {
+            self.len -= 1;
+            old
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+/// local eid → (相手, 辺の row) の昇順の並び (4096 row ずつのページ)。 到達の辺の索引: 届く row を広げるたびに出る辺を
+/// 引くので、 BTreeSet の (始点, 終点, 辺) の範囲引きより、 row の並びを 1 回引く方が速い。
+#[derive(Default)]
+struct Adj {
+    pages: Vec<Option<Box<[Vec<(u32, u32)>]>>>,
+}
+
+impl Adj {
+    const BITS: u32 = 12;
+
+    fn slot(x: u32) -> (usize, usize) {
+        ((x >> Self::BITS) as usize, (x & ((1 << Self::BITS) - 1)) as usize)
+    }
+
+    fn get(&self, x: u32) -> &[(u32, u32)] {
+        let (p, i) = Self::slot(x);
+        match self.pages.get(p).and_then(|q| q.as_ref()) {
+            Some(q) => &q[i],
+            None => &[],
+        }
+    }
+
+    /// x から o への辺が在るか。
+    fn has(&self, x: u32, o: u32) -> bool {
+        let v = self.get(x);
+        let i = v.partition_point(|&(a, _)| a < o);
+        v.get(i).is_some_and(|&(a, _)| a == o)
+    }
+
+    fn insert(&mut self, x: u32, e: (u32, u32)) -> bool {
+        let (p, i) = Self::slot(x);
+        if self.pages.len() <= p {
+            self.pages.resize_with(p + 1, || None);
+        }
+        let v = &mut self.pages[p].get_or_insert_with(|| (0..1 << Self::BITS).map(|_| Vec::new()).collect())[i];
+        match v.binary_search(&e) {
+            Ok(_) => false,
+            Err(j) => {
+                if v.len() < 4 {
+                    // 辺の少ない row (ほとんど) は詰めて持つ
+                    v.reserve_exact(1);
+                }
+                v.insert(j, e);
+                true
+            }
+        }
+    }
+
+    fn remove(&mut self, x: u32, e: (u32, u32)) -> bool {
+        let (p, i) = Self::slot(x);
+        let Some(v) = self.pages.get_mut(p).and_then(|q| q.as_mut()).map(|q| &mut q[i]) else { return false };
+        match v.binary_search(&e) {
+            Ok(j) => {
+                v.remove(j);
+                if v.is_empty() {
+                    *v = Vec::new();
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// local eid の集合 (4096 row ずつのビットのページ、 触ったページだけ持つ)。 購読の 「条件を満たす row」 は table の
+/// 全 row になりうる (100 万 row で BTreeSet は数十 MB、 ビットなら 128 KB) し、 poll ごとに出入りした row の数だけ引く。
+#[derive(Default)]
+struct RowSet {
+    pages: Vec<Option<Box<[u64]>>>,
+}
+
+impl RowSet {
+    const BITS: u32 = 12;
+
+    fn slot(x: u32) -> (usize, usize, u64) {
+        ((x >> Self::BITS) as usize, ((x >> 6) & ((1 << (Self::BITS - 6)) - 1)) as usize, 1 << (x & 63))
+    }
+
+    fn contains(&self, x: u32) -> bool {
+        let (p, w, b) = Self::slot(x);
+        self.pages.get(p).and_then(|q| q.as_ref()).is_some_and(|q| q[w] & b != 0)
+    }
+
+    /// 無かったら true。
+    fn insert(&mut self, x: u32) -> bool {
+        let (p, w, b) = Self::slot(x);
+        if self.pages.len() <= p {
+            self.pages.resize_with(p + 1, || None);
+        }
+        let q = self.pages[p].get_or_insert_with(|| vec![0; 1 << (Self::BITS - 6)].into_boxed_slice());
+        let new = q[w] & b == 0;
+        q[w] |= b;
+        new
+    }
+
+    /// 在ったら true。
+    fn remove(&mut self, x: u32) -> bool {
+        let (p, w, b) = Self::slot(x);
+        match self.pages.get_mut(p).and_then(|q| q.as_mut()) {
+            Some(q) => {
+                let had = q[w] & b != 0;
+                q[w] &= !b;
+                had
+            }
+            None => false,
+        }
+    }
 }
 
 impl Graph {
     fn outs(&self, x: u32) -> impl Iterator<Item = u32> + '_ {
-        self.out.range((x, 0, 0)..=(x, u32::MAX, u32::MAX)).map(|t| t.1)
+        self.out.get(x).iter().map(|t| t.0)
     }
 
     fn ins(&self, x: u32) -> impl Iterator<Item = u32> + '_ {
-        self.inn.range((x, 0, 0)..=(x, u32::MAX, u32::MAX)).map(|t| t.1)
+        self.inn.get(x).iter().map(|t| t.0)
     }
 
     fn reached(&self, x: u32) -> bool {
-        self.sup.contains_key(&x)
+        self.sup.contains(x)
+    }
+
+    /// x が支えている row。
+    fn kids(&self, x: u32) -> Vec<u32> {
+        let mut v: Vec<u32> = self.outs(x).filter(|&y| self.sup.get(y) == Some(x)).collect();
+        v.dedup();
+        v
     }
 
     /// w から辺を出して届かせられるか (seed か、 届く row)。
     fn source(&self, w: u32) -> bool {
-        self.seed.contains(&w) || self.sup.contains_key(&w)
+        self.seed.contains(&w) || self.sup.contains(w)
     }
 
     /// w が支えになれるか: w から支えをたどって seed に着く。 支えを探している row (支えを外してある) を通る鎖は着かない
@@ -4335,8 +4511,8 @@ impl Graph {
             if self.seed.contains(&w) {
                 return true;
             }
-            match self.sup.get(&w) {
-                Some(&p) => w = p,
+            match self.sup.get(w) {
+                Some(p) => w = p,
                 None => return false,
             }
         }
@@ -4346,13 +4522,11 @@ impl Graph {
 
     fn set_sup(&mut self, x: u32, w: u32) {
         self.sup.insert(x, w);
-        self.kids.insert((w, x));
     }
 
     /// x の支えを外して `pending` に積む (支えていなければ何もしない)。
     fn unhook(&mut self, x: u32, pending: &mut Vec<(u32, u32)>) {
-        if let Some(old) = self.sup.remove(&x) {
-            self.kids.remove(&(old, x));
+        if let Some(old) = self.sup.remove(x) {
             pending.push((x, old));
         }
     }
@@ -4362,21 +4536,21 @@ impl Graph {
         // 1. 辺と seed を消して足す (置くだけ)。 支えの辺が消えた row と、 外れた seed が支えていた row を覚える
         let mut roots: Vec<u32> = Vec::new();
         for &(s, d, r) in del {
-            if self.out.remove(&(s, d, r)) {
-                self.inn.remove(&(d, s, r));
-                if self.sup.get(&d) == Some(&s) && self.out.range((s, d, 0)..=(s, d, u32::MAX)).next().is_none() {
+            if self.out.remove(s, (d, r)) {
+                self.inn.remove(d, (s, r));
+                if self.sup.get(d) == Some(s) && !self.out.has(s, d) {
                     roots.push(d);
                 }
             }
         }
         for &s in unseed {
             if self.seed.remove(&s) {
-                roots.extend(self.kids.range((s, 0)..=(s, u32::MAX)).map(|k| k.1));
+                roots.extend(self.kids(s));
             }
         }
         for &(s, d, r) in add {
-            if self.out.insert((s, d, r)) {
-                self.inn.insert((d, s, r));
+            if self.out.insert(s, (d, r)) {
+                self.inn.insert(d, (s, r));
             }
         }
         let fresh: Vec<u32> = seed.iter().copied().filter(|&s| self.seed.insert(s)).collect();
@@ -4387,14 +4561,13 @@ impl Graph {
         }
         let mut gone: Vec<u32> = Vec::new();
         while let Some((x, old)) = pending.pop() {
-            let has_old = self.out.range((old, x, 0)..=(old, x, u32::MAX)).next().is_some();
+            let has_old = self.out.has(old, x);
             let alt = if has_old && self.chain_ok(old) { Some(old) } else { self.ins(x).find(|&w| w != old && self.chain_ok(w)) };
             match alt {
                 Some(w) => self.set_sup(x, w),
                 None => {
                     gone.push(x);
-                    let kids: Vec<u32> = self.kids.range((x, 0)..=(x, u32::MAX)).map(|k| k.1).collect();
-                    for y in kids {
+                    for y in self.kids(x) {
                         self.unhook(y, &mut pending);
                     }
                 }
@@ -4450,9 +4623,9 @@ struct ReachLive {
 struct ReachState {
     graph: Graph,
     /// この query の条件を満たす row。
-    filt: std::collections::BTreeSet<u32>,
+    filt: RowSet,
     /// 最後に渡した row。
-    reported: std::collections::BTreeSet<u32>,
+    reported: RowSet,
 }
 
 /// [`ReachQuery::subscribe`] の戻り値。 辺の table をたどって届く row の出入りを購読する。
@@ -4499,7 +4672,7 @@ impl LiveReach {
         let rs: BTreeSet<EntityId> = df.removed.iter().copied().collect();
         let reborn: BTreeSet<u32> = df.added.iter().filter(|e| rs.contains(e)).map(|&e| local(e)).collect();
         for &e in &df.removed {
-            filt.remove(&local(e));
+            filt.remove(local(e));
             touched.push(local(e));
         }
         for &e in &df.added {
@@ -4510,8 +4683,8 @@ impl LiveReach {
         touched.dedup();
         let mut d = LiveDelta::default();
         for x in touched {
-            let now = graph.reached(x) && filt.contains(&x);
-            let was = reported.contains(&x);
+            let now = graph.reached(x) && filt.contains(x);
+            let was = reported.contains(x);
             let e = enchudb_oplog::make_eid(peer, x);
             match (was, now) {
                 (false, true) => {
@@ -4519,7 +4692,7 @@ impl LiveReach {
                     d.added.push(e);
                 }
                 (true, false) => {
-                    reported.remove(&x);
+                    reported.remove(x);
                     d.removed.push(e);
                 }
                 (true, true) if reborn.contains(&x) => {
