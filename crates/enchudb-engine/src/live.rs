@@ -4984,6 +4984,13 @@ impl LiveKeyed {
         m.keyed.as_ref()?.reported.get(enchudb_oplog::eid_local(eid)).checked_sub(1)
     }
 
+    /// [`reported_key`](Self::reported_key) をまとめて (ロック 1 回)。 `eids` と同じ順。
+    pub fn reported_keys(&self, eids: &[EntityId]) -> Vec<Option<u64>> {
+        let guard = self.family.settled.lock();
+        let Some(ks) = guard.members[self.slot].as_ref().and_then(|m| m.keyed.as_ref()) else { return vec![None; eids.len()] };
+        eids.iter().map(|&e| ks.reported.get(enchudb_oplog::eid_local(e)).checked_sub(1)).collect()
+    }
+
     /// engine 内で一意な購読 id。
     pub fn id(&self) -> u64 {
         self.id

@@ -2526,25 +2526,32 @@ type IvChange = (Option<(u64, u64)>, Option<(u64, u64)>, bool);
 struct RangeState {
     /// 左の (値, row)
     points: std::collections::BTreeSet<(u64, EntityId)>,
-    /// 右の row の始点 / 終点 (値のある row)
-    lo_of: std::collections::BTreeMap<EntityId, u64>,
-    hi_of: std::collections::BTreeMap<EntityId, u64>,
     ivs: Intervals,
 }
 
-impl RangeState {
-    fn iv(&self, r: EntityId) -> Option<(u64, u64)> {
-        match (self.lo_of.get(&r), self.hi_of.get(&r)) {
-            (Some(&lo), Some(&hi)) if lo <= hi => Some((lo, hi)),
-            _ => None,
-        }
+/// 始点 / 終点から区間 (始点 > 終点 / 値の無い row は None)。
+fn interval(lo: Option<u64>, hi: Option<u64>) -> Option<(u64, u64)> {
+    match (lo, hi) {
+        (Some(lo), Some(hi)) if lo <= hi => Some((lo, hi)),
+        _ => None,
     }
+}
+
+impl RangeState {
 
     /// 差分を当てて組の差分を返す。 抜く側は抜く前の相手と、 足す側は足した後の相手と組む (同じ組を 2 度数えない):
     /// 左の removed × 旧区間 → 旧区間 × (左 − 左の removed) → 左の added × (区間 − 旧区間) → 新区間 × 新しい左。
     /// 居続ける組 (どちらの row も作り直していなくて、 動く前も後も組になる) は、 それぞれの段で出さない
     /// (出してから打ち消すと、 まとめた poll で抜く組を全部集合に入れることになる)。
-    fn apply(&mut self, dl: &enchudb_engine::KeyedDelta, dlo: &enchudb_engine::KeyedDelta, dhi: &enchudb_engine::KeyedDelta) -> PairDelta {
+    ///
+    /// 右の row の区間の前後は、 始点 / 終点の鍵付きの購読の差分と渡し済みの鍵 (`now` = 差分に出た row ごとの (始点, 終点)) から。
+    fn apply(
+        &mut self,
+        dl: &enchudb_engine::KeyedDelta,
+        dlo: &enchudb_engine::KeyedDelta,
+        dhi: &enchudb_engine::KeyedDelta,
+        now: &[(EntityId, Option<u64>, Option<u64>)],
+    ) -> PairDelta {
         use std::collections::{BTreeMap, BTreeSet};
         let within = |iv: Option<(u64, u64)>, v: u64| iv.is_some_and(|(lo, hi)| lo <= v && v <= hi);
         let mut d = PairDelta::default();
@@ -2556,20 +2563,10 @@ impl RangeState {
         let old_v = |a: EntityId| find(&dl.removed, a).filter(|_| !reborn(a));
         let new_v = |a: EntityId| find(&dl.added, a).filter(|_| !reborn(a));
         // 右: 区間の変わった (か作り直した) row の (旧区間, 新区間, 作り直したか)
-        let rows: BTreeSet<EntityId> = [dlo, dhi].iter().flat_map(|k| k.removed.iter().chain(k.added.iter()).map(|x| x.0)).collect();
         let reborn_r: BTreeSet<EntityId> = dlo.reentered.iter().chain(dhi.reentered.iter()).copied().collect();
-        let before: Vec<(EntityId, Option<(u64, u64)>)> = rows.iter().map(|&r| (r, self.iv(r))).collect();
-        for (k, map) in [(dlo, &mut self.lo_of), (dhi, &mut self.hi_of)] {
-            for (e, _) in &k.removed {
-                map.remove(e);
-            }
-            for &(e, v) in &k.added {
-                map.insert(e, v);
-            }
-        }
-        let changed: BTreeMap<EntityId, IvChange> = before
-            .into_iter()
-            .map(|(r, old)| (r, (old, self.iv(r), reborn_r.contains(&r))))
+        let changed: BTreeMap<EntityId, IvChange> = now
+            .iter()
+            .map(|&(r, lo, hi)| (r, (interval(key_before(dlo, r, lo), key_before(dhi, r, hi)), interval(lo, hi), reborn_r.contains(&r))))
             .filter(|(_, (old, new, re))| old != new || *re)
             .collect();
         // 1. 左の removed × 旧区間 (居続ける: 左が動いた先も、 右の今の区間に入る)
@@ -2703,11 +2700,26 @@ impl LiveJoin {
             JoinLive::Lag { part, order, state } => {
                 let dp = part.as_ref().map(|q| q.poll(&self.eng));
                 let dord = order.poll(&self.eng);
-                d = state.lock().unwrap_or_else(|p| p.into_inner()).apply(dp.as_ref(), &dord);
+                let mut rows: Vec<EntityId> =
+                    dp.iter().chain(std::iter::once(&dord)).flat_map(|k| k.removed.iter().chain(k.added.iter()).map(|x| x.0)).collect();
+                rows.sort_unstable();
+                rows.dedup();
+                let ps = match part {
+                    Some(q) => q.reported_keys(&rows),
+                    None => vec![Some(0); rows.len()],
+                };
+                let os = order.reported_keys(&rows);
+                let now: Vec<(EntityId, Option<u64>, Option<u64>)> = rows.iter().enumerate().map(|(i, &r)| (r, ps[i], os[i])).collect();
+                d = state.lock().unwrap_or_else(|p| p.into_inner()).apply(dp.as_ref(), &dord, &now);
             }
             JoinLive::Range { left, lo, hi, state } => {
                 let (dl, dlo, dhi) = (left.poll(&self.eng), lo.poll(&self.eng), hi.poll(&self.eng));
-                d = state.lock().unwrap_or_else(|p| p.into_inner()).apply(&dl, &dlo, &dhi);
+                let mut rows: Vec<EntityId> = [&dlo, &dhi].iter().flat_map(|k| k.removed.iter().chain(k.added.iter()).map(|x| x.0)).collect();
+                rows.sort_unstable();
+                rows.dedup();
+                let (los, his) = (lo.reported_keys(&rows), hi.reported_keys(&rows));
+                let now: Vec<(EntityId, Option<u64>, Option<u64>)> = rows.iter().enumerate().map(|(i, &r)| (r, los[i], his[i])).collect();
+                d = state.lock().unwrap_or_else(|p| p.into_inner()).apply(&dl, &dlo, &dhi, &now);
             }
         }
         // 並べない (順不同): batch で書いてから poll すると組は右の row ごとの run が入り組み、 並べるだけで
@@ -3419,8 +3431,6 @@ impl<'a> LagQuery<'a> {
 /// LAG の購読の状態。
 #[derive(Default)]
 struct LagState {
-    /// row → (group, 並びの値)。 group の無い LAG は group を 0 で持つ
-    vals: std::collections::BTreeMap<EntityId, (Option<u64>, Option<u64>)>,
     /// (group, 並びの値, row)
     seq: std::collections::BTreeSet<(u64, u64, EntityId)>,
     /// 最後に渡した 1 つ前の row
@@ -3442,56 +3452,32 @@ impl LagState {
 
     /// 差分を当てて組の差分を返す。 1 つ前が変わりうる row = 動いた row と、 動く前 / 後の位置の直後の row。
     /// それぞれの今の 1 つ前を渡し済みのものと比べる (作り直した row が組のどちらかに居れば、 同じでも出て入り直す)。
-    /// 動いた row の値は鍵付きの購読の差分 (eid の昇順) を二分探索で引き、 値の表は row ごとに 1 回だけ引く。
-    fn apply(&mut self, dp: Option<&enchudb_engine::KeyedDelta>, dord: &enchudb_engine::KeyedDelta) -> PairDelta {
+    /// 動いた row の値の後 = 鍵付きの購読が渡し済みの鍵 (`now` = 動いた row ごとの (group, 並び)、 row の昇順、 group の無い
+    /// LAG は group 0)、 前 = 差分の removed か、 動いていなければ後と同じ。
+    fn apply(
+        &mut self,
+        dp: Option<&enchudb_engine::KeyedDelta>,
+        dord: &enchudb_engine::KeyedDelta,
+        now: &[(EntityId, Option<u64>, Option<u64>)],
+    ) -> PairDelta {
         use std::collections::btree_map::Entry;
         let deltas: Vec<&enchudb_engine::KeyedDelta> = dp.into_iter().chain(std::iter::once(dord)).collect();
-        let mut moved: Vec<EntityId> = deltas.iter().flat_map(|k| k.removed.iter().chain(k.added.iter()).map(|x| x.0)).collect();
-        moved.sort_unstable();
-        moved.dedup();
+        let moved: Vec<EntityId> = now.iter().map(|x| x.0).collect();
         let mut reborn: Vec<EntityId> = deltas.iter().flat_map(|k| k.reentered.iter().copied()).collect();
         reborn.sort_unstable();
         let is_reborn = |e: EntityId| reborn.binary_search(&e).is_ok();
-        // 列の新しい値: added に居ればその値、 removed だけに居れば無し、 どちらにも居なければ元のまま
-        let step = |k: &enchudb_engine::KeyedDelta, e: EntityId, old: Option<u64>| -> Option<u64> {
-            match k.added.binary_search_by_key(&e, |x| x.0) {
-                Ok(i) => Some(k.added[i].1),
-                Err(_) if k.removed.binary_search_by_key(&e, |x| x.0).is_ok() => None,
-                Err(_) => old,
-            }
-        };
-        let pos = |e: EntityId, v: (Option<u64>, Option<u64>)| Some((v.0?, v.1?, e));
+        let pos = |e: EntityId, p: Option<u64>, o: Option<u64>| Some((p?, o?, e));
         // (row, 動く前の位置, 動いた後の位置)
-        let mut ups: Vec<(EntityId, Option<LagPos>, Option<LagPos>)> = Vec::with_capacity(moved.len());
-        for &e in &moved {
-            let next = |old: (Option<u64>, Option<u64>)| {
-                let p = match dp {
-                    Some(k) => step(k, e, old.0),
-                    None => Some(0),
+        let ups: Vec<(EntityId, Option<LagPos>, Option<LagPos>)> = now
+            .iter()
+            .map(|&(e, p, o)| {
+                let p0 = match dp {
+                    Some(k) => key_before(k, e, p),
+                    None => p,
                 };
-                (p, step(dord, e, old.1))
-            };
-            let (old, new) = match self.vals.entry(e) {
-                Entry::Occupied(mut o) => {
-                    let old = *o.get();
-                    let new = next(old);
-                    if new == (None, None) {
-                        o.remove();
-                    } else {
-                        *o.get_mut() = new;
-                    }
-                    (old, new)
-                }
-                Entry::Vacant(v) => {
-                    let new = next((None, None));
-                    if new != (None, None) {
-                        v.insert(new);
-                    }
-                    ((None, None), new)
-                }
-            };
-            ups.push((e, pos(e, old), pos(e, new)));
-        }
+                (e, pos(e, p0, key_before(dord, e, o)), pos(e, p, o))
+            })
+            .collect();
         // 1 つ前が変わりうる row と、 その今の位置 (動いた row は動いた後の位置で上書きする)
         let mut touched: Vec<(EntityId, Option<LagPos>)> = Vec::new();
         for &(_, old, _) in &ups {
@@ -4271,6 +4257,15 @@ impl Graph {
     }
 }
 
+/// 鍵付きの購読の差分 `k` を当てる前の、 row `e` の鍵。 `now` = 当てた後 (渡し済みの鍵)。 差分は eid の昇順。
+fn key_before(k: &enchudb_engine::KeyedDelta, e: EntityId, now: Option<u64>) -> Option<u64> {
+    match k.removed.binary_search_by_key(&e, |x| x.0) {
+        Ok(i) => Some(k.removed[i].1),
+        Err(_) if k.added.binary_search_by_key(&e, |x| x.0).is_ok() => None,
+        Err(_) => now,
+    }
+}
+
 /// 到達の購読の元。
 struct ReachLive {
     /// 辺の row の始点 / 終点の鍵付きの購読
@@ -4284,9 +4279,6 @@ struct ReachLive {
 #[derive(Default)]
 struct ReachState {
     graph: Graph,
-    /// 辺の row → 始点 / 終点
-    src_of: std::collections::BTreeMap<u32, u32>,
-    dst_of: std::collections::BTreeMap<u32, u32>,
     /// この query の条件を満たす row。
     filt: std::collections::BTreeSet<u32>,
     /// 最後に渡した row。
@@ -4306,32 +4298,28 @@ impl LiveReach {
         use std::collections::BTreeSet;
         let Some(lv) = &self.live else { return LiveDelta::default() };
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let ReachState { graph, src_of, dst_of, filt, reported } = &mut *st;
+        let ReachState { graph, filt, reported } = &mut *st;
         let peer = self.eng.peer_id();
         let local = |e: EntityId| enchudb_oplog::eid_local(e);
         let (dsrc, ddst, ds, df) = (lv.src.poll(&self.eng), lv.dst.poll(&self.eng), lv.seeds.poll(&self.eng), lv.filter.poll(&self.eng));
-        // 辺の row の (始点, 終点) の前後
-        let rows: BTreeSet<u32> = [&dsrc, &ddst].iter().flat_map(|k| k.removed.iter().chain(k.added.iter()).map(|x| local(x.0))).collect();
-        let before: Vec<(u32, Option<u32>, Option<u32>)> = rows.iter().map(|&r| (r, src_of.get(&r).copied(), dst_of.get(&r).copied())).collect();
-        for (k, map) in [(&dsrc, &mut *src_of), (&ddst, &mut *dst_of)] {
-            for (e, _) in &k.removed {
-                map.remove(&local(*e));
-            }
-            for &(e, v) in &k.added {
-                map.insert(local(e), v as u32);
-            }
-        }
+        // 辺の row の (始点, 終点) の前後。 後 = 鍵付きの購読が渡し済みの鍵、 前 = 差分の removed か、 動いていなければ後と同じ
+        let mut rows: Vec<EntityId> = [&dsrc, &ddst].iter().flat_map(|k| k.removed.iter().chain(k.added.iter()).map(|x| x.0)).collect();
+        rows.sort_unstable();
+        rows.dedup();
+        let (s_now, d_now) = (lv.src.reported_keys(&rows), lv.dst.reported_keys(&rows));
         let (mut del, mut add) = (Vec::new(), Vec::new());
-        for (r, s0, d0) in before {
-            let (s1, d1) = (src_of.get(&r).copied(), dst_of.get(&r).copied());
+        for (i, &e) in rows.iter().enumerate() {
+            let (s1, d1) = (s_now[i], d_now[i]);
+            let (s0, d0) = (key_before(&dsrc, e, s1), key_before(&ddst, e, d1));
             if (s0, d0) == (s1, d1) {
                 continue;
             }
+            let r = local(e);
             if let (Some(s), Some(d)) = (s0, d0) {
-                del.push((s, d, r));
+                del.push((s as u32, d as u32, r));
             }
             if let (Some(s), Some(d)) = (s1, d1) {
-                add.push((s, d, r));
+                add.push((s as u32, d as u32, r));
             }
         }
         let unseed: Vec<u32> = ds.removed.iter().map(|&e| local(e)).collect();
