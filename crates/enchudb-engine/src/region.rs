@@ -261,6 +261,19 @@ impl Region {
         Ok(())
     }
 
+    /// `ensure_committed` の疎な書き込み版: `end_in_region` の手前 `touched` byte だけを書く時
+    /// (hash の場所に散る索引の slot)。 空き容量は触るページの分だけ見る (#316)。
+    pub fn ensure_committed_sparse(&self, end_in_region: usize, touched: usize) -> std::io::Result<()> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(g) = &self.grower
+            && !self.is_committed(end_in_region)
+        {
+            g.grow_sparse(self.file_offset + end_in_region, touched)?;
+        }
+        let _ = (end_in_region, touched);
+        Ok(())
+    }
+
     /// mmap 上の 4 byte を `AtomicU32` として参照する。
     ///
     /// `MAP_SHARED` で map された region は複数プロセスで **同じ物理ページ**

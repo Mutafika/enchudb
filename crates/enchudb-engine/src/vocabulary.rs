@@ -18,6 +18,15 @@ const INDEX_MAGIC_V2: [u8; 4] = [b'V', b'I', b'X', b'2'];
 const INDEX_HEADER: usize = 16;
 const INDEX_SLOT_SIZE: usize = 13;
 
+/// `Vocabulary::try_insert` が値を入れられなかった理由 (#316)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VocabFail {
+    /// `vocab_max_entries` / 索引の天井に着いた (この先も入らない)
+    Full,
+    /// ディスクの空き不足で領域を伸ばせない (#167、 空けば入る)
+    Space,
+}
+
 pub struct Vocabulary {
     data: Region,
     offsets: Region,
@@ -320,17 +329,20 @@ impl Vocabulary {
     }
 
     /// 満杯なら **`u32::MAX` (予約 sentinel)** を返す (#59: panic しない)。
+    /// 理由 (一杯 / 空き不足) が要る時は `try_get_or_insert`。
     pub fn get_or_insert(&self, value: &[u8]) -> u32 {
-        if let Some(id) = self.lookup(value) { return id; }
-        let id = self.insert(value);
-        if id == u32::MAX {
-            return u32::MAX;
-        }
+        self.try_get_or_insert(value).unwrap_or(u32::MAX)
+    }
+
+    /// `get_or_insert` の理由付き版 (#316)。
+    pub fn try_get_or_insert(&self, value: &[u8]) -> Result<u32, VocabFail> {
+        if let Some(id) = self.lookup(value) { return Ok(id); }
+        let id = self.try_insert(value)?;
         // 並列挿入の競合チェック: 別スレッドが先に同じ値を挿入した場合、先着のidを使う
         if let Some(winner) = self.lookup(value) {
-            if winner != id { return winner; }
+            if winner != id { return Ok(winner); }
         }
-        id
+        Ok(id)
     }
 
     #[inline]
@@ -390,7 +402,20 @@ impl Vocabulary {
     }
 
     /// 満杯なら **`u32::MAX` (予約 sentinel)** を返す (#59: panic しない)。
+    /// 理由 (一杯 / 空き不足) が要る時は `try_insert`。
     pub fn insert(&self, value: &[u8]) -> u32 {
+        self.try_insert(value).unwrap_or(u32::MAX)
+    }
+
+    /// `insert` の理由付き版 (#316)。 `Full` は `vocab_max_entries` / 索引の天井 (この先も入らない)、
+    /// `Space` はディスクの空き不足で伸ばせない (空けば入る)。
+    pub fn try_insert(&self, value: &[u8]) -> Result<u32, VocabFail> {
+        // 索引の home slot のページを先に確保する。 空き不足で断られるのは大抵ここ (slot は索引全体に
+        // 散る) なので、 採番・data の書き込みの前に止めて orphan を作らない
+        let home = INDEX_HEADER + home_slot(fxhash(value), self.index_cap) * INDEX_SLOT_SIZE;
+        if self.index.ensure_committed_sparse(home + INDEX_SLOT_SIZE, INDEX_SLOT_SIZE).is_err() {
+            return Err(VocabFail::Space);
+        }
         let id = self.count.fetch_add(1, Ordering::Relaxed);
         // #122: vocab_max_entries が公開 knob になったので、 天井 hit を actionable に
         // する (#118 の `too many himos` と同じ扱い)。 既存 DB は header 焼き込みなので
@@ -402,7 +427,7 @@ impl Vocabulary {
         // engine 側の guard が見ている値なので、 新しい規約を増やしていない。
         if id >= self.max_entries {
             self.count.fetch_sub(1, Ordering::Relaxed);
-            return u32::MAX;
+            return Err(VocabFail::Full);
         }
         let len = value.len() as u32;
         let offset = self.data_end.fetch_add(len, Ordering::Relaxed);
@@ -417,7 +442,7 @@ impl Vocabulary {
             || self.offsets.ensure_committed(((id as usize) + 1) * 8).is_err()
         {
             self.count.fetch_sub(1, Ordering::Relaxed);
-            return u32::MAX;
+            return Err(VocabFail::Space);
         }
         self.data.write_at(offset as usize, value);
         self.data.write_at(0, &MAGIC);
@@ -440,11 +465,10 @@ impl Vocabulary {
         self.offsets.mark_dirty(off_pos, 8);
         // #59: index が満杯で登録できないなら 「vocab 満杯」 と同じ扱いにする
         // (dedup が黙って壊れるより、 write を拒否させる方が安全)。 data/offsets に
-        // 書いた分は orphan になるが、 これは terminal な capacity 状態。
-        if !self.index_insert(value, id) {
-            return u32::MAX;
-        }
-        id
+        // 書いた分は orphan になる (満杯なら terminal、 空き不足は probe が home のページを
+        // 越えた時だけ)。
+        self.index_insert(value, id)?;
+        Ok(id)
     }
 
     /// index に (hash, id) を登録する。 **index が満杯なら `false`** (#59)。
@@ -453,22 +477,22 @@ impl Vocabulary {
     /// 埋まると永久に回った (= 満杯が hang)。 走査は index_cap 回で打ち切る。
     /// 登録できなくても data/offsets 側の値は書けているので、 dedup が効かなくなる
     /// だけで read は壊れない (呼び出し側が fault として報告する)。
-    fn index_insert(&self, value: &[u8], id: u32) -> bool {
+    fn index_insert(&self, value: &[u8], id: u32) -> Result<(), VocabFail> {
         let mask = (self.index_cap - 1) as u64;
         let h = fxhash(value);
         let mut idx = home_slot(h, self.index_cap); // #123
         let mut probes = 0usize;
         loop {
             if probes >= self.index_cap as usize {
-                return false;
+                return Err(VocabFail::Full);
             }
             probes += 1;
             let off = INDEX_HEADER + idx * INDEX_SLOT_SIZE;
             // v10: index segment は書いた分だけ commit される (旧 fixed cluster の eager
             // commit ではない)。 slot の atomic CAS は write なので、 触る前に伸ばす。
             // 伸ばせない (#167) なら挿入失敗として返す (呼び側が満杯扱いする)。
-            if self.index.ensure_committed(off + INDEX_SLOT_SIZE).is_err() {
-                return false;
+            if self.index.ensure_committed_sparse(off + INDEX_SLOT_SIZE, INDEX_SLOT_SIZE).is_err() {
+                return Err(VocabFail::Space);
             }
             // #83: slot flag は Region 経由の AtomicU8 で直接触る (`&mut [u8]` を
             // 実体化しない)。 hash/id の書込も write_at (raw ptr)。
@@ -481,7 +505,7 @@ impl Vocabulary {
                         self.index.write_at(off + 9, &id.to_le_bytes());
                         flag.store(1, Ordering::Release);
                         self.index.mark_dirty(off, INDEX_SLOT_SIZE);
-                        return true;
+                        return Ok(());
                     }
                     Err(_) => continue,
                 }
@@ -507,7 +531,7 @@ impl Vocabulary {
                 // 読み飛ばす (実 insert は vid < max_entries を保証 = 通常運用では常に
                 // 通過。 max_entries は不変で並行 insert を skip しない = dedup race 無)。
                 if vid < self.max_entries && self.get(vid) == value {
-                    return true; // 本当の重複
+                    return Ok(()); // 本当の重複
                 }
                 // ハッシュ衝突 or 破損 slot → linear probe 続行
             }
