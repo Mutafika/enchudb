@@ -4161,9 +4161,10 @@ impl Graph {
     }
 
     /// w が支えになれるか: w から支えをたどって seed に着く。 支えを探している row (支えを外してある) を通る鎖は着かない
-    /// ので、 探している row 自身を通る鎖 (輪) も着かない。 鎖は輪にならないので必ず止まる。
+    /// ので、 探している row 自身を通る鎖 (輪) も着かない。 鎖は輪にならないので、 届く row の数より長くはならない —
+    /// 超えたら支えの森が壊れている: debug では panic (止まらずに気づく)、 release では着かない側 (外して広げ直す) に倒す。
     fn chain_ok(&self, mut w: u32) -> bool {
-        loop {
+        for _ in 0..=self.sup.len() {
             if self.seed.contains(&w) {
                 return true;
             }
@@ -4172,6 +4173,8 @@ impl Graph {
                 None => return false,
             }
         }
+        debug_assert!(false, "到達: 支えの鎖が輪になっている (row {w})");
+        false
     }
 
     fn set_sup(&mut self, x: u32, w: u32) {
