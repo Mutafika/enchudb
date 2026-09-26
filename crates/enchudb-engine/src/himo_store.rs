@@ -235,6 +235,13 @@ impl HimoStore {
         }
     }
 
+    /// `eid` の cell を書けるところまで列を伸ばす。 伸ばせなければ (ディスクの空き不足) false (#316)。
+    #[inline]
+    pub(crate) fn ensure_room(&self, eid: u32) -> bool {
+        let col = self.col();
+        col.is_committed_for(eid) || col.ensure_committed_for(eid).is_ok()
+    }
+
     /// column への参照。 遅延 store では初回だけ segment を mmap する。
     #[inline]
     fn col(&self) -> &Column {

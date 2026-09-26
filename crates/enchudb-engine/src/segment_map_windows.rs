@@ -210,6 +210,11 @@ impl SegmentMap {
         self.grow_to(needed)
     }
 
+    /// unix 版と同じ API (#316)。 Windows は section の commit が実体を持つので見かけの長さで見る。
+    pub fn grow_sparse(&self, needed: usize, _touched: usize) -> io::Result<()> {
+        self.grow_amortized(needed)
+    }
+
     pub fn refresh(&self) -> io::Result<usize> {
         Ok(self.committed())
     }

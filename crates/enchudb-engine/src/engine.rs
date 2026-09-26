@@ -149,6 +149,26 @@ impl FaultKind {
     }
 }
 
+/// `try_tie_*_to_by_id` が書かなかった理由 (#316)。 書かなかった時は oplog にも積まない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TieRejected {
+    /// 容量 / 値の範囲 (`Engine::fault_count` にも積まれる)
+    Fault(FaultKind),
+    /// cell に今より新しい版数が在る (時計が戻った、 LWW で負けた)
+    OlderThanCell,
+}
+
+impl std::fmt::Display for TieRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TieRejected::Fault(k) => f.write_str(k.as_str()),
+            TieRejected::OlderThanCell => f.write_str("the cell has a newer version (clock went backwards?)"),
+        }
+    }
+}
+
+impl std::error::Error for TieRejected {}
+
 /// `remote_*_apply` (sync 受信の apply) の結果 (#210)。
 ///
 /// 旧 `bool` は 「適用した / しなかった」 しか区別できず、 **「LWW で古い」 と
@@ -9194,25 +9214,21 @@ impl Engine {
         }
         // Tag は dedupe (get_or_insert)、Leaf は新規 id 発行 (insert)。
         let vid = match self.value_types[hid] {
-            ValueType::Tag => self.vocab.get_or_insert(value.as_bytes()),
-            ValueType::Leaf => self.vocab.insert(value.as_bytes()),
+            ValueType::Tag => self.vocab.try_get_or_insert(value.as_bytes()),
+            ValueType::Leaf => self.vocab.try_insert(value.as_bytes()),
             ht => panic!(
                 "tie_text on non-text himo '{}': {:?}",
                 self.himo_name_at(hid).unwrap_or("<unknown>"), ht
             ),
         };
-        if vid == u32::MAX {
-            // #59: vocab 満杯 → `insert`/`get_or_insert` が予約 sentinel を返した。
-            // panic せず write を拒否 + 計上 (sentinel を cell に書くと read 側が
-            // 「値なし」 と区別できない壊れ方をする)。
-            self.record_fault(
-                FaultKind::VocabSpace,
-                "vocabulary is full (vocab_max_entries 到達) — text write rejected. \
-                 GrowableOptions { vocab_max_entries: Some(n), .. } で上げられるが、\
-                 header 焼き込みなので既存 DB は再作成が必要",
-            );
-            return;
-        }
+        // #59 / #316: 入れられなければ write を拒否 + 計上 (一杯と空き不足を分ける)
+        let vid = match vid {
+            Ok(v) => v,
+            Err(f) => {
+                self.vocab_rejected(f);
+                return;
+            }
+        };
         self.live_set(hid, eid, vid);
     }
 
@@ -9320,11 +9336,17 @@ impl Engine {
     /// `tie_text_to` の himo_id 直指定版。 hot path 用 (per-call の string lookup を消す)。
     /// 起動時に `himo_id(&str)` で解決して u16 を cache しておく。
     pub fn tie_text_to_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: &str) {
+        let _ = self.try_tie_text_to_by_id(eid, himo_id, value);
+    }
+
+    /// `tie_text_to_by_id` の結果付き版 (#316)。 書かなかった時は理由を返す (oplog にも積まない)。
+    pub fn try_tie_text_to_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: &str) -> Result<(), TieRejected> {
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
+        self.ensure_cell_room(hid, eid)?;
         // v6 (#88): Leaf は LeafStore へ (vocab の vid は使わない)。 sync は bytes 同乗 TieLeaf。
         // #106: 書込順は insert(新 slot) → set(column publish) → free(旧 slot) の順。
         //   - 旧: free → insert (best-fit で旧 slot 即再利用) → set だと、 reader が
@@ -9343,7 +9365,7 @@ impl Engine {
                     FaultKind::DiskSpace,
                     "leaf payload の格納に必要な commit を伸ばせない — text write を拒否",
                 );
-                return;
+                return Err(TieRejected::Fault(FaultKind::DiskSpace));
             }
             // request17 step 4: WAL 先行で採番 → 値と版数を不可分に書く。 不採用なら
             // **今 insert した payload** を捨てる (cell は旧 offset を指したままなので
@@ -9358,29 +9380,23 @@ impl Engine {
             if !self.set_cell_local(eid, himo_id, off, hlc) {
                 leaf.free(off);
                 self.warn_local_write_rejected(eid, himo_id, hlc);
-                return;
+                return Err(TieRejected::OlderThanCell);
             }
             if let Some(old) = old { leaf.free(old); }
-            return;
+            return Ok(());
         }
         // Tag は dedupe、Leaf は常に新規 id。
         let vid = match self.value_types[hid] {
-            ValueType::Tag => self.vocab.get_or_insert(value.as_bytes()),
-            ValueType::Leaf => self.vocab.insert(value.as_bytes()),
+            ValueType::Tag => self.vocab.try_get_or_insert(value.as_bytes()),
+            ValueType::Leaf => self.vocab.try_insert(value.as_bytes()),
             ht => panic!("tie_text_to_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
-        if vid == u32::MAX {
-            // #59: vocab 満杯 → `insert`/`get_or_insert` が予約 sentinel を返した。
+        let vid = match vid {
+            Ok(v) => v,
             // panic せず write を拒否 + 計上 (sentinel を cell に書くと read 側が
             // 「値なし」 と区別できない壊れ方をする)。
-            self.record_fault(
-                FaultKind::VocabSpace,
-                "vocabulary is full (vocab_max_entries 到達) — text write rejected. \
-                 GrowableOptions { vocab_max_entries: Some(n), .. } で上げられるが、\
-                 header 焼き込みなので既存 DB は再作成が必要",
-            );
-            return;
-        }
+            Err(f) => return Err(self.vocab_rejected(f)),
+        };
         // WAL に Vocab + Tie を流す。 schema layer (enchudb-schema) は同期版の
         // tie_text_to を経由するため、 ここで append しないと WAL が空のままで
         // peer 同期が成立しない (publish 側が iter_committed で 0 件を見る).
@@ -9405,7 +9421,48 @@ impl Engine {
         };
         if !self.set_cell_local(eid, himo_id, vid, hlc) {
             self.warn_local_write_rejected(eid, himo_id, hlc);
+            return Err(TieRejected::OlderThanCell);
         }
+        Ok(())
+    }
+
+    /// 辞書に値を入れられなかった時の計上 (#316: 一杯と空き不足を分ける)。
+    fn vocab_rejected(&self, f: crate::vocabulary::VocabFail) -> TieRejected {
+        let kind = match f {
+            // #59: vocab 満杯 → 予約 sentinel。
+            crate::vocabulary::VocabFail::Full => {
+                self.record_fault(
+                    FaultKind::VocabSpace,
+                    "vocabulary is full (vocab_max_entries 到達) — text write rejected. \
+                     GrowableOptions { vocab_max_entries: Some(n), .. } で上げられるが、\
+                     header 焼き込みなので既存 DB は再作成が必要",
+                );
+                FaultKind::VocabSpace
+            }
+            crate::vocabulary::VocabFail::Space => {
+                self.record_fault(
+                    FaultKind::DiskSpace,
+                    "vocabulary を伸ばすディスクの空きが無い — text write rejected",
+                );
+                FaultKind::DiskSpace
+            }
+        };
+        TieRejected::Fault(kind)
+    }
+
+    /// 書く前に、 cell の列と版数の列を `local` まで伸ばせるかを確かめる (#316)。 伸ばせなければ
+    /// oplog に積まずに拒否する (積んだ後で伸ばせないと、 手元に無い値が peer にだけ届く)。
+    #[inline]
+    fn ensure_cell_room(&self, hid: usize, local: u32) -> Result<(), TieRejected> {
+        let ver_ok = match self.ver_col(hid as u16) {
+            Some(col) if local < self.max_entities() => col.is_committed_for(local) || col.ensure_committed_for(local).is_ok(),
+            _ => true,
+        };
+        if !ver_ok || !self.himos[hid].ensure_room(local) {
+            self.record_fault(FaultKind::DiskSpace, "列を伸ばすディスクの空きが無い — write rejected");
+            return Err(TieRejected::Fault(FaultKind::DiskSpace));
+        }
+        Ok(())
     }
 
     /// 0.7.0: 当該 himo が reserved table 配下か (= `_*` 表)。
@@ -9483,22 +9540,18 @@ impl Engine {
             return;
         }
         let vid = match self.value_types[hid] {
-            ValueType::Tag => self.vocab.get_or_insert(value),
-            ValueType::Leaf => self.vocab.insert(value),
+            ValueType::Tag => self.vocab.try_get_or_insert(value),
+            ValueType::Leaf => self.vocab.try_insert(value),
             ht => panic!("tie_bytes_to_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
-        if vid == u32::MAX {
-            // #59: vocab 満杯 → `insert`/`get_or_insert` が予約 sentinel を返した。
-            // panic せず write を拒否 + 計上 (sentinel を cell に書くと read 側が
-            // 「値なし」 と区別できない壊れ方をする)。
-            self.record_fault(
-                FaultKind::VocabSpace,
-                "vocabulary is full (vocab_max_entries 到達) — text write rejected. \
-                 GrowableOptions { vocab_max_entries: Some(n), .. } で上げられるが、\
-                 header 焼き込みなので既存 DB は再作成が必要",
-            );
-            return;
-        }
+        // #59 / #316: 入れられなければ write を拒否 + 計上 (一杯と空き不足を分ける)
+        let vid = match vid {
+            Ok(v) => v,
+            Err(f) => {
+                self.vocab_rejected(f);
+                return;
+            }
+        };
         // reserved table への write は oplog 再 append を skip (= 2 重書き防止)。
         // request17 step 4: Vocab → Tie/TieNamed の順に append し (transport は HLC 順に
         // 配るので依存順を崩せない)、 Tie に載った HLC で値と版数を書く。
@@ -9539,17 +9592,23 @@ impl Engine {
 
     /// `tie_to` の himo_id 直指定版。 hot path 用 (string lookup を避ける)。
     pub fn tie_to_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: impl CellValue) {
+        let _ = self.try_tie_to_by_id(eid, himo_id, value);
+    }
+
+    /// `tie_to_by_id` の結果付き版 (#316)。 書かなかった時は理由を返す (oplog にも積まない)。
+    pub fn try_tie_to_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: impl CellValue) -> Result<(), TieRejected> {
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
         // #59: 列の幅に入らない値 (sentinel 含む) は cell に入らない。 panic せず write を拒否 + 計上。
         // WAL に載せる前に弾く
-        let Some(value) = self.cell_value(value) else { return };
+        let Some(value) = self.cell_value(value) else { return Err(TieRejected::Fault(FaultKind::ValueOutOfRange)) };
         if !self.fits(hid, value) {
-            return;
+            return Err(TieRejected::Fault(FaultKind::ValueOutOfRange));
         }
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
+        self.ensure_cell_room(hid, eid)?;
         // Tag / Leaf 型 (vocab_id を value として持つ) も許可。 schema 層が
         // 起動時に解決済みの table_vid を marker himo に張る hot path 用途で
         // 必要 (request2.md 提案)。 caller 責任で vocab に既に居る id を渡すこと。
@@ -9566,7 +9625,9 @@ impl Engine {
         };
         if !self.set_cell_local(eid, himo_id, value, hlc) {
             self.warn_local_write_rejected(eid, himo_id, hlc);
+            return Err(TieRejected::OlderThanCell);
         }
+        Ok(())
     }
 
     /// 定義済みの紐にentity参照を張る。&selfで呼べる。
@@ -9578,6 +9639,11 @@ impl Engine {
 
     /// `tie_ref_to` の himo_id 直指定版。 hot path 用。
     pub fn tie_ref_to_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, target_eid: enchudb_oplog::EntityId) {
+        let _ = self.try_tie_ref_to_by_id(eid, himo_id, target_eid);
+    }
+
+    /// `tie_ref_to_by_id` の結果付き版 (#316)。 書かなかった時は理由を返す (oplog にも積まない)。
+    pub fn try_tie_ref_to_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, target_eid: enchudb_oplog::EntityId) -> Result<(), TieRejected> {
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
         let target_eid = enchudb_oplog::eid_local(target_eid);
@@ -9586,7 +9652,7 @@ impl Engine {
                 FaultKind::ValueOutOfRange,
                 "tie_ref target_eid >= u32::MAX (sentinel reserved)",
             );
-            return;
+            return Err(TieRejected::Fault(FaultKind::ValueOutOfRange));
         }
         let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
@@ -9595,6 +9661,7 @@ impl Engine {
             self.value_types[hid] == ValueType::Ref || self.value_types[hid] == ValueType::Number,
             "tie_ref_to_by_id on non-Ref himo_id {}", himo_id,
         );
+        self.ensure_cell_room(hid, eid)?;
         // request17 step 4: WAL 先行で採番し、 その HLC で値と版数を不可分に書く。
         let oplog_eid = self.oplog_eid(eid);
         let hlc = self.append_local_op(
@@ -9602,7 +9669,9 @@ impl Engine {
         );
         if !self.set_cell_local(eid, himo_id, target_eid, hlc) {
             self.warn_local_write_rejected(eid, himo_id, hlc);
+            return Err(TieRejected::OlderThanCell);
         }
+        Ok(())
     }
 
     // ──── untie ────
@@ -13435,19 +13504,18 @@ impl Engine {
         }
         // Tag は dedupe、Leaf は常に新規 id。
         let vid = match self.value_types[hid] {
-            ValueType::Tag => self.vocab.get_or_insert(value),
-            ValueType::Leaf => self.vocab.insert(value),
+            ValueType::Tag => self.vocab.try_get_or_insert(value),
+            ValueType::Leaf => self.vocab.try_insert(value),
             ht => panic!("tie_bytes_async_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
-        if vid == u32::MAX {
-            // #59: vocab 満杯 (insert が sentinel を返した) or sentinel 値。
-            self.record_fault(
-                FaultKind::VocabSpace,
-                "vocab vid == u32::MAX — text write rejected (vocab_max_entries 到達か \
-                 sentinel 値)。 GrowableOptions { vocab_max_entries: Some(n), .. } を参照",
-            );
-            return;
-        }
+        // #59 / #316: 入れられなければ write を拒否 + 計上 (一杯と空き不足を分ける)
+        let vid = match vid {
+            Ok(v) => v,
+            Err(f) => {
+                self.vocab_rejected(f);
+                return;
+            }
+        };
         // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
         // request17 step 4: Vocab は cell を持たない (= 版数の対象外) が、 record queue は
         // 版数付きで運ぶので Tie の手前で 1 個採番しておく (WAL 上の並びと HLC の

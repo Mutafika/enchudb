@@ -81,6 +81,13 @@ impl Column {
     /// variable cluster の末尾に置かれる region (v9 version column / tombstone
     /// column) は初期 commit の外にあるので、 **書く前に必ず呼ぶこと** —
     /// 呼ばずに触ると未コミット page への書き込みで SIGBUS する。
+    /// `entity_id` の cell が commit 済みか (伸ばさない、 atomic の読み 1 回)。
+    #[inline]
+    pub fn is_committed_for(&self, entity_id: u32) -> bool {
+        let vs = self.value_size.max(1) as usize;
+        self.region.is_committed(HEADER + (entity_id as usize + 1) * vs)
+    }
+
     #[inline]
     pub fn ensure_committed_for(&self, entity_id: u32) -> std::io::Result<()> {
         let vs = self.value_size.max(1) as usize;

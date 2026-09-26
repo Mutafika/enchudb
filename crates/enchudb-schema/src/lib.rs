@@ -212,6 +212,9 @@ pub enum SchemaError {
     SchemaConflict(String),
     /// 内部不整合 (himo_id 解決失敗など、 通常起こらない)
     Internal(String),
+    /// engine が列の書き込みを拒否した (ディスクの空き不足 / 辞書が一杯 / 時計が戻った、 #316)。
+    /// 拒否した列から後ろは書かれていない
+    WriteRejected(enchudb_engine::TieRejected),
 }
 
 impl std::fmt::Display for SchemaError {
@@ -226,11 +229,18 @@ impl std::fmt::Display for SchemaError {
             SchemaError::Parse(s) => write!(f, "parse: {s}"),
             SchemaError::SchemaConflict(s) => write!(f, "schema conflict: {s}"),
             SchemaError::Internal(s) => write!(f, "internal: {s}"),
+            SchemaError::WriteRejected(r) => write!(f, "write rejected: {r}"),
         }
     }
 }
 
 impl std::error::Error for SchemaError {}
+
+impl From<enchudb_engine::TieRejected> for SchemaError {
+    fn from(r: enchudb_engine::TieRejected) -> Self {
+        SchemaError::WriteRejected(r)
+    }
+}
 
 #[derive(Debug, Clone)]
 struct ColumnInner {
@@ -1857,7 +1867,13 @@ impl<'a> RowBuilder<'a> {
         // 当該 table の column を持つ entity のみ取れる。
 
         for (cd, v) in &resolved {
-            tie_value(eng, eid, cd, v)?;
+            if let Err(e) = tie_value(eng, eid, cd, v) {
+                // #316: 新しい row を書きかけで残さない (既存 row の upsert は書けた列までが残る)
+                if target_eid.is_none() {
+                    eng.delete(eid);
+                }
+                return Err(e);
+            }
         }
         Ok(eid)
     }
@@ -6061,24 +6077,18 @@ fn tie_value(eng: &Engine, eid: EntityId, cd: &ColumnInner, v: &Value) -> Result
             if *n < 0 || (*n as u64) >= u32::MAX as u64 {
                 return Err(SchemaError::BadValue(format!("integer out of u32 range: {n}")));
             }
-            eng.tie_to_by_id(eid, cd.himo_id, *n as u32);
-            Ok(())
+            Ok(eng.try_tie_to_by_id(eid, cd.himo_id, *n as u32)?)
         }
         (ColumnType::BigInt, Value::Number(n)) => {
             let raw = big_raw(*n).ok_or_else(|| SchemaError::BadValue(format!("integer out of BigInt range: {n}")))?;
-            eng.tie_to_by_id(eid, cd.himo_id, raw);
-            Ok(())
+            Ok(eng.try_tie_to_by_id(eid, cd.himo_id, raw)?)
         }
         (ColumnType::Tag, Value::Text(s)) | (ColumnType::Leaf, Value::Text(s)) => {
             // engine の tie_text_to_by_id は himo の ValueType (Tag / Leaf) を見て
             // vocab.get_or_insert (dedupe) vs vocab.insert (新規 id) を dispatch する。
-            eng.tie_text_to_by_id(eid, cd.himo_id, s);
-            Ok(())
+            Ok(eng.try_tie_text_to_by_id(eid, cd.himo_id, s)?)
         }
-        (ColumnType::Ref, Value::Ref(t)) => {
-            eng.tie_ref_to_by_id(eid, cd.himo_id, *t);
-            Ok(())
-        }
+        (ColumnType::Ref, Value::Ref(t)) => Ok(eng.try_tie_ref_to_by_id(eid, cd.himo_id, *t)?),
         (t, v) => Err(SchemaError::TypeMismatch(format!("{t:?} vs {v:?}"))),
     }
 }
