@@ -66,7 +66,7 @@ use enchudb_engine::{Engine, ValueType};
 /// (`enchudb_schema::GrowableOptions` / `LeafScale` で使えるように)。
 pub use enchudb_engine::engine::TableEidUsage;
 pub use enchudb_engine::{GrowableOptions, LeafScale};
-pub use enchudb_engine::{LiveDelta, LiveQuery};
+pub use enchudb_engine::LiveDelta;
 use enchudb_oplog::EntityId;
 use std::sync::Arc;
 
@@ -570,6 +570,13 @@ impl Database {
 
     /// `Arc<Engine>` を clone して返す。 engine 直接アクセス / 他 component との共有用。
     pub fn arc_engine(&self) -> Arc<Engine> { self.eng.clone() }
+
+    /// 購読の束を作る。 束に [`LiveGroup::add`] した購読のうち、 前回から出入りのあったものの差分だけを
+    /// [`LiveGroup::poll`] でまとめて受け取る (コストは購読の数でなく出入りの数に比例、 購読が数千本
+    /// ある時向け)。 束に入れていない購読 (同じ `Database` を使う他の部品が持つもの) の差分は取り出さない。
+    pub fn live_group(&self) -> LiveGroup {
+        LiveGroup { inner: self.eng.live_group(), eng: self.eng.clone() }
+    }
 
     /// build phase 用、 `Arc<Engine>` が他に共有されていない (count = 1) 時のみ
     /// `&mut Engine` を返す。 concurrent モード遷移後は常に None。
@@ -1796,6 +1803,222 @@ impl<'a> RowBuilder<'a> {
     }
 }
 
+// ─────────────────────────── LiveQuery ───────────────────────────
+
+/// [`Query::subscribe`] の戻り値。 drop で購読解除。
+///
+/// engine を `Arc` で抱えているので `Database` を借用しない — struct に入れて持ち回れ、
+/// 別 thread から poll してよい。
+pub struct LiveQuery {
+    inner: enchudb_engine::LiveQuery,
+    eng: Arc<Engine>,
+}
+
+impl LiveQuery {
+    /// 前回 poll からの差分。 初回は登録時点の全件が `added`。 removed → added の順に積めば
+    /// 常にその時点の `find()` と一致する。 eid は `find()` と同じ形 (peer prefix 付き)。
+    pub fn poll(&self) -> LiveDelta {
+        self.inner.poll(&self.eng)
+    }
+
+    /// 今の件数 (`find()?.len()` と同じ)。
+    pub fn count(&self) -> usize {
+        self.inner.count(&self.eng)
+    }
+
+    /// `eid` が今の結果に含まれるか。
+    pub fn contains(&self, eid: EntityId) -> bool {
+        self.inner.contains(&self.eng, eid)
+    }
+
+    /// 今の結果全体 (eid 昇順)。 poll の状態は変えない。
+    pub fn members(&self) -> Vec<EntityId> {
+        self.inner.members(&self.eng)
+    }
+
+    /// `order_by(..).limit(k)` の購読: 今の先頭 k 件を並びの順に (先頭が 1 位)。 他は `members` と同じ。
+    pub fn ranked(&self) -> Vec<EntityId> {
+        self.inner.ranked(&self.eng)
+    }
+
+    /// 未 poll の変化がありうるか (false なら `poll` は空)。 評価しないので軽い。
+    pub fn is_dirty(&self) -> bool {
+        self.inner.is_dirty()
+    }
+
+    /// engine 内で一意な購読 id ([`LiveGroup::poll`] の差分の宛先)。
+    pub fn id(&self) -> u64 {
+        self.inner.id()
+    }
+
+    /// engine 層の購読 (ablation 用の hidden API などに降りる時)。
+    pub fn engine_query(&self) -> &enchudb_engine::LiveQuery {
+        &self.inner
+    }
+}
+
+impl std::fmt::Debug for LiveQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+/// [`Query::subscribe_counts`] の戻り値。 group の値ごとの件数を購読する。 drop で購読解除、
+/// `Database` を借用しない。
+pub struct LiveCounts {
+    inner: enchudb_engine::LiveCounts,
+    eng: Arc<Engine>,
+    ty: ColumnType,
+}
+
+impl LiveCounts {
+    fn value(&self, v: u32) -> Value {
+        match self.ty {
+            ColumnType::Number => Value::Number(v as i64),
+            ColumnType::Ref => Value::Ref(enchudb_oplog::make_eid(self.eng.peer_id(), v)),
+            ColumnType::Tag | ColumnType::Leaf => Value::Text(String::from_utf8_lossy(self.eng.vocab_text(v)).into_owned()),
+        }
+    }
+
+    fn raw(&self, v: &Value) -> Option<u32> {
+        match (self.ty, v) {
+            (ColumnType::Number, Value::Number(n)) => u32::try_from(*n).ok(),
+            (ColumnType::Ref, Value::Ref(e)) => Some(enchudb_oplog::eid_local(*e)),
+            (ColumnType::Tag, Value::Text(t)) => self.eng.vocab_id(t),
+            _ => None,
+        }
+    }
+
+    /// 前回 poll から件数が変わった group と今の件数 (0 = その group の row が居なくなった)。
+    /// 値で上書きして積めば常に今の件数。 初回は登録時点の全 group。 並びは値の内部表現の順。
+    pub fn poll(&self) -> Vec<(Value, u64)> {
+        self.inner.poll(&self.eng).into_iter().map(|(v, n)| (self.value(v), n)).collect()
+    }
+
+    /// `poll` の、 件数と合計の両方を返す版 ([`Query::subscribe_sums`] の購読。 件数か合計が動いた
+    /// group、 件数 0 = group が消えた)。 `poll` と報告状態を共有する。 合計しない購読では合計は 0。
+    pub fn poll_sums(&self) -> Vec<(Value, u64, u64)> {
+        self.inner.poll_sums(&self.eng).into_iter().map(|(v, a)| (self.value(v), a.count, a.sum)).collect()
+    }
+
+    /// group `value` の今の合計 ([`Query::subscribe_sums`] の購読)。
+    pub fn get_sum(&self, value: &Value) -> u64 {
+        self.raw(value).map_or(0, |v| self.inner.get_agg(&self.eng, v).sum)
+    }
+
+    /// 今の全 group と件数・合計。
+    pub fn all_sums(&self) -> Vec<(Value, u64, u64)> {
+        self.inner.all_sums(&self.eng).into_iter().map(|(v, a)| (self.value(v), a.count, a.sum)).collect()
+    }
+
+    /// group `value` の今の件数。
+    pub fn get(&self, value: &Value) -> u64 {
+        self.raw(value).map_or(0, |v| self.inner.get(&self.eng, v))
+    }
+
+    /// 今の全 group と件数。
+    pub fn all(&self) -> Vec<(Value, u64)> {
+        self.inner.all(&self.eng).into_iter().map(|(v, n)| (self.value(v), n)).collect()
+    }
+
+    /// 全 group の件数の和 (= 条件に当てはまり、 group の列に値のある row の数)。
+    pub fn total(&self) -> usize {
+        self.inner.total(&self.eng)
+    }
+
+    /// engine 内で一意な購読 id。
+    pub fn id(&self) -> u64 {
+        self.inner.id()
+    }
+}
+
+impl std::fmt::Debug for LiveCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+/// 購読の束 ([`Database::live_group`])。 束を drop しても購読はそのまま (差分は各購読の `poll` で受け取れ、
+/// 他の束に入れ直してもよい)。
+pub struct LiveGroup {
+    inner: enchudb_engine::LiveGroup,
+    eng: Arc<Engine>,
+}
+
+impl LiveGroup {
+    /// 購読をこの束に入れる (購読は 1 つの束にしか入らない、 後から入れた束に移る)。
+    pub fn add(&self, q: &LiveQuery) {
+        self.inner.add(&q.inner);
+    }
+
+    /// 会社単位の購読を入れる (差分は group の eid)。
+    pub fn add_grouped(&self, q: &GroupedLiveQuery) {
+        self.inner.add_grouped(&q.inner);
+    }
+
+    /// 束の購読のうち、 前回から出入りのあったものの差分 (`(LiveQuery::id, 差分)`、 id 昇順)。 各購読の
+    /// `poll` と報告状態を共有するので、 同じ差分はどちらか一方にだけ届く。
+    pub fn poll(&self) -> Vec<(u64, LiveDelta)> {
+        self.inner.poll(&self.eng)
+    }
+}
+
+impl std::fmt::Debug for LiveGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+/// [`Query::subscribe_grouped`] の戻り値。 結果を ref の先の row (group) 単位で持つ購読。
+/// drop で購読解除、 `Database` を借用しない。
+pub struct GroupedLiveQuery {
+    inner: enchudb_engine::GroupedLiveQuery,
+    eng: Arc<Engine>,
+}
+
+impl GroupedLiveQuery {
+    /// 前回 poll からの group (ref の先の row) の差分。 初回は登録時点の全 group が `added`。
+    pub fn poll(&self) -> LiveDelta {
+        self.inner.poll(&self.eng)
+    }
+
+    /// 今条件を満たす group (eid 昇順)。
+    pub fn groups(&self) -> Vec<EntityId> {
+        self.inner.groups(&self.eng)
+    }
+
+    /// `group` を指していて、 根の table への条件も満たす row (eid 昇順)。 いつ引いても今の中身。
+    pub fn members(&self, group: EntityId) -> Vec<EntityId> {
+        self.inner.members(&self.eng, group)
+    }
+
+    /// 平らにした結果の件数 (= 同じ条件の `find()?.len()`)。
+    pub fn count(&self) -> usize {
+        self.inner.count(&self.eng)
+    }
+
+    /// 平らにした結果全体 (= 同じ条件の `find()`)。
+    pub fn flatten(&self) -> Vec<EntityId> {
+        self.inner.flatten(&self.eng)
+    }
+
+    /// 未 poll の group の変化がありうるか。
+    pub fn is_dirty(&self) -> bool {
+        self.inner.is_dirty()
+    }
+
+    /// engine 内で一意な購読 id ([`LiveGroup::poll`] の差分の宛先。 差分は group の eid)。
+    pub fn id(&self) -> u64 {
+        self.inner.id()
+    }
+}
+
+impl std::fmt::Debug for GroupedLiveQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
 // ─────────────────────────── Query ───────────────────────────
 
 #[derive(Clone, Copy, Debug)]
@@ -1808,6 +2031,10 @@ enum Predicate {
     Range { himo_name: String, lo: u32, hi: u32 },
     Cmp { himo_name: String, op: RangeOp, against: u32 },
     In(u16, Vec<u32>),
+    /// ref 列を順にたどった先の table の列への条件 (`where_eq("company.city", ..)`)。
+    Via(Vec<u16>, Box<Predicate>),
+    /// 枝 (条件の AND) のどれか (`Query::or`)。
+    Or(Vec<Vec<Predicate>>),
 }
 
 pub struct Query<'a> {
@@ -1815,37 +2042,100 @@ pub struct Query<'a> {
     table: Arc<TableInner>,
     preds: Vec<Predicate>,
     limit: Option<usize>,
+    /// 並びの列と降順か (`order_by` / `order_by_desc`)。
+    order: Option<(String, bool)>,
 }
 
 impl<'a> Query<'a> {
     fn new(db: &'a Database, table: Arc<TableInner>) -> Self {
-        Self { db, table, preds: Vec::new(), limit: None }
+        Self { db, table, preds: Vec::new(), limit: None, order: None }
     }
 
+    /// 結果を列 `col` の値の昇順に並べる (同じ値は eid の昇順)。 `col` は ref 列をたどってもよい。
+    /// **`col` に値の無い row は結果から外れる** (SQL の NULLS FIRST / LAST ではない)。
+    /// `limit` と組むと `subscribe` が先頭 k 件の購読 (live の `ORDER BY .. LIMIT`) になる。
+    pub fn order_by(mut self, col: &str) -> Self {
+        self.order = Some((col.to_string(), false));
+        self
+    }
+
+    /// `order_by` の降順。
+    pub fn order_by_desc(mut self, col: &str) -> Self {
+        self.order = Some((col.to_string(), true));
+        self
+    }
+
+    /// 並びの列を (ref の道, himo_id) に。
+    fn order_col(&self) -> Result<Option<(Vec<u16>, u16, bool)>, SchemaError> {
+        let Some((col, desc)) = &self.order else { return Ok(None) };
+        let (path, cd) = self
+            .resolve_col(col)
+            .ok_or_else(|| SchemaError::BadValue(format!("order_by: unknown column {col}")))?;
+        if cd.ty == ColumnType::Leaf {
+            return Err(SchemaError::BadValue("order_by: cannot order by a Leaf column".into()));
+        }
+        Ok(Some((path, cd.himo_id, *desc)))
+    }
+
+    /// 列名を解決する。 `"a.b.c"` は ref 列 `a`、 `b` を順にたどった先の table の列 `c`
+    /// (`ref_to` で宣言した関係)。 返り値は (たどる ref 列の himo_id 列, 対象の列)。
+    fn resolve_col(&self, col: &str) -> Option<(Vec<u16>, ColumnInner)> {
+        let mut table = self.table.clone();
+        let mut path = Vec::new();
+        let mut segs = col.split('.').peekable();
+        while let Some(seg) = segs.next() {
+            let cd = table.col(seg)?.clone();
+            if segs.peek().is_none() {
+                return Some((path, cd));
+            }
+            if cd.ty != ColumnType::Ref {
+                return None;
+            }
+            let to = &table.relations.iter().find(|r| r.from_col.eq_ignore_ascii_case(seg))?.to_table;
+            let next = self.db.tables.iter().find(|t| t.name.eq_ignore_ascii_case(to))?.clone();
+            path.push(cd.himo_id);
+            table = next;
+        }
+        None
+    }
+
+    /// ref の道が空でなければ `Via` で包んで積む。
+    fn push_at(&mut self, path: Vec<u16>, p: Predicate) {
+        if path.is_empty() {
+            self.preds.push(p);
+        } else {
+            self.preds.push(Predicate::Via(path, Box::new(p)));
+        }
+    }
+
+    /// `col` の値が `val`。 `col` は `"company.city"` のように ref 列をたどってもよい
+    /// (`ref_to` で宣言した関係。 ref の先の table の列への条件になる)。
     pub fn where_eq<V: Into<Value>>(mut self, col: &str, val: V) -> Self {
         let v = val.into();
-        match self.table.col(col) {
+        match self.resolve_col(col) {
             None => self.preds.push(Predicate::Eq(u16::MAX, u32::MAX)), // unknown col → empty
-            Some(cd) => match (cd.ty, v) {
-                (ColumnType::Tag, Value::Text(s)) => self.preds.push(Predicate::EqText(cd.himo_id, s)),
-                (ColumnType::Number, Value::Number(n)) if n >= 0 && (n as u64) < u32::MAX as u64 => {
-                    self.preds.push(Predicate::Eq(cd.himo_id, n as u32));
+            Some((path, cd)) => {
+                let p = match (cd.ty, v) {
+                    (ColumnType::Tag, Value::Text(s)) => Predicate::EqText(cd.himo_id, s),
+                    (ColumnType::Number, Value::Number(n)) if n >= 0 && (n as u64) < u32::MAX as u64 => {
+                        Predicate::Eq(cd.himo_id, n as u32)
+                    }
+                    (ColumnType::Ref, Value::Ref(eid)) => Predicate::Eq(cd.himo_id, eid as u32),
+                    _ => Predicate::Eq(u16::MAX, u32::MAX), // type mismatch → empty
+                };
+                if matches!(p, Predicate::Eq(u16::MAX, _)) {
+                    self.preds.push(p);
+                } else {
+                    self.push_at(path, p);
                 }
-                (ColumnType::Ref, Value::Ref(eid)) => {
-                    self.preds.push(Predicate::Eq(cd.himo_id, eid as u32));
-                }
-                _ => self.preds.push(Predicate::Eq(u16::MAX, u32::MAX)), // type mismatch → empty
-            },
+            }
         }
         self
     }
 
     pub fn where_range(mut self, col: &str, lo: u32, hi: u32) -> Self {
-        if let Some(cd) = self.table.col(col) {
-            self.preds.push(Predicate::Range {
-                himo_name: cd.himo_name.clone(),
-                lo, hi,
-            });
+        if let Some((path, cd)) = self.resolve_col(col) {
+            self.push_at(path, Predicate::Range { himo_name: cd.himo_name, lo, hi });
         } else {
             self.preds.push(Predicate::Eq(u16::MAX, u32::MAX));
         }
@@ -1853,11 +2143,8 @@ impl<'a> Query<'a> {
     }
 
     fn push_cmp(&mut self, col: &str, op: RangeOp, against: u32) {
-        if let Some(cd) = self.table.col(col) {
-            self.preds.push(Predicate::Cmp {
-                himo_name: cd.himo_name.clone(),
-                op, against,
-            });
+        if let Some((path, cd)) = self.resolve_col(col) {
+            self.push_at(path, Predicate::Cmp { himo_name: cd.himo_name, op, against });
         }
     }
 
@@ -1867,16 +2154,35 @@ impl<'a> Query<'a> {
     pub fn where_le(mut self, col: &str, against: u32) -> Self { self.push_cmp(col, RangeOp::Le, against); self }
 
     pub fn where_ref(mut self, col: &str, target: EntityId) -> Self {
-        if let Some(cd) = self.table.col(col) {
-            self.preds.push(Predicate::Eq(cd.himo_id, target as u32));
+        if let Some((path, cd)) = self.resolve_col(col) {
+            self.push_at(path, Predicate::Eq(cd.himo_id, target as u32));
         }
         self
     }
 
     pub fn where_in(mut self, col: &str, values: &[u32]) -> Self {
-        if let Some(cd) = self.table.col(col) {
-            self.preds.push(Predicate::In(cd.himo_id, values.to_vec()));
+        if let Some((path, cd)) = self.resolve_col(col) {
+            self.push_at(path, Predicate::In(cd.himo_id, values.to_vec()));
         }
+        self
+    }
+
+    /// この条件 **または** `other` の条件 (同じ table への query)。 `a.or(b).where_eq(..)` は
+    /// `(a OR b) AND ..`。 find / count / subscribe のどれでも使える。 `limit` は `self` のものを使う。
+    ///
+    /// ```ignore
+    /// let q = users.where_eq("city", "Tokyo").or(users.where_gt("age", 60));
+    /// let live = q.subscribe()?;   // 東京在住 または 61 歳以上
+    /// ```
+    ///
+    /// 別の table の query を渡すと `find` / `subscribe` が `BadValue`。
+    pub fn or(mut self, other: Query<'a>) -> Self {
+        if !Arc::ptr_eq(&self.table, &other.table) {
+            self.preds = vec![Predicate::Or(Vec::new())];
+            return self;
+        }
+        let mine = std::mem::take(&mut self.preds);
+        self.preds.push(Predicate::Or(vec![mine, other.preds]));
         self
     }
 
@@ -1894,9 +2200,48 @@ impl<'a> Query<'a> {
         Ok(self.find()?.into_iter().next())
     }
 
-    pub fn find(self) -> Result<Vec<EntityId>, SchemaError> {
+    pub fn find(mut self) -> Result<Vec<EntityId>, SchemaError> {
+        let Some((path, himo, desc)) = self.order_col()? else { return self.find_set() };
+        // 並べてから切る: 集合は limit 無しで取り、 並びの値 (ref の道をたどった先) で並べる
+        let limit = self.limit.take();
+        self.order = None;
+        let eng = self.db.engine();
+        let mut keyed: Vec<((u32, u32), EntityId)> = self
+            .find_set()?
+            .into_iter()
+            .filter_map(|e| {
+                let mut cur = e;
+                for &h in &path {
+                    cur = eng.get_by_id(cur, h)? as EntityId;
+                }
+                let v = eng.get_by_id(cur, himo)?;
+                let v = if desc { u32::MAX - v } else { v };
+                Some(((v, enchudb_oplog::eid_local(e)), e))
+            })
+            .collect();
+        keyed.sort_unstable_by_key(|x| x.0);
+        let mut out: Vec<EntityId> = keyed.into_iter().map(|x| x.1).collect();
+        if let Some(n) = limit {
+            out.truncate(n);
+        }
+        Ok(out)
+    }
+
+    fn find_set(self) -> Result<Vec<EntityId>, SchemaError> {
         let eng = self.db.engine();
         eng.rebuild();
+
+        // ref をたどる条件 (`"company.city"`) を含むなら engine の live 条件評価に任せる
+        // (候補を索引で引いて ref の逆引きで遡り、 全条件で評価)
+        if self.preds.iter().any(|p| matches!(p, Predicate::Via(..) | Predicate::Or(_))) {
+            let limit = self.limit;
+            let Some(preds) = self.live_preds()? else { return Ok(Vec::new()) };
+            let mut out = eng.find_by(preds).map_err(|e| SchemaError::Io(e.to_string()))?;
+            if let Some(n) = limit {
+                out.truncate(n);
+            }
+            return Ok(out);
+        }
 
         // 1. Eq / EqText / In を engine 側 query に折り込む。 Range / Cmp は post-filter。
         // column 名は `{table}.{col}` で prefix されてて他テーブルと共有しない設計
@@ -1924,6 +2269,7 @@ impl<'a> Query<'a> {
                 }
                 Predicate::Range { himo_name, lo, hi } => range_preds.push((himo_name, lo, hi)),
                 Predicate::Cmp { himo_name, op, against } => cmp_preds.push((himo_name, op, against)),
+                Predicate::Via(..) | Predicate::Or(_) => unreachable!("Via / Or は find の先頭で find_by に回している"),
             }
         }
         if empty { return Ok(Vec::new()); }
@@ -2004,33 +2350,150 @@ impl<'a> Query<'a> {
     ///   `where_gt` 系、 条件なし = table の全 row)。 まだ誰も書いていない文字列への
     ///   `where_eq` も、 後から書かれた時点で一致する
     ///
-    /// `limit` 付き、 または未知の列 / 型の合わない値の `where_eq` は `BadValue`
+    /// `order_by` + `limit` は先頭 k 件の購読 (差分は先頭 k 件への出入り、 並びは `ranked`)。
+    /// `where_in` / 枝が同じ形の `or` も使える (形の違う枝の `or` は `BadValue`)。
+    ///
+    /// `order_by` 無しの `limit`、 または未知の列 / 型の合わない値の `where_eq` は `BadValue`
     /// (`find()` なら常に 0 件になる条件 — 購読では書き間違いとして返す)。
     pub fn subscribe(self) -> Result<LiveQuery, SchemaError> {
-        use enchudb_engine::LivePred;
+        let order = self.order_col()?;
+        let limit = self.limit;
+        if limit.is_some() && order.is_none() {
+            return Err(SchemaError::BadValue("subscribe: limit needs order_by".into()));
+        }
+        let eng = self.db.arc_engine();
+        let preds = self.live_preds()?.ok_or_else(|| {
+            SchemaError::BadValue(
+                "subscribe: where_eq on an unknown column or with a mismatched value type".into(),
+            )
+        })?;
+        let inner = match (order, limit) {
+            (Some((path, himo, desc)), Some(k)) => {
+                eng.subscribe_top(preds, path, himo, desc, k).map_err(|e| SchemaError::BadValue(e.to_string()))?
+            }
+            _ => eng.subscribe(preds).map_err(|e| SchemaError::Io(e.to_string()))?,
+        };
+        Ok(LiveQuery { inner, eng })
+    }
+
+    /// ref をたどる条件 (`where_eq("company.city", "Tokyo")`) を **ref の先の row (group) 単位**
+    /// で購読する。 差分は 「条件を満たすようになった / 外れた会社」、 社員は
+    /// [`GroupedLiveQuery::members`] で会社から逆引きする。 会社の所在地を 1 個書き換えた時の
+    /// 差分は会社 1 件で、 配下の社員が何人でも O(1)。
+    ///
+    /// - dotted な条件は全部同じ ref 列から始まること (`company.city` と `company.region.name` は可、
+    ///   `company.city` と `dept.name` は不可)。 dotted な条件が 1 本以上要る
+    /// - dotted でない条件 (`where_gt("age", 30)` など) は `members` / `count` で絞る
+    /// - 社員の異動や社員側の条件の変化は差分に出ない — `members` / `count` を引いた時点の中身が返る
+    pub fn subscribe_grouped(self) -> Result<GroupedLiveQuery, SchemaError> {
         if self.limit.is_some() {
             return Err(SchemaError::BadValue("subscribe: limit is not supported".into()));
         }
+        let eng = self.db.arc_engine();
+        let preds = self.live_preds()?.ok_or_else(|| {
+            SchemaError::BadValue(
+                "subscribe: where_eq on an unknown column or with a mismatched value type".into(),
+            )
+        })?;
+        let inner = eng.subscribe_grouped(preds).map_err(|e| SchemaError::BadValue(e.to_string()))?;
+        Ok(GroupedLiveQuery { inner, eng })
+    }
+
+    /// この条件の結果を **列 `col` の値ごとに数えた件数** を購読する (live の `GROUP BY col` +
+    /// `COUNT(*)`)。 `col` は `"company.city"` のように ref 列をたどってもよい。
+    ///
+    /// ```ignore
+    /// let by_city = users.where_eq("status", "active").subscribe_counts("company.city")?;
+    /// for (city, n) in by_city.poll() { /* 件数が変わった city と今の件数 (0 = 居なくなった) */ }
+    /// by_city.get(&Value::Text("Tokyo".into()));
+    /// ```
+    ///
+    /// - `col` に値の無い row は数えない (NULL の group は無い)
+    /// - `col` が Leaf 列 (row ごとに固有の文字列)、 `limit` 付き、 形の違う枝の `or` は `BadValue`
+    ///   (`where_in` や同じ形の `or` (`city = A OR city = B`) は可)
+    pub fn subscribe_counts(self, col: &str) -> Result<LiveCounts, SchemaError> {
+        self.subscribe_agg(col, None)
+    }
+
+    /// [`subscribe_counts`](Self::subscribe_counts) に加えて、 group ごとに列 `sum_col` の値の和も持つ
+    /// (live の `GROUP BY col` + `COUNT(*)` + `SUM(sum_col)`)。 平均は合計 / 件数。
+    ///
+    /// ```ignore
+    /// let pay = users.where_eq("status", "active").subscribe_sums("company.city", "salary")?;
+    /// for (city, n, total) in pay.poll_sums() { /* 件数か合計が変わった city */ }
+    /// ```
+    ///
+    /// - `sum_col` はこの table の Number 列 (ref をたどる列は不可)。 値の無い row は件数に入り、
+    ///   合計には 0 として足す (SQL の `SUM` と同じく NULL を無視)
+    /// - 合計の列の書き換えも届く (row の出入りが無くても)
+    pub fn subscribe_sums(self, col: &str, sum_col: &str) -> Result<LiveCounts, SchemaError> {
+        let cd = self
+            .table
+            .col(sum_col)
+            .filter(|c| c.ty == ColumnType::Number)
+            .ok_or_else(|| SchemaError::BadValue(format!("subscribe_sums: {sum_col} is not a Number column of this table")))?;
+        let h = cd.himo_id;
+        self.subscribe_agg(col, Some(h))
+    }
+
+    fn subscribe_agg(self, col: &str, sum: Option<u16>) -> Result<LiveCounts, SchemaError> {
+        if self.limit.is_some() {
+            return Err(SchemaError::BadValue("subscribe_counts: limit is not supported".into()));
+        }
+        let (path, cd) = self
+            .resolve_col(col)
+            .ok_or_else(|| SchemaError::BadValue(format!("subscribe_counts: unknown column {col}")))?;
+        if cd.ty == ColumnType::Leaf {
+            return Err(SchemaError::BadValue("subscribe_counts: cannot group by a Leaf column".into()));
+        }
+        let eng = self.db.arc_engine();
+        let preds = self.live_preds()?.ok_or_else(|| {
+            SchemaError::BadValue(
+                "subscribe: where_eq on an unknown column or with a mismatched value type".into(),
+            )
+        })?;
+        let inner = match sum {
+            Some(h) => eng.subscribe_sums(preds, path, cd.himo_id, h),
+            None => eng.subscribe_counts(preds, path, cd.himo_id),
+        }
+        .map_err(|e| SchemaError::BadValue(e.to_string()))?;
+        Ok(LiveCounts { inner, eng, ty: cd.ty })
+    }
+
+    /// ablation / 計測用: engine の `subscribe_expand_always` で購読する (結果は `subscribe`
+    /// と同じ、 poll のコストだけが変わる)。
+    #[doc(hidden)]
+    pub fn subscribe_expand_always(self) -> Result<LiveQuery, SchemaError> {
+        if self.limit.is_some() {
+            return Err(SchemaError::BadValue("subscribe: limit is not supported".into()));
+        }
+        let eng = self.db.arc_engine();
+        let preds = self.live_preds()?.ok_or_else(|| {
+            SchemaError::BadValue(
+                "subscribe: where_eq on an unknown column or with a mismatched value type".into(),
+            )
+        })?;
+        let inner = eng.subscribe_expand_always(preds).map_err(|e| SchemaError::Io(e.to_string()))?;
+        Ok(LiveQuery { inner, eng })
+    }
+
+    /// 条件を engine の `LivePred` に写す。 `None` = 常に 0 件になる条件 (未知の列 / 型不一致の
+    /// `where_eq`)。 条件なし = table の全 row (`find()` と同じ代表列)。
+    fn live_preds(self) -> Result<Option<Vec<enchudb_engine::LivePred>>, SchemaError> {
+        use enchudb_engine::LivePred;
         let eng = self.db.engine();
-        let hid_of = |name: &str| -> Result<u16, SchemaError> {
-            eng.himo_id(name)
-                .map(|h| h as u16)
-                .ok_or_else(|| SchemaError::Internal(format!("himo not found: {name}")))
-        };
-        let mut preds = Vec::with_capacity(self.preds.len().max(1));
-        for p in self.preds {
-            match p {
-                Predicate::Eq(h, _) if h == u16::MAX => {
-                    return Err(SchemaError::BadValue(
-                        "subscribe: where_eq on an unknown column or with a mismatched value type".into(),
-                    ));
-                }
-                Predicate::Eq(h, v) => preds.push(LivePred::Eq { himo_id: h, value: v }),
-                Predicate::EqText(h, text) => preds.push(LivePred::EqText { himo_id: h, text }),
-                Predicate::In(h, values) => preds.push(LivePred::In { himo_id: h, values }),
-                Predicate::Range { himo_name, lo, hi } => {
-                    preds.push(LivePred::Range { himo_id: hid_of(&himo_name)?, lo, hi })
-                }
+        fn conv(eng: &Engine, p: Predicate, rep: Option<u16>) -> Result<Option<LivePred>, SchemaError> {
+            let hid_of = |name: &str| -> Result<u16, SchemaError> {
+                eng.himo_id(name)
+                    .map(|h| h as u16)
+                    .ok_or_else(|| SchemaError::Internal(format!("himo not found: {name}")))
+            };
+            Ok(Some(match p {
+                Predicate::Eq(h, _) if h == u16::MAX => return Ok(None),
+                Predicate::Eq(h, v) => LivePred::Eq { himo_id: h, value: v },
+                Predicate::EqText(h, text) => LivePred::EqText { himo_id: h, text },
+                Predicate::In(h, values) => LivePred::In { himo_id: h, values },
+                Predicate::Range { himo_name, lo, hi } => LivePred::Range { himo_id: hid_of(&himo_name)?, lo, hi },
                 Predicate::Cmp { himo_name, op, against } => {
                     // 値は u32::MAX 未満 (sentinel 予約) なので上端は u32::MAX - 1。
                     // 空区間 (`> 最大値` / `< 0`) は lo > hi の Range = 常に偽 (find と同じ 0 件)。
@@ -2044,19 +2507,50 @@ impl<'a> Query<'a> {
                         },
                         RangeOp::Le => (0, against),
                     };
-                    preds.push(LivePred::Range { himo_id: hid_of(&himo_name)?, lo, hi });
+                    LivePred::Range { himo_id: hid_of(&himo_name)?, lo, hi }
+                }
+                Predicate::Via(path, inner) => match conv(eng, *inner, rep)? {
+                    Some(pred) => LivePred::Via { path, pred: Box::new(pred) },
+                    None => return Ok(None),
+                },
+                Predicate::Or(branches) => {
+                    if branches.is_empty() {
+                        return Err(SchemaError::BadValue("or: queries on different tables".into()));
+                    }
+                    // 常に 0 件になる枝 (未知の列など) は落とす。 全部落ちたら全体が 0 件
+                    let mut out = Vec::new();
+                    for b in branches {
+                        if let Some(conj) = conv_all(eng, b, rep)? {
+                            out.push(conj);
+                        }
+                    }
+                    if out.is_empty() {
+                        return Ok(None);
+                    }
+                    LivePred::Or(out)
+                }
+            }))
+        }
+        /// AND 1 つ分。 `None` = 常に 0 件。 条件なし (`.all()`) は table の全 row = 代表列を持つ row。
+        fn conv_all(eng: &Engine, preds: Vec<Predicate>, rep: Option<u16>) -> Result<Option<Vec<LivePred>>, SchemaError> {
+            let mut out = Vec::with_capacity(preds.len().max(1));
+            for p in preds {
+                match conv(eng, p, rep)? {
+                    Some(lp) => out.push(lp),
+                    None => return Ok(None),
                 }
             }
+            if out.is_empty() {
+                let rep = rep.ok_or_else(|| SchemaError::BadValue("subscribe: table has no columns".into()))?;
+                out.push(LivePred::Present { himo_id: rep });
+            }
+            Ok(Some(out))
         }
-        if preds.is_empty() {
-            // `.all()` 系 — find() と同じ代表 column (PK or 先頭列) を持つ全 row
-            let rep = self.table.pk
-                .or_else(|| if self.table.cols.is_empty() { None } else { Some(0) })
-                .map(|i| self.table.cols[i].himo_id)
-                .ok_or_else(|| SchemaError::BadValue("subscribe: table has no columns".into()))?;
-            preds.push(LivePred::Present { himo_id: rep });
-        }
-        eng.subscribe(preds).map_err(|e| SchemaError::Io(e.to_string()))
+        // `.all()` 系 — find() と同じ代表 column (PK or 先頭列) を持つ全 row
+        let rep = self.table.pk
+            .or_else(|| if self.table.cols.is_empty() { None } else { Some(0) })
+            .map(|i| self.table.cols[i].himo_id);
+        conv_all(eng, self.preds, rep)
     }
 
     // ──── 0.8.10 (#43): Query 終端の集計 chain API ────

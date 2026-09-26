@@ -121,8 +121,8 @@ fn remote_writes_enter_and_leave_subscription() {
     eng_a.tie_text_to(rows[2], "notes.label", "bye");
     eng_a.tie_to(rows[2], "notes.score", 90);
     ship(&eng_a, &syncer_a, &syncer_b);
-    integrate(&mut seen_hello, hello.poll());
-    integrate(&mut seen_high, high.poll());
+    integrate(&mut seen_hello, hello.poll(&eng_b));
+    integrate(&mut seen_high, high.poll(&eng_b));
     assert_eq!(seen_hello.len(), 2, "hello の 2 row が sync で届く");
     assert_eq!(seen_high.len(), 2, "score 70 / 90 の 2 row が sync で届く");
     oracle(&seen_hello, &seen_high, "初回 sync");
@@ -132,8 +132,8 @@ fn remote_writes_enter_and_leave_subscription() {
     eng_a.tie_to(rows[1], "notes.score", 55); // high に入る
     eng_a.delete(rows[2]); // high から出る
     ship(&eng_a, &syncer_a, &syncer_b);
-    let d_hello = hello.poll();
-    let d_high = high.poll();
+    let d_hello = hello.poll(&eng_b);
+    let d_high = high.poll(&eng_b);
     assert_eq!((d_hello.added.len(), d_hello.removed.len()), (0, 1), "hello: {d_hello:?}");
     assert_eq!((d_high.added.len(), d_high.removed.len()), (1, 1), "high: {d_high:?}");
     integrate(&mut seen_hello, d_hello);

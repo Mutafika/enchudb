@@ -82,6 +82,24 @@ pub struct AppendBucket {
 unsafe impl Sync for AppendBucket {}
 unsafe impl Send for AppendBucket {}
 
+/// 同じ eid の 2 本目以降を落とす (最初の 1 本を残し、 順序は保つ)。 重複は稀 (re-tie 往復痕) なので、
+/// 並べた写しで重複の有無だけを見て、 無ければそのまま返す (hash を使わない)。
+fn dedup_first(v: Vec<u32>) -> Vec<u32> {
+    let mut sorted: Vec<(u32, u32)> = v.iter().enumerate().map(|(i, &e)| (e, i as u32)).collect();
+    sorted.sort_unstable();
+    if sorted.windows(2).all(|w| w[0].0 != w[1].0) {
+        return v;
+    }
+    // (eid, 位置) の昇順で、 同じ eid の 2 本目以降の位置に印
+    let mut drop = vec![false; v.len()];
+    for w in sorted.windows(2) {
+        if w[0].0 == w[1].0 {
+            drop[w[1].1 as usize] = true;
+        }
+    }
+    v.into_iter().zip(drop).filter(|&(_, d)| !d).map(|(e, _)| e).collect()
+}
+
 impl AppendBucket {
     /// 空の bucket（初回 push まで heap 確保しない）。
     pub fn new() -> Self {
@@ -191,12 +209,7 @@ impl AppendBucket {
         let b = unsafe { cur.deref() };
         let l = b.len.load(Ordering::Relaxed); // 単一 writer なので自身の len は Relaxed で可
         let src = unsafe { b.published(l) };
-        let mut seen = std::collections::HashSet::with_capacity(self.live() as usize + 1);
-        let kept: Vec<u32> = src
-            .iter()
-            .copied()
-            .filter(|&e| keep(e) && seen.insert(e))
-            .collect();
+        let kept = dedup_first(src.iter().copied().filter(|&e| keep(e)).collect());
 
         let ncap = kept.len().next_power_of_two().max(INITIAL_CAP);
         let nb = Buf::with_cap(ncap);
@@ -373,6 +386,13 @@ mod tests {
         let n = d.compact_in(&guard, |_| true);
         assert_eq!(n, 2);
         assert_eq!(d.read_to_vec(), vec![5, 7]);
+        // 順序は最初に現れた順のまま
+        let o = AppendBucket::new();
+        for e in [9u32, 5, 9, 3, 5, 7] {
+            o.push(e);
+        }
+        assert_eq!(o.compact_in(&guard, |_| true), 4);
+        assert_eq!(o.read_to_vec(), vec![9, 5, 3, 7]);
     }
 
     /// 1 writer + N reader 並行: 破損なし、 len 単調非減少、 全要素 valid。

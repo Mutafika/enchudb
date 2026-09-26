@@ -70,10 +70,10 @@ fn full_scan(eng: &Engine, max_eid: u64, f: &dyn Fn(&Engine, u64) -> bool) -> BT
 
 fn check(eng: &Engine, subs: &mut [Sub], max_eid: u64, step: usize) {
     for s in subs.iter_mut() {
-        integrate(&mut s.seen, s.q.poll());
+        integrate(&mut s.seen, s.q.poll(eng));
         let want = full_scan(eng, max_eid, &*s.oracle);
         assert_eq!(s.seen, want, "[{}] step {step}: 積分結果 != 全件走査", s.name);
-        assert_eq!(s.q.count(), want.len(), "[{}] step {step}: count", s.name);
+        assert_eq!(s.q.count(eng), want.len(), "[{}] step {step}: count", s.name);
     }
 }
 
@@ -230,13 +230,13 @@ fn reused_slot_is_reported_as_leave_and_reenter() {
     let e = eng.entity().unwrap();
     eng.tie(e, "age", 30);
     let q = eng.subscribe(vec![LivePred::Eq { himo_id: age, value: 30 }]).unwrap();
-    assert_eq!(q.poll().added, vec![e]);
+    assert_eq!(q.poll(&eng).added, vec![e]);
 
     eng.delete(e);
     let n = eng.entity().unwrap();
     assert_eq!(n, e, "前提: 容量 1 なら削除した slot が再利用される");
     eng.tie(n, "age", 30);
-    let d = q.poll();
+    let d = q.poll(&eng);
     assert_eq!(d.removed, vec![e]);
     assert_eq!(d.added, vec![e]);
     drop(q);
@@ -285,14 +285,14 @@ fn subscribe_while_writing_loses_nothing() {
         let q = eng.subscribe(vec![LivePred::Eq { himo_id: age, value: 1 }]).unwrap();
         let mut seen = BTreeSet::new();
         for _ in 0..5 {
-            integrate(&mut seen, q.poll());
+            integrate(&mut seen, q.poll(&eng));
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         for w in writers {
             w.join().unwrap();
         }
-        integrate(&mut seen, q.poll());
+        integrate(&mut seen, q.poll(&eng));
         let want: BTreeSet<u64> = eids.iter().copied().filter(|&e| eng.get(e, "age") == Some(1)).collect();
         assert_eq!(seen, want, "round {round}: 登録と並行した書き込みの取りこぼし");
     }
@@ -308,6 +308,265 @@ fn rejects_empty_and_unknown_himo() {
     eng.define_himo("age", ValueType::Number, 100);
     assert!(eng.subscribe(vec![]).is_err());
     assert!(eng.subscribe(vec![LivePred::Present { himo_id: 999 }]).is_err());
+    drop(eng);
+    cleanup(&path);
+}
+
+/// ref をたどる購読 (user → company → city) を、 hub の値の往復と ref の付け替えを並行で
+/// 書きながら poll し続け、 writer 停止後の積分 == 手でたどった結果を確かめる。
+///
+/// 「真偽の記録値を不明に戻す」 ルール (live.rs module doc) の **決定論の gate は
+/// `live::tests::concurrent_flip_and_back_is_not_swallowed`**。 これは実スレッドでの
+/// end-to-end の形を見る。 ルールを外すとこの test も落ちる (実測 release で 10 run 中 10 回。
+/// 行って戻る書き込みを 3 thread で回しているので、 実スレッド上でも競合は十分起きる)。
+#[test]
+fn via_subscription_under_concurrent_flips() {
+    let path = tmp_path("via_race");
+    cleanup(&path);
+    let mut eng = Engine::create_growable_opts(&path, GrowableOptions::default()).unwrap();
+    eng.define_himo("company", ValueType::Ref, 0);
+    eng.define_himo("city", ValueType::Number, 4);
+    let company = eng.himo_id("company").unwrap() as u16;
+    let city = eng.himo_id("city").unwrap() as u16;
+    let hubs: Vec<u64> = (0..8).map(|_| eng.entity().unwrap()).collect();
+    let users: Vec<u64> = (0..400).map(|_| eng.entity().unwrap()).collect();
+    for (i, &h) in hubs.iter().enumerate() {
+        eng.tie(h, "city", (i % 2) as u32);
+    }
+    for (i, &u) in users.iter().enumerate() {
+        eng.tie(u, "company", enchudb_oplog::eid_local(hubs[i % hubs.len()]));
+    }
+    let eng = Engine::concurrentize(eng);
+    let oracle = |eng: &Engine| -> BTreeSet<u64> {
+        users
+            .iter()
+            .copied()
+            .filter(|&u| {
+                let Some(c) = eng.get(u, "company") else { return false };
+                eng.get(enchudb_oplog::make_eid(eng.peer_id(), c), "city") == Some(1)
+            })
+            .collect()
+    };
+    let pred = || vec![LivePred::Via { path: vec![company], pred: Box::new(LivePred::Eq { himo_id: city, value: 1 }) }];
+
+    for round in 0..20u64 {
+        let fast = eng.subscribe(pred()).unwrap();
+        let naive = eng.subscribe_expand_always(pred()).unwrap();
+        let (mut seen_fast, mut seen_naive) = (BTreeSet::new(), BTreeSet::new());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0..3u64)
+            .map(|t| {
+                let eng = eng.clone();
+                let (hubs, users) = (hubs.clone(), users.clone());
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut rng = Rng(0xabcd_ef01_2345_6789 ^ (round * 3 + t + 1));
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let h = hubs[rng.below(hubs.len() as u64) as usize];
+                        if rng.below(3) == 0 {
+                            let u = users[rng.below(users.len() as u64) as usize];
+                            eng.tie_to(u, "company", enchudb_oplog::eid_local(h));
+                        } else {
+                            // 行って戻る: 1 → 0 → 1 を素早く
+                            eng.tie_to(h, "city", 0);
+                            eng.tie_to(h, "city", 1);
+                            if rng.below(2) == 0 {
+                                eng.tie_to(h, "city", 0);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_millis(40) {
+            integrate(&mut seen_fast, fast.poll(&eng));
+            integrate(&mut seen_naive, naive.poll(&eng));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for w in writers {
+            w.join().unwrap();
+        }
+        integrate(&mut seen_fast, fast.poll(&eng));
+        integrate(&mut seen_naive, naive.poll(&eng));
+        let want = oracle(&eng);
+        assert_eq!(seen_naive, want, "round {round}: 常に展開 != 手でたどった結果");
+        assert_eq!(seen_fast, want, "round {round}: 既定 (真偽が変わった時だけ展開) != 手でたどった結果");
+    }
+    drop(eng);
+    cleanup(&path);
+}
+
+/// 新しい種類の購読 (Or / 範囲の穴 / 集計 / 上位 k 件、 ref の先を含む) を **書き込みと並行して
+/// 登録し**、 書き込み 4 thread + 束の poll / 個別 poll / count を並行で回した後、 writer 停止後の
+/// 積分が手で数えた結果と一致すること。 lock 順 (Or の購読は family の lock を離してから自分を取る)
+/// を破ると deadlock で止まる形でもある。
+///
+/// 検出の実測: 印付けで dirty bit を印より先に立てる (+ 間に `yield_now`) 変異で 5 run 中 5 回落ちる。
+/// 順序そのものの gate は loom `loom_live_dirty.rs`。
+#[test]
+fn new_kinds_under_concurrent_writes() {
+    let path = tmp_path("kinds_race");
+    cleanup(&path);
+    let mut eng = Engine::create_growable_opts(&path, GrowableOptions::default()).unwrap();
+    for (h, t) in [("company", ValueType::Ref), ("city", ValueType::Number), ("revenue", ValueType::Number), ("age", ValueType::Number), ("score", ValueType::Number)] {
+        eng.define_himo(h, t, 0);
+    }
+    let id = |eng: &Engine, h: &str| eng.himo_id(h).unwrap() as u16;
+    let (company, city, revenue, age, score) =
+        (id(&eng, "company"), id(&eng, "city"), id(&eng, "revenue"), id(&eng, "age"), id(&eng, "score"));
+    let companies: Vec<u64> = (0..12).map(|_| eng.entity().unwrap()).collect();
+    let users: Vec<u64> = (0..600).map(|_| eng.entity().unwrap()).collect();
+    for (i, &c) in companies.iter().enumerate() {
+        eng.tie(c, "city", (i % 4) as u32);
+        eng.tie(c, "revenue", (i * 7 % 50) as u32);
+    }
+    for (i, &u) in users.iter().enumerate() {
+        eng.tie(u, "company", enchudb_oplog::eid_local(companies[i % companies.len()]));
+        eng.tie(u, "age", (i * 13 % 40) as u32);
+        eng.tie(u, "score", (i * 31 % 200) as u32);
+    }
+    let eng = Engine::concurrentize(eng);
+    let via = |p: LivePred| LivePred::Via { path: vec![company], pred: Box::new(p) };
+    let get = |eng: &Engine, e: u64, h: &str| eng.get(e, h);
+    let co = |eng: &Engine, e: u64| get(eng, e, "company").map(|c| enchudb_oplog::make_eid(eng.peer_id(), c));
+
+    for round in 0..10u64 {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0..4u64)
+            .map(|t| {
+                let eng = eng.clone();
+                let (companies, users) = (companies.clone(), users.clone());
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut rng = Rng(0x5eed_0000_1111_2222 ^ (round * 4 + t + 1));
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let u = users[rng.below(users.len() as u64) as usize];
+                        let c = companies[rng.below(companies.len() as u64) as usize];
+                        match rng.below(8) {
+                            0 => eng.tie_to(u, "age", rng.below(40) as u32),
+                            1 => eng.tie_to(u, "score", rng.below(200) as u32),
+                            2 => eng.tie_to(u, "company", enchudb_oplog::eid_local(c)),
+                            3 => eng.tie_to(c, "city", rng.below(4) as u32),
+                            4 => eng.tie_to(c, "revenue", rng.below(50) as u32),
+                            5 if rng.below(4) == 0 => eng.untie(u, "score"),
+                            6 if rng.below(4) == 0 => eng.untie(u, "age"),
+                            _ => eng.tie_to(u, "age", rng.below(40) as u32),
+                        }
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        // 書き込みと並行して登録
+        let or = eng
+            .subscribe(vec![LivePred::Or(vec![
+                vec![via(LivePred::Eq { himo_id: city, value: 1 })],
+                vec![LivePred::Range { himo_id: age, lo: 31, hi: 39 }],
+            ])])
+            .unwrap();
+        let range = eng.subscribe(vec![LivePred::Range { himo_id: age, lo: 10, hi: 20 }]).unwrap();
+        let range_via = eng.subscribe(vec![via(LivePred::Range { himo_id: revenue, lo: 10, hi: 30 })]).unwrap();
+        let counts = eng.subscribe_counts(vec![LivePred::Present { himo_id: age }], vec![company], city).unwrap();
+        let sums = eng.subscribe_sums(vec![LivePred::Range { himo_id: age, lo: 0, hi: 25 }], vec![company], city, score).unwrap();
+        let top = eng.subscribe_top(vec![LivePred::Present { himo_id: score }], vec![], score, false, 15).unwrap();
+        let top_via = eng.subscribe_top(vec![LivePred::Present { himo_id: age }], vec![company], revenue, true, 20).unwrap();
+        let top_in = eng
+            .subscribe_top(vec![via(LivePred::In { himo_id: city, values: vec![0, 2] })], vec![], score, true, 10)
+            .unwrap();
+        let qs: [&LiveQuery; 6] = [&or, &range, &range_via, &top, &top_via, &top_in];
+        let mut seen: Vec<BTreeSet<u64>> = vec![BTreeSet::new(); qs.len()];
+        let mut groups: std::collections::BTreeMap<u32, u64> = Default::default();
+        let mut sum_groups: std::collections::BTreeMap<u32, enchudb_engine::Agg> = Default::default();
+        let group = eng.live_group();
+        for q in qs {
+            group.add(q);
+        }
+        let absorb = |seen: &mut Vec<BTreeSet<u64>>, eng: &Engine| {
+            for (id, d) in group.poll(eng) {
+                let i = qs.iter().position(|q| q.id() == id).expect("知らない購読の id");
+                integrate(&mut seen[i], d);
+            }
+        };
+        let t0 = std::time::Instant::now();
+        let mut n = 0u64;
+        while t0.elapsed() < std::time::Duration::from_millis(40) {
+            n += 1;
+            if n.is_multiple_of(3) {
+                // count / ranked が先に settle して積んだ分も束の poll に届く
+                let _ = (or.count(&eng), top.ranked(&eng), counts.total(&eng));
+            }
+            if n.is_multiple_of(2) {
+                absorb(&mut seen, &eng);
+            } else {
+                for (i, q) in qs.iter().enumerate() {
+                    integrate(&mut seen[i], q.poll(&eng));
+                }
+            }
+            for (v, c) in counts.poll(&eng) {
+                if c == 0 { groups.remove(&v); } else { groups.insert(v, c); }
+            }
+            for (v, a) in sums.poll_sums(&eng) {
+                if a.count == 0 { sum_groups.remove(&v); } else { sum_groups.insert(v, a); }
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for w in writers {
+            w.join().unwrap();
+        }
+        absorb(&mut seen, &eng);
+        for (v, c) in counts.poll(&eng) {
+            if c == 0 { groups.remove(&v); } else { groups.insert(v, c); }
+        }
+        for (v, a) in sums.poll_sums(&eng) {
+            if a.count == 0 { sum_groups.remove(&v); } else { sum_groups.insert(v, a); }
+        }
+
+        let has_age = |e: u64, lo: u32, hi: u32| get(&eng, e, "age").is_some_and(|a| lo <= a && a <= hi);
+        let city_of = |e: u64| co(&eng, e).and_then(|c| get(&eng, c, "city"));
+        let rev_of = |e: u64| co(&eng, e).and_then(|c| get(&eng, c, "revenue"));
+        let set = |f: &dyn Fn(u64) -> bool| users.iter().copied().filter(|&e| f(e)).collect::<BTreeSet<u64>>();
+        let top_k = |key: &dyn Fn(u64) -> Option<u32>, keep: &dyn Fn(u64) -> bool, desc: bool, k: usize| {
+            let mut v: Vec<(u32, u64)> = users
+                .iter()
+                .copied()
+                .filter(|&e| keep(e))
+                .filter_map(|e| key(e).map(|x| (if desc { u32::MAX - x } else { x }, e)))
+                .collect();
+            v.sort_unstable();
+            v.into_iter().take(k).map(|x| x.1).collect::<BTreeSet<u64>>()
+        };
+        let want = [
+            set(&|e| city_of(e) == Some(1) || has_age(e, 31, 39)),
+            set(&|e| has_age(e, 10, 20)),
+            set(&|e| rev_of(e).is_some_and(|r| (10..=30).contains(&r))),
+            top_k(&|e| get(&eng, e, "score"), &|_| true, false, 15),
+            top_k(&rev_of, &|e| get(&eng, e, "age").is_some(), true, 20),
+            top_k(&|e| get(&eng, e, "score"), &|e| matches!(city_of(e), Some(0 | 2)), true, 10),
+        ];
+        let names = ["or", "range", "range via", "top", "top via", "top in"];
+        for i in 0..qs.len() {
+            assert_eq!(seen[i], want[i], "round {round}: [{}] 積分 != 手で数えた結果", names[i]);
+            assert_eq!(qs[i].count(&eng), want[i].len(), "round {round}: [{}] count", names[i]);
+        }
+        let mut want_groups: std::collections::BTreeMap<u32, u64> = Default::default();
+        for &e in &users {
+            if get(&eng, e, "age").is_some() && let Some(c) = city_of(e) {
+                *want_groups.entry(c).or_insert(0) += 1;
+            }
+        }
+        assert_eq!(groups, want_groups, "round {round}: [counts] 積分 != 手で数えた件数");
+        assert_eq!(counts.all(&eng), want_groups.into_iter().collect::<Vec<_>>(), "round {round}: [counts] all");
+        let mut want_sums: std::collections::BTreeMap<u32, enchudb_engine::Agg> = Default::default();
+        for &e in &users {
+            if get(&eng, e, "age").is_some_and(|a| a <= 25) && let Some(c) = city_of(e) {
+                let w = want_sums.entry(c).or_default();
+                w.count += 1;
+                w.sum += get(&eng, e, "score").unwrap_or(0) as u64;
+            }
+        }
+        assert_eq!(sum_groups, want_sums, "round {round}: [sums] 積分 != 手で数えた件数 / 合計");
+    }
     drop(eng);
     cleanup(&path);
 }
