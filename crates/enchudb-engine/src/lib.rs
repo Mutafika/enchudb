@@ -76,6 +76,8 @@ pub mod transport;
 // `sync::Syncer` は `enchudb-sync` crate に分離済。
 // engine は single-peer でも動くので sync を直接持たない。
 pub mod changefeed;
+// live query (クエリ購読): 条件に当てはまる entity 集合の差分を購読する。
+pub mod live;
 // Transport implementations moved to `enchu-transport` crate.
 pub mod acl;
 pub mod integrity;
@@ -83,6 +85,7 @@ pub mod blob_store;
 pub mod sparse_copy;
 
 pub use engine::{DbState, Engine, EntityValue, SnapshotFiles, AuditFilter, MigrationStats, LeafScale, GrowableOptions, FaultKind, RemoteApply};
+pub use live::{LiveDelta, LivePred, LiveQuery};
 pub use sparse_copy::copy_sparse;
 #[cfg(not(target_arch = "wasm32"))]
 pub use engine::copy_db_dir;

@@ -297,6 +297,12 @@ impl HimoStore {
         true
     }
 
+    /// write_lock を 1 度取って離すだけ。 これより前に lock を離した書き込みは全て見える
+    /// (live query の登録 barrier、 `crate::live` module doc)。
+    pub fn write_barrier(&self) {
+        drop(self.write_lock.lock());
+    }
+
     pub fn remove(&self, eid: u32) {
         let col = self.col();
         if eid < col.count() {
