@@ -3589,18 +3589,27 @@ impl<'a> UnderQuery<'a> {
         let Some((f, sd, a, via)) = self.plan()? else { return Ok(Vec::new()) };
         let peer = eng.peer_id();
         let local = |e: EntityId| enchudb_oplog::eid_local(e);
+        let refs = HierRef { eng: &eng, via, peer };
         let mut h = Hier::new(up);
-        for e in eng.find_by(a).map_err(io)? {
-            if let Some(p) = eng.get_by_id(e, via) {
-                h.link(local(e), p as u32, &mut Default::default());
+        if up {
+            // 上向きは seed の数を積むので、 親の表を組み立てる (下向きは親を engine から読む)
+            for e in eng.find_by(a).map_err(io)? {
+                if let Some(p) = eng.get_by_id(e, via) {
+                    h.link(local(e), p as u32, &mut Default::default());
+                }
             }
         }
         let mut touched = Vec::new();
         for e in eng.find_by(sd).map_err(io)? {
             h.set_seed(local(e), true, &mut touched);
         }
-        let mut out: Vec<EntityId> =
-            eng.find_by(f).map_err(io)?.into_iter().filter(|&e| h.find_answer(local(e))).map(|e| enchudb_oplog::make_eid(peer, local(e))).collect();
+        let mut out: Vec<EntityId> = eng
+            .find_by(f)
+            .map_err(io)?
+            .into_iter()
+            .filter(|&e| h.find_answer(local(e), &refs))
+            .map(|e| enchudb_oplog::make_eid(peer, local(e)))
+            .collect();
         out.sort_unstable();
         Ok(out)
     }
@@ -3619,19 +3628,36 @@ impl<'a> UnderQuery<'a> {
         let up = self.up;
         let state = std::sync::Mutex::new(UnderState { hier: Hier::new(up), filt: Default::default(), reported: Default::default() });
         let Some((f, sd, a, via)) = self.plan()? else {
-            return Ok(LiveUnder { eng, live: None, state });
+            return Ok(LiveUnder { eng, live: None, via: 0, state });
         };
         let parents = eng.subscribe_keyed(a, Vec::new(), via).map_err(io)?;
         let seeds = eng.subscribe(sd).map_err(io)?;
         let filter = eng.subscribe(f).map_err(io)?;
-        Ok(LiveUnder { eng, live: Some((parents, seeds, filter)), state })
+        Ok(LiveUnder { eng, live: Some((parents, seeds, filter)), via, state })
     }
 }
 
-/// 階層 (子 → 親) と seed、 配下の答え。 row は local eid。
+/// 階層の ref 列を engine から読む: 親 = ref 列の直読み (Column 1 回)。 購読が当てた差分より先の書き込みも見えるが、
+/// 下向きの答え (真偽) は、 読み違えた row の差分が次の poll で届いて決め直される。
+///
+/// 子は engine から引かない (ref 列の値で引くと、 その列の Cylinder が無ければ全 row で組まれ (#270 の lazy build)、
+/// 以後その列の書き込みごとに維持される: 社員 100 万のベンチで RSS +45 MB、 1 万件まとめ -4%)。 子は購読が当てた差分から持つ。
+struct HierRef<'e> {
+    eng: &'e Engine,
+    via: u16,
+    peer: u32,
+}
+
+impl HierRef<'_> {
+    fn parent(&self, x: u32) -> Option<u32> {
+        self.eng.get_by_id(enchudb_oplog::make_eid(self.peer, x), self.via).map(|p| p as u32)
+    }
+}
+
+/// 下向きの seed と配下の答え。 row は local eid。 親は持たず engine から読む ([`HierRef`])、 子は当てた差分から持つ。
 #[derive(Default)]
 struct Tree {
-    parent: std::collections::BTreeMap<u32, u32>,
+    /// (親, 子)
     children: std::collections::BTreeSet<(u32, u32)>,
     seed: std::collections::BTreeSet<u32>,
     /// 配下である row (答えが真)。
@@ -3639,21 +3665,11 @@ struct Tree {
 }
 
 impl Tree {
-    fn set_parent(&mut self, c: u32, p: Option<u32>) {
-        if let Some(old) = self.parent.remove(&c) {
-            self.children.remove(&(old, c));
-        }
-        if let Some(p) = p {
-            self.parent.insert(c, p);
-            self.children.insert((p, c));
-        }
-    }
-
     /// 親をたどって seed に着くか (根 / 輪に着いたら偽)。 階層の深さに比例。
-    fn walk(&self, r: u32) -> bool {
+    fn walk(&self, r: u32, h: &HierRef) -> bool {
         let mut cur = r;
         let mut seen = std::collections::BTreeSet::new();
-        while let Some(&p) = self.parent.get(&cur) {
+        while let Some(p) = h.parent(cur) {
             if self.seed.contains(&p) {
                 return true;
             }
@@ -3667,11 +3683,11 @@ impl Tree {
 
     /// `roots` の答えを親をたどって決め直し、 答えが変わった row の子へ下向きに伝える (子の答え = 親が seed か配下か)。
     /// 答えが変わった row を返す。
-    fn settle(&mut self, roots: impl IntoIterator<Item = u32>) -> Vec<u32> {
+    fn settle(&mut self, roots: impl IntoIterator<Item = u32>, h: &HierRef) -> Vec<u32> {
         let mut changed = Vec::new();
         let mut queue = std::collections::VecDeque::new();
         for r in roots {
-            let now = self.walk(r);
+            let now = self.walk(r, h);
             if now != self.under.contains(&r) {
                 if now { self.under.insert(r) } else { self.under.remove(&r) };
                 changed.push(r);
@@ -3875,7 +3891,7 @@ impl Hier {
     /// 根 c の親を p にする (find の組み立て用)。
     fn link(&mut self, c: u32, p: u32, touched: &mut Vec<u32>) {
         match self {
-            Hier::Down(t) => t.set_parent(c, Some(p)),
+            Hier::Down(_) => {}
             Hier::Up(a) => a.link(c, p, touched),
         }
     }
@@ -3890,9 +3906,9 @@ impl Hier {
     }
 
     /// find 用の答え (下向きは親をたどる)。
-    fn find_answer(&self, x: u32) -> bool {
+    fn find_answer(&self, x: u32, h: &HierRef) -> bool {
         match self {
-            Hier::Down(t) => t.walk(x),
+            Hier::Down(t) => t.walk(x, h),
             Hier::Up(a) => a.sub(x) > u64::from(a.seed.contains(&x)),
         }
     }
@@ -3906,7 +3922,7 @@ impl Hier {
     }
 
     /// 親の付け替えと seed の出入りを当てて、 答えが変わりうる row を返す。
-    fn apply(&mut self, dp: &enchudb_engine::KeyedDelta, ds: &LiveDelta) -> Vec<u32> {
+    fn apply(&mut self, dp: &enchudb_engine::KeyedDelta, ds: &LiveDelta, h: &HierRef) -> Vec<u32> {
         use std::collections::BTreeSet;
         let local = |e: EntityId| enchudb_oplog::eid_local(e);
         // 外れた ref (付け替えは added で上書き)
@@ -3917,11 +3933,11 @@ impl Hier {
             Hier::Down(tree) => {
                 // 答えを決め直す row: 親が変わった row と、 seed の出入りした row の子
                 let mut roots: BTreeSet<u32> = dp.removed.iter().chain(dp.added.iter()).map(|(e, _)| local(*e)).collect();
-                for &c in &cut {
-                    tree.set_parent(c, None);
+                for &(e, p) in &dp.removed {
+                    tree.children.remove(&(p as u32, local(e)));
                 }
                 for &(e, p) in &dp.added {
-                    tree.set_parent(local(e), Some(p as u32));
+                    tree.children.insert((p as u32, local(e)));
                 }
                 for &e in &ds.removed {
                     tree.seed.remove(&local(e));
@@ -3933,7 +3949,7 @@ impl Hier {
                     let x = local(e);
                     roots.extend(tree.children.range((x, 0)..=(x, u32::MAX)).map(|k| k.1));
                 }
-                tree.settle(roots)
+                tree.settle(roots, h)
             }
             Hier::Up(a) => {
                 let mut touched = Vec::new();
@@ -3969,6 +3985,8 @@ pub struct LiveUnder {
     eng: Arc<Engine>,
     /// (親の ref の鍵付きの購読, seed, 結果を絞る条件)
     live: Option<(enchudb_engine::LiveKeyed, enchudb_engine::LiveQuery, enchudb_engine::LiveQuery)>,
+    /// 階層の ref 列
+    via: u16,
     state: std::sync::Mutex<UnderState>,
 }
 
@@ -3986,7 +4004,7 @@ impl LiveUnder {
         let mut reborn: BTreeSet<u32> = dp.reentered.iter().map(|&e| local(e)).collect();
         let rs: BTreeSet<EntityId> = df.removed.iter().copied().collect();
         reborn.extend(df.added.iter().filter(|e| rs.contains(e)).map(|&e| local(e)));
-        let mut touched = hier.apply(&dp, &ds);
+        let mut touched = hier.apply(&dp, &ds, &HierRef { eng: &self.eng, via: self.via, peer });
         for &e in &df.removed {
             filt.remove(&local(e));
             touched.push(local(e));
