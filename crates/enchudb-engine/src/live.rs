@@ -845,7 +845,8 @@ impl ValWords {
 
 /// 印リスト。 追記するだけで、 重複は取り出す時 (と溜まりすぎた時) に畳む — 印は poll の
 /// たびに空になる一時的な集合なので、 付けるたびに整列した集合へ挿入するより安い。 大きさは
-/// 印の付いた entity の数の高々 2 倍 + 定数。
+/// 印の付いた entity の数の高々 4 倍 + 16384 (途中で畳む回数を減らす。 畳むたびに全体を整列するので、
+/// 2 倍 + 64 では 1 回の poll の印 1000 件を 4〜5 回分整列していた)。
 /// 中身は eid (既定) か、 集計の group の値 (u64)。
 struct Marks<T = u32> {
     list: Vec<T>,
@@ -859,17 +860,65 @@ impl<T> Default for Marks<T> {
     }
 }
 
-impl<T: Ord + Copy> Marks<T> {
+/// 印の整列。 eid (u32) は基数 sort — 印は 「会社 1 社の配下」 のような eid の飛んだ昇順の run が
+/// 入り組んだ連なりになり、 比較 sort では run の併合に log(run 数) 段かかる (batch で書いてから poll
+/// すると run が増える)。
+trait MarkKey: Ord + Copy {
+    fn sort(list: &mut Vec<Self>);
+}
+
+impl MarkKey for u64 {
+    fn sort(list: &mut Vec<u64>) {
+        list.sort_unstable();
+    }
+}
+
+impl MarkKey for u32 {
+    fn sort(list: &mut Vec<u32>) {
+        if list.len() < 256 {
+            list.sort_unstable();
+            return;
+        }
+        if list.is_sorted() {
+            return;
+        }
+        // 下の桁 (8 bit) から 4 回の安定な振り分け。 全部が同じ桁の回は飛ばす (eid の上位は揃いやすい)
+        let mut buf = vec![0u32; list.len()];
+        for shift in [0u32, 8, 16, 24] {
+            let mut count = [0usize; 256];
+            for &x in list.iter() {
+                count[((x >> shift) & 0xff) as usize] += 1;
+            }
+            if count.contains(&list.len()) {
+                continue;
+            }
+            let mut at = 0;
+            for c in count.iter_mut() {
+                let n = *c;
+                *c = at;
+                at += n;
+            }
+            for &x in list.iter() {
+                let d = &mut count[((x >> shift) & 0xff) as usize];
+                buf[*d] = x;
+                *d += 1;
+            }
+            std::mem::swap(list, &mut buf);
+        }
+    }
+}
+
+impl<T: MarkKey> Marks<T> {
     #[inline]
     fn add(&mut self, eid: T) {
         self.list.push(eid);
-        if self.list.len() > 2 * self.clean + 64 {
+        if self.list.len() > 4 * self.clean + 16384 {
             self.compact();
         }
     }
 
     fn compact(&mut self) {
-        self.list.sort_unstable();
+        T::sort(&mut self.list);
         self.list.dedup();
         self.clean = self.list.len();
     }
@@ -4995,6 +5044,36 @@ mod tests {
             }
             let narrow = matches!(f, FlatSet::Narrow { .. });
             assert_eq!(narrow, case < 2, "case {case}: u32 の値だけなら 8 B のまま、 窓の外の値で組に");
+        }
+    }
+
+    /// 印の整列 (u32 は基数 sort) は sort_unstable + dedup と同じ集合を返す: 入り組んだ昇順の run、 上位
+    /// の桁が揃った値 / 散った値、 重複、 整列済み、 短い列。 途中で畳む閾値をまたぐ量も入れる。
+    #[test]
+    fn marks_take_sorts_and_dedups() {
+        let mut seed = 11u64;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        for case in 0..40 {
+            let n = [0, 1, 200, 300, 5000, 40_000][case % 6];
+            let input: Vec<u32> = match case / 6 % 4 {
+                // 会社 c の配下 = c, c + 1000, c + 2000, .. の run を入り組ませる
+                0 => (0..n as u32).map(|i| (i % 7) + 1000 * (i / 7) + (rnd() % 3)).collect(),
+                1 => (0..n).map(|_| rnd()).collect(),
+                2 => (0..n).map(|_| rnd() % 50).collect(),
+                _ => (0..n as u32).collect(),
+            };
+            let mut m: Marks = Marks::default();
+            for &x in &input {
+                m.add(x);
+            }
+            let mut want = input.clone();
+            want.sort_unstable();
+            want.dedup();
+            assert_eq!(m.take(), want, "case {case}");
+            assert!(m.is_empty());
         }
     }
 
