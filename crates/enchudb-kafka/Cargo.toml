@@ -1,6 +1,6 @@
 [package]
 name = "enchudb-kafka"
-version = "0.26.14"
+version = "0.27.0"
 edition = "2024"
 rust-version = "1.89"
 description = "enchudb-connect の Kafka アダプタ (Redpanda など Kafka 互換も)。 純 Rust (rskafka)、 C のライブラリ不要。"

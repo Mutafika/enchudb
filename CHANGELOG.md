@@ -3,6 +3,127 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.27.0 — 2026-09-27
+
+**live query (クエリ購読) と 64 bit 列を入れた minor release。** `find()` を呼び直す代わりに
+query を 1 回購読し、 結果集合の差分を `poll()` で受け取る。 条件・ref の道・OR / In・否定 /
+EXISTS・集計と HAVING・上位 k 件・JOIN (ref / 値 / 範囲 / 3 table 以上)・再帰 (`WITH RECURSIVE`
+の上下)・グラフの到達・`LAG` まで、 書き込み 1 回あたり µs 以下で差分を保つ。 あわせて値の
+u32 上限を列単位で外す 64 bit 列 (schema `BigInt` / SQL `BIGINT`、 新しい SQL の表の
+`INTEGER`) を足した。
+
+**既存の DB はそのまま開ける** (v10 のまま、 旧 binary でも開ける)。 v11 になるのは 64 bit 列を
+define した DB だけ。 **API は breaking** — live / 値の型が u64 に広がった (下の移行ガイド)。
+
+対 DBSP (Feldera のエンジン、 `dbsp` 0.354 を in-process、 書き込み 1 回ごと、 出力の件数は全部一致、
+bench は repo 外の `enchu-ivm-bench`):
+
+| 機能 | enchu | DBSP |
+|---|---|---|
+| ref をたどる購読 (社員単位) | 0.6〜2.4 µs | 39〜43 µs |
+| OR (購読 1 万本まで) | 1.2〜2.1 µs | 86〜165 µs |
+| 集計 (hacg 577 万法人、 都道府県別): 閉鎖 / 都道府県変更 | 0.8 / 0.96 µs | 85 / 3002 µs |
+| 上位 k 件 (自分の値 / 会社の値で並べる) | 0.8 / 0.6 µs | 34〜100 / 84〜154 µs |
+| 超大 batch (100 万件書いて 1 回 poll) | 0.21〜0.27 µs | 0.45〜0.50 µs |
+
+メモリは全条件で enchu が 2〜4 倍少ない。 購読の無い DB の書き込みコストは不変 (`tie_to`
+200k entity: 購読 0 本 = 0.26.14 と差なし / 別の列に購読 +2 ns / 同じ列に購読 +25 ns)。
+
+### Breaking — 移行ガイド
+
+- **`LivePred::{Eq, Range, In}` の値が u64** (u32 の変数は `.into()`)。 `LiveCounts::poll` 等の
+  group も u64、 `Agg.sum` は u128 (+ field `Agg.summed` = 値のあった根の数)
+- **engine の `get` / `get_by_id` が列の幅によらず `Option<u64>`** (`get64` / `get_by_id64` は
+  吸収して削除)。 Ref を eid に戻す所は `make_eid(peer, v as u32)`。 Ravn の `path` / `extract` /
+  `select`、 enchudb-rag の `meta_value` も u64
+- **`translate_remote_vid` / `try_translate_remote_vid` / `remote_tie_apply` / `set_cell` 系の値が
+  u64** (`remote_tie_apply` は `CellValue`)
+- **enum に variant が増えた**: `ValueType::Number64` / `EntityValue::Num64` / `ColumnType::BigInt`
+  (網羅 match は腕を足す)
+- schema: `LiveCounts::poll_sums` / `all_sums` / `get_sum` の合計が i128、 `where_gt` /
+  `where_range` 系は `Into<Value>` (u32 / i32 リテラルはそのまま通る)
+- **SQL: 新しく作る表の整数型 (`INTEGER` / `INT` / `SMALLINT` / `TINYINT` / `BIGINT` / unsigned 系)
+  は i64 の列になる** (SQLite と同じ 64 bit、 型名 `BIGINT` で保存、 値域 `i64::MIN..=i64::MAX - 1`)。
+  旧版で作った表の `INTEGER` 列は u32 のまま開く (`SqlType::Integer` はそのためだけに残る)
+- ⚠️ **64 bit 列を define した DB は FILE_VERSION 11** になり、 0.26 以前の binary では開けない。
+  u32 に入らない値は oplog / wire の新しい op (`Tie64`) で運ぶので、 **64 bit 列を持つ table を
+  sync する peer は全員 0.27 以上に揃えること**。 SQL で新しい表を作ると整数列が 64 bit なので
+  v11 になる点に注意 (binary の更新を先に)
+
+### Added — live query (#289 / #290 / #292 / #300 / #302〜#309 / #312 / #313)
+
+```rust
+let tokyo = users.where_eq("city", "Tokyo").subscribe()?;
+let d = tokyo.poll();        // d.added / d.removed
+```
+
+- **条件**: 等値 / 範囲 / In / OR (#289, #290)、 ref の道 (`company.city`)、 否定 (`where_ne` /
+  `where_not_in` / `where_null` / `where_not_null`)、 EXISTS / NOT EXISTS (`where_exists`、 #292)、
+  値で結ぶ準結合 (`where_exists_eq`、 #300)、 件数 / 和の閾値 (`where_count_ge` / `where_sum_ge` /
+  `subscribe_having*`、 #302 / #304)
+- **集計**: `subscribe_counts` / `subscribe_sums` (GROUP BY + COUNT / SUM)、 上位 k 件
+  (`order_by*(..).limit(k).subscribe()`)、 会社単位の購読 (`subscribe_grouped`)
+- **JOIN**: 組を返す `join_ref` / `join_eq` (#303)、 組の上の集計 (#305)、 3 table 以上
+  (`then_ref` / `then_eq`、 #306)、 範囲で結ぶ `join_range` (#312)、 engine の土台として鍵付きの購読
+  `Engine::subscribe_keyed`
+- **再帰**: 階層の配下 `under` / 上 `above` (#307 / #308)、 辺の table をたどる `reachable` (#309)
+- **window**: `lag` / `lag_all` (#313、 `LEAD` は組を裏返す)
+- **購読の束** `db.live_group()`: 束に入れた購読の差分だけをまとめて受け取る (同じ DB を使う
+  他の部品の購読の差分は横取りしない)
+- 状態はメモリ上だけ (reopen で購読し直し)、 通知は poll 型
+
+### Added — 64 bit 列 (#296 / #297)
+
+- engine `ValueType::Number64` (cell 8 B、 既存の列は u32 のまま)、 schema `BigInt` (i64、
+  `v ^ 2^63` で順序を保つ)、 SQL `BIGINT`。 主キー (sync の束ねも) / group / 合計 (i128) /
+  上位 k 件 / live の全機能が乗る。 `sum64` / `min64` / `max64`、 `sum_i128` / `min_i64` / `max_i64`
+- 大きな値 (≥ 2^20) の索引を値の順の run の組 (`SparseRuns`) に: 1.7e9 台の値 100 万件で索引の
+  RSS 145 → 34 MB、 書き換え 368-386 → 242-251 ns (u32 の列にも効く)
+- 範囲検索を索引の範囲で引く (値を 1 つずつ引くループを撤去)
+- packed 1 ファイル / relay の `GET /bootstrap` / wasm の `from_bytes` が 64 bit 列を運べる
+
+### Added — enchudb-connect / enchudb-kafka (#291)
+
+外から流れてくる行の変更を取り込み (`Ingest`、 `JsonRows` / `Debezium`)、 live 購読の差分を外へ
+流す (`LiveExport`)。 Kafka (Redpanda 等の互換含む) はそのアダプタ (`KafkaSource` / `KafkaSink`)。
+読んだ位置は DB の table に置くので再開できる。 64 bit 列への対応はまだ。
+
+### Fixed
+
+- **HLC の採番が並行時に同じ HLC を払い出していた** (#293 / #294)。 同期経路と async 経路が
+  別の lock で wall と logical を別々の atomic に書いていた。 relay の `(peer, hlc)` 重複除去で
+  record が落ちる / cursor で読み飛ばす / LWW の勝者が peer ごとに割れる可能性があった。
+  `(wall, logical)` を 1 つの Mutex に
+- **SQL: 列に入らない値の等値検索がエラーだった** (#298 / #299)。 `WHERE n = 4294967295` は
+  0 件を返す (書き込みは今どおり弾く)。 64 bit 列の `i64::MAX` も同じ扱い
+- **`join_ref` の購読が右の row の作り直し (eid の使い回し) を届けなかった** (#310 / #311)
+
+### 性能
+
+- batch で書いてから poll した時の印の整列を基数 sort に (#301): 所在地の書き換え 1000 人 ×
+  batch 100 で 2.33 → 3.72 万 ops/s
+- 再帰 / 到達 / 範囲 / LAG が自前の表を持たず、 鍵付きの購読の渡し済みの鍵から引く (#314)。
+  到達 1 件ずつ 6.4 → 36.5 万 ops/s、 上向きの一本道 DEPTH 10 万 504 → 113 万 ops/s
+  (p99 19 ms → 1.7 µs)、 深さ 10 万で最初の poll が返らなかったのを 0.8〜1.0 秒に
+
+### 検証
+
+- 各機能で 「poll の積分 == `find()` / 手でたどった結果」 の oracle test (各 800〜2000 step、
+  途中で購読を張り替える)、 fix / 各機構を外して落ちる変異
+- loom: `RUSTFLAGS="--cfg loom" cargo test -p enchudb-engine --test loom_live_subscribe --release`
+  (登録と並行する書き込みの barrier) / `--test loom_live_dirty` (印の shard の順序)
+- 実 consumer: sunsu2 (docs だけ読んだ naive consumer、 peer 分散 SNS) の 5 peer chaos で、 sync で
+  届いた書き込みに対するフィード / いいね数 / 集計が `find()` と一致 (seed 8 通り)
+- `cargo test --workspace --release`: 1263 passed / 0 failed (merge 後の master)
+
+### 既知の残り
+
+- 形の違う枝の OR での集計・上位 k 件は `Err`、 MIN / MAX の native 購読は無い (group ごとの
+  `limit(1)` で代用)、 ROW_NUMBER / RANK は無い (上位 k 件で)
+- `join_range` の `subscribe_counts` / `then_*` は未対応 (`BadValue`)
+- enchudb-connect の BigInt / Number64 対応
+- 下流 (hacg / sunsu2 / sinfo) は API の型の変更への追従が要る
+
 ## 0.26.14 — 2026-09-18
 
 **sync 配布の恒久停止 (brick) を根治した patch** (#268)。 on-disk format は**不変**、
