@@ -33,6 +33,8 @@ use crate::region::Region;
 #[derive(Debug, PartialEq)]
 pub enum EntityValue<'a> {
     Num(u32),
+    /// 64 bit 列 (`ValueType::Number64`) の値。
+    Num64(u64),
     Text(&'a [u8]),
     Content(&'a [u8]),
 }
@@ -1096,11 +1098,11 @@ impl Engine {
 
     /// v10: DB directory を **packed 1 ファイル** (= 旧 v9 の 1 ファイル layout と byte 互換、
     /// sparse) に書き出す。 relay の bootstrap 配布 / 転送 / wasm (`from_bytes`) 用。
-    /// 戻り値は packed の総サイズ (= `layout.total_size`、 見かけ)。
+    /// 戻り値は packed の総サイズ (= `layout.packed_size()`、 見かけ)。
     pub fn pack_dir(dir: &str, packed: &std::path::Path) -> io::Result<u64> {
         let (layout, himo_count) = Self::read_header_layout(dir)?;
         let mut out = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(packed)?;
-        out.set_len(layout.total_size as u64)?;
+        out.set_len(layout.packed_size() as u64)?;
         // seek で飛ばした全 0 range + region の未使用尾部。 最後にまとめて穴に戻す (APFS)。
         let mut holes: Vec<(u64, u64)> = Vec::new();
         for kind in Self::segment_kinds_for(&layout, himo_count) {
@@ -1120,7 +1122,7 @@ impl Engine {
         }
         punch_holes(&out, &holes)?;
         out.sync_all()?;
-        Ok(layout.total_size as u64)
+        Ok(layout.packed_size() as u64)
     }
 
     /// #246 / #257: 旧 1 ファイル layout (header 4096 固定、 entities region が 4096 から) で
@@ -1257,12 +1259,19 @@ impl Engine {
         src.read_exact(&mut fixed).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, format!("packed header too small: {e}"))
         })?;
-        let (layout, himo_count) = Self::parse_header(&fixed, true)
+        let (mut layout, himo_count) = Self::parse_header(&fixed, true)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        // 型 byte の表は先頭 4096 byte を超えうる。 64 bit 列の置き場所 (packed の末尾) は表全体から
+        if layout.header_size > fixed.len() {
+            let mut full = vec![0u8; layout.header_size];
+            src.seek(SeekFrom::Start(0))?;
+            src.read_exact(&mut full)?;
+            layout.load_wide(&full, himo_count);
+        }
         // legacy (v8 / v9): reservation を既定まで広げ、 EntitySet を新 layout に組み直す
         // (free stack の位置が bitset 容量で決まるので、 中身を動かす必要がある)
         let src_version = u32::from_le_bytes(fixed[H_VERSION..H_VERSION + 4].try_into().unwrap());
-        let legacy = src_version != FILE_VERSION;
+        let legacy = src_version < FILE_VERSION;
         let total = src.metadata()?.len();
         if legacy {
             let max_himos = u32::from_le_bytes(fixed[H_MAX_HIMOS..H_MAX_HIMOS + 4].try_into().unwrap());
@@ -1281,14 +1290,14 @@ impl Engine {
         let must_have = if legacy {
             (layout.region_off(SegmentKind::Entities) + layout.segment_size(SegmentKind::Entities)) as u64
         } else {
-            layout.total_size as u64
+            layout.packed_size() as u64
         };
         if total < must_have {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "packed file truncated: {} bytes (required {}, layout.total_size = {})",
-                    total, must_have, layout.total_size
+                    "packed file truncated: {} bytes (required {}, layout.packed_size = {})",
+                    total, must_have, layout.packed_size()
                 ),
             ));
         }
@@ -1614,7 +1623,7 @@ impl Backing {
     fn ensure_himo(&self, hid: u32, layout: &Layout) -> io::Result<()> {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
-            Backing::Segments(set) => set.ensure_himo(hid, layout.himo_col_size),
+            Backing::Segments(set) => set.ensure_himo(hid, layout.segment_size(SegmentKind::Himo(hid))),
             Backing::Memory(_) => {
                 let _ = layout;
                 Ok(())
@@ -1647,7 +1656,7 @@ impl Backing {
 use crate::append_vec::AppendVec;
 use crate::vocabulary::Vocabulary;
 use crate::entity_set::EntitySet;
-use crate::himo_store::{HimoStore, ValueType};
+use crate::himo_store::{CellValue, HimoStore, ValueType};
 use crate::content_store::ContentStore;
 use crate::leaf_store::{LeafRead, LeafStore, cap_bytes_for_shift, MAX_OFF_SHIFT};
 use crate::column::Column;
@@ -1678,6 +1687,11 @@ const FILE_MAGIC: [u8; 4] = *b"ECDB";
 /// 1 byte も変わらない (= migration 不要)。 version を上げるのは、 v9 領域を持つ DB を
 /// **旧 binary が開いて version column を無視したまま書く**のを止めるため。
 const FILE_VERSION: u32 = 10;
+/// v11: 64 bit 列 (`ValueType::Number64`、 cell 8B) を持つ DB。 layout は v10 と同じで、 64 bit 列の
+/// segment だけ cell が 8B (幅は header の型 byte が真実)。 **最初の 64 bit 列を define した時に** 刻む
+/// (使っていない DB は v10 のまま = 旧 binary でも開ける)。 旧 binary は v11 を unsupported version で
+/// 断る (型 byte 4 を u32 の Number と誤読させない)。 oplog の TIE64 / wire の Tie64 も v11 同士でだけ通じる。
+const FILE_VERSION_WIDE: u32 = 11;
 /// v9 = 1 ファイル固定 layout の最終版 (0.19〜0.25)。 v10 の packed 形式 (`from_bytes`) は
 /// byte 互換なので、 Memory backing に限り v9 の blob も受け入れる。
 const FILE_VERSION_LEGACY_V9: u32 = 9;
@@ -2096,6 +2110,12 @@ struct Layout {
     reserve_entities: u32,
     content_index_reserve: usize,
     himo_col_reserve: usize,
+    /// 64 bit 列 (cell 8B) の segment の大きさ / 予約。 どの紐が 64 bit かは `wide`。
+    himo_col_size64: usize,
+    himo_col_reserve64: usize,
+    /// 紐ごとに 64 bit 列か (header の型 byte = `ValueType::Number64` から復元、 define で足す)。
+    /// 足りない添字は u32 の列。 packed 形式では 64 bit 列は `total_size` の後ろ (`packed_size`)。
+    wide: Vec<bool>,
     ver_col_reserve: usize,
     tomb_reserve: usize,
 }
@@ -2370,6 +2390,9 @@ impl Layout {
             max_entities, reserve_entities,
             content_index_reserve: align8(ContentStore::index_region_size_for(reserve_entities)),
             himo_col_reserve: align8(Column::region_size(reserve_entities, 4)),
+            himo_col_size64: align8(Column::region_size(max_entities, 8)),
+            himo_col_reserve64: align8(Column::region_size(reserve_entities, 8)),
+            wide: Vec::new(),
             ver_col_reserve: align8(Column::region_size(reserve_entities, HLC_CELL_BYTES)),
             tomb_reserve: align8(Column::region_size(reserve_entities, HLC_CELL_BYTES)),
             cyl_max_values,
@@ -2380,6 +2403,35 @@ impl Layout {
     fn himo_col_off(&self, hid: usize) -> usize {
         self.himo_base_off + hid * self.himo_slot_size
     }
+    /// packed 形式の総サイズ。 64 bit 列は紐ごとの固定 slot (4B 幅) に入らないので、 `total_size` の
+    /// 後ろに紐の番号の順で `himo_col_size64` ずつ並べる (どの紐が 64 bit かは header の型 byte で決まる)。
+    fn packed_size(&self) -> usize {
+        self.total_size + self.wide.iter().filter(|&&w| w).count() * self.himo_col_size64
+    }
+
+    /// 紐 `hid` が 64 bit 列か。
+    fn is_wide(&self, hid: u32) -> bool {
+        self.wide.get(hid as usize).copied().unwrap_or(false)
+    }
+
+    /// 紐 `hid` を 64 bit 列にする (define / open)。
+    fn set_wide(&mut self, hid: u32) {
+        let i = hid as usize;
+        if self.wide.len() <= i {
+            self.wide.resize(i + 1, false);
+        }
+        self.wide[i] = true;
+    }
+
+    /// header の型 byte から 64 bit 列の表を復元する。
+    fn load_wide(&mut self, header: &[u8], himo_count: u32) {
+        for hid in 0..himo_count {
+            if header.get(H_HIMO_TYPES + hid as usize) == Some(&(ValueType::Number64 as u8)) {
+                self.set_wide(hid);
+            }
+        }
+    }
+
     /// v9 (request17-A): himo `hid` の version column 先頭 (HLC 16B の並び)。
     /// `ver_col_size == 0` の DB (pre-v9) には領域が無いので、 呼び側が先に
     /// `has_cell_version()` を確認すること。
@@ -2405,6 +2457,10 @@ impl Layout {
             SegmentKind::ContentData => self.content_data_off,
             SegmentKind::LeafData => self.leaf_data_off,
             SegmentKind::Tomb => self.tomb_off,
+            SegmentKind::Himo(h) if self.is_wide(h) => {
+                let rank = self.wide.iter().take(h as usize).filter(|&&w| w).count();
+                self.total_size + rank * self.himo_col_size64
+            }
             SegmentKind::Himo(h) => self.himo_col_off(h as usize),
             SegmentKind::Ver(h) => self.ver_col_off(h as usize),
         }
@@ -2427,6 +2483,7 @@ impl SegmentSizes for Layout {
             SegmentKind::ContentData => self.content_data_size,
             SegmentKind::LeafData => self.leaf_data_size,
             SegmentKind::Tomb => self.tomb_size,
+            SegmentKind::Himo(h) if self.is_wide(h) => self.himo_col_size64,
             SegmentKind::Himo(_) => self.himo_col_size,
             SegmentKind::Ver(_) => self.ver_col_size,
         }
@@ -2438,6 +2495,7 @@ impl SegmentSizes for Layout {
         match kind {
             SegmentKind::Entities => self.entities_size,
             SegmentKind::ContentIndex => self.content_index_reserve,
+            SegmentKind::Himo(h) if self.is_wide(h) => self.himo_col_reserve64,
             SegmentKind::Himo(_) => self.himo_col_reserve,
             SegmentKind::Ver(_) => self.ver_col_reserve,
             SegmentKind::Tomb => self.tomb_reserve,
@@ -3803,7 +3861,14 @@ impl Engine {
         Self::check_db_dir(path)?;
         let p = std::path::Path::new(path);
         let buf = SegmentSet::read_header(p, HEADER_SIZE)?;
-        Self::parse_header(&buf, false).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        let (mut layout, himo_count) =
+            Self::parse_header(&buf, false).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        // 型 byte の表は先頭 4096 byte を超えうる (紐 3840 本超の v10 header)。 64 bit 列の表は全体から
+        if layout.header_size > buf.len() {
+            let full = SegmentSet::read_header(p, layout.header_size)?;
+            layout.load_wide(&full, himo_count);
+        }
+        Ok((layout, himo_count))
     }
 
     /// header bytes → `(Layout, himo_count)`。 magic / CRC / version / field の整合を検証する。
@@ -3817,7 +3882,7 @@ impl Engine {
         let version = u32::from_le_bytes(buf[H_VERSION..H_VERSION + 4].try_into().unwrap());
         let legacy_packed = allow_legacy_packed
             && (FILE_VERSION_LEGACY_V8..=FILE_VERSION_LEGACY_V9).contains(&version);
-        if version != FILE_VERSION && !legacy_packed {
+        if version != FILE_VERSION && version != FILE_VERSION_WIDE && !legacy_packed {
             return Err(format!(
                 "unsupported EnchuDB file version {} (this build reads v{}; v8 / v9 single-file \
                  databases must be migrated with Engine::migrate_v9_to_v10, older ones are not supported)",
@@ -3853,7 +3918,7 @@ impl Engine {
         } else {
             u32::from_le_bytes(buf[H_RESERVE_ENTITIES..H_RESERVE_ENTITIES + 4].try_into().unwrap()).max(max_entities)
         };
-        let layout = Layout::try_from_params_with_header(
+        let mut layout = Layout::try_from_params_with_header(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
@@ -3862,6 +3927,7 @@ impl Engine {
             header_size,
             reserve_entities,
         )?;
+        layout.load_wide(buf, himo_count);
         Ok((layout, himo_count))
     }
 
@@ -3881,7 +3947,7 @@ impl Engine {
         }
         let guard = self.layout.read().unwrap();
         let l = &*guard;
-        let v9 = Layout::try_from_params(
+        let mut v9 = Layout::try_from_params(
             self.max_entities(), self.max_himos,
             l.vocab_max_entries, l.vocab_index_cap, l.vocab_data_size,
             l.himoreg_max_entries, l.himoreg_index_cap, l.himoreg_data_size,
@@ -3890,6 +3956,7 @@ impl Engine {
             l.reserve_entities,
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        v9.wide = l.wide.clone();
         drop(guard);
 
         // 順序: segment file を作る → column を組む → header flag。 逆にすると flag だけ
@@ -4063,17 +4130,21 @@ impl Engine {
     fn load_from_backing(backing: Backing, readonly: bool) -> Result<Self, String> {
         let hdr: &[u8] = backing.header_mut(HEADER_SIZE);
         let allow_legacy_packed = backing.memory_len().is_some();
-        let (layout, himo_count) = Self::parse_header(hdr, allow_legacy_packed)?;
+        let (mut layout, himo_count) = Self::parse_header(hdr, allow_legacy_packed)?;
         if let Some(n) = backing.memory_len() {
-            if n < layout.total_size {
+            // 64 bit 列の置き場所 (packed の末尾) は型 byte の表全体から (表は 4096 byte を超えうる)
+            if layout.header_size > HEADER_SIZE && n >= layout.header_size {
+                layout.load_wide(backing.header_mut(layout.header_size), himo_count);
+            }
+            if n < layout.packed_size() {
                 return Err(format!(
-                    "backing too small: {} bytes (layout.total_size = {}) — truncated file?",
-                    n, layout.total_size,
+                    "backing too small: {} bytes (layout.packed_size = {}) — truncated file?",
+                    n, layout.packed_size(),
                 ));
             }
             // #257: legacy blob は himo 表が entities region に食い込んでいることがある
             let version = u32::from_le_bytes(hdr[H_VERSION..H_VERSION + 4].try_into().unwrap());
-            if version != FILE_VERSION {
+            if version < FILE_VERSION {
                 let max_himos = u32::from_le_bytes(hdr[H_MAX_HIMOS..H_MAX_HIMOS + 4].try_into().unwrap());
                 let data: &[u8] = backing.header_mut(n);
                 let mut read_at = |off: u64, buf: &mut [u8]| -> io::Result<()> {
@@ -4499,7 +4570,7 @@ impl Engine {
         if let Some(lsn_hid) = self.himo_id("_sync_ops.lsn") {
             let hid = lsn_hid as u16;
             for eid in self.entities_with_himo(hid) {
-                if let Some(l) = self.get_by_id(eid, hid) {
+                if let Some(l) = self.get_by_id32(eid, hid) {
                     if l > max_lsn { max_lsn = l; }
                 }
             }
@@ -4507,7 +4578,7 @@ impl Engine {
         if let Some(cons_hid) = self.himo_id("_sync_peers.consumed_lsn") {
             let hid = cons_hid as u16;
             for eid in self.entities_with_himo(hid) {
-                if let Some(l) = self.get_by_id(eid, hid) {
+                if let Some(l) = self.get_by_id32(eid, hid) {
                     if l > max_lsn { max_lsn = l; }
                 }
             }
@@ -4694,10 +4765,10 @@ impl Engine {
                 let mut tie_ref: Option<(u64, u64)> = None; // (target_world, 元 row eid)
                 let ref_unsendable = match &rec.op {
                     enchudb_oplog::oplog::DecodedOp::Tie { eid, himo_id, value } => {
-                        if self.himo_is_ref(*himo_id)
-                            && self.eid_translator.is_translated_local(*value)
-                        {
-                            match self.eid_translator.reverse(*value) {
+                        // Ref の列は u32 (local eid)
+                        let ref_local = u32::try_from(*value).ok().filter(|_| self.himo_is_ref(*himo_id));
+                        if let Some(local) = ref_local.filter(|&l| self.eid_translator.is_translated_local(l)) {
+                            match self.eid_translator.reverse(local) {
                                 Some((owner, owner_local)) => {
                                     tie_ref = Some((
                                         enchudb_oplog::make_eid(owner, owner_local),
@@ -4713,7 +4784,7 @@ impl Engine {
                     }
                     enchudb_oplog::oplog::DecodedOp::TieNamed { himo_kind, value, .. } => {
                         *himo_kind == crate::himo_store::ValueType::Ref as u8
-                            && self.eid_translator.is_translated_local(*value)
+                            && u32::try_from(*value).is_ok_and(|l| self.eid_translator.is_translated_local(l))
                     }
                     _ => false,
                 };
@@ -5399,7 +5470,7 @@ impl Engine {
         let mut rows: Vec<(u32, u64)> = self
             .entities_with_himo(lsn_hid)
             .into_iter()
-            .filter_map(|eid| self.get_by_id(eid, lsn_hid).map(|lsn| (lsn, eid)))
+            .filter_map(|eid| self.get_by_id32(eid, lsn_hid).map(|lsn| (lsn, eid)))
             .filter(|(lsn, _)| *lsn > start)
             .collect();
         rows.sort_by_key(|r| r.0);
@@ -5421,7 +5492,7 @@ impl Engine {
         let mut known_authors: Option<std::collections::HashSet<u32>> = None;
         for (lsn, eid) in rows.iter() {
             let decoded = self
-                .get_by_id(*eid, payload_hid)
+                .get_by_id32(*eid, payload_hid)
                 .map(|vid| self.vocab.get(vid).to_vec())
                 .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b));
             match decoded {
@@ -5561,7 +5632,7 @@ impl Engine {
         expected_lsn: u32,
     ) -> bool {
         let _guard = self.sync_ops_purge_lock.lock().unwrap();
-        if self.get_by_id(eid, lsn_hid) != Some(expected_lsn) {
+        if self.get_by_id32(eid, lsn_hid) != Some(expected_lsn) {
             return false;
         }
         let meta = self
@@ -5588,7 +5659,7 @@ impl Engine {
         self.query_by_id(&[(peer_id_hid as u16, peer)])
             .into_iter()
             .next()
-            .and_then(|eid| self.get_by_id(eid, consumed_lsn_hid as u16))
+            .and_then(|eid| self.get_by_id32(eid, consumed_lsn_hid as u16))
             .unwrap_or(0)
     }
 
@@ -5666,7 +5737,7 @@ impl Engine {
     ) -> (u32, enchudb_oplog::Hlc) {
         let author = self
             .himo_id("_sync_ops.peer_id")
-            .and_then(|h| self.get_by_id(eid, h as u16))
+            .and_then(|h| self.get_by_id32(eid, h as u16))
             .filter(|a| known_authors.contains(a))
             .unwrap_or(u32::MAX);
         (author, self.mint_local_hlc())
@@ -5703,7 +5774,7 @@ impl Engine {
             return set;
         };
         for eid in self.entities_with_himo(lsn_hid as u16) {
-            let Some(vid) = self.get_by_id(eid, payload_hid as u16) else { continue };
+            let Some(vid) = self.get_by_id32(eid, payload_hid as u16) else { continue };
             let bytes = self.vocab.get(vid).to_vec();
             if let Some(rec) = enchudb_oplog::oplog::decode_sync_ops_payload(&bytes) {
                 set.insert(rec.author_peer);
@@ -5747,7 +5818,7 @@ impl Engine {
         let self_peer = self.peer_id();
         // 下流 (self を除く登録済み peer) が 1 つも無ければ判定材料が無い。
         let has_downstream = self.entities_with_himo(peer_id_hid).into_iter().any(|eid| {
-            match self.get_by_id(eid, peer_id_hid) {
+            match self.get_by_id32(eid, peer_id_hid) {
                 Some(pid) => self_peer == 0 || pid != self_peer,
                 None => false,
             }
@@ -5779,12 +5850,12 @@ impl Engine {
             && let Some(payload_hid) = self.himo_id("_sync_ops.payload")
         {
             for eid in self.entities_with_himo(lsn_hid as u16) {
-                let Some(lsn) = self.get_by_id(eid, lsn_hid as u16) else { continue };
+                let Some(lsn) = self.get_by_id32(eid, lsn_hid as u16) else { continue };
                 if lsn > watermark {
                     continue;
                 }
                 if let Some(rec) = self
-                    .get_by_id(eid, payload_hid as u16)
+                    .get_by_id32(eid, payload_hid as u16)
                     .map(|vid| self.vocab.get(vid).to_vec())
                     .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b))
                 {
@@ -5815,11 +5886,11 @@ impl Engine {
         let mut counted = false;
         for eid in peer_rows {
             if self_peer != 0 {
-                if let Some(pid) = self.get_by_id(eid, peer_id_hid as u16) {
+                if let Some(pid) = self.get_by_id32(eid, peer_id_hid as u16) {
                     if pid == self_peer { continue; }
                 }
             }
-            if let Some(v) = self.get_by_id(eid, consumed_lsn_hid as u16) {
+            if let Some(v) = self.get_by_id32(eid, consumed_lsn_hid as u16) {
                 counted = true;
                 if v < min_lsn { min_lsn = v; }
             }
@@ -5868,12 +5939,12 @@ impl Engine {
         let mut dead_raw_authors: Vec<u32> = Vec::new();
         let dead_peer_id_hid = self.himo_id("_sync_ops.peer_id").map(|h| h as u16);
         for eid in rows {
-            let Some(lsn) = self.get_by_id(eid, lsn_hid_u16) else { continue };
+            let Some(lsn) = self.get_by_id32(eid, lsn_hid_u16) else { continue };
             if lsn >= watermark {
                 continue;
             }
             let decoded = payload_hid
-                .and_then(|h| self.get_by_id(eid, h))
+                .and_then(|h| self.get_by_id32(eid, h))
                 .map(|vid| self.vocab.get(vid).to_vec())
                 .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b));
             if decoded.is_none() && lsn >= inflight_lsn {
@@ -5892,7 +5963,7 @@ impl Engine {
                 }
                 None => dead_raw_authors.push(
                     dead_peer_id_hid
-                        .and_then(|h| self.get_by_id(eid, h))
+                        .and_then(|h| self.get_by_id32(eid, h))
                         .unwrap_or(u32::MAX),
                 ),
             }
@@ -5983,7 +6054,7 @@ impl Engine {
         }
         let hid = self.himo_id("_sync_peers.reclaimed_floor")? as u16;
         let row = self.entities_with_himo(hid).into_iter().next()?;
-        let vid = self.get_by_id(row, hid)?;
+        let vid = self.get_by_id32(row, hid)?;
         let bytes = self.vocab.get(vid).to_vec();
         let hlc_at = |b: &[u8]| -> Option<enchudb_oplog::Hlc> {
             Some(enchudb_oplog::Hlc {
@@ -6208,7 +6279,9 @@ impl Engine {
                     let Some(&foreign_local) = foreign.get(&local) else { continue };
                     enchudb_oplog::make_eid(author, foreign_local)
                 };
-                let Some(value) = self.get_by_id(eid, himo_id) else { continue };
+                let Some(wide) = self.get_by_id(eid, himo_id) else { continue };
+                // Number64 以外の列は u32 (vid / local eid / leaf offset)
+                let value = wide as u32;
                 let mut hlc = self.version_of(local, himo_id);
                 if hlc == enchudb_oplog::Hlc::ZERO {
                     // self: 現在値が最新なので `as_of` stamp で LWW 的に安全。
@@ -6221,8 +6294,8 @@ impl Engine {
                     hlc = as_of;
                 }
                 match vt {
-                    ValueType::Number => {
-                        records.push(mk(DecodedOp::Tie { eid: out_eid, himo_id, value }, hlc));
+                    ValueType::Number | ValueType::Number64 => {
+                        records.push(mk(DecodedOp::Tie { eid: out_eid, himo_id, value: wide }, hlc));
                     }
                     ValueType::Ref => {
                         // bridge と同じ規則: translated foreign target は世界番号
@@ -6237,7 +6310,7 @@ impl Engine {
                                         DecodedOp::Tie {
                                             eid: out_eid,
                                             himo_id,
-                                            value: owner_local,
+                                            value: owner_local as u64,
                                         },
                                         hlc,
                                     ));
@@ -6260,7 +6333,7 @@ impl Engine {
                                 }
                             }
                         } else if is_self {
-                            records.push(mk(DecodedOp::Tie { eid: out_eid, himo_id, value }, hlc));
+                            records.push(mk(DecodedOp::Tie { eid: out_eid, himo_id, value: value as u64 }, hlc));
                         } else {
                             // replica: author の行が「自分が author した entity」を
                             // 指すことはない (それは翻訳先を持つ)。 導けないので skip。
@@ -6288,7 +6361,7 @@ impl Engine {
                             records.push(mk(DecodedOp::Vocab { vid: out_vid, bytes }, hlc));
                         }
                         records
-                            .push(mk(DecodedOp::Tie { eid: out_eid, himo_id, value: out_vid }, hlc));
+                            .push(mk(DecodedOp::Tie { eid: out_eid, himo_id, value: out_vid as u64 }, hlc));
                     }
                     ValueType::Leaf => {
                         let Some(bytes) = self.text_owned_by_id(hid, local) else { continue };
@@ -6401,7 +6474,7 @@ impl Engine {
         let lsn_hid = self.himo_id("_sync_ops.lsn")? as u16;
         let mut min_lsn: Option<u32> = None;
         for eid in self.entities_with_himo(lsn_hid) {
-            if let Some(l) = self.get_by_id(eid, lsn_hid) {
+            if let Some(l) = self.get_by_id32(eid, lsn_hid) {
                 min_lsn = Some(match min_lsn {
                     Some(m) if m <= l => m,
                     _ => l,
@@ -6424,12 +6497,12 @@ impl Engine {
         let rows = self.entities_with_himo(lsn_hid_u16);
         let mut pairs: Vec<(u32, Vec<u8>)> = Vec::new();
         for eid in rows {
-            let lsn = match self.get_by_id(eid, lsn_hid_u16) {
+            let lsn = match self.get_by_id32(eid, lsn_hid_u16) {
                 Some(l) => l,
                 None => continue,
             };
             if lsn <= since_lsn { continue; }
-            let payload_vid = match self.get_by_id(eid, payload_hid_u16) {
+            let payload_vid = match self.get_by_id32(eid, payload_hid_u16) {
                 Some(v) => v,
                 None => continue,
             };
@@ -7421,7 +7494,7 @@ impl Engine {
             ));
         }
         let l = &*layout;
-        let grown = Layout::try_from_params_with_header(
+        let mut grown = Layout::try_from_params_with_header(
             new_cap, self.max_himos,
             l.vocab_max_entries, l.vocab_index_cap, l.vocab_data_size,
             l.himoreg_max_entries, l.himoreg_index_cap, l.himoreg_data_size,
@@ -7431,6 +7504,7 @@ impl Engine {
             l.reserve_entities,
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        grown.wide = l.wide.clone();
         self.entities.grow(new_cap).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         // header が唯一の永続 truth (store は open 時に header から cap を受け取る)
         {
@@ -7928,8 +8002,8 @@ impl Engine {
     /// を直に呼ばないこと** — 呼ぶと live query がその書き込みを取りこぼす。
     /// 通知は `HimoStore::set` が write_lock を離した **後** (`crate::live` の lock 順序)。
     #[inline]
-    fn live_set(&self, hid: usize, local: u32, value: u32) -> bool {
-        let ok = self.himos[hid].set(local, value);
+    fn live_set(&self, hid: usize, local: u32, value: impl Into<u64>) -> bool {
+        let ok = self.himos[hid].set(local, value.into());
         if ok {
             self.live.touch(hid as u16, local);
         }
@@ -7944,6 +8018,17 @@ impl Engine {
         self.live.freed(local);
     }
 
+    /// `value` が紐 `hid` の幅に入るか。 入らなければ fault に積んで false (黙って切り詰めない)。
+    #[inline]
+    fn fits(&self, hid: usize, value: u64) -> bool {
+        let max = self.value_types.get(hid).map_or(u32::MAX as u64 - 1, |t| t.max_value());
+        if value > max {
+            self.record_fault(FaultKind::ValueOutOfRange, "value does not fit the column width (u32 column / sentinel)");
+            return false;
+        }
+        true
+    }
+
     /// `live_set` の外す版。 `himos[..].remove` を直に呼ばないこと (同上)。
     #[inline]
     fn live_remove(&self, hid: usize, local: u32) {
@@ -7954,7 +8039,12 @@ impl Engine {
     /// `set_cell` の local eid 版 (engine 内の write 経路用。 `check_writable` と
     /// himo_id の範囲チェックは呼び元が済ませている — 範囲外は他の write 経路と
     /// 同じく `himos[hid]` の panic になる)。
-    fn set_cell_local(&self, local: u32, himo_id: u16, value: u32, hlc: enchudb_oplog::Hlc) -> bool {
+    fn set_cell_local(&self, local: u32, himo_id: u16, value: impl Into<u64>, hlc: enchudb_oplog::Hlc) -> bool {
+        let value = value.into();
+        // 列の幅に入らない値 (u32 の列への大きな値、 sync で届いた幅違い) は書かない
+        if !self.fits(himo_id as usize, value) {
+            return false;
+        }
         if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
@@ -8575,7 +8665,7 @@ impl Engine {
     /// (silent None / free-list の hole header が payload に混ざった捏造 bytes)。
     fn take_leaf_cell(&self, eid: u32, hid: usize) -> Option<u32> {
         if self.leaf_for(hid).is_some() {
-            self.himos[hid].get_value(eid)
+            self.himos[hid].get_value32(eid)
         } else {
             None
         }
@@ -8589,7 +8679,7 @@ impl Engine {
 
     fn free_leaf_cell(&self, eid: u32, hid: usize) {
         if let Some(leaf) = self.leaf_for(hid)
-            && let Some(off) = self.himos[hid].get_value(eid)
+            && let Some(off) = self.himos[hid].get_value32(eid)
         {
             leaf.free(off);
         }
@@ -8607,8 +8697,9 @@ impl Engine {
         let mut live: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for hid in 0..self.himos.len() {
             if self.leaf_for(hid).is_some() {
+                // leaf の列は u32 (offset)
                 self.himos[hid].for_each_set_value(|off| {
-                    live.insert(off);
+                    live.insert(off as u32);
                 });
             }
         }
@@ -8664,9 +8755,10 @@ impl Engine {
         &self,
         eid: enchudb_oplog::EntityId,
         himo_id: u16,
-        value: u32,
+        value: impl CellValue,
         hlc: enchudb_oplog::Hlc,
     ) -> bool {
+        let Some(value) = self.cell_value(value) else { return false };
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
         if hid >= self.himos.len() { return false; }
@@ -8807,14 +8899,15 @@ impl Engine {
 
     /// Symbol 型 himo の Tie を受信した際、remote vid を local vid に変換する。
     /// Symbol 以外の himo、または mapping 未登録なら元値をそのまま返す。
-    pub fn translate_remote_vid(&self, author_peer: enchudb_oplog::PeerId, himo_id: u16, value: u32) -> u32 {
+    pub fn translate_remote_vid(&self, author_peer: enchudb_oplog::PeerId, himo_id: u16, value: u64) -> u64 {
         let hid = himo_id as usize;
         if hid >= self.value_types.len() { return value; }
-        // Tag / Leaf どちらも vocab 経由なので vid 翻訳が必要。
+        // Tag / Leaf どちらも vocab 経由なので vid 翻訳が必要 (vid は u32)。
         match self.value_types[hid] {
             ValueType::Tag | ValueType::Leaf => {
+                let Ok(vid) = u32::try_from(value) else { return value };
                 let map = self.peer_vocab_map.read().unwrap();
-                *map.get(&(author_peer, value)).unwrap_or(&value)
+                *map.get(&(author_peer, vid)).unwrap_or(&vid) as u64
             }
             _ => value,
         }
@@ -8831,14 +8924,15 @@ impl Engine {
         &self,
         author_peer: enchudb_oplog::PeerId,
         himo_id: u16,
-        value: u32,
-    ) -> Option<u32> {
+        value: u64,
+    ) -> Option<u64> {
         let hid = himo_id as usize;
         if hid >= self.value_types.len() { return Some(value); }
         match self.value_types[hid] {
             ValueType::Tag | ValueType::Leaf => {
+                let vid = u32::try_from(value).ok()?;
                 let map = self.peer_vocab_map.read().unwrap();
-                map.get(&(author_peer, value)).copied()
+                map.get(&(author_peer, vid)).map(|&v| v as u64)
             }
             _ => Some(value),
         }
@@ -9083,7 +9177,7 @@ impl Engine {
         if let Some(leaf) = self.leaf_for(hid) {
             // #119: insert → publish → free に揃える (この経路は `&mut self` = 並行 reader
             // なしなので実害はないが、 3 経路で順序が揃っていないと事故の温床になる)。
-            let old = self.himos[hid].get_value(eid);
+            let old = self.himos[hid].get_value32(eid);
             let off = leaf.insert(value.as_bytes());
             if off == u32::MAX {
                 // #167: leaf payload を書けなかった (commit を伸ばせない = ディスク
@@ -9122,10 +9216,12 @@ impl Engine {
         self.live_set(hid, eid, vid);
     }
 
-    pub fn tie(&mut self, eid: enchudb_oplog::EntityId, himo: &str, value: u32) {
+    pub fn tie(&mut self, eid: enchudb_oplog::EntityId, himo: &str, value: impl CellValue) {
         self.check_writable();
-        // sentinel は himo を定義する前に弾く (拒否された write で himo が生えない)。
-        if self.reject_sentinel(value, "tie value == u32::MAX (sentinel reserved)") {
+        // 幅は himo を定義する前に確かめる (拒否された write で himo が生えない)。 新しく生える himo は
+        // Number (u32)
+        let Some(value) = self.cell_value(value) else { return };
+        if !self.fits(self.himo_id(himo).unwrap_or(usize::MAX), value) {
             return;
         }
         let hid = self.ensure_himo(himo, ValueType::Number, 0);
@@ -9134,21 +9230,22 @@ impl Engine {
 
     /// #264: `tie` の himo_id 直指定版 (build phase = `&mut self`)。
     /// 契約は [`Engine::tie_text_by_id`] と同じ (検証を保つ / himo は定義しない)。
-    pub fn tie_by_id(&mut self, eid: enchudb_oplog::EntityId, himo_id: u16, value: u32) {
+    pub fn tie_by_id(&mut self, eid: enchudb_oplog::EntityId, himo_id: u16, value: impl CellValue) {
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
-        if self.reject_sentinel(value, "tie value == u32::MAX (sentinel reserved)") {
+        let hid = himo_id as usize;
+        let Some(value) = self.cell_value(value) else { return };
+        if !self.fits(hid, value) {
             return;
         }
-        let hid = himo_id as usize;
         debug_assert!(
-            self.value_types[hid] == ValueType::Number || self.value_types[hid] == ValueType::Ref,
+            matches!(self.value_types[hid], ValueType::Number | ValueType::Number64 | ValueType::Ref),
             "tie on non-Value himo '{}'", self.himo_name_at(hid).unwrap_or("<unknown>")
         );
         // β-light step 6: eid が himo の所属 table eid_range 内か
         self.validate_eid_for_himo(hid, eid);
-        // β-light step 5: Ref himo は target_table の eid range を validate
-        self.validate_ref_tie(hid, value);
+        // β-light step 5: Ref himo は target_table の eid range を validate (Ref の列は u32)
+        self.validate_ref_tie(hid, value as u32);
         self.live_set(hid, eid, value);
     }
 
@@ -9192,6 +9289,16 @@ impl Engine {
     /// #59: sentinel (`u32::MAX`) は cell に入らない。 panic せず write を拒否 + 計上して
     /// true を返す (呼び出し側はそのまま return する)。 `tie` / `tie_ref` の名前版と
     /// id 版で同じ判定を使うための共通化。
+    /// 値の入口 (`CellValue`)。 負の数は fault に積んで None。
+    fn cell_value(&self, v: impl CellValue) -> Option<u64> {
+        let r = v.cell_value();
+        if r.is_none() {
+            self.record_fault(FaultKind::ValueOutOfRange, "negative value (cell values are unsigned)");
+        }
+        r
+    }
+
+    #[allow(dead_code)]
     fn reject_sentinel(&self, value: u32, what: &str) -> bool {
         if value != u32::MAX {
             return false;
@@ -9227,7 +9334,7 @@ impl Engine {
         //     旧 offset を掴んだ reader は column 再読 (get_text_owned) で stale を検出。
         if let Some(leaf) = self.leaf_for(hid) {
             let bytes = value.as_bytes();
-            let old = self.himos[hid].get_value(eid);
+            let old = self.himos[hid].get_value32(eid);
             let off = leaf.insert(bytes);
             if off == u32::MAX {
                 // #167: leaf payload を書けなかった (commit を伸ばせない = ディスク
@@ -9293,7 +9400,7 @@ impl Engine {
                 let _ = wal.append(enchudb_oplog::oplog::Op::Vocab { vid, bytes: value.as_bytes() });
             }
             self.append_local_op(
-                enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid },
+                enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid as u64 },
             )
         };
         if !self.set_cell_local(eid, himo_id, vid, hlc) {
@@ -9348,7 +9455,7 @@ impl Engine {
             // 旧 offset を掴んでいる並行 reader が再利用 slot を読んで seqlock retry を
             // 使い切り None になる — content 経路で実測 8,132/60,463 件)。
             // 既に `tie_text_to_by_id` はこの順序。
-            let old = self.himos[hid].get_value(eid);
+            let old = self.himos[hid].get_value32(eid);
             let off = leaf.insert(value);
             if off == u32::MAX {
                 // #167: leaf payload を書けなかった (commit を伸ばせない = ディスク
@@ -9410,11 +9517,11 @@ impl Engine {
                     eid: oplog_eid,
                     himo_name: &self.himo_names[hid],
                     himo_kind: self.value_types[hid] as u8,
-                    value: vid,
+                    value: vid as u64,
                 })
             } else {
                 self.append_local_op(
-                    enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid },
+                    enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid as u64 },
                 )
             }
         };
@@ -9424,25 +9531,23 @@ impl Engine {
     }
 
     /// 定義済みの紐にu32値を張る。&selfで呼べる。
-    pub fn tie_to(&self, eid: enchudb_oplog::EntityId, himo: &str, value: u32) {
+    pub fn tie_to(&self, eid: enchudb_oplog::EntityId, himo: &str, value: impl CellValue) {
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo)) as u16;
         self.tie_to_by_id(eid, hid, value);
     }
 
     /// `tie_to` の himo_id 直指定版。 hot path 用 (string lookup を避ける)。
-    pub fn tie_to_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: u32) {
+    pub fn tie_to_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: impl CellValue) {
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
-        if value == u32::MAX {
-            // #59: sentinel 値は cell に入らない。 panic せず write を拒否 + 計上。
-            self.record_fault(
-                FaultKind::ValueOutOfRange,
-                "tie value == u32::MAX (sentinel reserved)",
-            );
+        let hid = himo_id as usize;
+        // #59: 列の幅に入らない値 (sentinel 含む) は cell に入らない。 panic せず write を拒否 + 計上。
+        // WAL に載せる前に弾く
+        let Some(value) = self.cell_value(value) else { return };
+        if !self.fits(hid, value) {
             return;
         }
-        let hid = himo_id as usize;
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         // Tag / Leaf 型 (vocab_id を value として持つ) も許可。 schema 層が
@@ -9493,7 +9598,7 @@ impl Engine {
         // request17 step 4: WAL 先行で採番し、 その HLC で値と版数を不可分に書く。
         let oplog_eid = self.oplog_eid(eid);
         let hlc = self.append_local_op(
-            enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: target_eid },
+            enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: target_eid as u64 },
         );
         if !self.set_cell_local(eid, himo_id, target_eid, hlc) {
             self.warn_local_write_rejected(eid, himo_id, hlc);
@@ -9639,7 +9744,7 @@ impl Engine {
         let local = enchudb_oplog::eid_local(eid);
         // 新経路 (`_c_{key}` Leaf himo) 優先
         if let Some(hid) = self.content_himo_id(local, key) {
-            if let Some(vid) = self.get_by_id(eid, hid) {
+            if let Some(vid) = self.get_by_id32(eid, hid) {
                 return Some(self.text_value(hid as usize, vid));
             }
         }
@@ -9743,7 +9848,7 @@ impl Engine {
         // Tag は vocab、 routed-Leaf (#88) は LeafStore、 reserved Leaf は vocab。
         match self.value_types[hid] {
             ValueType::Tag | ValueType::Leaf => {
-                let raw = self.himos[hid].get_value(eid)?;
+                let raw = self.himos[hid].get_value32(eid)?;
                 Some(self.text_value(hid, raw))
             }
             _ => None,
@@ -9814,7 +9919,7 @@ impl Engine {
                             }
                         }
                         attempt += 1;
-                        let raw = self.himos[hid].get_value(eid_local)?;
+                        let raw = self.himos[hid].get_value32(eid_local)?;
                         // slot 内の seqlock (gen) で torn / 同 offset 再利用を検出。
                         let LeafRead::Ok(bytes) = leaf.try_read(raw) else {
                             let probe = (raw, leaf.slot_stamp(raw));
@@ -9830,7 +9935,7 @@ impl Engine {
                             continue;
                         };
                         // column offset を再読。 不変なら relocation も無かった = 確定。
-                        if self.himos[hid].get_value(eid_local) == Some(raw) {
+                        if self.himos[hid].get_value32(eid_local) == Some(raw) {
                             return Some(bytes);
                         }
                         // Ok だが column が動いた = writer 前進 (別 offset へ relocation)。
@@ -9840,7 +9945,7 @@ impl Engine {
                 }
                 // Tag / reserved Leaf: 不変な vocab bytes を copy。
                 None => {
-                    let raw = self.himos[hid].get_value(eid_local)?;
+                    let raw = self.himos[hid].get_value32(eid_local)?;
                     Some(self.vocab.get(raw).to_vec())
                 }
             },
@@ -9848,7 +9953,8 @@ impl Engine {
         }
     }
 
-    pub fn get(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Option<u32> {
+    /// entity の紐の値。 列の幅によらず u64 (u32 の列の値もそのまま広げて返す)。
+    pub fn get(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Option<u64> {
         let eid = enchudb_oplog::eid_local(eid);
         let hid = self.himo_id(himo)?;
         self.himos[hid].get_value(eid)
@@ -9856,9 +9962,15 @@ impl Engine {
 
     /// `get` の bindings 版。 schema 等で `himo_id` を起動時に pre-resolve した hot path 用。
     /// 名前 lookup (= himo_names の線形検索) が無くなるので point lookup が最速。
-    pub fn get_by_id(&self, eid: enchudb_oplog::EntityId, hid: u16) -> Option<u32> {
+    pub fn get_by_id(&self, eid: enchudb_oplog::EntityId, hid: u16) -> Option<u64> {
         let eid = enchudb_oplog::eid_local(eid);
         self.himos.get(hid as usize)?.get_value(eid)
+    }
+
+    /// u32 の列 (vocab id / ref / engine 内部の table の列) を u32 で読む。 64 bit 列で panic。
+    pub(crate) fn get_by_id32(&self, eid: enchudb_oplog::EntityId, hid: u16) -> Option<u32> {
+        let eid = enchudb_oplog::eid_local(eid);
+        self.himos.get(hid as usize)?.get_value32(eid)
     }
 
     /// `get_by_id` の bulk 版。 同 himo の N entity を一括 column scan で `out` に append。
@@ -9907,7 +10019,7 @@ impl Engine {
         let hs = &self.himos[hid];
         let mut total: u64 = 0;
         for &eid in eids {
-            if let Some(v) = hs.get_value(enchudb_oplog::eid_local(eid)) {
+            if let Some(v) = hs.get_value32(enchudb_oplog::eid_local(eid)) {
                 total += v as u64;
             }
         }
@@ -10553,7 +10665,7 @@ impl Engine {
         let hs = &self.himos[hid];
         let mut result: Option<u32> = None;
         for &eid in eids {
-            if let Some(v) = hs.get_value(enchudb_oplog::eid_local(eid)) {
+            if let Some(v) = hs.get_value32(enchudb_oplog::eid_local(eid)) {
                 result = Some(result.map_or(v, |cur: u32| cur.min(v)));
             }
         }
@@ -10566,7 +10678,7 @@ impl Engine {
         let hs = &self.himos[hid];
         let mut result: Option<u32> = None;
         for &eid in eids {
-            if let Some(v) = hs.get_value(enchudb_oplog::eid_local(eid)) {
+            if let Some(v) = hs.get_value32(enchudb_oplog::eid_local(eid)) {
                 result = Some(result.map_or(v, |cur: u32| cur.max(v)));
             }
         }
@@ -10580,7 +10692,7 @@ impl Engine {
         let mut total: u64 = 0;
         let mut count: u64 = 0;
         for &eid in eids {
-            if let Some(v) = hs.get_value(enchudb_oplog::eid_local(eid)) {
+            if let Some(v) = hs.get_value32(enchudb_oplog::eid_local(eid)) {
                 total += v as u64;
                 count += 1;
             }
@@ -10614,7 +10726,7 @@ impl Engine {
             let mut seen: Vec<bool> = vec![false; cap];
             for &eid in eids {
                 let local = enchudb_oplog::eid_local(eid);
-                if let (Some(group), Some(val)) = (gs.get_value(local), ss.get_value(local)) {
+                if let (Some(group), Some(val)) = (gs.get_value32(local), ss.get_value32(local)) {
                     let i = group as usize;
                     sums[i] += val as u64;
                     seen[i] = true;
@@ -10625,7 +10737,7 @@ impl Engine {
             let mut map: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
             for &eid in eids {
                 let local = enchudb_oplog::eid_local(eid);
-                if let (Some(group), Some(val)) = (gs.get_value(local), ss.get_value(local)) {
+                if let (Some(group), Some(val)) = (gs.get_value32(local), ss.get_value32(local)) {
                     *map.entry(group).or_insert(0) += val as u64;
                 }
             }
@@ -10691,7 +10803,7 @@ impl Engine {
         if let Some(cap) = self.group_dense_cap(gid) {
             let mut counts: Vec<u32> = vec![0; cap];
             for &eid in eids {
-                if let Some(group) = gs.get_value(enchudb_oplog::eid_local(eid)) {
+                if let Some(group) = gs.get_value32(enchudb_oplog::eid_local(eid)) {
                     counts[group as usize] += 1;
                 }
             }
@@ -10699,7 +10811,7 @@ impl Engine {
         } else {
             let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for &eid in eids {
-                if let Some(group) = gs.get_value(enchudb_oplog::eid_local(eid)) {
+                if let Some(group) = gs.get_value32(enchudb_oplog::eid_local(eid)) {
                     *map.entry(group).or_insert(0) += 1;
                 }
             }
@@ -10718,7 +10830,7 @@ impl Engine {
             let mut seen: Vec<bool> = vec![false; cap];
             for &eid in eids {
                 let local = enchudb_oplog::eid_local(eid);
-                if let (Some(group), Some(val)) = (gs.get_value(local), vs.get_value(local)) {
+                if let (Some(group), Some(val)) = (gs.get_value32(local), vs.get_value32(local)) {
                     let i = group as usize;
                     if val < mins[i] { mins[i] = val; }
                     seen[i] = true;
@@ -10729,7 +10841,7 @@ impl Engine {
             let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for &eid in eids {
                 let local = enchudb_oplog::eid_local(eid);
-                if let (Some(group), Some(val)) = (gs.get_value(local), vs.get_value(local)) {
+                if let (Some(group), Some(val)) = (gs.get_value32(local), vs.get_value32(local)) {
                     let entry = map.entry(group).or_insert(u32::MAX);
                     if val < *entry { *entry = val; }
                 }
@@ -10749,7 +10861,7 @@ impl Engine {
             let mut seen: Vec<bool> = vec![false; cap];
             for &eid in eids {
                 let local = enchudb_oplog::eid_local(eid);
-                if let (Some(group), Some(val)) = (gs.get_value(local), vs.get_value(local)) {
+                if let (Some(group), Some(val)) = (gs.get_value32(local), vs.get_value32(local)) {
                     let i = group as usize;
                     if val > maxs[i] { maxs[i] = val; }
                     seen[i] = true;
@@ -10760,7 +10872,7 @@ impl Engine {
             let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for &eid in eids {
                 let local = enchudb_oplog::eid_local(eid);
-                if let (Some(group), Some(val)) = (gs.get_value(local), vs.get_value(local)) {
+                if let (Some(group), Some(val)) = (gs.get_value32(local), vs.get_value32(local)) {
                     let entry = map.entry(group).or_insert(0);
                     if val > *entry { *entry = val; }
                 }
@@ -10780,7 +10892,7 @@ impl Engine {
             let mut cnts: Vec<u64> = vec![0; cap];
             for &eid in eids {
                 let local = enchudb_oplog::eid_local(eid);
-                if let (Some(group), Some(val)) = (gs.get_value(local), vs.get_value(local)) {
+                if let (Some(group), Some(val)) = (gs.get_value32(local), vs.get_value32(local)) {
                     let i = group as usize;
                     sums[i] += val as u64;
                     cnts[i] += 1;
@@ -10791,7 +10903,7 @@ impl Engine {
             let mut acc: std::collections::HashMap<u32, (u64, u64)> = std::collections::HashMap::new();
             for &eid in eids {
                 let local = enchudb_oplog::eid_local(eid);
-                if let (Some(group), Some(val)) = (gs.get_value(local), vs.get_value(local)) {
+                if let (Some(group), Some(val)) = (gs.get_value32(local), vs.get_value32(local)) {
                     let e = acc.entry(group).or_insert((0, 0));
                     e.0 += val as u64;
                     e.1 += 1;
@@ -10815,8 +10927,10 @@ impl Engine {
         let hs = &self.himos[hid];
         let mut result: Vec<u32> = Vec::new();
         for &eid in eids {
-            if let Some(v) = hs.get_value(enchudb_oplog::eid_local(eid)) {
-                if !result.contains(&v) { result.push(v); }
+            if let Some(v) = hs.get_value32(enchudb_oplog::eid_local(eid))
+                && !result.contains(&v)
+            {
+                result.push(v);
             }
         }
         result
@@ -10867,7 +10981,8 @@ impl Engine {
         use rayon::prelude::*;
         let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
         let hs = &self.himos[hid];
-        if eids.len() < Self::PAR_RANGE_THRESHOLD {
+        // 64 bit 列は u32 の生の配列を持たない (件数は幅によらない数え方で)
+        if eids.len() < Self::PAR_RANGE_THRESHOLD || hs.value_type == ValueType::Number64 {
             return self.count(himo, eids);
         }
         let values = hs.stored_slice();
@@ -11163,16 +11278,44 @@ impl Engine {
     // ──── 範囲クエリ ────
 
     /// 範囲内の全値に合致する entity を返す（min..=max）
-    pub fn pull_range(&self, himo: &str, min: u32, max: u32) -> Vec<enchudb_oplog::EntityId> {
+    /// 値が `min..=max` の entity (両端を含む)。 64 bit 列にも使える。 索引の範囲を引いて Column で
+    /// 確かめる (値を 1 つずつ引かない — 広い範囲 / 64 bit の範囲でも範囲内の件数に比例)。 結果は eid の昇順。
+    pub fn pull_range(&self, himo: &str, min: impl CellValue, max: impl CellValue) -> Vec<enchudb_oplog::EntityId> {
         let idx = match self.himo_id(himo) { Some(h) => h, None => return vec![] };
-        let hs = &self.himos[idx];
-        let mut result = Vec::new();
-        for v in min..=max {
-            for local in &hs.pull(v) {
-                result.push(*local as enchudb_oplog::EntityId);
-            }
-        }
-        result
+        let (Some(min), Some(max)) = (min.cell_value(), max.cell_value()) else { return vec![] };
+        self.himos[idx].pull_range(min, max).into_iter().map(|e| e as enchudb_oplog::EntityId).collect()
+    }
+
+    /// 64 bit の合計 (どの列でも。 u64 の和が溢れないよう u128)。 値の無い entity は数えない。
+    pub fn sum64(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> u128 {
+        let Some(hid) = self.himo_id(himo) else { return 0 };
+        let hs = &self.himos[hid];
+        eids.iter().filter_map(|&e| hs.get_value(enchudb_oplog::eid_local(e))).map(|v| v as u128).sum()
+    }
+
+    /// 64 bit の最小値 (どの列でも)。
+    pub fn min64(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u64> {
+        let hs = &self.himos[self.himo_id(himo)?];
+        eids.iter().filter_map(|&e| hs.get_value(enchudb_oplog::eid_local(e))).min()
+    }
+
+    /// 64 bit の最大値 (どの列でも)。
+    pub fn max64(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Option<u64> {
+        let hs = &self.himos[self.himo_id(himo)?];
+        eids.iter().filter_map(|&e| hs.get_value(enchudb_oplog::eid_local(e))).max()
+    }
+
+    /// eid の範囲 `lo..hi` での 64 bit の (件数, 合計, 最小, 最大) (table の全 row の集計用、 どの列でも)。
+    pub fn stats_range64(&self, himo: &str, lo: u32, hi: u32) -> (u64, u128, Option<u64>, Option<u64>) {
+        let Some(hid) = self.himo_id(himo) else { return (0, 0, None, None) };
+        let (mut n, mut sum, mut min, mut max) = (0u64, 0u128, None::<u64>, None::<u64>);
+        self.himos[hid].for_each_in(lo, hi, |_, v| {
+            n += 1;
+            sum += v as u128;
+            min = Some(min.map_or(v, |m| m.min(v)));
+            max = Some(max.map_or(v, |m| m.max(v)));
+        });
+        (n, sum, min, max)
     }
 
     // ──── 日付ヘルパー ────
@@ -11213,9 +11356,10 @@ impl Engine {
         self.tie(eid, himo, Self::date_to_days(year, month, day));
     }
 
-    /// epoch 日数から (year, month, day) を返す
+    /// epoch 日数から (year, month, day) を返す。 値が無い時と、 64 bit 列の値が日付でない
+    /// (u32 を超える日数 = 約 1,170 万年より先、 年が u32 に入らない) 時は None
     pub fn get_date(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Option<(u32, u32, u32)> {
-        self.get(eid, himo).map(Self::days_to_date)
+        self.get(eid, himo).and_then(|d| u32::try_from(d).ok()).map(Self::days_to_date)
     }
 
     /// 日付範囲で pull_range
@@ -11244,6 +11388,8 @@ impl Engine {
         let text_bytes = text.as_bytes();
         let vals = self.himos[hid].unique_values();
         for vid in vals {
+            // Tag の列は u32 (vid)。 64 bit 列の値は vid ではない
+            let Ok(vid) = u32::try_from(vid) else { continue };
             if self.vocab.get(vid) == text_bytes {
                 return Some(vid);
             }
@@ -11265,8 +11411,10 @@ impl Engine {
         for (i, hs) in self.himos.iter().enumerate() {
             if let Some(raw) = hs.get_value(eid) {
                 let val = match self.value_types[i] {
-                    ValueType::Tag | ValueType::Leaf => EntityValue::Text(self.text_value(i, raw)),
-                    _ => EntityValue::Num(raw),
+                    // Tag / Leaf / Number / Ref の列は u32
+                    ValueType::Tag | ValueType::Leaf => EntityValue::Text(self.text_value(i, raw as u32)),
+                    ValueType::Number64 => EntityValue::Num64(raw),
+                    _ => EntityValue::Num(raw as u32),
                 };
                 fields.push((self.himo_names[i].as_str(), val));
             }
@@ -11340,18 +11488,19 @@ impl Engine {
     }
 
     /// 引く。 EntityId(u64) の Vec を返す。
-    pub fn pull_raw(&self, himo: &str, value: u32) -> Vec<enchudb_oplog::EntityId> {
-        match self.himo_id(himo) {
-            Some(idx) => self.himos[idx].pull(value).into_iter().map(|e| e as enchudb_oplog::EntityId).collect(),
-            None => Vec::new(),
+    /// 値は u32 / u64 / 負でない整数 (負の数は 0 件)。
+    pub fn pull_raw(&self, himo: &str, value: impl CellValue) -> Vec<enchudb_oplog::EntityId> {
+        match (self.himo_id(himo), value.cell_value()) {
+            (Some(idx), Some(v)) => self.himos[idx].pull(v).into_iter().map(|e| e as enchudb_oplog::EntityId).collect(),
+            _ => Vec::new(),
         }
     }
 
     /// 引く。 HimoStore::pull (RwLock + clone) 直。
-    pub fn pull(&self, himo: &str, value: u32) -> Vec<u32> {
-        match self.himo_id(himo) {
-            Some(idx) => self.himos[idx].pull(value),
-            None => Vec::new(),
+    pub fn pull(&self, himo: &str, value: impl CellValue) -> Vec<u32> {
+        match (self.himo_id(himo), value.cell_value()) {
+            (Some(idx), Some(v)) => self.himos[idx].pull(v),
+            _ => Vec::new(),
         }
     }
 
@@ -11371,7 +11520,14 @@ impl Engine {
         self.pull_in_by_idx(idx, values)
     }
 
-    fn pull_in_by_idx(&self, idx: usize, values: &[u32]) -> Vec<enchudb_oplog::EntityId> {
+    /// `pull_in_by_id` の 64 bit 値版。
+    pub fn pull_in_by_id64(&self, himo_id: u16, values: &[u64]) -> Vec<enchudb_oplog::EntityId> {
+        let idx = himo_id as usize;
+        if idx >= self.himos.len() { return Vec::new(); }
+        self.pull_in_by_idx(idx, values)
+    }
+
+    fn pull_in_by_idx<V: CellValue>(&self, idx: usize, values: &[V]) -> Vec<enchudb_oplog::EntityId> {
         if values.is_empty() { return Vec::new(); }
         let mut out: Vec<u32> = Vec::new();
         for &v in values {
@@ -11503,8 +11659,10 @@ impl Engine {
         group_himo: u16,
         sum_himo: u16,
     ) -> std::io::Result<crate::live::LiveCounts> {
-        if sum_himo as usize >= self.himos.len() || self.value_type_at(sum_himo as usize) != Some(ValueType::Number) {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "sum himo is not a Number himo"));
+        if sum_himo as usize >= self.himos.len()
+            || !matches!(self.value_type_at(sum_himo as usize), Some(ValueType::Number | ValueType::Number64))
+        {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "sum himo is not a Number / Number64 himo"));
         }
         self.subscribe_agg(preds, group_path, group_himo, Some(sum_himo))
     }
@@ -11643,9 +11801,15 @@ impl Engine {
     /// schema 層用: himo_id を pre-resolve 済みの場合の高速 path。 名前 lookup を完全に skip。
     /// 同一 entity の AND 条件として扱う。 himo_id が範囲外なら空 Vec。
     pub fn query_by_id(&self, conds: &[(u16, u32)]) -> Vec<enchudb_oplog::EntityId> {
+        let wide: Vec<(u16, u64)> = conds.iter().map(|&(h, v)| (h, v as u64)).collect();
+        self.query_by_id64(&wide)
+    }
+
+    /// `query_by_id` の 64 bit 値版 (64 bit 列の等値を含む AND)。
+    pub fn query_by_id64(&self, conds: &[(u16, u64)]) -> Vec<enchudb_oplog::EntityId> {
         if conds.is_empty() { return Vec::new(); }
         let himo_count = self.himos.len();
-        let mut idx_conds: Vec<(usize, u32)> = Vec::with_capacity(conds.len());
+        let mut idx_conds: Vec<(usize, u64)> = Vec::with_capacity(conds.len());
         for &(hid, val) in conds {
             let idx = hid as usize;
             if idx >= himo_count { return Vec::new(); }
@@ -11665,10 +11829,10 @@ impl Engine {
     fn query_u32(&self, strings: &[(&str, u32)]) -> Vec<u32> {
         if strings.is_empty() { return vec![]; }
         // 全条件の himo index と value を解決
-        let mut conds: Vec<(usize, u32)> = Vec::with_capacity(strings.len());
+        let mut conds: Vec<(usize, u64)> = Vec::with_capacity(strings.len());
         for &(himo, val) in strings {
             match self.himo_id(himo) {
-                Some(idx) => conds.push((idx, val)),
+                Some(idx) => conds.push((idx, val as u64)),
                 None => return vec![],
             }
         }
@@ -11676,7 +11840,7 @@ impl Engine {
     }
 
     /// resolved conds (himo_index, value) に対する query 本体。 strategy 自動選択。
-    fn query_resolved(&self, conds: &[(usize, u32)]) -> Vec<u32> {
+    fn query_resolved(&self, conds: &[(usize, u64)]) -> Vec<u32> {
         // delta が溢れた himo があれば rebuild
         for hs in &self.himos {
             if hs.delta_needs_rebuild() { hs.rebuild_cylinder(); }
@@ -11696,7 +11860,7 @@ impl Engine {
     }
 
     /// Column直読みフィルタ（delta 補正付き）
-    fn query_column_filter(&self, conds: &[(usize, u32)]) -> Vec<u32> {
+    fn query_column_filter(&self, conds: &[(usize, u64)]) -> Vec<u32> {
         let total = self.entities.next_eid() as usize;
         // 各 cond の slice_len を事前計算 (per-eid 呼ばないように外出し)
         let slice_lens: Vec<usize> = conds.iter()
@@ -11820,9 +11984,20 @@ impl Engine {
             ));
         }
 
+        let wide = ht == ValueType::Number64;
+        if wide && self.backing.memory_len().is_some() && !self.layout.read().unwrap().is_wide(hid as u32) {
+            // packed の 64 bit 列は blob の末尾に置く (`packed_size`)。 blob は伸ばせないので、 新しく作るのは
+            // directory の DB で (既に 64 bit 列を持つ packed は開ける)
+            return Err("new 64-bit columns (Number64) need a file-backed (directory) database".into());
+        }
+
         self.himo_reg.get_or_insert(himo.as_bytes());
 
         let effective_mv = max_values.min(self.layout.read().unwrap().cyl_max_values);
+        if wide {
+            // segment を作る前に幅を載せる (segment の大きさ / 予約が 8B 幅になる)
+            self.layout.write().unwrap().set_wide(hid as u32);
+        }
         // v10: himo 列 (と版数列) の segment file をここで作る。 crash で file だけ残った
         // 場合 (header の count 更新前) は SegmentSet 側が open で回収する。
         self.backing
@@ -11881,6 +12056,10 @@ impl Engine {
         buf[mv_off..mv_off + 4].copy_from_slice(&max_values.to_le_bytes());
         let himo_count = (hid + 1) as u32;
         buf[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&himo_count.to_le_bytes());
+        if wide {
+            // v11: 64 bit 列を持つ DB は旧 binary に開かせない (型 byte 4 を u32 の Number と誤読する)
+            buf[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION_WIDE.to_le_bytes());
+        }
         // header CRC を再計算(himo_count が変わったため)
         write_header_crc(buf);
 
@@ -12137,8 +12316,9 @@ impl Engine {
             DecodedOp::Tie { eid, himo_id, value } => {
                 let Some(le) = self.resolve_remote_eid(*eid, *himo_id) else { return };
                 let v = if self.himo_is_ref(*himo_id) {
-                    match self.resolve_remote_ref_value(author, *value, *himo_id) {
-                        Some(v) => v,
+                    let Ok(value) = u32::try_from(*value) else { return }; // Ref の列は u32
+                    match self.resolve_remote_ref_value(author, value, *himo_id) {
+                        Some(v) => v as u64,
                         None => return,
                     }
                 } else {
@@ -13038,7 +13218,7 @@ impl Engine {
                     // 不採用: cell は旧値のまま = 旧 payload はまだ生きている。
                     // 代わりに push 側が確保済みの **新** payload (= value) を捨てる
                     // (routed-Leaf 以外では no-op)。
-                    self.free_leaf_offset(hid, Some(value));
+                    self.free_leaf_offset(hid, Some(value as u32)); // leaf の列は u32 (offset)
                     self.warn_local_write_rejected(eid, himo_id, hlc);
                 }
             }
@@ -13078,7 +13258,7 @@ impl Engine {
     ///
     /// WAL が有効な場合: tie_async は WAL append (memcpy) → WriteQueue push の順で実行する。
     /// WAL append は `.wal` ファイルに memcpy 1 回、100ns オーダー。hot path で fsync しない。
-    pub fn tie_async(&self, eid: enchudb_oplog::EntityId, himo: &str, value: u32) {
+    pub fn tie_async(&self, eid: enchudb_oplog::EntityId, himo: &str, value: impl CellValue) {
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo)) as u16;
         self.tie_async_by_id(eid, hid, value);
@@ -13087,16 +13267,13 @@ impl Engine {
     /// `tie_async` の himo_id 直指定版。 SNS の post / like 投入のように row/sec が KO
     /// 単位の hot path 用 (per-call の `himo_id(&str)` string lookup を消す)。
     /// 起動時に `himo_id(&str)` で u16 を 1 回引いて cache し、 hot loop で繰り返し使う想定。
-    pub fn tie_async_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: u32) {
+    pub fn tie_async_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: impl CellValue) {
         use std::sync::atomic::Ordering;
         self.check_writable();
         let local = enchudb_oplog::eid_local(eid);
-        if value == u32::MAX {
-            // #59: sentinel 値は cell に入らない。 panic せず write を拒否 + 計上。
-            self.record_fault(
-                FaultKind::ValueOutOfRange,
-                "tie value == u32::MAX (sentinel reserved)",
-            );
+        // #59: 列の幅に入らない値 (sentinel 含む) は拒否 + 計上
+        let Some(value) = self.cell_value(value) else { return };
+        if !self.fits(himo_id as usize, value) {
             return;
         }
         debug_assert!((himo_id as usize) < self.himos.len(),
@@ -13106,7 +13283,7 @@ impl Engine {
         self.validate_eid_for_himo(himo_id as usize, local);
         // β-light step 5: Ref himo の FK validation (非 Ref は即 return で
         // ~1 ns、 Ref で fk_refs entry なしも同じ)
-        self.validate_ref_tie(himo_id as usize, value);
+        self.validate_ref_tie(himo_id as usize, value as u32); // Ref の列は u32
         // #77-H4: op を write_queue へ push してから WAL record を push する。
         // 逆順 (record 先) だと 2 push の間で preempt された場合、 consumer が
         // record を fsync + checkpoint した時点で op が未適用となり、 crash で
@@ -13186,7 +13363,7 @@ impl Engine {
             let hlc = self.mint_local_hlc();
             let q = self.write_queue.as_ref()
                 .expect("tie_bytes_async requires create_concurrent or concurrentize");
-            q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value: off, hlc });
+            q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value: off as u64, hlc });
             self.push_count.fetch_add(1, Ordering::Release);
             if let Some(wal) = self.oplog.as_ref() {
                 let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
@@ -13228,7 +13405,7 @@ impl Engine {
         let hlc = self.mint_local_hlc();
         let q = self.write_queue.as_ref()
             .expect("tie_text_async requires create_concurrent or concurrentize");
-        q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value: vid, hlc });
+        q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value: vid as u64, hlc });
         self.push_count.fetch_add(1, Ordering::Release);
         if let Some(wal) = self.oplog.as_ref() {
             // Vocab op を先に(sync の receiver 側で Tie より先に mapping が張られるよう)
@@ -13240,10 +13417,10 @@ impl Engine {
                     eid: oplog_eid,
                     himo_name: self.himo_names[hid].clone(),
                     himo_kind: self.value_types[hid] as u8,
-                    value: vid,
+                    value: vid as u64,
                 }
             } else {
-                enchudb_oplog::oplog::OwnedOp::Tie { eid: oplog_eid, himo_id, value: vid }
+                enchudb_oplog::oplog::OwnedOp::Tie { eid: oplog_eid, himo_id, value: vid as u64 }
             };
             if let Some(wq) = self.oplog_record_queue.as_ref() {
                 // Vocab → Tie の順を保つため同一 thread から連続 push
@@ -13293,13 +13470,13 @@ impl Engine {
         let q = self.write_queue.as_ref()
             .expect("tie_ref_async requires create_concurrent or concurrentize");
         q.push(crate::write_queue::Op::Tie {
-            eid: local, himo_id, value: target_local, hlc,
+            eid: local, himo_id, value: target_local as u64, hlc,
         });
         self.push_count.fetch_add(1, Ordering::Release);
         if let Some(wal) = self.oplog.as_ref() {
             let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
             let rec = enchudb_oplog::oplog::OwnedOp::Tie {
-                eid: oplog_eid, himo_id, value: target_local,
+                eid: oplog_eid, himo_id, value: target_local as u64,
             };
             if let Some(wq) = self.oplog_record_queue.as_ref() {
                 push_oplog_record_blocking(wq, rec, hlc, &self.consumer_poisoned, &self.wal_push_count);
@@ -13524,13 +13701,13 @@ impl Engine {
 
 impl crate::live::CellReader for Engine {
     #[inline]
-    fn cell(&self, himo_id: u16, eid: u32) -> Option<u32> {
+    fn cell(&self, himo_id: u16, eid: u32) -> Option<u64> {
         self.himos.get(himo_id as usize)?.get_value(eid)
     }
     fn vocab_lookup(&self, text: &str) -> Option<u32> {
         self.vocab_id(text)
     }
-    fn pull(&self, himo_id: u16, value: u32) -> Vec<u32> {
+    fn pull(&self, himo_id: u16, value: u64) -> Vec<u32> {
         match self.himos.get(himo_id as usize) {
             Some(h) => h.pull(value),
             None => Vec::new(),
@@ -13542,21 +13719,13 @@ impl crate::live::CellReader for Engine {
             None => Vec::new(),
         }
     }
-    fn pull_len(&self, himo_id: u16, value: u32) -> usize {
+    fn pull_len(&self, himo_id: u16, value: u64) -> usize {
         self.himos.get(himo_id as usize).map_or(0, |h| h.slice_len(value))
     }
-    fn pull_range(&self, himo_id: u16, lo: u32, hi: u32) -> Vec<u32> {
+    fn pull_range(&self, himo_id: u16, lo: u64, hi: u64) -> Vec<u32> {
         let Some(h) = self.himos.get(himo_id as usize) else { return Vec::new() };
-        if lo > hi {
-            return Vec::new();
-        }
-        // 狭い範囲は値ごとに引く。 広い範囲は入っている値を列挙して範囲内の値だけ引く
-        // (unique_values は churn 後の stale 値を含む上位集合、 pull が Column で確かめる)
-        if hi - lo < 4096 {
-            (lo..=hi).flat_map(|v| h.pull(v)).collect()
-        } else {
-            h.unique_values().into_iter().filter(|v| (lo..=hi).contains(v)).flat_map(|v| h.pull(v)).collect()
-        }
+        // 索引の範囲を引いて Column で確かめる (dense は範囲の bucket、 大きな値は run の二分探索)
+        h.pull_range(lo, hi)
     }
 }
 
@@ -15007,7 +15176,7 @@ mod tests {
 
         // writer 書込中 crash の残骸を再現: slot gen を odd に汚す。
         let hid = eng.himo_id("body").unwrap();
-        let raw = eng.himos[hid].get_value(enchudb_oplog::eid_local(eid)).unwrap();
+        let raw = eng.himos[hid].get_value32(enchudb_oplog::eid_local(eid)).unwrap();
         eng.leaf_for(hid).expect("routed leaf").poison_gen_odd_for_test(raw);
 
         let t0 = std::time::Instant::now();
@@ -15091,7 +15260,7 @@ mod tests {
         let parent = eng.entity().unwrap();
         let child = eng.entity().unwrap();
         eng.tie_ref(child, "company", parent);
-        assert_eq!(eng.get(child, "company"), Some(parent as u32));
+        assert_eq!(eng.get(child, "company"), Some(parent as u64));
         eng.rebuild();
         let result = eng.pull_raw("company", parent as u32);
         assert_eq!(result, vec![child]);
@@ -15443,7 +15612,7 @@ mod tests {
         let ts = 1_743_552_000u32;
         let e = eng.entity().unwrap();
         eng.tie(e, "ts", ts);
-        assert_eq!(eng.get(e, "ts"), Some(ts));
+        assert_eq!(eng.get(e, "ts"), Some(u64::from(ts)));
         eng.rebuild();
         let result = eng.pull_raw("ts", ts);
         assert_eq!(result, vec![e]);
@@ -15454,7 +15623,7 @@ mod tests {
         let big = 1_000_000u32;
         let e2 = eng.entity().unwrap();
         eng.tie(e2, "huge", big);
-        assert_eq!(eng.get(e2, "huge"), Some(big));
+        assert_eq!(eng.get(e2, "huge"), Some(u64::from(big)));
         eng.rebuild();
         let result2 = eng.pull_raw("huge", big);
         assert_eq!(result2, vec![e2]);
@@ -15487,7 +15656,7 @@ mod tests {
             eng.tie(e, &format!("dim_{d}"), d * 10);
         }
         for d in 0..20u32 {
-            assert_eq!(eng.get(e, &format!("dim_{d}")), Some(d * 10));
+            assert_eq!(eng.get(e, &format!("dim_{d}")), Some(u64::from(d * 10)));
         }
         assert_eq!(eng.himos_of(e).len(), 20);
         let _ = std::fs::remove_dir_all(&dir); // v10: DB は directory
@@ -16148,7 +16317,7 @@ mod tests {
         assert_eq!(eng.query_count(&[("age", 30), ("dept", 10), ("group", 30)]), (n / groups) as usize);
 
         assert_eq!(eng.get(50, "age"), Some(50));
-        assert_eq!(eng.get(50, "dept"), Some(50 % depts));
+        assert_eq!(eng.get(50, "dept"), Some(u64::from(50 % depts)));
 
         let victims: Vec<u64> = eng.query(&[("age", 99)]).into_iter().take(1000).collect();
         for &eid in &victims { eng.delete(eid); }
@@ -16910,7 +17079,7 @@ mod v10_dir_tests {
     fn assert_seeded(eng: &Engine, rows: &[(enchudb_oplog::EntityId, u32)]) {
         assert_eq!(eng.entity_count(), rows.len() as u32);
         for (e, v) in rows {
-            assert_eq!(eng.get(*e, "widgets.n"), Some(*v));
+            assert_eq!(eng.get(*e, "widgets.n"), Some(u64::from(*v)));
         }
         let tables: Vec<String> = eng.list_user_tables().into_iter().map(|t| t.1).collect();
         assert!(tables.iter().any(|t| t == "widgets"), "tables: {tables:?}");
@@ -17246,7 +17415,7 @@ mod v10_dir_tests {
         assert_eq!(eng.himo_count(), 117);
         assert_eq!(eng.entity_count(), rows.len() as u32);
         for (e, v) in &rows {
-            assert_eq!(eng.get(*e, "t.h0"), Some(*v));
+            assert_eq!(eng.get(*e, "t.h0"), Some(u64::from(*v)));
         }
         drop(eng);
         let _ = std::fs::remove_dir_all(&dst);
@@ -17471,7 +17640,7 @@ mod v10_dir_tests {
         let eng = Engine::open_standalone(&path).unwrap();
         assert_eq!(eng.table_eid_extents("a").unwrap(), ext, "extents survive reopen (EXT1 block)");
         for (i, &e) in ids.iter().enumerate() {
-            assert_eq!(eng.get(e, "a.n"), Some(i as u32));
+            assert_eq!(eng.get(e, "a.n"), Some(i as u64));
         }
         // reopen 後の払出は live eid を再利用しない (next_local が bitmap から復元される)
         let fresh = eng.entity_in("a").unwrap();

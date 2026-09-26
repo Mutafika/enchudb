@@ -90,7 +90,7 @@ fn process_normal_exit_persists_all_writes() {
     assert!(eng.entity_count() >= 500);
     for i in 0..500u64 {
         let v = eng.get(i, "n");
-        assert_eq!(v, Some(i as u32), "entity {} should have value {}", i, i);
+        assert_eq!(v, Some(i), "entity {} should have value {}", i, i);
     }
     cleanup(&path);
 }
@@ -137,14 +137,14 @@ fn process_abort_mid_write_preserves_first_half() {
     let eng = Engine::open_concurrent_with_oplog(&path, 64 * 1024 * 1024).unwrap();
     // 前半 50 件は確実に残る
     for i in 0..50u64 {
-        assert_eq!(eng.get(i, "n"), Some(i as u32), "first half entity {} lost", i);
+        assert_eq!(eng.get(i, "n"), Some(i), "first half entity {} lost", i);
     }
     // 後半は残っても残らなくても OK(どちらも有効な挙動)。
     // ただし「書いた値が化けてる」は絶対 NG。
     for i in 50..100u64 {
         match eng.get(i, "n") {
             None => {}           // 消えた → OK
-            Some(v) if v as u64 == i => {} // そのまま → OK
+            Some(v) if v == i => {} // そのまま → OK
             Some(v) => panic!("entity {} corrupted: got {}", i, v),
         }
     }
@@ -410,7 +410,7 @@ fn fuzz_random_byte_flip_no_silent_corruption() {
                 let mut corrupt = false;
                 for &(eid, v) in &expected {
                     match eng.get(eid, "n") {
-                        Some(actual) if actual != v => { corrupt = true; break; }
+                        Some(actual) if actual != u64::from(v) => { corrupt = true; break; }
                         _ => {}
                     }
                 }

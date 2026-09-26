@@ -223,7 +223,7 @@ fn tie_ref_async_propagates_between_peers() {
         .map(|e| enchudb_oplog::eid_local(e) as u32);
     assert_eq!(
         eng_b.get(child_local, &q("parent")),
-        parent_local_on_b,
+        parent_local_on_b.map(u64::from),
         "cross-peer ref は B 側 local eid を指すこと",
     );
 

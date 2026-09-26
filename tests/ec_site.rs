@@ -187,8 +187,8 @@ fn category_search() {
     // 期待値を Column 直読みで算出
     let mut expected = 0u32;
     for eid in 0..db.next_eid() {
-        if db.get(eid, "type") == Some(TYPE_PRODUCT)
-            && db.get(eid, "category") == Some(target_cat as u32)
+        if db.get(eid, "type") == Some(u64::from(TYPE_PRODUCT))
+            && db.get(eid, "category") == Some(target_cat as u64)
         {
             expected += 1;
         }
@@ -215,9 +215,9 @@ fn category_price_search() {
 
     let mut expected = 0u32;
     for eid in 0..db.next_eid() {
-        if db.get(eid, "type") == Some(TYPE_PRODUCT)
-            && db.get(eid, "category") == Some(target_cat as u32)
-            && db.get(eid, "price_band") == Some(target_pb as u32)
+        if db.get(eid, "type") == Some(u64::from(TYPE_PRODUCT))
+            && db.get(eid, "category") == Some(target_cat as u64)
+            && db.get(eid, "price_band") == Some(target_pb as u64)
         {
             expected += 1;
         }
@@ -243,9 +243,9 @@ fn color_filter() {
 
     let mut expected = 0u32;
     for eid in 0..db.next_eid() {
-        if db.get(eid, "type") == Some(TYPE_PRODUCT)
-            && db.get(eid, "category") == Some(target_cat as u32)
-            && db.get(eid, "color") == Some(target_color as u32)
+        if db.get(eid, "type") == Some(u64::from(TYPE_PRODUCT))
+            && db.get(eid, "category") == Some(target_cat as u64)
+            && db.get(eid, "color") == Some(target_color as u64)
         {
             expected += 1;
         }
@@ -271,7 +271,7 @@ fn user_orders() {
     // 全注文を走査して user_ref が target_user を指すものを数える
     let mut expected = 0u32;
     for &oid in &data.orders {
-        if db.get(oid, "user_ref") == Some(target_user as u32) {
+        if db.get(oid, "user_ref") == Some(u64::from(target_user as u32)) {
             expected += 1;
         }
     }
@@ -295,7 +295,7 @@ fn order_items() {
 
     let mut expected = 0u32;
     for &item in &data.order_items {
-        if db.get(item, "order_ref") == Some(target_order as u32) {
+        if db.get(item, "order_ref") == Some(u64::from(target_order as u32)) {
             expected += 1;
         }
     }
@@ -339,9 +339,9 @@ fn user_order_products() {
     // 期待値を直接算出
     let mut expected_products = std::collections::HashSet::new();
     for &oid in &data.orders {
-        if db.get(oid, "user_ref") == Some(target_user as u32) {
+        if db.get(oid, "user_ref") == Some(u64::from(target_user as u32)) {
             for &item in &data.order_items {
-                if db.get(item, "order_ref") == Some(oid as u32) {
+                if db.get(item, "order_ref") == Some(u64::from(oid as u32)) {
                     if let Some(pid) = db.get(item, "product_ref") {
                         expected_products.insert(pid);
                     }
@@ -370,7 +370,7 @@ fn product_reviews() {
 
     let mut expected = 0u32;
     for &rev in &data.reviews {
-        if db.get(rev, "product_ref") == Some(target_product as u32) {
+        if db.get(rev, "product_ref") == Some(u64::from(target_product as u32)) {
             expected += 1;
         }
     }
@@ -436,7 +436,7 @@ fn orders_by_status() {
 
         let mut expected = 0u32;
         for &oid in &data.orders {
-            if db.get(oid, "order_status") == Some(status) {
+            if db.get(oid, "order_status") == Some(u64::from(status)) {
                 expected += 1;
             }
         }
@@ -466,9 +466,9 @@ fn monthly_orders() {
 
     let mut expected = 0u32;
     for eid in 0..db.next_eid() {
-        if db.get(eid, "type") == Some(TYPE_ORDER)
-            && db.get(eid, "year") == Some(target_year as u32)
-            && db.get(eid, "month") == Some(target_month as u32)
+        if db.get(eid, "type") == Some(u64::from(TYPE_ORDER))
+            && db.get(eid, "year") == Some(target_year as u64)
+            && db.get(eid, "month") == Some(target_month as u64)
         {
             expected += 1;
         }
@@ -562,7 +562,7 @@ fn view_persistence() {
 
     let mut expected = 0u32;
     for eid in 0..db.next_eid() {
-        if db.get(eid, "type") == Some(TYPE_PRODUCT)
+        if db.get(eid, "type") == Some(u64::from(TYPE_PRODUCT))
             && db.get(eid, "category") == Some(2)
             && db.get(eid, "price_band") == Some(3)
         {
@@ -668,12 +668,12 @@ fn referential_check() {
     let mut bad_order_refs = 0u32;
     for &item in &data.order_items {
         if let Some(pid) = db.get(item, "product_ref") {
-            if !product_set.contains(&(pid as u64)) { bad_product_refs += 1; }
+            if !product_set.contains(&pid) { bad_product_refs += 1; }
         } else {
             bad_product_refs += 1;
         }
         if let Some(oid) = db.get(item, "order_ref") {
-            if !order_set.contains(&(oid as u64)) { bad_order_refs += 1; }
+            if !order_set.contains(&oid) { bad_order_refs += 1; }
         } else {
             bad_order_refs += 1;
         }
@@ -684,12 +684,12 @@ fn referential_check() {
     let mut bad_review_urefs = 0u32;
     for &rev in &data.reviews {
         if let Some(pid) = db.get(rev, "product_ref") {
-            if !product_set.contains(&(pid as u64)) { bad_review_prefs += 1; }
+            if !product_set.contains(&pid) { bad_review_prefs += 1; }
         } else {
             bad_review_prefs += 1;
         }
         if let Some(uid) = db.get(rev, "user_ref") {
-            if !user_set.contains(&(uid as u64)) { bad_review_urefs += 1; }
+            if !user_set.contains(&uid) { bad_review_urefs += 1; }
         } else {
             bad_review_urefs += 1;
         }
@@ -699,7 +699,7 @@ fn referential_check() {
     let mut bad_order_urefs = 0u32;
     for &oid in &data.orders {
         if let Some(uid) = db.get(oid, "user_ref") {
-            if !user_set.contains(&(uid as u64)) { bad_order_urefs += 1; }
+            if !user_set.contains(&uid) { bad_order_urefs += 1; }
         } else {
             bad_order_urefs += 1;
         }

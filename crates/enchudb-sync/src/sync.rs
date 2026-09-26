@@ -1332,21 +1332,21 @@ impl Syncer {
                     // 文字列を持つ既存 row は存在し得ない → bind せず払い出しに任せる。
                     let from_batch = records.iter().find_map(|r| match &r.op {
                         DecodedOp::Vocab { vid, bytes }
-                            if r.author_peer == rec.author_peer && vid == value =>
+                            if r.author_peer == rec.author_peer && *vid as u64 == *value =>
                         {
                             self.engine.vocab_id_bytes(bytes)
                         }
                         _ => None,
                     });
                     match from_batch {
-                        Some(v) => v,
+                        Some(v) => v as u64,
                         None => continue,
                     }
                 }
             };
             let Some(existing) = self
                 .engine
-                .query_by_id(&[(*himo_id, local_value)])
+                .query_by_id64(&[(*himo_id, local_value)])
                 .into_iter()
                 .next()
             else {
@@ -1484,8 +1484,10 @@ impl Syncer {
                 // table 空間の local eid に翻訳 (確保できなければ skip)。 それ以外
                 // (Tag/Symbol) は remote vocab vid を local vid に変換 (Number は identity)。
                 let value = if self.engine.himo_is_ref(*himo_id) {
-                    match self.engine.resolve_remote_ref_value(rec.author_peer, *value, *himo_id) {
-                        Some(v) => v,
+                    // Ref の列は u32 (local eid)。 入らない値は target を導けない
+                    let Ok(foreign) = u32::try_from(*value) else { return ApplyResult::Dropped };
+                    match self.engine.resolve_remote_ref_value(rec.author_peer, foreign, *himo_id) {
+                        Some(v) => v as u64,
                         None => return ApplyResult::Dropped,
                     }
                 } else {
@@ -1709,7 +1711,7 @@ mod tests {
         let rec = WireRecord::unsigned(
             Hlc { wall: 100, logical: 0, peer: 2 },
             2,
-            DecodedOp::Tie { eid: remote_eid, himo_id: hid, value: colliding_vid },
+            DecodedOp::Tie { eid: remote_eid, himo_id: hid, value: colliding_vid as u64 },
         );
         let out = syncer.apply_records(&[rec]);
 
@@ -1734,7 +1736,7 @@ mod tests {
             WireRecord::unsigned(
                 Hlc { wall: 201, logical: 0, peer: 2 },
                 2,
-                DecodedOp::Tie { eid: remote_eid, himo_id: hid, value: colliding_vid },
+                DecodedOp::Tie { eid: remote_eid, himo_id: hid, value: colliding_vid as u64 },
             ),
         ];
         let out2 = syncer.apply_records(&recs);

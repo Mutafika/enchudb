@@ -85,14 +85,14 @@ fn author_notes(eng: &Arc<Engine>, from: u32, n: u32, parent_of: Option<u64>) ->
 }
 
 /// note=i の行を 1 件引いて (eid, city, body, parent 先の note 値) を返す。
-fn read_note(eng: &Arc<Engine>, i: u32) -> Option<(u64, Vec<u8>, Vec<u8>, Option<u32>)> {
+fn read_note(eng: &Arc<Engine>, i: u32) -> Option<(u64, Vec<u8>, Vec<u8>, Option<u64>)> {
     let rows = eng.pull_raw("notes.note", i);
     let e = *rows.first()?;
     let city = eng.get_text_owned(e, "notes.city")?;
     let body = eng.get_text_owned(e, "notes.body")?;
     let parent_note = eng
         .get(e, "notes.parent")
-        .and_then(|p| eng.get(p as u64, "notes.note"));
+        .and_then(|p| eng.get(p, "notes.note"));
     Some((e, city, body, parent_note))
 }
 

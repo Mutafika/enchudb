@@ -317,7 +317,7 @@ impl PeerSim {
                 peer,
                 DecodedOp::Vocab { vid, bytes: value.as_bytes().to_vec() },
             ),
-            tie: WireRecord::unsigned(h_tie, peer, DecodedOp::Tie { eid, himo_id, value: vid }),
+            tie: WireRecord::unsigned(h_tie, peer, DecodedOp::Tie { eid, himo_id, value: vid as u64 }),
         }
     }
 

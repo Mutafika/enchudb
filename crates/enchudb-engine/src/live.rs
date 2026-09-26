@@ -210,18 +210,19 @@ use enchudb_oplog::EntityId;
 /// live query の条件 1 個。 全部 **根の entity についての AND** として組み合わさる。
 ///
 /// himo は `himo_id` (= `Engine::himo_id`、 schema 層は build 時 resolve 済みの id) で指す。
-/// 値の意味は `query_by_id` と同じ (Number は値そのもの、 Tag は vocab id、 Ref は local eid)。
+/// 値の意味は `query_by_id64` と同じ (Number / Number64 は値そのもの、 Tag は vocab id、 Ref は local eid)。
+/// 値は u64 (64 bit 列の値もそのまま)。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LivePred {
     /// 値が `value` と等しい。
-    Eq { himo_id: u16, value: u32 },
+    Eq { himo_id: u16, value: u64 },
     /// Tag 紐の値が文字列 `text`。 **まだ vocab に無い文字列でもよい** — 後から誰かが
     /// その文字列をぶら下げた時点で一致し始める (登録時に vocab を汚さない)。
     EqText { himo_id: u16, text: String },
     /// `lo <= 値 <= hi` (両端含む)。 `lo > hi` は常に偽。
-    Range { himo_id: u16, lo: u32, hi: u32 },
+    Range { himo_id: u16, lo: u64, hi: u64 },
     /// 値が `values` のどれか。
-    In { himo_id: u16, values: Vec<u32> },
+    In { himo_id: u16, values: Vec<u64> },
     /// 値が何か tie されている (= その紐を持つ全 entity)。
     Present { himo_id: u16 },
     /// ref 紐 `path` を順にたどった先の entity で `pred` が真。 ref が張られていない / 先の
@@ -419,17 +420,24 @@ impl LiveDelta {
 }
 
 /// 評価に要る engine 側の読み口。 engine 本体と unit test の両方が実装する。
+/// 値は u64 (64 bit 列の値もそのまま)、 entity は local の u32。 Ref の列の値は local eid (u32 に収まる) —
+/// ref をたどる所は [`CellReader::ref_cell`] で読む。
 pub(crate) trait CellReader {
-    fn cell(&self, himo_id: u16, eid: u32) -> Option<u32>;
+    fn cell(&self, himo_id: u16, eid: u32) -> Option<u64>;
     fn vocab_lookup(&self, text: &str) -> Option<u32>;
     /// `himo_id` の値が `value` である entity (常設逆引き索引)。
-    fn pull(&self, himo_id: u16, value: u32) -> Vec<u32>;
+    fn pull(&self, himo_id: u16, value: u64) -> Vec<u32>;
     /// `himo_id` に何か値を持つ entity。
     fn with_himo(&self, himo_id: u16) -> Vec<u32>;
     /// `himo_id` の値が `lo..=hi` の entity (順不同)。
-    fn pull_range(&self, himo_id: u16, lo: u32, hi: u32) -> Vec<u32>;
+    fn pull_range(&self, himo_id: u16, lo: u64, hi: u64) -> Vec<u32>;
     /// `pull(himo_id, value)` の件数 (O(1))。
-    fn pull_len(&self, himo_id: u16, value: u32) -> usize;
+    fn pull_len(&self, himo_id: u16, value: u64) -> usize;
+    /// Ref の列の値 (= 指している local eid)。 u32 に収まらない値は ref として読めない (None)。
+    #[inline]
+    fn ref_cell(&self, himo_id: u16, eid: u32) -> Option<u32> {
+        self.cell(himo_id, eid).and_then(|v| u32::try_from(v).ok())
+    }
 }
 
 // ─────────────────────────── 疎な状態 ───────────────────────────
@@ -722,19 +730,93 @@ impl Words {
     }
 }
 
+/// entity → 値 (0 = なし) の page。 `Words` と同じ形で、 u32 に収まる間は 4 B、 収まらない値
+/// (64 bit 列) が来たら全 page を 8 B に作り直す — u32 の列だけの購読の状態は大きくならない。
+enum ValWords {
+    Narrow(Words),
+    Wide(Vec<Option<Box<[u64; 1024]>>>),
+}
+
+impl Default for ValWords {
+    fn default() -> Self {
+        ValWords::Narrow(Words::default())
+    }
+}
+
+impl ValWords {
+    #[inline]
+    fn get(&self, i: u32) -> u64 {
+        match self {
+            ValWords::Narrow(w) => w.get(i) as u64,
+            ValWords::Wide(p) => match p.get((i >> 10) as usize) {
+                Some(Some(p)) => p[(i & 1023) as usize],
+                _ => 0,
+            },
+        }
+    }
+
+    #[inline]
+    fn put(&mut self, i: u32, v: u64) {
+        if let ValWords::Narrow(w) = self {
+            match u32::try_from(v) {
+                Ok(v) => return w.put(i, v),
+                Err(_) => self.widen(),
+            }
+        }
+        let ValWords::Wide(pages) = self else { unreachable!("widened above") };
+        let pi = (i >> 10) as usize;
+        if pi >= pages.len() {
+            if v == 0 {
+                return;
+            }
+            pages.resize_with(pi + 1, || None);
+        }
+        let slot = &mut pages[pi];
+        if slot.is_none() && v == 0 {
+            return;
+        }
+        slot.get_or_insert_with(|| Box::new([0; 1024]))[(i & 1023) as usize] = v;
+    }
+
+    #[cold]
+    fn widen(&mut self) {
+        let ValWords::Narrow(w) = self else { return };
+        let pages = w
+            .0
+            .iter()
+            .map(|p| {
+                p.as_ref().map(|p| {
+                    let mut q = Box::new([0u64; 1024]);
+                    for (d, &s) in q.iter_mut().zip(p.iter()) {
+                        *d = s as u64;
+                    }
+                    q
+                })
+            })
+            .collect();
+        *self = ValWords::Wide(pages);
+    }
+}
+
 /// 印リスト。 追記するだけで、 重複は取り出す時 (と溜まりすぎた時) に畳む — 印は poll の
 /// たびに空になる一時的な集合なので、 付けるたびに整列した集合へ挿入するより安い。 大きさは
 /// 印の付いた entity の数の高々 2 倍 + 定数。
-#[derive(Default)]
-struct Marks {
-    list: Vec<u32>,
+/// 中身は eid (既定) か、 集計の group の値 (u64)。
+struct Marks<T = u32> {
+    list: Vec<T>,
     /// 最後に畳んだ時の長さ。
     clean: usize,
 }
 
-impl Marks {
+impl<T> Default for Marks<T> {
+    fn default() -> Self {
+        Marks { list: Vec::new(), clean: 0 }
+    }
+}
+
+impl<T: Ord + Copy> Marks<T> {
     #[inline]
-    fn add(&mut self, eid: u32) {
+    fn add(&mut self, eid: T) {
         self.list.push(eid);
         if self.list.len() > 2 * self.clean + 64 {
             self.compact();
@@ -748,13 +830,13 @@ impl Marks {
     }
 
     /// 昇順・重複なしで取り出して空にする。
-    fn take(&mut self) -> Vec<u32> {
+    fn take(&mut self) -> Vec<T> {
         self.compact();
         self.take_raw()
     }
 
     /// 整列せずに取り出して空にする (書き込み側の lock の下で呼ぶ — 整列は lock の外で)。
-    fn take_raw(&mut self) -> Vec<u32> {
+    fn take_raw(&mut self) -> Vec<T> {
         self.clean = 0;
         std::mem::take(&mut self.list)
     }
@@ -886,8 +968,8 @@ impl KeyStore {
 #[derive(Default)]
 struct KeyTable {
     width: usize,
-    /// 昇順の鍵を `width` 個ずつ詰めたもの。
-    keys: Vec<u32>,
+    /// 昇順の鍵を `width` 個ずつ詰めたもの (穴の値 / 子の鍵 id)。
+    keys: Vec<u64>,
     /// `keys` の i 番目の鍵の id。
     ids: Vec<u32>,
     /// `keys` の i 番目の鍵を使っている member の数。
@@ -902,7 +984,7 @@ impl KeyTable {
     }
 
     #[inline]
-    fn search(&self, k: &[u32]) -> Result<usize, usize> {
+    fn search(&self, k: &[u64]) -> Result<usize, usize> {
         debug_assert_eq!(k.len(), self.width);
         let w = self.width;
         if w == 0 {
@@ -921,12 +1003,12 @@ impl KeyTable {
     }
 
     #[inline]
-    fn find(&self, k: &[u32]) -> Option<u32> {
+    fn find(&self, k: &[u64]) -> Option<u32> {
         self.search(k).ok().map(|i| self.ids[i])
     }
 
     /// 鍵を載せ (使う member を 1 増やし)、 id を返す。
-    fn intern(&mut self, k: &[u32]) -> u32 {
+    fn intern(&mut self, k: &[u64]) -> u32 {
         match self.search(k) {
             Ok(i) => {
                 self.refs[i] += 1;
@@ -944,7 +1026,7 @@ impl KeyTable {
     }
 
     /// 使う member を 1 減らし、 0 になったら外す。
-    fn release(&mut self, k: &[u32]) {
+    fn release(&mut self, k: &[u64]) {
         let Ok(i) = self.search(k) else { return };
         self.refs[i] -= 1;
         if self.refs[i] == 0 {
@@ -968,7 +1050,7 @@ impl KeyTable {
 #[derive(Default)]
 struct Slabs {
     /// 帯の始まり (昇順)。 帯 i = [starts[i], starts[i + 1])、 最後の帯は上限なし。
-    starts: Vec<u32>,
+    starts: Vec<u64>,
     /// starts[i] を端に持つ member の数 (0 になったら外す)。
     refs: Vec<u32>,
     /// 帯 i を含む member の数。
@@ -978,24 +1060,24 @@ struct Slabs {
 impl Slabs {
     /// `v` を含む帯 (最初の端より下なら None)。
     #[inline]
-    fn slab(&self, v: u32) -> Option<usize> {
+    fn slab(&self, v: u64) -> Option<usize> {
         self.starts.partition_point(|&b| b <= v).checked_sub(1)
     }
 
     /// `v` を範囲に含む member が居るか。
     #[inline]
-    fn covered(&self, v: u32) -> bool {
+    fn covered(&self, v: u64) -> bool {
         self.slab(v).is_some_and(|i| self.cover[i] > 0)
     }
 
     /// 同じ帯か (帯の外どうしも同じとみなす)。
     #[inline]
-    fn same(&self, a: u32, b: u32) -> bool {
+    fn same(&self, a: u64, b: u64) -> bool {
         self.slab(a) == self.slab(b)
     }
 
     /// 端 `b` を 1 つ足す。 帯を新しく割ったら、 割られた帯の値の範囲 (両端含む) を返す。
-    fn add_end(&mut self, b: u32) -> Option<(u32, u32)> {
+    fn add_end(&mut self, b: u64) -> Option<(u64, u64)> {
         match self.starts.binary_search(&b) {
             Ok(i) => {
                 self.refs[i] += 1;
@@ -1007,14 +1089,14 @@ impl Slabs {
                 self.starts.insert(i, b);
                 self.refs.insert(i, 1);
                 self.cover.insert(i, cover);
-                let hi = self.starts.get(i + 1).map_or(u32::MAX - 1, |&n| n - 1);
+                let hi = self.starts.get(i + 1).map_or(u64::MAX - 1, |&n| n - 1);
                 (i > 0).then(|| (self.starts[i - 1], hi))
             }
         }
     }
 
     /// 端 `b` を 1 つ外す (0 になったら帯を前の帯に併せる)。
-    fn remove_end(&mut self, b: u32) {
+    fn remove_end(&mut self, b: u64) {
         let Ok(i) = self.starts.binary_search(&b) else { return };
         self.refs[i] -= 1;
         if self.refs[i] == 0 {
@@ -1027,30 +1109,30 @@ impl Slabs {
     }
 
     /// `[lo, hi]` の member を 1 つ足す / 外す。
-    fn add(&mut self, lo: u32, hi: u32) -> Vec<(u32, u32)> {
+    fn add(&mut self, lo: u64, hi: u64) -> Vec<(u64, u64)> {
         if lo > hi {
             return Vec::new();
         }
-        let mut split: Vec<(u32, u32)> = self.add_end(lo).into_iter().collect();
-        if hi < u32::MAX - 1 {
+        let mut split: Vec<(u64, u64)> = self.add_end(lo).into_iter().collect();
+        if hi < u64::MAX - 1 {
             split.extend(self.add_end(hi + 1));
         }
         self.recover(lo, hi, true);
         split
     }
 
-    fn remove(&mut self, lo: u32, hi: u32) {
+    fn remove(&mut self, lo: u64, hi: u64) {
         if lo > hi {
             return;
         }
         self.recover(lo, hi, false);
         self.remove_end(lo);
-        if hi < u32::MAX - 1 {
+        if hi < u64::MAX - 1 {
             self.remove_end(hi + 1);
         }
     }
 
-    fn recover(&mut self, lo: u32, hi: u32, add: bool) {
+    fn recover(&mut self, lo: u64, hi: u64, add: bool) {
         let a = self.starts.partition_point(|&b| b < lo);
         let z = self.starts.partition_point(|&b| b <= hi);
         for c in &mut self.cover[a..z] {
@@ -1067,22 +1149,22 @@ impl Slabs {
 /// 作り直す (`RootKey::ivs`)。
 struct Ivs {
     /// (lo, hi, member の slot)、 lo 昇順。 空の範囲 (lo > hi) は載せない。
-    items: Vec<(u32, u32, usize)>,
+    items: Vec<(u64, u64, usize)>,
     /// items の添字を hi 昇順に。
     by_hi: Vec<usize>,
     /// items の上の segment tree (葉 = items、 節 = 部分木の hi の最大)。
-    max_hi: Vec<u32>,
+    max_hi: Vec<u64>,
     leaves: usize,
 }
 
 impl Ivs {
-    fn new(mut items: Vec<(u32, u32, usize)>) -> Self {
+    fn new(mut items: Vec<(u64, u64, usize)>) -> Self {
         items.retain(|x| x.0 <= x.1);
         items.sort_unstable();
         let mut by_hi: Vec<usize> = (0..items.len()).collect();
         by_hi.sort_unstable_by_key(|&i| items[i].1);
         let leaves = items.len().next_power_of_two();
-        let mut max_hi = vec![0u32; 2 * leaves];
+        let mut max_hi = vec![0u64; 2 * leaves];
         for (i, x) in items.iter().enumerate() {
             max_hi[leaves + i] = x.1;
         }
@@ -1093,14 +1175,14 @@ impl Ivs {
     }
 
     /// `v` を含む member の slot を `f` に渡す (出力の数 × log)。
-    fn stab(&self, v: u32, f: &mut impl FnMut(usize)) {
+    fn stab(&self, v: u64, f: &mut impl FnMut(usize)) {
         let k = self.items.partition_point(|x| x.0 <= v);
         if k > 0 {
             self.stab_in(1, 0, self.leaves, k, v, f);
         }
     }
 
-    fn stab_in(&self, n: usize, l: usize, r: usize, k: usize, v: u32, f: &mut impl FnMut(usize)) {
+    fn stab_in(&self, n: usize, l: usize, r: usize, k: usize, v: u64, f: &mut impl FnMut(usize)) {
         if l >= k || self.max_hi[n] < v {
             return;
         }
@@ -1114,7 +1196,7 @@ impl Ivs {
     }
 
     /// `v` を含む区間の数 (O(log))。
-    fn count_at(&self, v: u32) -> usize {
+    fn count_at(&self, v: u64) -> usize {
         self.items.partition_point(|x| x.0 <= v) - self.by_hi.partition_point(|&i| self.items[i].1 < v)
     }
 
@@ -1122,7 +1204,7 @@ impl Ivs {
     /// 間にある区間だけを見る (間の端の数) か、 `a` を含む区間と `b` を含む区間を突き合わせる
     /// (両方の数) かの安い方 — 入れ子の閾値 (`age > k`) で近くに動くなら前者、 狭い範囲が多数並ぶ所を
     /// 遠くに飛ぶなら後者が小さい。
-    fn cross(&self, a: u32, b: u32, f: &mut impl FnMut(usize, bool)) {
+    fn cross(&self, a: u64, b: u64, f: &mut impl FnMut(usize, bool)) {
         let (x, y) = if a < b { (a, b) } else { (b, a) };
         let between = self.items.partition_point(|it| it.0 <= y) - self.items.partition_point(|it| it.0 <= x)
             + self.by_hi.partition_point(|&i| self.items[i].1 < y)
@@ -1153,7 +1235,7 @@ impl Ivs {
             }
             return;
         }
-        let has = |i: usize, v: u32| self.items[i].0 <= v && v <= self.items[i].1;
+        let has = |i: usize, v: u64| self.items[i].0 <= v && v <= self.items[i].1;
         let mut visit = |i: usize| {
             let (ia, ib) = (has(i, a), has(i, b));
             if ia != ib {
@@ -1182,10 +1264,10 @@ impl Ivs {
 
 /// 値を固定した単一紐条件 (家族の形の一部)。
 enum Pred {
-    Range(u16, u32, u32),
+    Range(u16, u64, u64),
     Present(u16),
     /// 値が並びのどれか (昇順・重複なし)。 否定の中身にだけ使う (肯定の `In` は値の穴)。
-    In(u16, Vec<u32>),
+    In(u16, Vec<u64>),
     /// Tag の値が文字列 (vocab に現れたら id を覚える)。 否定の中身にだけ使う。
     Text(u16, String, std::sync::OnceLock<u32>),
     /// 中身が偽 (値が無い entity も真)。
@@ -1225,7 +1307,7 @@ impl Pred {
                         None => return false,
                     },
                 };
-                r.cell(*h, eid) == Some(id)
+                r.cell(*h, eid) == Some(id as u64)
             }
             Pred::Not(p) => !p.matches(r, ex, eid),
             Pred::Exists { idx, .. } => ex[*idx].get(eid),
@@ -1237,11 +1319,11 @@ impl Pred {
 /// `Range` は `Range` の両端 (family に 1 個まで、 `canonical`)。
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum HoleVal {
-    Id(u32),
+    Id(u64),
     /// `In` の値 (昇順・重複なし)。 値の穴の選択肢 = member の鍵が値の数だけある。
-    Ids(Vec<u32>),
+    Ids(Vec<u64>),
     Text(String),
-    Range(u32, u32),
+    Range(u64, u64),
     /// 集計の group の列 ([`LiveCounts`])。 値は持たない (全ての値が group)。 中身は合計する根の列
     /// (紐 + 1、 0 = 合計しない — 件数だけ)。
     Group(u32),
@@ -1269,7 +1351,7 @@ enum Leaf {
 struct Flat {
     path: Vec<u16>,
     /// 形の符号 (穴の値を含まない)。
-    sig: Vec<u32>,
+    sig: Vec<u64>,
     leaf: Leaf,
 }
 
@@ -1291,17 +1373,17 @@ fn flatten(p: LivePred, path: &mut Vec<u16>, out: &mut Vec<Flat>) {
             path.truncate(n);
             return;
         }
-        LivePred::Eq { himo_id, value } => (vec![0, himo_id as u32], Leaf::Hole(himo_id, HoleVal::Id(value))),
-        LivePred::EqText { himo_id, text } => (vec![0, himo_id as u32], Leaf::Hole(himo_id, HoleVal::Text(text))),
+        LivePred::Eq { himo_id, value } => (vec![0, himo_id as u64], Leaf::Hole(himo_id, HoleVal::Id(value))),
+        LivePred::EqText { himo_id, text } => (vec![0, himo_id as u64], Leaf::Hole(himo_id, HoleVal::Text(text))),
         // 範囲の穴。 2 本目以降は canonical が値を固定した条件に戻す
-        LivePred::Range { himo_id, lo, hi } => (vec![1, himo_id as u32], Leaf::Hole(himo_id, HoleVal::Range(lo, hi))),
+        LivePred::Range { himo_id, lo, hi } => (vec![1, himo_id as u64], Leaf::Hole(himo_id, HoleVal::Range(lo, hi))),
         // 値の穴の選択肢 (`Eq` と同じ形 = `city = A` と `city IN (A, B)` は同じ family)
         LivePred::In { himo_id, mut values } => {
             values.sort_unstable();
             values.dedup();
-            (vec![0, himo_id as u32], Leaf::Hole(himo_id, HoleVal::Ids(values)))
+            (vec![0, himo_id as u64], Leaf::Hole(himo_id, HoleVal::Ids(values)))
         }
-        LivePred::Present { himo_id } => (vec![3, himo_id as u32], Leaf::Fixed(Pred::Present(himo_id))),
+        LivePred::Present { himo_id } => (vec![3, himo_id as u64], Leaf::Fixed(Pred::Present(himo_id))),
         // 否定は値を固定した条件 (値ごとに別の family)。 形の符号に中身の値まで入れる
         LivePred::Exists { via, preds } => {
             let (t, p) = exists_leaf(via, preds);
@@ -1310,41 +1392,41 @@ fn flatten(p: LivePred, path: &mut Vec<u16>, out: &mut Vec<Flat>) {
         LivePred::Not(inner) => {
             let (tail, p) = match *inner {
                 LivePred::Exists { via, preds } => exists_leaf(via, preds),
-                LivePred::Eq { himo_id, value } => (vec![0, himo_id as u32, value], Pred::In(himo_id, vec![value])),
+                LivePred::Eq { himo_id, value } => (vec![0, himo_id as u64, value], Pred::In(himo_id, vec![value])),
                 LivePred::In { himo_id, mut values } => {
                     values.sort_unstable();
                     values.dedup();
-                    let mut t = vec![0, himo_id as u32];
+                    let mut t = vec![0, himo_id as u64];
                     t.extend_from_slice(&values);
                     (t, Pred::In(himo_id, values))
                 }
                 LivePred::EqText { himo_id, text } => {
-                    let mut t = vec![1, himo_id as u32, text.len() as u32];
-                    t.extend(text.bytes().map(u32::from));
+                    let mut t = vec![1, himo_id as u64, text.len() as u64];
+                    t.extend(text.bytes().map(u64::from));
                     (t, Pred::Text(himo_id, text, std::sync::OnceLock::new()))
                 }
-                LivePred::Range { himo_id, lo, hi } => (vec![2, himo_id as u32, lo, hi], Pred::Range(himo_id, lo, hi)),
-                LivePred::Present { himo_id } => (vec![3, himo_id as u32], Pred::Present(himo_id)),
+                LivePred::Range { himo_id, lo, hi } => (vec![2, himo_id as u64, lo, hi], Pred::Range(himo_id, lo, hi)),
+                LivePred::Present { himo_id } => (vec![3, himo_id as u64], Pred::Present(himo_id)),
                 other => unreachable!("dnf が単一紐の否定だけを通す: {other:?}"),
             };
-            let mut t = vec![8, tail.len() as u32];
+            let mut t = vec![8, tail.len() as u64];
             t.extend(tail);
             (t, Leaf::Fixed(Pred::Not(Box::new(p))))
         }
         LivePred::Or(_) => unreachable!("Or は dnf で枝に展開してから flatten する"),
     };
     let mut sig = Vec::with_capacity(1 + path.len() + tail.len());
-    sig.push(path.len() as u32);
-    sig.extend(path.iter().map(|&h| h as u32));
+    sig.push(path.len() as u64);
+    sig.extend(path.iter().map(|&h| h as u64));
     sig.extend(tail);
     out.push(Flat { path: path.clone(), sig, leaf });
 }
 
 /// `Exists` の形の符号と条件 (中身の条件まで符号に入れる = 中身が違えば別の family)。
-fn exists_leaf(via: u16, preds: Vec<LivePred>) -> (Vec<u32>, Pred) {
+fn exists_leaf(via: u16, preds: Vec<LivePred>) -> (Vec<u64>, Pred) {
     let text = format!("{preds:?}");
-    let mut t = vec![9, via as u32, text.len() as u32];
-    t.extend(text.bytes().map(u32::from));
+    let mut t = vec![9, via as u64, text.len() as u64];
+    t.extend(text.bytes().map(u64::from));
     (t, Pred::Exists { via, preds, idx: usize::MAX })
 }
 
@@ -1378,19 +1460,19 @@ fn number_exists(flats: &mut [Flat]) -> Vec<(u16, Vec<LivePred>)> {
 ///
 /// `carry` (集計の group の列 / 上位 k 件の並びの列: ref の道 + 紐 + `HoleVal::Group` か
 /// `HoleVal::Order`) があれば、 その列を値を運ぶ穴にする (範囲の穴は作らない — 根まで運ぶ値は 1 つ)。
-fn canonical(preds: Vec<LivePred>, carry: Option<(Vec<u16>, u16, HoleVal)>) -> (Vec<u32>, Vec<Flat>, Vec<HoleVal>) {
+fn canonical(preds: Vec<LivePred>, carry: Option<(Vec<u16>, u16, HoleVal)>) -> (Vec<u64>, Vec<Flat>, Vec<HoleVal>) {
     let mut flats = Vec::new();
     for p in preds {
         flatten(p, &mut Vec::new(), &mut flats);
     }
     let grouped = carry.is_some();
     if let Some((path, h, hv)) = carry {
-        let mut sig = vec![path.len() as u32];
-        sig.extend(path.iter().map(|&x| x as u32));
+        let mut sig = vec![path.len() as u64];
+        sig.extend(path.iter().map(|&x| x as u64));
         match hv {
-            HoleVal::Order(desc) => sig.extend([7, h as u32, desc as u32]),
-            HoleVal::Group(sum) => sig.extend([6, h as u32, sum]),
-            _ => sig.extend([6, h as u32]),
+            HoleVal::Order(desc) => sig.extend([7, h as u64, desc as u64]),
+            HoleVal::Group(sum) => sig.extend([6, h as u64, sum as u64]),
+            _ => sig.extend([6, h as u64]),
         }
         flats.push(Flat { path, sig, leaf: Leaf::Hole(h, hv) });
     }
@@ -1401,7 +1483,7 @@ fn canonical(preds: Vec<LivePred>, carry: Option<(Vec<u16>, u16, HoleVal)>) -> (
         if let Leaf::Hole(h, HoleVal::Range(lo, hi)) = f.leaf {
             if !first {
                 f.sig.truncate(1 + f.path.len());
-                f.sig.extend([5, h as u32, lo, hi]);
+                f.sig.extend([5, h as u64, lo, hi]);
                 f.leaf = Leaf::Fixed(Pred::Range(h, lo, hi));
             }
             first = false;
@@ -1410,7 +1492,7 @@ fn canonical(preds: Vec<LivePred>, carry: Option<(Vec<u16>, u16, HoleVal)>) -> (
     flats.sort_by(order);
     let mut sig = Vec::new();
     for f in &flats {
-        sig.push(f.sig.len() as u32);
+        sig.push(f.sig.len() as u64);
         sig.extend_from_slice(&f.sig);
     }
     let key = flats.iter().filter_map(|f| f.hole().cloned()).collect();
@@ -1418,7 +1500,7 @@ fn canonical(preds: Vec<LivePred>, carry: Option<(Vec<u16>, u16, HoleVal)>) -> (
 }
 
 /// 束ねた形: (形, 条件, 枝ごとの鍵の選択肢)。
-type Shape = (Vec<u32>, Vec<Flat>, Vec<Vec<HoleVal>>);
+type Shape = (Vec<u64>, Vec<Flat>, Vec<Vec<HoleVal>>);
 
 /// 枝 (`Or` 展開済み) を運ぶ穴 `carry` 付きで 1 つの形に束ねる: (形, 条件, 枝ごとの鍵の選択肢)。
 /// 形の違う枝があれば Err (集計 / 上位 k 件は鍵を複数持つ 1 つの member にしかできない)。
@@ -1427,7 +1509,7 @@ fn one_shape(
     carry: (Vec<u16>, u16, HoleVal),
     what: &str,
 ) -> Result<Shape, String> {
-    let mut shape: Option<(Vec<u32>, Vec<Flat>)> = None;
+    let mut shape: Option<(Vec<u64>, Vec<Flat>)> = None;
     let mut alts = Vec::new();
     for b in branches {
         let (mut sig, flats, key) = canonical(b, Some(carry.clone()));
@@ -1542,7 +1624,7 @@ struct Pending {
 }
 
 /// 節の答え: (鍵 id, 範囲の穴の値)。 値は根と範囲の穴の節を結ぶ道の上の節だけが持つ (他は 0)。
-type Ans = (u32, u32);
+type Ans = (u32, u64);
 
 /// 購読 1 本ぶんの報告状態。
 struct Member {
@@ -1554,11 +1636,11 @@ struct Member {
     /// 有効化した鍵の根の鍵 id (昇順)。 根の鍵がどれかに一致すれば集合に居る。
     root_keys: Vec<u32>,
     /// 範囲の穴の範囲 (family に範囲の穴がある時。 束ねる枝は範囲が同じもの)。
-    range: Option<(u32, u32)>,
+    range: Option<(u64, u64)>,
     /// 範囲を帯に載せたか。
     range_on: bool,
     /// 有効化した鍵の組 (表から外す時に射影を計算し直す)。
-    tuples: Vec<Vec<u32>>,
+    tuples: Vec<Vec<u64>>,
     /// 最後の poll で呼び手に渡した集合 (= 呼び手が積分済みの集合)。
     reported: Bits,
     /// 最後の poll 以降に一度でも集合を出た eid。 報告済みかつ今も集合に居ても、 これが
@@ -1586,39 +1668,49 @@ struct Member {
 #[derive(Clone, Copy)]
 struct TopK {
     k: usize,
-    th: Option<(u32, u32)>,
+    th: Option<(u64, u32)>,
 }
 
 impl TopK {
     #[inline]
-    fn holds(&self, x: (u32, u32)) -> bool {
+    fn holds(&self, x: (u64, u32)) -> bool {
         self.th.is_none_or(|th| x <= th)
     }
 }
 
-/// group 1 つの集計: 根の数と、 合計する列の値の和 (値の無い根は 0 として足す = SQL の SUM)。
+/// group 1 つの集計: 根の数と、 合計する列の値の和 (値の無い根は足さない = SQL の SUM)。
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Agg {
     pub count: u64,
-    pub sum: u64,
+    /// 合計 (64 bit の値を足しても溢れないよう u128)。
+    pub sum: u128,
+    /// 合計の列に値のある根の数 (`sum` に足した数)。 値を符号化して載せる列 (schema の BigInt) が
+    /// 合計を元の値に戻すのに使う。
+    pub summed: u64,
 }
 
 impl Agg {
+    /// 根 1 つ。 `stored` = 合計する列の値 + 1 (0 = 値が無い)。
     #[inline]
-    fn one(x: u32) -> Agg {
-        Agg { count: 1, sum: x as u64 }
+    fn one(stored: u64) -> Agg {
+        match stored {
+            0 => Agg { count: 1, sum: 0, summed: 0 },
+            s => Agg { count: 1, sum: (s - 1) as u128, summed: 1 },
+        }
     }
 
     #[inline]
     fn add(&mut self, o: Agg) {
         self.count = self.count.wrapping_add(o.count);
         self.sum = self.sum.wrapping_add(o.sum);
+        self.summed = self.summed.wrapping_add(o.summed);
     }
 
     #[inline]
     fn sub(&mut self, o: Agg) {
         self.count = self.count.wrapping_sub(o.count);
         self.sum = self.sum.wrapping_sub(o.sum);
+        self.summed = self.summed.wrapping_sub(o.summed);
     }
 }
 
@@ -1626,13 +1718,13 @@ impl Agg {
 /// 「どの group の件数が動いたか」 と 「最後に渡した件数」 だけ。
 #[derive(Default)]
 struct GroupState {
-    changed: Marks,
-    reported: std::collections::BTreeMap<u32, Agg>,
+    changed: Marks<u64>,
+    reported: std::collections::BTreeMap<u64, Agg>,
 }
 
 impl GroupState {
     /// 動いた group の今の集計 (最後に渡したものと違うものだけ、 値の昇順。 件数 0 = group が消えた)。
-    fn drain(&mut self, groups: &std::collections::BTreeMap<u32, Agg>) -> Vec<(u32, Agg)> {
+    fn drain(&mut self, groups: &std::collections::BTreeMap<u64, Agg>) -> Vec<(u64, Agg)> {
         let mut out = Vec::new();
         for v in self.changed.take() {
             let now = groups.get(&v).copied().unwrap_or_default();
@@ -1678,7 +1770,7 @@ impl Member {
     }
 
     /// `has` の、 member 全体を借用しない版。
-    fn probe(keys: &[u32], range: Option<(u32, u32)>, topk: Option<(TopK, bool)>) -> impl Fn(u32, Option<Ans>) -> bool + '_ {
+    fn probe(keys: &[u32], range: Option<(u64, u64)>, topk: Option<(TopK, bool)>) -> impl Fn(u32, Option<Ans>) -> bool + '_ {
         move |e, rec| match rec {
             Some((id, v)) => {
                 (if keys.len() == 1 { keys[0] == id } else { keys.binary_search(&id).is_ok() })
@@ -1692,8 +1784,8 @@ impl Member {
 
 /// 並びの値を鍵の順序に載せる形に (降順は反転して昇順で持つ)。
 #[inline]
-fn order_val(v: u32, desc: bool) -> u32 {
-    if desc { u32::MAX - v } else { v }
+fn order_val(v: u64, desc: bool) -> u64 {
+    if desc { u64::MAX - v } else { v }
 }
 
 /// changed を消費して差分を返し、 報告済みの集合を進める (member と `Or` の購読で共通)。
@@ -1730,7 +1822,7 @@ fn drain_marks(changed: &mut Marks, left: &mut Marks, reported: &mut Bits, now: 
 
 /// 節 `n` の記録 (`None` = 不明)。 範囲の値は `vals` に `v + 1` で持つ (0 = なし)。
 #[inline]
-fn rec_at(recs: &[KeyStore], vals: &[Words], n: usize, e: u32) -> Option<Option<Ans>> {
+fn rec_at(recs: &[KeyStore], vals: &[ValWords], n: usize, e: u32) -> Option<Option<Ans>> {
     match recs[n].get(e) {
         Rec::Unknown => None,
         Rec::Known(k) => Some(k.map(|id| (id, vals[n].get(e).saturating_sub(1)))),
@@ -1739,7 +1831,7 @@ fn rec_at(recs: &[KeyStore], vals: &[Words], n: usize, e: u32) -> Option<Option<
 
 /// 根の答え。
 #[inline]
-fn root_at(recs: &[KeyStore], vals: &[Words], e: u32) -> Option<Ans> {
+fn root_at(recs: &[KeyStore], vals: &[ValWords], e: u32) -> Option<Ans> {
     recs[0].key(e).map(|id| (id, vals[0].get(e).saturating_sub(1)))
 }
 
@@ -1748,7 +1840,7 @@ struct Settled {
     /// 節ごとの記録 (添字 0 = 根の現在の鍵)。
     recs: Vec<KeyStore>,
     /// 節ごとの範囲の穴の値 (範囲の穴から根への道の上の節だけ使う)。
-    vals: Vec<Words>,
+    vals: Vec<ValWords>,
     /// 範囲の穴の値の帯。
     slabs: Slabs,
     /// 節ごとの鍵の表。
@@ -1768,8 +1860,8 @@ struct Settled {
     fresh: Vec<usize>,
     /// 次の settle は答えが変わらなくても展開する (`fresh` の初回の報告のため)。
     force: bool,
-    /// 合計する列のある集計の family: 根ごとに、 今数えている合計の値 (`Family::sum`)。
-    summand: Words,
+    /// 合計する列のある集計の family: 根ごとに、 今数えている合計の値 + 1 (0 = 値が無い、 `Family::sum`)。
+    summand: ValWords,
     /// `Exists` ごと: 指している entity (中身を満たすもの) が 1 つ以上ある entity。 `Family::exists` の
     /// 集計の購読の差分で動かす。
     exists: Vec<Bits>,
@@ -1782,17 +1874,18 @@ struct Settled {
 
 /// 上位 k 件の塊 (1 段目の先 = 会社) の値と、 塊のある鍵。
 struct OrderPart {
-    v: u32,
+    v: u64,
     keys: Vec<u32>,
 }
 
 /// member の条件に当てる根の答え (鍵, 範囲 / 並びの値)。 並びの列が根でない上位 k 件では記録の
 /// 1 段目の先を今の並びの値に引き直す。
 #[inline]
-fn view_at(recs: &[KeyStore], vals: &[Words], opart: &std::collections::BTreeMap<u32, OrderPart>, ov: Option<()>, e: u32) -> Option<Ans> {
+fn view_at(recs: &[KeyStore], vals: &[ValWords], opart: &std::collections::BTreeMap<u32, OrderPart>, ov: Option<()>, e: u32) -> Option<Ans> {
     let a = root_at(recs, vals, e)?;
     match ov {
-        Some(()) => Some((a.0, opart.get(&a.1).map_or(0, |p| p.v))),
+        // この形では記録の値は 1 段目の先の entity (u32)
+        Some(()) => Some((a.0, opart.get(&(a.1 as u32)).map_or(0, |p| p.v))),
         None => Some(a),
     }
 }
@@ -1800,7 +1893,7 @@ fn view_at(recs: &[KeyStore], vals: &[Words], opart: &std::collections::BTreeMap
 /// 集計で 1 段目の先の entity `t` (会社) を指している根の部分和。
 struct Partial {
     /// `t` の根を今数えている group の値。
-    g: u32,
+    g: u64,
     /// 根の鍵 id → その鍵で `t` を指して数えている根の集計。
     n: Vec<(u32, Agg)>,
 }
@@ -1848,7 +1941,7 @@ struct RootKey {
     /// 範囲の穴のある family: member の範囲の索引 (member が変わったら None に戻して作り直す)。
     ivs: Option<Ivs>,
     /// 集計の family: group の値 → その値の根の集計 (根の数 0 の group は載せない)。
-    groups: std::collections::BTreeMap<u32, Agg>,
+    groups: std::collections::BTreeMap<u64, Agg>,
     /// 上位 k 件の family: この鍵の根を (並びの値 (降順は反転), eid) の昇順で。
     order: OrderIndex,
 }
@@ -1856,17 +1949,126 @@ struct RootKey {
 /// 上位 k 件の順序 ((並びの値, eid) の昇順)。
 enum OrderIndex {
     /// 根ごとに値を持つ。
-    Flat(std::collections::BTreeSet<(u32, u32)>),
+    Flat(FlatSet),
     /// 並びの列が ref の先の時: 1 段目の先 (会社) を値の順に並べ、 会社ごとに根を eid の昇順で持つ。
     /// 全体の順序は (会社の値, 根の eid) = `Flat` と同じ。 会社の値が変わっても会社 1 つを付け替える
     /// だけで、 配下の根を 1 件ずつ動かさない (`RootKey::move_block`)。
     Blocks(Blocks),
 }
 
+/// `(並びの値, eid)` の昇順の集合。 値が基準 (`base`) から 2^32 未満の間は `(値 - base) << 32 | eid` の
+/// u64 1 つ (8 B) で持ち、 外れる値が来たら組 (16 B) に作り直す (u32 の列の索引を u64 化前の大きさに保つ)。
+/// 基準は最初の値で決める: 昇順の u32 の値は 0、 降順 (`u64::MAX - v`) の u32 の値は `u64::MAX - u32::MAX`。
+enum FlatSet {
+    Narrow { base: u64, set: std::collections::BTreeSet<u64> },
+    Wide(std::collections::BTreeSet<(u64, u32)>),
+}
+
+const NARROW_HI: u64 = u64::MAX - u32::MAX as u64;
+
+impl FlatSet {
+    fn new() -> Self {
+        FlatSet::Narrow { base: 0, set: std::collections::BTreeSet::new() }
+    }
+
+    /// 詰めた形 (`base` の窓に入らなければ None)。
+    #[inline]
+    fn pack(base: u64, x: (u64, u32)) -> Option<u64> {
+        let d = x.0.checked_sub(base)?;
+        (d <= u32::MAX as u64).then_some((d << 32) | x.1 as u64)
+    }
+
+    #[inline]
+    fn unpack(base: u64, k: u64) -> (u64, u32) {
+        (base + (k >> 32), k as u32)
+    }
+
+    fn insert(&mut self, x: (u64, u32)) {
+        if let FlatSet::Narrow { base, set } = self {
+            if set.is_empty() {
+                *base = if x.0 >= NARROW_HI { NARROW_HI } else { 0 };
+            }
+            if let Some(k) = Self::pack(*base, x) {
+                set.insert(k);
+                return;
+            }
+            let b = *base;
+            *self = FlatSet::Wide(set.iter().map(|&k| Self::unpack(b, k)).collect());
+        }
+        let FlatSet::Wide(w) = self else { unreachable!("widened above") };
+        w.insert(x);
+    }
+
+    fn remove(&mut self, x: (u64, u32)) -> bool {
+        match self {
+            FlatSet::Narrow { base, set } => Self::pack(*base, x).is_some_and(|k| set.remove(&k)),
+            FlatSet::Wide(w) => w.remove(&x),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            FlatSet::Narrow { set, .. } => set.len(),
+            FlatSet::Wide(w) => w.len(),
+        }
+    }
+
+    fn first(&self) -> Option<(u64, u32)> {
+        match self {
+            FlatSet::Narrow { base, set } => set.first().map(|&k| Self::unpack(*base, k)),
+            FlatSet::Wide(w) => w.first().copied(),
+        }
+    }
+
+    fn last(&self) -> Option<(u64, u32)> {
+        match self {
+            FlatSet::Narrow { base, set } => set.last().map(|&k| Self::unpack(*base, k)),
+            FlatSet::Wide(w) => w.last().copied(),
+        }
+    }
+
+    /// `x` より後の最初の要素 (`x` は集合に無くてよい)。
+    fn succ(&self, x: (u64, u32)) -> Option<(u64, u32)> {
+        match self {
+            FlatSet::Narrow { base, set } => {
+                if x.0 < *base {
+                    return self.first();
+                }
+                let k = Self::pack(*base, x)?; // 窓より上 = 後ろに要素は無い
+                set.range((std::ops::Bound::Excluded(k), std::ops::Bound::Unbounded)).next().map(|&k| Self::unpack(*base, k))
+            }
+            FlatSet::Wide(w) => w.range((std::ops::Bound::Excluded(x), std::ops::Bound::Unbounded)).next().copied(),
+        }
+    }
+
+    /// `x` より前の最後の要素 (`x` は集合に無くてよい)。
+    fn pred(&self, x: (u64, u32)) -> Option<(u64, u32)> {
+        match self {
+            FlatSet::Narrow { base, set } => {
+                if x.0 < *base {
+                    return None;
+                }
+                match Self::pack(*base, x) {
+                    Some(k) => set.range(..k).next_back().map(|&k| Self::unpack(*base, k)),
+                    None => self.last(), // 窓より上 = 全部が前
+                }
+            }
+            FlatSet::Wide(w) => w.range(..x).next_back().copied(),
+        }
+    }
+
+    fn first_k(&self, k: usize) -> Vec<(u64, u32)> {
+        match self {
+            FlatSet::Narrow { base, set } => set.iter().take(k).map(|&x| Self::unpack(*base, x)).collect(),
+            FlatSet::Wide(w) => w.iter().take(k).copied().collect(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Blocks {
     /// (会社の値, 会社)。 根の居る会社だけ。
-    by_val: std::collections::BTreeSet<(u32, u32)>,
+    by_val: std::collections::BTreeSet<(u64, u32)>,
     /// 会社 → その会社を指す根 (昇順)。
     rows: std::collections::BTreeMap<u32, Vec<u32>>,
     len: usize,
@@ -1874,11 +2076,11 @@ struct Blocks {
 
 impl Blocks {
     /// 値 `v` の会社の根の列。
-    fn at(&self, v: u32) -> impl Iterator<Item = &Vec<u32>> {
+    fn at(&self, v: u64) -> impl Iterator<Item = &Vec<u32>> {
         self.by_val.range((v, 0)..=(v, u32::MAX)).filter_map(|(_, t)| self.rows.get(t))
     }
 
-    fn succ(&self, x: (u32, u32)) -> Option<(u32, u32)> {
+    fn succ(&self, x: (u64, u32)) -> Option<(u64, u32)> {
         let same = self.at(x.0).filter_map(|r| r.get(r.partition_point(|&e| e <= x.1)).copied()).min();
         if let Some(e) = same {
             return Some((x.0, e));
@@ -1887,7 +2089,7 @@ impl Blocks {
         self.at(v).filter_map(|r| r.first().copied()).min().map(|e| (v, e))
     }
 
-    fn pred(&self, x: (u32, u32)) -> Option<(u32, u32)> {
+    fn pred(&self, x: (u64, u32)) -> Option<(u64, u32)> {
         let same = self.at(x.0).filter_map(|r| r.partition_point(|&e| e < x.1).checked_sub(1).map(|i| r[i])).max();
         if let Some(e) = same {
             return Some((x.0, e));
@@ -1896,12 +2098,12 @@ impl Blocks {
         self.at(v).filter_map(|r| r.last().copied()).max().map(|e| (v, e))
     }
 
-    fn first(&self) -> Option<(u32, u32)> {
+    fn first(&self) -> Option<(u64, u32)> {
         let v = self.by_val.first()?.0;
         self.at(v).filter_map(|r| r.first().copied()).min().map(|e| (v, e))
     }
 
-    fn last(&self) -> Option<(u32, u32)> {
+    fn last(&self) -> Option<(u64, u32)> {
         let v = self.by_val.last()?.0;
         self.at(v).filter_map(|r| r.last().copied()).max().map(|e| (v, e))
     }
@@ -1909,11 +2111,9 @@ impl Blocks {
 
 impl OrderIndex {
     /// `x` を足す (`t` = 1 段目の先、 `Blocks` の時だけ使う)。
-    fn insert(&mut self, x: (u32, u32), t: u32) {
+    fn insert(&mut self, x: (u64, u32), t: u32) {
         match self {
-            OrderIndex::Flat(s) => {
-                s.insert(x);
-            }
+            OrderIndex::Flat(s) => s.insert(x),
             OrderIndex::Blocks(b) => {
                 b.by_val.insert((x.0, t));
                 let r = b.rows.entry(t).or_default();
@@ -1926,9 +2126,9 @@ impl OrderIndex {
     }
 
     /// `x` を外す。 あったら true。
-    fn remove(&mut self, x: (u32, u32), t: u32) -> bool {
+    fn remove(&mut self, x: (u64, u32), t: u32) -> bool {
         match self {
-            OrderIndex::Flat(s) => s.remove(&x),
+            OrderIndex::Flat(s) => s.remove(x),
             OrderIndex::Blocks(b) => {
                 let Some(r) = b.rows.get_mut(&t) else { return false };
                 let Ok(p) = r.binary_search(&x.1) else { return false };
@@ -1950,40 +2150,40 @@ impl OrderIndex {
         }
     }
 
-    fn first(&self) -> Option<(u32, u32)> {
+    fn first(&self) -> Option<(u64, u32)> {
         match self {
-            OrderIndex::Flat(s) => s.first().copied(),
+            OrderIndex::Flat(s) => s.first(),
             OrderIndex::Blocks(b) => b.first(),
         }
     }
 
-    fn last(&self) -> Option<(u32, u32)> {
+    fn last(&self) -> Option<(u64, u32)> {
         match self {
-            OrderIndex::Flat(s) => s.last().copied(),
+            OrderIndex::Flat(s) => s.last(),
             OrderIndex::Blocks(b) => b.last(),
         }
     }
 
     /// `x` より後の最初の要素。
-    fn succ(&self, x: (u32, u32)) -> Option<(u32, u32)> {
+    fn succ(&self, x: (u64, u32)) -> Option<(u64, u32)> {
         match self {
-            OrderIndex::Flat(s) => s.range((std::ops::Bound::Excluded(x), std::ops::Bound::Unbounded)).next().copied(),
+            OrderIndex::Flat(s) => s.succ(x),
             OrderIndex::Blocks(b) => b.succ(x),
         }
     }
 
     /// `x` より前の最後の要素。
-    fn pred(&self, x: (u32, u32)) -> Option<(u32, u32)> {
+    fn pred(&self, x: (u64, u32)) -> Option<(u64, u32)> {
         match self {
-            OrderIndex::Flat(s) => s.range(..x).next_back().copied(),
+            OrderIndex::Flat(s) => s.pred(x),
             OrderIndex::Blocks(b) => b.pred(x),
         }
     }
 
     /// 先頭 `k` 個。
-    fn first_k(&self, k: usize) -> Vec<(u32, u32)> {
+    fn first_k(&self, k: usize) -> Vec<(u64, u32)> {
         match self {
-            OrderIndex::Flat(s) => s.iter().take(k).copied().collect(),
+            OrderIndex::Flat(s) => s.first_k(k),
             OrderIndex::Blocks(b) => {
                 let mut out = Vec::with_capacity(k.min(b.len));
                 let mut cur = b.first();
@@ -2005,7 +2205,7 @@ impl RootKey {
             count: 0,
             ivs: None,
             groups: std::collections::BTreeMap::new(),
-            order: OrderIndex::Flat(std::collections::BTreeSet::new()),
+            order: OrderIndex::Flat(FlatSet::new()),
         }
     }
 
@@ -2042,28 +2242,28 @@ impl<'a> OrderView<'a> {
         }
     }
 
-    fn first(&self) -> Option<(u32, u32)> {
+    fn first(&self) -> Option<(u64, u32)> {
         match self {
             OrderView::One(o) => o.first(),
             OrderView::Many(os) => os.iter().filter_map(|o| o.first()).min(),
         }
     }
 
-    fn last(&self) -> Option<(u32, u32)> {
+    fn last(&self) -> Option<(u64, u32)> {
         match self {
             OrderView::One(o) => o.last(),
             OrderView::Many(os) => os.iter().filter_map(|o| o.last()).max(),
         }
     }
 
-    fn succ(&self, x: (u32, u32)) -> Option<(u32, u32)> {
+    fn succ(&self, x: (u64, u32)) -> Option<(u64, u32)> {
         match self {
             OrderView::One(o) => o.succ(x),
             OrderView::Many(os) => os.iter().filter_map(|o| o.succ(x)).min(),
         }
     }
 
-    fn pred(&self, x: (u32, u32)) -> Option<(u32, u32)> {
+    fn pred(&self, x: (u64, u32)) -> Option<(u64, u32)> {
         match self {
             OrderView::One(o) => o.pred(x),
             OrderView::Many(os) => os.iter().filter_map(|o| o.pred(x)).max(),
@@ -2071,7 +2271,7 @@ impl<'a> OrderView<'a> {
     }
 
     /// 先頭 `k` 個。
-    fn first_k(&self, k: usize) -> Vec<(u32, u32)> {
+    fn first_k(&self, k: usize) -> Vec<(u64, u32)> {
         if let OrderView::One(o) = self {
             return o.first_k(k);
         }
@@ -2086,7 +2286,7 @@ impl<'a> OrderView<'a> {
 }
 
 /// 鍵 `i` の順序に `x` を足し、 鍵の各 member の境界を動かして出入りに印を付ける (`t` = 1 段目の先)。
-fn order_insert(keys: &mut [RootKey], i: usize, x: (u32, u32), t: u32, members: &mut [Option<Member>], ready: &mut Vec<usize>) {
+fn order_insert(keys: &mut [RootKey], i: usize, x: (u64, u32), t: u32, members: &mut [Option<Member>], ready: &mut Vec<usize>) {
     keys[i].order.insert(x, t);
     let keys = &*keys;
     for &slot in &keys[i].members {
@@ -2114,7 +2314,7 @@ fn order_insert(keys: &mut [RootKey], i: usize, x: (u32, u32), t: u32, members: 
 }
 
 /// 鍵 `i` の順序から `x` を外し、 鍵の各 member の境界を動かして出入りに印を付ける。
-fn order_remove(keys: &mut [RootKey], i: usize, x: (u32, u32), t: u32, members: &mut [Option<Member>], ready: &mut Vec<usize>) {
+fn order_remove(keys: &mut [RootKey], i: usize, x: (u64, u32), t: u32, members: &mut [Option<Member>], ready: &mut Vec<usize>) {
     if !keys[i].order.remove(x, t) {
         return;
     }
@@ -2142,13 +2342,13 @@ fn order_remove(keys: &mut [RootKey], i: usize, x: (u32, u32), t: u32, members: 
 /// 鍵 `i` の会社 `t` (`Blocks`) の値が `v1` → `v2` になった: 会社 1 つを付け替え、 鍵の各 member の
 /// 境界を動かす。 触るのは上位 k 件に居た / 入る配下と境界の前後だけ (出力の数 × log)。 上位 k 件から
 /// 遠い会社の変化は O(log)。
-fn move_block(keys: &mut [RootKey], i: usize, t: u32, v1: u32, v2: u32, members: &mut [Option<Member>], ready: &mut Vec<usize>) {
+fn move_block(keys: &mut [RootKey], i: usize, t: u32, v1: u64, v2: u64, members: &mut [Option<Member>], ready: &mut Vec<usize>) {
     let OrderIndex::Blocks(b) = &mut keys[i].order else { return };
     let Some(rows) = b.rows.remove(&t) else { return };
     b.by_val.remove(&(v1, t));
     b.len -= rows.len();
     // 外す: 境界以前に居た c1 人が抜け、 境界が c1 個後ろへ
-    let le = |v: u32, th: (u32, u32)| {
+    let le = |v: u64, th: (u64, u32)| {
         if v < th.0 {
             rows.len()
         } else if v > th.0 {
@@ -2192,7 +2392,7 @@ fn move_block(keys: &mut [RootKey], i: usize, t: u32, v1: u32, v2: u32, members:
     b.len += rows.len();
     let placed = rows.clone();
     b.rows.insert(t, rows);
-    let lt = |v: u32, th: (u32, u32)| {
+    let lt = |v: u64, th: (u64, u32)| {
         if v < th.0 {
             placed.len()
         } else if v > th.0 {
@@ -2267,7 +2467,7 @@ impl Settled {
     fn new(widths: &[usize]) -> Self {
         Settled {
             recs: widths.iter().map(|_| KeyStore::default()).collect(),
-            vals: widths.iter().map(|_| Words::default()).collect(),
+            vals: widths.iter().map(|_| ValWords::default()).collect(),
             slabs: Slabs::default(),
             tables: widths.iter().map(|&w| KeyTable::new(w)).collect(),
             keys: Vec::new(),
@@ -2277,7 +2477,7 @@ impl Settled {
             partial: std::collections::BTreeMap::new(),
             fresh: Vec::new(),
             force: false,
-            summand: Words::default(),
+            summand: ValWords::default(),
             exists: Vec::new(),
             order_view: None,
             opart: std::collections::BTreeMap::new(),
@@ -2291,7 +2491,7 @@ impl Settled {
 
     /// 上位 k 件の塊の family: 根 `eid` の答えを `now` (鍵, 1 段目の先 `t`) にする。 `v` = 今の
     /// `t` の並びの値 (`t` の塊がまだ無い時だけ使う。 ずれは `t` の評価し直しで `move_order` が直す)。
-    fn apply_root_order_part(&mut self, eid: u32, now: Option<Ans>, v: u32, desc: bool) {
+    fn apply_root_order_part(&mut self, eid: u32, now: Option<Ans>, v: u64, desc: bool) {
         let was = self.root(eid);
         if was == now {
             return;
@@ -2299,7 +2499,8 @@ impl Settled {
         self.recs[0].set_root(eid, now.map(|a| a.0));
         self.vals[0].put(eid, now.map_or(0, |a| a.1 + 1));
         let Settled { keys, members, ready, opart, .. } = self;
-        if let Some((k, t)) = was
+        // この形では記録の値は 1 段目の先の entity (u32)
+        if let Some((k, t)) = was.map(|(k, t)| (k, t as u32))
             && let Ok(i) = keys.binary_search_by_key(&k, |x| x.id)
         {
             let tv = opart.get(&t).map_or(0, |p| p.v);
@@ -2313,7 +2514,7 @@ impl Settled {
                 }
             }
         }
-        if let Some((k, t)) = now
+        if let Some((k, t)) = now.map(|(k, t)| (k, t as u32))
             && let Ok(i) = keys.binary_search_by_key(&k, |x| x.id)
         {
             let p = opart.entry(t).or_insert_with(|| OrderPart { v, keys: Vec::new() });
@@ -2327,7 +2528,7 @@ impl Settled {
     }
 
     /// 1 段目の先 `t` の並びの値が `v` になった: 塊を全部の鍵で付け替える (配下の根を評価しない)。
-    fn move_order(&mut self, t: u32, v: u32, desc: bool) {
+    fn move_order(&mut self, t: u32, v: u64, desc: bool) {
         let Settled { keys, members, ready, opart, .. } = self;
         let Some(p) = opart.get_mut(&t) else { return };
         if p.v == v {
@@ -2342,7 +2543,7 @@ impl Settled {
     }
 
     /// 根の鍵 `k` の group `g` に `d` を足す (`add` = false なら引く)。 鍵の member に 「g が動いた」 を積む。
-    fn bump_group(keys: &mut [RootKey], members: &mut [Option<Member>], k: u32, g: u32, d: Agg, add: bool) {
+    fn bump_group(keys: &mut [RootKey], members: &mut [Option<Member>], k: u32, g: u64, d: Agg, add: bool) {
         let Ok(i) = keys.binary_search_by_key(&k, |x| x.id) else { return };
         let rk = &mut keys[i];
         let c = rk.groups.entry(g).or_default();
@@ -2363,7 +2564,7 @@ impl Settled {
 
     /// 1 段目の先 `t` の group の値が `g` になった: `t` を指して数えている根を全部まとめて移す
     /// (根を 1 件ずつ評価しない)。
-    fn move_partial(&mut self, t: u32, g: u32) {
+    fn move_partial(&mut self, t: u32, g: u64) {
         let Settled { partial, keys, members, .. } = self;
         let Some(p) = partial.get_mut(&t) else { return };
         if p.g == g {
@@ -2383,7 +2584,7 @@ impl Settled {
     /// 下が書き換わった時で、 その印で `t` を評価し直した時に `move_partial` が全部移す)。
     ///
     /// `x` = 根の合計する列の今の値 (合計しない family では 0)。
-    fn apply_root_partial(&mut self, eid: u32, now: Option<Ans>, g: u32, x: u32) {
+    fn apply_root_partial(&mut self, eid: u32, now: Option<Ans>, g: u64, x: u64) {
         let was = self.root(eid);
         let wx = self.summand.get(eid);
         let x = if now.is_some() { x } else { 0 };
@@ -2394,7 +2595,8 @@ impl Settled {
         self.vals[0].put(eid, now.map_or(0, |a| a.1 + 1));
         self.summand.put(eid, x);
         let Settled { partial, keys, members, .. } = self;
-        if let Some((k, t)) = was {
+        // この形では記録の値は 1 段目の先の entity (u32)
+        if let Some((k, t)) = was.map(|(k, t)| (k, t as u32)) {
             if let Ok(i) = keys.binary_search_by_key(&k, |x| x.id) {
                 keys[i].count -= 1;
             }
@@ -2412,7 +2614,7 @@ impl Settled {
                 Settled::bump_group(keys, members, k, pg, Agg::one(wx), false);
             }
         }
-        if let Some((k, t)) = now {
+        if let Some((k, t)) = now.map(|(k, t)| (k, t as u32)) {
             if let Ok(i) = keys.binary_search_by_key(&k, |x| x.id) {
                 keys[i].count += 1;
             }
@@ -2436,7 +2638,7 @@ impl Settled {
     #[inline]
     ///
     /// `x` = 根の合計する列の今の値 (集計で合計する family 以外は 0)。
-    fn apply_root_cached(&mut self, eid: u32, now: Option<Ans>, x: u32, mode: RootMode, cache: &mut KeyCache, fresh: &[usize]) {
+    fn apply_root_cached(&mut self, eid: u32, now: Option<Ans>, x: u64, mode: RootMode, cache: &mut KeyCache, fresh: &[usize]) {
         let was = self.root(eid);
         // 既にある鍵に加わったばかりの member: 集合に居る根を初回の報告に積む (遷移しない根も)
         if now.is_some() {
@@ -2573,7 +2775,7 @@ impl Settled {
 /// 1 回だけやり、 結果は根の鍵 (穴の値の並び) ごとに member へ振り分ける。
 pub(crate) struct Family {
     id: u64,
-    sig: Vec<u32>,
+    sig: Vec<u64>,
     nodes: Vec<Node>,
     /// 深い節から順に並べた節の添字 (根が最後)。
     order: Vec<usize>,
@@ -2612,13 +2814,13 @@ pub(crate) struct Family {
 
 /// 穴の値を解決して鍵の組 (穴の値の並び) を返す。 `In` の穴は値の数だけ組が増える (組の掛け算)。
 /// 範囲の穴などの位置は 0 (範囲は `range_of`)。 text が vocab に無ければ None。
-fn resolve(r: &impl CellReader, key: &[HoleVal]) -> Option<Vec<Vec<u32>>> {
-    let mut out: Vec<Vec<u32>> = vec![Vec::with_capacity(key.len())];
+fn resolve(r: &impl CellReader, key: &[HoleVal]) -> Option<Vec<Vec<u64>>> {
+    let mut out: Vec<Vec<u64>> = vec![Vec::with_capacity(key.len())];
     for v in key {
-        let choices: Vec<u32> = match v {
+        let choices: Vec<u64> = match v {
             HoleVal::Id(x) => vec![*x],
             HoleVal::Ids(xs) => xs.clone(),
-            HoleVal::Text(t) => vec![r.vocab_lookup(t)?],
+            HoleVal::Text(t) => vec![r.vocab_lookup(t)? as u64],
             HoleVal::Range(..) | HoleVal::Group(_) | HoleVal::Order(_) => vec![0],
         };
         out = if choices.len() == 1 {
@@ -2657,7 +2859,7 @@ pub(crate) fn key_count(preds: &[LivePred]) -> usize {
     preds.iter().map(one).fold(1usize, |a, b| a.saturating_mul(b))
 }
 
-fn range_of(key: &[HoleVal]) -> Option<(u32, u32)> {
+fn range_of(key: &[HoleVal]) -> Option<(u64, u64)> {
     key.iter().find_map(|v| match v {
         HoleVal::Range(lo, hi) => Some((*lo, *hi)),
         _ => None,
@@ -2666,7 +2868,7 @@ fn range_of(key: &[HoleVal]) -> Option<(u32, u32)> {
 
 impl Family {
     /// `exists` = `number_exists` が返した順の集計の購読 (中身の件数)。
-    fn new(id: u64, sig: Vec<u32>, flats: Vec<Flat>, exists: Vec<LiveCounts>) -> Self {
+    fn new(id: u64, sig: Vec<u64>, flats: Vec<Flat>, exists: Vec<LiveCounts>) -> Self {
         let kind = flats
             .iter()
             .find_map(|f| match f.leaf {
@@ -2888,9 +3090,9 @@ impl Family {
                 return None;
             }
         }
-        let mut stack = [0u32; 8];
+        let mut stack = [0u64; 8];
         let mut heap = Vec::new();
-        let buf: &mut [u32] = if node.key_len <= stack.len() {
+        let buf: &mut [u64] = if node.key_len <= stack.len() {
             &mut stack[..node.key_len]
         } else {
             heap.resize(node.key_len, 0);
@@ -2905,7 +3107,7 @@ impl Family {
             let (id, cv) = match known {
                 Some((kc, ans)) if kc == c => ans,
                 _ => {
-                    let t = r.cell(self.nodes[c].via, e)?;
+                    let t = r.ref_cell(self.nodes[c].via, e)?;
                     match rec_at(&s.recs, &s.vals, c, t) {
                         Some(ans) => ans,
                         None => self.eval(r, s, c, t),
@@ -2916,7 +3118,7 @@ impl Family {
                 v = cv;
             }
             if self.nodes[c].has_holes {
-                buf[i] = id;
+                buf[i] = id as u64;
                 i += 1;
             }
         }
@@ -2924,14 +3126,14 @@ impl Family {
     }
 
     /// member の鍵の射影を各節の表に載せ、 根の鍵 id を返す。
-    fn install(&self, s: &mut Settled, vals: &[u32]) -> u32 {
+    fn install(&self, s: &mut Settled, vals: &[u64]) -> u32 {
         let mut ids = vec![0u32; self.nodes.len()];
-        let mut buf = Vec::new();
+        let mut buf: Vec<u64> = Vec::new();
         for &n in &self.order {
             let node = &self.nodes[n];
             buf.clear();
             buf.extend(node.holes.iter().map(|&(_, slot)| vals[slot]));
-            buf.extend(node.children.iter().filter(|&&c| self.nodes[c].has_holes).map(|&c| ids[c]));
+            buf.extend(node.children.iter().filter(|&&c| self.nodes[c].has_holes).map(|&c| ids[c] as u64));
             ids[n] = s.tables[n].intern(&buf);
         }
         if s.key(ids[0]).is_none() {
@@ -2947,14 +3149,14 @@ impl Family {
     }
 
     /// `install` の逆: member の鍵の射影を各節の表から 1 つ外す。
-    fn uninstall(&self, s: &mut Settled, vals: &[u32]) {
+    fn uninstall(&self, s: &mut Settled, vals: &[u64]) {
         let mut ids = vec![0u32; self.nodes.len()];
-        let mut buf = Vec::new();
+        let mut buf: Vec<u64> = Vec::new();
         for &n in &self.order {
             let node = &self.nodes[n];
             buf.clear();
             buf.extend(node.holes.iter().map(|&(_, slot)| vals[slot]));
-            buf.extend(node.children.iter().filter(|&&c| self.nodes[c].has_holes).map(|&c| ids[c]));
+            buf.extend(node.children.iter().filter(|&&c| self.nodes[c].has_holes).map(|&c| ids[c] as u64));
             ids[n] = s.tables[n].find(&buf).unwrap_or(u32::MAX);
             s.tables[n].release(&buf);
             let gone = n == 0 && s.tables[0].find(&buf).is_none();
@@ -2983,7 +3185,7 @@ impl Family {
     /// 索引を引いて根まで遡る (結果の根は全ての穴で値が一致するので、 どの穴から遡っても漏れない)。
     /// 無ければ範囲の穴の範囲、 それも無ければ索引で引ける条件 (無ければ条件の紐を持つ全 entity)
     /// から遡る。
-    fn walk(&self, r: &impl CellReader, vals: &[u32], range: Option<(u32, u32)>, ex: &[Bits]) -> Vec<u32> {
+    fn walk(&self, r: &impl CellReader, vals: &[u64], range: Option<(u64, u64)>, ex: &[Bits]) -> Vec<u32> {
         let hole = self
             .order
             .iter()
@@ -3020,7 +3222,7 @@ impl Family {
         while n != to && n != 0 {
             f(n, &ents);
             let via = self.nodes[n].via;
-            let mut up: Vec<u32> = ents.iter().flat_map(|&e| r.pull(via, e)).collect();
+            let mut up: Vec<u32> = ents.iter().flat_map(|&e| r.pull(via, e as u64)).collect();
             up.sort_unstable();
             up.dedup();
             ents = up;
@@ -3034,7 +3236,7 @@ impl Family {
     /// 手前まで遡って記録を不明に戻す (test `late_member_sees_hub_recorded_while_unsubscribed`)。
     /// 記録の意味が変わりうるのは、 部分木の穴が全部この member の値と一致する entity だけ =
     /// どの穴から遡っても含まれる。
-    fn forget_stale(&self, r: &impl CellReader, s: &mut Settled, vals: &[u32]) {
+    fn forget_stale(&self, r: &impl CellReader, s: &mut Settled, vals: &[u64]) {
         for (n, node) in self.nodes.iter().enumerate().skip(1) {
             for &(h, slot) in &node.holes {
                 self.climb(r, n, r.pull(h, vals[slot]), 0, |m, ents| {
@@ -3053,7 +3255,7 @@ impl Family {
     ///   同じ帯のどこかにある (帯の中では区別が要らない)。 帯が割れると両者が別の帯に分かれうる
     ///
     /// 道の上を全部不明に戻すので、 評価し直した値は根まで展開される。
-    fn forget_regions(&self, r: &impl CellReader, s: &mut Settled, regions: &[(u32, u32)]) {
+    fn forget_regions(&self, r: &impl CellReader, s: &mut Settled, regions: &[(u64, u64)]) {
         let Some((rn, h)) = self.range.filter(|&(n, _)| n != 0) else { return };
         let mut ents: Vec<u32> = regions.iter().flat_map(|&(lo, hi)| r.pull_range(h, lo, hi)).collect();
         ents.sort_unstable();
@@ -3126,7 +3328,7 @@ impl Family {
     }
 
     /// member `slot` に鍵の組 `tuple` を 1 つ足す (有効化の本体)。
-    fn activate_tuple(&self, r: &impl CellReader, s: &mut Settled, slot: usize, tuple: Vec<u32>, range: Option<(u32, u32)>) {
+    fn activate_tuple(&self, r: &impl CellReader, s: &mut Settled, slot: usize, tuple: Vec<u64>, range: Option<(u64, u64)>) {
         let known_before = s.tables[0].next as usize;
         let id = self.install(s, &tuple);
         let new_key = id as usize >= known_before;
@@ -3156,7 +3358,7 @@ impl Family {
             // 1 段目の先は最初に書き換わった時に 「前が不明」 = 配下の根を全部評価し直す (hacg で
             // 大きな市区町村の最初の都道府県変更が ms 級)。 登録の時に 1 回払っておく
             if let Some(c1) = self.partial {
-                let mut ts: Vec<u32> = roots.iter().filter_map(|&e| r.cell(self.nodes[c1].via, e)).collect();
+                let mut ts: Vec<u32> = roots.iter().filter_map(|&e| r.ref_cell(self.nodes[c1].via, e)).collect();
                 ts.sort_unstable();
                 ts.dedup();
                 self.push_marks(c1, ts);
@@ -3166,7 +3368,7 @@ impl Family {
             // 順序は空で、 候補を評価した時の遷移が境界を動かす)。 塊の family は集計と同じく 1 段目の
             // 先にも印を付けて記録を作る
             if let Some(c1) = self.order_part {
-                let mut ts: Vec<u32> = roots.iter().filter_map(|&e| r.cell(self.nodes[c1].via, e)).collect();
+                let mut ts: Vec<u32> = roots.iter().filter_map(|&e| r.ref_cell(self.nodes[c1].via, e)).collect();
                 ts.sort_unstable();
                 ts.dedup();
                 self.push_marks(c1, ts);
@@ -3206,6 +3408,8 @@ impl Family {
         for (i, (counts, node)) in ex.iter().enumerate() {
             let mut flipped = Vec::new();
             for (g, a) in counts.poll_with(r) {
+                // group は ref の列 (指している entity)
+                let g = g as u32;
                 let now = a.count > 0;
                 if s.exists[i].get(g) != now {
                     s.exists[i].put(g, now);
@@ -3297,7 +3501,8 @@ impl Family {
         let single_child = (self.nodes[0].children.len() == 1).then(|| self.nodes[0].children[0]);
         let mut via_child: Vec<(Option<Ans>, u32, Vec<u32>)> = Vec::new();
         // 合計する列の今の値 (合計しない family では読まない)
-        let summand = |e: u32| self.sum.and_then(|h| r.cell(h, e)).unwrap_or(0);
+        // 合計する列の値 + 1 (0 = 値が無い)。 `Settled::summand` もこの形で持つ
+        let summand = |e: u32| self.sum.and_then(|h| r.cell(h, e)).map_or(0, |v| v + 1);
         let root_plain = self.nodes[0].local.is_empty() && self.nodes[0].holes.is_empty() && self.nodes[0].range.is_none();
         for &n in &self.order {
             let mut list = std::mem::take(&mut work[n]);
@@ -3312,9 +3517,9 @@ impl Family {
                     for e in ents {
                         let now = same.unwrap_or_else(|| self.eval_known(r, s, 0, e, known));
                         match (self.partial, self.order_part, mode) {
-                            (Some(_), _, _) => s.apply_root_partial(e, now.map(|a| (a.0, t)), now.map_or(0, |a| a.1), summand(e)),
+                            (Some(_), _, _) => s.apply_root_partial(e, now.map(|a| (a.0, t as u64)), now.map_or(0, |a| a.1), summand(e)),
                             (_, Some(_), RootMode::Ordered(desc)) => {
-                                s.apply_root_order_part(e, now.map(|a| (a.0, t)), now.map_or(0, |a| a.1), desc)
+                                s.apply_root_order_part(e, now.map(|a| (a.0, t as u64)), now.map_or(0, |a| a.1), desc)
                             }
                             _ => s.apply_root_cached(e, now, summand(e), mode, &mut cache, &fresh),
                         }
@@ -3367,7 +3572,7 @@ impl Family {
                     }
                 }
                 if always || force || changed {
-                    let up = r.pull(via, e);
+                    let up = r.pull(via, e as u64);
                     if parent == 0 && single_child == Some(n) {
                         via_child.push((now, e, up));
                     } else {
@@ -3402,7 +3607,7 @@ fn find_branch(r: &impl CellReader, preds: Vec<LivePred>) -> Vec<u32> {
             let mut b = Bits::default();
             let kids = dnf(preds).map(|bs| find_once(r, bs)).unwrap_or_default();
             for x in kids {
-                if let Some(t) = r.cell(via, x) {
+                if let Some(t) = r.ref_cell(via, x) {
                     b.put(t, true);
                 }
             }
@@ -3596,11 +3801,11 @@ impl LiveRegistry {
     pub(crate) fn register_any(self: &Arc<Self>, branches: Vec<Vec<LivePred>>, expand_always: bool) -> LiveQuery {
         let id = self.next_member_id.fetch_add(1, Ordering::Relaxed);
         // (形, 条件, 範囲, 鍵の選択肢)
-        type Group = (Vec<u32>, Vec<Flat>, Option<(u32, u32)>, Vec<Vec<HoleVal>>);
+        type Group = (Vec<u64>, Vec<Flat>, Option<(u64, u64)>, Vec<Vec<HoleVal>>);
         let mut groups: Vec<Group> = Vec::new();
         for b in branches {
             let (mut sig, flats, key) = canonical(b, None);
-            sig.insert(0, expand_always as u32);
+            sig.insert(0, expand_always as u64);
             let rg = range_of(&key);
             match groups.iter_mut().find(|g| g.0 == sig && g.2 == rg) {
                 Some(g) => g.3.push(key),
@@ -3639,7 +3844,7 @@ impl LiveRegistry {
         limit: Option<usize>,
     ) -> (Arc<Family>, usize) {
         let (mut sig, flats, key) = canonical(preds, carry);
-        sig.insert(0, expand_always as u32);
+        sig.insert(0, expand_always as u64);
         self.register_alts(id, sig, flats, vec![key], expand_always, union, limit)
     }
 
@@ -3648,7 +3853,7 @@ impl LiveRegistry {
     fn register_alts(
         self: &Arc<Self>,
         id: u64,
-        sig: Vec<u32>,
+        sig: Vec<u64>,
         flats: Vec<Flat>,
         alts: Vec<Vec<HoleVal>>,
         expand_always: bool,
@@ -3675,7 +3880,7 @@ impl LiveRegistry {
     fn register_alts_locked(
         &self,
         id: u64,
-        sig: Vec<u32>,
+        sig: Vec<u64>,
         flats: Vec<Flat>,
         exists: &mut Vec<LiveCounts>,
         alts: Vec<Vec<HoleVal>>,
@@ -4208,7 +4413,7 @@ impl LiveCounts {
     }
 
     /// settle して `f(この購読の報告状態, 鍵の group の件数, 鍵の件数)`。
-    fn with<T>(&self, r: &impl CellReader, f: impl FnOnce(&mut GroupState, &std::collections::BTreeMap<u32, Agg>, usize) -> T) -> T {
+    fn with<T>(&self, r: &impl CellReader, f: impl FnOnce(&mut GroupState, &std::collections::BTreeMap<u64, Agg>, usize) -> T) -> T {
         let mut guard = self.family.settled.lock();
         self.family.settle(r, &mut guard);
         let Settled { members, keys, .. } = &mut *guard;
@@ -4239,45 +4444,45 @@ impl LiveCounts {
     /// 前回 poll から件数が変わった group と今の件数 (値の昇順、 0 = group が消えた)。 値は
     /// `query_by_id` と同じ (Number は値、 Tag は vocab id、 Ref は local eid)。 合計も持つ購読
     /// (`Engine::subscribe_sums`) では合計だけが動いた group も今の件数で届く ([`poll_sums`](Self::poll_sums))。
-    pub fn poll(&self, eng: &crate::engine::Engine) -> Vec<(u32, u64)> {
+    pub fn poll(&self, eng: &crate::engine::Engine) -> Vec<(u64, u64)> {
         self.check_engine(eng);
         self.poll_with(eng).into_iter().map(|(v, a)| (v, a.count)).collect()
     }
 
     /// `poll` の、 件数と合計の両方を返す版 (前回 poll から件数か合計が動いた group、 件数 0 = group が
     /// 消えた)。 `poll` と報告状態を共有する。 合計しない購読では合計は 0。
-    pub fn poll_sums(&self, eng: &crate::engine::Engine) -> Vec<(u32, Agg)> {
+    pub fn poll_sums(&self, eng: &crate::engine::Engine) -> Vec<(u64, Agg)> {
         self.check_engine(eng);
         self.poll_with(eng)
     }
 
-    pub(crate) fn poll_with(&self, r: &impl CellReader) -> Vec<(u32, Agg)> {
+    pub(crate) fn poll_with(&self, r: &impl CellReader) -> Vec<(u64, Agg)> {
         self.with(r, |g, groups, _| g.drain(groups))
     }
 
     /// group `value` の今の件数 (poll の状態は変えない)。
-    pub fn get(&self, eng: &crate::engine::Engine, value: u32) -> u64 {
+    pub fn get(&self, eng: &crate::engine::Engine, value: u64) -> u64 {
         self.get_agg(eng, value).count
     }
 
     /// group `value` の今の件数と合計 (poll の状態は変えない)。
-    pub fn get_agg(&self, eng: &crate::engine::Engine, value: u32) -> Agg {
+    pub fn get_agg(&self, eng: &crate::engine::Engine, value: u64) -> Agg {
         self.check_engine(eng);
         self.with(eng, |_, groups, _| groups.get(&value).copied().unwrap_or_default())
     }
 
     /// 今の全 group と件数 (値の昇順)。
-    pub fn all(&self, eng: &crate::engine::Engine) -> Vec<(u32, u64)> {
+    pub fn all(&self, eng: &crate::engine::Engine) -> Vec<(u64, u64)> {
         self.all_sums(eng).into_iter().map(|(v, a)| (v, a.count)).collect()
     }
 
     /// 今の全 group と件数・合計 (値の昇順)。
-    pub fn all_sums(&self, eng: &crate::engine::Engine) -> Vec<(u32, Agg)> {
+    pub fn all_sums(&self, eng: &crate::engine::Engine) -> Vec<(u64, Agg)> {
         self.check_engine(eng);
         self.all_with(eng)
     }
 
-    pub(crate) fn all_with(&self, r: &impl CellReader) -> Vec<(u32, Agg)> {
+    pub(crate) fn all_with(&self, r: &impl CellReader) -> Vec<(u64, Agg)> {
         self.with(r, |_, groups, _| groups.iter().map(|(&v, &c)| (v, c)).collect())
     }
 
@@ -4353,7 +4558,7 @@ fn matches_leaf(r: &impl CellReader, p: &LivePred, e: u32) -> bool {
     match p {
         LivePred::Eq { himo_id, value } => r.cell(*himo_id, e) == Some(*value),
         LivePred::EqText { himo_id, text } => {
-            r.vocab_lookup(text).is_some_and(|v| r.cell(*himo_id, e) == Some(v))
+            r.vocab_lookup(text).is_some_and(|v| r.cell(*himo_id, e) == Some(v as u64))
         }
         LivePred::Range { himo_id, lo, hi } => matches!(r.cell(*himo_id, e), Some(v) if *lo <= v && v <= *hi),
         LivePred::In { himo_id, values } => matches!(r.cell(*himo_id, e), Some(v) if values.contains(&v)),
@@ -4362,7 +4567,7 @@ fn matches_leaf(r: &impl CellReader, p: &LivePred, e: u32) -> bool {
         // 指している entity を逆引きして中身を 1 回評価 (会社単位の購読の根への条件用)
         LivePred::Exists { via, preds } => {
             let kids: Vec<u32> = dnf(preds.clone()).map(|bs| find_once(r, bs)).unwrap_or_default();
-            r.pull(*via, e).into_iter().any(|x| kids.binary_search(&x).is_ok())
+            r.pull(*via, e as u64).into_iter().any(|x| kids.binary_search(&x).is_ok())
         }
         LivePred::Via { .. } | LivePred::Or(_) => false,
     }
@@ -4412,7 +4617,7 @@ impl GroupedLiveQuery {
 
     fn members_of(&self, eng: &crate::engine::Engine, g: u32) -> Vec<EntityId> {
         let peer = self.inner.registry.peer.load(Ordering::Acquire);
-        let mut out: Vec<u32> = CellReader::pull(eng, self.via, g);
+        let mut out: Vec<u32> = CellReader::pull(eng, self.via, g as u64);
         out.retain(|&e| self.filter.iter().all(|p| matches_leaf(eng, p, e)));
         out.sort_unstable();
         out.into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect()
@@ -4423,7 +4628,7 @@ impl GroupedLiveQuery {
     pub fn count(&self, eng: &crate::engine::Engine) -> usize {
         let groups = self.inner.members(eng);
         if self.filter.is_empty() {
-            groups.iter().map(|&g| CellReader::pull_len(eng, self.via, enchudb_oplog::eid_local(g))).sum()
+            groups.iter().map(|&g| CellReader::pull_len(eng, self.via, enchudb_oplog::eid_local(g) as u64)).sum()
         } else {
             groups.iter().map(|&g| self.members_of(eng, enchudb_oplog::eid_local(g)).len()).sum()
         }
@@ -4466,14 +4671,14 @@ mod tests {
     /// Column の代わり。 (himo, eid) → value。
     #[derive(Default)]
     struct Fake {
-        cells: BTreeMap<(u16, u32), u32>,
+        cells: BTreeMap<(u16, u32), u64>,
         vocab: Vec<String>,
         /// 並行書き込みの再現用: この cell の読みは列の値を順に返す (尽きたら通常の値)。
-        script: Option<((u16, u32), std::collections::VecDeque<u32>)>,
+        script: Option<((u16, u32), std::collections::VecDeque<u64>)>,
     }
 
     impl CellReader for Mutex<Fake> {
-        fn cell(&self, h: u16, e: u32) -> Option<u32> {
+        fn cell(&self, h: u16, e: u32) -> Option<u64> {
             let mut f = self.lock();
             if let Some(v) = f.script.as_mut().filter(|(k, _)| *k == (h, e)).and_then(|(_, seq)| seq.pop_front()) {
                 return Some(v);
@@ -4483,21 +4688,21 @@ mod tests {
         fn vocab_lookup(&self, t: &str) -> Option<u32> {
             self.lock().vocab.iter().position(|v| v == t).map(|i| i as u32)
         }
-        fn pull(&self, h: u16, v: u32) -> Vec<u32> {
+        fn pull(&self, h: u16, v: u64) -> Vec<u32> {
             self.lock().cells.iter().filter(|&(k, vv)| k.0 == h && *vv == v).map(|(k, _)| k.1).collect()
         }
         fn with_himo(&self, h: u16) -> Vec<u32> {
             self.lock().cells.keys().filter(|&&(hh, _)| hh == h).map(|&(_, e)| e).collect()
         }
-        fn pull_len(&self, h: u16, v: u32) -> usize {
+        fn pull_len(&self, h: u16, v: u64) -> usize {
             self.pull(h, v).len()
         }
-        fn pull_range(&self, h: u16, lo: u32, hi: u32) -> Vec<u32> {
+        fn pull_range(&self, h: u16, lo: u64, hi: u64) -> Vec<u32> {
             self.lock().cells.iter().filter(|&(k, v)| k.0 == h && lo <= *v && *v <= hi).map(|(k, _)| k.1).collect()
         }
     }
 
-    fn write(reg: &LiveRegistry, f: &Mutex<Fake>, h: u16, e: u32, v: Option<u32>) {
+    fn write(reg: &LiveRegistry, f: &Mutex<Fake>, h: u16, e: u32, v: Option<u64>) {
         match v {
             Some(v) => f.lock().cells.insert((h, e), v),
             None => f.lock().cells.remove(&(h, e)),
@@ -4637,6 +4842,80 @@ mod tests {
     /// 無い = hub の記録は 「偽」。 その値を後から購読すると、 記録した 「偽」 は今は真 — 記録を
     /// 直さないと、 hub が別の (購読の無い) 値に移った時に 「偽 → 偽」 で展開されず、 配下が
     /// 後から加わった購読に残り続ける。
+    /// 上位 k 件の順序 (`FlatSet`) は BTreeSet<(値, eid)> と同じ答えを返す: u32 の値は昇順 / 降順とも 8 B で
+    /// 持ち、 窓 (基準から 2^32) の外の値が来たら組に作り直す。 問いの `x` は窓の下 / 中 / 上のどれでも。
+    #[test]
+    fn flat_set_matches_btreeset() {
+        let mut seed = 7u64;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed >> 11
+        };
+        for case in 0..4 {
+            let mut f = FlatSet::new();
+            let mut o: std::collections::BTreeSet<(u64, u32)> = std::collections::BTreeSet::new();
+            // 0: 昇順の u32 の値、 1: 降順の u32 の値、 2: 途中で大きな値が来る、 3: 降順に大きな値
+            let val = |r: u64, i: usize| -> u64 {
+                let v = r % 5000;
+                match case {
+                    0 => v,
+                    1 => u64::MAX - v,
+                    2 => if i == 300 { 1 << 40 } else { v },
+                    _ => if i == 300 { u64::MAX - (1 << 40) } else { u64::MAX - v },
+                }
+            };
+            for i in 0..600 {
+                // 窓の端: 降順の値 0 (= u64::MAX) は基準 + u32::MAX ちょうど
+                let x = if i == 0 { (val(0, 0), 1) } else { (val(rnd(), i), (rnd() % 64) as u32) };
+                if i != 300 && rnd() % 3 == 0 && !o.is_empty() {
+                    let y = *o.iter().nth((rnd() as usize) % o.len()).unwrap();
+                    assert_eq!(f.remove(y), o.remove(&y));
+                } else {
+                    f.insert(x);
+                    o.insert(x);
+                }
+                assert!(!f.remove((x.0 ^ (1 << 63), x.1)) || o.remove(&(x.0 ^ (1 << 63), x.1)), "無い要素を外した");
+                assert_eq!(f.len(), o.len());
+                assert_eq!(f.first(), o.first().copied());
+                assert_eq!(f.last(), o.last().copied());
+                for q in [x, (0, 0), (u64::MAX, u32::MAX), (5000, 0), (u64::MAX - 5000, 0), (1 << 40, 3), (NARROW_HI - 1, 9)] {
+                    assert_eq!(f.succ(q), o.range((std::ops::Bound::Excluded(q), std::ops::Bound::Unbounded)).next().copied(), "succ {q:?}");
+                    assert_eq!(f.pred(q), o.range(..q).next_back().copied(), "pred {q:?}");
+                }
+                assert_eq!(f.first_k(5), o.iter().take(5).copied().collect::<Vec<_>>());
+            }
+            let narrow = matches!(f, FlatSet::Narrow { .. });
+            assert_eq!(narrow, case < 2, "case {case}: u32 の値だけなら 8 B のまま、 窓の外の値で組に");
+        }
+    }
+
+    #[test]
+    fn late_range_member_forgets_stale_64_bit_values_in_the_last_band() {
+        // ref の先の範囲の穴: 値が同じ帯の中で動いても展開しない (根の記録は古い値のまま)。 後から張った範囲が
+        // 帯を割ったら、 割られた帯の領域 (最後の帯なら値の最大 u64::MAX - 1 まで) の記録を忘れさせる。
+        // 忘れさせないと、 古い値が新しい範囲に入り今の値が入らない根を新しい member が拾う
+        const COMPANY: u16 = 0;
+        const BIG: u16 = 1;
+        let via = |lo: u64, hi: u64| vec![LivePred::Via { path: vec![COMPANY], pred: Box::new(LivePred::Range { himo_id: BIG, lo, hi }) }];
+        let reg = Arc::new(LiveRegistry::new(0));
+        let f = Mutex::new(Fake::default());
+        write(&reg, &f, COMPANY, 1, Some(100));
+        write(&reg, &f, BIG, 100, Some(1 << 40));
+        // 最後の帯 [20, ∞) を含む member
+        let a = reg.register(via(20, u64::MAX - 1), false);
+        a.seed(&f);
+        assert_eq!(a.poll_with(&f).added, vec![1]);
+        // 同じ帯の中で動く: 展開しない (a の結果は変わらない)
+        write(&reg, &f, BIG, 100, Some((1 << 40) + 1000));
+        assert!(a.poll_with(&f).is_empty());
+        // 古い値 2^40 を含み、 今の値を含まない範囲
+        let b = reg.register(via((1 << 40) - 5, (1 << 40) + 5), false);
+        assert_eq!(reg.families().len(), 1, "範囲だけが違う = 同じ family");
+        assert!(b.poll_with(&f).added.is_empty(), "根の古い値の記録で新しい member に入った");
+        assert_eq!(b.count_with(&f), 0);
+        drop((a, b));
+    }
+
     #[test]
     fn late_member_sees_hub_recorded_while_unsubscribed() {
         const COMPANY: u16 = 0;

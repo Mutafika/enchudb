@@ -1080,7 +1080,7 @@ fn run_counts(path: &str) {
         name: String,
         q: enchudb_schema::LiveCounts,
         /// group → (件数, 合計)
-        seen: std::collections::BTreeMap<String, (u64, u64)>,
+        seen: std::collections::BTreeMap<String, (u64, i128)>,
         /// salary の合計も持つ購読 (subscribe_sums)
         sum: bool,
         cond: Cond<'a>,
@@ -1160,7 +1160,7 @@ fn run_counts(path: &str) {
 
     let check = |subs: &mut Vec<CSub>, users: &[u64], step: usize| {
         for s in subs.iter_mut() {
-            let got: Vec<(Value, u64, u64)> = if s.sum {
+            let got: Vec<(Value, u64, i128)> = if s.sum {
                 s.q.poll_sums()
             } else {
                 s.q.poll().into_iter().map(|(v, n)| (v, n, 0)).collect()
@@ -1172,7 +1172,7 @@ fn run_counts(path: &str) {
                     assert_ne!(s.seen.insert(show(&v), (n, t)), Some((n, t)), "[{}] 変わらない group を報告", s.name);
                 }
             }
-            let mut want: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
+            let mut want: std::collections::BTreeMap<String, (u64, i128)> = Default::default();
             for &e in users {
                 if (s.cond)(e)
                     && let Some(k) = (s.key)(e)
@@ -1180,13 +1180,13 @@ fn run_counts(path: &str) {
                     let w = want.entry(show(&k)).or_insert((0, 0));
                     w.0 += 1;
                     if s.sum {
-                        w.1 += salary(e);
+                        w.1 += salary(e) as i128;
                     }
                 }
             }
             assert_eq!(s.seen, want, "[{}] step {step}: 積分 != 手で数えた件数 / 合計", s.name);
             assert!(s.q.poll_sums().is_empty(), "[{}] step {step}: 受け取り済みの集計がまた届く", s.name);
-            let all: std::collections::BTreeMap<String, (u64, u64)> =
+            let all: std::collections::BTreeMap<String, (u64, i128)> =
                 s.q.all_sums().into_iter().map(|(v, n, t)| (show(&v), (n, t))).collect();
             assert_eq!(all, want, "[{}] step {step}: all_sums", s.name);
             let counts: std::collections::BTreeMap<String, u64> = s.q.all().into_iter().map(|(v, n)| (show(&v), n)).collect();

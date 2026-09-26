@@ -91,9 +91,9 @@ fn region_hierarchy_navigation() {
     let p1 = db.get(shibuya, "parent").unwrap();
     let p2 = db.get(p1 as u64, "parent").unwrap();
     let p3 = db.get(p2 as u64, "parent").unwrap();
-    assert_eq!(p1, tokyo as u32);
-    assert_eq!(p2, kanto as u32);
-    assert_eq!(p3, japan as u32);
+    assert_eq!(p1, u64::from(tokyo as u32));
+    assert_eq!(p2, u64::from(kanto as u32));
+    assert_eq!(p3, u64::from(japan as u32));
 
     assert_eq!(db.get_text(p3 as u64, "name").unwrap(), b"Japan");
     assert_eq!(db.get_text(p2 as u64, "name").unwrap(), b"Kanto");
@@ -199,8 +199,8 @@ fn delete_parent_dangling_refs() {
     db.delete(parent);
 
     // Enchu は参照整合性を強制しない: 子の参照は残ったまま
-    assert_eq!(db.get(child_a, "parent"), Some(parent as u32));
-    assert_eq!(db.get(child_b, "parent"), Some(parent as u32));
+    assert_eq!(db.get(child_a, "parent"), Some(parent as u64));
+    assert_eq!(db.get(child_b, "parent"), Some(parent as u64));
 
     // 逆引きでも残る(削除された ID 値で引ける)
     let r = db.pull_raw("parent", parent as u32);
@@ -278,13 +278,13 @@ fn repeated_tie_untie() {
     // 別の値に上書き
     for v in 0..8u32 {
         db.tie(e, "flag", v);
-        assert_eq!(db.get(e, "flag"), Some(v));
+        assert_eq!(db.get(e, "flag"), Some(u64::from(v)));
     }
     let final_v = db.get(e, "flag").unwrap();
     let r = db.pull_raw("flag", final_v);
     assert!(r.contains(&e));
     // それ以外の値からは消えてる
-    for v in 0..8u32 {
+    for v in 0..8u64 {
         if v == final_v { continue; }
         let r = db.pull_raw("flag", v);
         assert!(!r.contains(&e), "stale eid in flag={}", v);

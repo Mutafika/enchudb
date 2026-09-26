@@ -84,6 +84,8 @@ impl WireRecord {
     /// [signed_bytes.len: u32] [signed_bytes: N]
     /// [op_tag: u8]
     ///   0 = Tie:     [eid: u64] [himo_id: u16] [value: u32]
+    ///   9 = Tie64:   [eid: u64] [himo_id: u16] [value: u64]   (値が u32 に入らない Tie、 FILE_VERSION 11)
+    ///  10 = TieNamed64: [eid: u64] [value: u64] [kind: u8] [name_len: u16] [name]
     ///   1 = Untie:   [eid: u64] [himo_id: u16]
     ///   2 = Delete:  [eid: u64]
     ///   3 = Content: [eid: u64] [key_len: u32] [key: N] [data_len: u32] [data: M]
@@ -101,11 +103,17 @@ impl WireRecord {
         out.extend_from_slice(&(self.signed_bytes.len() as u32).to_le_bytes());
         out.extend_from_slice(&self.signed_bytes);
         match &self.op {
+            DecodedOp::Tie { eid, himo_id, value } if *value > u32::MAX as u64 => {
+                out.push(9);
+                out.extend_from_slice(&eid.to_le_bytes());
+                out.extend_from_slice(&himo_id.to_le_bytes());
+                out.extend_from_slice(&value.to_le_bytes());
+            }
             DecodedOp::Tie { eid, himo_id, value } => {
                 out.push(0);
                 out.extend_from_slice(&eid.to_le_bytes());
                 out.extend_from_slice(&himo_id.to_le_bytes());
-                out.extend_from_slice(&value.to_le_bytes());
+                out.extend_from_slice(&(*value as u32).to_le_bytes());
             }
             DecodedOp::Untie { eid, himo_id } => {
                 out.push(1);
@@ -134,9 +142,14 @@ impl WireRecord {
                 out.extend_from_slice(bytes);
             }
             DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => {
-                out.push(6);
+                let wide = *value > u32::MAX as u64;
+                out.push(if wide { 10 } else { 6 });
                 out.extend_from_slice(&eid.to_le_bytes());
-                out.extend_from_slice(&value.to_le_bytes());
+                if wide {
+                    out.extend_from_slice(&value.to_le_bytes());
+                } else {
+                    out.extend_from_slice(&(*value as u32).to_le_bytes());
+                }
                 out.push(*himo_kind);
                 out.extend_from_slice(&(himo_name.len() as u16).to_le_bytes());
                 out.extend_from_slice(himo_name.as_bytes());
@@ -200,7 +213,14 @@ impl WireRecord {
                 need(p, 14, buf)?;
                 let eid = u64::from_le_bytes(buf[p..p+8].try_into().unwrap()); p += 8;
                 let himo_id = u16::from_le_bytes(buf[p..p+2].try_into().unwrap()); p += 2;
-                let value = u32::from_le_bytes(buf[p..p+4].try_into().unwrap()); p += 4;
+                let value = u32::from_le_bytes(buf[p..p+4].try_into().unwrap()) as u64; p += 4;
+                DecodedOp::Tie { eid, himo_id, value }
+            }
+            9 => {
+                need(p, 18, buf)?;
+                let eid = u64::from_le_bytes(buf[p..p+8].try_into().unwrap()); p += 8;
+                let himo_id = u16::from_le_bytes(buf[p..p+2].try_into().unwrap()); p += 2;
+                let value = u64::from_le_bytes(buf[p..p+8].try_into().unwrap()); p += 8;
                 DecodedOp::Tie { eid, himo_id, value }
             }
             1 => {
@@ -238,10 +258,16 @@ impl WireRecord {
                 let bytes = buf[p..p+blen].to_vec(); p += blen;
                 DecodedOp::Vocab { vid, bytes }
             }
-            6 => {
-                need(p, 15, buf)?;
+            6 | 10 => {
+                let vlen = if op_tag == 10 { 8 } else { 4 };
+                need(p, 11 + vlen, buf)?;
                 let eid = u64::from_le_bytes(buf[p..p+8].try_into().unwrap()); p += 8;
-                let value = u32::from_le_bytes(buf[p..p+4].try_into().unwrap()); p += 4;
+                let value = if op_tag == 10 {
+                    u64::from_le_bytes(buf[p..p+8].try_into().unwrap())
+                } else {
+                    u32::from_le_bytes(buf[p..p+4].try_into().unwrap()) as u64
+                };
+                p += vlen;
                 let himo_kind = buf[p]; p += 1;
                 let nlen = u16::from_le_bytes(buf[p..p+2].try_into().unwrap()) as usize; p += 2;
                 need(p, nlen, buf)?;
@@ -883,7 +909,7 @@ mod tests {
         WireRecord {
             hlc: Hlc { wall: hlc_wall, logical: 0, peer },
             author_peer: peer,
-            op: DecodedOp::Tie { eid, himo_id: 0, value },
+            op: DecodedOp::Tie { eid, himo_id: 0, value: value as u64 },
             signature: [0u8; 64],
             pubkey_fp: [0u8; 8],
             signed_bytes: Vec::new(),

@@ -33,7 +33,7 @@ pub(crate) const DEFAULT_WRITE_QUEUE_CAP: usize = 1_048_576; // 1 M ops
 #[derive(Clone, Debug)]
 pub enum Op {
     /// 値の紐づけ。himo_id は事前に解決済み。
-    Tie { eid: u32, himo_id: u16, value: u32, hlc: Hlc },
+    Tie { eid: u32, himo_id: u16, value: u64, hlc: Hlc },
     /// 紐を外す。
     Untie { eid: u32, himo_id: u16, hlc: Hlc },
     /// entity ごと削除。

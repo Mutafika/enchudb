@@ -5,11 +5,16 @@
 //! 呼び出し側 = `HimoStore` が per-himo `write_lock` で直列化して契約を満たす。
 //!
 //! ## 構造
-//! - **dense**（value < `DENSE_CAP`）: `Atomic<Vec<Arc<AppendBucket>>>`。 外側 Vec を
+//! - **dense**（value < `DENSE_CAP`、 または `MID` ± `DENSE_CAP / 2`）: `Atomic<Vec<Arc<AppendBucket>>>`。 外側 Vec を
 //!   epoch-swap で成長させ、 `AppendBucket` 本体は `Arc` で stable（成長で動かない）。
-//!   read は完全 lock-free。
-//! - **sparse**（value ≥ `DENSE_CAP`、 稀）: `Mutex<HashMap>`。 common path（dense）を
-//!   lock-free に保ち、 稀な高 value だけ lock を許容する pragmatic split。
+//!   read は完全 lock-free。 残り 2 本の配列は `MID` = 2^63 の上 (`dense_pos`、 `MID + i`) と下 (`dense_neg`、
+//!   `MID - 1 - i`) を受け持つ — schema / SQL の符号付き 64 bit の列は大小の順を保つ `v ^ 2^63` で置くので、
+//!   0 に近い符号付きの値 (年齢・件数・負の小さな数) は全部ここに来る。 0 以上だけの列は `dense_pos` だけを
+//!   u32 の列の `dense` と同じ大きさで使う
+//! - **sparse**（どちらの dense にも入らない値）: `SparseRuns` (値の順に並べた `(値, eid)` の run の組、 1 件 12 B、
+//!   読みは lock-free)。 ms の時刻や 64 bit の ID のように値の種類が多い列はほぼ全部ここに入る。 値ごとの
+//!   件数・種類数は持たない (`slice_len_live` / `unique_live` は dense の分だけ — 正確な値は Column と
+//!   突き合わせる `HimoStore` が出す)。 古い entry は bucket ごとでなく sparse 全体で `compact_sparse`。
 //!
 //! ## append-only + lazy verify（#95 設計）
 //! - `insert` は該当 value の bucket に **append するだけ**。 旧 value からの削除はしない
@@ -20,12 +25,51 @@
 //!   compaction は後付け最適化（#99）。
 
 use crate::append_bucket::AppendBucket;
+use crate::sparse_runs::SparseRuns;
 use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 pub const DENSE_CAP: u32 = 1 << 20;
+
+/// 符号付き 64 bit の 0 の符号化 (`0 ^ 2^63`)。 `dense_pos` / `dense_neg` はこの上下を受け持つ。
+pub const MID: u64 = 1 << 63;
+const MID_HALF: u64 = (DENSE_CAP / 2) as u64;
+
+/// dense の 3 本の配列: 0 から (`LOW`)、 `MID` から上 (`POS`)、 `MID - 1` から下 (`NEG`)。
+const LOW: usize = 0;
+const POS: usize = 1;
+const NEG: usize = 2;
+
+/// 値の dense での置き場所: `(配列, 添字)`。 None は sparse。
+#[inline]
+fn dense_slot(value: u64) -> Option<(usize, usize)> {
+    if value < DENSE_CAP as u64 {
+        Some((LOW, value as usize))
+    } else if value >= MID && value - MID < MID_HALF {
+        Some((POS, (value - MID) as usize))
+    } else if value < MID && MID - 1 - value < MID_HALF {
+        Some((NEG, (MID - 1 - value) as usize))
+    } else {
+        None
+    }
+}
+
+/// `dense_slot` の逆 (配列と添字 → 値)。
+#[inline]
+fn slot_value(k: usize, i: usize) -> u64 {
+    match k {
+        LOW => i as u64,
+        POS => MID + i as u64,
+        _ => MID - 1 - i as u64,
+    }
+}
+
+/// 値が dense に入るか (値ごとの件数・種類数を持つか)。
+#[inline]
+pub fn is_dense(value: u64) -> bool {
+    dense_slot(value).is_some()
+}
 
 /// `new(max_values)` が事前確保する bucket 数の上限 (request23 案 F)。
 /// これを超える分は `insert` の成長経路 (doubling) が必要になった時だけ確保する。
@@ -43,7 +87,13 @@ pub fn dense_grow_count() -> usize {
 
 pub struct LockFreeCylinder {
     dense: Atomic<DenseArr>,
-    sparse: Mutex<HashMap<u32, Arc<AppendBucket>>>,
+    /// `MID` から上 / `MID - 1` から下の値の dense (添字は `dense_slot`)。 使われるまで空。
+    dense_pos: Atomic<DenseArr>,
+    dense_neg: Atomic<DenseArr>,
+    sparse: SparseRuns,
+    /// sparse の古い entry の数 (note_stale の累計 − compact_sparse の除去分)。 0 なら sparse の read は
+    /// verify 不要 (重複も古い entry も無い)。
+    sparse_stale: AtomicUsize,
     /// backing に現存する slot 総数 (stale 込み。compaction の除去分は反映)。
     /// メモリ会計・診断用、かつ total_live 導出の被減数 (request12.1)。
     total: AtomicUsize,
@@ -87,12 +137,24 @@ impl LockFreeCylinder {
         let init: DenseArr = (0..hint).map(|_| Arc::new(AppendBucket::new())).collect();
         Self {
             dense: Atomic::new(init),
-            sparse: Mutex::new(HashMap::new()),
+            dense_pos: Atomic::new(Vec::new()),
+            dense_neg: Atomic::new(Vec::new()),
+            sparse: SparseRuns::default(),
+            sparse_stale: AtomicUsize::new(0),
             total: AtomicUsize::new(0),
             unique_count: AtomicU32::new(0),
             stale_total: AtomicUsize::new(0),
             unique_live: AtomicU32::new(0),
             any_removed: AtomicBool::new(false),
+        }
+    }
+
+    #[inline]
+    fn arr(&self, k: usize) -> &Atomic<DenseArr> {
+        match k {
+            LOW => &self.dense,
+            POS => &self.dense_pos,
+            _ => &self.dense_neg,
         }
     }
 
@@ -111,29 +173,26 @@ impl LockFreeCylinder {
     ///
     /// 戻り値は `(bucket の raw len, 減分後の live)` — 呼び出し側 (HimoStore) が
     /// incremental compaction の trigger 判定 (stale 率) に使う (P2)。
-    pub fn note_stale(&self, value: u32) -> Option<(usize, u32)> {
+    pub fn note_stale(&self, value: u64) -> Option<(usize, u32)> {
         self.any_removed.store(true, Ordering::Relaxed);
-        let stats = if value < DENSE_CAP {
+        let stats = if let Some((k, i)) = dense_slot(value) {
             let guard = epoch::pin();
-            let arr = self.dense.load(Ordering::Acquire, &guard);
+            let arr = self.arr(k).load(Ordering::Acquire, &guard);
             // SAFETY: dense は常に非 null。
             let vec = unsafe { arr.deref() };
-            if (value as usize) < vec.len() {
-                let b = &vec[value as usize];
+            if i < vec.len() {
+                let b = &vec[i];
                 b.note_stale().map(|prev| (b.len(), prev - 1))
             } else {
                 debug_assert!(false, "note_stale: 未確保 bucket (value={value})");
                 None
             }
         } else {
-            let sp = self.sparse.lock().unwrap();
-            match sp.get(&value) {
-                Some(b) => b.note_stale().map(|prev| (b.len(), prev - 1)),
-                None => {
-                    debug_assert!(false, "note_stale: 未確保 sparse bucket (value={value})");
-                    None
-                }
-            }
+            // sparse は値ごとの件数を持たない: 古い entry の数だけ数え、 掃除は sparse 全体
+            // (`sparse_needs_compact` / `compact_sparse`)
+            self.stale_total.fetch_add(1, Ordering::Relaxed);
+            self.sparse_stale.fetch_add(1, Ordering::Relaxed);
+            return None;
         };
         match stats {
             Some((_, live_after)) => {
@@ -156,14 +215,14 @@ impl LockFreeCylinder {
     ///
     /// live/removed は bucket 内で確定し直すため、cylinder 側の total_live /
     /// unique_live は不変 (live な eid の集合は compaction で変わらない)。
-    pub fn compact_bucket(&self, value: u32, keep: impl FnMut(u32) -> bool) -> usize {
-        if value < DENSE_CAP {
+    pub fn compact_bucket(&self, value: u64, keep: impl FnMut(u32) -> bool) -> usize {
+        if let Some((k, i)) = dense_slot(value) {
             let guard = epoch::pin();
-            let arr = self.dense.load(Ordering::Acquire, &guard);
+            let arr = self.arr(k).load(Ordering::Acquire, &guard);
             // SAFETY: dense は常に非 null。
             let vec = unsafe { arr.deref() };
-            if (value as usize) < vec.len() {
-                let b = &vec[value as usize];
+            if i < vec.len() {
+                let b = &vec[i];
                 let before = b.len();
                 let kept = b.compact_in(&guard, keep);
                 self.discount_compacted(before - kept);
@@ -172,18 +231,83 @@ impl LockFreeCylinder {
                 0
             }
         } else {
-            let b = self.sparse.lock().unwrap().get(&value).cloned();
-            match b {
-                Some(b) => {
-                    let guard = epoch::pin();
-                    let before = b.len();
-                    let kept = b.compact_in(&guard, keep);
-                    self.discount_compacted(before - kept);
-                    kept
+            // sparse は値ごとに組み直さない (`compact_sparse` が全体で)
+            let _ = keep;
+            0
+        }
+    }
+
+    /// sparse の古い entry が半分を超えたか (掃除の合図)。 write_lock 下で。
+    pub fn sparse_needs_compact(&self) -> bool {
+        let stale = self.sparse_stale.load(Ordering::Relaxed);
+        stale > 0 && stale * 2 >= self.sparse.len().max(64)
+    }
+
+    /// sparse の古い entry があるか。
+    pub fn sparse_churned(&self) -> bool {
+        self.sparse_stale.load(Ordering::Relaxed) > 0
+    }
+
+    /// sparse を `keep(値, eid)` (Column の現在値との照合) で組み直す。 write_lock 下・Column 更新後に。
+    /// 重複 (書き換えで戻った値) も 1 つにする。 落とした数を返す。
+    pub fn compact_sparse(&self, keep: impl FnMut(u64, u32) -> bool) -> usize {
+        let removed = self.sparse.rebuild(keep);
+        if removed > 0 {
+            self.total.fetch_sub(removed, Ordering::Relaxed);
+            self.stale_total.fetch_sub(removed.min(self.stale_total.load(Ordering::Relaxed)), Ordering::Relaxed);
+        }
+        self.sparse_stale.store(0, Ordering::Relaxed);
+        removed
+    }
+
+    /// 値が `lo..=hi` の entry の eid (古い entry・重複込み、 呼び側が Column で verify する)。 dense は
+    /// 範囲の bucket を順に、 sparse は run を二分探索で。
+    pub fn range_raw(&self, lo: u64, hi: u64) -> Vec<u32> {
+        let mut out = Vec::new();
+        if lo > hi {
+            return out;
+        }
+        if lo < DENSE_CAP as u64 {
+            let guard = epoch::pin();
+            let arr = self.dense.load(Ordering::Acquire, &guard);
+            // SAFETY: dense は常に非 null。
+            let vec = unsafe { arr.deref() };
+            if !vec.is_empty() {
+                let end = hi.min(vec.len() as u64 - 1);
+                for v in lo..=end {
+                    vec[v as usize].with_read(&guard, |s| out.extend_from_slice(s));
                 }
-                None => 0,
             }
         }
+        // MID の上下: どちらも添字が値の順 (上は昇順、 下は降順) なので、 範囲に当たる添字だけ
+        for (k, a, b) in [
+            (POS, lo.max(MID), hi.min(MID + MID_HALF - 1)),
+            (NEG, lo.max(MID - MID_HALF), hi.min(MID - 1)),
+        ] {
+            if a > b {
+                continue;
+            }
+            let (i0, i1) = if k == POS { (a - MID, b - MID) } else { (MID - 1 - b, MID - 1 - a) };
+            let guard = epoch::pin();
+            let arr = self.arr(k).load(Ordering::Acquire, &guard);
+            // SAFETY: dense は常に非 null。
+            let vec = unsafe { arr.deref() };
+            if (i0 as usize) < vec.len() {
+                for i in i0..=i1.min(vec.len() as u64 - 1) {
+                    vec[i as usize].with_read(&guard, |s| out.extend_from_slice(s));
+                }
+            }
+        }
+        if hi >= DENSE_CAP as u64 {
+            // sparse に dense の値は入っていないので、 範囲をそのまま渡してよい
+            out.extend(self.sparse.range(lo.max(DENSE_CAP as u64), hi));
+        }
+        out
+    }
+
+    /// sparse の entry を `lo..=hi` で `(値, eid)` (古い entry 込み)。
+    pub fn sparse_range(&self, lo: u64, hi: u64) -> Vec<(u64, u32)> {
+        self.sparse.range_pairs(lo.max(DENSE_CAP as u64), hi)
     }
 
     /// compaction で除去された slot 数 (= その bucket に居た stale 全量) を
@@ -199,42 +323,38 @@ impl LockFreeCylinder {
     /// 単一 writer append。 value の bucket に eid を足す（旧 value は放置＝lazy verify）。
     /// pin は insert 全体で 1 回（push / unique 判定に guard を回す。 hot path の
     /// pin 3 回 → 1 回、 write 天井対策）。
-    pub fn insert(&self, eid: u32, value: u32) {
-        debug_assert!(value != u32::MAX, "value == u32::MAX is sentinel");
+    pub fn insert(&self, eid: u32, value: u64) {
+        debug_assert!(value != u64::MAX, "value == u64::MAX is sentinel");
         let guard = epoch::pin();
-        if value < DENSE_CAP {
-            let arr = self.dense.load(Ordering::Acquire, &guard);
+        if let Some((k, i)) = dense_slot(value) {
+            let dense = self.arr(k);
+            let arr = dense.load(Ordering::Acquire, &guard);
             // SAFETY: dense は常に非 null。
             let vec = unsafe { arr.deref() };
-            if (value as usize) < vec.len() {
-                let b = &vec[value as usize];
+            if i < vec.len() {
+                let b = &vec[i];
                 let prev_len = b.push_in(eid, &guard);
                 let prev_live = b.live_inc();
                 self.bump_stats(prev_len == 0, prev_live == 0);
             } else {
                 // 成長: doubling で amortize、 既存 Arc は clone（refcount）、 新規は空 bucket
                 let mut nv: DenseArr = vec.clone();
-                let new_len = ((value as usize) + 1).max(vec.len() * 2).min(DENSE_CAP as usize);
+                let new_len = (i + 1).max(vec.len() * 2).min(DENSE_CAP as usize);
                 nv.resize_with(new_len, || Arc::new(AppendBucket::new()));
-                nv[value as usize].push_in(eid, &guard);
-                nv[value as usize].live_inc();
+                nv[i].push_in(eid, &guard);
+                nv[i].live_inc();
                 self.bump_stats(true, true); // 新 bucket は必ず空だった
                 DENSE_GROWS.fetch_add(1, Ordering::Relaxed);
-                self.dense.store(Owned::new(nv), Ordering::Release);
+                dense.store(Owned::new(nv), Ordering::Release);
                 // SAFETY: 旧 array は全 reader が epoch 通過後に解放。
                 unsafe {
                     guard.defer_destroy(arr);
                 }
             }
         } else {
-            let mut sp = self.sparse.lock().unwrap();
-            let b = sp
-                .entry(value)
-                .or_insert_with(|| Arc::new(AppendBucket::new()));
-            let prev_len = b.push_in(eid, &guard);
-            let prev_live = b.live_inc();
-            drop(sp);
-            self.bump_stats(prev_len == 0, prev_live == 0);
+            // 値の種類数 (unique_count / unique_live) は dense の分だけ数える
+            self.sparse.insert(value, eid);
+            self.total.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -260,16 +380,14 @@ impl LockFreeCylinder {
     pub fn with_dense_read<R>(
         &self,
         guard: &Guard,
-        value: u32,
+        value: u64,
         f: impl FnOnce(&[u32]) -> R,
     ) -> Option<R> {
-        if value >= DENSE_CAP {
-            return None;
-        }
-        let arr = self.dense.load(Ordering::Acquire, guard);
+        let (k, i) = dense_slot(value)?;
+        let arr = self.arr(k).load(Ordering::Acquire, guard);
         let vec = unsafe { arr.deref() };
-        if (value as usize) < vec.len() {
-            Some(vec[value as usize].with_read(guard, f))
+        if i < vec.len() {
+            Some(vec[i].with_read(guard, f))
         } else {
             Some(f(&[]))
         }
@@ -278,54 +396,48 @@ impl LockFreeCylinder {
     /// value の全 eid を Vec で返す（dense / sparse 両対応、 内部で pin）。
     /// 注: stale filter はしない（caller = HimoStore が Column verify する）。
     #[allow(dead_code)]
-    pub fn read_to_vec(&self, value: u32) -> Vec<u32> {
+    pub fn read_to_vec(&self, value: u64) -> Vec<u32> {
         self.read_to_vec_verify(value).0
     }
 
     /// `read_to_vec` + この bucket の read が Column verify を要するか (request12)。
     /// 判定は `AppendBucket::read_snapshot_verify` の 3 段プロトコル
     /// (slice → flag → backing ptr 再検証) — 順序の健全性論証はそちらの doc 参照。
-    pub fn read_to_vec_verify(&self, value: u32) -> (Vec<u32>, bool) {
-        if value < DENSE_CAP {
+    pub fn read_to_vec_verify(&self, value: u64) -> (Vec<u32>, bool) {
+        if let Some((k, i)) = dense_slot(value) {
             let guard = epoch::pin();
-            let arr = self.dense.load(Ordering::Acquire, &guard);
+            let arr = self.arr(k).load(Ordering::Acquire, &guard);
             // SAFETY: dense は常に非 null。
             let vec = unsafe { arr.deref() };
-            if (value as usize) < vec.len() {
-                vec[value as usize].read_snapshot_verify(&guard)
+            if i < vec.len() {
+                vec[i].read_snapshot_verify(&guard)
             } else {
                 (Vec::new(), false)
             }
         } else {
-            // Arc を取ったら lock を即座に落とす。 bucket コピーを lock 下でやると
-            // 巨大 sparse bucket の read が writer の insert(sparse) を stall させる
-            // （#95 の相互排他を sparse 側で再発させない）。
-            let b = self.sparse.lock().unwrap().get(&value).cloned();
-            match b {
-                Some(b) => {
-                    let guard = epoch::pin();
-                    b.read_snapshot_verify(&guard)
-                }
-                None => (Vec::new(), false),
+            // run ごとに eid 順なので並べ直す (dense の bucket と同じく eid の昇順で返す)
+            let mut out = self.sparse.lookup(value);
+            if out.len() > 1 {
+                out.sort_unstable();
             }
+            (out, self.sparse_churned())
         }
     }
 
     /// value の bucket 長（raw、 stale 込み）。診断用 (planner は `slice_len_live` へ移行)。
     #[allow(dead_code)]
-    pub fn slice_len(&self, value: u32) -> usize {
-        if value < DENSE_CAP {
+    pub fn slice_len(&self, value: u64) -> usize {
+        if let Some((k, i)) = dense_slot(value) {
             let guard = epoch::pin();
-            let arr = self.dense.load(Ordering::Acquire, &guard);
+            let arr = self.arr(k).load(Ordering::Acquire, &guard);
             let vec = unsafe { arr.deref() };
-            if (value as usize) < vec.len() {
-                vec[value as usize].len()
+            if i < vec.len() {
+                vec[i].len()
             } else {
                 0
             }
         } else {
-            let sp = self.sparse.lock().unwrap();
-            sp.get(&value).map(|b| b.len()).unwrap_or(0)
+            self.sparse.lookup(value).len()
         }
     }
 
@@ -357,34 +469,33 @@ impl LockFreeCylinder {
 
     /// value の live 件数 (= verify 後の pull 結果の件数、正確)。
     /// planner の pivot 選択用 (raw の `slice_len` は stale 込みで over-count する)。
-    pub fn slice_len_live(&self, value: u32) -> usize {
-        if value < DENSE_CAP {
+    pub fn slice_len_live(&self, value: u64) -> usize {
+        if let Some((k, i)) = dense_slot(value) {
             let guard = epoch::pin();
-            let arr = self.dense.load(Ordering::Acquire, &guard);
+            let arr = self.arr(k).load(Ordering::Acquire, &guard);
             let vec = unsafe { arr.deref() };
-            if (value as usize) < vec.len() {
-                vec[value as usize].live() as usize
+            if i < vec.len() {
+                vec[i].live() as usize
             } else {
                 0
             }
         } else {
-            let sp = self.sparse.lock().unwrap();
-            sp.get(&value).map(|b| b.live() as usize).unwrap_or(0)
+            // 古い entry 込みの上限 (正確な件数は HimoStore が Column と突き合わせる)
+            self.sparse.lookup(value).len()
         }
     }
 
     /// value の bucket に churn 痕があるか。write_lock 下 (単一 writer) では正確 —
     /// `compact_now` の clean-bucket skip 判定用。
-    pub fn bucket_needs_verify(&self, value: u32) -> bool {
-        if value < DENSE_CAP {
+    pub fn bucket_needs_verify(&self, value: u64) -> bool {
+        if let Some((k, i)) = dense_slot(value) {
             let guard = epoch::pin();
-            let arr = self.dense.load(Ordering::Acquire, &guard);
+            let arr = self.arr(k).load(Ordering::Acquire, &guard);
             // SAFETY: dense は常に非 null。
             let vec = unsafe { arr.deref() };
-            (value as usize) < vec.len() && vec[value as usize].needs_verify()
+            i < vec.len() && vec[i].needs_verify()
         } else {
-            let sp = self.sparse.lock().unwrap();
-            sp.get(&value).map(|b| b.needs_verify()).unwrap_or(false)
+            self.sparse_churned()
         }
     }
 
@@ -393,27 +504,31 @@ impl LockFreeCylinder {
     /// double-buffer（2 コピー保持）なら `>= 2x` になるので、 それとの区別に使える。
     pub fn backing_bytes(&self) -> usize {
         let guard = epoch::pin();
-        let arr = self.dense.load(Ordering::Acquire, &guard);
-        let vec = unsafe { arr.deref() };
-        let mut slots: usize = vec.iter().map(|b| b.capacity()).sum();
-        let sp = self.sparse.lock().unwrap();
-        slots += sp.values().map(|b| b.capacity()).sum::<usize>();
-        drop(sp);
-        slots * std::mem::size_of::<u32>()
+        let mut slots = 0usize;
+        for k in [LOW, POS, NEG] {
+            let arr = self.arr(k).load(Ordering::Acquire, &guard);
+            let vec = unsafe { arr.deref() };
+            slots += vec.iter().map(|b| b.capacity()).sum::<usize>();
+        }
+        slots * std::mem::size_of::<u32>() + self.sparse.backing_bytes()
     }
 
     /// 非空 bucket の value を列挙（順序保証なし、 stale 込みの近似）。
-    pub fn unique_values(&self) -> Vec<u32> {
+    pub fn unique_values(&self) -> Vec<u64> {
         let guard = epoch::pin();
         let arr = self.dense.load(Ordering::Acquire, &guard);
         let vec = unsafe { arr.deref() };
-        let mut out: Vec<u32> = vec
+        let mut out: Vec<u64> = vec
             .iter()
             .enumerate()
-            .filter_map(|(v, b)| if b.is_empty() { None } else { Some(v as u32) })
+            .filter_map(|(v, b)| if b.is_empty() { None } else { Some(v as u64) })
             .collect();
-        let sp = self.sparse.lock().unwrap();
-        out.extend(sp.keys().copied());
+        for k in [POS, NEG] {
+            let arr = self.arr(k).load(Ordering::Acquire, &guard);
+            let vec = unsafe { arr.deref() };
+            out.extend(vec.iter().enumerate().filter(|(_, b)| !b.is_empty()).map(|(i, _)| slot_value(k, i)));
+        }
+        out.extend(self.sparse.values());
         out
     }
 }
@@ -421,11 +536,13 @@ impl LockFreeCylinder {
 impl Drop for LockFreeCylinder {
     fn drop(&mut self) {
         // 現在の dense array を解放（過去 grow の defer 分は collector が回収）。
-        let cur = self.dense.load(Ordering::Relaxed, unsafe { epoch::unprotected() });
-        if !cur.is_null() {
-            // SAFETY: drop = 単独所有。
-            unsafe {
-                drop(cur.into_owned());
+        for dense in [&self.dense, &self.dense_pos, &self.dense_neg] {
+            let cur = dense.load(Ordering::Relaxed, unsafe { epoch::unprotected() });
+            if !cur.is_null() {
+                // SAFETY: drop = 単独所有。
+                unsafe {
+                    drop(cur.into_owned());
+                }
             }
         }
     }
@@ -440,7 +557,7 @@ mod tests {
     fn dense_insert_read() {
         let c = LockFreeCylinder::new(0);
         for e in 0..100u32 {
-            c.insert(e, e % 10); // value 0..9
+            c.insert(e, (e % 10) as u64); // value 0..9
         }
         assert_eq!(c.total(), 100);
         assert_eq!(c.unique_count(), 10);
@@ -472,16 +589,82 @@ mod tests {
     fn sparse_path() {
         let c = LockFreeCylinder::new(0);
         let big = DENSE_CAP + 42;
-        c.insert(7, big);
-        c.insert(8, big);
-        assert_eq!(c.read_to_vec(big), vec![7, 8]);
-        assert_eq!(c.unique_count(), 1);
-        assert_eq!(c.slice_len(big), 2);
-        // request12: sparse 側も live / bucket-local flag が効く
-        assert_eq!(c.slice_len_live(big), 2);
-        c.note_stale(big);
-        assert_eq!(c.slice_len_live(big), 1);
-        assert!(c.read_to_vec_verify(big).1);
+        c.insert(7, big as u64);
+        c.insert(8, big as u64);
+        assert_eq!(c.read_to_vec(big as u64), vec![7, 8]);
+        // sparse は値ごとの件数・種類数を持たない (種類数は dense の分だけ、 件数は古い entry 込みの上限。
+        // 正確な値は HimoStore が Column と突き合わせる)
+        assert_eq!(c.unique_count(), 0);
+        assert_eq!(c.slice_len(big as u64), 2);
+        assert_eq!(c.slice_len_live(big as u64), 2);
+        assert!(!c.read_to_vec_verify(big as u64).1, "古い entry が無いうちは verify 不要");
+        c.note_stale(big as u64);
+        assert!(c.read_to_vec_verify(big as u64).1, "古い entry があれば verify");
+        assert_eq!(c.total_live(), 1);
+        // 掃除: eid 7 は別の値に移った (Column では big でない) とする
+        assert_eq!(c.compact_sparse(|_, eid| eid != 7), 1);
+        assert_eq!(c.read_to_vec(big as u64), vec![8]);
+        assert!(!c.read_to_vec_verify(big as u64).1);
+        assert_eq!(c.total_live(), 1);
+        assert_eq!(c.total(), 1);
+    }
+
+    /// 3 本の dense 配列の bucket 数の和。
+    fn dense_len(c: &LockFreeCylinder) -> usize {
+        let guard = epoch::pin();
+        [LOW, POS, NEG].iter().map(|&k| unsafe { c.arr(k).load(Ordering::Acquire, &guard).deref() }.len()).sum()
+    }
+
+    /// 符号付き 64 bit の符号化 (`v ^ 2^63`) で 0 に近い値は 2 本目の dense に入る: 値ごとの件数・種類数を
+    /// O(1) で持ち、 範囲も引ける。 窓の外 (±2^19 より遠い) は sparse。
+    #[test]
+    fn values_near_mid_are_dense() {
+        let enc = |v: i64| (v as u64) ^ MID;
+        let c = LockFreeCylinder::new(0);
+        let h = MID_HALF as i64;
+        let near = [0i64, -1, 1, 30, -30, h - 1, -h];
+        for (e, &v) in near.iter().enumerate() {
+            assert!(is_dense(enc(v)), "{v} は dense");
+            c.insert(e as u32, enc(v));
+            c.insert(100 + e as u32, enc(v));
+        }
+        for v in [h, -h - 1, 1 << 40, -(1 << 40)] {
+            assert!(!is_dense(enc(v)), "{v} は sparse");
+        }
+        c.insert(50, enc(h));
+        // 種類数は dense の分だけ数える = 窓の中の値は全部数えられている
+        assert_eq!(c.unique_live(), near.len() as u32);
+        for (e, &v) in near.iter().enumerate() {
+            assert_eq!(c.read_to_vec(enc(v)), vec![e as u32, 100 + e as u32], "{v}");
+            assert_eq!(c.slice_len_live(enc(v)), 2, "{v}");
+        }
+        let mut vals = c.unique_values();
+        vals.sort_unstable();
+        let mut want: Vec<u64> = near.iter().map(|&v| enc(v)).chain([enc(h)]).collect();
+        want.sort_unstable();
+        assert_eq!(vals, want, "添字 → 値の戻し");
+        // 範囲: 窓の中と外 (sparse) をまたいで
+        let mut got = c.range_raw(enc(-30), enc(h));
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1, 2, 3, 4, 5, 50, 100, 101, 102, 103, 104, 105], "-30..=2^19 (-2^19 の 6 だけ外)");
+        let mut got = c.range_raw(enc(-h), enc(-1));
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 4, 6, 101, 104, 106]);
+        // 0 以上だけの列は u32 の列と同じ数の bucket (上の配列だけ、 値の数ぶん)。 負をまたいでも値の数ぶん
+        let n = 1000u32;
+        let (as_u32, as_i64, both) = (LockFreeCylinder::new(0), LockFreeCylinder::new(0), LockFreeCylinder::new(0));
+        for v in 0..n {
+            as_u32.insert(v, v as u64);
+            as_i64.insert(v, enc(v as i64));
+            both.insert(v, enc(v as i64 - (n / 2) as i64));
+        }
+        assert_eq!(dense_len(&as_i64), dense_len(&as_u32), "0 以上の i64 は u32 と同じ数の bucket");
+        assert!(dense_len(&both) <= dense_len(&as_u32), "{} / {}", dense_len(&both), dense_len(&as_u32));
+        // 掃除・古い entry の印も 2 本目で
+        c.note_stale(enc(-1));
+        assert!(c.read_to_vec_verify(enc(-1)).1);
+        assert_eq!(c.compact_bucket(enc(-1), |eid| eid != 1), 1);
+        assert_eq!(c.read_to_vec(enc(-1)), vec![101]);
     }
 
     /// request12: verify 判定が bucket 局所であること + live counter の正確性。
@@ -490,7 +673,7 @@ mod tests {
         let c = LockFreeCylinder::new(0);
         // v0 に 5 eid、v1 に 5 eid
         for e in 0..10u32 {
-            c.insert(e, e % 2);
+            c.insert(e, (e % 2) as u64);
         }
         assert_eq!(c.total_live(), 10);
         assert_eq!(c.unique_live(), 2);
@@ -564,7 +747,7 @@ mod tests {
             (1_000_000u32, 10_000u32)
         };
         for e in 0..n {
-            c.insert(e, e % card);
+            c.insert(e, (e % card) as u64);
         }
         assert_eq!(c.total(), n as usize);
         let bytes = c.backing_bytes();
@@ -603,7 +786,7 @@ mod tests {
             let (c, ready) = (c.clone(), ready.clone());
             std::thread::spawn(move || {
                 for v in 0..n {
-                    c.insert(v, v);
+                    c.insert(v, v as u64);
                     ready.store(v + 1, Ordering::Release);
                 }
             })
@@ -622,7 +805,7 @@ mod tests {
                             continue;
                         }
                         let v = (seen.wrapping_mul(2654435761).wrapping_add(k) as u32) % hi;
-                        let got = c.read_to_vec(v);
+                        let got = c.read_to_vec(v as u64);
                         assert!(
                             got.iter().all(|&e| e == v),
                             "value {v} に別の eid が混ざった: {got:?}"
@@ -640,7 +823,7 @@ mod tests {
 
         // 成長が終わった後、 全部が読めること (取りこぼしが無い)。
         for v in 0..n {
-            assert_eq!(c.read_to_vec(v), vec![v], "value {v} が消えた");
+            assert_eq!(c.read_to_vec(v as u64), vec![v], "value {v} が消えた");
         }
         assert_eq!(c.unique_count(), n, "unique_count が合わない");
         assert!(reads > 0, "reader が 1 回も読めていない");
@@ -714,7 +897,7 @@ mod tests {
             })
             .collect();
         for e in 0..n {
-            c.insert(e, e % 7);
+            c.insert(e, (e % 7) as u64);
         }
         stop.store(true, Ordering::Relaxed);
         for r in readers {

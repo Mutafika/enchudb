@@ -37,7 +37,7 @@ fn main() {
     for i in 0..iters {
         let eid = enchudb_oplog::make_eid(eng.peer_id(), (i % n) as u32);
         if let Some(v) = eng.get(eid, "user_id") {
-            sum = sum.wrapping_add(v as u64);
+            sum = sum.wrapping_add(v);
         }
     }
     let get_ns = t.elapsed().as_nanos() as f64 / iters as f64;
@@ -95,12 +95,12 @@ fn main() {
     for _ in 0..list_iters {
         for &eid in &eids_for_listing {
             // 5 attr 取得 = 1 行の display 想定
-            if let Some(v) = eng.get(eid, "user_id") { acc = acc.wrapping_add(v as u64); }
-            if let Some(v) = eng.get(eid, "year")    { acc = acc.wrapping_add(v as u64); }
+            if let Some(v) = eng.get(eid, "user_id") { acc = acc.wrapping_add(v); }
+            if let Some(v) = eng.get(eid, "year")    { acc = acc.wrapping_add(v); }
             if let Some(_) = eng.get_text(eid, "city") { acc = acc.wrapping_add(1); }
             // year を 2 度引いて 5 attr 相当に
-            if let Some(v) = eng.get(eid, "year")    { acc = acc.wrapping_add(v as u64); }
-            if let Some(v) = eng.get(eid, "user_id") { acc = acc.wrapping_add(v as u64); }
+            if let Some(v) = eng.get(eid, "year")    { acc = acc.wrapping_add(v); }
+            if let Some(v) = eng.get(eid, "user_id") { acc = acc.wrapping_add(v); }
         }
     }
     let list_total = t.elapsed();

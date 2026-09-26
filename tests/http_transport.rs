@@ -48,7 +48,7 @@ fn q(himo: &str) -> String {
 }
 
 /// 受信側で foreign eid を翻訳して読む (#9)。
-fn get_remote(eng: &Engine, foreign_eid: u64, himo: &str) -> Option<u32> {
+fn get_remote(eng: &Engine, foreign_eid: u64, himo: &str) -> Option<u64> {
     let hid = eng.himo_id(&q(himo)).unwrap() as u16;
     let local = eng.resolve_remote_eid(foreign_eid, hid)?;
     eng.get(local, &q(himo))
@@ -284,6 +284,39 @@ fn fresh_replica_bootstraps_then_syncs() {
     // 旧データも残ってる
     assert_eq!(get_remote(&replica, e1, "val"), Some(42));
 
+    cleanup(&origin_path);
+    cleanup(&replica_path);
+}
+
+/// 64 bit 列 (Number64) を持つ DB も `GET /bootstrap` で丸ごと配れる (packed の末尾に 64 bit 列)。
+#[test]
+fn bootstrap_serves_64_bit_columns() {
+    let origin_path = tmp("boot64_origin");
+    let replica_path = tmp("boot64_replica");
+    let vals = [7u64, u32::MAX as u64 + 1, 1 << 50, u64::MAX - 1];
+    {
+        let mut eng = Engine::create_compact(&origin_path).unwrap();
+        eng.define_table(TABLE, 1000).unwrap();
+        eng.define_himo_in(TABLE, "n", ValueType::Number, 0).unwrap();
+        eng.define_himo_in(TABLE, "ts", ValueType::Number64, 0).unwrap();
+        for (i, &v) in vals.iter().enumerate() {
+            let e = eng.entity_in(TABLE).unwrap();
+            eng.tie(e, &q("n"), i as u32);
+            eng.tie(e, &q("ts"), v);
+        }
+        eng.flush().unwrap();
+    }
+    let relay = HttpRelay::start_with_bootstrap("127.0.0.1:0", &origin_path).unwrap();
+    let client = HttpTransport::new(format!("http://{}", relay.addr()));
+    client.bootstrap_to(&replica_path).expect("64 bit 列を持つ DB の bootstrap");
+    let replica = Engine::open_standalone(&replica_path).unwrap();
+    for (i, &v) in vals.iter().enumerate() {
+        let got = replica.pull_raw(&q("n"), i as u32);
+        assert_eq!(got.len(), 1, "row {i}");
+        assert_eq!(replica.get(got[0], &q("ts")), Some(v), "row {i}");
+        assert_eq!(replica.pull_raw(&q("ts"), v), got, "row {i} の索引");
+    }
+    drop(replica);
     cleanup(&origin_path);
     cleanup(&replica_path);
 }

@@ -66,7 +66,7 @@ fn append_orphan_record(path: &str, local_eid: u32, himo_id: u16, value: u32, wa
     let wal = OpLog::open(Path::new(&format!("{path}/oplog"))).expect("open wal");
     let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local_eid);
     wal.append_at_hlc(
-        Op::Tie { eid: oplog_eid, himo_id, value },
+        Op::Tie { eid: oplog_eid, himo_id, value: value as u64 },
         Hlc { wall, logical: 0, peer: PEER },
     )
     .expect("append");

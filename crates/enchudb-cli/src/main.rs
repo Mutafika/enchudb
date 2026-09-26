@@ -286,6 +286,7 @@ fn type_label(t: ValueType) -> &'static str {
         ValueType::Number => "num",
         ValueType::Leaf => "leaf",
         ValueType::Ref => "ref",
+        ValueType::Number64 => "num64",
     }
 }
 
@@ -295,7 +296,8 @@ fn parse_type(s: &str) -> Result<ValueType, String> {
         "num" | "number" => Ok(ValueType::Number),
         "leaf" => Ok(ValueType::Leaf),
         "ref" => Ok(ValueType::Ref),
-        _ => Err(format!("unknown type: {s} (tag|num|leaf|ref)")),
+        "num64" => Ok(ValueType::Number64),
+        _ => Err(format!("unknown type: {s} (tag|num|num64|leaf|ref)")),
     }
 }
 
@@ -319,6 +321,7 @@ fn cmd_entity(eng: &Engine, eid: u64) -> Result<(), String> {
     for (name, val) in fields {
         match val {
             EntityValue::Num(n) => println!("  {name}: {n}"),
+            EntityValue::Num64(n) => println!("  {name}: {n}"),
             EntityValue::Text(b) => match std::str::from_utf8(b) {
                 Ok(s) => println!("  {name}: \"{s}\""),
                 Err(_) => println!("  {name}: <{} bytes>", b.len()),
@@ -378,6 +381,7 @@ fn cmd_dump(eng: &Engine, limit: usize) {
         for (name, val) in fields {
             match val {
                 EntityValue::Num(v) => print!(" {name}={v}"),
+                EntityValue::Num64(v) => print!(" {name}={v}"),
                 EntityValue::Text(b) => match std::str::from_utf8(b) {
                     Ok(s) => print!(" {name}=\"{s}\""),
                     Err(_) => print!(" {name}=<{}b>", b.len()),

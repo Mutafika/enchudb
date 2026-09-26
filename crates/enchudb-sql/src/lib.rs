@@ -28,7 +28,8 @@
 //! - BETWEEN: `col BETWEEN lo AND hi` (両端 inclusive)
 //! - NULL 判定: `col IS NULL` / `col IS NOT NULL`
 //!
-//! TYPE は `INTEGER` / `TEXT` のみ。INTEGER は u32、TEXT は Symbol himo。
+//! TYPE は `INTEGER` / `BIGINT` / `TEXT`。 INTEGER は u32 (0 以上)、 BIGINT は i64 (負の数・ms の時刻)、
+//! TEXT は Symbol himo。
 //!
 //! ## 未対応 (今後)
 //! - JOIN / subquery
@@ -74,11 +75,14 @@ const SCHEMA_BLOB_HIMO: &str = "__enchu_schema_blob";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// SQL 上の列型。`enchudb_engine::ValueType` への dispatch 用。
 ///
-/// - `Integer` — `INTEGER` / `INT` 系。ValueType::Number。
+/// - `Integer` — `INTEGER` / `INT` 系。ValueType::Number (0 以上 u32::MAX 未満)。
+/// - `BigInt` — `BIGINT`。 ValueType::Number64 (i64、 `i64::MAX` を除く)。 engine には大小の順を保つ符号化
+///   (`v ^ 2^63`) で置く (schema 層の BigInt と同じ)。
 /// - `Text` — `TEXT` / `VARCHAR` 系。ValueType::Tag (vocab で dedupe)。
 /// - `Leaf` — 拡張型 `LEAF`。ValueType::Leaf (vocab に乗るが dedupe なし、自由記述用)。
 pub enum SqlType {
     Integer,
+    BigInt,
     Text,
     Leaf,
 }
@@ -289,6 +293,7 @@ impl Database {
             for c in &t.cols {
                 let ht = match c.ty {
                     SqlType::Integer => ValueType::Number,
+                    SqlType::BigInt => ValueType::Number64,
                     SqlType::Text => ValueType::Tag,
                     SqlType::Leaf => ValueType::Leaf,
                 };
@@ -337,9 +342,10 @@ impl Database {
         for c in &ct.columns {
             let col_name = c.name.value.clone();
             let ty = match &c.data_type {
-                DataType::Int(_) | DataType::Integer(_) | DataType::BigInt(_)
+                DataType::Int(_) | DataType::Integer(_)
                 | DataType::SmallInt(_) | DataType::TinyInt(_) | DataType::UnsignedInt(_)
-                | DataType::UnsignedBigInt(_) | DataType::UnsignedInteger(_) => SqlType::Integer,
+                | DataType::UnsignedInteger(_) => SqlType::Integer,
+                DataType::BigInt(_) | DataType::UnsignedBigInt(_) => SqlType::BigInt,
                 DataType::Text | DataType::String(_) | DataType::Varchar(_)
                 | DataType::Char(_) | DataType::CharacterVarying(_) => SqlType::Text,
                 // 拡張型: `LEAF` は dedupe しない自由記述テキスト用。
@@ -381,6 +387,7 @@ impl Database {
         for col in &cols {
             let ht = match col.ty {
                 SqlType::Integer => ValueType::Number,
+                SqlType::BigInt => ValueType::Number64,
                 SqlType::Text => ValueType::Tag,
                 SqlType::Leaf => ValueType::Leaf,
             };
@@ -426,7 +433,9 @@ impl Database {
             }
             let mut values: Vec<(&ColDef, Value)> = Vec::with_capacity(col_order.len());
             for (cd, e) in col_order.iter().zip(row_exprs.iter()) {
-                values.push((cd, eval_literal(e)?));
+                let v = eval_literal(e)?;
+                check_value(cd, &v)?; // 書く前に全部の列で (途中の列で失敗して半端な row を残さない)
+                values.push((cd, v));
             }
 
             // PRIMARY KEY 制約:
@@ -625,7 +634,9 @@ impl Database {
                 other => return Err(SqlError::Unsupported(format!("UPDATE target: {other:?}"))),
             };
             let cd = tdef.col(&col_name).ok_or_else(|| SqlError::UnknownColumn(col_name.clone()))?;
-            sets.push((cd, eval_literal(&a.value)?));
+            let v = eval_literal(&a.value)?;
+            check_value(cd, &v)?; // 書く前に (途中の行 / 列で失敗して半端に書き換えない)
+            sets.push((cd, v));
         }
 
         let eids = self.eval_where(&tdef, selection.as_ref())?;
@@ -691,17 +702,18 @@ impl Database {
         }
 
         // build query: __sql_table = <table_vid> AND <eq_preds>
-        let mut q: Vec<(String, u32)> = Vec::with_capacity(eq_preds.len() + 1);
-        q.push((TABLE_MARKER_HIMO.to_string(), table_vid));
+        let mut q: Vec<(String, u64)> = Vec::with_capacity(eq_preds.len() + 1);
+        q.push((TABLE_MARKER_HIMO.to_string(), table_vid as u64));
         for (cd, v) in &eq_preds {
             let raw = match (cd.ty, v) {
                 // #298: 列に入らない値を持つ row は無い = マッチなし (書き込みと違ってエラーにしない)
                 (SqlType::Integer, Value::Integer(n)) => match u32::try_from(*n) {
-                    Ok(v) if v != u32::MAX => v,
+                    Ok(v) if v != u32::MAX => v as u64,
                     _ => return Ok(Vec::new()),
                 },
+                (SqlType::BigInt, Value::Integer(n)) => big_raw(*n)?,
                 (SqlType::Text, Value::Text(s)) => match self.eng.vocab_id(s) {
-                    Some(id) => id,
+                    Some(id) => id as u64,
                     None => return Ok(Vec::new()), // 未知 vocab はマッチなし
                 },
                 // Leaf は dedupe しないので等値検索は原理的に成立しない (毎回別 vid)。
@@ -712,8 +724,14 @@ impl Database {
             };
             q.push((cd.himo.clone(), raw));
         }
-        let refs: Vec<(&str, u32)> = q.iter().map(|(h, v)| (h.as_str(), *v)).collect();
-        let candidates = self.eng.query(&refs);
+        let mut ids: Vec<(u16, u64)> = Vec::with_capacity(q.len());
+        for (h, v) in &q {
+            match self.eng.himo_id(h) {
+                Some(id) => ids.push((id as u16, *v)),
+                None => return Ok(Vec::new()),
+            }
+        }
+        let candidates = self.eng.query_by_id64(&ids);
 
         if range_preds.is_empty() && null_preds.is_empty() {
             return Ok(candidates);
@@ -748,10 +766,11 @@ impl Database {
                 if *n < 0 || *n >= u32::MAX as i64 {
                     return Err(SqlError::BadValue(format!("integer out of u32 range: {n}")));
                 }
-                *n as u32
+                *n as u64
             }
+            (SqlType::BigInt, Value::Integer(n)) => big_raw(*n)?,
             (SqlType::Text, Value::Text(s)) => match self.eng.vocab_id(s) {
-                Some(id) => id,
+                Some(id) => id as u64,
                 None => return Ok(None),
             },
             // Leaf を PK にするのは意味的に変だが、ここでは「マッチなし」として扱う。
@@ -759,7 +778,10 @@ impl Database {
             (_, Value::Null) => return Ok(None),
             (t, v) => return Err(SqlError::TypeMismatch(format!("{:?} vs {:?}", t, v))),
         };
-        let result = self.eng.query(&[(TABLE_MARKER_HIMO, table_vid), (cd.himo.as_str(), raw)]);
+        let (Some(marker), Some(h)) = (self.eng.himo_id(TABLE_MARKER_HIMO), self.eng.himo_id(&cd.himo)) else {
+            return Ok(None);
+        };
+        let result = self.eng.query_by_id64(&[(marker as u16, table_vid as u64), (h as u16, raw)]);
         Ok(result.into_iter().next())
     }
 }
@@ -935,11 +957,37 @@ fn eval_literal(e: &Expr) -> Result<Value, SqlError> {
             SqlValue::Boolean(b) => Ok(Value::Integer(if *b { 1 } else { 0 })),
             other => Err(SqlError::Unsupported(format!("literal: {other:?}"))),
         },
+        // 負の数値リテラルは符号ごと読む (`-9223372036854775808` = i64::MIN は符号を外すと i64 に入らない)
+        Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr } if matches!(**expr, Expr::Value(SqlValue::Number(..))) => {
+            let Expr::Value(SqlValue::Number(n, _)) = &**expr else { unreachable!("matched above") };
+            let parsed = format!("-{n}").parse::<i64>().map_err(|_| SqlError::BadValue(format!("number: -{n}")))?;
+            Ok(Value::Integer(parsed))
+        }
         Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr } => match eval_literal(expr)? {
-            Value::Integer(n) => Ok(Value::Integer(-n)),
+            Value::Integer(n) => n.checked_neg().map(Value::Integer).ok_or_else(|| SqlError::BadValue(format!("number: -{n}"))),
             other => Err(SqlError::TypeMismatch(format!("unary minus on {other:?}"))),
         },
         other => Err(SqlError::Unsupported(format!("expr: {other}"))),
+    }
+}
+
+/// BIGINT の値 → engine の u64 (大小の順を保つ: 符号 bit を反転)。 `i64::MAX` は engine の空の印と重なる。
+fn big_raw(n: i64) -> Result<u64, SqlError> {
+    if n == i64::MAX {
+        return Err(SqlError::BadValue(format!("integer out of BIGINT range: {n}")));
+    }
+    Ok((n as u64) ^ (1 << 63))
+}
+
+/// 列 `cd` に `v` を書けるか (値域 / 型)。 `tie_value` と同じ判定を、 書く前に全部の値で。
+fn check_value(cd: &ColDef, v: &Value) -> Result<(), SqlError> {
+    match (cd.ty, v) {
+        (SqlType::Integer, Value::Integer(n)) if *n < 0 || *n >= u32::MAX as i64 => {
+            Err(SqlError::BadValue(format!("integer out of u32 range: {n}")))
+        }
+        (SqlType::BigInt, Value::Integer(n)) => big_raw(*n).map(|_| ()),
+        (SqlType::Integer, Value::Integer(_)) | (SqlType::Text, Value::Text(_)) | (SqlType::Leaf, Value::Text(_)) | (_, Value::Null) => Ok(()),
+        (t, v) => Err(SqlError::TypeMismatch(format!("col {} expects {:?}, got {:?}", cd.name, t, v))),
     }
 }
 
@@ -950,6 +998,9 @@ fn tie_value(eng: &mut Engine, eid: EntityId, cd: &ColDef, v: &Value) -> Result<
                 return Err(SqlError::BadValue(format!("integer out of u32 range: {n}")));
             }
             eng.tie(eid, &cd.himo, *n as u32);
+        }
+        (SqlType::BigInt, Value::Integer(n)) => {
+            eng.tie(eid, &cd.himo, big_raw(*n)?);
         }
         (SqlType::Text, Value::Text(s)) | (SqlType::Leaf, Value::Text(s)) => {
             // engine の tie_text は himo の ValueType (Tag / Leaf) で内部 dispatch する。
@@ -965,6 +1016,10 @@ fn read_value(eng: &Engine, eid: EntityId, cd: &ColDef) -> Value {
     match cd.ty {
         SqlType::Integer => match eng.get(eid, &cd.himo) {
             Some(n) => Value::Integer(n as i64),
+            None => Value::Null,
+        },
+        SqlType::BigInt => match eng.get(eid, &cd.himo) {
+            Some(raw) => Value::Integer((raw ^ (1 << 63)) as i64),
             None => Value::Null,
         },
         // #119: owned + seqlock verify 版に寄せる (借用版は writer 稼働中 torn-unsafe)。
@@ -1001,6 +1056,7 @@ fn serialize_schema(tables: &[TableDef]) -> String {
             out.push(':');
             out.push_str(match c.ty {
                 SqlType::Integer => "INTEGER",
+                SqlType::BigInt => "BIGINT",
                 SqlType::Text => "TEXT",
                 SqlType::Leaf => "LEAF",
             });
@@ -1040,6 +1096,7 @@ fn deserialize_schema(s: &str) -> Result<Vec<TableDef>, SqlError> {
                 .ok_or_else(|| SqlError::Parse(format!("missing col type in: {col_str}")))?;
             let ty = match ty_str {
                 "INTEGER" => SqlType::Integer,
+                "BIGINT" => SqlType::BigInt,
                 "TEXT" => SqlType::Text,
                 "LEAF" => SqlType::Leaf,
                 other => return Err(SqlError::Parse(format!("unknown column type: {other}"))),
@@ -1064,6 +1121,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(&path);
         Database::create(&path).unwrap()
+    }
+
+    /// BIGINT: 負の数 / ms の時刻 / 値域の端が書けて、 等値 / 範囲 / 並び / 書き換え / 主キー / reopen で元の値。
+    #[test]
+    fn bigint_columns_hold_64_bit_values() {
+        let path = "/tmp/enchudb_sql_bigint.db";
+        let _ = std::fs::remove_dir_all(path);
+        let vals: [i64; 6] = [i64::MIN, -1_790_000_000_123, -1, 0, 1_790_000_000_123, i64::MAX - 1];
+        {
+            let mut db = Database::create(path).unwrap();
+            db.execute("CREATE TABLE ev (id BIGINT PRIMARY KEY, at BIGINT, n INTEGER)").unwrap();
+            for (i, v) in vals.iter().enumerate() {
+                db.execute(&format!("INSERT INTO ev VALUES ({}, {v}, {i})", -(i as i64) - 1)).unwrap();
+            }
+            let at = |db: &mut Database, q: &str| -> Vec<i64> {
+                match db.execute(q).unwrap() {
+                    Output::Rows { rows, .. } => rows.into_iter().map(|r| match r[0] { Value::Integer(n) => n, ref o => panic!("{o:?}") }).collect(),
+                    o => panic!("{o:?}"),
+                }
+            };
+            assert_eq!(at(&mut db, "SELECT at FROM ev WHERE at = -1790000000123"), vec![-1_790_000_000_123]);
+            assert_eq!(at(&mut db, "SELECT at FROM ev WHERE at < 0 ORDER BY at"), vec![i64::MIN, -1_790_000_000_123, -1]);
+            assert_eq!(at(&mut db, "SELECT at FROM ev WHERE at >= 0 ORDER BY at DESC"), vec![i64::MAX - 1, 1_790_000_000_123, 0]);
+            // 主キー (BIGINT、 負の数) で書き換え
+            db.execute("INSERT OR REPLACE INTO ev VALUES (-2, 5, 99)").unwrap();
+            assert_eq!(at(&mut db, "SELECT at FROM ev WHERE id = -2"), vec![5]);
+            assert_eq!(at(&mut db, "SELECT n FROM ev WHERE id = -2"), vec![99]);
+            assert!(db.execute("INSERT INTO ev VALUES (100, 9223372036854775807, 0)").is_err(), "i64::MAX は入らない");
+        }
+        let mut db = Database::open(path).unwrap();
+        match db.execute("SELECT id, at FROM ev ORDER BY at").unwrap() {
+            Output::Rows { rows, .. } => {
+                let got: Vec<(i64, i64)> = rows.iter().map(|r| match (&r[0], &r[1]) { (Value::Integer(a), Value::Integer(b)) => (*a, *b), o => panic!("{o:?}") }).collect();
+                assert_eq!(got, vec![(-1, i64::MIN), (-3, -1), (-4, 0), (-2, 5), (-5, 1_790_000_000_123), (-6, i64::MAX - 1)]);
+            }
+            o => panic!("{o:?}"),
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(path);
     }
 
     #[test]

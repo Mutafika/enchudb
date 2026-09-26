@@ -115,7 +115,7 @@ fn sns_timeline() {
     // Instead: find posts by author, then follow content
     // post1(3) → author → Bob(1)
     let author = ravn.path(post1, &["author"]);
-    assert_eq!(author, Some(bob as u32));
+    assert_eq!(author, Some(bob as u64));
 
     // follow from multiple posts to author
     let authors = ravn.follow(&[post1, post2, post3], &["author"]);
@@ -158,7 +158,7 @@ fn select_with_text() {
     // select type=1, get age
     let rows = ravn.select(&[("type", 1)], &["age"]);
     assert_eq!(rows.len(), 2);
-    let ages: Vec<u32> = rows.iter().filter_map(|(_, v)| v[0]).collect();
+    let ages: Vec<u64> = rows.iter().filter_map(|(_, v)| v[0]).collect();
     assert!(ages.contains(&30));
     assert!(ages.contains(&25));
 
@@ -337,7 +337,7 @@ fn exec_get() {
     match ravn.exec("type:1 | get score") {
         RavnResult::Values(rows) => {
             assert_eq!(rows.len(), 2);
-            let scores: Vec<u32> = rows.iter().filter_map(|(_, v)| v[0]).collect();
+            let scores: Vec<u64> = rows.iter().filter_map(|(_, v)| v[0]).collect();
             assert!(scores.contains(&42));
             assert!(scores.contains(&77));
         }

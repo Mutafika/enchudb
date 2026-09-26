@@ -43,6 +43,8 @@ pub enum ValueType {
     Ref = 2,
     /// 終端タグ — FreeStore を引く (dedupe なし)。1 entity しか繋がらない葉ノード。
     Leaf = 3,
+    /// 64 bit の数値 — cell 8B、 値は u64 (`u64::MAX` は空の印で使えない)。 FILE_VERSION 11。
+    Number64 = 4,
 }
 
 impl ValueType {
@@ -51,10 +53,43 @@ impl ValueType {
             0 => Self::Tag,
             2 => Self::Ref,
             3 => Self::Leaf,
+            4 => Self::Number64,
             _ => Self::Number,
         }
     }
+
+    /// cell の byte 数 (4 / 8)。
+    pub fn width(self) -> u32 {
+        match self {
+            Self::Number64 => 8,
+            _ => 4,
+        }
+    }
+
+    /// 書ける値の上限 (含む)。 cell には値 + 1 を置く (0 = 未設定) ので幅の最大値は使えない。
+    pub fn max_value(self) -> u64 {
+        match self {
+            Self::Number64 => u64::MAX - 1,
+            _ => u32::MAX as u64 - 1,
+        }
+    }
 }
+
+/// tie 系の値の入口。 u8 / u16 / u32 / u64 / usize と、 負でない i32 / i64 / isize を受ける (負の数は
+/// `None` = 書かない)。 i32 に実装してあるので数値リテラル (型推論で i32) もそのまま渡せる。 列の幅に
+/// 入るか (u32 の列は `u32::MAX` 未満、 64 bit 列は `u64::MAX` 未満) は書く側 (engine) が確かめる。
+pub trait CellValue: Copy {
+    fn cell_value(self) -> Option<u64>;
+}
+
+macro_rules! cell_value_unsigned {
+    ($($t:ty),*) => { $(impl CellValue for $t { #[inline] fn cell_value(self) -> Option<u64> { Some(self as u64) } })* };
+}
+macro_rules! cell_value_signed {
+    ($($t:ty),*) => { $(impl CellValue for $t { #[inline] fn cell_value(self) -> Option<u64> { u64::try_from(self).ok() } })* };
+}
+cell_value_unsigned!(u8, u16, u32, u64, usize);
+cell_value_signed!(i32, i64, isize);
 
 // #95 並行性:
 //   LockFreeCylinder 自体は「同時に 1 writer」を要求する。 write の呼び出し元は
@@ -96,26 +131,43 @@ pub struct HimoStore {
     write_lock: Mutex<()>,
 }
 
-/// `col.get(eid)` の 4 byte を stored 形式の u32 で。
+/// `col.get(eid)` の cell を stored 形式 (0 = 未設定、 N = 値 N-1) で。 列の幅 (4 / 8 byte) はここと
+/// `value_at` / `store` だけが見る。
 ///
 /// `col()` が (遅延解決のため) atomic load になったので、 **要素ごとに `self.col()` を
 /// 呼ぶとループ外に巻き上げられない**。 hot loop は `let col = self.col();` を 1 回だけ
 /// 取って、 この free 関数に渡すこと (request23 D2 の計測で sunsu2 phase2_chaos が
 /// 82.6s → 91.7s になった原因がこれだった)。
 #[inline(always)]
-fn stored_at(col: &Column, eid: u32) -> u32 {
-    u32::from_le_bytes(col.get(eid).try_into().unwrap())
+fn stored_at(col: &Column, eid: u32) -> u64 {
+    let b = col.get(eid);
+    if col.value_size == 8 {
+        u64::from_le_bytes(b.try_into().unwrap())
+    } else {
+        u32::from_le_bytes(b.try_into().unwrap()) as u64
+    }
 }
 
 /// `get_value` の col 受け取り版。
 #[inline(always)]
-fn value_at(col: &Column, eid: u32) -> Option<u32> {
+fn value_at(col: &Column, eid: u32) -> Option<u64> {
     if eid >= col.count() {
         return None;
     }
-    // #106: Acquire load。 writer の `store_u32_release` と対。
-    let stored = col.load_u32_acquire(eid);
+    // #106: Acquire load。 writer の `store_*_release` と対。
+    let stored = if col.value_size == 8 { col.load_u64_acquire(eid) } else { col.load_u32_acquire(eid) as u64 };
     if stored == 0 { None } else { Some(stored - 1) }
+}
+
+/// cell に stored 形式の値を Release で書く (幅に合わせて)。
+#[inline(always)]
+fn store_at(col: &Column, eid: u32, stored: u64) {
+    if col.value_size == 8 {
+        col.store_u64_release(eid, stored);
+    } else {
+        debug_assert!(stored <= u32::MAX as u64);
+        col.store_u32_release(eid, stored as u32);
+    }
 }
 
 fn ready(col: Column) -> OnceLock<Column> {
@@ -131,7 +183,7 @@ unsafe impl Send for HimoStore {}
 
 impl HimoStore {
     pub fn init(col_region: Region, ht: ValueType, max_values: u32, max_entities: u32) -> Self {
-        let col = Column::init(col_region, 4, max_entities);
+        let col = Column::init(col_region, ht.width(), max_entities);
         Self {
             col: ready(col),
             #[cfg(not(target_arch = "wasm32"))]
@@ -265,7 +317,12 @@ impl HimoStore {
     /// cell に値を書く。 **書けなかったら `false`** (#167: growable backing で
     /// commit を伸ばせない = ディスク満杯。 未 commit page に書くと SIGBUS になるので
     /// 書かずに諦める)。 戻り値を無視しても従来どおり動く。
-    pub fn set(&self, eid: u32, value: u32) -> bool {
+    pub fn set(&self, eid: u32, value: u64) -> bool {
+        // 幅に入らない値は書かない (呼び側 = engine の tie 系が先に弾いて fault に積む)
+        if value > self.value_type.max_value() {
+            debug_assert!(false, "HimoStore::set: value {value} exceeds {:?}", self.value_type);
+            return false;
+        }
         let w = self.write_lock.lock();
         // 未 build の cylinder は触らない (#270)。 順序契約は `cyl_live` 参照。
         let cyl = self.cyl_live(&w);
@@ -286,7 +343,7 @@ impl HimoStore {
         }
         // #106: Release store。 leaf offset を publish する前に書いた LeafStore slot
         // (payload/gen) を、 offset を Acquire で読む reader が必ず観測できるようにする。
-        col.store_u32_release(eid, value + 1);
+        store_at(col, eid, value + 1);
         if let Some(cyl) = cyl {
             cyl.insert(eid, value);
         }
@@ -294,7 +351,19 @@ impl HimoStore {
         if let Some((o, (len, live))) = stale {
             self.maybe_compact(o, len, live);
         }
+        if let Some(cyl) = cyl {
+            self.maybe_compact_sparse(cyl);
+        }
         true
+    }
+
+    /// sparse (大きな値の run) の古い entry が半分を超えたら Column 基準で組み直す。 write_lock 下・
+    /// Column 更新後に。 償却 O(1) / write (組み直すたびに古い entry は 0 に戻る)。
+    fn maybe_compact_sparse(&self, cyl: &LockFreeCylinder) {
+        if cyl.sparse_needs_compact() {
+            let col = self.col();
+            cyl.compact_sparse(|v, eid| stored_at(col, eid) == v + 1);
+        }
     }
 
     /// write_lock を 1 度取って離すだけ。 これより前に lock を離した書き込みは全て見える
@@ -316,6 +385,9 @@ impl HimoStore {
                 if let Some((len, live)) = stale {
                     self.maybe_compact(o, len, live);
                 }
+                if let Some(cyl) = cyl {
+                    self.maybe_compact_sparse(cyl);
+                }
             }
         }
     }
@@ -324,7 +396,7 @@ impl HimoStore {
     /// write_lock 下・Column 更新後に呼ぶこと。trigger は stale 率 50% なので
     /// amortized O(1)/write (Vec doubling と同じ理屈 — 組み直し後の stale は 0、
     /// 次の trigger までに live 相当数の churn が必要)。
-    fn maybe_compact(&self, value: u32, len: usize, live: u32) {
+    fn maybe_compact(&self, value: u64, len: usize, live: u32) {
         if len >= COMPACT_MIN_LEN && (len - live as usize) * 2 >= len {
             let col = self.col();
             self.cyl.compact_bucket(value, |eid| stored_at(col, eid) == value + 1);
@@ -342,7 +414,10 @@ impl HimoStore {
             return;
         };
         let col = self.col();
-        for v in cyl.unique_values() {
+        if cyl.sparse_churned() {
+            cyl.compact_sparse(|v, eid| stored_at(col, eid) == v + 1);
+        }
+        for v in cyl.unique_values().into_iter().filter(|&v| crate::lockfree_cylinder::is_dense(v)) {
             // clean bucket (churn 痕なし) は組み直し不要 — 無条件 swap は巨大 himo で
             // write_lock の長期保持 + 旧 backing の epoch 滞留 (一時 ~2x RSS) を招く
             // (PR #103 レビュー)。write_lock 下なので flag 判定は正確。
@@ -353,20 +428,45 @@ impl HimoStore {
     }
 
     /// 現在の unique 値数 (live 基準、churn があっても正確 — request12)。
+    ///
+    /// dense (値 < `DENSE_CAP`) の分は O(1)。 大きな値 (`SparseRuns`) の分は値ごとの件数を持たないので、
+    /// Column と突き合わせて数える (O(大きな値の entry 数)) — 値の種類が多い列 (時刻 / 64 bit ID) で
+    /// 書き込みのたびに値ごとの数を保つより、 呼ばれた時に数える方が安い。
     pub fn unique_count(&self) -> u32 {
         self.ensure_cylinder_built();
-        self.cyl.unique_live()
+        let col = self.col();
+        let mut sparse = self.cyl.sparse_range(0, u64::MAX);
+        sparse.retain(|&(v, eid)| stored_at(col, eid) == v + 1);
+        let mut vals: Vec<u64> = sparse.into_iter().map(|p| p.0).collect();
+        vals.dedup(); // run ごとに値の順なので、 並べ直してから
+        vals.sort_unstable();
+        vals.dedup();
+        self.cyl.unique_live() + vals.len() as u32
     }
 
     // ──── 読む（Column 直読み、Cylinder 非依存）────
 
-    pub fn get_value(&self, eid: u32) -> Option<u32> {
+    pub fn get_value(&self, eid: u32) -> Option<u64> {
         // #106: Acquire load。 writer の `store_u32_release` と対で、 leaf offset を
         // 掴んだら対応する LeafStore slot の payload/gen も必ず観測できるようにする。
         value_at(self.col(), eid)
     }
 
+    /// u32 の列 (Tag / Leaf / Ref / Number) の値。 vid / leaf offset / local eid を読む engine 内部用。
+    ///
+    /// # Panics
+    /// 64 bit 列 (u32 で読むと値が化ける)。
+    #[inline]
+    pub fn get_value32(&self, eid: u32) -> Option<u32> {
+        let col = self.col();
+        assert_eq!(col.value_size, 4, "get_value32 on a 64-bit column ({:?})", self.value_type);
+        value_at(col, eid).map(|v| v as u32)
+    }
+
     /// SIMD 集計向け raw stored values への view（stored 形式: 0 = 未設定、N = 値 N-1）。
+    ///
+    /// # Panics
+    /// 64 bit 列 (u32 の集計には使えない)。
     #[inline]
     pub fn stored_slice(&self) -> &[u32] {
         self.col().values_u32()
@@ -376,6 +476,7 @@ impl HimoStore {
     #[inline]
     pub fn get_stored_into(&self, eids: &[enchudb_oplog::EntityId], out: &mut Vec<u32>) {
         let col = self.col();
+        assert_eq!(col.value_size, 4, "get_stored_into: 64 bit 列は u32 で読めない");
         let count = col.count();
         out.clear();
         out.reserve(eids.len());
@@ -385,25 +486,27 @@ impl HimoStore {
                 out.push(0);
                 continue;
             }
-            out.push(stored_at(col, lid));
+            out.push(stored_at(col, lid) as u32);
         }
     }
 
     /// eid の現在値が value か（= lazy verify の primitive、Column 直読み）。
     #[inline(always)]
-    pub fn value_eq(&self, eid: u32, value: u32) -> bool {
+    pub fn value_eq(&self, eid: u32, value: impl CellValue) -> bool {
+        let Some(value) = value.cell_value() else { return false };
         stored_at(self.col(), eid) == value + 1
     }
 
-    pub fn get_raw_bytes(&self, eid: u32) -> [u8; 4] {
+    /// cell の stored 形式の値 (0 = 未設定)。 `restore` と対。
+    pub fn get_raw_stored(&self, eid: u32) -> u64 {
         let col = self.col();
         if eid >= col.count() {
-            return [0u8; 4];
+            return 0;
         }
-        col.get(eid).try_into().unwrap()
+        stored_at(col, eid)
     }
 
-    pub fn restore(&self, eid: u32, old_bytes: &[u8; 4]) {
+    pub fn restore(&self, eid: u32, stored: u64) {
         let w = self.write_lock.lock();
         // #270: set / remove と同じ gate。 ここで `ensure_cylinder_built` を呼ぶと、
         // rollback 1 回で index が組まれて以後の bulk load 全体が維持モードに戻る。
@@ -414,7 +517,6 @@ impl HimoStore {
             return;
         }
         col.ensure_count(eid);
-        let stored = u32::from_le_bytes(*old_bytes);
         let old = value_at(col, eid);
         let new = if stored == 0 { None } else { Some(stored - 1) };
         if old == new {
@@ -425,12 +527,15 @@ impl HimoStore {
             // flag → Column の順 (set と同じ、request12)
             stale = cyl.note_stale(o).map(|s| (o, s));
         }
-        col.set(eid, old_bytes);
+        store_at(col, eid, stored);
         if let (Some(cyl), Some(n)) = (cyl, new) {
             cyl.insert(eid, n);
         }
         if let Some((o, (len, live))) = stale {
             self.maybe_compact(o, len, live);
+        }
+        if let Some(cyl) = cyl {
+            self.maybe_compact_sparse(cyl);
         }
     }
 
@@ -439,7 +544,8 @@ impl HimoStore {
     /// 値に合致する entity。#95: Cylinder の raw を、削除/更新があった **bucket** でのみ
     /// Column verify + dedup で filter（churn していない bucket は raw 直返し =
     /// fast path。request12 で himo 単位 → bucket 単位に局所化）。
-    pub fn pull(&self, value: u32) -> Vec<u32> {
+    pub fn pull(&self, value: impl CellValue) -> Vec<u32> {
+        let Some(value) = value.cell_value() else { return Vec::new() };
         self.ensure_cylinder_built();
         let (raw, needs_verify) = self.cyl.read_to_vec_verify(value);
         if !needs_verify {
@@ -455,6 +561,37 @@ impl HimoStore {
             out.sort_unstable();
             out.dedup();
             out
+        }
+    }
+
+    /// 値が `lo..=hi` の entity (eid の昇順・重複なし)。 索引の範囲 (dense は bucket を範囲の分、 大きな値は
+    /// run の二分探索) を Column の現在値で確かめる。
+    pub fn pull_range(&self, lo: u64, hi: u64) -> Vec<u32> {
+        if lo > hi {
+            return Vec::new();
+        }
+        self.ensure_cylinder_built();
+        let col = self.col();
+        let mut out = self.cyl.range_raw(lo, hi);
+        out.retain(|&eid| {
+            let s = stored_at(col, eid);
+            // stored = 値 + 1 (0 = 未設定)
+            s != 0 && lo < s && s - 1 <= hi
+        });
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// eid `lo..hi` の値 (`None` = 未設定)。 64 bit 列でも読める集計用の走査 (u32 の SIMD 経路の代わり)。
+    pub fn for_each_in(&self, lo: u32, hi: u32, mut f: impl FnMut(u32, u64)) {
+        let col = self.col();
+        let end = hi.min(col.count());
+        for eid in lo..end {
+            let s = stored_at(col, eid);
+            if s != 0 {
+                f(eid, s - 1);
+            }
         }
     }
 
@@ -475,13 +612,18 @@ impl HimoStore {
     /// value の live 件数 (= pull 結果の件数、正確)。planner の pivot 選択用。
     /// request12 で raw (stale 込み over-count) から live 基準に変更 — churn 後も
     /// 最小スライスを正しく選べる。
-    pub fn slice_len(&self, value: u32) -> usize {
+    pub fn slice_len(&self, value: impl CellValue) -> usize {
+        let Some(value) = value.cell_value() else { return 0 };
+        if !crate::lockfree_cylinder::is_dense(value) {
+            // 大きな値は件数を持たない: 引いて数える (値の種類が多い列では 1 値あたりの件数は小さい)
+            return self.pull(value).len();
+        }
         self.ensure_cylinder_built();
         self.cyl.slice_len_live(value)
     }
 
     /// 入っている値を列挙（順序保証なし、churn 時は stale 含む近似）。
-    pub fn unique_values(&self) -> Vec<u32> {
+    pub fn unique_values(&self) -> Vec<u64> {
         self.ensure_cylinder_built();
         self.cyl.unique_values()
     }
@@ -494,11 +636,20 @@ impl HimoStore {
     ///
     /// 走査は非 atomic な raw view (`values_u32`) なので、 **書き込みと並走しない場面**
     /// (open 直後) でだけ使うこと。
-    pub fn for_each_set_value(&self, mut f: impl FnMut(u32)) {
+    pub fn for_each_set_value(&self, mut f: impl FnMut(u64)) {
         let col = self.col();
+        if col.value_size == 8 {
+            for eid in 0..col.count() {
+                let stored = stored_at(col, eid);
+                if stored != 0 {
+                    f(stored - 1);
+                }
+            }
+            return;
+        }
         for &stored in col.values_u32() {
             if stored != 0 {
-                f(stored - 1);
+                f(stored as u64 - 1);
             }
         }
     }
@@ -536,7 +687,8 @@ impl HimoStore {
 
     pub fn rebuild_cylinder(&self) {}
 
-    pub fn scan(&self, value: u32) -> Vec<u32> {
+    pub fn scan(&self, value: impl CellValue) -> Vec<u32> {
+        let Some(value) = value.cell_value() else { return Vec::new() };
         let col = self.col();
         let count = col.count();
         let target = value + 1;
@@ -586,7 +738,7 @@ mod tests {
         assert!(!hs.cylinder_built(), "remove が組んでいる");
 
         // restore: eid 3 に「元は 7 だった」を書き戻す (stored = value + 1)。
-        hs.restore(3, &8u32.to_le_bytes());
+        hs.restore(3, 8);
         assert!(!hs.cylinder_built(), "restore が組んでいる (#270 の gate 漏れ)");
 
         // 組む前に書いた 3 本 (0/1 は set、 3 は restore) を遅延構築が全部拾う。
@@ -601,6 +753,71 @@ mod tests {
         let mut got = hs.pull(7);
         got.sort_unstable();
         assert_eq!(got, vec![0, 1, 3, 4], "build 後の write が index に入っていない");
+    }
+
+    fn make_store64(max_entities: u32) -> HimoStore {
+        let bytes = 16 + max_entities as usize * 8 + 64;
+        let buf: Box<[u8]> = vec![0u8; bytes].into_boxed_slice();
+        let ptr = Box::leak(buf).as_mut_ptr();
+        let region = unsafe { Region::new(ptr, bytes) };
+        HimoStore::init(region, ValueType::Number64, 0, max_entities)
+    }
+
+    /// 大きな値 (sparse run) と小さな値 (dense bucket) を混ぜた書き込み / 書き換え / 削除の後でも、
+    /// `pull` / `slice_len` / `unique_count` / `total` が Column の中身と一致する。 sparse の古い entry
+    /// が半分を超えるたびに組み直される (件数が膨らまない) こと。
+    #[test]
+    fn sparse_runs_stay_exact_under_churn() {
+        const N: u32 = 400;
+        let hs = make_store64(N);
+        let mut cells: Vec<Option<u64>> = vec![None; N as usize];
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let vals = [3u64, 9, crate::lockfree_cylinder::DENSE_CAP as u64 + 1, 1 << 33, 1 << 40, u64::MAX - 2];
+        let _ = hs.pull(0u32); // 索引を組んでから (以後 writer が維持する)
+        for step in 0..20_000 {
+            let e = (next() % N as u64) as u32;
+            match next() % 5 {
+                0 => {
+                    hs.remove(e);
+                    cells[e as usize] = None;
+                }
+                1 => {
+                    // restore: 別の値の stored 形式を書き戻す
+                    let v = vals[(next() % vals.len() as u64) as usize];
+                    hs.restore(e, v + 1);
+                    cells[e as usize] = Some(v);
+                }
+                _ => {
+                    let v = vals[(next() % vals.len() as u64) as usize];
+                    assert!(hs.set(e, v));
+                    cells[e as usize] = Some(v);
+                }
+            }
+            if step % 997 == 0 || step == 19_999 {
+                for &v in &vals {
+                    let want: Vec<u32> = (0..N).filter(|&i| cells[i as usize] == Some(v)).collect();
+                    // dense の bucket は verify が要らない時は追記順で返す (並びは約束しない)
+                    let mut got = hs.pull(v);
+                    got.sort_unstable();
+                    assert_eq!(got, want, "step {step}: pull {v}");
+                    assert_eq!(hs.slice_len(v), want.len(), "step {step}: slice_len {v}");
+                }
+                let distinct = vals.iter().filter(|&&v| cells.contains(&Some(v))).count();
+                assert_eq!(hs.unique_count() as usize, distinct, "step {step}: unique_count");
+                assert_eq!(hs.total(), cells.iter().filter(|c| c.is_some()).count(), "step {step}: total");
+            }
+        }
+        // 古い entry が溜まり続けていない (組み直しが効いている)
+        assert!(hs.cyl.sparse_range(0, u64::MAX).len() < 3 * N as usize, "sparse の entry が膨らんでいる");
+        hs.compact_now();
+        let live = cells.iter().filter(|c| c.is_some_and(|v| v >= crate::lockfree_cylinder::DENSE_CAP as u64)).count();
+        assert_eq!(hs.cyl.sparse_range(0, u64::MAX).len(), live, "compact_now 後に古い entry が残る");
     }
 
     /// 観測 API が観測対象を確保しない (#270)。
