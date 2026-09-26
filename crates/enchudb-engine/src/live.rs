@@ -4984,6 +4984,14 @@ impl LiveKeyed {
         m.keyed.as_ref()?.reported.get(enchudb_oplog::eid_local(eid)).checked_sub(1)
     }
 
+    /// 渡し済みの鍵を引く関数を `f` に渡す (その間ロックを持つ)。 引く回数が多く、 まとめて渡せない時用 (親をたどる等)。
+    pub fn with_reported<R>(&self, f: impl FnOnce(&dyn Fn(EntityId) -> Option<u64>) -> R) -> R {
+        let guard = self.family.settled.lock();
+        let ks = guard.members[self.slot].as_ref().and_then(|m| m.keyed.as_ref());
+        let get = |e: EntityId| ks.and_then(|k| k.reported.get(enchudb_oplog::eid_local(e)).checked_sub(1));
+        f(&get)
+    }
+
     /// [`reported_key`](Self::reported_key) をまとめて (ロック 1 回)。 `eids` と同じ順。
     pub fn reported_keys(&self, eids: &[EntityId]) -> Vec<Option<u64>> {
         let guard = self.family.settled.lock();

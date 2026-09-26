@@ -3575,7 +3575,9 @@ impl<'a> UnderQuery<'a> {
         let Some((f, sd, a, via)) = self.plan()? else { return Ok(Vec::new()) };
         let peer = eng.peer_id();
         let local = |e: EntityId| enchudb_oplog::eid_local(e);
-        let refs = HierRef { eng: &eng, via, peer };
+        let col_parent = |x: u32| eng.get_by_id(enchudb_oplog::make_eid(peer, x), via).map(|p| p as u32);
+        let refs = HierRef { parent: &col_parent };
+        let mut memo = Some(std::collections::BTreeMap::new());
         let mut h = Hier::new(up);
         if up {
             // 上向きは seed の数を積むので、 親の表を組み立てる (下向きは親を engine から読む)
@@ -3593,7 +3595,7 @@ impl<'a> UnderQuery<'a> {
             .find_by(f)
             .map_err(io)?
             .into_iter()
-            .filter(|&e| h.find_answer(local(e), &refs))
+            .filter(|&e| h.find_answer(local(e), &refs, &mut memo))
             .map(|e| enchudb_oplog::make_eid(peer, local(e)))
             .collect();
         out.sort_unstable();
@@ -3614,33 +3616,32 @@ impl<'a> UnderQuery<'a> {
         let up = self.up;
         let state = std::sync::Mutex::new(UnderState { hier: Hier::new(up), filt: Default::default(), reported: Default::default() });
         let Some((f, sd, a, via)) = self.plan()? else {
-            return Ok(LiveUnder { eng, live: None, via: 0, state });
+            return Ok(LiveUnder { eng, live: None, state });
         };
         let parents = eng.subscribe_keyed(a, Vec::new(), via).map_err(io)?;
         let seeds = eng.subscribe(sd).map_err(io)?;
         let filter = eng.subscribe(f).map_err(io)?;
-        Ok(LiveUnder { eng, live: Some((parents, seeds, filter)), via, state })
+        Ok(LiveUnder { eng, live: Some((parents, seeds, filter)), state })
     }
 }
 
-/// 階層の ref 列を engine から読む: 親 = ref 列の直読み (Column 1 回)。 購読が当てた差分より先の書き込みも見えるが、
-/// 下向きの答え (真偽) は、 読み違えた row の差分が次の poll で届いて決め直される。
+/// 階層の親を引く。 購読では、 親の ref の鍵付きの購読が渡し済みの鍵 (= 当てた差分の状態) から引く。 engine の列を
+/// 直読みすると poll より後の書き込みが見え、 書いて戻した (x → y → x) row は差分が出ないので、 途中の y を通って決めた
+/// 答えが直らない (並行テストで 20 回に 3 回、 書き終わった後も結果に余分な row が残った)。 find は列を直読みする。
 ///
-/// 子は engine から引かない (ref 列の値で引くと、 その列の Cylinder が無ければ全 row で組まれ (#270 の lazy build)、
-/// 以後その列の書き込みごとに維持される: 社員 100 万のベンチで RSS +45 MB、 1 万件まとめ -4%)。 子は購読が当てた差分から持つ。
+/// 子は引かない: ref 列の値で引くと、 その列の Cylinder が無ければ全 row で組まれ (#270 の lazy build)、 以後その列の
+/// 書き込みごとに維持される (試した版: 社員 100 万で RSS +45 MB、 1 万件まとめ -4%)。 子は当てた差分から持つ。
 struct HierRef<'e> {
-    eng: &'e Engine,
-    via: u16,
-    peer: u32,
+    parent: &'e dyn Fn(u32) -> Option<u32>,
 }
 
 impl HierRef<'_> {
     fn parent(&self, x: u32) -> Option<u32> {
-        self.eng.get_by_id(enchudb_oplog::make_eid(self.peer, x), self.via).map(|p| p as u32)
+        (self.parent)(x)
     }
 }
 
-/// 下向きの seed と配下の答え。 row は local eid。 親は持たず engine から読む ([`HierRef`])、 子は当てた差分から持つ。
+/// 下向きの seed と配下の答え。 row は local eid。 親は持たず鍵付きの購読から引く ([`HierRef`])、 子は当てた差分から持つ。
 #[derive(Default)]
 struct Tree {
     /// (親, 子)
@@ -3651,20 +3652,52 @@ struct Tree {
 }
 
 impl Tree {
-    /// 親をたどって seed に着くか (根 / 輪に着いたら偽)。 階層の深さに比例。
-    fn walk(&self, r: u32, h: &HierRef) -> bool {
-        let mut cur = r;
-        let mut seen = std::collections::BTreeSet::new();
-        while let Some(p) = h.parent(cur) {
-            if self.seed.contains(&p) {
-                return true;
-            }
-            if p == r || !seen.insert(p) {
-                return false;
-            }
-            cur = p;
+    /// r の答え (親をたどって seed に着くか) を、 この poll で既に決めた答え (`memo`) を使って決める。 たどった道の row の
+    /// 答えも `memo` に残す — 根が多い poll (最初の poll は全 row が根) でも、 どの row も 1 回しかたどらない (row ごとに
+    /// 上までたどると row 数 × 深さ: 深さ 10 万の一本道で最初の poll が返らなかった)。 輪 (seed を含まない) の row は偽。
+    fn resolve(&self, r: u32, h: &HierRef, memo: &mut Option<std::collections::BTreeMap<u32, bool>>) -> bool {
+        if let Some(&a) = memo.as_ref().and_then(|m| m.get(&r)) {
+            return a;
         }
-        false
+        let mut path = vec![r];
+        // 輪の検出: 浅いうちは道を線形に見る、 深くなったら集合に
+        let mut on_path: Option<std::collections::BTreeSet<u32>> = None;
+        let mut cur = r;
+        // 道の一番上 (cur) の答え
+        let top = loop {
+            match h.parent(cur) {
+                None => break false,
+                Some(p) if self.seed.contains(&p) => break true,
+                Some(p) => {
+                    if let Some(&a) = memo.as_ref().and_then(|m| m.get(&p)) {
+                        break a;
+                    }
+                    let again = match on_path.as_mut() {
+                        Some(set) => !set.insert(p),
+                        None if path.len() < 32 => path.contains(&p),
+                        None => {
+                            let mut set: std::collections::BTreeSet<u32> = path.iter().copied().collect();
+                            let again = !set.insert(p);
+                            on_path = Some(set);
+                            again
+                        }
+                    };
+                    if again {
+                        // 輪 (道の上に seed が無い): 輪の row も、 輪に入る道の row も偽
+                        break false;
+                    }
+                    path.push(p);
+                    cur = p;
+                }
+            }
+        };
+        // 道の row の親は seed でない (seed に着いたら止まる) ので、 道の row は全部 top と同じ答え
+        if let Some(m) = memo.as_mut() {
+            for x in path {
+                m.insert(x, top);
+            }
+        }
+        top
     }
 
     /// `roots` の答えを親をたどって決め直し、 答えが変わった row の子へ下向きに伝える (子の答え = 親が seed か配下か)。
@@ -3672,8 +3705,11 @@ impl Tree {
     fn settle(&mut self, roots: impl IntoIterator<Item = u32>, h: &HierRef) -> Vec<u32> {
         let mut changed = Vec::new();
         let mut queue = std::collections::VecDeque::new();
+        // 道の途中の row の答えは、 その上の根を決め直して下へ伝えれば揃うので、 比べるのは根だけ。 覚えるのは根が 2 つ以上の時だけ
+        let roots: Vec<u32> = roots.into_iter().collect();
+        let mut memo = (roots.len() > 1).then(std::collections::BTreeMap::new);
         for r in roots {
-            let now = self.walk(r, h);
+            let now = self.resolve(r, h, &mut memo);
             if now != self.under.contains(&r) {
                 if now { self.under.insert(r) } else { self.under.remove(&r) };
                 changed.push(r);
@@ -3891,10 +3927,10 @@ impl Hier {
         }
     }
 
-    /// find 用の答え (下向きは親をたどる)。
-    fn find_answer(&self, x: u32, h: &HierRef) -> bool {
+    /// find 用の答え (下向きは親をたどる、 `memo` = たどって決めた答え)。
+    fn find_answer(&self, x: u32, h: &HierRef, memo: &mut Option<std::collections::BTreeMap<u32, bool>>) -> bool {
         match self {
-            Hier::Down(t) => t.walk(x, h),
+            Hier::Down(t) => t.resolve(x, h, memo),
             Hier::Up(a) => a.sub(x) > u64::from(a.seed.contains(&x)),
         }
     }
@@ -3971,8 +4007,6 @@ pub struct LiveUnder {
     eng: Arc<Engine>,
     /// (親の ref の鍵付きの購読, seed, 結果を絞る条件)
     live: Option<(enchudb_engine::LiveKeyed, enchudb_engine::LiveQuery, enchudb_engine::LiveQuery)>,
-    /// 階層の ref 列
-    via: u16,
     state: std::sync::Mutex<UnderState>,
 }
 
@@ -3990,7 +4024,10 @@ impl LiveUnder {
         let mut reborn: BTreeSet<u32> = dp.reentered.iter().map(|&e| local(e)).collect();
         let rs: BTreeSet<EntityId> = df.removed.iter().copied().collect();
         reborn.extend(df.added.iter().filter(|e| rs.contains(e)).map(|&e| local(e)));
-        let mut touched = hier.apply(&dp, &ds, &HierRef { eng: &self.eng, via: self.via, peer });
+        let mut touched = parents.with_reported(|get| {
+            let parent = |x: u32| get(enchudb_oplog::make_eid(peer, x)).map(|p| p as u32);
+            hier.apply(&dp, &ds, &HierRef { parent: &parent })
+        });
         for &e in &df.removed {
             filt.remove(&local(e));
             touched.push(local(e));
