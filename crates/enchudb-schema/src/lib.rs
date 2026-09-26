@@ -3579,17 +3579,20 @@ impl<'a> UnderQuery<'a> {
         let refs = HierRef { parent: &col_parent };
         let mut memo = Some(std::collections::BTreeMap::new());
         let mut h = Hier::new(up);
-        if up {
-            // 上向きは seed の数を積むので、 親の表を組み立てる (下向きは親を engine から読む)
+        if let Hier::Up(ab) = &mut h {
+            // 上向きは子から数を積むので、 親の表を組み立てる (下向きは親を engine から読む)
             for e in eng.find_by(a).map_err(io)? {
                 if let Some(p) = eng.get_by_id(e, via) {
-                    h.link(local(e), p as u32, &mut Default::default());
+                    ab.parent.insert(local(e), p as u32);
                 }
             }
-        }
-        let mut touched = Vec::new();
-        for e in eng.find_by(sd).map_err(io)? {
-            h.set_seed(local(e), true, &mut touched);
+            ab.seed.extend(eng.find_by(sd).map_err(io)?.into_iter().map(local));
+            ab.rebuild();
+        } else {
+            let mut touched = Vec::new();
+            for e in eng.find_by(sd).map_err(io)? {
+                h.set_seed(local(e), true, &mut touched);
+            }
         }
         let mut out: Vec<EntityId> = eng
             .find_by(f)
@@ -3609,7 +3612,7 @@ impl<'a> UnderQuery<'a> {
 
     /// 配下 (または上) の row の出入りを購読する。 初回 poll は登録時点の全部が `added`。 親の付け替え (異動・部署の移動)、
     /// seed の出入り、 この query の条件の変化で届く。 下向きは、 付け替えで配下の答えが変わらない row の下は見に行かない。
-    /// 上向きは、 付け替え 1 回・seed の出入り 1 回が階層の深さに比例。
+    /// 上向きは、 seed の出入り・葉の付け替えが答えの変わる row の数に比例 (深さによらない)、 子の居る row の付け替えは深さに比例。
     pub fn subscribe(self) -> Result<LiveUnder, SchemaError> {
         let eng = self.rows.db.arc_engine();
         let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
@@ -3740,86 +3743,155 @@ impl Tree {
     }
 }
 
-/// 上向き (seed の上司全員) の状態。 row x の `sub[x]` = x 自身か x の下 (何段下でも) に居る seed の数。 輪の上の row は、
-/// 輪につながる全員 (輪と、 輪にぶら下がる木) の seed の数。 x が答え ⇔ `sub[x]` が x 自身の seed を除いて 1 以上。
+/// 上向き (seed の上司全員) の状態。 x の答え = x の下 (何段下でも) に seed が居る。 row ごとに 「子のうち、 seed か答えが
+/// 真の子の数」 (`cnt`) を持ち、 答え = `cnt` が 1 以上。 子の真偽が変わったら親の `cnt` を動かし、 親の答えが変わった時
+/// だけ更に上へ伝える (伝わるのは答えが変わる row の数だけ、 深さによらない)。
 ///
-/// 付け替えは 「切る」 と 「つなぐ」 に分ける。 切る時は旧い親から上へ `sub[c]` を引き、 つなぐ時は新しい親から上へ足す
-/// (上へは輪を 1 周したら止まる)。 輪の上の row は 「自分と、 自分にぶら下がる木の seed の数」 (`own`) も持つ。 輪の上の
-/// row を切ると輪が c を根とする鎖にほどけるので、 鎖の `sub` を `own` から数え直す。 つないで輪ができたら (新しい親が
-/// c の下に居る)、 輪の row の `own` は道の隣どうしの `sub` の差、 `sub` は c の木の seed の数。 子の一覧は持たない。
+/// 数で持つと輪が自分を支える (輪の row どうしが数え合って、 seed が居なくなっても真のまま)。 真の row の居る輪は覚えておき、
+/// 輪の row の `cnt` には輪の外の子だけを数え、 輪ごとに 「輪の row の `cnt` と輪の上の seed の和」 (`cyc_sum`) を持つ。 輪の
+/// row は輪につながる全員の上なので、 答え = `cyc_sum` が自分の seed を除いて 1 以上。 輪の row の親は輪の row なので、 輪から
+/// 上へは伝わらない。 seed につながらない輪は覚えなくてよい (全員 0 で、 数え合う数が無い)。
+///
+/// 輪が真になるのは (1) 伝える途中で、 この回に真にした row (か伝え始めた row) に戻った時、 (2) 下に seed の居る row を
+/// 自分の下へ付け替えた時 (新しい親の側は既に真なので、 伝えるのが途中で止まる)。 (1) は伝える道で見つかり、 (2) だけ新しい
+/// 親から上へたどる (深さに比例)。 下に seed の居ない row の付け替え (ほとんど) は親の表を 1 回書くだけ。
 #[derive(Default)]
 struct Above {
     parent: std::collections::BTreeMap<u32, u32>,
     seed: std::collections::BTreeSet<u32>,
-    sub: std::collections::BTreeMap<u32, u64>,
-    /// 輪の上の row の own (0 は持たない)。
-    own: std::collections::BTreeMap<u32, u64>,
+    /// 子 (輪の row は輪の外の子) のうち seed か答えが真の数 (0 は持たない)。
+    cnt: std::collections::BTreeMap<u32, u64>,
+    /// 覚えている輪の row → 輪の番号。
+    cyc_of: std::collections::BTreeMap<u32, u32>,
+    /// 輪の番号 → 輪の row の `cnt` と輪の上の seed の和。
+    cyc_sum: std::collections::BTreeMap<u32, u64>,
+    next_cyc: u32,
+}
+
+/// たどった row の列と、 それに居るかの判定 (浅いうちは列を線形に見る、 長くなったら集合に)。
+struct Trail {
+    rows: Vec<u32>,
+    set: Option<std::collections::BTreeSet<u32>>,
+}
+
+impl Trail {
+    fn new(x: u32) -> Trail {
+        Trail { rows: vec![x], set: None }
+    }
+
+    fn contains(&self, x: u32) -> bool {
+        match &self.set {
+            Some(s) => s.contains(&x),
+            None => self.rows.contains(&x),
+        }
+    }
+
+    fn push(&mut self, x: u32) {
+        self.rows.push(x);
+        match self.set.as_mut() {
+            Some(s) => {
+                s.insert(x);
+            }
+            None if self.rows.len() > 32 => self.set = Some(self.rows.iter().copied().collect()),
+            None => {}
+        }
+    }
 }
 
 impl Above {
-    fn sub(&self, x: u32) -> u64 {
-        self.sub.get(&x).copied().unwrap_or(0)
+    fn cnt(&self, x: u32) -> u64 {
+        self.cnt.get(&x).copied().unwrap_or(0)
     }
 
-    fn put(&mut self, x: u32, v: u64, touched: &mut Vec<u32>) {
-        use std::collections::btree_map::Entry;
-        match self.sub.entry(x) {
-            Entry::Occupied(mut o) if *o.get() != v => {
-                touched.push(x);
-                if v == 0 {
-                    o.remove();
-                } else {
-                    o.insert(v);
-                }
-            }
-            Entry::Vacant(o) if v != 0 => {
-                touched.push(x);
-                o.insert(v);
-            }
-            _ => {}
+    fn answer(&self, x: u32) -> bool {
+        match self.cyc_of.get(&x) {
+            Some(id) => self.cyc_sum[id] > u64::from(self.seed.contains(&x)),
+            None => self.cnt(x) > 0,
         }
     }
 
-    /// x と、 x から親をたどった row (輪を 1 周したら止まる)。 輪に着いたら、 輪に入った row も返す。
-    fn up_from(&self, x: u32) -> (Vec<u32>, Option<u32>) {
+    /// 親へ見せる真偽 (輪の外の row だけ)。
+    fn hot(&self, x: u32) -> bool {
+        self.seed.contains(&x) || self.cnt(x) > 0
+    }
+
+    fn add_cnt(&mut self, x: u32, add: bool) -> (u64, u64) {
+        let old = self.cnt(x);
+        let new = if add { old + 1 } else { old - 1 };
+        if new == 0 { self.cnt.remove(&x) } else { self.cnt.insert(x, new) };
+        (old, new)
+    }
+
+    /// 輪の row (x から親をたどって x に戻るまで)。
+    fn cycle(&self, x: u32) -> Vec<u32> {
         let mut out = vec![x];
-        // 輪の検出: 浅いうちは道を線形に見る (階層は普通浅い)、 深くなったら集合に
-        let mut seen: Option<std::collections::BTreeSet<u32>> = None;
-        let mut cur = x;
-        while let Some(&p) = self.parent.get(&cur) {
-            let again = match seen.as_mut() {
-                Some(set) => !set.insert(p),
-                None if out.len() < 32 => out.contains(&p),
-                None => {
-                    let mut set: std::collections::BTreeSet<u32> = out.iter().copied().collect();
-                    let again = !set.insert(p);
-                    seen = Some(set);
-                    again
-                }
-            };
-            if again {
-                return (out, Some(p));
-            }
-            out.push(p);
-            cur = p;
+        let mut cur = self.parent[&x];
+        while cur != x {
+            out.push(cur);
+            cur = self.parent[&cur];
         }
-        (out, None)
+        out
     }
 
-    /// x から上の全員に ±k。
-    fn shift(&mut self, x: u32, k: u64, add: bool, touched: &mut Vec<u32>) {
-        if k == 0 {
-            return;
+    /// 輪の和を ±1。 和が 0 / 1 をまたぐと輪の row の答えが変わりうる (1 は、 seed がその row 自身だけの時)。
+    fn add_cyc(&mut self, x: u32, id: u32, add: bool, touched: &mut Vec<u32>) {
+        let s = self.cyc_sum.get_mut(&id).expect("輪の和");
+        let old = *s;
+        *s = if add { old + 1 } else { old - 1 };
+        if old.min(*s) <= 1 {
+            touched.extend(self.cycle(x));
         }
-        let (path, entry) = self.up_from(x);
-        for y in path {
-            let v = if add { self.sub(y) + k } else { self.sub(y) - k };
-            self.put(y, v, touched);
+    }
+
+    /// 輪 (`rows` の順に、 各 row の親が次の row、 最後の row の親が最初の row) を覚える。 各 row の `cnt` は輪の上の子
+    /// (1 つ前の row) の分を含まないこと。
+    fn remember(&mut self, rows: &[u32], touched: &mut Vec<u32>) {
+        let id = self.next_cyc;
+        self.next_cyc += 1;
+        let mut sum = 0;
+        for &y in rows {
+            sum += self.cnt(y) + u64::from(self.seed.contains(&y));
+            self.cyc_of.insert(y, id);
         }
-        if let Some(r) = entry {
-            let o = self.own.get(&r).copied().unwrap_or(0);
-            let o = if add { o + k } else { o - k };
-            if o == 0 { self.own.remove(&r) } else { self.own.insert(r, o) };
+        self.cyc_sum.insert(id, sum);
+        touched.extend_from_slice(rows);
+    }
+
+    /// x0 の親へ見せる真偽が変わった: 親の `cnt` を ±1 して、 答えが変わったら上へ伝える。 足す時、 この回に真にした row
+    /// (か x0) に戻ったら輪: 戻った所から先の row が輪で、 輪の上の子の分を引いて覚える。 引く時は輪に入らない (真の row の
+    /// 居る輪は覚えてある)。
+    fn bump(&mut self, x0: u32, add: bool, touched: &mut Vec<u32>) {
+        let Some(&p) = self.parent.get(&x0) else { return };
+        let mut trail = Trail::new(x0);
+        let mut x = p;
+        loop {
+            if let Some(&id) = self.cyc_of.get(&x) {
+                self.add_cnt(x, add);
+                self.add_cyc(x, id, add, touched);
+                return;
+            }
+            if add && trail.contains(x) {
+                let at = trail.rows.iter().position(|&y| y == x).expect("たどった row");
+                let rows = trail.rows.split_off(at);
+                for &y in &rows[1..] {
+                    self.add_cnt(y, false);
+                }
+                self.remember(&rows, touched);
+                return;
+            }
+            let (old, new) = self.add_cnt(x, add);
+            if (old > 0) == (new > 0) {
+                return;
+            }
+            touched.push(x);
+            if self.seed.contains(&x) {
+                return;
+            }
+            trail.push(x);
+            match self.parent.get(&x) {
+                Some(&p) => x = p,
+                None => return,
+            }
         }
     }
 
@@ -3829,34 +3901,83 @@ impl Above {
         }
         if on { self.seed.insert(s) } else { self.seed.remove(&s) };
         touched.push(s);
-        self.shift(s, 1, on, touched);
+        if let Some(&id) = self.cyc_of.get(&s) {
+            self.add_cyc(s, id, on, touched);
+        } else if self.cnt(s) == 0 {
+            self.bump(s, on, touched);
+        }
     }
 
+    /// c を親から外す。 c が覚えた輪の上なら、 輪が c を根とする鎖にほどける。
     fn cut(&mut self, c: u32, touched: &mut Vec<u32>) {
-        let Some(p) = self.parent.remove(&c) else { return };
-        let k = self.sub(c);
-        if k == 0 {
-            // c の下にも (輪なら、 つながる全員にも) seed が居ない: 誰の数も変わらない
+        let Some(id) = self.cyc_of.remove(&c) else {
+            if self.hot(c) {
+                self.bump(c, false, touched);
+            }
+            self.parent.remove(&c);
             return;
+        };
+        let p = self.parent.remove(&c).expect("輪の row の親");
+        self.cyc_sum.remove(&id);
+        // 鎖は p (一番下) から c まで。 下から数え直す
+        let mut chain = vec![p];
+        let mut cur = p;
+        while cur != c {
+            cur = self.parent[&cur];
+            chain.push(cur);
         }
-        let (path, _) = self.up_from(p);
-        if path.last() != Some(&c) {
-            self.shift(p, k, false, touched);
-            return;
-        }
-        // c は輪の上だった: 輪 (p → … → c) が c を根とする鎖にほどける。 p が一番下
-        let mut acc = 0;
-        for y in path {
-            acc += self.own.remove(&y).unwrap_or(0);
-            self.put(y, acc, touched);
+        let mut below = false;
+        for y in chain {
+            self.cyc_of.remove(&y);
+            if below {
+                self.add_cnt(y, true);
+            }
+            below = self.hot(y);
+            touched.push(y);
         }
     }
 
-    /// c の親を `to` にする。 下に seed の居ない row (ほとんど) は親の表を 1 回引くだけ。
+    /// 根 c を q の子にする。
+    fn link(&mut self, c: u32, q: u32, touched: &mut Vec<u32>) {
+        self.parent.insert(c, q);
+        if !self.hot(c) {
+            // 輪ができても seed につながらない (c の木に seed が居ない)
+            return;
+        }
+        if self.cnt(c) > 0 {
+            // c の下に seed が居る: q が c の下なら、 q の側は既に真で伝えるのが c まで届かないので、 たどって確かめる。
+            // 道の途中で (覚えていない、 seed につながらない) 輪に入ったら c には着かない
+            let mut trail = Trail::new(q);
+            let mut cur = q;
+            while cur != c && !self.cyc_of.contains_key(&cur) {
+                match self.parent.get(&cur) {
+                    Some(&p) if !trail.contains(p) => {
+                        trail.push(p);
+                        cur = p;
+                    }
+                    _ => break,
+                }
+            }
+            if cur == c {
+                // 輪 (q → … → c → q): 輪の row の cnt から輪の上の子 (道の 1 つ下) の分を引く
+                let rows = trail.rows;
+                let hots: Vec<bool> = rows.iter().map(|&y| self.hot(y)).collect();
+                for i in 1..rows.len() {
+                    if hots[i - 1] {
+                        self.add_cnt(rows[i], false);
+                    }
+                }
+                self.remember(&rows, touched);
+                return;
+            }
+        }
+        self.bump(c, true, touched);
+    }
+
+    /// c の親を `to` にする。 下に seed の居ない輪の外の row (ほとんど) は親の表を 1 回書くだけ。
     fn reparent(&mut self, c: u32, to: Option<u32>, touched: &mut Vec<u32>) {
         use std::collections::btree_map::Entry;
-        if self.sub(c) == 0 {
-            // c の下にも (輪なら、 つながる全員にも) seed が居ない: 誰の数も変わらない。 輪ができても c の木なので 0 のまま
+        if !self.hot(c) && !self.cyc_of.contains_key(&c) {
             match (self.parent.entry(c), to) {
                 (Entry::Occupied(mut o), Some(q)) => {
                     o.insert(q);
@@ -3880,31 +4001,20 @@ impl Above {
         }
     }
 
-    /// 根 c を q の子にする。
-    fn link(&mut self, c: u32, q: u32, touched: &mut Vec<u32>) {
-        let k = self.sub(c);
-        let (path, _) = if k == 0 { (Vec::new(), None) } else { self.up_from(q) };
-        self.parent.insert(c, q);
-        if k == 0 {
-            // 足す seed が無い (輪ができても、 つながる全員が c の木なので 0 のまま)
-            return;
+    /// 親の表と seed から全部組み直す (最初の poll / find / 大きい batch)。 seed を 1 つずつ足す (どの row も 0 → 1 は 1 回
+    /// なので全体で row の数に比例)。 答えが真だった row と真になった row を返す。
+    fn rebuild(&mut self) -> Vec<u32> {
+        let mut touched: Vec<u32> = self.cnt.keys().copied().chain(self.cyc_of.keys().copied()).filter(|&x| self.answer(x)).collect();
+        let seeds = std::mem::take(&mut self.seed);
+        self.cnt.clear();
+        self.cyc_of.clear();
+        self.cyc_sum.clear();
+        let mut scratch = Vec::new();
+        for s in seeds {
+            self.set_seed(s, true, &mut scratch);
         }
-        if path.last() != Some(&c) {
-            self.shift(q, k, true, touched);
-            return;
-        }
-        // 輪ができた (q → … → c → q): 輪の row の own は道の隣どうしの sub の差、 sub は c の木 (= つながる全員) の seed の数
-        let mut below = 0;
-        for &y in &path {
-            let s = self.sub(y);
-            if s > below {
-                self.own.insert(y, s - below);
-            }
-            below = s;
-        }
-        for &y in &path {
-            self.put(y, k, touched);
-        }
+        touched.extend(self.cnt.keys().copied().chain(self.cyc_of.keys().copied()).filter(|&x| self.answer(x)));
+        touched
     }
 }
 
@@ -3917,14 +4027,6 @@ enum Hier {
 impl Hier {
     fn new(up: bool) -> Hier {
         if up { Hier::Up(Above::default()) } else { Hier::Down(Tree::default()) }
-    }
-
-    /// 根 c の親を p にする (find の組み立て用)。
-    fn link(&mut self, c: u32, p: u32, touched: &mut Vec<u32>) {
-        match self {
-            Hier::Down(_) => {}
-            Hier::Up(a) => a.link(c, p, touched),
-        }
     }
 
     fn set_seed(&mut self, s: u32, on: bool, touched: &mut Vec<u32>) {
@@ -3940,7 +4042,7 @@ impl Hier {
     fn find_answer(&self, x: u32, h: &HierRef, memo: &mut Option<std::collections::BTreeMap<u32, bool>>) -> bool {
         match self {
             Hier::Down(t) => t.resolve(x, h, memo),
-            Hier::Up(a) => a.sub(x) > u64::from(a.seed.contains(&x)),
+            Hier::Up(a) => a.answer(x),
         }
     }
 
@@ -3948,7 +4050,7 @@ impl Hier {
     fn answer(&self, x: u32) -> bool {
         match self {
             Hier::Down(t) => t.under.contains(&x),
-            Hier::Up(a) => a.sub(x) > u64::from(a.seed.contains(&x)),
+            Hier::Up(a) => a.answer(x),
         }
     }
 
@@ -3984,6 +4086,25 @@ impl Hier {
             }
             Hier::Up(a) => {
                 let mut touched = Vec::new();
+                // 付け替えが多い (最初の poll は全 row) 時は組み直す: 子の居る row の付け替えは 1 回ずつだと深さに比例
+                if (cut.len() + dp.added.len()) * 8 > a.parent.len() {
+                    for &c in &cut {
+                        a.parent.remove(&c);
+                    }
+                    for &(e, p) in &dp.added {
+                        a.parent.insert(local(e), p as u32);
+                    }
+                    for &e in &ds.removed {
+                        a.seed.remove(&local(e));
+                        touched.push(local(e));
+                    }
+                    for &e in &ds.added {
+                        a.seed.insert(local(e));
+                        touched.push(local(e));
+                    }
+                    touched.extend(a.rebuild());
+                    return touched;
+                }
                 for &c in &cut {
                     a.reparent(c, None, &mut touched);
                 }
@@ -4827,7 +4948,8 @@ impl<'a> Query<'a> {
     /// ```
     ///
     /// - ref が輪になっている時、 輪の row は 「輪とそこにぶら下がる row の seed (自分を除く)」 の上。 輪は 1 周で止まる
-    /// - 付け替え 1 回・seed の出入り 1 回のコストは階層の深さに比例 (配下の数によらない)
+    /// - seed の出入り・葉 (部下の居ない row) の付け替えのコストは答えが変わる row の数に比例 (深さ・配下の数によらない)。
+    ///   部下の居る row の付け替えは、 輪ができるかを見るので深さに比例
     pub fn above(self, ref_col: &str, seeds: Query<'a>) -> UnderQuery<'a> {
         UnderQuery { rows: self, seeds, ref_col: ref_col.to_string(), up: true }
     }
