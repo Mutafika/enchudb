@@ -3705,10 +3705,12 @@ impl Tree {
     fn settle(&mut self, roots: impl IntoIterator<Item = u32>, h: &HierRef) -> Vec<u32> {
         let mut changed = Vec::new();
         let mut queue = std::collections::VecDeque::new();
+        // 葉 (子の無い row) の根は輪に入れない (自分の下に何も無い) ので、 答え = 親が seed か配下か を 1 回見るだけ。
+        // 親の答えは、 葉でない根を決め直して下へ伝えた後なら最新 (親の上の変化は全部葉でない根か seed の出入りの子)
+        let (leaves, inner): (Vec<u32>, Vec<u32>) = roots.into_iter().partition(|&r| self.children.range((r, 0)..=(r, u32::MAX)).next().is_none());
         // 道の途中の row の答えは、 その上の根を決め直して下へ伝えれば揃うので、 比べるのは根だけ。 覚えるのは根が 2 つ以上の時だけ
-        let roots: Vec<u32> = roots.into_iter().collect();
-        let mut memo = (roots.len() > 1).then(std::collections::BTreeMap::new);
-        for r in roots {
+        let mut memo = (inner.len() > 1).then(std::collections::BTreeMap::new);
+        for r in inner {
             let now = self.resolve(r, h, &mut memo);
             if now != self.under.contains(&r) {
                 if now { self.under.insert(r) } else { self.under.remove(&r) };
@@ -3725,6 +3727,13 @@ impl Tree {
                     changed.push(c);
                     queue.push_back(c);
                 }
+            }
+        }
+        for r in leaves {
+            let now = h.parent(r).is_some_and(|p| self.seed.contains(&p) || self.under.contains(&p));
+            if now != self.under.contains(&r) {
+                if now { self.under.insert(r) } else { self.under.remove(&r) };
+                changed.push(r);
             }
         }
         changed
