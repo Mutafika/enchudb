@@ -2163,6 +2163,260 @@ impl std::fmt::Debug for GroupedLiveQuery {
     }
 }
 
+// ─────────────────────────── JOIN (組) ───────────────────────────
+
+enum JoinOn {
+    /// 左の ref 列が右の row を指す。
+    Ref(String),
+    /// 左の列 (ref の先でもよい) と右の列の値が等しい。
+    Eq(String, String),
+}
+
+/// [`Query::join_ref`] / [`Query::join_eq`] の戻り値。 2 つの table の row の組を引く / 購読する。
+pub struct JoinQuery<'a> {
+    left: Query<'a>,
+    right: Query<'a>,
+    on: JoinOn,
+}
+
+/// [`LiveJoin::poll`] の戻り値。 前回 poll からの組の差分 (**順不同**、 同じ組は各リストに高々 1 回)。 適用順は
+/// removed → added。 同じ組が両方に居たら 「消えて、 別物として入り直した」 (削除された row の eid が使い回された)。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PairDelta {
+    pub added: Vec<(EntityId, EntityId)>,
+    pub removed: Vec<(EntityId, EntityId)>,
+}
+
+/// 組の計画: 左右の engine の条件と鍵。
+enum JoinPlan {
+    /// ref で結ぶ: 左の条件 + 右の条件を ref の先に置いたもの、 鍵 = ref 列。
+    Ref { preds: Vec<enchudb_engine::LivePred>, via: u16 },
+    /// 値で結ぶ: 左の条件と鍵 (ref の道 + 列)、 右の条件と鍵の列。
+    Eq { left: Vec<enchudb_engine::LivePred>, path: Vec<u16>, left_key: u16, right: Vec<enchudb_engine::LivePred>, right_key: u16 },
+}
+
+impl<'a> JoinQuery<'a> {
+    /// 左右の条件を engine の条件に写す。 `None` = 常に 0 組 (未知の値の where_eq など)。
+    fn plan(self) -> Result<Option<JoinPlan>, SchemaError> {
+        let bad = |m: String| Err(SchemaError::BadValue(m));
+        if self.left.limit.is_some() || self.right.limit.is_some() || self.left.order.is_some() || self.right.order.is_some() {
+            return bad("join: limit / order_by are not supported".into());
+        }
+        match &self.on {
+            JoinOn::Ref(col) => {
+                let cd = self.left.table.col(col).cloned();
+                let points = cd.as_ref().is_some_and(|c| c.ty == ColumnType::Ref)
+                    && self.left.table.relations.iter().any(|r| {
+                        r.from_col.eq_ignore_ascii_case(col) && r.to_table.eq_ignore_ascii_case(&self.right.table.name)
+                    });
+                let Some(cd) = cd.filter(|_| points) else {
+                    return bad(format!("join_ref: {col} is not a ref column of {} pointing to {}", self.left.table.name, self.right.table.name));
+                };
+                let (Some(mut l), Some(r)) = (self.left.live_preds()?, self.right.live_preds()?) else { return Ok(None) };
+                l.extend(r.into_iter().map(|p| enchudb_engine::LivePred::Via { path: vec![cd.himo_id], pred: Box::new(p) }));
+                Ok(Some(JoinPlan::Ref { preds: l, via: cd.himo_id }))
+            }
+            JoinOn::Eq(my, their) => {
+                let Some((path, mine)) = self.left.resolve_col(my) else { return bad(format!("join_eq: unknown column {my}")) };
+                let Some(theirs) = self.right.table.col(their).cloned() else { return bad(format!("join_eq: unknown column {their}")) };
+                if mine.ty != theirs.ty || matches!(mine.ty, ColumnType::Leaf | ColumnType::Ref) {
+                    return bad(format!("join_eq: {my} ({:?}) and {their} ({:?}) must have the same Tag / Number / BigInt type", mine.ty, theirs.ty));
+                }
+                let (Some(l), Some(r)) = (self.left.live_preds()?, self.right.live_preds()?) else { return Ok(None) };
+                Ok(Some(JoinPlan::Eq { left: l, path, left_key: mine.himo_id, right: r, right_key: theirs.himo_id }))
+            }
+        }
+    }
+
+    /// 今の組 (昇順)。
+    pub fn find(self) -> Result<Vec<(EntityId, EntityId)>, SchemaError> {
+        let eng = self.left.db.arc_engine();
+        let Some(plan) = self.plan()? else { return Ok(Vec::new()) };
+        let peer = eng.peer_id();
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        // entity の鍵 (ref の道をたどった先の列の値)
+        let key = |e: EntityId, path: &[u16], h: u16| -> Option<u64> {
+            let mut cur = e;
+            for &p in path {
+                cur = enchudb_oplog::make_eid(peer, eng.get_by_id(cur, p)? as u32);
+            }
+            eng.get_by_id(cur, h)
+        };
+        let mut out = Vec::new();
+        match plan {
+            JoinPlan::Ref { preds, via } => {
+                for a in eng.find_by(preds).map_err(io)? {
+                    if let Some(k) = key(a, &[], via) {
+                        out.push((a, enchudb_oplog::make_eid(peer, k as u32)));
+                    }
+                }
+            }
+            JoinPlan::Eq { left, path, left_key, right, right_key } => {
+                let mut by_key: std::collections::BTreeMap<u64, Vec<EntityId>> = std::collections::BTreeMap::new();
+                for b in eng.find_by(right).map_err(io)? {
+                    if let Some(k) = key(b, &[], right_key) {
+                        by_key.entry(k).or_default().push(b);
+                    }
+                }
+                for a in eng.find_by(left).map_err(io)? {
+                    if let Some(bs) = key(a, &path, left_key).and_then(|k| by_key.get(&k)) {
+                        out.extend(bs.iter().map(|&b| (a, b)));
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        Ok(out)
+    }
+
+    /// 今の組の数。
+    pub fn count(self) -> Result<usize, SchemaError> {
+        Ok(self.find()?.len())
+    }
+
+    /// 組を購読する。 初回 poll は登録時点の全部の組が `added`。 どちらの table の row の出入り・結ぶ列の
+    /// 書き換え (ref の付け替え、 ref の先の値の変化も) でも届く。 drop で購読解除、 `Database` を借用しない。
+    pub fn subscribe(self) -> Result<LiveJoin, SchemaError> {
+        let eng = self.left.db.arc_engine();
+        let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
+        let inner = match self.plan()? {
+            None => JoinLive::Empty,
+            Some(JoinPlan::Ref { preds, via }) => JoinLive::Ref(eng.subscribe_keyed(preds, Vec::new(), via).map_err(io)?),
+            Some(JoinPlan::Eq { left, path, left_key, right, right_key }) => JoinLive::Eq {
+                left: eng.subscribe_keyed(left, path, left_key).map_err(io)?,
+                right: eng.subscribe_keyed(right, Vec::new(), right_key).map_err(io)?,
+                state: Default::default(),
+            },
+        };
+        Ok(LiveJoin { inner, eng })
+    }
+}
+
+/// 値で結ぶ組の、 鍵ごとの左右の row (最後に渡した組の元)。
+#[derive(Default)]
+struct Buckets {
+    left: std::collections::BTreeMap<u64, std::collections::BTreeSet<EntityId>>,
+    right: std::collections::BTreeMap<u64, std::collections::BTreeSet<EntityId>>,
+}
+
+enum JoinLive {
+    Empty,
+    Ref(enchudb_engine::LiveKeyed),
+    Eq { left: enchudb_engine::LiveKeyed, right: enchudb_engine::LiveKeyed, state: std::sync::Mutex<Buckets> },
+}
+
+/// [`JoinQuery::subscribe`] の戻り値。 組の出入りを購読する。
+///
+/// - ref で結ぶ組は左の row 1 つにつき高々 1 つ: 書き込み 1 回のコストは普通の購読と同じ
+/// - 値で結ぶ組は、 片側の row 1 つの出入り / 鍵の変化で、 同じ鍵のもう片側の row の数だけ組が動く。 左右の
+///   row を鍵ごとに持つ (メモリは両側の結果の大きさに比例)
+pub struct LiveJoin {
+    inner: JoinLive,
+    eng: Arc<Engine>,
+}
+
+impl LiveJoin {
+    /// 前回 poll からの組の差分。
+    pub fn poll(&self) -> PairDelta {
+        let mut d = PairDelta::default();
+        match &self.inner {
+            JoinLive::Empty => {}
+            JoinLive::Ref(q) => {
+                let peer = self.eng.peer_id();
+                let kd = q.poll(&self.eng);
+                let pair = |(a, k): (EntityId, u64)| (a, enchudb_oplog::make_eid(peer, k as u32));
+                d.removed = kd.removed.into_iter().map(pair).collect();
+                d.added = kd.added.into_iter().map(pair).collect();
+            }
+            JoinLive::Eq { left, right, state } => {
+                let (dl, dr) = (left.poll(&self.eng), right.poll(&self.eng));
+                let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
+                let Buckets { left: lb, right: rb } = &mut *st;
+                // 左右が同じ鍵から同じ鍵へ一緒に移った組 (居続けている = 出さない)
+                let kept = kept_pairs(&dl, &dr);
+                let keep = |a: EntityId, b: EntityId| !kept.is_empty() && kept.contains(&(a, b));
+                // 抜く側は抜く前の相手と、 足す側は足した後の相手と組む (同じ組を 2 度数えない):
+                // 左の removed × 旧右 → 右の removed × (左 − 左の removed) → 左の added × (右 − 右の removed) →
+                // 右の added × 新左
+                for &(a, k) in &dl.removed {
+                    if let Some(bs) = rb.get(&k) {
+                        d.removed.extend(bs.iter().filter(|&&b| !keep(a, b)).map(|&b| (a, b)));
+                    }
+                    take(lb, k, a);
+                }
+                for &(b, k) in &dr.removed {
+                    if let Some(as_) = lb.get(&k) {
+                        d.removed.extend(as_.iter().filter(|&&a| !keep(a, b)).map(|&a| (a, b)));
+                    }
+                    take(rb, k, b);
+                }
+                for &(a, k) in &dl.added {
+                    lb.entry(k).or_default().insert(a);
+                    if let Some(bs) = rb.get(&k) {
+                        d.added.extend(bs.iter().filter(|&&b| !keep(a, b)).map(|&b| (a, b)));
+                    }
+                }
+                for &(b, k) in &dr.added {
+                    rb.entry(k).or_default().insert(b);
+                    if let Some(as_) = lb.get(&k) {
+                        d.added.extend(as_.iter().filter(|&&a| !keep(a, b)).map(|&a| (a, b)));
+                    }
+                }
+            }
+        }
+        // 並べない (順不同): batch で書いてから poll すると組は右の row ごとの run が入り組み、 並べるだけで
+        // poll の半分を使う。 積むのに順は要らない
+        d
+    }
+}
+
+/// 左右の row が同じ poll の中で同じ鍵から同じ鍵へ一緒に移った組 (旧鍵の組を抜いて新鍵の組を足す形になるが、
+/// 組は居続けている)。 移った row = `removed` と `added` の両方に居て入り直していない row。 入り直した row
+/// (eid の使い回し) の組は別物なので含めない。
+fn kept_pairs(dl: &enchudb_engine::KeyedDelta, dr: &enchudb_engine::KeyedDelta) -> std::collections::BTreeSet<(EntityId, EntityId)> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut out = BTreeSet::new();
+    // row → (旧鍵, 新鍵)
+    let moves = |k: &enchudb_engine::KeyedDelta| -> BTreeMap<EntityId, (u64, u64)> {
+        if k.removed.is_empty() || k.added.is_empty() {
+            return BTreeMap::new();
+        }
+        let re: BTreeSet<EntityId> = k.reentered.iter().copied().collect();
+        let old: BTreeMap<EntityId, u64> = k.removed.iter().copied().collect();
+        k.added.iter().filter(|(e, _)| !re.contains(e)).filter_map(|&(e, n)| old.get(&e).map(|&o| (e, (o, n)))).collect()
+    };
+    let ml = moves(dl);
+    if ml.is_empty() {
+        return out;
+    }
+    let mut by_move: BTreeMap<(u64, u64), Vec<EntityId>> = BTreeMap::new();
+    for (b, m) in moves(dr) {
+        by_move.entry(m).or_default().push(b);
+    }
+    for (a, m) in ml {
+        if let Some(bs) = by_move.get(&m) {
+            out.extend(bs.iter().map(|&b| (a, b)));
+        }
+    }
+    out
+}
+
+/// 鍵 `k` の組から `e` を抜く (空になった鍵は消す)。
+fn take(m: &mut std::collections::BTreeMap<u64, std::collections::BTreeSet<EntityId>>, k: u64, e: EntityId) {
+    if let Some(s) = m.get_mut(&k) {
+        s.remove(&e);
+        if s.is_empty() {
+            m.remove(&k);
+        }
+    }
+}
+
+impl std::fmt::Debug for LiveJoin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveJoin").finish_non_exhaustive()
+    }
+}
+
 // ─────────────────────────── Query ───────────────────────────
 
 /// 条件。 値は engine の u64 (Number は値、 BigInt は符号化した値、 Ref は local eid、 Tag は vocab id)。
@@ -2486,6 +2740,35 @@ impl<'a> Query<'a> {
             None => self.preds.push(Predicate::Eq(u16::MAX, u64::MAX)),
         }
         self
+    }
+
+    /// この query の row と、 ref 列 `ref_col` で指している `other` (別の table への query) の row の **組** (JOIN)。
+    /// 結果は `(この row, 指している row)`、 この row 1 つにつき組は高々 1 つ。
+    ///
+    /// ```ignore
+    /// // 公開済みの投稿と、 その作者 (日本の user) の組
+    /// let q = posts.where_eq("published", 1i64).join_ref("author", users.where_eq("country", "JP"));
+    /// q.find()?;                     // Vec<(post, user)>
+    /// let live = q.subscribe()?;     // 組の出入り (投稿の作者の付け替えも、 作者の条件の変化も届く)
+    /// ```
+    ///
+    /// `ref_col` はこの table の ref 列で、 `other` の table を指すこと (違えば `find` / `subscribe` が `BadValue`)。
+    pub fn join_ref(self, ref_col: &str, other: Query<'a>) -> JoinQuery<'a> {
+        JoinQuery { left: self, right: other, on: JoinOn::Ref(ref_col.to_string()) }
+    }
+
+    /// この query の row と `other` (別の table への query) の row のうち、 この row の列 `my_col` の値と `other` の
+    /// 列 `their_col` の値が等しいものの **組** (値で結ぶ JOIN、 SQL の `JOIN .. ON a.my_col = b.their_col`)。
+    ///
+    /// ```ignore
+    /// // 住人と、 住む街の開いた店の組
+    /// let q = users.all().join_eq("city", shops.where_eq("open", 1i64), "city");
+    /// ```
+    ///
+    /// `my_col` は ref の先でもよい (`"company.city"`)。 2 つの列は同じ型 (Tag / Number / BigInt、 違えば `BadValue`)。
+    /// 1 つの値に両側が大勢いると組は掛け算で増える (街に住人 1 万 × 店 10 = 組 10 万、 店 1 軒の出入りで組 1 万)。
+    pub fn join_eq(self, my_col: &str, other: Query<'a>, their_col: &str) -> JoinQuery<'a> {
+        JoinQuery { left: self, right: other, on: JoinOn::Eq(my_col.to_string(), their_col.to_string()) }
     }
 
     /// `sub` (別の table への query) の row のうち、 ref 列 `via_col` でこの row を指しているものが **`n` 個以上**

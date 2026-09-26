@@ -108,6 +108,14 @@
 //! 3 つとも `CountAtLeast` に揃える (`Exists` = `min: 1`)。 `min` は形の符号に入る (閾値が違えば別の family、
 //! 中身の集計の購読は共有)。
 //!
+//! # 鍵付きの購読 ([`LiveKeyed`])
+//!
+//! 集合への出入りに加えて、 集合に居る entity の鍵 (列の値、 ref の先でもよい) の変化も差分に出す。 集計の
+//! 購読と同じく鍵の列を 「値を根まで運ぶ穴」 (`HoleVal::Group(KEYED)`) にし、 根の答え (鍵 id, 値) が
+//! 変わった entity を member の印に積む (出入りの印と同じ `changed` / `left`)。 取り出す時に今の値と報告済みの
+//! 値 (`KeyedState`) を比べる。 1 段目の部分和 (会社の所在地を配下を評価せずに移す) は使わない — 配下の
+//! 1 人ずつの鍵の変化を出すため。 組を返す JOIN (schema の `join_ref` / `join_eq`) の片側。
+//!
 //! # 集計の購読 ([`LiveCounts`])
 //!
 //! 結果を group の列の値ごとに数えた件数の live 版。 group の列を 「値を根まで運ぶ穴」 にする
@@ -1837,6 +1845,8 @@ struct Member {
     union: Option<(std::sync::Weak<Union>, usize)>,
     /// 集計の購読 ([`LiveCounts`]) なら group の報告状態 (entity の出入りは積まない)。
     grp: Option<GroupState>,
+    /// 鍵付きの購読 ([`LiveKeyed`]) なら報告済みの鍵。 出入りと鍵の変化は `changed` / `left` に積む。
+    keyed: Option<KeyedState>,
     /// 上位 k 件の購読なら k と境界。
     topk: Option<TopK>,
     /// 上位 k 件の並びが降順か。
@@ -1897,6 +1907,15 @@ impl Agg {
     }
 }
 
+/// `HoleVal::Group` の印: 鍵付きの購読 ([`LiveKeyed`]、 合計の列の代わり)。
+const KEYED: u32 = u32::MAX;
+
+/// 鍵付きの購読 1 本ぶんの報告状態: 最後に渡した各 entity の鍵 (`v + 1`、 0 = 渡していない)。
+#[derive(Default)]
+struct KeyedState {
+    reported: ValWords,
+}
+
 /// 集計の購読 1 本ぶんの報告状態。 件数そのものは根の鍵が持ち (同じ鍵の購読で共有)、 ここは
 /// 「どの group の件数が動いたか」 と 「最後に渡した件数」 だけ。
 #[derive(Default)]
@@ -1950,6 +1969,41 @@ impl Member {
         self.queued = false;
         let probe = Member::probe(&self.root_keys, self.range, self.topk.map(|t| (t, self.order_desc)));
         drain_marks(&mut self.changed, &mut self.left, &mut self.reported, |e| probe(e, root(e)), peer)
+    }
+
+    /// 鍵付きの購読: changed を消費して `(eid, 鍵)` の差分を返す。 `root` = 根の答え (値 = 鍵)。 `left` に居る eid
+    /// は、 報告済みで今も居ても 「出て入り直した」 (鍵が同じでも removed + added)。
+    fn drain_keyed(&mut self, root: impl Fn(u32) -> Option<Ans>, peer: u32) -> KeyedDelta {
+        self.queued = false;
+        let mut delta = KeyedDelta::default();
+        let probe = Member::probe(&self.root_keys, self.range, None);
+        let Some(ks) = self.keyed.as_mut() else { return delta };
+        let left_set = self.left.take();
+        let mut li = 0;
+        for eid in self.changed.take() {
+            let a = root(eid);
+            let now = a.filter(|_| probe(eid, a)).map(|a| a.1);
+            let was = ks.reported.get(eid).checked_sub(1);
+            while li < left_set.len() && left_set[li] < eid {
+                li += 1;
+            }
+            let left = left_set.get(li) == Some(&eid);
+            if was == now && !left {
+                continue;
+            }
+            let e = enchudb_oplog::make_eid(peer, eid);
+            if let Some(w) = was {
+                delta.removed.push((e, w));
+            }
+            if let Some(n) = now {
+                delta.added.push((e, n));
+            }
+            if left && was.is_some() && now.is_some() {
+                delta.reentered.push(e);
+            }
+            ks.reported.put(eid, now.map_or(0, |n| n + 1));
+        }
+        delta
     }
 
     /// `has` の、 member 全体を借用しない版。
@@ -2874,8 +2928,13 @@ impl Settled {
                     }
                 }
                 for &slot in &rk.members {
-                    if let Some(g) = members[slot].as_mut().and_then(|m| m.grp.as_mut()) {
-                        g.changed.add(v);
+                    if let Some(m) = members[slot].as_mut() {
+                        match (m.grp.as_mut(), m.keyed.is_some()) {
+                            (Some(g), _) => g.changed.add(v),
+                            // 鍵付き: 出入りも鍵の変化も entity の印 (旧鍵と新鍵の両方の member に)
+                            (None, true) => m.note(slot, ready, eid, false),
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -3072,9 +3131,11 @@ impl Family {
             })
             .unwrap_or(CarryKind::Range);
         let sum = flats.iter().find_map(|f| match f.leaf {
-            Leaf::Hole(_, HoleVal::Group(x)) if x > 0 => Some((x - 1) as u16),
+            Leaf::Hole(_, HoleVal::Group(x)) if x > 0 && x != KEYED => Some((x - 1) as u16),
             _ => None,
         });
+        // 鍵付きの購読は根ごとの鍵の変化を報告するので、 1 段目の部分和 (根を評価しない移し替え) は使わない
+        let keyed = flats.iter().any(|f| matches!(f.leaf, Leaf::Hole(_, HoleVal::Group(KEYED))));
         let nodes = build_tree(flats);
         // `Exists` の添字 → 節
         let mut ex_node = vec![(0usize, None, 1u64); exists.len()];
@@ -3153,7 +3214,7 @@ impl Family {
                 st
             }),
             expand_always: AtomicBool::new(false),
-            partial: if kind == CarryKind::Group { nodes_partial } else { None },
+            partial: if kind == CarryKind::Group && !keyed { nodes_partial } else { None },
             order_part: if matches!(kind, CarryKind::Order(_)) { nodes_partial } else { None },
             range,
             kind,
@@ -3206,7 +3267,8 @@ impl Family {
     ) -> usize {
         let mut s = self.settled.lock();
         let first = alts.first().map(Vec::as_slice).unwrap_or_default();
-        let grp = first.iter().any(|v| matches!(v, HoleVal::Group(_))).then(GroupState::default);
+        let keyed = first.iter().any(|v| matches!(v, HoleVal::Group(KEYED))).then(KeyedState::default);
+        let grp = first.iter().any(|v| matches!(v, HoleVal::Group(x) if *x != KEYED)).then(GroupState::default);
         let order_desc = first.iter().any(|v| matches!(v, HoleVal::Order(true)));
         let range = range_of(first);
         let topk = limit.map(|k| TopK { k, th: None });
@@ -3222,6 +3284,7 @@ impl Family {
             changed: Marks::default(),
             queued: false,
             grp,
+            keyed,
             topk,
             order_desc,
             union,
@@ -3685,7 +3748,10 @@ impl Family {
             if let Some(i) = s.recs[0].key(e).and_then(|k| s.keys.binary_search_by_key(&k, |x| x.id).ok()) {
                 let Settled { keys, members, ready, .. } = &mut *s;
                 for &slot in &keys[i].members {
-                    if let Some(m) = members[slot].as_mut().filter(|m| m.reported.get(e)) {
+                    if let Some(m) = members[slot]
+                        .as_mut()
+                        .filter(|m| m.reported.get(e) || m.keyed.as_ref().is_some_and(|k| k.reported.get(e) > 0))
+                    {
                         m.note(slot, ready, e, true);
                     }
                 }
@@ -4005,6 +4071,15 @@ impl LiveRegistry {
         let id = self.next_member_id.fetch_add(1, Ordering::Relaxed);
         let (family, slot) = self.register_alts(id, sig, flats, alts, false, None, None);
         Ok(LiveCounts { family, slot, id, registry: self.clone() })
+    }
+
+    /// 鍵付きの購読を登録する: `branches` の結果を、 各 entity の `key` (ref の道 + 紐) の値と一緒に持つ。
+    /// 枝は全部同じ形であること (`register_counts` と同じ)。
+    pub(crate) fn register_keyed(self: &Arc<Self>, branches: Vec<Vec<LivePred>>, key: (Vec<u16>, u16)) -> Result<LiveKeyed, String> {
+        let (sig, flats, alts) = one_shape(branches, (key.0, key.1, HoleVal::Group(KEYED)), "subscribe_keyed")?;
+        let id = self.next_member_id.fetch_add(1, Ordering::Relaxed);
+        let (family, slot) = self.register_alts(id, sig, flats, alts, false, None, None);
+        Ok(LiveKeyed { family, slot, id, registry: self.clone() })
     }
 
     /// `Or` の購読を登録する。 形 (と範囲の穴の範囲) が同じ枝は鍵を複数持つ 1 つの member に束ね
@@ -4728,6 +4803,86 @@ impl Drop for LiveCounts {
 impl std::fmt::Debug for LiveCounts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LiveCounts").field("id", &self.id).finish()
+    }
+}
+
+// ─────────────────────────── 鍵付きの購読 ───────────────────────────
+
+/// [`LiveKeyed::poll`] の戻り値。 前回 poll からの `(entity, 鍵)` の差分 (eid 昇順)。 積分 = `removed` を
+/// 抜いて `added` を足す。 鍵が変わった entity は旧鍵で `removed`、 新鍵で `added` に居る。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeyedDelta {
+    pub added: Vec<(EntityId, u64)>,
+    pub removed: Vec<(EntityId, u64)>,
+    /// 報告済みの entity が削除され、 同じ eid が別の entity として入り直したもの (昇順)。 `removed` と `added`
+    /// の両方に居る eid のうち、 鍵が変わっただけのものと区別する用。
+    pub reentered: Vec<EntityId>,
+}
+
+/// 条件に当てはまる entity を、 **その entity の鍵の列 (ref の先でもよい) の値と一緒に** 持つ live 版
+/// ([`Engine::subscribe_keyed`](crate::engine::Engine::subscribe_keyed))。 普通の購読は集合への出入りしか
+/// 追わないが、 これは集合に居る entity の鍵の変化も差分に出す — 組を返す JOIN の片側。
+///
+/// - 鍵の列に値の無い entity は入らない
+/// - 鍵が ref の先 (`company.city`) なら、 会社の所在地が変わると配下が全員 (旧鍵 → 新鍵で) 届く
+///   (集計の購読のような部分和の移し替えはしない)
+/// - 値は `query_by_id64` と同じ (Number は値、 Tag は vocab id、 Ref は local eid)
+pub struct LiveKeyed {
+    family: Arc<Family>,
+    slot: usize,
+    id: u64,
+    registry: Arc<LiveRegistry>,
+}
+
+impl LiveKeyed {
+    pub(crate) fn himos(&self) -> Vec<u16> {
+        let mut hs: Vec<u16> = self.family.all_himos();
+        hs.sort_unstable();
+        hs.dedup();
+        hs
+    }
+
+    pub(crate) fn seed(&self, r: &impl CellReader) {
+        self.family.seed(r);
+    }
+
+    /// 前回 poll からの差分。 初回は登録時点の全 `(entity, 鍵)` が `added`。
+    pub fn poll(&self, eng: &crate::engine::Engine) -> KeyedDelta {
+        assert!(Arc::ptr_eq(&self.registry, eng.live_registry()), "LiveKeyed: 購読した engine とは別の engine が渡された");
+        self.poll_with(eng)
+    }
+
+    pub(crate) fn poll_with(&self, r: &impl CellReader) -> KeyedDelta {
+        let peer = self.registry.peer.load(Ordering::Acquire);
+        let mut guard = self.family.settled.lock();
+        self.family.settle(r, &mut guard);
+        let Settled { recs, vals, members, .. } = &mut *guard;
+        match members[self.slot].as_mut() {
+            Some(m) => m.drain_keyed(|e| root_at(recs, vals, e), peer),
+            None => KeyedDelta::default(),
+        }
+    }
+
+    /// engine 内で一意な購読 id。
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// 未 poll の変化がありうるか (評価しない)。
+    pub fn is_dirty(&self) -> bool {
+        self.family.member_dirty(self.slot)
+    }
+}
+
+impl Drop for LiveKeyed {
+    fn drop(&mut self) {
+        self.registry.unregister(&self.family, self.slot);
+    }
+}
+
+impl std::fmt::Debug for LiveKeyed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveKeyed").field("id", &self.id).finish()
     }
 }
 
