@@ -106,7 +106,8 @@
 //! 値で結ぶ存在 ([`LivePred::ExistsEq`]) は group が自分の列の値 (`Settled::exists` は値の集合)、 件数の閾値
 //! ([`LivePred::CountAtLeast`]、 `HAVING COUNT(*) >= min`) は 「1 以上」 を 「`min` 以上」 にしただけ。 dnf が
 //! 3 つとも `CountAtLeast` に揃える (`Exists` = `min: 1`)。 `min` は形の符号に入る (閾値が違えば別の family、
-//! 中身の集計の購読は共有)。
+//! 中身の集計の購読は共有)。 和の閾値 ([`LivePred::SumAtLeast`]、 `HAVING SUM(col) >= min`) は中身の集計の購読に
+//! 和の列を持たせ、 「件数が 1 以上で和が `min` 以上」 で判定する (内部の `Threshold`)。
 //!
 //! # 鍵付きの購読 ([`LiveKeyed`])
 //!
@@ -261,6 +262,11 @@ pub enum LivePred {
     /// `m` 列の値を `via` 列に持つ entity を数える (`ExistsEq` の件数版)。 `min` は 1 以上 (`Exists` = `min: 1`)。
     /// `Not(CountAtLeast)` = `min` 個未満 (0 個も含む)。
     CountAtLeast { via: u16, mine: Option<u16>, min: u64, preds: Vec<LivePred> },
+    /// `preds` を満たす entity が 1 つ以上あり、 その `sum_himo` の値の和が **`min` 以上** (SQL の `HAVING SUM(col) >= min`、
+    /// 行の無い group は SQL と同じく偽)。 `via` / `mine` は `CountAtLeast` と同じ。 値の無い entity は 0 として足す。
+    /// `signed` = 値を 2^63 ずらして載せる列 (schema の BigInt、 `v ^ 2^63`) — 和を元の値の和に戻して比べる。
+    /// `Not(SumAtLeast)` = 1 つも無いか、 和が `min` 未満。
+    SumAtLeast { via: u16, mine: Option<u16>, sum_himo: u16, min: i128, signed: bool, preds: Vec<LivePred> },
     /// 枝のどれかが真 (各枝は条件の AND)。 `Via` の中にも書ける (`company.city = 東京 OR
     /// company.city = 大阪` = `Via { company, Or([[city = 東京], [city = 大阪]]) }`)。 枝も枝の中の
     /// AND も空は不可。 展開した枝 (AND の OR に直した数) は [`MAX_BRANCHES`] まで。
@@ -310,6 +316,14 @@ impl LivePred {
                     p.collect_himos(out);
                 }
             }
+            LivePred::SumAtLeast { via, mine, sum_himo, preds, .. } => {
+                out.push(*via);
+                out.push(*sum_himo);
+                out.extend(*mine);
+                for p in preds {
+                    p.collect_himos(out);
+                }
+            }
             LivePred::Or(branches) => {
                 for p in branches.iter().flatten() {
                     p.collect_himos(out);
@@ -322,6 +336,27 @@ impl LivePred {
     pub fn ref_himos(&self) -> Vec<u16> {
         let mut out = Vec::new();
         self.collect_ref_himos(&mut out);
+        out
+    }
+
+    /// 条件に出てくる和の列 (`SumAtLeast` の `sum_himo`、 中身の中も)。 engine が Number / Number64 かを検証する用。
+    pub fn sum_himos(&self) -> Vec<u16> {
+        fn walk(p: &LivePred, out: &mut Vec<u16>) {
+            match p {
+                LivePred::Via { pred, .. } | LivePred::Not(pred) => walk(pred, out),
+                LivePred::Exists { preds, .. } | LivePred::ExistsEq { preds, .. } | LivePred::CountAtLeast { preds, .. } => {
+                    preds.iter().for_each(|q| walk(q, out))
+                }
+                LivePred::SumAtLeast { sum_himo, preds, .. } => {
+                    out.push(*sum_himo);
+                    preds.iter().for_each(|q| walk(q, out));
+                }
+                LivePred::Or(bs) => bs.iter().flatten().for_each(|q| walk(q, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(self, &mut out);
         out
     }
 
@@ -340,7 +375,7 @@ impl LivePred {
                 out.push((*mine, *theirs));
                 preds.iter().for_each(|p| p.collect_value_joins(out));
             }
-            LivePred::CountAtLeast { via, mine, preds, .. } => {
+            LivePred::CountAtLeast { via, mine, preds, .. } | LivePred::SumAtLeast { via, mine, preds, .. } => {
                 if let Some(m) = mine {
                     out.push((*m, *via));
                 }
@@ -369,7 +404,7 @@ impl LivePred {
                     p.collect_ref_himos(out);
                 }
             }
-            LivePred::CountAtLeast { via, mine, preds, .. } => {
+            LivePred::CountAtLeast { via, mine, preds, .. } | LivePred::SumAtLeast { via, mine, preds, .. } => {
                 if mine.is_none() {
                     out.push(*via);
                 }
@@ -444,6 +479,10 @@ fn count_at_least(p: LivePred) -> Result<LivePred, String> {
         LivePred::Exists { via, preds } => (via, None, 1, preds),
         LivePred::ExistsEq { mine, theirs, preds } => (theirs, Some(mine), 1, preds),
         LivePred::CountAtLeast { via, mine, min, preds } => (via, mine, min, preds),
+        LivePred::SumAtLeast { via, mine, sum_himo, min, signed, preds } => {
+            check_exists(via, &preds)?;
+            return Ok(LivePred::SumAtLeast { via, mine, sum_himo, min, signed, preds });
+        }
         other => return Ok(other),
     };
     if min == 0 {
@@ -480,12 +519,14 @@ fn alternatives(p: LivePred) -> Result<Vec<Vec<LivePred>>, String> {
             LivePred::Via { .. } | LivePred::Or(_) | LivePred::Not(_) => {
                 return Err("Not wraps a single-column condition (write Via { path, Not(..) } for a column behind a ref)".into());
             }
-            p @ (LivePred::Exists { .. } | LivePred::ExistsEq { .. } | LivePred::CountAtLeast { .. }) => {
+            p @ (LivePred::Exists { .. } | LivePred::ExistsEq { .. } | LivePred::CountAtLeast { .. } | LivePred::SumAtLeast { .. }) => {
                 vec![vec![LivePred::Not(Box::new(count_at_least(p)?))]]
             }
             leaf => vec![vec![LivePred::Not(Box::new(leaf))]],
         },
-        p @ (LivePred::Exists { .. } | LivePred::ExistsEq { .. } | LivePred::CountAtLeast { .. }) => vec![vec![count_at_least(p)?]],
+        p @ (LivePred::Exists { .. } | LivePred::ExistsEq { .. } | LivePred::CountAtLeast { .. } | LivePred::SumAtLeast { .. }) => {
+            vec![vec![count_at_least(p)?]]
+        }
         leaf => vec![vec![leaf]],
     })
 }
@@ -1411,8 +1452,46 @@ enum Pred {
     /// この entity を `via` で指し `preds` を満たす entity がある (`LivePred::Exists`、 `mine` = None)、 または
     /// この entity の `mine` 列の値を `via` 列に持ち `preds` を満たす entity がある (`LivePred::ExistsEq`)。
     /// `idx` = family の `exists` / `Settled::exists` の添字 (`number_exists` が振る)。
-    /// 件数が `min` 以上の group だけが真 (`LivePred::CountAtLeast`)。
-    Exists { via: u16, mine: Option<u16>, min: u64, preds: Vec<LivePred>, idx: usize },
+    /// `th` を満たす group だけが真 (`LivePred::CountAtLeast` / `SumAtLeast`)。
+    Exists { via: u16, mine: Option<u16>, th: Threshold, preds: Vec<LivePred>, idx: usize },
+}
+
+/// `Exists` の group が真になる閾値。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Threshold {
+    /// 件数が `min` 以上 (`Exists` = 1)。
+    Count(u64),
+    /// 件数が 1 以上で、 `himo` の値の和が `min` 以上 (`signed` = 値を 2^63 ずらして載せる列)。
+    Sum { himo: u16, min: i128, signed: bool },
+}
+
+impl Threshold {
+    #[inline]
+    fn holds(&self, a: Agg) -> bool {
+        match *self {
+            Threshold::Count(min) => a.count >= min,
+            Threshold::Sum { min, signed, .. } => {
+                let sum = if signed { a.sum as i128 - ((a.summed as i128) << 63) } else { a.sum as i128 };
+                a.count > 0 && sum >= min
+            }
+        }
+    }
+
+    /// 集計の購読で和も持つ列。
+    fn sum_himo(&self) -> Option<u16> {
+        match *self {
+            Threshold::Count(_) => None,
+            Threshold::Sum { himo, .. } => Some(himo),
+        }
+    }
+
+    /// 形の符号に入れる値 (閾値が違えば別の family)。
+    fn sig(&self) -> [u64; 4] {
+        match *self {
+            Threshold::Count(min) => [0, min, 0, 0],
+            Threshold::Sum { himo, min, signed } => [1 + signed as u64, himo as u64, min as u64, (min >> 64) as u64],
+        }
+    }
 }
 
 /// `Exists` の件数が `min` 以上の group: 指されている entity (`Eids`)、 値で結ぶ時は値 (`Vals`、 64 bit の値もある)。
@@ -1565,23 +1644,15 @@ fn flatten(p: LivePred, path: &mut Vec<u16>, out: &mut Vec<Flat>) {
         LivePred::Present { himo_id } => (vec![3, himo_id as u64], Leaf::Fixed(Pred::Present(himo_id))),
         // 否定は値を固定した条件 (値ごとに別の family)。 形の符号に中身の値まで入れる
         // dnf が `CountAtLeast` に揃えるが、 registry へ直に渡された条件 (dnf を通らない) も同じに
-        LivePred::Exists { via, preds } => {
-            let (t, p) = exists_leaf(via, None, 1, preds);
-            (t, Leaf::Fixed(p))
-        }
-        LivePred::ExistsEq { mine, theirs, preds } => {
-            let (t, p) = exists_leaf(theirs, Some(mine), 1, preds);
-            (t, Leaf::Fixed(p))
-        }
-        LivePred::CountAtLeast { via, mine, min, preds } => {
-            let (t, p) = exists_leaf(via, mine, min, preds);
+        p @ (LivePred::Exists { .. } | LivePred::ExistsEq { .. } | LivePred::CountAtLeast { .. } | LivePred::SumAtLeast { .. }) => {
+            let (t, p) = exists_of(p);
             (t, Leaf::Fixed(p))
         }
         LivePred::Not(inner) => {
             let (tail, p) = match *inner {
-                LivePred::Exists { via, preds } => exists_leaf(via, None, 1, preds),
-                LivePred::ExistsEq { mine, theirs, preds } => exists_leaf(theirs, Some(mine), 1, preds),
-                LivePred::CountAtLeast { via, mine, min, preds } => exists_leaf(via, mine, min, preds),
+                p @ (LivePred::Exists { .. } | LivePred::ExistsEq { .. } | LivePred::CountAtLeast { .. } | LivePred::SumAtLeast { .. }) => {
+                    exists_of(p)
+                }
                 LivePred::Eq { himo_id, value } => (vec![0, himo_id as u64, value], Pred::In(himo_id, vec![value])),
                 LivePred::In { himo_id, mut values } => {
                     values.sort_unstable();
@@ -1614,21 +1685,36 @@ fn flatten(p: LivePred, path: &mut Vec<u16>, out: &mut Vec<Flat>) {
 
 /// `Exists` の形の符号と条件 (中身の条件と `min` まで符号に入れる = 違えば別の family)。 `mine` = 値で結ぶ時の
 /// 自分の列 (None = `via` で指されている)。
-fn exists_leaf(via: u16, mine: Option<u16>, min: u64, preds: Vec<LivePred>) -> (Vec<u64>, Pred) {
+fn exists_leaf(via: u16, mine: Option<u16>, th: Threshold, preds: Vec<LivePred>) -> (Vec<u64>, Pred) {
     let text = format!("{preds:?}");
-    let mut t = vec![9, via as u64, mine.map_or(0, |m| m as u64 + 1), min, text.len() as u64];
+    let mut t = vec![9, via as u64, mine.map_or(0, |m| m as u64 + 1)];
+    t.extend(th.sig());
+    t.push(text.len() as u64);
     t.extend(text.bytes().map(u64::from));
-    (t, Pred::Exists { via, mine, min, preds, idx: usize::MAX })
+    (t, Pred::Exists { via, mine, th, preds, idx: usize::MAX })
 }
 
-/// 条件の中の `Exists` に添字を振り、 (via, mine, min, 中身) を添字の順に返す。
-fn number_exists(flats: &mut [Flat]) -> Vec<(u16, Option<u16>, u64, Vec<LivePred>)> {
-    fn visit(p: &mut Pred, out: &mut Vec<(u16, Option<u16>, u64, Vec<LivePred>)>) {
+/// 存在 / 件数 / 和の条件の形の符号と条件 (dnf を通らない条件も同じに扱う)。
+fn exists_of(p: LivePred) -> (Vec<u64>, Pred) {
+    match p {
+        LivePred::Exists { via, preds } => exists_leaf(via, None, Threshold::Count(1), preds),
+        LivePred::ExistsEq { mine, theirs, preds } => exists_leaf(theirs, Some(mine), Threshold::Count(1), preds),
+        LivePred::CountAtLeast { via, mine, min, preds } => exists_leaf(via, mine, Threshold::Count(min), preds),
+        LivePred::SumAtLeast { via, mine, sum_himo, min, signed, preds } => {
+            exists_leaf(via, mine, Threshold::Sum { himo: sum_himo, min, signed }, preds)
+        }
+        other => unreachable!("存在の条件でない: {other:?}"),
+    }
+}
+
+/// 条件の中の `Exists` に添字を振り、 (via, mine, 閾値, 中身) を添字の順に返す。
+fn number_exists(flats: &mut [Flat]) -> Vec<(u16, Option<u16>, Threshold, Vec<LivePred>)> {
+    fn visit(p: &mut Pred, out: &mut Vec<(u16, Option<u16>, Threshold, Vec<LivePred>)>) {
         match p {
             Pred::Not(q) => visit(q, out),
-            Pred::Exists { via, mine, min, preds, idx } => {
+            Pred::Exists { via, mine, th, preds, idx } => {
                 *idx = out.len();
-                out.push((*via, *mine, *min, preds.clone()));
+                out.push((*via, *mine, *th, preds.clone()));
             }
             _ => {}
         }
@@ -3061,8 +3147,8 @@ struct ExistsSub {
     node: usize,
     /// 値で結ぶ時の自分の列。
     mine: Option<u16>,
-    /// 件数がこれ以上の group が真。
-    min: u64,
+    /// 真になる閾値。
+    th: Threshold,
 }
 
 /// 穴の値を解決して鍵の組 (穴の値の並び) を返す。 `In` の穴は値の数だけ組が増える (組の掛け算)。
@@ -3138,12 +3224,12 @@ impl Family {
         let keyed = flats.iter().any(|f| matches!(f.leaf, Leaf::Hole(_, HoleVal::Group(KEYED))));
         let nodes = build_tree(flats);
         // `Exists` の添字 → 節
-        let mut ex_node = vec![(0usize, None, 1u64); exists.len()];
-        fn find_ex(p: &Pred, n: usize, out: &mut [(usize, Option<u16>, u64)]) {
+        let mut ex_node = vec![(0usize, None, Threshold::Count(1)); exists.len()];
+        fn find_ex(p: &Pred, n: usize, out: &mut [(usize, Option<u16>, Threshold)]) {
             match p {
                 Pred::Not(q) => find_ex(q, n, out),
                 // 1 回だけの評価 (`find_branch`) は集計の購読を持たない
-                Pred::Exists { idx, mine, min, .. } if *idx < out.len() => out[*idx] = (n, *mine, *min),
+                Pred::Exists { idx, mine, th, .. } if *idx < out.len() => out[*idx] = (n, *mine, *th),
                 _ => {}
             }
         }
@@ -3156,7 +3242,7 @@ impl Family {
         let exists: Vec<ExistsSub> = exists
             .into_iter()
             .zip(ex_node)
-            .map(|(counts, (node, mine, min))| ExistsSub { counts, node, mine, min })
+            .map(|(counts, (node, mine, th))| ExistsSub { counts, node, mine, th })
             .collect();
         let mut order: Vec<usize> = (0..nodes.len()).collect();
         order.sort_by_key(|&n| std::cmp::Reverse(nodes[n].depth));
@@ -3669,11 +3755,11 @@ impl Family {
     fn poll_exists(&self, r: &impl CellReader, s: &mut Settled) -> Vec<(usize, Vec<u32>)> {
         let ex = self.exists.lock();
         let mut out = Vec::new();
-        for (i, ExistsSub { counts, node, mine, min }) in ex.iter().enumerate() {
+        for (i, ExistsSub { counts, node, mine, th }) in ex.iter().enumerate() {
             let mut flipped = Vec::new();
             for (g, a) in counts.poll_with(r) {
                 // group は ref の列 (指している entity)、 値で結ぶ時は値 = その値を持つ entity 全部が動く
-                let now = a.count >= *min;
+                let now = th.holds(a);
                 if s.exists[i].has(g) != now {
                     s.exists[i].put(g, now);
                     match mine {
@@ -3873,20 +3959,24 @@ fn find_branch(r: &impl CellReader, preds: Vec<LivePred>) -> Vec<u32> {
     // `min` 以上の group に印
     s.exists = specs
         .into_iter()
-        .map(|(via, mine, min, preds)| {
+        .map(|(via, mine, th, preds)| {
             let kids = dnf(preds).map(|bs| find_once(r, bs)).unwrap_or_default();
-            let mut gs: Vec<u64> = kids
+            // (group, 和の列の値 + 1 (0 = 値が無い))
+            let mut gs: Vec<(u64, u64)> = kids
                 .into_iter()
-                .filter_map(|x| match mine {
-                    None => r.ref_cell(via, x).map(u64::from),
-                    Some(_) => r.cell(via, x),
+                .filter_map(|x| {
+                    let g = match mine {
+                        None => r.ref_cell(via, x).map(u64::from),
+                        Some(_) => r.cell(via, x),
+                    }?;
+                    Some((g, th.sum_himo().and_then(|h| r.cell(h, x)).map_or(0, |v| v + 1)))
                 })
                 .collect();
             gs.sort_unstable();
             let mut b = ExSet::new(mine.is_some());
-            for run in gs.chunk_by(|a, b| a == b) {
-                if run.len() as u64 >= min {
-                    b.put(run[0], true);
+            for run in gs.chunk_by(|a, b| a.0 == b.0) {
+                if th.holds(agg_of(run.iter().map(|x| x.1))) {
+                    b.put(run[0].0, true);
                 }
             }
             b
@@ -4153,9 +4243,9 @@ impl LiveRegistry {
         // 既にあって使わなかった分は、 edit lock を離してから drop する
         let mut exists: Vec<LiveCounts> = specs
             .into_iter()
-            .map(|(via, _, _, preds)| {
+            .map(|(via, _, th, preds)| {
                 let branches = dnf(preds).expect("Exists の中身は dnf (check_exists) で検査済み");
-                self.register_counts(branches, (Vec::new(), via), None).expect("check_exists で検査済み")
+                self.register_counts(branches, (Vec::new(), via), th.sum_himo()).expect("check_exists で検査済み")
             })
             .collect();
         let (family, slot) = self.register_alts_locked(id, sig, flats, &mut exists, alts, expand_always, union, limit);
@@ -4920,10 +5010,24 @@ pub(crate) fn split_grouped(preds: Vec<LivePred>) -> Result<(u16, Vec<LivePred>,
     }
 }
 
-/// 紐 `via` に値 `g` を持つ entity のうち、 `preds` を満たすものの数。
-fn count_matches(r: &impl CellReader, via: u16, g: u64, preds: &[LivePred]) -> u64 {
+/// 根の数と和の列の値 (`値 + 1`、 0 = 値が無い) から集計を作る。
+fn agg_of(stored: impl Iterator<Item = u64>) -> Agg {
+    let mut a = Agg::default();
+    for x in stored {
+        a.add(Agg::one(x));
+    }
+    a
+}
+
+/// 紐 `via` に値 `g` を持つ entity のうち、 `preds` を満たすものの集計 (和の列は `sum`)。
+fn agg_matches(r: &impl CellReader, via: u16, g: u64, preds: &[LivePred], sum: Option<u16>) -> Agg {
     let kids: Vec<u32> = dnf(preds.to_vec()).map(|bs| find_once(r, bs)).unwrap_or_default();
-    r.pull(via, g).into_iter().filter(|x| kids.binary_search(x).is_ok()).count() as u64
+    agg_of(
+        r.pull(via, g)
+            .into_iter()
+            .filter(|x| kids.binary_search(x).is_ok())
+            .map(|x| sum.and_then(|h| r.cell(h, x)).map_or(0, |v| v + 1)),
+    )
 }
 
 /// 根への単一紐条件 (`Via` 以外) を 1 entity に当てる。
@@ -4939,13 +5043,13 @@ fn matches_leaf(r: &impl CellReader, p: &LivePred, e: u32) -> bool {
         LivePred::Not(p) => !matches_leaf(r, p, e),
         // 指している entity (値で結ぶ時は自分の値を持つ entity) を引いて中身を 1 回評価し、 数える
         // (会社単位の購読の根への条件用)
-        LivePred::Exists { via, preds } => count_matches(r, *via, e as u64, preds) >= 1,
-        LivePred::ExistsEq { mine, theirs, preds } => {
-            r.cell(*mine, e).is_some_and(|v| count_matches(r, *theirs, v, preds) >= 1)
-        }
-        LivePred::CountAtLeast { via, mine: None, min, preds } => count_matches(r, *via, e as u64, preds) >= *min,
-        LivePred::CountAtLeast { via, mine: Some(m), min, preds } => {
-            r.cell(*m, e).is_some_and(|v| count_matches(r, *via, v, preds) >= *min)
+        p @ (LivePred::Exists { .. } | LivePred::ExistsEq { .. } | LivePred::CountAtLeast { .. } | LivePred::SumAtLeast { .. }) => {
+            let Pred::Exists { via, mine, th, preds, .. } = exists_of(p.clone()).1 else { return false };
+            let g = match mine {
+                None => Some(e as u64),
+                Some(m) => r.cell(m, e),
+            };
+            g.is_some_and(|g| th.holds(agg_matches(r, via, g, &preds, th.sum_himo())))
         }
         LivePred::Via { .. } | LivePred::Or(_) => false,
     }

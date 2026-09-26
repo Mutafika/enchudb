@@ -105,6 +105,26 @@ impl World<'_> {
     fn shops_in(&self, v: &Value, cond: &dyn Fn(u64) -> bool) -> u64 {
         self.shops.iter().filter(|&&x| get_val(self.s, x, "city").as_ref() == Some(v) && cond(x)).count() as u64
     }
+    fn num(t: &Table, e: u64, col: &str) -> i64 {
+        match get_val(t, e, col) {
+            Some(Value::Number(n)) => n,
+            _ => 0,
+        }
+    }
+    /// 会社 co を指す社員のうち cond を満たす人の (数, col の和)
+    fn staff_sum(&self, co: u64, col: &str, cond: &dyn Fn(u64) -> bool) -> (u64, i64) {
+        self.users
+            .iter()
+            .filter(|&&e| get_ref(self.u, e, "company") == Some(co) && cond(e))
+            .fold((0, 0), |(n, s), &e| (n + 1, s + World::num(self.u, e, col)))
+    }
+    /// 街 v の店のうち cond を満たす店の (数, rev の和)
+    fn shops_sum(&self, v: &Value, cond: &dyn Fn(u64) -> bool) -> (u64, i64) {
+        self.shops
+            .iter()
+            .filter(|&&x| get_val(self.s, x, "city").as_ref() == Some(v) && cond(x))
+            .fold((0, 0), |(n, s), &x| (n + 1, s + World::num(self.s, x, "rev")))
+    }
     fn ccity(&self, e: u64) -> Option<Value> {
         get_ref(self.u, e, "company").and_then(|co| get_val(self.c, co, "city"))
     }
@@ -117,11 +137,13 @@ fn run(path: &str) {
         .number("id")
         .number("age")
         .tag("city")
+        .number("salary")
+        .bigint("bal")
         .ref_to("company", "companies")
         .primary_key("id")
         .build()
         .unwrap();
-    db.table("shops").number("id").tag("city").number("open").primary_key("id").build().unwrap();
+    db.table("shops").number("id").tag("city").number("open").bigint("rev").primary_key("id").build().unwrap();
     let (users_t, shops_t, companies_t) =
         (db.get_table("users").unwrap(), db.get_table("shops").unwrap(), db.get_table("companies").unwrap());
     let (u, s, c) = (&users_t, &shops_t, &companies_t);
@@ -130,6 +152,12 @@ fn run(path: &str) {
         (0..8i64).map(|i| c.insert().set("id", i).set("city", CITIES[(i % 4) as usize]).commit().unwrap()).collect();
     let new_user = |rng: &mut Rng, id: i64, companies: &[u64]| {
         let mut b = u.insert().set("id", id).set("age", rng.below(50) as i64);
+        if rng.below(5) != 0 {
+            b = b.set("salary", rng.below(100) as i64);
+        }
+        if rng.below(5) != 0 {
+            b = b.set("bal", rng.below(101) as i64 - 50);
+        }
         if rng.below(6) != 0 {
             b = b.set("city", CITIES[rng.below(4) as usize]);
         }
@@ -140,6 +168,9 @@ fn run(path: &str) {
     };
     let new_shop = |rng: &mut Rng, id: i64| {
         let mut b = s.insert().set("id", id).set("open", rng.below(2) as i64);
+        if rng.below(5) != 0 {
+            b = b.set("rev", rng.below(41) as i64 - 20);
+        }
         if rng.below(6) != 0 {
             b = b.set("city", CITIES[rng.below(4) as usize]);
         }
@@ -163,6 +194,8 @@ fn run(path: &str) {
     let make = |kind: u64, rng: &mut Rng| -> Sub {
         let k = 1 + rng.below(4);
         let x = rng.below(50) as i64;
+        let t = rng.below(300) as i64;
+        let tb = rng.below(101) as i64 - 50;
         let a = CITIES[rng.below(4) as usize];
         let (name, of_companies, query, cond): (String, bool, Q, Cond) = match kind {
             0 => (
@@ -201,6 +234,47 @@ fn run(path: &str) {
                 Box::new(move || u.all().where_value_count_ge("company.city", s.where_eq("open", 1i64), "city", k)),
                 Box::new(move |w, e| w.ccity(e).is_some_and(|v| w.shops_in(&v, &|x| w.open(x)) >= k)),
             ),
+            7 => (
+                format!("社員の給与の和が {t} 以上の会社"),
+                true,
+                Box::new(move || c.all().where_sum_ge(u.all(), "company", "salary", t)),
+                Box::new(move |w, co| {
+                    let (n, sum) = w.staff_sum(co, "salary", &|_| true);
+                    n > 0 && sum >= t
+                }),
+            ),
+            8 => (
+                format!("{x} 歳より上の社員の残高 (BigInt) の和が {tb} 未満の会社 (社員なしも)"),
+                true,
+                Box::new(move || c.all().where_sum_lt(u.all().where_gt("age", x), "company", "bal", tb)),
+                Box::new(move |w, co| {
+                    let (n, sum) = w.staff_sum(co, "bal", &|e| w.age(e) > x);
+                    n == 0 || sum < tb
+                }),
+            ),
+            9 => (
+                format!("住む街の開いた店の売上 (BigInt) の和が {tb} 以上の住人"),
+                false,
+                Box::new(move || u.all().where_value_sum_ge("city", s.where_eq("open", 1i64), "city", "rev", tb)),
+                Box::new(move |w, e| {
+                    get_val(w.u, e, "city").is_some_and(|v| {
+                        let (n, sum) = w.shops_sum(&v, &|x| w.open(x));
+                        n > 0 && sum >= tb
+                    })
+                }),
+            ),
+            10 => (
+                format!("会社の所在地の店の売上の和が {tb} 未満の社員 (店なしも、 会社なしは入らない)"),
+                false,
+                Box::new(move || u.all().where_value_sum_lt("company.city", s.all(), "city", "rev", tb)),
+                Box::new(move |w, e| {
+                    get_ref(w.u, e, "company").is_some()
+                        && w.ccity(e).is_none_or(|v| {
+                            let (n, sum) = w.shops_sum(&v, &|_| true);
+                            n == 0 || sum < tb
+                        })
+                }),
+            ),
             _ => (
                 format!("所在地が {a} または社員が {k} 人以上の会社"),
                 true,
@@ -213,11 +287,16 @@ fn run(path: &str) {
         let q = query().subscribe().unwrap();
         Sub { name, of_companies, q, query, seen: BTreeSet::new(), cond }
     };
-    const KINDS: u64 = 7;
-    let mut subs: Vec<Sub> = (0..21).map(|i| make(i % KINDS, &mut rng)).collect();
+    const KINDS: u64 = 11;
+    let mut subs: Vec<Sub> = (0..33).map(|i| make(i % KINDS, &mut rng)).collect();
     // 開いた店が k 軒以上の街 (group の値の購読)
     let mut havings: Vec<(u64, LiveHaving, BTreeSet<String>)> = (1..=4u64)
         .map(|k| (k, s.where_eq("open", 1i64).subscribe_having("city", k).unwrap(), BTreeSet::new()))
+        .collect();
+    // 開いた店の売上 (BigInt) の和が t 以上の街
+    let mut having_sums: Vec<(i64, LiveHaving, BTreeSet<String>)> = [-15i64, 0, 7, 25]
+        .into_iter()
+        .map(|t| (t, s.where_eq("open", 1i64).subscribe_having_sum("city", "rev", t).unwrap(), BTreeSet::new()))
         .collect();
     // 会社単位の購読の社員への条件に件数の閾値 (members / count が 1 回の評価で数える): 所在地が a の会社の、
     // 住む街に開いた店が k 軒以上ある社員
@@ -243,6 +322,23 @@ fn run(path: &str) {
             let got: BTreeSet<u64> = g.groups().into_iter().flat_map(|co| g.members(co)).collect();
             assert_eq!(got, want, "step {step}: 会社 {a} の、 開いた店が {k} 軒以上の街の社員 (members)");
             assert_eq!(g.count(), want.len(), "step {step}: grouped count ({a}, {k})");
+        }
+    };
+    let check_sums = |having_sums: &mut Vec<(i64, LiveHaving, BTreeSet<String>)>, w: &World, step: usize| {
+        for (t, h, seen) in having_sums.iter_mut() {
+            integrate_groups(seen, h.poll());
+            let want: BTreeSet<String> = CITIES
+                .iter()
+                .filter(|c| {
+                    let (n, sum) = w.shops_sum(&Value::Text((**c).into()), &|x| w.open(x));
+                    n > 0 && sum >= *t
+                })
+                .map(|c| c.to_string())
+                .collect();
+            assert_eq!(*seen, want, "step {step}: 開いた店の売上の和が {t} 以上の街");
+            let groups: BTreeSet<String> =
+                h.groups().into_iter().map(|v| if let Value::Text(x) = v { x } else { unreachable!() }).collect();
+            assert_eq!(groups, want, "step {step}: groups (sum >= {t})");
         }
     };
     let check = |subs: &mut Vec<Sub>, havings: &mut Vec<(u64, LiveHaving, BTreeSet<String>)>, w: &World, step: usize| {
@@ -276,13 +372,29 @@ fn run(path: &str) {
         }
     };
     check(&mut subs, &mut havings, &w, 0);
+    check_sums(&mut having_sums, &w, 0);
     let eng = db.engine();
     let mut next_id = 5000i64;
     for step in 1..1500 {
         let e = w.users[rng.below(w.users.len() as u64) as usize];
         let x = w.shops[rng.below(w.shops.len() as u64) as usize];
         let co = w.companies[rng.below(w.companies.len() as u64) as usize];
-        match rng.below(12) {
+        match rng.below(15) {
+            12 => {
+                if rng.below(4) == 0 {
+                    eng.untie(e, "users.salary")
+                } else {
+                    u.entity(e).set("salary", rng.below(100) as i64).commit().unwrap()
+                }
+            }
+            13 => u.entity(e).set("bal", rng.below(101) as i64 - 50).commit().unwrap(),
+            14 => {
+                if rng.below(4) == 0 {
+                    eng.untie(x, "shops.rev")
+                } else {
+                    s.entity(x).set("rev", rng.below(41) as i64 - 20).commit().unwrap()
+                }
+            }
             0 | 1 => u.entity(e).set("company", Value::Ref(co)).commit().unwrap(),
             2 => eng.untie(e, "users.company"),
             3 => u.entity(e).set("age", rng.below(50) as i64).commit().unwrap(),
@@ -316,9 +428,11 @@ fn run(path: &str) {
         }
         if step % 3 == 0 {
             check(&mut subs, &mut havings, &w, step);
+            check_sums(&mut having_sums, &w, step);
         }
     }
     check(&mut subs, &mut havings, &w, 1_000_001);
+    check_sums(&mut having_sums, &w, 1_000_001);
     // 閾値 0: ge は条件なし、 lt は常に 0 件。 subscribe_having(0) は BadValue
     assert_eq!(c.all().where_count_ge(u.all(), "company", 0).count().unwrap(), w.companies.len());
     assert_eq!(c.all().where_count_lt(u.all(), "company", 0).count().unwrap(), 0);
