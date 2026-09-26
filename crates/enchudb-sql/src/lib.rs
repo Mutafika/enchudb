@@ -9,7 +9,7 @@
 //! ## v0.1 サポート
 //!
 //! ```sql
-//! CREATE TABLE t (col TYPE [PRIMARY KEY], ...)         -- INTEGER / TEXT
+//! CREATE TABLE t (col TYPE [PRIMARY KEY], ...)         -- INTEGER / BIGINT / TEXT / LEAF
 //! INSERT INTO t [(col, ...)] VALUES (...) [, (...)]
 //! INSERT OR REPLACE INTO t VALUES (...)
 //!
@@ -28,8 +28,9 @@
 //! - BETWEEN: `col BETWEEN lo AND hi` (両端 inclusive)
 //! - NULL 判定: `col IS NULL` / `col IS NOT NULL`
 //!
-//! TYPE は `INTEGER` / `BIGINT` / `TEXT`。 INTEGER は u32 (0 以上)、 BIGINT は i64 (負の数・ms の時刻)、
-//! TEXT は Symbol himo。
+//! TYPE は `INTEGER` / `BIGINT` / `TEXT`。 整数型 (`INTEGER` / `INT` / `BIGINT` / `SMALLINT` …) は全部 i64
+//! (SQLite の INTEGER と同じ、 ただし `i64::MAX` は入らない)、 TEXT は Symbol himo。 旧版で作った表の
+//! `INTEGER` 列は u32 (0 以上) のまま開く。
 //!
 //! ## 未対応 (今後)
 //! - JOIN / subquery
@@ -75,9 +76,10 @@ const SCHEMA_BLOB_HIMO: &str = "__enchu_schema_blob";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// SQL 上の列型。`enchudb_engine::ValueType` への dispatch 用。
 ///
-/// - `Integer` — `INTEGER` / `INT` 系。ValueType::Number (0 以上 u32::MAX 未満)。
-/// - `BigInt` — `BIGINT`。 ValueType::Number64 (i64、 `i64::MAX` を除く)。 engine には大小の順を保つ符号化
-///   (`v ^ 2^63`) で置く (schema 層の BigInt と同じ)。
+/// - `Integer` — 旧版で作った表の `INTEGER` 列。ValueType::Number (0 以上 u32::MAX 未満)。 新しい表では作らない
+///   (既存の DB を同じ意味で開くためだけに残る)。
+/// - `BigInt` — 整数型 (`INTEGER` / `INT` / `BIGINT` / `SMALLINT` …)。 ValueType::Number64 (i64、 `i64::MAX` を除く)。
+///   engine には大小の順を保つ符号化 (`v ^ 2^63`) で置く (schema 層の BigInt と同じ)。
 /// - `Text` — `TEXT` / `VARCHAR` 系。ValueType::Tag (vocab で dedupe)。
 /// - `Leaf` — 拡張型 `LEAF`。ValueType::Leaf (vocab に乗るが dedupe なし、自由記述用)。
 pub enum SqlType {
@@ -342,10 +344,11 @@ impl Database {
         for c in &ct.columns {
             let col_name = c.name.value.clone();
             let ty = match &c.data_type {
+                // 整数型は全部 i64 (SQLite の INTEGER と同じ)。 u32 の `SqlType::Integer` は旧版の表だけ。
                 DataType::Int(_) | DataType::Integer(_)
                 | DataType::SmallInt(_) | DataType::TinyInt(_) | DataType::UnsignedInt(_)
-                | DataType::UnsignedInteger(_) => SqlType::Integer,
-                DataType::BigInt(_) | DataType::UnsignedBigInt(_) => SqlType::BigInt,
+                | DataType::UnsignedInteger(_)
+                | DataType::BigInt(_) | DataType::UnsignedBigInt(_) => SqlType::BigInt,
                 DataType::Text | DataType::String(_) | DataType::Varchar(_)
                 | DataType::Char(_) | DataType::CharacterVarying(_) => SqlType::Text,
                 // 拡張型: `LEAF` は dedupe しない自由記述テキスト用。
@@ -711,7 +714,10 @@ impl Database {
                     Ok(v) if v != u32::MAX => v as u64,
                     _ => return Ok(Vec::new()),
                 },
-                (SqlType::BigInt, Value::Integer(n)) => big_raw(*n)?,
+                (SqlType::BigInt, Value::Integer(n)) => match big_raw(*n) {
+                    Ok(raw) => raw,
+                    Err(_) => return Ok(Vec::new()),
+                },
                 (SqlType::Text, Value::Text(s)) => match self.eng.vocab_id(s) {
                     Some(id) => id as u64,
                     None => return Ok(Vec::new()), // 未知 vocab はマッチなし
@@ -1162,6 +1168,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(path);
     }
 
+    fn ints(db: &mut Database, q: &str) -> Vec<i64> {
+        match db.execute(q).unwrap() {
+            Output::Rows { rows, .. } => rows.into_iter().map(|r| match r[0] { Value::Integer(n) => n, ref o => panic!("{o:?}") }).collect(),
+            o => panic!("{o:?}"),
+        }
+    }
+
+    /// 新しい表の INTEGER / INT / SMALLINT は i64 (SQLite の INTEGER と同じ): 負の数 / ms の時刻 / 値域の端 /
+    /// 主キー / 範囲 / 並び / reopen。
+    #[test]
+    fn integer_columns_of_new_tables_are_64_bit() {
+        let path = "/tmp/enchudb_sql_integer64.db";
+        let _ = std::fs::remove_dir_all(path);
+        {
+            let mut db = Database::create(path).unwrap();
+            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, at INT, s SMALLINT)").unwrap();
+            let tys: Vec<SqlType> = db.list_tables()[0].1.iter().map(|c| c.1).collect();
+            assert_eq!(tys, vec![SqlType::BigInt; 3]);
+            db.execute("INSERT INTO t VALUES (-1, 1790000000123, -5)").unwrap();
+            db.execute("INSERT INTO t VALUES (-9223372036854775808, 9223372036854775806, 7)").unwrap();
+            db.execute("INSERT INTO t VALUES (3, -1, 0)").unwrap();
+            assert!(db.execute("INSERT INTO t VALUES (4, 9223372036854775807, 0)").is_err(), "i64::MAX は入らない");
+            // 入らない値の検索はエラーでなく 0 件 (SQLite で動くクエリが落ちない)
+            assert_eq!(ints(&mut db, "SELECT id FROM t WHERE at = 9223372036854775807"), Vec::<i64>::new());
+            assert_eq!(ints(&mut db, "SELECT id FROM t WHERE id = 9223372036854775807"), Vec::<i64>::new());
+            db.execute("DELETE FROM t WHERE id = 9223372036854775807").unwrap();
+            assert_eq!(ints(&mut db, "SELECT at FROM t WHERE id = -1"), vec![1_790_000_000_123]);
+            assert_eq!(ints(&mut db, "SELECT id FROM t WHERE at > 1790000000000 ORDER BY at"), vec![-1, i64::MIN]);
+            assert_eq!(ints(&mut db, "SELECT s FROM t WHERE s < 0"), vec![-5]);
+            db.execute("INSERT OR REPLACE INTO t VALUES (-1, 2, 2)").unwrap();
+            assert_eq!(ints(&mut db, "SELECT at FROM t WHERE id = -1"), vec![2]);
+        }
+        let mut db = Database::open(path).unwrap();
+        assert_eq!(ints(&mut db, "SELECT id FROM t ORDER BY at"), vec![3, -1, i64::MIN]);
+        assert_eq!(ints(&mut db, "SELECT at FROM t WHERE id = -9223372036854775808"), vec![i64::MAX - 1]);
+        drop(db);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    /// 旧版で作った表の INTEGER 列 (u32) は、 reopen しても u32 のまま (保存済みの値を別の符号化で読まない)。
+    #[test]
+    fn integer_columns_of_old_tables_stay_u32() {
+        let path = "/tmp/enchudb_sql_integer_legacy.db";
+        let _ = std::fs::remove_dir_all(path);
+        {
+            // 旧版の CREATE TABLE と同じ状態: 型 INTEGER (u32) の表を保存し、 u32 の値を書く
+            let mut db = Database::create(path).unwrap();
+            db.eng.define_himo("old.id", ValueType::Number, 0);
+            db.eng.define_himo("old.n", ValueType::Number, 0);
+            db.tables.push(TableDef {
+                name: "old".into(),
+                cols: vec![
+                    ColDef { name: "id".into(), ty: SqlType::Integer, himo: "old.id".into() },
+                    ColDef { name: "n".into(), ty: SqlType::Integer, himo: "old.n".into() },
+                ],
+                pk: Some("id".into()),
+            });
+            db.persist_schema().unwrap();
+            db.execute("INSERT INTO old VALUES (1, 1715174400)").unwrap();
+        }
+        let mut db = Database::open(path).unwrap();
+        let tys: Vec<SqlType> = db.list_tables()[0].1.iter().map(|c| c.1).collect();
+        assert_eq!(tys, vec![SqlType::Integer; 2]);
+        assert_eq!(ints(&mut db, "SELECT n FROM old WHERE id = 1"), vec![1_715_174_400]);
+        db.execute("INSERT INTO old VALUES (2, 7)").unwrap();
+        assert_eq!(ints(&mut db, "SELECT id FROM old WHERE n < 100"), vec![2]);
+        assert!(db.execute("INSERT INTO old VALUES (3, -1)").is_err(), "u32 の列に負の数は入らない");
+        assert_eq!(db.engine().get(db.engine().pull_raw("old.id", 2u32)[0], "old.n"), Some(7), "u32 のまま置く");
+        drop(db);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
     #[test]
     fn create_and_insert_select() {
         let mut db = fresh("create_insert");
@@ -1199,14 +1277,15 @@ mod tests {
         let mut db = fresh("eq_out_of_range");
         db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)").unwrap();
         db.execute("INSERT INTO t VALUES (1, 5)").unwrap();
-        for q in ["SELECT id FROM t WHERE n = 4294967295", "SELECT id FROM t WHERE n = 99999999999"] {
+        // 新しい表の INTEGER は i64 (#297)、 列に入らないのは i64::MAX
+        for q in ["SELECT id FROM t WHERE n = 4294967295", "SELECT id FROM t WHERE n = 9223372036854775807"] {
             match db.execute(q) {
                 Ok(Output::Rows { rows, .. }) => assert!(rows.is_empty(), "{q}: {rows:?}"),
                 o => panic!("{q}: {o:?}"),
             }
         }
-        db.execute("DELETE FROM t WHERE n = 4294967295").unwrap();
-        assert!(db.execute("INSERT INTO t VALUES (2, 4294967295)").is_err(), "書き込みは今どおり弾く");
+        db.execute("DELETE FROM t WHERE n = 9223372036854775807").unwrap();
+        assert!(db.execute("INSERT INTO t VALUES (2, 9223372036854775807)").is_err(), "書き込みは今どおり弾く");
     }
 
     #[test]
