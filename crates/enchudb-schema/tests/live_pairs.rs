@@ -5,8 +5,8 @@
 //! 書き込みは両側の row の出入り (条件の列の書き換え・作り直し)、 結ぶ列の書き換え (ref の付け替え、 値の
 //! 書き換え・外し)、 ref の先の値の変化 (会社の所在地) を混ぜる。
 
-use enchudb_schema::{Database, PairDelta, Table, Value};
-use std::collections::BTreeSet;
+use enchudb_schema::{Database, LiveJoinCounts, PairDelta, Table, Value};
+use std::collections::{BTreeMap, BTreeSet};
 
 fn tmp_path(tag: &str) -> String {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -108,8 +108,8 @@ fn run(path: &str) {
         .primary_key("id")
         .build()
         .unwrap();
-    db.table("shops").number("id").tag("city").number("open").primary_key("id").build().unwrap();
-    db.table("posts").number("id").number("published").ref_to("author", "users").primary_key("id").build().unwrap();
+    db.table("shops").number("id").tag("city").number("open").bigint("rev").primary_key("id").build().unwrap();
+    db.table("posts").number("id").number("published").number("likes").ref_to("author", "users").primary_key("id").build().unwrap();
     let (ut, st, pt, ct) =
         (db.get_table("users").unwrap(), db.get_table("shops").unwrap(), db.get_table("posts").unwrap(), db.get_table("companies").unwrap());
     let (u, s, p, c) = (&ut, &st, &pt, &ct);
@@ -128,6 +128,9 @@ fn run(path: &str) {
     };
     let new_shop = |rng: &mut Rng, id: i64| {
         let mut b = s.insert().set("id", id).set("open", rng.below(2) as i64);
+        if rng.below(4) != 0 {
+            b = b.set("rev", rng.below(41) as i64 - 20);
+        }
         if rng.below(6) != 0 {
             b = b.set("city", CITIES[rng.below(4) as usize]);
         }
@@ -135,6 +138,9 @@ fn run(path: &str) {
     };
     let new_post = |rng: &mut Rng, id: i64, users: &[u64]| {
         let mut b = p.insert().set("id", id).set("published", rng.below(2) as i64);
+        if rng.below(4) != 0 {
+            b = b.set("likes", rng.below(30) as i64);
+        }
         if rng.below(6) != 0 {
             b = b.set("author", Value::Ref(users[rng.below(users.len() as u64) as usize]));
         }
@@ -222,6 +228,147 @@ fn run(path: &str) {
     };
     const KINDS: u64 = 4;
     let mut subs: Vec<Sub> = (0..12).map(|i| make(i % KINDS, &mut rng)).collect();
+    // 組の集計: (名前, 購読, 積分した group → (件数, 和), 総当たり)
+    type Groups = BTreeMap<String, (u64, i128)>;
+    type AggOracle<'a> = Box<dyn Fn(&World) -> Groups + 'a>;
+    let city = |v: Option<Value>| match v {
+        Some(Value::Text(t)) => Some(t),
+        _ => None,
+    };
+    let n0 = |v: Option<Value>| match v {
+        Some(Value::Number(n)) => n as i128,
+        _ => 0,
+    };
+    // 値の組 (住人 × 開いた店) を総当たりで
+    let user_shop = move |w: &World, key: &dyn Fn(u64) -> Option<Value>, age_gt: i64, open_only: bool| -> Vec<(u64, u64, String)> {
+        let mut out = Vec::new();
+        for &e in &w.users {
+            if w.age(e) <= age_gt {
+                continue;
+            }
+            let Some(v) = key(e) else { continue };
+            for &x in &w.shops {
+                if get_val(w.s, x, "city").as_ref() == Some(&v) && (!open_only || World::num(w.s, x, "open") == Some(1)) {
+                    out.push((e, x, city(Some(v.clone())).unwrap()));
+                }
+            }
+        }
+        out
+    };
+    let mut aggs: Vec<(String, LiveJoinCounts, Groups, AggOracle)> = vec![
+        (
+            "公開済みの投稿 × 20 歳より上の作者を作者の街ごとに数える".into(),
+            p.where_eq("published", 1i64).join_ref("author", u.all().where_gt("age", 20i64)).subscribe_counts("author.city").unwrap(),
+            Groups::new(),
+            Box::new(move |w: &World| {
+                let mut g = Groups::new();
+                for &q in &w.posts {
+                    let Some(a) = get_ref(w.p, q, "author") else { continue };
+                    if World::num(w.p, q, "published") != Some(1) || !World::alive(&w.users, a) || w.age(a) <= 20 {
+                        continue;
+                    }
+                    if let Some(c) = city(get_val(w.u, a, "city")) {
+                        g.entry(c).or_default().0 += 1;
+                    }
+                }
+                g
+            }),
+        ),
+        (
+            "投稿 × 作者の likes の和を作者の街ごとに".into(),
+            p.all().join_ref("author", u.all()).subscribe_sums("author.city", "likes").unwrap(),
+            Groups::new(),
+            Box::new(move |w: &World| {
+                let mut g = Groups::new();
+                for &q in &w.posts {
+                    let Some(a) = get_ref(w.p, q, "author") else { continue };
+                    if !World::alive(&w.users, a) {
+                        continue;
+                    }
+                    if let Some(c) = city(get_val(w.u, a, "city")) {
+                        let x = g.entry(c).or_default();
+                        x.0 += 1;
+                        x.1 += n0(get_val(w.p, q, "likes"));
+                    }
+                }
+                g
+            }),
+        ),
+        (
+            "住人 × 開いた店の組を街ごとに数える".into(),
+            u.all().join_eq("city", s.where_eq("open", 1i64), "city").subscribe_counts("city").unwrap(),
+            Groups::new(),
+            Box::new(move |w: &World| {
+                let mut g = Groups::new();
+                for (_, _, c) in user_shop(w, &|e| get_val(w.u, e, "city"), -1, true) {
+                    g.entry(c).or_default().0 += 1;
+                }
+                g
+            }),
+        ),
+        (
+            "住人 × 店の組の店の売上 (BigInt、 右の列) の和を街ごとに".into(),
+            u.all().join_eq("city", s.all(), "city").subscribe_sums("city", "shops.rev").unwrap(),
+            Groups::new(),
+            Box::new(move |w: &World| {
+                let mut g = Groups::new();
+                for (_, x, c) in user_shop(w, &|e| get_val(w.u, e, "city"), -1, false) {
+                    let v = g.entry(c).or_default();
+                    v.0 += 1;
+                    v.1 += n0(get_val(w.s, x, "rev"));
+                }
+                g
+            }),
+        ),
+        (
+            "住人 × 開いた店の組の住人の age (左の列) の和を街ごとに".into(),
+            u.all().join_eq("city", s.where_eq("open", 1i64), "city").subscribe_sums("city", "age").unwrap(),
+            Groups::new(),
+            Box::new(move |w: &World| {
+                let mut g = Groups::new();
+                for (e, _, c) in user_shop(w, &|e| get_val(w.u, e, "city"), -1, true) {
+                    let v = g.entry(c).or_default();
+                    v.0 += 1;
+                    v.1 += w.age(e) as i128;
+                }
+                g
+            }),
+        ),
+        (
+            "25 歳より上の社員 × 会社の所在地の店の組を所在地ごとに".into(),
+            u.all().where_gt("age", 25i64).join_eq("company.city", s.all(), "city").subscribe_counts("company.city").unwrap(),
+            Groups::new(),
+            Box::new(move |w: &World| {
+                let mut g = Groups::new();
+                let key = |e: u64| get_ref(w.u, e, "company").and_then(|co| get_val(w.c, co, "city"));
+                for (_, _, c) in user_shop(w, &key, 25, false) {
+                    g.entry(c).or_default().0 += 1;
+                }
+                g
+            }),
+        ),
+    ];
+    let check_aggs = |aggs: &mut Vec<(String, LiveJoinCounts, Groups, AggOracle)>, w: &World, step: usize| {
+        for (name, live, seen, oracle) in aggs.iter_mut() {
+            for (v, n, sum) in live.poll_sums() {
+                let Some(c) = city(Some(v)) else { panic!("group is a Tag") };
+                if n == 0 {
+                    assert!(seen.remove(&c).is_some(), "[{name}] step {step}: 報告していない group {c} が消えた");
+                } else {
+                    seen.insert(c, (n, sum));
+                }
+            }
+            let want = oracle(w);
+            assert_eq!(*seen, want, "[{name}] step {step}: 積分 != 総当たり");
+            let all: Groups = live.all_sums().into_iter().map(|(v, n, sum)| (city(Some(v)).unwrap(), (n, sum))).collect();
+            assert_eq!(all, want, "[{name}] step {step}: all_sums");
+            for c in CITIES {
+                let v = Value::Text(c.into());
+                let (n, sum) = want.get(c).copied().unwrap_or_default();
+                assert_eq!((live.get(&v), live.get_sum(&v)), (n, sum), "[{name}] step {step}: get {c}");
+            }
+        }
+    };
     let check = |subs: &mut Vec<Sub>, w: &World, step: usize| {
         for sub in subs.iter_mut() {
             integrate(&mut sub.seen, sub.live.poll());
@@ -233,6 +380,7 @@ fn run(path: &str) {
         }
     };
     check(&mut subs, &w, 0);
+    check_aggs(&mut aggs, &w, 0);
     let eng = db.engine();
     let mut next_id = 5000i64;
     for step in 1..1200 {
@@ -240,7 +388,15 @@ fn run(path: &str) {
         let x = w.shops[rng.below(w.shops.len() as u64) as usize];
         let q = w.posts[rng.below(w.posts.len() as u64) as usize];
         let co = w.companies[rng.below(w.companies.len() as u64) as usize];
-        match rng.below(16) {
+        match rng.below(18) {
+            16 => p.entity(q).set("likes", rng.below(30) as i64).commit().unwrap(),
+            17 => {
+                if rng.below(3) == 0 {
+                    eng.untie(x, "shops.rev")
+                } else {
+                    s.entity(x).set("rev", rng.below(41) as i64 - 20).commit().unwrap()
+                }
+            }
             0 => u.entity(e).set("city", CITIES[rng.below(4) as usize]).commit().unwrap(),
             1 => eng.untie(e, "users.city"),
             2 => u.entity(e).set("age", rng.below(50) as i64).commit().unwrap(),
@@ -282,9 +438,14 @@ fn run(path: &str) {
         }
         if step % 3 == 0 {
             check(&mut subs, &w, step);
+            check_aggs(&mut aggs, &w, step);
         }
     }
     check(&mut subs, &w, 1_000_001);
+    check_aggs(&mut aggs, &w, 1_000_001);
+    // 値の組は結ぶ列でだけ group にできる、 和の列は Number / BigInt
+    assert!(u.all().join_eq("city", s.all(), "city").subscribe_counts("age").is_err());
+    assert!(u.all().join_eq("city", s.all(), "city").subscribe_sums("city", "shops.city").is_err());
     // 結べない列は BadValue
     assert!(u.all().join_eq("city", s.all(), "open").subscribe().is_err(), "Tag と Number");
     assert!(u.all().join_ref("city", s.all()).find().is_err(), "ref 列でない");
