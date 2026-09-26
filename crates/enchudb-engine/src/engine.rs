@@ -11789,6 +11789,13 @@ impl Engine {
             {
                 return Err(bad(format!("Via path himo {h} is not a Ref himo")));
             }
+            // 値で結ぶ列は同じ型 (Tag どうしは vocab id が共通)。 Leaf は値ごとに別の id なので結べない
+            for (mine, theirs) in p.value_joins() {
+                let (a, b) = (self.value_type_at(mine as usize), self.value_type_at(theirs as usize));
+                if a != b || a == Some(ValueType::Leaf) {
+                    return Err(bad(format!("ExistsEq joins himo {mine} ({a:?}) with himo {theirs} ({b:?}) — they must have the same non-Leaf type")));
+                }
+            }
         }
         Ok(())
     }
