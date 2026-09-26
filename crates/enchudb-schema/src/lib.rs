@@ -2526,25 +2526,32 @@ type IvChange = (Option<(u64, u64)>, Option<(u64, u64)>, bool);
 struct RangeState {
     /// 左の (値, row)
     points: std::collections::BTreeSet<(u64, EntityId)>,
-    /// 右の row の始点 / 終点 (値のある row)
-    lo_of: std::collections::BTreeMap<EntityId, u64>,
-    hi_of: std::collections::BTreeMap<EntityId, u64>,
     ivs: Intervals,
 }
 
-impl RangeState {
-    fn iv(&self, r: EntityId) -> Option<(u64, u64)> {
-        match (self.lo_of.get(&r), self.hi_of.get(&r)) {
-            (Some(&lo), Some(&hi)) if lo <= hi => Some((lo, hi)),
-            _ => None,
-        }
+/// 始点 / 終点から区間 (始点 > 終点 / 値の無い row は None)。
+fn interval(lo: Option<u64>, hi: Option<u64>) -> Option<(u64, u64)> {
+    match (lo, hi) {
+        (Some(lo), Some(hi)) if lo <= hi => Some((lo, hi)),
+        _ => None,
     }
+}
+
+impl RangeState {
 
     /// 差分を当てて組の差分を返す。 抜く側は抜く前の相手と、 足す側は足した後の相手と組む (同じ組を 2 度数えない):
     /// 左の removed × 旧区間 → 旧区間 × (左 − 左の removed) → 左の added × (区間 − 旧区間) → 新区間 × 新しい左。
     /// 居続ける組 (どちらの row も作り直していなくて、 動く前も後も組になる) は、 それぞれの段で出さない
     /// (出してから打ち消すと、 まとめた poll で抜く組を全部集合に入れることになる)。
-    fn apply(&mut self, dl: &enchudb_engine::KeyedDelta, dlo: &enchudb_engine::KeyedDelta, dhi: &enchudb_engine::KeyedDelta) -> PairDelta {
+    ///
+    /// 右の row の区間の前後は、 始点 / 終点の鍵付きの購読の差分と渡し済みの鍵 (`now` = 差分に出た row ごとの (始点, 終点)) から。
+    fn apply(
+        &mut self,
+        dl: &enchudb_engine::KeyedDelta,
+        dlo: &enchudb_engine::KeyedDelta,
+        dhi: &enchudb_engine::KeyedDelta,
+        now: &[(EntityId, Option<u64>, Option<u64>)],
+    ) -> PairDelta {
         use std::collections::{BTreeMap, BTreeSet};
         let within = |iv: Option<(u64, u64)>, v: u64| iv.is_some_and(|(lo, hi)| lo <= v && v <= hi);
         let mut d = PairDelta::default();
@@ -2556,20 +2563,10 @@ impl RangeState {
         let old_v = |a: EntityId| find(&dl.removed, a).filter(|_| !reborn(a));
         let new_v = |a: EntityId| find(&dl.added, a).filter(|_| !reborn(a));
         // 右: 区間の変わった (か作り直した) row の (旧区間, 新区間, 作り直したか)
-        let rows: BTreeSet<EntityId> = [dlo, dhi].iter().flat_map(|k| k.removed.iter().chain(k.added.iter()).map(|x| x.0)).collect();
         let reborn_r: BTreeSet<EntityId> = dlo.reentered.iter().chain(dhi.reentered.iter()).copied().collect();
-        let before: Vec<(EntityId, Option<(u64, u64)>)> = rows.iter().map(|&r| (r, self.iv(r))).collect();
-        for (k, map) in [(dlo, &mut self.lo_of), (dhi, &mut self.hi_of)] {
-            for (e, _) in &k.removed {
-                map.remove(e);
-            }
-            for &(e, v) in &k.added {
-                map.insert(e, v);
-            }
-        }
-        let changed: BTreeMap<EntityId, IvChange> = before
-            .into_iter()
-            .map(|(r, old)| (r, (old, self.iv(r), reborn_r.contains(&r))))
+        let changed: BTreeMap<EntityId, IvChange> = now
+            .iter()
+            .map(|&(r, lo, hi)| (r, (interval(key_before(dlo, r, lo), key_before(dhi, r, hi)), interval(lo, hi), reborn_r.contains(&r))))
             .filter(|(_, (old, new, re))| old != new || *re)
             .collect();
         // 1. 左の removed × 旧区間 (居続ける: 左が動いた先も、 右の今の区間に入る)
@@ -2703,11 +2700,26 @@ impl LiveJoin {
             JoinLive::Lag { part, order, state } => {
                 let dp = part.as_ref().map(|q| q.poll(&self.eng));
                 let dord = order.poll(&self.eng);
-                d = state.lock().unwrap_or_else(|p| p.into_inner()).apply(dp.as_ref(), &dord);
+                let mut rows: Vec<EntityId> =
+                    dp.iter().chain(std::iter::once(&dord)).flat_map(|k| k.removed.iter().chain(k.added.iter()).map(|x| x.0)).collect();
+                rows.sort_unstable();
+                rows.dedup();
+                let ps = match part {
+                    Some(q) => q.reported_keys(&rows),
+                    None => vec![Some(0); rows.len()],
+                };
+                let os = order.reported_keys(&rows);
+                let now: Vec<(EntityId, Option<u64>, Option<u64>)> = rows.iter().enumerate().map(|(i, &r)| (r, ps[i], os[i])).collect();
+                d = state.lock().unwrap_or_else(|p| p.into_inner()).apply(dp.as_ref(), &dord, &now);
             }
             JoinLive::Range { left, lo, hi, state } => {
                 let (dl, dlo, dhi) = (left.poll(&self.eng), lo.poll(&self.eng), hi.poll(&self.eng));
-                d = state.lock().unwrap_or_else(|p| p.into_inner()).apply(&dl, &dlo, &dhi);
+                let mut rows: Vec<EntityId> = [&dlo, &dhi].iter().flat_map(|k| k.removed.iter().chain(k.added.iter()).map(|x| x.0)).collect();
+                rows.sort_unstable();
+                rows.dedup();
+                let (los, his) = (lo.reported_keys(&rows), hi.reported_keys(&rows));
+                let now: Vec<(EntityId, Option<u64>, Option<u64>)> = rows.iter().enumerate().map(|(i, &r)| (r, los[i], his[i])).collect();
+                d = state.lock().unwrap_or_else(|p| p.into_inner()).apply(&dl, &dlo, &dhi, &now);
             }
         }
         // 並べない (順不同): batch で書いてから poll すると組は右の row ごとの run が入り組み、 並べるだけで
@@ -3419,8 +3431,6 @@ impl<'a> LagQuery<'a> {
 /// LAG の購読の状態。
 #[derive(Default)]
 struct LagState {
-    /// row → (group, 並びの値)。 group の無い LAG は group を 0 で持つ
-    vals: std::collections::BTreeMap<EntityId, (Option<u64>, Option<u64>)>,
     /// (group, 並びの値, row)
     seq: std::collections::BTreeSet<(u64, u64, EntityId)>,
     /// 最後に渡した 1 つ前の row
@@ -3442,56 +3452,32 @@ impl LagState {
 
     /// 差分を当てて組の差分を返す。 1 つ前が変わりうる row = 動いた row と、 動く前 / 後の位置の直後の row。
     /// それぞれの今の 1 つ前を渡し済みのものと比べる (作り直した row が組のどちらかに居れば、 同じでも出て入り直す)。
-    /// 動いた row の値は鍵付きの購読の差分 (eid の昇順) を二分探索で引き、 値の表は row ごとに 1 回だけ引く。
-    fn apply(&mut self, dp: Option<&enchudb_engine::KeyedDelta>, dord: &enchudb_engine::KeyedDelta) -> PairDelta {
+    /// 動いた row の値の後 = 鍵付きの購読が渡し済みの鍵 (`now` = 動いた row ごとの (group, 並び)、 row の昇順、 group の無い
+    /// LAG は group 0)、 前 = 差分の removed か、 動いていなければ後と同じ。
+    fn apply(
+        &mut self,
+        dp: Option<&enchudb_engine::KeyedDelta>,
+        dord: &enchudb_engine::KeyedDelta,
+        now: &[(EntityId, Option<u64>, Option<u64>)],
+    ) -> PairDelta {
         use std::collections::btree_map::Entry;
         let deltas: Vec<&enchudb_engine::KeyedDelta> = dp.into_iter().chain(std::iter::once(dord)).collect();
-        let mut moved: Vec<EntityId> = deltas.iter().flat_map(|k| k.removed.iter().chain(k.added.iter()).map(|x| x.0)).collect();
-        moved.sort_unstable();
-        moved.dedup();
+        let moved: Vec<EntityId> = now.iter().map(|x| x.0).collect();
         let mut reborn: Vec<EntityId> = deltas.iter().flat_map(|k| k.reentered.iter().copied()).collect();
         reborn.sort_unstable();
         let is_reborn = |e: EntityId| reborn.binary_search(&e).is_ok();
-        // 列の新しい値: added に居ればその値、 removed だけに居れば無し、 どちらにも居なければ元のまま
-        let step = |k: &enchudb_engine::KeyedDelta, e: EntityId, old: Option<u64>| -> Option<u64> {
-            match k.added.binary_search_by_key(&e, |x| x.0) {
-                Ok(i) => Some(k.added[i].1),
-                Err(_) if k.removed.binary_search_by_key(&e, |x| x.0).is_ok() => None,
-                Err(_) => old,
-            }
-        };
-        let pos = |e: EntityId, v: (Option<u64>, Option<u64>)| Some((v.0?, v.1?, e));
+        let pos = |e: EntityId, p: Option<u64>, o: Option<u64>| Some((p?, o?, e));
         // (row, 動く前の位置, 動いた後の位置)
-        let mut ups: Vec<(EntityId, Option<LagPos>, Option<LagPos>)> = Vec::with_capacity(moved.len());
-        for &e in &moved {
-            let next = |old: (Option<u64>, Option<u64>)| {
-                let p = match dp {
-                    Some(k) => step(k, e, old.0),
-                    None => Some(0),
+        let ups: Vec<(EntityId, Option<LagPos>, Option<LagPos>)> = now
+            .iter()
+            .map(|&(e, p, o)| {
+                let p0 = match dp {
+                    Some(k) => key_before(k, e, p),
+                    None => p,
                 };
-                (p, step(dord, e, old.1))
-            };
-            let (old, new) = match self.vals.entry(e) {
-                Entry::Occupied(mut o) => {
-                    let old = *o.get();
-                    let new = next(old);
-                    if new == (None, None) {
-                        o.remove();
-                    } else {
-                        *o.get_mut() = new;
-                    }
-                    (old, new)
-                }
-                Entry::Vacant(v) => {
-                    let new = next((None, None));
-                    if new != (None, None) {
-                        v.insert(new);
-                    }
-                    ((None, None), new)
-                }
-            };
-            ups.push((e, pos(e, old), pos(e, new)));
-        }
+                (e, pos(e, p0, key_before(dord, e, o)), pos(e, p, o))
+            })
+            .collect();
         // 1 つ前が変わりうる row と、 その今の位置 (動いた row は動いた後の位置で上書きする)
         let mut touched: Vec<(EntityId, Option<LagPos>)> = Vec::new();
         for &(_, old, _) in &ups {
@@ -3589,18 +3575,32 @@ impl<'a> UnderQuery<'a> {
         let Some((f, sd, a, via)) = self.plan()? else { return Ok(Vec::new()) };
         let peer = eng.peer_id();
         let local = |e: EntityId| enchudb_oplog::eid_local(e);
+        let col_parent = |x: u32| eng.get_by_id(enchudb_oplog::make_eid(peer, x), via).map(|p| p as u32);
+        let refs = HierRef { parent: &col_parent };
+        let mut memo = Some(std::collections::BTreeMap::new());
         let mut h = Hier::new(up);
-        for e in eng.find_by(a).map_err(io)? {
-            if let Some(p) = eng.get_by_id(e, via) {
-                h.link(local(e), p as u32, &mut Default::default());
+        if let Hier::Up(ab) = &mut h {
+            // 上向きは子から数を積むので、 親の表を組み立てる (下向きは親を engine から読む)
+            for e in eng.find_by(a).map_err(io)? {
+                if let Some(p) = eng.get_by_id(e, via) {
+                    ab.parent.insert(local(e), p as u32);
+                }
+            }
+            ab.seed.extend(eng.find_by(sd).map_err(io)?.into_iter().map(local));
+            ab.rebuild();
+        } else {
+            let mut touched = Vec::new();
+            for e in eng.find_by(sd).map_err(io)? {
+                h.set_seed(local(e), true, &mut touched);
             }
         }
-        let mut touched = Vec::new();
-        for e in eng.find_by(sd).map_err(io)? {
-            h.set_seed(local(e), true, &mut touched);
-        }
-        let mut out: Vec<EntityId> =
-            eng.find_by(f).map_err(io)?.into_iter().filter(|&e| h.find_answer(local(e))).map(|e| enchudb_oplog::make_eid(peer, local(e))).collect();
+        let mut out: Vec<EntityId> = eng
+            .find_by(f)
+            .map_err(io)?
+            .into_iter()
+            .filter(|&e| h.find_answer(local(e), &refs, &mut memo))
+            .map(|e| enchudb_oplog::make_eid(peer, local(e)))
+            .collect();
         out.sort_unstable();
         Ok(out)
     }
@@ -3612,7 +3612,7 @@ impl<'a> UnderQuery<'a> {
 
     /// 配下 (または上) の row の出入りを購読する。 初回 poll は登録時点の全部が `added`。 親の付け替え (異動・部署の移動)、
     /// seed の出入り、 この query の条件の変化で届く。 下向きは、 付け替えで配下の答えが変わらない row の下は見に行かない。
-    /// 上向きは、 付け替え 1 回・seed の出入り 1 回が階層の深さに比例。
+    /// 上向きは、 seed の出入り・葉の付け替えが答えの変わる row の数に比例 (深さによらない)、 子の居る row の付け替えは深さに比例。
     pub fn subscribe(self) -> Result<LiveUnder, SchemaError> {
         let eng = self.rows.db.arc_engine();
         let io = |e: std::io::Error| SchemaError::BadValue(e.to_string());
@@ -3628,151 +3628,270 @@ impl<'a> UnderQuery<'a> {
     }
 }
 
-/// 階層 (子 → 親) と seed、 配下の答え。 row は local eid。
+/// 階層の親を引く。 購読では、 親の ref の鍵付きの購読が渡し済みの鍵 (= 当てた差分の状態) から引く。 engine の列を
+/// 直読みすると poll より後の書き込みが見え、 書いて戻した (x → y → x) row は差分が出ないので、 途中の y を通って決めた
+/// 答えが直らない (並行テストで 20 回に 3 回、 書き終わった後も結果に余分な row が残った)。 find は列を直読みする。
+///
+/// 子は引かない: ref 列の値で引くと、 その列の Cylinder が無ければ全 row で組まれ (#270 の lazy build)、 以後その列の
+/// 書き込みごとに維持される (試した版: 社員 100 万で RSS +45 MB、 1 万件まとめ -4%)。 子は当てた差分から持つ。
+struct HierRef<'e> {
+    parent: &'e dyn Fn(u32) -> Option<u32>,
+}
+
+impl HierRef<'_> {
+    fn parent(&self, x: u32) -> Option<u32> {
+        (self.parent)(x)
+    }
+}
+
+/// 下向きの seed と配下の答え。 row は local eid。 親は持たず鍵付きの購読から引く ([`HierRef`])、 子は当てた差分から持つ。
 #[derive(Default)]
 struct Tree {
-    parent: std::collections::BTreeMap<u32, u32>,
-    children: std::collections::BTreeSet<(u32, u32)>,
-    seed: std::collections::BTreeSet<u32>,
+    /// (親, 子)
+    children: Adj<u32>,
+    seed: RowSet,
     /// 配下である row (答えが真)。
-    under: std::collections::BTreeSet<u32>,
+    under: RowSet,
 }
 
 impl Tree {
-    fn set_parent(&mut self, c: u32, p: Option<u32>) {
-        if let Some(old) = self.parent.remove(&c) {
-            self.children.remove(&(old, c));
+    /// r の答え (親をたどって seed に着くか) を、 この poll で既に決めた答え (`memo`) を使って決める。 たどった道の row の
+    /// 答えも `memo` に残す — 根が多い poll (最初の poll は全 row が根) でも、 どの row も 1 回しかたどらない (row ごとに
+    /// 上までたどると row 数 × 深さ: 深さ 10 万の一本道で最初の poll が返らなかった)。 輪 (seed を含まない) の row は偽。
+    fn resolve(&self, r: u32, h: &HierRef, memo: &mut Option<std::collections::BTreeMap<u32, bool>>) -> bool {
+        if let Some(&a) = memo.as_ref().and_then(|m| m.get(&r)) {
+            return a;
         }
-        if let Some(p) = p {
-            self.parent.insert(c, p);
-            self.children.insert((p, c));
-        }
-    }
-
-    /// 親をたどって seed に着くか (根 / 輪に着いたら偽)。 階層の深さに比例。
-    fn walk(&self, r: u32) -> bool {
+        let mut path = vec![r];
+        // 輪の検出: 浅いうちは道を線形に見る、 深くなったら集合に
+        let mut on_path: Option<std::collections::BTreeSet<u32>> = None;
         let mut cur = r;
-        let mut seen = std::collections::BTreeSet::new();
-        while let Some(&p) = self.parent.get(&cur) {
-            if self.seed.contains(&p) {
-                return true;
+        // 道の一番上 (cur) の答え
+        let top = loop {
+            match h.parent(cur) {
+                None => break false,
+                Some(p) if self.seed.contains(p) => break true,
+                Some(p) => {
+                    if let Some(&a) = memo.as_ref().and_then(|m| m.get(&p)) {
+                        break a;
+                    }
+                    let again = match on_path.as_mut() {
+                        Some(set) => !set.insert(p),
+                        None if path.len() < 32 => path.contains(&p),
+                        None => {
+                            let mut set: std::collections::BTreeSet<u32> = path.iter().copied().collect();
+                            let again = !set.insert(p);
+                            on_path = Some(set);
+                            again
+                        }
+                    };
+                    if again {
+                        // 輪 (道の上に seed が無い): 輪の row も、 輪に入る道の row も偽
+                        break false;
+                    }
+                    path.push(p);
+                    cur = p;
+                }
             }
-            if p == r || !seen.insert(p) {
-                return false;
+        };
+        // 道の row の親は seed でない (seed に着いたら止まる) ので、 道の row は全部 top と同じ答え
+        if let Some(m) = memo.as_mut() {
+            for x in path {
+                m.insert(x, top);
             }
-            cur = p;
         }
-        false
+        top
     }
 
     /// `roots` の答えを親をたどって決め直し、 答えが変わった row の子へ下向きに伝える (子の答え = 親が seed か配下か)。
     /// 答えが変わった row を返す。
-    fn settle(&mut self, roots: impl IntoIterator<Item = u32>) -> Vec<u32> {
+    fn settle(&mut self, roots: impl IntoIterator<Item = u32>, h: &HierRef) -> Vec<u32> {
         let mut changed = Vec::new();
         let mut queue = std::collections::VecDeque::new();
-        for r in roots {
-            let now = self.walk(r);
-            if now != self.under.contains(&r) {
-                if now { self.under.insert(r) } else { self.under.remove(&r) };
+        // 葉 (子の無い row) の根は輪に入れない (自分の下に何も無い) ので、 答え = 親が seed か配下か を 1 回見るだけ。
+        // 親の答えは、 葉でない根を決め直して下へ伝えた後なら最新 (親の上の変化は全部葉でない根か seed の出入りの子)
+        let (leaves, inner): (Vec<u32>, Vec<u32>) = roots.into_iter().partition(|&r| self.children.get(r).is_empty());
+        // 道の途中の row の答えは、 その上の根を決め直して下へ伝えれば揃うので、 比べるのは根だけ。 覚えるのは根が 2 つ以上の時だけ
+        let mut memo = (inner.len() > 1).then(std::collections::BTreeMap::new);
+        for r in inner {
+            let now = self.resolve(r, h, &mut memo);
+            if now != self.under.contains(r) {
+                if now { self.under.insert(r) } else { self.under.remove(r) };
                 changed.push(r);
                 queue.push_back(r);
             }
         }
         while let Some(x) = queue.pop_front() {
-            let v = self.seed.contains(&x) || self.under.contains(&x);
-            let kids: Vec<u32> = self.children.range((x, 0)..=(x, u32::MAX)).map(|k| k.1).collect();
+            let v = self.seed.contains(x) || self.under.contains(x);
+            let kids: Vec<u32> = self.children.get(x).to_vec();
             for c in kids {
-                if v != self.under.contains(&c) {
-                    if v { self.under.insert(c) } else { self.under.remove(&c) };
+                if v != self.under.contains(c) {
+                    if v { self.under.insert(c) } else { self.under.remove(c) };
                     changed.push(c);
                     queue.push_back(c);
                 }
+            }
+        }
+        for r in leaves {
+            let now = h.parent(r).is_some_and(|p| self.seed.contains(p) || self.under.contains(p));
+            if now != self.under.contains(r) {
+                if now { self.under.insert(r) } else { self.under.remove(r) };
+                changed.push(r);
             }
         }
         changed
     }
 }
 
-/// 上向き (seed の上司全員) の状態。 row x の `sub[x]` = x 自身か x の下 (何段下でも) に居る seed の数。 輪の上の row は、
-/// 輪につながる全員 (輪と、 輪にぶら下がる木) の seed の数。 x が答え ⇔ `sub[x]` が x 自身の seed を除いて 1 以上。
+/// 上向き (seed の上司全員) の状態。 x の答え = x の下 (何段下でも) に seed が居る。 row ごとに 「子のうち、 seed か答えが
+/// 真の子の数」 (`cnt`) を持ち、 答え = `cnt` が 1 以上。 子の真偽が変わったら親の `cnt` を動かし、 親の答えが変わった時
+/// だけ更に上へ伝える (伝わるのは答えが変わる row の数だけ、 深さによらない)。
 ///
-/// 付け替えは 「切る」 と 「つなぐ」 に分ける。 切る時は旧い親から上へ `sub[c]` を引き、 つなぐ時は新しい親から上へ足す
-/// (上へは輪を 1 周したら止まる)。 輪の上の row は 「自分と、 自分にぶら下がる木の seed の数」 (`own`) も持つ。 輪の上の
-/// row を切ると輪が c を根とする鎖にほどけるので、 鎖の `sub` を `own` から数え直す。 つないで輪ができたら (新しい親が
-/// c の下に居る)、 輪の row の `own` は道の隣どうしの `sub` の差、 `sub` は c の木の seed の数。 子の一覧は持たない。
+/// 数で持つと輪が自分を支える (輪の row どうしが数え合って、 seed が居なくなっても真のまま)。 真の row の居る輪は覚えておき、
+/// 輪の row の `cnt` には輪の外の子だけを数え、 輪ごとに 「輪の row の `cnt` と輪の上の seed の和」 (`cyc_sum`) を持つ。 輪の
+/// row は輪につながる全員の上なので、 答え = `cyc_sum` が自分の seed を除いて 1 以上。 輪の row の親は輪の row なので、 輪から
+/// 上へは伝わらない。 seed につながらない輪は覚えなくてよい (全員 0 で、 数え合う数が無い)。
+///
+/// 輪が真になるのは (1) 伝える途中で、 この回に真にした row (か伝え始めた row) に戻った時、 (2) 下に seed の居る row を
+/// 自分の下へ付け替えた時 (新しい親の側は既に真なので、 伝えるのが途中で止まる)。 (1) は伝える道で見つかり、 (2) だけ新しい
+/// 親から上へたどる (深さに比例)。 下に seed の居ない row の付け替え (ほとんど) は親の表を 1 回書くだけ。
 #[derive(Default)]
 struct Above {
-    parent: std::collections::BTreeMap<u32, u32>,
+    parent: RowMap,
     seed: std::collections::BTreeSet<u32>,
-    sub: std::collections::BTreeMap<u32, u64>,
-    /// 輪の上の row の own (0 は持たない)。
-    own: std::collections::BTreeMap<u32, u64>,
+    /// 子 (輪の row は輪の外の子) のうち seed か答えが真の数 (0 は持たない)。
+    cnt: RowMap,
+    /// 覚えている輪の row → 輪の番号。
+    cyc_of: std::collections::BTreeMap<u32, u32>,
+    /// 輪の番号 → 輪の row の `cnt` と輪の上の seed の和。
+    cyc_sum: std::collections::BTreeMap<u32, u64>,
+    next_cyc: u32,
+}
+
+/// たどった row の列と、 それに居るかの判定 (浅いうちは列を線形に見る、 長くなったら集合に)。
+struct Trail {
+    rows: Vec<u32>,
+    set: Option<std::collections::BTreeSet<u32>>,
+}
+
+impl Trail {
+    fn new(x: u32) -> Trail {
+        Trail { rows: vec![x], set: None }
+    }
+
+    fn contains(&self, x: u32) -> bool {
+        match &self.set {
+            Some(s) => s.contains(&x),
+            None => self.rows.contains(&x),
+        }
+    }
+
+    fn push(&mut self, x: u32) {
+        self.rows.push(x);
+        match self.set.as_mut() {
+            Some(s) => {
+                s.insert(x);
+            }
+            None if self.rows.len() > 32 => self.set = Some(self.rows.iter().copied().collect()),
+            None => {}
+        }
+    }
 }
 
 impl Above {
-    fn sub(&self, x: u32) -> u64 {
-        self.sub.get(&x).copied().unwrap_or(0)
+    fn cnt(&self, x: u32) -> u64 {
+        self.cnt.get(x).map_or(0, u64::from)
     }
 
-    fn put(&mut self, x: u32, v: u64, touched: &mut Vec<u32>) {
-        use std::collections::btree_map::Entry;
-        match self.sub.entry(x) {
-            Entry::Occupied(mut o) if *o.get() != v => {
-                touched.push(x);
-                if v == 0 {
-                    o.remove();
-                } else {
-                    o.insert(v);
-                }
-            }
-            Entry::Vacant(o) if v != 0 => {
-                touched.push(x);
-                o.insert(v);
-            }
-            _ => {}
+    fn answer(&self, x: u32) -> bool {
+        match self.cyc_of.get(&x) {
+            Some(id) => self.cyc_sum[id] > u64::from(self.seed.contains(&x)),
+            None => self.cnt(x) > 0,
         }
     }
 
-    /// x と、 x から親をたどった row (輪を 1 周したら止まる)。 輪に着いたら、 輪に入った row も返す。
-    fn up_from(&self, x: u32) -> (Vec<u32>, Option<u32>) {
+    /// 親へ見せる真偽 (輪の外の row だけ)。
+    fn hot(&self, x: u32) -> bool {
+        self.seed.contains(&x) || self.cnt(x) > 0
+    }
+
+    fn add_cnt(&mut self, x: u32, add: bool) -> (u64, u64) {
+        let old = self.cnt(x);
+        let new = if add { old + 1 } else { old - 1 };
+        if new == 0 { self.cnt.remove(x) } else { self.cnt.insert(x, u32::try_from(new).expect("子の数")) };
+        (old, new)
+    }
+
+    /// 輪の row (x から親をたどって x に戻るまで)。
+    fn cycle(&self, x: u32) -> Vec<u32> {
         let mut out = vec![x];
-        // 輪の検出: 浅いうちは道を線形に見る (階層は普通浅い)、 深くなったら集合に
-        let mut seen: Option<std::collections::BTreeSet<u32>> = None;
-        let mut cur = x;
-        while let Some(&p) = self.parent.get(&cur) {
-            let again = match seen.as_mut() {
-                Some(set) => !set.insert(p),
-                None if out.len() < 32 => out.contains(&p),
-                None => {
-                    let mut set: std::collections::BTreeSet<u32> = out.iter().copied().collect();
-                    let again = !set.insert(p);
-                    seen = Some(set);
-                    again
-                }
-            };
-            if again {
-                return (out, Some(p));
-            }
-            out.push(p);
-            cur = p;
+        let mut cur = self.parent.get(x).expect("輪の row の親");
+        while cur != x {
+            out.push(cur);
+            cur = self.parent.get(cur).expect("輪の row の親");
         }
-        (out, None)
+        out
     }
 
-    /// x から上の全員に ±k。
-    fn shift(&mut self, x: u32, k: u64, add: bool, touched: &mut Vec<u32>) {
-        if k == 0 {
-            return;
+    /// 輪の和を ±1。 和が 0 / 1 をまたぐと輪の row の答えが変わりうる (1 は、 seed がその row 自身だけの時)。
+    fn add_cyc(&mut self, x: u32, id: u32, add: bool, touched: &mut Vec<u32>) {
+        let s = self.cyc_sum.get_mut(&id).expect("輪の和");
+        let old = *s;
+        *s = if add { old + 1 } else { old - 1 };
+        if old.min(*s) <= 1 {
+            touched.extend(self.cycle(x));
         }
-        let (path, entry) = self.up_from(x);
-        for y in path {
-            let v = if add { self.sub(y) + k } else { self.sub(y) - k };
-            self.put(y, v, touched);
+    }
+
+    /// 輪 (`rows` の順に、 各 row の親が次の row、 最後の row の親が最初の row) を覚える。 各 row の `cnt` は輪の上の子
+    /// (1 つ前の row) の分を含まないこと。
+    fn remember(&mut self, rows: &[u32], touched: &mut Vec<u32>) {
+        let id = self.next_cyc;
+        self.next_cyc += 1;
+        let mut sum = 0;
+        for &y in rows {
+            sum += self.cnt(y) + u64::from(self.seed.contains(&y));
+            self.cyc_of.insert(y, id);
         }
-        if let Some(r) = entry {
-            let o = self.own.get(&r).copied().unwrap_or(0);
-            let o = if add { o + k } else { o - k };
-            if o == 0 { self.own.remove(&r) } else { self.own.insert(r, o) };
+        self.cyc_sum.insert(id, sum);
+        touched.extend_from_slice(rows);
+    }
+
+    /// x0 の親へ見せる真偽が変わった: 親の `cnt` を ±1 して、 答えが変わったら上へ伝える。 足す時、 この回に真にした row
+    /// (か x0) に戻ったら輪: 戻った所から先の row が輪で、 輪の上の子の分を引いて覚える。 引く時は輪に入らない (真の row の
+    /// 居る輪は覚えてある)。
+    fn bump(&mut self, x0: u32, add: bool, touched: &mut Vec<u32>) {
+        let Some(p) = self.parent.get(x0) else { return };
+        let mut trail = Trail::new(x0);
+        let mut x = p;
+        loop {
+            if let Some(&id) = self.cyc_of.get(&x) {
+                self.add_cnt(x, add);
+                self.add_cyc(x, id, add, touched);
+                return;
+            }
+            if add && trail.contains(x) {
+                let at = trail.rows.iter().position(|&y| y == x).expect("たどった row");
+                let rows = trail.rows.split_off(at);
+                for &y in &rows[1..] {
+                    self.add_cnt(y, false);
+                }
+                self.remember(&rows, touched);
+                return;
+            }
+            let (old, new) = self.add_cnt(x, add);
+            if (old > 0) == (new > 0) {
+                return;
+            }
+            touched.push(x);
+            if self.seed.contains(&x) {
+                return;
+            }
+            trail.push(x);
+            match self.parent.get(x) {
+                Some(p) => x = p,
+                None => return,
+            }
         }
     }
 
@@ -3782,49 +3901,89 @@ impl Above {
         }
         if on { self.seed.insert(s) } else { self.seed.remove(&s) };
         touched.push(s);
-        self.shift(s, 1, on, touched);
+        if let Some(&id) = self.cyc_of.get(&s) {
+            self.add_cyc(s, id, on, touched);
+        } else if self.cnt(s) == 0 {
+            self.bump(s, on, touched);
+        }
     }
 
+    /// c を親から外す。 c が覚えた輪の上なら、 輪が c を根とする鎖にほどける。
     fn cut(&mut self, c: u32, touched: &mut Vec<u32>) {
-        let Some(p) = self.parent.remove(&c) else { return };
-        let k = self.sub(c);
-        if k == 0 {
-            // c の下にも (輪なら、 つながる全員にも) seed が居ない: 誰の数も変わらない
+        let Some(id) = self.cyc_of.remove(&c) else {
+            if self.hot(c) {
+                self.bump(c, false, touched);
+            }
+            self.parent.remove(c);
             return;
+        };
+        let p = self.parent.remove(c).expect("輪の row の親");
+        self.cyc_sum.remove(&id);
+        // 鎖は p (一番下) から c まで。 下から数え直す
+        let mut chain = vec![p];
+        let mut cur = p;
+        while cur != c {
+            cur = self.parent.get(cur).expect("輪の row の親");
+            chain.push(cur);
         }
-        let (path, _) = self.up_from(p);
-        if path.last() != Some(&c) {
-            self.shift(p, k, false, touched);
-            return;
-        }
-        // c は輪の上だった: 輪 (p → … → c) が c を根とする鎖にほどける。 p が一番下
-        let mut acc = 0;
-        for y in path {
-            acc += self.own.remove(&y).unwrap_or(0);
-            self.put(y, acc, touched);
+        let mut below = false;
+        for y in chain {
+            self.cyc_of.remove(&y);
+            if below {
+                self.add_cnt(y, true);
+            }
+            below = self.hot(y);
+            touched.push(y);
         }
     }
 
-    /// c の親を `to` にする。 下に seed の居ない row (ほとんど) は親の表を 1 回引くだけ。
-    fn reparent(&mut self, c: u32, to: Option<u32>, touched: &mut Vec<u32>) {
-        use std::collections::btree_map::Entry;
-        if self.sub(c) == 0 {
-            // c の下にも (輪なら、 つながる全員にも) seed が居ない: 誰の数も変わらない。 輪ができても c の木なので 0 のまま
-            match (self.parent.entry(c), to) {
-                (Entry::Occupied(mut o), Some(q)) => {
-                    o.insert(q);
-                }
-                (Entry::Occupied(o), None) => {
-                    o.remove();
-                }
-                (Entry::Vacant(v), Some(q)) => {
-                    v.insert(q);
-                }
-                (Entry::Vacant(_), None) => {}
-            }
+    /// 根 c を q の子にする。
+    fn link(&mut self, c: u32, q: u32, touched: &mut Vec<u32>) {
+        self.parent.insert(c, q);
+        if !self.hot(c) {
+            // 輪ができても seed につながらない (c の木に seed が居ない)
             return;
         }
-        if self.parent.get(&c).copied() == to {
+        if self.cnt(c) > 0 {
+            // c の下に seed が居る: q が c の下なら、 q の側は既に真で伝えるのが c まで届かないので、 たどって確かめる。
+            // 道の途中で (覚えていない、 seed につながらない) 輪に入ったら c には着かない
+            let mut trail = Trail::new(q);
+            let mut cur = q;
+            while cur != c && !self.cyc_of.contains_key(&cur) {
+                match self.parent.get(cur) {
+                    Some(p) if !trail.contains(p) => {
+                        trail.push(p);
+                        cur = p;
+                    }
+                    _ => break,
+                }
+            }
+            if cur == c {
+                // 輪 (q → … → c → q): 輪の row の cnt から輪の上の子 (道の 1 つ下) の分を引く
+                let rows = trail.rows;
+                let hots: Vec<bool> = rows.iter().map(|&y| self.hot(y)).collect();
+                for i in 1..rows.len() {
+                    if hots[i - 1] {
+                        self.add_cnt(rows[i], false);
+                    }
+                }
+                self.remember(&rows, touched);
+                return;
+            }
+        }
+        self.bump(c, true, touched);
+    }
+
+    /// c の親を `to` にする。 下に seed の居ない輪の外の row (ほとんど) は親の表を 1 回書くだけ。
+    fn reparent(&mut self, c: u32, to: Option<u32>, touched: &mut Vec<u32>) {
+        if !self.hot(c) && !self.cyc_of.contains_key(&c) {
+            match to {
+                Some(q) => self.parent.insert(c, q),
+                None => self.parent.remove(c),
+            };
+            return;
+        }
+        if self.parent.get(c) == to {
             return;
         }
         self.cut(c, touched);
@@ -3833,31 +3992,20 @@ impl Above {
         }
     }
 
-    /// 根 c を q の子にする。
-    fn link(&mut self, c: u32, q: u32, touched: &mut Vec<u32>) {
-        let k = self.sub(c);
-        let (path, _) = if k == 0 { (Vec::new(), None) } else { self.up_from(q) };
-        self.parent.insert(c, q);
-        if k == 0 {
-            // 足す seed が無い (輪ができても、 つながる全員が c の木なので 0 のまま)
-            return;
+    /// 親の表と seed から全部組み直す (最初の poll / find / 大きい batch)。 seed を 1 つずつ足す (どの row も 0 → 1 は 1 回
+    /// なので全体で row の数に比例)。 答えが真だった row と真になった row を返す。
+    fn rebuild(&mut self) -> Vec<u32> {
+        let mut touched: Vec<u32> = self.cnt.keys().chain(self.cyc_of.keys().copied()).filter(|&x| self.answer(x)).collect();
+        let seeds = std::mem::take(&mut self.seed);
+        self.cnt.clear();
+        self.cyc_of.clear();
+        self.cyc_sum.clear();
+        let mut scratch = Vec::new();
+        for s in seeds {
+            self.set_seed(s, true, &mut scratch);
         }
-        if path.last() != Some(&c) {
-            self.shift(q, k, true, touched);
-            return;
-        }
-        // 輪ができた (q → … → c → q): 輪の row の own は道の隣どうしの sub の差、 sub は c の木 (= つながる全員) の seed の数
-        let mut below = 0;
-        for &y in &path {
-            let s = self.sub(y);
-            if s > below {
-                self.own.insert(y, s - below);
-            }
-            below = s;
-        }
-        for &y in &path {
-            self.put(y, k, touched);
-        }
+        touched.extend(self.cnt.keys().chain(self.cyc_of.keys().copied()).filter(|&x| self.answer(x)));
+        touched
     }
 }
 
@@ -3872,41 +4020,33 @@ impl Hier {
         if up { Hier::Up(Above::default()) } else { Hier::Down(Tree::default()) }
     }
 
-    /// 根 c の親を p にする (find の組み立て用)。
-    fn link(&mut self, c: u32, p: u32, touched: &mut Vec<u32>) {
-        match self {
-            Hier::Down(t) => t.set_parent(c, Some(p)),
-            Hier::Up(a) => a.link(c, p, touched),
-        }
-    }
-
     fn set_seed(&mut self, s: u32, on: bool, touched: &mut Vec<u32>) {
         match self {
             Hier::Down(t) => {
-                if on { t.seed.insert(s) } else { t.seed.remove(&s) };
+                if on { t.seed.insert(s) } else { t.seed.remove(s) };
             }
             Hier::Up(a) => a.set_seed(s, on, touched),
         }
     }
 
-    /// find 用の答え (下向きは親をたどる)。
-    fn find_answer(&self, x: u32) -> bool {
+    /// find 用の答え (下向きは親をたどる、 `memo` = たどって決めた答え)。
+    fn find_answer(&self, x: u32, h: &HierRef, memo: &mut Option<std::collections::BTreeMap<u32, bool>>) -> bool {
         match self {
-            Hier::Down(t) => t.walk(x),
-            Hier::Up(a) => a.sub(x) > u64::from(a.seed.contains(&x)),
+            Hier::Down(t) => t.resolve(x, h, memo),
+            Hier::Up(a) => a.answer(x),
         }
     }
 
     /// 購読で持っている答え。
     fn answer(&self, x: u32) -> bool {
         match self {
-            Hier::Down(t) => t.under.contains(&x),
-            Hier::Up(a) => a.sub(x) > u64::from(a.seed.contains(&x)),
+            Hier::Down(t) => t.under.contains(x),
+            Hier::Up(a) => a.answer(x),
         }
     }
 
     /// 親の付け替えと seed の出入りを当てて、 答えが変わりうる row を返す。
-    fn apply(&mut self, dp: &enchudb_engine::KeyedDelta, ds: &LiveDelta) -> Vec<u32> {
+    fn apply(&mut self, dp: &enchudb_engine::KeyedDelta, ds: &LiveDelta, h: &HierRef) -> Vec<u32> {
         use std::collections::BTreeSet;
         let local = |e: EntityId| enchudb_oplog::eid_local(e);
         // 外れた ref (付け替えは added で上書き)
@@ -3917,26 +4057,45 @@ impl Hier {
             Hier::Down(tree) => {
                 // 答えを決め直す row: 親が変わった row と、 seed の出入りした row の子
                 let mut roots: BTreeSet<u32> = dp.removed.iter().chain(dp.added.iter()).map(|(e, _)| local(*e)).collect();
-                for &c in &cut {
-                    tree.set_parent(c, None);
+                for &(e, p) in &dp.removed {
+                    tree.children.remove(p as u32, local(e));
                 }
                 for &(e, p) in &dp.added {
-                    tree.set_parent(local(e), Some(p as u32));
+                    tree.children.insert(p as u32, local(e));
                 }
                 for &e in &ds.removed {
-                    tree.seed.remove(&local(e));
+                    tree.seed.remove(local(e));
                 }
                 for &e in &ds.added {
                     tree.seed.insert(local(e));
                 }
                 for &e in ds.removed.iter().chain(ds.added.iter()) {
                     let x = local(e);
-                    roots.extend(tree.children.range((x, 0)..=(x, u32::MAX)).map(|k| k.1));
+                    roots.extend(tree.children.get(x).iter().copied());
                 }
-                tree.settle(roots)
+                tree.settle(roots, h)
             }
             Hier::Up(a) => {
                 let mut touched = Vec::new();
+                // 付け替えが多い (最初の poll は全 row) 時は組み直す: 子の居る row の付け替えは 1 回ずつだと深さに比例
+                if (cut.len() + dp.added.len()) * 8 > a.parent.len() {
+                    for &c in &cut {
+                        a.parent.remove(c);
+                    }
+                    for &(e, p) in &dp.added {
+                        a.parent.insert(local(e), p as u32);
+                    }
+                    for &e in &ds.removed {
+                        a.seed.remove(&local(e));
+                        touched.push(local(e));
+                    }
+                    for &e in &ds.added {
+                        a.seed.insert(local(e));
+                        touched.push(local(e));
+                    }
+                    touched.extend(a.rebuild());
+                    return touched;
+                }
                 for &c in &cut {
                     a.reparent(c, None, &mut touched);
                 }
@@ -3959,9 +4118,9 @@ impl Hier {
 struct UnderState {
     hier: Hier,
     /// この query の条件を満たす row。
-    filt: std::collections::BTreeSet<u32>,
+    filt: RowSet,
     /// 最後に渡した row。
-    reported: std::collections::BTreeSet<u32>,
+    reported: RowSet,
 }
 
 /// [`UnderQuery::subscribe`] の戻り値。 階層の配下 (または上) の row の出入りを購読する。
@@ -3986,9 +4145,12 @@ impl LiveUnder {
         let mut reborn: BTreeSet<u32> = dp.reentered.iter().map(|&e| local(e)).collect();
         let rs: BTreeSet<EntityId> = df.removed.iter().copied().collect();
         reborn.extend(df.added.iter().filter(|e| rs.contains(e)).map(|&e| local(e)));
-        let mut touched = hier.apply(&dp, &ds);
+        let mut touched = parents.with_reported(|get| {
+            let parent = |x: u32| get(enchudb_oplog::make_eid(peer, x)).map(|p| p as u32);
+            hier.apply(&dp, &ds, &HierRef { parent: &parent })
+        });
         for &e in &df.removed {
-            filt.remove(&local(e));
+            filt.remove(local(e));
             touched.push(local(e));
         }
         for &e in &df.added {
@@ -4000,8 +4162,8 @@ impl LiveUnder {
         touched.dedup();
         let mut d = LiveDelta::default();
         for x in touched {
-            let now = hier.answer(x) && filt.contains(&x);
-            let was = reported.contains(&x);
+            let now = hier.answer(x) && filt.contains(x);
+            let was = reported.contains(x);
             let e = enchudb_oplog::make_eid(peer, x);
             match (was, now) {
                 (false, true) => {
@@ -4009,7 +4171,7 @@ impl LiveUnder {
                     d.added.push(e);
                 }
                 (true, false) => {
-                    reported.remove(&x);
+                    reported.remove(x);
                     d.removed.push(e);
                 }
                 (true, true) if reborn.contains(&x) => {
@@ -4127,58 +4289,254 @@ impl<'a> ReachQuery<'a> {
 /// 外して探し直す: 元の支え → 入ってくる辺の始点の順に、 seed に着く支えを探す (付け替えた辺の新しい始点も候補、
 /// 見つかればその先は見ない)。 見つからない row は外し、 その row が支えていた row も探し直す。 最後に、 外した
 /// row のうち届く支えを持つもの・足した辺の先・入った seed の先から幅優先に広げる。
+///
+/// 支えられている row の一覧は持たない: 支えは辺の始点なので、 x が支える row = x から出る辺の先で支えが x のもの。
 #[derive(Default)]
 struct Graph {
-    out: std::collections::BTreeSet<(u32, u32, u32)>,
-    inn: std::collections::BTreeSet<(u32, u32, u32)>,
+    /// 始点 → (終点, 辺の row)
+    out: Adj,
+    /// 終点 → (始点, 辺の row)
+    inn: Adj,
     seed: std::collections::BTreeSet<u32>,
     /// 届く row → 支え
-    sup: std::collections::BTreeMap<u32, u32>,
-    /// (支え, 支えられている row)
-    kids: std::collections::BTreeSet<(u32, u32)>,
+    sup: RowMap,
 }
 
-impl Graph {
-    fn outs(&self, x: u32) -> impl Iterator<Item = u32> + '_ {
-        self.out.range((x, 0, 0)..=(x, u32::MAX, u32::MAX)).map(|t| t.1)
+/// local eid → u32 の表。 4096 row ずつのページで、 触ったページだけ持つ。 到達の支えは 1 回の poll で 10 万 row 規模を
+/// 書き換え、 BTreeMap の出し入れがプロファイルの上位だった (row は table の範囲の local eid なので、 ページは詰まる)。
+#[derive(Default)]
+struct RowMap {
+    pages: Vec<Option<Box<[u32]>>>,
+    len: usize,
+}
+
+impl RowMap {
+    /// 値の無い印。
+    const NONE: u32 = u32::MAX;
+    const BITS: u32 = 12;
+
+    fn slot(x: u32) -> (usize, usize) {
+        ((x >> Self::BITS) as usize, (x & ((1 << Self::BITS) - 1)) as usize)
     }
 
-    fn ins(&self, x: u32) -> impl Iterator<Item = u32> + '_ {
-        self.inn.range((x, 0, 0)..=(x, u32::MAX, u32::MAX)).map(|t| t.1)
+    fn get(&self, x: u32) -> Option<u32> {
+        let (p, i) = Self::slot(x);
+        let v = self.pages.get(p)?.as_ref()?[i];
+        (v != Self::NONE).then_some(v)
     }
 
-    fn reached(&self, x: u32) -> bool {
-        self.sup.contains_key(&x)
+    fn contains(&self, x: u32) -> bool {
+        self.get(x).is_some()
     }
 
-    /// w から辺を出して届かせられるか (seed か、 届く row)。
-    fn source(&self, w: u32) -> bool {
-        self.seed.contains(&w) || self.sup.contains_key(&w)
+    fn insert(&mut self, x: u32, v: u32) -> Option<u32> {
+        debug_assert!(v != Self::NONE);
+        let (p, i) = Self::slot(x);
+        if self.pages.len() <= p {
+            self.pages.resize_with(p + 1, || None);
+        }
+        let page = self.pages[p].get_or_insert_with(|| vec![Self::NONE; 1 << Self::BITS].into_boxed_slice());
+        let old = std::mem::replace(&mut page[i], v);
+        if old == Self::NONE {
+            self.len += 1;
+            None
+        } else {
+            Some(old)
+        }
     }
 
-    /// w が支えになれるか: w から支えをたどって seed に着く。 支えを探している row (支えを外してある) を通る鎖は着かない
-    /// ので、 探している row 自身を通る鎖 (輪) も着かない。 鎖は輪にならないので必ず止まる。
-    fn chain_ok(&self, mut w: u32) -> bool {
-        loop {
-            if self.seed.contains(&w) {
-                return true;
-            }
-            match self.sup.get(&w) {
-                Some(&p) => w = p,
-                None => return false,
+    fn remove(&mut self, x: u32) -> Option<u32> {
+        let (p, i) = Self::slot(x);
+        let page = self.pages.get_mut(p)?.as_mut()?;
+        let old = std::mem::replace(&mut page[i], Self::NONE);
+        (old != Self::NONE).then(|| {
+            self.len -= 1;
+            old
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// 値の在る row (昇順)。 ページを全部なめる (組み直し用)。
+    fn keys(&self) -> impl Iterator<Item = u32> + '_ {
+        self.pages.iter().enumerate().filter_map(|(p, q)| q.as_ref().map(|q| (p, q))).flat_map(|(p, q)| {
+            q.iter().enumerate().filter(|&(_, &v)| v != Self::NONE).map(move |(i, _)| ((p as u32) << Self::BITS) | i as u32)
+        })
+    }
+
+    fn clear(&mut self) {
+        self.pages.clear();
+        self.len = 0;
+    }
+}
+
+/// local eid → (相手, 辺の row) の昇順の並び (4096 row ずつのページ)。 到達の辺の索引: 届く row を広げるたびに出る辺を
+/// 引くので、 BTreeSet の (始点, 終点, 辺) の範囲引きより、 row の並びを 1 回引く方が速い。
+struct Adj<T = (u32, u32)> {
+    pages: Vec<Option<Box<[Vec<T>]>>>,
+}
+
+impl<T> Default for Adj<T> {
+    fn default() -> Self {
+        Adj { pages: Vec::new() }
+    }
+}
+
+impl Adj<(u32, u32)> {
+    /// x から o への辺が在るか。
+    fn has(&self, x: u32, o: u32) -> bool {
+        let v = self.get(x);
+        let i = v.partition_point(|&(a, _)| a < o);
+        v.get(i).is_some_and(|&(a, _)| a == o)
+    }
+}
+
+impl<T: Ord + Copy> Adj<T> {
+    const BITS: u32 = 12;
+
+    fn slot(x: u32) -> (usize, usize) {
+        ((x >> Self::BITS) as usize, (x & ((1 << Self::BITS) - 1)) as usize)
+    }
+
+    fn get(&self, x: u32) -> &[T] {
+        let (p, i) = Self::slot(x);
+        match self.pages.get(p).and_then(|q| q.as_ref()) {
+            Some(q) => &q[i],
+            None => &[],
+        }
+    }
+
+    fn insert(&mut self, x: u32, e: T) -> bool {
+        let (p, i) = Self::slot(x);
+        if self.pages.len() <= p {
+            self.pages.resize_with(p + 1, || None);
+        }
+        let v = &mut self.pages[p].get_or_insert_with(|| (0..1 << Self::BITS).map(|_| Vec::new()).collect())[i];
+        match v.binary_search(&e) {
+            Ok(_) => false,
+            Err(j) => {
+                if v.len() < 4 {
+                    // 辺の少ない row (ほとんど) は詰めて持つ
+                    v.reserve_exact(1);
+                }
+                v.insert(j, e);
+                true
             }
         }
     }
 
+    fn remove(&mut self, x: u32, e: T) -> bool {
+        let (p, i) = Self::slot(x);
+        let Some(v) = self.pages.get_mut(p).and_then(|q| q.as_mut()).map(|q| &mut q[i]) else { return false };
+        match v.binary_search(&e) {
+            Ok(j) => {
+                v.remove(j);
+                if v.is_empty() {
+                    *v = Vec::new();
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// local eid の集合 (4096 row ずつのビットのページ、 触ったページだけ持つ)。 購読の 「条件を満たす row」 は table の
+/// 全 row になりうる (100 万 row で BTreeSet は数十 MB、 ビットなら 128 KB) し、 poll ごとに出入りした row の数だけ引く。
+#[derive(Default)]
+struct RowSet {
+    pages: Vec<Option<Box<[u64]>>>,
+}
+
+impl RowSet {
+    const BITS: u32 = 12;
+
+    fn slot(x: u32) -> (usize, usize, u64) {
+        ((x >> Self::BITS) as usize, ((x >> 6) & ((1 << (Self::BITS - 6)) - 1)) as usize, 1 << (x & 63))
+    }
+
+    fn contains(&self, x: u32) -> bool {
+        let (p, w, b) = Self::slot(x);
+        self.pages.get(p).and_then(|q| q.as_ref()).is_some_and(|q| q[w] & b != 0)
+    }
+
+    /// 無かったら true。
+    fn insert(&mut self, x: u32) -> bool {
+        let (p, w, b) = Self::slot(x);
+        if self.pages.len() <= p {
+            self.pages.resize_with(p + 1, || None);
+        }
+        let q = self.pages[p].get_or_insert_with(|| vec![0; 1 << (Self::BITS - 6)].into_boxed_slice());
+        let new = q[w] & b == 0;
+        q[w] |= b;
+        new
+    }
+
+    /// 在ったら true。
+    fn remove(&mut self, x: u32) -> bool {
+        let (p, w, b) = Self::slot(x);
+        match self.pages.get_mut(p).and_then(|q| q.as_mut()) {
+            Some(q) => {
+                let had = q[w] & b != 0;
+                q[w] &= !b;
+                had
+            }
+            None => false,
+        }
+    }
+}
+
+impl Graph {
+    fn outs(&self, x: u32) -> impl Iterator<Item = u32> + '_ {
+        self.out.get(x).iter().map(|t| t.0)
+    }
+
+    fn ins(&self, x: u32) -> impl Iterator<Item = u32> + '_ {
+        self.inn.get(x).iter().map(|t| t.0)
+    }
+
+    fn reached(&self, x: u32) -> bool {
+        self.sup.contains(x)
+    }
+
+    /// x が支えている row。
+    fn kids(&self, x: u32) -> Vec<u32> {
+        let mut v: Vec<u32> = self.outs(x).filter(|&y| self.sup.get(y) == Some(x)).collect();
+        v.dedup();
+        v
+    }
+
+    /// w から辺を出して届かせられるか (seed か、 届く row)。
+    fn source(&self, w: u32) -> bool {
+        self.seed.contains(&w) || self.sup.contains(w)
+    }
+
+    /// w が支えになれるか: w から支えをたどって seed に着く。 支えを探している row (支えを外してある) を通る鎖は着かない
+    /// ので、 探している row 自身を通る鎖 (輪) も着かない。 鎖は輪にならないので、 届く row の数より長くはならない —
+    /// 超えたら支えの森が壊れている: debug では panic (止まらずに気づく)、 release では着かない側 (外して広げ直す) に倒す。
+    fn chain_ok(&self, mut w: u32) -> bool {
+        for _ in 0..=self.sup.len() {
+            if self.seed.contains(&w) {
+                return true;
+            }
+            match self.sup.get(w) {
+                Some(p) => w = p,
+                None => return false,
+            }
+        }
+        debug_assert!(false, "到達: 支えの鎖が輪になっている (row {w})");
+        false
+    }
+
     fn set_sup(&mut self, x: u32, w: u32) {
         self.sup.insert(x, w);
-        self.kids.insert((w, x));
     }
 
     /// x の支えを外して `pending` に積む (支えていなければ何もしない)。
     fn unhook(&mut self, x: u32, pending: &mut Vec<(u32, u32)>) {
-        if let Some(old) = self.sup.remove(&x) {
-            self.kids.remove(&(old, x));
+        if let Some(old) = self.sup.remove(x) {
             pending.push((x, old));
         }
     }
@@ -4188,21 +4546,21 @@ impl Graph {
         // 1. 辺と seed を消して足す (置くだけ)。 支えの辺が消えた row と、 外れた seed が支えていた row を覚える
         let mut roots: Vec<u32> = Vec::new();
         for &(s, d, r) in del {
-            if self.out.remove(&(s, d, r)) {
-                self.inn.remove(&(d, s, r));
-                if self.sup.get(&d) == Some(&s) && self.out.range((s, d, 0)..=(s, d, u32::MAX)).next().is_none() {
+            if self.out.remove(s, (d, r)) {
+                self.inn.remove(d, (s, r));
+                if self.sup.get(d) == Some(s) && !self.out.has(s, d) {
                     roots.push(d);
                 }
             }
         }
         for &s in unseed {
             if self.seed.remove(&s) {
-                roots.extend(self.kids.range((s, 0)..=(s, u32::MAX)).map(|k| k.1));
+                roots.extend(self.kids(s));
             }
         }
         for &(s, d, r) in add {
-            if self.out.insert((s, d, r)) {
-                self.inn.insert((d, s, r));
+            if self.out.insert(s, (d, r)) {
+                self.inn.insert(d, (s, r));
             }
         }
         let fresh: Vec<u32> = seed.iter().copied().filter(|&s| self.seed.insert(s)).collect();
@@ -4213,14 +4571,13 @@ impl Graph {
         }
         let mut gone: Vec<u32> = Vec::new();
         while let Some((x, old)) = pending.pop() {
-            let has_old = self.out.range((old, x, 0)..=(old, x, u32::MAX)).next().is_some();
+            let has_old = self.out.has(old, x);
             let alt = if has_old && self.chain_ok(old) { Some(old) } else { self.ins(x).find(|&w| w != old && self.chain_ok(w)) };
             match alt {
                 Some(w) => self.set_sup(x, w),
                 None => {
                     gone.push(x);
-                    let kids: Vec<u32> = self.kids.range((x, 0)..=(x, u32::MAX)).map(|k| k.1).collect();
-                    for y in kids {
+                    for y in self.kids(x) {
                         self.unhook(y, &mut pending);
                     }
                 }
@@ -4253,6 +4610,15 @@ impl Graph {
     }
 }
 
+/// 鍵付きの購読の差分 `k` を当てる前の、 row `e` の鍵。 `now` = 当てた後 (渡し済みの鍵)。 差分は eid の昇順。
+fn key_before(k: &enchudb_engine::KeyedDelta, e: EntityId, now: Option<u64>) -> Option<u64> {
+    match k.removed.binary_search_by_key(&e, |x| x.0) {
+        Ok(i) => Some(k.removed[i].1),
+        Err(_) if k.added.binary_search_by_key(&e, |x| x.0).is_ok() => None,
+        Err(_) => now,
+    }
+}
+
 /// 到達の購読の元。
 struct ReachLive {
     /// 辺の row の始点 / 終点の鍵付きの購読
@@ -4266,13 +4632,10 @@ struct ReachLive {
 #[derive(Default)]
 struct ReachState {
     graph: Graph,
-    /// 辺の row → 始点 / 終点
-    src_of: std::collections::BTreeMap<u32, u32>,
-    dst_of: std::collections::BTreeMap<u32, u32>,
     /// この query の条件を満たす row。
-    filt: std::collections::BTreeSet<u32>,
+    filt: RowSet,
     /// 最後に渡した row。
-    reported: std::collections::BTreeSet<u32>,
+    reported: RowSet,
 }
 
 /// [`ReachQuery::subscribe`] の戻り値。 辺の table をたどって届く row の出入りを購読する。
@@ -4288,32 +4651,28 @@ impl LiveReach {
         use std::collections::BTreeSet;
         let Some(lv) = &self.live else { return LiveDelta::default() };
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let ReachState { graph, src_of, dst_of, filt, reported } = &mut *st;
+        let ReachState { graph, filt, reported } = &mut *st;
         let peer = self.eng.peer_id();
         let local = |e: EntityId| enchudb_oplog::eid_local(e);
         let (dsrc, ddst, ds, df) = (lv.src.poll(&self.eng), lv.dst.poll(&self.eng), lv.seeds.poll(&self.eng), lv.filter.poll(&self.eng));
-        // 辺の row の (始点, 終点) の前後
-        let rows: BTreeSet<u32> = [&dsrc, &ddst].iter().flat_map(|k| k.removed.iter().chain(k.added.iter()).map(|x| local(x.0))).collect();
-        let before: Vec<(u32, Option<u32>, Option<u32>)> = rows.iter().map(|&r| (r, src_of.get(&r).copied(), dst_of.get(&r).copied())).collect();
-        for (k, map) in [(&dsrc, &mut *src_of), (&ddst, &mut *dst_of)] {
-            for (e, _) in &k.removed {
-                map.remove(&local(*e));
-            }
-            for &(e, v) in &k.added {
-                map.insert(local(e), v as u32);
-            }
-        }
+        // 辺の row の (始点, 終点) の前後。 後 = 鍵付きの購読が渡し済みの鍵、 前 = 差分の removed か、 動いていなければ後と同じ
+        let mut rows: Vec<EntityId> = [&dsrc, &ddst].iter().flat_map(|k| k.removed.iter().chain(k.added.iter()).map(|x| x.0)).collect();
+        rows.sort_unstable();
+        rows.dedup();
+        let (s_now, d_now) = (lv.src.reported_keys(&rows), lv.dst.reported_keys(&rows));
         let (mut del, mut add) = (Vec::new(), Vec::new());
-        for (r, s0, d0) in before {
-            let (s1, d1) = (src_of.get(&r).copied(), dst_of.get(&r).copied());
+        for (i, &e) in rows.iter().enumerate() {
+            let (s1, d1) = (s_now[i], d_now[i]);
+            let (s0, d0) = (key_before(&dsrc, e, s1), key_before(&ddst, e, d1));
             if (s0, d0) == (s1, d1) {
                 continue;
             }
+            let r = local(e);
             if let (Some(s), Some(d)) = (s0, d0) {
-                del.push((s, d, r));
+                del.push((s as u32, d as u32, r));
             }
             if let (Some(s), Some(d)) = (s1, d1) {
-                add.push((s, d, r));
+                add.push((s as u32, d as u32, r));
             }
         }
         let unseed: Vec<u32> = ds.removed.iter().map(|&e| local(e)).collect();
@@ -4323,7 +4682,7 @@ impl LiveReach {
         let rs: BTreeSet<EntityId> = df.removed.iter().copied().collect();
         let reborn: BTreeSet<u32> = df.added.iter().filter(|e| rs.contains(e)).map(|&e| local(e)).collect();
         for &e in &df.removed {
-            filt.remove(&local(e));
+            filt.remove(local(e));
             touched.push(local(e));
         }
         for &e in &df.added {
@@ -4334,8 +4693,8 @@ impl LiveReach {
         touched.dedup();
         let mut d = LiveDelta::default();
         for x in touched {
-            let now = graph.reached(x) && filt.contains(&x);
-            let was = reported.contains(&x);
+            let now = graph.reached(x) && filt.contains(x);
+            let was = reported.contains(x);
             let e = enchudb_oplog::make_eid(peer, x);
             match (was, now) {
                 (false, true) => {
@@ -4343,7 +4702,7 @@ impl LiveReach {
                     d.added.push(e);
                 }
                 (true, false) => {
-                    reported.remove(&x);
+                    reported.remove(x);
                     d.removed.push(e);
                 }
                 (true, true) if reborn.contains(&x) => {
@@ -4772,7 +5131,8 @@ impl<'a> Query<'a> {
     /// ```
     ///
     /// - ref が輪になっている時、 輪の row は 「輪とそこにぶら下がる row の seed (自分を除く)」 の上。 輪は 1 周で止まる
-    /// - 付け替え 1 回・seed の出入り 1 回のコストは階層の深さに比例 (配下の数によらない)
+    /// - seed の出入り・葉 (部下の居ない row) の付け替えのコストは答えが変わる row の数に比例 (深さ・配下の数によらない)。
+    ///   部下の居る row の付け替えは、 輪ができるかを見るので深さに比例
     pub fn above(self, ref_col: &str, seeds: Query<'a>) -> UnderQuery<'a> {
         UnderQuery { rows: self, seeds, ref_col: ref_col.to_string(), up: true }
     }
