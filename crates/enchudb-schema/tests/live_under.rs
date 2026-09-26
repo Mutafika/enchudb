@@ -1,5 +1,5 @@
-//! 階層の配下 (`under`、 SQL の再帰 CTE): poll の差分を積分した集合・`find()`・`count()` が、 **テスト側で親を
-//! たどって決めた配下** と常に一致すること。 oracle は `entity(e).get(col)` で親を読んで seed まで上るだけ
+//! 階層の配下 (`under`) と上 (`above`、 SQL の再帰 CTE): poll の差分を積分した集合・`find()`・`count()` が、
+//! **テスト側で親をたどって決めた配下 / 上** と常に一致すること。 oracle は `entity(e).get(col)` で親を読んで seed まで上るだけ
 //! (engine の live 評価を通らない)。
 //!
 //! 書き込みは上司の付け替え (輪になるものも)・外し、 seed の条件の変化、 結果を絞る条件の変化、 row の作り直し。
@@ -77,7 +77,26 @@ fn run(path: &str) {
         emps.push(b.commit().unwrap());
     }
     // 総当たり: e が配下か = 上司をたどって seed に着く (生きていない row / 輪で止まる)
-    let oracle = |emps: &[u64], seed: &dyn Fn(u64) -> bool, keep: &dyn Fn(u64) -> bool| -> BTreeSet<u64> {
+    // 上: x が seed s (x 以外) から上司をたどった道 (輪は 1 周で止まる) に居る
+    let above = |emps: &[u64], seed: &dyn Fn(u64) -> bool, keep: &dyn Fn(u64) -> bool| -> BTreeSet<u64> {
+        let mut out = BTreeSet::new();
+        for &s in emps.iter().filter(|&&s| seed(s)) {
+            let mut seen = BTreeSet::from([s]);
+            let mut cur = s;
+            while let Some(b) = boss(t, cur) {
+                if !emps.contains(&b) || !seen.insert(b) {
+                    break;
+                }
+                out.insert(b);
+                cur = b;
+            }
+        }
+        out.into_iter().filter(|&e| keep(e)).collect()
+    };
+    let oracle = |emps: &[u64], seed: &dyn Fn(u64) -> bool, keep: &dyn Fn(u64) -> bool, up: bool| -> BTreeSet<u64> {
+        if up {
+            return above(emps, seed, keep);
+        }
         emps.iter()
             .copied()
             .filter(|&e| {
@@ -109,6 +128,7 @@ fn run(path: &str) {
         seen: BTreeSet<u64>,
         seed: Pred<'a>,
         keep: Pred<'a>,
+        up: bool,
     }
     let make = |kind: u64, rng: &mut Rng, emps: &[u64]| -> Sub {
         let d = rng.below(4) as i64;
@@ -128,6 +148,24 @@ fn run(path: &str) {
                 Box::new(move |e| num(t, e, "dept") == Some(d)),
                 Box::new(move |e| num(t, e, "age").is_some_and(|a| a > x)),
             ),
+            3 => (
+                format!("id {id} の上司全員"),
+                Box::new(move || t.all().above("boss", t.where_eq("id", id))),
+                Box::new(move |e| num(t, e, "id") == Some(id)),
+                Box::new(|_| true),
+            ),
+            4 => (
+                format!("部署 {d} の人の上で {x} 歳より上"),
+                Box::new(move || t.all().where_gt("age", x).above("boss", t.where_eq("dept", d))),
+                Box::new(move |e| num(t, e, "dept") == Some(d)),
+                Box::new(move |e| num(t, e, "age").is_some_and(|a| a > x)),
+            ),
+            5 => (
+                format!("{x} 歳より上の人の上で部署 {d}"),
+                Box::new(move || t.where_eq("dept", d).above("boss", t.all().where_gt("age", x))),
+                Box::new(move |e| num(t, e, "age").is_some_and(|a| a > x)),
+                Box::new(move |e| num(t, e, "dept") == Some(d)),
+            ),
             _ => (
                 format!("{x} 歳より上の人の配下で部署 {d}"),
                 Box::new(move || t.where_eq("dept", d).under("boss", t.all().where_gt("age", x))),
@@ -136,13 +174,13 @@ fn run(path: &str) {
             ),
         };
         let live = query().subscribe().unwrap();
-        Sub { name, live, query, seen: BTreeSet::new(), seed, keep }
+        Sub { name, live, query, seen: BTreeSet::new(), seed, keep, up: (3..=5).contains(&kind) }
     };
-    let mut subs: Vec<Sub> = (0..9).map(|i| make(i % 3, &mut rng, &emps)).collect();
+    let mut subs: Vec<Sub> = (0..12).map(|i| make(i % 6, &mut rng, &emps)).collect();
     let check = |subs: &mut Vec<Sub>, emps: &[u64], step: usize| {
         for s in subs.iter_mut() {
             integrate(&mut s.seen, s.live.poll());
-            let want = oracle(emps, &s.seed, &s.keep);
+            let want = oracle(emps, &s.seed, &s.keep, s.up);
             assert_eq!(s.seen, want, "[{}] step {step}: 積分 != 総当たり", s.name);
             let found: BTreeSet<u64> = (s.query)().find().unwrap().into_iter().collect();
             assert_eq!(found, want, "[{}] step {step}: find", s.name);
@@ -182,7 +220,7 @@ fn run(path: &str) {
         }
         if step % 11 == 0 {
             let i = rng.below(subs.len() as u64) as usize;
-            subs[i] = make(rng.below(3), &mut rng, &emps);
+            subs[i] = make(rng.below(6), &mut rng, &emps);
         }
         if step % 3 == 0 {
             check(&mut subs, &emps, step);
@@ -191,4 +229,5 @@ fn run(path: &str) {
     check(&mut subs, &emps, 1_000_001);
     // 自分の table を指す ref 列でない / seed が別の table なら BadValue
     assert!(t.all().under("dept", t.all()).find().is_err());
+    assert!(t.all().above("dept", t.all()).subscribe().is_err());
 }
