@@ -250,3 +250,82 @@ fn run(path: &str) {
     assert!(t.all().under("dept", t.all()).find().is_err());
     assert!(t.all().above("dept", t.all()).subscribe().is_err());
 }
+
+/// row が 4096 (中の表の 1 ページ) を超える時の、 大きい batch (組み直し) での差分。 組み直しは答えが真だった row を表から
+/// 全部拾って出し直すので、 2 ページ目より後ろの row を拾い損ねると、 真から偽になった row の removed が届かない
+/// (上の `run` は row が 64 なので 1 ページ目しか使わない)。
+#[test]
+fn big_batches_past_first_page() {
+    let path = tmp_path("pages");
+    cleanup(&path);
+    let mut db = Database::create(&path).unwrap();
+    db.table("emps").number("id").number("dept").ref_to("boss", "emps").primary_key("id").build().unwrap();
+    let t = &db.get_table("emps").unwrap();
+    let mut rng = Rng(0x7ee5_0000_0000_0002);
+    const N: u64 = 9000;
+    let mut emps: Vec<u64> = Vec::new();
+    for i in 0..N {
+        let mut b = t.insert().set("id", i as i64).set("dept", rng.below(40) as i64);
+        if i > 0 {
+            b = b.set("boss", Value::Ref(emps[rng.below(i) as usize]));
+        }
+        emps.push(b.commit().unwrap());
+    }
+    let live_set: BTreeSet<u64> = emps.iter().copied().collect();
+    let seed = |e: u64| num(t, e, "dept") == Some(0);
+    let oracle = |up: bool| -> BTreeSet<u64> {
+        if up {
+            let mut out = BTreeSet::new();
+            for &s in emps.iter().filter(|&&s| seed(s)) {
+                let mut cur = s;
+                while let Some(b) = boss(t, cur) {
+                    if !out.insert(b) {
+                        break;
+                    }
+                    cur = b;
+                }
+            }
+            return out;
+        }
+        emps.iter()
+            .copied()
+            .filter(|&e| {
+                let mut cur = e;
+                while let Some(b) = boss(t, cur) {
+                    if !live_set.contains(&b) {
+                        return false;
+                    }
+                    if seed(b) {
+                        return true;
+                    }
+                    cur = b;
+                }
+                false
+            })
+            .collect()
+    };
+    for up in [true, false] {
+        let q = || if up { t.all().above("boss", t.where_eq("dept", 0i64)) } else { t.all().under("boss", t.where_eq("dept", 0i64)) };
+        let live = q().subscribe().unwrap();
+        let mut seen = BTreeSet::new();
+        integrate(&mut seen, live.poll());
+        assert_eq!(seen, oracle(up), "up={up}: 最初の poll");
+        assert!(seen.iter().any(|&e| e & 0xffff_ffff >= 4096), "up={up}: 2 ページ目の row が答えに居ない");
+        for round in 0..4 {
+            // 1 回の poll に付け替え 2000 本 (上向きは組み直しに回る) + seed の出入り
+            for _ in 0..2000 {
+                let i = 1 + rng.below(N - 1) as usize;
+                t.entity(emps[i]).set("boss", Value::Ref(emps[rng.below(i as u64) as usize])).commit().unwrap();
+            }
+            for _ in 0..100 {
+                t.entity(emps[rng.below(N) as usize]).set("dept", rng.below(40) as i64).commit().unwrap();
+            }
+            integrate(&mut seen, live.poll());
+            let want = oracle(up);
+            assert_eq!(seen, want, "up={up} round {round}: 積分 != 総当たり");
+            assert_eq!(q().find().unwrap().into_iter().collect::<BTreeSet<_>>(), want, "up={up} round {round}: find");
+        }
+    }
+    drop(db);
+    cleanup(&path);
+}

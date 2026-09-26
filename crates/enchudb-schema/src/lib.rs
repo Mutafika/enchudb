@@ -3648,10 +3648,10 @@ impl HierRef<'_> {
 #[derive(Default)]
 struct Tree {
     /// (親, 子)
-    children: std::collections::BTreeSet<(u32, u32)>,
-    seed: std::collections::BTreeSet<u32>,
+    children: Adj<u32>,
+    seed: RowSet,
     /// 配下である row (答えが真)。
-    under: std::collections::BTreeSet<u32>,
+    under: RowSet,
 }
 
 impl Tree {
@@ -3670,7 +3670,7 @@ impl Tree {
         let top = loop {
             match h.parent(cur) {
                 None => break false,
-                Some(p) if self.seed.contains(&p) => break true,
+                Some(p) if self.seed.contains(p) => break true,
                 Some(p) => {
                     if let Some(&a) = memo.as_ref().and_then(|m| m.get(&p)) {
                         break a;
@@ -3710,32 +3710,32 @@ impl Tree {
         let mut queue = std::collections::VecDeque::new();
         // 葉 (子の無い row) の根は輪に入れない (自分の下に何も無い) ので、 答え = 親が seed か配下か を 1 回見るだけ。
         // 親の答えは、 葉でない根を決め直して下へ伝えた後なら最新 (親の上の変化は全部葉でない根か seed の出入りの子)
-        let (leaves, inner): (Vec<u32>, Vec<u32>) = roots.into_iter().partition(|&r| self.children.range((r, 0)..=(r, u32::MAX)).next().is_none());
+        let (leaves, inner): (Vec<u32>, Vec<u32>) = roots.into_iter().partition(|&r| self.children.get(r).is_empty());
         // 道の途中の row の答えは、 その上の根を決め直して下へ伝えれば揃うので、 比べるのは根だけ。 覚えるのは根が 2 つ以上の時だけ
         let mut memo = (inner.len() > 1).then(std::collections::BTreeMap::new);
         for r in inner {
             let now = self.resolve(r, h, &mut memo);
-            if now != self.under.contains(&r) {
-                if now { self.under.insert(r) } else { self.under.remove(&r) };
+            if now != self.under.contains(r) {
+                if now { self.under.insert(r) } else { self.under.remove(r) };
                 changed.push(r);
                 queue.push_back(r);
             }
         }
         while let Some(x) = queue.pop_front() {
-            let v = self.seed.contains(&x) || self.under.contains(&x);
-            let kids: Vec<u32> = self.children.range((x, 0)..=(x, u32::MAX)).map(|k| k.1).collect();
+            let v = self.seed.contains(x) || self.under.contains(x);
+            let kids: Vec<u32> = self.children.get(x).to_vec();
             for c in kids {
-                if v != self.under.contains(&c) {
-                    if v { self.under.insert(c) } else { self.under.remove(&c) };
+                if v != self.under.contains(c) {
+                    if v { self.under.insert(c) } else { self.under.remove(c) };
                     changed.push(c);
                     queue.push_back(c);
                 }
             }
         }
         for r in leaves {
-            let now = h.parent(r).is_some_and(|p| self.seed.contains(&p) || self.under.contains(&p));
-            if now != self.under.contains(&r) {
-                if now { self.under.insert(r) } else { self.under.remove(&r) };
+            let now = h.parent(r).is_some_and(|p| self.seed.contains(p) || self.under.contains(p));
+            if now != self.under.contains(r) {
+                if now { self.under.insert(r) } else { self.under.remove(r) };
                 changed.push(r);
             }
         }
@@ -3757,10 +3757,10 @@ impl Tree {
 /// 親から上へたどる (深さに比例)。 下に seed の居ない row の付け替え (ほとんど) は親の表を 1 回書くだけ。
 #[derive(Default)]
 struct Above {
-    parent: std::collections::BTreeMap<u32, u32>,
+    parent: RowMap,
     seed: std::collections::BTreeSet<u32>,
     /// 子 (輪の row は輪の外の子) のうち seed か答えが真の数 (0 は持たない)。
-    cnt: std::collections::BTreeMap<u32, u64>,
+    cnt: RowMap,
     /// 覚えている輪の row → 輪の番号。
     cyc_of: std::collections::BTreeMap<u32, u32>,
     /// 輪の番号 → 輪の row の `cnt` と輪の上の seed の和。
@@ -3800,7 +3800,7 @@ impl Trail {
 
 impl Above {
     fn cnt(&self, x: u32) -> u64 {
-        self.cnt.get(&x).copied().unwrap_or(0)
+        self.cnt.get(x).map_or(0, u64::from)
     }
 
     fn answer(&self, x: u32) -> bool {
@@ -3818,17 +3818,17 @@ impl Above {
     fn add_cnt(&mut self, x: u32, add: bool) -> (u64, u64) {
         let old = self.cnt(x);
         let new = if add { old + 1 } else { old - 1 };
-        if new == 0 { self.cnt.remove(&x) } else { self.cnt.insert(x, new) };
+        if new == 0 { self.cnt.remove(x) } else { self.cnt.insert(x, u32::try_from(new).expect("子の数")) };
         (old, new)
     }
 
     /// 輪の row (x から親をたどって x に戻るまで)。
     fn cycle(&self, x: u32) -> Vec<u32> {
         let mut out = vec![x];
-        let mut cur = self.parent[&x];
+        let mut cur = self.parent.get(x).expect("輪の row の親");
         while cur != x {
             out.push(cur);
-            cur = self.parent[&cur];
+            cur = self.parent.get(cur).expect("輪の row の親");
         }
         out
     }
@@ -3861,7 +3861,7 @@ impl Above {
     /// (か x0) に戻ったら輪: 戻った所から先の row が輪で、 輪の上の子の分を引いて覚える。 引く時は輪に入らない (真の row の
     /// 居る輪は覚えてある)。
     fn bump(&mut self, x0: u32, add: bool, touched: &mut Vec<u32>) {
-        let Some(&p) = self.parent.get(&x0) else { return };
+        let Some(p) = self.parent.get(x0) else { return };
         let mut trail = Trail::new(x0);
         let mut x = p;
         loop {
@@ -3888,8 +3888,8 @@ impl Above {
                 return;
             }
             trail.push(x);
-            match self.parent.get(&x) {
-                Some(&p) => x = p,
+            match self.parent.get(x) {
+                Some(p) => x = p,
                 None => return,
             }
         }
@@ -3914,16 +3914,16 @@ impl Above {
             if self.hot(c) {
                 self.bump(c, false, touched);
             }
-            self.parent.remove(&c);
+            self.parent.remove(c);
             return;
         };
-        let p = self.parent.remove(&c).expect("輪の row の親");
+        let p = self.parent.remove(c).expect("輪の row の親");
         self.cyc_sum.remove(&id);
         // 鎖は p (一番下) から c まで。 下から数え直す
         let mut chain = vec![p];
         let mut cur = p;
         while cur != c {
-            cur = self.parent[&cur];
+            cur = self.parent.get(cur).expect("輪の row の親");
             chain.push(cur);
         }
         let mut below = false;
@@ -3950,8 +3950,8 @@ impl Above {
             let mut trail = Trail::new(q);
             let mut cur = q;
             while cur != c && !self.cyc_of.contains_key(&cur) {
-                match self.parent.get(&cur) {
-                    Some(&p) if !trail.contains(p) => {
+                match self.parent.get(cur) {
+                    Some(p) if !trail.contains(p) => {
                         trail.push(p);
                         cur = p;
                     }
@@ -3976,23 +3976,14 @@ impl Above {
 
     /// c の親を `to` にする。 下に seed の居ない輪の外の row (ほとんど) は親の表を 1 回書くだけ。
     fn reparent(&mut self, c: u32, to: Option<u32>, touched: &mut Vec<u32>) {
-        use std::collections::btree_map::Entry;
         if !self.hot(c) && !self.cyc_of.contains_key(&c) {
-            match (self.parent.entry(c), to) {
-                (Entry::Occupied(mut o), Some(q)) => {
-                    o.insert(q);
-                }
-                (Entry::Occupied(o), None) => {
-                    o.remove();
-                }
-                (Entry::Vacant(v), Some(q)) => {
-                    v.insert(q);
-                }
-                (Entry::Vacant(_), None) => {}
-            }
+            match to {
+                Some(q) => self.parent.insert(c, q),
+                None => self.parent.remove(c),
+            };
             return;
         }
-        if self.parent.get(&c).copied() == to {
+        if self.parent.get(c) == to {
             return;
         }
         self.cut(c, touched);
@@ -4004,7 +3995,7 @@ impl Above {
     /// 親の表と seed から全部組み直す (最初の poll / find / 大きい batch)。 seed を 1 つずつ足す (どの row も 0 → 1 は 1 回
     /// なので全体で row の数に比例)。 答えが真だった row と真になった row を返す。
     fn rebuild(&mut self) -> Vec<u32> {
-        let mut touched: Vec<u32> = self.cnt.keys().copied().chain(self.cyc_of.keys().copied()).filter(|&x| self.answer(x)).collect();
+        let mut touched: Vec<u32> = self.cnt.keys().chain(self.cyc_of.keys().copied()).filter(|&x| self.answer(x)).collect();
         let seeds = std::mem::take(&mut self.seed);
         self.cnt.clear();
         self.cyc_of.clear();
@@ -4013,7 +4004,7 @@ impl Above {
         for s in seeds {
             self.set_seed(s, true, &mut scratch);
         }
-        touched.extend(self.cnt.keys().copied().chain(self.cyc_of.keys().copied()).filter(|&x| self.answer(x)));
+        touched.extend(self.cnt.keys().chain(self.cyc_of.keys().copied()).filter(|&x| self.answer(x)));
         touched
     }
 }
@@ -4032,7 +4023,7 @@ impl Hier {
     fn set_seed(&mut self, s: u32, on: bool, touched: &mut Vec<u32>) {
         match self {
             Hier::Down(t) => {
-                if on { t.seed.insert(s) } else { t.seed.remove(&s) };
+                if on { t.seed.insert(s) } else { t.seed.remove(s) };
             }
             Hier::Up(a) => a.set_seed(s, on, touched),
         }
@@ -4049,7 +4040,7 @@ impl Hier {
     /// 購読で持っている答え。
     fn answer(&self, x: u32) -> bool {
         match self {
-            Hier::Down(t) => t.under.contains(&x),
+            Hier::Down(t) => t.under.contains(x),
             Hier::Up(a) => a.answer(x),
         }
     }
@@ -4067,20 +4058,20 @@ impl Hier {
                 // 答えを決め直す row: 親が変わった row と、 seed の出入りした row の子
                 let mut roots: BTreeSet<u32> = dp.removed.iter().chain(dp.added.iter()).map(|(e, _)| local(*e)).collect();
                 for &(e, p) in &dp.removed {
-                    tree.children.remove(&(p as u32, local(e)));
+                    tree.children.remove(p as u32, local(e));
                 }
                 for &(e, p) in &dp.added {
-                    tree.children.insert((p as u32, local(e)));
+                    tree.children.insert(p as u32, local(e));
                 }
                 for &e in &ds.removed {
-                    tree.seed.remove(&local(e));
+                    tree.seed.remove(local(e));
                 }
                 for &e in &ds.added {
                     tree.seed.insert(local(e));
                 }
                 for &e in ds.removed.iter().chain(ds.added.iter()) {
                     let x = local(e);
-                    roots.extend(tree.children.range((x, 0)..=(x, u32::MAX)).map(|k| k.1));
+                    roots.extend(tree.children.get(x).iter().copied());
                 }
                 tree.settle(roots, h)
             }
@@ -4089,7 +4080,7 @@ impl Hier {
                 // 付け替えが多い (最初の poll は全 row) 時は組み直す: 子の居る row の付け替えは 1 回ずつだと深さに比例
                 if (cut.len() + dp.added.len()) * 8 > a.parent.len() {
                     for &c in &cut {
-                        a.parent.remove(&c);
+                        a.parent.remove(c);
                     }
                     for &(e, p) in &dp.added {
                         a.parent.insert(local(e), p as u32);
@@ -4367,23 +4358,49 @@ impl RowMap {
     fn len(&self) -> usize {
         self.len
     }
+
+    /// 値の在る row (昇順)。 ページを全部なめる (組み直し用)。
+    fn keys(&self) -> impl Iterator<Item = u32> + '_ {
+        self.pages.iter().enumerate().filter_map(|(p, q)| q.as_ref().map(|q| (p, q))).flat_map(|(p, q)| {
+            q.iter().enumerate().filter(|&(_, &v)| v != Self::NONE).map(move |(i, _)| ((p as u32) << Self::BITS) | i as u32)
+        })
+    }
+
+    fn clear(&mut self) {
+        self.pages.clear();
+        self.len = 0;
+    }
 }
 
 /// local eid → (相手, 辺の row) の昇順の並び (4096 row ずつのページ)。 到達の辺の索引: 届く row を広げるたびに出る辺を
 /// 引くので、 BTreeSet の (始点, 終点, 辺) の範囲引きより、 row の並びを 1 回引く方が速い。
-#[derive(Default)]
-struct Adj {
-    pages: Vec<Option<Box<[Vec<(u32, u32)>]>>>,
+struct Adj<T = (u32, u32)> {
+    pages: Vec<Option<Box<[Vec<T>]>>>,
 }
 
-impl Adj {
+impl<T> Default for Adj<T> {
+    fn default() -> Self {
+        Adj { pages: Vec::new() }
+    }
+}
+
+impl Adj<(u32, u32)> {
+    /// x から o への辺が在るか。
+    fn has(&self, x: u32, o: u32) -> bool {
+        let v = self.get(x);
+        let i = v.partition_point(|&(a, _)| a < o);
+        v.get(i).is_some_and(|&(a, _)| a == o)
+    }
+}
+
+impl<T: Ord + Copy> Adj<T> {
     const BITS: u32 = 12;
 
     fn slot(x: u32) -> (usize, usize) {
         ((x >> Self::BITS) as usize, (x & ((1 << Self::BITS) - 1)) as usize)
     }
 
-    fn get(&self, x: u32) -> &[(u32, u32)] {
+    fn get(&self, x: u32) -> &[T] {
         let (p, i) = Self::slot(x);
         match self.pages.get(p).and_then(|q| q.as_ref()) {
             Some(q) => &q[i],
@@ -4391,14 +4408,7 @@ impl Adj {
         }
     }
 
-    /// x から o への辺が在るか。
-    fn has(&self, x: u32, o: u32) -> bool {
-        let v = self.get(x);
-        let i = v.partition_point(|&(a, _)| a < o);
-        v.get(i).is_some_and(|&(a, _)| a == o)
-    }
-
-    fn insert(&mut self, x: u32, e: (u32, u32)) -> bool {
+    fn insert(&mut self, x: u32, e: T) -> bool {
         let (p, i) = Self::slot(x);
         if self.pages.len() <= p {
             self.pages.resize_with(p + 1, || None);
@@ -4417,7 +4427,7 @@ impl Adj {
         }
     }
 
-    fn remove(&mut self, x: u32, e: (u32, u32)) -> bool {
+    fn remove(&mut self, x: u32, e: T) -> bool {
         let (p, i) = Self::slot(x);
         let Some(v) = self.pages.get_mut(p).and_then(|q| q.as_mut()).map(|q| &mut q[i]) else { return false };
         match v.binary_search(&e) {
