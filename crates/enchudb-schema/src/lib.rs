@@ -1866,6 +1866,8 @@ impl<'a> RowBuilder<'a> {
         // 個別 row への marker tie は不要。 query 側も marker cond なしで
         // 当該 table の column を持つ entity のみ取れる。
 
+        // #206: 行の列を 1 回の書き込みとして書く (read_consistent に途中の組を見せない)
+        let _row = eng.write_row(eid);
         for (cd, v) in &resolved {
             if let Err(e) = tie_value(eng, eid, cd, v) {
                 // #316: 新しい row を書きかけで残さない (既存 row の upsert は書けた列までが残る)
@@ -5993,6 +5995,13 @@ impl<'a> EntityRef<'a> {
         }
     }
 
+    /// 複数の列を、 同時に在った組として読む (#206)。 `get` を列ごとに呼ぶと、 間に入った `commit()` で
+    /// 同時には無かった組 (新しい hash と古い mtime など) を掴みうる。 これは `commit()` 1 回の途中を見ない
+    /// (見たら読み直す)。 未知の列は `None`。
+    pub fn get_many(&self, cols: &[&str]) -> Vec<Option<Value>> {
+        self.db.engine().read_row(self.eid, || cols.iter().map(|c| self.get(c)).collect())
+    }
+
     /// 単発 set (1 column)。 chain したい場合は `update()` builder を使う。
     pub fn set<V: Into<Value>>(self, col: &str, val: V) -> EntityUpdate<'a> {
         EntityUpdate {
@@ -6032,6 +6041,8 @@ impl<'a> EntityUpdate<'a> {
     }
     pub fn commit(self) -> Result<(), SchemaError> {
         let eng = self.db.engine();
+        // #206: 行の列を 1 回の書き込みとして書く (read_consistent に途中の組を見せない)
+        let _row = eng.write_row(self.eid);
         for (col, v) in &self.values {
             let cd = self.table.col_or_err(col)?;
             tie_value(eng, self.eid, cd, v)?;

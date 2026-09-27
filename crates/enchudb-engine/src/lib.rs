@@ -79,6 +79,8 @@ pub mod transport;
 pub mod changefeed;
 // live query (クエリ購読): 条件に当てはまる entity 集合の差分を購読する。
 pub mod live;
+// 行の書き込み境界 (#206) と同じ cell への並行書き込みの直列化 (#135)。
+pub mod row_lock;
 // Transport implementations moved to `enchu-transport` crate.
 pub mod acl;
 pub mod integrity;

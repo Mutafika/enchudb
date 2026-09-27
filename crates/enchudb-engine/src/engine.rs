@@ -2946,6 +2946,8 @@ pub struct Engine {
     /// live query (クエリ購読) の route。 Column 書き込みが `live_set` / `live_remove`
     /// 経由で通知する (`crate::live` module doc)。
     live: std::sync::Arc<crate::live::LiveRegistry>,
+    /// 行ごとの書き込みの版 (#206 / #135)。 cell を書く経路は全部ここを握る (`crate::row_lock`)。
+    row_locks: crate::row_lock::RowLocks,
     /// LWW 用に (eid, himo) → 最後の HLC を記録。
     hlc_store: std::sync::Arc<crate::hlc_store::HlcStore>,
     /// request18: `sync_tables_enabled()` の cache。 本体は `has_reserved_table`
@@ -3416,6 +3418,7 @@ impl Engine {
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             live: std::sync::Arc::new(crate::live::LiveRegistry::new(0)),
+            row_locks: crate::row_lock::RowLocks::new(),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             sync_tables_on: std::sync::atomic::AtomicBool::new(false),
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
@@ -4452,6 +4455,7 @@ impl Engine {
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             live: std::sync::Arc::new(crate::live::LiveRegistry::new(0)),
+            row_locks: crate::row_lock::RowLocks::new(),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             sync_tables_on: std::sync::atomic::AtomicBool::new(false),
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
@@ -8168,6 +8172,7 @@ impl Engine {
         if !self.fits(himo_id as usize, value) {
             return false;
         }
+        let _row = self.row_locks.write(local);
         if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
@@ -8200,6 +8205,7 @@ impl Engine {
     /// `clear_cell` の local eid 版。 Leaf payload の解放 (`free_leaf_cell`) は
     /// **採用が決まってから**呼ぶこと (不採用なら cell は変わらないので解放しない)。
     fn clear_cell_local(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc) -> bool {
+        let _row = self.row_locks.write(local);
         if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
@@ -8212,6 +8218,7 @@ impl Engine {
     /// 解放する。 不採用 (= 古い untie) のときは payload を **解放しない**
     /// (cell がまだその payload を指しているため)。
     fn clear_cell_local_freeing_leaf(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc) -> bool {
+        let _row = self.row_locks.write(local);
         if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
@@ -8374,6 +8381,7 @@ impl Engine {
     /// 再配送 (この冪等化) と open 時の sweep (`finish_interrupted_deletes`) の
     /// 両方で埋まる。
     fn apply_delete_local(&self, local: u32, hlc: enchudb_oplog::Hlc) -> bool {
+        let _row = self.row_locks.write(local);
         let tomb = self.tombstone_version_of(local);
         if hlc != enchudb_oplog::Hlc::ZERO
             && tomb != enchudb_oplog::Hlc::ZERO
@@ -8859,6 +8867,8 @@ impl Engine {
             return RemoteApply::RejectedCapacity;
         }
         self.entities.ensure_live(local);
+        // #135: 旧 slot を読んでから free するまで同じ cell の書き手を入れない
+        let _row = self.row_locks.write(local);
         // v6 (#88): remote re-tie 上書きで旧 offset を回収。
         // #119: **insert → publish → free** の順 (逆順だと並行 reader が再利用 slot を読む)。
         let old = self.take_leaf_cell(local, hid);
@@ -9483,6 +9493,9 @@ impl Engine {
         //     旧 offset を掴んだ reader は column 再読 (get_text_owned) で stale を検出。
         if let Some(leaf) = self.leaf_for(hid) {
             let bytes = value.as_bytes();
+            // #135: 旧 slot を読んでから free するまで同じ cell の書き手を入れない (2 本が同じ旧 slot を
+            // free すると、 cell が free 済みの slot を指す)
+            let _row = self.row_locks.write(eid);
             let old = self.himos[hid].get_value32(eid);
             let off = leaf.insert(bytes);
             if off == u32::MAX {
@@ -9639,6 +9652,8 @@ impl Engine {
             // 旧 offset を掴んでいる並行 reader が再利用 slot を読んで seqlock retry を
             // 使い切り None になる — content 経路で実測 8,132/60,463 件)。
             // 既に `tie_text_to_by_id` はこの順序。
+            // #135: 旧 slot を読んでから free するまで同じ cell の書き手を入れない
+            let _row = self.row_locks.write(eid);
             let old = self.himos[hid].get_value32(eid);
             let off = leaf.insert(value);
             if off == u32::MAX {
@@ -9799,6 +9814,26 @@ impl Engine {
             return Err(TieRejected::OlderThanCell);
         }
         Ok(())
+    }
+
+    // ──── 行の書き込み境界 (#206) ────
+
+    /// 行 `eid` の複数の列を 1 回の書き込みとして書く間握る (drop で離す)。 握っている間の `tie_*` / `untie` /
+    /// `delete` は、 [`Engine::read_row`] で読む相手に途中の組を見せない。 同じ行の他の書き手は離すまで待つ。
+    ///
+    /// 同じ thread からは入れ子で握ってよい。 握ったまま別の thread の書き込みを待たないこと (その書き手が
+    /// 同じ行 (や同じ stripe に当たる行) を書こうとすると互いに待つ)。 `tie_*` 1 回だけなら握らなくても
+    /// その cell の書き込みは重ならない。
+    pub fn write_row(&self, eid: enchudb_oplog::EntityId) -> crate::row_lock::RowWrite<'_> {
+        self.row_locks.write(enchudb_oplog::eid_local(eid))
+    }
+
+    /// 行 `eid` を、 同じ行への書き込み (1 回の `tie_*` / [`Engine::write_row`] の間の書き込み全部) の
+    /// 途中を見ずに読む。 `f` の中で `get*` を並べる — 途中の書き込みに当たったら `f` を呼び直すので、
+    /// `f` は副作用を持たないこと。 `get*` を 1 つずつ呼ぶと、 間に入った書き込みで同時には無かった
+    /// 列の組を掴みうる。
+    pub fn read_row<R>(&self, eid: enchudb_oplog::EntityId, f: impl FnMut() -> R) -> R {
+        self.row_locks.read(enchudb_oplog::eid_local(eid), f)
     }
 
     // ──── untie ────
@@ -13468,6 +13503,11 @@ impl Engine {
     /// consumer スレッド内部で呼ぶ。Op 1 個を適用。
     fn apply_op(&self, op: crate::write_queue::Op) {
         use crate::write_queue::Op;
+        // #135 / #206: 旧 Leaf slot の読みから free まで / 削除の全列を 1 回の行の書き込みに
+        let _row = match &op {
+            Op::Tie { eid, .. } | Op::Untie { eid, .. } | Op::Delete { eid, .. } => Some(self.row_locks.write(*eid)),
+            _ => None,
+        };
         match op {
             Op::Tie { eid, himo_id, value, hlc } => {
                 let hid = himo_id as usize;
