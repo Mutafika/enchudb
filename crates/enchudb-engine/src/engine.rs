@@ -1816,7 +1816,8 @@ pub struct GrowableOptions {
     /// rebuild しないと変わらない、 `max_himos` と同じ性質)。
     pub vocab_max_entries: Option<u32>,
     /// v10 Phase 3: entity の reservation (= `grow_entity_cap` の上限)。 `None` は既定
-    /// (unix: max(max_entities, 2^28)、 Windows: max_entities = 伸ばせない)。
+    /// (macOS / Linux / Android: max(max_entities, 2^28)、 Windows と iOS / tvOS / watchOS /
+    /// visionOS: max_entities = 伸ばせない、 #320)。 schema からは `Database::create_growable_with`。
     pub reserve_entities: Option<u32>,
 }
 
@@ -1884,8 +1885,24 @@ const H_RESERVE_ENTITIES: usize = 92; // u32
 /// なら `GrowableOptions::reserve_entities` で明示)。
 const DEFAULT_RESERVE_ENTITIES: u32 = 1 << 28;
 
+/// 大きな reservation を既定にできる OS か。 Windows (上記) と Apple のモバイル OS は cap と同値にする:
+/// iOS 系はプロセスの仮想アドレス空間に上限があり (extended-virtual-addressing の entitlement が
+/// 無い場合)、 列ごとに 1〜4 GB の予約が積み重なると mmap が ENOMEM で失敗する (#320: Tag 12 列 +
+/// sync の DB で予約 +34 GB → create が ENOMEM。 cap と同値なら +1.6 GB)。
+const RESERVE_IS_CHEAP: bool = !cfg!(any(
+    windows,
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+));
+
 fn default_reserve_entities(max_entities: u32) -> u32 {
-    if cfg!(windows) { max_entities } else { max_entities.max(DEFAULT_RESERVE_ENTITIES) }
+    reserve_for(max_entities, RESERVE_IS_CHEAP)
+}
+
+fn reserve_for(max_entities: u32, cheap: bool) -> u32 {
+    if cheap { max_entities.max(DEFAULT_RESERVE_ENTITIES) } else { max_entities }
 }
 
 #[allow(dead_code)] // 同上 (v9 growable の識別値)
@@ -15010,6 +15027,16 @@ mod cell_version_tests {
         eng.set_space_margin(0);
         assert!(eng.set_cell_local(far, hid, 42u32, hlc(500, 7)), "空きが戻っても書けない");
         assert_eq!(eng.cell_hlc_local(far, hid), hlc(500, 7));
+    }
+
+    /// #320: 大きな reservation を取らない OS では既定が cap と同値 (iOS の ENOMEM)。
+    #[test]
+    fn default_reserve_follows_the_os() {
+        assert_eq!(reserve_for(65_536, true), 1 << 28);
+        assert_eq!(reserve_for(65_536, false), 65_536);
+        assert_eq!(reserve_for(1 << 29, true), 1 << 29, "cap が既定より大きければ cap");
+        let ios_like = cfg!(any(windows, target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos"));
+        assert_eq!(RESERVE_IS_CHEAP, !ios_like);
     }
 }
 
