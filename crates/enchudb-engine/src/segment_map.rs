@@ -210,6 +210,37 @@ pub(crate) fn free_bytes_for_fd(fd: libc::c_int) -> io::Result<u64> {
     Ok((vfs.f_bavail as u64).saturating_mul(unit))
 }
 
+/// #317: この fd の filesystem が mmap の page のブロックを **書き出す時に**確保するか (= 書いた直後は
+/// `fstatvfs` の空きが減らない)。 true なら、 まだ flush していない分を自分で数えて空きから引く。
+///
+/// 実測 (256 MB の loop image に mmap で書く、 msync 前の空き):
+/// - APFS: 減らない。 空きを超えた分は msync Ok のまま消える (#317)
+/// - btrfs: 減らない (fsync の後も。 transaction の commit で反映)。 空きを超えると SIGBUS
+/// - ext4: 書いた時点で減る (page fault で予約)。 空きを超えると SIGBUS
+///
+/// ext4 のように書いた時点で空きに出る filesystem で数えると二重に引く (flush するまで、 実際の空きの
+/// 半分ほどで断る) ので数えない。 分からない filesystem は数える側 (断るのが早いだけで、 消えはしない)。
+fn fs_defers_allocation(fd: libc::c_int) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatfs(fd, &mut fs) } == 0 {
+            return defers_for_fs_type(fs.f_type as u64);
+        }
+    }
+    let _ = fd;
+    true
+}
+
+/// Linux の `statfs.f_type` から: page fault でブロックを予約する filesystem なら false。
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn defers_for_fs_type(f_type: u64) -> bool {
+    const EXT4: u64 = 0xEF53; // ext2 / ext3 / ext4 (実測)
+    const XFS: u64 = 0x5846_5342; // delalloc の予約は page_mkwrite
+    const TMPFS: u64 = 0x0102_1994; // page fault で page を取る
+    !matches!(f_type, EXT4 | XFS | TMPFS)
+}
+
 /// #167: 伸長時に残す空き容量 margin (`GrowableMap` と同じ既定)。
 const SPACE_MARGIN: u64 = 32 * 1024 * 1024;
 
@@ -254,6 +285,8 @@ pub struct SegmentMap {
     space_denials: AtomicU64,
     /// #317: この segment が `UNFLUSHED` に足している分。
     unflushed: AtomicU64,
+    /// #317: filesystem が書き出す時にブロックを確保するか (`fs_defers_allocation`)。 false なら数えない。
+    defers_alloc: bool,
     /// #317: 疎な segment で空きを数え済みのページ (`touch_sparse`、 1 bit = 1 ページ)。
     touched: OnceLock<Box<[AtomicU64]>>,
     /// writer は fd を持ち続ける (reader は `None`、 refresh で都度 open)。
@@ -370,6 +403,7 @@ impl SegmentMap {
         }
         // writer は予算内なら fd を持ち続ける (struct doc 参照)。 reader と予算超過分は閉じる
         // (mapping は生き続ける。 grow / refresh は都度 open する)。
+        let defers_alloc = !readonly && fs_defers_allocation(file.as_raw_fd());
         let file = if !readonly && try_reserve_fd_slot() { Some(file) } else { None };
         Ok(Self {
             path,
@@ -383,6 +417,7 @@ impl SegmentMap {
             space_margin: AtomicU64::new(SPACE_MARGIN),
             space_denials: AtomicU64::new(0),
             unflushed: AtomicU64::new(0),
+            defers_alloc,
             touched: OnceLock::new(),
             file,
         })
@@ -481,6 +516,10 @@ impl SegmentMap {
     }
 
     fn add_unflushed(&self, n: u64) {
+        // 書いた時点で空きに出る filesystem では数えない (二重に引く)
+        if !self.defers_alloc {
+            return;
+        }
         // 全体に先に足す: 逆だと、 その間に flush が取り出して全体から引き、 全体が一瞬 0 を割る
         // (= 巨大な値に見えて、 その間の書き込みを空きがあっても断る)
         UNFLUSHED.fetch_add(n, Ordering::AcqRel);
@@ -761,6 +800,16 @@ impl Drop for SegmentMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #317: 書いた時点でブロックを予約する filesystem では、 まだ flush していない分を数えない。
+    #[test]
+    fn unflushed_counting_follows_the_filesystem() {
+        assert!(!defers_for_fs_type(0xEF53), "ext4");
+        assert!(!defers_for_fs_type(0x5846_5342), "xfs");
+        assert!(!defers_for_fs_type(0x0102_1994), "tmpfs");
+        assert!(defers_for_fs_type(0x9123_683E), "btrfs");
+        assert!(defers_for_fs_type(0), "知らない filesystem は数える側");
+    }
 
     fn dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("enchu_segmap_{}_{name}", std::process::id()));
