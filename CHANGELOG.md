@@ -3,6 +3,77 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.27.3 — 2026-09-27
+
+**並行書き込みで別の cell の値が化ける穴と、 辞書の番号の二重払い出しを塞いだ patch** (#135 / #206 /
+#327 / #328)。 on-disk format は**不変**、 migration 不要。 **複数 thread から同じ行 (特に Leaf 列) を書く
+consumer、 空きの少ない環境で使う consumer は上げること**。 API は足すだけ (下の Added)。
+
+### Fixed — 同じ Leaf の cell を並行に書き直すと、 関係ない cell の値が化ける (#135)
+
+同じ cell を複数 thread から `tie_*` で書き直すと、 2 本が同じ旧 Leaf slot を読んでどちらも free し、 その
+slot が 2 度払い出されて**別の cell の中身を上書きした**。 8 thread で回すと、 関係ない 16 万 cell のうち
+29,011 個が他の値に化けた (5/5 回)。 issue の記述 (silent None) はこの症状の一部だった。
+
+- 行ごとの書き込みの版 (`row_lock`) を足した。 local id の下位 12 bit で選ぶ 4096 本の stripe に seqlock を
+  置き、 cell を書く経路 (`set_cell_local` / `clear_cell_local*` / `apply_delete_local` / Leaf の書き直し /
+  consumer の `apply_op` / 受信 TieLeaf) はすべて握る = 同じ cell の書き手は重ならない
+- 版は process の中だけに持つ (mmap に置かない)。 形式は不変で、 crash で握ったまま残ることも無い
+
+### Fixed — `commit()` 1 回で書いた行を読むと、 同時には無かった列の組を掴む (#206)
+
+2 列を同じ値で書き換え続けた再現で、 1,350 万回の読みのうち 360 万回がずれた。 schema の insert / update /
+upsert の `commit()` は行を握って書き、 新しい `EntityRef::get_many(&[cols])` / `Engine::read_row` は
+途中の書き込みに当たったら読み直す (書き手が休まず書き続けて 128 回揃わない時は握って読む = 飢えない)。
+
+### Fixed — open 時の辞書の索引の作り直しが空き不足を無視する (#327)
+
+前回正常に閉じていない DB を開くと辞書の索引を作り直すが、 伸ばす失敗を捨てて全域に書いていた (伸ばせな
+ければ SIGBUS、 伸ばせても索引の散ったページを数えずに書くので #317 と同じく消えうる)。
+
+- 索引は見かけだけ伸ばし、 読むだけで書く slot を決め (正常な落ち方なら 0 件)、 書くページの空きを確かめて
+  から書く。 **足りなければ書かずに open をエラーにする**
+- 作り直しの probe を index_cap 回で打ち切る (旧: 索引が満杯なら永久 loop)
+- open より前に効く margin の既定値 `enchudb_engine::segment_map::set_default_space_margin` を足した
+
+### Fixed — 辞書の採番が並行 insert で同じ番号を 2 回配りうる (#328)
+
+番号を取った後に data / offsets を伸ばせないと `count` を巻き戻していた。 その間に次の番号を取った insert が
+居ると同じ番号が再び配られ、 offsets が上書きされる (前の値を指していた cell が別の値を読む)。 0.27.2 の
+#316 / #317 で 「伸ばせずに断る」 経路が実際に通るようになって顕在化しうる。
+
+- 番号は巻き戻さずに捨てる (捨てた番号は空の値として読める)。 捨てる数を減らすため、 番号を取る前に伸ばせるかを見る
+- header の件数 / data の終わりを `fetch_max` で書く (旧: 並行 insert が逆順に終わると件数が戻り、 開き直した
+  後に使用済みの番号を配り直しえた)
+
+### Added
+
+- `Engine::write_row(eid)` (行を 1 回の書き込みとして書く guard、 同じ thread は入れ子可) /
+  `Engine::read_row(eid, f)` / `EntityRef::get_many(&[cols])`
+- `enchudb_engine::segment_map::set_default_space_margin`
+
+### Changed
+
+- 前回正常に閉じていない DB を、 索引の作り直しに要る空きが無い状態で開くと、 open が `Err` を返す (旧: SIGBUS
+  か黙って消えうる)
+- engine の tie 1 回が 10.2-11.0 ns → 13.1-13.7 ns (行の版を握る分)。 schema の insert / update は揺れの幅と同程度
+  (insert 4 列 233-266 → 244-274 ns/row、 8 thread で別々の行を update 335-353 → 339-360 ns/row)
+
+### 検証
+
+- `issue135_concurrent_retie`: guard を外すと 5/5 回落ち (29,011 cell が化ける)、 入れると 5/5 回通る
+- `issue206_row_boundary`: 書く側の `write_row` を外しても、 読む側の `read_row` を外しても 3/3 回落ちる
+- `issue327_rebuild_space`: 空きを確かめるループを外すと落ちる。 `failed_take_is_not_reissued` (#328):
+  巻き戻しを戻すと落ちる
+
+### 既知の残り
+
+- `get` を 1 列ずつ呼ぶ読みは、 今までどおり行の境界を保証しない (`get_many` / `read_row` を使う)
+- sync で届いた行は op ごとに書くので、 送り手の `commit()` 1 回ぶんの境界は持たない
+- `write_row` を握ったまま `tie_async` → `flush_writes` を呼ぶとデッドロックする (consumer が同じ stripe で待つ)
+- 同じ stripe に当たる別の行は、 書き手が待ち、 読み手が読み直す (結果は正しい、 遅くなるだけ)
+- #328 の header の `fetch_max` はコードを読んでの直しで、 並行ストレスでは元の形でも再現しなかった
+
 ## 0.27.2 — 2026-09-27
 
 **ディスクの空きが少ない時に、 書き込みが Ok のまま消える穴を塞いだ patch** (#316 / #317)。
