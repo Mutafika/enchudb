@@ -922,7 +922,7 @@ fn acquire_writer_lock(path: &str) -> io::Result<WriterLock> {
 /// `AlreadyExists`。
 #[cfg(not(target_arch = "wasm32"))]
 fn create_db_dir(path: &str) -> io::Result<()> {
-    std::fs::create_dir(path).map_err(|e| {
+    let exists = |e: io::Error| {
         if e.kind() == io::ErrorKind::AlreadyExists {
             io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -934,7 +934,63 @@ fn create_db_dir(path: &str) -> io::Result<()> {
         } else {
             e
         }
-    })
+    };
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        // #323: 前の create が途中で落ちた残骸 (header が 0 のまま) なら片付けて作り直す。 片付けた直後に
+        // 別の create が作っていれば、 もう一度の create_dir が AlreadyExists で拒む
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && reclaim_create_remnant(std::path::Path::new(path)) => {
+            std::fs::create_dir(path).map_err(exists)
+        }
+        Err(e) => Err(exists(e)),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// #323 の test 用: create を segment を作った後 (header を書く前) で失敗させる。
+    static FAIL_CREATE_AFTER_SEGMENTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// #323: create が途中で落ちた残骸か — `header.seg` はあるが **全部 0** (magic は create の最後に書く)
+/// で、 commit されたものが何も無い (tables sidecar / segments manifest / himo・ver の segment が無い)。
+/// 完成していた DB は header に magic と CRC を持つので、 header が全部 0 になるのは create が header を
+/// 書く前に落ちた時だけ。 それ以外の形 (header だけ壊れた DB 等) は残骸と見なさない (`Damaged` のまま)。
+#[cfg(not(target_arch = "wasm32"))]
+fn is_create_remnant(dir: &std::path::Path) -> bool {
+    let header = dir.join(crate::segments::SegmentKind::Header.rel_path());
+    let Ok(bytes) = std::fs::read(&header) else { return false };
+    if bytes.iter().any(|&b| b != 0) {
+        return false;
+    }
+    let empty_or_absent = |sub: &str| match std::fs::read_dir(dir.join(sub)) {
+        Ok(mut it) => it.next().is_none(),
+        Err(e) => e.kind() == io::ErrorKind::NotFound,
+    };
+    !dir.join(crate::db_files::TABLES).exists()
+        && !dir.join(crate::db_files::SEGMENTS).exists()
+        && empty_or_absent("himo")
+        && empty_or_absent("ver")
+}
+
+/// #323: 残骸を片付ける。 片付けたら true。 別プロセスが作成中 (writer lock を持っている) なら触らない。
+#[cfg(not(target_arch = "wasm32"))]
+fn reclaim_create_remnant(dir: &std::path::Path) -> bool {
+    if !is_create_remnant(dir) {
+        return false;
+    }
+    let lock_path = dir.join(crate::db_files::LOCK);
+    let Ok(lock) = OpenOptions::new().create(true).write(true).truncate(false).open(&lock_path) else {
+        return false;
+    };
+    // 作成中の create は mkdir の直後から lock を持つ。 取れなければ作成中 (または lock の無い FS) = 触らない
+    if !matches!(enchudb_oplog::filelock::try_lock_exclusive(&lock), Ok(true)) {
+        return false;
+    }
+    // lock を取るまでの間に header が書かれていないか確かめ直す
+    let still = is_create_remnant(dir);
+    drop(lock); // Windows は開いている file を消せない
+    still && std::fs::remove_dir_all(dir).is_ok()
 }
 
 /// v10: `[start, end)` の中で data が載っている最後の byte 位置 (SEEK_DATA / SEEK_HOLE)。
@@ -1544,8 +1600,10 @@ pub enum DbState {
     /// backup を封緘したい / 転送後に中身まで確かめたいなら `probe` ではなく
     /// `seal_integrity()` + `open` を使うこと。
     Ready,
-    /// directory はあるが **DB になりきっていない** — `header.seg` が無い、 または
+    /// directory はあるが **DB になりきっていない** — `header.seg` が無い、 header が全部 0 で
+    /// commit されたものが何も無い (#323: create が header を書く前に落ちた)、 または
     /// header が指す segment が欠けていて manifest も無い (= create が途中で落ちた)。
+    /// header が全部 0 の残骸は `create*` がそのまま作り直す (別プロセスが作成中なら触らない)。
     ///
     /// **`header.seg` を持たない directory はすべてここに来る。** create が途中で落ちた
     /// 残骸だけでなく、 **db と無関係な普通の directory** も同じ `Incomplete` になる
@@ -3235,14 +3293,34 @@ impl Engine {
         }
         // H11: 既存 DB を silent に破壊しない。 directory 作成 (atomic) → lock → segment。
         create_db_dir(path)?;
+        // #323: ここから header を書き終えるまでに失敗したら、 自分が作った directory を片付ける
+        // (残すと header が 0 の directory になり、 open も create も通らない)。
+        let abandon = |e: io::Error| {
+            let _ = std::fs::remove_dir_all(path);
+            e
+        };
         // writer lock を先に取る (= 他 writer が居れば block)。 create も書き込みなので必須。
-        let writer_lock = acquire_writer_lock(path)?;
-        let set = SegmentSet::create(
+        let writer_lock = acquire_writer_lock(path).map_err(abandon)?;
+        let created = SegmentSet::create(
             std::path::Path::new(path),
             &layout,
             layout.leaf_data_size > 0,
             layout.has_cell_version(),
-        )?;
+        );
+        #[cfg(test)]
+        let created = created.and_then(|set| {
+            if FAIL_CREATE_AFTER_SEGMENTS.with(|f| f.get()) {
+                return Err(io::Error::other("test: create を segment の後で落とす"));
+            }
+            Ok(set)
+        });
+        let set = match created {
+            Ok(set) => set,
+            Err(e) => {
+                drop(writer_lock);
+                return Err(abandon(e));
+            }
+        };
         let backing = Backing::Segments(Arc::new(set));
         {
             let mmap = backing.header_mut(layout.header_size);
@@ -3268,7 +3346,11 @@ impl Engine {
             // ヘッダ整合性 CRC
             write_header_crc(mmap);
         }
-        backing.flush_header(layout.header_size)?;
+        if let Err(e) = backing.flush_header(layout.header_size) {
+            drop(backing);
+            drop(writer_lock);
+            return Err(abandon(e));
+        }
 
         let entities = EntitySet::init(backing.region(SegmentKind::Entities, &layout), max_entities, layout.reserve_entities);
         let vocab = Vocabulary::init(
@@ -3853,6 +3935,10 @@ impl Engine {
         }
         // header.seg が無い = create が header を書く前に落ちた。
         if !p.join(crate::segments::SegmentKind::Header.rel_path()).is_file() {
+            return DbState::Incomplete;
+        }
+        // #323: create が header を書く前に落ちた残骸 (header が全部 0 で、 commit されたものが無い)。
+        if is_create_remnant(p) {
             return DbState::Incomplete;
         }
         // header が読めなければ、 directory の形はしているが DB ではない。
@@ -17907,5 +17993,83 @@ mod v10_dir_tests {
             t0.elapsed(), eng.entity_count(), eng.himo_count(), tables, eng.has_cell_version()
         );
         assert!(eng.entity_count() > 0);
+    }
+
+    /// #323: create が segment の後 (header を書く前) で失敗しても directory を残さない。
+    /// (旧: header が 0 の directory が残り、 open は `not an EnchuDB file`、 create は `AlreadyExists`)
+    #[test]
+    fn failed_create_leaves_nothing() {
+        let path = tmp("323_failed_create");
+        FAIL_CREATE_AFTER_SEGMENTS.with(|f| f.set(true));
+        let r = Engine::create_growable_with_capacity(&path, 65_536);
+        FAIL_CREATE_AFTER_SEGMENTS.with(|f| f.set(false));
+        assert!(r.is_err(), "fault injection が効いていない");
+        assert!(!std::path::Path::new(&path).exists(), "失敗した create が directory を残した");
+        assert_eq!(Engine::probe(&path), DbState::Missing);
+        let mut eng = Engine::create_growable_with_capacity(&path, 65_536).expect("作り直せない");
+        eng.define_himo("n", ValueType::Number, 0);
+        drop(eng);
+        assert_eq!(Engine::probe(&path), DbState::Ready);
+    }
+
+    /// 前の版が残した残骸 (header が全部 0 / tables も manifest も himo も無い) は `Incomplete` で、
+    /// create がそこに作り直せる。
+    fn make_remnant(path: &str) {
+        drop(Engine::create_growable_with_capacity(path, 65_536).unwrap());
+        let h = format!("{path}/header.seg");
+        let len = std::fs::metadata(&h).unwrap().len() as usize;
+        std::fs::write(&h, vec![0u8; len]).unwrap();
+        for n in [db_files::TABLES, db_files::SEGMENTS] {
+            let _ = std::fs::remove_file(format!("{path}/{n}"));
+        }
+    }
+
+    #[test]
+    fn create_reclaims_a_remnant() {
+        let path = tmp("323_remnant");
+        make_remnant(&path);
+        assert!(Engine::open_standalone(&path).is_err());
+        assert_eq!(Engine::probe(&path), DbState::Incomplete, "残骸を Damaged と言っている");
+        let mut eng = Engine::create_growable_with_capacity(&path, 65_536).expect("残骸に作り直せない");
+        eng.define_himo("n", ValueType::Number, 0);
+        let e = eng.entity().unwrap();
+        eng.tie(e, "n", 7);
+        drop(eng);
+        let eng = Engine::open_standalone(&path).unwrap();
+        assert_eq!(eng.get(e, "n"), Some(7));
+    }
+
+    /// 別の handle が writer lock を持っている (= create の最中) なら、 残骸の形でも消さない。
+    #[test]
+    fn create_leaves_a_locked_remnant_alone() {
+        let path = tmp("323_locked");
+        make_remnant(&path);
+        let holder = std::fs::OpenOptions::new().create(true).write(true).truncate(false)
+            .open(format!("{path}/{}", db_files::LOCK)).unwrap();
+        assert_eq!(enchudb_oplog::filelock::lock_exclusive(&holder).unwrap(), enchudb_oplog::filelock::LockOutcome::Locked);
+        let r = Engine::create_growable_with_capacity(&path, 65_536);
+        assert_eq!(r.err().map(|e| e.kind()), Some(io::ErrorKind::AlreadyExists), "lock 中の directory を作り直した");
+        assert!(std::path::Path::new(&format!("{path}/header.seg")).exists(), "lock 中の directory を消した");
+        drop(holder);
+    }
+
+    /// 中身のある DB の header だけが 0 になった形は残骸と見なさない (`Damaged` のまま、 create は拒む)。
+    #[test]
+    fn zeroed_header_with_data_is_not_a_remnant() {
+        let path = tmp("323_data");
+        {
+            let mut eng = Engine::create_growable_with_capacity(&path, 65_536).unwrap();
+            eng.define_himo("n", ValueType::Number, 0);
+            let e = eng.entity().unwrap();
+            eng.tie(e, "n", 7);
+            eng.flush().unwrap();
+        }
+        let h = format!("{path}/header.seg");
+        let len = std::fs::metadata(&h).unwrap().len() as usize;
+        std::fs::write(&h, vec![0u8; len]).unwrap();
+        assert!(matches!(Engine::probe(&path), DbState::Damaged(_)), "{:?}", Engine::probe(&path));
+        let r = Engine::create_growable_with_capacity(&path, 65_536);
+        assert_eq!(r.err().map(|e| e.kind()), Some(io::ErrorKind::AlreadyExists), "中身のある DB を消して作り直した");
+        assert!(std::path::Path::new(&path).join("himo").read_dir().unwrap().next().is_some(), "himo segment が消えた");
     }
 }
