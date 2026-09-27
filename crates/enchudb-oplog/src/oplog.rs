@@ -624,6 +624,11 @@ pub struct OpLog {
     capacity: u64,
     /// writer 側のキャッシュ(atomic CAS で前進)。mmap ヘッダにも反映。
     head: AtomicU64,
+    /// #268: **書き終えた** record の終端。 append は head を先に進めてから record を書くので、 head と
+    /// この値の間は書いている最中 = 前の周 (fold 前) の record がまだ残っている。 scan はここまでしか読まない
+    /// (読むと前の周の Commit で group を閉じたつもりになり、 cursor を record の境目でない位置へ進めて
+    /// bridge が開き直すまで止まった)。 append は append_lock の下で書き終えてから Release で置く。
+    written: AtomicU64,
     checkpoint: AtomicU64,
     next_lsn: AtomicU64,
     /// 最後に払い出した HLC の (wall(ms), logical)。 logical は wall が進まない時の tiebreaker。
@@ -742,6 +747,7 @@ impl OpLog {
             mmap,
             capacity: capacity as u64,
             head: AtomicU64::new(HEADER_SIZE as u64),
+            written: AtomicU64::new(HEADER_SIZE as u64),
             checkpoint: AtomicU64::new(HEADER_SIZE as u64),
             next_lsn: AtomicU64::new(1),
             hlc_state: std::sync::Mutex::new((0, 0)),
@@ -807,6 +813,7 @@ impl OpLog {
             mmap,
             capacity,
             head: AtomicU64::new(head),
+            written: AtomicU64::new(head),
             checkpoint: AtomicU64::new(checkpoint),
             next_lsn: AtomicU64::new(1),
             hlc_state: std::sync::Mutex::new((0, 0)),
@@ -1046,6 +1053,7 @@ impl OpLog {
 
         // ファイルヘッダの head を一括更新 (batch 全体が書き終わったあと)
         mmap[8..16].copy_from_slice(&(start_offset + total as u64).to_le_bytes());
+        self.written.store(start_offset + total as u64, Ordering::Release);
 
         Ok(lsns)
     }
@@ -1128,6 +1136,7 @@ impl OpLog {
             .copy_from_slice(&sb[SIGNED_PAYLOAD_HEADER_SIZE..]);
         // ファイルヘッダの head も更新
         mmap[8..16].copy_from_slice(&(offset + record_size as u64).to_le_bytes());
+        self.written.store(offset + record_size as u64, Ordering::Release);
 
         // ローカル HLC clock を受信 HLC で merge (後退防止)
         let hlc = Hlc {
@@ -1247,6 +1256,7 @@ impl OpLog {
 
         // ファイルヘッダの head も更新
         mmap[8..16].copy_from_slice(&(offset + record_size as u64).to_le_bytes());
+        self.written.store(offset + record_size as u64, Ordering::Release);
 
         Ok((lsn, hlc))
     }
@@ -1294,6 +1304,7 @@ impl OpLog {
         if self.head.compare_exchange(head, HEADER_SIZE as u64, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return false;
         }
+        self.written.store(HEADER_SIZE as u64, Ordering::Release);
         self.checkpoint.store(HEADER_SIZE as u64, Ordering::Release);
         let mmap = self.mmap_mut_slice();
         mmap[8..16].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
@@ -1508,7 +1519,8 @@ impl OpLog {
         let mut batch = Vec::new();
         let mut offset = start_offset;
         let mut committed_end = start_offset;
-        let head = self.head.load(Ordering::Acquire);
+        // #268: head ではなく書き終えた終端まで (head との間は書いている最中 = 前の周の record が見える)
+        let head = self.written.load(Ordering::Acquire);
         let mut max_lsn = 0;
         let mut max_hlc = Hlc::ZERO;
         // #268: 打ち切り理由。 while を抜け切れば「head まで読んだ」。
@@ -1617,6 +1629,7 @@ impl OpLog {
     pub fn reset_to_checkpoint(&self) {
         let cp = self.checkpoint.load(Ordering::Acquire);
         self.head.store(cp, Ordering::Release);
+        self.written.store(cp, Ordering::Release);
         self.mmap_mut_slice()[8..16].copy_from_slice(&cp.to_le_bytes());
     }
 
@@ -1685,6 +1698,7 @@ impl OpLog {
             buf,
             capacity: capacity as u64,
             head: AtomicU64::new(HEADER_SIZE as u64),
+            written: AtomicU64::new(HEADER_SIZE as u64),
             checkpoint: AtomicU64::new(HEADER_SIZE as u64),
             next_lsn: AtomicU64::new(1),
             hlc_state: std::sync::Mutex::new((0, 0)),
