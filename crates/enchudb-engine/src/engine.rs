@@ -8068,7 +8068,12 @@ impl Engine {
         if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
-        self.live_set(himo_id as usize, local, value);
+        // #316: 列を伸ばせず書けなかったら版数も記録しない (記録すると、 値の無い cell が
+        // 「適用済み」 に見え、 同じ record の再配送も LWW で負ける)
+        if !self.live_set(himo_id as usize, local, value) {
+            self.record_fault(FaultKind::DiskSpace, "列を伸ばすディスクの空きが無い — cell も版数も書かない");
+            return false;
+        }
         self.store_cell_hlc(local, himo_id, hlc);
         true
     }
@@ -8746,6 +8751,10 @@ impl Engine {
         if !self.accepts_write(local, himo_id, hlc) {
             return RemoteApply::Stale;
         }
+        // #316: cell の列を伸ばせないなら payload を置く前に断る (置いてから cell を書けないと orphan)
+        if self.ensure_cell_room(hid, local).is_err() {
+            return RemoteApply::RejectedCapacity;
+        }
         self.entities.ensure_live(local);
         // v6 (#88): remote re-tie 上書きで旧 offset を回収。
         // #119: **insert → publish → free** の順 (逆順だと並行 reader が再利用 slot を読む)。
@@ -8778,15 +8787,30 @@ impl Engine {
         value: impl CellValue,
         hlc: enchudb_oplog::Hlc,
     ) -> bool {
-        let Some(value) = self.cell_value(value) else { return false };
+        self.remote_tie_apply_result(eid, himo_id, value, hlc).applied()
+    }
+
+    /// `remote_tie_apply` の結果付き版 (#316)。 列を伸ばせない時は `RejectedCapacity`
+    /// (値も版数も書かない = 空きが出てからの再配送で入る)。
+    pub fn remote_tie_apply_result(
+        &self,
+        eid: enchudb_oplog::EntityId,
+        himo_id: u16,
+        value: impl CellValue,
+        hlc: enchudb_oplog::Hlc,
+    ) -> RemoteApply {
+        let Some(value) = self.cell_value(value) else { return RemoteApply::Stale };
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
-        if hid >= self.himos.len() { return false; }
+        if hid >= self.himos.len() { return RemoteApply::Stale; }
         self.observe_remote_hlc(hlc);
+        if self.ensure_cell_room(hid, local).is_err() {
+            return RemoteApply::RejectedCapacity;
+        }
         // request17 step 5: LWW 判定は `set_cell` の内側だけ (A-2)。 sync 層で
         // 判定してから別関数で適用する形は、 呼び忘れれば黙って壊れる。
         if !self.set_cell_local(local, himo_id, value, hlc) {
-            return false;
+            return RemoteApply::Stale;
         }
         // entity 未確保ならローカル側の EntitySet に登録(eid は peer 側が決めた値)
         self.entities.ensure_live(local);
@@ -8797,7 +8821,7 @@ impl Engine {
         Self::advance_table_next_local_for(&self.tables, local);
         // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
         // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
-        true
+        RemoteApply::Applied
     }
 
     /// リモート peer から届いた Untie を apply。
@@ -14966,6 +14990,26 @@ mod cell_version_tests {
         assert_eq!(eng.get(e1, "a"), Some(1));
         assert_eq!(eng.get(e1, "b"), Some(2));
         assert_eq!(eng.get(e2, "a"), Some(3));
+    }
+
+    /// #316: 本体の列を伸ばせない時、 `set_cell_local` は false を返し、 版数も記録しない。
+    /// (旧: `live_set` の失敗を捨てて版数を記録し true を返した。 値の無い cell が 「適用済み」 に見え、
+    /// 同じ record の再配送も LWW で負ける)。 版数の列だけ伸ばせて本体が伸ばせない状態を直接作る。
+    #[test]
+    fn set_cell_local_rejects_when_the_column_cannot_grow() {
+        let path = tmp("316_set_cell_local");
+        let mut eng = Engine::create_growable_with_cell_version(&path, 1 << 20).unwrap();
+        eng.define_himo("n", ValueType::Number, 0);
+        let hid = eng.himo_id("n").unwrap() as u16;
+        let far = (1u32 << 20) - 2;
+        eng.ver_col(hid).expect("版数の列").ensure_committed_for(far).unwrap();
+        eng.set_space_margin(u64::MAX / 2);
+        assert!(!eng.set_cell_local(far, hid, 42u32, hlc(500, 7)), "列を伸ばせないのに採用した");
+        assert_eq!(eng.cell_hlc_local(far, hid), Hlc::ZERO, "値が無いのに版数が記録された");
+        assert!(eng.fault_count(FaultKind::DiskSpace) > 0);
+        eng.set_space_margin(0);
+        assert!(eng.set_cell_local(far, hid, 42u32, hlc(500, 7)), "空きが戻っても書けない");
+        assert_eq!(eng.cell_hlc_local(far, hid), hlc(500, 7));
     }
 }
 
