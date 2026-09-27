@@ -244,6 +244,15 @@ fn defers_for_fs_type(f_type: u64) -> bool {
 /// #167: 伸長時に残す空き容量 margin (`GrowableMap` と同じ既定)。
 const SPACE_MARGIN: u64 = 32 * 1024 * 1024;
 
+/// 新しく開く / 作る segment の margin の既定値 (`set_default_space_margin`)。
+static DEFAULT_SPACE_MARGIN: AtomicU64 = AtomicU64::new(SPACE_MARGIN);
+
+/// 以後に開く / 作る segment の空き容量 margin の既定値 (プロセス全体、 既定 32 MB)。 open の中で伸ばす分
+/// (索引の作り直し等) にも効かせたい時に open の前に呼ぶ。 開いた後は `Engine::set_space_margin`。
+pub fn set_default_space_margin(bytes: u64) {
+    DEFAULT_SPACE_MARGIN.store(bytes, Ordering::Relaxed);
+}
+
 /// #317: 伸ばした (疎な segment は初めて触った) のに、 まだ flush (msync + fsync) していない byte の
 /// プロセス全体の合計。
 ///
@@ -414,7 +423,7 @@ impl SegmentMap {
             grow_lock: Mutex::new(()),
             dirty_lo: AtomicUsize::new(usize::MAX),
             dirty_hi: AtomicUsize::new(0),
-            space_margin: AtomicU64::new(SPACE_MARGIN),
+            space_margin: AtomicU64::new(DEFAULT_SPACE_MARGIN.load(Ordering::Relaxed)),
             space_denials: AtomicU64::new(0),
             unflushed: AtomicU64::new(0),
             defers_alloc,
@@ -486,6 +495,12 @@ impl SegmentMap {
             }
         }
         Ok(())
+    }
+
+    /// 見かけだけ `end` まで伸ばす (空きは見ない)。 穴は読んでも食わないので、 読む範囲を用意する時に使う。
+    /// 書く page は `touch_sparse` で数えること (#327)。
+    pub fn grow_apparent(&self, end: usize) -> io::Result<()> {
+        self.grow_inner(end, Need::Nothing)
     }
 
     /// `need` byte を新しく書く空きがあるか: 空き < need + margin + まだ flush していない分 なら `StorageFull`。

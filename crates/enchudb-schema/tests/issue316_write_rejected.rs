@@ -8,6 +8,14 @@
 use enchudb_schema::{Database, SchemaError, Table, Value};
 use enchudb_engine::{FaultKind, TieRejected};
 
+/// panic しても DB を消す (変異試験で落とすたびに /tmp に数百 MB 残っていた)。
+struct Cleanup(String);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn tmp(tag: &str) -> String {
     format!("/tmp/enchudb-issue316-{tag}-{}.db", std::process::id())
 }
@@ -32,6 +40,7 @@ fn read(t: &Table, e: u64) -> (Option<Value>, Option<Value>) {
 fn tags_are_written_when_free_space_is_small() {
     let path = tmp("small");
     cleanup(&path);
+    let _cleanup = Cleanup(path.clone());
     let mut db = Database::create(&path).unwrap();
     db.table("users").number("id").tag("name").number("age").primary_key("id").build().unwrap();
     let t = db.get_table("users").unwrap();
@@ -55,6 +64,7 @@ fn tags_are_written_when_free_space_is_small() {
 fn refused_growth_is_an_error() {
     let path = tmp("refused");
     cleanup(&path);
+    let _cleanup = Cleanup(path.clone());
     let mut db = Database::create(&path).unwrap();
     db.table("users").number("id").tag("name").number("age").primary_key("id").build().unwrap();
     let t = db.get_table("users").unwrap();
@@ -91,6 +101,7 @@ fn refused_growth_is_an_error() {
 fn refused_column_growth_is_an_error() {
     let path = tmp("column");
     cleanup(&path);
+    let _cleanup = Cleanup(path.clone());
     let mut db = Database::create(&path).unwrap();
     db.table("events").number("id").number("kind").bigint("at").primary_key("id").build().unwrap();
     let t = db.get_table("events").unwrap();

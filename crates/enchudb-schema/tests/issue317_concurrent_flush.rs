@@ -5,11 +5,20 @@
 
 use enchudb_schema::Database;
 
+/// panic しても DB を消す (変異試験で落とすたびに /tmp に数百 MB 残っていた)。
+struct Cleanup(String);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
 fn syncing_while_writing_does_not_reject() {
     for round in 0..4 {
         let path = format!("/tmp/enchudb-issue317-sync-{}-{round}.db", std::process::id());
         let _ = std::fs::remove_dir_all(&path);
+        let _cleanup = Cleanup(path.clone());
         {
             let mut db = Database::create(&path).unwrap();
             db.table("t").number("id").tag("name").leaf("memo").number("age").primary_key("id").build().unwrap();

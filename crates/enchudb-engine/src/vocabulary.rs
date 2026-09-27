@@ -18,6 +18,11 @@ const INDEX_MAGIC_V2: [u8; 4] = [b'V', b'I', b'X', b'2'];
 const INDEX_HEADER: usize = 16;
 const INDEX_SLOT_SIZE: usize = 13;
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_AFTER_TAKE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// `Vocabulary::try_insert` が値を入れられなかった理由 (#316)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VocabFail {
@@ -122,7 +127,9 @@ impl Vocabulary {
     /// insert されてない) 場合は count=0 / data_end=HEADER の fresh
     /// state を返す。 これで `insert` が遅延書き込みする MAGIC を待たずに
     /// open できる。
-    pub fn load(data: Region, offsets: Region, index: Region, readonly: bool) -> Self {
+    ///
+    /// #327: 索引を作り直すのに要るページを書く空きが無ければ、 書かずにエラー。
+    pub fn load(data: Region, offsets: Region, index: Region, readonly: bool) -> std::io::Result<Self> {
         let dm = data.slice();
         let is_fresh = dm[0..4] != MAGIC;
         let (count, data_end, clean_flag) = if is_fresh {
@@ -177,19 +184,22 @@ impl Vocabulary {
                 shadow.sort_unstable();
                 v.shadow_index = Some(shadow);
             } else {
+                // #327: 索引の全域を読むので見かけだけ伸ばす (穴は読んでも食わない。 書くページは
+                // rebuild_index が数える)。
+                v.index.ensure_committed_apparent(v.index.len())?;
                 // #123: legacy は旧 slot を消してから (消さないと no-clear rebuild (#92) の
                 // 上に新 slot で二重に載って占有率が最大 2 倍になる)。
                 if legacy_index {
                     v.migrate_legacy_index();
                 }
-                v.rebuild_index();
+                v.rebuild_index()?;
                 if legacy_index {
                     v.index.write_at(0, &INDEX_MAGIC);
                     v.index.mark_dirty(0, 4);
                 }
             }
         }
-        v
+        Ok(v)
     }
 
     /// #123: VIX2 index (slot = hash 下位ビット) の entry を **正確に消す** (writer 専用)。
@@ -253,19 +263,27 @@ impl Vocabulary {
     /// #83: `index` を **排他借用** (`&mut self.index` → `as_mut_slice`) して可変
     /// slice を得る。 open 時の単一スレッド実行なので排他が保証され、 `slice_mut(&self)`
     /// のような aliasing 参照を作らない。 `offsets`/`data` は分割借用で不変参照する。
-    fn rebuild_index(&mut self) {
+    ///
+    /// #327: 読むだけで書く slot を決め、 書くページの空きを確かめてから書く。 空きが無ければ何も書かずに
+    /// エラー (旧: 伸ばせなくても書きに進み SIGBUS、 伸ばせても散った slot のページを数えず黙って消えうる)。
+    /// 索引は呼び側が見かけだけ全域 commit しておくこと。
+    fn rebuild_index(&mut self) -> std::io::Result<()> {
         let count = self.count.load(Ordering::Relaxed);
-        let index_cap = self.index_cap;
-        let max_entries = self.max_entries;
-        let Self { index, offsets, data, .. } = self;
-        // v10: rebuild は任意 slot に `&mut [u8]` で書くので index segment を全域 commit
-        // しておく (open 時 1 回、 index が dirty だった場合のみ)。
-        let _ = index.ensure_committed(index.len());
-        Self::rebuild_index_into(offsets, data, count, index_cap, max_entries, index.as_mut_slice());
+        let plan = Self::plan_rebuild(&self.offsets, &self.data, count, self.index_cap, self.max_entries, self.index.slice());
+        for &(off, _, _) in &plan {
+            self.index.ensure_committed_sparse(off + INDEX_SLOT_SIZE, INDEX_SLOT_SIZE)?;
+        }
+        let xm = self.index.as_mut_slice();
+        for (off, h, id) in plan {
+            xm[off] = 1;
+            xm[off + 1..off + 9].copy_from_slice(&h.to_le_bytes());
+            xm[off + 9..off + 13].copy_from_slice(&id.to_le_bytes());
+        }
+        Ok(())
     }
 
-    /// `xm` (index layout のバイト列、 mmap でも heap でも可) へ index を
-    /// 再構築する。 open 時の単一スレッド実行前提なので atomic は使わない。
+    /// 索引 `xm` (読むだけ) に live entry (id 0..count) を載せ直すのに **書く slot** を決める
+    /// (`(slot の位置, hash, id)`、 #327)。 open 時の単一スレッド実行前提なので atomic は使わない。
     ///
     /// #92 (#56 ③): **予約全域を zero-fill しない**。 旧実装は先頭で
     /// `for b in &mut xm[INDEX_HEADER..] { *b = 0; }` と index_cap×13B を全ゼロ
@@ -289,43 +307,50 @@ impl Vocabulary {
     ///   offsets region を溢れて OOB するのを防ぐ = 旧 zero-fill と同じ安全性を復元。
     ///   lookup / index_insert も同じ predicate で一貫させる。
     ///
-    /// #83: `&Self` ではなく必要な region (`offsets`/`data`) + scalar を直接受ける。
-    /// これで呼び出し側が `index` を `&mut` 借用したまま (writer 経路) でも分割借用
-    /// で呼べる。 heap shadow (readonly) 経路とも `xm: &mut [u8]` で共有できて DRY。
-    fn rebuild_index_into(
+    /// probe は index_cap 回で打ち切る (旧実装は無条件 loop = 索引が満杯なら永久に回った)。
+    fn plan_rebuild(
         offsets: &Region,
         data: &Region,
         count: u32,
         index_cap: u32,
         max_entries: u32,
-        xm: &mut [u8],
-    ) {
-        if count == 0 { return; }
-
+        xm: &[u8],
+    ) -> Vec<(usize, u64, u32)> {
+        let mut plan: Vec<(usize, u64, u32)> = Vec::new();
+        if count == 0 { return plan; }
+        // この rebuild で埋める slot (off → (hash, id))。 後の entry の probe はこれも埋まっているとして見る
+        let mut planned: std::collections::BTreeMap<usize, (u64, u32)> = std::collections::BTreeMap::new();
         let mask = (index_cap - 1) as u64;
         for id in 0..count {
             let value = read_value(offsets, data, id);
             let h = fxhash(value);
             let mut idx = home_slot(h, index_cap); // #123
-            loop {
+            for _ in 0..index_cap as usize {
                 let off = INDEX_HEADER + idx * INDEX_SLOT_SIZE;
-                if xm[off] == 0 {
-                    xm[off] = 1;
-                    xm[off + 1..off + 9].copy_from_slice(&h.to_le_bytes());
-                    xm[off + 9..off + 13].copy_from_slice(&id.to_le_bytes());
-                    break;
-                }
-                let slot_hash = u64::from_le_bytes(xm[off + 1..off + 9].try_into().unwrap());
-                if slot_hash == h {
-                    let vid = u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap());
+                let slot = match planned.get(&off) {
+                    Some(&(ph, pid)) => Some((ph, pid)),
+                    None if xm[off] == 0 => None,
+                    None => Some((
+                        u64::from_le_bytes(xm[off + 1..off + 9].try_into().unwrap()),
+                        u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap()),
+                    )),
+                };
+                match slot {
+                    None => {
+                        planned.insert(off, (h, id));
+                        plan.push((off, h, id));
+                        break;
+                    }
                     // #92: vid >= max_entries の破損 slot は read_value(vid) が offsets region を
                     // 溢れて OOB するので dup 判定に使わず読み飛ばす (lookup / index_insert と
                     // 同じ predicate = 破損 slot の扱いを 3 経路で一貫させる)。
-                    if vid < max_entries && read_value(offsets, data, vid) == value { break; } // 真の重複 (Leaf 二重 append 等)
+                    Some((slot_hash, vid)) if slot_hash == h && vid < max_entries && read_value(offsets, data, vid) == value => break, // 真の重複 (Leaf 二重 append 等)
+                    Some(_) => {}
                 }
                 idx = ((idx as u64 + 1) & mask) as usize;
             }
         }
+        plan
     }
 
     /// 満杯なら **`u32::MAX` (予約 sentinel)** を返す (#59: panic しない)。
@@ -416,6 +441,16 @@ impl Vocabulary {
         if self.index.ensure_committed_sparse(home + INDEX_SLOT_SIZE, INDEX_SLOT_SIZE).is_err() {
             return Err(VocabFail::Space);
         }
+        let len = value.len() as u32;
+        // #328: data / offsets も番号を取る前に伸ばせるか見る (取った後に伸ばせないと番号を捨てることになる)。
+        // 並行 insert で位置は先へずれうるので、 ここは捨てる番号を減らすための先取りで、 保証は下の確認
+        let (count_now, end_now) = (self.count.load(Ordering::Relaxed), self.data_end.load(Ordering::Relaxed));
+        if count_now < self.max_entries
+            && (self.data.ensure_committed((end_now + len) as usize).is_err()
+                || self.offsets.ensure_committed(((count_now as usize) + 1) * 8).is_err())
+        {
+            return Err(VocabFail::Space);
+        }
         let id = self.count.fetch_add(1, Ordering::Relaxed);
         // #122: vocab_max_entries が公開 knob になったので、 天井 hit を actionable に
         // する (#118 の `too many himos` と同じ扱い)。 既存 DB は header 焼き込みなので
@@ -426,10 +461,10 @@ impl Vocabulary {
         // 記録 + 報告し、 write を拒否する。 `u32::MAX` は元々 「無効値」 として
         // engine 側の guard が見ている値なので、 新しい規約を増やしていない。
         if id >= self.max_entries {
+            // 天井より先の番号は誰も使わないので戻してよい (戻す間に取られる番号も天井より先)
             self.count.fetch_sub(1, Ordering::Relaxed);
             return Err(VocabFail::Full);
         }
-        let len = value.len() as u32;
         let offset = self.data_end.fetch_add(len, Ordering::Relaxed);
         // Growable backing: extend the file-backed window before
         // writing past the current commit. No-op for static backings.
@@ -437,19 +472,23 @@ impl Vocabulary {
         // past its committed footprint (offsets have id × 8 layout).
         // #167: commit を伸ばせなければ **書かずに諦める** (予約 sentinel を返す)。
         // 未 commit page への書き込みは (ディスク満杯なら) SIGBUS でプロセスごと
-        // 落ちるので、 error を捨てて書き進めてはいけない。 採番は巻き戻す。
-        if self.data.ensure_committed((offset + len) as usize).is_err()
+        // 落ちるので、 error を捨てて書き進めてはいけない。
+        // #328: 番号は巻き戻さずに捨てる。 巻き戻すと、 その間に次の番号を取った insert が居た時に次の
+        // fetch_add がその番号をもう一度配り、 offsets を上書きする。 捨てた番号は offsets が 0 = 空の値として読める
+        if Self::fail_after_take()
+            || self.data.ensure_committed((offset + len) as usize).is_err()
             || self.offsets.ensure_committed(((id as usize) + 1) * 8).is_err()
         {
-            self.count.fetch_sub(1, Ordering::Relaxed);
             return Err(VocabFail::Space);
         }
         self.data.write_at(offset as usize, value);
         self.data.write_at(0, &MAGIC);
         let new_count = id + 1;
         let new_end = offset + len;
-        self.data.write_at(4, &new_count.to_le_bytes());
-        self.data.write_at(8, &new_end.to_le_bytes());
+        // #328: 並行 insert は逆順に終わりうるので、 header の件数 / data の終わりは戻さない (max で書く)。
+        // 素の上書きだと後から終わった小さい番号が件数を戻し、 開き直した後に使用済みの番号を配り直す
+        self.data.as_atomic_u32(4).fetch_max(new_count, Ordering::AcqRel);
+        self.data.as_atomic_u32(8).fetch_max(new_end, Ordering::AcqRel);
         self.data.mark_dirty(0, 12);
         // #77-M1: flush() が clean=1 を書いた後の最初の insert で 0 に戻す。
         // これが無いと flush 後の write 中 crash で、 次 open が部分 writeback
@@ -471,7 +510,18 @@ impl Vocabulary {
         Ok(id)
     }
 
-    /// index に (hash, id) を登録する。 **index が満杯なら `false`** (#59)。
+    /// テストで 「番号を取った直後に伸ばせなかった」 を起こす (#328)。 thread_local なので他のテストに効かない。
+    #[cfg(test)]
+    fn fail_after_take() -> bool {
+        FAIL_AFTER_TAKE.with(|f| f.get())
+    }
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn fail_after_take() -> bool {
+        false
+    }
+
+    /// index に (hash, id) を登録する。 **index が満杯なら `Err(Full)`、 伸ばせなければ `Err(Space)`** (#59 / #316)。
     ///
     /// 旧実装は空 slot が見つかるまで無条件に linear probe しており、 index が 100%
     /// 埋まると永久に回った (= 満杯が hang)。 走査は index_cap 回で打ち切る。
@@ -621,6 +671,7 @@ mod tests {
                 unsafe { Region::new(self.index_ptr, self.index_len) },
                 readonly,
             )
+            .unwrap()
         }
         fn index_bytes(&self) -> Vec<u8> {
             unsafe { std::slice::from_raw_parts(self.index_ptr, self.index_len) }.to_vec()
@@ -937,6 +988,25 @@ mod tests {
         assert_eq!(flag(&r), 1, "flush 直後は clean=1");
         w.get_or_insert(b"second");
         assert_eq!(flag(&r), 0, "flush 後の insert で clean=0 に戻るはず (#77-M1)");
+    }
+
+    /// #328: 番号を取った直後に伸ばせなかった insert の番号は、 次の insert に配り直さない (巻き戻すと、 並行に
+    /// 次の番号を取った insert が居た時に同じ番号を 2 回配り、 offsets を上書きする)。 捨てた番号は空の値として
+    /// 読め、 開き直しても件数は戻らない。
+    #[test]
+    fn failed_take_is_not_reissued() {
+        let r = make_regions(1024, 1024, 64 * 1024);
+        let w = r.vocab_init(1024, 1024);
+        assert_eq!(w.try_insert(b"a"), Ok(0));
+        FAIL_AFTER_TAKE.with(|f| f.set(true));
+        assert_eq!(w.try_insert(b"b"), Err(VocabFail::Space));
+        FAIL_AFTER_TAKE.with(|f| f.set(false));
+        assert_eq!(w.try_insert(b"c"), Ok(2), "捨てた番号 1 を配り直した");
+        assert_eq!((w.get(0), w.get(1), w.get(2)), (&b"a"[..], &b""[..], &b"c"[..]));
+        drop(w);
+        let v = r.vocab_load(false);
+        assert_eq!(v.count(), 3);
+        assert_eq!((v.lookup(b"a"), v.lookup(b"c")), (Some(0), Some(2)));
     }
 
     /// index 領域を直接叩くための helper。

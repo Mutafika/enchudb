@@ -6,6 +6,14 @@
 
 use enchudb_schema::{Database, SchemaError, Value};
 
+/// panic しても DB を消す (変異試験で落とすたびに /tmp に数百 MB 残っていた)。
+struct Cleanup(String);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn name(i: i64) -> String {
     format!("tag-{i:08}")
 }
@@ -14,6 +22,7 @@ fn name(i: i64) -> String {
 fn new_index_pages_are_counted() {
     let path = format!("/tmp/enchudb-issue317-pages-{}.db", std::process::id());
     let _ = std::fs::remove_dir_all(&path);
+    let _cleanup = Cleanup(path.clone());
     let n;
     {
         let mut db = Database::create(&path).unwrap();
