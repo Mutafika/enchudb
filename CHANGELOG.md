@@ -3,6 +3,45 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.27.1 — 2026-09-27
+
+**iOS で新しい DB を作れなかった regression の patch** (#320)。 on-disk format は**不変**、
+migration 不要、 公開 API の変更なし。 **iOS / tvOS / watchOS / visionOS の consumer は上げること**。
+
+### Fixed — iOS 系で create が ENOMEM で失敗する (#320)
+
+0.26.0 (request20 案 B) から、 unix では create 時に既定で 2^28 entity 分を予約していた
+(`grow_entity_cap` で伸ばせる上限)。 予約は仮想領域だけだが **列ごとに 1〜4 GB** (Column 4 B /
+版数 16 B) かかり、 列の数だけ積み重なる。 iOS はプロセスの仮想アドレス空間に上限がある
+(extended-virtual-addressing の entitlement が無い場合) ので、 実機 (iPhone 17) で
+`create_growable_with_capacity(path, 65_536)` が `Cannot allocate memory (os error 12)` になった。
+macOS / Android では起きない。 0.26.0〜0.27.0 のすべてが該当する。
+
+iOS / tvOS / watchOS / visionOS では、 Windows と同じく既定の予約を `max_entities` にした
+(= `grow_entity_cap` で cap を伸ばせない。 伸ばしたい時は予約を明示する)。 v9 からの migrate の
+既定も同じ扱い。 macOS で同じ形 (Tag 12 列 + Number 2 列 + sync) の DB を作った時の仮想領域:
+
+| | 仮想領域の増分 |
+|---|---|
+| 既定 (2^28 予約) | +34,393 MB |
+| 予約 = cap | +1,597 MB |
+
+予約を明示したい時は、 schema からも既存の API で渡せる:
+
+```rust
+Database::create_growable_with(path, GrowableOptions {
+    max_entities: 65_536,
+    reserve_entities: Some(65_536),
+    ..Default::default()
+})?;
+```
+
+- 既に作った DB の予約は header に焼かれている (open 時もその値で予約する)。 macOS 等で作った DB を
+  iOS に持ち込む構成では、 作る側で `reserve_entities` を明示すること
+- 検証: 判定の unit test を iOS simulator (`aarch64-apple-ios-sim`) でも実行、 `cargo check
+  --target aarch64-apple-ios` 通過。 simulator には端末の仮想アドレス空間の上限がかからないので、
+  実機での解消は consumer 側で確認する
+
 ## 0.27.0 — 2026-09-27
 
 **live query (クエリ購読) と 64 bit 列を入れた minor release。** `find()` を呼び直す代わりに
