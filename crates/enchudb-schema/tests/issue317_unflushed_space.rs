@@ -14,6 +14,14 @@
 
 use enchudb_schema::{Database, SchemaError, Value};
 
+/// panic しても DB を消す (変異試験で落とすたびに /tmp に数百 MB 残っていた)。
+struct Cleanup(String);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn memo(i: i64) -> String {
     format!("{i:08}-{}", "m".repeat(1000))
 }
@@ -22,6 +30,7 @@ fn memo(i: i64) -> String {
 fn stops_before_the_space_it_was_given() {
     let path = format!("/tmp/enchudb-issue317-{}.db", std::process::id());
     let _ = std::fs::remove_dir_all(&path);
+    let _cleanup = Cleanup(path.clone());
     let n;
     {
         let mut db = Database::create(&path).unwrap();
