@@ -12346,9 +12346,10 @@ impl Engine {
             // body より先に writeback すると、 recovery 直後の再 crash で
             // 「一度 durable だった committed record」 が replay 対象外になり
             // 恒久消失した。
-            let _ = eng.body_msync();
-            let _ = w.fsync();
-            w.advance_checkpoint(w.head());
+            // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
+            if eng.body_msync().is_ok() && w.fsync().is_ok() {
+                w.advance_checkpoint(w.head());
+            }
             std::sync::Arc::new(w)
         } else {
             std::sync::Arc::new(enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?)
@@ -12636,9 +12637,10 @@ impl Engine {
                 eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer);
             }
             // #77-H2: body msync → checkpoint の順 (open_concurrent_with_oplog と同じ)
-            let _ = eng.body_msync();
-            let _ = w.fsync();
-            w.advance_checkpoint(w.head());
+            // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
+            if eng.body_msync().is_ok() && w.fsync().is_ok() {
+                w.advance_checkpoint(w.head());
+            }
             std::sync::Arc::new(w)
         } else {
             std::sync::Arc::new(enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?)
@@ -12837,8 +12839,9 @@ impl Engine {
                                 // fsync 済み write が replay 対象外になり消失した。
                                 let durable_head = wal.head();
                                 let durable_lsn = wal.next_lsn().saturating_sub(1);
-                                let _ = wal.fsync();
-                                let _ = engine.body_msync();
+                                // #317: 書き出しに失敗したら checkpoint を進めない (進めると oplog が畳まれ、
+                                // 書き出せなかった本体を復旧する record も消える)
+                                let synced = engine.sync_for_checkpoint(wal);
                                 // 0.8.1: 周期 fsync でも tables sidecar を persist。
                                 // checkpoint を前進させる前に必ず sidecar を固める
                                 // (= 直後に process kill されても次 open で sidecar
@@ -12852,7 +12855,7 @@ impl Engine {
                                 // 一過性要因なら自力で回復する。 例外は死区間
                                 // (append_dead = Commit 1 個すら入らない) で、 こちらは
                                 // 二度と閉じられないので従来どおり進めて fold に任せる。
-                                if committed || wal.append_dead() {
+                                if (committed || wal.append_dead()) && synced {
                                     wal.advance_checkpoint(durable_head);
                                 }
                                 durable_lsn_for_thread.store(durable_lsn, Ordering::Release);
@@ -12960,8 +12963,7 @@ impl Engine {
                         if let Some(wal) = oplog_for_thread.as_ref() {
                             let committed = engine.append_commit_marker(wal).is_ok();
                             let durable_head = wal.head(); // #77-H3: msync 前に snapshot
-                            let _ = wal.fsync();
-                            let _ = engine.body_msync();
+                            let synced = engine.sync_for_checkpoint(wal); // #317
                             // 0.8.1: shutdown 時に tables sidecar を強制 persist。
                             // 旧 behavior では body_msync のみで `next_local` が
                             // sidecar に書かれず、 short-lived CLI (sinfo の sf 等)
@@ -12971,7 +12973,7 @@ impl Engine {
                             engine.try_persist_tables();
                             // #268: Commit が打てなかったら checkpoint は据え置く
                             // (理由は周期 fsync 側の同じ分岐を参照)。
-                            if committed || wal.append_dead() {
+                            if (committed || wal.append_dead()) && synced {
                                 wal.advance_checkpoint(durable_head);
                             }
                             // 0.8.0: shutdown 時も最終 sync 転送 (drop で残った record も
@@ -13037,6 +13039,20 @@ impl Engine {
 
         *arc.consumer_handle.lock().unwrap() = Some(handle);
         arc
+    }
+
+    /// checkpoint を進める前の oplog fsync + 本体の書き出し。 どちらかが失敗したら false (#317: 空き不足で
+    /// 書き出せなかった page があると fsync が ENOSPC を返す)。 失敗は `FaultKind::DiskSpace` に積む。
+    fn sync_for_checkpoint(&self, wal: &enchudb_oplog::oplog::OpLog) -> bool {
+        let wal_ok = wal.fsync().is_ok();
+        let body_ok = self.body_msync().is_ok();
+        if !(wal_ok && body_ok) {
+            self.record_fault(
+                FaultKind::DiskSpace,
+                "oplog / 本体の書き出しに失敗 (空き不足?) — checkpoint を進めない",
+            );
+        }
+        wal_ok && body_ok
     }
 
     /// body mmap の msync(WAL 順序と絡むので &self で呼び出し可能)。
