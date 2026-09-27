@@ -41,6 +41,15 @@ use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
 const SPACE_MARGIN: u64 = 32 * 1024 * 1024;
+
+/// 新しく開く / 作る segment の margin の既定値 (`set_default_space_margin`)。
+static DEFAULT_SPACE_MARGIN: AtomicU64 = AtomicU64::new(SPACE_MARGIN);
+
+/// 以後に開く / 作る segment の空き容量 margin の既定値 (プロセス全体、 既定 32 MB)。 open の中で伸ばす分
+/// (索引の作り直し等) にも効かせたい時に open の前に呼ぶ。 開いた後は `Engine::set_space_margin`。
+pub fn set_default_space_margin(bytes: u64) {
+    DEFAULT_SPACE_MARGIN.store(bytes, Ordering::Relaxed);
+}
 const GRANULARITY: usize = 64 * 1024;
 
 fn align_up(v: usize, a: usize) -> usize {
@@ -163,7 +172,7 @@ impl SegmentMap {
             readonly,
             dirty_lo: AtomicUsize::new(usize::MAX),
             dirty_hi: AtomicUsize::new(0),
-            space_margin: AtomicU64::new(SPACE_MARGIN),
+            space_margin: AtomicU64::new(DEFAULT_SPACE_MARGIN.load(Ordering::Relaxed)),
             space_denials: AtomicU64::new(0),
         })
     }
@@ -208,6 +217,11 @@ impl SegmentMap {
     pub fn grow_amortized(&self, needed: usize) -> io::Result<()> {
         GROW_COUNT.fetch_add(1, Ordering::Relaxed);
         self.grow_to(needed)
+    }
+
+    /// unix 版と同じ API (#327)。 Windows は section の commit が実体を持つので見かけの長さで見る。
+    pub fn grow_apparent(&self, end: usize) -> io::Result<()> {
+        self.grow_to(end)
     }
 
     /// unix 版と同じ API (#316 / #317)。 Windows は section の commit が実体を持つので見かけの長さで見る。

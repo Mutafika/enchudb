@@ -4210,7 +4210,8 @@ impl Engine {
             unsafe { Region::new(base.add(layout.vocab_offsets_off), layout.vocab_offsets_size) },
             unsafe { Region::new(base.add(layout.vocab_index_off), layout.vocab_index_size) },
             /*readonly=*/ true,
-        );
+        )
+        .map_err(|e| e.to_string())?;
         // v6 出力なので leaf offset は byte (off_shift=0)。
         let leaf = LeafStore::init(unsafe {
             Region::new(base.add(layout.leaf_data_off), layout.leaf_data_size)
@@ -4344,14 +4345,16 @@ impl Engine {
             backing.region(SegmentKind::VocabOffsets, &layout),
             backing.region(SegmentKind::VocabIndex, &layout),
             readonly, // #77-H1: readonly は共有 index を書き換えず shadow へ rebuild
-        );
+        )
+        .map_err(|e| e.to_string())?;
         report("Vocabulary::load", &mut t, &mut p);
         let himo_reg = Vocabulary::load(
             backing.region(SegmentKind::HimoregData, &layout),
             backing.region(SegmentKind::HimoregOffsets, &layout),
             backing.region(SegmentKind::HimoregIndex, &layout),
             readonly,
-        );
+        )
+        .map_err(|e| e.to_string())?;
         report("himo_reg(Vocabulary)", &mut t, &mut p);
         let contents = ContentStore::load(
             backing.region(SegmentKind::ContentIndex, &layout),
