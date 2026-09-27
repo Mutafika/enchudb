@@ -3,6 +3,86 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.27.2 — 2026-09-27
+
+**ディスクの空きが少ない時に、 書き込みが Ok のまま消える穴を塞いだ patch** (#316 / #317)。
+on-disk format は**不変**、 migration 不要。 **空きの少ない環境 (モバイル / 小さいボリューム) で使う
+consumer は上げること**。 挙動変更が 3 つある (下の Changed)。
+
+### Fixed — 空きが少ないと Tag 列の値が commit Ok のまま消える (#316)
+
+64 MB の APFS RAM ディスクで 30 万行 insert すると、 commit は全部 Ok なのに **8,358 行の Tag 列が
+None** で、 reopen しても戻らなかった (本体 disk の空きが数 GB 以下でも schema のテスト 24 本が同じ形で落ちた)。
+
+- 辞書の索引 (疎なファイル、 slot が全体に散る) を伸ばす時、 見かけの長さ (最大 3.4 GB) と空きを比べて
+  断っていた → 触るページの分だけ見る
+- 空き不足で断られたのを 「vocabulary is full」 と報告していた → `FaultKind::DiskSpace` に分ける
+- engine の `tie_*_to_by_id` は拒否を返さず、 schema の `commit()` は常に Ok だった →
+  `try_tie_to_by_id` / `try_tie_text_to_by_id` / `try_tie_ref_to_by_id` が `TieRejected` を返し、
+  schema の `commit()` は `SchemaError::WriteRejected` を返す (新しい row なら書きかけを消す)
+- 列の本体を伸ばせない時、 oplog に積んだ Tie だけが peer に届いていた → 伸ばせるかを oplog に積む前に確かめる
+- **sync で受け取った Tie** を、 列を伸ばせない時に 「適用済み」 と数えて cursor を進めていた (受け手で
+  黙って恒久的に消える) → `remote_tie_apply_result` が `RemoteApply::RejectedCapacity` を返し、 sync は
+  cursor を止めて再配送させる。 `remote_tieleaf_apply` も同じ。 `set_cell_local` は列を伸ばせなかったら
+  版数も記録しない
+
+旧 30 万行中 8,358 行消失 → 新 200 万行で 0 行。
+
+### Fixed — macOS / btrfs: 空きを超えた mmap の書き込みが flush Ok のまま消える (#317)
+
+APFS は mmap の page を **書き出す時に**ブロックを確保するので、 書き出し前の page は `fstatvfs` の空きから
+引かれない。 #167 の判定は伸ばすたびに 「まだ空いている」 と見えて通り、 macOS の msync は書き出しの失敗を
+返さない。 64 MB の RAM ディスクに 200 万行入れると commit も flush も Ok のまま、 unmount 後に開くと列の
+header すら無かった。
+
+- まだ flush していない分をプロセス全体で数え、 伸ばす時に空きから引いて見る (断れるようにする)。 flush が
+  成功したら引く。 一部の範囲だけの flush (header の先頭など) では引かない
+- 空きが 1 GiB + まだ flush していない分 を切ったら、 flush で msync の後に fsync して失敗を `Err` にする
+- Leaf の high_water は伸ばせた時だけ進める (旧: 進めてから諦め、 次の open が `leaf store corrupt` で panic)
+
+**filesystem で切り替える**: 256 MB の loop image で実測すると、 書いた直後に空きが減らないのは APFS と
+btrfs (btrfs は transaction の commit で反映、 空きを超えると SIGBUS)。 ext4 は書いた時点で減る (page fault
+で予約) ので、 数えると二重に引く。 segment を map する時に `fstatfs` の `f_type` を見て、 ext4 / xfs / tmpfs
+では数えない。 macOS と知らない filesystem は数える (断るのが早いだけで、 消えはしない側)。 256 MB の ext4 で
+commit が拒否されるまでの行数: 数える 20,268 → 数えない 41,209 (2.03x)、 Leaf が多い形 372,520 → 740,441。
+
+64 MB の APFS RAM ディスク (unmount → mount 後に別プロセスで verify): Tag が多い形は 1,954 行で
+`WriteRejected(DiskSpace)`、 1,954 行とも残る。 Leaf が多い形は 91,980 行で Err、 全部残る (旧: 200 万行 Ok
+のまま大半が消えた)。
+
+### Fixed — create が途中で落ちると、 header が 0 の directory が残って抜けられない (#323)
+
+create は segment を作ってから header (magic) を最後に書く。 その前に失敗すると (#320 の iOS の ENOMEM で
+発生) header が全部 0 の directory が残り、 open は `not an EnchuDB file`、 create は `AlreadyExists`、
+`probe` は `Damaged` を返して、 enchudb の API では抜けられなかった。
+
+- create は header を書き終えるまでに失敗したら、 自分が作った directory を消す
+- 既に残っている残骸 (0.26.0〜0.27.1 / kill で落ちた create): header が全部 0 で commit されたものが何も無い
+  (tables sidecar / segments manifest / himo・ver の segment が無い) 形だけを残骸と見なし、 `probe` は
+  `Incomplete`、 create は消して作り直す。 別プロセスが作成中 (writer lock を保持) なら触らない。 header
+  だけが 0 になった中身のある DB は `Damaged` のまま
+- enchudb-oplog: `filelock::try_lock_exclusive` (block しない試し取り)
+
+### Changed
+
+- **schema の `commit()` が書き込みの拒否を `Err(SchemaError::WriteRejected(..))` で返す** (ディスクの空き
+  不足 / 辞書が一杯 / 時計が戻って LWW で負けた)。 これまでは Ok を返して値が消えていた。 新しい row なら
+  書きかけを消す。 既存 row の upsert は拒否された列より前が書かれたまま残る (row 単位で atomic ではない)。
+  `SchemaError` に variant が 1 つ増えた (網羅 match は腕を足す)
+- **ディスクが満杯の間は checkpoint を進めない**: oplog の fsync か本体の書き出しに失敗したら、 周期 fsync /
+  終了時 / open 時の復旧で checkpoint を据え置く (進めると oplog が畳まれ、 本体を復旧する record も消える)。
+  Commit marker すら入らない状態 (`append_dead`) でも同じなので、 WAL が満杯のまま止まり、 空きが戻れば
+  自力で回復する。 失敗は `FaultKind::DiskSpace`
+- insert (Tag / Leaf / Number / BigInt の 5 列、 100 万行) が 3-6% 遅い (列ごとに commit 済みかを atomic で
+  1-2 回読む)。 100 行ごとの `oplog_sync` は -5% (揺れの幅と同程度)
+
+### 既知の残り
+
+- fsync で失敗に気付いても、 その時点で書き出せなかった page は戻らない (checkpoint を進めないので oplog から
+  replay できるが、 oplog 自体も同じディスク)。 防ぐ方 (数えて断る) が本体
+- btrfs は flush の後も空きの表示に反映されるまで数秒かかるので、 その間は数えから外れる
+- 新しい Tag の値ごとに辞書の索引の別ページ (16 KB) を食う (索引の置き方の footprint の問題)
+
 ## 0.27.1 — 2026-09-27
 
 **iOS で新しい DB を作れなかった regression の patch** (#320)。 on-disk format は**不変**、
