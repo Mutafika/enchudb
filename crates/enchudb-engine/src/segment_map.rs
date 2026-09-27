@@ -669,7 +669,16 @@ impl SegmentMap {
     }
 
     /// [offset, offset+len) を msync (MS_SYNC)。 offset は page aligned であること。
+    ///
+    /// 範囲の一部だけの書き出しなので、 まだ flush していない分の数え (#317) は減らさない
+    /// (減らすと、 書き出していない page の分まで空きに戻して見てしまう)。
     pub fn flush(&self, offset: usize, len: usize) -> io::Result<()> {
+        self.flush_range(offset, len, false)
+    }
+
+    /// `settle`: この書き出しで、 この segment のまだ flush していない page が全部書き出される
+    /// (`flush_all` / `flush_dirty`) なら true — 成功したら数えを減らす。
+    fn flush_range(&self, offset: usize, len: usize, settle: bool) -> io::Result<()> {
         let end = offset + len;
         if end > self.committed() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "flush past committed"));
@@ -679,7 +688,7 @@ impl SegmentMap {
         }
         // この flush で書き出す分を先に取り出す (同じ segment の flush が 2 本同時に走っても 2 回引かない。
         // flush の途中で伸ばした分は取り出した後に足されるので残る)
-        let flushed = self.unflushed.swap(0, Ordering::AcqRel);
+        let flushed = if settle { self.unflushed.swap(0, Ordering::AcqRel) } else { 0 };
         let rc = unsafe { libc::msync(self.base.add(offset) as *mut _, len, libc::MS_SYNC) };
         // #317: macOS の msync は書き出しの失敗 (空き不足で書けなかった page) を返さない。 fsync は返す。
         // 書き出しで消えうるのは空きが少ない時だけなので、 fsync はその時だけ (sync ごとの fsync は
@@ -734,6 +743,10 @@ impl SegmentMap {
 
     /// page 境界に拡げて flush。
     pub fn flush_aligned(&self, offset: usize, len: usize) -> io::Result<()> {
+        self.flush_aligned_inner(offset, len, false)
+    }
+
+    fn flush_aligned_inner(&self, offset: usize, len: usize, settle: bool) -> io::Result<()> {
         if len == 0 {
             return Ok(());
         }
@@ -743,12 +756,12 @@ impl SegmentMap {
         if hi <= lo {
             return Ok(());
         }
-        self.flush(lo, hi - lo)
+        self.flush_range(lo, hi - lo, settle)
     }
 
     /// commit 済み全域を flush。
     pub fn flush_all(&self) -> io::Result<()> {
-        self.flush(0, self.committed())
+        self.flush_range(0, self.committed(), true)
     }
 
     /// 書いた範囲を記録する (`flush_dirty` がその範囲だけ msync する)。
@@ -781,7 +794,8 @@ impl SegmentMap {
         if hi <= lo {
             return Ok(());
         }
-        self.flush_aligned(lo, hi - lo)
+        // 書いた page は mark_dirty で dirty の範囲に入るので、 ここで全部書き出される
+        self.flush_aligned_inner(lo, hi - lo, true)
     }
 }
 
@@ -819,6 +833,26 @@ mod tests {
     }
 
     const MB: usize = 1024 * 1024;
+
+    /// #317: 一部の範囲だけの flush (header の先頭 16 byte など) は、 まだ flush していない分の数えを減らさない。
+    /// 減らすのは、 その segment の書いた page が全部書き出される `flush_all` / `flush_dirty` の成功だけ。
+    #[test]
+    fn partial_flush_keeps_the_unflushed_count() {
+        let p = dir("partial_flush").join("seg");
+        let m = SegmentMap::create(&p, 64 * MB, 4096).unwrap();
+        if !m.defers_alloc {
+            return; // 書いた時点で空きに出る filesystem (ext4 / tmpfs) では数えない
+        }
+        m.grow_amortized(8 * MB).unwrap();
+        let counted = m.unflushed.load(Ordering::Acquire);
+        assert!(counted > 0, "伸ばした分が数えられていない");
+        unsafe { *m.base() = 1 };
+        m.mark_dirty(0, 1);
+        m.flush_aligned(0, 16).unwrap();
+        assert_eq!(m.unflushed.load(Ordering::Acquire), counted, "一部の flush で数えを減らした");
+        m.flush_dirty().unwrap();
+        assert_eq!(m.unflushed.load(Ordering::Acquire), 0, "全部書き出したのに数えが残った");
+    }
 
     #[test]
     fn create_write_reopen_roundtrip() {
