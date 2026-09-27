@@ -417,7 +417,10 @@ impl LeafStore {
         let need_words = self.b2w(need_bytes);
 
         let mut holes = self.holes.lock().unwrap_or_else(|p| p.into_inner());
-        let (word_off, slot_words) = self.alloc_locked(&mut holes, need_words);
+        let Some((word_off, slot_words)) = self.alloc_locked(&mut holes, need_words) else {
+            // #317: high_water の先を伸ばせない (空き不足)。 high_water は進めていない
+            return u32::MAX;
+        };
         drop(holes);
 
         let byte_off = self.w2b(word_off);
@@ -471,7 +474,8 @@ impl LeafStore {
 
     /// `need_words` を確保。 返り値 = (word offset, 実 slot_words)。 best-fit は
     /// O(hole 数) の線形走査 (Phase 1)。 hole が定常で少なければ十分。
-    fn alloc_locked(&self, holes: &mut BTreeMap<u32, u32>, need_words: u32) -> (u32, u32) {
+    /// high_water の先を伸ばせなければ (空き不足) `None` で、 high_water は進めない。
+    fn alloc_locked(&self, holes: &mut BTreeMap<u32, u32>, need_words: u32) -> Option<(u32, u32)> {
         // best-fit: need 以上で最小の hole
         let best = holes
             .iter()
@@ -491,21 +495,20 @@ impl LeafStore {
                 // legacy 分岐に落ちて corrupt を返す (#132) ため、 必ず hole header で書く。
                 self.write_hole_header(roff, self.w2b(remainder) as u32);
                 holes.insert(roff, remainder);
-                (hoff, need_words)
+                Some((hoff, need_words))
             } else {
                 // 余りが hole にならない → 丸ごと払い出し (内部断片 < MIN_SLOT)
-                (hoff, hsize)
+                Some((hoff, hsize))
             }
         } else {
             // fresh: high_water を伸ばす
             let hw = self.hw_words();
             let end = hw + need_words;
-            // #167: high_water の前進ぶん。 実際に payload を書く範囲は `insert` が
-            // 改めて ensure_committed して **失敗したら書かない** ので、 ここは
-            // 先行 commit の best-effort に留める。
-            let _ = self.region.ensure_committed(self.w2b(end));
+            // #167 / #317: 伸ばせなければ high_water を進めない。 進めてから諦めると、 中身の無い
+            // 範囲が high_water の手前に残り、 次の open の走査が 「slot_words 0」 で壊れた store と見る
+            self.region.ensure_committed(self.w2b(end)).ok()?;
             self.set_hw_words(end);
-            (hw, need_words)
+            Some((hw, need_words))
         }
     }
 

@@ -3,6 +3,15 @@
 
 use enchudb_schema::{Database, Value};
 
+/// `FEW_TAGS=1` なら Tag の値は 100 種類だけ (Leaf の memo が空きを埋める形)。
+fn name_of(i: i64) -> String {
+    if std::env::var("FEW_TAGS").is_ok() {
+        format!("name-{:03}", i % 100)
+    } else {
+        format!("name-{i:08}-{}", "x".repeat(40))
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let path = args[1].clone();
@@ -13,7 +22,7 @@ fn main() {
         let users = db.get_table("users").unwrap();
         let (mut ok, mut differ, mut missing) = (0usize, 0usize, 0usize);
         for i in 0..n {
-            let name = format!("name-{i:08}-{}", "x".repeat(40));
+            let name = name_of(i);
             let memo = format!("memo-{i:08}-{}", "y".repeat(200));
             match users.where_eq("id", i).find_one() {
                 Ok(Some(e)) => {
@@ -52,7 +61,7 @@ fn main() {
     let mut first_err = None;
     let mut silent = 0usize;
     for i in 0..n {
-        let name = format!("name-{i:08}-{}", "x".repeat(40));
+        let name = name_of(i);
         let memo = format!("memo-{i:08}-{}", "y".repeat(200));
         let r = users.insert().set("id", i).set("name", name.as_str()).set("memo", memo.as_str()).set("age", i % 1000).commit();
         match r {

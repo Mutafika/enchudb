@@ -25,7 +25,9 @@ fn read(t: &Table, e: u64) -> (Option<Value>, Option<Value>) {
     (t.entity(e).get("name"), t.entity(e).get("age"))
 }
 
-/// 使える空きを 64 MB に絞っても、 Tag の値は全部書けて読める。
+/// 使える空きを 256 MB に絞っても、 Tag の値は全部書けて読める (旧: 索引を見かけの長さ = 数 GB で見て断った)。
+/// 新しい Tag の値は索引の別々のページ (16 KB) を触り、 そのページは書き出しで本当に食うので (#317)、 5000 値で
+/// 約 80 MB 要る。
 #[test]
 fn tags_are_written_when_free_space_is_small() {
     let path = tmp("small");
@@ -35,7 +37,7 @@ fn tags_are_written_when_free_space_is_small() {
     let t = db.get_table("users").unwrap();
     let eng = db.engine();
     let free = eng.disk_free_bytes().expect("growable backing");
-    eng.set_space_margin(free.saturating_sub(64 << 20));
+    eng.set_space_margin(free.saturating_sub(256 << 20));
     for i in 0..5000i64 {
         let e = t.insert().set("id", i).set("name", name(i).as_str()).set("age", i % 100).commit().unwrap();
         assert_eq!(read(&t, e), (Some(Value::Text(name(i))), Some(Value::Number(i % 100))), "row {i}");

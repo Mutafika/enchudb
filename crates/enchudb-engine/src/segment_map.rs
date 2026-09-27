@@ -36,7 +36,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 /// reservation を切り上げる単位。 **runtime の page size ではなく、 host が取りうる
 /// 最大の page size** を使う。 page size は host ごとに違い (Apple Silicon = 16 KiB /
@@ -213,6 +213,30 @@ pub(crate) fn free_bytes_for_fd(fd: libc::c_int) -> io::Result<u64> {
 /// #167: 伸長時に残す空き容量 margin (`GrowableMap` と同じ既定)。
 const SPACE_MARGIN: u64 = 32 * 1024 * 1024;
 
+/// #317: 伸ばした (疎な segment は初めて触った) のに、 まだ flush (msync + fsync) していない byte の
+/// プロセス全体の合計。
+///
+/// APFS は mmap の page を **書き出す時に**ブロックを確保する (遅延割り当て) ので、 書き出し前の page は
+/// `fstatvfs` の空きから引かれていない。 伸ばす時にこの合計も空きから引いて見ないと、 伸ばすたびに
+/// 「まだ空いている」 と見えて通り、 空きを超えた分が書き出しで黙って消える (msync は失敗を返さない)。
+/// 同じ filesystem の DB は空きを分け合うのでプロセス全体で 1 本 (別の filesystem の分も数えるので
+/// その分は厳しめ、 flush のたびに減る)。
+static UNFLUSHED: AtomicU64 = AtomicU64::new(0);
+
+/// #317: 空きがこれ (+ まだ flush していない分) を切ったら、 flush で msync の後に fsync して書き出しの失敗を拾う。
+const FSYNC_BELOW: u64 = 1 << 30;
+
+/// 伸ばす時に空きを要る量 (#316 / #317)。
+#[derive(Clone, Copy)]
+enum Need {
+    /// 伸ばす分の全部 (明示の `grow_to`)
+    Whole,
+    /// この位置から先だけ書く (順に書いていく領域。 先頭の穴 = table の eid の範囲の手前 は書かない)
+    From(usize),
+    /// 見かけだけ伸ばす (疎な segment、 書くページは `touch_sparse` が 1 ページずつ数える)
+    Nothing,
+}
+
 pub struct SegmentMap {
     path: PathBuf,
     base: *mut u8,
@@ -228,6 +252,10 @@ pub struct SegmentMap {
     dirty_hi: AtomicUsize,
     space_margin: AtomicU64,
     space_denials: AtomicU64,
+    /// #317: この segment が `UNFLUSHED` に足している分。
+    unflushed: AtomicU64,
+    /// #317: 疎な segment で空きを数え済みのページ (`touch_sparse`、 1 bit = 1 ページ)。
+    touched: OnceLock<Box<[AtomicU64]>>,
     /// writer は fd を持ち続ける (reader は `None`、 refresh で都度 open)。
     ///
     /// macOS は **dirty な mmap page を持つ file を write fd で close すると、 その場で
@@ -354,6 +382,8 @@ impl SegmentMap {
             dirty_hi: AtomicUsize::new(0),
             space_margin: AtomicU64::new(SPACE_MARGIN),
             space_denials: AtomicU64::new(0),
+            unflushed: AtomicU64::new(0),
+            touched: OnceLock::new(),
             file,
         })
     }
@@ -394,17 +424,70 @@ impl SegmentMap {
     /// ファイルは **現在長より大きい時だけ** `ftruncate` する (別 process が先に
     /// 伸ばしていた場合に縮めない)。 空き容量が足りなければ `StorageFull` (#167)。
     pub fn grow_to(&self, new_size: usize) -> io::Result<()> {
-        self.grow_inner(new_size, None)
+        self.grow_inner(new_size, Need::Whole)
     }
 
-    /// `grow_to` の疎な書き込み版: 伸ばした先のうち実際に書くのは `touched` byte だけの時
-    /// (hash の場所に散る索引の slot)。 空きは伸ばす見かけの長さでなく、 触るページの分を見る
-    /// (#316: 見かけの長さで見ると、 1 ページ書くのに数 GB の空きを要求して断っていた)。
-    pub fn grow_sparse(&self, new_size: usize, touched: usize) -> io::Result<()> {
-        self.grow_inner(new_size, Some(touched))
+    /// 疎な書き込み: [start, start + len) だけを書く時 (hash の場所に散る索引の slot)。 見かけは
+    /// 伸ばすが、 空きは **初めて触るページの分**だけ見る (#316: 見かけの長さ = 数 GB と比べて断っていた。
+    /// #317: 伸ばした先のページを書くたびに数えないと、 空きを超えても気付けない)。
+    pub fn touch_sparse(&self, start: usize, len: usize) -> io::Result<()> {
+        let end = start + len;
+        if end > self.committed.load(Ordering::Acquire) {
+            self.grow_inner(end, Need::Nothing)?;
+        }
+        let ps = runtime_page_size();
+        let bits = self.touched.get_or_init(|| {
+            (0..self.reserved.div_ceil(ps).div_ceil(64)).map(|_| AtomicU64::new(0)).collect()
+        });
+        for page in start / ps..=(end - 1) / ps {
+            let (w, b) = (page / 64, 1u64 << (page % 64));
+            if bits[w].load(Ordering::Acquire) & b != 0 {
+                continue;
+            }
+            self.check_space(ps as u64)?;
+            // 同じページを 2 本が同時に数えないよう、 立てた方だけが足す
+            if bits[w].fetch_or(b, Ordering::AcqRel) & b == 0 {
+                self.add_unflushed(ps as u64);
+            }
+        }
+        Ok(())
     }
 
-    fn grow_inner(&self, new_size: usize, touched: Option<usize>) -> io::Result<()> {
+    /// `need` byte を新しく書く空きがあるか: 空き < need + margin + まだ flush していない分 なら `StorageFull`。
+    fn check_space(&self, need: u64) -> io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let reopened;
+        let file: &File = match &self.file {
+            Some(f) => f,
+            None => {
+                reopened = self.reopen()?;
+                &reopened
+            }
+        };
+        let Ok(free) = free_bytes_for_fd(file.as_raw_fd()) else { return Ok(()) };
+        let margin = self.space_margin.load(Ordering::Relaxed);
+        let pending = UNFLUSHED.load(Ordering::Relaxed);
+        if free < need.saturating_add(margin).saturating_add(pending) {
+            self.space_denials.fetch_add(1, Ordering::Relaxed);
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!(
+                    "refusing to grow segment {}: {free} bytes free, need {need} + {margin} margin + {pending} not yet flushed (#167 / #317)",
+                    self.path.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn add_unflushed(&self, n: u64) {
+        // 全体に先に足す: 逆だと、 その間に flush が取り出して全体から引き、 全体が一瞬 0 を割る
+        // (= 巨大な値に見えて、 その間の書き込みを空きがあっても断る)
+        UNFLUSHED.fetch_add(n, Ordering::AcqRel);
+        self.unflushed.fetch_add(n, Ordering::AcqRel);
+    }
+
+    fn grow_inner(&self, new_size: usize, need: Need) -> io::Result<()> {
         let aligned = align_up(new_size, runtime_page_size());
         if aligned <= self.committed.load(Ordering::Acquire) {
             return Ok(());
@@ -436,30 +519,21 @@ impl SegmentMap {
             }
         };
         let file_len = file.metadata()?.len();
+        let mut need_bytes = 0;
         if file_len < aligned as u64 {
-            use std::os::unix::io::AsRawFd;
-            let ps = runtime_page_size();
-            // 書く範囲はページ境界をまたぎうるので 1 ページ足す
-            let delta = match touched {
-                Some(t) => ((align_up(t, ps) + ps) as u64).min(aligned as u64 - file_len),
-                None => aligned as u64 - file_len,
+            need_bytes = match need {
+                Need::Whole => aligned as u64 - file_len,
+                Need::From(at) => aligned as u64 - file_len.max(at as u64).min(aligned as u64),
+                Need::Nothing => 0,
             };
-            if let Ok(free) = free_bytes_for_fd(file.as_raw_fd()) {
-                let margin = self.space_margin.load(Ordering::Relaxed);
-                if free < delta.saturating_add(margin) {
-                    self.space_denials.fetch_add(1, Ordering::Relaxed);
-                    return Err(io::Error::new(
-                        io::ErrorKind::StorageFull,
-                        format!(
-                            "refusing to grow segment {}: {free} bytes free, need {delta} + {margin} margin (#167)",
-                            self.path.display()
-                        ),
-                    ));
-                }
+            if need_bytes > 0 {
+                self.check_space(need_bytes)?;
             }
             file.set_len(aligned as u64)?;
         }
-        self.remap_to(file, aligned)
+        self.remap_to(file, aligned)?;
+        self.add_unflushed(need_bytes);
+        Ok(())
     }
 
     /// amortized 伸長: 幾何級数 (×2、 最低 +64 KB、 1 回の伸びは `MAX_GROW_STEP` = 16 MB まで)。
@@ -482,7 +556,8 @@ impl SegmentMap {
         if target < needed_aligned {
             return Err(io::Error::new(io::ErrorKind::OutOfMemory, "needed exceeds reservation"));
         }
-        self.grow_to(target)
+        // 書くのは要る位置の手前 1 ページから先 (#317: 先頭の穴を空きの計算に入れない)
+        self.grow_inner(target, Need::From(needed_aligned.saturating_sub(ps)))
     }
 
     /// ファイルの現在長まで commit を追従させる (reader が writer の伸長を拾う経路。
@@ -563,8 +638,56 @@ impl SegmentMap {
         if len == 0 {
             return Ok(());
         }
+        // この flush で書き出す分を先に取り出す (同じ segment の flush が 2 本同時に走っても 2 回引かない。
+        // flush の途中で伸ばした分は取り出した後に足されるので残る)
+        let flushed = self.unflushed.swap(0, Ordering::AcqRel);
         let rc = unsafe { libc::msync(self.base.add(offset) as *mut _, len, libc::MS_SYNC) };
-        if rc < 0 {
+        // #317: macOS の msync は書き出しの失敗 (空き不足で書けなかった page) を返さない。 fsync は返す。
+        // 書き出しで消えうるのは空きが少ない時だけなので、 fsync はその時だけ (sync ごとの fsync は
+        // 10 万行 / 100 行ごとの oplog_sync で -21%。 空きの確認は fstatvfs 1 回)
+        let res = if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else if self.space_is_low() {
+            self.fsync()
+        } else {
+            Ok(())
+        };
+        match res {
+            // 書き出した page はブロックが割り当て済み = 空きから引かれた
+            Ok(()) => {
+                UNFLUSHED.fetch_sub(flushed, Ordering::AcqRel);
+            }
+            Err(_) => {
+                self.unflushed.fetch_add(flushed, Ordering::Relaxed);
+            }
+        }
+        res
+    }
+
+    /// 空き < `FSYNC_BELOW` + まだ flush していない分 か。 空きが読めなければ low 扱い (fsync する側に倒す)。
+    fn space_is_low(&self) -> bool {
+        use std::os::unix::io::AsRawFd;
+        let free = match &self.file {
+            Some(f) => free_bytes_for_fd(f.as_raw_fd()),
+            None => self.reopen().and_then(|f| free_bytes_for_fd(f.as_raw_fd())),
+        };
+        match free {
+            Ok(free) => free < FSYNC_BELOW.saturating_add(UNFLUSHED.load(Ordering::Acquire)),
+            Err(_) => true,
+        }
+    }
+
+    fn fsync(&self) -> io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let reopened;
+        let file: &File = match &self.file {
+            Some(f) => f,
+            None => {
+                reopened = self.reopen()?;
+                &reopened
+            }
+        };
+        if unsafe { libc::fsync(file.as_raw_fd()) } < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
@@ -625,6 +748,7 @@ impl SegmentMap {
 
 impl Drop for SegmentMap {
     fn drop(&mut self) {
+        UNFLUSHED.fetch_sub(*self.unflushed.get_mut(), Ordering::Relaxed);
         unsafe {
             libc::munmap(self.base as *mut _, self.reserved);
         }

@@ -262,13 +262,11 @@ impl Region {
     }
 
     /// `ensure_committed` の疎な書き込み版: `end_in_region` の手前 `touched` byte だけを書く時
-    /// (hash の場所に散る索引の slot)。 空き容量は触るページの分だけ見る (#316)。
+    /// (hash の場所に散る索引の slot)。 空き容量は初めて触るページの分だけ見る (#316 / #317)。
     pub fn ensure_committed_sparse(&self, end_in_region: usize, touched: usize) -> std::io::Result<()> {
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(g) = &self.grower
-            && !self.is_committed(end_in_region)
-        {
-            g.grow_sparse(self.file_offset + end_in_region, touched)?;
+        if let Some(g) = &self.grower {
+            g.touch_sparse(self.file_offset + end_in_region - touched, touched)?;
         }
         let _ = (end_in_region, touched);
         Ok(())
