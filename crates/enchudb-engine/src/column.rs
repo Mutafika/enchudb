@@ -87,6 +87,13 @@ impl Column {
         self.region.ensure_committed(HEADER + (entity_id as usize + 1) * vs)
     }
 
+    /// `entity_id` の cell が commit 済みか (伸ばさない、 atomic の読み 1 回)。
+    #[inline]
+    pub fn is_committed_for(&self, entity_id: u32) -> bool {
+        let vs = self.value_size.max(1) as usize;
+        self.region.is_committed(HEADER + (entity_id as usize + 1) * vs)
+    }
+
     #[inline]
     pub fn get(&self, entity_id: u32) -> &[u8] {
         let vs = self.value_size as usize;

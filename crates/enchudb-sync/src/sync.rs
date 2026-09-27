@@ -1501,7 +1501,7 @@ impl Syncer {
                 // request17 step 5: LWW / tombstone の判定は engine (`set_cell`) の
                 // 内側だけ。 ここで判定して別関数で適用する形は、 呼び忘れれば黙って
                 // 壊れる (実際 ローカル write 経路がそうなっていた = #154/#160 の根)。
-                ApplyResult::from_lww(self.engine.remote_tie_apply(local_eid, *himo_id, value, rec.hlc))
+                ApplyResult::from(self.engine.remote_tie_apply_result(local_eid, *himo_id, value, rec.hlc))
             }
             DecodedOp::TieRef { eid, himo_id, target } => {
                 // #183: Ref 値の target を**世界番号 (u64) 同乗**で運ぶ Tie。author の
@@ -1522,7 +1522,7 @@ impl Syncer {
                     Some(v) => v,
                     None => return ApplyResult::Dropped,
                 };
-                ApplyResult::from_lww(self.engine.remote_tie_apply(local_eid, *himo_id, value, rec.hlc))
+                ApplyResult::from(self.engine.remote_tie_apply_result(local_eid, *himo_id, value, rec.hlc))
             }
             DecodedOp::Untie { eid, himo_id } => {
                 // #9: foreign eid を翻訳 (table-less なら確保先が無いので skip)。
@@ -1566,7 +1566,7 @@ impl Syncer {
                     Some(v) => v,
                     None => return ApplyResult::DroppedVocab,
                 };
-                ApplyResult::from_lww(self.engine.remote_tie_apply(local_eid, local_hid, value, rec.hlc))
+                ApplyResult::from(self.engine.remote_tie_apply_result(local_eid, local_hid, value, rec.hlc))
             }
             DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => {
                 // 0.12.0 (#88): Leaf payload を bytes 同乗で受信。 名前で himo 解決 →

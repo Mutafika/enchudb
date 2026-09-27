@@ -394,6 +394,17 @@ impl SegmentMap {
     /// ファイルは **現在長より大きい時だけ** `ftruncate` する (別 process が先に
     /// 伸ばしていた場合に縮めない)。 空き容量が足りなければ `StorageFull` (#167)。
     pub fn grow_to(&self, new_size: usize) -> io::Result<()> {
+        self.grow_inner(new_size, None)
+    }
+
+    /// `grow_to` の疎な書き込み版: 伸ばした先のうち実際に書くのは `touched` byte だけの時
+    /// (hash の場所に散る索引の slot)。 空きは伸ばす見かけの長さでなく、 触るページの分を見る
+    /// (#316: 見かけの長さで見ると、 1 ページ書くのに数 GB の空きを要求して断っていた)。
+    pub fn grow_sparse(&self, new_size: usize, touched: usize) -> io::Result<()> {
+        self.grow_inner(new_size, Some(touched))
+    }
+
+    fn grow_inner(&self, new_size: usize, touched: Option<usize>) -> io::Result<()> {
         let aligned = align_up(new_size, runtime_page_size());
         if aligned <= self.committed.load(Ordering::Acquire) {
             return Ok(());
@@ -427,7 +438,12 @@ impl SegmentMap {
         let file_len = file.metadata()?.len();
         if file_len < aligned as u64 {
             use std::os::unix::io::AsRawFd;
-            let delta = aligned as u64 - file_len;
+            let ps = runtime_page_size();
+            // 書く範囲はページ境界をまたぎうるので 1 ページ足す
+            let delta = match touched {
+                Some(t) => ((align_up(t, ps) + ps) as u64).min(aligned as u64 - file_len),
+                None => aligned as u64 - file_len,
+            };
             if let Ok(free) = free_bytes_for_fd(file.as_raw_fd()) {
                 let margin = self.space_margin.load(Ordering::Relaxed);
                 if free < delta.saturating_add(margin) {
