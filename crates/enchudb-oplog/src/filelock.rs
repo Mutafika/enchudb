@@ -45,6 +45,18 @@ pub fn lock_exclusive(f: &File) -> io::Result<LockOutcome> {
     }
 }
 
+/// 排他 advisory lock を **block せずに**試す (#323)。 取れたら `Ok(true)` (fd を close するか
+/// [`unlock`] で解放)。 他プロセスが保持中なら `Ok(false)`。 lock を持たない FS も `Ok(false)` —
+/// 「誰も持っていない」 と言い切れないので、 取れなかった側に倒す。
+pub fn try_lock_exclusive(f: &File) -> io::Result<bool> {
+    match f.try_lock() {
+        Ok(()) => Ok(true),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Err(std::fs::TryLockError::Error(e)) if e.kind() == io::ErrorKind::Unsupported => fallback_try_lock(f),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
 /// [`lock_exclusive`] で取った lock を明示的に解放する。 `LockOutcome::Unsupported`
 /// だった file に対して呼んでも成功扱い (解放するものが無い)。
 pub fn unlock(f: &File) -> io::Result<()> {
@@ -60,6 +72,16 @@ fn fallback_lock_exclusive(f: &File) -> io::Result<LockOutcome> {
     match raw_flock(f, libc::LOCK_EX) {
         Ok(()) => Ok(LockOutcome::Locked),
         Err(e) if lock_unavailable(&e) => Ok(LockOutcome::Unsupported),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(unix)]
+fn fallback_try_lock(f: &File) -> io::Result<bool> {
+    match raw_flock(f, libc::LOCK_EX | libc::LOCK_NB) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        Err(e) if lock_unavailable(&e) => Ok(false),
         Err(e) => Err(e),
     }
 }
@@ -106,6 +128,11 @@ fn lock_unavailable(e: &io::Error) -> bool {
 #[cfg(not(unix))]
 fn fallback_lock_exclusive(_f: &File) -> io::Result<LockOutcome> {
     Ok(LockOutcome::Unsupported)
+}
+
+#[cfg(not(unix))]
+fn fallback_try_lock(_f: &File) -> io::Result<bool> {
+    Ok(false)
 }
 
 #[cfg(not(unix))]
@@ -168,6 +195,25 @@ mod tests {
 
         drop(held);
         drop(after_close);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #323: try は保持中なら block せず false、 解放後は true。 fallback (Android の経路) も同じ。
+    #[test]
+    fn try_lock_does_not_block_and_reports_holder() {
+        let dir = std::env::temp_dir().join(format!("enchudb-filelock-try-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lock");
+        let held = open(&path);
+        assert_eq!(lock_exclusive(&held).unwrap(), LockOutcome::Locked);
+        let other = open(&path);
+        assert!(!try_lock_exclusive(&other).unwrap(), "保持中なのに取れた");
+        assert!(!fallback_try_lock(&other).unwrap(), "fallback: 保持中なのに取れた");
+        drop(held);
+        assert!(try_lock_exclusive(&other).unwrap(), "解放後に取れない");
+        unlock(&other).unwrap();
+        assert!(fallback_try_lock(&other).unwrap(), "fallback: 解放後に取れない");
+        drop(other);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
