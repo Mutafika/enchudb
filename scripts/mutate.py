@@ -20,7 +20,7 @@ mutations.json は変異の並び:
 - この script 自体が落ちても (SIGKILL でも) 孤児が残らないように、 test は見張り付きのシェルの中で走らせる: 見張りは
   同じプロセスグループで上限 + 5 秒眠り、 起きたらグループごと kill する
 - 変異を入れた file は、 run が終わるたび / 例外 / SIGINT・SIGTERM・SIGHUP で必ず元に戻す。 SIGKILL では戻せないので、
-  元の中身を `target/mutate-backup/` にも置き、 次に起動した時に最初に戻す
+  元の中身を `target/mutate-backup/` にも置き、 次に起動した時に最初に戻す (その間に file が編集されていたら戻さずに止まる)
 """
 
 import argparse
@@ -41,27 +41,41 @@ def backup_path(path: str) -> str:
     return os.path.join(BACKUP_DIR, path.replace(os.sep, "__"))
 
 
-def keep_original(path: str, text: str) -> None:
+def keep_original(path: str, text: str, mutated: str) -> None:
+    """元の中身を控える。 控えには変異を入れた後の中身も置く (次の起動で、 まだ変異のままかを確かめるため)。"""
     _ORIGINAL[path] = text
     os.makedirs(BACKUP_DIR, exist_ok=True)
     with open(backup_path(path) + ".tmp", "w") as f:
-        f.write(path + "\n" + text)
+        json.dump({"path": path, "original": text, "mutated": mutated}, f)
     os.replace(backup_path(path) + ".tmp", backup_path(path))
 
 
-def restore_leftovers() -> None:
-    """前の起動が SIGKILL で死んで戻せなかった file を戻す。"""
+def restore_leftovers() -> bool:
+    """前の起動が SIGKILL で死んで戻せなかった file を戻す。
+
+    戻すのは、 今の中身が変異を入れたままの時だけ。 その後に誰かが編集していたら (共有 checkout では他の session も
+    同じ file を触る) 上書きせず、 控えを残して False を返す (旧: 無条件に上書きし、 その編集を黙って消した)。"""
     if not os.path.isdir(BACKUP_DIR):
-        return
+        return True
+    ok = True
     for name in os.listdir(BACKUP_DIR):
         if name.endswith(".tmp"):
             continue
-        raw = open(os.path.join(BACKUP_DIR, name)).read()
-        path, text = raw.split("\n", 1)
-        with open(path, "w") as f:
-            f.write(text)
-        os.remove(os.path.join(BACKUP_DIR, name))
-        print(f"前の run が戻せなかった {path} を元に戻した", file=sys.stderr)
+        bak = os.path.join(BACKUP_DIR, name)
+        b = json.load(open(bak))
+        path = b["path"]
+        now = open(path).read() if os.path.exists(path) else None
+        if now == b["mutated"]:
+            with open(path, "w") as f:
+                f.write(b["original"])
+            print(f"前の run が戻せなかった {path} を元に戻した", file=sys.stderr)
+        elif now != b["original"]:
+            print(f"{path} は前の run の後に変わっている — 戻さない。 確かめて {bak} を消してから起動し直す",
+                  file=sys.stderr)
+            ok = False
+            continue
+        os.remove(bak)
+    return ok
 # 走っている test のプロセスグループ
 _RUNNING: list[int] = []
 
@@ -119,13 +133,18 @@ def main() -> int:
     ap.add_argument("mutations", help="変異の JSON")
     ap.add_argument("--timeout", type=float, help="1 run の上限 (秒)。 既定は baseline の 3 倍 + 30 秒")
     ap.add_argument("--build-timeout", type=float, default=1800, help="build の上限 (秒)")
-    ap.add_argument("cmd", nargs=argparse.REMAINDER, help="-- の後に test のコマンド")
-    a = ap.parse_args()
-    cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
+    # test のコマンドは最初の `--` で自分で切り分ける (argparse の REMAINDER は mutations の後ろの `--timeout` まで
+    # コマンドに飲み込み、 `--timeout` を実行して baseline が fail した)。 コマンド側の `--` (test binary への引数) は残る
+    argv = sys.argv[1:]
+    if "--" not in argv:
+        ap.error("-- の後に test のコマンドを置く")
+    sep = argv.index("--")
+    a, cmd = ap.parse_args(argv[:sep]), argv[sep + 1:]
     if not cmd:
         ap.error("-- の後に test のコマンドを置く")
     muts = json.load(open(a.mutations))
-    restore_leftovers()
+    if not restore_leftovers():
+        return 2
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, on_signal)
 
@@ -158,9 +177,10 @@ def main() -> int:
                 print(f"  skip   {name}: find が {n} 回")
                 results.append((name, "skip"))
                 continue
-            keep_original(path, text)
+            mutated = text.replace(m["find"], m["replace"])
+            keep_original(path, text, mutated)
             with open(path, "w") as f:
-                f.write(text.replace(m["find"], m["replace"]))
+                f.write(mutated)
             try:
                 if not build_ok():
                     verdict = "build-error"
