@@ -10132,61 +10132,75 @@ impl Engine {
                 Some(leaf) => {
                     // #119: 単一 cell を止めどなく re-tie する writer と競ると、 retry を
                     // **間を置かずに** 64 回消費して「値が無い」と区別できない None を返して
-                    // いた (実測 3〜9 件 / 33 万 read)。 spin → yield の backoff と上限
-                    // 256 回化で緩和した。
+                    // いた。 #128: 回数で諦めると CPU contention 下で writer loop と位相が
+                    // 噛み合って silent None。 進捗の無い連敗だけ数える形にしたら、 今度は
+                    // writer が前進し続ける限り抜けられない (原理的に無制限、 #131)。
                     //
-                    // #128: それでも「一律 256 回で give-up」 は、 CPU contention 下で
-                    // writer loop と位相が噛み合う (resonance) と 256 連敗して silent None
-                    // を返す (issue119 test の並列実行 flaky、 実測 10/30 run fail)。
-                    // 値が存在する限り None は契約違反なので、 **進捗の無い連敗** だけを
-                    // 数える方式に変更:
-                    // - column offset (raw) か slot stamp (gen/ss) が動いた = writer 前進中
-                    //   の生きた race → stall を 0 に戻して続行 (seqlock reader と同じ
-                    //   「書き続けられる間は待つ」 契約)
-                    // - 同じ (raw, stamp) のまま STALL_LIMIT 連敗 = 誰も動かしていないのに
-                    //   検証が通らない (crash 残骸の odd gen / 恒久 stale / 破損) → None
-                    // また yield だけでは位相が崩れないことがあるので、 µs sleep の階段
-                    // backoff を足して共振を破る。
-                    const STALL_LIMIT: usize = 256;
+                    // #131: 揃った版を 64 回掴めなかったら、 行の書き手と同じ
+                    // row lock (#135) を握って 1 回だけ読む。 Leaf の cell を書き換える経路は全部
+                    // その行の row lock の中なので、 握っている間は書き換わらない = 1 回で確定する
+                    // (読めなければ誰も動かさない odd gen / 破損 = None)。 書き手より先に握るので、
+                    // 待つのは今の書き手 1 本が離すまで。
+                    // 実際に握るのは稀 (row lock で同じ cell の書き手は 1 本ずつ = 9600 万 read に 1 回)。
+                    // crate 内の test は thread ごとに回数を下げて、 握る経路を毎回通せる (tests_issue131)。
+                    #[cfg(not(test))]
+                    let lock_free_tries: usize = 64;
+                    #[cfg(test)]
+                    let lock_free_tries: usize = crate::tests_issue131::LOCK_FREE_TRIES.with(|c| c.get());
                     const SPIN_TRIES: usize = 16;
-                    const YIELD_TRIES: usize = 64;
+                    // 揃わなかった時は、 見た (column offset, slot stamp)。 relocation なら None。
+                    let read = || -> Result<Option<Vec<u8>>, Option<(u32, u64)>> {
+                        let raw = match self.himos[hid].get_value32(eid_local) {
+                            Some(raw) => raw,
+                            None => return Ok(None),
+                        };
+                        // slot 内の seqlock (gen) で torn / 同 offset 再利用を検出。
+                        let LeafRead::Ok(bytes) = leaf.try_read(raw) else {
+                            return Err(Some((raw, leaf.slot_stamp(raw))));
+                        };
+                        // column offset を再読。 不変なら relocation も無かった = 確定。
+                        if self.himos[hid].get_value32(eid_local) == Some(raw) { Ok(Some(bytes)) } else { Err(None) }
+                    };
+                    // 別の行を握っている thread は握れない (互いを待って止まる) ので、 揃うまで読み直す
+                    // (#128: µs sleep の階段 backoff で書き手との位相をずらす。 同じ (offset, stamp) の
+                    // まま STALL_LIMIT 回続けて揃わない = 誰も動かしていない odd gen / 破損 → None)。
+                    const STALL_LIMIT: usize = 256;
                     let mut stall = 0usize;
                     let mut last_probe: Option<(u32, u64)> = None;
                     let mut attempt = 0usize;
                     loop {
+                        // readonly の Engine (別 process の読み手) が握っても書き手は止まらない (row lock は
+                        // process の中だけ) — 握って 1 回で諦めると値があるのに None (#128 が戻る)。 読み直しへ
+                        if attempt == lock_free_tries
+                            && !self.is_readonly()
+                            && let Some(_row) = self.row_locks.read_locked(eid_local)
+                        {
+                            return read().unwrap_or(None);
+                        }
                         if attempt > 0 {
                             if attempt < SPIN_TRIES {
                                 std::hint::spin_loop();
-                            } else if attempt < YIELD_TRIES {
+                            } else if attempt < lock_free_tries {
                                 std::thread::yield_now();
                             } else {
-                                let us = ((attempt - YIELD_TRIES + 1) as u64).min(100);
+                                let us = ((attempt - lock_free_tries + 1) as u64).min(100);
                                 std::thread::sleep(std::time::Duration::from_micros(us));
                             }
                         }
                         attempt += 1;
-                        let raw = self.himos[hid].get_value32(eid_local)?;
-                        // slot 内の seqlock (gen) で torn / 同 offset 再利用を検出。
-                        let LeafRead::Ok(bytes) = leaf.try_read(raw) else {
-                            let probe = (raw, leaf.slot_stamp(raw));
-                            if last_probe == Some(probe) {
+                        match read() {
+                            Ok(v) => return v,
+                            Err(Some(probe)) if last_probe == Some(probe) => {
                                 stall += 1;
                                 if stall >= STALL_LIMIT {
                                     return None;
                                 }
-                            } else {
-                                stall = 0;
-                                last_probe = Some(probe);
                             }
-                            continue;
-                        };
-                        // column offset を再読。 不変なら relocation も無かった = 確定。
-                        if self.himos[hid].get_value32(eid_local) == Some(raw) {
-                            return Some(bytes);
+                            Err(probe) => {
+                                stall = 0;
+                                last_probe = probe;
+                            }
                         }
-                        // Ok だが column が動いた = writer 前進 (別 offset へ relocation)。
-                        stall = 0;
-                        last_probe = None;
                     }
                 }
                 // Tag / reserved Leaf: 不変な vocab bytes を copy。
@@ -15663,6 +15677,33 @@ mod tests {
             t0.elapsed().as_millis()
         );
         let _ = std::fs::remove_dir_all(&dir); // v10: DB は directory
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// #131: 別の行を握っている thread は読みのために行を握らない (互いを待って止まるので) —
+    /// その時も odd gen は #128 の 「進捗の無い連敗」 で None に落ちること (握れば 1 回で None)。
+    #[test]
+    fn issue131_stalled_slot_while_holding_another_row_returns_none() {
+        let dir = tmp("issue131_stall_holding");
+        let mut eng = Engine::create_growable(&dir).unwrap();
+        eng.define_himo("body", ValueType::Leaf, 0);
+        let eid = eng.entity().unwrap();
+        let other = eng.entity().unwrap();
+        eng.tie_text(eid, "body", "hello-leaf-body");
+        let hid = eng.himo_id("body").unwrap();
+        let raw = eng.himos[hid].get_value32(enchudb_oplog::eid_local(eid)).unwrap();
+        eng.leaf_for(hid).expect("routed leaf").poison_gen_odd_for_test(raw);
+
+        let _held = eng.write_row(other);
+        let t0 = std::time::Instant::now();
+        assert_eq!(eng.get_text_owned(eid, "body"), None, "odd gen (進捗なし) は None に落ちること");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "stall escape が {} ms — hang している",
+            t0.elapsed().as_millis()
+        );
+        drop(_held);
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&dir);
     }
 
