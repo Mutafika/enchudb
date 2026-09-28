@@ -5,6 +5,16 @@
 //! 置く場所。 本体の行と同じ WAL / commit に載る必要がある一方、 相手に配ると嘘になる。
 
 use enchudb_schema::{Database, Value};
+use std::time::{Duration, Instant};
+
+/// 条件が立つまで待つ (固定 sleep は遅い CI で取りこぼす、 #278 / #208)。
+fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !f() {
+        assert!(Instant::now() < deadline, "10 秒待っても成立しない: {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
 
 fn tmp_path(tag: &str) -> String {
     format!(
@@ -81,23 +91,23 @@ fn local_only_table_is_not_bridged_to_peers() {
     const USER_MARKER: i64 = 0x0123_4567;
     const LOCAL_MARKER: i64 = 0x0BAD_F00D;
 
-    db.get_table("notes").unwrap().insert().set("n", USER_MARKER).commit().unwrap();
+    // local-only を先に、 user table を後に書く。 bridge は WAL 順に読むので、 後の
+    // USER_MARKER が届いた = LOCAL_MARKER も判定を通過済み (固定 sleep で待たない)。
     db.get_table("_seen").unwrap().insert().set("n", LOCAL_MARKER).commit().unwrap();
+    db.get_table("notes").unwrap().insert().set("n", USER_MARKER).commit().unwrap();
 
     let eng = db.engine();
     eng.flush_writes();
     eng.oplog_commit();
     eng.oplog_sync().unwrap();
-    eng.transfer_oplog_to_sync_ops();
-    std::thread::sleep(std::time::Duration::from_millis(250));
-    eng.transfer_oplog_to_sync_ops();
-
-    let payloads = eng.pending_sync_ops(0);
     let contains = |m: i64| {
         let pat = (m as u32).to_le_bytes();
-        payloads.iter().any(|p| p.windows(4).any(|w| w == pat))
+        eng.pending_sync_ops(0).iter().any(|p| p.windows(4).any(|w| w == pat))
     };
-    assert!(contains(USER_MARKER), "user table の write が bridge されていない — 前提が壊れている");
+    wait_until("user table の write が bridge される — 前提", || {
+        eng.transfer_oplog_to_sync_ops();
+        contains(USER_MARKER)
+    });
     assert!(
         !contains(LOCAL_MARKER),
         "local-only table の write が `_sync_ops` に流れている (peer に配られてしまう)"

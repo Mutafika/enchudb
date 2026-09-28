@@ -36,16 +36,34 @@ fn prepare_db(path: &str) {
     e.flush().unwrap();
 }
 
+/// `crash_writer` (enchudb-engine の bin) の path。 root package の test からは cargo が
+/// 他 crate の bin を作ってくれないので、 この test と同じ target dir / profile に 1 回だけ
+/// `cargo build` する (事前 build 不要、 古い binary も作り直される、 #272)。
 fn crash_writer_bin() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("target");
-    p.push("debug");
-    p.push("crash_writer");
-    assert!(
-        p.exists(),
-        "crash_writer binary not built. run: cargo build -p enchudb-engine --bin crash_writer"
-    );
-    p
+    static BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        // test binary は <target>/<profile>/deps/<name>、 bin は <target>/<profile>/<bin>
+        let exe = std::env::current_exe().unwrap();
+        let profile_dir = exe.parent().and_then(|d| d.parent()).unwrap().to_path_buf();
+        let target_dir = profile_dir.parent().unwrap();
+        let profile = match profile_dir.file_name().and_then(|s| s.to_str()) {
+            Some("debug") | None => "dev",
+            Some(p) => p,
+        };
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let status = Command::new(cargo)
+            .args(["build", "-p", "enchudb-engine", "--bin", "crash_writer", "--profile", profile])
+            .arg("--target-dir")
+            .arg(target_dir)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .status()
+            .expect("cargo build crash_writer");
+        assert!(status.success(), "crash_writer の build に失敗: {status:?}");
+        let bin = profile_dir.join("crash_writer");
+        assert!(bin.exists(), "build したのに crash_writer が無い: {}", bin.display());
+        bin
+    })
+    .clone()
 }
 
 // ═══════════════════════════════════════════════════════════

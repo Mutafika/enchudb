@@ -6,7 +6,17 @@
 
 use enchudb_engine::{Engine, ValueType};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// 条件が真になるまで 5ms 間隔で待つ (上限 10 秒)。 固定 sleep だと遅い CI で
+/// consumer の自動転送 (100ms tick) が間に合わず落ちるので、 実際の条件を見る (#278)。
+fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !f() {
+        assert!(Instant::now() < deadline, "timeout (10s): {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
 
 fn tmp_path(tag: &str) -> String {
     format!(
@@ -47,8 +57,10 @@ fn consumer_thread_auto_transfers_to_sync_ops() {
     }
     eng.oplog_commit();
 
-    // consumer thread の fsync_interval = 100ms、 余裕を持って 300ms 待つ
-    std::thread::sleep(Duration::from_millis(300));
+    // consumer thread (fsync_interval = 100ms) が 5 件を自動転送するまで待つ
+    wait_until("consumer が 5 件を _sync_ops へ自動転送", || {
+        eng.current_sync_lsn() >= 5 && eng.pending_sync_ops(0).len() >= 5
+    });
 
     // pending_sync_ops は自動転送されてるはず
     let pending = eng.pending_sync_ops(0);
@@ -86,7 +98,8 @@ fn manual_transfer_remains_idempotent_after_auto() {
         eng.tie_to(e, "notes.note", i);
     }
     eng.oplog_commit();
-    std::thread::sleep(Duration::from_millis(300));
+    // consumer が 3 件を自動転送するまで待つ (手動 transfer は呼ばない)
+    wait_until("consumer が 3 件を自動転送", || eng.current_sync_lsn() >= 3);
 
     // 自動転送済みのはず
     let auto_lsn = eng.current_sync_lsn();

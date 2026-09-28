@@ -7,7 +7,17 @@
 
 use enchudb_engine::{Engine, ValueType};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// 条件が真になるまで 5ms 間隔で待つ (上限 10 秒)。 固定 sleep だと遅い CI で
+/// consumer の自動転送 (100ms tick) が間に合わず落ちるので、 実際の条件を見る (#278)。
+fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !f() {
+        assert!(Instant::now() < deadline, "timeout (10s): {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
 
 fn tmp_path(tag: &str) -> String {
     format!(
@@ -47,7 +57,9 @@ fn reclaim_pushes_local_id_to_free_list() {
         eng.tie_to(e, "notes.note", i);
     }
     eng.oplog_commit();
-    std::thread::sleep(Duration::from_millis(300));
+    wait_until("5 件の自動転送", || {
+        eng.current_sync_lsn() >= 5 && eng.pending_sync_ops(0).len() >= 5
+    });
 
     let pre_pending = eng.pending_sync_ops(0).len();
     assert!(pre_pending >= 5);
@@ -84,7 +96,7 @@ fn entity_in_reuses_freed_locals_after_reclaim() {
         eng.tie_to(e, "notes.note", i);
     }
     eng.oplog_commit();
-    std::thread::sleep(Duration::from_millis(300));
+    wait_until("1 サイクル目 10 件の自動転送", || eng.current_sync_lsn() >= 10);
     let lsn1 = eng.current_sync_lsn();
     eng.ack_sync(1, lsn1).unwrap();
     let purged1 = eng.reclaim_sync_ops();
@@ -96,7 +108,7 @@ fn entity_in_reuses_freed_locals_after_reclaim() {
         eng.tie_to(e, "notes.note", i);
     }
     eng.oplog_commit();
-    std::thread::sleep(Duration::from_millis(300));
+    wait_until("2 サイクル目 10 件の自動転送", || eng.current_sync_lsn() >= lsn1 + 10);
 
     // 2 サイクル目も問題なく転送できてるか (= 飽和しなければ OK)
     let pending = eng.pending_sync_ops(0);
@@ -132,7 +144,9 @@ fn long_cycle_does_not_exhaust_eid_range() {
             eng.tie_to(e, "notes.note", cycle * 50 + i);
         }
         eng.oplog_commit();
-        std::thread::sleep(Duration::from_millis(200));
+        // tie 1 件 = sync record 1 件。 このサイクルの 50 件が転送されるまで待つ
+        let want = (cycle + 1) * 50;
+        wait_until("サイクルの 50 件の自動転送", || eng.current_sync_lsn() >= want);
         let lsn = eng.current_sync_lsn();
         eng.ack_sync(1, lsn).unwrap();
         total_purged += eng.reclaim_sync_ops();

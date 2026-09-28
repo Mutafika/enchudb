@@ -191,8 +191,10 @@ mod tests {
         let drained2 = drained.clone();
         let h = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            let _ = q2.pop();
+            // #274: 印は pop の **前** に立てる。 pop の後だと、 pop で空いた瞬間に push が返って印を読むまでの間に
+            // 立て終わらないことがある (push は正しく待ったのに落ちる)
             drained2.store(true, Ordering::Release);
+            let _ = q2.pop();
         });
         // この push は block するはず、 drainer が動くまで返らない
         q.push(Op::Delete { eid: 99, hlc: Hlc::ZERO });

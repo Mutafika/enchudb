@@ -11,7 +11,27 @@
 
 use enchudb_engine::{Engine, ValueType};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// 条件が真になるまで 5ms 間隔で待つ (上限 10 秒)。 固定 sleep だと遅い CI で
+/// consumer の自動転送 (100ms tick) が間に合わず落ちるので、 実際の条件を見る (#278 / #336)。
+fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !f() {
+        assert!(Instant::now() < deadline, "timeout (10s): {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// `_sync_ops` ring に空きが無い (bridge が backpressure で止まる状態)。
+fn ring_full(eng: &Engine) -> bool {
+    eng.table_eid_usage("_sync_ops").expect("_sync_ops が無い").free == 0
+}
+
+/// bridge が oplog を読み切った (cursor が head に追いついた)。
+fn bridge_caught_up(eng: &Engine) -> bool {
+    eng.sync_ops_bridge_offset() >= eng.oplog_head()
+}
 
 fn tmp_path(tag: &str) -> String {
     format!(
@@ -33,30 +53,26 @@ fn cleanup(path: &str) {
 }
 
 /// ring が埋まるまで tie し続ける (1 entity への tie 連打なので user table は消費しない)。
-/// pending が 3 回連続で増えなくなったら「満杯」とみなして返す。
+/// batch ごとに consumer の bridge が 「読み切る」 か 「満杯で止まる」 まで待ち、
+/// `_sync_ops` の空きが 0 になったら満杯として返す。
+/// 旧実装は 150ms sleep 後の pending の頭打ちで満杯と推定していたが、 遅い CI では
+/// bridge が遅れただけの頭打ちを満杯と誤認する (#336)。
 fn fill_ring(eng: &Arc<Engine>, e: u64, start: u32) -> (u32, usize) {
     let mut v = start;
-    let mut plateau = 0;
-    let mut last_pending = 0usize;
     for _ in 0..400 {
         for _ in 0..32 {
             v += 1;
             eng.tie_to(e, "notes.note", v);
         }
         eng.oplog_commit();
-        std::thread::sleep(Duration::from_millis(150));
-        let p = eng.pending_sync_ops(0).len();
-        if p <= last_pending {
-            plateau += 1;
-            if plateau >= 3 {
-                return (v, p);
-            }
-        } else {
-            plateau = 0;
+        wait_until("bridge が batch を読み切るか ring が満杯になる", || {
+            ring_full(eng) || bridge_caught_up(eng)
+        });
+        if ring_full(eng) {
+            return (v, eng.pending_sync_ops(0).len());
         }
-        last_pending = p;
     }
-    (v, last_pending)
+    panic!("400 batch 書いても _sync_ops ring が満杯にならない — テスト前提が壊れている");
 }
 
 /// payload (oplog record の wire bytes) に marker 値が u32 LE で載っているか。
@@ -101,7 +117,11 @@ fn backlog_larger_than_ring_drains_instead_of_livelocking() {
     let marker = 777_777u32;
     eng.tie_to(e, "notes.note", marker);
     eng.oplog_commit();
-    std::thread::sleep(Duration::from_millis(400));
+    // bridge が満杯のまま backlog 末尾 (marker の commit) まで scan したのを待つ
+    let head = eng.oplog_head();
+    wait_until("bridge が満杯のまま backlog 末尾まで scan する", || {
+        eng.bridge_last_committed_end() >= head
+    });
 
     // ack + reclaim で ring を回し続ければ、 backlog 末尾の marker まで必ず到達する。
     let mut found = false;
@@ -111,7 +131,12 @@ fn backlog_larger_than_ring_drains_instead_of_livelocking() {
         let lsn = eng.current_sync_lsn();
         eng.ack_sync(1, lsn).unwrap();
         eng.reclaim_sync_ops();
-        std::thread::sleep(Duration::from_millis(400));
+        // 空いた ring を consumer が埋め直す (= 満杯に戻る) か、 backlog を読み切るまで待つ
+        wait_until("reclaim 後に bridge が ring を埋め直すか読み切る", || {
+            ring_full(&eng)
+                || bridge_caught_up(&eng)
+                || contains_marker(&eng.pending_sync_ops(0), marker)
+        });
         if contains_marker(&eng.pending_sync_ops(0), marker) {
             found = true;
             break;
