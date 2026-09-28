@@ -656,10 +656,10 @@ pub struct OpLog {
     /// #268: テスト用 fault injection。 残り回数ぶん Commit の append を満杯として
     /// 失敗させる。 0 (既定) で何もしない。 `fail_next_commits` の doc を参照。
     fail_next_commits: std::sync::atomic::AtomicU32,
-    /// #57: append に失敗して WAL に載らなかった record の author (Commit は除く、 重複なし)。
-    /// engine が [`OpLog::take_dropped_authors`] で取り出し、 その author の配布履歴に穴が
+    /// #57: append に失敗して WAL に載らなかった record の (author, その author の落ちた HLC の max)
+    /// (Commit は除く)。 engine が [`OpLog::take_dropped`] で取り出し、 その author の配布履歴に穴が
     /// あったことを puller に知らせる (history floor を上げて bootstrap に回す)。
-    dropped_authors: std::sync::Mutex<Vec<PeerId>>,
+    dropped: std::sync::Mutex<Vec<(PeerId, Hlc)>>,
 }
 
 unsafe impl Send for OpLog {}
@@ -761,7 +761,7 @@ impl OpLog {
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
-            dropped_authors: std::sync::Mutex::new(Vec::new()),
+            dropped: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -828,7 +828,7 @@ impl OpLog {
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
-            dropped_authors: std::sync::Mutex::new(Vec::new()),
+            dropped: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -987,9 +987,16 @@ impl OpLog {
 
         let _guard = self.pending_guard(records.len() as u32);
         let r = self.append_many_inner(records, &sizes, total, hlcs);
-        // #57: 自分の write の束 (Commit しか無い束は record を運ばない)
-        if r.is_err() && records.iter().any(|x| !matches!(x.as_op(), Op::Commit)) {
-            self.note_dropped(self.peer_id());
+        // #57: 自分の write の束 (Commit しか無い束は record を運ばない)。 HLC は事前採番の max
+        if r.is_err() {
+            let carried = records.iter().enumerate().filter(|(_, x)| !matches!(x.as_op(), Op::Commit));
+            let max = match hlcs {
+                Some(h) => carried.map(|(i, _)| h[i]).max(),
+                None => carried.map(|_| ()).next().map(|_| self.next_hlc()),
+            };
+            if let Some(h) = max {
+                self.note_dropped(self.peer_id(), h);
+            }
         }
         r
     }
@@ -1131,7 +1138,12 @@ impl OpLog {
         let r = self.append_verbatim_checked(sb, signature, pubkey_fp, record_size);
         // #57: 検証を通った record が載らなかった = 中継の配布履歴に穴 (壊れた bytes の拒否は数えない)
         if r.is_err() {
-            self.note_dropped(u32::from_le_bytes(sb[32..36].try_into().unwrap()));
+            let hlc = Hlc {
+                wall: u64::from_le_bytes(sb[16..24].try_into().unwrap()),
+                logical: u32::from_le_bytes(sb[24..28].try_into().unwrap()),
+                peer: u32::from_le_bytes(sb[28..32].try_into().unwrap()),
+            };
+            self.note_dropped(u32::from_le_bytes(sb[32..36].try_into().unwrap()), hlc);
         }
         r
     }
@@ -1199,14 +1211,41 @@ impl OpLog {
         // request17-A3: Some なら採番せず与えられた HLC を載せる (`mint_hlc` 済み)。
         hlc_override: Option<Hlc>,
     ) -> io::Result<(u64, Hlc)> {
+        self.append_inner_noting(op, payload_size, record_size, relay, hlc_override)
+            .map_err(|(e, _)| e)
+    }
+
+    /// `append_inner` の本体。 載らなかった時は、 その record の HLC (採番前なら今採番) も返す。
+    fn append_inner_noting(
+        &self,
+        op: Op<'_>,
+        payload_size: usize,
+        record_size: usize,
+        relay: Option<RelayedHeader>,
+        hlc_override: Option<Hlc>,
+    ) -> Result<(u64, Hlc), (io::Error, Hlc)> {
         let is_commit = matches!(op, Op::Commit);
-        let r = self.append_inner_raw(op, payload_size, record_size, relay, hlc_override);
-        // #57: 落ちた record の author を覚える。 Commit は record を運ばない (落ちても group が
-        // 閉じるのが遅れるだけ、 #268) ので数えない。
-        if r.is_err() && !is_commit {
-            self.note_dropped(relay.map(|h| h.author).unwrap_or_else(|| self.peer_id()));
-        }
-        r
+        self.append_inner_raw(op, payload_size, record_size, relay, hlc_override).map_err(|e| {
+            // #57: 落ちた record の author と HLC を覚える。 Commit は record を運ばない (落ちても group が
+            // 閉じるのが遅れるだけ、 #268) ので覚えない (採番もしない)。
+            if is_commit {
+                return (e, Hlc::ZERO);
+            }
+            let hlc = relay.map(|h| h.hlc).or(hlc_override).unwrap_or_else(|| self.next_hlc());
+            self.note_dropped(relay.map(|h| h.author).unwrap_or_else(|| self.peer_id()), hlc);
+            (e, hlc)
+        })
+    }
+
+    /// #57: `append_with_hlc` と同じ。 載らなかった時は Err に **落ちた record の HLC** を添える
+    /// (採番して [`OpLog::take_dropped`] に覚えた値)。 同期 write はそれを cell の版数に使う —
+    /// 覚えるより後に採番し直すと、 その間に engine の bridge が floor を決めて、 落ちた write の
+    /// 版数が floor を越える。
+    pub fn append_or_dropped(&self, op: Op<'_>) -> Result<(u64, Hlc), (io::Error, Hlc)> {
+        let payload_size = op.payload_size();
+        let record_size = REC_HEADER_SIZE + payload_size;
+        let _guard = self.pending_guard(1);
+        self.append_inner_noting(op, payload_size, record_size, None, None)
     }
 
     fn append_inner_raw(
@@ -1409,19 +1448,21 @@ impl OpLog {
         self.fail_next_commits.store(n, Ordering::Release);
     }
 
-    fn note_dropped(&self, author: PeerId) {
-        let mut g = self.dropped_authors.lock().unwrap_or_else(|p| p.into_inner());
-        if !g.contains(&author) {
-            g.push(author);
+    fn note_dropped(&self, author: PeerId, hlc: Hlc) {
+        let mut g = self.dropped.lock().unwrap_or_else(|p| p.into_inner());
+        match g.iter_mut().find(|(a, _)| *a == author) {
+            Some((_, h)) => *h = (*h).max(hlc),
+            None => g.push((author, hlc)),
         }
     }
 
-    /// #57: 前回から append に失敗して WAL に載らなかった record の author を取り出す (空にする)。
+    /// #57: 前回から append に失敗して WAL に載らなかった record を、 author ごとに落ちた HLC の max で
+    /// 取り出す (空にする)。
     ///
     /// 載らなかった record は `_sync_ops` にも入らないので、 差分 pull では二度と届かない。
     /// engine の bridge がこれを見て、 その author の history floor を上げる。
-    pub fn take_dropped_authors(&self) -> Vec<PeerId> {
-        std::mem::take(&mut *self.dropped_authors.lock().unwrap_or_else(|p| p.into_inner()))
+    pub fn take_dropped(&self) -> Vec<(PeerId, Hlc)> {
+        std::mem::take(&mut *self.dropped.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
     /// fault injection の残数を 1 消費する。 消費できたら true。
@@ -1766,7 +1807,7 @@ impl OpLog {
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
-            dropped_authors: std::sync::Mutex::new(Vec::new()),
+            dropped: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -2385,31 +2426,37 @@ mod tests {
         src.set_peer_id(7);
         src.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
         let rec = tie_record(&src);
-        let fill = || while wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).is_ok() {};
-        fill();
-        assert_eq!(wal.take_dropped_authors(), vec![1], "自分の write");
-        assert!(wal.take_dropped_authors().is_empty(), "取り出したら空");
+        while wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).is_ok() {}
+        let got = wal.take_dropped();
+        assert!(got.len() == 1 && got[0].0 == 1 && got[0].1 != Hlc::ZERO, "自分の write: {got:?}");
+        assert!(wal.take_dropped().is_empty(), "取り出したら空");
+
+        // 同期 write が版数に使う HLC = 覚えた HLC
+        let (_, h) = wal.append_or_dropped(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap_err();
+        assert_eq!(wal.take_dropped(), vec![(1, h)], "返した HLC と覚えた HLC が違う");
 
         assert!(wal.append(Op::Commit).is_err(), "前提: 満杯");
-        assert!(wal.take_dropped_authors().is_empty(), "Commit は覚えない");
+        assert!(wal.take_dropped().is_empty(), "Commit は覚えない");
 
         let hdr = RelayedHeader { hlc: rec.hlc, author: 7, signature: rec.signature, pubkey_fp: rec.pubkey_fp };
         assert!(wal.append_relayed(Op::Tie { eid: 1, himo_id: 0, value: 1 }, hdr).is_err());
-        assert_eq!(wal.take_dropped_authors(), vec![7], "中継 (再 encode)");
+        assert_eq!(wal.take_dropped(), vec![(7, rec.hlc)], "中継 (再 encode) は元の author と HLC");
 
         assert!(wal.append_relayed_verbatim(&rec.signed_bytes, &rec.signature, &rec.pubkey_fp).is_err());
-        assert_eq!(wal.take_dropped_authors(), vec![7], "中継 (bytes のまま)");
+        assert_eq!(wal.take_dropped(), vec![(7, rec.hlc)], "中継 (bytes のまま) は元の author と HLC");
         // 壊れた bytes の拒否は載らなかった record ではない
         let mut bad = rec.signed_bytes.clone();
         bad[0] ^= 0xff;
         assert!(wal.append_relayed_verbatim(&bad, &rec.signature, &rec.pubkey_fp).is_err());
-        assert!(wal.take_dropped_authors().is_empty(), "壊れた bytes の拒否");
+        assert!(wal.take_dropped().is_empty(), "壊れた bytes の拒否");
 
-        let batch = [OwnedOp::Tie { eid: 1, himo_id: 0, value: 1 }];
-        assert!(wal.append_many(&batch).is_err());
-        assert_eq!(wal.take_dropped_authors(), vec![1], "まとめた append");
+        let (h1, h2) = (wal.mint_hlc(), wal.mint_hlc());
+        let batch = [OwnedOp::Tie { eid: 1, himo_id: 0, value: 1 }, OwnedOp::Commit, OwnedOp::Tie { eid: 2, himo_id: 0, value: 1 }];
+        let h3 = wal.mint_hlc();
+        assert!(wal.append_many_with_hlcs(&batch, &[h1, h3, h2]).is_err());
+        assert_eq!(wal.take_dropped(), vec![(1, h2)], "まとめた append は record の HLC の max (Commit は除く)");
         assert!(wal.append_many(&[OwnedOp::Commit]).is_err());
-        assert!(wal.take_dropped_authors().is_empty(), "Commit だけの束");
+        assert!(wal.take_dropped().is_empty(), "Commit だけの束");
         for q in [&p, &src_p] {
             let _ = std::fs::remove_dir_all(q);
             let _ = std::fs::remove_file(q);

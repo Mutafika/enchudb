@@ -66,6 +66,17 @@ fn settle(eng: &Arc<Engine>) {
     eng.transfer_oplog_to_sync_ops();
 }
 
+/// bridge が WAL に載らなかった record のために floor を上げるまで待つ (上げた回数が `before` を越えるまで)。
+/// 落ちるのが止まった後は次の bridge で上がるので、 2 秒 (満杯の間に待つ上限 5 秒より短い) で見切る。
+fn wait_floor_bump(eng: &Arc<Engine>, before: u64) {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while eng.wal_drop_floor_bumps() <= before {
+        assert!(std::time::Instant::now() < end, "落ちるのが止まって 2 秒で floor が上がらない");
+        eng.transfer_oplog_to_sync_ops();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 fn has_note(eng: &Arc<Engine>, i: u32, async_: bool) -> bool {
     let Some(e) = eng.pull_raw("notes.note", i).first().copied() else { return false };
     async_ || eng.get_text_owned(e, "notes.body").is_some_and(|b| b == format!("body {i}").as_bytes())
@@ -115,7 +126,12 @@ fn dropped_writes_reach_the_peer(async_: bool, per_peer: bool) {
     let hid = eng_a.himo_id("notes.note").unwrap() as u16;
     settle(&eng_a);
     assert!(burst.iter().all(|e| eng_a.cell_hlc(*e, hid) != Hlc::ZERO), "版数の無い cell がある");
-    assert!(eng_a.wal_drop_floor_bumps() > 0, "前提: WAL が溢れて record が落ちること");
+    // floor は満杯の episode が終わった周に上がる (WAL が畳まれて空いた後の bridge)
+    wait_floor_bump(&eng_a, 0);
+    // 落ちた write の版数は floor 以下 (floor を越えた cursor の puller が取りこぼさない)
+    let floor = eng_a.sync_reclaimed_floors().unwrap().into_iter().find(|(a, _)| *a == 1).unwrap().1;
+    let max_cell = burst.iter().map(|e| eng_a.cell_hlc(*e, hid)).max().unwrap();
+    assert!(max_cell <= floor, "落ちた write の版数 {max_cell:?} が floor {floor:?} を越える");
     if per_peer {
         sync_a.publish_since_for_peer(2, Hlc::ZERO);
     } else {
@@ -149,4 +165,72 @@ fn dropped_writes_reach_the_peer(async_: bool, per_peer: bool) {
     drop((sync_a, sync_b, eng_a, eng_b));
     cleanup(&pa);
     cleanup(&pb);
+}
+
+/// 中継した他人の record が落ちたら、 その author の floor は **落ちた record の HLC** (中継役の今ではない)。
+/// 他人の author の bootstrap は as_of を 「その author の HLC の max」 で決めるので、 中継役の今を入れると
+/// bootstrap しても cursor が floor に届かず、 pull のたびに truncated になり続ける (#345 レビュー)。
+#[test]
+fn a_dropped_relayed_record_raises_its_authors_floor_to_its_own_hlc() {
+    let pa = tmp_path("relay");
+    let eng = make_engine(&pa, 1, 64 * 1024);
+    let src_p = format!("{pa}-src.oplog");
+    let src = enchudb_oplog::oplog::OpLog::create(std::path::Path::new(&src_p), 1024 * 1024).unwrap();
+    src.set_peer_id(7);
+    src.append(enchudb_oplog::oplog::Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
+    src.append(enchudb_oplog::oplog::Op::Commit).unwrap();
+    let rec = src.iter_committed().into_iter().next().unwrap();
+    // 中継役の clock を author 7 より先に進めておく
+    for _ in 0..1000 {
+        eng.oplog().unwrap().mint_hlc();
+    }
+
+    // WAL を溢れさせてから中継する
+    let wal = eng.oplog().unwrap().clone();
+    while wal.append(enchudb_oplog::oplog::Op::Tie { eid: 1, himo_id: 0, value: 1 }).is_ok() {}
+    assert!(wal.append_relayed_verbatim(&rec.signed_bytes, &rec.signature, &rec.pubkey_fp).is_err(), "前提: 満杯");
+    wait_floor_bump(&eng, 0);
+    let floors = eng.sync_reclaimed_floors().unwrap();
+    let f7 = floors.iter().find(|(a, _)| *a == 7).map(|(_, h)| *h);
+    assert_eq!(f7, Some(rec.hlc), "author 7 の floor は落ちた record の HLC: {floors:?}");
+    drop((wal, eng));
+    let _ = std::fs::remove_file(&src_p);
+    cleanup(&pa);
+}
+
+/// 書き続けて WAL が満杯のままの間は floor を上げない (上げるたびに全 peer が全状態を bootstrap する)。
+/// 書くのを止めて落ちなくなった周に 1 回上げる。
+#[test]
+fn the_floor_is_raised_once_when_the_full_episode_ends() {
+    let pa = tmp_path("episode");
+    let eng = make_engine(&pa, 1, 64 * 1024);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let w = {
+        let (eng, stop) = (eng.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut i = 0u32;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let e = eng.entity_in("notes").unwrap();
+                eng.tie_to(e, "notes.note", i % 1000);
+                eng.untie(e, "notes.note");
+                eng.delete(e);
+                i += 1;
+            }
+        })
+    };
+    // 1.5 秒 (consumer の 15 周) 書き続ける間、 毎周落ちているので上げない
+    let end = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    while std::time::Instant::now() < end {
+        eng.transfer_oplog_to_sync_ops();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(eng.wal_drop_floor_bumps(), 0, "満杯の間に floor を上げた");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    w.join().unwrap();
+    wait_floor_bump(&eng, 0);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    eng.transfer_oplog_to_sync_ops();
+    assert_eq!(eng.wal_drop_floor_bumps(), 1, "episode 1 回に 1 回");
+    drop(eng);
+    cleanup(&pa);
 }
