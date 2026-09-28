@@ -3,6 +3,64 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.27.5 — 2026-09-28
+
+**changefeed の listener に commit 済みの record が届かない穴を塞いだ patch** (#337)。 on-disk format / 公開
+API は**不変**、 migration 不要。 **`add_change_listener` を使う consumer (WsPushHub を含む) は上げること**。
+
+### Fixed — changefeed の listener が commit 済み record を取りこぼす (#337)
+
+`oplog_sync()` は Commit → fsync → checkpoint を進める → (bridge) → listener へ配信、 の順に進む。 途中で
+consumer の tick が来ると、 tick は `head == checkpoint` なので配らずに WAL を畳み (fold の条件は bridge しか
+見ていなかった)、 listener の cursor を先頭に戻す。 配信は lock も CAS も無く最後に cursor を上書きするので、
+巻き戻しを古い終端で潰し、 cursor が新しい ring の head より先に居座って、 そこまでの record が届かなかった
+(#196 と同じ lost update)。
+
+- 2 万回の tie + `oplog_sync` で 8 回中 1 回、 1,184 件が届かない
+- listener の処理に 200 µs かかると、 5,000 件中 **3,192〜4,715 件**が届かない (5/5 回)。 配信先へ書く listener
+  (WsPushHub) では大半を落とす
+
+直し方:
+
+- 配信 (cursor の読み → 配る → 進める) と fold を lock で直列にする
+- listener が居れば、 配り終える (cursor >= head) まで WAL を畳まない。 例外は bridge と同じ満杯の死区間
+  (閉じられない孤児の group しか残っていなければ畳む)
+- consumer は fold の前に毎 tick listener に追いつかせる
+
+### Changed
+
+- **配信は 1 本ずつ**になった。 `oplog_sync()` は、 他の thread が配っている最中ならそれを待ってから自分の commit
+  を配り、 配り終えてから返る (戻った時点で配り終えている、 という doc の約束は変わらない)
+- listener の中から `oplog_sync()` を呼んでよい (その呼び出しは配らずに返り、 残りは呼び出し元の配信か consumer
+  が配る)。 **listener の中で別の thread の `oplog_sync()` を待たないこと** (その thread はこちらの配信が終わるのを
+  待っているので、 互いに待って止まる)
+- listener が遅いと、 配り終えるまで WAL を畳まない分、 WAL の使用量が増えうる
+
+### 検証 (`tests/issue337_changefeed_fold.rs`)
+
+| | 結果 |
+|---|---|
+| 修正前 | 5/5 回落ちる (3,192〜4,715 / 5,000 件が届かない) |
+| 修正後 | 5/5 回通る |
+| 配信の lock だけ残す | 4/4 回落ちる (2,864〜4,749 件) |
+| 配信の lock + fold 側の lock | 2/3 回落ちる (2〜3 件、 配る前に畳む窓) |
+
+- `oplog_sync_returns_after_its_records_are_delivered`: consumer の配信と重なる形で 3000 回、 戻った時点で届いて
+  いるか。 `oplog_sync` を待たない形 (`try_lock`) に戻すと落ちる
+- `oplog_sync_inside_a_listener_does_not_block`: listener の中の `oplog_sync` で止まらないか。 再入の見分けを外すと
+  30 秒の上限で落ちる
+
+### 既知の残り
+
+- テストで当てられていない手当てが 2 つある (fold 側の lock / fold 前の追いつき)。 コードから必要と判断して残した
+- #335 (`number64` の audit が空) は、 `oplog_sync` と audit の間に consumer が WAL を畳むだけのテストの前提の
+  問題と判明 (本体のバグではない)。 テストの修正は別
+
+### Tooling
+
+- `scripts/mutate.py`: 変異試験の runner (#334)。 1 run ごとに時間の上限を置き、 返ってこない変異はプロセス
+  グループごと kill する。 SIGKILL で戻せなかった file は次の起動で戻す (その間に編集されていれば戻さずに止まる)
+
 ## 0.27.4 — 2026-09-28
 
 **sync の bridge が WAL を畳んだ直後に止まり、 開き直すまで何も送らなくなる穴を塞いだ patch** (#268 の 2 回目の
