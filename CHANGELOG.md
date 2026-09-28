@@ -3,6 +3,67 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.28.0 — 2026-09-29
+
+**oplog の record を v3 にした minor** (#58)。 あわせて、 WAL が満杯で載らなかった write が相手に届かない穴 (#57) と、
+Leaf の読みが原理的に返らないことがある穴 (#131) を塞いだ。 **on-disk の oplog record の形式が変わる** (下の
+「互換」)。 DB 本体の形式と公開 API の既存部分は不変、 migration 不要。
+
+### 互換 — oplog の record v3 (#58)
+
+- **新版は v3 の record を書き、 v2 も読む** (旧 binary が書いた WAL、 旧版の peer が署名した中継 record)。 v2 の
+  署名もそのまま検証できる
+- **旧 binary は v3 の record を読めない**。 新版で書いた `.oplog` を旧版で開くと、 checkpoint より後の v3 record は
+  scan が止まって当てられない。 **下げる時は `oplog_sync()` / `flush()` してから**
+- **旧版の peer は v3 の record を受け取って当てられる** (受け手は op を `WireRecord` から取り、 署名は bytes のまま
+  検証する)。 ただし **旧版の peer は v3 の record を bytes のまま中継 (gossip) できない** (`unsupported record
+  version` で弾く)。 relay を挟む構成は relay から先に上げること
+- sync の wire format、 `_sync_ops` の形は不変
+
+### Fixed — oplog の record header が CRC の対象外 (#58)
+
+record の CRC は payload だけで、 header (op / len / lsn / hlc / author) が壊れても magic が残っていれば scan を
+通った。 WAL は ring を使い回すので、 crash で header の後半の page だけ前の周の bytes が残ると、 前の周の中身を
+今の lsn / HLC で recovery・bridge・audit・publish に流しえた。 v3 は CRC に header の値も混ぜる (payload の FNV-1a に
+4 byte ずつ xor → 掛け算)。 `OpLog::append` は 527 → 544 ns (+3%)。
+
+(#58 の残り 2 つ — `pending_writes` の漏れと、 短い `.oplog` での open の panic — は以前の版で直っていた)
+
+### Fixed — WAL が満杯で載らなかった write が相手に永久に届かない (#57)
+
+WAL に載らなかった write はローカルの表には書かれるが `_sync_ops` に入らず、 差分 pull では二度と届かなかった
+(#268 で数えて警告するようにはなっていた)。 既存の 「history floor より前の cursor の puller は bootstrap で live
+state を受け取る」 (#140) に乗せた:
+
+- OpLog が載らなかった record の (author, HLC) を覚え (`take_dropped`)、 bridge がその author の floor を上げる。
+  自分の write は max(今, 落ちた HLC)、 中継した他人の record は落ちた record の HLC
+- 上げるのは満杯の episode が終わった周 (新しく落ちなかった周) か、 最初に落ちてから 5 秒後。 それまでに配った
+  record は上げる時の 「今」 より小さい HLC なので、 その puller も bootstrap に回る
+- publish は record を集めた後にも floor を広告する (`publish_since_for_peer` は広告していなかった)
+- 同期 write が WAL に載らなかった時も cell に版数を付ける (旧: `Hlc::ZERO` で、 後から届く古い write に負けた)
+- 観測: `Engine::wal_drop_floor_bumps()`
+
+WAL が満杯になると、 その episode ごとに相手は 1 回 bootstrap する。
+
+### Fixed — Leaf の読みのやり直しに上限が無い (#131)
+
+`get_text_owned` / `get_content_owned` の Leaf の読みは、 #128 で 「進捗の無い連敗だけ数える」 形になっていて、
+書き手が同じ cell を書き換え続ける限り原理的に返らなかった。 揃った版を 64 回掴めなかったら、 その行の row lock
+(#135) を **書き手より先に**握って 1 回で読む (Leaf の cell を書き換える経路は row lock の中)。
+
+- readonly の Engine (別 process の読み手) は握らない (row lock は process の中だけ。 握って 1 回で諦めると、 値が
+  あるのに None が返る)。 別の行を握っている thread も握らない (互いを待って止まるので)。 どちらも従来の読み直し
+- `read_row` / `get_many` の握って読む経路も、 書き手より先に握るようにした
+- `tie_to_by_id` は 12.79 → 12.91 ns (row lock の stripe を 1 つの構造に並べた)
+
+### 既知の残り
+
+- 別の行を握っている thread の Leaf の読みには、 今も上限が無い
+- WAL が満杯で record を落としてから、 floor を上げるまで (次の bridge、 満杯の間は最大 5 秒) の間に process が
+  落ちると、 floor が上がらない
+- changefeed の listener (WsPushHub など) は WAL から直接配るので、 WAL に載らなかった write は届かない
+- `clear_local_only_tables` / `repair_interrupted_deletes` が row lock を取らない (#349)
+
 ## 0.27.6 — 2026-09-28
 
 **Leaf 列の untie / delete と並行する読みに、 別の行の値が返る穴を塞いだ patch** (#343)。 on-disk format /
