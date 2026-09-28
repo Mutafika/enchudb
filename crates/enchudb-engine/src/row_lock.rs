@@ -30,17 +30,25 @@ const STRIPES: usize = 1 << 12;
 const READ_TRIES: u32 = 128;
 
 pub struct RowLocks {
-    stripes: Box<[AtomicU64]>,
+    /// 1 stripe の版・握っている thread の印・先に握りたい読み手の数を 1 つに並べる (書き手 1 回で触る
+    /// cache line を 1 本にする)。
+    stripes: Box<[Stripe]>,
+}
+
+/// 32 B に揃えて cache line をまたがせない (24 B のままだと 3 つに 1 つがまたぐ)。
+#[derive(Default)]
+#[repr(align(32))]
+struct Stripe {
+    /// 偶数 = 書き手なし、 奇数 = 書いている最中。
+    ver: AtomicU64,
     /// stripe を握っている thread の印 (0 = 誰も)。 握った thread だけが書く = 自分の印が見えたら自分が握っている。
-    owners: Box<[AtomicUsize]>,
+    owner: AtomicUsize,
     /// 先に握りたい読み手の数。 0 でない間、 書き手は新しく握らない。
-    urgent: Box<[AtomicU32]>,
+    urgent: AtomicU32,
 }
 
 thread_local! {
     static TOKEN: u8 = const { 0 };
-    /// この thread が握っている stripe の数 (入れ子は数えない)。
-    static HOLDING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// thread ごとに違う 0 でない値 (thread local の番地)。
@@ -66,15 +74,13 @@ impl Default for RowLocks {
 impl RowLocks {
     pub fn new() -> Self {
         Self {
-            stripes: (0..STRIPES).map(|_| AtomicU64::new(0)).collect(),
-            owners: (0..STRIPES).map(|_| AtomicUsize::new(0)).collect(),
-            urgent: (0..STRIPES).map(|_| AtomicU32::new(0)).collect(),
+            stripes: (0..STRIPES).map(|_| Stripe::default()).collect(),
         }
     }
 
     /// この thread が stripe `i` を握っているか。
     fn held(&self, i: usize, me: usize) -> bool {
-        self.stripes[i].load(Ordering::Relaxed) & 1 == 1 && self.owners[i].load(Ordering::Relaxed) == me
+        self.stripes[i].ver.load(Ordering::Relaxed) & 1 == 1 && self.stripes[i].owner.load(Ordering::Relaxed) == me
     }
 
     /// 行 `local` を書く間握る。 drop で離す。
@@ -86,7 +92,9 @@ impl RowLocks {
     /// この thread が別の stripe を握っている時は握らずに None (互いを待って止まらないように)。
     pub fn read_locked(&self, local: u32) -> Option<RowWrite<'_>> {
         let i = local as usize & (STRIPES - 1);
-        if HOLDING.get() != 0 && !self.held(i, me()) {
+        let me = me();
+        // 握っている stripe は数えずに探す (握りに来るのは稀。 書き手の度に thread local を数えると tie 1 回 +0.5 ns)
+        if !self.held(i, me) && (0..STRIPES).any(|j| self.held(j, me)) {
             return None;
         }
         Some(self.lock(local, true))
@@ -98,27 +106,26 @@ impl RowLocks {
         if self.held(i, me) {
             return RowWrite { locks: self, i: usize::MAX, _not_send: std::marker::PhantomData };
         }
-        let s = &self.stripes[i];
+        let s = &self.stripes[i].ver;
         if urgent {
-            self.urgent[i].fetch_add(1, Ordering::Relaxed);
+            self.stripes[i].urgent.fetch_add(1, Ordering::Relaxed);
         }
         let mut spins = 0;
         loop {
             // Acquire: 前の書き手が離した後に見る 「先に握りたい読み手の数」 は、 その書き手が離す前に見た数より古くない
             let v = s.load(Ordering::Acquire);
-            let wait = v & 1 == 1 || (!urgent && self.urgent[i].load(Ordering::Relaxed) != 0);
+            let wait = v & 1 == 1 || (!urgent && self.stripes[i].urgent.load(Ordering::Relaxed) != 0);
             if !wait && s.compare_exchange_weak(v, v + 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                 break;
             }
             backoff(&mut spins);
         }
         if urgent {
-            self.urgent[i].fetch_sub(1, Ordering::Relaxed);
+            self.stripes[i].urgent.fetch_sub(1, Ordering::Relaxed);
         }
         // 奇数を見せてから cell を書く (読み手が cell の新しい値を見たなら、 後の版の読みは奇数か次の版)
         std::sync::atomic::fence(Ordering::Release);
-        self.owners[i].store(me, Ordering::Relaxed);
-        HOLDING.set(HOLDING.get() + 1);
+        self.stripes[i].owner.store(me, Ordering::Relaxed);
         RowWrite { locks: self, i, _not_send: std::marker::PhantomData }
     }
 
@@ -130,7 +137,7 @@ impl RowLocks {
         if self.held(i, me()) {
             return f();
         }
-        let s = &self.stripes[i];
+        let s = &self.stripes[i].ver;
         let mut spins = 0;
         let mut tries = 0;
         loop {
@@ -167,9 +174,8 @@ pub struct RowWrite<'a> {
 impl Drop for RowWrite<'_> {
     fn drop(&mut self) {
         if self.i != usize::MAX {
-            self.locks.owners[self.i].store(0, Ordering::Relaxed);
-            HOLDING.set(HOLDING.get() - 1);
-            self.locks.stripes[self.i].fetch_add(1, Ordering::Release);
+            self.locks.stripes[self.i].owner.store(0, Ordering::Relaxed);
+            self.locks.stripes[self.i].ver.fetch_add(1, Ordering::Release);
         }
     }
 }
@@ -211,7 +217,7 @@ mod tests {
                     order.lock().unwrap().push("reader");
                 })
             };
-            wait_until("読み手が待ちに入る", || locks.urgent[7].load(Ordering::Relaxed) != 0);
+            wait_until("読み手が待ちに入る", || locks.stripes[7].urgent.load(Ordering::Relaxed) != 0);
             drop(held);
             reader.join().unwrap();
             for w in writers {
@@ -233,7 +239,7 @@ mod tests {
                 rx.recv().unwrap(); // 相手が終わるまで離さない
             })
         };
-        wait_until("別の thread が行 2 を握る", || locks.stripes[2].load(Ordering::Relaxed) & 1 == 1);
+        wait_until("別の thread が行 2 を握る", || locks.stripes[2].ver.load(Ordering::Relaxed) & 1 == 1);
         let _a = locks.write(1);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let me = {
