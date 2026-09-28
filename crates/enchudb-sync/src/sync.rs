@@ -1119,6 +1119,10 @@ impl Syncer {
             // backward compat: known_peers 未実装 transport (HTTP/WS push 等) は
             // 旧 broadcast 経路。 filter は無視される。
             let filtered = self.collect_records_since(since);
+            // #57: 集めた後にも広告する (engine の bridge は WAL に載らなかった record のために
+            // floor を上げてから後続を転写する。 集める前の広告だけだと、 その後続を古い floor と
+            // 一緒に配り、 puller の cursor が floor を越えて bootstrap に回らない)
+            self.advertise_history_floor();
             let count = filtered.len();
             let self_peer = self.engine.peer_id();
             self.transport.publish(self_peer, filtered);
@@ -1239,6 +1243,8 @@ impl Syncer {
                 }
             }
         }
+        // #57: 集めた後に広告する (`publish_since` の broadcast 経路と同じ理由)
+        self.advertise_history_floor();
         let count = filtered.len();
         self.transport.publish_to(self_peer, target_peer, filtered);
         count

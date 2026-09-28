@@ -3034,6 +3034,8 @@ pub struct Engine {
     /// 適用済みなので、 ローカルは正常に見えたまま配布だけが欠ける。 旧実装は
     /// warn-once の 1 行だけで、 26 時間の停止でもログに 1 行しか残らなかった。
     wal_dropped_records: std::sync::atomic::AtomicU64,
+    /// #57: WAL に載らなかった record のために history floor を上げた回数。
+    wal_drop_floor_bumps: std::sync::atomic::AtomicU64,
     /// #268: Commit marker の append が失敗した回数。 失敗すると直前の record 群は
     /// **閉じられない group** として残り、 bridge からも recovery からも見えなくなる。
     wal_commit_failures: std::sync::atomic::AtomicU64,
@@ -3450,6 +3452,7 @@ impl Engine {
             bridge_last_scan_stop: std::sync::Mutex::new("none"),
             bridge_pending_records: std::sync::atomic::AtomicU64::new(0),
             wal_dropped_records: std::sync::atomic::AtomicU64::new(0),
+            wal_drop_floor_bumps: std::sync::atomic::AtomicU64::new(0),
             wal_commit_failures: std::sync::atomic::AtomicU64::new(0),
             wal_append_warned: std::sync::atomic::AtomicBool::new(false),
             bridge_stall_warned: std::sync::atomic::AtomicBool::new(false),
@@ -4491,6 +4494,7 @@ impl Engine {
             bridge_last_scan_stop: std::sync::Mutex::new("none"),
             bridge_pending_records: std::sync::atomic::AtomicU64::new(0),
             wal_dropped_records: std::sync::atomic::AtomicU64::new(0),
+            wal_drop_floor_bumps: std::sync::atomic::AtomicU64::new(0),
             wal_commit_failures: std::sync::atomic::AtomicU64::new(0),
             wal_append_warned: std::sync::atomic::AtomicBool::new(false),
             bridge_stall_warned: std::sync::atomic::AtomicBool::new(false),
@@ -4763,6 +4767,20 @@ impl Engine {
         // row insert → offset store の 4 step を排他化。 per-fsync 頻度 (= 100ms
         // 周期) なので lock 競合の hot path 影響なし。
         let _guard = self.transfer_lock.lock().unwrap();
+
+        // #57: WAL に載らなかった record (満杯) は `_sync_ops` にも入らず、 差分 pull では二度と
+        // 届かない。 その author の history floor を 「今」 に上げて、 それより前の cursor の puller を
+        // bootstrap (live state の転写、 #140) に回す。 今より後の record は必ず今より大きい HLC を
+        // 持つので、 floor を越えた cursor の puller は落ちた分を bootstrap で受け取り済み。
+        // ここ (転写より前) で上げるのは、 落ちた後に書かれた record を floor より先に配らないため
+        // (publish は record を集めた後にも floor を広告する)。
+        let dropped = wal.take_dropped_authors();
+        if !dropped.is_empty() {
+            let now = wal.mint_hlc();
+            self.wal_drop_floor_bumps.fetch_add(1, Ordering::Relaxed);
+            let floors: Vec<(u32, enchudb_oplog::Hlc)> = dropped.iter().map(|a| (*a, now)).collect();
+            self.record_reclaimed_floors(&floors);
+        }
 
         let from = self.sync_ops_offset.load(Ordering::Acquire);
         let trace = Self::trace_bridge_enabled();
@@ -5330,6 +5348,13 @@ impl Engine {
     /// まま配布だけが欠ける。 0 でなければ 「その差分は peer に永久に届かない」。
     pub fn wal_dropped_records(&self) -> u64 {
         self.wal_dropped_records.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #57: WAL に載らなかった record のために、 その author の history floor を上げた回数 (観測用)。
+    /// 上げると、 それより前の cursor の puller は差分 pull で `history_truncated` になり、
+    /// bootstrap で live state (落ちた write を含む) を受け取る。 平常時は 0。
+    pub fn wal_drop_floor_bumps(&self) -> u64 {
+        self.wal_drop_floor_bumps.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Commit marker の append が失敗した回数（観測用）。 平常時は 0。
@@ -7842,10 +7867,9 @@ impl Engine {
     #[inline]
     fn append_local_op(&self, op: enchudb_oplog::oplog::Op<'_>) -> enchudb_oplog::Hlc {
         match self.oplog.as_ref() {
-            Some(wal) => wal
-                .append_with_hlc(op)
-                .map(|(_, h)| h)
-                .unwrap_or(enchudb_oplog::Hlc::ZERO),
+            // #57: 載らなかった (満杯) write にも版数を付ける (ZERO = 版数不明だと、 後から届く
+            // 古い write に負ける)。 載らなかったことは WAL が覚え、 bridge が floor を上げる
+            Some(wal) => wal.append_with_hlc(op).map(|(_, h)| h).unwrap_or_else(|_| wal.mint_hlc()),
             None => enchudb_oplog::Hlc::ZERO,
         }
     }
