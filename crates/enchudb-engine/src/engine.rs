@@ -12795,8 +12795,10 @@ impl Engine {
     /// changefeed 内部ヘルパ: WAL から emit_offset 以降の record を取り出して
     /// 全 listener に渡し、cursor を進める。
     ///
-    /// #337: `emit_lock` を握って配る (fold と直列)。 他が配っている最中 (listener の中から `oplog_sync` を呼んだ時も)
-    /// は取れないので配らずに返る — 残りは consumer が次の tick で配り、 配り終えるまで fold しない (`wal_fold_safe`)。
+    /// #337: `emit_lock` を握って配る (fold と直列)。 `wait` = 他が配っている最中なら待つ (`oplog_sync` の経路:
+    /// 戻った時点で自分の commit を配り終えている、 という約束のため)。 consumer は待たずに返る (残りは次の tick、
+    /// 配り終えるまで fold しない)。 listener の中からの再入 (この thread が配っている最中) は、 待つと止まるので
+    /// どちらでも配らずに返る。
     fn fire_change_listeners(
         wal: &std::sync::Arc<enchudb_oplog::oplog::OpLog>,
         listeners: &std::sync::RwLock<
@@ -12804,13 +12806,33 @@ impl Engine {
         >,
         emit_offset: &std::sync::Arc<std::sync::atomic::AtomicU64>,
         emit_lock: &std::sync::Mutex<()>,
+        wait: bool,
     ) {
         use std::sync::atomic::Ordering;
-        let _emit = match emit_lock.try_lock() {
-            Ok(g) => g,
-            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return,
+        thread_local! {
+            /// この thread が listener に配っている最中か (listener の中から oplog_sync を呼んだ再入を見分ける)。
+            static EMITTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        if EMITTING.with(|e| e.get()) {
+            return;
+        }
+        let _emit = if wait {
+            emit_lock.lock().unwrap_or_else(|p| p.into_inner())
+        } else {
+            match emit_lock.try_lock() {
+                Ok(g) => g,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return,
+            }
         };
+        struct Emitting;
+        impl Drop for Emitting {
+            fn drop(&mut self) {
+                EMITTING.with(|e| e.set(false));
+            }
+        }
+        EMITTING.with(|e| e.set(true));
+        let _emitting = Emitting;
         // listener 登録ゼロなら何もしない(cursor は進めない:listener 加入時に
         // wal.head() に同期する設計なので、ここで進めると先行 record が漏れる)
         let guard = listeners.read().unwrap();
@@ -13024,6 +13046,7 @@ impl Engine {
                                     &listeners_for_thread,
                                     &emit_offset_for_thread,
                                     &emit_lock_for_thread,
+                                    false,
                                 );
                             }
                             // ring buffer reset を試みる。head == checkpoint &&
@@ -13066,6 +13089,7 @@ impl Engine {
                                 &listeners_for_thread,
                                 &emit_offset_for_thread,
                                 &emit_lock_for_thread,
+                                false,
                             );
                             let fold_guard = engine.transfer_lock_for_fold();
                             // #337: 配信と直列にする。 配っている最中なら今回は畳まない (次の tick)
@@ -13149,6 +13173,7 @@ impl Engine {
                                 &listeners_for_thread,
                                 &emit_offset_for_thread,
                                 &emit_lock_for_thread,
+                                false,
                             );
                             // graceful close でも ring を畳む: head==checkpoint なら
                             // HEADER_SIZE へ巻き戻す。 100ms fsync tick を踏まない
@@ -13284,7 +13309,7 @@ impl Engine {
             }
             // changefeed: durable 化したので listener へ即時 push
             // (consumer の 100ms tick を待たず caller スレッドで発火)
-            Self::fire_change_listeners(wal, &self.change_listeners, &self.change_emit_offset, &self.change_emit_lock);
+            Self::fire_change_listeners(wal, &self.change_listeners, &self.change_emit_offset, &self.change_emit_lock, true);
             // #268: transfer / listener まで済ませてから失敗を返す (打てた分は配る)。
             //
             // ただし **死区間 (`append_dead`) では返さない**。 Commit は payload 0 =

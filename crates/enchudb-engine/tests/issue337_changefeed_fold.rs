@@ -97,3 +97,81 @@ fn two_writers_with_sync_tables_lose_nothing() {
     let _ = db_files::remove_db(&p);
     assert!(missing.is_empty(), "{} / {} 件が listener に届かない (先頭 {:?})", missing.len(), 2 * N, &missing[..missing.len().min(5)]);
 }
+
+/// consumer の thread から呼ばれた時だけ遅い listener (consumer が配っている最中を長くする)。
+struct SlowOnConsumer(Mutex<BTreeSet<u64>>);
+impl ChangeListener for SlowOnConsumer {
+    fn on_changes(&self, recs: &[WireRecord]) {
+        if std::thread::current().name() == Some("enchudb-consumer") {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut s = self.0.lock().unwrap();
+        for r in recs {
+            if let enchudb_oplog::oplog::DecodedOp::Tie { value, .. } = r.op {
+                s.insert(value);
+            }
+        }
+    }
+}
+
+/// `oplog_sync()` から戻った時点で、 その commit は listener に配り終えている (changefeed の module doc の約束)。
+/// consumer の tick が同じ record を遅い listener に配っている最中でも、 `oplog_sync` はそれを待ってから返る
+/// (待たずに返ると、 まだ配り終えていない)。
+#[test]
+fn oplog_sync_returns_after_its_records_are_delivered() {
+    let p = format!("/tmp/enchudb-issue337-promise-{}", std::process::id());
+    let _ = db_files::remove_db(&p);
+    let eng: Arc<Engine> = Engine::create_concurrent_with_oplog(&p, 16 << 20).unwrap();
+    let ts = eng.ensure_himo_dynamic("ts", ValueType::Number64, 0).unwrap();
+    let seen = Arc::new(SlowOnConsumer(Mutex::new(BTreeSet::new())));
+    eng.add_change_listener(seen.clone());
+    let a = eng.entity().unwrap();
+    let mut late = Vec::new();
+    for i in 0..3000u64 {
+        eng.tie_to_by_id(a, ts, i);
+        eng.oplog_commit();
+        eng.oplog_sync().unwrap();
+        if !seen.0.lock().unwrap().contains(&i) {
+            late.push(i);
+        }
+    }
+    drop(eng);
+    let _ = db_files::remove_db(&p);
+    assert!(late.is_empty(), "{} 回、 oplog_sync から戻った時点で届いていない (先頭 {:?})", late.len(), &late[..late.len().min(5)]);
+}
+
+/// listener の中から `oplog_sync()` を呼んでも止まらない (配っている最中の再入は配らずに返る)。
+#[test]
+fn oplog_sync_inside_a_listener_does_not_block() {
+    struct Reenter(Mutex<Option<Arc<Engine>>>, std::sync::atomic::AtomicU64);
+    impl ChangeListener for Reenter {
+        fn on_changes(&self, _: &[WireRecord]) {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(eng) = self.0.lock().unwrap().as_ref() {
+                eng.oplog_sync().unwrap();
+            }
+        }
+    }
+    let p = format!("/tmp/enchudb-issue337-reenter-{}", std::process::id());
+    let _ = db_files::remove_db(&p);
+    let eng: Arc<Engine> = Engine::create_concurrent_with_oplog(&p, 16 << 20).unwrap();
+    let ts = eng.ensure_himo_dynamic("ts", ValueType::Number64, 0).unwrap();
+    let l = Arc::new(Reenter(Mutex::new(Some(eng.clone())), Default::default()));
+    eng.add_change_listener(l.clone());
+    let a = eng.entity().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let eng2 = eng.clone();
+    std::thread::spawn(move || {
+        for i in 0..50u64 {
+            eng2.tie_to_by_id(a, ts, i);
+            eng2.oplog_commit();
+            eng2.oplog_sync().unwrap();
+        }
+        tx.send(()).unwrap();
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(30)).expect("listener の中の oplog_sync で止まった");
+    assert!(l.1.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    *l.0.lock().unwrap() = None; // engine との循環参照を切る
+    drop(eng);
+    let _ = db_files::remove_db(&p);
+}
