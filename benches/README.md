@@ -219,7 +219,7 @@ v10 (0.26.0) で DB は **directory** になった。 example の 「前回の�
   で sorted leaf を読む SQLite は強い。 cylinder は等値 AND が桁違いに速い反面、 範囲は
   pull_range で min..=max を線形走査するので幅が広いと負ける。
 - **持続性のセマンティクス**: SQLite は ACID をデフォルトで提供、 EnchuDB の async モード
-  は durability を捨ててる。 `wal_sync()` を毎回呼べば SQLite と同等の durability になるが
+  は durability を捨ててる。 `oplog_sync()` を毎回呼べば SQLite と同等の durability になるが
   その分遅くなるので、 比較するなら durability mode を揃えること。
 - **RAG の速さは cosine FLOPs 律速**: enchudb の ns lookup は RAG では見えない。
   「個人スケールで sub-ms RAG が brute force で出る」という主張は naive baseline でも同じく成立する。
