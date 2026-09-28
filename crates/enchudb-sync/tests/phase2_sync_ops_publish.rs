@@ -176,8 +176,14 @@ fn records_after_ring_reset_are_still_synced() {
         eng.tie_to(e, "notes.note", i);
     }
     eng.oplog_commit();
-    // バグ版 (#63) では batch2 が bridge されず lsn が 3 のまま → ここで timeout して落ちる
     wait_bridged(&eng, 5);
+    // #63: fold が bridge cursor を巻き戻していること。 巻き戻さないと cursor が head を追い越し、 今は
+    // `wal_fold_safe` の修復 (#196、 平常時は 0 回) が拾うので batch2 も届いてしまう — 修復に頼ったかで見る
+    assert_eq!(
+        eng.sync_ops_cursor_repairs(),
+        0,
+        "fold が bridge cursor を巻き戻さず、 追い越しの修復に頼った (#63)"
+    );
 
     // 全 5 件が `_sync_ops` 経由で publish されること。
     let transport: Arc<dyn enchudb_engine::transport::Transport> =
