@@ -3,6 +3,48 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.27.6 — 2026-09-28
+
+**Leaf 列の untie / delete と並行する読みに、 別の行の値が返る穴を塞いだ patch** (#343)。 on-disk format /
+公開 API は**不変**、 migration 不要。 **Leaf 列 (本文など) を並行に読み書きする consumer は上げること**。
+
+### Fixed — Leaf 列の untie / delete と並行する読みに、 別の行の値が返る (#343)
+
+Leaf 列の値を untie / delete すると、 並行して `get_text_owned` / `get_content_owned` で読んでいる thread に
+**別の行の値**が返ることがあった (読み手 1 本で 3 秒に 5,117〜8,554 回)。
+
+untie / delete / consumer が当てる delete / `clear_local_only_tables` の 4 経路が、 **slot を返してから**列を
+消していた。 その間に別の行の書き込みが同じ長さの slot を再利用すると、 lock 無しの読み手は 「列はまだ旧 offset、
+その slot は別の行の値で揃っている」 状態を見て確定した。 書き換え (re-tie) は #119 で 「置く → 列に出す → 旧 slot
+を返す」 の順に直していたが、 消す側が残っていた。
+
+4 経路とも 「列を消す → slot を返す」 の順にした (#119 と同じ)。 LWW で負けた untie / delete は従来どおり slot を
+返さない。 列を消してから slot を返すまでの間に落ちても、 空き slot の一覧は open 時に live な cell から作り直すので、
+漏れも破損も無い。
+
+### 検証
+
+x の値を書いては外す thread、 y を同じ長さの別の値で書き換え続ける thread、 x を読む読み手 4 本を 3 秒回し、 x の値
+か None 以外が返ったら落とす。
+
+| 経路 | 旧順序での検出 |
+|---|---|
+| untie (`tests/issue343_leaf_free_after_clear.rs`) | 8/8 回 (1 回 4,931〜62,239 件) |
+| delete (同上) | 8/8 回 (215〜12,825 件) |
+| consumer の delete (`apply_op`) | 8/8 回 (167〜1,820 件) |
+
+### 既知の残り
+
+- 読み手が確かめるのは 「列の offset が変わっていない」 だけなので、 読み手が止まっている間に同じ slot が別の行を
+  経由して元の行に戻る順序 (ABA) では、 別の行の値を返しうる (re-tie の #119 と同じ穴、 起きる窓はずっと狭い)
+- `clear_local_only_tables` と実行中に呼べる `repair_interrupted_deletes` は行の lock を取らない
+
+### Tests / Docs
+
+- 固定の `sleep` / 壁時計に頼るテストを、 条件が成り立つまで待つ形にした (#341: #336 / #273 / #274 / #278 / #272)
+- `number64` の oplog の確認を audit から listener に替えた (#340: consumer が WAL を畳むと audit は空になる、 #335)
+- `enchudb-schema` の README のサンプルを今の API に合わせた (#347、 #288)
+
 ## 0.27.5 — 2026-09-28
 
 **changefeed の listener に commit 済みの record が届かない穴を塞いだ patch** (#337)。 on-disk format / 公開
