@@ -7277,8 +7277,7 @@ impl Engine {
             }
             // 版数を進めずに落とす — local-only なので LWW の相手が居ない。
             for hid in 0..self.himos.len() {
-                self.free_leaf_cell(local, hid);
-                self.live_remove(hid, local);
+                self.remove_cell_freeing_leaf(local, hid);
             }
             self.live_free(local);
             cleared += 1;
@@ -8219,7 +8218,7 @@ impl Engine {
         self.clear_cell_local(enchudb_oplog::eid_local(eid), himo_id, hlc)
     }
 
-    /// `clear_cell` の local eid 版。 Leaf payload の解放 (`free_leaf_cell`) は
+    /// `clear_cell` の local eid 版。 Leaf payload の解放 (`remove_cell_freeing_leaf`) は
     /// **採用が決まってから**呼ぶこと (不採用なら cell は変わらないので解放しない)。
     fn clear_cell_local(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc) -> bool {
         let _row = self.row_locks.write(local);
@@ -8239,8 +8238,7 @@ impl Engine {
         if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
-        self.free_leaf_cell(local, himo_id as usize);
-        self.live_remove(himo_id as usize, local);
+        self.remove_cell_freeing_leaf(local, himo_id as usize);
         self.store_cell_hlc(local, himo_id, hlc);
         true
     }
@@ -8541,8 +8539,7 @@ impl Engine {
                 survivor = true;
                 continue;
             }
-            self.free_leaf_cell(local, hid);
-            self.live_remove(hid, local);
+            self.remove_cell_freeing_leaf(local, hid);
         }
         if !survivor {
             self.live_free(local);
@@ -8807,9 +8804,6 @@ impl Engine {
         }
     }
 
-    /// v6 (#88): routed-Leaf の cell が offset を持っていれば LeafStore に free。
-    /// delete / untie / apply_op の remove 直前に呼ぶ (leak 防止)。 非 routed は no-op。
-    #[inline]
     /// #119: **publish 後**に旧 offset を free するための 2 段版。 `take_leaf_cell` で
     /// 旧 offset を先に捕まえ、 column を更新してから `free_leaf_offset` に渡す。
     ///
@@ -8830,12 +8824,15 @@ impl Engine {
         }
     }
 
-    fn free_leaf_cell(&self, eid: u32, hid: usize) {
-        if let Some(leaf) = self.leaf_for(hid)
-            && let Some(off) = self.himos[hid].get_value32(eid)
-        {
-            leaf.free(off);
-        }
+    /// cell を外し、 routed-Leaf なら指していた slot を LeafStore に返す (leak 防止、 非 routed は外すだけ)。
+    ///
+    /// #343: **列を消してから**返す。 返してから消すと、 その間に別の行の書き込みが同じ長さの slot を
+    /// best-fit で再利用し、 lock 無しの読み手が 「旧 offset → 別の行の値で gen が揃った slot → 列はまだ旧
+    /// offset」 と確定して、 別の行の値を返した (#119 の書き換えと同じ順)。
+    fn remove_cell_freeing_leaf(&self, local: u32, hid: usize) {
+        let old = self.take_leaf_cell(local, hid);
+        self.live_remove(hid, local);
+        self.free_leaf_offset(hid, old);
     }
 
     /// v6 (#88): open 時に routed-Leaf の live cell offset を集めて LeafStore の
@@ -13611,8 +13608,7 @@ impl Engine {
                     return;
                 }
                 for hid in 0..self.himos.len() {
-                    self.free_leaf_cell(eid, hid);
-                    self.live_remove(hid, eid);
+                    self.remove_cell_freeing_leaf(eid, hid);
                 }
                 self.live_free(eid);
             }
@@ -15560,6 +15556,78 @@ mod tests {
         for suffix in ["", ".oplog", ".tables", ".crc", ".lock"] {
             let _ = std::fs::remove_file(format!("{path}{suffix}"));
         }
+    }
+
+    /// #343: consumer が当てる delete (`apply_op` の `Op::Delete`) も **列を消してから** Leaf の slot を返す。
+    /// consumer を通すと当てるのが遅れ、 読み手が当てる途中の entity を読めない (16 回中 2 回しか検出
+    /// しなかった) ので、 同じ `apply_op` を churn の thread から直接呼ぶ。 旧順序で 8/8 回検出 (1 回
+    /// 167〜1,820 件)。 他の経路は `tests/issue343_leaf_free_after_clear.rs`。
+    #[test]
+    fn issue343_apply_op_delete_clears_before_freeing_leaf() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+        let dir = tmp("issue343_apply_op_delete");
+        let mut eng = Engine::create_growable(&dir).unwrap();
+        eng.define_himo("body", ValueType::Leaf, 0);
+        let hid = eng.himo_id("body").unwrap() as u16;
+        let y = eng.entity().unwrap();
+        let first = eng.entity().unwrap();
+        let eng = Arc::new(eng);
+        const X: &[u8] = &[b'x'; 64];
+        let current = Arc::new(AtomicU64::new(first));
+        let stop = Arc::new(AtomicBool::new(false));
+        let churn = {
+            let (eng, current, stop) = (eng.clone(), current.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let e = eng.entity().unwrap();
+                    eng.tie_bytes_to_by_id(e, hid, X);
+                    current.store(e, Ordering::Relaxed);
+                    let hlc = eng.mint_local_hlc();
+                    eng.apply_op(crate::write_queue::Op::Delete { eid: enchudb_oplog::eid_local(e), hlc });
+                }
+            })
+        };
+        let other_row = {
+            let (eng, stop) = (eng.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut n = 0u8;
+                while !stop.load(Ordering::Relaxed) {
+                    eng.tie_bytes_to_by_id(y, hid, &[b'a' + n % 20; 64]);
+                    n = n.wrapping_add(1);
+                }
+            })
+        };
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let (eng, current) = (eng.clone(), current.clone());
+                std::thread::spawn(move || {
+                    let (mut x, mut other) = (0usize, 0usize);
+                    let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    while std::time::Instant::now() < end {
+                        match eng.get_text_owned(current.load(Ordering::Relaxed), "body") {
+                            Some(b) if b == X => x += 1,
+                            None => {}
+                            Some(_) => other += 1,
+                        }
+                    }
+                    (x, other)
+                })
+            })
+            .collect();
+        let (mut x, mut other) = (0, 0);
+        for r in readers {
+            let (a, b) = r.join().unwrap();
+            (x, other) = (x + a, other + b);
+        }
+        stop.store(true, Ordering::Relaxed);
+        churn.join().unwrap();
+        other_row.join().unwrap();
+        eprintln!("x {x} / 他の値 {other}");
+        assert!(x > 0, "x を一度も読めていない (前提が崩れた)");
+        assert_eq!(other, 0, "consumer の delete の途中で別の行の値を読んだ");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
     }
 
     /// #128: 進捗の無い Retry 連発 (= crash 残骸の odd gen) では reader が
