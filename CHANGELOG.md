@@ -3,6 +3,44 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.27.4 — 2026-09-28
+
+**sync の bridge が WAL を畳んだ直後に止まり、 開き直すまで何も送らなくなる穴を塞いだ patch** (#268 の 2 回目の
+再発)。 on-disk format / 公開 API は**不変**、 migration 不要。 **sync を使う consumer は上げること**。
+
+### Fixed — WAL を畳んだ後、 前の周の Commit を読んで bridge が止まる (#268)
+
+v0.26.14 で 71 時間止まった再発の機序。 報告の値 (cursor = 256 = 32 + 112 × 2 で固定、 head / checkpoint だけ
+25 MB 進む、 再起動で滞留 81,946 件が一括で出る) と合う。
+
+1. 畳む (`try_reset_if`) のは header の head / checkpoint を 32 に戻すだけで、 ring の中の前の周の record は残る
+2. append は head を先に進めてから payload → 署名 → header を書く。 書いている最中の record の header 位置には、
+   前の周の record の header がまだ見える
+3. bridge の scan (lock-free) がその窓で読むと、 前の周の Commit (payload 0 = CRC が必ず合う) で group を閉じた
+   つもりになり、 cursor を今の周の record の境目でない位置へ進める。 以後そこから読むと毎回 bad magic で空の
+   scan が続く (cursor < head なので #196 の検出は鳴らない)
+
+`OpLog` に**書き終えた終端**を持たせ (append の 3 経路は `append_lock` の下で書き終えてから置く。 畳む / 
+`reset_to_checkpoint` / open でも揃える)、 scan は head ではなくそこまでしか読まない。
+
+放っておくと WAL が満杯まで進み、 `wal_fold_safe` がずれた cursor からの空 scan を 「閉じられなかった孤児」 と
+読んで畳み、 bridge していない record が sync から永久に消えうる (コードからの推論、 未実測)。
+
+### 検証
+
+`issue268_stale_record`: 毎周、 前の周の Commit を ring の先頭に残して畳み、 bridge と同じ形の scan を別 thread で
+回しながら署名付き record と Commit を書く。
+
+| | 3000 周中、 止まった周 |
+|---|---|
+| 修正前 | 2976 / 2998 / 2978 (cursor が 144 で固定、 1 件も運ばない) |
+| 修正後 | 0 / 0 / 0 |
+
+### 既知の残り
+
+- この版より前に cursor がずれた稼働中のプロセスは自力では戻らない (開き直せば戻る)
+- #268 は soak で再発しないことを確かめるまで open のまま
+
 ## 0.27.3 — 2026-09-27
 
 **並行書き込みで別の cell の値が化ける穴と、 辞書の番号の二重払い出しを塞いだ patch** (#135 / #206 /
