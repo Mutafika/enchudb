@@ -125,11 +125,31 @@ fn reopen_keeps_values_and_only_wide_dbs_become_v11() {
     let _ = db_files::remove_db(&q);
 }
 
+/// oplog に載った record を受け取る listener (Tie の値を控える)。
+struct TieValues(std::sync::Mutex<Vec<(u16, u64)>>);
+impl enchudb_engine::changefeed::ChangeListener for TieValues {
+    fn on_changes(&self, recs: &[enchudb_engine::transport::WireRecord]) {
+        let mut v = self.0.lock().unwrap();
+        for r in recs {
+            if let enchudb_oplog::oplog::DecodedOp::Tie { himo_id, value, .. } = r.op {
+                v.push((himo_id, value));
+            }
+        }
+    }
+}
+
+/// 同期の書き込みも async の書き込みも、 oplog の record に 64 bit のまま載る。
+///
+/// record は listener で受け取って見る (#335): `oplog_sync()` は checkpoint を head まで進めるので、 その直後に
+/// consumer の tick が ring を畳むと `audit()` からは消える (CI で 1 回、 150 ms 待てば毎回)。 listener には
+/// `oplog_sync()` から戻った時点で配り終えている (#337)。
 #[test]
 fn concurrent_writes_go_through_the_oplog() {
     let p = tmp("concurrent");
     let eng: Arc<Engine> = Engine::create_concurrent_with_oplog(&p, 16 << 20).unwrap();
     let ts = eng.ensure_himo_dynamic("ts", ValueType::Number64, 0).unwrap();
+    let seen = Arc::new(TieValues(Default::default()));
+    eng.add_change_listener(seen.clone());
     let a = eng.entity().unwrap();
     let b = eng.entity().unwrap();
     eng.tie_to_by_id(a, ts, 1u64 << 50);
@@ -139,15 +159,7 @@ fn concurrent_writes_go_through_the_oplog() {
     eng.oplog_sync().unwrap();
     assert_eq!(eng.get(a, "ts"), Some(1 << 50));
     assert_eq!(eng.get(b, "ts"), Some((1 << 50) + 1));
-    // 監査で読める record は 64 bit のまま
-    let vals: Vec<u64> = eng
-        .audit(&Default::default())
-        .into_iter()
-        .filter_map(|r| match r.op {
-            enchudb_oplog::oplog::DecodedOp::Tie { himo_id, value, .. } if himo_id == ts => Some(value),
-            _ => None,
-        })
-        .collect();
+    let vals: Vec<u64> = seen.0.lock().unwrap().iter().filter(|&&(h, _)| h == ts).map(|&(_, v)| v).collect();
     assert_eq!(vals, vec![1 << 50, (1 << 50) + 1]);
     drop(eng);
     let _ = db_files::remove_db(&p);
