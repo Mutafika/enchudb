@@ -10169,7 +10169,10 @@ impl Engine {
                     let mut last_probe: Option<(u32, u64)> = None;
                     let mut attempt = 0usize;
                     loop {
+                        // readonly の Engine (別 process の読み手) が握っても書き手は止まらない (row lock は
+                        // process の中だけ) — 握って 1 回で諦めると値があるのに None (#128 が戻る)。 読み直しへ
                         if attempt == LOCK_FREE_TRIES
+                            && !self.is_readonly()
                             && let Some(_row) = self.row_locks.read_locked(eid_local)
                         {
                             return read().unwrap_or(None);

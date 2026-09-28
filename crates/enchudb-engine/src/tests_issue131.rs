@@ -92,3 +92,66 @@ fn leaf_read_under_retie_storm_returns_a_written_value_in_bounded_time() {
     drop(eng);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// readonly の Engine は書き手 (別の Engine、 別 process と同じ条件) の row lock を握れない。 握って 1 回で
+/// 諦めると値があるのに None を返した (レビューの実測: 書き手 48 本・読み手 8 本で 3 秒に 0〜7 件)。
+/// crate 内の test は 1 回で握りに行くので、 揃わない読みは毎回ここを通る。
+#[test]
+fn readonly_reader_does_not_return_none_under_a_retie_storm() {
+    let dir = std::env::temp_dir().join(format!("issue131_ro_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_str().unwrap().to_string();
+    let mut eng = Engine::create_growable_opts(&path, GrowableOptions::default()).unwrap();
+    eng.define_himo("body", ValueType::Leaf, 0);
+    let hid = eng.himo_id("body").unwrap() as u16;
+    let eid = eng.entity().unwrap();
+    let bodies: Vec<Vec<u8>> = (0..8).map(|i| vec![b'a' + i as u8; 16 + i * 40]).collect();
+    eng.tie_bytes_to_by_id(eid, hid, &bodies[0]);
+    eng.flush().unwrap();
+    let ro = Arc::new(Engine::open_readonly(&path).unwrap());
+    assert!(ro.get_text_owned(eid, "body").is_some(), "前提");
+    let eng = Arc::new(eng);
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let stop = Arc::new(AtomicBool::new(false));
+    let writers: Vec<_> = (0..cores * 2)
+        .map(|w| {
+            let (eng, stop, bodies) = (eng.clone(), stop.clone(), bodies.clone());
+            std::thread::spawn(move || {
+                let mut n = w;
+                while !stop.load(Ordering::Relaxed) {
+                    eng.tie_bytes_to_by_id(eid, hid, &bodies[n % bodies.len()]);
+                    n += 1;
+                }
+            })
+        })
+        .collect();
+    let readers: Vec<_> = (0..cores.max(2) / 2)
+        .map(|_| {
+            let (ro, bodies) = (ro.clone(), bodies.clone());
+            std::thread::spawn(move || {
+                let (mut missing, mut corrupt) = (0usize, 0usize);
+                let end = Instant::now() + Duration::from_millis(2000);
+                while Instant::now() < end {
+                    match ro.get_text_owned(eid, "body") {
+                        Some(b) if bodies.contains(&b) => {}
+                        Some(_) => corrupt += 1,
+                        None => missing += 1,
+                    }
+                }
+                (missing, corrupt)
+            })
+        })
+        .collect();
+    let res: Vec<_> = readers.into_iter().map(|r| r.join().unwrap()).collect();
+    stop.store(true, Ordering::Relaxed);
+    for w in writers {
+        w.join().unwrap();
+    }
+    let missing: usize = res.iter().map(|r| r.0).sum();
+    let corrupt: usize = res.iter().map(|r| r.1).sum();
+    eprintln!("readonly: None {missing} / 書いていない bytes {corrupt}");
+    assert_eq!(missing, 0, "値が在るのに None");
+    assert_eq!(corrupt, 0);
+    drop((ro, eng));
+    let _ = std::fs::remove_dir_all(&dir);
+}
