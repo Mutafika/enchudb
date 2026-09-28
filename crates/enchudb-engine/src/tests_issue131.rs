@@ -5,8 +5,9 @@
 //! 書き手より先に行の lock を握って 1 回で読む (握っている間は column も slot も動かない)。
 //!
 //! 実際に握るのは稀 (row lock (#135) で同じ cell の書き手は 1 本ずつになり、 揃った版を 64 回続けて
-//! 掴めない読みは 9600 万回に 1 回)。 crate 内の test では 1 回で握りに行く (`cfg!(test)`) ので、 ここは
-//! crate 内に置いて握る経路を毎回通す。
+//! 掴めない読みは 9600 万回に 1 回)。 ここの読み手の thread は `LOCK_FREE_TRIES` を 1 にして、 揃わない
+//! 読みが毎回握る経路を通るようにする (他の test は本番と同じ 64 回のまま — 1 回にすると、 揃わない読みが
+//! 書き手と並んで他の test の race を隠す)。
 //!
 //! 無制限のまま返らない読みは手元では再現していない (#131 のコメント: CPU 4 倍の奪い合いでも
 //! 最大 72 回で抜けた)。 ここで固定するのは、 握って読む経路が書き手と重なっても値を落とさない /
@@ -14,6 +15,11 @@
 //! 読みのために握らないことは `row_lock` の test。
 
 use crate::{Engine, GrowableOptions, ValueType};
+
+thread_local! {
+    /// Leaf の読みで、 行を握る前に lock 無しで読み直す回数 (本番は 64)。
+    pub(crate) static LOCK_FREE_TRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(64) };
+}
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -53,6 +59,7 @@ fn leaf_read_under_retie_storm_returns_a_written_value_in_bounded_time() {
         .map(|_| {
             let (eng, bodies) = (eng.clone(), bodies.clone());
             std::thread::spawn(move || {
+                LOCK_FREE_TRIES.with(|c| c.set(1));
                 let (mut reads, mut missing, mut corrupt) = (0usize, 0usize, 0usize);
                 let mut slowest = Duration::ZERO;
                 let end = Instant::now() + Duration::from_millis(2000);
@@ -129,6 +136,7 @@ fn readonly_reader_does_not_return_none_under_a_retie_storm() {
         .map(|_| {
             let (ro, bodies) = (ro.clone(), bodies.clone());
             std::thread::spawn(move || {
+                LOCK_FREE_TRIES.with(|c| c.set(1));
                 let (mut missing, mut corrupt) = (0usize, 0usize);
                 let end = Instant::now() + Duration::from_millis(2000);
                 while Instant::now() < end {

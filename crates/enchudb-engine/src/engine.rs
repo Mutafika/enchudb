@@ -10139,14 +10139,17 @@ impl Engine {
                     // 噛み合って silent None。 進捗の無い連敗だけ数える形にしたら、 今度は
                     // writer が前進し続ける限り抜けられない (原理的に無制限、 #131)。
                     //
-                    // #131: 揃った版を LOCK_FREE_TRIES 回掴めなかったら、 行の書き手と同じ
+                    // #131: 揃った版を 64 回掴めなかったら、 行の書き手と同じ
                     // row lock (#135) を握って 1 回だけ読む。 Leaf の cell を書き換える経路は全部
                     // その行の row lock の中なので、 握っている間は書き換わらない = 1 回で確定する
                     // (読めなければ誰も動かさない odd gen / 破損 = None)。 書き手より先に握るので、
                     // 待つのは今の書き手 1 本が離すまで。
                     // 実際に握るのは稀 (row lock で同じ cell の書き手は 1 本ずつ = 9600 万 read に 1 回)。
-                    // crate 内の test では 1 回で握りに行き、 握る経路を毎回通す (tests_issue131)。
-                    const LOCK_FREE_TRIES: usize = if cfg!(test) { 1 } else { 64 };
+                    // crate 内の test は thread ごとに回数を下げて、 握る経路を毎回通せる (tests_issue131)。
+                    #[cfg(not(test))]
+                    let lock_free_tries: usize = 64;
+                    #[cfg(test)]
+                    let lock_free_tries: usize = crate::tests_issue131::LOCK_FREE_TRIES.with(|c| c.get());
                     const SPIN_TRIES: usize = 16;
                     // 揃わなかった時は、 見た (column offset, slot stamp)。 relocation なら None。
                     let read = || -> Result<Option<Vec<u8>>, Option<(u32, u64)>> {
@@ -10171,7 +10174,7 @@ impl Engine {
                     loop {
                         // readonly の Engine (別 process の読み手) が握っても書き手は止まらない (row lock は
                         // process の中だけ) — 握って 1 回で諦めると値があるのに None (#128 が戻る)。 読み直しへ
-                        if attempt == LOCK_FREE_TRIES
+                        if attempt == lock_free_tries
                             && !self.is_readonly()
                             && let Some(_row) = self.row_locks.read_locked(eid_local)
                         {
@@ -10180,10 +10183,10 @@ impl Engine {
                         if attempt > 0 {
                             if attempt < SPIN_TRIES {
                                 std::hint::spin_loop();
-                            } else if attempt < LOCK_FREE_TRIES {
+                            } else if attempt < lock_free_tries {
                                 std::thread::yield_now();
                             } else {
-                                let us = ((attempt - LOCK_FREE_TRIES + 1) as u64).min(100);
+                                let us = ((attempt - lock_free_tries + 1) as u64).min(100);
                                 std::thread::sleep(std::time::Duration::from_micros(us));
                             }
                         }
