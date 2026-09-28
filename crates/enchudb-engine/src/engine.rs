@@ -596,6 +596,10 @@ const BRIDGE_STALL_WARN_AFTER: u64 = 256;
 /// 実機の事象は 41 時間なので、 30 秒の下限で見落とすことはない。
 const BRIDGE_STALL_WARN_AFTER_MS: u64 = 30_000;
 
+/// #57: WAL が満杯で落ち続けていても、 最初に落ちてからこれだけ経ったら history floor を上げる (ms)。
+/// 満杯が終わった周にはすぐ上げる。
+const WAL_DROP_FLOOR_MAX_DELAY_MS: u64 = 5_000;
+
 fn serialize_eidmap(entries: &[EidmapEntry]) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + entries.len() * 28);
     out.extend_from_slice(b"EIDM");
@@ -3034,6 +3038,11 @@ pub struct Engine {
     /// 適用済みなので、 ローカルは正常に見えたまま配布だけが欠ける。 旧実装は
     /// warn-once の 1 行だけで、 26 時間の停止でもログに 1 行しか残らなかった。
     wal_dropped_records: std::sync::atomic::AtomicU64,
+    /// #57: WAL に載らなかった record のために history floor を上げた回数。
+    wal_drop_floor_bumps: std::sync::atomic::AtomicU64,
+    /// #57: まだ floor に入れていない、 WAL に載らなかった record (author, 落ちた HLC の max) と、
+    /// 最初に落ちた時刻 (unix ms)。 満杯の episode が終わった周にまとめて floor に入れる。
+    wal_drop_pending: std::sync::Mutex<(Vec<(u32, enchudb_oplog::Hlc)>, Option<u64>)>,
     /// #268: Commit marker の append が失敗した回数。 失敗すると直前の record 群は
     /// **閉じられない group** として残り、 bridge からも recovery からも見えなくなる。
     wal_commit_failures: std::sync::atomic::AtomicU64,
@@ -3450,6 +3459,8 @@ impl Engine {
             bridge_last_scan_stop: std::sync::Mutex::new("none"),
             bridge_pending_records: std::sync::atomic::AtomicU64::new(0),
             wal_dropped_records: std::sync::atomic::AtomicU64::new(0),
+            wal_drop_floor_bumps: std::sync::atomic::AtomicU64::new(0),
+            wal_drop_pending: std::sync::Mutex::new((Vec::new(), None)),
             wal_commit_failures: std::sync::atomic::AtomicU64::new(0),
             wal_append_warned: std::sync::atomic::AtomicBool::new(false),
             bridge_stall_warned: std::sync::atomic::AtomicBool::new(false),
@@ -4491,6 +4502,8 @@ impl Engine {
             bridge_last_scan_stop: std::sync::Mutex::new("none"),
             bridge_pending_records: std::sync::atomic::AtomicU64::new(0),
             wal_dropped_records: std::sync::atomic::AtomicU64::new(0),
+            wal_drop_floor_bumps: std::sync::atomic::AtomicU64::new(0),
+            wal_drop_pending: std::sync::Mutex::new((Vec::new(), None)),
             wal_commit_failures: std::sync::atomic::AtomicU64::new(0),
             wal_append_warned: std::sync::atomic::AtomicBool::new(false),
             bridge_stall_warned: std::sync::atomic::AtomicBool::new(false),
@@ -4763,6 +4776,64 @@ impl Engine {
         // row insert → offset store の 4 step を排他化。 per-fsync 頻度 (= 100ms
         // 周期) なので lock 競合の hot path 影響なし。
         let _guard = self.transfer_lock.lock().unwrap();
+
+        // #57: WAL に載らなかった record (満杯) は `_sync_ops` にも入らず、 差分 pull では二度と
+        // 届かない。 その author の history floor を上げて、 それより前の cursor の puller を
+        // bootstrap (live state の転写、 #140) に回す。
+        //
+        // - 自分の write: floor = max(今, 落ちた HLC)。 今より後の record は必ず今より大きい HLC を持つので、
+        //   floor を越えた cursor の puller は落ちた分を bootstrap で受け取り済み。 ここ (転写より前) で
+        //   上げるのは、 落ちた後に書かれた record を floor より先に配らないため (publish は record を
+        //   集めた後にも floor を広告する)
+        // - 中継した他人の record: floor = 落ちた record の HLC。 他人の author の bootstrap は as_of を
+        //   「その author の HLC の max」 で決める (自分の clock を混ぜない) ので、 自分の今を入れると
+        //   bootstrap しても cursor が floor に届かず、 pull のたびに truncated になり続ける
+        //
+        // 上げるのは満杯の episode が終わった周 (新しく落ちなかった周) か、 最初に落ちてから
+        // WAL_DROP_FLOOR_MAX_DELAY_MS 経った周。 満杯の間ずっと 100 ms ごとに上げると、 全 peer が
+        // pull のたびに全状態を bootstrap する。 待つ間に配った record は上げる時の 「今」 より小さい
+        // HLC なので、 その puller も bootstrap に回る (待っても取りこぼさない)。
+        let fresh = wal.take_dropped();
+        let due = {
+            let mut p = self.wal_drop_pending.lock().unwrap_or_else(|e| e.into_inner());
+            let had_fresh = !fresh.is_empty();
+            for (a, h) in fresh {
+                match p.0.iter_mut().find(|(x, _)| *x == a) {
+                    Some((_, m)) => *m = (*m).max(h),
+                    None => p.0.push((a, h)),
+                }
+            }
+            if p.0.is_empty() {
+                None
+            } else {
+                let now_ms = Self::unix_millis();
+                let first = *p.1.get_or_insert(now_ms);
+                if !had_fresh || now_ms.saturating_sub(first) >= WAL_DROP_FLOOR_MAX_DELAY_MS {
+                    p.1 = None;
+                    Some(std::mem::take(&mut p.0))
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(dropped) = due {
+            let now = wal.mint_hlc();
+            let me = self.peer_id();
+            let floors: Vec<(u32, enchudb_oplog::Hlc)> =
+                dropped.iter().map(|&(a, h)| (a, if a == me { now.max(h) } else { h })).collect();
+            if self.record_reclaimed_floors(&floors) {
+                self.wal_drop_floor_bumps.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // 記録できなかった分は次の周に持ち越す (捨てると穴を知らせる手段が無くなる)
+                let mut p = self.wal_drop_pending.lock().unwrap_or_else(|e| e.into_inner());
+                for (a, h) in dropped {
+                    match p.0.iter_mut().find(|(x, _)| *x == a) {
+                        Some((_, m)) => *m = (*m).max(h),
+                        None => p.0.push((a, h)),
+                    }
+                }
+            }
+        }
 
         let from = self.sync_ops_offset.load(Ordering::Acquire);
         let trace = Self::trace_bridge_enabled();
@@ -5330,6 +5401,16 @@ impl Engine {
     /// まま配布だけが欠ける。 0 でなければ 「その差分は peer に永久に届かない」。
     pub fn wal_dropped_records(&self) -> u64 {
         self.wal_dropped_records.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #57: WAL に載らなかった record のために、 その author の history floor を上げた回数 (観測用)。
+    /// 上げると、 それより前の cursor の puller は差分 pull で `history_truncated` になり、
+    /// bootstrap で live state (落ちた write を含む) を受け取る。 平常時は 0。
+    ///
+    /// 上げるのは bridge (`transfer_oplog_to_sync_ops`) が満杯の episode の終わり (新しく落ちなかった周) を
+    /// 見た時、 または最初に落ちてから 5 秒経った時。
+    pub fn wal_drop_floor_bumps(&self) -> u64 {
+        self.wal_drop_floor_bumps.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Commit marker の append が失敗した回数（観測用）。 平常時は 0。
@@ -6234,7 +6315,8 @@ impl Engine {
     /// sentinel を全 author への baseline として畳み込む
     /// ([`Engine::sync_reclaimed_floors`] の doc 参照)。 **`u32::MAX` は author の
     /// peer id として予約済み** (実 author に使うと legacy baseline と誤分類される)。
-    fn record_reclaimed_floors(&self, candidates: &[(u32, enchudb_oplog::Hlc)]) {
+    /// 戻り値: 記録できたか (上げる必要が無かった時も true)。
+    fn record_reclaimed_floors(&self, candidates: &[(u32, enchudb_oplog::Hlc)]) -> bool {
         let mut merged: std::collections::HashMap<u32, enchudb_oplog::Hlc> = self
             .read_reclaimed_floor_entries()
             .unwrap_or_default()
@@ -6249,7 +6331,7 @@ impl Engine {
             }
         }
         if !changed {
-            return;
+            return true;
         }
         let hid = match self.ensure_himo_dynamic_in(
             "_sync_peers",
@@ -6260,7 +6342,7 @@ impl Engine {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("[enchudb] warning: reclaimed_floor himo unavailable ({e}) — history floor will over-approximate after restart");
-                return;
+                return false;
             }
         };
         let row = match self.entities_with_himo(hid).into_iter().next() {
@@ -6269,7 +6351,7 @@ impl Engine {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("[enchudb] warning: reclaimed_floor row unavailable ({e})");
-                    return;
+                    return false;
                 }
             },
         };
@@ -6286,6 +6368,7 @@ impl Engine {
             bytes.extend_from_slice(&h.peer.to_be_bytes());
         }
         self.tie_bytes_to_by_id(row, hid, &bytes);
+        true
     }
 
     /// #140: 自 peer が author した **live state** を bridge と同語彙の wire record
@@ -7277,8 +7360,7 @@ impl Engine {
             }
             // 版数を進めずに落とす — local-only なので LWW の相手が居ない。
             for hid in 0..self.himos.len() {
-                self.free_leaf_cell(local, hid);
-                self.live_remove(hid, local);
+                self.remove_cell_freeing_leaf(local, hid);
             }
             self.live_free(local);
             cleared += 1;
@@ -7842,10 +7924,12 @@ impl Engine {
     #[inline]
     fn append_local_op(&self, op: enchudb_oplog::oplog::Op<'_>) -> enchudb_oplog::Hlc {
         match self.oplog.as_ref() {
-            Some(wal) => wal
-                .append_with_hlc(op)
-                .map(|(_, h)| h)
-                .unwrap_or(enchudb_oplog::Hlc::ZERO),
+            // #57: 載らなかった (満杯) write にも版数を付ける (ZERO = 版数不明だと、 後から届く
+            // 古い write に負ける)。 その HLC は WAL が落ちた record として覚えた値 (後で採番し直すと、
+            // その間に bridge が floor を決めて版数が floor を越える)。 bridge が floor を上げる
+            Some(wal) => match wal.append_or_dropped(op) {
+                Ok((_, h)) | Err((_, h)) => h,
+            },
             None => enchudb_oplog::Hlc::ZERO,
         }
     }
@@ -8219,7 +8303,7 @@ impl Engine {
         self.clear_cell_local(enchudb_oplog::eid_local(eid), himo_id, hlc)
     }
 
-    /// `clear_cell` の local eid 版。 Leaf payload の解放 (`free_leaf_cell`) は
+    /// `clear_cell` の local eid 版。 Leaf payload の解放 (`remove_cell_freeing_leaf`) は
     /// **採用が決まってから**呼ぶこと (不採用なら cell は変わらないので解放しない)。
     fn clear_cell_local(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc) -> bool {
         let _row = self.row_locks.write(local);
@@ -8239,8 +8323,7 @@ impl Engine {
         if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
-        self.free_leaf_cell(local, himo_id as usize);
-        self.live_remove(himo_id as usize, local);
+        self.remove_cell_freeing_leaf(local, himo_id as usize);
         self.store_cell_hlc(local, himo_id, hlc);
         true
     }
@@ -8541,8 +8624,7 @@ impl Engine {
                 survivor = true;
                 continue;
             }
-            self.free_leaf_cell(local, hid);
-            self.live_remove(hid, local);
+            self.remove_cell_freeing_leaf(local, hid);
         }
         if !survivor {
             self.live_free(local);
@@ -8807,9 +8889,6 @@ impl Engine {
         }
     }
 
-    /// v6 (#88): routed-Leaf の cell が offset を持っていれば LeafStore に free。
-    /// delete / untie / apply_op の remove 直前に呼ぶ (leak 防止)。 非 routed は no-op。
-    #[inline]
     /// #119: **publish 後**に旧 offset を free するための 2 段版。 `take_leaf_cell` で
     /// 旧 offset を先に捕まえ、 column を更新してから `free_leaf_offset` に渡す。
     ///
@@ -8830,12 +8909,15 @@ impl Engine {
         }
     }
 
-    fn free_leaf_cell(&self, eid: u32, hid: usize) {
-        if let Some(leaf) = self.leaf_for(hid)
-            && let Some(off) = self.himos[hid].get_value32(eid)
-        {
-            leaf.free(off);
-        }
+    /// cell を外し、 routed-Leaf なら指していた slot を LeafStore に返す (leak 防止、 非 routed は外すだけ)。
+    ///
+    /// #343: **列を消してから**返す。 返してから消すと、 その間に別の行の書き込みが同じ長さの slot を
+    /// best-fit で再利用し、 lock 無しの読み手が 「旧 offset → 別の行の値で gen が揃った slot → 列はまだ旧
+    /// offset」 と確定して、 別の行の値を返した (#119 の書き換えと同じ順)。
+    fn remove_cell_freeing_leaf(&self, local: u32, hid: usize) {
+        let old = self.take_leaf_cell(local, hid);
+        self.live_remove(hid, local);
+        self.free_leaf_offset(hid, old);
     }
 
     /// v6 (#88): open 時に routed-Leaf の live cell offset を集めて LeafStore の
@@ -10135,61 +10217,75 @@ impl Engine {
                 Some(leaf) => {
                     // #119: 単一 cell を止めどなく re-tie する writer と競ると、 retry を
                     // **間を置かずに** 64 回消費して「値が無い」と区別できない None を返して
-                    // いた (実測 3〜9 件 / 33 万 read)。 spin → yield の backoff と上限
-                    // 256 回化で緩和した。
+                    // いた。 #128: 回数で諦めると CPU contention 下で writer loop と位相が
+                    // 噛み合って silent None。 進捗の無い連敗だけ数える形にしたら、 今度は
+                    // writer が前進し続ける限り抜けられない (原理的に無制限、 #131)。
                     //
-                    // #128: それでも「一律 256 回で give-up」 は、 CPU contention 下で
-                    // writer loop と位相が噛み合う (resonance) と 256 連敗して silent None
-                    // を返す (issue119 test の並列実行 flaky、 実測 10/30 run fail)。
-                    // 値が存在する限り None は契約違反なので、 **進捗の無い連敗** だけを
-                    // 数える方式に変更:
-                    // - column offset (raw) か slot stamp (gen/ss) が動いた = writer 前進中
-                    //   の生きた race → stall を 0 に戻して続行 (seqlock reader と同じ
-                    //   「書き続けられる間は待つ」 契約)
-                    // - 同じ (raw, stamp) のまま STALL_LIMIT 連敗 = 誰も動かしていないのに
-                    //   検証が通らない (crash 残骸の odd gen / 恒久 stale / 破損) → None
-                    // また yield だけでは位相が崩れないことがあるので、 µs sleep の階段
-                    // backoff を足して共振を破る。
-                    const STALL_LIMIT: usize = 256;
+                    // #131: 揃った版を 64 回掴めなかったら、 行の書き手と同じ
+                    // row lock (#135) を握って 1 回だけ読む。 Leaf の cell を書き換える経路は全部
+                    // その行の row lock の中なので、 握っている間は書き換わらない = 1 回で確定する
+                    // (読めなければ誰も動かさない odd gen / 破損 = None)。 書き手より先に握るので、
+                    // 待つのは今の書き手 1 本が離すまで。
+                    // 実際に握るのは稀 (row lock で同じ cell の書き手は 1 本ずつ = 9600 万 read に 1 回)。
+                    // crate 内の test は thread ごとに回数を下げて、 握る経路を毎回通せる (tests_issue131)。
+                    #[cfg(not(test))]
+                    let lock_free_tries: usize = 64;
+                    #[cfg(test)]
+                    let lock_free_tries: usize = crate::tests_issue131::LOCK_FREE_TRIES.with(|c| c.get());
                     const SPIN_TRIES: usize = 16;
-                    const YIELD_TRIES: usize = 64;
+                    // 揃わなかった時は、 見た (column offset, slot stamp)。 relocation なら None。
+                    let read = || -> Result<Option<Vec<u8>>, Option<(u32, u64)>> {
+                        let raw = match self.himos[hid].get_value32(eid_local) {
+                            Some(raw) => raw,
+                            None => return Ok(None),
+                        };
+                        // slot 内の seqlock (gen) で torn / 同 offset 再利用を検出。
+                        let LeafRead::Ok(bytes) = leaf.try_read(raw) else {
+                            return Err(Some((raw, leaf.slot_stamp(raw))));
+                        };
+                        // column offset を再読。 不変なら relocation も無かった = 確定。
+                        if self.himos[hid].get_value32(eid_local) == Some(raw) { Ok(Some(bytes)) } else { Err(None) }
+                    };
+                    // 別の行を握っている thread は握れない (互いを待って止まる) ので、 揃うまで読み直す
+                    // (#128: µs sleep の階段 backoff で書き手との位相をずらす。 同じ (offset, stamp) の
+                    // まま STALL_LIMIT 回続けて揃わない = 誰も動かしていない odd gen / 破損 → None)。
+                    const STALL_LIMIT: usize = 256;
                     let mut stall = 0usize;
                     let mut last_probe: Option<(u32, u64)> = None;
                     let mut attempt = 0usize;
                     loop {
+                        // readonly の Engine (別 process の読み手) が握っても書き手は止まらない (row lock は
+                        // process の中だけ) — 握って 1 回で諦めると値があるのに None (#128 が戻る)。 読み直しへ
+                        if attempt == lock_free_tries
+                            && !self.is_readonly()
+                            && let Some(_row) = self.row_locks.read_locked(eid_local)
+                        {
+                            return read().unwrap_or(None);
+                        }
                         if attempt > 0 {
                             if attempt < SPIN_TRIES {
                                 std::hint::spin_loop();
-                            } else if attempt < YIELD_TRIES {
+                            } else if attempt < lock_free_tries {
                                 std::thread::yield_now();
                             } else {
-                                let us = ((attempt - YIELD_TRIES + 1) as u64).min(100);
+                                let us = ((attempt - lock_free_tries + 1) as u64).min(100);
                                 std::thread::sleep(std::time::Duration::from_micros(us));
                             }
                         }
                         attempt += 1;
-                        let raw = self.himos[hid].get_value32(eid_local)?;
-                        // slot 内の seqlock (gen) で torn / 同 offset 再利用を検出。
-                        let LeafRead::Ok(bytes) = leaf.try_read(raw) else {
-                            let probe = (raw, leaf.slot_stamp(raw));
-                            if last_probe == Some(probe) {
+                        match read() {
+                            Ok(v) => return v,
+                            Err(Some(probe)) if last_probe == Some(probe) => {
                                 stall += 1;
                                 if stall >= STALL_LIMIT {
                                     return None;
                                 }
-                            } else {
-                                stall = 0;
-                                last_probe = Some(probe);
                             }
-                            continue;
-                        };
-                        // column offset を再読。 不変なら relocation も無かった = 確定。
-                        if self.himos[hid].get_value32(eid_local) == Some(raw) {
-                            return Some(bytes);
+                            Err(probe) => {
+                                stall = 0;
+                                last_probe = probe;
+                            }
                         }
-                        // Ok だが column が動いた = writer 前進 (別 offset へ relocation)。
-                        stall = 0;
-                        last_probe = None;
                     }
                 }
                 // Tag / reserved Leaf: 不変な vocab bytes を copy。
@@ -13611,8 +13707,7 @@ impl Engine {
                     return;
                 }
                 for hid in 0..self.himos.len() {
-                    self.free_leaf_cell(eid, hid);
-                    self.live_remove(hid, eid);
+                    self.remove_cell_freeing_leaf(eid, hid);
                 }
                 self.live_free(eid);
             }
@@ -15562,6 +15657,78 @@ mod tests {
         }
     }
 
+    /// #343: consumer が当てる delete (`apply_op` の `Op::Delete`) も **列を消してから** Leaf の slot を返す。
+    /// consumer を通すと当てるのが遅れ、 読み手が当てる途中の entity を読めない (16 回中 2 回しか検出
+    /// しなかった) ので、 同じ `apply_op` を churn の thread から直接呼ぶ。 旧順序で 8/8 回検出 (1 回
+    /// 167〜1,820 件)。 他の経路は `tests/issue343_leaf_free_after_clear.rs`。
+    #[test]
+    fn issue343_apply_op_delete_clears_before_freeing_leaf() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+        let dir = tmp("issue343_apply_op_delete");
+        let mut eng = Engine::create_growable(&dir).unwrap();
+        eng.define_himo("body", ValueType::Leaf, 0);
+        let hid = eng.himo_id("body").unwrap() as u16;
+        let y = eng.entity().unwrap();
+        let first = eng.entity().unwrap();
+        let eng = Arc::new(eng);
+        const X: &[u8] = &[b'x'; 64];
+        let current = Arc::new(AtomicU64::new(first));
+        let stop = Arc::new(AtomicBool::new(false));
+        let churn = {
+            let (eng, current, stop) = (eng.clone(), current.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let e = eng.entity().unwrap();
+                    eng.tie_bytes_to_by_id(e, hid, X);
+                    current.store(e, Ordering::Relaxed);
+                    let hlc = eng.mint_local_hlc();
+                    eng.apply_op(crate::write_queue::Op::Delete { eid: enchudb_oplog::eid_local(e), hlc });
+                }
+            })
+        };
+        let other_row = {
+            let (eng, stop) = (eng.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut n = 0u8;
+                while !stop.load(Ordering::Relaxed) {
+                    eng.tie_bytes_to_by_id(y, hid, &[b'a' + n % 20; 64]);
+                    n = n.wrapping_add(1);
+                }
+            })
+        };
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let (eng, current) = (eng.clone(), current.clone());
+                std::thread::spawn(move || {
+                    let (mut x, mut other) = (0usize, 0usize);
+                    let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    while std::time::Instant::now() < end {
+                        match eng.get_text_owned(current.load(Ordering::Relaxed), "body") {
+                            Some(b) if b == X => x += 1,
+                            None => {}
+                            Some(_) => other += 1,
+                        }
+                    }
+                    (x, other)
+                })
+            })
+            .collect();
+        let (mut x, mut other) = (0, 0);
+        for r in readers {
+            let (a, b) = r.join().unwrap();
+            (x, other) = (x + a, other + b);
+        }
+        stop.store(true, Ordering::Relaxed);
+        churn.join().unwrap();
+        other_row.join().unwrap();
+        eprintln!("x {x} / 他の値 {other}");
+        assert!(x > 0, "x を一度も読めていない (前提が崩れた)");
+        assert_eq!(other, 0, "consumer の delete の途中で別の行の値を読んだ");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
+    }
+
     /// #128: 進捗の無い Retry 連発 (= crash 残骸の odd gen) では reader が
     /// hang せず **有限時間で None** に落ちること。 進捗検出付き retry loop
     /// (text_owned_by_id) の escape 経路の regression test。
@@ -15595,6 +15762,33 @@ mod tests {
             t0.elapsed().as_millis()
         );
         let _ = std::fs::remove_dir_all(&dir); // v10: DB は directory
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// #131: 別の行を握っている thread は読みのために行を握らない (互いを待って止まるので) —
+    /// その時も odd gen は #128 の 「進捗の無い連敗」 で None に落ちること (握れば 1 回で None)。
+    #[test]
+    fn issue131_stalled_slot_while_holding_another_row_returns_none() {
+        let dir = tmp("issue131_stall_holding");
+        let mut eng = Engine::create_growable(&dir).unwrap();
+        eng.define_himo("body", ValueType::Leaf, 0);
+        let eid = eng.entity().unwrap();
+        let other = eng.entity().unwrap();
+        eng.tie_text(eid, "body", "hello-leaf-body");
+        let hid = eng.himo_id("body").unwrap();
+        let raw = eng.himos[hid].get_value32(enchudb_oplog::eid_local(eid)).unwrap();
+        eng.leaf_for(hid).expect("routed leaf").poison_gen_odd_for_test(raw);
+
+        let _held = eng.write_row(other);
+        let t0 = std::time::Instant::now();
+        assert_eq!(eng.get_text_owned(eid, "body"), None, "odd gen (進捗なし) は None に落ちること");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "stall escape が {} ms — hang している",
+            t0.elapsed().as_millis()
+        );
+        drop(_held);
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&dir);
     }
 

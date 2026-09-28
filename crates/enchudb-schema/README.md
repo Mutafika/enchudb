@@ -35,16 +35,16 @@ SQL crate (`enchudb-sql`) はこの schema 層の上に乗る parser。
 ## 起動時: schema で declare + 永続化
 
 ```rust
-use enchudb_schema::{Database, ColumnType};
+use enchudb_schema::Database;
 
 let mut db = Database::create("/tmp/app.db")?;
 
 // schema declare — build() 時に col 名 → himo_id を pre-resolve
 let _ = db.table("users")
-    .integer("id")
-    .text("name")
-    .integer("age")
-    .text("city")
+    .number("id")
+    .tag("name")
+    .number("age")
+    .tag("city")
     .primary_key("id")
     .build()?;
 ```
@@ -63,7 +63,7 @@ drop(users);
 
 // runtime: bindings + engine 直叩き
 let eng = db.arc_engine();
-let e = eng.entity().unwrap();
+let e = eng.entity_in("users").unwrap();   // table を定義した DB では entity() は使えない
 eng.tie_text_to_by_id(e, name_hid, "Alice");
 eng.tie_to_by_id(e, age_hid, 30);
 eng.tie_text_to_by_id(e, city_hid, "Tokyo");
@@ -96,7 +96,7 @@ let count  = users.where_eq("city", "Tokyo").count()?;
 let one    = users.where_eq("id", 1i64).find_one()?;
 
 let prime  = users.where_range("age", 25, 35).find()?;
-let adults = users.where_ge("age", 18).find()?;
+let adults = users.all().where_ge("age", 18i64).find()?;   // where_gt / ge / lt / le は Query 側 (all() から)
 
 let age = users.entity(alice).get("age");
 users.entity(alice).set("age", 31i64).commit()?;
@@ -113,18 +113,19 @@ users.entity(alice).delete()?;
 let mut db = Database::create("/tmp/x.db")?;
 
 // referenced 側 table を先に build
-db.table("companies").integer("id").text("name").primary_key("id").build()?;
+db.table("companies").number("id").tag("name").primary_key("id").build()?;
 
-let users = db.table("users")
-    .integer("id")
-    .text("name")
+db.table("users")
+    .number("id")
+    .tag("name")
     .ref_to("company", "companies")   // users.company : Ref → companies.eid
     .primary_key("id")
     .build()?;
 
-// 使い方
+// 使い方 — build() が返す Table は db を借りたままなので、 table を全部 build してから get_table で取る
 let companies = db.get_table("companies").unwrap();
-let ant = companies.where_eq("name", "Anthropic").find_one()?.unwrap();
+let users = db.get_table("users").unwrap();
+let ant = companies.insert().set("id", 1i64).set("name", "Anthropic").commit()?;
 
 users.insert().set("id", 1i64).set("name", "Alice")
     .set("company", enchudb_schema::Value::Ref(ant))
@@ -137,7 +138,7 @@ let staff = users.where_ref("company", ant).find()?;
 ## upsert (`INSERT OR REPLACE` 相当)
 
 ```rust
-let kv = db.table("kv").text("key").integer("ts").primary_key("key").build()?;
+let kv = db.table("kv").tag("key").number("ts").primary_key("key").build()?;
 
 // PK 一致 row があれば update、 無ければ insert
 kv.upsert().set("key", "k1").set("ts", 100i64).commit()?;
@@ -248,7 +249,7 @@ schema layer の `get_table` は **hot path じゃない** (起動時に 1 回�
 ```rust
 {
     let mut db = Database::create("/tmp/app.db")?;
-    let users = db.table("users").integer("id").text("name").primary_key("id").build()?;
+    let users = db.table("users").number("id").tag("name").primary_key("id").build()?;
     users.insert().set("id", 1i64).set("name", "Alice").commit()?;
 }
 // 1 行も schema declare せず reopen
@@ -264,14 +265,14 @@ schema layer の `get_table` は **hot path じゃない** (起動時に 1 回�
 
 schema は engine の content blob に serialize して保存。 178 列の prisma schema レベルでも 512 MB 上限内に収まる。
 
-## concurrent / WAL モード
+## concurrent / oplog モード
 
 `Database` は内部で `Arc<Engine>` を持ち、 2 phase で運用する:
 
 | phase | 状態 | 何ができる |
 |---|---|---|
 | build | Arc count = 1、 consumer thread なし | `db.table(...).build()` で schema 拡張、 `db.engine_mut()` で `&mut Engine` 取得可 |
-| concurrent | `Arc<Database>` 経由で共有可能、 consumer thread 起動 | 全 write は WAL に append (有効時)、 background fsync、 `&Database` のみで操作 |
+| concurrent | `Arc<Database>` 経由で共有可能、 consumer thread 起動 | 全 write は oplog に append (有効時)、 background fsync、 `&Database` のみで操作 |
 
 ```rust
 use std::sync::Arc;
@@ -279,11 +280,11 @@ use enchudb_schema::Database;
 
 // 1. build phase で schema declare
 let mut db = Database::create_growable_tiny("/tmp/store.db")?;
-db.table("notes").integer("id").text("body").primary_key("id").build()?;
-db.table("kv").text("key").integer("ts").primary_key("key").build()?;
+db.table("notes").number("id").leaf("body").primary_key("id").build()?;
+db.table("kv").tag("key").number("ts").primary_key("key").build()?;
 
-// 2. concurrent + WAL モードに遷移、 `Arc<Database>` を取得
-let db: Arc<Database> = db.finish_with_wal(256 * 1024 * 1024)?;
+// 2. concurrent + oplog モードに遷移、 `Arc<Database>` を取得
+let db: Arc<Database> = db.finish_with_oplog(256 * 1024 * 1024)?;
 
 // 3. 各 thread / sub-store で clone 共有、 全部 `&Database` 経由
 let db_clone = db.clone();
@@ -292,17 +293,17 @@ std::thread::spawn(move || {
     kv.insert().set("key", "alpha").set("ts", 1000i64).commit().unwrap();
 });
 
-// 4. 同期書き出しが必要なら wal_sync (~148µs)
-db.engine().wal_sync()?;
+// 4. 同期書き出しが必要なら oplog_sync
+db.engine().oplog_sync()?;
 ```
 
 | API | 戻り値 | 用途 |
 |---|---|---|
 | `Database::create*(path)` | `Database` | build phase 開始 (single-thread) |
 | `Database::open(path)` | `Database` | reopen、 standalone (consumer なし) |
-| `db.finish_with_wal(cap)` | `Arc<Database>` | build phase → concurrent + WAL |
-| `db.finish_concurrent()` | `Arc<Database>` | build phase → concurrent (WAL なし) |
-| `Database::open_with_wal(path, cap)` | `Arc<Database>` | reopen を直接 concurrent + WAL、 schema は自動復元 |
+| `db.finish_with_oplog(cap)` | `Arc<Database>` | build phase → concurrent + oplog |
+| `db.finish_concurrent()` | `Arc<Database>` | build phase → concurrent (oplog なし) |
+| `Database::open_with_oplog(path, cap)` | `Arc<Database>` | reopen を直接 concurrent + oplog、 schema は自動復元 |
 
 `finish_*` は `self` を consume するので呼んだ後の元 `db` は無効。 失敗条件は Arc 共有後の呼び出し (build phase で既に `Arc::new(db)` した後など)。
 
@@ -312,7 +313,7 @@ db.engine().wal_sync()?;
 // 1 個の Database を 18 個の sub-store で Arc 共有
 let db = Database::create("/var/sinfo/store.db")?;
 // ... build phase で 70+ himo を含む全 table を declare ...
-let db = db.finish_with_wal(256 * 1024 * 1024)?;
+let db = db.finish_with_oplog(256 * 1024 * 1024)?;
 
 // 各 sub-store に Arc<Database> を clone して渡す
 let store1 = SubStore::new(db.clone());
@@ -320,15 +321,17 @@ let store2 = SubStore::new(db.clone());
 // ...
 ```
 
-crash 時は次回 `open_with_wal` で WAL から recover、 commit 済み write は durable。
+crash 時は次回 `open_with_oplog` で oplog から recover、 commit 済み write は durable。
 
 ## column 型
 
-| `ColumnType` | tie 経路 | 値の Rust 型 |
+| builder | `ColumnType` | 値 |
 |---|---|---|
-| `Integer` | `Engine::tie_to` | `i64` (内部 u32、 `< u32::MAX`) |
-| `Text` | `Engine::tie_text_to` | `String` / `&str` (Vocabulary 経由) |
-| `Ref` | `Engine::tie_ref_to` | `EntityId` (= u64) |
+| `.number(col)` | `Number` | 整数、 `0..u32::MAX` |
+| `.bigint(col)` | `BigInt` | 整数、 `BIGINT_MIN..=BIGINT_MAX` (負の数 / ms・µs の時刻 / 64 bit の ID) |
+| `.tag(col)` | `Tag` | 文字列、 同じ値を共有する (Vocabulary で dedupe)。 city / 状態など |
+| `.leaf(col)` | `Leaf` | 文字列、 row ごとに固有 (dedupe しない)。 本文 / メモなど |
+| `.ref_to(col, table)` | `Ref` | 別 table の row (`Value::Ref(eid)`) |
 
 `Value::from(...)` で各種 Rust 値から自動変換 (`i64` / `i32` / `u32` / `&str` / `String`)。 `Ref` だけは `Value::Ref(eid)` で明示。
 
@@ -369,8 +372,9 @@ use enchudb::schema::{Database, ColumnType};
 
 ## 制約 + 未対応
 
-- 集計 (`sum` / `count` / `group by`) は engine API 直 (`db.engine().sum(...)`) か DSL (`query_lang`)
-- JOIN は relation + `where_ref` の組合せ (multi-step は manual)
+- 集計は `Query` の `count` / `sum` / `min` / `max` / `group_sum` / `group_min` / `group_max` (BigInt の列は
+  `sum_i128` / `min_i64` / `max_i64`)。 購読なら `subscribe_counts` / `subscribe_sums`
+- JOIN は `join_ref` / `join_eq` (組を返す、 購読も可) か、 relation + `where_ref` の組合せ
 - 1 table の col 上限 = engine の `max_himos` (default 256)
 - ALTER TABLE 相当はなし (schema は append-only、 column 削除は untie で代用)
 - `Null` 値の tie は不可 (untie で代用、 unset = engine.get が None)
