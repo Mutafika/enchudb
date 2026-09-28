@@ -21,11 +21,11 @@
 //! - **書きは oplog append を memcpy 1 回で済ます**(tie_async の ~1μs を維持)
 //! - **fsync は hot path から外す**(非同期、consumer スレッド側で定期実行)
 //!
-//! # レコード形式(v2)
+//! # レコード形式(v3)
 //!
 //! ```text
 //! [magic: 2B "WL"]
-//! [version: 1B]         = 2
+//! [version: 1B]         = 3 (2 も読む)
 //! [op_type: 1B]         0=Tie, 1=Untie, 2=Delete, 3=Content, 4=Commit, 5=Schema
 //! [len: 4B LE]          payload bytes
 //! [lsn: 8B LE]          Log Sequence Number(ローカル単調増加、recover 用)
@@ -33,7 +33,7 @@
 //! [hlc_logical: 4B LE]  HLC logical counter
 //! [hlc_peer: 4B LE]     HLC peer id
 //! [author_peer: 4B LE]  record を書いた peer の id
-//! [crc32: 4B LE]        payload の FNV-1a
+//! [crc32: 4B LE]        FNV-1a over (op_type 〜 author_peer ‖ payload)。 v2 は payload だけ
 //! [signature: 64B]      ed25519 over (header fixed ‖ payload)。現状 zeros。
 //! [pubkey_fp: 8B]       署名に使った pubkey の先頭 8B。現状 zeros。
 //! [payload: len B]
@@ -77,7 +77,55 @@ pub const OPLOG_FILE_VERSION: u32 = 2;
 pub const HEADER_SIZE: usize = 32;
 
 const REC_MAGIC: &[u8; 2] = b"WL";
-const REC_VERSION: u8 = 2;
+/// 書く record の版。 v3 (#58): CRC が payload だけでなく op / len / lsn / hlc / author も覆う。
+/// 旧: CRC は payload だけで、 header が壊れても (ring の前の周の bytes が一部残る torn write 等)
+/// magic が残っていれば通り、 ゴミの HLC / author が recovery・bridge・audit に流れた。
+const REC_VERSION: u8 = 3;
+/// 読める旧版 (CRC は payload だけ)。 旧 binary が書いた WAL と、 旧版の peer が署名した中継 record。
+const REC_VERSION_V2: u8 = 2;
+/// CRC が覆う header の範囲 (op / len / lsn / hlc / author)。 magic / version は見分けに使い、
+/// crc / 署名は覆えない。
+const CRC_FIELDS: std::ops::Range<usize> = OFF_OP..OFF_CRC;
+
+fn known_version(v: u8) -> bool {
+    v == REC_VERSION || v == REC_VERSION_V2
+}
+
+/// record の CRC。 `fields` は header の `CRC_FIELDS` (signed_bytes の同じ位置)。
+///
+/// v3 は payload の FNV-1a に header の値を 4 byte ずつ混ぜる (xor → 奇数の掛け算は 1 対 1 なので、
+/// どの 1 bit が反転しても値が変わる)。 1 byte ずつの FNV-1a で 33 byte 足すと append 1 回が
+/// +39 ns (528 → 567 ns) だった。
+fn record_crc(version: u8, fields: &[u8], payload: &[u8]) -> u32 {
+    let h = fnv1a(payload);
+    if version == REC_VERSION_V2 {
+        return h;
+    }
+    // fields は常に 33 byte (最後の塊だけ 1 byte、 残りを 0 で埋める)
+    fields.chunks(4).fold(h, |h, c| {
+        let mut w = [0u8; 4];
+        w[..c.len()].copy_from_slice(c);
+        (h ^ u32::from_le_bytes(w)).wrapping_mul(0x01000193)
+    })
+}
+
+/// 書く record の CRC (v3) を header の値から。
+fn new_record_crc(op_byte: u8, payload_len: u32, lsn: u64, hlc: Hlc, author_peer: PeerId, payload: &[u8]) -> u32 {
+    let mut f = [0u8; OFF_CRC - OFF_OP];
+    f[0] = op_byte;
+    f[1..5].copy_from_slice(&payload_len.to_le_bytes());
+    f[5..13].copy_from_slice(&lsn.to_le_bytes());
+    f[13..21].copy_from_slice(&hlc.wall.to_le_bytes());
+    f[21..25].copy_from_slice(&hlc.logical.to_le_bytes());
+    f[25..29].copy_from_slice(&hlc.peer.to_le_bytes());
+    f[29..33].copy_from_slice(&author_peer.to_le_bytes());
+    record_crc(REC_VERSION, &f, payload)
+}
+
+/// signed_bytes (header 固定部 ‖ payload) の CRC をその版の規則で計算し直す。
+fn signed_bytes_crc(sb: &[u8]) -> u32 {
+    record_crc(sb[OFF_VERSION], &sb[CRC_FIELDS], &sb[SIGNED_PAYLOAD_HEADER_SIZE..])
+}
 /// v2 レコード固定ヘッダ: 2+1+1+4+8 + 8+4+4 + 4 + 4 + 64 + 8 = 112
 const REC_HEADER_SIZE: usize = 112;
 
@@ -95,6 +143,8 @@ const OFF_CRC: usize = 36;        // 4
 const OFF_SIGNATURE: usize = 40;  // 64
 const OFF_PUBKEY_FP: usize = 104; // 8
 const _: () = assert!(OFF_PUBKEY_FP + 8 == REC_HEADER_SIZE);
+// header の署名より前は signed_bytes の固定部と同じ並び (scan はそこを切り出して signed_bytes にする)
+const _: () = assert!(OFF_SIGNATURE == SIGNED_PAYLOAD_HEADER_SIZE);
 
 /// Phase C で keypair が無い場合のデフォルト署名(zeros)。
 const ZERO_SIGNATURE: [u8; 64] = [0u8; 64];
@@ -151,7 +201,7 @@ pub fn decode_sync_ops_payload(payload: &[u8]) -> Option<Record> {
 
     // signed_bytes header parse
     if &signed_bytes[0..2] != REC_MAGIC { return None; }
-    if signed_bytes[2] != REC_VERSION { return None; }
+    if !known_version(signed_bytes[OFF_VERSION]) { return None; }
     let op_byte = signed_bytes[3];
     let payload_len = u32::from_le_bytes(signed_bytes[4..8].try_into().ok()?) as usize;
     let lsn = u64::from_le_bytes(signed_bytes[8..16].try_into().ok()?);
@@ -189,7 +239,7 @@ pub struct ResignedRecord {
 /// - lsn / hlc / author_peer は元 record の値を**維持**する (= LWW identity と
 ///   record の由来を保つ。 変わるのは宛名 = eid だけ)
 /// - 全 op payload で eid は先頭 8 byte 固定 (v2 layout) なので定位置 patch +
-///   crc (payload の FNV-1a) 再計算 + 全体 re-sign で完結する
+///   crc (その record の版の規則) 再計算 + 全体 re-sign で完結する
 /// - eid を持たない op (Commit / Vocab) は None
 /// - `keypair` が None なら zero 署名 (= 署名無効運用、 append 時と同じ扱い)
 pub fn resign_with_eid(
@@ -219,8 +269,8 @@ pub fn resign_with_eid(
     }
     // eid patch (全 eid 持ち op で payload 先頭 8 byte)
     sb[payload_off..payload_off + 8].copy_from_slice(&new_eid.to_le_bytes());
-    // crc は payload のみが対象 (append 時と同じ規約)
-    let crc = fnv1a(&sb[payload_off..payload_end]);
+    // crc はその版の規則で (v3 は header の値も覆う)
+    let crc = signed_bytes_crc(&sb);
     sb[36..40].copy_from_slice(&crc.to_le_bytes());
     let (signature, pubkey_fp) = match keypair {
         Some(kp) => (kp.sign(&sb), kp.pubkey_fp()),
@@ -263,7 +313,8 @@ pub fn resign_as_tie_ref(
     sb.extend_from_slice(&himo_id.to_le_bytes());
     sb.extend_from_slice(&[0u8; 2]);
     sb.extend_from_slice(&target_world.to_le_bytes());
-    let crc = fnv1a(&sb[SIGNED_PAYLOAD_HEADER_SIZE..]);
+    // op / len を差し替えたので、 v3 の crc (header の値も覆う) はここで計算し直す
+    let crc = signed_bytes_crc(&sb);
     sb[36..40].copy_from_slice(&crc.to_le_bytes());
     let (signature, pubkey_fp) = match keypair {
         Some(kp) => (kp.sign(&sb), kp.pubkey_fp()),
@@ -1019,7 +1070,10 @@ impl OpLog {
             let op_byte = op.op_byte();
             let payload_offset = offset as usize + REC_HEADER_SIZE;
             op.write_payload(&mut mmap[payload_offset..payload_offset + payload_size]);
-            let crc = fnv1a(&mmap[payload_offset..payload_offset + payload_size]);
+            let crc = new_record_crc(
+                op_byte, payload_size as u32, lsn, hlc, author_peer,
+                &mmap[payload_offset..payload_offset + payload_size],
+            );
 
             let (signature, pubkey_fp) = match &keypair {
                 Some(kp) => {
@@ -1105,7 +1159,7 @@ impl OpLog {
         if &sb[0..2] != REC_MAGIC {
             return Err(bad("relayed signed_bytes: bad magic"));
         }
-        if sb[2] != REC_VERSION {
+        if !known_version(sb[OFF_VERSION]) {
             return Err(bad("relayed signed_bytes: unsupported record version"));
         }
         let payload_len = u32::from_le_bytes(sb[4..8].try_into().unwrap()) as usize;
@@ -1113,8 +1167,8 @@ impl OpLog {
             return Err(bad("relayed signed_bytes: len field mismatch"));
         }
         let crc_stored = u32::from_le_bytes(sb[36..40].try_into().unwrap());
-        if fnv1a(&sb[SIGNED_PAYLOAD_HEADER_SIZE..]) != crc_stored {
-            return Err(bad("relayed signed_bytes: payload crc mismatch"));
+        if signed_bytes_crc(sb) != crc_stored {
+            return Err(bad("relayed signed_bytes: crc mismatch"));
         }
         let record_size = REC_HEADER_SIZE + payload_len;
 
@@ -1219,7 +1273,10 @@ impl OpLog {
         let payload_offset = offset as usize + REC_HEADER_SIZE;
         let mmap = self.mmap_mut_slice();
         op.write_payload(&mut mmap[payload_offset..payload_offset + payload_size]);
-        let crc = fnv1a(&mmap[payload_offset..payload_offset + payload_size]);
+        let crc = new_record_crc(
+            op_byte, payload_size as u32, lsn, hlc, author_peer,
+            &mmap[payload_offset..payload_offset + payload_size],
+        );
 
         // Phase C: 鍵があれば署名。無ければ zeros。 relay 経路では元の署名を保持。
         let (signature, pubkey_fp) = match &relay {
@@ -1536,7 +1593,8 @@ impl OpLog {
                 stop = ScanStop::BadMagic;
                 break;
             }
-            if header[OFF_VERSION] != REC_VERSION {
+            let version = header[OFF_VERSION];
+            if !known_version(version) {
                 stop = ScanStop::BadVersion;
                 break;
             }
@@ -1559,7 +1617,8 @@ impl OpLog {
             let payload_end = payload_off + payload_len;
             if payload_end > mmap.len() { stop = ScanStop::OutOfBounds; break; }
 
-            let computed_crc = fnv1a(&mmap[payload_off..payload_end]);
+            // v3 は header の値も覆う (壊れた header のゴミの HLC / author を通さない、 #58)
+            let computed_crc = record_crc(version, &header[CRC_FIELDS], &mmap[payload_off..payload_end]);
             if stored_crc != computed_crc {
                 stop = ScanStop::BadCrc; // 破損 tail
                 break;
@@ -1570,10 +1629,11 @@ impl OpLog {
             if lsn > max_lsn { max_lsn = lsn; }
             if hlc > max_hlc { max_hlc = hlc; }
 
-            let signed_bytes = signed_payload(
-                op_byte, payload_len as u32, lsn, hlc,
-                author_peer, stored_crc, payload_slice,
-            );
+            // 署名はその record の版の bytes に掛かっている。 header の先頭は signed_bytes と同じ並びなので
+            // そのまま切り出す (v2 の record を v3 として組み直さない)
+            let mut signed_bytes = Vec::with_capacity(SIGNED_PAYLOAD_HEADER_SIZE + payload_len);
+            signed_bytes.extend_from_slice(&header[..SIGNED_PAYLOAD_HEADER_SIZE]);
+            signed_bytes.extend_from_slice(payload_slice);
 
             match op {
                 Some(DecodedOp::Commit) => {
@@ -2312,6 +2372,95 @@ mod tests {
             .filter(|r| matches!(r.op, DecodedOp::Tie { .. }))
             .map(|r| (r.lsn, r.hlc))
             .collect()
+    }
+
+    /// #58: v3 の CRC は header の値 (op / len / lsn / hlc / author) も覆う。 旧 (payload だけ) は
+    /// header が壊れても magic が残っていれば通し、 ゴミの lsn / HLC / author を recovery・bridge・
+    /// audit に流した。 各 field の 1 bit を反転すると scan はその record で止まる。
+    #[test]
+    fn a_corrupted_header_field_stops_the_scan() {
+        for (field, off) in [
+            ("op", OFF_OP),
+            ("lsn", OFF_LSN),
+            ("hlc_wall", OFF_HLC_WALL),
+            ("hlc_logical", OFF_HLC_LOGICAL),
+            ("hlc_peer", OFF_HLC_PEER),
+            ("author", OFF_AUTHOR_PEER),
+        ] {
+            let p = tmp(&format!("hdr_crc_{field}"));
+            let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+            wal.set_peer_id(1);
+            wal.append(Op::Untie { eid: 1, himo_id: 0 }).unwrap();
+            wal.append(Op::Tie { eid: 2, himo_id: 0, value: 2 }).unwrap();
+            wal.append(Op::Commit).unwrap();
+            assert_eq!(wal.iter_committed().len(), 2, "前提");
+            // 1 本目の record (file header の直後) の field を壊す。 op は Untie ↔ Delete 等の別の op に化ける
+            wal.mmap_mut_slice()[HEADER_SIZE + off] ^= 0x01;
+            let (recs, _, _, stop) = wal.iter_committed_from_with_diag(HEADER_SIZE as u64);
+            assert!(recs.is_empty(), "{field} が壊れた record を通した: {:?}", recs.first().map(|(r, _)| (r.lsn, r.hlc, r.author_peer)));
+            assert_eq!(stop.as_str(), ScanStop::BadCrc.as_str(), "{field}");
+            let _ = std::fs::remove_dir_all(&p);
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
+    /// #58: v2 (CRC は payload だけ) の record も読める — 旧 binary が書いた WAL と、 旧版の peer が
+    /// 署名した中継 record。 署名は v2 の bytes のまま検証できる (v3 として組み直さない)。
+    #[test]
+    fn v2_records_are_still_read_and_their_signatures_still_verify() {
+        let p = tmp("v2_compat");
+        let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+        wal.set_peer_id(5);
+        let kp = crate::keys::Keypair::generate();
+        wal.set_keypair(Some(std::sync::Arc::new(crate::keys::Keypair::from_bytes(&kp.secret_bytes()))));
+        wal.append(Op::Tie { eid: 1, himo_id: 0, value: 7 }).unwrap();
+        // 旧 binary が書いた形に書き換える: version 2、 CRC は payload だけ、 署名は v2 の bytes に
+        {
+            let m = wal.mmap_mut_slice();
+            let h = HEADER_SIZE;
+            let len = u32::from_le_bytes(m[h + OFF_LEN..h + OFF_LEN + 4].try_into().unwrap()) as usize;
+            let payload = m[h + REC_HEADER_SIZE..h + REC_HEADER_SIZE + len].to_vec();
+            m[h + OFF_VERSION] = REC_VERSION_V2;
+            m[h + OFF_CRC..h + OFF_CRC + 4].copy_from_slice(&fnv1a(&payload).to_le_bytes());
+            let mut sb = m[h..h + SIGNED_PAYLOAD_HEADER_SIZE].to_vec();
+            sb.extend_from_slice(&payload);
+            let sig = kp.sign(&sb);
+            m[h + OFF_SIGNATURE..h + OFF_SIGNATURE + 64].copy_from_slice(&sig);
+        }
+        wal.append(Op::Tie { eid: 2, himo_id: 0, value: 8 }).unwrap(); // こちらは v3
+        wal.append(Op::Commit).unwrap();
+        let recs = wal.iter_committed();
+        assert_eq!(recs.len(), 2, "v2 と v3 が混ざった WAL を読めない");
+        assert_eq!(recs[0].signed_bytes[OFF_VERSION], REC_VERSION_V2);
+        assert_eq!(recs[1].signed_bytes[OFF_VERSION], REC_VERSION);
+        let keys = crate::keys::PubkeyStore::new();
+        keys.force_register(5, &kp.public_bytes());
+        for r in &recs {
+            assert!(keys.verify(5, &r.signed_bytes, &r.signature), "署名が合わない (版 {})", r.signed_bytes[OFF_VERSION]);
+        }
+
+        // 中継 (bytes のまま): v2 も受ける。 v3 は header を壊すと弾く (旧: payload しか見ず通した)
+        let q = tmp("v2_compat_relay");
+        let relay = OpLog::create(&q, 1024 * 1024).unwrap();
+        relay.append_relayed_verbatim(&recs[0].signed_bytes, &recs[0].signature, &recs[0].pubkey_fp).unwrap();
+        let mut bad = recs[1].signed_bytes.clone();
+        bad[OFF_HLC_WALL] ^= 0x01;
+        assert!(relay.append_relayed_verbatim(&bad, &recs[1].signature, &recs[1].pubkey_fp).is_err());
+        relay.append_relayed_verbatim(&recs[1].signed_bytes, &recs[1].signature, &recs[1].pubkey_fp).unwrap();
+        relay.append(Op::Commit).unwrap();
+        assert_eq!(relay.iter_committed().len(), 2);
+
+        // 宛名の書き換え (bridge の逆写像) も版の規則で CRC を付け直す
+        for r in &recs {
+            let rs = resign_with_eid(r, 99, None).unwrap();
+            assert_eq!(signed_bytes_crc(&rs.signed_bytes).to_le_bytes(), rs.signed_bytes[36..40]);
+        }
+        let rs = resign_as_tie_ref(&recs[1], 99, 100, None).unwrap();
+        assert_eq!(signed_bytes_crc(&rs.signed_bytes).to_le_bytes(), rs.signed_bytes[36..40]);
+        for x in [&p, &q] {
+            let _ = std::fs::remove_dir_all(x);
+            let _ = std::fs::remove_file(x);
+        }
     }
 
     #[test]
