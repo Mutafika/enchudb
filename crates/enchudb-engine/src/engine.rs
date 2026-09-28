@@ -596,6 +596,10 @@ const BRIDGE_STALL_WARN_AFTER: u64 = 256;
 /// 実機の事象は 41 時間なので、 30 秒の下限で見落とすことはない。
 const BRIDGE_STALL_WARN_AFTER_MS: u64 = 30_000;
 
+/// #57: WAL が満杯で落ち続けていても、 最初に落ちてからこれだけ経ったら history floor を上げる (ms)。
+/// 満杯が終わった周にはすぐ上げる。
+const WAL_DROP_FLOOR_MAX_DELAY_MS: u64 = 5_000;
+
 fn serialize_eidmap(entries: &[EidmapEntry]) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + entries.len() * 28);
     out.extend_from_slice(b"EIDM");
@@ -3034,6 +3038,11 @@ pub struct Engine {
     /// 適用済みなので、 ローカルは正常に見えたまま配布だけが欠ける。 旧実装は
     /// warn-once の 1 行だけで、 26 時間の停止でもログに 1 行しか残らなかった。
     wal_dropped_records: std::sync::atomic::AtomicU64,
+    /// #57: WAL に載らなかった record のために history floor を上げた回数。
+    wal_drop_floor_bumps: std::sync::atomic::AtomicU64,
+    /// #57: まだ floor に入れていない、 WAL に載らなかった record (author, 落ちた HLC の max) と、
+    /// 最初に落ちた時刻 (unix ms)。 満杯の episode が終わった周にまとめて floor に入れる。
+    wal_drop_pending: std::sync::Mutex<(Vec<(u32, enchudb_oplog::Hlc)>, Option<u64>)>,
     /// #268: Commit marker の append が失敗した回数。 失敗すると直前の record 群は
     /// **閉じられない group** として残り、 bridge からも recovery からも見えなくなる。
     wal_commit_failures: std::sync::atomic::AtomicU64,
@@ -3450,6 +3459,8 @@ impl Engine {
             bridge_last_scan_stop: std::sync::Mutex::new("none"),
             bridge_pending_records: std::sync::atomic::AtomicU64::new(0),
             wal_dropped_records: std::sync::atomic::AtomicU64::new(0),
+            wal_drop_floor_bumps: std::sync::atomic::AtomicU64::new(0),
+            wal_drop_pending: std::sync::Mutex::new((Vec::new(), None)),
             wal_commit_failures: std::sync::atomic::AtomicU64::new(0),
             wal_append_warned: std::sync::atomic::AtomicBool::new(false),
             bridge_stall_warned: std::sync::atomic::AtomicBool::new(false),
@@ -4491,6 +4502,8 @@ impl Engine {
             bridge_last_scan_stop: std::sync::Mutex::new("none"),
             bridge_pending_records: std::sync::atomic::AtomicU64::new(0),
             wal_dropped_records: std::sync::atomic::AtomicU64::new(0),
+            wal_drop_floor_bumps: std::sync::atomic::AtomicU64::new(0),
+            wal_drop_pending: std::sync::Mutex::new((Vec::new(), None)),
             wal_commit_failures: std::sync::atomic::AtomicU64::new(0),
             wal_append_warned: std::sync::atomic::AtomicBool::new(false),
             bridge_stall_warned: std::sync::atomic::AtomicBool::new(false),
@@ -4763,6 +4776,64 @@ impl Engine {
         // row insert → offset store の 4 step を排他化。 per-fsync 頻度 (= 100ms
         // 周期) なので lock 競合の hot path 影響なし。
         let _guard = self.transfer_lock.lock().unwrap();
+
+        // #57: WAL に載らなかった record (満杯) は `_sync_ops` にも入らず、 差分 pull では二度と
+        // 届かない。 その author の history floor を上げて、 それより前の cursor の puller を
+        // bootstrap (live state の転写、 #140) に回す。
+        //
+        // - 自分の write: floor = max(今, 落ちた HLC)。 今より後の record は必ず今より大きい HLC を持つので、
+        //   floor を越えた cursor の puller は落ちた分を bootstrap で受け取り済み。 ここ (転写より前) で
+        //   上げるのは、 落ちた後に書かれた record を floor より先に配らないため (publish は record を
+        //   集めた後にも floor を広告する)
+        // - 中継した他人の record: floor = 落ちた record の HLC。 他人の author の bootstrap は as_of を
+        //   「その author の HLC の max」 で決める (自分の clock を混ぜない) ので、 自分の今を入れると
+        //   bootstrap しても cursor が floor に届かず、 pull のたびに truncated になり続ける
+        //
+        // 上げるのは満杯の episode が終わった周 (新しく落ちなかった周) か、 最初に落ちてから
+        // WAL_DROP_FLOOR_MAX_DELAY_MS 経った周。 満杯の間ずっと 100 ms ごとに上げると、 全 peer が
+        // pull のたびに全状態を bootstrap する。 待つ間に配った record は上げる時の 「今」 より小さい
+        // HLC なので、 その puller も bootstrap に回る (待っても取りこぼさない)。
+        let fresh = wal.take_dropped();
+        let due = {
+            let mut p = self.wal_drop_pending.lock().unwrap_or_else(|e| e.into_inner());
+            let had_fresh = !fresh.is_empty();
+            for (a, h) in fresh {
+                match p.0.iter_mut().find(|(x, _)| *x == a) {
+                    Some((_, m)) => *m = (*m).max(h),
+                    None => p.0.push((a, h)),
+                }
+            }
+            if p.0.is_empty() {
+                None
+            } else {
+                let now_ms = Self::unix_millis();
+                let first = *p.1.get_or_insert(now_ms);
+                if !had_fresh || now_ms.saturating_sub(first) >= WAL_DROP_FLOOR_MAX_DELAY_MS {
+                    p.1 = None;
+                    Some(std::mem::take(&mut p.0))
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(dropped) = due {
+            let now = wal.mint_hlc();
+            let me = self.peer_id();
+            let floors: Vec<(u32, enchudb_oplog::Hlc)> =
+                dropped.iter().map(|&(a, h)| (a, if a == me { now.max(h) } else { h })).collect();
+            if self.record_reclaimed_floors(&floors) {
+                self.wal_drop_floor_bumps.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // 記録できなかった分は次の周に持ち越す (捨てると穴を知らせる手段が無くなる)
+                let mut p = self.wal_drop_pending.lock().unwrap_or_else(|e| e.into_inner());
+                for (a, h) in dropped {
+                    match p.0.iter_mut().find(|(x, _)| *x == a) {
+                        Some((_, m)) => *m = (*m).max(h),
+                        None => p.0.push((a, h)),
+                    }
+                }
+            }
+        }
 
         let from = self.sync_ops_offset.load(Ordering::Acquire);
         let trace = Self::trace_bridge_enabled();
@@ -5330,6 +5401,16 @@ impl Engine {
     /// まま配布だけが欠ける。 0 でなければ 「その差分は peer に永久に届かない」。
     pub fn wal_dropped_records(&self) -> u64 {
         self.wal_dropped_records.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #57: WAL に載らなかった record のために、 その author の history floor を上げた回数 (観測用)。
+    /// 上げると、 それより前の cursor の puller は差分 pull で `history_truncated` になり、
+    /// bootstrap で live state (落ちた write を含む) を受け取る。 平常時は 0。
+    ///
+    /// 上げるのは bridge (`transfer_oplog_to_sync_ops`) が満杯の episode の終わり (新しく落ちなかった周) を
+    /// 見た時、 または最初に落ちてから 5 秒経った時。
+    pub fn wal_drop_floor_bumps(&self) -> u64 {
+        self.wal_drop_floor_bumps.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Commit marker の append が失敗した回数（観測用）。 平常時は 0。
@@ -6234,7 +6315,8 @@ impl Engine {
     /// sentinel を全 author への baseline として畳み込む
     /// ([`Engine::sync_reclaimed_floors`] の doc 参照)。 **`u32::MAX` は author の
     /// peer id として予約済み** (実 author に使うと legacy baseline と誤分類される)。
-    fn record_reclaimed_floors(&self, candidates: &[(u32, enchudb_oplog::Hlc)]) {
+    /// 戻り値: 記録できたか (上げる必要が無かった時も true)。
+    fn record_reclaimed_floors(&self, candidates: &[(u32, enchudb_oplog::Hlc)]) -> bool {
         let mut merged: std::collections::HashMap<u32, enchudb_oplog::Hlc> = self
             .read_reclaimed_floor_entries()
             .unwrap_or_default()
@@ -6249,7 +6331,7 @@ impl Engine {
             }
         }
         if !changed {
-            return;
+            return true;
         }
         let hid = match self.ensure_himo_dynamic_in(
             "_sync_peers",
@@ -6260,7 +6342,7 @@ impl Engine {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("[enchudb] warning: reclaimed_floor himo unavailable ({e}) — history floor will over-approximate after restart");
-                return;
+                return false;
             }
         };
         let row = match self.entities_with_himo(hid).into_iter().next() {
@@ -6269,7 +6351,7 @@ impl Engine {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("[enchudb] warning: reclaimed_floor row unavailable ({e})");
-                    return;
+                    return false;
                 }
             },
         };
@@ -6286,6 +6368,7 @@ impl Engine {
             bytes.extend_from_slice(&h.peer.to_be_bytes());
         }
         self.tie_bytes_to_by_id(row, hid, &bytes);
+        true
     }
 
     /// #140: 自 peer が author した **live state** を bridge と同語彙の wire record
@@ -7841,10 +7924,12 @@ impl Engine {
     #[inline]
     fn append_local_op(&self, op: enchudb_oplog::oplog::Op<'_>) -> enchudb_oplog::Hlc {
         match self.oplog.as_ref() {
-            Some(wal) => wal
-                .append_with_hlc(op)
-                .map(|(_, h)| h)
-                .unwrap_or(enchudb_oplog::Hlc::ZERO),
+            // #57: 載らなかった (満杯) write にも版数を付ける (ZERO = 版数不明だと、 後から届く
+            // 古い write に負ける)。 その HLC は WAL が落ちた record として覚えた値 (後で採番し直すと、
+            // その間に bridge が floor を決めて版数が floor を越える)。 bridge が floor を上げる
+            Some(wal) => match wal.append_or_dropped(op) {
+                Ok((_, h)) | Err((_, h)) => h,
+            },
             None => enchudb_oplog::Hlc::ZERO,
         }
     }
