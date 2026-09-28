@@ -11,7 +11,7 @@ use enchudb_engine::ValueType;
 use enchudb_oplog::Hlc;
 use enchudb_sync::Syncer;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn tmp_path(tag: &str) -> String {
     format!(
@@ -23,6 +23,26 @@ fn tmp_path(tag: &str) -> String {
             .unwrap()
             .as_nanos()
     )
+}
+
+/// 条件が立つまで 5ms 間隔で待つ (上限 10 秒)。 固定 sleep は CI の負荷で足りなくなる (#336)。
+fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !f() {
+        assert!(Instant::now() < deadline, "timed out waiting for: {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// consumer が `_sync_ops` へ bridge し終え (sync lsn が `n` まで進み)、
+/// oplog ring を畳んだ (head が HEADER_SIZE に戻った) ところまで待つ。
+fn wait_bridged(eng: &Engine, n: u32) {
+    wait_until(&format!("consumer bridges {n} records into _sync_ops"), || {
+        eng.current_sync_lsn() >= n
+    });
+    wait_until("oplog ring reset to HEADER_SIZE", || {
+        eng.oplog().unwrap().head() == enchudb_oplog::oplog::HEADER_SIZE as u64
+    });
 }
 
 fn cleanup(path: &str) {
@@ -51,8 +71,8 @@ fn publish_since_uses_sync_ops_when_enabled() {
         eng.tie_to(e, "notes.note", i);
     }
     eng.oplog_commit();
-    // 自動 transfer 待ち (phase 1 で fsync interval = 100ms)
-    std::thread::sleep(Duration::from_millis(300));
+    // 自動 transfer 待ち (consumer の fsync tick 任せ、 手で transfer しない)
+    wait_bridged(&eng, 5);
 
     let transport: Arc<dyn enchudb_engine::transport::Transport> =
         Arc::new(InMemoryTransport::new());
@@ -81,7 +101,7 @@ fn publish_since_filters_by_hlc_through_sync_ops() {
         eng.tie_to(e, "notes.note", i);
     }
     eng.oplog_commit();
-    std::thread::sleep(Duration::from_millis(300));
+    wait_bridged(&eng, 3);
 
     // 現時刻 hlc を境にする (= 厳密な marker でなく実時刻ベース、 raw test なので OK)
     let marker_hlc = Hlc {
@@ -93,14 +113,14 @@ fn publish_since_filters_by_hlc_through_sync_ops() {
         peer: 0,
     };
 
-    // marker 後に 2 件追加
+    // marker 後に 2 件追加。 この sleep は HLC の wall (ms) を marker より後にずらすため (待ち合わせではない)
     std::thread::sleep(Duration::from_millis(20));
     for i in 4u32..=5 {
         let e = eng.entity_in("notes").unwrap();
         eng.tie_to(e, "notes.note", i);
     }
     eng.oplog_commit();
-    std::thread::sleep(Duration::from_millis(300));
+    wait_bridged(&eng, 5);
 
     let transport: Arc<dyn enchudb_engine::transport::Transport> =
         Arc::new(InMemoryTransport::new());
@@ -140,7 +160,7 @@ fn records_after_ring_reset_are_still_synced() {
         eng.tie_to(e, "notes.note", i);
     }
     eng.oplog_commit();
-    std::thread::sleep(Duration::from_millis(400));
+    wait_bridged(&eng, 3);
 
     // ring が実際に reset したことを確認 (= このテストの前提が成立している)。
     let head_after_reset = eng.oplog().unwrap().head();
@@ -156,7 +176,14 @@ fn records_after_ring_reset_are_still_synced() {
         eng.tie_to(e, "notes.note", i);
     }
     eng.oplog_commit();
-    std::thread::sleep(Duration::from_millis(400));
+    wait_bridged(&eng, 5);
+    // #63: fold が bridge cursor を巻き戻していること。 巻き戻さないと cursor が head を追い越し、 今は
+    // `wal_fold_safe` の修復 (#196、 平常時は 0 回) が拾うので batch2 も届いてしまう — 修復に頼ったかで見る
+    assert_eq!(
+        eng.sync_ops_cursor_repairs(),
+        0,
+        "fold が bridge cursor を巻き戻さず、 追い越しの修復に頼った (#63)"
+    );
 
     // 全 5 件が `_sync_ops` 経由で publish されること。
     let transport: Arc<dyn enchudb_engine::transport::Transport> =

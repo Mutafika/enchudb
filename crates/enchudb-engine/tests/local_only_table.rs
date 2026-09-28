@@ -11,8 +11,9 @@
 //! 跨いでそのまま効く。
 
 use enchudb_engine::{Engine, ValueType};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CAP: usize = 8 * 1024 * 1024;
 
@@ -48,18 +49,35 @@ fn make_db(path: &str) -> Arc<Engine> {
     eng
 }
 
+/// 条件が立つまで待つ (固定 sleep は遅い CI で取りこぼす、 #278 / #208)。
+fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !f() {
+        assert!(Instant::now() < deadline, "10 秒待っても成立しない: {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// 番兵の値 (bridge される user table の行に書く)。 呼ぶたびに違う値。
+static FENCE: AtomicU32 = AtomicU32::new(0x7E7E_0000);
+
 /// 1 cell 書いて WAL commit → bridge まで流す。
 ///
-/// bridge は consumer thread (≤100ms 周期) も回すので、 明示 transfer に加えて
-/// 1 tick 待ってから測る。
+/// 直後に user table へ番兵を書き、 番兵が `_sync_ops` に届くまで待つ。 bridge は
+/// WAL 順に読むので、 番兵が届いた = 先に書いた cell も bridge の判定を通過済み
+/// (local-only の 「載っていない」 を、 待ち時間ではなく番兵で確かめる)。
 fn write_and_bridge(eng: &Arc<Engine>, eid: u64, himo: &str, v: u32) {
     eng.tie_to(eid, himo, v);
+    let fence = FENCE.fetch_add(1, Ordering::Relaxed);
+    let fence_eid = eng.entity_in("notes").expect("番兵の entity");
+    eng.tie_to(fence_eid, "notes.n", fence);
     eng.flush_writes();
     eng.oplog_commit();
     eng.oplog_sync().expect("durable");
-    eng.transfer_oplog_to_sync_ops();
-    std::thread::sleep(Duration::from_millis(250));
-    eng.transfer_oplog_to_sync_ops();
+    wait_until("番兵が bridge される", || {
+        eng.transfer_oplog_to_sync_ops();
+        bridged(eng, fence)
+    });
 }
 
 /// bridge 済み payload (oplog record の wire bytes) に marker 値が u32 LE で載っているか。

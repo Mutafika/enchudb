@@ -61,6 +61,15 @@ fn declare_phase_does_not_scale_linearly_with_table_count() {
     let t = Instant::now();
     declare_n(&mut db, n);
     let declare_ms = t.elapsed().as_secs_f64() * 1000.0;
+    // #273: 壁時計の閾値 (旧: declare < 200 ms) は混んだ machine で偽 fail した。 coalesce そのものを見る:
+    // build の途中では `.schema` を書かず (table ごとの persist + fsync の線形をやめた、 修正前 ~687 ms /
+    // 修正後 ~10 ms)、 finish で 1 度だけ書く。 build の途中の `.schema` に最後の table はまだ無い
+    let sidecar = enchudb_engine::db_files::path_for(&path, enchudb_engine::db_files::SCHEMA);
+    let mid = std::fs::read_to_string(&sidecar).unwrap_or_default();
+    assert!(
+        !mid.contains(&format!("t{}", n - 1)),
+        "build の途中で .schema を書いている (= persist_schema が build で coalesce されていない)"
+    );
 
     let t = Instant::now();
     let _arc = db.finish_with_oplog(64 * 1024 * 1024).unwrap();
@@ -74,13 +83,9 @@ fn declare_phase_does_not_scale_linearly_with_table_count() {
         finish_ms
     );
 
-    // 修正前は ~687ms、 修正後は ~10ms。 余裕を持って 200ms を threshold に。
-    assert!(
-        declare_ms < 200.0,
-        "declare phase took {:.1}ms for {} tables — expected <200ms (= persist_schema が build で coalesce されてない疑い)",
-        declare_ms, n,
-    );
-
+    let last = format!("t{}", n - 1);
+    let after_finish = std::fs::read_to_string(&sidecar).unwrap_or_default();
+    assert!(after_finish.contains(&last), "finish の後の .schema に {last} が無い");
     cleanup(&path);
 }
 

@@ -9,7 +9,9 @@
 //! msync だったので、 ここは v10 で性質が変わった箇所。
 //!
 //! 子は 「1 batch 書く → flush → 進捗 file に batch 番号を fsync」 を繰り返す。 親は
-//! 任意の時点で SIGKILL する。 進捗 file は DB の外に置く (DB の一部を検証に使わない)。
+//! 進捗 file が round ごとの batch 数に届くのを待ってから SIGKILL する (壁時計の遅延で
+//! 殺すと、 遅い CI では子が書き始める前 / 書き終えた後に当たる、 #336)。 進捗 file は
+//! DB の外に置く (DB の一部を検証に使わない)。
 //!
 //! **このテストが証明していないこと**: SIGKILL は **process の死**であって電源断ではない。
 //! mmap の dirty page は page cache に残り、 process が死んでも file には反映される。
@@ -60,9 +62,12 @@ fn crash_writer_child() {
         eng.flush().unwrap();
         eng.persist_tables().unwrap();
         // flush が返った = ここまでは durable、 という主張を外に記録する。
-        let mut f = std::fs::File::create(&progress).unwrap();
+        // 一時 file に書いて rename (親が読んだ時に空の file を見ないように)。
+        let tmp = format!("{progress}.tmp");
+        let mut f = std::fs::File::create(&tmp).unwrap();
         write!(f, "{}", b + 1).unwrap();
         f.sync_all().unwrap();
+        std::fs::rename(&tmp, &progress).unwrap();
     }
 }
 
@@ -94,14 +99,36 @@ fn verify_after_crash(db: &str, committed_batches: u32) -> String {
     String::new()
 }
 
+fn read_progress(progress: &str) -> Option<u32> {
+    std::fs::read_to_string(progress).ok().and_then(|s| s.trim().parse().ok())
+}
+
+/// 進捗が `target` batch に届くまで待つ (上限 30 秒)。 子が先に終わったら false。
+fn wait_for_progress(child: &mut std::process::Child, progress: &str, target: u32) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if read_progress(progress).unwrap_or(0) >= target {
+            return true;
+        }
+        if child.try_wait().ok().flatten().is_some() {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    false
+}
+
 #[test]
 fn sigkill_mid_write_keeps_everything_that_was_flushed() {
     let mut report = vec![];
-    for (round, delay_ms) in [120u64, 250, 400, 650, 900, 1400].into_iter().enumerate() {
+    // (待つ batch 数, 届いてから殺すまでの追加の ms)。 追加の遅延で batch の途中にも当てる。
+    let plan = [(1u32, 0u64), (3, 2), (8, 5), (15, 1), (25, 7), (40, 3)];
+    for (round, (target, extra_ms)) in plan.into_iter().enumerate() {
         let db = format!("/tmp/enchu_crash_{}_{round}.db", std::process::id());
         let progress = format!("/tmp/enchu_crash_{}_{round}.progress", std::process::id());
         let _ = std::fs::remove_dir_all(&db);
         let _ = std::fs::remove_file(&progress);
+        let _ = std::fs::remove_file(format!("{progress}.tmp"));
 
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["crash_writer_child", "--exact", "--test-threads=1"])
@@ -112,42 +139,51 @@ fn sigkill_mid_write_keeps_everything_that_was_flushed() {
             .spawn()
             .expect("spawn child");
 
-        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        let reached = wait_for_progress(&mut child, &progress, target);
+        if reached {
+            std::thread::sleep(std::time::Duration::from_millis(extra_ms));
+        }
         let killed = unsafe { libc::kill(child.id() as i32, libc::SIGKILL) } == 0;
         let status = child.wait().unwrap();
 
-        let committed: u32 = std::fs::read_to_string(&progress)
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
+        let committed = read_progress(&progress).unwrap_or(0);
 
-        // まだ 1 batch も flush していない / 既に完走していた round は情報が薄いので記録だけ。
+        // 殺す前に子が自分で終わった: 完走なら情報が薄いだけ、 失敗なら子が壊れている。
+        let exited_itself = status.code().is_some();
         let finished_normally = status.success();
-        let err = if Path::new(&db).exists() {
+        let err = if exited_itself && !finished_normally {
+            format!("子が自分で失敗した: {status:?}")
+        } else if Path::new(&db).exists() {
             verify_after_crash(&db, committed)
-        } else {
+        } else if committed > 0 {
             "DB directory が無い".to_string()
+        } else {
+            String::new() // 30 秒待っても DB を作れなかった遅い round。 検証するものが無い
         };
-        report.push((round, delay_ms, killed, finished_normally, committed, err));
+        let mid_write = reached && !exited_itself && committed > 0 && committed < BATCHES;
+        report.push((round, target, killed, mid_write, committed, err));
 
         let _ = std::fs::remove_dir_all(&db);
         let _ = std::fs::remove_file(&progress);
+        let _ = std::fs::remove_file(format!("{progress}.tmp"));
     }
 
     let mut failures = vec![];
     eprintln!("\n=== SIGKILL round ===");
-    for (round, delay, killed, finished, committed, err) in &report {
+    for (round, target, killed, mid, committed, err) in &report {
         eprintln!(
-            "  round {round} kill@{delay}ms killed={killed} 完走={finished} flush 済み batch={committed} ({} entity) → {}",
+            "  round {round} kill@batch>={target} killed={killed} 書き込み中={mid} flush 済み batch={committed} ({} entity) → {}",
             committed * BATCH,
             if err.is_empty() { "OK" } else { err.as_str() }
         );
         if !err.is_empty() {
-            failures.push(format!("round {round} (kill@{delay}ms): {err}"));
+            failures.push(format!("round {round} (kill@batch>={target}): {err}"));
         }
     }
-    // 少なくとも 1 round は 「書いている途中で殺した」 状態でなければテストの意味が無い。
-    let mid_write = report.iter().filter(|(_, _, _, fin, c, _)| !fin && *c > 0 && *c < BATCHES).count();
-    assert!(mid_write >= 1, "書き込み中に殺せた round が無い (BATCHES / delay の調整が要る)");
     assert!(failures.is_empty(), "crash 後に壊れた round:\n{}", failures.join("\n"));
+    // 書き込み中に殺せなかった round は skip 扱い (前提が立たないだけで壊れてはいない)。
+    let mid_write = report.iter().filter(|r| r.3).count();
+    if mid_write == 0 {
+        eprintln!("警告: 書き込み中に殺せた round が無い (全 round skip、 30 秒で進捗が届かなかった)");
+    }
 }

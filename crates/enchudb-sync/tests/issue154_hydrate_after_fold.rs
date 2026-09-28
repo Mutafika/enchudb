@@ -20,7 +20,16 @@ use enchudb_engine::ValueType;
 use enchudb_oplog::Hlc;
 use enchudb_sync::Syncer;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// 条件が立つまで待つ (固定 sleep は遅い CI で取りこぼす、 #278 / #208)。
+fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !f() {
+        assert!(Instant::now() < deadline, "10 秒待っても成立しない: {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
 
 fn tmp_path(tag: &str) -> String {
     format!(
@@ -69,7 +78,8 @@ fn folded_record_hlc_survives_reopen_and_blocks_stale_rollback() {
     let ea = a.entity_in("notes").unwrap();
     a.tie_to(ea, "notes.note", 111);
     a.oplog_commit();
-    std::thread::sleep(Duration::from_millis(300));
+    // publish の source は `_sync_ops`。 consumer の bridge が載せるまで待つ
+    wait_until("A の record が `_sync_ops` に bridge される", || !a.pending_sync_ops(0).is_empty());
     let sa = Syncer::new(a.clone(), transport.clone());
     assert!(sa.publish_since(Hlc::ZERO) > 0, "A が publish できていない");
 
@@ -88,11 +98,13 @@ fn folded_record_hlc_survives_reopen_and_blocks_stale_rollback() {
 
         b.tie_to(eid_b.into(), "notes.note", 222);
         b.oplog_commit();
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(b.get(eid_b.into(), "notes.note"), Some(222));
+        wait_until("B のローカル更新 222 が入る", || b.get(eid_b.into(), "notes.note") == Some(222));
 
-        // bridge させて WAL fold を成立させる (ack はしない = relay 型の実機構成)
-        std::thread::sleep(Duration::from_millis(400));
+        // bridge させて WAL fold を成立させる (ack はしない = relay 型の実機構成)。
+        // consumer が実際に畳む (= WAL に commit 済み record が 0 件) まで待つ
+        wait_until("B の WAL が fold される", || {
+            b.wal_fold_safe() && b.oplog_arc().is_some_and(|w| w.iter_committed().is_empty())
+        });
         assert!(b.wal_fold_safe(), "bridge が追いついていない — テスト前提が壊れている");
         // drop で graceful shutdown → 最終 transfer + fold
     }
