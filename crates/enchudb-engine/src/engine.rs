@@ -1852,8 +1852,10 @@ impl LeafScale {
 pub struct GrowableOptions {
     /// DB 全体の entity (eid) 上限。 default 16 M。
     pub max_entities: u32,
-    /// DB 全体の himo (= table × column 通し) 上限。 default 4096。 header 焼き込みなので
-    /// 既存 DB は rebuild しないと変わらない。
+    /// DB 全体の himo (= table × column 通し) 上限。 default 256 (`DEFAULT_MAX_HIMOS`、 上げない理由は
+    /// そちらの doc — 列の領域が max_himos 倍になる)。 列が多い schema は create 時にここで上げる。
+    /// header 焼き込みなので既存 DB は rebuild しないと変わらない。 超えると `define_himo_in` が
+    /// `too many himos (max N)` の Err。
     pub max_himos: u32,
     /// vocab (Tag/Leaf 値) データ領域の予約 byte。 default 512 MiB (sparse、 未使用なら実消費 0)。
     pub vocab_data_size: usize,
