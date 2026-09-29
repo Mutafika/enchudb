@@ -3,6 +3,31 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.28.1 — 2026-09-29
+
+patch。 on-disk format・公開 API・wire は不変、 migration 不要。
+
+### Fixed — 途中で切れた delete の修復と local-only table の片付けが row lock を取っていなかった (#349)
+
+`repair_interrupted_deletes` / open 時の `finish_interrupted_deletes` (→ 本体を消す処理) と
+`clear_local_only_tables` は、 行の cell を 1 列ずつ消すのに row lock (#135) を取っていなかった。 他の cell の
+書き手は全部 row lock の中なので、 `read_row` / `get_many` (#206) で 1 行をそろって読む相手に、 消している途中の
+行 (片方の列だけ在る) が見えた。 #131 の 「握って読む間は cell が動かない」 前提も同じ理由で崩れていた。
+今は行を握って消す (delete から来た時は入れ子で素通り)。 test は読み手 7 本で 1.5 秒、 直す前は片方だけの組が
+clear で 14,485、 修復で 15,313〜28,275 (毎回落ちる)、 直した後は 0。
+
+### Tests — reclaim + reopen の後も LWW の記憶が残る (#160)
+
+#160 (揮発の `HlcStore` を配送バッファから作り直すので、 reclaim 済みの範囲の版数が reopen で消え、 ローカルの
+より新しい行が古い record で巻き戻る) は v9 (per-cell version column、 #173) で構造ごと直っていた。 issue の
+再現手順 (受けた行をローカルで書き換え → 配送バッファを reclaim → reopen → 新品の transport で古い record) を
+そのまま test にした (`version_of` が揮発の store を引く変異で落ちる)。 削除の復活の方は #140 の test。
+
+### Docs — `GrowableOptions::max_himos` の default は 256 (#118)
+
+field の doc が 「default 4096」 のままだった (実際は 256、 上げない理由は `DEFAULT_MAX_HIMOS` の doc — 列の領域が
+max_himos 倍になる)。 列の多い schema は create 時に `GrowableOptions { max_himos, .. }` で上げる。
+
 ## 0.28.0 — 2026-09-29
 
 **oplog の record を v3 にした minor** (#58)。 あわせて、 WAL が満杯で載らなかった write が相手に届かない穴 (#57) と、
