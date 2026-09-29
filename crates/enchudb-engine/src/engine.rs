@@ -7359,6 +7359,8 @@ impl Engine {
                 continue;
             }
             // 版数を進めずに落とす — local-only なので LWW の相手が居ない。
+            // 行を握って消す (#349、 `read_row` に消している途中の行を見せない)。
+            let _row = self.row_locks.write(local);
             for hid in 0..self.himos.len() {
                 self.remove_cell_freeing_leaf(local, hid);
             }
@@ -8614,7 +8616,11 @@ impl Engine {
     ///
     /// 版数 column は**触らない** — 「この cell が最後に書かれた版」 は削除後も
     /// LWW 判定に要る (古い tie の復活を弾くのは版数の役目)。
+    ///
+    /// 行を握って消す (#349): 他の cell の書き手と同じく、 `read_row` に消している途中の行を見せない。
+    /// `apply_delete_local` から来た時は入れ子で素通り。
     fn remove_entity_body(&self, local: u32, hlc: enchudb_oplog::Hlc) {
+        let _row = self.row_locks.write(local);
         let mut survivor = false;
         for hid in 0..self.himos.len() {
             if self.himos[hid].get_value(local).is_none() {
