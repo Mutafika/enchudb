@@ -1702,10 +1702,12 @@ impl Backing {
     }
 
     /// himo 列 segment を用意する (define_himo)。 Memory は packed に全 slot がある。
+    /// 予約は reservation 分 (`segment_reserve`) — open と揃える。 cap 分で作ると
+    /// `grow_entity_cap` の後も列が伸びない (#355)。
     fn ensure_himo(&self, hid: u32, layout: &Layout) -> io::Result<()> {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
-            Backing::Segments(set) => set.ensure_himo(hid, layout.segment_size(SegmentKind::Himo(hid))),
+            Backing::Segments(set) => set.ensure_himo(hid, layout.segment_reserve(SegmentKind::Himo(hid))),
             Backing::Memory(_) => {
                 let _ = layout;
                 Ok(())
@@ -1716,7 +1718,7 @@ impl Backing {
     fn ensure_ver(&self, hid: u32, layout: &Layout) -> io::Result<()> {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
-            Backing::Segments(set) => set.ensure_ver(hid, layout.ver_col_size),
+            Backing::Segments(set) => set.ensure_ver(hid, layout.segment_reserve(SegmentKind::Ver(hid))),
             Backing::Memory(_) => {
                 let _ = layout;
                 Ok(())
@@ -1727,7 +1729,7 @@ impl Backing {
     fn ensure_tomb(&self, layout: &Layout) -> io::Result<()> {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
-            Backing::Segments(set) => set.ensure_tomb(layout.tomb_size),
+            Backing::Segments(set) => set.ensure_tomb(layout.segment_reserve(SegmentKind::Tomb)),
             Backing::Memory(_) => {
                 let _ = layout;
                 Ok(())
