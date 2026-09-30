@@ -3,6 +3,27 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.28.2 — 2026-09-30
+
+patch。 on-disk format・公開 API・wire は不変、 migration 不要。
+
+### Fixed — `grow_entity_cap` の後も列が伸びず、 書き込みが `WriteRejected(DiskSpace)` で断られる (#355)
+
+create / 列の定義で作る himo 列・版数列・tombstone 列の segment を、 reservation 分でなく **作成時の cap 分**で
+予約していた (予約は 64 KB 切り上げなので、 cap 4,096 の Tag 列は 16,379 行目で頭打ち)。 `grow_entity_cap` は
+header と entity の bitset しか伸ばさないので、 cap を広げても列が予約の端で止まり、 `needed exceeds reservation`
+が空き不足 (`FaultKind::DiskSpace`) として返っていた (ディスクの空きとは無関係、 tmpfs でも起きる)。 open は元から
+reservation 分で開くので、 **同じ process で作った列だけ**の問題 — 0.28.1 以前でも grow の後に開き直せば書ける。
+今は create / define も open と同じ reservation 分で予約する。 仮想予約は reopen 後の今の状態と同じで、 iOS /
+Windows (reservation = cap) は挙動不変。
+
+検証: 倍々に grow しながら 4 万行、 先に 100 万まで grow + sync (版数・tombstone 列) + delete + reopen で全行
+読める。 直す前は 16,379 行目 / 6,463 行目で `WriteRejected(DiskSpace)`。
+
+既知の残ギャップ: Tag の辞書の上限 (`vocab_max_entries`、 既定 = 作成時の cap × 16) は header 焼き込みで grow に
+追従しない。 小さく作って grow で伸ばす DB は、 一意な Tag 値が多いと `VocabSpace` で止まる
+(`GrowableOptions { vocab_max_entries, .. }` で create 時に上げる)。
+
 ## 0.28.1 — 2026-09-29
 
 patch。 on-disk format・公開 API・wire は不変、 migration 不要。
