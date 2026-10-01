@@ -5,9 +5,9 @@
 //! 呼び出し側 = `HimoStore` が per-himo `write_lock` で直列化して契約を満たす。
 //!
 //! ## 構造
-//! - **dense**（value < `DENSE_CAP`、 または `MID` ± `DENSE_CAP / 2`）: `Atomic<Vec<Arc<AppendBucket>>>`。 外側 Vec を
+//! - **dense**（value < `DENSE_CAP`、 または `MID` ± `DENSE_CAP / 2`）: `Atomic<Vec<Slot>>`。 外側 Vec を
 //!   epoch-swap で成長させ、 `AppendBucket` 本体は `Arc` で stable（成長で動かない）。
-//!   read は完全 lock-free。 残り 2 本の配列は `MID` = 2^63 の上 (`dense_pos`、 `MID + i`) と下 (`dense_neg`、
+//!   read は完全 lock-free。 要素 ([`Slot`]) は、 その値が 1 件でも入るまで空 (bucket を作らない、 #358)。 残り 2 本の配列は `MID` = 2^63 の上 (`dense_pos`、 `MID + i`) と下 (`dense_neg`、
 //!   `MID - 1 - i`) を受け持つ — schema / SQL の符号付き 64 bit の列は大小の順を保つ `v ^ 2^63` で置くので、
 //!   0 に近い符号付きの値 (年齢・件数・負の小さな数) は全部ここに来る。 0 以上だけの列は `dense_pos` だけを
 //!   u32 の列の `dense` と同じ大きさで使う
@@ -27,7 +27,7 @@
 use crate::append_bucket::AppendBucket;
 use crate::sparse_runs::SparseRuns;
 use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 pub const DENSE_CAP: u32 = 1 << 20;
@@ -75,7 +75,71 @@ pub fn is_dense(value: u64) -> bool {
 /// これを超える分は `insert` の成長経路 (doubling) が必要になった時だけ確保する。
 const PREALLOC_CAP: usize = 64;
 
-type DenseArr = Vec<Arc<AppendBucket>>;
+/// dense の 1 要素: その値の bucket を指すか、 **空** (その値がまだ 1 件も入っていない)。
+///
+/// #358: 昔は全要素が `Arc<AppendBucket>` で、 配列を伸ばすたびに間の全要素へ空の bucket を作っていた
+/// (1 要素あたり `Arc` と `Buf` の確保で約 90 B)。 Tag の値は DB で 1 つの辞書の ID なので、 配列は
+/// 「その列にある値の数」 でなく 「辞書 ID の範囲」 まで伸びる — 表の多い DB では、 他の表が進めた辞書 ID の分
+/// まで全部の列が空の bucket を抱えた。 今は空の要素は null の pointer 1 つ (8 B) だけ。
+///
+/// - 指す先は **空 → bucket の 1 回だけ**変わる (置くのは書き手、 [`Slot::get_or_create`])。 1 度置いたら
+///   その `Slot` が drop するまで同じ bucket を指す
+/// - 配列を伸ばす時の写し ([`Clone`]) は同じ bucket を指す (`Arc` の参照を 1 つ増やす)。 bucket は配列が
+///   代わっても動かない
+/// - 古い配列を掴んだ読み手は、 その後に置かれた bucket を見ない (空と読む) — 配列を伸ばす前の値の読みと同じで、
+///   読みが書き込みより前に並ぶだけ
+struct Slot(AtomicPtr<AppendBucket>);
+
+impl Slot {
+    #[inline]
+    fn empty() -> Self {
+        Slot(AtomicPtr::new(std::ptr::null_mut()))
+    }
+
+    /// bucket (空なら `None`)。 読み手・書き手のどちらからでも。
+    #[inline]
+    fn get(&self) -> Option<&AppendBucket> {
+        let p = self.0.load(Ordering::Acquire);
+        // SAFETY: 非 null なら `Arc::into_raw` で置いた pointer で、 この Slot が参照を 1 つ持っている。
+        // 1 度置いたら変わらないので、 Slot が生きている間 (`&self` の間) は有効。
+        unsafe { p.as_ref() }
+    }
+
+    /// bucket (空なら作って置く)。 **書き手だけ** — `HimoStore` の write_lock の下で同時に 1 本。
+    #[inline]
+    fn get_or_create(&self) -> &AppendBucket {
+        if let Some(b) = self.get() {
+            return b;
+        }
+        let p = Arc::into_raw(Arc::new(AppendBucket::new())) as *mut AppendBucket;
+        self.0.store(p, Ordering::Release);
+        // SAFETY: 今置いた pointer (参照はこの Slot が持つ)。
+        unsafe { &*p }
+    }
+}
+
+impl Clone for Slot {
+    fn clone(&self) -> Self {
+        let p = self.0.load(Ordering::Acquire);
+        if !p.is_null() {
+            // SAFETY: `Arc::into_raw` 由来で、 `self` が参照を持っている間は生きている。 写しの分を 1 つ足す。
+            unsafe { Arc::increment_strong_count(p as *const AppendBucket) };
+        }
+        Slot(AtomicPtr::new(p))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let p = *self.0.get_mut();
+        if !p.is_null() {
+            // SAFETY: この Slot が持っていた参照を 1 つ返す。
+            unsafe { drop(Arc::from_raw(p as *const AppendBucket)) };
+        }
+    }
+}
+
+type DenseArr = Vec<Slot>;
 
 static DENSE_GROWS: AtomicUsize = AtomicUsize::new(0);
 
@@ -134,7 +198,8 @@ impl LockFreeCylinder {
         } else {
             ((max_values as usize + 1).min(PREALLOC_CAP)) as u32
         };
-        let init: DenseArr = (0..hint).map(|_| Arc::new(AppendBucket::new())).collect();
+        // 確保するのは要素 (空の Slot) だけ。 bucket は値が入った時に作る (#358)
+        let init: DenseArr = (0..hint).map(|_| Slot::empty()).collect();
         Self {
             dense: Atomic::new(init),
             dense_pos: Atomic::new(Vec::new()),
@@ -180,8 +245,7 @@ impl LockFreeCylinder {
             let arr = self.arr(k).load(Ordering::Acquire, &guard);
             // SAFETY: dense は常に非 null。
             let vec = unsafe { arr.deref() };
-            if i < vec.len() {
-                let b = &vec[i];
+            if let Some(b) = vec.get(i).and_then(Slot::get) {
                 b.note_stale().map(|prev| (b.len(), prev - 1))
             } else {
                 debug_assert!(false, "note_stale: 未確保 bucket (value={value})");
@@ -221,8 +285,7 @@ impl LockFreeCylinder {
             let arr = self.arr(k).load(Ordering::Acquire, &guard);
             // SAFETY: dense は常に非 null。
             let vec = unsafe { arr.deref() };
-            if i < vec.len() {
-                let b = &vec[i];
+            if let Some(b) = vec.get(i).and_then(Slot::get) {
                 let before = b.len();
                 let kept = b.compact_in(&guard, keep);
                 self.discount_compacted(before - kept);
@@ -274,8 +337,11 @@ impl LockFreeCylinder {
             let vec = unsafe { arr.deref() };
             if !vec.is_empty() {
                 let end = hi.min(vec.len() as u64 - 1);
-                for v in lo..=end {
-                    vec[v as usize].with_read(&guard, |s| out.extend_from_slice(s));
+                // lo が配列の外 (lo > end) なら何も無い。 空の要素は飛ばす
+                if lo <= end {
+                    for b in vec[lo as usize..=end as usize].iter().filter_map(Slot::get) {
+                        b.with_read(&guard, |s| out.extend_from_slice(s));
+                    }
                 }
             }
         }
@@ -293,8 +359,9 @@ impl LockFreeCylinder {
             // SAFETY: dense は常に非 null。
             let vec = unsafe { arr.deref() };
             if (i0 as usize) < vec.len() {
-                for i in i0..=i1.min(vec.len() as u64 - 1) {
-                    vec[i as usize].with_read(&guard, |s| out.extend_from_slice(s));
+                // 添字の順 = 今までと同じ順 (下の配列は値の降順) で、 空の要素は飛ばす
+                for b in vec[i0 as usize..=i1.min(vec.len() as u64 - 1) as usize].iter().filter_map(Slot::get) {
+                    b.with_read(&guard, |s| out.extend_from_slice(s));
                 }
             }
         }
@@ -332,17 +399,20 @@ impl LockFreeCylinder {
             // SAFETY: dense は常に非 null。
             let vec = unsafe { arr.deref() };
             if i < vec.len() {
-                let b = &vec[i];
+                // 空の要素なら、 ここで初めて bucket を作る (#358)
+                let b = vec[i].get_or_create();
                 let prev_len = b.push_in(eid, &guard);
                 let prev_live = b.live_inc();
                 self.bump_stats(prev_len == 0, prev_live == 0);
             } else {
-                // 成長: doubling で amortize、 既存 Arc は clone（refcount）、 新規は空 bucket
+                // 成長: doubling で amortize、 既存の bucket は写しが同じものを指す (refcount)。 足した要素は
+                // 空のまま — bucket を作るのは値が入る要素だけ (#358)
                 let mut nv: DenseArr = vec.clone();
                 let new_len = (i + 1).max(vec.len() * 2).min(DENSE_CAP as usize);
-                nv.resize_with(new_len, || Arc::new(AppendBucket::new()));
-                nv[i].push_in(eid, &guard);
-                nv[i].live_inc();
+                nv.resize_with(new_len, Slot::empty);
+                let b = nv[i].get_or_create();
+                b.push_in(eid, &guard);
+                b.live_inc();
                 self.bump_stats(true, true); // 新 bucket は必ず空だった
                 DENSE_GROWS.fetch_add(1, Ordering::Relaxed);
                 dense.store(Owned::new(nv), Ordering::Release);
@@ -386,10 +456,9 @@ impl LockFreeCylinder {
         let (k, i) = dense_slot(value)?;
         let arr = self.arr(k).load(Ordering::Acquire, guard);
         let vec = unsafe { arr.deref() };
-        if i < vec.len() {
-            Some(vec[i].with_read(guard, f))
-        } else {
-            Some(f(&[]))
+        match vec.get(i).and_then(Slot::get) {
+            Some(b) => Some(b.with_read(guard, f)),
+            None => Some(f(&[])),
         }
     }
 
@@ -409,10 +478,9 @@ impl LockFreeCylinder {
             let arr = self.arr(k).load(Ordering::Acquire, &guard);
             // SAFETY: dense は常に非 null。
             let vec = unsafe { arr.deref() };
-            if i < vec.len() {
-                vec[i].read_snapshot_verify(&guard)
-            } else {
-                (Vec::new(), false)
+            match vec.get(i).and_then(Slot::get) {
+                Some(b) => b.read_snapshot_verify(&guard),
+                None => (Vec::new(), false),
             }
         } else {
             // run ごとに eid 順なので並べ直す (dense の bucket と同じく eid の昇順で返す)
@@ -431,11 +499,7 @@ impl LockFreeCylinder {
             let guard = epoch::pin();
             let arr = self.arr(k).load(Ordering::Acquire, &guard);
             let vec = unsafe { arr.deref() };
-            if i < vec.len() {
-                vec[i].len()
-            } else {
-                0
-            }
+            vec.get(i).and_then(Slot::get).map_or(0, AppendBucket::len)
         } else {
             self.sparse.lookup(value).len()
         }
@@ -474,11 +538,7 @@ impl LockFreeCylinder {
             let guard = epoch::pin();
             let arr = self.arr(k).load(Ordering::Acquire, &guard);
             let vec = unsafe { arr.deref() };
-            if i < vec.len() {
-                vec[i].live() as usize
-            } else {
-                0
-            }
+            vec.get(i).and_then(Slot::get).map_or(0, |b| b.live() as usize)
         } else {
             // 古い entry 込みの上限 (正確な件数は HimoStore が Column と突き合わせる)
             self.sparse.lookup(value).len()
@@ -493,7 +553,7 @@ impl LockFreeCylinder {
             let arr = self.arr(k).load(Ordering::Acquire, &guard);
             // SAFETY: dense は常に非 null。
             let vec = unsafe { arr.deref() };
-            i < vec.len() && vec[i].needs_verify()
+            vec.get(i).and_then(Slot::get).is_some_and(AppendBucket::needs_verify)
         } else {
             self.sparse_churned()
         }
@@ -508,7 +568,7 @@ impl LockFreeCylinder {
         for k in [LOW, POS, NEG] {
             let arr = self.arr(k).load(Ordering::Acquire, &guard);
             let vec = unsafe { arr.deref() };
-            slots += vec.iter().map(|b| b.capacity()).sum::<usize>();
+            slots += vec.iter().filter_map(Slot::get).map(|b| b.capacity()).sum::<usize>();
         }
         slots * std::mem::size_of::<u32>() + self.sparse.backing_bytes()
     }
@@ -521,12 +581,14 @@ impl LockFreeCylinder {
         let mut out: Vec<u64> = vec
             .iter()
             .enumerate()
-            .filter_map(|(v, b)| if b.is_empty() { None } else { Some(v as u64) })
+            .filter_map(|(v, s)| s.get().filter(|b| !b.is_empty()).map(|_| v as u64))
             .collect();
         for k in [POS, NEG] {
             let arr = self.arr(k).load(Ordering::Acquire, &guard);
             let vec = unsafe { arr.deref() };
-            out.extend(vec.iter().enumerate().filter(|(_, b)| !b.is_empty()).map(|(i, _)| slot_value(k, i)));
+            out.extend(
+                vec.iter().enumerate().filter(|(_, s)| s.get().is_some_and(|b| !b.is_empty())).map(|(i, _)| slot_value(k, i)),
+            );
         }
         out.extend(self.sparse.values());
         out
@@ -583,6 +645,134 @@ mod tests {
             assert_eq!(c.read_to_vec(999_999), vec![4]);
             assert_eq!(c.unique_count(), 4);
         }
+    }
+
+    /// #358: 配列を伸ばしても、 間の要素に bucket は作らない。 空の要素は、 どの読みでも 「何も無い」。
+    /// (名前が `dense` で始まる test は CI の Miri でも回る — `Slot` の unsafe を見る)
+    #[test]
+    fn dense_grown_slots_stay_empty_until_first_insert() {
+        let c = LockFreeCylinder::new(0);
+        c.insert(1, 5);
+        c.insert(2, 500);
+        {
+            let guard = epoch::pin();
+            let arr = c.dense.load(Ordering::Acquire, &guard);
+            let vec = unsafe { arr.deref() };
+            assert!(vec.len() > 500);
+            assert_eq!(vec.iter().filter(|s| s.get().is_some()).count(), 2, "bucket を持つのは値の入った要素だけ");
+        }
+        // 空の要素 (値 100) への読み
+        assert_eq!(c.read_to_vec(100), Vec::<u32>::new());
+        assert_eq!(c.read_to_vec_verify(100), (Vec::new(), false));
+        assert_eq!(c.slice_len(100), 0);
+        assert_eq!(c.slice_len_live(100), 0);
+        assert!(!c.bucket_needs_verify(100));
+        assert_eq!(c.compact_bucket(100, |_| true), 0);
+        {
+            let guard = epoch::pin();
+            assert_eq!(c.with_dense_read(&guard, 100, |s| s.len()), Some(0));
+        }
+        // 空の要素をまたぐ読み
+        assert_eq!(c.range_raw(0, 600), vec![1, 2]);
+        assert_eq!(c.range_raw(6, 499), Vec::<u32>::new());
+        let mut values = c.unique_values();
+        values.sort_unstable();
+        assert_eq!(values, vec![5, 500]);
+        assert_eq!((c.unique_count(), c.unique_live(), c.total()), (2, 2, 2));
+        assert_eq!(c.backing_bytes(), 2 * 4 * std::mem::size_of::<u32>(), "eid の置き場は bucket 2 つ分だけ");
+
+        // 空だった要素に後から入れる (配列は伸びない)
+        c.insert(3, 100);
+        c.insert(4, 100);
+        assert_eq!(c.read_to_vec(100), vec![3, 4]);
+        assert_eq!(c.slice_len_live(100), 2);
+        assert_eq!(c.range_raw(0, 600), vec![1, 3, 4, 2]);
+        assert_eq!((c.unique_count(), c.unique_live(), c.total()), (3, 3, 4));
+        let guard = epoch::pin();
+        let vec = unsafe { c.dense.load(Ordering::Acquire, &guard).deref() };
+        assert_eq!(vec.iter().filter(|s| s.get().is_some()).count(), 3);
+    }
+
+    /// 事前確保 (`new(max_values)`) も要素だけで、 bucket は作らない。
+    #[test]
+    fn dense_prealloc_makes_no_buckets() {
+        let c = LockFreeCylinder::new(1000);
+        let guard = epoch::pin();
+        let vec = unsafe { c.dense.load(Ordering::Acquire, &guard).deref() };
+        assert_eq!(vec.len(), PREALLOC_CAP);
+        assert_eq!(vec.iter().filter(|s| s.get().is_some()).count(), 0);
+        drop(guard);
+        c.insert(1, 3);
+        assert_eq!(c.read_to_vec(3), vec![1]);
+        assert_eq!(c.read_to_vec(4), Vec::<u32>::new());
+    }
+
+    /// 掃除で空になった bucket (要素は bucket を持ったまま) の値は `unique_values` に出ない。 3 本の配列とも。
+    #[test]
+    fn dense_unique_values_skips_emptied_buckets() {
+        let c = LockFreeCylinder::new(0);
+        for (eid, v) in [(1u32, 7u64), (2, 9), (3, MID + 3), (4, MID + 5), (5, MID - 4), (6, MID - 6)] {
+            c.insert(eid, v);
+        }
+        // 7 / MID + 3 / MID - 4 の entity が別の値へ移った: 古い entry にして掃除で落とす
+        for v in [7, MID + 3, MID - 4] {
+            c.note_stale(v);
+            assert_eq!(c.compact_bucket(v, |_| false), 0);
+        }
+        let mut values = c.unique_values();
+        values.sort_unstable();
+        assert_eq!(values, vec![9, MID - 6, MID + 5]);
+        assert_eq!(c.unique_live(), 3);
+    }
+
+    /// 範囲の下端が配列の外でも落ちない (空の要素を飛ばす読みは配列を slice で切るので、 外の下端は先に弾く)。
+    #[test]
+    fn dense_range_beyond_array_is_empty() {
+        let c = LockFreeCylinder::new(0);
+        c.insert(1, 5); // 配列は 6 要素
+        assert_eq!(c.range_raw(6, 9), Vec::<u32>::new());
+        assert_eq!(c.range_raw(7, 9), Vec::<u32>::new());
+        assert_eq!(c.range_raw(100, 200), Vec::<u32>::new());
+        assert_eq!(c.range_raw(5, 200), vec![1]);
+        // MID の上下の配列も同じ
+        c.insert(2, MID + 3);
+        c.insert(3, MID - 4);
+        assert_eq!(c.range_raw(MID + 10, MID + 20), Vec::<u32>::new());
+        assert_eq!(c.range_raw(MID - 20, MID - 10), Vec::<u32>::new());
+        assert_eq!(c.range_raw(MID - 20, MID + 20), vec![2, 3]);
+    }
+
+    /// `Slot`: 写しは同じ bucket を指して参照を 1 つ足し、 drop で返す (足さなければ解放済みを読み、
+    /// 返さなければ bucket が残り続ける)。
+    #[test]
+    fn dense_slot_clone_shares_bucket_and_drop_releases() {
+        /// bucket の参照の数 (数えるための 1 つは除く)。
+        fn refs(p: *const AppendBucket) -> usize {
+            // SAFETY: 呼ぶ側が、 p を指す Slot を 1 つ以上持っている間に呼ぶ。
+            unsafe {
+                Arc::increment_strong_count(p);
+                let a = Arc::from_raw(p);
+                Arc::strong_count(&a) - 1
+            }
+        }
+        let s = Slot::empty();
+        assert!(s.get().is_none());
+        let early = s.clone();
+        assert!(early.get().is_none(), "空の写しは空");
+
+        let p = s.get_or_create() as *const AppendBucket;
+        assert_eq!(s.get_or_create() as *const AppendBucket, p, "2 度目は同じ bucket");
+        assert!(early.get().is_none(), "写した後に置いた bucket は、 先に取った写しからは見えない");
+        assert_eq!(refs(p), 1);
+
+        let c1 = s.clone();
+        let c2 = c1.clone();
+        assert_eq!(c1.get().unwrap() as *const AppendBucket, p);
+        assert_eq!(refs(p), 3);
+        drop(c1);
+        drop(s);
+        assert_eq!(refs(p), 1, "残りは c2 の 1 つ");
+        assert!(c2.get().unwrap().is_empty());
     }
 
     #[test]
