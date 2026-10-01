@@ -39,6 +39,15 @@ pub enum EntityValue<'a> {
     Content(&'a [u8]),
 }
 
+/// `get_entity_owned` の戻り値。 [`EntityValue`] の text を copy して持つ版 (#107)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum EntityValueOwned {
+    Num(u32),
+    /// 64 bit 列 (`ValueType::Number64`) の値。
+    Num64(u64),
+    Text(Vec<u8>),
+}
+
 /// table の eid 枠の使用状況。 `Engine::table_eid_usage` の戻り値。
 ///
 /// 枠 (`capacity`) は create 時に固定で、 後から伸ばせない。 溢れると
@@ -8891,11 +8900,53 @@ impl Engine {
 
     /// v6 (#88): text 型 himo の cell 生値 (raw) を payload に解決。 routed-Leaf は
     /// LeafStore offset として、 それ以外 (Tag / reserved Leaf) は vocab vid として読む。
+    ///
+    /// 借用を返す 3 つの API ([`Engine::get_text`] / [`Engine::get_content`] / [`Engine::get_entity`]) の
+    /// 共通の出口。 routed-Leaf の借用は debug build で `debug_check_leaf_borrow` を通す (#107)。
     #[inline]
     fn text_value(&self, hid: usize, raw: u32) -> &[u8] {
         match self.leaf_for(hid) {
-            Some(leaf) => leaf.get(raw),
+            Some(leaf) => {
+                #[cfg(debug_assertions)]
+                self.debug_check_leaf_borrow(leaf, hid);
+                leaf.get(raw)
+            }
             None => self.vocab.get(raw),
+        }
+    }
+
+    /// #107: Leaf を**借用で**読んでよい状況かを debug build で確かめる (release build には無い)。
+    ///
+    /// 借用は live mmap を指す。 返した後に書き手が同じ slot を返す / 置き直すと、 手元の `&[u8]` の中身が
+    /// 変わる (#106 の torn read、 壊れた長さでの範囲外 panic)。 copy しないので seqlock では守れず、
+    /// 「copy 版を呼ぶ」 という約束が engine の外に残る。 その約束が破れうる状況を止める:
+    ///
+    /// - **`open_readonly`**: 別 process の書き手と共存するための開き方。 書き手が居るかは見えないので常に止める
+    ///   (書き手の居ない file を読むだけなら `open_standalone`)
+    /// - **別の thread が Leaf を書いている engine**: 借用の読みが始まった後に、 その読み手でない thread が
+    ///   Leaf を置いた / 返した (`leaf_store::BorrowWatch`)。 並行の書き手、 async の書き込みを適用する
+    ///   consumer thread、 sync の apply がこれに当たる
+    ///
+    /// 止めないもの: 1 本の thread で書いて読む、 書き終えてから複数の thread で読むだけ、 Tag / 内部 table の
+    /// Leaf (追記だけの共有辞書で、 借用の指す先は動かない)。
+    #[cfg(debug_assertions)]
+    fn debug_check_leaf_borrow(&self, leaf: &LeafStore, hid: usize) {
+        let himo = self.himo_names.get(hid).map(String::as_str).unwrap_or("?");
+        if self.is_readonly() {
+            panic!(
+                "#107: borrowed read of Leaf himo '{himo}' on a read-only Engine. open_readonly coexists with a \
+                 writer in another process, and a borrowed &[u8] points into the live mmap that writer may \
+                 rewrite. Use get_text_owned / get_content_owned / get_entity_owned (or open_standalone when \
+                 no writer exists)."
+            );
+        }
+        if !leaf.debug_note_borrow() {
+            panic!(
+                "#107: borrowed read of Leaf himo '{himo}' while another thread writes Leaf values of this \
+                 Engine. A borrowed &[u8] points into the live mmap and that writer may rewrite or reuse the \
+                 slot under it (torn bytes / out-of-bounds). Use get_text_owned / get_content_owned / \
+                 get_entity_owned."
+            );
         }
     }
 
@@ -10080,6 +10131,8 @@ impl Engine {
         self.tie_bytes_to_by_id(eid, hid, data);
     }
 
+    /// content を**借用で**読む。 書き手が同時に動かない時だけ使える — 他の thread / 他の process が
+    /// 書いているなら [`Engine::get_content_owned`] (#107、 debug build は [`Engine::get_text`] と同じ条件で止める)。
     pub fn get_content(&self, eid: enchudb_oplog::EntityId, key: &str) -> Option<&[u8]> {
         let local = enchudb_oplog::eid_local(eid);
         // 新経路 (`_c_{key}` Leaf himo) 優先
@@ -10183,6 +10236,18 @@ impl Engine {
 
     // ──── get ────
 
+    /// text を**借用で**読む (copy しない)。 **書き手が同時に動かない時だけ使える。**
+    ///
+    /// 返る `&[u8]` は live mmap を指す。 Leaf の列では、 返した後に書き手が同じ値を張り直す / 外すと
+    /// 中身が変わる (壊れた中身、 壊れた長さでの範囲外 panic — #106)。 借用である以上 engine からは守れない。
+    ///
+    /// - 他の thread が書いている (並行の書き手 / `tie_text_async` / sync の apply)、 または `open_readonly`
+    ///   で開いている (別 process の書き手と共存) → [`Engine::get_text_owned`]
+    /// - 1 本の thread で書いて読む / 書き終えてから読むだけ / Tag の列 → この関数でよい
+    ///
+    /// debug build は、 上の使えない状況で Leaf を読むと panic する (#107: `open_readonly`、 または
+    /// 借用の読みが始まった後に別の thread が Leaf を書いた engine)。 release build は何もしない。
+    /// 同じ借用を返す [`Engine::get_content`] / [`Engine::get_entity`] も同じ扱い。
     pub fn get_text(&self, eid: enchudb_oplog::EntityId, himo: &str) -> Option<&[u8]> {
         let eid = enchudb_oplog::eid_local(eid);
         let hid = self.himo_id(himo)?;
@@ -11760,6 +11825,9 @@ impl Engine {
             .collect()
     }
     /// 1 entity の全フィールドを一括取得。HashMap ルックアップ 0 回。
+    ///
+    /// text は**借用**で返る。 書き手が同時に動かない時だけ使える — 他の thread / 他の process が
+    /// 書いているなら [`Engine::get_entity_owned`] (#107、 debug build は [`Engine::get_text`] と同じ条件で止める)。
     pub fn get_entity(&self, eid: enchudb_oplog::EntityId) -> Vec<(&str, EntityValue<'_>)> {
         let eid = enchudb_oplog::eid_local(eid);
         let mut fields = Vec::with_capacity(self.himos.len());
@@ -11770,6 +11838,30 @@ impl Engine {
                     ValueType::Tag | ValueType::Leaf => EntityValue::Text(self.text_value(i, raw as u32)),
                     ValueType::Number64 => EntityValue::Num64(raw),
                     _ => EntityValue::Num(raw as u32),
+                };
+                fields.push((self.himo_names[i].as_str(), val));
+            }
+        }
+        fields
+    }
+
+    /// [`Engine::get_entity`] の copy 版 (#107)。 text を [`Engine::get_text_owned`] と同じ読み方で copy
+    /// するので、 書き手が同時に動いていても壊れた中身を掴まない (`open_readonly` の表示用 process など)。
+    ///
+    /// 列ごとに読むので、 列をまたいだ 1 つの版ではない (揃った組が要るなら [`Engine::read_row`] の中で)。
+    /// 読んでいる間に外れた列は入らない。
+    pub fn get_entity_owned(&self, eid: enchudb_oplog::EntityId) -> Vec<(&str, EntityValueOwned)> {
+        let eid = enchudb_oplog::eid_local(eid);
+        let mut fields = Vec::with_capacity(self.himos.len());
+        for (i, hs) in self.himos.iter().enumerate() {
+            if let Some(raw) = hs.get_value(eid) {
+                let val = match self.value_types[i] {
+                    ValueType::Tag | ValueType::Leaf => match self.text_owned_by_id(i, eid) {
+                        Some(bytes) => EntityValueOwned::Text(bytes),
+                        None => continue,
+                    },
+                    ValueType::Number64 => EntityValueOwned::Num64(raw),
+                    _ => EntityValueOwned::Num(raw as u32),
                 };
                 fields.push((self.himo_names[i].as_str(), val));
             }
