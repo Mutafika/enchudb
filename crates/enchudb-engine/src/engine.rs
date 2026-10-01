@@ -57,6 +57,8 @@ pub enum EntityValueOwned {
 /// 残りは [`Engine::grow_entity_cap`] を呼ばない限り減るだけなので、 0 を見た後は枠が伸びない (逆の順だと、
 /// 2 つの読みの間に枠が足されて満杯に見える)。
 ///
+/// 例外は `_sync_ops` (sync の未配送 record の ring): 自動では枠を足さないので、 `free == 0` が満杯 (#368)。
+///
 /// 満杯になると **アプリの掃引がそこで止まる** — 掃引が止まると削除も流れなくなり、 削除は枠を空ける手段なので
 /// 抜け出しにくい (他の手段は [`Engine::grow_entity_cap`])。 その手前で気付けるように、 残量を問い合わせられる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2836,6 +2838,12 @@ impl TableDef {
 #[inline]
 pub fn is_reserved_table_name(name: &str) -> bool {
     name.starts_with('_')
+}
+
+/// sync の未配送 record を置く ring の table か。 この table だけ、 枠を自動では足さない (#368)。
+#[inline]
+fn is_sync_ring_table(name: &str) -> bool {
+    name == "_sync_ops"
 }
 
 /// request19: engine 自身が持つ内部 table か (= `clear_local_only_tables` の対象外)。
@@ -6921,6 +6929,15 @@ impl Engine {
                         // 払出した分を rollback (= overflow 状態を維持しないため厳密には
                         // 必要だが、 単調 monotone な next_local なので少々超過しても
                         // 次回以降の check で確実に弾ける。 ここは error を返すのみ)。
+                        if is_sync_ring_table(&table.name) {
+                            // #368: ring は自動では足さない。 entity cap を伸ばしても空かない
+                            return Err(format!(
+                                "table '{}' ring is full ({} eids — ack_sync + reclaim_sync_ops \
+                                 frees it, Engine::grow_table enlarges it)",
+                                table_name,
+                                table.capacity(),
+                            ));
+                        }
                         return Err(format!(
                             "table '{}' eid range exhausted ({} eids reserved, entity cap {} — \
                              Engine::grow_entity_cap to add room)",
@@ -7252,7 +7269,8 @@ impl Engine {
 
     /// v10 Phase 3 (request20): table の枠を `extra` 個明示的に足す (末尾の空き eid 空間から)。
     /// 戻り値は新しい capacity。 空きが無ければ Err (`grow_entity_cap` で cap を伸ばす)。
-    /// `entity_in` は枯渇時に同じことを自動でやるので、 通常は呼ばなくてよい。
+    /// `entity_in` は枯渇時に同じことを自動でやるので、 通常は呼ばなくてよい。 例外は `_sync_ops`
+    /// (sync の ring): 自動では足さないので、 大きくするならここで (#368)。
     pub fn grow_table(&self, name: &str, extra: u32) -> Result<u32, String> {
         let tid = self
             .tables
@@ -7276,9 +7294,14 @@ impl Engine {
 
     /// `entity_in` の枯渇時: `local` (払出済み offset) が入るまで extent を足す。 足せた
     /// なら global を返す。 lock 下で再判定するので並行 thread の二重 grow はしない。
+    ///
+    /// `_sync_ops` には足さない (#368)。 あれは ring で、 満杯になったら bridge が止まって ack + reclaim を
+    /// 待つ作り (`enable_sync_tables` が大きさを決める、 最大 1 M 行)。 自動で足すと、 ack が来ない間
+    /// どの table にも割り当てていない eid 空間を全部取るまで止まらず、 user の table が足せなくなる
+    /// (同じ 1 行を書き換え続けるだけで起きた)。 大きくしたい時は [`Engine::grow_table`] を明示的に呼ぶ。
     fn grow_table_extent_for(&self, tid: usize, local: u32) -> Option<u32> {
         let table = &self.tables[tid];
-        if table.is_open_ended() {
+        if table.is_open_ended() || is_sync_ring_table(&table.name) {
             return None;
         }
         let _g = self.table_grow_lock.lock().unwrap_or_else(|p| p.into_inner());
