@@ -110,6 +110,8 @@ pub struct LeafStore {
     /// 毎 = reader の read 窓 (µs) では衝突しない。
     gen_seq: std::sync::atomic::AtomicU32,
     /// #107: 借用の読みと別 thread の書き込みが重なりうるかの記録 (debug build だけ)。
+    /// release build では空の型で、 読む所も消えるので dead_code の警告を止める。
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     borrow_watch: BorrowWatch,
 }
 
