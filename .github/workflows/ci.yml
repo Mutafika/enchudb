@@ -129,6 +129,23 @@ jobs:
           -p enchudb-sql
           -p enchudb-sync
 
+  release-check:
+    name: check (release profile)
+    runs-on: ubuntu-latest
+    # `cfg(debug_assertions)` の付いたコードは、 debug で回る test / clippy では全部 compile される。
+    # release build でだけ出る警告 / error はどこにも信号が出ない: 0.28.3 は #107 の番人 (debug build
+    # だけ中身を持つ型) の field が、 release build で dead_code の警告を出したまま出た。
+    # 利用者は release で build するので、 使っていないもの (`unused` の lint 群) は落とす。
+    # `cargo check` は codegen しないので速い (手元で 26 秒)。
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check --release (workspace, -D unused)
+        env:
+          RUSTFLAGS: -D unused
+        run: cargo check --release --workspace
+
   wasm-check:
     name: check (wasm cross)
     runs-on: ubuntu-latest
