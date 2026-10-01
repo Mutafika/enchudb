@@ -3,6 +3,104 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.28.3 — 2026-10-01
+
+patch。 on-disk format・wire は不変、 migration 不要。 公開 API は追加だけ (`Table::recent` / `Engine::recent_by_id` /
+`Engine::recent` / `Engine::get_entity_owned` / `EntityValueOwned`)。
+
+**上げる時に 1 つだけ注意**: debug build に、 Leaf を借用で読む API (`get_text` / `get_content` / `get_entity`) の
+番人が入った (#107)。 書き手が同時に動きうる状況でこれらを呼んでいるコードは、 debug build (test を含む) で panic
+する — copy 版 (`get_text_owned` / `get_content_owned` / `get_entity_owned`) に替える。 release build は不変。
+
+### Fixed — Tag 列の索引が、 辞書 ID の範囲まで空の bucket を作っていた (#358)
+
+`LockFreeCylinder` の dense 配列は、 値が配列の外なら伸ばす。 その時に間の全要素へ空の bucket (`Arc` と `Buf` の
+確保で約 90 B) を作っていた。 Tag の値は DB で 1 つの辞書の ID なので、 配列は 「その列にある値の数」 でなく
+「辞書 ID の範囲」 まで伸びる — 表の多い DB では、 他の表が進めた辞書 ID の分まで全部の列が空の bucket を抱え、
+ヒープが 「Tag 列の数 × 辞書の大きさ」 で増えた (sinfohub の負荷試験で 1,000 人ごとに 150〜190 MB)。
+今は配列の要素が bucket への pointer か null で、 bucket は値が最初に入った時に作る。
+
+実測 (issue の再現手順、 64,000 行、 表 1 / 4 / 8 / 16 個でのヒープの増分):
+
+| | 1 | 4 | 8 | 16 |
+|---|---|---|---|---|
+| 0.28.2 | 5.5 MB | 22.8 MB | 48.7 MB | 99.4 MB |
+| 0.28.3 | 5.4 MB | 7.6 MB | 10.8 MB | 17.1 MB |
+
+**残るもの**: 配列そのもの (空の要素 1 つ 8 B) は辞書 ID の範囲まで伸びる (倍々で伸ばすので最大その 2 倍、 上限は
+1 列 8 MB)。 表 1 個につき約 0.8 MB の増え方はこれで、 「Tag 列の数 × 辞書の大きさ」 の形は係数が約 90 B →
+8〜16 B になって残っている。 消すには値のまばらな列を値の順の run に回す変更が要る (#358 は実機の確認が
+取れるまで open)。
+
+読みの経路に足されたのは load 1 つと分岐 1 つ。 前後の binary を交互に回した criterion は `pull_raw/single_value`
+177 → 182 ns、 `tie/plain_value` 31.7 → 30.6 ns — 計測中の load average が 40〜150 で、 差は雑音の幅の中
+(「速くも遅くもなっていない」 以上のことは言えない)。
+
+### Fixed — `decode_batch` が、 相手から届いた件数をそのまま確保していた (#362)
+
+`decode_batch` は先頭 4 byte (件数) をそのまま `Vec::with_capacity` に渡していた。 大きな件数だと record を 1 件も
+読む前に 「件数 × record の大きさ」 を確保しようとし、 Linux では確保に失敗して**プロセスごと abort する** (panic で
+ないので拾えない)。 sync の pull で相手から届いた bytes を読む入口なので、 壊れた応答や悪意のある相手の 4 byte で
+受け側が落ちる。 今は確保する件数を 「残りの bytes に入りうる件数」 (record 1 件 = 長さ 4 byte + 最小 98 byte) で
+頭打ちにする。 wire format は不変。
+
+root crate の test (`fuzz_like_parsing`) は元からこの入力を食わせていたが、 CI で回っておらず (下の CI の項)、
+macOS は大きな確保を触るまで実体化しないので手元でも通っていた。 CI に足した最初の実行で
+`memory allocation of 180490557696 bytes failed` として出た。
+
+### Changed — Leaf を借用で読む API を、 書き手が動きうる状況で debug build が止める (#107)
+
+`get_text` / `get_content` / `get_entity` は live mmap への借用 (`&[u8]`) を返す。 Leaf の値 (content も Leaf) は、
+返した後に書き手が張り直す / 外すと手元の中身が変わる (#106)。 0.28.1 の実測: 読み手 4 本が `get_text` で読み、
+書き手が 100 万回張り直すと、 壊れた中身 487 回 + 範囲外 panic 149 回。
+
+debug build は次の時に panic する (release build は何もしない):
+
+- `open_readonly` の engine で Leaf を借用で読んだ (別 process の書き手と共存するための開き方)
+- 借用の読みが始まった後に、 その読み手でない thread が Leaf を書いた engine で Leaf を借用で読んだ
+  (並行の書き手 / `tie_text_async` を適用する consumer / sync の apply)
+
+止めないもの: 1 本の thread で書いて読む、 書き終えてから複数の thread で読むだけ、 Tag の列。 見逃すもの: 最初の
+1 回、 1 本の thread が借用を持ったまま自分で書く場合。 止めすぎるもの: 別々の thread が時間をずらして読んで書く場合。
+
+- **`Engine::get_entity_owned` / `EntityValueOwned`** を追加 (`get_entity` の copy 版)
+- CLI の `--readonly` の `.entity` / `.dump` が借用版を使っていたのを copy 版に替えた
+
+### Added — 直近 N 件を table の大きさによらずに取る (#21)
+
+```rust
+let latest = posts.recent(80);        // schema: 新しい順 (insert の逆順) に最大 80 件
+eng.recent_by_id(himo_id, 80);        // engine: 列に値のある row を新しい順に
+eng.recent("posts.ts", 80);
+```
+
+列の table の払い出し済みの末尾から逆にたどり、 n 件そろった所で止まる。 `Table::recent` は `all()` と同じ代表列。
+
+実測 (`cargo run --release --example recent_bench`、 直近 80 件、 中央値、 M2 Max、 load average 60〜80 の中):
+
+| rows | `entities_with_himo().rev().take` | `order_by_desc().limit` | `Table::recent` | SQLite `ORDER BY id DESC LIMIT` |
+|---|---|---|---|---|
+| 50,000 | 94〜105 µs | 584〜647 µs | 0.54〜0.58 µs | 7.0〜7.1 µs |
+| 1,000,000 | 1,990〜2,661 µs | 73,006〜76,317 µs | 0.54〜0.58 µs | 7.0 µs |
+
+順序は **eid を払い出した順**の逆で、 次の時は書き込みの順とずれる: table の枠を使い切った後に削除済みの eid が
+使い直された時、 sync で届いた row (届いた順)、 table に属さない列で削除がある時。 時刻で並べるなら時刻の列で
+`order_by_desc(col).limit(n)`。
+
+### CI — test を全 crate に広げ、 今通っている wasm の組を check で固定 (#98 / #230)
+
+`test` job は core 5 crate (oplog / engine / schema / sql / sync) だけで、 残りは壊れても信号が出なかった。 3 job 足した。
+
+- `test (periphery crates)`: connect / kafka / ngram / textsearch / transport / ffi / cli / rag
+- `test (root crate)`: root crate — 最初の実行で #362 を見つけた
+- `check (wasm cross)`: `wasm32-unknown-unknown` (ngram / textsearch) と `wasm32-wasip1` (ngram / textsearch / oplog)。
+  cfg gate を 1 行外すと PR #194 の初版と同じエラーで落ちることを確かめた。 engine の wasm は通らないまま (#230)
+
+### Known
+
+- `sync_ops_freelist_reopen` の `full_ring_backpressures_instead_of_dropping` が CI (Linux) で落ちることがある (#364)。
+  同じ commit の 2 回の実行で 1 回だけ落ちた。 手元 (macOS) では 40 回回して再現せず、 原因は未確定
+
 ## 0.28.2 — 2026-09-30
 
 patch。 on-disk format・公開 API・wire は不変、 migration 不要。
