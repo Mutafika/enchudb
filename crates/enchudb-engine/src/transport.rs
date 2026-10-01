@@ -353,12 +353,22 @@ pub fn encode_batch(records: &[WireRecord]) -> Vec<u8> {
     out
 }
 
+/// wire 上の record 1 件の最小の長さ: version 1 + HLC 16 + author 4 + 署名 64 + 鍵の印 8 +
+/// 署名対象の長さ 4 + op の種類 1 (署名対象も op の中身も空の時)。
+const MIN_WIRE_RECORD_LEN: usize = 1 + 16 + 4 + 64 + 8 + 4 + 1;
+
 /// `encode_batch` の逆。
 pub fn decode_batch(buf: &[u8]) -> Result<Vec<WireRecord>, WireDecodeError> {
     if buf.len() < 4 { return Err(WireDecodeError::Truncated); }
     let count = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
     let mut p = 4;
-    let mut out = Vec::with_capacity(count);
+    // #362: 件数は相手から届いた bytes。 そのまま確保すると、 壊れた / 悪意のある 4 byte で
+    // 「件数 × record の大きさ」 (数百 GB) を要求し、 確保に失敗してプロセスごと abort する
+    // (panic でないので拾えない)。 record 1 件は長さの 4 byte + 最小の中身を必ず使うので、 残りの
+    // bytes に入りうる件数で頭打ちにする — 確保は入力の長さに比例する。 入りきらない件数は
+    // 下の loop が今までどおり `Truncated` で弾く
+    let fits = (buf.len() - 4) / (4 + MIN_WIRE_RECORD_LEN);
+    let mut out = Vec::with_capacity(count.min(fits));
     for _ in 0..count {
         if p + 4 > buf.len() { return Err(WireDecodeError::Truncated); }
         let rec_len = u32::from_le_bytes(buf[p..p+4].try_into().unwrap()) as usize;
@@ -904,6 +914,21 @@ impl Transport for InMemoryTransport {
 mod tests {
     use super::*;
     use enchudb_oplog::oplog::DecodedOp;
+
+    /// #362: `MIN_WIRE_RECORD_LEN` は、 実際に一番短い record (署名対象も op の中身も空 = 未署名の Commit) の
+    /// 長さと一致する。 これより大きく見積もると、 正しい batch で確保が足りなくなる (伸ばすだけで壊れは
+    /// しないが、 頭打ちの根拠が崩れる)。
+    #[test]
+    fn min_wire_record_len_is_the_shortest_record() {
+        let commit = WireRecord::unsigned(Hlc { wall: 1, logical: 0, peer: 1 }, 1, DecodedOp::Commit);
+        assert_eq!(commit.encode().len(), MIN_WIRE_RECORD_LEN);
+        // 一番短い record だけの batch でも、 入りうる件数の見積もりは実際の件数を下回らない
+        for k in [1usize, 2, 7, 100] {
+            let batch = encode_batch(&vec![commit.clone(); k]);
+            assert_eq!((batch.len() - 4) / (4 + MIN_WIRE_RECORD_LEN), k);
+            assert_eq!(decode_batch(&batch).unwrap().len(), k);
+        }
+    }
 
     fn rec(hlc_wall: u64, peer: PeerId, eid: u64, value: u32) -> WireRecord {
         WireRecord {
