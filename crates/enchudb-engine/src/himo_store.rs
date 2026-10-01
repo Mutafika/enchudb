@@ -21,7 +21,7 @@ use crate::region::Region;
 /// column region の取得元 (request23 D2)。
 ///
 /// v10 の DB では himo 1 本 = file 1 本なので、 open 時に全 himo の column を作ると
-/// 「そのコマンドが触らない himo」 の分まで `open(2)` + `mmap` を払う。 kenning の
+/// 「そのコマンドが触らない himo」 の分まで `open(2)` + `mmap` を払う。 コード索引の CLI (1 コマンド 1 process) の
 /// 実測では 1 コマンドが触る himo は 48 本中 2〜13 本だった。 そこで column を
 /// **最初に触ったときに** 組み立てる。
 ///
@@ -136,7 +136,7 @@ pub struct HimoStore {
 ///
 /// `col()` が (遅延解決のため) atomic load になったので、 **要素ごとに `self.col()` を
 /// 呼ぶとループ外に巻き上げられない**。 hot loop は `let col = self.col();` を 1 回だけ
-/// 取って、 この free 関数に渡すこと (request23 D2 の計測で sunsu2 phase2_chaos が
+/// 取って、 この free 関数に渡すこと (request23 D2 の計測で 負荷 harness の phase2_chaos が
 /// 82.6s → 91.7s になった原因がこれだった)。
 #[inline(always)]
 fn stored_at(col: &Column, eid: u32) -> u64 {
@@ -192,7 +192,7 @@ impl HimoStore {
             value_type: ht,
             max_values,
             // 新規 column は空なので「組み済み」で始めてよいが、 **それだと bulk load が
-            // 誰も引かない index を育て続ける** (#270: naruhodo のフルリビルドで 1.5GB /
+            // 誰も引かない index を育て続ける** (#270: 法令検索の消費側アプリのフルリビルドで 1.5GB /
             // 2,856 万確保)。 false で始めれば writer は cylinder を触らない (`cyl_live`)。
             cyl_built: AtomicBool::new(false),
             write_lock: Mutex::new(()),

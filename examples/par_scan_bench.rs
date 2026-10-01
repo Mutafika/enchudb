@@ -1,6 +1,6 @@
 //! 0.8.9 (#39): bulk column scan の seq vs par 実測 bench。
 //!
-//! suzukapulse dominance(all) で 12M sample scan が 1.95s かかってた hot path
+//! 時系列解析の消費側アプリの dominance(all) で 12M sample scan が 1.95s かかってた hot path
 //! を rayon 並列化で改善できるかの実測。 M2 Max (4 perf core + 6 efficiency)
 //! で 3x 前後の改善を期待。
 //!

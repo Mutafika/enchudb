@@ -3,7 +3,7 @@
 //! 旧 behavior: `apply_one::DecodedOp::Vocab` 分岐が **LWW check 無しで常に
 //! `true` を返す**。 gossip_remote_apply ON 構成で同じ vocab record が無限に
 //! re-apply 扱いされ、 caller (Syncer) の applied counter が永久に 0 に戻らず、
-//! WAL 再追記から amplification loop に発展した (bisquit dogfood で実証)。
+//! WAL 再追記から amplification loop に発展した (消費側アプリの dogfood で実証)。
 //!
 //! 修正後: 同 `(author_peer, vid, bytes)` の再受信は skip カウントに乗る、
 //! 2 度目の apply で applied == 0、 skipped == received。

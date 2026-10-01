@@ -4,7 +4,7 @@
 //! Windows では **accept した接続 socket が non-blocking を継承**する。 そのまま
 //! `write_all` すると送信バッファが埋まった時点で `WouldBlock` がエラー扱いになり、
 //! ハンドラが死んで Content-Length より短い body で接続が閉じる（読み手が遅いほど
-//! 確実に再現）。 実機では下流 syncretic の「初回フル pull（数 MB）が毎回失敗し、
+//! 確実に再現）。 実機では下流のファイル同期の消費側アプリの「初回フル pull（数 MB）が毎回失敗し、
 //! cursor が永遠に 0 のまま 1 件も同期しない」として発現した。 ws.rs は既に
 //! `set_nonblocking(false)` 済みで、 http.rs だけ取り残されていた。
 

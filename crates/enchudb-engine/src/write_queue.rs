@@ -5,7 +5,7 @@
 //!
 //! v0.2.3 以前は `crossbeam_queue::SegQueue` (unbounded) を使っていた。
 //! consumer が drain しきれない rate で writer が push し続けると、 queue
-//! 内 record が線形成長 → RSS 線形成長 → OOM kill (sunsu Docker scenario
+//! 内 record が線形成長 → RSS 線形成長 → OOM kill (SNS 型の負荷試験の Docker scenario
 //! 03 で 14s / 8M posts / 3.38 GB → 4 GB cap 突破)。
 //!
 //! v0.2.4 から `crossbeam_queue::ArrayQueue` (bounded、 lock-free) に変更。
@@ -17,7 +17,7 @@ use crossbeam_queue::ArrayQueue;
 use enchudb_oplog::Hlc;
 
 /// queue capacity の default。 既存 caller 互換のため、 sustained writer の
-/// peak rate を捌ける程度の余裕を持たせる。 SNS 系 hot path (sunsu の
+/// peak rate を捌ける程度の余裕を持たせる。 SNS 系 hot path (SNS 型の負荷試験の
 /// concurrent_posts 等、 1 M posts/sec 級) でも、 consumer 進捗との rate 差が
 /// 数百 ms 程度なら飲み込める。
 pub(crate) const DEFAULT_WRITE_QUEUE_CAP: usize = 1_048_576; // 1 M ops

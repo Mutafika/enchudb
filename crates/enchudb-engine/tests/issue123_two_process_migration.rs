@@ -2,7 +2,7 @@
 //! いる最中に、 別プロセスの readonly reader が値を引き続けても壊れないこと。
 //!
 //! 既存の「cross-process」テスト (`issue106_leaf_cross_process.rs`) は同一プロセス内の
-//! 別 Engine ハンドルで、 プロセスを跨いでいない。 oboro / sinfo-studio が
+//! 別 Engine ハンドルで、 プロセスを跨いでいない。 別 process の readonly reader が
 //! `open_readonly` の別プロセスで読む運用をしているので、 そこを実プロセスで固定する。
 //!
 //! 子プロセスはこのテストバイナリ自身を `ENCHUDB_ISSUE123_CHILD` 付きで起動して兼ねる。

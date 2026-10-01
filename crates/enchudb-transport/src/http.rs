@@ -571,7 +571,7 @@ pub struct HttpTransport {
     /// "" (legacy) または "/rooms/<room_id>"。pull/publish の path 先頭に付く。
     path_prefix: String,
     /// 任意の追加ヘッダ ("HeaderName: value\r\n" の連結)。
-    /// opyula が monban cert を `Authorization: SSHCert <openssh>` で乗せる用。
+    /// 消費側アプリが SSH 証明書の認証の cert を `Authorization: SSHCert <openssh>` で乗せる用。
     extra_headers: String,
 }
 

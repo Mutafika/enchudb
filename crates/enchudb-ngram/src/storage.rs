@@ -577,7 +577,7 @@ fn write_index<W: Write>(
 //
 // 索引を「小さい完結ファイル (segment) を並べて、後から統合する」形で運用できるようにする。
 // これが無いと索引の作り直しは常に全 doc をメモリに載せる形しか取れず、build のピークが
-// コーパス量に比例する (naruhodo の実測で 494,133 doc = +2.7GB)。
+// コーパス量に比例する (法令検索の消費側アプリの実測で 494,133 doc = +2.7GB)。
 //
 // **形式は変えない。** `.etxt` は Gram Index が key 昇順・Doc Index が eid 昇順・
 // 各 gram の posting run が eid 昇順 (compact 済み) なので、統合は整列済みリストの

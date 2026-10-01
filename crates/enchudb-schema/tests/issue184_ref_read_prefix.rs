@@ -3,7 +3,7 @@
 //! storage の Ref 値は u32 (local 部) だが、schema 層の `find()` / `commit()` は
 //! peer prefix 付きの full eid を返す。read (`EntityRef::get`) だけが素 cast で
 //! local 部を返すと、同じ層の API 同士で eid 表現が食い違い `==` 比較が silent に
-//! 外れる (発見経路: sunsu2 の timeline 重複 materialize)。
+//! 外れる (発見経路: 負荷 harness の timeline 重複 materialize)。
 
 use enchudb_schema::{Database, Value};
 

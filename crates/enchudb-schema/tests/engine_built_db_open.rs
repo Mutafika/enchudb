@@ -1,5 +1,5 @@
 //! 0.8.7 fix: engine 直で構築した DB (= schema crate を経由していない)
-//! を `Database::open` した時 panic しないこと (= mlbpulse の 4.5M pitch DB の再現)。
+//! を `Database::open` した時 panic しないこと (= 4.5M 行の消費側の pitch DB の再現)。
 //!
 //! 旧 behavior: `Database::open` は `__enchu_schema_meta__` marker himo の存在を
 //! 前提にしていたが、 engine 直構築 DB には marker が無いため、 query 実行時に
@@ -43,7 +43,7 @@ fn database_open_works_on_engine_built_db_without_schema_marker() {
     let path = tmp_path("no_marker");
     cleanup(&path);
 
-    // === phase 1: engine 直で table を構築 (= mlbpulse の build phase 相当) ===
+    // === phase 1: engine 直で table を構築 (= その消費側の build phase 相当) ===
     {
         let mut eng = Engine::create_standalone(&path).unwrap();
         eng.define_table("pitches", 100).unwrap();

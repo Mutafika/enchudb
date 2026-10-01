@@ -6,9 +6,9 @@
 //! 「reopen 200 himo 0.96 → 5.5 ms」 と出ていたのに 「1 回きりの経路」 と分類してしまった。
 //!
 //! 実際の consumer はそうではない:
-//! - **kenning / `sf` は 1 コマンド = 1 process** なので open 代を毎回払う (償却先が無い)
-//! - **1 process で N 個の DB を開く経路がある** (kenning の `across` は 20〜25 db、
-//!   sinfohub は `_router` + `users/*` + `shared/shard_*`)
+//! - **コード索引の CLI などの消費側 CLI は 1 コマンド = 1 process** なので open 代を毎回払う (償却先が無い)
+//! - **1 process で N 個の DB を開く経路がある** (コード索引の CLI の横断検索は 20〜25 db、
+//!   マルチユーザーのサーバ構成は `_router` + `users/*` + `shared/shard_*`)
 //!
 //! この bench は open が支配する形 (開く → 小さな query 1 本 → 閉じる) で、
 //! **himo 数を振って 1 file あたりのコスト**を出し、 **N db を 1 process で開く**逐次 / 並列を
@@ -52,7 +52,7 @@ fn open_query_close(path: &str, himos: u32) -> u64 {
     let eng = Engine::open_readonly(path).unwrap();
     let mut acc = eng.entity_count() as u64;
     if himos > 0 {
-        // 触るのは 1 himo だけ (kenning 実測で 48 中 2〜13 本)。
+        // 触るのは 1 himo だけ (コード索引の CLI の実測で 48 中 2〜13 本)。
         acc += eng.get(0, "t.h0").map(|v| v.to_string().len() as u64).unwrap_or(0);
     }
     acc

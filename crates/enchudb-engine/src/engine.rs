@@ -1807,7 +1807,7 @@ const DEFAULT_MAX_ENTITIES: u32 = 16_777_216;
 /// per-himo 列領域を max_himos 倍する**構造 (try_from_params L1234-1242)。 16M entity DB で
 /// 256→4096 にすると himo 領域が ~16GB→~256GB の apparent (sparse だが macOS/APFS では phys
 /// inflate) に膨れる。 → 全 DB の default を上げるのは footprint 的に不可。 代わりに
-/// `GrowableOptions { max_himos, .. }` で **必要な consumer (sinfo 等) が明示的に引き上げる**
+/// `GrowableOptions { max_himos, .. }` で **必要な consumer (消費側の CLI 等) が明示的に引き上げる**
 /// (自分の DB の apparent 増を承知の上で opt-in)。 header 焼き込みなので既存 DB は rebuild
 /// するまで旧値のまま。
 const DEFAULT_MAX_HIMOS: u32 = 256;
@@ -1823,7 +1823,7 @@ const DEFAULT_LEAF_OFF_SHIFT: u32 = 2;
 /// v7 (#90): LeafStore region の addressable 上限を選ぶ (create 時)。 cell 参照を
 /// word offset (`byte >> shift`) で持つことで、 列幅・indirection を増やさず cap を
 /// 拡げる。 大きいほど slot alignment (= padding) が粗くなるので、 payload が小さい
-/// 用途は `Gb16`、 wikipulse のような大 payload × 巨大 working set は `Gb32`/`Gb64`。
+/// 用途は `Gb16`、 wiki 型 workload のような大 payload × 巨大 working set は `Gb32`/`Gb64`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeafScale {
     /// shift 2 / align4 / ~16GB。 default。
@@ -3550,7 +3550,7 @@ impl Engine {
     }
 
     /// #90: growable backing で、 leaf region の予約 size と scale (16/32/64GB) を
-    /// 明示する。 wikipulse のような大 payload × 巨大 live working set 用途で、
+    /// 明示する。 wiki 型 workload のような大 payload × 巨大 live working set 用途で、
     /// leaf region を 4GB 超に伸ばす場合に使う。 `leaf_data_size` は選んだ scale の
     /// cap 以下であること。 leaf offset は word 単位なので列幅は不変。
     #[cfg(not(target_arch = "wasm32"))]
@@ -3614,7 +3614,7 @@ impl Engine {
         )
     }
 
-    /// Tiny growable preset for app state-logs (matcha-style: a few
+    /// Tiny growable preset for app state-logs (e.g. a desktop app's notification state: a few
     /// hundred rows of dismissed-key / seen-at / etc.). Default
     /// `create_growable` uses gigascale capacities so the layout
     /// total — and thus the on-disk apparent size of a fresh DB —
@@ -3635,7 +3635,7 @@ impl Engine {
         let max_himos = 16_u32;
         // tiny preset では vocab_max_entries の default ×16 multiplier
         // が過剰 (16384 entries → vocab_offsets 128KB + index 213KB)。
-        // matcha のような数百エントリ用途では ×2 で十分 — 2048 entries
+        // 通知 state のような数百エントリ用途では ×2 で十分 — 2048 entries
         // で offsets 16KB + index ~26KB に収まる。
         let vocab_max_entries = max_entities.saturating_mul(2);
         let layout = Layout::compute_with_caps(
@@ -5332,7 +5332,7 @@ impl Engine {
 
     // ──── #268: bridge の無言停止を host から検出するための観測値 ────
     //
-    // 実機 (syncretic) で `transfer_oplog_to_sync_ops()` が 41 時間 0 を返し続け、
+    // 実機の sync 構成で `transfer_oplog_to_sync_ops()` が 41 時間 0 を返し続け、
     // 配布が完全に沈黙した。 再起動で cursor が ring 先頭に戻った瞬間に滞留 21,512
     // record が一括で出たので、 record は commit 済みで WAL 上に在り、 **走行中の
     // bridge だけが読めていなかった**。 既存の counter
@@ -7017,7 +7017,7 @@ impl Engine {
     /// **cell 本体は msync しない** — 受信 op を適用した後の barrier が要るなら
     /// [`Engine::persist_sync_state`] を使うこと。
     ///
-    /// short-lived CLI (= 1 write → drop) で sinfo 等の embed consumer が
+    /// short-lived CLI (= 1 write → drop) で消費側の CLI 等の embed consumer が
     /// 明示的に呼ぶ想定。 wasm / memory-only (= path 空) では Ok(()) no-op。
     /// persist 失敗時は呼び出し側に io::Error を返す (= `try_persist_tables`
     /// と違って best-effort ではない、 fail-fast)。
@@ -8538,7 +8538,7 @@ impl Engine {
     /// 対象は **「tombstone が立っているのに、 それより古い cell が生きている」 entity**。
     /// この形は `apply_delete_local` の doc にあるとおり、 tombstone を書いた直後に
     /// 落ちると残る。 query 経路は tombstone を見ないので、 放置するとアプリからは
-    /// 生きた行に見え続ける (実地: syncretic の chaos soak で保全した store 3/3 に
+    /// 生きた行に見え続ける (実地: ファイル同期の消費側アプリの chaos soak で保全した store 3/3 に
     /// 1 件ずつ在った)。 再配送があれば冪等化した apply が直すが、 record が ring から
     /// 落ちた後は再配送が来ないので、 **open 時にこちらでも埋める**。
     ///
@@ -9199,7 +9199,7 @@ impl Engine {
     ///
     /// 旧 behavior: sync apply_one は Vocab を **HLC dedupe せず常に applied 扱い**
     /// していた。 gossip_remote_apply ON 構成で同じ vocab record が無限に往復し、
-    /// `entities_live` が膨れる amplification loop が出た (bisquit dogfood 実例)。
+    /// `entities_live` が膨れる amplification loop が出た (消費側アプリの dogfood 実例)。
     /// 本 method を sync 側で先に叩いて、 既登録なら apply_one が false を返す。
     pub fn has_remote_vocab(
         &self,
@@ -9381,7 +9381,7 @@ impl Engine {
         let owner = &mut self.tables[owner_tid as usize];
         // persist は entry を**新規に**足した時だけ。 idempotent な再登録 (schema crate の
         // `load_schema` が rw open のたびに全 relation を通す) で毎回 sidecar を fsync すると、
-        // relation 数 × ~6 ms (APFS) が **open の定数コスト**になる (kenning: 8 本で ~50 ms、
+        // relation 数 × ~6 ms (APFS) が **open の定数コスト**になる (コード索引の CLI: 8 本で ~50 ms、
         // 書き込み 0 でも `tables` の mtime が動く)。 既存 entry なら disk と一致済み。
         if !owner.fk_refs.iter().any(|e| *e == entry) {
             owner.fk_refs.push(entry);
@@ -12688,7 +12688,7 @@ impl Engine {
     /// `create_concurrent_with_oplog` + `queue_capacity` override (issue4)。
     /// - `queue_capacity`: WriteQueue / oplog_record_queue の bounded cap (default 1 M)
     ///
-    /// sustained writer (sunsu Docker scenario 03 等) で writer >> consumer rate に
+    /// sustained writer (SNS 型の負荷試験の Docker scenario 03 等) で writer >> consumer rate に
     /// なると、 旧 unbounded queue では RSS 線形成長 → OOM。 bounded 化 + producer
     /// block でこれを cap する。 capacity の選び方:
     /// - 小さい (例: 10 K) → RSS 低い、 latency 不安定
@@ -12773,7 +12773,7 @@ impl Engine {
     /// 機会無く drop → 次 open で oplog recover) のとき:
     ///   - entity_set の live bitmap が stale → 次 entity_in が eid 重複払出し
     ///   - table.next_local が 0 のまま → 次 alloc が既存 eid と衝突
-    /// になる。 sinfo 連携で表面化したので 0.8.1 patch で根治。
+    /// になる。 消費側の CLI との連携で表面化したので 0.8.1 patch で根治。
     fn apply_oplog_op(
         &mut self,
         op: &enchudb_oplog::oplog::DecodedOp,
@@ -12992,7 +12992,7 @@ impl Engine {
 
     /// `concurrentize` + WAL 後付け版。 `define_himo` などの build phase を `Engine`
     /// 値所有で終えた後、 既存 schema 状態を保ったまま consumer + WAL を起動して
-    /// `Arc<Engine>` に遷移する。 sinfo / enchudb-schema の build → runtime 移行に使う。
+    /// `Arc<Engine>` に遷移する。 消費側アプリ / enchudb-schema の build → runtime 移行に使う。
     ///
     /// 既存 `.wal` ファイルがあれば recover してから consumer 起動。
     /// (build phase で flush 済みなら本体は最新、 WAL は空のまま start)
@@ -13420,7 +13420,7 @@ impl Engine {
                             let synced = engine.sync_for_checkpoint(wal); // #317
                             // 0.8.1: shutdown 時に tables sidecar を強制 persist。
                             // 旧 behavior では body_msync のみで `next_local` が
-                            // sidecar に書かれず、 short-lived CLI (sinfo の sf 等)
+                            // sidecar に書かれず、 short-lived CLI (1 コマンド 1 process の CLI 等)
                             // で次 open 時に eid 衝突が出ていた。 graceful shutdown
                             // 経路では oplog checkpoint も進めてしまうので、 ここで
                             // sidecar を確実に固める必要がある。
@@ -15616,7 +15616,7 @@ mod tests {
 
     /// #268: bridge が 0 を返し続けたときに、 host がそれを **異常として読める**こと。
     ///
-    /// 実機 (syncretic) で `transfer_oplog_to_sync_ops()` が 41 時間 0 を返し続け、
+    /// 実機の sync 構成で `transfer_oplog_to_sync_ops()` が 41 時間 0 を返し続け、
     /// 配布が沈黙した。 既存 counter は #196 の窓しか数えないので両方 0 のまま、
     /// host には 「静かなのか壊れているのか」 を分ける材料が無かった。
     ///
@@ -17401,8 +17401,8 @@ mod tests {
     }
 
     /// `create_growable_tiny` の apparent サイズが state-log 想定の
-    /// 数百 KB に収まることを確認する。 dogfood は matcha-shell の
-    /// notif_state でやるが、 ここでも基本の roundtrip + サイズを
+    /// 数百 KB に収まることを確認する。 dogfood は消費側アプリの
+    /// 通知 state でやるが、 ここでも基本の roundtrip + サイズを
     /// 押さえる。
     #[test]
     fn growable_tiny_file_is_small() {
@@ -17411,7 +17411,7 @@ mod tests {
             let mut eng = Engine::create_growable_tiny(&dir).unwrap();
             eng.define_himo("key", ValueType::Tag, 0);
             eng.define_himo("ts", ValueType::Number, 0);
-            // 50 rows of (uuid-like, timestamp) — matcha の notif_state
+            // 50 rows of (uuid-like, timestamp) — 通知 state 用途
             // が捌くサイズ感。
             for i in 0..50u32 {
                 let e = eng.entity().unwrap();
@@ -17811,7 +17811,7 @@ mod v10_dir_tests {
     /// (#246 の header 境界 fixture 用。 0 なら `seed_with` と同じ)。
     fn seed_padded(path: &str, reserve: Option<u32>, min_himos: usize) -> Vec<(enchudb_oplog::EntityId, u32)> {
         // max_himos 2048 → v10 の header は可変長 (12 KB)。 legacy 化するときに 4096 へ切り詰めて
-        // 「固定 4096 header の v8 / v9」 を再現する (実 DB = sinfohub の shape)。
+        // 「固定 4096 header の v8 / v9」 を再現する (実 DB = マルチユーザーのサーバ構成の shape)。
         let mut eng = Engine::create_growable_opts(
             path,
             GrowableOptions {

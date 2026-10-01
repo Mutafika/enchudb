@@ -552,7 +552,7 @@ impl Syncer {
             // Weak 必須: transport は peer より長生きする。 強参照で capture すると、
             // restart で drop したはずの engine (background consumer 込み) が provider の
             // 中で生き続け、 同一 DB file を再 open した新 engine と並走して sidecar
-            // persist が衝突する (sunsu2 chaos の restart で実測)。
+            // persist が衝突する (負荷 harness の chaos restart で実測)。
             let engine = Arc::downgrade(&self.engine);
             let is_self = author == self_peer;
             // #236: replica batch が cell 単位で欠けていたら一度だけ warn する。
@@ -1054,7 +1054,7 @@ impl Syncer {
     /// は cursor < floor で truncation 行きになる。 bootstrap (#140) が受け皿だが、
     /// 差分で追いつけるならその方が安いので、 reclaim は「容量管理」であって
     /// 「消化済みの掃除」ではない。 eager に回すと、 round 1 個ずれて参加した
-    /// follower が即 bootstrap 送りになる (sunsu2 Phase 2 chaos で実測)。
+    /// follower が即 bootstrap 送りになる (負荷 harness の Phase 2 chaos で実測)。
     ///
     /// `publish_since` の冒頭から自動で呼ばれるので、 app は publish/pull を
     /// 回すだけで良い。 publish しない caller (pull 専用 hub 等) が明示的に

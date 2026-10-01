@@ -1,6 +1,6 @@
 //! issue #47 repro: `entity_in` が live local を re-issue して既存 entity を上書きする
 //!
-//! 観測: bisquit 0.8.11 で、 22 articles seed 済の DB に対し新 URL を save すると
+//! 観測: 消費側アプリで、 22 articles seed 済の DB に対し新 URL を save すると
 //! `entity_in("articles")` が **existing live local 20, 21, 22 を返す** → tie_value で
 //! seed 過去 row が新 URL に上書きされる silent data loss。
 //!

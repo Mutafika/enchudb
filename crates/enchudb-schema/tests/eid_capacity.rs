@@ -3,7 +3,7 @@
 //! `max_entities` は create 時に header へ焼かれる。 後から table を足すアプリは
 //! `with_capacity` を決める前に残量を知る必要があるが、 手段が無かったため
 //! 「既知の table 名の range を全部引いて自分で引き算する」 しかなかった
-//! (実地: syncretic が `_local_seen` を足そうとして
+//! (実地: ファイル同期の消費側アプリが `_local_seen` を足そうとして
 //!  `eid range [41984, 107520) exceeds max_entities 65536` で失敗)。
 
 use enchudb_schema::Database;

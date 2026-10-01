@@ -2,7 +2,7 @@
 //! (`open_readonly`)** が `get_text_owned` で読んでも torn read しない。
 //!
 //! `open_readonly` は writer flock を取らず同じ file を `MAP_SHARED` で map する
-//! (= 別プロセスの readonly reader = oboro / tail / studio パターン、 CLAUDE.md の
+//! (= 別プロセスの readonly reader = tail / viewer 型の readonly reader パターン、 CLAUDE.md の
 //! peer 検証方針)。 別ハンドルは **別 `gen_seq` カウンタ** を持つが、 reader は
 //! gen を書かず共有 mmap から読むだけなので、 writer が焼いた gen で seqlock が成立
 //! する。 これで in-process epoch では守れない cross-process 経路を検証する。

@@ -53,7 +53,7 @@ fn drop_without_sync_persists_data_end() {
 
 #[test]
 fn many_short_lived_writes_do_not_corrupt() {
-    // oboro hook 的 pattern: 開く→書く→drop を繰り返す。
+    // hook 型の短命 process の pattern: 開く→書く→drop を繰り返す。
     // 各書き込みが独立 entity で、最後に全部読めることを保証。
     let path = tmp("many_hooks");
     let mut entities = Vec::new();

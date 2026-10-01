@@ -84,7 +84,7 @@ impl TextSearch {
     /// `.etxt` が DB 本体の本文を二重化しなくなる (#84)。 この file を開いた engine は
     /// 原文を持たないので [`search`](TextSearch::search) の substring 検証ができない。
     /// caller は [`candidates`](TextSearch::candidates) の生候補を DB 本体の原文で
-    /// 検証する (naruhodo hanrei の body lookup がその経路)。
+    /// 検証する (判例の全文検索の body lookup がその経路)。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn save_postings_only(&mut self, path: &str) -> io::Result<()> {
         self.idx.save_postings_only(path)

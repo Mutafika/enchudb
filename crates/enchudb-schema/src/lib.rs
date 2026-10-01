@@ -452,7 +452,7 @@ impl Database {
     /// GUI の表示専用 process、 監視ツール等の用途。
     ///
     /// 0.8.7: schema sidecar (`{path}.schema`) があれば PK / column type 含む
-    /// 完全な schema を復元。 sidecar が無い engine 直 DB (= mlbpulse のような
+    /// 完全な schema を復元。 sidecar が無い engine 直 DB (= 4.5M 行の消費側のような
     /// `Engine::define_table` 構築) でも、 engine の `.tables` sidecar + value_types
     /// から fallback 復元 (= PK は不明扱い、 column type は value_type から推定)。
     pub fn open_readonly(path: &str) -> Result<Self, SchemaError> {
@@ -503,7 +503,7 @@ impl Database {
 
     fn wrap_concurrent(arc_eng: Arc<Engine>) -> Result<Arc<Self>, SchemaError> {
         // 0.8.7: schema sidecar / engine `.tables` から復元 (= marker himo は不要)。
-        // mlbpulse のような engine 直構築 DB でも fallback 復元できる。
+        // 4.5M 行規模の engine 直構築 DB でも fallback 復元できる。
         let mut db = Self {
             eng: arc_eng,
             tables: Vec::new(),
@@ -514,7 +514,7 @@ impl Database {
     }
 
     /// build phase 終了 + concurrent + WAL モードに遷移。 consumer thread を spawn し、
-    /// `Arc<Database>` を返す。 sinfo のように複数の sub-store で `Arc<Database>` を
+    /// `Arc<Database>` を返す。 消費側の CLI のように複数の sub-store で `Arc<Database>` を
     /// clone 共有する用途向け。
     ///
     /// 失敗条件: `self` が既に `Arc<Database>` 経由で共有されている (= Arc count > 1)、
@@ -1014,7 +1014,7 @@ impl Database {
         if parsed_opt.is_none() {
             parsed_opt = self.load_schema_from_legacy_blob()?;
         }
-        // 3. fallback: engine `.tables` + value_types (= mlbpulse 等の engine 直 DB)
+        // 3. fallback: engine `.tables` + value_types (= engine 直で構築した大きな DB 等)
         if parsed_opt.is_none() {
             parsed_opt = self.synthesize_schema_from_engine()?;
         }
@@ -1134,7 +1134,7 @@ impl Database {
 
     /// 0.8.7: engine `.tables` sidecar + value_types から synthetic な RawTableDef を
     /// 組み立てる fallback。 schema sidecar も legacy blob も無い engine 直構築 DB
-    /// (= mlbpulse の 4.5M pitch DB 等) を query 可能にするための path。
+    /// (= 4.5M 行の消費側の pitch DB 等) を query 可能にするための path。
     ///
     /// 復元できる情報: table 名、 column 名 (= himo full name の `.` 後)、 column type
     /// (= engine の value_type)、 relations (= engine の fk_refs)。

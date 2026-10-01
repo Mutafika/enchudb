@@ -3,7 +3,7 @@
 //!
 //! 1M slot 固定は per-DB ~128MiB の固定 RSS (queue 2 本) になり、per-user /
 //! per-tenant に DB を分ける構成の host 密度を縛っていた。RSS の実測は
-//! sunsu2 `examples/memory_probe.rs` 側で行う (ここは capacity の契約のみ)。
+//! 負荷 harness の `examples/memory_probe.rs` 側で行う (ここは capacity の契約のみ)。
 
 use enchudb_schema::Database;
 

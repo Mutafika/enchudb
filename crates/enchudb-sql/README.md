@@ -7,7 +7,7 @@ EnchuDB 上に積む SQL frontend。 SQLite の **上位互換 (superset)** を�
 - SQLite dialect の SQL をパースして engine メソッドに 1:1 dispatch
 - **schema は DB ファイル内に永続化** (reopen 後 CREATE TABLE 再呼出不要)
 - 仮想 2D table 抽象 — N 個の紐 (himo) を 1 つの table 名で束ねる
-- 非 SQL コンシューマ (`enchu studio` など) は `Database::list_tables()` で schema を直接読める
+- 非 SQL コンシューマ (GUI の DB viewer など) は `Database::list_tables()` で schema を直接読める
 - 中間 AST 評価層を作らない設計、 SQL のオーバーヘッドは parse のみ
 
 ## なぜ SQLite 上位互換 (drop-in じゃなく)
@@ -86,7 +86,7 @@ db.execute("SELECT * FROM notif")?;  // そのまま動く
 ## 非 SQL コンシューマ向け API
 
 ```rust
-// schema を直接読む (enchu studio で table 一覧表示など)
+// schema を直接読む (GUI の DB viewer で table 一覧表示など)
 for (table_name, cols) in db.list_tables() {
     println!("{}: {:?}", table_name, cols);
     // cols は Vec<(col_name, SqlType, is_pk)>

@@ -42,7 +42,7 @@
 pub use enchudb_engine::*;
 
 // Convenience re-exports for downstream crates that previously imported these
-// from the root (opyula など)。 EntityId / Hlc / PeerId / keys は本来
+// from the root (消費側アプリなど)。 EntityId / Hlc / PeerId / keys は本来
 // `enchudb_oplog` 配下だが、 meta crate として薄く再露出する。
 pub use enchudb_oplog::{eid_local, eid_peer, make_eid, EntityId, Hlc, PeerId};
 pub mod keys {

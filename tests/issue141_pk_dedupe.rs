@@ -5,7 +5,7 @@
 //! 解決し、初見の remote_eid には `alloc_translated_local` で**新規 eid を払い出す**。
 //! 適用先 table に同じ PK の既存 row がいても束ねないため、 同一 PK の entity が 2 個並ぶ。
 //!
-//! 実機 (下流 syncretic) では 1 table 内 2,358 entity 中 788 個が同一キー文字列の重複、
+//! 実機 (下流のファイル同期の消費側アプリ) では 1 table 内 2,358 entity 中 788 個が同一キー文字列の重複、
 //! 恒久チャーンループ → WAL 膨張 → oplog リング一周 → #140 の tombstone 消失、 と連鎖した。
 //!
 //! **PK は schema 層の概念で engine は関知しない** (`enchudb-sync` と `enchudb-schema` は
@@ -39,7 +39,7 @@ fn cleanup(path: &str) {
     }
 }
 
-/// PK 付き table を持つ sync 可能な Database を作る (bisquit の store.rs と同じ作法)。
+/// PK 付き table を持つ sync 可能な Database を作る (消費側アプリの store 層と同じ作法)。
 fn make_peer(path: &str, peer: u32) -> Arc<Database> {
     let mut b = Database::create_with_capacity(path, 65_536).unwrap();
     b.table(TABLE)

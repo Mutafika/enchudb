@@ -2,7 +2,7 @@
 //!
 //! 書き込みゼロの rw session (= 開いて読んで閉じるだけ) が、 `impl Drop for Database`
 //! の無条件 `persist_schema()` で `.schema` fsync + engine flush を毎回払っている。
-//! 消費側 (kenning の増分 update、 `sf` の条件付き更新) は 1 コマンド 1 process なので
+//! 消費側 (コード索引の CLI の増分 update、 別の CLI の条件付き更新) は 1 コマンド 1 process なので
 //! これが定数として効く。
 //!
 //! ```text

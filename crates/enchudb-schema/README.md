@@ -30,7 +30,7 @@ SQL crate (`enchudb-sql`) はこの schema 層の上に乗る parser。
 | schema (declarator) | `enchudb-schema` | DDL 宣言、 schema 永続化、 declarative CRUD (低頻度) |
 | **engine (runtime)** | **`enchudb-engine`** | **hot path、 ns 級 lookup、 `_by_id` API** |
 
-「全 himo は何かの table に所属する」 という app modeling は **100% のケース** で正しい (matcha / t5ug3 / sinfo / enchu studio すべて) ので、 declarator + bindings として schema 層を持つ価値はある。 ただし runtime path で経由する必要はない (perf を犠牲にするだけ)。
+「全 himo は何かの table に所属する」 という app modeling は **100% のケース** で正しい (作者の手元の消費側アプリすべて) ので、 declarator + bindings として schema 層を持つ価値はある。 ただし runtime path で経由する必要はない (perf を犠牲にするだけ)。
 
 ## 起動時: schema で declare + 永続化
 
@@ -313,11 +313,11 @@ db.engine().oplog_sync()?;
 
 `finish_*` は `self` を consume するので呼んだ後の元 `db` は無効。 失敗条件は Arc 共有後の呼び出し (build phase で既に `Arc::new(db)` した後など)。
 
-### sinfo / multi-store パターン
+### multi-store パターン
 
 ```rust
 // 1 個の Database を 18 個の sub-store で Arc 共有
-let db = Database::create("/var/sinfo/store.db")?;
+let db = Database::create("/var/myapp/store.db")?;
 // ... build phase で 70+ himo を含む全 table を declare ...
 let db = db.finish_with_oplog(256 * 1024 * 1024)?;
 

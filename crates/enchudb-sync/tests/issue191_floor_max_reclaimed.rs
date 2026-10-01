@@ -2,7 +2,7 @@
 //!
 //! 旧実装 (生存 record の最小 HLC、 空なら Hlc::MAX) は、 reclaim 分を全部
 //! 消化済みの follower (cursor = max_reclaimed) まで gap と誤認し、 reclaim
-//! 1 回で既追従 follower 全員が bootstrap 行きになっていた (sunsu2 Phase 2
+//! 1 回で既追従 follower 全員が bootstrap 行きになっていた (負荷 harness の Phase 2
 //! chaos で発見)。
 //!
 //! 検証:

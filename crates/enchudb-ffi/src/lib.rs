@@ -469,8 +469,8 @@ mod tests {
     }
 
     #[test]
-    fn matcha_use_case_via_ffi() {
-        let db = fresh("matcha_ffi");
+    fn notif_state_use_case_via_ffi() {
+        let db = fresh("notif_state_ffi");
         for s in &[
             "CREATE TABLE notif_state (key TEXT PRIMARY KEY, dismissed_at INTEGER)",
             "INSERT INTO notif_state VALUES ('uuid-1', 1715174400)",

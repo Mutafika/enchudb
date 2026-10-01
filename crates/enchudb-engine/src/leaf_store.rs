@@ -6,7 +6,7 @@
 //! Tag は共有 dedup 辞書 (`Vocabulary`) が本来の用途だが、 Leaf は「先 (outgoing
 //! edge) の無い終端ノード」で `vocab.insert` (dedup 無し・単一所有) を使うだけ =
 //! 共有辞書性を使っていない。 それが append-only-never-reclaim の vocab に乗ると、
-//! delete しても回収されず単調増加する (wikipulse の 512MB 壁)。 本 store は Leaf を
+//! delete しても回収されず単調増加する (大 payload × 高 churn の消費側で 512MB 壁)。 本 store は Leaf を
 //! vocab から剥がし、 delete/untie で **free-list に返して再利用** する。
 //!
 //! # 設計 (reclaim ≠ compaction)

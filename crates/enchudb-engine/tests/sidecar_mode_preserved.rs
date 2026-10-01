@@ -1,6 +1,6 @@
 //! sidecar (`tables` / `eidmap` / `vocabmap`) は tmp write → rename で置き換わるので、
 //! **呼び出し側が chmod した mode が rename で消える** (新しい inode が umask 由来の
-//! 0644 で生まれる)。 consumer (sinfo) が open のたびに 0600 を掛け直しているのに
+//! 0644 で生まれる)。 consumer (消費側の CLI) が open のたびに 0600 を掛け直しているのに
 //! 書き直された sidecar だけ 0644 に戻っていた、 という実測から。
 //!
 //! v10 は sidecar が directory の中に増えるので、 面としても広がる。
@@ -28,7 +28,7 @@ fn persist_keeps_the_mode_the_caller_set_on_sidecars() {
     eng.flush().unwrap();
     eng.persist_tables().unwrap();
 
-    // consumer が締める (sinfo の restrict_global_db_perms 相当)。
+    // consumer が締める (消費側の CLI の restrict_global_db_perms 相当)。
     let dir = Path::new(&path);
     let sidecars: Vec<_> = ["tables", "eidmap", "vocabmap", "schema"]
         .iter()
