@@ -22,15 +22,10 @@ fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
 
 /// `_sync_ops` ring が満杯 (bridge が backpressure で止まる状態)。
 ///
-/// 「今の枠に空きが無い」 だけでは満杯でない。 `entity_in` は枠を使い切ると、 どの table にも割り当てていない
-/// eid 空間から枠を足す (v10 Phase 3) — この DB では 508 → 953。 508 行目を払い出してから次の行で枠を足すまで
-/// (bridge が動いている間は一瞬、 手元の debug build で 34 µs) は空きが 0 に見えるので、 それを満杯と読むと、
-/// その後で枠が伸びて bridge は止まらない (#364: CI で時々落ちた)。
-/// 足せる eid 空間が残っていないことを**先に**見る: この test は entity cap を伸ばさないので残りは減るだけで、
-/// 0 を見た後は枠が伸びない (逆の順だと、 2 つの読みの間に枠が足されて満杯に見える)。
+/// ring は枠を自動では足さない (#368) ので、 空きが 0 なら満杯。 0.26.0 〜 0.28.3 は ring も空き eid 空間から
+/// 枠を足していて (この DB では 508 → 953)、 足す直前の 「空き 0」 を満杯と読んで CI で時々落ちた (#364)。
 fn ring_full(eng: &Engine) -> bool {
-    eng.remaining_eid_capacity() == 0
-        && eng.table_eid_usage("_sync_ops").expect("_sync_ops が無い").free == 0
+    eng.table_eid_usage("_sync_ops").expect("_sync_ops が無い").free == 0
 }
 
 /// 失敗した時に出す ring の状態 (枠が伸びたのか、 行が減ったのかを 1 回の失敗で決める)。
@@ -69,7 +64,7 @@ fn cleanup(path: &str) {
 
 /// ring が埋まるまで tie し続ける（1 entity への tie 連打なので user table は消費しない）。
 /// batch ごとに consumer の bridge が 「読み切る」 か 「満杯で止まる」 まで待ち、
-/// `_sync_ops` がこれ以上伸びず空きも 0 になったら ([`ring_full`]) 満杯として返す。
+/// `_sync_ops` の空きが 0 になったら ([`ring_full`]) 満杯として返す。
 /// 旧実装は 150ms sleep 後の pending の頭打ちで満杯と推定していたが、 遅い CI では
 /// bridge が遅れただけの頭打ちを満杯と誤認する (#336)。
 fn fill_ring(eng: &Arc<Engine>, e: u64, start: u32) -> (u32, usize) {
