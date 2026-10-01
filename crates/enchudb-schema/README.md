@@ -97,6 +97,7 @@ let one    = users.where_eq("id", 1i64).find_one()?;
 
 let prime  = users.where_range("age", 25, 35).find()?;
 let adults = users.all().where_ge("age", 18i64).find()?;   // where_gt / ge / lt / le は Query 側 (all() から)
+let latest = users.recent(80);                               // 新しい順 (insert の逆順) に最大 80 件
 
 let age = users.entity(alice).get("age");
 users.entity(alice).set("age", 31i64).commit()?;
@@ -106,6 +107,11 @@ users.entity(alice).update()
     .commit()?;
 users.entity(alice).delete()?;
 ```
+
+`recent(n)` は table の末尾から逆にたどって `n` 件そろった所で止まるので、 table の大きさによらない
+(直近 80 件が 5 万行でも 100 万行でも 0.5〜0.6 µs、 `examples/recent_bench.rs`。 `all().find()` や `order_by_desc(..).limit(n)` は全 row を集める)。 順序は
+eid を払い出した順の逆 — table の枠を使い切った後に削除済みの eid が使い直された時と、 sync で届いた row
+(届いた順) は書き込みの順とずれる。 時刻で並べたいなら時刻の列で `order_by_desc(col).limit(n)`。
 
 ## relation (cross-table ref)
 

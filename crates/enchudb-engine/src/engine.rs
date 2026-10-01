@@ -10368,6 +10368,76 @@ impl Engine {
             .collect()
     }
 
+    /// 列 `himo_id` に値のある row を、 **新しい順** (その列の table が eid を払い出した逆順) に最大 `n` 件 (#21)。
+    ///
+    /// 「直近 N 件」 用。 table の払い出し済みの末尾から逆にたどり、 `n` 件そろった所で止まる — コストは
+    /// `n` + 途中で飛ばした row (削除済み / この列に値の無い row) の数で、 table の大きさによらない。
+    /// [`Engine::entities_with_himo`] は列を先頭から全部なめる (O(table))。
+    ///
+    /// 戻り値の eid は [`Engine::entities_with_himo`] と同じ形 (peer prefix 付き)、 降順とは限らない
+    /// (枠を足した table は extent をまたぐ)。
+    ///
+    /// 「新しい順」 は **eid を払い出した順**の逆で、 次の時は書き込みの順とずれる:
+    /// - 削除で空いた eid が使い直された時。 table のある列は、 枠 (`table_eid_usage().capacity`) を使い切って
+    ///   初めて削除済みの eid を使い直す (それまでは末尾に足すだけ)。 table に属さない列 (`define_himo` /
+    ///   `entity()`) は削除のたびに使い直すので、 削除のある使い方では順序の保証が無い
+    /// - sync で届いた row は、 届いた順に払い出される (相手が書いた順ではない)
+    ///
+    /// 書き込みの時刻で並べたいなら、 時刻の列を持って `order_by_desc(..).limit(n)` (schema) を使う。
+    pub fn recent_by_id(&self, himo_id: u16, n: usize) -> Vec<enchudb_oplog::EntityId> {
+        use std::sync::atomic::Ordering;
+        let hid = himo_id as usize;
+        let Some(hs) = self.himos.get(hid) else { return Vec::new(); };
+        if n == 0 {
+            return Vec::new();
+        }
+        let tid = self.himo_table_get(hid).unwrap_or(ANONYMOUS_TABLE) as usize;
+        let Some(table) = self.tables.get(tid) else { return Vec::new(); };
+
+        // 払い出し済みの範囲を extent ごとに `[lo, end)` で (払い出しの順)
+        let mut spans: Vec<(u32, u32)> = Vec::new();
+        if tid == ANONYMOUS_TABLE as usize {
+            // table に属さない列: eid は EntitySet が 0 から払い出す (`next_local` は使わない)
+            let end = self.entities.next_eid().min(table.eid_range_hi);
+            if end > table.eid_range_lo {
+                spans.push((table.eid_range_lo, end));
+            }
+        } else {
+            let mut left = table.next_local.load(Ordering::Acquire).min(table.capacity());
+            for (lo, hi) in table.extents() {
+                if left == 0 {
+                    break;
+                }
+                let used = left.min(hi - lo);
+                spans.push((lo, lo + used));
+                left -= used;
+            }
+        }
+
+        let peer = self.peer_id();
+        let mut out = Vec::with_capacity(n.min(1024));
+        for &(lo, end) in spans.iter().rev() {
+            for eid in (lo..end).rev() {
+                if hs.get_value(eid).is_some() {
+                    out.push(enchudb_oplog::make_eid(peer, eid));
+                    if out.len() == n {
+                        return out;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// [`Engine::recent_by_id`] の名前版 (`himo` は `himo_id` に渡す名前 = table の列なら `"table.col"`)。
+    /// 未定義の列は空。
+    pub fn recent(&self, himo: &str, n: usize) -> Vec<enchudb_oplog::EntityId> {
+        match self.himo_id(himo) {
+            Some(hid) => self.recent_by_id(hid as u16, n),
+            None => Vec::new(),
+        }
+    }
+
     /// 指定 entity 群の紐値を合計
     pub fn sum(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> u64 {
         let hid = match self.himo_id(himo) { Some(h) => h, None => return 0 };
