@@ -50,20 +50,26 @@ pub enum EntityValueOwned {
 
 /// table の eid 枠の使用状況。 `Engine::table_eid_usage` の戻り値。
 ///
-/// 枠 (`capacity`) は create 時に固定で、 後から伸ばせない。 溢れると
-/// `entity_in` が `Err` を返し、 **アプリの掃引がそこで止まる** — 掃引が
-/// 止まると削除も流れなくなり、 削除は枠を空ける唯一の手段なので回復不能に
-/// なる。 その手前で気付けるように、 残量を公式に問い合わせられるようにした。
+/// 数えるのは**今ある枠**だけ。 枠を使い切ると `entity_in` は、 どの table にも割り当てていない eid 空間
+/// ([`Engine::remaining_eid_capacity`]) から枠を足す (v10 Phase 3)。 なので `free == 0` は 「次の `entity_in` が
+/// 枠を足す」 であって、 満杯ではない (#364)。 満杯 = `entity_in` が `Err` を返すのは、
+/// `remaining_eid_capacity() == 0` かつ `free == 0` の時。 書き手が動いている間に見るなら、 この順に見る:
+/// 残りは [`Engine::grow_entity_cap`] を呼ばない限り減るだけなので、 0 を見た後は枠が伸びない (逆の順だと、
+/// 2 つの読みの間に枠が足されて満杯に見える)。
+///
+/// 満杯になると **アプリの掃引がそこで止まる** — 掃引が止まると削除も流れなくなり、 削除は枠を空ける手段なので
+/// 抜け出しにくい (他の手段は [`Engine::grow_entity_cap`])。 その手前で気付けるように、 残量を問い合わせられる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TableEidUsage {
-    /// 枠の総数 (= `eid_range_hi - eid_range_lo`)。
+    /// 今ある枠の総数 (全 extent の合計)。 枠を足すと増える。
     pub capacity: u32,
     /// これまでに払い出した最大 (= `next_local`)。 削除で空いた分は含んだまま。
     pub allocated: u32,
     /// いま生きている行数。
     pub live: u32,
-    /// あと何行入るか (= `capacity - live`)。 削除で空いた slot は
-    /// `entity_in` が free list 経由で再利用するのでここに戻る。
+    /// 今ある枠にあと何行入るか (= `capacity - live`)。 削除で空いた slot は
+    /// `entity_in` が free list 経由で再利用するのでここに戻る。 0 でも、 空き eid 空間が
+    /// 残っていれば次の `entity_in` で枠が足される。
     pub free: u32,
 }
 
@@ -7308,9 +7314,10 @@ impl Engine {
 
     /// table の eid 枠の使用状況 (未定義 table は `None`)。
     ///
-    /// 枠は create 時に固定なので、 **満杯にする前に気付く**のがアプリ側の唯一の
-    /// 防御になる。 満杯後は `entity_in` が `Err` を返し、 そこで掃引を止めると
-    /// 削除まで流れなくなって回復不能になる (削除は枠を空ける唯一の手段)。
+    /// 数えるのは今ある枠だけ。 `free == 0` でも、 空き eid 空間 ([`Engine::remaining_eid_capacity`]) が
+    /// 残っていれば次の `entity_in` で枠が足される。 満杯は `remaining_eid_capacity() == 0` かつ `free == 0`
+    /// (見る順と理由は [`TableEidUsage`])。 **満杯にする前に気付く**のがアプリ側の防御になる: 満杯後は
+    /// `entity_in` が `Err` を返し、 そこで掃引を止めると削除まで流れなくなる (削除は枠を空ける手段)。
     pub fn table_eid_usage(&self, name: &str) -> Option<TableEidUsage> {
         let t = self.tables.iter().find(|t| t.name == name)?;
         let capacity = t.capacity();

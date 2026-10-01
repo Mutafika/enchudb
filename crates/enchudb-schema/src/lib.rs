@@ -629,8 +629,9 @@ impl Database {
     /// できる方が事故になる)。
     pub fn remaining_eid_capacity(&self) -> u32 { self.eng.remaining_eid_capacity() }
 
-    /// table の eid 枠の使用状況 (未定義 table は `None`)。 枠は create 時に固定で
-    /// 後から伸ばせないので、 **満杯にする前に気付く**のがアプリ側の防御になる。
+    /// table の eid 枠の使用状況 (未定義 table は `None`)。 数えるのは今ある枠だけで、 使い切ると
+    /// 空き eid 空間 ([`Database::remaining_eid_capacity`]) から枠が足される。 満杯 (insert が失敗する) は
+    /// `remaining_eid_capacity() == 0` かつ `free == 0`。 **満杯にする前に気付く**のがアプリ側の防御になる。
     pub fn table_eid_usage(&self, name: &str) -> Option<TableEidUsage> {
         self.eng.table_eid_usage(name)
     }
