@@ -26,9 +26,11 @@ fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
 /// `_sync_ops` ring が満杯 (bridge が backpressure で止まる状態)。
 ///
 /// 「今の枠に空きが無い」 だけでは満杯でない。 `entity_in` は枠を使い切ると、 どの table にも割り当てていない
-/// eid 空間から枠を足す (v10 Phase 3) — この DB では 508 → 953。 足す直前の一瞬 (実測 34 µs) は空きが 0 に
-/// 見えるので、 それを満杯と読むと、 その後で枠が伸びて bridge は止まらない (#364: CI で時々落ちた)。
-/// 足せる eid 空間が残っていないことを**先に**見る: 残りは減るだけなので、 0 を見た後は枠が伸びない。
+/// eid 空間から枠を足す (v10 Phase 3) — この DB では 508 → 953。 508 行目を払い出してから次の行で枠を足すまで
+/// (bridge が動いている間は一瞬、 手元の debug build で 34 µs) は空きが 0 に見えるので、 それを満杯と読むと、
+/// その後で枠が伸びて bridge は止まらない (#364: CI で時々落ちた)。
+/// 足せる eid 空間が残っていないことを**先に**見る: この test は entity cap を伸ばさないので残りは減るだけで、
+/// 0 を見た後は枠が伸びない (逆の順だと、 2 つの読みの間に枠が足されて満杯に見える)。
 fn ring_full(eng: &Engine) -> bool {
     eng.remaining_eid_capacity() == 0
         && eng.table_eid_usage("_sync_ops").expect("_sync_ops が無い").free == 0
