@@ -128,3 +128,43 @@ fn one_shot_exec_via_dash_e() {
 
     cleanup(&db);
 }
+
+/// #107: `--readonly` (別 process の書き手が動いている DB を見るための開き方) の `.entity` / `.dump` は、
+/// Leaf の列を copy 版 (`get_entity_owned`) で読む。 借用版のままだと debug build の番人が止める。
+#[test]
+fn readonly_entity_and_dump_read_leaf_columns() {
+    let db = tmp_db("readonly_leaf");
+    let status = Command::new(bin())
+        .args(["--create", "--tiny", db.to_str().unwrap()])
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::inherit())
+        .status().unwrap();
+    assert!(status.success());
+
+    let run = |args: &[&str], script: &str| {
+        let mut child = Command::new(bin())
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn().unwrap();
+        child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+        drop(child.stdin.take());
+        child.wait_with_output().unwrap()
+    };
+
+    let out = run(
+        &[db.to_str().unwrap()],
+        ".define body leaf\n.define city tag\n.define age num\n+ body:\"leaf value\" city:\"Tokyo\" age:30\n",
+    );
+    assert!(out.status.success(), "write failed\n{}", String::from_utf8_lossy(&out.stderr));
+
+    let out = run(&["--readonly", db.to_str().unwrap()], ".entity 0\n.dump 5\n");
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "readonly REPL exited with {:?}\nstderr: {stderr}", out.status);
+    assert!(!stderr.contains("#107"), "番人に止められた\n{stderr}");
+    assert!(stdout.contains("body: \"leaf value\""), ".entity should print the leaf value\n{stdout}\n{stderr}");
+    assert!(stdout.contains("city: \"Tokyo\""), "{stdout}");
+    assert!(stdout.contains("0: body=\"leaf value\" city=\"Tokyo\" age=30"), ".dump should print the row\n{stdout}");
+
+    cleanup(&db);
+}

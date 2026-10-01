@@ -109,6 +109,66 @@ pub struct LeafStore {
     /// 独立カウンタにする。 in-memory (writer 単一プロセス内で単調)。 wrap は 2^31 insert
     /// 毎 = reader の read 窓 (µs) では衝突しない。
     gen_seq: std::sync::atomic::AtomicU32,
+    /// #107: 借用の読みと別 thread の書き込みが重なりうるかの記録 (debug build だけ)。
+    borrow_watch: BorrowWatch,
+}
+
+/// #107: 借用の読み (`get`) と、 別の thread の書き込みが重なりうるかの記録。 **debug build だけ**中身を
+/// 持つ (release build では空の型で、 呼び出しも消える)。
+///
+/// 借用は live mmap を指すので、 返した後に別の thread が slot を返す / 置き直すと手元の `&[u8]` の中身が
+/// 変わる。 借用を返した後のことは store からは見えない (いつ手放したか分からない) ので、 見るのは
+/// **「借用の読みが始まった後に、 その読み手でない thread が書いた」** という証拠だけ:
+///
+/// - 1 本の thread で書いて読む → 読み手 = 書き手なので何も立たない
+/// - 書き終えてから複数の thread で読むだけ → 書き込みが無いので何も立たない
+/// - 読み手と別の thread が書く (並行の書き手 / async の書き込みを適用する consumer / sync の apply) →
+///   `raced` が立ち、 次の借用の読みから止まる
+///
+/// 見逃すもの: 最初の 1 回 (書き手が読み手の印を見る前に読みが入った時)、 と、 1 本の thread が借用を
+/// 持ったまま自分で書く場合。 止めすぎるもの: 別々の thread が**時間をずらして**読んで書く場合 (重なって
+/// いなくても、 読みが始まった後の別 thread の書き込みなので立つ)。
+#[derive(Default)]
+struct BorrowWatch {
+    /// 借用の読みをした thread の印。 0 = まだ無い、 [`BorrowWatch::MANY`] = 2 本以上。
+    #[cfg(debug_assertions)]
+    reader: std::sync::atomic::AtomicU64,
+    /// 借用の読みが始まった後に、 その読み手でない thread が slot を置いた / 返した。
+    #[cfg(debug_assertions)]
+    raced: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(debug_assertions)]
+impl BorrowWatch {
+    const MANY: u64 = u64::MAX;
+
+    /// この thread の印 (1 から、 process の中で一意)。
+    fn me() -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        thread_local! {
+            static ME: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
+        }
+        ME.with(|m| *m)
+    }
+
+    fn note_write(&self) {
+        let reader = self.reader.load(Ordering::SeqCst);
+        if reader != 0 && reader != Self::me() {
+            self.raced.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// 借用の読みを記録する。 返り値 = 別の thread の書き込みと重なった証拠が**無い**か。
+    fn note_borrow(&self) -> bool {
+        let me = Self::me();
+        if let Err(seen) = self.reader.compare_exchange(0, me, Ordering::SeqCst, Ordering::SeqCst)
+            && seen != me
+            && seen != Self::MANY
+        {
+            self.reader.store(Self::MANY, Ordering::SeqCst);
+        }
+        !self.raced.load(Ordering::SeqCst)
+    }
 }
 
 // Region は raw ptr を持つため。 vocab / entity_set と同じ扱い (writer 排他は
@@ -133,6 +193,7 @@ impl LeafStore {
             holes: Mutex::new(BTreeMap::new()),
             off_shift,
             gen_seq: std::sync::atomic::AtomicU32::new(0),
+            borrow_watch: BorrowWatch::default(),
         };
         let data_start = s.data_start_byte();
         // #167: init 時 (header 領域) の commit。 write 経路は `insert` 側で
@@ -173,6 +234,7 @@ impl LeafStore {
             holes: Mutex::new(BTreeMap::new()),
             off_shift,
             gen_seq: std::sync::atomic::AtomicU32::new(0),
+            borrow_watch: BorrowWatch::default(),
         })
     }
 
@@ -268,6 +330,13 @@ impl LeafStore {
     #[inline]
     fn header_len(ss_raw: u32) -> usize {
         if ss_raw & HAS_GEN != 0 { SLOT_HEADER_GEN } else { SLOT_HEADER }
+    }
+
+    /// #107 (debug build): 借用の読みを記録し、 別の thread の書き込みと重なった証拠が**無い**かを返す。
+    /// engine の借用 API (`get_text` / `get_content` / `get_entity`) が [`LeafStore::get`] の前に呼ぶ。
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_note_borrow(&self) -> bool {
+        self.borrow_watch.note_borrow()
     }
 
     /// slot 先頭 (word offset) から payload を読む。 **single-thread / quiesce 前提**
@@ -410,6 +479,8 @@ impl LeafStore {
     /// あればそこへ、 無ければ high_water を伸ばす。
     /// slot を確保して payload を書く。 **commit を伸ばせなければ `u32::MAX`** (#167)。
     pub fn insert(&self, bytes: &[u8]) -> u32 {
+        #[cfg(debug_assertions)]
+        self.borrow_watch.note_write();
         let blen = bytes.len();
         assert!(blen <= (u32::MAX as usize - SLOT_HEADER_GEN), "leaf value too large");
         // #106: 新規 slot は常に gen 付き 12B header。
@@ -514,6 +585,8 @@ impl LeafStore {
 
     /// slot を解放 (word offset)。 隣接 free hole と coalesce し、 末尾なら high_water 後退。
     pub fn free(&self, word_off: u32) {
+        #[cfg(debug_assertions)]
+        self.borrow_watch.note_write();
         let mut hsize = self.b2w(self.slot_size_bytes_at(word_off) as usize);
 
         // #132: 何よりも先に「この offset はもう読めない」を publish する。 coalesce で

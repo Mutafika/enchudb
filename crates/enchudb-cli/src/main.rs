@@ -8,7 +8,7 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 
-use enchudb_engine::engine::{Engine, EntityValue};
+use enchudb_engine::engine::{Engine, EntityValueOwned};
 use enchudb_engine::himo_store::ValueType;
 use enchudb_engine::query_lang;
 
@@ -313,20 +313,20 @@ fn cmd_entities(eng: &Engine, limit: usize) {
 }
 
 fn cmd_entity(eng: &Engine, eid: u64) -> Result<(), String> {
-    let fields = eng.get_entity(eid);
+    // copy 版で読む: `--readonly` は別 process の書き手が動いている DB を見るための開き方 (#107)
+    let fields = eng.get_entity_owned(eid);
     if fields.is_empty() {
         return Err(format!("entity {eid} has no fields (or does not exist)"));
     }
     println!("eid={eid}");
     for (name, val) in fields {
         match val {
-            EntityValue::Num(n) => println!("  {name}: {n}"),
-            EntityValue::Num64(n) => println!("  {name}: {n}"),
-            EntityValue::Text(b) => match std::str::from_utf8(b) {
+            EntityValueOwned::Num(n) => println!("  {name}: {n}"),
+            EntityValueOwned::Num64(n) => println!("  {name}: {n}"),
+            EntityValueOwned::Text(b) => match std::str::from_utf8(&b) {
                 Ok(s) => println!("  {name}: \"{s}\""),
                 Err(_) => println!("  {name}: <{} bytes>", b.len()),
             },
-            EntityValue::Content(b) => println!("  {name}: <content {} bytes>", b.len()),
         }
     }
     Ok(())
@@ -375,18 +375,17 @@ fn cmd_dump(eng: &Engine, limit: usize) {
     let eids = eng.entities();
     let n = eids.len().min(limit);
     for eid in eids.iter().take(n) {
-        let fields = eng.get_entity(*eid);
+        let fields = eng.get_entity_owned(*eid);
         if fields.is_empty() { continue; }
         print!("{eid}:");
         for (name, val) in fields {
             match val {
-                EntityValue::Num(v) => print!(" {name}={v}"),
-                EntityValue::Num64(v) => print!(" {name}={v}"),
-                EntityValue::Text(b) => match std::str::from_utf8(b) {
+                EntityValueOwned::Num(v) => print!(" {name}={v}"),
+                EntityValueOwned::Num64(v) => print!(" {name}={v}"),
+                EntityValueOwned::Text(b) => match std::str::from_utf8(&b) {
                     Ok(s) => print!(" {name}=\"{s}\""),
                     Err(_) => print!(" {name}=<{}b>", b.len()),
                 },
-                EntityValue::Content(b) => print!(" {name}=<content {}b>", b.len()),
             }
         }
         println!();
