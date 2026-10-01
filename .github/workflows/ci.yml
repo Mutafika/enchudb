@@ -1,10 +1,14 @@
 name: CI
 
-# core crate 群 (oplog / engine / schema / sql / sync) の standing test。 push / PR ごとに
-# 回り、 論理正当性・並行安全性・破損耐性・unsafe UB を毎回 gate する。 #95 で足した
-# proptest / fault-injection / Miri / loom もここに乗るので「一回きりの証明」ではなく
-# 永続的な回帰テストになる。 root meta crate (examples/bench) と transport / ffi は対象外
-# (root は duckdb bundled 等の重量 dev-dep があるため。 拡張は #98)。
+# 全 crate の standing test。 push / PR ごとに回り、 論理正当性・並行安全性・破損耐性・
+# unsafe UB を毎回 gate する。 #95 で足した proptest / fault-injection / Miri / loom も
+# ここに乗るので「一回きりの証明」ではなく永続的な回帰テストになる。
+#
+# test は 3 job に分ける (core の待ち時間を伸ばさない / どこが落ちたかが job 名で分かる):
+#   - test          : core 5 crate (oplog / engine / schema / sql / sync)
+#   - test-periphery: connect / kafka / ngram / textsearch / transport / ffi / cli / rag
+#   - test-root     : root meta crate (duckdb / rusqlite bundled の重量 dev-dep を持つ)
+# 以前は core 5 crate だけで、 残りは壊れても信号が出なかった (#98)。
 
 on:
   push:
@@ -31,6 +35,37 @@ jobs:
           -p enchudb-schema
           -p enchudb-sql
           -p enchudb-sync
+
+  test-periphery:
+    name: test (periphery crates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # kafka の結合 test は ENCHU_KAFKA (broker) が無ければ飛ぶ。 ここでは build と単体だけ。
+      - name: cargo test (periphery crates)
+        run: >
+          cargo test
+          -p enchudb-connect
+          -p enchudb-kafka
+          -p enchudb-ngram
+          -p enchudb-textsearch
+          -p enchudb-transport
+          -p enchudb-ffi
+          -p enchudb-cli
+          -p enchudb-rag
+
+  test-root:
+    name: test (root crate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # root crate の integration test。 #213 (取り残された should_panic) はここを回して見つけた。
+      - name: cargo test (root crate)
+        run: cargo test -p enchudb
 
   miri:
     name: miri (unsafe UB)
@@ -93,6 +128,36 @@ jobs:
           -p enchudb-schema
           -p enchudb-sql
           -p enchudb-sync
+
+  wasm-check:
+    name: check (wasm cross)
+    runs-on: ubuntu-latest
+    # #230: wasm32 の cfg gate は native の test では compile されない。 PR #194 の初版は
+    # cfg の付く位置がずれて enchudb-ngram の wasm build を壊したが、 どこにも信号が出なかった。
+    # ここで守るのは **今通っている組だけ**:
+    #   - wasm32-unknown-unknown: ngram / textsearch
+    #   - wasm32-wasip1         : ngram / textsearch / oplog
+    # engine (と、 それに依存する schema / sync / root) はどちらの target でも通らない
+    # (unknown-unknown は getrandom、 wasip1 は rayon / SegmentKind)。 直すか gate を外すかは #230。
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown, wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check (wasm32-unknown-unknown)
+        run: >
+          cargo check
+          --target wasm32-unknown-unknown
+          -p enchudb-ngram
+          -p enchudb-textsearch
+      - name: cargo check (wasm32-wasip1)
+        run: >
+          cargo check
+          --target wasm32-wasip1
+          -p enchudb-ngram
+          -p enchudb-textsearch
+          -p enchudb-oplog
 
   clippy:
     name: clippy
