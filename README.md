@@ -54,6 +54,8 @@ let alice = users.insert()
 let hits = users.where_eq("age", 30i64)
     .where_eq("name", "Alice")
     .find()?;
+
+let latest = users.recent(80);   // newest first (reverse insert order), independent of table size
 ```
 
 `build()` pre-resolves col → himo_id, so the hot-path string lookup disappears internally. "Drop to the engine for performance" is normally unnecessary (the schema layer has been zero-cost since v0.3.0).
