@@ -3,6 +3,65 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.28.4 — 2026-10-02
+
+patch。 on-disk format・wire は不変、 migration 不要。 公開 API の変更なし。
+
+**上げる時に 1 つだけ注意**: sync の ring (`_sync_ops`) が、 枠を自動では足さなくなった (#368)。 ack が来ない間に
+ring に溜められる record の数は、 「entity cap の残り全部」 から 「ring の大きさ」 (`enable_sync_tables` が決める、
+残りの eid 空間の半分で最大 1 M 行) に戻る — 0.25 までと同じ。 満杯になると bridge が止まって ack + reclaim を待ち、
+運べない record は WAL で待つ (WAL も一杯なら floor を上げて bootstrap、 #57)。 もっと溜めたい時は
+`Engine::grow_table("_sync_ops", n)`。
+
+### Fixed — ack が来ないと、 sync の ring が空いている eid 空間を全部取っていた (#368)
+
+`_sync_ops` は満杯になったら bridge が止まる作りの ring だが、 0.26.0 で入った枠の自動追加 (table が枠を使い切ると、
+どの table にも割り当てていない eid 空間から枠を足す) が ring にも効いていた。 ack が来ない間は、 空いている eid 空間を
+全部取るまで止まらない。 取られた後は user の table が枠を足せず、 `entity_in` が `exhausted` を返す。 user の行が
+増えていなくても起きる (同じ 1 行を書き換え続けるだけで、 書き換えの record が ring に溜まる)。
+
+実測 (entity cap 1024、 `notes` の枠 8、 ring の最初の枠 508、 残りの eid 空間 445。 ack なしで `notes` の 1 行を
+書き換え続けた後):
+
+| | ring の枠 | 残りの eid 空間 | `notes` に入る行 |
+|---|---|---|---|
+| 0.28.3 | `[(8, 516), (579, 1024)]` | 0 | 8 |
+| 0.28.4 | `[(8, 516)]` | 445 | 453 |
+
+- 足さないのは ring だけ。 `_sync_peers` (peer ごとに 1 行)、 アプリの reserved table、 user の table は今まで通り伸びる
+- 明示の `Engine::grow_table("_sync_ops", n)` は効く。 足した分だけ、 待っていた record が運ばれる
+- 満杯の ring の error は効く手を言う: `ring is full (N eids — ack_sync + reclaim_sync_ops frees it,
+  Engine::grow_table enlarges it)`。 今までの文面は `grow_entity_cap` を勧めていたが、 entity cap を伸ばしても
+  ring は空かない
+- **0.26.0 〜 0.28.3 で既に伸びた ring はそのまま** (枠は縮めない)。 eid 空間を取られた DB は
+  `Engine::grow_entity_cap` で足す
+
+測ったのは小さい DB だけ。 既定の大きさ (entity cap 16 M、 ring 1 M) では測っていない (経路は同じ)。
+
+### Fixed — release build で dead_code の警告が 1 つ出ていた (0.28.3 の regression)
+
+0.28.3 の `enchudb-engine` は release build で `field borrow_watch is never read` を出す。 #107 の番人は debug build
+だけ中身を持つ型で、 release build では読む所が全部消えて field だけが残っていた。 動きには影響しない
+(空の型で、 大きさも変わらない)。
+
+### Fixed — `TableEidUsage` の doc: 「枠は固定で伸ばせない」 は 0.26.0 から誤り (#364)
+
+`free == 0` は 「次の `entity_in` が枠を足す」 であって、 満杯ではない。 満杯 (`entity_in` が `Err`) は
+`remaining_eid_capacity() == 0` かつ `free == 0` — 書き手が動いている間に見るなら、 この順に見る (逆の順だと、
+2 つの読みの間に枠が足されて満杯に見える)。 `_sync_ops` は上の通り枠を足さないので、 `free == 0` が満杯。
+
+この doc の通りに 「空き 0 = 満杯」 と読んでいた engine の test 2 本が、 枠が伸びる直前の一瞬を踏んで CI で時々
+落ちていた (#364、 `full_ring_backpressures_instead_of_dropping`)。 枠を足す直前に 60 ms 眠らせると 3 回中 3 回、
+CI と同じ文面で落ちる。 同じ状況で `reopened_store_recovers_reclaimed_slots_and_keeps_bridging` は、 肝心の
+reopen 後の自己修復を外しても通っていた (前提が黙って抜ける)。 今は ring が伸びないので、 どちらも起きない。
+
+### CI
+
+- `check (release profile)`: `RUSTFLAGS="-D unused" cargo check --release --workspace`。 `cfg(debug_assertions)` の
+  付いたコードは debug の test / clippy では全部 compile されるので、 release build でだけ出るものは信号が無かった
+  (上の警告がそれ)。 `-D warnings` でなく `-D unused` なのは、 toolchain が上がって lint が増えた時に関係ない PR を
+  赤くしないため
+
 ## 0.28.3 — 2026-10-01
 
 patch。 on-disk format・wire は不変、 migration 不要。 公開 API は追加だけ (`Table::recent` / `Engine::recent_by_id` /
