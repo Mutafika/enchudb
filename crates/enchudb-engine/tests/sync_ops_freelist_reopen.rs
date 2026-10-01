@@ -20,9 +20,25 @@ fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
     }
 }
 
-/// `_sync_ops` ring に空きが無い (bridge が backpressure で止まる状態)。
+/// `_sync_ops` ring が満杯 (bridge が backpressure で止まる状態)。
+///
+/// 「今の枠に空きが無い」 だけでは満杯でない。 `entity_in` は枠を使い切ると、 どの table にも割り当てていない
+/// eid 空間から枠を足す (v10 Phase 3) — この DB では 508 → 953。 足す直前の一瞬 (実測 34 µs) は空きが 0 に
+/// 見えるので、 それを満杯と読むと、 その後で枠が伸びて bridge は止まらない (#364: CI で時々落ちた)。
+/// 足せる eid 空間が残っていないことを**先に**見る: 残りは減るだけなので、 0 を見た後は枠が伸びない。
 fn ring_full(eng: &Engine) -> bool {
-    eng.table_eid_usage("_sync_ops").expect("_sync_ops が無い").free == 0
+    eng.remaining_eid_capacity() == 0
+        && eng.table_eid_usage("_sync_ops").expect("_sync_ops が無い").free == 0
+}
+
+/// 失敗した時に出す ring の状態 (枠が伸びたのか、 行が減ったのかを 1 回の失敗で決める)。
+fn ring_state(eng: &Engine) -> String {
+    format!(
+        "usage={:?} extents={:?} remaining_eid_capacity={}",
+        eng.table_eid_usage("_sync_ops"),
+        eng.table_eid_extents("_sync_ops"),
+        eng.remaining_eid_capacity(),
+    )
 }
 
 /// bridge が oplog を読み切った (cursor が head に追いついた)。
@@ -51,7 +67,7 @@ fn cleanup(path: &str) {
 
 /// ring が埋まるまで tie し続ける（1 entity への tie 連打なので user table は消費しない）。
 /// batch ごとに consumer の bridge が 「読み切る」 か 「満杯で止まる」 まで待ち、
-/// `_sync_ops` の空きが 0 になったら満杯として返す。
+/// `_sync_ops` がこれ以上伸びず空きも 0 になったら ([`ring_full`]) 満杯として返す。
 /// 旧実装は 150ms sleep 後の pending の頭打ちで満杯と推定していたが、 遅い CI では
 /// bridge が遅れただけの頭打ちを満杯と誤認する (#336)。
 fn fill_ring(eng: &Arc<Engine>, e: u64, start: u32) -> (u32, usize) {
@@ -69,7 +85,10 @@ fn fill_ring(eng: &Arc<Engine>, e: u64, start: u32) -> (u32, usize) {
             return (v, eng.pending_sync_ops(0).len());
         }
     }
-    panic!("400 batch 書いても _sync_ops ring が満杯にならない — テスト前提が壊れている");
+    panic!(
+        "400 batch 書いても _sync_ops ring が満杯にならない — テスト前提が壊れている ({})",
+        ring_state(eng)
+    );
 }
 
 #[test]
@@ -167,10 +186,15 @@ fn full_ring_backpressures_instead_of_dropping() {
     wait_until("bridge が満杯のまま marker まで scan する", || {
         eng.bridge_last_committed_end() >= head
     });
-    assert!(ring_full(&eng), "marker の scan 前に ring が空いた — テスト前提が壊れている");
+    assert!(
+        ring_full(&eng),
+        "marker の scan 前に ring が空いた — テスト前提が壊れている ({})",
+        ring_state(&eng)
+    );
     assert!(
         eng.sync_ops_bridge_offset() < head,
-        "満杯なのに cursor が marker を越えた — 待機せず破棄している"
+        "満杯なのに cursor が marker を越えた — 待機せず破棄している ({})",
+        ring_state(&eng)
     );
 
     // ack + reclaim で ring を空ける → 待っていた record が bridge されるはず
