@@ -1,4 +1,5 @@
-//! `SparseRuns` — 大きな値 (`LockFreeCylinder` の dense に入らない値 ≥ `DENSE_CAP`) の索引。
+//! `SparseRuns` — `LockFreeCylinder` の dense の配列の外の値 (配列の窓に入らない大きな値と、 窓の中でも配列を
+//! そこまで伸ばしていない値、 #373) の索引。
 //!
 //! 値の順に並べた `(値, eid)` の **run** の組 (LSM)。 ms の時刻や 64 bit の ID のように値の種類が多い列は、
 //! 値ごとの bucket (`AppendBucket`、 1 値 ~100 B + 値 → bucket の map) だと索引が本体の 10 倍を超える。
@@ -110,6 +111,18 @@ impl SparseRuns {
         unsafe { guard.defer_destroy(old) };
     }
 
+    /// 空の索引に `(value, eid)` の組をまとめて入れる (書き手のみ、 索引を組み直す時)。 並べ直して 1 本の run に
+    /// するので、 1 件ずつ `insert` するより速い (1 件ごとの差し替えが無い)。
+    pub fn build_from(&self, mut pairs: Vec<(u64, u32)>) {
+        debug_assert!(self.is_empty(), "build_from は空の索引に");
+        if pairs.is_empty() {
+            return;
+        }
+        pairs.sort_unstable();
+        let run = Run { vals: pairs.iter().map(|p| p.0).collect(), eids: pairs.iter().map(|p| p.1).collect() };
+        self.publish(RunSet { runs: vec![Arc::new(run)], delta: Run::default() });
+    }
+
     /// `(value, eid)` を足す (書き手のみ)。
     pub fn insert(&self, value: u64, eid: u32) {
         let next = self.with(|cur| {
@@ -171,6 +184,11 @@ impl SparseRuns {
             }
             out
         })
+    }
+
+    /// 値が `lo..=hi` の entry の数 (古い entry 込み、 確保なし)。
+    pub fn count_in(&self, lo: u64, hi: u64) -> usize {
+        self.with(|set| set.all().map(|r| r.span(lo, hi).len()).sum())
     }
 
     /// entry の数 (古い entry 込み)。

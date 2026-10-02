@@ -284,12 +284,11 @@ impl HimoStore {
         }
         let col = self.col();
         let count = col.count();
-        for eid in 0..count {
+        // 全部を見てからまとめて組む (dense / sparse の振り分けを 1 度で決める、 #373)
+        self.cyl.build((0..count).filter_map(|eid| {
             let stored = stored_at(col, eid);
-            if stored != 0 {
-                self.cyl.insert(eid, stored - 1);
-            }
-        }
+            (stored != 0).then(|| (eid, stored - 1))
+        }));
         self.cyl_built.store(true, Ordering::Release);
     }
 
@@ -352,7 +351,7 @@ impl HimoStore {
         // (payload/gen) を、 offset を Acquire で読む reader が必ず観測できるようにする。
         store_at(col, eid, value + 1);
         if let Some(cyl) = cyl {
-            cyl.insert(eid, value);
+            cyl.insert(eid, value, |v, e| stored_at(col, e) == v + 1);
         }
         // compaction は Column 更新の **後** (keep = value_eq が新状態を見るため)
         if let Some((o, (len, live))) = stale {
@@ -424,7 +423,7 @@ impl HimoStore {
         if cyl.sparse_churned() {
             cyl.compact_sparse(|v, eid| stored_at(col, eid) == v + 1);
         }
-        for v in cyl.unique_values().into_iter().filter(|&v| crate::lockfree_cylinder::is_dense(v)) {
+        for v in cyl.unique_values().into_iter().filter(|&v| cyl.is_dense(v)) {
             // clean bucket (churn 痕なし) は組み直し不要 — 無条件 swap は巨大 himo で
             // write_lock の長期保持 + 旧 backing の epoch 滞留 (一時 ~2x RSS) を招く
             // (PR #103 レビュー)。write_lock 下なので flag 判定は正確。
@@ -436,9 +435,9 @@ impl HimoStore {
 
     /// 現在の unique 値数 (live 基準、churn があっても正確 — request12)。
     ///
-    /// dense (値 < `DENSE_CAP`) の分は O(1)。 大きな値 (`SparseRuns`) の分は値ごとの件数を持たないので、
-    /// Column と突き合わせて数える (O(大きな値の entry 数)) — 値の種類が多い列 (時刻 / 64 bit ID) で
-    /// 書き込みのたびに値ごとの数を保つより、 呼ばれた時に数える方が安い。
+    /// dense に置いている値の分は O(1)。 sparse (`SparseRuns`: 大きな値と、 dense の配列をそこまで伸ばしていない
+    /// まばらな値、 #373) の分は値ごとの件数を持たないので、 Column と突き合わせて数える (O(sparse の entry 数)) —
+    /// 値の種類が多い列 (時刻 / 64 bit ID / 一意な Tag) で書き込みのたびに値ごとの数を保つより、 呼ばれた時に数える方が安い。
     pub fn unique_count(&self) -> u32 {
         self.ensure_cylinder_built();
         let col = self.col();
@@ -536,7 +535,7 @@ impl HimoStore {
         }
         store_at(col, eid, stored);
         if let (Some(cyl), Some(n)) = (cyl, new) {
-            cyl.insert(eid, n);
+            cyl.insert(eid, n, |v, e| stored_at(col, e) == v + 1);
         }
         if let Some((o, (len, live))) = stale {
             self.maybe_compact(o, len, live);
@@ -621,11 +620,12 @@ impl HimoStore {
     /// 最小スライスを正しく選べる。
     pub fn slice_len(&self, value: impl CellValue) -> usize {
         let Some(value) = value.cell_value() else { return 0 };
-        if !crate::lockfree_cylinder::is_dense(value) {
-            // 大きな値は件数を持たない: 引いて数える (値の種類が多い列では 1 値あたりの件数は小さい)
+        self.ensure_cylinder_built();
+        if !self.cyl.is_dense(value) {
+            // sparse の値は件数を持たない: 引いて数える (sparse に置くのは、 値の種類が多い列か、 配列を伸ばすほど
+            // 溜まっていない値なので、 1 値あたりの件数は小さい)
             return self.pull(value).len();
         }
-        self.ensure_cylinder_built();
         self.cyl.slice_len_live(value)
     }
 
@@ -825,6 +825,72 @@ mod tests {
         hs.compact_now();
         let live = cells.iter().filter(|c| c.is_some_and(|v| v >= crate::lockfree_cylinder::DENSE_CAP as u64)).count();
         assert_eq!(hs.cyl.sparse_range(0, u64::MAX).len(), live, "compact_now 後に古い entry が残る");
+    }
+
+    /// #373: dense の配列の窓の中でもまばらな値は sparse に置き、 行が溜まると配列を伸ばして dense へ移す。 その
+    /// 移動を書き込み / 書き換え / 削除 / restore の途中で何度も踏んでも、 `pull` / `pull_range` / `slice_len` /
+    /// `unique_count` / `total` が Column の中身と一致する (移す時に古い entry・重複を live に数えない)。
+    #[test]
+    fn values_moving_from_sparse_to_dense_stay_exact_under_churn() {
+        const N: u32 = 6_000;
+        let hs = make_store64(N);
+        let mut cells: Vec<Option<u64>> = vec![None; N as usize];
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        // 3 / 9 は最初から dense、 2_000 / 2_003 / 5_000 / 70_000 は窓の中だが遠い (溜まるまで sparse)、 残りは窓の外
+        let vals = [3u64, 9, 2_000, 2_003, 5_000, 70_000, crate::lockfree_cylinder::DENSE_CAP as u64 + 1, 1 << 33];
+        let _ = hs.pull(0u32); // 索引を組んでから (以後 writer が維持する)
+        let mut was_sparse = [false; 3];
+        for step in 0..60_000 {
+            let e = (next() % N as u64) as u32;
+            // 遠い値に寄せる (溜まって配列が伸びるように)
+            let pick = |r: u64| vals[if r % 4 == 0 { (r / 4) as usize % vals.len() } else { 2 + (r / 4) as usize % 3 }];
+            match next() % 6 {
+                0 => {
+                    hs.remove(e);
+                    cells[e as usize] = None;
+                }
+                1 => {
+                    let v = pick(next());
+                    hs.restore(e, v + 1);
+                    cells[e as usize] = Some(v);
+                }
+                _ => {
+                    let v = pick(next());
+                    assert!(hs.set(e, v));
+                    cells[e as usize] = Some(v);
+                }
+            }
+            for (k, v) in [2_000u64, 2_003, 5_000].into_iter().enumerate() {
+                was_sparse[k] |= !hs.cyl.is_dense(v);
+            }
+            if step % 1_499 == 0 || step == 59_999 {
+                for &v in &vals {
+                    let want: Vec<u32> = (0..N).filter(|&i| cells[i as usize] == Some(v)).collect();
+                    let mut got = hs.pull(v);
+                    got.sort_unstable();
+                    assert_eq!(got, want, "step {step}: pull {v}");
+                    assert_eq!(hs.slice_len(v), want.len(), "step {step}: slice_len {v}");
+                }
+                for (lo, hi) in [(0u64, 2_001), (1_000, 80_000), (2_003, 2_003), (4_000, u64::MAX - 1)] {
+                    let want: Vec<u32> = (0..N).filter(|&i| cells[i as usize].is_some_and(|v| lo <= v && v <= hi)).collect();
+                    assert_eq!(hs.pull_range(lo, hi), want, "step {step}: pull_range {lo}..={hi}");
+                }
+                let distinct = vals.iter().filter(|&&v| cells.contains(&Some(v))).count();
+                assert_eq!(hs.unique_count() as usize, distinct, "step {step}: unique_count");
+                assert_eq!(hs.total(), cells.iter().filter(|c| c.is_some()).count(), "step {step}: total");
+            }
+        }
+        // 前提: 遠い値は最初 sparse に置かれ、 途中で dense に移った
+        assert_eq!(was_sparse, [true; 3], "遠い値が最初から dense だった (移動を踏んでいない)");
+        for v in [2_000u64, 2_003, 5_000] {
+            assert!(hs.cyl.is_dense(v), "{v} が dense に移っていない");
+        }
     }
 
     /// 観測 API が観測対象を確保しない (#270)。
