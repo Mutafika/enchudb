@@ -3728,7 +3728,7 @@ impl Family {
             }
             // 部分和の節 (1 段目) の entity にも印を付けて記録を作っておく。 根の評価は子の記録が
             // 無いと子を評価し直すだけで記録しない (記録は印を消費した時だけ書く) ので、 記録の無い
-            // 1 段目の先は最初に書き換わった時に 「前が不明」 = 配下の根を全部評価し直す (hacg で
+            // 1 段目の先は最初に書き換わった時に 「前が不明」 = 配下の根を全部評価し直す (live query の消費側で
             // 大きな市区町村の最初の都道府県変更が ms 級)。 登録の時に 1 回払っておく
             if let Some(c1) = self.partial {
                 let mut ts: Vec<u32> = roots.iter().filter_map(|&e| r.ref_cell(self.nodes[c1].via, e)).collect();

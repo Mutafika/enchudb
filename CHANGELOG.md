@@ -76,7 +76,7 @@ patch。 on-disk format・wire は不変、 migration 不要。 公開 API は�
 `LockFreeCylinder` の dense 配列は、 値が配列の外なら伸ばす。 その時に間の全要素へ空の bucket (`Arc` と `Buf` の
 確保で約 90 B) を作っていた。 Tag の値は DB で 1 つの辞書の ID なので、 配列は 「その列にある値の数」 でなく
 「辞書 ID の範囲」 まで伸びる — 表の多い DB では、 他の表が進めた辞書 ID の分まで全部の列が空の bucket を抱え、
-ヒープが 「Tag 列の数 × 辞書の大きさ」 で増えた (sinfohub の負荷試験で 1,000 人ごとに 150〜190 MB)。
+ヒープが 「Tag 列の数 × 辞書の大きさ」 で増えた (マルチユーザーのサーバ構成の負荷試験で 1,000 人ごとに 150〜190 MB)。
 今は配列の要素が bucket への pointer か null で、 bucket は値が最初に入った時に作る。
 
 実測 (issue の再現手順、 64,000 行、 表 1 / 4 / 8 / 16 個でのヒープの増分):
@@ -608,13 +608,13 @@ u32 上限を列単位で外す 64 bit 列 (schema `BigInt` / SQL `BIGINT`、 �
 define した DB だけ。 **API は breaking** — live / 値の型が u64 に広がった (下の移行ガイド)。
 
 対 DBSP (Feldera のエンジン、 `dbsp` 0.354 を in-process、 書き込み 1 回ごと、 出力の件数は全部一致、
-bench は repo 外の `enchu-ivm-bench`):
+bench は repo 外の比較用 harness):
 
 | 機能 | enchu | DBSP |
 |---|---|---|
 | ref をたどる購読 (社員単位) | 0.6〜2.4 µs | 39〜43 µs |
 | OR (購読 1 万本まで) | 1.2〜2.1 µs | 86〜165 µs |
-| 集計 (hacg 577 万法人、 都道府県別): 閉鎖 / 都道府県変更 | 0.8 / 0.96 µs | 85 / 3002 µs |
+| 集計 (live query の消費側・577 万法人、 都道府県別): 閉鎖 / 都道府県変更 | 0.8 / 0.96 µs | 85 / 3002 µs |
 | 上位 k 件 (自分の値 / 会社の値で並べる) | 0.8 / 0.6 µs | 34〜100 / 84〜154 µs |
 | 超大 batch (100 万件書いて 1 回 poll) | 0.21〜0.27 µs | 0.45〜0.50 µs |
 
@@ -704,7 +704,7 @@ let d = tokyo.poll();        // d.added / d.removed
   途中で購読を張り替える)、 fix / 各機構を外して落ちる変異
 - loom: `RUSTFLAGS="--cfg loom" cargo test -p enchudb-engine --test loom_live_subscribe --release`
   (登録と並行する書き込みの barrier) / `--test loom_live_dirty` (印の shard の順序)
-- 実 consumer: sunsu2 (docs だけ読んだ naive consumer、 peer 分散 SNS) の 5 peer chaos で、 sync で
+- 実 consumer: SNS 型の負荷 harness (docs だけ読んだ naive consumer、 peer 分散 SNS) の 5 peer chaos で、 sync で
   届いた書き込みに対するフィード / いいね数 / 集計が `find()` と一致 (seed 8 通り)
 - `cargo test --workspace --release`: 1263 passed / 0 failed (merge 後の master)
 
@@ -714,7 +714,7 @@ let d = tokyo.poll();        // d.added / d.removed
   `limit(1)` で代用)、 ROW_NUMBER / RANK は無い (上位 k 件で)
 - `join_range` の `subscribe_counts` / `then_*` は未対応 (`BadValue`)
 - enchudb-connect の BigInt / Number64 対応
-- 下流 (hacg / sunsu2 / sinfo) は API の型の変更への追従が要る
+- 下流 (live query の消費側アプリ / SNS 型の負荷 harness / 消費側の CLI) は API の型の変更への追従が要る
 
 ## 0.26.14 — 2026-09-18
 
@@ -725,7 +725,7 @@ migration 不要、 公開 API の削除・改名なし。 **sync tables を使�
 
 ### Fixed — Commit を打てなかったのに checkpoint を進めていた (#268)
 
-実機 (syncretic、 mac、 単一 writer) で bridge が 26.4 時間 0 を返し続け、 lsn が 859793 で
+実機 (ファイル同期の消費側アプリ、 mac、 単一 writer) で bridge が 26.4 時間 0 を返し続け、 lsn が 859793 で
 凍結した。 #269 で入れた検出器が捉えた形は `cursor=32 (ring 先頭) / head=256` で、 254 件の
 警告すべてで cursor が 1 byte も動いていない。 その 224 byte は **Commit で閉じられていない
 group** だった。
@@ -823,7 +823,7 @@ HEADER_SIZE に戻るだけで 0 にはならない (= fold と競争しない) 
 
 ## 0.26.12 — 2026-09-15
 
-**Android (bionic) で DB を一切開けなかったのを直した patch** (#280、 bisquit からの報告)。
+**Android (bionic) で DB を一切開けなかったのを直した patch** (#280、 消費側アプリからの報告)。
 on-disk format は**不変**、 migration 不要、 breaking なし、 公開 API の変更なし。
 **Android 向けに配る consumer は上げること** (0.26.0〜0.26.11 は Android で使えない)。
 他 platform (iOS / macOS / Linux / Windows) は影響なし。
@@ -836,7 +836,7 @@ on-disk format は**不変**、 migration 不要、 breaking なし、 公開 AP
 なったので、 Android では新規作成も既存 open も等しく失敗していた = 0.26.0 の regression。
 
 ```
-uniffi.bisquit_ffi.BisquitException$Open: msg=open db: Io("lock() not supported")
+uniffi.<app>_ffi.<App>Exception$Open: msg=open db: Io("lock() not supported")
 ```
 
 bionic に flock(2) が無いわけではない (NDK の `sys/file.h` が API level の制約無しに
@@ -857,7 +857,7 @@ close で解放** という意味論を他 platform と揃えたまま塞いだ�
   platform / FS ごと使えなくなるため。 同一プロセスの二重 open は従来どおり
   `WRITER_LOCK_REGISTRY` が止めるので、 1 app = 1 process の構成は安全側に倒れる
 
-**検証**: bisquit の Android 実機 (SM-F966Z / arm64-v8a) でストア作成 → ペアリング → sync
+**検証**: 消費側アプリの Android 実機 (SM-F966Z / arm64-v8a) でストア作成 → ペアリング → sync
 まで通過 (Mac 42 件 ↔ 端末 42 件で収束、 blob 転送も完了)。 回帰テスト
 `fallback_lock_excludes_other_fd_and_releases` は **別 fd から取れないこと** と
 **close / unlock で解放されること** の両方を固定しており、 no-op 実装にも fcntl 版にも
@@ -866,7 +866,7 @@ x86_64-pc-windows-msvc で通過。
 
 ## 0.26.11 — 2026-09-14
 
-**page size が違う機械の間で DB が可搬でなかったのを直した patch** (#276、 naruhodo からの報告)。
+**page size が違う機械の間で DB が可搬でなかったのを直した patch** (#276、 法令検索の消費側アプリからの報告)。
 on-disk format は**不変**、 migration 不要、 breaking なし、 公開 API の変更なし。
 **別 page size の機械へ DB を配る運用をするなら上げること** (Mac で焼いて Linux で配信する等)。
 既存 DB はそのまま開ける。
@@ -885,7 +885,7 @@ segment /data/hourei.enchu/header.seg is 16384 bytes, larger than reservation 40
 ```
 
 `probe` は Ready を返す (形式は正常) ので、 権限 / ロックを疑う方向に誤誘導する
-エラーだった。 実 DB (naruhodo の統一ストア・55 segment) では宣言 size が 16 KiB 未満の
+エラーだった。 実 DB (同じ消費側の統一ストア・55 segment) では宣言 size が 16 KiB 未満の
 **7 本**が該当していた。
 
 - reservation を runtime page ではなく host 非依存の定数 `RESERVE_ALIGN` (64 KiB) で
@@ -903,13 +903,13 @@ Linux arm64 (page 4096) へ rsync して `open_readonly` が成功、 修正を�
 EOF を含む page までなので、 mmap が EOF を越えた page を含むことはない)。
 回帰テスト `open_accepts_segment_created_by_larger_page_host` は修正を戻すと落ちる。
 
-naruhodo の 「Mac で焼いたストアを VPS (Linux) へ rsync して配信する」 運用は、 この bug の
+その消費側の 「Mac で焼いたストアを VPS (Linux) へ rsync して配信する」 運用は、 この bug の
 ために成立していなかった。 iOS は Apple Silicon と同じ 16 KiB page なので offline pack は
 偶然無事だったが、 64 KiB page の arm64 Linux が相手なら同じ形で壊れる。
 
 ## 0.26.10 — 2026-09-14
 
-**bulk load が誰も引かない逆索引を育てるのをやめた perf patch** (#270、 naruhodo からの報告)。
+**bulk load が誰も引かない逆索引を育てるのをやめた perf patch** (#270、 法令検索の消費側アプリからの報告)。
 on-disk format は**不変**、 migration 不要、 breaking なし、 公開 API の signature 変更なし。
 **大量に tie を書く consumer は上げること** — 特に 「書くだけで `pull` しない」 フルリビルド系。
 0.26.5 (#255) が **rw open** の eager build を畳んだのに対し、 これは **書き込み**に残っていた
@@ -930,7 +930,7 @@ bulk load は `pull` を一度も引かないので、 育てた index は**誰�
 `false` で始めれば writer は cylinder を触らず、 読み手が最初に `pull` した時点で
 `ensure_cylinder_built` が Column から組む — **結果は同じ**、 むしろ stale ゼロで組み上がる。
 
-| naruhodo フルリビルド (9,549 法令 / 辺 1,496 万 / 版 53,668 / tie 約 7,200 万) | 0.26.9 | 0.26.10 |
+| 法令検索の消費側アプリのフルリビルド (9,549 法令 / 辺 1,496 万 / 版 53,668 / tie 約 7,200 万) | 0.26.9 | 0.26.10 |
 |---|---:|---:|
 | **peak memory footprint** | 2.489 GB | **1.264 GB** (−49%) |
 | 峰の生存 heap | 2,073 MB | **598 MB** |
@@ -989,7 +989,7 @@ workspace (oplog / engine / schema / sql / sync) **736 tests green**、 loom 4 g
 ## 0.26.9 — 2026-09-08
 
 **build phase の tie に `*_by_id` を足し、 `himo_id` の doc の嘘を直した patch** (#264 / #265、
-どちらも naruhodo からの報告)。 on-disk format は**不変**、 breaking なし、 公開 API は
+どちらも法令検索の消費側アプリからの報告)。 on-disk format は**不変**、 breaking なし、 公開 API は
 **追加のみ**。 既存 consumer は上げなくても壊れない — build phase (`&mut self`) で tie する
 consumer が API の対称性を必要とする場合だけ。
 
@@ -1031,9 +1031,9 @@ consumer が API の対称性を必要とする場合だけ。
 ## 0.26.8 — 2026-09-07
 
 **書き込みゼロの rw session が払っていた drop の定数コストを畳んだ perf patch** (#261、
-kenning からの報告)。 on-disk format は**不変**、 breaking なし、 公開 API は追加のみ
+コード索引の CLI からの報告)。 on-disk format は**不変**、 breaking なし、 公開 API は追加のみ
 (`db_files::write_atomic_if_changed`)。 **1 コマンド 1 process で `Database` / `Engine` を
-rw open する consumer は上げること** (kenning の増分 update、 `sf` の書き込み系)。
+rw open する consumer は上げること** (コード索引の CLI の増分 update、 別の消費側 CLI の書き込み系)。
 0.26.7 の 「残る定数」 として挙げていたものがこれ。
 
 ### Performance — 無変更でも Drop が sidecar を fsync 付きで書き直していた (#261)
@@ -1060,10 +1060,10 @@ fsync (APFS ~6〜8 ms) を毎回払っていた。 #259 (0.26.7) で rw open が
 
 | drop (実 DB の隔離コピー、 release、 median) | 0.26.7 | 0.26.8 |
 |---|---:|---:|
-| kenning (136 entity / 96 himo / 16 table): `Database::open` (rw、 書き込みなし) | 18.2 ms | **1.1 ms** |
-| kenning: `Engine::open_standalone` | 11.2 ms | **0.5 ms** |
-| sinfo (9282 entity / 117 himo / 19 table): `Database::open` (rw、 書き込みなし) | 20.7 ms | **1.6 ms** |
-| sinfo: `Engine::open_standalone` | 7.0 ms | **1.1 ms** |
+| コード索引の CLI (136 entity / 96 himo / 16 table): `Database::open` (rw、 書き込みなし) | 18.2 ms | **1.1 ms** |
+| 同: `Engine::open_standalone` | 11.2 ms | **0.5 ms** |
+| 別の消費側 CLI (9282 entity / 117 himo / 19 table): `Database::open` (rw、 書き込みなし) | 20.7 ms | **1.6 ms** |
+| 同: `Engine::open_standalone` | 7.0 ms | **1.1 ms** |
 | 参考: `Database::open_readonly` (両者) | 0.3 ms | 0.2 ms |
 
 書き込みゼロの rw open → drop で `schema` / `tables` の mtime が動かなくなった (= 書き直して
@@ -1083,10 +1083,10 @@ segment ごとの stat) が `Engine::flush()` と `Engine::drop` で 2 回走る
 
 ## 0.26.7 — 2026-09-04
 
-**schema 層の rw open の定数コストを畳んだ perf patch** (#259、 kenning からの報告)。 on-disk
+**schema 層の rw open の定数コストを畳んだ perf patch** (#259、 コード索引の CLI からの報告)。 on-disk
 format は**不変**、 breaking なし、 公開 API の変更なし。 **schema 層 (`enchudb-schema`) の
-`Database::open` (rw) を 1 コマンド 1 process で使う consumer は上げること** (kenning の
-増分 update 経路 / `sf` の書き込みコマンド)。 #255 (0.26.5) で engine 側の writer open は
+`Database::open` (rw) を 1 コマンド 1 process で使う consumer は上げること** (コード索引の CLI の
+増分 update 経路 / 別の消費側 CLI の書き込みコマンド)。 #255 (0.26.5) で engine 側の writer open は
 片付いていたが、 schema 層に relation 数に比例する定数が残っていた。
 
 ### Performance — `define_ref_in` が idempotent な再登録でも `tables` sidecar を fsync していた (#259)
@@ -1103,12 +1103,12 @@ open 中に fsync を起こしていたのはここだけ。
 - `defer_tables_persist` を open 経路で立てる案は、 open 後の user の `define_*` の即時
   persist という既存の振る舞いを変えるので採らなかった
 
-| kenning の DB (3952 entity / 48 himo / relation 8 本) | 0.26.6 | 0.26.7 |
+| コード索引の CLI の DB (3952 entity / 48 himo / relation 8 本) | 0.26.6 | 0.26.7 |
 |---|---:|---:|
 | `Database::open` (rw) | 42〜44 ms | **0.7〜1.0 ms** |
 | `Engine::open_standalone` (参考) | 0.7〜2 ms | 同 |
-| kenning tokio corpus: `update` (無変更) | 91 ms | **53 ms** |
-| kenning tokio corpus: 編集直後の query (rw open + 増分) | 123 ms | **80 ms** |
+| 同 CLI、 tokio corpus: `update` (無変更) | 91 ms | **53 ms** |
+| 同 CLI、 tokio corpus: 編集直後の query (rw open + 増分) | 123 ms | **80 ms** |
 
 **検証**: gate 3 本 — engine 層 (再登録で `tables` の mtime 不変 / 新規 relation は persist され
 reopen 後も残る) と schema 層 (relation 8 本の DB を rw open しても open 時点で `tables` 不変)。
@@ -1119,20 +1119,20 @@ fix を外すと狙った 2 本だけが落ちる。
 
 ## 0.26.6 — 2026-09-04
 
-**0.26.4 の #246 ガードが sf の v8 DB を全件誤拒否していた regression の patch** (#257)。
+**0.26.4 の #246 ガードが消費側 CLI の v8 DB を全件誤拒否していた regression の patch** (#257)。
 on-disk format は**不変**、 breaking なし、 公開 API の変更なし。 **0.26.4 / 0.26.5 で
-v8 / v9 → v10 の migrate を行う consumer は上げること** (sf の DB は `max_himos 4096` なので
+v8 / v9 → v10 の migrate を行う consumer は上げること** (この CLI の DB は `max_himos 4096` なので
 全件この形)。 移行済みの DB には影響しない。
 
-### Fixed — `migrate_v9_to_v10` が sf の v8 DB (max_himos 4096 / himo 117 / max_values 全 0) を「壊れている」と誤判定する (#257)
+### Fixed — `migrate_v9_to_v10` が max_himos 4096 の v8 DB (himo 117 / max_values 全 0) を「壊れている」と誤判定する (#257)
 
 0.26.4 は 「legacy header の himo 表の使用域が固定 4096 を越えていれば entities region を
-壊している」 と決め打ちして拒否した。 しかし sf の実 file (max_entities 524288 / max_himos
+壊している」 と決め打ちして拒否した。 しかし同 CLI の実 file (max_entities 524288 / max_himos
 4096 / himo 117) では、 越えた max_values 表 (packed 4352..4820) は **bitset の eid 1920〜5663
 の live bit に 0 を書いただけ**で、 そこに live entity が無ければ実害が無い。 同じ file を
-0.26.3 で migrate した結果は健全 (sinfo: 移行後 3 日の実運用、 `sf fsck` 0 bad / 0 mismatch /
+0.26.3 で migrate した結果は健全 (同 CLI: 移行後 3 日の実運用、 CLI の fsck で 0 bad / 0 mismatch /
 0 dangling、 本番 hub も 7 scope 移行して無事故) だった。 gate の fixture も max_himos 2048
-(sinfohub の shape) だけで、 sf の 4096 を検体に含めていなかった (#252 と同じ教訓)。
+(マルチユーザーのサーバ構成の shape) だけで、 CLI の 4096 を検体に含めていなかった (#252 と同じ教訓)。
 
 判定を **「越えた範囲の実バイトが何を壊したか」** に作り直した (`check_legacy_himo_table_overlap`、
 `migrate_v9_to_v10` / `unpack_to_dir` / `from_bytes` の legacy 経路で共通):
@@ -1151,9 +1151,9 @@ v8 / v9 → v10 の migrate を行う consumer は上げること** (sf の DB �
   「source data から新 binary で作り直す / 数字を添えて issue」 に
 
 **検証**:
-- sf の実 file 2 本 (enchudb-lp / sinfo repo の v8 backup の clonefile 隔離コピー) の migrate が
+- max_himos 4096 の実 file 2 本 (2 つの repo の v8 backup の clonefile 隔離コピー) の migrate が
   通り、 entity 数が ENT1 header の live_count と一致 (118 / 9239)
-- gate 5 本: sf shape (bitset に 0、 entity 無し) が通る / 同 shape で潰された bit の範囲に live
+- gate 5 本: max_himos 4096 の shape (bitset に 0、 entity 無し) が通る / 同 shape で潰された bit の範囲に live
   entity がいた file は拒否 / free stack に掛かる shape (max_entities 1024) の通過と拒否 /
   max_values を宣言していた file は拒否。 既存の 449 本 test は 「ENT1 header に掛かる」 として
   拒否のまま。 cell 検査と free stack 検査を外すと拒否 test が落ちることを確認
@@ -1168,7 +1168,7 @@ v8 / v9 → v10 の migrate を行う consumer は上げること** (sf の DB �
 
 **writer open の定数コストを畳んだ perf patch** (#255)。 on-disk format は**不変**、 migration
 不要、 breaking なし。 公開 API は観測用の `Engine::himos_with_cylinder_built()` が増えるだけ。
-**rw open する consumer は上げること** — 特に 1 コマンド 1 process の CLI (`sf` の書き込み系
+**rw open する consumer は上げること** — 特に 1 コマンド 1 process の CLI (書き込み系
 コマンド) は毎回払っていた。 readonly 側は 0.26.1 で片付いており、 これが writer open に残って
 いた最後の定数。
 
@@ -1179,7 +1179,7 @@ v8 / v9 → v10 の migrate を行う consumer は上げること** (sf の DB �
 の in-memory index (cylinder) を open で組み、 drop でそれを free していた**。 0.26.1
 (request23 D2) で lazy にした HimoStore の効果が、 writer open ではこの 1 箇所で全部無効化
 されていた。 readonly open は同ブロックを通らないので速く、 `ENCHU_OPEN_PROFILE` も
-`HimoStore::load` の Δt しか出さないので計測の外だった。 消費側 (`sf`) の 「1 行書くだけで
+`HimoStore::load` の Δt しか出さないので計測の外だった。 消費側の CLI の 「1 行書くだけで
 ~350 ms、 うち ~250 ms が open + drop」 という stack sample 付きの報告で発覚。
 
 - `HimoStore::for_each_set_value` (raw cell の走査。 `ensure_cylinder_built` と同じ走査を
@@ -1190,7 +1190,7 @@ v8 / v9 → v10 の migrate を行う consumer は上げること** (sf の DB �
 
 | `examples/rw_open_bench.rs` (release、 median) | 0.26.4 | 0.26.5 |
 |---|---:|---:|
-| sinfo 実 DB clone (9250 entity / 117 himo、 leaf 13 本) rw open | 158.7 ms | **4.1 ms** |
+| 消費側 CLI の実 DB clone (9250 entity / 117 himo、 leaf 13 本) rw open | 158.7 ms | **4.1 ms** |
 | 同 rw drop | 92.7 ms | **11.4 ms** |
 | 同 open 直後に built な cylinder | 13 本 | **0 本** |
 | 合成 DB (leaf 59 本、 全 9211 entity に値) rw open | 2058 ms | **32 ms** |
@@ -1218,7 +1218,7 @@ format は**不変**、 migration 不要、 breaking なし。 公開 API は `T
 #167 (0.23.0) が growable backing に足した 3 メソッドが非 unix stub に無く、 `--target
 x86_64-pc-windows-msvc` の `cargo check` が 5 版連続で落ちていた。 CI が unix のみで検出できず。
 **code 自体は 0.26.0 (v10 segment 化) で stub ごと置き換わって直っている** — 0.26.x を
-Windows で build する consumer (syncretic の Win 機) は 0.23.0 から上げれば通る。
+Windows で build する consumer (ファイル同期の消費側アプリの Win 機) は 0.23.0 から上げれば通る。
 
 - 再発防止: CI に `check (windows cross)` job を追加。 ubuntu runner 上の cross `cargo check`
   (link しないので target の std だけで通る) で core 5 crate (oplog / engine / schema / sql /
@@ -1240,7 +1240,7 @@ engine は define / flush のたびに**定義済み hid まで**を書いてい
   himo_count × 4`) が 4096 を越えていれば `InvalidData` で拒否する。 message は `#246` と
   「entity 情報は既に壊れている、 旧 binary で export すること」 を明記。 **黙って壊れた v10 を
   作らない**ための止血で、 復旧はしない (bitset の元の値は失われている)
-- 使用域が収まる DB (sinfohub の shape = max_himos 2048 / himo 117 本) は今まで通り通る。
+- 使用域が収まる DB (マルチユーザーのサーバ構成の shape = max_himos 2048 / himo 117 本) は今まで通り通る。
   gate は 448 本 (ちょうど 4096) が通り 449 本が拒否される境界 test
 
 **既知の残ギャップ**: 越境済み DB の救済手段は enchudb には無い。 himo_count が境界を越えて
@@ -1251,7 +1251,7 @@ engine は define / flush のたびに**定義済み hid まで**を書いてい
 
 `Syncer::pull_once` は 0.23.1 (#216) から**常に** `pull_as_multi` を呼ぶが、 その default 実装は
 `pull_as(to, from, Hlc::ZERO)` = **cursor を transport に渡さない**。 request の cursor を到達証明
-として ack に写す transport (syncretic の HTTP gateway) では ack が前進せず、 `sync_watermark()`
+として ack に写す transport (ファイル同期の消費側アプリの HTTP gateway) では ack が前進せず、 `sync_watermark()`
 が 0 のまま `_sync_ops` が reclaim されない → #149 (0.22.0) が潰した backpressure が再発する。
 0.23.1 の release note は #216 を relay 構成の話として書いており、 直 pull 構成の transport
 実装者が「override しないと運用が壊れる」と読み取れなかった。
@@ -1277,7 +1277,7 @@ per-author filter を、 それぞれ明示的に選ぶ必要がある。
 
 **v9 → v10 migrate が「作ってから一度も開いていない DB」を拒否していた bug の patch** (#252)。
 on-disk format は**不変**、 migration 不要、 breaking なし、 公開 API の変更なし。 **これから
-v10 移行を行う consumer (`sf migrate --v10` 等) は上げること**。 既に全 DB を v10 へ移行済みの
+v10 移行を行う consumer (消費側 CLI の `migrate --v10` 等) は上げること**。 既に全 DB を v10 へ移行済みの
 consumer には影響しない (`unpack_to_dir` / `migrate_v9_to_v10` 以外は 0.26.2 と同一)。
 
 ### Fixed — `migrate_v9_to_v10` が `layout.total_size` より短い v8 / v9 file を `packed file truncated` で拒否する (#252)
@@ -1285,7 +1285,7 @@ consumer には影響しない (`unpack_to_dir` / `migrate_v9_to_v10` 以外は 
 v8 / v9 の engine は open 時に file を `layout.total_size` まで zero 拡張する。 そのため
 **作ってから一度も開いていない DB** は尾部 region (v8 なら layout 末尾の `leaf.data` 512 MiB)
 が未確保のまま = 旧 binary では正常に開けるのに、 0.26.0〜0.26.2 の `unpack_to_dir` は
-`total < layout.total_size` を即 Err にしていたので v10 へ移行できなかった。 sinfo の手元
+`total < layout.total_size` を即 Err にしていたので v10 へ移行できなかった。 消費側 CLI の手元
 12 project 中 5 件がこれで停止 (mtime が per-project 化の瞬間のまま、 それ以降一度も open
 されていない DB だけ)。 「`status` は migrate しろと言い、 `migrate` は truncated で止まる」
 往復になるので、 consumer 側からは抜けられない。
@@ -1301,9 +1301,9 @@ v8 / v9 の engine は open 時に file を `layout.total_size` まで zero 拡�
 **検証**:
 - gate 3 本 (engine lib): 短い v8 fixture の migrate がフルサイズと意味的同一 (共通 prefix
   一致 + 長い方の尾部は全 0) で、 open 後の内容も一致 / Entities を跨ぐ本物の truncation は
-  Err のまま、 dst dir も残さない / v10 packed の短縮は Err のまま。 修正を外すと sinfo と
+  Err のまま、 dst dir も残さない / v10 packed の短縮は Err のまま。 修正を外すと消費側 CLI と
   同じ error で落ちることを確認
-- 実 DB: sinfo が踏んだ project の v8 backup (10,446,254,152 bytes) を隔離コピーし、 片方を
+- 実 DB: 同 CLI が踏んだ project の v8 backup (10,446,254,152 bytes) を隔離コピーし、 片方を
   失敗時と同じ 9,910,435,840 bytes に切り詰めて両方 migrate → **132 file 全て byte 一致**
   (entities 278 / himos 117 / tables 19)
 - engine crate 全 test (464 本) green
@@ -1323,14 +1323,14 @@ rustdoc / bench example のみ)。 **既に 0.26.1 を使っている consumer �
 次に版を動かすときで足りる。 この tag を切るのは、 **これから v10 を採用する consumer が pin
 した版の doc を読んで事故らないようにする**ため。
 
-0.26.0 / 0.26.1 を実際に採用した consumer (kenning / `sf`) から上がった落とし穴を、
+0.26.0 / 0.26.1 を実際に採用した consumer (コード索引の CLI / 別の消費側 CLI) から上がった落とし穴を、
 移行注意と rustdoc に反映した。 **どれも 1119 本 green のこちら側からは出せず、 消費側の
 指摘か、 その検証から出ている。**
 
 ### Docs — `is_dir()` で db を取り違える (0.26.0 の移行注意に追記)
 
 v9 まで db は 1 ファイルだったので `Path::is_dir()` で 「directory = db ではない」 と振り分け
-られた。 **v10 の db は directory** なので db 自身がそちら側に落ちる。 実例: kenning の
+られた。 **v10 の db は directory** なので db 自身がそちら側に落ちる。 実例: コード索引の CLI の
 `update [repo] [db]` がこれを踏み、 **指定した db は更新されないまま、 db directory を索引した
 別 index が `~/.cache` に生えた** (build は通り exit 0、 stderr も無音)。 判別には
 [`Engine::probe`] を使うこと。 正しい式と、 `probe(p) != DbState::Missing` が**全 directory を
@@ -1390,23 +1390,23 @@ db 判定にしてしまう**理由も併記した。
 
 **v10 の open 代 (file 数に比例する定数) を畳んだ patch** (`[[request23]]`)。 on-disk format は
 **不変**、 migration 不要、 breaking なし、 公開 API の変更なし。 **0.26.0 を採用した
-consumer は上げること** — 特に **1 コマンド 1 process** の CLI (kenning / `sf`) と
-**1 process で複数 DB を開く**経路 (kenning の `across`、 hub の scope 群) に効く。
+consumer は上げること** — 特に **1 コマンド 1 process** の CLI と
+**1 process で複数 DB を開く**経路 (コード索引の CLI の `across`、 hub の scope 群) に効く。
 
 v10 は 1 region = 1 file なので、 DB を開くコストが **file 数に比例する定数** (~25 µs/file) に
 なった。 中身とは無関係で空の DB でも同じだけ払う。 request21 の設計時に既知としていた
 コストだが、 **償却先の無い consumer がそれを毎回・db 数だけ払う**という効き方を
-過小評価していた (kenning 実測で open が v9 比 8.7x)。
+過小評価していた (コード索引の CLI の実測で open が v9 比 8.7x)。
 
 | entity 200 / max_values 1000 (macOS M2 Max) | 0.26.0 | 0.26.1 |
 |---|---:|---:|
 | open 1 db (himo 16 / 30 file) | 0.975 ms | **0.517 ms** |
 | open 1 db (himo 48 / 62 file) | 2.124 ms | **0.873 ms** |
 | open 1 db (himo 200 / 214 file) | 7.556 ms | **1.436 ms** |
-| open 1 db (himo 96 / 110 file = `sf` の形) | 3.434 ms | **0.916 ms** |
+| open 1 db (himo 96 / 110 file = 消費側 CLI の形) | 3.434 ms | **0.916 ms** |
 | 20 db を 1 process で逐次 open (himo 200) | 207.2 ms | **28.6 ms** |
 
-**消費側 (kenning、 250 rust file を index した実 DB、 48 himo) の実測**:
+**消費側 (コード索引の CLI、 250 rust file を index した実 DB、 48 himo) の実測**:
 
 | | v9 (0.25.1) | 0.26.0 | 0.26.1 |
 |---|---:|---:|---:|
@@ -1424,7 +1424,7 @@ file mmap 12%** なので、 mmap を 1 回に畳んでも上限 9%、 `openat` 
 
 ### Performance — 触らない himo の segment は open しない (request23 D2)
 
-kenning の実測では **1 コマンドが触る himo は 48 本中 2〜13 本** (全走査するコマンドはゼロ)。
+コード索引の CLI の実測では **1 コマンドが触る himo は 48 本中 2〜13 本** (全走査するコマンドはゼロ)。
 それでも 0.26.0 は open 時に全 himo の column を組んでいた。 **column を最初に触ったときに
 組み立てる**ようにして、 触らない himo は `open(2)` すら払わないようにした。
 
@@ -1448,7 +1448,7 @@ kenning の実測では **1 コマンドが触る himo は 48 本中 2〜13 本*
 | `max_values` 20,000 で宣言 | 103.7 ms | **5.9 ms** |
 
 **ただしこの数字はベンチ側で `max_values` を大きく設定して作ったもので、 現行 consumer
-(kenning / `sf` / sunsu2) は全員 `max_values = 0` なので体感は変わらない。**
+(コード索引の CLI / 別の消費側 CLI / SNS 型の負荷 harness) は全員 `max_values = 0` なので体感は変わらない。**
 「cardinality を宣言する利用者が出た時の保険」 として入れている。 成長経路自体は
 `lockfree_cylinder::tests::dense_grows_while_readers_read` で gate (CI の miri 対象)。
 
@@ -1464,7 +1464,7 @@ cargo update -p enchudb        # または Cargo.lock を消して解決し直�
 ```
 
 `Cargo.toml` の `enchudb = { path = "..." }` (patch ではなく直接 path) を使っている構成
-(sunsu2 など) は影響を受けない。
+(SNS 型の負荷 harness など) は影響を受けない。
 
 ### コスト model — 「触った himo の本数 × ~20 µs」
 
@@ -1475,7 +1475,7 @@ cargo update -p enchudb        # または Cargo.lock を消して解決し直�
 | 触る himo (1 行) | open | 最初の読み | drop | 計 |
 |---:|---:|---:|---:|---:|
 | 1 | 451.3 | 18.7 | 50.5 | **520.5** |
-| 12 (`sf` の形) | 447.6 | 225.4 | 108.2 | 781.2 |
+| 12 (消費側 CLI の形) | 447.6 | 225.4 | 108.2 | 781.2 |
 | 30 | 447.6 | 566.9 | 182.2 | 1196.8 |
 | 117 (全部) | 459.4 | 2266.7 | 673.9 | **3400.0** |
 | 参考: 0.26.0 (eager、 1 行) | 2655.4 | 0.0 | 584.4 | **3239.8** |
@@ -1485,7 +1485,7 @@ cargo update -p enchudb        # または Cargo.lock を消して解決し直�
   12 列で行を 1 → 1000 に振っても読みは 225 → 500 µs 程度 (= 固定ぶん + 行あたり 0.2 µs 前後)。
   **一覧系ほど 1 行あたりに薄まる**
 - **全列を触ると eager より数 % 悪い** (117 本全部で 3400 µs vs eager 3240 µs)。 D2 は無条件の
-  改善ではなく 「**一部しか触らない形**」 への最適化。 kenning は 48 中 2〜13 本、 `sf` は
+  改善ではなく 「**一部しか触らない形**」 への最適化。 コード索引の CLI は 48 中 2〜13 本、 別の消費側 CLI は
   117 中 12 本
 - 行あたり 0.2 µs 前後 (12 列) = **1 列 十数 ns** は `get(eid, "名前")` の**文字列解決込み**。
   hot loop なら `himo_id(name)` で 1 回引いて **`get_by_id(eid, hid)`** を回すと落ちる
@@ -1509,7 +1509,7 @@ cargo update -p enchudb        # または Cargo.lock を消して解決し直�
   なら `set_fd_budget(n)`
 - gate は `tests/v10_fd_budget.rs` (子 process の `RLIMIT_NOFILE` を絞って himo 200 本を通す)
 
-消費側の実例: `sf` の `read_project()` は 12 列を触る → 予測 0.24 ms に対し実測 0.279 ms。
+消費側の実例: CLI の `read_project()` は 12 列を触る → 予測 0.24 ms に対し実測 0.279 ms。
 計測は `examples/open_split_bench.rs` (open / 読み / drop を分離)。
 
 ### 検証
@@ -1517,8 +1517,8 @@ cargo update -p enchudb        # または Cargo.lock を消して解決し直�
 - workspace **173 suite / 1119 passed / 0 failed** (macOS M2 Max、 逐次単独実行)
 - gate は `tests/v10_lazy_himo_open.rs` の 3 本。 **反証済み** — 遅延を戻す / 存在確認を
   外す / manifest を `all()` 由来に戻す、 のそれぞれで落ちることを確認している
-- 消費側 2 つで実測: **kenning** (実 DB) は open 1853 → 567 µs で **query に退化なし**、
-  **`sf`** は 「効かない条件」 2 つ (`.crc` / sync tables) のどちらにも該当せず全効果が出る側
+- 消費側 2 つで実測: **コード索引の CLI** (実 DB) は open 1853 → 567 µs で **query に退化なし**、
+  **別の消費側 CLI** は 「効かない条件」 2 つ (`.crc` / sync tables) のどちらにも該当せず全効果が出る側
 
 ## 0.26.0 — 2026-08-30
 
@@ -1531,7 +1531,7 @@ cargo update -p enchudb        # または Cargo.lock を消して解決し直�
 |---|---|---|
 | 空 DB (既定 capacity) apparent | 26,482 MB | **6.3 MB** |
 | 同 `enable_sync_tables` 後 | 95,469 MB | **6.6 MB** |
-| 実 DB (sinfohub、 v8、 654 entity / 117 himo) physical | 130 MB (apparent 10 GB) | **4.8 MB** (migrate 5 秒) |
+| 実 DB (消費側のサーバ、 v8、 654 entity / 117 himo) physical | 130 MB (apparent 10 GB) | **4.8 MB** (migrate 5 秒) |
 | `create_growable` 100K ent 直後 (#172) | 1,229 MB | 数 MB |
 
 ### Breaking
@@ -1547,8 +1547,8 @@ cargo update -p enchudb        # または Cargo.lock を消して解決し直�
   `tests/v10_legacy_open_is_read_only.rs` で hash / len / mtime / 隣接 file を gate。
   - ⚠️ **逆向き (v9 以前の binary で v10 の DB を開く) は生の OS エラーになる**:
     `Is a directory (os error 21)`。 版の不一致だと分からないので、 **binary の更新を DB の
-    移行より先に**行うこと。 特に 「PATH 上の旧 binary を subprocess で呼ぶ」 構成 (sinfo hub が
-    `sf` を呼ぶ形) は、 移行済みの DB に旧 binary が当たって止まる。 offline で 1 回:
+    移行より先に**行うこと。 特に 「PATH 上の旧 binary を subprocess で呼ぶ」 構成 (消費側のサーバが
+    CLI を呼ぶ形) は、 移行済みの DB に旧 binary が当たって止まる。 offline で 1 回:
   ```rust
   enchudb::Engine::migrate_v9_to_v10("old.db", "new.db")?;  // new.db は directory、 old.db は不変
   ```
@@ -1567,13 +1567,13 @@ cargo update -p enchudb        # または Cargo.lock を消して解決し直�
   `lock` / `schema` / `segments`)。 `{db}.tables` のような隣置きは無い。 path 生成は
   `enchudb_engine::db_files` に集約 (schema / transport もこれを使う)
   - ⚠️ **呼び出し側が DB root 直下に独自の file を置いていないか確認すること。** 上の 7 つと
-    名前が当たると壊れる (`lock` / `segments` は特に踏みやすい)。 実例: sinfo は CLI 直列化用の
+    名前が当たると壊れる (`lock` / `segments` は特に踏みやすい)。 実例: ある消費側は CLI 直列化用の
     flock を `<db_dir>/lock` に置いており、
     engine root を `<db_dir>` に素直化すると enchudb の `lock` と同じ file を掴んで即死する
     (`<db_dir>/enchu.db` のような入れ子を維持していれば衝突しない)
   - ⚠️ **逆向きも踏む: 「directory なら db ではない」 と判別している呼び出し側が壊れる。**
     v9 まで db は 1 ファイルだったので `Path::is_dir()` で 「directory = 別のもの」 と振り分け
-    られたが、 **v10 の db は directory** なので db 自身がそちら側に落ちる。 実例: kenning の
+    られたが、 **v10 の db は directory** なので db 自身がそちら側に落ちる。 実例: コード索引の CLI の
     `update [repo] [db]` は位置引数を `is_dir()` で repo / db に振り分けており、 **指定した db が
     更新されないまま、 db directory を索引した別 index が `~/.cache` に生えた** (build は通り
     exit 0、 stderr も無音。 統合テストだけが捕まえ、 誤った index が 12 本溜まっていた)。
@@ -1590,11 +1590,11 @@ cargo update -p enchudb        # または Cargo.lock を消して解決し直�
   table (下記) は間に他 table の eid を挟むので、 **scan は `table_eid_extents(name)`** で
 - **`define_table(name, size_hint)` の `size_hint` は硬い上限ではなくなった。** table が先頭
   range を使い切ると空き eid 空間から extent を自動で足す (下記)。 「N 件で `entity_in` が
-  Err になる」 前提の test / 運用 (例: sinfo の `huge_scale_lifts_module_cap`、 enchudb 自身の
+  Err になる」 前提の test / 運用 (例: 消費側 CLI の `huge_scale_lifts_module_cap`、 enchudb 自身の
   `entity_in_returns_err_when_table_eid_range_exhausted`) は entity cap ごと尽きる shape に直す
   - ⚠️ **`size_hint` を上限として読んでいる箇所が壊れる。** 実測された壊れ方: 監視ゲージの
     分母に table の cap を使っていると、 **分子が分母を超えて 100% に張り付き、 まだ余裕が
-    あるのにゲージが意味を失う** (sinfo hub の `/admin/capacity` は `shard_cap("versions")` を
+    あるのにゲージが意味を失う** (消費側サーバの `/admin/capacity` は `shard_cap("versions")` を
     分母にしていて、 5,000 件が cap 2,000 の table に入った)。 上限として使えるのは
     `reserve_entities()` (= 予約の天井) だけで、 それ以外は consumer 側で論理上限を別に持つこと
 - `Engine::migrate_file_v5_to_v6` / `_with_leaf` を撤去 (出力が 1 ファイルで v10 では開けない)。
@@ -1627,7 +1627,7 @@ cargo update -p enchudb        # または Cargo.lock を消して解決し直�
   素性を言う。 `Missing` / `Ready` / `Incomplete` (create が途中で落ちた directory) /
   `Damaged(理由)` / `SingleFileLegacy` (v8・v9 の 1 ファイル)。 v10 は DB が directory なので
   consumer の `if path.exists() { open } else { create }` が半端な directory を既存 DB と誤認する
-  — その入口を sidecar 名に結合させずに塞ぐ (消費側 sinfo からの要望)
+  — その入口を sidecar 名に結合させずに塞ぐ (消費側からの要望)
   - 見るのは 3 段: header が読めるか → **header が指す segment が全部あるか** (mmap しない) →
     manifest との長さ照合。 `create` は最後に manifest を書くので 「manifest が無い =
     create が完了していない」 と言い切れ、 **segment 欠損が `Damaged` (後から消された) か
@@ -1677,7 +1677,7 @@ cargo update -p enchudb        # または Cargo.lock を消して解決し直�
 - **sidecar の mode が書き換えのたびに umask へ戻っていた。** `tables` / `eidmap` / `vocabmap` は
   tmp write → rename で置き換わるので、 呼び出し側が `chmod 600` していても **rename で新しい
   inode (0644) に化けていた**。 置き換え前の mode を tmp に写してから rename するようにした
-  (v9 以前からの挙動。 sinfo が「開くたびに 0600 を掛け直しているのに、 最後に書かれた sidecar
+  (v9 以前からの挙動。 消費側が「開くたびに 0600 を掛け直しているのに、 最後に書かれた sidecar
   だけ 0644」という形で実測して判明。 新規作成時は従来どおり umask 依存)
 - **壊れた entity 領域で panic していた** (`bad entity set magic`)。 `EntitySet::load` が
   `io::Result` を返すようになり、 `InvalidData` の Err になる (`corrupt_header_open` と同じ方針)。
@@ -1697,10 +1697,10 @@ cargo update -p enchudb        # または Cargo.lock を消して解決し直�
 
 ### 検証
 
-> **取得時点に注意。** 下の消費側の数字 (sinfo / syncretic / kenning / 実 data の `sf` 出力照合)
+> **取得時点に注意。** 下の消費側の数字 (消費側 CLI / ファイル同期の消費側アプリ / コード索引の CLI / 実 data の CLI 出力照合)
 > と Linux 全走は、 **segment manifest と `Engine::probe` を入れる前**の branch HEAD で取った
 > ものです。 その後 open / create / flush / `snapshot_export` / migrate に手が入っているので、
-> **release tag `v0.26.0` そのものを消費側で確かめたのは workspace 全走と sunsu2 だけ**です。
+> **release tag `v0.26.0` そのものを消費側で確かめたのは workspace 全走と SNS 型の負荷 harness だけ**です。
 > pin を動かす前に、 各 consumer で tag に対して回し直すこと。
 
 - workspace 全走: Phase 2 時点 166 suites / 1097 passed / 0 failed、 性能修正 (fd 保持 /
@@ -1716,22 +1716,22 @@ cargo update -p enchudb        # または Cargo.lock を消して解決し直�
   `v10_legacy_open_is_read_only` (v9 DB を open しても hash / mtime / 隣接 file が不変)、
   `v10_fd_budget` (`RLIMIT_NOFILE` を 64 / 128 / 512 に絞った子 process で himo 200 本の DB を
   作り、 全値を読み直す)、 `sidecar_mode_preserved`
-- 実 DB: sinfohub の v8 `enchu.db` (clonefile した隔離 copy) を migrate → `open_readonly` で
+- 実 DB: 消費側サーバの v8 `enchu.db` (clonefile した隔離 copy) を migrate → `open_readonly` で
   654 entity / 117 himo / 19 table を確認
 - **消費側 (tag 固定 v0.25.1 の app を `--config patch` で branch に差し替え、 repo の隔離 copy で)**:
-  sinfo (schema 層経由の create / open / insert / query、 5 crate) **617 passed / 1 failed** —
-  失敗は上記 `size_hint` 前提の 1 件のみ。 syncretic (sync / relay / bootstrap 経路、 44 test file) **184 passed / 0 failed**
-- kenning (v0.25.1 pin): 素の状態で 30 passed / 4 failed。 落ちた 4 本は全部 kenning 側の
+  消費側 CLI (schema 層経由の create / open / insert / query、 5 crate) **617 passed / 1 failed** —
+  失敗は上記 `size_hint` 前提の 1 件のみ。 ファイル同期の消費側アプリ (sync / relay / bootstrap 経路、 44 test file) **184 passed / 0 failed**
+- コード索引の CLI (v0.25.1 pin): 素の状態で 30 passed / 4 failed。 落ちた 4 本は全部 CLI 側の
   1 ファイル前提 (`remove_file` で作り直し / dir の実消費 / cache prune / `is_dir` で dir と db を
-  振り分け) で、 5 箇所直すと **34 / 34**。 patch は enchudb の `notes/requests/kenning-v10.patch`
-- **実 data の end-to-end**: `~/.sinfo/db` (v8、 25,061 entity / 258 himo / 40 table。 sinfo が 2026-08-08 に
+  振り分け) で、 5 箇所直すと **34 / 34**。 patch は enchudb の `notes/requests/` 配下
+- **実 data の end-to-end**: 消費側 CLI の DB (v8、 25,061 entity / 258 himo / 40 table。 2026-08-08 に
   per-project 化する前の旧 shared DB) と
-  sinfohub の project store (654 entity) を clonefile で隔離 → `enchu --migrate-v10` (13 秒 / 6 秒、
-  10 GB apparent → 82 MB / 4.8 MB) → **v10 で build した `sf`** の project / fsck / module list /
-  tree / snap list / structure log / target list が、 **release 版 `sf 0.28.0` × 元の v8 copy と
+  消費側サーバの project store (654 entity) を clonefile で隔離 → `enchu --migrate-v10` (13 秒 / 6 秒、
+  10 GB apparent → 82 MB / 4.8 MB) → **v10 で build した CLI** の project / fsck / module list /
+  tree / snap list / structure log / target list が、 **同 CLI の release 版 (0.28.0) × 元の v8 copy と
   出力が byte 一致** (fsck の dangling snap pin ×10 も元から)
-- **sunsu2** (peer 分散 SNS 兼 sync 破壊試験機、 `../enchudb` path 依存): **22 passed / 0 failed**
-  (Phase 0〜3、 24-peer Zipf chaos 42 s、 real wire、 findings、 workload)。 sunsu2 側は
+- **SNS 型の負荷 harness** (peer 分散 SNS 兼 sync 破壊試験機、 `../enchudb` path 依存): **22 passed / 0 failed**
+  (Phase 0〜3、 24-peer Zipf chaos 42 s、 real wire、 findings、 workload)。 harness 側は
   source 変更なしで compile も通る。 **release tag `v0.26.0` に対して再走して同じ 22/0**
   (= segment manifest / `probe` を入れた後の状態で通っている唯一の消費側検証)
 - **Linux (OrbStack、 Ubuntu 26.04 arm64、 root=btrfs / /tmp=tmpfs)**: workspace 全走
@@ -1962,7 +1962,7 @@ replica batch の cell 単位の欠け) を sync 節に追記。
 
 - `cargo test --workspace` (**root crate 込み** — CI は `oplog/engine/schema/sql/sync` の
   5 crate のみで、 #98 の穴): **167 suites / 1,096 passed / 0 failed**
-- 実 consumer (sunsu2) `cargo test --workspace`: 11 suites / 0 failed
+- 実 consumer (SNS 型の負荷 harness) `cargo test --workspace`: 11 suites / 0 failed
 - clippy: 追加分に指摘 0
 - **falsify 済み**: #235 は fix を両方外すと 3 回中 2 回 `dead == 0` が破れる。 #218 は
   新規 6 本のうち **5 本が落ちる** (残る 1 本 `healthy_reclaim_does_not_raise_baseline` は
@@ -2045,7 +2045,7 @@ growable の commit は単調 high-water なので、 variable cluster 末尾の
 
 - **0.19〜0.24 で作った / 開いた非 sync DB** は v9 領域を持ったまま。 実害は apparent のみで、
   載っている版数も従来どおり尊重される。 戻したい場合は `snapshot_export` → 新規 create
-- **自動 demote (v9 → v8) はしない。** `oboro` / `opyula` が Leaf を別 process から readonly
+- **自動 demote (v9 → v8) はしない。** 消費側アプリが Leaf を別 process から readonly
   mmap で直読みしており、 writer の `.db.lock` flock は readonly open を排他しない。 ファイルを
   縮めた瞬間に reader が SIGBUS する。 伸ばすのは安全、 縮めるのは危険
 - **sync DB** は `enable_sync_tables()` 済み = sidecar に sync tables があるので、 次の writer
@@ -2125,7 +2125,7 @@ posting run (compact 済み = eid 昇順) が全部整列済みなので、 素�
 - **segment を作る専用 API は無い**。 `index()` → `save()` で焼いた普通の `.etxt` が
   そのまま segment になる
 
-実測 (naruhodo の法令索引・494,133 doc / 1,007,416,823 B の `.etxt`):
+実測 (法令検索の消費側アプリの索引・494,133 doc / 1,007,416,823 B の `.etxt`):
 
 | | ピークメモリ |
 |---|---|
@@ -2148,7 +2148,7 @@ cold read で 5.8s)。 ピークメモリは 2 回とも 27〜28MB で安定。 
 ### 呼び出し側にとって何が変わるか
 
 索引の作り直しが segment 単位になるので、 build ピークがコーパス量から独立する。
-naruhodo は日次差分のために **本体 `.etxt` + `delta.etxt` の 2 層引き** (delta 在籍 doc は
+同じ消費側は日次差分のために **本体 `.etxt` + `delta.etxt` の 2 層引き** (delta 在籍 doc は
 本体ヒットを tombstone 抑制) を既に実装していて、 これは segment 数 2 に固定した segment
 検索そのもの。 delta を本体へ畳む作業がこの merge に置き換わる。
 
@@ -2370,7 +2370,7 @@ ring は lsn 順で HLC 非単調なので、 高 lsn に乗った古い HLC の
   delete と push の間」の同時成立が要る)。 test 2 本は回帰検知として置いてあるが、
   正しさの根拠は lock 順序であってその緑ではない、と doc に明記した
 
-検証: workspace 1058 passed / 0 failed (root crate 込み)、 参照 app (sunsu2) 21/21。
+検証: workspace 1058 passed / 0 failed (root crate 込み)、 参照 app (SNS 型の負荷 harness) 21/21。
 
 ## 0.23.0 — 2026-08-28
 
@@ -2430,7 +2430,7 @@ engine 側では **使われなくなっていた**引数。 breaking を 1 つ�
 - **workspace 全体 (root crate 込み)**: release 対象の tree (`c473895`) で
   **1042 passed / 0 failed**。 2 台のセッションが独立に実測しており、 うち片方は
   CI 対象外の root crate (263 passed) と clippy パリティも併せて確認している
-- **実 consumer での確認**: sunsu2 が **20/20 green** (relay fanout の収束 + relay 死亡 →
+- **実 consumer での確認**: SNS 型の負荷 harness が **20/20 green** (relay fanout の収束 + relay 死亡 →
   bootstrap 復旧を含む)。 `entity()` の breaking は schema 層を経由しているため無風だった
 - **CI の範囲に穴があった** (#213): `test` job は core 5 crate しか回さず、 root crate は
   重量 dev-dep のため除外されている (#98)。 #59 で panic を撤去したのに
@@ -2531,8 +2531,8 @@ storage format 変更なし (v9 のまま)。
 
 ## 0.22.0 — 2026-08-27
 
-**author の生涯 op 数上限 (≒ ring 容量) を撤廃した release。** peer SNS 試験機
-(sunsu2) を 24-peer Zipf chaos / celebrity fanout / ring 溢れで回して踏んだ 7 件を、
+**author の生涯 op 数上限 (≒ ring 容量) を撤廃した release。** peer SNS 試験機を
+24-peer Zipf chaos / celebrity fanout / ring 溢れで回して踏んだ 7 件を、
 1 つずつ根まで追って潰している。全て sync 経路の正しさ・容量の話で、 **storage
 format 変更なし** (file format v9 のまま、 旧 DB はそのまま開ける)。
 
@@ -2613,7 +2613,7 @@ cursor < floor で永久 truncation になる。 履歴は容量が許す限り�
 ### 検証状況
 
 - workspace 1045 tests green (新規 guard: #149 ×4 / #190 / #191 ×2 / #195)
-- 実 consumer gate: sunsu2 全 18 tests green — 24-peer Zipf chaos (churn /
+- 実 consumer gate: SNS 型の負荷 harness 全 18 tests green — 24-peer Zipf chaos (churn /
   offline 窓 / restart ×2) 収束 + truncation ゼロ、 ring 容量超 1500 post flood
   全配布、 cold backlog 1200 post の ring 回転 drain
 - fanout 実測 (M4 Max): follower catch-up 26k posts/s/core、 25 並列 62.6k
@@ -2671,7 +2671,7 @@ record は再配送されない)。
 
 **caller 側では直せない** — `pull_once` が return した時点で cursor は既に落ちているため。
 
-実地の発現 (syncretic、 SIGKILL を混ぜた 2 台の soak、 6 万操作):
+実地の発現 (ファイル同期の消費側アプリ、 SIGKILL を混ぜた 2 台の soak、 6 万操作):
 
 - **相手が削除した行がこちらで生き残る** (194 件)。 写像を失うと後続の `Delete` が
   `resolve_remote_eid_existing` で外れ、 `skipped` に紛れて cursor が越える
@@ -2766,7 +2766,7 @@ entity が 2 つになる。
 
 **#177 の sweep が、 実運用で最も修復が要る母集団だけ素通りしていた。**
 
-実地 (syncretic の実機 store、 作り直す前のコピー / live 15,953 / 枠 16,384) を
+実地 (ファイル同期の消費側アプリの実機 store、 作り直す前のコピー / live 15,953 / 枠 16,384) を
 **#177 入りのバイナリで複数回 writer open した上で** 8,490 行が残っていた。 内訳:
 
 | | |
@@ -2840,7 +2840,7 @@ range から手で引き算するしかなかった。
 **PK を持たない重複行**を払い出す。 その行は代表 column (= PK) を持たないため
 `Table::all()` の母集団にも入らず、 **アプリの監査からも見えない**。
 
-実地 (syncretic の chaos soak) では 8 seed 中 1 seed で両側に 1 件ずつ出た。
+実地 (実機の sync 構成の chaos soak) では 8 seed 中 1 seed で両側に 1 件ずつ出た。
 
 - `Engine::bind_over_local_writes()` / `EngineStats::bind_over_local_writes` を追加。
   **「自分が書いた行が、 後から foreign identity に束ねられた」 回数**を数える
@@ -2854,7 +2854,7 @@ range から手で引き算するしかなかった。
 
 アプリが 「この path を、 まさに disk と突き合わせた」 のような**端末ローカルな観測**を
 持つとき、 それを別ファイル (JSON 等) に置くと **「本体の行は WAL 経由で復元されるのに、
-観測記録だけ消える」** が起きる。 実地 (syncretic の chaos soak) では、 削除の証拠を失った
+観測記録だけ消える」** が起きる。 実地 (実機の sync 構成の chaos soak) では、 削除の証拠を失った
 path の削除が永久に見送られ、 apply が書き戻して**削除したファイルが復活**した
 (8 seed 中 4 seed)。
 
@@ -2908,7 +2908,7 @@ query 経路 (`entities_with_himo` / `Table::all()`) は tombstone を見ない�
 LWW は同値 HLC を弾くので **同じ Delete が再配送 / replay されても本体除去に到達しない**。
 判定と適用が bool 1 本に潰れていたのが根で、 **一度この形になると二度と直らなかった**。
 
-実地 (syncretic の chaos soak / SIGKILL 混じり) では保全した peer store **3 本すべてに
+実地 (実機の sync 構成の chaos soak / SIGKILL 混じり) では保全した peer store **3 本すべてに
 1 件ずつ**在った。 生き残った cell が毎回 himo 宣言順ループの**接尾辞**になっており、
 中断点がループ内であることが確認できている:
 
@@ -2949,7 +2949,7 @@ tombstone 版数が揮発なので対象外)。 実地で壊れていた store 3
 (`Syncer::apply_one` の `Tie` / `TieNamed`) は写像が無いとき **生値をそのまま書いていた**。
 
 vid は author ローカルな番号なので、 生値は受信側の**無関係な文字列**を指す。 実地
-(syncretic / mac ↔ Windows) では files table 15962 行のうち 12 行がこの経路で壊れた:
+(ファイル同期の消費側アプリ / mac ↔ Windows) では files table 15962 行のうち 12 行がこの経路で壊れた:
 
 | 壊れた列 | 入っていた値 |
 |---|---|
@@ -2959,7 +2959,7 @@ vid は author ローカルな番号なので、 生値は受信側の**無関�
 | `key` (PK) | blob の sha256 hex |
 | `module_id` | 空文字 |
 
-アプリ側はこれを信じて `outputs/win/ab7e38fa2b56d1f72ebb09f3623a91e7 myapp/kasane/…` という
+アプリ側はこれを信じて `outputs/win/ab7e38fa2b56d1f72ebb09f3623a91e7 myapp/<app>/…` という
 化けた名前のディレクトリを disk に作っていた。
 
 写像は受信済み `Vocab` op から組み立てる。 上の `.vocabmap` で再起動を跨いで残るようになったが、
@@ -3111,8 +3111,8 @@ DB を copy する必要がある場合は `enchudb_engine::copy_sparse` を使�
 0.18.x 以前の binary では開けなくなる。** layout そのものは 1 byte も変わらない
 (v9 領域は header flag で gate されている) ので migration 作業は不要だが、 **戻れない**。
 
-- **consumer を全部 rebuild してから本番 DB に触ること** (opyula / oboro / sinfo /
-  sinfohub / sunsu / bisquit)。 readonly consumer も含む
+- **consumer を全部 rebuild してから本番 DB に触ること** (CLI / サーバ / 別 process の readonly reader /
+  負荷 harness のすべて)。 readonly consumer も含む
 - 試すときは本番 DB を直接開かず、 `Engine::snapshot_export` か
   `enchudb_engine::copy_sparse` で隔離コピーを取ってから
 - 既存の v8 DB は **v9 領域を持たない**ままなので、 per-cell 版数の恩恵は
@@ -3417,7 +3417,7 @@ vid 割当タイミング依存のため)。
 - **反証済み**: 修正を 0.17.0 相当に戻すと新規回帰テスト
   `different_pk_with_colliding_vid_numbers_stay_separate` が
   「A 自身のキーが 0 row に潰れる」で確実に落ちる
-- 下流 syncretic のフルスイート **86 / 0**。 0.17.0 で 46 秒 timeout していた
+- 下流のファイル同期アプリのフルスイート **86 / 0**。 0.17.0 で 46 秒 timeout していた
   `symmetric_sync` が 3 連続 9 秒で安定 pass
 
 ### 影響範囲
@@ -3489,9 +3489,9 @@ Kafka の `OffsetOutOfRange` と同じ「差分では追いつけないので bo
 ### Known limitation — 残り (bootstrap-first の Phase 2/3)
 
 1. **HTTP transport への floor 伝搬が未実装**。 `Transport` trait の default が `None` を
-   返すため、 **HTTP 経路では検知が働かない**。 下流 bisquit に効かせるにはこれが要る
+   返すため、 **HTTP 経路では検知が働かない**。 下流の消費側アプリに効かせるにはこれが要る
 2. `GET /bootstrap` を初回 full-sync の正規経路に昇格させる Syncer フロー
-3. bisquit 側のペアリング経路改修 (`/bootstrap` を未使用、 cursor 0 pull のみ)
+3. 同アプリ側のペアリング経路改修 (`/bootstrap` を未使用、 cursor 0 pull のみ)
 
 ### 検証 (0.18.0)
 
@@ -3513,7 +3513,7 @@ public API の追加と sidecar の拡張を含むため、 方針どおり patc
 ### Fixed — 同一 PK の entity が cross-author apply で二重払い出しされる (#141)
 
 2 台が**同じ自然キーの row を独立に作って**から相互 sync すると、 同一 PK の entity が
-author ごとに二重化していた。 実測 (下流 syncretic) では 1 table 内 2,358 entity 中
+author ごとに二重化していた。 実測 (下流のファイル同期アプリ) では 1 table 内 2,358 entity 中
 **788 個が同一キー文字列の重複**。 二次被害が本体で、 2 つの entity が同じ外部状態を
 取り合う**恒久チャーンループ** → 数時間で DB 1.7 GB / oplog リング一周 → #140 の
 tombstone 消失 (削除済み entity の亡霊復活) まで連鎖していた。
@@ -3603,7 +3603,7 @@ migration 不要 — 依存を更新するだけで上がれる。
 `HttpRelay` の応答が socket 送信バッファ (loopback で数百 KB) を超えると、
 **Content-Length より短い body のまま接続が閉じる**。読み手が遅いほど確実に起きる。
 
-下流 syncretic (Mac ↔ Windows folder sync) では、片端の WAL が 4.7 MB に育った時点で
+下流のファイル同期アプリ (Mac ↔ Windows folder sync) では、片端の WAL が 4.7 MB に育った時点で
 相手の「cursor 0 からの初回フル pull」が**ほぼ毎回** (実測 10 回中 8 回) 途中切断され、
 pull クライアントが失敗を空 batch に落とすため **cursor が永遠に 0 のまま 1 件も同期
 しない**という形で発現した。エラーログも出ないので無音の停止に見える。
@@ -3652,7 +3652,7 @@ minor bump とした。
 ### Added — Windows ビルド対応 (#133)
 
 unix 依存だった 4 箇所を解消し、`aarch64-pc-windows-gnullvm` で workspace 全体が
-ビルドできるようになった (下流 syncretic の Windows 対応の前提)。
+ビルドできるようになった (下流のファイル同期アプリの Windows 対応の前提)。
 
 | 箇所 | 対応 |
 |---|---|
@@ -3726,7 +3726,7 @@ blob** を返していた。長さは正しいまま先頭 4 byte に gen カウ
 欠落する。長さ prefix 付き codec なら decode 失敗で弾けるが、**固定長 codec では silent に
 誤値を掴む**。
 
-実測 (wikipulse の torture test): owned ~1/25 万 read、借用 ~1/10 万 read。
+実測 (大 payload × 高 churn の消費側での torture test): owned ~1/25 万 read、借用 ~1/10 万 read。
 `get_*_owned` への移行 (#119 Step 0) で頻度は下がるが根治しない。
 
 原因は `LeafStore::free()` が hole header を **`HAS_GEN` を落とした素の `slot_size`** で
@@ -3780,37 +3780,37 @@ freed slot / coalesce で header が前方へ移った場合 / split remainder �
 **ライブラリコードの変更なし** (engine on-disk format v8 不変、 公開 API 不変)。
 packaging / CI のみの chore release。 依存を更新するだけで上がれる。
 
-### Fixed — workspace が repo 外の `../sabitori` に path 依存していた (#124)
+### Fixed — workspace が repo 外の sibling repo に path 依存していた (#124)
 
 clean checkout (CI / コンテナ / 外部 contributor / crates.io 公開) では
 **manifest 読み込み段階で** workspace 全体が解決できず、 `cargo test --workspace` が
-`failed to read /sabitori/crates/sabitori/Cargo.toml` で落ちていた。 ローカルの
+`failed to read /<sibling>/crates/<sibling>/Cargo.toml` で落ちていた。 ローカルの
 `~/myapp` レイアウトでしか workspace build が通らない状態。
 
 ```
 error: failed to load manifest for workspace member `/repo/.`
 Caused by: failed to load manifest for dependency `enchudb-transport`
-Caused by: failed to load manifest for dependency `sabitori`
+Caused by: failed to load manifest for dependency `<sibling>`
 ```
 
-`sabitori` (自作 GPU GUI framework) を使っていたのは
+その依存 (自作 GPU GUI framework) を使っていたのは
 `enchudb-transport/examples/dist_dashboard.rs` の 1 本だけ — origin + replica × 3 を
 1 プロセスに同居させて 4 分割ビューで可視化する分散デモ (1030 行、 実質休眠)。
 **example ごと削除**した。 `[dev-dependencies]` に置くだけでは直らない (path 解決は
 dev-dep でも manifest 段階で走る) こと、 repo 外の font asset を
-`include_bytes!("../../../../sabitori/assets/...")` で直参照していて feature gate では
+`include_bytes!("../../../../<sibling>/assets/...")` で直参照していて feature gate では
 path が残ること、 の 2 点から「隠す」ではなく「出す」を選んだ。 デモを残すなら依存の
-向きが自然な sabitori 側 repo へ引っ越すのが筋 (git 履歴からはいつでも復元できる)。
+向きが自然な GUI framework 側 repo へ引っ越すのが筋 (git 履歴からはいつでも復元できる)。
 
 - root `Cargo.toml` にも同じ dev-deps 3 行があったが、 root には使用箇所が無く
   **dead だった** (「bench 専用」 の注記に反して) ので併せて撤去。
 - **CI の回避ハックを撤去**: 全 4 job (test / miri / loom / clippy) が
-  `find . -name Cargo.toml -exec sed -i '/sabitori/d' {} +` で manifest を書き換えてから
+  `find . -name Cargo.toml -exec sed -i '/<sibling>/d' {} +` で manifest を書き換えてから
   検証していた。 CI が素の repo をそのまま検証するようになった。
 
-検証は clean 環境 (sibling に `sabitori` が無い隔離 dir へ repo を複製) で
+検証は clean 環境 (sibling に GUI framework の repo が無い隔離 dir へ repo を複製) で
 `cargo metadata` / `cargo check -p enchudb-transport --all-targets` の通過を確認し、
-**同環境で sabitori 行を 1 行戻すと manifest 解決が失敗する**ことまで実演している。
+**同環境で依存行を 1 行戻すと manifest 解決が失敗する**ことまで実演している。
 `cargo test --workspace --no-fail-fast` は 724 passed / 0 failed / 27 ignored で
 0.15.2 と同数 (regression なし)。
 
@@ -3831,7 +3831,7 @@ bug fix のみ。 **engine の on-disk format は不変** (v8 のまま)、 公�
 `make_eid(peer, e)` に修正 — `where_eq(x).where_in(y)` の組合せが peer_id ≠ 0 の
 DB で空になる潜在バグも同時に消えている。
 
-- 発見: sunsu home-timeline (fan-out-on-read) を `posts.where_in(author, followees)`
+- 発見: SNS 型の負荷試験の home-timeline (fan-out-on-read) を `posts.where_in(author, followees)`
   で引いたら全 user で空。 followee ごとに `where_ref` を N 回呼ぶ回避策 (クエリ N 倍)
   から `where_in` 一括に戻せる。
 - regression test: `crates/enchudb-schema/tests/issue12_where_in_standalone.rs` (3) —
@@ -3844,7 +3844,7 @@ rebuild するが (#77-H1)、 旧形式は index layout の byte 複製
 (`vec![0u8; index_cap × 13B]`)。 確保は calloc (仮想) でも、 **#123 で hash slot が
 一様分散になったため rebuild が shadow の全ページに live slot を書いて全ページを
 物理化**し、 readonly open 1 回ごとに index_cap 比例の anon RSS が Engine 寿命の間
-残っていた。 1 GB VPS で同一 DB を複数 layer が readonly open する構成 (naruhodo) の
+残っていた。 1 GB VPS で同一 DB を複数 layer が readonly open する構成 (全文検索の消費側アプリ) の
 boot +~300 MB / storm OOM の有力因。
 
 shadow を `(fxhash(value), vid)` sorted の **count 比例 compact 形式**に変更:
@@ -4004,7 +4004,7 @@ wontfix にはしない — 別 issue。
 ## 0.15.0 — 2026-07-31
 
 **on-disk format v8** (index の slot 関数変更に伴う version bump)。 公開 API 追加 1 件 +
-enchudb-rag の signature 変更 1 件。 いずれも naruhodo の実ワークロードから出た 3 件。
+enchudb-rag の signature 変更 1 件。 いずれも法令検索の消費側アプリの実ワークロードから出た 3 件。
 
 ### Fixed — vocab index の slot が hash 下位ビットで clustering する (#123)
 
@@ -4087,7 +4087,7 @@ falsify で実演)。
 falsify (修正を無効化して落ちることの実演) は #120 の align8 検証、 #123 の VIX2 migration、
 #119 Step 0 の借用版差し戻し、 crash 中断 tombstone の回収、 の 4 件で実施。
 
-`cargo test --workspace` は `enchudb-transport` が repo 外の `../sabitori` に path 依存する
+`cargo test --workspace` は `enchudb-transport` が repo 外の sibling repo (GUI framework) に path 依存する
 ため clean 環境では manifest 解決に失敗する (0.15.0 とは独立の既知問題、 別途 issue 化予定)。
 Linux 検証は該当 crate を除いた 5 crate 指定で実行した。
 
@@ -4122,7 +4122,7 @@ silent データ全損の防止 1 件。 on-disk format / 公開 API / 既定 la
 `create_growable_with_leaf(path, ents, Some(u32::MAX as usize), ..)` が **create もビルドも
 成功する**のに、 できたストアを open すると
 `vocab_data_size 4294967296 exceeds format limit 4294967295 (u32 data_end) — corrupt header`
-で恒久的に開けなかった。 naruhodo の配信ストア準備で、 **7 分のフルビルドが「完走ログを
+で恒久的に開けなかった。 法令検索の消費側アプリの配信ストア準備で、 **7 分のフルビルドが「完走ログを
 出した後に全損」**する形で実踏 (v0.14.4)。
 
 原因は検証の当て先。 create 側は **整列前** の要求値 (`u32::MAX` = 4 GiB−1) を検証して
@@ -4154,7 +4154,7 @@ header に焼く。 open 側は header の値を u32 data_end 制約で検証す
 `Database` の growable create API が `max_entities` / `vocab_data_size` / `leaf_data_size`
 しか露出せず、 **`max_himos`（DB 全体の himo = table × column 通し上限、 default 256）** /
 `content_data_size` / `cyl_max_values` を設定する術が無かった。 himo は DB 全体で通し採番
-されるため、 router+scope を 1 DB に同居させる sinfo が 40 table / 列合計 255 まで育った
+されるため、 router+scope を 1 DB に同居させる消費側が 40 table / 列合計 255 まで育った
 ところで新列追加が `too many himos (max 256)` で失敗し、 **無関係な全 table の open を
 巻き添えで殺していた**。 (queue_cap #116 に続く「schema が engine knob を出し損ねる」系の 2 件目。)
 
@@ -4186,7 +4186,7 @@ data corruption 1 件。 公開 API / on-disk format は不変 (patch)。
 
 `enchudb::schema::Database` を経由しつつ raw `engine_mut().define_table()` /
 `define_himo_in()` で table を定義し、 `finish_*` を呼ばず `flush()` + drop する DB
-(opyula の wiki route / cord junction 等) で `.tables` sidecar が永続されず、 reopen 時に
+(消費側アプリの wiki route / cord junction 等) で `.tables` sidecar が永続されず、 reopen 時に
 2 つの顔で壊れていた:
 
 1. **table 定義消失** → range 再導出で既存 entity が範囲外に孤立し tie が panic
@@ -4212,10 +4212,10 @@ root cause は `Database::wrap_new` の `defer_tables_persist=true` を、 build
 
 #### Migration
 
-- **≤0.14.2 で raw-define パターンを使っていた DB (opyula 等)**: 0.14.3 で open 時に `next_local` が
+- **≤0.14.2 で raw-define パターンを使っていた DB (消費側アプリの一部)**: 0.14.3 で open 時に `next_local` が
   自己修復されるため **今後の eid 再払出は止まる**。 ただし **既に上書き破壊された entity は復元
   されない** — 破壊が疑われる DB は snapshot / rebuild で作り直すこと。
-- schema builder (`db.table().build()`) + `finish_*` のみを使う consumer (sinfo 等) は影響なし、
+- schema builder (`db.table().build()`) + `finish_*` のみを使う consumer は影響なし、
   upgrade で挙動不変。
 
 ## 0.14.2 — 2026-07-20
@@ -4338,12 +4338,12 @@ over-count」という 2 つの構造的コストが解消され、#99 (compacti
 
 clean flag（index↔data 整合性マーク）を書く経路が `flush()`（`&mut`、実質 `seal_integrity`
 専用）にしか無く、通常の close は dirty のまま終了 → **writer open 毎に vocab/himo_reg の
-`rebuild_index` が O(count) で走っていた**（sf のような 1 コマンド 1 open の使い方で全コマンドに
+`rebuild_index` が O(count) で走っていた**（CLI のような 1 コマンド 1 open の使い方で全コマンドに
 乗る固定税。readonly open も shadow index を毎回 heap rebuild）。vocab は回収なし単調増加なので
 税は unbounded に育つ（20万 entry で実測 +20ms/コマンド）。
 
 - **`Engine::flush_clean(&self)`** 追加: 滞留 write を全 apply → 全 region msync →
-  vocab/himo_reg の clean マーク → 再 msync。プロセス生存中の checkpoint 用（sinfo の
+  vocab/himo_reg の clean マーク → 再 msync。プロセス生存中の checkpoint 用（消費側の
   `sync()` 等から呼べる `&self` 版）。readonly open では no-op。
 - **`Engine::Drop` で best-effort clean-flush**: graceful close だけで次 open が rebuild を
   skip できる。panic unwinding 中 / consumer 死亡時 / readonly は書かない（= dirty のまま
@@ -4361,7 +4361,7 @@ clean flag（index↔data 整合性マーク）を書く経路が `flush()`（`&
 
 `HimoStore` の `RwLock<BucketCylinder>` は read が write と per-himo で相互排他になり、
 長い read（巨大 bucket の clone）が write を stall させ、read↔write が取り合っていた
-（sinfo 等「開いたまま read しつつ write する」アプリで問題）。CLAUDE.md が謳う
+（「開いたまま read しつつ write する」アプリで問題）。CLAUDE.md が謳う
 「ロックフリー並行 read / ダブルバッファ + AtomicBool swap」は**実装されておらず**
 （履歴上 double-buffer は一度も存在せず）、実物は `std::sync::RwLock` だった。
 
@@ -4374,14 +4374,14 @@ clean flag（index↔data 整合性マーク）を書く経路が `flush()`（`&
 - **write は per-himo writer lock で直列**（append O(1) amortized、メモリ ~1 倍）。writer の
   呼び出し元は consumer 1 本ではない — **同期 tie（`tie_to_by_id` 系）/ schema
   `RowBuilder::commit` は任意の user thread が呼ぶ**（master では RwLock write が直列化）。
-  初版はここを見落として無 lock にしており、多 thread schema commit（sunsu matrix bench）で
+  初版はここを見落として無 lock にしており、多 thread schema commit（SNS 型負荷試験の matrix bench）で
   epoch defer_destroy の double free → malloc abort していた。writer lock で master と同じ
   write 直列度に復元（reader は lock を一切取らないまま = 本 fix の目的は維持）。
   lock は `parking_lot::Mutex`（critical section ~100ns に対し std::sync::Mutex は競合で即
   カーネル休眠 = psynch 待ちが支配項になり schema write が ~40% 落ちた。adaptive spin で回復）。
   insert の epoch pin も 3 回 → 1 回に集約（`push_in`、pin を insert 全体で共有）。
 
-  sunsu matrix（100k posts / 4 thread、warm、同一機）で master 同等を確認:
+  SNS 型負荷試験の matrix（100k posts / 4 thread、warm、同一機）で master 同等を確認:
 
   | 構成 | master | 本 branch |
   |---|---|---|
@@ -4460,7 +4460,7 @@ fixed cluster で mmap 済みだが **sparse** (物理ブロック未確保) な
 比例の物理コミット**が起きていた (#56 で ①② は fix 済だが ③「rebuild は used slot
 だけ touch する」提案が未実装のまま残存)。 `create_growable_with_capacity` は
 `vocab_max_entries = cap×16` なので大 pool ほど深刻 (cap=1M で dirty reopen 一発
-+~200MB、 cap=16M で ~3.5GB)。 sinfo CLI (sf) の「空 DB でも起動が pool 比例で重い」
++~200MB、 cap=16M で ~3.5GB)。 消費側 CLI の「空 DB でも起動が pool 比例で重い」
 の主因。
 
 - **全域 zero-fill を廃止**し、 既存 on-disk index の上へ live entry (id 0..count) を
@@ -4515,7 +4515,7 @@ test green。
 
 - **選択式**: `create_full_with_leaf_scale` / `create_growable_with_leaf` で
   `LeafScale` を指定 (default `Gb16`)。 大きい scale ほど slot alignment (padding)
-  が粗くなるので、 小さい payload は `Gb16`、 wikipulse 型の大 payload × 巨大
+  が粗くなるので、 小さい payload は `Gb16`、 wiki 型 workload の大 payload × 巨大
   working set は `Gb32`/`Gb64`。 予約 `leaf_data_size` は選んだ scale の cap 以下を検証。
 - `off_shift` は leaf region header に self-describing に記録。
 - `leaf_footprint()` / `MigrationStats.leaf_footprint` を **`u64` (byte)** に
@@ -4542,7 +4542,7 @@ offset の往復 / shift 2·4 の churn reclaim / v6 byte 互換)、 `issue90_le
 
 ### Changed — `Leaf` を vocab から剥がし reclaim 対応 store に載せる (#88): high-churn Leaf の単一 DB 無限運用
 
-`content()` → `Leaf` 統合 (0.9.0 #81) 以降、 高 churn な `Leaf` 値 (wikipulse の
+`content()` → `Leaf` 統合 (0.9.0 #81) 以降、 高 churn な `Leaf` 値 (wiki 型 workload の
 毎 event content 等) が **共有辞書 vocab に単調 append され、 delete しても回収
 されない** 問題 (#88)。 `Leaf` は先が無い終端ノード = 単一所有・dedup 不要なのに、
 append-only-never-reclaim の vocab に入るから貯まる。 対策は「vocab に reclaim を
@@ -4617,7 +4617,7 @@ no-op / file 非破壊)、 sync の `TieLeaf` 収束、 全 workspace test green
 ### Added — postings-only な `.etxt` build + 生候補 API (#84 の第一歩): 索引が本文を二重化しない
 
 全文検索の `.etxt` (ETXT) が原文を自前保持していた分を、 DB 本体の本文 (0.9.0
-#81 の `_c_` Leaf 値) と二重化しない経路を追加。 driving consumer (naruhodo 判例)
+#81 の `_c_` Leaf 値) と二重化しない経路を追加。 driving consumer (判例の全文検索)
 では incremental index ではなく **この冗長性解消**が #84 の実要件だった。
 
 - `TextSearch::save_postings_only` / `write_to_postings_only` (下層 `NgramIndex` /
@@ -4633,7 +4633,7 @@ no-op / file 非破壊)、 sync の `TieLeaf` 収束、 全 workspace test green
 **format 互換**: ETXT header の `reserved[0]` に `FLAG_TEXT_OMITTED` を立てるだけで
 **version bump なし**。 原文保持の書き出しはバイト等価、 旧 reader も postings-only
 file を `doc_count=0` として無害に読める (非 breaking = patch)。 consumer 側
-(naruhodo の `build_hanrei_etxt` / search handler) の差し替えは別途。
+(判例の全文検索の build / search handler) の差し替えは別途。
 
 ## 0.11.0 — 2026-07-06
 
@@ -4853,7 +4853,7 @@ refactor (#69/#70)。 crate 名は変わるが file format / magic `ETXT` は不
 - **`enchudb-text` を `enchudb-ngram`(primitive) に改名し、テキスト検索を
   `enchudb-textsearch`(policy) に分離**
   ([#69](https://github.com/Mutafika/enchudb/issues/69)): `enchudb-text` は実体が
-  bigram 部分一致エンジンだが名前が「検索」という正体を隠していた。lawgraph の機械検索で
+  bigram 部分一致エンジンだが名前が「検索」という正体を隠していた。法令グラフの消費側アプリの機械検索で
   断片 `出力` が `入出力` の部分文字列として無関係条文を引き込むノイズ調査から、用途が
   逆である事が判明（**人間の対話検索 = 部分一致が正解** `接地`→`接地極` ／ **機械 =
   フレーズ完全一致が欲しい**）。これは bug でなく substring の正しい挙動なので、関心を
@@ -4866,7 +4866,7 @@ refactor (#69/#70)。 crate 名は変わるが file format / magic `ETXT` は不
     渡せば同じ path で扱える（issue option (a)、専用 `enchudb-phrase` は未実装）。
   - file format / magic `ETXT` は不変。既存 `.etxt` はそのまま読める。
   - 旧 `TextEngine` は `TextSearch` にほぼ同型で移行（dep 差し替え + 型名リネーム）。
-    downstream（`lawgraph-explorer` / `naruhodo` / `bisquit`）は別 repo で dep 差し替えが要る。
+    downstream（法令グラフ / 法令検索 / ほか消費側アプリ）は別 repo で dep 差し替えが要る。
 
 ## 0.8.19 — 2026-06-23
 
@@ -5075,7 +5075,7 @@ format 完全不変、 **0.8.15 から再 build のみで上がれる**。
 
 `vocab.insert` (= Leaf 用の dedup なし append) は re-tie / remove で旧 vid を
 回収しないため、 long-lived な curated store (= 元ソースから rebuild しない
-タイプ、 例: opyula の memory / room store) で vocab data が単調増加。 opyula
+タイプ、 例: 消費側アプリの memory / room store) で vocab data が単調増加。 同アプリの
 `wiki.ecdb` は live 45 entity に対し物理 155 MB (~3.4 MB/entity) と観測され
 ており、 大半が orphan と推定 (= この API で初めて実測可能に)。
 
@@ -5110,7 +5110,7 @@ ENOSPC 起因の warning スパムと sidecar 破損時の DB 読取不能 (issu
     `.schema.corrupt-<unix_ts>` に rename → 下流の legacy blob / engine
     synthesize fallback に流す (`crates/enchudb-schema/src/lib.rs`)。
   - これまで `.schema` 破損は `Database::open` 全体を fail させていたため、
-    sinfo / opyula 等の consumer が **disk full からの recovery 後も DB を
+    CLI / アプリ等の consumer が **disk full からの recovery 後も DB を
     全く開けなくなる** 状態に陥っていた。 今回 fail-readable 化で engine の
     `list_user_tables` から table 定義を再 synthesize できるようになり、
     破損 sidecar を「警告 + 退避ファイル」 として処理して継続。
@@ -5121,7 +5121,7 @@ ENOSPC 起因の warning スパムと sidecar 破損時の DB 読取不能 (issu
 ### 影響範囲
 
 すべての user が恩恵。 特に:
-- 高頻度 write workload (= opyula / sinfo / suzukapulse 等 ingest 系) が
+- 高頻度 write workload (= 消費側アプリ / CLI / 時系列解析の消費側アプリ等 ingest 系) が
   ENOSPC を踏んでも terminal を失わない。
 - disk full → recovery で `.schema` 破損が起きた DB を、 再 deploy なしで
   そのまま再 open 可能 (= synthesize で table 復元)。
@@ -5178,7 +5178,7 @@ file format / wire format 完全不変、 **0.8.13 から再 build のみで上�
 ## 0.8.13 — 2026-06-03
 
 `TableBuilder::build()` を reopen 時 idempotent に。 issue
-[#50](https://github.com/Mutafika/enchudb/issues/50) で sinfohub-server が踏んだ
+[#50](https://github.com/Mutafika/enchudb/issues/50) で消費側のサーバが踏んだ
 crash-loop bug を根治。 file format / wire format 完全不変、 **0.8.12 から再
 build のみで上がれる**。
 
@@ -5192,7 +5192,7 @@ build のみで上がれる**。
   table 定義を蓄積していく場合、 schema blob (`.schema`) と divergence した
   状態で `db.table("foo").build()` が
   `define_table(foo) failed: table 'foo' already exists` で fail して
-  server crash-loop に陥っていた (sinfohub production で観測)。
+  server crash-loop に陥っていた (消費側サーバの production で観測)。
   既に `v0.8.2-flush-patch` branch に `5ebc5b6` として fix 済だったが master
   に merge 漏れ。 今回 cherry-pick で master に取り込み。
 - regression test を `crates/enchudb-schema/tests/issue50_build_idempotent.rs`
@@ -5210,7 +5210,7 @@ migration / re-declare pattern を使う user のみ。 single-shot `Database::c
 apply する際、 `next_local` を前進させていなかったため、 後続の `entity_in` が
 既に live な local id を再払出 → user の新規 save が既存 entity を上書きする
 silent data loss。 issue [#47](https://github.com/Mutafika/enchudb/issues/47) で
-bisquit が踏んだ症状。 0.8.5 以降の全 sync user に影響、 0.8.12 へ即時更新を推奨。
+消費側アプリが踏んだ症状。 0.8.5 以降の全 sync user に影響、 0.8.12 へ即時更新を推奨。
 
 file format / wire format 完全不変、 **0.8.11 から再 build のみで上がれる**。
 
@@ -5233,7 +5233,7 @@ file format / wire format 完全不変、 **0.8.11 から再 build のみで上�
 
 sync mode (`open_with_oplog` + `enable_sync`) で、 自 peer が複数の foreign peer
 から記録を受信している環境のみ。 単一 peer / 非 sync 利用は無影響。 production
-で bisquit (Mac-Android 2 peer) が「Share Intent で URL 追加するたびに 1 件
+で消費側アプリ (Mac-Android 2 peer) が「Share Intent で URL 追加するたびに 1 件
 silent loss」 として観測した重大 bug。
 
 ## 0.8.11 — 2026-05-31
@@ -5330,7 +5330,7 @@ format 完全不変、 **0.8.9 から再 build のみで上がれる**。
 - `Query::group_max(group, val) -> Result<Vec<(u32, u32)>>`
 - `Query::histogram(col, vmin, vmax, n_buckets) -> Result<Vec<u32>>`
 
-使用例 (= suzukapulse dominance v3 の書き換え想定):
+使用例 (= 時系列解析の消費側アプリの dominance 集計の書き換え想定):
 
 ```rust
 // 0.8.9 までは engine 直叩きが必要だった (= schema 層を素通り)
@@ -5377,7 +5377,7 @@ tel.where_range("speed", 100, 300).group_max("lap_no", "elapsed_ms")?
 #39 対応。 bulk column scan の **rayon 並列化** 系 API を `_par` suffix で追加。
 12M row scan で `min_range` / `max_range` が **9-15x** 高速化、 `histogram_range`
 が **6.2x**、 reduce 系 (`sum` / `count`) が 2x。 callsite が並列で OK と分かって
-る場面 (= 大規模 read-only scan、 suzukapulse / mlbpulse の analytical hot path)
+る場面 (= 大規模 read-only scan、 時系列解析 / 4.5M 行規模の消費側の analytical hot path)
 向け。 file format / wire format 完全不変、 **0.8.8 から再 build のみで上がれる**。
 
 ### Added (Engine、 9 API)
@@ -5435,11 +5435,11 @@ tel.where_range("speed", 100, 300).group_max("lap_no", "elapsed_ms")?
 - `examples/par_scan_bench.rs`: 12M row で 9 query の seq / par 比較を一発実行。
   `cargo run --release --example par_scan_bench` で再現可能。
 
-### 期待 impact (= suzukapulse / mlbpulse)
+### 期待 impact (= 時系列解析 / 野球データの消費側)
 
-- suzukapulse dominance: lap 別 column scan の min/max 系が dominant cost
+- 時系列解析の dominance 集計: lap 別 column scan の min/max 系が dominant cost
   だったので、 9-15x の improvement で全体 1.95s → 数百 ms 級になる見込み。
-- mlbpulse 球種別 max velo / 投手別 min ERA: 同様に大幅改善。
+- 野球データの消費側の球種別 max velo / 投手別 min ERA: 同様に大幅改善。
 
 ### Reference
 
@@ -5449,7 +5449,7 @@ tel.where_range("speed", 100, 300).group_max("lap_no", "elapsed_ms")?
 ## 0.8.8 — 2026-05-31
 
 #38 対応。 0.8.6 の `sum_range` / `group_sum_range` pattern を **min / max /
-group_min / group_max / histogram** に拡張。 suzukapulse / mlbpulse で callsite
+group_min / group_max / histogram** に拡張。 時系列解析 / 野球データの消費側で callsite
 に散在していた手書き min/max loop を engine primitive に集約できる。 file
 format / wire format 完全不変、 **0.8.7 から再 build のみで上がれる**。
 
@@ -5491,9 +5491,9 @@ format / wire format 完全不変、 **0.8.7 から再 build のみで上がれ�
 
 ### Performance impact
 
-- suzukapulse dominance (lap 別 segment min / corner max): callsite の per-lap
+- 時系列解析の dominance 集計 (lap 別 segment min / corner max): callsite の per-lap
   手書き loop が 1 関数呼び出しに圧縮可能。 30〜50% の追加短縮見込み (= [#38])。
-- mlbpulse (球種別 max velo / 投手別 min ERA 等): 同様に手書き loop 撲滅。
+- 野球データの消費側 (球種別 max velo / 投手別 min ERA 等): 同様に手書き loop 撲滅。
 - 詳細 bench は次 patch で計測予定。
 
 ### Reference
@@ -5504,13 +5504,13 @@ format / wire format 完全不変、 **0.8.7 から再 build のみで上がれ�
 ## 0.8.7 — 2026-05-30
 
 schema 永続化を **`.schema` sidecar に移行**、 0.6.x 以来の `schema_meta_entity`
-(= anonymous entity に blob を載せる方式) を撤去。 mlbpulse 等の engine 直構築
+(= anonymous entity に blob を載せる方式) を撤去。 4.5M 行規模などの engine 直構築
 DB を `Database::open` した時の panic を根治。 file format / wire format 完全
 不変、 **0.8.6 から再 build のみで上がれる**。
 
 ### Fixed
 
-- **engine 直構築 DB を `Database::open` で開くと panic** (= mlbpulse の 4.5M
+- **engine 直構築 DB を `Database::open` で開くと panic** (= 4.5M 行の消費側の
   pitch DB で表面化): 旧実装は `__enchu_schema_meta__` marker himo の存在を
   前提に `ensure_schema_entity` で `eng.entity()` (= anonymous) を呼んでいたが、
   `define_table` 後 anonymous は close されており panic していた。
@@ -5563,7 +5563,7 @@ DB を `Database::open` した時の panic を根治。 file format / wire forma
 ### 0.8.6 consumer 向け migration
 
 なし。 `cargo build` で 0.8.7 binary。 既存 DB は自動 migrate (= legacy blob
-読み込み → `.schema` sidecar 書き出し)。 mlbpulse のような engine 直 DB は
+読み込み → `.schema` sidecar 書き出し)。 engine 直で構築した DB は
 fallback 復元で開けるようになる。
 
 ## 0.8.6 — 2026-05-30
@@ -5634,20 +5634,20 @@ DuckDB に届かず (= 別 algorithmic work)。 **file format / wire format 完�
 
 ### 0.8.5 consumer 向け migration
 
-なし。 `cargo build` で 0.8.6 binary。 bisquit / sinfo / suzukapulse / mlbpulse
+なし。 `cargo build` で 0.8.6 binary。 消費側アプリ / CLI / 時系列解析 / 野球データ
 等の consumer も再 build のみで上がれる。 集計が遅かった code は
 `Table::sum` / `Table::group_sum` に書き換えで 10-100x 改善見込み。
 
 ## 0.8.5 — 2026-05-30
 
-sync 経路の 2 件の bug fix patch release。 bisquit (dogfood) の Mac ↔ Android
+sync 経路の 2 件の bug fix patch release。 消費側アプリ (dogfood) の Mac ↔ Android
 mesh sync で表面化した amplification loop と、 schema 層の `where_eq().find_one()`
 が壊れた eid を返してた cast bug を fix。 file format / wire format / 公開 API
 変更なし、 **0.8.4 から再 build のみで上がれる**。
 
 ### Fixed
 
-- **#30 `apply_one::DecodedOp::Vocab` の HLC dedupe 欠落** (= bisquit dogfood で
+- **#30 `apply_one::DecodedOp::Vocab` の HLC dedupe 欠落** (= 消費側アプリの dogfood で
   amplification loop): 旧 behavior では同じ vocab record の再受信を毎回
   `applied++` 扱いし、 `gossip_remote_apply` ON 構成で WAL 再追記 → 再 publish
   → 再受信 の cycle に見える状態だった。 受信前に `Engine::has_remote_vocab`
@@ -5680,8 +5680,8 @@ mesh sync で表面化した amplification loop と、 schema 層の `where_eq()
 
 ### 0.8.4 consumer 向け migration
 
-なし。 `cargo build` で 0.8.5 binary になる。 bisquit / sinfo / suzukapulse /
-mlbpulse 等の consumer は再 build のみで上がれる。 `gossip_remote_apply(true)`
+なし。 `cargo build` で 0.8.5 binary になる。 消費側アプリ / CLI / 時系列解析 /
+野球データ等の consumer は再 build のみで上がれる。 `gossip_remote_apply(true)`
 構成は 0.8.5 以降で amplification loop 解消。
 
 ## 0.8.4 — 2026-05-25
@@ -5699,7 +5699,7 @@ mlbpulse 等の consumer は再 build のみで上がれる。 `gossip_remote_ap
 - `Engine::create_growable_with_options(path, max_entities, vocab_data_size)`
 - `Database::create_growable_with_options(path, max_entities, vocab_data_size)`
 
-setagaya-pwa の世田谷区議会議事録 archive (4,844 会議 / 554,092 発言 /
+議事録 archive の消費側アプリ・世田谷区議会議事録 (4,844 会議 / 554,092 発言 /
 466,383 theme、本文 vocab ~531 MB) で検証。`vocab_data_size = 2 GiB`
 で全量 import 2.4 秒 (230K rows/sec) 完走、search レスポンス 0.8 秒。
 closes #26
@@ -5708,7 +5708,7 @@ closes #26
 
 `wasm32-unknown-unknown` build が 0.8.2 で壊れていた問題を 1 行修正。 native
 build / 公開 API / file format / wire format は完全不変、 wasm consumer
-(naruhodo/web 等) は再 build のみで上がれる。
+(法令検索の消費側アプリの web 版等) は再 build のみで上がれる。
 
 ### Fixed
 
@@ -5722,7 +5722,7 @@ build / 公開 API / file format / wire format は完全不変、 wasm consumer
 ## 0.8.2 — 2026-05-23
 
 `Database::create → build×N → finish_with_oplog` の cold-open perf を
-N table 数 linear から定数時間に圧縮。 sinfo (sinfohub-server) の multi-tenant
+N table 数 linear から定数時間に圧縮。 消費側サーバの multi-tenant
 scope DB cold-open がボトルネックで、 60 user 同時 push の bench で 5+ 秒
 latency 出てた issue #19 を fix。 file format / wire format / 公開 API
 変更なし、 0.8.1 から **再 build のみで上がれる**。
@@ -5757,7 +5757,7 @@ latency 出てた issue #19 を fix。 file format / wire format / 公開 API
 | finish | 13.6 ms | 37.6 ms | -2.8x (= 1 回に集約された fsync 分) |
 | **total cold-open** | **677 ms** | **39 ms** | **17x** |
 
-issue #19 の予測値 (~720ms → ~70ms, 10x) を更に上回る改善。 sinfo の 60 user
+issue #19 の予測値 (~720ms → ~70ms, 10x) を更に上回る改善。 消費側サーバの 60 user
 同時 push bench は scope DB cold-open がボトルネックだったので、 これで unblock。
 
 ### Unchanged
@@ -5769,13 +5769,13 @@ issue #19 の予測値 (~720ms → ~70ms, 10x) を更に上回る改善。 sinfo
 
 ### 0.8.1 consumer 向け migration
 
-なし。 `cargo build` で 0.8.2 binary になる。 sinfo / opyula 等の schema 経由
+なし。 `cargo build` で 0.8.2 binary になる。 消費側 CLI / アプリ等の schema 経由
 consumer も再 build のみ。
 
 ## 0.8.1 — 2026-05-22
 
-short-lived CLI consumer 連携で表面化した recover 不完全の patch release。 sinfo
-の sf CLI (= open → 1 write → drop) で entity 状態 (`next_local` + `entities`
+short-lived CLI consumer 連携で表面化した recover 不完全の patch release。 消費側
+の CLI (= open → 1 write → drop) で entity 状態 (`next_local` + `entities`
 live bitmap) が次 open に持ち越せず eid 衝突が出ていた。 file format / wire
 format / API 変更なし、 **0.8.0 から再 build のみで上がれる**。
 
@@ -5796,7 +5796,7 @@ format / API 変更なし、 **0.8.0 から再 build のみで上がれる**。
 
 - **`Engine::persist_tables(&self) -> io::Result<()>`** public API: `Arc<Engine>`
   (= concurrent mode) でも tables sidecar を強制 persist できる。 既存 `flush(&mut)`
-  が取れない context (= sinfo 等の embed consumer で long-lived process が任意
+  が取れない context (= embed consumer で long-lived process が任意
   tick で固めたい場合) 用、 wasm / memory-only では Ok(()) no-op
 - **`apply_oplog_op` 内で `advance_table_next_local_for`**: recover 中に与えられた
   global eid を含む table の `next_local` を `(eid - lo) + 1` まで前進させる
@@ -5811,7 +5811,7 @@ format / API 変更なし、 **0.8.0 から再 build のみで上がれる**。
 
 ### 0.8.0 consumer 向け migration
 
-なし。 `cargo build` で 0.8.1 binary になる。 sinfo / opyula 等の schema 経由
+なし。 `cargo build` で 0.8.1 binary になる。 消費側 CLI / アプリ等の schema 経由
 consumer も再 build のみ。
 
 ## 0.8.0 — 2026-05-22
@@ -5869,7 +5869,7 @@ source にし、 oplog は local crash recovery 専用に役割を絞る。 0.7.
 [`docs/migration-0.7.0-to-0.8.0.md`](docs/migration-0.7.0-to-0.8.0.md) (=
 local 専用) に詳細あり、 要約:
 
-- **schema 経由 consumer** (opyula / bisquit / sinfo / matcha / t5ug3 等):
+- **schema 経由 consumer** (消費側アプリ / CLI 等):
   再 build で済む、 公開 API 完全不変。 `Database::enable_sync()` 呼んでいた
   consumer は自動 transfer 化により `transfer_oplog_to_sync_ops()` の手動
   呼び出しが不要に (= 残しても idempotent で no-op)
@@ -5959,7 +5959,7 @@ mini-RDB semantics の **actually 確立** ([issue #11](https://github.com/Mutaf
 透過 open / consumer code への影響 / sync 経路の opt-in 化手順あり。
 
 API 不変 (= schema crate 公開 API は 0.6.0 から変わらない) なので、 schema crate
-経由の consumer (opyula / bisquit / sinfo / matcha / t5ug3 / sinfohub-server 等) は
+経由の consumer (消費側アプリ / CLI / サーバ等) は
 **再 build で済む**。 sync 経路を活用する consumer は `Database::enable_sync()` を
 build phase で呼ぶ opt-in 切替で `_sync_ops` table 機構の恩恵を受けられる。
 
@@ -6299,9 +6299,9 @@ eng.tie(post, "posts.author", alice as u32);  // alice が users 範囲外なら
 
 ### Migration
 
-- 既存 caller (`sinfo` / `matcha` / `bisquit` / sunsu の broadcast 経路) は
+- 既存 caller (消費側 CLI / アプリ / SNS 型負荷試験の broadcast 経路) は
   **API 完全不変**。 何もしなくても旧挙動で動く
-- SNS partial sync を作りたい caller (sunsu の次の段階) は:
+- SNS partial sync を作りたい caller (SNS 型負荷試験の次の段階) は:
   ```rust
   struct SnsFilter { /* peer 別 follow set 等 */ }
   impl SubscriptionFilter for SnsFilter {
@@ -6341,7 +6341,7 @@ eng.tie(post, "posts.author", alice as u32);  // alice が users 範囲外なら
 
 - **request3: `body_msync` を dirty range 限定化** — 旧実装は consumer thread の
   `body_msync` が `flush(0, committed)` で committed 全体を msync。 sustained
-  workload で committed が伸びるたびに線形に遅くなる症状 (sinfohub-server 10K user
+  workload で committed が伸びるたびに線形に遅くなる症状 (消費側サーバの 10K user
   ×100KB load test で body_msync **6 ms → 3.6 s** に増大、 fsync_interval=100 ms
   が実質機能せず producer 全体が consumer に律速)
   - `GrowableMap` に `dirty_lo` / `dirty_hi` の atomic ペアを追加。 hot write path
@@ -6376,7 +6376,7 @@ eng.tie(post, "posts.author", alice as u32);  // alice が users 範囲外なら
   際、 push_count の counter 連動を入れ忘れていた。 apply_count は EntityCreated
   でも +1 されるので、 `applied >= pushed` が Ties 未 apply の段階で成立 →
   早期 return → flush_writes 直後の live query が 5-12% の write を見落とす
-  bug (sunsu Docker scenario 01 medium/large で panic していた症状)
+  bug (SNS 型負荷試験の Docker scenario 01 medium/large で panic していた症状)
   - `entity()` で `Op::EntityCreated` を push した直後に
     `push_count.fetch_add(1, Ordering::Release)` を呼ぶように修正
   - durability は **影響なし** (WAL は正しく書かれていたので drop+reopen で正しい
@@ -6396,7 +6396,7 @@ eng.tie(post, "posts.author", alice as u32);  // alice が users 範囲外なら
 - **issue4: sustained async writer で queue が unbounded で OOM** — option 1
   (bounded queue + producer block) で対応。 旧 unbounded `SegQueue` では
   writer >> consumer rate になると queue 内 record が線形成長 → RSS 線形成長
-  → OOM kill (sunsu Docker scenario 03 で 14s / 8M posts / 3.38 GB → 4 GB 突破)
+  → OOM kill (SNS 型負荷試験の Docker scenario 03 で 14s / 8M posts / 3.38 GB → 4 GB 突破)
   - `WriteQueue` を `crossbeam_queue::ArrayQueue` に変更、 push 満杯時は
     `std::thread::yield_now` ループで consumer の drain を待つ (自然な
     backpressure)
@@ -6422,7 +6422,7 @@ eng.tie(post, "posts.author", alice as u32);  // alice が users 範囲外なら
   ops/sec 級の writer なら latency 体感不変
 - writer rate が consumer 上限を恒常的に超える app (sustained SNS post 等) は
   **producer 側で push が block する** ようになるので、 throughput が
-  consumer 上限に張り付く (= sunsu 等で実測 ~500K posts/sec)
+  consumer 上限に張り付く (= SNS 型負荷試験等で実測 ~500K posts/sec)
 - RSS を更に絞りたいなら `create_concurrent_with_wal_queue_cap(.., queue_cap=10_000)`
   等で明示
 
@@ -6431,7 +6431,7 @@ eng.tie(post, "posts.author", alice as u32);  // alice が users 範囲外なら
 ### Fixed
 
 - **issue3: sustained 並列 sync writer で undo region (16 M) overflow → panic** —
-  3 段階で対応。 sinfohub-server の 100K user load test / sunsu scenario 03 が
+  3 段階で対応。 消費側サーバの 100K user load test / SNS 型負荷試験の scenario 03 が
   完走できる
   - **Phase 1**: `Engine::entity()` の `undo.record` を consumer thread に逃がす。
     新規 `Op::EntityCreated { local }` を WriteQueue に push、 consumer thread の
@@ -6480,7 +6480,7 @@ eng.tie(post, "posts.author", alice as u32);  // alice が users 範囲外なら
   を lazy 化 (`Vec::new()` start、 `ensure_positions` で on-demand 伸長)。 同時に
   v33 以降 dead weight になっていた `PairTable` (= `ensure_himo` で card_a × card_b
   cells を pre-allocate していた、 ~4.6 GB / 200 himos) を全削除
-  - sinfo (26 tables / ~156 himos) の OOM kill が解消
+  - 消費側 CLI (26 tables / ~156 himos) の OOM kill が解消
   - on-disk layout / API は不変、 consumer 側は `cargo update` だけで効果あり
 - **WAL append を consumer thread で batch 化** — 従来 record 1 件ごとに `flock` を
   取って `head` を進めていたのを、 consumer thread が複数 record をまとめて 1 度の
@@ -6502,7 +6502,7 @@ eng.tie(post, "posts.author", alice as u32);  // alice が users 範囲外なら
   が `.db.lock` sidecar に `flock(LOCK_EX)` を engine 寿命中保持。 2 つ目の
   writer process は block する (sqlite WAL モード相当の挙動)
 - **`Database::create_growable_with_capacity(path, max_entities)`** — default 16M
-  (= layout 25 GB、 apparent file 24 GB) を絞れる。 sinfo 等の中規模 app で
+  (= layout 25 GB、 apparent file 24 GB) を絞れる。 消費側の中規模 app で
   65K 程度に指定すると layout 1.3 GB / apparent 765 MB に縮む
 - **WAL `append_inner` に `flock` 排他** — 同 .wal を別 process が直接開いて append
   する場合の data race を防ぐ defense-in-depth
@@ -6550,7 +6550,7 @@ eng.tie(post, "posts.author", alice as u32);  // alice が users 範囲外なら
 ### Positioning / docs
 
 - **schema 層を declarator + bindings 専門に位置付け直した** — README / schema crate
-  README を rewrite。 高頻度 writer / reader (sunsu の SNS bench、 sinfo の concurrent
+  README を rewrite。 高頻度 writer / reader (SNS 型の負荷試験、 消費側 CLI の concurrent
   job 等) は **「起動時に schema declare → bindings 抽出 → runtime は engine 直叩き」**
   が公式推奨。 schema 層の `insert().commit()` / `where_eq().find()` は declarative
   convenience として残るが、 hot path で経由する想定ではない
@@ -6574,13 +6574,13 @@ eng.tie(post, "posts.author", alice as u32);  // alice が users 範囲外なら
 - **schema commit 経路を使ってる app は何もしなくていい** (内部で `_by_id` 経路に
   切り替え済み、 API 不変)
 - **hot path で perf を出したい app** は次に bindings 抽出 + engine 直叩きに移行:
-  - `sunsu` の concurrent_posts: 113k posts/sec → ~1.4 M posts/sec (estimate ~12×)
-  - sinfo の SNS 系 writer 全般
-- `sinfo` の sf CLI が持っている `fs2::FileExt::lock_exclusive` (acquire_db_lock)
+  - SNS 型負荷試験の concurrent_posts: 113k posts/sec → ~1.4 M posts/sec (estimate ~12×)
+  - 消費側 CLI の SNS 系 writer 全般
+- 消費側 CLI が持っている `fs2::FileExt::lock_exclusive` (acquire_db_lock)
   は本 release の enchudb 内蔵 lock と二重になる。 動作は壊れないが、 redundant
-  なので sinfo 側で別途 cleanup PR を出す予定
-- `Sinfo Studio` は `Database::open` を `Database::open_readonly` に切り替えれば、
-  sf CLI 起動中でも block されない (= 既存 race を完全解消)
+  なので消費側で別途 cleanup PR を出す予定
+- 同じ DB を読む消費側アプリは `Database::open` を `Database::open_readonly` に切り替えれば、
+  CLI 起動中でも block されない (= 既存 race を完全解消)
 
 ## 0.2.1 — 2026-05-13
 

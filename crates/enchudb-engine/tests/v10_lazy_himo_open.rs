@@ -1,7 +1,7 @@
 //! v10 / request23 D2: **触らない himo の segment は open しない**。
 //!
 //! v10 は himo 1 本 = file 1 本なので、 open 代が himo 数に比例していた。 consumer は
-//! 1 コマンド 1 process (償却先が無い) で、 kenning の実測では 1 コマンドが触る himo は
+//! 1 コマンド 1 process (償却先が無い) で、 コード索引の CLI の実測では 1 コマンドが触る himo は
 //! 48 本中 2〜13 本しかない。 `HimoStore` の column を遅延 mmap にして、 その差を消した。
 //!
 //! ここで gate するのは 3 つ:

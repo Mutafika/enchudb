@@ -79,7 +79,7 @@ fn main() {
         "case", "max_val", "distinct", "cold ms", "warm ms", "昇順 ms", "query ms", "drop ms", "open ms"
     );
     let ents = 200_000;
-    // 宣言だけ大きく、 実際に使う値は少ない (sinfo / kenning の形)
+    // 宣言だけ大きく、 実際に使う値は少ない (消費側の CLI / コード索引の CLI の形)
     run("大宣言/小", 100_000, 1_000, ents);
     // 宣言どおり全部使う (成長経路の最悪形)
     run("全部使う", 100_000, 100_000, ents);

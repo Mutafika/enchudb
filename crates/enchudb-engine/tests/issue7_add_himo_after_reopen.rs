@@ -1,6 +1,6 @@
 //! issue7 再現テスト: 既存 DB に新 himo を append → 次回 open で SIGBUS。
 //!
-//! opyula `schema::define_all_himos` の挙動を模す:
+//! 消費側アプリの `schema::define_all_himos` の挙動を模す:
 //! 1) create_full で DB を作る (max_himos=64、 vocab/content 16MB ずつ、 cap 262144)
 //! 2) ~44 個 himo を define、 data を tie、 flush、 drop
 //! 3) open_standalone で開いて、 さらに ~18 個 himo を append、 flush、 drop
@@ -74,13 +74,13 @@ fn append_himos_after_reopen_does_not_sigbus() {
     cleanup(&path);
 }
 
-/// opyula が報告する具体的 himo 名・型を使った版 (Tag / Number / Ref が混在)。
+/// 消費側アプリが報告した具体的 himo 名・型を使った版 (Tag / Number / Ref が混在)。
 #[test]
 fn append_mixed_type_himos_after_reopen() {
     let path = tmp_path("append_mixed");
     cleanup(&path);
 
-    // 既存 schema (opyula V1 の前半 44 個に近い構成)
+    // 既存 schema (消費側アプリ V1 の前半 44 個に近い構成)
     {
         let mut eng = Engine::create_full(
             &path,

@@ -6,7 +6,7 @@
 //!     （append-only + lazy verify）。
 //! (3) 同期 tie API（`tie_to_by_id` 系 = schema `RowBuilder::commit` の経路）を
 //!     複数 thread から並行に呼んでも壊れない。 master では RwLock write が直列化して
-//!     いた契約で、 lock-free 化直後は per-himo write_lock が無く sunsu matrix bench
+//!     いた契約で、 lock-free 化直後は per-himo write_lock が無く SNS 型の負荷試験の matrix bench
 //!     (schema commit ×4 thread) が malloc abort（epoch defer_destroy の double free）
 //!     していた（レビュー発覚分。 修正 = HimoStore::write_lock）。
 

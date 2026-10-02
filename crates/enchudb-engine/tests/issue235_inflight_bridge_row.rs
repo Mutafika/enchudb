@@ -111,7 +111,7 @@ fn inflight_bridge_row_is_not_eaten_by_ack() {
 /// caller が実在より先を ack して watermark が未完成 row を跨ぐと、
 /// `ack_sync_prefix` と同じ silent loss になる。 `ack_sync` は生の lsn を受ける
 /// public API なので、 caller 側だけでは防げない (enchudb 自身の
-/// `issue221_purge_atomicity` と sunsu2 の `relay_death_*` が実際に使っている)。
+/// `issue221_purge_atomicity` と負荷 harness の `relay_death_*` が実際に使っている)。
 ///
 /// ここで **payload を剥がして「decode 不能」を作っている**のは意図的。 engine は
 /// 「まだ書けていない」 と 「壊れている」 を**観測上区別できない**、 というのが

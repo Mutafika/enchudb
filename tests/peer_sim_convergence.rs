@@ -2,7 +2,7 @@
 //!
 //! 判定は 1 本: **アプリ層の再 author / bootstrap を一切挟まずに peer が収束するか**。
 //!
-//! sync の欠陥は長らく実アプリ (syncretic) の症状から逆算していたが、 アプリ固有の
+//! sync の欠陥は長らく実アプリ (ファイル同期の消費側アプリ) の症状から逆算していたが、 アプリ固有の
 //! 復旧手段 (disk からの再 scan) を前提にすると、 library として壊れていても
 //! 気付けない。 ここではその逃げ道を塞いだ状態で判定する。
 
@@ -30,7 +30,7 @@ fn text_converges_when_vocab_and_tie_arrive_together() {
 /// 一方 pull cursor は `with_cursor_path` で永続する。 この非対称のせいで
 /// 「cursor は Vocab を消費済みと言うが、 写像はもう無い」窓ができる。
 ///
-/// syncretic の実地発現 (15962 行中 12 行が破損、 再起動 28 回、
+/// ファイル同期の消費側アプリの実地発現 (15962 行中 12 行が破損、 再起動 28 回、
 /// `history_truncated` は 0 回) と同じ形。
 #[test]
 fn text_converges_across_peer_restart() {
@@ -39,7 +39,7 @@ fn text_converges_across_peer_restart() {
     // peer B 側の vid 空間を埋めておく。 fresh store 同士は intern 順が対称で
     // vid 番号が衝突するので、 生の remote vid をそのまま書く実装では
     // **B 自身の無関係な文字列**が peer A の値として見えることになる
-    // (syncretic の `path` 列に別行の PK が入った症状と同じ)。
+    // (そのアプリの `path` 列に別行の PK が入った症状と同じ)。
     for i in 0..8 {
         sim.write_local_text(1, "name", &format!("B-LOCAL-DECOY-{}", i));
     }
@@ -106,7 +106,7 @@ fn consumed_vocab_mapping_survives_restart() {
     );
 }
 
-/// **削除が受信側の再起動を跨いで効くか** (syncretic の「亡霊」観測の切り分け)。
+/// **削除が受信側の再起動を跨いで効くか** (ファイル同期の消費側アプリの「亡霊」観測の切り分け)。
 ///
 /// `Delete` は himo を持たないので、 受信側は `resolve_remote_eid_existing`
 /// (= 既存の eid 写像) でしか宛先を引けない。 引けなければ `apply_one` は false を
@@ -149,7 +149,7 @@ fn delete_applies_after_receiver_restart() {
 /// **eid 写像は clean close を挟まずに耐えるか** (SIGKILL 相当)。
 ///
 /// `delete_applies_after_receiver_restart` が通るのは in-process の drop が
-/// 必ず clean shutdown になるから。 syncretic の chaos harness は SIGKILL を
+/// 必ず clean shutdown になるから。 ファイル同期の消費側アプリの chaos harness は SIGKILL を
 /// 混ぜているので、 「apply した直後に電源が落ちたら `.eidmap` に載っているか」
 /// が本当の分かれ目になる。
 ///

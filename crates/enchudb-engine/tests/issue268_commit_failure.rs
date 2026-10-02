@@ -1,6 +1,6 @@
 //! #268: **Commit marker の append が失敗したときに checkpoint を進めない。**
 //!
-//! 実機 (syncretic) で bridge が 26.4 時間 0 を返し続け、 配布が完全に沈黙した。
+//! 実機の sync 構成で bridge が 26.4 時間 0 を返し続け、 配布が完全に沈黙した。
 //! 警告が捉えた形は `cursor=32 (ring 先頭) / head=256` で、 その 224 byte は
 //! **Commit で閉じられていない group** だった (payload 0 の op は Commit だけなので
 //! 224 = record 1〜2 本ぶん)。

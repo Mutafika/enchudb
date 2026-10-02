@@ -1,4 +1,4 @@
-//! v10: directory DB を **別 process** が `open_readonly` で開けること (oboro / opyula の
+//! v10: directory DB を **別 process** が `open_readonly` で開けること (別 process の readonly reader の
 //! Leaf 直読み経路)。 sidecar (tables) が directory の中に移っても reader は同じ path 文字列
 //! で開けて、 writer が lock を握ったまま後から足した himo (= 新しい segment file) も
 //! 次の open で見える。 child は自分自身 (test binary) を `readonly_probe_child` で起動。

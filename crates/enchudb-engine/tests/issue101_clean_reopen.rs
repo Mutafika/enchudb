@@ -97,7 +97,7 @@ fn graceful_close_skips_rebuild_crash_does_not() {
 }
 
 /// 明示 `flush_clean(&self)` はプロセス生存中に clean flag を立てられる
-/// (sinfo のような「commit 後に checkpoint」用途)。 次の insert で dirty に戻る。
+/// (消費側の CLI のような「commit 後に checkpoint」用途)。 次の insert で dirty に戻る。
 #[test]
 fn explicit_flush_clean_marks_clean() {
     let path = "/tmp/test_issue101_explicit.db";

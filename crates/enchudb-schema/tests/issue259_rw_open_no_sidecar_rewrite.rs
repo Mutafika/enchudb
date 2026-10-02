@@ -24,7 +24,7 @@ fn rw_open_with_relations_does_not_rewrite_tables_sidecar() {
     let p = tmp_path("rw");
     let _ = enchudb_engine::db_files::remove_db(&p);
     {
-        // kenning と同じ形: 8 本の ref relation
+        // コード索引の CLI と同じ形: 8 本の ref relation
         let mut db = Database::create_growable_with_capacity(&p, 4096).unwrap();
         db.table("file").tag("path").build().unwrap();
         db.table("sym")

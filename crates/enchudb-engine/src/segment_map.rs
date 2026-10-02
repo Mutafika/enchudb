@@ -22,7 +22,7 @@
 //! - 伸長は writer だけ: `ftruncate` → 全 [0..new) を MAP_FIXED で貼り直す
 //!   (macOS が隣接 slice の MAP_FIXED を EINVAL にする quirk を避ける、 `GrowableMap` と同じ)
 //! - **別 process の reader** は `refresh()` でファイル長を見て自分の commit を伸ばす
-//!   (縮めない = SIGBUS しない、 oboro / opyula の readonly 直読み契約)
+//!   (縮めない = SIGBUS しない、 別 process の readonly reader の直読み契約)
 //! - fd は **map 後に閉じる**。 macOS GUI app の既定 `ulimit -n 256` に数百 segment を
 //!   乗せるため。 伸長 / refresh / 空き容量確認は path から開き直す
 //! - #167: 伸長時に 「これから commit する分 + margin」 の空きを statvfs で確認し、

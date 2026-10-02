@@ -1,6 +1,6 @@
 //! oplog → `_sync_ops` bridge (`transfer_oplog_to_sync_ops`) の scaling 計測。
 //!
-//! sunsu2 fanout probe で「48k op の bridge が数分」を観測した最小化。
+//! 負荷 harness の fanout probe で「48k op の bridge が数分」を観測した最小化。
 //! N を倍々にして transfer の wall time を測る — 線形なら倍々、超線形なら発散。
 //!
 //! 使い方: `cargo run --release --example bridge_scaling [N1,N2,...]`
@@ -15,7 +15,7 @@ fn main() {
         .map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect())
         .unwrap_or_else(|| vec![5_000, 10_000, 20_000, 40_000]);
 
-    // ── stage 2: schema 層経由 (sunsu2 の posts と同型: tag PK + leaf + number×3、
+    // ── stage 2: schema 層経由 (負荷 harness の posts と同型: tag PK + leaf + number×3、
     //    1 row = 1 commit) で同じ scaling を測る ──
     if std::env::args().any(|a| a == "--schema") {
         for n in ns {

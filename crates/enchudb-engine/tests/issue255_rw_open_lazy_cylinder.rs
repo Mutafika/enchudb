@@ -67,7 +67,7 @@ fn rw_open_builds_no_cylinder_until_touched() {
     assert_eq!(rw.get_text_owned(eids[0], "t.h0").as_deref(), Some(b"leaf value 0/0".as_slice()));
     assert_eq!(rw.himos_with_cylinder_built(), 0);
     // #270: **書き込みも組まない**。 bulk load は pull を一度も引かないので、 書きながら
-    // 育てた index は誰にも使われずに捨てられる (naruhodo のフルリビルドで 1.5GB /
+    // 育てた index は誰にも使われずに捨てられる (法令検索の消費側アプリのフルリビルドで 1.5GB /
     // 2,856 万確保)。 組むのは **最初に引かれた時**。
     rw.tie_to(eids[0], "t.h1", 5);
     assert_eq!(rw.himos_with_cylinder_built(), 0, "書き込みでは組まない (#270)");

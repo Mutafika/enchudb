@@ -48,12 +48,12 @@ fn by_id_matches_the_named_version() {
     let by_id = eng.entity_in("a").unwrap();
 
     eng.tie(named, "a.n", 42);
-    eng.tie_text(named, "a.tag", "kenning");
+    eng.tie_text(named, "a.tag", "alpha");
     eng.tie_text(named, "a.leaf", "本文はここ");
     eng.tie_ref(named, "a.r", target);
 
     eng.tie_by_id(by_id, h_n, 42);
-    eng.tie_text_by_id(by_id, h_tag, "kenning");
+    eng.tie_text_by_id(by_id, h_tag, "alpha");
     eng.tie_text_by_id(by_id, h_leaf, "本文はここ");
     eng.tie_ref_by_id(by_id, h_r, target);
 

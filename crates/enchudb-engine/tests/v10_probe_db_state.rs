@@ -2,7 +2,7 @@
 //!
 //! v10 は DB が directory なので、 consumer の `if path.exists() { open } else { create }` が
 //! 「create の途中で落ちた半端な directory」 を既存 DB と誤認する。 sidecar 名を決め打ちで
-//! 見に行かせないための入口 (消費側 sinfo からの要望)。
+//! 見に行かせないための入口 (消費側の CLI からの要望)。
 
 use enchudb_engine::{DbState, Engine, ValueType};
 use std::path::Path;
@@ -101,7 +101,7 @@ fn probe_tells_missing_ready_incomplete_damaged_and_legacy_apart() {
     let _ = std::fs::remove_dir_all(&half);
 
     // writer が lock を握っている最中でも probe でき、 file を 1 つも増やさない
-    // (sinfo の local peer が readonly で覗く経路と競合しないこと)
+    // (消費側の CLI の local peer が readonly で覗く経路と競合しないこと)
     let held = base("lock_held");
     let mut eng = Engine::create_with_capacity(&held, 1024).unwrap();
     eng.define_table("t", 100).unwrap();

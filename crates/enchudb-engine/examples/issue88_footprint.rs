@@ -1,7 +1,7 @@
 //! #88 footprint bench — Leaf を vocab に載せる旧挙動 (before) と LeafStore に
 //! 載せる v6 (after) で、 rolling retention 下の footprint を比較する。
 //!
-//! wikipulse 型の workload を模す:
+//! wiki 型の workload (大 payload × 高 churn) を模す:
 //!   round 毎に 1 entity 作成 + content(Leaf) を tie、 `WINDOW` round 前の entity を
 //!   delete (= retention)。 live 集合は常に ~WINDOW 件。
 //!

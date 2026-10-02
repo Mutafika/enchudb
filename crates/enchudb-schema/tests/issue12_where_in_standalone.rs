@@ -4,7 +4,7 @@
 //! IN が唯一の述語のとき base candidates が `query_by_id(&[])` = 空になり、
 //! 空集合を retain して常に 0 件だった。 fix 後は IN 集合自体が候補の seed になる。
 //!
-//! sunsu home-timeline (fan-out-on-read) の repro を enchudb-schema API のみで移植。
+//! SNS 型の負荷試験の home-timeline (fan-out-on-read) の repro を enchudb-schema API のみで移植。
 
 use enchudb_schema::{Database, Value};
 

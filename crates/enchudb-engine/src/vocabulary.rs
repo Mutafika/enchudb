@@ -46,7 +46,7 @@ pub struct Vocabulary {
     /// **count 比例の compact 形式** `(fxhash(value), vid)` sorted に変更。 旧形式は
     /// 確保こそ calloc (仮想) だが、 #123 で hash が一様分散になったため rebuild が
     /// shadow の全ページに live slot を書いて **index_cap 比例の anon RSS** を
-    /// Engine 寿命の間占有していた (dirty DB の readonly open 1 回ごと。 naruhodo
+    /// Engine 寿命の間占有していた (dirty DB の readonly open 1 回ごと。 全文検索の消費側アプリ
     /// 1GB VPS の boot +~300MB の正体)。 lookup は hash の binary search + 同 hash
     /// 内の値比較で、 旧 probe と同じ「最小 vid が勝つ」 解決を保つ。
     shadow_index: Option<Vec<(u64, u32)>>,
@@ -875,7 +875,7 @@ mod tests {
 
     /// #123: readonly open で VIX2 を掴んだ場合、 共有 index を **1 byte も書かず**に
     /// shadow (新 slot 関数) で正しく引けること。 別 process の writer と併走する
-    /// oboro / sinfo-studio 型の構成が該当する。
+    /// 別 process の readonly reader 型の構成が該当する。
     #[test]
     fn issue123_readonly_open_of_legacy_index_uses_shadow() {
         let cap = 1u32 << 8;

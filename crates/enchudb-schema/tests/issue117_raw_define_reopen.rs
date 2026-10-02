@@ -40,7 +40,7 @@ fn face1_table_definition_survives_reopen() {
         eng.define_table("wiki", 200_000).unwrap();
         eng.define_himo_in("wiki", "kind", ValueType::Tag, 0).unwrap();
         eng.flush().unwrap();
-        // finish_* を呼ばず drop (opyula の wiki route と同じ)
+        // finish_* を呼ばず drop (消費側アプリの wiki route と同じ)
     }
 
     let eng = Engine::open_standalone(path_s).unwrap();

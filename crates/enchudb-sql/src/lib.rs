@@ -208,7 +208,7 @@ impl Database {
     /// Tiny growable preset for app state-logs. Caps at 1024 rows /
     /// 16 himos / 64 KB per data section → layout total ≈ 250 KB.
     /// This is the right default for "a few hundred rows of
-    /// dismissed-key / seen-at" stores (matcha's notif state, etc.).
+    /// dismissed-key / seen-at" stores (a desktop app's notification state, etc.).
     /// The file appears at ~250 KB on disk, not the 305 MB that the
     /// regular `create_compact` produces.
     pub fn create_growable_tiny(path: &str) -> Result<Self, SqlError> {
@@ -228,7 +228,7 @@ impl Database {
     pub fn engine(&self) -> &Engine { &self.eng }
     pub fn engine_mut(&mut self) -> &mut Engine { &mut self.eng }
 
-    /// 登録済み table の一覧を返す (enchu studio / 非 SQL consumer 用)。
+    /// 登録済み table の一覧を返す (GUI の DB viewer / 非 SQL consumer 用)。
     pub fn list_tables(&self) -> Vec<(String, Vec<(String, SqlType, bool)>)> {
         self.tables.iter().map(|t| {
             let cols = t.cols.iter().map(|c| {
@@ -1607,10 +1607,10 @@ mod tests {
     }
 
     #[test]
-    fn matcha_history_query() {
-        // matcha の本番ユース: 通知履歴を delivered_at desc で limit、
+    fn notif_history_query() {
+        // 消費側アプリの本番ユース: 通知履歴を delivered_at desc で limit、
         // retention は古い行を delete。
-        let mut db = fresh("matcha_history");
+        let mut db = fresh("notif_history");
         db.execute(
             "CREATE TABLE notif_log (\
                 key TEXT PRIMARY KEY, \
@@ -1646,9 +1646,9 @@ mod tests {
     }
 
     #[test]
-    fn matcha_use_case() {
-        // matcha の通知 state 永続化シナリオ
-        let mut db = fresh("matcha");
+    fn notif_state_use_case() {
+        // 消費側アプリの通知 state 永続化シナリオ
+        let mut db = fresh("notif_state");
         db.execute("CREATE TABLE notif_state (key TEXT PRIMARY KEY, dismissed_at INTEGER)").unwrap();
         db.execute("INSERT INTO notif_state VALUES ('uuid-1', 1715174400)").unwrap();
         db.execute("INSERT INTO notif_state VALUES ('uuid-2', 1715174500)").unwrap();
@@ -1778,7 +1778,7 @@ mod tests {
 
     #[test]
     fn open_existing_schema_data_visible_without_create_table() {
-        // matcha 起動時のパターン: open するだけで既存 schema + データが見える
+        // 消費側アプリ起動時のパターン: open するだけで既存 schema + データが見える
         let path = "/tmp/enchudb_sql_persist_no_create.db";
         let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
         let _ = std::fs::remove_file(path);

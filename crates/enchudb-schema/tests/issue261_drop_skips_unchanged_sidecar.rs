@@ -1,6 +1,6 @@
 //! #261: 書き込みゼロの rw session (= 開いて読んで閉じるだけ) が、 `impl Drop for Database`
 //! の無条件 `persist_schema()` で `schema` fsync + engine flush を毎回払っていた。
-//! 1 コマンド 1 process の消費側 (kenning の増分 update、 `sf` の条件付き更新) では
+//! 1 コマンド 1 process の消費側 (コード索引の CLI の増分 update、 別の CLI の条件付き更新) では
 //! これが drop の 15〜21 ms として乗る。
 //!
 //! gate は 3 本:
@@ -30,7 +30,7 @@ fn mtime(path: &str, sidecar: &str) -> std::time::SystemTime {
         .unwrap()
 }
 
-/// kenning / sf の形: 数 table + relation + 実データ入り。
+/// 1 コマンド 1 process の CLI の形: 数 table + relation + 実データ入り。
 fn seed(p: &str) {
     let _ = enchudb_engine::db_files::remove_db(p);
     let mut db = Database::create_growable_with_capacity(p, 4096).unwrap();

@@ -3,7 +3,7 @@
 //! schema 層の `Database::open` (rw) は `load_schema` で sidecar から復元した各 relation を
 //! `define_ref_in` で engine に再登録する。 fk entry が既に登録済みでも末尾で無条件に
 //! `try_persist_tables()` を呼んでいたため、 relation 1 本につき fsync 1 回 (APFS ~6 ms) が
-//! rw open の定数コストになっていた (kenning: relation 8 本で open 42〜69 ms、 修正後 1 ms)。
+//! rw open の定数コストになっていた (コード索引の CLI: relation 8 本で open 42〜69 ms、 修正後 1 ms)。
 //! persist を「entry を新規に push した時だけ」に変えた。
 //!
 //! gate は 2 つ:
@@ -22,7 +22,7 @@ fn tables_mtime(path: &str) -> SystemTime {
     std::fs::metadata(db_files::path_for(path, db_files::TABLES)).expect("tables sidecar").modified().unwrap()
 }
 
-const RELS: u32 = 8; // kenning と同じ本数
+const RELS: u32 = 8; // コード索引の CLI と同じ本数
 
 /// 2 table + `RELS` 本の ref relation を持つ DB を作って閉じる。
 fn build(path: &str) {

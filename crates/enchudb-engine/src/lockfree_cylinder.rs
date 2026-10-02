@@ -190,7 +190,7 @@ impl LockFreeCylinder {
         // dense は `insert` に成長経路 (doubling) を持っているので、 事前確保は純粋な
         // 最適化であって無くても動く。 打ち切っても:
         // - open は `max_values` 非依存になる (同条件で 103.7 → 5.5 ms)
-        // - write は変わらない (200k tie の実測で差なし、 実 consumer の sunsu2 でも同一)
+        // - write は変わらない (200k tie の実測で差なし、 実 consumer の負荷 harness でも同一)
         // 低 cardinality 列 (`cardinality()` の想定用途) は `PREALLOC_CAP` 以内に収まるので、
         // hint としての意味は残る。
         let hint = if max_values == 0 {
@@ -433,7 +433,7 @@ impl LockFreeCylinder {
         self.total.fetch_add(1, Ordering::Relaxed);
         // total_live は total − stale_total で導出 (request12.1) — ここで RMW を
         // 増やさない (raw tie_async + oplog の consumer apply が per-insert コストに
-        // 直結する。sunsu matrix で +33% の実測退行が出た)。
+        // 直結する。SNS 型の負荷試験 matrix で +33% の実測退行が出た)。
         if was_empty {
             self.unique_count.fetch_add(1, Ordering::Relaxed);
         }

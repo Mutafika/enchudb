@@ -308,7 +308,7 @@ impl BlobStore for LocalBlobStore {
 // ─── AsyncBlobStore (async-blob feature) ──────────────────────────────
 //
 // 動機:
-//   sinfo / sinfohub-server のような async ランタイム上で動くサーバ実装は、
+//   マルチユーザーのサーバ構成のような async ランタイム上で動くサーバ実装は、
 //   S3 / R2 / HTTP リモートへ blob を流す必要がある。これらは原理的に async
 //   I/O のほうが効率的なので、enchudb 本体の sync `BlobStore` とは別軸の
 //   `AsyncBlobStore` trait を併設する。
@@ -317,7 +317,7 @@ impl BlobStore for LocalBlobStore {
 //   - Engine 本体は sync の `BlobStore` のままにする。Engine の hot path は
 //     ns オーダーであり、async ランタイムのトランポリンを混ぜたくない。
 //   - サーバ側のロジック（push 受信 → S3 アップロード等）が AsyncBlobStore を
-//     直接使う。すなわち「sinfo の保存層 = sync BlobStore (engine 経由)」と
+//     直接使う。すなわち「消費側の保存層 = sync BlobStore (engine 経由)」と
 //     「サーバの転送層 = AsyncBlobStore (S3 等)」は分離する。
 //   - 既存の sync 実装 (LocalBlobStore) は blanket impl で自動的に
 //     AsyncBlobStore を満たす (`spawn_blocking` 経由)。専用実装は不要。

@@ -25,7 +25,7 @@
 //! ので、 **body に無いものを相手に配る**状態が確定する。 だから recovery で
 //! 適用しきる (`OpLog::recover_with_tail`)。
 //!
-//! 実地 (syncretic の chaos soak / SIGKILL 混じり) では、 9 cell を 1 行として書く
+//! 実地 (ファイル同期の消費側アプリの chaos soak / SIGKILL 混じり) では、 9 cell を 1 行として書く
 //! insert が 「著者側の body には 2 cell、 相手には 3 cell」 で固まり、 以後の scan でも
 //! 埋まらない行として残った。 PK cell が欠けた行は PK 引きに掛からないので、 次の scan が
 //! 同じ行をもう一度 insert し、 同一 PK の entity が 2 つになる。

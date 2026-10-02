@@ -2,7 +2,7 @@
 //!
 //! 旧 behavior: `apply_oplog_op` の Tie/Content path で `entities.ensure_live`
 //! も `table.next_local` 推進も呼ばれず → 次 open で entity_in が重複 eid を
-//! 払い出す defect。 sinfo の sf CLI (= open → write → drop, sidecar persist
+//! 払い出す defect。 1 コマンド 1 process の CLI (= open → write → drop, sidecar persist
 //! 機会無し) で表面化。
 //!
 //! 期待:

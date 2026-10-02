@@ -5,7 +5,7 @@
 //! (仮想) だが、 #123 で hash が一様分散になったため rebuild が shadow の全ページに
 //! live slot を書いて全ページを物理化し、 readonly open 1 回ごとに index_cap × 13B
 //! (vocab_max_entries=4M で 52MB、 既定式 max_entities×16 だと数百 MB) の anon RSS を
-//! Engine 寿命の間占有していた。 naruhodo (1GB VPS) の boot +~300MB / storm OOM の正体。
+//! Engine 寿命の間占有していた。 全文検索の消費側アプリ (1GB VPS) の boot +~300MB / storm OOM の正体。
 //!
 //! fix 後: shadow は count 比例の compact 形式 `(fxhash, vid)` sorted。
 //! 本 test は counting allocator で readonly open の heap 増分を実測し、

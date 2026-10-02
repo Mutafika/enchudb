@@ -56,7 +56,7 @@ pub trait ShardRouter: Send + Sync {
 /// FNV-1a ベースの consistent-ish hash router。
 ///
 /// 単純な `hash(himo) % n_peers` で peer を決める。
-/// peer の増減で大半の assignment が変わるが、静的クラスタ (niente 辞書用途)
+/// peer の増減で大半の assignment が変わるが、静的クラスタ (辞書用途)
 /// ではこれで十分。rebalance 必要な動的クラスタは別 router を書く。
 pub struct HashRouter {
     peers: Vec<PeerId>,

@@ -1,6 +1,6 @@
 //! #106 再現 probe — LeafStore の read-while-write torn read。
 //!
-//! opyula の `enchudb_upgrade_probe -- leafrace` を engine repo 内に移植した
+//! 消費側アプリの `enchudb_upgrade_probe -- leafrace` を engine repo 内に移植した
 //! 自己完結版。 writer 1 thread が複数 entity を **size class 混在**の
 //! self-describing body（先頭 16 桁 == 末尾 16 桁の世代 stamp）で上書きし続け、
 //! reader が毎 read で「先頭 16 桁 == 末尾 16 桁」を照合する。
