@@ -11991,12 +11991,12 @@ impl Engine {
         self.himo_id(himo).map(|idx| self.value_types[idx])
     }
 
-    /// 指定紐の現在の unique 値数(非空バケット数)。O(1)。
-    /// 紐が未定義なら None。
+    /// 指定紐の現在の unique 値数。 紐が未定義なら None。
     ///
-    /// BucketCylinder は tie/untie/remove 時に AtomicU32 を増減させる。
-    /// `define_himo` の `max_values` はヒントに過ぎないので、ここで返るのは
-    /// 実データ上の cardinality。
+    /// 索引が値ごとの bucket で持つ値 (値の詰まった列) の分は O(1) — tie/untie/remove 時に数を増減させている。
+    /// 値の順の run で持つ値 (時刻・64 bit の ID のように値の種類が多い列、 Tag のように値が辞書 ID の範囲に
+    /// まばらに散る列、 #373) の分は、 その entry を Column と突き合わせて数える (O(run の entry 数))。
+    /// `define_himo` の `max_values` はヒントに過ぎないので、ここで返るのは実データ上の cardinality。
     pub fn himo_cardinality(&self, himo: &str) -> Option<u32> {
         let idx = self.himo_id(himo)?;
         Some(self.himos[idx].unique_count())
