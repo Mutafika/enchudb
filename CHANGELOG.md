@@ -3,6 +3,68 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.29.0 — 2026-10-04
+
+minor。 公開 API の追加と、 opt-in の **file version 12** (辞書の語の回収)。
+
+**上げる時の注意**:
+
+- 何もしなければ on-disk 形式は 0.28.6 と同じ (回収を有効にした DB だけが v12)
+- 回収を有効にした DB (`GrowableOptions::vocab_reclaim` / `Engine::enable_vocab_reclaim`) は **0.28 以前の binary で
+  開けない** (unsupported version で断る)。 有効にする前に、 その DB を開く全ての process / peer を 0.29 に上げること
+- `FaultKind` に `StaleValue` が増えた (網羅的に match しているコードは腕を足す)
+- `GrowableOptions` に `vocab_reclaim` が増えた (`..Default::default()` を使わない struct literal は欄を足す)
+- `VocabUsage` (新しい型) は欄が増えうる
+
+### Added — 辞書 (Tag の値) の語の回収 (#381、 #383)
+
+Tag の値の辞書は全 table 共通で、 値は行を消しても戻らなかった。 一意な ID を Tag の主キーに持ち、 古い行から消す
+表は、 生きている行が少なくても作った行の数だけ辞書を使い、 上限 (`vocab_max_entries`) に着くと DB の全ての表で
+Tag が書けなくなった (再現: 生きている行 100 で、 上限 16,000 の DB が 16,000 個目で止まる)。
+
+回収を有効にした DB では、 行から参照されなくなった値の場所を使い回す:
+
+- 番号 = 世代 (上位 2 bit) | 場所 (下位 30 bit)。 使い回すたびに世代を進めるので、 古い番号 (アプリが持っていた
+  `vocab_id` の戻り値など) は**該当なし**になる (別の値に当たらない)。 **番号は値が生きている間だけ有効**
+- 空いた場所はいちばん昔に空いたものから使い回す (同じ番号が戻るのは 「空き場所の数 × 4」 回の破棄の後)
+- 有効化: 作る時 `GrowableOptions { vocab_reclaim: true, .. }`、 既存 DB は `Engine::enable_vocab_reclaim()`
+  (**次に開いた時から**効く)
+- 開いた後、 既存の cell は書き込みのたびに少しずつ数え、 数え終えるまで回収しない (開くのは待たせない)。 一気に
+  数えるなら `Engine::build_vocab_refs()`
+- 購読 (live query) は条件の text の番号を押さえるので、 使い回しで別の値に向かない
+- 古い番号での書き込みは oplog に積む前に断る (`FaultKind::StaleValue`)
+- sync: peer ごとの番号の対応は世代込みの番号で持つので、 両方の peer が使い回しても混ざらない
+- `VocabUsage` に `reclaim` / `reclaim_ready` / `reclaimable_entries` / `reclaimed`
+
+回収しない DB の速さは変わらない。 回収する DB は新しい値の `tie_text` が数 ns 増え、 作っては消す負荷では辞書が
+大きくならない分 速くなる (語 20 万個、 0.28.6 と交互に計測):
+
+| | 0.28.6 | 0.29.0 回収なし | 0.29.0 回収あり |
+|---|---:|---:|---:|
+| 新しい値の `tie_text` | 98〜120 ns | 104〜128 ns | 110〜123 ns |
+| `vocab_id` | 18〜23 ns | 17〜24 ns | 17〜24 ns |
+| `get_text` | 6 ns | 6〜7 ns | 6〜7 ns |
+| 削除 + 新しい値の書き込み | 233〜263 ns | 221〜316 ns | 186〜220 ns |
+
+**まだ**: 値の byte (辞書の data) は回収しない。 使い回した値の byte も末尾に足すので、 data は入れた値の総量で
+増える (id 1 つ約 20 B なら既定 512 MiB で約 2,600 万個)。 `vocab_usage()` で残りを見て `grow_vocab` で伸ばす。
+
+### Added — 辞書の上限を開いたまま伸ばす / 使用量を軽く見る (#381、 #382)
+
+- `Engine::vocab_usage()`: 語数・data の使用量と上限、 開いたまま伸ばせる幅を O(1) で返す (今までは列を全部
+  走査する `vocab_orphan_stats` しか無かった)
+- `Engine::grow_vocab(max_entries, data_size)`: `vocab_max_entries` / `vocab_data_size` を開いたまま伸ばし、 header に
+  書く。 辞書の segment は宣言の 4 倍を予約するので (仮想アドレスだけ、 RAM / disk は書いた分)、 開いた時の上限の
+  4 倍まで伸ばせる。 開き直すと伸ばした値の 4 倍まで。 Windows は予約を広げない (segment の file が予約の長さに
+  なるため) ので、 伸ばせるのは 64 KiB の切り上げの端数だけ
+- 予約を広げても、 file は宣言 size を越えて伸ばさない (宣言 size で予約する旧 binary が開けなくならないように)
+
+### Fixed
+
+- 辞書の data の上限に着いた時の報告が `DiskSpace` (空き不足) だったのを `VocabSpace` (辞書が一杯) に (#382)
+- 開き直すと辞書の語数の上限が header の値でなく領域の長さ (64 KiB の切り上げ) で決まり、 作った時と食い違っていた (#382)
+- 並行 insert でも辞書の data が上限を越えない (#382)
+
 ## 0.28.6 — 2026-10-03
 
 patch。 公開 API の変更なし。 **辞書の索引の on-disk 形式が変わる** (下記、 migration は自動)。
