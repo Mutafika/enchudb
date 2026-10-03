@@ -1971,7 +1971,14 @@ impl Default for GrowableOptions {
 /// #381: 辞書の segment は宣言 (`vocab_max_entries` / `vocab_data_size`) のこの倍を予約する。 予約は仮想アドレスだけ
 /// (RAM / disk は食わない) で、 `grow_vocab` は開いたままこの幅まで上限を伸ばせる。 開き直すと伸ばした宣言の倍を
 /// 予約し直すので、 その先も伸ばせる。
+///
+/// Windows は 1 (広げない): Windows の segment は書き手が開くたびに file を予約の長さまで伸ばす (sparse) ので、
+/// 広げると file の見かけが 4 倍になり、 宣言 size で予約する旧 binary が 「file が予約より大きい」 で開けなくなる。
+/// Windows の `grow_vocab` は予約 (64 KiB 単位の切り上げの端数) の範囲でしか伸ばせない。
+#[cfg(not(windows))]
 const VOCAB_RESERVE_FACTOR: u64 = 4;
+#[cfg(windows)]
+const VOCAB_RESERVE_FACTOR: u64 = 1;
 /// `vocab_max_entries` の format の上限 (索引の大きさ `next_power_of_two` が u32 に入る)。
 const VOCAB_MAX_ENTRIES_LIMIT: u32 = 1 << 31;
 /// `vocab_data_size` の format の上限 (data の位置は u32、 8 byte 整列)。

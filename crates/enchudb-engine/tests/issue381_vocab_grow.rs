@@ -3,6 +3,10 @@
 //!
 //! 語は行を消しても戻らないので、 一意な値を Tag 列に入れる表は、 生きている行が少なくても辞書の上限に着く。
 //! 上限は作成時に header に焼かれ、 前は伸ばす口が無かった (DB を作り直すしかなかった)。
+//!
+//! Windows は予約を広げない (`VOCAB_RESERVE_FACTOR` = 1) ので対象外。
+
+#![cfg(not(windows))]
 
 use enchudb_engine::{Engine, FaultKind, GrowableOptions, TieRejected, ValueType, VocabUsage};
 
