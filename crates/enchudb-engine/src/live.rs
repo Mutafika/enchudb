@@ -553,6 +553,17 @@ impl LiveDelta {
 pub(crate) trait CellReader {
     fn cell(&self, himo_id: u16, eid: u32) -> Option<u64>;
     fn vocab_lookup(&self, text: &str) -> Option<u32>;
+    /// #381: `vocab_lookup` して番号を押さえる (購読が覚える番号を、 購読が生きている間は回収させない)。 押さえた番号は
+    /// `vocab_unpin` で返す。 回収しない辞書では `vocab_lookup` と同じ。
+    fn vocab_pin(&self, text: &str) -> Option<u32> {
+        self.vocab_lookup(text)
+    }
+    /// #381: `vocab_pin` で押さえた番号を返す。
+    fn vocab_unpin(&self, _vid: u32) {}
+    /// #381: 番号がまだその語を指しているか (回収されて世代が進んでいないか)。
+    fn vocab_current(&self, _vid: u32) -> bool {
+        true
+    }
     /// `himo_id` の値が `value` である entity (常設逆引き索引)。
     fn pull(&self, himo_id: u16, value: u64) -> Vec<u32>;
     /// `himo_id` に何か値を持つ entity。
@@ -1446,7 +1457,8 @@ enum Pred {
     /// 値が並びのどれか (昇順・重複なし)。 否定の中身にだけ使う (肯定の `In` は値の穴)。
     In(u16, Vec<u64>),
     /// Tag の値が文字列 (vocab に現れたら id を覚える)。 否定の中身にだけ使う。
-    Text(u16, String, std::sync::OnceLock<u32>),
+    /// 覚えた id は `id + 1` (0 = まだ)。 #381: 回収で古くなった id は引き直す。
+    Text(u16, String, std::sync::atomic::AtomicU64),
     /// 中身が偽 (値が無い entity も真)。
     Not(Box<Pred>),
     /// この entity を `via` で指し `preds` を満たす entity がある (`LivePred::Exists`、 `mine` = None)、 または
@@ -1557,10 +1569,14 @@ impl Pred {
             Pred::Present(h) => r.cell(*h, eid).is_some(),
             Pred::In(h, vs) => matches!(r.cell(*h, eid), Some(v) if vs.binary_search(&v).is_ok()),
             Pred::Text(h, t, id) => {
-                let id = match id.get() {
-                    Some(&x) => x,
-                    None => match r.vocab_lookup(t) {
-                        Some(x) => *id.get_or_init(|| x),
+                let cached = id.load(Ordering::Acquire);
+                let id = match cached.checked_sub(1).map(|x| x as u32) {
+                    Some(x) if r.vocab_current(x) => x,
+                    _ => match r.vocab_lookup(t) {
+                        Some(x) => {
+                            id.store(x as u64 + 1, Ordering::Release);
+                            x
+                        }
                         None => return false,
                     },
                 };
@@ -1664,7 +1680,7 @@ fn flatten(p: LivePred, path: &mut Vec<u16>, out: &mut Vec<Flat>) {
                 LivePred::EqText { himo_id, text } => {
                     let mut t = vec![1, himo_id as u64, text.len() as u64];
                     t.extend(text.bytes().map(u64::from));
-                    (t, Pred::Text(himo_id, text, std::sync::OnceLock::new()))
+                    (t, Pred::Text(himo_id, text, std::sync::atomic::AtomicU64::new(0)))
                 }
                 LivePred::Range { himo_id, lo, hi } => (vec![2, himo_id as u64, lo, hi], Pred::Range(himo_id, lo, hi)),
                 LivePred::Present { himo_id } => (vec![3, himo_id as u64], Pred::Present(himo_id)),
@@ -1940,6 +1956,8 @@ struct Member {
     /// 入っている [`LiveGroup`] の id (0 = どこにも入っていない)。 group の poll はこの値が同じ member
     /// だけを取り出し、 他は ready に残す (他の部品が持つ購読の差分を横取りしない)。
     group: u64,
+    /// #381: 鍵の text を解決した時に押さえた辞書の番号 (購読を外す時に返す)。
+    pins: Vec<u32>,
 }
 
 /// 上位 k 件の購読の境界。 鍵の順序 (`RootKey::order`、 (並びの値, eid) の昇順。 降順の購読は
@@ -3200,6 +3218,40 @@ fn resolve(r: &impl CellReader, key: &[HoleVal]) -> Option<Vec<Vec<u64>>> {
     Some(out)
 }
 
+/// `resolve` の、 text の穴の番号を押さえる版 (#381、 購読の鍵)。 押さえた番号は `pins` に足す。 解決できなければ
+/// (text がまだ辞書に無い) この呼び出しで押さえた分を返して None。
+fn resolve_pinned(r: &impl CellReader, key: &[HoleVal], pins: &mut Vec<u32>) -> Option<Vec<Vec<u64>>> {
+    let start = pins.len();
+    let mut ids = Vec::new();
+    for v in key {
+        if let HoleVal::Text(t) = v {
+            match r.vocab_pin(t) {
+                Some(id) => {
+                    pins.push(id);
+                    ids.push(id as u64);
+                }
+                None => {
+                    for &p in &pins[start..] {
+                        r.vocab_unpin(p);
+                    }
+                    pins.truncate(start);
+                    return None;
+                }
+            }
+        }
+    }
+    // 押さえた番号で解決する (押さえる前に引いた番号と違わないように)
+    let mut it = ids.into_iter();
+    let key: Vec<HoleVal> = key
+        .iter()
+        .map(|v| match v {
+            HoleVal::Text(_) => HoleVal::Id(it.next().expect("pinned id per text hole")),
+            other => other.clone(),
+        })
+        .collect();
+    resolve(r, &key)
+}
+
 /// member 1 本の鍵の組の数の上限 (`In` の値の数の掛け算、 `Or` の同じ形の枝の和)。
 pub const MAX_KEYS: usize = 4096;
 
@@ -3398,6 +3450,7 @@ impl Family {
             order_desc,
             union,
             group: 0,
+            pins: Vec::new(),
         };
         let slot = match s.members.iter().position(Option::is_none) {
             Some(i) => {
@@ -3413,10 +3466,13 @@ impl Family {
         slot
     }
 
-    /// 残りの member 数を返す。
-    fn remove_member(&self, slot: usize) -> usize {
+    /// 残りの member 数を返す。 member が押さえていた辞書の番号 (#381) は `unpins` に積む。
+    fn remove_member(&self, slot: usize, unpins: &Mutex<Vec<u32>>) -> usize {
         let mut s = self.settled.lock();
         if let Some(m) = s.members[slot].take() {
+            if !m.pins.is_empty() {
+                unpins.lock().extend_from_slice(&m.pins);
+            }
             for &k in &m.root_keys {
                 if let Some(rk) = s.key(k) {
                     rk.members.retain(|&x| x != slot);
@@ -3667,7 +3723,7 @@ impl Family {
             let alts = std::mem::take(&mut m.alts);
             let (mut ready_tuples, mut pending) = (Vec::new(), Vec::new());
             for alt in alts {
-                match resolve(r, &alt) {
+                match resolve_pinned(r, &alt, &mut m.pins) {
                     Some(ts) => ready_tuples.extend(ts),
                     None => pending.push(alt),
                 }
@@ -4049,6 +4105,8 @@ pub(crate) struct LiveRegistry {
     next_group: AtomicU64,
     /// poll が返す EntityId の peer prefix (`Engine::set_peer_id` が追従させる)。
     peer: AtomicU32,
+    /// #381: 外した購読が押さえていた辞書の番号。 engine が `take_unpins` で取り出して返す。
+    unpins: Mutex<Vec<u32>>,
 }
 
 impl Drop for LiveRegistry {
@@ -4064,6 +4122,12 @@ impl Drop for LiveRegistry {
 }
 
 impl LiveRegistry {
+    /// #381: 外した購読が押さえていた辞書の番号を取り出す (engine が返す)。
+    pub(crate) fn take_unpins(&self) -> Vec<u32> {
+        let mut u = self.unpins.lock();
+        if u.is_empty() { Vec::new() } else { std::mem::take(&mut *u) }
+    }
+
     pub(crate) fn new(peer: u32) -> Self {
         Self {
             active: AtomicUsize::new(0),
@@ -4074,6 +4138,7 @@ impl LiveRegistry {
             next_member_id: std::sync::atomic::AtomicU64::new(0),
             next_group: AtomicU64::new(1),
             peer: AtomicU32::new(peer),
+            unpins: Mutex::new(Vec::new()),
         }
     }
 
@@ -4379,7 +4444,7 @@ impl LiveRegistry {
     fn unregister(&self, family: &Arc<Family>, slot: usize) {
         let dead = {
             let _edit = self.edit.lock();
-            if family.remove_member(slot) > 0 {
+            if family.remove_member(slot, &self.unpins) > 0 {
                 return;
             }
             self.replace_snap(|s| {

@@ -23,8 +23,58 @@
 //! 作り直す。 `VIX3` (全域の表、 0.14 〜 0.28.5) / `VIX2` (slot が hash 下位ビット、 0.14 以前) の DB は、 書き手が
 //! 開いた時に data から作り直して `VIX4` にする。
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use crate::region::Region;
+
+/// #381: 番号 (vid) = 世代 (上位 2 bit) | 場所 (下位 30 bit、 offsets の添字)。 免許証番号の末尾の再交付回数と同じで、
+/// 語を回収して場所を別の語に渡すたびにその場所の世代を 1 つ進める。 古い番号は世代が合わず該当なしになる
+/// (別の語に当たらない)。 世代は offsets の長さの上位 2 bit に置く (世代 0 = 今までの番号そのもの)。
+pub const VID_GEN_SHIFT: u32 = 30;
+/// 番号の場所の部分。
+pub const VID_SLOT_MASK: u32 = (1 << VID_GEN_SHIFT) - 1;
+/// offsets の長さの欄のうち長さの部分 (上位 2 bit は世代)。 1 語の長さの上限。
+const LEN_MASK: u32 = VID_SLOT_MASK;
+/// 場所の数の上限。 世代 3 の最後の場所は `u32::MAX` (空の印) になるので使わない。
+pub const MAX_SLOTS: u32 = VID_SLOT_MASK;
+/// 参照数の欄の印: 回収してこの場所を別の語に渡している最中 (#381)。
+const CLAIMED: u32 = u32::MAX;
+
+/// 番号の場所 (offsets の添字)。
+#[inline]
+pub fn vid_slot(vid: u32) -> u32 {
+    vid & VID_SLOT_MASK
+}
+
+/// 番号の世代。
+#[inline]
+pub fn vid_gen(vid: u32) -> u32 {
+    vid >> VID_GEN_SHIFT
+}
+
+#[inline]
+fn make_vid(generation: u32, slot: u32) -> u32 {
+    (generation & 3) << VID_GEN_SHIFT | slot
+}
+
+/// #381: 語の回収 (`Vocabulary::enable_reclaim` で有効)。 場所ごとの参照数 (Tag の cell + 書き手が押さえている分) と、
+/// 参照数が 0 になった場所の待ち行列 (いちばん昔に空いたものから使い回す)。
+struct Reclaim {
+    /// 場所ごとの参照数。 `CLAIMED` = 回収して別の語に渡している最中。
+    refs: Box<[AtomicU32]>,
+    /// 参照数が 0 になった場所 (先入れ先出し)。 取り出した時に参照数が 0 でなければ (誰かが使い直した) 捨てる。
+    free: std::sync::Mutex<std::collections::VecDeque<u32>>,
+    /// 既存の cell を数え終えたか。 数え終わるまでは回収しない (数えていない参照があるので)。
+    ready: AtomicBool,
+    /// 使い回した回数 (観測用)。
+    claims: AtomicU64,
+}
+
+/// 0 で埋まった `n` 個の参照数 (calloc の 0 ページのまま確保する — 触った分だけ RAM を食う)。
+fn zeroed_counters(n: usize) -> Box<[AtomicU32]> {
+    let v = std::mem::ManuallyDrop::new(vec![0u32; n]);
+    // SAFETY: AtomicU32 は u32 と大きさ・整列が同じで、 0 は正しい値。 `vec![0; n]` は len == capacity
+    unsafe { Vec::from_raw_parts(v.as_ptr() as *mut AtomicU32, v.len(), v.capacity()) }.into_boxed_slice()
+}
 
 const MAGIC: [u8; 4] = [b'V', b'O', b'C', b'1'];
 const HEADER: usize = 16;
@@ -177,6 +227,11 @@ pub struct Vocabulary {
     index_cap: AtomicU32,
     /// readonly open (領域は書けない)。
     readonly: bool,
+    /// #381: 語の回収 (有効な時だけ Some)。
+    reclaim: std::sync::OnceLock<Reclaim>,
+    /// #381: 今の表の中の、 語が入れ替わって死んだ entry の数 (回収で場所を別の語に渡すたびに 1)。 表の埋まりに
+    /// 数え、 増えたら表を作り直して落とす。
+    stale_entries: AtomicU32,
 }
 
 unsafe impl Sync for Vocabulary {}
@@ -218,6 +273,7 @@ impl Vocabulary {
         index.write_at(GEN_OFF, &first.word().to_le_bytes());
 
         let (offsets_cap, data_limit) = Self::region_caps(&offsets, &data);
+        let offsets_cap = offsets_cap.min(MAX_SLOTS);
         Self {
             data, offsets, index,
             shadow_index: None,
@@ -232,6 +288,8 @@ impl Vocabulary {
             data_limit: AtomicU32::new(data_limit),
             index_cap: AtomicU32::new(index_cap),
             readonly: false,
+            reclaim: std::sync::OnceLock::new(),
+            stale_entries: AtomicU32::new(0),
         }
     }
 
@@ -261,6 +319,7 @@ impl Vocabulary {
         };
 
         let (offsets_cap, data_limit) = Self::region_caps(&offsets, &data);
+        let offsets_cap = offsets_cap.min(MAX_SLOTS);
 
         let xm = index.slice();
         let index_cap = u32::from_le_bytes(xm[4..8].try_into().unwrap());
@@ -284,6 +343,8 @@ impl Vocabulary {
             data_limit: AtomicU32::new(data_limit),
             index_cap: AtomicU32::new(index_cap),
             readonly,
+            reclaim: std::sync::OnceLock::new(),
+            stale_entries: AtomicU32::new(0),
         };
         if usable {
             return Ok(v);
@@ -298,9 +359,9 @@ impl Vocabulary {
             // から構築する。 count は破損 header 対策で offsets 領域に clamp する。
             let count = v.count.load(Ordering::Relaxed).min(v.offsets_cap);
             let mut shadow: Vec<(u64, u32)> = Vec::with_capacity(count as usize);
-            for id in 0..count {
-                let value = read_value(&v.offsets, &v.data, id);
-                shadow.push((fxhash(value), id));
+            for slot in 0..count {
+                let (value, generation) = read_slot(&v.offsets, &v.data, slot);
+                shadow.push((fxhash(value), make_vid(generation, slot)));
             }
             // (hash, vid) 昇順 = 同 hash 内は vid 昇順。 lookup の線形走査が
             // 最小 vid から当たるので、 旧 probe の dup 解決 (先着 vid) と一致。
@@ -335,7 +396,10 @@ impl Vocabulary {
         let old = self.gen_on_disk();
         let next = Gen { base: 0, bits, ver: old.ver.wrapping_add(2) & !1 };
         let (offsets, data) = (&self.offsets, &self.data);
-        let ids = (0..count).map(|id| (fxhash(read_value(offsets, data, id)), id));
+        let ids = (0..count).map(|slot| {
+            let (value, generation) = read_slot(offsets, data, slot);
+            (fxhash(value), make_vid(generation, slot))
+        });
         self.write_gen(Some(old), next, ids, true)?;
         self.index.write_at(0, &INDEX_MAGIC);
         self.index.mark_dirty(0, 4);
@@ -413,42 +477,59 @@ impl Vocabulary {
 
     /// 語数が今の表の半分を超えていたら、 表を伸ばす (書き手、 `try_insert` の後で)。 空き不足で伸ばせなければ
     /// 何もしない (今の表で続け、 次の insert でまた試す)。
+    ///
+    /// #381: 回収で場所を別の語に渡すと、 古い語の entry は死んだまま表に残る (`stale_entries`)。 死んだ entry が
+    /// 表の 1/4 を超えたら (`force` なら 1 つでもあれば)、 同じ大きさで作り直して落とす。
     fn maybe_grow(&self) {
-        let index_cap = self.index_cap();
-        let needs = |g: Gen| g.cap() < index_cap && self.count.load(Ordering::Relaxed) as u64 * 2 > g.cap() as u64;
-        if self.legacy_gen.is_some() || self.shadow_index.is_some() || !needs(self.table()) {
+        self.rebuild_table(false);
+    }
+
+    fn rebuild_table(&self, force: bool) {
+        let needs = |g: Gen, index_cap: u32| {
+            let (count, stale) =
+                (self.count.load(Ordering::Relaxed) as u64, self.stale_entries.load(Ordering::Relaxed) as u64);
+            (g.cap() < index_cap && count * 2 > g.cap() as u64) || stale * 4 > g.cap() as u64 || (force && stale > 0)
+        };
+        if self.legacy_gen.is_some() || self.shadow_index.is_some() || !needs(self.table(), self.index_cap()) {
             return;
         }
         let _w = self.grow_lock.write().unwrap_or_else(|p| p.into_inner());
         // 上限が伸びて (#381) 領域が広がったかもしれないので、 lock の中で読み直す
         let index_cap = self.index_cap();
-        let needs = |g: Gen| g.cap() < index_cap && self.count.load(Ordering::Relaxed) as u64 * 2 > g.cap() as u64;
         let g = self.table();
-        if !needs(g) {
+        if !needs(g, index_cap) {
             return;
         }
-        // 今の表の slot を集める (表は書き込みを止めているので確定している)
-        let mut entries = Vec::with_capacity(self.count.load(Ordering::Relaxed) as usize);
+        // 今の表の slot を集める (表は書き込みを止めているので確定している)。 語が入れ替わった entry は落とす
+        let count = self.count.load(Ordering::Relaxed);
+        let mut entries = Vec::with_capacity(count as usize);
         let xm = self.index.slice();
         for i in 0..g.cap() as usize {
             let off = g.slot_off(i);
             if xm[off] == 1 {
                 let h = u64::from_le_bytes(xm[off + 1..off + 9].try_into().unwrap());
                 let vid = u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap());
-                entries.push((h, vid));
+                if self.get_checked(vid).is_some() {
+                    entries.push((h, vid));
+                }
             }
         }
-        let bits = Self::bits_for(self.count.load(Ordering::Relaxed) as usize, index_cap).max(g.bits + 1);
+        // 語数で伸ばす時だけ倍にする (死んだ entry を落とすだけなら同じ大きさ)
+        let grow = (g.cap() < index_cap && count as u64 * 2 > g.cap() as u64) as u8;
+        let bits = Self::bits_for(count as usize, index_cap).max(g.bits + grow);
         let ver = g.ver.wrapping_add(2);
         let after = Gen { base: g.base + g.cap(), bits, ver };
-        let _ = if after.base as u64 + after.cap() as u64 <= index_cap as u64 {
+        let written = if after.base as u64 + after.cap() as u64 <= index_cap as u64 {
             // 今の表の直後に置く: 今の表は書き換えないので、 読み手は止めない
             self.write_gen(None, after, entries, false)
         } else {
-            // 直後に置けない: 領域の先頭から全域の表に組み直す (今の表と重なるので読み手を待たせる)
-            let full = Gen { base: 0, bits: index_cap.trailing_zeros() as u8, ver };
+            // 直後に置けない: 領域の先頭から組み直す (今の表と重なるので読み手を待たせる)
+            let full = Gen { base: 0, bits, ver };
             self.write_gen(Some(g), full, entries, false)
         };
+        if written.is_ok() {
+            self.stale_entries.store(0, Ordering::Relaxed);
+        }
     }
 
     /// 満杯なら **`u32::MAX` (予約 sentinel)** を返す (#59: panic しない)。
@@ -458,6 +539,9 @@ impl Vocabulary {
     }
 
     /// `get_or_insert` の理由付き版 (#316)。
+    ///
+    /// #381: 回収が有効な辞書で、 返した番号を cell に書くなら `try_get_or_insert_pinned` を使う (こちらは押さえない
+    /// ので、 書くまでの間に回収されうる — 書く時に世代で弾かれる)。
     pub fn try_get_or_insert(&self, value: &[u8]) -> Result<u32, VocabFail> {
         if let Some(id) = self.lookup(value) { return Ok(id); }
         let id = self.try_insert(value)?;
@@ -468,9 +552,197 @@ impl Vocabulary {
         Ok(id)
     }
 
+    /// `try_get_or_insert` の押さえる版 (#381): 返した番号の参照を 1 つ持った状態で返す (cell に書くまでの間に
+    /// 回収されない)。 書いた後 (書けても書けなくても) `release` で返すこと。 回収が無効なら `try_get_or_insert` と同じ。
+    pub fn try_get_or_insert_pinned(&self, value: &[u8]) -> Result<u32, VocabFail> {
+        loop {
+            if let Some(id) = self.lookup(value) {
+                if self.acquire(id) {
+                    return Ok(id);
+                }
+                // 引いた後に回収された: 引き直す (次は見つからないか、 別の書き手が入れ直した番号)
+                continue;
+            }
+            let id = self.try_insert_with(value, true)?;
+            // 並列挿入の競合: 先着の番号を使う。 自分の番号は押さえを返す (参照 0 = 回収の候補、 #378 の負け番号)
+            if let Some(winner) = self.lookup(value)
+                && winner != id
+            {
+                self.release(id);
+                if self.acquire(winner) {
+                    return Ok(winner);
+                }
+                continue;
+            }
+            return Ok(id);
+        }
+    }
+
+    // ──── #381: 語の回収 ────
+
+    /// 語の回収を有効にする (書き手、 開いた時に 1 回)。 有効にしただけでは回収しない — 既存の cell を数え
+    /// (`count_ref`)、 数え終えて `finish_refs` を呼んでから回収が始まる。
+    pub fn enable_reclaim(&self) {
+        let slots = self.offsets_cap as usize;
+        let _ = self.reclaim.set(Reclaim {
+            refs: zeroed_counters(slots),
+            free: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            ready: AtomicBool::new(false),
+            claims: AtomicU64::new(0),
+        });
+    }
+
+    /// 回収が有効か。
+    pub fn reclaim_enabled(&self) -> bool {
+        self.reclaim.get().is_some()
+    }
+
+    /// 番号 `vid` の参照を 1 つ取る (cell に書く / 書くまで押さえる)。 世代が合わない (回収された) / 回収している
+    /// 最中なら false (取らない)。 回収が無効なら常に true。
+    pub fn acquire(&self, vid: u32) -> bool {
+        let Some(r) = self.reclaim.get() else { return true };
+        let slot = vid_slot(vid);
+        if slot as usize >= r.refs.len() || slot >= self.count() {
+            return false;
+        }
+        let c = &r.refs[slot as usize];
+        let mut cur = c.load(Ordering::Acquire);
+        loop {
+            if cur == CLAIMED {
+                return false;
+            }
+            match c.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(x) => cur = x,
+            }
+        }
+        // 取った後で世代を見る: 回収は 「参照 0 → CLAIMED → 世代を進める → 参照を戻す」 の順なので、 取る前に回収が
+        // 終わっていれば世代はもう進んでいる
+        if self.slot_gen(slot) != vid_gen(vid) {
+            self.release_slot(r, slot);
+            return false;
+        }
+        true
+    }
+
+    /// 番号 `vid` の参照を 1 つ返す。 0 になったら (既存の cell を数え終えていれば) 回収の待ち行列へ。
+    pub fn release(&self, vid: u32) {
+        if let Some(r) = self.reclaim.get() {
+            let slot = vid_slot(vid);
+            if (slot as usize) < r.refs.len() {
+                self.release_slot(r, slot);
+            }
+        }
+    }
+
+    fn release_slot(&self, r: &Reclaim, slot: u32) {
+        let c = &r.refs[slot as usize];
+        let mut cur = c.load(Ordering::Acquire);
+        loop {
+            // 0 / CLAIMED から返すのは数え違い (取っていない参照を返した)。 0 を割らない
+            if cur == 0 || cur == CLAIMED {
+                debug_assert!(false, "vocab slot {slot}: release without acquire (refs {cur})");
+                return;
+            }
+            match c.compare_exchange_weak(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(x) => cur = x,
+            }
+        }
+        if cur == 1 && r.ready.load(Ordering::Acquire) {
+            r.free.lock().unwrap_or_else(|p| p.into_inner()).push_back(slot);
+        }
+    }
+
+    /// 既存の cell が持つ番号を 1 つ数える (`Engine` が開いた後に列を読んで呼ぶ)。 世代が合わない cell は数えない。
+    pub fn count_ref(&self, vid: u32) -> bool {
+        self.acquire(vid)
+    }
+
+    /// 既存の cell を数え終えた: 参照 0 の場所を待ち行列に入れ (場所の順)、 回収を始める。
+    pub fn finish_refs(&self) {
+        let Some(r) = self.reclaim.get() else { return };
+        // 先に ready を立てる: 以後に 0 になった場所は release が入れる (下の走査と重なっても、 取り出す時に
+        // 参照 0 を CAS で確かめるので二重は害が無い)
+        r.ready.store(true, Ordering::Release);
+        let count = self.count().min(r.refs.len() as u32);
+        let mut q = r.free.lock().unwrap_or_else(|p| p.into_inner());
+        for slot in 0..count {
+            if r.refs[slot as usize].load(Ordering::Acquire) == 0 {
+                q.push_back(slot);
+            }
+        }
+    }
+
+    /// 回収を始めたか (既存の cell を数え終えたか)。
+    pub fn reclaim_ready(&self) -> bool {
+        self.reclaim.get().is_some_and(|r| r.ready.load(Ordering::Acquire))
+    }
+
+    /// (待ち行列の長さ、 使い回した回数)。 観測用。
+    pub fn reclaim_stats(&self) -> (usize, u64) {
+        match self.reclaim.get() {
+            Some(r) => (r.free.lock().unwrap_or_else(|p| p.into_inner()).len(), r.claims.load(Ordering::Relaxed)),
+            None => (0, 0),
+        }
+    }
+
+    /// 番号の場所の参照数 (test / 観測用)。
+    pub fn ref_count(&self, vid: u32) -> Option<u32> {
+        self.reclaim.get().and_then(|r| r.refs.get(vid_slot(vid) as usize)).map(|c| c.load(Ordering::Acquire))
+    }
+
+    /// 待ち行列からいちばん昔に空いた場所を取る (参照 0 → CLAIMED)。 取り出した時に参照が戻っていた場所は捨てる。
+    fn claim(&self) -> Option<u32> {
+        let r = self.reclaim.get()?;
+        if !r.ready.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut q = r.free.lock().unwrap_or_else(|p| p.into_inner());
+        while let Some(slot) = q.pop_front() {
+            if r.refs[slot as usize].compare_exchange(0, CLAIMED, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                return Some(slot);
+            }
+        }
+        None
+    }
+
+    /// 取った場所を使えなかった (data の上限 / 空き不足): 元に戻して待ち行列の先頭へ。
+    fn unclaim(&self, slot: u32) {
+        if let Some(r) = self.reclaim.get() {
+            r.refs[slot as usize].store(0, Ordering::Release);
+            r.free.lock().unwrap_or_else(|p| p.into_inner()).push_front(slot);
+        }
+    }
+
     #[inline]
-    pub fn get(&self, id: u32) -> &[u8] {
-        read_value(&self.offsets, &self.data, id)
+    pub fn get(&self, vid: u32) -> &[u8] {
+        self.get_checked(vid).unwrap_or(&[])
+    }
+
+    /// 番号 `vid` の語。 世代が合わない (語が回収されて場所が別の語に渡った、 #381) / 場所が範囲外なら None。
+    #[inline]
+    pub fn get_checked(&self, vid: u32) -> Option<&[u8]> {
+        let slot = vid_slot(vid);
+        if slot >= self.offsets_cap {
+            return None;
+        }
+        let (value, generation) = read_slot(&self.offsets, &self.data, slot);
+        (generation == vid_gen(vid)).then_some(value)
+    }
+
+    /// 場所 `slot` の今の語 (世代は見ない)。 辞書全体を走査する観測用 (#381)。
+    pub fn get_slot(&self, slot: u32) -> &[u8] {
+        if slot >= self.offsets_cap {
+            return &[];
+        }
+        read_slot(&self.offsets, &self.data, slot).0
+    }
+
+    /// 場所 `slot` の今の世代。
+    #[inline]
+    fn slot_gen(&self, slot: u32) -> u32 {
+        ((self.offsets.as_atomic_u64(slot as usize * 8).load(Ordering::Acquire) >> 32) as u32) >> VID_GEN_SHIFT
     }
 
     #[inline]
@@ -483,7 +755,7 @@ impl Vocabulary {
             let mut i = shadow.partition_point(|&(sh, _)| sh < h);
             while let Some(&(sh, vid)) = shadow.get(i) {
                 if sh != h { break; }
-                if self.get(vid) == value { return Some(vid); }
+                if self.get_checked(vid) == Some(value) { return Some(vid); }
                 i += 1;
             }
             return None;
@@ -520,7 +792,7 @@ impl Vocabulary {
                 let vid = u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap());
                 // #92: 実 insert は必ず vid < max_entries を assert する。 残りうる **vid >= max_entries の
                 // 破損 slot** は get(vid) が offsets region を溢れて OOB するので読み飛ばす。
-                if vid < self.offsets_cap && self.get(vid) == value { return Some(vid); }
+                if self.get_checked(vid) == Some(value) { return Some(vid); }
             }
             idx = ((idx as u64 + 1) & mask) as usize;
         }
@@ -535,6 +807,7 @@ impl Vocabulary {
     /// 今後 1 件も insert できないか (= 天井 hit)。
     pub fn is_full(&self) -> bool {
         self.count.load(Ordering::Relaxed) >= self.max_entries.load(Ordering::Relaxed)
+            && self.reclaim_stats().0 == 0
     }
 
     /// 満杯なら **`u32::MAX` (予約 sentinel)** を返す (#59: panic しない)。
@@ -546,6 +819,19 @@ impl Vocabulary {
     /// `insert` の理由付き版 (#316)。 `Full` は `vocab_max_entries` / 索引の天井 (この先も入らない)、
     /// `Space` はディスクの空き不足で伸ばせない (空けば入る)。
     pub fn try_insert(&self, value: &[u8]) -> Result<u32, VocabFail> {
+        self.try_insert_with(value, false)
+    }
+
+    /// `try_insert` の本体。 `pinned` なら返す番号の参照を 1 つ持った状態で返す (#381)。
+    fn try_insert_with(&self, value: &[u8], pinned: bool) -> Result<u32, VocabFail> {
+        // #381: 1 語の長さは 30 bit まで (offsets の長さの上位 2 bit は世代)
+        if value.len() > LEN_MASK as usize {
+            return Err(VocabFail::Full);
+        }
+        // #381: 回収した場所があれば、 新しい番号より先に使い回す
+        if let Some(slot) = self.claim() {
+            return self.insert_into_claimed(slot, value, pinned);
+        }
         // 索引の home slot のページを先に確保する。 空き不足で断られるのは大抵ここなので、 採番・data の書き込みの
         // 前に止めて orphan を作らない (表はこの後で伸びうるので、 確かめるのは今の表)
         let g = self.table();
@@ -624,17 +910,81 @@ impl Vocabulary {
         }
         self.data.mark_dirty(offset as usize, len as usize);
         let off_pos = (id as usize) * 8;
-        self.offsets.write_at(off_pos, &offset.to_le_bytes());
-        self.offsets.write_at(off_pos + 4, &len.to_le_bytes());
+        self.offsets.as_atomic_u64(off_pos).store(slot_entry(offset, len, 0), Ordering::Release);
         self.offsets.mark_dirty(off_pos, 8);
+        // #381: 索引に載せる (= 他の書き手に見える) 前に押さえる
+        if pinned && let Some(r) = self.reclaim.get() {
+            r.refs[id as usize].store(1, Ordering::Release);
+        }
         // #59: index が満杯で登録できないなら 「vocab 満杯」 と同じ扱いにする
         // (dedup が黙って壊れるより、 write を拒否させる方が安全)。 data/offsets に
         // 書いた分は orphan になる (満杯なら terminal、 空き不足は probe が home のページを
         // 越えた時だけ)。
-        self.index_insert(value, id)?;
+        if let Err(e) = self.index_insert_healing(value, id) {
+            if pinned {
+                self.release(id);
+            }
+            return Err(e);
+        }
         // #374: 語数が表の半分を超えたら伸ばす
         self.maybe_grow();
         Ok(id)
+    }
+
+    /// 回収した場所 `slot` (参照 CLAIMED) に `value` を入れ、 世代を 1 つ進めた番号を返す (#381)。 data は今までと
+    /// 同じく末尾に足す (前の語の byte は残る — 借用で読んでいる読み手の中身は変わらない)。
+    fn insert_into_claimed(&self, slot: u32, value: &[u8], pinned: bool) -> Result<u32, VocabFail> {
+        let len = value.len() as u32;
+        let limit = self.data_limit.load(Ordering::Relaxed) as u64;
+        let Ok(offset) = self.data_end.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+            (end as u64 + len as u64 <= limit).then_some(end + len)
+        }) else {
+            self.unclaim(slot);
+            return Err(VocabFail::Full);
+        };
+        if self.data.ensure_committed((offset + len) as usize).is_err() {
+            self.unclaim(slot);
+            return Err(VocabFail::Space);
+        }
+        self.data.write_at(offset as usize, value);
+        self.data.as_atomic_u32(8).fetch_max(offset + len, Ordering::AcqRel);
+        self.data.mark_dirty(0, 12);
+        if self.clean_on_disk.swap(false, Ordering::AcqRel) {
+            self.data.write_at(CLEAN_FLAG_OFF, &0u32.to_le_bytes());
+            self.data.mark_dirty(CLEAN_FLAG_OFF, 4);
+        }
+        self.data.mark_dirty(offset as usize, len as usize);
+        let generation = (self.slot_gen(slot) + 1) & 3;
+        let off_pos = slot as usize * 8;
+        // 位置・長さ・世代を 1 回で書く (読み手は 1 回で読む)。 data を書いた後 (Release)
+        self.offsets.as_atomic_u64(off_pos).store(slot_entry(offset, len, generation), Ordering::Release);
+        self.offsets.mark_dirty(off_pos, 8);
+        let r = self.reclaim.get().expect("claimed without reclaim");
+        // 世代を進めた後で参照を戻す (`acquire` は取った後に世代を見る)
+        r.refs[slot as usize].store(pinned as u32, Ordering::Release);
+        r.claims.fetch_add(1, Ordering::Relaxed);
+        // 前の語の entry は死んだまま表に残る
+        self.stale_entries.fetch_add(1, Ordering::Relaxed);
+        let vid = make_vid(generation, slot);
+        if let Err(e) = self.index_insert_healing(value, vid) {
+            if pinned {
+                self.release(vid);
+            }
+            return Err(e);
+        }
+        self.maybe_grow();
+        Ok(vid)
+    }
+
+    /// `index_insert`、 表が死んだ entry で埋まって入らなければ作り直してもう 1 回 (#381)。
+    fn index_insert_healing(&self, value: &[u8], vid: u32) -> Result<(), VocabFail> {
+        match self.index_insert(value, vid) {
+            Err(_) if self.stale_entries.load(Ordering::Relaxed) > 0 => {
+                self.rebuild_table(true);
+                self.index_insert(value, vid)
+            }
+            r => r,
+        }
     }
 
     /// テストで 「番号を取った直後に伸ばせなかった」 を起こす (#328)。 thread_local なので他のテストに効かない。
@@ -712,7 +1062,7 @@ impl Vocabulary {
                 // #92: vid >= offsets_cap の破損 slot は get(vid) が OOB するので
                 // 読み飛ばす (実 insert は vid < max_entries <= offsets_cap を保証 = 通常運用では常に
                 // 通過。 offsets_cap は不変で並行 insert を skip しない = dedup race 無)。
-                if vid < self.offsets_cap && self.get(vid) == value {
+                if self.get_checked(vid) == Some(value) {
                     return Ok(()); // 本当の重複
                 }
                 // ハッシュ衝突 or 破損 slot → linear probe 続行
@@ -735,7 +1085,7 @@ impl Vocabulary {
         let index_slots = (self.index.len().saturating_sub(INDEX_HEADER) / INDEX_SLOT_SIZE) as u64;
         // 索引は上限の次の 2 の冪の slot を要る
         let by_index = if index_slots == 0 { 0 } else { 1u64 << (63 - index_slots.leading_zeros()) };
-        (offsets_cap.min(by_index.min(u32::MAX as u64) as u32), data_cap)
+        (offsets_cap.min(by_index.min(u32::MAX as u64) as u32).min(MAX_SLOTS), data_cap)
     }
 
     fn region_caps(offsets: &Region, data: &Region) -> (u32, u32) {
@@ -849,8 +1199,9 @@ mod tests {
     }
 
     fn make_regions(max_entries: u32, index_cap: u32, data_size: usize) -> Regions {
+        // offsets は 8 byte の atomic で読み書きする (#381) ので u64 で確保して整列させる
         let leak = |size: usize| -> *mut u8 {
-            Box::leak(vec![0u8; size].into_boxed_slice()).as_mut_ptr()
+            Box::leak(vec![0u64; size.div_ceil(8)].into_boxed_slice()).as_mut_ptr() as *mut u8
         };
         Regions {
             data_ptr: leak(Vocabulary::data_region_size(data_size)),
@@ -1195,6 +1546,125 @@ mod tests {
         assert_eq!(flag(&r), CLEAN_GEN, "flush 直後は clean (#374 で 2)");
         w.get_or_insert(b"second");
         assert_eq!(flag(&r), 0, "flush 後の insert で clean=0 に戻るはず (#77-M1)");
+    }
+
+    /// 回収を有効にして既存の語を数え終えた辞書 (#381)。
+    fn reclaiming(max: u32) -> (Regions, Vocabulary) {
+        let r = make_regions(max, max, 1 << 20);
+        let v = r.vocab_init(max, max);
+        v.enable_reclaim();
+        (r, v)
+    }
+
+    /// #381: 参照が 0 になった語の場所を使い回し、 世代を進める。 古い番号は該当なしになる (別の語に当たらない)。
+    #[test]
+    fn released_slot_is_reused_with_the_next_generation() {
+        let (_r, v) = reclaiming(64);
+        let a = v.try_get_or_insert_pinned(b"alpha").unwrap();
+        v.finish_refs();
+        assert_eq!(v.reclaim_stats().0, 0, "押さえている語は待ち行列に入らない");
+        v.release(a);
+        assert_eq!(v.reclaim_stats().0, 1);
+        let b = v.try_get_or_insert_pinned(b"beta").unwrap();
+        assert_eq!(vid_slot(b), vid_slot(a), "空いた場所を使い回す");
+        assert_eq!(vid_gen(b), vid_gen(a) + 1, "世代を進める");
+        assert_eq!(v.count(), 1, "新しい番号を取らない");
+        assert_eq!(v.get_checked(a), None, "古い番号は該当なし");
+        assert_eq!(v.get(a), b"", "古い番号は空");
+        assert_eq!(v.get_checked(b), Some(&b"beta"[..]));
+        assert_eq!(v.lookup(b"alpha"), None, "回収した語は引けない");
+        assert_eq!(v.lookup(b"beta"), Some(b));
+        assert!(!v.acquire(a), "古い番号は取れない");
+        assert_eq!(v.ref_count(b), Some(1));
+        // 回収した語を入れ直すと、 新しい番号になる
+        let a2 = v.try_get_or_insert_pinned(b"alpha").unwrap();
+        assert_ne!(a2, a);
+        assert_eq!(v.lookup(b"alpha"), Some(a2));
+    }
+
+    /// #381: いちばん昔に空いた場所から使い回す (同じ場所がすぐ戻ってこない = 世代 2 bit で足りる根拠)。
+    #[test]
+    fn reuse_is_first_in_first_out() {
+        let (_r, v) = reclaiming(64);
+        let ids: Vec<u32> = (0..4).map(|i| v.try_get_or_insert_pinned(format!("w{i}").as_bytes()).unwrap()).collect();
+        v.finish_refs();
+        for &i in [2, 0, 3, 1].iter() {
+            v.release(ids[i]);
+        }
+        let got: Vec<u32> =
+            (0..4).map(|i| vid_slot(v.try_get_or_insert_pinned(format!("n{i}").as_bytes()).unwrap())).collect();
+        assert_eq!(got, vec![vid_slot(ids[2]), vid_slot(ids[0]), vid_slot(ids[3]), vid_slot(ids[1])]);
+    }
+
+    /// #381: 既存の cell を数え終えるまでは回収しない / 待ち行列に入った後に使い直された語は回収しない。
+    #[test]
+    fn no_reuse_before_counting_or_after_revival() {
+        let (_r, v) = reclaiming(64);
+        let a = v.try_get_or_insert_pinned(b"alpha").unwrap();
+        v.release(a);
+        let b = v.try_get_or_insert_pinned(b"beta").unwrap();
+        assert_ne!(vid_slot(b), vid_slot(a), "数え終える前は使い回さない");
+        v.finish_refs();
+        assert_eq!(v.reclaim_stats().0, 1, "参照 0 の alpha が待ち行列に入る");
+        // 待ち行列に居る alpha を使い直す
+        assert_eq!(v.try_get_or_insert_pinned(b"alpha").unwrap(), a);
+        let c = v.try_get_or_insert_pinned(b"gamma").unwrap();
+        assert_ne!(vid_slot(c), vid_slot(a), "使い直された場所は回収しない");
+        assert_eq!(v.get_checked(a), Some(&b"alpha"[..]));
+        assert_eq!(v.reclaim_stats().0, 0);
+    }
+
+    /// #381: 使い回しを繰り返しても、 死んだ entry で表が埋まらない (作り直して落とす)。 引きは常に正しい。
+    #[test]
+    fn churn_does_not_fill_the_index_with_dead_entries() {
+        let (_r, v) = reclaiming(4096);
+        v.finish_refs();
+        let mut live = std::collections::VecDeque::new();
+        for i in 0..50_000u32 {
+            let id = v.try_get_or_insert_pinned(format!("id-{i}").as_bytes()).expect("insert");
+            live.push_back((i, id));
+            if live.len() > 100 {
+                let (_, old) = live.pop_front().unwrap();
+                v.release(old);
+            }
+        }
+        assert!(v.count() <= 200, "使い回しで場所が増えない: {}", v.count());
+        for &(i, id) in &live {
+            assert_eq!(v.lookup(format!("id-{i}").as_bytes()), Some(id), "{i}");
+        }
+        assert_eq!(v.lookup(b"id-0"), None);
+        assert!(v.index_table_slots() <= 4096, "表が伸び続けない: {}", v.index_table_slots());
+    }
+
+    /// #381: 世代は offsets に残るので、 開き直しても古い番号は該当なし。 索引も世代込みで作り直す。
+    #[test]
+    fn generation_survives_reload() {
+        let (r, v) = reclaiming(64);
+        let a = v.try_get_or_insert_pinned(b"alpha").unwrap();
+        v.finish_refs();
+        v.release(a);
+        let b = v.try_get_or_insert_pinned(b"beta").unwrap();
+        drop(v);
+        for readonly in [false, true] {
+            let w = r.vocab_load(readonly);
+            assert_eq!(w.get_checked(a), None, "readonly {readonly}");
+            assert_eq!(w.get_checked(b), Some(&b"beta"[..]));
+            assert_eq!(w.lookup(b"beta"), Some(b), "readonly {readonly}");
+            assert_eq!(w.lookup(b"alpha"), None, "readonly {readonly}");
+        }
+    }
+
+    /// #381: 回収が無効なら今までどおり (押さえる・返すは何もしない、 使い回さない)。
+    #[test]
+    fn without_reclaim_nothing_changes() {
+        let r = make_regions(64, 64, 1 << 20);
+        let v = r.vocab_init(64, 64);
+        let a = v.try_get_or_insert_pinned(b"alpha").unwrap();
+        v.release(a);
+        v.finish_refs();
+        let b = v.try_get_or_insert_pinned(b"beta").unwrap();
+        assert_eq!((a, b), (0, 1));
+        assert_eq!(v.ref_count(a), None);
     }
 
     /// #381: data の上限は並行 insert が同時に先取りを抜けても越えない (越える側は番号を捨てて `Full`)。
@@ -1711,13 +2181,21 @@ mod tests {
 /// で共有する (後者は index を `&mut` 借用中に呼ぶため `&self` メソッドではなく
 /// region を直接受ける free fn にして分割借用を可能にする)。
 #[inline]
-fn read_value<'a>(offsets: &'a Region, data: &'a Region, id: u32) -> &'a [u8] {
-    let om = offsets.slice();
-    let off_pos = (id as usize) * 8;
-    let offset = u32::from_le_bytes(om[off_pos..off_pos + 4].try_into().unwrap()) as usize;
-    let len = u32::from_le_bytes(om[off_pos + 4..off_pos + 8].try_into().unwrap()) as usize;
+/// 場所 `slot` の語と世代。 offsets の 8 byte (位置 u32 | 長さ u32 の上位 2 bit = 世代) を 1 回で読む (回収で
+/// 場所を別の語に渡す書き手と、 位置と長さが食い違わないように、 #381)。
+fn read_slot<'a>(offsets: &'a Region, data: &'a Region, slot: u32) -> (&'a [u8], u32) {
+    let e = offsets.as_atomic_u64(slot as usize * 8).load(Ordering::Acquire);
+    let offset = e as u32 as usize;
+    let len_gen = (e >> 32) as u32;
+    let len = (len_gen & LEN_MASK) as usize;
     let dm = data.slice();
-    &dm[offset..offset + len]
+    (&dm[offset..offset + len], len_gen >> VID_GEN_SHIFT)
+}
+
+/// offsets の 8 byte の値 (位置、 長さ、 世代)。
+#[inline]
+fn slot_entry(offset: u32, len: u32, generation: u32) -> u64 {
+    offset as u64 | ((len | (generation & 3) << VID_GEN_SHIFT) as u64) << 32
 }
 
 #[inline(always)]

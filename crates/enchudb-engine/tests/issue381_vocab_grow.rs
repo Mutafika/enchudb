@@ -8,7 +8,7 @@
 
 #![cfg(not(windows))]
 
-use enchudb_engine::{Engine, FaultKind, GrowableOptions, TieRejected, ValueType, VocabUsage};
+use enchudb_engine::{Engine, FaultKind, GrowableOptions, TieRejected, ValueType};
 
 fn tmp(tag: &str) -> String {
     let p = format!(

@@ -142,10 +142,12 @@ pub enum FaultKind {
     ValueOutOfRange,
     /// #167: filesystem の空き容量不足で DB を伸ばせない
     DiskSpace,
+    /// #381: Tag の値の番号が古い (語が回収されて番号の場所が別の語に渡った)。 古い番号で書こうとした
+    StaleValue,
 }
 
 impl FaultKind {
-    pub(crate) const COUNT: usize = 5;
+    pub(crate) const COUNT: usize = 6;
     pub(crate) fn index(self) -> usize {
         match self {
             FaultKind::EntitySpace => 0,
@@ -153,6 +155,7 @@ impl FaultKind {
             FaultKind::VocabSpace => 2,
             FaultKind::ValueOutOfRange => 3,
             FaultKind::DiskSpace => 4,
+            FaultKind::StaleValue => 5,
         }
     }
     pub fn as_str(self) -> &'static str {
@@ -162,6 +165,7 @@ impl FaultKind {
             FaultKind::VocabSpace => "vocabulary full",
             FaultKind::ValueOutOfRange => "value out of range",
             FaultKind::DiskSpace => "filesystem is (nearly) full",
+            FaultKind::StaleValue => "stale value id (reclaimed)",
         }
     }
 }
@@ -222,8 +226,10 @@ impl RemoteApply {
 
 /// 辞書 (Tag の値の共有辞書) の使用量と上限 (#381)。 `Engine::vocab_usage` が O(1) で返す。
 ///
-/// 語は行を消しても戻らない (回収は無い) ので、 `entries` はこれまでに入れた値の種類の総数。 上限に着くと DB の
-/// **全ての表**で新しい Tag の値が書けなくなる (`FaultKind::VocabSpace`)。 残りを見て `Engine::grow_vocab` で伸ばす。
+/// 語を回収しない DB では、 語は行を消しても戻らないので、 `entries` はこれまでに入れた値の種類の総数。 上限に着くと
+/// DB の**全ての表**で新しい Tag の値が書けなくなる (`FaultKind::VocabSpace`)。 残りを見て `Engine::grow_vocab` で
+/// 伸ばすか、 語を回収する (`Engine::enable_vocab_reclaim`、 #381)。 回収する DB では `entries` は使った場所の数で、
+/// 空いた場所は `reclaimable_entries`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VocabUsage {
     /// 辞書の語数 (行から参照されなくなった語も含む)。
@@ -239,6 +245,15 @@ pub struct VocabUsage {
     pub reserved_entries: u32,
     /// 開いたまま `grow_vocab` で伸ばせる data の byte 数の上限 (予約)。
     pub reserved_data_bytes: u64,
+    /// 語を回収する DB として開いたか (`enable_vocab_reclaim` / `GrowableOptions::vocab_reclaim`)。
+    pub reclaim: bool,
+    /// 既存の cell を数え終えて回収が始まったか (`Engine::build_vocab_refs`)。
+    pub reclaim_ready: bool,
+    /// 行から参照されなくなり、 使い回しを待っている語の数 (多めに数えることがある — 使い回す前に参照 0 を確かめる)。
+    /// `max_entries - entries + reclaimable_entries` が新しく入れられる値の数の目安。
+    pub reclaimable_entries: u32,
+    /// この session で番号を使い回した回数。
+    pub reclaimed: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1837,6 +1852,10 @@ const FILE_VERSION: u32 = 10;
 /// (使っていない DB は v10 のまま = 旧 binary でも開ける)。 旧 binary は v11 を unsupported version で
 /// 断る (型 byte 4 を u32 の Number と誤読させない)。 oplog の TIE64 / wire の Tie64 も v11 同士でだけ通じる。
 const FILE_VERSION_WIDE: u32 = 11;
+/// v12 (#381): 辞書の語を回収する DB (`H_VOCAB_RECLAIM`)。 Tag の値の番号の上位 2 bit が世代で、 offsets の長さの
+/// 上位 2 bit に世代を置く。 旧 binary は世代の載った長さを巨大な長さと読んで範囲外を引くので開かせない。 v11 (64 bit 列)
+/// の上位 (64 bit 列も持てる)。 回収を有効にした時に刻む。
+const FILE_VERSION_RECLAIM: u32 = 12;
 /// v9 = 1 ファイル固定 layout の最終版 (0.19〜0.25)。 v10 の packed 形式 (`from_bytes`) は
 /// byte 互換なので、 Memory backing に限り v9 の blob も受け入れる。
 const FILE_VERSION_LEGACY_V9: u32 = 9;
@@ -1950,6 +1969,10 @@ pub struct GrowableOptions {
     /// (macOS / Linux / Android: max(max_entities, 2^28)、 Windows と iOS / tvOS / watchOS /
     /// visionOS: max_entities = 伸ばせない、 #320)。 schema からは `Database::create_growable_with`。
     pub reserve_entities: Option<u32>,
+    /// #381: 辞書 (Tag の値) の語を回収する。 行から参照されなくなった値の番号を、 いちばん昔に空いたものから使い
+    /// 回す (番号の世代を進めるので、 古い番号は該当なしになる)。 file version は 12 になる (旧 binary は開けない)。
+    /// 既存 DB は `Engine::enable_vocab_reclaim`。
+    pub vocab_reclaim: bool,
 }
 
 impl Default for GrowableOptions {
@@ -1964,6 +1987,7 @@ impl Default for GrowableOptions {
             leaf_scale: LeafScale::Gb16,
             vocab_max_entries: None,
             reserve_entities: None,
+            vocab_reclaim: false,
         }
     }
 }
@@ -2025,6 +2049,9 @@ const H_CELL_VERSION: usize = 88; // u32
 /// 予約長と EntitySet の bitset 容量がこれで決まる。 0 (v10 初期 / legacy) は `max_entities`。
 /// header CRC の範囲外 (grow で書き換えるのは `H_MAX_ENTITIES` だけ)。
 const H_RESERVE_ENTITIES: usize = 92; // u32
+/// #381: 辞書の語を回収するか (u32、 0 = しない)。 立っていれば file version は `FILE_VERSION_RECLAIM`。
+/// header CRC の範囲外 (`Engine::enable_vocab_reclaim` が後から立てる)。
+const H_VOCAB_RECLAIM: usize = 96; // u32
 
 /// v10 Phase 3: create 時の reservation 既定。 unix は仮想空間だけなので大きく取る (2^28 entity
 /// = Column 4 B で 1 GB / 版数 16 B で 4 GB の仮想)。 Windows は sparse file を reservation
@@ -2952,6 +2979,13 @@ pub struct Engine {
     max_himos: u32,
     vocab: Vocabulary,
     himo_reg: Vocabulary,
+    /// #381: 辞書の語の回収で、 既存の cell を数え済みの local の上限 (`local < cursor` は数え済み)。
+    /// 数える処理 (`advance_vocab_refs`) と cell の書き手は、 同じ行の lock の下でこれを読み書きする。
+    vocab_refs_cursor: std::sync::atomic::AtomicU32,
+    /// #381: 数え始めた時の払い出し位置。 これ以上の local は最初から書き手が数える (数え始めた時に cell が無い)。
+    vocab_refs_end: u32,
+    /// #381: 数える処理を 1 本にする。
+    vocab_refs_lock: std::sync::Mutex<()>,
     // 0.9.0 himo dynamic definition: himo の並列配列は AppendVec (固定 capacity
     // + append-only + lock-free read) 化して `&self` から定義追加できるように
     // した (design a: pre-sized slots + atomic len publish)。 reader の hot path
@@ -3487,6 +3521,8 @@ impl Engine {
             layout.himoreg_max_entries, layout.himoreg_index_cap,
         );
         backing.apply_vocab_limits(&layout, &vocab, &himo_reg);
+        // #381: 作った時は回収しない (GrowableOptions::vocab_reclaim は作った後で有効にする)
+        let vocab_refs_end = 0u32;
         let contents = ContentStore::init(
             backing.region(SegmentKind::ContentIndex, &layout),
             backing.region(SegmentKind::ContentData, &layout),
@@ -3509,6 +3545,9 @@ impl Engine {
             path: path.to_string(), layout: std::sync::RwLock::new(layout), entity_cap: std::sync::atomic::AtomicU32::new(max_entities),
             table_grow_lock: std::sync::Mutex::new(()), max_himos,
             vocab, himo_reg,
+            vocab_refs_cursor: std::sync::atomic::AtomicU32::new(0),
+            vocab_refs_end,
+            vocab_refs_lock: std::sync::Mutex::new(()),
             himo_names: AppendVec::with_capacity(max_himos as usize),
             value_types: AppendVec::with_capacity(max_himos as usize),
             himo_max_values: AppendVec::with_capacity(max_himos as usize),
@@ -3700,13 +3739,20 @@ impl Engine {
                 ),
             ));
         }
-        Self::create_growable_full(
+        let eng = Self::create_growable_full(
             path,
             layout,
             opts.max_entities,
             opts.max_himos,
             opts.leaf_scale.off_shift(),
-        )
+        )?;
+        if opts.vocab_reclaim {
+            eng.enable_vocab_reclaim()?;
+            // 作ったばかり (cell も押さえている番号も無い) なので、 開き直さずにこのまま回収を始めてよい
+            eng.vocab.enable_reclaim();
+            eng.vocab.finish_refs();
+        }
+        Ok(eng)
     }
 
     /// Tiny growable preset for app state-logs (e.g. a desktop app's notification state: a few
@@ -4131,7 +4177,7 @@ impl Engine {
         let version = u32::from_le_bytes(buf[H_VERSION..H_VERSION + 4].try_into().unwrap());
         let legacy_packed = allow_legacy_packed
             && (FILE_VERSION_LEGACY_V8..=FILE_VERSION_LEGACY_V9).contains(&version);
-        if version != FILE_VERSION && version != FILE_VERSION_WIDE && !legacy_packed {
+        if version != FILE_VERSION && version != FILE_VERSION_WIDE && version != FILE_VERSION_RECLAIM && !legacy_packed {
             return Err(format!(
                 "unsupported EnchuDB file version {} (this build reads v{}; v8 / v9 single-file \
                  databases must be migrated with Engine::migrate_v9_to_v10, older ones are not supported)",
@@ -4482,6 +4528,22 @@ impl Engine {
         )
         .map_err(|e| e.to_string())?;
         backing.apply_vocab_limits(&layout, &vocab, &himo_reg);
+        // #381: 回収する DB の書き手は、 開いた時から番号の参照を数える。 既存の cell は後で数える
+        // (`advance_vocab_refs`)。 数え始めた時の払い出し位置より後ろの local には cell が無い
+        let vocab_reclaim = !readonly && {
+            let h = backing.header_mut(layout.header_size);
+            u32::from_le_bytes(h[H_VOCAB_RECLAIM..H_VOCAB_RECLAIM + 4].try_into().unwrap()) != 0
+        };
+        let vocab_refs_end = if vocab_reclaim {
+            vocab.enable_reclaim();
+            let end = entities.next_eid();
+            if end == 0 {
+                vocab.finish_refs();
+            }
+            end
+        } else {
+            0
+        };
         report("himo_reg(Vocabulary)", &mut t, &mut p);
         let contents = ContentStore::load(
             backing.region(SegmentKind::ContentIndex, &layout),
@@ -4557,6 +4619,9 @@ impl Engine {
             path: String::new(), layout: std::sync::RwLock::new(layout), entity_cap: std::sync::atomic::AtomicU32::new(max_entities),
             table_grow_lock: std::sync::Mutex::new(()), max_himos,
             vocab, himo_reg,
+            vocab_refs_cursor: std::sync::atomic::AtomicU32::new(0),
+            vocab_refs_end,
+            vocab_refs_lock: std::sync::Mutex::new(()),
             himo_names, value_types, himo_max_values,
             himos, ver_cols, tomb_col, entities, contents,
             leaf,
@@ -8356,13 +8421,122 @@ impl Engine {
     /// Column 書き込みの唯一の入口 (live query 通知込み)。 **engine 内で `himos[..].set`
     /// を直に呼ばないこと** — 呼ぶと live query がその書き込みを取りこぼす。
     /// 通知は `HimoStore::set` が write_lock を離した **後** (`crate::live` の lock 順序)。
+    ///
+    /// #381: 回収する辞書の Tag の列なら、 新しい値の参照を取って古い値の参照を返す (数え済みの local だけ、
+    /// `vocab_counted`)。 新しい値の番号が古い (回収された) なら書かずに `StaleValue` を計上して false。
     #[inline]
     fn live_set(&self, hid: usize, local: u32, value: impl Into<u64>) -> bool {
-        let ok = self.himos[hid].set(local, value.into());
+        let value = value.into();
+        let tracked = self.vocab_tracks(hid) && self.vocab_counted(local);
+        let old = if tracked { self.himos[hid].get_value32(local) } else { None };
+        let changed = tracked && old != Some(value as u32);
+        if changed && !self.vocab.acquire(value as u32) {
+            self.record_fault(FaultKind::StaleValue, "Tag の値の番号が古い (語が回収された) — write rejected");
+            return false;
+        }
+        let ok = self.himos[hid].set(local, value);
         if ok {
             self.live.touch(hid as u16, local);
         }
+        if changed {
+            match (ok, old) {
+                (true, Some(o)) => self.vocab.release(o),
+                (false, _) => self.vocab.release(value as u32),
+                _ => {}
+            }
+        }
         ok
+    }
+
+    /// #381: この紐の値が辞書の回収で数える番号か (回収する辞書の値を持つ列 = Tag と、 LeafStore に回していない Leaf
+    /// — engine 内部の table (`_sync_ops` の payload など) の Leaf は辞書に入る)。
+    #[inline]
+    fn vocab_tracks(&self, hid: usize) -> bool {
+        self.vocab.reclaim_enabled() && self.uses_vocab(hid)
+    }
+
+    /// 紐の値が辞書の番号か (Tag / LeafStore に回していない Leaf)。
+    fn uses_vocab(&self, hid: usize) -> bool {
+        match self.value_types[hid] {
+            ValueType::Tag => true,
+            ValueType::Leaf => self.leaf_for(hid).is_none(),
+            _ => false,
+        }
+    }
+
+    /// #381: local の cell を既に数えたか (= 書き手が参照の増減をするか)。 行の lock の下で呼ぶ
+    /// (`advance_vocab_refs` も同じ lock の下で `vocab_refs_cursor` を進める)。
+    #[inline]
+    fn vocab_counted(&self, local: u32) -> bool {
+        local >= self.vocab_refs_end
+            || local < self.vocab_refs_cursor.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// #381: 既存の cell の番号を数える (回収する辞書で開いた後)。 `budget` 行まで進めて、 数え終えたら回収を始める。
+    /// 戻り値は数え終えたか。 他の thread が数えている最中なら何もしない。
+    fn advance_vocab_refs(&self, budget: u32) -> bool {
+        use std::sync::atomic::Ordering;
+        if !self.vocab.reclaim_enabled() || self.vocab.reclaim_ready() {
+            return true;
+        }
+        let Ok(_g) = self.vocab_refs_lock.try_lock() else { return false };
+        let end = self.vocab_refs_end;
+        let mut local = self.vocab_refs_cursor.load(Ordering::Acquire);
+        let stop = local.saturating_add(budget).min(end);
+        let tags: Vec<usize> = (0..self.value_types.len()).filter(|&h| self.uses_vocab(h)).collect();
+        while local < stop {
+            // 行の lock の下で数えて位置を進める: 同じ行の書き手は 「数える前 (書き手は数えない)」 か
+            // 「数えた後 (書き手が数える)」 のどちらかだけを見る
+            let _row = self.row_locks.write(local);
+            for &h in &tags {
+                if let Some(v) = self.himos[h].get_value32(local) {
+                    self.vocab.count_ref(v);
+                }
+            }
+            local += 1;
+            self.vocab_refs_cursor.store(local, Ordering::Release);
+        }
+        if local >= end {
+            self.vocab.finish_refs();
+            return true;
+        }
+        false
+    }
+
+    /// #381: 既存の cell を全部数えて、 辞書の語の回収を始める。 回収する DB (`enable_vocab_reclaim`) を開いた後、
+    /// 数え終えるまでは回収しない (語が増えるだけで壊れない)。 数える処理は新しい語を入れる書き込みのたびに少しずつ
+    /// 進むので、 呼ばなくても書いていればいずれ終わる。 早く回収を始めたい時に呼ぶ (書き手と並行に呼んでよい)。
+    pub fn build_vocab_refs(&self) {
+        while !self.advance_vocab_refs(1 << 16) {
+            if !self.vocab.reclaim_enabled() {
+                return;
+            }
+            // 他の thread が数えている: 終わるのを待つ
+            let _g = self.vocab_refs_lock.lock().unwrap_or_else(|p| p.into_inner());
+        }
+    }
+
+    /// #381: 新しい語を入れる書き込みの前に、 既存の cell を少し数え (数え終えたら何もしない)、 外した購読が押さえて
+    /// いた番号を返す。
+    #[inline]
+    fn step_vocab_refs(&self) {
+        if !self.vocab.reclaim_enabled() {
+            return;
+        }
+        if !self.vocab.reclaim_ready() {
+            self.advance_vocab_refs(1 << 12);
+        }
+        for vid in self.live.take_unpins() {
+            self.vocab.release(vid);
+        }
+    }
+
+    /// #381: 書き手が押さえた番号を返す (Tag の列への書き込みの後、 書けても書けなくても)。
+    #[inline]
+    fn vocab_unpin(&self, hid: usize, vid: u32) {
+        if self.value_types[hid] == ValueType::Tag {
+            self.vocab.release(vid);
+        }
     }
 
     /// entity slot の解放 (live query 通知込み)。 `entities.free` を直に呼ばないこと —
@@ -8387,8 +8561,16 @@ impl Engine {
     /// `live_set` の外す版。 `himos[..].remove` を直に呼ばないこと (同上)。
     #[inline]
     fn live_remove(&self, hid: usize, local: u32) {
+        let old = if self.vocab_tracks(hid) && self.vocab_counted(local) {
+            self.himos[hid].get_value32(local)
+        } else {
+            None
+        };
         self.himos[hid].remove(local);
         self.live.touch(hid as u16, local);
+        if let Some(o) = old {
+            self.vocab.release(o);
+        }
     }
 
     /// `set_cell` の local eid 版 (engine 内の write 経路用。 `check_writable` と
@@ -9623,7 +9805,11 @@ impl Engine {
         }
         // Tag は dedupe (get_or_insert)、Leaf は新規 id 発行 (insert)。
         let vid = match self.value_types[hid] {
-            ValueType::Tag => self.vocab.try_get_or_insert(value.as_bytes()),
+            ValueType::Tag => {
+                // #381: 書くまでの間に回収されないよう押さえる (書いた後で `vocab_unpin`)
+                self.step_vocab_refs();
+                self.vocab.try_get_or_insert_pinned(value.as_bytes())
+            }
             ValueType::Leaf => self.vocab.try_insert(value.as_bytes()),
             ht => panic!(
                 "tie_text on non-text himo '{}': {:?}",
@@ -9639,6 +9825,7 @@ impl Engine {
             }
         };
         self.live_set(hid, eid, vid);
+        self.vocab_unpin(hid, vid);
     }
 
     pub fn tie(&mut self, eid: enchudb_oplog::EntityId, himo: &str, value: impl CellValue) {
@@ -9799,7 +9986,11 @@ impl Engine {
         }
         // Tag は dedupe、Leaf は常に新規 id。
         let vid = match self.value_types[hid] {
-            ValueType::Tag => self.vocab.try_get_or_insert(value.as_bytes()),
+            ValueType::Tag => {
+                // #381: 書くまでの間に回収されないよう押さえる (書いた後で `vocab_unpin`)
+                self.step_vocab_refs();
+                self.vocab.try_get_or_insert_pinned(value.as_bytes())
+            }
             ValueType::Leaf => self.vocab.try_insert(value.as_bytes()),
             ht => panic!("tie_text_to_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
@@ -9831,7 +10022,9 @@ impl Engine {
                 enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid as u64 },
             )
         };
-        if !self.set_cell_local(eid, himo_id, vid, hlc) {
+        let written = self.set_cell_local(eid, himo_id, vid, hlc);
+        self.vocab_unpin(hid, vid);
+        if !written {
             self.warn_local_write_rejected(eid, himo_id, hlc);
             return Err(TieRejected::OlderThanCell);
         }
@@ -9954,7 +10147,11 @@ impl Engine {
             return;
         }
         let vid = match self.value_types[hid] {
-            ValueType::Tag => self.vocab.try_get_or_insert(value),
+            ValueType::Tag => {
+                // #381: 書くまでの間に回収されないよう押さえる (書いた後 / 適用した後で `vocab_unpin`)
+                self.step_vocab_refs();
+                self.vocab.try_get_or_insert_pinned(value)
+            }
             ValueType::Leaf => self.vocab.try_insert(value),
             ht => panic!("tie_bytes_to_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
@@ -9995,6 +10192,7 @@ impl Engine {
         if !self.set_cell_local(eid, himo_id, vid, hlc) {
             self.warn_local_write_rejected(eid, himo_id, hlc);
         }
+        self.vocab_unpin(hid, vid);
     }
 
     /// 定義済みの紐にu32値を張る。&selfで呼べる。
@@ -10023,6 +10221,12 @@ impl Engine {
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         self.ensure_cell_room(hid, eid)?;
+        // #381: 回収された値の古い番号は oplog に積む前に断る (積むと peer に配られる)。 書き終えるまで押さえる
+        let pinned = self.vocab_tracks(hid);
+        if pinned && !self.vocab.acquire(value as u32) {
+            self.record_fault(FaultKind::StaleValue, "Tag の値の番号が古い (語が回収された) — write rejected");
+            return Err(TieRejected::Fault(FaultKind::StaleValue));
+        }
         // Tag / Leaf 型 (vocab_id を value として持つ) も許可。 schema 層が
         // 起動時に解決済みの table_vid を marker himo に張る hot path 用途で
         // 必要 (request2.md 提案)。 caller 責任で vocab に既に居る id を渡すこと。
@@ -10037,7 +10241,11 @@ impl Engine {
             let oplog_eid = self.oplog_eid(eid);
             self.append_local_op(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value })
         };
-        if !self.set_cell_local(eid, himo_id, value, hlc) {
+        let written = self.set_cell_local(eid, himo_id, value, hlc);
+        if pinned {
+            self.vocab.release(value as u32);
+        }
+        if !written {
             self.warn_local_write_rejected(eid, himo_id, hlc);
             return Err(TieRejected::OlderThanCell);
         }
@@ -11977,6 +12185,8 @@ impl Engine {
     /// 既存の `intern_table_name` 系で entity → tie_text → delete の dummy roundtrip
     /// をしていた path を、 vocab 直接 inject に置換するための公開 API。
     /// entity / table 経路を一切触らないので、 anonymous closed 後でも安全に呼べる。
+    ///
+    /// #381: 語を回収する DB では、 どの cell からも参照されない語は回収されうる (返した番号はその後 該当なしになる)。
     pub fn vocab_intern_text(&self, text: &str) -> u32 {
         self.vocab.get_or_insert(text.as_bytes())
     }
@@ -11992,7 +12202,7 @@ impl Engine {
         for vid in vals {
             // Tag の列は u32 (vid)。 64 bit 列の値は vid ではない
             let Ok(vid) = u32::try_from(vid) else { continue };
-            if self.vocab.get(vid) == text_bytes {
+            if self.vocab.get_checked(vid) == Some(text_bytes) {
                 return Some(vid);
             }
         }
@@ -12739,7 +12949,9 @@ impl Engine {
         buf[H_HIMO_COUNT..H_HIMO_COUNT + 4].copy_from_slice(&himo_count.to_le_bytes());
         if wide {
             // v11: 64 bit 列を持つ DB は旧 binary に開かせない (型 byte 4 を u32 の Number と誤読する)
-            buf[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION_WIDE.to_le_bytes());
+            // v12 (#381) は v11 の上位なので下げない
+            let cur = u32::from_le_bytes(buf[H_VERSION..H_VERSION + 4].try_into().unwrap());
+            buf[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION_WIDE.max(cur).to_le_bytes());
         }
         // header CRC を再計算(himo_count が変わったため)
         write_header_crc(buf);
@@ -13900,6 +14112,7 @@ impl Engine {
     /// 辞書の語数・data の使用量と上限 (#381)。 O(1) (`vocab_orphan_stats` と違って列を走査しない)。
     pub fn vocab_usage(&self) -> VocabUsage {
         let (reserved_entries, reserved_data) = self.vocab.region_limits();
+        let (reclaimable_entries, reclaimed) = self.vocab.reclaim_stats();
         VocabUsage {
             entries: self.vocab.count(),
             max_entries: self.vocab.max_entries(),
@@ -13907,7 +14120,36 @@ impl Engine {
             max_data_bytes: self.vocab.data_limit() as u64,
             reserved_entries,
             reserved_data_bytes: reserved_data as u64,
+            reclaim: self.vocab.reclaim_enabled(),
+            reclaim_ready: self.vocab.reclaim_ready(),
+            reclaimable_entries: reclaimable_entries as u32,
+            reclaimed,
         }
+    }
+
+    /// #381: この DB の辞書の語を回収するようにする (header に印を立て、 file version を 12 にする = 旧 binary は
+    /// 開けない)。 **次に開いた時から**効く (開いている間に始めると、 書き込みの queue に積まれた番号を数え漏らす)。
+    /// 開いた後、 既存の cell を数え終えてから回収が始まる (`build_vocab_refs`、 書いていれば少しずつ進む)。
+    ///
+    /// 回収すると、 行から参照されなくなった値の番号を別の値に使い回す。 番号は世代を含むので、 古い番号
+    /// (`vocab_id` の戻り値をアプリが持っていた等) は該当なしになる (別の値に当たらない)。 番号は値が生きている
+    /// 間だけ有効。 既に有効なら何もしない。
+    pub fn enable_vocab_reclaim(&self) -> io::Result<()> {
+        if self.is_readonly() {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "enable_vocab_reclaim: readonly open"));
+        }
+        let header_size = self.layout.read().unwrap().header_size;
+        {
+            let buf = self.backing.header_mut(header_size);
+            if u32::from_le_bytes(buf[H_VOCAB_RECLAIM..H_VOCAB_RECLAIM + 4].try_into().unwrap()) != 0 {
+                return Ok(());
+            }
+            buf[H_VOCAB_RECLAIM..H_VOCAB_RECLAIM + 4].copy_from_slice(&1u32.to_le_bytes());
+            let cur = u32::from_le_bytes(buf[H_VERSION..H_VERSION + 4].try_into().unwrap());
+            buf[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION_RECLAIM.max(cur).to_le_bytes());
+            write_header_crc(buf);
+        }
+        self.backing.flush_header(header_size)
     }
 
     /// 辞書の上限 (`vocab_max_entries` / `vocab_data_size`) を開いたまま伸ばす (#381)。 `grow_entity_cap` の辞書版。
@@ -14004,8 +14246,10 @@ impl Engine {
                 ValueType::Tag | ValueType::Leaf => {
                     let vids = self.himos[hid].unique_values();
                     for v in vids {
-                        if (v as usize) < is_live.len() {
-                            is_live[v as usize] = true;
+                        // #381: 番号の上位 2 bit は世代。 今の世代の番号だけが生きている
+                        let slot = crate::vocabulary::vid_slot(v as u32) as usize;
+                        if slot < is_live.len() && self.vocab.get_checked(v as u32).is_some() {
+                            is_live[slot] = true;
                         }
                     }
                 }
@@ -14016,9 +14260,9 @@ impl Engine {
         let mut orphan_vids: u32 = 0;
         let mut live_bytes: u64 = 0;
         let mut orphan_bytes: u64 = 0;
-        for vid in 0..vocab_total {
-            let len = self.vocab.get(vid).len() as u64;
-            if is_live[vid as usize] {
+        for slot in 0..vocab_total {
+            let len = self.vocab.get_slot(slot).len() as u64;
+            if is_live[slot as usize] {
                 live_vids += 1;
                 live_bytes += len;
             } else {
@@ -14051,7 +14295,10 @@ impl Engine {
                 // #119: **publish → free** の順 (逆順だと並行 reader が再利用 slot を読む)。
                 let old = self.take_leaf_cell(eid, hid);
                 // request17 step 4: push 時に採番した版数で値と一緒に書く。
-                if self.set_cell_local(eid, himo_id, value, hlc) {
+                let written = self.set_cell_local(eid, himo_id, value, hlc);
+                // #381: push 側が押さえた番号を返す (Tag の列)
+                self.vocab_unpin(hid, value as u32);
+                if written {
                     self.free_leaf_offset(hid, old);
                 } else {
                     // 不採用: cell は旧値のまま = 旧 payload はまだ生きている。
@@ -14122,6 +14369,14 @@ impl Engine {
         // β-light step 5: Ref himo の FK validation (非 Ref は即 return で
         // ~1 ns、 Ref で fk_refs entry なしも同じ)
         self.validate_ref_tie(himo_id as usize, value as u32); // Ref の列は u32
+        // #381: Tag の列なら、 適用するまでの間に回収されないよう番号を押さえる (適用した後で返す)
+        if self.vocab.reclaim_enabled()
+            && self.value_types[himo_id as usize] == ValueType::Tag
+            && !self.vocab.acquire(value as u32)
+        {
+            self.record_fault(FaultKind::StaleValue, "Tag の値の番号が古い (語が回収された) — write rejected");
+            return;
+        }
         // #77-H4: op を write_queue へ push してから WAL record を push する。
         // 逆順 (record 先) だと 2 push の間で preempt された場合、 consumer が
         // record を fsync + checkpoint した時点で op が未適用となり、 crash で
@@ -14221,7 +14476,11 @@ impl Engine {
         }
         // Tag は dedupe、Leaf は常に新規 id。
         let vid = match self.value_types[hid] {
-            ValueType::Tag => self.vocab.try_get_or_insert(value),
+            ValueType::Tag => {
+                // #381: 書くまでの間に回収されないよう押さえる (書いた後 / 適用した後で `vocab_unpin`)
+                self.step_vocab_refs();
+                self.vocab.try_get_or_insert_pinned(value)
+            }
             ValueType::Leaf => self.vocab.try_insert(value),
             ht => panic!("tie_bytes_async_by_id on non-text himo_id {}: {:?}", himo_id, ht),
         };
@@ -14543,6 +14802,21 @@ impl crate::live::CellReader for Engine {
     }
     fn vocab_lookup(&self, text: &str) -> Option<u32> {
         self.vocab_id(text)
+    }
+    fn vocab_pin(&self, text: &str) -> Option<u32> {
+        loop {
+            let id = self.vocab.lookup(text.as_bytes())?;
+            if self.vocab.acquire(id) {
+                return Some(id);
+            }
+            // 引いた後に回収された: 引き直す
+        }
+    }
+    fn vocab_unpin(&self, vid: u32) {
+        self.vocab.release(vid);
+    }
+    fn vocab_current(&self, vid: u32) -> bool {
+        self.vocab.get_checked(vid).is_some()
     }
     fn pull(&self, himo_id: u16, value: u64) -> Vec<u32> {
         match self.himos.get(himo_id as usize) {
