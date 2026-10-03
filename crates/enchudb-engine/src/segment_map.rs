@@ -282,6 +282,10 @@ pub struct SegmentMap {
     base: *mut u8,
     /// 予約した仮想アドレス幅。 open 後は不変。 伸長の上限。
     reserved: usize,
+    /// `grow_amortized` が先回りして伸ばしてよい上限 (既定は `reserved`)。 宣言 size より広く予約する segment
+    /// (辞書、 #381) は宣言 size で止める — 先回りで file が宣言 size を越えると、 宣言 size で予約する旧 binary が
+    /// 「file が予約より大きい」 で開けなくなる。 要る位置そのものはこれを越えても伸ばす。
+    grow_cap: AtomicUsize,
     /// file-backed に貼ってある byte 数 (page 単位)。 hot path は lock なしで読む。
     committed: AtomicUsize,
     readonly: bool,
@@ -418,6 +422,7 @@ impl SegmentMap {
             path,
             base: base as *mut u8,
             reserved: reserve,
+            grow_cap: AtomicUsize::new(reserve),
             committed: AtomicUsize::new(committed),
             readonly,
             grow_lock: Mutex::new(()),
@@ -606,7 +611,8 @@ impl SegmentMap {
         const MIN_GROW_STEP: usize = 64 * 1024;
         const MAX_GROW_STEP: usize = 16 * 1024 * 1024;
         let step = cur.max(MIN_GROW_STEP).min(MAX_GROW_STEP);
-        let target = cur.saturating_add(step).max(needed_aligned).min(self.reserved);
+        let cap = self.grow_cap.load(Ordering::Relaxed).max(needed_aligned);
+        let target = cur.saturating_add(step).min(cap).max(needed_aligned).min(self.reserved);
         if target < needed_aligned {
             return Err(io::Error::new(io::ErrorKind::OutOfMemory, "needed exceeds reservation"));
         }
@@ -649,6 +655,12 @@ impl SegmentMap {
 
     pub fn committed(&self) -> usize {
         self.committed.load(Ordering::Acquire)
+    }
+
+    /// `grow_amortized` の先回りを `bytes` (open と同じく `RESERVE_ALIGN` に切り上げ) で止める (#381)。
+    pub fn set_grow_cap(&self, bytes: usize) {
+        let ps = runtime_page_size();
+        self.grow_cap.store(align_up(bytes.max(ps), RESERVE_ALIGN).min(self.reserved), Ordering::Relaxed);
     }
 
     pub fn reserved(&self) -> usize {

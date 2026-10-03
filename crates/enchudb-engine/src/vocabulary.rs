@@ -56,6 +56,9 @@ thread_local! {
     /// test 用の割り込み点 (#374): 読み手が表を読んだ直後に 1 回だけ走らせる処理。 書き手が表を組み直す窓を、
     /// thread の運に頼らず踏むため。
     static AFTER_TABLE_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    /// test 用の割り込み点 (#381): insert が data の上限の先取りを抜けた直後に 1 回だけ走らせる処理。 並行 insert が
+    /// 同時に先取りを抜ける窓を踏むため。
+    static AFTER_PRECHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// 読み手が表を読んだ直後の割り込み点 (test 以外では何もしない)。
@@ -63,6 +66,15 @@ thread_local! {
 fn hook_after_table_read() {
     #[cfg(test)]
     if let Some(f) = AFTER_TABLE_READ.with(|h| h.borrow_mut().take()) {
+        f();
+    }
+}
+
+/// insert が data の上限の先取りを抜けた直後の割り込み点 (test 以外では何もしない)。
+#[inline(always)]
+fn hook_after_precheck() {
+    #[cfg(test)]
+    if let Some(f) = AFTER_PRECHECK.with(|h| h.borrow_mut().take()) {
         f();
     }
 }
@@ -154,9 +166,17 @@ pub struct Vocabulary {
     pub rebuilt_on_load: bool,
     count: AtomicU32,
     data_end: AtomicU32,
-    max_entries: u32,
-    /// 索引の領域の slot 数 (2 の冪)。 表はこの中に置く (#374)。
-    index_cap: u32,
+    /// 語数の上限 (header の `vocab_max_entries`)。 `grow` で伸びる (#381)。
+    max_entries: AtomicU32,
+    /// offsets 領域に入る語数 (= 予約の長さ / 8)。 `max_entries` はこの範囲で伸びる。 破損 slot の vid を
+    /// 読み飛ばす境界にも使う (`max_entries` は他 process の書き手が伸ばしうるので、 読み手の境界にしない)。
+    offsets_cap: u32,
+    /// data の byte 数の上限 (header の `vocab_data_size`)。 `grow` で伸びる (#381)。
+    data_limit: AtomicU32,
+    /// 索引の領域の slot 数 (2 の冪)。 表はこの中に置く (#374)。 `grow` で伸びる (#381)。
+    index_cap: AtomicU32,
+    /// readonly open (領域は書けない)。
+    readonly: bool,
 }
 
 unsafe impl Sync for Vocabulary {}
@@ -197,6 +217,7 @@ impl Vocabulary {
         index.write_at(4, &index_cap.to_le_bytes());
         index.write_at(GEN_OFF, &first.word().to_le_bytes());
 
+        let (offsets_cap, data_limit) = Self::region_caps(&offsets, &data);
         Self {
             data, offsets, index,
             shadow_index: None,
@@ -206,7 +227,11 @@ impl Vocabulary {
             rebuilt_on_load: false,
             count: AtomicU32::new(0),
             data_end: AtomicU32::new(HEADER as u32),
-            max_entries, index_cap,
+            max_entries: AtomicU32::new(max_entries.min(offsets_cap)),
+            offsets_cap,
+            data_limit: AtomicU32::new(data_limit),
+            index_cap: AtomicU32::new(index_cap),
+            readonly: false,
         }
     }
 
@@ -235,8 +260,7 @@ impl Vocabulary {
             )
         };
 
-        let om = offsets.slice();
-        let max_entries = (om.len() / 8) as u32;
+        let (offsets_cap, data_limit) = Self::region_caps(&offsets, &data);
 
         let xm = index.slice();
         let index_cap = u32::from_le_bytes(xm[4..8].try_into().unwrap());
@@ -254,7 +278,12 @@ impl Vocabulary {
             rebuilt_on_load: false,
             count: AtomicU32::new(count),
             data_end: AtomicU32::new(data_end),
-            max_entries, index_cap,
+            // 上限は領域から決めた仮の値。 engine が header の値を `set_limits` で入れる (#381)
+            max_entries: AtomicU32::new(offsets_cap),
+            offsets_cap,
+            data_limit: AtomicU32::new(data_limit),
+            index_cap: AtomicU32::new(index_cap),
+            readonly,
         };
         if usable {
             return Ok(v);
@@ -266,8 +295,8 @@ impl Vocabulary {
         v.rebuilt_on_load = !is_fresh;
         if readonly {
             // #77-H1 / #127: 共有 mmap は書かない。 count 比例の compact shadow を data/offsets (= ground truth)
-            // から構築する。 count は破損 header 対策で max_entries に clamp する。
-            let count = v.count.load(Ordering::Relaxed).min(v.max_entries);
+            // から構築する。 count は破損 header 対策で offsets 領域に clamp する。
+            let count = v.count.load(Ordering::Relaxed).min(v.offsets_cap);
             let mut shadow: Vec<(u64, u32)> = Vec::with_capacity(count as usize);
             for id in 0..count {
                 let value = read_value(&v.offsets, &v.data, id);
@@ -301,8 +330,8 @@ impl Vocabulary {
     ///
     /// #327: 書く表の領域の空きを先に確かめる。 空きが無ければ何も書かずにエラー。
     fn rebuild_from_data(&mut self) -> std::io::Result<()> {
-        let count = self.count.load(Ordering::Relaxed).min(self.max_entries);
-        let bits = Self::bits_for(count as usize, self.index_cap);
+        let count = self.count.load(Ordering::Relaxed).min(self.offsets_cap);
+        let bits = Self::bits_for(count as usize, self.index_cap());
         let old = self.gen_on_disk();
         let next = Gen { base: 0, bits, ver: old.ver.wrapping_add(2) & !1 };
         let (offsets, data) = (&self.offsets, &self.data);
@@ -385,11 +414,15 @@ impl Vocabulary {
     /// 語数が今の表の半分を超えていたら、 表を伸ばす (書き手、 `try_insert` の後で)。 空き不足で伸ばせなければ
     /// 何もしない (今の表で続け、 次の insert でまた試す)。
     fn maybe_grow(&self) {
-        let needs = |g: Gen| g.cap() < self.index_cap && self.count.load(Ordering::Relaxed) as u64 * 2 > g.cap() as u64;
+        let index_cap = self.index_cap();
+        let needs = |g: Gen| g.cap() < index_cap && self.count.load(Ordering::Relaxed) as u64 * 2 > g.cap() as u64;
         if self.legacy_gen.is_some() || self.shadow_index.is_some() || !needs(self.table()) {
             return;
         }
         let _w = self.grow_lock.write().unwrap_or_else(|p| p.into_inner());
+        // 上限が伸びて (#381) 領域が広がったかもしれないので、 lock の中で読み直す
+        let index_cap = self.index_cap();
+        let needs = |g: Gen| g.cap() < index_cap && self.count.load(Ordering::Relaxed) as u64 * 2 > g.cap() as u64;
         let g = self.table();
         if !needs(g) {
             return;
@@ -405,15 +438,15 @@ impl Vocabulary {
                 entries.push((h, vid));
             }
         }
-        let bits = Self::bits_for(self.count.load(Ordering::Relaxed) as usize, self.index_cap).max(g.bits + 1);
+        let bits = Self::bits_for(self.count.load(Ordering::Relaxed) as usize, index_cap).max(g.bits + 1);
         let ver = g.ver.wrapping_add(2);
         let after = Gen { base: g.base + g.cap(), bits, ver };
-        let _ = if after.base as u64 + after.cap() as u64 <= self.index_cap as u64 {
+        let _ = if after.base as u64 + after.cap() as u64 <= index_cap as u64 {
             // 今の表の直後に置く: 今の表は書き換えないので、 読み手は止めない
             self.write_gen(None, after, entries, false)
         } else {
             // 直後に置けない: 領域の先頭から全域の表に組み直す (今の表と重なるので読み手を待たせる)
-            let full = Gen { base: 0, bits: self.index_cap.trailing_zeros() as u8, ver };
+            let full = Gen { base: 0, bits: index_cap.trailing_zeros() as u8, ver };
             self.write_gen(Some(g), full, entries, false)
         };
     }
@@ -487,7 +520,7 @@ impl Vocabulary {
                 let vid = u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap());
                 // #92: 実 insert は必ず vid < max_entries を assert する。 残りうる **vid >= max_entries の
                 // 破損 slot** は get(vid) が offsets region を溢れて OOB するので読み飛ばす。
-                if vid < self.max_entries && self.get(vid) == value { return Some(vid); }
+                if vid < self.offsets_cap && self.get(vid) == value { return Some(vid); }
             }
             idx = ((idx as u64 + 1) & mask) as usize;
         }
@@ -501,7 +534,7 @@ impl Vocabulary {
     /// (data/offsets のみ完全に増分)。
     /// 今後 1 件も insert できないか (= 天井 hit)。
     pub fn is_full(&self) -> bool {
-        self.count.load(Ordering::Relaxed) >= self.max_entries
+        self.count.load(Ordering::Relaxed) >= self.max_entries.load(Ordering::Relaxed)
     }
 
     /// 満杯なら **`u32::MAX` (予約 sentinel)** を返す (#59: panic しない)。
@@ -524,12 +557,18 @@ impl Vocabulary {
         // #328: data / offsets も番号を取る前に伸ばせるか見る (取った後に伸ばせないと番号を捨てることになる)。
         // 並行 insert で位置は先へずれうるので、 ここは捨てる番号を減らすための先取りで、 保証は下の確認
         let (count_now, end_now) = (self.count.load(Ordering::Relaxed), self.data_end.load(Ordering::Relaxed));
-        if count_now < self.max_entries
+        let max_entries = self.max_entries.load(Ordering::Relaxed);
+        // #381: data の上限 (`vocab_data_size`) に着いた。 番号を取る前に止める (先取り、 保証は下の確認)
+        if count_now < max_entries && end_now as u64 + len as u64 > self.data_limit.load(Ordering::Relaxed) as u64 {
+            return Err(VocabFail::Full);
+        }
+        if count_now < max_entries
             && (self.data.ensure_committed((end_now + len) as usize).is_err()
                 || self.offsets.ensure_committed(((count_now as usize) + 1) * 8).is_err())
         {
             return Err(VocabFail::Space);
         }
+        hook_after_precheck();
         let id = self.count.fetch_add(1, Ordering::Relaxed);
         // #122: vocab_max_entries が公開 knob になったので、 天井 hit を actionable に
         // する (#118 の `too many himos` と同じ扱い)。 既存 DB は header 焼き込みなので
@@ -539,12 +578,19 @@ impl Vocabulary {
         // **予約 sentinel `u32::MAX`** を返し、 呼び出し側 (Engine) が fault として
         // 記録 + 報告し、 write を拒否する。 `u32::MAX` は元々 「無効値」 として
         // engine 側の guard が見ている値なので、 新しい規約を増やしていない。
-        if id >= self.max_entries {
+        if id >= max_entries {
             // 天井より先の番号は誰も使わないので戻してよい (戻す間に取られる番号も天井より先)
             self.count.fetch_sub(1, Ordering::Relaxed);
             return Err(VocabFail::Full);
         }
-        let offset = self.data_end.fetch_add(len, Ordering::Relaxed);
+        // #381: data は上限の内側でだけ取る (並行 insert が上の先取りを同時に抜けても越えない)。 取れなければ番号は
+        // 捨てる (#328 と同じく巻き戻さない、 offsets が 0 = 空の値)
+        let limit = self.data_limit.load(Ordering::Relaxed) as u64;
+        let Ok(offset) = self.data_end.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+            (end as u64 + len as u64 <= limit).then_some(end + len)
+        }) else {
+            return Err(VocabFail::Full);
+        };
         // Growable backing: extend the file-backed window before
         // writing past the current commit. No-op for static backings.
         // We also grow the offsets region in case `id` advanced
@@ -620,7 +666,7 @@ impl Vocabulary {
         let mut probes = 0usize;
         loop {
             if probes >= g.cap() as usize {
-                return Err(if g.cap() >= self.index_cap { VocabFail::Full } else { VocabFail::Space });
+                return Err(if g.cap() >= self.index_cap() { VocabFail::Full } else { VocabFail::Space });
             }
             probes += 1;
             let off = g.slot_off(idx);
@@ -663,10 +709,10 @@ impl Vocabulary {
             };
             if slot_hash == h {
                 // ハッシュ一致 → 実際の値を比較して本当に重複か確認。
-                // #92: vid >= max_entries の破損 slot は get(vid) が OOB するので
-                // 読み飛ばす (実 insert は vid < max_entries を保証 = 通常運用では常に
-                // 通過。 max_entries は不変で並行 insert を skip しない = dedup race 無)。
-                if vid < self.max_entries && self.get(vid) == value {
+                // #92: vid >= offsets_cap の破損 slot は get(vid) が OOB するので
+                // 読み飛ばす (実 insert は vid < max_entries <= offsets_cap を保証 = 通常運用では常に
+                // 通過。 offsets_cap は不変で並行 insert を skip しない = dedup race 無)。
+                if vid < self.offsets_cap && self.get(vid) == value {
                     return Ok(()); // 本当の重複
                 }
                 // ハッシュ衝突 or 破損 slot → linear probe 続行
@@ -676,6 +722,68 @@ impl Vocabulary {
     }
 
     pub fn count(&self) -> u32 { self.count.load(Ordering::Relaxed) }
+
+    /// 語数の上限 (#381)。 回収されない語 (行を消した値) も `count` に入っている。
+    pub fn max_entries(&self) -> u32 { self.max_entries.load(Ordering::Relaxed) }
+
+    /// data の byte 数の上限 (#381)。 使った分は `data_footprint`。
+    pub fn data_limit(&self) -> u32 { self.data_limit.load(Ordering::Relaxed) }
+
+    /// 領域 (予約) に入る語数と data の byte 数。 上限はこの範囲でしか伸ばせない (#381)。
+    pub fn region_limits(&self) -> (u32, u32) {
+        let (offsets_cap, data_cap) = Self::region_caps(&self.offsets, &self.data);
+        let index_slots = (self.index.len().saturating_sub(INDEX_HEADER) / INDEX_SLOT_SIZE) as u64;
+        // 索引は上限の次の 2 の冪の slot を要る
+        let by_index = if index_slots == 0 { 0 } else { 1u64 << (63 - index_slots.leading_zeros()) };
+        (offsets_cap.min(by_index.min(u32::MAX as u64) as u32), data_cap)
+    }
+
+    fn region_caps(offsets: &Region, data: &Region) -> (u32, u32) {
+        ((offsets.len() / 8).min(u32::MAX as usize) as u32, data.len().min(u32::MAX as usize) as u32)
+    }
+
+    #[inline]
+    fn index_cap(&self) -> u32 {
+        self.index_cap.load(Ordering::Acquire)
+    }
+
+    /// 上限を入れる (#381)。 開いた時は header の値を、 `Engine::grow_vocab` は伸ばした値を渡す。 語数・data は今
+    /// 使っている分より下げない。 索引の領域 (`vocab_max_entries` の次の 2 の冪) が今より広がる時は index header の
+    /// 領域の大きさも書く (書き手のみ。 readonly の領域は書けないので、 readonly で伸ばす値を渡さないこと)。
+    ///
+    /// 領域 (予約) に入らない値は `Err` (何も変えない)。
+    pub fn set_limits(&self, max_entries: u32, data_size: usize) -> Result<(), String> {
+        let (entries_room, data_room) = self.region_limits();
+        if max_entries > entries_room {
+            return Err(format!(
+                "vocab_max_entries {max_entries} does not fit the reservation ({entries_room} entries)"
+            ));
+        }
+        if data_size > data_room as usize {
+            return Err(format!("vocab_data_size {data_size} does not fit the reservation ({data_room} bytes)"));
+        }
+        let index_cap = max_entries.max(1).next_power_of_two();
+        let widened = {
+            // 表を伸ばす途中 (`maybe_grow`) と重ねない
+            let _w = self.grow_lock.write().unwrap_or_else(|p| p.into_inner());
+            // 呼び手 (open / `Engine::grow_vocab`) は直列なので store でよい (開いた時の仮の値は下げる)
+            self.max_entries.store(max_entries.max(self.count()), Ordering::Release);
+            self.data_limit.store((data_size as u32).max(self.data_footprint()), Ordering::Release);
+            let widened = index_cap > self.index_cap() && !self.readonly;
+            if widened {
+                self.index.write_at(4, &index_cap.to_le_bytes());
+                self.index.mark_dirty(4, 4);
+                self.index_cap.store(index_cap, Ordering::Release);
+            }
+            widened
+        };
+        // 表が領域いっぱい (= 上限まで語が入った) なら、 広がった領域へ今のうちに伸ばす。 伸ばすのは insert の後
+        // だけなので、 ここで伸ばさないと次の insert が満杯の表に当たる
+        if widened {
+            self.maybe_grow();
+        }
+        Ok(())
+    }
 
     /// 今の表の slot 数 (観測用、 #374)。 語数の 2〜4 倍 (最小 `FIRST_GEN_CAP`、 最大は領域の全域)。
     pub fn index_table_slots(&self) -> u32 {
@@ -1087,6 +1195,29 @@ mod tests {
         assert_eq!(flag(&r), CLEAN_GEN, "flush 直後は clean (#374 で 2)");
         w.get_or_insert(b"second");
         assert_eq!(flag(&r), 0, "flush 後の insert で clean=0 に戻るはず (#77-M1)");
+    }
+
+    /// #381: data の上限は並行 insert が同時に先取りを抜けても越えない (越える側は番号を捨てて `Full`)。
+    /// 割り込み点で、 先取りを抜けた insert の間に別の insert が残りの data を使い切る窓を作る。
+    #[test]
+    fn data_limit_holds_when_another_insert_slips_past_the_precheck() {
+        let r = make_regions(1024, 1024, 64 * 1024);
+        let w: &'static Vocabulary = Box::leak(Box::new(r.vocab_init(1024, 1024)));
+        // data は header 16 B + 値 2 つ分 (10 B ずつ)
+        w.set_limits(1024, HEADER + 20).unwrap();
+        assert_eq!(w.try_insert(b"aaaaaaaaaa"), Ok(0));
+        AFTER_PRECHECK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                assert_eq!(w.try_insert(b"bbbbbbbbbb"), Ok(1), "割り込んだ insert は残りに入る");
+            }))
+        });
+        assert_eq!(w.try_insert(b"cccccccccc"), Err(VocabFail::Full), "先取りを抜けても上限を越えて書かない");
+        assert_eq!(w.data_footprint() as usize, HEADER + 20);
+        assert_eq!((w.get(0), w.get(1)), (&b"aaaaaaaaaa"[..], &b"bbbbbbbbbb"[..]));
+        assert_eq!(w.lookup(b"cccccccccc"), None);
+        // 上限を伸ばせば入る
+        w.set_limits(1024, HEADER + 30).unwrap();
+        assert!(w.try_insert(b"cccccccccc").is_ok());
     }
 
     /// #328: 番号を取った直後に伸ばせなかった insert の番号は、 次の insert に配り直さない (巻き戻すと、 並行に

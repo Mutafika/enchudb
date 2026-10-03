@@ -239,6 +239,9 @@ impl SegmentMap {
     pub fn committed(&self) -> usize {
         self.committed.load(Ordering::Acquire)
     }
+    /// unix 版と同じ API (#381)。 Windows の `grow_amortized` は要る位置までしか伸ばさない (先回りしない) ので何もしない。
+    pub fn set_grow_cap(&self, _bytes: usize) {}
+
     pub fn reserved(&self) -> usize {
         self.reserved
     }

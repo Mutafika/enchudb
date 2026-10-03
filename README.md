@@ -389,12 +389,25 @@ eng.entity();                                 // Result — Err when the eid spa
 eng.fault_count(FaultKind::EntitySpace);      // refused: no eid slots left
                                               // (grow_entity_cap raises the cap; tables
                                               // auto-grow into free eid space first)
-eng.fault_count(FaultKind::VocabSpace);       // refused: vocab_max_entries reached
+eng.fault_count(FaultKind::VocabSpace);       // refused: vocab_max_entries or
+                                              // vocab_data_size reached (grow_vocab
+                                              // raises both while open)
 eng.fault_count(FaultKind::ContentSpace);     // refused: content region full
 eng.fault_count(FaultKind::ValueOutOfRange);  // refused: value == u32::MAX (sentinel)
 eng.fault_count(FaultKind::DiskSpace);        // refused: cannot grow the file
 eng.fault_total();
 ```
+
+The Tag dictionary (`vocab`) is shared by every table and **never gives values back**:
+a value stays in it after the last row using it is deleted. A table that puts unique
+values (IDs) in a Tag column therefore consumes the budget at the rate it creates rows,
+not at the rate it keeps them. `Engine::vocab_usage()` returns the entry / byte counts and
+limits in O(1), so you can watch the headroom; `Engine::grow_vocab(max_entries, data_size)`
+raises the limits on a live DB, up to 4x the limits it was opened with (reopen to go
+further). The reservation is address space only — RAM and disk grow with what is written.
+On Windows the reservation is not widened (segment files are sized to their reservation
+there, and a wider one would stop older binaries from opening the DB), so `grow_vocab`
+only has the 64 KiB rounding slack to work with.
 
 A non-zero count means writes were dropped on purpose. Watch it the way you would watch
 a queue depth: the DB stays readable and usable, but it is telling you it could not
