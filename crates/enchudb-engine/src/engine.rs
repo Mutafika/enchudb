@@ -220,6 +220,27 @@ impl RemoteApply {
     }
 }
 
+/// 辞書 (Tag の値の共有辞書) の使用量と上限 (#381)。 `Engine::vocab_usage` が O(1) で返す。
+///
+/// 語は行を消しても戻らない (回収は無い) ので、 `entries` はこれまでに入れた値の種類の総数。 上限に着くと DB の
+/// **全ての表**で新しい Tag の値が書けなくなる (`FaultKind::VocabSpace`)。 残りを見て `Engine::grow_vocab` で伸ばす。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VocabUsage {
+    /// 辞書の語数 (行から参照されなくなった語も含む)。
+    pub entries: u32,
+    /// 語数の上限 (header の `vocab_max_entries`)。
+    pub max_entries: u32,
+    /// data の使用 byte 数 (先頭 16 B の header を含む)。
+    pub data_bytes: u64,
+    /// data の上限 byte 数 (header の `vocab_data_size`)。
+    pub max_data_bytes: u64,
+    /// 開いたまま `grow_vocab` で伸ばせる語数の上限 (予約)。 開いた時の上限の 4 倍以上 (64 KiB 単位で切り上げる)。
+    /// 開き直すと伸ばした上限の 4 倍以上になる。
+    pub reserved_entries: u32,
+    /// 開いたまま `grow_vocab` で伸ばせる data の byte 数の上限 (予約)。
+    pub reserved_data_bytes: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct VocabOrphanStats {
     /// vocab に発行済みの全 vid 数 (= `Vocabulary::count()`)。
@@ -1648,6 +1669,29 @@ enum Backing {
 }
 
 impl Backing {
+    /// #381: 辞書 2 つ (値の辞書 / 紐名の辞書) に header の上限を入れ、 辞書の segment の先回りの伸長を宣言 size で
+    /// 止める (予約は宣言より広い、 `VOCAB_RESERVE_FACTOR`)。 作った時 / 開いた時 / `grow_vocab` の後に呼ぶ。
+    fn apply_vocab_limits(&self, layout: &Layout, vocab: &Vocabulary, himo_reg: &Vocabulary) {
+        // 宣言が領域に入らない (壊れた header / 旧 layout) なら領域に入る分にする — 開けなくするより安全
+        let fit = |v: &Vocabulary, max: u32, size: usize| {
+            let (room_e, room_d) = v.region_limits();
+            let _ = v.set_limits(max.min(room_e), size.min(room_d as usize));
+        };
+        fit(vocab, layout.vocab_max_entries, layout.vocab_data_size);
+        fit(himo_reg, layout.himoreg_max_entries, layout.himoreg_data_size);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Backing::Segments(set) = self {
+            for (kind, size) in [
+                (SegmentKind::VocabData, layout.vocab_data_size),
+                (SegmentKind::VocabOffsets, layout.vocab_offsets_size),
+            ] {
+                if let Some(seg) = set.segment(kind) {
+                    seg.set_grow_cap(size);
+                }
+            }
+        }
+    }
+
     fn region(&self, kind: SegmentKind, layout: &Layout) -> Region {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
@@ -1923,6 +1967,15 @@ impl Default for GrowableOptions {
         }
     }
 }
+
+/// #381: 辞書の segment は宣言 (`vocab_max_entries` / `vocab_data_size`) のこの倍を予約する。 予約は仮想アドレスだけ
+/// (RAM / disk は食わない) で、 `grow_vocab` は開いたままこの幅まで上限を伸ばせる。 開き直すと伸ばした宣言の倍を
+/// 予約し直すので、 その先も伸ばせる。
+const VOCAB_RESERVE_FACTOR: u64 = 4;
+/// `vocab_max_entries` の format の上限 (索引の大きさ `next_power_of_two` が u32 に入る)。
+const VOCAB_MAX_ENTRIES_LIMIT: u32 = 1 << 31;
+/// `vocab_data_size` の format の上限 (data の位置は u32、 8 byte 整列)。
+const VOCAB_DATA_SIZE_LIMIT: usize = (u32::MAX as usize) & !7;
 
 // ヘッダオフセット
 const H_MAGIC: usize = 0;
@@ -2255,11 +2308,11 @@ impl Layout {
             // #120 と同じ原則: 上限超過は **書く前に** Err。 2^31 超は下の
             // `next_power_of_two()` が overflow し (release では 0 に化けて header に
             // 焼かれ、 open が "index_cap 0 must be nonzero" で恒久失敗する)。
-            Some(v) if v > (1u32 << 31) => {
+            Some(v) if v > VOCAB_MAX_ENTRIES_LIMIT => {
                 return Err(format!(
                     "vocab_max_entries {} exceeds format limit {} (next_power_of_two が u32 を溢れる)",
                     v,
-                    1u32 << 31,
+                    VOCAB_MAX_ENTRIES_LIMIT,
                 ));
             }
             Some(v) => v.max(1),
@@ -2566,6 +2619,14 @@ impl Layout {
     fn has_cell_version(&self) -> bool {
         self.ver_col_size > 0 && self.tomb_size > 0
     }
+    /// #381: 開いたまま `grow_vocab` で伸ばせる辞書の語数 (予約)。 宣言の `VOCAB_RESERVE_FACTOR` 倍、 format の上限まで。
+    fn vocab_reserve_entries(&self) -> u32 {
+        (self.vocab_max_entries as u64 * VOCAB_RESERVE_FACTOR).min(VOCAB_MAX_ENTRIES_LIMIT as u64) as u32
+    }
+    /// #381: 開いたまま `grow_vocab` で伸ばせる辞書の data の byte 数 (予約)。 data の位置は u32 なので u32 まで。
+    fn vocab_reserve_data(&self) -> usize {
+        (self.vocab_data_size as u64 * VOCAB_RESERVE_FACTOR).min(VOCAB_DATA_SIZE_LIMIT as u64) as usize
+    }
     /// v10: packed 形式 (= 旧 1 ファイル layout) での `kind` の offset。 `Memory` backing 用。
     fn region_off(&self, kind: SegmentKind) -> usize {
         match kind {
@@ -2617,6 +2678,14 @@ impl SegmentSizes for Layout {
     /// base pointer が動かない)。 それ以外は size と同じ。
     fn segment_reserve(&self, kind: SegmentKind) -> usize {
         match kind {
+            // #381: 辞書は宣言の `VOCAB_RESERVE_FACTOR` 倍を予約する (`grow_vocab` が開いたまま伸ばせる幅)
+            SegmentKind::VocabData => self.vocab_data_size.max(self.vocab_reserve_data()),
+            SegmentKind::VocabOffsets => {
+                self.vocab_offsets_size.max(Vocabulary::offsets_region_size(self.vocab_reserve_entries()))
+            }
+            SegmentKind::VocabIndex => self
+                .vocab_index_size
+                .max(Vocabulary::index_region_size(self.vocab_reserve_entries().next_power_of_two())),
             SegmentKind::Entities => self.entities_size,
             SegmentKind::ContentIndex => self.content_index_reserve,
             SegmentKind::Himo(h) if self.is_wide(h) => self.himo_col_reserve64,
@@ -3410,6 +3479,7 @@ impl Engine {
             backing.region(SegmentKind::HimoregIndex, &layout),
             layout.himoreg_max_entries, layout.himoreg_index_cap,
         );
+        backing.apply_vocab_limits(&layout, &vocab, &himo_reg);
         let contents = ContentStore::init(
             backing.region(SegmentKind::ContentIndex, &layout),
             backing.region(SegmentKind::ContentData, &layout),
@@ -4404,6 +4474,7 @@ impl Engine {
             readonly,
         )
         .map_err(|e| e.to_string())?;
+        backing.apply_vocab_limits(&layout, &vocab, &himo_reg);
         report("himo_reg(Vocabulary)", &mut t, &mut p);
         let contents = ContentStore::load(
             backing.region(SegmentKind::ContentIndex, &layout),
@@ -9767,9 +9838,9 @@ impl Engine {
             crate::vocabulary::VocabFail::Full => {
                 self.record_fault(
                     FaultKind::VocabSpace,
-                    "vocabulary is full (vocab_max_entries 到達) — text write rejected. \
-                     GrowableOptions { vocab_max_entries: Some(n), .. } で上げられるが、\
-                     header 焼き込みなので既存 DB は再作成が必要",
+                    "vocabulary is full (vocab_max_entries / vocab_data_size 到達) — text write rejected. \
+                     Engine::grow_vocab で開いたまま伸ばせる (Engine::vocab_usage で残りを見る)。 \
+                     新しい DB は GrowableOptions { vocab_max_entries: Some(n), .. } で作成時に指定",
                 );
                 FaultKind::VocabSpace
             }
@@ -13817,6 +13888,90 @@ impl Engine {
     /// 「Leaf を vocab に載せる旧挙動」の footprint 増加を計測する用。
     pub fn vocab_data_footprint(&self) -> u32 {
         self.vocab.data_footprint()
+    }
+
+    /// 辞書の語数・data の使用量と上限 (#381)。 O(1) (`vocab_orphan_stats` と違って列を走査しない)。
+    pub fn vocab_usage(&self) -> VocabUsage {
+        let (reserved_entries, reserved_data) = self.vocab.region_limits();
+        VocabUsage {
+            entries: self.vocab.count(),
+            max_entries: self.vocab.max_entries(),
+            data_bytes: self.vocab.data_footprint() as u64,
+            max_data_bytes: self.vocab.data_limit() as u64,
+            reserved_entries,
+            reserved_data_bytes: reserved_data as u64,
+        }
+    }
+
+    /// 辞書の上限 (`vocab_max_entries` / `vocab_data_size`) を開いたまま伸ばす (#381)。 `grow_entity_cap` の辞書版。
+    ///
+    /// 今より小さい値は今のまま (縮めない)。 伸ばせるのは開いた時の予約 (`VocabUsage::reserved_entries` /
+    /// `reserved_data_bytes` = 開いた時の上限の 4 倍以上) まで、 それを越える値は `InvalidInput` (何も変えない)。
+    /// 開き直すと予約も伸ばした上限の 4 倍以上になるので、 その先はもう一度呼ぶ。 header に書くので開き直しても残る。
+    /// 予約は仮想アドレスだけで、 伸ばしても RAM / disk は書いた分しか増えない。 packed (in-memory) の DB は
+    /// `Unsupported`。
+    pub fn grow_vocab(&self, max_entries: u32, data_size: usize) -> io::Result<VocabUsage> {
+        if self.backing.memory_len().is_some() {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "grow_vocab: packed (in-memory) backing"));
+        }
+        if self.is_readonly() {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "grow_vocab: readonly open"));
+        }
+        let mut layout = self.layout.write().unwrap();
+        let l = &*layout;
+        let max_entries = max_entries.max(l.vocab_max_entries);
+        let data_size = Vocabulary::data_region_size(data_size).next_multiple_of(8).max(l.vocab_data_size);
+        if max_entries == l.vocab_max_entries && data_size == l.vocab_data_size {
+            drop(layout);
+            return Ok(self.vocab_usage());
+        }
+        if max_entries > VOCAB_MAX_ENTRIES_LIMIT || data_size > VOCAB_DATA_SIZE_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "grow_vocab: vocab_max_entries {max_entries} / vocab_data_size {data_size} exceeds the format \
+                     limit ({VOCAB_MAX_ENTRIES_LIMIT} entries / {VOCAB_DATA_SIZE_LIMIT} bytes)"
+                ),
+            ));
+        }
+        let (room_entries, room_data) = self.vocab.region_limits();
+        if max_entries > room_entries || data_size > room_data as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "grow_vocab: vocab_max_entries {max_entries} / vocab_data_size {data_size} exceeds the \
+                     reservation made at open ({room_entries} entries / {room_data} bytes = {VOCAB_RESERVE_FACTOR} x \
+                     the limits then). grow to the reservation, reopen, and grow again"
+                ),
+            ));
+        }
+        let mut grown = Layout::try_from_params_with_header(
+            l.max_entities, self.max_himos,
+            max_entries, max_entries.next_power_of_two(), data_size,
+            l.himoreg_max_entries, l.himoreg_index_cap, l.himoreg_data_size,
+            l.content_data_size, l.leaf_data_size, l.cyl_max_values,
+            l.has_cell_version(),
+            l.header_size,
+            l.reserve_entities,
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        grown.wide = l.wide.clone();
+        // 辞書を先に伸ばす (header を先に書いて落ちても、 開いた時に header の上限を入れ直すのでどちらの順でもよい)
+        self.vocab
+            .set_limits(grown.vocab_max_entries, grown.vocab_data_size)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        self.backing.apply_vocab_limits(&grown, &self.vocab, &self.himo_reg);
+        {
+            let buf = self.backing.header_mut(l.header_size);
+            buf[H_VOCAB_MAX_ENTRIES..H_VOCAB_MAX_ENTRIES + 4].copy_from_slice(&grown.vocab_max_entries.to_le_bytes());
+            buf[H_VOCAB_INDEX_CAP..H_VOCAB_INDEX_CAP + 4].copy_from_slice(&grown.vocab_index_cap.to_le_bytes());
+            buf[H_VOCAB_DATA_SIZE..H_VOCAB_DATA_SIZE + 8].copy_from_slice(&(grown.vocab_data_size as u64).to_le_bytes());
+            write_header_crc(buf);
+        }
+        self.backing.flush_header(l.header_size)?;
+        *layout = grown;
+        drop(layout);
+        Ok(self.vocab_usage())
     }
 
     pub fn vocab_orphan_stats(&self) -> VocabOrphanStats {
