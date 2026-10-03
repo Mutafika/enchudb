@@ -1,5 +1,27 @@
 //! Vocabulary — ユニーク値辞書。Symbol の値を value_id (u32) に変換。
 //! 3つのRegion（data, offsets, index）で構成。
+//!
+//! ## 索引 (index) = 語数に合わせて伸びるハッシュ表 (#374)
+//!
+//! index 領域は作成時に `index_cap` slot (= `vocab_max_entries` の次の 2 の冪、 1 slot 13 B) の大きさで予約する
+//! (entity cap 2 億なら 3.49 GB、 sparse)。 昔はこの全域を 1 つのハッシュ表にしていたので、 語が少なくても slot は
+//! 全域に散り、 引くたび・入れるたびに別のページを触った (語 2 万個で 367 MB のページ)。 メモリの小さい箱では
+//! page cache が溢れ、 `lookup` のたびに読み直しになった。
+//!
+//! 今は表を**語数に合わせて**持つ:
+//! - 表 (gen) は領域の中の連続した `2^bits` slot (`base` から)。 最初は `FIRST_GEN_CAP` slot
+//! - 語数が表の半分を超えたら、 倍の表を**今の表の直後**に作り、 今の表の slot を移して切り替える (`grow`)。
+//!   古い表は書き換えないので、 切り替えの間も読み手は止まらない (古い表を読んだ読み手は、 その後に入った語を
+//!   見落とすだけ — `try_get_or_insert` の重複検査が拾う)
+//! - 直後に置けない (語数が領域の約 1/4 を超えた) 時だけ、 領域全体を 1 つの表に組み直す (`full`)。 この時は
+//!   読み手を待たせる (header の版が奇数の間、 読み手は待って読み直す)。 辞書の上限は昔と同じ
+//! - 今の表は index header の 8..16 に 1 語 (`Gen`) で置く。 別 process の読み手 (readonly open) も毎回ここを読む
+//!
+//! 形式: magic `VIX4`。 graceful close の印は data header の clean flag = `CLEAN_GEN` (2)。 旧 binary は
+//! clean flag が 1 でなければ全域の表として作り直すので、 `VIX4` の DB を開いても正しく引ける (全域の表に
+//! 入れ直す)。 旧 binary が閉じた (clean flag = 1) `VIX4` の DB は、 表が全域の形になっているので、 新 binary は
+//! 作り直す。 `VIX3` (全域の表、 0.14 〜 0.28.5) / `VIX2` (slot が hash 下位ビット、 0.14 以前) の DB は、 書き手が
+//! 開いた時に data から作り直して `VIX4` にする。
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use crate::region::Region;
@@ -7,20 +29,42 @@ use crate::region::Region;
 const MAGIC: [u8; 4] = [b'V', b'O', b'C', b'1'];
 const HEADER: usize = 16;
 /// data header byte 12 に書く「index は data と consistent」 マーカー。
-/// 0 = dirty (rebuild 要)、 1 = clean (rebuild skip 可)。
+/// 0 = dirty (rebuild 要)、 `CLEAN_GEN` = clean (rebuild skip 可)。 1 は旧 binary の clean (全域の表、 #374)。
 /// 残り 13-15 byte は reserved。
 const CLEAN_FLAG_OFF: usize = 12;
-const INDEX_MAGIC: [u8; 4] = [b'V', b'I', b'X', b'3'];
+/// #374: 伸びる表の形式で graceful close した印。 旧 binary は `!= 1` を dirty と見て作り直す。
+const CLEAN_GEN: u32 = 2;
+/// #374: 伸びる表 (今の表の位置と大きさを header の `GEN_OFF` に持つ)。
+const INDEX_MAGIC: [u8; 4] = [b'V', b'I', b'X', b'4'];
+/// 全域の表 (0.14 〜 0.28.5)。 書き手は開いた時に `VIX4` へ作り直す。 readonly はそのまま全域の表として読む。
+const INDEX_MAGIC_V3: [u8; 4] = [b'V', b'I', b'X', b'3'];
 /// #123: slot 選択を hash 下位ビット (`h & mask`) から **上位ビット** に変えた前の index。
-/// 0.14 以前の DB はこの magic を持つので、 open 時に in-place migrate する
-/// (`migrate_legacy_index`)。
+/// 0.14 以前の DB はこの magic を持つ。 書き手は開いた時に作り直す、 readonly は data から shadow を組む
+/// (どちらも `VIX4` でも clean な `VIX3` でもない、 で決まるので、 code では test が旧 index を再現する時だけ使う)。
+#[cfg_attr(not(test), allow(dead_code))]
 const INDEX_MAGIC_V2: [u8; 4] = [b'V', b'I', b'X', b'2'];
 const INDEX_HEADER: usize = 16;
 const INDEX_SLOT_SIZE: usize = 13;
+/// index header の中の今の表 (`Gen`) の位置 (8 byte、 atomic)。
+const GEN_OFF: usize = 8;
+/// 最初の表の slot 数 (13 KB)。
+const FIRST_GEN_CAP: u32 = 1024;
 
 #[cfg(test)]
 thread_local! {
     static FAIL_AFTER_TAKE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// test 用の割り込み点 (#374): 読み手が表を読んだ直後に 1 回だけ走らせる処理。 書き手が表を組み直す窓を、
+    /// thread の運に頼らず踏むため。
+    static AFTER_TABLE_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// 読み手が表を読んだ直後の割り込み点 (test 以外では何もしない)。
+#[inline(always)]
+fn hook_after_table_read() {
+    #[cfg(test)]
+    if let Some(f) = AFTER_TABLE_READ.with(|h| h.borrow_mut().take()) {
+        f();
+    }
 }
 
 /// `Vocabulary::try_insert` が値を入れられなかった理由 (#316)。
@@ -30,6 +74,51 @@ pub enum VocabFail {
     Full,
     /// ディスクの空き不足で領域を伸ばせない (#167、 空けば入る)
     Space,
+}
+
+/// 今の表: 領域の slot `base .. base + 2^bits` + 版 (#374)。 header の `GEN_OFF` に 1 語で置く
+/// (`base` 32 bit | `bits` 8 bit | 版 24 bit)。 版が奇数の間は表を組み直している (読み手は待つ)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Gen {
+    base: u32,
+    bits: u8,
+    ver: u32,
+}
+
+impl Gen {
+    const VER_MASK: u32 = (1 << 24) - 1;
+
+    #[inline]
+    fn cap(self) -> u32 {
+        1u32 << self.bits
+    }
+
+    #[inline]
+    fn word(self) -> u64 {
+        self.base as u64 | (self.bits as u64) << 32 | ((self.ver & Self::VER_MASK) as u64) << 40
+    }
+
+    #[inline]
+    fn from_word(w: u64) -> Self {
+        Gen { base: w as u32, bits: (w >> 32) as u8, ver: (w >> 40) as u32 & Self::VER_MASK }
+    }
+
+    #[inline]
+    fn busy(self) -> bool {
+        self.ver & 1 == 1
+    }
+
+    /// 表の `i` 番目の slot の、 index 領域の中の位置。
+    #[inline]
+    fn slot_off(self, i: usize) -> usize {
+        INDEX_HEADER + (self.base as usize + i) * INDEX_SLOT_SIZE
+    }
+
+    /// 表の領域 (byte、 `[start, end)`)。
+    #[inline]
+    fn span(self) -> (usize, usize) {
+        (self.slot_off(0), self.slot_off(self.cap() as usize))
+    }
 }
 
 pub struct Vocabulary {
@@ -50,6 +139,11 @@ pub struct Vocabulary {
     /// 1GB VPS の boot +~300MB の正体)。 lookup は hash の binary search + 同 hash
     /// 内の値比較で、 旧 probe と同じ「最小 vid が勝つ」 解決を保つ。
     shadow_index: Option<Vec<(u64, u32)>>,
+    /// #374: readonly open した全域の表 (`VIX3`、 clean)。 header に今の表を持たないので、 ここに全域の表を置く。
+    /// 別 process の書き手が `VIX4` に作り直したら (magic が変わったら) header の表を読む。
+    legacy_gen: Option<Gen>,
+    /// #374: 表を伸ばす間、 書き込み (`index_insert`) を止める。 読み (`lookup`) は取らない。
+    grow_lock: std::sync::RwLock<()>,
     /// #77-M1: disk 上の clean_flag のキャッシュ。 flush() が 1 を書いた後の
     /// 最初の insert で 0 に戻すための判定に使う (旧実装は open 時の 1 回
     /// しか 0 に倒さず、 flush 後の追加 write 中 crash で破損 index を
@@ -61,6 +155,7 @@ pub struct Vocabulary {
     count: AtomicU32,
     data_end: AtomicU32,
     max_entries: u32,
+    /// 索引の領域の slot 数 (2 の冪)。 表はこの中に置く (#374)。
     index_cap: u32,
 }
 
@@ -76,18 +171,11 @@ unsafe impl Send for Vocabulary {}
 /// は 1 word ちょうどで `h = word * SEED`、 下位 32 bit が完全一致)。 上位ビットなら乗算の
 /// 桁上がりが載る。
 ///
-/// `index_cap` は 2^n (open 時に検証済み、 `validate_header`)。 cap == 1 の退化ケースは 0。
+/// `cap` は 2^n。 cap == 1 の退化ケースは 0。
 #[inline]
-fn home_slot(h: u64, index_cap: u32) -> usize {
-    let bits = index_cap.trailing_zeros();
+fn home_slot(h: u64, cap: u32) -> usize {
+    let bits = cap.trailing_zeros();
     if bits == 0 { 0 } else { (h >> (64 - bits)) as usize }
-}
-
-/// VIX2 (0.14 以前) の slot 選択。 index の in-place migration で **旧 slot を正確に消す**
-/// ためだけに残す。
-#[inline]
-fn home_slot_legacy(h: u64, index_cap: u32) -> usize {
-    (h & (index_cap - 1) as u64) as usize
 }
 
 impl Vocabulary {
@@ -101,18 +189,19 @@ impl Vocabulary {
     /// + data_end は **書かない** — `insert` の初回 append で初めて書く
     /// (lazy init)。 これで growable backing の `initial_commit` が
     /// data 領域の末尾までコミットしなくて済むようになる (Phase B Step 2)。
-    /// `index` 領域 (固定 cluster) は eager init のまま — 固定上限なので
-    /// initial_commit に含めるオーバーヘッドが小さい。
+    /// `index` は header だけ書く。 表は最初 `FIRST_GEN_CAP` slot (#374)。
     pub fn init(data: Region, offsets: Region, index: Region, max_entries: u32, index_cap: u32) -> Self {
         let index_cap = index_cap.next_power_of_two();
-
-        // index header — eager init は固定 cluster なのでコスト低
+        let first = Gen { base: 0, bits: FIRST_GEN_CAP.min(index_cap).trailing_zeros() as u8, ver: 0 };
         index.write_at(0, &INDEX_MAGIC);
         index.write_at(4, &index_cap.to_le_bytes());
+        index.write_at(GEN_OFF, &first.word().to_le_bytes());
 
         Self {
             data, offsets, index,
             shadow_index: None,
+            legacy_gen: None,
+            grow_lock: std::sync::RwLock::new(()),
             clean_on_disk: std::sync::atomic::AtomicBool::new(false),
             rebuilt_on_load: false,
             count: AtomicU32::new(0),
@@ -121,12 +210,16 @@ impl Vocabulary {
         }
     }
 
-    /// 既存領域をロード。ハッシュインデックスを再構築する。
+    /// 既存領域をロード。
     ///
     /// data の先頭 4 バイトが MAGIC でない (= 全 0 = lazy fresh、 一度も
     /// insert されてない) 場合は count=0 / data_end=HEADER の fresh
     /// state を返す。 これで `insert` が遅延書き込みする MAGIC を待たずに
     /// open できる。
+    ///
+    /// 索引をそのまま使えるのは `VIX4` + clean flag `CLEAN_GEN` の時だけ。 それ以外 (crash 後 / 旧 binary が閉じた /
+    /// `VIX3`・`VIX2`) は、 書き手なら data から語数に合った表を作り直し (`rebuild_from_data`)、 readonly なら
+    /// heap に shadow を組む (`VIX3` + clean 1 の readonly だけは全域の表をそのまま読む)。
     ///
     /// #327: 索引を作り直すのに要るページを書く空きが無ければ、 書かずにエラー。
     pub fn load(data: Region, offsets: Region, index: Region, readonly: bool) -> std::io::Result<Self> {
@@ -147,210 +240,182 @@ impl Vocabulary {
 
         let xm = index.slice();
         let index_cap = u32::from_le_bytes(xm[4..8].try_into().unwrap());
-        // #123: VIX2 = slot が hash **下位**ビットの旧 index。 clean_flag が立っていても
-        // slot 関数が違うので再利用できない (lookup が全部 miss する) → 必ず作り直す。
-        let legacy_index = !is_fresh && xm[0..4] == INDEX_MAGIC_V2;
-        let needs_rebuild = !is_fresh && (clean_flag != 1 || legacy_index);
+        let magic: [u8; 4] = xm[0..4].try_into().unwrap();
+        let usable = magic == INDEX_MAGIC && (is_fresh || clean_flag == CLEAN_GEN);
+        // readonly で全域の表 (VIX3) を graceful close のまま読む
+        let legacy_clean = readonly && magic == INDEX_MAGIC_V3 && (is_fresh || clean_flag == 1);
 
         let mut v = Self {
             data, offsets, index,
             shadow_index: None,
-            clean_on_disk: std::sync::atomic::AtomicBool::new(clean_flag == 1 && !legacy_index),
-            rebuilt_on_load: needs_rebuild,
+            legacy_gen: None,
+            grow_lock: std::sync::RwLock::new(()),
+            clean_on_disk: std::sync::atomic::AtomicBool::new(usable && !is_fresh),
+            rebuilt_on_load: false,
             count: AtomicU32::new(count),
             data_end: AtomicU32::new(data_end),
             max_entries, index_cap,
         };
-        // clean_flag == 1 なら前回 graceful close で「index と data は consistent」と
-        // 保証されているので rebuild skip。 それ以外 (= 初期 / crash 後 / 未対応の旧 DB) は
-        // 全部 rebuild。
-        // #77-H1: readonly open は共有 mmap を書き換えず heap の shadow へ。
-        if needs_rebuild {
-            if readonly {
-                // #127: count 比例の compact shadow を data/offsets (= ground truth)
-                // から構築する。 on-disk index は VIX2 / dirty のまま残す (readonly は
-                // 共有 mmap を書かない)。 構築元が data 直なので、 旧 shadow rebuild の
-                // 「破損 slot (vid >= max_entries) 読み飛ばし」 は不要 — count 側だけ
-                // 破損 header 対策で max_entries に clamp する (旧実装は clamp なしで
-                // read_value が offsets を溢れる余地があった、 安全側の強化)。
-                let count = v.count.load(Ordering::Relaxed).min(v.max_entries);
-                let mut shadow: Vec<(u64, u32)> = Vec::with_capacity(count as usize);
-                for id in 0..count {
-                    let value = read_value(&v.offsets, &v.data, id);
-                    shadow.push((fxhash(value), id));
-                }
-                // (hash, vid) 昇順 = 同 hash 内は vid 昇順。 lookup の線形走査が
-                // 最小 vid から当たるので、 旧 probe の dup 解決 (先着 vid) と一致。
-                shadow.sort_unstable();
-                v.shadow_index = Some(shadow);
-            } else {
-                // #327: 索引の全域を読むので見かけだけ伸ばす (穴は読んでも食わない。 書くページは
-                // rebuild_index が数える)。
-                v.index.ensure_committed_apparent(v.index.len())?;
-                // #123: legacy は旧 slot を消してから (消さないと no-clear rebuild (#92) の
-                // 上に新 slot で二重に載って占有率が最大 2 倍になる)。
-                if legacy_index {
-                    v.migrate_legacy_index();
-                }
-                v.rebuild_index()?;
-                if legacy_index {
-                    v.index.write_at(0, &INDEX_MAGIC);
-                    v.index.mark_dirty(0, 4);
-                }
+        if usable {
+            return Ok(v);
+        }
+        if legacy_clean {
+            v.legacy_gen = Some(Gen { base: 0, bits: index_cap.trailing_zeros() as u8, ver: 0 });
+            return Ok(v);
+        }
+        v.rebuilt_on_load = !is_fresh;
+        if readonly {
+            // #77-H1 / #127: 共有 mmap は書かない。 count 比例の compact shadow を data/offsets (= ground truth)
+            // から構築する。 count は破損 header 対策で max_entries に clamp する。
+            let count = v.count.load(Ordering::Relaxed).min(v.max_entries);
+            let mut shadow: Vec<(u64, u32)> = Vec::with_capacity(count as usize);
+            for id in 0..count {
+                let value = read_value(&v.offsets, &v.data, id);
+                shadow.push((fxhash(value), id));
             }
+            // (hash, vid) 昇順 = 同 hash 内は vid 昇順。 lookup の線形走査が
+            // 最小 vid から当たるので、 旧 probe の dup 解決 (先着 vid) と一致。
+            shadow.sort_unstable();
+            v.shadow_index = Some(shadow);
+        } else {
+            v.rebuild_from_data()?;
         }
         Ok(v)
     }
 
-    /// #123: VIX2 index (slot = hash 下位ビット) の entry を **正確に消す** (writer 専用)。
-    ///
-    /// 手順: ① 旧 probe (`home_slot_legacy`) で各 live id の slot を見つけ **tombstone
-    /// (flag = 3)** にして位置を記録する。 その場で 0 にすると後続 id の probe chain が
-    /// 途切れて取り残しが出るため、 chain を保つ中間状態を使う。 ② 記録した tombstone を
-    /// 0 に戻す。 この後 `rebuild_index` が新 slot 関数で再挿入する。
-    ///
-    /// index 全域の zero-fill は sparse ページを 1 枚残らず物理化する (#92 の回帰) ので
-    /// 採らない。 clear / insert とも O(count) で、 触るのは live slot が載るページのみ。
-    /// flag = 3 は open 時の単一スレッド区間だけに存在し、 ② で必ず消える。
-    fn migrate_legacy_index(&mut self) {
-        let count = self.count.load(Ordering::Relaxed);
-        if count == 0 {
-            return;
-        }
-        let index_cap = self.index_cap;
-        let max_entries = self.max_entries;
-        let mask = (index_cap - 1) as u64;
-        let Self { index, offsets, data, .. } = self;
-        let xm = index.as_mut_slice();
-
-        let mut tombstones: Vec<usize> = Vec::new();
-        for id in 0..count {
-            let value = read_value(offsets, data, id);
-            let h = fxhash(value);
-            let mut idx = home_slot_legacy(h, index_cap);
-            for _ in 0..index_cap as usize {
-                let off = INDEX_HEADER + idx * INDEX_SLOT_SIZE;
-                if xm[off] == 0 {
-                    break; // 旧 index に載っていない (torn write 等) — rebuild が入れ直す
-                }
-                let slot_hash = u64::from_le_bytes(xm[off + 1..off + 9].try_into().unwrap());
-                let vid = u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap());
-                // #92 と同じ predicate: vid >= max_entries の破損 slot は read_value が
-                // offsets を溢れるので触らない。
-                // flag == 3 は「前回の migration が crash で中断して残した tombstone」。
-                // 同じ entry なのでここで回収し、 ② で 0 に戻す (migration を idempotent に
-                // する。 index 全域の scan は sparse ページ全物理化 = #92 の回帰なので採らない)。
-                if (xm[off] == 1 || xm[off] == 3)
-                    && slot_hash == h
-                    && vid < max_entries
-                    && read_value(offsets, data, vid) == value
-                {
-                    xm[off] = 3;
-                    tombstones.push(off);
-                    break;
-                }
-                idx = ((idx as u64 + 1) & mask) as usize;
+    /// 今の表。 header から読む (別 process の書き手が伸ばしても追える)。
+    #[inline]
+    fn table(&self) -> Gen {
+        if let Some(g) = self.legacy_gen {
+            // 別 process の書き手が VIX4 に作り直すまでは全域の表
+            if self.index.as_atomic_u32(0).load(Ordering::Acquire) != u32::from_le_bytes(INDEX_MAGIC) {
+                return g;
             }
         }
-        for off in tombstones {
-            xm[off..off + INDEX_SLOT_SIZE].fill(0);
-        }
+        Gen::from_word(self.index.as_atomic_u64(GEN_OFF).load(Ordering::Acquire))
     }
 
-    /// ハッシュインデックスを data/offsets から再構築する (writer 専用、
-    /// 共有 mmap 上の index を in-place で書き直す)。
+    /// 書き手専用 (開いた時、 単一スレッド): data/offsets (= ground truth) から、 語数に合った表を領域の先頭に
+    /// 作り直して `VIX4` にする (#374)。 同じ値が 2 つの id にある時は小さい id が勝つ (旧 `plan_rebuild` と同じ)。
+    /// 語を一度に集めず、 表に入れながら重複を見る (語数に比例するヒープを取らない)。
     ///
-    /// #83: `index` を **排他借用** (`&mut self.index` → `as_mut_slice`) して可変
-    /// slice を得る。 open 時の単一スレッド実行なので排他が保証され、 `slice_mut(&self)`
-    /// のような aliasing 参照を作らない。 `offsets`/`data` は分割借用で不変参照する。
-    ///
-    /// #327: 読むだけで書く slot を決め、 書くページの空きを確かめてから書く。 空きが無ければ何も書かずに
-    /// エラー (旧: 伸ばせなくても書きに進み SIGBUS、 伸ばせても散った slot のページを数えず黙って消えうる)。
-    /// 索引は呼び側が見かけだけ全域 commit しておくこと。
-    fn rebuild_index(&mut self) -> std::io::Result<()> {
-        let count = self.count.load(Ordering::Relaxed);
-        let plan = Self::plan_rebuild(&self.offsets, &self.data, count, self.index_cap, self.max_entries, self.index.slice());
-        for &(off, _, _) in &plan {
-            self.index.ensure_committed_sparse(off + INDEX_SLOT_SIZE, INDEX_SLOT_SIZE)?;
-        }
-        let xm = self.index.as_mut_slice();
-        for (off, h, id) in plan {
-            xm[off] = 1;
-            xm[off + 1..off + 9].copy_from_slice(&h.to_le_bytes());
-            xm[off + 9..off + 13].copy_from_slice(&id.to_le_bytes());
-        }
+    /// #327: 書く表の領域の空きを先に確かめる。 空きが無ければ何も書かずにエラー。
+    fn rebuild_from_data(&mut self) -> std::io::Result<()> {
+        let count = self.count.load(Ordering::Relaxed).min(self.max_entries);
+        let bits = Self::bits_for(count as usize, self.index_cap);
+        let old = self.gen_on_disk();
+        let next = Gen { base: 0, bits, ver: old.ver.wrapping_add(2) & !1 };
+        let (offsets, data) = (&self.offsets, &self.data);
+        let ids = (0..count).map(|id| (fxhash(read_value(offsets, data, id)), id));
+        self.write_gen(Some(old), next, ids, true)?;
+        self.index.write_at(0, &INDEX_MAGIC);
+        self.index.mark_dirty(0, 4);
         Ok(())
     }
 
-    /// 索引 `xm` (読むだけ) に live entry (id 0..count) を載せ直すのに **書く slot** を決める
-    /// (`(slot の位置, hash, id)`、 #327)。 open 時の単一スレッド実行前提なので atomic は使わない。
+    /// header の今の表 (`VIX4` 以外なら、 版 0 の空の表)。
+    fn gen_on_disk(&self) -> Gen {
+        if self.index.slice()[0..4] == INDEX_MAGIC {
+            Gen::from_word(self.index.as_atomic_u64(GEN_OFF).load(Ordering::Acquire))
+        } else {
+            Gen { base: 0, bits: 0, ver: 0 }
+        }
+    }
+
+    /// `n` 語を半分以下の埋まり方で持つ表の大きさ (`FIRST_GEN_CAP` 以上、 領域以下、 2 の冪の指数)。
+    fn bits_for(n: usize, index_cap: u32) -> u8 {
+        let want = (n.saturating_mul(2).max(1) as u64).next_power_of_two().max(FIRST_GEN_CAP as u64);
+        want.min(index_cap as u64).trailing_zeros() as u8
+    }
+
+    /// 表 `next` を書いて切り替える (書き手、 `grow_lock` の write か開いた時)。 `next` の領域を 0 にしてから
+    /// `entries` (hash, vid) を入れ、 header を `next` に。 `stall` (= 今の表 `old` と領域が重なる) なら、 書く間は
+    /// header の版を奇数にして読み手を待たせる。 `dedup` なら、 同じ値が既に入っていれば入れない (先に来た vid が勝つ)。
     ///
-    /// #92 (#56 ③): **予約全域を zero-fill しない**。 旧実装は先頭で
-    /// `for b in &mut xm[INDEX_HEADER..] { *b = 0; }` と index_cap×13B を全ゼロ
-    /// 埋めしてから live entry を再挿入していた。 index region は fixed cluster で
-    /// mmap 済みだが **sparse** (物理未確保) なので、 この全域書き込みが sparse
-    /// ページを 1 枚残らず物理化 → live vocab 数と無関係に index_cap 比例の物理
-    /// commit (writer) / RAM commit (readonly shadow) を起こしていた。
-    ///
-    /// 代わりに **既存の on-disk index の上へ live entry (id 0..count) を再挿入
-    /// するだけ** にする (used-slot only touch)。 append-only vocab の count は
-    /// 単調なので:
-    /// - 通常の落ち方 (page cache 経由の drop / process::exit) では on-disk index は
-    ///   data と consistent。 → 各 entry は自分の slot で dup 一致し **書き込みゼロ**
-    ///   (触るのは live slot が載る数ページのみ)。
-    /// - torn write で index が count より遅れていた (slot 欠落) 場合は空 slot へ
-    ///   再挿入して self-heal。
-    /// - 旧実装は全域 zero-fill で破損/不整合 slot を全 scrub していた。 no-clear では
-    ///   既存 slot が残るので、 **vid >= max_entries の破損 slot** (実 insert は
-    ///   `vid < max_entries` を assert するので通常あり得ないが、 bit-rot 等) を
-    ///   `slot_hash == h` でも `get(vid)` を呼ばず読み飛ばす guard を入れる。 get が
-    ///   offsets region を溢れて OOB するのを防ぐ = 旧 zero-fill と同じ安全性を復元。
-    ///   lookup / index_insert も同じ predicate で一貫させる。
-    ///
-    /// probe は index_cap 回で打ち切る (旧実装は無条件 loop = 索引が満杯なら永久に回った)。
-    fn plan_rebuild(
-        offsets: &Region,
-        data: &Region,
-        count: u32,
-        index_cap: u32,
-        max_entries: u32,
-        xm: &[u8],
-    ) -> Vec<(usize, u64, u32)> {
-        let mut plan: Vec<(usize, u64, u32)> = Vec::new();
-        if count == 0 { return plan; }
-        // この rebuild で埋める slot (off → (hash, id))。 後の entry の probe はこれも埋まっているとして見る
-        let mut planned: std::collections::BTreeMap<usize, (u64, u32)> = std::collections::BTreeMap::new();
-        let mask = (index_cap - 1) as u64;
-        for id in 0..count {
-            let value = read_value(offsets, data, id);
-            let h = fxhash(value);
-            let mut idx = home_slot(h, index_cap); // #123
-            for _ in 0..index_cap as usize {
-                let off = INDEX_HEADER + idx * INDEX_SLOT_SIZE;
-                let slot = match planned.get(&off) {
-                    Some(&(ph, pid)) => Some((ph, pid)),
-                    None if xm[off] == 0 => None,
-                    None => Some((
-                        u64::from_le_bytes(xm[off + 1..off + 9].try_into().unwrap()),
-                        u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap()),
-                    )),
-                };
-                match slot {
-                    None => {
-                        planned.insert(off, (h, id));
-                        plan.push((off, h, id));
-                        break;
-                    }
-                    // #92: vid >= max_entries の破損 slot は read_value(vid) が offsets region を
-                    // 溢れて OOB するので dup 判定に使わず読み飛ばす (lookup / index_insert と
-                    // 同じ predicate = 破損 slot の扱いを 3 経路で一貫させる)。
-                    Some((slot_hash, vid)) if slot_hash == h && vid < max_entries && read_value(offsets, data, vid) == value => break, // 真の重複 (Leaf 二重 append 等)
-                    Some(_) => {}
+    /// 空きは先に確かめる (書く表の全域、 #327)。 足りなければ何も書かずに Err。
+    fn write_gen(
+        &self,
+        stall: Option<Gen>,
+        next: Gen,
+        entries: impl IntoIterator<Item = (u64, u32)>,
+        dedup: bool,
+    ) -> std::io::Result<()> {
+        let (start, end) = next.span();
+        self.index.ensure_committed_sparse(end, end - start)?;
+        let word = self.index.as_atomic_u64(GEN_OFF);
+        if let Some(old) = stall {
+            word.store(Gen { ver: old.ver | 1, ..old }.word(), Ordering::Release);
+        }
+        self.index.fill_at(start, end - start, 0);
+        let mask = (next.cap() - 1) as u64;
+        // slot の読みは毎回取り直す (書き込みと借用を重ねない、 #83)
+        let slot = |off: usize| -> (u8, u64, u32) {
+            let xm = self.index.slice();
+            (
+                xm[off],
+                u64::from_le_bytes(xm[off + 1..off + 9].try_into().unwrap()),
+                u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap()),
+            )
+        };
+        'entries: for (h, vid) in entries {
+            let mut idx = home_slot(h, next.cap());
+            for _ in 0..next.cap() as usize {
+                let off = next.slot_off(idx);
+                let (flag, slot_h, other) = slot(off);
+                if flag == 0 {
+                    self.index.write_at(off + 1, &h.to_le_bytes());
+                    self.index.write_at(off + 9, &vid.to_le_bytes());
+                    self.index.as_atomic_u8(off).store(1, Ordering::Release);
+                    continue 'entries;
+                }
+                if dedup && slot_h == h && self.get(other) == self.get(vid) {
+                    continue 'entries; // 同じ値 (先の vid が勝つ)
                 }
                 idx = ((idx as u64 + 1) & mask) as usize;
             }
+            // 表が満杯 (語数より大きい表を選ぶので来ない): 残りは入れない
+            break;
         }
-        plan
+        self.index.mark_dirty(start, end - start);
+        word.store(next.word(), Ordering::Release);
+        self.index.mark_dirty(GEN_OFF, 8);
+        Ok(())
+    }
+
+    /// 語数が今の表の半分を超えていたら、 表を伸ばす (書き手、 `try_insert` の後で)。 空き不足で伸ばせなければ
+    /// 何もしない (今の表で続け、 次の insert でまた試す)。
+    fn maybe_grow(&self) {
+        let needs = |g: Gen| g.cap() < self.index_cap && self.count.load(Ordering::Relaxed) as u64 * 2 > g.cap() as u64;
+        if self.legacy_gen.is_some() || self.shadow_index.is_some() || !needs(self.table()) {
+            return;
+        }
+        let _w = self.grow_lock.write().unwrap_or_else(|p| p.into_inner());
+        let g = self.table();
+        if !needs(g) {
+            return;
+        }
+        // 今の表の slot を集める (表は書き込みを止めているので確定している)
+        let mut entries = Vec::with_capacity(self.count.load(Ordering::Relaxed) as usize);
+        let xm = self.index.slice();
+        for i in 0..g.cap() as usize {
+            let off = g.slot_off(i);
+            if xm[off] == 1 {
+                let h = u64::from_le_bytes(xm[off + 1..off + 9].try_into().unwrap());
+                let vid = u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap());
+                entries.push((h, vid));
+            }
+        }
+        let bits = Self::bits_for(self.count.load(Ordering::Relaxed) as usize, self.index_cap).max(g.bits + 1);
+        let ver = g.ver.wrapping_add(2);
+        let after = Gen { base: g.base + g.cap(), bits, ver };
+        let _ = if after.base as u64 + after.cap() as u64 <= self.index_cap as u64 {
+            // 今の表の直後に置く: 今の表は書き換えないので、 読み手は止めない
+            self.write_gen(None, after, entries, false)
+        } else {
+            // 直後に置けない: 領域の先頭から全域の表に組み直す (今の表と重なるので読み手を待たせる)
+            let full = Gen { base: 0, bits: self.index_cap.trailing_zeros() as u8, ver };
+            self.write_gen(Some(g), full, entries, false)
+        };
     }
 
     /// 満杯なら **`u32::MAX` (予約 sentinel)** を返す (#59: panic しない)。
@@ -390,29 +455,42 @@ impl Vocabulary {
             }
             return None;
         }
-        let mask = (self.index_cap - 1) as u64;
-        let xm: &[u8] = self.index.slice();
         let h = fxhash(value);
-        let mut idx = home_slot(h, self.index_cap); // #123
-        // #59: index が 100% 埋まると 「空 slot に当たる」 終了条件が成立せず、
-        // 素の `loop` は **永久に回る** (= 満杯が hang になる。 embedded DB としては
-        // panic と同じくらい悪い)。 走査上限を index_cap 回にする — 全 slot を見て
-        // 見つからなければ不在。
-        for _ in 0..self.index_cap as usize {
-            let off = INDEX_HEADER + idx * INDEX_SLOT_SIZE;
+        loop {
+            let g = self.table();
+            if g.busy() {
+                // 全域の表へ組み直している (#374): 終わるまで待つ
+                std::thread::yield_now();
+                continue;
+            }
+            hook_after_table_read();
+            let found = self.lookup_in(g, h, value);
+            // 読む間に表が組み直された (重なる領域を書き換えた) なら読み直す
+            if self.table() == g {
+                return found;
+            }
+        }
+    }
+
+    /// 表 `g` を引く。
+    fn lookup_in(&self, g: Gen, h: u64, value: &[u8]) -> Option<u32> {
+        let mask = (g.cap() - 1) as u64;
+        let xm: &[u8] = self.index.slice();
+        let mut idx = home_slot(h, g.cap()); // #123
+        // #59: 表が 100% 埋まると 「空 slot に当たる」 終了条件が成立せず、 素の `loop` は **永久に回る**。
+        // 走査上限を表の slot 数にする — 全 slot を見て見つからなければ不在。
+        for _ in 0..g.cap() as usize {
+            let off = g.slot_off(idx);
             if xm[off] == 0 { return None; }
             let slot_hash = u64::from_le_bytes(xm[off + 1..off + 9].try_into().unwrap());
             if slot_hash == h {
                 let vid = u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap());
-                // #92: 実 insert は必ず vid < max_entries を assert する。 no-clear
-                // rebuild で残りうる **vid >= max_entries の破損 slot** は get(vid) が
-                // offsets region を溢れて OOB するので読み飛ばす。 max_entries は不変
-                // なので atomic 不要・並行 insert の valid slot を skip しない (race 無)。
+                // #92: 実 insert は必ず vid < max_entries を assert する。 残りうる **vid >= max_entries の
+                // 破損 slot** は get(vid) が offsets region を溢れて OOB するので読み飛ばす。
                 if vid < self.max_entries && self.get(vid) == value { return Some(vid); }
             }
             idx = ((idx as u64 + 1) & mask) as usize;
         }
-        // 全 slot 走査して空きも一致も無かった = index 満杯かつ不在。
         None
     }
 
@@ -435,9 +513,10 @@ impl Vocabulary {
     /// `insert` の理由付き版 (#316)。 `Full` は `vocab_max_entries` / 索引の天井 (この先も入らない)、
     /// `Space` はディスクの空き不足で伸ばせない (空けば入る)。
     pub fn try_insert(&self, value: &[u8]) -> Result<u32, VocabFail> {
-        // 索引の home slot のページを先に確保する。 空き不足で断られるのは大抵ここ (slot は索引全体に
-        // 散る) なので、 採番・data の書き込みの前に止めて orphan を作らない
-        let home = INDEX_HEADER + home_slot(fxhash(value), self.index_cap) * INDEX_SLOT_SIZE;
+        // 索引の home slot のページを先に確保する。 空き不足で断られるのは大抵ここなので、 採番・data の書き込みの
+        // 前に止めて orphan を作らない (表はこの後で伸びうるので、 確かめるのは今の表)
+        let g = self.table();
+        let home = g.slot_off(home_slot(fxhash(value), g.cap()));
         if self.index.ensure_committed_sparse(home + INDEX_SLOT_SIZE, INDEX_SLOT_SIZE).is_err() {
             return Err(VocabFail::Space);
         }
@@ -490,7 +569,7 @@ impl Vocabulary {
         self.data.as_atomic_u32(4).fetch_max(new_count, Ordering::AcqRel);
         self.data.as_atomic_u32(8).fetch_max(new_end, Ordering::AcqRel);
         self.data.mark_dirty(0, 12);
-        // #77-M1: flush() が clean=1 を書いた後の最初の insert で 0 に戻す。
+        // #77-M1: flush() が clean を書いた後の最初の insert で 0 に戻す。
         // これが無いと flush 後の write 中 crash で、 次 open が部分 writeback
         // された index を rebuild なしで信用してしまう。
         if self.clean_on_disk.swap(false, Ordering::AcqRel) {
@@ -507,6 +586,8 @@ impl Vocabulary {
         // 書いた分は orphan になる (満杯なら terminal、 空き不足は probe が home のページを
         // 越えた時だけ)。
         self.index_insert(value, id)?;
+        // #374: 語数が表の半分を超えたら伸ばす
+        self.maybe_grow();
         Ok(id)
     }
 
@@ -521,23 +602,28 @@ impl Vocabulary {
         false
     }
 
-    /// index に (hash, id) を登録する。 **index が満杯なら `Err(Full)`、 伸ばせなければ `Err(Space)`** (#59 / #316)。
+    /// index に (hash, id) を登録する。 **表が満杯なら `Err(Full)`、 伸ばせなければ `Err(Space)`** (#59 / #316)。
     ///
     /// 旧実装は空 slot が見つかるまで無条件に linear probe しており、 index が 100%
-    /// 埋まると永久に回った (= 満杯が hang)。 走査は index_cap 回で打ち切る。
+    /// 埋まると永久に回った (= 満杯が hang)。 走査は表の slot 数で打ち切る。
     /// 登録できなくても data/offsets 側の値は書けているので、 dedup が効かなくなる
     /// だけで read は壊れない (呼び出し側が fault として報告する)。
+    ///
+    /// #374: 表を伸ばしている間は待つ (`grow_lock` の read)。 全域の表でない表が満杯 (= 空き不足で伸ばせなかった)
+    /// なら `Space` (空けば伸びて入る)。
     fn index_insert(&self, value: &[u8], id: u32) -> Result<(), VocabFail> {
-        let mask = (self.index_cap - 1) as u64;
+        let _r = self.grow_lock.read().unwrap_or_else(|p| p.into_inner());
+        let g = self.table();
+        let mask = (g.cap() - 1) as u64;
         let h = fxhash(value);
-        let mut idx = home_slot(h, self.index_cap); // #123
+        let mut idx = home_slot(h, g.cap()); // #123
         let mut probes = 0usize;
         loop {
-            if probes >= self.index_cap as usize {
-                return Err(VocabFail::Full);
+            if probes >= g.cap() as usize {
+                return Err(if g.cap() >= self.index_cap { VocabFail::Full } else { VocabFail::Space });
             }
             probes += 1;
-            let off = INDEX_HEADER + idx * INDEX_SLOT_SIZE;
+            let off = g.slot_off(idx);
             // v10: index segment は書いた分だけ commit される (旧 fixed cluster の eager
             // commit ではない)。 slot の atomic CAS は write なので、 触る前に伸ばす。
             // 伸ばせない (#167) なら挿入失敗として返す (呼び側が満杯扱いする)。
@@ -591,6 +677,14 @@ impl Vocabulary {
 
     pub fn count(&self) -> u32 { self.count.load(Ordering::Relaxed) }
 
+    /// 今の表の slot 数 (観測用、 #374)。 語数の 2〜4 倍 (最小 `FIRST_GEN_CAP`、 最大は領域の全域)。
+    pub fn index_table_slots(&self) -> u32 {
+        if let Some(s) = &self.shadow_index {
+            return s.len() as u32;
+        }
+        self.table().cap()
+    }
+
     /// data 領域の append pointer (= 消費済み byte 数)。 単調増加・回収なし。
     /// #88 bench: Leaf を vocab に載せた場合の「回収されない footprint」計測用。
     pub fn data_footprint(&self) -> u32 { self.data_end.load(Ordering::Relaxed) }
@@ -601,18 +695,18 @@ impl Vocabulary {
         self.data.write_at(8, &self.data_end.load(Ordering::Relaxed).to_le_bytes());
     }
 
-    /// index と data の整合性マーカーを書く。
-    ///
-    /// `clean = true`: 直前に全 msync が完了 → 次回 open で rebuild skip 可
-    /// `clean = false`: insert が走った／crash 検知用 → 次回 open で rebuild 強制
-    ///
-    /// 自身では msync しない。 caller (Engine) が body_msync で永続化する責任を負う。
     /// #101: 観測用 — clean flag の現在値。 open 直後に true なら「前回 graceful close
     /// 済みで rebuild を skip した」。 insert が走ると false に戻る (#77-M1)。
     pub fn index_clean_on_disk(&self) -> bool {
         self.clean_on_disk.load(Ordering::Acquire)
     }
 
+    /// index と data の整合性マーカーを書く。
+    ///
+    /// `clean = true`: 直前に全 msync が完了 → 次回 open で rebuild skip 可 (`CLEAN_GEN` を書く、 #374)
+    /// `clean = false`: insert が走った／crash 検知用 → 次回 open で rebuild 強制
+    ///
+    /// 自身では msync しない。 caller (Engine) が body_msync で永続化する責任を負う。
     pub fn mark_index_clean(&self, clean: bool) {
         // data 領域は variable cluster (lazy commit) なので、 先頭 header を
         // 確実に commit してから書く。
@@ -622,7 +716,7 @@ impl Vocabulary {
         if self.data.ensure_committed(HEADER).is_err() {
             return;
         }
-        let val: u32 = if clean { 1 } else { 0 };
+        let val: u32 = if clean { CLEAN_GEN } else { 0 };
         self.data.write_at(CLEAN_FLAG_OFF, &val.to_le_bytes());
         self.clean_on_disk.store(clean, Ordering::Release); // #77-M1 キャッシュ追従
     }
@@ -631,6 +725,11 @@ impl Vocabulary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VIX2 (0.14 以前) の slot 選択 (hash 下位ビット)。 旧 index を再現する test のためだけに残す。
+    fn home_slot_legacy(h: u64, index_cap: u32) -> usize {
+        (h & (index_cap - 1) as u64) as usize
+    }
 
     struct Regions {
         data_ptr: *mut u8,
@@ -866,7 +965,7 @@ mod tests {
         let v2 = r.vocab_load(false);
         assert!(
             !v2.rebuilt_on_load,
-            "migrate 後も rebuild され続けている (VIX3 magic が永続化されていない)"
+            "migrate 後も rebuild され続けている (VIX4 magic が永続化されていない)"
         );
         for (k, id) in keys.iter().zip(&ids) {
             assert_eq!(v2.lookup(k.as_bytes()), Some(*id), "{k} が引けない");
@@ -941,7 +1040,7 @@ mod tests {
         assert_eq!(v.lookup("第999条".as_bytes()), None, "無い値が引けてしまう");
         assert_eq!(
             &r.index_bytes()[0..4], &INDEX_MAGIC,
-            "migration 後の index magic が VIX3 になっていない (次 open で毎回 rebuild する)"
+            "migration 後の index magic が VIX4 になっていない (次 open で毎回 rebuild する)"
         );
         assert_eq!(
             r.occupied_slots(cap), keys.len(),
@@ -985,7 +1084,7 @@ mod tests {
             let dm = unsafe { std::slice::from_raw_parts(r.data_ptr, r.data_len) };
             u32::from_le_bytes(dm[CLEAN_FLAG_OFF..CLEAN_FLAG_OFF + 4].try_into().unwrap())
         };
-        assert_eq!(flag(&r), 1, "flush 直後は clean=1");
+        assert_eq!(flag(&r), CLEAN_GEN, "flush 直後は clean (#374 で 2)");
         w.get_or_insert(b"second");
         assert_eq!(flag(&r), 0, "flush 後の insert で clean=0 に戻るはず (#77-M1)");
     }
@@ -1107,9 +1206,10 @@ mod tests {
         }
     }
 
-    /// #92: no-clear rebuild で残りうる **vid >= max_entries の破損 slot** (bit-rot 等)
-    /// でも rebuild / lookup / insert が offsets region を溢れて OOB せず正しく振る舞う
-    /// こと。 破損 slot の hash がクエリと衝突する配置にして guard 経路を必ず踏ませる。
+    /// #92: **vid >= max_entries の破損 slot** (bit-rot 等) があっても rebuild / lookup / insert が offsets region を
+    /// 溢れて OOB せず正しく振る舞うこと。 破損 slot の hash がクエリと衝突する配置にして guard 経路を必ず踏ませる。
+    /// #374 から dirty open の rebuild は表を 0 から作り直すので破損 slot は消える。 lookup / insert の guard は、
+    /// 開いた後の表に植えた破損 slot で踏む。
     #[test]
     fn dirty_rebuild_tolerates_corrupt_slot_no_oob() {
         let max_entries = 1024u32;
@@ -1129,6 +1229,9 @@ mod tests {
         drop(w);
 
         let w2 = r.vocab_load(false); // rebuild は破損 slot で OOB してはならない
+        assert_eq!(w2.lookup(b"probe-me"), None, "rebuild 後に破損 slot が誤 hit");
+        // 開いた後の表に、 もう一度破損 slot を植える (lookup / insert の guard を踏ませる)
+        r.plant_slot(index_cap, b"probe-me", 9999);
         // probe-me は未挿入 → 破損 slot を skip して None (誤 hit / OOB しない)。
         assert_eq!(w2.lookup(b"probe-me"), None, "破損 slot が誤 hit / OOB");
         for i in 0..10 {
@@ -1173,6 +1276,303 @@ mod tests {
             assert!(got.is_some(), "並行 insert 後に {v} が lost (dedup race)");
             assert_eq!(w.get(got.unwrap()), v.as_bytes(), "{v} の vid 実体不一致");
         }
+    }
+
+    impl Regions {
+        fn set_clean_flag(&self, v: u32) {
+            let dm = unsafe { std::slice::from_raw_parts_mut(self.data_ptr, self.data_len) };
+            dm[CLEAN_FLAG_OFF..CLEAN_FLAG_OFF + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        /// 0.14 〜 0.28.5 (VIX3) が書いた index を再現する — 全ゼロ化して VIX3 magic + 全域の表 (今と同じ slot
+        /// 選択) で live entry を植える。
+        fn plant_full_index(&self, index_cap: u32, entries: &[(&[u8], u32)]) {
+            let xm = unsafe { std::slice::from_raw_parts_mut(self.index_ptr, self.index_len) };
+            xm.fill(0);
+            xm[0..4].copy_from_slice(&INDEX_MAGIC_V3);
+            xm[4..8].copy_from_slice(&index_cap.to_le_bytes());
+            for (value, vid) in entries {
+                let h = fxhash(value);
+                let mut idx = home_slot(h, index_cap);
+                loop {
+                    let off = INDEX_HEADER + idx * INDEX_SLOT_SIZE;
+                    if xm[off] == 0 {
+                        xm[off] = 1;
+                        xm[off + 1..off + 9].copy_from_slice(&h.to_le_bytes());
+                        xm[off + 9..off + 13].copy_from_slice(&vid.to_le_bytes());
+                        break;
+                    }
+                    idx = (idx + 1) & (index_cap as usize - 1);
+                }
+            }
+        }
+        /// 今の表 (`v.table()`) の中の使用中 slot の数。
+        fn table_occupied(&self, v: &Vocabulary) -> usize {
+            let g = v.table();
+            let xm = unsafe { std::slice::from_raw_parts(self.index_ptr, self.index_len) };
+            (0..g.cap() as usize).filter(|&i| xm[g.slot_off(i)] != 0).count()
+        }
+        /// index 領域の中で 0 でない最後の byte の位置 (書いた所の上限)。
+        fn last_written(&self) -> usize {
+            let xm = unsafe { std::slice::from_raw_parts(self.index_ptr, self.index_len) };
+            xm.iter().rposition(|&b| b != 0).unwrap_or(0)
+        }
+    }
+
+    /// #374: 表は語数に合わせて伸びる (語数の 2〜4 倍、 最小 `FIRST_GEN_CAP`)。 書くのは領域の先頭の、 語数に比例する
+    /// 範囲だけ — 大きな領域 (entity cap の大きい DB) でも、 語が少なければ触るページは少ない。
+    #[test]
+    fn issue374_table_grows_with_the_number_of_values() {
+        let cap = 1u32 << 20; // 13 MB の領域
+        let r = make_regions(cap, cap, 1 << 20);
+        let w = r.vocab_init(cap, cap);
+        assert_eq!(w.index_table_slots(), FIRST_GEN_CAP);
+        let n = 20_000u32;
+        let ids: Vec<u32> = (0..n).map(|i| w.get_or_insert(format!("value-{i}").as_bytes())).collect();
+        let slots = w.index_table_slots();
+        assert!(slots >= 2 * n && slots <= 4 * n, "表の大きさ {slots} が語数 {n} の 2〜4 倍でない");
+        // 書いたのは今までの表 (倍々なので合わせて今の表の 2 倍まで) の範囲だけ
+        let limit = INDEX_HEADER + 2 * slots as usize * INDEX_SLOT_SIZE;
+        assert!(r.last_written() < limit, "表の外 ({} > {limit}) を書いた", r.last_written());
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(w.lookup(format!("value-{i}").as_bytes()), Some(id), "value-{i}");
+        }
+        assert_eq!(w.lookup(b"absent"), None);
+        assert_eq!(w.get_or_insert(b"value-7"), ids[7], "伸ばした後の重複検査");
+    }
+
+    /// #374: 今の表の直後に倍の表を置けなくなったら、 領域の先頭から全域の表に組み直す。 辞書の上限 (`max_entries`)
+    /// まで入り、 その先は `Full` (昔と同じ)。
+    #[test]
+    fn issue374_table_falls_back_to_the_whole_region_and_keeps_the_capacity() {
+        let cap = 4096u32; // 表は 1024 → 2048 (1024 の直後) → 全域 4096 (直後に置けない)
+        let r = make_regions(cap, cap, 1 << 20);
+        let w = r.vocab_init(cap, cap);
+        let mut seen = vec![w.index_table_slots()];
+        let mut ids = Vec::new();
+        for i in 0..cap {
+            ids.push(w.try_insert(format!("k{i}").as_bytes()).unwrap_or_else(|e| panic!("k{i}: {e:?}")));
+            if *seen.last().unwrap() != w.index_table_slots() {
+                seen.push(w.index_table_slots());
+            }
+        }
+        assert_eq!(seen, vec![1024, 2048, 4096], "表の大きさの移り方");
+        assert_eq!(w.table(), Gen { base: 0, bits: 12, ver: w.table().ver }, "全域の表は領域の先頭から");
+        assert_eq!(w.try_insert(b"one-more"), Err(VocabFail::Full), "上限の先は Full");
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(w.lookup(format!("k{i}").as_bytes()), Some(id), "k{i}");
+        }
+    }
+
+    /// #374: graceful close (clean) の後は表をそのまま使う (作り直さない)。 crash 後 (dirty) は data から語数に
+    /// 合った表を作り直す。 どちらも全部引ける。
+    #[test]
+    fn issue374_reopen_keeps_or_rebuilds_the_table() {
+        let cap = 1u32 << 16;
+        let r = make_regions(cap, cap, 1 << 20);
+        let ids: Vec<u32> = {
+            let w = r.vocab_init(cap, cap);
+            let ids = (0..3000).map(|i| w.get_or_insert(format!("x{i}").as_bytes())).collect();
+            // 同じ値を別の id で (Leaf の書き込みは重複を見ない)。 作り直しでは先の id だけが表に載る
+            for i in 0..50 {
+                w.insert(format!("x{i}").as_bytes());
+            }
+            w.sync();
+            w.mark_index_clean(true);
+            ids
+        };
+        let check = |v: &Vocabulary| {
+            for (i, &id) in ids.iter().enumerate() {
+                assert_eq!(v.lookup(format!("x{i}").as_bytes()), Some(id), "x{i}");
+            }
+        };
+        let clean = r.vocab_load(false);
+        assert!(!clean.rebuilt_on_load, "clean なのに作り直した");
+        let kept = clean.table();
+        assert!(kept.base > 0, "前提: 伸ばした表 (先頭でない) を持っている");
+        check(&clean);
+        drop(clean);
+        r.set_clean_flag(0); // crash 相当
+        let dirty = r.vocab_load(false);
+        assert!(dirty.rebuilt_on_load);
+        assert_eq!(dirty.table().base, 0, "作り直す表は領域の先頭から");
+        assert!(dirty.index_table_slots() <= 4 * 3000);
+        assert_eq!(r.table_occupied(&dirty), 3000, "同じ値を 2 度載せた");
+        check(&dirty);
+        assert_eq!(dirty.get_or_insert(b"x5"), ids[5]);
+        assert_eq!(dirty.get_or_insert(b"new"), 3050);
+    }
+
+    /// #374: 旧 binary (全域の表しか知らない) が閉じた `VIX4` の DB (clean flag 1) は、 表が全域の形になって
+    /// いるかもしれないので作り直す。 clean flag 1 を 「clean」 と信じると、 旧 binary が入れた語を見落とし、
+    /// 同じ値に別の id を配る。
+    #[test]
+    fn issue374_vix4_closed_by_an_old_binary_is_rebuilt() {
+        let cap = 1u32 << 12;
+        let r = make_regions(cap, cap, 1 << 20);
+        let ids: Vec<u32> = {
+            let w = r.vocab_init(cap, cap);
+            let ids = (0..100).map(|i| w.get_or_insert(format!("y{i}").as_bytes())).collect();
+            w.sync();
+            ids
+        };
+        // 旧 binary が全域の表に作り直して閉じた状態: magic は VIX4 のまま、 表は全域、 clean flag 1
+        let entries: Vec<(String, u32)> = ids.iter().enumerate().map(|(i, &id)| (format!("y{i}"), id)).collect();
+        let refs: Vec<(&[u8], u32)> = entries.iter().map(|(k, id)| (k.as_bytes(), *id)).collect();
+        r.plant_full_index(cap, &refs);
+        let xm = unsafe { std::slice::from_raw_parts_mut(r.index_ptr, r.index_len) };
+        xm[0..4].copy_from_slice(&INDEX_MAGIC);
+        r.set_clean_flag(1);
+        let v = r.vocab_load(false);
+        assert!(v.rebuilt_on_load, "旧 binary の clean (1) を信じた");
+        for (k, id) in &entries {
+            assert_eq!(v.lookup(k.as_bytes()), Some(*id), "{k}");
+        }
+        // readonly でも同じ (shadow で引く)
+        let ro = r.vocab_load(true);
+        assert_eq!(ro.lookup(b"y42"), Some(ids[42]));
+    }
+
+    /// #374: `VIX3` (全域の表、 0.14 〜 0.28.5) の DB。 readonly はそのまま全域の表として読み、 書き手が開くと
+    /// 語数に合った表に作り直して `VIX4` にする。 先に開いていた readonly は、 magic が変わったら新しい表を読む。
+    #[test]
+    fn issue374_vix3_index_is_converted_by_the_writer() {
+        let cap = 1u32 << 16;
+        let r = make_regions(cap, cap, 1 << 20);
+        let ids: Vec<u32> = {
+            let w = r.vocab_init(cap, cap);
+            let ids = (0..500).map(|i| w.get_or_insert(format!("z{i}").as_bytes())).collect();
+            w.sync();
+            ids
+        };
+        let entries: Vec<(String, u32)> = ids.iter().enumerate().map(|(i, &id)| (format!("z{i}"), id)).collect();
+        let refs: Vec<(&[u8], u32)> = entries.iter().map(|(k, id)| (k.as_bytes(), *id)).collect();
+        r.plant_full_index(cap, &refs);
+        r.set_clean_flag(1); // 0.28.5 の graceful close
+
+        let ro = r.vocab_load(true);
+        assert!(!ro.rebuilt_on_load && ro.shadow_index.is_none(), "clean な VIX3 は readonly がそのまま読む");
+        assert_eq!(ro.lookup(b"z7"), Some(ids[7]));
+
+        let w = r.vocab_load(false);
+        assert!(w.rebuilt_on_load, "書き手は VIX3 を作り直す");
+        assert_eq!(&r.index_bytes()[0..4], &INDEX_MAGIC);
+        assert!(w.index_table_slots() <= 4 * 500, "作り直した表が語数に合っていない: {}", w.index_table_slots());
+        assert_eq!(r.table_occupied(&w), 500, "作り直した表に旧形式の slot が残っている");
+        for (k, id) in &entries {
+            assert_eq!(w.lookup(k.as_bytes()), Some(*id), "{k}");
+            assert_eq!(ro.lookup(k.as_bytes()), Some(*id), "先に開いた readonly が {k} を引けない");
+        }
+        let fresh = w.get_or_insert(b"after-convert");
+        assert_eq!(ro.lookup(b"after-convert"), Some(fresh), "readonly が新しい表を読んでいない");
+    }
+
+    /// #374: 表を伸ばしている最中 (直後に置く / 全域へ組み直す) も、 読み手は入れ終えた語を必ず見つける。
+    /// 書き手 1 本が語を入れ続け、 読み手 3 本が入れ終えた語を引き続ける。
+    #[test]
+    fn issue374_readers_never_miss_values_while_the_table_grows() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU32;
+        let cap = 1u32 << 14; // 1024 → … → 8192 (直後) → 16384 (全域へ組み直す)
+        let r = make_regions(cap, cap, 1 << 20);
+        let w = Arc::new(r.vocab_init(cap, cap));
+        let done = Arc::new(AtomicU32::new(0));
+        let n = cap - 100;
+        let readers: Vec<_> = (0..3u32)
+            .map(|k| {
+                let (w, done) = (w.clone(), done.clone());
+                std::thread::spawn(move || {
+                    let mut reads = 0u64;
+                    loop {
+                        let d = done.load(Ordering::Acquire);
+                        if d >= n {
+                            return reads;
+                        }
+                        if d == 0 {
+                            std::hint::spin_loop();
+                            continue;
+                        }
+                        let i = (reads as u32).wrapping_mul(2_654_435_761).wrapping_add(k) % d;
+                        assert_eq!(w.lookup(format!("g{i}").as_bytes()), Some(i), "入れ終えた g{i} を見落とした");
+                        reads += 1;
+                    }
+                })
+            })
+            .collect();
+        for i in 0..n {
+            assert_eq!(w.get_or_insert(format!("g{i}").as_bytes()), i);
+            done.store(i + 1, Ordering::Release);
+        }
+        let reads: u64 = readers.into_iter().map(|h| h.join().unwrap()).sum();
+        assert!(reads > 0);
+        assert_eq!(w.index_table_slots(), cap, "前提: 全域の表まで伸びた");
+        for i in (0..n).step_by(37) {
+            assert_eq!(w.lookup(format!("g{i}").as_bytes()), Some(i));
+        }
+    }
+
+    /// #374: 読み手が表を読んだ直後に、 書き手が全域の表へ組み直す (今の表と重なる領域を書き換える)。 読み手は
+    /// 引き終えた後で表が変わっていないかを見て、 変わっていたら読み直すので、 見落とさない。
+    #[test]
+    fn issue374_reader_rereads_when_the_table_is_rebuilt_under_it() {
+        use std::sync::Arc;
+        let cap = 4096u32; // 1024@0 → 2048@1024 → (語 1025 個目で) 全域 4096@0
+        let r = make_regions(cap, cap, 1 << 20);
+        let w = Arc::new(r.vocab_init(cap, cap));
+        let ids: Vec<u32> = (0..1024).map(|i| w.get_or_insert(format!("q{i}").as_bytes())).collect();
+        assert_eq!((w.table().base, w.index_table_slots()), (1024, 2048), "前提: 直後に置いた表");
+        let writer = w.clone();
+        AFTER_TABLE_READ.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                writer.get_or_insert(b"q-trigger");
+                assert_eq!(writer.index_table_slots(), cap, "前提: この insert で全域へ組み直した");
+            }))
+        });
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(w.lookup(format!("q{i}").as_bytes()), Some(id), "組み直しの最中に読んだ q{i} を見落とした");
+        }
+    }
+
+    /// #374: 書き手が多数でも、 表を伸ばす間に入れた語は失われず、 同じ値に 2 つの id を返さない
+    /// (`grow_lock` で書き込みを止め、 切り替えた後の表に入れる)。
+    ///
+    /// 同じ値を同時に入れると、 負けた側の番号は使われずに残る (data にも残る)。 この書き方 (8 thread が 143 歩ずつ
+    /// ずれて同じ値を追う) では値の 4〜5 倍の番号を使う — 0.28.5 でも同じなので、 番号の上限は広く取る。
+    #[test]
+    fn issue374_concurrent_writers_across_growth() {
+        use std::sync::Arc;
+        let cap = 1u32 << 17;
+        let r = make_regions(cap, cap, 1 << 22);
+        let w = Arc::new(r.vocab_init(cap, cap));
+        let distinct = 12_000usize;
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let w = w.clone();
+                std::thread::spawn(move || {
+                    (0..distinct)
+                        .map(|i| {
+                            let k = (i * 7 + t * 1_001) % distinct;
+                            let got = w.try_get_or_insert(format!("c{k}").as_bytes());
+                            let id = got.unwrap_or_else(|e| panic!("c{k}: {e:?} (count {}, table {})", w.count(), w.index_table_slots()));
+                            (k, id)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut first: Vec<Option<u32>> = vec![None; distinct];
+        for h in threads {
+            for (k, id) in h.join().unwrap() {
+                assert!(id < cap, "c{k}: 入らなかった");
+                match first[k] {
+                    None => first[k] = Some(id),
+                    Some(prev) => assert_eq!(prev, id, "c{k} に 2 つの id を配った"),
+                }
+            }
+        }
+        for (k, id) in first.iter().enumerate() {
+            assert_eq!(w.lookup(format!("c{k}").as_bytes()), *id, "c{k}");
+        }
+        assert!(w.index_table_slots() >= 2 * distinct as u32, "前提: 表が伸びている");
     }
 }
 

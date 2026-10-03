@@ -1897,6 +1897,10 @@ pub struct GrowableOptions {
     ///
     /// 値は内部で `next_power_of_two` に丸められ、 header に焼かれる (= 既存 DB は
     /// rebuild しないと変わらない、 `max_himos` と同じ性質)。
+    ///
+    /// #374 から、 索引のハッシュ表は語数に合わせて伸びる (語数の 2〜4 倍の slot、 予約した領域の中で)。 予約は
+    /// sparse なので、 ここで決めるのは辞書の上限 (と仮想の予約の大きさ) で、 触るページの量ではない。 上の例の
+    /// 「索引が 3.49 GB のページに散る」 は 0.28.5 までの話。
     pub vocab_max_entries: Option<u32>,
     /// v10 Phase 3: entity の reservation (= `grow_entity_cap` の上限)。 `None` は既定
     /// (macOS / Linux / Android: max(max_entities, 2^28)、 Windows と iOS / tvOS / watchOS /
