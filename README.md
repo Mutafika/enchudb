@@ -409,6 +409,18 @@ On Windows the reservation is not widened (segment files are sized to their rese
 there, and a wider one would stop older binaries from opening the DB), so `grow_vocab`
 only has the 64 KiB rounding slack to work with.
 
+To have the dictionary give values back, enable reclaiming: `GrowableOptions { vocab_reclaim:
+true, .. }` at create, or `Engine::enable_vocab_reclaim()` on an existing DB (takes effect on
+the next open; the file version becomes 12, which older binaries refuse). A value whose last
+referencing cell is gone frees its slot, and slots are reused oldest-freed-first. Value ids
+carry a 2-bit generation, so an id kept from before the reuse (an app-cached `vocab_id`, say)
+resolves to nothing instead of to the new value — **an id is only valid while its value is
+alive**. After opening, existing cells are counted in the background of writes (or at once
+with `Engine::build_vocab_refs()`); nothing is reused until that finishes. Subscriptions hold
+the ids of the texts they match, so reuse never redirects them. The value bytes themselves are
+not reclaimed yet — the data area still grows with every value inserted, so watch
+`vocab_usage().data_bytes` and use `grow_vocab` there.
+
 A non-zero count means writes were dropped on purpose. Watch it the way you would watch
 a queue depth: the DB stays readable and usable, but it is telling you it could not
 accept everything.
