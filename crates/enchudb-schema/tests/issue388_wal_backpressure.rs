@@ -27,9 +27,18 @@ const WAL: usize = 4 << 20;
 
 /// issue の再現 (WAL を 4 MiB に縮めた): 1 thread で 1 行入れては、 生きている行が 100 を超えた分を古い順に消す。
 /// WAL の容量の何倍も書いても、 落ちた record も打てなかった Commit も無い。
+///
+/// consumer が満杯の瞬間に畳みに入る形 (0.29.2 で consumer 自身の Commit が落ちていた) は確率的にしか踏めないので
+/// 5 回繰り返す (1 回あたりの検出率は約 1/3)。
 #[test]
 fn single_writer_insert_delete_never_drops_wal_records() {
-    let path = tmp("burst");
+    for round in 0..5 {
+        single_writer_round(round);
+    }
+}
+
+fn single_writer_round(round: u32) {
+    let path = tmp(&format!("burst{round}"));
     let rows = 60_000u64;
     let live_ids: Vec<String> = {
         let mut b = Database::create_growable_with_capacity(&path, 1_000_000).unwrap();
@@ -80,7 +89,13 @@ fn single_writer_insert_delete_never_drops_wal_records() {
 /// consumer が先に畳む)。
 #[test]
 fn large_rows_wait_instead_of_dropping() {
-    let path = tmp("large");
+    for round in 0..5 {
+        large_rows_round(round);
+    }
+}
+
+fn large_rows_round(round: u32) {
+    let path = tmp(&format!("large{round}"));
     let payload = "x".repeat(64 << 10);
     {
         let mut b = Database::create_growable_with_capacity(&path, 100_000).unwrap();
@@ -133,9 +148,18 @@ fn writers_do_not_stall_when_the_wal_cannot_be_folded() {
 
 /// 1 つの record が ring の残り (1/4 を切る前に畳む目安) より大きい時: consumer は自分の append が満杯にぶつかった
 /// その場で畳んで書き直す (待つ相手がいない — 自分が畳む役)。
+///
+/// consumer が空いている時の試みを 「畳めなかった」 と覚えると、 待っている書き手が諦めて落ちる (#391 で見つけた)。
+/// その形は確率的にしか踏めないので 5 回繰り返す。
 #[test]
 fn a_record_larger_than_the_headroom_is_not_dropped() {
-    let path = tmp("huge");
+    for round in 0..5 {
+        huge_round(round);
+    }
+}
+
+fn huge_round(round: u32) {
+    let path = tmp(&format!("huge{round}"));
     let payload = "y".repeat(1_200 << 10);
     {
         let mut b = Database::create_growable_with_capacity(&path, 100_000).unwrap();

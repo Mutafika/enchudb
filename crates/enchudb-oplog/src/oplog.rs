@@ -719,6 +719,8 @@ pub struct OpLog {
     /// #388: append が満杯にぶつかった時に呼ぶ待ち手 (engine が consumer に畳ませて、 空くまで待つ)。 true を返したら
     /// 1 回だけ書き直す。 None なら今までどおりすぐ落とす。
     room_waiter: std::sync::RwLock<Option<RoomWaiter>>,
+    /// #391: append が載った後に呼ぶ (engine が consumer を起こす — 書き出しの tick を回すため)。
+    append_hook: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 /// #388: [`OpLog::set_room_waiter`] の待ち手。 引数は載せたい byte 数、 戻り値は空いたか。 append_lock を持たずに呼ぶ。
@@ -794,6 +796,18 @@ impl OpLog {
         }
     }
 
+    /// #391: append が載るたびに呼ぶ処理を置く (1 回だけ、 2 回目以降は無視)。 append_lock を持たずに呼ぶ。
+    pub fn set_append_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.append_hook.set(hook);
+    }
+
+    #[inline]
+    fn appended(&self) {
+        if let Some(h) = self.append_hook.get() {
+            h();
+        }
+    }
+
     /// #388: 満杯の待ち手を置く (None で外す)。
     pub fn set_room_waiter(&self, waiter: Option<RoomWaiter>) {
         *self.room_waiter.write().unwrap_or_else(|p| p.into_inner()) = waiter;
@@ -847,6 +861,7 @@ impl OpLog {
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
             room_waiter: std::sync::RwLock::new(None),
+            append_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
         })
     }
@@ -915,6 +930,7 @@ impl OpLog {
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
             room_waiter: std::sync::RwLock::new(None),
+            append_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
         })
     }
@@ -1077,6 +1093,9 @@ impl OpLog {
         if r.is_err() && self.wait_for_room(total as u64) {
             r = self.append_many_inner(records, &sizes, total, hlcs);
         }
+        if r.is_ok() {
+            self.appended();
+        }
         // #57: 自分の write の束 (Commit しか無い束は record を運ばない)。 HLC は事前採番の max
         if r.is_err() {
             let carried = records.iter().enumerate().filter(|(_, x)| !matches!(x.as_op(), Op::Commit));
@@ -1232,6 +1251,9 @@ impl OpLog {
         if r.is_err() && self.wait_for_room(record_size as u64) {
             r = self.append_verbatim_checked(sb, signature, pubkey_fp, record_size);
         }
+        if r.is_ok() {
+            self.appended();
+        }
         // #57: 検証を通った record が載らなかった = 中継の配布履歴に穴 (壊れた bytes の拒否は数えない)
         if r.is_err() {
             let hlc = Hlc {
@@ -1324,6 +1346,9 @@ impl OpLog {
         let mut r = self.append_inner_raw(op.clone(), payload_size, record_size, relay, hlc_override);
         if r.is_err() && self.wait_for_room(record_size as u64) {
             r = self.append_inner_raw(op, payload_size, record_size, relay, hlc_override);
+        }
+        if r.is_ok() {
+            self.appended();
         }
         r.map_err(|e| {
             // #57: 落ちた record の author と HLC を覚える。 Commit は record を運ばない (落ちても group が
@@ -1947,6 +1972,7 @@ impl OpLog {
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
             room_waiter: std::sync::RwLock::new(None),
+            append_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
         }
     }
