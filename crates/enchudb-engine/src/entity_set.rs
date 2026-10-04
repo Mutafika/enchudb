@@ -425,6 +425,28 @@ impl EntitySet {
         }
     }
 
+    /// 生きている eid を昇順に `f` へ渡す (#385)。 bitset を 64 個単位で読み、 空の word は丸ごと飛ばす
+    /// (払い出した eid の最大値が大きくても、 行の数 + 最大値 / 64 で済む)。
+    pub fn for_each_live(&self, mut f: impl FnMut(u32)) {
+        let mm = self.region.slice();
+        let next = self.next_eid().min(self.max_entities());
+        let base = self.bitset_offset;
+        let mut word_start = 0u32;
+        while word_start < next {
+            let off = base + (word_start / 8) as usize;
+            let mut w = u64::from_le_bytes(mm[off..off + 8].try_into().unwrap());
+            while w != 0 {
+                let eid = word_start + w.trailing_zeros();
+                if eid >= next {
+                    break;
+                }
+                f(eid);
+                w &= w - 1;
+            }
+            word_start += 64;
+        }
+    }
+
     pub fn iter(&self) -> Vec<u32> {
         let mm = self.region.slice();
         let next = self.next_eid();

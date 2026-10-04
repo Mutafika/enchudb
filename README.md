@@ -415,8 +415,10 @@ the next open; the file version becomes 12, which older binaries refuse). A valu
 referencing cell is gone frees its slot, and slots are reused oldest-freed-first. Value ids
 carry a 2-bit generation, so an id kept from before the reuse (an app-cached `vocab_id`, say)
 resolves to nothing instead of to the new value — **an id is only valid while its value is
-alive**. After opening, existing cells are counted in the background of writes (or at once
-with `Engine::build_vocab_refs()`); nothing is reused until that finishes. Subscriptions hold
+alive**. Reference counts live in `vocab.refs.seg` inside the DB directory and are reused as-is
+after a clean close, so opening costs nothing extra. After a crash (or when the file is missing,
+or an older 0.29.0 binary wrote to the DB) they are recounted at open from the live rows, in time
+proportional to rows × dictionary columns (empty eid slots are skipped 64 at a time). Subscriptions hold
 the ids of the texts they match, so reuse never redirects them. The value bytes themselves are
 not reclaimed yet — the data area still grows with every value inserted, so watch
 `vocab_usage().data_bytes` and use `grow_vocab` there.
