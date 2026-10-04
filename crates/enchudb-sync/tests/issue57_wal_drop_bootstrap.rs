@@ -185,10 +185,15 @@ fn a_dropped_relayed_record_raises_its_authors_floor_to_its_own_hlc() {
         eng.oplog().unwrap().mint_hlc();
     }
 
-    // WAL を溢れさせてから中継する
+    // WAL を溢れさせてから中継する。 #388: 満杯の書き手は consumer が畳むのを待つので、 待ち手を外し、 fold の lock を
+    // 握って畳ませない (畳めない WAL = 落ちる経路を作る)
     let wal = eng.oplog().unwrap().clone();
-    while wal.append(enchudb_oplog::oplog::Op::Tie { eid: 1, himo_id: 0, value: 1 }).is_ok() {}
-    assert!(wal.append_relayed_verbatim(&rec.signed_bytes, &rec.signature, &rec.pubkey_fp).is_err(), "前提: 満杯");
+    wal.set_room_waiter(None);
+    {
+        let _no_fold = eng.transfer_lock_for_fold();
+        while wal.append(enchudb_oplog::oplog::Op::Tie { eid: 1, himo_id: 0, value: 1 }).is_ok() {}
+        assert!(wal.append_relayed_verbatim(&rec.signed_bytes, &rec.signature, &rec.pubkey_fp).is_err(), "前提: 満杯");
+    }
     wait_floor_bump(&eng, 0);
     let floors = eng.sync_reclaimed_floors().unwrap();
     let f7 = floors.iter().find(|(a, _)| *a == 7).map(|(_, h)| *h);

@@ -374,6 +374,11 @@ pub enum OwnedOp {
 }
 
 impl OwnedOp {
+    /// #388: WAL に載せた時の record の byte 数 (header 込み)。
+    pub fn record_size(&self) -> usize {
+        REC_HEADER_SIZE + self.as_op().payload_size()
+    }
+
     /// borrow 版 `Op` への変換 (append 用)。
     pub fn as_op(&self) -> Op<'_> {
         match self {
@@ -711,7 +716,13 @@ pub struct OpLog {
     /// (Commit は除く)。 engine が [`OpLog::take_dropped`] で取り出し、 その author の配布履歴に穴が
     /// あったことを puller に知らせる (history floor を上げて bootstrap に回す)。
     dropped: std::sync::Mutex<Vec<(PeerId, Hlc)>>,
+    /// #388: append が満杯にぶつかった時に呼ぶ待ち手 (engine が consumer に畳ませて、 空くまで待つ)。 true を返したら
+    /// 1 回だけ書き直す。 None なら今までどおりすぐ落とす。
+    room_waiter: std::sync::RwLock<Option<RoomWaiter>>,
 }
+
+/// #388: [`OpLog::set_room_waiter`] の待ち手。 引数は載せたい byte 数、 戻り値は空いたか。 append_lock を持たずに呼ぶ。
+pub type RoomWaiter = std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync>;
 
 unsafe impl Send for OpLog {}
 unsafe impl Sync for OpLog {}
@@ -755,6 +766,11 @@ impl OpLog {
     /// emit する。 0.8.15 の persist warning と同じく **1 秒 1 行**に
     /// rate-limit してターミナルを潰さない。 完全な伝播 / 修復経路は別 issue。
     fn wal_full_err(&self) -> io::Error {
+        io::Error::new(io::ErrorKind::OutOfMemory, "WAL full — consumer reset behind")
+    }
+
+    /// #388: 満杯で載らなかった (待っても空かなかった) ことを 1 秒 1 行で警告する。
+    fn warn_wal_full(&self) {
         #[cfg(not(target_arch = "wasm32"))]
         {
             use std::sync::atomic::AtomicU64;
@@ -776,7 +792,25 @@ impl OpLog {
                 }
             }
         }
-        io::Error::new(io::ErrorKind::OutOfMemory, "WAL full — consumer reset behind")
+    }
+
+    /// #388: 満杯の待ち手を置く (None で外す)。
+    pub fn set_room_waiter(&self, waiter: Option<RoomWaiter>) {
+        *self.room_waiter.write().unwrap_or_else(|p| p.into_inner()) = waiter;
+    }
+
+    /// #388: `size` byte の append が満杯で載らなかった後に呼ぶ。 待ち手が空けたら true (呼び手は 1 回書き直す)。
+    /// 空かなければ警告を出して false。 満杯でない失敗 (fault injection など) は何もせず false。
+    fn wait_for_room(&self, size: u64) -> bool {
+        if self.free_bytes() >= size {
+            return false;
+        }
+        let waiter = self.room_waiter.read().unwrap_or_else(|p| p.into_inner()).clone();
+        if waiter.is_some_and(|w| w(size)) {
+            return true;
+        }
+        self.warn_wal_full();
+        false
     }
 
     /// 新規 WAL ファイル作成。capacity は初期サイズ(bytes)。
@@ -812,6 +846,7 @@ impl OpLog {
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
+            room_waiter: std::sync::RwLock::new(None),
             dropped: std::sync::Mutex::new(Vec::new()),
         })
     }
@@ -879,6 +914,7 @@ impl OpLog {
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
+            room_waiter: std::sync::RwLock::new(None),
             dropped: std::sync::Mutex::new(Vec::new()),
         })
     }
@@ -1037,7 +1073,10 @@ impl OpLog {
         let total: usize = sizes.iter().sum();
 
         let _guard = self.pending_guard(records.len() as u32);
-        let r = self.append_many_inner(records, &sizes, total, hlcs);
+        let mut r = self.append_many_inner(records, &sizes, total, hlcs);
+        if r.is_err() && self.wait_for_room(total as u64) {
+            r = self.append_many_inner(records, &sizes, total, hlcs);
+        }
         // #57: 自分の write の束 (Commit しか無い束は record を運ばない)。 HLC は事前採番の max
         if r.is_err() {
             let carried = records.iter().enumerate().filter(|(_, x)| !matches!(x.as_op(), Op::Commit));
@@ -1189,7 +1228,10 @@ impl OpLog {
             return Err(bad("relayed signed_bytes: crc mismatch"));
         }
         let record_size = REC_HEADER_SIZE + payload_len;
-        let r = self.append_verbatim_checked(sb, signature, pubkey_fp, record_size);
+        let mut r = self.append_verbatim_checked(sb, signature, pubkey_fp, record_size);
+        if r.is_err() && self.wait_for_room(record_size as u64) {
+            r = self.append_verbatim_checked(sb, signature, pubkey_fp, record_size);
+        }
         // #57: 検証を通った record が載らなかった = 中継の配布履歴に穴 (壊れた bytes の拒否は数えない)
         if r.is_err() {
             let hlc = Hlc {
@@ -1279,7 +1321,11 @@ impl OpLog {
         hlc_override: Option<Hlc>,
     ) -> Result<(u64, Hlc), (io::Error, Hlc)> {
         let is_commit = matches!(op, Op::Commit);
-        self.append_inner_raw(op, payload_size, record_size, relay, hlc_override).map_err(|e| {
+        let mut r = self.append_inner_raw(op.clone(), payload_size, record_size, relay, hlc_override);
+        if r.is_err() && self.wait_for_room(record_size as u64) {
+            r = self.append_inner_raw(op, payload_size, record_size, relay, hlc_override);
+        }
+        r.map_err(|e| {
             // #57: 落ちた record の author と HLC を覚える。 Commit は record を運ばない (落ちても group が
             // 閉じるのが遅れるだけ、 #268) ので覚えない (採番もしない)。
             if is_commit {
@@ -1440,6 +1486,11 @@ impl OpLog {
         if self.pending_writes.load(Ordering::Acquire) > 0 { return false; }
         // lock 下での再評価。 ここで false なら畳まない (= 未 bridge record を守る)。
         if !fold_safe() { return false; }
+        self.reset_ring_locked(head)
+    }
+
+    /// ring を先頭に戻す (`append_lock` を持った呼び手から、 head == checkpoint を確かめた後)。
+    fn reset_ring_locked(&self, head: u64) -> bool {
         if self.head.compare_exchange(head, HEADER_SIZE as u64, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return false;
         }
@@ -1449,6 +1500,34 @@ impl OpLog {
         mmap[8..16].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
         mmap[16..24].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
         true
+    }
+
+    /// #388: append を止めたまま (`append_lock` を持ったまま) checkpoint を head まで進め、 そのまま畳めれば畳む。
+    ///
+    /// `sync(head)` は head までの record の効果を本体に書き出す (oplog の fsync + 本体の msync) 役で、 false なら何も
+    /// 進めない。 その間 append は待たされる (= 書き手への back-pressure)。 `try_reset` は書き出してから畳むまでの間に
+    /// 次の record が入ると畳めず、 書き手が休まず書く間は ring が満杯まで埋まっていた。
+    ///
+    /// 戻り値は (checkpoint を進めたか、 畳んだか)。 `fold_safe` は lock の下で、 checkpoint を進めた後に呼ぶ
+    /// (`try_reset_if` と同じ)。 `pending_writes` は見ない — 全 append は `append_lock` の下で場所を取るので、 ここで
+    /// 数に入っているのは lock を待っている (まだ場所を取っていない) append だけ。 `sync` / `fold_safe` から
+    /// この OpLog の append 系を呼んではならない (自分の lock で止まる)。
+    pub fn checkpoint_and_reset(&self, sync: impl FnOnce(u64) -> bool, fold_safe: impl FnOnce() -> bool) -> (bool, bool) {
+        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let head = self.head.load(Ordering::Acquire);
+        if head <= HEADER_SIZE as u64 || !sync(head) {
+            return (false, false);
+        }
+        self.advance_checkpoint(head);
+        if !fold_safe() {
+            return (true, false);
+        }
+        (true, self.reset_ring_locked(head))
+    }
+
+    /// WAL の容量 (byte)。
+    pub fn capacity(&self) -> u64 {
+        self.capacity
     }
 
     /// pending_writes を返す(テスト/観測用)。
@@ -1867,6 +1946,7 @@ impl OpLog {
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
+            room_waiter: std::sync::RwLock::new(None),
             dropped: std::sync::Mutex::new(Vec::new()),
         }
     }
