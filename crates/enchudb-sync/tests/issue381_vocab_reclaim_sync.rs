@@ -120,10 +120,11 @@ fn sync_ops_payload_survives_recount_after_reopen() {
         // bridge が _sync_ops に写すのを待つ
         std::thread::sleep(Duration::from_millis(400));
     }
+    // 閉じた時の参照数を捨てて、 開く時に数え直させる (#385: 落ちた後と同じ経路)
+    std::fs::remove_file(format!("{path_a}/vocab.refs.seg")).unwrap();
     let eng_a = Engine::open_concurrent_with_oplog(&path_a, 64 * 1024 * 1024).unwrap();
     eng_a.set_peer_id(1);
-    assert!(eng_a.vocab_usage().reclaim);
-    eng_a.build_vocab_refs();
+    assert!(eng_a.vocab_usage().reclaim && eng_a.vocab_usage().reclaim_ready);
     // 他の値を作っては消して、 参照 0 の場所を使い回す
     for i in 0..3_000 {
         let e = eng_a.entity_in("notes").unwrap();

@@ -60,7 +60,7 @@ fn make_vid(generation: u32, slot: u32) -> u32 {
 /// 参照数が 0 になった場所の待ち行列 (いちばん昔に空いたものから使い回す)。
 struct Reclaim {
     /// 場所ごとの参照数。 `CLAIMED` = 回収して別の語に渡している最中。
-    refs: Box<[AtomicU32]>,
+    refs: RefStore,
     /// 参照数が 0 になった場所 (先入れ先出し)。 取り出した時に参照数が 0 でなければ (誰かが使い直した) 捨てる。
     free: std::sync::Mutex<std::collections::VecDeque<u32>>,
     /// 既存の cell を数え終えたか。 数え終わるまでは回収しない (数えていない参照があるので)。
@@ -68,6 +68,41 @@ struct Reclaim {
     /// 使い回した回数 (観測用)。
     claims: AtomicU64,
 }
+
+/// #385: 参照数の置き場。 file (`vocab.refs.seg`) に置けば閉じても残り、 次に開いた時に数え直さずに使える。
+/// file を持てない backing (packed / wasm) は heap に置き、 開くたびに数える。
+enum RefStore {
+    Heap(Box<[AtomicU32]>),
+    /// 先頭 `REFS_HEADER` byte の後ろに場所ごとの u32。 commit した所までしか触らない。
+    Mapped(Region),
+}
+
+impl RefStore {
+    /// 場所 `slot` の参照数。 範囲外 (file なら commit していない所) は None。
+    #[inline]
+    fn at(&self, slot: u32) -> Option<&AtomicU32> {
+        match self {
+            RefStore::Heap(b) => b.get(slot as usize),
+            RefStore::Mapped(r) => {
+                let off = REFS_HEADER + slot as usize * 4;
+                (off + 4 <= r.committed_len()).then(|| r.as_atomic_u32(off))
+            }
+        }
+    }
+
+    /// 場所 `slot` まで参照数を置けるようにする (file は commit を伸ばす)。
+    fn ensure(&self, slot: u32) -> std::io::Result<()> {
+        match self {
+            RefStore::Heap(b) if (slot as usize) < b.len() => Ok(()),
+            RefStore::Heap(_) => Err(std::io::Error::new(std::io::ErrorKind::OutOfMemory, "vocab refs: slot out of range")),
+            RefStore::Mapped(r) => r.ensure_committed(REFS_HEADER + (slot as usize + 1) * 4),
+        }
+    }
+}
+
+/// #385: 参照数の file の header (magic 4 + 数えた場所の数 4 + 予約 8)。
+const REFS_HEADER: usize = 16;
+const REFS_MAGIC: [u8; 4] = [b'V', b'R', b'F', b'1'];
 
 /// 0 で埋まった `n` 個の参照数 (calloc の 0 ページのまま確保する — 触った分だけ RAM を食う)。
 fn zeroed_counters(n: usize) -> Box<[AtomicU32]> {
@@ -84,6 +119,10 @@ const HEADER: usize = 16;
 const CLEAN_FLAG_OFF: usize = 12;
 /// #374: 伸びる表の形式で graceful close した印。 旧 binary は `!= 1` を dirty と見て作り直す。
 const CLEAN_GEN: u32 = 2;
+/// #385: `CLEAN_GEN` に加えて、 参照数の file (`vocab.refs.seg`) も閉じた時の cell と合っている印。 回収する DB だけが
+/// 書く。 0.29.0 は `CLEAN_GEN` でないので索引を作り直す (遅いだけ) うえ、 閉じる時に `CLEAN_GEN` を書く = 0.29.0 が
+/// 書いた後の参照数は信じない (数え直す)。
+const CLEAN_REFS: u32 = 3;
 /// #374: 伸びる表 (今の表の位置と大きさを header の `GEN_OFF` に持つ)。
 const INDEX_MAGIC: [u8; 4] = [b'V', b'I', b'X', b'4'];
 /// 全域の表 (0.14 〜 0.28.5)。 書き手は開いた時に `VIX4` へ作り直す。 readonly はそのまま全域の表として読む。
@@ -229,6 +268,8 @@ pub struct Vocabulary {
     readonly: bool,
     /// #381: 語の回収 (有効な時だけ Some)。
     reclaim: std::sync::OnceLock<Reclaim>,
+    /// #385: 開いた時の clean flag が `CLEAN_REFS` だった (= 参照数の file を数え直さずに使える)。
+    refs_clean_on_load: bool,
     /// #381: 今の表の中の、 語が入れ替わって死んだ entry の数 (回収で場所を別の語に渡すたびに 1)。 表の埋まりに
     /// 数え、 増えたら表を作り直して落とす。
     stale_entries: AtomicU32,
@@ -289,6 +330,7 @@ impl Vocabulary {
             index_cap: AtomicU32::new(index_cap),
             readonly: false,
             reclaim: std::sync::OnceLock::new(),
+            refs_clean_on_load: false,
             stale_entries: AtomicU32::new(0),
         }
     }
@@ -324,7 +366,7 @@ impl Vocabulary {
         let xm = index.slice();
         let index_cap = u32::from_le_bytes(xm[4..8].try_into().unwrap());
         let magic: [u8; 4] = xm[0..4].try_into().unwrap();
-        let usable = magic == INDEX_MAGIC && (is_fresh || clean_flag == CLEAN_GEN);
+        let usable = magic == INDEX_MAGIC && (is_fresh || clean_flag == CLEAN_GEN || clean_flag == CLEAN_REFS);
         // readonly で全域の表 (VIX3) を graceful close のまま読む
         let legacy_clean = readonly && magic == INDEX_MAGIC_V3 && (is_fresh || clean_flag == 1);
 
@@ -344,6 +386,7 @@ impl Vocabulary {
             index_cap: AtomicU32::new(index_cap),
             readonly,
             reclaim: std::sync::OnceLock::new(),
+            refs_clean_on_load: usable && !is_fresh && clean_flag == CLEAN_REFS,
             stale_entries: AtomicU32::new(0),
         };
         if usable {
@@ -580,16 +623,57 @@ impl Vocabulary {
 
     // ──── #381: 語の回収 ────
 
-    /// 語の回収を有効にする (書き手、 開いた時に 1 回)。 有効にしただけでは回収しない — 既存の cell を数え
-    /// (`count_ref`)、 数え終えて `finish_refs` を呼んでから回収が始まる。
-    pub fn enable_reclaim(&self) {
-        let slots = self.offsets_cap as usize;
-        let _ = self.reclaim.set(Reclaim {
-            refs: zeroed_counters(slots),
+    /// 参照数の file (`vocab.refs.seg`) の予約長 (#385)。 offsets に入る語数ぶん。
+    pub fn refs_region_size(&self) -> usize {
+        REFS_HEADER + self.offsets_cap as usize * 4
+    }
+
+    /// 語の回収を有効にする (書き手、 開いた時に 1 回)。 `refs` は参照数の file (#385、 None = heap に置く)。
+    ///
+    /// 戻り値は参照数がもう揃っているか。 前回きれいに閉じた (`CLEAN_REFS`) file なら true で、 すぐ回収を始める。
+    /// false なら参照数は 0 から — 既存の cell を数え (`count_ref`)、 `finish_refs` を呼んでから回収が始まる。
+    pub fn enable_reclaim(&self, refs: Option<Region>) -> bool {
+        // file を今の語数まで伸ばせない (空き不足) なら heap に置く (file のまま参照を置けないと Tag を書けない)
+        let refs = refs.filter(|r| r.ensure_committed(REFS_HEADER + self.count() as usize * 4).is_ok());
+        let (store, trusted) = match refs {
+            Some(r) => {
+                let m = r.slice();
+                let trusted = self.refs_clean_on_load
+                    && m[0..4] == REFS_MAGIC
+                    && u32::from_le_bytes(m[4..8].try_into().unwrap()) == self.count();
+                if !trusted {
+                    // 前の数は使わない (数え直す)
+                    let len = r.committed_len();
+                    if len > REFS_HEADER {
+                        r.fill_at(REFS_HEADER, len - REFS_HEADER, 0);
+                    }
+                }
+                r.write_at(0, &REFS_MAGIC);
+                (RefStore::Mapped(r), trusted)
+            }
+            None => (RefStore::Heap(zeroed_counters(self.offsets_cap as usize)), false),
+        };
+        let set = self.reclaim.set(Reclaim {
+            refs: store,
             free: std::sync::Mutex::new(std::collections::VecDeque::new()),
             ready: AtomicBool::new(false),
             claims: AtomicU64::new(0),
         });
+        if set.is_ok() && trusted {
+            self.finish_refs();
+        }
+        trusted
+    }
+
+    /// #385: 閉じる時、 参照数の file に今の語数を書く (engine が file を msync した後で `mark_index_clean_refs`)。
+    pub fn seal_refs(&self) -> bool {
+        match self.reclaim.get().map(|r| &r.refs) {
+            Some(RefStore::Mapped(r)) if r.committed_len() >= REFS_HEADER => {
+                r.write_at(4, &self.count().to_le_bytes());
+                true
+            }
+            _ => false,
+        }
     }
 
     /// 回収が有効か。
@@ -602,10 +686,10 @@ impl Vocabulary {
     pub fn acquire(&self, vid: u32) -> bool {
         let Some(r) = self.reclaim.get() else { return true };
         let slot = vid_slot(vid);
-        if slot as usize >= r.refs.len() || slot >= self.count() {
+        if slot >= self.count() {
             return false;
         }
-        let c = &r.refs[slot as usize];
+        let Some(c) = r.refs.at(slot) else { return false };
         let mut cur = c.load(Ordering::Acquire);
         loop {
             if cur == CLAIMED {
@@ -628,15 +712,12 @@ impl Vocabulary {
     /// 番号 `vid` の参照を 1 つ返す。 0 になったら (既存の cell を数え終えていれば) 回収の待ち行列へ。
     pub fn release(&self, vid: u32) {
         if let Some(r) = self.reclaim.get() {
-            let slot = vid_slot(vid);
-            if (slot as usize) < r.refs.len() {
-                self.release_slot(r, slot);
-            }
+            self.release_slot(r, vid_slot(vid));
         }
     }
 
     fn release_slot(&self, r: &Reclaim, slot: u32) {
-        let c = &r.refs[slot as usize];
+        let Some(c) = r.refs.at(slot) else { return };
         let mut cur = c.load(Ordering::Acquire);
         loop {
             // 0 / CLAIMED から返すのは数え違い (取っていない参照を返した)。 0 を割らない
@@ -665,10 +746,11 @@ impl Vocabulary {
         // 先に ready を立てる: 以後に 0 になった場所は release が入れる (下の走査と重なっても、 取り出す時に
         // 参照 0 を CAS で確かめるので二重は害が無い)
         r.ready.store(true, Ordering::Release);
-        let count = self.count().min(r.refs.len() as u32);
+        let count = self.count();
         let mut q = r.free.lock().unwrap_or_else(|p| p.into_inner());
         for slot in 0..count {
-            if r.refs[slot as usize].load(Ordering::Acquire) == 0 {
+            // 置けなかった場所 (#328 で捨てた番号の commit 失敗) は誰も持たないが、 使い回しもしない
+            if r.refs.at(slot).is_some_and(|c| c.load(Ordering::Acquire) == 0) {
                 q.push_back(slot);
             }
         }
@@ -689,7 +771,7 @@ impl Vocabulary {
 
     /// 番号の場所の参照数 (test / 観測用)。
     pub fn ref_count(&self, vid: u32) -> Option<u32> {
-        self.reclaim.get().and_then(|r| r.refs.get(vid_slot(vid) as usize)).map(|c| c.load(Ordering::Acquire))
+        self.reclaim.get().and_then(|r| r.refs.at(vid_slot(vid))).map(|c| c.load(Ordering::Acquire))
     }
 
     /// 待ち行列からいちばん昔に空いた場所を取る (参照 0 → CLAIMED)。 取り出した時に参照が戻っていた場所は捨てる。
@@ -700,7 +782,7 @@ impl Vocabulary {
         }
         let mut q = r.free.lock().unwrap_or_else(|p| p.into_inner());
         while let Some(slot) = q.pop_front() {
-            if r.refs[slot as usize].compare_exchange(0, CLAIMED, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            if r.refs.at(slot).is_some_and(|c| c.compare_exchange(0, CLAIMED, Ordering::AcqRel, Ordering::Relaxed).is_ok()) {
                 return Some(slot);
             }
         }
@@ -710,7 +792,9 @@ impl Vocabulary {
     /// 取った場所を使えなかった (data の上限 / 空き不足): 元に戻して待ち行列の先頭へ。
     fn unclaim(&self, slot: u32) {
         if let Some(r) = self.reclaim.get() {
-            r.refs[slot as usize].store(0, Ordering::Release);
+            if let Some(c) = r.refs.at(slot) {
+                c.store(0, Ordering::Release);
+            }
             r.free.lock().unwrap_or_else(|p| p.into_inner()).push_front(slot);
         }
     }
@@ -889,6 +973,7 @@ impl Vocabulary {
         if Self::fail_after_take()
             || self.data.ensure_committed((offset + len) as usize).is_err()
             || self.offsets.ensure_committed(((id as usize) + 1) * 8).is_err()
+            || self.reclaim.get().is_some_and(|r| r.refs.ensure(id).is_err())
         {
             return Err(VocabFail::Space);
         }
@@ -913,8 +998,8 @@ impl Vocabulary {
         self.offsets.as_atomic_u64(off_pos).store(slot_entry(offset, len, 0), Ordering::Release);
         self.offsets.mark_dirty(off_pos, 8);
         // #381: 索引に載せる (= 他の書き手に見える) 前に押さえる
-        if pinned && let Some(r) = self.reclaim.get() {
-            r.refs[id as usize].store(1, Ordering::Release);
+        if pinned && let Some(c) = self.reclaim.get().and_then(|r| r.refs.at(id)) {
+            c.store(1, Ordering::Release);
         }
         // #59: index が満杯で登録できないなら 「vocab 満杯」 と同じ扱いにする
         // (dedup が黙って壊れるより、 write を拒否させる方が安全)。 data/offsets に
@@ -961,7 +1046,9 @@ impl Vocabulary {
         self.offsets.mark_dirty(off_pos, 8);
         let r = self.reclaim.get().expect("claimed without reclaim");
         // 世代を進めた後で参照を戻す (`acquire` は取った後に世代を見る)
-        r.refs[slot as usize].store(pinned as u32, Ordering::Release);
+        if let Some(c) = r.refs.at(slot) {
+            c.store(pinned as u32, Ordering::Release);
+        }
         r.claims.fetch_add(1, Ordering::Relaxed);
         // 前の語の entry は死んだまま表に残る
         self.stale_entries.fetch_add(1, Ordering::Relaxed);
@@ -1165,6 +1252,17 @@ impl Vocabulary {
     /// `clean = false`: insert が走った／crash 検知用 → 次回 open で rebuild 強制
     ///
     /// 自身では msync しない。 caller (Engine) が body_msync で永続化する責任を負う。
+    /// `mark_index_clean(true)` の、 参照数の file も閉じた時の cell と合っている版 (#385、 `seal_refs` + msync の後)。
+    /// 参照数を file に置いていなければ `mark_index_clean(true)` と同じ。
+    pub fn mark_index_clean_refs(&self) {
+        let mapped = matches!(self.reclaim.get().map(|r| &r.refs), Some(RefStore::Mapped(_)));
+        if !mapped || self.data.ensure_committed(HEADER).is_err() {
+            return self.mark_index_clean(true);
+        }
+        self.data.write_at(CLEAN_FLAG_OFF, &CLEAN_REFS.to_le_bytes());
+        self.clean_on_disk.store(true, Ordering::Release);
+    }
+
     pub fn mark_index_clean(&self, clean: bool) {
         // data 領域は variable cluster (lazy commit) なので、 先頭 header を
         // 確実に commit してから書く。
@@ -1552,7 +1650,7 @@ mod tests {
     fn reclaiming(max: u32) -> (Regions, Vocabulary) {
         let r = make_regions(max, max, 1 << 20);
         let v = r.vocab_init(max, max);
-        v.enable_reclaim();
+        v.enable_reclaim(None);
         (r, v)
     }
 

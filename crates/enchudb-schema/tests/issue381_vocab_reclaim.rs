@@ -61,7 +61,7 @@ fn rolling_unique_ids_stay_within_the_vocab_budget() {
     }
 }
 
-/// 既存 DB を後から回収する DB にする: 印を立てて開き直すと、 既存の cell を数え終えてから使い回す。 生きている値は
+/// 既存 DB を後から回収する DB にする: 印を立てて開き直すと、 開く時に既存の cell を数えて使い回す。 生きている値は
 /// 使い回さない。
 #[test]
 fn enabling_on_an_existing_db_takes_effect_on_reopen() {
@@ -82,11 +82,9 @@ fn enabling_on_an_existing_db_takes_effect_on_reopen() {
         assert!(!b.engine().vocab_usage().reclaim, "開き直すまでは回収しない");
     }
     let db = Database::open(&path).unwrap();
+    // 開く時に既存の cell を数え終えている (#385)
     let u = db.engine().vocab_usage();
-    assert!(u.reclaim && !u.reclaim_ready, "{u:?}");
-    db.engine().build_vocab_refs();
-    let u = db.engine().vocab_usage();
-    assert!(u.reclaim_ready, "{u:?}");
+    assert!(u.reclaim && u.reclaim_ready, "{u:?}");
     // 消した 150 行の k と v + 表名 (schema が辞書に入れるが cell からは参照しない)
     assert_eq!(u.reclaimable_entries, 301, "{u:?}");
     let before = u.entries;

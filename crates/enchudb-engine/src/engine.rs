@@ -247,7 +247,7 @@ pub struct VocabUsage {
     pub reserved_data_bytes: u64,
     /// 語を回収する DB として開いたか (`enable_vocab_reclaim` / `GrowableOptions::vocab_reclaim`)。
     pub reclaim: bool,
-    /// 既存の cell を数え終えて回収が始まったか (`Engine::build_vocab_refs`)。
+    /// 回収が始まったか (開いた時に始まる、 #385)。
     pub reclaim_ready: bool,
     /// 行から参照されなくなり、 使い回しを待っている語の数 (多めに数えることがある — 使い回す前に参照 0 を確かめる)。
     /// `max_entries - entries + reclaimable_entries` が新しく入れられる値の数の目安。
@@ -2979,13 +2979,11 @@ pub struct Engine {
     max_himos: u32,
     vocab: Vocabulary,
     himo_reg: Vocabulary,
-    /// #381: 辞書の語の回収で、 既存の cell を数え済みの local の上限 (`local < cursor` は数え済み)。
-    /// 数える処理 (`advance_vocab_refs`) と cell の書き手は、 同じ行の lock の下でこれを読み書きする。
-    vocab_refs_cursor: std::sync::atomic::AtomicU32,
-    /// #381: 数え始めた時の払い出し位置。 これ以上の local は最初から書き手が数える (数え始めた時に cell が無い)。
-    vocab_refs_end: u32,
-    /// #381: 数える処理を 1 本にする。
-    vocab_refs_lock: std::sync::Mutex<()>,
+    /// #385: 辞書の語の参照数の file (`vocab.refs.seg`、 回収する DB の書き手だけ)。 閉じる時に msync する。
+    #[cfg(not(target_arch = "wasm32"))]
+    vocab_refs_map: std::sync::OnceLock<Arc<crate::segment_map::SegmentMap>>,
+    /// #385: 開いた時に参照数を使えず、 数え直しを待っている (`finish_vocab_refs_at_open`)。
+    vocab_recount_pending: std::sync::atomic::AtomicBool,
     // 0.9.0 himo dynamic definition: himo の並列配列は AppendVec (固定 capacity
     // + append-only + lock-free read) 化して `&self` から定義追加できるように
     // した (design a: pre-sized slots + atomic len publish)。 reader の hot path
@@ -3521,8 +3519,6 @@ impl Engine {
             layout.himoreg_max_entries, layout.himoreg_index_cap,
         );
         backing.apply_vocab_limits(&layout, &vocab, &himo_reg);
-        // #381: 作った時は回収しない (GrowableOptions::vocab_reclaim は作った後で有効にする)
-        let vocab_refs_end = 0u32;
         let contents = ContentStore::init(
             backing.region(SegmentKind::ContentIndex, &layout),
             backing.region(SegmentKind::ContentData, &layout),
@@ -3545,9 +3541,9 @@ impl Engine {
             path: path.to_string(), layout: std::sync::RwLock::new(layout), entity_cap: std::sync::atomic::AtomicU32::new(max_entities),
             table_grow_lock: std::sync::Mutex::new(()), max_himos,
             vocab, himo_reg,
-            vocab_refs_cursor: std::sync::atomic::AtomicU32::new(0),
-            vocab_refs_end,
-            vocab_refs_lock: std::sync::Mutex::new(()),
+            #[cfg(not(target_arch = "wasm32"))]
+            vocab_refs_map: std::sync::OnceLock::new(),
+            vocab_recount_pending: std::sync::atomic::AtomicBool::new(false),
             himo_names: AppendVec::with_capacity(max_himos as usize),
             value_types: AppendVec::with_capacity(max_himos as usize),
             himo_max_values: AppendVec::with_capacity(max_himos as usize),
@@ -3749,7 +3745,7 @@ impl Engine {
         if opts.vocab_reclaim {
             eng.enable_vocab_reclaim()?;
             // 作ったばかり (cell も押さえている番号も無い) なので、 開き直さずにこのまま回収を始めてよい
-            eng.vocab.enable_reclaim();
+            eng.attach_vocab_refs();
             eng.vocab.finish_refs();
         }
         Ok(eng)
@@ -3886,6 +3882,8 @@ impl Engine {
         }
         // request18: table 定義が確定したので hot path 用 cache を張り直す。
         eng.refresh_sync_tables_flag();
+        // #385: 辞書の参照数を数え直す (要る時だけ)。 table が決まった後、 oplog の回復で書く前
+        eng.finish_vocab_refs_at_open();
 
         // v10: sync tables を持つ DB は版数列 (`ver/*.seg` / `tomb.seg`) を持つのが不変条件。
         // `enable_sync_tables()` は segment を作ってから header flag を立てるので、 その間の
@@ -4283,7 +4281,9 @@ impl Engine {
     /// Vec<u8> からエンジンを構築。WASM ではこれが唯一のエントリポイント。
     /// native でも使える（テスト、ファイル丸読みなど）。
     pub fn from_bytes(data: Vec<u8>) -> Result<Self, String> {
-        Self::load_from_backing(Backing::Memory(data), /*readonly=*/ false)
+        let eng = Self::load_from_backing(Backing::Memory(data), /*readonly=*/ false)?;
+        eng.finish_vocab_refs_at_open();
+        Ok(eng)
     }
 
     /// #88 (0.12.0): v5 DB (leaf region 無し = `Leaf` 値が vocab 辞書に単調
@@ -4528,21 +4528,10 @@ impl Engine {
         )
         .map_err(|e| e.to_string())?;
         backing.apply_vocab_limits(&layout, &vocab, &himo_reg);
-        // #381: 回収する DB の書き手は、 開いた時から番号の参照を数える。 既存の cell は後で数える
-        // (`advance_vocab_refs`)。 数え始めた時の払い出し位置より後ろの local には cell が無い
+        // #381: 回収する DB の書き手は、 開いた時から番号の参照を数える (下の `attach_vocab_refs`)
         let vocab_reclaim = !readonly && {
             let h = backing.header_mut(layout.header_size);
             u32::from_le_bytes(h[H_VOCAB_RECLAIM..H_VOCAB_RECLAIM + 4].try_into().unwrap()) != 0
-        };
-        let vocab_refs_end = if vocab_reclaim {
-            vocab.enable_reclaim();
-            let end = entities.next_eid();
-            if end == 0 {
-                vocab.finish_refs();
-            }
-            end
-        } else {
-            0
         };
         report("himo_reg(Vocabulary)", &mut t, &mut p);
         let contents = ContentStore::load(
@@ -4619,9 +4608,9 @@ impl Engine {
             path: String::new(), layout: std::sync::RwLock::new(layout), entity_cap: std::sync::atomic::AtomicU32::new(max_entities),
             table_grow_lock: std::sync::Mutex::new(()), max_himos,
             vocab, himo_reg,
-            vocab_refs_cursor: std::sync::atomic::AtomicU32::new(0),
-            vocab_refs_end,
-            vocab_refs_lock: std::sync::Mutex::new(()),
+            #[cfg(not(target_arch = "wasm32"))]
+            vocab_refs_map: std::sync::OnceLock::new(),
+            vocab_recount_pending: std::sync::atomic::AtomicBool::new(false),
             himo_names, value_types, himo_max_values,
             himos, ver_cols, tomb_col, entities, contents,
             leaf,
@@ -4723,6 +4712,12 @@ impl Engine {
         // index rebuild を誘発する (= read-only のはずが DB を太らせる)。 readonly
         // では clean flag を一切触らない (真に非破壊 open)。
         if !readonly {
+            // #381 / #385: 参照数は前回閉じた時の file をそのまま使う。 使えなければ (落ちた後 / 0.29.0 が書いた後 /
+            // file が無い) 生きている行の cell を数え直す — table の定義 (sidecar) を読んだ後で
+            // (`finish_vocab_refs_at_open`、 内部 table の Leaf = 辞書を使う列かが table で決まる)
+            if vocab_reclaim && !eng.attach_vocab_refs() {
+                eng.vocab_recount_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             eng.vocab.mark_index_clean(false);
             eng.himo_reg.mark_index_clean(false);
             // v6 (#88): routed-Leaf の live cell offset から LeafStore free-list を
@@ -8422,12 +8417,12 @@ impl Engine {
     /// を直に呼ばないこと** — 呼ぶと live query がその書き込みを取りこぼす。
     /// 通知は `HimoStore::set` が write_lock を離した **後** (`crate::live` の lock 順序)。
     ///
-    /// #381: 回収する辞書の Tag の列なら、 新しい値の参照を取って古い値の参照を返す (数え済みの local だけ、
-    /// `vocab_counted`)。 新しい値の番号が古い (回収された) なら書かずに `StaleValue` を計上して false。
+    /// #381: 回収する辞書の Tag の列なら、 新しい値の参照を取って古い値の参照を返す。 新しい値の番号が古い (回収された)
+    /// なら書かずに `StaleValue` を計上して false。
     #[inline]
     fn live_set(&self, hid: usize, local: u32, value: impl Into<u64>) -> bool {
         let value = value.into();
-        let tracked = self.vocab_tracks(hid) && self.vocab_counted(local);
+        let tracked = self.vocab_tracks(hid);
         let old = if tracked { self.himos[hid].get_value32(local) } else { None };
         let changed = tracked && old != Some(value as u32);
         if changed && !self.vocab.acquire(value as u32) {
@@ -8464,67 +8459,74 @@ impl Engine {
         }
     }
 
-    /// #381: local の cell を既に数えたか (= 書き手が参照の増減をするか)。 行の lock の下で呼ぶ
-    /// (`advance_vocab_refs` も同じ lock の下で `vocab_refs_cursor` を進める)。
-    #[inline]
-    fn vocab_counted(&self, local: u32) -> bool {
-        local >= self.vocab_refs_end
-            || local < self.vocab_refs_cursor.load(std::sync::atomic::Ordering::Acquire)
+    /// #385: 参照数を file (`vocab.refs.seg`) に置いて回収を有効にする。 戻り値は前回閉じた時の数をそのまま使えたか
+    /// (false なら 0 から、 呼び手が `recount_vocab_refs` → `finish_refs`)。 file を持てない backing (packed / wasm) と、
+    /// file を作れなかった時は heap に置く (開くたびに数える)。
+    fn attach_vocab_refs(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Backing::Segments(set) = &self.backing {
+            let size = self.vocab.refs_region_size();
+            match map_vocab_refs(set.dir(), size) {
+                Ok(map) => {
+                    // SAFETY: size <= map の予約 (`map_vocab_refs` が size で予約する)
+                    let region = unsafe { Region::from_segment(map.clone(), size) };
+                    let _ = self.vocab_refs_map.set(map);
+                    return self.vocab.enable_reclaim(Some(region));
+                }
+                Err(e) => eprintln!("warning: vocab.refs.seg を開けない ({e}) — 参照数は heap に置き、 開くたびに数える"),
+            }
+        }
+        self.vocab.enable_reclaim(None)
     }
 
-    /// #381: 既存の cell の番号を数える (回収する辞書で開いた後)。 `budget` 行まで進めて、 数え終えたら回収を始める。
-    /// 戻り値は数え終えたか。 他の thread が数えている最中なら何もしない。
-    fn advance_vocab_refs(&self, budget: u32) -> bool {
-        use std::sync::atomic::Ordering;
-        if !self.vocab.reclaim_enabled() || self.vocab.reclaim_ready() {
-            return true;
+    /// #385: 開いた時に参照数を使えなかった (`attach_vocab_refs` が false) なら、 ここで数え直して回収を始める。
+    /// table の定義を読んだ後、 書き手が動く前に 1 回呼ぶ (`open_internal` / `from_bytes`)。
+    fn finish_vocab_refs_at_open(&self) {
+        if self.vocab_recount_pending.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            self.recount_vocab_refs();
+            self.vocab.finish_refs();
         }
-        let Ok(_g) = self.vocab_refs_lock.try_lock() else { return false };
-        let end = self.vocab_refs_end;
-        let mut local = self.vocab_refs_cursor.load(Ordering::Acquire);
-        let stop = local.saturating_add(budget).min(end);
+    }
+
+    /// #385: 生きている行の、 辞書の番号を持つ cell を全部数える (回収する DB を開いた時、 参照数が使えなければ)。
+    /// 時間は 行の数 × 辞書を使う列の数 (空いた eid は生存 bitmap の 64 個単位で飛ばす)。
+    fn recount_vocab_refs(&self) {
         let tags: Vec<usize> = (0..self.value_types.len()).filter(|&h| self.uses_vocab(h)).collect();
-        while local < stop {
-            // 行の lock の下で数えて位置を進める: 同じ行の書き手は 「数える前 (書き手は数えない)」 か
-            // 「数えた後 (書き手が数える)」 のどちらかだけを見る
-            let _row = self.row_locks.write(local);
+        if tags.is_empty() {
+            return;
+        }
+        self.entities.for_each_live(|local| {
             for &h in &tags {
                 if let Some(v) = self.himos[h].get_value32(local) {
                     self.vocab.count_ref(v);
                 }
             }
-            local += 1;
-            self.vocab_refs_cursor.store(local, Ordering::Release);
-        }
-        if local >= end {
-            self.vocab.finish_refs();
-            return true;
-        }
-        false
+        });
     }
 
-    /// #381: 既存の cell を全部数えて、 辞書の語の回収を始める。 回収する DB (`enable_vocab_reclaim`) を開いた後、
-    /// 数え終えるまでは回収しない (語が増えるだけで壊れない)。 数える処理は新しい語を入れる書き込みのたびに少しずつ
-    /// 進むので、 呼ばなくても書いていればいずれ終わる。 早く回収を始めたい時に呼ぶ (書き手と並行に呼んでよい)。
-    pub fn build_vocab_refs(&self) {
-        while !self.advance_vocab_refs(1 << 16) {
-            if !self.vocab.reclaim_enabled() {
-                return;
-            }
-            // 他の thread が数えている: 終わるのを待つ
-            let _g = self.vocab_refs_lock.lock().unwrap_or_else(|p| p.into_inner());
+    /// #381: 既存の cell を数えて辞書の語の回収を始める — 0.29.1 からは何もしない。 参照数は file に残り、
+    /// 使えない時 (落ちた後など) は開く時に数え直すので、 開いた直後から回収が始まっている (#385)。
+    pub fn build_vocab_refs(&self) {}
+
+    /// #385: 閉じる時、 参照数を cell の数だけにして (外した購読と、 まだ居る購読が押さえていた番号を返す) 参照数の
+    /// file を書き出す。 書き出せたら true (= 次に開いた時に数え直さずに使える)。 書き込みは全部終わっていること。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn seal_vocab_refs(&self) -> bool {
+        let Some(map) = self.vocab_refs_map.get() else { return false };
+        if !self.vocab.reclaim_ready() {
+            return false;
         }
+        for vid in self.live.take_unpins().into_iter().chain(self.live.drain_pins()) {
+            self.vocab.release(vid);
+        }
+        self.vocab.seal_refs() && map.flush_all().is_ok()
     }
 
-    /// #381: 新しい語を入れる書き込みの前に、 既存の cell を少し数え (数え終えたら何もしない)、 外した購読が押さえて
-    /// いた番号を返す。
+    /// #381: 外した購読が押さえていた番号を返す (新しい語を入れる書き込みの前)。
     #[inline]
     fn step_vocab_refs(&self) {
         if !self.vocab.reclaim_enabled() {
             return;
-        }
-        if !self.vocab.reclaim_ready() {
-            self.advance_vocab_refs(1 << 12);
         }
         for vid in self.live.take_unpins() {
             self.vocab.release(vid);
@@ -8561,7 +8563,7 @@ impl Engine {
     /// `live_set` の外す版。 `himos[..].remove` を直に呼ばないこと (同上)。
     #[inline]
     fn live_remove(&self, hid: usize, local: u32) {
-        let old = if self.vocab_tracks(hid) && self.vocab_counted(local) {
+        let old = if self.vocab_tracks(hid) {
             self.himos[hid].get_value32(local)
         } else {
             None
@@ -14129,7 +14131,8 @@ impl Engine {
 
     /// #381: この DB の辞書の語を回収するようにする (header に印を立て、 file version を 12 にする = 旧 binary は
     /// 開けない)。 **次に開いた時から**効く (開いている間に始めると、 書き込みの queue に積まれた番号を数え漏らす)。
-    /// 開いた後、 既存の cell を数え終えてから回収が始まる (`build_vocab_refs`、 書いていれば少しずつ進む)。
+    /// 参照数は DB の directory の `vocab.refs.seg` に置き、 きれいに閉じれば次に開いた時もそのまま使う。 落ちた後などで
+    /// 使えない時は、 開く時に生きている行の cell を数え直す (時間は 行の数 × 辞書を使う列の数、 #385)。
     ///
     /// 回収すると、 行から参照されなくなった値の番号を別の値に使い回す。 番号は世代を含むので、 古い番号
     /// (`vocab_id` の戻り値をアプリが持っていた等) は該当なしになる (別の値に当たらない)。 番号は値が生きている
@@ -14736,8 +14739,18 @@ impl Engine {
     /// mark 前の msync で「flag が指す中身」を先に固める順序が要る (flush() から切り出し)。
     #[cfg(not(target_arch = "wasm32"))]
     fn sync_and_mark_clean(&self) -> io::Result<()> {
+        self.sync_and_mark_clean_with(false)
+    }
+
+    /// `refs` = 参照数の file も閉じた時の cell と合っている (`seal_vocab_refs` 済み) → `CLEAN_REFS` を書く (#385)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn sync_and_mark_clean_with(&self, refs: bool) -> io::Result<()> {
         self.backing.flush_to_disk()?;
-        self.vocab.mark_index_clean(true);
+        if refs {
+            self.vocab.mark_index_clean_refs();
+        } else {
+            self.vocab.mark_index_clean(true);
+        }
         self.himo_reg.mark_index_clean(true);
         self.backing.flush_to_disk()?;
         if let Backing::Segments(set) = &self.backing {
@@ -14840,6 +14853,25 @@ impl crate::live::CellReader for Engine {
     }
 }
 
+/// #385: 参照数の file (`{dir}/vocab.refs.seg`) を開く (無ければ作る)。 予約が合わない (前の予約より短い) 時は
+/// 作り直す — 中身は数え直せるので捨ててよい。
+#[cfg(not(target_arch = "wasm32"))]
+fn map_vocab_refs(dir: &std::path::Path, size: usize) -> io::Result<Arc<crate::segment_map::SegmentMap>> {
+    use crate::segment_map::SegmentMap;
+    let path = dir.join(VOCAB_REFS_FILE);
+    if path.exists() {
+        match SegmentMap::open(&path, size, false) {
+            Ok(m) => return Ok(Arc::new(m)),
+            Err(_) => std::fs::remove_file(&path)?,
+        }
+    }
+    Ok(Arc::new(SegmentMap::create(&path, size, 4096.min(size))?))
+}
+
+/// #385: 参照数の file の名前 (DB の directory の中、 manifest には載せない = 無くても数え直すだけ)。
+#[cfg(not(target_arch = "wasm32"))]
+const VOCAB_REFS_FILE: &str = "vocab.refs.seg";
+
 impl Drop for Engine {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
@@ -14884,7 +14916,9 @@ impl Drop for Engine {
             self.vocab.sync();
             self.himo_reg.sync();
             self.contents.sync();
-            let _ = self.sync_and_mark_clean();
+            // #385: 参照数を閉じた時の cell の数に揃えて (購読が押さえていた番号を返す)、 file を書き出してから印を立てる
+            let refs = self.seal_vocab_refs();
+            let _ = self.sync_and_mark_clean_with(refs);
         }
     }
 }

@@ -4128,6 +4128,19 @@ impl LiveRegistry {
         if u.is_empty() { Vec::new() } else { std::mem::take(&mut *u) }
     }
 
+    /// #385: まだ居る購読が押さえている辞書の番号を全部取り出す (engine が閉じる時に返し、 参照数を cell の数だけにして
+    /// file に残す)。 取り出した購読は以後何も押さえていない扱い (外しても返さない)。
+    pub(crate) fn drain_pins(&self) -> Vec<u32> {
+        let mut out = Vec::new();
+        for f in self.families() {
+            let mut s = f.settled.lock();
+            for m in s.members.iter_mut().flatten() {
+                out.append(&mut m.pins);
+            }
+        }
+        out
+    }
+
     pub(crate) fn new(peer: u32) -> Self {
         Self {
             active: AtomicUsize::new(0),

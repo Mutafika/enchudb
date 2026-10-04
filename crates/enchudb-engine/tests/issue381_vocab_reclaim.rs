@@ -54,10 +54,11 @@ fn stale_vid_is_rejected() {
     assert_eq!(eng.get_text(b, "k"), Some(&b"new"[..]));
 }
 
-/// 既存の cell を数える処理と書き手が並行に走っても、 生きている値の語を回収しない (数え漏らすと、 使い回しで
-/// 生きている行の値が消えるか別の値になる)。 数え終えた後も作っては消すを続けて、 使い回しを起こしてから確かめる。
+/// 既存の行がある DB で回収を始めると、 開く時に生きている行の cell を数え (#385: 消した行の空き slot は飛ばす)、
+/// 書き手が並行に作っては消しても生きている値の語を回収しない (数え漏らすと、 使い回しで生きている行の値が消えるか
+/// 別の値になる)。 使い回しを起こしてから確かめる。
 #[test]
-fn counting_concurrently_with_writers_keeps_live_values() {
+fn counting_at_open_then_concurrent_writers_keep_live_values() {
     let path = tmp("concurrent");
     // 回収しない DB で既存の行を作り、 半分消してから回収する DB にする
     let mut survivors: HashMap<u64, (String, String)> = HashMap::new();
@@ -80,7 +81,7 @@ fn counting_concurrently_with_writers_keeps_live_values() {
         eng.flush().unwrap();
     }
     let eng = Arc::new(Engine::open_standalone(&path).unwrap());
-    assert!(eng.vocab_usage().reclaim && !eng.vocab_usage().reclaim_ready);
+    assert!(eng.vocab_usage().reclaim && eng.vocab_usage().reclaim_ready, "開いた時に数え終えている (#385)");
     let (k, g) = (eng.himo_id("k").unwrap() as u16, eng.himo_id("g").unwrap() as u16);
     let stop = Arc::new(AtomicBool::new(false));
     let writers: Vec<_> = (0..4)
@@ -105,8 +106,6 @@ fn counting_concurrently_with_writers_keeps_live_values() {
             })
         })
         .collect();
-    eng.build_vocab_refs();
-    assert!(eng.vocab_usage().reclaim_ready);
     std::thread::sleep(std::time::Duration::from_millis(200));
     stop.store(true, Ordering::Relaxed);
     let mut live: Vec<(u64, String, String)> = writers.into_iter().flat_map(|h| h.join().unwrap()).collect();
