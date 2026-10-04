@@ -223,6 +223,17 @@ db.oplog_sync()?;     // fsync + msync
 // or oplog_commit() for a background fsync (Async mode)
 ```
 
+A returned write is in the mapped file, so it survives a killed process. It survives power loss
+once it has been flushed: by the background flush (every 100 ms) or by `oplog_sync()`.
+
+The oplog is a ring. When it fills up, the background thread pauses appends, flushes, and starts
+the ring over. Writers that append in the meantime wait instead of losing their records, so a
+single writer that never pauses no longer overflows it (#388); `Engine::wal_room_folds()` counts
+these pauses. A DB that syncs to peers (or has change listeners) cannot restart the ring until
+those records have been handed on. If that is stuck, writes still land in the DB, but their
+records drop out of the stream (`wal_dropped_records` / `wal_commit_failures`), and peers catch
+up by bootstrap.
+
 ### RAG (`enchudb-rag`)
 
 ```rust
