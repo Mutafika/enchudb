@@ -3,6 +3,42 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.29.3 — 2026-10-05
+
+patch。 on-disk 形式は 0.29.2 と同じ。
+
+**上げる時の注意**:
+
+- `Engine::consumer_wakeups` / `OpLog::set_append_hook` が増えた
+- 何もしていない間、 consumer thread は寝ている (sync / changefeed を使う DB は 1 秒ごとに起きる)
+
+### Fixed — 何も書いていない DB でも consumer が 1 ms ごとに起きた (#391、 #392)
+
+consumer は queue が空だと 1 ms 眠っては見回っていた。 何もしない DB 1 つで 1 秒に約 500 回起き、 開いた DB の数に
+比例して CPU を使っていた。
+
+- 仕事が無い間は寝て、 書き手が queue に積んだ / WAL に書いた / 閉じる / WAL の空きを待つ時に起こされる (park / unpark)。
+  書き手のコストは atomic を 1 回読むだけ
+- 時間で起きるのは書き出し・畳みが残っている間 (100 ms の書き出しの周期まで) だけ。 sync / changefeed の DB は 1 秒ごと
+
+| | 0.29.2 | 0.29.3 |
+|---|---:|---:|
+| 待機中の CPU (DB 32 個) | 231 ms/s (1 core の 23 %) | 0.00 ms/s |
+| 1 つ書いて適用を待つ往復 | 1.25 ms | 4〜47 µs |
+| 同期の書き込み 200 万行 (#388 の再現) | 12.0〜12.2 s | 12.1 s |
+
+### Fixed — 0.29.2 の WAL の満杯で Commit marker の失敗が数わることがあった (#388 の残り、 #392)
+
+- 満杯の時に consumer が畳み始めると、 最初に打つ Commit marker が満杯で落ち、 `wal_commit_failures` に数わっていた。
+  満杯なら打たない (本体を書き出してから畳むので復旧には要らない)
+- 空いている時の試みを 「畳めなかった」 と覚え、 待っている書き手がそれを見て諦めていた
+- どちらも落ちるのは Commit marker の計数と警告だけで、 行の中身は失われない
+
+### Fixed — WAL が満杯の間に sync の floor を上げ続けることがあった (#57、 #392)
+
+floor (相手に bootstrap を促す印) は 「前に bridge が見た時から新しく落ちていなければ満杯の episode は終わった」 で上げて
+いて、 bridge を回す間隔で答えが変わった。 「最後に落ちてから 100 ms 落ちなかったら終わった」 で決める。
+
 ## 0.29.2 — 2026-10-04
 
 patch。 on-disk 形式は 0.29.1 と同じ。
