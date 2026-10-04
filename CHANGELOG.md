@@ -3,6 +3,35 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.29.2 — 2026-10-04
+
+patch。 on-disk 形式は 0.29.1 と同じ。
+
+**上げる時の注意**:
+
+- WAL (oplog) が埋まってきた時、 WAL に直接書く書き手 (Commit marker など) は落ちずに待つようになった (最大 5 秒、 畳めない時は
+  すぐ諦める)。 書き込みが一瞬止まりうる
+- `OpLog::set_room_waiter` / `OpLog::checkpoint_and_reset` / `OpLog::capacity` / `OwnedOp::record_size` /
+  `Engine::wal_room_folds` が増えた
+
+### Fixed — 1 thread の書き込みでも WAL が溢れて Commit marker が落ちた (#388、 #389)
+
+WAL は ring で、 空きを作るのは consumer の 100 ms ごとの tick の 「書き出し (oplog fsync + 本体 msync) → checkpoint を
+進める → 畳む」 だけだった。 書き出しから畳むまでの間に次の record が入ると畳めないので、 書き手が休まず書く間は ring が
+満杯まで埋まり、 Commit marker の append が落ちていた (sync を使わない DB でも)。
+
+- 書き出しから畳むまで append を止める (`OpLog::checkpoint_and_reset`)。 consumer は ring の空きが 1/4 を切ったら、 apply を
+  終えた直後にこれを呼ぶ。 自分の append が満杯にぶつかった時もその場で畳んで書き直す
+- consumer 以外の書き手は満杯にぶつかったら、 consumer が空けるのを待って書き直す。 consumer が 1 回試して空かなければ
+  (sync の bridge / changefeed が配り終えていない等) 待たずに諦める (今までどおり落ちて #57 の floor → bootstrap)
+- README の Durability に、 何が落ちうるか (kill では残る / 電源断は書き出し後に残る / 配れない sync の DB) を書いた
+
+| WAL 64 MiB、 1 thread で 200 万行 (insert + 古い行の delete) | 0.29.1 | 0.29.2 |
+|---|---:|---:|
+| 打てなかった Commit | 19 | 0 |
+| WAL の空きの最小 (50 万行ごと) | 11 B | 34 MB |
+| 時間 | 10.4〜10.5 s | 11.0 s |
+
 ## 0.29.1 — 2026-10-04
 
 patch。 on-disk 形式は 0.29.0 と同じ (file version 12)。 回収する DB の directory に参照数の file
