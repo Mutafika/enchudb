@@ -653,6 +653,11 @@ const BRIDGE_STALL_WARN_AFTER_MS: u64 = 30_000;
 /// 満杯が終わった周にはすぐ上げる。
 const WAL_DROP_FLOOR_MAX_DELAY_MS: u64 = 5_000;
 
+/// #57 / #391: 最後に落ちてからこれだけ新しく落ちなかったら、 満杯の episode は終わった (ms、 consumer の書き出しの
+/// 周期)。 「前に bridge が見た時から落ちていない」 で決めると、 bridge を見る間隔で答えが変わる — 満杯を待つ書き手が
+/// consumer を起こして bridge を回すと、 落ちと落ちの間に毎回 「終わった」 になり floor を上げ続けた。
+const WAL_DROP_EPISODE_QUIET_MS: u64 = 100;
+
 fn serialize_eidmap(entries: &[EidmapEntry]) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + entries.len() * 28);
     out.extend_from_slice(b"EIDM");
@@ -857,12 +862,17 @@ fn push_oplog_record_blocking(
     hlc: enchudb_oplog::Hlc,
     poisoned: &std::sync::atomic::AtomicBool,
     wal_push_count: &std::sync::atomic::AtomicU64,
+    // #391: 積んだら consumer を起こす
+    waker: Option<&crate::write_queue::ConsumerWaker>,
 ) {
     let mut rec = (rec, hlc);
     loop {
         match wq.push(rec) {
             Ok(()) => {
                 wal_push_count.fetch_add(1, std::sync::atomic::Ordering::Release);
+                if let Some(w) = waker {
+                    w.wake();
+                }
                 return;
             }
             Err(returned) => {
@@ -3095,6 +3105,8 @@ pub struct Engine {
     consumer_thread: std::sync::OnceLock<std::thread::ThreadId>,
     /// #388: 満杯に近づいて consumer が書き出し + 畳みをした回数 (観測用)。
     wal_room_folds: std::sync::atomic::AtomicU64,
+    /// #391: consumer の loop が回った回数 (起きた回数、 観測用)。
+    consumer_wakeups: std::sync::atomic::AtomicU64,
     /// #388: consumer が書き出し + 畳みを試し終えた回数 (待ち手は、 待ち始めた後の 1 回で空かなければ諦める)。
     wal_room_attempts: std::sync::atomic::AtomicU64,
     /// #388: `make_wal_room` の最中 (中の Commit marker が満杯で待ち手に入った時に、 もう一度入らない)。
@@ -3197,8 +3209,9 @@ pub struct Engine {
     /// #57: WAL に載らなかった record のために history floor を上げた回数。
     wal_drop_floor_bumps: std::sync::atomic::AtomicU64,
     /// #57: まだ floor に入れていない、 WAL に載らなかった record (author, 落ちた HLC の max) と、
-    /// 最初に落ちた時刻 (unix ms)。 満杯の episode が終わった周にまとめて floor に入れる。
-    wal_drop_pending: std::sync::Mutex<(Vec<(u32, enchudb_oplog::Hlc)>, Option<u64>)>,
+    /// 最初に落ちた時刻 / 最後に落ちたのを見た時刻 (unix ms)。 満杯の episode が終わったら (最後に落ちてから
+    /// `WAL_DROP_EPISODE_QUIET_MS` 落ちなかったら) まとめて floor に入れる。
+    wal_drop_pending: std::sync::Mutex<(Vec<(u32, enchudb_oplog::Hlc)>, Option<(u64, u64)>)>,
     /// #268: Commit marker の append が失敗した回数。 失敗すると直前の record 群は
     /// **閉じられない group** として残り、 bridge からも recovery からも見えなくなる。
     wal_commit_failures: std::sync::atomic::AtomicU64,
@@ -3592,6 +3605,7 @@ impl Engine {
             consumer_thread: std::sync::OnceLock::new(),
             wal_room_folds: std::sync::atomic::AtomicU64::new(0),
             wal_room_attempts: std::sync::atomic::AtomicU64::new(0),
+            consumer_wakeups: std::sync::atomic::AtomicU64::new(0),
             wal_room_busy: std::sync::atomic::AtomicBool::new(false),
             wal_room_failed_at: std::sync::Mutex::new(None),
             peer_id: std::sync::atomic::AtomicU32::new(0),
@@ -4661,6 +4675,7 @@ impl Engine {
             consumer_thread: std::sync::OnceLock::new(),
             wal_room_folds: std::sync::atomic::AtomicU64::new(0),
             wal_room_attempts: std::sync::atomic::AtomicU64::new(0),
+            consumer_wakeups: std::sync::atomic::AtomicU64::new(0),
             wal_room_busy: std::sync::atomic::AtomicBool::new(false),
             wal_room_failed_at: std::sync::Mutex::new(None),
             peer_id: std::sync::atomic::AtomicU32::new(0),
@@ -5005,8 +5020,12 @@ impl Engine {
                 None
             } else {
                 let now_ms = Self::unix_millis();
-                let first = *p.1.get_or_insert(now_ms);
-                if !had_fresh || now_ms.saturating_sub(first) >= WAL_DROP_FLOOR_MAX_DELAY_MS {
+                let (first, last) = p.1.get_or_insert((now_ms, now_ms));
+                if had_fresh {
+                    *last = now_ms;
+                }
+                let quiet = now_ms.saturating_sub(*last) >= WAL_DROP_EPISODE_QUIET_MS;
+                if quiet || now_ms.saturating_sub(*first) >= WAL_DROP_FLOOR_MAX_DELAY_MS {
                     p.1 = None;
                     Some(std::mem::take(&mut p.0))
                 } else {
@@ -13535,6 +13554,13 @@ impl Engine {
                 engine.wait_for_wal_room(size)
             })));
         }
+        // #391: WAL に直接書いた (同期の書き込み / Commit marker / 中継) 時も consumer を起こす (書き出しの tick を回す)。
+        // tick を待つ短い眠りの間は起こさない (100 ms 以内に自分で起きる)
+        let waker = queue.waker().clone();
+        if let Some(wal) = oplog.as_ref() {
+            let w = waker.clone();
+            wal.set_append_hook(Box::new(move || w.wake_if_deep()));
+        }
         let q_for_thread = queue.clone();
         let flag_for_thread = shutdown.clone();
         let apply_count_for_thread = arc.apply_count.clone();
@@ -13576,10 +13602,12 @@ impl Engine {
                 };
                 let engine: &Engine = unsafe { &*(engine_addr as *const Engine) };
                 let _ = engine.consumer_thread.set(std::thread::current().id());
+                waker.register_current();
                 let fsync_interval = Duration::from_millis(100);
                 let mut last_fsync = Instant::now();
 
                 loop {
+                    engine.consumer_wakeups.fetch_add(1, Ordering::Relaxed);
                     let mut drained_any = false;
                     // WAL record queue を batch drain (per-record flock を償却)
                     if let (Some(wq), Some(wal)) = (
@@ -13864,11 +13892,34 @@ impl Engine {
                     }
 
                     if !drained_any {
-                        // yield_now alone is effectively a busy-spin on multi-core
-                        // (OS reschedules immediately). Sleep briefly so the consumer
-                        // doesn't peg a core when the queue is idle. fsync runs every
-                        // 100ms so 1ms tick is plenty fine-grained.
-                        std::thread::sleep(Duration::from_millis(1));
+                        // #391: 仕事が無い間は寝て、 書き手が積んだ / WAL に書いた / 閉じる / WAL の空きを待つ書き手が
+                        // 居る時に起こされる (旧: 1 ms ごとに起きて見回り = 何もしない DB 1 つで 1 秒 500 回)。
+                        // 時間で起きるのは、 書き出し (100 ms ごと) や畳みがまだ残っている間だけ
+                        let timeout = match oplog_for_thread.as_ref() {
+                            None => None,
+                            Some(wal) => {
+                                let behind = wal.head() > wal.checkpoint()
+                                    || wal.head() > enchudb_oplog::oplog::HEADER_SIZE as u64
+                                    || engine.wal_room_wanted.load(Ordering::Acquire);
+                                if behind {
+                                    Some(fsync_interval.saturating_sub(last_fsync.elapsed()).max(Duration::from_millis(1)))
+                                } else if engine.sync_tables_enabled()
+                                    || !listeners_for_thread.read().unwrap_or_else(|p| p.into_inner()).is_empty()
+                                {
+                                    // sync の bridge (相手の ack で `_sync_ops` が空くのを待つ等) / changefeed は時間で
+                                    // 見直す物が残りうるので、 1 秒ごとには起きる
+                                    Some(Duration::from_secs(1))
+                                } else {
+                                    None
+                                }
+                            }
+                        };
+                        waker.sleep(timeout, || {
+                            q_for_thread.is_empty()
+                                && oplog_record_queue_for_thread.as_ref().is_none_or(|w| w.is_empty())
+                                && !flag_for_thread.load(Ordering::Acquire)
+                                && !engine.wal_room_wanted.load(Ordering::Acquire)
+                        });
                     }
                 }
             })
@@ -13890,7 +13941,9 @@ impl Engine {
             return false;
         }
         let folded = self.make_wal_room(wal);
-        if !folded {
+        // 畳めなかったと覚えるのは、 まだ空きが無い時だけ (他の経路が先に畳んでいた = 空いているのは失敗ではない。 覚えると
+        // 待っている書き手が 「今は畳めない」 と見て諦める)
+        if !folded && wal.free_bytes() < wal.capacity() / 4 {
             *self.wal_room_failed_at.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::time::Instant::now());
         }
         folded
@@ -13926,8 +13979,11 @@ impl Engine {
         if wal.head() <= enchudb_oplog::oplog::HEADER_SIZE as u64 {
             return false;
         }
-        // 開いている group を閉じる (満杯なら打てないが、 本体に書き出してから畳むので復旧には要らない)
-        let _ = self.append_commit_marker(wal);
+        // 開いている group を閉じる。 満杯 (Commit 1 つも入らない) なら打たない — 本体に書き出してから畳むので復旧には
+        // 要らず、 打てば満杯で落ちて 「打てなかった Commit」 に数わる
+        if !wal.append_dead() {
+            let _ = self.append_commit_marker(wal);
+        }
         // checkpoint を進める前に sidecar を固める (consumer の tick と同じ)
         self.try_persist_tables();
         let direct = !self.sync_tables_enabled()
@@ -14004,9 +14060,24 @@ impl Engine {
                 return wal.free_bytes() >= size;
             }
             self.wal_room_wanted.store(true, Ordering::Release);
+            if let Some(w) = self.consumer_waker() {
+                w.wake();
+            }
             std::thread::sleep(std::time::Duration::from_micros(200));
         }
         wal.free_bytes() >= size
+    }
+
+    /// #391: consumer thread が起きた (loop を回った) 回数。 何も書いていない間は増えない
+    /// (sync / changefeed を使う DB は 1 秒に 1 回、 書き出しや畳みが残っている間は 100 ms に 1 回)。
+    pub fn consumer_wakeups(&self) -> u64 {
+        self.consumer_wakeups.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #391: consumer を起こす係 (consumer が居なければ None)。
+    #[inline]
+    fn consumer_waker(&self) -> Option<&crate::write_queue::ConsumerWaker> {
+        self.write_queue.as_ref().map(|q| &**q.waker())
     }
 
     /// #388: WAL が満杯の時に consumer が畳んで空いた回数 (書き手は待たされたが、 何も落ちていない)。
@@ -14588,7 +14659,7 @@ impl Engine {
             let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
             let rec = enchudb_oplog::oplog::OwnedOp::Tie { eid: oplog_eid, himo_id, value };
             if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec, hlc, &self.consumer_poisoned, &self.wal_push_count);
+                push_oplog_record_blocking(wq, rec, hlc, &self.consumer_poisoned, &self.wal_push_count, self.consumer_waker());
             } else {
                 let _ = wal.append_at_hlc(rec.as_op(), hlc);
             }
@@ -14657,7 +14728,7 @@ impl Engine {
                     bytes: value.to_vec(),
                 };
                 if let Some(wq) = self.oplog_record_queue.as_ref() {
-                    push_oplog_record_blocking(wq, rec, hlc, &self.consumer_poisoned, &self.wal_push_count);
+                    push_oplog_record_blocking(wq, rec, hlc, &self.consumer_poisoned, &self.wal_push_count, self.consumer_waker());
                 } else {
                     let _ = wal.append_at_hlc(rec.as_op(), hlc);
                 }
@@ -14710,8 +14781,8 @@ impl Engine {
             };
             if let Some(wq) = self.oplog_record_queue.as_ref() {
                 // Vocab → Tie の順を保つため同一 thread から連続 push
-                push_oplog_record_blocking(wq, vocab_rec, vocab_hlc, &self.consumer_poisoned, &self.wal_push_count);
-                push_oplog_record_blocking(wq, tie_rec, hlc, &self.consumer_poisoned, &self.wal_push_count);
+                push_oplog_record_blocking(wq, vocab_rec, vocab_hlc, &self.consumer_poisoned, &self.wal_push_count, self.consumer_waker());
+                push_oplog_record_blocking(wq, tie_rec, hlc, &self.consumer_poisoned, &self.wal_push_count, self.consumer_waker());
             } else {
                 let _ = wal.append_at_hlc(vocab_rec.as_op(), vocab_hlc);
                 let _ = wal.append_at_hlc(tie_rec.as_op(), hlc);
@@ -14765,7 +14836,7 @@ impl Engine {
                 eid: oplog_eid, himo_id, value: target_local as u64,
             };
             if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec, hlc, &self.consumer_poisoned, &self.wal_push_count);
+                push_oplog_record_blocking(wq, rec, hlc, &self.consumer_poisoned, &self.wal_push_count, self.consumer_waker());
             } else {
                 let _ = wal.append_at_hlc(rec.as_op(), hlc);
             }
@@ -14797,7 +14868,7 @@ impl Engine {
             let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
             let rec = enchudb_oplog::oplog::OwnedOp::Untie { eid: oplog_eid, himo_id };
             if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec, hlc, &self.consumer_poisoned, &self.wal_push_count);
+                push_oplog_record_blocking(wq, rec, hlc, &self.consumer_poisoned, &self.wal_push_count, self.consumer_waker());
             } else {
                 let _ = wal.append_at_hlc(rec.as_op(), hlc);
             }
@@ -14820,7 +14891,7 @@ impl Engine {
             let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
             let rec = enchudb_oplog::oplog::OwnedOp::Delete { eid: oplog_eid };
             if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec, hlc, &self.consumer_poisoned, &self.wal_push_count);
+                push_oplog_record_blocking(wq, rec, hlc, &self.consumer_poisoned, &self.wal_push_count, self.consumer_waker());
             } else {
                 let _ = wal.append_at_hlc(rec.as_op(), hlc);
             }
@@ -15082,6 +15153,10 @@ impl Drop for Engine {
         }
         if let Some(flag) = &self.shutdown_flag {
             flag.store(true, Ordering::Release);
+        }
+        // #391: 寝ている consumer を起こして最終 drain に入らせる
+        if let Some(w) = self.consumer_waker() {
+            w.wake();
         }
         // consumer スレッドは shutdown flag を検知したら最終 drain を行って exit する。
         if let Ok(mut h) = self.consumer_handle.lock() {
