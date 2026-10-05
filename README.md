@@ -446,12 +446,15 @@ A SQLite-WAL-style model: **one writer process + unlimited readers**.
 |---|---|---|---|
 | Write + read | `Engine::open_concurrent_with_oplog` / `Engine::open_standalone` | exclusive | 1 |
 | Read only | `Engine::open_readonly` / `Database::open_readonly` | none | unlimited |
+| Read only, no writer ever | `Engine::open_immutable` / `Database::open_immutable` | none | unlimited |
 
 The writer holds `flock(LOCK_EX)` on `{path}/lock` for the engine's lifetime. A second writer blocks until the first is dropped (same as sqlite's default). Readonly opens take no lock, so they coexist with the writer; calling a write API on one panics so you notice immediately.
 
 Reading variable-length text (`Leaf` / text himos) while a writer is live should go through `Engine::get_text_owned`, which returns an owned `Vec<u8>` via a per-slot gen-seqlock (the borrowing `get_text` is for single-threaded / quiesced access). This is what makes cross-process readonly reads of live text torn-read-safe ([#106](https://github.com/Mutafika/enchudb/issues/106) / [#113](https://github.com/Mutafika/enchudb/issues/113)).
 
 The same applies to the other two borrowing reads: use `get_content_owned` instead of `get_content`, and `get_entity_owned` instead of `get_entity`. Debug builds enforce this ([#107](https://github.com/Mutafika/enchudb/issues/107)): a borrowed read of a `Leaf` value panics on an `open_readonly` engine, and on any engine where another thread has written `Leaf` values since borrowed reads began (a concurrent writer, the consumer applying `tie_text_async`, a sync apply). Writing and reading from one thread, reading from many threads after writes have finished, and `Tag` columns are not affected. Release builds do nothing.
+
+For a DB that no process will ever write again (built elsewhere, then published by swapping the directory in), open it with `open_immutable` ([#395](https://github.com/Mutafika/enchudb/issues/395)). Like `open_readonly` it takes no lock, so any number of readers open it at once and a writer is never kept waiting, but borrowed `Leaf` reads are allowed. Opening fails with `WouldBlock` if a writer has the DB open. In debug builds every borrowed `Leaf` read checks that no writer has the DB open at that moment, and panics if one does.
 
 For a GUI app + CLI sharing one DB, the recommended pattern is **the GUI opens `open_readonly` and the CLI opens as a writer subprocess**. See [`docs/concurrency.md`](./docs/concurrency.md).
 

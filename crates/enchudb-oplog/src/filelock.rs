@@ -57,6 +57,21 @@ pub fn try_lock_exclusive(f: &File) -> io::Result<bool> {
     }
 }
 
+/// 排他 lock を誰か (別の open file description) が持っているかを、 lock を持ち続けずに見る (#395)。 共有 lock を
+/// block せずに試し、 取れたらすぐ外す。 `Some(true)` = 持っている、 `Some(false)` = 持っていない、 `None` = この FS は
+/// lock を持たない (分からない)。 `f` は読み取りだけで開いた file でよい。
+pub fn exclusive_held(f: &File) -> io::Result<Option<bool>> {
+    match f.try_lock_shared() {
+        Ok(()) => {
+            unlock(f)?;
+            Ok(Some(false))
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Ok(Some(true)),
+        Err(std::fs::TryLockError::Error(e)) if e.kind() == io::ErrorKind::Unsupported => fallback_exclusive_held(f),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
 /// [`lock_exclusive`] で取った lock を明示的に解放する。 `LockOutcome::Unsupported`
 /// だった file に対して呼んでも成功扱い (解放するものが無い)。
 pub fn unlock(f: &File) -> io::Result<()> {
@@ -82,6 +97,19 @@ fn fallback_try_lock(f: &File) -> io::Result<bool> {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
         Err(e) if lock_unavailable(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(unix)]
+fn fallback_exclusive_held(f: &File) -> io::Result<Option<bool>> {
+    match raw_flock(f, libc::LOCK_SH | libc::LOCK_NB) {
+        Ok(()) => {
+            fallback_unlock(f)?;
+            Ok(Some(false))
+        }
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(Some(true)),
+        Err(e) if lock_unavailable(&e) => Ok(None),
         Err(e) => Err(e),
     }
 }
@@ -133,6 +161,11 @@ fn fallback_lock_exclusive(_f: &File) -> io::Result<LockOutcome> {
 #[cfg(not(unix))]
 fn fallback_try_lock(_f: &File) -> io::Result<bool> {
     Ok(false)
+}
+
+#[cfg(not(unix))]
+fn fallback_exclusive_held(_f: &File) -> io::Result<Option<bool>> {
+    Ok(None)
 }
 
 #[cfg(not(unix))]
@@ -214,6 +247,26 @@ mod tests {
         unlock(&other).unwrap();
         assert!(fallback_try_lock(&other).unwrap(), "fallback: 解放後に取れない");
         drop(other);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #395: 排他の保持者が居るかを、 共有 lock を持ち続けずに見る。 読み取りだけで開いた fd からも。 見た後は
+    /// 書き手が排他を取れる (見る側が lock を残さない)。 fallback (Android の経路) も同じ。
+    #[test]
+    fn exclusive_held_probes_without_keeping_a_lock() {
+        let dir = std::env::temp_dir().join(format!("enchudb-filelock-held-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lock");
+        let writer = open(&path);
+        let reader = std::fs::File::open(&path).unwrap();
+        assert_eq!(exclusive_held(&reader).unwrap(), Some(false));
+        assert_eq!(fallback_exclusive_held(&reader).unwrap(), Some(false));
+        assert!(try_lock_exclusive(&writer).unwrap(), "見た側が共有 lock を残している");
+        assert_eq!(exclusive_held(&reader).unwrap(), Some(true));
+        assert_eq!(fallback_exclusive_held(&reader).unwrap(), Some(true));
+        unlock(&writer).unwrap();
+        assert_eq!(exclusive_held(&reader).unwrap(), Some(false));
+        drop((writer, reader));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

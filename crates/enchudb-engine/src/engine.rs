@@ -910,6 +910,48 @@ pub(crate) struct WriterLock {
     key: std::path::PathBuf,
 }
 
+/// `open_immutable` の 「書き手は居ない」 という宣言を debug build で確かめるための、 writer lock の file (#395)。
+/// lock は持たない (書き手を待たせない)。 借用の読みのたびに、 誰かが排他を持っていないかを見るだけ。
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+pub(crate) struct ImmutableWatch {
+    lock_path: std::path::PathBuf,
+    /// 読み取りだけで開いた lock file。 開いた時に無ければ None (書き手が開けば作られるので、 見るたびに開き直す)。
+    file: std::sync::Mutex<Option<std::fs::File>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ImmutableWatch {
+    fn new(path: &str) -> io::Result<Self> {
+        let lock_path = writer_lock_path_for(path);
+        let w = Self { lock_path, file: std::sync::Mutex::new(None) };
+        if w.writer_present()? == Some(true) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "\"{path}\" is open for writing in another Engine; open_immutable requires that no writer \
+                     exists (use open_readonly to read alongside a writer)"
+                ),
+            ));
+        }
+        Ok(w)
+    }
+
+    /// 今、 書き手 (writer lock の排他) が居るか。 `None` = lock を持たない FS / lock file が無い (= 書き手が
+    /// 1 度も開いていない) で分からない or 居ない。
+    fn writer_present(&self) -> io::Result<Option<bool>> {
+        let mut file = self.file.lock().unwrap_or_else(|p| p.into_inner());
+        if file.is_none() {
+            match std::fs::File::open(&self.lock_path) {
+                Ok(f) => *file = Some(f),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e),
+            }
+        }
+        enchudb_oplog::filelock::exclusive_held(file.as_ref().expect("opened above"))
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for WriterLock {
     fn drop(&mut self) {
@@ -3289,6 +3331,9 @@ pub struct Engine {
     /// 多 process write の同 .db 競合を防ぐ (sqlite WAL モード相当)。
     #[cfg(not(target_arch = "wasm32"))]
     _writer_lock: Option<WriterLock>,
+    /// `open_immutable` で開いた時だけ Some (#395)。 debug build の借用の読みが、 書き手が居ないことを確かめる。
+    #[cfg(not(target_arch = "wasm32"))]
+    immutable: Option<ImmutableWatch>,
     backing: Backing, // 最後に drop されるよう最終フィールド
 }
 
@@ -3662,6 +3707,7 @@ impl Engine {
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             sidecar_persist_lock: std::sync::Mutex::new(()),
             _writer_lock: Some(writer_lock),
+            immutable: None,
             backing,
         })
     }
@@ -3855,6 +3901,35 @@ impl Engine {
         let eng = Self::open_internal(path, /*verify_region_crc=*/ true, /*take_lock=*/ false, /*readonly=*/ true)?;
         eng.is_readonly.store(true, std::sync::atomic::Ordering::Release);
         Ok(eng)
+    }
+
+    /// 書き手の居ない DB を読むだけで開く (#395)。 `open_readonly` と同じく lock を取らず (読み手は何 process でも
+    /// 同時に開ける、 書き手を待たせない)、 書き込み API は error。 違いは、 Leaf の借用の読み (`get_text` /
+    /// `get_content` / `get_entity`) を debug build で止めないこと — 作り終えて公開した DB (次の版は別の directory
+    /// に作って差し替える) のように、 **書き手が二度と開かない** DB 用。
+    ///
+    /// 開く時に書き手が居れば `ErrorKind::WouldBlock` (書き手と並べて読むなら `open_readonly` と `get_*_owned`)。
+    /// 開いた後に書き手が来ると、 借用が指す mmap を書き換えうる (#106) — debug build は借用の読みのたびに書き手が
+    /// 居ないかを見て、 居れば panic する。 release build は開く時だけ見る。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_immutable(path: &str) -> io::Result<Self> {
+        Self::check_db_dir(path)?;
+        let watch = ImmutableWatch::new(path)?;
+        let mut eng = Self::open_readonly(path)?;
+        eng.immutable = Some(watch);
+        Ok(eng)
+    }
+
+    /// `open_immutable` で開いたか (#395)。
+    pub fn is_immutable(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.immutable.is_some()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
     }
 
     /// `open` は WAL 有効 + `Arc<Self>` 返し。
@@ -4733,6 +4808,8 @@ impl Engine {
             sidecar_persist_lock: std::sync::Mutex::new(()),
             #[cfg(not(target_arch = "wasm32"))]
             _writer_lock: None, // caller (open_internal) が後から差し替える
+            #[cfg(not(target_arch = "wasm32"))]
+            immutable: None,
             backing,
         };
 
@@ -9266,7 +9343,8 @@ impl Engine {
     /// 「copy 版を呼ぶ」 という約束が engine の外に残る。 その約束が破れうる状況を止める:
     ///
     /// - **`open_readonly`**: 別 process の書き手と共存するための開き方。 書き手が居るかは見えないので常に止める
-    ///   (書き手の居ない file を読むだけなら `open_standalone`)
+    ///   (書き手の居ない file を読むだけなら `open_immutable`)
+    /// - **`open_immutable`** (#395): 書き手は居ない宣言。 止めるのは、 その時点で書き手 (writer lock の排他) が居る時だけ
     /// - **別の thread が Leaf を書いている engine**: 借用の読みが始まった後に、 その読み手でない thread が
     ///   Leaf を置いた / 返した (`leaf_store::BorrowWatch`)。 並行の書き手、 async の書き込みを適用する
     ///   consumer thread、 sync の apply がこれに当たる
@@ -9276,11 +9354,24 @@ impl Engine {
     #[cfg(debug_assertions)]
     fn debug_check_leaf_borrow(&self, leaf: &LeafStore, hid: usize) {
         let himo = self.himo_names.get(hid).map(String::as_str).unwrap_or("?");
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(w) = &self.immutable {
+            // 書き手は居ない宣言 (#395): 本当に居ないかだけ見る。 この engine 自身は書かない
+            if w.writer_present().ok().flatten() == Some(true) {
+                panic!(
+                    "#395: borrowed read of Leaf himo '{himo}' on an open_immutable Engine while a writer has the DB \
+                     open. open_immutable declares that no writer exists; a borrowed &[u8] points into the live mmap \
+                     that writer may rewrite. Use open_readonly with get_text_owned / get_content_owned / \
+                     get_entity_owned to read alongside a writer."
+                );
+            }
+            return;
+        }
         if self.is_readonly() {
             panic!(
                 "#107: borrowed read of Leaf himo '{himo}' on a read-only Engine. open_readonly coexists with a \
                  writer in another process, and a borrowed &[u8] points into the live mmap that writer may \
-                 rewrite. Use get_text_owned / get_content_owned / get_entity_owned (or open_standalone when \
+                 rewrite. Use get_text_owned / get_content_owned / get_entity_owned (or open_immutable when \
                  no writer exists)."
             );
         }

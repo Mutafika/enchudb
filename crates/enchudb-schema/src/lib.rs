@@ -466,6 +466,20 @@ impl Database {
         Ok(db)
     }
 
+    /// 書き手の居ない DB を読むだけで開く (#395、 [`Engine::open_immutable`])。 `open_readonly` と同じく lock を
+    /// 取らず何 process でも同時に開けるが、 Leaf の借用の読みを debug build で止めない。 作り終えて公開した DB
+    /// (次の版は別の directory に作って差し替える) 用。 開く時に書き手が居れば error。
+    pub fn open_immutable(path: &str) -> Result<Self, SchemaError> {
+        let eng = Engine::open_immutable(path).map_err(|e| SchemaError::Io(e.to_string()))?;
+        let mut db = Self {
+            eng: Arc::new(eng),
+            tables: Vec::new(),
+            is_concurrent: false,
+        };
+        db.load_schema()?;
+        Ok(db)
+    }
+
     pub fn open(path: &str) -> Result<Self, SchemaError> {
         let eng = Engine::open_standalone(path).map_err(|e| SchemaError::Io(e.to_string()))?;
         let mut db = Self {
