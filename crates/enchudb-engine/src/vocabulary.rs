@@ -134,6 +134,28 @@ const INDEX_MAGIC_V3: [u8; 4] = [b'V', b'I', b'X', b'3'];
 const INDEX_MAGIC_V2: [u8; 4] = [b'V', b'I', b'X', b'2'];
 const INDEX_HEADER: usize = 16;
 const INDEX_SLOT_SIZE: usize = 13;
+
+/// `claim_index_slot` の結果 (#378)。
+enum Probe {
+    /// 同じ値が既に入っている
+    Found(u32),
+    /// 空の slot (この byte offset) に 「入れている途中」 を置いた
+    Claimed(usize),
+}
+
+/// 索引の slot が 「入れている途中」 (flag 2) でなくなるまで待つ。 置いた書き手は番号を取って data を書く間 (ページを
+/// 伸ばす syscall を含みうる) 持つので、 少し回ったら他の thread に譲る。
+fn wait_slot(flag: &std::sync::atomic::AtomicU8) {
+    let mut spins = 0u32;
+    while flag.load(Ordering::Acquire) == 2 {
+        if spins < 64 {
+            std::hint::spin_loop();
+            spins += 1;
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
 /// index header の中の今の表 (`Gen`) の位置 (8 byte、 atomic)。
 const GEN_OFF: usize = 8;
 /// 最初の表の slot 数 (13 KB)。
@@ -586,38 +608,117 @@ impl Vocabulary {
     /// #381: 回収が有効な辞書で、 返した番号を cell に書くなら `try_get_or_insert_pinned` を使う (こちらは押さえない
     /// ので、 書くまでの間に回収されうる — 書く時に世代で弾かれる)。
     pub fn try_get_or_insert(&self, value: &[u8]) -> Result<u32, VocabFail> {
-        if let Some(id) = self.lookup(value) { return Ok(id); }
-        let id = self.try_insert(value)?;
-        // 並列挿入の競合チェック: 別スレッドが先に同じ値を挿入した場合、先着のidを使う
-        if let Some(winner) = self.lookup(value) {
-            if winner != id { return Ok(winner); }
-        }
-        Ok(id)
+        self.get_or_insert_unique(value, false)
     }
 
     /// `try_get_or_insert` の押さえる版 (#381): 返した番号の参照を 1 つ持った状態で返す (cell に書くまでの間に
     /// 回収されない)。 書いた後 (書けても書けなくても) `release` で返すこと。 回収が無効なら `try_get_or_insert` と同じ。
     pub fn try_get_or_insert_pinned(&self, value: &[u8]) -> Result<u32, VocabFail> {
+        self.get_or_insert_unique(value, true)
+    }
+
+    /// `try_get_or_insert` / `_pinned` の本体 (#378)。 同じ値を同時に入れる書き手が居ても、 番号と data は 1 つしか使わない。
+    ///
+    /// 旧: 番号と data を取ってから索引に入れていた。 同じ値を同時に入れた側はどちらも番号と data を取り、 索引に入れられ
+    /// なかった側の分が残った (8 thread で値の 4〜5 倍)。 今は先に索引の slot に 「入れている途中」 (flag 2) を置き、
+    /// それを置けた側だけが番号と data を取る。 同じ値を入れようとする側は、 途中の slot が確定する (flag 1) のを待って
+    /// 値を比べ、 先に入った番号を使う。 slot を置いてから確定するまで、 表は伸ばさない (`grow_lock` の read を持つ)。
+    fn get_or_insert_unique(&self, value: &[u8], pinned: bool) -> Result<u32, VocabFail> {
+        // #381: 1 語の長さは 30 bit まで (offsets の長さの上位 2 bit は世代)
+        if value.len() > LEN_MASK as usize {
+            return Err(VocabFail::Full);
+        }
+        let h = fxhash(value);
+        let mut healed = false;
         loop {
             if let Some(id) = self.lookup(value) {
-                if self.acquire(id) {
+                if !pinned || self.acquire(id) {
                     return Ok(id);
                 }
                 // 引いた後に回収された: 引き直す (次は見つからないか、 別の書き手が入れ直した番号)
                 continue;
             }
-            let id = self.try_insert_with(value, true)?;
-            // 並列挿入の競合: 先着の番号を使う。 自分の番号は押さえを返す (参照 0 = 回収の候補、 #378 の負け番号)
-            if let Some(winner) = self.lookup(value)
-                && winner != id
-            {
-                self.release(id);
-                if self.acquire(winner) {
-                    return Ok(winner);
+            let guard = self.grow_lock.read().unwrap_or_else(|p| p.into_inner());
+            let off = match self.claim_index_slot(h, value) {
+                Ok(Probe::Found(id)) => {
+                    drop(guard);
+                    if !pinned || self.acquire(id) {
+                        return Ok(id);
+                    }
+                    continue;
                 }
-                continue;
+                Ok(Probe::Claimed(off)) => off,
+                // 表が死んだ entry で埋まっている (#381): 作り直してもう 1 回
+                Err(_) if !healed && self.stale_entries.load(Ordering::Relaxed) > 0 => {
+                    drop(guard);
+                    healed = true;
+                    self.rebuild_table(true);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let flag = self.index.as_atomic_u8(off);
+            match self.alloc_entry(value, pinned) {
+                Ok(id) => {
+                    self.index.write_at(off + 1, &h.to_le_bytes());
+                    self.index.write_at(off + 9, &id.to_le_bytes());
+                    flag.store(1, Ordering::Release);
+                    self.index.mark_dirty(off, INDEX_SLOT_SIZE);
+                    drop(guard);
+                    // #374: 語数が表の半分を超えたら伸ばす
+                    self.maybe_grow();
+                    return Ok(id);
+                }
+                Err(e) => {
+                    // 置いた slot を空に戻す (待っている書き手は空を見て入れ直す)
+                    flag.store(0, Ordering::Release);
+                    return Err(e);
+                }
             }
-            return Ok(id);
+        }
+    }
+
+    /// 今の表で `value` を探し、 無ければ空の slot に 「入れている途中」 (flag 2) を置いて、 その位置を返す (#378)。
+    /// 呼び手は `grow_lock` の read を持っていること (置いた slot を確定させるまで表を変えさせない)。
+    fn claim_index_slot(&self, h: u64, value: &[u8]) -> Result<Probe, VocabFail> {
+        let g = self.table();
+        let mask = (g.cap() - 1) as u64;
+        let mut idx = home_slot(h, g.cap());
+        let mut probes = 0usize;
+        loop {
+            if probes >= g.cap() as usize {
+                return Err(if g.cap() >= self.index_cap() { VocabFail::Full } else { VocabFail::Space });
+            }
+            probes += 1;
+            let off = g.slot_off(idx);
+            if self.index.ensure_committed_sparse(off + INDEX_SLOT_SIZE, INDEX_SLOT_SIZE).is_err() {
+                return Err(VocabFail::Space);
+            }
+            let flag = self.index.as_atomic_u8(off);
+            match flag.load(Ordering::Acquire) {
+                0 => {
+                    if flag.compare_exchange(0, 2, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                        return Ok(Probe::Claimed(off));
+                    }
+                    continue; // 取られた: 同じ slot を見直す
+                }
+                2 => {
+                    wait_slot(flag);
+                    continue; // 確定 (か空に戻った) slot を見直す
+                }
+                _ => {}
+            }
+            let (slot_hash, vid) = {
+                let xm = self.index.slice();
+                (
+                    u64::from_le_bytes(xm[off + 1..off + 9].try_into().unwrap()),
+                    u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap()),
+                )
+            };
+            if slot_hash == h && self.get_checked(vid) == Some(value) {
+                return Ok(Probe::Found(vid));
+            }
+            idx = ((idx as u64 + 1) & mask) as usize;
         }
     }
 
@@ -871,6 +972,11 @@ impl Vocabulary {
         for _ in 0..g.cap() as usize {
             let off = g.slot_off(idx);
             if xm[off] == 0 { return None; }
+            // 入れている途中 (#378): まだ無い語として先を見る (書き手は確定するまで待って見直す)
+            if xm[off] == 2 {
+                idx = ((idx as u64 + 1) & mask) as usize;
+                continue;
+            }
             let slot_hash = u64::from_le_bytes(xm[off + 1..off + 9].try_into().unwrap());
             if slot_hash == h {
                 let vid = u32::from_le_bytes(xm[off + 9..off + 13].try_into().unwrap());
@@ -912,16 +1018,35 @@ impl Vocabulary {
         if value.len() > LEN_MASK as usize {
             return Err(VocabFail::Full);
         }
-        // #381: 回収した場所があれば、 新しい番号より先に使い回す
-        if let Some(slot) = self.claim() {
-            return self.insert_into_claimed(slot, value, pinned);
-        }
         // 索引の home slot のページを先に確保する。 空き不足で断られるのは大抵ここなので、 採番・data の書き込みの
         // 前に止めて orphan を作らない (表はこの後で伸びうるので、 確かめるのは今の表)
         let g = self.table();
         let home = g.slot_off(home_slot(fxhash(value), g.cap()));
         if self.index.ensure_committed_sparse(home + INDEX_SLOT_SIZE, INDEX_SLOT_SIZE).is_err() {
             return Err(VocabFail::Space);
+        }
+        let id = self.alloc_entry(value, pinned)?;
+        // #59: index が満杯で登録できないなら 「vocab 満杯」 と同じ扱いにする
+        // (dedup が黙って壊れるより、 write を拒否させる方が安全)。 data/offsets に
+        // 書いた分は orphan になる (満杯なら terminal、 空き不足は probe が home のページを
+        // 越えた時だけ)。
+        if let Err(e) = self.index_insert_healing(value, id) {
+            if pinned {
+                self.release(id);
+            }
+            return Err(e);
+        }
+        // #374: 語数が表の半分を超えたら伸ばす
+        self.maybe_grow();
+        Ok(id)
+    }
+
+    /// 番号を取り、 data と offsets に `value` を書く (索引にはまだ入れない)。 回収した場所があれば使い回す (#381)。
+    /// `pinned` なら返す番号の参照を 1 つ持った状態で返す。
+    fn alloc_entry(&self, value: &[u8], pinned: bool) -> Result<u32, VocabFail> {
+        // #381: 回収した場所があれば、 新しい番号より先に使い回す
+        if let Some(slot) = self.claim() {
+            return self.fill_claimed(slot, value, pinned);
         }
         let len = value.len() as u32;
         // #328: data / offsets も番号を取る前に伸ばせるか見る (取った後に伸ばせないと番号を捨てることになる)。
@@ -1001,24 +1126,12 @@ impl Vocabulary {
         if pinned && let Some(c) = self.reclaim.get().and_then(|r| r.refs.at(id)) {
             c.store(1, Ordering::Release);
         }
-        // #59: index が満杯で登録できないなら 「vocab 満杯」 と同じ扱いにする
-        // (dedup が黙って壊れるより、 write を拒否させる方が安全)。 data/offsets に
-        // 書いた分は orphan になる (満杯なら terminal、 空き不足は probe が home のページを
-        // 越えた時だけ)。
-        if let Err(e) = self.index_insert_healing(value, id) {
-            if pinned {
-                self.release(id);
-            }
-            return Err(e);
-        }
-        // #374: 語数が表の半分を超えたら伸ばす
-        self.maybe_grow();
         Ok(id)
     }
 
-    /// 回収した場所 `slot` (参照 CLAIMED) に `value` を入れ、 世代を 1 つ進めた番号を返す (#381)。 data は今までと
-    /// 同じく末尾に足す (前の語の byte は残る — 借用で読んでいる読み手の中身は変わらない)。
-    fn insert_into_claimed(&self, slot: u32, value: &[u8], pinned: bool) -> Result<u32, VocabFail> {
+    /// 回収した場所 `slot` (参照 CLAIMED) に `value` を書き、 世代を 1 つ進めた番号を返す (#381、 索引にはまだ入れない)。
+    /// data は今までと同じく末尾に足す (前の語の byte は残る — 借用で読んでいる読み手の中身は変わらない)。
+    fn fill_claimed(&self, slot: u32, value: &[u8], pinned: bool) -> Result<u32, VocabFail> {
         let len = value.len() as u32;
         let limit = self.data_limit.load(Ordering::Relaxed) as u64;
         let Ok(offset) = self.data_end.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
@@ -1052,15 +1165,7 @@ impl Vocabulary {
         r.claims.fetch_add(1, Ordering::Relaxed);
         // 前の語の entry は死んだまま表に残る
         self.stale_entries.fetch_add(1, Ordering::Relaxed);
-        let vid = make_vid(generation, slot);
-        if let Err(e) = self.index_insert_healing(value, vid) {
-            if pinned {
-                self.release(vid);
-            }
-            return Err(e);
-        }
-        self.maybe_grow();
-        Ok(vid)
+        Ok(make_vid(generation, slot))
     }
 
     /// `index_insert`、 表が死んだ entry で埋まって入らなければ作り直してもう 1 回 (#381)。
@@ -1130,9 +1235,7 @@ impl Vocabulary {
                 }
             }
             if f == 2 {
-                while self.index.as_atomic_u8(off).load(Ordering::Acquire) == 2 {
-                    std::hint::spin_loop();
-                }
+                wait_slot(flag);
                 continue;
             }
             // f == 1 (committed): hash/id は flag=1 の Release publish より前に書かれ、
@@ -2234,8 +2337,8 @@ mod tests {
     /// #374: 書き手が多数でも、 表を伸ばす間に入れた語は失われず、 同じ値に 2 つの id を返さない
     /// (`grow_lock` で書き込みを止め、 切り替えた後の表に入れる)。
     ///
-    /// 同じ値を同時に入れると、 負けた側の番号は使われずに残る (data にも残る)。 この書き方 (8 thread が 143 歩ずつ
-    /// ずれて同じ値を追う) では値の 4〜5 倍の番号を使う — 0.28.5 でも同じなので、 番号の上限は広く取る。
+    /// #378: 同じ値を同時に入れても番号は値 1 つにつき 1 つ (8 thread が 143 歩ずつずれて同じ値を追うこの書き方で、
+    /// 直す前は値の 4〜5 倍の番号を使った)。
     #[test]
     fn issue374_concurrent_writers_across_growth() {
         use std::sync::Arc;
@@ -2272,6 +2375,31 @@ mod tests {
             assert_eq!(w.lookup(format!("c{k}").as_bytes()), *id, "c{k}");
         }
         assert!(w.index_table_slots() >= 2 * distinct as u32, "前提: 表が伸びている");
+        assert_eq!(w.count(), distinct as u32, "値 {distinct} 個に番号 {} 個 (#378)", w.count());
+    }
+
+    /// #378: 一杯で番号を取れなかった `try_get_or_insert` は、 索引に置いた 「入れている途中」 を空に戻す。 戻さないと、
+    /// 同じ値 (同じ home slot) をもう一度入れる書き手が確定を待ち続ける。
+    #[test]
+    fn issue378_a_full_insert_releases_its_slot() {
+        use std::sync::Arc;
+        let r = make_regions(64, 64, 1 << 16);
+        let w = Arc::new(r.vocab_init(4, 64));
+        for k in 0..4 {
+            w.try_get_or_insert(format!("f{k}").as_bytes()).unwrap();
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let w2 = w.clone();
+        std::thread::spawn(move || {
+            let a = w2.try_get_or_insert(b"over");
+            let b = w2.try_get_or_insert(b"over");
+            let c = w2.try_get_or_insert(b"f1");
+            tx.send((a, b, c)).unwrap();
+        });
+        let (a, b, c) = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("一杯で断った後の書き手が止まった");
+        assert_eq!(a, Err(VocabFail::Full));
+        assert_eq!(b, Err(VocabFail::Full));
+        assert_eq!(c, w.lookup(b"f1").ok_or(VocabFail::Full));
     }
 }
 
