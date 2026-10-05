@@ -77,6 +77,18 @@ fn wait_floor_bump(eng: &Arc<Engine>, before: u64) {
     }
 }
 
+/// author の floor が `hlc` 以上になるまで待つ。 engine の約束は 「落ちが止んで 100 ms (遅くとも 5 秒) で、
+/// 落ちた write を全部覆う floor を広告する」 なので、 間の bump の回数は問わず 7 秒で見切る。
+fn wait_floor_covers(eng: &Arc<Engine>, author: PeerId, hlc: Hlc) {
+    let floor = || eng.sync_reclaimed_floors().unwrap_or_default().into_iter().find(|(a, _)| *a == author).map(|(_, h)| h);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(7);
+    while floor().is_none_or(|f| f < hlc) {
+        assert!(std::time::Instant::now() < end, "落ちた write の版数 {hlc:?} が 7 秒たっても floor {:?} を越える", floor());
+        eng.transfer_oplog_to_sync_ops();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 fn has_note(eng: &Arc<Engine>, i: u32, async_: bool) -> bool {
     let Some(e) = eng.pull_raw("notes.note", i).first().copied() else { return false };
     async_ || eng.get_text_owned(e, "notes.body").is_some_and(|b| b == format!("body {i}").as_bytes())
@@ -126,12 +138,11 @@ fn dropped_writes_reach_the_peer(async_: bool, per_peer: bool) {
     let hid = eng_a.himo_id("notes.note").unwrap() as u16;
     settle(&eng_a);
     assert!(burst.iter().all(|e| eng_a.cell_hlc(*e, hid) != Hlc::ZERO), "版数の無い cell がある");
-    // floor は満杯の episode が終わった周に上がる (WAL が畳まれて空いた後の bridge)
-    wait_floor_bump(&eng_a, 0);
-    // 落ちた write の版数は floor 以下 (floor を越えた cursor の puller が取りこぼさない)
-    let floor = eng_a.sync_reclaimed_floors().unwrap().into_iter().find(|(a, _)| *a == 1).unwrap().1;
+    // 落ちた write の版数は、 いずれ floor 以下になる (floor を越えた cursor の puller が取りこぼさない)。
+    // floor は満杯の episode が終わった周に上がる (WAL が畳まれて空いた後の bridge)。 遅い機械では burst の途中に
+    // 落ちない周が挟まって途中で 1 度上がり、 残りは次の bump が覆う (#398) ので、 1 回目の bump では見ない
     let max_cell = burst.iter().map(|e| eng_a.cell_hlc(*e, hid)).max().unwrap();
-    assert!(max_cell <= floor, "落ちた write の版数 {max_cell:?} が floor {floor:?} を越える");
+    wait_floor_covers(&eng_a, 1, max_cell);
     if per_peer {
         sync_a.publish_since_for_peer(2, Hlc::ZERO);
     } else {
