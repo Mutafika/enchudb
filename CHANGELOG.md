@@ -3,6 +3,35 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.30.0 — 2026-10-05
+
+minor。 **on-disk 形式が増えた** (file version 13)。
+
+**上げる時の注意**:
+
+- この版で macOS / Linux / Android に**新しく作った DB は 0.29 以前の binary で開けない** (file version 13)。 旧 binary でも
+  開ける DB が要るなら `GrowableOptions { column_pad: Some(false), .. }`。 iOS 系と Windows は既定で旧形式のまま
+- 既存 DB はそのまま開けて、 形も変わらない。 縮めるなら `Engine::migrate_column_pad(path)` (offline、 移すと version 13)
+- `unpack_to_dir` で展開した DB も、 この OS の既定の形になる。 packed (`pack_dir`) は旧形式 (v12 以下) のまま
+- `GrowableOptions::column_pad` / `Engine::migrate_column_pad` / `column::CELLS_PAD` が増えた
+
+### Fixed — 後ろの table の列が、 先頭から自分の行までの 0 を実ディスクに抱えた (macOS、 #400、 #401)
+
+APFS は書いた所に隣り合う 16 MiB 未満の穴を 0 で埋めて実体化する。 列の cell は DB 全体の通し eid の位置にあるので、 後ろの
+table の列は header と自分の行の間が実ディスクになっていた (列 1 本最大約 16 MB、 eid 約 400 万まで)。 列の cell を header から
+17 MiB 離して、 その穴を埋めさせない (離した分は file の上の穴と仮想の予約だけ)。 列は自分の header で形を名乗るので、 1 つの
+DB に新旧の形が混ざってよい。 先回りして伸ばす歩幅も、 その列の行の量 (1 回 1 MiB まで) で決める。
+
+列 (`himo/`) の実ディスク (macOS):
+
+| 表 × 行 × 列 | 0.29.4 | 0.30.0 (新規 DB) | 0.29.4 の DB を移行 |
+|---|---:|---:|---:|
+| 8 × 10 万 × 5 | 115.8 MB | 26.9 MB | 17.4 MB |
+| 30 × 2 万 × 6 | 421.0 MB | 30.5 MB | 20.5 MB |
+| 2 × 300 万 × 4 | 180.0 MB | 102.9 MB | 96.2 MB |
+
+Linux / Windows の DB は元から穴のままなので、 実ディスクは変わらない。
+
 ## 0.29.4 — 2026-10-05
 
 patch。 on-disk 形式は 0.29.3 と同じ。
