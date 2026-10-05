@@ -16,8 +16,10 @@
 //!   mmap_ahead          — 1 件書き込み + body_msync(mmap 強制 disk) → wal fsync
 //!                         せずに abort。 mmap > WAL の race を deterministic に
 //!                         再現する。 sync 整合性の known issue 検証用。
-//!   signed_loop     — 署名付きで無限書き込み(親が kill する前提)。
-//!                         seed 固定の keypair で WAL に署名レコードを残す。
+//!   signed_loop     — 署名付きで書き続け、 1500 件目の commit を changefeed に配る所で止まる
+//!                         (`held <件数>` を出す、 親が kill する前提)。 seed 固定の keypair で
+//!                         WAL に署名レコードを残す。 止まっている間は WAL が畳まれないので、 kill した時に
+//!                         commit 済みの署名 record が必ず残る (#377、 理由は下の `Hold`)。
 
 fn main() {
     use enchudb_engine::Engine;
@@ -128,12 +130,38 @@ fn main() {
             std::process::abort();
         }
         "signed_loop" => {
+            use enchudb_engine::changefeed::ChangeListener;
+            use enchudb_engine::transport::WireRecord;
             use enchudb_oplog::keys::Keypair;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::Arc;
+
+            /// `hold` が立った後に配られた最初の batch で止まり続ける。 止まるのは consumer か、 oplog_sync を
+            /// 呼んだ main。 consumer なら畳む者が居ない。 main なら書き込みが止まり、 consumer は適用する物が
+            /// 無いので畳みに行かない。 その上で、 配っている間 (配信の lock を持ち、 cursor が head の手前) は
+            /// 畳まない (#337)。 なので配っている batch は WAL に残り続ける。
+            struct Hold(Arc<AtomicBool>);
+            impl ChangeListener for Hold {
+                fn on_changes(&self, records: &[WireRecord]) {
+                    if !self.0.load(Ordering::Acquire) {
+                        return;
+                    }
+                    use std::io::Write;
+                    println!("held {}", records.len());
+                    let _ = std::io::stdout().flush();
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(60));
+                    }
+                }
+            }
+
             // seed 固定で親が pubkey を事前登録できるようにする
             let seed = [7u8; 32];
-            let kp = std::sync::Arc::new(Keypair::from_bytes(&seed));
+            let kp = Arc::new(Keypair::from_bytes(&seed));
             eng.set_peer_id(1);
             eng.set_keypair(Some(kp));
+            let hold = Arc::new(AtomicBool::new(false));
+            eng.add_change_listener(Arc::new(Hold(hold.clone())));
 
             let mut i = 0u32;
             loop {
@@ -143,15 +171,12 @@ fn main() {
                 if i.is_multiple_of(500) {
                     eng.flush_writes();
                     eng.oplog_commit();
+                    if i == 1500 {
+                        // ここから配られる batch で止まる (この oplog_sync か、 先に回った consumer の周)。
+                        // 先に配り終えられて空振りしても、 書き続ける間の次の batch で止まる
+                        hold.store(true, Ordering::Release);
+                    }
                     eng.oplog_sync().unwrap();
-                }
-                // #204: 進捗は sync 境界と独立に細かく出す。sync 直後にだけ print
-                // すると、親の kill が常に「全 record 適用済み = fold され得る窓」
-                // に同期してしまう。細かい print で親が sync 境界の直後 (fold が
-                // 走る前) に kill を刺せるようにする — residue が残る確率を上げる
-                // 部品で、決定化そのものは test 側の bounded retry が担う。
-                if i.is_multiple_of(50) {
-                    println!("{}", i);
                 }
             }
         }
