@@ -286,6 +286,10 @@ pub struct SegmentMap {
     /// (辞書、 #381) は宣言 size で止める — 先回りで file が宣言 size を越えると、 宣言 size で予約する旧 binary が
     /// 「file が予約より大きい」 で開けなくなる。 要る位置そのものはこれを越えても伸ばす。
     grow_cap: AtomicUsize,
+    /// `grow_amortized` の歩幅を `committed - step_base` で決める (既定 0)。 先頭を大きく空けた segment (#400: cell を
+    /// header から離した column) が、 空けた分で最初から最大の歩幅で伸ばさないため — APFS は書いた所に隣り合う 16 MiB
+    /// 未満の穴を埋めるので、 先回りで伸ばした末尾の穴は実ディスクになる。
+    step_base: AtomicUsize,
     /// file-backed に貼ってある byte 数 (page 単位)。 hot path は lock なしで読む。
     committed: AtomicUsize,
     readonly: bool,
@@ -423,6 +427,7 @@ impl SegmentMap {
             base: base as *mut u8,
             reserved: reserve,
             grow_cap: AtomicUsize::new(reserve),
+            step_base: AtomicUsize::new(0),
             committed: AtomicUsize::new(committed),
             readonly,
             grow_lock: Mutex::new(()),
@@ -609,8 +614,26 @@ impl SegmentMap {
             return Ok(());
         }
         const MIN_GROW_STEP: usize = 64 * 1024;
+        const PADDED_MAX_STEP: usize = 1024 * 1024;
         const MAX_GROW_STEP: usize = 16 * 1024 * 1024;
-        let step = cur.max(MIN_GROW_STEP).min(MAX_GROW_STEP);
+        let span = match self.step_base.load(Ordering::Relaxed) {
+            0 => cur,
+            base => {
+                // 先頭を空けた segment (#400): 歩幅は 「最初に書いた位置から先の量」 で決め、 1 回 `PADDED_MAX_STEP` まで。
+                // 先回りで伸ばした末尾の穴は、 APFS が隣を書いた時に埋める (= 歩幅の分だけ実ディスクになる)。 空けた所の
+                // 先 (表の手前の行の分) を量に数えると、 後ろの table の列ほど大きく先回りする
+                let base = if cur <= base {
+                    // 空けた所を越えて初めて伸ばす = ここから書き始める
+                    let first = needed_aligned.saturating_sub(ps).max(base);
+                    self.step_base.store(first, Ordering::Relaxed);
+                    first
+                } else {
+                    base
+                };
+                cur.saturating_sub(base).min(PADDED_MAX_STEP)
+            }
+        };
+        let step = span.clamp(MIN_GROW_STEP, MAX_GROW_STEP);
         let cap = self.grow_cap.load(Ordering::Relaxed).max(needed_aligned);
         let target = cur.saturating_add(step).min(cap).max(needed_aligned).min(self.reserved);
         if target < needed_aligned {
@@ -655,6 +678,11 @@ impl SegmentMap {
 
     pub fn committed(&self) -> usize {
         self.committed.load(Ordering::Acquire)
+    }
+
+    /// `grow_amortized` の歩幅を、 先頭 `bytes` を除いた量で決める (#400)。
+    pub fn set_step_base(&self, bytes: usize) {
+        self.step_base.store(bytes, Ordering::Relaxed);
     }
 
     /// `grow_amortized` の先回りを `bytes` (open と同じく `RESERVE_ALIGN` に切り上げ) で止める (#381)。

@@ -1194,6 +1194,23 @@ fn copy_file_range(
     Ok(zero_runs)
 }
 
+/// 列 (cell を entity の番号で引く `Column`) の segment か (#400: cell を header から離す対象)。
+fn is_column_kind(kind: SegmentKind) -> bool {
+    matches!(kind, SegmentKind::Himo(_) | SegmentKind::Ver(_) | SegmentKind::Tomb)
+}
+
+/// 列の segment file の先頭 16 B から cell の開始位置を読む (#400)。 16 B に満たない file は旧形式。
+#[cfg(not(target_arch = "wasm32"))]
+fn column_cells_offset(f: &mut std::fs::File) -> io::Result<usize> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut h = [0u8; crate::column::HEADER_BYTES];
+    f.seek(SeekFrom::Start(0))?;
+    if f.read_exact(&mut h).is_err() {
+        return Ok(crate::column::HEADER_BYTES);
+    }
+    Ok(crate::column::Column::cells_offset_of(&h))
+}
+
 /// `copy_file_range` が飛ばした全 0 範囲を穴に戻す (macOS / APFS の `F_PUNCHHOLE`)。
 /// 対応しない FS (HFS+ 等) では実体化したままにする = 失敗ではない。 他 OS では seek で
 /// 飛ばした範囲が既に穴なので no-op。 4 KB 未満の端数は punch できないので残す。
@@ -1297,13 +1314,51 @@ impl Engine {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e),
             };
-            let len = f.metadata()?.len().min(layout.segment_size(kind) as u64);
+            let file_len = f.metadata()?.len();
             let off = layout.region_off(kind) as u64;
             let size = layout.segment_size(kind) as u64;
+            let cells = if is_column_kind(kind) { column_cells_offset(&mut f)? } else { crate::column::HEADER_BYTES };
+            if cells != crate::column::HEADER_BYTES {
+                // #400: packed では cell を離さない (header の直後に詰め、 cell の開始位置の欄を 0 = 旧形式に)
+                use std::io::{Read, Seek, SeekFrom, Write};
+                let hb = crate::column::HEADER_BYTES as u64;
+                let mut hdr = [0u8; crate::column::HEADER_BYTES];
+                f.seek(SeekFrom::Start(0))?;
+                f.read_exact(&mut hdr)?;
+                hdr[12..16].fill(0);
+                out.seek(SeekFrom::Start(off))?;
+                out.write_all(&hdr)?;
+                let cell_len = file_len.saturating_sub(cells as u64).min(size - hb);
+                holes.extend(copy_file_range(&mut f, cells as u64, &mut out, off + hb, cell_len)?);
+                if size > hb + cell_len {
+                    holes.push((off + hb + cell_len, size - hb - cell_len));
+                }
+                continue;
+            }
+            let len = file_len.min(size);
             holes.extend(copy_file_range(&mut f, 0, &mut out, off, len)?);
             if size > len {
                 holes.push((off + len, size - len));
             }
+        }
+        if layout.col_pad {
+            // packed の header は離さない形 (v12 以下) にする
+            use std::io::{Read, Seek, SeekFrom, Write};
+            let mut hdr = vec![0u8; layout.header_size];
+            out.seek(SeekFrom::Start(0))?;
+            out.read_exact(&mut hdr)?;
+            hdr[H_COLUMN_PAD..H_COLUMN_PAD + 4].fill(0);
+            let version = if u32::from_le_bytes(hdr[H_VOCAB_RECLAIM..H_VOCAB_RECLAIM + 4].try_into().unwrap()) != 0 {
+                FILE_VERSION_RECLAIM
+            } else if layout.wide.iter().any(|&w| w) {
+                FILE_VERSION_WIDE
+            } else {
+                FILE_VERSION
+            };
+            hdr[H_VERSION..H_VERSION + 4].copy_from_slice(&version.to_le_bytes());
+            write_header_crc(&mut hdr);
+            out.seek(SeekFrom::Start(0))?;
+            out.write_all(&hdr)?;
         }
         punch_holes(&out, &holes)?;
         out.sync_all()?;
@@ -1491,6 +1546,8 @@ impl Engine {
         } else {
             layout.reserve_entities
         };
+        // #400: 展開した directory は、 この binary で新しく作る DB と同じく列の cell を離す (packed は離さない形)
+        let pad_columns = COLUMN_PAD_DEFAULT;
         let dstp = std::path::Path::new(dst);
         std::fs::create_dir(dstp)?;
         std::fs::create_dir(dstp.join("himo"))?;
@@ -1513,6 +1570,11 @@ impl Engine {
                     hdr[H_RESERVE_ENTITIES..H_RESERVE_ENTITIES + 4].copy_from_slice(&new_reserve.to_le_bytes());
                     write_header_crc(&mut hdr);
                 }
+                if pad_columns {
+                    hdr[H_COLUMN_PAD..H_COLUMN_PAD + 4].copy_from_slice(&1u32.to_le_bytes());
+                    hdr[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION_COLPAD.to_le_bytes());
+                    write_header_crc(&mut hdr);
+                }
                 out.write_all(&hdr)?;
             } else if legacy && kind == SegmentKind::Entities {
                 let mut old = vec![0u8; size as usize];
@@ -1528,9 +1590,28 @@ impl Engine {
                 // page 未満でも SegmentMap::open が page に揃える。 ここでは data の末尾まで。
                 let len = used.saturating_sub(off).max(4096.min(size));
                 let copy = len.min(avail_end - off);
-                let holes = copy_file_range(&mut src, off, &mut out, 0, copy)?;
-                out.set_len(len)?;
-                punch_holes(&out, &holes)?;
+                let hb = crate::column::HEADER_BYTES as u64;
+                if pad_columns && is_column_kind(kind) && copy >= hb && {
+                    let mut h = [0u8; crate::column::HEADER_BYTES];
+                    src.seek(SeekFrom::Start(off))?;
+                    src.read_exact(&mut h)?;
+                    h[4..8] != [0, 0, 0, 0] // header の書かれた列だけ (value_size 0 = 未使用の版数列は後で組まれる)
+                } {
+                    // #400: この binary の既定で列の cell を離す
+                    let mut h = [0u8; crate::column::HEADER_BYTES];
+                    src.seek(SeekFrom::Start(off))?;
+                    src.read_exact(&mut h)?;
+                    h[12..16].copy_from_slice(&(crate::column::CELLS_PAD as u32).to_le_bytes());
+                    out.write_all(&h)?;
+                    let cells = crate::column::CELLS_PAD as u64;
+                    let holes = copy_file_range(&mut src, off + hb, &mut out, cells, copy - hb)?;
+                    out.set_len(cells + len - hb)?;
+                    punch_holes(&out, &holes)?;
+                } else {
+                    let holes = copy_file_range(&mut src, off, &mut out, 0, copy)?;
+                    out.set_len(len)?;
+                    punch_holes(&out, &holes)?;
+                }
             }
             out.sync_all()?;
         }
@@ -1564,6 +1645,97 @@ impl Engine {
         // v9 の隣には無いので、 書き終えた segment の実長から作る。
         crate::segments::write_manifest_from_dir(std::path::Path::new(dst_dir))?;
         Ok(())
+    }
+
+    /// 既存 DB の列を、 cell を header から離した形 (#400) に移す (offline、 その場で)。 戻り値は移した列の数。
+    ///
+    /// APFS は、 書いた所に隣り合う 16 MiB 未満の穴を 0 で埋めて実体化する。 列の cell は DB 全体の通し eid の位置にある
+    /// ので、 後ろの table の列は header と自分の行の間の穴が実ディスクになっていた (eid 約 400 万まで)。 移すと各列の
+    /// file は 「header + 0 でない cell」 だけの実ディスクになる。 Linux / Windows の DB は元から穴のままなので、 移しても
+    /// 実ディスクは変わらない。
+    ///
+    /// - 書き手の lock を取る (開いている process が居れば、 閉じるまで待つ。 同じ process で開いていれば `WouldBlock`)
+    /// - 先に header に印を立てて file version を 13 にする (= 0.29 以前の binary は開けなくなる)。 その後、 列ごとに
+    ///   新しい file に写して rename で差し替える。 列は自分の header で形を名乗るので、 途中で落ちても開ける (次に
+    ///   呼べば残りを移す)。 既に移した列は飛ばす
+    /// - `seal_integrity` の `.crc` は消す (列の file が変わるので合わなくなる。 要るなら打ち直す)
+    /// - 写す間、 一番大きな列 1 本分の空きが要る
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn migrate_column_pad(path: &str) -> io::Result<usize> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        Self::check_db_dir(path)?;
+        let _lock = acquire_writer_lock(path)?;
+        let dir = std::path::Path::new(path);
+        let (layout, himo_count) = Self::read_header_layout(path)?;
+        // 前に落ちた移行の書きかけ
+        for sub in ["himo", "ver", ""] {
+            if let Ok(rd) = std::fs::read_dir(dir.join(sub)) {
+                for e in rd.flatten() {
+                    if e.file_name().to_string_lossy().ends_with(".pad.tmp") {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+        }
+        if !layout.col_pad {
+            // 列を 1 本でも離す前に、 旧 binary が開けない印を立てる
+            let hp = dir.join(SegmentKind::Header.rel_path());
+            let mut f = OpenOptions::new().read(true).write(true).open(&hp)?;
+            let mut hdr = vec![0u8; layout.header_size];
+            f.read_exact(&mut hdr)?;
+            hdr[H_COLUMN_PAD..H_COLUMN_PAD + 4].copy_from_slice(&1u32.to_le_bytes());
+            hdr[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION_COLPAD.to_le_bytes());
+            write_header_crc(&mut hdr);
+            f.seek(SeekFrom::Start(0))?;
+            f.write_all(&hdr[..HEADER_SIZE.min(hdr.len())])?;
+            f.sync_all()?;
+        }
+        let _ = std::fs::remove_file(crate::integrity::crc_path_for(path));
+        let hb = crate::column::HEADER_BYTES as u64;
+        let cells = crate::column::CELLS_PAD as u64;
+        let mut moved = 0;
+        for kind in Self::segment_kinds_for(&layout, himo_count).into_iter().filter(|k| is_column_kind(*k)) {
+            let p = dir.join(kind.rel_path());
+            let mut src = match std::fs::File::open(&p) {
+                Ok(f) => f,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            let len = src.metadata()?.len();
+            let mut h = [0u8; crate::column::HEADER_BYTES];
+            if len < hb || src.read_exact(&mut h).is_err() {
+                continue;
+            }
+            // 移し済み / header の無い (まだ使っていない) 列は飛ばす
+            if crate::column::Column::cells_offset_of(&h) != crate::column::HEADER_BYTES || h[4..8] == [0, 0, 0, 0] {
+                continue;
+            }
+            let tmp = p.with_extension("seg.pad.tmp");
+            let r = (|| -> io::Result<()> {
+                let mut out = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+                h[12..16].copy_from_slice(&(crate::column::CELLS_PAD as u32).to_le_bytes());
+                out.write_all(&h)?;
+                let used = last_data_end(&src, hb, len).max(hb);
+                let holes = copy_file_range(&mut src, hb, &mut out, cells, used - hb)?;
+                out.set_len(cells + len - hb)?;
+                punch_holes(&out, &holes)?;
+                out.sync_all()?;
+                std::fs::rename(&tmp, &p)
+            })();
+            if let Err(e) = r {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(io::Error::new(e.kind(), format!("migrate_column_pad: {}: {e}", p.display())));
+            }
+            moved += 1;
+        }
+        #[cfg(unix)]
+        for sub in ["himo", "ver", ""] {
+            if let Ok(d) = std::fs::File::open(dir.join(sub)) {
+                let _ = d.sync_all();
+            }
+        }
+        crate::segments::write_manifest_from_dir(dir)?;
+        Ok(moved)
     }
 }
 
@@ -1913,6 +2085,16 @@ const FILE_VERSION_WIDE: u32 = 11;
 /// 上位 2 bit に世代を置く。 旧 binary は世代の載った長さを巨大な長さと読んで範囲外を引くので開かせない。 v11 (64 bit 列)
 /// の上位 (64 bit 列も持てる)。 回収を有効にした時に刻む。
 const FILE_VERSION_RECLAIM: u32 = 12;
+/// v13 (#400): 列の cell を header から離して置く DB (`H_COLUMN_PAD`)。 旧 binary は列の header の cell の開始位置の欄を
+/// 知らず、 離した cell を header の直後から読む (別の行の値に化ける) ので開かせない。 v11 / v12 の上位。 packed 形式
+/// (`pack_dir`) は離さずに書くので、 packed の version は v12 以下のまま。
+const FILE_VERSION_COLPAD: u32 = 13;
+
+/// #400: 新しく作る DB で列の cell を離すか。 列の予約が 1 本 17 MiB 長くなる (仮想アドレスだけ)。 予約が安い OS
+/// (`RESERVE_IS_CHEAP`: macOS / Linux / Android は今でも列 1 本に 1 GiB 前後を予約している) だけ既定で離す。 iOS 系と
+/// Windows は予約を cap と同値にしている (#320) ので、 17 MiB でも数倍になりうる — 既定では離さない
+/// (`GrowableOptions::column_pad` で明示できる)。
+const COLUMN_PAD_DEFAULT: bool = RESERVE_IS_CHEAP;
 /// v9 = 1 ファイル固定 layout の最終版 (0.19〜0.25)。 v10 の packed 形式 (`from_bytes`) は
 /// byte 互換なので、 Memory backing に限り v9 の blob も受け入れる。
 const FILE_VERSION_LEGACY_V9: u32 = 9;
@@ -2030,6 +2212,11 @@ pub struct GrowableOptions {
     /// 回す (番号の世代を進めるので、 古い番号は該当なしになる)。 file version は 12 になる (旧 binary は開けない)。
     /// 既存 DB は `Engine::enable_vocab_reclaim`。
     pub vocab_reclaim: bool,
+    /// #400: 列の cell を header から離して置く (APFS が 「header と、 後ろの table の行の間の穴」 を実ディスクにしない)。
+    /// `None` = OS の既定 (macOS / Linux / Android は離す、 iOS 系と Windows は離さない — 列の予約が 1 本 17 MiB 長くなる
+    /// (仮想アドレスだけ) ので、 予約を cap と同値にしている OS では既定にしない)。 離すと file version は 13 になる
+    /// (0.29 以前の binary は開けない)。 `Some(false)` は旧 binary でも開ける DB を作る。 既存 DB は `Engine::migrate_column_pad`。
+    pub column_pad: Option<bool>,
 }
 
 impl Default for GrowableOptions {
@@ -2045,6 +2232,7 @@ impl Default for GrowableOptions {
             vocab_max_entries: None,
             reserve_entities: None,
             vocab_reclaim: false,
+            column_pad: None,
         }
     }
 }
@@ -2109,6 +2297,10 @@ const H_RESERVE_ENTITIES: usize = 92; // u32
 /// #381: 辞書の語を回収するか (u32、 0 = しない)。 立っていれば file version は `FILE_VERSION_RECLAIM`。
 /// header CRC の範囲外 (`Engine::enable_vocab_reclaim` が後から立てる)。
 const H_VOCAB_RECLAIM: usize = 96; // u32
+/// #400: 新しく作る列の cell を header から `CELLS_PAD` 離すか (u32、 0 = 離さない)。 立っていれば file version は
+/// `FILE_VERSION_COLPAD`。 既にある列は自分の header (cell の開始位置の欄) が真実で、 1 つの DB に両方の形が混ざってよい
+/// (`Engine::migrate_column_pad` の途中)。 header CRC の範囲外。
+const H_COLUMN_PAD: usize = 100; // u32
 
 /// v10 Phase 3: create 時の reservation 既定。 unix は仮想空間だけなので大きく取る (2^28 entity
 /// = Column 4 B で 1 GB / 版数 16 B で 4 GB の仮想)。 Windows は sparse file を reservation
@@ -2178,7 +2370,7 @@ fn hlc_from_cell(b: &[u8]) -> enchudb_oplog::Hlc {
 /// v9 (request17-A): version column を region から作る。 fresh な (= zero-fill
 /// された) region は Column header が空なので `init`、 既存 v9 DB の region は
 /// `load` する。 判定は header の value_size (offset 4..8) を覗くだけ。
-fn ver_column_from_region(region: Region, max_entities: u32) -> Column {
+fn ver_column_from_region(region: Region, max_entities: u32, padded: bool) -> Column {
     // request18: growable backing では v9 領域は variable cluster の末尾 = 初期
     // commit の外にある。 commit は **単調 high-water** なので、 header 16B を
     // 読むためだけに `ensure_committed` を呼ぶと手前の vocab_data / content_data /
@@ -2190,13 +2382,13 @@ fn ver_column_from_region(region: Region, max_entities: u32) -> Column {
     // 触らずに空 column として組み立ててよい。 header は最初の実書き込み直前に
     // `Column::ensure_header` が書く。
     if !region.is_committed(crate::column::HEADER_BYTES) {
-        return Column::init_lazy(region, HLC_CELL_BYTES, max_entities);
+        return Column::init_lazy(region, HLC_CELL_BYTES, max_entities, padded);
     }
     let stored_vs = u32::from_le_bytes(region.slice()[4..8].try_into().unwrap());
     if stored_vs == HLC_CELL_BYTES {
         Column::load(region)
     } else {
-        Column::init(region, HLC_CELL_BYTES, max_entities)
+        Column::init(region, HLC_CELL_BYTES, max_entities, padded)
     }
 }
 
@@ -2384,6 +2576,9 @@ struct Layout {
     /// 紐ごとに 64 bit 列か (header の型 byte = `ValueType::Number64` から復元、 define で足す)。
     /// 足りない添字は u32 の列。 packed 形式では 64 bit 列は `total_size` の後ろ (`packed_size`)。
     wide: Vec<bool>,
+    /// #400: 列 (himo / 版数 / 削除の印) の cell を header から `CELLS_PAD` 離して置く DB (`H_COLUMN_PAD`)。 予約を
+    /// その分だけ長く取る (packed 形式の大きさ = `segment_size` は変わらない、 packed では離さない)。
+    col_pad: bool,
     ver_col_reserve: usize,
     tomb_reserve: usize,
 }
@@ -2447,14 +2642,17 @@ impl Layout {
         // 行う (整列前の要求値だけを見ていたため、 u32::MAX の create が成功して
         // header に 2^32 が焼かれ、 open 不能な DB ができていた)。
         let leaf_data_size = leaf_data_size.unwrap_or(DEFAULT_LEAF_DATA_SIZE);
-        Self::try_from_params(
+        let mut layout = Self::try_from_params(
             max_entities, max_himos,
             vocab_max_entries, vocab_index_cap, vocab_data_size,
             himoreg_max_entries, himoreg_index_cap, himoreg_data_size,
             content_data_size, leaf_data_size, cyl_max_values,
             cell_version,
             reserve_entities.unwrap_or_else(|| default_reserve_entities(max_entities)),
-        )
+        )?;
+        // 新しく作る DB の既定 (#400)
+        layout.col_pad = COLUMN_PAD_DEFAULT;
+        Ok(layout)
     }
 
     /// 0.9.0 (L1): checked arithmetic 版。 header CRC==0 の legacy DB では
@@ -2661,11 +2859,17 @@ impl Layout {
             himo_col_size64: align8(Column::region_size(max_entities, 8)),
             himo_col_reserve64: align8(Column::region_size(reserve_entities, 8)),
             wide: Vec::new(),
+            col_pad: false,
             ver_col_reserve: align8(Column::region_size(reserve_entities, HLC_CELL_BYTES)),
             tomb_reserve: align8(Column::region_size(reserve_entities, HLC_CELL_BYTES)),
             cyl_max_values,
             total_size: off,
         })
+    }
+
+    /// 列の予約に足す分 (#400、 cell を離さない DB は 0)。
+    fn col_pad_extra(&self) -> usize {
+        if self.col_pad { crate::column::CELLS_PAD - crate::column::HEADER_BYTES } else { 0 }
     }
 
     fn himo_col_off(&self, hid: usize) -> usize {
@@ -2779,10 +2983,10 @@ impl SegmentSizes for Layout {
                 .max(Vocabulary::index_region_size(self.vocab_reserve_entries().next_power_of_two())),
             SegmentKind::Entities => self.entities_size,
             SegmentKind::ContentIndex => self.content_index_reserve,
-            SegmentKind::Himo(h) if self.is_wide(h) => self.himo_col_reserve64,
-            SegmentKind::Himo(_) => self.himo_col_reserve,
-            SegmentKind::Ver(_) => self.ver_col_reserve,
-            SegmentKind::Tomb => self.tomb_reserve,
+            SegmentKind::Himo(h) if self.is_wide(h) => self.himo_col_reserve64 + self.col_pad_extra(),
+            SegmentKind::Himo(_) => self.himo_col_reserve + self.col_pad_extra(),
+            SegmentKind::Ver(_) => self.ver_col_reserve + self.col_pad_extra(),
+            SegmentKind::Tomb => self.tomb_reserve + self.col_pad_extra(),
             _ => self.segment_size(kind),
         }
     }
@@ -3570,6 +3774,10 @@ impl Engine {
             // v9 (request17): per-cell version 領域の有無。 open 側はこの flag だけを見る。
             mmap[H_CELL_VERSION..H_CELL_VERSION + 4]
                 .copy_from_slice(&(layout.has_cell_version() as u32).to_le_bytes());
+            if layout.col_pad {
+                mmap[H_COLUMN_PAD..H_COLUMN_PAD + 4].copy_from_slice(&1u32.to_le_bytes());
+                mmap[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION_COLPAD.to_le_bytes());
+            }
 
             // ヘッダ整合性 CRC
             write_header_crc(mmap);
@@ -3607,7 +3815,7 @@ impl Engine {
         // v9 (request17-A5): tombstone column は himo に依らないので create 時に確保。
         // himo ごとの version column は define_himo_slot_locked で himo と同時に作る。
         let tomb_col = if layout.has_cell_version() {
-            Some(ver_column_from_region(backing.region(SegmentKind::Tomb, &layout), max_entities))
+            Some(ver_column_from_region(backing.region(SegmentKind::Tomb, &layout), max_entities, layout.col_pad))
         } else {
             None
         };
@@ -3808,6 +4016,8 @@ impl Engine {
             opts.reserve_entities,
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let mut layout = layout;
+        layout.col_pad = opts.column_pad.unwrap_or(COLUMN_PAD_DEFAULT);
         let leaf_cap = opts.leaf_scale.cap_bytes();
         if layout.leaf_data_size as u64 > leaf_cap {
             return Err(io::Error::new(
@@ -4287,7 +4497,7 @@ impl Engine {
         let version = u32::from_le_bytes(buf[H_VERSION..H_VERSION + 4].try_into().unwrap());
         let legacy_packed = allow_legacy_packed
             && (FILE_VERSION_LEGACY_V8..=FILE_VERSION_LEGACY_V9).contains(&version);
-        if version != FILE_VERSION && version != FILE_VERSION_WIDE && version != FILE_VERSION_RECLAIM && !legacy_packed {
+        if !(FILE_VERSION..=FILE_VERSION_COLPAD).contains(&version) && !legacy_packed {
             return Err(format!(
                 "unsupported EnchuDB file version {} (this build reads v{}; v8 / v9 single-file \
                  databases must be migrated with Engine::migrate_v9_to_v10, older ones are not supported)",
@@ -4333,6 +4543,8 @@ impl Engine {
             reserve_entities,
         )?;
         layout.load_wide(buf, himo_count);
+        layout.col_pad = version >= FILE_VERSION
+            && u32::from_le_bytes(buf[H_COLUMN_PAD..H_COLUMN_PAD + 4].try_into().unwrap()) != 0;
         Ok((layout, himo_count))
     }
 
@@ -4362,6 +4574,7 @@ impl Engine {
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         v9.wide = l.wide.clone();
+        v9.col_pad = l.col_pad;
         drop(guard);
 
         // 順序: segment file を作る → column を組む → header flag。 逆にすると flag だけ
@@ -4375,12 +4588,14 @@ impl Engine {
             let ver = ver_column_from_region(
                 self.backing.region(SegmentKind::Ver(hid as u32), &*self.layout.read().unwrap()),
                 self.max_entities(),
+                self.layout.read().unwrap().col_pad,
             );
             let _ = self.ver_cols.push(ver);
         }
         self.tomb_col = Some(ver_column_from_region(
             self.backing.region(SegmentKind::Tomb, &*self.layout.read().unwrap()),
             self.max_entities(),
+            self.layout.read().unwrap().col_pad,
         ));
 
         let buf = self.backing.header_mut(HEADER_SIZE);
@@ -4540,6 +4755,8 @@ impl Engine {
         let allow_legacy_packed = backing.memory_len().is_some();
         let (mut layout, himo_count) = Self::parse_header(hdr, allow_legacy_packed)?;
         if let Some(n) = backing.memory_len() {
+            // packed の列は cell を離さない (#400、 blob の region は離した分の長さを持たない)
+            layout.col_pad = false;
             // 64 bit 列の置き場所 (packed の末尾) は型 byte の表全体から (表は 4096 byte を超えうる)
             if layout.header_size > HEADER_SIZE && n >= layout.header_size {
                 layout.load_wide(backing.header_mut(layout.header_size), himo_count);
@@ -4684,6 +4901,7 @@ impl Engine {
                 let _ = ver_cols.push(ver_column_from_region(
                     backing.region(SegmentKind::Ver(hid as u32), &layout),
                     max_entities,
+                    layout.col_pad,
                 ));
             }
 
@@ -4696,6 +4914,7 @@ impl Engine {
             Some(ver_column_from_region(
                 backing.region(SegmentKind::Tomb, &layout),
                 max_entities,
+                layout.col_pad,
             ))
         } else {
             None
@@ -8043,6 +8262,7 @@ impl Engine {
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         grown.wide = l.wide.clone();
+        grown.col_pad = l.col_pad;
         self.entities.grow(new_cap).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         // header が唯一の永続 truth (store は open 時に header から cap を受け取る)
         {
@@ -13043,13 +13263,14 @@ impl Engine {
 
         let hs = HimoStore::init(
             self.backing.region(SegmentKind::Himo(hid as u32), &*self.layout.read().unwrap()),
-            ht, effective_mv, self.max_entities(),
+            ht, effective_mv, self.max_entities(), self.layout.read().unwrap().col_pad,
         );
 
         if self.layout.read().unwrap().has_cell_version() {
             let ver = ver_column_from_region(
                 self.backing.region(SegmentKind::Ver(hid as u32), &*self.layout.read().unwrap()),
                 self.max_entities(),
+                self.layout.read().unwrap().col_pad,
             );
             assert!(
                 self.ver_cols.push(ver).is_ok(),
@@ -14557,6 +14778,7 @@ impl Engine {
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         grown.wide = l.wide.clone();
+        grown.col_pad = l.col_pad;
         // 辞書を先に伸ばす (header を先に書いて落ちても、 開いた時に header の上限を入れ直すのでどちらの順でもよい)
         self.vocab
             .set_limits(grown.vocab_max_entries, grown.vocab_data_size)

@@ -8,27 +8,57 @@ use crate::region::Region;
 
 const HEADER: usize = 16;
 
-/// Column region 先頭のメタ領域 (count / value_size / max_entities)。
+/// Column region 先頭のメタ領域 (count / value_size / max_entities / cell の開始位置)。
 /// growable backing で「header を読む前にどこまで commit すべきか」を
 /// 呼び側 (engine の v9 version column) が知るために公開する。
 pub const HEADER_BYTES: usize = HEADER;
+
+/// #400: cell を header から離して置く時の、 cell の開始位置 (region 先頭から)。
+///
+/// APFS は、 書いた所に隣り合う **16 MiB 未満の穴**を書いた時に 0 で埋めて実体化する (手元の計測: 64 MiB の file でも
+/// 3 MiB 地点に書くと先頭から 3 MiB が実体になる。 穴が 16 MiB をわずかに越えると埋めない)。 cell の位置は DB 全体の
+/// 通し eid なので、 後ろの table の列は header (先頭) と自分の行の間が全部穴で、 eid が約 400 万 (u32 の cell) までは
+/// その穴が実ディスクになっていた。 cell を header から 17 MiB 離すと、 その穴が埋まらない。 離した分は file の上の穴と
+/// 仮想の予約だけで、 実ディスクも RAM も食わない。
+pub const CELLS_PAD: usize = 17 << 20;
+
+/// header の cell の開始位置の欄 (u32)。 0 = 旧形式 (`HEADER` の直後から)。
+const CELLS_AT: usize = 12;
 
 pub struct Column {
     region: Region,
     count: AtomicU32,
     pub(crate) value_size: u32,
     pub(crate) max_entities: u32,
+    /// cell の開始位置 (region 先頭から)。 `HEADER` (旧形式) か `CELLS_PAD` (#400)。
+    cells: usize,
 }
 
 unsafe impl Sync for Column {}
 unsafe impl Send for Column {}
 
 impl Column {
-    pub fn init(region: Region, value_size: u32, max_entities: u32) -> Self {
+    /// `padded` = cell を header から `CELLS_PAD` 離して置く (#400)。 region は `CELLS_PAD - HEADER` だけ長く取ること。
+    pub fn init(region: Region, value_size: u32, max_entities: u32, padded: bool) -> Self {
+        let cells = if padded { CELLS_PAD } else { HEADER };
         region.write_at(0, &0u32.to_le_bytes());
         region.write_at(4, &value_size.to_le_bytes());
         region.write_at(8, &max_entities.to_le_bytes());
-        Self { region, count: AtomicU32::new(0), value_size, max_entities }
+        region.write_at(CELLS_AT, &Self::cells_field(cells).to_le_bytes());
+        Self::with_cells(region, 0, value_size, max_entities, cells)
+    }
+
+    fn cells_field(cells: usize) -> u32 {
+        if cells == HEADER { 0 } else { cells as u32 }
+    }
+
+    fn with_cells(region: Region, count: u32, value_size: u32, max_entities: u32, cells: usize) -> Self {
+        if cells != HEADER {
+            // 伸ばす歩幅を cell の量で決める (file の長さで決めると、 離した分で最初から 16 MB ずつ伸ばし、 末尾の穴が
+            // 埋められる)
+            region.set_grow_base(cells);
+        }
+        Self { region, count: AtomicU32::new(count), value_size, max_entities, cells }
     }
 
     /// region を **1 byte も触らずに** 空の column を組み立てる (request18)。
@@ -38,8 +68,9 @@ impl Column {
     /// 読み書きするだけで **手前の vocab_data / content_data / leaf_data が丸ごと
     /// commit される** (100K entity の growable DB で create 直後 1.7 GB)。
     /// header は最初の実書き込み直前に `ensure_header` が書く。
-    pub fn init_lazy(region: Region, value_size: u32, max_entities: u32) -> Self {
-        Self { region, count: AtomicU32::new(0), value_size, max_entities }
+    pub fn init_lazy(region: Region, value_size: u32, max_entities: u32, padded: bool) -> Self {
+        let cells = if padded { CELLS_PAD } else { HEADER };
+        Self::with_cells(region, 0, value_size, max_entities, cells)
     }
 
     /// `init_lazy` で作った column の header を確定させる。 既に書かれていれば no-op。
@@ -50,6 +81,7 @@ impl Column {
         if stored != self.value_size {
             self.region.write_at(4, &self.value_size.to_le_bytes());
             self.region.write_at(8, &self.max_entities.to_le_bytes());
+            self.region.write_at(CELLS_AT, &Self::cells_field(self.cells).to_le_bytes());
             self.region.mark_dirty(0, HEADER);
         }
     }
@@ -59,17 +91,34 @@ impl Column {
         let count = u32::from_le_bytes(mm[0..4].try_into().unwrap());
         let value_size = u32::from_le_bytes(mm[4..8].try_into().unwrap());
         let max_entities = u32::from_le_bytes(mm[8..12].try_into().unwrap());
-        Self { region, count: AtomicU32::new(count), value_size, max_entities }
+        let cells = match u32::from_le_bytes(mm[CELLS_AT..CELLS_AT + 4].try_into().unwrap()) {
+            0 => HEADER,
+            c => c as usize,
+        };
+        Self::with_cells(region, count, value_size, max_entities, cells)
     }
 
     pub fn region_size(max_entities: u32, value_size: u32) -> usize {
         HEADER + (max_entities as usize) * (value_size as usize)
     }
 
+    /// cell を `CELLS_PAD` 離して置いているか (#400)。
+    pub fn is_padded(&self) -> bool {
+        self.cells != HEADER
+    }
+
+    /// file の先頭 16 B (column の header) から、 cell の開始位置を読む (#400、 0 = 旧形式の `HEADER`)。
+    pub fn cells_offset_of(header: &[u8]) -> usize {
+        match header.get(CELLS_AT..CELLS_AT + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())) {
+            Some(c) if c != 0 => c as usize,
+            _ => HEADER,
+        }
+    }
+
     #[inline]
     pub fn set(&self, entity_id: u32, value: &[u8]) {
         let vs = self.value_size as usize;
-        let off = HEADER + (entity_id as usize) * vs;
+        let off = self.cells + (entity_id as usize) * vs;
         let len = value.len().min(vs);
         self.region.write_at(off, &value[..len]);
         self.region.mark_dirty(off, len);
@@ -84,20 +133,20 @@ impl Column {
     #[inline]
     pub fn ensure_committed_for(&self, entity_id: u32) -> std::io::Result<()> {
         let vs = self.value_size.max(1) as usize;
-        self.region.ensure_committed(HEADER + (entity_id as usize + 1) * vs)
+        self.region.ensure_committed(self.cells + (entity_id as usize + 1) * vs)
     }
 
     /// `entity_id` の cell が commit 済みか (伸ばさない、 atomic の読み 1 回)。
     #[inline]
     pub fn is_committed_for(&self, entity_id: u32) -> bool {
         let vs = self.value_size.max(1) as usize;
-        self.region.is_committed(HEADER + (entity_id as usize + 1) * vs)
+        self.region.is_committed(self.cells + (entity_id as usize + 1) * vs)
     }
 
     #[inline]
     pub fn get(&self, entity_id: u32) -> &[u8] {
         let vs = self.value_size as usize;
-        let off = HEADER + (entity_id as usize) * vs;
+        let off = self.cells + (entity_id as usize) * vs;
         let mm = self.region.slice();
         &mm[off..off + vs]
     }
@@ -108,7 +157,7 @@ impl Column {
     /// seqlock (gen) を stale 値で誤通過して torn read になる。 value_size==4 前提。
     #[inline]
     pub fn store_u32_release(&self, entity_id: u32, v: u32) {
-        let off = HEADER + (entity_id as usize) * (self.value_size as usize);
+        let off = self.cells + (entity_id as usize) * (self.value_size as usize);
         self.region.as_atomic_u32(off).store(v, Ordering::Release);
         self.region.mark_dirty(off, 4);
     }
@@ -116,7 +165,7 @@ impl Column {
     /// #106: 4B 値を Acquire で読む (`store_u32_release` と対)。 value_size==4 前提。
     #[inline]
     pub fn load_u32_acquire(&self, entity_id: u32) -> u32 {
-        let off = HEADER + (entity_id as usize) * (self.value_size as usize);
+        let off = self.cells + (entity_id as usize) * (self.value_size as usize);
         self.region.as_atomic_u32(off).load(Ordering::Acquire)
     }
 
@@ -124,7 +173,7 @@ impl Column {
     #[inline]
     pub fn store_u64_release(&self, entity_id: u32, v: u64) {
         debug_assert_eq!(self.value_size, 8);
-        let off = HEADER + (entity_id as usize) * 8;
+        let off = self.cells + (entity_id as usize) * 8;
         self.region.as_atomic_u64(off).store(v, Ordering::Release);
         self.region.mark_dirty(off, 8);
     }
@@ -133,7 +182,7 @@ impl Column {
     #[inline]
     pub fn load_u64_acquire(&self, entity_id: u32) -> u64 {
         debug_assert_eq!(self.value_size, 8);
-        let off = HEADER + (entity_id as usize) * 8;
+        let off = self.cells + (entity_id as usize) * 8;
         self.region.as_atomic_u64(off).load(Ordering::Acquire)
     }
 
@@ -152,14 +201,14 @@ impl Column {
         // SAFETY: HEADER (16) は u32 アラインで、 mmap region は page-aligned。
         // n * 4 <= max_entities * 4 (= region 内 packed 領域の上限)。
         // u32 LE は aarch64 / x86_64 で native u32 と一致。
-        let base = unsafe { mm.as_ptr().add(HEADER) as *const u32 };
+        let base = unsafe { mm.as_ptr().add(self.cells) as *const u32 };
         unsafe { std::slice::from_raw_parts(base, n) }
     }
 
     #[inline]
     pub fn clear(&self, entity_id: u32) {
         let vs = self.value_size as usize;
-        let off = HEADER + (entity_id as usize) * vs;
+        let off = self.cells + (entity_id as usize) * vs;
         // v10: 未 commit の cell は zero page で既に 0 (= 未設定)。 書くと fault するので触らない。
         if !self.region.is_committed(off + vs) {
             return;
