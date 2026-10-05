@@ -3,6 +3,38 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.29.4 — 2026-10-05
+
+patch。 on-disk 形式は 0.29.3 と同じ。
+
+**上げる時の注意**:
+
+- `Engine::open_immutable` / `Database::open_immutable` / `Engine::is_immutable` / `enchudb_oplog::filelock::exclusive_held` が増えた
+
+### Fixed — 0.28.5 から open 後に索引を組むとヒープ・footprint が膨らんだ (#394、 #396)
+
+0.28.5 (#373) の索引の組み立ては、 `(eid, 値)` の並びと添字を全部 Vec に集め (1,500 万行で 360 MB の一時確保、 macOS は
+解放後も footprint に残る)、 1 回の pin を持ったまま bucket を倍々で伸ばしていた (伸ばすたびの古い backing が epoch を
+過ぎず、 readonly で読むだけの process では残り続けた)。 1 回目に値ごとの件数を数え、 2 回目に件数ちょうどの bucket へ入れる。
+
+行 1,500 万 / 値 24 万種の Number 列を readonly で開いて 1 回引いた時:
+
+| | 0.28.4 | 0.29.3 | 0.29.4 |
+|---|---:|---:|---:|
+| ヒープ増分 | +81 MB | +197 MB | +78 MB |
+| 組む間の峰 | +81 MB | +581 MB | +82 MB |
+| footprint | 90 MB | 569 MB | 88 MB |
+| 1 回目の `pull_raw` | 214〜229 ms | 313〜319 ms | 162〜169 ms |
+
+### Added — 書き手の居ない DB を複数の読み手で開く `open_immutable` (#395、 #397)
+
+作り終えて公開した DB (次の版は別の directory に作って差し替える) を複数 process から読む開き方。 `open_readonly` と同じく
+lock を取らず (読み手は何本でも、 書き手も待たせない)、 書き込み API は拒む。 違いは Leaf の借用の読み (`get_text` /
+`get_content` / `get_entity`) を debug build で止めないこと (#107)。
+
+- 開く時に書き手が居れば `ErrorKind::WouldBlock`
+- debug build は借用の読みのたびに書き手が居ないかを見て (共有 lock を待たずに試してすぐ外す)、 居れば panic
+
 ## 0.29.3 — 2026-10-05
 
 patch。 on-disk 形式は 0.29.2 と同じ。
