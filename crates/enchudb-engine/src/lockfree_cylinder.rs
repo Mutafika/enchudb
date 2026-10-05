@@ -169,10 +169,16 @@ impl Slot {
     /// bucket (空なら作って置く) と、 今作ったか。 **書き手だけ** — `HimoStore` の write_lock の下で同時に 1 本。
     #[inline]
     fn get_or_create(&self) -> (&AppendBucket, bool) {
+        self.get_or_create_with(0)
+    }
+
+    /// `get_or_create` の、 作る時に `cap` 件分を先に確保する版 (索引をまとめて組む時、 #394)。
+    #[inline]
+    fn get_or_create_with(&self, cap: usize) -> (&AppendBucket, bool) {
         if let Some(b) = self.get() {
             return (b, false);
         }
-        let p = Arc::into_raw(Arc::new(AppendBucket::new())) as *mut AppendBucket;
+        let p = Arc::into_raw(Arc::new(AppendBucket::with_capacity(cap))) as *mut AppendBucket;
         self.0.store(p, Ordering::Release);
         // SAFETY: 今置いた pointer (参照はこの Slot が持つ)。
         (unsafe { &*p }, true)
@@ -647,43 +653,60 @@ impl LockFreeCylinder {
     }
 
     /// 空の索引を `(eid, 値)` の並び (Column の中身、 eid の順) からまとめて組む。 書き手のみ (`HimoStore` が
-    /// write_lock の下で、 読み手が索引を使い始める前に呼ぶ)。
+    /// write_lock の下で、 読み手が索引を使い始める前に呼ぶ)。 `entries` は同じ並びを 2 回出す (1 回目で数え、
+    /// 2 回目で入れる)。
     ///
     /// 1 件ずつ `insert` すると、 sparse に置く値は 1 件ごとに run の組を差し替えるので遅い (#373 で Tag の値の多くが
     /// sparse に来るようになった)。 ここでは全部を見てから決める: 配列ごとに、 長さ L (2 の冪、 `DENSE_FREE_LEN` 以上)
     /// のうち 「添字 L 未満の entry の数の `DENSE_MIN_FILL` 倍 ≥ L」 を満たす最大のものまで dense、 残りは並べ直して
     /// 1 本の run にする。 `insert` と同じ規則 (配列の長さ未満 = dense) なので、 後の `insert` はそのまま続けられる。
-    pub fn build(&self, entries: impl IntoIterator<Item = (u32, u64)>) {
+    ///
+    /// #394: 並びを Vec に集めず (1,500 万行で 240 MB + 添字 120 MB の一時確保)、 1 回目は値の添字ごとの件数だけを
+    /// 数える。 bucket は 2 回目に入る件数ちょうどで作る — 倍々で伸ばすと、 伸ばすたびの古い backing が、 この関数の
+    /// 間ずっと持つ pin のせいで epoch を過ぎず、 後で誰も pin しない (readonly で読むだけの) process では残り続けた。
+    pub fn build<I: Iterator<Item = (u32, u64)>>(&self, entries: impl Fn() -> I) {
         debug_assert_eq!(self.total.load(Ordering::Relaxed), 0, "build は空の索引に");
-        let entries: Vec<(u32, u64)> = entries.into_iter().collect();
         let guard = epoch::pin();
-        // 配列ごとの長さを決める
-        let mut idx: [Vec<usize>; 3] = Default::default();
-        for &(_, v) in &entries {
-            if let Some((k, i)) = dense_slot(v) {
-                idx[k].push(i);
+        // 1 回目: 配列ごとに、 添字ごとの件数 (出てきた最大の添字まで) と sparse の件数
+        let mut counts: [Vec<u32>; 3] = Default::default();
+        let mut n_sparse = 0usize;
+        for (_, v) in entries() {
+            match dense_slot(v) {
+                Some((k, i)) => {
+                    let c = &mut counts[k];
+                    if c.len() <= i {
+                        c.resize((i + 1).next_power_of_two().min(region_cap(k)), 0);
+                    }
+                    c[i] += 1;
+                }
+                None => n_sparse += 1,
             }
         }
+        // 配列ごとの長さを決める
         let mut lens = self.lens(&guard);
         for k in [LOW, POS, NEG] {
-            let s = &mut idx[k];
-            if s.is_empty() {
+            let c = &counts[k];
+            if c.is_empty() {
                 continue;
             }
-            s.sort_unstable();
-            let below = |l: usize| s.partition_point(|&i| i < l);
+            // below(l) = 添字 l 未満の entry の数
+            let below = |l: usize| c[..l.min(c.len())].iter().map(|&n| n as usize).sum::<usize>();
             let cap = region_cap(k);
             let mut best = DENSE_FREE_LEN.min(cap);
             let mut l = best;
+            let mut acc = below(l);
             while l < cap {
-                l = (l * 2).min(cap);
-                if below(l) * DENSE_MIN_FILL >= l {
+                let next = (l * 2).min(cap);
+                acc += c[l.min(c.len())..next.min(c.len())].iter().map(|&n| n as usize).sum::<usize>();
+                l = next;
+                if acc * DENSE_MIN_FILL >= l {
                     best = l;
                 }
             }
             // 要るのは入る値の最大の添字まで (今の長さより短くはしない)
-            let top = s[..below(best)].last().map_or(0, |&i| i + 1);
+            let top = c[..best.min(c.len())].iter().rposition(|&n| n > 0).map_or(0, |i| i + 1);
             lens[k] = lens[k].max(top);
+            n_sparse += c[best.min(c.len())..].iter().map(|&n| n as usize).sum::<usize>();
         }
         // dense の配列を作って、 eid の順に bucket へ。 残りは sparse へまとめて
         let mut arrs: [DenseArr; 3] = [LOW, POS, NEG].map(|k| {
@@ -691,11 +714,11 @@ impl LockFreeCylinder {
             v.resize_with(lens[k], Slot::empty);
             v
         });
-        let mut sparse = Vec::new();
-        for (eid, v) in entries {
+        let mut sparse = Vec::with_capacity(n_sparse);
+        for (eid, v) in entries() {
             match dense_slot(v) {
                 Some((k, i)) if i < lens[k] => {
-                    let (b, created) = arrs[k][i].get_or_create();
+                    let (b, created) = arrs[k][i].get_or_create_with(counts[k][i] as usize);
                     if created {
                         self.used[k].fetch_add(1, Ordering::Relaxed);
                     }
@@ -1375,7 +1398,7 @@ mod tests {
             })
             .collect();
         let built = LockFreeCylinder::new(0);
-        built.build(entries.iter().copied());
+        built.build(|| entries.iter().copied());
         let one = LockFreeCylinder::new(0);
         for &(e, v) in &entries {
             one.insert(e, v, all);
@@ -1409,7 +1432,7 @@ mod tests {
         assert_used_matches(&built);
         // 配列は入る値の最大の添字まで (小さい値だけなら 2 の冪まで伸ばさない)
         let small = LockFreeCylinder::new(0);
-        small.build((0..200u32).map(|e| (e, (e % 50) as u64)));
+        small.build(|| (0..200u32).map(|e| (e, (e % 50) as u64)));
         assert_eq!(small.dense_slots(), 50);
         // 組んだ後も 1 件ずつ入れられる: まばらな値に行を溜めて配列を伸ばす
         let (far, more) = (3_000 + 16 * 4_200, if cfg!(miri) { 50 } else { 12_000 });
