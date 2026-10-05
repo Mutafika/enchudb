@@ -14446,6 +14446,10 @@ impl Engine {
             // それを `Ok(())` で返すのが 「oplog_sync() は成功したのに配布されない」
             // の正体だったので、 呼び出し側に伝える (死区間を除く。 下の `commit_res?`)。
             let commit_res = self.append_commit_marker(wal);
+            // 満杯で打てなかったか (= その瞬間の `append_dead`) は失敗の種類で決める。 Commit は
+            // REC_HEADER_SIZE ちょうどなので、 容量 (`OutOfMemory`) で落ちた時は満杯と同値。 後で
+            // `append_dead()` を読み直すと、 間に consumer が畳んで満杯が解けていれば Err を返してしまう (#407)
+            let commit_full = matches!(&commit_res, Err(e) if e.kind() == io::ErrorKind::OutOfMemory);
             // #77-H3: checkpoint 上限と durable_lsn は Commit append 直後に
             // snapshot (msync 後の再読は未同期 record まで checkpoint してしまう)
             let durable_head = wal.head();
@@ -14483,7 +14487,7 @@ impl Engine {
             // 参照、 実運用で発現済み) に居るだけの呼び出し側が Err を受けることに
             // なる。 落ちた分は `wal_dropped_records()` / `wal_commit_failures()` で
             // 観測できるので、 ここで伝えるのは **畳んでも消えない失敗** だけでよい。
-            if !wal.append_dead() {
+            if !commit_full && !wal.append_dead() {
                 commit_res?;
             }
         }
