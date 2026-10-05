@@ -3,6 +3,25 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.30.2 — 2026-10-05
+
+patch。 on-disk 形式は 0.30.1 と同じ。 API の変更なし。
+
+### Fixed — WAL が満杯の時、 `oplog_sync` が満杯で打てなかった Commit の Err を返すことがあった (#407、 #408)
+
+`oplog_sync` は Commit marker が WAL 満杯で打てなかった時は Err を返さない (満杯は checkpoint → fold で回復する経路、 #268)。
+満杯かどうかを Commit が失敗した後に読み直していたので、 間に consumer が WAL を畳むと満杯が解けていて、 Err を返していた。
+満杯で打てなかったかを失敗の種類 (容量 = `OutOfMemory`) で決める。 テスト用の `OpLog::fail_next_commits` は満杯でない WAL の
+失敗を作るものなので、 error を `OutOfMemory` 以外にした。
+
+### Tests — CI でたまに落ちるテスト 3 本
+
+- `issue57_wal_drop_bootstrap`: floor が最初に上がった時に、 溢れて落ちた write を全部覆っていると仮定していた。 遅い機械では
+  途中で 1 度上がる。 全部を覆うまで待つ (#398、 #405)
+- `crash_recovery` の SIGKILL の署名テスト: kill の瞬間に WAL が畳まれた直後だと署名 record が残らない (負荷の下で 24 回中 17 回)。
+  子を changefeed の配信の所で止めてから kill する (#377、 #406)
+- `wal_full_fold`: consumer が先に WAL を畳んでいると fold できるかの assert が落ちた (#407、 #408)
+
 ## 0.30.1 — 2026-10-05
 
 patch。 on-disk 形式は 0.30.0 と同じ。 API の変更なし。
