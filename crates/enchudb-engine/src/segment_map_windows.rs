@@ -241,6 +241,8 @@ impl SegmentMap {
     }
     /// unix 版と同じ API (#381)。 Windows の `grow_amortized` は要る位置までしか伸ばさない (先回りしない) ので何もしない。
     pub fn set_grow_cap(&self, _bytes: usize) {}
+    /// unix 版と同じ API (#400)。 Windows の `grow_amortized` は先回りしないので何もしない。
+    pub fn set_step_base(&self, _bytes: usize) {}
 
     pub fn reserved(&self) -> usize {
         self.reserved

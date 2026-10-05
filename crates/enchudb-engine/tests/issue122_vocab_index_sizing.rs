@@ -126,8 +126,9 @@ fn legacy_version_in_v10_header_is_rejected() {
     let path = tmp_path("v7upgrade");
     cleanup(&path);
     {
-        let mut eng =
-            Engine::create_growable_opts(&path, GrowableOptions::default()).expect("create");
+        // 列の cell を離さない形 (#400 の v13 にしない) で、 v10 の header を作る
+        let mut eng = Engine::create_growable_opts(&path, GrowableOptions { column_pad: Some(false), ..Default::default() })
+            .expect("create");
         eng.define_himo("k", ValueType::Tag, 1024);
         drop(eng);
     }

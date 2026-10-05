@@ -19,6 +19,12 @@ fn file_version(path: &str) -> u32 {
     u32::from_le_bytes(b[4..8].try_into().unwrap())
 }
 
+/// 列の cell を離す DB (#400、 macOS / Linux の既定) は v13 (64 bit 列の有無によらない)。 それ以外は `v`。
+fn want_version(path: &str, v: u32) -> u32 {
+    let b = std::fs::read(std::path::Path::new(path).join("header.seg")).unwrap();
+    if u32::from_le_bytes(b[100..104].try_into().unwrap()) != 0 { 13 } else { v }
+}
+
 const BIG: [u64; 6] = [0, u32::MAX as u64 - 1, u32::MAX as u64, u32::MAX as u64 + 1, 1 << 40, u64::MAX - 1];
 
 #[test]
@@ -94,7 +100,7 @@ fn reopen_keeps_values_and_only_wide_dbs_become_v11() {
         eng.define_table("t", 3900).unwrap();
         eng.define_himo_in("t", "n", ValueType::Number, 0).unwrap();
         eng.flush().unwrap();
-        assert_eq!(file_version(&p), 10, "64 bit 列を持つ前は v10 のまま");
+        assert_eq!(file_version(&p), want_version(&p, 10), "64 bit 列を持つ前は v10 のまま");
         eng.define_himo_in("t", "ts", ValueType::Number64, 0).unwrap();
         for (i, &v) in BIG.iter().enumerate() {
             let e = eng.entity_in("t").unwrap();
@@ -110,8 +116,8 @@ fn reopen_keeps_values_and_only_wide_dbs_become_v11() {
         narrow.define_himo("n", ValueType::Number, 0);
         narrow.flush().unwrap();
     }
-    assert_eq!(file_version(&p), 11);
-    assert_eq!(file_version(&q), 10, "64 bit 列の無い DB まで v11 にしない");
+    assert_eq!(file_version(&p), want_version(&p, 11));
+    assert_eq!(file_version(&q), want_version(&q, 10), "64 bit 列の無い DB まで v11 にしない");
     let eng = Engine::open_standalone(&p).unwrap();
     for (i, &v) in BIG.iter().enumerate() {
         let e = eng.pull_raw("t.n", i as u32)[0];
@@ -583,7 +589,10 @@ fn packed_round_trip_keeps_64_bit_columns() {
     Engine::unpack_to_dir(std::path::Path::new(&packed), &back).unwrap();
     let eng = Engine::open_standalone(&back).unwrap();
     assert_mixed(&eng, &rows, "unpack");
-    assert_eq!(file_version(&back), 11);
+    assert_eq!(file_version(&back), want_version(&back, 11));
+    // packed は列を離さない形 (v11) で運ぶ
+    let pk = std::fs::read(&packed).unwrap();
+    assert_eq!(u32::from_le_bytes(pk[4..8].try_into().unwrap()), 11, "packed の version");
     // 詰めた 1 ファイルが切れていれば断る (末尾の 64 bit 列の分も要る)
     let f = std::fs::OpenOptions::new().write(true).open(&packed).unwrap();
     f.set_len(size - 8).unwrap();

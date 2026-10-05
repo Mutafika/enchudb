@@ -283,7 +283,7 @@ region grows independently and only what you write is materialised. Everything t
 belongs to the DB lives inside it — `mv`, `rm -r` and `cp -r` move the whole thing.
 
 ```
-{path}/                     the database (FILE_VERSION 10)
+{path}/                     the database (FILE_VERSION 10–13)
   header.seg                header: capacities, himo table, flags
   entities.seg              live bitmap + free stack
   vocab.{data,offsets,index}.seg
@@ -308,6 +308,19 @@ geometrically as you write (only the *apparent* size grows; blocks are allocated
 pages you touch). The per-cell version regions are created by `enable_sync_tables()`
 **immediately** (they are separate files, so nothing has to be remapped) and a DB that
 never syncs simply does not have them.
+
+**Column files keep their cells 17 MiB away from their header** (format v13, since 0.30.0,
+[#400](https://github.com/Mutafika/enchudb/issues/400)). A column is indexed by the
+DB-wide entity id, so the column of a table created after a large one has a long run of
+zeros between its 16-byte header and its first row. APFS turns any hole shorter than about
+16 MiB next to a write into real blocks, so on macOS each such column used to cost up to
+~16 MB of zeros on disk (eids up to ~4 M). Separating the cells from the header leaves that
+hole alone; it costs 17 MiB of virtual reservation per column and nothing on disk. New DBs
+use this layout on macOS / Linux / Android (`GrowableOptions::column_pad` overrides it; iOS
+and Windows keep the old layout by default because their reservations are sized to the
+capacity). Existing DBs keep working as they are; move them with
+`Engine::migrate_column_pad(path)` (offline, in place, resumable). A v13 DB is not opened
+by 0.29 or older; `pack_dir` still writes the old (v12) packed layout.
 
 **File descriptors.** A writer keeps one fd open per segment file (≈ number of himos + 10)
 for the lifetime of the handle — reopening on every growth step made macOS write the

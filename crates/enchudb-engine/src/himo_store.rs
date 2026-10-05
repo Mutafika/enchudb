@@ -182,8 +182,9 @@ unsafe impl Sync for HimoStore {}
 unsafe impl Send for HimoStore {}
 
 impl HimoStore {
-    pub fn init(col_region: Region, ht: ValueType, max_values: u32, max_entities: u32) -> Self {
-        let col = Column::init(col_region, ht.width(), max_entities);
+    /// `padded` = 列の cell を header から離して置く (#400、 `Column::init`)。
+    pub fn init(col_region: Region, ht: ValueType, max_values: u32, max_entities: u32, padded: bool) -> Self {
+        let col = Column::init(col_region, ht.width(), max_entities, padded);
         Self {
             col: ready(col),
             #[cfg(not(target_arch = "wasm32"))]
@@ -725,7 +726,7 @@ mod tests {
         let buf: Box<[u8]> = vec![0u8; bytes].into_boxed_slice();
         let ptr = Box::leak(buf).as_mut_ptr();
         let region = unsafe { Region::new(ptr, bytes) };
-        HimoStore::init(region, ValueType::Number, 0, max_entities)
+        HimoStore::init(region, ValueType::Number, 0, max_entities, false)
     }
 
     /// #270: **writer 3 経路 (`set` / `remove` / `restore`) はどれも cylinder を組まない**。
@@ -769,7 +770,7 @@ mod tests {
         let buf: Box<[u8]> = vec![0u8; bytes].into_boxed_slice();
         let ptr = Box::leak(buf).as_mut_ptr();
         let region = unsafe { Region::new(ptr, bytes) };
-        HimoStore::init(region, ValueType::Number64, 0, max_entities)
+        HimoStore::init(region, ValueType::Number64, 0, max_entities, false)
     }
 
     /// 大きな値 (sparse run) と小さな値 (dense bucket) を混ぜた書き込み / 書き換え / 削除の後でも、

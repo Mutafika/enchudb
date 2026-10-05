@@ -82,6 +82,16 @@ impl Region {
         unsafe { Self::with_grower(seg, 0, len) }
     }
 
+    /// region の `base` byte 目から先の量で、 segment を伸ばす歩幅を決めさせる (#400: cell を header から離した column)。
+    /// `Memory` backing では何もしない。
+    pub fn set_grow_base(&self, base: usize) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(g) = &self.grower {
+            g.set_step_base(self.file_offset + base);
+        }
+        let _ = base;
+    }
+
     /// 実際に file-backed で commit されている長さ (region 内)。 静的 backing は `len`。
     /// CRC 計算や dump で 「予約全域 (zero page) を舐めない」 ために使う。
     pub fn committed_len(&self) -> usize {
