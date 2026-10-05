@@ -110,6 +110,16 @@ impl AppendBucket {
         }
     }
 
+    /// `cap` 件分の backing を先に確保した空の bucket。 入る件数が分かっている時 (索引をまとめて組む時、 #394)
+    /// に使う — 倍々で伸ばすと、 伸ばすたびの古い backing が epoch を過ぎるまで残る。
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            backing: Atomic::new(Buf::with_cap(cap)),
+            live: AtomicU32::new(0),
+            removed: AtomicBool::new(false),
+        }
+    }
+
     // ──── request12: bucket ローカルメタデータ ────
     // live/removed は write_lock 下の単一 writer だけが更新する。read 側の
     // verify 要否は `read_snapshot_verify` の 3 段プロトコル (slice → flag →

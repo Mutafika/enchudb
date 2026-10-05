@@ -285,10 +285,12 @@ impl HimoStore {
         let col = self.col();
         let count = col.count();
         // 全部を見てからまとめて組む (dense / sparse の振り分けを 1 度で決める、 #373)
-        self.cyl.build((0..count).filter_map(|eid| {
-            let stored = stored_at(col, eid);
-            (stored != 0).then(|| (eid, stored - 1))
-        }));
+        self.cyl.build(|| {
+            (0..count).filter_map(|eid| {
+                let stored = stored_at(col, eid);
+                (stored != 0).then(|| (eid, stored - 1))
+            })
+        });
         self.cyl_built.store(true, Ordering::Release);
     }
 
