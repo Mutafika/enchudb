@@ -1394,7 +1394,9 @@ impl OpLog {
 
         // #268: テスト用 fault injection (既定では atomic load すら踏まない)。
         if matches!(op, Op::Commit) && self.take_commit_fault() {
-            return Err(self.wal_full_err());
+            // 容量の失敗 (`OutOfMemory`) とは種類を分ける: 呼び出し側は `OutOfMemory` を 「満杯 = 畳めば回復」
+            // と読む (#407)。 これは満杯でない WAL で Commit が打てない場合を作るためのもの
+            return Err(io::Error::other("injected commit failure (test)"));
         }
 
         // #75: 同一プロセス内は append_lock、 プロセス間は flock で直列化。
@@ -1596,7 +1598,7 @@ impl OpLog {
     }
 
     /// #268: **テスト専用** fault injection。 次の `n` 回の Commit append を
-    /// 「WAL 満杯」 として失敗させる。
+    /// 失敗させる (WAL は満杯でないまま、 error は `OutOfMemory` 以外 = 容量の失敗と見分ける、 #407)。
     ///
     /// 「Commit が打てない」 状態は実機では満杯 / 別 fd の head 先行でしか起きず、
     /// test から自然に作れない。 一方でそこは **恒久停止の入口** (閉じられない

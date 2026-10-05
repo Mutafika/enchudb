@@ -155,8 +155,10 @@ fn wal_full_mid_group_folds_after_bridge_drains() {
 
     // ── 本丸: 旧実装は offset < head（未 commit の孤児 tail）で fold を恒久拒否
     // = brick。 修正後は「append_dead + committed 残なし」で畳んでよい。
+    // consumer tick が先に畳んでいたら (満杯が解けている)、 それが答え。 その後に積まれた record が bridge 前だと
+    // fold_safe は一時的に false なので、 false の時は満杯のままかを後から見る (先に満杯を見ると、 間に畳まれる、 #407)
     assert!(
-        eng.wal_fold_safe(),
+        eng.wal_fold_safe() || !wal.append_dead(),
         "満杯 WAL の未 commit tail (孤児 group) が fold を恒久ブロックしている"
     );
 
