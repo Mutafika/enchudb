@@ -283,7 +283,7 @@ region grows independently and only what you write is materialised. Everything t
 belongs to the DB lives inside it — `mv`, `rm -r` and `cp -r` move the whole thing.
 
 ```
-{path}/                     the database (FILE_VERSION 10–13)
+{path}/                     the database (FILE_VERSION 10–14)
   header.seg                header: capacities, himo table, flags
   entities.seg              live bitmap + free stack
   vocab.{data,offsets,index}.seg
@@ -293,6 +293,7 @@ belongs to the DB lives inside it — `mv`, `rm -r` and `cp -r` move the whole t
   himo/NNNN.seg             one Column per himo (id = NNNN, never reused)
   ver/NNNN.seg              per-cell HLC version column (syncing DBs only)
   tomb.seg                  tombstone column (syncing DBs only)
+  sync.payload.seg          `_sync_ops` payload ring (syncing DBs only, since 0.31.0)
   oplog                     WAL (when enabled)
   tables                    table definitions (+ PK / extent blocks)
   eidmap, vocabmap          foreign-eid / vocab translation (only when syncing)
@@ -321,6 +322,17 @@ and Windows keep the old layout by default because their reservations are sized 
 capacity). Existing DBs keep working as they are; move them with
 `Engine::migrate_column_pad(path)` (offline, in place, resumable). A v13 DB is not opened
 by 0.29 or older; `pack_dir` still writes the old (v12) packed layout.
+
+**Sync payloads live in their own ring** (format v14, since 0.31.0,
+[#410](https://github.com/Mutafika/enchudb/issues/410)). The records the oplog→sync bridge
+keeps for peers used to be stored in the vocabulary, which never reclaims bytes, so a busy
+syncing DB grew its vocabulary by every record ever bridged until Tag writes failed. They
+now go to `sync.payload.seg`, a FIFO byte ring sized from the `_sync_ops` capacity (16 MiB
+to 1 GiB) whose space is reused as acked rows are reclaimed; when it is full the bridge
+waits, as it does when `_sync_ops` itself is full. A syncing DB becomes v14 the first time
+it bridges with 0.31, after which 0.30 or older refuses to open it (an older binary would
+see the rows as broken and purge undelivered records). Non-syncing DBs and the wire format
+are unchanged.
 
 **File descriptors.** A writer keeps one fd open per segment file (≈ number of himos + 10)
 for the lifetime of the handle — reopening on every growth step made macOS write the
