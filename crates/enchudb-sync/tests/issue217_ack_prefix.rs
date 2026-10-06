@@ -71,12 +71,10 @@ fn tick() {
 /// ring 位置は lsn column から読む。
 fn ring_rows(eng: &Arc<Engine>) -> Vec<(u32, PeerId, Hlc)> {
     let lsn_hid = eng.himo_id("_sync_ops.lsn").unwrap() as u16;
-    let payload_hid = eng.himo_id("_sync_ops.payload").unwrap() as u16;
     let mut out = Vec::new();
     for eid in eng.entities_with_himo(lsn_hid) {
         let Some(lsn) = eng.get_by_id(eid, lsn_hid).map(|l| l as u32) else { continue };
-        let Some(vid) = eng.get_by_id(eid, payload_hid).map(|v| v as u32) else { continue };
-        let bytes = eng.vocab_text(vid).to_vec();
+        let Some(bytes) = eng.sync_ops_payload(eid) else { continue };
         let Some(rec) = enchudb_oplog::oplog::decode_sync_ops_payload(&bytes) else { continue };
         out.push((lsn, rec.author_peer, rec.hlc));
     }
@@ -286,7 +284,11 @@ fn dead_row_is_purged_not_a_permanent_blocker() {
 
     // batch2 の最終 row の payload を欠落させる = decode 不能な dead row。
     let dead_eid = *eng_r.pull_raw("_sync_ops.lsn", b2_max).first().expect("row exists");
-    eng_r.untie(dead_eid, "_sync_ops.payload");
+    {
+        let dead = dead_eid;
+        eng_r.untie(dead, "_sync_ops.payload");
+        eng_r.untie(dead, "_sync_ops.payload_at");
+    }
 
     // 全 author の cursor を渡す → dead row は削除して越え、 relayed row まで届く。
     let ack = eng_r.ack_sync_up_to_cursors(3, &[(2, t_new), (1, t_mid)]).unwrap();

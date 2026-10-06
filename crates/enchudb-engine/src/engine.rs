@@ -1684,7 +1684,9 @@ impl Engine {
             let mut hdr = vec![0u8; layout.header_size];
             f.read_exact(&mut hdr)?;
             hdr[H_COLUMN_PAD..H_COLUMN_PAD + 4].copy_from_slice(&1u32.to_le_bytes());
-            hdr[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION_COLPAD.to_le_bytes());
+            // 下げない: payload の ring を持つ DB は v14 (下げると 0.30 の binary が開いて ring の row を消す)
+            let cur = u32::from_le_bytes(hdr[H_VERSION..H_VERSION + 4].try_into().unwrap());
+            hdr[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION_COLPAD.max(cur).to_le_bytes());
             write_header_crc(&mut hdr);
             f.seek(SeekFrom::Start(0))?;
             f.write_all(&hdr[..HEADER_SIZE.min(hdr.len())])?;
@@ -2098,6 +2100,10 @@ const COLUMN_PAD_DEFAULT: bool = RESERVE_IS_CHEAP;
 /// v9 = 1 ファイル固定 layout の最終版 (0.19〜0.25)。 v10 の packed 形式 (`from_bytes`) は
 /// byte 互換なので、 Memory backing に限り v9 の blob も受け入れる。
 const FILE_VERSION_LEGACY_V9: u32 = 9;
+/// v14: `_sync_ops` の payload を辞書ではなく専用の循環バッファ (`sync.payload.seg`) に置く DB。 layout は
+/// 変わらないが、 旧 binary は payload の無い row を壊れた row と見て消し、 未配送の record を失う (#217 の
+/// dead-row purge)。 ring を作った時に刻む ([`Engine::payload_ring`])。
+const FILE_VERSION_SYNC_RING: u32 = 14;
 /// v8 (0.15.0〜0.18.x)。 v9 binary で writer open すると version stamp は 9 に上がる
 /// (layout は変わらない — v9 領域は `H_CELL_VERSION` flag で管理)。
 const FILE_VERSION_LEGACY_V8: u32 = 8;
@@ -3243,6 +3249,10 @@ pub struct Engine {
     /// #385: 辞書の語の参照数の file (`vocab.refs.seg`、 回収する DB の書き手だけ)。 閉じる時に msync する。
     #[cfg(not(target_arch = "wasm32"))]
     vocab_refs_map: std::sync::OnceLock<Arc<crate::segment_map::SegmentMap>>,
+    /// `_sync_ops` の payload の循環バッファ (`sync.payload.seg`)。 bridge の最初の書き込みで作り、 在れば開く
+    /// ([`Engine::payload_ring`])。 packed / wasm の DB は持たない (payload は従来どおり辞書)。
+    #[cfg(not(target_arch = "wasm32"))]
+    sync_payload_ring: std::sync::OnceLock<crate::sync_payload_ring::PayloadRing>,
     /// #385: 開いた時に参照数を使えず、 数え直しを待っている (`finish_vocab_refs_at_open`)。
     vocab_recount_pending: std::sync::atomic::AtomicBool,
     // 0.9.0 himo dynamic definition: himo の並列配列は AppendVec (固定 capacity
@@ -3329,6 +3339,9 @@ pub struct Engine {
     warned_bind_over_local_writes: std::sync::atomic::AtomicBool,
     /// 0.18.2: `_sync_ops` 満杯 backpressure の warn を 1 回に抑制（解消で解除）。
     warned_sync_ops_full: std::sync::atomic::AtomicBool,
+    /// `sync.payload.seg` を開けなかった警告を 1 回だけ出す。
+    #[cfg(not(target_arch = "wasm32"))]
+    warned_sync_payload_ring: std::sync::atomic::AtomicBool,
     /// request17 (v9): ローカル write が cell の版数判定で弾かれた warn の一度きり
     /// フラグ。 構造上起きないはずの事象なので、 起きたら無音にしない。
     warned_cell_version_reject: std::sync::atomic::AtomicBool,
@@ -3826,6 +3839,8 @@ impl Engine {
             vocab, himo_reg,
             #[cfg(not(target_arch = "wasm32"))]
             vocab_refs_map: std::sync::OnceLock::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            sync_payload_ring: std::sync::OnceLock::new(),
             vocab_recount_pending: std::sync::atomic::AtomicBool::new(false),
             himo_names: AppendVec::with_capacity(max_himos as usize),
             value_types: AppendVec::with_capacity(max_himos as usize),
@@ -3851,6 +3866,8 @@ impl Engine {
             bind_over_local_writes: std::sync::atomic::AtomicU64::new(0),
             warned_bind_over_local_writes: std::sync::atomic::AtomicBool::new(false),
             warned_sync_ops_full: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(not(target_arch = "wasm32"))]
+            warned_sync_payload_ring: std::sync::atomic::AtomicBool::new(false),
             warned_cell_version_reject: std::sync::atomic::AtomicBool::new(false),
             hlc_mint_lock: parking_lot::Mutex::new(()),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -4497,7 +4514,7 @@ impl Engine {
         let version = u32::from_le_bytes(buf[H_VERSION..H_VERSION + 4].try_into().unwrap());
         let legacy_packed = allow_legacy_packed
             && (FILE_VERSION_LEGACY_V8..=FILE_VERSION_LEGACY_V9).contains(&version);
-        if !(FILE_VERSION..=FILE_VERSION_COLPAD).contains(&version) && !legacy_packed {
+        if !(FILE_VERSION..=FILE_VERSION_SYNC_RING).contains(&version) && !legacy_packed {
             return Err(format!(
                 "unsupported EnchuDB file version {} (this build reads v{}; v8 / v9 single-file \
                  databases must be migrated with Engine::migrate_v9_to_v10, older ones are not supported)",
@@ -4941,6 +4958,8 @@ impl Engine {
             vocab, himo_reg,
             #[cfg(not(target_arch = "wasm32"))]
             vocab_refs_map: std::sync::OnceLock::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            sync_payload_ring: std::sync::OnceLock::new(),
             vocab_recount_pending: std::sync::atomic::AtomicBool::new(false),
             himo_names, value_types, himo_max_values,
             himos, ver_cols, tomb_col, entities, contents,
@@ -4962,6 +4981,8 @@ impl Engine {
             bind_over_local_writes: std::sync::atomic::AtomicU64::new(0),
             warned_bind_over_local_writes: std::sync::atomic::AtomicBool::new(false),
             warned_sync_ops_full: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(not(target_arch = "wasm32"))]
+            warned_sync_payload_ring: std::sync::atomic::AtomicBool::new(false),
             warned_cell_version_reject: std::sync::atomic::AtomicBool::new(false),
             hlc_mint_lock: parking_lot::Mutex::new(()),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -5417,6 +5438,14 @@ impl Engine {
             hlc_wall_lo_hid as u16,
             payload_hid as u16,
         );
+        // payload の置き場 = 専用の循環バッファ (`sync.payload.seg`)。 辞書に置くと値の byte が回収されず、 bridge
+        // した record の分だけ辞書が一生伸びる。 ring を持てない (packed / readonly / 開けない) 時は辞書の従来経路。
+        #[cfg(not(target_arch = "wasm32"))]
+        let payload_ring = self.payload_ring(true).and_then(|r| {
+            self.ensure_himo_dynamic_in("_sync_ops", "payload_at", ValueType::Number, 0)
+                .ok()
+                .map(|hid| (r, hid as u16))
+        });
 
         // 0.8.11: 自己再帰 sync の循環を断つ filter。
         // `_sync_ops` / `_sync_peers` 配下の write (= ack_sync の watermark
@@ -5567,34 +5596,33 @@ impl Engine {
                     }
                 }
             }
+            // 0.8.0 phase 2: payload は signature(64) + pubkey_fp(8) + signed_bytes(rest)
+            // の concat 形式。 0.7.0 では signed_bytes のみだったが、 publish path を
+            // _sync_ops 経由にするため signature 込みで保存し、 sync crate で完全な
+            // WireRecord に復元できるよう拡張した。 wire format breaking、 0.7.x との
+            // 並走 sync は不可。
+            // 0.11: 逆写像で宛名を書き戻した record は再署名済み payload を使う
+            let (sig, fp, sb): (&[u8; 64], &[u8; 8], &[u8]) = match &resigned {
+                Some(r) => (&r.signature, &r.pubkey_fp, &r.signed_bytes[..]),
+                None => (&rec.signature, &rec.pubkey_fp, &rec.signed_bytes[..]),
+            };
+            let mut wire_payload = Vec::with_capacity(72 + sb.len());
+            wire_payload.extend_from_slice(sig);
+            wire_payload.extend_from_slice(fp);
+            wire_payload.extend_from_slice(sb);
+            // payload の ring 上の場所は **row を取る前に**確保する (取れなければ row も作らずに待つ = 行の枠が
+            // 埋まった時と同じ backpressure)。 大きすぎる payload は辞書の従来経路へ。
+            #[cfg(not(target_arch = "wasm32"))]
+            let ring_slot = match payload_ring.filter(|(r, _)| r.accepts(wire_payload.len())) {
+                Some((r, at_hid)) => match r.reserve(wire_payload.len(), || self.sync_ring_extremes().1) {
+                    Some(off) => Some((r, at_hid, off)),
+                    None => return self.sync_ops_backpressure(from, done_end, count, "payload ring"),
+                },
+                None => None,
+            };
             let row_eid = match self.entity_in("_sync_ops") {
                 Ok(e) => e,
-                Err(_) => {
-                    // eid_range exhausted (= ring 満杯)。 #152: **挿入し切った分まで**
-                    // cursor を進めて返す (partial advance)。
-                    //
-                    // 履歴:
-                    // - 0.18.1 まで: committed_end まで飛ばして残りを破棄 → ring 満杯が
-                    //   続く限り全ての新規変更が配布から無言で欠落する data loss
-                    // - 0.18.2 (#150): cursor を一切進めない retry → 損失は消えたが、
-                    //   backlog が ring 容量を超えると毎周「先頭 K 件を再挿入 → K+1 件目で
-                    //   満杯 → cursor 据置」を繰り返して**永久に前進しない** (#152)
-                    // - 本実装: 処理し切った record の終端まで進める。 各 record は
-                    //   ちょうど 1 回だけ挿入され、 重複も損失も進行不能も無い。
-                    //   ring が空けば必ず続きから再開する。
-                    if let Some(end) = done_end {
-                        self.advance_sync_ops_cursor(from, end);
-                    }
-                    if !self.warned_sync_ops_full.swap(true, Ordering::Relaxed) {
-                        eprintln!(
-                            "[enchudb] warning: _sync_ops ring is full — oplog→sync bridge is \
-                             backpressured (transferred records are kept, the rest wait; \
-                             nothing is dropped). Consumers must ack (ack_sync) so \
-                             reclaim_sync_ops can free the ring."
-                        );
-                    }
-                    return count;
-                }
+                Err(_) => return self.sync_ops_backpressure(from, done_end, count, "_sync_ops ring"),
             };
             count += 1;
             let lsn = self.next_sync_lsn.fetch_add(1, Ordering::AcqRel);
@@ -5630,21 +5658,25 @@ impl Engine {
             // hlc.wall は u64 ms-since-epoch、 下位 32bit のみ保持 (= ~50 日サイクル
             // で wrap するが、 lsn 順序で query するので debug/filter 程度の用途)
             self.tie_to_by_id(row_eid, hlc_wall_lo_hid, rec.hlc.wall as u32);
-            // 0.8.0 phase 2: payload は signature(64) + pubkey_fp(8) + signed_bytes(rest)
-            // の concat 形式。 0.7.0 では signed_bytes のみだったが、 publish path を
-            // _sync_ops 経由にするため signature 込みで保存し、 sync crate で完全な
-            // WireRecord に復元できるよう拡張した。 wire format breaking、 0.7.x との
-            // 並走 sync は不可。
-            // 0.11: 逆写像で宛名を書き戻した record は再署名済み payload を使う
-            let (sig, fp, sb): (&[u8; 64], &[u8; 8], &[u8]) = match &resigned {
-                Some(r) => (&r.signature, &r.pubkey_fp, &r.signed_bytes[..]),
-                None => (&rec.signature, &rec.pubkey_fp, &rec.signed_bytes[..]),
+            #[cfg(not(target_arch = "wasm32"))]
+            let in_ring = match ring_slot {
+                Some((r, at_hid, off)) => match r.write(off, lsn, &wire_payload) {
+                    Ok(handle) => {
+                        self.tie_to_by_id(row_eid, at_hid, handle);
+                        true
+                    }
+                    Err(e) => {
+                        self.record_fault(FaultKind::DiskSpace, &format!("sync.payload.seg に書けない ({e}) — 辞書に置く"));
+                        false
+                    }
+                },
+                None => false,
             };
-            let mut wire_payload = Vec::with_capacity(72 + sb.len());
-            wire_payload.extend_from_slice(sig);
-            wire_payload.extend_from_slice(fp);
-            wire_payload.extend_from_slice(sb);
-            self.tie_bytes_to_by_id(row_eid, payload_hid, &wire_payload);
+            #[cfg(target_arch = "wasm32")]
+            let in_ring = false;
+            if !in_ring {
+                self.tie_bytes_to_by_id(row_eid, payload_hid, &wire_payload);
+            }
             // #235: **`lsn` は最後**。 `_sync_ops` の走査は全部 `entities_with_himo(lsn_hid)`
             // 経由 (`reclaim_sync_ops` / `ack_sync_prefix` / `pending_sync_ops`) なので、
             // lsn を tie した瞬間に row が索引へ載る。 先に tie すると payload の無い
@@ -5668,6 +5700,33 @@ impl Engine {
         self.advance_sync_ops_cursor(from, committed_end);
         // 満杯が解消して完走した — 次の満杯では再び warn する
         self.warned_sync_ops_full.store(false, Ordering::Relaxed);
+        count
+    }
+
+    /// bridge が満杯 (`_sync_ops` の行の枠、 または payload の ring) にぶつかった。 #152: **挿入し切った分まで**
+    /// cursor を進めて返す (partial advance)。
+    ///
+    /// 履歴:
+    /// - 0.18.1 まで: committed_end まで飛ばして残りを破棄 → ring 満杯が
+    ///   続く限り全ての新規変更が配布から無言で欠落する data loss
+    /// - 0.18.2 (#150): cursor を一切進めない retry → 損失は消えたが、
+    ///   backlog が ring 容量を超えると毎周「先頭 K 件を再挿入 → K+1 件目で
+    ///   満杯 → cursor 据置」を繰り返して**永久に前進しない** (#152)
+    /// - 本実装: 処理し切った record の終端まで進める。 各 record は
+    ///   ちょうど 1 回だけ挿入され、 重複も損失も進行不能も無い。
+    ///   ring が空けば必ず続きから再開する。
+    fn sync_ops_backpressure(&self, from: u64, done_end: Option<u64>, count: usize, what: &str) -> usize {
+        if let Some(end) = done_end {
+            self.advance_sync_ops_cursor(from, end);
+        }
+        if !self.warned_sync_ops_full.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[enchudb] warning: {what} is full — oplog→sync bridge is \
+                 backpressured (transferred records are kept, the rest wait; \
+                 nothing is dropped). Consumers must ack (ack_sync) so \
+                 reclaim_sync_ops can free the ring."
+            );
+        }
         count
     }
 
@@ -6195,9 +6254,8 @@ impl Engine {
         if !self.sync_tables_enabled() {
             return Err("sync tables not enabled (call enable_sync first)".into());
         }
-        let lsn_hid = self.himo_id("_sync_ops.lsn").ok_or("missing _sync_ops.lsn")? as u16;
-        let payload_hid =
-            self.himo_id("_sync_ops.payload").ok_or("missing _sync_ops.payload")? as u16;
+        let cols = self.sync_payload_cols().ok_or("missing _sync_ops.lsn")?;
+        let lsn_hid = cols.lsn;
         let session_start = {
             let guard = self.ack_walk_resume.lock().unwrap();
             guard.get(&peer).copied()
@@ -6230,8 +6288,7 @@ impl Engine {
         let mut known_authors: Option<std::collections::HashSet<u32>> = None;
         for (lsn, eid) in rows.iter() {
             let decoded = self
-                .get_by_id32(*eid, payload_hid)
-                .map(|vid| self.vocab.get(vid).to_vec())
+                .sync_op_payload(*eid, &cols)
                 .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b));
             match decoded {
                 Some(rec) => {
@@ -6253,6 +6310,11 @@ impl Engine {
                     // backstop としてここでも止める。 break なので、 完成後の次の
                     // walk で普通に判定される。
                     if *lsn >= self.current_sync_lsn() {
+                        break;
+                    }
+                    // payload の ring を開けないだけなら、 row は壊れていない (読めないのは置き場の方)。
+                    // 消すと未配送の record を失うので、 ここで止めて次の walk に回す。
+                    if self.sync_payload_unreachable(*eid, &cols) {
                         break;
                     }
                     // #218: 消す前に floor 候補を作る (delete 後は peer_id を読めない)。
@@ -6505,15 +6567,11 @@ impl Engine {
                 }
             }
         }
-        let (Some(lsn_hid), Some(payload_hid)) = (
-            self.himo_id("_sync_ops.lsn"),
-            self.himo_id("_sync_ops.payload"),
-        ) else {
+        let Some(cols) = self.sync_payload_cols() else {
             return set;
         };
-        for eid in self.entities_with_himo(lsn_hid as u16) {
-            let Some(vid) = self.get_by_id32(eid, payload_hid as u16) else { continue };
-            let bytes = self.vocab.get(vid).to_vec();
+        for eid in self.entities_with_himo(cols.lsn) {
+            let Some(bytes) = self.sync_op_payload(eid, &cols) else { continue };
             if let Some(rec) = enchudb_oplog::oplog::decode_sync_ops_payload(&bytes) {
                 set.insert(rec.author_peer);
             }
@@ -6584,17 +6642,15 @@ impl Engine {
         // 生存 row のうち watermark 以下 (= 下流全員が消化済み)。
         let watermark = self.sync_watermark();
         if watermark > 0
-            && let Some(lsn_hid) = self.himo_id("_sync_ops.lsn")
-            && let Some(payload_hid) = self.himo_id("_sync_ops.payload")
+            && let Some(cols) = self.sync_payload_cols()
         {
-            for eid in self.entities_with_himo(lsn_hid as u16) {
-                let Some(lsn) = self.get_by_id32(eid, lsn_hid as u16) else { continue };
+            for eid in self.entities_with_himo(cols.lsn) {
+                let Some(lsn) = self.get_by_id32(eid, cols.lsn) else { continue };
                 if lsn > watermark {
                     continue;
                 }
                 if let Some(rec) = self
-                    .get_by_id32(eid, payload_hid as u16)
-                    .map(|vid| self.vocab.get(vid).to_vec())
+                    .sync_op_payload(eid, &cols)
                     .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b))
                 {
                     bump(rec.author_peer, rec.hlc);
@@ -6650,7 +6706,7 @@ impl Engine {
 
         // _sync_ops 全 row を走査して lsn < watermark を delete
         let rows = self.entities_with_himo(lsn_hid_u16);
-        let payload_hid = self.himo_id("_sync_ops.payload").map(|h| h as u16);
+        let payload_cols = self.sync_payload_cols();
         let mut purged = 0;
         // #191: purge した record の最大 HLC = 「差分 pull で配れない履歴の上限」。
         // publish 側はこれを history floor として広告する (生存 record の最小 HLC を
@@ -6681,11 +6737,15 @@ impl Engine {
             if lsn >= watermark {
                 continue;
             }
-            let decoded = payload_hid
-                .and_then(|h| self.get_by_id32(eid, h))
-                .map(|vid| self.vocab.get(vid).to_vec())
+            let decoded = payload_cols
+                .as_ref()
+                .and_then(|c| self.sync_op_payload(eid, c))
                 .and_then(|b| enchudb_oplog::oplog::decode_sync_ops_payload(&b));
-            if decoded.is_none() && lsn >= inflight_lsn {
+            // payload の ring を開けないだけの row も消さない (`ack_sync_prefix` と同じ)。
+            if decoded.is_none()
+                && (lsn >= inflight_lsn
+                    || payload_cols.as_ref().is_some_and(|c| self.sync_payload_unreachable(eid, c)))
+            {
                 continue;
             }
             // #218: floor は **decode できた row だけ**で作っていた = 過少申告。
@@ -7224,15 +7284,122 @@ impl Engine {
         min_lsn
     }
 
+    /// `_sync_ops` の payload を引く列。
+    fn sync_payload_cols(&self) -> Option<SyncPayloadCols> {
+        Some(SyncPayloadCols {
+            lsn: self.himo_id("_sync_ops.lsn")? as u16,
+            at: self.himo_id(SYNC_PAYLOAD_AT).map(|h| h as u16),
+            legacy: self.himo_id("_sync_ops.payload").map(|h| h as u16),
+        })
+    }
+
+    /// row の payload (完全 wire bytes)。 ring の row は handle と lsn で引き、 その場所が後の record に使い回された
+    /// 後 (= 既に reclaim / purge 済み) なら `None`。 ring を入れる前に bridge した row は辞書から読む。
+    fn sync_op_payload(&self, eid: u64, cols: &SyncPayloadCols) -> Option<Vec<u8>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(at) = cols.at
+            && let Some(handle) = self.get_by_id32(eid, at)
+        {
+            let lsn = self.get_by_id32(eid, cols.lsn)?;
+            return self.payload_ring(false)?.read(handle, lsn);
+        }
+        let vid = self.get_by_id32(eid, cols.legacy?)?;
+        Some(self.vocab.get(vid).to_vec())
+    }
+
+    /// row の payload が ring にあるのに ring を開けない (= 壊れているのは置き場で、 row ではない)。
+    /// この row を dead row として消すと、 未配送の record を失う。
+    fn sync_payload_unreachable(&self, eid: u64, cols: &SyncPayloadCols) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(at) = cols.at
+            && self.get_by_id32(eid, at).is_some()
+        {
+            return self.payload_ring(false).is_none();
+        }
+        let _ = (eid, cols);
+        false
+    }
+
+    /// `_sync_ops` の row の payload (test / 診断用)。 無い・読めない (dead row) なら `None`。
+    pub fn sync_ops_payload(&self, eid: u64) -> Option<Vec<u8>> {
+        self.sync_op_payload(eid, &self.sync_payload_cols()?)
+    }
+
+    /// payload の循環バッファ。 在れば開き、 `create` なら無い時に作る (version を v14 に上げる)。 readonly /
+    /// packed / 開けなかった時は `None` (payload は辞書の従来経路)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn payload_ring(&self, create: bool) -> Option<&crate::sync_payload_ring::PayloadRing> {
+        use crate::sync_payload_ring::{capacity_for, PayloadRing, FILE};
+        if let Some(r) = self.sync_payload_ring.get() {
+            return Some(r);
+        }
+        let Backing::Segments(set) = &self.backing else { return None };
+        let readonly = self.is_readonly();
+        let exists = set.dir().join(FILE).exists();
+        if !exists && (!create || readonly) {
+            return None;
+        }
+        let rows = self.table_eid_usage("_sync_ops").map(|u| u.capacity).unwrap_or(0);
+        let ring = match PayloadRing::open_or_create(set.dir(), capacity_for(rows), readonly) {
+            Ok(r) => r,
+            Err(e) => {
+                if !self.warned_sync_payload_ring.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("[enchudb] warning: {FILE} を開けない ({e}) — _sync_ops の payload は辞書に置く");
+                }
+                return None;
+            }
+        };
+        let (newest, oldest) = self.sync_ring_extremes();
+        ring.restore(newest, oldest);
+        if self.sync_payload_ring.set(ring).is_ok() && !exists && let Err(e) = self.stamp_sync_ring_version() {
+            eprintln!("[enchudb] warning: v14 の version を刻めない ({e})");
+        }
+        self.sync_payload_ring.get()
+    }
+
+    /// ring に payload を持つ生きている row のうち、 最大 lsn の (handle, lsn) と最小 lsn の handle。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn sync_ring_extremes(&self) -> (Option<(u32, u32)>, Option<u32>) {
+        let Some(cols) = self.sync_payload_cols() else { return (None, None) };
+        let Some(at) = cols.at else { return (None, None) };
+        let mut newest: Option<(u32, u32)> = None;
+        let mut oldest: Option<(u32, u32)> = None;
+        for eid in self.entities_with_himo(cols.lsn) {
+            let (Some(lsn), Some(h)) = (self.get_by_id32(eid, cols.lsn), self.get_by_id32(eid, at)) else { continue };
+            if newest.is_none_or(|(l, _)| lsn > l) {
+                newest = Some((lsn, h));
+            }
+            if oldest.is_none_or(|(l, _)| lsn < l) {
+                oldest = Some((lsn, h));
+            }
+        }
+        (newest.map(|(l, h)| (h, l)), oldest.map(|(_, h)| h))
+    }
+
+    /// v14 を刻む (`enable_vocab_reclaim` と同じ形)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn stamp_sync_ring_version(&self) -> io::Result<()> {
+        let header_size = self.layout.read().unwrap().header_size;
+        {
+            let buf = self.backing.header_mut(header_size);
+            let cur = u32::from_le_bytes(buf[H_VERSION..H_VERSION + 4].try_into().unwrap());
+            if cur >= FILE_VERSION_SYNC_RING {
+                return Ok(());
+            }
+            buf[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION_SYNC_RING.to_le_bytes());
+            write_header_crc(buf);
+        }
+        self.backing.flush_header(header_size)
+    }
+
+
     /// 0.7.0 (Phase 4): `_sync_ops` の `lsn > since_lsn` row を全 himo set で
     /// 返す。 Syncer の publish_since が「peer.consumed_lsn より新しい op を
     /// 流す」 用途で呼ぶ。 返り値の各 entry は payload (= 完全 wire bytes)。
     pub fn pending_sync_ops(&self, since_lsn: u32) -> Vec<Vec<u8>> {
         if !self.sync_tables_enabled() { return Vec::new(); }
-        let Some(lsn_hid) = self.himo_id("_sync_ops.lsn") else { return Vec::new(); };
-        let Some(payload_hid) = self.himo_id("_sync_ops.payload") else { return Vec::new(); };
-        let lsn_hid_u16 = lsn_hid as u16;
-        let payload_hid_u16 = payload_hid as u16;
+        let Some(cols) = self.sync_payload_cols() else { return Vec::new(); };
+        let lsn_hid_u16 = cols.lsn;
 
         let rows = self.entities_with_himo(lsn_hid_u16);
         let mut pairs: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -7242,11 +7409,7 @@ impl Engine {
                 None => continue,
             };
             if lsn <= since_lsn { continue; }
-            let payload_vid = match self.get_by_id32(eid, payload_hid_u16) {
-                Some(v) => v,
-                None => continue,
-            };
-            let bytes = self.vocab.get(payload_vid).to_vec();
+            let Some(bytes) = self.sync_op_payload(eid, &cols) else { continue };
             pairs.push((lsn, bytes));
         }
         // lsn 順
@@ -14419,6 +14582,10 @@ impl Engine {
         match &self.backing {
             Backing::Segments(set) => {
                 set.flush_dirty_all()?;
+                // ring の payload も本体と同じ契機で書き出す (row だけ残って payload が消えると dead row になる)
+                if let Some(ring) = self.sync_payload_ring.get() {
+                    ring.flush()?;
+                }
                 // 「この時点の segment 長」 を記録する。 次の open で切り詰めを検出できる。
                 set.write_manifest()
             }
@@ -15321,6 +15488,10 @@ impl Engine {
     #[cfg(not(target_arch = "wasm32"))]
     fn sync_and_mark_clean_with(&self, refs: bool) -> io::Result<()> {
         self.backing.flush_to_disk()?;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ring) = self.sync_payload_ring.get() {
+            ring.flush()?;
+        }
         if refs {
             self.vocab.mark_index_clean_refs();
         } else {
@@ -15446,6 +15617,18 @@ fn map_vocab_refs(dir: &std::path::Path, size: usize) -> io::Result<Arc<crate::s
 /// #385: 参照数の file の名前 (DB の directory の中、 manifest には載せない = 無くても数え直すだけ)。
 #[cfg(not(target_arch = "wasm32"))]
 const VOCAB_REFS_FILE: &str = "vocab.refs.seg";
+
+/// `_sync_ops` の row が payload の ring 上の位置 (handle) を持つ列。 ring を入れる前の row は持たない。
+const SYNC_PAYLOAD_AT: &str = "_sync_ops.payload_at";
+
+/// `_sync_ops` の payload を引く列の himo id ([`Engine::sync_payload_cols`])。
+struct SyncPayloadCols {
+    lsn: u16,
+    /// ring の handle (`payload_at`)。
+    at: Option<u16>,
+    /// 辞書の vid (`payload`、 ring を入れる前の row)。
+    legacy: Option<u16>,
+}
 
 impl Drop for Engine {
     fn drop(&mut self) {

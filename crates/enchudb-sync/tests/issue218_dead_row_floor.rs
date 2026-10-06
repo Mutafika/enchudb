@@ -75,12 +75,10 @@ fn tick() {
 /// ring 位置は lsn column から読む。
 fn ring_rows(eng: &Arc<Engine>) -> Vec<(u32, PeerId, Hlc)> {
     let lsn_hid = eng.himo_id("_sync_ops.lsn").unwrap() as u16;
-    let payload_hid = eng.himo_id("_sync_ops.payload").unwrap() as u16;
     let mut out = Vec::new();
     for eid in eng.entities_with_himo(lsn_hid) {
         let Some(lsn) = eng.get_by_id(eid, lsn_hid).map(|l| l as u32) else { continue };
-        let Some(vid) = eng.get_by_id(eid, payload_hid).map(|v| v as u32) else { continue };
-        let bytes = eng.vocab_text(vid).to_vec();
+        let Some(bytes) = eng.sync_ops_payload(eid) else { continue };
         let Some(rec) = enchudb_oplog::oplog::decode_sync_ops_payload(&bytes) else { continue };
         out.push((lsn, rec.author_peer, rec.hlc));
     }
@@ -183,7 +181,11 @@ fn reclaim_purge_of_undecodable_row_raises_floor_for_its_author() {
         .find(|(l, _, _)| *l == dead_lsn)
         .map(|(_, _, h)| h)
         .unwrap();
-    eng_r.untie(row_eid(&eng_r, dead_lsn), "_sync_ops.payload");
+    {
+        let dead = row_eid(&eng_r, dead_lsn);
+        eng_r.untie(dead, "_sync_ops.payload");
+        eng_r.untie(dead, "_sync_ops.payload_at");
+    }
 
     // dead row までを purge 対象に (最後の R own row は残す = #235 guard を避ける)。
     eng_r.ack_sync(9, dead_lsn + 1).unwrap();
@@ -229,7 +231,11 @@ fn ack_prefix_purge_of_dead_row_raises_floor() {
         .find(|(l, _, _)| *l == dead_lsn)
         .map(|(_, _, h)| h)
         .unwrap();
-    eng_r.untie(row_eid(&eng_r, dead_lsn), "_sync_ops.payload");
+    {
+        let dead = row_eid(&eng_r, dead_lsn);
+        eng_r.untie(dead, "_sync_ops.payload");
+        eng_r.untie(dead, "_sync_ops.payload_at");
+    }
 
     // 全 author の cursor を「全部消化済み」で渡す → prefix walk が dead row を
     // 削除して越える。
@@ -259,7 +265,11 @@ fn dead_row_without_peer_id_falls_back_to_baseline() {
 
     let dead_lsn = *relayed.last().unwrap();
     let eid = row_eid(&eng_r, dead_lsn);
-    eng_r.untie(eid, "_sync_ops.payload");
+    {
+        let dead = eid;
+        eng_r.untie(dead, "_sync_ops.payload");
+        eng_r.untie(dead, "_sync_ops.payload_at");
+    }
     eng_r.untie(eid, "_sync_ops.peer_id");
 
     eng_r.ack_sync(9, dead_lsn + 1).unwrap();
@@ -288,7 +298,11 @@ fn dead_row_with_implausible_peer_id_falls_back_to_baseline() {
 
     let dead_lsn = *relayed.last().unwrap();
     let eid = row_eid(&eng_r, dead_lsn);
-    eng_r.untie(eid, "_sync_ops.payload");
+    {
+        let dead = eid;
+        eng_r.untie(dead, "_sync_ops.payload");
+        eng_r.untie(dead, "_sync_ops.payload_at");
+    }
     // ring のどの decodable row も名乗っていない peer id。
     eng_r.tie_to(eid, "_sync_ops.peer_id", 777);
     assert!(ring_rows(&eng_r).iter().all(|(_, a, _)| *a != 777));
@@ -379,7 +393,11 @@ fn puller_below_a_purged_dead_row_is_told_truncated() {
 
     let rows = ring_rows(&eng_a);
     let oldest = rows.first().map(|(l, _, _)| *l).expect("ring に row がある");
-    eng_a.untie(row_eid(&eng_a, oldest), "_sync_ops.payload");
+    {
+        let dead = row_eid(&eng_a, oldest);
+        eng_a.untie(dead, "_sync_ops.payload");
+        eng_a.untie(dead, "_sync_ops.payload_at");
+    }
 
     // 最古の 1 行だけを purge 対象にする。
     eng_a.ack_sync(2, oldest + 1).unwrap();

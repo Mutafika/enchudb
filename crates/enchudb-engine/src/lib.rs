@@ -54,6 +54,8 @@ pub mod segment_map;
 pub mod segment_map;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod segments;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod sync_payload_ring;
 pub mod db_files;
 pub mod column;
 pub mod vocabulary;
