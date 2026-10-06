@@ -146,7 +146,11 @@ fn over_ack_does_not_let_reclaim_eat_an_undecodable_newest_row() {
 
     // 最新 row を「書き込み途中」と同じ観測状態にする (payload が引けない)。
     let newest_eid = *eng.pull_raw("_sync_ops.lsn", newest).first().expect("row exists");
-    eng.untie(newest_eid, "_sync_ops.payload");
+    {
+        let dead = newest_eid;
+        eng.untie(dead, "_sync_ops.payload");
+        eng.untie(dead, "_sync_ops.payload_at");
+    }
 
     // 実在より先を ack する (caller の誤り、 だが API は受け付ける)。
     eng.ack_sync(2, newest + 10).unwrap();
