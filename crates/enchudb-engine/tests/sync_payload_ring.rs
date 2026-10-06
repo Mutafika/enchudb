@@ -165,3 +165,39 @@ fn rows_are_kept_while_the_ring_cannot_be_opened() {
     drop(eng);
     cleanup(&path);
 }
+
+fn file_version(path: &str) -> u32 {
+    let b = std::fs::read(format!("{path}/header.seg")).unwrap();
+    u32::from_le_bytes(b[4..8].try_into().unwrap())
+}
+
+/// 列を離していない DB に ring ができた後で `migrate_column_pad` を流しても、 version を v14 から下げない。
+/// 下げると 0.30 の binary が開けてしまい、 `payload_at` を知らないので ring の row を dead row として消す。
+#[test]
+fn column_pad_migration_keeps_the_ring_version() {
+    let path = tmp_path("colpad");
+    cleanup(&path);
+    let before: Vec<Vec<u8>>;
+    {
+        let opts = enchudb_engine::GrowableOptions { column_pad: Some(false), ..Default::default() };
+        let mut eng = Engine::create_growable_opts(&path, opts).unwrap();
+        eng.define_table("notes", 64).unwrap();
+        eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
+        eng.enable_sync_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 16 * 1024 * 1024).unwrap();
+        let e = eng.entity_in("notes").unwrap();
+        for v in 1..=5 {
+            write_and_bridge(&eng, e, v);
+        }
+        before = eng.pending_sync_ops(0);
+        assert!(before.len() >= 5);
+        eng.flush_writes();
+    }
+    assert_eq!(file_version(&path), 14, "ring を作った DB が v14 になっていない — テスト前提");
+    assert!(Engine::migrate_column_pad(&path).unwrap() > 0, "列が移っていない — テスト前提");
+    assert_eq!(file_version(&path), 14, "migrate_column_pad が ring の DB の version を下げた");
+    let eng = Engine::open(&path).unwrap();
+    assert_eq!(eng.pending_sync_ops(0), before, "移行後に ring の payload が読めない");
+    drop(eng);
+    cleanup(&path);
+}

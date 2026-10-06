@@ -1684,7 +1684,9 @@ impl Engine {
             let mut hdr = vec![0u8; layout.header_size];
             f.read_exact(&mut hdr)?;
             hdr[H_COLUMN_PAD..H_COLUMN_PAD + 4].copy_from_slice(&1u32.to_le_bytes());
-            hdr[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION_COLPAD.to_le_bytes());
+            // 下げない: payload の ring を持つ DB は v14 (下げると 0.30 の binary が開いて ring の row を消す)
+            let cur = u32::from_le_bytes(hdr[H_VERSION..H_VERSION + 4].try_into().unwrap());
+            hdr[H_VERSION..H_VERSION + 4].copy_from_slice(&FILE_VERSION_COLPAD.max(cur).to_le_bytes());
             write_header_crc(&mut hdr);
             f.seek(SeekFrom::Start(0))?;
             f.write_all(&hdr[..HEADER_SIZE.min(hdr.len())])?;
