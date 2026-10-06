@@ -3,6 +3,39 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.31.0 — 2026-10-07
+
+minor。 **on-disk 形式が増えた** (file version 14)。 API は増えただけ (`Engine::sync_ops_payload`)。
+
+**上げる時の注意**:
+
+- sync を有効にした DB は、 この版で最初に bridge した時に `sync.payload.seg` を作って **file version 14 になり、 0.30 以前の
+  binary で開けなくなる**。 旧 binary は ring に置いた payload を読めず、 その row を壊れた row として消して未配送の record を
+  失う (#217 の dead row の掃除) ので、 開かせない。 下げる予定のある DB は上げる前に控えを取る
+- sync をしていない DB は何も変わらない (version も上がらない)
+- wire 形式 / `_sync_ops` の lsn / ack の意味は不変。 0.30 の peer とそのまま sync できる
+- 既存の sync DB はそのまま開ける。 前の版で bridge した row は辞書から読み、 以後の record は ring に置く
+- packed (`pack_dir`) は ring の file を含めない。 packed にした DB では ring の row は壊れた row になる (従来の bootstrap の経路)
+
+### Fixed — sync DB の辞書が、 bridge した record の数だけ伸び続けた (#410、 #411)
+
+`_sync_ops.payload` は engine 内部の table の Leaf なので LeafStore に載らず、 辞書 (vocab) に置かれていた。 辞書は値の byte を
+回収しない (#381 の回収も番号だけ) ので、 record 1 件ごとに 100 B 前後が一生残り、 ack / reclaim しても戻らなかった。 書き込みの
+多い sync DB は、 生きている行の量によらず `vocab_data_size` (既定 512 MiB) に着いて、 全 table の新しい Tag の値が書けなくなる
+(下流の Windows 機: 生きている行 約 11 万で辞書 4,325,886 語 / 536,870,907 B、 相手から届いた record も当てられずに捨てた)。
+
+payload を専用の循環バッファ `sync.payload.seg` に置く。 lsn の順に足して古い方から捨てる待ち行列なので、 head に足し、 生きて
+いる row のうち最小 lsn の entry を tail とする (個別の解放も空き一覧も無い)。 row は新しい列 `_sync_ops.payload_at` に場所を
+持ち、 読む時は entry の lsn と row の lsn が一致するかを確かめる。 場所は row を取る前に確保し、 取れなければ row の枠が埋まった
+時と同じく bridge が待つ (#152)。 大きさは `_sync_ops` の行数 × 256 B (16 MiB〜1 GiB)。 ring の 1/4 を越える payload と、 ring を
+持てない DB (packed / readonly / file を開けない) は従来どおり辞書。 ring の file を開けない間は、 ring に payload を置いた row を
+消さない (壊れているのは置き場の方で、 消すと未配送の record を失う)。
+
+1 つの cell を 3,000 回書き換え、 毎回 bridge、 100 回ごとに ack + reclaim した時の辞書の伸び: 3,030 語 / 384,720 B → 30 語 / 720 B
+(残る 30 語は reclaim ごとの `_sync_peers.reclaimed_floor`、 record の数ではなく reclaim の回数で伸びる)。
+
+`Engine::migrate_column_pad` は version を下げない (v14 の DB を移しても v14 のまま。 13 に書くと 0.30 の binary が開けてしまう)。
+
 ## 0.30.2 — 2026-10-05
 
 patch。 on-disk 形式は 0.30.1 と同じ。 API の変更なし。
