@@ -11159,7 +11159,13 @@ impl Engine {
                             None => return Ok(None),
                         };
                         // slot 内の seqlock (gen) で torn / 同 offset 再利用を検出。
-                        let LeafRead::Ok(bytes) = leaf.try_read(raw) else {
+                        let mut res = leaf.try_read(raw);
+                        // #417: readonly の Engine は書き手 (別 process) が伸ばした Leaf 領域を写像に持って
+                        // いない。 揃わなければ取り込んでから 1 回読み直す (fstat 1 回、 伸びていなければ何もしない)
+                        if self.is_readonly() && !matches!(res, LeafRead::Ok(_)) && leaf.refresh().is_ok() {
+                            res = leaf.try_read(raw);
+                        }
+                        let LeafRead::Ok(bytes) = res else {
                             return Err(Some((raw, leaf.slot_stamp(raw))));
                         };
                         // column offset を再読。 不変なら relocation も無かった = 確定。

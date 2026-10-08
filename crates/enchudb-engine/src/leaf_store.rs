@@ -372,6 +372,11 @@ impl LeafStore {
         if h8 > region_len {
             return LeafRead::Retry;
         }
+        // #417: 写像に貼っていない所 (readonly の読み手から見て、 書き手が後から伸ばした先) は予約の
+        // ゼロ page。 ゼロの header を 「空の旧形式 slot」 と読んではいけない — 呼び側が `refresh` して読み直す
+        if !self.region.is_committed(h8) {
+            return LeafRead::Retry;
+        }
         // header field も payload も **atomic load** で読む (#113: read_atomic)。 plain な
         // slice 読みは「不変」とコンパイラに誤認され、 並行 writer 下 (data race = UB) で
         // 再順序化/重複除去され seqlock を破る。 atomic なら writer の atomic store と対で健全。
@@ -402,7 +407,7 @@ impl LeafStore {
                 return LeafRead::Retry;
             }
             let Some(end) = h12.checked_add(len) else { return LeafRead::Retry };
-            if end > region_len {
+            if end > region_len || !self.region.is_committed(end) {
                 return LeafRead::Retry;
             }
             // payload を relaxed-atomic で copy (#113: writer の write_atomic と対で data
@@ -418,12 +423,16 @@ impl LeafStore {
         } else {
             // ── legacy 8B slot (不変・再利用時のみ 12B へ化ける) ──
             let slot_size = ss0 as usize;
+            // #417: 旧形式の slot は最小でも header の 8 B。 0 は slot ではない (書かれていない所)
+            if slot_size < MIN_SLOT {
+                return LeafRead::Retry;
+            }
             let len = self.region.as_atomic_u32(o + 4).load(Ordering::Relaxed) as usize;
             if len > slot_size.saturating_sub(SLOT_HEADER) {
                 return LeafRead::Retry;
             }
             let Some(end) = h8.checked_add(len) else { return LeafRead::Retry };
-            if end > region_len {
+            if end > region_len || !self.region.is_committed(end) {
                 return LeafRead::Retry;
             }
             // h8 = byte_off + 8 も 4B aligned。 legacy slot は不変だが uniform に atomic read。
@@ -435,6 +444,11 @@ impl LeafStore {
             }
             LeafRead::Ok(bytes)
         }
+    }
+
+    /// 別 process の書き手が伸ばした分を写像に取り込む (readonly の読み手用、 #417)。
+    pub fn refresh(&self) -> std::io::Result<()> {
+        self.region.refresh()
     }
 
     /// #128: retry の進捗検出用に slot の状態 stamp (ss word + gen) を返す。

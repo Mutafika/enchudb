@@ -246,6 +246,15 @@ impl Region {
     ///
     /// v9 領域は variable cluster の末尾にあるため、 「commit を伸ばさずに
     /// 中身を読めるか」 を先に確かめたい経路 (`ver_column_from_region`) で使う。
+    /// 別 process の書き手が伸ばした分を写像に取り込む (readonly の読み手用、 #417)。 静的 backing は no-op。
+    pub fn refresh(&self) -> std::io::Result<()> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(g) = &self.grower {
+            g.refresh()?;
+        }
+        Ok(())
+    }
+
     pub fn is_committed(&self, end_in_region: usize) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(g) = &self.grower {
