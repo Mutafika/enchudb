@@ -8,7 +8,9 @@
 //!
 //! - **書き出しの記録** — engine が msync (segment / oplog) や `sync_all` (sidecar) に成功した所で、
 //!   書き出した page の中身を控える ([`data_synced`] / [`file_synced`])。 控えは file の
-//!   (device, inode) ごと (rename で名前が変わっても、 消して作り直した file と混ざらない)。
+//!   (device, inode) ごと (rename で名前が変わっても同じ file を指す)。 Linux (ext4 / overlayfs) は空いた
+//!   inode の番号をすぐ次に作った file に渡すので、 控えのある file を手放す所 (rename での置き換え /
+//!   削除) は [`releasing`] を通して控えを捨てる (捨てないと、 番号を引き継いだ別の file に古い控えが写る)。
 //! - **電源断の像** — [`capture`] が directory を丸ごと別の場所に写す。 各 page の中身は
 //!   - [`Mode::Lost`]: 控え (書き出しの済んだ中身)。 控えの無い page はゼロ
 //!   - [`Mode::Mixed`]: page ごとに控えか今の中身 (OS が勝手に書き出していた分) を seed で選ぶ
@@ -138,6 +140,26 @@ pub fn file_synced(path: &Path) {
         pages.insert(i as u64, slot);
     }
     EVENTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `path` の file を手放す操作 (rename で置き換える / 消す) を `op` で行い、 その file の控えを捨てる。
+///
+/// Linux (ext4 / overlayfs) は空いた inode の番号をすぐ次に作った file に渡す。 捨てないと、 番号を
+/// 引き継いだ file の page に古い控えが写る (table の定義の sidecar を rename で置き換えた直後に作った
+/// 列の segment の page 0 が、 古い sidecar の中身 `TBL1` になった)。 控えの lock を持ったまま行うので、
+/// 像は手放す前 (古い file と控え) か後 (古い控えは無い) のどちらか。 `path` が無い / `op` が失敗した
+/// 時は何も捨てない。 記録していない時は `op` を呼ぶだけ。
+pub fn releasing<R>(path: &Path, op: impl FnOnce() -> io::Result<R>) -> io::Result<R> {
+    if !active() {
+        return op();
+    }
+    let mut guard = STATE.lock().unwrap();
+    let old = std::fs::metadata(path).ok().map(|md| (md.dev(), md.ino()));
+    let r = op()?;
+    if let (Some(id), Some(st)) = (old, guard.as_mut()) {
+        st.files.remove(&id);
+    }
+    Ok(r)
 }
 
 /// `root` の下を丸ごと、 電源断が今起きた時の姿で `out` に写す。 控えの lock を持ったまま写すので、

@@ -199,6 +199,9 @@ fn verify_in_child(kind: Kind, db: &Path, acked: u32) -> String {
     }
 }
 
+/// crashsim の控えは process 全体で 1 つ。 同じ binary の test を並べて走らせない
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Image {
     dir: PathBuf,
     acked: u32,
@@ -208,8 +211,6 @@ struct Image {
 
 /// 書き手を走らせ、 その横で像を撮り続ける。
 fn run(kind: Kind) {
-    // crashsim の控えは process 全体で 1 つ。 同じ binary の test を並べて走らせない
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let root = scratch(kind.name());
@@ -339,3 +340,42 @@ fn power_loss_keeps_oplog_synced_batches() {
     run(Kind::Oplog);
 }
 
+/// crashsim の控えが、 rename で置き換えた sidecar の inode 番号を引き継いだ列の segment に写らない。
+///
+/// Linux (ext4 / overlayfs) は空いた inode の番号をすぐ次に作った file に渡す。 置き換えで控えを捨てて
+/// いなかった頃は、 table の定義の sidecar を書き直した直後に作った列の page 0 に古い sidecar の控え
+/// (`TBL1`) が写り、 像を開くと列の header (value_size 1) として読んで panic した (CI の Linux だけ、
+/// 書き出しが返る前の像)。 番号を使い回さない FS (APFS) では元から起きない — ここは何も確かめずに通る。
+#[test]
+fn capture_does_not_carry_sidecar_pages_into_reused_inode() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("inode_reuse");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let db = live.join("db");
+    crashsim::start();
+    let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 65_536).unwrap();
+    eng.define_table("t", 1_000).unwrap();
+    for h in 0..16 {
+        // sidecar を rename で置き換える (前の sidecar の inode が空く) → 列の segment を作る
+        eng.persist_tables().unwrap();
+        eng.define_himo_in("t", &format!("h{h}"), ValueType::Number, 1_000).unwrap();
+    }
+    let img = root.join("img");
+    let st = crashsim::capture(&live, &img, Mode::Lost);
+    crashsim::stop();
+    st.unwrap();
+    let mut carried = Vec::new();
+    for ent in std::fs::read_dir(img.join("db").join("himo")).unwrap() {
+        let p = ent.unwrap().path();
+        if std::fs::read(&p).unwrap().starts_with(b"TBL1") {
+            carried.push(p.display().to_string());
+        }
+    }
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(carried.is_empty(), "sidecar の控えが列の segment に写った: {carried:?}");
+}
