@@ -744,6 +744,12 @@ impl SegmentMap {
         // この flush で書き出す分を先に取り出す (同じ segment の flush が 2 本同時に走っても 2 回引かない。
         // flush の途中で伸ばした分は取り出した後に足されるので残る)
         let flushed = if settle { self.unflushed.swap(0, Ordering::AcqRel) } else { 0 };
+        // 電源断の模擬: msync は page 単位で書くので、 末尾も page まで広げて写す (msync の前に)
+        #[cfg(feature = "crashsim")]
+        let sim = enchudb_oplog::crashsim::active().then(|| {
+            let hi = align_up(end, runtime_page_size()).min(self.committed());
+            unsafe { std::slice::from_raw_parts(self.base.add(offset), hi - offset) }.to_vec()
+        });
         let rc = unsafe { libc::msync(self.base.add(offset) as *mut _, len, libc::MS_SYNC) };
         // #317: macOS の msync は書き出しの失敗 (空き不足で書けなかった page) を返さない。 fsync は返す。
         // 書き出しで消えうるのは空きが少ない時だけなので、 fsync はその時だけ (sync ごとの fsync は
@@ -759,6 +765,17 @@ impl SegmentMap {
             // 書き出した page はブロックが割り当て済み = 空きから引かれた
             Ok(()) => {
                 UNFLUSHED.fetch_sub(flushed, Ordering::AcqRel);
+                #[cfg(feature = "crashsim")]
+                if let Some(bytes) = sim {
+                    match &self.file {
+                        Some(f) => enchudb_oplog::crashsim::data_synced(f, offset as u64, &bytes),
+                        None => {
+                            if let Ok(f) = self.reopen() {
+                                enchudb_oplog::crashsim::data_synced(&f, offset as u64, &bytes);
+                            }
+                        }
+                    }
+                }
             }
             Err(_) => {
                 self.unflushed.fetch_add(flushed, Ordering::Relaxed);
