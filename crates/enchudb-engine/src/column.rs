@@ -45,7 +45,22 @@ impl Column {
         region.write_at(4, &value_size.to_le_bytes());
         region.write_at(8, &max_entities.to_le_bytes());
         region.write_at(CELLS_AT, &Self::cells_field(cells).to_le_bytes());
+        // #414: concurrent の書き出し (`flush_dirty`) は印の付いた範囲だけ msync する。 印が無いと、 実行中に
+        // 足した列の header は書き出されない (電源断の後に value_size 0 の列になる)
+        region.mark_dirty(0, HEADER);
         Self::with_cells(region, 0, value_size, max_entities, cells)
+    }
+
+    /// open 時の load。 header の value_size が 0 = header が一度もディスクに届いていない (作った直後に
+    /// 電源が落ちた、 #414) なら、 書かれていない列として組む (`init_lazy`、 header は最初の書き込みが書く)。
+    /// そのまま `load` すると value_size 0 の列になり、 読みの assert (`values_u32`) で落ちる。
+    pub fn load_or_unwritten(region: Region, value_size: u32, max_entities: u32, padded: bool) -> Self {
+        let stored_vs = u32::from_le_bytes(region.slice()[4..8].try_into().unwrap());
+        if stored_vs == 0 {
+            Self::init_lazy(region, value_size, max_entities, padded)
+        } else {
+            Self::load(region)
+        }
     }
 
     fn cells_field(cells: usize) -> u32 {

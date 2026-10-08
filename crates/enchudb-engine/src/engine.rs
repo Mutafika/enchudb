@@ -1953,9 +1953,9 @@ impl Backing {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
             Backing::Segments(set) => {
-                HimoStore::load_lazy(set.clone(), SegmentKind::Himo(hid), ht, max_values)
+                HimoStore::load_lazy(set.clone(), SegmentKind::Himo(hid), ht, max_values, layout.max_entities, layout.col_pad)
             }
-            _ => HimoStore::load(self.region(SegmentKind::Himo(hid), layout), ht, max_values),
+            _ => HimoStore::load(self.region(SegmentKind::Himo(hid), layout), ht, max_values, layout.max_entities, layout.col_pad),
         }
     }
 
@@ -4223,6 +4223,12 @@ impl Engine {
         eng.refresh_sync_tables_flag();
         // #385: 辞書の参照数を数え直す (要る時だけ)。 table が決まった後、 oplog の回復で書く前
         eng.finish_vocab_refs_at_open();
+        // v6 (#88): routed-Leaf の live cell offset から LeafStore free-list を再構成 (free-list は非永続)。
+        // #414: table の定義が決まった後で — 前は sidecar を読む前に呼んでいて、 engine 内部の table の Leaf 列
+        // (辞書の番号を持つ) を LeafStore の offset と見ていた
+        if !readonly {
+            eng.rebuild_leaf_free_list();
+        }
 
         // v10: sync tables を持つ DB は版数列 (`ver/*.seg` / `tomb.seg`) を持つのが不変条件。
         // `enable_sync_tables()` は segment を作ってから header flag を立てるので、 その間の
@@ -4627,6 +4633,7 @@ impl Engine {
     pub fn from_bytes(data: Vec<u8>) -> Result<Self, String> {
         let eng = Self::load_from_backing(Backing::Memory(data), /*readonly=*/ false)?;
         eng.finish_vocab_refs_at_open();
+        eng.rebuild_leaf_free_list();
         Ok(eng)
     }
 
@@ -5081,10 +5088,6 @@ impl Engine {
             }
             eng.vocab.mark_index_clean(false);
             eng.himo_reg.mark_index_clean(false);
-            // v6 (#88): routed-Leaf の live cell offset から LeafStore free-list を
-            // 再構成 (free-list は非永続)。 これが無いと dead slot が再利用されず
-            // footprint が増える。
-            eng.rebuild_leaf_free_list();
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let _ = eng.backing.flush_kind(SegmentKind::VocabData, 0, 16);
@@ -9817,7 +9820,34 @@ impl Engine {
                 });
             }
         }
-        leaf.rebuild_free_list(&live);
+        let broken = leaf.rebuild_free_list(&live);
+        if broken.is_empty() {
+            return;
+        }
+        // #414: 電源断で中身の届かなかった slot を指す cell は外す (指したままだと、 空きにした場所を
+        // 使い回した別の値を読む)。 値は失われている — 届いていない。 high_water より後ろの slot も外す (high_water の
+        // header だけ届かなかった時は中身の正しい値を捨てるが、 残すと次の insert が上書きする)。 版数 / HLC は触らない
+        // ので、 sync の相手と同じ版の値は LWW で skip され、 相手とずれたままになりうる
+        let mut cleared = 0usize;
+        for hid in 0..self.himos.len() {
+            if self.leaf_for(hid).is_some() {
+                let mut gone = Vec::new();
+                self.himos[hid].for_each_set_cell(|eid, off| {
+                    if broken.contains(&(off as u32)) {
+                        gone.push(eid);
+                    }
+                });
+                for eid in gone {
+                    self.himos[hid].remove(eid);
+                    cleared += 1;
+                }
+            }
+        }
+        eprintln!(
+            "[enchudb] warning: {} Leaf slot(s) were not durable (power loss before flush) — cleared {cleared} cell(s) \
+             pointing at them; these values are lost locally and may stay diverged from sync peers",
+            broken.len()
+        );
     }
 
     /// v6 (#88): リモート peer から届いた TieLeaf を apply。 bytes を local

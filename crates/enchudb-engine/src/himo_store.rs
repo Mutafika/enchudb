@@ -31,6 +31,9 @@ use crate::region::Region;
 struct LazyCol {
     set: std::sync::Arc<crate::segments::SegmentSet>,
     kind: crate::segments::SegmentKind,
+    /// header が届いていない列を組む時の形 (`Column::load_or_unwritten`)
+    max_entities: u32,
+    padded: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -202,8 +205,9 @@ impl HimoStore {
 
     /// open 時の load。 cylinder は空のまま返し、最初の cyl 触りで
     /// `ensure_cylinder_built` 経由で rebuild する（reopen latency を膨らませないため）。
-    pub fn load(col_region: Region, ht: ValueType, max_values: u32) -> Self {
-        let col = Column::load(col_region);
+    /// `max_entities` / `padded` は header が一度も届いていない列を組む時だけ使う (`Column::load_or_unwritten`)。
+    pub fn load(col_region: Region, ht: ValueType, max_values: u32, max_entities: u32, padded: bool) -> Self {
+        let col = Column::load_or_unwritten(col_region, ht.width(), max_entities, padded);
         Self {
             col: ready(col),
             #[cfg(not(target_arch = "wasm32"))]
@@ -224,10 +228,12 @@ impl HimoStore {
         kind: crate::segments::SegmentKind,
         ht: ValueType,
         max_values: u32,
+        max_entities: u32,
+        padded: bool,
     ) -> Self {
         Self {
             col: OnceLock::new(),
-            lazy: Some(LazyCol { set, kind }),
+            lazy: Some(LazyCol { set, kind, max_entities, padded }),
             cyl: LockFreeCylinder::new(max_values),
             value_type: ht,
             max_values,
@@ -265,7 +271,9 @@ impl HimoStore {
             .as_ref()
             .expect("HimoStore column is neither loaded nor lazy");
         self.col
-            .get_or_init(|| Column::load(lazy.set.region(lazy.kind)))
+            .get_or_init(|| {
+                Column::load_or_unwritten(lazy.set.region(lazy.kind), self.value_type.width(), lazy.max_entities, lazy.padded)
+            })
     }
 
     /// cylinder が未 build なら column から rebuild。lazy build の入口。
@@ -664,6 +672,17 @@ impl HimoStore {
         }
     }
 
+    /// `for_each_set_value` の (eid, 値) 版。 同じく書き込みと並走しない場面 (open 直後) でだけ使うこと。
+    pub fn for_each_set_cell(&self, mut f: impl FnMut(u32, u64)) {
+        let col = self.col();
+        for eid in 0..col.count() {
+            let stored = stored_at(col, eid);
+            if stored != 0 {
+                f(eid, stored - 1);
+            }
+        }
+    }
+
     /// cylinder (in-memory index) が組まれているか = **writer が以後それを維持するか**
     /// (#270)。 観測用 (#255 / #270 の gate)。
     pub fn cylinder_built(&self) -> bool {
@@ -727,6 +746,24 @@ mod tests {
         let ptr = Box::leak(buf).as_mut_ptr();
         let region = unsafe { Region::new(ptr, bytes) };
         HimoStore::init(region, ValueType::Number, 0, max_entities, false)
+    }
+
+    /// #414: 列の header が一度もディスクに届いていない (作った直後に電源が落ちた = 全部ゼロ) region を開いても
+    /// 落ちない。 旧 `Column::load` は value_size 0 の列を組み、 open の Leaf の free-list 再構成
+    /// (`for_each_set_value` → `values_u32` の assert) で panic した。 書かれていない列として開き、 書ける。
+    #[test]
+    fn load_of_never_written_header_is_an_empty_column() {
+        for ht in [ValueType::Leaf, ValueType::Number, ValueType::Number64] {
+            let bytes = 64 * 1024;
+            let ptr = Box::leak(vec![0u8; bytes].into_boxed_slice()).as_mut_ptr();
+            let region = unsafe { Region::new(ptr, bytes) };
+            let hs = HimoStore::load(region, ht, 0, 64, false);
+            let mut n = 0;
+            hs.for_each_set_value(|_| n += 1);
+            assert_eq!(n, 0, "{ht:?}");
+            assert!(hs.set(3, 7), "{ht:?}");
+            assert_eq!(hs.get_value(3), Some(7), "{ht:?}");
+        }
     }
 
     /// #270: **writer 3 経路 (`set` / `remove` / `restore`) はどれも cylinder を組まない**。
