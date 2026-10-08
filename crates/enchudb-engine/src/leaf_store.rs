@@ -669,7 +669,7 @@ impl LeafStore {
             }
             let limit = anchors.get(i + 1).copied().unwrap_or(hw).min(hw);
             let ss = self.b2w(self.slot_size_bytes_at(a) as usize);
-            if ss >= self.min_slot_words() && a as u64 + ss as u64 <= limit as u64 {
+            if ss >= self.min_slot_words() && a as u64 + ss as u64 <= limit as u64 && !self.odd_gen_at(a) {
                 kept.push((a, ss));
             } else {
                 broken.insert(a);
@@ -687,6 +687,17 @@ impl LeafStore {
             self.flush_run(&mut holes, cur, hw - cur, hw);
         }
         broken
+    }
+
+    /// gen 付き slot の gen が奇数 (解放済み = `HOLE_GEN` / 書きかけ) か。 open 時に live の cell がこれを指すのは、
+    /// 解放の印はディスクに届いたが cell の書き換えが届かなかった時 (#414)。 `try_read` は読めず (None)、 借用の
+    /// `get` は旧い len で旧い中身を返す — 読み方で答えが割れるので、 壊れた slot として外す。
+    fn odd_gen_at(&self, word_off: u32) -> bool {
+        let o = self.w2b(word_off);
+        let ss_raw = self.region.as_atomic_u32(o).load(Ordering::Relaxed);
+        ss_raw & HAS_GEN != 0
+            && o + SLOT_HEADER_GEN <= self.region.len()
+            && self.region.as_atomic_u32(o + GEN_OFF).load(Ordering::Relaxed) & 1 != 0
     }
 
     /// rebuild 中: coalesce 済み free run を確定 (word 単位)。 末尾なら high_water 後退。
@@ -1035,6 +1046,26 @@ mod tests {
         let z = s.insert(&[b'Z'; 300]);
         assert_eq!(s.get(z), &[b'Z'; 300][..]);
         assert_eq!(s.get(y), b"keep-y", "空きにした範囲が live の y に重なった");
+    }
+
+    /// #414: 解放の印 (`HOLE_GEN`) はディスクに届いたが cell の書き換えが届かなかった — live の cell が解放済みの
+    /// slot を指したまま。 壊れた slot として返し、 空きに戻す (残すと owned は None、 借用は旧い中身、 領域は漏れる)。
+    #[test]
+    fn rebuild_free_list_treats_freed_slot_under_live_cell_as_broken() {
+        let s = make_store(64 * 1024);
+        let a = s.insert(b"keep-a");
+        let old = s.insert(b"old-value");
+        let d = s.insert(b"keep-d");
+        s.free(old); // cell は old を指したまま (書き換えが届かなかった)
+
+        let live: HashSet<u32> = [a, old, d].into_iter().collect();
+        let broken = s.rebuild_free_list(&live);
+        assert_eq!(broken, [old].into_iter().collect::<HashSet<u32>>());
+        assert_eq!(s.get(a), b"keep-a");
+        assert_eq!(s.get(d), b"keep-d");
+        let e = s.insert(b"reuse");
+        assert!(e < d, "解放済みの slot が空きに戻っていない");
+        assert_eq!(s.get(d), b"keep-d");
     }
 
     #[test]

@@ -9825,7 +9825,9 @@ impl Engine {
             return;
         }
         // #414: 電源断で中身の届かなかった slot を指す cell は外す (指したままだと、 空きにした場所を
-        // 使い回した別の値を読む)。 値は失われている — 届いていない
+        // 使い回した別の値を読む)。 値は失われている — 届いていない。 high_water より後ろの slot も外す (high_water の
+        // header だけ届かなかった時は中身の正しい値を捨てるが、 残すと次の insert が上書きする)。 版数 / HLC は触らない
+        // ので、 sync の相手と同じ版の値は LWW で skip され、 相手とずれたままになりうる
         let mut cleared = 0usize;
         for hid in 0..self.himos.len() {
             if self.leaf_for(hid).is_some() {
@@ -9842,7 +9844,8 @@ impl Engine {
             }
         }
         eprintln!(
-            "[enchudb] warning: Leaf の slot が {} 個壊れていた (電源断で書き出しが届かなかった) — 指していた cell {cleared} 個を外した",
+            "[enchudb] warning: {} Leaf slot(s) were not durable (power loss before flush) — cleared {cleared} cell(s) \
+             pointing at them; these values are lost locally and may stay diverged from sync peers",
             broken.len()
         );
     }
