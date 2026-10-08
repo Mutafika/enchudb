@@ -567,6 +567,8 @@ impl LeafStore {
                 // 先頭が過去に gen slot の先頭だった場合、 素の size で書くと stale reader が
                 // legacy 分岐に落ちて corrupt を返す (#132) ため、 必ず hole header で書く。
                 self.write_hole_header(roff, self.w2b(remainder) as u32);
+                // #414: 書き出しに載せる (載せないと、 電源断の後に余りの位置が分割前の旧い header のまま)
+                self.region.mark_dirty(self.w2b(roff), SLOT_HEADER_GEN);
                 holes.insert(roff, remainder);
                 Some((hoff, need_words))
             } else {
@@ -603,6 +605,8 @@ impl LeafStore {
                 self.region
                     .as_atomic_u32(o + GEN_OFF)
                     .store(HOLE_GEN, Ordering::Release);
+                // #414: coalesce で header が前の hole に移っても、 この offset の印は書き出す
+                self.region.mark_dirty(o + GEN_OFF, 4);
             }
         }
 
@@ -640,41 +644,60 @@ impl LeafStore {
         }
     }
 
-    /// reopen 用: live な slot **word offset** 集合を渡し、 領域を walk して free-list を
-    /// 再構成する。 free-list は永続化しないので open 時に必ず呼ぶ。
-    pub fn rebuild_free_list(&self, live: &HashSet<u32>) {
+    /// reopen 用: live な slot **word offset** 集合を渡し、 free-list を再構成する。 free-list は永続化しない
+    /// ので open 時に必ず呼ぶ。
+    ///
+    /// 空き = live の slot の隙間。 live でない slot の header は読まない (#414): 電源断の後は、 分割した
+    /// 余りの header / 解放した slot の header がディスクに届いていない (旧い大きな size が残っている) ことが
+    /// あり、 それを信じて walk すると live の slot を飛び越して空きにしてしまう。 live の slot の header は
+    /// size が読めて、 次の live の slot (無ければ high_water) を越えないことだけを確かめる。 確かめられない
+    /// live の offset は返す — 呼び側は cell を外すこと (空きにした場所が使い回されると、 cell が別の値を読む)。
+    pub fn rebuild_free_list(&self, live: &HashSet<u32>) -> HashSet<u32> {
         let hw = self.hw_words();
         let mut holes = self.holes.lock().unwrap_or_else(|p| p.into_inner());
         holes.clear();
+        let start = self.b2w(self.data_start_byte());
+        let mut anchors: Vec<u32> = live.iter().copied().filter(|&a| a >= start).collect();
+        anchors.sort_unstable();
+        let mut broken: HashSet<u32> = live.iter().copied().filter(|&a| a < start || a >= hw).collect();
 
-        // 連続する free run を溜めて coalesce する (word 単位)
-        let mut pending: Option<(u32, u32)> = None; // (word offset, word size)
-        let mut off = self.b2w(self.data_start_byte());
-        while off < hw {
-            let ss = self.b2w(self.slot_size_bytes_at(off) as usize);
-            assert!(
-                ss >= self.min_slot_words() && (off as u64 + ss as u64) <= hw as u64,
-                "leaf store corrupt: slot_words {} at word_off {} (hw {})", ss, off, hw
-            );
-            if live.contains(&off) {
-                if let Some((poff, psize)) = pending.take() {
-                    self.flush_run(&mut holes, poff, psize, hw);
-                }
-            } else {
-                pending = match pending {
-                    Some((poff, psize)) if poff + psize == off => Some((poff, psize + ss)),
-                    Some((poff, psize)) => {
-                        self.flush_run(&mut holes, poff, psize, hw);
-                        Some((off, ss))
-                    }
-                    None => Some((off, ss)),
-                };
+        // 確かめた live の slot を (offset, size) で並べる
+        let mut kept: Vec<(u32, u32)> = Vec::with_capacity(anchors.len());
+        for (i, &a) in anchors.iter().enumerate() {
+            if a >= hw {
+                continue;
             }
-            off += ss;
+            let limit = anchors.get(i + 1).copied().unwrap_or(hw).min(hw);
+            let ss = self.b2w(self.slot_size_bytes_at(a) as usize);
+            if ss >= self.min_slot_words() && a as u64 + ss as u64 <= limit as u64 && !self.odd_gen_at(a) {
+                kept.push((a, ss));
+            } else {
+                broken.insert(a);
+            }
         }
-        if let Some((poff, psize)) = pending.take() {
-            self.flush_run(&mut holes, poff, psize, hw);
+        // 隙間を空きに (末尾の隙間は high_water を戻す)
+        let mut cur = start;
+        for &(a, ss) in &kept {
+            if a > cur {
+                self.flush_run(&mut holes, cur, a - cur, hw);
+            }
+            cur = a + ss;
         }
+        if cur < hw {
+            self.flush_run(&mut holes, cur, hw - cur, hw);
+        }
+        broken
+    }
+
+    /// gen 付き slot の gen が奇数 (解放済み = `HOLE_GEN` / 書きかけ) か。 open 時に live の cell がこれを指すのは、
+    /// 解放の印はディスクに届いたが cell の書き換えが届かなかった時 (#414)。 `try_read` は読めず (None)、 借用の
+    /// `get` は旧い len で旧い中身を返す — 読み方で答えが割れるので、 壊れた slot として外す。
+    fn odd_gen_at(&self, word_off: u32) -> bool {
+        let o = self.w2b(word_off);
+        let ss_raw = self.region.as_atomic_u32(o).load(Ordering::Relaxed);
+        ss_raw & HAS_GEN != 0
+            && o + SLOT_HEADER_GEN <= self.region.len()
+            && self.region.as_atomic_u32(o + GEN_OFF).load(Ordering::Relaxed) & 1 != 0
     }
 
     /// rebuild 中: coalesce 済み free run を確定 (word 単位)。 末尾なら high_water 後退。
@@ -958,6 +981,91 @@ mod tests {
                 "shift{shift}: reclaim 下で footprint が有界化してない (B={bounded}, 1round≈{one_round})",
             );
         }
+    }
+
+    /// #414: 電源断で slot header が届かなかった (ゼロ) 領域を open が walk しても panic しない。 壊れた所は次の
+    /// live の slot まで空きにし、 壊れた slot を指す live は返す。 その後ろの live は無傷で読める。
+    #[test]
+    fn rebuild_free_list_skips_headers_lost_in_power_loss() {
+        let s = make_store(64 * 1024);
+        let a = s.insert(b"keep-a");
+        let b = s.insert(b"lost-b");
+        let _c = s.insert(b"dead-c");
+        let d = s.insert(b"keep-d");
+        // b と c の header (と中身) がディスクに届かなかった: ゼロ
+        let (lo, hi) = (s.w2b(b), s.w2b(d));
+        s.region.fill_at(lo, hi - lo, 0);
+
+        let live: HashSet<u32> = [a, b, d].into_iter().collect();
+        let broken = s.rebuild_free_list(&live);
+        assert_eq!(broken, [b].into_iter().collect::<HashSet<u32>>(), "壊れた slot を指す live だけを返す");
+        assert_eq!(s.get(a), b"keep-a");
+        assert_eq!(s.get(d), b"keep-d");
+        // 壊れた範囲は空きとして使い回せる
+        assert!(s.free_bytes() > 0);
+        let e = s.insert(b"reuse");
+        assert!(e < d, "壊れた範囲 (d より手前) が使い回されていない");
+        assert_eq!(s.get(d), b"keep-d", "使い回しが後ろの live を壊した");
+
+        // 末尾の header が届かなかった: live が居なければ high_water を戻す
+        let s = make_store(64 * 1024);
+        let a = s.insert(b"keep-a");
+        let t = s.insert(b"tail");
+        let hw = s.high_water();
+        s.region.fill_at(s.w2b(t), (hw as usize) - s.w2b(t), 0);
+        let broken = s.rebuild_free_list(&[a].into_iter().collect());
+        assert!(broken.is_empty());
+        assert!(s.high_water() < hw, "届かなかった末尾が空きに戻っていない");
+        assert_eq!(s.get(a), b"keep-a");
+    }
+
+    /// #414: 生きていない slot の header が電源断で旧い (分割前の大きな) size のまま残っていても、 それを信じて
+    /// 後ろの live の slot を空きにしない。 旧い walk はここで y を飛び越し、 y を指す cell を外していた。
+    #[test]
+    fn rebuild_free_list_ignores_stale_size_of_dead_slot() {
+        let s = make_store(64 * 1024);
+        let a = s.insert(b"keep-a");
+        let big = s.insert(&[b'B'; 400]);
+        let _tail = s.insert(b"tail-keeps-hole-from-retracting");
+        let big_ss = s.region.as_atomic_u32(s.w2b(big)).load(Ordering::Relaxed);
+        s.free(big);
+        let x = s.insert(b"dead-x"); // big の先頭を使い回す (余りは hole)
+        let y = s.insert(b"keep-y"); // 余りの中
+        assert_eq!(x, big, "前提: best-fit が big の先頭を使い回す");
+        assert!(y > x && y < big + s.b2w((big_ss & !HAS_GEN) as usize), "前提: y は big の範囲の中");
+        // x の header がディスクで分割前の big の size のまま (x を書いた page が届かなかった)
+        s.region.as_atomic_u32(s.w2b(x)).store(big_ss, Ordering::Relaxed);
+
+        let live: HashSet<u32> = [a, y].into_iter().collect();
+        let broken = s.rebuild_free_list(&live);
+        assert!(broken.is_empty(), "旧い size に覆われた live を壊れた扱いにした: {broken:?}");
+        assert_eq!(s.get(y), b"keep-y");
+        assert_eq!(s.get(a), b"keep-a");
+        // big の大きさの値を入れても y を上書きしない (旧い walk は [x, x+big) を丸ごと空きにしていたので、
+        // z がそこに入って y を壊した)
+        let z = s.insert(&[b'Z'; 300]);
+        assert_eq!(s.get(z), &[b'Z'; 300][..]);
+        assert_eq!(s.get(y), b"keep-y", "空きにした範囲が live の y に重なった");
+    }
+
+    /// #414: 解放の印 (`HOLE_GEN`) はディスクに届いたが cell の書き換えが届かなかった — live の cell が解放済みの
+    /// slot を指したまま。 壊れた slot として返し、 空きに戻す (残すと owned は None、 借用は旧い中身、 領域は漏れる)。
+    #[test]
+    fn rebuild_free_list_treats_freed_slot_under_live_cell_as_broken() {
+        let s = make_store(64 * 1024);
+        let a = s.insert(b"keep-a");
+        let old = s.insert(b"old-value");
+        let d = s.insert(b"keep-d");
+        s.free(old); // cell は old を指したまま (書き換えが届かなかった)
+
+        let live: HashSet<u32> = [a, old, d].into_iter().collect();
+        let broken = s.rebuild_free_list(&live);
+        assert_eq!(broken, [old].into_iter().collect::<HashSet<u32>>());
+        assert_eq!(s.get(a), b"keep-a");
+        assert_eq!(s.get(d), b"keep-d");
+        let e = s.insert(b"reuse");
+        assert!(e < d, "解放済みの slot が空きに戻っていない");
+        assert_eq!(s.get(d), b"keep-d");
     }
 
     #[test]
