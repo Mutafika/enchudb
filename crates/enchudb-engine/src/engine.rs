@@ -1055,6 +1055,40 @@ fn create_db_dir(path: &str) -> io::Result<()> {
     }
 }
 
+/// #419 の試験用 (crashsim feature): 本体の書き出し (`write_out_body`) を段の切れ目で止める hook。 電源断の
+/// 模擬で、 並行の書き手が書く時機を決めて撮るのに使う (`tests/power_loss.rs`)。
+#[cfg(feature = "crashsim")]
+#[doc(hidden)]
+pub mod write_out_hook {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Phase {
+        /// 中身の segment を書き出した後 (門を閉じる前)
+        BeforeGate,
+        /// 門を閉じた直後 (中身をもう一度書き出す前)
+        Closed,
+        /// 門を閉じて中身をもう一度書き出した後 (中身を指す列を書き出す前)
+        GateClosed,
+        /// 中身を指す列を書き出して門を開いた後 (残りを書き出す前)
+        Opened,
+    }
+
+    type Hook = Arc<dyn Fn(Phase) + Send + Sync>;
+    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    pub fn set(hook: Option<Hook>) {
+        *HOOK.lock().unwrap_or_else(|p| p.into_inner()) = hook;
+    }
+
+    pub(crate) fn call(phase: Phase) {
+        let hook = HOOK.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(h) = hook {
+            h(phase);
+        }
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// #323 の test 用: create を segment を作った後 (header を書く前) で失敗させる。
@@ -1988,14 +2022,6 @@ impl Backing {
             Backing::Memory(v) => unsafe {
                 std::slice::from_raw_parts_mut(v.as_ptr() as *mut u8, len.min(v.len()))
             },
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn flush_to_disk(&self) -> io::Result<()> {
-        match self {
-            Backing::Segments(set) => set.flush_all(),
-            Backing::Memory(_) => Ok(()),
         }
     }
 
@@ -3388,6 +3414,9 @@ pub struct Engine {
     live: std::sync::Arc<crate::live::LiveRegistry>,
     /// 行ごとの書き込みの版 (#206 / #135)。 cell を書く経路は全部ここを握る (`crate::row_lock`)。
     row_locks: crate::row_lock::RowLocks,
+    /// #419: 中身 (辞書の語 / Leaf の slot) を指す cell の書き込みを、 書き出しが中身を指す列を msync する間だけ
+    /// 待たせる (`write_out_body`、 `crate::publish_gate`)。
+    publish_gate: crate::publish_gate::PublishGate,
     /// LWW 用に (eid, himo) → 最後の HLC を記録。
     hlc_store: std::sync::Arc<crate::hlc_store::HlcStore>,
     /// request18: `sync_tables_enabled()` の cache。 本体は `has_reserved_table`
@@ -3890,6 +3919,7 @@ impl Engine {
             peer_id: std::sync::atomic::AtomicU32::new(0),
             live: std::sync::Arc::new(crate::live::LiveRegistry::new(0)),
             row_locks: crate::row_lock::RowLocks::new(),
+            publish_gate: crate::publish_gate::PublishGate::new(),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             sync_tables_on: std::sync::atomic::AtomicBool::new(false),
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
@@ -5012,6 +5042,7 @@ impl Engine {
             peer_id: std::sync::atomic::AtomicU32::new(0),
             live: std::sync::Arc::new(crate::live::LiveRegistry::new(0)),
             row_locks: crate::row_lock::RowLocks::new(),
+            publish_gate: crate::publish_gate::PublishGate::new(),
             hlc_store: std::sync::Arc::new(crate::hlc_store::HlcStore::new()),
             sync_tables_on: std::sync::atomic::AtomicBool::new(false),
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
@@ -8949,7 +8980,13 @@ impl Engine {
             self.record_fault(FaultKind::StaleValue, "Tag の値の番号が古い (語が回収された) — write rejected");
             return false;
         }
-        let ok = self.himos[hid].set(local, value);
+        let ok = if self.points_to_content(hid) {
+            // #419: 中身を指す cell は門の中で書く (書き出しが中身を指す列を msync する間は待つ。 中身はこの前に書いてある)
+            let _pass = self.publish_gate.enter(local);
+            self.himos[hid].set(local, value)
+        } else {
+            self.himos[hid].set(local, value)
+        };
         if ok {
             self.live.touch(hid as u16, local);
         }
@@ -8968,6 +9005,13 @@ impl Engine {
     #[inline]
     fn vocab_tracks(&self, hid: usize) -> bool {
         self.vocab.reclaim_enabled() && self.uses_vocab(hid)
+    }
+
+    /// #419: 紐の cell が中身 (辞書の語 / Leaf の slot) を指すか。 そういう cell は中身より先にディスクに届いてはいけない
+    /// (`write_out_body`)。
+    #[inline]
+    fn points_to_content(&self, hid: usize) -> bool {
+        matches!(self.value_types.get(hid), Some(ValueType::Tag | ValueType::Leaf))
     }
 
     /// 紐の値が辞書の番号か (Tag / LeafStore に回していない Leaf)。
@@ -14676,7 +14720,7 @@ impl Engine {
             Backing::Segments(set) => {
                 // #414: 書き出しの前に積んだ旧 Leaf slot は、 書き出しが成功したら空きに戻せる
                 let leaf_token = self.leaf.as_ref().map(|l| l.durable_begin());
-                set.flush_dirty_all()?;
+                self.write_out_body(false)?;
                 if let (Some(leaf), Some(t)) = (self.leaf.as_ref(), leaf_token) {
                     leaf.durable_end(t);
                 }
@@ -14693,6 +14737,49 @@ impl Engine {
 
     #[cfg(target_arch = "wasm32")]
     pub fn body_msync(&self) -> io::Result<()> { Ok(()) }
+
+    /// 本体の segment を書き出す (`all` = commit 済み全域、 でなければ書いた範囲だけ)。
+    ///
+    /// #419: Tag / Leaf の cell は中身 (辞書の語 / Leaf の slot) を指す。 cell が中身より先にディスクに届くと、 電源断の
+    /// 後に cell の指す先に中身が無い (旧い値も新しい値も読めない)。 中身の segment を列より先に書き出すだけでは足りない:
+    /// 並行の書き手は書き出しの間も書くので、 中身の msync の後に書いた中身を指す cell が、 列の msync で先に届く。
+    /// そこで次の順にする:
+    ///
+    /// 1. 中身の segment (Leaf の slot / 辞書)。 その後、 書き出している間に書かれた分をあと 2 回追いかける (門を
+    ///    閉じている間の 3 を短くする)
+    /// 2. 門を閉じる (`PublishGate::close`): 中身を指す cell を書いている書き手が出るのを待ち、 開くまで書かせない
+    /// 3. 中身の segment をもう一度 (書いた範囲だけ)
+    /// 4. 中身を指す列 (Tag / Leaf)、 門を開く
+    /// 5. 残り (header / entity / 中身を指さない列 …)
+    ///
+    /// 4 で届く cell は 2 より前に書かれたもので、 書き手は中身を書いてから門に入るので、 その中身は 3 までに届いている。
+    /// 書き手が待つのは 3 と 4 の間だけ。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write_out_body(&self, all: bool) -> io::Result<()> {
+        let Backing::Segments(set) = &self.backing else { return Ok(()) };
+        let points = |k: SegmentKind| matches!(k, SegmentKind::Himo(h) if self.points_to_content(h as usize));
+        let content = |k: SegmentKind| {
+            matches!(k, SegmentKind::LeafData | SegmentKind::VocabData | SegmentKind::VocabOffsets | SegmentKind::VocabIndex)
+        };
+        set.flush_where(all, content)?;
+        for _ in 0..2 {
+            set.flush_where(false, content)?;
+        }
+        #[cfg(feature = "crashsim")]
+        write_out_hook::call(write_out_hook::Phase::BeforeGate);
+        {
+            let _closed = self.publish_gate.close();
+            #[cfg(feature = "crashsim")]
+            write_out_hook::call(write_out_hook::Phase::Closed);
+            set.flush_where(false, content)?;
+            #[cfg(feature = "crashsim")]
+            write_out_hook::call(write_out_hook::Phase::GateClosed);
+            set.flush_where(all, points)?;
+        }
+        #[cfg(feature = "crashsim")]
+        write_out_hook::call(write_out_hook::Phase::Opened);
+        set.flush_where(all, |k| !content(k) && !points(k))
+    }
 
     /// 強制同期: Commit marker 挿入 → WAL fsync → body msync → checkpoint 前進。
     /// Sync mode 相当の待ち。
@@ -15590,7 +15677,7 @@ impl Engine {
     fn sync_and_mark_clean_with(&self, refs: bool) -> io::Result<()> {
         // #414: 書き出しの前に積んだ旧 Leaf slot は、 書き出しが成功したら空きに戻せる
         let leaf_token = self.leaf.as_ref().map(|l| l.durable_begin());
-        self.backing.flush_to_disk()?;
+        self.write_out_body(true)?;
         if let (Some(leaf), Some(t)) = (self.leaf.as_ref(), leaf_token) {
             leaf.durable_end(t);
         }
@@ -15604,7 +15691,7 @@ impl Engine {
             self.vocab.mark_index_clean(true);
         }
         self.himo_reg.mark_index_clean(true);
-        self.backing.flush_to_disk()?;
+        self.write_out_body(true)?;
         if let Backing::Segments(set) = &self.backing {
             set.write_manifest()?;
         }

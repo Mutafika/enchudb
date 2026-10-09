@@ -19,6 +19,7 @@
 
 #![cfg(all(feature = "crashsim", unix))]
 
+use enchudb_engine::engine::write_out_hook::{self, Phase};
 use enchudb_engine::{Engine, ValueType};
 use enchudb_oplog::crashsim::{self, Mode};
 use std::path::{Path, PathBuf};
@@ -52,6 +53,9 @@ enum Kind {
     Oplog,
     /// standalone で Leaf / Tag の値を書き換え・untie・delete する (#414)。 像は `Lost` だけ (下の `LEAF_*`)
     Leaf,
+    /// `Leaf` と同じ操作を concurrent + oplog の engine に同期の API (`tie_text_to` …) で書く (#419 / #429)。
+    /// consumer の周期の書き出しと、 oplog_sync を回し続ける thread が書き手と並んで走る。 像は `Lost` だけ
+    LeafSync,
 }
 
 impl Kind {
@@ -60,13 +64,14 @@ impl Kind {
             Kind::Flush => "flush",
             Kind::Oplog => "oplog",
             Kind::Leaf => "leaf",
+            Kind::LeafSync => "leaf_sync",
         }
     }
     /// 書き出しが返る batch の数
     fn batches(self) -> u32 {
         match self {
             Kind::Flush | Kind::Oplog => BATCHES,
-            Kind::Leaf => LEAF_BATCHES,
+            Kind::Leaf | Kind::LeafSync => LEAF_BATCHES,
         }
     }
     fn parse(s: &str) -> Self {
@@ -74,6 +79,7 @@ impl Kind {
             "flush" => Kind::Flush,
             "oplog" => Kind::Oplog,
             "leaf" => Kind::Leaf,
+            "leaf_sync" => Kind::LeafSync,
             _ => panic!("unknown kind {s}"),
         }
     }
@@ -136,6 +142,7 @@ fn write_workload(kind: Kind, db: &str, acked: &AtomicU32) {
                 acked.store(b + 1, Ordering::Release);
             }
         }
+        Kind::LeafSync => write_leaf_sync(db, acked),
         Kind::Leaf => {
             let mut eng = Engine::create_with_capacity(db, 65_536).unwrap();
             eng.define_table("t", 40_000).unwrap();
@@ -164,6 +171,47 @@ fn write_workload(kind: Kind, db: &str, acked: &AtomicU32) {
             }
         }
     }
+}
+
+fn write_leaf_sync(db: &str, acked: &AtomicU32) {
+    let mut eng = Engine::create_with_capacity(db, 65_536).unwrap();
+    eng.define_table("t", 40_000).unwrap();
+    for (name, vt) in LEAF_HIMOS {
+        eng.define_himo_in("t", name, vt, 0).unwrap();
+    }
+    eng.flush().unwrap();
+    eng.persist_tables().unwrap();
+    let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+    // 書き手と並んで書き出し続ける thread (oplog_sync を呼ぶ別の thread)。 consumer の周期 (100 ms) だけでは書き手と
+    // 重なる書き出しが少なく、 #419 の形を 3〜10 run に 1 回しか撮れなかった
+    let done = Arc::new(AtomicBool::new(false));
+    let syncer = {
+        let (eng, done) = (eng.clone(), done.clone());
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                eng.oplog_sync().unwrap();
+            }
+        })
+    };
+    let full: Vec<String> = LEAF_HIMOS.iter().map(|(n, _)| format!("t.{n}")).collect();
+    for (b, ops) in leaf_batches().into_iter().enumerate() {
+        for op in ops {
+            match op {
+                Op::New(i) => {
+                    let e = eng.entity_in("t").unwrap();
+                    assert_eq!(e, u64::from(i), "eid が連番でない");
+                }
+                Op::Set(e, h, Val::N(v)) => eng.tie_to(u64::from(e), &full[h], v),
+                Op::Set(e, h, Val::T(t)) => eng.tie_text_to(u64::from(e), &full[h], &t),
+                Op::Untie(e, h) => eng.untie(u64::from(e), &full[h]),
+                Op::Delete(e) => eng.delete(u64::from(e)),
+            }
+        }
+        eng.oplog_sync().unwrap();
+        acked.store(b as u32 + 1, Ordering::Release);
+    }
+    done.store(true, Ordering::Relaxed);
+    syncer.join().unwrap();
 }
 
 // ---- Leaf: standalone で Leaf / Tag の値を書き換える書き手と、 その oracle (#414) ----
@@ -306,13 +354,13 @@ fn verify_leaf(eng: &Engine, acked: u32) -> String {
 fn verify_image(kind: Kind, db: &str, acked: u32) -> String {
     let opened = match kind {
         Kind::Flush | Kind::Leaf => Engine::open_standalone(db).map(Arc::new),
-        Kind::Oplog => Engine::open_concurrent_with_oplog(db, OPLOG_CAP),
+        Kind::Oplog | Kind::LeafSync => Engine::open_concurrent_with_oplog(db, OPLOG_CAP),
     };
     let eng = match opened {
         Ok(e) => e,
         Err(e) => return format!("{OPEN_ERR}{e}"),
     };
-    if kind == Kind::Leaf {
+    if matches!(kind, Kind::Leaf | Kind::LeafSync) {
         return verify_leaf(&eng, acked);
     }
     let must_have = acked * BATCH;
@@ -428,7 +476,11 @@ fn run(kind: Kind) {
         }
         // acked を先に読む: 像の控えはこの時点以降の書き出しを含む (acked は控えた後に進む)
         let a = acked.load(Ordering::Acquire);
-        let mode = if kind == Kind::Leaf || n.is_multiple_of(2) { Mode::Lost } else { Mode::Mixed { seed: n } };
+        let mode = if matches!(kind, Kind::Leaf | Kind::LeafSync) || n.is_multiple_of(2) {
+            Mode::Lost
+        } else {
+            Mode::Mixed { seed: n }
+        };
         let dir = root.join(format!("img{n:03}"));
         match crashsim::capture(&live, &dir, mode) {
             Ok(st) => images.push(Image { dir, acked: a, mode, divergent: st.divergent }),
@@ -522,6 +574,18 @@ fn power_loss_keeps_rewritten_leaf_values() {
     run(Kind::Leaf);
 }
 
+/// 同期の書き手 (`tie_text_to` …) と並んで書き出し (consumer の周期 + oplog_sync を回し続ける thread) が走る。
+/// #429 (再生が untie だけを当てて書き直した Leaf を消す) を 3〜10 run に 1 回撮った。 #419 (cell が中身より先に届く)
+/// はこの形ではまれにしか撮れない (修正前で 10 run 中 0) — 書き出しの順は `write_out_never_persists_a_cell_without_its_content`
+/// が決定的に確かめる。
+#[test]
+fn power_loss_keeps_values_rewritten_by_sync_writers() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    run(Kind::LeafSync);
+}
+
 /// crashsim の控えが、 rename で置き換えた sidecar の inode 番号を引き継いだ列の segment に写らない。
 ///
 /// Linux (ext4 / overlayfs) は空いた inode の番号をすぐ次に作った file に渡す。 置き換えで控えを捨てて
@@ -560,6 +624,117 @@ fn capture_does_not_carry_sidecar_pages_into_reused_inode() {
     drop(eng);
     let _ = std::fs::remove_dir_all(&root);
     assert!(carried.is_empty(), "sidecar の控えが列の segment に写った: {carried:?}");
+}
+
+/// #419: 本体の書き出し (`body_msync`) の途中で並行の書き手が中身と cell を書いても、 cell だけがディスクに届くことは
+/// 無い。 書き出しを段の切れ目で止め (`write_out_hook`)、 その間に書き手に書かせて電源断の像 (`Lost`) を撮る (決定的)。
+///
+/// - 中身の segment を書き出した後 (門を閉じる前) で止めて書かせる: その時点の像と書き出しの後の像の両方で、 cell は
+///   書き出す前の値か、 中身ごと届いた新しい値 (旧: 列を中身のすぐ後に書き出していたので、 中身の後で書いた cell だけが
+///   届いた)
+/// - 門を閉じた後で止めて書かせる: 書き手は門で待つので、 その cell は書き出しに入らない
+#[test]
+fn write_out_never_persists_a_cell_without_its_content() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    for stop_at in [Phase::BeforeGate, Phase::GateClosed] {
+        for himo in ["t.lf", "t.tg"] {
+            write_during_write_out(stop_at, himo);
+        }
+    }
+}
+
+fn write_during_write_out(stop_at: Phase, himo: &'static str) {
+    use std::sync::mpsc;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    const NEW: &str = "a new value, longer than the old one";
+    let root = scratch(&format!("write_out_{stop_at:?}_{}", &himo[2..]));
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let db = live.join("db");
+    crashsim::start();
+    let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 1024).unwrap();
+    eng.define_table("t", 100).unwrap();
+    eng.define_himo_in("t", "lf", ValueType::Leaf, 0).unwrap();
+    eng.define_himo_in("t", "tg", ValueType::Tag, 0).unwrap();
+    let e = eng.entity_in("t").unwrap();
+    eng.tie_text(e, himo, "old");
+    eng.flush().unwrap();
+    eng.persist_tables().unwrap();
+    let eng = Arc::new(eng);
+
+    // stop_at で止めて書き手に書かせる。 門を閉じる前で止める時は、 書かせた後 (まだ門の前) と門を閉じた直後の像も撮る
+    let (paused_tx, paused_rx) = mpsc::channel::<()>();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let (wrote_tx, wrote_rx) = mpsc::channel::<()>();
+    let (paused_tx, go_rx, wrote_rx) = (Mutex::new(paused_tx), Mutex::new(go_rx), Mutex::new(wrote_rx));
+    let (before_gate, closed) = (root.join("before_gate"), root.join("closed"));
+    {
+        let (live, before_gate, closed) = (live.clone(), before_gate.clone(), closed.clone());
+        write_out_hook::set(Some(Arc::new(move |p: Phase| {
+            if p == stop_at {
+                paused_tx.lock().unwrap().send(()).unwrap();
+                go_rx.lock().unwrap().recv_timeout(Duration::from_secs(10)).expect("書き出しを進める合図が来ない");
+                if p == Phase::BeforeGate {
+                    crashsim::capture(&live, &before_gate, Mode::Lost).unwrap();
+                }
+            }
+            if p == Phase::Closed && stop_at == Phase::BeforeGate {
+                crashsim::capture(&live, &closed, Mode::Lost).unwrap();
+            }
+            // 門で待っていた書き手が書き終えてから残りを書き出す (残りに中身を指す列が混ざれば、 その cell が届く)
+            if p == Phase::Opened && stop_at == Phase::GateClosed {
+                wrote_rx.lock().unwrap().recv_timeout(Duration::from_secs(10)).expect("門を開いた後も書き手が書かない");
+            }
+        })));
+    }
+    let syncer = {
+        let eng = eng.clone();
+        std::thread::spawn(move || eng.body_msync().unwrap())
+    };
+    paused_rx.recv_timeout(Duration::from_secs(10)).expect("書き出しが止まらない");
+    let writer = {
+        let eng = eng.clone();
+        std::thread::spawn(move || {
+            eng.tie_text_to(e, himo, NEW);
+            let _ = wrote_tx.send(());
+        })
+    };
+    let mut writer = Some(writer);
+    if stop_at == Phase::BeforeGate {
+        writer.take().unwrap().join().unwrap(); // 門は開いている = すぐ書ける
+    } else {
+        std::thread::sleep(Duration::from_millis(50)); // 門で待つ (門が無ければこの間に書く)
+    }
+    go_tx.send(()).unwrap();
+    syncer.join().unwrap();
+    let after = root.join("after");
+    crashsim::capture(&live, &after, Mode::Lost).unwrap();
+    write_out_hook::set(None);
+    if let Some(w) = writer {
+        w.join().unwrap();
+    }
+    crashsim::stop();
+
+    for img in [before_gate, closed, after] {
+        if !img.exists() {
+            continue;
+        }
+        let got = {
+            let opened = Engine::open_standalone(img.join("db").to_str().unwrap()).unwrap();
+            opened.get_text_owned(e, himo).map(|b| String::from_utf8_lossy(&b).into_owned())
+        };
+        assert!(
+            got.as_deref() == Some("old") || got.as_deref() == Some(NEW),
+            "{stop_at:?} で止めて {himo} を書いた像 {}: cell が中身より先に届いた (got {got:?})",
+            img.file_name().unwrap().to_string_lossy()
+        );
+    }
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// #431: oplog の fsync の後・本体の書き出しの前に電源が落ちても、 新しい語を書いた Tag の cell は開き直した後に

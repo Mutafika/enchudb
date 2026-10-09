@@ -83,6 +83,8 @@ pub mod changefeed;
 pub mod live;
 // 行の書き込み境界 (#206) と同じ cell への並行書き込みの直列化 (#135)。
 pub mod row_lock;
+// #419: 中身を指す cell の書き込みと本体の書き出しの順序 (中身を指す列の msync の間だけ書き手を待たせる)。
+pub(crate) mod publish_gate;
 #[cfg(test)]
 mod tests_issue131;
 // Transport implementations moved to `enchu-transport` crate.
