@@ -561,3 +561,51 @@ fn capture_does_not_carry_sidecar_pages_into_reused_inode() {
     let _ = std::fs::remove_dir_all(&root);
     assert!(carried.is_empty(), "sidecar の控えが列の segment に写った: {carried:?}");
 }
+
+/// #431: oplog の fsync の後・本体の書き出しの前に電源が落ちても、 新しい語を書いた Tag の cell は開き直した後に
+/// その語を読む (再生が自分の Vocab を当てる)。 oplog だけを fsync して像を撮る (consumer の周期の書き出しが先に
+/// 辞書を書き出していたら撮り直す)。 旧実装: `Some("")` (cell は語の番号を指すが、 辞書に語が無い)。
+#[test]
+fn new_tag_word_survives_power_loss_before_write_out() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    for attempt in 0..20 {
+        let root = scratch(&format!("vocab_replay_{attempt}"));
+        let live = root.join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        let db = live.join("db");
+        crashsim::start();
+        let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 1024).unwrap();
+        eng.define_table("t", 100).unwrap();
+        eng.define_himo_in("t", "tg", ValueType::Tag, 0).unwrap();
+        let e = eng.entity_in("t").unwrap();
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+        let word = format!("a-word-only-in-the-oplog-{attempt}");
+        eng.tie_text_to(e, "t.tg", &word);
+        eng.oplog_commit();
+        eng.oplog().unwrap().fsync().unwrap();
+        let img = root.join("img");
+        let st = crashsim::capture(&live, &img, Mode::Lost);
+        crashsim::stop();
+        st.unwrap();
+        drop(eng);
+        let vocab = std::fs::read(img.join("db").join("vocab.data.seg")).unwrap();
+        if vocab.windows(word.len()).any(|w| w == word.as_bytes()) {
+            // consumer の周期の書き出しが先に辞書を書き出した (前提が作れていない)
+            let _ = std::fs::remove_dir_all(&root);
+            continue;
+        }
+        let got = {
+            let opened = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+            opened.get_text_owned(e, "t.tg").map(|b| String::from_utf8_lossy(&b).into_owned())
+        };
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(got.as_deref(), Some(word.as_str()), "oplog にだけ在った語を再生で辞書に戻していない");
+        return;
+    }
+    panic!("前提を作れなかった (20 回とも、 像を撮る前に辞書が書き出された)");
+}

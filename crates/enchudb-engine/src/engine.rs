@@ -13664,8 +13664,9 @@ impl Engine {
             // ここで適用せずに checkpoint で越えると恒久消失する
             // (`OpLog::recover_with_tail` の doc 参照)。
             let records = w.recover_with_tail();
+            let mut vids = std::collections::HashMap::new();
             for rec in &records {
-                eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer);
+                eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut vids);
             }
             // #77-H2: 適用効果を disk に固めてから checkpoint を前進する。
             // 旧順序 (apply → 即 checkpoint) は kernel が checkpoint header を
@@ -13693,11 +13694,14 @@ impl Engine {
     ///   - entity_set の live bitmap が stale → 次 entity_in が eid 重複払出し
     ///   - table.next_local が 0 のまま → 次 alloc が既存 eid と衝突
     /// になる。 消費側の CLI との連携で表面化したので 0.8.1 patch で根治。
+    ///
+    /// `vids` = 再生で辞書に入れ直した語の番号の写像 (record の番号 → 今の番号、 #431)。 1 回の再生の間持ち回る。
     fn apply_oplog_op(
         &mut self,
         op: &enchudb_oplog::oplog::DecodedOp,
         hlc: enchudb_oplog::Hlc,
         author: enchudb_oplog::PeerId,
+        vids: &mut std::collections::HashMap<u32, u32>,
     ) {
         use enchudb_oplog::oplog::DecodedOp;
         // #209: relay (gossip) が verbatim で積んだ foreign-author record は、
@@ -13714,10 +13718,15 @@ impl Engine {
                 let hid = *himo_id as usize;
                 let local = enchudb_oplog::eid_local(*eid);
                 if hid < self.himos.len() {
+                    // #431: 辞書の番号を持つ列は、 再生で入れ直した語の番号に引き直す
+                    let value = match vids.get(&(*value as u32)) {
+                        Some(&v) if self.uses_vocab(hid) => u64::from(v),
+                        _ => *value,
+                    };
                     // request17 step 4: replay も版数付きで書く。 不採用 (= cell に
                     // 既に同じか新しい版数が載っている = body に msync 済み) なら
                     // 値を戻さない — 戻すと新しい write を古い record で潰す。
-                    self.set_cell_local(local, *himo_id, *value, hlc);
+                    self.set_cell_local(local, *himo_id, value, hlc);
                 }
                 // eid 空間の整合 (live bitmap / next_local) は適用可否に依らず進める。
                 self.entities.ensure_live(local);
@@ -13757,7 +13766,12 @@ impl Engine {
                 let local = enchudb_oplog::eid_local(*eid);
                 let ht = ValueType::from_byte(*himo_kind);
                 if let Ok(hid) = self.ensure_himo_by_full_name(himo_name, ht) {
-                    self.set_cell_local(local, hid, *value, hlc);
+                    // #431: 辞書の番号を持つ列は、 再生で入れ直した語の番号に引き直す
+                    let value = match vids.get(&(*value as u32)) {
+                        Some(&v) if self.uses_vocab(hid as usize) => u64::from(v),
+                        _ => *value,
+                    };
+                    self.set_cell_local(local, hid, value, hlc);
                 }
                 self.entities.ensure_live(local);
                 Self::advance_table_next_local_for(&self.tables, local);
@@ -13778,10 +13792,15 @@ impl Engine {
                 // 万一混入しても local state は Tie で既に durable なので no-op。
             }
             DecodedOp::Commit => {}
-            DecodedOp::Vocab { .. } => {
-                // 自プロセスの recover 時は Vocab 個別の apply 不要
-                // (author_peer == self の場合は既に local vocab にある)。
-                // Sync 経由で他 peer から受信する場合のみ apply_one 側で処理。
+            DecodedOp::Vocab { vid, bytes } => {
+                // #431: 自分が書いた Vocab も当てる。 旧: 「辞書にもうある」 として何もしなかったが、 oplog の fsync の後・
+                // 本体の書き出しの前に落ちると、 oplog には Vocab と Tie があるのに辞書には語が無く、 再生した Tie の番号の
+                // 先が空になった (後で別の語がその番号に入るとその語を読む)。 語を辞書に入れ (在れば同じ番号)、 番号が
+                // 変わったら後の Tie を引き直す写像に置く。 他の peer から受信した Vocab は apply_one 側
+                let now = self.vocab.get_or_insert(bytes);
+                if now != *vid {
+                    vids.insert(*vid, now);
+                }
             }
         }
     }
@@ -13962,8 +13981,9 @@ impl Engine {
             // ここで適用せずに checkpoint で越えると恒久消失する
             // (`OpLog::recover_with_tail` の doc 参照)。
             let records = w.recover_with_tail();
+            let mut vids = std::collections::HashMap::new();
             for rec in &records {
-                eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer);
+                eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut vids);
             }
             // #77-H2: body msync → checkpoint の順 (open_concurrent_with_oplog と同じ)
             // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
@@ -17183,6 +17203,30 @@ mod tests {
         for suffix in ["", ".oplog", ".tables", ".crc", ".lock"] {
             let _ = std::fs::remove_file(format!("{path}{suffix}"));
         }
+    }
+
+    /// #431: 再生は自分の Vocab を辞書に入れ直し、 番号が変わったら後の Tie (Tag の列) をその番号に引き直す。
+    /// record の番号 (辞書に無い 1000) の Vocab と、 それを指す Tie を当てて読む。
+    #[test]
+    fn issue431_replay_remaps_vids_of_own_vocab_records() {
+        use enchudb_oplog::oplog::DecodedOp;
+        let dir = tmp("issue431_replay_vocab");
+        let mut eng = Engine::create_growable(&dir).unwrap();
+        eng.define_himo("tg", ValueType::Tag, 0);
+        let hid = eng.himo_id("tg").unwrap() as u16;
+        let e = eng.entity().unwrap();
+        let hlc = eng.mint_local_hlc();
+        let mut vids = std::collections::HashMap::new();
+        eng.apply_oplog_op(&DecodedOp::Vocab { vid: 1000, bytes: b"replayed".to_vec() }, hlc, 0, &mut vids);
+        eng.apply_oplog_op(&DecodedOp::Tie { eid: e, himo_id: hid, value: 1000 }, hlc, 0, &mut vids);
+        assert_eq!(eng.get_text_owned(e, "tg").as_deref(), Some(&b"replayed"[..]), "Tie を入れ直した語の番号に引き直していない");
+        // 辞書に在る語は同じ番号 (写像に置かない)
+        let known = eng.vocab.get_or_insert(b"known");
+        let mut vids = std::collections::HashMap::new();
+        eng.apply_oplog_op(&DecodedOp::Vocab { vid: known, bytes: b"known".to_vec() }, hlc, 0, &mut vids);
+        assert!(vids.is_empty(), "辞書に在る語まで写像に置いた: {vids:?}");
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #343: consumer が当てる delete (`apply_op` の `Op::Delete`) も **列を消してから** Leaf の slot を返す。
