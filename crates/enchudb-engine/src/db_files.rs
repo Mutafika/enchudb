@@ -197,8 +197,14 @@ pub fn write_atomic_if_changed(sidecar: &Path, bytes: &[u8]) -> io::Result<bool>
             .open(&tmp_path)?;
         f.write_all(bytes)?;
         f.sync_all()?;
+        #[cfg(all(feature = "crashsim", unix))]
+        enchudb_oplog::crashsim::file_synced(&tmp_path);
     }
     inherit_mode(sidecar, &tmp_path);
+    // 電源断の模擬: 置き換えで手放す旧 sidecar の控えを捨てる (inode の番号は次に作った file に渡る)
+    #[cfg(all(feature = "crashsim", unix))]
+    enchudb_oplog::crashsim::releasing(sidecar, || std::fs::rename(&tmp_path, sidecar))?;
+    #[cfg(not(all(feature = "crashsim", unix)))]
     std::fs::rename(&tmp_path, sidecar)?;
     Ok(true)
 }

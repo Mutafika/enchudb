@@ -107,6 +107,16 @@ jobs:
       - name: loom model check (lazy cylinder build)
         run: cargo test -p enchudb-engine --test loom_lazy_cylinder_build --release
 
+      # #421: 書いた範囲 (dirty) の取り出しと同時の印 / 同時の flush。 lo / hi を別々に swap すると印が
+      # 消え、 lock なしだと後の flush が前の flush の書き出しより先に返る (oplog_sync の後で checkpoint が先に進む)。
+      - name: loom model check (flush_dirty の取り出し)
+        run: cargo test -p enchudb-engine --test loom_flush_dirty --release
+
+      # #413: 電源断 (page cache ごと失う) の模擬。 SIGKILL のテストは page cache が残るので
+      # msync の漏れを通してしまう。 crashsim の hook は feature の裏なので、 ここでだけ build する。
+      - name: power loss simulation (crashsim)
+        run: cargo test -p enchudb-engine --features crashsim --test power_loss --release
+
   windows-check:
     name: check (windows cross)
     runs-on: ubuntu-latest
