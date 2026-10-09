@@ -3,6 +3,63 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.31.1 — 2026-10-09
+
+patch。 on-disk 形式は 0.31.0 と同じ。 Engine / schema の API は変わらない (低レベルの `HimoStore::load` / `load_lazy` は列の形の
+引数が 2 つ増え、 `LeafStore::rebuild_free_list` は壊れた slot の offset を返す)。 電源断 (page cache ごと失う) の後の
+durability の修正をまとめた版。 下の電源断の模擬 (crashsim) が見つけた。
+
+### Fixed — 書き出しが 2 本同時に走ると、 書き出していない page のまま oplog の checkpoint が進んだ (#421、 #422)
+
+`SegmentMap::flush_dirty` (consumer の周期 sync と `oplog_sync` が本体を書き出す所) が `Ok` を返した時に、 呼ぶ前に印を付けた
+page がまだディスクに届いていないことがあった。 呼び側はその前提で checkpoint を進めるので、 その後に電源が落ちると
+`oplog_sync()` が返った値が消えた (checkpoint より前の record は replay されない)。
+
+- consumer の周期 sync と `oplog_sync` (書き手の thread) が同じ segment を同時に書き出すと、 後の方は前の方が範囲を取り出した
+  後の 「空」 を見てすぐ返った → flush を segment ごとに 1 本ずつにした
+- 書いた範囲を lo / hi の 2 つの atomic に置き、 別々に swap / 読みしていたので、 同時の印の片方だけを取り出して残りが空に
+  化けた / どちらの範囲にも入らない page を入っていると見て飛ばしえた → page 番号の範囲を 1 語 (`AtomicU64`) に詰め、 印は
+  CAS、 取り出しは 1 回の swap
+- 書き出しに失敗した範囲を捨てていたので、 #317 の 「失敗したら checkpoint を進めない」 が次の周期で破れていた → 印に戻す
+
+電源断の模擬 (Linux、 page 4 KiB) で 16 run 中 2 回 → 40 run 連続 0 回。 書き込みの度に通る `mark_dirty` は旧版と同等
+(単体 0.655 / 0.654 ns、 単一 thread の順次 tie は中央値 -1.4%)。 取り出しの契約は loom の model (`tests/loom_flush_dirty.rs`)
+でも見る (CI の loom job)。
+
+### Fixed — 列の件数 (count) が書き出しの印に入っていなかった (#413、 #416)
+
+`Column::ensure_count` が header の count を書くのに印 (`mark_dirty`) を付けていなかった。 concurrent の書き出しは印の付いた
+範囲だけ msync するので、 count の page が書き出されないまま checkpoint が進み、 電源断の後に count が古い値 (多くは 0) に
+戻って、 `oplog_sync()` が返った値が `get` で `None` になった。 同じ印の漏れを、 実行中に足した列の header (`Column::init`)、
+Leaf の slot を分割した余りの header、 解放した slot の印でも直した (#420)。
+
+### Fixed — 電源断の後に開くと panic した (#414 の一部、 #420)
+
+- Leaf の空き一覧の作り直しが、 生きていない slot の header の size を信じて領域を歩いていた。 届かなかった header (ゼロ) で
+  assert が落ち、 分割前の旧い大きな size が残っていると生きている slot を飛び越して空きにした (次の insert が値を上書き)。
+  空き = 生きている slot の隙間 にした。 確かめられない slot (size が読めない / 次の slot を越える / 解放済みの印) を指す
+  cell は外して警告を出す (値は届いていない)
+- 作った直後に落ちて header が一度も届いていない列 (value_size 0) を開くと、 読みの assert で落ちた。 書かれていない列として
+  開く
+- 空き一覧の作り直しを table の定義 (sidecar) を読んだ後へ移した (前は engine 内部の table の Leaf 列 = 辞書の番号を
+  Leaf の offset と見ていた)
+
+書き出しが返った Leaf の値が電源断で消える件 (#414 の本体) はまだ直っていない。
+
+### Fixed — readonly の Engine が、 書き手の伸ばした Leaf 領域の値を空で返した (#417、 #418)
+
+`open_readonly` の写像は開いた時の file 長までで、 その先はゼロの page。 `LeafStore::try_read` はゼロの header を 「空の旧形式の
+slot」 として `Ok(空)` を返していた (`None` でないので呼び側は区別できない)。 写像に無い所と、 旧形式で最小の 8 B に満たない
+header は読み直しにし、 readonly は Leaf の segment を `refresh` して取り込んでから読む。
+
+### Tests — 電源断の模擬 (feature `crashsim`、 テスト専用) (#413、 #416)
+
+SIGKILL のテストは page cache が残るので msync の漏れを通してしまう。 `enchudb_oplog::crashsim` が書き出し (segment の msync /
+oplog の fsync / sidecar の `sync_all`) の済んだ page を控え、 書き手の横で 「今電源が落ちた」 像を撮って子 process で開く
+(`tests/power_loss.rs`、 CI の loom job で走る)。 feature を引かない build には何も入らない。 控えは (device, inode) ごとで、
+Linux は空いた inode の番号をすぐ次の file に渡すので、 控えのある file を手放す所 (sidecar の rename での置き換え) は
+`crashsim::releasing` を通す (通さないと、 古い sidecar の控えが後から作った列の page に写る)。
+
 ## 0.31.0 — 2026-10-07
 
 minor。 **on-disk 形式が増えた** (file version 14)。 API は増えただけ (`Engine::sync_ops_payload`)。
