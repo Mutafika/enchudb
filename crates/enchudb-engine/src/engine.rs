@@ -2026,14 +2026,6 @@ impl Backing {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn flush_to_disk(&self) -> io::Result<()> {
-        match self {
-            Backing::Segments(set) => set.flush_all(),
-            Backing::Memory(_) => Ok(()),
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
     fn flush_header(&self, len: usize) -> io::Result<()> {
         self.flush_kind(SegmentKind::Header, 0, len)
     }
