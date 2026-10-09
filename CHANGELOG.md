@@ -3,6 +3,107 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.31.2 — 2026-10-09
+
+patch。 on-disk 形式・wire 形式は 0.31.1 と同じ。 Engine / schema の API は変わらない (低レベルの `LeafStore` / `SegmentSet` /
+`db_files` / `OpLog` / `filelock` に関数・定数が増えた。 消えたものは無い)。 電源断 / process の死の後の durability の続き
+(0.31.1 で残った #414 / #419 / #415 と、 その途中で見つけた再生の誤り)、 並行の読み手の誤読、 Leaf の書き換えの速さの修正。
+
+**上げる時の注意**:
+
+- Leaf の書き換え / untie / delete で cell が指さなくなった slot は、 次の本体の書き出し (consumer の周期 / `oplog_sync` /
+  flush) が終わるまで使い回さない。 Leaf 領域がその間隔ぶん大きくなる (書き換えの多いベンチで high water 8.3 → 11.8 MiB)。
+  書き出しの無い使い方 (standalone / oplog の無い concurrent) は、 待つ slot が 「4 MiB と Leaf 領域の 1/4 の大きい方」 を
+  越えると書き手が自分で `body_msync` する。 Leaf 領域の footprint を見るテストは flush を挟むこと
+- 本体の書き出しの間、 Tag / Leaf の cell の書き手は、 中身を指す列を msync する間だけ待つ。 書き出しが consumer の
+  100 ms ごとなら差は無い。 何本もの thread から `oplog_sync` を連発すると遅くなる (書き手 4 本が 10 回書くごとに
+  `oplog_sync`: +16 %、 別の thread が `oplog_sync` を回し続ける: +33 %)
+- create は最後に全 segment を msync する (数 ms)。 作る途中で落ちた directory (作成中の印 `creating` が残る) は、 開くと
+  `incomplete` で断り、 次の create がその場で作り直す。 空の directory への create は、 その directory に作る (0.31.1 は
+  `AlreadyExists`)
+
+### Fixed — 書き出しが返った Leaf の値が、 後の書き換えに巻き込まれて電源断で消えた (#414、 #428)
+
+Leaf の書き換え / untie / delete で cell が指さなくなった slot を、 cell を付け替えた直後に空きに戻していた。 同じ batch の
+別の値がその slot を使い回し、 その中身が cell の付け替えより先にディスクに届くと、 電源断の後に書き出しの返った値が別の
+行の値 / 空になった (flush も consumer の書き出しも Leaf 領域を列より先に msync するし、 OS の書き出しも順を選べない)。
+その後に始まった本体の書き出しが成功してから空きに戻す (`LeafStore::retire` → `durable_begin` / `durable_end`)。
+
+- まとめて空きに戻す時は offset の順に並べ、 隣り合う slot を 1 つの空きにまとめる (1 つずつ戻すと 1.6 倍かかった)
+- Memory backing (`from_bytes`) と、 一度も cell に載せていない slot (断った書き込み) は今まで通りすぐ空きに戻す
+- 待っている slot は永続化しない。 開く時の空きは生きている slot の隙間から作る (#420) ので、 次の open で空きになる
+
+電源断の模擬 (standalone で Leaf / Tag の書き換え・untie・delete を混ぜる) で、 旧 103 枚中 30 枚の失敗 → 10 run 失敗 0。
+
+### Fixed — 書き出しが Tag / Leaf の cell を中身より先にディスクへ届かせた (#419、 #433)
+
+Tag / Leaf の cell は中身 (辞書の語 / Leaf の slot) を指す。 本体の書き出しは中身の segment を列より先に msync していたが、
+並行の書き手は書き出しの間も書くので、 中身の msync の後に書いた cell が列の msync で届くと、 電源断の後に cell の指す先に
+中身が無かった (書き出しの返った旧い値も消える)。 本体の書き出し (`body_msync` / flush / close) を 「中身 → 門を閉じる
+(`PublishGate`、 中身を指す cell の書き手を待たせる) → 中身をもう一度 → 中身を指す列 → 門を開く → 残り」 の順にした。
+
+OS が書き出し (msync) より前に cell の page だけを先に書いた場合は防いでいない。 防ぐには同期の書き込みごとに中身の msync
+が要る (1 回 20 µs、 同期の Tag / Leaf の書き込みが 50 倍遅くなる)。 書き出しは 100 ms ごとなので、 その間に OS が cell の
+page だけを書くのは主にメモリの逼迫時。
+
+書き出しを段の切れ目で止める試験 (`write_out_never_persists_a_cell_without_its_content`、 crashsim の hook
+`engine::write_out_hook`) が、 修正を外す変異 5 種を全部検出する。
+
+### Fixed — 落ちた後の oplog の再生が、 untie の後に書き直した Leaf の値を消した (#429、 #430)
+
+開く時の oplog の再生は、 自分が書いた TieLeaf を 「本体にある」 として当てず、 同じ cell の Untie / Delete は当て直して
+いた。 [Untie, TieLeaf] の順に並ぶと Untie だけが当たり、 cell が空になった。 cell の版数の無い DB (sync しない DB の既定)
+で、 **電源断でなく process の死 (abort / SIGKILL) でも**、 周期の書き出し (100 ms) より前の書き直しに起きた (旧: 10 回中
+10 回)。 自分の TieLeaf も当て直す (受信の `remote_tieleaf_apply` と同じ処理)。
+
+### Fixed — 電源断の後の oplog の再生が、 新しい語を書いた Tag の値を空 (別の語) にした (#431、 #432)
+
+開く時の再生は、 自分が書いた Vocab を 「辞書にある」 として当てず、 Tie は当て直していた。 書き出しは oplog の fsync →
+本体の msync の順なので、 その間に電源が落ちると oplog には Vocab と Tie があるのに本体の辞書に語が無く、 再生した Tie の
+番号の先が空 (後で別の語が入るとその語) になった。 自分の Vocab も当て (在れば同じ番号)、 番号が変わったら後の Tie を
+その番号に引き直す。
+
+### Fixed — 作った直後に電源が落ちると、 開けず作り直しもできなかった (#415、 #434、 #437、 #438)
+
+create は header だけを書き出して返し、 辞書 / entity / Leaf 領域の header は最初の flush まで書き出さなかった。 その間に
+電源が落ちると 「壊れている」 で開けず、 directory はあるので create し直しも断られた。 oplog も、 consumer の最初の fsync
+(100 ms) より前に落ちると `bad WAL magic` で開けなかった。
+
+- create は mkdir の直後に writer lock を取り (待ち続けない。 約 20 ms 取り直して取れなければ、 別の create が作っている →
+  `AlreadyExists`)、 作成中の印 (`creating`) を置き、 作った中身を全部書き出してから印を消す。 印の残った directory は、 開くと `incomplete` で断り
+  (`probe` は `Incomplete`)、 次の create がその場で作り直す。 mkdir の直後に落ちた空の directory も同じ
+- 作り直すのは、 中身が全部 create の置く名前 (segment / sidecar / `lock` / `creating`) の directory だけ
+- oplog は作った時に header を書き出す。 一度も書き出されていない oplog は開く側が作り直す (`OpLog::was_never_written`)
+
+#434 の最初の形は lock を取る前に印を置いていたので、 同じ path への同時の create が作成中の directory を残骸と見て消し、
+勝った側が作り終えた DB を負けた側が後から消した (#437、 リリース前に #438 で直した)。
+
+### Fixed — sync で届いた Leaf の値が新しい書き込みに負けた時、 cell の slot を空きに戻した (#435、 #436)
+
+`remote_tieleaf_apply` は、 行の lock の中で版数に負けて書かなかった (`set_cell_local` が false) のに、 cell の旧い slot (=
+勝った書き込みの slot) を空きに戻して `Applied` を返していた。 その slot が使い回されると、 cell が別の値を読んだ。 cell の
+版数のある DB (sync する DB) だけで起きる。 負けたら insert した slot だけを空きに戻して `Stale` を返す。
+
+### Fixed — untie / delete が cell を 1 byte ずつ消し、 並行の読み手が書いていない値を読んだ (#424、 #425)
+
+`Column::clear` (untie / delete) が memset で cell を消していた。 macOS の memset は 4 B を 1 byte ずつ書くので、 lock 無しで
+同じ cell を読む読み手が 「一部だけ 0」 = 書いていない値 (別の entity / 別の語 / slot の境目からずれた Leaf の offset) を
+読んだ (読みのおよそ 5 %)。 4 B / 8 B の cell は 1 回の atomic store で消す。 版数の列 (16 B) は memset のまま。
+
+### Performance — Leaf の空き探しが空きの数に比例して遅かった (#426、 #427)
+
+Leaf 領域の空きを大きさの順 (`BTreeSet<(size, offset)>`) でも持ち、 best-fit を 1 回の範囲引きにした (旧: insert のたびに
+空きを全部走査)。 選ぶ空きは旧と同じ。 長さの違う値で書き換えると、 分割の余りが小さな空きとして溜まり、 空きの数が行の
+数の桁になっていた。 Leaf 10 万行を 40 B / 80 B で交互に 100 万回書き換え: standalone 58.6 s → 0.47 s (124x)、 concurrent +
+oplog 50.4 s → 1.4 s (35x)、 書き手 8 本 × 15 万回 15.6 s → 1.7 s (9x)。
+
+### Tests
+
+- 電源断の模擬 (`tests/power_loss.rs`、 feature `crashsim`): concurrent の engine に同期の API で書き、 周期の書き出しと
+  `oplog_sync` を回し続ける形 (#419 / #429 / #431 はここで見つかった)、 書き出しの段の切れ目で止める決定的な試験、 新しい語の
+  Tag。 最初の書き出しが返る前の像は、 開けるか、 「作成中 / 無い」 と言って同じ path に作り直せることを確かめる
+- 同じ path への同時の create (thread / 別 process) で、 勝つのが 1 本だけで、 勝者の DB が残ること (#437)
+
 ## 0.31.1 — 2026-10-09
 
 patch。 on-disk 形式は 0.31.0 と同じ。 Engine / schema の API は変わらない (低レベルの `HimoStore::load` / `load_lazy` は列の形の
