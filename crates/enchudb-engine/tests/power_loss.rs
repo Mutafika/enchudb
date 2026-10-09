@@ -33,6 +33,8 @@ const KIND_ENV: &str = "ENCHU_POWER_LOSS_KIND";
 const KEEP_ENV: &str = "ENCHU_POWER_LOSS_KEEP";
 /// 子の失敗理由のうち 「開けなかった」 の印
 const OPEN_ERR: &str = "開けない: ";
+/// 子が 「作り終える前の像 (開けないが、 作り直せる)」 を見た印 (stderr、 #415)
+const UNBORN: &str = "POWER_LOSS_UNBORN";
 
 const BATCH: u32 = 200;
 const BATCHES: u32 = 40;
@@ -358,6 +360,17 @@ fn verify_image(kind: Kind, db: &str, acked: u32) -> String {
     };
     let eng = match opened {
         Ok(e) => e,
+        // #415: 最初の書き出しが返る前の像は、 作り終えていなければ開けなくてよい。 ただし 「作成中」 (directory が
+        // 無い) と言うこと、 そして同じ path に作り直せること (旧: 「壊れている」 で開けず、 作り直しも既存として断った)
+        Err(e) if acked == 0 && (e.kind() == std::io::ErrorKind::NotFound || e.to_string().contains("incomplete")) => {
+            return match Engine::create_with_capacity(db, 65_536) {
+                Ok(_) => {
+                    eprintln!("{UNBORN}");
+                    String::new()
+                }
+                Err(c) => format!("作り終える前の像を作り直せない: 開く {e} / 作る {c}"),
+            };
+        }
         Err(e) => return format!("{OPEN_ERR}{e}"),
     };
     if matches!(kind, Kind::Leaf | Kind::LeafSync) {
@@ -397,7 +410,8 @@ fn power_loss_verify_child() {
     }
 }
 
-fn verify_in_child(kind: Kind, db: &Path, acked: u32) -> String {
+/// 子で像を確かめる。 (失敗の理由 (空 = 合格), 作り終える前の像だったか)
+fn verify_in_child(kind: Kind, db: &Path, acked: u32) -> (String, bool) {
     let out = Command::new(std::env::current_exe().unwrap())
         .args(["power_loss_verify_child", "--exact", "--test-threads=1", "--nocapture"])
         .env(VERIFY_ENV, db)
@@ -407,17 +421,19 @@ fn verify_in_child(kind: Kind, db: &Path, acked: u32) -> String {
         .stderr(Stdio::piped())
         .output()
         .expect("spawn child");
-    if out.status.success() {
-        return String::new();
-    }
     let stderr = String::from_utf8_lossy(&out.stderr);
-    match stderr.lines().find_map(|l| l.strip_prefix("POWER_LOSS_FAIL: ")) {
+    let unborn = stderr.lines().any(|l| l == UNBORN);
+    if out.status.success() {
+        return (String::new(), unborn);
+    }
+    let err = match stderr.lines().find_map(|l| l.strip_prefix("POWER_LOSS_FAIL: ")) {
         Some(msg) => msg.to_string(),
         None => {
             let tail: Vec<&str> = stderr.lines().rev().take(6).collect();
             format!("子が落ちた ({:?}): {}", out.status, tail.into_iter().rev().collect::<Vec<_>>().join(" | "))
         }
-    }
+    };
+    (err, unborn)
 }
 
 /// crashsim の控えは process 全体で 1 つ。 同じ binary の test を並べて走らせない
@@ -498,7 +514,7 @@ fn run(kind: Kind) {
 
     // oracle を確かめる: 電源断の無い live の DB (書き手は drop 済み) は、 全 batch acked で合格すること。
     // ここで落ちるなら検証器か oracle の方が間違っている
-    let sane = verify_in_child(kind, &live.join("db"), kind.batches());
+    let (sane, _) = verify_in_child(kind, &live.join("db"), kind.batches());
     if !sane.is_empty() {
         crashsim::stop();
         let _ = std::fs::remove_dir_all(&root);
@@ -512,13 +528,10 @@ fn run(kind: Kind) {
         if img.acked > 0 && img.acked < kind.batches() {
             mid += 1;
         }
-        let err = verify_in_child(kind, &img.dir.join("db"), img.acked);
-        // 最初の書き出しが返る前の像は、 開けなくても (clean な Err なら) 約束は破っていない — 数えるだけ。
-        // create の途中 / 直後に落ちた DB は 「壊れた」 で開けず、 create し直しも既存として断られる (既知、 未修正)
-        if img.acked == 0 && err.starts_with(OPEN_ERR) {
+        let (err, was_unborn) = verify_in_child(kind, &img.dir.join("db"), img.acked);
+        // 作り終える前の像 (開けないが 「作成中」 と言い、 作り直せた) は数えるだけ
+        if was_unborn {
             unborn += 1;
-            let _ = std::fs::remove_dir_all(&img.dir);
-            continue;
         }
         if err.is_empty() {
             let _ = std::fs::remove_dir_all(&img.dir);
@@ -536,7 +549,7 @@ fn run(kind: Kind) {
         }
     }
     eprintln!(
-        "[{}] 像 {} 枚 (書き込みの途中 {mid}、 最初の書き出し前で開けない {unborn}) 書き出し {} 回 → 失敗 {}",
+        "[{}] 像 {} 枚 (書き込みの途中 {mid}、 作り終える前 {unborn}) 書き出し {} 回 → 失敗 {}",
         kind.name(),
         images.len(),
         crashsim::events(),
