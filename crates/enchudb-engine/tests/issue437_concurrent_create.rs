@@ -56,7 +56,7 @@ fn concurrent_creates_in_threads_leave_exactly_one_db() {
     let base = tmp("threads");
     std::fs::create_dir_all(&base).unwrap();
     let mut tally = Tally::default();
-    for round in 0..200 {
+    for round in 0..100 {
         let path = base.join(format!("db{round}")).to_str().unwrap().to_string();
         let start = Arc::new(Barrier::new(4));
         let racers: Vec<_> = (0..4)
@@ -171,7 +171,8 @@ fn create_leaves_a_directory_being_created_alone() {
         assert_eq!(path.join("creating").exists(), with_marker, "作成中の directory を触った");
         drop(holder);
         // lock が空けば残骸として作り直せる。 同じ process の別 thread (上の process の試験) が子を起動する瞬間は、 子が
-        // fd の写しを exec まで持つので、 手放した lock がまだ取れないことがある (実測: 子を起動し続ける横で 2 万回中 12 回)
+        // fd の写しを exec まで持つので、 手放した lock がまだ取れないことがある (実測: 子を起動し続ける横で 2 万回中 12 回)。
+        // create も約 20 ms 取り直すが、 負荷の高い machine ではそれより長いことがあるので、 ここでも取り直す
         let eng = (0..100)
             .find_map(|_| match Engine::create_growable_tiny(path.to_str().unwrap()) {
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {

@@ -974,9 +974,18 @@ fn acquire_writer_lock(path: &str) -> io::Result<WriterLock> {
     Ok(lock_writer(path, true)?.expect("待つ lock は取れるまで返らない"))
 }
 
-/// #437: create 用の writer lock。 待たない — 別の handle (別 process / 同じ process の Engine) が持っていれば `Ok(None)`。
+/// #437: create 用の writer lock。 別の handle (別 process / 同じ process の Engine) が持っていれば、 少しの間 (約 20 ms)
+/// 取り直して、 それでも取れなければ `Ok(None)`。 同時の open (header が無いのですぐ離す) や、 別の thread が起動した子
+/// process が exec までに持つ fd の写しはすぐ離すので待つ。 作り始めた create / 開いている Engine は離さないので、 待ち
+/// 切らずに諦める (0.31.1 までの create は lock を待ち続けた)。
 #[cfg(not(target_arch = "wasm32"))]
 fn try_acquire_writer_lock(path: &str) -> io::Result<Option<WriterLock>> {
+    for _ in 0..20 {
+        if let Some(lock) = lock_writer(path, false)? {
+            return Ok(Some(lock));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     lock_writer(path, false)
 }
 
@@ -20224,6 +20233,31 @@ mod v10_dir_tests {
             let eng = Engine::open_standalone(&path).expect("割り込んだ create の DB が消えた");
             assert_eq!(eng.get(e, "n"), Some(7), "割り込んだ create の値が消えた");
         }
+    }
+
+    /// #437: create が lock を取ろうとした時に、 別の handle (同時の open: header が無いのですぐ離す) が lock を一瞬持って
+    /// いる。 create は少し取り直して作る (すぐ諦めると、 open も create も失敗して DB ができない)。
+    #[test]
+    fn issue437_create_waits_out_a_brief_lock_holder() {
+        let path = tmp("437_brief_holder");
+        BEFORE_CREATE_LOCK.with(|h| {
+            let path = path.clone();
+            *h.borrow_mut() = Some(Box::new(move || {
+                let holder = std::fs::OpenOptions::new().create(true).write(true).truncate(false)
+                    .open(format!("{path}/{}", db_files::LOCK)).unwrap();
+                holder.lock().unwrap();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    drop(holder);
+                });
+            }));
+        });
+        let r = Engine::create_growable_with_capacity(&path, 65_536);
+        BEFORE_CREATE_LOCK.with(|h| *h.borrow_mut() = None);
+        let mut eng = r.expect("lock を一瞬持った相手に負けた");
+        eng.define_himo("n", ValueType::Number, 0);
+        drop(eng);
+        assert_eq!(Engine::probe(&path), DbState::Ready);
     }
 
     /// #437: lock file を開いてから lock を取るまでの間に、 失敗した create が (lock を持ったまま) directory ごと消し、
