@@ -50,7 +50,7 @@
 //! walk できる。 これにより reopen 時に「live cell 集合」を渡すだけで free-list を
 //! rebuild できる (free-list 自体は永続化しない = store の派生)。
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use crate::region::Region;
@@ -95,11 +95,11 @@ pub fn cap_bytes_for_shift(off_shift: u32) -> u64 {
 /// Leaf payload の store。 単一所有・reclaim 対応。 offset は word 単位 (#90)。
 pub struct LeafStore {
     region: Region,
-    /// free hole: **word** offset -> **word** slot_size。 offset 昇順 (coalesce 必須)。
+    /// free hole (word 単位、 [`Holes`])。
     /// **永続化しない** — reopen 時は `rebuild_free_list` で live cell から再構成。
     /// insert/free/rebuild を直列化する (writer は `.db.lock` で 1 プロセスだが
     /// in-process では複数スレッドが consumer 経由で触りうる)。
-    holes: Mutex<BTreeMap<u32, u32>>,
+    holes: Mutex<Holes>,
     /// byte_off = word_off << off_shift。 0 = byte offset (v6 互換)。
     off_shift: u32,
     /// #106: slot gen seqlock 用の store-wide 単調カウンタ。 insert ごとに +2 した
@@ -113,6 +113,56 @@ pub struct LeafStore {
     /// release build では空の型で、 読む所も消えるので dead_code の警告を止める。
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     borrow_watch: BorrowWatch,
+}
+
+/// free hole の一覧 (word 単位)。 offset の順 (隣の空きとの結合) と、 大きさの順 (best-fit) の 2 つで持つ。
+///
+/// #426: 旧は offset の順だけで、 best-fit が毎回全部を走査していた。 長さの違う値で書き換えると分割の余りが小さな
+/// 空きとして残り続けるので、 空きの数が行の数の桁まで増え、 1 回の insert がそれに比例して遅くなった。
+#[derive(Default)]
+struct Holes {
+    /// offset → size
+    by_off: BTreeMap<u32, u32>,
+    /// (size, offset)。 `by_off` と同じ空きを持つ
+    by_size: BTreeSet<(u32, u32)>,
+}
+
+impl Holes {
+    fn insert(&mut self, off: u32, size: u32) {
+        if let Some(old) = self.by_off.insert(off, size) {
+            self.by_size.remove(&(old, off));
+        }
+        self.by_size.insert((size, off));
+    }
+
+    fn remove(&mut self, off: u32) -> Option<u32> {
+        let size = self.by_off.remove(&off)?;
+        self.by_size.remove(&(size, off));
+        Some(size)
+    }
+
+    fn get(&self, off: u32) -> Option<u32> {
+        self.by_off.get(&off).copied()
+    }
+
+    /// `off` より前で最後の空き (offset, size)。
+    fn before(&self, off: u32) -> Option<(u32, u32)> {
+        self.by_off.range(..off).next_back().map(|(&o, &sz)| (o, sz))
+    }
+
+    /// best-fit: `need` 以上で最小の空き (offset, size)。 同じ大きさなら offset の小さい方。
+    fn best_fit(&self, need: u32) -> Option<(u32, u32)> {
+        self.by_size.range((need, 0)..).next().map(|&(sz, off)| (off, sz))
+    }
+
+    fn clear(&mut self) {
+        self.by_off.clear();
+        self.by_size.clear();
+    }
+
+    fn sizes(&self) -> impl Iterator<Item = u32> + '_ {
+        self.by_off.values().copied()
+    }
 }
 
 /// #107: 借用の読み (`get`) と、 別の thread の書き込みが重なりうるかの記録。 **debug build だけ**中身を
@@ -192,7 +242,7 @@ impl LeafStore {
         assert!(off_shift <= MAX_OFF_SHIFT, "off_shift {} > {}", off_shift, MAX_OFF_SHIFT);
         let s = Self {
             region,
-            holes: Mutex::new(BTreeMap::new()),
+            holes: Mutex::new(Holes::default()),
             off_shift,
             gen_seq: std::sync::atomic::AtomicU32::new(0),
             borrow_watch: BorrowWatch::default(),
@@ -233,7 +283,7 @@ impl LeafStore {
         }
         Ok(Self {
             region,
-            holes: Mutex::new(BTreeMap::new()),
+            holes: Mutex::new(Holes::default()),
             off_shift,
             gen_seq: std::sync::atomic::AtomicU32::new(0),
             borrow_watch: BorrowWatch::default(),
@@ -560,18 +610,14 @@ impl LeafStore {
     }
 
     /// `need_words` を確保。 返り値 = (word offset, 実 slot_words)。 best-fit は
-    /// O(hole 数) の線形走査 (Phase 1)。 hole が定常で少なければ十分。
+    /// 大きさの順の索引を 1 回引く (O(log hole 数)、 #426)。
     /// high_water の先を伸ばせなければ (空き不足) `None` で、 high_water は進めない。
-    fn alloc_locked(&self, holes: &mut BTreeMap<u32, u32>, need_words: u32) -> Option<(u32, u32)> {
+    fn alloc_locked(&self, holes: &mut Holes, need_words: u32) -> Option<(u32, u32)> {
         // best-fit: need 以上で最小の hole
-        let best = holes
-            .iter()
-            .filter(|(_, sz)| **sz >= need_words)
-            .min_by_key(|(_, sz)| **sz)
-            .map(|(&off, &sz)| (off, sz));
+        let best = holes.best_fit(need_words);
 
         if let Some((hoff, hsize)) = best {
-            holes.remove(&hoff);
+            holes.remove(hoff);
             let remainder = hsize - need_words;
             // #132: split 閾値は 12B (= hole header に odd gen まで書ける最小)。
             if remainder >= self.min_hole_words() {
@@ -628,17 +674,17 @@ impl LeafStore {
         let mut holes = self.holes.lock().unwrap_or_else(|p| p.into_inner());
 
         // 直前の隣接 hole と結合
-        if let Some((poff, psize)) = holes.range(..hoff).next_back().map(|(&k, &v)| (k, v))
+        if let Some((poff, psize)) = holes.before(hoff)
             && poff + psize == hoff
         {
-            holes.remove(&poff);
+            holes.remove(poff);
             hoff = poff;
             hsize += psize;
         }
         // 直後の隣接 hole と結合
         let end = hoff + hsize;
-        if let Some(&nsize) = holes.get(&end) {
-            holes.remove(&end);
+        if let Some(nsize) = holes.get(end) {
+            holes.remove(end);
             hsize += nsize;
         }
 
@@ -715,7 +761,7 @@ impl LeafStore {
     }
 
     /// rebuild 中: coalesce 済み free run を確定 (word 単位)。 末尾なら high_water 後退。
-    fn flush_run(&self, holes: &mut BTreeMap<u32, u32>, off: u32, size: u32, hw: u32) {
+    fn flush_run(&self, holes: &mut Holes, off: u32, size: u32, hw: u32) {
         if off + size == hw {
             self.set_hw_words(off);
         } else {
@@ -733,7 +779,7 @@ impl LeafStore {
     /// free-list が抱える回収可能 **byte** 数 (test / stats 用)。
     pub fn free_bytes(&self) -> u64 {
         let holes = self.holes.lock().unwrap_or_else(|p| p.into_inner());
-        holes.values().map(|&w| (w as u64) << self.off_shift).sum()
+        holes.sizes().map(|w| (w as u64) << self.off_shift).sum()
     }
 }
 
@@ -942,6 +988,44 @@ mod tests {
         assert_eq!(s.get(big), b"aaaabbbb_pad");
         // c は無傷
         assert_eq!(s.get(c), b"cccc");
+    }
+
+    /// #426: best-fit を大きさの順の索引で引いても、 旧来の全走査 (need 以上で最小、 同じ大きさなら offset の小さい方) と
+    /// 同じ空きを選ぶ。 長さの違う値の insert / free を混ぜ、 毎回の insert の前に両方で引いて比べる。 2 つの一覧が同じ
+    /// 空きを持つことも見る。
+    #[test]
+    fn best_fit_matches_linear_scan() {
+        let s = make_store(8 << 20);
+        let mut live: Vec<u32> = Vec::new();
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut from_hole = 0usize;
+        for _ in 0..20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            if live.is_empty() || x % 3 != 0 {
+                let len = (x >> 8) as usize % 200;
+                let need = s.b2w(s.align_slot(SLOT_HEADER_GEN + len));
+                {
+                    let h = s.holes.lock().unwrap();
+                    let scan = h
+                        .by_off
+                        .iter()
+                        .filter(|&(_, &sz)| sz >= need)
+                        .min_by_key(|&(_, &sz)| sz)
+                        .map(|(&o, &sz)| (o, sz));
+                    assert_eq!(h.best_fit(need), scan, "need {need}");
+                    from_hole += usize::from(scan.is_some());
+                    assert_eq!(h.by_off.len(), h.by_size.len());
+                    assert!(h.by_off.iter().all(|(&o, &sz)| h.by_size.contains(&(sz, o))));
+                }
+                live.push(s.insert(&vec![b'v'; len]));
+            } else {
+                let k = (x >> 20) as usize % live.len();
+                s.free(live.swap_remove(k));
+            }
+        }
+        assert!(from_hole > 1_000, "空きから取る insert が少ない ({from_hole}) — 比べられていない");
     }
 
     #[test]
