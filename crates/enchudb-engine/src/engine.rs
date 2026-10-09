@@ -3528,6 +3528,11 @@ pub struct Engine {
     /// `sync.payload.seg` を開けなかった警告を 1 回だけ出す。
     #[cfg(not(target_arch = "wasm32"))]
     warned_sync_payload_ring: std::sync::atomic::AtomicBool,
+    /// #440: bridge が `_sync_ops` に写した record の数 (行と payload を書き終えた所で数える)。
+    sync_bridged: std::sync::atomic::AtomicU64,
+    /// #440: 本体の書き出しが届かせた `sync_bridged` (書き出しの始めに読んだ値を、 書き出しが成功したら置く)。 これが
+    /// `sync_bridged` に追いつくまで oplog を畳まない。
+    sync_bridged_durable: std::sync::atomic::AtomicU64,
     /// request17 (v9): ローカル write が cell の版数判定で弾かれた warn の一度きり
     /// フラグ。 構造上起きないはずの事象なので、 起きたら無音にしない。
     warned_cell_version_reject: std::sync::atomic::AtomicBool,
@@ -4050,6 +4055,8 @@ impl Engine {
             warned_sync_ops_full: std::sync::atomic::AtomicBool::new(false),
             #[cfg(not(target_arch = "wasm32"))]
             warned_sync_payload_ring: std::sync::atomic::AtomicBool::new(false),
+            sync_bridged: std::sync::atomic::AtomicU64::new(0),
+            sync_bridged_durable: std::sync::atomic::AtomicU64::new(0),
             warned_cell_version_reject: std::sync::atomic::AtomicBool::new(false),
             hlc_mint_lock: parking_lot::Mutex::new(()),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -5202,6 +5209,8 @@ impl Engine {
             warned_sync_ops_full: std::sync::atomic::AtomicBool::new(false),
             #[cfg(not(target_arch = "wasm32"))]
             warned_sync_payload_ring: std::sync::atomic::AtomicBool::new(false),
+            sync_bridged: std::sync::atomic::AtomicU64::new(0),
+            sync_bridged_durable: std::sync::atomic::AtomicU64::new(0),
             warned_cell_version_reject: std::sync::atomic::AtomicBool::new(false),
             hlc_mint_lock: parking_lot::Mutex::new(()),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -5904,6 +5913,7 @@ impl Engine {
             // が成立する。 engine 内の `set_cell` (値 → HLC の順) と同じ規則で、
             // 逆順にすると 「識別子だけ新しい」 窓ができる、 も同じ。
             self.tie_to_by_id(row_eid, lsn_hid, lsn);
+            self.sync_bridged.fetch_add(1, Ordering::Release);
             done_end = Some(*rec_end);
         }
 
@@ -5997,7 +6007,19 @@ impl Engine {
     /// 「sync は `_sync_ops` 経由で ring を直接読まない」という誤った前提だった
     /// （bridge 自体が ring の reader）。 bridge が backpressure で止まっている間
     /// （ring 満杯）は fold も止まり、 WAL が保持を引き受ける。
+    ///
+    /// #440: 加えて、 bridge が写した `_sync_ops` の行と payload を本体の書き出しが届かせた後だけ畳む。 畳んだ oplog には
+    /// 次の record が上書きされ、 次の oplog の fsync がそれを行の書き出しより先に届かせるので、 その間に電源が落ちると
+    /// record が oplog にも `_sync_ops` にも無くなる。 畳む側は先に [`Self::write_out_bridged`] を呼ぶ。
     pub fn wal_fold_safe(&self) -> bool {
+        // bridge の判定が先 (cursor の追い越しを見つけたら、 そこで巻き戻す)
+        self.wal_fold_safe_bridge()
+            && self.sync_bridged.load(std::sync::atomic::Ordering::Acquire)
+                <= self.sync_bridged_durable.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// [`Self::wal_fold_safe`] のうち、 listener が配り終え、 bridge が読み切ったか。
+    fn wal_fold_safe_bridge(&self) -> bool {
         let Some(wal) = self.oplog.as_ref() else {
             return true;
         };
@@ -14562,6 +14584,8 @@ impl Engine {
                                 &emit_lock_for_thread,
                                 false,
                             );
+                            // #440: bridge した行と payload を書き出してから畳む
+                            engine.write_out_bridged(wal);
                             let fold_guard = engine.transfer_lock_for_fold();
                             // #337: 配信と直列にする。 配っている最中なら今回は畳まない (次の tick)
                             let emit_guard = emit_lock_for_thread.try_lock();
@@ -14669,6 +14693,8 @@ impl Engine {
                             // 誤読して畳み続ける = 無言の恒久欠落)。 transfer と同じ lock を
                             // 取って直列化する。 lock 順は transfer_lock → append_lock で
                             // transfer 自身 (row insert → append) と同じなので deadlock しない。
+                            // #440: bridge した行と payload を書き出してから畳む
+                            engine.write_out_bridged(wal);
                             let fold_guard = engine.transfer_lock_for_fold();
                             // #337: 配信と直列にする (配っている最中なら畳まない)
                             let emit_guard = emit_lock_for_thread.try_lock();
@@ -14812,6 +14838,8 @@ impl Engine {
                 self.transfer_oplog_to_sync_ops();
             }
             Self::fire_change_listeners(wal, &self.change_listeners, &self.change_emit_offset, &self.change_emit_lock, false);
+            // #440: bridge した行と payload を書き出してから畳む
+            self.write_out_bridged(wal);
             // 待って取らない: transfer の中で満杯にぶつかった書き手がこの lock を持ったまま待ち手に居ると、 互いに待つ
             let fold_guard = self.transfer_lock.try_lock();
             let emit_guard = self.change_emit_lock.try_lock();
@@ -14883,6 +14911,19 @@ impl Engine {
         self.wal_room_folds.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// #440: bridge が写した `_sync_ops` の行と payload をまだ書き出していなければ、 本体を書き出す。 oplog を畳む前に呼ぶ
+    /// (畳むかは [`Self::wal_fold_safe`] が決める。 書き出せなければ畳まない)。 畳めない時 (head が checkpoint より先 =
+    /// 書き出し待ちの record がある) は何もしない — その record の書き出しが行も一緒に書き出す。
+    fn write_out_bridged(&self, wal: &enchudb_oplog::oplog::OpLog) {
+        use std::sync::atomic::Ordering;
+        if wal.head() != wal.checkpoint() {
+            return;
+        }
+        if self.sync_bridged.load(Ordering::Acquire) > self.sync_bridged_durable.load(Ordering::Acquire) {
+            let _ = self.body_msync();
+        }
+    }
+
     /// checkpoint を進める前の oplog fsync + 本体の書き出し。 どちらかが失敗したら false (#317: 空き不足で
     /// 書き出せなかった page があると fsync が ENOSPC を返す)。 失敗は `FaultKind::DiskSpace` に積む。
     fn sync_for_checkpoint(&self, wal: &enchudb_oplog::oplog::OpLog) -> bool {
@@ -14906,18 +14947,27 @@ impl Engine {
             Backing::Segments(set) => {
                 // #414: 書き出しの前に積んだ旧 Leaf slot は、 書き出しが成功したら空きに戻せる
                 let leaf_token = self.leaf.as_ref().map(|l| l.durable_begin());
+                // #440: 書き出しの前に bridge が写した record は、 書き出しが成功したら oplog から畳める
+                let bridged = self.sync_bridged.load(std::sync::atomic::Ordering::Acquire);
+                // ring の payload も本体と同じ契機で、 それを指す `_sync_ops` の行より先に書き出す (#440: 行だけ届いて
+                // payload が無いと dead row になる)
+                if let Some(ring) = self.sync_payload_ring.get() {
+                    ring.flush()?;
+                }
                 self.write_out_body(false)?;
                 if let (Some(leaf), Some(t)) = (self.leaf.as_ref(), leaf_token) {
                     leaf.durable_end(t);
                 }
-                // ring の payload も本体と同じ契機で書き出す (row だけ残って payload が消えると dead row になる)
-                if let Some(ring) = self.sync_payload_ring.get() {
-                    ring.flush()?;
-                }
+                self.sync_bridged_durable.fetch_max(bridged, std::sync::atomic::Ordering::AcqRel);
                 // 「この時点の segment 長」 を記録する。 次の open で切り詰めを検出できる。
                 set.write_manifest()
             }
-            Backing::Memory(_) => Ok(()),
+            Backing::Memory(_) => {
+                // ディスクが無いので、 bridge した行はいつでも畳める (#440)
+                let bridged = self.sync_bridged.load(std::sync::atomic::Ordering::Acquire);
+                self.sync_bridged_durable.fetch_max(bridged, std::sync::atomic::Ordering::AcqRel);
+                Ok(())
+            }
         }
     }
 
@@ -15863,14 +15913,17 @@ impl Engine {
     fn sync_and_mark_clean_with(&self, refs: bool) -> io::Result<()> {
         // #414: 書き出しの前に積んだ旧 Leaf slot は、 書き出しが成功したら空きに戻せる
         let leaf_token = self.leaf.as_ref().map(|l| l.durable_begin());
-        self.write_out_body(true)?;
-        if let (Some(leaf), Some(t)) = (self.leaf.as_ref(), leaf_token) {
-            leaf.durable_end(t);
-        }
+        // #440: 書き出しの前に bridge が写した record は、 書き出しが成功したら oplog から畳める。 ring は行より先に
+        let bridged = self.sync_bridged.load(std::sync::atomic::Ordering::Acquire);
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(ring) = self.sync_payload_ring.get() {
             ring.flush()?;
         }
+        self.write_out_body(true)?;
+        if let (Some(leaf), Some(t)) = (self.leaf.as_ref(), leaf_token) {
+            leaf.durable_end(t);
+        }
+        self.sync_bridged_durable.fetch_max(bridged, std::sync::atomic::Ordering::AcqRel);
         if refs {
             self.vocab.mark_index_clean_refs();
         } else {
