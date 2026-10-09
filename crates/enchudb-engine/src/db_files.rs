@@ -67,6 +67,17 @@ pub fn is_segment_entry(name: &OsStr) -> bool {
     s.ends_with(".seg") || s == "himo" || s == "ver"
 }
 
+/// #437: create が DB directory に置き得る名前か (segment / sidecar / `lock` / 作成中の印 / sidecar を書き換える
+/// 一時 file `{sidecar}.tmp`・`segments.{pid}.{thread}.tmp`)。 これ以外の entry がある directory は、 create の残骸と
+/// 見なさない (DB と無関係な directory を片付けない)。
+pub fn is_create_entry(name: &OsStr) -> bool {
+    let s = name.to_string_lossy();
+    if is_segment_entry(name) || s == CREATING || ALL.contains(&s.as_ref()) {
+        return true;
+    }
+    s.ends_with(".tmp") && ALL.iter().any(|n| s.strip_prefix(n).is_some_and(|rest| rest.starts_with('.')))
+}
+
 /// directory entry を DB の複製に含めるか。 本体 + sidecar は含め、 `lock` (flock 中、
 /// 複製先は開き直し側が取る) と `*.tmp` (書きかけ) は除く。
 pub fn is_copyable_entry(name: &OsStr) -> bool {

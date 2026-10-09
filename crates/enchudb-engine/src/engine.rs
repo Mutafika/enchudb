@@ -908,6 +908,8 @@ fn writer_registry() -> std::sync::MutexGuard<'static, std::collections::HashSet
 pub(crate) struct WriterLock {
     _file: std::fs::File,
     key: std::path::PathBuf,
+    /// 別 process を排他できているか (false = advisory lock を持たない FS で、 排他なしで続けている)
+    exclusive: bool,
 }
 
 /// `open_immutable` の 「書き手は居ない」 という宣言を debug build で確かめるための、 writer lock の file (#395)。
@@ -966,9 +968,29 @@ impl Drop for WriterLock {
 /// lock も解放。 **別プロセス**が保持中は block する (= sqlite と同様、 取れる
 /// まで待つ)。 **同一プロセス**が既に保持中は block せず即エラー (#80、
 /// `ErrorKind::WouldBlock`)。 readonly open は呼ばない。 writer 系の
-/// open / create だけ呼ぶ。
+/// open だけ呼ぶ (create は [`try_acquire_writer_lock`])。
 #[cfg(not(target_arch = "wasm32"))]
 fn acquire_writer_lock(path: &str) -> io::Result<WriterLock> {
+    Ok(lock_writer(path, true)?.expect("待つ lock は取れるまで返らない"))
+}
+
+/// #437: create 用の writer lock。 別の handle (別 process / 同じ process の Engine) が持っていれば、 少しの間 (約 20 ms)
+/// 取り直して、 それでも取れなければ `Ok(None)`。 同時の open (header が無いのですぐ離す) や、 別の thread が起動した子
+/// process が exec までに持つ fd の写しはすぐ離すので待つ。 作り始めた create / 開いている Engine は離さないので、 待ち
+/// 切らずに諦める (0.31.1 までの create は lock を待ち続けた)。
+#[cfg(not(target_arch = "wasm32"))]
+fn try_acquire_writer_lock(path: &str) -> io::Result<Option<WriterLock>> {
+    for _ in 0..20 {
+        if let Some(lock) = lock_writer(path, false)? {
+            return Ok(Some(lock));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    lock_writer(path, false)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn lock_writer(path: &str, wait: bool) -> io::Result<Option<WriterLock>> {
     // v10: lock は DB directory の中。 directory は create 側が作り、 open は存在を
     // `check_db_dir` で確認済み (無い path に空 directory を残さない)。
     let lock_path = writer_lock_path_for(path);
@@ -977,10 +999,19 @@ fn acquire_writer_lock(path: &str) -> io::Result<WriterLock> {
         .write(true)
         .truncate(false)
         .open(&lock_path)?;
+    #[cfg(test)]
+    AFTER_LOCK_FILE_OPEN.with(|h| {
+        if let Some(h) = h.borrow().as_ref() {
+            h()
+        }
+    });
     // 直前に create 済みなので canonicalize は通常成功する (symlink / 相対 path
     // の表記揺れで registry をすり抜けないための正規化)。
     let key = lock_path.canonicalize().unwrap_or(lock_path);
     if !writer_registry().insert(key.clone()) {
+        if !wait {
+            return Ok(None);
+        }
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             format!(
@@ -994,13 +1025,18 @@ fn acquire_writer_lock(path: &str) -> io::Result<WriterLock> {
     // **Android (bionic) は `Unsupported`** を返す ("lock() not supported")。
     // #280: その穴は `enchudb_oplog::filelock` が libc の flock で塞ぐ
     // (WAL の append guard と同じ経路 = 意味論を 1 箇所に揃える)。
-    match enchudb_oplog::filelock::lock_exclusive(&f) {
-        Ok(enchudb_oplog::filelock::LockOutcome::Locked) => {}
+    let got = if wait {
+        enchudb_oplog::filelock::lock_exclusive(&f).map(Some)
+    } else {
+        enchudb_oplog::filelock::try_lock_exclusive_outcome(&f)
+    };
+    let exclusive = match got {
+        Ok(Some(enchudb_oplog::filelock::LockOutcome::Locked)) => true,
         // advisory lock を持たない FS (一部の FUSE / ネットワーク FS) では
         // **プロセス間の排他を諦めて続行する**。 同一プロセスの二重 open は上の
         // registry が止めるので、 1 app = 1 process の構成は安全側に倒れる。
         // ここで落とすと platform / FS ごと使えなくなるため、 警告 1 回で開ける。
-        Ok(enchudb_oplog::filelock::LockOutcome::Unsupported) => {
+        Ok(Some(enchudb_oplog::filelock::LockOutcome::Unsupported)) => {
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1010,13 +1046,36 @@ fn acquire_writer_lock(path: &str) -> io::Result<WriterLock> {
                      writing the same DB will corrupt it."
                 );
             }
+            false
+        }
+        // 待たない時だけ: 別 process が持っている
+        Ok(None) => {
+            writer_registry().remove(&key);
+            return Ok(None);
         }
         Err(err) => {
             writer_registry().remove(&key);
             return Err(err);
         }
+    };
+    Ok(Some(WriterLock { _file: f, key, exclusive }))
+}
+
+/// #437: 取った writer lock が今の `{path}/lock` か。 lock を取るまでの間に、 失敗した create が directory ごと消して
+/// いれば (lock file を開いた後に消された)、 消えた file の lock を取っている。
+#[cfg(unix)]
+fn lock_is_current(lock: &WriterLock, path: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (lock._file.metadata(), std::fs::metadata(writer_lock_path_for(path))) {
+        (Ok(held), Ok(now)) => held.dev() == now.dev() && held.ino() == now.ino(),
+        _ => false,
     }
-    Ok(WriterLock { _file: f, key })
+}
+
+/// unix 以外は file の同一性を std で見られない。 開いている file は消せない (Windows) ので、 在ることだけ見る。
+#[cfg(all(not(unix), not(target_arch = "wasm32")))]
+fn lock_is_current(_lock: &WriterLock, path: &str) -> bool {
+    writer_lock_path_for(path).exists()
 }
 
 /// 0.9.0 (H11): create 系 API の既存ファイルガード。
@@ -1026,46 +1085,101 @@ fn acquire_writer_lock(path: &str) -> io::Result<WriterLock> {
 /// 存在する path への create は `AlreadyExists` で拒否する。
 /// 既存 DB を開くなら `Engine::open*`、 作り直すなら caller が明示的に削除すること。
 #[cfg(not(target_arch = "wasm32"))]
-/// v10: DB directory を作る。 `mkdir` の atomic 性で「既存を silent に潰さない」 (H11)
-/// と「同時 create の片方だけ勝つ」を兼ねる。 既存が file でも directory でも
-/// `AlreadyExists`。
+/// v10: DB directory を作り、 writer lock を持って返す。 `mkdir` の atomic 性で「既存を silent に潰さない」 (H11)。
+/// 既存が file でも、 DB / DB でない directory でも `AlreadyExists`。 前の create が途中で落ちた残骸
+/// ([`is_create_remnant`]) なら、 その場で作り直す。
+///
+/// #437: lock は作り始める前に取る (待たない)。 取れない = 別の create が作っている / 作り終えて使っている ので
+/// `AlreadyExists` (同時 create は片方だけ勝つ)。 残骸は消さずに、 lock を持ったまま中身を片付けて使う。 旧 (#415):
+/// 作成中の印を置いて fsync してから lock を取っていたので、 その間の directory を同時の create が残骸と見て消して
+/// 作り直し、 消された側がその directory の lock を先に取って作り終えると、 lock を待っていた側が後から
+/// (`SegmentSet::create` の `AlreadyExists` の片付けで) 作り終えた DB を消した。
 #[cfg(not(target_arch = "wasm32"))]
-fn create_db_dir(path: &str) -> io::Result<()> {
-    let exists = |e: io::Error| {
-        if e.kind() == io::ErrorKind::AlreadyExists {
-            io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "database already exists: \"{path}\" — refusing to overwrite. \
-                     use Engine::open* to open the existing DB, or remove it first"
-                ),
-            )
-        } else {
-            e
-        }
+fn create_db_dir(path: &str) -> io::Result<WriterLock> {
+    let dir = std::path::Path::new(path);
+    let exists = || {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "database already exists: \"{path}\" — refusing to overwrite. \
+                 use Engine::open* to open the existing DB, or remove it first"
+            ),
+        )
     };
-    match std::fs::create_dir(path) {
-        Ok(()) => {}
-        // #323: 前の create が途中で落ちた残骸 (header が 0 のまま / #415: 作成中の印が残っている) なら片付けて
-        // 作り直す。 片付けた直後に別の create が作っていれば、 もう一度の create_dir が AlreadyExists で拒む
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && reclaim_create_remnant(std::path::Path::new(path)) => {
-            std::fs::create_dir(path).map_err(exists)?
+    let made = match std::fs::create_dir(dir) {
+        Ok(()) => true,
+        // #323 / #415: 前の create が途中で落ちた残骸。 作成中の create もこの形に見えるので、 下の lock で分ける
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && is_create_remnant(dir) => false,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(exists()),
+        Err(e) => return Err(e),
+    };
+    #[cfg(test)]
+    BEFORE_CREATE_LOCK.with(|h| {
+        if let Some(h) = h.borrow().as_ref() {
+            h()
         }
-        Err(e) => return Err(exists(e)),
+    });
+    // 取れなければ、 別の create が作っている (または作り終えて使っている)。 何も書いていないので片付けない
+    let Some(lock) = try_acquire_writer_lock(path)? else {
+        return Err(exists());
+    };
+    // lock を取るまでの間に、 別の create がここを作り終えた / 失敗して消した。 lock を持たない FS では、 作成中の
+    // create と落ちた残骸を分けられないので、 自分で作った directory しか使わない
+    if !lock_is_current(&lock, path) || !is_create_remnant(dir) || (!made && !lock.exclusive) {
+        return Err(exists());
     }
     // #415: 作成中の印。 作った中身を全部書き出してから消す (`Engine::finish_create`)。 印より先に directory の
-    // 中身が届くことの無いよう、 印を書き出してから先へ進む
-    let marker = std::path::Path::new(path).join(crate::db_files::CREATING);
-    if let Err(e) = std::fs::File::create(&marker).and_then(|f| f.sync_all()) {
-        // 印の無い空の directory を残すと、 開けも作り直しもできない
-        let _ = std::fs::remove_dir_all(path);
+    // 中身が届くことの無いよう、 印を書き出してから先へ進む。 前の create の残りは印の後に消す (消す途中で落ちても、
+    // 印のある残骸のまま)
+    let marker = dir.join(crate::db_files::CREATING);
+    let started = std::fs::File::create(&marker).and_then(|f| f.sync_all()).and_then(|()| {
+        sync_dir(dir);
+        if let Some(parent) = dir.parent() {
+            sync_dir(parent);
+        }
+        clear_create_remnant(dir)
+    });
+    if let Err(e) = started {
+        abandon_create(path, lock);
         return Err(e);
     }
-    sync_dir(std::path::Path::new(path));
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        sync_dir(parent);
+    Ok(lock)
+}
+
+/// #437: 前の create が残した中身 (lock と作成中の印以外) を消す。 lock を持って、 印を書き出した後に呼ぶ。
+#[cfg(not(target_arch = "wasm32"))]
+fn clear_create_remnant(dir: &std::path::Path) -> io::Result<()> {
+    for ent in std::fs::read_dir(dir)? {
+        let ent = ent?;
+        let name = ent.file_name();
+        if name == crate::db_files::LOCK || name == crate::db_files::CREATING {
+            continue;
+        }
+        if ent.file_type()?.is_dir() {
+            std::fs::remove_dir_all(ent.path())?;
+        } else {
+            std::fs::remove_file(ent.path())?;
+        }
     }
     Ok(())
+}
+
+/// #323: 失敗した create の directory を消す。 #437: lock を持っている時だけ呼ぶ (持たずに消すと、 別の create が
+/// 作っている directory を消す)。 unix は lock を持ったまま消す (開いている lock file も消せる) ので、 消している最中の
+/// directory に同時の create が入り込まない (lock を取った後に [`lock_is_current`] で気づく)。
+#[cfg(not(target_arch = "wasm32"))]
+fn abandon_create(path: &str, lock: WriterLock) {
+    #[cfg(unix)]
+    {
+        let _ = std::fs::remove_dir_all(path);
+        drop(lock);
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows は開いている file を消せない
+        drop(lock);
+        let _ = std::fs::remove_dir_all(path);
+    }
 }
 
 /// #415: directory の entry (作った / 消した file) を書き出す。 失敗は無視する (directory の fsync を持たない FS がある)。
@@ -1115,28 +1229,48 @@ pub mod write_out_hook {
 thread_local! {
     /// #323 の test 用: create を segment を作った後 (header を書く前) で失敗させる。
     static FAIL_CREATE_AFTER_SEGMENTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// #437 の test 用: create が directory を作った (残骸を見つけた) 後、 lock を取る前に呼ぶ。
+    #[allow(clippy::type_complexity)]
+    static BEFORE_CREATE_LOCK: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    /// #437 の test 用: writer lock の file を開いた後、 lock を取る前に呼ぶ。
+    #[allow(clippy::type_complexity)]
+    static AFTER_LOCK_FILE_OPEN: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// #323: create が途中で落ちた残骸か — `header.seg` はあるが **全部 0** (magic は create の最後に書く)
-/// で、 commit されたものが何も無い (tables sidecar / segments manifest / himo・ver の segment が無い)。
-/// 完成していた DB は header に magic と CRC を持つので、 header が全部 0 になるのは create が header を
-/// 書く前に落ちた時だけ。 それ以外の形 (header だけ壊れた DB 等) は残骸と見なさない (`Damaged` のまま)。
+/// 前の create が途中で落ちた残骸 (create がその場で作り直してよい directory) か。 中身が全部 create の置く名前
+/// ([`crate::db_files::is_create_entry`]) で、 次のどれか:
+///
+/// - #415: 作成中の印 (`creating`) がある = 作った中身を書き出し終える前に落ちた
+/// - #415: lock 以外に何も無い = mkdir の直後 (印を置く前) に落ちた
+/// - #323: `header.seg` が **全部 0** (magic は create の最後に書く) で、 commit されたものが何も無い (tables sidecar /
+///   segments manifest / himo・ver の segment が無い)。 印を置かない版 (0.31.1 以前) の create が落ちた形
+///
+/// 完成していた DB は印を持たず、 header に magic と CRC を持つ。 それ以外の形 (header だけ壊れた DB 等) は残骸と
+/// 見なさない (`Damaged` のまま)。 #437: create の置かない名前がある directory (DB と無関係な directory) も見なさない
+/// (旧: 印があれば他の中身を見ずに残骸と見て、 create が directory ごと消した)。
+///
+/// 作成中の create の directory もこの形をしている。 create は lock を取ってから使う ([`create_db_dir`])。
 #[cfg(not(target_arch = "wasm32"))]
 fn is_create_remnant(dir: &std::path::Path) -> bool {
-    // #415: 作成中の印が残っている = 作った中身を書き出し終える前に落ちた
-    if dir.join(crate::db_files::CREATING).exists() {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut names = Vec::new();
+    for ent in entries {
+        let Ok(ent) = ent else {
+            return false;
+        };
+        names.push(ent.file_name());
+    }
+    if !names.iter().all(|n| crate::db_files::is_create_entry(n)) {
+        return false;
+    }
+    if names.iter().any(|n| n == crate::db_files::CREATING) || names.iter().all(|n| n == crate::db_files::LOCK) {
         return true;
     }
     let header = dir.join(crate::segments::SegmentKind::Header.rel_path());
-    let bytes = match std::fs::read(&header) {
-        Ok(b) => b,
-        // #415: mkdir の直後 (印を置く前 / segment を作る前) に落ちた directory: lock 以外に何も無い
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return std::fs::read_dir(dir).is_ok_and(|it| {
-                it.flatten().all(|ent| ent.file_name() == crate::db_files::LOCK)
-            });
-        }
-        Err(_) => return false,
+    let Ok(bytes) = std::fs::read(&header) else {
+        return false;
     };
     if bytes.iter().any(|&b| b != 0) {
         return false;
@@ -1149,26 +1283,6 @@ fn is_create_remnant(dir: &std::path::Path) -> bool {
         && !dir.join(crate::db_files::SEGMENTS).exists()
         && empty_or_absent("himo")
         && empty_or_absent("ver")
-}
-
-/// #323: 残骸を片付ける。 片付けたら true。 別プロセスが作成中 (writer lock を持っている) なら触らない。
-#[cfg(not(target_arch = "wasm32"))]
-fn reclaim_create_remnant(dir: &std::path::Path) -> bool {
-    if !is_create_remnant(dir) {
-        return false;
-    }
-    let lock_path = dir.join(crate::db_files::LOCK);
-    let Ok(lock) = OpenOptions::new().create(true).write(true).truncate(false).open(&lock_path) else {
-        return false;
-    };
-    // 作成中の create は mkdir の直後から lock を持つ。 取れなければ作成中 (または lock の無い FS) = 触らない
-    if !matches!(enchudb_oplog::filelock::try_lock_exclusive(&lock), Ok(true)) {
-        return false;
-    }
-    // lock を取るまでの間に header が書かれていないか確かめ直す
-    let still = is_create_remnant(dir);
-    drop(lock); // Windows は開いている file を消せない
-    still && std::fs::remove_dir_all(dir).is_ok()
 }
 
 /// v10: `[start, end)` の中で data が載っている最後の byte 位置 (SEEK_DATA / SEEK_HOLE)。
@@ -1953,9 +2067,11 @@ pub enum DbState {
     /// `seal_integrity()` + `open` を使うこと。
     Ready,
     /// directory はあるが **DB になりきっていない** — `header.seg` が無い、 header が全部 0 で
-    /// commit されたものが何も無い (#323: create が header を書く前に落ちた)、 または
+    /// commit されたものが何も無い (#323: create が header を書く前に落ちた)、 作成中の印 (`creating`) が
+    /// 残っている (#415: create が作った中身を書き出し終える前に落ちた、 または作成中)、 または
     /// header が指す segment が欠けていて manifest も無い (= create が途中で落ちた)。
-    /// header が全部 0 の残骸は `create*` がそのまま作り直す (別プロセスが作成中なら触らない)。
+    /// create の残骸 (header が全部 0 / 印がある / 空で、 中身が全部 create の置く名前) には `create*` が
+    /// そのまま作り直す (別の create が作成中 = writer lock を持っていれば触らない、 #437)。
     ///
     /// **`header.seg` を持たない directory はすべてここに来る。** create が途中で落ちた
     /// 残骸だけでなく、 **db と無関係な普通の directory** も同じ `Incomplete` になる
@@ -3809,16 +3925,9 @@ impl Engine {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        // H11: 既存 DB を silent に破壊しない。 directory 作成 (atomic) → lock → segment。
-        create_db_dir(path)?;
-        // #323: ここから header を書き終えるまでに失敗したら、 自分が作った directory を片付ける
-        // (残すと header が 0 の directory になり、 open も create も通らない)。
-        let abandon = |e: io::Error| {
-            let _ = std::fs::remove_dir_all(path);
-            e
-        };
-        // writer lock を先に取る (= 他 writer が居れば block)。 create も書き込みなので必須。
-        let writer_lock = acquire_writer_lock(path).map_err(abandon)?;
+        // H11: 既存 DB を silent に破壊しない。 directory 作成 (atomic) → lock → segment。 #437: lock を持って返る
+        let writer_lock = create_db_dir(path)?;
+        // #323: ここから header を書き終えるまでに失敗したら、 directory を片付ける (`abandon_create`、 lock を持ったまま)
         let created = SegmentSet::create(
             std::path::Path::new(path),
             &layout,
@@ -3835,8 +3944,8 @@ impl Engine {
         let set = match created {
             Ok(set) => set,
             Err(e) => {
-                drop(writer_lock);
-                return Err(abandon(e));
+                abandon_create(path, writer_lock);
+                return Err(e);
             }
         };
         let backing = Backing::Segments(Arc::new(set));
@@ -3870,8 +3979,8 @@ impl Engine {
         }
         if let Err(e) = backing.flush_header(layout.header_size) {
             drop(backing);
-            drop(writer_lock);
-            return Err(abandon(e));
+            abandon_create(path, writer_lock);
+            return Err(e);
         }
 
         let entities = EntitySet::init(backing.region(SegmentKind::Entities, &layout), max_entities, layout.reserve_entities);
@@ -4512,13 +4621,14 @@ impl Engine {
                 format!("database directory not found: \"{path}\""),
             ));
         }
-        // #415: create の途中で落ちた (作った中身を書き出し終えていない)。 中身が揃っている保証が無いので開かない
+        // #415: create の途中で落ちた (作った中身を書き出し終えていない) か、 別の create が作っている最中。 中身が
+        // 揃っている保証が無いので開かない
         if p.join(crate::db_files::CREATING).exists() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "database \"{path}\" is incomplete: it was still being created when the process stopped \
-                     (\"{}\" is left) — create it again (Engine::create* reclaims it)",
+                    "database \"{path}\" is incomplete: it is being created, or its creation was interrupted \
+                     (\"{}\" is left) — if no one is creating it, create it again (Engine::create* reclaims it)",
                     crate::db_files::CREATING
                 ),
             ));
@@ -20087,6 +20197,94 @@ mod v10_dir_tests {
         assert_eq!(r.err().map(|e| e.kind()), Some(io::ErrorKind::AlreadyExists), "lock 中の directory を作り直した");
         assert!(std::path::Path::new(&format!("{path}/header.seg")).exists(), "lock 中の directory を消した");
         drop(holder);
+    }
+
+    /// #437: create が directory を作ってから lock を取るまでの間に、 別の create (別の thread) がその directory を残骸と
+    /// 見て作り終える。 後から lock を取る側は `AlreadyExists` で退き、 先に作り終えた DB に触らない。 別の create が
+    /// 閉じてから lock を取る形 (lock は取れる、 作り終えた DB があるので退く) と、 開いたまま (lock が取れない) の 2 通り。
+    #[test]
+    fn issue437_create_that_loses_the_race_to_lock_leaves_the_winner_alone() {
+        for winner_closes in [true, false] {
+            let path = tmp(&format!("437_race_{winner_closes}"));
+            // 割り込んだ create の engine (閉じた時は None) と、 書いた entity
+            let winner = std::sync::Arc::new(std::sync::Mutex::new(None::<(Option<Engine>, u64)>));
+            BEFORE_CREATE_LOCK.with(|h| {
+                let (path, winner) = (path.clone(), winner.clone());
+                *h.borrow_mut() = Some(Box::new(move || {
+                    let path = path.clone();
+                    let won = std::thread::spawn(move || {
+                        let mut eng = Engine::create_growable_with_capacity(&path, 65_536).expect("割り込んだ create が失敗した");
+                        let e = eng.entity().unwrap();
+                        eng.tie(e, "n", 7);
+                        eng.flush().unwrap();
+                        (eng, e)
+                    })
+                    .join()
+                    .unwrap();
+                    let (eng, e) = won;
+                    *winner.lock().unwrap() = Some((if winner_closes { None } else { Some(eng) }, e));
+                }));
+            });
+            let r = Engine::create_growable_with_capacity(&path, 65_536);
+            BEFORE_CREATE_LOCK.with(|h| *h.borrow_mut() = None);
+            assert_eq!(r.err().map(|e| e.kind()), Some(io::ErrorKind::AlreadyExists), "後から lock を取る側が作った");
+            let (eng, e) = winner.lock().unwrap().take().expect("割り込んだ create が走っていない");
+            drop(eng);
+            let eng = Engine::open_standalone(&path).expect("割り込んだ create の DB が消えた");
+            assert_eq!(eng.get(e, "n"), Some(7), "割り込んだ create の値が消えた");
+        }
+    }
+
+    /// #437: create が lock を取ろうとした時に、 別の handle (同時の open: header が無いのですぐ離す) が lock を一瞬持って
+    /// いる。 create は少し取り直して作る (すぐ諦めると、 open も create も失敗して DB ができない)。
+    #[test]
+    fn issue437_create_waits_out_a_brief_lock_holder() {
+        let path = tmp("437_brief_holder");
+        BEFORE_CREATE_LOCK.with(|h| {
+            let path = path.clone();
+            *h.borrow_mut() = Some(Box::new(move || {
+                let holder = std::fs::OpenOptions::new().create(true).write(true).truncate(false)
+                    .open(format!("{path}/{}", db_files::LOCK)).unwrap();
+                holder.lock().unwrap();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    drop(holder);
+                });
+            }));
+        });
+        let r = Engine::create_growable_with_capacity(&path, 65_536);
+        BEFORE_CREATE_LOCK.with(|h| *h.borrow_mut() = None);
+        let mut eng = r.expect("lock を一瞬持った相手に負けた");
+        eng.define_himo("n", ValueType::Number, 0);
+        drop(eng);
+        assert_eq!(Engine::probe(&path), DbState::Ready);
+    }
+
+    /// #437: lock file を開いてから lock を取るまでの間に、 失敗した create が (lock を持ったまま) directory ごと消し、
+    /// 別の create が mkdir した直後の形になる。 後から lock を取った側は消えた lock file の lock を持っているので退く。
+    /// 取った lock が今の lock file かを見ないと、 空の directory を残骸と見て作り、 mkdir した側と同じ directory に書く。
+    #[test]
+    fn issue437_create_backs_off_when_its_lock_file_was_removed() {
+        let path = tmp("437_removed_lock");
+        AFTER_LOCK_FILE_OPEN.with(|h| {
+            let path = path.clone();
+            *h.borrow_mut() = Some(Box::new(move || {
+                let p = path.clone();
+                let failed = std::thread::spawn(move || {
+                    FAIL_CREATE_AFTER_SEGMENTS.with(|f| f.set(true));
+                    Engine::create_growable_with_capacity(&p, 65_536).err()
+                })
+                .join()
+                .unwrap();
+                assert!(failed.is_some(), "割り込んだ create が失敗しなかった");
+                assert!(!std::path::Path::new(&path).exists(), "失敗した create が directory を消していない");
+                std::fs::create_dir(&path).unwrap(); // 別の create が mkdir した直後
+            }));
+        });
+        let r = Engine::create_growable_with_capacity(&path, 65_536);
+        AFTER_LOCK_FILE_OPEN.with(|h| *h.borrow_mut() = None);
+        assert_eq!(r.err().map(|e| e.kind()), Some(io::ErrorKind::AlreadyExists), "消えた lock file の lock で作った");
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0, "mkdir した側の directory に書いた");
     }
 
     /// 中身のある DB の header だけが 0 になった形は残骸と見なさない (`Damaged` のまま、 create は拒む)。

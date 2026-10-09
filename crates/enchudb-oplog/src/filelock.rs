@@ -57,6 +57,18 @@ pub fn try_lock_exclusive(f: &File) -> io::Result<bool> {
     }
 }
 
+/// [`try_lock_exclusive`] の、 lock を持たない FS を分けて返す版 (#437)。 取れたら `Some(Locked)`、 他が保持中なら
+/// `None`、 この FS が lock を持たなければ `Some(Unsupported)` ([`lock_exclusive`] と同じく、 排他なしで続けるかは
+/// 呼び側が決める)。 engine の create は待たずに排他を取りたいが、 lock を持たない FS でも作れなければならない。
+pub fn try_lock_exclusive_outcome(f: &File) -> io::Result<Option<LockOutcome>> {
+    match f.try_lock() {
+        Ok(()) => Ok(Some(LockOutcome::Locked)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) if e.kind() == io::ErrorKind::Unsupported => fallback_try_lock_outcome(f),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
 /// 排他 lock を誰か (別の open file description) が持っているかを、 lock を持ち続けずに見る (#395)。 共有 lock を
 /// block せずに試し、 取れたらすぐ外す。 `Some(true)` = 持っている、 `Some(false)` = 持っていない、 `None` = この FS は
 /// lock を持たない (分からない)。 `f` は読み取りだけで開いた file でよい。
@@ -97,6 +109,16 @@ fn fallback_try_lock(f: &File) -> io::Result<bool> {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
         Err(e) if lock_unavailable(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(unix)]
+fn fallback_try_lock_outcome(f: &File) -> io::Result<Option<LockOutcome>> {
+    match raw_flock(f, libc::LOCK_EX | libc::LOCK_NB) {
+        Ok(()) => Ok(Some(LockOutcome::Locked)),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) if lock_unavailable(&e) => Ok(Some(LockOutcome::Unsupported)),
         Err(e) => Err(e),
     }
 }
@@ -161,6 +183,11 @@ fn fallback_lock_exclusive(_f: &File) -> io::Result<LockOutcome> {
 #[cfg(not(unix))]
 fn fallback_try_lock(_f: &File) -> io::Result<bool> {
     Ok(false)
+}
+
+#[cfg(not(unix))]
+fn fallback_try_lock_outcome(_f: &File) -> io::Result<Option<LockOutcome>> {
+    Ok(Some(LockOutcome::Unsupported))
 }
 
 #[cfg(not(unix))]
