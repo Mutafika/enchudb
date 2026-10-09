@@ -255,6 +255,15 @@ impl Region {
         true
     }
 
+    /// 別 process の書き手が伸ばした分を写像に取り込む (readonly の読み手用、 #417)。 静的 backing は no-op。
+    pub fn refresh(&self) -> std::io::Result<()> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(g) = &self.grower {
+            g.refresh()?;
+        }
+        Ok(())
+    }
+
     /// Region 内の `end_in_region` byte までを書き込み可能にする (= ファイル
     /// 内 commit を `file_offset + end_in_region` まで進める)。 grower が
     /// 設定されていなければ no-op (静的 backing は既に全コミット済み)。
