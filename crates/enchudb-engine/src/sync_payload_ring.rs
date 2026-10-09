@@ -110,29 +110,49 @@ impl PayloadRing {
     /// `{dir}/sync.payload.seg` を開く (無ければ `cap` で作る)。 既に在る file は作った時の大きさで開く。
     pub fn open_or_create(dir: &Path, cap: usize, readonly: bool) -> io::Result<Self> {
         let path = dir.join(FILE);
-        if path.exists() {
-            // header は普通に読む (大きさが判る前に map すると、 予約より伸びた file を `SegmentMap::open` が断る)
-            let mut h = [0u8; 12];
-            std::io::Read::read_exact(&mut std::fs::File::open(&path)?, &mut h)?;
-            if h[..4] != MAGIC {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "sync.payload.seg: bad magic"));
+        if !path.exists() {
+            if readonly {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "sync.payload.seg が無い (readonly)"));
             }
-            let cap = u64::from_le_bytes(h[4..12].try_into().unwrap()) as usize;
-            let map = Arc::new(SegmentMap::open(&path, HEADER + cap, readonly)?);
-            return Ok(Self::with_map(map, cap));
+            Self::create(dir, &path, cap.next_multiple_of(ALIGN))?;
         }
-        if readonly {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "sync.payload.seg が無い (readonly)"));
+        // header は普通に読む (大きさが判る前に map すると、 予約より伸びた file を `SegmentMap::open` が断る)
+        let mut h = [0u8; 12];
+        std::io::Read::read_exact(&mut std::fs::File::open(&path)?, &mut h)?;
+        if h[..4] != MAGIC {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "sync.payload.seg: bad magic"));
         }
-        let cap = cap.next_multiple_of(ALIGN);
-        let map = Arc::new(SegmentMap::create(&path, HEADER + cap, 4096)?);
-        let ring = Self::with_map(map, cap);
+        let cap = u64::from_le_bytes(h[4..12].try_into().unwrap()) as usize;
+        let map = Arc::new(SegmentMap::open(&path, HEADER + cap, readonly)?);
+        Ok(Self::with_map(map, cap))
+    }
+
+    /// 空の ring を `path` に置く。 #441: 別の名前で作って header を書き出してから rename で置き、 directory を書き出す。
+    /// 置く名前で作ると、 header が届く前に電源が落ちた時に 「header の無い file」 が残り (file を作ったことは中身より
+    /// 先に durable になる)、 以後ずっと bad magic で開けず、 payload を辞書に置き続けた。
+    fn create(dir: &Path, path: &Path, cap: usize) -> io::Result<()> {
+        let tmp = dir.join(format!("{FILE}.tmp"));
+        if tmp.exists() {
+            // 前に作りかけて落ちた分
+            #[cfg(all(feature = "crashsim", unix))]
+            enchudb_oplog::crashsim::releasing(&tmp, || std::fs::remove_file(&tmp))?;
+            #[cfg(not(all(feature = "crashsim", unix)))]
+            std::fs::remove_file(&tmp)?;
+        }
+        let ring = Self::with_map(Arc::new(SegmentMap::create(&tmp, HEADER + cap, 4096)?), cap);
         let mut h = [0u8; 12];
         h[..4].copy_from_slice(&MAGIC);
         h[4..12].copy_from_slice(&(cap as u64).to_le_bytes());
         ring.region.write_at(0, &h);
         ring.region.mark_dirty(0, HEADER);
-        Ok(ring)
+        ring.flush()?;
+        drop(ring);
+        std::fs::rename(&tmp, path)?;
+        // 置いたことを書き出す (書き出す前に落ちると ring が無いことになり、 それを指す row が読めない)
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+        Ok(())
     }
 
     fn with_map(map: Arc<SegmentMap>, cap: usize) -> Self {
@@ -274,6 +294,21 @@ mod tests {
             }
         }
         assert!(ring.read(ha, 1).is_none(), "使い回した場所を古い lsn で読めてしまう");
+    }
+
+    /// #441: 前に作りかけて落ちた一時 file が残っていても作れる。 置いた ring は header を持つ。
+    #[test]
+    fn create_replaces_a_leftover_temporary_file() {
+        let dir = tempdir("leftover");
+        std::fs::write(dir.join(format!("{FILE}.tmp")), b"half made").unwrap();
+        let ring = PayloadRing::open_or_create(&dir, 1 << 20, false).unwrap();
+        let off = ring.reserve(10, || None).unwrap();
+        let h = ring.write(off, 1, b"0123456789").unwrap();
+        ring.flush().unwrap();
+        drop(ring);
+        assert!(!dir.join(format!("{FILE}.tmp")).exists(), "一時 file が残った");
+        let ring = PayloadRing::open_or_create(&dir, 1 << 20, true).unwrap();
+        assert_eq!(ring.read(h, 1).unwrap(), b"0123456789");
     }
 
     #[test]

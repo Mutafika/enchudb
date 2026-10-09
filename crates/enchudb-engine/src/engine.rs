@@ -7556,6 +7556,12 @@ impl Engine {
             return None;
         }
         let rows = self.table_eid_usage("_sync_ops").map(|u| u.capacity).unwrap_or(0);
+        // #441: 作る時は version を先に刻む。 ring は作った時に書き出すので、 後で刻むと、 その間に電源が落ちた DB は ring
+        // を持ったまま v13 で残り、 0.30 以前の binary が開いて ring の row を壊れた row として消す。 刻んだ後に落ちた
+        // DB は ring の無い v14 で、 次の bridge が作る
+        if !exists && let Err(e) = self.stamp_sync_ring_version() {
+            eprintln!("[enchudb] warning: v14 の version を刻めない ({e})");
+        }
         let ring = match PayloadRing::open_or_create(set.dir(), capacity_for(rows), readonly) {
             Ok(r) => r,
             Err(e) => {
@@ -7567,9 +7573,7 @@ impl Engine {
         };
         let (newest, oldest) = self.sync_ring_extremes();
         ring.restore(newest, oldest);
-        if self.sync_payload_ring.set(ring).is_ok() && !exists && let Err(e) = self.stamp_sync_ring_version() {
-            eprintln!("[enchudb] warning: v14 の version を刻めない ({e})");
-        }
+        let _ = self.sync_payload_ring.set(ring);
         self.sync_payload_ring.get()
     }
 
