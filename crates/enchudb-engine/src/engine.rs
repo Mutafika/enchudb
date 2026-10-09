@@ -5839,7 +5839,7 @@ impl Engine {
             // 埋まった時と同じ backpressure)。 大きすぎる payload は辞書の従来経路へ。
             #[cfg(not(target_arch = "wasm32"))]
             let ring_slot = match payload_ring.filter(|(r, _)| r.accepts(wire_payload.len())) {
-                Some((r, at_hid)) => match r.reserve(wire_payload.len(), || self.sync_ring_extremes().1) {
+                Some((r, at_hid)) => match r.reserve(wire_payload.len(), || self.sync_ring_extremes(r).1) {
                     Some(off) => Some((r, at_hid, off)),
                     None => return self.sync_ops_backpressure(from, done_end, count, "payload ring"),
                 },
@@ -7593,7 +7593,7 @@ impl Engine {
                 return None;
             }
         };
-        let (newest, oldest) = self.sync_ring_extremes();
+        let (newest, oldest) = self.sync_ring_extremes(&ring);
         ring.restore(newest, oldest);
         let _ = self.sync_payload_ring.set(ring);
         self.sync_payload_ring.get()
@@ -7601,13 +7601,21 @@ impl Engine {
 
     /// ring に payload を持つ生きている row のうち、 最大 lsn の (handle, lsn) と最小 lsn の handle。
     #[cfg(not(target_arch = "wasm32"))]
-    fn sync_ring_extremes(&self) -> (Option<(u32, u32)>, Option<u32>) {
+    ///
+    /// #442: entry が読める行だけを見る。 行は届いたのに entry が届かなかった行 (電源断の後の dead row) を数えると、
+    /// 最大 lsn の行の entry が読めない時に書き込み位置を先頭に戻し、 生きている範囲の先頭 (最小 lsn の行) も先頭なら
+    /// 「満杯」 になって bridge が止まった (一周した ring なら、 先頭から先の生きている entry を上書きする)。 dead row の
+    /// 場所は使い回してよい (その行は読めないまま、 #217 で掃除される)。
+    fn sync_ring_extremes(&self, ring: &crate::sync_payload_ring::PayloadRing) -> (Option<(u32, u32)>, Option<u32>) {
         let Some(cols) = self.sync_payload_cols() else { return (None, None) };
         let Some(at) = cols.at else { return (None, None) };
         let mut newest: Option<(u32, u32)> = None;
         let mut oldest: Option<(u32, u32)> = None;
         for eid in self.entities_with_himo(cols.lsn) {
             let (Some(lsn), Some(h)) = (self.get_by_id32(eid, cols.lsn), self.get_by_id32(eid, at)) else { continue };
+            if !ring.holds(h, lsn) {
+                continue;
+            }
             if newest.is_none_or(|(l, _)| lsn > l) {
                 newest = Some((lsn, h));
             }

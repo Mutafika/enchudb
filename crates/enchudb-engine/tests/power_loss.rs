@@ -59,8 +59,9 @@ enum Kind {
     /// `Leaf` と同じ操作を concurrent + oplog の engine に同期の API (`tie_text_to` …) で書く (#419 / #429)。
     /// consumer の周期の書き出しと、 oplog_sync を回し続ける thread が書き手と並んで走る。 像は `Lost` だけ
     LeafSync,
-    /// `Oplog` と同じ書き込みを sync する DB (cell の版数 + `_sync_ops`) に書く。 書き出しが返った書き込みは、 開き
-    /// 直して bridge し直した後の配る分 (`pending_sync_ops`) に全部あること (相手の peer に届く)。 像は `Lost` だけ
+    /// `Oplog` と同じ書き込みを sync する DB (cell の版数 + `_sync_ops`) に書く。 oplog_sync を回し続ける thread が
+    /// 書き手と並んで走る。 書き出しが返った書き込みは、 開き直して bridge し直した後の配る分 (`pending_sync_ops`) に
+    /// 全部あること (相手の peer に届く)。 像は `Lost` だけ
     Sync,
 }
 
@@ -144,6 +145,17 @@ fn write_workload(kind: Kind, db: &str, acked: &AtomicU32) {
             eng.flush().unwrap();
             eng.persist_tables().unwrap();
             let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+            // sync: 書き手と並んで oplog_sync を回し続ける thread。 bridge が本体の書き出しや畳む所と重なる (#440 の
+            // 「畳む前の書き出し」 と 「畳む」 の間に bridge が入る、 #442 の 「行だけ届いた」 行ができる)
+            let done = Arc::new(AtomicBool::new(false));
+            let syncer = (kind == Kind::Sync).then(|| {
+                let (eng, done) = (eng.clone(), done.clone());
+                std::thread::spawn(move || {
+                    while !done.load(Ordering::Relaxed) {
+                        eng.oplog_sync().unwrap();
+                    }
+                })
+            });
             let hids: Vec<u16> =
                 (0..HIMOS).map(|h| eng.himo_id(&format!("t.h{h}")).unwrap() as u16).collect();
             for b in 0..BATCHES {
@@ -157,6 +169,10 @@ fn write_workload(kind: Kind, db: &str, acked: &AtomicU32) {
                 }
                 eng.oplog_sync().unwrap();
                 acked.store(b + 1, Ordering::Release);
+            }
+            done.store(true, Ordering::Relaxed);
+            if let Some(s) = syncer {
+                s.join().unwrap();
             }
             // WAL に載らずに落ちた record は配る分に無くてよい (floor を上げて相手に取り直させる、 #57)。 ここは落ちない
             // 大きさの oplog で、 書き出しが返った書き込みが全部配る分にあることを見る

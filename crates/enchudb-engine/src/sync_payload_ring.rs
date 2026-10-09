@@ -161,8 +161,8 @@ impl PayloadRing {
         Self { _map: map, region, cap, cursor: Mutex::new(Cursor { head: 0, tail: None }) }
     }
 
-    /// 開いた時の位置合わせ。 `newest` = 生きている row のうち最大 lsn の handle、 `oldest` = 最小 lsn の handle。
-    /// どちらも無ければ空 (head = 0)。
+    /// 開いた時の位置合わせ。 `newest` = 生きている row (entry が読める row、 #442) のうち最大 lsn の handle、 `oldest` =
+    /// 最小 lsn の handle。 どちらも無ければ空 (head = 0)。
     pub fn restore(&self, newest: Option<(u32, u32)>, oldest: Option<u32>) {
         let mut c = self.cursor.lock().unwrap();
         c.head = newest
@@ -219,6 +219,12 @@ impl PayloadRing {
         let bytes = self.region.slice()[at + ENTRY_HEADER..at + ENTRY_HEADER + len].to_vec();
         std::sync::atomic::fence(Ordering::Acquire);
         (self.lsn_at(at).load(Ordering::Acquire) == lsn).then_some(bytes)
+    }
+
+    /// handle の場所に `lsn` の entry が在るか (読めるか)。 #442: 行は届いたのに entry が届かなかった (電源断) 行を、
+    /// 開いた時の位置合わせと満杯の数え直しで生きている entry と数えないため。
+    pub fn holds(&self, handle: u32, lsn: u32) -> bool {
+        off_of(handle).and_then(|off| self.entry_len_if(off, lsn)).is_some()
     }
 
     /// `off` の entry が `lsn` のものなら、 その長さ。
