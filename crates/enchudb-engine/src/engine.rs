@@ -1045,13 +1045,35 @@ fn create_db_dir(path: &str) -> io::Result<()> {
         }
     };
     match std::fs::create_dir(path) {
-        Ok(()) => Ok(()),
-        // #323: 前の create が途中で落ちた残骸 (header が 0 のまま) なら片付けて作り直す。 片付けた直後に
-        // 別の create が作っていれば、 もう一度の create_dir が AlreadyExists で拒む
+        Ok(()) => {}
+        // #323: 前の create が途中で落ちた残骸 (header が 0 のまま / #415: 作成中の印が残っている) なら片付けて
+        // 作り直す。 片付けた直後に別の create が作っていれば、 もう一度の create_dir が AlreadyExists で拒む
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists && reclaim_create_remnant(std::path::Path::new(path)) => {
-            std::fs::create_dir(path).map_err(exists)
+            std::fs::create_dir(path).map_err(exists)?
         }
-        Err(e) => Err(exists(e)),
+        Err(e) => return Err(exists(e)),
+    }
+    // #415: 作成中の印。 作った中身を全部書き出してから消す (`Engine::finish_create`)。 印より先に directory の
+    // 中身が届くことの無いよう、 印を書き出してから先へ進む
+    let marker = std::path::Path::new(path).join(crate::db_files::CREATING);
+    if let Err(e) = std::fs::File::create(&marker).and_then(|f| f.sync_all()) {
+        // 印の無い空の directory を残すと、 開けも作り直しもできない
+        let _ = std::fs::remove_dir_all(path);
+        return Err(e);
+    }
+    sync_dir(std::path::Path::new(path));
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        sync_dir(parent);
+    }
+    Ok(())
+}
+
+/// #415: directory の entry (作った / 消した file) を書き出す。 失敗は無視する (directory の fsync を持たない FS がある)。
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_dir(dir: &std::path::Path) {
+    let dir = if dir.as_os_str().is_empty() { std::path::Path::new(".") } else { dir };
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
     }
 }
 
@@ -1067,8 +1089,21 @@ thread_local! {
 /// 書く前に落ちた時だけ。 それ以外の形 (header だけ壊れた DB 等) は残骸と見なさない (`Damaged` のまま)。
 #[cfg(not(target_arch = "wasm32"))]
 fn is_create_remnant(dir: &std::path::Path) -> bool {
+    // #415: 作成中の印が残っている = 作った中身を書き出し終える前に落ちた
+    if dir.join(crate::db_files::CREATING).exists() {
+        return true;
+    }
     let header = dir.join(crate::segments::SegmentKind::Header.rel_path());
-    let Ok(bytes) = std::fs::read(&header) else { return false };
+    let bytes = match std::fs::read(&header) {
+        Ok(b) => b,
+        // #415: mkdir の直後 (印を置く前 / segment を作る前) に落ちた directory: lock 以外に何も無い
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return std::fs::read_dir(dir).is_ok_and(|it| {
+                it.flatten().all(|ent| ent.file_name() == crate::db_files::LOCK)
+            });
+        }
+        Err(_) => return false,
+    };
     if bytes.iter().any(|&b| b != 0) {
         return false;
     }
@@ -3842,7 +3877,7 @@ impl Engine {
             None
         };
 
-        Ok(Self {
+        let eng = Self {
             path: path.to_string(), layout: std::sync::RwLock::new(layout), entity_cap: std::sync::atomic::AtomicU32::new(max_entities),
             table_grow_lock: std::sync::Mutex::new(()), max_himos,
             vocab, himo_reg,
@@ -3943,7 +3978,24 @@ impl Engine {
             _writer_lock: Some(writer_lock),
             immutable: None,
             backing,
-        })
+        };
+        eng.finish_create()?;
+        Ok(eng)
+    }
+
+    /// #415: create の最後に、 作った中身を全部書き出してから作成中の印を消す。 旧: header だけを書き出して返し、 辞書 /
+    /// entity / Leaf 領域の header は最初の flush まで書き出さなかった。 その間に電源が落ちると 「壊れている」 で開けず、
+    /// directory はあるので create し直しも断られた。 印を消す前に落ちた directory は、 開くと 「作成中」 で断り、 次の
+    /// create が片付けて作り直す。 書き出しは全域 (init は書いた範囲の印を付けない store がある)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn finish_create(&self) -> io::Result<()> {
+        if let Backing::Segments(set) = &self.backing {
+            set.flush_all()?;
+            set.write_manifest()?;
+        }
+        std::fs::remove_file(std::path::Path::new(&self.path).join(crate::db_files::CREATING))?;
+        sync_dir(std::path::Path::new(&self.path));
+        Ok(())
     }
 
     /// growable backing で新規 DB を作る。 通常の `create_full_with_cyl`
@@ -4428,6 +4480,17 @@ impl Engine {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("database directory not found: \"{path}\""),
+            ));
+        }
+        // #415: create の途中で落ちた (作った中身を書き出し終えていない)。 中身が揃っている保証が無いので開かない
+        if p.join(crate::db_files::CREATING).exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "database \"{path}\" is incomplete: it was still being created when the process stopped \
+                     (\"{}\" is left) — create it again (Engine::create* reclaims it)",
+                    crate::db_files::CREATING
+                ),
             ));
         }
         Ok(())
@@ -13655,7 +13718,8 @@ impl Engine {
         let _ = std::fs::remove_dir_all(&crc_path); // v10: DB は directory
         let _ = std::fs::remove_file(&crc_path);
         let oplog_path = oplog_path_for(path);
-        let wal = if oplog_path.exists() {
+        // #415: header が一度も書き出されていない oplog (作った直後に落ちた) は、 record も無いので作り直す
+        let wal = if oplog_path.exists() && !enchudb_oplog::oplog::OpLog::was_never_written(&oplog_path)? {
             let w = enchudb_oplog::oplog::OpLog::open(&oplog_path)?;
             // リカバリ: commit されたレコードを本体に適用
             // #77-H2 の順序に加えて: **未 commit tail も replay する**。
@@ -13951,7 +14015,8 @@ impl Engine {
         let crc_path = crate::integrity::crc_path_for(&path);
         let _ = std::fs::remove_dir_all(&crc_path); // v10: DB は directory
         let _ = std::fs::remove_file(&crc_path);
-        let wal = if oplog_path.exists() {
+        // #415: header が一度も書き出されていない oplog (作った直後に落ちた) は、 record も無いので作り直す
+        let wal = if oplog_path.exists() && !enchudb_oplog::oplog::OpLog::was_never_written(&oplog_path)? {
             let w = enchudb_oplog::oplog::OpLog::open(&oplog_path)?;
             // #77-H2 の順序に加えて: **未 commit tail も replay する**。
             // concurrent 経路は WAL append → body 適用 の順に流すので、 crash が

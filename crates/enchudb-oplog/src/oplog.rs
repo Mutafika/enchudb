@@ -845,7 +845,7 @@ impl OpLog {
         mmap[16..24].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes()); // checkpoint
         mmap[24..32].copy_from_slice(&(capacity as u64).to_le_bytes()); // capacity
 
-        Ok(Self {
+        let wal = Self {
             _file: file,
             mmap,
             capacity: capacity as u64,
@@ -863,7 +863,28 @@ impl OpLog {
             room_waiter: std::sync::RwLock::new(None),
             append_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
-        })
+        };
+        // #415: header をすぐ書き出す。 書き出さないと、 consumer の最初の fsync (100 ms) より前に落ちた時に header が
+        // 0 のまま残り、 `bad WAL magic` で開けない (開く側は 0 のままの header を作り直す: `was_never_written`)
+        wal.fsync()?;
+        Ok(wal)
+    }
+
+    /// #415: header が一度もディスクに届いていない oplog か (作った直後、 最初の書き出しより前に落ちた)。 そういう
+    /// file には record も無い (record は header と一緒に書き出す) ので、 開く側は無いものとして作り直してよい。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn was_never_written(path: &Path) -> io::Result<bool> {
+        use std::io::Read;
+        let mut head = [0u8; HEADER_SIZE];
+        let mut f = std::fs::File::open(path)?;
+        let mut n = 0;
+        while n < head.len() {
+            match f.read(&mut head[n..])? {
+                0 => return Ok(true), // header より短い
+                k => n += k,
+            }
+        }
+        Ok(head.iter().all(|&b| b == 0))
     }
 
     /// 既存 WAL を開く。v2 のみ対応。

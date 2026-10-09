@@ -29,6 +29,10 @@ pub const SCHEMA: &str = "schema";
 /// 未使用 region も 0 byte な v10 で、 切り詰めを stat だけで検出するための記録。
 pub const SEGMENTS: &str = "segments";
 
+/// #415: create の途中の印。 mkdir の直後に置き、 作った中身を全部書き出してから消す。 これが残っている directory は、
+/// 作る途中で落ちた残骸 (開けない、 create が片付けて作り直す)。 出来上がった DB には無いので [`ALL`] に入れない。
+pub const CREATING: &str = "creating";
+
 /// segment 以外に DB directory へ置かれ得る file 名の一覧 (migrate / copy 用)。
 pub const ALL: [&str; 8] = [OPLOG, TABLES, EIDMAP, VOCABMAP, CRC, LOCK, SCHEMA, SEGMENTS];
 
