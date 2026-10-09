@@ -72,3 +72,28 @@ fn clean_close_folds_so_reopen_does_not_bridge_again() {
     drop(eng);
     let _ = std::fs::remove_dir_all(&path);
 }
+
+/// bridge した行がまだ書き出されていない間は、 oplog を畳んでよいと言わない (書き出せば言う)。 本物の畳む所は先に書き出す
+/// (`write_out_bridged`) ので、 この判定はその書き出しと畳むの間に別の thread が bridge した時の安全網。
+#[test]
+fn fold_waits_until_bridged_rows_are_written_out() {
+    let path = std::env::temp_dir().join(format!("issue440_gate_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    let mut eng = Engine::create_with_cell_version(path.to_str().unwrap(), 65_536).unwrap();
+    eng.define_table("notes", 1_000).unwrap();
+    eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
+    eng.enable_sync_tables().unwrap();
+    let eng = Engine::concurrentize_with_oplog(eng, 4 << 20).unwrap();
+    for i in 0..10u32 {
+        let e = eng.entity_in("notes").unwrap();
+        eng.tie_to(e, "notes.note", i);
+    }
+    // oplog_sync は本体の書き出しの後に bridge するので、 返った時点で写した行は書き出されていない。 consumer の周期
+    // (100 ms) が間に書き出すと成り立たないので、 すぐに聞く
+    eng.oplog_sync().unwrap();
+    assert!(!eng.wal_fold_safe(), "bridge した行を書き出す前に畳んでよいと言った");
+    eng.body_msync().unwrap();
+    assert!(eng.wal_fold_safe(), "bridge した行を書き出した後も畳めない");
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&path);
+}
