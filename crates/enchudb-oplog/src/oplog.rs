@@ -1640,7 +1640,14 @@ impl OpLog {
     /// fsync(WAL 本体のみ)。consumer スレッドが定期実行。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn fsync(&self) -> io::Result<()> {
-        self.mmap.flush()
+        #[cfg(all(feature = "crashsim", unix))]
+        let sim = crate::crashsim::active().then(|| self.mmap.to_vec());
+        self.mmap.flush()?;
+        #[cfg(all(feature = "crashsim", unix))]
+        if let Some(bytes) = sim {
+            crate::crashsim::data_synced(&self._file, 0, &bytes);
+        }
+        Ok(())
     }
 
     #[cfg(target_arch = "wasm32")]

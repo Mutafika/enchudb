@@ -33,6 +33,11 @@
 pub mod keys;
 pub mod oplog;
 
+/// 電源断の模擬 (テスト専用、 feature `crashsim`)。 書き出しの済んだ page を控え、 page cache ごと
+/// 失った姿の像を作る。
+#[cfg(all(feature = "crashsim", unix))]
+pub mod crashsim;
+
 /// #280: `std::fs::File::lock` が `Unsupported` を返す platform (Android/bionic)
 /// 向けの file lock 吸収。 engine の writer lock もここを通る。
 #[cfg(not(target_arch = "wasm32"))]

@@ -9,6 +9,8 @@ authors = ["mutafika"]
 repository = "https://github.com/mutafika/enchudb"
 
 [features]
+# 電源断の模擬 (テスト専用、 tests/power_loss.rs)。 enchudb-oplog の crashsim を引く。
+crashsim = ["enchudb-oplog/crashsim"]
 # AsyncBlobStore trait + tokio-based default adapter。
 # S3 / HTTP / 遠隔ストア向け。引かない限り tokio / async-trait は依存に入らない。
 async-blob = ["dep:async-trait", "dep:tokio"]

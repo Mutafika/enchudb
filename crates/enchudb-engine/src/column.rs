@@ -242,6 +242,9 @@ impl Column {
         let current = u32::from_le_bytes(self.region.slice()[0..4].try_into().unwrap());
         if needed > current {
             self.region.write_at(0, &needed.to_le_bytes());
+            // #413: 印を付けないと concurrent の書き出し (`flush_dirty`) が header の page を msync しない。
+            // 電源断の後に count が古い値に戻り、 書き出し済みの cell が見えなくなる
+            self.region.mark_dirty(0, 4);
         }
     }
 
