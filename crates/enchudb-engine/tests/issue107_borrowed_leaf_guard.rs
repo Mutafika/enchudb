@@ -107,6 +107,32 @@ fn single_thread_write_then_borrow_is_allowed_on_concurrent_engine() {
     cleanup(&path);
 }
 
+/// #414: 書き換えの旧い slot は、 consumer の周期の書き出し (oplog の DB) の後で consumer の thread が空きに戻す。
+/// cell を付け替えたのは読み手と同じ thread なので、 1 本の thread で書いて読む使い方は止めない。
+#[test]
+fn old_slots_released_by_the_consumer_do_not_stop_a_single_thread() {
+    let path = tmp("released");
+    cleanup(&path);
+    let eng: Arc<Engine> = Engine::create_concurrent_with_oplog(&path, 4 << 20).expect("create");
+    let body = define(&eng, "body", ValueType::Leaf);
+    let e = eng.entity().unwrap();
+    eng.tie_text_to_by_id(e, body, "value-000");
+    let before = eng.leaf_footprint().unwrap();
+    for i in 1..=5 {
+        let v = format!("value-{i:03}");
+        eng.tie_text_to_by_id(e, body, &v);
+        // consumer の周期の書き出し (100 ms ごと) を待つ。 その後で consumer の thread が旧い slot を空きに戻す
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert_eq!(eng.get_text(e, "body"), Some(v.as_bytes()));
+    }
+    // consumer が空きに戻していれば、 同じ長さの書き換えは空いた slot を使い回す (Leaf 領域は 1 slot 分までしか
+    // 伸びない)。 戻していなければ 5 slot 分 (24 B × 5) 伸びる
+    let grown = eng.leaf_footprint().unwrap() - before;
+    assert!(grown < 48, "旧い slot が空きに戻っていない (伸び {grown} B) — consumer が空きに戻す経路を通っていない");
+    drop(eng);
+    cleanup(&path);
+}
+
 /// 書き終えてから複数の thread で読むだけ (読み手が何本でも、 書き手が居なければ借用は動かない)。
 #[test]
 fn many_reader_threads_after_writes_finished_are_allowed() {
