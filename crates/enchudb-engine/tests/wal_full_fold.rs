@@ -101,6 +101,7 @@ fn wal_full_mid_group_folds_after_bridge_drains() {
         }
         while eng.transfer_oplog_to_sync_ops() > 0 {}
         eng.oplog_sync().unwrap();
+        eng.body_msync().unwrap(); // #440: 畳むのは bridge した行を書き出した後
         if !eng.wal_fold_safe() {
             break; // 読み残し committed が残った = ring 満杯 (backpressure 成立)
         }
@@ -152,6 +153,7 @@ fn wal_full_mid_group_folds_after_bridge_drains() {
     }
     eng.ack_sync(7, eng.current_sync_lsn()).unwrap();
     eng.reclaim_sync_ops();
+    eng.body_msync().unwrap(); // #440: 畳むのは bridge した行を書き出した後
 
     // ── 本丸: 旧実装は offset < head（未 commit の孤児 tail）で fold を恒久拒否
     // = brick。 修正後は「append_dead + committed 残なし」で畳んでよい。
@@ -165,6 +167,7 @@ fn wal_full_mid_group_folds_after_bridge_drains() {
     // fold を実行（consumer tick が先に畳んでいてもよい）。
     if wal.append_dead() {
         eng.oplog_sync().unwrap();
+        eng.body_msync().unwrap(); // #440
         if eng.wal_fold_safe() && wal.try_reset() {
             eng.reset_sync_ops_offset();
         }
@@ -207,6 +210,9 @@ fn uncommitted_tail_with_room_blocks_fold() {
     // 書きかけ group（未 commit、 WAL には十分な余裕がある）。
     wal.append(Op::Tie { eid: e, himo_id: note_hid, value: 2 }).unwrap();
     while eng.transfer_oplog_to_sync_ops() > 0 {}
+    // #440: 畳むのは bridge した行を書き出した後。 書き出しておかないと、 下の 「畳めない」 が書きかけの group ではなく
+    // 書き出し待ちで成り立ってしまう
+    eng.body_msync().unwrap();
     assert!(!wal.append_dead(), "前提が崩れた: WAL に余裕があるはず");
     assert!(
         !eng.wal_fold_safe(),
@@ -216,6 +222,7 @@ fn uncommitted_tail_with_room_blocks_fold() {
     // 閉じれば bridge が読み切り、 fold してよくなる。
     wal.append(Op::Commit).unwrap();
     while eng.transfer_oplog_to_sync_ops() > 0 {}
+    eng.body_msync().unwrap(); // #440
     assert!(eng.wal_fold_safe(), "commit 後も fold 可能にならない");
 
     cleanup(&path);

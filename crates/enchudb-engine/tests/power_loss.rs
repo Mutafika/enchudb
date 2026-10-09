@@ -59,6 +59,9 @@ enum Kind {
     /// `Leaf` と同じ操作を concurrent + oplog の engine に同期の API (`tie_text_to` …) で書く (#419 / #429)。
     /// consumer の周期の書き出しと、 oplog_sync を回し続ける thread が書き手と並んで走る。 像は `Lost` だけ
     LeafSync,
+    /// `Oplog` と同じ書き込みを sync する DB (cell の版数 + `_sync_ops`) に書く。 書き出しが返った書き込みは、 開き
+    /// 直して bridge し直した後の配る分 (`pending_sync_ops`) に全部あること (相手の peer に届く)。 像は `Lost` だけ
+    Sync,
 }
 
 impl Kind {
@@ -68,12 +71,13 @@ impl Kind {
             Kind::Oplog => "oplog",
             Kind::Leaf => "leaf",
             Kind::LeafSync => "leaf_sync",
+            Kind::Sync => "sync",
         }
     }
     /// 書き出しが返る batch の数
     fn batches(self) -> u32 {
         match self {
-            Kind::Flush | Kind::Oplog => BATCHES,
+            Kind::Flush | Kind::Oplog | Kind::Sync => BATCHES,
             Kind::Leaf | Kind::LeafSync => LEAF_BATCHES,
         }
     }
@@ -83,6 +87,7 @@ impl Kind {
             "oplog" => Kind::Oplog,
             "leaf" => Kind::Leaf,
             "leaf_sync" => Kind::LeafSync,
+            "sync" => Kind::Sync,
             _ => panic!("unknown kind {s}"),
         }
     }
@@ -124,9 +129,18 @@ fn write_workload(kind: Kind, db: &str, acked: &AtomicU32) {
                 acked.store(b + 1, Ordering::Release);
             }
         }
-        Kind::Oplog => {
-            let mut eng = Engine::create_with_capacity(db, 65_536).unwrap();
+        Kind::Oplog | Kind::Sync => {
+            let mut eng = if kind == Kind::Sync {
+                // `_sync_ops` の枠は残りの eid 空間の半分。 全 batch の record (2.4 万) が ack 無しで入る大きさにする
+                // (入らない分は ack されるまで oplog で待つ)
+                Engine::create_with_cell_version(db, 262_144).unwrap()
+            } else {
+                Engine::create_with_capacity(db, 65_536).unwrap()
+            };
             define_schema(&mut eng);
+            if kind == Kind::Sync {
+                eng.enable_sync_tables().unwrap();
+            }
             eng.flush().unwrap();
             eng.persist_tables().unwrap();
             let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
@@ -143,6 +157,11 @@ fn write_workload(kind: Kind, db: &str, acked: &AtomicU32) {
                 }
                 eng.oplog_sync().unwrap();
                 acked.store(b + 1, Ordering::Release);
+            }
+            // WAL に載らずに落ちた record は配る分に無くてよい (floor を上げて相手に取り直させる、 #57)。 ここは落ちない
+            // 大きさの oplog で、 書き出しが返った書き込みが全部配る分にあることを見る
+            if kind == Kind::Sync {
+                assert_eq!(eng.wal_dropped_records(), 0, "WAL に載らずに落ちた record がある (oplog が小さい)");
             }
         }
         Kind::LeafSync => write_leaf_sync(db, acked),
@@ -357,7 +376,7 @@ fn verify_leaf(eng: &Engine, acked: u32) -> String {
 fn verify_image(kind: Kind, db: &str, acked: u32) -> String {
     let opened = match kind {
         Kind::Flush | Kind::Leaf => Engine::open_standalone(db).map(Arc::new),
-        Kind::Oplog | Kind::LeafSync => Engine::open_concurrent_with_oplog(db, OPLOG_CAP),
+        Kind::Oplog | Kind::LeafSync | Kind::Sync => Engine::open_concurrent_with_oplog(db, OPLOG_CAP),
     };
     let eng = match opened {
         Ok(e) => e,
@@ -392,6 +411,49 @@ fn verify_image(kind: Kind, db: &str, acked: u32) -> String {
                 && v != want
             {
                 return format!("化けた値: eid={i} h{h} got={v} want={want} (acked batch {acked})");
+            }
+        }
+    }
+    if kind == Kind::Sync {
+        return verify_sync_stream(&eng, acked);
+    }
+    String::new()
+}
+
+/// sync する DB: 書き出しが返った書き込みは、 開き直して bridge し直した後の配る分 (`pending_sync_ops`) に全部ある。
+fn verify_sync_stream(eng: &Engine, acked: u32) -> String {
+    use enchudb_oplog::oplog::{decode_sync_ops_payload, DecodedOp};
+    if acked == 0 {
+        return String::new(); // 書き出しが返った書き込みが無い (列もまだ届いていないことがある)
+    }
+    if let Err(e) = eng.oplog_sync() {
+        return format!("開いた後の oplog_sync が失敗: {e}");
+    }
+    while eng.transfer_oplog_to_sync_ops() > 0 {}
+    let hids: Vec<u16> = (0..HIMOS).map(|h| eng.himo_id(&format!("t.h{h}")).unwrap() as u16).collect();
+    let mut have = std::collections::HashSet::new();
+    let (mut rows, mut unreadable) = (0, 0);
+    for payload in eng.pending_sync_ops(0) {
+        rows += 1;
+        match decode_sync_ops_payload(&payload) {
+            Some(rec) => {
+                if let DecodedOp::Tie { eid, himo_id, value } = rec.op {
+                    have.insert((eid, himo_id, value));
+                }
+            }
+            None => unreadable += 1,
+        }
+    }
+    for i in 0..acked * BATCH {
+        for (h, &hid) in hids.iter().enumerate() {
+            if !have.contains(&(u64::from(i), hid, u64::from(value_of(i, h as u32)))) {
+                return format!(
+                    "書き出しが返った書き込みが配る分に無い: eid={i} h{h} (acked batch {acked}、 配る分 {rows} 行 / Tie {} 件、 \
+                     読めない payload {unreadable}、 壊れた行の掃除 {}、 sync lsn {})",
+                    have.len(),
+                    eng.sync_dead_rows_purged(),
+                    eng.current_sync_lsn()
+                );
             }
         }
     }
@@ -493,7 +555,7 @@ fn run(kind: Kind) {
         }
         // acked を先に読む: 像の控えはこの時点以降の書き出しを含む (acked は控えた後に進む)
         let a = acked.load(Ordering::Acquire);
-        let mode = if matches!(kind, Kind::Leaf | Kind::LeafSync) || n.is_multiple_of(2) {
+        let mode = if matches!(kind, Kind::Leaf | Kind::LeafSync | Kind::Sync) || n.is_multiple_of(2) {
             Mode::Lost
         } else {
             Mode::Mixed { seed: n }
@@ -627,6 +689,14 @@ fn sync_payload_ring_header_is_written_out_when_created() {
     let opened = PayloadRing::open_or_create(&img, 1 << 20, true);
     let _ = std::fs::remove_dir_all(&root);
     assert!(opened.is_ok(), "作った直後の像で ring を開けない: {:?}", opened.err());
+}
+
+#[test]
+fn power_loss_keeps_sync_records_of_synced_batches() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    run(Kind::Sync);
 }
 
 #[test]
