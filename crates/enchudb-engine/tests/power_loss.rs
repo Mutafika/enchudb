@@ -20,6 +20,7 @@
 #![cfg(all(feature = "crashsim", unix))]
 
 use enchudb_engine::engine::write_out_hook::{self, Phase};
+use enchudb_engine::sync_payload_ring::PayloadRing;
 use enchudb_engine::{Engine, ValueType};
 use enchudb_oplog::crashsim::{self, Mode};
 use std::path::{Path, PathBuf};
@@ -605,6 +606,29 @@ fn power_loss_keeps_values_rewritten_by_sync_writers() {
 /// いなかった頃は、 table の定義の sidecar を書き直した直後に作った列の page 0 に古い sidecar の控え
 /// (`TBL1`) が写り、 像を開くと列の header (value_size 1) として読んで panic した (CI の Linux だけ、
 /// 書き出しが返る前の像)。 番号を使い回さない FS (APFS) では元から起きない — ここは何も確かめずに通る。
+/// #441: sync の payload の ring は作った時に header を書き出す。 作った直後 (最初の本体の書き出しの前) に電源が落ちても
+/// ring を開ける (旧: header の無い file が残り、 以後ずっと bad magic で開けず、 payload を辞書に置いた)。
+#[test]
+fn sync_payload_ring_header_is_written_out_when_created() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("ring_header");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let ring = PayloadRing::open_or_create(&live, 1 << 20, false).unwrap();
+    let img = root.join("img");
+    let captured = crashsim::capture(&live, &img, Mode::Lost);
+    crashsim::stop();
+    drop(ring);
+    captured.unwrap();
+    let opened = PayloadRing::open_or_create(&img, 1 << 20, true);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(opened.is_ok(), "作った直後の像で ring を開けない: {:?}", opened.err());
+}
+
 #[test]
 fn capture_does_not_carry_sidecar_pages_into_reused_inode() {
     if std::env::var(VERIFY_ENV).is_ok() {
