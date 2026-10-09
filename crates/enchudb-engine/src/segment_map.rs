@@ -38,6 +38,11 @@ use std::ptr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+/// `SegmentMap::dirty` の空 (first = `u32::MAX` page、 last = 0 page)。
+const DIRTY_NONE: u64 = (u32::MAX as u64) << 32;
+/// `SegmentMap::dirty` の last (下位 32 bit)。
+const DIRTY_LAST_MASK: u64 = u32::MAX as u64;
+
 /// reservation を切り上げる単位。 **runtime の page size ではなく、 host が取りうる
 /// 最大の page size** を使う。 page size は host ごとに違い (Apple Silicon = 16 KiB /
 /// 大半の Linux = 4 KiB / 一部 arm64 Linux = 64 KiB)、 `create` は `initial.max(ps)` で
@@ -62,6 +67,20 @@ pub(crate) fn runtime_page_size() -> usize {
     let ps = if v > 0 { v as usize } else { 4096 };
     CACHED.store(ps, Ordering::Relaxed);
     ps
+}
+
+/// `runtime_page_size` の log2 (page 長は 2 の冪)。 書き込みの度に page 番号を出す `mark_dirty` 用。
+#[inline]
+fn runtime_page_shift() -> u32 {
+    use std::sync::atomic::AtomicU32;
+    static CACHED: AtomicU32 = AtomicU32::new(0);
+    let cur = CACHED.load(Ordering::Relaxed);
+    if cur != 0 {
+        return cur;
+    }
+    let shift = runtime_page_size().trailing_zeros();
+    CACHED.store(shift, Ordering::Relaxed);
+    shift
 }
 
 /// process 全体の grow 回数 / 所要時間 (bench / 診断用)。 grow は稀な経路なので atomic 2 本で十分。
@@ -296,8 +315,17 @@ pub struct SegmentMap {
     /// 伸長 / refresh の直列化 (#74 と同じ理由: stale な committed を読んだ 2 本目が
     /// ftruncate で縮めない)。
     grow_lock: Mutex<()>,
-    dirty_lo: AtomicUsize,
-    dirty_hi: AtomicUsize,
+    /// 書いた範囲 (`mark_dirty`)。 page 番号の [first, last] (両端を含む) を 1 語に詰める (上位 32 bit = first、
+    /// 下位 32 bit = last、 空は `DIRTY_NONE` = last < first)。 1 語なのは読みと取り出しを 1 回にするため: 旧実装は
+    /// lo / hi を別々の atomic に置き、 `flush_dirty` が別々に swap していたので、 間に入った `mark_dirty` の片方
+    /// だけを取り出し、 残りが 「hi <= lo = 空」 に化けた (その page は次にもっと後ろへ書くまで書き出されない)。
+    /// `mark_dirty` の 「もう範囲に入っている」 の判定も lo / hi を別々に読むので、 間に flush と別の印が挟まると
+    /// どちらの範囲にも入らない page を入っていると見て飛ばしえた。
+    dirty: AtomicU64,
+    /// `flush_dirty` を 1 本ずつにする。 後から来た flush が、 前の flush が取り出して msync している最中の
+    /// 範囲を 「空」 と見て返ると、 呼び側 (`oplog_sync` / consumer の周期 sync) がまだディスクに届いていない
+    /// page を前提に checkpoint を進める (電源断の模擬で、 `oplog_sync` の返った値が消えた)。
+    flush_lock: Mutex<()>,
     space_margin: AtomicU64,
     space_denials: AtomicU64,
     /// #317: この segment が `UNFLUSHED` に足している分。
@@ -431,8 +459,8 @@ impl SegmentMap {
             committed: AtomicUsize::new(committed),
             readonly,
             grow_lock: Mutex::new(()),
-            dirty_lo: AtomicUsize::new(usize::MAX),
-            dirty_hi: AtomicUsize::new(0),
+            dirty: AtomicU64::new(DIRTY_NONE),
+            flush_lock: Mutex::new(()),
             space_margin: AtomicU64::new(DEFAULT_SPACE_MARGIN.load(Ordering::Relaxed)),
             space_denials: AtomicU64::new(0),
             unflushed: AtomicU64::new(0),
@@ -750,17 +778,23 @@ impl SegmentMap {
             let hi = align_up(end, runtime_page_size()).min(self.committed());
             unsafe { std::slice::from_raw_parts(self.base.add(offset), hi - offset) }.to_vec()
         });
-        let rc = unsafe { libc::msync(self.base.add(offset) as *mut _, len, libc::MS_SYNC) };
-        // #317: macOS の msync は書き出しの失敗 (空き不足で書けなかった page) を返さない。 fsync は返す。
-        // 書き出しで消えうるのは空きが少ない時だけなので、 fsync はその時だけ (sync ごとの fsync は
-        // 10 万行 / 100 行ごとの oplog_sync で -21%。 空きの確認は fstatvfs 1 回)
-        let res = if rc < 0 {
-            Err(io::Error::last_os_error())
-        } else if self.space_is_low() {
-            self.fsync()
-        } else {
-            Ok(())
-        };
+        #[cfg(test)]
+        let hooked = tests::flush_hook(&self.path);
+        #[cfg(not(test))]
+        let hooked: io::Result<()> = Ok(());
+        let res = hooked.and_then(|()| {
+            let rc = unsafe { libc::msync(self.base.add(offset) as *mut _, len, libc::MS_SYNC) };
+            // #317: macOS の msync は書き出しの失敗 (空き不足で書けなかった page) を返さない。 fsync は返す。
+            // 書き出しで消えうるのは空きが少ない時だけなので、 fsync はその時だけ (sync ごとの fsync は
+            // 10 万行 / 100 行ごとの oplog_sync で -21%。 空きの確認は fstatvfs 1 回)
+            if rc < 0 {
+                Err(io::Error::last_os_error())
+            } else if self.space_is_low() {
+                self.fsync()
+            } else {
+                Ok(())
+            }
+        });
         match res {
             // 書き出した page はブロックが割り当て済み = 空きから引かれた
             Ok(()) => {
@@ -847,27 +881,57 @@ impl SegmentMap {
         if len == 0 {
             return;
         }
-        let ps = runtime_page_size();
-        let lo = offset & !(ps - 1);
-        let hi = align_up(offset + len, ps);
-        if self.dirty_lo.load(Ordering::Relaxed) <= lo
-            && self.dirty_hi.load(Ordering::Relaxed) >= hi
-        {
+        // 書き込みの度に通る: page 番号は shift で出し、 判定は 1 語の読み 1 回
+        let shift = runtime_page_shift();
+        let first = (offset >> shift) as u64;
+        let last = ((offset + len - 1) >> shift) as u64;
+        let cur = self.dirty.load(Ordering::Relaxed);
+        if cur >> 32 <= first && cur & DIRTY_LAST_MASK >= last {
             return;
         }
-        self.dirty_lo.fetch_min(lo, Ordering::Release);
-        self.dirty_hi.fetch_max(hi, Ordering::Release);
+        self.widen_dirty(cur, first, last);
+    }
+
+    /// `mark_dirty` の範囲を page [first, last] まで広げる。 範囲の外へ書いた時だけ通る (順に書くなら page を
+    /// またぐ時だけ) ので、 書き込みの度に通る部分 (`mark_dirty`) から外に出す。
+    #[cold]
+    #[inline(never)]
+    fn widen_dirty(&self, mut cur: u64, first: u64, last: u64) {
+        debug_assert!(last < u64::from(u32::MAX), "segment の page 番号が 32 bit を越えた");
+        loop {
+            let (cfirst, clast) = (cur >> 32, cur & DIRTY_LAST_MASK);
+            // 空 (clast < cfirst) の時、 min / max は [first, last] そのものになる
+            let next = if clast < cfirst { (first << 32) | last } else { (cfirst.min(first) << 32) | clast.max(last) };
+            if next == cur {
+                return;
+            }
+            match self.dirty.compare_exchange_weak(cur, next, Ordering::Release, Ordering::Relaxed) {
+                Ok(_) => return,
+                Err(now) => cur = now,
+            }
+        }
     }
 
     /// 直近 `mark_dirty` の範囲だけ msync して reset。
+    ///
+    /// 返った時、 呼ぶ前に印を付けた page は全部書き出してある (同時に走る別の flush が取り出していても、
+    /// それが終わるまで待つ)。 書き出しに失敗した範囲は印に戻す (戻さないと次の flush が 「空」 と見て
+    /// `Ok` を返し、 呼び側が checkpoint を進める)。
     pub fn flush_dirty(&self) -> io::Result<()> {
-        let lo = self.dirty_lo.swap(usize::MAX, Ordering::AcqRel);
-        let hi = self.dirty_hi.swap(0, Ordering::AcqRel);
-        if hi <= lo {
+        let _one_at_a_time = self.flush_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let d = self.dirty.swap(DIRTY_NONE, Ordering::AcqRel);
+        let (first, last) = (d >> 32, d & DIRTY_LAST_MASK);
+        if last < first {
             return Ok(());
         }
+        let ps = runtime_page_size();
+        let (lo, hi) = (first as usize * ps, (last as usize + 1) * ps);
         // 書いた page は mark_dirty で dirty の範囲に入るので、 ここで全部書き出される
-        self.flush_aligned_inner(lo, hi - lo, true)
+        let res = self.flush_aligned_inner(lo, hi - lo, true);
+        if res.is_err() {
+            self.mark_dirty(lo, hi - lo);
+        }
+        res
     }
 }
 
@@ -905,6 +969,120 @@ mod tests {
     }
 
     const MB: usize = 1024 * 1024;
+
+    type FlushHook = std::sync::Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
+    /// `flush_range` が msync の直前に呼ぶ hook (segment の path ごと。 並んで走る他の test の segment は素通り)。
+    /// Err を返すと書き出しの失敗を模す。
+    static FLUSH_HOOKS: Mutex<Vec<(PathBuf, FlushHook)>> = Mutex::new(Vec::new());
+
+    pub(super) fn flush_hook(path: &Path) -> io::Result<()> {
+        let hook = {
+            let hooks = FLUSH_HOOKS.lock().unwrap_or_else(|p| p.into_inner());
+            match hooks.iter().find(|(p, _)| p == path) {
+                Some((_, h)) => h.clone(),
+                None => return Ok(()),
+            }
+        };
+        hook()
+    }
+
+    fn set_flush_hook(path: &Path, hook: impl Fn() -> io::Result<()> + Send + Sync + 'static) {
+        let mut hooks = FLUSH_HOOKS.lock().unwrap_or_else(|p| p.into_inner());
+        hooks.retain(|(p, _)| p != path);
+        hooks.push((path.to_path_buf(), std::sync::Arc::new(hook)));
+    }
+
+    fn clear_flush_hook(path: &Path) {
+        FLUSH_HOOKS.lock().unwrap_or_else(|p| p.into_inner()).retain(|(p, _)| p != path);
+    }
+
+    /// #421: `flush_dirty` が 2 本同時に来たら、 後の方は前の方の msync が終わるまで返らない。 旧実装は
+    /// 前の方が範囲を取り出した後の 「空」 を見てすぐ `Ok` を返し、 呼び側 (`oplog_sync`) がまだディスクに
+    /// 届いていない page を前提に checkpoint を進めた (電源断の模擬で `oplog_sync` の返った値が消えた)。
+    /// 前の方を msync の直前で止め、 後の方がその間に返らないことを見る (旧実装では毎回すぐ返って落ちる)。
+    #[test]
+    fn concurrent_flush_dirty_waits_for_the_one_in_flight() {
+        use std::sync::mpsc;
+        let p = dir("concurrent_flush").join("seg");
+        let seg = std::sync::Arc::new(SegmentMap::create(&p, 4 * MB, 4 * MB).unwrap());
+        unsafe { *seg.base() = 1 };
+        seg.mark_dirty(0, 1);
+        let (inside_tx, inside_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (inside_tx, go_rx) = (Mutex::new(inside_tx), Mutex::new(go_rx));
+        set_flush_hook(&p, move || {
+            let _ = inside_tx.lock().unwrap().send(());
+            let _ = go_rx.lock().unwrap().recv();
+            Ok(())
+        });
+        let first = {
+            let seg = seg.clone();
+            std::thread::spawn(move || seg.flush_dirty())
+        };
+        inside_rx.recv().unwrap(); // 前の方は範囲を取り出し、 msync の直前で止まっている
+        let (done_tx, done_rx) = mpsc::channel();
+        let second = {
+            let seg = seg.clone();
+            std::thread::spawn(move || {
+                let r = seg.flush_dirty();
+                let _ = done_tx.send(());
+                r
+            })
+        };
+        let returned_early = done_rx.recv_timeout(std::time::Duration::from_millis(500)).is_ok();
+        go_tx.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        clear_flush_hook(&p);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        assert!(!returned_early, "後から来た flush_dirty が、 前の flush の msync が終わる前に返った");
+    }
+
+    /// #421: 書き出しに失敗した範囲は印に戻る。 旧実装は取り出した範囲を捨てたので、 次の flush が
+    /// 「空」 と見て `Ok` を返し、 呼び側 (consumer の周期 sync) が書き出していない page のまま checkpoint を
+    /// 進めた。
+    #[test]
+    fn failed_flush_dirty_keeps_the_range_marked() {
+        let p = dir("failed_flush").join("seg");
+        let seg = SegmentMap::create(&p, 4 * MB, 4 * MB).unwrap();
+        unsafe { *seg.base().add(3 * 4096) = 1 };
+        seg.mark_dirty(3 * 4096, 1);
+        let before = seg.dirty.load(Ordering::Acquire);
+        set_flush_hook(&p, || Err(io::Error::other("模した書き出しの失敗")));
+        assert!(seg.flush_dirty().is_err());
+        clear_flush_hook(&p);
+        assert_eq!(seg.dirty.load(Ordering::Acquire), before, "失敗した範囲が印に戻っていない");
+        seg.flush_dirty().unwrap();
+        assert_eq!(seg.dirty.load(Ordering::Acquire), DIRTY_NONE);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// 印は page 番号の範囲 [first, last] の和 (1 語に詰めても、 前後どちらに広げても範囲が合う)。
+    #[test]
+    fn mark_dirty_unions_page_ranges() {
+        let p = dir("mark_union").join("seg");
+        let seg = SegmentMap::create(&p, 64 * MB, 64 * MB).unwrap();
+        let ps = runtime_page_size() as u64;
+        // (first, last) の page 番号、 両端を含む
+        let range = |seg: &SegmentMap| {
+            let d = seg.dirty.load(Ordering::Acquire);
+            (d >> 32, d & DIRTY_LAST_MASK)
+        };
+        seg.mark_dirty(5 * ps as usize + 7, 1);
+        assert_eq!(range(&seg), (5, 5));
+        seg.mark_dirty(ps as usize - 1, 2); // page 0 と 1 にまたがる
+        assert_eq!(range(&seg), (0, 5));
+        seg.mark_dirty(40 * MB, 1);
+        assert_eq!(range(&seg), (0, 40 * MB as u64 / ps));
+        seg.mark_dirty(2 * ps as usize, 1); // 中に入る = 変わらない
+        assert_eq!(range(&seg), (0, 40 * MB as u64 / ps));
+        seg.flush_dirty().unwrap();
+        assert_eq!(seg.dirty.load(Ordering::Acquire), DIRTY_NONE);
+        seg.mark_dirty(6 * ps as usize, ps as usize); // ちょうど page 6 の 1 枚 (page 7 に触れない)
+        assert_eq!(range(&seg), (6, 6));
+        seg.flush_dirty().unwrap();
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
 
     /// #317: 一部の範囲だけの flush (header の先頭 16 byte など) は、 まだ flush していない分の数えを減らさない。
     /// 減らすのは、 その segment の書いた page が全部書き出される `flush_all` / `flush_dirty` の成功だけ。
