@@ -228,7 +228,13 @@ impl Column {
         if !self.region.is_committed(off + vs) {
             return;
         }
-        self.region.fill_at(off, vs, 0);
+        // #424: 値の cell は lock 無しの読み手が 1 回の atomic load で読む (`load_u32_acquire` / `load_u64_acquire`)。
+        // memset で消すと 1 byte ずつ書かれることがあり (macOS)、 途中の 「一部だけ 0」 を書いていない値として読む
+        match vs {
+            4 => self.region.as_atomic_u32(off).store(0, Ordering::Release),
+            8 => self.region.as_atomic_u64(off).store(0, Ordering::Release),
+            _ => self.region.fill_at(off, vs, 0),
+        }
         self.region.mark_dirty(off, vs);
     }
 
