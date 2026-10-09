@@ -13762,12 +13762,15 @@ impl Engine {
                 self.entities.ensure_live(local);
                 Self::advance_table_next_local_for(&self.tables, local);
             }
-            DecodedOp::TieLeaf { .. } => {
-                // 0.12.0 (#88): self-authored TieLeaf の recover は no-op。
-                // Leaf payload は LeafStore、 cell offset は himo 列、 どちらも mmap
-                // body として durable なので「既に local に在る」(Vocab と同思想)。
-                // 再 insert すると offset が変わり slot が二重化するため触らない。
-                // remote peer からの TieLeaf は sync crate の apply-one 経由で別 apply。
+            DecodedOp::TieLeaf { eid, himo_name, himo_kind, bytes } => {
+                // #429: 自分の TieLeaf も当て直す。 旧: 「payload も cell も本体にある」 として何もしなかったが、 同じ cell の
+                // Untie / Delete は当て直すので、 [Untie, TieLeaf] の順に並ぶと Untie だけが当たり、 本体に入っていた値ごと
+                // cell が空になった (cell の版数の無い DB は、 再生する record を全部受け入れる)。 bytes を入れ直して cell を
+                // 張り、 前の slot は空きに戻す (受信と同じ処理)。 版数のある DB は同じ HLC を弾くので二重にならない。
+                let ht = ValueType::from_byte(*himo_kind);
+                if let Ok(hid) = self.ensure_himo_by_full_name(himo_name, ht) {
+                    let _ = self.remote_tieleaf_apply(*eid, hid, bytes, hlc);
+                }
             }
             DecodedOp::TieRef { .. } => {
                 // #183: TieRef は bridge が `_sync_ops` 発送時に合成する op で、
