@@ -1910,6 +1910,15 @@ enum Backing {
 }
 
 impl Backing {
+    /// ディスクの file に書き出す backing か (Memory = packed / `from_bytes` は電源断と無縁)。
+    fn is_on_disk(&self) -> bool {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Backing::Segments(_) => true,
+            Backing::Memory(_) => false,
+        }
+    }
+
     /// #381: 辞書 2 つ (値の辞書 / 紐名の辞書) に header の上限を入れ、 辞書の segment の先回りの伸長を宣言 size で
     /// 止める (予約は宣言より広い、 `VOCAB_RESERVE_FACTOR`)。 作った時 / 開いた時 / `grow_vocab` の後に呼ぶ。
     fn apply_vocab_limits(&self, layout: &Layout, vocab: &Vocabulary, himo_reg: &Vocabulary) {
@@ -9785,10 +9794,35 @@ impl Engine {
         }
     }
 
+    /// cell が指さなくなった slot を返す ([`Engine::retire_leaf_slot`])。
     fn free_leaf_offset(&self, hid: usize, off: Option<u32>) {
         if let (Some(leaf), Some(off)) = (self.leaf_for(hid), off) {
-            leaf.free(off);
+            self.retire_leaf_slot(leaf, off);
         }
+    }
+
+    /// #414: cell が指さなくなった Leaf の slot (書き換えの旧い値 / untie / delete) を返す。 ディスクに書き出す DB では、
+    /// cell の付け替えが書き出されるまで空きに戻さない (`LeafStore::retire`、 本体の書き出しが `durable_end` で戻す)。
+    /// すぐ戻すと、 使い回した中身が付け替えより先にディスクに届いて、 電源断の後に書き出しの返った値が空 / 別の行の
+    /// 値になる。 一度も cell に載せていない slot (書き込みを断った新しい値) は `LeafStore::free` でよい。
+    fn retire_leaf_slot(&self, leaf: &LeafStore, off: u32) {
+        if !self.backing.is_on_disk() {
+            leaf.free(off);
+            return;
+        }
+        let waiting = leaf.retire(off);
+        if leaf.settle_due(waiting) {
+            self.settle_retired_leaves(leaf);
+        }
+    }
+
+    /// #414: 書き出しを待つ旧 Leaf slot が溜まった時に、 本体を書き出して空きに戻す。 consumer の居る DB は 100 ms
+    /// ごとに書き出すので普段は届かない。 consumer の無い書き手 (standalone / `&self` の `tie_*_to` だけの書き手) が
+    /// flush せずに書き換え続けた時の上限。 書き出すのは 1 本の thread だけ (他の thread は待たずに続ける)。
+    fn settle_retired_leaves(&self, leaf: &LeafStore) {
+        let Some(_one) = leaf.begin_settle() else { return };
+        let ok = self.body_msync().is_ok();
+        leaf.settle_finished(ok);
     }
 
     /// cell を外し、 routed-Leaf なら指していた slot を LeafStore に返す (leak 防止、 非 routed は外すだけ)。
@@ -10354,7 +10388,7 @@ impl Engine {
                 return;
             }
             self.live_set(hid, eid, off);
-            if let Some(old) = old { leaf.free(old); }
+            if let Some(old) = old { self.retire_leaf_slot(leaf, old); }
             return;
         }
         // Tag は dedupe (get_or_insert)、Leaf は新規 id 発行 (insert)。
@@ -10535,7 +10569,7 @@ impl Engine {
                 self.warn_local_write_rejected(eid, himo_id, hlc);
                 return Err(TieRejected::OlderThanCell);
             }
-            if let Some(old) = old { leaf.free(old); }
+            if let Some(old) = old { self.retire_leaf_slot(leaf, old); }
             return Ok(());
         }
         // Tag は dedupe、Leaf は常に新規 id。
@@ -10697,7 +10731,7 @@ impl Engine {
                 self.warn_local_write_rejected(eid, himo_id, hlc);
                 return;
             }
-            if let Some(old) = old { leaf.free(old); }
+            if let Some(old) = old { self.retire_leaf_slot(leaf, old); }
             return;
         }
         let vid = match self.value_types[hid] {
@@ -14617,7 +14651,12 @@ impl Engine {
         // `mark_dirty` を通さない EntitySet / header は全域 (小さい固定 segment)。
         match &self.backing {
             Backing::Segments(set) => {
+                // #414: 書き出しの前に積んだ旧 Leaf slot は、 書き出しが成功したら空きに戻せる
+                let leaf_token = self.leaf.as_ref().map(|l| l.durable_begin());
                 set.flush_dirty_all()?;
+                if let (Some(leaf), Some(t)) = (self.leaf.as_ref(), leaf_token) {
+                    leaf.durable_end(t);
+                }
                 // ring の payload も本体と同じ契機で書き出す (row だけ残って payload が消えると dead row になる)
                 if let Some(ring) = self.sync_payload_ring.get() {
                     ring.flush()?;
@@ -15085,7 +15124,10 @@ impl Engine {
                     // 不採用: cell は旧値のまま = 旧 payload はまだ生きている。
                     // 代わりに push 側が確保済みの **新** payload (= value) を捨てる
                     // (routed-Leaf 以外では no-op)。
-                    self.free_leaf_offset(hid, Some(value as u32)); // leaf の列は u32 (offset)
+                    // 一度も cell に載せていないので、 書き出しを待たずに空きへ (#414)
+                    if let Some(leaf) = self.leaf_for(hid) {
+                        leaf.free(value as u32); // leaf の列は u32 (offset)
+                    }
                     self.warn_local_write_rejected(eid, himo_id, hlc);
                 }
             }
@@ -15523,7 +15565,12 @@ impl Engine {
     /// `refs` = 参照数の file も閉じた時の cell と合っている (`seal_vocab_refs` 済み) → `CLEAN_REFS` を書く (#385)。
     #[cfg(not(target_arch = "wasm32"))]
     fn sync_and_mark_clean_with(&self, refs: bool) -> io::Result<()> {
+        // #414: 書き出しの前に積んだ旧 Leaf slot は、 書き出しが成功したら空きに戻せる
+        let leaf_token = self.leaf.as_ref().map(|l| l.durable_begin());
         self.backing.flush_to_disk()?;
+        if let (Some(leaf), Some(t)) = (self.leaf.as_ref(), leaf_token) {
+            leaf.durable_end(t);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(ring) = self.sync_payload_ring.get() {
             ring.flush()?;

@@ -46,12 +46,15 @@ fn leaf_retie_reclaims() {
     let fp1 = eng.leaf_footprint().expect("v6 は leaf region あり");
     assert!(fp1 > 0, "leaf footprint should grow after first tie");
 
-    // 同サイズで 50 回 re-tie → 毎回旧 slot を free → 再利用で footprint 不変
+    // 同サイズで 50 回 re-tie → 旧 slot は書き出し (flush) の後で空きに戻り (#414)、 次の re-tie が再利用する →
+    // footprint は re-tie の回数に比例して増えない (新旧 2 slot 分で止まる)
+    let mut fp2 = 0;
     for _ in 0..50 {
         eng.tie_text(eid, "notes.body", "bbbbb");
+        eng.flush().unwrap();
+        fp2 = fp2.max(eng.leaf_footprint().unwrap());
     }
-    let fp2 = eng.leaf_footprint().unwrap();
-    assert_eq!(fp1, fp2, "同サイズ re-tie で footprint が増えた = 回収されてない");
+    assert!(fp2 <= 2 * fp1, "同サイズ re-tie で footprint が増え続けた = 回収されてない (fp1={fp1}, max={fp2})");
     // vocab は依然 clean
     assert_eq!(eng.vocab_orphan_stats().vocab_total, 0);
 
@@ -74,8 +77,9 @@ fn leaf_remove_reclaims() {
     let fp_before = eng.leaf_footprint().unwrap();
     assert!(fp_before > 0);
 
-    // untie → 末尾 slot を free → footprint 後退 (旧: orphan として残置)
+    // untie → 末尾 slot を free → footprint 後退 (旧: orphan として残置)。 空きに戻すのは書き出しの後 (#414)
     eng.untie(eid, "notes.body");
+    eng.flush().unwrap();
     let fp_after = eng.leaf_footprint().unwrap();
     assert!(
         fp_after < fp_before,
@@ -128,13 +132,16 @@ fn leaf_churn_footprint_bounded() {
     assert_eq!(s.vocab_total, 0, "Leaf churn は vocab を汚さない");
     assert_eq!(s.orphan_vids, 0);
 
-    // 同サイズで更に churn → footprint 不変 (回収が効いている)
+    // 同サイズで更に churn → footprint は churn の回数に比例して増えない (回収が効いている)。 旧 slot は書き出し
+    // (flush) の後で空きに戻る (#414)
     let fp1 = eng.leaf_footprint().unwrap();
+    let mut fp2 = 0;
     for _ in 0..20 {
         eng.tie_text(eid, "n.v", "e");
+        eng.flush().unwrap();
+        fp2 = fp2.max(eng.leaf_footprint().unwrap());
     }
-    let fp2 = eng.leaf_footprint().unwrap();
-    assert_eq!(fp1, fp2, "churn で footprint が有界化していない");
+    assert!(fp2 <= 2 * fp1, "churn で footprint が有界化していない (fp1={fp1}, max={fp2})");
 
     cleanup(&path);
 }

@@ -82,11 +82,14 @@ fn reclaim_works_at_each_scale() {
         let e = eng.entity().unwrap();
         eng.tie_text(e, "body", "0123456789");
         let fp1 = eng.leaf_footprint().unwrap();
-        // 同サイズ 30 回 re-tie → 旧 slot を free して再利用 → footprint 不変
+        // 同サイズ 30 回 re-tie → 旧 slot を書き出し (flush) の後で free して (#414) 再利用 → footprint は新旧 2 slot 分で止まる
+        let mut fp2 = 0;
         for _ in 0..30 {
             eng.tie_text(e, "body", "9876543210");
+            eng.flush().unwrap();
+            fp2 = fp2.max(eng.leaf_footprint().unwrap());
         }
-        assert_eq!(eng.leaf_footprint().unwrap(), fp1, "{scale:?}: reclaim が効いていない");
+        assert!(fp2 <= 2 * fp1, "{scale:?}: reclaim が効いていない (fp1={fp1}, max={fp2})");
         cleanup(&path);
     }
 }

@@ -13,7 +13,8 @@
 //!
 //! - **reclaim (footprint 有界化)**: 死んだ slot を free-list に積み、 次の insert は
 //!   空きに緩く置く (best-fit)。 隣接空きは coalesce。 末尾に達した空きは high_water を
-//!   後退させて自由空間へ戻す。 **live は一切動かさない。**
+//!   後退させて自由空間へ戻す。 **live は一切動かさない。** cell が指さなくなった slot を
+//!   free-list に積むのは、 cell の付け替えがディスクに書き出された後 (`retire`、 #414)。
 //! - **compaction は本 store の責務外**: live を動かして file を OS へ縮めるのは
 //!   別レイヤの rare 保険 (steady churn では不要)。
 //!
@@ -50,7 +51,7 @@
 //! walk できる。 これにより reopen 時に「live cell 集合」を渡すだけで free-list を
 //! rebuild できる (free-list 自体は永続化しない = store の派生)。
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use crate::region::Region;
@@ -78,6 +79,9 @@ const HAS_GEN: u32 = 1;
 /// #132: hole (free 済み領域) の header に焼く gen。 **odd = 書込中/読むな** の既存規約に
 /// 乗せているので、 reader 側に新しい判定を足す必要がない。
 const HOLE_GEN: u32 = 1;
+/// #414: 書き出しを待つ旧 slot がこれ (と Leaf 領域の 1/4 の大きい方) を越えたら、 書き手が自分で本体を書き出す
+/// ([`LeafStore::settle_due`])。
+const RETIRED_SETTLE_MIN: u64 = 4 * 1024 * 1024;
 /// 最小 slot (空 payload = header のみ、 byte)。 これ未満の余りは hole にできない。
 const MIN_SLOT: usize = SLOT_HEADER;
 /// off_shift の上限 (16B align = 64GB)。 これ以上は padding 過大で不許可。
@@ -113,6 +117,33 @@ pub struct LeafStore {
     /// release build では空の型で、 読む所も消えるので dead_code の警告を止める。
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     borrow_watch: BorrowWatch,
+    /// #414: cell が指さなくなった slot を、 cell の付け替えがディスクに届くまで空きに戻さない ([`Retired`])。
+    retired: Mutex<Retired>,
+    /// #414: 溜まった旧 slot のために本体を書き出す thread を 1 本にする ([`LeafStore::begin_settle`])
+    settle: Mutex<()>,
+    /// #414: 前の書き出しが失敗した時の、 次に書き出す目安 (byte、 0 = 失敗していない)
+    settle_backoff: std::sync::atomic::AtomicU64,
+}
+
+/// #414: 書き出しを待つ旧 slot。
+///
+/// 電源断で page cache を失うと、 ディスクの上の cell は最後に書き出した時の slot を指している。 書き換え / untie /
+/// delete で cell が指さなくなった slot をすぐ空きに戻すと、 空きの印や使い回した別の値の中身が cell の付け替えより
+/// 先にディスクに届きうる (mmap の page をいつ・どの順で書くかは OS が決める)。 その後に落ちると、 書き出しの返った
+/// 値が空や別の行の値になる。
+///
+/// そこで、 空きに戻すのは **積んだ後に始まった本体の書き出し** ([`LeafStore::durable_begin`] → msync →
+/// [`LeafStore::durable_end`]) が成功した後にする。 その書き出しで cell の付け替えはディスクに届いている。 待って
+/// いる slot は永続化しない — 次の open の空き ([`LeafStore::rebuild_free_list`]) は live の slot の隙間から作るので、
+/// ここに残っていた slot も空きになる。
+#[derive(Default)]
+struct Retired {
+    /// `durable_begin` のたびに 1 進む
+    epoch: u64,
+    /// (積んだ時の epoch, word offset, byte 数)。 epoch の昇順
+    pending: VecDeque<(u64, u32, u32)>,
+    /// `pending` の byte 数の和
+    bytes: u64,
 }
 
 /// free hole の一覧 (word 単位)。 offset の順 (隣の空きとの結合) と、 大きさの順 (best-fit) の 2 つで持つ。
@@ -246,6 +277,9 @@ impl LeafStore {
             off_shift,
             gen_seq: std::sync::atomic::AtomicU32::new(0),
             borrow_watch: BorrowWatch::default(),
+            retired: Mutex::new(Retired::default()),
+            settle: Mutex::new(()),
+            settle_backoff: std::sync::atomic::AtomicU64::new(0),
         };
         let data_start = s.data_start_byte();
         // #167: init 時 (header 領域) の commit。 write 経路は `insert` 側で
@@ -287,6 +321,9 @@ impl LeafStore {
             off_shift,
             gen_seq: std::sync::atomic::AtomicU32::new(0),
             borrow_watch: BorrowWatch::default(),
+            retired: Mutex::new(Retired::default()),
+            settle: Mutex::new(()),
+            settle_backoff: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -651,28 +688,39 @@ impl LeafStore {
     pub fn free(&self, word_off: u32) {
         #[cfg(debug_assertions)]
         self.borrow_watch.note_write();
-        let mut hsize = self.b2w(self.slot_size_bytes_at(word_off) as usize);
+        self.free_slot(word_off);
+    }
 
-        // #132: 何よりも先に「この offset はもう読めない」を publish する。 coalesce で
-        // merged header の位置が前方 (poff) へ移ったり、 末尾で high_water が後退して
-        // header 自体を書かない経路に入っても、 **freed slot 自身の offset** を掴んだ
-        // stale reader は必ず Retry する。 gen 付き slot のみ (legacy 8B は payload 開始
-        // 位置が reader の legacy 分岐と一致するので誤読しない)。
-        {
-            let o = self.w2b(word_off);
-            let ss_raw = self.region.as_atomic_u32(o).load(Ordering::Relaxed);
-            if ss_raw & HAS_GEN != 0 {
-                self.region
-                    .as_atomic_u32(o + GEN_OFF)
-                    .store(HOLE_GEN, Ordering::Release);
-                // #414: coalesce で header が前の hole に移っても、 この offset の印は書き出す
-                self.region.mark_dirty(o + GEN_OFF, 4);
-            }
-        }
-
-        let mut hoff = word_off;
+    /// [`Self::free`] の本体。 #107 の記録 (書いた thread) は付けない: 書き出しの後で空きに戻す slot
+    /// ([`Self::durable_end`]) は、 cell を付け替えた thread が [`Self::retire`] で記録済み。 空きに戻すのは consumer /
+    /// 書き出しを呼んだ thread なので、 ここで記録すると 1 本の thread で書いて読む使い方まで 「別の thread が書いた」
+    /// になる。
+    fn free_slot(&self, word_off: u32) {
+        let hsize = self.b2w(self.slot_size_bytes_at(word_off) as usize);
+        self.mark_unreadable(word_off);
         let mut holes = self.holes.lock().unwrap_or_else(|p| p.into_inner());
+        self.insert_hole_locked(&mut holes, word_off, hsize);
+    }
 
+    /// #132: 空きに戻す slot に 「この offset はもう読めない」 を publish する (空きの一覧に入れる **前** に)。 coalesce で
+    /// merged header の位置が前方 (poff) へ移ったり、 末尾で high_water が後退して header 自体を書かない経路に入っても、
+    /// **freed slot 自身の offset** を掴んだ stale reader は必ず Retry する。 gen 付き slot のみ (legacy 8B は payload
+    /// 開始位置が reader の legacy 分岐と一致するので誤読しない)。
+    fn mark_unreadable(&self, word_off: u32) {
+        let o = self.w2b(word_off);
+        let ss_raw = self.region.as_atomic_u32(o).load(Ordering::Relaxed);
+        if ss_raw & HAS_GEN != 0 {
+            self.region
+                .as_atomic_u32(o + GEN_OFF)
+                .store(HOLE_GEN, Ordering::Release);
+            // #414: coalesce で header が前の hole に移っても、 この offset の印は書き出す
+            self.region.mark_dirty(o + GEN_OFF, 4);
+        }
+    }
+
+    /// `[off, off + hsize)` (word) を空きの一覧に入れる。 隣の空きと結合し、 末尾に達したら high_water を戻す。
+    fn insert_hole_locked(&self, holes: &mut Holes, off: u32, mut hsize: u32) {
+        let mut hoff = off;
         // 直前の隣接 hole と結合
         if let Some((poff, psize)) = holes.before(hoff)
             && poff + psize == hoff
@@ -702,6 +750,97 @@ impl LeafStore {
             self.region.mark_dirty(self.w2b(hoff), SLOT_HEADER_GEN);
             holes.insert(hoff, hsize);
         }
+    }
+
+    /// #414: 書き出しの後で空きに戻す slot (word offset, byte 数) をまとめて返す。 offset の順に並べ、 隣り合う slot は
+    /// 1 つの空きにまとめてから空きの一覧に入れる (retire の順 = ばらばらの offset で 1 つずつ入れると、 空きの一覧の木の
+    /// 違う所を毎回辿るので、 すぐ返す時の 1.6 倍かかった)。 #107 の記録は付けない ([`Self::free_slot`] と同じ理由)。
+    fn free_retired(&self, mut slots: Vec<(u32, u32)>) {
+        slots.sort_unstable();
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        for (off, size) in slots {
+            self.mark_unreadable(off);
+            let words = self.b2w(size as usize);
+            match runs.last_mut() {
+                Some((o, w)) if *o + *w == off => *w += words,
+                _ => runs.push((off, words)),
+            }
+        }
+        // lock は 1024 個ごとに取り直す (並行の insert を、 まとめて返す間ずっと待たせない)
+        for chunk in runs.chunks(1024) {
+            let mut holes = self.holes.lock().unwrap_or_else(|p| p.into_inner());
+            for &(off, words) in chunk {
+                self.insert_hole_locked(&mut holes, off, words);
+            }
+        }
+    }
+
+    /// #414: cell が指さなくなった slot を返す。 空きに戻すのは、 この後に始まった本体の書き出しが成功した後
+    /// ([`Self::durable_end`]、 [`Retired`])。 一度も cell に載せていない slot (書き込みを断った新しい slot) と、
+    /// ディスクに書き出さない store (Memory backing) は [`Self::free`] でよい。
+    ///
+    /// 返り値は書き出しを待っている byte 数 (書き出しの契機の無い書き手が、 自分で書き出すかを決める)。
+    pub fn retire(&self, word_off: u32) -> u64 {
+        #[cfg(debug_assertions)]
+        self.borrow_watch.note_write();
+        let size = self.slot_size_bytes_at(word_off);
+        let mut r = self.retired.lock().unwrap_or_else(|p| p.into_inner());
+        let e = r.epoch;
+        r.pending.push_back((e, word_off, size));
+        r.bytes += u64::from(size);
+        r.bytes
+    }
+
+    /// 本体の書き出し (msync) を始める前に呼ぶ。 返り値を、 書き出しが成功した後の [`Self::durable_end`] に渡す。
+    pub fn durable_begin(&self) -> u64 {
+        let mut r = self.retired.lock().unwrap_or_else(|p| p.into_inner());
+        let token = r.epoch;
+        r.epoch += 1;
+        token
+    }
+
+    /// [`Self::durable_begin`] が `token` を返した書き出しが成功した: それより前に積んだ slot を空きに戻す。 書き出しの
+    /// 前に cell を付け替えている (`retire` は付け替えの後) ので、 付け替えはディスクに届いている。 失敗した書き出しでは
+    /// 呼ばないこと (積んだままにして、 次の書き出しを待つ)。
+    pub fn durable_end(&self, token: u64) {
+        let done: Vec<(u32, u32)> = {
+            let mut r = self.retired.lock().unwrap_or_else(|p| p.into_inner());
+            let n = r.pending.iter().take_while(|&&(e, _, _)| e <= token).count();
+            let done: Vec<(u32, u32)> = r.pending.drain(..n).map(|(_, off, size)| (off, size)).collect();
+            r.bytes -= done.iter().map(|&(_, size)| u64::from(size)).sum::<u64>();
+            done
+        };
+        if !done.is_empty() {
+            self.free_retired(done);
+        }
+    }
+
+    /// #414: 書き出しを待っている byte 数 `waiting` ([`Self::retire`] の返り値) が、 書き手が自分で本体を書き出す目安を
+    /// 越えたか。 consumer の居る DB は 100 ms ごとに書き出すので普段は越えない。 目安は 4 MiB と Leaf 領域の 1/4 の
+    /// 大きい方 (待つ slot が Leaf 領域を何倍にも伸ばさない)。 前の書き出しが失敗していたら、 その時の 2 倍。
+    pub fn settle_due(&self, waiting: u64) -> bool {
+        let due = RETIRED_SETTLE_MIN
+            .max(self.high_water() / 4)
+            .max(self.settle_backoff.load(Ordering::Relaxed));
+        waiting >= due
+    }
+
+    /// 溜まった slot のために本体を書き出す thread を 1 本にする。 `None` = 他の thread が書き出している (待たない)。
+    pub fn begin_settle(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        self.settle.try_lock().ok()
+    }
+
+    /// [`Self::begin_settle`] の後の書き出しの結果。 失敗したら目安を今の 2 倍にする (失敗し続ける書き出しを、 書き
+    /// 換えのたびに繰り返さない)。
+    pub fn settle_finished(&self, ok: bool) {
+        let next = if ok { 0 } else { self.retired().1.saturating_mul(2) };
+        self.settle_backoff.store(next, Ordering::Relaxed);
+    }
+
+    /// 書き出しを待っている slot の (数, byte 数)。 test / stats 用。
+    pub fn retired(&self) -> (usize, u64) {
+        let r = self.retired.lock().unwrap_or_else(|p| p.into_inner());
+        (r.pending.len(), r.bytes)
     }
 
     /// reopen 用: live な slot **word offset** 集合を渡し、 free-list を再構成する。 free-list は永続化しない
@@ -1026,6 +1165,54 @@ mod tests {
             }
         }
         assert!(from_hole > 1_000, "空きから取る insert が少ない ({from_hole}) — 比べられていない");
+    }
+
+    /// #414: retire した slot は、 retire の **後に始まった** 書き出し (`durable_begin` → `durable_end`) まで空きに戻らない。
+    /// retire より前に始まった書き出しには cell の付け替えが載っていないかもしれない。
+    #[test]
+    fn retired_slot_waits_for_a_write_out_started_after_it() {
+        let s = make_store(64 * 1024);
+        let a = s.insert(b"aaaaaaaa");
+        let _keep = s.insert(b"keeps the high water above a");
+        let early = s.durable_begin();
+        s.retire(a);
+        s.durable_end(early);
+        assert_eq!(s.retired().0, 1, "retire より前に始まった書き出しで空きに戻った");
+        assert_eq!(s.free_bytes(), 0);
+
+        let t = s.durable_begin();
+        s.durable_end(t);
+        assert_eq!(s.retired(), (0, 0));
+        let hw = s.high_water();
+        let b = s.insert(b"bbbbbbbb");
+        assert_eq!((b, s.high_water()), (a, hw), "書き出しの後も空きに戻らない");
+    }
+
+    /// #414: 書き出しの後でまとめて空きに戻す時も、 (1) 返した offset は読めない (#132: 前の空きに結合されて header が
+    /// 書かれない offset も)、 (2) 隣り合う slot だけを 1 つの空きにまとめる (間に live の slot がある 2 つをまとめると、
+    /// live の slot が空きに入って使い回される)。
+    #[test]
+    fn retired_slots_freed_together_stay_unreadable_and_spare_live_slots() {
+        let s = make_store(64 * 1024);
+        let a = s.insert(&[b'a'; 40]);
+        let b = s.insert(&[b'b'; 40]); // a と隣り合う → a の空きに結合されて、 b には header が書かれない
+        let live = s.insert(&[b'l'; 40]);
+        let c = s.insert(&[b'c'; 40]);
+        let _keep = s.insert(b"keeps the high water above c");
+        for off in [c, a, b] {
+            s.retire(off); // 順不同で積む
+        }
+        let t = s.durable_begin();
+        s.durable_end(t);
+        for off in [a, b, c] {
+            assert!(matches!(s.try_read(off), LeafRead::Retry), "空きに戻した offset {off} が読める");
+        }
+        assert_eq!(s.get(live), &[b'l'; 40]);
+        // 空きを全部使い切っても live の slot は上書きされない
+        for _ in 0..3 {
+            s.insert(&[b'n'; 40]);
+        }
+        assert_eq!(s.get(live), &[b'l'; 40], "live の slot が空きに入って上書きされた");
     }
 
     #[test]

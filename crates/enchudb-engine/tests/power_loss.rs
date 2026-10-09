@@ -50,6 +50,8 @@ enum Kind {
     Flush,
     /// concurrent + oplog: tie_async → `oplog_sync()` が返ったら durable (open は oplog から recover)
     Oplog,
+    /// standalone で Leaf / Tag の値を書き換え・untie・delete する (#414)。 像は `Lost` だけ (下の `LEAF_*`)
+    Leaf,
 }
 
 impl Kind {
@@ -57,16 +59,21 @@ impl Kind {
         match self {
             Kind::Flush => "flush",
             Kind::Oplog => "oplog",
+            Kind::Leaf => "leaf",
         }
     }
     /// 書き出しが返る batch の数
     fn batches(self) -> u32 {
-        BATCHES
+        match self {
+            Kind::Flush | Kind::Oplog => BATCHES,
+            Kind::Leaf => LEAF_BATCHES,
+        }
     }
     fn parse(s: &str) -> Self {
         match s {
             "flush" => Kind::Flush,
             "oplog" => Kind::Oplog,
+            "leaf" => Kind::Leaf,
             _ => panic!("unknown kind {s}"),
         }
     }
@@ -129,19 +136,185 @@ fn write_workload(kind: Kind, db: &str, acked: &AtomicU32) {
                 acked.store(b + 1, Ordering::Release);
             }
         }
+        Kind::Leaf => {
+            let mut eng = Engine::create_with_capacity(db, 65_536).unwrap();
+            eng.define_table("t", 40_000).unwrap();
+            for (name, vt) in LEAF_HIMOS {
+                eng.define_himo_in("t", name, vt, 0).unwrap();
+            }
+            eng.flush().unwrap();
+            eng.persist_tables().unwrap();
+            let full: Vec<String> = LEAF_HIMOS.iter().map(|(n, _)| format!("t.{n}")).collect();
+            for (b, ops) in leaf_batches().into_iter().enumerate() {
+                for op in ops {
+                    match op {
+                        Op::New(i) => {
+                            let e = eng.entity_in("t").unwrap();
+                            assert_eq!(e, u64::from(i), "eid が連番でない");
+                        }
+                        Op::Set(e, h, Val::N(v)) => eng.tie(u64::from(e), &full[h], v),
+                        Op::Set(e, h, Val::T(t)) => eng.tie_text(u64::from(e), &full[h], &t),
+                        Op::Untie(e, h) => eng.untie(u64::from(e), &full[h]),
+                        Op::Delete(e) => eng.delete(u64::from(e)),
+                    }
+                }
+                eng.flush().unwrap();
+                eng.persist_tables().unwrap();
+                acked.store(b as u32 + 1, Ordering::Release);
+            }
+        }
     }
+}
+
+// ---- Leaf: standalone で Leaf / Tag の値を書き換える書き手と、 その oracle (#414) ----
+//
+// Leaf の書き換えは 「新しい slot に書く → cell を付け替える → 旧い slot を空きに戻す」。 旧い slot を同じ batch の
+// 新しい値が使い回し、 その中身が cell の付け替えより先にディスクに届くと (flush は Leaf 領域を列より先に msync
+// する)、 書き出しの返った値が空 / 別の行の値になる。 書き換えを batch の先に置いて、 空いた slot を同じ batch の
+// 新しい値が使い回すようにしている。
+//
+// 像は `Lost` だけ。 書き手は 1 本で flush の間は書かないので、 `Lost` の像では 「cell が中身より先に届く」 (#419) は
+// 起きない (flush は中身の segment を列より先に msync する)。 `Mixed` の像は page ごとに今の中身を混ぜるので #419 が
+// 混ざり、 #414 と見分けられない。
+
+const LEAF_BATCH: u32 = 150;
+const LEAF_BATCHES: u32 = 30;
+const LEAF_HIMOS: [(&str, ValueType); 3] =
+    [("n0", ValueType::Number), ("tg", ValueType::Tag), ("lf", ValueType::Leaf)];
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Val {
+    N(u64),
+    T(String),
+}
+
+enum Op {
+    New(u32),
+    Set(u32, usize, Val),
+    Untie(u32, usize),
+    Delete(u32),
+}
+
+fn mix(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// batch ごとの操作列 (決定的)。 前の batch の entity を書き換え / untie / delete してから、 新しい entity に 3 列を書く。
+/// 消した entity には以後触らない (eid は使い回されない: table の枠に余裕がある)。 Leaf の値は長さを変える。
+fn leaf_batches() -> Vec<Vec<Op>> {
+    let mut alive: Vec<bool> = Vec::new();
+    let mut out = Vec::new();
+    for b in 0..LEAF_BATCHES {
+        let mut ops = Vec::new();
+        let born = b * LEAF_BATCH;
+        if b > 0 {
+            for j in 0..60u64 {
+                let e = (mix((u64::from(b) << 16) | j) % u64::from(born)) as u32;
+                if !alive[e as usize] {
+                    continue;
+                }
+                match j % 10 {
+                    0..=5 => ops.push(Op::Set(e, 2, Val::T(format!("lf-{e}-{b}-{}", "x".repeat((j % 4) as usize * 20))))),
+                    6 => ops.push(Op::Set(e, 1, Val::T(format!("tag{}", (e + b) % 13)))),
+                    7 => ops.push(Op::Set(e, 0, Val::N(u64::from(e) * 7 + u64::from(b) * 100_000))),
+                    8 => ops.push(Op::Untie(e, 2)),
+                    _ => {
+                        ops.push(Op::Delete(e));
+                        alive[e as usize] = false;
+                    }
+                }
+            }
+        }
+        for k in 0..LEAF_BATCH {
+            let i = born + k;
+            alive.push(true);
+            ops.push(Op::New(i));
+            ops.push(Op::Set(i, 0, Val::N(u64::from(i) * 7 + u64::from(b))));
+            ops.push(Op::Set(i, 1, Val::T(format!("tag{}", i % 13))));
+            ops.push(Op::Set(i, 2, Val::T(format!("lf-{i}-{b}-{}", "y".repeat((i % 4) as usize * 20)))));
+        }
+        out.push(ops);
+    }
+    out
+}
+
+/// acked batch までの状態と、 それ以降に書いた値 (untie / delete は None) — 電源断の後に許される値。
+fn leaf_allowed(acked: u32) -> (Vec<[Option<Val>; 3]>, Vec<[Vec<Option<Val>>; 3]>) {
+    let total = (LEAF_BATCH * LEAF_BATCHES) as usize;
+    let mut state: Vec<[Option<Val>; 3]> = vec![Default::default(); total];
+    let mut later: Vec<[Vec<Option<Val>>; 3]> = vec![Default::default(); total];
+    for (b, ops) in leaf_batches().into_iter().enumerate() {
+        let after = b as u32 >= acked;
+        for op in ops {
+            let (e, h, v) = match op {
+                Op::New(_) => continue,
+                Op::Set(e, h, v) => (e as usize, h, Some(v)),
+                Op::Untie(e, h) => (e as usize, h, None),
+                Op::Delete(e) => {
+                    for h in 0..3 {
+                        if after {
+                            later[e as usize][h].push(None);
+                        } else {
+                            state[e as usize][h] = None;
+                        }
+                    }
+                    continue;
+                }
+            };
+            if after {
+                later[e][h].push(v);
+            } else {
+                state[e][h] = v;
+            }
+        }
+    }
+    (state, later)
+}
+
+fn verify_leaf(eng: &Engine, acked: u32) -> String {
+    let (state, later) = leaf_allowed(acked);
+    let full: Vec<String> = LEAF_HIMOS.iter().map(|(n, _)| format!("t.{n}")).collect();
+    for (e, cells) in state.iter().enumerate() {
+        for (h, want) in cells.iter().enumerate() {
+            let got = match LEAF_HIMOS[h].1 {
+                ValueType::Number => eng.get(e as u64, &full[h]).map(Val::N),
+                _ => eng
+                    .get_text_owned(e as u64, &full[h])
+                    .map(|b| Val::T(String::from_utf8_lossy(&b).into_owned())),
+            };
+            if &got == want || later[e][h].contains(&got) {
+                continue;
+            }
+            let what = if want.is_some() && !later[e][h].contains(&None) && got.is_none() {
+                "書き出しが返った値が消えた"
+            } else {
+                "許されない値"
+            };
+            return format!(
+                "{what}: eid={e} {} got={got:?} want={want:?} (以後に書いた値 {:?}、 acked batch {acked})",
+                full[h], later[e][h]
+            );
+        }
+    }
+    String::new()
 }
 
 /// 像を開いて確かめる。 空文字 = 合格。
 fn verify_image(kind: Kind, db: &str, acked: u32) -> String {
     let opened = match kind {
-        Kind::Flush => Engine::open_standalone(db).map(Arc::new),
+        Kind::Flush | Kind::Leaf => Engine::open_standalone(db).map(Arc::new),
         Kind::Oplog => Engine::open_concurrent_with_oplog(db, OPLOG_CAP),
     };
     let eng = match opened {
         Ok(e) => e,
         Err(e) => return format!("{OPEN_ERR}{e}"),
     };
+    if kind == Kind::Leaf {
+        return verify_leaf(&eng, acked);
+    }
     let must_have = acked * BATCH;
     for i in 0..BATCHES * BATCH {
         for h in 0..HIMOS {
@@ -255,7 +428,7 @@ fn run(kind: Kind) {
         }
         // acked を先に読む: 像の控えはこの時点以降の書き出しを含む (acked は控えた後に進む)
         let a = acked.load(Ordering::Acquire);
-        let mode = if n.is_multiple_of(2) { Mode::Lost } else { Mode::Mixed { seed: n } };
+        let mode = if kind == Kind::Leaf || n.is_multiple_of(2) { Mode::Lost } else { Mode::Mixed { seed: n } };
         let dir = root.join(format!("img{n:03}"));
         match crashsim::capture(&live, &dir, mode) {
             Ok(st) => images.push(Image { dir, acked: a, mode, divergent: st.divergent }),
@@ -338,6 +511,15 @@ fn power_loss_keeps_oplog_synced_batches() {
         return;
     }
     run(Kind::Oplog);
+}
+
+/// #414: Leaf の書き換えで旧い slot を空きに戻すのは、 cell の付け替えが書き出された後。
+#[test]
+fn power_loss_keeps_rewritten_leaf_values() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    run(Kind::Leaf);
 }
 
 /// crashsim の控えが、 rename で置き換えた sidecar の inode 番号を引き継いだ列の segment に写らない。
