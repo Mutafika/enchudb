@@ -472,6 +472,22 @@ impl SegmentSet {
         Ok(())
     }
 
+    /// `pick` が選んだ segment だけを msync する (`all` = commit 済み全域、 でなければ書いた範囲だけ)。 書き出しの順を
+    /// 段に分ける時に使う (#419: 中身 → 中身を指す列)。 `mark_dirty` を通さない store (EntitySet / header) は常に全域。
+    pub fn flush_where(&self, all: bool, pick: impl Fn(SegmentKind) -> bool) -> io::Result<()> {
+        for (k, s) in self.all() {
+            if !pick(k) {
+                continue;
+            }
+            match k {
+                SegmentKind::Header | SegmentKind::Entities => s.flush_all()?,
+                _ if all => s.flush_all()?,
+                _ => s.flush_dirty()?,
+            }
+        }
+        Ok(())
+    }
+
     pub fn flush_kind(&self, kind: SegmentKind, off: usize, len: usize) -> io::Result<()> {
         match self.segment(kind) {
             Some(s) => s.flush_aligned(off, len),
