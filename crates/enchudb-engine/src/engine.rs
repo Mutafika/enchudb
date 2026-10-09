@@ -10034,7 +10034,14 @@ impl Engine {
             );
             return RemoteApply::RejectedCapacity;
         }
-        self.set_cell_local(local, himo_id, value, hlc);
+        if !self.set_cell_local(local, himo_id, value, hlc) {
+            // #435: 行の lock を取るまでの間に入った新しい書き込みに版数で負けた。 cell は勝った書き込みの slot を指して
+            // いる (= `old`) ので触らない。 insert した slot は一度も cell に載せていないので、 すぐ空きに戻す
+            if let Some(leaf) = self.leaf_for(hid) {
+                leaf.free(value);
+            }
+            return RemoteApply::Stale;
+        }
         self.free_leaf_offset(hid, old);
         Self::advance_table_next_local_for(&self.tables, local);
         // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
