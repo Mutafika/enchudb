@@ -3661,6 +3661,8 @@ pub struct Engine {
     wal_dropped_records: std::sync::atomic::AtomicU64,
     /// #57: WAL に載らなかった record のために history floor を上げた回数。
     wal_drop_floor_bumps: std::sync::atomic::AtomicU64,
+    /// #451: 開く時に、 本体にあって oplog / `_sync_ops` に無かった自分の write を作り直した cell / 削除の数。
+    unlogged_writes_relogged: std::sync::atomic::AtomicU64,
     /// #57: まだ floor に入れていない、 WAL に載らなかった record (author, 落ちた HLC の max) と、
     /// 最初に落ちた時刻 / 最後に落ちたのを見た時刻 (unix ms)。 満杯の episode が終わったら (最後に落ちてから
     /// `WAL_DROP_EPISODE_QUIET_MS` 落ちなかったら) まとめて floor に入れる。
@@ -4100,6 +4102,7 @@ impl Engine {
             bridge_pending_records: std::sync::atomic::AtomicU64::new(0),
             wal_dropped_records: std::sync::atomic::AtomicU64::new(0),
             wal_drop_floor_bumps: std::sync::atomic::AtomicU64::new(0),
+            unlogged_writes_relogged: std::sync::atomic::AtomicU64::new(0),
             wal_drop_pending: std::sync::Mutex::new((Vec::new(), None)),
             wal_commit_failures: std::sync::atomic::AtomicU64::new(0),
             wal_append_warned: std::sync::atomic::AtomicBool::new(false),
@@ -5254,6 +5257,7 @@ impl Engine {
             bridge_pending_records: std::sync::atomic::AtomicU64::new(0),
             wal_dropped_records: std::sync::atomic::AtomicU64::new(0),
             wal_drop_floor_bumps: std::sync::atomic::AtomicU64::new(0),
+            unlogged_writes_relogged: std::sync::atomic::AtomicU64::new(0),
             wal_drop_pending: std::sync::Mutex::new((Vec::new(), None)),
             wal_commit_failures: std::sync::atomic::AtomicU64::new(0),
             wal_append_warned: std::sync::atomic::AtomicBool::new(false),
@@ -5308,13 +5312,7 @@ impl Engine {
             if vocab_reclaim && !eng.attach_vocab_refs() {
                 eng.vocab_recount_pending.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            eng.vocab.mark_index_clean(false);
-            eng.himo_reg.mark_index_clean(false);
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let _ = eng.backing.flush_kind(SegmentKind::VocabData, 0, 16);
-                let _ = eng.backing.flush_kind(SegmentKind::HimoregData, 0, 16);
-            }
+            eng.mark_session_dirty();
         }
 
         Ok(eng)
@@ -6238,6 +6236,13 @@ impl Engine {
     /// 見た時、 最初に落ちてから 5 秒経った時、 または閉じる時 (#449)。
     pub fn wal_drop_floor_bumps(&self) -> u64 {
         self.wal_drop_floor_bumps.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #451: この Engine を開いた時に、 本体にあって oplog / `_sync_ops` に無かった自分の write を作り直した
+    /// cell / 削除の数 (観測用)。 きれいに閉じた後は 0 (調べない)。 作り直せなかった時は floor を上げる
+    /// (`wal_drop_floor_bumps` には数えない)。
+    pub fn unlogged_writes_relogged(&self) -> u64 {
+        self.unlogged_writes_relogged.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Commit marker の append が失敗した回数（観測用）。 平常時は 0。
@@ -13944,6 +13949,8 @@ impl Engine {
             for rec in &records {
                 eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut vids);
             }
+            // #451: 本体にあって oplog / `_sync_ops` に無い自分の write を作り直して載せる (下の書き出しが届かせる)
+            eng.relog_unlogged_writes(&w);
             // #77-H2: 適用効果を disk に固めてから checkpoint を前進する。
             // 旧順序 (apply → 即 checkpoint) は kernel が checkpoint header を
             // body より先に writeback すると、 recovery 直後の再 crash で
@@ -13955,10 +13962,200 @@ impl Engine {
             }
             std::sync::Arc::new(w)
         } else {
-            std::sync::Arc::new(enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?)
+            let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
+            // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
+            if eng.relog_unlogged_writes(&w) && eng.body_msync().is_ok() && w.fsync().is_ok() {
+                w.advance_checkpoint(w.head());
+            }
+            std::sync::Arc::new(w)
         };
         eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog_queue_cap(eng, Some(wal), queue_capacity))
+    }
+
+    /// clean flag (#101) を倒して即書き出す。 書き始める前に呼ぶ: 立ったまま書いて落ちると、 次の open が 「きれいに閉じた」
+    /// と読んで、 辞書の索引の作り直し (#101) と、 本体にあって oplog に無い write の照合 (#451) を飛ばす。 立てるのは
+    /// きれいに閉じた時 (`sync_and_mark_clean_with`) だけ。 該当 page (辞書 / 紐名の data の header) だけ書き出すので
+    /// 1 ms 以下。
+    fn mark_session_dirty(&self) {
+        self.vocab.mark_index_clean(false);
+        self.himo_reg.mark_index_clean(false);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = self.backing.flush_kind(SegmentKind::VocabData, 0, 16);
+            let _ = self.backing.flush_kind(SegmentKind::HimoregData, 0, 16);
+        }
+    }
+
+    /// #451: きれいに閉じなかった後に開く時 (oplog の再生の後、 consumer を起こす前)、 本体にあって oplog / `_sync_ops`
+    /// に無い自分の write を作り直して `wal` に載せる。 何か書いたら (record / floor) true。
+    ///
+    /// 書き出しは 「oplog を fsync → 本体を msync」 の順で、 その間に書いた write は本体にだけ届きうる (OS が本体の
+    /// page を先に書き出した時も同じ)。 電源断の後、 その write は本体にあるのに bridge が `_sync_ops` に写さず、 相手に
+    /// 永久に届かない (#57 の落ちた write を floor に入れる前に落ちた時、 #450 の孤児の group も同じ形)。
+    ///
+    /// cell の版数 (v9) を、 配る経路が知っている自分の HLC (oplog の record、 `_sync_ops` の行、 floor 以下) と突き合わせる
+    /// — (peer, HLC) は record ごとに一意なので、 版数がどれにも無い cell は、 それを書いた record が届いていない:
+    ///
+    /// - 値のある cell / untie した cell: **新しい HLC** で record を作り、 cell の版数もその HLC に上げる。 元の HLC だと、
+    ///   Tag の語の record (Tie より前に置く) に付ける HLC が無く (transport は (peer, HLC) で record を一意に扱う)、
+    ///   相手の cursor が元の HLC を越えていると届かない
+    /// - delete: **元の HLC** のまま (新しい HLC にすると、 削除の後に書いた cell を相手側で消す)。 元の HLC が配った最大
+    ///   以下なら相手の cursor が越えているので、 作らずに floor を上げて取り直させる
+    /// - oplog に載らない (満杯) 時も floor を上げる (floor = 今 は自分の write を全部覆う)
+    ///
+    /// 対象外: 中継した他人の cell (版数の peer が自分でない — author の署名を作れない)、 配らない table (reserved)、
+    /// content。 作った record の署名は開いた時点の鍵 (まだ無いので署名なし — #140 の state 転写と同じ)。
+    fn relog_unlogged_writes(&self, wal: &enchudb_oplog::oplog::OpLog) -> bool {
+        use enchudb_oplog::Hlc;
+        use enchudb_oplog::oplog::Op;
+        // きれいに閉じたかは紐名の辞書の clean flag で見る (辞書 (vocab) の flag は、 一度も語を入れていない DB では
+        // 読めない — 空の辞書は header を書いていないので 「まっさら」 と読む)。 sync する DB は紐を必ず持つ
+        if !self.himo_reg.rebuilt_on_load || !self.has_cell_version() || !self.sync_tables_enabled() {
+            return false;
+        }
+        let me = self.peer_id();
+        // 配る経路が知っている自分の HLC
+        let mut known: std::collections::HashSet<Hlc> =
+            wal.records_with_tail().into_iter().filter(|r| r.author_peer == me).map(|r| r.hlc).collect();
+        if let Some(cols) = self.sync_payload_cols() {
+            for row in self.entities_with_himo(cols.lsn) {
+                if let Some((author, hlc)) = self
+                    .sync_op_payload(row, &cols)
+                    .and_then(|p| enchudb_oplog::oplog::sync_ops_payload_author_hlc(&p))
+                    && author == me
+                {
+                    known.insert(hlc);
+                }
+            }
+        }
+        let floor = self
+            .read_reclaimed_floor_entries()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(a, _)| *a == me || *a == u32::MAX)
+            .map(|(_, h)| h)
+            .max()
+            .unwrap_or(Hlc::ZERO);
+        // 相手の cursor (自分の author) はこれを越えない
+        let reached = known.iter().copied().max().unwrap_or(Hlc::ZERO).max(floor);
+        let unlogged = |h: Hlc| h != Hlc::ZERO && h.peer == me && h > floor && !known.contains(&h);
+        let mut cells: Vec<(Hlc, u32, usize)> = Vec::new();
+        for hid in 0..self.himos.len() {
+            if self.himo_is_in_reserved_table(hid) {
+                continue;
+            }
+            let Some(n) = self.ver_col(hid as u16).map(|c| c.count()) else { continue };
+            for local in 0..n {
+                let h = self.cell_hlc_local(local, hid as u16);
+                if unlogged(h) {
+                    cells.push((h, local, hid));
+                }
+            }
+        }
+        let mut deletes: Vec<(Hlc, u32)> = Vec::new();
+        if let Some(n) = self.tomb_col.as_ref().map(|c| c.count()) {
+            for local in 0..n {
+                let h = self.tombstone_hlc_local(local);
+                if unlogged(h) {
+                    deletes.push((h, local));
+                }
+            }
+        }
+        if cells.is_empty() && deletes.is_empty() {
+            return false;
+        }
+        wal.set_peer_id(me);
+        let mut relogged = 0u64;
+        let mut fallback = deletes.iter().any(|(h, _)| *h <= reached);
+        if !fallback {
+            // 新しい HLC は、 作り直す版数と配った版数より後に採番する
+            let top = cells.iter().map(|c| c.0).chain(deletes.iter().map(|d| d.0)).max().unwrap_or(Hlc::ZERO);
+            wal.observe_hlc(top.max(reached));
+            deletes.sort_unstable();
+            cells.sort_unstable();
+            for (h, local) in &deletes {
+                if wal.append_at_hlc(Op::Delete { eid: enchudb_oplog::make_eid(me, *local) }, *h).is_err() {
+                    fallback = true;
+                    break;
+                }
+                relogged += 1;
+            }
+            if !fallback {
+                // 語の record は語ごとに 1 つ
+                let mut vocab_sent = std::collections::HashSet::new();
+                for (_, local, hid) in &cells {
+                    match self.relog_cell(wal, me, *local, *hid, &mut vocab_sent) {
+                        Ok(true) => relogged += 1,
+                        Ok(false) => {}
+                        Err(_) => {
+                            fallback = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !fallback && wal.append(Op::Commit).is_err() {
+                fallback = true;
+            }
+        }
+        if fallback {
+            let now = wal.mint_hlc();
+            self.record_reclaimed_floors(&[(me, now)]);
+        }
+        self.unlogged_writes_relogged.store(relogged, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "[enchudb] open after an unclean shutdown: {} write(s) were on disk but not in the oplog / _sync_ops — {} (#451)",
+            cells.len() + deletes.len(),
+            if fallback { "raised the history floor so peers re-fetch the state" } else { "re-logged them" }
+        );
+        true
+    }
+
+    /// #451: cell の今の状態 (値 / 空) を新しい HLC の record にして `wal` に載せ、 cell の版数をその HLC に上げる。
+    /// Tag は語の record を前に置く (`vocab_sent` に無い語だけ)。 `Ok(false)` = 作らなかった (削除が後の untie は delete の
+    /// record が覆う)、 `Err` = 載らなかった (満杯)。
+    fn relog_cell(
+        &self,
+        wal: &enchudb_oplog::oplog::OpLog,
+        me: enchudb_oplog::PeerId,
+        local: u32,
+        hid: usize,
+        vocab_sent: &mut std::collections::HashSet<u32>,
+    ) -> io::Result<bool> {
+        use enchudb_oplog::oplog::Op;
+        let himo_id = hid as u16;
+        let eid = enchudb_oplog::make_eid(me, local);
+        let hlc = match self.himos[hid].get_value(local) {
+            None => {
+                if self.tombstone_hlc_local(local) >= self.cell_hlc_local(local, himo_id) {
+                    return Ok(false);
+                }
+                wal.append_with_hlc(Op::Untie { eid, himo_id })?.1
+            }
+            Some(value) => match self.value_types[hid] {
+                ValueType::Tag => {
+                    let vid = value as u32;
+                    if vocab_sent.insert(vid) {
+                        wal.append(Op::Vocab { vid, bytes: self.vocab.get(vid) })?;
+                    }
+                    wal.append_with_hlc(Op::Tie { eid, himo_id, value })?.1
+                }
+                ValueType::Leaf => {
+                    let Some(bytes) = self.text_owned_by_id(hid, local) else { return Ok(false) };
+                    wal.append_with_hlc(Op::TieLeaf {
+                        eid,
+                        himo_name: &self.himo_names[hid],
+                        himo_kind: ValueType::Leaf as u8,
+                        bytes: &bytes,
+                    })?
+                    .1
+                }
+                _ => wal.append_with_hlc(Op::Tie { eid, himo_id, value })?.1,
+            },
+        };
+        self.store_cell_hlc(local, himo_id, hlc);
+        Ok(true)
     }
 
     /// WAL の 1 op を本体に適用(recover 専用)。
@@ -14249,6 +14446,10 @@ impl Engine {
         let crc_path = crate::integrity::crc_path_for(&path);
         let _ = std::fs::remove_dir_all(&crc_path); // v10: DB は directory
         let _ = std::fs::remove_file(&crc_path);
+        // #451: clean flag を倒してから書き始める (writer の open と同じ)。 create → flush → ここ、 の DB は flag が立った
+        // まま (倒すのは open と辞書への insert だけ) で、 辞書に書かずに落ちると次の open が 「きれいに閉じた」 と読み、
+        // 本体にあって oplog に無い write を調べない (`relog_unlogged_writes`)
+        eng.mark_session_dirty();
         // #415: header が一度も書き出されていない oplog (作った直後に落ちた) は、 record も無いので作り直す
         let wal = if oplog_path.exists() && !enchudb_oplog::oplog::OpLog::was_never_written(&oplog_path)? {
             let w = enchudb_oplog::oplog::OpLog::open(&oplog_path)?;
@@ -14262,6 +14463,8 @@ impl Engine {
             for rec in &records {
                 eng.apply_oplog_op(&rec.op, rec.hlc, rec.author_peer, &mut vids);
             }
+            // #451: open_concurrent_with_oplog と同じ
+            eng.relog_unlogged_writes(&w);
             // #77-H2: body msync → checkpoint の順 (open_concurrent_with_oplog と同じ)
             // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
             if eng.body_msync().is_ok() && w.fsync().is_ok() {
@@ -14269,7 +14472,12 @@ impl Engine {
             }
             std::sync::Arc::new(w)
         } else {
-            std::sync::Arc::new(enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?)
+            let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
+            // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
+            if eng.relog_unlogged_writes(&w) && eng.body_msync().is_ok() && w.fsync().is_ok() {
+                w.advance_checkpoint(w.head());
+            }
+            std::sync::Arc::new(w)
         };
         eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog_queue_cap(eng, Some(wal), queue_capacity))

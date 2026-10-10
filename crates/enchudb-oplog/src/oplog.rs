@@ -223,6 +223,18 @@ pub fn decode_sync_ops_payload(payload: &[u8]) -> Option<Record> {
     })
 }
 
+/// #451: `_sync_ops` の payload から author と HLC だけを読む ([`decode_sync_ops_payload`] と同じ形の検査、 record は
+/// 組み立てない)。 読めない payload は None。
+pub fn sync_ops_payload_author_hlc(payload: &[u8]) -> Option<(PeerId, Hlc)> {
+    let sb = payload.get(SYNC_OPS_PAYLOAD_PREFIX..)?;
+    if sb.len() < SIGNED_PAYLOAD_HEADER_SIZE || &sb[0..2] != REC_MAGIC || !known_version(sb[OFF_VERSION]) {
+        return None;
+    }
+    let u32_at = |o: usize| u32::from_le_bytes(sb[o..o + 4].try_into().unwrap());
+    let wall = u64::from_le_bytes(sb[OFF_HLC_WALL..OFF_HLC_WALL + 8].try_into().unwrap());
+    Some((u32_at(OFF_AUTHOR_PEER), Hlc { wall, logical: u32_at(OFF_HLC_LOGICAL), peer: u32_at(OFF_HLC_PEER) }))
+}
+
 /// 0.11 (request10 / #76 逆写像): eid を書き換えて re-sign した record。
 /// bridge が `_sync_ops.payload` を組み立てるのに必要な 3 点セット。
 pub struct ResignedRecord {
@@ -1649,6 +1661,12 @@ impl OpLog {
         std::mem::take(&mut *self.dropped.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
+    /// #451: ring にある record を全部 (Commit で閉じた group と、 閉じていない末尾) 返す。 読むだけ (clock を戻さない)。
+    pub fn records_with_tail(&self) -> Vec<Record> {
+        let s = self.scan_from_offset(HEADER_SIZE as u64);
+        s.out.into_iter().chain(s.tail).map(|(r, _)| r).collect()
+    }
+
     /// #450: `start_offset` から先の、 Commit で閉じられていない record (閉じの Commit が満杯で入らなかった孤児の group) を、
     /// WAL に載らなかった record と同じに覚える ([`OpLog::take_dropped`] が返す)。 満杯の死区間で ring を畳む直前に呼ぶ —
     /// 畳むと二度と配れないので、 engine の bridge がその author の floor を上げる。 戻り値は覚えた record の数。
@@ -1673,7 +1691,7 @@ impl OpLog {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn fsync(&self) -> io::Result<()> {
         #[cfg(all(feature = "crashsim", unix))]
-        let sim = crate::crashsim::active().then(|| crate::crashsim::copy_for_sync(0, &self.mmap));
+        let sim = crate::crashsim::active().then(|| crate::crashsim::copy_for_sync(crate::crashsim::Copied::Oplog, 0, &self.mmap));
         self.mmap.flush()?;
         #[cfg(all(feature = "crashsim", unix))]
         if let Some(copy) = sim {

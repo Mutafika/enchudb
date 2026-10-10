@@ -23,7 +23,9 @@
 use enchudb_engine::engine::write_out_hook::{self, Phase};
 use enchudb_engine::sync_payload_ring::PayloadRing;
 use enchudb_engine::{Engine, ValueType};
-use enchudb_oplog::crashsim::{self, Mode};
+use enchudb_oplog::crashsim::{self, Copied, Mode};
+use enchudb_oplog::oplog::{decode_sync_ops_payload, DecodedOp, OpLog, Record};
+use enchudb_oplog::{eid_local, Hlc};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -758,6 +760,63 @@ fn capture_does_not_carry_sidecar_pages_into_reused_inode() {
     assert!(carried.is_empty(), "sidecar の控えが列の segment に写った: {carried:?}");
 }
 
+/// 別の thread の `oplog_sync` を oplog を写した直後 (fsync の中、 本体の書き出しの前) で止め、 その間に `during` を
+/// 走らせてから続けさせる (返るまで待つ)。
+///
+/// consumer も、 次に oplog を写した所で止め、 返した [`ConsumerHeld`] を drop するまで止めておく。 止めないと consumer の
+/// 周期の書き出しが `during` の write の record を oplog ごと届かせることがある (CI の少ない CPU では毎回届いた)。 止める
+/// 所 (周期の oplog の fsync) は lock を持たない。 WAL の空き作り (#388) は append の lock を持ったまま書き出すので、 WAL
+/// が埋まる試験では使わないこと。 `during` で queue の write (`tie_async` …) を待つと止まる。
+fn with_stalled_sync(eng: &Arc<Engine>, during: impl FnOnce()) -> ConsumerHeld {
+    let (copied_tx, copied_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let stall = std::sync::Mutex::new(Some((copied_tx, go_rx)));
+    let hold = std::sync::Mutex::new(Some(release_rx));
+    crashsim::set_after_copy_hook(Some(Arc::new(move |what| {
+        if what != Copied::Oplog {
+            return;
+        }
+        match std::thread::current().name() {
+            Some("stalled-sync") => {
+                let taken = stall.lock().unwrap().take();
+                if let Some((copied, go)) = taken {
+                    copied.send(()).unwrap();
+                    go.recv().unwrap();
+                }
+            }
+            Some("enchudb-consumer") => {
+                let taken = hold.lock().unwrap().take();
+                if let Some(release) = taken {
+                    let _ = release.recv();
+                }
+            }
+            _ => {}
+        }
+    })));
+    let stalled = {
+        let eng = eng.clone();
+        std::thread::Builder::new().name("stalled-sync".into()).spawn(move || eng.oplog_sync().unwrap()).unwrap()
+    };
+    copied_rx.recv().unwrap();
+    during();
+    go_tx.send(()).unwrap();
+    stalled.join().unwrap();
+    ConsumerHeld(Some(release_tx))
+}
+
+/// [`with_stalled_sync`] が止めた consumer を、 drop で放す (hook も外す)。 像を撮った後、 engine を drop する前に。
+struct ConsumerHeld(Option<std::sync::mpsc::Sender<()>>);
+
+impl Drop for ConsumerHeld {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.take() {
+            let _ = release.send(());
+        }
+        crashsim::set_after_copy_hook(None);
+    }
+}
+
 /// #446: oplog の書き出しが重なって、 先に写した方が後で終わっても、 控えを古い写しへ戻さない。
 ///
 /// oplog の fsync は consumer の周期 / `oplog_sync` の呼び手が同時に呼ぶ。 crashsim は fsync の前に写した中身を
@@ -787,40 +846,248 @@ fn overlapping_oplog_writes_do_not_roll_back_what_a_later_write_persisted() {
     eng.tie_text_to(e, "t.lf", "old");
     eng.oplog_sync().unwrap();
     eng.tie_text_to(e, "t.lf", "new");
-    // 別の thread の書き出しを、 oplog を写した直後で 1 度だけ止める
-    let (copied_tx, copied_rx) = std::sync::mpsc::channel::<()>();
-    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
-    let stall = std::sync::Mutex::new(Some((copied_tx, go_rx)));
-    crashsim::set_after_copy_hook(Some(Arc::new(move || {
-        if std::thread::current().name() != Some("stalled-sync") {
-            return;
-        }
-        let taken = stall.lock().unwrap().take();
-        if let Some((copied, go)) = taken {
-            copied.send(()).unwrap();
-            go.recv().unwrap();
-        }
-    })));
-    let stalled = {
-        let eng = eng.clone();
-        std::thread::Builder::new().name("stalled-sync".into()).spawn(move || eng.oplog_sync().unwrap()).unwrap()
-    };
-    copied_rx.recv().unwrap();
-    eng.untie(e, "t.lf");
-    // 書き出しが返った = この untie は電源断の後も残る
-    eng.oplog_sync().unwrap();
-    go_tx.send(()).unwrap();
-    stalled.join().unwrap();
-    crashsim::set_after_copy_hook(None);
+    let held = with_stalled_sync(&eng, || {
+        eng.untie(e, "t.lf");
+        // 書き出しが返った = この untie は電源断の後も残る
+        eng.oplog_sync().unwrap();
+    });
     let img = root.join("img");
     let captured = crashsim::capture(&live, &img, Mode::Lost);
     crashsim::stop();
+    drop(held);
     drop(eng);
     captured.unwrap();
     let got = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP)
         .map(|eng| eng.get_text_owned(e, "t.lf").map(|b| String::from_utf8_lossy(&b).into_owned()));
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(got.unwrap(), None, "書き出しの返った untie が電源断の像で消え、 前の値が戻った");
+}
+
+/// #451 の DB: sync する (cell の版数あり)、 note (Number) / tag (Tag) / body (Leaf)、 peer 1。
+fn notes_engine(db: &Path, oplog_cap: usize) -> Arc<Engine> {
+    let mut eng = Engine::create_with_cell_version(db.to_str().unwrap(), 65_536).unwrap();
+    eng.define_table("notes", 1_000).unwrap();
+    eng.define_himo_in("notes", "note", ValueType::Number, 0).unwrap();
+    eng.define_himo_in("notes", "tag", ValueType::Tag, 0).unwrap();
+    eng.define_himo_in("notes", "body", ValueType::Leaf, 0).unwrap();
+    eng.enable_sync_tables().unwrap();
+    eng.flush().unwrap();
+    eng.persist_tables().unwrap();
+    let eng = Engine::concurrentize_with_oplog(eng, oplog_cap).unwrap();
+    eng.set_peer_id(1);
+    eng
+}
+
+/// 配る分 (bridge し直した後の `pending_sync_ops`) の record。
+fn distributed(eng: &Engine) -> Vec<Record> {
+    eng.oplog_sync().unwrap();
+    while eng.transfer_oplog_to_sync_ops() > 0 {}
+    eng.pending_sync_ops(0).iter().filter_map(|p| decode_sync_ops_payload(p)).collect()
+}
+
+fn floor_of(eng: &Engine, author: u32) -> Option<Hlc> {
+    eng.sync_reclaimed_floors().unwrap_or_default().into_iter().find(|(a, _)| *a == author).map(|(_, h)| h)
+}
+
+/// #451: oplog の fsync と本体の書き出しの間に書いた write は、 電源断の後に本体にだけ残る (oplog に無い)。 開く時に
+/// 作り直して配る分に載せる (旧: 本体にあるのに相手に永久に届かなかった)。 値 (Number / Tag の新しい語 / Leaf)・
+/// untie・delete。 値と untie は新しい HLC で作り直して cell の版数もそれに上げ、 delete は元の HLC のまま。
+///
+/// 別の thread の `oplog_sync` を oplog を写した直後で止め、 その間に書き、 止めた方の本体の書き出しで届かせてから像を
+/// 撮る (consumer の oplog の書き出しも止めておく)。 それでも像の oplog にその record があれば前提が崩れているので撮り直す。
+#[test]
+fn writes_on_disk_before_their_oplog_record_are_relogged_after_power_loss() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    for attempt in 0..5 {
+        let root = scratch(&format!("unlogged{attempt}"));
+        let live = root.join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        crashsim::start();
+        let eng = notes_engine(&live.join("db"), OPLOG_CAP);
+        let [a, b, c, d, e] = [(); 5].map(|_| eng.entity_in("notes").unwrap());
+        eng.tie_to(a, "notes.note", 1);
+        eng.tie_to(e, "notes.note", 5);
+        eng.oplog_sync().unwrap();
+        let held = with_stalled_sync(&eng, || {
+            eng.tie_to(b, "notes.note", 22);
+            eng.tie_text_to(c, "notes.tag", "fresh-word");
+            eng.tie_text_to(d, "notes.body", "leaf body");
+            eng.untie(a, "notes.note");
+            eng.delete(e);
+        });
+        let img = root.join("img");
+        let captured = crashsim::capture(&live, &img, Mode::Lost);
+        crashsim::stop();
+        drop(held);
+        let hid = |n: &str| eng.himo_id(n).unwrap() as u16;
+        let (note, tag, body) = (hid("notes.note"), hid("notes.tag"), hid("notes.body"));
+        let before = [eng.cell_hlc(b, note), eng.cell_hlc(c, tag), eng.cell_hlc(d, body), eng.cell_hlc(a, note)];
+        let deleted_at = eng.tombstone_hlc(e);
+        drop(eng);
+        captured.unwrap();
+        let db = img.join("db");
+        // 前提: 像の oplog にこの write の record が無い
+        let in_oplog = OpLog::open(&db.join("oplog"))
+            .unwrap()
+            .records_with_tail()
+            .iter()
+            .filter(|r| before.contains(&r.hlc) || r.hlc == deleted_at)
+            .count();
+        if in_oplog > 0 {
+            eprintln!("[unlogged] 撮り直す ({attempt} 回目): consumer の書き出しが先に oplog を届かせた");
+            let _ = std::fs::remove_dir_all(&root);
+            continue;
+        }
+        let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
+        let text = |e: u64, n: &str| eng.get_text_owned(e, n).map(|t| String::from_utf8_lossy(&t).into_owned());
+        // 前提: 本体には届いている
+        assert_eq!(eng.get(b, "notes.note"), Some(22), "前提: 本体に届いている");
+        assert_eq!(text(c, "notes.tag").as_deref(), Some("fresh-word"));
+        assert_eq!(text(d, "notes.body").as_deref(), Some("leaf body"));
+        assert_eq!(eng.get(a, "notes.note"), None);
+        assert!(!eng.is_live(e));
+        assert_eq!(eng.unlogged_writes_relogged(), 5, "本体にあって oplog に無い write を作り直していない");
+        let after = [eng.cell_hlc(b, note), eng.cell_hlc(c, tag), eng.cell_hlc(d, body), eng.cell_hlc(a, note)];
+        assert!(before.iter().zip(&after).all(|(x, y)| y > x), "値と untie は新しい HLC: {before:?} → {after:?}");
+        let recs = distributed(&eng);
+        let find = |pred: &dyn Fn(&DecodedOp) -> bool| recs.iter().find(|r| pred(&r.op)).map(|r| r.hlc);
+        let local = |x: u64, y: &u64| eid_local(x) == eid_local(*y);
+        let vid = eng.get(c, "notes.tag").unwrap();
+        assert_eq!(
+            find(&|op| matches!(op, DecodedOp::Tie { eid, himo_id, value } if local(b, eid) && *himo_id == note && *value == 22)),
+            Some(after[0]),
+            "Number の値が配る分に無い"
+        );
+        let vocab_hlc = find(&|op| matches!(op, DecodedOp::Vocab { bytes, .. } if bytes == b"fresh-word"));
+        let tie_hlc = find(&|op| matches!(op, DecodedOp::Tie { eid, himo_id, value } if local(c, eid) && *himo_id == tag && *value == vid));
+        assert!(vocab_hlc.is_some() && tie_hlc == Some(after[1]) && vocab_hlc < tie_hlc, "Tag の語と値: {vocab_hlc:?} {tie_hlc:?}");
+        assert_eq!(
+            find(&|op| matches!(op, DecodedOp::TieLeaf { eid, himo_name, bytes, .. } if local(d, eid) && himo_name == "notes.body" && bytes == b"leaf body")),
+            Some(after[2]),
+            "Leaf の値が配る分に無い"
+        );
+        assert_eq!(
+            find(&|op| matches!(op, DecodedOp::Untie { eid, himo_id } if local(a, eid) && *himo_id == note)),
+            Some(after[3]),
+            "untie が配る分に無い"
+        );
+        assert_eq!(find(&|op| matches!(op, DecodedOp::Delete { eid } if local(e, eid))), Some(deleted_at), "delete は元の HLC で");
+        assert_eq!(floor_of(&eng, 1), None, "作り直せたので floor は上げない");
+        drop(eng);
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
+    panic!("5 回とも consumer の書き出しが先に oplog を届かせ、 前提を作れなかった");
+}
+
+/// #451: 本体にある write が全部 oplog か配る分 (`_sync_ops`) にある電源断の像と、 きれいに閉じた後は、 何も作り直さない
+/// (配った record を新しい HLC で重ねて配らない)。 像は 2 枚: `oplog_sync` の直後 (record は oplog にだけある — 写した
+/// `_sync_ops` の行はまだ書き出していない) と、 oplog を畳んだ後 (record は `_sync_ops` にだけある)。
+#[test]
+fn nothing_is_relogged_when_every_write_on_disk_is_in_the_oplog() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("logged");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let db = live.join("db");
+    crashsim::start();
+    let eng = notes_engine(&db, OPLOG_CAP);
+    let [a, b, c] = [(); 3].map(|_| eng.entity_in("notes").unwrap());
+    eng.tie_to(a, "notes.note", 1);
+    eng.tie_text_to(b, "notes.tag", "word");
+    eng.tie_text_to(c, "notes.body", "leaf");
+    eng.oplog_sync().unwrap();
+    eng.untie(a, "notes.note");
+    eng.delete(b);
+    eng.oplog_sync().unwrap();
+    let in_oplog = crashsim::capture(&live, &root.join("img_oplog"), Mode::Lost);
+    // 畳ませる
+    let wal = eng.oplog().unwrap().clone();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while wal.head() != enchudb_oplog::oplog::HEADER_SIZE as u64 {
+        assert!(std::time::Instant::now() < deadline, "前提: 5 秒で oplog を畳まない (head {})", wal.head());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    drop(wal);
+    // 畳んだ ring (先頭に戻した header) を書き出す。 書き出すまでディスクの oplog には畳む前の record が残っている
+    eng.oplog_sync().unwrap();
+    let in_sync_ops = crashsim::capture(&live, &root.join("img_sync_ops"), Mode::Lost);
+    crashsim::stop();
+    drop(eng);
+    for (name, captured) in [("img_oplog", in_oplog), ("img_sync_ops", in_sync_ops)] {
+        captured.unwrap();
+        let eng = Engine::open_concurrent_with_oplog(root.join(name).join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+        assert_eq!(eng.unlogged_writes_relogged(), 0, "{name}: 届いている write を作り直した");
+        assert_eq!(floor_of(&eng, 1), None, "{name}");
+    }
+    // きれいに閉じた後は調べない
+    let eng = Engine::open_concurrent_with_oplog(db.to_str().unwrap(), OPLOG_CAP).unwrap();
+    assert_eq!(eng.unlogged_writes_relogged(), 0, "きれいに閉じた後に作り直した");
+    assert_eq!(floor_of(&eng, 1), None);
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// #451 / #449: WAL が満杯で載らなかった write (#57) は、 floor を上げる前に電源が落ちると本体にだけ残る。 開く時に
+/// 作り直そうとしても oplog が満杯なら、 floor を上げて相手に取り直させる (floor = 開いた時の今 は落ちた write を覆う)。
+#[test]
+fn writes_dropped_from_a_full_wal_are_covered_by_a_floor_after_power_loss() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("dropped");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    crashsim::start();
+    let eng = notes_engine(&live.join("db"), 64 * 1024);
+    let note = eng.himo_id("notes.note").unwrap() as u16;
+    let wal = eng.oplog().unwrap().clone();
+    // 満杯の書き手を待たせず (#388) 畳ませずに、 WAL に載らない write を作る
+    wal.set_room_waiter(None);
+    let mut dropped = Vec::new();
+    let img = root.join("img");
+    let captured = {
+        let _no_fold = eng.transfer_lock_for_fold();
+        // 閉じた group で WAL を埋め、 残りを 100 B (Tie 128 B も Commit 112 B も入らない) にする。 TieLeaf の record は
+        // 文字列の長さ + c B
+        let e0 = eng.entity_in("notes").unwrap();
+        let h0 = wal.head();
+        eng.tie_text_to(e0, "notes.body", "x");
+        let c = wal.head() - h0 - 1;
+        eng.oplog_commit();
+        let pad = wal.free_bytes() - 112 - 100 - c;
+        let e1 = eng.entity_in("notes").unwrap();
+        eng.tie_text_to(e1, "notes.body", &"p".repeat(pad as usize));
+        eng.oplog_commit();
+        assert_eq!(wal.free_bytes(), 100, "前提: 残り 100 B");
+        for i in 0..5u32 {
+            let head = wal.head();
+            let e = eng.entity_in("notes").unwrap();
+            eng.tie_to(e, "notes.note", i);
+            assert_eq!(wal.head(), head, "前提: WAL に載らない");
+            dropped.push(eng.cell_hlc(e, note));
+        }
+        // 落ちた write は本体にだけ届く (floor を上げる bridge は畳む lock で止めている)
+        wal.fsync().unwrap();
+        eng.body_msync().unwrap();
+        crashsim::capture(&live, &img, Mode::Lost)
+    };
+    crashsim::stop();
+    drop((wal, eng));
+    captured.unwrap();
+    let eng = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), 64 * 1024).unwrap();
+    let max_dropped = dropped.into_iter().max().unwrap();
+    let floor = floor_of(&eng, 1);
+    assert!(floor.is_some_and(|f| f >= max_dropped), "落ちた write {max_dropped:?} を floor {floor:?} が覆わない");
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// #419: 本体の書き出し (`body_msync`) の途中で並行の書き手が中身と cell を書いても、 cell だけがディスクに届くことは
