@@ -24,7 +24,7 @@
 //! [`STRIPES`]) を取る (古い値と新しい値の 2 本、 番号の小さい方から)。 同じ entity の記録を書くのは、 その entity の
 //! 書き手 = 行の lock を握っている thread だけ (engine の全部の書き込みの道が行の lock の下で `live_set` /
 //! `live_remove` を呼ぶ)。 記録は置き場の鍵の下で書く (詰め直しが同じ鍵の下で他の entity の記録を読むので)。
-//! 会社の紐の write_lock は作る前の確認にしか使わない — 年齢の書き手どうしは、 違う会社の社員なら待たない
+//! 紐の write_lock は作る時にしか使わない — 年齢の書き手どうしは、 違う会社の社員なら待たない
 //! (2026-10-10: 全部を via の write_lock で並べた版は、 年齢の書き手 4 本で 1 回 0.66 → 1.9 µs になった)。
 //!
 //! stale が bucket の半分を超えたら、 記録で残すものを決めて詰め直す (同じ置き場の鍵の下)。
@@ -44,11 +44,16 @@
 //!
 //! ## 作る
 //!
-//! 遅延: 最初に読む時に、 via の write_lock の下で via の列をなめて全部 `place` する (円柱の遅延構築 #270 と同じく、
-//! 作る前の書き込みは何もしない)。 書き手は 「作ったか」 を見て、 作っていなければ via の write_lock の下でもう一度見る
-//! (作る側はその lock の下で列をなめるので、 見落としが無い。 `tests/loom_order_index_build.rs`)。 葉が置く entity の数に
+//! 遅延: 最初に読む時に、 via と key の紐の write_lock を両方取って (この順。 書き手が列を書く間に持つのはどちらか
+//! 1 本だけ)、 via の列をなめて全部 `place` する (円柱の遅延構築 #270 と同じく、 作る前の書き込みは何もしない)。
+//! 書き手は列を (その紐の write_lock の下で) 書いた後に 「作ったか」 を見て、 作っていなければ何もしない: 作る側が
+//! lock を取る前に書いた列はなめる時に読まれ、 lock を離した後に書いた書き手には 「作った」 が見える
+//! (`tests/loom_order_index_build.rs`)。 宣言を足した直後の書き込みも、 同じ理由で見落とさない。 葉が置く entity の数に
 //! 比べて多すぎる (値が散っている) か、 置き場の番号に入らない値 (`base` より前 = ref の先の表の外) が来たら索引をやめる
 //! (`disabled`)。 やめた後の読みは None (呼び手は普通の逆引きを使う)。
+//!
+//! 宣言を外す / 置き換える時は、 古い索引に `retired` を立てる (読みにも置き直しにも使わない)。 読み手が持っている
+//! 参照を壊さないよう、 枠と中身は閉じるまで残す。
 
 use crate::append_bucket::AppendBucket;
 use crate::lockfree_cylinder::Slot;
@@ -249,6 +254,8 @@ pub(crate) struct OrderIndex {
     planned: AtomicUsize,
     built: AtomicBool,
     disabled: AtomicBool,
+    /// 外した (宣言を外した / 置き換えた)。 一度立てたら戻さない。
+    retired: AtomicBool,
     /// 計測: 読んだ回数と、 読んだ entity の数 (stale 込み)。
     hits: AtomicU64,
     read: AtomicU64,
@@ -276,6 +283,7 @@ impl OrderIndex {
             planned: AtomicUsize::new(0),
             built: AtomicBool::new(false),
             disabled: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
             hits: AtomicU64::new(0),
             read: AtomicU64::new(0),
         }
@@ -356,6 +364,15 @@ impl OrderIndex {
 
     pub(crate) fn is_disabled(&self) -> bool {
         self.disabled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
+
+    /// 外す (`LiveRegistry` が宣言を外す / 置き換える時)。 以後の読みと置き直しはこの索引を使わない。
+    pub(crate) fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
     }
 
     /// 番号 `s` の置き場に葉が要る時、 置いてよいか。 葉が置く entity の数に比べて多すぎる (値が散っている) なら false。
