@@ -383,6 +383,11 @@ impl HimoStore {
         }
     }
 
+    /// この紐の write_lock を取る (並びの索引 `OrderIndex` の置き直し・作る時。 via の紐の書き手と直列にする)。
+    pub(crate) fn write_guard(&self) -> MutexGuard<'_, ()> {
+        self.write_lock.lock()
+    }
+
     /// write_lock を 1 度取って離すだけ。 これより前に lock を離した書き込みは全て見える
     /// (live query の登録 barrier、 `crate::live` module doc)。
     pub fn write_barrier(&self) {
