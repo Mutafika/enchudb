@@ -210,6 +210,10 @@ struct Stripe {
     seq: AtomicU64,
 }
 
+/// 帯の控えを stack に置ける帯の数 (目盛り 6 本まで。 それより多い宣言の読みは控えを heap に置く)。
+const STACK_BANDS: usize = 8;
+
+
 /// 帯を 2 本以上読む時、 控える間に書き換えと重なって控え直す回数の上限 (超えたら None = 呼び手は普通の逆引きを使う)。
 const READ_TRIES: usize = 8;
 /// 版が奇数 (書き換えの最中) の間に待つ回数の上限 (書き手が鍵を持ったまま止まった時に、 読み手が待ち続けない)。
@@ -483,6 +487,19 @@ impl OrderIndex {
     /// (大きい会社を写す間に書き込みが来ても控え直さない)。 控え直しが [`READ_TRIES`] 回で揃わなければ None。
     /// 帯 1 本は bucket の 3 段の確かめで足りる。
     pub(crate) fn arc_into(&self, v: u32, bands: Bands, out: &mut Vec<u32>) -> Option<bool> {
+        self.arc_impl(v, bands, false, out)
+    }
+
+    /// [`arc_into`](Self::arc_into) の、 entity の番号の昇順に近い形で足す版 (`members` のように昇順で返す読み用)。 帯を
+    /// 2 本以上読み、 どの帯の一覧も昇順で stale も無ければ、 混ぜ合わせて (merge) 昇順で足す。 そうでなければ
+    /// `arc_into` と同じく帯の順につなぐ (帯ごとの一覧は、 書き込みで後ろに足された所までは昇順)。 呼び手は並べ直す
+    /// (並んでいればすぐ終わる)。 会社単位の購読で範囲の条件なしの members を全部の会社について引くと、 帯をつないで全部を
+    /// 並べ直していた前の形より 1.3〜3.8 倍速い (100 万人、 10〜10 万人/社、 2026-10-11)。
+    pub(crate) fn arc_sorted_into(&self, v: u32, bands: Bands, out: &mut Vec<u32>) -> Option<bool> {
+        self.arc_impl(v, bands, true, out)
+    }
+
+    fn arc_impl(&self, v: u32, bands: Bands, merge: bool, out: &mut Vec<u32>) -> Option<bool> {
         if !self.is_built() || self.is_disabled() {
             return None;
         }
@@ -498,15 +515,31 @@ impl OrderIndex {
                 }
             } else {
                 let q = &self.stripes[self.stripe_of(s)].seq;
-                // 控える間に heap を確保しない (控える間を短く)
-                let mut snaps = Vec::with_capacity(bins.len());
-                self.consistent(q, || {
-                    snaps.clear();
-                    snaps.extend(bins.iter().filter_map(Slot::get).map(|b| b.snapshot_in(&guard)));
+                // 控えは stack に (控える間に heap を確保しない = 控える間を短く、 読むたびの確保も無い)。 帯が多い宣言だけ heap
+                let mut stack: [(&[u32], bool); STACK_BANDS] = [(&[], false); STACK_BANDS];
+                let mut heap: Vec<(&[u32], bool)> = Vec::new();
+                let n = self.consistent(q, || {
+                    let mut n = 0;
+                    if bins.len() <= STACK_BANDS {
+                        for b in bins.iter().filter_map(Slot::get) {
+                            stack[n] = b.snapshot_in(&guard);
+                            n += 1;
+                        }
+                    } else {
+                        heap.clear();
+                        heap.extend(bins.iter().filter_map(Slot::get).map(|b| b.snapshot_in(&guard)));
+                        n = heap.len();
+                    }
+                    n
                 })?;
-                for (slice, v) in snaps {
-                    out.extend_from_slice(slice);
-                    verify |= v;
+                let snaps: &[(&[u32], bool)] = if bins.len() <= STACK_BANDS { &stack[..n] } else { &heap };
+                verify = snaps.iter().any(|x| x.1);
+                let total = snaps.iter().map(|x| x.0.len()).sum();
+                out.reserve(total);
+                if !(merge && !verify && merge_sorted_into(snaps, out)) {
+                    for (slice, _) in snaps {
+                        out.extend_from_slice(slice);
+                    }
                 }
             }
         }
@@ -576,9 +609,216 @@ impl OrderIndex {
     }
 }
 
+/// 帯ごとの一覧 `parts` (控え。 stale を含まないこと) を、 entity の番号の昇順に混ぜて `out` の後ろに足す。 どれかの一覧が
+/// 昇順でなければ (書き込みで後ろに足された entity がある)、 何も足さずに false。 一覧が 3 本以上なら 2 本ずつ混ぜる。
+fn merge_sorted_into(parts: &[(&[u32], bool)], out: &mut Vec<u32>) -> bool {
+    if !parts.iter().all(|p| p.0.is_sorted()) {
+        return false;
+    }
+    let mut runs = parts.iter().map(|p| p.0).filter(|r| !r.is_empty());
+    let (Some(a), Some(b)) = (runs.next(), runs.next()) else {
+        // 1 本以下: 並べ直しは要らない
+        if let Some(only) = parts.iter().map(|p| p.0).find(|r| !r.is_empty()) {
+            out.extend_from_slice(only);
+        }
+        return true;
+    };
+    match runs.next() {
+        None => merge2(a, b, out),
+        Some(c) => {
+            let mut acc = Vec::with_capacity(a.len() + b.len());
+            merge2(a, b, &mut acc);
+            let mut next = c;
+            for r in runs {
+                let mut t = Vec::with_capacity(acc.len() + next.len());
+                merge2(&acc, next, &mut t);
+                acc = t;
+                next = r;
+            }
+            merge2(&acc, next, out);
+        }
+    }
+    true
+}
+
+/// [`merge2`] が同時に進める混ぜ合わせの本数。
+const CHAINS: usize = 4;
+
+/// 昇順の 2 本 (同じ番号は無い) を昇順に混ぜて `out` の後ろに足す。 出力を [`CHAINS`] 個の区間に分けて別々に混ぜる: 区間の
+/// 境目 (その手前に入る `a` と `b` の数) を二分探索で決め (merge path)、 区間ごとの混ぜ合わせを 1 つのループで同時に進める。
+/// 1 本ずつだと、 次にどちらを読むかが 1 つ前の比較の結果を待つ (読みの遅れが毎回のる) が、 何本も同時なら待ちが重なる。
+/// どちらを取るかは分岐でなく選択で決める (帯の並びは混ざっているので、 分岐にすると予測が外れ続ける)。
+fn merge2(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+    let n = a.len() + b.len();
+    let start = out.len();
+    out.resize(start + n, 0);
+    let dst = &mut out[start..];
+    if n < CHAINS * 16 {
+        // 短い時は区間に分けない (境目を探す手間の方が大きい)
+        merge_from(a, b, 0, 0, dst);
+        return;
+    }
+    // 区間 c は a[ia[c]..ea[c]] と b[ib[c]..eb[c]] を混ぜて dst[ia[c] + ib[c]..] に書く
+    let (mut ia, mut ib, mut ea, mut eb) = ([0; CHAINS], [0; CHAINS], [0; CHAINS], [0; CHAINS]);
+    let mut prev = (0, 0);
+    for c in 0..CHAINS {
+        let h = n * (c + 1) / CHAINS;
+        let i = merge_path(a, b, h);
+        (ia[c], ib[c]) = prev;
+        (ea[c], eb[c]) = (i, h - i);
+        prev = (i, h - i);
+    }
+    while (0..CHAINS).all(|c| ia[c] < ea[c] && ib[c] < eb[c]) {
+        for c in 0..CHAINS {
+            let (x, y) = (a[ia[c]], b[ib[c]]);
+            let t = x < y;
+            dst[ia[c] + ib[c]] = if t { x } else { y };
+            ia[c] += usize::from(t);
+            ib[c] += usize::from(!t);
+        }
+    }
+    for c in 0..CHAINS {
+        merge_from(&a[..ea[c]], &b[..eb[c]], ia[c], ib[c], &mut dst[..ea[c] + eb[c]]);
+    }
+}
+
+/// `a[i..]` と `b[j..]` (どちらも昇順) を混ぜて `dst[i + j..]` に書く (`dst` の長さは `a.len() + b.len()`)。 1 本の鎖。
+fn merge_from(a: &[u32], b: &[u32], mut i: usize, mut j: usize, dst: &mut [u32]) {
+    while i < a.len() && j < b.len() {
+        let (x, y) = (a[i], b[j]);
+        let t = x < y;
+        dst[i + j] = if t { x } else { y };
+        i += usize::from(t);
+        j += usize::from(!t);
+    }
+    dst[i + j..a.len() + j].copy_from_slice(&a[i..]);
+    dst[a.len() + j..].copy_from_slice(&b[j..]);
+}
+
+/// 2 本の昇順の一覧を混ぜた時、 先頭から `h` 個に入る `a` の数 (残りの `h - i` 個は `b` から)。 「a[i] が b[h - i - 1] より
+/// 小さい (= a[i] も先頭 h 個に入る)」 が偽になる一番小さい i。
+fn merge_path(a: &[u32], b: &[u32], h: usize) -> usize {
+    let (mut lo, mut hi) = (h.saturating_sub(b.len()), h.min(a.len()));
+    while lo < hi {
+        let i = (lo + hi) / 2;
+        if a[i] < b[h - i - 1] {
+            lo = i + 1;
+        } else {
+            hi = i;
+        }
+    }
+    lo
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 帯を混ぜ合わせる読み (`arc_sorted_into`): 作った直後 (帯ごとの一覧は昇順) は全部の帯を昇順で返し、 中身は
+    /// `arc_into` と同じ。 一覧の後ろに番号の小さい entity が足されて昇順が崩れた帯があれば、 `arc_into` と同じつなぎ方に戻る。
+    #[test]
+    fn sorted_reads_merge_bands_while_they_are_in_order() {
+        let o = OrderIndex::new(0, 1, &[30, 65], u32::MAX as u64 - 1, 0);
+        // 会社 5 に 300 人 (番号 100〜399)、 年齢は 3 つの帯に散らす
+        let rows: Vec<(u32, Option<u32>, Option<u64>)> =
+            (100..400).map(|e| (e, Some(5), Some([20, 40, 70][e as usize % 3]))).collect();
+        build_from(&o, &rows);
+        let all = o.all_bands();
+        let (mut a, mut b) = (vec![1], vec![1]);
+        assert_eq!(o.arc_into(5, all, &mut a), Some(false));
+        assert_eq!(o.arc_sorted_into(5, all, &mut b), Some(false));
+        assert_eq!((a[0], b[0]), (1, 1), "前に積んだ分を変えない");
+        assert!(!a[1..].is_sorted(), "前提: 帯をつないだだけでは昇順でない");
+        assert!(b[1..].is_sorted(), "混ぜ合わせると昇順");
+        a[1..].sort_unstable();
+        assert_eq!(a, b);
+        assert_eq!(b.len(), 301);
+        // 範囲 (帯 2 本) でも同じ
+        let (mut a2, mut b2) = (Vec::new(), Vec::new());
+        o.arc_into(5, o.bands_of(30, u32::MAX as u64 - 1), &mut a2).unwrap();
+        o.arc_sorted_into(5, o.bands_of(30, u32::MAX as u64 - 1), &mut b2).unwrap();
+        assert!(b2.is_sorted() && b2.len() == 200);
+        a2.sort_unstable();
+        assert_eq!(a2, b2);
+        // 新しい entity 7 (番号が小さい) を 40 歳で足す: 帯 2 の一覧の後ろに足されて昇順が崩れる (stale は出ない)
+        o.place(7, Some(5), Some(40));
+        let (mut c, mut d) = (Vec::new(), Vec::new());
+        assert_eq!(o.arc_into(5, all, &mut c), Some(false));
+        assert_eq!(o.arc_sorted_into(5, all, &mut d), Some(false));
+        assert_eq!(c, d, "崩れた帯があれば、 つなぐだけ (呼び手が並べる)");
+        assert!(!d.is_sorted() && d.contains(&7) && d.len() == 301);
+    }
+
+    /// 2 本の混ぜ合わせ (区間に分けて同時に混ぜる): 長さの偏り (片方が空 / 1 個 / 全部が片方の前か後) も含めて、 つないで
+    /// 並べたものと同じ。
+    #[test]
+    fn merge2_matches_sorting_for_skewed_lengths() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        for round in 0..2000 {
+            let n = rnd(70) as u32;
+            let mode = rnd(4);
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            for e in 0..n {
+                let to_a = match mode {
+                    0 => rnd(2) == 0,
+                    1 => rnd(10) == 0,
+                    2 => e < n / 2,
+                    _ => e >= n / 3,
+                };
+                if to_a { a.push(e * 3 + 1) } else { b.push(e * 3 + 2) }
+            }
+            let mut out = vec![9];
+            merge2(&a, &b, &mut out);
+            let mut want = [a.clone(), b.clone()].concat();
+            want.sort_unstable();
+            assert_eq!(out[0], 9);
+            assert_eq!(out[1..], want[..], "round {round}: a = {a:?}, b = {b:?}");
+        }
+    }
+
+    /// 混ぜ合わせ: 0〜5 本の昇順の一覧 (空も混ぜる) は、 つないで並べたものと同じ。 昇順でない一覧があれば何も足さずに false。
+    #[test]
+    fn merge_sorted_runs_matches_sorting_the_concatenation() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        for round in 0..300 {
+            let k = rnd(6) as usize;
+            // 番号は全部で重ならない (帯どうしで同じ entity は居ない)
+            let mut pool: Vec<u32> = (0..rnd(400) as u32 * 3).filter(|_| rnd(3) == 0).collect();
+            let mut parts: Vec<Vec<u32>> = vec![Vec::new(); k];
+            for e in pool.drain(..) {
+                if k > 0 {
+                    parts[rnd(k as u64) as usize].push(e);
+                }
+            }
+            let refs: Vec<(&[u32], bool)> = parts.iter().map(|p| (p.as_slice(), false)).collect();
+            let mut out = vec![7, 7];
+            assert!(merge_sorted_into(&refs, &mut out), "round {round}");
+            let mut want: Vec<u32> = parts.concat();
+            want.sort_unstable();
+            assert_eq!(out[..2], [7, 7], "前に積んだ分を変えない");
+            assert_eq!(out[2..], want[..], "round {round}: k = {k}");
+            // 1 本を崩すと false で何も足さない
+            if let Some(p) = parts.iter_mut().find(|p| p.len() >= 2) {
+                p.swap(0, 1);
+                let refs: Vec<(&[u32], bool)> = parts.iter().map(|p| (p.as_slice(), false)).collect();
+                let mut out2 = vec![1];
+                assert!(!merge_sorted_into(&refs, &mut out2));
+                assert_eq!(out2, vec![1]);
+            }
+        }
+    }
 
     /// `rows` = (entity, via の値, key の値) で作る。
     fn build_from(o: &OrderIndex, rows: &[(u32, Option<u32>, Option<u64>)]) {

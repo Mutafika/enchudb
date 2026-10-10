@@ -9403,15 +9403,22 @@ impl Engine {
     /// 並びの索引から、 値 `target` の帯 `bands` に居る entity を `out` の後ろに足す (順不同)。 stale のある帯を読んだら、
     /// 足した分を今の値で確かめ (via が target、 key の帯が `bands` の中)、 並べて重複を落とす。 索引が答えられない時は
     /// None (`out` は変えない)。
+    ///
+    /// `sorted` なら帯ごとの一覧を混ぜ合わせて番号の昇順に近い形で足す ([`OrderIndex::arc_sorted_into`]、 `members` の
+    /// ように昇順で返す読み用)。 確かめた時は今まで通り昇順。
+    ///
+    /// [`OrderIndex::arc_sorted_into`]: crate::order_index::OrderIndex::arc_sorted_into
     fn order_read_into(
         &self,
         o: &crate::order_index::OrderIndex,
         target: u32,
         bands: crate::order_index::Bands,
+        sorted: bool,
         out: &mut Vec<u32>,
     ) -> Option<()> {
         let start = out.len();
-        if o.arc_into(target, bands, out)? {
+        let stale = if sorted { o.arc_sorted_into(target, bands, out)? } else { o.arc_into(target, bands, out)? };
+        if stale {
             let (vh, kh) = (&self.himos[o.via as usize], &self.himos[o.key as usize]);
             let mut w = start;
             for r in start..out.len() {
@@ -9446,25 +9453,26 @@ impl Engine {
 
     /// 並びの索引がある via の紐の逆引き: 値 `value` を指している entity を `out` の後ろに足す (全部の帯)。 索引が答え
     /// られない時 (無い / やめた / 値が索引の外 / 帯を揃えて控えられない) は false で、 `out` は変えない (呼び手は円柱)。
-    fn order_pull_into(&self, idx: usize, value: u64, out: &mut Vec<u32>) -> bool {
+    fn order_pull_into(&self, idx: usize, value: u64, sorted: bool, out: &mut Vec<u32>) -> bool {
         let Some(o) = self.order_of_via(idx) else { return false };
         let Ok(target) = u32::try_from(value) else { return false };
-        self.order_ready(o) && self.order_read_into(o, target, o.all_bands(), out).is_some()
+        self.order_ready(o) && self.order_read_into(o, target, o.all_bands(), sorted, out).is_some()
     }
 
     /// 紐 `idx` の値 `value` を指している entity (`HimoStore::pull` の代わり)。 並びの索引がある via の紐なら索引から読み、
     /// 円柱を作らない (並びは帯の順。 確かめた時は eid の昇順)。 それ以外は円柱。
     fn himo_pull(&self, idx: usize, value: u64) -> Vec<u32> {
         let mut out = Vec::new();
-        if !self.order_pull_into(idx, value, &mut out) {
+        if !self.order_pull_into(idx, value, false, &mut out) {
             out = self.himos[idx].pull(value);
         }
         out
     }
 
-    /// [`himo_pull`](Self::himo_pull) の、 `out` の後ろに足す版。
-    fn himo_pull_into(&self, idx: usize, value: u64, out: &mut Vec<u32>) {
-        if !self.order_pull_into(idx, value, out) {
+    /// [`himo_pull`](Self::himo_pull) の、 `out` の後ろに足す版。 `sorted` なら並びの索引の帯を混ぜ合わせて番号の昇順に
+    /// 近い形で足す (昇順で返す読み用。 円柱の一覧は元から昇順に近い)。
+    fn himo_pull_into(&self, idx: usize, value: u64, sorted: bool, out: &mut Vec<u32>) {
+        if !self.order_pull_into(idx, value, sorted, out) {
             self.himos[idx].pull_into(value, out);
         }
     }
@@ -13385,7 +13393,7 @@ impl Engine {
         let mut out: Vec<u32> = Vec::new();
         for &v in values {
             if let Some(v) = v.cell_value() {
-                self.himo_pull_into(idx, v, &mut out);
+                self.himo_pull_into(idx, v, false, &mut out);
             }
         }
         out.sort_unstable();
@@ -13507,6 +13515,9 @@ impl Engine {
     ///   購読の展開と登録)。 その紐の円柱 (普通の逆引き) は作らない — 値の範囲で引く `pull_range` と、 値の一覧・件数の
     ///   集計 (`unique_values` など) だけは今まで通り円柱を作る。 索引が答えられない時 (やめた、 帯を揃えて控えられない) も円柱
     /// - via の紐の `pull` の並びは帯の順になる (確かめた時は eid の昇順)。 order_by の無い `limit` は別の部分集合を返しうる
+    /// - 範囲の条件なしで昇順に読む所 (会社単位の購読の `members` など) は帯ごとの一覧を混ぜ合わせるので、 宣言しない時
+    ///   (円柱の一覧はもとから昇順に近い) より遅い: 会社を先に作る並べ方で 1.3〜1.6 倍、 会社の eid が 2^20 を超える並べ方
+    ///   では 0.8〜1.1 倍 (100 万人、 2026-10-11)。 小さい会社の `pull` も 1 回 +0.04〜0.08 µs
     /// - メモリ上だけ (開き直したら宣言し直す)
     pub fn declare_order(&self, via: &str, key: &str, ticks: &[u64]) -> Result<(), String> {
         let via_id = self.himo_id(via).ok_or_else(|| format!("declare_order: unknown himo '{via}'"))?;
@@ -16488,13 +16499,27 @@ impl crate::live::CellReader for Engine {
     }
     fn pull_into(&self, himo_id: u16, value: u64, out: &mut Vec<u32>) {
         if (himo_id as usize) < self.himos.len() {
-            self.himo_pull_into(himo_id as usize, value, out);
+            self.himo_pull_into(himo_id as usize, value, false, out);
+        }
+    }
+    fn pull_sorted_into(&self, himo_id: u16, value: u64, out: &mut Vec<u32>) {
+        if (himo_id as usize) < self.himos.len() {
+            self.himo_pull_into(himo_id as usize, value, true, out);
         }
     }
     fn has_order(&self, via: u16, key: u16) -> bool {
         self.live.order_for(via, key).is_some()
     }
-    fn order_arc_into(&self, via: u16, key: u16, target: u32, lo: u64, hi: u64, out: &mut Vec<u32>) -> Option<bool> {
+    fn order_arc_into(
+        &self,
+        via: u16,
+        key: u16,
+        target: u32,
+        lo: u64,
+        hi: u64,
+        sorted: bool,
+        out: &mut Vec<u32>,
+    ) -> Option<bool> {
         let o = self.live.order_for(via, key)?;
         if lo > hi {
             return Some(true);
@@ -16503,7 +16528,7 @@ impl crate::live::CellReader for Engine {
             return None;
         }
         let bands = o.bands_of(lo, hi);
-        self.order_read_into(o, target, bands, out)?;
+        self.order_read_into(o, target, bands, sorted, out)?;
         Some(bands.exact)
     }
     fn order_arc_len(&self, via: u16, key: u16, target: u32, lo: u64, hi: u64) -> Option<usize> {

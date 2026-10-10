@@ -596,6 +596,11 @@ pub(crate) trait CellReader {
     fn pull_into(&self, himo_id: u16, value: u64, out: &mut Vec<u32>) {
         out.extend(self.pull(himo_id, value));
     }
+    /// [`pull_into`](Self::pull_into) の、 番号の昇順に近い形で足す版 (`members` のように昇順で返す読み用。 呼び手は並べ
+    /// 直す)。 並びの索引がある紐は帯ごとの一覧を混ぜ合わせる。 それ以外は `pull_into` と同じ。
+    fn pull_sorted_into(&self, himo_id: u16, value: u64, out: &mut Vec<u32>) {
+        self.pull_into(himo_id, value, out);
+    }
     /// `himo_id` に何か値を持つ entity。
     fn with_himo(&self, himo_id: u16) -> Vec<u32>;
     /// `himo_id` の値が `lo..=hi` の entity (順不同)。
@@ -612,9 +617,20 @@ pub(crate) trait CellReader {
         false
     }
     /// 並びの索引から、 `via` で `target` を指していて `key` の値が `lo..=hi` の帯に居る entity を `out` の後ろに足す
-    /// (stale は確かめ済み、 順不同)。 返り値 = 帯が範囲とちょうど一致するか (一致すれば範囲の条件は確かめなくてよい、
-    /// しなければ帯の分だけ広い)。 索引が無い / 使えない時は None (何も足さない、 呼び手は `pull` を使う)。
-    fn order_arc_into(&self, _via: u16, _key: u16, _target: u32, _lo: u64, _hi: u64, _out: &mut Vec<u32>) -> Option<bool> {
+    /// (stale は確かめ済み、 順不同。 `sorted` なら帯ごとの一覧を混ぜ合わせて番号の昇順に近い形で)。 返り値 = 帯が範囲と
+    /// ちょうど一致するか (一致すれば範囲の条件は確かめなくてよい、 しなければ帯の分だけ広い)。 索引が無い / 使えない時は
+    /// None (何も足さない、 呼び手は `pull` を使う)。
+    #[allow(clippy::too_many_arguments)]
+    fn order_arc_into(
+        &self,
+        _via: u16,
+        _key: u16,
+        _target: u32,
+        _lo: u64,
+        _hi: u64,
+        _sorted: bool,
+        _out: &mut Vec<u32>,
+    ) -> Option<bool> {
         None
     }
     /// 並びの索引の帯が範囲とちょうど一致する時、 その件数 (O(帯の数))。 それ以外は None。
@@ -3729,7 +3745,7 @@ impl Family {
             let arc = root_arc.filter(|&(key, ..)| self.nodes[n].parent == 0 && r.has_order(via, key));
             let mut up: Vec<u32> = Vec::new();
             for &e in &ents {
-                let from_order = arc.is_some_and(|(key, lo, hi)| r.order_arc_into(via, key, e, lo, hi, &mut up).is_some());
+                let from_order = arc.is_some_and(|(key, lo, hi)| r.order_arc_into(via, key, e, lo, hi, false, &mut up).is_some());
                 if !from_order {
                     r.pull_into(via, e as u64, &mut up);
                 }
@@ -4126,7 +4142,7 @@ impl Family {
                     let up = match order_range {
                         Some((key, lo, hi)) if parent == 0 && single_child == Some(n) => {
                             let mut up = Vec::new();
-                            match r.order_arc_into(via, key, e, lo, hi, &mut up) {
+                            match r.order_arc_into(via, key, e, lo, hi, false, &mut up) {
                                 Some(_) => up,
                                 None => r.pull(via, e as u64),
                             }
@@ -5479,6 +5495,15 @@ impl RootTest {
     }
 }
 
+/// `members` の並べ直し: 昇順なら何もしない (円柱の一覧と、 並びの索引の帯を混ぜ合わせた一覧はたいてい昇順)。 そうで
+/// なければ並んだ区間をつなぐ sort (stable の sort。 帯ごとの一覧の、 書き込みで後ろに足された所だけが崩れた形や、 帯を
+/// つないだだけの形を、 全部を並べ直すより軽く並べる)。
+fn sort_members(v: &mut [u32]) {
+    if !v.is_sorted() {
+        v.sort();
+    }
+}
+
 /// ref をたどる条件の結果を **group (ref の 1 段目の先の entity) 単位** で持つ live query。
 ///
 /// 例: 「所属会社の所在地が東京の社員」 を、 差分は 「東京になった会社 / 東京でなくなった会社」、
@@ -5519,7 +5544,7 @@ impl GroupedLiveQuery {
             return Vec::new();
         }
         let mut out = self.members_one(eng, enchudb_oplog::eid_local(group));
-        out.sort_unstable();
+        sort_members(&mut out);
         self.eids_of(&out)
     }
 
@@ -5544,7 +5569,7 @@ impl GroupedLiveQuery {
                 }
                 buf.clear();
                 self.members_into(eng, enchudb_oplog::eid_local(g), &tests, ord, &mut buf);
-                buf.sort_unstable();
+                sort_members(&mut buf);
                 self.eids_of(&buf)
             })
             .collect()
@@ -5630,7 +5655,7 @@ impl GroupedLiveQuery {
     fn members_one(&self, eng: &crate::engine::Engine, g: u32) -> Vec<u32> {
         if let Some((i, key, lo, hi)) = self.order_range(eng) {
             let mut out = Vec::new();
-            if let Some(exact) = CellReader::order_arc_into(eng, self.via, key, g, lo, hi, &mut out) {
+            if let Some(exact) = CellReader::order_arc_into(eng, self.via, key, g, lo, hi, true, &mut out) {
                 // 帯が範囲とちょうど合えば、 その範囲の条件は確かめない
                 if self.filter.len() > usize::from(exact) {
                     out.retain(|&e| self.filter.iter().enumerate().all(|(j, p)| (exact && j == i) || matches_leaf(eng, p, e)));
@@ -5638,7 +5663,8 @@ impl GroupedLiveQuery {
                 return out;
             }
         }
-        let mut out = CellReader::pull(eng, self.via, g as u64);
+        let mut out = Vec::new();
+        CellReader::pull_sorted_into(eng, self.via, g as u64, &mut out);
         if !self.filter.is_empty() {
             out.retain(|&e| self.filter.iter().all(|p| matches_leaf(eng, p, e)));
         }
@@ -5658,7 +5684,7 @@ impl GroupedLiveQuery {
         let start = out.len();
         let mut skip = None;
         let from_order = match ord {
-            Some((i, key, lo, hi)) => match CellReader::order_arc_into(eng, self.via, key, g, lo, hi, out) {
+            Some((i, key, lo, hi)) => match CellReader::order_arc_into(eng, self.via, key, g, lo, hi, true, out) {
                 Some(exact) => {
                     skip = exact.then_some(i);
                     true
@@ -5668,7 +5694,7 @@ impl GroupedLiveQuery {
             None => false,
         };
         if !from_order {
-            CellReader::pull_into(eng, self.via, g as u64, out);
+            CellReader::pull_sorted_into(eng, self.via, g as u64, out);
         }
         if tests.len() <= usize::from(skip.is_some()) {
             return;
