@@ -150,8 +150,14 @@ impl SparseRuns {
     /// 値 `value` の entry の eid (古い entry 込み、 呼び側が verify する)。 run ごとに二分探索 1 回 +
     /// 同じ値の間だけ進む。
     pub fn lookup(&self, value: u64) -> Vec<u32> {
+        let mut out = Vec::new();
+        self.lookup_into(value, &mut out);
+        out
+    }
+
+    /// [`lookup`](Self::lookup) の、 呼び手の buffer の後ろに足す版。
+    pub fn lookup_into(&self, value: u64, out: &mut Vec<u32>) {
         self.with(|set| {
-            let mut out = Vec::new();
             for r in set.all() {
                 let mut i = r.vals.partition_point(|&v| v < value);
                 while i < r.vals.len() && r.vals[i] == value {
@@ -159,7 +165,6 @@ impl SparseRuns {
                     i += 1;
                 }
             }
-            out
         })
     }
 
