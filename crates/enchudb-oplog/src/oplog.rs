@@ -1649,6 +1649,12 @@ impl OpLog {
         std::mem::take(&mut *self.dropped.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
+    /// #451: ring にある record を全部 (Commit で閉じた group と、 閉じていない末尾) 返す。 読むだけ (clock を戻さない)。
+    pub fn records_with_tail(&self) -> Vec<Record> {
+        let s = self.scan_from_offset(HEADER_SIZE as u64);
+        s.out.into_iter().chain(s.tail).map(|(r, _)| r).collect()
+    }
+
     /// #450: `start_offset` から先の、 Commit で閉じられていない record (閉じの Commit が満杯で入らなかった孤児の group) を、
     /// WAL に載らなかった record と同じに覚える ([`OpLog::take_dropped`] が返す)。 満杯の死区間で ring を畳む直前に呼ぶ —
     /// 畳むと二度と配れないので、 engine の bridge がその author の floor を上げる。 戻り値は覚えた record の数。
