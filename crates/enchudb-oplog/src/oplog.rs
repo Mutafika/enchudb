@@ -1649,6 +1649,17 @@ impl OpLog {
         std::mem::take(&mut *self.dropped.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
+    /// #450: `start_offset` から先の、 Commit で閉じられていない record (閉じの Commit が満杯で入らなかった孤児の group) を、
+    /// WAL に載らなかった record と同じに覚える ([`OpLog::take_dropped`] が返す)。 満杯の死区間で ring を畳む直前に呼ぶ —
+    /// 畳むと二度と配れないので、 engine の bridge がその author の floor を上げる。 戻り値は覚えた record の数。
+    pub fn note_uncommitted_tail_dropped(&self, start_offset: u64) -> usize {
+        let tail = self.scan_from_offset(start_offset).tail;
+        for (r, _) in &tail {
+            self.note_dropped(r.author_peer, r.hlc);
+        }
+        tail.len()
+    }
+
     /// fault injection の残数を 1 消費する。 消費できたら true。
     fn take_commit_fault(&self) -> bool {
         self.fail_next_commits
