@@ -86,6 +86,9 @@ jobs:
         run: cargo miri test -p enchudb-engine --lib append_bucket
       - name: miri lockfree_cylinder (dense)
         run: cargo miri test -p enchudb-engine --lib "lockfree_cylinder::tests::dense"
+      # 並びの索引: 置き場の配列 (epoch で差し替え) と bucket の Slot、 drop。
+      - name: miri order_index
+        run: cargo miri test -p enchudb-engine --lib order_index
 
   loom:
     name: loom (interleaving)
@@ -106,6 +109,11 @@ jobs:
       # issue255_rw_open_lazy_cylinder が全 pass した)。 この model が唯一の gate。
       - name: loom model check (lazy cylinder build)
         run: cargo test -p enchudb-engine --test loom_lazy_cylinder_build --release
+
+      # 並びの索引 (declare_order) の遅延の作成と、 via / key の並行の書き込み。 key の列は via の write_lock の外で
+      # 書くので、 「作ったか」 の判定を lock の前に出すと置き直しを落とす (#270 と同じ窓、 key の書き手の分だけ広い)。
+      - name: loom model check (order index build)
+        run: cargo test -p enchudb-engine --test loom_order_index_build --release
 
       # #421: 書いた範囲 (dirty) の取り出しと同時の印 / 同時の flush。 lo / hi を別々に swap すると印が
       # 消え、 lock なしだと後の flush が前の flush の書き出しより先に返る (oplog_sync の後で checkpoint が先に進む)。

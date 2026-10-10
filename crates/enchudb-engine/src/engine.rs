@@ -9217,6 +9217,8 @@ impl Engine {
             self.himos[hid].set(local, value)
         };
         if ok {
+            // 並びの索引の置き直しは印の前 (印を受けた poll が索引を読む時には、 もう置き直してある)
+            self.order_note(hid as u16, local);
             self.live.touch(hid as u16, local);
         }
         if changed {
@@ -9362,10 +9364,56 @@ impl Engine {
             None
         };
         self.himos[hid].remove(local);
+        self.order_note(hid as u16, local);
         self.live.touch(hid as u16, local);
         if let Some(o) = old {
             self.vocab.release(o);
         }
+    }
+
+    /// 並びの索引 (`declare_order`) の via か key の列を書いた後に呼ぶ: entity を今の値の置き場に置き直す。 索引が
+    /// 無ければ atomic 1 回で戻る。 **行の lock の下で** 呼ぶ (同じ entity の置き直しを 1 本に並べる。 engine の書き込みの
+    /// 道は全部 `live_set` / `live_remove` を行の lock の下で呼ぶ)。 鍵の順は 行 → (作る前だけ) via の write_lock →
+    /// 置き場の鍵 (`OrderIndex::place`)。
+    #[inline]
+    fn order_note(&self, hid: u16, local: u32) {
+        if self.live.has_orders() {
+            self.order_note_slow(hid, local);
+        }
+    }
+
+    #[cold]
+    fn order_note_slow(&self, hid: u16, local: u32) {
+        for o in self.live.orders_on(hid) {
+            // 作る前は何もしない (作る時に今の列を読む)。 作ったかは、 作っていなければ via の write_lock の下で
+            // もう一度見る (作る側はその下で列をなめる。 lock の前の判定だけだと、 key の列の書き込みを見落とす:
+            // `tests/loom_order_index_build.rs`)。 作り終えた後は via の lock を取らない
+            if !o.is_built() {
+                let _w = self.himos[o.via as usize].write_guard();
+                if !o.is_built() {
+                    continue;
+                }
+            }
+            let v = self.himos[o.via as usize].get_value(local).and_then(|v| u32::try_from(v).ok());
+            let k = self.himos[o.key as usize].get_value(local);
+            o.place(local, v, k);
+        }
+    }
+
+    /// 並びの索引を使える状態にする (作っていなければ via の write_lock の下で作る)。 やめた索引は false。
+    fn order_ready(&self, o: &crate::order_index::OrderIndex) -> bool {
+        if !o.is_built() {
+            let _w = self.himos[o.via as usize].write_guard();
+            if !o.is_built() {
+                let (via, key) = (&self.himos[o.via as usize], &self.himos[o.key as usize]);
+                o.build(
+                    &via.entities_with_value(),
+                    |e| via.get_value(e).and_then(|v| u32::try_from(v).ok()),
+                    |e| key.get_value(e),
+                );
+            }
+        }
+        !o.is_disabled()
     }
 
     /// `set_cell` の local eid 版 (engine 内の write 経路用。 `check_writable` と
@@ -13349,6 +13397,58 @@ impl Engine {
         Ok(crate::live::GroupedLiveQuery::new(q, via, filter))
     }
 
+    /// 並びの索引を宣言する。 ref 紐 `via` の逆引き (「会社 c を指している社員」) を、 紐 `key` の値の帯 (目盛り `ticks` の
+    /// 間) ごとに分けて持つ。 会社単位の購読 ([`subscribe_grouped`](Self::subscribe_grouped) /
+    /// [`subscribe_touched`](Self::subscribe_touched)) の `members` / `members_many` / `count_in` / `count` / `flatten` と、
+    /// 社員単位の購読の 「会社の答えが変わった時に社員を引く」 所が、 根への条件の範囲 (`key` の `Range`) に当たる帯だけを
+    /// 読む。 範囲の両端が目盛りとちょうど合えば、 範囲の条件を社員ごとに確かめず、 件数は帯の件数の和で数える。
+    ///
+    /// - `via` は Ref の紐、 `key` は Number / Number64 の紐 (どちらも根の entity の列)。 `ticks` は空でない狭義の昇順で、
+    ///   key の列に入る値。 帯は 「値が無い」 / `[0, t1)` / `[t1, t2)` / … / `[t_last, ∞)`
+    /// - via の紐 1 本に索引は 1 つ (全部で 64 まで)。 同じ宣言をもう一度するのは何もしない、 違う宣言は Err
+    /// - 宣言しただけでは作らない (最初に読む時に via の列をなめて作る)。 作った後は via / key の書き込みのたびに置き直す
+    ///   (1 回 +30〜90 ns、 10 万〜100 万人での実測 2026-10-10。 宣言の無い DB は書き込みのコストが変わらない)
+    /// - メモリ上だけ (開き直したら宣言し直す)。 今は普通の逆引き (円柱) とは別に持つ
+    pub fn declare_order(&self, via: &str, key: &str, ticks: &[u64]) -> Result<(), String> {
+        let via_id = self.himo_id(via).ok_or_else(|| format!("declare_order: unknown himo '{via}'"))?;
+        let key_id = self.himo_id(key).ok_or_else(|| format!("declare_order: unknown himo '{key}'"))?;
+        let vt = self.himos[via_id].value_type;
+        if vt != ValueType::Ref {
+            return Err(format!("declare_order: '{via}' is not a Ref himo ({vt:?})"));
+        }
+        let key_max = match self.himos[key_id].value_type {
+            ValueType::Number => u32::MAX as u64 - 1,
+            ValueType::Number64 => u64::MAX - 1,
+            t => return Err(format!("declare_order: '{key}' must be a Number / Number64 himo ({t:?})")),
+        };
+        if ticks.is_empty() || ticks.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(format!("declare_order: ticks must be non-empty and strictly increasing ({ticks:?})"));
+        }
+        if ticks.last().is_some_and(|&t| t > key_max) {
+            return Err(format!("declare_order: ticks must fit in '{key}' (max {key_max})"));
+        }
+        // 置き場の配列の 0 番 = ref の先の table の eid の始まり (表を宣言していない ref は 0)
+        let base = self
+            .tables
+            .iter()
+            .find_map(|t| t.fk_refs.iter().find(|&&(h, _)| h as usize == via_id).map(|&(_, tid)| tid))
+            .and_then(|tid| self.tables.get(tid as usize))
+            .map_or(0, |t| t.eid_range_lo);
+        self.live.add_order(crate::order_index::OrderIndex::new(via_id as u16, key_id as u16, ticks, key_max, base))
+    }
+
+    /// 診断: 並びの索引ごとの (via, key, 読んだ回数, 読んだ entity の数, heap の大きさ)。
+    #[doc(hidden)]
+    pub fn order_stats(&self) -> Vec<(u16, u16, u64, u64, usize)> {
+        self.live
+            .orders()
+            .map(|o| {
+                let (h, r) = o.stats();
+                (o.via, o.key, h, r, o.heap_bytes())
+            })
+            .collect()
+    }
+
     /// 見直す場所だけを返す購読 ([`crate::live::TouchedLiveQuery`])。 条件と group (ref の 1 段目の先) の分け方は
     /// [`subscribe_grouped`](Self::subscribe_grouped) と同じで、 poll はそれに加えて **前回 poll 以降に根の紐 (`Via` の ref と
     /// 根への条件の紐) が書かれた根の entity** を返す。 社員ごとの答えは持たない (呼び手が `group_of` で引き直す)。
@@ -16296,6 +16396,57 @@ impl crate::live::CellReader for Engine {
         if let Some(h) = self.himos.get(himo_id as usize) {
             h.pull_into(value, out);
         }
+    }
+    fn has_order(&self, via: u16, key: u16) -> bool {
+        self.live.order_for(via, key).is_some()
+    }
+    fn order_arc_into(&self, via: u16, key: u16, target: u32, lo: u64, hi: u64, out: &mut Vec<u32>) -> Option<bool> {
+        let o = self.live.order_for(via, key)?;
+        if lo > hi {
+            return Some(true);
+        }
+        if !self.order_ready(o) {
+            return None;
+        }
+        let bands = o.bands_of(lo, hi);
+        let start = out.len();
+        if o.arc_into(target, bands, out)? {
+            // stale のある帯を読んだ: 今の値で確かめて (via が target、 key の帯が範囲の帯)、 並べて重複を落とす
+            let (vh, kh) = (&self.himos[via as usize], &self.himos[key as usize]);
+            let mut w = start;
+            for r in start..out.len() {
+                let e = out[r];
+                if vh.get_value(e) == Some(target as u64) && (bands.lo..=bands.hi).contains(&o.band(kh.get_value(e))) {
+                    out[w] = e;
+                    w += 1;
+                }
+            }
+            out.truncate(w);
+            out[start..].sort_unstable();
+            let mut w = start;
+            for r in start..out.len() {
+                if w == start || out[r] != out[w - 1] {
+                    out[w] = out[r];
+                    w += 1;
+                }
+            }
+            out.truncate(w);
+        }
+        Some(bands.exact)
+    }
+    fn order_arc_len(&self, via: u16, key: u16, target: u32, lo: u64, hi: u64) -> Option<usize> {
+        let o = self.live.order_for(via, key)?;
+        if lo > hi {
+            return Some(0);
+        }
+        if !self.order_ready(o) {
+            return None;
+        }
+        let bands = o.bands_of(lo, hi);
+        if !bands.exact {
+            return None;
+        }
+        o.arc_len(target, bands)
     }
     fn with_himo(&self, himo_id: u16) -> Vec<u32> {
         match self.himos.get(himo_id as usize) {

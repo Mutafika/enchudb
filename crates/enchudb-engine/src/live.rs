@@ -607,6 +607,20 @@ pub(crate) trait CellReader {
     fn ref_cell(&self, himo_id: u16, eid: u32) -> Option<u32> {
         self.cell(himo_id, eid).and_then(|v| u32::try_from(v).ok())
     }
+    /// ref 紐 `via` を紐 `key` の帯で分けた並びの索引 ([`crate::order_index::OrderIndex`]) があるか。
+    fn has_order(&self, _via: u16, _key: u16) -> bool {
+        false
+    }
+    /// 並びの索引から、 `via` で `target` を指していて `key` の値が `lo..=hi` の帯に居る entity を `out` の後ろに足す
+    /// (stale は確かめ済み、 順不同)。 返り値 = 帯が範囲とちょうど一致するか (一致すれば範囲の条件は確かめなくてよい、
+    /// しなければ帯の分だけ広い)。 索引が無い / 使えない時は None (何も足さない、 呼び手は `pull` を使う)。
+    fn order_arc_into(&self, _via: u16, _key: u16, _target: u32, _lo: u64, _hi: u64, _out: &mut Vec<u32>) -> Option<bool> {
+        None
+    }
+    /// 並びの索引の帯が範囲とちょうど一致する時、 その件数 (O(帯の数))。 それ以外は None。
+    fn order_arc_len(&self, _via: u16, _key: u16, _target: u32, _lo: u64, _hi: u64) -> Option<usize> {
+        None
+    }
 }
 
 // ─────────────────────────── 疎な状態 ───────────────────────────
@@ -3996,6 +4010,24 @@ impl Family {
         // 記録」 と分かっているので、 評価で ref と子の記録を読み直さない (会社 1 社の移転で配下
         // 数十万人が動く時、 1 人あたりの評価がほぼ根自身の条件だけになる)
         let single_child = (self.nodes[0].children.len() == 1).then(|| self.nodes[0].children[0]);
+        // 根に範囲の穴 (年齢など) があって並びの索引があれば、 会社から社員を引く時に member の範囲の和の帯だけ読む
+        // (範囲に当たらない社員は答えが偽のまま変わらない。 読んだ社員は今まで通り根の条件で評価する)
+        let order_range = match (self.range, self.kind, self.partial, self.order_part, single_child) {
+            (Some((0, key)), CarryKind::Range, None, None, Some(c)) if r.has_order(self.nodes[c].via, key) => {
+                let (mut lo, mut hi, mut all) = (u64::MAX, 0u64, true);
+                for m in s.members.iter().flatten() {
+                    match m.range {
+                        Some((a, b)) => {
+                            lo = lo.min(a);
+                            hi = hi.max(b);
+                        }
+                        None => all = false,
+                    }
+                }
+                (all && lo <= hi).then_some((key, lo, hi))
+            }
+            _ => None,
+        };
         let mut via_child: Vec<(Option<Ans>, u32, Vec<u32>)> = Vec::new();
         // 合計する列の今の値 (合計しない family では読まない)
         // 合計する列の値 + 1 (0 = 値が無い)。 `Settled::summand` もこの形で持つ
@@ -4069,7 +4101,16 @@ impl Family {
                     }
                 }
                 if always || force || changed {
-                    let up = r.pull(via, e as u64);
+                    let up = match order_range {
+                        Some((key, lo, hi)) if parent == 0 && single_child == Some(n) => {
+                            let mut up = Vec::new();
+                            match r.order_arc_into(via, key, e, lo, hi, &mut up) {
+                                Some(_) => up,
+                                None => r.pull(via, e as u64),
+                            }
+                        }
+                        _ => r.pull(via, e as u64),
+                    };
                     if parent == 0 && single_child == Some(n) {
                         via_child.push((now, e, up));
                     } else {
@@ -4169,7 +4210,16 @@ pub(crate) struct LiveRegistry {
     peer: AtomicU32,
     /// #381: 外した購読が押さえていた辞書の番号。 engine が `take_unpins` で取り出して返す。
     unpins: Mutex<Vec<u32>>,
+    /// 並びの索引 (`Engine::declare_order`)。 via の紐 1 本に 1 つまで、 全部で [`MAX_ORDERS`] まで。 足すだけ (外さない) なので、
+    /// 読み手 (全部の書き込みの `order_note`、 購読の読み) は `n_orders` までを lock なしで読む (共有の数を書き換えない =
+    /// 書き手が何本居ても cache line を奪い合わない)。 足すのは `orders_add` の下で、 置いてから `n_orders` を Release で進める。
+    orders: [std::sync::OnceLock<Box<crate::order_index::OrderIndex>>; MAX_ORDERS],
+    n_orders: AtomicUsize,
+    orders_add: Mutex<()>,
 }
+
+/// 並びの索引の上限 (via の紐 1 本に 1 つなので、 ref の紐の数より多くは要らない)。
+pub(crate) const MAX_ORDERS: usize = 64;
 
 impl Drop for LiveRegistry {
     fn drop(&mut self) {
@@ -4214,7 +4264,56 @@ impl LiveRegistry {
             next_group: AtomicU64::new(1),
             peer: AtomicU32::new(peer),
             unpins: Mutex::new(Vec::new()),
+            orders: std::array::from_fn(|_| std::sync::OnceLock::new()),
+            n_orders: AtomicUsize::new(0),
+            orders_add: Mutex::new(()),
         }
+    }
+
+    /// 並びの索引を足す。 同じ via の索引が既にあれば、 key と目盛りが同じなら何もしない (Ok)、 違えば Err。
+    /// [`MAX_ORDERS`] を超えるのも Err。
+    pub(crate) fn add_order(&self, o: crate::order_index::OrderIndex) -> Result<(), String> {
+        let _g = self.orders_add.lock();
+        if let Some(x) = self.orders().find(|x| x.via == o.via) {
+            return if x.key == o.key && x.declared() == o.declared() {
+                Ok(())
+            } else {
+                Err(format!("an order on himo {} is already declared (key {}, ticks {:?})", x.via, x.key, x.declared()))
+            };
+        }
+        let n = self.n_orders.load(Ordering::Acquire);
+        if n == MAX_ORDERS {
+            return Err(format!("too many orders (max {MAX_ORDERS})"));
+        }
+        // `orders_add` の下なので n 番はまだ空
+        let _ = self.orders[n].set(Box::new(o));
+        self.n_orders.store(n + 1, Ordering::Release);
+        Ok(())
+    }
+
+    /// 並びの索引が 1 つでもあるか (書き込みの速い道)。
+    #[inline]
+    pub(crate) fn has_orders(&self) -> bool {
+        self.n_orders.load(Ordering::Acquire) != 0
+    }
+
+    /// 全部の並びの索引 (lock なし)。
+    #[inline]
+    pub(crate) fn orders(&self) -> impl Iterator<Item = &crate::order_index::OrderIndex> {
+        let n = self.n_orders.load(Ordering::Acquire);
+        self.orders[..n].iter().filter_map(|o| o.get().map(|b| &**b))
+    }
+
+    /// (via, key) の並びの索引。
+    #[inline]
+    pub(crate) fn order_for(&self, via: u16, key: u16) -> Option<&crate::order_index::OrderIndex> {
+        self.orders().find(|o| o.via == via && o.key == key)
+    }
+
+    /// 紐 `himo` (via か key) が書かれたら置き直す並びの索引。
+    #[inline]
+    pub(crate) fn orders_on(&self, himo: u16) -> impl Iterator<Item = &crate::order_index::OrderIndex> {
+        self.orders().filter(move |o| o.via == himo || o.key == himo)
     }
 
     pub(crate) fn set_peer(&self, peer: u32) {
@@ -5412,6 +5511,7 @@ impl GroupedLiveQuery {
     /// [`members_many`](Self::members_many) の中身: `live[i]` が偽の group は空。
     fn members_many_where(&self, eng: &crate::engine::Engine, groups: &[EntityId], live: Vec<bool>) -> Vec<Vec<EntityId>> {
         let tests = self.tests(eng);
+        let ord = self.order_range(eng);
         let mut buf = Vec::new();
         groups
             .iter()
@@ -5421,7 +5521,7 @@ impl GroupedLiveQuery {
                     return Vec::new();
                 }
                 buf.clear();
-                self.members_into(eng, enchudb_oplog::eid_local(g), &tests, &mut buf);
+                self.members_into(eng, enchudb_oplog::eid_local(g), &tests, ord, &mut buf);
                 buf.sort_unstable();
                 self.eids_of(&buf)
             })
@@ -5436,10 +5536,14 @@ impl GroupedLiveQuery {
         self.count_one(eng, enchudb_oplog::eid_local(group))
     }
 
-    /// group `g` (local eid) の members の数 (group が居るかは見ない)。
+    /// group `g` (local eid) の members の数 (group が居るかは見ない)。 根への条件が並びの索引の範囲 1 本だけで帯と
+    /// ちょうど合えば、 帯の件数の和 (O(帯の数))。
     fn count_one(&self, eng: &crate::engine::Engine, g: u32) -> usize {
         if self.filter.is_empty() {
             return CellReader::pull_len(eng, self.via, g as u64);
+        }
+        if let Some(n) = self.order_count(eng, g, self.order_range(eng)) {
+            return n;
         }
         self.members_one(eng, g).len()
     }
@@ -5448,20 +5552,22 @@ impl GroupedLiveQuery {
     /// 一覧を読んで数える (buffer は使い回し、 列は作らない)。 どちらも group 数に比例する。
     pub fn count(&self, eng: &crate::engine::Engine) -> usize {
         let tests = self.tests(eng);
+        let ord = self.order_range(eng);
         let mut buf = Vec::new();
         self.inner
             .members(eng)
             .iter()
-            .map(|&g| self.count_of(eng, enchudb_oplog::eid_local(g), &tests, &mut buf))
+            .map(|&g| self.count_of(eng, enchudb_oplog::eid_local(g), &tests, ord, &mut buf))
             .sum()
     }
 
     /// 平らにした結果全体 (eid 昇順)。 全 group の一覧を 1 本の buffer に読み、 最後に 1 回だけ並べる。
     pub fn flatten(&self, eng: &crate::engine::Engine) -> Vec<EntityId> {
         let tests = self.tests(eng);
+        let ord = self.order_range(eng);
         let mut out = Vec::new();
         for g in self.inner.members(eng) {
-            self.members_into(eng, enchudb_oplog::eid_local(g), &tests, &mut out);
+            self.members_into(eng, enchudb_oplog::eid_local(g), &tests, ord, &mut out);
         }
         out.sort_unstable();
         // 1 entity の ref は 1 つなので、 止まっている時は重ならない。 並行の付け替えで 2 つの group の一覧に
@@ -5481,9 +5587,35 @@ impl GroupedLiveQuery {
         self.filter.iter().all(|p| matches_leaf(eng, p, e))
     }
 
+    /// 根への条件のうち、 並びの索引 (`Engine::declare_order`) がある紐の範囲: (条件の位置, 紐, lo, hi)。
+    fn order_range(&self, eng: &crate::engine::Engine) -> Option<(usize, u16, u64, u64)> {
+        self.filter.iter().enumerate().find_map(|(i, p)| match *p {
+            LivePred::Range { himo_id, lo, hi } if CellReader::has_order(eng, self.via, himo_id) => Some((i, himo_id, lo, hi)),
+            _ => None,
+        })
+    }
+
+    /// 根への条件が並びの索引の範囲 1 本だけで、 帯と範囲がちょうど合えば、 group `g` の数 (帯の件数の和)。
+    fn order_count(&self, eng: &crate::engine::Engine, g: u32, ord: Option<(usize, u16, u64, u64)>) -> Option<usize> {
+        match ord {
+            Some((0, key, lo, hi)) if self.filter.len() == 1 => CellReader::order_arc_len(eng, self.via, key, g, lo, hi),
+            _ => None,
+        }
+    }
+
     /// group `g` (local eid) の members を 1 つだけ読む (順不同)。 条件は組み立てずに [`matches_leaf`] で当てる
-    /// (0.31.4 までの `members_of` と同じ読み方)。
+    /// (0.31.4 までの `members_of` と同じ読み方)。 並びの索引があれば範囲の帯だけ読む。
     fn members_one(&self, eng: &crate::engine::Engine, g: u32) -> Vec<u32> {
+        if let Some((i, key, lo, hi)) = self.order_range(eng) {
+            let mut out = Vec::new();
+            if let Some(exact) = CellReader::order_arc_into(eng, self.via, key, g, lo, hi, &mut out) {
+                // 帯が範囲とちょうど合えば、 その範囲の条件は確かめない
+                if self.filter.len() > usize::from(exact) {
+                    out.retain(|&e| self.filter.iter().enumerate().all(|(j, p)| (exact && j == i) || matches_leaf(eng, p, e)));
+                }
+                return out;
+            }
+        }
         let mut out = CellReader::pull(eng, self.via, g as u64);
         if !self.filter.is_empty() {
             out.retain(|&e| self.filter.iter().all(|p| matches_leaf(eng, p, e)));
@@ -5491,17 +5623,38 @@ impl GroupedLiveQuery {
         out
     }
 
-    /// group `g` (local eid) を指していて `tests` を満たす entity を `out` の後ろに足す (順不同)。
-    fn members_into(&self, eng: &crate::engine::Engine, g: u32, tests: &[RootTest], out: &mut Vec<u32>) {
+    /// group `g` (local eid) を指していて `tests` を満たす entity を `out` の後ろに足す (順不同)。 `ord` (並びの索引の
+    /// 範囲) があれば範囲の帯だけ読み、 帯が範囲とちょうど合えばその範囲の条件は確かめない。
+    fn members_into(
+        &self,
+        eng: &crate::engine::Engine,
+        g: u32,
+        tests: &[RootTest],
+        ord: Option<(usize, u16, u64, u64)>,
+        out: &mut Vec<u32>,
+    ) {
         let start = out.len();
-        CellReader::pull_into(eng, self.via, g as u64, out);
-        if tests.is_empty() {
+        let mut skip = None;
+        let from_order = match ord {
+            Some((i, key, lo, hi)) => match CellReader::order_arc_into(eng, self.via, key, g, lo, hi, out) {
+                Some(exact) => {
+                    skip = exact.then_some(i);
+                    true
+                }
+                None => false,
+            },
+            None => false,
+        };
+        if !from_order {
+            CellReader::pull_into(eng, self.via, g as u64, out);
+        }
+        if tests.len() <= usize::from(skip.is_some()) {
             return;
         }
         let mut w = start;
         for r in start..out.len() {
             let e = out[r];
-            if tests.iter().all(|t| t.holds(eng, e)) {
+            if tests.iter().enumerate().all(|(j, t)| Some(j) == skip || t.holds(eng, e)) {
                 out[w] = e;
                 w += 1;
             }
@@ -5510,12 +5663,22 @@ impl GroupedLiveQuery {
     }
 
     /// group `g` (local eid) の members の数。 `buf` は読むための使い回しの buffer。
-    fn count_of(&self, eng: &crate::engine::Engine, g: u32, tests: &[RootTest], buf: &mut Vec<u32>) -> usize {
+    fn count_of(
+        &self,
+        eng: &crate::engine::Engine,
+        g: u32,
+        tests: &[RootTest],
+        ord: Option<(usize, u16, u64, u64)>,
+        buf: &mut Vec<u32>,
+    ) -> usize {
         if tests.is_empty() {
             return CellReader::pull_len(eng, self.via, g as u64);
         }
+        if let Some(n) = self.order_count(eng, g, ord) {
+            return n;
+        }
         buf.clear();
-        self.members_into(eng, g, tests, buf);
+        self.members_into(eng, g, tests, ord, buf);
         buf.len()
     }
 
@@ -6362,5 +6525,25 @@ mod tests {
         drop(q);
         assert_eq!(reg.active.load(Ordering::Acquire), 0);
         assert!(reg.with_snap(|s| s.routes.iter().all(Vec::is_empty)).unwrap_or(true));
+    }
+
+    /// 並びの索引の一覧: [`MAX_ORDERS`] まで足せて、 その先は Err。 同じ via への同じ宣言は Ok (数は増えない)、 違う宣言は Err。
+    #[test]
+    fn add_order_caps_at_max_orders() {
+        use crate::order_index::OrderIndex;
+        let reg = LiveRegistry::new(0);
+        assert!(!reg.has_orders());
+        for v in 0..MAX_ORDERS as u16 {
+            reg.add_order(OrderIndex::new(v, 999, &[30], 1000, 0)).unwrap();
+        }
+        assert!(reg.has_orders());
+        assert!(reg.add_order(OrderIndex::new(MAX_ORDERS as u16, 999, &[30], 1000, 0)).is_err(), "上限の先");
+        assert!(reg.add_order(OrderIndex::new(3, 999, &[30], 1000, 0)).is_ok(), "同じ宣言");
+        assert!(reg.add_order(OrderIndex::new(3, 998, &[30], 1000, 0)).is_err(), "同じ via に違う key");
+        assert!(reg.add_order(OrderIndex::new(3, 999, &[40], 1000, 0)).is_err(), "同じ via に違う目盛り");
+        assert_eq!(reg.orders().count(), MAX_ORDERS);
+        assert!(reg.order_for(3, 999).is_some() && reg.order_for(3, 998).is_none());
+        assert_eq!(reg.orders_on(999).count(), MAX_ORDERS, "key の紐からは全部");
+        assert_eq!(reg.orders_on(5).map(|o| o.via).collect::<Vec<_>>(), vec![5], "via の紐からは 1 つ");
     }
 }

@@ -149,17 +149,17 @@ const PREALLOC_CAP: usize = 64;
 ///   代わっても動かない
 /// - 古い配列を掴んだ読み手は、 その後に置かれた bucket を見ない (空と読む) — 配列を伸ばす前の値の読みと同じで、
 ///   読みが書き込みより前に並ぶだけ
-struct Slot(AtomicPtr<AppendBucket>);
+pub(crate) struct Slot(AtomicPtr<AppendBucket>);
 
 impl Slot {
     #[inline]
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Slot(AtomicPtr::new(std::ptr::null_mut()))
     }
 
     /// bucket (空なら `None`)。 読み手・書き手のどちらからでも。
     #[inline]
-    fn get(&self) -> Option<&AppendBucket> {
+    pub(crate) fn get(&self) -> Option<&AppendBucket> {
         let p = self.0.load(Ordering::Acquire);
         // SAFETY: 非 null なら `Arc::into_raw` で置いた pointer で、 この Slot が参照を 1 つ持っている。
         // 1 度置いたら変わらないので、 Slot が生きている間 (`&self` の間) は有効。
@@ -168,7 +168,7 @@ impl Slot {
 
     /// bucket (空なら作って置く) と、 今作ったか。 **書き手だけ** — `HimoStore` の write_lock の下で同時に 1 本。
     #[inline]
-    fn get_or_create(&self) -> (&AppendBucket, bool) {
+    pub(crate) fn get_or_create(&self) -> (&AppendBucket, bool) {
         self.get_or_create_with(0)
     }
 
