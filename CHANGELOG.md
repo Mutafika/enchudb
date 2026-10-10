@@ -3,6 +3,58 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.31.3 — 2026-10-10
+
+patch。 on-disk 形式・wire 形式は 0.31.2 と同じ。 Engine / schema の API は変わらない (低レベルの `PayloadRing` に `holds` が
+増えた。 試験専用の feature `crashsim` は `data_synced` の引数が変わり、 `copy_for_sync` / `SyncCopy` / `set_after_copy_hook` が
+増えた)。 sync する DB の電源断の後の durability (電源断の模擬に sync する DB を足して見つけた 3 件) と、 模擬そのものの誤り。
+
+**上げる時の注意**:
+
+- sync する DB は、 bridge が `_sync_ops` に写した行と payload を本体に書き出してから oplog を畳む (`wal_fold_safe` はそれまで
+  false)。 畳む所 (consumer の周期 / 閉じる時 / WAL の空き作り) は、 畳める時に先に書き出す (書き出しが 1 回増える)。 oplog を
+  小さくして WAL が溢れ続ける使い方では、 WAL に載らずに落ちる record (#57、 相手に取り直させる) が増える (64 KiB の oplog に
+  書き続けると、 中央値で 2.4 万件中 1.15 万 → 1.43 万件)
+- bridge した直後の `wal_fold_safe()` を 「畳める」 の印にしている試験 / 監視は、 その前に `body_msync()` を挟む
+
+### Fixed — sync する DB で、 電源断の後に書き出しが返った書き込みの sync の record が消えた (#440、 #444)
+
+oplog を畳む条件 (`wal_fold_safe`) は 「bridge が head まで読んだ」 だけで、 bridge が `_sync_ops` に写した行と payload を
+書き出したかを見なかった。 `oplog_sync` も consumer の周期も bridge を本体の書き出しの後に回し、 consumer は bridge した
+直後に畳んだ。 畳んだ oplog には次の record が上書きされるので、 その間に電源が落ちると、 書き出しが返った書き込みの record が
+oplog にも `_sync_ops` にも無くなった。 本体の値は残るので相手の peer とだけ永久にずれ、 floor も上がらないので bootstrap にも
+ならない (電源断の模擬で、 書き込みの途中の像の約半分)。
+
+- bridge は写した record の数を数え、 本体の書き出し (`body_msync` / flush) は始めに読んだ数を、 成功した時に 「届いた数」 と
+  して置く (#414 の旧 Leaf slot と同じ形)。 届いた数が追いつくまで畳まない
+- 畳む所は、 畳める時 (head == checkpoint) だけ先に書き出す
+- 本体の書き出しは payload の ring を `_sync_ops` の行より先に msync する (旧は行が先で、 payload の無い行ができた → 下の #442)
+
+### Fixed — payload の ring を作った直後に電源が落ちると、 ring を二度と開けず、 以後 payload を辞書に置き続けた (#441、 #443)
+
+ring (`sync.payload.seg`、 0.31.0 の #410) を置く名前で作り、 header を書き出さずに使っていた。 file を作ったことは中身より
+先に届くので、 その間に電源が落ちると header の無い file が残り、 開くたびに `bad magic` で断って payload を辞書に置いた (#410
+で直した辞書の膨張が戻る。 その ring を指す行も読めない)。 別の名前で作って header を書き出し、 rename で置く。 file version 14
+は ring を作る前に刻む。 0.31.0〜0.31.2 でこの形になった DB (ring を作った最初の bridge の数 ms に電源が落ちた DB) は、 これまで
+通り辞書に置き続ける (header だけ壊れた ring と見分けられず、 作り直すと届いている record を捨てるため)。
+
+### Fixed — payload の届かなかった `_sync_ops` の行があると、 開いた時に ring が一杯に見えて bridge が止まった (#442、 #445)
+
+開いた時の ring の位置合わせ (`PayloadRing::restore`) と、 満杯の時の数え直しが、 entry の読めない行 (電源断で行だけ届いて
+payload が届かなかった行) も数えた。 最大 lsn の行の entry が読めないと書き込み位置を先頭に戻し、 ring を一周していなければ
+「満杯」 で bridge が止まった (一周した ring なら、 生きている entry を上書きしうる)。 entry が読める行だけを見る
+(`PayloadRing::holds`)。
+
+### Tests
+
+- 電源断の模擬 (`tests/power_loss.rs`、 feature `crashsim`) に sync する DB を足した: 書き出しが返った書き込みが、 開き直して
+  bridge し直した後の配る分に全部あるか。 上の 3 件はここで見つかった
+- 電源断の模擬の控えが、 重なった書き出しの古い写しで巻き戻っていた (#446、 #447)。 oplog の fsync は consumer と
+  `oplog_sync` の呼び手が同時に呼ぶので、 先に写した方が後で終わると控えが時間を遡り、 開いた像が書き出しの返った untie /
+  書き直しの前の値を当て直した (Linux だけ、 54 run 中 5 回)。 engine のバグではない (本物の msync はディスクの中身を古い方へ
+  戻さない)。 控えは page ごとに後に写した中身を残す (`crashsim::copy_for_sync` → `data_synced`)
+- `ENCHU_POWER_LOSS_KEEP=1` で残す像は、 検証の前の写しを隣の `imgNNN.raw` に置く (検証は像を開いて再生する)
+
 ## 0.31.2 — 2026-10-09
 
 patch。 on-disk 形式・wire 形式は 0.31.1 と同じ。 Engine / schema の API は変わらない (低レベルの `LeafStore` / `SegmentSet` /
