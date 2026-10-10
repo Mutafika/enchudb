@@ -559,7 +559,8 @@ fn order_under_concurrent_writes_and_build() {
     assert!(order_hits(&w).0 > 0);
 }
 
-/// 宣言の検査: Ref でない via、 数でない key、 空・昇順でない目盛り、 同じ via への違う宣言は Err。 同じ宣言の繰り返しは Ok。
+/// 宣言の検査: Ref でない via、 数でない key、 空・昇順でない目盛り、 無い紐は Err。 同じ宣言の繰り返しは何もしない、
+/// 同じ via への違う宣言は置き換える (PR-D。 前は Err)、 外すと宣言が無くなる。
 #[test]
 fn declare_order_validates() {
     let w = world(Layout::Anon, 0x5eed_4041);
@@ -568,10 +569,18 @@ fn declare_order_validates() {
     assert!(w.eng.declare_order(w.n_company, w.n_age, &[]).is_err(), "空の目盛り");
     assert!(w.eng.declare_order(w.n_company, w.n_age, &[30, 30]).is_err(), "昇順でない目盛り");
     assert!(w.eng.declare_order(w.n_company, "no_such_himo", &[30]).is_err(), "無い紐");
+    assert!(w.eng.drop_order("no_such_himo").is_err(), "無い紐は外せない");
+    let decl = |key: &str, ticks: &[u64]| vec![(w.n_company.to_string(), key.to_string(), ticks.to_vec())];
     w.eng.declare_order(w.n_company, w.n_age, &[30, 1001]).unwrap();
     w.eng.declare_order(w.n_company, w.n_age, &[30, 1001]).unwrap();
-    assert!(w.eng.declare_order(w.n_company, w.n_age, &[40]).is_err(), "同じ via に違う目盛り");
-    assert!(w.eng.declare_order(w.n_company, w.n_role, &[1]).is_err(), "同じ via に違う key");
+    assert_eq!(w.eng.order_declarations(), decl(w.n_age, &[30, 1001]));
+    w.eng.declare_order(w.n_company, w.n_age, &[40]).unwrap();
+    assert_eq!(w.eng.order_declarations(), decl(w.n_age, &[40]), "同じ via に違う目盛り = 置き換え");
+    w.eng.declare_order(w.n_company, w.n_role, &[1]).unwrap();
+    assert_eq!(w.eng.order_declarations(), decl(w.n_role, &[1]), "同じ via に違う key = 置き換え");
+    assert!(w.eng.drop_order(w.n_company).unwrap());
+    assert!(w.eng.order_declarations().is_empty());
+    assert!(!w.eng.drop_order(w.n_company).unwrap());
 }
 
 /// 円柱の大きさ (0 = 作っていない)。

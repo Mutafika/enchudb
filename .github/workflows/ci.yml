@@ -86,7 +86,7 @@ jobs:
         run: cargo miri test -p enchudb-engine --lib append_bucket
       - name: miri lockfree_cylinder (dense)
         run: cargo miri test -p enchudb-engine --lib "lockfree_cylinder::tests::dense"
-      # 並びの索引: 置き場の配列 (epoch で差し替え) と bucket の Slot、 drop。
+      # 並びの索引: 置き場の 3 段の表 (葉は CAS で置き、 drop まで動かさない) と bucket の Slot、 drop。
       - name: miri order_index
         run: cargo miri test -p enchudb-engine --lib order_index
 
