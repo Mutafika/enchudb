@@ -53,6 +53,7 @@
 use crate::append_bucket::AppendBucket;
 use crate::lockfree_cylinder::Slot;
 use crossbeam_epoch as epoch;
+#[cfg(not(miri))]
 use parking_lot::Mutex;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -182,6 +183,23 @@ impl<T> Drop for Radix<T> {
 
 /// 値 1024 個ぶんの置き場 (値ごとに帯の数だけ並ぶ)。
 struct Bins(Box<[Slot]>);
+
+/// Miri で検査する時の置き場の鍵: std の Mutex。 parking_lot_core 0.9.12 (今の最新) は Linux で待つ時に futex の syscall へ
+/// `&AtomicI32` を可変長引数で渡し、 新しい Miri はそれを UB と判定する (2026-10-11 の CI、 並行の test で鍵を待った時)。
+/// 普段の build は parking_lot のまま (動きは同じ: 取って、 guard を落とすと離す)。
+#[cfg(miri)]
+struct Mutex<T>(std::sync::Mutex<T>);
+
+#[cfg(miri)]
+impl<T> Mutex<T> {
+    fn new(v: T) -> Self {
+        Mutex(std::sync::Mutex::new(v))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, T> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
 
 /// 置き場の鍵 1 本 (隣の鍵と cache line を分ける。 Apple の M 系は 128 B)。
 #[repr(align(128))]
