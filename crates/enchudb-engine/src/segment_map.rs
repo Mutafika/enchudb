@@ -777,7 +777,7 @@ impl SegmentMap {
         let sim = enchudb_oplog::crashsim::active().then(|| {
             let hi = align_up(end, runtime_page_size()).min(self.committed());
             let bytes = unsafe { std::slice::from_raw_parts(self.base.add(offset), hi - offset) };
-            enchudb_oplog::crashsim::copy_for_sync(offset as u64, bytes)
+            enchudb_oplog::crashsim::copy_for_sync(enchudb_oplog::crashsim::Copied::Segment, offset as u64, bytes)
         });
         #[cfg(test)]
         let hooked = tests::flush_hook(&self.path);

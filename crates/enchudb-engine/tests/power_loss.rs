@@ -23,7 +23,7 @@
 use enchudb_engine::engine::write_out_hook::{self, Phase};
 use enchudb_engine::sync_payload_ring::PayloadRing;
 use enchudb_engine::{Engine, ValueType};
-use enchudb_oplog::crashsim::{self, Mode};
+use enchudb_oplog::crashsim::{self, Copied, Mode};
 use enchudb_oplog::oplog::{decode_sync_ops_payload, DecodedOp, OpLog, Record};
 use enchudb_oplog::{eid_local, Hlc};
 use std::path::{Path, PathBuf};
@@ -762,18 +762,36 @@ fn capture_does_not_carry_sidecar_pages_into_reused_inode() {
 
 /// 別の thread の `oplog_sync` を oplog を写した直後 (fsync の中、 本体の書き出しの前) で止め、 その間に `during` を
 /// 走らせてから続けさせる (返るまで待つ)。
-fn with_stalled_sync(eng: &Arc<Engine>, during: impl FnOnce()) {
+///
+/// consumer も、 次に oplog を写した所で止め、 返した [`ConsumerHeld`] を drop するまで止めておく。 止めないと consumer の
+/// 周期の書き出しが `during` の write の record を oplog ごと届かせることがある (CI の少ない CPU では毎回届いた)。 止める
+/// 所 (周期の oplog の fsync) は lock を持たない。 WAL の空き作り (#388) は append の lock を持ったまま書き出すので、 WAL
+/// が埋まる試験では使わないこと。 `during` で queue の write (`tie_async` …) を待つと止まる。
+fn with_stalled_sync(eng: &Arc<Engine>, during: impl FnOnce()) -> ConsumerHeld {
     let (copied_tx, copied_rx) = std::sync::mpsc::channel::<()>();
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let stall = std::sync::Mutex::new(Some((copied_tx, go_rx)));
-    crashsim::set_after_copy_hook(Some(Arc::new(move || {
-        if std::thread::current().name() != Some("stalled-sync") {
+    let hold = std::sync::Mutex::new(Some(release_rx));
+    crashsim::set_after_copy_hook(Some(Arc::new(move |what| {
+        if what != Copied::Oplog {
             return;
         }
-        let taken = stall.lock().unwrap().take();
-        if let Some((copied, go)) = taken {
-            copied.send(()).unwrap();
-            go.recv().unwrap();
+        match std::thread::current().name() {
+            Some("stalled-sync") => {
+                let taken = stall.lock().unwrap().take();
+                if let Some((copied, go)) = taken {
+                    copied.send(()).unwrap();
+                    go.recv().unwrap();
+                }
+            }
+            Some("enchudb-consumer") => {
+                let taken = hold.lock().unwrap().take();
+                if let Some(release) = taken {
+                    let _ = release.recv();
+                }
+            }
+            _ => {}
         }
     })));
     let stalled = {
@@ -784,7 +802,19 @@ fn with_stalled_sync(eng: &Arc<Engine>, during: impl FnOnce()) {
     during();
     go_tx.send(()).unwrap();
     stalled.join().unwrap();
-    crashsim::set_after_copy_hook(None);
+    ConsumerHeld(Some(release_tx))
+}
+
+/// [`with_stalled_sync`] が止めた consumer を、 drop で放す (hook も外す)。 像を撮った後、 engine を drop する前に。
+struct ConsumerHeld(Option<std::sync::mpsc::Sender<()>>);
+
+impl Drop for ConsumerHeld {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.take() {
+            let _ = release.send(());
+        }
+        crashsim::set_after_copy_hook(None);
+    }
 }
 
 /// #446: oplog の書き出しが重なって、 先に写した方が後で終わっても、 控えを古い写しへ戻さない。
@@ -816,7 +846,7 @@ fn overlapping_oplog_writes_do_not_roll_back_what_a_later_write_persisted() {
     eng.tie_text_to(e, "t.lf", "old");
     eng.oplog_sync().unwrap();
     eng.tie_text_to(e, "t.lf", "new");
-    with_stalled_sync(&eng, || {
+    let held = with_stalled_sync(&eng, || {
         eng.untie(e, "t.lf");
         // 書き出しが返った = この untie は電源断の後も残る
         eng.oplog_sync().unwrap();
@@ -824,6 +854,7 @@ fn overlapping_oplog_writes_do_not_roll_back_what_a_later_write_persisted() {
     let img = root.join("img");
     let captured = crashsim::capture(&live, &img, Mode::Lost);
     crashsim::stop();
+    drop(held);
     drop(eng);
     captured.unwrap();
     let got = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP)
@@ -863,8 +894,7 @@ fn floor_of(eng: &Engine, author: u32) -> Option<Hlc> {
 /// untie・delete。 値と untie は新しい HLC で作り直して cell の版数もそれに上げ、 delete は元の HLC のまま。
 ///
 /// 別の thread の `oplog_sync` を oplog を写した直後で止め、 その間に書き、 止めた方の本体の書き出しで届かせてから像を
-/// 撮る。 その間に consumer の周期の書き出しが oplog も届かせると前提が崩れるので、 像の oplog にその record が無いことを
-/// 確かめ、 崩れていたら撮り直す。
+/// 撮る (consumer の oplog の書き出しも止めておく)。 それでも像の oplog にその record があれば前提が崩れているので撮り直す。
 #[test]
 fn writes_on_disk_before_their_oplog_record_are_relogged_after_power_loss() {
     if std::env::var(VERIFY_ENV).is_ok() {
@@ -881,7 +911,7 @@ fn writes_on_disk_before_their_oplog_record_are_relogged_after_power_loss() {
         eng.tie_to(a, "notes.note", 1);
         eng.tie_to(e, "notes.note", 5);
         eng.oplog_sync().unwrap();
-        with_stalled_sync(&eng, || {
+        let held = with_stalled_sync(&eng, || {
             eng.tie_to(b, "notes.note", 22);
             eng.tie_text_to(c, "notes.tag", "fresh-word");
             eng.tie_text_to(d, "notes.body", "leaf body");
@@ -891,6 +921,7 @@ fn writes_on_disk_before_their_oplog_record_are_relogged_after_power_loss() {
         let img = root.join("img");
         let captured = crashsim::capture(&live, &img, Mode::Lost);
         crashsim::stop();
+        drop(held);
         let hid = |n: &str| eng.himo_id(n).unwrap() as u16;
         let (note, tag, body) = (hid("notes.note"), hid("notes.tag"), hid("notes.body"));
         let before = [eng.cell_hlc(b, note), eng.cell_hlc(c, tag), eng.cell_hlc(d, body), eng.cell_hlc(a, note)];

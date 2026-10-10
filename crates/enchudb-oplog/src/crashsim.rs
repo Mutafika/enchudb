@@ -53,8 +53,17 @@ struct Page {
 /// どの page も前の写しと同じか新しい中身
 static COPY: Mutex<u64> = Mutex::new(0);
 
-type Hook = std::sync::Arc<dyn Fn() + Send + Sync>;
+type Hook = std::sync::Arc<dyn Fn(Copied) + Send + Sync>;
 static AFTER_COPY: Mutex<Option<Hook>> = Mutex::new(None);
+
+/// 写したものの種類 ([`copy_for_sync`]、 hook にも渡す)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Copied {
+    /// oplog の fsync
+    Oplog,
+    /// segment の msync
+    Segment,
+}
 
 struct State {
     page: usize,
@@ -129,7 +138,7 @@ pub struct SyncCopy {
 /// 写すのは 1 本ずつで、 写した順番を付ける。 書き出しが重なって先に写した方が後で終わっても、 [`data_synced`] は
 /// 後に写した中身を古い写しで戻さない (#446: 戻していた頃は、 後の書き出しが届けた oplog の record が控えから消え、
 /// 開いた像が古い checkpoint から再生して、 書き出しの返った untie の前の値を当て直した)。
-pub fn copy_for_sync(offset: u64, bytes: &[u8]) -> SyncCopy {
+pub fn copy_for_sync(what: Copied, offset: u64, bytes: &[u8]) -> SyncCopy {
     let copy = {
         let mut last = COPY.lock().unwrap_or_else(|p| p.into_inner());
         *last += 1;
@@ -138,13 +147,13 @@ pub fn copy_for_sync(offset: u64, bytes: &[u8]) -> SyncCopy {
     // 写す係の lock を離してから (止めた書き出しの横で、 他の書き出しが写せるように)
     let hook = AFTER_COPY.lock().unwrap_or_else(|p| p.into_inner()).clone();
     if let Some(h) = hook {
-        h();
+        h(what);
     }
     copy
 }
 
-/// 試験用: [`copy_for_sync`] が写した直後 (書き出しの前) に呼ぶ hook。 書き出しを重ねる試験が、 写した後で書き出しを
-/// 止めるのに使う。 None で外す。
+/// 試験用: [`copy_for_sync`] が写した直後 (書き出しの前) に、 写したものの種類を渡して呼ぶ hook。 書き出しを重ねる試験が、
+/// 写した後で書き出しを止めるのに使う。 None で外す。
 pub fn set_after_copy_hook(hook: Option<Hook>) {
     *AFTER_COPY.lock().unwrap_or_else(|p| p.into_inner()) = hook;
 }
