@@ -15,7 +15,8 @@
 //! 3. **それ以外の entity も、 値があるならその entity に書いた値** (化けた値が出ない)
 //!
 //! 模型の前提 (metadata は journal で即 durable、 page 単位で書き出す) は crashsim の module doc。
-//! 失敗した像は `ENCHU_POWER_LOSS_KEEP=1` で消さずに残る (`ENCHU_POWER_LOSS_VERIFY` に渡して再現)。
+//! 失敗した像は `ENCHU_POWER_LOSS_KEEP=1` で消さずに残る (`ENCHU_POWER_LOSS_VERIFY` に渡して再現)。 検証は像を開いて
+//! 復旧する (oplog の再生 / bridge) ので、 撮ったままの像は隣の `imgNNN.raw` に写してある。
 
 #![cfg(all(feature = "crashsim", unix))]
 
@@ -607,6 +608,12 @@ fn run(kind: Kind) {
         if img.acked > 0 && img.acked < kind.batches() {
             mid += 1;
         }
+        // 検証の子は像を開いて復旧する (oplog の再生 / bridge) ので、 残す像は検証の前に写しを取っておく
+        let raw = img.dir.with_extension("raw");
+        if keep {
+            let st = Command::new("cp").arg("-R").arg(&img.dir).arg(&raw).status().expect("cp");
+            assert!(st.success(), "像を写せない: {}", img.dir.display());
+        }
         let (err, was_unborn) = verify_in_child(kind, &img.dir.join("db"), img.acked);
         // 作り終える前の像 (開けないが 「作成中」 と言い、 作り直せた) は数えるだけ
         if was_unborn {
@@ -614,13 +621,15 @@ fn run(kind: Kind) {
         }
         if err.is_empty() {
             let _ = std::fs::remove_dir_all(&img.dir);
+            let _ = std::fs::remove_dir_all(&raw);
         } else {
             failures.push(format!(
-                "{} ({:?}, acked {}): {err}\n    失われうる page: {:?}",
+                "{} ({:?}, acked {}): {err}\n    失われうる page: {:?}{}",
                 img.dir.display(),
                 img.mode,
                 img.acked,
-                img.divergent
+                img.divergent,
+                if keep { format!("\n    検証の前の像: {}", raw.display()) } else { String::new() }
             ));
             if !keep {
                 let _ = std::fs::remove_dir_all(&img.dir);
@@ -678,12 +687,6 @@ fn power_loss_keeps_values_rewritten_by_sync_writers() {
     run(Kind::LeafSync);
 }
 
-/// crashsim の控えが、 rename で置き換えた sidecar の inode 番号を引き継いだ列の segment に写らない。
-///
-/// Linux (ext4 / overlayfs) は空いた inode の番号をすぐ次に作った file に渡す。 置き換えで控えを捨てて
-/// いなかった頃は、 table の定義の sidecar を書き直した直後に作った列の page 0 に古い sidecar の控え
-/// (`TBL1`) が写り、 像を開くと列の header (value_size 1) として読んで panic した (CI の Linux だけ、
-/// 書き出しが返る前の像)。 番号を使い回さない FS (APFS) では元から起きない — ここは何も確かめずに通る。
 /// #441: sync の payload の ring は作った時に header を書き出す。 作った直後 (最初の本体の書き出しの前) に電源が落ちても
 /// ring を開ける (旧: header の無い file が残り、 以後ずっと bad magic で開けず、 payload を辞書に置いた)。
 #[test]
@@ -715,6 +718,12 @@ fn power_loss_keeps_sync_records_of_synced_batches() {
     run(Kind::Sync);
 }
 
+/// crashsim の控えが、 rename で置き換えた sidecar の inode 番号を引き継いだ列の segment に写らない。
+///
+/// Linux (ext4 / overlayfs) は空いた inode の番号をすぐ次に作った file に渡す。 置き換えで控えを捨てて
+/// いなかった頃は、 table の定義の sidecar を書き直した直後に作った列の page 0 に古い sidecar の控え
+/// (`TBL1`) が写り、 像を開くと列の header (value_size 1) として読んで panic した (CI の Linux だけ、
+/// 書き出しが返る前の像)。 番号を使い回さない FS (APFS) では元から起きない — ここは何も確かめずに通る。
 #[test]
 fn capture_does_not_carry_sidecar_pages_into_reused_inode() {
     if std::env::var(VERIFY_ENV).is_ok() {
@@ -747,6 +756,71 @@ fn capture_does_not_carry_sidecar_pages_into_reused_inode() {
     drop(eng);
     let _ = std::fs::remove_dir_all(&root);
     assert!(carried.is_empty(), "sidecar の控えが列の segment に写った: {carried:?}");
+}
+
+/// #446: oplog の書き出しが重なって、 先に写した方が後で終わっても、 控えを古い写しへ戻さない。
+///
+/// oplog の fsync は consumer の周期 / `oplog_sync` の呼び手が同時に呼ぶ。 crashsim は fsync の前に写した中身を
+/// 書き出しが返った後に控えに置くので、 先に写した方が後で終わると、 控えが後の書き出しより前の中身に戻っていた。
+/// 像を開くと古い控えの checkpoint から再生し、 書き出しの返った untie / 書き直しの前の値を当て直した (Linux の
+/// LeafSync が 54 run 中 5 回落ちた。 本物の msync はディスクの中身を古い方へ戻さない)。 ここは別の thread の
+/// `oplog_sync` を oplog を写した直後で止め、 その間に untie して `oplog_sync` を返らせてから、 止めた方を終わらせて
+/// 像を撮る。
+#[test]
+fn overlapping_oplog_writes_do_not_roll_back_what_a_later_write_persisted() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("overlap");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let db = live.join("db");
+    crashsim::start();
+    let mut eng = Engine::create_with_capacity(db.to_str().unwrap(), 65_536).unwrap();
+    eng.define_table("t", 1_000).unwrap();
+    eng.define_himo_in("t", "lf", ValueType::Leaf, 0).unwrap();
+    eng.flush().unwrap();
+    eng.persist_tables().unwrap();
+    let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+    let e = eng.entity_in("t").unwrap();
+    eng.tie_text_to(e, "t.lf", "old");
+    eng.oplog_sync().unwrap();
+    eng.tie_text_to(e, "t.lf", "new");
+    // 別の thread の書き出しを、 oplog を写した直後で 1 度だけ止める
+    let (copied_tx, copied_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let stall = std::sync::Mutex::new(Some((copied_tx, go_rx)));
+    crashsim::set_after_copy_hook(Some(Arc::new(move || {
+        if std::thread::current().name() != Some("stalled-sync") {
+            return;
+        }
+        let taken = stall.lock().unwrap().take();
+        if let Some((copied, go)) = taken {
+            copied.send(()).unwrap();
+            go.recv().unwrap();
+        }
+    })));
+    let stalled = {
+        let eng = eng.clone();
+        std::thread::Builder::new().name("stalled-sync".into()).spawn(move || eng.oplog_sync().unwrap()).unwrap()
+    };
+    copied_rx.recv().unwrap();
+    eng.untie(e, "t.lf");
+    // 書き出しが返った = この untie は電源断の後も残る
+    eng.oplog_sync().unwrap();
+    go_tx.send(()).unwrap();
+    stalled.join().unwrap();
+    crashsim::set_after_copy_hook(None);
+    let img = root.join("img");
+    let captured = crashsim::capture(&live, &img, Mode::Lost);
+    crashsim::stop();
+    drop(eng);
+    captured.unwrap();
+    let got = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP)
+        .map(|eng| eng.get_text_owned(e, "t.lf").map(|b| String::from_utf8_lossy(&b).into_owned()));
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(got.unwrap(), None, "書き出しの返った untie が電源断の像で消え、 前の値が戻った");
 }
 
 /// #419: 本体の書き出し (`body_msync`) の途中で並行の書き手が中身と cell を書いても、 cell だけがディスクに届くことは

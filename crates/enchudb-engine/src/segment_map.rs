@@ -776,7 +776,8 @@ impl SegmentMap {
         #[cfg(feature = "crashsim")]
         let sim = enchudb_oplog::crashsim::active().then(|| {
             let hi = align_up(end, runtime_page_size()).min(self.committed());
-            unsafe { std::slice::from_raw_parts(self.base.add(offset), hi - offset) }.to_vec()
+            let bytes = unsafe { std::slice::from_raw_parts(self.base.add(offset), hi - offset) };
+            enchudb_oplog::crashsim::copy_for_sync(offset as u64, bytes)
         });
         #[cfg(test)]
         let hooked = tests::flush_hook(&self.path);
@@ -800,12 +801,12 @@ impl SegmentMap {
             Ok(()) => {
                 UNFLUSHED.fetch_sub(flushed, Ordering::AcqRel);
                 #[cfg(feature = "crashsim")]
-                if let Some(bytes) = sim {
+                if let Some(copy) = sim {
                     match &self.file {
-                        Some(f) => enchudb_oplog::crashsim::data_synced(f, offset as u64, &bytes),
+                        Some(f) => enchudb_oplog::crashsim::data_synced(f, copy),
                         None => {
                             if let Ok(f) = self.reopen() {
-                                enchudb_oplog::crashsim::data_synced(&f, offset as u64, &bytes);
+                                enchudb_oplog::crashsim::data_synced(&f, copy);
                             }
                         }
                     }

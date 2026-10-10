@@ -7,7 +7,7 @@
 //! ここは 「どの byte がディスクに届いたと言えるか」 を書き手の横で記録する:
 //!
 //! - **書き出しの記録** — engine が msync (segment / oplog) や `sync_all` (sidecar) に成功した所で、
-//!   書き出した page の中身を控える ([`data_synced`] / [`file_synced`])。 控えは file の
+//!   書き出した page の中身を控える ([`copy_for_sync`] → [`data_synced`] / [`file_synced`])。 控えは file の
 //!   (device, inode) ごと (rename で名前が変わっても同じ file を指す)。 Linux (ext4 / overlayfs) は空いた
 //!   inode の番号をすぐ次に作った file に渡すので、 控えのある file を手放す所 (rename での置き換え /
 //!   削除) は [`releasing`] を通して控えを捨てる (捨てないと、 番号を引き継いだ別の file に古い控えが写る)。
@@ -23,6 +23,9 @@
 //! - msync / fsync は page 単位で書き出す。 page の途中で破れる (torn sector) は見ない
 //! - 書き出しの記録は msync の **前に** 中身を写し、 成功した後に控える。 書き出しの最中に書き手が
 //!   page を書き換えても、 控えは 「確かに届いた」 側 (古い方) に倒れる
+//! - 書き出しは重なりうる (oplog の fsync は consumer の周期と `oplog_sync` の呼び手が同時に呼ぶ)。 後に写した方の
+//!   msync が返れば写した時点の中身は届いていて、 先に写した方が後で終わってもディスクは古い方へ戻らない。 控えは
+//!   page ごとに後に写した中身を残す (写すのは 1 本ずつ、 写した順 = 中身の新しさ、 #446)
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -36,8 +39,22 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static EVENTS: AtomicU64 = AtomicU64::new(0);
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
-/// page 番号 → 書き出しの済んだ中身 (page 長、 末尾の page も page 長)
-type Pages = BTreeMap<u64, Box<[u8]>>;
+/// page 番号 → 書き出しの済んだ中身
+type Pages = BTreeMap<u64, Page>;
+
+struct Page {
+    /// 中身を写した順番 ([`copy_for_sync`] / [`file_synced`])。 大きいほど新しい中身
+    order: u64,
+    /// page 長 (末尾の page も page 長)
+    bytes: Box<[u8]>,
+}
+
+/// 写す係を 1 本に並べる lock と、 最後に写した順番。 写している間は他が写さないので、 順番が後の写しは
+/// どの page も前の写しと同じか新しい中身
+static COPY: Mutex<u64> = Mutex::new(0);
+
+type Hook = std::sync::Arc<dyn Fn() + Send + Sync>;
+static AFTER_COPY: Mutex<Option<Hook>> = Mutex::new(None);
 
 struct State {
     page: usize,
@@ -98,10 +115,42 @@ fn identity(file: &File) -> io::Result<(u64, u64)> {
     Ok((md.dev(), md.ino()))
 }
 
-/// mmap の `[offset, offset + bytes.len())` の書き出しが済んだ (msync 成功)。 `bytes` は msync の
-/// **前に** 写した中身。 offset は page 境界であること (msync は page 単位で書くので、 呼ぶ側は
-/// 末尾も page まで広げて写す — 写した範囲の外は控えに入らない)。
-pub fn data_synced(file: &File, offset: u64, bytes: &[u8]) {
+/// msync / fsync の前に写した中身 ([`copy_for_sync`])。 書き出しが成功したら [`data_synced`] に渡す。
+pub struct SyncCopy {
+    order: u64,
+    offset: u64,
+    bytes: Vec<u8>,
+}
+
+/// msync / fsync の **前に**、 書き出す範囲の今の中身を写す。 `bytes` は file の `[offset, offset + len)` の mmap。
+/// offset は page 境界であること (msync は page 単位で書くので、 呼ぶ側は末尾も page まで広げて写す — 写した範囲の
+/// 外は控えに入らない)。
+///
+/// 写すのは 1 本ずつで、 写した順番を付ける。 書き出しが重なって先に写した方が後で終わっても、 [`data_synced`] は
+/// 後に写した中身を古い写しで戻さない (#446: 戻していた頃は、 後の書き出しが届けた oplog の record が控えから消え、
+/// 開いた像が古い checkpoint から再生して、 書き出しの返った untie の前の値を当て直した)。
+pub fn copy_for_sync(offset: u64, bytes: &[u8]) -> SyncCopy {
+    let copy = {
+        let mut last = COPY.lock().unwrap_or_else(|p| p.into_inner());
+        *last += 1;
+        SyncCopy { order: *last, offset, bytes: bytes.to_vec() }
+    };
+    // 写す係の lock を離してから (止めた書き出しの横で、 他の書き出しが写せるように)
+    let hook = AFTER_COPY.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    if let Some(h) = hook {
+        h();
+    }
+    copy
+}
+
+/// 試験用: [`copy_for_sync`] が写した直後 (書き出しの前) に呼ぶ hook。 書き出しを重ねる試験が、 写した後で書き出しを
+/// 止めるのに使う。 None で外す。
+pub fn set_after_copy_hook(hook: Option<Hook>) {
+    *AFTER_COPY.lock().unwrap_or_else(|p| p.into_inner()) = hook;
+}
+
+/// [`copy_for_sync`] で写した範囲の書き出しが済んだ (msync 成功)。 page ごとに、 控えより後に写した中身だけ置く。
+pub fn data_synced(file: &File, copy: SyncCopy) {
     if !active() {
         return;
     }
@@ -109,12 +158,17 @@ pub fn data_synced(file: &File, offset: u64, bytes: &[u8]) {
     let mut guard = STATE.lock().unwrap();
     let Some(st) = guard.as_mut() else { return };
     let ps = st.page as u64;
-    debug_assert_eq!(offset % ps, 0, "crashsim::data_synced: offset が page 境界に無い");
+    debug_assert_eq!(copy.offset % ps, 0, "crashsim::data_synced: offset が page 境界に無い");
     let pages = st.files.entry(id).or_default();
-    for (i, chunk) in bytes.chunks(st.page).enumerate() {
-        let p = offset / ps + i as u64;
-        let slot = pages.entry(p).or_insert_with(|| vec![0u8; st.page].into_boxed_slice());
-        slot[..chunk.len()].copy_from_slice(chunk);
+    for (i, chunk) in copy.bytes.chunks(st.page).enumerate() {
+        let p = copy.offset / ps + i as u64;
+        let page = pages.entry(p).or_insert_with(|| Page { order: 0, bytes: vec![0u8; st.page].into_boxed_slice() });
+        // 後に写した中身が先に届いている (重なった書き出しの、 先に写した方が後で終わった)
+        if page.order > copy.order {
+            continue;
+        }
+        page.order = copy.order;
+        page.bytes[..chunk.len()].copy_from_slice(chunk);
     }
     EVENTS.fetch_add(1, Ordering::Relaxed);
 }
@@ -129,15 +183,21 @@ pub fn file_synced(path: &Path) {
     // 読めないなら控えない、 では 「控えが無い = 全部失う」 像になって検証が嘘をつく。 落とす
     let file = File::open(path).unwrap_or_else(|e| panic!("crashsim::file_synced: {} を開けない: {e}", path.display()));
     let id = identity(&file).expect("crashsim::file_synced: metadata");
-    let buf = std::fs::read(path).unwrap_or_else(|e| panic!("crashsim::file_synced: {} を読めない: {e}", path.display()));
+    // 書き出しの後に読んだ中身は、 それまでに写したどの中身より新しい (写す係と同じ順番に並べる)
+    let (order, buf) = {
+        let mut last = COPY.lock().unwrap_or_else(|p| p.into_inner());
+        *last += 1;
+        let buf = std::fs::read(path).unwrap_or_else(|e| panic!("crashsim::file_synced: {} を読めない: {e}", path.display()));
+        (*last, buf)
+    };
     let mut guard = STATE.lock().unwrap();
     let Some(st) = guard.as_mut() else { return };
     let pages = st.files.entry(id).or_default();
     pages.clear();
     for (i, chunk) in buf.chunks(st.page).enumerate() {
-        let mut slot = vec![0u8; st.page].into_boxed_slice();
-        slot[..chunk.len()].copy_from_slice(chunk);
-        pages.insert(i as u64, slot);
+        let mut bytes = vec![0u8; st.page].into_boxed_slice();
+        bytes[..chunk.len()].copy_from_slice(chunk);
+        pages.insert(i as u64, Page { order, bytes });
     }
     EVENTS.fetch_add(1, Ordering::Relaxed);
 }
@@ -222,7 +282,7 @@ fn copy_file(
     for p in 0..n_pages {
         let off = p * ps;
         let take = ((len - off) as usize).min(st.page);
-        let saved: Option<&[u8]> = durable.and_then(|m| m.get(&p)).map(|b| &b[..take]);
+        let saved: Option<&[u8]> = durable.and_then(|m| m.get(&p)).map(|pg| &pg.bytes[..take]);
         let has_data = data.as_ref().is_none_or(|d| d.contains(p));
         let current: Option<&[u8]> = if has_data {
             src.read_exact_at(&mut cur[..take], off)?;

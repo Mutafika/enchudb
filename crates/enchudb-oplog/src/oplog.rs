@@ -1662,11 +1662,11 @@ impl OpLog {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn fsync(&self) -> io::Result<()> {
         #[cfg(all(feature = "crashsim", unix))]
-        let sim = crate::crashsim::active().then(|| self.mmap.to_vec());
+        let sim = crate::crashsim::active().then(|| crate::crashsim::copy_for_sync(0, &self.mmap));
         self.mmap.flush()?;
         #[cfg(all(feature = "crashsim", unix))]
-        if let Some(bytes) = sim {
-            crate::crashsim::data_synced(&self._file, 0, &bytes);
+        if let Some(copy) = sim {
+            crate::crashsim::data_synced(&self._file, copy);
         }
         Ok(())
     }
