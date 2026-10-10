@@ -762,9 +762,10 @@ fn capture_does_not_carry_sidecar_pages_into_reused_inode() {
 ///
 /// oplog の fsync は consumer の周期 / `oplog_sync` の呼び手が同時に呼ぶ。 crashsim は fsync の前に写した中身を
 /// 書き出しが返った後に控えに置くので、 先に写した方が後で終わると、 控えが後の書き出しより前の中身に戻っていた。
-/// 像を開くと古い控えの checkpoint から再生し、 書き出しの返った untie の前の値を当て直した (LeafSync が Linux で
-/// 5〜10 run に 1 回落ちた。 本物の msync はディスクの中身を古い方へ戻さない)。 ここは別の thread の `oplog_sync` を
-/// oplog を写した直後で止め、 その間に untie して `oplog_sync` を返らせてから、 止めた方を終わらせて像を撮る。
+/// 像を開くと古い控えの checkpoint から再生し、 書き出しの返った untie / 書き直しの前の値を当て直した (Linux の
+/// LeafSync が 54 run 中 5 回落ちた。 本物の msync はディスクの中身を古い方へ戻さない)。 ここは別の thread の
+/// `oplog_sync` を oplog を写した直後で止め、 その間に untie して `oplog_sync` を返らせてから、 止めた方を終わらせて
+/// 像を撮る。
 #[test]
 fn overlapping_oplog_writes_do_not_roll_back_what_a_later_write_persisted() {
     if std::env::var(VERIFY_ENV).is_ok() {
