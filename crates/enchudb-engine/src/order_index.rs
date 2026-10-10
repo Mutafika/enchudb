@@ -1,6 +1,7 @@
 //! 並びの索引 ([`OrderIndex`]、 2026-10-10)。 ref 紐 `via` の逆引き (「会社 c を指している社員」) を、 別の紐 `key`
 //! (年齢など) の値の帯ごとに分けて持つ。 会社単位の購読の 「会社 c の 30 歳以上は誰 / 何人」 を、 会社の全員をなめずに
-//! 30 歳以上の帯だけ読む / 帯の件数を足すだけで答える。
+//! 30 歳以上の帯だけ読む / 帯の件数を足すだけで答える。 宣言した via の紐の逆引き (`pull` など) も、 全部の帯を読んで
+//! これが答える (その紐の円柱は作らない。 [`all_bands`](OrderIndex::all_bands))。
 //!
 //! ## 形
 //!
@@ -283,6 +284,11 @@ impl OrderIndex {
             None => hi >= self.key_max,
         };
         Bands { lo: k_lo, hi: k_hi, exact: lo_ok && hi_ok }
+    }
+
+    /// 全部の帯 (値が無い帯 0 から最後の帯まで) = via の値を指している entity の全員 (`pull` の代わりに読む時)。
+    pub(crate) fn all_bands(&self) -> Bands {
+        Bands { lo: 0, hi: self.n_bands() - 1, exact: true }
     }
 
     /// ref の値 `v` の帯 `k` の置き場の番号 (`v < base` か、 番号 + 1 が u32 に入らなければ None)。

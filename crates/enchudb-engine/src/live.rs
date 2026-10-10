@@ -3699,19 +3699,41 @@ impl Family {
                 })
             });
         let Some((n, ents)) = pick else { return Vec::new() };
-        let (_, mut ents) = self.climb(r, n, ents, 0, |_, _| {});
+        // 根に範囲の穴があれば、 根へ降りる最後の段は並びの索引の範囲の帯だけ読む (返すのは上位集合で、 根の条件は呼び手が
+        // 評価する。 範囲に当たらない根は結果に入らない)
+        let root_arc = match (self.range, range) {
+            (Some((0, key)), Some((lo, hi))) => Some((key, lo, hi)),
+            _ => None,
+        };
+        let (_, mut ents) = self.climb(r, n, ents, 0, root_arc, |_, _| {});
         ents.sort_unstable();
         ents.dedup();
         ents
     }
 
     /// 節 `n` の entity `ents` から、 それを (ref の道で) 指している節 `to` の entity まで遡る。
-    /// 途中の各節 (`n` を含み `to` を含まない) で `f(節, entity)` を呼ぶ。
-    fn climb(&self, r: &impl CellReader, mut n: usize, mut ents: Vec<u32>, to: usize, mut f: impl FnMut(usize, &[u32])) -> (usize, Vec<u32>) {
+    /// 途中の各節 (`n` を含み `to` を含まない) で `f(節, entity)` を呼ぶ。 `root_arc` = (紐 key, lo, hi) なら、 根へ降りる
+    /// 段は並びの索引 (via, key) の `lo..=hi` の帯だけ読む (索引が無い / 答えられない時は全員。 どちらも上位集合)。
+    fn climb(
+        &self,
+        r: &impl CellReader,
+        mut n: usize,
+        mut ents: Vec<u32>,
+        to: usize,
+        root_arc: Option<(u16, u64, u64)>,
+        mut f: impl FnMut(usize, &[u32]),
+    ) -> (usize, Vec<u32>) {
         while n != to && n != 0 {
             f(n, &ents);
             let via = self.nodes[n].via;
-            let mut up: Vec<u32> = ents.iter().flat_map(|&e| r.pull(via, e as u64)).collect();
+            let arc = root_arc.filter(|&(key, ..)| self.nodes[n].parent == 0 && r.has_order(via, key));
+            let mut up: Vec<u32> = Vec::new();
+            for &e in &ents {
+                let from_order = arc.is_some_and(|(key, lo, hi)| r.order_arc_into(via, key, e, lo, hi, &mut up).is_some());
+                if !from_order {
+                    r.pull_into(via, e as u64, &mut up);
+                }
+            }
             up.sort_unstable();
             up.dedup();
             ents = up;
@@ -3728,7 +3750,7 @@ impl Family {
     fn forget_stale(&self, r: &impl CellReader, s: &mut Settled, vals: &[u64]) {
         for (n, node) in self.nodes.iter().enumerate().skip(1) {
             for &(h, slot) in &node.holes {
-                self.climb(r, n, r.pull(h, vals[slot]), 0, |m, ents| {
+                self.climb(r, n, r.pull(h, vals[slot]), 0, None, |m, ents| {
                     for &e in ents {
                         s.recs[m].forget(e);
                     }
@@ -3752,7 +3774,7 @@ impl Family {
         if ents.is_empty() {
             return;
         }
-        self.climb(r, rn, ents.clone(), 0, |m, es| {
+        self.climb(r, rn, ents.clone(), 0, None, |m, es| {
             for &e in es {
                 s.recs[m].forget(e);
             }
