@@ -67,6 +67,7 @@ use enchudb_engine::{Engine, ValueType};
 pub use enchudb_engine::engine::TableEidUsage;
 pub use enchudb_engine::{GrowableOptions, LeafScale};
 pub use enchudb_engine::LiveDelta;
+pub use enchudb_engine::TouchedDelta;
 use enchudb_oplog::EntityId;
 use std::sync::Arc;
 
@@ -2240,6 +2241,77 @@ impl GroupedLiveQuery {
 }
 
 impl std::fmt::Debug for GroupedLiveQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+/// [`Query::subscribe_touched`] の戻り値。 group (ref の先の row) の出入りに加えて、 根の列が書かれた row (見直す場所) を
+/// 返す購読。 drop で購読解除、 `Database` を借用しない。
+pub struct TouchedLiveQuery {
+    inner: enchudb_engine::TouchedLiveQuery,
+    eng: Arc<Engine>,
+}
+
+impl TouchedLiveQuery {
+    /// 前回 poll からの group の出入りと、 根の列 (ref の列と、 dotted でない条件の列) が書かれた row。 初回は登録時点の
+    /// 全 group が `added`。 `touched` の row は [`group_of`](Self::group_of) で引き直す (答えに入ったかどうかは判定していない)。
+    pub fn poll(&self) -> TouchedDelta {
+        self.inner.poll(&self.eng)
+    }
+
+    /// row が今答えに居るなら、 その group。 居なければ None (消された row も None)。
+    pub fn group_of(&self, row: EntityId) -> Option<EntityId> {
+        self.inner.group_of(&self.eng, row)
+    }
+
+    /// row が今答えに居るか。
+    pub fn contains(&self, row: EntityId) -> bool {
+        self.inner.contains(&self.eng, row)
+    }
+
+    /// 今条件を満たす group (eid 昇順)。
+    pub fn groups(&self) -> Vec<EntityId> {
+        self.inner.groups(&self.eng)
+    }
+
+    /// [`GroupedLiveQuery::members`] と同じ。
+    pub fn members(&self, group: EntityId) -> Vec<EntityId> {
+        self.inner.members(&self.eng, group)
+    }
+
+    /// [`GroupedLiveQuery::members_many`] と同じ。
+    pub fn members_many(&self, groups: &[EntityId]) -> Vec<Vec<EntityId>> {
+        self.inner.members_many(&self.eng, groups)
+    }
+
+    /// [`GroupedLiveQuery::count_in`] と同じ。
+    pub fn count_in(&self, group: EntityId) -> usize {
+        self.inner.count_in(&self.eng, group)
+    }
+
+    /// 平らにした結果の件数 (= 同じ条件の `find()?.len()`)。
+    pub fn count(&self) -> usize {
+        self.inner.count(&self.eng)
+    }
+
+    /// 平らにした結果全体 (= 同じ条件の `find()`)。
+    pub fn flatten(&self) -> Vec<EntityId> {
+        self.inner.flatten(&self.eng)
+    }
+
+    /// 未 poll の group の出入りか見直しがありうるか。
+    pub fn is_dirty(&self) -> bool {
+        self.inner.is_dirty()
+    }
+
+    /// engine 内で一意な購読 id。
+    pub fn id(&self) -> u64 {
+        self.inner.id()
+    }
+}
+
+impl std::fmt::Debug for TouchedLiveQuery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.inner.fmt(f)
     }
@@ -5654,6 +5726,35 @@ impl<'a> Query<'a> {
         })?;
         let inner = eng.subscribe_grouped(preds).map_err(|e| SchemaError::BadValue(e.to_string()))?;
         Ok(GroupedLiveQuery { inner, eng })
+    }
+
+    /// 見直す場所だけを返す購読。 分け方は [`subscribe_grouped`](Self::subscribe_grouped) と同じ (差分は group = ref の先の
+    /// row の出入り)。 加えて poll の `touched` に、 **前回 poll 以降に ref の列や dotted でない条件の列が書かれた row** が出る。
+    /// row ごとの答えは持たず計算もしない: アプリは `touched` の row を [`TouchedLiveQuery::group_of`] で引き直す
+    /// (異動・年齢の変化・削除・作り直しも、 引き直すだけで今の状態になる)。 書き込み 1 回のコストは印 1 つ。
+    ///
+    /// ```ignore
+    /// let w = users.where_eq("company.city", "Tokyo").where_ge("age", 30).subscribe_touched()?;
+    /// let d = w.poll();
+    /// for (g, staff) in d.added.iter().zip(w.members_many(&d.added)) { /* 入った会社の社員 */ }
+    /// for u in d.touched { match w.group_of(u) { Some(g) => { /* 居る (会社 g) */ } None => { /* 居ない */ } } }
+    /// ```
+    ///
+    /// - dotted でない条件は列 1 つで決まるもの (`where_eq` / `where_in` / `where_range` / `where_gt` 系 / `where_ne` /
+    ///   `where_null` など) だけ。 `where_exists` 系は `BadValue`
+    /// - `limit` は `BadValue`
+    pub fn subscribe_touched(self) -> Result<TouchedLiveQuery, SchemaError> {
+        if self.limit.is_some() {
+            return Err(SchemaError::BadValue("subscribe: limit is not supported".into()));
+        }
+        let eng = self.db.arc_engine();
+        let preds = self.live_preds()?.ok_or_else(|| {
+            SchemaError::BadValue(
+                "subscribe: where_eq on an unknown column or with a mismatched value type".into(),
+            )
+        })?;
+        let inner = eng.subscribe_touched(preds).map_err(|e| SchemaError::BadValue(e.to_string()))?;
+        Ok(TouchedLiveQuery { inner, eng })
     }
 
     /// この条件の結果を **列 `col` の値ごとに数えた件数** を購読する (live の `GROUP BY col` +

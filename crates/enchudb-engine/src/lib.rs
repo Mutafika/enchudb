@@ -94,7 +94,7 @@ pub mod blob_store;
 pub mod sparse_copy;
 
 pub use engine::{DbState, Engine, EntityValue, EntityValueOwned, SnapshotFiles, AuditFilter, MigrationStats, LeafScale, GrowableOptions, FaultKind, RemoteApply, TieRejected, VocabUsage};
-pub use live::{Agg, GroupedLiveQuery, KeyedDelta, LiveCounts, LiveGroup, LiveDelta, LiveKeyed, LivePred, LiveQuery, MAX_BRANCHES, MAX_KEYS};
+pub use live::{Agg, GroupedLiveQuery, KeyedDelta, LiveCounts, LiveGroup, LiveDelta, LiveKeyed, LivePred, LiveQuery, TouchedDelta, TouchedLiveQuery, MAX_BRANCHES, MAX_KEYS};
 pub use sparse_copy::copy_sparse;
 #[cfg(not(target_arch = "wasm32"))]
 pub use engine::copy_db_dir;
