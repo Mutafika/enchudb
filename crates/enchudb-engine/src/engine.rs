@@ -6091,19 +6091,32 @@ impl Engine {
         *ON.get_or_init(|| std::env::var("ENCHU_TRACE_BRIDGE").is_ok_and(|v| v != "0"))
     }
 
-    /// `try_reset_if` の述語として `append_lock` 保持下で呼ばれる `wal_fold_safe`。
+    /// `try_reset_if` の述語として `append_lock` 保持下で呼ばれる `wal_fold_safe`。 true なら呼び手はそのまま畳む。
     ///
-    /// 判定内容は `wal_fold_safe` と同一。 違いは **false だった回数を数える**点だけ。
-    /// lock 外の pre-check が true を返した後にここで false になるのは、 pre-check と
-    /// fold の間に append + `advance_checkpoint` が割り込んだ場合だけなので、
-    /// この counter は check-then-act の窓を踏んだ回数そのものになる。
+    /// 判定内容は `wal_fold_safe` と同一。 違いは 2 つ:
+    ///
+    /// - **false だった回数を数える**。 lock 外の pre-check が true を返した後にここで false になるのは、 pre-check と
+    ///   fold の間に append + `advance_checkpoint` が割り込んだ場合だけなので、 この counter は check-then-act の窓を
+    ///   踏んだ回数そのものになる
+    /// - true の時、 bridge の cursor より先に残っている record (満杯の死区間の例外で畳む時だけ在る、 閉じの Commit が
+    ///   入らなかった孤児の group) を、 WAL に載らなかった write (#57) と同じに覚える (#450)。 その write は本体に
+    ///   当たっているのに、 畳むと `_sync_ops` にも WAL にも無くなる — 覚えれば bridge がその author の floor を上げる
     pub fn wal_fold_safe_locked(&self) -> bool {
         let safe = self.wal_fold_safe();
         if !safe {
             self.fold_race_saves
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
         }
-        safe
+        if self.sync_tables_enabled()
+            && let Some(wal) = self.oplog.as_ref()
+        {
+            let from = self.sync_ops_offset.load(std::sync::atomic::Ordering::Acquire);
+            if from < wal.head() {
+                wal.note_uncommitted_tail_dropped(from);
+            }
+        }
+        true
     }
 
     /// fold (`try_reset` + `reset_sync_ops_offset`) を `transfer_oplog_to_sync_ops`
