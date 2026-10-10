@@ -5548,6 +5548,10 @@ impl Engine {
         // WAL_DROP_FLOOR_MAX_DELAY_MS 経った周。 満杯の間ずっと 100 ms ごとに上げると、 全 peer が
         // pull のたびに全状態を bootstrap する。 待つ間に配った record は上げる時の 「今」 より小さい
         // HLC なので、 その puller も bootstrap に回る (待っても取りこぼさない)。
+        //
+        // 閉じる時 (consumer の最後の bridge) は待たずに上げる (#449)。 落ちたことはメモリにしか無いので、
+        // 待つと閉じた後に floor が残らず、 落ちた write は本体にあるのに相手に永久に届かない。
+        let closing = self.shutdown_flag.as_ref().is_some_and(|f| f.load(Ordering::Acquire));
         let fresh = wal.take_dropped();
         let due = {
             let mut p = self.wal_drop_pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -5567,7 +5571,7 @@ impl Engine {
                     *last = now_ms;
                 }
                 let quiet = now_ms.saturating_sub(*last) >= WAL_DROP_EPISODE_QUIET_MS;
-                if quiet || now_ms.saturating_sub(*first) >= WAL_DROP_FLOOR_MAX_DELAY_MS {
+                if closing || quiet || now_ms.saturating_sub(*first) >= WAL_DROP_FLOOR_MAX_DELAY_MS {
                     p.1 = None;
                     Some(std::mem::take(&mut p.0))
                 } else {
@@ -6218,7 +6222,7 @@ impl Engine {
     /// bootstrap で live state (落ちた write を含む) を受け取る。 平常時は 0。
     ///
     /// 上げるのは bridge (`transfer_oplog_to_sync_ops`) が満杯の episode の終わり (新しく落ちなかった周) を
-    /// 見た時、 または最初に落ちてから 5 秒経った時。
+    /// 見た時、 最初に落ちてから 5 秒経った時、 または閉じる時 (#449)。
     pub fn wal_drop_floor_bumps(&self) -> u64 {
         self.wal_drop_floor_bumps.load(std::sync::atomic::Ordering::Relaxed)
     }
