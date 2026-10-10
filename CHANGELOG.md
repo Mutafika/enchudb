@@ -3,6 +3,68 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.31.4 — 2026-10-10
+
+patch。 on-disk 形式・wire 形式は 0.31.3 と同じ。 Engine / schema の API は変わらない (観測用の
+`Engine::unlogged_writes_relogged` が増えた。 低レベルの `OpLog` に `records_with_tail` / `note_uncommitted_tail_dropped`、
+`oplog::sync_ops_payload_author_hlc` が増えた。 試験専用の feature `crashsim` は `copy_for_sync` と `set_after_copy_hook` の
+hook に、 写したものの種類 (`Copied`) の引数が増えた)。 sync する DB で、 本体には届いているのに相手の peer に永久に届かない
+write の 3 件 (#57 の WAL が満杯の時の続きと、 電源断の後)。
+
+**上げる時の注意**:
+
+- sync する DB (cell の版数 + `enable_sync_tables`) を、 きれいに閉じなかった後 (process の死 / 電源断) に開くと、 cell の
+  版数の列・oplog・`_sync_ops` の行を全部読んで突き合わせる (#451)。 その分開くのが遅くなる (20 万行 × 3 列、 配る分 76 万行の
+  DB で 12 ms → 124 ms)。 きれいに閉じた後は読まないので変わらない
+- 開く時に作り直した record には署名が無い (開いた時点では鍵がまだ無い)。 `require_signature` の相手は受け取らない (#140 の
+  state 転写と同じ)。 作り直した / floor を上げた時は stderr に 1 行の警告 (`[enchudb] open after an unclean shutdown: ...`)
+- WAL が満杯で write が落ちてすぐ閉じた DB、 孤児の group を畳んだ DB、 開く時に作り直せなかった DB は floor を上げる。 その
+  相手は次の差分 pull で `history_truncated` になり、 bootstrap で取り直す (旧: 何も知らされず、 永久にずれたままだった)
+
+### Fixed — 電源断の後、 oplog の fsync と本体の書き出しの間に書いた write が本体にだけ残り、 相手に永久に届かなかった (#451、 #455)
+
+書き出しは 「oplog を fsync → 本体を msync」 の順で、 その間に別の thread が書いた write は本体にだけ届く (OS が本体の page を
+先に書き出した時も同じ)。 電源断の後、 その write は本体にあるのに oplog に無く、 bridge が `_sync_ops` に写さないので、 相手に
+永久に届かなかった (floor も上がらない)。 下の #449 / #450 で、 floor を上げる前 / 畳む前に電源が落ちた分も同じ形。
+
+きれいに閉じなかった後に開く時 (oplog の再生の後、 consumer を起こす前)、 自分の cell の版数と削除の印 (tombstone) を、 配る
+経路が知っている自分の HLC (oplog の record、 `_sync_ops` の行の payload、 floor 以下) と突き合わせる。 どれにも無い write は
+作り直して oplog に載せ、 開いた後の bridge が配る分に写す。
+
+- 値のある cell / untie した cell: 新しい HLC で作り直し (Number / Ref = Tie、 Tag = 語 + Tie、 Leaf = TieLeaf、 untie = Untie)、
+  cell の版数もその HLC に上げる。 元の HLC のままだと Tag の語の record に付ける HLC が無く、 相手の cursor が元の HLC を越えて
+  いると届かない
+- delete: 元の HLC のまま (新しい HLC にすると、 削除の後に書いた cell を相手側で消す)。 元の HLC が配った分の最大以下の delete
+  がある時は、 作り直さずに floor を上げる
+- oplog が満杯で載らない時: floor を上げる (floor = 開いた時の今 は自分の write を全部覆う、 相手は取り直す)
+- きれいに閉じたかは紐名の辞書の clean flag で見る。 `concurrentize_with_oplog` で書き始める時もこの flag を倒す (旧: create →
+  flush → concurrentize の DB は、 新しい語 / 紐を足すまで 「きれいに閉じた」 の印のまま書いていた)
+- 対象外: 中継した他人の cell (author の署名を作れない)、 配らない table、 content
+
+### Fixed — WAL が満杯で落ちた write の floor を閉じる時に上げず、 落ちてすぐ閉じるとその write が相手に永久に届かなかった (#449、 #452)
+
+WAL が満杯で載らなかった write (#57) の floor を上げるのは、 満杯の episode が終わった周 (落ちなくなって 100 ms) か、 最初に
+落ちてから 5 秒後で、 閉じる時 (consumer の最後の bridge) もその条件で待った。 落ちたことはメモリにしか無いので、 落ちてすぐ
+閉じると floor が残らず、 落ちた write は本体にあるのに相手は bootstrap にも回らなかった。 閉じる時は待たずに上げる。
+
+### Fixed — WAL が満杯で閉じの Commit が入らなかった group (孤児) を畳む時に floor を上げず、 その write が相手に永久に届かなかった (#450、 #453)
+
+孤児の group は Commit で閉じていないので bridge が `_sync_ops` に写さず、 満杯の死区間では 「残りが孤児の group だけなら
+畳んでよい」 (#268 の brick を防ぐ例外) として畳んだ。 その write は本体に当たっているのに floor を上げなかった (後に続く
+write が落ちれば自分の author は floor で覆われたが、 後が続かない時 = 閉じの Commit だけが入らない時と、 中継した他人の
+record (floor は author 別) は覆われなかった)。 畳む直前に、 bridge が写していない閉じていない record を WAL に載らなかった
+write と同じに覚え (author と HLC)、 bridge が floor を上げる。
+
+### Tests
+
+- 電源断の模擬 (`tests/power_loss.rs`、 feature `crashsim`) に #451 の決定的な試験を 3 本: 本体にだけ届いた 5 種 (Number /
+  新しい語の Tag / Leaf / untie / delete) を作り直して配る分に載せる、 全部が oplog / `_sync_ops` にある時ときれいに閉じた後は
+  何もしない、 WAL が満杯で作り直せない時は floor で覆う
+- 書き出しを止めている間に consumer の周期の書き出しが試験の前提を崩した (CI の loom job = `--cfg loom` で、 Linux 2 CPU で
+  10 回中 9 回撮り直し) ので、 consumer も次に oplog を写した所で止める。 そのため crashsim の hook に写したものの種類
+  (`Copied::Oplog` / `Segment`) を渡す
+- `issue449_drop_floor_on_close.rs` / `issue450_orphan_group_floor.rs` (sync crate、 決定的)
+
 ## 0.31.3 — 2026-10-10
 
 patch。 on-disk 形式・wire 形式は 0.31.2 と同じ。 Engine / schema の API は変わらない (低レベルの `PayloadRing` に `holds` が
