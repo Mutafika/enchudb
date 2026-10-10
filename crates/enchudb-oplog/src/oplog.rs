@@ -223,6 +223,18 @@ pub fn decode_sync_ops_payload(payload: &[u8]) -> Option<Record> {
     })
 }
 
+/// #451: `_sync_ops` の payload から author と HLC だけを読む ([`decode_sync_ops_payload`] と同じ形の検査、 record は
+/// 組み立てない)。 読めない payload は None。
+pub fn sync_ops_payload_author_hlc(payload: &[u8]) -> Option<(PeerId, Hlc)> {
+    let sb = payload.get(SYNC_OPS_PAYLOAD_PREFIX..)?;
+    if sb.len() < SIGNED_PAYLOAD_HEADER_SIZE || &sb[0..2] != REC_MAGIC || !known_version(sb[OFF_VERSION]) {
+        return None;
+    }
+    let u32_at = |o: usize| u32::from_le_bytes(sb[o..o + 4].try_into().unwrap());
+    let wall = u64::from_le_bytes(sb[OFF_HLC_WALL..OFF_HLC_WALL + 8].try_into().unwrap());
+    Some((u32_at(OFF_AUTHOR_PEER), Hlc { wall, logical: u32_at(OFF_HLC_LOGICAL), peer: u32_at(OFF_HLC_PEER) }))
+}
+
 /// 0.11 (request10 / #76 逆写像): eid を書き換えて re-sign した record。
 /// bridge が `_sync_ops.payload` を組み立てるのに必要な 3 点セット。
 pub struct ResignedRecord {

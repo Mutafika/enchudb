@@ -14020,11 +14020,12 @@ impl Engine {
             wal.records_with_tail().into_iter().filter(|r| r.author_peer == me).map(|r| r.hlc).collect();
         if let Some(cols) = self.sync_payload_cols() {
             for row in self.entities_with_himo(cols.lsn) {
-                if let Some(rec) =
-                    self.sync_op_payload(row, &cols).and_then(|p| enchudb_oplog::oplog::decode_sync_ops_payload(&p))
-                    && rec.author_peer == me
+                if let Some((author, hlc)) = self
+                    .sync_op_payload(row, &cols)
+                    .and_then(|p| enchudb_oplog::oplog::sync_ops_payload_author_hlc(&p))
+                    && author == me
                 {
-                    known.insert(rec.hlc);
+                    known.insert(hlc);
                 }
             }
         }
