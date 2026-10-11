@@ -603,63 +603,150 @@ fn sorted_locals(v: impl IntoIterator<Item = u64>) -> Vec<u32> {
     v
 }
 
-/// C2: 並びの索引がある via の紐の逆引き (`pull` / `pull_in` / `query` の 1 条件と 2 条件 (件数で軸を選ぶ)) は索引から読み、
-/// その紐の円柱を作らない。 書き込みのたびに shadow と比べる (会社を外した社員、 年齢の無い社員 = 帯 0 も入る)。
-/// 負の対照: 宣言しない DB では同じ読みで円柱ができる。
-#[test]
-fn via_reads_use_the_order_index_and_leave_the_cylinder_unbuilt() {
-    for (layout, seed) in [(Layout::Anon, 0x5eed_4051u64), (Layout::AnonUsersFirst, 0x5eed_4052), (Layout::Tables, 0x5eed_4053)] {
-        let mut w = world(layout, seed);
-        declare(&w, &[30, 1001]);
-        assert_eq!(company_cylinder_bytes(&w), 0, "{layout:?}: 前提");
-        let mut rng = Rng(seed ^ 0xc2);
-        for round in 0..=150 {
-            if round > 0 {
-                for _ in 0..1 + rng.below(5) {
-                    write_one(&mut w, &mut rng);
-                }
-            }
-            for (k, &c) in w.comps.iter().enumerate() {
-                let local = enchudb_oplog::eid_local(c);
-                let mut got = w.eng.pull(w.n_company, local);
-                got.sort_unstable();
-                assert_eq!(got, staff_of(&w, c, None), "{layout:?} round {round}: pull({c})");
-                let q = sorted_locals(w.eng.query(&[(w.n_company, local)]));
-                assert_eq!(q, staff_of(&w, c, None), "{layout:?} round {round}: query 1 条件 ({c})");
-                let q2 = sorted_locals(w.eng.query(&[(w.n_company, local), (w.n_role, 1)]));
-                assert_eq!(q2, staff_of(&w, c, Some(1)), "{layout:?} round {round}: query 2 条件 ({c})");
-                if k + 1 < w.comps.len() {
-                    let d = w.comps[k + 1];
-                    let both = sorted_locals(w.eng.pull_in(w.n_company, &[local, enchudb_oplog::eid_local(d)]));
-                    let mut want = staff_of(&w, c, None);
-                    want.extend(staff_of(&w, d, None));
-                    want.sort_unstable();
-                    assert_eq!(both, want, "{layout:?} round {round}: pull_in({c}, {d})");
-                }
-            }
-        }
-        assert!(order_hits(&w).0 > 0, "{layout:?}: 索引を読んでいない");
-        assert_eq!(company_cylinder_bytes(&w), 0, "{layout:?}: 円柱を作った");
-    }
-    // 負の対照: 宣言しなければ、 同じ pull で円柱ができる (この test が円柱を作ったことを見分けられる)
-    let w = world(Layout::Anon, 0x5eed_4054);
-    let _ = w.eng.pull(w.n_company, enchudb_oplog::eid_local(w.comps[0]));
-    assert!(company_cylinder_bytes(&w) > 0, "対照: 宣言なしの pull が円柱を作っていない");
+/// 局所の番号 (並びはそのまま)。 eid の peer の部分は DB ごとに違うので、 2 つの DB の答えの並びは局所の番号で比べる。
+fn locals(v: impl IntoIterator<Item = u64>) -> Vec<u32> {
+    v.into_iter().map(enchudb_oplog::eid_local).collect()
 }
 
-/// C2: 購読 (社員単位 / 見直す場所だけ / 会社単位) を張っても、 書き込みと poll と find_by を回しても、 宣言した via の紐の
-/// 円柱を作らない (購読の登録が ref の逆引きを先に作る所は索引を作る)。 答えは find_by と shadow の 2 経路で比べる。
-/// 負の対照: 宣言しなければ社員単位の購読の登録で円柱ができる。
+/// 会社 `c` の社員を、 並びの索引の帯の順 (帯の中は番号の昇順) に並べたもの (shadow から。 目盛り [30, 1001] の帯:
+/// 値が無い / 30 未満 / 30〜1000 / 1001 以上)。 0.32.0 の `pull` はこの順で返していた。
+fn staff_in_band_order(w: &World, c: u64) -> Vec<u32> {
+    let band = |age: Option<u64>| match age {
+        None => 0,
+        Some(a) if a < 30 => 1,
+        Some(a) if a < 1001 => 2,
+        Some(_) => 3,
+    };
+    let mut v: Vec<(u8, u32)> = w
+        .rows
+        .iter()
+        .filter(|(_, r)| r.company == Some(c))
+        .map(|(&u, r)| (band(r.age), enchudb_oplog::eid_local(u)))
+        .collect();
+    v.sort_unstable();
+    v.into_iter().map(|(_, e)| e).collect()
+}
+
+/// 範囲の条件の無い via の逆引き (`pull` / `pull_in` / `query` の 1 条件と 2 条件 (件数で軸を選ぶ)) は、 宣言しても円柱から
+/// 読む (2 つの並びを書く時に同時に保つ): 同じ書き込みをした宣言なしの DB と、 返る並びまで同じ。 書き込みのたびに
+/// shadow とも比べる (会社を外した社員、 年齢の無い社員 = 帯 0 も入る)。 索引は作って保ったまま (範囲の find_by が読む) で、
+/// 範囲の無い読みの間は索引を読まない (読んだ回数が変わらない)。
+/// 対照: 始めは帯の順と番号の順が違う会社がある (並びの比べ方が、 0.32.0 の帯の順を見分けられる)。
 #[test]
-fn subscriptions_and_find_by_leave_the_via_cylinder_unbuilt() {
+fn via_reads_without_a_range_come_from_the_cylinder_like_an_undeclared_db() {
+    for (layout, seed) in [(Layout::Anon, 0x5eed_4051u64), (Layout::AnonUsersFirst, 0x5eed_4052), (Layout::Tables, 0x5eed_4053)] {
+        let mut w = world(layout, seed);
+        let mut plain = world(layout, seed);
+        assert_eq!((&w.comps, &w.users), (&plain.comps, &plain.users), "{layout:?}: 前提: 同じ種から同じ DB");
+        declare(&w, &[30, 1001]);
+        assert!(
+            w.comps.iter().any(|&c| staff_in_band_order(&w, c) != staff_of(&w, c, None)),
+            "{layout:?}: 対照: 帯の順と番号の順が同じ会社しか無い"
+        );
+        let (mut rng, mut rng_plain) = (Rng(seed ^ 0xc2), Rng(seed ^ 0xc2));
+        for round in 0..=150 {
+            if round > 0 {
+                let n = 1 + rng.below(5);
+                assert_eq!(n, 1 + rng_plain.below(5));
+                for _ in 0..n {
+                    write_one(&mut w, &mut rng);
+                    write_one(&mut plain, &mut rng_plain);
+                }
+            }
+            // 範囲の find_by は索引から (作って保っている索引を、 書き込みの後も正しく読める)
+            let hits = order_hits(&w).0;
+            let found: BTreeSet<u64> = w.eng.find_by(preds(&w, 1, Root::Age(30, 1000))).unwrap().into_iter().collect();
+            let want: BTreeSet<u64> = w
+                .rows
+                .iter()
+                .filter(|(_, r)| r.company.is_some_and(|c| w.city.get(&c) == Some(&1)) && root_holds(r, Root::Age(30, 1000)))
+                .map(|(&u, _)| u)
+                .collect();
+            assert_eq!(found, want, "{layout:?} round {round}: 範囲の find_by");
+            assert!(order_hits(&w).0 > hits, "{layout:?} round {round}: 範囲の find_by が索引を読んでいない");
+            let hits = order_hits(&w);
+            for (k, &c) in w.comps.iter().enumerate() {
+                let local = enchudb_oplog::eid_local(c);
+                let got = w.eng.pull(w.n_company, local);
+                assert_eq!(got, plain.eng.pull(plain.n_company, local), "{layout:?} round {round}: pull({c}) の並びが宣言なしと違う");
+                let mut sorted = got.clone();
+                sorted.sort_unstable();
+                assert_eq!(sorted, staff_of(&w, c, None), "{layout:?} round {round}: pull({c})");
+                let q = locals(w.eng.query(&[(w.n_company, local)]));
+                assert_eq!(q, locals(plain.eng.query(&[(plain.n_company, local)])), "{layout:?} round {round}: query 1 条件 ({c}) の並び");
+                assert_eq!(sorted_locals(w.eng.query(&[(w.n_company, local)])), staff_of(&w, c, None), "{layout:?} round {round}: query 1 条件 ({c})");
+                let q2 = locals(w.eng.query(&[(w.n_company, local), (w.n_role, 1)]));
+                assert_eq!(
+                    q2,
+                    locals(plain.eng.query(&[(plain.n_company, local), (plain.n_role, 1)])),
+                    "{layout:?} round {round}: query 2 条件 ({c}) の並び"
+                );
+                assert_eq!(
+                    sorted_locals(w.eng.query(&[(w.n_company, local), (w.n_role, 1)])),
+                    staff_of(&w, c, Some(1)),
+                    "{layout:?} round {round}: query 2 条件 ({c})"
+                );
+                if k + 1 < w.comps.len() {
+                    let d = enchudb_oplog::eid_local(w.comps[k + 1]);
+                    let both = locals(w.eng.pull_in(w.n_company, &[local, d]));
+                    assert_eq!(both, locals(plain.eng.pull_in(plain.n_company, &[local, d])), "{layout:?} round {round}: pull_in の並び");
+                    let mut want = staff_of(&w, c, None);
+                    want.extend(staff_of(&w, w.comps[k + 1], None));
+                    want.sort_unstable();
+                    let mut both = both;
+                    both.sort_unstable();
+                    assert_eq!(both, want, "{layout:?} round {round}: pull_in({c}, {})", w.comps[k + 1]);
+                }
+            }
+            assert_eq!(order_hits(&w), hits, "{layout:?} round {round}: 範囲の無い読みが索引を読んだ");
+        }
+        assert!(company_cylinder_bytes(&w) > 0, "{layout:?}: 範囲の無い読みが円柱を作っていない");
+    }
+}
+
+/// 並びの索引の heap の大きさの和 (作ると増える)。
+fn order_heap(w: &World) -> usize {
+    w.eng.order_stats().iter().map(|s| s.4).sum()
+}
+
+/// 購読の登録は、 その購読が読む並びだけを作る (2026-10-11): 根への条件の範囲でだけ逆に引く購読 (社員単位・見直す場所
+/// だけ) は並びの索引だけ、 範囲の無い購読は円柱だけ。 もう片方は、 それを読む読みが来た時に作る。
+/// - 範囲つきの社員単位の購読は、 合う会社がある時も円柱を作らない (登録の 「記録を不明に戻す」 段は根の手前で止まり、
+///   会社の全員を引かない = `visit_up`)
+/// - 範囲の無い社員単位の購読は円柱だけ (索引は作らない)
+/// - 混ぜると、 範囲の無い会社単位の読み (根の条件の無い count / members) が来た時に円柱を作り、 その読みは索引を読まない。
+///   書き込みと poll と find_by を回して、 答えを find_by と shadow の 2 経路で比べる
+///
+/// 対照: 宣言しない DB は、 同じ範囲つきの登録で円柱を作る (索引は無い)。
+#[test]
+fn subscriptions_build_the_arrangement_they_read() {
+    // 範囲つき (合う会社あり): 索引だけ
+    let e = world(Layout::Tables, 0x5eed_4064);
+    declare(&e, &[30, 1001]);
+    let heap0 = order_heap(&e);
+    let _row = e.eng.subscribe(preds(&e, 1, Root::Age(30, 1000))).unwrap();
+    let _touched = e.eng.subscribe_touched(preds(&e, 2, Root::Age(30, 1000))).unwrap();
+    assert!(order_heap(&e) > heap0, "範囲つきの購読の登録が索引を作っていない");
+    assert_eq!(company_cylinder_bytes(&e), 0, "範囲つきの購読の登録が円柱を作った");
+    drop((_row, _touched, e));
+    // 範囲なし: 円柱だけ
+    let f = world(Layout::Tables, 0x5eed_4065);
+    declare(&f, &[30, 1001]);
+    let heap0 = order_heap(&f);
+    let _row = f.eng.subscribe(preds(&f, 1, Root::None)).unwrap();
+    assert!(company_cylinder_bytes(&f) > 0, "範囲の無い購読の登録が円柱を作っていない");
+    assert_eq!(order_heap(&f), heap0, "範囲の無い購読の登録が索引を作った");
+    drop((_row, f));
+
     let mut w = world(Layout::Tables, 0x5eed_4061);
     declare(&w, &[30, 1001]);
     let row = w.eng.subscribe(preds(&w, 1, Root::Age(30, 1000))).unwrap();
     let touched = w.eng.subscribe_touched(preds(&w, 2, Root::Age(30, 1000))).unwrap();
     let grouped = w.eng.subscribe_grouped(preds(&w, 3, Root::None)).unwrap();
-    assert_eq!(company_cylinder_bytes(&w), 0, "購読の登録が円柱を作った");
+    assert_eq!(company_cylinder_bytes(&w), 0, "前提: 範囲の無い読みはまだ来ていない");
     let mut rng = Rng(0x5eed_4062);
     let mut seen = BTreeSet::new();
+    let mut groups = BTreeSet::new();
     for round in 0..=150 {
         if round > 0 {
             for _ in 0..1 + rng.below(5) {
@@ -668,7 +755,7 @@ fn subscriptions_and_find_by_leave_the_via_cylinder_unbuilt() {
         }
         integrate(&mut seen, row.poll(&w.eng));
         let _ = touched.poll(&w.eng);
-        let _ = grouped.poll(&w.eng);
+        integrate(&mut groups, grouped.poll(&w.eng));
         let found: BTreeSet<u64> = w.eng.find_by(preds(&w, 1, Root::Age(30, 1000))).unwrap().into_iter().collect();
         let want: BTreeSet<u64> = w
             .rows
@@ -678,18 +765,26 @@ fn subscriptions_and_find_by_leave_the_via_cylinder_unbuilt() {
             .collect();
         assert_eq!(found, want, "round {round}: find_by");
         assert_eq!(seen, want, "round {round}: 社員単位の購読");
+        let hits = order_hits(&w);
         let in_city3 = w.rows.values().filter(|r| r.company.is_some_and(|c| w.city.get(&c) == Some(&3))).count();
-        assert_eq!(grouped.count(&w.eng), in_city3, "round {round}: 会社単位の count (根の条件なし = 帯の件数の和)");
+        assert_eq!(grouped.count(&w.eng), in_city3, "round {round}: 会社単位の count (根の条件なし)");
+        for &c in &groups {
+            assert_eq!(grouped.members(&w.eng, c), want_members(&w, Root::None, c), "round {round}: 会社単位の members({c})");
+        }
+        assert_eq!(order_hits(&w), hits, "round {round}: 根の条件の無い会社単位の読みが索引を読んだ");
+        if round == 0 {
+            assert!(company_cylinder_bytes(&w) > 0, "範囲の無い読みが円柱を作っていない");
+        }
     }
-    assert!(order_hits(&w).0 > 0);
-    assert_eq!(company_cylinder_bytes(&w), 0, "書き込みと読みの間に円柱を作った");
+    assert!(order_hits(&w).0 > 0, "範囲の読みが索引を読んでいない");
     let c = world(Layout::Tables, 0x5eed_4063);
     let _q = c.eng.subscribe(preds(&c, 1, Root::Age(30, 1000))).unwrap();
     assert!(company_cylinder_bytes(&c) > 0, "対照: 宣言なしの社員単位の購読が円柱を作っていない");
+    assert!(c.eng.order_stats().is_empty(), "対照: 宣言なしの DB に索引がある");
 }
 
 /// C2: find_by の Via + 範囲は、 会社から社員へ降りる段で範囲に当たる帯だけ読む。 書き込み前 (stale なし) なら、 読んだ
-/// entity の数 = 答えの数、 読んだ回数 = city の合う会社の数。 対照: 範囲の条件が無いと、 その会社の全員を読む。
+/// entity の数 = 答えの数、 読んだ回数 = city の合う会社の数。 対照: 範囲の条件が無いと索引を読まない (円柱から全員を読む)。
 #[test]
 fn find_by_via_and_range_reads_only_the_range_bands() {
     let w = world(Layout::Anon, 0x5eed_4071);
@@ -710,5 +805,5 @@ fn find_by_via_and_range_reads_only_the_range_bands() {
     let all = w.eng.find_by(preds(&w, 1, Root::None)).unwrap();
     let (h2, r2) = order_hits(&w);
     assert!(all.len() > got.len(), "前提: 範囲の外の社員が居る");
-    assert_eq!((h2 - h1, r2 - r1), (n_comp, all.len() as u64), "対照: 範囲の条件が無ければ全員を読む");
+    assert_eq!((h2 - h1, r2 - r1), (0, 0), "対照: 範囲の条件が無ければ索引を読まない (円柱から全員を読む)");
 }

@@ -9526,48 +9526,12 @@ impl Engine {
         self.live.orders().find(|o| o.via as usize == idx)
     }
 
-    /// 並びの索引がある via の紐の逆引き: 値 `value` を指している entity を `out` の後ろに足す (全部の帯)。 索引が答え
-    /// られない時 (無い / やめた / 値が索引の外 / 帯を揃えて控えられない) は false で、 `out` は変えない (呼び手は円柱)。
-    fn order_pull_into(&self, idx: usize, value: u64, sorted: bool, out: &mut Vec<u32>) -> bool {
-        let Some(o) = self.order_of_via(idx) else { return false };
-        let Ok(target) = u32::try_from(value) else { return false };
-        self.order_ready(o) && self.order_read_into(o, target, o.all_bands(), sorted, out).is_some()
-    }
-
-    /// 紐 `idx` の値 `value` を指している entity (`HimoStore::pull` の代わり)。 並びの索引がある via の紐なら索引から読み、
-    /// 円柱を作らない (並びは帯の順。 確かめた時は eid の昇順)。 それ以外は円柱。
-    fn himo_pull(&self, idx: usize, value: u64) -> Vec<u32> {
-        let mut out = Vec::new();
-        if !self.order_pull_into(idx, value, false, &mut out) {
-            out = self.himos[idx].pull(value);
-        }
-        out
-    }
-
-    /// [`himo_pull`](Self::himo_pull) の、 `out` の後ろに足す版。 `sorted` なら並びの索引の帯を混ぜ合わせて番号の昇順に
-    /// 近い形で足す (昇順で返す読み用。 円柱の一覧は元から昇順に近い)。
-    fn himo_pull_into(&self, idx: usize, value: u64, sorted: bool, out: &mut Vec<u32>) {
-        if !self.order_pull_into(idx, value, sorted, out) {
-            self.himos[idx].pull_into(value, out);
-        }
-    }
-
-    /// 紐 `idx` の値 `value` の件数 (`HimoStore::slice_len` の代わり。 並びの索引がある via の紐なら帯の件数の和)。
-    fn himo_slice_len(&self, idx: usize, value: u64) -> usize {
-        let from_order = self.order_of_via(idx).and_then(|o| {
-            let target = u32::try_from(value).ok()?;
-            if !self.order_ready(o) {
-                return None;
-            }
-            o.arc_len(target, o.all_bands())
-        });
-        from_order.unwrap_or_else(|| self.himos[idx].slice_len(value))
-    }
-
-    /// 購読を張る前に ref の逆引きを作っておく (最初の poll がそれを作る時間を払わないように)。 並びの索引がある via の
-    /// 紐は索引を作り、 円柱は作らない (索引をやめた時だけ円柱)。
-    fn warm_ref(&self, h: u16) {
-        if let Some(o) = self.order_of_via(h as usize)
+    /// 購読を張る前に ref の逆引きを作っておく (最初の poll がそれを作る時間を払わないように)。 作るのは、 その購読が読む
+    /// 並びだけ: 根への条件の範囲でだけ逆に引く via (`ranged`) は並びの索引 (宣言があり、 使える時)、 それ以外は円柱。
+    /// もう片方は、 それを読む読みが来た時に作る (読まない並びは作らず、 書き込みもその手入れを払わない。 2026-10-11)。
+    fn warm_ref(&self, h: u16, ranged: bool) {
+        if ranged
+            && let Some(o) = self.order_of_via(h as usize)
             && self.order_ready(o)
         {
             return;
@@ -13451,7 +13415,7 @@ impl Engine {
     /// 値は u32 / u64 / 負でない整数 (負の数は 0 件)。
     pub fn pull_raw(&self, himo: &str, value: impl CellValue) -> Vec<enchudb_oplog::EntityId> {
         match (self.himo_id(himo), value.cell_value()) {
-            (Some(idx), Some(v)) => self.himo_pull(idx, v).into_iter().map(|e| e as enchudb_oplog::EntityId).collect(),
+            (Some(idx), Some(v)) => self.himos[idx].pull(v).into_iter().map(|e| e as enchudb_oplog::EntityId).collect(),
             _ => Vec::new(),
         }
     }
@@ -13459,7 +13423,7 @@ impl Engine {
     /// 引く。 HimoStore::pull 直 (並びの索引 [`declare_order`](Self::declare_order) がある via の紐は索引から)。
     pub fn pull(&self, himo: &str, value: impl CellValue) -> Vec<u32> {
         match (self.himo_id(himo), value.cell_value()) {
-            (Some(idx), Some(v)) => self.himo_pull(idx, v),
+            (Some(idx), Some(v)) => self.himos[idx].pull(v),
             _ => Vec::new(),
         }
     }
@@ -13492,7 +13456,7 @@ impl Engine {
         let mut out: Vec<u32> = Vec::new();
         for &v in values {
             if let Some(v) = v.cell_value() {
-                self.himo_pull_into(idx, v, false, &mut out);
+                self.himos[idx].pull_into(v, &mut out);
             }
         }
         out.sort_unstable();
@@ -13566,7 +13530,12 @@ impl Engine {
         refs.sort_unstable();
         refs.dedup();
         for h in refs {
-            self.warm_ref(h);
+            // どの枝でも根への条件の範囲でだけ逆に引くなら、 並びの索引だけ (社員単位の購読は会社から社員へ降りる段を範囲の
+            // 帯だけで読む)
+            let ranged = branches
+                .iter()
+                .all(|b| crate::live::LivePred::reads_via_only_by_range(b, h, |k| self.live.order_for(h, k).is_some()));
+            self.warm_ref(h, ranged);
         }
 
         // 登録手順 (順序が正しさの根拠、 `crate::live` module doc):
@@ -13615,13 +13584,10 @@ impl Engine {
     ///   (宣言なしとの差は書き手 1 本で +0〜14 ns、 8 本で +3〜9%)。 宣言の無い DB の書き込みは宣言があるかを atomic で
     ///   1 回見るだけ。 購読を張ると張った時に作るので、 **範囲の条件で絞って引く ref にだけ宣言する** (範囲で引かない紐に
     ///   宣言すると、 置き直しの上乗せだけ払う)
-    /// - via の紐の逆引きは全部この索引から読む ([`pull`](Self::pull) / [`pull_in`](Self::pull_in) / [`query`](Self::query) /
-    ///   購読の展開と登録)。 その紐の円柱 (普通の逆引き) は作らない — 値の範囲で引く `pull_range` と、 値の一覧・件数の
-    ///   集計 (`unique_values` など) だけは今まで通り円柱を作る。 索引が答えられない時 (やめた、 帯を揃えて控えられない) も円柱
-    /// - via の紐の `pull` の並びは帯の順になる (確かめた時は eid の昇順)。 order_by の無い `limit` は別の部分集合を返しうる
-    /// - 範囲の条件なしで昇順に読む所 (会社単位の購読の `members` など) は帯ごとの一覧を混ぜ合わせるので、 宣言しない時
-    ///   (円柱の一覧はもとから昇順に近い) より遅い: 会社を先に作る並べ方で 1.3〜1.6 倍、 会社の eid が 2^20 を超える並べ方
-    ///   では 0.8〜1.1 倍 (100 万人、 2026-10-11)。 小さい会社の `pull` も 1 回 +0.04〜0.08 µs
+    /// - 索引を読むのは範囲の条件の付いた読みだけ。 それ以外の via の逆引き ([`pull`](Self::pull) / [`pull_in`](Self::pull_in)
+    ///   / [`query`](Self::query) / 根への条件の無い `members` など) は、 宣言が無い時と同じく円柱 (普通の逆引き) から読む
+    ///   (答えも並びも宣言が無い時と同じ)。 書く時に円柱と索引の 2 つの並びを同時に保ち、 読みはそれぞれ合う方を写す。
+    ///   購読の登録は両方を作る。 索引が答えられない時 (やめた、 帯を揃えて控えられない) も円柱
     /// - 宣言は `{db}/tables` に保存し、 開き直すと戻る (中身は最初に読む時に作り直す)。 保存は他の table 定義と同じ
     ///   (build phase は `persist_tables` / finish で、 その後は宣言した時に)。 宣言を知らない古い binary で開いても
     ///   壊れない (宣言を読まないだけ。 その binary が table 定義を書き直すと宣言は消える)。 memory-only の DB は保存しない
@@ -13743,8 +13709,12 @@ impl Engine {
         refs.push(via);
         refs.sort_unstable();
         refs.dedup();
+        // group の中身 (via の逆引き) は根への条件で絞って読む: 範囲の条件に並びの索引があれば索引だけ
+        let ranged_via = filter
+            .iter()
+            .any(|p| matches!(p, crate::live::LivePred::Range { himo_id, .. } if self.live.order_for(via, *himo_id).is_some()));
         for h in refs {
-            self.warm_ref(h);
+            self.warm_ref(h, h == via && ranged_via);
         }
         // 登録手順は subscribe_inner と同じ: route に載せる → 全紐の write_lock で barrier → 初期候補に印
         let q = self.live.register_touched(branch, &notice);
@@ -13811,7 +13781,7 @@ impl Engine {
         refs.sort_unstable();
         refs.dedup();
         for h in refs {
-            self.warm_ref(h);
+            self.warm_ref(h, false);
         }
         // 登録手順は subscribe と同じ (route → barrier → 初期候補)
         let q = self.live.register_counts(branches, (group_path, group_himo), sum_himo).map_err(|m| bad(&m))?;
@@ -13849,7 +13819,7 @@ impl Engine {
         refs.sort_unstable();
         refs.dedup();
         for h in refs {
-            self.warm_ref(h);
+            self.warm_ref(h, false);
         }
         // 登録手順は subscribe と同じ (route → barrier → 初期候補)
         let q = self.live.register_keyed(branches, (key_path, key_himo)).map_err(|m| bad(&m))?;
@@ -13894,7 +13864,7 @@ impl Engine {
         refs.sort_unstable();
         refs.dedup();
         for h in refs {
-            self.warm_ref(h);
+            self.warm_ref(h, false);
         }
         let q = self.live.register_top(branches, (order_path, order_himo, desc), limit).map_err(|m| bad(&m))?;
         for h in q.himos() {
@@ -14020,7 +13990,7 @@ impl Engine {
 
         if conds.len() == 1 {
             let (idx, val) = conds[0];
-            return self.himo_pull(idx, val);
+            return self.himos[idx].pull(val);
         }
 
         // Column直読みフィルタ。 `delta` は常に空なので Column が最新で OK。
@@ -14035,7 +14005,7 @@ impl Engine {
         let total = self.entities.next_eid() as usize;
         // 各 cond の slice_len を事前計算 (per-eid 呼ばないように外出し)
         let slice_lens: Vec<usize> = conds.iter()
-            .map(|&(idx, val)| self.himo_slice_len(idx, val))
+            .map(|&(idx, val)| self.himos[idx].slice_len(val))
             .collect();
 
         // pivot: 最小スライスを選ぶ
@@ -14046,7 +14016,9 @@ impl Engine {
         }
 
         let (pivot_idx, pivot_val) = conds[best];
-        let candidates = self.himo_pull(pivot_idx, pivot_val);
+        let hs = &self.himos[pivot_idx];
+
+        let candidates = hs.pull(pivot_val);
 
         // 残りの条件を Column 直読みでフィルタ（Column は常に最新）。
         // 全件相当の cond (e.g. schema layer の table marker) は always-true として skip。
@@ -16647,16 +16619,14 @@ impl crate::live::CellReader for Engine {
         self.vocab.get_checked(vid).is_some()
     }
     fn pull(&self, himo_id: u16, value: u64) -> Vec<u32> {
-        if (himo_id as usize) < self.himos.len() { self.himo_pull(himo_id as usize, value) } else { Vec::new() }
-    }
-    fn pull_into(&self, himo_id: u16, value: u64, out: &mut Vec<u32>) {
-        if (himo_id as usize) < self.himos.len() {
-            self.himo_pull_into(himo_id as usize, value, false, out);
+        match self.himos.get(himo_id as usize) {
+            Some(h) => h.pull(value),
+            None => Vec::new(),
         }
     }
-    fn pull_sorted_into(&self, himo_id: u16, value: u64, out: &mut Vec<u32>) {
-        if (himo_id as usize) < self.himos.len() {
-            self.himo_pull_into(himo_id as usize, value, true, out);
+    fn pull_into(&self, himo_id: u16, value: u64, out: &mut Vec<u32>) {
+        if let Some(h) = self.himos.get(himo_id as usize) {
+            h.pull_into(value, out);
         }
     }
     fn has_order(&self, via: u16, key: u16) -> bool {
@@ -16704,7 +16674,7 @@ impl crate::live::CellReader for Engine {
         }
     }
     fn pull_len(&self, himo_id: u16, value: u64) -> usize {
-        if (himo_id as usize) < self.himos.len() { self.himo_slice_len(himo_id as usize, value) } else { 0 }
+        self.himos.get(himo_id as usize).map_or(0, |h| h.slice_len(value))
     }
     fn pull_range(&self, himo_id: u16, lo: u64, hi: u64) -> Vec<u32> {
         let Some(h) = self.himos.get(himo_id as usize) else { return Vec::new() };
