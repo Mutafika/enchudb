@@ -1,21 +1,27 @@
 //! loom model — 並びの索引 (`OrderIndex`、 `Engine::declare_order`) の **遅延の作成と並行の書き込み** の契約を全
 //! interleaving で検証する。 `loom_lazy_cylinder_build` (#270) と同じ形で、 違いは書き込みが 2 本の紐から来ること:
-//! via (会社の ref) の書き手と、 key (年齢) の書き手。 key の列は via の write_lock の外 (key の紐の write_lock の下) で書く。
+//! via (会社の ref) の書き手と、 key (年齢) の書き手。 列はそれぞれの紐の write_lock の下で書く (`HimoStore::set`)。
 //!
 //! ## 何を守っているのか
-//! 書き手 (`Engine::order_note_slow`、 行の lock の下) は 「列を書く → 作ってあれば (無ければ via の write_lock の下で
-//! もう一度見て) 今の via / key の値で置き直す」。 置き直しは置き場の鍵の下 (`OrderIndex::place`)。 作る側
-//! (`Engine::order_ready`) は 「via の write_lock を取る → 作っていなければ via の列をなめて今の値で置く → 作った印」。
+//! 書き手 (`Engine::order_note_slow`、 行の lock の下) は 「列を (その紐の write_lock の下で) 書く → 索引があって作って
+//! あれば、 今の via / key の値で置き直す。 作っていなければ何もしない (lock も取らない)」。 置き直しは置き場の鍵の下
+//! (`OrderIndex::place`)。 作る側 (`Engine::order_ready`) は 「via と key の write_lock を両方取る → 作っていなければ
+//! via の列をなめて今の値で置く → 作った印」。
 //!
-//!   - 書き手が 「作ってある」 を見た = 作り終えている → 書き手が今の値で置き直す (作る側とは重ならない)
-//!   - lock の下で 「作っていない」 を見た = 作る側はまだ lock を取れていない → 後でなめる時に、 lock の前に書いた列を読む
+//!   - 作る側が lock を取る前に書いた列: lock の受け渡しで、 なめる時に読まれる
+//!   - 作る側が lock を離した後に書いた列: 同じく lock の受け渡しで、 書き手には 「作った」 が見える → 書き手が置き直す
 //!
 //! どちらかが必ず今の値で置くので、 止まった後の置き場所 (`placed`) と置き場ごとの人数 (bucket の live) は今の列の値と
-//! 一致する。 **lock の下で見直さないと壊れる**: key の書き手が lock なしで 「作っていない」 を読む → 作る側が書く前の
-//! key の列をなめて印を立てる → 書き手は置かない → 古い帯のまま残る。 実測 (2026-10-10): 見直しを外すと、 key の書き手が
-//! 居る 2 本 (`key_write_vs_build`、 `via_and_key_writers_vs_build`) が落ちる。 via の書き手だけの `via_write_vs_build` は
-//! 落ちない — via の列は via の write_lock の下で書くので、 作る側がその前になめたなら印は書き手の lock より前に立って
-//! いて、 後になめたなら新しい値を読む。 key の列は via の write_lock の外で書くので、 この順序が無い。
+//! 一致する。 **作る側が key の write_lock も取らないと壊れる**: key の書き手が 「作っていない」 を読む → 作る側が書く前の
+//! key の列をなめて印を立てる → 書き手は置かない → 古い帯のまま残る。 実測 (2026-10-11): 作る側の key の lock を外すと、
+//! key の書き手が居る 3 本 (`key_write_vs_build`、 `via_and_key_writers_vs_build`、 `declare_vs_key_write`) が落ちる。
+//! via の書き手だけの `via_write_vs_build` は落ちない (via の列は作る側が取る via の write_lock の下で書く)。
+//!
+//! 前 (PR-C1) は作る側が via の lock だけを取り、 書き手が 「作っていない」 を見たら via の lock の下でもう一度見ていた。
+//! これだと宣言を足した直後の書き込みを見落としうる: 書き手は列を書いた後に 「索引が無い」 を見て何もせず、 作る側は
+//! 宣言を足してから (書き手の lock とは関係なく) key の列をなめるので、 書いたばかりの値を読まないことがある
+//! (`declare_vs_key_write`。 実測 2026-10-11: 前の約束に戻すとこの 1 本だけ落ちる)。 また開き直した後 (宣言は戻すが
+//! 作るのは最初に読む時) の書き込みが、 毎回 via の lock を取っていた。
 //!
 //! 同じ entity の置き直しは行の lock で 1 本に並ぶ (記録を読んで、 古い置き場を −1、 新しい置き場を +1、 記録を書く)。
 //! 行の lock を外すと、 同じ entity の 2 本の書き手が同じ記録を読んで古い置き場を 2 回 −1 する (実測 2026-10-10:
@@ -23,7 +29,7 @@
 //!
 //! ## model の範囲
 //! 列 (`AtomicUsize`、 0 = 値が無い、 それ以外は値 + 1)、 via / key の write_lock、 行の lock (entity ごと。 本物は eid の
-//! 下位 bit の stripe)、 作った印、 置き場所の記録、 置き場ごとの人数を写す。 置き場の鍵は 1 本で写す (本物は値ごとの 64 本で、
+//! 下位 bit の stripe)、 宣言の有無 (本物は `LiveRegistry::n_orders`)、 作った印、 置き場所の記録、 置き場ごとの人数を写す。 置き場の鍵は 1 本で写す (本物は値ごとの 64 本で、
 //! 2 本取る時は添字の順。 違う値どうしの並びは単体 test が見る)。 bucket の中身 (足すだけの一覧と古い印) は
 //! `loom_append_publish` と単体 test が、 epoch の解放は Miri が見ている。
 //!
@@ -69,6 +75,8 @@ struct Model {
     key_lock: Mutex<()>,
     /// 行の lock (entity ごと)。
     row: Vec<Mutex<()>>,
+    /// 宣言してあるか (書き手が見る `LiveRegistry::has_orders` / `orders_on`)。
+    declared: AtomicBool,
     built: AtomicBool,
     /// 置き場の鍵。
     stripe: Mutex<()>,
@@ -86,6 +94,7 @@ impl Model {
             via_lock: Mutex::new(()),
             key_lock: Mutex::new(()),
             row: init.iter().map(|_| Mutex::new(())).collect(),
+            declared: AtomicBool::new(true),
             built: AtomicBool::new(false),
             stripe: Mutex::new(()),
             placed: init.iter().map(|_| AtomicUsize::new(0)).collect(),
@@ -111,14 +120,11 @@ impl Model {
         self.placed[e].store(want, Ordering::Relaxed);
     }
 
-    /// `Engine::order_note_slow` (行の lock の下で呼ぶ)。
+    /// `Engine::order_note` / `order_note_slow` (行の lock の下で、 列の write_lock を離した後に呼ぶ)。 宣言が無い・作って
+    /// いない索引には何もしない (lock を取らない)。
     fn note(&self, e: usize) {
-        // ★契約: 作っていなければ via の write_lock の下で見直す。 見直しを外すと、 key の書き手が居る下の 2 本が落ちる。
-        if !self.built.load(Ordering::Acquire) {
-            let _w = self.via_lock.lock().unwrap();
-            if !self.built.load(Ordering::Acquire) {
-                return;
-            }
+        if !self.declared.load(Ordering::Acquire) || !self.built.load(Ordering::Acquire) {
+            return;
         }
         self.place(e);
     }
@@ -149,7 +155,9 @@ impl Model {
         if self.built.load(Ordering::Acquire) {
             return;
         }
+        // ★契約: via → key の順で両方の write_lock を取ってからなめる。 key の lock を外すと key の書き手が居る 3 本が落ちる
         let _w = self.via_lock.lock().unwrap();
+        let _k = self.key_lock.lock().unwrap();
         if self.built.load(Ordering::Acquire) {
             return;
         }
@@ -239,6 +247,31 @@ fn via_and_key_writers_vs_build() {
         a.join().unwrap();
         b.join().unwrap();
         r.join().unwrap();
+        m.assert_matches_columns();
+    });
+}
+
+/// 宣言を足すのと年齢の書き込みが重なる (`Engine::declare_order` の直後に読む = 作る、 と 年齢の書き手)。 書き手が
+/// 「宣言が無い」 を見て何もしなくても、 作る側がなめる時に書いた値を読む。
+#[test]
+fn declare_vs_key_write() {
+    loom::model(|| {
+        // 社員 0: 会社 1、 25 歳 (帯 1)。 まだ宣言していない
+        let m = Arc::new(Model::new(&[(2, 26)]));
+        m.declared.store(false, Ordering::Relaxed);
+        let w = {
+            let m = m.clone();
+            loom::thread::spawn(move || m.write_key(0, 41))
+        };
+        let d = {
+            let m = m.clone();
+            loom::thread::spawn(move || {
+                m.declared.store(true, Ordering::Release);
+                m.ensure_ready();
+            })
+        };
+        w.join().unwrap();
+        d.join().unwrap();
         m.assert_matches_columns();
     });
 }

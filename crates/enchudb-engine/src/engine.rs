@@ -338,7 +338,10 @@ fn tables_path_for(path: &str) -> std::path::PathBuf {
 /// だけで、 DB が開けなくなることはない)。 version を 2 に上げると古いバイナリが
 /// `unsupported version` で **開けなくなる** ため、 同じ DB を旧 enchudb で開く別
 /// プロセスを巻き込む。
-fn serialize_tables(tables: &[TableDef]) -> Vec<u8> {
+///
+/// 並びの索引の宣言 (`orders`、 [`Engine::declare_order`]) は `DIA1` block として一番後ろに足す (`PKS1` / `EXT1` を
+/// 知っている古いバイナリは、 それを読んでから知らない magic の所で止まる)。
+fn serialize_tables(tables: &[TableDef], orders: &[OrderDecl]) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 + tables.len() * 128);
     out.extend_from_slice(b"TBL1");
     out.extend_from_slice(&1u32.to_le_bytes());
@@ -401,12 +404,56 @@ fn serialize_tables(tables: &[TableDef]) -> Vec<u8> {
             }
         }
     }
+    // 並びの索引の宣言。 EXT1 の後ろ (古いバイナリが PKS1 / EXT1 を読み終えてから止まるように)。 宣言が無ければ書かない
+    // (= 宣言の無い DB は 1 byte も変わらない)。
+    //   dia_magic: "DIA1" (4)
+    //   dia_count: u32
+    //   [(via: u32, key: u32, n: u32, [tick: u64] × n)] × dia_count
+    if !orders.is_empty() {
+        out.extend_from_slice(b"DIA1");
+        out.extend_from_slice(&(orders.len() as u32).to_le_bytes());
+        for (via, key, ticks) in orders {
+            out.extend_from_slice(&u32::from(*via).to_le_bytes());
+            out.extend_from_slice(&u32::from(*key).to_le_bytes());
+            out.extend_from_slice(&(ticks.len() as u32).to_le_bytes());
+            for t in ticks {
+                out.extend_from_slice(&t.to_le_bytes());
+            }
+        }
+    }
     out
 }
 
+/// 並びの索引の宣言 1 つ: (via の紐, key の紐, 目盛り)。
+type OrderDecl = (u16, u16, Vec<u64>);
+
+/// `DIA1` block の中身 (magic の後ろ) を読む: (宣言, 読んだ byte 数)。 途中で切れている / 番号が紐の id に入らない
+/// なら None。
+fn deserialize_orders(buf: &[u8]) -> Option<(Vec<OrderDecl>, usize)> {
+    let mut off = 0usize;
+    let u32_at = |off: &mut usize| -> Option<u32> {
+        let v = u32::from_le_bytes(buf.get(*off..*off + 4)?.try_into().ok()?);
+        *off += 4;
+        Some(v)
+    };
+    let count = u32_at(&mut off)? as usize;
+    // 1 件は最低 12 byte (via / key / n)。 壊れた count で大きく確保しない
+    let mut out = Vec::with_capacity(count.min(buf.len() / 12));
+    for _ in 0..count {
+        let via = u16::try_from(u32_at(&mut off)?).ok()?;
+        let key = u16::try_from(u32_at(&mut off)?).ok()?;
+        let n = u32_at(&mut off)? as usize;
+        let bytes = buf.get(off..off.checked_add(n.checked_mul(8)?)?)?;
+        let ticks = bytes.as_chunks::<8>().0.iter().map(|&c| u64::from_le_bytes(c)).collect();
+        off += bytes.len();
+        out.push((via, key, ticks));
+    }
+    Some((out, off))
+}
+
 /// β-light step 7: tables sidecar を decode。 magic 不一致 / 短すぎる buffer
-/// は Err。 部分破損は次の field 読みで失敗 → Err として扱う。
-fn deserialize_tables(buf: &[u8]) -> Result<Vec<TableDef>, String> {
+/// は Err。 部分破損は次の field 読みで失敗 → Err として扱う。 並びの索引の宣言 (`DIA1`) も返す (無ければ空)。
+fn deserialize_tables(buf: &[u8]) -> Result<(Vec<TableDef>, Vec<OrderDecl>), String> {
     if buf.len() < 12 || &buf[0..4] != b"TBL1" {
         return Err("tables sidecar: bad magic".into());
     }
@@ -473,6 +520,7 @@ fn deserialize_tables(buf: &[u8]) -> Result<Vec<TableDef>, String> {
     // 壊れた trailer は「PK 情報が無い」扱いにするだけで、 sidecar 全体は有効とする
     // (PK は再 build で復元できる派生情報であって、 table 定義の本体ではない)。
     // 末尾の optional block 群 (順不同、 未知の magic で打ち切り)
+    let mut orders = Vec::new();
     while off + 8 <= buf.len() {
         let magic = &buf[off..off + 4];
         if magic == b"PKS1" {
@@ -523,17 +571,34 @@ fn deserialize_tables(buf: &[u8]) -> Result<Vec<TableDef>, String> {
                     *t.extra.write().unwrap() = extents;
                 }
             }
+        } else if magic == b"DIA1" {
+            // 並びの索引の宣言。 索引は列から作り直せる派生のデータなので、 壊れていたら宣言なしとして読む
+            // (sidecar 全体は有効)
+            match deserialize_orders(&buf[off + 4..]) {
+                Some((decls, used)) => {
+                    orders = decls;
+                    off += 4 + used;
+                }
+                None => {
+                    eprintln!("warning: tables sidecar: broken order declarations (DIA1), ignored");
+                    break;
+                }
+            }
         } else {
             break;
         }
     }
-    Ok(tables)
+    Ok((tables, orders))
 }
 
-/// β-light step 7: tables を sidecar に atomic 書き換え。 fsync まで含む。
+/// β-light step 7: tables を sidecar に atomic 書き換え。 fsync まで含む。 `orders` は並びの索引の宣言 (`DIA1`)。
 #[cfg(not(target_arch = "wasm32"))]
-fn persist_tables_to_sidecar(db_path: &str, tables: &[TableDef]) -> io::Result<()> {
-    crate::db_files::write_atomic_if_changed(&tables_path_for(db_path), &serialize_tables(tables))
+fn persist_tables_to_sidecar(
+    db_path: &str,
+    tables: &[TableDef],
+    orders: &[OrderDecl],
+) -> io::Result<()> {
+    crate::db_files::write_atomic_if_changed(&tables_path_for(db_path), &serialize_tables(tables, orders))
         .map(|_| ())
 }
 
@@ -587,13 +652,13 @@ fn rename_corrupt_sidecar(db_path: &str, kind: &str, err: &io::Error) {
     }
 }
 
-/// β-light step 7: 既存 sidecar を読む。 不在 (v4 DB) なら Ok(None)。
+/// β-light step 7: 既存 sidecar を読む。 不在 (v4 DB) なら Ok(None)。 並びの索引の宣言も返す。
 #[cfg(not(target_arch = "wasm32"))]
-fn load_tables_from_sidecar(db_path: &str) -> io::Result<Option<Vec<TableDef>>> {
+fn load_tables_from_sidecar(db_path: &str) -> io::Result<Option<(Vec<TableDef>, Vec<OrderDecl>)>> {
     let sidecar = tables_path_for(db_path);
     match std::fs::read(&sidecar) {
         Ok(buf) => match deserialize_tables(&buf) {
-            Ok(tables) => Ok(Some(tables)),
+            Ok(t) => Ok(Some(t)),
             Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
         },
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -4417,7 +4482,12 @@ impl Engine {
         // から再合成できるので、 sidecar 破損で全 DB が unreadable になる失敗
         // モードを避ける。
         match load_tables_from_sidecar(path) {
-            Ok(Some(persisted)) => eng.adopt_persisted_tables(persisted),
+            Ok(Some((persisted, orders))) => {
+                eng.adopt_persisted_tables(persisted);
+                // 並びの索引の宣言を戻す (table 定義の後: ref の先の表の eid の始まりを使う)。 作るのは最初に読む時
+                // (WAL の replay や Leaf の修理の後)。 作る前の書き込みは何もしないので、 replay は遅くならない
+                eng.restore_orders(orders);
+            }
             Ok(None) => {} // 不在: 新規 DB or v4 legacy
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 rename_corrupt_sidecar(path, "tables", &e);
@@ -7975,7 +8045,7 @@ impl Engine {
         // (守っているのは file I/O の順序だけで、guard 下の共有 state は無い)。
         let _guard =
             self.sidecar_persist_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        persist_tables_to_sidecar(&self.path, &self.tables)?;
+        persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw())?;
         // #9: 翻訳テーブルも同じ trigger で persist (next_local と整合させる)。
         persist_eidmap_to_sidecar(&self.path, &self.eidmap_entries_with_tombstones())?;
         self.persist_vocab_map_if_dirty()
@@ -8067,7 +8137,7 @@ impl Engine {
                     .sidecar_persist_lock
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Err(e) = persist_tables_to_sidecar(&self.path, &self.tables) {
+                if let Err(e) = persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw()) {
                     // best effort: panic せずログだけ。 user table の定義は
                     // メモリには反映されてる、 次回 reopen で失われるだけ。
                     // 0.8.15 (issue #52): ENOSPC 等で consumer thread が毎 batch
@@ -9373,8 +9443,7 @@ impl Engine {
 
     /// 並びの索引 (`declare_order`) の via か key の列を書いた後に呼ぶ: entity を今の値の置き場に置き直す。 索引が
     /// 無ければ atomic 1 回で戻る。 **行の lock の下で** 呼ぶ (同じ entity の置き直しを 1 本に並べる。 engine の書き込みの
-    /// 道は全部 `live_set` / `live_remove` を行の lock の下で呼ぶ)。 鍵の順は 行 → (作る前だけ) via の write_lock →
-    /// 置き場の鍵 (`OrderIndex::place`)。
+    /// 道は全部 `live_set` / `live_remove` を行の lock の下で呼ぶ)。 鍵の順は 行 → 置き場の鍵 (`OrderIndex::place`)。
     #[inline]
     fn order_note(&self, hid: u16, local: u32) {
         if self.live.has_orders() {
@@ -9385,14 +9454,12 @@ impl Engine {
     #[cold]
     fn order_note_slow(&self, hid: u16, local: u32) {
         for o in self.live.orders_on(hid) {
-            // 作る前は何もしない (作る時に今の列を読む)。 作ったかは、 作っていなければ via の write_lock の下で
-            // もう一度見る (作る側はその下で列をなめる。 lock の前の判定だけだと、 key の列の書き込みを見落とす:
-            // `tests/loom_order_index_build.rs`)。 作り終えた後は via の lock を取らない
+            // 作る前は何もしない (lock も取らない)。 列はこの紐の write_lock の下で書いてあり、 作る側は via と key の
+            // write_lock を両方取ってから列をなめる ([`order_ready`](Self::order_ready)): 作る側が取る前に書いた列は
+            // なめる時に読まれ、 離した後に書いたならここで 「作った」 が見える (`tests/loom_order_index_build.rs`)。
+            // 開き直した後 (宣言は戻すが作るのは最初に読む時) の書き込みも、 これで上乗せが無い
             if !o.is_built() {
-                let _w = self.himos[o.via as usize].write_guard();
-                if !o.is_built() {
-                    continue;
-                }
+                continue;
             }
             let v = self.himos[o.via as usize].get_value(local).and_then(|v| u32::try_from(v).ok());
             let k = self.himos[o.key as usize].get_value(local);
@@ -9500,10 +9567,16 @@ impl Engine {
         let _ = self.himos[h as usize].slice_len(0);
     }
 
-    /// 並びの索引を使える状態にする (作っていなければ via の write_lock の下で作る)。 やめた索引は false。
+    /// 並びの索引を使える状態にする (作っていなければ via と key の write_lock の下で作る)。 やめた / 外した索引は false。
     fn order_ready(&self, o: &crate::order_index::OrderIndex) -> bool {
+        if o.is_retired() {
+            return false;
+        }
         if !o.is_built() {
+            // via → key の順 (via は Ref、 key は Number / Number64 の紐なので同じ紐にはならない)。 書き手は列を書く間に
+            // どちらか 1 本しか持たないので、 両方を取れた時点で書きかけの列は無い ([`order_note_slow`](Self::order_note_slow))
             let _w = self.himos[o.via as usize].write_guard();
+            let _k = self.himos[o.key as usize].write_guard();
             if !o.is_built() {
                 let (via, key) = (&self.himos[o.via as usize], &self.himos[o.key as usize]);
                 o.build(
@@ -13508,9 +13581,13 @@ impl Engine {
     ///
     /// - `via` は Ref の紐、 `key` は Number / Number64 の紐 (どちらも根の entity の列)。 `ticks` は空でない狭義の昇順で、
     ///   key の列に入る値。 帯は 「値が無い」 / `[0, t1)` / `[t1, t2)` / … / `[t_last, ∞)`
-    /// - via の紐 1 本に索引は 1 つ (全部で 64 まで)。 同じ宣言をもう一度するのは何もしない、 違う宣言は Err
+    /// - via の紐 1 本に索引は 1 つ。 同じ宣言をもう一度するのは何もしない、 違う宣言 (key か目盛りが違う) は置き換える
+    ///   (新しい索引は最初に読む時に作り直す)。 外すのは [`drop_order`](Self::drop_order)。 枠は全部で 64 で、 置き換え /
+    ///   外した古い索引も開き直すまで枠を使う (作ってあった中身も残る)
     /// - 宣言しただけでは作らない (最初に読む時に via の列をなめて作る)。 作った後は via / key の書き込みのたびに置き直す
-    ///   (1 回 +30〜90 ns、 10 万〜100 万人での実測 2026-10-10。 宣言の無い DB は書き込みのコストが変わらない)
+    ///   (1 回 +30〜90 ns、 10 万〜100 万人での実測 2026-10-10)。 作る前の書き込みと、 宣言の無い DB の書き込みは
+    ///   コストが変わらない。 購読を張ると張った時に作るので、 **範囲の条件で絞って引く ref にだけ宣言する** (範囲で
+    ///   引かない紐に宣言すると、 置き直しの上乗せだけ払う)
     /// - via の紐の逆引きは全部この索引から読む ([`pull`](Self::pull) / [`pull_in`](Self::pull_in) / [`query`](Self::query) /
     ///   購読の展開と登録)。 その紐の円柱 (普通の逆引き) は作らない — 値の範囲で引く `pull_range` と、 値の一覧・件数の
     ///   集計 (`unique_values` など) だけは今まで通り円柱を作る。 索引が答えられない時 (やめた、 帯を揃えて控えられない) も円柱
@@ -13518,24 +13595,72 @@ impl Engine {
     /// - 範囲の条件なしで昇順に読む所 (会社単位の購読の `members` など) は帯ごとの一覧を混ぜ合わせるので、 宣言しない時
     ///   (円柱の一覧はもとから昇順に近い) より遅い: 会社を先に作る並べ方で 1.3〜1.6 倍、 会社の eid が 2^20 を超える並べ方
     ///   では 0.8〜1.1 倍 (100 万人、 2026-10-11)。 小さい会社の `pull` も 1 回 +0.04〜0.08 µs
-    /// - メモリ上だけ (開き直したら宣言し直す)
+    /// - 宣言は `{db}/tables` に保存し、 開き直すと戻る (中身は最初に読む時に作り直す)。 保存は他の table 定義と同じ
+    ///   (build phase は `persist_tables` / finish で、 その後は宣言した時に)。 宣言を知らない古い binary で開いても
+    ///   壊れない (宣言を読まないだけ。 その binary が table 定義を書き直すと宣言は消える)。 memory-only の DB は保存しない
     pub fn declare_order(&self, via: &str, key: &str, ticks: &[u64]) -> Result<(), String> {
         let via_id = self.himo_id(via).ok_or_else(|| format!("declare_order: unknown himo '{via}'"))?;
         let key_id = self.himo_id(key).ok_or_else(|| format!("declare_order: unknown himo '{key}'"))?;
-        let vt = self.himos[via_id].value_type;
-        if vt != ValueType::Ref {
-            return Err(format!("declare_order: '{via}' is not a Ref himo ({vt:?})"));
+        let o = self.new_order_index(via_id, key_id, ticks).map_err(|e| format!("declare_order: {e}"))?;
+        if self.live.add_order(o).map_err(|e| format!("declare_order: {e}"))? {
+            self.try_persist_tables();
         }
-        let key_max = match self.himos[key_id].value_type {
+        Ok(())
+    }
+
+    /// 並びの索引 ([`declare_order`](Self::declare_order)) を外す。 外したら true、 宣言が無ければ false。 以後 via の紐の
+    /// 逆引きは円柱 (普通の逆引き) に戻る。 宣言は保存からも消える。 外した索引は開き直すまで枠とメモリを使う。
+    pub fn drop_order(&self, via: &str) -> Result<bool, String> {
+        let via_id = self.himo_id(via).ok_or_else(|| format!("drop_order: unknown himo '{via}'"))?;
+        let removed = self.live.remove_order(via_id as u16);
+        if removed {
+            self.try_persist_tables();
+        }
+        Ok(removed)
+    }
+
+    /// 今の並びの索引の宣言 (via の紐の名前, key の紐の名前, 目盛り)。 宣言した順。
+    pub fn order_declarations(&self) -> Vec<(String, String, Vec<u64>)> {
+        let name = |h: u16| self.himo_name_at(h as usize).unwrap_or_default().to_string();
+        self.live.orders().map(|o| (name(o.via), name(o.key), o.declared().to_vec())).collect()
+    }
+
+    /// `{db}/tables` に書く宣言 (via, key, 目盛り)。
+    fn order_decls_raw(&self) -> Vec<OrderDecl> {
+        self.live.orders().map(|o| (o.via, o.key, o.declared().to_vec())).collect()
+    }
+
+    /// 開く時: `{db}/tables` の宣言を戻す (作るのは最初に読む時。 保存は書き直さない)。 紐の型が合わない / 目盛りが
+    /// 壊れているなどの宣言は、 警告して捨てる (索引は派生のデータなので、 無くても答えは変わらない)。
+    fn restore_orders(&self, decls: Vec<OrderDecl>) {
+        for (via, key, ticks) in decls {
+            let r = self.new_order_index(via as usize, key as usize, &ticks).and_then(|o| self.live.add_order(o));
+            if let Err(e) = r {
+                eprintln!("warning: dropped a stored order declaration (via himo {via}, key himo {key}): {e}");
+            }
+        }
+    }
+
+    /// 宣言を確かめて並びの索引を作る (中身は空、 作るのは [`order_ready`](Self::order_ready))。
+    fn new_order_index(&self, via_id: usize, key_id: usize, ticks: &[u64]) -> Result<crate::order_index::OrderIndex, String> {
+        let (Some(via), Some(key)) = (self.himos.get(via_id), self.himos.get(key_id)) else {
+            return Err(format!("himo {via_id} / {key_id} out of range"));
+        };
+        let via_name = self.himo_name_at(via_id).unwrap_or_default();
+        let key_name = self.himo_name_at(key_id).unwrap_or_default();
+        if via.value_type != ValueType::Ref {
+            return Err(format!("'{via_name}' is not a Ref himo ({:?})", via.value_type));
+        }
+        let key_max = match key.value_type {
             ValueType::Number => u32::MAX as u64 - 1,
             ValueType::Number64 => u64::MAX - 1,
-            t => return Err(format!("declare_order: '{key}' must be a Number / Number64 himo ({t:?})")),
+            t => return Err(format!("'{key_name}' must be a Number / Number64 himo ({t:?})")),
         };
         if ticks.is_empty() || ticks.windows(2).any(|w| w[0] >= w[1]) {
-            return Err(format!("declare_order: ticks must be non-empty and strictly increasing ({ticks:?})"));
+            return Err(format!("ticks must be non-empty and strictly increasing ({ticks:?})"));
         }
         if ticks.last().is_some_and(|&t| t > key_max) {
-            return Err(format!("declare_order: ticks must fit in '{key}' (max {key_max})"));
+            return Err(format!("ticks must fit in '{key_name}' (max {key_max})"));
         }
         // 置き場の配列の 0 番 = ref の先の table の eid の始まり (表を宣言していない ref は 0)
         let base = self
@@ -13544,7 +13669,7 @@ impl Engine {
             .find_map(|t| t.fk_refs.iter().find(|&&(h, _)| h as usize == via_id).map(|&(_, tid)| tid))
             .and_then(|tid| self.tables.get(tid as usize))
             .map_or(0, |t| t.eid_range_lo);
-        self.live.add_order(crate::order_index::OrderIndex::new(via_id as u16, key_id as u16, ticks, key_max, base))
+        Ok(crate::order_index::OrderIndex::new(via_id as u16, key_id as u16, ticks, key_max, base))
     }
 
     /// 診断: 並びの索引ごとの (via, key, 読んだ回数, 読んだ entity の数, heap の大きさ)。
@@ -15675,7 +15800,7 @@ impl Engine {
         // (durability は copy と同じ page-cache level、 backup の fsync は呼び出し側責務)。
         // 0.7.0: .tables には reserved table `_sync_ops` / `_sync_peers` も含む。
         if !self.tables.is_empty() {
-            std::fs::write(tables_path_for(target), serialize_tables(&self.tables))?;
+            std::fs::write(tables_path_for(target), serialize_tables(&self.tables, &self.order_decls_raw()))?;
         }
         let eidmap_entries = self.eidmap_entries_with_tombstones();
         if !eidmap_entries.is_empty() {
@@ -20892,5 +21017,114 @@ mod v10_dir_tests {
         let r = Engine::create_growable_with_capacity(&path, 65_536);
         assert_eq!(r.err().map(|e| e.kind()), Some(io::ErrorKind::AlreadyExists), "中身のある DB を消して作り直した");
         assert!(std::path::Path::new(&path).join("himo").read_dir().unwrap().next().is_some(), "himo segment が消えた");
+    }
+}
+
+/// 並びの索引の宣言 (`DIA1`、 `Engine::declare_order`) の読み書き。 古い binary の読み方 (知らない magic で止まる) で
+/// PKS1 / EXT1 が同じに読めること、 壊れた DIA1 は宣言なしとして読むこと、 開く時に戻せない宣言は捨てること。
+#[cfg(test)]
+mod order_decl_sidecar_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> String {
+        let path = format!("/tmp/enchu_order_decl_{name}_{}.db", std::process::id());
+        let _ = crate::db_files::remove_db(&path);
+        path
+    }
+
+    /// table の形 (名前, eid の範囲, PK, 追加 extent)。
+    #[allow(clippy::type_complexity)]
+    fn shape(t: &[TableDef]) -> Vec<(String, u32, u32, Option<u16>, Vec<(u32, u32)>)> {
+        t.iter()
+            .map(|t| (t.name.clone(), t.eid_range_lo, t.eid_range_hi, t.pk_himo, t.extra.read().unwrap().clone()))
+            .collect()
+    }
+
+    /// PK と追加 extent を持つ表 (PKS1 と EXT1 を書く) の engine。
+    fn engine(path: &str) -> Engine {
+        let mut eng = Engine::create_growable_opts(
+            path,
+            GrowableOptions {
+                max_entities: 64,
+                max_himos: 16,
+                vocab_data_size: 64 * 1024,
+                content_data_size: Some(64 * 1024),
+                reserve_entities: Some(128),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        eng.define_table("c", 4).unwrap();
+        eng.define_table("u", 4).unwrap();
+        eng.define_himo_in("u", "id", ValueType::Number, 0).unwrap();
+        eng.define_himo_in("u", "age", ValueType::Number, 0).unwrap();
+        eng.define_ref_in("u", "company", "c").unwrap();
+        let id = eng.himo_id("u.id").unwrap() as u16;
+        eng.set_table_pk("u", id).unwrap();
+        // u の直後に x を切る = u は extent を足して伸びる
+        eng.define_table("x", 4).unwrap();
+        for _ in 0..6 {
+            eng.entity_in("u").unwrap();
+        }
+        eng
+    }
+
+    #[test]
+    fn dia1_is_appended_after_the_blocks_old_binaries_read() {
+        let path = tmp("append");
+        let eng = engine(&path);
+        assert!(eng.table_eid_extents("u").unwrap().len() >= 2, "前提: EXT1 を書く");
+        assert!(eng.tables.iter().any(|t| t.pk_himo.is_some()), "前提: PKS1 を書く");
+        let without = serialize_tables(&eng.tables, &[]);
+        assert!(!without.windows(4).any(|w| w == b"DIA1"), "宣言が無ければ DIA1 を書かない");
+        eng.declare_order("u.company", "u.age", &[30, 65]).unwrap();
+        let decls = eng.order_decls_raw();
+        assert_eq!(decls.len(), 1);
+        let with = serialize_tables(&eng.tables, &decls);
+        assert!(with.starts_with(&without) && &with[without.len()..without.len() + 4] == b"DIA1", "DIA1 は一番後ろに足す");
+        let (t0, o0) = deserialize_tables(&without).unwrap();
+        let (t1, o1) = deserialize_tables(&with).unwrap();
+        assert!(o0.is_empty());
+        assert_eq!(o1, decls);
+        assert_eq!(shape(&t0), shape(&eng.tables), "前提: 読み戻した形が元と同じ");
+        assert_eq!(shape(&t1), shape(&t0));
+        // 古い binary の読み方 = DIA1 を知らない = 知らない magic で止まる。 今の読み手で magic だけ変えて写す
+        let mut old = with.clone();
+        old[without.len()..without.len() + 4].copy_from_slice(b"ZZZ9");
+        let (t2, o2) = deserialize_tables(&old).unwrap();
+        assert!(o2.is_empty());
+        assert_eq!(shape(&t2), shape(&t0), "古い binary に見える table / PK / extent が変わった");
+        // 途中で切れた DIA1 は宣言なし (table は有効)
+        for cut in [1, 4, 9, 12] {
+            let (t3, o3) = deserialize_tables(&with[..with.len() - cut]).unwrap();
+            assert!(o3.is_empty(), "cut {cut}");
+            assert_eq!(shape(&t3), shape(&t0), "cut {cut}");
+        }
+        // DIA1 の後ろの知らない block: DIA1 は読み、 その先で止まる
+        let mut more = with.clone();
+        more.extend_from_slice(b"ZZZ9\x01\x00\x00\x00junk");
+        assert_eq!(deserialize_tables(&more).unwrap().1, decls);
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+    }
+
+    #[test]
+    fn restore_keeps_only_valid_declarations() {
+        let path = tmp("restore");
+        let eng = engine(&path);
+        let h = |n: &str| eng.himo_id(n).unwrap() as u16;
+        let (via, age, id) = (h("u.company"), h("u.age"), h("u.id"));
+        eng.restore_orders(vec![
+            (age, age, vec![30]),     // via が Ref でない
+            (via, via, vec![30]),     // key が数でない
+            (via, age, vec![]),       // 目盛りが空
+            (via, age, vec![65, 30]), // 昇順でない
+            (via, 999, vec![30]),     // 紐が無い
+            (via, age, vec![30, 65]),
+            (via, id, vec![1]), // 同じ via への 2 つ目は置き換え
+        ]);
+        assert_eq!(eng.order_decls_raw(), vec![(via, id, vec![1])]);
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
     }
 }

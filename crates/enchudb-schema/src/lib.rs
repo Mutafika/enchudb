@@ -703,6 +703,7 @@ impl Database {
             relations: Vec::new(),
             capacity: None,
             local_only: false,
+            orders: Vec::new(),
         }
     }
 
@@ -1389,6 +1390,8 @@ pub struct TableBuilder<'a> {
     relations: Vec<(String, String)>, // (from_col, to_table)
     capacity: Option<u32>,
     local_only: bool,
+    /// 並びの索引の宣言 (via 列, key 列, 目盛り)。 build でまとめて検査する。
+    orders: Vec<(String, String, Vec<i64>)>,
 }
 
 impl<'a> TableBuilder<'a> {
@@ -1466,8 +1469,32 @@ impl<'a> TableBuilder<'a> {
         self
     }
 
+    /// 並びの索引を宣言する ([`Engine::declare_order`])。 ref 列 `via` の逆引き (「会社 c の社員」) を、 同じ表の数の列
+    /// `key` の値の帯 (目盛り `ticks` の間) ごとに分けて持つ。 `where_ref(via, c)` に `key` の範囲を足した検索と購読が、
+    /// 会社の全員をなめずに範囲に当たる帯だけを読む。 範囲の両端が目盛りとちょうど合えば (目盛り `[30, 65]` に
+    /// `where_range("age", 30, 64)` など)、 範囲の条件を行ごとに確かめず、 件数は帯の件数の和で数える。
+    ///
+    /// ```ignore
+    /// db.table("users").ref_to("company", "companies").number("age").order("company", "age", &[30, 65]).build()?;
+    /// ```
+    ///
+    /// - `via` は `ref_to` の列、 `key` は `number` / `bigint` の列 (どちらもこの表の列)。 `ticks` は空でない狭義の昇順で、
+    ///   key の列に入る値 (number は 0 以上)。 帯は 「値が無い」 / 一番下から t1 の手前 / t1 から t2 の手前 / … / t_last から上
+    /// - ref 列 1 本に 1 つ。 列の宣言との順はどちらが先でもよい (build でまとめて検査する)
+    /// - build のたびに、 書いた並びがこの表の並びの全部になる: 目盛りを変えれば作り直し、 書かなければ外れる。
+    ///   列も並びも書かない `build()` (handle を取るだけ) は何も変えない
+    /// - 宣言は engine の `{db}/tables` に保存され、 開き直すと engine が自分で戻す (中身は最初に読む時に作る)
+    /// - 費用: 作った後は via / key の列の書き込みのたびに置き直す (1 回 +30〜90 ns)。 購読を張るとその時に作るので、
+    ///   **範囲の条件で絞って引く ref にだけ宣言する**。 via 列の逆引きは全部この索引から読み、 普通の逆引き (円柱) は
+    ///   作らない。 via 列で引いた行の並び (order_by の無い `limit` が返す部分集合) は帯の順になる
+    pub fn order(mut self, via: &str, key: &str, ticks: &[i64]) -> Self {
+        self.orders.push((via.to_string(), key.to_string(), ticks.to_vec()));
+        self
+    }
+
     pub fn build(self) -> Result<Table<'a>, SchemaError> {
-        let TableBuilder { db, name, cols: col_specs, pk, relations, capacity: capacity_hint, local_only } = self;
+        let TableBuilder { db, name, cols: col_specs, pk, relations, capacity: capacity_hint, local_only, orders } = self;
+        let declared: Vec<(String, ColumnType)> = col_specs.iter().map(|(n, t, _)| (n.clone(), *t)).collect();
 
         // 既存 table と同名の場合 (#73 G1):
         // - cols 未宣言 (= handle 取得 idiom) は従来通り existing を返す
@@ -1475,13 +1502,21 @@ impl<'a> TableBuilder<'a> {
         //   trailing 新列なら auto-migrate、 矛盾は SchemaConflict で loud に落とす。
         //   従来はここで宣言を無条件に捨てていて、 新列への `set` が
         //   UnknownColumn になるか silent data loss になっていた。
+        // 並びの索引は、 列か並びを宣言したら宣言どおりに合わせる (`order` の doc)。
         if let Some(existing) = db.find_table_inner(&name) {
             if col_specs.is_empty() {
+                if !orders.is_empty() {
+                    let cols: Vec<(String, ColumnType)> = existing.cols.iter().map(|c| (c.name.clone(), c.ty)).collect();
+                    let orders = check_orders(&cols, &orders)?;
+                    sync_orders(&db.eng, &existing, &orders)?;
+                }
                 return Ok(Table { db, inner: existing });
             }
+            let orders = check_orders(&declared, &orders)?;
             let inner = db.migrate_existing_table(
                 existing, &col_specs, pk.as_deref(), &relations,
             )?;
+            sync_orders(&db.eng, &inner, &orders)?;
             return Ok(Table { db, inner });
         }
 
@@ -1506,6 +1541,9 @@ impl<'a> TableBuilder<'a> {
                 return Err(SchemaError::UnknownTable(to_table.clone()));
             }
         }
+
+        // 並びの索引の検査 (engine に何か作る前に)
+        let orders = check_orders(&declared, &orders)?;
 
         // 0.8.7: schema_meta_entity の eager 予約は撤去 (= `.schema` sidecar に
         // 移行したので anonymous entity を確保する必要が無くなった)。
@@ -1605,6 +1643,8 @@ impl<'a> TableBuilder<'a> {
             relations: relations.into_iter().map(|(from_col, to_table)| RelationInner { from_col, to_table }).collect(),
             upsert_lock: std::sync::Mutex::new(()),
         });
+        // engine に table が残っていた (schema の blob だけ古い) 時は、 engine が戻した並びもここで宣言に合わせる
+        sync_orders(&db.eng, &inner, &orders)?;
         db.tables.push(inner.clone());
         // 0.8.2: build phase 中の persist_schema は finish_* に coalesce
         // (= 1 build = 1 fsync ≒ 47ms の linear scaling を解消、 issue #19)。
@@ -1614,6 +1654,73 @@ impl<'a> TableBuilder<'a> {
 
         Ok(Table { db, inner })
     }
+}
+
+/// `.order(...)` の宣言を検査して engine の値にする: (via 列, key 列, 目盛り (engine の値))。 列は `cols` (名前, 型)
+/// から引き、 列の名前は `cols` の綴りにそろえる。
+fn check_orders(
+    cols: &[(String, ColumnType)],
+    orders: &[(String, String, Vec<i64>)],
+) -> Result<Vec<(String, String, Vec<u64>)>, SchemaError> {
+    let find = |n: &str| {
+        cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).ok_or_else(|| SchemaError::UnknownColumn(n.to_string()))
+    };
+    let mut out: Vec<(String, String, Vec<u64>)> = Vec::with_capacity(orders.len());
+    for (via, key, ticks) in orders {
+        let (via_col, via_ty) = find(via)?;
+        if *via_ty != ColumnType::Ref {
+            return Err(SchemaError::TypeMismatch(format!("order: via column {via:?} must be a ref column ({via_ty:?})")));
+        }
+        let (key_col, key_ty) = find(key)?;
+        let raw = match key_ty {
+            ColumnType::Number => |t: i64| (0..u32::MAX as i64).contains(&t).then_some(t as u64),
+            ColumnType::BigInt => big_raw,
+            t => {
+                return Err(SchemaError::TypeMismatch(format!(
+                    "order: key column {key:?} must be a number / bigint column ({t:?})"
+                )));
+            }
+        };
+        if ticks.is_empty() || ticks.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(SchemaError::BadValue(format!(
+                "order on {via:?}: ticks must be non-empty and strictly increasing ({ticks:?})"
+            )));
+        }
+        let ticks = ticks
+            .iter()
+            .map(|&t| raw(t).ok_or_else(|| SchemaError::BadValue(format!("order on {via:?}: tick {t} does not fit in column {key:?}"))))
+            .collect::<Result<Vec<u64>, _>>()?;
+        if out.iter().any(|o| o.0 == *via_col) {
+            return Err(SchemaError::BadValue(format!("order: two orders on the via column {via:?}")));
+        }
+        out.push((via_col.clone(), key_col.clone(), ticks));
+    }
+    Ok(out)
+}
+
+/// 表 `t` の並びの索引を、 検査済みの宣言 `orders` (via 列, key 列, engine の目盛り) にちょうど合わせる: 足す / key や
+/// 目盛りを変える (engine が置き換えて作り直す) / 宣言に無い ref 列の並びを外す。 同じ宣言なら何もしない (保存も
+/// 書き直さない)。
+fn sync_orders(eng: &Engine, t: &TableInner, orders: &[(String, String, Vec<u64>)]) -> Result<(), SchemaError> {
+    let have = eng.order_declarations();
+    for c in t.cols.iter().filter(|c| c.ty == ColumnType::Ref) {
+        let wanted = orders.iter().any(|o| o.0.eq_ignore_ascii_case(&c.name));
+        if !wanted && have.iter().any(|h| h.0 == c.himo_name) {
+            eng.drop_order(&c.himo_name).map_err(SchemaError::Internal)?;
+        }
+    }
+    for (via, key, ticks) in orders {
+        let himo = |n: &str| {
+            t.col(n)
+                .map(|c| c.himo_name.as_str())
+                .ok_or_else(|| SchemaError::Internal(format!("order: column {n:?} missing after build")))
+        };
+        let (via, key) = (himo(via)?, himo(key)?);
+        if !have.iter().any(|h| h.0 == via && h.1 == key && h.2 == *ticks) {
+            eng.declare_order(via, key, ticks).map_err(SchemaError::BadValue)?;
+        }
+    }
+    Ok(())
 }
 
 // ─────────────────────────── Table ───────────────────────────

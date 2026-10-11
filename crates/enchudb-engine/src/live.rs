@@ -4248,15 +4248,16 @@ pub(crate) struct LiveRegistry {
     peer: AtomicU32,
     /// #381: 外した購読が押さえていた辞書の番号。 engine が `take_unpins` で取り出して返す。
     unpins: Mutex<Vec<u32>>,
-    /// 並びの索引 (`Engine::declare_order`)。 via の紐 1 本に 1 つまで、 全部で [`MAX_ORDERS`] まで。 足すだけ (外さない) なので、
-    /// 読み手 (全部の書き込みの `order_note`、 購読の読み) は `n_orders` までを lock なしで読む (共有の数を書き換えない =
-    /// 書き手が何本居ても cache line を奪い合わない)。 足すのは `orders_add` の下で、 置いてから `n_orders` を Release で進める。
+    /// 並びの索引 (`Engine::declare_order`)。 via の紐 1 本に 1 つまで、 全部で [`MAX_ORDERS`] まで。 枠は足すだけ (外す時は
+    /// 索引に `retired` を立てるだけで、 枠も中身も閉じるまで残す) なので、 読み手 (全部の書き込みの `order_note`、 購読の
+    /// 読み) は `n_orders` までを lock なしで読む (共有の数を書き換えない = 書き手が何本居ても cache line を奪い合わない)。
+    /// 足す / 外すのは `orders_add` の下で、 足す時は置いてから `n_orders` を Release で進める。
     orders: [std::sync::OnceLock<Box<crate::order_index::OrderIndex>>; MAX_ORDERS],
     n_orders: AtomicUsize,
     orders_add: Mutex<()>,
 }
 
-/// 並びの索引の上限 (via の紐 1 本に 1 つなので、 ref の紐の数より多くは要らない)。
+/// 並びの索引の上限 (via の紐 1 本に 1 つなので、 ref の紐の数より多くは要らない)。 外した索引も、 閉じるまで枠を使う。
 pub(crate) const MAX_ORDERS: usize = 64;
 
 impl Drop for LiveRegistry {
@@ -4308,38 +4309,45 @@ impl LiveRegistry {
         }
     }
 
-    /// 並びの索引を足す。 同じ via の索引が既にあれば、 key と目盛りが同じなら何もしない (Ok)、 違えば Err。
-    /// [`MAX_ORDERS`] を超えるのも Err。
-    pub(crate) fn add_order(&self, o: crate::order_index::OrderIndex) -> Result<(), String> {
+    /// 並びの索引を足す。 同じ via の索引が既にあれば、 key と目盛りが同じなら何もしない、 違えば古い方を外して足す
+    /// (置き換え)。 [`MAX_ORDERS`] を超えるのは Err (古い宣言はそのまま)。 戻り値は足したか。
+    pub(crate) fn add_order(&self, o: crate::order_index::OrderIndex) -> Result<bool, String> {
         let _g = self.orders_add.lock();
-        if let Some(x) = self.orders().find(|x| x.via == o.via) {
-            return if x.key == o.key && x.declared() == o.declared() {
-                Ok(())
-            } else {
-                Err(format!("an order on himo {} is already declared (key {}, ticks {:?})", x.via, x.key, x.declared()))
-            };
+        let old = self.orders().find(|x| x.via == o.via);
+        if old.is_some_and(|x| x.key == o.key && x.declared() == o.declared()) {
+            return Ok(false);
         }
         let n = self.n_orders.load(Ordering::Acquire);
         if n == MAX_ORDERS {
-            return Err(format!("too many orders (max {MAX_ORDERS})"));
+            return Err(format!("too many orders (max {MAX_ORDERS}, retired ones included until the engine is reopened)"));
+        }
+        // 外すのは足せると決まってから。 外してから足すまでの間の読み手は索引を見つけず、 普通の逆引きを使う
+        if let Some(x) = old {
+            x.retire();
         }
         // `orders_add` の下なので n 番はまだ空
         let _ = self.orders[n].set(Box::new(o));
         self.n_orders.store(n + 1, Ordering::Release);
-        Ok(())
+        Ok(true)
     }
 
-    /// 並びの索引が 1 つでもあるか (書き込みの速い道)。
+    /// via の紐の並びの索引を外す。 外したか (無ければ false)。
+    pub(crate) fn remove_order(&self, via: u16) -> bool {
+        let _g = self.orders_add.lock();
+        self.orders().find(|x| x.via == via).inspect(|x| x.retire()).is_some()
+    }
+
+    /// 並びの索引が 1 つでもあるか (書き込みの速い道。 外した索引も数える)。
     #[inline]
     pub(crate) fn has_orders(&self) -> bool {
         self.n_orders.load(Ordering::Acquire) != 0
     }
 
-    /// 全部の並びの索引 (lock なし)。
+    /// 今の (外していない) 並びの索引 (lock なし)。
     #[inline]
     pub(crate) fn orders(&self) -> impl Iterator<Item = &crate::order_index::OrderIndex> {
         let n = self.n_orders.load(Ordering::Acquire);
-        self.orders[..n].iter().filter_map(|o| o.get().map(|b| &**b))
+        self.orders[..n].iter().filter_map(|o| o.get().map(|b| &**b)).filter(|o| !o.is_retired())
     }
 
     /// (via, key) の並びの索引。
@@ -6575,23 +6583,28 @@ mod tests {
         assert!(reg.with_snap(|s| s.routes.iter().all(Vec::is_empty)).unwrap_or(true));
     }
 
-    /// 並びの索引の一覧: [`MAX_ORDERS`] まで足せて、 その先は Err。 同じ via への同じ宣言は Ok (数は増えない)、 違う宣言は Err。
+    /// 並びの索引の一覧: [`MAX_ORDERS`] まで足せて、 その先は Err (古い宣言はそのまま)。 同じ via への同じ宣言は何もしない、
+    /// 違う宣言は置き換える。 外した索引は一覧から消えるが、 枠は使ったまま。
     #[test]
     fn add_order_caps_at_max_orders() {
         use crate::order_index::OrderIndex;
         let reg = LiveRegistry::new(0);
         assert!(!reg.has_orders());
-        for v in 0..MAX_ORDERS as u16 {
-            reg.add_order(OrderIndex::new(v, 999, &[30], 1000, 0)).unwrap();
+        for v in 0..MAX_ORDERS as u16 - 2 {
+            assert!(reg.add_order(OrderIndex::new(v, 999, &[30], 1000, 0)).unwrap());
         }
         assert!(reg.has_orders());
-        assert!(reg.add_order(OrderIndex::new(MAX_ORDERS as u16, 999, &[30], 1000, 0)).is_err(), "上限の先");
-        assert!(reg.add_order(OrderIndex::new(3, 999, &[30], 1000, 0)).is_ok(), "同じ宣言");
-        assert!(reg.add_order(OrderIndex::new(3, 998, &[30], 1000, 0)).is_err(), "同じ via に違う key");
-        assert!(reg.add_order(OrderIndex::new(3, 999, &[40], 1000, 0)).is_err(), "同じ via に違う目盛り");
-        assert_eq!(reg.orders().count(), MAX_ORDERS);
-        assert!(reg.order_for(3, 999).is_some() && reg.order_for(3, 998).is_none());
-        assert_eq!(reg.orders_on(999).count(), MAX_ORDERS, "key の紐からは全部");
+        assert!(!reg.add_order(OrderIndex::new(3, 999, &[30], 1000, 0)).unwrap(), "同じ宣言は足さない");
+        assert!(reg.add_order(OrderIndex::new(3, 999, &[40], 1000, 0)).unwrap(), "同じ via に違う目盛り = 置き換え");
+        assert_eq!(reg.orders().find(|o| o.via == 3).map(|o| o.declared().to_vec()), Some(vec![40]));
+        assert!(reg.add_order(OrderIndex::new(3, 998, &[30], 1000, 0)).unwrap(), "同じ via に違う key = 置き換え");
+        assert!(reg.order_for(3, 998).is_some() && reg.order_for(3, 999).is_none(), "古い方は見えない");
+        assert_eq!(reg.orders().count(), MAX_ORDERS - 2, "置き換えで数は増えない");
+        assert!(reg.add_order(OrderIndex::new(4, 999, &[50], 1000, 0)).is_err(), "枠の先 (外した 2 つも枠を使う)");
+        assert_eq!(reg.orders().find(|o| o.via == 4).map(|o| o.declared().to_vec()), Some(vec![30]), "足せない時は古い宣言のまま");
+        assert_eq!(reg.orders_on(999).count(), MAX_ORDERS - 3, "key の紐からは全部 (via 3 は key 998 に移った)");
         assert_eq!(reg.orders_on(5).map(|o| o.via).collect::<Vec<_>>(), vec![5], "via の紐からは 1 つ");
+        assert!(reg.remove_order(5) && !reg.remove_order(5), "外せるのは 1 回");
+        assert!(reg.orders_on(5).next().is_none() && reg.orders().count() == MAX_ORDERS - 3);
     }
 }
