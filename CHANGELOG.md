@@ -3,6 +3,104 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.32.0 — 2026-10-11
+
+minor。 **API が増えた**: 並びの索引 (`Engine::declare_order` / `drop_order` / `order_declarations`、 schema の
+`TableBuilder::order`)、 見直す場所だけ返す購読 (`Engine::subscribe_touched` / schema の `Query::subscribe_touched`)、 会社単位の
+購読のまとめ読み (`GroupedLiveQuery::members_many` / `count_in`)。 on-disk 形式は、 並びを宣言した DB だけ `{db}/tables` の後ろに
+`DIA1` の block が付く (宣言の無い DB は 1 byte も変わらない)。 wire 形式は 0.31.4 と同じ。 0.31.4 にあった、 値が 2^20 以上の
+ref を並行の書き込み中に引くと、 もう別の値に移った entity を返しうる不具合を直した (#457)。
+
+**上げる時の注意**:
+
+- 並びの索引は宣言した時だけ働く。 宣言しない DB は `{db}/tables` が変わらず、 書き込みは宣言があるかを atomic で 1 回見るだけ
+- 並びを宣言した DB を古い binary (0.31.4 以前) で開いても壊れない (`DIA1` の手前で読むのをやめ、 table / 主キー / extent は
+  今まで通り読む。 0.31.4 で build した binary で確かめた)。 ただし古い binary が rw で開いて閉じると table 定義を書き直すので、
+  宣言は消える (答えは変わらない。 新しい binary で宣言し直せば戻る)
+- 宣言した ref の列 (via) について (数字は 100 万人での実測):
+  - `pull` で返る並びが帯の順になる (0.31.4 は、 確かめた時は eid の昇順だった。 並びは約束していない)。 order_by の無い
+    `limit` は別の部分集合を返しうる
+  - 範囲の条件なしで昇順に読む所 (会社単位の購読の、 根への条件が無い `members` など) は、 宣言しない時の 1.3〜1.6 倍の時間が
+    かかる (会社を先に作る並べ方。 会社の eid が 2^20 を超える並べ方では 0.8〜1.1 倍)。 小さい会社の `pull` は 1 回
+    +0.04〜0.08 µs
+  - 索引を作った後は、 via / key を書くたびに帯を置き直す。 年齢だけを書き続けると、 書き手 1 本で 1 回 49〜52 → 132〜168 ns、
+    処理量は書き手 4 本で 0.52〜0.64 倍、 8 本で 0.68〜0.71 倍。 購読を張るとその時に索引を作るので、 **範囲の条件で絞って
+    引く ref にだけ宣言する**
+  - メモリ (最大 RSS、 宣言 1 本): 会社を先に作る並べ方で +1〜+22 MB、 表 3 つの並べ方で −16〜+10 MB (会社 10 万社を範囲なしで
+    全部引く時は −108 MB)。 索引そのものは 8〜21 MB で、 via の円柱 (4〜16 MB) を作らなくなる
+- schema の `.order(...)`: build のたびに、 書いた並びがその表の並びの全部になる (目盛りを変えれば作り直し、 書かなければ
+  外れる)。 列も並びも書かない `build()` (handle を取るだけ) は何も変えない
+- 宣言の枠は DB 全体で 64。 置き換えた / 外した索引も、 開き直すまで枠とメモリを使う
+
+### Fixed — 値が 2^20 以上の ref を並行の書き込み中に引くと、 もう別の値に移った entity を返しえた (#457)
+
+`LockFreeCylinder` の sparse (値が 2^20 以上の run) の読みは、 run を読んだ **後** に 「古い entry があるか」 を見て、 列で
+確かめるかを決めていた。 読んだ直後に書き手が sparse を組み直す (古い entry を落とした版を出して数を 0 に戻す) と、 読み手は
+組み直す前の版を持ったまま 0 を見て、 古い entry を確かめずに返した。 読む **前** に数を見る (組み直しは版を出してから
+Release で 0 に戻すので、 0 を見た後に読む版は組み直した後のもの)。
+
+影響: 値が 2^20 以上の ref (3 つ目以降に作った表を指す ref など) を `pull` する所 (会社単位の購読の `members`、 ref の値での
+検索) が、 並行の書き込み中に、 もう別の値に移った entity を返しえた。
+
+### Added — 並びの索引: ref の逆引きを key の帯ごとに分けて持ち、 範囲で絞る読みを帯だけで答える (#460、 #461)
+
+`Engine::declare_order(via, key, ticks)` / schema の `TableBuilder::order(via, key, &[ticks])`: ref の列 via の逆引き (「会社 c
+を指している社員」) を、 数の列 key (年齢など) の値の帯 (目盛りの間) ごとに分けて持つ。 「会社 c の 30 歳以上は誰 / 何人」 を、
+会社の全員をなめずに、 範囲に当たる帯だけを読む / 帯の件数を足すだけで答える。
+
+```rust
+db.table("users").ref_to("company", "companies").number("age").order("company", "age", &[30, 65]).build()?;
+```
+
+- 使う所: 会社単位の購読 (`subscribe_grouped` / `subscribe_touched`) の `members` / `members_many` / `count_in` / `count` /
+  `flatten`、 社員単位の購読の 「会社の答えが変わった時に社員を引く」 所、 `find_by` の会社から社員へ降りる所。 範囲の両端が
+  目盛りとちょうど合えば、 範囲の条件を社員ごとに確かめない
+- 宣言した via の逆引き (`pull` / `pull_in` / `query` / 購読の展開と登録) は全部この索引から読み、 via の円柱は作らない
+  (`pull_range` と、 値の一覧・件数の集計は今まで通り円柱)
+- 宣言だけでは作らず、 最初に読む時 (購読の登録を含む) に作る。 ref の先が相手の表の始まりより前の時と、 値が散りすぎている
+  時は、 索引をやめて普通の逆引きに戻る
+- 同じ via への違う宣言は置き換え。 `drop_order` で外し、 `order_declarations` で一覧を見る。 宣言は `{db}/tables` の `DIA1` に
+  保存し、 開き直すと engine が戻す (中身は最初に読む時に作り直す。 戻すだけでは保存を書き直さない)。 snapshot にも乗る。
+  壊れた `DIA1` と戻せない宣言は捨てる (索引は列から作り直せる)
+
+範囲の条件つきの読みの速さ (100 万人、 索引なしとの比): 会社単位の購読の `count` 3.2〜3127 倍、 会社ごとの `members`
+1.6〜189 倍、 `members_many` 1.6〜261 倍、 `flatten` 1.6〜66 倍、 毎回の `find_by` (Via + 範囲) 1.6〜59 倍。
+
+### Added — 見直す場所だけ返す購読 `subscribe_touched` (#459)
+
+`Engine::subscribe_touched(preds)` / schema の `Query::subscribe_touched()` → `TouchedLiveQuery`。 poll は
+`TouchedDelta { added, removed, touched }`: group (ref の 1 段目の先、 会社など) の出入りと、 前回の poll 以降に根の紐 (via の
+ref と根への条件の紐) が書かれた根の entity (削除・同じ値の書き直しも含む)。 根ごとの答えは持たず、 アプリが引き直す
+(removed の会社の社員を外し、 added の会社を `members_many` で足し、 touched を `group_of` で引き直す)。
+
+- group が居るかの判定 (`group_of` / `contains` / `members` / `members_many` / `count_in`) は、 最後の poll で渡した集合で決める
+- 根への条件は 1 列で決まるもの (`Eq` / `EqText` / `In` / `Range` / `Present` / その `Not`) だけ、 ref の先は `Or` の無い 1 本。
+  それ以外は `InvalidInput` (schema は `BadValue`)。 `LiveGroup` にはまだ入れられない
+
+アプリの表を最新に保つ DB 側の手間 (100 万人、 1 書き込みあたり、 引き直しを含む): 会社の city の書き換えは社員単位の購読より
+1.7〜9.3 倍速い (並びの索引と合わせると、 索引なしの 1.1〜163 倍)。 社員の書き込み (異動・年齢) は社員単位の購読と同程度
+(引き直しの分 0.05〜0.15 µs 多い)。
+
+### Added — 会社単位の購読のまとめ読み `members_many` / `count_in` (#458)
+
+`GroupedLiveQuery::members_many(&[group])` は、 「今条件を満たすか」 の確認と根への条件の組み立てを全部で 1 回にして、 一覧を
+使い回しの buffer に読む。 `count_in(group)` は 1 つの group の数 (列を作らない)。 `count` / `flatten` も全 group を 1 本の
+buffer に読み、 並べるのは最後に 1 回。 schema の `GroupedLiveQuery` にも足した。 低い所の `HimoStore::pull_into` /
+`CellReader::pull_into` は、 値ごとの Vec を作らずに呼び手の buffer に足す。
+
+100 万人・30 歳以上 1%: `count` / `flatten` 1.22〜1.86 倍、 全 group を `members_many` で引くと 1 つずつの `members` より
+1.23〜1.81 倍 (小さい会社が多いほど効く)。 1 つだけの `members` と書き込みは変わらない (0.98〜1.03 倍)。
+
+### Tests
+
+- `tests/order_index.rs` 14 本 (書き込み 9 種のたびに購読の読みと `find_by` を shadow と比べる、 並べ方 3 種、 並行の書き込みと
+  作成)、 `tests/order_persist.rs` 6 本 (開き直し、 WAL の replay の後、 宣言しない DB、 置き換えと外す、 snapshot、 並行)、
+  schema の `tests/order_decl.rs` 4 本、 `tests/touched.rs` 5 本、 `tests/grouped_batch.rs` 4 本
+- loom の `tests/loom_order_index_build.rs` (索引を作るのと、 並行の書き込み・宣言・読み手。 6 model)。 CI に loom (order index
+  build) と Miri (order_index) の段を足した。 Miri の時だけ置き場の鍵を std の Mutex にする (parking_lot_core 0.9.12 の futex の
+  呼び方を、 新しい nightly の Miri が UB と判定するため。 普段の build は parking_lot のまま)
+- #457: 読んだ直後に sparse を組み直す決定的な試験 (`sparse_reader_checks_stale_before_reading`)
+
 ## 0.31.4 — 2026-10-10
 
 patch。 on-disk 形式・wire 形式は 0.31.3 と同じ。 Engine / schema の API は変わらない (観測用の
