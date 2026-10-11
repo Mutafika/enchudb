@@ -115,6 +115,11 @@ jobs:
       - name: loom model check (order index build)
         run: cargo test -p enchudb-engine --test loom_order_index_build --release
 
+      # 円柱を組んでいない紐の書き手は write_lock を取らずに門を通る (`write_gate`)。 購読の登録の barrier は、 lock を
+      # 取って離すだけだと門を通る書き手を取りこぼす (その対照が落ちることも見る)。 実コードの並行 test は窓を踏めない。
+      - name: loom model check (live query の登録 barrier と門)
+        run: cargo test -p enchudb-engine --test loom_live_subscribe --release
+
       # #421: 書いた範囲 (dirty) の取り出しと同時の印 / 同時の flush。 lo / hi を別々に swap すると印が
       # 消え、 lock なしだと後の flush が前の flush の書き出しより先に返る (oplog_sync の後で checkpoint が先に進む)。
       - name: loom model check (flush_dirty の取り出し)

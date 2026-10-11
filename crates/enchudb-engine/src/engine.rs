@@ -9273,7 +9273,8 @@ impl Engine {
 
     /// Column 書き込みの唯一の入口 (live query 通知込み)。 **engine 内で `himos[..].set`
     /// を直に呼ばないこと** — 呼ぶと live query がその書き込みを取りこぼす。
-    /// 通知は `HimoStore::set` が write_lock を離した **後** (`crate::live` の lock 順序)。
+    /// 通知は `HimoStore::set` が write_lock を離した (cylinder を組んでいない紐は門を出た) **後** (`crate::live` の lock
+    /// 順序)。
     ///
     /// #381: 回収する辞書の Tag の列なら、 新しい値の参照を取って古い値の参照を返す。 新しい値の番号が古い (回収された)
     /// なら書かずに `StaleValue` を計上して false。
@@ -9462,9 +9463,10 @@ impl Engine {
     #[cold]
     fn order_note_slow(&self, hid: u16, local: u32) {
         for o in self.live.orders_on(hid) {
-            // 作る前は何もしない (lock も取らない)。 列はこの紐の write_lock の下で書いてあり、 作る側は via と key の
-            // write_lock を両方取ってから列をなめる ([`order_ready`](Self::order_ready)): 作る側が取る前に書いた列は
-            // なめる時に読まれ、 離した後に書いたならここで 「作った」 が見える (`tests/loom_order_index_build.rs`)。
+            // 作る前は何もしない (lock も取らない)。 列はこの紐の write_lock の下か門の中 (`write_gate`) で書いてあり、
+            // 作る側は via と key の書き手を両方止めてから (write_lock を取り、 門を閉じて中の書き手を待つ、
+            // `HimoStore::write_guard`) 列をなめる ([`order_ready`](Self::order_ready)): 作る側が止める前に書いた列は
+            // なめる時に読まれ、 放した後に書いたならここで 「作った」 が見える (`tests/loom_order_index_build.rs`)。
             // 開き直した後 (宣言は戻すが作るのは最初に読む時) の書き込みも、 これで上乗せが無い
             if !o.is_built() {
                 continue;
@@ -9539,14 +9541,16 @@ impl Engine {
         let _ = self.himos[h as usize].slice_len(0);
     }
 
-    /// 並びの索引を使える状態にする (作っていなければ via と key の write_lock の下で作る)。 やめた / 外した索引は false。
+    /// 並びの索引を使える状態にする (作っていなければ via と key の書き手を止めて作る、 `HimoStore::write_guard`)。 やめた /
+    /// 外した索引は false。
     fn order_ready(&self, o: &crate::order_index::OrderIndex) -> bool {
         if o.is_retired() {
             return false;
         }
         if !o.is_built() {
             // via → key の順 (via は Ref、 key は Number / Number64 の紐なので同じ紐にはならない)。 書き手は列を書く間に
-            // どちらか 1 本しか持たないので、 両方を取れた時点で書きかけの列は無い ([`order_note_slow`](Self::order_note_slow))
+            // どちらか 1 本しか持たない (門の中の書き手は lock を持たず、 `write_guard` が出るのを待つ) ので、 両方を
+            // 止めた時点で書きかけの列は無い ([`order_note_slow`](Self::order_note_slow))
             let _w = self.himos[o.via as usize].write_guard();
             let _k = self.himos[o.key as usize].write_guard();
             if !o.is_built() {
@@ -13539,7 +13543,7 @@ impl Engine {
         }
 
         // 登録手順 (順序が正しさの根拠、 `crate::live` module doc):
-        // 1. route に載せる  2. 条件の全紐の write_lock で barrier  3. 初期候補に印
+        // 1. route に載せる  2. 条件の全紐の書き手を 1 度止めて放す (barrier、 `HimoStore::write_barrier`)  3. 初期候補に印
         let q = if branches.len() == 1 {
             self.live.register(branches.pop().unwrap_or_default(), expand_always)
         } else {
@@ -13716,7 +13720,7 @@ impl Engine {
         for h in refs {
             self.warm_ref(h, h == via && ranged_via);
         }
-        // 登録手順は subscribe_inner と同じ: route に載せる → 全紐の write_lock で barrier → 初期候補に印
+        // 登録手順は subscribe_inner と同じ: route に載せる → 全紐の barrier (`HimoStore::write_barrier`) → 初期候補に印
         let q = self.live.register_touched(branch, &notice);
         for h in q.himos() {
             self.himos[h as usize].write_barrier();

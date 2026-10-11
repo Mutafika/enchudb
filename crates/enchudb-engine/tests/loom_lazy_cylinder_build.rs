@@ -22,12 +22,26 @@
 //! issue95_stress / engine_model_proptest / issue119_retie_order_all_paths /
 //! issue255_rw_open_lazy_cylinder が全 pass した) ので、 **これが唯一の gate**。
 //!
+//! ## 門 (2026-10-11、 `write_gate`)
+//! 組む前の writer は `write_lock` を取らずに門を通って Column だけを書く: shard の数を足し、
+//! 閉じていなければ書いて数を引く。 閉じていれば数を戻して上の lock の道へ。 組む側は lock を
+//! 取った後で全 shard を閉じ、 数が 0 になるのを待ってから scan する (以後は開けない)。 足す
+//! と閉じるは同じ word への RMW なので、 どちらかが先になる:
+//!
+//!   - writer の足すが先 → 組む側はその writer が書いて出るのを待つ → scan が拾う
+//!   - 閉じるが先 → writer は閉じた印を見て lock の道へ → 上の契約
+//!
+//! **組む側が待たないと壊れる** (`build_that_does_not_wait_for_the_gate_loses_a_write`)。
+//! **writer が数を足す前に閉じた印を見ると壊れる** (`writer_that_looks_before_counting_loses_a_write`:
+//! 印を見てから足すまでの間に、 組む側が閉じて数 0 を見て scan する)。 どちらも下の
+//! `#[should_panic]` の test が loom で窓を見つける = この model が窓を表現できていることの確認。
+//!
 //! ## model の範囲
-//! `HimoStore` の flag (`AtomicBool`) / `write_lock` (`Mutex`) / Column cell の
-//! Release store と、 `ensure_cylinder_built` の double-check build を写す。 index 自体は
-//! 「write_lock 下でしか変更されない集合」として `Mutex<Vec<_>>` で置く — 実 index
-//! (`LockFreeCylinder`) の lock-free publish ordering は `loom_append_publish` が、
-//! epoch 解放は Miri が別途見ているので、 ここでは **build と write の見落とし** だけに絞る。
+//! `HimoStore` の flag (`AtomicBool`) / `write_lock` (`Mutex`) / 門の shard (2 本、 writer
+//! ごとに別) / Column cell の Release store と、 `ensure_cylinder_built` の double-check build
+//! を写す。 index 自体は 「write_lock 下でしか変更されない集合」 として `Mutex<Vec<_>>` で
+//! 置く — 実 index (`LockFreeCylinder`) の lock-free publish ordering は `loom_append_publish`
+//! が、 epoch 解放は Miri が別途見ているので、 ここでは **build と write の見落とし** だけに絞る。
 //!
 //! ## 実行
 //! ```sh
@@ -40,6 +54,20 @@
 use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use loom::sync::{Arc, Mutex};
 
+/// 門の shard の最上位 bit = 閉じている (`write_gate::CLOSED` と同じ形)。
+const CLOSED: usize = 1 << 31;
+
+/// 壊した形 (下の `#[should_panic]` の test 用)。
+#[derive(Clone, Copy)]
+struct Broken {
+    /// 組む側が門を閉じた後、 中の writer が出るのを待たない。
+    no_wait: bool,
+    /// writer が数を足す前に、 閉じた印を load で見る。
+    look_first: bool,
+}
+
+const SOUND: Broken = Broken { no_wait: false, look_first: false };
+
 /// `HimoStore` の lazy build 契約の de-epoch model。
 struct Store {
     /// Column の cell。 0 = 未設定、 それ以外は `value + 1` (実装と同じ +1 encode)。
@@ -50,20 +78,46 @@ struct Store {
     built: AtomicBool,
     /// writer 直列化 lock。 build も取る。
     write_lock: Mutex<()>,
+    /// 門の shard (`WriteGate`)。 閉じた印 | 中に居る writer の数。
+    gate: [AtomicUsize; 2],
+    broken: Broken,
 }
 
 impl Store {
-    fn new(cells: usize) -> Self {
+    fn new(cells: usize, broken: Broken) -> Self {
         Self {
             col: (0..cells).map(|_| AtomicUsize::new(0)).collect(),
             cyl: Mutex::new(Vec::new()),
             built: AtomicBool::new(false),
             write_lock: Mutex::new(()),
+            gate: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            broken,
         }
     }
 
-    /// `HimoStore::set` の model。
-    fn set(&self, eid: usize, value: usize) {
+    /// `WriteGate::try_enter` + 門の中の書き込み + `Pass` の drop。 入れなかったら false。
+    fn write_in_gate(&self, shard: usize, eid: usize, value: usize) -> bool {
+        let s = &self.gate[shard];
+        if self.broken.look_first {
+            if s.load(Ordering::Acquire) & CLOSED != 0 {
+                return false;
+            }
+            s.fetch_add(1, Ordering::Acquire);
+        } else if s.fetch_add(1, Ordering::Acquire) & CLOSED != 0 {
+            s.fetch_sub(1, Ordering::Relaxed);
+            return false;
+        }
+        self.col[eid].store(value + 1, Ordering::Release);
+        s.fetch_sub(1, Ordering::Release);
+        true
+    }
+
+    /// `HimoStore::set` の model。 `shard` = writer の thread が使う門の shard。
+    fn set(&self, shard: usize, eid: usize, value: usize) {
+        // 組んでいなければ門の中で Column だけを書く (flag は門を見るかどうかの目安。 決めるのは門)
+        if !self.built.load(Ordering::Relaxed) && self.write_in_gate(shard, eid, value) {
+            return;
+        }
         let _w = self.write_lock.lock().unwrap();
         // ★契約: 判定は lock を取った **後**。 ここを `_w` の前に出すと下の test が落ちる。
         let live = self.built.load(Ordering::Acquire);
@@ -81,6 +135,17 @@ impl Store {
         let _g = self.write_lock.lock().unwrap();
         if self.built.load(Ordering::Acquire) {
             return;
+        }
+        // `WriteGate::close`: 全 shard に閉じた印を立ててから、 中の writer が出るのを待つ
+        for s in &self.gate {
+            s.fetch_or(CLOSED, Ordering::AcqRel);
+        }
+        if !self.broken.no_wait {
+            for s in &self.gate {
+                while s.load(Ordering::Acquire) & !CLOSED != 0 {
+                    loom::thread::yield_now();
+                }
+            }
         }
         let mut cyl = self.cyl.lock().unwrap();
         for (eid, cell) in self.col.iter().enumerate() {
@@ -112,15 +177,12 @@ impl Store {
     }
 }
 
-/// 1 writer + 1 reader。 build と write のどの interleaving でも、 write は index に
-/// ちょうど 1 件入る (writer が入れるか、 build の scan が拾うか、 必ずどちらか一方)。
-#[test]
-fn lost_write_single_writer() {
-    loom::model(|| {
-        let s = Arc::new(Store::new(1));
+fn single_writer(broken: Broken) {
+    loom::model(move || {
+        let s = Arc::new(Store::new(1, broken));
         let w = {
             let s = s.clone();
-            loom::thread::spawn(move || s.set(0, 7))
+            loom::thread::spawn(move || s.set(0, 0, 7))
         };
         let r = {
             let s = s.clone();
@@ -133,19 +195,26 @@ fn lost_write_single_writer() {
     });
 }
 
-/// 2 writer (別 eid) + 1 reader。 build が片方の write だけ拾って片方を落とす、
-/// という非対称な取りこぼしも許さない。
+/// 1 writer + 1 reader。 build と write のどの interleaving でも、 write は index に
+/// ちょうど 1 件入る (writer が入れるか、 build の scan が拾うか、 必ずどちらか一方)。
+#[test]
+fn lost_write_single_writer() {
+    single_writer(SOUND);
+}
+
+/// 2 writer (別 eid、 別の門の shard) + 1 reader。 build が片方の write だけ拾って片方を
+/// 落とす、 という非対称な取りこぼしも許さない。
 #[test]
 fn lost_write_two_writers() {
     loom::model(|| {
-        let s = Arc::new(Store::new(2));
+        let s = Arc::new(Store::new(2, SOUND));
         let w0 = {
             let s = s.clone();
-            loom::thread::spawn(move || s.set(0, 7))
+            loom::thread::spawn(move || s.set(0, 0, 7))
         };
         let w1 = {
             let s = s.clone();
-            loom::thread::spawn(move || s.set(1, 7))
+            loom::thread::spawn(move || s.set(1, 1, 7))
         };
         let r = {
             let s = s.clone();
@@ -156,4 +225,37 @@ fn lost_write_two_writers() {
         r.join().unwrap();
         s.assert_index_matches_column();
     });
+}
+
+/// 1 writer が組む前 (門) と組んだ後 (lock) をまたいで 2 回書く (別 eid)。 1 回目が門、 2 回目が
+/// lock の道になる interleaving を含む。
+#[test]
+fn writer_crossing_the_build() {
+    loom::model(|| {
+        let s = Arc::new(Store::new(2, SOUND));
+        let w = {
+            let s = s.clone();
+            loom::thread::spawn(move || {
+                s.set(0, 0, 7);
+                s.set(0, 1, 9);
+            })
+        };
+        s.ensure_built();
+        w.join().unwrap();
+        s.assert_index_matches_column();
+    });
+}
+
+/// 対照: 組む側が門を閉じても中の writer を待たないと、 書く前の Column を scan して取りこぼす。
+#[test]
+#[should_panic(expected = "取りこぼした")]
+fn build_that_does_not_wait_for_the_gate_loses_a_write() {
+    single_writer(Broken { no_wait: true, look_first: false });
+}
+
+/// 対照: writer が数を足す前に閉じた印を見ると、 その間に組む側が閉じて数 0 を見て scan する。
+#[test]
+#[should_panic(expected = "取りこぼした")]
+fn writer_that_looks_before_counting_loses_a_write() {
+    single_writer(Broken { no_wait: false, look_first: true });
 }

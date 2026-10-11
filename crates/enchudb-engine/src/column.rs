@@ -241,13 +241,20 @@ impl Column {
     pub fn count(&self) -> u32 { self.count.load(Ordering::Relaxed) }
 
     /// count を eid+1 まで引き上げる（atomic、並列安全）。
+    ///
+    /// 2026-10-11: cylinder を組んでいない紐の書き手は、 紐の write_lock を取らずに並んで呼ぶ (`write_gate`)。 header の
+    /// count も fetch_max で上げる (読んでから書くと、 並んだ書き手の小さい値が大きい値を上書きして count が戻る)。 伸ばさない
+    /// 書き込み (ほとんど) は読むだけにして、 並んで書く書き手が count の cache line を取り合わないようにする。
     pub fn ensure_count(&self, eid: u32) {
         let needed = eid + 1;
-        self.count.fetch_max(needed, Ordering::Relaxed);
-        // mmapヘッダにも書く。 count は rebuild/flush 時に確定するので、ここでは最大値。
-        let current = u32::from_le_bytes(self.region.slice()[0..4].try_into().unwrap());
-        if needed > current {
-            self.region.write_at(0, &needed.to_le_bytes());
+        if self.count.load(Ordering::Relaxed) < needed {
+            self.count.fetch_max(needed, Ordering::Relaxed);
+        }
+        // mmapヘッダにも書く。 count は rebuild/flush 時に確定するので、ここでは最大値。 自分の cell の分は自分で上げる
+        // (別の書き手が上げている最中でも、 その書き手を待たずに header が自分の cell を覆う)
+        let header = self.region.as_atomic_u32(0);
+        if header.load(Ordering::Relaxed) < needed {
+            header.fetch_max(needed, Ordering::Relaxed);
             // #413: 印を付けないと concurrent の書き出し (`flush_dirty`) が header の page を msync しない。
             // 電源断の後に count が古い値に戻り、 書き出し済みの cell が見えなくなる
             self.region.mark_dirty(0, 4);
@@ -258,5 +265,48 @@ impl Column {
     pub fn sync_count(&self) {
         let c = self.count.load(Ordering::Relaxed);
         self.region.write_at(0, &c.to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 並んで count を上げる書き手が居ても、 header の count は一番大きい値で終わる (戻らない)。 版数の列
+    /// (`Engine::store_cell_hlc`) は行の lock だけで並んで `ensure_count` を呼び、 2026-10-11 からは円柱を組んでいない紐の
+    /// 列も紐の write_lock を取らずに呼ぶ (`write_gate`)。 旧: header を読んでから書いたので、 先に読んだ小さい値が後の
+    /// 大きい値を上書きし、 電源断の後に count が戻って書いた cell が見えなくなりえた。
+    #[test]
+    fn concurrent_growth_never_lowers_the_header_count() {
+        const THREADS: u32 = 8;
+        const PER: u32 = 4_000;
+        let n = THREADS * PER;
+        let mut lowered = 0;
+        for round in 0..20 {
+            let bytes = HEADER + n as usize * 4;
+            // 8 byte にそろえた buffer (`u8` の Vec だと atomic の参照が Miri で 「そろっていない」 UB になる)
+            let words = Box::leak(vec![0u64; bytes.div_ceil(8)].into_boxed_slice());
+            let col = Column::init(unsafe { Region::new(words.as_mut_ptr().cast::<u8>(), bytes) }, 4, n, false);
+            let start = std::sync::Barrier::new(THREADS as usize);
+            std::thread::scope(|s| {
+                for t in 0..THREADS {
+                    let (col, start) = (&col, &start);
+                    s.spawn(move || {
+                        start.wait();
+                        // thread ごとに飛び飛びの eid を下から順に (全 thread が同時に末尾を伸ばす)
+                        for i in 0..PER {
+                            col.ensure_count(i * THREADS + t);
+                        }
+                    });
+                }
+            });
+            let header = u32::from_le_bytes(col.region.slice()[0..4].try_into().unwrap());
+            assert_eq!(col.count(), n, "round {round}: count");
+            if header != n {
+                lowered += 1;
+                eprintln!("round {round}: header {header} < {n}");
+            }
+        }
+        assert_eq!(lowered, 0, "header の count が戻った回数");
     }
 }
