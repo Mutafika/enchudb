@@ -46,11 +46,11 @@
 //!
 //! ## 作る
 //!
-//! 遅延: 最初に読む時に、 via と key の紐の write_lock を両方取って (この順。 書き手が列を書く間に持つのはどちらか
-//! 1 本だけ)、 via の列をなめて全部 `place` する (円柱の遅延構築 #270 と同じく、 作る前の書き込みは何もしない)。
-//! 書き手は列を (その紐の write_lock の下で) 書いた後に 「作ったか」 を見て、 作っていなければ何もしない: 作る側が
-//! lock を取る前に書いた列はなめる時に読まれ、 lock を離した後に書いた書き手には 「作った」 が見える
-//! (`tests/loom_order_index_build.rs`)。 宣言を足した直後の書き込みも、 同じ理由で見落とさない。 葉が置く entity の数に
+//! 遅延: 最初に読む時に、 via と key の紐の書き手を両方止めて (この順。 write_lock を取り、 門を閉じて中の書き手が出るのを
+//! 待つ、 `HimoStore::write_guard`。 書き手が列を書く間に持つのはどちらか 1 本だけ)、 via の列をなめて全部 `place` する
+//! (円柱の遅延構築 #270 と同じく、 作る前の書き込みは何もしない)。 書き手は列を (その紐の write_lock の下か、 円柱を
+//! 組んでいない紐は門の中で) 書いた後に 「作ったか」 を見て、 作っていなければ何もしない: 作る側が止める前に書いた列は
+//! なめる時に読まれ、 放した後に書いた書き手には 「作った」 が見える (`tests/loom_order_index_build.rs`)。 宣言を足した直後の書き込みも、 同じ理由で見落とさない。 葉が置く entity の数に
 //! 比べて多すぎる (値が散っている) か、 置き場の番号に入らない値 (`base` より前 = ref の先の表の外) が来たら索引をやめる
 //! (`disabled`)。 やめた後の読みは None (呼び手は普通の逆引きを使う)。
 //!
@@ -390,7 +390,7 @@ impl OrderIndex {
     }
 
     /// entity `e` を今の (ref の値 `v`, key の値 `k`) の置き場に置き直す (記録と同じなら何もしない)。
-    /// **e の書き手として** 呼ぶ (engine では行の lock の下、 作る時は via の write_lock の下で書き手が居ない間)。
+    /// **e の書き手として** 呼ぶ (engine では行の lock の下、 作る時は via と key の書き手を止めている間)。
     pub(crate) fn place(&self, e: u32, v: Option<u32>, k: Option<u64>) {
         if self.is_disabled() {
             return;
@@ -482,7 +482,7 @@ impl OrderIndex {
     }
 
     /// 作る: `entities` (via の列に値のある entity) を全部、 `via_of` / `key_of` (今の via / key の値) で置く。
-    /// **via の write_lock の下で** (書き手は作り終えるまで置かない)。
+    /// **via と key の書き手を止めている間に** (`HimoStore::write_guard`。 書き手は作り終えるまで置かない)。
     pub(crate) fn build(&self, entities: &[u32], via_of: impl Fn(u32) -> Option<u32>, key_of: impl Fn(u32) -> Option<u64>) {
         if self.is_built() {
             return;

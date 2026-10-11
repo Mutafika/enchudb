@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::column::Column;
 use crate::lockfree_cylinder::LockFreeCylinder;
 use crate::region::Region;
+use crate::write_gate::WriteGate;
 
 /// column region の取得元 (request23 D2)。
 ///
@@ -107,6 +108,45 @@ cell_value_signed!(i32, i64, isize);
 //   Column の write も write_lock 下に入る（get_value→set の read-modify-write が
 //   atomic になる）。 pull の verify は Column を直読みするが、 これは #95 とは
 //   別の既知の無同期読みで別 issue（#100 と同時に設計）。
+//
+//   2026-10-11: cylinder を組んでいない紐の set / remove は write_lock を取らず、 門
+//   (`write_gate::WriteGate`) を通って Column だけを書く (同じ cell の書き手どうしは
+//   engine の行の lock で並ぶ)。 write_lock を barrier に使う側 (lazy build、 並びの
+//   索引の構築、 購読の登録) は lock を取った後で門を閉じ、 中の書き手が出るのを待つ。
+//   組んだ後は門を閉じたまま = 上の直列化のまま。
+
+/// test 用の割り込み点: 名前の一致した 1 回だけ、 登録した処理をこの thread で走らせる (`lockfree_cylinder` と同じ形)。
+/// 門の中の書き手と、 門を閉じる側の窓を、 thread の運に頼らず踏むため。 test 以外では何もしない。
+#[cfg(test)]
+mod hook {
+    use std::cell::RefCell;
+
+    type Hook = (&'static str, Box<dyn FnOnce()>);
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub fn set(at: &'static str, f: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some((at, Box::new(f))));
+    }
+
+    pub fn at(name: &'static str) {
+        let hit = HOOK.with(|h| {
+            let mut h = h.borrow_mut();
+            if h.as_ref().is_some_and(|(at, _)| *at == name) { h.take() } else { None }
+        });
+        if let Some((_, f)) = hit {
+            f();
+        }
+    }
+}
+
+#[cfg(not(test))]
+mod hook {
+    #[inline(always)]
+    pub fn at(_: &'static str) {}
+}
 
 /// incremental compaction (request12 P2) の trigger: これ未満の bucket は
 /// 組み直さない (小 bucket は verify の方が安い)。stale 率 (len-live)/len >= 1/2
@@ -135,7 +175,11 @@ pub struct HimoStore {
     /// writer 直列化 lock。 lazy build と set/remove/restore が取る。
     /// reader (pull 系) は一切取らない。 同期 tie / schema commit の多 thread
     /// 呼び出しを master (RwLock write) と同じ直列度で安全にする（#96 レビュー発覚分）。
+    /// cylinder を組む前の set / remove は取らずに `gate` を通る。
     write_lock: Mutex<()>,
+    /// cylinder を組んでいない間の書き手の門 ([`WriteGate`])。 開いている = 組んでいない。 組む時に
+    /// (write_lock の下で) 閉じて、 以後は開けない。 barrier ([`HimoStore::write_guard`]) は閉じて開け直す。
+    gate: WriteGate,
 }
 
 /// `col.get(eid)` の cell を stored 形式 (0 = 未設定、 N = 値 N-1) で。 列の幅 (4 / 8 byte) はここと
@@ -183,10 +227,27 @@ fn ready(col: Column) -> OnceLock<Column> {
     cell
 }
 
-// SAFETY: writer は write_lock で直列、 reader は lock-free（Cylinder は epoch +
-// Mutex(sparse)）。 Column の read は無同期（既知、 別 issue）。
+// SAFETY: Cylinder の writer は write_lock で直列 (組んだ後は門が閉じていて、 全部の書き手が
+// write_lock を取る)、 reader は lock-free（Cylinder は epoch + Mutex(sparse)）。 組む前の
+// 門の中の書き手は Column の cell (atomic) と count (fetch_max) だけを書く。 Column の read は
+// 無同期（既知、 別 issue）。
 unsafe impl Sync for HimoStore {}
 unsafe impl Send for HimoStore {}
+
+/// 紐の書き手を止めている間持つ ([`HimoStore::write_guard`])。 drop で門を開け直してから write_lock を離す。
+pub(crate) struct WriteGuard<'a> {
+    store: &'a HimoStore,
+    _lock: MutexGuard<'a, ()>,
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        // 持っている間に cylinder を組むことは無い (組む側も write_lock を取る) が、 組んだ後の紐の門は開けない
+        if !self.store.cyl_built.load(Ordering::Acquire) {
+            self.store.gate.open();
+        }
+    }
+}
 
 impl HimoStore {
     /// `padded` = 列の cell を header から離して置く (#400、 `Column::init`)。
@@ -205,6 +266,7 @@ impl HimoStore {
             cyl_built: AtomicBool::new(false),
             dense_base_hint: AtomicU64::new(0),
             write_lock: Mutex::new(()),
+            gate: WriteGate::new(),
         }
     }
 
@@ -223,6 +285,7 @@ impl HimoStore {
             cyl_built: AtomicBool::new(false),
             dense_base_hint: AtomicU64::new(0),
             write_lock: Mutex::new(()),
+            gate: WriteGate::new(),
         }
     }
 
@@ -246,6 +309,7 @@ impl HimoStore {
             cyl_built: AtomicBool::new(false),
             dense_base_hint: AtomicU64::new(0),
             write_lock: Mutex::new(()),
+            gate: WriteGate::new(),
         }
     }
 
@@ -313,6 +377,9 @@ impl HimoStore {
         if self.cyl_built.load(Ordering::Acquire) {
             return;
         }
+        // 門の中で書いている書き手 (write_lock を取らない) が出るのを待ってから scan する。 以後は開けない
+        // (組んだ cylinder は write_lock の下の書き手 1 本で手入れする)
+        self.gate.close();
         let col = self.col();
         let count = col.count();
         // dense の窓の始まりは組む前に (読み手はまだこの索引を読まない)
@@ -345,6 +412,10 @@ impl HimoStore {
     /// (silent lost row)。 `tests/loom_lazy_cylinder_build.rs` がその interleaving を
     /// 全探索で検出する。
     ///
+    /// 門 (`gate`) を通る書き手は lock を取らないが、 組む側は lock の下で門を閉じて中の書き手が
+    /// 出るのを待ってから scan するので、 門の中で書いた cell は scan に読まれる。 閉じた後に
+    /// 来た書き手はこの lock の道に回る (同じ loom model が見る)。
+    ///
     /// **guard を引数に取るのはこの順序を型で強制するため** — 返り値の lifetime を guard に
     /// 縛ってあるので、 lock の前に呼ぶことも、 guard を先に drop することもできない。
     /// 観測用途 (`cyl_backing_bytes`) は race して良いので flag を直に読む。
@@ -364,9 +435,19 @@ impl HimoStore {
             debug_assert!(false, "HimoStore::set: value {value} exceeds {:?}", self.value_type);
             return false;
         }
+        // cylinder を組んでいなければ、 write_lock を取らずに門の中で Column だけを書く (`WriteGate`)。 組んだ後は
+        // 門が閉じたままなので、 先に flag を見て門の数に触らない (見誤っても門が閉じていれば lock の道に回る)
+        if !self.cyl_built.load(Ordering::Relaxed)
+            && let Some(_pass) = self.gate.try_enter()
+        {
+            hook::at("inside_gate");
+            return self.store_unindexed(eid, value);
+        }
         let w = self.write_lock.lock();
         // 未 build の cylinder は触らない (#270)。 順序契約は `cyl_live` 参照。
-        let cyl = self.cyl_live(&w);
+        let Some(cyl) = self.cyl_live(&w) else {
+            return self.store_unindexed(eid, value);
+        };
         let col = self.col();
         if col.ensure_committed_for(eid).is_err() {
             return false;
@@ -376,24 +457,37 @@ impl HimoStore {
         if old == Some(value) {
             return true; // 冗長な re-tie = no-op（bucket に dup を作らない）
         }
-        let mut stale = None;
-        if let (Some(cyl), Some(o)) = (cyl, old) {
-            // 値更新: 旧 value の bucket に stale が残る → その bucket の read は verify する。
-            // Column を書き換える **前** に flag を立てる (request12、順序契約は note_stale 参照)
-            stale = cyl.note_stale(o).map(|s| (o, s));
-        }
+        // 値更新: 旧 value の bucket に stale が残る → その bucket の read は verify する。
+        // Column を書き換える **前** に flag を立てる (request12、順序契約は note_stale 参照)
+        let stale = old.and_then(|o| cyl.note_stale(o).map(|s| (o, s)));
         // #106: Release store。 leaf offset を publish する前に書いた LeafStore slot
         // (payload/gen) を、 offset を Acquire で読む reader が必ず観測できるようにする。
         store_at(col, eid, value + 1);
-        if let Some(cyl) = cyl {
-            cyl.insert(eid, value, |v, e| stored_at(col, e) == v + 1);
-        }
+        cyl.insert(eid, value, |v, e| stored_at(col, e) == v + 1);
         // compaction は Column 更新の **後** (keep = value_eq が新状態を見るため)
         if let Some((o, (len, live))) = stale {
             self.maybe_compact(o, len, live);
         }
-        if let Some(cyl) = cyl {
-            self.maybe_compact_sparse(cyl);
+        self.maybe_compact_sparse(cyl);
+        true
+    }
+
+    /// cylinder の手入れの無い書き込み (門の中か、 組む前の write_lock の下)。 Column の cell (atomic) と count
+    /// (fetch_max) だけを書くので、 同じ紐の書き手が並んで書いてよい (同じ cell の書き手は engine の行の lock で並ぶ)。
+    ///
+    /// `set` の中に展開する: 別の関数のままだと、 書き手 1 本の書き込みが門の無い形の 0.93〜0.96 倍だった (w1、 交互
+    /// 20 回、 p = 0.01〜0.05)。 展開すると 0.98〜1.05 倍 (p = 0.26〜0.96)。
+    #[inline(always)]
+    fn store_unindexed(&self, eid: u32, value: u64) -> bool {
+        let col = self.col();
+        if col.ensure_committed_for(eid).is_err() {
+            return false;
+        }
+        col.ensure_count(eid);
+        // 冗長な re-tie は書かない (書き出しの dirty を増やさない)
+        if value_at(col, eid) != Some(value) {
+            // #106: Release store (上と同じ)
+            store_at(col, eid, value + 1);
         }
         true
     }
@@ -407,20 +501,40 @@ impl HimoStore {
         }
     }
 
-    /// この紐の write_lock を取る (並びの索引 `OrderIndex` の置き直し・作る時。 via の紐の書き手と直列にする)。
-    pub(crate) fn write_guard(&self) -> MutexGuard<'_, ()> {
-        self.write_lock.lock()
+    /// この紐の書き手を止める (並びの索引 `OrderIndex` を作る時。 via の紐の書き手と直列にする): write_lock を取り、
+    /// 門を閉じて中の書き手が出るのを待つ。 持っている間、 この紐の書き手は全部 write_lock を待つ。 drop で門を開け
+    /// 直す (cylinder を組んでいれば閉じたまま) — 開けた後に入る書き手は、 持っている間に置いたもの (作った索引) を見る。
+    pub(crate) fn write_guard(&self) -> WriteGuard<'_> {
+        let lock = self.write_lock.lock();
+        self.gate.close();
+        WriteGuard { store: self, _lock: lock }
     }
 
-    /// write_lock を 1 度取って離すだけ。 これより前に lock を離した書き込みは全て見える
+    /// 書き手を 1 度止めて放すだけ ([`write_guard`](Self::write_guard) を取って離す)。 これより前に write_lock を離した
+    /// 書き込みと、 門を出た書き込みは全て見え、 これより後の書き込みは、 これより前に置いたもの (購読の route) を見る
     /// (live query の登録 barrier、 `crate::live` module doc)。
     pub fn write_barrier(&self) {
-        drop(self.write_lock.lock());
+        drop(self.write_guard());
+    }
+
+    /// 門が閉じているか (test 用)。
+    #[cfg(test)]
+    fn gate_is_closed(&self) -> bool {
+        self.gate.is_closed()
     }
 
     pub fn remove(&self, eid: u32) {
         let col = self.col();
         if eid < col.count() {
+            // cylinder を組んでいなければ門の中で消すだけ (`set` と同じ)
+            if !self.cyl_built.load(Ordering::Relaxed)
+                && let Some(_pass) = self.gate.try_enter()
+            {
+                if value_at(col, eid).is_some() {
+                    col.clear(eid);
+                }
+                return;
+            }
             let w = self.write_lock.lock();
             let cyl = self.cyl_live(&w); // set と同じ契約
             if let Some(o) = value_at(col, eid) {
@@ -797,14 +911,16 @@ impl HimoStore {
 mod tests {
     use super::*;
 
-    /// heap buffer 上に static backing (grower 無し = 全 commit 済み) の store を作る。
-    /// leaf_store の `make_store` と同じ idiom。
+    /// heap buffer 上の static backing (grower 無し = 全 commit 済み) の region。 8 byte にそろえる (`u8` の Vec は
+    /// 1 byte そろえで、 列の cell と header の atomic の参照が Miri で 「そろっていない」 UB になる。 本物の列は mmap の上)。
+    fn heap_region(bytes: usize) -> Region {
+        let words = Box::leak(vec![0u64; bytes.div_ceil(8)].into_boxed_slice());
+        unsafe { Region::new(words.as_mut_ptr().cast::<u8>(), bytes) }
+    }
+
+    /// heap buffer 上に static backing の store を作る。 leaf_store の `make_store` と同じ idiom。
     fn make_store(max_entities: u32) -> HimoStore {
-        let bytes = 64 * 1024;
-        let buf: Box<[u8]> = vec![0u8; bytes].into_boxed_slice();
-        let ptr = Box::leak(buf).as_mut_ptr();
-        let region = unsafe { Region::new(ptr, bytes) };
-        HimoStore::init(region, ValueType::Number, 0, max_entities, false)
+        HimoStore::init(heap_region(64 * 1024), ValueType::Number, 0, max_entities, false)
     }
 
     /// #414: 列の header が一度もディスクに届いていない (作った直後に電源が落ちた = 全部ゼロ) region を開いても
@@ -813,10 +929,7 @@ mod tests {
     #[test]
     fn load_of_never_written_header_is_an_empty_column() {
         for ht in [ValueType::Leaf, ValueType::Number, ValueType::Number64] {
-            let bytes = 64 * 1024;
-            let ptr = Box::leak(vec![0u8; bytes].into_boxed_slice()).as_mut_ptr();
-            let region = unsafe { Region::new(ptr, bytes) };
-            let hs = HimoStore::load(region, ht, 0, 64, false);
+            let hs = HimoStore::load(heap_region(64 * 1024), ht, 0, 64, false);
             let mut n = 0;
             hs.for_each_set_value(|_| n += 1);
             assert_eq!(n, 0, "{ht:?}");
@@ -905,10 +1018,7 @@ mod tests {
 
     fn make_store64(max_entities: u32) -> HimoStore {
         let bytes = 16 + max_entities as usize * 8 + 64;
-        let buf: Box<[u8]> = vec![0u8; bytes].into_boxed_slice();
-        let ptr = Box::leak(buf).as_mut_ptr();
-        let region = unsafe { Region::new(ptr, bytes) };
-        HimoStore::init(region, ValueType::Number64, 0, max_entities, false)
+        HimoStore::init(heap_region(bytes), ValueType::Number64, 0, max_entities, false)
     }
 
     /// 大きな値 (sparse run) と小さな値 (dense bucket) を混ぜた書き込み / 書き換え / 削除の後でも、
@@ -1043,5 +1153,201 @@ mod tests {
         assert!(!hs.cylinder_built(), "観測が cylinder を組んでしまった");
         let _ = hs.pull(7);
         assert!(hs.cyl_backing_bytes() > 0, "build 後は実 backing を返す");
+    }
+
+    /// `f` を別 thread で走らせ、 `wait` の間に終わったか。 終わっていなければ `release` を呼んでから終わるのを待つ。
+    fn finishes_while(f: impl FnOnce() + Send, wait: std::time::Duration, release: impl FnOnce()) -> bool {
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| {
+                f();
+                done.store(true, Ordering::SeqCst);
+            });
+            let deadline = std::time::Instant::now() + wait;
+            while !done.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let finished = done.load(Ordering::SeqCst);
+            release();
+            h.join().unwrap();
+            finished
+        })
+    }
+
+    /// 2026-10-11: cylinder を組んでいない紐の書き手 (set / remove) は write_lock を取らずに門を通る。 組んだ後は門が
+    /// 閉じたままで、 書き手は write_lock を待つ (対照: 同じ持ち方で、 組む前は待たず、 組んだ後は待つ)。
+    #[test]
+    fn unindexed_writers_pass_the_gate_without_the_lock() {
+        let hs = make_store(64);
+        assert!(hs.set(1, 5));
+        let held = hs.write_lock.lock();
+        let ok = finishes_while(
+            || {
+                assert!(hs.set(2, 6));
+                hs.remove(1);
+            },
+            std::time::Duration::from_secs(2),
+            || drop(held),
+        );
+        assert!(ok, "組んでいない紐の書き手が write_lock を待った");
+        assert_eq!((hs.get_value(1), hs.get_value(2)), (None, Some(6)));
+        assert_eq!(hs.pull(6), vec![2]);
+        assert!(hs.cylinder_built());
+        let held = hs.write_lock.lock();
+        let ok = finishes_while(|| assert!(hs.set(3, 6)), std::time::Duration::from_millis(100), || drop(held));
+        assert!(!ok, "対照: 組んだ後の書き手が write_lock を待たない");
+        let mut got = hs.pull(6);
+        got.sort_unstable();
+        assert_eq!(got, vec![2, 3]);
+    }
+
+    /// `write_guard` を持つ間は書き手が待ち (門が閉じて write_lock の道に回る)、 放すと門が開いて lock を取らない道に
+    /// 戻る。 組んだ後の紐の門は放しても閉じたまま。
+    #[test]
+    fn write_guard_stops_writers_and_reopens_the_gate() {
+        let hs = make_store(64);
+        let g = hs.write_guard();
+        assert!(hs.gate_is_closed());
+        let ok = finishes_while(|| assert!(hs.set(1, 5)), std::time::Duration::from_millis(100), || drop(g));
+        assert!(!ok, "write_guard を持つ間に書き手が書いた");
+        assert_eq!(hs.get_value(1), Some(5));
+        assert!(!hs.gate_is_closed(), "放した後に門が閉じたまま");
+        hs.write_barrier();
+        assert!(!hs.gate_is_closed(), "barrier の後に門が閉じたまま");
+        let _ = hs.pull(5);
+        assert!(hs.gate_is_closed(), "組んだのに門が開いている");
+        hs.write_barrier();
+        assert!(hs.gate_is_closed(), "組んだ紐の門を barrier が開けた");
+    }
+
+    /// 組む前の書き手と遅延構築が並んでも、 止まった後の cylinder は列とちょうど一致する (取りこぼし・重複なし)。 書き手
+    /// 4 本が別々の eid を書き換え続け (値の書き換え・消す・書き戻す)、 途中で読み手が組む。 答えは列を `get_value` で
+    /// なめる走査と、 書き手が最後に書いた値の写し (shadow) の 2 経路。
+    #[test]
+    fn writers_racing_the_lazy_build_all_reach_the_cylinder() {
+        const THREADS: u32 = 4;
+        const EIDS: u32 = 2_000;
+        const VALUES: u64 = 7;
+        for round in 0..30u64 {
+            let hs = HimoStore::init(heap_region(64 * 1024), ValueType::Number, 0, EIDS * THREADS, false);
+            let start = std::sync::Barrier::new(THREADS as usize + 1);
+            let shadow: Vec<Vec<Option<u64>>> = std::thread::scope(|s| {
+                let writers: Vec<_> = (0..THREADS)
+                    .map(|t| {
+                        let (hs, start) = (&hs, &start);
+                        s.spawn(move || {
+                            let mut last = vec![None; EIDS as usize];
+                            let mut x = 0x9e37_79b9_7f4a_7c15u64 ^ (round << 8 | u64::from(t));
+                            start.wait();
+                            for _ in 0..20_000 {
+                                x ^= x << 13;
+                                x ^= x >> 7;
+                                x ^= x << 17;
+                                let i = (x % u64::from(EIDS)) as usize;
+                                let eid = i as u32 * THREADS + t;
+                                if x >> 60 == 0 {
+                                    hs.remove(eid);
+                                    last[i] = None;
+                                } else {
+                                    let v = (x >> 32) % VALUES;
+                                    assert!(hs.set(eid, v));
+                                    last[i] = Some(v);
+                                }
+                            }
+                            last
+                        })
+                    })
+                    .collect();
+                start.wait();
+                // 書き手が書いている途中で組む
+                std::thread::sleep(std::time::Duration::from_micros(200 + 300 * (round % 5)));
+                let _ = hs.pull(0);
+                writers.into_iter().map(|w| w.join().unwrap()).collect()
+            });
+            assert!(hs.cylinder_built());
+            for v in 0..VALUES {
+                let mut got = hs.pull(v);
+                got.sort_unstable();
+                let mut by_scan: Vec<u32> = (0..EIDS * THREADS).filter(|&e| hs.get_value(e) == Some(v)).collect();
+                by_scan.sort_unstable();
+                let mut by_shadow: Vec<u32> = (0..THREADS)
+                    .flat_map(|t| {
+                        let last = &shadow[t as usize];
+                        (0..EIDS).filter(move |&i| last[i as usize] == Some(v)).map(move |i| i * THREADS + t)
+                    })
+                    .collect();
+                by_shadow.sort_unstable();
+                assert_eq!(by_scan, by_shadow, "round {round}: 列が書き手の写しと違う (値 {v})");
+                assert_eq!(got, by_scan, "round {round}: cylinder が列と違う (値 {v})");
+            }
+        }
+    }
+
+    /// 門の中で書きかけの書き手が居る間は、 遅延構築は scan しない (出るのを待つ)。 thread の運に頼らずに窓を踏む:
+    /// 書き手を門に入った直後 (cell を書く前) で止め、 その間に読み手が組み始める。 組む側が待たないと、 scan は書く前の
+    /// cell を読み、 書き手は門の道なので cylinder に入れず、 その eid は `pull` から消える (実測 2026-10-11: 門を閉じても
+    /// 待たない形にすると、 この test が落ちる)。
+    #[test]
+    fn lazy_build_waits_for_a_writer_inside_the_gate() {
+        let hs = make_store(64);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let built = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let w = s.spawn(|| {
+                hook::set("inside_gate", move || {
+                    entered_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                });
+                assert!(hs.set(3, 9));
+            });
+            entered_rx.recv().unwrap();
+            let r = s.spawn(|| {
+                let got = hs.pull(9);
+                built.store(true, Ordering::SeqCst);
+                got
+            });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            // 書き手を放してから確かめる (先に assert すると、 落ちた時に書き手が止まったままになる)
+            let early = built.load(Ordering::SeqCst);
+            go_tx.send(()).unwrap();
+            w.join().unwrap();
+            let got = r.join().unwrap();
+            assert!(!early, "門の中の書き手が書く前に組み終えた");
+            assert_eq!(got, vec![3], "組む前に門の中で書いた cell を取りこぼした");
+        });
+        assert_eq!(hs.pull(9), vec![3]);
+    }
+
+    /// barrier (`write_barrier`、 購読の登録) も門の中の書き手が出るまで返らない。
+    #[test]
+    fn barrier_waits_for_a_writer_inside_the_gate() {
+        let hs = make_store(64);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let passed = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let w = s.spawn(|| {
+                hook::set("inside_gate", move || {
+                    entered_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                });
+                assert!(hs.set(5, 1));
+            });
+            entered_rx.recv().unwrap();
+            let b = s.spawn(|| {
+                hs.write_barrier();
+                passed.store(true, Ordering::SeqCst);
+                hs.get_value(5)
+            });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let early = passed.load(Ordering::SeqCst);
+            go_tx.send(()).unwrap();
+            w.join().unwrap();
+            let got = b.join().unwrap();
+            assert!(!early, "門の中の書き手が書く前に barrier を抜けた");
+            assert_eq!(got, Some(1), "barrier の後に門の中で書いた cell が見えない");
+        });
+        assert!(!hs.gate_is_closed());
     }
 }
