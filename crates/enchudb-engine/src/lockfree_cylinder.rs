@@ -202,16 +202,13 @@ pub struct LockFreeCylinder {
     /// sparse の古い entry の数 (note_stale の累計 − compact_sparse の除去分)。 0 なら sparse の read は
     /// verify 不要 (重複も古い entry も無い)。
     sparse_stale: AtomicUsize,
-    /// backing に現存する slot 総数 (stale 込み。compaction の除去分は反映)。
-    /// メモリ会計・診断用、かつ total_live 導出の被減数 (request12.1)。
-    total: AtomicUsize,
     /// 一度でも要素が入った bucket 数 (raw)。診断用。
+    ///
+    /// 2026-10-11: backing に現存する slot 総数 (`total`) と stale slot 総数 (`stale_total`) は持たない。 書き込みのたびに
+    /// 全部の書き手が同じ数を足し引きすると、 値の鍵で並んで書く書き手どうしが 1 本の cache line を取り合う。 読むのは
+    /// test と診断だけなので、 読む時に bucket ごとの数と sparse の数から出す ([`total`](Self::total) /
+    /// [`total_live`](Self::total_live))。
     unique_count: AtomicU32,
-    /// backing に現存する stale slot 総数 (= note_stale 累計 − compaction 除去分)。
-    /// live な tie 総数は `total − stale_total` で導出する (request12.1)。
-    /// per-insert の RMW を避け、churn 経路 (note_stale / compaction) でのみ更新
-    /// — 純 insert workload の hot path を master と同一コストに保つ。
-    stale_total: AtomicUsize,
     /// live > 0 の bucket 数 (= 正確な cardinality)。request12。
     unique_live: AtomicU32,
     /// delete / 値更新が一度でも起きたか (himo 全体、診断用)。
@@ -254,9 +251,7 @@ impl LockFreeCylinder {
             used: Default::default(),
             waiting: Default::default(),
             sparse_stale: AtomicUsize::new(0),
-            total: AtomicUsize::new(0),
             unique_count: AtomicU32::new(0),
-            stale_total: AtomicUsize::new(0),
             unique_live: AtomicU32::new(0),
             any_removed: AtomicBool::new(false),
         }
@@ -270,7 +265,7 @@ impl LockFreeCylinder {
     /// **空の索引にだけ** 置ける: `HimoStore` が組む前に write_lock の下で呼ぶ (読み手は組み終わりの flag の
     /// Release / Acquire の後にしか索引を読まないので、 この値を見る)。 `MID` の上下の窓と重なる `base` は 0 にする。
     pub fn set_low_base(&self, base: u64) {
-        debug_assert_eq!(self.total.load(Ordering::Relaxed), 0, "set_low_base は空の索引に");
+        debug_assert_eq!(self.total(), 0, "set_low_base は空の索引に");
         let base = if base <= MID - MID_HALF - DENSE_CAP as u64 { base } else { 0 };
         self.low_base.store(base, Ordering::Relaxed);
     }
@@ -420,14 +415,12 @@ impl LockFreeCylinder {
             None => {
                 // sparse は値ごとの件数を持たない: 古い entry の数だけ数え、 掃除は sparse 全体
                 // (`sparse_needs_compact` / `compact_sparse`)
-                self.stale_total.fetch_add(1, Ordering::Relaxed);
                 self.sparse_stale.fetch_add(1, Ordering::Release);
                 return None;
             }
         };
         match stats {
             Some((_, live_after)) => {
-                self.stale_total.fetch_add(1, Ordering::Relaxed);
                 if live_after == 0 {
                     // この bucket の live が 0 になった = cardinality 減
                     self.unique_live.fetch_sub(1, Ordering::Relaxed);
@@ -450,10 +443,7 @@ impl LockFreeCylinder {
         let guard = epoch::pin();
         match self.writer_dense_at(value, &guard) {
             Some(Some(b)) => {
-                let before = b.len();
-                let kept = b.compact_in(&guard, keep);
-                self.discount_compacted(before - kept);
-                kept
+                b.compact_in(&guard, keep)
             }
             // 空の要素 / sparse は値ごとに組み直さない (`compact_sparse` が全体で)
             _ => 0,
@@ -484,10 +474,6 @@ impl LockFreeCylinder {
     /// 重複 (書き換えで戻った値) も 1 つにする。 落とした数を返す。
     pub fn compact_sparse(&self, keep: impl FnMut(u64, u32) -> bool) -> usize {
         let removed = self.sparse.rebuild(keep);
-        if removed > 0 {
-            self.total.fetch_sub(removed, Ordering::Relaxed);
-            self.stale_total.fetch_sub(removed.min(self.stale_total.load(Ordering::Relaxed)), Ordering::Relaxed);
-        }
         // 組み直した版を出した **後** に 0 へ戻す (Release、 読み手は `sparse_churned_before_read` で Acquire)
         self.sparse_stale.store(0, Ordering::Release);
         self.recount_waiting();
@@ -574,16 +560,6 @@ impl LockFreeCylinder {
         out
     }
 
-    /// compaction で除去された slot 数 (= その bucket に居た stale 全量) を
-    /// total / stale_total から同数引く — `total_live` (= 差分) は不変のまま、
-    /// raw `total` は「backing に現存する slot 総数」として正確さを保つ。
-    fn discount_compacted(&self, removed: usize) {
-        if removed > 0 {
-            self.total.fetch_sub(removed, Ordering::Relaxed);
-            self.stale_total.fetch_sub(removed, Ordering::Relaxed);
-        }
-    }
-
     /// 単一 writer append。 value の bucket に eid を足す（旧 value は放置＝lazy verify）。
     /// pin は insert 全体で 1 回（push / unique 判定に guard を回す。 hot path の
     /// pin 3 回 → 1 回、 write 天井対策）。
@@ -644,7 +620,6 @@ impl LockFreeCylinder {
         let Some((k, i)) = self.dense_slot(value) else {
             // 値の種類数 (unique_count / unique_live) は dense の分だけ数える
             self.sparse.insert(value, eid);
-            self.total.fetch_add(1, Ordering::Relaxed);
             return;
         };
         let dense = self.arr(k);
@@ -659,7 +634,6 @@ impl LockFreeCylinder {
         if !may_grow || self.grow_too_sparse(k, i, vec.len()) {
             // 伸ばさない (伸ばすと空の要素ばかりになる): sparse に置く。 entry が溜まれば、 後で伸ばす時に dense へ移る
             self.sparse.insert(value, eid);
-            self.total.fetch_add(1, Ordering::Relaxed);
             self.waiting[k].fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -684,10 +658,8 @@ impl LockFreeCylinder {
             // `with_value`)。 消すのは、 今 dense が覆う値の entry 全部 (移したもの + 古い entry・重複)
             let lens = self.lens(&guard);
             let removed = self.sparse.rebuild(|v, _| self.dense_slot(v).is_none_or(|(k2, j)| j >= lens[k2]));
-            // 移した entry は dense に数え直しただけ (total のまま)。 残りは古い entry・重複 (stale に数えてある)
+            // 移した entry は dense に数え直しただけ。 残りは古い entry・重複 (sparse の古い entry に数えてある)
             let dropped = removed.saturating_sub(moved);
-            self.total.fetch_sub(dropped.min(self.total.load(Ordering::Relaxed)), Ordering::Relaxed);
-            self.stale_total.fetch_sub(dropped.min(self.stale_total.load(Ordering::Relaxed)), Ordering::Relaxed);
             self.sparse_stale.fetch_sub(dropped.min(self.sparse_stale.load(Ordering::Relaxed)), Ordering::Relaxed);
             self.recount_waiting();
         }
@@ -744,7 +716,7 @@ impl LockFreeCylinder {
     /// 数える。 bucket は 2 回目に入る件数ちょうどで作る — 倍々で伸ばすと、 伸ばすたびの古い backing が、 この関数の
     /// 間ずっと持つ pin のせいで epoch を過ぎず、 後で誰も pin しない (readonly で読むだけの) process では残り続けた。
     pub fn build<I: Iterator<Item = (u32, u64)>>(&self, entries: impl Fn() -> I) {
-        debug_assert_eq!(self.total.load(Ordering::Relaxed), 0, "build は空の索引に");
+        debug_assert_eq!(self.total(), 0, "build は空の索引に");
         let guard = epoch::pin();
         // 1 回目: 配列ごとに、 添字ごとの件数 (出てきた最大の添字まで) と sparse の件数
         let mut counts: [Vec<u32>; 3] = Default::default();
@@ -805,10 +777,7 @@ impl LockFreeCylinder {
                     let prev_live = b.live_inc();
                     self.bump_stats(prev_len == 0, prev_live == 0);
                 }
-                _ => {
-                    sparse.push((v, eid));
-                    self.total.fetch_add(1, Ordering::Relaxed);
-                }
+                _ => sparse.push((v, eid)),
             }
         }
         for (k, arr) in arrs.iter_mut().enumerate() {
@@ -822,10 +791,8 @@ impl LockFreeCylinder {
 
     #[inline]
     fn bump_stats(&self, was_empty: bool, was_dead: bool) {
-        self.total.fetch_add(1, Ordering::Relaxed);
-        // total_live は total − stale_total で導出 (request12.1) — ここで RMW を
-        // 増やさない (raw tie_async + oplog の consumer apply が per-insert コストに
-        // 直結する。SNS 型の負荷試験 matrix で +33% の実測退行が出た)。
+        // 総数は持たない (読む時に数える、 `total` / `total_live`) — ここで RMW を増やさない (raw tie_async + oplog の
+        // consumer apply が per-insert コストに直結する。SNS 型の負荷試験 matrix で +33% の実測退行が出た)。
         if was_empty {
             self.unique_count.fetch_add(1, Ordering::Relaxed);
         }
@@ -920,10 +887,17 @@ impl LockFreeCylinder {
         self.with_value(value, |b, _| b.map_or(0, AppendBucket::len), |sparse| sparse.lookup(value).len())
     }
 
-    /// backing に現存する slot 総数 (raw、stale 込み、compaction 除去は反映)。診断用。
+    /// backing に現存する slot 総数 (raw、stale 込み、compaction 除去は反映)。診断用。 読む時に bucket ごとの長さと sparse の
+    /// entry の数を足す (O(配列の長さ + sparse の run の数))。
     #[allow(dead_code)]
     pub fn total(&self) -> usize {
-        self.total.load(Ordering::Relaxed)
+        self.fold_buckets(AppendBucket::len) + self.sparse.len()
+    }
+
+    /// 3 本の配列の全部の bucket について `f` の和。
+    fn fold_buckets(&self, f: impl Fn(&AppendBucket) -> usize) -> usize {
+        let guard = epoch::pin();
+        [LOW, POS, NEG].iter().map(|&k| self.vec_of(k, &guard).iter().filter_map(Slot::get).map(&f).sum::<usize>()).sum()
     }
 
     /// 一度でも要素が入った bucket 数 (raw)。診断用。
@@ -932,13 +906,12 @@ impl LockFreeCylinder {
         self.unique_count.load(Ordering::Relaxed)
     }
 
-    /// live な tie 総数 (正確、churn の影響なし)。request12。
-    /// `total − stale_total` で導出。stale → total の順で load するので
-    /// 並行 insert があっても負に振れない (並行 compaction 中のみ一時的に
-    /// 過少に見えうる — Relaxed 統計として許容、saturating で防御)。
+    /// live な tie 総数 (正確、churn の影響なし)。request12。 読む時に数える: dense は bucket ごとの live の和、 sparse は
+    /// entry の数 − 古い entry の数 (重複は古い entry に数えてある)。 書き込みと並ぶと一時的にずれうる (Relaxed 統計、
+    /// saturating で防御)。
     pub fn total_live(&self) -> usize {
-        let stale = self.stale_total.load(Ordering::Relaxed);
-        self.total.load(Ordering::Relaxed).saturating_sub(stale)
+        let stale = self.sparse_stale.load(Ordering::Relaxed);
+        self.fold_buckets(|b| b.live() as usize) + self.sparse.len().saturating_sub(stale)
     }
 
     /// live > 0 の bucket 数 (dense に置いている値の正確な cardinality)。request12。
