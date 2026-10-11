@@ -385,7 +385,7 @@ impl LockFreeCylinder {
                 // sparse は値ごとの件数を持たない: 古い entry の数だけ数え、 掃除は sparse 全体
                 // (`sparse_needs_compact` / `compact_sparse`)
                 self.stale_total.fetch_add(1, Ordering::Relaxed);
-                self.sparse_stale.fetch_add(1, Ordering::Relaxed);
+                self.sparse_stale.fetch_add(1, Ordering::Release);
                 return None;
             }
         };
@@ -430,9 +430,18 @@ impl LockFreeCylinder {
         stale > 0 && stale * 2 >= self.sparse.len().max(64)
     }
 
-    /// sparse の古い entry があるか。
+    /// sparse の古い entry があるか。 書き手 (write_lock の下) 用。
     pub fn sparse_churned(&self) -> bool {
         self.sparse_stale.load(Ordering::Relaxed) > 0
+    }
+
+    /// 読み手用: sparse を **読む前** に、 古い entry がありうるかを見る。 読んだ後に見ると、 組み直す前の版 (古い entry
+    /// 入り) を読んだまま、 組み直した後の 「古い entry なし」 を見て、 古い entry を確かめずに live として返す
+    /// (`compact_sparse` は組み直した版を出してから数を 0 に戻す。 ここで 0 を Acquire で見たなら、 この後に読む版は
+    /// 組み直した後のもの)。 並行の書き込みの test で、 会社単位の購読が、 もう別の会社に移った社員を返して見つかった。
+    #[inline]
+    fn sparse_churned_before_read(&self) -> bool {
+        self.sparse_stale.load(Ordering::Acquire) > 0
     }
 
     /// sparse を `keep(値, eid)` (Column の現在値との照合) で組み直す。 write_lock 下・Column 更新後に。
@@ -443,7 +452,8 @@ impl LockFreeCylinder {
             self.total.fetch_sub(removed, Ordering::Relaxed);
             self.stale_total.fetch_sub(removed.min(self.stale_total.load(Ordering::Relaxed)), Ordering::Relaxed);
         }
-        self.sparse_stale.store(0, Ordering::Relaxed);
+        // 組み直した版を出した **後** に 0 へ戻す (Release、 読み手は `sparse_churned_before_read` で Acquire)
+        self.sparse_stale.store(0, Ordering::Release);
         self.recount_waiting();
         removed
     }
@@ -787,12 +797,15 @@ impl LockFreeCylinder {
             value,
             |b, guard| b.map_or((Vec::new(), false), |b| b.read_snapshot_verify(guard)),
             |sparse| {
+                // 古い entry の有無は **読む前** に見る (`sparse_churned_before_read`)
+                let churned = self.sparse_churned_before_read();
                 // run ごとに eid 順なので並べ直す (dense の bucket と同じく eid の昇順で返す)
                 let mut out = sparse.lookup(value);
+                hook::at("sparse_after_lookup");
                 if out.len() > 1 {
                     out.sort_unstable();
                 }
-                (out, self.sparse_churned())
+                (out, churned)
             },
         )
     }
@@ -1263,6 +1276,28 @@ mod tests {
         got.sort_unstable();
         got.dedup();
         assert_eq!(got.len(), 501, "範囲の読みで dense へ移った値を見落とした: {} 件", got.len());
+    }
+
+    /// sparse の読みは古い entry の有無を **読む前** に見る: 読んだ直後 (割り込み点 `sparse_after_lookup`) に書き手が
+    /// sparse を組み直して数を 0 に戻しても、 読んだ版にあった古い entry を確かめずに返さない。 読んだ後に見る形だと、
+    /// 組み直した後の 0 を見て、 もう別の値に移った entity を live として返していた。
+    #[test]
+    fn sparse_reader_checks_stale_before_reading() {
+        let c = std::rc::Rc::new(LockFreeCylinder::new(0));
+        let cells = std::rc::Rc::new(Cells::new());
+        let far = 5_000_000u64; // DENSE_CAP 以上 = sparse
+        cells.set(&c, 0, far);
+        cells.set(&c, 1, far);
+        cells.set(&c, 0, far + 1); // 0 は far を出た: far に古い entry が残る
+        assert!(c.sparse_churned(), "前提: 古い entry がある");
+        let (c2, k2) = (c.clone(), cells.clone());
+        hook::set("sparse_after_lookup", move || {
+            c2.compact_sparse(k2.keep());
+        });
+        let (raw, verify) = c.read_to_vec_verify(far);
+        assert!(!c.sparse_churned(), "前提: 読む間に組み直した");
+        assert!(verify || !raw.contains(&0), "古い entry (0) を確かめずに返した: {raw:?}");
+        assert_eq!(pull(&c, &cells, far), vec![1]);
     }
 
     /// #373: 配列を伸ばした直後 (sparse から消す前) は、 移した値が dense と sparse の両方にある。 その間に値を
