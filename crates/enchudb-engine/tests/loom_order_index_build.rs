@@ -44,7 +44,7 @@
 //!
 //! ## model の範囲
 //! 列 (`AtomicUsize`、 0 = 値が無い、 それ以外は値 + 1)、 via / key の write_lock と門 (1 shard) と値の鍵 (1 本)、 行の lock (entity
-//! ごと。 本物は eid の下位 bit の stripe)、 宣言の有無 (本物は `LiveRegistry::n_orders`)、 作った印、 置き場所の記録、 置き場ごとの人数を写す。 置き場の鍵は 1 本で写す (本物は値ごとの 64 本で、
+//! ごと。 本物は eid の下位 bit の stripe)、 宣言の有無 (本物は `LiveRegistry::n_orders`)、 作った印、 置き場所の記録、 置き場ごとの人数を写す。 置き場の鍵は 1 本で写す (本物は値ごとの 1024 本で、
 //! 2 本取る時は添字の順。 違う値どうしの並びは単体 test が見る)。 bucket の中身 (足すだけの一覧と古い印) は
 //! `loom_append_publish` と単体 test が、 epoch の解放は Miri が見ている。
 //!
