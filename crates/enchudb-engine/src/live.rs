@@ -347,6 +347,27 @@ impl LivePred {
         out
     }
 
+    /// 枝 `branch` (DNF の 1 本) が ref 紐 `via` を、 根への条件の範囲でだけ逆に引くか: `via` が根の段の `Via` の 1 段目に
+    /// だけ出て (それより深い所や `Exists` などの中には出ない)、 根に `has_order(key)` の範囲の条件 (`Range { himo_id: key }`)
+    /// がある。 その時 `via` の逆引きは並びの索引の範囲の帯だけで読めるので、 購読の登録は円柱を作らない
+    /// (`Engine::warm_ref`。 外れても、 円柱は最初に読む時に作られる)。
+    pub(crate) fn reads_via_only_by_range(branch: &[LivePred], via: u16, has_order: impl Fn(u16) -> bool) -> bool {
+        let mut first_hop = false;
+        for p in branch {
+            match p {
+                LivePred::Via { path, pred } if path.first() == Some(&via) => {
+                    if path[1..].contains(&via) || pred.ref_himos().contains(&via) {
+                        return false;
+                    }
+                    first_hop = true;
+                }
+                _ if p.ref_himos().contains(&via) => return false,
+                _ => {}
+            }
+        }
+        first_hop && branch.iter().any(|p| matches!(p, LivePred::Range { himo_id, .. } if has_order(*himo_id)))
+    }
+
     /// 条件に出てくる和の列 (`SumAtLeast` の `sum_himo`、 中身の中も)。 engine が Number / Number64 かを検証する用。
     pub fn sum_himos(&self) -> Vec<u16> {
         fn walk(p: &LivePred, out: &mut Vec<u16>) {
@@ -3753,6 +3774,29 @@ impl Family {
         (n, ents)
     }
 
+    /// 節 `n` の entity `ents` から根の手前まで (ref の道で) 遡り、 途中の各節 (`n` を含み根を含まない) で `f(節, entity)`
+    /// を呼ぶ。 [`climb`](Self::climb) と同じ道だが、 根の entity は集めない (根の手前の節で止める)。 記録を不明に戻す
+    /// [`forget_stale`](Self::forget_stale) / [`forget_regions`](Self::forget_regions) は根の entity を使わない
+    /// (2026-10-11 まではここでも根まで引いていて、 合う会社の全員を引いて捨てる手間と、 そのための円柱が要った)。
+    fn visit_up(&self, r: &impl CellReader, mut n: usize, mut ents: Vec<u32>, mut f: impl FnMut(usize, &[u32])) {
+        while n != 0 {
+            f(n, &ents);
+            let parent = self.nodes[n].parent;
+            if parent == 0 {
+                break;
+            }
+            let via = self.nodes[n].via;
+            let mut up: Vec<u32> = Vec::new();
+            for &e in &ents {
+                r.pull_into(via, e as u64, &mut up);
+            }
+            up.sort_unstable();
+            up.dedup();
+            ents = up;
+            n = parent;
+        }
+    }
+
     /// 鍵の表が増えると、 増える前に 「偽」 と記録した節の entity が今は真でありうる (購読の
     /// 無かった値が購読された)。 評価は子の記録を信じるので、 各穴の値を持つ entity から根の
     /// 手前まで遡って記録を不明に戻す (test `late_member_sees_hub_recorded_while_unsubscribed`)。
@@ -3761,7 +3805,7 @@ impl Family {
     fn forget_stale(&self, r: &impl CellReader, s: &mut Settled, vals: &[u64]) {
         for (n, node) in self.nodes.iter().enumerate().skip(1) {
             for &(h, slot) in &node.holes {
-                self.climb(r, n, r.pull(h, vals[slot]), 0, None, |m, ents| {
+                self.visit_up(r, n, r.pull(h, vals[slot]), |m, ents| {
                     for &e in ents {
                         s.recs[m].forget(e);
                     }
@@ -3785,7 +3829,7 @@ impl Family {
         if ents.is_empty() {
             return;
         }
-        self.climb(r, rn, ents.clone(), 0, None, |m, es| {
+        self.visit_up(r, rn, ents.clone(), |m, es| {
             for &e in es {
                 s.recs[m].forget(e);
             }

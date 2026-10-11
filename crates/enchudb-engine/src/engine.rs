@@ -9526,11 +9526,15 @@ impl Engine {
         self.live.orders().find(|o| o.via as usize == idx)
     }
 
-    /// 購読を張る前に ref の逆引きを作っておく (最初の poll がそれを作る時間を払わないように)。 円柱は宣言が無い時と同じに
-    /// 作り、 並びの索引がある via の紐は索引も作る (範囲の条件で絞る読みは索引、 それ以外は円柱から読む)。
-    fn warm_ref(&self, h: u16) {
-        if let Some(o) = self.order_of_via(h as usize) {
-            let _ = self.order_ready(o);
+    /// 購読を張る前に ref の逆引きを作っておく (最初の poll がそれを作る時間を払わないように)。 作るのは、 その購読が読む
+    /// 並びだけ: 根への条件の範囲でだけ逆に引く via (`ranged`) は並びの索引 (宣言があり、 使える時)、 それ以外は円柱。
+    /// もう片方は、 それを読む読みが来た時に作る (読まない並びは作らず、 書き込みもその手入れを払わない。 2026-10-11)。
+    fn warm_ref(&self, h: u16, ranged: bool) {
+        if ranged
+            && let Some(o) = self.order_of_via(h as usize)
+            && self.order_ready(o)
+        {
+            return;
         }
         let _ = self.himos[h as usize].slice_len(0);
     }
@@ -13526,7 +13530,12 @@ impl Engine {
         refs.sort_unstable();
         refs.dedup();
         for h in refs {
-            self.warm_ref(h);
+            // どの枝でも根への条件の範囲でだけ逆に引くなら、 並びの索引だけ (社員単位の購読は会社から社員へ降りる段を範囲の
+            // 帯だけで読む)
+            let ranged = branches
+                .iter()
+                .all(|b| crate::live::LivePred::reads_via_only_by_range(b, h, |k| self.live.order_for(h, k).is_some()));
+            self.warm_ref(h, ranged);
         }
 
         // 登録手順 (順序が正しさの根拠、 `crate::live` module doc):
@@ -13700,8 +13709,12 @@ impl Engine {
         refs.push(via);
         refs.sort_unstable();
         refs.dedup();
+        // group の中身 (via の逆引き) は根への条件で絞って読む: 範囲の条件に並びの索引があれば索引だけ
+        let ranged_via = filter
+            .iter()
+            .any(|p| matches!(p, crate::live::LivePred::Range { himo_id, .. } if self.live.order_for(via, *himo_id).is_some()));
         for h in refs {
-            self.warm_ref(h);
+            self.warm_ref(h, h == via && ranged_via);
         }
         // 登録手順は subscribe_inner と同じ: route に載せる → 全紐の write_lock で barrier → 初期候補に印
         let q = self.live.register_touched(branch, &notice);
@@ -13768,7 +13781,7 @@ impl Engine {
         refs.sort_unstable();
         refs.dedup();
         for h in refs {
-            self.warm_ref(h);
+            self.warm_ref(h, false);
         }
         // 登録手順は subscribe と同じ (route → barrier → 初期候補)
         let q = self.live.register_counts(branches, (group_path, group_himo), sum_himo).map_err(|m| bad(&m))?;
@@ -13806,7 +13819,7 @@ impl Engine {
         refs.sort_unstable();
         refs.dedup();
         for h in refs {
-            self.warm_ref(h);
+            self.warm_ref(h, false);
         }
         // 登録手順は subscribe と同じ (route → barrier → 初期候補)
         let q = self.live.register_keyed(branches, (key_path, key_himo)).map_err(|m| bad(&m))?;
@@ -13851,7 +13864,7 @@ impl Engine {
         refs.sort_unstable();
         refs.dedup();
         for h in refs {
-            self.warm_ref(h);
+            self.warm_ref(h, false);
         }
         let q = self.live.register_top(branches, (order_path, order_himo, desc), limit).map_err(|m| bad(&m))?;
         for h in q.himos() {

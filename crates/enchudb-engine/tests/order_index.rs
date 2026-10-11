@@ -709,32 +709,41 @@ fn order_heap(w: &World) -> usize {
     w.eng.order_stats().iter().map(|s| s.4).sum()
 }
 
-/// 購読 (社員単位 / 見直す場所だけ / 会社単位) の登録は、 宣言した via の紐の円柱と索引を両方作る (最初の poll が作る
-/// 時間を払わないように)。 書き込みと poll と find_by を回して、 答えを find_by と shadow の 2 経路で比べる。 会社単位の購読の
-/// 根の条件の無い count / members は円柱から読み、 索引を読まない (読んだ回数が変わらない)。
-/// 対照: 宣言しない DB は、 同じ登録で円柱だけを作る (索引は無い)。
+/// 購読の登録は、 その購読が読む並びだけを作る (2026-10-11): 根への条件の範囲でだけ逆に引く購読 (社員単位・見直す場所
+/// だけ) は並びの索引だけ、 範囲の無い購読は円柱だけ。 もう片方は、 それを読む読みが来た時に作る。
+/// - 範囲つきの社員単位の購読は、 合う会社がある時も円柱を作らない (登録の 「記録を不明に戻す」 段は根の手前で止まり、
+///   会社の全員を引かない = `visit_up`)
+/// - 範囲の無い社員単位の購読は円柱だけ (索引は作らない)
+/// - 混ぜると、 範囲の無い会社単位の読み (根の条件の無い count / members) が来た時に円柱を作り、 その読みは索引を読まない。
+///   書き込みと poll と find_by を回して、 答えを find_by と shadow の 2 経路で比べる
+///
+/// 対照: 宣言しない DB は、 同じ範囲つきの登録で円柱を作る (索引は無い)。
 #[test]
-fn subscriptions_build_both_arrangements_and_read_the_matching_one() {
-    // 登録そのものが両方を作る: どの会社も合わない購読 (city 99) なら最初の評価は社員を引かないので、 作るのは登録だけ
-    // (合う会社のある購読は最初の評価が両方の並びを読むので、 登録が作らなくても作られる。 2026-10-11 に登録の作り方を
-    // 壊して確かめた)
+fn subscriptions_build_the_arrangement_they_read() {
+    // 範囲つき (合う会社あり): 索引だけ
     let e = world(Layout::Tables, 0x5eed_4064);
     declare(&e, &[30, 1001]);
     let heap0 = order_heap(&e);
-    let _none = e.eng.subscribe(preds(&e, 99, Root::Age(30, 1000))).unwrap();
-    assert!(company_cylinder_bytes(&e) > 0, "購読の登録が円柱を先に作っていない");
-    assert!(order_heap(&e) > heap0, "購読の登録が索引を先に作っていない");
-    drop(e);
+    let _row = e.eng.subscribe(preds(&e, 1, Root::Age(30, 1000))).unwrap();
+    let _touched = e.eng.subscribe_touched(preds(&e, 2, Root::Age(30, 1000))).unwrap();
+    assert!(order_heap(&e) > heap0, "範囲つきの購読の登録が索引を作っていない");
+    assert_eq!(company_cylinder_bytes(&e), 0, "範囲つきの購読の登録が円柱を作った");
+    drop((_row, _touched, e));
+    // 範囲なし: 円柱だけ
+    let f = world(Layout::Tables, 0x5eed_4065);
+    declare(&f, &[30, 1001]);
+    let heap0 = order_heap(&f);
+    let _row = f.eng.subscribe(preds(&f, 1, Root::None)).unwrap();
+    assert!(company_cylinder_bytes(&f) > 0, "範囲の無い購読の登録が円柱を作っていない");
+    assert_eq!(order_heap(&f), heap0, "範囲の無い購読の登録が索引を作った");
+    drop((_row, f));
 
     let mut w = world(Layout::Tables, 0x5eed_4061);
     declare(&w, &[30, 1001]);
-    assert_eq!(company_cylinder_bytes(&w), 0, "前提: まだ円柱を作っていない");
-    let heap0 = order_heap(&w);
     let row = w.eng.subscribe(preds(&w, 1, Root::Age(30, 1000))).unwrap();
     let touched = w.eng.subscribe_touched(preds(&w, 2, Root::Age(30, 1000))).unwrap();
     let grouped = w.eng.subscribe_grouped(preds(&w, 3, Root::None)).unwrap();
-    assert!(company_cylinder_bytes(&w) > 0, "購読の登録が円柱を作っていない");
-    assert!(order_heap(&w) > heap0, "購読の登録が索引を作っていない");
+    assert_eq!(company_cylinder_bytes(&w), 0, "前提: 範囲の無い読みはまだ来ていない");
     let mut rng = Rng(0x5eed_4062);
     let mut seen = BTreeSet::new();
     let mut groups = BTreeSet::new();
@@ -763,6 +772,9 @@ fn subscriptions_build_both_arrangements_and_read_the_matching_one() {
             assert_eq!(grouped.members(&w.eng, c), want_members(&w, Root::None, c), "round {round}: 会社単位の members({c})");
         }
         assert_eq!(order_hits(&w), hits, "round {round}: 根の条件の無い会社単位の読みが索引を読んだ");
+        if round == 0 {
+            assert!(company_cylinder_bytes(&w) > 0, "範囲の無い読みが円柱を作っていない");
+        }
     }
     assert!(order_hits(&w).0 > 0, "範囲の読みが索引を読んでいない");
     let c = world(Layout::Tables, 0x5eed_4063);
