@@ -900,11 +900,21 @@ impl LockFreeCylinder {
         self.unique_live.load(Ordering::Relaxed)
     }
 
-    /// value の live 件数 (= verify 後の pull 結果の件数、正確)。
-    /// planner の pivot 選択用 (raw の `slice_len` は stale 込みで over-count する)。
+    /// value の live 件数 (= verify 後の pull 結果の件数、正確)。 単体 test 用 (planner の pivot 選択などは
+    /// [`dense_live_len`](Self::dense_live_len) を 1 回の pin で使う)。
+    #[cfg(test)]
     pub fn slice_len_live(&self, value: u64) -> usize {
         // sparse は古い entry 込みの上限 (正確な件数は HimoStore が Column と突き合わせる)
         self.with_value(value, |b, _| b.map_or(0, |b| b.live() as usize), |sparse| sparse.lookup(value).len())
+    }
+
+    /// 今 dense に置いている値なら、 その live な件数 (空の要素は 0)。 sparse の値は None (件数を持たない、 呼び手が引いて
+    /// 数える)。 [`is_dense`](Self::is_dense) と [`slice_len_live`](Self::slice_len_live) を 1 回の pin で
+    /// (2026-10-11: 件数を数える所は値ごとに 2 回 pin し、 dense の位置も 2 回求めていた)。
+    pub fn dense_live_len(&self, value: u64) -> Option<usize> {
+        let guard = epoch::pin();
+        let (k, i) = self.dense_slot(value)?;
+        self.dense_at(k, i, &guard).map(|b| b.map_or(0, |b| b.live() as usize))
     }
 
     /// value の bucket に churn 痕があるか。write_lock 下 (単一 writer) では正確 —
@@ -1592,7 +1602,7 @@ mod tests {
         let base = 2_000_000u64;
         let n = if cfg!(miri) { 400u32 } else { 30_000 };
         // 会社 200 社 (base から) を指す社員。 50 人に 1 人は窓の前の値 (base − 5) を指す
-        let value_of = |e: u32| if e % 50 == 0 { base - 5 } else { base + u64::from(e % 200) };
+        let value_of = |e: u32| if e.is_multiple_of(50) { base - 5 } else { base + u64::from(e % 200) };
         let c = LockFreeCylinder::new(0);
         c.set_low_base(base);
         assert_eq!(c.low_base(), base);
@@ -1611,6 +1621,13 @@ mod tests {
             assert_eq!(pull(&c, &cells, v), cells.eids_of(v), "値 {v}");
         }
         assert_eq!(c.slice_len_live(base + 150), cells.eids_of(base + 150).len(), "dense の値ごとの件数");
+        // 1 回の pin で件数 (dense の値) / None (sparse の値): `is_dense` + `slice_len_live` と同じ答え
+        for v in probes {
+            let two = c.is_dense(v).then(|| c.slice_len_live(v));
+            assert_eq!(c.dense_live_len(v), two, "dense_live_len({v})");
+        }
+        assert_eq!(c.dense_live_len(base), Some(0), "窓の中で誰も指さない値は空の要素 = 0");
+        assert_eq!(c.dense_live_len(base - 5), None, "窓の前の値は sparse = None");
         // 今の値の種類 (base + 0 / 50 / 100 は誰も指さない: 50 人に 1 人の窓の前の値と重なるので)
         let mut want: Vec<u64> = cells.0.borrow().values().copied().collect();
         want.sort_unstable();

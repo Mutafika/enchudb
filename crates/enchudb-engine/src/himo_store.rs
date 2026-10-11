@@ -691,12 +691,12 @@ impl HimoStore {
     pub fn slice_len(&self, value: impl CellValue) -> usize {
         let Some(value) = value.cell_value() else { return 0 };
         self.ensure_cylinder_built();
-        if !self.cyl.is_dense(value) {
+        match self.cyl.dense_live_len(value) {
+            Some(n) => n,
             // sparse の値は件数を持たない: 引いて数える (sparse に置くのは、 値の種類が多い列か、 配列を伸ばすほど
             // 溜まっていない値なので、 1 値あたりの件数は小さい)
-            return self.pull(value).len();
+            None => self.pull(value).len(),
         }
-        self.cyl.slice_len_live(value)
     }
 
     /// 入っている値を列挙（順序保証なし、churn 時は stale 含む近似）。
