@@ -3,6 +3,31 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.32.2 — 2026-10-12
+
+patch。 on-disk 形式・wire 形式・API は 0.32.1 と同じ。 書き手が休まず書いて WAL が満杯に近い時、 consumer が WAL を空けに
+来て開いている group を閉じる Commit が満杯で打てないと、 「打てなかった Commit」 に数えて警告を出していた (0.32.0 からの
+`issue388_wal_backpressure` の test が数 % で落ちていた原因) のを直した (#469)。
+
+### Fixed — consumer が WAL を空けに来た時の Commit が満杯で打てないと、 「打てなかった Commit」 に数えていた (#469)
+
+consumer は WAL の空きが 1/4 を切ると、 書き出して畳む前に開いている group を Commit で閉じる (`make_wal_room_inner`)。 この
+Commit は満杯なら打たない (本体に書き出してから畳むので復旧に要らない) が、 「満杯でない」 と見てから打つまでの間に、 書き手の
+thread が直接打つ Commit が残りを埋めることがあった。 その時の append は待ち手に回るが、 待ち手は consumer 自身 = 畳んでいる最中
+なので何もせず、 Commit は落ちて `wal_commit_failures()` に数わり、 警告 (`WAL commit marker append failed`) が 1 行出た。 満杯で
+落ちた時は打たなかったのと同じに扱い、 数えない (満杯以外の失敗は今まで通り数える)。 打てなかった Commit は満杯で打たない時と
+同じ扱いなので、 中身は失っていない。
+
+もう 1 つ (読んで見つけた。 観測はしていない): 入れ子の待ち手は 「畳めなかった」 印を付けていた。 外側はこの後畳むのに印は残り、
+10 ms の間 consumer は畳みに行かず、 待っている書き手も 「今は畳めない」 と見て諦めた (その間に WAL がまた埋まると、 書き手の
+record が落ちうる)。 畳んでいる最中なら何もせず、 印も付けない。
+
+### Tests
+
+- engine の単体 `room_commit_lost_to_a_full_wal_is_neither_a_failure_nor_a_failed_fold`: test 用の割り込み点で、 「満杯でない」 と
+  見た後・Commit を打つ前に WAL を満杯まで埋めて窓を必ず踏む (数えない / 印を付けない / 外側は畳む / 書いた値は残る)。 直しを
+  1 つずつ戻すと落ちる
+
 ## 0.32.1 — 2026-10-11
 
 patch。 on-disk 形式・wire 形式は 0.32.0 と同じ。 Engine / schema の API は変わらない (診断用の
