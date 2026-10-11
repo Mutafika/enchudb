@@ -596,11 +596,6 @@ pub(crate) trait CellReader {
     fn pull_into(&self, himo_id: u16, value: u64, out: &mut Vec<u32>) {
         out.extend(self.pull(himo_id, value));
     }
-    /// [`pull_into`](Self::pull_into) の、 番号の昇順に近い形で足す版 (`members` のように昇順で返す読み用。 呼び手は並べ
-    /// 直す)。 並びの索引がある紐は帯ごとの一覧を混ぜ合わせる。 それ以外は `pull_into` と同じ。
-    fn pull_sorted_into(&self, himo_id: u16, value: u64, out: &mut Vec<u32>) {
-        self.pull_into(himo_id, value, out);
-    }
     /// `himo_id` に何か値を持つ entity。
     fn with_himo(&self, himo_id: u16) -> Vec<u32>;
     /// `himo_id` の値が `lo..=hi` の entity (順不同)。
@@ -5672,7 +5667,7 @@ impl GroupedLiveQuery {
             }
         }
         let mut out = Vec::new();
-        CellReader::pull_sorted_into(eng, self.via, g as u64, &mut out);
+        CellReader::pull_into(eng, self.via, g as u64, &mut out);
         if !self.filter.is_empty() {
             out.retain(|&e| self.filter.iter().all(|p| matches_leaf(eng, p, e)));
         }
@@ -5702,7 +5697,7 @@ impl GroupedLiveQuery {
             None => false,
         };
         if !from_order {
-            CellReader::pull_sorted_into(eng, self.via, g as u64, out);
+            CellReader::pull_into(eng, self.via, g as u64, out);
         }
         if tests.len() <= usize::from(skip.is_some()) {
             return;

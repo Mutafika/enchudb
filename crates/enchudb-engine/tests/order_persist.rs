@@ -2,8 +2,8 @@
 //! 保存され、 開き直すと engine が自分で戻す (中身は最初に読む時に作る)。
 //!
 //! 答えは shadow (書いた値を test の側でも持つ) と、 列を `get` で直接読む走査の 2 経路で比べる。 索引を本当に読んだか
-//! (正の対照: 読んだ回数、 via の紐の円柱を作っていない) と、 宣言しない DB (負の対照: 宣言が戻らない、 `DIA1` を書かない、
-//! 同じ読みで円柱ができる) も見る。
+//! (正の対照: 範囲の find_by で読んだ回数) と、 宣言しない DB (負の対照: 宣言が戻らない、 `DIA1` を書かない、 索引を読まない)
+//! も見る。 範囲の無い `pull` は、 宣言があっても円柱から読む (2 つの並びを書く時に同時に保つ)。
 
 use enchudb_engine::{Engine, GrowableOptions, LivePred, ValueType};
 use std::collections::{BTreeMap, BTreeSet};
@@ -213,9 +213,9 @@ fn reopen(eng: Arc<Engine>, path: &str) -> Arc<Engine> {
     Engine::open(path).unwrap()
 }
 
-/// 宣言は開き直しても戻る。 戻った直後は作っていない (読んだ回数 0)、 最初の読みで作り、 答えは shadow / 列の走査と一致、
-/// via の紐の円柱は作らない。 作る前の書き込み (開き直した直後、 WAL の replay) も見落とさない: 書き込みを 2 回目の
-/// 開き直しの前に WAL に積み、 開き直した後 (replay の後) に初めて読む。
+/// 宣言は開き直しても戻る。 戻った直後は作っていない (読んだ回数 0)、 最初の範囲の読みで作り、 答えは shadow / 列の走査と
+/// 一致。 範囲の無い `pull` は円柱から読む。 作る前の書き込み (開き直した直後、 WAL の replay) も見落とさない: 書き込みを
+/// 2 回目の開き直しの前に WAL に積み、 開き直した後 (replay の後) に初めて読む。
 #[test]
 fn declaration_survives_reopen_and_answers_match() {
     let mut s = create("reopen", 0x5eed_d001, true, 600);
@@ -230,7 +230,7 @@ fn declaration_survives_reopen_and_answers_match() {
     }
     check(&eng, &s, "1 回目の開き直し", true);
     assert!(order_hits(&eng) > 0, "索引を読んでいない");
-    assert_eq!(via_cylinder_bytes(&eng), 0, "宣言した紐の円柱を作った");
+    assert!(via_cylinder_bytes(&eng) > 0, "範囲の無い pull が円柱から読んでいない");
     // 作った後の書き込み、 毎回の答え合わせ
     for round in 0..40 {
         for _ in 0..1 + rng.below(6) {
@@ -247,11 +247,11 @@ fn declaration_survives_reopen_and_answers_match() {
     assert_eq!(order_hits(&eng), 0);
     check(&eng, &s, "2 回目の開き直し (replay の後)", true);
     assert!(order_hits(&eng) > 0);
-    assert_eq!(via_cylinder_bytes(&eng), 0);
+    assert!(via_cylinder_bytes(&eng) > 0);
 }
 
-/// 負の対照: 宣言しない DB は、 開き直しても宣言が無く、 `{db}/tables` に DIA1 を書かず、 同じ読みで円柱ができる
-/// (上の test が 「索引を戻した」 「円柱を作らない」 を見分けられること)。 答えは同じ。
+/// 負の対照: 宣言しない DB は、 開き直しても宣言が無く、 `{db}/tables` に DIA1 を書かず、 同じ読みで索引を読まない
+/// (上の test が 「索引を戻した」 を見分けられること)。 答えは同じ。 範囲の無い `pull` が円柱を作るのは宣言した DB と同じ。
 #[test]
 fn without_declaration_nothing_is_stored() {
     let mut s = create("plain", 0x5eed_d011, false, 600);
@@ -264,7 +264,7 @@ fn without_declaration_nothing_is_stored() {
     }
     check(&eng, &s, "宣言なし", true);
     assert_eq!(order_hits(&eng), 0);
-    assert!(via_cylinder_bytes(&eng) > 0, "対照: 宣言なしの pull が円柱を作っていない");
+    assert!(via_cylinder_bytes(&eng) > 0, "宣言なしの pull が円柱を作っていない");
     eng.persist_tables().unwrap();
     assert!(!has_dia1(&s.path), "宣言の無い DB に DIA1 を書いた");
 }
@@ -308,7 +308,6 @@ fn redeclare_replaces_and_drop_falls_back() {
         check(&eng, &s, &format!("置き換えの後 round {round}"), false);
     }
     assert!(order_hits(&eng) > 0, "新しい索引を読んでいない");
-    assert_eq!(via_cylinder_bytes(&eng), 0, "置き換えで円柱を作った");
     eng.flush_writes();
     assert!(has_dia1(&s.path), "置き換えた宣言を保存していない");
     let eng = reopen(eng, &s.path);
@@ -325,7 +324,7 @@ fn redeclare_replaces_and_drop_falls_back() {
         check(&eng, &s, &format!("外した後 round {round}"), false);
     }
     assert_eq!(order_hits(&eng), 0, "外した索引を読んだ");
-    assert!(via_cylinder_bytes(&eng) > 0, "外した後は円柱で読むはず");
+    assert!(via_cylinder_bytes(&eng) > 0, "外した後も円柱で読むはず");
     assert!(!has_dia1(&s.path), "外した宣言が保存に残っている");
     let eng = reopen(eng, &s.path);
     assert!(eng.order_declarations().is_empty(), "外した宣言が開き直しで戻った");
