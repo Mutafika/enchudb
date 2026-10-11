@@ -89,8 +89,10 @@ jobs:
       # 並びの索引: 置き場の 3 段の表 (葉は CAS で置き、 drop まで動かさない) と bucket の Slot、 drop。
       - name: miri order_index
         run: cargo miri test -p enchudb-engine --lib order_index
+      # 名前は module の道まで書く (`value_locks` だけだと、 write_lock (parking_lot) を取り合う himo_store の test にも当たり、
+      # Linux の Miri が parking_lot_core の futex の呼び方を UB と判定する。 0.32.0 の order_index の段と同じ問題)
       - name: miri value_locks (値の鍵と、 詰め直しの照合が並んだ書き手と data race にならないこと)
-        run: cargo miri test -p enchudb-engine --lib -- value_locks himo_store::tests::compaction_reads
+        run: cargo miri test -p enchudb-engine --lib -- value_locks::tests himo_store::tests::compaction_reads
 
   loom:
     name: loom (interleaving)
