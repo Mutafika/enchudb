@@ -40,7 +40,7 @@
 use crate::append_bucket::AppendBucket;
 use crate::sparse_runs::SparseRuns;
 use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 pub const DENSE_CAP: u32 = 1 << 20;
@@ -63,42 +63,10 @@ const DENSE_FREE_LEN: usize = 1024;
 /// (倍々で伸ばすので、 伸ばした直後は最大 64 B)。
 const DENSE_MIN_FILL: usize = 4;
 
-/// 値の dense での位置: `(配列, 添字)`。 None は dense の窓の外 (常に sparse)。 添字が今の配列の長さ以上なら
-/// その値も sparse にある (module doc)。
-#[inline]
-fn dense_slot(value: u64) -> Option<(usize, usize)> {
-    if value < DENSE_CAP as u64 {
-        Some((LOW, value as usize))
-    } else if value >= MID && value - MID < MID_HALF {
-        Some((POS, (value - MID) as usize))
-    } else if value < MID && MID - 1 - value < MID_HALF {
-        Some((NEG, (MID - 1 - value) as usize))
-    } else {
-        None
-    }
-}
-
-/// `dense_slot` の逆 (配列と添字 → 値)。
-#[inline]
-fn slot_value(k: usize, i: usize) -> u64 {
-    match k {
-        LOW => i as u64,
-        POS => MID + i as u64,
-        _ => MID - 1 - i as u64,
-    }
-}
-
 /// 配列 `k` の添字の上限 (配列はここまでしか伸ばさない)。
 #[inline]
 fn region_cap(k: usize) -> usize {
     if k == LOW { DENSE_CAP as usize } else { MID_HALF as usize }
-}
-
-/// 配列 `k` の添字 `from..to` に当たる値の範囲 (`lo..=hi`、 `from < to`)。
-#[inline]
-fn region_values(k: usize, from: usize, to: usize) -> (u64, u64) {
-    let (a, b) = (slot_value(k, from), slot_value(k, to - 1));
-    (a.min(b), a.max(b))
 }
 
 /// test 用の割り込み点: 名前の一致した 1 回だけ、 登録した処理をこの thread で走らせる。 読み手と書き手の
@@ -217,6 +185,8 @@ pub fn dense_grow_count() -> usize {
 }
 
 pub struct LockFreeCylinder {
+    /// `dense` の 0 番に当たる値 ([`set_low_base`](Self::set_low_base)、 既定 0)。 組んだ後は変わらない。
+    low_base: AtomicU64,
     dense: Atomic<DenseArr>,
     /// `MID` から上 / `MID - 1` から下の値の dense (添字は `dense_slot`)。 使われるまで空。
     dense_pos: Atomic<DenseArr>,
@@ -273,6 +243,7 @@ impl LockFreeCylinder {
         // 確保するのは要素 (空の Slot) だけ。 bucket は値が入った時に作る (#358)
         let init: DenseArr = (0..hint).map(|_| Slot::empty()).collect();
         Self {
+            low_base: AtomicU64::new(0),
             dense: Atomic::new(init),
             dense_pos: Atomic::new(Vec::new()),
             dense_neg: Atomic::new(Vec::new()),
@@ -286,6 +257,58 @@ impl LockFreeCylinder {
             unique_live: AtomicU32::new(0),
             any_removed: AtomicBool::new(false),
         }
+    }
+
+    /// `dense` (0 から上の値の配列) の 0 番に当たる値を `base` にする (既定 0)。 ref の列は指す先の表の eid の
+    /// 始まりにすると、 2^20 より後ろの表を指す ref も dense に置ける (2026-10-11。 表を 3 つ作ると後の表の eid は
+    /// 2^20 の先になり、 その表を指す ref の値は全部 sparse に入って、 会社ごとの読みが遅かった)。 `base` より前の値は
+    /// sparse に置く (答えは同じ)。
+    ///
+    /// **空の索引にだけ** 置ける: `HimoStore` が組む前に write_lock の下で呼ぶ (読み手は組み終わりの flag の
+    /// Release / Acquire の後にしか索引を読まないので、 この値を見る)。 `MID` の上下の窓と重なる `base` は 0 にする。
+    pub fn set_low_base(&self, base: u64) {
+        debug_assert_eq!(self.total.load(Ordering::Relaxed), 0, "set_low_base は空の索引に");
+        let base = if base <= MID - MID_HALF - DENSE_CAP as u64 { base } else { 0 };
+        self.low_base.store(base, Ordering::Relaxed);
+    }
+
+    /// `dense` の 0 番に当たる値 ([`set_low_base`](Self::set_low_base))。
+    pub fn low_base(&self) -> u64 {
+        self.low_base.load(Ordering::Relaxed)
+    }
+
+    /// 値の dense での位置: `(配列, 添字)`。 None は dense の窓の外 (常に sparse)。 添字が今の配列の長さ以上なら
+    /// その値も sparse にある (module doc)。 `LOW` の窓は `low_base` から `DENSE_CAP` 個。
+    #[inline]
+    fn dense_slot(&self, value: u64) -> Option<(usize, usize)> {
+        // value < low_base なら wrapping_sub は大きな数になって窓の外
+        let off = value.wrapping_sub(self.low_base.load(Ordering::Relaxed));
+        if off < DENSE_CAP as u64 {
+            Some((LOW, off as usize))
+        } else if value >= MID && value - MID < MID_HALF {
+            Some((POS, (value - MID) as usize))
+        } else if value < MID && MID - 1 - value < MID_HALF {
+            Some((NEG, (MID - 1 - value) as usize))
+        } else {
+            None
+        }
+    }
+
+    /// `dense_slot` の逆 (配列と添字 → 値)。
+    #[inline]
+    fn slot_value(&self, k: usize, i: usize) -> u64 {
+        match k {
+            LOW => self.low_base.load(Ordering::Relaxed) + i as u64,
+            POS => MID + i as u64,
+            _ => MID - 1 - i as u64,
+        }
+    }
+
+    /// 配列 `k` の添字 `from..to` に当たる値の範囲 (`lo..=hi`、 `from < to`)。
+    #[inline]
+    fn region_values(&self, k: usize, from: usize, to: usize) -> (u64, u64) {
+        let (a, b) = (self.slot_value(k, from), self.slot_value(k, to - 1));
+        (a.min(b), a.max(b))
     }
 
     #[inline]
@@ -329,7 +352,7 @@ impl LockFreeCylinder {
         on_sparse: impl FnOnce(&SparseRuns) -> R,
     ) -> R {
         let guard = epoch::pin();
-        let Some((k, i)) = dense_slot(value) else {
+        let Some((k, i)) = self.dense_slot(value) else {
             return on_sparse(&self.sparse);
         };
         if let Some(b) = self.dense_at(k, i, &guard) {
@@ -346,7 +369,7 @@ impl LockFreeCylinder {
     /// 書き手用: 今 dense に置いている値なら、 その bucket (`Some(None)` = 空の要素)。 書き手は配列を差し替える
     /// 本人なので読み直しは要らない。
     fn writer_dense_at<'g>(&self, value: u64, guard: &'g Guard) -> Option<Option<&'g AppendBucket>> {
-        let (k, i) = dense_slot(value)?;
+        let (k, i) = self.dense_slot(value)?;
         self.dense_at(k, i, guard)
     }
 
@@ -464,7 +487,7 @@ impl LockFreeCylinder {
         let lens = self.lens(&guard);
         for k in [LOW, POS, NEG] {
             let n = if lens[k] < region_cap(k) {
-                let (lo, hi) = region_values(k, lens[k], region_cap(k));
+                let (lo, hi) = self.region_values(k, lens[k], region_cap(k));
                 self.sparse.count_in(lo, hi)
             } else {
                 0
@@ -502,13 +525,13 @@ impl LockFreeCylinder {
                 continue;
             }
             // 範囲 lo..=hi に当たる添字 (配列 k の窓の中だけ)
-            let (wlo, whi) = region_values(k, 0, region_cap(k));
+            let (wlo, whi) = self.region_values(k, 0, region_cap(k));
             let (a, b) = (lo.max(wlo), hi.min(whi));
             if a > b {
                 continue;
             }
             let (i0, i1) = match k {
-                LOW => (a as usize, b as usize),
+                LOW => ((a - wlo) as usize, (b - wlo) as usize),
                 POS => ((a - MID) as usize, (b - MID) as usize),
                 _ => ((MID - 1 - b) as usize, (MID - 1 - a) as usize),
             };
@@ -534,7 +557,7 @@ impl LockFreeCylinder {
         let mut out = self.sparse.range_pairs(lo, hi);
         let guard = epoch::pin();
         let lens = self.lens(&guard);
-        out.retain(|&(v, _)| dense_slot(v).is_none_or(|(k, i)| i >= lens[k]));
+        out.retain(|&(v, _)| self.dense_slot(v).is_none_or(|(k, i)| i >= lens[k]));
         out
     }
 
@@ -558,7 +581,7 @@ impl LockFreeCylinder {
     pub fn insert(&self, eid: u32, value: u64, keep: impl FnMut(u64, u32) -> bool) {
         debug_assert!(value != u64::MAX, "value == u64::MAX is sentinel");
         let guard = epoch::pin();
-        let Some((k, i)) = dense_slot(value) else {
+        let Some((k, i)) = self.dense_slot(value) else {
             // 値の種類数 (unique_count / unique_live) は dense の分だけ数える
             self.sparse.insert(value, eid);
             self.total.fetch_add(1, Ordering::Relaxed);
@@ -614,7 +637,7 @@ impl LockFreeCylinder {
             // 移した値を sparse から消す — 配列を差し替えた**後**で (読み手は配列の長さで置き場所を決める、
             // `with_value`)。 消すのは、 今 dense が覆う値の entry 全部 (移したもの + 古い entry・重複)
             let lens = self.lens(&guard);
-            let removed = self.sparse.rebuild(|v, _| dense_slot(v).is_none_or(|(k2, j)| j >= lens[k2]));
+            let removed = self.sparse.rebuild(|v, _| self.dense_slot(v).is_none_or(|(k2, j)| j >= lens[k2]));
             // 移した entry は dense に数え直しただけ (total のまま)。 残りは古い entry・重複 (stale に数えてある)
             let dropped = removed.saturating_sub(moved);
             self.total.fetch_sub(dropped.min(self.total.load(Ordering::Relaxed)), Ordering::Relaxed);
@@ -638,7 +661,7 @@ impl LockFreeCylinder {
         mut keep: impl FnMut(u64, u32) -> bool,
         guard: &Guard,
     ) -> usize {
-        let (lo, hi) = region_values(k, old_len, new_len);
+        let (lo, hi) = self.region_values(k, old_len, new_len);
         let mut pairs = self.sparse.range_pairs(lo, hi);
         pairs.sort_unstable();
         pairs.dedup();
@@ -647,7 +670,7 @@ impl LockFreeCylinder {
             if (v, e) == skip || !keep(v, e) {
                 continue;
             }
-            let (_, j) = dense_slot(v).expect("配列 k の窓の値");
+            let (_, j) = self.dense_slot(v).expect("配列 k の窓の値");
             let (b, created) = nv[j].get_or_create();
             if created {
                 self.used[k].fetch_add(1, Ordering::Relaxed);
@@ -681,7 +704,7 @@ impl LockFreeCylinder {
         let mut counts: [Vec<u32>; 3] = Default::default();
         let mut n_sparse = 0usize;
         for (_, v) in entries() {
-            match dense_slot(v) {
+            match self.dense_slot(v) {
                 Some((k, i)) => {
                     let c = &mut counts[k];
                     if c.len() <= i {
@@ -726,7 +749,7 @@ impl LockFreeCylinder {
         });
         let mut sparse = Vec::with_capacity(n_sparse);
         for (eid, v) in entries() {
-            match dense_slot(v) {
+            match self.dense_slot(v) {
                 Some((k, i)) if i < lens[k] => {
                     let (b, created) = arrs[k][i].get_or_create_with(counts[k][i] as usize);
                     if created {
@@ -827,7 +850,7 @@ impl LockFreeCylinder {
             churned
         };
         let guard = epoch::pin();
-        let Some((k, i)) = dense_slot(value) else {
+        let Some((k, i)) = self.dense_slot(value) else {
             return sparse_into(out);
         };
         if let Some(b) = self.dense_at(k, i, &guard) {
@@ -923,12 +946,12 @@ impl LockFreeCylinder {
                     .iter()
                     .enumerate()
                     .filter(|(_, s)| s.get().is_some_and(|b| !b.is_empty()))
-                    .map(|(i, _)| slot_value(k, i)),
+                    .map(|(i, _)| self.slot_value(k, i)),
             );
         }
         // dense に移した値 (配列を伸ばした直後に sparse に残っているもの) は 2 度出さない
         let lens = self.lens(&guard);
-        out.extend(self.sparse.values().into_iter().filter(|&v| dense_slot(v).is_none_or(|(k, i)| i >= lens[k])));
+        out.extend(self.sparse.values().into_iter().filter(|&v| self.dense_slot(v).is_none_or(|(k, i)| i >= lens[k])));
         out
     }
 }
@@ -1558,6 +1581,90 @@ mod tests {
     fn dense_len(c: &LockFreeCylinder) -> usize {
         let guard = epoch::pin();
         [LOW, POS, NEG].iter().map(|&k| unsafe { c.arr(k).load(Ordering::Acquire, &guard).deref() }.len()).sum()
+    }
+
+    /// 2026-10-11: dense の窓の始まり (`set_low_base`)。 2^20 より先の値 (後ろの表を指す ref) も、 窓の始まりを
+    /// そこにすれば dense に置ける。 窓の前の値 (別の表を指す ref など) は sparse で、 答えは同じ。 1 件ずつの insert
+    /// (配列を伸ばす・異動で古い entry を残す) と、 まとめて組む `build` の両方。 値の一覧・範囲の読み・件数も。
+    /// 対照: 窓の始まりが 0 なら、 同じ値は全部 sparse。
+    #[test]
+    fn dense_low_base_puts_values_far_beyond_2_20() {
+        let base = 2_000_000u64;
+        let n = if cfg!(miri) { 400u32 } else { 30_000 };
+        // 会社 200 社 (base から) を指す社員。 50 人に 1 人は窓の前の値 (base − 5) を指す
+        let value_of = |e: u32| if e % 50 == 0 { base - 5 } else { base + u64::from(e % 200) };
+        let c = LockFreeCylinder::new(0);
+        c.set_low_base(base);
+        assert_eq!(c.low_base(), base);
+        let cells = Cells::new();
+        for e in 0..n {
+            cells.set(&c, e, value_of(e));
+        }
+        // 異動 (古い entry を残す)
+        for e in (0..n).step_by(7) {
+            cells.set(&c, e, base + 150);
+        }
+        assert!(c.is_dense(base) && c.is_dense(base + 199), "窓の中の値が dense でない");
+        assert!(!c.is_dense(base - 5), "窓の前の値は sparse");
+        let probes = [base - 5, base, base + 1, base + 150, base + 199, base + 200];
+        for v in probes {
+            assert_eq!(pull(&c, &cells, v), cells.eids_of(v), "値 {v}");
+        }
+        assert_eq!(c.slice_len_live(base + 150), cells.eids_of(base + 150).len(), "dense の値ごとの件数");
+        // 今の値の種類 (base + 0 / 50 / 100 は誰も指さない: 50 人に 1 人の窓の前の値と重なるので)
+        let mut want: Vec<u64> = cells.0.borrow().values().copied().collect();
+        want.sort_unstable();
+        want.dedup();
+        assert!(want.contains(&(base - 5)) && want.contains(&(base + 199)) && !want.contains(&base), "前提");
+        let mut got = c.unique_values();
+        got.sort_unstable();
+        assert_eq!(got, want, "値の一覧 (添字 → 値に窓の始まりを足す)");
+        // 範囲: 窓の前から窓の中へまたぐ / 窓の中だけ
+        for (lo, hi) in [(base - 10, base + 3), (base + 100, base + 120)] {
+            let mut r = c.range_raw(lo, hi);
+            r.retain(|&e| cells.0.borrow().get(&e).is_some_and(|&v| (lo..=hi).contains(&v)));
+            r.sort_unstable();
+            r.dedup();
+            let mut w: Vec<u32> = (lo..=hi).flat_map(|v| cells.eids_of(v)).collect();
+            w.sort_unstable();
+            assert_eq!(r, w, "範囲 {lo}..={hi}");
+        }
+        assert_used_matches(&c);
+        // まとめて組む形も同じ
+        let entries: Vec<(u32, u64)> = (0..n).filter_map(|e| cells.0.borrow().get(&e).map(|&v| (e, v))).collect();
+        let b = LockFreeCylinder::new(0);
+        b.set_low_base(base);
+        b.build(|| entries.iter().copied());
+        assert!(b.is_dense(base) && b.is_dense(base + 199) && !b.is_dense(base - 5));
+        for v in probes {
+            let mut r = b.read_to_vec(v);
+            r.sort_unstable();
+            assert_eq!(r, cells.eids_of(v), "組んだ形の値 {v}");
+        }
+        // 対照: 窓の始まりが 0 なら、 同じ値は全部 sparse
+        let z = LockFreeCylinder::new(0);
+        z.build(|| entries.iter().copied());
+        assert!(!z.is_dense(base) && !z.is_dense(base + 199), "対照: 窓の始まり 0 で 2^20 より先の値が dense");
+        let mut r = z.read_to_vec(base + 1);
+        r.sort_unstable();
+        assert_eq!(r, cells.eids_of(base + 1), "対照の答え");
+    }
+
+    /// `set_low_base` は `MID` の上下の窓 (符号付きの値) と重なる始まりを 0 にする。
+    #[test]
+    fn dense_low_base_never_overlaps_the_signed_windows() {
+        let c = LockFreeCylinder::new(0);
+        c.set_low_base(MID - 10);
+        assert_eq!(c.low_base(), 0, "符号付きの窓と重なる始まりを置いた");
+        let d = LockFreeCylinder::new(0);
+        let ok = MID - MID_HALF - DENSE_CAP as u64;
+        d.set_low_base(ok);
+        assert_eq!(d.low_base(), ok);
+        d.insert(1, ok + 3, |_, _| true);
+        d.insert(2, MID - 1, |_, _| true); // 符号付きの -1 = NEG の窓
+        assert!(d.is_dense(ok + 3) && d.is_dense(MID - 1));
+        assert_eq!(d.read_to_vec(ok + 3), vec![1]);
+        assert_eq!(d.read_to_vec(MID - 1), vec![2]);
     }
 
     /// 符号付き 64 bit の符号化 (`v ^ 2^63`) で 0 に近い値は 2 本目・3 本目の dense に入る: 値ごとの件数・種類数を
