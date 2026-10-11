@@ -1290,6 +1290,106 @@ pub mod write_out_hook {
     }
 }
 
+/// test 用の割り込み点: `make_wal_room_inner` が 「満杯でない」 を見た後、 開いている group を閉じる Commit を打つ前。
+/// 書き手の thread の Commit が、 その間に WAL の残りを埋める窓を踏むため。 置いた WAL (番地で見分ける) で 1 回だけ呼ぶ
+/// (並んで走る他の test の engine では呼ばない)。 consumer の thread から呼ばれるので thread local ではない。
+#[cfg(test)]
+mod room_commit_hook {
+    use enchudb_oplog::oplog::OpLog;
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn FnOnce(&OpLog) + Send>;
+    static HOOK: Mutex<Option<(usize, Hook)>> = Mutex::new(None);
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        *HOOK.lock().unwrap_or_else(|p| p.into_inner()) = Some((wal as *const OpLog as usize, Box::new(f)));
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        let me = wal as *const OpLog as usize;
+        let hit = {
+            let mut h = HOOK.lock().unwrap_or_else(|p| p.into_inner());
+            if h.as_ref().is_some_and(|(at, _)| *at == me) { h.take() } else { None }
+        };
+        if let Some((_, f)) = hit {
+            f(wal);
+        }
+    }
+}
+
+/// consumer が WAL を空けに来て、 開いている group を閉じる Commit を打つ前に書き手の Commit が残りを埋める窓 (2026-10-11、
+/// `issue388_wal_backpressure` が数 % で落ちていた)。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod wal_room_commit_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// 畳む直前の Commit を打つ前に WAL が満杯になっても (見てから打つまでの間に、 書き手の thread の Commit が残りを埋める
+    /// 形を、 割り込み点で満杯まで Commit を打って作る):
+    ///
+    /// - 「打てなかった Commit」 に数えない (満杯なら打たなくてよい Commit。 前の形は数えた)
+    /// - 「畳めなかった」 印を付けない (満杯の append の待ち手が consumer 自身 = 畳んでいる最中で何もしなかっただけ。 前の形は
+    ///   印を付け、 外側が畳んだ後も 10 ms の間、 consumer は畳みに行かず、 待っている書き手も諦めた)
+    /// - 外側は畳み、 書いた値は残る
+    #[test]
+    fn room_commit_lost_to_a_full_wal_is_neither_a_failure_nor_a_failed_fold() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-roomcommit-{}-{nanos}.db", std::process::id());
+        let eids: Vec<u64> = {
+            let mut eng = Engine::create_standalone(&path).unwrap();
+            eng.define_himo("v", ValueType::Number, 0);
+            let eids = (0..4_000).map(|_| eng.entity().unwrap()).collect();
+            eng.flush().unwrap();
+            eids
+        };
+        let eng = Engine::open_concurrent_with_oplog(&path, 64 << 10).unwrap();
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_in_hook = fired.clone();
+        room_commit_hook::set(&wal, move |w| {
+            // 書き手の thread の Commit が残りを埋めた形: 満杯 (Commit 1 つも入らない) まで Commit を打つ
+            for _ in 0..1_000_000 {
+                if w.append_dead() {
+                    break;
+                }
+                let _ = w.append(enchudb_oplog::oplog::Op::Commit);
+            }
+            fired_in_hook.store(true, Ordering::Release);
+        });
+        let folds_before = eng.wal_room_folds();
+        // 空きが 1/4 を切るまで書く (consumer が空けに来て、 割り込み点を通る)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut i = 0u32;
+        while !fired.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            eng.tie_to(eids[i as usize % eids.len()], "v", i);
+            i += 1;
+        }
+        assert!(fired.load(Ordering::Acquire), "前提: consumer が WAL を空けに来て割り込み点を通った");
+        // 外側の畳みが終わるまで待つ
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while (eng.wal_room_busy.load(Ordering::Acquire) || eng.wal_room_folds() == folds_before)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(eng.wal_room_folds() > folds_before, "前提: 外側は畳んだ");
+        assert_eq!(eng.wal_commit_failures(), 0, "満杯で打たなかった Commit を 「打てなかった Commit」 に数えた");
+        assert!(
+            eng.wal_room_failed_at.lock().unwrap_or_else(|p| p.into_inner()).is_none(),
+            "入れ子の待ち手が 「畳めなかった」 印を付けた (外側は畳んだ)"
+        );
+        assert_eq!(eng.wal_dropped_records(), 0);
+        // 書いた値は残る (最後に書いた値)
+        eng.flush_writes();
+        let last = i - 1;
+        assert_eq!(eng.get(eids[last as usize % eids.len()], "v"), Some(u64::from(last)));
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// #323 の test 用: create を segment を作った後 (header を書く前) で失敗させる。
@@ -6335,12 +6435,21 @@ impl Engine {
         &self,
         wal: &enchudb_oplog::oplog::OpLog,
     ) -> std::io::Result<()> {
+        self.append_commit_marker_with(wal, true)
+    }
+
+    /// `append_commit_marker` の、 WAL が満杯で打てなかった時を数えるかを選べる版。 `count_full = false` は、 満杯なら
+    /// 打たなくてよい Commit (畳む直前に開いている group を閉じる Commit、 `make_wal_room_inner`) のため: 満杯で落ちたのは
+    /// 打たなかったのと同じで、 「打てなかった Commit」 にも警告にも入れない (満杯以外の失敗は数える)。 Commit は payload 0
+    /// = `REC_HEADER_SIZE` ちょうどなので、 容量 (`OutOfMemory`) で落ちた時は満杯 (`append_dead`) と同値。
+    fn append_commit_marker_with(&self, wal: &enchudb_oplog::oplog::OpLog, count_full: bool) -> std::io::Result<()> {
         use std::sync::atomic::Ordering;
         match wal.append(enchudb_oplog::oplog::Op::Commit) {
             Ok(_) => {
                 self.wal_append_warned.store(false, Ordering::Relaxed);
                 Ok(())
             }
+            Err(e) if !count_full && e.kind() == io::ErrorKind::OutOfMemory => Err(e),
             Err(e) => {
                 self.wal_commit_failures.fetch_add(1, Ordering::Relaxed);
                 if !self.wal_append_warned.swap(true, Ordering::Relaxed) {
@@ -15378,6 +15487,12 @@ impl Engine {
         if self.wal_room_failed_recently() {
             return false;
         }
+        // 畳んでいる最中 = この thread の外側の `make_wal_room` の中の append が満杯で待ち手に来た (`make_wal_room` は consumer
+        // の thread からしか呼ばない)。 外側が畳むので何もしない。 下で 「畳めなかった」 と覚えると、 外側が畳んだ後も 10 ms
+        // の間、 consumer は畳みに行かず、 待っている書き手も諦める (外側が畳めなければ、 外側がここで覚える)
+        if self.wal_room_busy.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
         let folded = self.make_wal_room(wal);
         // 畳めなかったと覚えるのは、 まだ空きが無い時だけ (他の経路が先に畳んでいた = 空いているのは失敗ではない。 覚えると
         // 待っている書き手が 「今は畳めない」 と見て諦める)
@@ -15418,9 +15533,14 @@ impl Engine {
             return false;
         }
         // 開いている group を閉じる。 満杯 (Commit 1 つも入らない) なら打たない — 本体に書き出してから畳むので復旧には
-        // 要らず、 打てば満杯で落ちて 「打てなかった Commit」 に数わる
+        // 要らない。 見た後で、 書き手の thread が直接打つ Commit (`commit` / `oplog_commit`) が残りを埋めることがある (見て
+        // から打つまでの間)。 その時の append は待ち手に回るが、 待ち手は consumer 自身 = 畳んでいる最中 (`wal_room_busy`)
+        // なので空けられずに落ちる。 これも打たなかったのと同じなので数えない (2026-10-11: `issue388_wal_backpressure` が
+        // 数 % で 「打てなかった Commit」 = 1 で落ちていた。 backtrace で、 この Commit だった)
         if !wal.append_dead() {
-            let _ = self.append_commit_marker(wal);
+            #[cfg(test)]
+            room_commit_hook::call(wal);
+            let _ = self.append_commit_marker_with(wal, false);
         }
         // checkpoint を進める前に sidecar を固める (consumer の tick と同じ)
         self.try_persist_tables();
