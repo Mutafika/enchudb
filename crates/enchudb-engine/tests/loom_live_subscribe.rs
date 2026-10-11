@@ -30,11 +30,17 @@
 //! - 開けた後に入った W → W の門に入る RMW が barrier の開ける RMW に同期する → W は `active` を見る
 //!
 //! **lock を取って離すだけの barrier (門を閉じない、 前の形) では、 門を通る W を取りこぼす**
-//! (`subscribe_with_lock_only_barrier_misses_gate_writers`)。 cylinder を組んだ紐 (門は閉じた
-//! まま、 W は lock の道) では、 今の barrier も前の形と同じに働く (`barrier_on_a_closed_gate_never_misses`)。
+//! (`subscribe_with_lock_only_barrier_misses_gate_writers`)。
+//!
+//! ## 値の鍵 (2026-10-11、 `value_locks`)
+//! cylinder を組んだ紐 (門は閉じたまま) の W は、 write_lock を取らずに値ごとの鍵の下で Column を書く
+//! (`HimoStore::set_indexed`)。 barrier は lock を取って門を閉じた後、 全部の鍵も取って離す (`HimoStore::write_guard`):
+//! W の鍵が barrier より先なら W の Column store は R の走査に見え、 後なら barrier の鍵の unlock が W の鍵に同期して W は
+//! `active` を見る (`barrier_on_a_closed_gate_never_misses`)。 **鍵を取らない barrier は、 鍵で書く W を取りこぼす**
+//! (`subscribe_with_barrier_that_skips_value_locks_misses_indexed_writers`)。
 //!
 //! ## model の範囲
-//! 購読 1 本 × 条件 1 個 (`値 == 7`) × eid 1 個。 Column cell / write_lock / 門 (1 shard) /
+//! 購読 1 本 × 条件 1 個 (`値 == 7`) × eid 1 個。 Column cell / write_lock / 門 (1 shard) / 値の鍵 (1 本) /
 //! `active` / 購読 mutex を写す。 route (RwLock<Vec>) は 「`active` > 0 を見たら必ず見える」
 //! ことを registry 側で `active` の Release の前に push することで保証しているので、 model
 //! では `active` に畳む。
@@ -60,8 +66,11 @@ enum Barrier {
     None,
     /// write_lock を取って離すだけ (門を閉じない、 前の形。 門を通る W に対しては対照)。
     LockOnly,
-    /// `HimoStore::write_barrier`: lock → 門を閉じて中の W を待つ → (組んでいなければ) 門を開ける → unlock。
+    /// `HimoStore::write_barrier`: lock → 門を閉じて中の W を待つ → (組んだ紐なら) 全部の鍵を取って離す → (組んで
+    /// いなければ) 門を開ける → unlock。
     Gate,
+    /// 対照: `Gate` から値の鍵を取る所を外した形 (組んだ紐の、 鍵で書く W を取りこぼす)。
+    GateWithoutValueLocks,
 }
 
 struct Model {
@@ -70,8 +79,10 @@ struct Model {
     write_lock: Mutex<()>,
     /// 門 (`WriteGate`、 1 shard)。 閉じた印 | 中に居る W の数。
     gate: AtomicUsize,
-    /// cylinder を組んでいない紐 (門が開く)。 false = 組んだ紐 (門は閉じたまま)。
+    /// cylinder を組んでいない紐 (門が開く)。 false = 組んだ紐 (門は閉じたまま、 W は値の鍵で書く)。
     gate_open: bool,
+    /// 組んだ紐の値の鍵 (`ValueLocks`、 値 1 つなので 1 本)。
+    value_lock: Mutex<()>,
     /// 登録中の購読数。
     active: AtomicUsize,
     /// 購読の membership (条件を満たすか)。 `LiveState::m` に相当。
@@ -85,6 +96,7 @@ impl Model {
             write_lock: Mutex::new(()),
             gate: AtomicUsize::new(if gate_open { 0 } else { CLOSED }),
             gate_open,
+            value_lock: Mutex::new(()),
             active: AtomicUsize::new(0),
             member: Mutex::new(false),
         }
@@ -94,9 +106,13 @@ impl Model {
         self.col.load(Ordering::Acquire) == 7 + 1
     }
 
-    /// `Engine::live_set` → `HimoStore::set` (門か write_lock の下) → `LiveRegistry::touch`。
+    /// `Engine::live_set` → `HimoStore::set` (門か write_lock か値の鍵の下) → `LiveRegistry::touch`。
     fn write(&self, value: usize) {
-        if self.gate.fetch_add(1, Ordering::Acquire) & CLOSED == 0 {
+        if !self.gate_open {
+            // 組んだ紐: 値の鍵の下で書く (`set_indexed`)
+            let _k = self.value_lock.lock().unwrap();
+            self.col.store(value + 1, Ordering::Release);
+        } else if self.gate.fetch_add(1, Ordering::Acquire) & CLOSED == 0 {
             self.col.store(value + 1, Ordering::Release);
             self.gate.fetch_sub(1, Ordering::Release);
         } else {
@@ -117,11 +133,15 @@ impl Model {
         match barrier {
             Barrier::None => {}
             Barrier::LockOnly => drop(self.write_lock.lock().unwrap()),
-            Barrier::Gate => {
+            Barrier::Gate | Barrier::GateWithoutValueLocks => {
                 let g = self.write_lock.lock().unwrap();
                 self.gate.fetch_or(CLOSED, Ordering::AcqRel);
                 while self.gate.load(Ordering::Acquire) & !CLOSED != 0 {
                     loom::thread::yield_now();
+                }
+                if !self.gate_open && barrier == Barrier::Gate {
+                    // 組んだ紐: 全部の鍵を取って離す (鍵の中の W が出るのを待つ)
+                    drop(self.value_lock.lock().unwrap());
                 }
                 if self.gate_open {
                     self.gate.fetch_and(!CLOSED, Ordering::Release);
@@ -155,10 +175,17 @@ fn subscribe_with_barrier_never_misses() {
     run(Barrier::Gate, true);
 }
 
-/// cylinder を組んだ紐 (門は閉じたまま、 W は lock の道) でも取りこぼし無し。
+/// cylinder を組んだ紐 (門は閉じたまま、 W は値の鍵の道) でも取りこぼし無し。
 #[test]
 fn barrier_on_a_closed_gate_never_misses() {
     run(Barrier::Gate, false);
+}
+
+/// 対照: 組んだ紐で値の鍵を取らない barrier は、 鍵で書く W を取りこぼす。
+#[test]
+#[should_panic(expected = "取りこぼし")]
+fn subscribe_with_barrier_that_skips_value_locks_misses_indexed_writers() {
+    run(Barrier::GateWithoutValueLocks, false);
 }
 
 /// barrier を外すと loom が取りこぼしの interleaving を見つける = この model が窓を

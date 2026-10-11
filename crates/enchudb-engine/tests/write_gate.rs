@@ -3,11 +3,13 @@
 //! - 同じ列を何本もの書き手が同時に書き、 同時に列の末尾を伸ばしても、 値は全部残り、 開き直しても読める (列の header の
 //!   count は fetch_max で上げる。 読んでから書く前の形で count が戻るのを捕まえるのは `column` の単体 test — この test は
 //!   前の形でも 5 回とも通った (2026-10-11 実測、 engine の道では終わり際の競合がそろわない))
-//! - 書きながら購読を張り、 途中で円柱を組んでも (門を閉じて以後は write_lock の道)、 止まった後の購読と `pull` は列と一致
+//! - 書きながら購読を張り、 途中で円柱を組んでも (門を閉じて以後は値の鍵の道)、 止まった後の購読と `pull` は列と一致
+//! - 円柱を組んだ紐 (値の鍵で書く、 `value_locks`) を 8 本で書き換え続ける間に、 会社の先の条件と範囲の購読を張る。
+//!   止まった後の購読・`find_by`・値ごとの `pull` が列と一致
 //!
-//! 答えは書き手の写し (shadow) と、 列を `get` で読む走査の 2 経路。 門の約束そのもの (組む側・barrier・並びの索引の構築が
-//! 門の中の書き手を待つこと) は loom model (`loom_lazy_cylinder_build` / `loom_live_subscribe` / `loom_order_index_build`) と
-//! `HimoStore` の単体 test が見る。
+//! 答えは書き手の写し (shadow) と、 列を `get` で読む走査の 2 経路。 門と値の鍵の約束そのもの (組む側・barrier・並びの
+//! 索引の構築が、 門の中と鍵の中の書き手を待つこと) は loom model (`loom_lazy_cylinder_build` / `loom_live_subscribe` /
+//! `loom_order_index_build`) と `HimoStore` の単体 test が見る。
 
 use enchudb_engine::{Engine, GrowableOptions, LiveDelta, LivePred, ValueType};
 use std::collections::BTreeSet;
@@ -133,7 +135,7 @@ fn parallel_writers_while_subscribing_and_building() {
             let q = eng.subscribe(vec![LivePred::Eq { himo_id: age, value: 1 }]).unwrap();
             integrate(&mut seen, q.poll(&eng));
             std::thread::sleep(std::time::Duration::from_millis(1 + round % 3));
-            // 書いている途中で円柱を組む (以後の書き手は write_lock の道)
+            // 書いている途中で円柱を組む (以後の書き手は値の鍵の道)
             let _ = eng.pull("age", 1u32);
             for _ in 0..3 {
                 integrate(&mut seen, q.poll(&eng));
@@ -152,6 +154,119 @@ fn parallel_writers_while_subscribing_and_building() {
         let found: BTreeSet<u64> = eng.find_by(vec![LivePred::Eq { himo_id: age, value: 1 }]).unwrap().into_iter().collect();
         assert_eq!(found, want, "round {round}: find_by が列と違う");
         drop(q);
+        drop(eng);
+        cleanup(&path);
+    }
+}
+
+/// 円柱を組んだ紐の書き手 8 本 (値の鍵で書く): 年齢 (0..60) の書き換えと異動 (会社 0..40) を続ける間に、 社員単位の購読
+/// (会社の city == 1 かつ 30 歳以上) と会社単位の購読を張る。 止まった後の購読の集合・会社単位の flatten・`find_by` が、
+/// 列を `get` で読む走査と一致し、 値ごとの `pull` (年齢・会社) も走査と一致する。
+#[test]
+fn parallel_writers_on_built_cylinders_while_subscribing() {
+    const COMPANIES: u64 = 40;
+    for round in 0..6u64 {
+        let path = tmp_path(&format!("built{round}"));
+        cleanup(&path);
+        let mut eng = Engine::create_growable_opts(&path, GrowableOptions::default()).unwrap();
+        eng.define_himo("company", ValueType::Ref, 0);
+        eng.define_himo("city", ValueType::Number, 4);
+        eng.define_himo("age", ValueType::Number, 0);
+        let (company, city, age) = (
+            eng.himo_id("company").unwrap() as u16,
+            eng.himo_id("city").unwrap() as u16,
+            eng.himo_id("age").unwrap() as u16,
+        );
+        let cs: Vec<u64> = (0..COMPANIES).map(|_| eng.entity().unwrap()).collect();
+        for (i, &c) in cs.iter().enumerate() {
+            eng.tie(c, "city", (i % 2) as u32);
+        }
+        let users: Vec<u64> = (0..4_000).map(|_| eng.entity().unwrap()).collect();
+        let mut rng = Rng(0x5eed ^ round);
+        for &u in &users {
+            eng.tie(u, "company", enchudb_oplog::eid_local(cs[rng.below(COMPANIES) as usize]));
+            eng.tie(u, "age", rng.below(60) as u32);
+        }
+        let eng = Engine::concurrentize(eng);
+        // 書く前に両方の円柱を組む (以後の書き手は値の鍵の道)
+        let _ = eng.pull("age", 30u32);
+        let _ = eng.pull("company", enchudb_oplog::eid_local(cs[0]));
+        let preds = || {
+            vec![
+                LivePred::Via { path: vec![company], pred: Box::new(LivePred::Eq { himo_id: city, value: 1 }) },
+                LivePred::Range { himo_id: age, lo: 30, hi: 1000 },
+            ]
+        };
+        let stop = AtomicBool::new(false);
+        let mut seen = BTreeSet::new();
+        let (q, g) = std::thread::scope(|s| {
+            for t in 0..THREADS as u64 {
+                let (eng, users, cs, stop) = (&eng, &users, &cs, &stop);
+                s.spawn(move || {
+                    let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ (round * 16 + t + 1));
+                    // 書き手ごとに別の社員 (同じ cell の書き手は engine の行の lock で並ぶので、 重ねてもよいが写しを簡単に)
+                    let mine: Vec<u64> = users.iter().copied().skip(t as usize).step_by(THREADS).collect();
+                    while !stop.load(Ordering::Relaxed) {
+                        let u = mine[rng.below(mine.len() as u64) as usize];
+                        if rng.below(5) == 0 {
+                            eng.tie_to(u, "company", enchudb_oplog::eid_local(cs[rng.below(COMPANIES) as usize]));
+                        } else {
+                            eng.tie_to(u, "age", rng.below(60) as u32);
+                        }
+                    }
+                });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let q = eng.subscribe(preds()).unwrap();
+            let g = eng.subscribe_grouped(preds()).unwrap();
+            integrate(&mut seen, q.poll(&eng));
+            for _ in 0..3 {
+                std::thread::sleep(std::time::Duration::from_millis(1 + round % 3));
+                integrate(&mut seen, q.poll(&eng));
+                let _ = g.poll(&eng);
+            }
+            stop.store(true, Ordering::Relaxed);
+            (q, g)
+        });
+        integrate(&mut seen, q.poll(&eng));
+        let _ = g.poll(&eng);
+        let by_local: std::collections::BTreeMap<u64, u64> =
+            cs.iter().map(|&c| (u64::from(enchudb_oplog::eid_local(c)), c)).collect();
+        let want: BTreeSet<u64> = users
+            .iter()
+            .copied()
+            .filter(|&u| {
+                let c = eng.get(u, "company").and_then(|l| by_local.get(&l).copied());
+                c.is_some_and(|c| eng.get(c, "city") == Some(1)) && eng.get(u, "age").is_some_and(|a| a >= 30)
+            })
+            .collect();
+        assert_eq!(seen, want, "round {round}: 社員単位の購読が列と違う");
+        let flat: BTreeSet<u64> = g.flatten(&eng).into_iter().collect();
+        assert_eq!(flat, want, "round {round}: 会社単位の購読が列と違う");
+        let found: BTreeSet<u64> = eng.find_by(preds()).unwrap().into_iter().collect();
+        assert_eq!(found, want, "round {round}: find_by が列と違う");
+        for a in 0..60u32 {
+            let mut got = eng.pull("age", a);
+            got.sort_unstable();
+            let want: Vec<u32> = users
+                .iter()
+                .filter(|&&u| eng.get(u, "age") == Some(u64::from(a)))
+                .map(|&u| enchudb_oplog::eid_local(u))
+                .collect();
+            assert_eq!(got, want, "round {round}: pull(age {a}) が列と違う");
+        }
+        for &c in &cs {
+            let l = enchudb_oplog::eid_local(c);
+            let mut got = eng.pull("company", l);
+            got.sort_unstable();
+            let want: Vec<u32> = users
+                .iter()
+                .filter(|&&u| eng.get(u, "company") == Some(u64::from(l)))
+                .map(|&u| enchudb_oplog::eid_local(u))
+                .collect();
+            assert_eq!(got, want, "round {round}: pull(company {l}) が列と違う");
+        }
+        drop((q, g));
         drop(eng);
         cleanup(&path);
     }

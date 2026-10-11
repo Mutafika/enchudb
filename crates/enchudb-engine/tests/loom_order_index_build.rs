@@ -32,12 +32,19 @@
 //! 書き手を止める (`HimoStore::write_guard`: write_lock を取り、 門を閉じて中の書き手が出るのを待つ)。 なめ終えて
 //! 作った印を立ててから、 門を開けて lock を離す。 開けた後に門に入った書き手は、 開けた RMW と同期するので 「作った」
 //! が見える。 閉じている間に来た書き手は lock の道に回る。 各 test は門が開いている形 (円柱を組んでいない紐) と閉じた
-//! ままの形 (組んだ紐 = 全部の書き手が lock を取る、 前の形) の 2 通りで流す。 **作る側が key の門の中の書き手を待たないと
-//! 壊れる** (`build_that_does_not_wait_for_key_writers_misses_a_move`)。
+//! ままの形 (組んだ紐) の 2 通りで流す。 **作る側が key の門の中の書き手を待たないと壊れる**
+//! (`build_that_does_not_wait_for_key_writers_misses_a_move`)。
+//!
+//! ## 値の鍵 (2026-10-11、 `value_locks`)
+//! 円柱を組んだ紐の書き手は、 write_lock を取らずに値ごとの鍵の下で列を書く (`HimoStore::set_indexed`)。 作る側の
+//! `write_guard` は、 組んだ紐なら全部の鍵も取って、 作り終えるまで持つ。 鍵の中の書き手が出るまで待ち、 放した後に鍵を
+//! 取った書き手は 「作った」 を見る。 門が閉じたままの形 (組んだ紐) では、 書き手は全部この鍵の道を通る。 **作る側が key の
+//! 鍵を取らないと壊れる** (`build_that_skips_key_value_locks_misses_a_move`: 鍵の中の key の書き手が 「作っていない」 を
+//! 見て何もせず、 作る側は書く前の key の列をなめる)。
 //!
 //! ## model の範囲
-//! 列 (`AtomicUsize`、 0 = 値が無い、 それ以外は値 + 1)、 via / key の write_lock と門 (1 shard)、 行の lock (entity
-//! ごと。 本物は eid の下位 bit の stripe)、 宣言の有無 (本物は `LiveRegistry::n_orders`)、 作った印、 置き場所の記録、 置き場ごとの人数を写す。 置き場の鍵は 1 本で写す (本物は値ごとの 64 本で、
+//! 列 (`AtomicUsize`、 0 = 値が無い、 それ以外は値 + 1)、 via / key の write_lock と門 (1 shard) と値の鍵 (1 本)、 行の lock (entity
+//! ごと。 本物は eid の下位 bit の stripe)、 宣言の有無 (本物は `LiveRegistry::n_orders`)、 作った印、 置き場所の記録、 置き場ごとの人数を写す。 置き場の鍵は 1 本で写す (本物は値ごとの 1024 本で、
 //! 2 本取る時は添字の順。 違う値どうしの並びは単体 test が見る)。 bucket の中身 (足すだけの一覧と古い印) は
 //! `loom_append_publish` と単体 test が、 epoch の解放は Miri が見ている。
 //!
@@ -87,10 +94,15 @@ struct Model {
     /// via / key の紐の門 (`WriteGate`、 1 shard)。 閉じた印 | 中に居る書き手の数。
     via_gate: AtomicUsize,
     key_gate: AtomicUsize,
-    /// 円柱を組んでいない紐 (門が開く)。 false = 組んだ紐 (門は閉じたまま、 書き手は全部 lock の道)。
+    /// 円柱を組んでいない紐 (門が開く)。 false = 組んだ紐 (門は閉じたまま、 書き手は全部値の鍵の道)。
     gates_open: bool,
+    /// via / key の紐の値の鍵 (`ValueLocks`、 1 本で写す)。 組んだ紐の書き手と作る側が取る。
+    via_vlock: Mutex<()>,
+    key_vlock: Mutex<()>,
     /// 対照: 作る側が key の門を閉じても中の書き手を待たない。
     key_no_wait: bool,
+    /// 対照: 作る側が key の値の鍵を取らない。
+    key_skip_vlock: bool,
     /// 行の lock (entity ごと)。
     row: Vec<Mutex<()>>,
     /// 宣言してあるか (書き手が見る `LiveRegistry::has_orders` / `orders_on`)。
@@ -115,7 +127,10 @@ impl Model {
             via_gate: AtomicUsize::new(gate),
             key_gate: AtomicUsize::new(gate),
             gates_open,
+            via_vlock: Mutex::new(()),
+            key_vlock: Mutex::new(()),
             key_no_wait: false,
+            key_skip_vlock: false,
             row: init.iter().map(|_| Mutex::new(())).collect(),
             declared: AtomicBool::new(true),
             built: AtomicBool::new(false),
@@ -152,8 +167,14 @@ impl Model {
         self.place(e);
     }
 
-    /// `HimoStore::set`: 門が開いていれば門の中で列を書き (write_lock を取らない)、 閉じていれば write_lock の下で書く。
-    fn store(cell: &AtomicUsize, x: usize, gate: &AtomicUsize, lock: &Mutex<()>) {
+    /// `HimoStore::set`: 組んだ紐は値の鍵の下で列を書く (`set_indexed`)。 組んでいなければ、 門が開いていれば門の中で
+    /// 列を書き (write_lock を取らない)、 閉じていれば write_lock の下で書く。
+    fn store(&self, cell: &AtomicUsize, x: usize, gate: &AtomicUsize, lock: &Mutex<()>, vlock: &Mutex<()>) {
+        if !self.gates_open {
+            let _k = vlock.lock().unwrap();
+            cell.store(x, Ordering::Release);
+            return;
+        }
         if gate.fetch_add(1, Ordering::Acquire) & CLOSED == 0 {
             cell.store(x, Ordering::Release);
             gate.fetch_sub(1, Ordering::Release);
@@ -168,14 +189,14 @@ impl Model {
     /// (`HimoStore::set`)、 書いた後に note。
     fn write_via(&self, e: usize, v: usize) {
         let _row = self.row[e].lock().unwrap();
-        Self::store(&self.via[e], v, &self.via_gate, &self.via_lock);
+        self.store(&self.via[e], v, &self.via_gate, &self.via_lock, &self.via_vlock);
         self.note(e);
     }
 
     /// key の書き手: 行の lock の下で、 列は key の門か write_lock の下で書き、 書いた後に note。
     fn write_key(&self, e: usize, k: usize) {
         let _row = self.row[e].lock().unwrap();
-        Self::store(&self.key[e], k, &self.key_gate, &self.key_lock);
+        self.store(&self.key[e], k, &self.key_gate, &self.key_lock, &self.key_vlock);
         self.note(e);
     }
 
@@ -203,8 +224,11 @@ impl Model {
         // 待つ)。 key の lock を外すと key の書き手が居る 3 本が落ちる
         let w = self.via_lock.lock().unwrap();
         Self::close(&self.via_gate, true);
+        // 組んだ紐なら全部の鍵も (鍵の中の書き手が出るのを待ち、 作り終えるまで持つ)
+        let wv = (!self.gates_open).then(|| self.via_vlock.lock().unwrap());
         let k = self.key_lock.lock().unwrap();
         Self::close(&self.key_gate, !self.key_no_wait);
+        let kv = (!self.gates_open && !self.key_skip_vlock).then(|| self.key_vlock.lock().unwrap());
         if !self.built.load(Ordering::Acquire) {
             for e in 0..self.via.len() {
                 if self.via[e].load(Ordering::Acquire) != 0 {
@@ -213,10 +237,12 @@ impl Model {
             }
             self.built.store(true, Ordering::Release);
         }
-        // guard の drop は key → via の順 (門を開けてから lock を離す)
+        // guard の drop は key → via の順 (門を開けてから、 鍵と lock を離す)
         self.reopen(&self.key_gate);
+        drop(kv);
         drop(k);
         self.reopen(&self.via_gate);
+        drop(wv);
         drop(w);
     }
 
@@ -237,7 +263,7 @@ impl Model {
     }
 }
 
-/// 門が開いている形 (円柱を組んでいない紐) と、 閉じたままの形 (組んだ紐 = 書き手は全部 lock の道) の両方で流す。
+/// 門が開いている形 (円柱を組んでいない紐) と、 閉じたままの形 (組んだ紐 = 書き手は全部値の鍵の道) の両方で流す。
 fn both(f: impl Fn(bool) + Sync + Send + 'static) {
     let f = std::sync::Arc::new(f);
     for open in [true, false] {
@@ -366,6 +392,30 @@ fn build_that_does_not_wait_for_key_writers_misses_a_move() {
         // 社員 0: 会社 1、 25 歳 (帯 1) → 40 歳 (帯 2)
         let mut m = Model::new(&[(2, 26)], true);
         m.key_no_wait = true;
+        let m = Arc::new(m);
+        let w = {
+            let m = m.clone();
+            loom::thread::spawn(move || m.write_key(0, 41))
+        };
+        let r = {
+            let m = m.clone();
+            loom::thread::spawn(move || m.ensure_ready())
+        };
+        w.join().unwrap();
+        r.join().unwrap();
+        m.assert_matches_columns();
+    });
+}
+
+/// 対照: 組んだ紐で作る側が key の値の鍵を取らないと、 鍵の中の key の書き手は 「作っていない」 を見て何もせず、
+/// 作る側は書く前の key の列をなめて印を立てる → 古い帯のまま残る。
+#[test]
+#[should_panic(expected = "置き場所が今の値と違う")]
+fn build_that_skips_key_value_locks_misses_a_move() {
+    loom::model(|| {
+        // 社員 0: 会社 1、 25 歳 (帯 1) → 40 歳 (帯 2)。 組んだ紐 (門は閉じたまま)
+        let mut m = Model::new(&[(2, 26)], false);
+        m.key_skip_vlock = true;
         let m = Arc::new(m);
         let w = {
             let m = m.clone();

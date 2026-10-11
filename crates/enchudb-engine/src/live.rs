@@ -193,13 +193,14 @@
 //!
 //! 登録と並行する書き込みの取りこぼしは、 登録側が 「購読を route に載せる → 条件の全紐の
 //! 書き手を 1 度止めて放す (barrier、 `HimoStore::write_barrier`: write_lock を取り、 門を閉じて
-//! 中の書き手が出るのを待ち、 門を開けて lock を離す) → 初期候補を数える」 の順で塞ぐ:
+//! 中の書き手が出るのを待ち、 円柱を組んだ紐なら全部の値の鍵も取り、 鍵を離して門を開けて lock を離す) →
+//! 初期候補を数える」 の順で塞ぐ:
 //!
-//! - 書き込み W の lock (円柱を組んでいない紐は門に入るの) が barrier より先 → barrier は W が
-//!   lock を離す (門を出る) のを待つので、 W の Column 書き込みは初期候補の走査に見える
+//! - 書き込み W の lock (円柱を組んでいない紐は門に入るの、 組んだ紐は値の鍵) が barrier より先 → barrier は
+//!   W が lock を離す (門を出る、 鍵を離す) のを待つので、 W の Column 書き込みは初期候補の走査に見える
 //! - W の lock が barrier より後 → barrier の unlock が W の lock に同期するので、 W は
 //!   route 上の購読を必ず見て印を付ける。 門に入るのが後なら、 W の門に入る RMW が barrier の
-//!   門を開ける RMW に同期する (閉じている間に来た W は lock の道に回る)
+//!   門を開ける RMW に同期する (閉じている間に来た W は lock の道に回る)。 値の鍵も同じ (鍵の受け渡し)
 //!
 //! **この保証は lock 順序が根拠であって、 並行 test の緑が根拠ではない** — 実コードの並行
 //! test は barrier を外しても落ちなかった (10 run 中 0 回)。 barrier の gate は loom model
@@ -4437,7 +4438,7 @@ impl LiveRegistry {
         }
     }
 
-    /// Column の `(himo_id, eid)` を書き換えた **後** (himo の write_lock を離した後 / 門を出た後) に呼ぶ。
+    /// Column の `(himo_id, eid)` を書き換えた **後** (himo の write_lock を離した後 / 門を出た後 / 値の鍵を離した後) に呼ぶ。
     /// 評価はしない — 印を付けるだけ。
     #[inline]
     pub(crate) fn touch(&self, himo_id: u16, eid: u32) {

@@ -88,6 +88,8 @@ pub mod row_lock;
 pub(crate) mod publish_gate;
 // 円柱を組んでいない紐の書き手は紐の write_lock を取らずに門を通る (組む側・barrier は門を閉じて中の書き手を待つ)。
 pub(crate) mod write_gate;
+// 円柱を組んだ紐の書き手は紐の write_lock を取らずに値ごとの鍵で書く (違う値の書き手どうしは並ばない)。
+pub(crate) mod value_locks;
 #[cfg(test)]
 mod tests_issue131;
 // Transport implementations moved to `enchu-transport` crate.
