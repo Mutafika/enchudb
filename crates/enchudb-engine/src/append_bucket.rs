@@ -282,6 +282,20 @@ impl AppendBucket {
         (v, f || p2 != p1)
     }
 
+    /// [`read_snapshot_verify`](Self::read_snapshot_verify) の、 呼び手の buffer の後ろに足す版 (多くの bucket を
+    /// 続けて読む時に、 bucket ごとの Vec を作らない)。 3 段の順序は同じ。
+    pub fn read_snapshot_verify_into(&self, guard: &Guard, out: &mut Vec<u32>) -> bool {
+        let p1 = self.backing.load(Ordering::Acquire, guard);
+        // SAFETY: backing は常に非 null。
+        let b = unsafe { p1.deref() };
+        let n = b.len.load(Ordering::Acquire);
+        // SAFETY: [0..n] は publish 済み = 不変。 guard が backing を生存させる。
+        out.extend_from_slice(unsafe { b.published(n) });
+        let f = self.removed.load(Ordering::Acquire);
+        let p2 = self.backing.load(Ordering::Acquire, guard);
+        f || p2 != p1
+    }
+
     /// 現在の publish 済み件数（lock-free）。
     pub fn len(&self) -> usize {
         let guard = epoch::pin();

@@ -2207,6 +2207,17 @@ impl GroupedLiveQuery {
         self.inner.members(&self.eng, group)
     }
 
+    /// 複数の group の [`members`](Self::members) をまとめて引く (返り値は `groups` と同じ並び)。 group が
+    /// 多い時 (poll の `added` をまとめて引く時など) は 1 つずつ引くより速い。
+    pub fn members_many(&self, groups: &[EntityId]) -> Vec<Vec<EntityId>> {
+        self.inner.members_many(&self.eng, groups)
+    }
+
+    /// `group` の [`members`](Self::members) の数 (列は作らない)。 今条件を満たさない group は 0。
+    pub fn count_in(&self, group: EntityId) -> usize {
+        self.inner.count_in(&self.eng, group)
+    }
+
     /// 平らにした結果の件数 (= 同じ条件の `find()?.len()`)。
     pub fn count(&self) -> usize {
         self.inner.count(&self.eng)

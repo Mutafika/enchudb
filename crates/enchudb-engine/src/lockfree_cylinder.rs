@@ -810,6 +810,41 @@ impl LockFreeCylinder {
         )
     }
 
+    /// [`read_to_vec_verify`](Self::read_to_vec_verify) の、 呼び手の buffer の後ろに足す版 (多くの値を続けて
+    /// 読む時に、 値ごとの Vec を作らない)。 読み方は [`with_value`](Self::with_value) と同じで、 sparse を読んだ後に
+    /// 値が dense に移っていたら、 足した分を捨てて dense を読み直す。 返り値 = 足した分が Column verify を要するか。
+    pub fn read_into_verify(&self, value: u64, out: &mut Vec<u32>) -> bool {
+        let start = out.len();
+        let sparse_into = |out: &mut Vec<u32>| {
+            // 古い entry の有無は **読む前** に見る (`sparse_churned_before_read`)
+            let churned = self.sparse_churned_before_read();
+            self.sparse.lookup_into(value, out);
+            hook::at("sparse_after_lookup");
+            // run ごとに eid 順なので並べ直す (dense の bucket と同じく eid の昇順で返す)
+            if out.len() - start > 1 {
+                out[start..].sort_unstable();
+            }
+            churned
+        };
+        let guard = epoch::pin();
+        let Some((k, i)) = dense_slot(value) else {
+            return sparse_into(out);
+        };
+        if let Some(b) = self.dense_at(k, i, &guard) {
+            return b.is_some_and(|b| b.read_snapshot_verify_into(&guard, out));
+        }
+        hook::at("reader_missed_dense");
+        let r = sparse_into(out);
+        hook::at("reader_read_sparse");
+        match self.dense_at(k, i, &guard) {
+            Some(b) => {
+                out.truncate(start);
+                b.is_some_and(|b| b.read_snapshot_verify_into(&guard, out))
+            }
+            None => r,
+        }
+    }
+
     /// value の bucket 長（raw、 stale 込み）。診断用 (planner は `slice_len_live` へ移行)。
     #[allow(dead_code)]
     pub fn slice_len(&self, value: u64) -> usize {
@@ -1280,24 +1315,58 @@ mod tests {
 
     /// sparse の読みは古い entry の有無を **読む前** に見る: 読んだ直後 (割り込み点 `sparse_after_lookup`) に書き手が
     /// sparse を組み直して数を 0 に戻しても、 読んだ版にあった古い entry を確かめずに返さない。 読んだ後に見る形だと、
-    /// 組み直した後の 0 を見て、 もう別の値に移った entity を live として返していた。
+    /// 組み直した後の 0 を見て、 もう別の値に移った entity を live として返していた。 `read_into_verify` も同じ。
     #[test]
     fn sparse_reader_checks_stale_before_reading() {
-        let c = std::rc::Rc::new(LockFreeCylinder::new(0));
-        let cells = std::rc::Rc::new(Cells::new());
-        let far = 5_000_000u64; // DENSE_CAP 以上 = sparse
-        cells.set(&c, 0, far);
-        cells.set(&c, 1, far);
-        cells.set(&c, 0, far + 1); // 0 は far を出た: far に古い entry が残る
-        assert!(c.sparse_churned(), "前提: 古い entry がある");
-        let (c2, k2) = (c.clone(), cells.clone());
-        hook::set("sparse_after_lookup", move || {
-            c2.compact_sparse(k2.keep());
-        });
-        let (raw, verify) = c.read_to_vec_verify(far);
-        assert!(!c.sparse_churned(), "前提: 読む間に組み直した");
-        assert!(verify || !raw.contains(&0), "古い entry (0) を確かめずに返した: {raw:?}");
-        assert_eq!(pull(&c, &cells, far), vec![1]);
+        for read_into in [false, true] {
+            let c = std::rc::Rc::new(LockFreeCylinder::new(0));
+            let cells = std::rc::Rc::new(Cells::new());
+            let far = 5_000_000u64; // DENSE_CAP 以上 = sparse
+            cells.set(&c, 0, far);
+            cells.set(&c, 1, far);
+            cells.set(&c, 0, far + 1); // 0 は far を出た: far に古い entry が残る
+            assert!(c.sparse_churned(), "前提: 古い entry がある");
+            let (c2, k2) = (c.clone(), cells.clone());
+            hook::set("sparse_after_lookup", move || {
+                c2.compact_sparse(k2.keep());
+            });
+            let (raw, verify) = if read_into {
+                let mut out = Vec::new();
+                let v = c.read_into_verify(far, &mut out);
+                (out, v)
+            } else {
+                c.read_to_vec_verify(far)
+            };
+            assert!(!c.sparse_churned(), "前提: 読む間に組み直した (read_into={read_into})");
+            assert!(verify || !raw.contains(&0), "古い entry (0) を確かめずに返した (read_into={read_into}): {raw:?}");
+            assert_eq!(pull(&c, &cells, far), vec![1]);
+        }
+    }
+
+    /// `read_into_verify` も同じ: sparse を読んだ後で dense へ移った値を見落とさず、 sparse で足した分は捨てて
+    /// 読み直す (2 度足さない)。 呼び手が先に積んでいた分には触らない。
+    #[test]
+    fn dense_reader_into_rechecks_after_values_move_out_of_sparse() {
+        let (c, far) = ready_to_grow();
+        let w = c.clone();
+        hook::set("reader_missed_dense", move || trigger(&w, far));
+        let mut out = vec![7, 7, 7];
+        c.read_into_verify(far, &mut out);
+        assert_eq!(&out[..3], &[7, 7, 7], "先に積んであった分を変えた");
+        assert_eq!(out.len() - 3, 501, "dense へ移った値を見落とした / sparse の分と 2 度足した: {} 件", out.len() - 3);
+        let mut got = out[3..].to_vec();
+        got.sort_unstable();
+        got.dedup();
+        assert_eq!(got.len(), 501, "重複がある");
+
+        // sparse を読んだ **後** に dense へ移る (読み直す前): sparse で足した 500 件を捨ててから dense を読む
+        let (c, far) = ready_to_grow();
+        let w = c.clone();
+        hook::set("reader_read_sparse", move || trigger(&w, far));
+        let mut out = vec![7, 7, 7];
+        c.read_into_verify(far, &mut out);
+        assert_eq!(&out[..3], &[7, 7, 7], "先に積んであった分を変えた");
+        assert_eq!(out.len() - 3, 501, "sparse で足した分を捨てずに dense も足した: {} 件", out.len() - 3);
     }
 
     /// #373: 配列を伸ばした直後 (sparse から消す前) は、 移した値が dense と sparse の両方にある。 その間に値を

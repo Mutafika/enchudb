@@ -16248,6 +16248,11 @@ impl crate::live::CellReader for Engine {
             None => Vec::new(),
         }
     }
+    fn pull_into(&self, himo_id: u16, value: u64, out: &mut Vec<u32>) {
+        if let Some(h) = self.himos.get(himo_id as usize) {
+            h.pull_into(value, out);
+        }
+    }
     fn with_himo(&self, himo_id: u16) -> Vec<u32> {
         match self.himos.get(himo_id as usize) {
             Some(h) => h.entities_with_value(),

@@ -566,6 +566,10 @@ pub(crate) trait CellReader {
     }
     /// `himo_id` の値が `value` である entity (常設逆引き索引)。
     fn pull(&self, himo_id: u16, value: u64) -> Vec<u32>;
+    /// `pull(himo_id, value)` を `out` の後ろに足す (多くの値を続けて引く時に、 値ごとの Vec を作らない)。
+    fn pull_into(&self, himo_id: u16, value: u64, out: &mut Vec<u32>) {
+        out.extend(self.pull(himo_id, value));
+    }
     /// `himo_id` に何か値を持つ entity。
     fn with_himo(&self, himo_id: u16) -> Vec<u32>;
     /// `himo_id` の値が `lo..=hi` の entity (順不同)。
@@ -4756,6 +4760,27 @@ impl LiveQuery {
         s.members[slot].as_ref().is_some_and(|m| m.has(e, s.view(e)))
     }
 
+    /// 複数の eid について [`contains`](Self::contains) (lock と settle は 1 回)。
+    pub(crate) fn contains_many(&self, eng: &crate::engine::Engine, eids: &[EntityId]) -> Vec<bool> {
+        self.check_engine(eng);
+        let (family, slot) = match &self.kind {
+            Kind::One { family, slot } => (family, *slot),
+            Kind::Any(u) => {
+                let st = self.settle_union(u, eng);
+                return eids.iter().map(|&eid| st.has(enchudb_oplog::eid_local(eid))).collect();
+            }
+        };
+        let mut s = family.settled.lock();
+        family.settle(eng, &mut s);
+        let Some(m) = s.members[slot].as_ref() else { return vec![false; eids.len()] };
+        eids.iter()
+            .map(|&eid| {
+                let e = enchudb_oplog::eid_local(eid);
+                m.has(e, s.view(e))
+            })
+            .collect()
+    }
+
     /// 現在の結果全体 (eid 昇順)。 poll の状態は変えない。
     pub fn members(&self, eng: &crate::engine::Engine) -> Vec<EntityId> {
         self.check_engine(eng);
@@ -5179,6 +5204,56 @@ fn matches_leaf(r: &impl CellReader, p: &LivePred, e: u32) -> bool {
     }
 }
 
+/// 根への単一紐条件を、 多くの entity に当てる前に 1 回だけ組み立てたもの ([`matches_leaf`] と同じ答え)。
+/// 語の条件 (`EqText`) は組み立てる時に 1 回だけ辞書を引き、 `In` は整列して二分探索にする。 中身を数える
+/// 条件 (`Exists` 系) は今まで通り 1 entity ずつ解釈する。
+enum RootTest {
+    Eq(u16, u64),
+    /// まだ辞書に無い語の `EqText` (どの entity も満たさない)
+    Never,
+    Range(u16, u64, u64),
+    /// 昇順・重複なし
+    In(u16, Vec<u64>),
+    Present(u16),
+    Not(Box<RootTest>),
+    Other(LivePred),
+}
+
+impl RootTest {
+    fn new(r: &impl CellReader, p: &LivePred) -> Self {
+        match p {
+            LivePred::Eq { himo_id, value } => RootTest::Eq(*himo_id, *value),
+            LivePred::EqText { himo_id, text } => match r.vocab_lookup(text) {
+                Some(v) => RootTest::Eq(*himo_id, v as u64),
+                None => RootTest::Never,
+            },
+            LivePred::Range { himo_id, lo, hi } => RootTest::Range(*himo_id, *lo, *hi),
+            LivePred::In { himo_id, values } => {
+                let mut vs = values.clone();
+                vs.sort_unstable();
+                vs.dedup();
+                RootTest::In(*himo_id, vs)
+            }
+            LivePred::Present { himo_id } => RootTest::Present(*himo_id),
+            LivePred::Not(p) => RootTest::Not(Box::new(RootTest::new(r, p))),
+            p => RootTest::Other(p.clone()),
+        }
+    }
+
+    #[inline]
+    fn holds(&self, r: &impl CellReader, e: u32) -> bool {
+        match self {
+            RootTest::Eq(h, v) => r.cell(*h, e) == Some(*v),
+            RootTest::Never => false,
+            RootTest::Range(h, lo, hi) => matches!(r.cell(*h, e), Some(v) if *lo <= v && v <= *hi),
+            RootTest::In(h, vs) => matches!(r.cell(*h, e), Some(v) if vs.binary_search(&v).is_ok()),
+            RootTest::Present(h) => r.cell(*h, e).is_some(),
+            RootTest::Not(t) => !t.holds(r, e),
+            RootTest::Other(p) => matches_leaf(r, p, e),
+        }
+    }
+}
+
 /// ref をたどる条件の結果を **group (ref の 1 段目の先の entity) 単位** で持つ live query。
 ///
 /// 例: 「所属会社の所在地が東京の社員」 を、 差分は 「東京になった会社 / 東京でなくなった会社」、
@@ -5218,38 +5293,118 @@ impl GroupedLiveQuery {
         if !self.inner.contains(eng, group) {
             return Vec::new();
         }
-        self.members_of(eng, enchudb_oplog::eid_local(group))
-    }
-
-    fn members_of(&self, eng: &crate::engine::Engine, g: u32) -> Vec<EntityId> {
-        let peer = self.inner.registry.peer.load(Ordering::Acquire);
-        let mut out: Vec<u32> = CellReader::pull(eng, self.via, g as u64);
-        out.retain(|&e| self.filter.iter().all(|p| matches_leaf(eng, p, e)));
+        let mut out = self.members_one(eng, enchudb_oplog::eid_local(group));
         out.sort_unstable();
-        out.into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect()
+        self.eids_of(&out)
     }
 
-    /// 平らにした結果の件数。 根への条件が無ければ group ごとの逆引きの件数の和 (group 数に比例)、
-    /// あれば members を数える。
-    pub fn count(&self, eng: &crate::engine::Engine) -> usize {
-        let groups = self.inner.members(eng);
-        if self.filter.is_empty() {
-            groups.iter().map(|&g| CellReader::pull_len(eng, self.via, enchudb_oplog::eid_local(g) as u64)).sum()
-        } else {
-            groups.iter().map(|&g| self.members_of(eng, enchudb_oplog::eid_local(g)).len()).sum()
+    /// 複数の group の [`members`](Self::members) をまとめて引く (返り値は `groups` と同じ並び)。 「今条件を
+    /// 満たすか」 の確認 (lock と settle) は全部で 1 回、 根への条件の組み立ても 1 回、 一覧を読む buffer は
+    /// 使い回す。 小さい group が多い時の 1 group ごとの手間を減らす。
+    pub fn members_many(&self, eng: &crate::engine::Engine, groups: &[EntityId]) -> Vec<Vec<EntityId>> {
+        let live = self.inner.contains_many(eng, groups);
+        let tests = self.tests(eng);
+        let mut buf = Vec::new();
+        groups
+            .iter()
+            .zip(live)
+            .map(|(&g, ok)| {
+                if !ok {
+                    return Vec::new();
+                }
+                buf.clear();
+                self.members_into(eng, enchudb_oplog::eid_local(g), &tests, &mut buf);
+                buf.sort_unstable();
+                self.eids_of(&buf)
+            })
+            .collect()
+    }
+
+    /// `group` の [`members`](Self::members) の数 (列は作らない)。 `group` が今条件を満たしていなければ 0。
+    pub fn count_in(&self, eng: &crate::engine::Engine, group: EntityId) -> usize {
+        if !self.inner.contains(eng, group) {
+            return 0;
         }
+        let g = enchudb_oplog::eid_local(group);
+        if self.filter.is_empty() {
+            return CellReader::pull_len(eng, self.via, g as u64);
+        }
+        self.members_one(eng, g).len()
     }
 
-    /// 平らにした結果全体 (eid 昇順)。
-    pub fn flatten(&self, eng: &crate::engine::Engine) -> Vec<EntityId> {
-        let mut out: Vec<EntityId> = self
-            .inner
+    /// 平らにした結果の件数。 根への条件が無ければ group ごとの逆引きの件数の和、 あれば group ごとに
+    /// 一覧を読んで数える (buffer は使い回し、 列は作らない)。 どちらも group 数に比例する。
+    pub fn count(&self, eng: &crate::engine::Engine) -> usize {
+        let tests = self.tests(eng);
+        let mut buf = Vec::new();
+        self.inner
             .members(eng)
-            .into_iter()
-            .flat_map(|g| self.members_of(eng, enchudb_oplog::eid_local(g)))
-            .collect();
+            .iter()
+            .map(|&g| self.count_of(eng, enchudb_oplog::eid_local(g), &tests, &mut buf))
+            .sum()
+    }
+
+    /// 平らにした結果全体 (eid 昇順)。 全 group の一覧を 1 本の buffer に読み、 最後に 1 回だけ並べる。
+    pub fn flatten(&self, eng: &crate::engine::Engine) -> Vec<EntityId> {
+        let tests = self.tests(eng);
+        let mut out = Vec::new();
+        for g in self.inner.members(eng) {
+            self.members_into(eng, enchudb_oplog::eid_local(g), &tests, &mut out);
+        }
         out.sort_unstable();
+        // 1 entity の ref は 1 つなので、 止まっている時は重ならない。 並行の付け替えで 2 つの group の一覧に
+        // 同時に見えた entity は 1 回にする
+        out.dedup();
+        self.eids_of(&out)
+    }
+
+    /// 根への条件を組み立てる (語の条件は辞書を 1 回だけ引く)。 多くの group を続けて読む時に使う (1 つだけ読む時は
+    /// 組み立てる手間の方が大きいので [`members_one`](Self::members_one))。
+    fn tests(&self, eng: &crate::engine::Engine) -> Vec<RootTest> {
+        self.filter.iter().map(|p| RootTest::new(eng, p)).collect()
+    }
+
+    /// group `g` (local eid) の members を 1 つだけ読む (順不同)。 条件は組み立てずに [`matches_leaf`] で当てる
+    /// (0.31.4 までの `members_of` と同じ読み方)。
+    fn members_one(&self, eng: &crate::engine::Engine, g: u32) -> Vec<u32> {
+        let mut out = CellReader::pull(eng, self.via, g as u64);
+        if !self.filter.is_empty() {
+            out.retain(|&e| self.filter.iter().all(|p| matches_leaf(eng, p, e)));
+        }
         out
+    }
+
+    /// group `g` (local eid) を指していて `tests` を満たす entity を `out` の後ろに足す (順不同)。
+    fn members_into(&self, eng: &crate::engine::Engine, g: u32, tests: &[RootTest], out: &mut Vec<u32>) {
+        let start = out.len();
+        CellReader::pull_into(eng, self.via, g as u64, out);
+        if tests.is_empty() {
+            return;
+        }
+        let mut w = start;
+        for r in start..out.len() {
+            let e = out[r];
+            if tests.iter().all(|t| t.holds(eng, e)) {
+                out[w] = e;
+                w += 1;
+            }
+        }
+        out.truncate(w);
+    }
+
+    /// group `g` (local eid) の members の数。 `buf` は読むための使い回しの buffer。
+    fn count_of(&self, eng: &crate::engine::Engine, g: u32, tests: &[RootTest], buf: &mut Vec<u32>) -> usize {
+        if tests.is_empty() {
+            return CellReader::pull_len(eng, self.via, g as u64);
+        }
+        buf.clear();
+        self.members_into(eng, g, tests, buf);
+        buf.len()
+    }
+
+    fn eids_of(&self, local: &[u32]) -> Vec<EntityId> {
+        let peer = self.inner.registry.peer.load(Ordering::Acquire);
+        local.iter().map(|&e| enchudb_oplog::make_eid(peer, e)).collect()
     }
 
     /// 未 poll の group の変化がありうるか。

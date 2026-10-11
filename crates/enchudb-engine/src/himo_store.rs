@@ -581,6 +581,36 @@ impl HimoStore {
         }
     }
 
+    /// [`pull`](Self::pull) の、 呼び手の buffer の後ろに足す版 (多くの値を続けて引く時に、 値ごとの Vec を
+    /// 作らない)。 足した分の並びと verify は `pull` と同じ (verify した bucket だけ eid の昇順・重複なし)。
+    pub fn pull_into(&self, value: impl CellValue, out: &mut Vec<u32>) {
+        let Some(value) = value.cell_value() else { return };
+        self.ensure_cylinder_built();
+        let start = out.len();
+        if self.cyl.read_into_verify(value, out) {
+            // lazy verify: Column で現在値を確認、churn 由来の dup を除去 (足した分だけ、 その場で)
+            let col = self.col();
+            let mut w = start;
+            for r in start..out.len() {
+                let eid = out[r];
+                if stored_at(col, eid) == value + 1 {
+                    out[w] = eid;
+                    w += 1;
+                }
+            }
+            out.truncate(w);
+            out[start..].sort_unstable();
+            let mut w = start;
+            for r in start..out.len() {
+                if w == start || out[r] != out[w - 1] {
+                    out[w] = out[r];
+                    w += 1;
+                }
+            }
+            out.truncate(w);
+        }
+    }
+
     /// 値が `lo..=hi` の entity (eid の昇順・重複なし)。 索引の範囲 (dense は bucket を範囲の分、 大きな値は
     /// run の二分探索) を Column の現在値で確かめる。
     pub fn pull_range(&self, lo: u64, hi: u64) -> Vec<u32> {
@@ -800,6 +830,48 @@ mod tests {
         let mut got = hs.pull(7);
         got.sort_unstable();
         assert_eq!(got, vec![0, 1, 3, 4], "build 後の write が index に入っていない");
+    }
+
+    /// `pull_into` は `pull` と同じ entity を (呼び手が先に積んだ分の後ろに) 足す。 書き換え・外しで古い entry の
+    /// ある bucket (verify する経路)、 sparse の値 (2^20 以上)、 組む前 (遅延構築) を含む。
+    #[test]
+    fn pull_into_matches_pull_and_keeps_the_prefix() {
+        let hs = make_store(4096);
+        let big = 5_000_000u64; // DENSE_CAP (2^20) 以上 = sparse
+        for e in 0..3000u32 {
+            let e64 = e as u64;
+            assert!(hs.set(e, if e % 5 == 0 { big + e64 % 2 } else { e64 % 7 }));
+        }
+        let check = |label: &str| {
+            for v in (0..7u64).chain([big, big + 1, 99]) {
+                let mut want = hs.pull(v);
+                want.sort_unstable();
+                let mut out = vec![u32::MAX, u32::MAX];
+                hs.pull_into(v, &mut out);
+                assert_eq!(&out[..2], &[u32::MAX, u32::MAX], "{label}: 先に積んだ分を変えた (値 {v})");
+                let mut got = out[2..].to_vec();
+                got.sort_unstable();
+                assert_eq!(got, want, "{label}: 値 {v}");
+            }
+        };
+        check("組む前");
+        // 組んだ後の書き換え (古い entry が残る) と外し
+        for e in (0..3000u32).step_by(3) {
+            let e64 = e as u64;
+            assert!(hs.set(e, if e % 2 == 0 { (e64 + 1) % 7 } else { big + (e64 + 1) % 2 }));
+        }
+        for e in (1..3000u32).step_by(11) {
+            hs.remove(e);
+        }
+        // 行って戻った (A → B → A) entity: bucket に重複が残る
+        for e in (2..3000u32).step_by(13) {
+            let v = hs.get_value(e);
+            assert!(hs.set(e, 6));
+            if let Some(v) = v {
+                assert!(hs.set(e, v));
+            }
+        }
+        check("書き換えの後");
     }
 
     fn make_store64(max_entities: u32) -> HimoStore {
