@@ -8218,6 +8218,14 @@ impl Engine {
         }
         self.himo_to_table = rebuilt;
         self.tables = tables;
+        // ref の紐の円柱は、 指す先の表の eid の始まりから dense に置く (円柱を組むのは開いた後の最初の読み)
+        for t in &self.tables {
+            for &(hid, tid) in &t.fk_refs {
+                if let (Some(h), Some(target)) = (self.himos.get(hid as usize), self.tables.get(tid as usize)) {
+                    h.set_dense_base_hint(u64::from(target.eid_range_lo));
+                }
+            }
+        }
     }
 
     /// 既知 table を `(id, name, eid_range)` で列挙する。 試験用 / debug 用 API。
@@ -10770,6 +10778,10 @@ impl Engine {
             owner.fk_refs.push(entry);
             self.try_persist_tables();
         }
+        // この ref の円柱は、 指す先の表の eid の始まりから dense に置く (2^20 より後ろの表を指しても sparse に
+        // しない。 円柱を組むのは最初の読みなので、 組む前ならここで決まる)
+        let lo = u64::from(self.tables[target_tid as usize].eid_range_lo);
+        self.himos[hid as usize].set_dense_base_hint(lo);
         Ok(hid)
     }
 
@@ -13395,6 +13407,20 @@ impl Engine {
     pub fn himo_cylinder_backing_bytes(&self, himo: &str) -> Option<usize> {
         let idx = self.himo_id(himo)?;
         Some(self.himos[idx].cyl_backing_bytes())
+    }
+
+    /// 診断: himo の円柱の dense の窓の始まり (ref の紐は指す先の表の eid の始まり、 円柱を組む前は 0)。
+    #[doc(hidden)]
+    pub fn himo_cylinder_low_base(&self, himo: &str) -> Option<u64> {
+        let idx = self.himo_id(himo)?;
+        Some(self.himos[idx].cylinder_low_base())
+    }
+
+    /// 診断: himo の円柱で、 値 `value` を dense に置いているか (組む前は false)。
+    #[doc(hidden)]
+    pub fn himo_value_is_dense(&self, himo: &str, value: u64) -> Option<bool> {
+        let idx = self.himo_id(himo)?;
+        Some(self.himos[idx].cylinder_is_dense(value))
     }
 
     /// 指定 himo の全 bucket を Column 基準で即時 compaction する (request12 P2)。

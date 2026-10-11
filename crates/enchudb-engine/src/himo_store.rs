@@ -12,7 +12,7 @@
 
 use parking_lot::{Mutex, MutexGuard};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::column::Column;
 use crate::lockfree_cylinder::LockFreeCylinder;
@@ -128,6 +128,10 @@ pub struct HimoStore {
     /// `ensure_cylinder_built` が立てる。 #270 以降このフラグは「組み済みか」と
     /// **「以後この索引を維持するか」** を兼ねる (= writer の gate、 `cyl_live` 参照)。
     cyl_built: AtomicBool,
+    /// cylinder を組む時の dense の窓の始まり ([`LockFreeCylinder::set_low_base`])。 ref の紐は指す先の表の eid の
+    /// 始まり (engine が表の定義から置く、 [`set_dense_base_hint`](Self::set_dense_base_hint))。 組んだ後に変えても
+    /// 効かない (組み直すまで今の窓のまま)。
+    dense_base_hint: AtomicU64,
     /// writer 直列化 lock。 lazy build と set/remove/restore が取る。
     /// reader (pull 系) は一切取らない。 同期 tie / schema commit の多 thread
     /// 呼び出しを master (RwLock write) と同じ直列度で安全にする（#96 レビュー発覚分）。
@@ -199,6 +203,7 @@ impl HimoStore {
             // 誰も引かない index を育て続ける** (#270: 法令検索の消費側アプリのフルリビルドで 1.5GB /
             // 2,856 万確保)。 false で始めれば writer は cylinder を触らない (`cyl_live`)。
             cyl_built: AtomicBool::new(false),
+            dense_base_hint: AtomicU64::new(0),
             write_lock: Mutex::new(()),
         }
     }
@@ -216,6 +221,7 @@ impl HimoStore {
             value_type: ht,
             max_values,
             cyl_built: AtomicBool::new(false),
+            dense_base_hint: AtomicU64::new(0),
             write_lock: Mutex::new(()),
         }
     }
@@ -238,6 +244,7 @@ impl HimoStore {
             value_type: ht,
             max_values,
             cyl_built: AtomicBool::new(false),
+            dense_base_hint: AtomicU64::new(0),
             write_lock: Mutex::new(()),
         }
     }
@@ -276,6 +283,21 @@ impl HimoStore {
             })
     }
 
+    /// cylinder を組む時の dense の窓の始まりを置く (ref の紐 = 指す先の表の eid の始まり)。 組んだ後は効かない。
+    pub fn set_dense_base_hint(&self, base: u64) {
+        self.dense_base_hint.store(base, Ordering::Relaxed);
+    }
+
+    /// 組んだ cylinder の dense の窓の始まり (診断用。 組む前は 0)。
+    pub fn cylinder_low_base(&self) -> u64 {
+        self.cyl.low_base()
+    }
+
+    /// 組んだ cylinder で値を dense に置いているか (診断用。 組む前は false)。
+    pub fn cylinder_is_dense(&self, value: u64) -> bool {
+        self.cyl_built.load(Ordering::Acquire) && self.cyl.is_dense(value)
+    }
+
     /// cylinder が未 build なら column から rebuild。lazy build の入口。
     /// fast path は AtomicBool::load で即 return。
     ///
@@ -293,6 +315,8 @@ impl HimoStore {
         }
         let col = self.col();
         let count = col.count();
+        // dense の窓の始まりは組む前に (読み手はまだこの索引を読まない)
+        self.cyl.set_low_base(self.dense_base_hint.load(Ordering::Relaxed));
         // 全部を見てからまとめて組む (dense / sparse の振り分けを 1 度で決める、 #373)
         self.cyl.build(|| {
             (0..count).filter_map(|eid| {
@@ -667,12 +691,12 @@ impl HimoStore {
     pub fn slice_len(&self, value: impl CellValue) -> usize {
         let Some(value) = value.cell_value() else { return 0 };
         self.ensure_cylinder_built();
-        if !self.cyl.is_dense(value) {
+        match self.cyl.dense_live_len(value) {
+            Some(n) => n,
             // sparse の値は件数を持たない: 引いて数える (sparse に置くのは、 値の種類が多い列か、 配列を伸ばすほど
             // 溜まっていない値なので、 1 値あたりの件数は小さい)
-            return self.pull(value).len();
+            None => self.pull(value).len(),
         }
-        self.cyl.slice_len_live(value)
     }
 
     /// 入っている値を列挙（順序保証なし、churn 時は stale 含む近似）。
