@@ -285,15 +285,26 @@ impl AppendBucket {
     /// [`read_snapshot_verify`](Self::read_snapshot_verify) の、 呼び手の buffer の後ろに足す版 (多くの bucket を
     /// 続けて読む時に、 bucket ごとの Vec を作らない)。 3 段の順序は同じ。
     pub fn read_snapshot_verify_into(&self, guard: &Guard, out: &mut Vec<u32>) -> bool {
+        let (s, verify) = self.snapshot_in(guard);
+        out.extend_from_slice(s);
+        verify
+    }
+
+    /// 中身を写す前で止める版: (publish 済みの slice, verify が要るか)。 3 段の順序は同じ (1 の 「観測」 は len の
+    /// Acquire load で、 [0..n] は publish 済み = 不変なので、 中身を後で写しても (1) で写したのと同じ)。 slice は guard の
+    /// 間は生きている。 いくつかの bucket を揃えて控えてから中身を読む時に使う (並びの索引の帯、 控える間だけを seqlock で
+    /// 揃える)。
+    #[inline]
+    pub fn snapshot_in<'g>(&self, guard: &'g Guard) -> (&'g [u32], bool) {
         let p1 = self.backing.load(Ordering::Acquire, guard);
         // SAFETY: backing は常に非 null。
         let b = unsafe { p1.deref() };
         let n = b.len.load(Ordering::Acquire);
         // SAFETY: [0..n] は publish 済み = 不変。 guard が backing を生存させる。
-        out.extend_from_slice(unsafe { b.published(n) });
+        let s = unsafe { b.published(n) };
         let f = self.removed.load(Ordering::Acquire);
         let p2 = self.backing.load(Ordering::Acquire, guard);
-        f || p2 != p1
+        (s, f || p2 != p1)
     }
 
     /// 現在の publish 済み件数（lock-free）。
