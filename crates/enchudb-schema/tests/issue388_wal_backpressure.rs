@@ -29,7 +29,9 @@ const WAL: usize = 4 << 20;
 /// WAL の容量の何倍も書いても、 落ちた record も打てなかった Commit も無い。
 ///
 /// consumer が満杯の瞬間に畳みに入る形 (0.29.2 で consumer 自身の Commit が落ちていた) は確率的にしか踏めないので
-/// 5 回繰り返す (1 回あたりの検出率は約 1/3)。
+/// 5 回繰り返す (1 回あたりの検出率は約 1/3)。 0.32.1 まで残っていた窓 (consumer が空けに来て、 開いている group を閉じる
+/// Commit を 「満杯でない」 と見てから打つまでの間に、 書き手の Commit が残りを埋める。 この test が数 % で 「打てなかった
+/// Commit」 = 1 で落ちていた) は、 engine の `wal_room_commit_tests` が割り込み点で必ず踏む。
 #[test]
 fn single_writer_insert_delete_never_drops_wal_records() {
     for round in 0..5 {
