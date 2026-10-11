@@ -1,8 +1,10 @@
 //! `LockFreeCylinder` — value → eid の lock-free concurrent bucket store。 #95。
 //!
-//! 現状の `RwLock<BucketCylinder>` を置き換える。 **同時に 1 writer** / 多 reader。
+//! 現状の `RwLock<BucketCylinder>` を置き換える。 **bucket ごとに同時に 1 writer** / 多 reader。
 //! writer は 1 thread とは限らない（consumer + 同期 tie + schema commit）ので、
-//! 呼び出し側 = `HimoStore` が per-himo `write_lock` で直列化して契約を満たす。
+//! 呼び出し側 = `HimoStore` が契約を満たす: bucket の書き手は値ごとの鍵で 1 本、 sparse と配列の差し替えの書き手は
+//! per-himo `write_lock` で 1 本 (差し替える書き手は全部の鍵も持つ、 `crate::value_locks`、 2026-10-11)。 前は
+//! `write_lock` で全部の書き手を 1 本に並べていた。
 //!
 //! ## 構造
 //! - **dense**: 値ごとの bucket の配列 3 本 (`Atomic<Vec<Slot>>`)。 0 から (`dense`、 値 < `DENSE_CAP`)、 `MID` = 2^63
@@ -134,7 +136,7 @@ impl Slot {
         unsafe { p.as_ref() }
     }
 
-    /// bucket (空なら作って置く) と、 今作ったか。 **書き手だけ** — `HimoStore` の write_lock の下で同時に 1 本。
+    /// bucket (空なら作って置く) と、 今作ったか。 **その値の書き手だけ** — `HimoStore` の値の鍵の下で同時に 1 本。
     #[inline]
     pub(crate) fn get_or_create(&self) -> (&AppendBucket, bool) {
         self.get_or_create_with(0)
@@ -218,7 +220,8 @@ pub struct LockFreeCylinder {
     any_removed: AtomicBool,
 }
 
-// SAFETY: 単一 writer / 多 reader。 dense / sparse とも epoch で publish。
+// SAFETY: bucket ごとに単一 writer (sparse と配列の差し替えは全体で単一 writer) / 多 reader。 dense / sparse とも epoch で
+// publish。
 unsafe impl Sync for LockFreeCylinder {}
 unsafe impl Send for LockFreeCylinder {}
 
@@ -388,15 +391,25 @@ impl LockFreeCylinder {
         self.any_removed.load(Ordering::Relaxed)
     }
 
+    /// 値を今の配列の中 (bucket で持つ所) に置くか。 配列は伸びるだけなので、 一度 true なら以後も true。
+    #[inline]
+    pub(crate) fn in_array(&self, value: u64, guard: &Guard) -> bool {
+        self.dense_slot(value).is_some_and(|(k, i)| i < self.vec_of(k, guard).len())
+    }
+
     /// 値更新 / 削除で `value` の bucket に stale が残ることを記録する (request12)。
-    /// 該当 bucket の removed flag を立て、live を -1。write_lock 下の単一 writer 前提。
+    /// 該当 bucket の removed flag を立て、live を -1。 その bucket の書き手 1 本 (`HimoStore` の値の鍵の下、 sparse の
+    /// 値は write_lock の下) で呼ぶ。
     /// **Column を書き換える前に呼ぶこと** (reader が「flag 未設定なのに Column は
     /// 新値」を観測する窓を作らない — 旧 mark_removed と同じ順序契約)。
     ///
     /// 戻り値は `(bucket の raw len, 減分後の live)` — 呼び出し側 (HimoStore) が
     /// incremental compaction の trigger 判定 (stale 率) に使う (P2)。
     pub fn note_stale(&self, value: u64) -> Option<(usize, u32)> {
-        self.any_removed.store(true, Ordering::Relaxed);
+        // 立っていれば書かない (書き手が並ぶと、 同じ値の store でも cache line を取り合う)
+        if !self.any_removed.load(Ordering::Relaxed) {
+            self.any_removed.store(true, Ordering::Relaxed);
+        }
         let guard = epoch::pin();
         let stats = match self.writer_dense_at(value, &guard) {
             Some(Some(b)) => b.note_stale().map(|prev| (b.len(), prev - 1)),
@@ -578,7 +591,54 @@ impl LockFreeCylinder {
     /// `keep(値, eid)` は Column の現在値との照合 (`HimoStore` が渡す)。 配列を伸ばして sparse の entry を dense の
     /// bucket へ移す時に、 古い entry を移さないために使う (bucket の live の数を正しく保つ)。 呼ぶのは
     /// **Column を書き換えた後** (`set` の順序)。
+    ///
+    /// 配列を伸ばすことがあるので、 他の書き手が 1 本も居ない時に (`HimoStore` では write_lock と全部の鍵の下で)。
     pub fn insert(&self, eid: u32, value: u64, keep: impl FnMut(u64, u32) -> bool) {
+        self.insert_with(eid, value, true, keep);
+    }
+
+    /// 配列の中の値 (`in_array` が true) の bucket に足す。 配列は伸ばさない。 その値の bucket の書き手 1 本で
+    /// (`HimoStore` の値の鍵の下)。 配列を伸ばす書き手は全部の鍵を持つので、 この間に配列は差し替わらない。
+    #[inline]
+    pub(crate) fn push_in_array(&self, eid: u32, value: u64, guard: &Guard) {
+        debug_assert!(self.in_array(value, guard), "push_in_array: 配列の外の値 {value}");
+        let (k, i) = self.dense_slot(value).expect("push_in_array: 窓の外の値");
+        self.push_slot(k, &self.vec_of(k, guard)[i], eid, guard);
+    }
+
+    /// 要素 `slot` (配列 `k`) の bucket に足す (空なら、 ここで初めて bucket を作る、 #358)。
+    #[inline]
+    fn push_slot(&self, k: usize, slot: &Slot, eid: u32, guard: &Guard) {
+        let (b, created) = slot.get_or_create();
+        if created {
+            self.used[k].fetch_add(1, Ordering::Relaxed);
+        }
+        let prev_len = b.push_in(eid, guard);
+        let prev_live = b.live_inc();
+        self.bump_stats(prev_len == 0, prev_live == 0);
+    }
+
+    /// 値を足す時に配列を伸ばすか (`insert` と同じ判定)。 配列の中の値と窓の外の値は false。 判定に使う数は、
+    /// 鍵で書く書き手が並んで増やす (bucket を作った数) ので、 呼んだ後で変わりうる — 決めたら `insert_with` に渡す。
+    pub(crate) fn would_grow(&self, value: u64, guard: &Guard) -> bool {
+        let Some((k, i)) = self.dense_slot(value) else {
+            return false;
+        };
+        let len = self.vec_of(k, guard).len();
+        i >= len && !self.grow_too_sparse(k, i, len)
+    }
+
+    /// 配列 `k` (今の長さ `len`) を添字 `i` まで伸ばすと、 空の要素ばかりになるか (#373)。
+    #[inline]
+    fn grow_too_sparse(&self, k: usize, i: usize, len: usize) -> bool {
+        let new_len = (i + 1).max(len * 2).min(region_cap(k));
+        let filled = self.used[k].load(Ordering::Relaxed) + self.waiting[k].load(Ordering::Relaxed) + 1;
+        new_len > DENSE_FREE_LEN && new_len > DENSE_MIN_FILL * filled
+    }
+
+    /// `insert` の、 配列を伸ばすかを選べる版。 `may_grow = false` なら配列の外の値は伸ばさずに sparse へ (sparse の
+    /// 書き手 1 本 = `HimoStore` の write_lock の下で)。 `true` なら他の書き手が 1 本も居ない時に。
+    pub(crate) fn insert_with(&self, eid: u32, value: u64, may_grow: bool, keep: impl FnMut(u64, u32) -> bool) {
         debug_assert!(value != u64::MAX, "value == u64::MAX is sentinel");
         let guard = epoch::pin();
         let Some((k, i)) = self.dense_slot(value) else {
@@ -592,21 +652,12 @@ impl LockFreeCylinder {
         // SAFETY: dense は常に非 null。
         let vec = unsafe { arr.deref() };
         if i < vec.len() {
-            // 空の要素なら、 ここで初めて bucket を作る (#358)
-            let (b, created) = vec[i].get_or_create();
-            if created {
-                self.used[k].fetch_add(1, Ordering::Relaxed);
-            }
-            let prev_len = b.push_in(eid, &guard);
-            let prev_live = b.live_inc();
-            self.bump_stats(prev_len == 0, prev_live == 0);
+            self.push_slot(k, &vec[i], eid, &guard);
             return;
         }
         // 配列の外: 伸ばすか、 sparse に置くか (#373)
-        let new_len = (i + 1).max(vec.len() * 2).min(region_cap(k));
-        let filled = self.used[k].load(Ordering::Relaxed) + self.waiting[k].load(Ordering::Relaxed) + 1;
-        if new_len > DENSE_FREE_LEN && new_len > DENSE_MIN_FILL * filled {
-            // 伸ばすと空の要素ばかりになる: sparse に置く。 entry が溜まれば、 後で伸ばす時に dense へ移る
+        if !may_grow || self.grow_too_sparse(k, i, vec.len()) {
+            // 伸ばさない (伸ばすと空の要素ばかりになる): sparse に置く。 entry が溜まれば、 後で伸ばす時に dense へ移る
             self.sparse.insert(value, eid);
             self.total.fetch_add(1, Ordering::Relaxed);
             self.waiting[k].fetch_add(1, Ordering::Relaxed);
@@ -614,18 +665,13 @@ impl LockFreeCylinder {
         }
         // 成長: doubling で amortize、 既存の bucket は写しが同じものを指す (refcount)。 足した要素は
         // 空のまま — bucket を作るのは値が入る要素だけ (#358)
+        let new_len = (i + 1).max(vec.len() * 2).min(region_cap(k));
         let old_len = vec.len();
         let mut nv: DenseArr = vec.clone();
         nv.resize_with(new_len, Slot::empty);
         let waited = self.waiting[k].load(Ordering::Relaxed) > 0;
         let moved = if waited { self.move_from_sparse(k, old_len, new_len, &nv, (value, eid), keep, &guard) } else { 0 };
-        let (b, created) = nv[i].get_or_create();
-        if created {
-            self.used[k].fetch_add(1, Ordering::Relaxed);
-        }
-        let prev_len = b.push_in(eid, &guard);
-        let prev_live = b.live_inc();
-        self.bump_stats(prev_len == 0, prev_live == 0);
+        self.push_slot(k, &nv[i], eid, &guard);
         DENSE_GROWS.fetch_add(1, Ordering::Relaxed);
         dense.store(Owned::new(nv), Ordering::Release);
         // SAFETY: 旧 array は全 reader が epoch 通過後に解放。

@@ -36,6 +36,15 @@
 //! 印を見てから足すまでの間に、 組む側が閉じて数 0 を見て scan する)。 どちらも下の
 //! `#[should_panic]` の test が loom で窓を見つける = この model が窓を表現できていることの確認。
 //!
+//! ## 値の鍵 (2026-10-11、 `value_locks`)
+//! 組んだ後の writer は `write_lock` を取らずに値ごとの鍵の下で Column と index を書く (`HimoStore::set_indexed`)。
+//! writer は最初に flag を Acquire で見て、 立っていれば鍵の道へ。 立っていなければ門か lock の道 (上と同じ) で、 lock を
+//! 取った後に立っているのを見たら lock を離して鍵の道へ。 組む側は flag を立てる前に鍵を作る:
+//!
+//!   - flag を見て鍵の道へ行った writer は build の後 (scan の後) に書く → 自分で index に入れる
+//!   - lock の道で flag を見直さないと壊れる (`writer_that_keeps_the_flag_it_saw_before_the_lock_loses_a_write`:
+//!     lock の前に見た 「組んでいない」 のまま、 組み終わった後に Column だけを書く = 上の hoist と同じ取りこぼし)
+//!
 //! ## model の範囲
 //! `HimoStore` の flag (`AtomicBool`) / `write_lock` (`Mutex`) / 門の shard (2 本、 writer
 //! ごとに別) / Column cell の Release store と、 `ensure_cylinder_built` の double-check build
@@ -64,9 +73,11 @@ struct Broken {
     no_wait: bool,
     /// writer が数を足す前に、 閉じた印を load で見る。
     look_first: bool,
+    /// lock の道で flag を見直さない (lock の前に見た値のまま決める)。
+    stale_flag: bool,
 }
 
-const SOUND: Broken = Broken { no_wait: false, look_first: false };
+const SOUND: Broken = Broken { no_wait: false, look_first: false, stale_flag: false };
 
 /// `HimoStore` の lazy build 契約の de-epoch model。
 struct Store {
@@ -76,8 +87,10 @@ struct Store {
     cyl: Mutex<Vec<(usize, usize)>>,
     /// 組み済み = 以後 writer が維持する。
     built: AtomicBool,
-    /// writer 直列化 lock。 build も取る。
+    /// writer 直列化 lock。 build も取る。 組んだ後の writer は取らない。
     write_lock: Mutex<()>,
+    /// 組んだ後の writer の値の鍵 (`ValueLocks`、 値 1 つなので 1 本)。
+    value_lock: Mutex<()>,
     /// 門の shard (`WriteGate`)。 閉じた印 | 中に居る writer の数。
     gate: [AtomicUsize; 2],
     broken: Broken,
@@ -90,6 +103,7 @@ impl Store {
             cyl: Mutex::new(Vec::new()),
             built: AtomicBool::new(false),
             write_lock: Mutex::new(()),
+            value_lock: Mutex::new(()),
             gate: [AtomicUsize::new(0), AtomicUsize::new(0)],
             broken,
         }
@@ -114,17 +128,30 @@ impl Store {
 
     /// `HimoStore::set` の model。 `shard` = writer の thread が使う門の shard。
     fn set(&self, shard: usize, eid: usize, value: usize) {
-        // 組んでいなければ門の中で Column だけを書く (flag は門を見るかどうかの目安。 決めるのは門)
-        if !self.built.load(Ordering::Relaxed) && self.write_in_gate(shard, eid, value) {
+        // 組んだ後は値の鍵の道 (flag は組む側が scan の後に Release で立てる)
+        let seen = self.built.load(Ordering::Acquire);
+        if seen {
+            return self.set_indexed(eid, value);
+        }
+        // 組んでいなければ門の中で Column だけを書く (閉じていれば lock の道)
+        if self.write_in_gate(shard, eid, value) {
             return;
         }
-        let _w = self.write_lock.lock().unwrap();
-        // ★契約: 判定は lock を取った **後**。 ここを `_w` の前に出すと下の test が落ちる。
-        let live = self.built.load(Ordering::Acquire);
-        self.col[eid].store(value + 1, Ordering::Release);
+        let w = self.write_lock.lock().unwrap();
+        // ★契約: 判定は lock を取った **後**。 lock の前に見た値で決めると下の test が落ちる (`stale_flag`)。
+        let live = if self.broken.stale_flag { seen } else { self.built.load(Ordering::Acquire) };
         if live {
-            self.cyl.lock().unwrap().push((eid, value));
+            drop(w);
+            return self.set_indexed(eid, value);
         }
+        self.col[eid].store(value + 1, Ordering::Release);
+    }
+
+    /// `HimoStore::set_indexed`: 値の鍵の下で Column と index を書く (write_lock は取らない)。
+    fn set_indexed(&self, eid: usize, value: usize) {
+        let _k = self.value_lock.lock().unwrap();
+        self.col[eid].store(value + 1, Ordering::Release);
+        self.cyl.lock().unwrap().push((eid, value));
     }
 
     /// `HimoStore::ensure_cylinder_built` の model (fast path + double-check)。
@@ -227,8 +254,8 @@ fn lost_write_two_writers() {
     });
 }
 
-/// 1 writer が組む前 (門) と組んだ後 (lock) をまたいで 2 回書く (別 eid)。 1 回目が門、 2 回目が
-/// lock の道になる interleaving を含む。
+/// 1 writer が組む前 (門) と組んだ後 (値の鍵) をまたいで 2 回書く (別 eid)。 1 回目が門、 2 回目が
+/// lock の道から鍵の道になる interleaving を含む。
 #[test]
 fn writer_crossing_the_build() {
     loom::model(|| {
@@ -250,12 +277,19 @@ fn writer_crossing_the_build() {
 #[test]
 #[should_panic(expected = "取りこぼした")]
 fn build_that_does_not_wait_for_the_gate_loses_a_write() {
-    single_writer(Broken { no_wait: true, look_first: false });
+    single_writer(Broken { no_wait: true, ..SOUND });
 }
 
 /// 対照: writer が数を足す前に閉じた印を見ると、 その間に組む側が閉じて数 0 を見て scan する。
 #[test]
 #[should_panic(expected = "取りこぼした")]
 fn writer_that_looks_before_counting_loses_a_write() {
-    single_writer(Broken { no_wait: false, look_first: true });
+    single_writer(Broken { look_first: true, ..SOUND });
+}
+
+/// 対照: lock の道で flag を見直さないと、 lock を待つ間に組み終わった索引に入れずに Column だけを書く。
+#[test]
+#[should_panic(expected = "取りこぼした")]
+fn writer_that_keeps_the_flag_it_saw_before_the_lock_loses_a_write() {
+    single_writer(Broken { stale_flag: true, ..SOUND });
 }

@@ -9273,7 +9273,8 @@ impl Engine {
 
     /// Column 書き込みの唯一の入口 (live query 通知込み)。 **engine 内で `himos[..].set`
     /// を直に呼ばないこと** — 呼ぶと live query がその書き込みを取りこぼす。
-    /// 通知は `HimoStore::set` が write_lock を離した (cylinder を組んでいない紐は門を出た) **後** (`crate::live` の lock
+    /// 通知は `HimoStore::set` が write_lock を離した (cylinder を組んでいない紐は門を出た、 組んだ紐は値の鍵を離した) **後**
+    /// (`crate::live` の lock
     /// 順序)。
     ///
     /// #381: 回収する辞書の Tag の列なら、 新しい値の参照を取って古い値の参照を返す。 新しい値の番号が古い (回収された)
@@ -9463,9 +9464,9 @@ impl Engine {
     #[cold]
     fn order_note_slow(&self, hid: u16, local: u32) {
         for o in self.live.orders_on(hid) {
-            // 作る前は何もしない (lock も取らない)。 列はこの紐の write_lock の下か門の中 (`write_gate`) で書いてあり、
-            // 作る側は via と key の書き手を両方止めてから (write_lock を取り、 門を閉じて中の書き手を待つ、
-            // `HimoStore::write_guard`) 列をなめる ([`order_ready`](Self::order_ready)): 作る側が止める前に書いた列は
+            // 作る前は何もしない (lock も取らない)。 列はこの紐の write_lock の下か、 門の中 (`write_gate`) か、 値の鍵の下
+            // (`value_locks`) で書いてあり、 作る側は via と key の書き手を両方止めてから (write_lock を取り、 門を閉じて中の
+            // 書き手を待ち、 組んだ紐なら全部の鍵も取る、 `HimoStore::write_guard`) 列をなめる ([`order_ready`](Self::order_ready)): 作る側が止める前に書いた列は
             // なめる時に読まれ、 放した後に書いたならここで 「作った」 が見える (`tests/loom_order_index_build.rs`)。
             // 開き直した後 (宣言は戻すが作るのは最初に読む時) の書き込みも、 これで上乗せが無い
             if !o.is_built() {
@@ -9549,7 +9550,7 @@ impl Engine {
         }
         if !o.is_built() {
             // via → key の順 (via は Ref、 key は Number / Number64 の紐なので同じ紐にはならない)。 書き手は列を書く間に
-            // どちらか 1 本しか持たない (門の中の書き手は lock を持たず、 `write_guard` が出るのを待つ) ので、 両方を
+            // どちらか 1 本しか持たない (門の中・値の鍵の中の書き手は lock を持たず、 `write_guard` が出るのを待つ) ので、 両方を
             // 止めた時点で書きかけの列は無い ([`order_note_slow`](Self::order_note_slow))
             let _w = self.himos[o.via as usize].write_guard();
             let _k = self.himos[o.key as usize].write_guard();
