@@ -85,6 +85,14 @@
 //! (社員) への条件」 の組で、 差分は会社の eid、 社員は必要な時に常設の逆引き索引から引く。 会社の
 //! 所在地を 1 個書き換えた時の差分は会社 1 件 (配下が何人でも O(1))、 社員の付け替えは印を付けない。
 //!
+//! # 見直す場所だけ返す購読 ([`TouchedLiveQuery`])
+//!
+//! 会社単位の購読に、 **根の紐 (所属会社の ref と根への条件の紐) が書かれた根の entity** を足して返す。 family に見直しの
+//! 節 (添字 `nodes.len()` の番兵) を 1 つ足し、 根の紐から route を張る — 書き手は今と同じく (family, 節) に印を置くだけで、
+//! settle が番兵の印を member の `touched` に渡す。 根の entity ごとの答えは持たず評価もしない (呼び手が引き直す)。 group が
+//! 居るかの判定は最後の poll で渡した集合 (`reported`) で決める — poll の間に入って出た group は差分に出ないので、 今の集合で
+//! 答えると呼び手は外すきっかけを失う。 `LiveGroup` にはまだ入れられない。
+//!
 //! # 否定 ([`LivePred::Not`])
 //!
 //! 単一紐の条件の否定は節の値を固定した条件 (`Pred::Not`、 値ごとに別の family)。 値が無い entity も真
@@ -544,6 +552,24 @@ pub struct LiveDelta {
 impl LiveDelta {
     pub fn is_empty(&self) -> bool {
         self.added.is_empty() && self.removed.is_empty()
+    }
+}
+
+/// [`TouchedLiveQuery::poll`] の差分: group (ref の先の entity) の出入りと、 見直すべき根の entity。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TouchedDelta {
+    /// 条件を満たすようになった group (eid 昇順)。 中身は [`TouchedLiveQuery::members`] などで引く。
+    pub added: Vec<EntityId>,
+    /// 条件を満たさなくなった group (eid 昇順)。
+    pub removed: Vec<EntityId>,
+    /// 前回 poll 以降に根の紐 (via の ref、 根への条件の紐) が書かれた / 外された根の entity (eid 昇順、 削除も含む)。
+    /// 答えに入ったか出たかは判定していない — 呼び手が [`TouchedLiveQuery::group_of`] で引き直す。 同じ値の書き直しも含む。
+    pub touched: Vec<EntityId>,
+}
+
+impl TouchedDelta {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.touched.is_empty()
     }
 }
 
@@ -1962,6 +1988,8 @@ struct Member {
     group: u64,
     /// #381: 鍵の text を解決した時に押さえた辞書の番号 (購読を外す時に返す)。
     pins: Vec<u32>,
+    /// 見直しの節を持つ family の member ([`TouchedLiveQuery`]) なら、 最後の poll 以降に根の紐が書かれた根の entity。
+    touched: Option<Marks>,
 }
 
 /// 上位 k 件の購読の境界。 鍵の順序 (`RootKey::order`、 (並びの値, eid) の昇順。 降順の購読は
@@ -3151,6 +3179,9 @@ pub(crate) struct Family {
     order: Vec<usize>,
     /// route を張る (himo, 節) の組。
     routes: Vec<(u16, usize)>,
+    /// 見直しの節 (添字 `nodes.len()` の番兵) を持つか ([`TouchedLiveQuery`])。 根の紐 (via の ref と根への条件の紐) が
+    /// 書かれた根の entity を、 評価せずに印のまま member の `touched` へ渡す。
+    notice: bool,
     /// 書き込み側が付ける印 (shard ごと)。 評価 lock とは別 — poll の最中も書き込みは待たない。
     pending: Box<[Shard]>,
     /// 最後に印を取り出してから印が付いた shard (bit i = shard i)。 書き手は印を置いて lock を
@@ -3285,7 +3316,7 @@ fn range_of(key: &[HoleVal]) -> Option<(u64, u64)> {
 
 impl Family {
     /// `exists` = `number_exists` が返した順の集計の購読 (中身の件数)。
-    fn new(id: u64, sig: Vec<u64>, flats: Vec<Flat>, exists: Vec<LiveCounts>) -> Self {
+    fn new(id: u64, sig: Vec<u64>, flats: Vec<Flat>, exists: Vec<LiveCounts>, notice: &[u16]) -> Self {
         let kind = flats
             .iter()
             .find_map(|f| match f.leaf {
@@ -3354,6 +3385,10 @@ impl Family {
         if let Some(h) = sum {
             routes.push((h, 0));
         }
+        // 見直しの節: 根の紐の書き込みを番兵の節 (`nodes.len()`) に積む
+        for &h in notice {
+            routes.push((h, nodes.len()));
+        }
         routes.sort_unstable();
         routes.dedup();
         let nodes_partial = nodes[0].children.iter().copied().find(|&c| on_path[c]);
@@ -3365,8 +3400,12 @@ impl Family {
             nodes,
             order,
             routes,
+            notice: !notice.is_empty(),
             pending: (0..SHARDS)
-                .map(|_| Shard(Mutex::new(Pending { nodes: (0..n).map(|_| Marks::default()).collect(), freed: Marks::default() })))
+                .map(|_| {
+                    let nodes = (0..n + usize::from(!notice.is_empty())).map(|_| Marks::default()).collect();
+                    Shard(Mutex::new(Pending { nodes, freed: Marks::default() }))
+                })
                 .collect(),
             dirty: AtomicU32::new(0),
             settled: Mutex::new({
@@ -3420,7 +3459,9 @@ impl Family {
             return true;
         }
         let s = self.settled.lock();
-        s.members[slot].as_ref().is_some_and(|m| !m.changed.is_empty() || s.dormant.contains(&slot))
+        s.members[slot].as_ref().is_some_and(|m| {
+            !m.changed.is_empty() || m.touched.as_ref().is_some_and(|t| !t.is_empty()) || s.dormant.contains(&slot)
+        })
     }
 
     fn add_member(
@@ -3455,6 +3496,7 @@ impl Family {
             union,
             group: 0,
             pins: Vec::new(),
+            touched: self.notice.then(Marks::default),
         };
         let slot = match s.members.iter().position(Option::is_none) {
             Some(i) => {
@@ -3897,6 +3939,7 @@ impl Family {
             work[n].extend(es);
         }
         let mut freed = Vec::new();
+        let mut touched = Vec::new();
         for (i, sh) in self.pending.iter().enumerate() {
             if mask & (1 << i) == 0 {
                 continue;
@@ -3909,7 +3952,22 @@ impl Family {
                     w.append(&mut m.take_raw());
                 }
             }
+            // 見直しの節 (番兵) は zip の外: 明示して取り出す (dirty の bit はもう落としてある)
+            if self.notice {
+                touched.append(&mut p.nodes[self.nodes.len()].take_raw());
+            }
             freed.append(&mut p.freed.take_raw());
+        }
+        if !touched.is_empty() {
+            touched.sort_unstable();
+            touched.dedup();
+            for m in s.members.iter_mut().flatten() {
+                if let Some(t) = m.touched.as_mut() {
+                    for &e in &touched {
+                        t.add(e);
+                    }
+                }
+            }
         }
         for e in freed {
             // 報告済みの根が解放された = 呼び手の持つ eid は別物になりうる。 今の鍵と違う
@@ -4035,7 +4093,7 @@ pub(crate) fn find_once(r: &impl CellReader, branches: Vec<Vec<LivePred>>) -> Ve
 fn find_branch(r: &impl CellReader, preds: Vec<LivePred>) -> Vec<u32> {
     let (sig, mut flats, key) = canonical(preds, None);
     let specs = number_exists(&mut flats);
-    let fam = Family::new(0, sig, flats, Vec::new());
+    let fam = Family::new(0, sig, flats, Vec::new(), &[]);
     let Some(tuples) = resolve(r, &key) else { return Vec::new() };
     let range = range_of(&key);
     let mut s = Settled::new(&fam.nodes.iter().map(|x| x.key_len).collect::<Vec<_>>());
@@ -4237,6 +4295,20 @@ impl LiveRegistry {
         LiveQuery { kind: Kind::One { family, slot }, id, registry: self.clone() }
     }
 
+    /// [`TouchedLiveQuery`] の中身の購読を登録する: `preds` (group の側の条件) の family に、 見直しの節を足す。 `notice` =
+    /// 書かれたら根の entity を見直しに積む紐 (昇順・重複なし)。 見直しの節は family の形に入るので、 見直しの紐の違う購読や
+    /// 普通の購読とは family を共有しない。
+    pub(crate) fn register_touched(self: &Arc<Self>, preds: Vec<LivePred>, notice: &[u16]) -> LiveQuery {
+        let id = self.next_member_id.fetch_add(1, Ordering::Relaxed);
+        let (mut sig, flats, key) = canonical(preds, None);
+        // 先頭は普通の購読の expand_always (0 / 1) と同じ場所。 2 = 見直しの節あり
+        sig.insert(0, 2);
+        sig.push(notice.len() as u64);
+        sig.extend(notice.iter().map(|&h| h as u64));
+        let (family, slot) = self.register_alts(id, sig, flats, vec![key], false, None, None, notice);
+        LiveQuery { kind: Kind::One { family, slot }, id, registry: self.clone() }
+    }
+
     /// 上位 k 件の購読を登録する: `branches` (`Or` 展開済み) の結果を `order` (ref の道 + 紐 + 降順か)
     /// で並べた先頭 `limit` 件。 枝は全部同じ形であること (鍵を複数持つ 1 つの member に束ね、 鍵たちの
     /// 順序の和の先頭 k 個を持つ)。 形の違う枝があれば Err。
@@ -4248,7 +4320,7 @@ impl LiveRegistry {
     ) -> Result<LiveQuery, String> {
         let (sig, flats, alts) = one_shape(branches, (order.0, order.1, HoleVal::Order(order.2)), "subscribe_top")?;
         let id = self.next_member_id.fetch_add(1, Ordering::Relaxed);
-        let (family, slot) = self.register_alts(id, sig, flats, alts, false, None, Some(limit));
+        let (family, slot) = self.register_alts(id, sig, flats, alts, false, None, Some(limit), &[]);
         Ok(LiveQuery { kind: Kind::One { family, slot }, id, registry: self.clone() })
     }
 
@@ -4265,7 +4337,7 @@ impl LiveRegistry {
         let carry = HoleVal::Group(sum.map_or(0, |h| h as u32 + 1));
         let (sig, flats, alts) = one_shape(branches, (group.0, group.1, carry), "subscribe_counts")?;
         let id = self.next_member_id.fetch_add(1, Ordering::Relaxed);
-        let (family, slot) = self.register_alts(id, sig, flats, alts, false, None, None);
+        let (family, slot) = self.register_alts(id, sig, flats, alts, false, None, None, &[]);
         Ok(LiveCounts { family, slot, id, registry: self.clone() })
     }
 
@@ -4274,7 +4346,7 @@ impl LiveRegistry {
     pub(crate) fn register_keyed(self: &Arc<Self>, branches: Vec<Vec<LivePred>>, key: (Vec<u16>, u16)) -> Result<LiveKeyed, String> {
         let (sig, flats, alts) = one_shape(branches, (key.0, key.1, HoleVal::Group(KEYED)), "subscribe_keyed")?;
         let id = self.next_member_id.fetch_add(1, Ordering::Relaxed);
-        let (family, slot) = self.register_alts(id, sig, flats, alts, false, None, None);
+        let (family, slot) = self.register_alts(id, sig, flats, alts, false, None, None, &[]);
         Ok(LiveKeyed { family, slot, id, registry: self.clone() })
     }
 
@@ -4297,7 +4369,7 @@ impl LiveRegistry {
         }
         if groups.len() == 1 {
             let (sig, flats, _, alts) = groups.pop().unwrap_or_default();
-            let (family, slot) = self.register_alts(id, sig, flats, alts, expand_always, None, None);
+            let (family, slot) = self.register_alts(id, sig, flats, alts, expand_always, None, None, &[]);
             return LiveQuery { kind: Kind::One { family, slot }, id, registry: self.clone() };
         }
         let n = groups.len();
@@ -4308,7 +4380,7 @@ impl LiveRegistry {
                 .enumerate()
                 .map(|(i, (sig, flats, _, alts))| {
                     let bid = self.next_member_id.fetch_add(1, Ordering::Relaxed);
-                    self.register_alts(bid, sig, flats, alts, expand_always, Some((w.clone(), i)), None)
+                    self.register_alts(bid, sig, flats, alts, expand_always, Some((w.clone(), i)), None, &[])
                 })
                 .collect(),
             state: Mutex::new(UnionState::new(n)),
@@ -4328,7 +4400,7 @@ impl LiveRegistry {
     ) -> (Arc<Family>, usize) {
         let (mut sig, flats, key) = canonical(preds, carry);
         sig.insert(0, expand_always as u64);
-        self.register_alts(id, sig, flats, vec![key], expand_always, union, limit)
+        self.register_alts(id, sig, flats, vec![key], expand_always, union, limit, &[])
     }
 
     /// 形 `sig` の family (無ければ作る) に、 鍵の選択肢 `alts` の member を加える。
@@ -4342,6 +4414,7 @@ impl LiveRegistry {
         expand_always: bool,
         union: Option<(std::sync::Weak<Union>, usize)>,
         limit: Option<usize>,
+        notice: &[u16],
     ) -> (Arc<Family>, usize) {
         let mut flats = flats;
         let specs = number_exists(&mut flats);
@@ -4354,7 +4427,7 @@ impl LiveRegistry {
                 self.register_counts(branches, (Vec::new(), via), th.sum_himo()).expect("check_exists で検査済み")
             })
             .collect();
-        let (family, slot) = self.register_alts_locked(id, sig, flats, &mut exists, alts, expand_always, union, limit);
+        let (family, slot) = self.register_alts_locked(id, sig, flats, &mut exists, alts, expand_always, union, limit, notice);
         drop(exists);
         (family, slot)
     }
@@ -4370,13 +4443,14 @@ impl LiveRegistry {
         expand_always: bool,
         union: Option<(std::sync::Weak<Union>, usize)>,
         limit: Option<usize>,
+        notice: &[u16],
     ) -> (Arc<Family>, usize) {
         let _edit = self.edit.lock();
         let family = match self.families().into_iter().find(|f| f.sig == sig) {
             Some(f) => f,
             None => {
                 let ex = std::mem::take(exists);
-                let f = Arc::new(Family::new(self.next_id.fetch_add(1, Ordering::Relaxed) as u64, sig, flats, ex));
+                let f = Arc::new(Family::new(self.next_id.fetch_add(1, Ordering::Relaxed) as u64, sig, flats, ex, notice));
                 f.expand_always.store(expand_always, Ordering::Relaxed);
                 self.replace_snap(|s| {
                     for &(h, node) in &f.routes {
@@ -4676,6 +4750,26 @@ impl LiveQuery {
         }
     }
 
+    /// [`TouchedLiveQuery::poll`] の中身: group の差分と、 見直しの節に積まれた根の entity (local、 昇順・重複なし)。
+    pub(crate) fn poll_touched(&self, eng: &crate::engine::Engine) -> (LiveDelta, Vec<u32>) {
+        self.check_engine(eng);
+        let peer = self.registry.peer.load(Ordering::Acquire);
+        let Kind::One { family, slot } = &self.kind else {
+            return (LiveDelta::default(), Vec::new());
+        };
+        let mut guard = family.settled.lock();
+        family.settle(eng, &mut guard);
+        let Settled { recs, vals, members, opart, order_view, .. } = &mut *guard;
+        match members[*slot].as_mut() {
+            Some(m) => {
+                let d = m.drain(|e| view_at(recs, vals, opart, *order_view, e), peer);
+                let t = m.touched.as_mut().map(Marks::take).unwrap_or_default();
+                (d, t)
+            }
+            None => (LiveDelta::default(), Vec::new()),
+        }
+    }
+
     /// engine 内で一意な購読 id。 [`LiveGroup::poll`] の
     /// 差分がどの購読のものかを表す。
     pub fn id(&self) -> u64 {
@@ -4758,6 +4852,16 @@ impl LiveQuery {
         let mut s = family.settled.lock();
         family.settle(eng, &mut s);
         s.members[slot].as_ref().is_some_and(|m| m.has(e, s.view(e)))
+    }
+
+    /// 最後の poll で呼び手に渡した集合 (= 呼び手が積分済みの集合) に `eids` が居るか。 settle しない — 次の poll までの
+    /// 変化は見ない。 `Or` の購読は扱わない (全部 false)。
+    pub(crate) fn reported_many(&self, eng: &crate::engine::Engine, eids: &[EntityId]) -> Vec<bool> {
+        self.check_engine(eng);
+        let Kind::One { family, slot } = &self.kind else { return vec![false; eids.len()] };
+        let s = family.settled.lock();
+        let Some(m) = s.members[*slot].as_ref() else { return vec![false; eids.len()] };
+        eids.iter().map(|&e| m.reported.get(enchudb_oplog::eid_local(e))).collect()
     }
 
     /// 複数の eid について [`contains`](Self::contains) (lock と settle は 1 回)。
@@ -5302,7 +5406,11 @@ impl GroupedLiveQuery {
     /// 満たすか」 の確認 (lock と settle) は全部で 1 回、 根への条件の組み立ても 1 回、 一覧を読む buffer は
     /// 使い回す。 小さい group が多い時の 1 group ごとの手間を減らす。
     pub fn members_many(&self, eng: &crate::engine::Engine, groups: &[EntityId]) -> Vec<Vec<EntityId>> {
-        let live = self.inner.contains_many(eng, groups);
+        self.members_many_where(eng, groups, self.inner.contains_many(eng, groups))
+    }
+
+    /// [`members_many`](Self::members_many) の中身: `live[i]` が偽の group は空。
+    fn members_many_where(&self, eng: &crate::engine::Engine, groups: &[EntityId], live: Vec<bool>) -> Vec<Vec<EntityId>> {
         let tests = self.tests(eng);
         let mut buf = Vec::new();
         groups
@@ -5325,7 +5433,11 @@ impl GroupedLiveQuery {
         if !self.inner.contains(eng, group) {
             return 0;
         }
-        let g = enchudb_oplog::eid_local(group);
+        self.count_one(eng, enchudb_oplog::eid_local(group))
+    }
+
+    /// group `g` (local eid) の members の数 (group が居るかは見ない)。
+    fn count_one(&self, eng: &crate::engine::Engine, g: u32) -> usize {
         if self.filter.is_empty() {
             return CellReader::pull_len(eng, self.via, g as u64);
         }
@@ -5362,6 +5474,11 @@ impl GroupedLiveQuery {
     /// 組み立てる手間の方が大きいので [`members_one`](Self::members_one))。
     fn tests(&self, eng: &crate::engine::Engine) -> Vec<RootTest> {
         self.filter.iter().map(|p| RootTest::new(eng, p)).collect()
+    }
+
+    /// 根の entity `e` (local) が根への条件を満たすか。
+    fn root_holds(&self, eng: &crate::engine::Engine, e: u32) -> bool {
+        self.filter.iter().all(|p| matches_leaf(eng, p, e))
     }
 
     /// group `g` (local eid) の members を 1 つだけ読む (順不同)。 条件は組み立てずに [`matches_leaf`] で当てる
@@ -5421,6 +5538,115 @@ impl GroupedLiveQuery {
 impl std::fmt::Debug for GroupedLiveQuery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GroupedLiveQuery").field("inner", &self.inner).field("via", &self.via).finish()
+    }
+}
+
+/// 根への条件が 1 列で決まるなら、 その紐 (`subscribe_touched` が見直しの節を張る紐)。 中身を数える条件 (`Exists` 系) は
+/// 別の entity の紐を読むので、 根の entity に印を付けても見直す場所にならない (None)。
+pub(crate) fn root_leaf_himo(p: &LivePred) -> Option<u16> {
+    match p {
+        LivePred::Eq { himo_id, .. }
+        | LivePred::EqText { himo_id, .. }
+        | LivePred::Range { himo_id, .. }
+        | LivePred::In { himo_id, .. }
+        | LivePred::Present { himo_id } => Some(*himo_id),
+        LivePred::Not(p) => root_leaf_himo(p),
+        _ => None,
+    }
+}
+
+/// 見直す場所だけを返す購読 ([`crate::engine::Engine::subscribe_touched`])。
+///
+/// 「所属会社の所在地が東京の 30 歳以上の社員」 を、 会社単位の購読 ([`GroupedLiveQuery`]) と同じく group (会社) の出入りで
+/// 持ち、 それに加えて **前回 poll 以降に根の紐 (所属会社の ref、 年齢) が書かれた社員** を返す。 社員ごとの答えは覚えず、
+/// 計算もしない — 呼び手は `touched` の社員を [`group_of`](Self::group_of) で引き直す。 書き込み 1 回のコストは印 1 つ
+/// (社員が何人いても、 会社の所在地の書き換えは会社 1 件の差分)。
+///
+/// 呼び手の持ち方 (社員 → 会社 の表): poll ごとに、 `removed` の会社の社員を外し、 `added` の会社の社員を
+/// [`members_many`](Self::members_many) で足し、 `touched` の社員を `group_of` で引き直して置き直す (None なら外す)。
+/// これで表は毎回 「今の答え」 と一致する (行って戻った書き込み・削除・slot の使い回しも、 引き直すだけで今の状態になる)。
+///
+/// `group_of` / `contains` / `members` / `members_many` / `count_in` の 「group が居るか」 は、 **最後の poll で渡した
+/// group の集合** で決める (今の集合ではない)。 poll と poll の間に group が入って出ると、 次の poll の差分には出ない
+/// (差し引き 0)。 その間に今の集合で 「居る」 と答えると、 呼び手は外すきっかけを失う (並行の書き込みの test で見つけた)。
+/// `groups` / `count` / `flatten` は今の集合 (ぜんぶ引き直す時用)。
+pub struct TouchedLiveQuery {
+    g: GroupedLiveQuery,
+}
+
+impl TouchedLiveQuery {
+    pub(crate) fn new(g: GroupedLiveQuery) -> Self {
+        TouchedLiveQuery { g }
+    }
+
+    /// 前回 poll からの group の差分と、 見直すべき根の entity (初回は登録時点の全 group が `added`)。
+    pub fn poll(&self, eng: &crate::engine::Engine) -> TouchedDelta {
+        let (d, t) = self.g.inner.poll_touched(eng);
+        TouchedDelta { added: d.added, removed: d.removed, touched: self.g.eids_of(&t) }
+    }
+
+    /// 根の entity `eid` が答えに居るなら、 その group (ref の 1 段目の先)。 ref と根への条件は今の値、 group が居るかは
+    /// 最後の poll で渡した集合で決める (型の doc)。 居なければ None (削除された entity も None)。
+    pub fn group_of(&self, eng: &crate::engine::Engine, eid: EntityId) -> Option<EntityId> {
+        let e = enchudb_oplog::eid_local(eid);
+        let g = CellReader::ref_cell(eng, self.g.via, e)?;
+        let peer = self.g.inner.registry.peer.load(Ordering::Acquire);
+        let ge = enchudb_oplog::make_eid(peer, g);
+        (self.g.inner.reported_many(eng, &[ge])[0] && self.g.root_holds(eng, e)).then_some(ge)
+    }
+
+    /// 根の entity `eid` が答えに居るか ([`group_of`](Self::group_of) が Some か)。
+    pub fn contains(&self, eng: &crate::engine::Engine, eid: EntityId) -> bool {
+        self.group_of(eng, eid).is_some()
+    }
+
+    /// 今条件を満たす group (eid 昇順)。
+    pub fn groups(&self, eng: &crate::engine::Engine) -> Vec<EntityId> {
+        self.g.groups(eng)
+    }
+
+    /// `group` を指していて根への条件を満たす entity (eid 昇順)。 `group` が最後の poll で渡した集合に居なければ空。
+    pub fn members(&self, eng: &crate::engine::Engine, group: EntityId) -> Vec<EntityId> {
+        self.members_many(eng, &[group]).pop().unwrap_or_default()
+    }
+
+    /// 複数の group の [`members`](Self::members) をまとめて引く (返り値は `groups` と同じ並び)。
+    pub fn members_many(&self, eng: &crate::engine::Engine, groups: &[EntityId]) -> Vec<Vec<EntityId>> {
+        self.g.members_many_where(eng, groups, self.g.inner.reported_many(eng, groups))
+    }
+
+    /// `group` の [`members`](Self::members) の数 (列は作らない)。
+    pub fn count_in(&self, eng: &crate::engine::Engine, group: EntityId) -> usize {
+        if !self.g.inner.reported_many(eng, &[group])[0] {
+            return 0;
+        }
+        self.g.count_one(eng, enchudb_oplog::eid_local(group))
+    }
+
+    /// [`GroupedLiveQuery::count`] と同じ。
+    pub fn count(&self, eng: &crate::engine::Engine) -> usize {
+        self.g.count(eng)
+    }
+
+    /// [`GroupedLiveQuery::flatten`] と同じ。
+    pub fn flatten(&self, eng: &crate::engine::Engine) -> Vec<EntityId> {
+        self.g.flatten(eng)
+    }
+
+    /// 未 poll の group の変化か見直しがありうるか。
+    pub fn is_dirty(&self) -> bool {
+        self.g.is_dirty()
+    }
+
+    /// engine 内で一意な購読 id。
+    pub fn id(&self) -> u64 {
+        self.g.id()
+    }
+}
+
+impl std::fmt::Debug for TouchedLiveQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TouchedLiveQuery").field("grouped", &self.g).finish()
     }
 }
 

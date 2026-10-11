@@ -13349,6 +13349,50 @@ impl Engine {
         Ok(crate::live::GroupedLiveQuery::new(q, via, filter))
     }
 
+    /// 見直す場所だけを返す購読 ([`crate::live::TouchedLiveQuery`])。 条件と group (ref の 1 段目の先) の分け方は
+    /// [`subscribe_grouped`](Self::subscribe_grouped) と同じで、 poll はそれに加えて **前回 poll 以降に根の紐 (`Via` の ref と
+    /// 根への条件の紐) が書かれた根の entity** を返す。 社員ごとの答えは持たない (呼び手が `group_of` で引き直す)。
+    ///
+    /// 根への条件は 1 列で決まるもの (`Eq` / `EqText` / `In` / `Range` / `Present` / その `Not`) だけ。 `Via` を
+    /// 展開した中身は `Or` の無い 1 本の形であること。
+    pub fn subscribe_touched(
+        &self,
+        preds: Vec<crate::live::LivePred>,
+    ) -> std::io::Result<crate::live::TouchedLiveQuery> {
+        let invalid = |m: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, m);
+        self.validate_live_preds(&preds)?;
+        let (via, inner, filter) = crate::live::split_grouped(preds).map_err(invalid)?;
+        let mut notice = vec![via];
+        for p in &filter {
+            notice.push(crate::live::root_leaf_himo(p).ok_or_else(|| {
+                invalid("subscribe_touched: root conditions must read only the row's own columns (Eq / EqText / In / Range / Present / Not)".into())
+            })?);
+        }
+        notice.sort_unstable();
+        notice.dedup();
+        self.validate_live_preds(&inner)?;
+        let mut branches = crate::live::dnf(inner).map_err(invalid)?;
+        if branches.len() != 1 {
+            return Err(invalid("subscribe_touched: the conditions behind the ref must not branch (no Or)".into()));
+        }
+        let branch = branches.pop().unwrap_or_default();
+        // ref の逆引き索引は 1 度組んでおく (subscribe_inner と同じ理由)。 group の中身を引く via も
+        let mut refs: Vec<u16> = branch.iter().flat_map(|p| p.ref_himos()).collect();
+        refs.push(via);
+        refs.sort_unstable();
+        refs.dedup();
+        for h in refs {
+            let _ = self.himos[h as usize].slice_len(0);
+        }
+        // 登録手順は subscribe_inner と同じ: route に載せる → 全紐の write_lock で barrier → 初期候補に印
+        let q = self.live.register_touched(branch, &notice);
+        for h in q.himos() {
+            self.himos[h as usize].write_barrier();
+        }
+        q.seed(self);
+        Ok(crate::live::TouchedLiveQuery::new(crate::live::GroupedLiveQuery::new(q, via, filter)))
+    }
+
     /// 条件 `preds` に当てはまる entity を、 ref の道 `group_path` をたどった先の紐 `group_himo` の
     /// 値ごとに数えた件数を購読する ([`crate::live::LiveCounts`])。 `group_path` が空なら根の紐。
     /// `Or` は枝が全部同じ形の時だけ (`city = A OR city = B`、 `In` と同じ)、 違えば `InvalidInput`。
