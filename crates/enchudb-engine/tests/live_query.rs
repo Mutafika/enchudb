@@ -397,6 +397,165 @@ fn via_subscription_under_concurrent_flips() {
     cleanup(&path);
 }
 
+/// poll されずに溜まった印 (書き手 1 本あたり 16384 件を超える) は、 書き手の側で entity の bit に移る
+/// (`PendingMarks`)。 bit に移った印も列のままの印と同じく 1 件も落とさずに poll に届くこと。 書き手 4 本が会社の city と
+/// 社員の会社・年齢を書き換え続け (会社の節と根の節の両方の印が 1 本あたり 16384 件を超える)、 書き手を止めるまで poll
+/// しない区切りと、 書いている最中も poll する区切りを交互にする。 区切りごとに、 社員単位の購読の積分が全件走査と、
+/// 見直す場所だけを返す購読 (`subscribe_touched`) の `touched` の和が書いた社員とちょうど一致する。 最後に 1 本で
+/// 社員の半分 (2 万) を消す (消した社員は印の付いた列が外れて見直される)。
+///
+/// 検出の実測: 取り出した bit を捨てる、 bit の位置を 1 つずらす、 bit を別の節 / 見直しの節に渡す、 見直しの節の列を
+/// 捨てる変異で落ちる。 解放の印の bit は次の test。
+#[test]
+fn unpolled_bursts_deliver_every_mark() {
+    let path = tmp_path("burst");
+    cleanup(&path);
+    let mut eng = Engine::create_growable_opts(&path, GrowableOptions::default()).unwrap();
+    eng.define_himo("company", ValueType::Ref, 0);
+    eng.define_himo("city", ValueType::Number, 4);
+    eng.define_himo("age", ValueType::Number, 0);
+    let company = eng.himo_id("company").unwrap() as u16;
+    let city = eng.himo_id("city").unwrap() as u16;
+    let age = eng.himo_id("age").unwrap() as u16;
+    let hubs: Vec<u64> = (0..20_000).map(|_| eng.entity().unwrap()).collect();
+    let users: Vec<u64> = (0..40_000).map(|_| eng.entity().unwrap()).collect();
+    for (i, &h) in hubs.iter().enumerate() {
+        eng.tie(h, "city", (i % 2) as u32);
+    }
+    for (i, &u) in users.iter().enumerate() {
+        eng.tie(u, "company", enchudb_oplog::eid_local(hubs[i % hubs.len()]));
+        eng.tie(u, "age", 18 + (i % 50) as u32);
+    }
+    let eng = Engine::concurrentize(eng);
+    let pred = || {
+        vec![
+            LivePred::Via { path: vec![company], pred: Box::new(LivePred::Eq { himo_id: city, value: 1 }) },
+            LivePred::Range { himo_id: age, lo: 30, hi: 1000 },
+        ]
+    };
+    let oracle = |eng: &Engine| -> BTreeSet<u64> {
+        users
+            .iter()
+            .copied()
+            .filter(|&u| {
+                let Some(c) = eng.get(u, "company") else { return false };
+                eng.get(enchudb_oplog::make_eid(eng.peer_id(), c as u32), "city") == Some(1)
+                    && eng.get(u, "age").is_some_and(|a| (30..=1000).contains(&a))
+            })
+            .collect()
+    };
+    let q = eng.subscribe(pred()).unwrap();
+    let tq = eng.subscribe_touched(pred()).unwrap();
+    let mut seen = BTreeSet::new();
+    integrate(&mut seen, q.poll(&eng));
+    let _ = tq.poll(&eng);
+    assert_eq!(seen, oracle(&eng), "張った直後");
+    for round in 0..4u64 {
+        let writers: Vec<_> = (0..4u64)
+            .map(|t| {
+                let eng = eng.clone();
+                let (hubs, users) = (hubs.clone(), users.clone());
+                std::thread::spawn(move || {
+                    let mut rng = Rng(0x5eed_0000_0000_0001 ^ (round * 4 + t + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+                    let mut wrote = Vec::new();
+                    for _ in 0..40_000 {
+                        let u = users[rng.below(users.len() as u64) as usize];
+                        let h = hubs[rng.below(hubs.len() as u64) as usize];
+                        match rng.below(100) {
+                            0..45 => eng.tie_to(h, "city", rng.below(2) as u32),
+                            45..60 => {
+                                eng.tie_to(u, "company", enchudb_oplog::eid_local(h));
+                                wrote.push(u);
+                            }
+                            _ => {
+                                eng.tie_to(u, "age", 18 + rng.below(50) as u32);
+                                wrote.push(u);
+                            }
+                        }
+                    }
+                    wrote
+                })
+            })
+            .collect();
+        let mut touched = BTreeSet::new();
+        // 奇数の区切りは書いている最中にも poll する (書き手の印を取り合う)
+        if round % 2 == 1 {
+            while !writers.iter().all(|w| w.is_finished()) {
+                integrate(&mut seen, q.poll(&eng));
+                touched.extend(tq.poll(&eng).touched);
+            }
+        }
+        let wrote: BTreeSet<u64> = writers.into_iter().flat_map(|w| w.join().unwrap()).collect();
+        integrate(&mut seen, q.poll(&eng));
+        touched.extend(tq.poll(&eng).touched);
+        assert_eq!(seen, oracle(&eng), "round {round}: 積分 != 全件走査");
+        assert_eq!(touched, wrote, "round {round}: touched の和 != 書いた社員");
+    }
+    // 1 本で社員の半分を消す (解放の印が 1 本の shard に 2 万)
+    let gone: BTreeSet<u64> = users.iter().copied().step_by(2).collect();
+    std::thread::scope(|sc| {
+        sc.spawn(|| {
+            for &u in &gone {
+                eng.delete(u);
+            }
+        });
+    });
+    integrate(&mut seen, q.poll(&eng));
+    let touched: BTreeSet<u64> = tq.poll(&eng).touched.into_iter().collect();
+    assert_eq!(seen, oracle(&eng), "消した後: 積分 != 全件走査");
+    assert!(seen.is_disjoint(&gone), "消した社員が答えに残った");
+    assert_eq!(touched, gone, "消した後: touched != 消した社員");
+    drop((q, tq));
+    drop(eng);
+    cleanup(&path);
+}
+
+/// 解放の印も poll されずに溜まれば bit に移る。 消した slot が作り直されて同じ条件を満たしても、 poll は消した entity を
+/// 「出た」、 作った entity を 「入った」 と返す (再利用された eid は出て入る = 呼び手の持つ eid は別物になった)。 容量
+/// ちょうどまで作ってから 2 万を消して 2 万を作るので、 作り直しは消した slot を使う。
+///
+/// 検出の実測: 解放の印の bit を捨てる変異で落ちる (再利用された eid が何も起きなかったように見える)。
+#[test]
+fn unpolled_reuse_burst_reports_leave_and_reenter() {
+    let path = tmp_path("reuse_burst");
+    cleanup(&path);
+    let mut eng = Engine::create_with_capacity(&path, 30_000).unwrap();
+    eng.define_himo("age", ValueType::Number, 100);
+    let age = eng.himo_id("age").unwrap() as u16;
+    let mut all = Vec::new();
+    while let Ok(e) = eng.entity() {
+        eng.tie(e, "age", 30);
+        all.push(e);
+    }
+    assert!(all.len() >= 30_000, "前提: 容量まで作れる");
+    let q = eng.subscribe(vec![LivePred::Eq { himo_id: age, value: 30 }]).unwrap();
+    let mut seen = BTreeSet::new();
+    integrate(&mut seen, q.poll(&eng));
+    assert_eq!(seen.len(), all.len());
+    // 3 つに 2 つ (2 万) を消す: 解放の印は 1 本の shard に 16384 件を超える
+    let gone: BTreeSet<u64> = all.iter().enumerate().filter(|(i, _)| i % 3 != 0).map(|(_, &e)| e).collect();
+    assert!(gone.len() > 16_384);
+    for &e in &gone {
+        eng.delete(e);
+    }
+    let made: BTreeSet<u64> = (0..gone.len())
+        .map(|_| {
+            let e = eng.entity().unwrap();
+            eng.tie(e, "age", 30);
+            e
+        })
+        .collect();
+    assert_eq!(made, gone, "前提: 作り直しは消した slot を使う");
+    let d = q.poll(&eng);
+    assert_eq!(d.removed, gone.iter().copied().collect::<Vec<_>>(), "消した entity が出ていない");
+    assert_eq!(d.added, made.iter().copied().collect::<Vec<_>>(), "作った entity が入っていない");
+    integrate(&mut seen, d);
+    assert_eq!(seen.len(), all.len());
+    drop(q);
+    drop(eng);
+    cleanup(&path);
+}
+
 /// 新しい種類の購読 (Or / 範囲の穴 / 集計 / 上位 k 件、 ref の先を含む) を **書き込みと並行して
 /// 登録し**、 書き込み 4 thread + 束の poll / 個別 poll / count を並行で回した後、 writer 停止後の
 /// 積分が手で数えた結果と一致すること。 lock 順 (Or の購読は family の lock を離してから自分を取る)
