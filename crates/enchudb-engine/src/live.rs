@@ -1086,9 +1086,15 @@ impl<T: MarkKey> Marks<T> {
     #[inline]
     fn add(&mut self, eid: T) {
         self.list.push(eid);
-        if self.list.len() > 4 * self.clean + 16384 {
+        if self.full() {
             self.compact();
         }
+    }
+
+    /// 畳む所まで溜まった。
+    #[inline]
+    fn full(&self) -> bool {
+        self.list.len() > 4 * self.clean + 16384
     }
 
     fn compact(&mut self) {
@@ -1111,6 +1117,105 @@ impl<T: MarkKey> Marks<T> {
 
     fn is_empty(&self) -> bool {
         self.list.is_empty()
+    }
+}
+
+/// 書き手が置く印 (shard ごと・節ごと)。 少ないうちは [`Marks`] の列。 poll されずに溜まって列を畳む所まで来たら、
+/// 印の entity を [`PageBits`] (4096 entity ごとの page の bit) に移し、 その後は bit を立てるだけにする。 bit は
+/// 書く時に eid の順に並ぶので、 書き手は整列しない (bit の方が列より大きくなる疎な印は、 今まで通り列を畳む)。
+///
+/// 旧: 書き手が行の鍵と shard の鍵を持ったまま列全体を整列して畳み、 印が 100 万 entity に届くと長いもので 1 回
+/// 4〜17 ms かかった (機械の混み方で違う)。 その間、 行の鍵の同じ stripe に当たった他の書き手が止まった (w1、 書き手
+/// 8 本・社員単位の購読・1 本 300 万回で、 1 ms 以上の行の鍵の待ちが 70〜100 回、 待ちの合計の半分以上)。 列は
+/// 「印の付いた entity の数の 4 倍 + 16384」 まで伸びるので、 同じ w1 の最大 RSS は 610 MB (bit に移すと 410 MB)。
+#[derive(Default)]
+struct PendingMarks {
+    marks: Marks,
+    bits: Option<PageBits>,
+}
+
+impl PendingMarks {
+    #[inline]
+    fn add(&mut self, eid: u32) {
+        if let Some(b) = &mut self.bits {
+            b.set(eid);
+            return;
+        }
+        self.marks.list.push(eid);
+        if self.marks.full() {
+            self.spill();
+        }
+    }
+
+    #[cold]
+    fn spill(&mut self) {
+        let list = &self.marks.list;
+        if PageBits::size_for(list) <= std::mem::size_of_val(list.as_slice()) {
+            let mut b = PageBits::default();
+            for &e in list {
+                b.set(e);
+            }
+            self.bits = Some(b);
+            self.marks = Marks::default();
+        } else {
+            self.marks.compact();
+        }
+    }
+
+    /// 整列せずに取り出して空にする: 列と、 bit に移っていれば bit (shard の鍵の下で呼ぶ — 持ち替えるだけ。 bit を読み
+    /// 出すのは鍵の外で)。
+    fn take_raw(&mut self) -> (Vec<u32>, Option<PageBits>) {
+        (self.marks.take_raw(), self.bits.take())
+    }
+}
+
+/// entity の集合を 4096 entity (512 B) ごとの page の bit で持つ。 触った page だけ確保する。 立てるだけで、 読むと
+/// 昇順。
+#[derive(Default)]
+struct PageBits(Vec<Option<Box<[u64; 64]>>>);
+
+impl PageBits {
+    /// `list` の entity を移した時の大きさ (byte): page の表と、 触る page。
+    fn size_for(list: &[u32]) -> usize {
+        let Some(&max) = list.iter().max() else { return 0 };
+        let pages = (max >> 12) as usize + 1;
+        let mut seen = vec![0u64; pages.div_ceil(64)];
+        let mut touched = 0;
+        for &e in list {
+            let p = (e >> 12) as usize;
+            let m = 1u64 << (p & 63);
+            if seen[p >> 6] & m == 0 {
+                seen[p >> 6] |= m;
+                touched += 1;
+            }
+        }
+        pages * std::mem::size_of::<Option<Box<[u64; 64]>>>() + touched * std::mem::size_of::<[u64; 64]>()
+    }
+
+    #[inline]
+    fn set(&mut self, e: u32) {
+        let p = (e >> 12) as usize;
+        if p >= self.0.len() {
+            self.0.resize_with(p + 1, || None);
+        }
+        self.0[p].get_or_insert_with(|| Box::new([0; 64]))[(e as usize >> 6) & 63] |= 1u64 << (e & 63);
+    }
+
+    fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        let pages = self.0.iter().enumerate().filter_map(|(p, page)| page.as_deref().map(|page| ((p as u32) << 12, page)));
+        pages.flat_map(|(base, page)| {
+            page.iter().enumerate().flat_map(move |(wi, &w)| {
+                let mut w = w;
+                std::iter::from_fn(move || {
+                    if w == 0 {
+                        return None;
+                    }
+                    let b = w.trailing_zeros();
+                    w &= w - 1;
+                    Some(base | ((wi as u32) << 6) | b)
+                })
+            })
+        })
     }
 }
 
@@ -1991,9 +2096,9 @@ struct Shard(Mutex<Pending>);
 /// 書き込み側が付ける印。
 struct Pending {
     /// 節ごと: 条件の紐が書かれた entity。
-    nodes: Vec<Marks>,
+    nodes: Vec<PendingMarks>,
     /// 解放された entity (slot 再利用で別 entity になりうる)。
-    freed: Marks,
+    freed: PendingMarks,
 }
 
 /// 節の答え: (鍵 id, 範囲の穴の値)。 値は根と範囲の穴の節を結ぶ道の上の節だけが持つ (他は 0)。
@@ -3453,8 +3558,8 @@ impl Family {
             notice: !notice.is_empty(),
             pending: (0..SHARDS)
                 .map(|_| {
-                    let nodes = (0..n + usize::from(!notice.is_empty())).map(|_| Marks::default()).collect();
-                    Shard(Mutex::new(Pending { nodes, freed: Marks::default() }))
+                    let nodes = (0..n + usize::from(!notice.is_empty())).map(|_| PendingMarks::default()).collect();
+                    Shard(Mutex::new(Pending { nodes, freed: PendingMarks::default() }))
                 })
                 .collect(),
             dirty: AtomicU32::new(0),
@@ -4035,23 +4140,37 @@ impl Family {
         }
         let mut freed = Vec::new();
         let mut touched = Vec::new();
+        // bit に移った印 (印が多い時) は shard の鍵の下では持ち替えるだけにして、 読み出すのは鍵を離してから (鍵の下で
+        // 読むと、 その shard の書き手が行の鍵を持ったまま次の印で待つ)。 受け手: 節 0..n、 見直しの節 n、 解放 n + 1
+        let n = self.nodes.len();
+        let mut late: Vec<(usize, PageBits)> = Vec::new();
         for (i, sh) in self.pending.iter().enumerate() {
             if mask & (1 << i) == 0 {
                 continue;
             }
             let mut p = sh.0.lock();
-            for (w, m) in work.iter_mut().zip(p.nodes.iter_mut()) {
+            // 見直しの節 (番兵、 `notice` の時だけある) は節の後ろ (dirty の bit はもう落としてある)
+            for (k, m) in p.nodes.iter_mut().enumerate() {
+                let (mut list, bits) = m.take_raw();
+                let w = if k < n { &mut work[k] } else { &mut touched };
                 if w.is_empty() {
-                    *w = m.take_raw();
+                    *w = list;
                 } else {
-                    w.append(&mut m.take_raw());
+                    w.append(&mut list);
                 }
+                late.extend(bits.map(|b| (k, b)));
             }
-            // 見直しの節 (番兵) は zip の外: 明示して取り出す (dirty の bit はもう落としてある)
-            if self.notice {
-                touched.append(&mut p.nodes[self.nodes.len()].take_raw());
-            }
-            freed.append(&mut p.freed.take_raw());
+            let (mut list, bits) = p.freed.take_raw();
+            freed.append(&mut list);
+            late.extend(bits.map(|b| (n + 1, b)));
+        }
+        for (k, b) in late {
+            let w = match k {
+                k if k < n => &mut work[k],
+                k if k == n => &mut touched,
+                _ => &mut freed,
+            };
+            w.extend(b.iter());
         }
         if !touched.is_empty() {
             touched.sort_unstable();
@@ -6166,6 +6285,67 @@ mod tests {
             assert_eq!(m.take(), want, "case {case}");
             assert!(m.is_empty());
         }
+    }
+
+    /// 書き手の印 (`PendingMarks`): 畳む所まで溜まった時、 bit の方が列より小さければ bit に移り、 その後は bit を
+    /// 立てるだけ。 疎な印 (bit の page の表が列より大きい) は今まで通り列を畳む。 取り出すと置いた entity の集合で、
+    /// bit の分は昇順・重複なし。 取り出した後は列から始め直す。 `size_for` は移した後の大きさと一致する。
+    #[test]
+    fn pending_marks_move_to_bits_only_when_smaller() {
+        let mut seed = 7u64;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        // (名前, 件数, 値, bit に移るか)
+        type Gen = fn(u32) -> u32;
+        // 1 回目の満杯は 16385 件 (65540 B)。 100 万の範囲に散ると page 245 枚 (127400 B) で列より大きいので畳み、
+        // 2 回目の満杯 (畳んだ数の 4 倍 + 16384 件) で移る
+        let cases: [(&str, usize, Gen, bool); 7] = [
+            ("密", 100_000, |r| r % 50_000, true),
+            ("密・番号が大きい", 100_000, |r| 3_000_000 + r % 50_000, true),
+            ("同じ値ばかり", 40_000, |r| r % 7, true),
+            ("閾値ちょうど", 16_385, |r| r % 100_000, true),
+            ("閾値の手前", 16_384, |r| r % 50_000, false),
+            ("2 回目の満杯で移る", 200_000, |r| r % 1_000_000, true),
+            ("疎 (1 page に 1 個)", 100_000, |r| (r % 200_000) << 13, false),
+        ];
+        for (name, n, value, to_bits) in cases {
+            let input: Vec<u32> = (0..n).map(|_| value(rnd())).collect();
+            let mut pm = PendingMarks::default();
+            for &x in &input {
+                pm.add(x);
+            }
+            assert_eq!(pm.bits.is_some(), to_bits, "[{name}] bit に移ったか");
+            let mut want = input.clone();
+            want.sort_unstable();
+            want.dedup();
+            if let Some(b) = &pm.bits {
+                assert!(pm.marks.list.is_empty(), "[{name}] 移した後に列が残った");
+                let size = b.0.len() * std::mem::size_of::<Option<Box<[u64; 64]>>>()
+                    + b.0.iter().flatten().count() * std::mem::size_of::<[u64; 64]>();
+                assert_eq!(PageBits::size_for(&input), size, "[{name}] size_for と移した後の大きさ");
+                let got: Vec<u32> = b.iter().collect();
+                assert_eq!(got, want, "[{name}] bit の読み出し (昇順・重複なし)");
+            }
+            let (mut out, bits) = pm.take_raw();
+            out.extend(bits.iter().flat_map(PageBits::iter));
+            out.sort_unstable();
+            out.dedup();
+            assert_eq!(out, want, "[{name}] 取り出した集合");
+            assert!(pm.bits.is_none() && pm.marks.list.is_empty(), "[{name}] 取り出した後が空でない");
+            pm.add(5);
+            assert!(pm.bits.is_none() && pm.marks.list == [5], "[{name}] 取り出した後は列から");
+        }
+        // 移した後に取り出すと、 列は空で bit だけ (移す前の列の印も bit に入っている)。 bit は昇順
+        let mut pm = PendingMarks::default();
+        for x in (0..20_000u32).rev() {
+            pm.add(x);
+        }
+        let (list, bits) = pm.take_raw();
+        assert!(list.is_empty());
+        let got: Vec<u32> = bits.expect("bit に移った").iter().collect();
+        assert_eq!(got, (0..20_000u32).collect::<Vec<_>>());
     }
 
     #[test]
