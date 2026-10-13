@@ -84,11 +84,43 @@ unsafe impl Send for AppendBucket {}
 
 /// 同じ eid の 2 本目以降を落とし、 eid の昇順にして返す (重複は稀 = re-tie 往復痕。 hash を使わない)。
 /// 前は重複を探すためだけに (eid, 位置) の写しを並べ、 並びは捨てて元の順 (最初に現れた順) で返していた。 今は並べた順で
-/// 返すので、 組み直した bucket は eid の昇順になる (組んだ時の bucket と同じ形)。 並べる物も (eid, 位置) の組から eid だけになる。
+/// 返すので、 組み直した bucket は eid の昇順になる (組んだ時の bucket と同じ形)。 bucket は 「前の昇順 + 後ろに足した順番外」
+/// なので、 読みと同じ [`sort_appended`] で後ろだけ並べて混ぜる。
 fn dedup_sorted(mut v: Vec<u32>) -> Vec<u32> {
-    v.sort_unstable();
+    sort_appended(&mut v);
     v.dedup();
     v
+}
+
+/// bucket から写した eid の列を昇順にする (verify した読み・組み直し)。 bucket は組んだ時と組み直した時の eid の昇順の上に、
+/// 書き換えで入ってきた entity が後ろに足されるので、 列は 「長い昇順 + 後ろの順番外」。 最初に崩れた所から後ろだけを写して
+/// 並べ、 列の後ろから混ぜる (前の昇順の部分は並べ直さない)。 昇順かは先に `is_sorted` (塊ごとにまとめて比べるので速い) で見て、
+/// 崩れた所も 256 個の塊ごとに `is_sorted` で飛ばしてから探す (1 つずつ探すと、 昇順の時に 1 行 0.07 → 0.30 ns になった)。
+/// 全部ばらばらでも `sort_unstable` と同じ並びを返す (後ろの写しの分だけ余計に手間がかかる)。
+pub(crate) fn sort_appended(v: &mut [u32]) {
+    if v.is_sorted() {
+        return;
+    }
+    const C: usize = 256;
+    let mut s = 0;
+    while s + C < v.len() && v[s..=s + C].is_sorted() {
+        s += C;
+    }
+    let k = s + v[s..].windows(2).position(|w| w[0] > w[1]).map_or(v.len() - s, |i| i + 1);
+    let mut b = v[k..].to_vec();
+    b.sort_unstable();
+    // 前 (v[..k]、 昇順) と b (昇順) を、 v の後ろから大きい順に置く。 置く先 w は読む前 i より前に来ない (w = i + j)
+    let (mut i, mut j) = (k, b.len());
+    while j > 0 {
+        let w = i + j;
+        if i > 0 && v[i - 1] > b[j - 1] {
+            v[w - 1] = v[i - 1];
+            i -= 1;
+        } else {
+            v[w - 1] = b[j - 1];
+            j -= 1;
+        }
+    }
 }
 
 impl AppendBucket {
@@ -455,6 +487,49 @@ mod tests {
             assert!(!b.needs_verify());
         }
         assert!(unsorted_before >= n_cases / 2, "負の対照: 組み直す前の bucket が昇順でない回が少ない ({unsorted_before})");
+    }
+
+    /// `sort_appended` は `sort_unstable` と同じ並びを返す (昇順・後ろだけ順番外・全部ばらばら・重複・空・1 つ・塊 (256 個) を
+    /// またぐ長さ)。 負の対照: 混ぜずに後ろだけ並べた形は昇順にならない
+    #[test]
+    fn sort_appended_matches_sort_unstable() {
+        let mut r = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        let mut caught = false;
+        let n_cases = if cfg!(miri) { 40 } else { 3000 };
+        for case in 0..n_cases {
+            let n = (next() % if cfg!(miri) { 300 } else { 2000 }) as usize;
+            let mut v: Vec<u32> = (0..n).map(|_| (next() % 500) as u32).collect();
+            match case % 4 {
+                0 => v.sort_unstable(),
+                1 => {
+                    let k = (next() as usize) % (n + 1);
+                    v[..k].sort_unstable();
+                }
+                2 => {
+                    // 前の昇順の後ろに、 少しだけ順番外 (書き換えの形)
+                    let k = n - n / 10;
+                    v[..k].sort_unstable();
+                }
+                _ => {}
+            }
+            let mut want = v.clone();
+            want.sort_unstable();
+            let mut got = v.clone();
+            sort_appended(&mut got);
+            assert_eq!(got, want, "case {case}");
+            if let Some(k) = v.windows(2).position(|w| w[0] > w[1]).map(|i| i + 1) {
+                let mut bad = v.clone();
+                bad[k..].sort_unstable();
+                caught |= !bad.is_sorted();
+            }
+        }
+        assert!(caught, "負の対照: 混ぜない形がいつも昇順になった (比べ方が弱い)");
     }
 
     /// 1 writer + N reader 並行: 破損なし、 len 単調非減少、 全要素 valid。
