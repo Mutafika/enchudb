@@ -12294,6 +12294,11 @@ impl Engine {
     // `RwLock<BucketCylinder>` を持つが、 ここで触る `stored_slice` は
     // immutable な mmap view (= read 中は lock 不要) なので thread-safe。
 
+    /// 並列の dense の道の sum で、 group の和の u64 の一番上の bit を 「row があった」 の印にする (和が 0 の group も返すため、
+    /// #474)。 1 行の書き込みは和と同じ 1 つで済む (bool の配列を別に持つ形は、 並列の sum で最大 1.45 倍遅かった)。 和は u32 の値の
+    /// 足し算なので、 1 group の行が 2^31 未満なら印の bit まで届かない。
+    const GROUP_SEEN: u64 = 1 << 63;
+
     /// 並列化閾値。 これ未満の `[lo, hi)` 幅では seq fallback (= thread spawn
     /// overhead が利益を上回らない、 実測ベースで 64k 程度が境界)。
     const PAR_RANGE_THRESHOLD: usize = 64_000;
@@ -12460,7 +12465,7 @@ impl Engine {
                     if g_stored == 0 || v_stored == 0 { continue; }
                     let g = (g_stored - 1) as usize;
                     if g < cap {
-                        acc[g] += (v_stored - 1) as u64;
+                        acc[g] = (acc[g] + (v_stored - 1) as u64) | Self::GROUP_SEEN;
                     } else {
                         Self::spill_sum(&mut spill, g as u32, (v_stored - 1) as u64);
                     }
@@ -12468,12 +12473,14 @@ impl Engine {
                 (acc, spill)
             })
             .reduce(|| (vec![0u64; cap], std::collections::HashMap::new()), |(mut a, mut a_spill), (b, b_spill)| {
-                for (i, &v) in b.iter().enumerate() { a[i] += v; }
+                for (i, &v) in b.iter().enumerate() {
+                    a[i] = ((a[i] & !Self::GROUP_SEEN) + (v & !Self::GROUP_SEEN)) | ((a[i] | v) & Self::GROUP_SEEN);
+                }
                 for (g, v) in b_spill { *a_spill.entry(g).or_insert(0) += v; }
                 (a, a_spill)
             });
-        let mut out: Vec<(u32, u64)> = (0..cap).filter(|&i| result[i] > 0).map(|i| (i as u32, result[i])).collect();
-        Self::push_spilled(&mut out, spill.into_iter().filter(|&(_, v)| v > 0));
+        let mut out: Vec<(u32, u64)> = (0..cap).filter(|&i| result[i] & Self::GROUP_SEEN != 0).map(|i| (i as u32, result[i] & !Self::GROUP_SEEN)).collect();
+        Self::push_spilled(&mut out, spill);
         out
     }
 
@@ -12805,11 +12812,10 @@ impl Engine {
         if lo >= hi { return vec![]; }
 
         if let Some(cap) = self.group_dense_cap(gid) {
-            // dense cap での group_sum: seen[] tracking を廃止して
-            // hot loop の per-iter store を 2 → 1 に圧縮。
-            // 「acc[g] == 0」 が non-empty 判定の代用、 値 0 と「データ無し」を
-            // 区別したい時は別 API を使うこと。
+            // row のあった group は、 和が 0 でも返す (hint の無い道・逐次の道と同じ答え、 #474)。 「row があった」 は bool の配列に
+            // 書くだけ (読まない)。 和の一番上の bit を印にする形 (並列の版) は、 この輪では 1.06〜1.22 倍遅かった。
             let mut acc: Vec<u64> = vec![0; cap];
+            let mut seen: Vec<bool> = vec![false; cap];
             let mut spill: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
             for i in lo..hi {
                 let g_stored = groups[i];
@@ -12818,12 +12824,13 @@ impl Engine {
                 let g = (g_stored - 1) as usize;
                 if g < cap {
                     acc[g] += (s_stored - 1) as u64;
+                    seen[g] = true;
                 } else {
                     Self::spill_sum(&mut spill, g as u32, (s_stored - 1) as u64);
                 }
             }
-            let mut out: Vec<(u32, u64)> = (0..cap).filter(|&i| acc[i] > 0).map(|i| (i as u32, acc[i])).collect();
-            Self::push_spilled(&mut out, spill.into_iter().filter(|&(_, v)| v > 0));
+            let mut out: Vec<(u32, u64)> = (0..cap).filter(|&i| seen[i]).map(|i| (i as u32, acc[i])).collect();
+            Self::push_spilled(&mut out, spill);
             out
         } else {
             let mut map: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
@@ -13204,7 +13211,7 @@ impl Engine {
                     if g_stored == 0 || s_stored == 0 { continue; }
                     let g = (g_stored - 1) as usize;
                     if g < cap {
-                        acc[g] += (s_stored - 1) as u64;
+                        acc[g] = (acc[g] + (s_stored - 1) as u64) | Self::GROUP_SEEN;
                     } else {
                         Self::spill_sum(&mut spill, g as u32, (s_stored - 1) as u64);
                     }
@@ -13212,12 +13219,14 @@ impl Engine {
                 (acc, spill)
             })
             .reduce(|| (vec![0u64; cap], std::collections::HashMap::new()), |(mut a, mut a_spill), (b, b_spill)| {
-                for (i, &v) in b.iter().enumerate() { a[i] += v; }
+                for (i, &v) in b.iter().enumerate() {
+                    a[i] = ((a[i] & !Self::GROUP_SEEN) + (v & !Self::GROUP_SEEN)) | ((a[i] | v) & Self::GROUP_SEEN);
+                }
                 for (g, v) in b_spill { *a_spill.entry(g).or_insert(0) += v; }
                 (a, a_spill)
             });
-        let mut out: Vec<(u32, u64)> = (0..cap).filter(|&i| result[i] > 0).map(|i| (i as u32, result[i])).collect();
-        Self::push_spilled(&mut out, spill.into_iter().filter(|&(_, v)| v > 0));
+        let mut out: Vec<(u32, u64)> = (0..cap).filter(|&i| result[i] & Self::GROUP_SEEN != 0).map(|i| (i as u32, result[i] & !Self::GROUP_SEEN)).collect();
+        Self::push_spilled(&mut out, spill);
         out
     }
 

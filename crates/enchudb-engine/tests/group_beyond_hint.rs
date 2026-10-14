@@ -3,7 +3,7 @@
 //!
 //! 14 個の関数を、 (a) 書いた値を覚えた写しから数えた答え、 (b) hint の無い同じ値の列 (HashMap の道) の答え、 の
 //! 2 つと比べる。 行数は並列の閾値 (64000) の下と上の両方。 hint の道の答えが group の昇順なことも見る。
-//! 和が 0 の group は作らない (`_range` / `_par` は和が 0 の group を返さず、 逐次の版は返す。 #474 の別の話)。
+//! 和が 0 の group はここでは作らない (それは `group_zero_sum.rs` で見る)。
 
 use enchudb_engine::{Engine, ValueType};
 use enchudb_oplog::EntityId;
