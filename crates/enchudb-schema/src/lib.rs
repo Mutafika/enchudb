@@ -1884,16 +1884,35 @@ impl<'a> Table<'a> {
     // `sum` と同じ pattern (= table の eid_range を auto-bind して engine の
     // `_range` primitive を呼ぶ)。 stored_slice 直 scan で auto-vectorize する。
 
-    /// table 内の `col` の最小値 (= MIN(col))。 全 missing なら None。
+    /// table 内の `col` の最小値 (= MIN(col))。 全 missing なら None。 Number の列は、 列の索引を値の順にたどって
+    /// 最初の row の値 (列をなめない。 値ごとの bucket がそのまま値の順)。
     pub fn min(&self, col: &str) -> Option<u32> {
+        if let Some(v) = self.first_value(col, false) {
+            return v;
+        }
         let himo = format!("{}.{}", self.inner.name, col);
         self.eid_extents().into_iter().filter_map(|(lo, hi)| self.db.eng.min_range(&himo, lo, hi)).min()
     }
 
-    /// table 内の `col` の最大値 (= MAX(col))。 全 missing なら None。
+    /// table 内の `col` の最大値 (= MAX(col))。 全 missing なら None。 たどり方は [`min`](Self::min) と同じ。
     pub fn max(&self, col: &str) -> Option<u32> {
+        if let Some(v) = self.first_value(col, true) {
+            return v;
+        }
         let himo = format!("{}.{}", self.inner.name, col);
         self.eid_extents().into_iter().filter_map(|(lo, hi)| self.db.eng.max_range(&himo, lo, hi)).max()
+    }
+
+    /// Number の列 `col` の、 table の eid の枠の中の row の最小 (`desc` なら最大) の値。 Number の列でなければ None
+    /// (呼び手が列をなめる)。 `Some(None)` = 値のある row が無い。
+    fn first_value(&self, col: &str, desc: bool) -> Option<Option<u32>> {
+        let cd = self.inner.col(col).filter(|c| c.ty == ColumnType::Number)?;
+        let ext = self.eid_extents();
+        let inside = |e: EntityId| {
+            let l = enchudb_oplog::eid_local(e);
+            ext.iter().any(|&(lo, hi)| lo <= l && l < hi)
+        };
+        Some(self.db.eng.first_by_id(cd.himo_id, 0, u64::MAX, desc, inside).map(|(v, _)| v as u32))
     }
 
     /// `group` でグループ化した上での `val` 最小値 (= MIN(val) GROUP BY group)。
@@ -5037,6 +5056,188 @@ fn th_of(table: &TableInner, spec: ThSpec) -> Option<Th> {
     }
 }
 
+/// 条件を索引の道に向けて解いたもの ([`Plan::of`])。
+enum Plan {
+    /// ref をたどる / OR / NOT / 存在 などを含む (engine の `find_by` に任せる)
+    Complex,
+    /// 常に 0 件 (未知の列・型の合わない値・空の範囲・まだ誰も書いていない語・空の IN)
+    Empty,
+    Simple(Simple),
+}
+
+/// ref をたどらない 等値 / IN / 範囲 の AND を、 engine の値に解いたもの。 索引の数 (値ごとの bucket の live の数) で
+/// 候補の種を選ぶ・件数を索引だけで出す・並びの列をたどる、 に使う。
+#[derive(Clone)]
+struct Simple {
+    /// 等値 (himo, 値)
+    eq: Vec<(u16, u64)>,
+    /// IN (himo, 値の昇順・重複なし)。 1 つまで
+    in_: Option<(u16, Vec<u64>)>,
+    /// 範囲 (himo, lo, hi)。 同じ列の範囲は重ねて 1 つに (`where_ge` + `where_lt` など)
+    ranges: Vec<(u16, u64, u64)>,
+}
+
+/// 並びの列をたどる計画 (`Query::walk_plan`)。
+enum Walk {
+    /// 常に 0 件
+    Empty,
+    /// 条件 `s` (並びの列の範囲は外してある) を列で確かめながら、 並びの列の `lo..=hi` を値の順にたどる。 `rep` = 確かめる
+    /// 代表列 (条件の無い `.all()` の時だけ)
+    Run { s: Simple, lo: u64, hi: u64, rep: Option<u16> },
+    /// たどらない: 条件 (解いたまま、 並びの列の範囲も入れて) で候補を引いて並べる
+    Sort(Simple),
+}
+
+/// 候補の種にした条件 (列で確かめなくてよいもの)。
+#[derive(Clone, Copy, PartialEq)]
+enum Seed {
+    None,
+    Eq,
+    In,
+    Range(usize),
+}
+
+impl Plan {
+    fn of(eng: &Engine, preds: &[Predicate]) -> Result<Plan, SchemaError> {
+        if preds.iter().any(|p| {
+            matches!(p, Predicate::Via(..) | Predicate::Or(_) | Predicate::Not(_) | Predicate::Present(_) | Predicate::Exists { .. } | Predicate::ExistsEq { .. })
+        }) {
+            return Ok(Plan::Complex);
+        }
+        let mut s = Simple { eq: Vec::new(), in_: None, ranges: Vec::new() };
+        let mut empty = false;
+        for p in preds {
+            match p {
+                Predicate::Eq(h, _) if *h == u16::MAX => empty = true,
+                Predicate::Eq(h, v) => s.eq.push((*h, *v)),
+                Predicate::EqText(h, t) => match eng.vocab_id(t) {
+                    Some(vid) => s.eq.push((*h, vid as u64)),
+                    None => empty = true,
+                },
+                Predicate::In(h, vs) => {
+                    if s.in_.is_some() {
+                        return Err(SchemaError::BadValue("multiple where_in not supported yet".into()));
+                    }
+                    s.in_ = Some((*h, vs.clone()));
+                }
+                Predicate::Range { himo_name, lo, hi } => match eng.himo_id(himo_name).and_then(|h| u16::try_from(h).ok()) {
+                    None => empty = true,
+                    Some(h) => match s.ranges.iter_mut().find(|r| r.0 == h) {
+                        Some(r) => {
+                            r.1 = r.1.max(*lo);
+                            r.2 = r.2.min(*hi);
+                        }
+                        None => s.ranges.push((h, *lo, *hi)),
+                    },
+                },
+                Predicate::Via(..) | Predicate::Or(_) | Predicate::Not(_) | Predicate::Present(_) | Predicate::Exists { .. } | Predicate::ExistsEq { .. } => {
+                    unreachable!("先頭で Complex にしている")
+                }
+            }
+        }
+        if empty || s.ranges.iter().any(|r| r.1 > r.2) || s.in_.as_ref().is_some_and(|(_, vs)| vs.is_empty()) {
+            return Ok(Plan::Empty);
+        }
+        Ok(Plan::Simple(s))
+    }
+}
+
+impl Simple {
+    fn is_empty(&self) -> bool {
+        self.eq.is_empty() && self.in_.is_none() && self.ranges.is_empty()
+    }
+
+    /// 列 `himo` の範囲を外して返す (無ければ全部 = `0..=u64::MAX`)。 並びの列の範囲は、 たどる区間にする。
+    fn take_range(&mut self, himo: u16) -> (u64, u64) {
+        match self.ranges.iter().position(|r| r.0 == himo) {
+            Some(i) => {
+                let (_, lo, hi) = self.ranges.remove(i);
+                (lo, hi)
+            }
+            None => (0, u64::MAX),
+        }
+    }
+
+    /// 条件が 1 つの列だけなら、 索引の数だけで出す件数 (等値は O(1)、 IN は値の数、 範囲は範囲の中の値の数に比例)。
+    fn count_only(&self, eng: &Engine) -> Option<usize> {
+        match (self.eq.as_slice(), &self.in_, self.ranges.as_slice()) {
+            ([(h, v)], None, []) => Some(eng.count_value_by_id(*h, *v)),
+            ([], Some((h, vs)), []) => Some(vs.iter().map(|&v| eng.count_value_by_id(*h, v)).sum()),
+            ([], None, [(h, lo, hi)]) => Some(eng.count_range_by_id(*h, *lo, *hi)),
+            _ => None,
+        }
+    }
+
+    /// 候補の種: 索引の数が一番少ない条件と、 その数 (条件が無ければ None)。 等値どうしの AND は engine の
+    /// `query_by_id64` が一番小さい bucket を軸にするので、 等値は 1 つの種として数える (数は等値の中の最小)。
+    fn seed(&self, eng: &Engine) -> Option<(usize, Seed)> {
+        let mut best: Option<(usize, Seed)> = None;
+        let mut offer = |n: usize, s: Seed| {
+            if best.is_none_or(|b| n < b.0) {
+                best = Some((n, s));
+            }
+        };
+        if let Some(n) = self.eq.iter().map(|&(h, v)| eng.count_value_by_id(h, v)).min() {
+            offer(n, Seed::Eq);
+        }
+        if let Some((h, vs)) = &self.in_ {
+            offer(vs.iter().map(|&v| eng.count_value_by_id(*h, v)).sum(), Seed::In);
+        }
+        for (i, &(h, lo, hi)) in self.ranges.iter().enumerate() {
+            offer(eng.count_range_by_id(h, lo, hi), Seed::Range(i));
+        }
+        best
+    }
+
+    /// 条件に合う entity。 条件の種類が 1 つだけなら数えずにその索引を引き、 2 つ以上なら索引の数が一番少ない条件を種に
+    /// して、 残りの条件を列で確かめる (範囲は範囲の索引を引く — 前は範囲を全部の row の後ろで確かめていた)。
+    fn find(&self, eng: &Engine) -> Vec<EntityId> {
+        let kinds = usize::from(!self.eq.is_empty()) + usize::from(self.in_.is_some()) + self.ranges.len();
+        let seed = if kinds <= 1 {
+            if !self.eq.is_empty() {
+                Seed::Eq
+            } else if self.in_.is_some() {
+                Seed::In
+            } else {
+                Seed::Range(0)
+            }
+        } else {
+            match self.seed(eng) {
+                Some((0, _)) | None => return Vec::new(),
+                Some((_, s)) => s,
+            }
+        };
+        let mut c = match seed {
+            Seed::Eq => eng.query_by_id64(&self.eq),
+            Seed::In => {
+                let (h, vs) = self.in_.as_ref().expect("種にした IN");
+                eng.pull_in_by_id64(*h, vs)
+            }
+            Seed::Range(i) => {
+                let (h, lo, hi) = self.ranges[i];
+                eng.pull_range_by_id(h, lo, hi)
+            }
+            Seed::None => unreachable!("条件が 1 つ以上ある"),
+        };
+        if kinds > 1 {
+            c.retain(|&e| self.holds(eng, e, seed));
+        }
+        c
+    }
+
+    /// `e` が条件を満たすか (列を読む)。 種にした条件 `skip` は見ない。
+    fn holds(&self, eng: &Engine, e: EntityId, skip: Seed) -> bool {
+        (skip == Seed::Eq || self.eq.iter().all(|&(h, v)| eng.get_by_id(e, h) == Some(v)))
+            && (skip == Seed::In
+                || self.in_.as_ref().is_none_or(|(h, vs)| eng.get_by_id(e, *h).is_some_and(|x| vs.binary_search(&x).is_ok())))
+            && self
+                .ranges
+                .iter()
+                .enumerate()
+                .all(|(i, &(h, lo, hi))| skip == Seed::Range(i) || eng.get_by_id(e, h).is_some_and(|x| lo <= x && x <= hi))
+    }
+}
+
 pub struct Query<'a> {
     db: &'a Database,
     table: Arc<TableInner>,
@@ -5639,7 +5840,21 @@ impl<'a> Query<'a> {
         self
     }
 
+    /// 件数。 条件が 1 つの列の等値 / IN / 範囲だけなら、 索引の数 (値ごとの bucket の live の数) を足すだけで entity を
+    /// 読まない (等値は O(1)、 範囲は範囲の中の値の数に比例)。 それ以外は `find().len()`。 `limit` があれば超えない。
     pub fn count(self) -> Result<usize, SchemaError> {
+        // 並びは件数に関係ないが、 未知の列は find と同じく誤りにする
+        self.order_col()?;
+        let eng = self.db.engine();
+        match Plan::of(eng, &self.preds)? {
+            Plan::Empty => return Ok(0),
+            Plan::Simple(s) => {
+                if let Some(n) = s.count_only(eng) {
+                    return Ok(self.limit.map_or(n, |l| n.min(l)));
+                }
+            }
+            Plan::Complex => {}
+        }
         Ok(self.find()?.len())
     }
 
@@ -5650,13 +5865,24 @@ impl<'a> Query<'a> {
 
     pub fn find(mut self) -> Result<Vec<EntityId>, SchemaError> {
         let Some((path, himo, desc)) = self.order_col()? else { return self.find_set() };
-        // 並べてから切る: 集合は limit 無しで取り、 並びの値 (ref の道をたどった先) で並べる
         let limit = self.limit.take();
         self.order = None;
         let eng = self.db.engine();
+        // この table の列で並べる時は、 列を値の順にたどって limit 件で止めるか、 解いた条件で候補を引いて並べるか
+        // (`walk_plan`)。 ref をたどった先の列で並べる時と、 条件が単純でない時は、 候補を引いて並べる
+        let plan = if path.is_empty() { self.walk_plan(himo, limit.unwrap_or(usize::MAX))? } else { None };
+        let set = match plan {
+            Some(Walk::Empty) => return Ok(Vec::new()),
+            Some(Walk::Run { s, lo, hi, rep }) => {
+                let keep = |e: EntityId| s.holds(eng, e, Seed::None) && rep.is_none_or(|r| eng.get_by_id(e, r).is_some());
+                return Ok(eng.ordered_by_id(himo, lo, hi, desc, limit.unwrap_or(usize::MAX), keep));
+            }
+            Some(Walk::Sort(s)) => s.find(eng),
+            None => self.find_set()?,
+        };
+        // 並べてから切る: 集合は limit 無しで取り、 並びの値 (ref の道をたどった先) で並べる
         // 並びは engine の値 (BigInt の符号化は大小の順を保つ)
-        let mut keyed: Vec<((u64, u32), EntityId)> = self
-            .find_set()?
+        let mut keyed: Vec<((u64, u32), EntityId)> = set
             .into_iter()
             .filter_map(|e| {
                 let mut cur = e;
@@ -5694,76 +5920,86 @@ impl<'a> Query<'a> {
             return Ok(out);
         }
 
-        // 1. Eq / EqText / In を engine 側 query に折り込む。 Range は post-filter。
+        // Eq / EqText / In / Range を engine の値に解決し、 索引の数で一番少ない条件を種にして、 残りは列で確かめる。
         // column 名は `{table}.{col}` で prefix されてて他テーブルと共有しない設計
         // (case 1: column 名空間分離)。 marker cond は不要。
-        let mut eq_conds: Vec<(u16, u64)> = Vec::with_capacity(self.preds.len());
-
-        let mut in_pred: Option<(u16, Vec<u64>)> = None;
-        let mut range_preds: Vec<(String, u64, u64)> = Vec::new();
-        let mut empty = false;
-
-        for p in self.preds {
-            match p {
-                Predicate::Eq(h, _) if h == u16::MAX => { empty = true; }
-                Predicate::Eq(h, v) => eq_conds.push((h, v)),
-                Predicate::EqText(h, s) => match eng.vocab_id(&s) {
-                    Some(vid) => eq_conds.push((h, vid as u64)),
-                    None => empty = true,
-                },
-                Predicate::In(h, vs) => {
-                    if in_pred.is_some() {
-                        return Err(SchemaError::BadValue("multiple where_in not supported yet".into()));
-                    }
-                    in_pred = Some((h, vs));
-                }
-                Predicate::Range { himo_name, lo, hi } => range_preds.push((himo_name, lo, hi)),
-                Predicate::Via(..) | Predicate::Or(_) | Predicate::Not(_) | Predicate::Present(_) | Predicate::Exists { .. } | Predicate::ExistsEq { .. } => {
-                    unreachable!("Via / Or / Not / Present / Exists は find の先頭で find_by に回している")
-                }
-            }
-        }
-        if empty { return Ok(Vec::new()); }
-
-        // 2. base candidates。
-        //    - eq_conds あり → engine query が primary index
-        //    - eq_conds 無し + IN あり → IN 集合自体を候補の seed にする (issue12:
-        //      旧実装は IN を post-filter 専用にしていて、 単独 where_in が
-        //      query_by_id(&[]) = 空集合の retain となり常に 0 件だった)
-        //    - どちらも無し = `.all()` 系 → table 所属を表す代表 column (PK or
-        //      first col) で「値が tie された全 entity」 を取る。
-        //      case 1 設計では「table の row」 = 「table の column を 1 つ以上 tie してる entity」、
-        //      厳密には全 column union だが、 代表 column slice で実用上十分。
-        let mut candidates = if !eq_conds.is_empty() {
-            let mut c = eng.query_by_id64(&eq_conds);
-            // 3. IN は候補集合への set-membership filter として intersect
-            //    (pull_in_by_id64 の結果は sort + dedup 済み)
-            if let Some((h, vs)) = in_pred {
-                let in_sorted = eng.pull_in_by_id64(h, &vs);
-                c.retain(|e| in_sorted.binary_search(e).is_ok());
-            }
-            c
-        } else if let Some((h, vs)) = in_pred {
-            eng.pull_in_by_id64(h, &vs)
-        } else {
-            let representative_hid = self.table.pk
-                .or_else(|| if self.table.cols.is_empty() { None } else { Some(0) })
-                .map(|i| self.table.cols[i].himo_id);
-            match representative_hid {
+        let s = match Plan::of(eng, &self.preds)? {
+            Plan::Empty => return Ok(Vec::new()),
+            Plan::Simple(s) => s,
+            Plan::Complex => unreachable!("Via / Or / Not / Present / Exists は find の先頭で find_by に回している"),
+        };
+        let mut candidates = if s.is_empty() {
+            // 条件なし = `.all()` 系 → table 所属を表す代表 column (PK or first col) で 「値が tie された全 entity」 を取る。
+            // case 1 設計では「table の row」 = 「table の column を 1 つ以上 tie してる entity」、
+            // 厳密には全 column union だが、 代表 column slice で実用上十分。
+            match self.rep_himo() {
                 Some(hid) => eng.entities_with_himo(hid),
                 None => Vec::new(),
             }
+        } else {
+            s.find(eng)
         };
-
-        // 4. post-filter range predicates (Column 直読み、 engine の値で比べる)
-        if !range_preds.is_empty() {
-            candidates.retain(|&eid| {
-                range_preds.iter().all(|(h, lo, hi)| eng.get(eid, h).is_some_and(|v| *lo <= v && v <= *hi))
-            });
-        }
-
         if let Some(n) = self.limit { candidates.truncate(n); }
         Ok(candidates)
+    }
+
+    /// table 所属を表す代表 column (PK、 無ければ先頭の列) の himo。
+    fn rep_himo(&self) -> Option<u16> {
+        self.table.pk
+            .or_else(|| if self.table.cols.is_empty() { None } else { Some(0) })
+            .map(|i| self.table.cols[i].himo_id)
+    }
+
+    /// 条件が単純な時の 最小 / 最大 (`desc`) を、 列 `himo` を値の順にたどって最初に条件に合った row の値で出す。 たどる道を
+    /// 使わない時 ([`walk_plan`](Self::walk_plan) の判断) は None (呼び手が候補を引いて読む)。 `Some(None)` = 値のある row が
+    /// 無い。
+    fn first_value(&self, himo: u16, desc: bool) -> Result<Option<Option<u64>>, SchemaError> {
+        match self.walk_plan(himo, 1)? {
+            Some(Walk::Empty) => Ok(Some(None)),
+            Some(Walk::Run { s, lo, hi, rep }) => {
+                let eng = self.db.engine();
+                let keep = |e: EntityId| s.holds(eng, e, Seed::None) && rep.is_none_or(|r| eng.get_by_id(e, r).is_some());
+                Ok(Some(eng.first_by_id(himo, lo, hi, desc, keep).map(|(v, _)| v)))
+            }
+            Some(Walk::Sort(_)) | None => Ok(None),
+        }
+    }
+
+    /// `order_by` の列 `himo` (この table の列) を値の順にたどって、 条件に合う row を `limit` 件まで読むか (全部を引いて
+    /// 並べない)、 候補を引いて並べるかを決める。 None = 条件が単純でない (呼び手が `find_set` で引いて並べる)。
+    ///
+    /// - 条件が無い (`.all()`) 時は、 find と同じく代表列のある row だけ (たどる時に代表列を確かめる。 並びの列が代表列
+    ///   なら要らない)。 条件がある時は、 等値と同じく条件に合う entity
+    /// - 並びの列の範囲は、 たどる区間にする (列で確かめない)。 条件が無い (か並びの列の範囲だけ) なら、 limit が無くても
+    ///   たどる (値ごとの bucket がそのまま値の順なので並べ直さない)
+    /// - ほかの条件がある時は、 候補 m 件を引いて並べる手間 (m 件ぶん) と、 たどって limit 件に当たるまで読む手間 (条件に
+    ///   当たる割合が m / N なら約 limit · N / m 件) を比べ、 m² > 2 · limit · N の時だけたどる。 N は table の eid の枠の
+    ///   大きさ (row の数の上限) なので、 迷う時は並べる道に倒れる。 limit が無い時はたどらない。 並べる道には解いた条件を
+    ///   そのまま渡す (`Walk::Sort`、 条件を解き直さない)
+    fn walk_plan(&self, himo: u16, limit: usize) -> Result<Option<Walk>, SchemaError> {
+        let eng = self.db.engine();
+        let mut s = match Plan::of(eng, &self.preds)? {
+            Plan::Complex => return Ok(None),
+            Plan::Empty => return Ok(Some(Walk::Empty)),
+            Plan::Simple(s) => s,
+        };
+        eng.rebuild();
+        let rep = if s.is_empty() { self.rep_himo().filter(|&r| r != himo) } else { None };
+        let full = s.clone();
+        let (lo, hi) = s.take_range(himo);
+        if !s.is_empty() {
+            let m = s.seed(eng).map_or(0, |(n, _)| n);
+            if m == 0 {
+                return Ok(Some(Walk::Empty));
+            }
+            let rows: u64 = eng
+                .table_eid_extents(&self.table.name)
+                .map_or(u64::MAX, |x| x.iter().map(|&(a, b)| u64::from(b.saturating_sub(a))).sum());
+            if limit == usize::MAX || (m as u128) * (m as u128) <= 2 * (limit as u128) * u128::from(rows) {
+                return Ok(Some(Walk::Sort(full)));
+            }
+        }
+        Ok(Some(Walk::Run { s, lo, hi, rep }))
     }
 
     /// この条件の **結果集合を購読する** (live query)。 以降の書き込みで結果が変わった分
@@ -6125,20 +6361,28 @@ impl<'a> Query<'a> {
         Ok(raw - (n << 63))
     }
 
-    /// sub-set 内の `col` の最小値 (Number / BigInt)。
+    /// sub-set 内の `col` の最小値 (Number / BigInt)。 条件が単純なら列を値の順にたどる (全部の row を読まない)。
     pub fn min_i64(self, col: &str) -> Result<Option<i64>, SchemaError> {
-        let (himo, big) = self.resolve_num(col)?;
-        let db = self.db;
-        let eids = self.find()?;
-        Ok(db.eng.min64(&himo, &eids).map(|v| if big { big_val(v) } else { v as i64 }))
+        self.extreme_i64(col, false)
     }
 
-    /// sub-set 内の `col` の最大値 (Number / BigInt)。
+    /// sub-set 内の `col` の最大値 (Number / BigInt)。 条件が単純なら列を値の順にたどる (全部の row を読まない)。
     pub fn max_i64(self, col: &str) -> Result<Option<i64>, SchemaError> {
+        self.extreme_i64(col, true)
+    }
+
+    fn extreme_i64(self, col: &str, desc: bool) -> Result<Option<i64>, SchemaError> {
         let (himo, big) = self.resolve_num(col)?;
+        let conv = |v: u64| if big { big_val(v) } else { v as i64 };
+        if let Some(hid) = self.table.col(col).map(|c| c.himo_id)
+            && let Some(v) = self.first_value(hid, desc)?
+        {
+            return Ok(v.map(conv));
+        }
         let db = self.db;
         let eids = self.find()?;
-        Ok(db.eng.max64(&himo, &eids).map(|v| if big { big_val(v) } else { v as i64 }))
+        let v = if desc { db.eng.max64(&himo, &eids) } else { db.eng.min64(&himo, &eids) };
+        Ok(v.map(conv))
     }
 
     /// sub-set 内で `col` が tie された entity 数 (= `SELECT COUNT(col) WHERE ...`)。
@@ -6162,20 +6406,27 @@ impl<'a> Query<'a> {
         Ok(db.eng.sum_eids_par(&himo, &eids))
     }
 
-    /// sub-set 内の `col` の最小値 (= `SELECT MIN(col) WHERE ...`)。
+    /// sub-set 内の `col` の最小値 (= `SELECT MIN(col) WHERE ...`)。 Number の列で条件が単純なら、 列を値の順に
+    /// たどって最初に条件に合った row の値 (全部の row を読まない)。
     pub fn min(self, col: &str) -> Result<Option<u32>, SchemaError> {
-        let himo = self.resolve_himo(col)?;
-        let db = self.db;
-        let eids = self.find()?;
-        Ok(db.eng.min_eids_par(&himo, &eids))
+        self.extreme_u32(col, false)
     }
 
-    /// sub-set 内の `col` の最大値 (= `SELECT MAX(col) WHERE ...`)。
+    /// sub-set 内の `col` の最大値 (= `SELECT MAX(col) WHERE ...`)。 たどり方は [`min`](Self::min) と同じ。
     pub fn max(self, col: &str) -> Result<Option<u32>, SchemaError> {
+        self.extreme_u32(col, true)
+    }
+
+    fn extreme_u32(self, col: &str, desc: bool) -> Result<Option<u32>, SchemaError> {
         let himo = self.resolve_himo(col)?;
+        if let Some(cd) = self.table.col(col).filter(|c| c.ty == ColumnType::Number)
+            && let Some(v) = self.first_value(cd.himo_id, desc)?
+        {
+            return Ok(v.map(|v| v as u32));
+        }
         let db = self.db;
         let eids = self.find()?;
-        Ok(db.eng.max_eids_par(&himo, &eids))
+        Ok(if desc { db.eng.max_eids_par(&himo, &eids) } else { db.eng.min_eids_par(&himo, &eids) })
     }
 
     /// sub-set 内で `group` × `sum` の GROUP BY 集計 (= `SUM(sum) GROUP BY group WHERE ...`)。
