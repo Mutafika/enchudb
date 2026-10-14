@@ -1419,11 +1419,13 @@ impl<'a> TableBuilder<'a> {
     /// fallback + 並列無効に落ちる ([#46])。 `dept` / `status` / `category` など、
     /// group / filter される low-cardinality 列に付けると効く。 値の上限ではなく
     /// hint なので、 超過しても tie は可能 (`BucketCylinder` が動的拡張する)。
+    /// hint 以上の値の group も集計に入る (dense の配列の外の分は HashMap で集計する、 [#474])。
     ///
     /// 列宣言メソッド (`number` / `tag` / `leaf` / `column` / `ref_to`) の直後に
     /// chain する。 列が一つも宣言されていなければ no-op。
     ///
     /// [#46]: https://github.com/Mutafika/enchudb/issues/46
+    /// [#474]: https://github.com/Mutafika/enchudb/issues/474
     pub fn cardinality(mut self, n: u32) -> Self {
         if let Some(last) = self.cols.last_mut() {
             last.2 = n;
