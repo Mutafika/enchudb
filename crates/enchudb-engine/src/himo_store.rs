@@ -984,6 +984,11 @@ impl HimoStore {
         }
     }
 
+    /// 列の長さ (値を書いたことのある一番大きい eid + 1)。 [`entities_with_value`](Self::entities_with_value) がなめる数。
+    pub fn column_len(&self) -> u32 {
+        self.col().count()
+    }
+
     /// 値が tie された全 entity（= column 非ゼロ走査）。O(next_eid) で重い。
     pub fn entities_with_value(&self) -> Vec<u32> {
         let col = self.col();

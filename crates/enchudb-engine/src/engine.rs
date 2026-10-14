@@ -13291,6 +13291,12 @@ impl Engine {
         hs.pull_range(lo, hi).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect()
     }
 
+    /// 紐の列の長さ (値を書いたことのある一番大きい local eid + 1)。 列をなめる読み ([`entities_with_himo`](Self::entities_with_himo)
+    /// など) の手間はこれに比例する。 未知の紐は 0。
+    pub fn column_len_by_id(&self, hid: u16) -> u32 {
+        self.himos.get(hid as usize).map_or(0, |hs| hs.column_len())
+    }
+
     /// 値が `value` の entity の数 (live、 [`pull`](Self::pull) の件数と同じ)。 dense に置いている値は bucket の live の
     /// 数を読むだけ (O(1))、 sparse に置いている値 (値の種類の多い列) は引いて数える。 未知の紐は 0。
     pub fn count_value_by_id(&self, hid: u16, value: u64) -> usize {

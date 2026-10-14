@@ -66,6 +66,9 @@ const DENSE_FREE_LEN: usize = 1024;
 /// (倍々で伸ばすので、 伸ばした直後は最大 64 B)。
 const DENSE_MIN_FILL: usize = 4;
 
+/// 値の区間 `(最小, 最大, 置き場)`。 置き場は `Some(配列)` か `None` (sparse) ([`LockFreeCylinder::segments`])。
+type Segment = (u64, u64, Option<usize>);
+
 /// 配列 `k` の添字の上限 (配列はここまでしか伸ばさない)。
 #[inline]
 fn region_cap(k: usize) -> usize {
@@ -574,32 +577,38 @@ impl LockFreeCylinder {
     /// 値の空間を、 配列の今の長さ `lens` で区間に分けて値の昇順に並べる: `(区間の最小, 最大, 置き場)`。 置き場は
     /// `Some(配列)` か `None` (sparse)。 区間ごとに置き場が 1 つに決まる (配列が覆う値は bucket、 それ以外は sparse、
     /// module doc): sparse `[0, base)`、 `LOW`、 sparse (間)、 `NEG`、 `POS`、 sparse (上)。 `set_low_base` が `LOW` の窓を
-    /// `NEG` の窓より下に置くので、 区間は重ならない。
-    fn segments(&self, lens: [usize; 3]) -> Vec<(u64, u64, Option<usize>)> {
+    /// `NEG` の窓より下に置くので、 区間は重ならない。 返り値は区間の配列と、 その中の使う数 (区間は 6 つまで。 読み 1 回ごとに
+    /// 呼ぶので heap を使わない)。
+    fn segments(&self, lens: [usize; 3]) -> ([Segment; 6], usize) {
         let base = self.low_base.load(Ordering::Relaxed);
         let (nl, np, nn) = (lens[LOW] as u64, lens[POS] as u64, lens[NEG] as u64);
-        let mut segs = Vec::with_capacity(6);
+        let mut segs = [(0u64, 0u64, None::<usize>); 6];
+        let mut len = 0;
+        let mut push = |seg: Segment| {
+            segs[len] = seg;
+            len += 1;
+        };
         // 次の区間の始まり
         let mut at = 0u64;
         if nl > 0 {
             if base > 0 {
-                segs.push((0, base - 1, None));
+                push((0, base - 1, None));
             }
-            segs.push((base, base + nl - 1, Some(LOW)));
+            push((base, base + nl - 1, Some(LOW)));
             at = base + nl;
         }
         let neg_lo = MID - nn;
         if at < neg_lo {
-            segs.push((at, neg_lo - 1, None));
+            push((at, neg_lo - 1, None));
         }
         if nn > 0 {
-            segs.push((neg_lo, MID - 1, Some(NEG)));
+            push((neg_lo, MID - 1, Some(NEG)));
         }
         if np > 0 {
-            segs.push((MID, MID + np - 1, Some(POS)));
+            push((MID, MID + np - 1, Some(POS)));
         }
-        segs.push((MID + np, u64::MAX, None));
-        segs
+        push((MID + np, u64::MAX, None));
+        (segs, len)
     }
 
     /// 値が `lo..=hi` の entry を値の順 (`desc` なら大きい順) に、 値ごとに `f(値, eid の列, Column で確かめるか)` に渡す。
@@ -618,11 +627,12 @@ impl LockFreeCylinder {
         let _ = self.sparse.snapshot(|sp| {
             let guard = epoch::pin();
             let vecs = [LOW, POS, NEG].map(|k| self.vec_of(k, &guard));
-            let mut segs = self.segments(vecs.map(|v| v.len()));
+            let (mut segs, len) = self.segments(vecs.map(|v| v.len()));
+            let segs = &mut segs[..len];
             if desc {
                 segs.reverse();
             }
-            for (a, b, at) in segs {
+            for &mut (a, b, at) in segs {
                 let (a, b) = (a.max(lo), b.min(hi));
                 if a > b {
                     continue;
@@ -670,7 +680,8 @@ impl LockFreeCylinder {
             let vecs = [LOW, POS, NEG].map(|k| self.vec_of(k, &guard));
             let mut n = 0usize;
             let mut checked: Vec<u32> = Vec::new();
-            for (a, b, at) in self.segments(vecs.map(|v| v.len())) {
+            let (segs, len) = self.segments(vecs.map(|v| v.len()));
+            for &(a, b, at) in &segs[..len] {
                 let (a, b) = (a.max(lo), b.min(hi));
                 if a > b {
                     continue;
