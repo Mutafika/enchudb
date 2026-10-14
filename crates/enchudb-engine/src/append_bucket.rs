@@ -82,22 +82,45 @@ pub struct AppendBucket {
 unsafe impl Sync for AppendBucket {}
 unsafe impl Send for AppendBucket {}
 
-/// 同じ eid の 2 本目以降を落とす (最初の 1 本を残し、 順序は保つ)。 重複は稀 (re-tie 往復痕) なので、
-/// 並べた写しで重複の有無だけを見て、 無ければそのまま返す (hash を使わない)。
-fn dedup_first(v: Vec<u32>) -> Vec<u32> {
-    let mut sorted: Vec<(u32, u32)> = v.iter().enumerate().map(|(i, &e)| (e, i as u32)).collect();
-    sorted.sort_unstable();
-    if sorted.windows(2).all(|w| w[0].0 != w[1].0) {
-        return v;
+/// 同じ eid の 2 本目以降を落とし、 eid の昇順にして返す (重複は稀 = re-tie 往復痕。 hash を使わない)。
+/// 前は重複を探すためだけに (eid, 位置) の写しを並べ、 並びは捨てて元の順 (最初に現れた順) で返していた。 今は並べた順で
+/// 返すので、 組み直した bucket は eid の昇順になる (組んだ時の bucket と同じ形)。 bucket は 「前の昇順 + 後ろに足した順番外」
+/// なので、 読みと同じ [`sort_appended`] で後ろだけ並べて混ぜる。
+fn dedup_sorted(mut v: Vec<u32>) -> Vec<u32> {
+    sort_appended(&mut v);
+    v.dedup();
+    v
+}
+
+/// bucket から写した eid の列を昇順にする (verify した読み・組み直し)。 bucket は組んだ時と組み直した時の eid の昇順の上に、
+/// 書き換えで入ってきた entity が後ろに足されるので、 列は 「長い昇順 + 後ろの順番外」。 最初に崩れた所から後ろだけを写して
+/// 並べ、 列の後ろから混ぜる (前の昇順の部分は並べ直さない)。 昇順かは先に `is_sorted` (塊ごとにまとめて比べるので速い) で見て、
+/// 崩れた所も 256 個の塊ごとに `is_sorted` で飛ばしてから探す (1 つずつ探すと、 昇順の時に 1 行 0.07 → 0.30 ns になった)。
+/// 全部ばらばらでも `sort_unstable` と同じ並びを返す (後ろの写しの分だけ余計に手間がかかる)。
+pub(crate) fn sort_appended(v: &mut [u32]) {
+    if v.is_sorted() {
+        return;
     }
-    // (eid, 位置) の昇順で、 同じ eid の 2 本目以降の位置に印
-    let mut drop = vec![false; v.len()];
-    for w in sorted.windows(2) {
-        if w[0].0 == w[1].0 {
-            drop[w[1].1 as usize] = true;
+    const C: usize = 256;
+    let mut s = 0;
+    while s + C < v.len() && v[s..=s + C].is_sorted() {
+        s += C;
+    }
+    let k = s + v[s..].windows(2).position(|w| w[0] > w[1]).map_or(v.len() - s, |i| i + 1);
+    let mut b = v[k..].to_vec();
+    b.sort_unstable();
+    // 前 (v[..k]、 昇順) と b (昇順) を、 v の後ろから大きい順に置く。 置く先 w は読む前 i より前に来ない (w = i + j)
+    let (mut i, mut j) = (k, b.len());
+    while j > 0 {
+        let w = i + j;
+        if i > 0 && v[i - 1] > b[j - 1] {
+            v[w - 1] = v[i - 1];
+            i -= 1;
+        } else {
+            v[w - 1] = b[j - 1];
+            j -= 1;
         }
     }
-    v.into_iter().zip(drop).filter(|&(_, d)| !d).map(|(e, _)| e).collect()
 }
 
 impl AppendBucket {
@@ -206,7 +229,7 @@ impl AppendBucket {
     /// published prefix を `keep` 判定で組み直して backing を atomic swap する
     /// (request12 P2 = incremental compaction)。単一 writer (write_lock 下) 前提。
     ///
-    /// - 同一 eid の重複 slot (re-tie 往復痕) は最初の 1 本だけ残す (dedup)
+    /// - 同一 eid の重複 slot (re-tie 往復痕) は 1 本だけ残し、 残した entry は eid の昇順に並べ直す (dedup)
     /// - 旧 backing は epoch で全 reader 通過後に解放 — reader は停止しない
     /// - swap 後に live を確定し、removed flag を **backing swap の後で** false に
     ///   戻す (Release)。reader は flag を Acquire で slice より先に読むので、
@@ -219,7 +242,7 @@ impl AppendBucket {
         let b = unsafe { cur.deref() };
         let l = b.len.load(Ordering::Relaxed); // 単一 writer なので自身の len は Relaxed で可
         let src = unsafe { b.published(l) };
-        let kept = dedup_first(src.iter().copied().filter(|&e| keep(e)).collect());
+        let kept = dedup_sorted(src.iter().copied().filter(|&e| keep(e)).collect());
 
         let ncap = kept.len().next_power_of_two().max(INITIAL_CAP);
         let nb = Buf::with_cap(ncap);
@@ -413,7 +436,7 @@ mod tests {
         assert_eq!(b.read_to_vec(), (50..100).collect::<Vec<_>>());
         assert!(b.capacity() <= 64, "backing が縮んでいない: cap {}", b.capacity());
 
-        // dup (re-tie 往復痕) は最初の 1 本だけ残る
+        // dup (re-tie 往復痕) は 1 本だけ残る
         let d = AppendBucket::new();
         for e in [5u32, 5, 7, 5] {
             d.push(e);
@@ -421,13 +444,92 @@ mod tests {
         let n = d.compact_in(&guard, |_| true);
         assert_eq!(n, 2);
         assert_eq!(d.read_to_vec(), vec![5, 7]);
-        // 順序は最初に現れた順のまま
+        // 組み直すと eid の昇順になる (前は最初に現れた順のまま = [9, 5, 3, 7])
         let o = AppendBucket::new();
         for e in [9u32, 5, 9, 3, 5, 7] {
             o.push(e);
         }
         assert_eq!(o.compact_in(&guard, |_| true), 4);
-        assert_eq!(o.read_to_vec(), vec![9, 5, 3, 7]);
+        assert_eq!(o.read_to_vec(), vec![3, 5, 7, 9]);
+    }
+
+    /// 組み直した bucket は eid の昇順で、 中身は前と同じ (keep の通る eid を 1 本ずつ)。 bucket の形は、 組んだ時の昇順の後ろに
+    /// 書き換えで入ってきた順番外の entry と re-tie の重複が続く形。 負の対照: 組み直す前の bucket は昇順でない。
+    #[test]
+    fn compact_sorts_by_eid() {
+        let mut rng = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let guard = epoch::pin();
+        let mut unsorted_before = 0;
+        let n_cases = if cfg!(miri) { 14 } else { 700 };
+        for case in 0..n_cases {
+            let n = [1usize, 2, 63, 64, 65, 300, 1000][case % 7];
+            let b = AppendBucket::new();
+            let mut pushed = Vec::with_capacity(n);
+            for i in 0..n {
+                let e = if i < n / 2 { i as u32 * 3 } else { (next() % (3 * n as u64 + 7)) as u32 };
+                b.push(e);
+                b.live_inc();
+                pushed.push(e);
+            }
+            unsorted_before += usize::from(!b.read_to_vec().is_sorted());
+            let keep = |e: u32| e % 7 != 3;
+            let want: std::collections::BTreeSet<u32> = pushed.iter().copied().filter(|&e| keep(e)).collect();
+            let got_n = b.compact_in(&guard, keep);
+            assert_eq!(got_n, want.len(), "case {case}");
+            assert_eq!(b.read_to_vec(), want.iter().copied().collect::<Vec<_>>(), "case {case}: 中身か並びが違う");
+            assert_eq!(b.live() as usize, want.len());
+            assert!(!b.needs_verify());
+        }
+        assert!(unsorted_before >= n_cases / 2, "負の対照: 組み直す前の bucket が昇順でない回が少ない ({unsorted_before})");
+    }
+
+    /// `sort_appended` は `sort_unstable` と同じ並びを返す (昇順・後ろだけ順番外・全部ばらばら・重複・空・1 つ・塊 (256 個) を
+    /// またぐ長さ)。 負の対照: 混ぜずに後ろだけ並べた形は昇順にならない
+    #[test]
+    fn sort_appended_matches_sort_unstable() {
+        let mut r = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        let mut caught = false;
+        let n_cases = if cfg!(miri) { 40 } else { 3000 };
+        for case in 0..n_cases {
+            let n = (next() % if cfg!(miri) { 300 } else { 2000 }) as usize;
+            let mut v: Vec<u32> = (0..n).map(|_| (next() % 500) as u32).collect();
+            match case % 4 {
+                0 => v.sort_unstable(),
+                1 => {
+                    let k = (next() as usize) % (n + 1);
+                    v[..k].sort_unstable();
+                }
+                2 => {
+                    // 前の昇順の後ろに、 少しだけ順番外 (書き換えの形)
+                    let k = n - n / 10;
+                    v[..k].sort_unstable();
+                }
+                _ => {}
+            }
+            let mut want = v.clone();
+            want.sort_unstable();
+            let mut got = v.clone();
+            sort_appended(&mut got);
+            assert_eq!(got, want, "case {case}");
+            if let Some(k) = v.windows(2).position(|w| w[0] > w[1]).map(|i| i + 1) {
+                let mut bad = v.clone();
+                bad[k..].sort_unstable();
+                caught |= !bad.is_sorted();
+            }
+        }
+        assert!(caught, "負の対照: 混ぜない形がいつも昇順になった (比べ方が弱い)");
     }
 
     /// 1 writer + N reader 並行: 破損なし、 len 単調非減少、 全要素 valid。

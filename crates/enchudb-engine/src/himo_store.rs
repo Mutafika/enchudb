@@ -830,7 +830,8 @@ impl HimoStore {
                 .into_iter()
                 .filter(|&eid| stored_at(col, eid) == value + 1)
                 .collect();
-            out.sort_unstable();
+            // bucket は 「組んだ時・組み直した時の昇順 + 後ろに足した順番外」 なので、 後ろだけ並べて混ぜる
+            crate::append_bucket::sort_appended(&mut out);
             out.dedup();
             out
         }
@@ -854,7 +855,7 @@ impl HimoStore {
                 }
             }
             out.truncate(w);
-            out[start..].sort_unstable();
+            crate::append_bucket::sort_appended(&mut out[start..]);
             let mut w = start;
             for r in start..out.len() {
                 if w == start || out[r] != out[w - 1] {
@@ -1136,6 +1137,61 @@ mod tests {
     /// 大きな値 (sparse run) と小さな値 (dense bucket) を混ぜた書き込み / 書き換え / 削除の後でも、
     /// `pull` / `slice_len` / `unique_count` / `total` が Column の中身と一致する。 sparse の古い entry
     /// が半分を超えるたびに組み直される (件数が膨らまない) こと。
+    /// verify の要る bucket の `pull` / `pull_into` は eid の昇順・重複なしで、 列をなめた答えと同じ。 並べるのは bucket の後ろだけ
+    /// (`sort_appended`。 bucket は 「組んだ時・組み直した時の昇順 + 後ろに足した順番外」)。 書き換えを続け、 組み直しの前・後の両方で
+    /// 見る (verify の要らない読みは追記順のままなので、 中身だけ比べる)。 `pull_into` は前に別の中身が入った buffer の後ろに足す。
+    /// 負の対照: verify の要る読みのうち、 並べる前の写し (`read_to_vec_verify`) が昇順でないものがある (後ろだけ並べる道を通る)
+    #[test]
+    fn verified_pull_is_sorted_after_churn() {
+        const N: u32 = 12_000; // make_store の region (64 KB) に入る数
+        let hs = make_store(N);
+        let mut cells = vec![0u32; N as usize];
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for e in 0..N {
+            let v = (next() % 20) as u32;
+            assert!(hs.set(e, v as u64));
+            cells[e as usize] = v;
+        }
+        let _ = hs.pull(0u32); // 索引を組んでから (以後 writer が維持する)
+        let (mut verified, mut unsorted_raw) = (0usize, 0usize);
+        for round in 0..8 {
+            // 1 round = 人数の半分の書き換え (2 round ほどで、 値ごとの bucket が組み直される)
+            for _ in 0..N / 2 {
+                let e = (next() % N as u64) as u32;
+                let v = (next() % 20) as u32;
+                assert!(hs.set(e, v as u64));
+                cells[e as usize] = v;
+            }
+            for v in 0..20u32 {
+                let want: Vec<u32> = (0..N).filter(|&i| cells[i as usize] == v).collect();
+                let (raw, needs) = hs.cyl.read_to_vec_verify(v as u64);
+                let got = hs.pull(v);
+                let mut into = vec![u32::MAX, 7];
+                hs.pull_into(v, &mut into);
+                assert_eq!(&into[..2], &[u32::MAX, 7], "pull_into が前の中身を変えた");
+                if needs {
+                    verified += 1;
+                    unsorted_raw += usize::from(!raw.is_sorted());
+                    assert!(got.windows(2).all(|w| w[0] < w[1]), "round {round} 値 {v}: verify した pull が昇順・重複なしでない");
+                    assert!(into[2..].windows(2).all(|w| w[0] < w[1]), "round {round} 値 {v}: verify した pull_into が昇順・重複なしでない");
+                }
+                let mut g = got.clone();
+                g.sort_unstable();
+                assert_eq!(g, want, "round {round} 値 {v}: pull");
+                let mut g = into[2..].to_vec();
+                g.sort_unstable();
+                assert_eq!(g, want, "round {round} 値 {v}: pull_into");
+            }
+        }
+        assert!(verified >= 50 && unsorted_raw >= 10, "負の対照: verify の要る読み {verified}・並べる前が昇順でない読み {unsorted_raw} が少ない");
+    }
+
     #[test]
     fn sparse_runs_stay_exact_under_churn() {
         const N: u32 = 400;
