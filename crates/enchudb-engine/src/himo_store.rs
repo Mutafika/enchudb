@@ -12,6 +12,7 @@
 
 use crossbeam_epoch as epoch;
 use parking_lot::{Mutex, MutexGuard};
+use std::ops::ControlFlow;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -241,6 +242,67 @@ fn ready(col: Column) -> OnceLock<Column> {
     let cell = OnceLock::new();
     let _ = cell.set(col);
     cell
+}
+
+/// 1 つの値の bucket の中の entity を、 eid の昇順・重複なしで、 要るなら Column で確かめながら 1 件ずつ出す
+/// ([`HimoStore::walk_values`] が渡す)。
+///
+/// 全部を写して並べない: bucket は 「組んだ時・組み直した時の昇順の頭 + 後ろに足した順番外」 (sparse の値は run ごとの昇順を
+/// つないだもの) なので、 頭 (最初に崩れた所まで) はそのまま読み、 後ろだけを heap にして小さい順に取り出し、 2 つを混ぜる。
+/// 手間は 頭を探す分 (塊ごとの `is_sorted`) + 後ろの数 + 出した数・飛ばした古い entry の数。 上位 k や最小は bucket の大きさに
+/// よらない (前は bucket を全部写して確かめて並べていた: 100 万行の値 1 つ = 1 万件)。
+pub(crate) struct BucketIter<'a> {
+    head: &'a [u32],
+    at: usize,
+    tail: std::collections::BinaryHeap<std::cmp::Reverse<u32>>,
+    /// Column で確かめる時の (列, stored 形式の値 = 値 + 1)。 古い entry の無い bucket は None
+    check: Option<(&'a Column, u64)>,
+    /// 前に出した (か確かめて落とした) eid。 同じ eid の 2 つ目 (書き換えで戻った値の重複) を飛ばす
+    last: Option<u32>,
+}
+
+impl<'a> BucketIter<'a> {
+    fn new(raw: &'a [u32], check: Option<(&'a Column, u64)>) -> Self {
+        let p = crate::append_bucket::sorted_prefix_len(raw);
+        let tail = raw[p..].iter().map(|&e| std::cmp::Reverse(e)).collect();
+        BucketIter { head: &raw[..p], at: 0, tail, check, last: None }
+    }
+}
+
+impl Iterator for BucketIter<'_> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
+        loop {
+            let h = self.head.get(self.at).copied();
+            let t = self.tail.peek().map(|r| r.0);
+            let e = match (h, t) {
+                (None, None) => return None,
+                (Some(x), Some(y)) if y < x => {
+                    self.tail.pop();
+                    y
+                }
+                (Some(x), _) => {
+                    self.at += 1;
+                    x
+                }
+                (None, Some(y)) => {
+                    self.tail.pop();
+                    y
+                }
+            };
+            if self.last == Some(e) {
+                continue;
+            }
+            self.last = Some(e);
+            if let Some((col, s)) = self.check
+                && stored_at(col, e) != s
+            {
+                continue;
+            }
+            return Some(e);
+        }
+    }
 }
 
 // SAFETY: Cylinder の bucket の書き手は値ごとの鍵で 1 本 (組んだ後の書き手、 `value_locks`)、 sparse と配列の差し替えの
@@ -867,6 +929,30 @@ impl HimoStore {
         }
     }
 
+    /// 値が `lo..=hi` の entity を値の順 (`desc` なら大きい順) に、 値ごとに `f(値, その値の entity を 1 件ずつ出す
+    /// [`BucketIter`])` に渡す。 出すのは Column で確かめた live なものだけで、 eid の昇順・重複なし。 `f` が `Break` を返したら
+    /// 止める。
+    ///
+    /// 全部を引いて並べ直さない: 値ごとの bucket (dense) と値の順の run (sparse) を値の順にたどり、 bucket の中も要る分だけ
+    /// 出すので、 上位 k・最小 / 最大は k 件で止まる。 dense の空の要素は飛ばす。
+    pub(crate) fn walk_values(&self, lo: u64, hi: u64, desc: bool, mut f: impl FnMut(u64, &mut BucketIter<'_>) -> ControlFlow<()>) {
+        self.ensure_cylinder_built();
+        let col = self.col();
+        self.cyl.walk(lo, hi, desc, |v, raw, verify| f(v, &mut BucketIter::new(raw, verify.then_some((col, v + 1)))));
+    }
+
+    /// 値が `lo..=hi` の live な entity の数 (`pull_range(lo, hi).len()` と同じ数)。 dense の値は bucket の live の数を
+    /// 足すだけで entity を読まない (範囲の中の値の数に比例)。 sparse の値は run から数える (古い entry があれば
+    /// Column で確かめる)。
+    pub fn count_range(&self, lo: u64, hi: u64) -> usize {
+        if lo > hi {
+            return 0;
+        }
+        self.ensure_cylinder_built();
+        let col = self.col();
+        self.cyl.count_range(lo, hi, |v, e| stored_at(col, e) == v + 1)
+    }
+
     /// 値が `lo..=hi` の entity (eid の昇順・重複なし)。 索引の範囲 (dense は bucket を範囲の分、 大きな値は
     /// run の二分探索) を Column の現在値で確かめる。
     pub fn pull_range(&self, lo: u64, hi: u64) -> Vec<u32> {
@@ -1034,6 +1120,64 @@ mod tests {
     /// heap buffer 上に static backing の store を作る。 leaf_store の `make_store` と同じ idiom。
     fn make_store(max_entities: u32) -> HimoStore {
         HimoStore::init(heap_region(64 * 1024), ValueType::Number, 0, max_entities, false)
+    }
+
+    /// `walk_values` の値ごとの [`BucketIter`] が、 bucket を写さずに eid の昇順・重複なし・Column で確かめた live だけを
+    /// 出す: 組んだ後に足した順番外の entry (後ろ)、 出ていった古い entry、 同じ値に戻った entity の重複 (往復) を混ぜて、
+    /// 全部の cell を読んだ答えと比べる。 途中で止めた時 (先頭 k 件) も同じ。
+    #[test]
+    fn walk_values_yields_sorted_live_eids_without_copying_the_bucket() {
+        let n = if cfg!(miri) { 120u32 } else { 4_000 };
+        let hs = make_store(n);
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for e in 0..n {
+            assert!(hs.set(e, rnd() % 8));
+        }
+        // 索引を組む (組んだ時の bucket は eid の昇順)
+        assert_eq!(hs.count_range(0, 7), n as usize);
+        // 書き換え (後ろに順番外で足す + 古い entry)、 往復 (同じ値の bucket に同じ eid が 2 つ)、 消し
+        for _ in 0..n / 2 {
+            let e = (rnd() % n as u64) as u32;
+            assert!(hs.set(e, rnd() % 8));
+        }
+        for e in (0..n).step_by(37) {
+            let v = hs.get_value(e).unwrap();
+            assert!(hs.set(e, (v + 1) % 8));
+            assert!(hs.set(e, v));
+        }
+        for e in (0..n).step_by(53) {
+            hs.remove(e);
+        }
+        let want = |v: u64| -> Vec<u32> { (0..n).filter(|&e| hs.get_value(e) == Some(v)).collect() };
+        for desc in [false, true] {
+            let mut seen = Vec::new();
+            hs.walk_values(0, u64::MAX, desc, |v, it| {
+                let got: Vec<u32> = it.collect();
+                assert_eq!(got, want(v), "値 {v}");
+                seen.push(v);
+                ControlFlow::Continue(())
+            });
+            let mut vals: Vec<u64> = (0..8).filter(|&v| !want(v).is_empty()).collect();
+            if desc {
+                vals.reverse();
+            }
+            assert_eq!(seen, vals, "値の順 desc={desc}");
+        }
+        // 先頭 k 件で止める
+        for k in [1usize, 5, 50] {
+            let mut got = Vec::new();
+            hs.walk_values(3, 3, false, |_, it| {
+                got.extend(it.take(k));
+                ControlFlow::Break(())
+            });
+            assert_eq!(got, want(3).into_iter().take(k).collect::<Vec<_>>(), "k={k}");
+        }
     }
 
     /// #414: 列の header が一度もディスクに届いていない (作った直後に電源が落ちた = 全部ゼロ) region を開いても

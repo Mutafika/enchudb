@@ -12916,14 +12916,16 @@ impl Engine {
         if cap == 0 || cap > 65_536 { None } else { Some(cap) }
     }
 
-    /// 値集合の distinct — eids の中で himo に張られた値のユニーク集合
+    /// 値集合の distinct — eids の中で himo に張られた値のユニーク集合 (最初に現れた順)。
+    /// 見た値は HashSet で引く (前は結果の Vec をなめていて、 値の種類 d に対し O(|eids| · d) だった)。
     pub fn distinct(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> Vec<u32> {
         let hid = match self.himo_id(himo) { Some(h) => h, None => return vec![] };
         let hs = &self.himos[hid];
         let mut result: Vec<u32> = Vec::new();
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for &eid in eids {
             if let Some(v) = hs.get_value32(enchudb_oplog::eid_local(eid))
-                && !result.contains(&v)
+                && seen.insert(v)
             {
                 result.push(v);
             }
@@ -13281,6 +13283,88 @@ impl Engine {
         self.himos[idx].pull_range(min, max).into_iter().map(|e| e as enchudb_oplog::EntityId).collect()
     }
 
+    /// [`pull_range`](Self::pull_range) の himo_id 版 (値は engine の u64、 両端を含む)。 eid は peer の頭付き
+    /// ([`query_by_id64`](Self::query_by_id64) と同じ形)、 昇順。 未知の紐は空。
+    pub fn pull_range_by_id(&self, hid: u16, lo: u64, hi: u64) -> Vec<enchudb_oplog::EntityId> {
+        let Some(hs) = self.himos.get(hid as usize) else { return Vec::new() };
+        let peer = self.peer_id();
+        hs.pull_range(lo, hi).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect()
+    }
+
+    /// 値が `value` の entity の数 (live、 [`pull`](Self::pull) の件数と同じ)。 dense に置いている値は bucket の live の
+    /// 数を読むだけ (O(1))、 sparse に置いている値 (値の種類の多い列) は引いて数える。 未知の紐は 0。
+    pub fn count_value_by_id(&self, hid: u16, value: u64) -> usize {
+        self.himos.get(hid as usize).map_or(0, |hs| hs.slice_len(value))
+    }
+
+    /// 値が `lo..=hi` の entity の数 (live、 [`pull_range_by_id`](Self::pull_range_by_id) の件数と同じ)。 dense の値は
+    /// bucket の live の数を足すだけで entity を読まない (範囲の中の値の数に比例)。 sparse の値は run の二分探索で
+    /// 数える (古い entry があれば Column で確かめる)。 未知の紐は 0。
+    pub fn count_range_by_id(&self, hid: u16, lo: u64, hi: u64) -> usize {
+        self.himos.get(hid as usize).map_or(0, |hs| hs.count_range(lo, hi))
+    }
+
+    /// 値の順に読む (`ORDER BY col LIMIT n`): 値が `lo..=hi` の entity を、 値の小さい順 (`desc` なら大きい順)、 同じ値は
+    /// eid の昇順で、 `keep` を満たすものを `limit` 件まで。 eid は peer の頭付き。
+    ///
+    /// 全部を引いて並べない: 値ごとの bucket を値の順にたどって `limit` 件で止める (値の種類の少ない列は、 たどった
+    /// 値の数 + 見た entity の数に比例。 値の種類の多い列は run を値の順に混ぜて読む)。
+    pub fn ordered_by_id(
+        &self,
+        hid: u16,
+        lo: u64,
+        hi: u64,
+        desc: bool,
+        limit: usize,
+        mut keep: impl FnMut(enchudb_oplog::EntityId) -> bool,
+    ) -> Vec<enchudb_oplog::EntityId> {
+        let mut out = Vec::new();
+        let Some(hs) = self.himos.get(hid as usize) else { return out };
+        if limit == 0 {
+            return out;
+        }
+        let peer = self.peer_id();
+        hs.walk_values(lo, hi, desc, |_, eids| {
+            for e in eids {
+                let id = enchudb_oplog::make_eid(peer, e);
+                if keep(id) {
+                    out.push(id);
+                    if out.len() >= limit {
+                        return std::ops::ControlFlow::Break(());
+                    }
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        });
+        out
+    }
+
+    /// 値が `lo..=hi` の entity のうち `keep` を満たすものの、 値の最小 (`desc` なら最大) と、 その値の entity のうち eid の
+    /// 一番小さいもの。 無ければ None。 [`ordered_by_id`](Self::ordered_by_id) の 1 件版で、 値も一緒に返す (eid から読み直すと、
+    /// その間の書き込みで値が変わりうる)。
+    pub fn first_by_id(
+        &self,
+        hid: u16,
+        lo: u64,
+        hi: u64,
+        desc: bool,
+        mut keep: impl FnMut(enchudb_oplog::EntityId) -> bool,
+    ) -> Option<(u64, enchudb_oplog::EntityId)> {
+        let hs = self.himos.get(hid as usize)?;
+        let peer = self.peer_id();
+        let mut found = None;
+        hs.walk_values(lo, hi, desc, |v, eids| {
+            match eids.map(|e| enchudb_oplog::make_eid(peer, e)).find(|&id| keep(id)) {
+                Some(id) => {
+                    found = Some((v, id));
+                    std::ops::ControlFlow::Break(())
+                }
+                None => std::ops::ControlFlow::Continue(()),
+            }
+        });
+        found
+    }
+
     /// 64 bit の合計 (どの列でも。 u64 の和が溢れないよう u128)。 値の無い entity は数えない。
     pub fn sum64(&self, himo: &str, eids: &[enchudb_oplog::EntityId]) -> u128 {
         let Some(hid) = self.himo_id(himo) else { return 0 };
@@ -13534,7 +13618,8 @@ impl Engine {
         }
     }
 
-    /// 引く。 HimoStore::pull 直 (並びの索引 [`declare_order`](Self::declare_order) がある via の紐は索引から)。
+    /// 引く。 HimoStore::pull 直 (円柱 = 値ごとの bucket から。 並びの索引 [`declare_order`](Self::declare_order) がある
+    /// via の紐でも、 範囲の無い逆引きは円柱が答える — `order_index` の module doc)。
     pub fn pull(&self, himo: &str, value: impl CellValue) -> Vec<u32> {
         match (self.himo_id(himo), value.cell_value()) {
             (Some(idx), Some(v)) => self.himos[idx].pull(v),
@@ -18728,6 +18813,120 @@ mod tests {
             let c = qc(&mut eng, &[("bucket", b)]);
             assert_eq!(q.len(), c);
         }
+        let _ = std::fs::remove_dir_all(&dir); // v10: DB は directory
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// 値の順の読み (`ordered_by_id` / `first_by_id`)、 索引だけの件数 (`count_value_by_id` / `count_range_by_id`)、
+    /// `pull_range_by_id` を、 本物の Column と比べる。 小さな値の列 (dense) と 64 bit の列 (MID の上下 = dense、 大きな値
+    /// = sparse) に書き換えと消しを混ぜる。 答えは全部の entity の値を `get_by_id` で読んで並べたもの (別の道)。
+    #[test]
+    fn ordered_and_counts_match_column_scan() {
+        let dir = tmp("ordered_counts");
+        let mut eng = Engine::create_standalone(&dir).unwrap();
+        eng.define_himo("small", ValueType::Number, 0);
+        eng.define_himo("wide", ValueType::Number64, 0);
+        let hs = eng.himo_id("small").unwrap() as u16;
+        let hw = eng.himo_id("wide").unwrap() as u16;
+        let n = 2_000usize;
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mid = 1u64 << 63;
+        let wide = |r: u64| match r % 3 {
+            0 => mid + (r >> 8) % 30,
+            1 => mid - 1 - (r >> 8) % 30,
+            _ => (r >> 4) % (1u64 << 50),
+        };
+        let mut ids = Vec::with_capacity(n);
+        for _ in 0..n {
+            let e = eng.entity().unwrap();
+            let (a, b) = (rnd(), rnd());
+            eng.tie(e, "small", (a % 40) as u32);
+            eng.tie(e, "wide", wide(b));
+            ids.push(e);
+        }
+        // 索引を組んでから書き換えと消し (bucket と sparse に古い entry を残す)
+        assert!(eng.count_value_by_id(hs, 0) > 0);
+        let _ = eng.count_range_by_id(hw, 0, u64::MAX);
+        for _ in 0..n / 2 {
+            let e = ids[(rnd() % n as u64) as usize];
+            let (a, b) = (rnd(), rnd());
+            eng.tie(e, "small", (a % 40) as u32);
+            eng.tie(e, "wide", wide(b));
+        }
+        // 値の種類の多い値 (sparse) へ戻る往復: sparse に同じ (値, eid) の entry が 2 つ残る
+        let far: Vec<u64> = ids.iter().copied().filter(|&e| eng.get_by_id(e, hw).is_some_and(|v| v < mid - (1 << 20))).take(30).collect();
+        assert!(!far.is_empty(), "test の前提: sparse の値の entity がある");
+        for &e in &far {
+            let x = eng.get_by_id(e, hw).unwrap();
+            eng.tie(e, "wide", mid + 3);
+            eng.tie(e, "wide", x);
+        }
+        for _ in 0..n / 10 {
+            let e = ids[(rnd() % n as u64) as usize];
+            if !far.contains(&e) {
+                eng.delete(e);
+            }
+        }
+        for &e in &far {
+            let x = eng.get_by_id(e, hw).unwrap();
+            let want = ids.iter().filter(|&&f| eng.get_by_id(f, hw) == Some(x)).count();
+            assert_eq!(eng.count_range_by_id(hw, x, x), want, "往復した値 {x}");
+            assert_eq!(eng.count_value_by_id(hw, x), want, "往復した値 {x} (等値)");
+        }
+        for h in [hs, hw] {
+            // (値, eid) の昇順
+            let mut all: Vec<(u64, u64)> = ids.iter().filter_map(|&e| eng.get_by_id(e, h).map(|v| (v, e))).collect();
+            all.sort_unstable();
+            assert!(all.len() > n / 2, "test の前提: 値のある entity が残っている");
+            let order = |lo: u64, hi: u64, desc: bool, keep: &dyn Fn(u64) -> bool| -> Vec<(u64, u64)> {
+                let mut v: Vec<(u64, u64)> = all.iter().copied().filter(|&(x, e)| lo <= x && x <= hi && keep(e)).collect();
+                if desc {
+                    // 値の降順、 同じ値は eid の昇順
+                    v.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+                }
+                v
+            };
+            let (vmin, vmax) = (all[0].0, all[all.len() - 1].0);
+            let mut ranges = vec![(0, u64::MAX), (vmin, vmin), (vmax, vmax), (5, 25), (mid - 10, mid + 10), (mid, u64::MAX), (0, mid - 1), (30, 20)];
+            for _ in 0..20 {
+                let (a, b) = (all[(rnd() % all.len() as u64) as usize].0, all[(rnd() % all.len() as u64) as usize].0);
+                ranges.push((a.min(b), a.max(b)));
+            }
+            for &(lo, hi) in &ranges {
+                let want = order(lo, hi, false, &|_| true);
+                assert_eq!(eng.count_range_by_id(h, lo, hi), want.len(), "count_range h={h} {lo}..={hi}");
+                let mut ids_sorted: Vec<u64> = want.iter().map(|x| x.1).collect();
+                ids_sorted.sort_unstable();
+                assert_eq!(eng.pull_range_by_id(h, lo, hi), ids_sorted, "pull_range h={h} {lo}..={hi}");
+                for desc in [false, true] {
+                    for limit in [1, 5, 50, usize::MAX] {
+                        let want: Vec<u64> = order(lo, hi, desc, &|_| true).into_iter().take(limit).map(|x| x.1).collect();
+                        assert_eq!(eng.ordered_by_id(h, lo, hi, desc, limit, |_| true), want, "ordered h={h} {lo}..={hi} desc={desc} limit={limit}");
+                    }
+                    // keep で絞る (条件つきの上位 k)
+                    let want: Vec<u64> = order(lo, hi, desc, &|e| e % 3 == 0).into_iter().take(7).map(|x| x.1).collect();
+                    assert_eq!(eng.ordered_by_id(h, lo, hi, desc, 7, |e| e % 3 == 0), want, "ordered keep h={h} {lo}..={hi} desc={desc}");
+                    let first = order(lo, hi, desc, &|e| e % 2 == 1).first().copied();
+                    assert_eq!(eng.first_by_id(h, lo, hi, desc, |e| e % 2 == 1), first, "first h={h} {lo}..={hi} desc={desc}");
+                }
+            }
+            for &(v, _) in all.iter().step_by(37) {
+                assert_eq!(eng.count_value_by_id(h, v), all.iter().filter(|x| x.0 == v).count(), "count_value h={h} v={v}");
+            }
+            // 値の無い所・範囲の外
+            assert_eq!(eng.count_value_by_id(h, vmax + 1), 0);
+            assert_eq!(eng.ordered_by_id(h, vmax + 1, u64::MAX, false, 10, |_| true), Vec::<u64>::new());
+            assert_eq!(eng.first_by_id(h, 0, vmin.saturating_sub(1), false, |_| true).filter(|_| vmin > 0), None);
+        }
+        // 未知の紐
+        assert_eq!(eng.count_range_by_id(999, 0, u64::MAX), 0);
+        assert_eq!(eng.ordered_by_id(999, 0, u64::MAX, false, 5, |_| true), Vec::<u64>::new());
         let _ = std::fs::remove_dir_all(&dir); // v10: DB は directory
         let _ = std::fs::remove_file(&dir);
     }

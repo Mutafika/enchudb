@@ -18,6 +18,7 @@
 //! `LockFreeCylinder` と同じ: 値の書き換え / 削除で古い entry は消さず、 読む側 (`HimoStore`) が Column の
 //! 現在値と突き合わせて落とす。 古い entry が半分を超えたら `rebuild` が Column 基準で組み直す。
 use crossbeam_epoch::{self as epoch, Atomic, Owned};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -80,6 +81,72 @@ impl RunSet {
     }
 }
 
+/// 控えた 1 つの版 ([`SparseRuns::snapshot`])。 続けて読む間に書き手が差し替えても、 同じ版を読む。
+pub(crate) struct SparseSnap<'a> {
+    set: &'a RunSet,
+}
+
+impl SparseSnap<'_> {
+    /// 値が `lo..=hi` の entry を値の順 (`desc` なら大きい順) に、 値ごとにまとめて `f(値, eid の列)` に渡す (古い entry
+    /// 込み。 eid の列は run ごとの順をつないだもので、 並べていない)。 `f` が `Break` を返したら止めて `Break`。 値 1 つごとに
+    /// run の本数ぶんの比べ (run の中の位置は持ち越すので、 二分探索は最初の 1 回だけ)。
+    pub(crate) fn walk(&self, lo: u64, hi: u64, desc: bool, mut f: impl FnMut(u64, &[u32]) -> ControlFlow<()>) -> ControlFlow<()> {
+        if lo > hi {
+            return ControlFlow::Continue(());
+        }
+        let runs: Vec<&Run> = self.set.all().filter(|r| r.len() > 0).collect();
+        // run ごとの、 まだ渡していない添字の範囲
+        let mut left: Vec<std::ops::Range<usize>> = runs.iter().map(|r| r.span(lo, hi)).collect();
+        let mut buf = Vec::new();
+        loop {
+            // 次の値: 昇順なら残りの先頭の最小、 降順なら残りの末尾の最大
+            let ends = runs.iter().zip(&left).filter(|(_, s)| !s.is_empty());
+            let next = if desc { ends.map(|(r, s)| r.vals[s.end - 1]).max() } else { ends.map(|(r, s)| r.vals[s.start]).min() };
+            let Some(v) = next else { return ControlFlow::Continue(()) };
+            buf.clear();
+            for (r, s) in runs.iter().zip(left.iter_mut()) {
+                if desc {
+                    let mut a = s.end;
+                    while a > s.start && r.vals[a - 1] == v {
+                        a -= 1;
+                    }
+                    buf.extend_from_slice(&r.eids[a..s.end]);
+                    s.end = a;
+                } else {
+                    let mut b = s.start;
+                    while b < s.end && r.vals[b] == v {
+                        b += 1;
+                    }
+                    buf.extend_from_slice(&r.eids[s.start..b]);
+                    s.start = b;
+                }
+            }
+            f(v, &buf)?;
+        }
+    }
+
+    /// 値が `lo..=hi` の entry の数 (古い entry 込み、 確保なし)。
+    pub(crate) fn count_in(&self, lo: u64, hi: u64) -> usize {
+        if lo > hi {
+            return 0;
+        }
+        self.set.all().map(|r| r.span(lo, hi).len()).sum()
+    }
+
+    /// 値が `lo..=hi` の entry を `f(値, eid)` に (古い entry 込み、 run ごとに値の順)。
+    pub(crate) fn for_each_in(&self, lo: u64, hi: u64, mut f: impl FnMut(u64, u32)) {
+        if lo > hi {
+            return;
+        }
+        for r in self.set.all() {
+            let s = r.span(lo, hi);
+            for (&v, &e) in r.vals[s.clone()].iter().zip(&r.eids[s]) {
+                f(v, e);
+            }
+        }
+    }
+}
+
 pub struct SparseRuns {
     set: Atomic<RunSet>,
 }
@@ -101,6 +168,11 @@ impl SparseRuns {
         let cur = self.set.load(Ordering::Acquire, &guard);
         // SAFETY: set は常に非 null、 古い RunSet は epoch を過ぎるまで解放されない。
         f(unsafe { cur.deref() })
+    }
+
+    /// 今の版を 1 つ控えて `f` に渡す (lock-free。 `f` の間は同じ版を読む)。
+    pub(crate) fn snapshot<R>(&self, f: impl FnOnce(SparseSnap<'_>) -> R) -> R {
+        self.with(|set| f(SparseSnap { set }))
     }
 
     /// 新しい RunSet に差し替える (書き手のみ)。

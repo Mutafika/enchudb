@@ -92,21 +92,30 @@ fn dedup_sorted(mut v: Vec<u32>) -> Vec<u32> {
     v
 }
 
-/// bucket から写した eid の列を昇順にする (verify した読み・組み直し)。 bucket は組んだ時と組み直した時の eid の昇順の上に、
-/// 書き換えで入ってきた entity が後ろに足されるので、 列は 「長い昇順 + 後ろの順番外」。 最初に崩れた所から後ろだけを写して
-/// 並べ、 列の後ろから混ぜる (前の昇順の部分は並べ直さない)。 昇順かは先に `is_sorted` (塊ごとにまとめて比べるので速い) で見て、
-/// 崩れた所も 256 個の塊ごとに `is_sorted` で飛ばしてから探す (1 つずつ探すと、 昇順の時に 1 行 0.07 → 0.30 ns になった)。
-/// 全部ばらばらでも `sort_unstable` と同じ並びを返す (後ろの写しの分だけ余計に手間がかかる)。
-pub(crate) fn sort_appended(v: &mut [u32]) {
+/// 列の頭の昇順の長さ (最初に崩れた所の次の位置。 全部昇順なら列の長さ)。 昇順かは先に `is_sorted` で見て、 崩れた所は
+/// 256 個の塊ごとに `is_sorted` で飛ばしてから探す ([`sort_appended`] と `HimoStore` の 1 件ずつ出す読みが使う)。
+pub(crate) fn sorted_prefix_len(v: &[u32]) -> usize {
     if v.is_sorted() {
-        return;
+        return v.len();
     }
     const C: usize = 256;
     let mut s = 0;
     while s + C < v.len() && v[s..=s + C].is_sorted() {
         s += C;
     }
-    let k = s + v[s..].windows(2).position(|w| w[0] > w[1]).map_or(v.len() - s, |i| i + 1);
+    s + v[s..].windows(2).position(|w| w[0] > w[1]).map_or(v.len() - s, |i| i + 1)
+}
+
+/// bucket から写した eid の列を昇順にする (verify した読み・組み直し)。 bucket は組んだ時と組み直した時の eid の昇順の上に、
+/// 書き換えで入ってきた entity が後ろに足されるので、 列は 「長い昇順 + 後ろの順番外」。 最初に崩れた所から後ろだけを写して
+/// 並べ、 列の後ろから混ぜる (前の昇順の部分は並べ直さない)。 昇順かは先に `is_sorted` (塊ごとにまとめて比べるので速い) で見て、
+/// 崩れた所も 256 個の塊ごとに `is_sorted` で飛ばしてから探す (1 つずつ探すと、 昇順の時に 1 行 0.07 → 0.30 ns になった)。
+/// 全部ばらばらでも `sort_unstable` と同じ並びを返す (後ろの写しの分だけ余計に手間がかかる)。
+pub(crate) fn sort_appended(v: &mut [u32]) {
+    let k = sorted_prefix_len(v);
+    if k == v.len() {
+        return;
+    }
     let mut b = v[k..].to_vec();
     b.sort_unstable();
     // 前 (v[..k]、 昇順) と b (昇順) を、 v の後ろから大きい順に置く。 置く先 w は読む前 i より前に来ない (w = i + j)

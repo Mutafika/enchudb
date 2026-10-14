@@ -42,6 +42,7 @@
 use crate::append_bucket::AppendBucket;
 use crate::sparse_runs::SparseRuns;
 use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned};
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -558,6 +559,140 @@ impl LockFreeCylinder {
         let lens = self.lens(&guard);
         out.retain(|&(v, _)| self.dense_slot(v).is_none_or(|(k, i)| i >= lens[k]));
         out
+    }
+
+    /// 配列 `k` の窓の中の値の添字 ([`slot_value`](Self::slot_value) の逆)。
+    #[inline]
+    fn slot_index(&self, k: usize, value: u64) -> usize {
+        match k {
+            LOW => (value - self.low_base.load(Ordering::Relaxed)) as usize,
+            POS => (value - MID) as usize,
+            _ => (MID - 1 - value) as usize,
+        }
+    }
+
+    /// 値の空間を、 配列の今の長さ `lens` で区間に分けて値の昇順に並べる: `(区間の最小, 最大, 置き場)`。 置き場は
+    /// `Some(配列)` か `None` (sparse)。 区間ごとに置き場が 1 つに決まる (配列が覆う値は bucket、 それ以外は sparse、
+    /// module doc): sparse `[0, base)`、 `LOW`、 sparse (間)、 `NEG`、 `POS`、 sparse (上)。 `set_low_base` が `LOW` の窓を
+    /// `NEG` の窓より下に置くので、 区間は重ならない。
+    fn segments(&self, lens: [usize; 3]) -> Vec<(u64, u64, Option<usize>)> {
+        let base = self.low_base.load(Ordering::Relaxed);
+        let (nl, np, nn) = (lens[LOW] as u64, lens[POS] as u64, lens[NEG] as u64);
+        let mut segs = Vec::with_capacity(6);
+        // 次の区間の始まり
+        let mut at = 0u64;
+        if nl > 0 {
+            if base > 0 {
+                segs.push((0, base - 1, None));
+            }
+            segs.push((base, base + nl - 1, Some(LOW)));
+            at = base + nl;
+        }
+        let neg_lo = MID - nn;
+        if at < neg_lo {
+            segs.push((at, neg_lo - 1, None));
+        }
+        if nn > 0 {
+            segs.push((neg_lo, MID - 1, Some(NEG)));
+        }
+        if np > 0 {
+            segs.push((MID, MID + np - 1, Some(POS)));
+        }
+        segs.push((MID + np, u64::MAX, None));
+        segs
+    }
+
+    /// 値が `lo..=hi` の entry を値の順 (`desc` なら大きい順) に、 値ごとに `f(値, eid の列, Column で確かめるか)` に渡す。
+    /// eid の列は古い entry・重複込みで並べていない (`HimoStore::walk_values` が確かめて並べる)。 dense の空の要素と
+    /// live が 0 の bucket は渡さない。 `f` が `Break` を返したら止める。
+    ///
+    /// 区間 ([`segments`](Self::segments)) を値の順に読むので、 混ぜ合わせずに値の順になる。 sparse の版を **配列より
+    /// 先に** 控える: 配列を伸ばす書き手は bucket に移して配列を差し替えてから sparse から消すので、 先に控えた版に無い
+    /// 値は、 後で読む配列が覆っている。 配列が覆う区間にある sparse の entry (移した直後の残り) は読まない。 古い entry の
+    /// 有無は sparse を控える前に見る (`sparse_churned_before_read`)。
+    pub fn walk(&self, lo: u64, hi: u64, desc: bool, mut f: impl FnMut(u64, &[u32], bool) -> ControlFlow<()>) {
+        if lo > hi {
+            return;
+        }
+        let churned = self.sparse_churned_before_read();
+        let _ = self.sparse.snapshot(|sp| {
+            let guard = epoch::pin();
+            let vecs = [LOW, POS, NEG].map(|k| self.vec_of(k, &guard));
+            let mut segs = self.segments(vecs.map(|v| v.len()));
+            if desc {
+                segs.reverse();
+            }
+            for (a, b, at) in segs {
+                let (a, b) = (a.max(lo), b.min(hi));
+                if a > b {
+                    continue;
+                }
+                let Some(k) = at else {
+                    sp.walk(a, b, desc, |v, eids| f(v, eids, churned))?;
+                    continue;
+                };
+                let (i, j) = (self.slot_index(k, a), self.slot_index(k, b));
+                let i0 = i.min(j);
+                let slots = &vecs[k][i0..=i.max(j)];
+                let mut visit = |i: usize, s: &Slot| match s.get() {
+                    Some(bk) if bk.live() > 0 => {
+                        let (raw, verify) = bk.snapshot_in(&guard);
+                        if raw.is_empty() { ControlFlow::Continue(()) } else { f(self.slot_value(k, i0 + i), raw, verify) }
+                    }
+                    _ => ControlFlow::Continue(()),
+                };
+                // 値の昇順は、 LOW / POS は添字の昇順、 NEG は降順
+                if (k != NEG) != desc {
+                    for (i, s) in slots.iter().enumerate() {
+                        visit(i, s)?;
+                    }
+                } else {
+                    for (i, s) in slots.iter().enumerate().rev() {
+                        visit(i, s)?;
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        });
+    }
+
+    /// 値が `lo..=hi` の live な entity の数。 dense の値は bucket の live の数を足すだけ (区間の中の要素の数に比例、
+    /// entity は読まない)。 sparse の値は、 古い entry が無ければ run の二分探索で数え、 あれば entry を `live(値, eid)`
+    /// (Column の現在値との照合、 `HimoStore` が渡す) で確かめ、 同じ eid を 1 つにして数える。 区間と版の控え方は
+    /// [`walk`](Self::walk) と同じ。
+    pub fn count_range(&self, lo: u64, hi: u64, mut live: impl FnMut(u64, u32) -> bool) -> usize {
+        if lo > hi {
+            return 0;
+        }
+        let churned = self.sparse_churned_before_read();
+        self.sparse.snapshot(|sp| {
+            let guard = epoch::pin();
+            let vecs = [LOW, POS, NEG].map(|k| self.vec_of(k, &guard));
+            let mut n = 0usize;
+            let mut checked: Vec<u32> = Vec::new();
+            for (a, b, at) in self.segments(vecs.map(|v| v.len())) {
+                let (a, b) = (a.max(lo), b.min(hi));
+                if a > b {
+                    continue;
+                }
+                match at {
+                    None if !churned => n += sp.count_in(a, b),
+                    None => sp.for_each_in(a, b, |v, e| {
+                        if live(v, e) {
+                            checked.push(e);
+                        }
+                    }),
+                    Some(k) => {
+                        let (i, j) = (self.slot_index(k, a), self.slot_index(k, b));
+                        n += vecs[k][i.min(j)..=i.max(j)].iter().filter_map(Slot::get).map(|b| b.live() as usize).sum::<usize>();
+                    }
+                }
+            }
+            // 書き換えで戻った値の重複 (同じ eid の entry 2 つ) を 1 つに
+            checked.sort_unstable();
+            checked.dedup();
+            n + checked.len()
+        })
     }
 
     /// 単一 writer append。 value の bucket に eid を足す（旧 value は放置＝lazy verify）。
@@ -1233,6 +1368,141 @@ mod tests {
         raw.sort_unstable();
         raw.dedup();
         raw
+    }
+
+    /// `walk` で値の順に読んだ (値, eid の列) を、 `HimoStore::walk_values` と同じく確かめて並べて集める。 `limit` 件の
+    /// entity を集めたら止める。
+    fn walked(c: &LockFreeCylinder, cells: &Cells, lo: u64, hi: u64, desc: bool, limit: usize) -> Vec<(u64, Vec<u32>)> {
+        let mut out: Vec<(u64, Vec<u32>)> = Vec::new();
+        let mut n = 0;
+        c.walk(lo, hi, desc, |v, raw, verify| {
+            let mut got: Vec<u32> = raw.iter().copied().filter(|&e| !verify || cells.0.borrow().get(&e) == Some(&v)).collect();
+            got.sort_unstable();
+            got.dedup();
+            if got.is_empty() {
+                return ControlFlow::Continue(());
+            }
+            n += got.len();
+            out.push((v, got));
+            if n >= limit { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+        });
+        out
+    }
+
+    /// Column の代わり (`Cells`) から出した答え: 値が `lo..=hi` の (値, eid の昇順) を値の順に、 `limit` 件の entity まで
+    /// (最後の値は全部入れる — `walked` と同じ切り方)。
+    fn expected(cells: &Cells, lo: u64, hi: u64, desc: bool, limit: usize) -> Vec<(u64, Vec<u32>)> {
+        let mut vals: Vec<u64> = cells.0.borrow().values().copied().filter(|v| lo <= *v && *v <= hi).collect();
+        vals.sort_unstable();
+        vals.dedup();
+        if desc {
+            vals.reverse();
+        }
+        let mut out = Vec::new();
+        let mut n = 0;
+        for v in vals {
+            if n >= limit {
+                break;
+            }
+            let e = cells.eids_of(v);
+            n += e.len();
+            out.push((v, e));
+        }
+        out
+    }
+
+    /// 値の順にたどる `walk` と範囲の件数 `count_range` を、 値が 6 つの区間 (sparse の下の窓の外は無いので、 LOW・
+    /// LOW の窓の中で配列の外 (後で伸びて dense に移る)・LOW の窓の外の sparse・NEG・POS・POS の窓の外の sparse) に
+    /// 散る列で、 書き換えと消しの後に、 Column の代わりから出した答えと比べる。 昇順・降順・範囲の端・途中で止める。
+    #[test]
+    fn walk_and_count_range_match_cells_across_regions() {
+        let c = LockFreeCylinder::new(0);
+        let cells = Cells::new();
+        let n = if cfg!(miri) { 60u32 } else { 3_000 };
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let pick = |r: u64| -> u64 {
+            match r % 6 {
+                0 => r % 50,
+                1 => 1_500 + (r >> 8) % 20,
+                2 => 10_000_000 + (r >> 8) % 1_000_000,
+                3 => MID - 1 - (r >> 8) % 40,
+                4 => MID + (r >> 8) % 40,
+                _ => MID + (1 << 40) + (r >> 8) % 1_000,
+            }
+        };
+        for e in 0..n {
+            let v = pick(rnd());
+            cells.set(&c, e, v);
+        }
+        // 書き換え (古い entry と、 戻った値の重複を残す) と消し (印 → Column の順)
+        for _ in 0..n / 3 {
+            let e = (rnd() % n as u64) as u32;
+            let v = pick(rnd());
+            cells.set(&c, e, v);
+        }
+        // sparse の値へ戻る往復 (x → 別の値 → x): sparse に同じ (x, e) の entry が 2 つ残る (件数で 2 回数えない)
+        let far: Vec<u32> = (0..n).filter(|e| cells.0.borrow().get(e).is_some_and(|&v| (10_000_000..MID - MID_HALF).contains(&v))).take(20).collect();
+        assert!(!far.is_empty(), "test の前提: sparse の値の entity がある");
+        for &e in &far {
+            let x = cells.0.borrow()[&e];
+            cells.set(&c, e, 7);
+            cells.set(&c, e, x);
+        }
+        for _ in 0..n / 10 {
+            let e = (rnd() % n as u64) as u32;
+            if far.contains(&e) {
+                continue;
+            }
+            let old = cells.0.borrow().get(&e).copied();
+            if let Some(o) = old {
+                c.note_stale(o);
+                cells.0.borrow_mut().remove(&e);
+            }
+        }
+        if !cfg!(miri) {
+            assert!(c.is_dense(1_500), "LOW の窓の中の値が配列に移っていない (test の前提)");
+        }
+        // 往復した entity の値だけの範囲: 重複を 2 回数えない
+        for &e in &far {
+            let x = cells.0.borrow()[&e];
+            assert_eq!(c.count_range(x, x, cells.keep()), cells.eids_of(x).len(), "往復した値 {x}");
+        }
+        assert!(c.sparse_churned(), "sparse に古い entry が無い (test の前提)");
+        let edges = [0, 49, 50, 1_499, 1_519, 9_999_999, 10_500_000, MID - 41, MID - 1, MID, MID + 39, MID + 40, MID + (1 << 40), u64::MAX];
+        let mut ranges: Vec<(u64, u64)> = vec![(0, u64::MAX), (MID - 20, MID + 20), (5, 5), (MID, MID), (20, 10)];
+        for &a in &edges {
+            for &b in &edges {
+                if a <= b {
+                    ranges.push((a, b));
+                }
+            }
+        }
+        for &(lo, hi) in &ranges {
+            for desc in [false, true] {
+                assert_eq!(walked(&c, &cells, lo, hi, desc, usize::MAX), expected(&cells, lo, hi, desc, usize::MAX), "{lo}..={hi} desc={desc}");
+            }
+            let want: usize = expected(&cells, lo, hi, false, usize::MAX).iter().map(|x| x.1.len()).sum();
+            assert_eq!(c.count_range(lo, hi, cells.keep()), want, "count_range {lo}..={hi}");
+        }
+        // 途中で止める (上位 k): 止めた所までが同じ
+        for k in [1, 7, 100] {
+            for desc in [false, true] {
+                assert_eq!(walked(&c, &cells, 0, u64::MAX, desc, k), expected(&cells, 0, u64::MAX, desc, k), "k={k} desc={desc}");
+            }
+        }
+        // 掃除しても同じ
+        c.compact_sparse(cells.keep());
+        assert!(!c.sparse_churned());
+        for desc in [false, true] {
+            assert_eq!(walked(&c, &cells, 0, u64::MAX, desc, usize::MAX), expected(&cells, 0, u64::MAX, desc, usize::MAX));
+        }
+        assert_eq!(c.count_range(0, u64::MAX, cells.keep()), cells.0.borrow().len());
     }
 
     /// #373: 辞書 ID のように値が範囲にまばらに散る列 (表 16 個の DB の 1 列 = 16 個に 1 つ) は、 配列を値の範囲まで
