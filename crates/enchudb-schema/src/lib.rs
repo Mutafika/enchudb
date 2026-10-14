@@ -5189,24 +5189,40 @@ impl Simple {
         best
     }
 
-    /// 条件に合う entity。 条件の種類が 1 つだけなら数えずにその索引を引き、 2 つ以上なら索引の数が一番少ない条件を種に
-    /// して、 残りの条件を列で確かめる (範囲は範囲の索引を引く — 前は範囲を全部の row の後ろで確かめていた)。
+    /// 条件に合う entity。 条件の種類が 1 つだけならその索引を引き、 2 つ以上なら索引の数が一番少ない条件を種にして、
+    /// 残りの条件を列で確かめる (範囲は範囲の索引を引く — 前は範囲を全部の row の後ろで確かめていた)。
+    ///
+    /// 種が範囲で、 当たりが範囲の列の長さの半分を超える時は、 範囲の列を eid の順になめて確かめる。 範囲の索引から引くと、
+    /// 値ごとの bucket を全部写して並べ直すので、 表のほぼ全部を返す範囲では列を 1 回なめるより遅い (100 万行の全部を覆う範囲で
+    /// 1.8〜2.3 倍、 当たり 10% では索引が 6.6 倍速い。 分かれ目は測った線でおよそ半分)。 列の長さ (なめる数) は O(1) で読める
+    /// (表の row を数えると、 表の eid の枠の bitset を数えるので 100 万行で 5〜20 µs かかった)。
     fn find(&self, eng: &Engine) -> Vec<EntityId> {
         let kinds = usize::from(!self.eq.is_empty()) + usize::from(self.in_.is_some()) + self.ranges.len();
-        let seed = if kinds <= 1 {
+        let (seed, m) = if kinds <= 1 {
             if !self.eq.is_empty() {
-                Seed::Eq
+                (Seed::Eq, None)
             } else if self.in_.is_some() {
-                Seed::In
+                (Seed::In, None)
             } else {
-                Seed::Range(0)
+                let (h, lo, hi) = self.ranges[0];
+                (Seed::Range(0), Some(eng.count_range_by_id(h, lo, hi)))
             }
         } else {
             match self.seed(eng) {
-                Some((0, _)) | None => return Vec::new(),
-                Some((_, s)) => s,
+                Some((n, s)) => (s, Some(n)),
+                None => return Vec::new(),
             }
         };
+        if m == Some(0) {
+            return Vec::new();
+        }
+        if let (Seed::Range(i), Some(m)) = (seed, m)
+            && 2 * m as u64 > u64::from(eng.column_len_by_id(self.ranges[i].0))
+        {
+            let mut c = eng.entities_with_himo(self.ranges[i].0);
+            c.retain(|&e| self.holds(eng, e, Seed::None));
+            return c;
+        }
         let mut c = match seed {
             Seed::Eq => eng.query_by_id64(&self.eq),
             Seed::In => {

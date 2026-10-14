@@ -300,3 +300,66 @@ fn index_paths_keep_errors() {
     drop(db);
     cleanup(&path);
 }
+
+/// 範囲の当たりが表の半分を超える時は、 範囲の列を eid の順になめる道 (範囲の索引から引いて並べ直すより速い)。 その道でも
+/// 答えが同じ: 範囲だけ (全部 / 7 割)、 範囲 + 等値、 範囲 2 つ、 書き換えと消しの後。 当たりが少ない時 (索引の道) とも比べる。
+#[test]
+fn wide_range_find_scans_the_column() {
+    let path = tmp_path("wide");
+    cleanup(&path);
+    let mut db = Database::create(&path).unwrap();
+    db.table("w").number("id").number("age").number("grp").primary_key("id").with_capacity(20_000).build().unwrap();
+    let t = db.get_table("w").unwrap();
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    let n = 12_000usize;
+    let mut rows: Vec<(u64, bool, u32, u32)> = Vec::with_capacity(n);
+    for i in 0..n {
+        let (a, g) = (rng.below(100) as u32, rng.below(4) as u32);
+        let e = t.insert().set("id", i as i64).set("age", a as i64).set("grp", g as i64).commit().unwrap();
+        rows.push((e, true, a, g));
+    }
+    let check = |rows: &[(u64, bool, u32, u32)], stage: &str| {
+        let ids = |f: &dyn Fn(u32, u32) -> bool| -> Vec<u64> { sorted(rows.iter().filter(|r| r.1 && f(r.2, r.3)).map(|r| r.0).collect()) };
+        for (lo, hi) in [(0u32, 99u32), (0, 69), (30, 99), (10, 12)] {
+            assert_eq!(t.where_range("age", lo as i64, hi as i64).find().unwrap(), ids(&|a, _| lo <= a && a <= hi), "{stage} 範囲 {lo}..={hi}");
+            assert_eq!(
+                t.where_range("age", lo as i64, hi as i64).count().unwrap(),
+                ids(&|a, _| lo <= a && a <= hi).len(),
+                "{stage} 件数 {lo}..={hi}"
+            );
+            for g in 0..4u32 {
+                assert_eq!(
+                    sorted(t.where_range("age", lo as i64, hi as i64).where_eq("grp", g as i64).find().unwrap()),
+                    ids(&|a, gg| lo <= a && a <= hi && gg == g),
+                    "{stage} 範囲 {lo}..={hi} + grp {g}"
+                );
+            }
+            assert_eq!(
+                sorted(t.where_range("age", lo as i64, hi as i64).where_range("grp", 1, 3).find().unwrap()),
+                ids(&|a, gg| lo <= a && a <= hi && (1..=3).contains(&gg)),
+                "{stage} 範囲 2 つ {lo}..={hi}"
+            );
+        }
+    };
+    check(&rows, "static");
+    for _ in 0..n / 4 {
+        let i = rng.below(n as u64) as usize;
+        if !rows[i].1 {
+            continue;
+        }
+        let a = rng.below(100) as u32;
+        t.entity(rows[i].0).update().set("age", a as i64).commit().unwrap();
+        rows[i].2 = a;
+    }
+    for _ in 0..n / 20 {
+        let i = rng.below(n as u64) as usize;
+        if rows[i].1 {
+            t.entity(rows[i].0).delete().unwrap();
+            rows[i].1 = false;
+        }
+    }
+    check(&rows, "churn");
+    drop(t);
+    drop(db);
+    cleanup(&path);
+}
