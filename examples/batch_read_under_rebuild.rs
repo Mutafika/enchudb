@@ -31,7 +31,9 @@ fn main() {
     let _ = enchudb::db_files::remove_db(&path);
 
     // build phase: 500K entity、 全部 a=7、 grp は 0..1000 に散らす (rebuild に仕事)
-    let mut eng = Engine::create_growable_with_capacity(path, 8_000_000).unwrap();
+    // entity の枠は writer が DUR_SECS で足す数より十分大きく取る (手元で 1 秒に 200 万個前後。
+    // 800 万だと 4 秒ほどで使い切り、 writer の entity().unwrap() で落ちていた)
+    let mut eng = Engine::create_growable_with_capacity(path, 32_000_000).unwrap();
     eng.define_himo("a", ValueType::Number, 0);
     eng.define_himo("grp", ValueType::Number, 0);
     for i in 0..BASE {
@@ -161,5 +163,7 @@ fn main() {
         );
     }
 
+    // 閉じてから消す (開いたまま消すと、 閉じる時の書き出しが消えた場所に向かい 「filesystem is (nearly) full」 などの警告が出る)
+    drop(eng);
     let _ = enchudb::db_files::remove_db(&path);
 }
