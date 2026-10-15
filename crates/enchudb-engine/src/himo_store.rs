@@ -302,29 +302,59 @@ fn present_stripe() -> usize {
     })
 }
 
-/// 1 つの値の bucket の中の entity を、 eid の昇順・重複なしで、 要るなら Column で確かめながら 1 件ずつ出す
+/// 1 つの値の bucket の中の entity を、 置いてある順・重複なしで、 要るなら Column で確かめながら 1 件ずつ出す
 /// ([`HimoStore::walk_values`] が渡す)。
 ///
-/// 全部を写して並べない: bucket は 「組んだ時・組み直した時の昇順の頭 + 後ろに足した順番外」 (sparse の値は run ごとの昇順を
-/// つないだもの) なので、 頭 (最初に崩れた所まで) はそのまま読み、 後ろだけを heap にして小さい順に取り出し、 2 つを混ぜる。
-/// 頭の長さは置き場が渡す (探さない): dense の bucket は書き手が足すたびに持っている数、 sparse の値は run ごとの区間のつなぎ目を
-/// 比べた数。 手間は 後ろの数 + 出した数・飛ばした古い entry の数。 上位 k や最小は、 書き換えの無い bucket なら bucket の大きさに
-/// よらない (前は bucket を全部写して確かめて並べていた: 100 万行の値 1 つ = 1 万件。 その次の形は頭を毎回探していた)。
+/// 並べ直さない: 同じ値の中の順は 「置いてある順」 (bucket に足した順。 sparse の値は run ごとの区間をつないだ順)。 eid は辞書の鍵で
+/// 順に意味が無い (番号は使い直し・sync で付け替える) ので、 eid の順には並べない。 古い entry が無い bucket は写すだけ。 古い entry の
+/// ある bucket は Column で確かめて飛ばし、 行って戻った entity の 2 つ目 (同じ eid が 2 回ある) を出した eid の集合で落とす。 手間は
+/// 出した数 + 飛ばした古い entry の数 (古い entry が半分を超えると詰め直すので、 飛ばす数は出した数の高々同じくらい)。
 pub(crate) struct BucketIter<'a> {
-    head: &'a [u32],
+    raw: &'a [u32],
     at: usize,
-    tail: std::collections::BinaryHeap<std::cmp::Reverse<u32>>,
     /// Column で確かめる時の (列, stored 形式の値 = 値 + 1)。 古い entry の無い bucket は None
     check: Option<(&'a Column, u64)>,
-    /// 前に出した (か確かめて落とした) eid。 同じ eid の 2 つ目 (書き換えで戻った値の重複) を飛ばす
-    last: Option<u32>,
+    /// 確かめのある bucket で出した eid (行って戻った entity の 2 つ目を落とす)。 古い entry の無い bucket には重複が無い
+    seen: Seen,
+}
+
+/// 出した eid の集合。 16 個までは確保の要らない箱で探し、 それを超えたら hash にする (上位 k は k が小さい。 値の種類の多い列は
+/// 値 1 つに 1〜2 行で、 値ごとにこの集合を作るので、 確保をしない)。
+struct Seen {
+    few: [u32; 16],
+    n: usize,
+    many: Option<std::collections::HashSet<u32>>,
+}
+
+impl Seen {
+    fn new() -> Self {
+        Seen { few: [0; 16], n: 0, many: None }
+    }
+
+    /// 初めてなら入れて true。
+    #[inline]
+    fn insert(&mut self, e: u32) -> bool {
+        if let Some(h) = &mut self.many {
+            return h.insert(e);
+        }
+        if self.few[..self.n].contains(&e) {
+            return false;
+        }
+        if self.n < self.few.len() {
+            self.few[self.n] = e;
+            self.n += 1;
+        } else {
+            let mut h: std::collections::HashSet<u32> = self.few.iter().copied().collect();
+            h.insert(e);
+            self.many = Some(h);
+        }
+        true
+    }
 }
 
 impl<'a> BucketIter<'a> {
-    fn new(raw: &'a [u32], p: usize, check: Option<(&'a Column, u64)>) -> Self {
-        debug_assert!(p <= raw.len() && raw[..p].is_sorted(), "頭の昇順の長さ {p} が合わない");
-        let tail = raw[p..].iter().map(|&e| std::cmp::Reverse(e)).collect();
-        BucketIter { head: &raw[..p], at: 0, tail, check, last: None }
+    fn new(raw: &'a [u32], check: Option<(&'a Column, u64)>) -> Self {
+        BucketIter { raw, at: 0, check, seen: Seen::new() }
     }
 }
 
@@ -332,35 +362,16 @@ impl Iterator for BucketIter<'_> {
     type Item = u32;
 
     fn next(&mut self) -> Option<u32> {
-        loop {
-            let h = self.head.get(self.at).copied();
-            let t = self.tail.peek().map(|r| r.0);
-            let e = match (h, t) {
-                (None, None) => return None,
-                (Some(x), Some(y)) if y < x => {
-                    self.tail.pop();
-                    y
-                }
-                (Some(x), _) => {
-                    self.at += 1;
-                    x
-                }
-                (None, Some(y)) => {
-                    self.tail.pop();
-                    y
-                }
-            };
-            if self.last == Some(e) {
-                continue;
-            }
-            self.last = Some(e);
+        while let Some(&e) = self.raw.get(self.at) {
+            self.at += 1;
             if let Some((col, s)) = self.check
-                && stored_at(col, e) != s
+                && (stored_at(col, e) != s || !self.seen.insert(e))
             {
                 continue;
             }
             return Some(e);
         }
+        None
     }
 }
 
@@ -1041,7 +1052,7 @@ impl HimoStore {
     }
 
     /// 値が `lo..=hi` の entity を値の順 (`desc` なら大きい順) に、 値ごとに `f(値, その値の entity を 1 件ずつ出す
-    /// [`BucketIter`])` に渡す。 出すのは Column で確かめた live なものだけで、 eid の昇順・重複なし。 `f` が `Break` を返したら
+    /// [`BucketIter`])` に渡す。 出すのは Column で確かめた live なものだけで、 置いてある順・重複なし。 `f` が `Break` を返したら
     /// 止める。
     ///
     /// 全部を引いて並べ直さない: 値ごとの bucket (dense) と値の順の run (sparse) を値の順にたどり、 bucket の中も要る分だけ
@@ -1049,7 +1060,7 @@ impl HimoStore {
     pub(crate) fn walk_values(&self, lo: u64, hi: u64, desc: bool, mut f: impl FnMut(u64, &mut BucketIter<'_>) -> ControlFlow<()>) {
         self.ensure_cylinder_built();
         let col = self.col();
-        self.cyl.walk(lo, hi, desc, |v, raw, head, verify| f(v, &mut BucketIter::new(raw, head, verify.then_some((col, v + 1)))));
+        self.cyl.walk(lo, hi, desc, |v, raw, _head, verify| f(v, &mut BucketIter::new(raw, verify.then_some((col, v + 1)))));
     }
 
     /// 値が `lo..=hi` の live な entity の数 (`pull_range(lo, hi).len()` と同じ数)。 dense の値は bucket の live の数を
@@ -1238,9 +1249,9 @@ mod tests {
         HimoStore::init(heap_region(64 * 1024), ValueType::Number, 0, max_entities, false)
     }
 
-    /// `walk_values` の値ごとの [`BucketIter`] が、 bucket を写さずに eid の昇順・重複なし・Column で確かめた live だけを
-    /// 出す: 組んだ後に足した順番外の entry (後ろ)、 出ていった古い entry、 同じ値に戻った entity の重複 (往復) を混ぜて、
-    /// 全部の cell を読んだ答えと比べる。 途中で止めた時 (先頭 k 件) も同じ。
+    /// `walk_values` の値ごとの [`BucketIter`] が、 bucket を写さずに置いてある順・重複なし・Column で確かめた live だけを
+    /// 出す: 組んだ後に足した entry、 出ていった古い entry、 同じ値に戻った entity の重複 (往復) を混ぜて、 全部の cell を読んだ
+    /// 答えと顔ぶれで比べる (同じ値の中の順は問わない)。 途中で止めた時 (先頭 k 件) も、 k 件ちょうど・重複なし・その値の live。
     #[test]
     fn walk_values_yields_sorted_live_eids_without_copying_the_bucket() {
         let n = if cfg!(miri) { 120u32 } else { 4_000 };
@@ -1274,8 +1285,9 @@ mod tests {
         for desc in [false, true] {
             let mut seen = Vec::new();
             hs.walk_values(0, u64::MAX, desc, |v, it| {
-                let got: Vec<u32> = it.collect();
-                assert_eq!(got, want(v), "値 {v}");
+                let mut got: Vec<u32> = it.collect();
+                got.sort_unstable();
+                assert_eq!(got, want(v), "値 {v} (並べ直して比べる。 並べる前の重複は並べた後も隣り合って残る)");
                 seen.push(v);
                 ControlFlow::Continue(())
             });
@@ -1292,7 +1304,13 @@ mod tests {
                 got.extend(it.take(k));
                 ControlFlow::Break(())
             });
-            assert_eq!(got, want(3).into_iter().take(k).collect::<Vec<_>>(), "k={k}");
+            let all = want(3);
+            assert_eq!(got.len(), k.min(all.len()), "k={k}: 数");
+            let mut uniq = got.clone();
+            uniq.sort_unstable();
+            uniq.dedup();
+            assert_eq!(uniq.len(), got.len(), "k={k}: 重複");
+            assert!(got.iter().all(|e| all.contains(e)), "k={k}: 値 3 の live でない eid");
         }
     }
 

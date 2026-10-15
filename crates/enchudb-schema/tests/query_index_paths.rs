@@ -83,6 +83,19 @@ fn top(rows: &[Row], k: usize, key: impl Fn(&Row) -> Option<i128>) -> Vec<u64> {
     v.into_iter().take(k).map(|x| x.1).collect()
 }
 
+/// order_by の答えを、 同じ値の中の順を問わずに写しと比べる (同じ値の中は 「置いてある順」): 並びの値の列が写しの先頭 k 件と
+/// 同じ・eid に重複が無い・どれも生きていて key のある row。
+fn assert_top(rows: &[Row], got: Vec<u64>, k: usize, key: impl Fn(&Row) -> Option<i128>, msg: &str) {
+    let want = top(rows, k, &key);
+    let by_eid: std::collections::HashMap<u64, &Row> = rows.iter().filter(|r| r.alive).map(|r| (r.eid, r)).collect();
+    let keys = |v: &[u64]| -> Vec<Option<i128>> { v.iter().map(|e| by_eid.get(e).and_then(|r| key(r))).collect() };
+    let (kg, kw) = (keys(&got), keys(&want));
+    let mut u = got.clone();
+    u.sort_unstable();
+    u.dedup();
+    assert!(kg.iter().all(Option::is_some) && kg == kw && u.len() == got.len(), "{msg}: got {got:?} want {want:?}");
+}
+
 #[test]
 fn index_paths_match_mirror() {
     let path = tmp_path("mirror");
@@ -185,26 +198,10 @@ fn index_paths_match_mirror() {
             );
             // order_by + limit (並び)
             let k = 1 + rng.below(20) as usize;
-            assert_eq!(
-                t.where_range("age", a as i64, b as i64).order_by("age").limit(k).find().unwrap(),
-                top(rows, k, |r| inr(r.age, a, b).then(|| r.age.unwrap() as i128)),
-                "{stage} o_rng_same_col"
-            );
-            assert_eq!(
-                t.where_eq("city", city).order_by("age").limit(k).find().unwrap(),
-                top(rows, k, |r| (r.city == Some(city)).then_some(r.age).flatten().map(i128::from)),
-                "{stage} o_tag"
-            );
-            assert_eq!(
-                t.where_range("score", 0, sb as i64).order_by_desc("age").limit(k).find().unwrap(),
-                top(rows, k, |r| inr(r.score, 0, sb).then_some(r.age).flatten().map(|x| -(x as i128))),
-                "{stage} o_rng_other_col_desc"
-            );
-            assert_eq!(
-                t.where_eq("grp", g as i64).order_by("score").limit(k).find().unwrap(),
-                top(rows, k, |r| (r.grp == Some(g)).then_some(r.score).flatten().map(i128::from)),
-                "{stage} o_eq_small (引いて並べる道)"
-            );
+            assert_top(rows, t.where_range("age", a as i64, b as i64).order_by("age").limit(k).find().unwrap(), k, |r| inr(r.age, a, b).then(|| r.age.unwrap() as i128), &format!("{stage} o_rng_same_col"));
+            assert_top(rows, t.where_eq("city", city).order_by("age").limit(k).find().unwrap(), k, |r| (r.city == Some(city)).then_some(r.age).flatten().map(i128::from), &format!("{stage} o_tag"));
+            assert_top(rows, t.where_range("score", 0, sb as i64).order_by_desc("age").limit(k).find().unwrap(), k, |r| inr(r.score, 0, sb).then_some(r.age).flatten().map(|x| -(x as i128)), &format!("{stage} o_rng_other_col_desc"));
+            assert_top(rows, t.where_eq("grp", g as i64).order_by("score").limit(k).find().unwrap(), k, |r| (r.grp == Some(g)).then_some(r.score).flatten().map(i128::from), &format!("{stage} o_eq_small (引いて並べる道)"));
             // 最小 / 最大 (条件つき)
             let want_min = alive().filter(|r| inr(r.age, a, b)).filter_map(|r| r.age).min();
             assert_eq!(t.where_range("age", a as i64, b as i64).min("age").unwrap(), want_min, "{stage} q_min_rng");
@@ -215,27 +212,15 @@ fn index_paths_match_mirror() {
         let has_pk = |r: &Row| r.id.is_some();
         assert_eq!(t.all().count().unwrap(), alive().filter(|r| has_pk(r)).count(), "{stage} c_all");
         for k in [1, 10, 100] {
-            assert_eq!(t.all().order_by("age").limit(k).find().unwrap(), top(rows, k, |r| has_pk(r).then_some(r.age).flatten().map(i128::from)), "{stage} top_age {k}");
-            assert_eq!(
-                t.all().order_by_desc("score").limit(k).find().unwrap(),
-                top(rows, k, |r| has_pk(r).then_some(r.score).flatten().map(|x| -(x as i128))),
-                "{stage} top_score_desc {k}"
-            );
-            assert_eq!(t.all().order_by("ts").limit(k).find().unwrap(), top(rows, k, |r| has_pk(r).then_some(r.ts).flatten().map(i128::from)), "{stage} top_ts {k}");
-            assert_eq!(
-                t.all().order_by_desc("ts").limit(k).find().unwrap(),
-                top(rows, k, |r| has_pk(r).then_some(r.ts).flatten().map(|x| -(x as i128))),
-                "{stage} top_ts_desc {k}"
-            );
-            assert_eq!(t.all().order_by("id").limit(k).find().unwrap(), top(rows, k, |r| r.id.map(i128::from)), "{stage} top_id {k}");
+            assert_top(rows, t.all().order_by("age").limit(k).find().unwrap(), k, |r| has_pk(r).then_some(r.age).flatten().map(i128::from), &format!("{stage} top_age {k}"));
+            assert_top(rows, t.all().order_by_desc("score").limit(k).find().unwrap(), k, |r| has_pk(r).then_some(r.score).flatten().map(|x| -(x as i128)), &format!("{stage} top_score_desc {k}"));
+            assert_top(rows, t.all().order_by("ts").limit(k).find().unwrap(), k, |r| has_pk(r).then_some(r.ts).flatten().map(i128::from), &format!("{stage} top_ts {k}"));
+            assert_top(rows, t.all().order_by_desc("ts").limit(k).find().unwrap(), k, |r| has_pk(r).then_some(r.ts).flatten().map(|x| -(x as i128)), &format!("{stage} top_ts_desc {k}"));
+            assert_top(rows, t.all().order_by("id").limit(k).find().unwrap(), k, |r| r.id.map(i128::from), &format!("{stage} top_id {k}"));
         }
         // limit なしの並び (全部)
-        assert_eq!(t.all().order_by("age").find().unwrap(), top(rows, usize::MAX, |r| has_pk(r).then_some(r.age).flatten().map(i128::from)), "{stage} order_all");
-        assert_eq!(
-            t.where_range("age", 10, 20).order_by("age").find().unwrap(),
-            top(rows, usize::MAX, |r| inr(r.age, 10, 20).then(|| r.age.unwrap() as i128)),
-            "{stage} order_rng_all"
-        );
+        assert_top(rows, t.all().order_by("age").find().unwrap(), usize::MAX, |r| has_pk(r).then_some(r.age).flatten().map(i128::from), &format!("{stage} order_all"));
+        assert_top(rows, t.where_range("age", 10, 20).order_by("age").find().unwrap(), usize::MAX, |r| inr(r.age, 10, 20).then(|| r.age.unwrap() as i128), &format!("{stage} order_rng_all"));
         // 最小 / 最大 (条件なし = 主キーのある row)
         assert_eq!(t.all().min("age").unwrap(), alive().filter(|r| has_pk(r)).filter_map(|r| r.age).min(), "{stage} q_min_age");
         assert_eq!(t.all().max("score").unwrap(), alive().filter(|r| has_pk(r)).filter_map(|r| r.score).max(), "{stage} q_max_score");
@@ -297,6 +282,53 @@ fn index_paths_keep_errors() {
     assert!(t.where_eq("a", 1i64).order_by("nope").count().is_err());
     assert!(t.where_eq("a", 1i64).order_by("nope").limit(1).find().is_err());
     drop(t);
+    drop(db);
+    cleanup(&path);
+}
+
+/// 順の無い値の列では並べられない: Tag の列 (値は辞書の番号 = 辞書に初めて入った順) と Ref の列 (値は entity の番号 = 辞書の鍵)。
+/// find / count / limit 付き / 購読がどれも BadValue。 ref の道をたどった先が Tag の列でも同じ。 対照: 順番を表す数を結んだ
+/// Number の列 (ref の道の先) なら並べられ、 その順になる。
+#[test]
+fn order_by_a_column_without_order_is_an_error() {
+    let path = tmp_path("tag-order");
+    cleanup(&path);
+    let mut db = Database::create(&path).unwrap();
+    db.table("prefs").number("id").tag("name").number("code").primary_key("id").build().unwrap();
+    db.table("shops").number("id").tag("pref").ref_to("at", "prefs").primary_key("id").build().unwrap();
+    let prefs = db.get_table("prefs").unwrap();
+    let shops = db.get_table("shops").unwrap();
+    // 辞書に入る順 (北海道 → 沖縄 → 島根) と、 結んだ順番の数 (code) は違う
+    let mut p = Vec::new();
+    for (i, (name, code)) in [("北海道", 1i64), ("沖縄", 47), ("島根", 32)].into_iter().enumerate() {
+        p.push(prefs.insert().set("id", i as i64).set("name", name).set("code", code).commit().unwrap());
+    }
+    for i in 0..6i64 {
+        let at = p[(i % 3) as usize];
+        let name = ["北海道", "沖縄", "島根"][(i % 3) as usize];
+        shops.insert().set("id", i).set("pref", name).set("at", enchudb_schema::Value::Ref(at)).commit().unwrap();
+    }
+    let bad = |r: Result<usize, enchudb_schema::SchemaError>, what: &str| {
+        assert!(matches!(r, Err(enchudb_schema::SchemaError::BadValue(_))), "{what}: {r:?}");
+    };
+    bad(shops.all().order_by("pref").find().map(|v| v.len()), "find");
+    bad(shops.all().order_by_desc("pref").limit(2).find().map(|v| v.len()), "limit 付きの find");
+    bad(shops.all().order_by("pref").count(), "count");
+    bad(shops.all().order_by("at.name").find().map(|v| v.len()), "ref の道の先の Tag");
+    bad(shops.all().order_by("at").find().map(|v| v.len()), "Ref の列 (entity の番号)");
+    bad(shops.all().order_by_desc("at").limit(2).count(), "Ref の列の count");
+    assert!(shops.all().order_by("pref").limit(2).subscribe().is_err(), "購読");
+    // 対照: 順番を表す数の列 (ref の道の先の Number) なら並べられる
+    let got = shops.all().order_by("at.code").find().unwrap();
+    let codes: Vec<i64> = got
+        .iter()
+        .map(|&e| match prefs.entity(match shops.entity(e).get("at") { Some(enchudb_schema::Value::Ref(r)) => r, v => panic!("{v:?}") }).get("code") {
+            Some(enchudb_schema::Value::Number(c)) => c,
+            v => panic!("{v:?}"),
+        })
+        .collect();
+    assert_eq!(codes, vec![1, 1, 32, 32, 47, 47], "対照: code の順");
+    drop((prefs, shops));
     drop(db);
     cleanup(&path);
 }

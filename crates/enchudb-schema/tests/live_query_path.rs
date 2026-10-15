@@ -1442,7 +1442,17 @@ fn run_top(path: &str) {
             assert_eq!(s.q.ranked(), ranked, "[{}] step {step}: ranked", s.name);
             assert_eq!(s.q.count(), ranked.len(), "[{}] step {step}: count", s.name);
             assert!(s.q.poll().is_empty(), "[{}] step {step}: 受け取り済みの差分がまた届く", s.name);
-            assert_eq!((s.query)().find().unwrap(), ranked, "[{}] step {step}: find", s.name);
+            // find は同じ値の中から別の行を選んでもよい (同じ値の中の順は決めない): 並びの値の列が同じ・重複なし・条件を満たす
+            let found = (s.query)().find().unwrap();
+            let keys = |v: &[u64]| -> Vec<Option<i64>> { v.iter().map(|&e| (s.key)(e)).collect() };
+            let mut uniq = found.clone();
+            uniq.sort_unstable();
+            uniq.dedup();
+            assert!(
+                keys(&found) == keys(&ranked) && uniq.len() == found.len() && found.iter().all(|&e| (s.cond)(e)),
+                "[{}] step {step}: find: got {found:?} ranked {ranked:?}",
+                s.name
+            );
         }
     };
     check(&mut subs, &users, 0);

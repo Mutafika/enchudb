@@ -163,15 +163,24 @@ fn bigint_values_and_queries_match_oracle() {
             "{who}: not in {:?}",
             &small[..2]
         );
-        // 並び (昇順 / 降順、 同じ値は eid の昇順) + limit
+        // 並び (昇順 / 降順、 同じ値の中は置いてある順 = 順を問わない) + limit: 値の列が写しの先頭 20 件と同じ・重複なし
         let mut asc: Vec<(i64, u64)> = rows.iter().filter_map(|&e| at(e).map(|v| (v, e))).collect();
         asc.sort_by_key(|&(v, e)| (v, enchudb_oplog::eid_local(e)));
+        let vals = |v: &[u64]| -> Vec<Option<i64>> { v.iter().map(|&e| at(e)).collect() };
+        let uniq = |v: &[u64]| {
+            let mut u = v.to_vec();
+            u.sort_unstable();
+            u.dedup();
+            u.len() == v.len()
+        };
         let got: Vec<u64> = ev.all().order_by("at").limit(20).find().unwrap();
-        assert_eq!(got, asc.iter().take(20).map(|x| x.1).collect::<Vec<_>>(), "{who}: order_by");
+        let want: Vec<u64> = asc.iter().take(20).map(|x| x.1).collect();
+        assert!(vals(&got) == vals(&want) && uniq(&got), "{who}: order_by: got {got:?} want {want:?}");
         let mut desc = asc.clone();
         desc.sort_by_key(|&(v, e)| (std::cmp::Reverse(v), enchudb_oplog::eid_local(e)));
         let got: Vec<u64> = ev.all().order_by_desc("at").limit(20).find().unwrap();
-        assert_eq!(got, desc.iter().take(20).map(|x| x.1).collect::<Vec<_>>(), "{who}: order_by_desc");
+        let want: Vec<u64> = desc.iter().take(20).map(|x| x.1).collect();
+        assert!(vals(&got) == vals(&want) && uniq(&got), "{who}: order_by_desc: got {got:?} want {want:?}");
     }
     // 値域外の等値は常に 0 件、 範囲は値域で切る
     assert!(ev.where_eq("at", BIGINT_MAX + 1).find().unwrap().is_empty());

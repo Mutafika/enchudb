@@ -13463,8 +13463,9 @@ impl Engine {
         self.himos.get(hid as usize).map_or(0, |hs| hs.count_range(lo, hi))
     }
 
-    /// 値の順に読む (`ORDER BY col LIMIT n`): 値が `lo..=hi` の entity を、 値の小さい順 (`desc` なら大きい順)、 同じ値は
-    /// eid の昇順で、 `keep` を満たすものを `limit` 件まで。 eid は peer の頭付き。
+    /// 値の順に読む (`ORDER BY col LIMIT n`): 値が `lo..=hi` の entity を、 値の小さい順 (`desc` なら大きい順) に、 `keep` を
+    /// 満たすものを `limit` 件まで。 同じ値の中の順は決めない (置いてある順に出す。 eid は辞書の鍵で順に意味が無いので、 eid の順に
+    /// 並べ直さない)。 eid は peer の頭付き。
     ///
     /// 全部を引いて並べない: 値ごとの bucket を値の順にたどって `limit` 件で止める (値の種類の少ない列は、 たどった
     /// 値の数 + 見た entity の数に比例。 値の種類の多い列は run を値の順に混ぜて読む)。
@@ -13498,8 +13499,8 @@ impl Engine {
         out
     }
 
-    /// 値が `lo..=hi` の entity のうち `keep` を満たすものの、 値の最小 (`desc` なら最大) と、 その値の entity のうち eid の
-    /// 一番小さいもの。 無ければ None。 [`ordered_by_id`](Self::ordered_by_id) の 1 件版で、 値も一緒に返す (eid から読み直すと、
+    /// 値が `lo..=hi` の entity のうち `keep` を満たすものの、 値の最小 (`desc` なら最大) と、 その値の entity のどれか 1 つ
+    /// (同じ値の中は決めない、 [`ordered_by_id`](Self::ordered_by_id) と同じ)。 無ければ None。 [`ordered_by_id`](Self::ordered_by_id) の 1 件版で、 値も一緒に返す (eid から読み直すと、
     /// その間の書き込みで値が変わりうる)。
     pub fn first_by_id(
         &self,
@@ -14191,7 +14192,8 @@ impl Engine {
     /// 条件 `preds` に当てはまる entity を、 ref の道 `order_path` をたどった先の紐 `order_himo` の
     /// 値で並べた **先頭 `limit` 件** を購読する (live の `ORDER BY .. LIMIT`)。 差分は普通の購読と
     /// 同じく先頭 `limit` 件への出入り、 並びは [`LiveQuery::ranked`](crate::live::LiveQuery::ranked)。
-    /// 同じ値は eid の昇順。 並びの列に値の無い entity は入らない。 `In` / 枝が全部同じ形の `Or` は
+    /// 同じ値は eid の昇順 (購読の中の選び方。 同じ値の中の順は決めない決まりなので、 同じ問いの `find` は境目の値の中で別の
+    /// entity を選ぶことがある)。 並びの列に値の無い entity は入らない。 `In` / 枝が全部同じ形の `Or` は
     /// 1 つの購読に束ねる (鍵ごとの順序の和の先頭 `limit` 件)。 形の違う枝の `Or` と `limit == 0` は `InvalidInput`。
     pub fn subscribe_top(
         &self,
@@ -19063,16 +19065,32 @@ mod tests {
                 let mut ids_sorted: Vec<u64> = want.iter().map(|x| x.1).collect();
                 ids_sorted.sort_unstable();
                 assert_eq!(eng.pull_range_by_id(h, lo, hi), ids_sorted, "pull_range h={h} {lo}..={hi}");
+                // 同じ値の中の順は決めない: 値の列が (値, eid) の順の先頭と同じ・重複なし・どれも範囲の中で keep を満たす
+                let same_vals = |got: &[u64], want: &[(u64, u64)], keep: &dyn Fn(u64) -> bool| -> bool {
+                    let mut u = got.to_vec();
+                    u.sort_unstable();
+                    u.dedup();
+                    got.len() == want.len()
+                        && u.len() == got.len()
+                        && got.iter().zip(want).all(|(&e, &(v, _))| eng.get_by_id(e, h) == Some(v) && keep(e))
+                };
                 for desc in [false, true] {
                     for limit in [1, 5, 50, usize::MAX] {
-                        let want: Vec<u64> = order(lo, hi, desc, &|_| true).into_iter().take(limit).map(|x| x.1).collect();
-                        assert_eq!(eng.ordered_by_id(h, lo, hi, desc, limit, |_| true), want, "ordered h={h} {lo}..={hi} desc={desc} limit={limit}");
+                        let want: Vec<(u64, u64)> = order(lo, hi, desc, &|_| true).into_iter().take(limit).collect();
+                        let got = eng.ordered_by_id(h, lo, hi, desc, limit, |_| true);
+                        assert!(same_vals(&got, &want, &|_| true), "ordered h={h} {lo}..={hi} desc={desc} limit={limit}: got {got:?}");
                     }
                     // keep で絞る (条件つきの上位 k)
-                    let want: Vec<u64> = order(lo, hi, desc, &|e| e % 3 == 0).into_iter().take(7).map(|x| x.1).collect();
-                    assert_eq!(eng.ordered_by_id(h, lo, hi, desc, 7, |e| e % 3 == 0), want, "ordered keep h={h} {lo}..={hi} desc={desc}");
+                    let want: Vec<(u64, u64)> = order(lo, hi, desc, &|e| e % 3 == 0).into_iter().take(7).collect();
+                    let got = eng.ordered_by_id(h, lo, hi, desc, 7, |e| e % 3 == 0);
+                    assert!(same_vals(&got, &want, &|e| e % 3 == 0), "ordered keep h={h} {lo}..={hi} desc={desc}: got {got:?}");
+                    // 最初の 1 件: 値は (値, eid) の順の先頭と同じ、 eid はその値で keep を満たすどれか
                     let first = order(lo, hi, desc, &|e| e % 2 == 1).first().copied();
-                    assert_eq!(eng.first_by_id(h, lo, hi, desc, |e| e % 2 == 1), first, "first h={h} {lo}..={hi} desc={desc}");
+                    let got = eng.first_by_id(h, lo, hi, desc, |e| e % 2 == 1);
+                    assert_eq!(got.map(|x| x.0), first.map(|x| x.0), "first の値 h={h} {lo}..={hi} desc={desc}");
+                    if let Some((v, e)) = got {
+                        assert!(e % 2 == 1 && eng.get_by_id(e, h) == Some(v), "first の eid h={h} {lo}..={hi} desc={desc}");
+                    }
                 }
             }
             for &(v, _) in all.iter().step_by(37) {
