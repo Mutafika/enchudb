@@ -364,10 +364,10 @@ impl Iterator for BucketIter<'_> {
     fn next(&mut self) -> Option<u32> {
         while let Some(&e) = self.raw.get(self.at) {
             self.at += 1;
-            if let Some((col, s)) = self.check {
-                if stored_at(col, e) != s || !self.seen.insert(e) {
-                    continue;
-                }
+            if let Some((col, s)) = self.check
+                && (stored_at(col, e) != s || !self.seen.insert(e))
+            {
+                continue;
             }
             return Some(e);
         }
