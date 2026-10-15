@@ -14,7 +14,7 @@ use crossbeam_epoch as epoch;
 use parking_lot::{Mutex, MutexGuard};
 use std::ops::ControlFlow;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use crate::column::Column;
 use crate::lockfree_cylinder::LockFreeCylinder;
@@ -188,6 +188,8 @@ pub struct HimoStore {
     gate: WriteGate,
     /// cylinder を組んだ後の書き手の値ごとの鍵 ([`ValueLocks`])。 組む時 (`cyl_built` を立てる前) に作る。
     vlocks: OnceLock<ValueLocks>,
+    /// 値のある cell の数 ([`PresentCount`])。 `init` は 0 から、 `load` / `load_lazy` は最初に引かれた時に数える。
+    present: PresentCount,
 }
 
 /// `col.get(eid)` の cell を stored 形式 (0 = 未設定、 N = 値 N-1) で。 列の幅 (4 / 8 byte) はここと
@@ -242,6 +244,62 @@ fn ready(col: Column) -> OnceLock<Column> {
     let cell = OnceLock::new();
     let _ = cell.set(col);
     cell
+}
+
+/// [`PresentCount`] の塊の数。
+const PRESENT_STRIPES: usize = 8;
+
+/// 値のある cell の数 ([`HimoStore::present_count`])。 書き手は 「値無し → 有り」 で 1 足し、 「有り → 無し」 で 1 引く。
+/// 足す所は thread ごとに決めた塊 (並んで書く書き手が 1 つの cache line を取り合わない)。 数 = `base` + 塊の和。
+///
+/// 開いた紐 (`load`) は開いた時の数が分からない (`known` が false)。 最初に引かれた時に書き手を止めて列を数え、
+/// `base` = 数 − 塊の和 にする (それまでの書き込みも塊に足してあるので、 以後は足し引きだけで合う)。
+struct PresentCount {
+    known: AtomicBool,
+    base: AtomicI64,
+    stripes: [PresentStripe; PRESENT_STRIPES],
+}
+
+#[repr(align(128))]
+struct PresentStripe(AtomicI64);
+
+impl PresentCount {
+    fn new(known: bool) -> Self {
+        Self { known: AtomicBool::new(known), base: AtomicI64::new(0), stripes: std::array::from_fn(|_| PresentStripe(AtomicI64::new(0))) }
+    }
+
+    /// 書き手が呼ぶ (cell を書いた後、 門・鍵・write_lock の中で。 数える側は書き手を止めてから数える)。
+    #[inline(always)]
+    fn add(&self, d: i64) {
+        self.stripes[present_stripe()].0.fetch_add(d, Ordering::Relaxed);
+    }
+
+    fn delta(&self) -> i64 {
+        self.stripes.iter().map(|s| s.0.load(Ordering::Relaxed)).sum()
+    }
+
+    /// 並んだ書き手の途中で読むと、 先に引いた塊だけが見えて一時的に負になりうるので 0 で止める。
+    fn get(&self) -> u64 {
+        (self.base.load(Ordering::Relaxed) + self.delta()).max(0) as u64
+    }
+}
+
+/// この thread が足す [`PresentCount`] の塊 (thread が初めて書いた順に配る)。
+#[inline(always)]
+fn present_stripe() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static MINE: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    }
+    MINE.with(|m| {
+        let s = m.get();
+        if s != usize::MAX {
+            return s;
+        }
+        let s = NEXT.fetch_add(1, Ordering::Relaxed) % PRESENT_STRIPES;
+        m.set(s);
+        s
+    })
 }
 
 /// 1 つの値の bucket の中の entity を、 eid の昇順・重複なしで、 要るなら Column で確かめながら 1 件ずつ出す
@@ -349,6 +407,7 @@ impl HimoStore {
             write_lock: Mutex::new(()),
             gate: WriteGate::new(),
             vlocks: OnceLock::new(),
+            present: PresentCount::new(true),
         }
     }
 
@@ -369,6 +428,7 @@ impl HimoStore {
             write_lock: Mutex::new(()),
             gate: WriteGate::new(),
             vlocks: OnceLock::new(),
+            present: PresentCount::new(false),
         }
     }
 
@@ -394,6 +454,7 @@ impl HimoStore {
             write_lock: Mutex::new(()),
             gate: WriteGate::new(),
             vlocks: OnceLock::new(),
+            present: PresentCount::new(false),
         }
     }
 
@@ -570,6 +631,9 @@ impl HimoStore {
                 // #106: Release store。 leaf offset を publish する前に書いた LeafStore slot
                 // (payload/gen) を、 offset を Acquire で読む reader が必ず観測できるようにする。
                 store_at(col, eid, value + 1);
+                if old.is_none() {
+                    self.present.add(1);
+                }
                 cyl.push_in_array(eid, value, &guard);
                 // compaction は Column 更新の **後** (keep = value_eq が新状態を見るため)。 古い値の鍵の下で
                 if let Some((o, (len, live))) = stale {
@@ -589,6 +653,9 @@ impl HimoStore {
         let _held = (!grow).then(|| locks.lock_pair(old_in, new_in.then_some(value)));
         let stale = old.and_then(|o| cyl.note_stale(o).map(|s| (o, s)));
         store_at(col, eid, value + 1);
+        if old.is_none() {
+            self.present.add(1);
+        }
         if new_in {
             cyl.push_in_array(eid, value, &guard);
         } else {
@@ -620,9 +687,13 @@ impl HimoStore {
         }
         col.ensure_count(eid);
         // 冗長な re-tie は書かない (書き出しの dirty を増やさない)
-        if value_at(col, eid) != Some(value) {
+        let old = value_at(col, eid);
+        if old != Some(value) {
             // #106: Release store (上と同じ)
             store_at(col, eid, value + 1);
+            if old.is_none() {
+                self.present.add(1);
+            }
         }
         true
     }
@@ -673,6 +744,7 @@ impl HimoStore {
             if let Some(_pass) = self.gate.try_enter() {
                 if value_at(col, eid).is_some() {
                     col.clear(eid);
+                    self.present.add(-1);
                 }
                 return;
             }
@@ -683,6 +755,7 @@ impl HimoStore {
             }
             if value_at(col, eid).is_some() {
                 col.clear(eid);
+                self.present.add(-1);
             }
         }
     }
@@ -701,6 +774,7 @@ impl HimoStore {
                 let _held = self.vlocks().lock_pair(Some(o), None);
                 let stale = cyl.note_stale(o);
                 col.clear(eid);
+                self.present.add(-1);
                 if let Some((len, live)) = stale {
                     self.maybe_compact(o, len, live);
                 }
@@ -714,6 +788,7 @@ impl HimoStore {
         let _held = cyl.in_array(o, &guard).then(|| self.vlocks().lock_pair(Some(o), None));
         let stale = cyl.note_stale(o);
         col.clear(eid);
+        self.present.add(-1);
         if let Some((len, live)) = stale {
             self.maybe_compact(o, len, live);
         }
@@ -774,6 +849,40 @@ impl HimoStore {
         vals.sort_unstable();
         vals.dedup();
         self.cyl.unique_live() + vals.len() as u32
+    }
+
+    /// 値のある cell の数 (`entities_with_value().len()` と同じ)。 書き手が足し引きした数を読む (O(1)、 列をなめない)。
+    /// 開いた紐は最初の 1 回だけ、 書き手を止めて (`write_guard`) 列を数える。 並んだ書き手の途中で読むと、 書きかけの
+    /// 分がずれることがある (`count_range` などほかの数と同じ)。
+    pub fn present_count(&self) -> u64 {
+        if !self.present.known.load(Ordering::Acquire) {
+            self.count_present_cells();
+        }
+        self.present.get()
+    }
+
+    /// 開いた紐の最初の [`present_count`](Self::present_count): 書き手を止めて列を数え、 それまでに書き手が塊に足した分を
+    /// 引いて `base` にする。
+    #[cold]
+    fn count_present_cells(&self) {
+        let _g = self.write_guard();
+        if self.present.known.load(Ordering::Acquire) {
+            return;
+        }
+        let n = self.scan_present_count();
+        self.present.base.store(n as i64 - self.present.delta(), Ordering::Relaxed);
+        self.present.known.store(true, Ordering::Release);
+    }
+
+    /// 列をなめて値のある cell を数える (O(列の長さ)、 足し引きした数を使わない)。
+    pub fn scan_present_count(&self) -> u64 {
+        let col = self.col();
+        let n = if col.value_size == 4 {
+            col.values_u32().iter().filter(|&&v| v != 0).count()
+        } else {
+            (0..col.count()).filter(|&e| stored_at(col, e) != 0).count()
+        };
+        n as u64
     }
 
     // ──── 読む（Column 直読み、Cylinder 非依存）────
@@ -862,6 +971,7 @@ impl HimoStore {
             stale = cyl.note_stale(o).map(|s| (o, s));
         }
         store_at(col, eid, stored);
+        self.present.add(i64::from(new.is_some()) - i64::from(old.is_some()));
         if let (Some(cyl), Some(n)) = (cyl, new) {
             cyl.insert(eid, n, |v, e| stored_at(col, e) == v + 1);
         }
@@ -1198,6 +1308,85 @@ mod tests {
             assert!(hs.set(3, 7), "{ht:?}");
             assert_eq!(hs.get_value(3), Some(7), "{ht:?}");
         }
+    }
+
+    /// 値のある cell の数 (`present_count`) が、 書き手 3 経路 (`set` / `remove` / `restore`) の組む前・組んだ後と、 開いた
+    /// 紐 (`load`。 最初に引いた時に列を数える。 その前に書いた分も入る) で、 書くたびに列を数えた数と合う。 `restore` は
+    /// workspace の中に呼び手が無いので、 ここでだけ見る。
+    #[test]
+    fn present_count_follows_every_writer() {
+        let words = Box::leak(vec![0u64; 64 * 1024 / 8].into_boxed_slice());
+        let ptr = words.as_mut_ptr().cast::<u8>();
+        let region = || unsafe { Region::new(ptr, 64 * 1024) };
+        let chk = |hs: &HimoStore, want: u64, at: &str| {
+            assert_eq!(hs.entities_with_value().len() as u64, want, "{at}: 対照 (列を数えた数)");
+            assert_eq!(hs.present_count(), want, "{at}");
+        };
+        let hs = HimoStore::init(region(), ValueType::Number, 0, 64, false);
+        chk(&hs, 0, "空");
+        // 組む前 (門の中の書き手)
+        assert!(hs.set(0, 7));
+        chk(&hs, 1, "set");
+        assert!(hs.set(1, 7));
+        chk(&hs, 2, "set 2 つ目");
+        assert!(hs.set(1, 8));
+        chk(&hs, 2, "書き換え");
+        assert!(hs.set(1, 8));
+        chk(&hs, 2, "同じ値");
+        hs.remove(1);
+        chk(&hs, 1, "remove");
+        hs.remove(1);
+        chk(&hs, 1, "無い値の remove");
+        hs.restore(3, 8);
+        chk(&hs, 2, "restore で置く");
+        hs.restore(3, 9);
+        chk(&hs, 2, "restore で書き換え");
+        hs.restore(0, 0);
+        chk(&hs, 1, "restore で外す");
+        // 組んだ後 (配列の中の値と、 sparse の大きな値)
+        assert_eq!(hs.pull(8), vec![3]);
+        assert!(hs.cylinder_built());
+        assert!(hs.set(4, 7));
+        chk(&hs, 2, "組んだ後の set");
+        assert!(hs.set(5, 1 << 20));
+        chk(&hs, 3, "組んだ後の set (sparse)");
+        assert!(hs.set(5, 1 << 21));
+        chk(&hs, 3, "sparse の書き換え");
+        assert!(hs.set(4, 1 << 22));
+        chk(&hs, 3, "配列の値から sparse の値へ");
+        hs.remove(4);
+        chk(&hs, 2, "組んだ後の remove (sparse)");
+        hs.remove(3);
+        chk(&hs, 1, "組んだ後の remove (配列の中)");
+        hs.restore(6, 3);
+        chk(&hs, 2, "組んだ後の restore で置く");
+        hs.restore(5, 0);
+        chk(&hs, 1, "組んだ後の restore で外す");
+        assert!(hs.set(7, 2));
+        chk(&hs, 2, "組んだ後の set 2 つ目");
+        drop(hs);
+        // 開いた紐: 数を引く前に書いた分 (2 足して 1 引く) も入る
+        let re = HimoStore::load(region(), ValueType::Number, 0, 64, false);
+        assert!(re.set(10, 1));
+        assert!(re.set(11, 1));
+        re.remove(6);
+        chk(&re, 3, "開いて書いた後 (値は 7 と 10 と 11)");
+        re.restore(12, 5);
+        chk(&re, 4, "数えた後の restore");
+        re.remove(7);
+        chk(&re, 3, "数えた後の remove");
+
+        // 門が閉じている間に来た書き手 (組む前の write_lock の道): 放した後に書く set と remove も数に入る
+        let hs = make_store(64);
+        assert!(hs.set(1, 5));
+        let wait = std::time::Duration::from_millis(100);
+        let g = hs.write_guard();
+        assert!(!finishes_while(|| hs.remove(1), wait, || drop(g)), "write_guard を持つ間に remove が書いた");
+        chk(&hs, 0, "write_lock の道の remove");
+        let g = hs.write_guard();
+        assert!(!finishes_while(|| assert!(hs.set(2, 6)), wait, || drop(g)), "write_guard を持つ間に set が書いた");
+        assert!(!hs.cylinder_built());
+        chk(&hs, 1, "write_lock の道の set");
     }
 
     /// #270: **writer 3 経路 (`set` / `remove` / `restore`) はどれも cylinder を組まない**。

@@ -5857,8 +5857,9 @@ impl<'a> Query<'a> {
     }
 
     /// 件数 (`find()?.len()` と同じ)。 条件が 1 つの列の等値 / IN / 範囲だけなら、 索引の数 (値ごとの bucket の live の数) を
-    /// 足すだけで entity を読まない (等値は O(1)、 範囲は範囲の中の値の数に比例)。 並び (`order_by`) のある時は、 並びの列に
-    /// 値の無い row を外す (`order_by` の doc) ので `find().len()`。 それ以外も `find().len()`。 `limit` があれば超えない。
+    /// 足すだけで entity を読まない (等値は O(1)、 範囲は範囲の中の値の数に比例)。 条件の無い `.all()` は、 代表列に値のある
+    /// row の数 (書く時に足し引きした数、 O(1))。 並び (`order_by`) のある時は、 並びの列に値の無い row を外す
+    /// (`order_by` の doc) ので `find().len()`。 それ以外も `find().len()`。 `limit` があれば超えない。
     pub fn count(self) -> Result<usize, SchemaError> {
         // 並びの列に値の無い row は find が外すので、 索引の数では数えない (未知の列は find と同じく誤り)
         if self.order_col()?.is_some() {
@@ -5868,7 +5869,9 @@ impl<'a> Query<'a> {
         match Plan::of(eng, &self.preds)? {
             Plan::Empty => return Ok(0),
             Plan::Simple(s) => {
-                if let Some(n) = s.count_only(eng) {
+                // 条件なし = `.all()`: 代表列に値のある row (`find_set` と同じ集合)
+                let n = if s.is_empty() { Some(self.rep_himo().map_or(0, |h| eng.count_present_by_id(h))) } else { s.count_only(eng) };
+                if let Some(n) = n {
                     return Ok(self.limit.map_or(n, |l| n.min(l)));
                 }
             }
