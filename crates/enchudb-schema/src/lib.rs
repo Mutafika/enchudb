@@ -5270,7 +5270,9 @@ impl<'a> Query<'a> {
 
     /// 結果を列 `col` の値の昇順に並べる。 同じ値の中の順は決めない (`limit` で切る時も、 同じ値の中ならどの row を選んでも
     /// 正しい答え。 道 (値の順にたどる / 引いて並べる) や購読で選ぶ row が違うことがある)。 意味のある順が要る時は 2 つ目の
-    /// 並びの列で決める。 `col` は ref 列をたどってもよい。
+    /// 並びの列で決める。 `col` は ref 列をたどってもよい。 Leaf と Tag の列では並べられない (Tag の値は辞書の番号で、 辞書に
+    /// 初めて入った順 = 意味が無い。 並べたい時は、 順番を表す Number の列を結んでその列で並べる) — `find` / `count` /
+    /// `subscribe` が `BadValue` を返す。
     /// **`col` に値の無い row は結果から外れる** (SQL の NULLS FIRST / LAST ではない)。
     /// `limit` と組むと `subscribe` が先頭 k 件の購読 (live の `ORDER BY .. LIMIT`) になる。
     pub fn order_by(mut self, col: &str) -> Self {
@@ -5292,6 +5294,13 @@ impl<'a> Query<'a> {
             .ok_or_else(|| SchemaError::BadValue(format!("order_by: unknown column {col}")))?;
         if cd.ty == ColumnType::Leaf {
             return Err(SchemaError::BadValue("order_by: cannot order by a Leaf column".into()));
+        }
+        // Tag の値は辞書の番号 (辞書に初めて入った順) で、 その順に意味が無い
+        if cd.ty == ColumnType::Tag {
+            return Err(SchemaError::BadValue(format!(
+                "order_by: cannot order by a Tag column {col} (its values are dictionary ids with no meaningful order); \
+                 to order by it, tie a Number column holding the order you want and order by that"
+            )));
         }
         Ok(Some((path, cd.himo_id, *desc)))
     }

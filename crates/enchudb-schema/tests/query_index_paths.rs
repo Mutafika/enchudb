@@ -286,6 +286,50 @@ fn index_paths_keep_errors() {
     cleanup(&path);
 }
 
+/// Tag の列では並べられない (値は辞書の番号 = 辞書に初めて入った順で、 意味が無い): find / count / limit 付き / 購読がどれも
+/// BadValue。 ref の道をたどった先が Tag の列でも同じ。 対照: 同じ表の Number の列 (順番を表す数を結んだ列) なら並べられる。
+#[test]
+fn order_by_a_tag_column_is_an_error() {
+    let path = tmp_path("tag-order");
+    cleanup(&path);
+    let mut db = Database::create(&path).unwrap();
+    db.table("prefs").number("id").tag("name").number("code").primary_key("id").build().unwrap();
+    db.table("shops").number("id").tag("pref").ref_to("at", "prefs").primary_key("id").build().unwrap();
+    let prefs = db.get_table("prefs").unwrap();
+    let shops = db.get_table("shops").unwrap();
+    // 辞書に入る順 (北海道 → 沖縄 → 島根) と、 結んだ順番の数 (code) は違う
+    let mut p = Vec::new();
+    for (i, (name, code)) in [("北海道", 1i64), ("沖縄", 47), ("島根", 32)].into_iter().enumerate() {
+        p.push(prefs.insert().set("id", i as i64).set("name", name).set("code", code).commit().unwrap());
+    }
+    for i in 0..6i64 {
+        let at = p[(i % 3) as usize];
+        let name = ["北海道", "沖縄", "島根"][(i % 3) as usize];
+        shops.insert().set("id", i).set("pref", name).set("at", enchudb_schema::Value::Ref(at)).commit().unwrap();
+    }
+    let bad = |r: Result<usize, enchudb_schema::SchemaError>, what: &str| {
+        assert!(matches!(r, Err(enchudb_schema::SchemaError::BadValue(_))), "{what}: {r:?}");
+    };
+    bad(shops.all().order_by("pref").find().map(|v| v.len()), "find");
+    bad(shops.all().order_by_desc("pref").limit(2).find().map(|v| v.len()), "limit 付きの find");
+    bad(shops.all().order_by("pref").count(), "count");
+    bad(shops.all().order_by("at.name").find().map(|v| v.len()), "ref の道の先の Tag");
+    assert!(shops.all().order_by("pref").limit(2).subscribe().is_err(), "購読");
+    // 対照: 順番を表す数の列 (ref の道の先の Number) なら並べられる
+    let got = shops.all().order_by("at.code").find().unwrap();
+    let codes: Vec<i64> = got
+        .iter()
+        .map(|&e| match prefs.entity(match shops.entity(e).get("at") { Some(enchudb_schema::Value::Ref(r)) => r, v => panic!("{v:?}") }).get("code") {
+            Some(enchudb_schema::Value::Number(c)) => c,
+            v => panic!("{v:?}"),
+        })
+        .collect();
+    assert_eq!(codes, vec![1, 1, 32, 32, 47, 47], "対照: code の順");
+    drop((prefs, shops));
+    drop(db);
+    cleanup(&path);
+}
+
 /// 範囲の当たりが表の半分を超える時は、 範囲の列を eid の順になめる道 (範囲の索引から引いて並べ直すより速い)。 その道でも
 /// 答えが同じ: 範囲だけ (全部 / 7 割)、 範囲 + 等値、 範囲 2 つ、 書き換えと消しの後。 当たりが少ない時 (索引の道) とも比べる。
 #[test]
