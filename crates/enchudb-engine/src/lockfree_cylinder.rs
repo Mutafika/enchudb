@@ -612,15 +612,16 @@ impl LockFreeCylinder {
     }
 
     /// 値が `lo..=hi` の entry を値の順 (`desc` なら大きい順) に、 値ごとに `f(値, eid の列, 頭の昇順の長さ, Column で確かめるか)`
-    /// に渡す。 eid の列は古い entry・重複込みで並べていない (`HimoStore::walk_values` が確かめて並べる)。 頭の昇順の長さは、
-    /// dense の bucket は書き手が足すたびに持っている数 ([`AppendBucket::snapshot_sorted_in`])、 sparse の値は None (run ごとの
-    /// 昇順をつないだもの)。 dense の空の要素と live が 0 の bucket は渡さない。 `f` が `Break` を返したら止める。
+    /// に渡す。 eid の列は古い entry・重複込みで並べていない (`HimoStore::walk_values` が確かめて並べる)。 頭の昇順の長さは
+    /// 置き場が渡す (読む側は探さない): dense の bucket は書き手が足すたびに持っている数 ([`AppendBucket::snapshot_sorted_in`])、
+    /// sparse の値は run ごとの区間のつなぎ目を比べた数 ([`SparseSnap::walk`](crate::sparse_runs::SparseSnap::walk))。
+    /// dense の空の要素と live が 0 の bucket は渡さない。 `f` が `Break` を返したら止める。
     ///
     /// 区間 ([`segments`](Self::segments)) を値の順に読むので、 混ぜ合わせずに値の順になる。 sparse の版を **配列より
     /// 先に** 控える: 配列を伸ばす書き手は bucket に移して配列を差し替えてから sparse から消すので、 先に控えた版に無い
     /// 値は、 後で読む配列が覆っている。 配列が覆う区間にある sparse の entry (移した直後の残り) は読まない。 古い entry の
     /// 有無は sparse を控える前に見る (`sparse_churned_before_read`)。
-    pub fn walk(&self, lo: u64, hi: u64, desc: bool, mut f: impl FnMut(u64, &[u32], Option<usize>, bool) -> ControlFlow<()>) {
+    pub fn walk(&self, lo: u64, hi: u64, desc: bool, mut f: impl FnMut(u64, &[u32], usize, bool) -> ControlFlow<()>) {
         if lo > hi {
             return;
         }
@@ -639,7 +640,7 @@ impl LockFreeCylinder {
                     continue;
                 }
                 let Some(k) = at else {
-                    sp.walk(a, b, desc, |v, eids| f(v, eids, None, churned))?;
+                    sp.walk(a, b, desc, |v, eids, head| f(v, eids, head, churned))?;
                     continue;
                 };
                 let (i, j) = (self.slot_index(k, a), self.slot_index(k, b));
@@ -648,7 +649,7 @@ impl LockFreeCylinder {
                 let mut visit = |i: usize, s: &Slot| match s.get() {
                     Some(bk) if bk.live() > 0 => {
                         let (raw, head, verify) = bk.snapshot_sorted_in(&guard);
-                        if raw.is_empty() { ControlFlow::Continue(()) } else { f(self.slot_value(k, i0 + i), raw, Some(head), verify) }
+                        if raw.is_empty() { ControlFlow::Continue(()) } else { f(self.slot_value(k, i0 + i), raw, head, verify) }
                     }
                     _ => ControlFlow::Continue(()),
                 };
@@ -1388,9 +1389,8 @@ mod tests {
         let mut out: Vec<(u64, Vec<u32>)> = Vec::new();
         let mut n = 0;
         c.walk(lo, hi, desc, |v, raw, head, verify| {
-            if let Some(h) = head {
-                assert!(h <= raw.len() && raw[..h].is_sorted(), "値 {v}: 頭の昇順の長さ {h} が合わない");
-            }
+            // 置き場が渡す頭の長さは、 探した長さとちょうど同じ (短いと遅く、 長いと答えが壊れる)
+            assert_eq!(head, crate::append_bucket::sorted_prefix_len(raw), "値 {v}: 頭の昇順の長さが合わない");
             let mut got: Vec<u32> = raw.iter().copied().filter(|&e| !verify || cells.0.borrow().get(&e) == Some(&v)).collect();
             got.sort_unstable();
             got.dedup();

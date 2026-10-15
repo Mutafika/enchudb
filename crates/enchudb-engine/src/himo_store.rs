@@ -307,10 +307,9 @@ fn present_stripe() -> usize {
 ///
 /// 全部を写して並べない: bucket は 「組んだ時・組み直した時の昇順の頭 + 後ろに足した順番外」 (sparse の値は run ごとの昇順を
 /// つないだもの) なので、 頭 (最初に崩れた所まで) はそのまま読み、 後ろだけを heap にして小さい順に取り出し、 2 つを混ぜる。
-/// 頭の長さは、 dense の bucket なら書き手が足すたびに持っている数を使い (探さない)、 sparse の値だけ塊ごとの `is_sorted` で探す。
-/// 手間は 後ろの数 + 出した数・飛ばした古い entry の数 (+ sparse の値は頭を探す分)。 上位 k や最小は、 書き換えの無い bucket なら
-/// bucket の大きさによらない (前は bucket を全部写して確かめて並べていた: 100 万行の値 1 つ = 1 万件。 その次の形は頭を毎回
-/// 探していた)。
+/// 頭の長さは置き場が渡す (探さない): dense の bucket は書き手が足すたびに持っている数、 sparse の値は run ごとの区間のつなぎ目を
+/// 比べた数。 手間は 後ろの数 + 出した数・飛ばした古い entry の数。 上位 k や最小は、 書き換えの無い bucket なら bucket の大きさに
+/// よらない (前は bucket を全部写して確かめて並べていた: 100 万行の値 1 つ = 1 万件。 その次の形は頭を毎回探していた)。
 pub(crate) struct BucketIter<'a> {
     head: &'a [u32],
     at: usize,
@@ -322,8 +321,7 @@ pub(crate) struct BucketIter<'a> {
 }
 
 impl<'a> BucketIter<'a> {
-    fn new(raw: &'a [u32], head: Option<usize>, check: Option<(&'a Column, u64)>) -> Self {
-        let p = head.unwrap_or_else(|| crate::append_bucket::sorted_prefix_len(raw));
+    fn new(raw: &'a [u32], p: usize, check: Option<(&'a Column, u64)>) -> Self {
         debug_assert!(p <= raw.len() && raw[..p].is_sorted(), "頭の昇順の長さ {p} が合わない");
         let tail = raw[p..].iter().map(|&e| std::cmp::Reverse(e)).collect();
         BucketIter { head: &raw[..p], at: 0, tail, check, last: None }
