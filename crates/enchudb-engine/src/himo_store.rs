@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use crate::column::Column;
-use crate::lockfree_cylinder::LockFreeCylinder;
+use crate::lockfree_cylinder::{LockFreeCylinder, Part};
 use crate::region::Region;
 use crate::value_locks::{HeldAll, ValueLocks};
 use crate::write_gate::WriteGate;
@@ -190,6 +190,75 @@ pub struct HimoStore {
     vlocks: OnceLock<ValueLocks>,
     /// 値のある cell の数 ([`PresentCount`])。 `init` は 0 から、 `load` / `load_lazy` は最初に引かれた時に数える。
     present: PresentCount,
+}
+
+/// 古い entry のある bucket (値 `value`) の eid の列 `eids` (頭 `head` 件が広義の昇順) から、 今の値がちょうど `value` の entity を
+/// 1 回ずつ `out` に足す。 同じ entity が 2 つ以上あるのは往復した時だけで、 頭の中では隣り合い (昇順)、 頭の後ろの分は頭か
+/// 後ろのどこかにもう 1 つある。 頭は確かめて隣の重複を落とすだけ (並べない)。 後ろは確かめた分を並べ、 隣の重複と、 頭に
+/// 入れたものを落とす (頭は昇順なので、 並べた後ろの順に跳びながら探す)。 足した分の順: 頭の分 (昇順) の後ろに後ろの分 (昇順)。
+fn push_live_once(col: &Column, value: u64, eids: &[u32], head: usize, out: &mut Vec<u32>) {
+    let want = value + 1;
+    let start = out.len();
+    let mut last = None;
+    for &e in &eids[..head] {
+        if last != Some(e) && stored_at(col, e) == want {
+            out.push(e);
+            last = Some(e);
+        }
+    }
+    let mid = out.len();
+    out.extend(eids[head..].iter().copied().filter(|&e| stored_at(col, e) == want));
+    if out.len() == mid {
+        return;
+    }
+    let (hd, tl) = out[start..].split_at_mut(mid - start);
+    tl.sort_unstable();
+    let (mut w, mut at, mut prev) = (0, 0, None);
+    for r in 0..tl.len() {
+        let e = tl[r];
+        if prev == Some(e) {
+            continue;
+        }
+        prev = Some(e);
+        at = gallop_ge(hd, at, e);
+        if at < hd.len() && hd[at] == e {
+            continue;
+        }
+        tl[w] = e;
+        w += 1;
+    }
+    out.truncate(mid + w);
+}
+
+/// eid の重複を落とす (残す順は決めない)。 件数が一番大きい eid の 1/256 以上なら eid の bit の印 (一番大きい eid / 8 byte を作り、
+/// 1 件ごとに見て付ける。 並べない)、 少なければ並べて隣を落とす (印を作る手間の方が並べより重い)。
+fn dedup_eids(v: &mut Vec<u32>) {
+    let top = v.iter().copied().max().map_or(0, |m| m as usize + 1);
+    if v.len() * 256 >= top {
+        let mut seen = vec![0u64; top.div_ceil(64)];
+        v.retain(|&e| {
+            let (w, b) = (e as usize / 64, 1u64 << (e % 64));
+            let fresh = seen[w] & b == 0;
+            seen[w] |= b;
+            fresh
+        });
+    } else {
+        v.sort_unstable();
+        v.dedup();
+    }
+}
+
+/// 昇順の `s` の `from` 以降で、 `e` 以上の最初の位置 (無ければ `s.len()`)。 1, 2, 4, .. と跳んで越えたら、 その間を二分探索する
+/// (近い所にある時は跳ぶ回数だけ)。
+fn gallop_ge(s: &[u32], from: usize, e: u32) -> usize {
+    let (mut lo, mut at, mut step) = (from, from, 1);
+    while at < s.len() && s[at] < e {
+        lo = at + 1;
+        at += step;
+        step <<= 1;
+    }
+    let hi = at.min(s.len());
+    lo + s[lo..hi].partition_point(|&x| x < e)
 }
 
 /// `col.get(eid)` の cell を stored 形式 (0 = 未設定、 N = 値 N-1) で。 列の幅 (4 / 8 byte) はここと
@@ -1073,6 +1142,40 @@ impl HimoStore {
         self.ensure_cylinder_built();
         let col = self.col();
         self.cyl.count_range(lo, hi, |v, e| stored_at(col, e) == v + 1)
+    }
+
+    /// 値が `lo..=hi` の entity (重複なし、 順は決めない)。 置き場の単位で写す (値の順にたどらない、 全体を並べない):
+    /// - 古い entry の無い bucket と sparse の run の区間はそのまま写す (確かめも並べも無い)
+    /// - 古い entry のある bucket は、 今の値がちょうどその値かを Column で確かめる。 同じ entity が 2 つあるのは書き換えで
+    ///   戻ってきた時 (往復) だけで、 2 つ目は頭 (昇順の部分) より後ろにある。 頭は確かめて隣の重複を落とすだけ、 後ろは
+    ///   確かめた分だけ並べて、 後ろの中の重複と頭にあるものを落とす (頭は跳びながら探す)
+    /// - 古い entry のある sparse は、 今の値が sparse の区間の中かを Column で確かめ (値の列は読まない)、 通った eid の重複を最後に
+    ///   落とす ([`dedup_eids`]: 往復した entity や、 区間の中で値が動いた entity の古い entry も通るので)。 区間どうしは重ならず
+    ///   bucket の値とも重ならないので、 ほかの区間・bucket の分と重なることは無い
+    ///
+    /// ([`pull_range`](Self::pull_range) は全部を Column で確かめ、 全部を eid の順に並べる)。
+    pub fn pull_range_unordered(&self, lo: u64, hi: u64) -> Vec<u32> {
+        if lo > hi {
+            return Vec::new();
+        }
+        self.ensure_cylinder_built();
+        let col = self.col();
+        let mut out = Vec::new();
+        // 古い entry のある sparse で確かめた eid (最後に重複を落とす)
+        let mut loose = Vec::new();
+        self.cyl.for_each_part(lo, hi, |part| match part {
+            Part::Bucket { eids, verify: false, .. } | Part::Run { eids, verify: false, .. } => out.extend_from_slice(eids),
+            Part::Bucket { value, eids, head, verify: true } => push_live_once(col, value, eids, head, &mut out),
+            Part::Run { lo, hi, eids, verify: true } => loose.extend(eids.iter().copied().filter(|&e| {
+                let s = stored_at(col, e);
+                s != 0 && lo < s && s - 1 <= hi
+            })),
+        });
+        if !loose.is_empty() {
+            dedup_eids(&mut loose);
+            out.extend_from_slice(&loose);
+        }
+        out
     }
 
     /// 値が `lo..=hi` の entity (eid の昇順・重複なし)。 索引の範囲 (dense は bucket を範囲の分、 大きな値は

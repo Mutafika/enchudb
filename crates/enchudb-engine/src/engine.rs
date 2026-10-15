@@ -13427,12 +13427,14 @@ impl Engine {
         self.himos[idx].pull_range(min, max).into_iter().map(|e| e as enchudb_oplog::EntityId).collect()
     }
 
-    /// [`pull_range`](Self::pull_range) の himo_id 版 (値は engine の u64、 両端を含む)。 eid は peer の頭付き
-    /// ([`query_by_id64`](Self::query_by_id64) と同じ形)、 昇順。 未知の紐は空。
+    /// 値が `lo..=hi` (engine の u64、 両端を含む) の entity。 eid は peer の頭付き ([`query_by_id64`](Self::query_by_id64) と
+    /// 同じ形)。 重複なし、 順は決めない (置き場の単位で写し、 全体を並べない: 古い entry の無い bucket と sparse の run の区間は
+    /// 写すだけ、 古い entry のある所は Column で確かめて往復の重複を落とす。 eid の昇順が要る時は [`pull_range`](Self::pull_range))。
+    /// 未知の紐は空。
     pub fn pull_range_by_id(&self, hid: u16, lo: u64, hi: u64) -> Vec<enchudb_oplog::EntityId> {
         let Some(hs) = self.himos.get(hid as usize) else { return Vec::new() };
         let peer = self.peer_id();
-        hs.pull_range(lo, hi).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect()
+        hs.pull_range_unordered(lo, hi).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect()
     }
 
     /// 紐の列の長さ (値を書いたことのある一番大きい local eid + 1)。 列をなめる読み ([`entities_with_himo`](Self::entities_with_himo)
@@ -19014,6 +19016,29 @@ mod tests {
         // 索引を組んでから書き換えと消し (bucket と sparse に古い entry を残す)
         assert!(eng.count_value_by_id(hs, 0) > 0);
         let _ = eng.count_range_by_id(hw, 0, u64::MAX);
+        // 範囲の find を、 書き換える前 (古い entry の無い bucket と run を写すだけの道) に本物の Column と比べる
+        let pulled = |eng: &Engine, h: u16, lo: u64, hi: u64| {
+            let mut got = eng.pull_range_by_id(h, lo, hi);
+            got.sort_unstable();
+            got
+        };
+        let scanned = |eng: &Engine, ids: &[u64], h: u16, lo: u64, hi: u64| {
+            let mut want: Vec<u64> = ids.iter().copied().filter(|&e| eng.get_by_id(e, h).is_some_and(|v| lo <= v && v <= hi)).collect();
+            want.sort_unstable();
+            want
+        };
+        for (h, lo, hi) in [(hs, 0, u64::MAX), (hs, 5, 25), (hw, 0, u64::MAX), (hw, mid - 10, mid + 10), (hw, 0, mid - 1)] {
+            let want = scanned(&eng, &ids, h, lo, hi);
+            assert!(!want.is_empty(), "test の前提: h={h} {lo}..={hi} に entity がある");
+            assert_eq!(pulled(&eng, h, lo, hi), want, "書き換える前 h={h} {lo}..={hi}");
+        }
+        // 頭の中で同じ eid が隣り合う bucket: 組んだ後に作った entity (一番大きい eid) を値 7 に足すと頭が伸び、 8 へ行って 7 に
+        // 戻ると同じ eid がもう 1 つ頭に足される (頭は広義の昇順)
+        let f = eng.entity().unwrap();
+        eng.tie(f, "small", 7u32);
+        eng.tie(f, "small", 8u32);
+        eng.tie(f, "small", 7u32);
+        ids.push(f);
         for _ in 0..n / 2 {
             let e = ids[(rnd() % n as u64) as usize];
             let (a, b) = (rnd(), rnd());
@@ -19021,16 +19046,32 @@ mod tests {
             eng.tie(e, "wide", wide(b));
         }
         // 値の種類の多い値 (sparse) へ戻る往復: sparse に同じ (値, eid) の entry が 2 つ残る
-        let far: Vec<u64> = ids.iter().copied().filter(|&e| eng.get_by_id(e, hw).is_some_and(|v| v < mid - (1 << 20))).take(30).collect();
+        // eid の小さい方と大きい方から 15 ずつ (範囲の find の重複落としは、 件数と一番大きい eid で印と並べを使い分けるので、 値 1 つの
+        // 範囲で両方の道を通す)
+        let far: Vec<u64> = {
+            let cand: Vec<u64> = ids.iter().copied().filter(|&e| eng.get_by_id(e, hw).is_some_and(|v| v < mid - (1 << 20))).collect();
+            cand.iter().take(15).chain(cand.iter().rev().take(15)).copied().collect()
+        };
         assert!(!far.is_empty(), "test の前提: sparse の値の entity がある");
         for &e in &far {
             let x = eng.get_by_id(e, hw).unwrap();
             eng.tie(e, "wide", mid + 3);
             eng.tie(e, "wide", x);
         }
+        // 値の種類の少ない値 (dense) の往復: 頭にある entity が後ろにもう 1 つ (x → y → x)、 後ろに 2 つ (x → y → x → y → x)
+        let mut trips = Vec::new();
+        for (k, &e) in ids[10..30].iter().enumerate() {
+            let Some(x) = eng.get_by_id(e, hs) else { continue };
+            for _ in 0..1 + k % 2 {
+                eng.tie(e, "small", ((x + 1) % 40) as u32);
+                eng.tie(e, "small", x as u32);
+            }
+            trips.push(e);
+        }
+        assert!(trips.len() >= 10, "test の前提: 往復させた dense の entity がある");
         for _ in 0..n / 10 {
             let e = ids[(rnd() % n as u64) as usize];
-            if !far.contains(&e) {
+            if !far.contains(&e) && !trips.contains(&e) {
                 eng.delete(e);
             }
         }
@@ -19039,6 +19080,8 @@ mod tests {
             let want = ids.iter().filter(|&&f| eng.get_by_id(f, hw) == Some(x)).count();
             assert_eq!(eng.count_range_by_id(hw, x, x), want, "往復した値 {x}");
             assert_eq!(eng.count_value_by_id(hw, x), want, "往復した値 {x} (等値)");
+            // 範囲の find の、 少ない件数 (並べて重複を落とす道) で往復の 2 つ目を落とす
+            assert_eq!(pulled(&eng, hw, x, x), scanned(&eng, &ids, hw, x, x), "往復した値 {x} の範囲の find");
         }
         for h in [hs, hw] {
             // (値, eid) の昇順
@@ -19064,7 +19107,9 @@ mod tests {
                 assert_eq!(eng.count_range_by_id(h, lo, hi), want.len(), "count_range h={h} {lo}..={hi}");
                 let mut ids_sorted: Vec<u64> = want.iter().map(|x| x.1).collect();
                 ids_sorted.sort_unstable();
-                assert_eq!(eng.pull_range_by_id(h, lo, hi), ids_sorted, "pull_range h={h} {lo}..={hi}");
+                let mut got = eng.pull_range_by_id(h, lo, hi);
+                got.sort_unstable();
+                assert_eq!(got, ids_sorted, "pull_range h={h} {lo}..={hi} (順は決めない。 並べると重複が隣り合う)");
                 // 同じ値の中の順は決めない: 値の列が (値, eid) の順の先頭と同じ・重複なし・どれも範囲の中で keep を満たす
                 let same_vals = |got: &[u64], want: &[(u64, u64)], keep: &dyn Fn(u64) -> bool| -> bool {
                     let mut u = got.to_vec();
