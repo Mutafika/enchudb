@@ -13420,11 +13420,14 @@ impl Engine {
 
     /// 範囲内の全値に合致する entity を返す（min..=max）
     /// 値が `min..=max` の entity (両端を含む)。 64 bit 列にも使える。 索引の範囲を引いて Column で
-    /// 確かめる (値を 1 つずつ引かない — 広い範囲 / 64 bit の範囲でも範囲内の件数に比例)。 結果は eid の昇順。
+    /// 確かめる (値を 1 つずつ引かない — 広い範囲 / 64 bit の範囲でも範囲内の件数に比例)。 結果は eid の昇順、 eid は peer の頭付き
+    /// ([`entities`](Self::entities) / [`query_by_id64`](Self::query_by_id64) と同じ形。 前は頭を付けずに local の番号を返していた —
+    /// #32 / issue12 と同じ抜け)。
     pub fn pull_range(&self, himo: &str, min: impl CellValue, max: impl CellValue) -> Vec<enchudb_oplog::EntityId> {
         let idx = match self.himo_id(himo) { Some(h) => h, None => return vec![] };
         let (Some(min), Some(max)) = (min.cell_value(), max.cell_value()) else { return vec![] };
-        self.himos[idx].pull_range(min, max).into_iter().map(|e| e as enchudb_oplog::EntityId).collect()
+        let peer = self.peer_id();
+        self.himos[idx].pull_range(min, max).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect()
     }
 
     /// 値が `lo..=hi` (engine の u64、 両端を含む) の entity。 eid は peer の頭付き ([`query_by_id64`](Self::query_by_id64) と
@@ -13771,11 +13774,15 @@ impl Engine {
         for ds in &self.himos { ds.rebuild_cylinder(); }
     }
 
-    /// 引く。 EntityId(u64) の Vec を返す。
+    /// 引く。 EntityId(u64) の Vec を返す (peer の頭付き、 [`entities`](Self::entities) / [`query_by_id64`](Self::query_by_id64)
+    /// と同じ形。 前は頭を付けずに local の番号を返していた — #32 / issue12 と同じ抜け)。
     /// 値は u32 / u64 / 負でない整数 (負の数は 0 件)。
     pub fn pull_raw(&self, himo: &str, value: impl CellValue) -> Vec<enchudb_oplog::EntityId> {
         match (self.himo_id(himo), value.cell_value()) {
-            (Some(idx), Some(v)) => self.himos[idx].pull(v).into_iter().map(|e| e as enchudb_oplog::EntityId).collect(),
+            (Some(idx), Some(v)) => {
+                let peer = self.peer_id();
+                self.himos[idx].pull(v).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect()
+            }
             _ => Vec::new(),
         }
     }
@@ -13828,8 +13835,11 @@ impl Engine {
         out.into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect()
     }
 
+    /// 紐の名前と値の組の AND に当てはまる entity。 eid は peer の頭付き ([`query_by_id`](Self::query_by_id) と同じ形。 前は頭を
+    /// 付けずに local の番号を返していた — #32 / issue12 と同じ抜け)。
     pub fn query(&self, strings: &[(&str, u32)]) -> Vec<enchudb_oplog::EntityId> {
-        self.query_u32(strings).into_iter().map(|e| e as enchudb_oplog::EntityId).collect()
+        let peer = self.peer_id();
+        self.query_u32(strings).into_iter().map(|e| enchudb_oplog::make_eid(peer, e)).collect()
     }
 
     /// live query (クエリ購読) を登録する。 条件 (`preds`、 同一 entity の AND) に当てはまる
