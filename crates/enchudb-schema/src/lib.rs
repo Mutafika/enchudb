@@ -2077,6 +2077,13 @@ impl LiveQuery {
         self.inner.members(&self.eng)
     }
 
+    /// `deck` (例: `table.where_eq("addr", "Tokyo").find()` で引いた束) のうち、 今の結果に入るもの (`deck` の順のまま)。
+    /// カードごとに購読の記録を引くだけで、 条件の列は読まない (「addr = Tokyo かつ この購読」 を、 束 × 購読で答える)。
+    /// poll の状態は変えない。
+    pub fn members_in(&self, deck: &[EntityId]) -> Vec<EntityId> {
+        self.inner.members_in(&self.eng, deck)
+    }
+
     /// `order_by(..).limit(k)` の購読: 今の先頭 k 件を並びの順に (先頭が 1 位)。 他は `members` と同じ。
     pub fn ranked(&self) -> Vec<EntityId> {
         self.inner.ranked(&self.eng)

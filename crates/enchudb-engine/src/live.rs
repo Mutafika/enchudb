@@ -2121,6 +2121,10 @@ struct Member {
     tuples: Vec<Vec<u64>>,
     /// 最後の poll で呼び手に渡した集合 (= 呼び手が積分済みの集合)。
     reported: Bits,
+    /// 今の集合 (最後の settle までの答え = 根の記録から引いた答えと同じ)。 束 × 購読 ([`LiveQuery::members_in`]) に初めて使った時に
+    /// 根の記録から作り、 以後は根の記録が動いて出入りした時と初回の報告の時に立て直す ([`Settled::apply_root_cached`])。 使わない
+    /// 購読と、 集計・鍵付き・上位 k の member は持たない (`None`)。
+    now: Option<Bits>,
     /// 最後の poll 以降に一度でも集合を出た eid。 報告済みかつ今も集合に居ても、 これが
     /// 立っていれば 「出て入り直した」 として removed + added の両方を出す。
     left: Marks,
@@ -2252,6 +2256,14 @@ impl Member {
         if !self.queued {
             self.queued = true;
             ready.push(slot);
+        }
+    }
+
+    /// 今の集合の bit を `on` にする (持つ member だけ)。
+    #[inline]
+    fn set_now(&mut self, eid: u32, on: bool) {
+        if let Some(b) = self.now.as_mut() {
+            b.put(eid, on);
         }
     }
 
@@ -3175,6 +3187,7 @@ impl Settled {
             for &slot in fresh {
                 if let Some(m) = self.members[slot].as_mut().filter(|m| m.has(eid, now)) {
                     m.note(slot, &mut self.ready, eid, false);
+                    m.set_now(eid, true);
                 }
             }
         }
@@ -3261,6 +3274,7 @@ impl Settled {
                 ivs.cross(a, b, &mut |slot, enter| {
                     if let Some(m) = members[slot].as_mut() {
                         m.note(slot, ready, eid, !enter);
+                        m.set_now(eid, enter);
                     }
                 });
             }
@@ -3319,6 +3333,7 @@ impl Settled {
             };
             if let Some(m) = members[slot].as_mut() {
                 m.note(slot, ready, eid, !enter);
+                m.set_now(eid, enter);
             }
         }
     }
@@ -3641,6 +3656,7 @@ impl Family {
             range_on: false,
             tuples: Vec::new(),
             reported: Bits::default(),
+            now: None,
             left: Marks::default(),
             changed: Marks::default(),
             queued: false,
@@ -5188,6 +5204,60 @@ impl LiveQuery {
             .map(|&eid| {
                 let e = enchudb_oplog::eid_local(eid);
                 m.has(e, s.view(e))
+            })
+            .collect()
+    }
+
+    /// `deck` (タグや値で引いた束など、 呼び手が引いた eid の列) のうち、 今の結果に入るもの (`deck` の順のまま、 eid の形も
+    /// `deck` のまま)。 条件の列は読まない。 「タグ = x かつ この購読」 を、 デッキ × 購読のスピンで答える。 poll の状態は変えない。
+    ///
+    /// lock と settle は 1 回。 カードごとに今の集合の bit (`Member::now`) を見るだけ。 bit はこの購読を初めて束 × 購読に使った時に
+    /// 根の記録から作り (答えの大きさに比例、 1 回だけ)、 以後は settle で出入りのたびに立て直す (使わない購読は持たない)。 集計・
+    /// 鍵付き・上位 k の購読は bit を持たず、 最後の poll の後に出入りがありえた (`changed` に印がある) カードは購読の記録 (family の
+    /// 根の記録) を引いて確かめ、 それ以外は最後の poll で渡した集合 (`reported`) の bit を見る (出入りがありえないので、 それが今の答え)。
+    pub fn members_in(&self, eng: &crate::engine::Engine, deck: &[EntityId]) -> Vec<EntityId> {
+        self.check_engine(eng);
+        let (family, slot) = match &self.kind {
+            Kind::One { family, slot } => (family, *slot),
+            Kind::Any(u) => {
+                let st = self.settle_union(u, eng);
+                return deck.iter().copied().filter(|&eid| st.has(enchudb_oplog::eid_local(eid))).collect();
+            }
+        };
+        let mut guard = family.settled.lock();
+        family.settle(eng, &mut guard);
+        let Settled { recs, vals, members, .. } = &mut *guard;
+        let Some(m) = members[slot].as_mut() else { return Vec::new() };
+        if m.grp.is_none() && m.keyed.is_none() && m.topk.is_none() {
+            // 初めて束 × 購読に使う購読は、 根の記録から今の集合の bit を作る (以後は出入りのたびに立て直す)
+            let now = m.now.get_or_insert_with(|| {
+                let mut b = Bits::default();
+                for e in recs[0].with_keys(&m.root_keys) {
+                    if Member::probe(&m.root_keys, m.range, None)(e, root_at(recs, vals, e)) {
+                        b.put(e, true);
+                    }
+                }
+                b
+            });
+            return deck.iter().copied().filter(|&eid| now.get(enchudb_oplog::eid_local(eid))).collect();
+        }
+        let s = &mut *guard;
+        let Some(m) = s.members[slot].as_mut() else { return Vec::new() };
+        // 印を畳んで (昇順・重複なし) 二分探索で引けるようにする (poll の drain と同じ畳み方。 印は消さない)
+        m.changed.compact();
+        let m = &*m;
+        let changed = &m.changed.list;
+        let probe = Member::probe(&m.root_keys, m.range, m.topk.map(|t| (t, m.order_desc)));
+        let (recs, vals, opart, ov) = (&s.recs, &s.vals, &s.opart, s.order_view);
+        deck.iter()
+            .copied()
+            .filter(|&eid| {
+                let e = enchudb_oplog::eid_local(eid);
+                if !changed.is_empty() && changed.binary_search(&e).is_ok() {
+                    probe(e, view_at(recs, vals, opart, ov, e))
+                } else {
+                    m.reported.get(e)
+                }
             })
             .collect()
     }
