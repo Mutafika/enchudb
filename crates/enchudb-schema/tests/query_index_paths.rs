@@ -353,7 +353,7 @@ fn wide_range_find_scans_the_column() {
     let check = |rows: &[(u64, bool, u32, u32)], stage: &str| {
         let ids = |f: &dyn Fn(u32, u32) -> bool| -> Vec<u64> { sorted(rows.iter().filter(|r| r.1 && f(r.2, r.3)).map(|r| r.0).collect()) };
         for (lo, hi) in [(0u32, 99u32), (0, 69), (30, 99), (10, 12)] {
-            assert_eq!(t.where_range("age", lo as i64, hi as i64).find().unwrap(), ids(&|a, _| lo <= a && a <= hi), "{stage} 範囲 {lo}..={hi}");
+            assert_eq!(sorted(t.where_range("age", lo as i64, hi as i64).find().unwrap()), ids(&|a, _| lo <= a && a <= hi), "{stage} 範囲 {lo}..={hi}");
             assert_eq!(
                 t.where_range("age", lo as i64, hi as i64).count().unwrap(),
                 ids(&|a, _| lo <= a && a <= hi).len(),

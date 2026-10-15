@@ -69,6 +69,16 @@ const DENSE_MIN_FILL: usize = 4;
 /// 値の区間 `(最小, 最大, 置き場)`。 置き場は `Some(配列)` か `None` (sparse) ([`LockFreeCylinder::segments`])。
 type Segment = (u64, u64, Option<usize>);
 
+/// [`LockFreeCylinder::for_each_part`] が渡す置き場の 1 単位。 `verify` = 古い entry がありうる (Column で今の値を確かめる。
+/// 無ければ全部 live で重複も無い)。
+pub(crate) enum Part<'a> {
+    /// dense の値 1 つの bucket: eid の列 (置いてある順) と、 その頭の昇順 (広義) の長さ。
+    Bucket { value: u64, eids: &'a [u32], head: usize, verify: bool },
+    /// sparse の run 1 本の、 値が `lo..=hi` の区間の eid の列 ((値, eid) の順)。 `lo..=hi` は sparse の区間 (`segments`) で
+    /// 切ってある: 区間どうしは重ならず、 dense の bucket の値とも重ならない。
+    Run { lo: u64, hi: u64, eids: &'a [u32], verify: bool },
+}
+
 /// 配列 `k` の添字の上限 (配列はここまでしか伸ばさない)。
 #[inline]
 fn region_cap(k: usize) -> usize {
@@ -665,6 +675,44 @@ impl LockFreeCylinder {
                 }
             }
             ControlFlow::Continue(())
+        });
+    }
+
+    /// 値が `lo..=hi` の entry を、 置き場の単位 ([`Part`]) で順を決めずに `f` に渡す: dense は値 1 つの bucket ごと、 sparse は
+    /// run ごとの区間 (値の順の混ぜ合わせをしない)。 dense の空の要素と live が 0 の bucket は渡さない。 区間と版の控え方は
+    /// [`walk`](Self::walk) と同じ (sparse の版を配列より先に控え、 配列が覆う区間の sparse は読まない。 古い entry の有無は
+    /// sparse を控える前に見る)。
+    pub(crate) fn for_each_part(&self, lo: u64, hi: u64, mut f: impl FnMut(Part<'_>)) {
+        if lo > hi {
+            return;
+        }
+        let churned = self.sparse_churned_before_read();
+        self.sparse.snapshot(|sp| {
+            let guard = epoch::pin();
+            let vecs = [LOW, POS, NEG].map(|k| self.vec_of(k, &guard));
+            let (segs, len) = self.segments(vecs.map(|v| v.len()));
+            for &(a, b, at) in &segs[..len] {
+                let (a, b) = (a.max(lo), b.min(hi));
+                if a > b {
+                    continue;
+                }
+                let Some(k) = at else {
+                    sp.for_each_span(a, b, |eids| f(Part::Run { lo: a, hi: b, eids, verify: churned }));
+                    continue;
+                };
+                let (i, j) = (self.slot_index(k, a), self.slot_index(k, b));
+                let i0 = i.min(j);
+                for (d, s) in vecs[k][i0..=i.max(j)].iter().enumerate() {
+                    if let Some(bk) = s.get()
+                        && bk.live() > 0
+                    {
+                        let (eids, head, verify) = bk.snapshot_sorted_in(&guard);
+                        if !eids.is_empty() {
+                            f(Part::Bucket { value: self.slot_value(k, i0 + d), eids, head, verify });
+                        }
+                    }
+                }
+            }
         });
     }
 
@@ -1404,6 +1452,48 @@ mod tests {
         out
     }
 
+    /// `for_each_part` で置き場の単位に読んだ entry を、 `HimoStore::pull_range_unordered` と同じく確かめて集める (重複を落として
+    /// eid の昇順で返す)。 置き場の形も見る: bucket の頭の長さは探した長さと同じ、 bucket の値と run の区間は問い合わせの範囲の中で
+    /// 重ならない、 古い entry の無い所 (`verify` が false) の eid に重複が無い。
+    fn parted(c: &LockFreeCylinder, cells: &Cells, lo: u64, hi: u64) -> Vec<u32> {
+        let (mut clean, mut checked, mut values, mut spans) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        c.for_each_part(lo, hi, |part| match part {
+            Part::Bucket { value, eids, head, verify } => {
+                assert_eq!(head, crate::append_bucket::sorted_prefix_len(eids), "値 {value}: 頭の昇順の長さが合わない");
+                assert!(lo <= value && value <= hi, "範囲の外の bucket {value}");
+                values.push(value);
+                if verify {
+                    checked.extend(eids.iter().copied().filter(|&e| cells.0.borrow().get(&e) == Some(&value)));
+                } else {
+                    clean.extend_from_slice(eids);
+                }
+            }
+            Part::Run { lo: a, hi: b, eids, verify } => {
+                assert!(lo <= a && a <= b && b <= hi, "範囲の外の run の区間 {a}..={b}");
+                spans.push((a, b));
+                if verify {
+                    checked.extend(eids.iter().copied().filter(|&e| cells.0.borrow().get(&e).is_some_and(|&v| a <= v && v <= b)));
+                } else {
+                    clean.extend_from_slice(eids);
+                }
+            }
+        });
+        assert!(values.iter().all(|&v| spans.iter().all(|&(a, b)| v < a || b < v)), "bucket の値が run の区間に重なる");
+        clean.sort_unstable();
+        assert!(clean.windows(2).all(|w| w[0] < w[1]), "古い entry の無い所に同じ eid が 2 つある");
+        clean.extend(checked);
+        clean.sort_unstable();
+        clean.dedup();
+        clean
+    }
+
+    /// `expected` の entity を eid の昇順で。
+    fn expected_eids(cells: &Cells, lo: u64, hi: u64) -> Vec<u32> {
+        let mut out: Vec<u32> = expected(cells, lo, hi, false, usize::MAX).into_iter().flat_map(|x| x.1).collect();
+        out.sort_unstable();
+        out
+    }
+
     /// Column の代わり (`Cells`) から出した答え: 値が `lo..=hi` の (値, eid の昇順) を値の順に、 `limit` 件の entity まで
     /// (最後の値は全部入れる — `walked` と同じ切り方)。
     fn expected(cells: &Cells, lo: u64, hi: u64, desc: bool, limit: usize) -> Vec<(u64, Vec<u32>)> {
@@ -1504,6 +1594,7 @@ mod tests {
             }
             let want: usize = expected(&cells, lo, hi, false, usize::MAX).iter().map(|x| x.1.len()).sum();
             assert_eq!(c.count_range(lo, hi, cells.keep()), want, "count_range {lo}..={hi}");
+            assert_eq!(parted(&c, &cells, lo, hi), expected_eids(&cells, lo, hi), "for_each_part {lo}..={hi}");
         }
         // 途中で止める (上位 k): 止めた所までが同じ
         for k in [1, 7, 100] {
@@ -1511,11 +1602,14 @@ mod tests {
                 assert_eq!(walked(&c, &cells, 0, u64::MAX, desc, k), expected(&cells, 0, u64::MAX, desc, k), "k={k} desc={desc}");
             }
         }
-        // 掃除しても同じ
+        // 掃除しても同じ (sparse は古い entry が無くなり、 run の区間を写すだけの道になる)
         c.compact_sparse(cells.keep());
         assert!(!c.sparse_churned());
         for desc in [false, true] {
             assert_eq!(walked(&c, &cells, 0, u64::MAX, desc, usize::MAX), expected(&cells, 0, u64::MAX, desc, usize::MAX));
+        }
+        for &(lo, hi) in &ranges {
+            assert_eq!(parted(&c, &cells, lo, hi), expected_eids(&cells, lo, hi), "掃除の後の for_each_part {lo}..={hi}");
         }
         assert_eq!(c.count_range(0, u64::MAX, cells.keep()), cells.0.borrow().len());
     }

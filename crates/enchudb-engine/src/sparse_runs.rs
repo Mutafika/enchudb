@@ -146,6 +146,20 @@ impl SparseSnap<'_> {
         self.set.all().map(|r| r.span(lo, hi).len()).sum()
     }
 
+    /// 値が `lo..=hi` の entry の eid を、 run ごとの区間で `f` に渡す (古い entry 込み、 空の区間は渡さない)。 run をまたいだ
+    /// 混ぜ合わせはしない (順の要らない読み用)。
+    pub(crate) fn for_each_span(&self, lo: u64, hi: u64, mut f: impl FnMut(&[u32])) {
+        if lo > hi {
+            return;
+        }
+        for r in self.set.all() {
+            let s = r.span(lo, hi);
+            if !s.is_empty() {
+                f(&r.eids[s]);
+            }
+        }
+    }
+
     /// 値が `lo..=hi` の entry を `f(値, eid)` に (古い entry 込み、 run ごとに値の順)。
     pub(crate) fn for_each_in(&self, lo: u64, hi: u64, mut f: impl FnMut(u64, u32)) {
         if lo > hi {
