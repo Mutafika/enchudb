@@ -3,6 +3,146 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.33.0 — 2026-10-16
+
+minor。 on-disk 形式・wire 形式は 0.32.3 と同じ (開き直しも sync もそのまま)。 order_by の決まり、 範囲の find の答えの並び、 範囲
+だけの条件の find / count に入る row、 和が 0 の group、 名前で引く読みの eid が変わる (下の 「上げる時の注意」)。 schema の問い
+合わせの件数・範囲・order_by + limit・最小 / 最大・条件の無い件数を索引で答えるようになり (100 万行で ms → µs)、 書き換えのあった
+値の読み、 RAG の絞り込み付きの検索、 n-gram の AND が速くなった。 live 購読に、 引いた束のうち購読の今の答えに入るものを返す
+`LiveQuery::members_in` を足した。 cardinality の hint 以上の値の group が、 group 集計で panic するか黙って落ちていたのを直した
+(#474)。
+
+**上げる時の注意**:
+
+- order_by の同じ値の中の順は決めない (0.32.3 は eid の昇順)。 Tag・Ref・Leaf の列の order_by は `BadValue` で断る (0.32.3 は
+  Tag の列を辞書に入った順、 Ref の列を entity の番号の順に並べていた)。 順が要る時は数の列で並べる。 ref の道の先の数の列で
+  並べるのは今まで通り (#481)
+- 範囲の条件の find (schema の `find()`、 engine の `pull_range_by_id`) の答えは eid の順に並ばない (中身は同じ集合)。 engine の
+  `pull_range` は eid の昇順のまま (#483)
+- 範囲だけの条件 (等値・IN の無い) の `find()` / `count()` に、 主キー (代表列) の無い row も入る (等値・IN の条件と同じ 「条件に
+  合う entity」 にそろえた。 条件の無い `all()` は今まで通り主キーのある row だけ) (#475)
+- 範囲・並び・最小 / 最大の読みは、 最初の 1 回でその列の索引 (円柱) を作る (等値の読みと同じ)。 索引のある列は書き換えのたびに
+  索引も手入れするので、 その列の update が重くなる (schema の bench の 4 列の update で 1.76〜2.40 倍。 全部の列の索引を前もって
+  作ってから比べると 1.02 倍) (#475)
+- group の和は、 値のある row が 1 つでもある group を、 和が 0 でも返す (0.32.3 は cardinality の hint のある列の範囲・並列の道
+  だけが返さず、 `Query::group_sum` の答えが件数 64000 を境に変わった) (#476)
+- peer を設定した DB (sync) で、 `Engine::pull_raw` / `pull_range` / `query` の返す eid に peer の頭が付く (0.32.3 は頭が 0 の
+  local の番号で、 ほかの eid を返す API と食い違っていた。 peer を設定していない DB では前と同じ) (#485)
+- engine の公開 API が増えた: `count_value_by_id` / `count_range_by_id` / `pull_range_by_id` / `ordered_by_id` / `first_by_id` /
+  `column_len_by_id` (#475)、 `count_present_by_id` (#478)。 engine と schema の `LiveQuery::members_in` (#486)
+
+### Added — 引いた束のうち購読の今の答えに入るもの: `LiveQuery::members_in` (#486)
+
+`q.members_in(&deck)` は、 呼び手が引いた束 (例: `t.where_eq("addr", x).find()`) のうち、 購読 `q` の今の結果に入るものを束の順
+のまま返す (「タグ = x かつ この購読」)。 条件の列は読まない。 lock と settle は 1 回、 poll の状態は変えない。 購読ごとの今の
+集合の bit は、 その購読を初めて `members_in` に使った時に根の記録から作り (答えの大きさに比例、 1 回だけ)、 以後は settle で
+出入りのたびに立て直す (使わない購読は持たない)。 集計・鍵付き・上位 k の購読は bit を持たず、 最後の poll の後に出入りが
+ありえたカードを記録で確かめる。 100 万行・束 2.1 万人で、 10% を書き換えた後 (poll していない) の 「束を引いて `members_in`」
+は同じ問いの find の 0.26 倍、 `members_in` だけで 0.11 倍。
+
+### Changed — order_by の同じ値の中の順を決めない / 順の無い値の列の order_by を断る (#481)
+
+order_by は 「同じ値は eid の昇順」 だった。 eid は辞書の鍵 (entity → 置き場) で、 番号は使い直し・sync で付け替えるので、 その
+順に意味は無い。 それでもその順を守るために、 書き換えで bucket の後ろに足された entry を読むたびに並べ直していた。 同じ値の中
+の順は決めず (同じ値の中ならどの row を選んでも正しい答え)、 値の順にたどる道は bucket を置いてある順に写す (古い entry の
+ある bucket は Column で確かめ、 行って戻った entity の 2 つ目は落とす)。 引いて並べる道は (値, eid) で並べ、 購読の上位 k は
+中で eid の小さい方を残す (今のまま) ので、 同じ問いでも道や購読によって、 境目の値の中で選ぶ row が違うことがある。 LAG
+(1 つ前の row の組) は全体の順が要るので、 今のまま eid を決め手にする。
+
+Tag の列の値は辞書の番号、 Ref の列の値は entity の番号で、 どちらも番号の順に意味が無い (Tag の列で並べると辞書に入った順に
+なっていた)。 order_by は数の列 (Number / BigInt) だけを受け、 Tag・Ref・Leaf の列は理由を添えて `BadValue` で断る (`find` /
+`count` / 購読。 ref の道の先が Tag の列でも同じ)。
+
+1 つ前の形との比 (100 万行、 10% を書き換えた後): 上位 10 件 1405 → 363 ns、 `Query` の最小 1076 → 100 ns、 `Table` の最小
+1067 → 63 ns (10 万行 → 100 万行の伸びは 3.0〜5.8 倍 → 1.00〜1.04 倍)。 書き換えの無い表の上位 k・最小は 0.86〜0.92 倍。
+
+### Performance — schema の問い合わせの件数・範囲・order_by + limit・最小 / 最大を索引で答える (#475、 #478、 #479、 #480)
+
+0.32.3 の schema の `Query` / `Table` は、 範囲の条件の `count()` / `find()`、 `order_by(..).limit(k)`、 `min` / `max`、 条件の
+無い `count()` を、 索引 (円柱) を使わずに表の row を全部なめて答えていた (100 万行で 0.5〜38 ms)。
+
+- `count()`: 条件が 1 つの列だけなら索引の数 (等値は O(1)、 IN は値の数、 範囲は範囲の中の値の数に比例) (#475)。 条件の無い
+  `count()` は、 列ごとに値のある row の数を書き手が持ち O(1) (#478)。 並びのある `count()` は `find().len()` と同じ数 (#477)
+- `find()`: 範囲は範囲の索引を引く。 条件が 2 種類以上なら、 索引の数が一番少ない条件を種にして残りを列で確かめる。 種が範囲で
+  当たりが列の半分を超える時は列をなめる (#475)
+- `order_by` (+ `limit`)、 `min` / `max` / `min_i64` / `max_i64` / `Table::min` / `Table::max`: 列を値の順にたどって limit 件で
+  止める (#475)。 bucket の 「頭の昇順の長さ」 は書き手 (dense) と置き場 (sparse) が渡し、 読みは探さない (#479、 #480)
+- `Engine::distinct` は見た値を HashSet で引く (答えの中身と並びは同じ) (#475)
+
+それぞれの PR の時の master と比べて (100 万行、 書き換えの無い表):
+
+| 読み | 前 | 後 |
+|---|---|---|
+| `where_range(score, 10 値).count()` (当たり 0.1%) | 8.3 ms | 0.14 µs (#475) |
+| `where_range(score, 10 値).find()` (当たり 0.1%) | 7.3 ms | 12 µs (#475) |
+| `where_in(grp, 5 値).count()` | 43 µs | 0.19 µs (#475) |
+| `all().order_by(age).limit(10).find()` | 35 ms | 0.91 µs (#475) → 320 ns (#479) |
+| `all().order_by_desc(score).limit(10).find()` | 38 ms | 0.33 µs (#475) |
+| `all().min(age)` | 1.17 ms | 0.67 µs (#475) → 103 ns (#479) |
+| `t.min(age)` | 0.56 ms | 0.65 µs (#475) → 63 ns (#479) |
+| `all().count()` | 1.18 ms | 15 ns (#478) |
+
+### Performance — 書き換えのあった値の読み (#473、 #483)
+
+- bucket の組み直し (出ていった entry が半分になった bucket を列の今の値で組み直す) は、 重複を探すためだけに並べて並びを捨て
+  ていた。 組み直した bucket を eid の昇順にし、 verify した `pull` / `pull_into` は後ろ (足した順番外) だけ並べて混ぜる (#473)。
+  100 万人で書き換え 10% の後の `Engine::pull` が 0.34〜0.50 倍、 実際に近い混ぜ方 (社員の表 100 万行に 60 秒) で読み 0.835 倍・
+  全体の op/s 1.17 倍、 書き込みは変わらない。 前の昇順の所が 1 割以下の bucket では、 並べる手間が最大 24% 遅い
+- 範囲の find (`pull_range_by_id`) を置き場の単位で写す (dense は値ごとの bucket、 sparse は run ごとの区間。 全体を eid の順に
+  並べず、 古い entry の無い所は写すだけ) (#483)。 100 万行・当たり 10% の範囲で、 書き換えの無い表 1023 → 21 µs、 書き換えの後
+  1173 → 402 µs
+
+### Performance — live: 範囲の購読の出入りを帯の bit で決める (#486)
+
+範囲の穴の family (範囲の違う購読を同じ形で共有) は、 根の値が動くたびに、 どの購読の範囲をまたいだかを区間の索引 (二分探索と
+Vec) で求めていた。 鍵ごとに、 帯ごとの 「その帯を範囲に含む member」 の bit を持ち (member 64 本まで、 超える鍵は今まで通り)、
+出入りは 2 つの帯の bit の XOR で決める (Vec を作らない)。 100 万行で、 書き換えの後の最初の読み (たまった印の評価) が 0.75〜
+0.95 倍 (同じ形の購読 8 本で 4.72 → 3.56 ms)、 購読の登録が 0.80〜0.90 倍。 書き込みは変わらない。
+
+### Performance — RAG の絞り込み付きの検索 (#482)
+
+`RagStore::search` / `hybrid_search` は、 絞り込みのたびに生きている entity の一覧 (100 万件で 1 ms) を作り、 AND は子を全部
+引いて並べていた。 一覧は要る時だけ作り、 AND は件数の一番少ない子だけを引いて残りは候補ごとに確かめる (AND の中の NOT も)。
+100 万件で、 tenant 1 つ (約 1000 件) 955 → 58 µs、 tenant AND NOT lang 4.04 ms → 57 µs。 答えと API は同じ。
+
+### Performance — n-gram の AND (#484)
+
+`NgramIndex::candidates` は AND のたびに全部の gram の list を写して並べていた。 メモリの list は書く時に昇順に保ち (順の崩れた
+list だけ印を付けて `compact` で並べる)、 AND は一番短い list を種にして、 残りは跳びながら探す。 mmap の list は writer が昇順・
+重複なしで書いているのを形式の決まりとして module doc に書き、 写さずに mmap の上で探す。 30 万文書で、 まれな語 + よく出る語が
+メモリ 0.42 倍・mmap 0.18 倍。 答えと file の形式は同じ。
+
+### Fixed — cardinality の hint 以上の値の group が、 group 集計で panic するか黙って落ちていた (#474、 #476)
+
+`TableBuilder::cardinality(n)` の hint は値の上限ではない (超えても tie できる) のに、 group 集計の dense の道は、 group の値が
+hint 以上の row を、 逐次の 5 関数では配列の外を引いて panic し、 範囲・並列の 9 関数では黙って捨てていた (`Query::group_*` /
+`Table::group_*` / query_lang の group がここを通る)。 hint 以上の group は同じ集計の中の HashMap に回し、 group の昇順にして
+後ろに足す。 hint の中の値だけの時の速さは変わらない。 hint の外の値が 100 行に 1 行ある時は、 hint の外の値が無い時と比べて
+逐次の版 1.09〜1.15 倍、 範囲の版 1.34〜1.63 倍、 並列の版 1.9〜3.2 倍。
+
+### Fixed — 名前で引く `pull_raw` / `pull_range` / `query` の eid に peer の頭が無かった (#485)
+
+この 3 つは `HimoStore` の local の番号をそのまま広げて返していたので、 peer を設定した DB では、 同じ entity がほかの eid を返す
+API (`entities()`、 `query_by_id`、 `pull_in`、 `pull_range_by_id`、 `entities_with_himo`) と違う番号で返っていた (集合の差を取る
+RAG の NOT などで食い違う)。 `make_eid(peer, e)` で頭を付ける。 読みは 0.964〜1.021 倍。
+
+### Tests
+
+- engine の単体 `compact_sorts_by_eid` / `sort_appended_matches_sort_unstable`、 `verified_pull_is_sorted_after_churn` (#473)
+- engine の単体 `walk_and_count_range_match_cells_across_regions` / `walk_values_yields_sorted_live_eids_without_copying_the_bucket` /
+  `ordered_and_counts_match_column_scan`、 schema `tests/query_index_paths.rs` (3000 行の写しと 30 種類ほどの問い合わせを比べる
+  `index_paths_match_mirror`、 `index_paths_keep_errors`、 `wide_range_find_scans_the_column`) (#475)。 `order_by_a_column_without_order_is_an_error`
+  (#481)。 範囲の find の往復・頭の重複を `ordered_and_counts_match_column_scan` に足した (#483)
+- engine `tests/group_beyond_hint.rs` / `tests/group_zero_sum.rs`、 schema `group_cardinality.rs` の `group_values_beyond_hint_are_kept` /
+  `zero_sum_groups_are_returned` (#476)
+- engine `tests/present_count.rs` と単体 `present_count_follows_every_writer`、 schema `tests/query_count_matches_find.rs` (#478)
+- engine の単体 `sorted_head_is_kept_by_the_writer` / `concurrent_readers_see_a_sorted_head` (書き手の持つ頭の昇順の長さが探した長さと
+  同じ、 読み手が控えた頭がいつも昇順、 #479)、 `walk_reports_the_sorted_head_of_each_value` (sparse の置き場が渡す長さ、 #480)
+- rag `tests/filter_eval.rs` (#482)、 ngram `tests/and_matches_gram_scan.rs` (#484)、 engine `tests/name_pulls_peer_prefix.rs` (#485)
+- schema `tests/live_members_in.rs` / `tests/live_members_in_concurrent.rs` (#486)
+- example `batch_read_under_rebuild` の entity の枠を 800 万 → 3200 万にし、 DB を閉じてから消す (0.32.3 でも枠を使い切って panic
+  していた) (#473)
+
 ## 0.32.3 — 2026-10-12
 
 patch。 on-disk 形式・wire 形式・API は 0.32.2 と同じ。 書き手を並べ、 購読を張ったまま poll の間を空けて書き続けた時の書き込みが
