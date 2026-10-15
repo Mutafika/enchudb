@@ -40,6 +40,9 @@ const INITIAL_CAP: usize = 4;
 struct Buf {
     data: Box<[UnsafeCell<u32>]>,
     len: AtomicUsize,
+    /// `data[0..len]` の頭の昇順 (同じ値が続くのも昇順に数える) の長さ。 書き手が足すたびに持つ (頭が全部昇順で、 前の値
+    /// 以上なら 1 つ伸ばす)。 読み手は `len` と小さい方を使う (読んだ `len` より大きい値は、 その後に足した書き手の分)。
+    sorted: AtomicUsize,
 }
 
 // SAFETY: published 範囲 [0..len] は書き換わらない。 writer は spare slot [len] のみ書く。
@@ -53,6 +56,7 @@ impl Buf {
         Self {
             data: v.into_boxed_slice(),
             len: AtomicUsize::new(0),
+            sorted: AtomicUsize::new(0),
         }
     }
     #[inline]
@@ -211,6 +215,10 @@ impl AppendBucket {
             unsafe {
                 *b.data[l].get() = eid;
             }
+            // 頭の昇順が全部 (= l) で前の値以上なら伸ばす (読み手は len と小さい方を使うので、 len より先に置いてよい)
+            if b.sorted.load(Ordering::Relaxed) == l && (l == 0 || unsafe { *b.data[l - 1].get() } <= eid) {
+                b.sorted.store(l + 1, Ordering::Relaxed);
+            }
             b.len.store(l + 1, Ordering::Release);
         } else {
             let ncap = (b.cap() * 2).max(INITIAL_CAP);
@@ -225,6 +233,9 @@ impl AppendBucket {
             unsafe {
                 *nb.data[l].get() = eid;
             }
+            let sorted = b.sorted.load(Ordering::Relaxed);
+            let sorted = if sorted == l && (l == 0 || src[l - 1] <= eid) { l + 1 } else { sorted };
+            nb.sorted.store(sorted, Ordering::Relaxed);
             nb.len.store(l + 1, Ordering::Relaxed); // まだ誰も見ていない
             self.backing.store(Owned::new(nb), Ordering::Release);
             // 旧 backing は全 reader が epoch を通過してから解放
@@ -260,6 +271,7 @@ impl AppendBucket {
                 *nb.data[i].get() = v;
             }
         }
+        nb.sorted.store(kept.len(), Ordering::Relaxed); // dedup_sorted で昇順
         nb.len.store(kept.len(), Ordering::Relaxed); // まだ誰も見ていない
         self.backing.store(Owned::new(nb), Ordering::Release);
         // SAFETY: 旧 backing は全 reader が epoch を通過してから解放。
@@ -337,6 +349,22 @@ impl AppendBucket {
         let f = self.removed.load(Ordering::Acquire);
         let p2 = self.backing.load(Ordering::Acquire, guard);
         (s, f || p2 != p1)
+    }
+
+    /// [`snapshot_in`](Self::snapshot_in) に、 slice の頭の昇順の長さ (書き手が足すたびに持っている数、 slice の長さ以下) を
+    /// 足したもの。 読み手は頭を探さずに、 頭はそのまま・後ろだけを並べて混ぜられる (`HimoStore` の 1 件ずつ出す読み)。
+    #[inline]
+    pub fn snapshot_sorted_in<'g>(&self, guard: &'g Guard) -> (&'g [u32], usize, bool) {
+        let p1 = self.backing.load(Ordering::Acquire, guard);
+        // SAFETY: backing は常に非 null。
+        let b = unsafe { p1.deref() };
+        let n = b.len.load(Ordering::Acquire);
+        let head = b.sorted.load(Ordering::Relaxed).min(n);
+        // SAFETY: [0..n] は publish 済み = 不変。 guard が backing を生存させる。
+        let s = unsafe { b.published(n) };
+        let f = self.removed.load(Ordering::Acquire);
+        let p2 = self.backing.load(Ordering::Acquire, guard);
+        (s, head, f || p2 != p1)
     }
 
     /// 現在の publish 済み件数（lock-free）。
@@ -539,6 +567,93 @@ mod tests {
             }
         }
         assert!(caught, "負の対照: 混ぜない形がいつも昇順になった (比べ方が弱い)");
+    }
+
+    /// 書き手が持つ頭の昇順の長さ (`snapshot_sorted_in` の 2 つ目) が、 探した長さ (`sorted_prefix_len`) といつも同じ:
+    /// 昇順に足す・同じ値を続けて足す・前より小さい値を足す (その後は伸びない)・backing を倍にする境目 (4, 8, 16, ..)・
+    /// 詰め直し (`compact_in`、 昇順に並べ直すので全部) の後。 空の bucket は 0。
+    #[test]
+    fn sorted_head_is_kept_by_the_writer() {
+        let mut r = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        let guard = epoch::pin();
+        let head = |b: &AppendBucket| {
+            let (s, h, _) = b.snapshot_sorted_in(&guard);
+            (h, sorted_prefix_len(s), s.len())
+        };
+        let mut broke = 0;
+        let n_cases = if cfg!(miri) { 12 } else { 400 };
+        for case in 0..n_cases {
+            let b = if case % 2 == 0 { AppendBucket::new() } else { AppendBucket::with_capacity(5) };
+            let (h, want, _) = head(&b);
+            assert_eq!((h, want), (0, 0), "case {case}: 空");
+            let n = 1 + (next() % if cfg!(miri) { 40 } else { 300 }) as usize;
+            let mut last = 0u32;
+            for i in 0..n {
+                // 多くは昇順 (同じ値も)、 時々前より小さい値
+                let e = match next() % 10 {
+                    0 => (next() % 1000) as u32,
+                    1 => last,
+                    _ => last + (next() % 5) as u32,
+                };
+                last = last.max(e);
+                b.push(e);
+                let (h, want, len) = head(&b);
+                assert_eq!(h, want, "case {case} の {i} 件目 (len {len})");
+                broke += usize::from(want < len);
+            }
+            // 詰め直し: 偶数だけ残す。 並べ直すので頭は全部
+            b.compact_in(&guard, |e| e % 2 == 0);
+            let (h, want, len) = head(&b);
+            assert_eq!((h, want), (len, len), "case {case}: 詰め直しの後");
+            // 詰め直しの後に足しても同じ
+            for _ in 0..8 {
+                b.push((next() % 2000) as u32);
+                let (h, want, _) = head(&b);
+                assert_eq!(h, want, "case {case}: 詰め直しの後に足した");
+            }
+        }
+        assert!(broke > 0, "対照: 頭が崩れる場合が無かった (順番外を足していない)");
+    }
+
+    /// 書き手 1 本が順番外も混ぜて足す間、 読み手 4 本が控えた slice の頭 (書き手が持つ長さ) がいつも昇順。
+    #[test]
+    fn concurrent_readers_see_a_sorted_head() {
+        let b = Arc::new(AppendBucket::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let n = if cfg!(miri) { 200u32 } else { 100_000u32 };
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let b = b.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut seen = 0usize;
+                    while !stop.load(Ordering::Relaxed) {
+                        let guard = epoch::pin();
+                        let (s, h, _) = b.snapshot_sorted_in(&guard);
+                        assert!(h <= s.len() && s[..h].is_sorted(), "頭 {h} が昇順でない (len {})", s.len());
+                        seen = seen.max(h);
+                    }
+                    seen
+                })
+            })
+            .collect();
+        // 頭は n * 3 / 4 まで伸び、 その後に小さい値を 1 つ足して止まる (後ろは昇順でも頭は伸びない)
+        for i in 0..n {
+            b.push(if i == n * 3 / 4 { 0 } else { i + 1 });
+        }
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
+        let guard = epoch::pin();
+        let (s, h, _) = b.snapshot_sorted_in(&guard);
+        assert_eq!((h, s.len()), ((n * 3 / 4) as usize, n as usize));
     }
 
     /// 1 writer + N reader 並行: 破損なし、 len 単調非減少、 全要素 valid。
