@@ -87,10 +87,12 @@ pub(crate) struct SparseSnap<'a> {
 }
 
 impl SparseSnap<'_> {
-    /// 値が `lo..=hi` の entry を値の順 (`desc` なら大きい順) に、 値ごとにまとめて `f(値, eid の列)` に渡す (古い entry
-    /// 込み。 eid の列は run ごとの順をつないだもので、 並べていない)。 `f` が `Break` を返したら止めて `Break`。 値 1 つごとに
-    /// run の本数ぶんの比べ (run の中の位置は持ち越すので、 二分探索は最初の 1 回だけ)。
-    pub(crate) fn walk(&self, lo: u64, hi: u64, desc: bool, mut f: impl FnMut(u64, &[u32]) -> ControlFlow<()>) -> ControlFlow<()> {
+    /// 値が `lo..=hi` の entry を値の順 (`desc` なら大きい順) に、 値ごとにまとめて `f(値, eid の列, 頭の昇順の長さ)` に渡す
+    /// (古い entry 込み)。 eid の列は run ごとの区間をつないだもの: run は (値, eid) の順なので区間は昇順で、 崩れはつなぎ目にしか
+    /// 無い。 頭の昇順の長さは、 つなぎ目で前の区間の最後と次の区間の最初を比べて出す (区間の数だけの比べ。 中は読まない)。
+    /// `f` が `Break` を返したら止めて `Break`。 値 1 つごとに run の本数ぶんの比べ (run の中の位置は持ち越すので、 二分探索は
+    /// 最初の 1 回だけ)。
+    pub(crate) fn walk(&self, lo: u64, hi: u64, desc: bool, mut f: impl FnMut(u64, &[u32], usize) -> ControlFlow<()>) -> ControlFlow<()> {
         if lo > hi {
             return ControlFlow::Continue(());
         }
@@ -104,24 +106,35 @@ impl SparseSnap<'_> {
             let next = if desc { ends.map(|(r, s)| r.vals[s.end - 1]).max() } else { ends.map(|(r, s)| r.vals[s.start]).min() };
             let Some(v) = next else { return ControlFlow::Continue(()) };
             buf.clear();
+            // 頭の昇順の長さ: 頭が全部 (= buf の長さ) の間だけ、 次の区間が前の最後以上なら区間ごと伸ばす
+            let mut head = 0;
             for (r, s) in runs.iter().zip(left.iter_mut()) {
-                if desc {
+                let seg = if desc {
                     let mut a = s.end;
                     while a > s.start && r.vals[a - 1] == v {
                         a -= 1;
                     }
-                    buf.extend_from_slice(&r.eids[a..s.end]);
+                    let seg = &r.eids[a..s.end];
                     s.end = a;
+                    seg
                 } else {
                     let mut b = s.start;
                     while b < s.end && r.vals[b] == v {
                         b += 1;
                     }
-                    buf.extend_from_slice(&r.eids[s.start..b]);
+                    let seg = &r.eids[s.start..b];
                     s.start = b;
+                    seg
+                };
+                if let Some(&first) = seg.first()
+                    && head == buf.len()
+                    && buf.last().is_none_or(|&last| last <= first)
+                {
+                    head += seg.len();
                 }
+                buf.extend_from_slice(seg);
             }
-            f(v, &buf)?;
+            f(v, &buf, head)?;
         }
     }
 
@@ -389,6 +402,38 @@ mod tests {
         assert_eq!(s.run_count(), 1);
         let want: Vec<u32> = all.iter().filter(|p| p.1 % 2 == 0 && p.0 == all[0].0).map(|p| p.1).collect();
         assert_eq!(sorted(s.lookup(all[0].0)), sorted(want));
+    }
+
+    /// `walk` が値ごとに渡す頭の昇順の長さ (run ごとの区間のつなぎ目だけを比べた数) が、 渡した eid の列を探した長さ
+    /// (`sorted_prefix_len`) とちょうど同じ: 値の順・逆順、 同じ値の eid がいくつもの run にまたがって、 つなぎ目で崩れる値・
+    /// 崩れない値・同じ eid が続く値を混ぜる。 対照: 頭が途中で切れる値も、 run をまたいで頭が続く値もある。
+    #[test]
+    fn walk_reports_the_sorted_head_of_each_value() {
+        let s = SparseRuns::default();
+        let mut rng = Rng(0x5a55_0002);
+        let n = if cfg!(miri) { 600u32 } else { 20_000 };
+        for i in 0..n {
+            // 値は 32 + 8 通り。 前の 32 通りは eid に 「大きくなる」 と 「ばらばら (同じ eid も)」 を混ぜて run の間で順が崩れる
+            // ようにし、 後の 8 通りは eid が大きくなる一方 (古い run ほど小さい eid なので、 つなぎ目をまたいでも頭が続く)
+            let mono = rng.next() % 4 == 0;
+            let v = if mono { (1 << 41) + rng.next() % 8 } else { (1 << 40) + rng.next() % 32 };
+            let e = if !mono && rng.next() % 3 == 0 { (rng.next() % u64::from(n)) as u32 } else { i };
+            s.insert(v, e);
+        }
+        assert!(s.run_count() >= 2, "run が 1 本だけ (つなぎ目が無い)");
+        let (mut cut, mut across) = (0, 0);
+        for desc in [false, true] {
+            s.snapshot(|sp| {
+                sp.walk(0, u64::MAX, desc, |v, eids, head| {
+                    assert_eq!(head, crate::append_bucket::sorted_prefix_len(eids), "値 {v} (desc {desc})");
+                    cut += usize::from(head < eids.len());
+                    across += usize::from(head == eids.len() && eids.len() > 1);
+                    ControlFlow::Continue(())
+                })
+            });
+        }
+        assert!(cut > 0, "対照: 頭が途中で切れる値が無い");
+        assert!(across > 0, "対照: 頭が全部の値が無い");
     }
 
     /// 同じ `(値, eid)` の重複は rebuild で 1 つになる。
