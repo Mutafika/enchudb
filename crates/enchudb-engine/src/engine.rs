@@ -12157,17 +12157,22 @@ impl Engine {
             // 「データ有り」の代用にする。 stored で持ったまま比較すれば mins init=u32::MAX
             // のときは必ず上書きされる (= seen tracking 不要)。
             let mut mins_stored: Vec<u32> = vec![u32::MAX; cap];
+            let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for i in lo..hi {
                 let g_stored = groups[i];
                 let v_stored = vals[i];
                 if g_stored == 0 || v_stored == 0 { continue; }
                 let g = (g_stored - 1) as usize;
-                if g < cap && v_stored < mins_stored[g] {
-                    mins_stored[g] = v_stored;
+                if g < cap {
+                    if v_stored < mins_stored[g] { mins_stored[g] = v_stored; }
+                } else {
+                    Self::spill_min(&mut spill, g as u32, v_stored);
                 }
             }
-            (0..cap).filter(|&i| mins_stored[i] != u32::MAX)
-                .map(|i| (i as u32, mins_stored[i] - 1)).collect()
+            let mut out: Vec<(u32, u32)> = (0..cap).filter(|&i| mins_stored[i] != u32::MAX)
+                .map(|i| (i as u32, mins_stored[i] - 1)).collect();
+            Self::push_spilled(&mut out, spill.into_iter().map(|(g, v_stored)| (g, v_stored - 1)));
+            out
         } else {
             let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for i in lo..hi {
@@ -12205,17 +12210,22 @@ impl Engine {
             // maxs_stored の init = 0 (== missing 扱い)。 stored > 0 を見たら必ず
             // 上書きされるので、 結果 filter で maxs_stored > 0 を有効データ判定。
             let mut maxs_stored: Vec<u32> = vec![0; cap];
+            let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for i in lo..hi {
                 let g_stored = groups[i];
                 let v_stored = vals[i];
                 if g_stored == 0 || v_stored == 0 { continue; }
                 let g = (g_stored - 1) as usize;
-                if g < cap && v_stored > maxs_stored[g] {
-                    maxs_stored[g] = v_stored;
+                if g < cap {
+                    if v_stored > maxs_stored[g] { maxs_stored[g] = v_stored; }
+                } else {
+                    Self::spill_max(&mut spill, g as u32, v_stored);
                 }
             }
-            (0..cap).filter(|&i| maxs_stored[i] != 0)
-                .map(|i| (i as u32, maxs_stored[i] - 1)).collect()
+            let mut out: Vec<(u32, u32)> = (0..cap).filter(|&i| maxs_stored[i] != 0)
+                .map(|i| (i as u32, maxs_stored[i] - 1)).collect();
+            Self::push_spilled(&mut out, spill.into_iter().map(|(g, v_stored)| (g, v_stored - 1)));
+            out
         } else {
             let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for i in lo..hi {
@@ -12283,6 +12293,11 @@ impl Engine {
     // 局所 accumulator を計算 → `reduce` で合算。 HimoStore は内部に
     // `RwLock<BucketCylinder>` を持つが、 ここで触る `stored_slice` は
     // immutable な mmap view (= read 中は lock 不要) なので thread-safe。
+
+    /// 並列の dense の道の sum で、 group の和の u64 の一番上の bit を 「row があった」 の印にする (和が 0 の group も返すため、
+    /// #474)。 1 行の書き込みは和と同じ 1 つで済む (bool の配列を別に持つ形は、 並列の sum で最大 1.45 倍遅かった)。 和は u32 の値の
+    /// 足し算なので、 1 group の行が 2^31 未満なら印の bit まで届かない。
+    const GROUP_SEEN: u64 = 1 << 63;
 
     /// 並列化閾値。 これ未満の `[lo, hi)` 幅では seq fallback (= thread spawn
     /// overhead が利益を上回らない、 実測ベースで 64k 程度が境界)。
@@ -12437,28 +12452,36 @@ impl Engine {
         let chunk = Self::PAR_RANGE_CHUNK;
         let n = hi_u - lo_u;
         let n_chunks = (n + chunk - 1) / chunk;
-        let result: Vec<u64> = (0..n_chunks)
+        let (result, spill) = (0..n_chunks)
             .into_par_iter()
             .map(|ci| {
                 let s = lo_u + ci * chunk;
                 let e = (s + chunk).min(hi_u);
                 let mut acc: Vec<u64> = vec![0; cap];
+                let mut spill: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
                 for i in s..e {
                     let g_stored = groups[i];
                     let v_stored = sums[i];
                     if g_stored == 0 || v_stored == 0 { continue; }
                     let g = (g_stored - 1) as usize;
                     if g < cap {
-                        acc[g] += (v_stored - 1) as u64;
+                        acc[g] = (acc[g] + (v_stored - 1) as u64) | Self::GROUP_SEEN;
+                    } else {
+                        Self::spill_sum(&mut spill, g as u32, (v_stored - 1) as u64);
                     }
                 }
-                acc
+                (acc, spill)
             })
-            .reduce(|| vec![0u64; cap], |mut a, b| {
-                for (i, &v) in b.iter().enumerate() { a[i] += v; }
-                a
+            .reduce(|| (vec![0u64; cap], std::collections::HashMap::new()), |(mut a, mut a_spill), (b, b_spill)| {
+                for (i, &v) in b.iter().enumerate() {
+                    a[i] = ((a[i] & !Self::GROUP_SEEN) + (v & !Self::GROUP_SEEN)) | ((a[i] | v) & Self::GROUP_SEEN);
+                }
+                for (g, v) in b_spill { *a_spill.entry(g).or_insert(0) += v; }
+                (a, a_spill)
             });
-        (0..cap).filter(|&i| result[i] > 0).map(|i| (i as u32, result[i])).collect()
+        let mut out: Vec<(u32, u64)> = (0..cap).filter(|&i| result[i] & Self::GROUP_SEEN != 0).map(|i| (i as u32, result[i] & !Self::GROUP_SEEN)).collect();
+        Self::push_spilled(&mut out, spill);
+        out
     }
 
     /// 0.8.9: `group_min_range` の並列版。 dense path のみ。
@@ -12488,31 +12511,40 @@ impl Engine {
         let chunk = Self::PAR_RANGE_CHUNK;
         let n = hi_u - lo_u;
         let n_chunks = (n + chunk - 1) / chunk;
-        let result: Vec<u32> = (0..n_chunks)
+        let (result, spill) = (0..n_chunks)
             .into_par_iter()
             .map(|ci| {
                 let s = lo_u + ci * chunk;
                 let e = (s + chunk).min(hi_u);
                 let mut mins: Vec<u32> = vec![u32::MAX; cap];
+                let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
                 for i in s..e {
                     let g_stored = groups[i];
                     let v_stored = vals[i];
                     if g_stored == 0 || v_stored == 0 { continue; }
                     let g = (g_stored - 1) as usize;
-                    if g < cap && v_stored < mins[g] {
-                        mins[g] = v_stored;
+                    if g < cap {
+                        if v_stored < mins[g] { mins[g] = v_stored; }
+                    } else {
+                        Self::spill_min(&mut spill, g as u32, v_stored);
                     }
                 }
-                mins
+                (mins, spill)
             })
-            .reduce(|| vec![u32::MAX; cap], |mut a, b| {
+            .reduce(|| (vec![u32::MAX; cap], std::collections::HashMap::new()), |(mut a, mut a_spill), (b, b_spill)| {
                 for (i, &v) in b.iter().enumerate() {
                     if v < a[i] { a[i] = v; }
                 }
-                a
+                for (g, v) in b_spill {
+                    let entry = a_spill.entry(g).or_insert(u32::MAX);
+                    if v < *entry { *entry = v; }
+                }
+                (a, a_spill)
             });
-        (0..cap).filter(|&i| result[i] != u32::MAX)
-            .map(|i| (i as u32, result[i] - 1)).collect()
+        let mut out: Vec<(u32, u32)> = (0..cap).filter(|&i| result[i] != u32::MAX)
+            .map(|i| (i as u32, result[i] - 1)).collect();
+        Self::push_spilled(&mut out, spill.into_iter().map(|(g, v_stored)| (g, v_stored - 1)));
+        out
     }
 
     /// 0.8.9: `group_max_range` の並列版。 dense path のみ。
@@ -12542,31 +12574,40 @@ impl Engine {
         let chunk = Self::PAR_RANGE_CHUNK;
         let n = hi_u - lo_u;
         let n_chunks = (n + chunk - 1) / chunk;
-        let result: Vec<u32> = (0..n_chunks)
+        let (result, spill) = (0..n_chunks)
             .into_par_iter()
             .map(|ci| {
                 let s = lo_u + ci * chunk;
                 let e = (s + chunk).min(hi_u);
                 let mut maxs: Vec<u32> = vec![0; cap];
+                let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
                 for i in s..e {
                     let g_stored = groups[i];
                     let v_stored = vals[i];
                     if g_stored == 0 || v_stored == 0 { continue; }
                     let g = (g_stored - 1) as usize;
-                    if g < cap && v_stored > maxs[g] {
-                        maxs[g] = v_stored;
+                    if g < cap {
+                        if v_stored > maxs[g] { maxs[g] = v_stored; }
+                    } else {
+                        Self::spill_max(&mut spill, g as u32, v_stored);
                     }
                 }
-                maxs
+                (maxs, spill)
             })
-            .reduce(|| vec![0u32; cap], |mut a, b| {
+            .reduce(|| (vec![0u32; cap], std::collections::HashMap::new()), |(mut a, mut a_spill), (b, b_spill)| {
                 for (i, &v) in b.iter().enumerate() {
                     if v > a[i] { a[i] = v; }
                 }
-                a
+                for (g, v) in b_spill {
+                    let entry = a_spill.entry(g).or_insert(0);
+                    if v > *entry { *entry = v; }
+                }
+                (a, a_spill)
             });
-        (0..cap).filter(|&i| result[i] != 0)
-            .map(|i| (i as u32, result[i] - 1)).collect()
+        let mut out: Vec<(u32, u32)> = (0..cap).filter(|&i| result[i] != 0)
+            .map(|i| (i as u32, result[i] - 1)).collect();
+        Self::push_spilled(&mut out, spill.into_iter().map(|(g, v_stored)| (g, v_stored - 1)));
+        out
     }
 
     /// 0.8.9: `range_scan` の並列版。 chunk ごとに local hits → flat_map で連結。
@@ -12719,15 +12760,22 @@ impl Engine {
         if let Some(cap) = cap {
             let mut sums: Vec<u64> = vec![0; cap];
             let mut seen: Vec<bool> = vec![false; cap];
+            let mut spill: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
             for &eid in eids {
                 let local = enchudb_oplog::eid_local(eid);
                 if let (Some(group), Some(val)) = (gs.get_value32(local), ss.get_value32(local)) {
                     let i = group as usize;
-                    sums[i] += val as u64;
-                    seen[i] = true;
+                    if i < cap {
+                        sums[i] += val as u64;
+                        seen[i] = true;
+                    } else {
+                        *spill.entry(group).or_insert(0) += val as u64;
+                    }
                 }
             }
-            (0..cap).filter(|&i| seen[i]).map(|i| (i as u32, sums[i])).collect()
+            let mut out: Vec<(u32, u64)> = (0..cap).filter(|&i| seen[i]).map(|i| (i as u32, sums[i])).collect();
+            Self::push_spilled(&mut out, spill);
+            out
         } else {
             let mut map: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
             for &eid in eids {
@@ -12764,11 +12812,11 @@ impl Engine {
         if lo >= hi { return vec![]; }
 
         if let Some(cap) = self.group_dense_cap(gid) {
-            // dense cap での group_sum: seen[] tracking を廃止して
-            // hot loop の per-iter store を 2 → 1 に圧縮。
-            // 「acc[g] == 0」 が non-empty 判定の代用、 値 0 と「データ無し」を
-            // 区別したい時は別 API を使うこと。
+            // row のあった group は、 和が 0 でも返す (hint の無い道・逐次の道と同じ答え、 #474)。 「row があった」 は bool の配列に
+            // 書くだけ (読まない)。 和の一番上の bit を印にする形 (並列の版) は、 この輪では 1.06〜1.22 倍遅かった。
             let mut acc: Vec<u64> = vec![0; cap];
+            let mut seen: Vec<bool> = vec![false; cap];
+            let mut spill: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
             for i in lo..hi {
                 let g_stored = groups[i];
                 let s_stored = sums[i];
@@ -12776,9 +12824,14 @@ impl Engine {
                 let g = (g_stored - 1) as usize;
                 if g < cap {
                     acc[g] += (s_stored - 1) as u64;
+                    seen[g] = true;
+                } else {
+                    Self::spill_sum(&mut spill, g as u32, (s_stored - 1) as u64);
                 }
             }
-            (0..cap).filter(|&i| acc[i] > 0).map(|i| (i as u32, acc[i])).collect()
+            let mut out: Vec<(u32, u64)> = (0..cap).filter(|&i| seen[i]).map(|i| (i as u32, acc[i])).collect();
+            Self::push_spilled(&mut out, spill);
+            out
         } else {
             let mut map: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
             for i in lo..hi {
@@ -12797,12 +12850,18 @@ impl Engine {
         let gs = &self.himos[gid];
         if let Some(cap) = self.group_dense_cap(gid) {
             let mut counts: Vec<u32> = vec![0; cap];
+            let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for &eid in eids {
                 if let Some(group) = gs.get_value32(enchudb_oplog::eid_local(eid)) {
-                    counts[group as usize] += 1;
+                    match counts.get_mut(group as usize) {
+                        Some(c) => *c += 1,
+                        None => *spill.entry(group).or_insert(0) += 1,
+                    }
                 }
             }
-            (0..cap).filter(|&i| counts[i] > 0).map(|i| (i as u32, counts[i])).collect()
+            let mut out: Vec<(u32, u32)> = (0..cap).filter(|&i| counts[i] > 0).map(|i| (i as u32, counts[i])).collect();
+            Self::push_spilled(&mut out, spill);
+            out
         } else {
             let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for &eid in eids {
@@ -12823,15 +12882,23 @@ impl Engine {
         if let Some(cap) = self.group_dense_cap(gid) {
             let mut mins: Vec<u32> = vec![u32::MAX; cap];
             let mut seen: Vec<bool> = vec![false; cap];
+            let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for &eid in eids {
                 let local = enchudb_oplog::eid_local(eid);
                 if let (Some(group), Some(val)) = (gs.get_value32(local), vs.get_value32(local)) {
                     let i = group as usize;
-                    if val < mins[i] { mins[i] = val; }
-                    seen[i] = true;
+                    if i < cap {
+                        if val < mins[i] { mins[i] = val; }
+                        seen[i] = true;
+                    } else {
+                        let entry = spill.entry(group).or_insert(u32::MAX);
+                        if val < *entry { *entry = val; }
+                    }
                 }
             }
-            (0..cap).filter(|&i| seen[i]).map(|i| (i as u32, mins[i])).collect()
+            let mut out: Vec<(u32, u32)> = (0..cap).filter(|&i| seen[i]).map(|i| (i as u32, mins[i])).collect();
+            Self::push_spilled(&mut out, spill);
+            out
         } else {
             let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for &eid in eids {
@@ -12854,15 +12921,23 @@ impl Engine {
         if let Some(cap) = self.group_dense_cap(gid) {
             let mut maxs: Vec<u32> = vec![0; cap];
             let mut seen: Vec<bool> = vec![false; cap];
+            let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for &eid in eids {
                 let local = enchudb_oplog::eid_local(eid);
                 if let (Some(group), Some(val)) = (gs.get_value32(local), vs.get_value32(local)) {
                     let i = group as usize;
-                    if val > maxs[i] { maxs[i] = val; }
-                    seen[i] = true;
+                    if i < cap {
+                        if val > maxs[i] { maxs[i] = val; }
+                        seen[i] = true;
+                    } else {
+                        let entry = spill.entry(group).or_insert(0);
+                        if val > *entry { *entry = val; }
+                    }
                 }
             }
-            (0..cap).filter(|&i| seen[i]).map(|i| (i as u32, maxs[i])).collect()
+            let mut out: Vec<(u32, u32)> = (0..cap).filter(|&i| seen[i]).map(|i| (i as u32, maxs[i])).collect();
+            Self::push_spilled(&mut out, spill);
+            out
         } else {
             let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             for &eid in eids {
@@ -12885,15 +12960,24 @@ impl Engine {
         if let Some(cap) = self.group_dense_cap(gid) {
             let mut sums: Vec<u64> = vec![0; cap];
             let mut cnts: Vec<u64> = vec![0; cap];
+            let mut spill: std::collections::HashMap<u32, (u64, u64)> = std::collections::HashMap::new();
             for &eid in eids {
                 let local = enchudb_oplog::eid_local(eid);
                 if let (Some(group), Some(val)) = (gs.get_value32(local), vs.get_value32(local)) {
                     let i = group as usize;
-                    sums[i] += val as u64;
-                    cnts[i] += 1;
+                    if i < cap {
+                        sums[i] += val as u64;
+                        cnts[i] += 1;
+                    } else {
+                        let e = spill.entry(group).or_insert((0, 0));
+                        e.0 += val as u64;
+                        e.1 += 1;
+                    }
                 }
             }
-            (0..cap).filter(|&i| cnts[i] > 0).map(|i| (i as u32, sums[i] / cnts[i])).collect()
+            let mut out: Vec<(u32, u64)> = (0..cap).filter(|&i| cnts[i] > 0).map(|i| (i as u32, sums[i] / cnts[i])).collect();
+            Self::push_spilled(&mut out, spill.into_iter().map(|(k, (s, n))| (k, s / n)));
+            out
         } else {
             let mut acc: std::collections::HashMap<u32, (u64, u64)> = std::collections::HashMap::new();
             for &eid in eids {
@@ -12910,10 +12994,44 @@ impl Engine {
 
     /// group 系の dense path 適用判定。 himo の max_values が小さく定義されていれば
     /// その値範囲を Vec 直接 index で集計できる。 閾値は 64K (Vec 確保 256KB 以下) まで。
+    /// max_values は hint (`TableBuilder::cardinality`) で値の上限ではないので、 `cap` 以上の
+    /// group は dense の道の中で HashMap に回して集計する (`push_spilled`、 #474)。
     fn group_dense_cap(&self, hid: usize) -> Option<usize> {
         let hs = &self.himos[hid];
         let cap = hs.max_values as usize;
         if cap == 0 || cap > 65_536 { None } else { Some(cap) }
+    }
+
+    /// dense の道で `cap` 以上の group を HashMap に足す所 (#474)。 めったに通らないので、 範囲と並列の版では輪の外に出す
+    /// (`#[cold]`)。 輪の中に HashMap の entry を書くと、 hint の中の値しか無い時も輪の組み方が変わって、 並列の sum が 1.1〜1.2 倍
+    /// 遅くなった。 逐次の版 (`group_sum` など、 1 行ごとに `get_value32` で読む) は逆に、 外に出すと max が 1.10〜1.15 倍、 min が
+    /// 1.05〜1.12 倍遅くなったので、 輪の中に書いている。
+    #[cold]
+    #[inline(never)]
+    fn spill_sum(spill: &mut std::collections::HashMap<u32, u64>, g: u32, v: u64) {
+        *spill.entry(g).or_insert(0) += v;
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn spill_min(spill: &mut std::collections::HashMap<u32, u32>, g: u32, v: u32) {
+        let entry = spill.entry(g).or_insert(u32::MAX);
+        if v < *entry { *entry = v; }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn spill_max(spill: &mut std::collections::HashMap<u32, u32>, g: u32, v: u32) {
+        let entry = spill.entry(g).or_insert(0);
+        if v > *entry { *entry = v; }
+    }
+
+    /// dense の道で `cap` 以上の group を受けた分を、 group の昇順にして答えの後ろに足す (#474)。
+    /// dense の分は `0..cap` の昇順で、 回した分は全部 `cap` 以上なので、 足した後も group の昇順のまま。
+    fn push_spilled<T>(out: &mut Vec<(u32, T)>, spill: impl IntoIterator<Item = (u32, T)>) {
+        let start = out.len();
+        out.extend(spill);
+        out[start..].sort_unstable_by_key(|&(g, _)| g);
     }
 
     /// 値集合の distinct — eids の中で himo に張られた値のユニーク集合 (最初に現れた順)。
@@ -13080,10 +13198,11 @@ impl Engine {
         let ss = &self.himos[sid];
         let groups = gs.stored_slice();
         let sums = ss.stored_slice();
-        let result: Vec<u64> = eids
+        let (result, spill) = eids
             .par_chunks(Self::PAR_RANGE_CHUNK)
             .map(|chunk| {
                 let mut acc: Vec<u64> = vec![0; cap];
+                let mut spill: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
                 for &eid in chunk {
                     let local = enchudb_oplog::eid_local(eid) as usize;
                     if local >= groups.len() || local >= sums.len() { continue; }
@@ -13092,16 +13211,23 @@ impl Engine {
                     if g_stored == 0 || s_stored == 0 { continue; }
                     let g = (g_stored - 1) as usize;
                     if g < cap {
-                        acc[g] += (s_stored - 1) as u64;
+                        acc[g] = (acc[g] + (s_stored - 1) as u64) | Self::GROUP_SEEN;
+                    } else {
+                        Self::spill_sum(&mut spill, g as u32, (s_stored - 1) as u64);
                     }
                 }
-                acc
+                (acc, spill)
             })
-            .reduce(|| vec![0u64; cap], |mut a, b| {
-                for (i, &v) in b.iter().enumerate() { a[i] += v; }
-                a
+            .reduce(|| (vec![0u64; cap], std::collections::HashMap::new()), |(mut a, mut a_spill), (b, b_spill)| {
+                for (i, &v) in b.iter().enumerate() {
+                    a[i] = ((a[i] & !Self::GROUP_SEEN) + (v & !Self::GROUP_SEEN)) | ((a[i] | v) & Self::GROUP_SEEN);
+                }
+                for (g, v) in b_spill { *a_spill.entry(g).or_insert(0) += v; }
+                (a, a_spill)
             });
-        (0..cap).filter(|&i| result[i] > 0).map(|i| (i as u32, result[i])).collect()
+        let mut out: Vec<(u32, u64)> = (0..cap).filter(|&i| result[i] & Self::GROUP_SEEN != 0).map(|i| (i as u32, result[i] & !Self::GROUP_SEEN)).collect();
+        Self::push_spilled(&mut out, spill);
+        out
     }
 
     /// 0.8.10: `group_min(group, val, eids)` の並列版。 dense path のみ。
@@ -13124,10 +13250,11 @@ impl Engine {
         let vs = &self.himos[vid];
         let groups = gs.stored_slice();
         let vals = vs.stored_slice();
-        let result: Vec<u32> = eids
+        let (result, spill) = eids
             .par_chunks(Self::PAR_RANGE_CHUNK)
             .map(|chunk| {
                 let mut mins: Vec<u32> = vec![u32::MAX; cap];
+                let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
                 for &eid in chunk {
                     let local = enchudb_oplog::eid_local(eid) as usize;
                     if local >= groups.len() || local >= vals.len() { continue; }
@@ -13135,20 +13262,28 @@ impl Engine {
                     let v_stored = vals[local];
                     if g_stored == 0 || v_stored == 0 { continue; }
                     let g = (g_stored - 1) as usize;
-                    if g < cap && v_stored < mins[g] {
-                        mins[g] = v_stored;
+                    if g < cap {
+                        if v_stored < mins[g] { mins[g] = v_stored; }
+                    } else {
+                        Self::spill_min(&mut spill, g as u32, v_stored);
                     }
                 }
-                mins
+                (mins, spill)
             })
-            .reduce(|| vec![u32::MAX; cap], |mut a, b| {
+            .reduce(|| (vec![u32::MAX; cap], std::collections::HashMap::new()), |(mut a, mut a_spill), (b, b_spill)| {
                 for (i, &v) in b.iter().enumerate() {
                     if v < a[i] { a[i] = v; }
                 }
-                a
+                for (g, v) in b_spill {
+                    let entry = a_spill.entry(g).or_insert(u32::MAX);
+                    if v < *entry { *entry = v; }
+                }
+                (a, a_spill)
             });
-        (0..cap).filter(|&i| result[i] != u32::MAX)
-            .map(|i| (i as u32, result[i] - 1)).collect()
+        let mut out: Vec<(u32, u32)> = (0..cap).filter(|&i| result[i] != u32::MAX)
+            .map(|i| (i as u32, result[i] - 1)).collect();
+        Self::push_spilled(&mut out, spill.into_iter().map(|(g, v_stored)| (g, v_stored - 1)));
+        out
     }
 
     /// 0.8.10: `group_max(group, val, eids)` の並列版。 dense path のみ。
@@ -13171,10 +13306,11 @@ impl Engine {
         let vs = &self.himos[vid];
         let groups = gs.stored_slice();
         let vals = vs.stored_slice();
-        let result: Vec<u32> = eids
+        let (result, spill) = eids
             .par_chunks(Self::PAR_RANGE_CHUNK)
             .map(|chunk| {
                 let mut maxs: Vec<u32> = vec![0; cap];
+                let mut spill: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
                 for &eid in chunk {
                     let local = enchudb_oplog::eid_local(eid) as usize;
                     if local >= groups.len() || local >= vals.len() { continue; }
@@ -13182,20 +13318,28 @@ impl Engine {
                     let v_stored = vals[local];
                     if g_stored == 0 || v_stored == 0 { continue; }
                     let g = (g_stored - 1) as usize;
-                    if g < cap && v_stored > maxs[g] {
-                        maxs[g] = v_stored;
+                    if g < cap {
+                        if v_stored > maxs[g] { maxs[g] = v_stored; }
+                    } else {
+                        Self::spill_max(&mut spill, g as u32, v_stored);
                     }
                 }
-                maxs
+                (maxs, spill)
             })
-            .reduce(|| vec![0u32; cap], |mut a, b| {
+            .reduce(|| (vec![0u32; cap], std::collections::HashMap::new()), |(mut a, mut a_spill), (b, b_spill)| {
                 for (i, &v) in b.iter().enumerate() {
                     if v > a[i] { a[i] = v; }
                 }
-                a
+                for (g, v) in b_spill {
+                    let entry = a_spill.entry(g).or_insert(0);
+                    if v > *entry { *entry = v; }
+                }
+                (a, a_spill)
             });
-        (0..cap).filter(|&i| result[i] != 0)
-            .map(|i| (i as u32, result[i] - 1)).collect()
+        let mut out: Vec<(u32, u32)> = (0..cap).filter(|&i| result[i] != 0)
+            .map(|i| (i as u32, result[i] - 1)).collect();
+        Self::push_spilled(&mut out, spill.into_iter().map(|(g, v_stored)| (g, v_stored - 1)));
+        out
     }
 
     /// 0.8.10: 不連続 eids への histogram (= range scan できない sub-set 向け、

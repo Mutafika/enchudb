@@ -150,3 +150,91 @@ fn cardinality_before_any_column_is_noop() {
     drop(db);
     cleanup(&path);
 }
+
+#[test]
+fn group_values_beyond_hint_are_kept() {
+    // #474: hint (cardinality 10) 以上の値 (dept = 20) の row があっても、 group 集計が panic せず、 その group も入る。
+    // `Query::group_*` は件数 64000 の下で逐次の版 (前は panic)、 上で `_eids_par` (前は group 20 を落とした)、
+    // `Table::group_*` は `_range` (前は group 20 を落とした) を通る。
+    /// assert で落ちても DB を消す。 DB より先に作って、 DB の後に drop させる。
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            cleanup(&self.0);
+        }
+    }
+    for n in [1_000i64, 70_000] {
+        let path = tmp_path(&format!("beyond{n}"));
+        cleanup(&path);
+        let _cleanup = Cleanup(path.clone());
+        let mut db = Database::create_growable_with_capacity(&path, (n as u32 * 2).max(1 << 16)).unwrap();
+        db.table("e")
+            .number("id")
+            .number("dept").cardinality(10)
+            .number("sal")
+            .primary_key("id")
+            .with_capacity(n as u32 + 16)
+            .build()
+            .unwrap();
+        let t = db.get_table("e").unwrap();
+        let mut want: std::collections::BTreeMap<u32, (u64, u32, u32)> = std::collections::BTreeMap::new();
+        for i in 0..n {
+            let dept = if i == n - 1 { 20 } else { i % 10 };
+            let sal = 1 + i % 7;
+            t.insert().set("id", i).set("dept", dept).set("sal", sal).commit().unwrap();
+            let w = want.entry(dept as u32).or_insert((0, u32::MAX, 0));
+            w.0 += sal as u64;
+            w.1 = w.1.min(sal as u32);
+            w.2 = w.2.max(sal as u32);
+        }
+        let want_sum: Vec<(u32, u64)> = want.iter().map(|(&g, w)| (g, w.0)).collect();
+        let want_min: Vec<(u32, u32)> = want.iter().map(|(&g, w)| (g, w.1)).collect();
+        let want_max: Vec<(u32, u32)> = want.iter().map(|(&g, w)| (g, w.2)).collect();
+        assert_eq!(want_sum.last().map(|x| x.0), Some(20), "対照: 写しに group 20 がある");
+        let sorted32 = |mut g: Vec<(u32, u32)>| {
+            g.sort();
+            g
+        };
+        assert_eq!(sorted(t.all().group_sum("dept", "sal").unwrap()), want_sum, "n={n} Query::group_sum");
+        assert_eq!(sorted32(t.all().group_min("dept", "sal").unwrap()), want_min, "n={n} Query::group_min");
+        assert_eq!(sorted32(t.all().group_max("dept", "sal").unwrap()), want_max, "n={n} Query::group_max");
+        assert_eq!(sorted(t.group_sum("dept", "sal")), want_sum, "n={n} Table::group_sum");
+        assert_eq!(sorted32(t.group_min("dept", "sal")), want_min, "n={n} Table::group_min");
+        assert_eq!(sorted32(t.group_max("dept", "sal")), want_max, "n={n} Table::group_max");
+    }
+}
+
+#[test]
+fn zero_sum_groups_are_returned() {
+    // #474 の 「ついでに」: dept 9 の sal が全部 0 (和が 0 の group)。 hint の有無・件数 (64000 の前後)・Query / Table によらず、
+    // (9, 0) を返す。 前は hint 付きの `Table::group_sum` と、 件数 64000 以上の hint 付きの `Query::group_sum` だけが返さなかった。
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            cleanup(&self.0);
+        }
+    }
+    for hint in [true, false] {
+        for n in [1_000i64, 70_000] {
+            let path = tmp_path(&format!("zero{n}{hint}"));
+            cleanup(&path);
+            let _cleanup = Cleanup(path.clone());
+            let mut db = Database::create_growable_with_capacity(&path, (n as u32 * 2).max(1 << 16)).unwrap();
+            let b = db.table("e").number("id").number("dept");
+            let b = if hint { b.cardinality(10) } else { b };
+            b.number("sal").primary_key("id").with_capacity(n as u32 + 16).build().unwrap();
+            let t = db.get_table("e").unwrap();
+            let mut want: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+            for i in 0..n {
+                let dept = i % 10;
+                let sal = if dept == 9 { 0 } else { 1 + i % 7 };
+                t.insert().set("id", i).set("dept", dept).set("sal", sal).commit().unwrap();
+                *want.entry(dept as u32).or_insert(0) += sal as u64;
+            }
+            let want: Vec<(u32, u64)> = want.into_iter().collect();
+            assert!(want.contains(&(9, 0)), "対照: 写しに (9, 0) がある");
+            assert_eq!(sorted(t.all().group_sum("dept", "sal").unwrap()), want, "hint={hint} n={n} Query::group_sum");
+            assert_eq!(sorted(t.group_sum("dept", "sal")), want, "hint={hint} n={n} Table::group_sum");
+        }
+    }
+}

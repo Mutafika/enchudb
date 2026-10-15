@@ -1419,11 +1419,13 @@ impl<'a> TableBuilder<'a> {
     /// fallback + 並列無効に落ちる ([#46])。 `dept` / `status` / `category` など、
     /// group / filter される low-cardinality 列に付けると効く。 値の上限ではなく
     /// hint なので、 超過しても tie は可能 (`BucketCylinder` が動的拡張する)。
+    /// hint 以上の値の group も集計に入る (dense の配列の外の分は HashMap で集計する、 [#474])。
     ///
     /// 列宣言メソッド (`number` / `tag` / `leaf` / `column` / `ref_to`) の直後に
     /// chain する。 列が一つも宣言されていなければ no-op。
     ///
     /// [#46]: https://github.com/Mutafika/enchudb/issues/46
+    /// [#474]: https://github.com/Mutafika/enchudb/issues/474
     pub fn cardinality(mut self, n: u32) -> Self {
         if let Some(last) = self.cols.last_mut() {
             last.2 = n;
@@ -1872,7 +1874,7 @@ impl<'a> Table<'a> {
 
     /// `group` でグループ化した上での `sum` 合計 (= SUM(sum) GROUP BY group)。
     /// 戻り値: `Vec<(group_value, sum_total)>`、 順序は group_value 昇順 (dense cap 経路) or
-    /// 任意 (HashMap 経路)。
+    /// 任意 (HashMap 経路)。 `sum` の値のある row が 1 つでもある group は、 和が 0 でも返す。
     pub fn group_sum(&self, group: &str, sum: &str) -> Vec<(u32, u64)> {
         let group_himo = format!("{}.{}", self.inner.name, group);
         let sum_himo = format!("{}.{}", self.inner.name, sum);
@@ -6452,6 +6454,7 @@ impl<'a> Query<'a> {
     }
 
     /// sub-set 内で `group` × `sum` の GROUP BY 集計 (= `SUM(sum) GROUP BY group WHERE ...`)。
+    /// `sum` の値のある row が 1 つでもある group は、 和が 0 でも返す (件数や hint によらない)。
     pub fn group_sum(self, group: &str, sum: &str) -> Result<Vec<(u32, u64)>, SchemaError> {
         let group_himo = self.resolve_himo(group)?;
         let sum_himo = self.resolve_himo(sum)?;
