@@ -286,10 +286,11 @@ fn index_paths_keep_errors() {
     cleanup(&path);
 }
 
-/// Tag の列では並べられない (値は辞書の番号 = 辞書に初めて入った順で、 意味が無い): find / count / limit 付き / 購読がどれも
-/// BadValue。 ref の道をたどった先が Tag の列でも同じ。 対照: 同じ表の Number の列 (順番を表す数を結んだ列) なら並べられる。
+/// 順の無い値の列では並べられない: Tag の列 (値は辞書の番号 = 辞書に初めて入った順) と Ref の列 (値は entity の番号 = 辞書の鍵)。
+/// find / count / limit 付き / 購読がどれも BadValue。 ref の道をたどった先が Tag の列でも同じ。 対照: 順番を表す数を結んだ
+/// Number の列 (ref の道の先) なら並べられ、 その順になる。
 #[test]
-fn order_by_a_tag_column_is_an_error() {
+fn order_by_a_column_without_order_is_an_error() {
     let path = tmp_path("tag-order");
     cleanup(&path);
     let mut db = Database::create(&path).unwrap();
@@ -314,6 +315,8 @@ fn order_by_a_tag_column_is_an_error() {
     bad(shops.all().order_by_desc("pref").limit(2).find().map(|v| v.len()), "limit 付きの find");
     bad(shops.all().order_by("pref").count(), "count");
     bad(shops.all().order_by("at.name").find().map(|v| v.len()), "ref の道の先の Tag");
+    bad(shops.all().order_by("at").find().map(|v| v.len()), "Ref の列 (entity の番号)");
+    bad(shops.all().order_by_desc("at").limit(2).count(), "Ref の列の count");
     assert!(shops.all().order_by("pref").limit(2).subscribe().is_err(), "購読");
     // 対照: 順番を表す数の列 (ref の道の先の Number) なら並べられる
     let got = shops.all().order_by("at.code").find().unwrap();

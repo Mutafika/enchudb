@@ -5270,9 +5270,10 @@ impl<'a> Query<'a> {
 
     /// 結果を列 `col` の値の昇順に並べる。 同じ値の中の順は決めない (`limit` で切る時も、 同じ値の中ならどの row を選んでも
     /// 正しい答え。 道 (値の順にたどる / 引いて並べる) や購読で選ぶ row が違うことがある)。 意味のある順が要る時は 2 つ目の
-    /// 並びの列で決める。 `col` は ref 列をたどってもよい。 Leaf と Tag の列では並べられない (Tag の値は辞書の番号で、 辞書に
-    /// 初めて入った順 = 意味が無い。 並べたい時は、 順番を表す Number の列を結んでその列で並べる) — `find` / `count` /
-    /// `subscribe` が `BadValue` を返す。
+    /// 並びの列で決める。 `col` は ref 列をたどってもよい (たどった先の列で並べる)。 並べられるのは値に順のある列 (Number /
+    /// BigInt) だけ: Tag の列 (値は辞書の番号 = 辞書に初めて入った順)・Ref の列 (値は entity の番号 = 辞書の鍵)・Leaf の列は
+    /// 順が無いので、 `find` / `count` / `subscribe` が `BadValue` を返す。 並べたい時は、 順番を表す Number の列を結んでその列で
+    /// 並べる。
     /// **`col` に値の無い row は結果から外れる** (SQL の NULLS FIRST / LAST ではない)。
     /// `limit` と組むと `subscribe` が先頭 k 件の購読 (live の `ORDER BY .. LIMIT`) になる。
     pub fn order_by(mut self, col: &str) -> Self {
@@ -5292,14 +5293,18 @@ impl<'a> Query<'a> {
         let (path, cd) = self
             .resolve_col(col)
             .ok_or_else(|| SchemaError::BadValue(format!("order_by: unknown column {col}")))?;
-        if cd.ty == ColumnType::Leaf {
-            return Err(SchemaError::BadValue("order_by: cannot order by a Leaf column".into()));
-        }
-        // Tag の値は辞書の番号 (辞書に初めて入った順) で、 その順に意味が無い
-        if cd.ty == ColumnType::Tag {
+        // 並べられるのは値に順のある列 (数) だけ。 Tag (辞書の番号で持つ文字)・Ref (entity の番号 = 辞書の鍵) の値は番号の順に意味が
+        // 無く、 Leaf (1 entity の文字) も順を持たない
+        let why = match cd.ty {
+            ColumnType::Number | ColumnType::BigInt => None,
+            ColumnType::Tag => Some("its values are dictionary ids"),
+            ColumnType::Ref => Some("its values are entity ids, which are dictionary keys"),
+            ColumnType::Leaf => Some("it is a Leaf column"),
+        };
+        if let Some(why) = why {
             return Err(SchemaError::BadValue(format!(
-                "order_by: cannot order by a Tag column {col} (its values are dictionary ids with no meaningful order); \
-                 to order by it, tie a Number column holding the order you want and order by that"
+                "order_by: cannot order by {col}: {why}, which have no meaningful order; \
+                 to order rows by it, tie a Number column holding the order you want and order by that"
             )));
         }
         Ok(Some((path, cd.himo_id, *desc)))
