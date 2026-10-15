@@ -21,6 +21,7 @@
 use crate::{Chunk, Error, Hit, Meta, MetaValue, Query, HybridQuery, Result};
 use crate::bm25::{Bm25Index, rrf_fuse};
 use crate::distance::Metric;
+use crate::filter::Universe;
 use enchudb::{Engine, ValueType};
 use enchudb_oplog::EntityId;
 use memmap2::MmapMut;
@@ -261,12 +262,11 @@ impl RagStore {
             return Err(Error::DimMismatch { expected: self.dim, got: q.vector.len() });
         }
 
-        // 候補集合
+        // 候補集合（生きている entity の全部は、条件が All / Not を使う時だけ作る）
         let candidates = if q.filter.is_all() {
             None
         } else {
-            let alive = self.alive_ids();
-            Some(q.filter.evaluate(&self.db, &alive))
+            Some(q.filter.evaluate(&Universe::new(&self.db)))
         };
 
         let mut top = TopK::new(q.top_k);
@@ -364,11 +364,10 @@ impl RagStore {
         }
 
         // メタで候補を絞る
-        let alive = self.alive_ids();
         let candidates: Vec<EntityId> = if q.filter.is_all() {
-            alive
+            self.alive_ids()
         } else {
-            q.filter.evaluate(&self.db, &alive)
+            q.filter.evaluate(&Universe::new(&self.db))
         };
 
         // ベクトル側のランキング（候補内で brute force）
