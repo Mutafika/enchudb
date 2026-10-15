@@ -13297,6 +13297,15 @@ impl Engine {
         self.himos.get(hid as usize).map_or(0, |hs| hs.column_len())
     }
 
+    /// 紐に値のある entity の数 ([`entities_with_himo`](Self::entities_with_himo) の件数と同じ)。 書き手が 「値無し → 有り」 で
+    /// 1 足し、 「有り → 無し」 で 1 引いた数を読む (O(1)、 列をなめない)。 開いた DB では、 紐ごとに最初に引いた時だけ
+    /// その紐の書き手を止めて列を数える。 読み取り専用で開いた engine は列をなめて数える (別の process の書き手が同じ file に
+    /// 書く。 この engine の足し引きはそれを知らない、 [`open_readonly`](Self::open_readonly))。 未知の紐は 0。
+    pub fn count_present_by_id(&self, hid: u16) -> usize {
+        let Some(hs) = self.himos.get(hid as usize) else { return 0 };
+        if self.is_readonly() { hs.scan_present_count() as usize } else { hs.present_count() as usize }
+    }
+
     /// 値が `value` の entity の数 (live、 [`pull`](Self::pull) の件数と同じ)。 dense に置いている値は bucket の live の
     /// 数を読むだけ (O(1))、 sparse に置いている値 (値の種類の多い列) は引いて数える。 未知の紐は 0。
     pub fn count_value_by_id(&self, hid: u16, value: u64) -> usize {
