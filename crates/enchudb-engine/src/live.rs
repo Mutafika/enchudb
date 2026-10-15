@@ -2121,6 +2121,10 @@ struct Member {
     tuples: Vec<Vec<u64>>,
     /// 最後の poll で呼び手に渡した集合 (= 呼び手が積分済みの集合)。
     reported: Bits,
+    /// 今の集合 (最後の settle までの答え = 根の記録から引いた答えと同じ)。 束 × 購読 ([`LiveQuery::members_in`]) に初めて使った時に
+    /// 根の記録から作り、 以後は根の記録が動いて出入りした時と初回の報告の時に立て直す ([`Settled::apply_root_cached`])。 使わない
+    /// 購読と、 集計・鍵付き・上位 k の member は持たない (`None`)。
+    now: Option<Bits>,
     /// 最後の poll 以降に一度でも集合を出た eid。 報告済みかつ今も集合に居ても、 これが
     /// 立っていれば 「出て入り直した」 として removed + added の両方を出す。
     left: Marks,
@@ -2252,6 +2256,14 @@ impl Member {
         if !self.queued {
             self.queued = true;
             ready.push(slot);
+        }
+    }
+
+    /// 今の集合の bit を `on` にする (持つ member だけ)。
+    #[inline]
+    fn set_now(&mut self, eid: u32, on: bool) {
+        if let Some(b) = self.now.as_mut() {
+            b.put(eid, on);
         }
     }
 
@@ -2470,6 +2482,9 @@ struct RootKey {
     count: usize,
     /// 範囲の穴のある family: member の範囲の索引 (member が変わったら None に戻して作り直す)。
     ivs: Option<Ivs>,
+    /// 範囲の穴のある family: 帯 (`Slabs`) ごとに、 その帯を範囲に含む member (`members` の添字) の bit。 member が 64 以下の鍵
+    /// だけ ([`RootKey::ensure_bands`])。 member が変わった時と帯が変わった時に None に戻して作り直す。
+    bands: Option<Vec<u64>>,
     /// 集計の family: group の値 → その値の根の集計 (根の数 0 の group は載せない)。
     groups: std::collections::BTreeMap<u64, Agg>,
     /// 上位 k 件の family: この鍵の根を (並びの値 (降順は反転), eid) の昇順で。
@@ -2734,6 +2749,7 @@ impl RootKey {
             members: Vec::new(),
             count: 0,
             ivs: None,
+            bands: None,
             groups: std::collections::BTreeMap::new(),
             order: OrderIndex::Flat(FlatSet::new()),
         }
@@ -2973,6 +2989,35 @@ fn move_block(keys: &mut [RootKey], i: usize, t: u32, v1: u64, v2: u64, members:
 }
 
 impl RootKey {
+    /// 帯ごとの member の bit (`bands`) を (無ければ作って) 用意する。 member が 64 を超える鍵は作らずに false (範囲の索引を使う)。
+    /// どの member の範囲も両端を帯の端に持つ (`Slabs::add`) ので、 帯の始まりの値が範囲に入れば帯全体が入る。
+    fn ensure_bands(&mut self, members: &[Option<Member>], slabs: &Slabs) -> bool {
+        if self.members.len() > 64 {
+            return false;
+        }
+        if self.bands.is_none() {
+            let ranges: Vec<(u64, u64)> =
+                self.members.iter().map(|&slot| members[slot].as_ref().and_then(|m| m.range).unwrap_or((1, 0))).collect();
+            self.bands = Some(
+                slabs
+                    .starts
+                    .iter()
+                    .map(|&b| ranges.iter().enumerate().fold(0u64, |m, (j, &(lo, hi))| if lo <= b && b <= hi { m | 1 << j } else { m }))
+                    .collect(),
+            );
+        }
+        true
+    }
+
+    /// 値 `v` の帯を範囲に含む member の bit (`ensure_bands` の後に呼ぶ)。
+    #[inline]
+    fn band_mask(&self, slabs: &Slabs, v: u64) -> u64 {
+        match (self.bands.as_ref(), slabs.slab(v)) {
+            (Some(b), Some(i)) => b[i],
+            _ => 0,
+        }
+    }
+
     /// 範囲の索引を (無ければ作って) 返す。
     fn ivs(&mut self, members: &[Option<Member>]) -> &Ivs {
         self.ivs.get_or_insert_with(|| {
@@ -3175,6 +3220,7 @@ impl Settled {
             for &slot in fresh {
                 if let Some(m) = self.members[slot].as_mut().filter(|m| m.has(eid, now)) {
                     m.note(slot, &mut self.ready, eid, false);
+                    m.set_now(eid, true);
                 }
             }
         }
@@ -3188,7 +3234,7 @@ impl Settled {
             self.vals[0].put(eid, now.map_or(0, |a| a.1 + 1));
         }
         let ranged = mode == RootMode::Ranged;
-        let Settled { keys, members, ready, .. } = self;
+        let Settled { keys, members, ready, slabs, .. } = self;
         let iw = was.and_then(|a| cache.find(keys, a.0));
         let inw = now.and_then(|a| cache.find(keys, a.0));
         if let RootMode::Ordered(desc) = mode {
@@ -3254,13 +3300,28 @@ impl Settled {
         if let (Some(i), Some(j), Some((_, a)), Some((_, b))) = (iw, inw, was, now)
             && i == j
         {
-            // 同じ鍵の中で範囲の値だけが動いた: 端をまたいだ member だけが出入りする
+            // 同じ鍵の中で範囲の値だけが動いた: 端をまたいだ member だけが出入りする (帯の bit の違い)
             let rk = &mut keys[i];
+            if rk.ensure_bands(members, slabs) {
+                let (ma, mb) = (rk.band_mask(slabs, a), rk.band_mask(slabs, b));
+                let mut d = ma ^ mb;
+                while d != 0 {
+                    let j = d.trailing_zeros() as usize;
+                    d &= d - 1;
+                    let (slot, enter) = (rk.members[j], mb >> j & 1 == 1);
+                    if let Some(m) = members[slot].as_mut() {
+                        m.note(slot, ready, eid, !enter);
+                        m.set_now(eid, enter);
+                    }
+                }
+                return;
+            }
             rk.ivs(members);
             if let Some(ivs) = &rk.ivs {
                 ivs.cross(a, b, &mut |slot, enter| {
                     if let Some(m) = members[slot].as_mut() {
                         m.note(slot, ready, eid, !enter);
+                        m.set_now(eid, enter);
                     }
                 });
             }
@@ -3278,11 +3339,18 @@ impl Settled {
                 }
             }
         }
+        // 旧鍵の側と新鍵の側の member の並び (slot の昇順)。 範囲の family は値の帯を範囲に含む member: 帯の bit から取り出す (Vec を
+        // 作らない)。 member が 64 を超える鍵は範囲の索引で引いて並べる
         let mut stabbed: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+        let mut masks = [None::<(usize, u64)>; 2];
         if ranged {
             for (side, (k, ans)) in [(iw, was), (inw, now)].into_iter().enumerate() {
                 let (Some(i), Some((_, v))) = (k, ans) else { continue };
                 let rk = &mut keys[i];
+                if rk.ensure_bands(members, slabs) {
+                    masks[side] = Some((i, rk.band_mask(slabs, v)));
+                    continue;
+                }
                 rk.ivs(members);
                 if let Some(ivs) = &rk.ivs {
                     ivs.stab(v, &mut |slot| stabbed[side].push(slot));
@@ -3291,35 +3359,60 @@ impl Settled {
                 stabbed[side].dedup();
             }
         }
-        let list = |side: usize, k: Option<usize>| -> &[usize] {
-            if ranged {
-                &stabbed[side]
-            } else {
-                k.map_or(&[][..], |i| &keys[i].members[..])
+        let seq = |side: usize, k: Option<usize>| -> SlotSeq<'_> {
+            match masks[side] {
+                Some((i, m)) => SlotSeq { mask: m, members: &keys[i].members, list: &[], pos: 0 },
+                None if ranged => SlotSeq { mask: 0, members: &[], list: &stabbed[side], pos: 0 },
+                None => SlotSeq { mask: 0, members: &[], list: k.map_or(&[][..], |i| &keys[i].members[..]), pos: 0 },
             }
         };
-        let (old, new) = (list(0, iw), list(1, inw));
-        let (mut i, mut j) = (0, 0);
-        while i < old.len() || j < new.len() {
-            let (slot, enter) = match (old.get(i), new.get(j)) {
+        let (mut old, mut new) = (seq(0, iw), seq(1, inw));
+        loop {
+            let (slot, enter) = match (old.peek(), new.peek()) {
                 (Some(a), Some(b)) if a == b => {
-                    i += 1;
-                    j += 1;
+                    old.advance();
+                    new.advance();
                     continue;
                 }
-                (Some(&a), b) if b.is_none_or(|&b| a < b) => {
-                    i += 1;
+                (Some(a), b) if b.is_none_or(|b| a < b) => {
+                    old.advance();
                     (a, false)
                 }
-                (_, Some(&b)) => {
-                    j += 1;
+                (_, Some(b)) => {
+                    new.advance();
                     (b, true)
                 }
                 _ => break,
             };
             if let Some(m) = members[slot].as_mut() {
                 m.note(slot, ready, eid, !enter);
+                m.set_now(eid, enter);
             }
+        }
+    }
+}
+
+/// 出入りを突き合わせる member の並び (slot の昇順): 鍵の member のうち `mask` の bit の立った添字 (`mask` が 0 でない間)、
+/// そうでなければ `list`。
+struct SlotSeq<'a> {
+    mask: u64,
+    members: &'a [usize],
+    list: &'a [usize],
+    pos: usize,
+}
+
+impl SlotSeq<'_> {
+    #[inline]
+    fn peek(&self) -> Option<usize> {
+        if self.mask != 0 { Some(self.members[self.mask.trailing_zeros() as usize]) } else { self.list.get(self.pos).copied() }
+    }
+
+    #[inline]
+    fn advance(&mut self) {
+        if self.mask != 0 {
+            self.mask &= self.mask - 1;
+        } else {
+            self.pos += 1;
         }
     }
 }
@@ -3641,6 +3734,7 @@ impl Family {
             range_on: false,
             tuples: Vec::new(),
             reported: Bits::default(),
+            now: None,
             left: Marks::default(),
             changed: Marks::default(),
             queued: false,
@@ -3678,6 +3772,7 @@ impl Family {
                 if let Some(rk) = s.key(k) {
                     rk.members.retain(|&x| x != slot);
                     rk.ivs = None;
+                    rk.bands = None;
                 }
             }
             for t in &m.tuples {
@@ -3685,7 +3780,14 @@ impl Family {
             }
             // 端が減って帯が併さるだけ = 記録の値は同じ帯に居続けるので直さなくてよい
             if let (true, Some((lo, hi))) = (m.range_on, m.range) {
+                let ends = s.slabs.starts.len();
                 s.slabs.remove(lo, hi);
+                // 帯の端が減った = どの鍵の帯の bit も並びが変わる
+                if s.slabs.starts.len() != ends {
+                    for k in s.keys.iter_mut() {
+                        k.bands = None;
+                    }
+                }
             }
         }
         s.dormant.retain(|&x| x != slot);
@@ -3982,7 +4084,14 @@ impl Family {
             if range_on || range.is_none() || ready_tuples.is_empty() {
                 // 範囲は最初に鍵を載せる時に 1 回だけ帯に載せる
             } else if let Some((lo, hi)) = range {
+                let ends = s.slabs.starts.len();
                 let mut regions = s.slabs.add(lo, hi);
+                // 帯の端が増えた = どの鍵の帯の bit も並びが変わる
+                if s.slabs.starts.len() != ends {
+                    for k in s.keys.iter_mut() {
+                        k.bands = None;
+                    }
+                }
                 if lo <= hi {
                     regions.push((lo, hi));
                 }
@@ -4014,6 +4123,7 @@ impl Family {
         {
             rk.members.insert(p, slot);
             rk.ivs = None;
+            rk.bands = None;
         }
         let Settled { members, ready, keys, fresh, force, .. } = &mut *s;
         let Some(m) = members[slot].as_mut() else { return };
@@ -5188,6 +5298,60 @@ impl LiveQuery {
             .map(|&eid| {
                 let e = enchudb_oplog::eid_local(eid);
                 m.has(e, s.view(e))
+            })
+            .collect()
+    }
+
+    /// `deck` (タグや値で引いた束など、 呼び手が引いた eid の列) のうち、 今の結果に入るもの (`deck` の順のまま、 eid の形も
+    /// `deck` のまま)。 条件の列は読まない。 「タグ = x かつ この購読」 を、 デッキ × 購読のスピンで答える。 poll の状態は変えない。
+    ///
+    /// lock と settle は 1 回。 カードごとに今の集合の bit (`Member::now`) を見るだけ。 bit はこの購読を初めて束 × 購読に使った時に
+    /// 根の記録から作り (答えの大きさに比例、 1 回だけ)、 以後は settle で出入りのたびに立て直す (使わない購読は持たない)。 集計・
+    /// 鍵付き・上位 k の購読は bit を持たず、 最後の poll の後に出入りがありえた (`changed` に印がある) カードは購読の記録 (family の
+    /// 根の記録) を引いて確かめ、 それ以外は最後の poll で渡した集合 (`reported`) の bit を見る (出入りがありえないので、 それが今の答え)。
+    pub fn members_in(&self, eng: &crate::engine::Engine, deck: &[EntityId]) -> Vec<EntityId> {
+        self.check_engine(eng);
+        let (family, slot) = match &self.kind {
+            Kind::One { family, slot } => (family, *slot),
+            Kind::Any(u) => {
+                let st = self.settle_union(u, eng);
+                return deck.iter().copied().filter(|&eid| st.has(enchudb_oplog::eid_local(eid))).collect();
+            }
+        };
+        let mut guard = family.settled.lock();
+        family.settle(eng, &mut guard);
+        let Settled { recs, vals, members, .. } = &mut *guard;
+        let Some(m) = members[slot].as_mut() else { return Vec::new() };
+        if m.grp.is_none() && m.keyed.is_none() && m.topk.is_none() {
+            // 初めて束 × 購読に使う購読は、 根の記録から今の集合の bit を作る (以後は出入りのたびに立て直す)
+            let now = m.now.get_or_insert_with(|| {
+                let mut b = Bits::default();
+                for e in recs[0].with_keys(&m.root_keys) {
+                    if Member::probe(&m.root_keys, m.range, None)(e, root_at(recs, vals, e)) {
+                        b.put(e, true);
+                    }
+                }
+                b
+            });
+            return deck.iter().copied().filter(|&eid| now.get(enchudb_oplog::eid_local(eid))).collect();
+        }
+        let s = &mut *guard;
+        let Some(m) = s.members[slot].as_mut() else { return Vec::new() };
+        // 印を畳んで (昇順・重複なし) 二分探索で引けるようにする (poll の drain と同じ畳み方。 印は消さない)
+        m.changed.compact();
+        let m = &*m;
+        let changed = &m.changed.list;
+        let probe = Member::probe(&m.root_keys, m.range, m.topk.map(|t| (t, m.order_desc)));
+        let (recs, vals, opart, ov) = (&s.recs, &s.vals, &s.opart, s.order_view);
+        deck.iter()
+            .copied()
+            .filter(|&eid| {
+                let e = enchudb_oplog::eid_local(eid);
+                if !changed.is_empty() && changed.binary_search(&e).is_ok() {
+                    probe(e, view_at(recs, vals, opart, ov, e))
+                } else {
+                    m.reported.get(e)
+                }
             })
             .collect()
     }
