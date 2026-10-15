@@ -41,6 +41,9 @@
 //!
 //! [Posting Data] — posting_total × 8 bytes
 //!   flat array of u64 entity IDs (little-endian)
+//!   gram ごとの list は eid 昇順・重複なし (writer は書く前に並べる: `NgramIndex` の save / write_to 系は
+//!   `compact` の後に書き、`merge_files` は gram ごとに並べて重複を落とす)。reader の AND は並んでいる前提で
+//!   跳びながら探す (list を写さない)
 //!
 //! [Doc Index] — doc_count × 16 bytes
 //!   eid: u64, offset: u32, len: u32
@@ -240,9 +243,8 @@ impl MappedIndex {
         })
     }
 
-    /// gram key → posting list (entity IDs)。
-    /// アライメント非依存の読み出しで `Vec<u64>` を返す（slice cast を使わない）。
-    pub fn get_posting(&self, key: u64) -> Vec<u64> {
+    /// gram key の posting list の位置 (Posting Data の中のエントリ単位の offset, len)。無い key は None。
+    fn posting_span(&self, key: u64) -> Option<(usize, usize)> {
         let idx = self.gram_index();
         let w = self.gram_entry;
         // 二分探索
@@ -253,42 +255,51 @@ impl MappedIndex {
             let (entry_key, offset, len) = decode_gram_entry(&idx[mid * w..(mid + 1) * w], w);
             if entry_key < key { lo = mid + 1; }
             else if entry_key > key { hi = mid; }
-            else {
-                let (offset, len) = (offset as usize, len as usize);
-                let data = self.posting_data();
-                let mut out = Vec::with_capacity(len);
-                for i in 0..len {
-                    let start = (offset + i) * POSTING_ENTRY;
-                    let bytes: [u8; 8] = data[start..start + POSTING_ENTRY].try_into().unwrap();
-                    out.push(u64::from_le_bytes(bytes));
-                }
-                return out;
-            }
+            else { return Some((offset as usize, len as usize)); }
         }
-        Vec::new()
+        None
     }
 
-    /// 複数 key の AND
+    /// Posting Data の `i` 番目のエントリ (アライメント非依存の読み出し)。
+    #[inline]
+    fn posting_at(data: &[u8], i: usize) -> u64 {
+        let start = i * POSTING_ENTRY;
+        u64::from_le_bytes(data[start..start + POSTING_ENTRY].try_into().unwrap())
+    }
+
+    /// gram key → posting list (entity IDs)。
+    /// アライメント非依存の読み出しで `Vec<u64>` を返す（slice cast を使わない）。
+    pub fn get_posting(&self, key: u64) -> Vec<u64> {
+        let Some((offset, len)) = self.posting_span(key) else { return Vec::new() };
+        let data = self.posting_data();
+        (offset..offset + len).map(|i| Self::posting_at(data, i)).collect()
+    }
+
+    /// 複数 key の AND（昇順）。一番短い list だけを写して種にし、残りの list は mmap の上で種の eid の順に跳びながら
+    /// 探す（写さない。list は昇順・重複なし — module doc の Posting Data）。
     pub fn intersect(&self, keys: &[u64]) -> Vec<u64> {
         if keys.is_empty() { return vec![]; }
 
-        let postings: Vec<Vec<u64>> = keys.iter().map(|&k| self.get_posting(k)).collect();
-        if postings.iter().any(|p| p.is_empty()) { return vec![]; }
-
-        let (shortest_idx, _) = postings.iter().enumerate()
-            .min_by_key(|(_, p)| p.len())
+        let mut spans = Vec::with_capacity(keys.len());
+        for &k in keys {
+            match self.posting_span(k) {
+                Some(sp) if sp.1 > 0 => spans.push(sp),
+                _ => return vec![],
+            }
+        }
+        let (shortest_idx, &(offset, len)) = spans.iter().enumerate()
+            .min_by_key(|(_, sp)| sp.1)
             .unwrap();
 
-        let mut result = postings[shortest_idx].clone();
-        result.sort_unstable();
-        result.dedup();
-
-        for (i, posting) in postings.iter().enumerate() {
+        let data = self.posting_data();
+        let mut result: Vec<u64> = (offset..offset + len).map(|i| Self::posting_at(data, i)).collect();
+        for (i, &(offset, len)) in spans.iter().enumerate() {
             if i == shortest_idx { continue; }
-            let mut set = posting.clone();
-            set.sort_unstable();
-            set.dedup();
-            result.retain(|eid| set.binary_search(eid).is_ok());
+            let mut at = 0;
+            result.retain(|&e| {
+                at = crate::posting::gallop_ge_by(len, at, e, |j| Self::posting_at(data, offset + j));
+                at < len && Self::posting_at(data, offset + at) == e
+            });
             if result.is_empty() { return vec![]; }
         }
         result
