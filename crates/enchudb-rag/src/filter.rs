@@ -12,13 +12,37 @@
 //!
 //! # 評価
 //!
-//! AND: 最も小さい候補集合を取って、他の条件で filter する（engine 本体の非 bitmap 戦略に近い）。
-//! OR: 和集合。
-//! 評価結果は**ソート済み EntityId (u64) の Vec**として返す（後段の集合演算をしやすくするため）。
+//! AND: 子の件数を索引の数で見積もり（値は bucket の数で O(1)、範囲は範囲の中の値の数に比例）、一番少ない子（Not / All
+//! 以外）だけを引いて、残りの子は候補ごとに列の値を読んで確かめる（他の子の集合は作らない。Not の子も確かめるだけなので、
+//! 全体の補集合を作らない）。
+//! OR: 和集合。NOT（AND の外）: 生きている entity 全体との差。
+//! 生きている entity の全部（All / Not の基底）は、要る時だけ 1 回作る（条件が値・範囲と、それを AND / OR したものだけなら作らない）。
+//! 評価結果は**ソート済み EntityId (u64) の Vec**として返す（後段の集合演算と、BM25 の候補の二分探索のため）。
 
 use enchudb::{Engine};
 use enchudb_oplog::EntityId;
+use std::cell::OnceCell;
 use std::ops::RangeInclusive;
+
+/// 評価の間の、生きている entity の全部（ソート済み）。最初に要った時に 1 回だけ作る。
+pub(crate) struct Universe<'a> {
+    db: &'a Engine,
+    alive: OnceCell<Vec<EntityId>>,
+}
+
+impl<'a> Universe<'a> {
+    pub(crate) fn new(db: &'a Engine) -> Self {
+        Self { db, alive: OnceCell::new() }
+    }
+
+    fn alive(&self) -> &[EntityId] {
+        self.alive.get_or_init(|| {
+            let mut v = self.db.entities();
+            v.sort_unstable();
+            v
+        })
+    }
+}
 
 #[derive(Clone, Debug)]
 pub enum Filter {
@@ -85,15 +109,13 @@ impl Filter {
     pub fn is_all(&self) -> bool { matches!(self, Filter::All) }
 
     /// フィルタを評価して、マッチする entity id のソート済み Vec を返す。
-    /// `all_alive` は Filter::All / Filter::Not の基底集合として使う。
-    pub(crate) fn evaluate(&self, db: &Engine, all_alive: &[EntityId]) -> Vec<EntityId> {
+    /// 生きている entity の全部（Filter::All / Filter::Not の基底）は `u` が要る時だけ作る。
+    pub(crate) fn evaluate(&self, u: &Universe<'_>) -> Vec<EntityId> {
+        let db = u.db;
         match self {
-            Filter::All => all_alive.to_vec(),
+            Filter::All => u.alive().to_vec(),
 
-            Filter::Value { field, value } => {
-                let s = pull_sorted(db, field, *value);
-                s
-            }
+            Filter::Value { field, value } => pull_sorted(db, field, *value),
 
             Filter::Symbol { field, value } => {
                 let Some(vid) = db.vocab_id(value) else { return Vec::new(); };
@@ -130,16 +152,21 @@ impl Filter {
             }
 
             Filter::And(filters) => {
-                if filters.is_empty() { return all_alive.to_vec(); }
-                // 最小集合を起点に、残りで filter（minimum-slice pivot 戦略）
-                let mut sets: Vec<Vec<EntityId>> = filters.iter()
-                    .map(|f| f.evaluate(db, all_alive))
+                // 種 = 見積もりが一番少ない子（Not / All は全体から引くので種にしない）。残りの子は候補ごとに列で確かめる
+                let seed = filters.iter().enumerate()
+                    .filter(|(_, f)| !matches!(f, Filter::Not(_) | Filter::All))
+                    .min_by_key(|(_, f)| f.estimate(db))
+                    .map(|(i, _)| i);
+                let mut cur = match seed {
+                    Some(i) => filters[i].evaluate(u),
+                    None => u.alive().to_vec(),
+                };
+                let rest: Vec<Probe> = filters.iter().enumerate()
+                    .filter(|&(i, _)| Some(i) != seed)
+                    .map(|(_, f)| f.probe(db))
                     .collect();
-                sets.sort_by_key(|s| s.len());
-                let mut cur = sets.remove(0);
-                for s in sets {
-                    cur = intersect_sorted(&cur, &s);
-                    if cur.is_empty() { break; }
+                if !rest.is_empty() {
+                    cur.retain(|&e| rest.iter().all(|p| p.holds(db, e)));
                 }
                 cur
             }
@@ -147,7 +174,7 @@ impl Filter {
             Filter::Or(filters) => {
                 let mut out = Vec::new();
                 for f in filters {
-                    out.extend(f.evaluate(db, all_alive));
+                    out.extend(f.evaluate(u));
                 }
                 out.sort_unstable();
                 out.dedup();
@@ -155,11 +182,94 @@ impl Filter {
             }
 
             Filter::Not(f) => {
-                let exclude = f.evaluate(db, all_alive);
-                diff_sorted(all_alive, &exclude)
+                let exclude = f.evaluate(u);
+                diff_sorted(u.alive(), &exclude)
             }
         }
     }
+
+    /// 当たる entity の数の上からの見積もり（索引の数だけで、entity は読まない。AND の種を選ぶ用）。
+    fn estimate(&self, db: &Engine) -> usize {
+        let all = db.entity_count() as usize;
+        let count = |field: &str, v: u64| himo(db, field).map_or(0, |h| db.count_value_by_id(h, v));
+        match self {
+            Filter::All | Filter::Not(_) => all,
+            Filter::Value { field, value } => count(field, *value as u64),
+            Filter::Symbol { field, value } => db.vocab_id(value).map_or(0, |vid| count(field, vid as u64)),
+            Filter::Range { field, min, max } => {
+                if min > max { 0 } else { himo(db, field).map_or(0, |h| db.count_range_by_id(h, *min as u64, *max as u64)) }
+            }
+            Filter::AnyValue { field, values } => values.iter().map(|&v| count(field, v as u64)).sum(),
+            Filter::AnySymbol { field, values } => {
+                values.iter().filter_map(|s| db.vocab_id(s)).map(|vid| count(field, vid as u64)).sum()
+            }
+            Filter::And(filters) => filters.iter().map(|f| f.estimate(db)).min().unwrap_or(all),
+            Filter::Or(filters) => filters.iter().map(|f| f.estimate(db)).fold(0usize, |a, b| a.saturating_add(b)).min(all),
+        }
+    }
+
+    /// 1 つの entity が当たるかを列の値で確かめる形に（紐の名前と語は先に引いておく）。
+    fn probe(&self, db: &Engine) -> Probe {
+        let eq = |field: &str, v: u64| himo(db, field).map_or(Probe::False, |h| Probe::Eq(h, v));
+        let any = |field: &str, vs: Vec<u64>| match himo(db, field) {
+            Some(h) if !vs.is_empty() => {
+                let mut vs = vs;
+                vs.sort_unstable();
+                vs.dedup();
+                Probe::In(h, vs)
+            }
+            _ => Probe::False,
+        };
+        match self {
+            Filter::All => Probe::True,
+            Filter::Value { field, value } => eq(field, *value as u64),
+            Filter::Symbol { field, value } => db.vocab_id(value).map_or(Probe::False, |vid| eq(field, vid as u64)),
+            Filter::Range { field, min, max } => {
+                himo(db, field).map_or(Probe::False, |h| Probe::Range(h, *min as u64, *max as u64))
+            }
+            Filter::AnyValue { field, values } => any(field, values.iter().map(|&v| v as u64).collect()),
+            Filter::AnySymbol { field, values } => {
+                any(field, values.iter().filter_map(|s| db.vocab_id(s)).map(|vid| vid as u64).collect())
+            }
+            Filter::And(filters) => Probe::And(filters.iter().map(|f| f.probe(db)).collect()),
+            Filter::Or(filters) => Probe::Or(filters.iter().map(|f| f.probe(db)).collect()),
+            Filter::Not(f) => Probe::Not(Box::new(f.probe(db))),
+        }
+    }
+}
+
+/// [`Filter`] を 1 つの entity について確かめる形（紐は himo_id、文字は語の番号に引いたもの）。
+enum Probe {
+    True,
+    /// 紐が無い・語が無いなど、どの entity も当たらない。
+    False,
+    Eq(u16, u64),
+    /// 両端を含む。
+    Range(u16, u64, u64),
+    /// 値の昇順・重複なし。
+    In(u16, Vec<u64>),
+    And(Vec<Probe>),
+    Or(Vec<Probe>),
+    Not(Box<Probe>),
+}
+
+impl Probe {
+    fn holds(&self, db: &Engine, e: EntityId) -> bool {
+        match self {
+            Probe::True => true,
+            Probe::False => false,
+            Probe::Eq(h, v) => db.get_by_id(e, *h) == Some(*v),
+            Probe::Range(h, lo, hi) => db.get_by_id(e, *h).is_some_and(|x| *lo <= x && x <= *hi),
+            Probe::In(h, vs) => db.get_by_id(e, *h).is_some_and(|x| vs.binary_search(&x).is_ok()),
+            Probe::And(ps) => ps.iter().all(|p| p.holds(db, e)),
+            Probe::Or(ps) => ps.iter().any(|p| p.holds(db, e)),
+            Probe::Not(p) => !p.holds(db, e),
+        }
+    }
+}
+
+fn himo(db: &Engine, field: &str) -> Option<u16> {
+    db.himo_id(field).map(|h| h as u16)
 }
 
 fn pull_sorted(db: &Engine, field: &str, value: u32) -> Vec<EntityId> {
@@ -167,20 +277,6 @@ fn pull_sorted(db: &Engine, field: &str, value: u32) -> Vec<EntityId> {
     let mut v = db.pull_raw(field, value).to_vec();
     v.sort_unstable();
     v
-}
-
-/// 昇順ソート済み配列の積集合。
-fn intersect_sorted(a: &[EntityId], b: &[EntityId]) -> Vec<EntityId> {
-    let mut out = Vec::with_capacity(a.len().min(b.len()));
-    let (mut i, mut j) = (0, 0);
-    while i < a.len() && j < b.len() {
-        match a[i].cmp(&b[j]) {
-            std::cmp::Ordering::Less => i += 1,
-            std::cmp::Ordering::Greater => j += 1,
-            std::cmp::Ordering::Equal => { out.push(a[i]); i += 1; j += 1; }
-        }
-    }
-    out
 }
 
 /// 昇順ソート済み配列の差集合 a \ b。
@@ -198,13 +294,6 @@ fn diff_sorted(a: &[EntityId], b: &[EntityId]) -> Vec<EntityId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn intersect_basic() {
-        assert_eq!(intersect_sorted(&[1, 2, 3], &[2, 3, 4]), vec![2u64, 3]);
-        assert_eq!(intersect_sorted(&[1, 2], &[3, 4]), Vec::<EntityId>::new());
-        assert_eq!(intersect_sorted(&[], &[1]), Vec::<EntityId>::new());
-    }
 
     #[test]
     fn diff_basic() {
