@@ -5268,7 +5268,9 @@ impl<'a> Query<'a> {
         Self { db, table, preds: Vec::new(), limit: None, order: None }
     }
 
-    /// 結果を列 `col` の値の昇順に並べる (同じ値は eid の昇順)。 `col` は ref 列をたどってもよい。
+    /// 結果を列 `col` の値の昇順に並べる。 同じ値の中の順は決めない (`limit` で切る時も、 同じ値の中ならどの row を選んでも
+    /// 正しい答え。 道 (値の順にたどる / 引いて並べる) や購読で選ぶ row が違うことがある)。 意味のある順が要る時は 2 つ目の
+    /// 並びの列で決める。 `col` は ref 列をたどってもよい。
     /// **`col` に値の無い row は結果から外れる** (SQL の NULLS FIRST / LAST ではない)。
     /// `limit` と組むと `subscribe` が先頭 k 件の購読 (live の `ORDER BY .. LIMIT`) になる。
     pub fn order_by(mut self, col: &str) -> Self {

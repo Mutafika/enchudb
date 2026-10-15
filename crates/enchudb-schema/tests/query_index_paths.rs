@@ -83,6 +83,19 @@ fn top(rows: &[Row], k: usize, key: impl Fn(&Row) -> Option<i128>) -> Vec<u64> {
     v.into_iter().take(k).map(|x| x.1).collect()
 }
 
+/// order_by の答えを、 同じ値の中の順を問わずに写しと比べる (同じ値の中は 「置いてある順」): 並びの値の列が写しの先頭 k 件と
+/// 同じ・eid に重複が無い・どれも生きていて key のある row。
+fn assert_top(rows: &[Row], got: Vec<u64>, k: usize, key: impl Fn(&Row) -> Option<i128>, msg: &str) {
+    let want = top(rows, k, &key);
+    let by_eid: std::collections::HashMap<u64, &Row> = rows.iter().filter(|r| r.alive).map(|r| (r.eid, r)).collect();
+    let keys = |v: &[u64]| -> Vec<Option<i128>> { v.iter().map(|e| by_eid.get(e).and_then(|r| key(r))).collect() };
+    let (kg, kw) = (keys(&got), keys(&want));
+    let mut u = got.clone();
+    u.sort_unstable();
+    u.dedup();
+    assert!(kg.iter().all(Option::is_some) && kg == kw && u.len() == got.len(), "{msg}: got {got:?} want {want:?}");
+}
+
 #[test]
 fn index_paths_match_mirror() {
     let path = tmp_path("mirror");
@@ -185,26 +198,10 @@ fn index_paths_match_mirror() {
             );
             // order_by + limit (並び)
             let k = 1 + rng.below(20) as usize;
-            assert_eq!(
-                t.where_range("age", a as i64, b as i64).order_by("age").limit(k).find().unwrap(),
-                top(rows, k, |r| inr(r.age, a, b).then(|| r.age.unwrap() as i128)),
-                "{stage} o_rng_same_col"
-            );
-            assert_eq!(
-                t.where_eq("city", city).order_by("age").limit(k).find().unwrap(),
-                top(rows, k, |r| (r.city == Some(city)).then_some(r.age).flatten().map(i128::from)),
-                "{stage} o_tag"
-            );
-            assert_eq!(
-                t.where_range("score", 0, sb as i64).order_by_desc("age").limit(k).find().unwrap(),
-                top(rows, k, |r| inr(r.score, 0, sb).then_some(r.age).flatten().map(|x| -(x as i128))),
-                "{stage} o_rng_other_col_desc"
-            );
-            assert_eq!(
-                t.where_eq("grp", g as i64).order_by("score").limit(k).find().unwrap(),
-                top(rows, k, |r| (r.grp == Some(g)).then_some(r.score).flatten().map(i128::from)),
-                "{stage} o_eq_small (引いて並べる道)"
-            );
+            assert_top(rows, t.where_range("age", a as i64, b as i64).order_by("age").limit(k).find().unwrap(), k, |r| inr(r.age, a, b).then(|| r.age.unwrap() as i128), &format!("{stage} o_rng_same_col"));
+            assert_top(rows, t.where_eq("city", city).order_by("age").limit(k).find().unwrap(), k, |r| (r.city == Some(city)).then_some(r.age).flatten().map(i128::from), &format!("{stage} o_tag"));
+            assert_top(rows, t.where_range("score", 0, sb as i64).order_by_desc("age").limit(k).find().unwrap(), k, |r| inr(r.score, 0, sb).then_some(r.age).flatten().map(|x| -(x as i128)), &format!("{stage} o_rng_other_col_desc"));
+            assert_top(rows, t.where_eq("grp", g as i64).order_by("score").limit(k).find().unwrap(), k, |r| (r.grp == Some(g)).then_some(r.score).flatten().map(i128::from), &format!("{stage} o_eq_small (引いて並べる道)"));
             // 最小 / 最大 (条件つき)
             let want_min = alive().filter(|r| inr(r.age, a, b)).filter_map(|r| r.age).min();
             assert_eq!(t.where_range("age", a as i64, b as i64).min("age").unwrap(), want_min, "{stage} q_min_rng");
@@ -215,27 +212,15 @@ fn index_paths_match_mirror() {
         let has_pk = |r: &Row| r.id.is_some();
         assert_eq!(t.all().count().unwrap(), alive().filter(|r| has_pk(r)).count(), "{stage} c_all");
         for k in [1, 10, 100] {
-            assert_eq!(t.all().order_by("age").limit(k).find().unwrap(), top(rows, k, |r| has_pk(r).then_some(r.age).flatten().map(i128::from)), "{stage} top_age {k}");
-            assert_eq!(
-                t.all().order_by_desc("score").limit(k).find().unwrap(),
-                top(rows, k, |r| has_pk(r).then_some(r.score).flatten().map(|x| -(x as i128))),
-                "{stage} top_score_desc {k}"
-            );
-            assert_eq!(t.all().order_by("ts").limit(k).find().unwrap(), top(rows, k, |r| has_pk(r).then_some(r.ts).flatten().map(i128::from)), "{stage} top_ts {k}");
-            assert_eq!(
-                t.all().order_by_desc("ts").limit(k).find().unwrap(),
-                top(rows, k, |r| has_pk(r).then_some(r.ts).flatten().map(|x| -(x as i128))),
-                "{stage} top_ts_desc {k}"
-            );
-            assert_eq!(t.all().order_by("id").limit(k).find().unwrap(), top(rows, k, |r| r.id.map(i128::from)), "{stage} top_id {k}");
+            assert_top(rows, t.all().order_by("age").limit(k).find().unwrap(), k, |r| has_pk(r).then_some(r.age).flatten().map(i128::from), &format!("{stage} top_age {k}"));
+            assert_top(rows, t.all().order_by_desc("score").limit(k).find().unwrap(), k, |r| has_pk(r).then_some(r.score).flatten().map(|x| -(x as i128)), &format!("{stage} top_score_desc {k}"));
+            assert_top(rows, t.all().order_by("ts").limit(k).find().unwrap(), k, |r| has_pk(r).then_some(r.ts).flatten().map(i128::from), &format!("{stage} top_ts {k}"));
+            assert_top(rows, t.all().order_by_desc("ts").limit(k).find().unwrap(), k, |r| has_pk(r).then_some(r.ts).flatten().map(|x| -(x as i128)), &format!("{stage} top_ts_desc {k}"));
+            assert_top(rows, t.all().order_by("id").limit(k).find().unwrap(), k, |r| r.id.map(i128::from), &format!("{stage} top_id {k}"));
         }
         // limit なしの並び (全部)
-        assert_eq!(t.all().order_by("age").find().unwrap(), top(rows, usize::MAX, |r| has_pk(r).then_some(r.age).flatten().map(i128::from)), "{stage} order_all");
-        assert_eq!(
-            t.where_range("age", 10, 20).order_by("age").find().unwrap(),
-            top(rows, usize::MAX, |r| inr(r.age, 10, 20).then(|| r.age.unwrap() as i128)),
-            "{stage} order_rng_all"
-        );
+        assert_top(rows, t.all().order_by("age").find().unwrap(), usize::MAX, |r| has_pk(r).then_some(r.age).flatten().map(i128::from), &format!("{stage} order_all"));
+        assert_top(rows, t.where_range("age", 10, 20).order_by("age").find().unwrap(), usize::MAX, |r| inr(r.age, 10, 20).then(|| r.age.unwrap() as i128), &format!("{stage} order_rng_all"));
         // 最小 / 最大 (条件なし = 主キーのある row)
         assert_eq!(t.all().min("age").unwrap(), alive().filter(|r| has_pk(r)).filter_map(|r| r.age).min(), "{stage} q_min_age");
         assert_eq!(t.all().max("score").unwrap(), alive().filter(|r| has_pk(r)).filter_map(|r| r.score).max(), "{stage} q_max_score");
