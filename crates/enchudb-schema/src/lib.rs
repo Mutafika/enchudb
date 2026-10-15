@@ -5856,11 +5856,14 @@ impl<'a> Query<'a> {
         self
     }
 
-    /// 件数。 条件が 1 つの列の等値 / IN / 範囲だけなら、 索引の数 (値ごとの bucket の live の数) を足すだけで entity を
-    /// 読まない (等値は O(1)、 範囲は範囲の中の値の数に比例)。 それ以外は `find().len()`。 `limit` があれば超えない。
+    /// 件数 (`find()?.len()` と同じ)。 条件が 1 つの列の等値 / IN / 範囲だけなら、 索引の数 (値ごとの bucket の live の数) を
+    /// 足すだけで entity を読まない (等値は O(1)、 範囲は範囲の中の値の数に比例)。 並び (`order_by`) のある時は、 並びの列に
+    /// 値の無い row を外す (`order_by` の doc) ので `find().len()`。 それ以外も `find().len()`。 `limit` があれば超えない。
     pub fn count(self) -> Result<usize, SchemaError> {
-        // 並びは件数に関係ないが、 未知の列は find と同じく誤りにする
-        self.order_col()?;
+        // 並びの列に値の無い row は find が外すので、 索引の数では数えない (未知の列は find と同じく誤り)
+        if self.order_col()?.is_some() {
+            return Ok(self.find()?.len());
+        }
         let eng = self.db.engine();
         match Plan::of(eng, &self.preds)? {
             Plan::Empty => return Ok(0),
