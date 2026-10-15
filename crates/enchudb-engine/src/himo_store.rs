@@ -307,8 +307,10 @@ fn present_stripe() -> usize {
 ///
 /// 全部を写して並べない: bucket は 「組んだ時・組み直した時の昇順の頭 + 後ろに足した順番外」 (sparse の値は run ごとの昇順を
 /// つないだもの) なので、 頭 (最初に崩れた所まで) はそのまま読み、 後ろだけを heap にして小さい順に取り出し、 2 つを混ぜる。
-/// 手間は 頭を探す分 (塊ごとの `is_sorted`) + 後ろの数 + 出した数・飛ばした古い entry の数。 上位 k や最小は bucket の大きさに
-/// よらない (前は bucket を全部写して確かめて並べていた: 100 万行の値 1 つ = 1 万件)。
+/// 頭の長さは、 dense の bucket なら書き手が足すたびに持っている数を使い (探さない)、 sparse の値だけ塊ごとの `is_sorted` で探す。
+/// 手間は 後ろの数 + 出した数・飛ばした古い entry の数 (+ sparse の値は頭を探す分)。 上位 k や最小は、 書き換えの無い bucket なら
+/// bucket の大きさによらない (前は bucket を全部写して確かめて並べていた: 100 万行の値 1 つ = 1 万件。 その次の形は頭を毎回
+/// 探していた)。
 pub(crate) struct BucketIter<'a> {
     head: &'a [u32],
     at: usize,
@@ -320,8 +322,9 @@ pub(crate) struct BucketIter<'a> {
 }
 
 impl<'a> BucketIter<'a> {
-    fn new(raw: &'a [u32], check: Option<(&'a Column, u64)>) -> Self {
-        let p = crate::append_bucket::sorted_prefix_len(raw);
+    fn new(raw: &'a [u32], head: Option<usize>, check: Option<(&'a Column, u64)>) -> Self {
+        let p = head.unwrap_or_else(|| crate::append_bucket::sorted_prefix_len(raw));
+        debug_assert!(p <= raw.len() && raw[..p].is_sorted(), "頭の昇順の長さ {p} が合わない");
         let tail = raw[p..].iter().map(|&e| std::cmp::Reverse(e)).collect();
         BucketIter { head: &raw[..p], at: 0, tail, check, last: None }
     }
@@ -1048,7 +1051,7 @@ impl HimoStore {
     pub(crate) fn walk_values(&self, lo: u64, hi: u64, desc: bool, mut f: impl FnMut(u64, &mut BucketIter<'_>) -> ControlFlow<()>) {
         self.ensure_cylinder_built();
         let col = self.col();
-        self.cyl.walk(lo, hi, desc, |v, raw, verify| f(v, &mut BucketIter::new(raw, verify.then_some((col, v + 1)))));
+        self.cyl.walk(lo, hi, desc, |v, raw, head, verify| f(v, &mut BucketIter::new(raw, head, verify.then_some((col, v + 1)))));
     }
 
     /// 値が `lo..=hi` の live な entity の数 (`pull_range(lo, hi).len()` と同じ数)。 dense の値は bucket の live の数を
