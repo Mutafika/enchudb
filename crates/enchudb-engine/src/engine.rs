@@ -15322,6 +15322,14 @@ impl Engine {
         // per-tenant / per-user に DB を分ける構成の host 密度を RAM(GB)×~8 に縛る。
         // 小 DB (max_entities が小さい) は queue も小さく、default 16M DB は従来
         // どおり 1M slot (挙動不変)。floor 4096 は burst 吸収の下限。
+        // 書き手の lock (`.db.lock`、 書き手の process は 1 つ) を持つ engine は、 WAL の flock を開いている間 1 回だけ取る
+        // (record ごとの flock の lock / unlock = system call 2 回を省く)。 取れなければ今までどおり record ごとに取る
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(wal) = oplog.as_ref()
+            && eng._writer_lock.is_some()
+        {
+            let _ = wal.lock_session();
+        }
         let qc = queue_cap.unwrap_or_else(|| {
             (eng.max_entities() as usize).clamp(4096, crate::write_queue::DEFAULT_WRITE_QUEUE_CAP)
         });

@@ -672,13 +672,16 @@ pub struct RelayedHeader {
 /// 永久に解放されず、 別プロセスの append が無限に待つ**)。
 #[cfg(not(target_arch = "wasm32"))]
 struct OpLogLockGuard<'a> {
-    file: &'a File,
+    /// None = 開いている間の lock ([`OpLog::lock_session`]) を持っているので、 取りも外しもしない。
+    file: Option<&'a File>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for OpLogLockGuard<'_> {
     fn drop(&mut self) {
-        let _ = crate::filelock::unlock(self.file);
+        if let Some(file) = self.file {
+            let _ = crate::filelock::unlock(file);
+        }
     }
 }
 
@@ -714,6 +717,10 @@ pub struct OpLog {
     /// write) と `next_hlc` はこの lock の下でのみ安全。 cross-process 排他は
     /// 従来通り flock が担う。
     append_lock: std::sync::Mutex<()>,
+    /// [`OpLog::lock_session`] で、 開いている間ずっと flock を持っている。 立っている間の append は record ごとに
+    /// flock を取らない (取ると外す時に、 開いている間の lock ごと外れる: flock は開いた file ごとの lock で数えない)。
+    /// `append_lock` の下で立て、 append も `append_lock` の下で見る。
+    session_locked: std::sync::atomic::AtomicBool,
     /// append 中の writer 数。try_reset はこれが 0 のときだけ実行できる。
     pending_writes: std::sync::atomic::AtomicU32,
     /// auto reset を許可するか。default false。
@@ -746,6 +753,8 @@ unsafe impl Sync for OpLog {}
 #[cfg(test)]
 thread_local! {
     static FAULT_INJECT_APPEND_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// test 用: この thread が record ごとの flock を実際に取った回数 ([`OpLog::lock_session`] の test)。
+    static FLOCK_TAKEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// `pending_writes` を RAII で減算するガード。
@@ -869,6 +878,7 @@ impl OpLog {
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
             append_lock: std::sync::Mutex::new(()),
+            session_locked: std::sync::atomic::AtomicBool::new(false),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
@@ -959,6 +969,7 @@ impl OpLog {
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
             append_lock: std::sync::Mutex::new(()),
+            session_locked: std::sync::atomic::AtomicBool::new(false),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
@@ -1969,12 +1980,43 @@ impl OpLog {
     /// 取得まで block する (典型的に数 µs〜ms)。 read 経路は lock 取らない。
     #[cfg(not(target_arch = "wasm32"))]
     fn flock_exclusive(&self) -> io::Result<OpLogLockGuard<'_>> {
+        // 開いている間の lock を持っていれば、 record ごとには取らない (呼び手は `append_lock` の下)
+        if self.session_locked.load(Ordering::Relaxed) {
+            return Ok(OpLogLockGuard { file: None });
+        }
         // #280: advisory lock を持たない FS では **排他なしで続行**する
         // (エラーにすると platform / FS ごと書き込み不能になる)。 同一プロセス内の
         // 直列化は呼び出し側の `append_lock` が担うので、 単一プロセス構成
         // (モバイル) は安全側に倒れる。 guard の unlock は no-op になる。
         let _ = crate::filelock::lock_exclusive(&self._file)?;
-        Ok(OpLogLockGuard { file: &self._file })
+        #[cfg(test)]
+        FLOCK_TAKEN.with(|c| c.set(c.get() + 1));
+        Ok(OpLogLockGuard { file: Some(&self._file) })
+    }
+
+    /// この OpLog を開いている間、 WAL の flock を持ちっぱなしにする (閉じると OS が外す)。 以後の append は record ごとに
+    /// flock を取らない (system call 2 回を省く)。 engine が書き手の lock (`.db.lock`、 書き手の process は 1 つ) を持って WAL を
+    /// 開いた時に呼ぶ: その間、 同じ WAL に追記する別の process は居ない。 何度呼んでもよい。 別の process が record ごとの
+    /// flock で追記する使い方 (この crate を直に使う時) では呼ばない — 呼ぶと、 その process は閉じるまで待つ。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn lock_session(&self) -> io::Result<()> {
+        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.session_locked.load(Ordering::Relaxed) {
+            let _ = crate::filelock::lock_exclusive(&self._file)?;
+            self.session_locked.store(true, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// wasm には flock が無い (`flock_exclusive` も無い) ので何もしない。
+    #[cfg(target_arch = "wasm32")]
+    pub fn lock_session(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// [`OpLog::lock_session`] を呼んだか (test 用)。
+    pub fn session_locked(&self) -> bool {
+        self.session_locked.load(Ordering::Relaxed)
     }
 
     // ---- internal mmap helpers ----
@@ -2027,6 +2069,7 @@ impl OpLog {
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
             append_lock: std::sync::Mutex::new(()),
+            session_locked: std::sync::atomic::AtomicBool::new(false),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
@@ -2497,6 +2540,72 @@ mod tests {
         assert_eq!(hlcs.len(), before, "HLC が重複発行された");
 
         let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// `lock_session` の後の append は record ごとに flock を取らない (取る前は record の数だけ取る = 対照)。 開いている間の
+    /// lock は本当に持っている: 同じ WAL を別に開いた file (= 別の process と同じく別の lock の持ち主) からは取れず、 閉じると取れる。
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn session_lock_skips_per_record_flock_and_holds_the_file_lock() {
+        let p = tmp("session_lock");
+        let wal = OpLog::create(&p, 1 << 20).unwrap();
+        let taken = || FLOCK_TAKEN.with(|c| c.get());
+        let before = taken();
+        for i in 0..10u64 {
+            wal.append(Op::Tie { eid: i, himo_id: 0, value: i }).unwrap();
+        }
+        assert_eq!(taken() - before, 10, "対照: lock_session の前は record ごとに取る");
+        assert!(!wal.session_locked());
+        wal.lock_session().unwrap();
+        wal.lock_session().unwrap(); // 何度呼んでもよい
+        assert!(wal.session_locked());
+        let before = taken();
+        for i in 10..20u64 {
+            wal.append(Op::Tie { eid: i, himo_id: 0, value: i }).unwrap();
+        }
+        wal.append_many(&[OwnedOp::Tie { eid: 20, himo_id: 0, value: 20 }, OwnedOp::Commit]).unwrap();
+        assert_eq!(taken() - before, 0, "lock_session の後は取らない");
+        let other = std::fs::OpenOptions::new().read(true).write(true).open(&p).unwrap();
+        assert!(!crate::filelock::try_lock_exclusive(&other).unwrap(), "開いている間の lock を持っている");
+        drop(wal);
+        assert!(crate::filelock::try_lock_exclusive(&other).unwrap(), "閉じると外れる");
+        let _ = crate::filelock::unlock(&other);
+        let ties = OpLog::open(&p).unwrap().recover().iter().filter(|r| matches!(r.op, DecodedOp::Tie { .. })).count();
+        assert_eq!(ties, 21);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// `lock_session` の後に 8 本の thread で append しても、 場所と LSN はぶつからない (process の中の直列化は `append_lock` のまま)。
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn session_lock_appends_from_threads_do_not_collide() {
+        let p = tmp("session_threads");
+        let wal = OpLog::create(&p, 8 << 20).unwrap();
+        wal.lock_session().unwrap();
+        std::thread::scope(|s| {
+            for t in 0..8u64 {
+                let wal = &wal;
+                s.spawn(move || {
+                    for i in 0..1000u64 {
+                        wal.append(Op::Tie { eid: t * 1000 + i, himo_id: 0, value: i }).unwrap();
+                    }
+                });
+            }
+        });
+        wal.append(Op::Commit).unwrap();
+        drop(wal);
+        let recs = OpLog::open(&p).unwrap().recover();
+        let mut eids: Vec<u64> = recs.iter().filter_map(|r| match r.op { DecodedOp::Tie { eid, .. } => Some(eid), _ => None }).collect();
+        let mut lsns: Vec<u64> = recs.iter().map(|r| r.lsn).collect();
+        assert_eq!(eids.len(), 8000);
+        eids.sort_unstable();
+        eids.dedup();
+        assert_eq!(eids.len(), 8000, "どの record も 1 回ずつ読める");
+        let n = lsns.len();
+        lsns.sort_unstable();
+        lsns.dedup();
+        assert_eq!(lsns.len(), n, "LSN が重ならない");
         let _ = std::fs::remove_file(&p);
     }
 
