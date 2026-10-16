@@ -3,6 +3,52 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.33.1 — 2026-10-16
+
+patch。 on-disk 形式・wire 形式・答えは 0.33.0 と同じ。 schema の handle が表を `Arc` で数えずに借りるようになり、 書き手や読み手を
+並べた時の取り合いが無くなった (書き手 8 本 6.5 倍、 読み手 8 本 18 倍)。 書き手の engine は WAL の flock を開いている間 1 回だけ
+取るようになり、 WAL 付きの書き込みが 3〜5 倍速くなった。 辞書の索引を空き不足で伸ばせない間、 insert のたびに今の表をなめ直して
+いたのを直した (#488)。
+
+**上げる時の注意**:
+
+- WAL 付きで開いた書き手の engine は、 閉じるまで WAL の file の flock を持つ (前は record ごとに取って外した)。 同じ WAL に別の
+  process が record ごとの flock で追記しようとすると、 閉じるまで待つ (書き手の process は `.db.lock` で 1 つなので、 今までも
+  そういう process は居ない) (#494)
+- oplog の公開 API が増えた: `OpLog::lock_session` / `OpLog::session_locked` (#494)
+
+### Fixed — 辞書の索引を空き不足で伸ばせない間、 insert のたびに今の表をなめ直していた (#488、 #489)
+
+辞書の索引は、 語数が今の表の半分を超えると、 新しい語の insert のたびに表を伸ばそうとする。 新しい表を書く空きを、 今の表を全部
+なめて語を集めた後で確かめていたので、 空き不足 (`set_space_margin` の線) で伸ばせない間は、 insert のたびに表を全部なめてから
+諦めていた (debug の build で 32768 slot の表をなめて 1 回 2 ms)。 新しい表の形 (大きさと置き場) は語数だけで決まるので、 先に
+決めて空きを確かめ、 足りなければなめずに戻る。 `issue317_sparse_pages` は 1 回 8 秒 → 0.15 秒。 この test は、 走っている間に
+ほかの process がディスクの空きを動かした回をやり直す形にした。 新しい Tag の値を入れ続ける insert は 0.993 倍、 同じ値を回す
+insert は 0.947 倍 (300 万行)。
+
+### Performance — schema の handle が表を借りる (#491、 #492)
+
+`Table` / `RowBuilder` / `Query` / `EntityRef` / `EntityUpdate` は `Arc<TableInner>` を持ち、 `get_table` / `insert` / `upsert` /
+`where_*` / `all` / `entity` のたびに clone して、 落とす時に数を戻していた。 全部の thread が同じ参照数 (1 本の cache line) を
+atomic に足し引きするので、 書き手や読み手を並べると取り合いになり、 1 本の時より遅くなった (書き手 8 本で 1 本の 0.86 倍)。
+handle は `Database` の持つ表を借りる (`&'a TableInner`)。 公開の型の形は変わらない。
+
+社員 100 万人の表 (`finish_concurrent()`): 書き手 8 本 (1 行 1 列の update) 5.25 → 32.1 M 回/秒 (6.49 倍)、 読み手 8 本
+(`where_eq().count()` と `entity().get()`) 3.78 → 68.0 M 回/秒 (17.9 倍)、 読み手 1 本 1.17 倍、 書き手 1 本 1.053 倍、 insert の
+1 行 0.999 倍、 1 本の問い (100 万行、 15 種類) の p50 0.980 倍。
+
+### Performance — 書き手の engine は WAL の flock を開いている間 1 回だけ取る (#493、 #494)
+
+WAL への追記は、 record を 1 件書くたびに WAL の file の flock を取って外していた (system call 2 回。 schema の 1 行の insert は
+record が 5 件で 10 回)。 この flock は別の process の同時 append 除けで (process の中の直列化は `append_lock`)、 書き手の process は
+`.db.lock` で 1 つなので、 書き手の engine が開いている間は要らない。 `OpLog::lock_session()` で開いている間ずっと持ち、 record
+ごとには取らない。 flock は開いた file ごとの lock で数えないので、 record ごとの guard が外すと開いている間の lock ごと外れる —
+「持っている」 印は `append_lock` の下で立て、 append も `append_lock` の下で見る。 engine は書き手の lock を持つ時だけ使う。
+
+社員 100 万人の表を WAL 付き (`finish_with_oplog(64 MB)`) で: 書き手 1 本 0.663 → 3.068 M 回/秒 (4.58 倍)、 書き手 8 本 0.191 →
+0.606 M 回/秒 (3.18 倍)。 1 行 1 commit の insert (5 列) 7047 → 1368 ns、 update (4 列) 8117 → 2537 ns、 delete 3134 → 1055 ns。
+WAL 付きの書き手 8 本は、 まだ 1 本より遅い (`append_lock` の取り合い)。
+
 ## 0.33.0 — 2026-10-16
 
 minor。 on-disk 形式・wire 形式は 0.32.3 と同じ (開き直しも sync もそのまま)。 order_by の決まり、 範囲の find の答えの並び、 範囲
