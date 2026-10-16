@@ -915,42 +915,6 @@ fn writer_lock_path_for(path: &str) -> std::path::PathBuf {
     crate::db_files::path_for(path, crate::db_files::LOCK)
 }
 
-/// `oplog_record_queue` (= bounded ArrayQueue) への blocking push。
-/// queue 満杯時は `yield_now` で consumer の進捗を待つ (issue4 backpressure)。
-/// #77-M2: consumer 死亡 (poisoned) 時は無限待ちせず panic で失敗する。
-/// push 成功時に `wal_push_count` を進める (flush_writes の WAL barrier 用)。
-#[inline]
-fn push_oplog_record_blocking(
-    wq: &crossbeam_queue::ArrayQueue<(enchudb_oplog::oplog::OwnedOp, enchudb_oplog::Hlc)>,
-    rec: enchudb_oplog::oplog::OwnedOp,
-    // request17-A3: push 側が採番した版数。 cell に書いたものと同一。
-    hlc: enchudb_oplog::Hlc,
-    poisoned: &std::sync::atomic::AtomicBool,
-    wal_push_count: &std::sync::atomic::AtomicU64,
-    // #391: 積んだら consumer を起こす
-    waker: Option<&crate::write_queue::ConsumerWaker>,
-) {
-    let mut rec = (rec, hlc);
-    loop {
-        match wq.push(rec) {
-            Ok(()) => {
-                wal_push_count.fetch_add(1, std::sync::atomic::Ordering::Release);
-                if let Some(w) = waker {
-                    w.wake();
-                }
-                return;
-            }
-            Err(returned) => {
-                if poisoned.load(std::sync::atomic::Ordering::Acquire) {
-                    panic!("enchudb consumer thread has panicked — WAL record queue is dead (#77-M2)");
-                }
-                rec = returned;
-                std::thread::yield_now();
-            }
-        }
-    }
-}
-
 /// 同一プロセス内で writer lock を保持中の lock path の registry (#80)。
 /// flock は open file description 単位なので、同一プロセスからの二重 open は
 /// block 検知できず無期限ハングになる。flock に入る前にここで fast-fail する。
@@ -3701,17 +3665,6 @@ pub struct Engine {
     /// request17 (v9): ローカル write が cell の版数判定で弾かれた warn の一度きり
     /// フラグ。 構造上起きないはずの事象なので、 起きたら無音にしない。
     warned_cell_version_reject: std::sync::atomic::AtomicBool,
-    /// request17 (A-3): **async write の HLC 事前採番と queue push を束ねる lock**。
-    ///
-    /// async 経路は「op の適用」も「WAL append」も consumer thread が後から行うため、
-    /// 版数は push 側で採番して両 queue に同じ値を運ぶしかない。 その採番順と queue
-    /// 投入順がずれると WAL 上で HLC が単調増加しなくなり、 **HLC 順に record を
-    /// 並べ替えて配る transport** の下で依存順 (Vocab → その vid を使う Tie) が逆転する
-    /// (#141 の誤 bind と同じ壊れ方)。 採番と push を 1 単位にして順序を固定する。
-    ///
-    /// 同期経路はこの lock を取らない (採番が `append` の直列化の内側にあるため
-    /// 構造的に単調 — `append_local_op` 参照)。
-    hlc_mint_lock: parking_lot::Mutex<()>,
     /// 背景 fsync が最後に completed した LSN。
     durable_lsn: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// #388: WAL が満杯にぶつかった書き手が、 consumer に畳むよう頼んでいる (`wait_for_wal_room`)。
@@ -4225,7 +4178,6 @@ impl Engine {
             sync_bridged: std::sync::atomic::AtomicU64::new(0),
             sync_bridged_durable: std::sync::atomic::AtomicU64::new(0),
             warned_cell_version_reject: std::sync::atomic::AtomicBool::new(false),
-            hlc_mint_lock: parking_lot::Mutex::new(()),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             wal_room_wanted: std::sync::atomic::AtomicBool::new(false),
             consumer_thread: std::sync::OnceLock::new(),
@@ -5385,7 +5337,6 @@ impl Engine {
             sync_bridged: std::sync::atomic::AtomicU64::new(0),
             sync_bridged_durable: std::sync::atomic::AtomicU64::new(0),
             warned_cell_version_reject: std::sync::atomic::AtomicBool::new(false),
-            hlc_mint_lock: parking_lot::Mutex::new(()),
             durable_lsn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             wal_room_wanted: std::sync::atomic::AtomicBool::new(false),
             consumer_thread: std::sync::OnceLock::new(),
@@ -6390,10 +6341,12 @@ impl Engine {
         self.bridge_pending_records.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// WAL append 失敗で **sync 経路から落ちた record 数**（観測用）。 平常時は 0。
+    /// WAL append 失敗で **sync 経路から落ちた record 数**（観測用）。 平常時は 0。 同期の書き込み (`tie_to` / `untie` / `delete`
+    /// など、 0.34 からは `*_async` も)・辞書の record・中継の write を数える (#454)。
     ///
-    /// #268: 落ちた record も table 本体には適用済みなので、 ローカルは正常に見えた
-    /// まま配布だけが欠ける。 0 でなければ 「その差分は peer に永久に届かない」。
+    /// #268: 落ちた record も table 本体には適用済みなので、 ローカルは正常に見えたまま配布だけが欠ける。 #57 から、 落ちた record
+    /// は author ごとの floor を上げて相手に取り直させる (bootstrap) ので、 届かないままにはならない。 0 でなければ、 相手が取り
+    /// 直しに回る (重い) ことがある。
     pub fn wal_dropped_records(&self) -> u64 {
         self.wal_dropped_records.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -8958,9 +8911,7 @@ impl Engine {
         // 署名対象 bytes を持つ record は **byte 単位の素通し** — 署名は LSN 込みの
         // 領域に掛かっているので、 再 encode すると必ず不一致になる。
         if !rec.signed_bytes.is_empty() {
-            return wal
-                .append_relayed_verbatim(&rec.signed_bytes, &rec.signature, &rec.pubkey_fp)
-                .is_ok();
+            return self.relayed(wal.append_relayed_verbatim(&rec.signed_bytes, &rec.signature, &rec.pubkey_fp));
         }
         // signed_bytes を持たない record (state 転写 #140 等) は op 再 encode で
         // relay する (署名なしなので一致性の問題はない)。
@@ -8999,7 +8950,21 @@ impl Engine {
             // 無限反響する。 group 境界は relay 自身の commit 周期で足りる。
             DecodedOp::Commit => return false,
         };
-        wal.append_relayed(op, header).is_ok()
+        self.relayed(wal.append_relayed(op, header))
+    }
+
+    /// #454: 中継の append の結果。 落ちたら数える。
+    fn relayed(&self, r: std::io::Result<u64>) -> bool {
+        match r {
+            Ok(_) => {
+                self.wal_append_recovered();
+                true
+            }
+            Err(e) => {
+                self.note_wal_records_dropped(1, &e);
+                false
+            }
+        }
     }
 
     /// **pre-v9 DB の版数置き場**への参照 (legacy)。 v9 DB では空のまま
@@ -9068,13 +9033,6 @@ impl Engine {
         enchudb_oplog::make_eid(peer, local)
     }
 
-    /// async write 用: 「版数の採番」と「2 本の queue への push」を 1 単位にする guard。
-    /// oplog 無効なら版数は常に `Hlc::ZERO` で並び順に意味が無いので lock を取らない。
-    #[inline]
-    fn mint_guard(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
-        self.oplog.as_ref().map(|_| self.hlc_mint_lock.lock())
-    }
-
     #[inline]
     fn append_local_op(&self, op: enchudb_oplog::oplog::Op<'_>) -> enchudb_oplog::Hlc {
         match self.oplog.as_ref() {
@@ -9082,9 +9040,35 @@ impl Engine {
             // 古い write に負ける)。 その HLC は WAL が落ちた record として覚えた値 (後で採番し直すと、
             // その間に bridge が floor を決めて版数が floor を越える)。 bridge が floor を上げる
             Some(wal) => match wal.append_or_dropped(op) {
-                Ok((_, h)) | Err((_, h)) => h,
+                Ok((_, h)) => {
+                    self.wal_append_recovered();
+                    h
+                }
+                Err((e, h)) => {
+                    // #454: 同期の書き込みで落ちた record も数える
+                    self.note_wal_records_dropped(1, &e);
+                    h
+                }
             },
             None => enchudb_oplog::Hlc::ZERO,
+        }
+    }
+
+    /// #268: append が通った。 落ちていた episode の後なら、 次の episode でまた 1 行警告できるよう戻す (立っている時だけ書く:
+    /// 書き込みのたびに共有の flag へ store すると、 書き手を並べた時に cache line を取り合う)。
+    #[inline]
+    fn wal_append_recovered(&self) {
+        use std::sync::atomic::Ordering;
+        if self.wal_append_warned.load(Ordering::Relaxed) {
+            self.wal_append_warned.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// #454: cell を持たない record (Vocab) を同期の書き込みの中で積む。 落ちたら数える。
+    fn append_vocab_record(&self, wal: &enchudb_oplog::oplog::OpLog, vid: u32, bytes: &[u8]) {
+        match wal.append(enchudb_oplog::oplog::Op::Vocab { vid, bytes }) {
+            Ok(_) => self.wal_append_recovered(),
+            Err(e) => self.note_wal_records_dropped(1, &e),
         }
     }
 
@@ -11195,7 +11179,7 @@ impl Engine {
             let oplog_eid = self.oplog_eid(eid);
             if let Some(wal) = self.oplog.as_ref() {
                 // Vocab は cell を持たない (= 版数の対象外)。
-                let _ = wal.append(enchudb_oplog::oplog::Op::Vocab { vid, bytes: value.as_bytes() });
+                self.append_vocab_record(wal, vid, value.as_bytes());
             }
             self.append_local_op(
                 enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid as u64 },
@@ -11352,7 +11336,7 @@ impl Engine {
             let oplog_eid = self.oplog_eid(eid);
             if let Some(wal) = self.oplog.as_ref() {
                 // Vocab は cell を持たない (= 版数の対象外)。
-                let _ = wal.append(enchudb_oplog::oplog::Op::Vocab { vid, bytes: value });
+                self.append_vocab_record(wal, vid, value);
             }
             if self.himo_is_content(hid) {
                 // 0.9.0: 動的 content himo は id が peer 間で揃わないため名前で運ぶ
@@ -16506,23 +16490,20 @@ impl Engine {
         }
     }
 
-    /// 非同期 tie。`create_concurrent`/`concurrentize` で有効化済みの場合のみ使える。
-    /// 紐名は事前に `define_himo` で定義されている必要がある。
-    /// WriteQueue は SegQueue(unbounded)なので push は必ず成功する。
+    /// 呼んだ thread がその場で書く (`tie_to` と同じ道)。 返った時には本体に当たっていて、 WAL 付きの engine なら WAL にも
+    /// 載っている。 紐名は事前に `define_himo` で定義されている必要がある。
     ///
-    /// WAL が有効な場合: tie_async は WAL append (memcpy) → WriteQueue push の順で実行する。
-    /// WAL append は `.wal` ファイルに memcpy 1 回、100ns オーダー。hot path で fsync しない。
+    /// 0.33 までは write queue に積んで裏の consumer thread が後から当てていた (返った後の読みは `flush_writes` で待つ)。
+    /// 書き込みの道を 1 本にするため、 その場で書く形に変えた。 名前は互換のために残す (新しいコードは `tie_to` を使う)。
     pub fn tie_async(&self, eid: enchudb_oplog::EntityId, himo: &str, value: impl CellValue) {
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo)) as u16;
         self.tie_async_by_id(eid, hid, value);
     }
 
-    /// `tie_async` の himo_id 直指定版。 SNS の post / like 投入のように row/sec が KO
-    /// 単位の hot path 用 (per-call の `himo_id(&str)` string lookup を消す)。
-    /// 起動時に `himo_id(&str)` で u16 を 1 回引いて cache し、 hot loop で繰り返し使う想定。
+    /// `tie_async` の himo_id 直指定版 (`tie_to_by_id` と同じ道)。 entity が紐の table の範囲の外、 または Ref の行き先が
+    /// 行き先の table の範囲の外なら panic する (今まで通り。 `tie_to_by_id` は確かめない)。
     pub fn tie_async_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: impl CellValue) {
-        use std::sync::atomic::Ordering;
         self.check_writable();
         let local = enchudb_oplog::eid_local(eid);
         // #59: 列の幅に入らない値 (sentinel 含む) は拒否 + 計上
@@ -16538,52 +16519,11 @@ impl Engine {
         // β-light step 5: Ref himo の FK validation (非 Ref は即 return で
         // ~1 ns、 Ref で fk_refs entry なしも同じ)
         self.validate_ref_tie(himo_id as usize, value as u32); // Ref の列は u32
-        // #381: Tag の列なら、 適用するまでの間に回収されないよう番号を押さえる (適用した後で返す)
-        if self.vocab.reclaim_enabled()
-            && self.value_types[himo_id as usize] == ValueType::Tag
-            && !self.vocab.acquire(value as u32)
-        {
-            self.record_fault(FaultKind::StaleValue, "Tag の値の番号が古い (語が回収された) — write rejected");
-            return;
-        }
-        // #77-H4: op を write_queue へ push してから WAL record を push する。
-        // 逆順 (record 先) だと 2 push の間で preempt された場合、 consumer が
-        // record を fsync + checkpoint した時点で op が未適用となり、 crash で
-        // 「fsync 済みの write」が replay 対象外になって消えた。 op 先行なら
-        // consumer が wq drain で record を見た時点で op は必ず queue に居て、
-        // 同 tick の q drain (wq の後) で適用される。
-        //
-        // request17 step 4 (A-3): 版数は **push 側で 1 回だけ**採番し、 write_queue の
-        // op と WAL record の両方に同じ値を運ぶ。 適用も append も consumer thread が
-        // 後から別々に行うため、 どちらかで採番し直すと cell の版数と配った版数がずれる。
-        // 採番と 2 本の queue push は 1 単位 (`hlc_mint_lock` の doc 参照)。
-        let _mint = self.mint_guard();
-        let hlc = self.mint_local_hlc();
-        let q = self.write_queue.as_ref()
-            .expect("tie_async requires create_concurrent or concurrentize");
-        q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value, hlc });
-        self.push_count.fetch_add(1, Ordering::Release);
-        if let Some(wal) = self.oplog.as_ref() {
-            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
-            let rec = enchudb_oplog::oplog::OwnedOp::Tie { eid: oplog_eid, himo_id, value };
-            if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec, hlc, &self.consumer_poisoned, &self.wal_push_count, self.consumer_waker());
-            } else {
-                let _ = wal.append_at_hlc(rec.as_op(), hlc);
-            }
-        }
+        let _ = self.try_tie_to_by_id(eid, himo_id, value);
     }
 
-    /// 非同期 tie_text。text 値を vocab に挿入し、WAL に Vocab + Tie の 2 op を流す。
-    ///
-    /// 流れ:
-    /// 1. local vocab に bytes を get_or_insert → `local_vid`
-    /// 2. WAL に `Vocab { vid: local_vid, bytes }` を append
-    ///    - receiver 側でこれを受けると `(author_peer, vid) → receiver_local_vid` の mapping が張られる
-    /// 3. WAL に `Tie { eid, himo_id, value: local_vid }` を append
-    /// 4. write_queue に Tie push で本体に apply
-    ///
-    /// `Engine::tie_text` の &self 版。`tie_async` と異なり text を sync 対象に乗せる。
+    /// 呼んだ thread がその場で書く text 版 (`tie_text_to` と同じ道。 `tie_async` の doc を参照)。 Tag は辞書に入れ、 WAL には
+    /// `Vocab` → `Tie` の順に載せる (受け手で `(author_peer, vid)` → 受け手の vid の対応が先に張られる)。
     pub fn tie_text_async(&self, eid: enchudb_oplog::EntityId, himo: &str, value: &str) {
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo)) as u16;
@@ -16595,9 +16535,9 @@ impl Engine {
         self.tie_bytes_async_by_id(eid, himo_id, value.as_bytes());
     }
 
-    /// `tie_text_async_by_id` の bytes 版 (0.9.0: content 互換層も使う)。
+    /// `tie_text_async_by_id` の bytes 版 (0.9.0: content 互換層も使う)。 `tie_bytes_to_by_id` と同じ道。 entity が紐の table の
+    /// 範囲の外なら panic する (今まで通り)。
     pub fn tie_bytes_async_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, value: &[u8]) {
-        use std::sync::atomic::Ordering;
         self.check_writable();
         let local = enchudb_oplog::eid_local(eid);
         let hid = himo_id as usize;
@@ -16605,113 +16545,21 @@ impl Engine {
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         // β-light step 6: eid が himo の所属 table eid_range 内か
         self.validate_eid_for_himo(hid, local);
-        // v6 (#88): Leaf は LeafStore へ。 offset を write_queue の value に載せ、
-        // WAL には bytes 同乗 TieLeaf を流す。 旧 offset の free は apply_op::Tie 側
-        // (= 適用時点の cell を見る。 push 時 free は queue 未適用の二重 free を招く)。
-        if let Some(leaf) = self.leaf_for(hid) {
-            let off = leaf.insert(value);
-            if off == u32::MAX {
-                // #167: leaf payload を書けなかった (commit を伸ばせない = ディスク
-                // 満杯)。 sentinel を cell に書くと read が壊れるので write を拒否。
-                self.record_fault(
-                    FaultKind::DiskSpace,
-                    "leaf payload の格納に必要な commit を伸ばせない — text write を拒否",
-                );
-                return;
-            }
-            // request17 step 4: push 側で採番、 op と record に同じ版数を載せる。
-            // 採番 → push は `hlc_mint_lock` で 1 単位に。
-            let _mint = self.mint_guard();
-            let hlc = self.mint_local_hlc();
-            let q = self.write_queue.as_ref()
-                .expect("tie_bytes_async requires create_concurrent or concurrentize");
-            q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value: off as u64, hlc });
-            self.push_count.fetch_add(1, Ordering::Release);
-            if let Some(wal) = self.oplog.as_ref() {
-                let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
-                let rec = enchudb_oplog::oplog::OwnedOp::TieLeaf {
-                    eid: oplog_eid,
-                    himo_name: self.himo_names[hid].clone(),
-                    himo_kind: self.value_types[hid] as u8,
-                    bytes: value.to_vec(),
-                };
-                if let Some(wq) = self.oplog_record_queue.as_ref() {
-                    push_oplog_record_blocking(wq, rec, hlc, &self.consumer_poisoned, &self.wal_push_count, self.consumer_waker());
-                } else {
-                    let _ = wal.append_at_hlc(rec.as_op(), hlc);
-                }
-            }
-            return;
-        }
-        // Tag は dedupe、Leaf は常に新規 id。
-        let vid = match self.value_types[hid] {
-            ValueType::Tag => {
-                // #381: 書くまでの間に回収されないよう押さえる (書いた後 / 適用した後で `vocab_unpin`)
-                self.step_vocab_refs();
-                self.vocab.try_get_or_insert_pinned(value)
-            }
-            ValueType::Leaf => self.vocab.try_insert(value),
-            ht => panic!("tie_bytes_async_by_id on non-text himo_id {}: {:?}", himo_id, ht),
-        };
-        // #59 / #316: 入れられなければ write を拒否 + 計上 (一杯と空き不足を分ける)
-        let vid = match vid {
-            Ok(v) => v,
-            Err(f) => {
-                self.vocab_rejected(f);
-                return;
-            }
-        };
-        // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
-        // request17 step 4: Vocab は cell を持たない (= 版数の対象外) が、 record queue は
-        // 版数付きで運ぶので Tie の手前で 1 個採番しておく (WAL 上の並びと HLC の
-        // 並びを揃える)。
-        let _mint = self.mint_guard();
-        let vocab_hlc = self.mint_local_hlc();
-        let hlc = self.mint_local_hlc();
-        let q = self.write_queue.as_ref()
-            .expect("tie_text_async requires create_concurrent or concurrentize");
-        q.push(crate::write_queue::Op::Tie { eid: local, himo_id, value: vid as u64, hlc });
-        self.push_count.fetch_add(1, Ordering::Release);
-        if let Some(wal) = self.oplog.as_ref() {
-            // Vocab op を先に(sync の receiver 側で Tie より先に mapping が張られるよう)
-            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
-            let vocab_rec = enchudb_oplog::oplog::OwnedOp::Vocab { vid, bytes: value.to_vec() };
-            let tie_rec = if self.himo_is_content(hid) {
-                // 0.9.0: 動的 content himo は id が peer 間で揃わないため名前で運ぶ
-                enchudb_oplog::oplog::OwnedOp::TieNamed {
-                    eid: oplog_eid,
-                    himo_name: self.himo_names[hid].clone(),
-                    himo_kind: self.value_types[hid] as u8,
-                    value: vid as u64,
-                }
-            } else {
-                enchudb_oplog::oplog::OwnedOp::Tie { eid: oplog_eid, himo_id, value: vid as u64 }
-            };
-            if let Some(wq) = self.oplog_record_queue.as_ref() {
-                // Vocab → Tie の順を保つため同一 thread から連続 push
-                push_oplog_record_blocking(wq, vocab_rec, vocab_hlc, &self.consumer_poisoned, &self.wal_push_count, self.consumer_waker());
-                push_oplog_record_blocking(wq, tie_rec, hlc, &self.consumer_poisoned, &self.wal_push_count, self.consumer_waker());
-            } else {
-                let _ = wal.append_at_hlc(vocab_rec.as_op(), vocab_hlc);
-                let _ = wal.append_at_hlc(tie_rec.as_op(), hlc);
-            }
-        }
+        self.tie_bytes_to_by_id(eid, himo_id, value);
     }
 
-    /// 非同期 tie_ref。target_eid の local 部(u32)を WAL / 本体に運ぶ。
-    /// target_eid は u64 [peer|local] だが、現行 WAL は value: u32 しか運べないため
-    /// peer_id 部は捨てる。すなわち receiver 側では「author_peer と同一 peer 上の entity」を
-    /// 指す ref として再構成される。cross-peer ref (peer A が peer B の entity を指す)は
-    /// 現状未対応 (Ref 用 WAL op を別途用意する必要あり)。
+    /// 呼んだ thread がその場で書く ref 版 (`tie_ref_to` と同じ道。 `tie_async` の doc を参照)。 target_eid の local 部 (u32) を
+    /// WAL / 本体に運ぶ。 target_eid は u64 [peer|local] だが、 WAL は value: u32 しか運べないため peer_id 部は捨てる。 すなわち
+    /// 受け手では 「author_peer と同じ peer 上の entity」 を指す ref として組み直される (cross-peer ref は未対応)。
     pub fn tie_ref_async(&self, eid: enchudb_oplog::EntityId, himo: &str, target_eid: enchudb_oplog::EntityId) {
         let hid = self.himo_id(himo)
             .unwrap_or_else(|| panic!("himo '{}' not defined", himo)) as u16;
         self.tie_ref_async_by_id(eid, hid, target_eid);
     }
 
-    /// `tie_ref_async` の himo_id 直指定版。
+    /// `tie_ref_async` の himo_id 直指定版 (`tie_ref_to_by_id` と同じ道)。 entity が紐の table の範囲の外、 または行き先が行き先の
+    /// table の範囲の外なら panic する (今まで通り)。
     pub fn tie_ref_async_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16, target_eid: enchudb_oplog::EntityId) {
-        use std::sync::atomic::Ordering;
         self.check_writable();
         let local = enchudb_oplog::eid_local(eid);
         let target_local = enchudb_oplog::eid_local(target_eid);
@@ -16728,85 +16576,27 @@ impl Engine {
         self.validate_eid_for_himo(himo_id as usize, local);
         // β-light step 5: target_eid が target_table の eid range 内か
         self.validate_ref_tie(himo_id as usize, target_local);
-        // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
-        // request17 step 4: push 側で採番、 op と record に同じ版数 (採番 → push は 1 単位)。
-        let _mint = self.mint_guard();
-        let hlc = self.mint_local_hlc();
-        let q = self.write_queue.as_ref()
-            .expect("tie_ref_async requires create_concurrent or concurrentize");
-        q.push(crate::write_queue::Op::Tie {
-            eid: local, himo_id, value: target_local as u64, hlc,
-        });
-        self.push_count.fetch_add(1, Ordering::Release);
-        if let Some(wal) = self.oplog.as_ref() {
-            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
-            let rec = enchudb_oplog::oplog::OwnedOp::Tie {
-                eid: oplog_eid, himo_id, value: target_local as u64,
-            };
-            if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec, hlc, &self.consumer_poisoned, &self.wal_push_count, self.consumer_waker());
-            } else {
-                let _ = wal.append_at_hlc(rec.as_op(), hlc);
-            }
-        }
+        let _ = self.try_tie_ref_to_by_id(eid, himo_id, target_eid);
     }
 
-    /// 非同期 untie。
+    /// 呼んだ thread がその場で外す (`untie` と同じ道。 `tie_async` の doc を参照)。
     pub fn untie_async(&self, eid: enchudb_oplog::EntityId, himo: &str) {
         let hid = match self.himo_id(himo) { Some(x) => x as u16, None => return };
         self.untie_async_by_id(eid, hid);
     }
 
-    /// `untie_async` の himo_id 直指定版。
+    /// `untie_async` の himo_id 直指定版 (`untie_by_id` と同じ道)。
     pub fn untie_async_by_id(&self, eid: enchudb_oplog::EntityId, himo_id: u16) {
-        use std::sync::atomic::Ordering;
-        self.check_writable();
-        let local = enchudb_oplog::eid_local(eid);
-        debug_assert!((himo_id as usize) < self.himos.len(),
-            "himo_id {} out of range (max {})", himo_id, self.himos.len());
-        if (himo_id as usize) >= self.himos.len() { return; }
-        // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
-        // request17 step 4: untie も版数を進める (push 側で採番、 採番 → push は 1 単位)。
-        let _mint = self.mint_guard();
-        let hlc = self.mint_local_hlc();
-        let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
-        q.push(crate::write_queue::Op::Untie { eid: local, himo_id, hlc });
-        self.push_count.fetch_add(1, Ordering::Release);
-        if let Some(wal) = self.oplog.as_ref() {
-            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
-            let rec = enchudb_oplog::oplog::OwnedOp::Untie { eid: oplog_eid, himo_id };
-            if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec, hlc, &self.consumer_poisoned, &self.wal_push_count, self.consumer_waker());
-            } else {
-                let _ = wal.append_at_hlc(rec.as_op(), hlc);
-            }
-        }
+        self.untie_by_id(eid, himo_id);
     }
 
-    /// 非同期 delete。
+    /// 呼んだ thread がその場で消す (`delete` と同じ道。 `tie_async` の doc を参照)。
     pub fn delete_async(&self, eid: enchudb_oplog::EntityId) {
-        use std::sync::atomic::Ordering;
-        self.check_writable();
-        let local = enchudb_oplog::eid_local(eid);
-        // #77-H4: op 先行 push (tie_async_by_id と同じ理由)
-        // request17 step 4 (A-5): delete の版数は tombstone column へ (適用は consumer)。
-        let _mint = self.mint_guard();
-        let hlc = self.mint_local_hlc();
-        let q = match self.write_queue.as_ref() { Some(x) => x, None => return };
-        q.push(crate::write_queue::Op::Delete { eid: local, hlc });
-        self.push_count.fetch_add(1, Ordering::Release);
-        if let Some(wal) = self.oplog.as_ref() {
-            let oplog_eid = enchudb_oplog::make_eid(wal.peer_id(), local);
-            let rec = enchudb_oplog::oplog::OwnedOp::Delete { eid: oplog_eid };
-            if let Some(wq) = self.oplog_record_queue.as_ref() {
-                push_oplog_record_blocking(wq, rec, hlc, &self.consumer_poisoned, &self.wal_push_count, self.consumer_waker());
-            } else {
-                let _ = wal.append_at_hlc(rec.as_op(), hlc);
-            }
-        }
+        self.delete(eid);
     }
 
-    /// 非同期 content 書き込み。WAL 有効時はクラッシュ後も復元される。
+    /// 呼んだ thread がその場で書く content (`content` と同じく `_c_{key}` の Leaf の紐へ。 `tie_async` の doc を参照)。
+    /// WAL 有効時はクラッシュ後も復元される。
     ///
     /// 0.9.0: 保存先を `_c_{key}` Leaf himo に変更 (`content` の doc 参照)。
     /// WAL には `Op::Content` ではなく通常の `Op::Vocab` + `Op::Tie` が乗る。

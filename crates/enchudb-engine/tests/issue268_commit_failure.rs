@@ -184,3 +184,52 @@ fn records_dropped_from_the_sync_path_are_counted_not_just_warned_once() {
     drop(eng);
     let _ = std::fs::remove_dir_all(&path);
 }
+
+/// #454: 同期の API (`tie_to_by_id`、 Tag の列への `tie_text_to_by_id`) で書いて WAL から落ちた record も数える。 前は
+/// `tie_async` の道 (consumer がまとめて載せる) の失敗だけを数え、 同期の API で書くアプリは満杯で落ちていても
+/// `wal_dropped_records()` で気付けなかった。 Tag の新しい語は辞書の record (`Vocab`) と `Tie` の 2 件を積むので、 満杯なら
+/// 2 件とも落ちて 2 件数える。 対照: 満杯になる前は 0。
+#[test]
+fn records_dropped_from_the_sync_api_are_counted() {
+    let path = tmp("dropped-sync");
+    let _ = std::fs::remove_dir_all(&path);
+    {
+        let mut eng = Engine::create_standalone(&path).unwrap();
+        eng.define_table("rows", 1_000).unwrap();
+        eng.define_himo_in("rows", "val", ValueType::Number, 1_000).unwrap();
+        eng.define_himo_in("rows", "name", ValueType::Tag, 0).unwrap();
+        eng.enable_sync_tables().unwrap();
+        eng.flush().unwrap();
+    }
+    let eng = Engine::open_concurrent_with_oplog(&path, 8 * 1024).unwrap();
+    eng.set_peer_id(1);
+    let val = eng.himo_id("rows.val").unwrap() as u16;
+    let name = eng.himo_id("rows.name").unwrap() as u16;
+    let e = eng.entity_in("rows").unwrap();
+    eng.tie_to_by_id(e, val, 1u32);
+    assert_eq!(eng.wal_dropped_records(), 0, "対照: 満杯になる前は 0");
+
+    // Commit を打てない = 畳めないので、 書き続ければ必ず満杯になる
+    eng.oplog().unwrap().fail_next_commits(u32::MAX);
+    let mut i = 0u32;
+    assert!(
+        until(|| {
+            for _ in 0..32 {
+                let e = eng.entity_in("rows").unwrap();
+                eng.tie_to_by_id(e, val, i);
+                i += 1;
+            }
+            eng.wal_dropped_records() > 0
+        }),
+        "同期の tie_to で落ちた record が数えられていない (free={} bytes)",
+        eng.wal_free_bytes(),
+    );
+    let before = eng.wal_dropped_records();
+    let e = eng.entity_in("rows").unwrap();
+    eng.tie_text_to_by_id(e, name, "a-brand-new-word");
+    assert_eq!(eng.wal_dropped_records() - before, 2, "Tag の新しい語は Vocab と Tie の 2 件が落ちる");
+
+    eng.oplog().unwrap().fail_next_commits(0);
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&path);
+}
