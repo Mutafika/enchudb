@@ -1,5 +1,8 @@
-//! #391: 何も書いていない間、 consumer thread は寝ている (旧: 1 ms ごとに起きて見回り)。 書き手が積んだ / WAL に
-//! 書いた / 閉じる時に起こされ、 書き出し (100 ms ごと) や畳みが残っている間だけ時間で起きる。
+//! #391: 何も書いていない間、 consumer thread は寝ている (旧: 1 ms ごとに起きて見回り)。 WAL に書いた / 閉じる時に
+//! 起こされ、 書き出し (100 ms ごと) や畳みが残っている間だけ時間で起きる。
+//!
+//! 0.34 から `*_async` の書き込みは呼んだ thread がその場で書く (consumer に渡さない)。 なので 「consumer が起こされずに
+//! 積んだ書き込みが当たらない」 ことは起きなくなり、 その形を見ていた 2 本は 「返った時に見える」 を見る形にした。
 
 use enchudb_engine::{Engine, ValueType};
 use std::sync::Arc;
@@ -120,60 +123,46 @@ fn drop_wakes_a_sleeping_consumer() {
     }
 }
 
-/// oplog の無い DB でも、 寝ている consumer は async の書き込みで起きる (起こすのは queue に積んだ時だけ)。
+/// consumer が寝ている時に async で書いても、 返った時に見える (`flush_writes` を待たない)。 oplog の有り無しの両方。
+/// 前は async の書き込みを consumer が当てていたので、 寝ている consumer を起こし損ねると当たらなかった (0.34 から
+/// 呼んだ thread がその場で書く)。
 #[test]
-fn async_write_wakes_without_oplog() {
-    let path = tmp("wake-nooplog");
-    let eng = engine(&path, false);
-    let k = eng.himo_id("k").unwrap() as u16;
-    for round in 0..3u32 {
-        std::thread::sleep(Duration::from_millis(200));
-        let a = eng.entity().unwrap();
-        eng.tie_async_by_id(a, k, round);
-        let started = Instant::now();
-        eng.flush_writes();
-        assert!(started.elapsed() < Duration::from_millis(500), "寝ている consumer が起きない");
-        assert_eq!(eng.get(a, "k"), Some(round as u64));
+fn async_write_after_idle_is_visible_on_return() {
+    for oplog in [false, true] {
+        let path = tmp(if oplog { "visible-idle" } else { "visible-idle-nooplog" });
+        let eng = engine(&path, oplog);
+        let k = eng.himo_id("k").unwrap() as u16;
+        for round in 0..3u32 {
+            // consumer が寝に入るのを待つ
+            std::thread::sleep(Duration::from_millis(200));
+            let a = eng.entity().unwrap();
+            eng.tie_async_by_id(a, k, round);
+            assert_eq!(eng.get(a, "k"), Some(round as u64), "oplog {oplog}: 返った時に見えない");
+        }
+        drop(eng);
+        cleanup(&path);
     }
-    drop(eng);
-    cleanup(&path);
 }
 
-/// consumer が寝に入る瞬間に書き手が積む形を連打する: async の書き込みを 1 つ積んでは適用を待つ。 起こし損ねると
-/// (寝る前に仕事を見直さない / record の queue に積んでも起こさない)、 consumer は次に起こされるまで寝たままで
-/// `flush_writes` が返らない。 確率的: 寝る前の見直しを外した変異は 4 回中 3 回検出した。 record の queue に積んだ時の
-/// 起こしを外した変異はこのテストでは踏めない (op を積んだ時の起こしで consumer が起き、 窓は 「畳み終えた後に op と
-/// record の間で寝に入る」 時だけ)。
+/// async の書き込みを連打しても、 1 つずつ返った時に見える (`flush_writes` を待たない)。 前は consumer が寝に入る瞬間に
+/// 積むと起こし損ねることがあり (寝る前の見直しを外した変異で 4 回中 3 回)、 2026-10-16 に手元の CI で 2 回 60 秒の打ち切りで
+/// 落ちた (oplog の無い形)。 0.34 から async の書き込みは呼んだ thread がその場で書くので、 待つ相手が居ない。
 #[test]
-fn back_to_back_writes_never_strand_the_consumer() {
+fn back_to_back_async_writes_are_visible_on_return() {
     for oplog in [false, true] {
         let path = tmp(if oplog { "race" } else { "race-nooplog" });
         let eng = engine(&path, oplog);
         let k = eng.himo_id("k").unwrap() as u16;
         let a = eng.entity().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let worker = {
-            let eng = eng.clone();
-            std::thread::spawn(move || {
-                // oplog の無い DB は 1 回 4 µs ほどなので多めに回す (寝る前の見直しを外した変異の検出率を上げる)
-                let n = if oplog { 20_000u32 } else { 200_000 };
-                for i in 0..n {
-                    // 積むタイミングを少しずつずらして、 consumer が寝に入る窓をなめる
-                    for _ in 0..(i % 97) * 8 {
-                        std::hint::spin_loop();
-                    }
-                    eng.tie_async_by_id(a, k, i);
-                    eng.flush_writes();
-                }
-                tx.send(()).unwrap();
-            })
-        };
-        assert!(
-            rx.recv_timeout(Duration::from_secs(60)).is_ok(),
-            "oplog {oplog}: 積んだ書き込みが適用されないまま止まった (consumer を起こし損ねた)"
-        );
-        worker.join().unwrap();
-        assert_eq!(eng.get(a, "k"), Some(if oplog { 19_999 } else { 199_999 }));
+        let n = if oplog { 20_000u32 } else { 200_000 };
+        for i in 0..n {
+            // 書くタイミングを少しずつずらす (前の形の窓をなめる並べ方のまま)
+            for _ in 0..(i % 97) * 8 {
+                std::hint::spin_loop();
+            }
+            eng.tie_async_by_id(a, k, i);
+            assert_eq!(eng.get(a, "k"), Some(i as u64), "oplog {oplog}: {i} 回目が返った時に見えない");
+        }
         drop(eng);
         cleanup(&path);
     }
