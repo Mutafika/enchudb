@@ -711,7 +711,7 @@ impl Database {
     pub fn get_table<'a>(&'a self, name: &str) -> Option<Table<'a>> {
         self.tables.iter()
             .find(|t| t.name.eq_ignore_ascii_case(name))
-            .map(|t| Table { db: self, inner: t.clone() })
+            .map(|t| Table { db: self, inner: t })
     }
 
     /// 既存 table に column を追加。 同名 column が既にあれば idempotent に成功で
@@ -1513,14 +1513,16 @@ impl<'a> TableBuilder<'a> {
                     let orders = check_orders(&cols, &orders)?;
                     sync_orders(&db.eng, &existing, &orders)?;
                 }
-                return Ok(Table { db, inner: existing });
+                drop(existing);
+                return built_handle(db, &name);
             }
             let orders = check_orders(&declared, &orders)?;
             let inner = db.migrate_existing_table(
                 existing, &col_specs, pk.as_deref(), &relations,
             )?;
             sync_orders(&db.eng, &inner, &orders)?;
-            return Ok(Table { db, inner });
+            drop(inner);
+            return built_handle(db, &name);
         }
 
         // issue #61: 名前に sidecar 区切り文字が入ると round-trip で schema が壊れる。
@@ -1655,8 +1657,15 @@ impl<'a> TableBuilder<'a> {
         // finish_with_oplog / finish_concurrent の冒頭で 1 度 persist する、
         // finish 経由しない drop path は Drop impl が safety net で persist。
 
-        Ok(Table { db, inner })
+        drop(inner);
+        built_handle(db, &name)
     }
+}
+
+/// 作った (または合わせた) 表の handle。 `db.tables` に置いた表を借りる (handle ごとに `Arc` を数えない: 書き手や読み手を並べた時に
+/// 参照数の cache line を取り合わないため)。
+fn built_handle<'a>(db: &'a Database, name: &str) -> Result<Table<'a>, SchemaError> {
+    db.get_table(name).ok_or_else(|| SchemaError::Internal(format!("table {name} is missing right after it was built")))
 }
 
 /// `.order(...)` の宣言を検査して engine の値にする: (via 列, key 列, 目盛り (engine の値))。 列は `cols` (名前, 型)
@@ -1732,7 +1741,7 @@ fn sync_orders(eng: &Engine, t: &TableInner, orders: &[(String, String, Vec<u64>
 #[derive(Clone)]
 pub struct Table<'a> {
     db: &'a Database,
-    inner: Arc<TableInner>,
+    inner: &'a TableInner,
 }
 
 impl<'a> Table<'a> {
@@ -1751,7 +1760,7 @@ impl<'a> Table<'a> {
     pub fn insert(&self) -> RowBuilder<'a> {
         RowBuilder {
             db: self.db,
-            table: self.inner.clone(),
+            table: self.inner,
             values: Vec::new(),
             replace_on_pk: false,
         }
@@ -1766,28 +1775,28 @@ impl<'a> Table<'a> {
 
     /// `WHERE col = val` 単一条件 query 開始。
     pub fn where_eq<V: Into<Value>>(&self, col: &str, val: V) -> Query<'a> {
-        Query::new(self.db, self.inner.clone()).where_eq(col, val)
+        Query::new(self.db, self.inner).where_eq(col, val)
     }
 
     /// `WHERE col >= lo AND col <= hi` 範囲 query 開始 (inclusive)。 `lo` / `hi` は整数 (u32 / i32 / i64)。
     pub fn where_range<V: Into<Value>>(&self, col: &str, lo: V, hi: V) -> Query<'a> {
-        Query::new(self.db, self.inner.clone()).where_range(col, lo, hi)
+        Query::new(self.db, self.inner).where_range(col, lo, hi)
     }
 
     /// `WHERE col = target_eid` ref-typed カラム経由の逆引き。
     pub fn where_ref(&self, col: &str, target: EntityId) -> Query<'a> {
-        Query::new(self.db, self.inner.clone()).where_ref(col, target)
+        Query::new(self.db, self.inner).where_ref(col, target)
     }
 
     /// `WHERE col IN (v1, v2, ...)` set-membership。
     /// Integer / Ref 列向け。 Text 列は別途 helper が必要 (vocab_id 解決のため)。
     pub fn where_in(&self, col: &str, values: &[u32]) -> Query<'a> {
-        Query::new(self.db, self.inner.clone()).where_in(col, values)
+        Query::new(self.db, self.inner).where_in(col, values)
     }
 
     /// 全 row (WHERE 無し相当)。
     pub fn all(&self) -> Query<'a> {
-        Query::new(self.db, self.inner.clone())
+        Query::new(self.db, self.inner)
     }
 
     /// この table の row を **新しい順** (insert した逆順) に最大 `n` 件 (#21)。
@@ -1810,7 +1819,7 @@ impl<'a> Table<'a> {
 
     /// 既存 entity への accessor。 存在チェックはしない、 get で None が返れば未 tie。
     pub fn entity(&self, eid: EntityId) -> EntityRef<'a> {
-        EntityRef { db: self.db, table: self.inner.clone(), eid }
+        EntityRef { db: self.db, table: self.inner, eid }
     }
 
     // ──── bindings: 列名 / table 識別子から build 時 pre-resolve 済みの ID を引く ────
@@ -1959,7 +1968,7 @@ impl<'a> Table<'a> {
 
 pub struct RowBuilder<'a> {
     db: &'a Database,
-    table: Arc<TableInner>,
+    table: &'a TableInner,
     values: Vec<(String, Value)>,
     replace_on_pk: bool,
 }
@@ -2507,7 +2516,7 @@ impl<'a> JoinQuery<'a> {
                 let Some(cd) = cd.filter(|_| points) else {
                     return bad(format!("join_ref: {col} is not a ref column of {} pointing to {}", self.left.table.name, self.right.table.name));
                 };
-                let all = Query::new(self.right.db, self.right.table.clone());
+                let all = Query::new(self.right.db, self.right.table);
                 let (Some(mut l), Some(r), Some(rows)) = (self.left.live_preds()?, self.right.live_preds()?, all.live_preds()?) else { return Ok(None) };
                 l.extend(r.into_iter().map(|p| enchudb_engine::LivePred::Via { path: vec![cd.himo_id], pred: Box::new(p) }));
                 Ok(Some(JoinPlan::Ref { preds: l, via: cd.himo_id, right: rows }))
@@ -2593,7 +2602,7 @@ impl<'a> JoinQuery<'a> {
                     return Err(bad("join subscribe_counts: cannot group by a Leaf column".into()));
                 }
                 let sum = match sum_col {
-                    Some(sc) => Some(num(&self.left.table, sc).ok_or_else(|| {
+                    Some(sc) => Some(num(self.left.table, sc).ok_or_else(|| {
                         bad(format!("join subscribe_sums: {sc} is not a Number / BigInt column of {}", self.left.table.name))
                     })?),
                     None => None,
@@ -2619,8 +2628,8 @@ impl<'a> JoinQuery<'a> {
                 let side = match sum_col {
                     None => None,
                     Some(sc) => match sc.split_once('.').filter(|(t, _)| t.eq_ignore_ascii_case(&right_name)) {
-                        Some((_, c)) => Some((true, num(&self.right.table, c).ok_or_else(|| bad(format!("join subscribe_sums: {sc} is not a Number / BigInt column")))?)),
-                        None => Some((false, num(&self.left.table, sc).ok_or_else(|| bad(format!("join subscribe_sums: {sc} is not a Number / BigInt column")))?)),
+                        Some((_, c)) => Some((true, num(self.right.table, c).ok_or_else(|| bad(format!("join subscribe_sums: {sc} is not a Number / BigInt column")))?)),
+                        None => Some((false, num(self.left.table, sc).ok_or_else(|| bad(format!("join subscribe_sums: {sc} is not a Number / BigInt column")))?)),
                     },
                 };
                 let ty = self.left.resolve_col(my).map(|(_, c)| c.ty).ok_or_else(|| bad(format!("join_eq: unknown column {my}")))?;
@@ -3827,17 +3836,17 @@ impl<'a> UnderQuery<'a> {
         if rows.limit.is_some() || rows.order.is_some() || seeds.limit.is_some() || seeds.order.is_some() {
             return bad(format!("{what}: limit / order_by are not supported"));
         }
-        if !Arc::ptr_eq(&rows.table, &seeds.table) {
+        if !std::ptr::eq(rows.table, seeds.table) {
             return bad(format!("{what}: seeds must be a query on {}", rows.table.name));
         }
-        let t = &rows.table;
+        let t = rows.table;
         let cd = t.col(&self.ref_col).cloned();
         let points = cd.as_ref().is_some_and(|c| c.ty == ColumnType::Ref)
             && t.relations.iter().any(|r| r.from_col.eq_ignore_ascii_case(&self.ref_col) && r.to_table.eq_ignore_ascii_case(&t.name));
         let Some(cd) = cd.filter(|_| points) else {
             return bad(format!("{what}: {} is not a ref column of {} pointing to itself", self.ref_col, t.name));
         };
-        let all = Query::new(rows.db, t.clone());
+        let all = Query::new(rows.db, t);
         let (Some(f), Some(sd), Some(a)) = (rows.live_preds()?, seeds.live_preds()?, all.live_preds()?) else { return Ok(None) };
         Ok(Some((f, sd, a, cd.himo_id)))
     }
@@ -4493,8 +4502,8 @@ impl<'a> ReachQuery<'a> {
                 return bad("reachable: limit / order_by are not supported".into());
             }
         }
-        let t = &rows.table;
-        if !Arc::ptr_eq(t, &seeds.table) {
+        let t = rows.table;
+        if !std::ptr::eq(t, seeds.table) {
             return bad(format!("reachable: seeds must be a query on {}", t.name));
         }
         let e = &edges.table;
@@ -5265,7 +5274,7 @@ impl Simple {
 
 pub struct Query<'a> {
     db: &'a Database,
-    table: Arc<TableInner>,
+    table: &'a TableInner,
     preds: Vec<Predicate>,
     limit: Option<usize>,
     /// 並びの列と降順か (`order_by` / `order_by_desc`)。
@@ -5273,7 +5282,7 @@ pub struct Query<'a> {
 }
 
 impl<'a> Query<'a> {
-    fn new(db: &'a Database, table: Arc<TableInner>) -> Self {
+    fn new(db: &'a Database, table: &'a TableInner) -> Self {
         Self { db, table, preds: Vec::new(), limit: None, order: None }
     }
 
@@ -5322,7 +5331,7 @@ impl<'a> Query<'a> {
     /// 列名を解決する。 `"a.b.c"` は ref 列 `a`、 `b` を順にたどった先の table の列 `c`
     /// (`ref_to` で宣言した関係)。 返り値は (たどる ref 列の himo_id 列, 対象の列)。
     fn resolve_col(&self, col: &str) -> Option<(Vec<u16>, ColumnInner)> {
-        let mut table = self.table.clone();
+        let mut table: &TableInner = self.table;
         let mut path = Vec::new();
         let mut segs = col.split('.').peekable();
         while let Some(seg) = segs.next() {
@@ -5334,7 +5343,7 @@ impl<'a> Query<'a> {
                 return None;
             }
             let to = &table.relations.iter().find(|r| r.from_col.eq_ignore_ascii_case(seg))?.to_table;
-            let next = self.db.tables.iter().find(|t| t.name.eq_ignore_ascii_case(to))?.clone();
+            let next: &TableInner = self.db.tables.iter().find(|t| t.name.eq_ignore_ascii_case(to))?;
             path.push(cd.himo_id);
             table = next;
         }
@@ -5827,7 +5836,7 @@ impl<'a> Query<'a> {
         if mine.ty != theirs_ty || matches!(mine.ty, ColumnType::Leaf | ColumnType::Ref) {
             return None;
         }
-        let th = th_of(&sub.table, th)?;
+        let th = th_of(sub.table, th)?;
         let preds = sub.live_preds().ok()?;
         Some((path, Predicate::ExistsEq { mine: mine.himo_id, theirs, th, preds }))
     }
@@ -5843,7 +5852,7 @@ impl<'a> Query<'a> {
             return None;
         }
         let via = cd.himo_id;
-        let th = th_of(&sub.table, th)?;
+        let th = th_of(sub.table, th)?;
         let preds = sub.live_preds().ok()?;
         Some(Predicate::Exists { via, th, preds })
     }
@@ -5867,7 +5876,7 @@ impl<'a> Query<'a> {
     ///
     /// 別の table の query を渡すと `find` / `subscribe` が `BadValue`。
     pub fn or(mut self, other: Query<'a>) -> Self {
-        if !Arc::ptr_eq(&self.table, &other.table) {
+        if !std::ptr::eq(self.table, other.table) {
             self.preds = vec![Predicate::Or(Vec::new())];
             return self;
         }
@@ -5993,7 +6002,7 @@ impl<'a> Query<'a> {
     /// table 所属を表す代表 column (PK、 無ければ先頭の列) の himo。
     fn rep_himo(&self) -> Option<u16> {
         self.table.pk
-            .or_else(|| if self.table.cols.is_empty() { None } else { Some(0) })
+            .or(if self.table.cols.is_empty() { None } else { Some(0) })
             .map(|i| self.table.cols[i].himo_id)
     }
 
@@ -6358,7 +6367,7 @@ impl<'a> Query<'a> {
         }
         // `.all()` 系 — find() と同じ代表 column (PK or 先頭列) を持つ全 row
         let rep = self.table.pk
-            .or_else(|| if self.table.cols.is_empty() { None } else { Some(0) })
+            .or(if self.table.cols.is_empty() { None } else { Some(0) })
             .map(|i| self.table.cols[i].himo_id);
         conv_all(eng, self.preds, rep)
     }
@@ -6520,7 +6529,7 @@ impl<'a> Query<'a> {
 
 pub struct EntityRef<'a> {
     db: &'a Database,
-    table: Arc<TableInner>,
+    table: &'a TableInner,
     eid: EntityId,
 }
 
@@ -6581,7 +6590,7 @@ impl<'a> EntityRef<'a> {
 
 pub struct EntityUpdate<'a> {
     db: &'a Database,
-    table: Arc<TableInner>,
+    table: &'a TableInner,
     eid: EntityId,
     values: Vec<(String, Value)>,
 }
@@ -6809,6 +6818,42 @@ mod tests {
             assert_eq!(users.entity(alice).get("age"), Some(Value::Number(30)));
         }
         let _ = std::fs::remove_dir_all(&path); // v10: DB は directory
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 表の handle・問い・行の handle は表を借りるだけで、 `Arc<TableInner>` の参照数を動かさない (2026-10-16: 前は `entity()` /
+    /// `insert()` / `where_*` のたびに clone し、 書き手を 8 本並べると参照数の cache line の取り合いで 1 本より遅くなった)。
+    /// 対照: `Arc` を clone すれば数は動く (数え方が効いている)。
+    #[test]
+    fn handles_borrow_the_table_without_counting() {
+        let path = tmp("borrow_table");
+        let _ = std::fs::remove_dir_all(&path);
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut db = Database::create(&path).unwrap();
+            db.table("t").number("id").number("age").primary_key("id").build().unwrap();
+            let strong = |db: &Database| Arc::strong_count(db.tables.iter().find(|x| x.name == "t").unwrap());
+            assert_eq!(strong(&db), 1);
+            let t = db.get_table("t").unwrap();
+            let mut eids = Vec::new();
+            for i in 0..1000i64 {
+                eids.push(t.insert().set("id", i).set("age", i % 50).commit().unwrap());
+                let (q, e, b) = (t.where_eq("age", i % 50), t.entity(eids[i as usize]), t.insert());
+                assert_eq!(strong(&db), 1, "handle を持っている間 (i = {i})");
+                drop((q, e, b));
+                t.entity(eids[i as usize]).update().set("age", (i + 1) % 50).commit().unwrap();
+            }
+            assert_eq!(t.all().count().unwrap(), 1000);
+            assert_eq!(t.where_eq("age", 0i64).count().unwrap(), 20);
+            let t2 = t.clone();
+            assert_eq!(t2.all().count().unwrap(), 1000);
+            assert_eq!(strong(&db), 1, "Table の clone も借りるだけ");
+            let c = db.tables.iter().find(|x| x.name == "t").unwrap().clone();
+            assert_eq!(strong(&db), 2, "対照: Arc を clone すれば数は動く");
+            drop(c);
+            assert_eq!(strong(&db), 1);
+        }
+        let _ = std::fs::remove_dir_all(&path);
         let _ = std::fs::remove_file(&path);
     }
 
