@@ -502,18 +502,14 @@ impl Database {
         Self::wrap_concurrent(arc_eng)
     }
 
-    /// #116: `open_with_oplog` + write/oplog-record queue の capacity 指定。
-    /// 多 DB を LRU pool で open/close する hosted 構成の open 側 knob (説明は
-    /// `finish_with_oplog_with_queue` 参照)。
+    /// #116: `open_with_oplog` と同じ (互換のために残す)。 `queue_capacity` は 0.33 までの engine の write queue の cap で、
+    /// 0.34 で queue を外したので使わない。
     pub fn open_with_oplog_with_queue(
         path: &str,
         oplog_capacity: usize,
-        queue_capacity: usize,
+        _queue_capacity: usize,
     ) -> Result<Arc<Self>, SchemaError> {
-        let arc_eng =
-            Engine::open_concurrent_with_oplog_queue(path, oplog_capacity, queue_capacity)
-                .map_err(|e| SchemaError::Io(e.to_string()))?;
-        Self::wrap_concurrent(arc_eng)
+        Self::open_with_oplog(path, oplog_capacity)
     }
 
     fn wrap_concurrent(arc_eng: Arc<Engine>) -> Result<Arc<Self>, SchemaError> {
@@ -528,7 +524,7 @@ impl Database {
         Ok(Arc::new(db))
     }
 
-    /// build phase 終了 + concurrent + WAL モードに遷移。 consumer thread を spawn し、
+    /// build phase 終了 + concurrent + WAL モードに遷移。 WAL の書き出し係 (裏の thread) を起こし、
     /// `Arc<Database>` を返す。 消費側の CLI のように複数の sub-store で `Arc<Database>` を
     /// clone 共有する用途向け。
     ///
@@ -552,31 +548,18 @@ impl Database {
         }))
     }
 
-    /// #116: `finish_with_oplog` + write/oplog-record queue の capacity 指定。
-    ///
-    /// queue は engine ごとに 2 本 eager 確保され、default 1M slot だと per-DB
-    /// ~128MiB の固定 RSS になる (低 write / 多 DB 同居の host では 4096〜16384
-    /// 程度で十分)。省略版 `finish_with_oplog` は `max_entities` 連動の scaled
-    /// default (小 DB は自動で小さくなる)。
+    /// #116: `finish_with_oplog` と同じ (互換のために残す)。 `queue_capacity` は 0.33 までの engine の write queue の cap
+    /// (engine ごとに 2 本 eager に確保していた) で、 0.34 で queue を外したので使わない。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn finish_with_oplog_with_queue(
-        mut self,
+        self,
         oplog_capacity: usize,
-        queue_capacity: usize,
+        _queue_capacity: usize,
     ) -> Result<Arc<Self>, SchemaError> {
-        self.eng.set_defer_tables_persist(false);
-        self.persist_schema()?;
-        let (eng, tables) = self.into_parts()?;
-        let arc_eng = Engine::concurrentize_with_oplog_queue(eng, oplog_capacity, queue_capacity)
-            .map_err(|e| SchemaError::Io(e.to_string()))?;
-        Ok(Arc::new(Self {
-            eng: arc_eng,
-            tables,
-            is_concurrent: true,
-        }))
+        self.finish_with_oplog(oplog_capacity)
     }
 
-    /// build phase 終了 + consumer thread spawn (concurrent)、 WAL なし。
+    /// build phase 終了 + concurrent、 WAL なし (裏の thread は持たない)。
     /// crash consistency 不要 (cache / 揮発 store) なケース向け。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn finish_concurrent(mut self) -> Result<Arc<Self>, SchemaError> {
@@ -592,22 +575,11 @@ impl Database {
         }))
     }
 
-    /// #116: `finish_concurrent` + queue capacity 指定 (説明は
-    /// `finish_with_oplog_with_queue` 参照)。
+    /// #116: `finish_concurrent` と同じ (互換のために残す)。 `queue_capacity` は 0.33 までの engine の write queue の cap で、
+    /// 0.34 で queue を外したので使わない。
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn finish_concurrent_with_queue(
-        mut self,
-        queue_capacity: usize,
-    ) -> Result<Arc<Self>, SchemaError> {
-        self.eng.set_defer_tables_persist(false);
-        self.persist_schema()?;
-        let (eng, tables) = self.into_parts()?;
-        let arc_eng = Engine::concurrentize_queue(eng, queue_capacity);
-        Ok(Arc::new(Self {
-            eng: arc_eng,
-            tables,
-            is_concurrent: true,
-        }))
+    pub fn finish_concurrent_with_queue(self, _queue_capacity: usize) -> Result<Arc<Self>, SchemaError> {
+        self.finish_concurrent()
     }
 
     /// `self.eng` から `Engine` を取り出す helper (Arc count = 1 が前提)。

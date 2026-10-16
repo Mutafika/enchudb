@@ -278,7 +278,7 @@ schema は engine の content blob に serialize して保存。 178 列の pris
 | phase | 状態 | 何ができる |
 |---|---|---|
 | build | Arc count = 1、 consumer thread なし | `db.table(...).build()` で schema 拡張、 `db.engine_mut()` で `&mut Engine` 取得可 |
-| concurrent | `Arc<Database>` 経由で共有可能、 consumer thread 起動 | 全 write は oplog に append (有効時)、 background fsync、 `&Database` のみで操作 |
+| concurrent | `Arc<Database>` 経由で共有可能、 WAL 付きなら書き出し係 (consumer thread) 起動 | 全 write は呼んだ thread が oplog に append (有効時) して本体に当てる、 background fsync、 `&Database` のみで操作 |
 
 ```rust
 use std::sync::Arc;

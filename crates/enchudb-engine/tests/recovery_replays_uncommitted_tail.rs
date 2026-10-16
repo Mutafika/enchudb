@@ -1,10 +1,10 @@
 //! **WAL に durable に届いた write は、 body に反映されないまま checkpoint に
 //! 埋められてはいけない。**
 //!
-//! concurrent write path は queue を 2 本持つ (`engine.rs` の `tie_async_by_id`):
-//! producer は op を `write_queue` へ、 record を `oplog_record_queue` へ push し、
-//! consumer thread が 1 tick の中で **(1) WAL append → (2) body 適用 → (3) fsync /
-//! msync / checkpoint 前進** の順に流す。 つまり **WAL は body より先に書かれる**。
+//! concurrent write path は、 書いた thread が **(1) WAL append → (2) body 適用** の順に書き、 裏の thread が
+//! **(3) fsync / msync / checkpoint 前進** をする (0.33 までの `tie_async_by_id` は queue 2 本を通して consumer
+//! thread が (1) → (2) → (3) を流していた。 0.34 からは `*_async` も書いた thread が書く)。 つまり **WAL は body
+//! より先に書かれる**。
 //!
 //! (1) と (2) の間で殺されると 「WAL には在るが body には無い record」 が末尾に
 //! 残る。 これ自体は crash として正常で、 次の open の recovery が replay して

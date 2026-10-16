@@ -70,7 +70,6 @@ pub mod engine;
 pub mod query_lang;
 pub mod ravn;
 pub mod cas;
-pub mod write_queue;
 // `wal::*` / `keys::*` / Hlc / PeerId / EntityId / make_eid 等は
 // `enchudb-wal` crate に分離済。 後方互換 re-export は提供しない。
 // 移行ガイド: docs/migration-wal-crate.md
@@ -90,6 +89,8 @@ pub(crate) mod publish_gate;
 pub(crate) mod write_gate;
 // 円柱を組んだ紐の書き手は紐の write_lock を取らずに値ごとの鍵で書く (違う値の書き手どうしは並ばない)。
 pub(crate) mod value_locks;
+// WAL 付きの engine の裏の thread (書き出し係) を寝かせて起こす係 (#391)。
+pub(crate) mod consumer_waker;
 #[cfg(test)]
 mod tests_issue131;
 // Transport implementations moved to `enchu-transport` crate.

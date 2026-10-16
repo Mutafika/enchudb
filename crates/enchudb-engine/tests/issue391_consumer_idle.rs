@@ -3,6 +3,8 @@
 //!
 //! 0.34 から `*_async` の書き込みは呼んだ thread がその場で書く (consumer に渡さない)。 なので 「consumer が起こされずに
 //! 積んだ書き込みが当たらない」 ことは起きなくなり、 その形を見ていた 2 本は 「返った時に見える」 を見る形にした。
+//! consumer の仕事は WAL の書き出しだけになったので、 WAL の無い engine は consumer を持たない (起きる回数は 0、 閉じる
+//! のもすぐ)。 oplog false の形は、 その対照として残す。
 
 use enchudb_engine::{Engine, ValueType};
 use std::sync::Arc;
@@ -75,8 +77,8 @@ fn idle_consumer_sleeps() {
     }
 }
 
-/// 寝ている間に書いても取りこぼさない: async の書き込みは適用され、 同期の書き込み (WAL に直接) も 100 ms ごとの
-/// 書き出しで checkpoint が head まで進む。
+/// 寝ている間に書いても取りこぼさない: async の書き込みは返った時に見え (consumer を待たない)、 同期の書き込み (WAL に
+/// 直接) も 100 ms ごとの書き出しで checkpoint が head まで進む。
 #[test]
 fn writes_after_idle_are_applied_and_flushed() {
     let path = tmp("wake");
@@ -91,7 +93,7 @@ fn writes_after_idle_are_applied_and_flushed() {
         eng.tie_async_by_id(a, k, 10 + round);
         let started = Instant::now();
         eng.flush_writes();
-        assert!(started.elapsed() < Duration::from_millis(500), "寝ている consumer が async の書き込みで起きない");
+        assert!(started.elapsed() < Duration::from_millis(500), "flush_writes が待った (0.34 から何もしない)");
         assert_eq!(eng.get(a, "k"), Some(10 + round as u64));
 
         std::thread::sleep(Duration::from_millis(300));
@@ -109,7 +111,8 @@ fn writes_after_idle_are_applied_and_flushed() {
     cleanup(&path);
 }
 
-/// 寝ている consumer の engine を閉じても止まらない (閉じる時に起こして最終 drain に入らせる)。
+/// 寝ている consumer の engine を閉じても止まらない (閉じる時に起こして最後の書き出しに入らせる)。 WAL の無い engine は
+/// consumer を持たないので、 すぐ閉じる。
 #[test]
 fn drop_wakes_a_sleeping_consumer() {
     for oplog in [true, false] {
