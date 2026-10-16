@@ -170,6 +170,10 @@ thread_local! {
     /// test 用の割り込み点 (#381): insert が data の上限の先取りを抜けた直後に 1 回だけ走らせる処理。 並行 insert が
     /// 同時に先取りを抜ける窓を踏むため。
     static AFTER_PRECHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    /// test 用: 立っている間、 新しい表を書く空きの確かめ (`Vocabulary::reserve_table`) を空き不足にする。
+    static TABLE_SPACE_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// test 用: 表を作り直すために今の表をなめた回数 (`Vocabulary::rebuild_table`)。
+    static TABLE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// 読み手が表を読んだ直後の割り込み点 (test 以外では何もしない)。
@@ -188,6 +192,13 @@ fn hook_after_precheck() {
     if let Some(f) = AFTER_PRECHECK.with(|h| h.borrow_mut().take()) {
         f();
     }
+}
+
+/// 表を作り直すために今の表をなめる時に数える (test 以外では何もしない)。
+#[inline(always)]
+fn note_table_scan() {
+    #[cfg(test)]
+    TABLE_SCANS.with(|c| c.set(c.get() + 1));
 }
 
 /// `Vocabulary::try_insert` が値を入れられなかった理由 (#316)。
@@ -541,7 +552,8 @@ impl Vocabulary {
     }
 
     /// 語数が今の表の半分を超えていたら、 表を伸ばす (書き手、 `try_insert` の後で)。 空き不足で伸ばせなければ
-    /// 何もしない (今の表で続け、 次の insert でまた試す)。
+    /// 何もしない (今の表で続け、 次の insert でまた試す)。 空きは今の表をなめる前に確かめる (伸ばせない間の insert
+    /// が、 毎回表を全部なめてから諦めないように)。
     ///
     /// #381: 回収で場所を別の語に渡すと、 古い語の entry は死んだまま表に残る (`stale_entries`)。 死んだ entry が
     /// 表の 1/4 を超えたら (`force` なら 1 つでもあれば)、 同じ大きさで作り直して落とす。
@@ -565,8 +577,27 @@ impl Vocabulary {
         if !needs(g, index_cap) {
             return;
         }
-        // 今の表の slot を集める (表は書き込みを止めているので確定している)。 語が入れ替わった entry は落とす
+        // 語数で伸ばす時だけ倍にする (死んだ entry を落とすだけなら同じ大きさ)
         let count = self.count.load(Ordering::Relaxed);
+        let grow = (g.cap() < index_cap && count as u64 * 2 > g.cap() as u64) as u8;
+        let bits = Self::bits_for(count as usize, index_cap).max(g.bits + grow);
+        let ver = g.ver.wrapping_add(2);
+        let after = Gen { base: g.base + g.cap(), bits, ver };
+        let (stall, next) = if after.base as u64 + after.cap() as u64 <= index_cap as u64 {
+            // 今の表の直後に置く: 今の表は書き換えないので、 読み手は止めない
+            (None, after)
+        } else {
+            // 直後に置けない: 領域の先頭から組み直す (今の表と重なるので読み手を待たせる)
+            (Some(g), Gen { base: 0, bits, ver })
+        };
+        // 空きは今の表をなめる前に確かめる。 空き不足で伸ばせない間は insert のたびにここへ来るので、 先になめると
+        // insert ごとに表の大きさに比例した手間を払ってから諦めることになる (`write_gen` も同じ範囲を確かめるが、
+        // 数えたページは飛ばす)
+        if self.reserve_table(next).is_err() {
+            return;
+        }
+        note_table_scan();
+        // 今の表の slot を集める (表は書き込みを止めているので確定している)。 語が入れ替わった entry は落とす
         let mut entries = Vec::with_capacity(count as usize);
         let xm = self.index.slice();
         for i in 0..g.cap() as usize {
@@ -579,22 +610,20 @@ impl Vocabulary {
                 }
             }
         }
-        // 語数で伸ばす時だけ倍にする (死んだ entry を落とすだけなら同じ大きさ)
-        let grow = (g.cap() < index_cap && count as u64 * 2 > g.cap() as u64) as u8;
-        let bits = Self::bits_for(count as usize, index_cap).max(g.bits + grow);
-        let ver = g.ver.wrapping_add(2);
-        let after = Gen { base: g.base + g.cap(), bits, ver };
-        let written = if after.base as u64 + after.cap() as u64 <= index_cap as u64 {
-            // 今の表の直後に置く: 今の表は書き換えないので、 読み手は止めない
-            self.write_gen(None, after, entries, false)
-        } else {
-            // 直後に置けない: 領域の先頭から組み直す (今の表と重なるので読み手を待たせる)
-            let full = Gen { base: 0, bits, ver };
-            self.write_gen(Some(g), full, entries, false)
-        };
-        if written.is_ok() {
+        if self.write_gen(stall, next, entries, false).is_ok() {
             self.stale_entries.store(0, Ordering::Relaxed);
         }
+    }
+
+    /// 表 `next` を書く空きがあるか (書く範囲のページを先に数える。 `write_gen` と同じ数え方、 #327)。 test では
+    /// `TABLE_SPACE_FAILS` で空き不足にできる。
+    fn reserve_table(&self, next: Gen) -> std::io::Result<()> {
+        #[cfg(test)]
+        if TABLE_SPACE_FAILS.with(|f| f.get()) {
+            return Err(std::io::Error::new(std::io::ErrorKind::StorageFull, "test: 新しい表の空きが無い"));
+        }
+        let (start, end) = next.span();
+        self.index.ensure_committed_sparse(end, end - start)
     }
 
     /// 満杯なら **`u32::MAX` (予約 sentinel)** を返す (#59: panic しない)。
@@ -1470,6 +1499,39 @@ mod tests {
     /// #123: `fxhash` は乗算で終わるので **下位ビットに上位の entropy が届かない**。
     /// issue の実キー (`第N条` は UTF-8 で 8 byte = 1 word ちょうどなので
     /// `h = word * SEED` そのもの) で、 旧 slot 選択が全滅し新 slot 選択が散ることを固定する。
+    /// 空き不足で表を伸ばせない間は、 insert のたびに今の表をなめ直さない (空きを先に確かめる)。 空きが戻れば次の insert
+    /// で伸ばし、 入れた語は全部引ける。
+    #[test]
+    fn growth_without_space_does_not_rescan_the_table() {
+        let r = make_regions(1 << 14, 1 << 14, 1 << 20);
+        let v = r.vocab_init(1 << 14, 1 << 14);
+        let words: Vec<String> = (0..1000).map(|i| format!("word-{i:05}")).collect();
+        // 最初の表 (FIRST_GEN_CAP slot) の半分まで入れる (ここまでは伸ばさない)
+        let half = (FIRST_GEN_CAP / 2) as usize;
+        for w in &words[..half] {
+            assert_ne!(v.get_or_insert(w.as_bytes()), u32::MAX);
+        }
+        let cap0 = v.table().cap();
+        assert_eq!(cap0, FIRST_GEN_CAP, "test の前提: まだ最初の表");
+        TABLE_SCANS.with(|c| c.set(0));
+        TABLE_SPACE_FAILS.with(|f| f.set(true));
+        // 半分を超えた後の insert は毎回伸ばそうとするが、 空きが無いので伸ばさない。 語は今の表に入る
+        for w in &words[half..900] {
+            assert_ne!(v.get_or_insert(w.as_bytes()), u32::MAX);
+        }
+        let scans = TABLE_SCANS.with(|c| c.get());
+        TABLE_SPACE_FAILS.with(|f| f.set(false));
+        assert_eq!(v.table().cap(), cap0, "空きが無い間は伸ばさない");
+        assert_eq!(scans, 0, "空きが無い間に今の表をなめた ({scans} 回)");
+        // 空きが戻った後の 1 語で伸ばす (なめるのは 1 回)
+        assert_ne!(v.get_or_insert(words[900].as_bytes()), u32::MAX);
+        assert!(v.table().cap() > cap0, "空きが戻ったら伸ばす");
+        assert_eq!(TABLE_SCANS.with(|c| c.get()), 1);
+        for (i, w) in words[..901].iter().enumerate() {
+            assert!(v.lookup(w.as_bytes()).is_some(), "語 {i} が引けない");
+        }
+    }
+
     #[test]
     fn issue123_low_bits_collide_high_bits_spread() {
         let keys: Vec<&[u8]> = vec![
