@@ -92,11 +92,11 @@ pub struct EngineStats {
     pub oplog_next_lsn: u64,
     /// fsync/msync 完了済みの LSN(背景 fsync が進めた地点)
     pub durable_lsn: u64,
-    /// WriteQueue に滞留中の op 数
+    /// 0.33 までの write queue に滞留中の op 数。 0.34 で queue を外したので常に 0 (互換のために残す)
     pub queue_len: usize,
-    /// writer が push した累計
+    /// 0.33 までの write queue に writer が push した累計。 0.34 から常に 0 (同上)
     pub pushed: u64,
-    /// consumer が apply した累計
+    /// 0.33 までの consumer が apply した累計。 0.34 から常に 0 (同上)
     pub applied: u64,
     /// 自 peer の peer_id(単独 peer 運用では 0)
     pub peer_id: u32,
@@ -3605,39 +3605,17 @@ pub struct Engine {
     /// v6 (0.12.0, #88): Leaf 終端ノードの可変長 payload store。 vocab から剥がした
     /// reclaim 対応 store。 pre-v6 DB (leaf region 無し) は None。
     leaf: Option<LeafStore>,
-    /// 非同期書き込みキュー。`create_concurrent` で有効化される。
-    write_queue: Option<std::sync::Arc<crate::write_queue::WriteQueue>>,
+    /// #391: 裏の thread (WAL の書き出し係) を起こす係。 WAL 付きの並行の形で有効化される (WAL の無い engine は裏の
+    /// thread を持たない)。
+    consumer_waker: Option<std::sync::Arc<crate::consumer_waker::ConsumerWaker>>,
     /// consumer スレッドへの shutdown 通知。`Drop` で true に。
     shutdown_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// consumer スレッドハンドル。Drop で join。
     consumer_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
-    /// writer が push した累積件数。tie_async/untie_async/delete_async で +1。
-    push_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// consumer が apply 完了した累積件数。apply_count >= push_count が同期点。
-    apply_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// WAL。`create_concurrent_with_oplog` or `open_concurrent_with_oplog` で有効化。
-    /// Some なら tie_async/untie_async/delete_async は oplog_record_queue 経由で
-    /// consumer thread 側に batch flush を委ねる。
     oplog: Option<std::sync::Arc<enchudb_oplog::oplog::OpLog>>,
-    /// async path 専用の WAL record queue。 writer は WAL に直接書かず、 ここに
-    /// owned record を push。 consumer thread が drain して `wal.append_many` で
-    /// 1 flock サイクル N records にまとめる (per-record flock コスト償却)。
-    /// request17 (A-3): record と **その版数** を対で運ぶ。 consumer は
-    /// `append_many_with_hlcs` でこの HLC のまま WAL に載せる (採番し直さない)。
-    oplog_record_queue: Option<std::sync::Arc<crossbeam_queue::ArrayQueue<(enchudb_oplog::oplog::OwnedOp, enchudb_oplog::Hlc)>>>,
-    /// writer が `oplog_record_queue` へ push した WAL record の累積件数。
-    /// op は queue 先行・record 後追い (#77-H4) なので、 apply_count barrier
-    /// だけでは「op は適用済みだが record は未 append」の窓が残る。
-    /// `flush_writes` はこの counter 対でも待つ (下の wal_append_count 参照)。
-    wal_push_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// consumer が WAL へ append し終えた record の累積件数。
-    /// wal_append_count >= wal_push_count が「queue に record が残っていない」
-    /// 同期点 — これが無いと `oplog_sync` が record より先に Commit を打ち、
-    /// fsync 済みのはずの write が crash で消える。
-    wal_append_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// #77-M2: consumer thread が panic すると true。 flush_writes / Drop の
-    /// barrier spin と producer の blocking push が「絶対に進まない待ち」に
-    /// 陥らないための脱出フラグ。
+    /// #77-M2: consumer thread (WAL の書き出し係) が panic すると true。 WAL の空きを待つ書き手 (`wait_for_wal_room`) が
+    /// 待ち続けないための脱出フラグ。 立っていたら Drop は clean の印を立てない (次の open で調べ直す)。
     consumer_poisoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 0.11 (request10): Ref 値が translated foreign entity を指す write を
     /// bridge から除外した際の一度きり警告フラグ (u32 wire value に世界番号が
@@ -4159,15 +4137,10 @@ impl Engine {
             tables: vec![TableDef::anonymous()],
             himo_to_table: AppendVec::with_capacity(max_himos as usize),
             himo_def_lock: std::sync::Mutex::new(()),
-            write_queue: None,
+            consumer_waker: None,
             shutdown_flag: None,
             consumer_handle: std::sync::Mutex::new(None),
-            push_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            apply_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            wal_push_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            wal_append_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             oplog: None,
-            oplog_record_queue: None,
             consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             warned_ref_to_replica: std::sync::atomic::AtomicBool::new(false),
             bind_over_local_writes: std::sync::atomic::AtomicU64::new(0),
@@ -5318,15 +5291,10 @@ impl Engine {
             tables: initial_tables,
             himo_to_table: initial_himo_to_table,
             himo_def_lock: std::sync::Mutex::new(()),
-            write_queue: None,
+            consumer_waker: None,
             shutdown_flag: None,
             consumer_handle: std::sync::Mutex::new(None),
-            push_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            apply_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            wal_push_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            wal_append_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             oplog: None,
-            oplog_record_queue: None,
             consumer_poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             warned_ref_to_replica: std::sync::atomic::AtomicBool::new(false),
             bind_over_local_writes: std::sync::atomic::AtomicU64::new(0),
@@ -5452,7 +5420,7 @@ impl Engine {
         Ok(eng)
     }
 
-    /// WAL + 並行 write queue 付きで replica open。通常の Engine と同じく Arc 共有可能。
+    /// WAL 付きの並行の形で replica open。通常の Engine と同じく Arc 共有可能。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_concurrent_replica(path: &str, oplog_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
         let eng = Self::open_concurrent_with_oplog(path, oplog_capacity)?;
@@ -7950,11 +7918,6 @@ impl Engine {
             // (`clear_cell_versions` の doc 参照)。
             self.clear_cell_versions(global);
             self.entities.allocate_at(global);
-            // #195: queue に積まず counter 対称 bump (entity() の同所コメント参照)。
-            if self.write_queue.is_some() {
-                self.push_count.fetch_add(1, Ordering::Release);
-                self.apply_count.fetch_add(1, Ordering::Release);
-            }
             let peer = self.peer_id.load(Ordering::Acquire);
             return Ok(enchudb_oplog::make_eid(peer, global));
         }
@@ -8006,13 +7969,6 @@ impl Engine {
         // EntitySet で live mark + next_eid 前進 (CAS safe)
         self.entities.allocate_at(global);
 
-        // concurrent mode barrier (entity() と同じ)。
-        // #195: queue に積まず counter 対称 bump — consumer thread 自身が bridge 中に
-        // ここを通る (blocking push だと自縄自縛 livelock)。
-        if self.write_queue.is_some() {
-            self.push_count.fetch_add(1, Ordering::Release);
-            self.apply_count.fetch_add(1, Ordering::Release);
-        }
         let peer = self.peer_id.load(Ordering::Acquire);
         Ok(enchudb_oplog::make_eid(peer, global))
     }
@@ -8667,22 +8623,6 @@ impl Engine {
         if reused {
             self.clear_cell_versions(local);
         }
-        // concurrent mode (= consumer thread 稼働) なら barrier counter を対称に
-        // 進める。 issue5: push_count と apply_count を対称に保たないと
-        // `flush_writes` が ties drain 前に early return して live query が
-        // pending Tie を見落とす。 undo 廃止 (v4) 後は payload なしで
-        // counter increment のみが起こる。
-        //
-        // #195: 以前は `Op::EntityCreated` を queue に積んでいたが、 drain 側は
-        // no-op (counter 対称用のみ) なのに blocking push で、 consumer thread
-        // 自身が bridge (`transfer_oplog_to_sync_ops`) 中に `entity_in` する経路で
-        // 「満杯 queue の唯一の drainer が push に blocking」する livelock に
-        // なった (#116 の小 queue default で顕在化)。 queue を経由せず両 counter を
-        // 直接進める (push 先 → apply 後、 apply > push を作らない順序)。
-        if self.write_queue.is_some() {
-            self.push_count.fetch_add(1, Ordering::Release);
-            self.apply_count.fetch_add(1, Ordering::Release);
-        }
         let peer = self.peer_id.load(Ordering::Acquire);
         Ok(enchudb_oplog::make_eid(peer, local))
     }
@@ -9004,9 +8944,10 @@ impl Engine {
     /// `append_many_with_hlcs`)。 cell の版数と record の HLC がずれると、 peer 間で
     /// 「自分が持つ版数」と「配った版数」が食い違う。
     ///
-    /// **事前採番は async 経路専用** — 同期経路は `append_local_op` (WAL 先行) を使う。
-    /// 事前採番には「採番順 = WAL 上の並び順」を呼び側が保証する義務が付く
-    /// (`hlc_mint_lock` 参照)。
+    /// 今の呼び手は、 record を書かずに 「今」 の版数として使う所だけ (sync の floor の見積もり:
+    /// `dead_row_floor_candidate` / `reclaim_sync_ops`)。 ローカルの write は `append_local_op` (WAL 先行、 採番は
+    /// append の直列化の内側) を使う。 事前採番した HLC で cell を書くなら、 「採番順 = WAL 上の並び順」 を呼び側が
+    /// 保証する義務も付く (0.33 までの async 経路は `hlc_mint_lock` の下で採番と queue への push を束ねていた)。
     #[inline]
     fn mint_local_hlc(&self) -> enchudb_oplog::Hlc {
         match self.oplog.as_ref() {
@@ -11311,7 +11252,7 @@ impl Engine {
         }
         let vid = match self.value_types[hid] {
             ValueType::Tag => {
-                // #381: 書くまでの間に回収されないよう押さえる (書いた後 / 適用した後で `vocab_unpin`)
+                // #381: 書くまでの間に回収されないよう押さえる (書いた後で `vocab_unpin`)
                 self.step_vocab_refs();
                 self.vocab.try_get_or_insert_pinned(value)
             }
@@ -14583,8 +14524,8 @@ impl Engine {
 
     /// 並行対応版の create。
     ///
-    /// writer は `tie_async` で WriteQueue に push(~ns オーダー)、
-    /// 裏で単一 consumer スレッドが pop して HimoStore に適用する。
+    /// 書き込み (`tie_to` / `tie_async` など) は呼んだ thread がその場で書く (0.33 までの write queue は無い。 WAL が無いので
+    /// 裏の thread も持たない)。
     /// reader は Arc<Engine> を複数スレッドで共有し、`pull_raw`/`query` で
     /// RwLock 越しに安全に読める。
     ///
@@ -14592,8 +14533,6 @@ impl Engine {
     /// `Arc::get_mut` 経由(定義の前に呼ぶ前提)で行う、もしくは本関数の前に
     /// `create_with_capacity` で定義済み状態を作ってから `concurrentize` する
     /// パターンを使う。
-    ///
-    /// WriteQueue は `SegQueue`(unbounded)。cap 指定は不要。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create_concurrent(path: &str) -> io::Result<std::sync::Arc<Self>> {
         let eng = Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)?;
@@ -14603,8 +14542,8 @@ impl Engine {
     /// WAL 付き create_concurrent。
     /// `{path}.wal` に Write-Ahead Log を作成。
     ///
-    /// tie_async / untie_async / delete_async は hot path で WAL append(memcpy)を行い、
-    /// consumer スレッドが背景で 100ms 毎に fsync + checkpoint。
+    /// 書き込みは呼んだ thread が WAL に載せて (memcpy) 本体に当てる。 裏の thread (書き出し係) が 100ms 毎に
+    /// fsync + checkpoint。
     ///
     /// プロセス/OS クラッシュ時は open_concurrent_with_oplog で最後の Commit まで復元される。
     #[cfg(not(target_arch = "wasm32"))]
@@ -14616,24 +14555,26 @@ impl Engine {
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
     }
 
-    /// `create_concurrent_with_oplog` + `queue_capacity` override (issue4)。
-    /// - `queue_capacity`: WriteQueue / oplog_record_queue の bounded cap (default 1 M)
-    ///
-    /// sustained writer (SNS 型の負荷試験の Docker scenario 03 等) で writer >> consumer rate に
-    /// なると、 旧 unbounded queue では RSS 線形成長 → OOM。 bounded 化 + producer
-    /// block でこれを cap する。 capacity の選び方:
-    /// - 小さい (例: 10 K) → RSS 低い、 latency 不安定
-    /// - 大きい (例: 10 M) → latency 安定、 RSS は queue 内 record サイズ × cap
+    /// `create_concurrent_with_oplog` と同じ (互換のために残す)。 `queue_capacity` は 0.33 までの write queue の cap (issue4)
+    /// で、 0.34 で queue を外したので使わない。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create_concurrent_with_oplog_queue_cap(
         path: &str,
         oplog_capacity: usize,
-        queue_capacity: usize,
+        _queue_capacity: usize,
     ) -> io::Result<std::sync::Arc<Self>> {
-        let eng = Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)?;
-        let oplog_path = oplog_path_for(path);
-        let wal = std::sync::Arc::new(enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?);
-        Ok(Self::spawn_consumer_with_oplog_queue_cap(eng, Some(wal), Some(queue_capacity)))
+        Self::create_concurrent_with_oplog(path, oplog_capacity)
+    }
+
+    /// #116: `open_concurrent_with_oplog` と同じ (互換のために残す)。 `queue_capacity` は 0.33 までの write queue の cap で、
+    /// 0.34 で queue を外したので使わない。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_concurrent_with_oplog_queue(
+        path: &str,
+        oplog_capacity: usize,
+        _queue_capacity: usize,
+    ) -> io::Result<std::sync::Arc<Self>> {
+        Self::open_concurrent_with_oplog(path, oplog_capacity)
     }
 
     /// WAL 付き open_concurrent。既存 WAL があればリカバリする。
@@ -14641,26 +14582,6 @@ impl Engine {
     /// 代わりに古い `.crc` ファイルは削除して、次回 flush で regenerate させる。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_concurrent_with_oplog(path: &str, oplog_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
-        Self::open_concurrent_with_oplog_queue_opt(path, oplog_capacity, None)
-    }
-
-    /// #116: `open_concurrent_with_oplog` + queue capacity 上書き。多 DB を LRU pool で
-    /// open/close する hosted 構成の open 側 knob (説明は `concurrentize_with_oplog_queue`)。
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn open_concurrent_with_oplog_queue(
-        path: &str,
-        oplog_capacity: usize,
-        queue_capacity: usize,
-    ) -> io::Result<std::sync::Arc<Self>> {
-        Self::open_concurrent_with_oplog_queue_opt(path, oplog_capacity, Some(queue_capacity))
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn open_concurrent_with_oplog_queue_opt(
-        path: &str,
-        oplog_capacity: usize,
-        queue_capacity: Option<usize>,
-    ) -> io::Result<std::sync::Arc<Self>> {
         let mut eng = Self::open_internal(path, /*verify_region_crc=*/ false, /*take_lock=*/ true, /*readonly=*/ false)?;
         // 古い .crc は WAL 活動後に stale になるので削除
         let crc_path = crate::integrity::crc_path_for(path);
@@ -14702,7 +14623,7 @@ impl Engine {
             std::sync::Arc::new(w)
         };
         eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
-        Ok(Self::spawn_consumer_with_oplog_queue_cap(eng, Some(wal), queue_capacity))
+        Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
     }
 
     /// clean flag (#101) を倒して即書き出す。 書き始める前に呼ぶ: 立ったまま書いて落ちると、 次の open が 「きれいに閉じた」
@@ -15128,10 +15049,10 @@ impl Engine {
     }
 
     /// 既存の `Engine`(create や create_with_capacity で作成済み、define_himo も
-    /// 済ませたもの)を Arc 化して consumer スレッドを起動する。
+    /// 済ませたもの)を Arc 化する。 WAL が無いので裏の thread は持たない (0.33 までは write queue を当てる consumer
+    /// スレッドを起動していた)。
     ///
     /// 返り値の `Arc<Engine>` を各 writer/reader スレッドで clone して使う。
-    /// Drop(最後の Arc が落ちた時)で consumer スレッドは join される。
     pub fn concurrentize(eng: Self) -> std::sync::Arc<Self> {
         Self::spawn_consumer(eng)
     }
@@ -15143,35 +15064,7 @@ impl Engine {
     /// 既存 `.wal` ファイルがあれば recover してから consumer 起動。
     /// (build phase で flush 済みなら本体は最新、 WAL は空のまま start)
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn concurrentize_with_oplog(eng: Self, oplog_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
-        Self::concurrentize_with_oplog_queue_opt(eng, oplog_capacity, None)
-    }
-
-    /// #116: `concurrentize_with_oplog` + write/oplog-record queue の capacity 上書き。
-    /// 多 DB 同居 / 低メモリ host は 4096〜16384 程度に落とすと per-DB の固定 RSS が
-    /// ~128MiB → ~1〜2MiB になる (queue は burst 吸収バッファなので、writer rate が
-    /// consumer を長時間超えない workload なら小さくて良い)。省略時 (= 既存 API) は
-    /// `max_entities` 連動の scaled default。
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn concurrentize_with_oplog_queue(
-        eng: Self,
-        oplog_capacity: usize,
-        queue_capacity: usize,
-    ) -> io::Result<std::sync::Arc<Self>> {
-        Self::concurrentize_with_oplog_queue_opt(eng, oplog_capacity, Some(queue_capacity))
-    }
-
-    /// #116: `concurrentize` (oplog なし) + queue capacity 上書き。
-    pub fn concurrentize_queue(eng: Self, queue_capacity: usize) -> std::sync::Arc<Self> {
-        Self::spawn_consumer_with_oplog_queue_cap(eng, None, Some(queue_capacity))
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn concurrentize_with_oplog_queue_opt(
-        mut eng: Self,
-        oplog_capacity: usize,
-        queue_capacity: Option<usize>,
-    ) -> io::Result<std::sync::Arc<Self>> {
+    pub fn concurrentize_with_oplog(mut eng: Self, oplog_capacity: usize) -> io::Result<std::sync::Arc<Self>> {
         let path = eng.path.clone();
         let oplog_path = oplog_path_for(&path);
         // 古い .crc は WAL 活動後に stale になるので削除 (open_concurrent_with_oplog と同じ扱い)
@@ -15212,7 +15105,24 @@ impl Engine {
             std::sync::Arc::new(w)
         };
         eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
-        Ok(Self::spawn_consumer_with_oplog_queue_cap(eng, Some(wal), queue_capacity))
+        Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
+    }
+
+    /// #116: `concurrentize_with_oplog` と同じ (互換のために残す)。 `queue_capacity` は 0.33 までの write queue の cap で、
+    /// 0.34 で queue を外したので使わない。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn concurrentize_with_oplog_queue(
+        eng: Self,
+        oplog_capacity: usize,
+        _queue_capacity: usize,
+    ) -> io::Result<std::sync::Arc<Self>> {
+        Self::concurrentize_with_oplog(eng, oplog_capacity)
+    }
+
+    /// #116: `concurrentize` と同じ (互換のために残す)。 `queue_capacity` は 0.33 までの write queue の cap で、 0.34 で
+    /// queue を外したので使わない。
+    pub fn concurrentize_queue(eng: Self, _queue_capacity: usize) -> std::sync::Arc<Self> {
+        Self::concurrentize(eng)
     }
 
     fn spawn_consumer(eng: Self) -> std::sync::Arc<Self> {
@@ -15282,30 +15192,18 @@ impl Engine {
         emit_offset.store(committed_end, Ordering::Release);
     }
 
+    /// 並行の形にする (`Arc` に包む)。 WAL 付きなら裏の thread (consumer = 書き出し係) を起こす: 100 ms ごとに Commit →
+    /// 書き出し (oplog の fsync + 本体の msync) → checkpoint → sync の橋 → 通知 → 畳む。 WAL が満杯に近ければ、 その前に畳む。
+    ///
+    /// 0.34 から書き込みは全部、 呼んだ thread がその場で書く (0.33 までの write queue と、 それを当てる裏の thread の仕事は
+    /// 無い)。 なので WAL の無い engine は裏の thread を持たない。
     fn spawn_consumer_with_oplog(
-        eng: Self,
-        oplog: Option<std::sync::Arc<enchudb_oplog::oplog::OpLog>>,
-    ) -> std::sync::Arc<Self> {
-        Self::spawn_consumer_with_oplog_queue_cap(eng, oplog, None)
-    }
-
-    /// `spawn_consumer_with_oplog` + queue capacity 上書き。 None = default。
-    /// issue4 backpressure 用 — capacity 大きいほど push 側 latency 安定、
-    /// 小さいほど RSS 安定 (writer rate >> consumer rate の差を queue で吸収しない)。
-    fn spawn_consumer_with_oplog_queue_cap(
         mut eng: Self,
         oplog: Option<std::sync::Arc<enchudb_oplog::oplog::OpLog>>,
-        queue_cap: Option<usize>,
     ) -> std::sync::Arc<Self> {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
-        use crate::write_queue::WriteQueue;
 
-        // #116: default を DB の max_entities に連動させる。1M slot 固定は
-        // write_queue + oplog_record_queue の 2 本で per-DB ~128MiB を eager 確保し、
-        // per-tenant / per-user に DB を分ける構成の host 密度を RAM(GB)×~8 に縛る。
-        // 小 DB (max_entities が小さい) は queue も小さく、default 16M DB は従来
-        // どおり 1M slot (挙動不変)。floor 4096 は burst 吸収の下限。
         // 書き手の lock (`.db.lock`、 書き手の process は 1 つ) を持つ engine は、 WAL の flock を開いている間 1 回だけ取る
         // (record ごとの flock の lock / unlock = system call 2 回を省く)。 取れなければ今までどおり record ごとに取る
         #[cfg(not(target_arch = "wasm32"))]
@@ -15314,24 +15212,14 @@ impl Engine {
         {
             let _ = wal.lock_session();
         }
-        let qc = queue_cap.unwrap_or_else(|| {
-            (eng.max_entities() as usize).clamp(4096, crate::write_queue::DEFAULT_WRITE_QUEUE_CAP)
-        });
-        let queue = Arc::new(WriteQueue::with_capacity(qc));
-        let shutdown = Arc::new(AtomicBool::new(false));
-        // WAL 有効時のみ oplog_record_queue を生やす。 writer は直接 wal.append せず
-        // ここに owned record を push する → consumer thread が drain して append_many。
-        // issue4: bounded `ArrayQueue` で sustained writer の RSS を cap する。
-        let oplog_record_queue = oplog.as_ref().map(|_| {
-            Arc::new(crossbeam_queue::ArrayQueue::<
-                (enchudb_oplog::oplog::OwnedOp, enchudb_oplog::Hlc),
-            >::new(qc))
-        });
-
-        eng.write_queue = Some(queue.clone());
-        eng.shutdown_flag = Some(shutdown.clone());
         eng.oplog = oplog.clone();
-        eng.oplog_record_queue = oplog_record_queue.clone();
+        if oplog.is_none() {
+            return Arc::new(eng);
+        }
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let waker = Arc::new(crate::consumer_waker::ConsumerWaker::default());
+        eng.consumer_waker = Some(waker.clone());
+        eng.shutdown_flag = Some(shutdown.clone());
 
         let arc = Arc::new(eng);
 
@@ -15347,39 +15235,30 @@ impl Engine {
                 engine.wait_for_wal_room(size)
             })));
         }
-        // #391: WAL に直接書いた (同期の書き込み / Commit marker / 中継) 時も consumer を起こす (書き出しの tick を回す)。
+        // #391: WAL に書いた (書き込み / Commit marker / 中継) 時に consumer を起こす (書き出しの tick を回す)。
         // tick を待つ短い眠りの間は起こさない (100 ms 以内に自分で起きる)
-        let waker = queue.waker().clone();
         if let Some(wal) = oplog.as_ref() {
             let w = waker.clone();
             wal.set_append_hook(Box::new(move || w.wake_if_deep()));
         }
-        let q_for_thread = queue.clone();
         let flag_for_thread = shutdown.clone();
-        let apply_count_for_thread = arc.apply_count.clone();
-        let wal_append_count_for_thread = arc.wal_append_count.clone();
         let oplog_for_thread = oplog.clone();
-        let oplog_record_queue_for_thread = oplog_record_queue.clone();
         let durable_lsn_for_thread = arc.durable_lsn.clone();
         let listeners_for_thread = arc.change_listeners.clone();
         let emit_offset_for_thread = arc.change_emit_offset.clone();
         let emit_lock_for_thread = arc.change_emit_lock.clone();
         let poisoned_for_thread = arc.consumer_poisoned.clone();
 
-        // #77-M2: consumer が panic した場合に unwind 経路で poison を立てる
-        // guard。 これが無いと apply_count が永久に追いつかず、 flush_writes /
-        // Drop の barrier spin と満杯 queue の producer が全員無限待ちになる
-        // (旧 behavior: content cap 超過等の panic でプロセス全体が silent hang)。
+        // #77-M2: consumer が panic した場合に unwind 経路で poison を立てる guard。 WAL の空きを待つ書き手
+        // (`wait_for_wal_room`) はこれを見て待つのをやめ、 Drop は clean の印を立てない。
         struct PoisonOnPanic {
             flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-            queue: std::sync::Arc<crate::write_queue::WriteQueue>,
         }
         impl Drop for PoisonOnPanic {
             fn drop(&mut self) {
                 if std::thread::panicking() {
                     self.flag.store(true, std::sync::atomic::Ordering::Release);
-                    self.queue.poison();
-                    eprintln!("[enchudb] consumer thread panicked — engine poisoned, subsequent writes/flushes will fail fast");
+                    eprintln!("[enchudb] consumer thread panicked — engine poisoned: the WAL is no longer written out in the background, and writers stop waiting for WAL room");
                 }
             }
         }
@@ -15389,10 +15268,7 @@ impl Engine {
             .spawn(move || {
                 use std::sync::atomic::Ordering;
                 use std::time::{Duration, Instant};
-                let _poison_guard = PoisonOnPanic {
-                    flag: poisoned_for_thread,
-                    queue: q_for_thread.clone(),
-                };
+                let _poison_guard = PoisonOnPanic { flag: poisoned_for_thread };
                 let engine: &Engine = unsafe { &*(engine_addr as *const Engine) };
                 let _ = engine.consumer_thread.set(std::thread::current().id());
                 waker.register_current();
@@ -15401,59 +15277,8 @@ impl Engine {
 
                 loop {
                     engine.consumer_wakeups.fetch_add(1, Ordering::Relaxed);
-                    let mut drained_any = false;
-                    // WAL record queue を batch drain (per-record flock を償却)
-                    if let (Some(wq), Some(wal)) = (
-                        oplog_record_queue_for_thread.as_ref(),
-                        oplog_for_thread.as_ref(),
-                    ) {
-                        let mut batch: Vec<enchudb_oplog::oplog::OwnedOp> = Vec::new();
-                        let mut hlcs: Vec<enchudb_oplog::Hlc> = Vec::new();
-                        while let Some((rec, hlc)) = wq.pop() {
-                            batch.push(rec);
-                            hlcs.push(hlc);
-                        }
-                        if !batch.is_empty() {
-                            // #388: 載らなければ append の中の待ち手 (`wait_for_wal_room`) が consumer 自身で畳んで書き直す。
-                            // ここで畳めるのは、 WAL に居る record の効果が全部本体に入っているから (前の周回で append した
-                            // record の op は、 その周回の apply の drain で適用済み — async の書き手は op を先に積む)
-                            // append 失敗でも進める: barrier の意味は「queue に
-                            // 残っていない」であり、 失敗 record の再送は無い
-                            // request17-A3: push 時に採番済みの HLC で書く
-                            // (採番し直すと cell の版数と record がずれる)。
-                            match wal.append_many_with_hlcs(&batch, &hlcs) {
-                                Ok(_) => {
-                                    wal_append_count_for_thread
-                                        .fetch_add(batch.len() as u64, Ordering::Release);
-                                    // #268: 次の episode でまた 1 行出せるよう戻す。
-                                    engine.wal_append_warned.store(false, Ordering::Relaxed);
-                                }
-                                Err(e) => {
-                                    // #268: warn-once だけだと 26 時間の停止でも
-                                    // ログに 1 行しか残らない。 累計を数える。
-                                    engine.note_wal_records_dropped(batch.len(), &e);
-                                    // #268: **失敗しても barrier は進める**。 barrier の
-                                    // 意味は 「queue に残っていない」 であり、 失敗 record の
-                                    // 再送は無い (すぐ上の doc コメントの通り)。 進めないと
-                                    // `flush_writes()` が `wal_appended >= wal_pushed` を
-                                    // 永久に待って **yield spin** し、 WAL が満杯の DB では
-                                    // 全 writer thread がそこで固まる。 sleep も mutex 待ちも
-                                    // panic も無いので、 thread dump にも 「待っている」 とは
-                                    // 映らない (実機の 「publish スレッドが消えた」)。
-                                    wal_append_count_for_thread
-                                        .fetch_add(batch.len() as u64, Ordering::Release);
-                                }
-                            }
-                            drained_any = true;
-                        }
-                    }
-                    while let Some(op) = q_for_thread.pop() {
-                        drained_any = true;
-                        engine.apply_op(op);
-                        apply_count_for_thread.fetch_add(1, Ordering::Release);
-                    }
-                    // #388: 満杯にぶつかった書き手が待っている / ring の空きが 1/4 を切った → 書き出して畳む (apply の
-                    // drain の直後 = WAL に居る record の効果は本体に入っている)
+                    // #388: 満杯にぶつかった書き手が待っている / ring の空きが 1/4 を切った → 書き出して畳む (`make_wal_room`
+                    // の doc: 書き込みの途中で本体にまだ当たっていない record は、 その書き込みが返る前に当たる)
                     if let Some(wal) = oplog_for_thread.as_ref()
                         && (engine.wal_room_wanted.load(Ordering::Acquire)
                             || wal.free_bytes() < wal.capacity() / 4)
@@ -15581,38 +15406,6 @@ impl Engine {
                     }
 
                     if flag_for_thread.load(Ordering::Acquire) {
-                        // 最終 WAL drain
-                        if let (Some(wq), Some(wal)) = (
-                            oplog_record_queue_for_thread.as_ref(),
-                            oplog_for_thread.as_ref(),
-                        ) {
-                            let mut batch: Vec<enchudb_oplog::oplog::OwnedOp> = Vec::new();
-                            let mut hlcs: Vec<enchudb_oplog::Hlc> = Vec::new();
-                            while let Some((rec, hlc)) = wq.pop() {
-                                batch.push(rec);
-                                hlcs.push(hlc);
-                            }
-                            if !batch.is_empty() {
-                                // request17-A3: push 時に採番済みの HLC で書く。
-                                match wal.append_many_with_hlcs(&batch, &hlcs) {
-                                    Ok(_) => {
-                                        wal_append_count_for_thread
-                                            .fetch_add(batch.len() as u64, Ordering::Release);
-                                    }
-                                    Err(e) => {
-                                        engine.note_wal_records_dropped(batch.len(), &e);
-                                        // #268: shutdown 経路でも barrier は進める
-                                        // (理由は main loop 側の同じ分岐を参照)。
-                                        wal_append_count_for_thread
-                                            .fetch_add(batch.len() as u64, Ordering::Release);
-                                    }
-                                }
-                            }
-                        }
-                        while let Some(op) = q_for_thread.pop() {
-                            engine.apply_op(op);
-                            apply_count_for_thread.fetch_add(1, Ordering::Release);
-                        }
                         // shutdown 時の最終 Commit + 順序付き同期
                         if let Some(wal) = oplog_for_thread.as_ref() {
                             let committed = engine.append_commit_marker(wal).is_ok();
@@ -15688,36 +15481,31 @@ impl Engine {
                         return;
                     }
 
-                    if !drained_any {
-                        // #391: 仕事が無い間は寝て、 書き手が積んだ / WAL に書いた / 閉じる / WAL の空きを待つ書き手が
-                        // 居る時に起こされる (旧: 1 ms ごとに起きて見回り = 何もしない DB 1 つで 1 秒 500 回)。
-                        // 時間で起きるのは、 書き出し (100 ms ごと) や畳みがまだ残っている間だけ
-                        let timeout = match oplog_for_thread.as_ref() {
-                            None => None,
-                            Some(wal) => {
-                                let behind = wal.head() > wal.checkpoint()
-                                    || wal.head() > enchudb_oplog::oplog::HEADER_SIZE as u64
-                                    || engine.wal_room_wanted.load(Ordering::Acquire);
-                                if behind {
-                                    Some(fsync_interval.saturating_sub(last_fsync.elapsed()).max(Duration::from_millis(1)))
-                                } else if engine.sync_tables_enabled()
-                                    || !listeners_for_thread.read().unwrap_or_else(|p| p.into_inner()).is_empty()
-                                {
-                                    // sync の bridge (相手の ack で `_sync_ops` が空くのを待つ等) / changefeed は時間で
-                                    // 見直す物が残りうるので、 1 秒ごとには起きる
-                                    Some(Duration::from_secs(1))
-                                } else {
-                                    None
-                                }
+                    // #391: 仕事が無い間は寝て、 WAL に書いた / 閉じる / WAL の空きを待つ書き手が居る時に起こされる
+                    // (旧: 1 ms ごとに起きて見回り = 何もしない DB 1 つで 1 秒 500 回)。
+                    // 時間で起きるのは、 書き出し (100 ms ごと) や畳みがまだ残っている間だけ
+                    let timeout = match oplog_for_thread.as_ref() {
+                        None => None,
+                        Some(wal) => {
+                            let behind = wal.head() > wal.checkpoint()
+                                || wal.head() > enchudb_oplog::oplog::HEADER_SIZE as u64
+                                || engine.wal_room_wanted.load(Ordering::Acquire);
+                            if behind {
+                                Some(fsync_interval.saturating_sub(last_fsync.elapsed()).max(Duration::from_millis(1)))
+                            } else if engine.sync_tables_enabled()
+                                || !listeners_for_thread.read().unwrap_or_else(|p| p.into_inner()).is_empty()
+                            {
+                                // sync の bridge (相手の ack で `_sync_ops` が空くのを待つ等) / changefeed は時間で
+                                // 見直す物が残りうるので、 1 秒ごとには起きる
+                                Some(Duration::from_secs(1))
+                            } else {
+                                None
                             }
-                        };
-                        waker.sleep(timeout, || {
-                            q_for_thread.is_empty()
-                                && oplog_record_queue_for_thread.as_ref().is_none_or(|w| w.is_empty())
-                                && !flag_for_thread.load(Ordering::Acquire)
-                                && !engine.wal_room_wanted.load(Ordering::Acquire)
-                        });
-                    }
+                        }
+                    };
+                    waker.sleep(timeout, || {
+                        !flag_for_thread.load(Ordering::Acquire) && !engine.wal_room_wanted.load(Ordering::Acquire)
+                    });
                 }
             })
             .expect("failed to spawn consumer thread");
@@ -15752,8 +15540,10 @@ impl Engine {
         folded
     }
 
-    /// #388: WAL を書き出して (Commit → oplog fsync + 本体 msync → checkpoint を head まで) 畳む。 consumer thread から、
-    /// WAL に居る record の効果が全部本体に入っている時 (apply の drain の後) だけ呼ぶ。
+    /// #388: WAL を書き出して (Commit → oplog fsync + 本体 msync → checkpoint を head まで) 畳む。 consumer thread から呼ぶ。
+    /// 書き込みは呼んだ thread が WAL に載せてから本体に当てるので、 途中の書き込みの record は本体に入る前に畳まれうる。
+    /// その書き込みはまだ返っておらず、 返る前に本体に当たって次の書き出しに入る (0.33 までは async の書き込みを consumer
+    /// が当てていたので、 当て終えた後 = apply の drain の後にだけ呼んでいた)。
     ///
     /// 書き出しから畳むまで append を止める (`OpLog::checkpoint_and_reset`)。 consumer の 100 ms ごとの tick は、
     /// 書き出しと畳みの間に次の record が入ると畳めないので、 休まず書く書き手が居ると ring が満杯まで埋まり、 append が
@@ -15842,7 +15632,7 @@ impl Engine {
     /// #388: WAL が満杯で載らなかった書き手の待ち手 (`OpLog::set_room_waiter`)。 空いたら true (書き手は書き直す)、
     /// 空かなければ false (今までどおり落ちる)。
     ///
-    /// - consumer 自身 (束の append / tick の Commit): その場で畳む (WAL に居る record の効果は本体に入っている)
+    /// - consumer 自身 (tick の Commit など): その場で畳む
     /// - 他の thread: consumer に畳むよう頼み、 `size` byte 空くまで待つ。 待ち始めた後に consumer が 1 回試して空かな
     ///   ければ (sync の bridge が配り終えていない等で畳めない) すぐ諦める。 上限 `WAL_ROOM_WAIT`、 閉じている最中は待たない
     #[cfg(not(target_arch = "wasm32"))]
@@ -15886,8 +15676,8 @@ impl Engine {
 
     /// #391: consumer を起こす係 (consumer が居なければ None)。
     #[inline]
-    fn consumer_waker(&self) -> Option<&crate::write_queue::ConsumerWaker> {
-        self.write_queue.as_ref().map(|q| &**q.waker())
+    fn consumer_waker(&self) -> Option<&crate::consumer_waker::ConsumerWaker> {
+        self.consumer_waker.as_deref()
     }
 
     /// #388: WAL が満杯の時に consumer が畳んで空いた回数 (書き手は待たされたが、 何も落ちていない)。
@@ -16222,9 +16012,10 @@ impl Engine {
             oplog_lag_bytes: oplog_head.saturating_sub(oplog_checkpoint),
             oplog_next_lsn: oplog_lsn,
             durable_lsn: self.durable_lsn.load(Ordering::Acquire),
-            queue_len: self.write_queue.as_ref().map(|q| q.len()).unwrap_or(0),
-            pushed: self.push_count.load(Ordering::Acquire),
-            applied: self.apply_count.load(Ordering::Acquire),
+            // 0.34 で write queue を外した (欄は互換のために残す)
+            queue_len: 0,
+            pushed: 0,
+            applied: 0,
             peer_id,
             bind_over_local_writes: self.bind_over_local_writes(),
             hlc_entries,
@@ -16276,7 +16067,7 @@ impl Engine {
     }
 
     /// #381: この DB の辞書の語を回収するようにする (header に印を立て、 file version を 12 にする = 旧 binary は
-    /// 開けない)。 **次に開いた時から**効く (開いている間に始めると、 書き込みの queue に積まれた番号を数え漏らす)。
+    /// 開けない)。 **次に開いた時から**効く (開いている間に始めると、 書き込みの途中で押さえた番号を数え漏らす)。
     /// 参照数は DB の directory の `vocab.refs.seg` に置き、 きれいに閉じれば次に開いた時もそのまま使う。 落ちた後などで
     /// 使えない時は、 開く時に生きている行の cell を数え直す (時間は 行の数 × 辞書を使う列の数、 #385)。
     ///
@@ -16429,67 +16220,6 @@ impl Engine {
         }
     }
 
-    /// consumer スレッド内部で呼ぶ。Op 1 個を適用。
-    fn apply_op(&self, op: crate::write_queue::Op) {
-        use crate::write_queue::Op;
-        // #135 / #206: 旧 Leaf slot の読みから free まで / 削除の全列を 1 回の行の書き込みに
-        let _row = match &op {
-            Op::Tie { eid, .. } | Op::Untie { eid, .. } | Op::Delete { eid, .. } => Some(self.row_locks.write(*eid)),
-            _ => None,
-        };
-        match op {
-            Op::Tie { eid, himo_id, value, hlc } => {
-                let hid = himo_id as usize;
-                if hid >= self.himos.len() { return; }
-                // v6 (#88): routed-Leaf の re-tie 上書きは旧 offset を free (async path)。
-                // #119: **publish → free** の順 (逆順だと並行 reader が再利用 slot を読む)。
-                let old = self.take_leaf_cell(eid, hid);
-                // request17 step 4: push 時に採番した版数で値と一緒に書く。
-                let written = self.set_cell_local(eid, himo_id, value, hlc);
-                // #381: push 側が押さえた番号を返す (Tag の列)
-                self.vocab_unpin(hid, value as u32);
-                if written {
-                    self.free_leaf_offset(hid, old);
-                } else {
-                    // 不採用: cell は旧値のまま = 旧 payload はまだ生きている。
-                    // 代わりに push 側が確保済みの **新** payload (= value) を捨てる
-                    // (routed-Leaf 以外では no-op)。
-                    // 一度も cell に載せていないので、 書き出しを待たずに空きへ (#414)
-                    if let Some(leaf) = self.leaf_for(hid) {
-                        leaf.free(value as u32); // leaf の列は u32 (offset)
-                    }
-                    self.warn_local_write_rejected(eid, himo_id, hlc);
-                }
-            }
-            Op::Untie { eid, himo_id, hlc } => {
-                let hid = himo_id as usize;
-                if hid >= self.himos.len() { return; }
-                if !self.clear_cell_local_freeing_leaf(eid, himo_id, hlc) {
-                    self.warn_local_write_rejected(eid, himo_id, hlc);
-                }
-            }
-            Op::Delete { eid, hlc } => {
-                // request17 (A-5): 削除の版数は eid 空間の tombstone column へ。
-                if !self.set_tombstone_local(eid, hlc) {
-                    self.warn_local_write_rejected(eid, u16::MAX, hlc);
-                    return;
-                }
-                for hid in 0..self.himos.len() {
-                    self.remove_cell_freeing_leaf(eid, hid);
-                }
-                self.live_free(eid);
-            }
-            Op::EntityCreated { local: _ } => {
-                // v4 (undo 廃止) 以降は no-op。 `entity()` で local slot は writer
-                // thread 側で既に allocate 済み。 ここに来るのは `flush_writes` の
-                // push_count / apply_count counter を対称に進めるためだけ (issue5)。
-                // #195: 新規 code はこの op を queue に積まない (counter 直接 bump に
-                // 置換 — blocking push が consumer 自身の bridge 経路で livelock を
-                // 起こした)。 variant と本 arm は互換のため残置。
-            }
-        }
-    }
-
     /// 呼んだ thread がその場で書く (`tie_to` と同じ道)。 返った時には本体に当たっていて、 WAL 付きの engine なら WAL にも
     /// 載っている。 紐名は事前に `define_himo` で定義されている必要がある。
     ///
@@ -16621,41 +16351,19 @@ impl Engine {
     /// oplog への参照(テスト / 内部用)。
     pub fn oplog(&self) -> Option<&std::sync::Arc<enchudb_oplog::oplog::OpLog>> { self.oplog.as_ref() }
 
-    /// #116: write queue の slot 数 (観測用)。concurrent mode でなければ None。
-    /// oplog_record_queue も同じ capacity で確保される。
+    /// #116: 0.33 までの write queue の slot 数 (観測用)。 0.34 で queue を外したので常に None (互換のために残す)。
     pub fn write_queue_capacity(&self) -> Option<usize> {
-        self.write_queue.as_ref().map(|q| q.capacity())
+        None
     }
 
-    /// push 済みの全 Op が apply 完了するまで spin 待ち。`tie_async` の同期点。
-    /// `queue.is_empty()` は pop 直後 / apply 前のウィンドウで true になる race が
-    /// あるため、push_count と apply_count の累積カウンタで apply 完了を待つ。
-    pub fn flush_writes(&self) {
-        use std::sync::atomic::Ordering;
-        if self.write_queue.is_none() { return; }
-        loop {
-            let pushed = self.push_count.load(Ordering::Acquire);
-            let applied = self.apply_count.load(Ordering::Acquire);
-            // WAL record queue も barrier に含める: op は queue 先行・record
-            // 後追い (#77-H4) なので、 apply_count だけで返ると「op は適用済み
-            // だが WAL record は queue 内」の窓が残り、 直後の oplog_sync が
-            // record を含まない WAL に Commit + fsync してしまう
-            // (= fsync 済みのはずの write が crash で消える durability 破れ)。
-            let wal_pushed = self.wal_push_count.load(Ordering::Acquire);
-            let wal_appended = self.wal_append_count.load(Ordering::Acquire);
-            if applied >= pushed && wal_appended >= wal_pushed { return; }
-            // #77-M2: consumer が死んでいたら barrier は永遠に成立しない。
-            // silent hang ではなく診断可能な panic で失敗する。
-            if self.consumer_poisoned.load(Ordering::Acquire) {
-                panic!("enchudb consumer thread has panicked — flush_writes cannot complete (#77-M2)");
-            }
-            std::thread::yield_now();
-        }
-    }
+    /// 何もしない (互換のために残す)。 0.33 までは `tie_async` などが積んだ write queue を裏の thread が当て終えるまで
+    /// 待つ同期点だった。 0.34 から書き込みは全部、 呼んだ thread がその場で書く (返った時には本体に当たっていて、 WAL
+    /// 付きなら WAL にも載っている) ので、 待つものが無い。
+    pub fn flush_writes(&self) {}
 
-    /// キューに滞留中の件数(デバッグ用)。
+    /// 0.33 までの write queue に滞留中の件数 (デバッグ用)。 0.34 で queue を外したので常に 0 (互換のために残す)。
     pub fn pending_writes(&self) -> usize {
-        self.write_queue.as_ref().map(|q| q.len()).unwrap_or(0)
+        0
     }
 
     // ──── flush ────
@@ -16902,28 +16610,14 @@ impl Drop for Engine {
         if let Some(wal) = self.oplog.as_ref() {
             wal.set_room_waiter(None);
         }
-        // 既に push 済みの全 Op が apply 完了するまで待機(best-effort)。
-        // shutdown flag を立てる前に呼ぶことで、writer がまだ活きてる場合でも
-        // ここまでに走った tie_async は consumer が反映済みとなる。
-        if self.write_queue.is_some() {
-            loop {
-                let pushed = self.push_count.load(Ordering::Acquire);
-                let applied = self.apply_count.load(Ordering::Acquire);
-                if applied >= pushed { break; }
-                // #77-M2: consumer 死亡時は待っても進まない。 Drop は panic せず
-                // 諦めて shutdown へ進む (未 apply 分は失われるが、 hang しない)。
-                if self.consumer_poisoned.load(Ordering::Acquire) { break; }
-                std::thread::yield_now();
-            }
-        }
         if let Some(flag) = &self.shutdown_flag {
             flag.store(true, Ordering::Release);
         }
-        // #391: 寝ている consumer を起こして最終 drain に入らせる
+        // #391: 寝ている consumer を起こして最後の書き出しに入らせる
         if let Some(w) = self.consumer_waker() {
             w.wake();
         }
-        // consumer スレッドは shutdown flag を検知したら最終 drain を行って exit する。
+        // consumer スレッドは shutdown flag を検知したら最後の書き出しをして exit する。
         if let Ok(mut h) = self.consumer_handle.lock() {
             if let Some(handle) = h.take() {
                 let _ = handle.join();
@@ -16932,7 +16626,6 @@ impl Drop for Engine {
         // #101: graceful close で clean flag を永続化 → 次 open は rebuild_index skip。
         // panic unwinding 中 / consumer 死亡時は「dirty のまま」に倒す (= 次 open で
         // rebuild が走るのが正しい recovery)。 readonly は共有 mmap を書けないので除外。
-        // queue は上の drain + consumer join で空なので barrier (flush_writes) は不要。
         // best-effort: msync の Err は握る (dirty のままでも安全側)。
         #[cfg(not(target_arch = "wasm32"))]
         if !std::thread::panicking()
@@ -17555,7 +17248,7 @@ mod cell_version_tests {
 
     // ──── step 4: ローカル write が版数を書く ────
 
-    /// v9 DB + oplog (WAL) + consumer。 async 経路まで通した実構成。
+    /// v9 DB + oplog (WAL) + consumer (書き出し係) の実構成。
     fn v9_with_wal(name: &str, himo: &str) -> (std::sync::Arc<Engine>, u16) {
         let path = tmp(name);
         let _ = std::fs::remove_file(format!("{path}.wal"));
@@ -17630,8 +17323,8 @@ mod cell_version_tests {
         assert_eq!(deletes, vec![tomb], "tombstone 版数と Delete record の HLC が違う");
     }
 
-    /// **async 経路** (適用と WAL append が別 queue / 別タイミング) でも、 cell の版数と
-    /// record の HLC が一致すること。 ここがずれると peer 間で勝者が分かれる。
+    /// `*_async` の書き込みでも、 cell の版数と record の HLC が一致すること (0.33 までは適用と WAL append が別 queue /
+    /// 別タイミングだった。 0.34 から同期の道と同じ)。 ここがずれると peer 間で勝者が分かれる。
     #[test]
     fn async_write_puts_the_same_hlc_on_cell_and_record() {
         let (eng, hid) = v9_with_wal("async_tie", "age");
@@ -17958,7 +17651,7 @@ mod cell_version_tests {
         eng.tie_to(e1, "age", 30);
         eng.tie_text_to(e2, "name", "bob");
         eng.untie(e1, "age");
-        // async 経路も混ぜる
+        // `*_async` の名前の書き込みも混ぜる (0.34 から同期の道と同じ)
         eng.tie_async(e2, "age", 20);
         eng.tie_text_async(e2, "name", "bobby");
         eng.delete_async(e1);
@@ -18180,8 +17873,9 @@ mod tests {
 
         let e = eng.entity_in("rows").unwrap();
         eng.tie_async_by_id(e, hid, 9);
-        // tie_async は queue 経由。 WAL append を待たずに Commit を打つと、 record が
-        // Commit の **後ろ** に並んで次の fsync まで commit されない (= 空 scan が続く)。
+        // 0.33 までは tie_async が queue 経由で、 WAL append を待たずに Commit を打つと、 record が
+        // Commit の **後ろ** に並んで次の fsync まで commit されなかった (= 空 scan が続く)。 0.34 から
+        // tie_async も返った時に WAL に載っているので、 flush_writes は何もしない。
         eng.flush_writes();
         eng.oplog_sync().unwrap();
 
@@ -18388,76 +18082,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #343: consumer が当てる delete (`apply_op` の `Op::Delete`) も **列を消してから** Leaf の slot を返す。
-    /// consumer を通すと当てるのが遅れ、 読み手が当てる途中の entity を読めない (16 回中 2 回しか検出
-    /// しなかった) ので、 同じ `apply_op` を churn の thread から直接呼ぶ。 旧順序で 8/8 回検出 (1 回
-    /// 167〜1,820 件)。 他の経路は `tests/issue343_leaf_free_after_clear.rs`。
+    /// 0.34: 裏の thread の仕事は WAL の書き出しだけ (書き込みは `*_async` も呼んだ thread がその場で書く) なので、 WAL の
+    /// 無い並行の engine は裏の thread を持たない。 対照: WAL 付きは持つ。
     #[test]
-    fn issue343_apply_op_delete_clears_before_freeing_leaf() {
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-        use std::sync::Arc;
-        let dir = tmp("issue343_apply_op_delete");
-        let mut eng = Engine::create_growable(&dir).unwrap();
-        eng.define_himo("body", ValueType::Leaf, 0);
-        let hid = eng.himo_id("body").unwrap() as u16;
-        let y = eng.entity().unwrap();
-        let first = eng.entity().unwrap();
-        let eng = Arc::new(eng);
-        const X: &[u8] = &[b'x'; 64];
-        let current = Arc::new(AtomicU64::new(first));
-        let stop = Arc::new(AtomicBool::new(false));
-        let churn = {
-            let (eng, current, stop) = (eng.clone(), current.clone(), stop.clone());
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    let e = eng.entity().unwrap();
-                    eng.tie_bytes_to_by_id(e, hid, X);
-                    current.store(e, Ordering::Relaxed);
-                    let hlc = eng.mint_local_hlc();
-                    eng.apply_op(crate::write_queue::Op::Delete { eid: enchudb_oplog::eid_local(e), hlc });
-                }
-            })
-        };
-        let other_row = {
-            let (eng, stop) = (eng.clone(), stop.clone());
-            std::thread::spawn(move || {
-                let mut n = 0u8;
-                while !stop.load(Ordering::Relaxed) {
-                    eng.tie_bytes_to_by_id(y, hid, &[b'a' + n % 20; 64]);
-                    n = n.wrapping_add(1);
-                }
-            })
-        };
-        let readers: Vec<_> = (0..4)
-            .map(|_| {
-                let (eng, current) = (eng.clone(), current.clone());
-                std::thread::spawn(move || {
-                    let (mut x, mut other) = (0usize, 0usize);
-                    let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
-                    while std::time::Instant::now() < end {
-                        match eng.get_text_owned(current.load(Ordering::Relaxed), "body") {
-                            Some(b) if b == X => x += 1,
-                            None => {}
-                            Some(_) => other += 1,
-                        }
-                    }
-                    (x, other)
-                })
-            })
-            .collect();
-        let (mut x, mut other) = (0, 0);
-        for r in readers {
-            let (a, b) = r.join().unwrap();
-            (x, other) = (x + a, other + b);
+    fn concurrent_engine_without_wal_has_no_background_thread() {
+        for wal in [false, true] {
+            let dir = tmp(if wal { "bg_thread_wal" } else { "bg_thread_nowal" });
+            let mut eng = Engine::create_growable(&dir).unwrap();
+            eng.define_himo("v", ValueType::Number, 0);
+            let eng = if wal { Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap() } else { Engine::concurrentize(eng) };
+            assert_eq!(eng.consumer_handle.lock().unwrap().is_some(), wal, "wal {wal}: 裏の thread の有無");
+            assert_eq!(eng.consumer_waker.is_some(), wal, "wal {wal}: 起こす係の有無");
+            let e = eng.entity().unwrap();
+            eng.tie_async(e, "v", 7u32);
+            assert_eq!(eng.get(e, "v"), Some(7), "wal {wal}: 返った時に見えない");
+            drop(eng);
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_file(&dir);
+            let _ = std::fs::remove_file(format!("{dir}.oplog"));
         }
-        stop.store(true, Ordering::Relaxed);
-        churn.join().unwrap();
-        other_row.join().unwrap();
-        eprintln!("x {x} / 他の値 {other}");
-        assert!(x > 0, "x を一度も読めていない (前提が崩れた)");
-        assert_eq!(other, 0, "consumer の delete の途中で別の行の値を読んだ");
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_file(&dir);
     }
 
     /// #128: 進捗の無い Retry 連発 (= crash 残骸の odd gen) では reader が

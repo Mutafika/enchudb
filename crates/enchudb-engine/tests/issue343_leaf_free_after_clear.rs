@@ -7,7 +7,7 @@
 //! 各経路で、 x を書いては外す thread と、 y を同じ長さの別の値で書き換え続ける thread を回し、 x を
 //! 読み続ける。 x の値か None 以外が返ったら落とす。 旧順序での実測 (release、 M2、 3 秒):
 //! 読み手 4 本で 8 回ずつ、 untie 8/8 回 (1 回 4,931〜62,239 件)、 delete 8/8 回 (215〜12,825 件)。
-//! consumer が当てる delete (`apply_op`) は engine の unit test (`issue343_apply_op_delete_clears_before_freeing_leaf`)。
+//! 0.33 までの consumer が当てる delete (`apply_op`) は 0.34 で無くなった (`delete_async` もここの `delete` を通る)。
 
 use enchudb_engine::{Engine, GrowableOptions, ValueType};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

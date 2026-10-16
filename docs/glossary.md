@@ -164,8 +164,8 @@ declarative API 層。 0.7.0 で内部実装が engine table API 経由に切り
 |---|---|---|
 | **writer 1 process + reader 無制限** | concurrency | SQLite WAL モード相当。 writer 系 open は `.db.lock` を flock(LOCK_EX)、 2 つ目は block |
 | **.db.lock sidecar** | concurrency | `{path}.db.lock` ファイル、 flock 排他用。 Engine drop で fd close = lock release |
-| **concurrentize_with_oplog** | concurrency | build 済み Engine を Arc + consumer thread + oplog 配送モードに遷移する関数 |
-| **WriteQueue** | concurrency | in-process の write を consumer thread に渡す lock-free queue (SegQueue)、 oplog mode で使う |
+| **concurrentize_with_oplog** | concurrency | build 済み Engine を Arc + consumer thread (WAL の書き出し係) + oplog 配送モードに遷移する関数 |
+| **WriteQueue** | concurrency | 0.33 まで: in-process の write を consumer thread に渡す bounded queue。 0.34 で外した (書き込みは呼んだ thread がその場で書く) |
 | **AtomicBool swap** | concurrency | Cylinder rebuild のロックフリー切替に使う double buffer + atomic compare_exchange |
 | **&self vs &mut self** | concurrency | API 表で峻別。 build phase は `&mut self`、 runtime は `&self` のみで concurrent 読み書き |
 

@@ -13,6 +13,10 @@
 //! 直後の `oplog_sync()` が record の入っていない WAL に Commit + fsync して
 //! いた (= sync 転送漏れ / crash durability 破れ。 sync lib テストの flaky の
 //! 正体)。
+//!
+//! 0.34 で queue を外した (`*_async` も書いた thread がその場で書き、 `flush_writes` は何もしない)。 守っていた約束
+//! (返った書き込みが直後の問い合わせに見える、 `oplog_sync` の前に書いた record が `_sync_ops` に載る) は、 同じ形で
+//! 見続ける。
 
 use enchudb_engine::{Engine, ValueType};
 use std::sync::Arc;

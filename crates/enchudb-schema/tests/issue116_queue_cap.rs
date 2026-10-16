@@ -1,9 +1,9 @@
-//! #116: write/oplog-record queue の capacity が (1) default で max_entities に
-//! 連動し、(2) `finish_*_with_queue` で明示指定できること。
+//! #116: 0.33 までは engine ごとに write/oplog-record queue を 2 本 eager に確保していた (default は max_entities に
+//! 連動、 上限 1M slot = per-DB 最大 ~128MiB の固定 RSS)。 `finish_*_with_queue` / `open_with_oplog_with_queue` で cap を
+//! 指定できた。
 //!
-//! 1M slot 固定は per-DB ~128MiB の固定 RSS (queue 2 本) になり、per-user /
-//! per-tenant に DB を分ける構成の host 密度を縛っていた。RSS の実測は
-//! 負荷 harness の `examples/memory_probe.rs` 側で行う (ここは capacity の契約のみ)。
+//! 0.34 で queue を外した (書き込みは呼んだ thread がその場で書く) ので、 queue の分の固定のメモリは無い。 ここでは、
+//! どの開き方でも queue が無いこと、 cap の knob は互換のために受け付けて使わず、 DB は普通に使えることを見る。
 
 use enchudb_schema::Database;
 
@@ -32,51 +32,42 @@ fn build(path: &str, cap: u32) -> Database {
     db
 }
 
-/// 小 DB の default は max_entities に連動して縮む。
+/// どの開き方でも write queue は無い (0.33 の default: 小 DB は max_entities に連動・下限 4096、 大 DB は 1M slot)。
 #[test]
-fn default_queue_cap_scales_with_max_entities() {
-    let path = tmp("scaled");
-    cleanup(&path);
-    let db = build(&path, 10_000).finish_with_oplog(4 * 1024 * 1024).unwrap();
-    assert_eq!(db.engine().write_queue_capacity(), Some(10_000));
-    drop(db);
-    cleanup(&path);
-}
-
-/// floor: 極小 DB でも burst 吸収の下限 4096 は確保する。
-#[test]
-fn default_queue_cap_has_a_floor() {
-    let path = tmp("floor");
-    cleanup(&path);
-    let db = build(&path, 1_000).finish_with_oplog(4 * 1024 * 1024).unwrap();
-    assert_eq!(db.engine().write_queue_capacity(), Some(4_096));
-    drop(db);
-    cleanup(&path);
-}
-
-/// ceiling: 大 DB は従来どおり 1M slot で頭打ち (挙動不変)。
-#[test]
-fn default_queue_cap_is_capped_at_one_million() {
-    let path = tmp("cap");
+fn no_write_queue_in_any_mode() {
+    for (tag, cap) in [("small", 1_000u32), ("mid", 10_000)] {
+        let path = tmp(tag);
+        cleanup(&path);
+        let db = build(&path, cap).finish_with_oplog(4 * 1024 * 1024).unwrap();
+        assert_eq!(db.engine().write_queue_capacity(), None, "{tag}: finish_with_oplog");
+        drop(db);
+        cleanup(&path);
+    }
+    let path = tmp("big");
     cleanup(&path);
     let mut db = Database::create(&path).unwrap(); // max_entities = 16M default
     db.table("t").tag("k").number("v").primary_key("k").build().unwrap();
     let db = db.finish_with_oplog(4 * 1024 * 1024).unwrap();
-    assert_eq!(db.engine().write_queue_capacity(), Some(1_048_576));
+    assert_eq!(db.engine().write_queue_capacity(), None, "big: finish_with_oplog");
+    drop(db);
+    cleanup(&path);
+    let path = tmp("no-oplog-default");
+    cleanup(&path);
+    let db = build(&path, 100_000).finish_concurrent().unwrap();
+    assert_eq!(db.engine().write_queue_capacity(), None, "finish_concurrent");
     drop(db);
     cleanup(&path);
 }
 
-/// 明示指定 (finish_with_oplog_with_queue) が default より優先される。
+/// cap の knob (finish_with_oplog_with_queue) は受け付けて使わない。 書き込みは普通に通る。
 #[test]
-fn explicit_queue_cap_wins() {
+fn queue_cap_knob_is_accepted_and_ignored() {
     let path = tmp("explicit");
     cleanup(&path);
     let db = build(&path, 100_000)
         .finish_with_oplog_with_queue(4 * 1024 * 1024, 4_096)
         .unwrap();
-    assert_eq!(db.engine().write_queue_capacity(), Some(4_096));
-    // 通常の書き込みが問題なく通る
+    assert_eq!(db.engine().write_queue_capacity(), None);
     db.get_table("t").unwrap().insert().set("k", "a").set("v", 1i64).commit().unwrap();
     assert_eq!(db.get_table("t").unwrap().all().count().unwrap(), 1);
     drop(db);
@@ -85,19 +76,20 @@ fn explicit_queue_cap_wins() {
 
 /// oplog なし版 (finish_concurrent_with_queue)。
 #[test]
-fn explicit_queue_cap_without_oplog() {
+fn queue_cap_knob_without_oplog() {
     let path = tmp("no-oplog");
     cleanup(&path);
     let db = build(&path, 100_000).finish_concurrent_with_queue(8_192).unwrap();
-    assert_eq!(db.engine().write_queue_capacity(), Some(8_192));
+    assert_eq!(db.engine().write_queue_capacity(), None);
+    db.get_table("t").unwrap().insert().set("k", "a").set("v", 1i64).commit().unwrap();
+    assert_eq!(db.get_table("t").unwrap().all().count().unwrap(), 1);
     drop(db);
     cleanup(&path);
 }
 
-/// reopen 側 (open_with_oplog_with_queue) — LRU pool 運用の open hot path。
-/// 省略版 open は header の max_entities から scaled default。
+/// reopen 側 (open_with_oplog / open_with_oplog_with_queue) — LRU pool 運用の open hot path。 中身はそのまま。
 #[test]
-fn open_side_queue_cap() {
+fn open_side_queue_cap_knob() {
     let path = tmp("open");
     cleanup(&path);
     {
@@ -107,11 +99,11 @@ fn open_side_queue_cap() {
     }
     {
         let db = Database::open_with_oplog(&path, 4 * 1024 * 1024).unwrap();
-        assert_eq!(db.engine().write_queue_capacity(), Some(50_000), "scaled default on open");
+        assert_eq!(db.engine().write_queue_capacity(), None, "open");
     }
     {
         let db = Database::open_with_oplog_with_queue(&path, 4 * 1024 * 1024, 4_096).unwrap();
-        assert_eq!(db.engine().write_queue_capacity(), Some(4_096), "explicit knob on open");
+        assert_eq!(db.engine().write_queue_capacity(), None, "open with the knob");
         assert_eq!(db.get_table("t").unwrap().all().count().unwrap(), 1, "data intact");
     }
     cleanup(&path);

@@ -1,6 +1,9 @@
 //! issue4 regression: write_queue / oplog_record_queue を bounded ArrayQueue 化、
 //! producer は queue 満杯時に yield-spin で block する。 small cap で writer 数 >>
 //! consumer rate な状況を作って、 hang せず全 push が完走する事を確認。
+//!
+//! 0.34 で queue を外した (`*_async` も書いた thread がその場で書く。 cap の knob は受け付けて使わない)。 その後も
+//! cap の knob を渡した engine で、 8 本の書き手が止まらずに書き終わり、 返った時に全部見えることを見る。
 
 use enchudb_engine::{Engine, ValueType};
 use std::sync::Arc;
@@ -40,4 +43,10 @@ fn small_queue_cap_does_not_hang() {
         })
     }).collect();
     for h in handles { h.join().expect("writer panicked"); }
+    // flush_writes を呼ばずに、 書いた値が全部見える (0.34: 返った時には当たっている)
+    for w in 0..n_writers {
+        for i in 0..per {
+            assert_eq!(eng.query_by_id(&[(marker_hid, w * 1000 + i)]).len(), 1, "writer {w} の {i} 番目が見えない");
+        }
+    }
 }

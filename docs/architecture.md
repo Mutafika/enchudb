@@ -245,8 +245,10 @@ client-server (集約) 両 topology に対応。 transport は `enchudb-transpor
 - writer 系 open は `.db.lock` に **flock(LOCK_EX)**、 engine drop で release
   (= 2 つ目の writer は **block する**、 SQLite と同じ、 timeout 無し)
 - `open_readonly` は lock 取らない、 reader 同士 + writer と共存 OK
-- in-process は consumer thread + WriteQueue で並列 write を受ける (= server 用、
-  `concurrentize_with_oplog`)
+- in-process は `Arc<Engine>` を共有して並列 write を受ける (= server 用、
+  `concurrentize_with_oplog`)。 0.34 から書き込みは全部、 呼んだ thread がその場で書く
+  (`*_async` も。 0.33 までは WriteQueue に積んで consumer thread が当てていた)。 裏の
+  thread は WAL の書き出し係だけで、 WAL の無い engine は持たない
 - 0.7.0: `entity_in(table)` が `&self` 化 (= AtomicU32 CAS 払出)、 Arc<Engine>
   経由の concurrent mode から row insert で race しなくなった
 

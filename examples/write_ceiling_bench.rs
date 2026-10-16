@@ -5,6 +5,9 @@
 //!
 //!   tie_async → oplog append (memcpy) → WriteQueue push → 単一 consumer が apply
 //!
+//! 0.34 から tie_async は呼んだ thread がその場で書く (WriteQueue と consumer の apply は無い)。 なので下の push は
+//! 書き込みの全部で、 drain (flush_writes) はすぐ返る。 single-consumer bound の問いは 0.33 までのもの。
+//!
 //! producer thread 数 P を 1/2/4/8 と変えて、 throughput が P で伸びるか
 //! (＝ scale する) / 頭打ちになるか (＝ single-consumer bound) を見る。
 //!

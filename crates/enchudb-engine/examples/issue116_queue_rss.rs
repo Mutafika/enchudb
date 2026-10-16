@@ -3,6 +3,10 @@
 //! 確保しているため、 中身が空の DB でも per-open ~80MB RSS を固定予約する問題の
 //! 再現・計測。
 //!
+//! 0.34 で engine は queue を持たなくなった (書き込みは呼んだ thread がその場で書く)。 MODE=open / multiopen は queue
+//! 抜きの footprint を測り、 QUEUE_CAP は受け付けて使われない。 MODE=arrayqueue は 0.33 までの queue 1 本の大きさの
+//! 参考として残す。
+//!
 //! **Linux 専用**: RSS は `/proc/self/status` の VmRSS から読む。 macOS/APFS では
 //! sparse 予約が phys へ inflate するので判定は必ず Linux (OrbStack container) で行う。
 //!
