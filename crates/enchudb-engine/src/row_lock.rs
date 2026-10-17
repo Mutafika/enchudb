@@ -141,6 +141,11 @@ impl RowLocks {
                 && self.more_internal.read().unwrap_or_else(|p| p.into_inner()).iter().any(|&r| inside(r)))
     }
 
+    /// この thread が行 `local` の stripe を握っているか (握った証を受け取る関数の debug の確かめ用)。
+    pub fn held_by_me(&self, local: u32) -> bool {
+        self.held(self.stripe(local), me())
+    }
+
     /// この thread が stripe `i` を握っているか。
     fn held(&self, i: usize, me: usize) -> bool {
         self.stripes[i].ver.load(Ordering::Relaxed) & 1 == 1 && self.stripes[i].owner.load(Ordering::Relaxed) == me

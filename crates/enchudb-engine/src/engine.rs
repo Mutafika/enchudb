@@ -9000,16 +9000,6 @@ impl Engine {
         }
     }
 
-    /// 同期経路のローカル write を WAL に載せ、 **その record に載った HLC** を返す。
-    ///
-    /// 採番を `append` の直列化 (append_lock + flock) の内側に置くのが要点で、
-    /// これで **WAL 上の HLC が並び順どおり単調増加**する。 transport は record を
-    /// HLC 順に並べ替えて配る (`InMemoryTransport::pull_as` 等) ので、 崩すと
-    /// 「Vocab → その vid を使う Tie」のような依存順が受信側で逆転し、 vid 翻訳が
-    /// 生値に fallback して無関係な row へ誤 bind する (#141 の再来)。
-    ///
-    /// oplog 無効、 または append 失敗 (WAL 満杯) は `Hlc::ZERO` = 版数不明。
-    /// 後者は「本体には適用するが sync には流れない」従来の挙動と揃える。
     /// local eid → WAL に載せる global eid。 oplog 無効なら peer 0 扱い
     /// (record を出さないので値は使われない)。
     #[inline]
@@ -9018,6 +9008,28 @@ impl Engine {
         enchudb_oplog::make_eid(peer, local)
     }
 
+    /// ローカルの書き込みが WAL に積む前に握る行の lock (`append_local_op` の doc)。 WAL が無ければ積まない = 順をそろえる相手が
+    /// 無いので握らない (本体に当てる間だけ握る、 `set_cell_in` などに `None` を渡す)。 前から握っていた形のまま = WAL の無い
+    /// engine の書き込みの道は変わらない。
+    #[inline]
+    fn row_for_wal(&self, local: u32) -> Option<crate::row_lock::RowWrite<'_>> {
+        self.oplog.is_some().then(|| self.row_locks.write(local))
+    }
+
+    /// 同期経路のローカル write を WAL に載せ、 **その record に載った HLC** を返す。
+    ///
+    /// 採番を `append` の直列化 (append_lock) の内側に置くのが要点で、
+    /// これで **WAL 上の HLC が並び順どおり単調増加**する。 transport は record を
+    /// HLC 順に並べ替えて配る (`InMemoryTransport::pull_as` 等) ので、 崩すと
+    /// 「Vocab → その vid を使う Tie」のような依存順が受信側で逆転し、 vid 翻訳が
+    /// 生値に fallback して無関係な row へ誤 bind する (#141 の再来)。
+    ///
+    /// 呼び手は **行の lock を握ってから呼び ([`Self::row_for_wal`])、 本体に当て終えるまで離さない**。 同じ cell の書き手どうしで、
+    /// WAL に載る順 (= HLC の順) と本体に当てる順がそろう。 lock の外で積むと順が入れ違い、 版数を持たない DB (sync の表なし。
+    /// 後から当てた方が残る) では、 読める値と WAL の最後の record (開き直した後・change listener・相手に届く値) が食い違った (#503)。
+    /// 版数を持つ DB では、 後から当てる古い方を 「時計が戻った」 と弾いていた (`warn_local_write_rejected`)。
+    ///
+    /// oplog 無効は `Hlc::ZERO` = 版数不明。 載らなかった (WAL 満杯) 時は、 落ちた record として覚えた HLC (#57)。
     #[inline]
     fn append_local_op(&self, op: enchudb_oplog::oplog::Op<'_>) -> enchudb_oplog::Hlc {
         match self.oplog.as_ref() {
@@ -9062,8 +9074,10 @@ impl Engine {
     ///
     /// 構造上ここには来ない — ローカル採番は単調増加で、 remote apply は受信 HLC で
     /// ローカル clock を merge するため、 自分の次の HLC は必ず既存版数より大きい。
+    /// 同じ cell のローカルの書き手どうしは、 行の lock を握ってから採番するので、 採番の順に当たる
+    /// (`append_local_op` の doc。 前は lock の外で採番していて、 後から当てる古い方がここに来た)。
     /// 来たなら clock の巻き戻り (システム時刻の後退等) を意味し、 **その write は
-    /// 落ちている**ので無音にはしない。
+    /// 本体に当たっていない**ので無音にはしない (WAL には載っている)。
     fn warn_local_write_rejected(&self, local: u32, himo_id: u16, mine: enchudb_oplog::Hlc) {
         use std::sync::atomic::Ordering;
         if self.warned_cell_version_reject.swap(true, Ordering::Relaxed) {
@@ -9072,7 +9086,7 @@ impl Engine {
         eprintln!(
             "[enchudb] warning: local write (eid {}, himo {}) was rejected by the cell version \
              guard — stored HLC {:?} >= minted {:?}. clock went backwards? \
-             (this write was NOT applied and is NOT published)",
+             (this write was NOT applied here; its WAL record was already appended)",
             local, himo_id, self.cell_hlc(local as enchudb_oplog::EntityId, himo_id), mine,
         );
     }
@@ -9648,12 +9662,26 @@ impl Engine {
     /// himo_id の範囲チェックは呼び元が済ませている — 範囲外は他の write 経路と
     /// 同じく `himos[hid]` の panic になる)。
     fn set_cell_local(&self, local: u32, himo_id: u16, value: impl Into<u64>, hlc: enchudb_oplog::Hlc) -> bool {
+        self.set_cell_in(None, local, himo_id, value, hlc)
+    }
+
+    /// `set_cell_local` の、 行 `local` の lock を握っている呼び手も呼べる形。 `row` が握っている証 (握り直さない)、 `None` なら
+    /// 当てる間だけ握る。
+    fn set_cell_in(
+        &self,
+        row: Option<&crate::row_lock::RowWrite<'_>>,
+        local: u32,
+        himo_id: u16,
+        value: impl Into<u64>,
+        hlc: enchudb_oplog::Hlc,
+    ) -> bool {
         let value = value.into();
         // 列の幅に入らない値 (u32 の列への大きな値、 sync で届いた幅違い) は書かない
         if !self.fits(himo_id as usize, value) {
             return false;
         }
-        let _row = self.row_locks.write(local);
+        let _own = row.is_none().then(|| self.row_locks.write(local));
+        debug_assert!(self.row_locks.held_by_me(local), "行 {local} の lock を握っていない");
         if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
@@ -9699,7 +9727,19 @@ impl Engine {
     /// 解放する。 不採用 (= 古い untie) のときは payload を **解放しない**
     /// (cell がまだその payload を指しているため)。
     fn clear_cell_local_freeing_leaf(&self, local: u32, himo_id: u16, hlc: enchudb_oplog::Hlc) -> bool {
-        let _row = self.row_locks.write(local);
+        self.clear_cell_in_freeing_leaf(None, local, himo_id, hlc)
+    }
+
+    /// `clear_cell_local_freeing_leaf` の、 行 `local` の lock を握っている呼び手も呼べる形 (`set_cell_in` と同じ)。
+    fn clear_cell_in_freeing_leaf(
+        &self,
+        row: Option<&crate::row_lock::RowWrite<'_>>,
+        local: u32,
+        himo_id: u16,
+        hlc: enchudb_oplog::Hlc,
+    ) -> bool {
+        let _own = row.is_none().then(|| self.row_locks.write(local));
+        debug_assert!(self.row_locks.held_by_me(local), "行 {local} の lock を握っていない");
         if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
@@ -9861,7 +9901,13 @@ impl Engine {
     /// 再配送 (この冪等化) と open 時の sweep (`finish_interrupted_deletes`) の
     /// 両方で埋まる。
     fn apply_delete_local(&self, local: u32, hlc: enchudb_oplog::Hlc) -> bool {
-        let _row = self.row_locks.write(local);
+        self.apply_delete_in(None, local, hlc)
+    }
+
+    /// `apply_delete_local` の、 行 `local` の lock を握っている呼び手も呼べる形 (`set_cell_in` と同じ)。
+    fn apply_delete_in(&self, row: Option<&crate::row_lock::RowWrite<'_>>, local: u32, hlc: enchudb_oplog::Hlc) -> bool {
+        let _own = row.is_none().then(|| self.row_locks.write(local));
+        debug_assert!(self.row_locks.held_by_me(local), "行 {local} の lock を握っていない");
         let tomb = self.tombstone_version_of(local);
         if hlc != enchudb_oplog::Hlc::ZERO
             && tomb != enchudb_oplog::Hlc::ZERO
@@ -11102,7 +11148,7 @@ impl Engine {
             let bytes = value.as_bytes();
             // #135: 旧 slot を読んでから free するまで同じ cell の書き手を入れない (2 本が同じ旧 slot を
             // free すると、 cell が free 済みの slot を指す)
-            let _row = self.row_locks.write(eid);
+            let row = self.row_locks.write(eid);
             let old = self.himos[hid].get_value32(eid);
             let off = leaf.insert(bytes);
             if off == u32::MAX {
@@ -11124,7 +11170,7 @@ impl Engine {
                 himo_kind: self.value_types[hid] as u8,
                 bytes,
             });
-            if !self.set_cell_local(eid, himo_id, off, hlc) {
+            if !self.set_cell_in(Some(&row), eid, himo_id, off, hlc) {
                 leaf.free(off);
                 self.warn_local_write_rejected(eid, himo_id, hlc);
                 return Err(TieRejected::OlderThanCell);
@@ -11158,6 +11204,8 @@ impl Engine {
         // Tie が先に採番されると受信側で vid mapping が未登録のまま Tie を適用し、
         // 生の remote vid で誤 bind する (#141)。
         let reserved = self.himo_is_in_engine_internal_table(hid);
+        // 行を握ってから WAL に積む (`append_local_op` の doc)
+        let row = self.row_for_wal(eid);
         let hlc = if reserved {
             enchudb_oplog::Hlc::ZERO
         } else {
@@ -11170,7 +11218,8 @@ impl Engine {
                 enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid as u64 },
             )
         };
-        let written = self.set_cell_local(eid, himo_id, vid, hlc);
+        let written = self.set_cell_in(row.as_ref(), eid, himo_id, vid, hlc);
+        drop(row);
         self.vocab_unpin(hid, vid);
         if !written {
             self.warn_local_write_rejected(eid, himo_id, hlc);
@@ -11266,7 +11315,7 @@ impl Engine {
             // 使い切り None になる — content 経路で実測 8,132/60,463 件)。
             // 既に `tie_text_to_by_id` はこの順序。
             // #135: 旧 slot を読んでから free するまで同じ cell の書き手を入れない
-            let _row = self.row_locks.write(eid);
+            let row = self.row_locks.write(eid);
             let old = self.himos[hid].get_value32(eid);
             let off = leaf.insert(value);
             if off == u32::MAX {
@@ -11286,7 +11335,7 @@ impl Engine {
                 himo_kind: self.value_types[hid] as u8,
                 bytes: value,
             });
-            if !self.set_cell_local(eid, himo_id, off, hlc) {
+            if !self.set_cell_in(Some(&row), eid, himo_id, off, hlc) {
                 leaf.free(off);
                 self.warn_local_write_rejected(eid, himo_id, hlc);
                 return;
@@ -11315,6 +11364,8 @@ impl Engine {
         // request17 step 4: Vocab → Tie/TieNamed の順に append し (transport は HLC 順に
         // 配るので依存順を崩せない)、 Tie に載った HLC で値と版数を書く。
         let reserved = self.himo_is_in_engine_internal_table(hid);
+        // 行を握ってから WAL に積む (`append_local_op` の doc)
+        let row = self.row_for_wal(eid);
         let hlc = if reserved {
             enchudb_oplog::Hlc::ZERO
         } else {
@@ -11337,7 +11388,9 @@ impl Engine {
                 )
             }
         };
-        if !self.set_cell_local(eid, himo_id, vid, hlc) {
+        let written = self.set_cell_in(row.as_ref(), eid, himo_id, vid, hlc);
+        drop(row);
+        if !written {
             self.warn_local_write_rejected(eid, himo_id, hlc);
         }
         self.vocab_unpin(hid, vid);
@@ -11383,13 +11436,16 @@ impl Engine {
         // WAL record にも載せる (`append_at_hlc`)。 0.7.0: reserved table への write は
         // sync 対象外なので採番しない (版数不明のまま = 従来どおり)。
         let reserved = self.himo_is_in_engine_internal_table(hid);
+        // 行を握ってから WAL に積む (`append_local_op` の doc)
+        let row = self.row_for_wal(eid);
         let hlc = if reserved {
             enchudb_oplog::Hlc::ZERO
         } else {
             let oplog_eid = self.oplog_eid(eid);
             self.append_local_op(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value })
         };
-        let written = self.set_cell_local(eid, himo_id, value, hlc);
+        let written = self.set_cell_in(row.as_ref(), eid, himo_id, value, hlc);
+        drop(row);
         if pinned {
             self.vocab.release(value as u32);
         }
@@ -11432,12 +11488,15 @@ impl Engine {
             "tie_ref_to_by_id on non-Ref himo_id {}", himo_id,
         );
         self.ensure_cell_room(hid, eid)?;
-        // request17 step 4: WAL 先行で採番し、 その HLC で値と版数を不可分に書く。
+        // request17 step 4: WAL 先行で採番し、 その HLC で値と版数を不可分に書く。 行を握ってから積む (`append_local_op` の doc)
+        let row = self.row_for_wal(eid);
         let oplog_eid = self.oplog_eid(eid);
         let hlc = self.append_local_op(
             enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: target_eid as u64 },
         );
-        if !self.set_cell_local(eid, himo_id, target_eid, hlc) {
+        let written = self.set_cell_in(row.as_ref(), eid, himo_id, target_eid, hlc);
+        drop(row);
+        if !written {
             self.warn_local_write_rejected(eid, himo_id, hlc);
             return Err(TieRejected::OlderThanCell);
         }
@@ -11483,12 +11542,15 @@ impl Engine {
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         if hid >= self.himos.len() { return; }
         // request17 step 4: untie も版数を進める (進めないと外した cell に古い tie が
-        // 蘇る)。 Leaf payload の解放は **採用が決まってから**。
+        // 蘇る)。 Leaf payload の解放は **採用が決まってから**。 行を握ってから積む (`append_local_op` の doc)
+        let row = self.row_for_wal(eid);
         let oplog_eid = self.oplog_eid(eid);
         let hlc = self.append_local_op(
             enchudb_oplog::oplog::Op::Untie { eid: oplog_eid, himo_id },
         );
-        if !self.clear_cell_local_freeing_leaf(eid, himo_id, hlc) {
+        let cleared = self.clear_cell_in_freeing_leaf(row.as_ref(), eid, himo_id, hlc);
+        drop(row);
+        if !cleared {
             self.warn_local_write_rejected(eid, himo_id, hlc);
         }
     }
@@ -11501,9 +11563,13 @@ impl Engine {
         // request17 step 4 (A-5): 削除は himo を持たないので eid 空間の tombstone
         // column に版数を記録する。 これが永続することで、 配送バッファから
         // tombstone が消えた後も削除済み entity が復活しない (#140 の根)。
+        // 行を握ってから積む (`append_local_op` の doc)
+        let row = self.row_for_wal(eid);
         let oplog_eid = self.oplog_eid(eid);
         let hlc = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: oplog_eid });
-        if !self.apply_delete_local(eid, hlc) {
+        let applied = self.apply_delete_in(row.as_ref(), eid, hlc);
+        drop(row);
+        if !applied {
             self.warn_local_write_rejected(eid, u16::MAX, hlc);
         }
     }
