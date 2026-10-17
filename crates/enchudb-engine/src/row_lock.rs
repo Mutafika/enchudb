@@ -22,17 +22,33 @@
 //!
 //! 同じ thread が握っている stripe はもう一度握れる (schema の行の書き込みの中の 1 cell ずつの書き込み、
 //! 行を握ったまま読む時)。 stripe ごとに握っている thread の印を置き、 奇数で印が自分なら入れ子。
+//!
+//! engine の内部の表 (`_sync_ops` / `_sync_peers`) の行は、 ユーザの行と別の stripe を使う
+//! ([`RowLocks::add_internal_range`])。 内部の表は WAL を書き出す裏の thread (sync の bridge) が書く。 同じ stripe を
+//! 使うと、 ユーザの行を握ったまま WAL の空きを待つ書き手 (schema の `commit()` など) と、 空きを作るために
+//! `_sync_ops` の行を書く bridge が互いを待ち、 書き手は待ちの上限 (5 秒) で諦めて record を落とした (#502)。 握る順は
+//! ユーザの行 → 内部の表の行だけ (内部の表の行を握ったまま、 ユーザの行も WAL の空きも待たない: 内部の表は WAL に
+//! 積まない)。
 
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 const STRIPES: usize = 1 << 12;
+/// engine の内部の表の行の stripe の数 (ユーザの行の stripe の後ろに置く)。
+const INTERNAL_STRIPES: usize = 1 << 8;
+/// 内部の表の範囲を lock を取らずに引ける数。 越えた分 (表を何度も伸ばした時) は `more_internal` に置く。
+const INTERNAL_RANGES: usize = 16;
 /// 揃った版を掴めなかったら握って読むまでの試行回数。
 const READ_TRIES: u32 = 128;
 
 pub struct RowLocks {
     /// 1 stripe の版・握っている thread の印・先に握りたい読み手の数を 1 つに並べる (書き手 1 回で触る
-    /// cache line を 1 本にする)。
+    /// cache line を 1 本にする)。 ユーザの行の `STRIPES` 本の後ろに、 内部の表の行の `INTERNAL_STRIPES` 本。
     stripes: Box<[Stripe]>,
+    /// 内部の表の行の範囲 `[lo, hi)` (`lo << 32 | hi`)。 足すだけ (減らさない)。
+    internal: [AtomicU64; INTERNAL_RANGES],
+    /// 足した範囲の数 (`INTERNAL_RANGES` を越えた分は `more_internal` にある)。
+    internal_len: AtomicUsize,
+    more_internal: std::sync::RwLock<Vec<(u32, u32)>>,
 }
 
 /// 32 B に揃えて cache line をまたがせない (24 B のままだと 3 つに 1 つがまたぐ)。
@@ -74,8 +90,55 @@ impl Default for RowLocks {
 impl RowLocks {
     pub fn new() -> Self {
         Self {
-            stripes: (0..STRIPES).map(|_| Stripe::default()).collect(),
+            stripes: (0..STRIPES + INTERNAL_STRIPES).map(|_| Stripe::default()).collect(),
+            internal: std::array::from_fn(|_| AtomicU64::new(0)),
+            internal_len: AtomicUsize::new(0),
+            more_internal: std::sync::RwLock::new(Vec::new()),
         }
+    }
+
+    /// engine の内部の表の行の範囲 `[lo, hi)` を足す (同じ範囲は 1 回だけ)。 その範囲の行を誰かが握る前に呼ぶこと
+    /// (開いた時・表を作った時・表を伸ばして eid を払い出す前): 足す前と後で同じ行が別の stripe を使うと、 書き手どうしが
+    /// 重なる。 並行に呼ばないこと (呼び手が直列にする: `&mut` か表を伸ばす lock)。
+    pub fn add_internal_range(&self, lo: u32, hi: u32) {
+        let n = self.internal_len.load(Ordering::Relaxed);
+        let fixed = self.internal[..n.min(INTERNAL_RANGES)].iter().map(|r| unpack(r.load(Ordering::Relaxed)));
+        let more = self.more_internal.read().unwrap_or_else(|p| p.into_inner());
+        if lo >= hi || fixed.chain(more.iter().copied()).any(|r| r == (lo, hi)) {
+            return;
+        }
+        drop(more);
+        if n < INTERNAL_RANGES {
+            self.internal[n].store(u64::from(lo) << 32 | u64::from(hi), Ordering::Relaxed);
+        } else {
+            self.more_internal.write().unwrap_or_else(|p| p.into_inner()).push((lo, hi));
+        }
+        // 範囲を置いてから数を増やす (読む側の理由は `is_internal`)
+        self.internal_len.store(n + 1, Ordering::Release);
+    }
+
+    /// 行 `local` の stripe。 内部の表の行は後ろの stripe。
+    #[inline]
+    fn stripe(&self, local: u32) -> usize {
+        if self.is_internal(local) {
+            STRIPES + (local as usize & (INTERNAL_STRIPES - 1))
+        } else {
+            local as usize & (STRIPES - 1)
+        }
+    }
+
+    #[inline]
+    fn is_internal(&self, local: u32) -> bool {
+        // Relaxed で足りる: 範囲の中の行を握る thread は、 その eid を受け取った時点で、 範囲を足したこと (eid を払い出す前) が
+        // 見えている (happens-before)。 範囲の外の行は、 範囲が見えても見えなくても同じ stripe になる
+        let n = self.internal_len.load(Ordering::Relaxed);
+        if n == 0 {
+            return false;
+        }
+        let inside = |(lo, hi): (u32, u32)| local >= lo && local < hi;
+        self.internal[..n.min(INTERNAL_RANGES)].iter().any(|r| inside(unpack(r.load(Ordering::Relaxed))))
+            || (n > INTERNAL_RANGES
+                && self.more_internal.read().unwrap_or_else(|p| p.into_inner()).iter().any(|&r| inside(r)))
     }
 
     /// この thread が stripe `i` を握っているか。
@@ -91,17 +154,17 @@ impl RowLocks {
     /// 読み手が揃った版を掴めなかった時に、 書き手より先に握る。 drop で離す。
     /// この thread が別の stripe を握っている時は握らずに None (互いを待って止まらないように)。
     pub fn read_locked(&self, local: u32) -> Option<RowWrite<'_>> {
-        let i = local as usize & (STRIPES - 1);
+        let i = self.stripe(local);
         let me = me();
         // 握っている stripe は数えずに探す (握りに来るのは稀。 書き手の度に thread local を数えると tie 1 回 +0.5 ns)
-        if !self.held(i, me) && (0..STRIPES).any(|j| self.held(j, me)) {
+        if !self.held(i, me) && (0..self.stripes.len()).any(|j| self.held(j, me)) {
             return None;
         }
         Some(self.lock(local, true))
     }
 
     fn lock(&self, local: u32, urgent: bool) -> RowWrite<'_> {
-        let i = local as usize & (STRIPES - 1);
+        let i = self.stripe(local);
         let me = me();
         if self.held(i, me) {
             return RowWrite { locks: self, i: usize::MAX, _not_send: std::marker::PhantomData };
@@ -132,7 +195,7 @@ impl RowLocks {
     /// 行 `local` を、 同じ行への書き込みと重ならずに読む。 `f` は途中の書き込みを見たら捨てられ、
     /// 呼び直される (副作用を持たないこと)。 書き手が休まず同じ stripe を書き続けて揃わない時は、 握って読む。
     pub fn read<R>(&self, local: u32, mut f: impl FnMut() -> R) -> R {
-        let i = local as usize & (STRIPES - 1);
+        let i = self.stripe(local);
         // 自分が書いている最中の行 = 他の書き手はいない
         if self.held(i, me()) {
             return f();
@@ -161,6 +224,10 @@ impl RowLocks {
             backoff(&mut spins);
         }
     }
+}
+
+fn unpack(r: u64) -> (u32, u32) {
+    ((r >> 32) as u32, r as u32)
 }
 
 /// 握った thread で離すこと (握っている thread の印で入れ子を見分ける) — `Send` にしない。
@@ -262,5 +329,55 @@ mod tests {
         // 何も握っていない thread は握れる
         drop(_a);
         assert!(locks.read_locked(2).is_some());
+    }
+
+    /// 内部の表の行は、 下位 bit が同じユーザの行を握られていても待たない (別の stripe)。 範囲の外の行は今まで通り
+    /// 同じ stripe で待つ (対照)。
+    #[test]
+    fn internal_rows_do_not_wait_for_user_rows() {
+        let locks = Arc::new(RowLocks::new());
+        locks.add_internal_range(10_000, 20_000);
+        let user = 7u32;
+        let internal = 3 * STRIPES as u32 + 7; // 12295: 範囲の中、 下位 12 bit が `user` と同じ
+        let outside = 5 * STRIPES as u32 + 7; // 20487: 範囲の外、 下位 12 bit が同じ
+        assert_eq!(locks.stripe(internal), STRIPES + 7);
+        assert_eq!(locks.stripe(outside), 7);
+        let held = locks.write(user);
+        let take = |row: u32| {
+            let (locks, (tx, rx)) = (locks.clone(), std::sync::mpsc::channel());
+            let t = std::thread::spawn(move || {
+                let _w = locks.write(row);
+                tx.send(()).unwrap();
+            });
+            (t, rx)
+        };
+        let (t, rx) = take(internal);
+        rx.recv_timeout(Duration::from_secs(10)).expect("内部の表の行がユーザの行の lock を待った");
+        t.join().unwrap();
+        let (t, rx) = take(outside);
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "範囲の外の行が、 同じ stripe の lock を待たなかった");
+        drop(held);
+        rx.recv_timeout(Duration::from_secs(10)).expect("離した後も範囲の外の行が握れない");
+        t.join().unwrap();
+    }
+
+    /// 範囲は同じものを 1 回だけ数え、 lock を取らずに引ける数を越えても引ける。
+    #[test]
+    fn internal_ranges_are_counted_once_and_found_beyond_the_fixed_slots() {
+        let locks = RowLocks::new();
+        locks.add_internal_range(100, 200);
+        locks.add_internal_range(100, 200);
+        locks.add_internal_range(5, 5); // 空の範囲は足さない
+        assert_eq!(locks.internal_len.load(Ordering::Relaxed), 1);
+        for k in 0..2 * INTERNAL_RANGES as u32 {
+            locks.add_internal_range(1000 + 10 * k, 1005 + 10 * k);
+        }
+        assert_eq!(locks.internal_len.load(Ordering::Relaxed), 1 + 2 * INTERNAL_RANGES);
+        for k in 0..2 * INTERNAL_RANGES as u32 {
+            assert!(locks.is_internal(1000 + 10 * k + 4), "{k} 番目の範囲が引けない");
+            assert!(!locks.is_internal(1005 + 10 * k), "{k} 番目の範囲の外 (hi) を内部と見た");
+        }
+        assert!(locks.is_internal(150));
+        assert!(!locks.is_internal(99));
     }
 }
