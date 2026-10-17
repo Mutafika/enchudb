@@ -75,6 +75,16 @@ pub struct TableEidUsage {
     pub free: u32,
 }
 
+/// changefeed の cursor と、 畳んだ ring から移した、 まだ listener に渡していない record。
+struct ChangeCursor {
+    /// 次に listener へ渡す WAL offset。 add_change_listener 時に wal.head() に合わせ、 それ以降の commit だけが流れる。
+    offset: u64,
+    /// 畳む時に ring から移した、 Commit で閉じた record (古い順)。 次の配信が ring の分より先に渡す。
+    committed: Vec<crate::transport::WireRecord>,
+    /// 畳む時に Commit で閉じていなかった末尾の record。 その group が閉じたら (cursor の先に Commit が来たら)、 頭として渡す。
+    open_tail: Vec<crate::transport::WireRecord>,
+}
+
 /// Engine の実行時状態スナップショット。
 #[derive(Debug, Clone)]
 pub struct EngineStats {
@@ -3711,14 +3721,24 @@ pub struct Engine {
     /// 未設定なら `blob_store()` は None を返す。
     blob_store: std::sync::RwLock<Option<std::sync::Arc<dyn crate::blob_store::BlobStore>>>,
     /// changefeed: WAL に durable 化した record を listener に push する。
-    /// consumer スレッドが背景 fsync 完了後に発火。
+    /// 通知係の thread (`ensure_notifier`) が、 consumer の書き出しの後に配る。
     change_listeners: std::sync::Arc<std::sync::RwLock<Vec<std::sync::Arc<dyn crate::changefeed::ChangeListener>>>>,
-    /// changefeed: 次に listener へ emit すべき WAL offset。
-    /// add_change_listener 時に wal.head() に同期され、それ以降の commit のみが流れる。
-    change_emit_offset: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// #337: listener への配信 (cursor の読み → 配る → 進める) と fold (cursor の巻き戻し) を直列にする。
-    /// 並走すると、 fold が巻き戻した cursor を配信が古い終端で上書きし、 新しい ring の record を飛ばした。
-    change_emit_lock: std::sync::Arc<std::sync::Mutex<()>>,
+    /// changefeed の cursor と溜め。 配信が渡す分を取り出す所 (短く) と、 fold が cursor から先を溜めに移して cursor を
+    /// 巻き戻す所をこの lock で直列にする (#337: 並走すると、 fold が巻き戻した cursor を配信が古い終端で上書きし、 新しい
+    /// ring の record を飛ばした)。 listener の callback はこの lock の外で呼ぶ。
+    change_emit: std::sync::Mutex<ChangeCursor>,
+    /// 配信 (listener の callback) を 1 本ずつにする (`oplog_sync` と通知係が同時に配らない、 #337)。
+    change_deliver_lock: std::sync::Mutex<()>,
+    /// 通知係の thread。 WAL 付きの並行の形で listener が居る時だけ起こす。 Drop で止めて join する。
+    notifier_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// 通知係を起こす係 (通知係を起こす時に作る)。
+    notifier_waker: std::sync::OnceLock<std::sync::Arc<crate::consumer_waker::ConsumerWaker>>,
+    /// 通知係への 「配るものがあるかもしれない」 印 (consumer の書き出しの後と、 溜めに移した後に立てる)。
+    notifier_pending: std::sync::atomic::AtomicBool,
+    /// 通知係を止める印 (Drop)。
+    notifier_stop: std::sync::atomic::AtomicBool,
+    /// 並行の形で `Arc` に入った (住所が動かない)。 通知係の thread がこの engine を指してよい。
+    pinned: std::sync::atomic::AtomicBool,
     /// 0.7.0 Phase 4: 既に `_sync_ops` table に転送済みの WAL offset。
     /// consumer thread が背景 fsync 後に新規 commit を `_sync_ops` へ転送する。
     /// `enable_sync_tables` 有効化前は使われない (= 0)、 後は単調前進。
@@ -4175,10 +4195,17 @@ impl Engine {
             gossip_remote_apply: std::sync::atomic::AtomicBool::new(false),
             blob_store: std::sync::RwLock::new(None),
             change_listeners: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
-            change_emit_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-                enchudb_oplog::oplog::HEADER_SIZE as u64,
-            )),
-            change_emit_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            change_emit: std::sync::Mutex::new(ChangeCursor {
+                offset: enchudb_oplog::oplog::HEADER_SIZE as u64,
+                committed: Vec::new(),
+                open_tail: Vec::new(),
+            }),
+            change_deliver_lock: std::sync::Mutex::new(()),
+            notifier_handle: std::sync::Mutex::new(None),
+            notifier_waker: std::sync::OnceLock::new(),
+            notifier_pending: std::sync::atomic::AtomicBool::new(false),
+            notifier_stop: std::sync::atomic::AtomicBool::new(false),
+            pinned: std::sync::atomic::AtomicBool::new(false),
             sync_ops_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 enchudb_oplog::oplog::HEADER_SIZE as u64,
             )),
@@ -5329,10 +5356,17 @@ impl Engine {
             gossip_remote_apply: std::sync::atomic::AtomicBool::new(false),
             blob_store: std::sync::RwLock::new(None),
             change_listeners: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
-            change_emit_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-                enchudb_oplog::oplog::HEADER_SIZE as u64,
-            )),
-            change_emit_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            change_emit: std::sync::Mutex::new(ChangeCursor {
+                offset: enchudb_oplog::oplog::HEADER_SIZE as u64,
+                committed: Vec::new(),
+                open_tail: Vec::new(),
+            }),
+            change_deliver_lock: std::sync::Mutex::new(()),
+            notifier_handle: std::sync::Mutex::new(None),
+            notifier_waker: std::sync::OnceLock::new(),
+            notifier_pending: std::sync::atomic::AtomicBool::new(false),
+            notifier_stop: std::sync::atomic::AtomicBool::new(false),
+            pinned: std::sync::atomic::AtomicBool::new(false),
             sync_ops_offset: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 enchudb_oplog::oplog::HEADER_SIZE as u64,
             )),
@@ -6109,20 +6143,13 @@ impl Engine {
                 <= self.sync_bridged_durable.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// [`Self::wal_fold_safe`] のうち、 listener が配り終え、 bridge が読み切ったか。
+    /// [`Self::wal_fold_safe`] のうち、 bridge が読み切ったか。 listener に配っていない record は、 畳む時に溜めへ移す
+    /// ([`Self::spill_changes_for_fold`]。 0.34 までは配り終えるまで畳まず (#337)、 遅い listener が WAL を満杯にして書き込みを
+    /// 落としていた)。
     fn wal_fold_safe_bridge(&self) -> bool {
         let Some(wal) = self.oplog.as_ref() else {
             return true;
         };
-        // #337: listener が居れば、 cursor が head まで配り終えるまで畳まない (畳むと配っていない record が
-        // ring ごと消え、 listener に届かない)。 例外は bridge と同じ満杯の死区間: 残りが閉じられない孤児の
-        // group だけなら、 二度と配る物は無いので畳んでよい (ここで止めると以後の append が全滅する)
-        if !self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).is_empty() {
-            let emit = self.change_emit_offset.load(std::sync::atomic::Ordering::Acquire);
-            if emit < wal.head() && !(wal.append_dead() && wal.iter_committed_from_with_offsets(emit).0.is_empty()) {
-                return false;
-            }
-        }
         if !self.sync_tables_enabled() {
             return true;
         }
@@ -11594,8 +11621,8 @@ impl Engine {
     // ──── changefeed (WAL 変更通知) ────
 
     /// WAL に durable 化した record を listener に push する。
-    /// consumer スレッドが背景 fsync 完了後に発火、HLC 昇順で渡す。
-    /// 詳細は [`crate::changefeed`] のドキュメント参照。
+    /// 通知係の thread が、 consumer の背景 fsync の後に HLC 昇順で渡す。 listener が遅くても WAL は畳め、 まだ渡していない
+    /// record はメモリに溜めて順に渡す ([`Self::change_backlog_len`])。 詳細は [`crate::changefeed`] のドキュメント参照。
     ///
     /// 初回 listener 追加時に emit cursor を現在の `wal.head()` に揃えるので、
     /// 過去の commit は流れない(必要なら `audit()` で取得して resume すること)。
@@ -11611,12 +11638,12 @@ impl Engine {
         };
         // 初回登録時は cursor を現在の wal.head() に揃える(過去 record を流さない)
         if was_empty {
-            let _emit = self.change_emit_lock.lock().unwrap_or_else(|p| p.into_inner());
+            let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(wal) = self.oplog.as_ref() {
-                self.change_emit_offset
-                    .store(wal.head(), std::sync::atomic::Ordering::Release);
+                c.offset = wal.head();
             }
         }
+        self.ensure_notifier();
     }
 
     /// 登録済み listener 数(テスト/監視用)。
@@ -15129,23 +15156,15 @@ impl Engine {
         Self::spawn_consumer_with_oplog(eng, None)
     }
 
-    /// changefeed 内部ヘルパ: WAL から emit_offset 以降の record を取り出して
-    /// 全 listener に渡し、cursor を進める。
+    /// changefeed: 溜め (畳んだ ring から移した分) と、 cursor から先の Commit で閉じた record を取り出して全 listener に渡し、
+    /// cursor を進める。
     ///
-    /// #337: `emit_lock` を握って配る (fold と直列)。 `wait` = 他が配っている最中なら待つ (`oplog_sync` の経路:
-    /// 戻った時点で自分の commit を配り終えている、 という約束のため)。 consumer は待たずに返る (残りは次の tick、
-    /// 配り終えるまで fold しない)。 listener の中からの再入 (この thread が配っている最中) は、 待つと止まるので
-    /// どちらでも配らずに返る。
-    fn fire_change_listeners(
-        wal: &std::sync::Arc<enchudb_oplog::oplog::OpLog>,
-        listeners: &std::sync::RwLock<
-            Vec<std::sync::Arc<dyn crate::changefeed::ChangeListener>>,
-        >,
-        emit_offset: &std::sync::Arc<std::sync::atomic::AtomicU64>,
-        emit_lock: &std::sync::Mutex<()>,
-        wait: bool,
-    ) {
-        use std::sync::atomic::Ordering;
+    /// 配信は `change_deliver_lock` で 1 本ずつ (#337)。 `wait` = 他が配っている最中なら待つ (`oplog_sync` の経路: 戻った
+    /// 時点で自分の commit を配り終えている、 という約束のため。 先に取り出した配信は、 lock を返す前に配り終えている)。
+    /// 待たない時は、 配っている最中なら何もせず返る。 listener の中からの再入 (この thread が配っている最中) は、 待つと
+    /// 止まるのでどちらでも配らずに返る。 取り出しは `change_emit` の下で短く、 callback はその外で呼ぶ (畳む側は callback を
+    /// 待たない)。
+    fn deliver_changes(&self, wait: bool) {
         thread_local! {
             /// この thread が listener に配っている最中か (listener の中から oplog_sync を呼んだ再入を見分ける)。
             static EMITTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -15153,10 +15172,11 @@ impl Engine {
         if EMITTING.with(|e| e.get()) {
             return;
         }
-        let _emit = if wait {
-            emit_lock.lock().unwrap_or_else(|p| p.into_inner())
+        let Some(wal) = self.oplog.as_ref() else { return };
+        let _deliver = if wait {
+            self.change_deliver_lock.lock().unwrap_or_else(|p| p.into_inner())
         } else {
-            match emit_lock.try_lock() {
+            match self.change_deliver_lock.try_lock() {
                 Ok(g) => g,
                 Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
                 Err(std::sync::TryLockError::WouldBlock) => return,
@@ -15172,24 +15192,143 @@ impl Engine {
         let _emitting = Emitting;
         // listener 登録ゼロなら何もしない(cursor は進めない:listener 加入時に
         // wal.head() に同期する設計なので、ここで進めると先行 record が漏れる)
-        let guard = listeners.read().unwrap();
-        if guard.is_empty() {
+        let listeners = self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).clone();
+        if listeners.is_empty() {
             return;
         }
-        let start = emit_offset.load(Ordering::Acquire);
-        // #77-H4: cursor は commit 済み終端まで。 head 再読は in-flight record の
-        // 恒久 skip (listener への通知漏れ) を起こしていた。
-        let (recs, committed_end) = wal.iter_committed_from_with_end(start);
-        if recs.is_empty() {
-            emit_offset.store(committed_end, Ordering::Release);
+        let batch = {
+            let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+            // #77-H4: cursor は commit 済み終端まで。 head 再読は in-flight record の
+            // 恒久 skip (listener への通知漏れ) を起こしていた。
+            let (recs, committed_end) = wal.iter_committed_from_with_end(c.offset);
+            let mut batch = std::mem::take(&mut c.committed);
+            if committed_end > c.offset {
+                // 畳んだ時に閉じていなかった末尾は、 この Commit で閉じた group の頭
+                batch.append(&mut c.open_tail);
+                batch.extend(recs.into_iter().map(crate::transport::WireRecord::from));
+                c.offset = committed_end;
+            }
+            batch
+        };
+        if batch.is_empty() {
             return;
         }
-        let wires: Vec<crate::transport::WireRecord> =
-            recs.into_iter().map(|r| r.into()).collect();
-        for listener in guard.iter() {
-            listener.on_changes(&wires);
+        for listener in &listeners {
+            listener.on_changes(&batch);
         }
-        emit_offset.store(committed_end, Ordering::Release);
+    }
+
+    /// changefeed: ring を畳む直前 (`append_lock` の下、 呼び手が `change_emit` を持って) に、 cursor から先の record を溜めに
+    /// 移す。 Commit で閉じた分は `committed` に (前に閉じていなかった末尾を頭に付けて)、 閉じていない末尾は `open_tail` に
+    /// 足す。 cursor は読み終えた終端に進める (畳めたら呼び手が ring の頭に戻す。 畳めなくても、 移した分を二度渡さない)。
+    /// listener が居なければ何もしない。 戻り値は移した record の数。
+    fn spill_changes_for_fold(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor) -> usize {
+        if self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).is_empty() {
+            return 0;
+        }
+        let (recs, committed_end, tail, end) = wal.iter_from_with_tail(c.offset);
+        let moved = recs.len() + tail.len();
+        if committed_end > c.offset {
+            let open = std::mem::take(&mut c.open_tail);
+            c.committed.extend(open);
+            c.committed.extend(recs.into_iter().map(crate::transport::WireRecord::from));
+        }
+        c.open_tail.extend(tail.into_iter().map(crate::transport::WireRecord::from));
+        c.offset = end;
+        moved
+    }
+
+    /// changefeed: 畳んだ後の後始末 (呼び手が `change_emit` を持ったまま)。 畳めたら cursor を ring の頭に戻し、 溜めに移した
+    /// 分があれば通知係を起こす。 閉じていない末尾が残っていれば、 新しい ring に Commit を打ってその group を閉じる (打たない
+    /// と、 次に書かれるまで末尾が渡らない。 consumer の tick も head が checkpoint より先にある時しか Commit を打たない)。
+    fn after_fold_changes(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor, folded: bool, moved: usize) {
+        if folded {
+            c.offset = enchudb_oplog::oplog::HEADER_SIZE as u64;
+        }
+        if folded && !c.open_tail.is_empty() {
+            let _ = self.append_commit_marker(wal);
+        }
+        if moved > 0 {
+            self.notify_listeners();
+        }
+    }
+
+    /// head == checkpoint の ring を畳む (`try_reset_if`、 bridge が読み切っている時だけ)。 listener に配っていない record は
+    /// 溜めへ移し、 畳めたら changefeed と bridge の cursor を ring の頭に戻す (#63)。 `transfer_lock` は呼び手が持つ。
+    fn try_fold_with_changes(&self, wal: &enchudb_oplog::oplog::OpLog) -> bool {
+        let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+        let mut moved = 0;
+        let folded = self.wal_fold_safe()
+            && wal.try_reset_if(|| {
+                self.wal_fold_safe_locked() && {
+                    moved = self.spill_changes_for_fold(wal, &mut c);
+                    true
+                }
+            });
+        if folded {
+            self.reset_sync_ops_offset();
+        }
+        self.after_fold_changes(wal, &mut c, folded, moved);
+        folded
+    }
+
+    /// changefeed: 通知係に配るよう頼む (通知係が居なければ何もしない。 その時は `oplog_sync` が配る)。
+    fn notify_listeners(&self) {
+        self.notifier_pending.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(w) = self.notifier_waker.get() {
+            w.wake();
+        }
+    }
+
+    /// changefeed: 溜めにある、 まだ listener に渡していない record の数 (観測用)。 listener が遅いと増える (WAL は畳めるので
+    /// 書き込みは止まらないが、 渡すまでメモリに持つ)。
+    pub fn change_backlog_len(&self) -> usize {
+        let c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+        c.committed.len() + c.open_tail.len()
+    }
+
+    /// changefeed: 通知係の thread を起こす (まだ居なければ)。 listener の callback を WAL の書き出し係 (consumer) から外す:
+    /// consumer が callback を呼ぶと、 遅い・止まった listener の間は畳めず、 WAL が満杯になって書き手が待たされ、 落ちた。
+    /// WAL 付きの並行の形 (`Arc` に入って住所が動かない) で、 listener が居る時だけ。 Drop が止めて join する。
+    fn ensure_notifier(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use std::sync::atomic::Ordering;
+            if self.oplog.is_none()
+                || !self.pinned.load(Ordering::Acquire)
+                || self.notifier_stop.load(Ordering::Acquire)
+                || self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).is_empty()
+            {
+                return;
+            }
+            let mut handle = self.notifier_handle.lock().unwrap_or_else(|p| p.into_inner());
+            if handle.is_some() {
+                return;
+            }
+            let waker = self.notifier_waker.get_or_init(Default::default).clone();
+            let engine_addr = self as *const Engine as usize;
+            let spawned = std::thread::Builder::new().name("enchudb-notifier".into()).spawn(move || {
+                // SAFETY: Drop が通知係を止めて join するまで engine は生きている (`pinned` = `Arc` の中で動かない)
+                let engine: &Engine = unsafe { &*(engine_addr as *const Engine) };
+                waker.register_current();
+                loop {
+                    let stop = engine.notifier_stop.load(Ordering::Acquire);
+                    engine.notifier_pending.store(false, Ordering::Release);
+                    engine.deliver_changes(true);
+                    if stop {
+                        return;
+                    }
+                    waker.sleep(None, || {
+                        !engine.notifier_pending.load(Ordering::Acquire) && !engine.notifier_stop.load(Ordering::Acquire)
+                    });
+                }
+            });
+            match spawned {
+                Ok(h) => *handle = Some(h),
+                // thread を起こせなければ今までどおり (consumer の書き出しの後に配るのは `oplog_sync` だけになる)
+                Err(e) => eprintln!("[enchudb] warning: could not spawn the change notifier thread ({e}) — listeners get records only from oplog_sync()"),
+            }
+        }
     }
 
     /// 並行の形にする (`Arc` に包む)。 WAL 付きなら裏の thread (consumer = 書き出し係) を起こす: 100 ms ごとに Commit →
@@ -15222,6 +15361,8 @@ impl Engine {
         eng.shutdown_flag = Some(shutdown.clone());
 
         let arc = Arc::new(eng);
+        // ここから住所が動かない (通知係の thread がこの engine を指してよい)
+        arc.pinned.store(true, std::sync::atomic::Ordering::Release);
 
         let engine_ptr: *const Engine = Arc::as_ptr(&arc);
         let engine_addr = engine_ptr as usize;
@@ -15244,9 +15385,6 @@ impl Engine {
         let flag_for_thread = shutdown.clone();
         let oplog_for_thread = oplog.clone();
         let durable_lsn_for_thread = arc.durable_lsn.clone();
-        let listeners_for_thread = arc.change_listeners.clone();
-        let emit_offset_for_thread = arc.change_emit_offset.clone();
-        let emit_lock_for_thread = arc.change_emit_lock.clone();
         let poisoned_for_thread = arc.consumer_poisoned.clone();
 
         // #77-M2: consumer が panic した場合に unwind 経路で poison を立てる guard。 WAL の空きを待つ書き手
@@ -15331,14 +15469,8 @@ impl Engine {
                                     engine.transfer_oplog_to_sync_ops();
                                 }
 
-                                // changefeed: durable 化した record を listener に push
-                                Self::fire_change_listeners(
-                                    wal,
-                                    &listeners_for_thread,
-                                    &emit_offset_for_thread,
-                                    &emit_lock_for_thread,
-                                    false,
-                                );
+                                // changefeed: durable 化した record を listener に渡すよう通知係に頼む
+                                engine.notify_listeners();
                             }
                             // ring buffer reset を試みる。head == checkpoint &&
                             // pending_writes == 0 のときだけ head/checkpoint を HEADER_SIZE に戻す。
@@ -15373,33 +15505,12 @@ impl Engine {
                             // 誤読して畳み続ける = 無言の恒久欠落)。 transfer と同じ lock を
                             // 取って直列化する。 lock 順は transfer_lock → append_lock で
                             // transfer 自身 (row insert → append) と同じなので deadlock しない。
-                            // #337: listener にも追いつかせてから畳む (上の emit は head > checkpoint の時しか
-                            // 走らないので、 caller の oplog_sync が checkpoint を進めて配る前だと取り残される)
-                            Self::fire_change_listeners(
-                                wal,
-                                &listeners_for_thread,
-                                &emit_offset_for_thread,
-                                &emit_lock_for_thread,
-                                false,
-                            );
                             // #440: bridge した行と payload を書き出してから畳む
                             engine.write_out_bridged(wal);
                             let fold_guard = engine.transfer_lock_for_fold();
-                            // #337: 配信と直列にする。 配っている最中なら今回は畳まない (次の tick)
-                            let emit_guard = emit_lock_for_thread.try_lock();
-                            if emit_guard.is_ok()
-                                && engine.wal_fold_safe()
-                                && wal.try_reset_if(|| engine.wal_fold_safe_locked())
-                            {
-                                emit_offset_for_thread.store(
-                                    enchudb_oplog::oplog::HEADER_SIZE as u64,
-                                    Ordering::Release,
-                                );
-                                // #63 regression fix: bridge cursor も巻き戻す。
-                                // これが無いと reset 後の record が sync 欠落する。
-                                engine.reset_sync_ops_offset();
-                            }
-                            drop(emit_guard);
+                            // listener に配っていない record は畳む直前に溜めへ移す (配り終えるのを待たない、 #337 の cursor の
+                            // 巻き戻しは配信の取り出しと直列)。 #63: bridge の cursor も巻き戻す
+                            engine.try_fold_with_changes(wal);
                             drop(fold_guard);
                             last_fsync = Instant::now();
                         }
@@ -15428,14 +15539,7 @@ impl Engine {
                             if engine.sync_tables_enabled() {
                                 engine.transfer_oplog_to_sync_ops();
                             }
-                            // shutdown 時の最終 emit
-                            Self::fire_change_listeners(
-                                wal,
-                                &listeners_for_thread,
-                                &emit_offset_for_thread,
-                                &emit_lock_for_thread,
-                                false,
-                            );
+                            // listener への最後の配信は、 consumer が抜けた後に Drop の中で通知係がする (畳む時に溜めへ移した分も)
                             // graceful close でも ring を畳む: head==checkpoint なら
                             // HEADER_SIZE へ巻き戻す。 100ms fsync tick を踏まない
                             // short-lived writer (events.ecdb の log_event 等) でも
@@ -15462,20 +15566,7 @@ impl Engine {
                             // #440: bridge した行と payload を書き出してから畳む
                             engine.write_out_bridged(wal);
                             let fold_guard = engine.transfer_lock_for_fold();
-                            // #337: 配信と直列にする (配っている最中なら畳まない)
-                            let emit_guard = emit_lock_for_thread.try_lock();
-                            if emit_guard.is_ok()
-                                && engine.wal_fold_safe()
-                                && wal.try_reset_if(|| engine.wal_fold_safe_locked())
-                            {
-                                emit_offset_for_thread.store(
-                                    enchudb_oplog::oplog::HEADER_SIZE as u64,
-                                    std::sync::atomic::Ordering::Release,
-                                );
-                                // #63 regression fix: bridge cursor も巻き戻す。
-                                engine.reset_sync_ops_offset();
-                            }
-                            drop(emit_guard);
+                            engine.try_fold_with_changes(wal);
                             drop(fold_guard);
                         }
                         return;
@@ -15492,11 +15583,9 @@ impl Engine {
                                 || engine.wal_room_wanted.load(Ordering::Acquire);
                             if behind {
                                 Some(fsync_interval.saturating_sub(last_fsync.elapsed()).max(Duration::from_millis(1)))
-                            } else if engine.sync_tables_enabled()
-                                || !listeners_for_thread.read().unwrap_or_else(|p| p.into_inner()).is_empty()
-                            {
-                                // sync の bridge (相手の ack で `_sync_ops` が空くのを待つ等) / changefeed は時間で
-                                // 見直す物が残りうるので、 1 秒ごとには起きる
+                            } else if engine.sync_tables_enabled() {
+                                // sync の bridge (相手の ack で `_sync_ops` が空くのを待つ等) は時間で見直す物が残りうるので、
+                                // 1 秒ごとには起きる (changefeed の配信は通知係がする)
                                 Some(Duration::from_secs(1))
                             } else {
                                 None
@@ -15511,6 +15600,8 @@ impl Engine {
             .expect("failed to spawn consumer thread");
 
         *arc.consumer_handle.lock().unwrap() = Some(handle);
+        // 並行の形にする前に登録した listener があれば、 通知係を起こす
+        arc.ensure_notifier();
         arc
     }
 
@@ -15584,11 +15675,16 @@ impl Engine {
         }
         // checkpoint を進める前に sidecar を固める (consumer の tick と同じ)
         self.try_persist_tables();
-        let direct = !self.sync_tables_enabled()
-            && self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).is_empty();
+        // listener に配っていない record は畳む時に溜めへ移す (配り終えるのを待たない) ので、 listener が居ても append を
+        // 止めたまま畳める。 sync の bridge が居る時は、 bridge が読み切ってから (下)
+        let direct = !self.sync_tables_enabled();
         let folded = {
             // fold は bridge の cursor を巻き戻すので transfer と直列にする (tick と同じ)。 transfer 中なら今回は見送る
             let Ok(_fold_guard) = self.transfer_lock.try_lock() else { return false };
+            // changefeed の cursor の巻き戻しを配信の取り出しと直列にする (#337)。 書き出しの間も持つ (配信の取り出しが待つ
+            // だけで、 listener の callback は待たない)
+            let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+            let mut moved = 0;
             let (_, folded) = wal.checkpoint_and_reset(
                 |_head| {
                     let durable_lsn = wal.next_lsn().saturating_sub(1);
@@ -15598,34 +15694,31 @@ impl Engine {
                     }
                     ok
                 },
-                || direct && self.wal_fold_safe_locked(),
+                || {
+                    direct && self.wal_fold_safe_locked() && {
+                        moved = self.spill_changes_for_fold(wal, &mut c);
+                        true
+                    }
+                },
             );
             if folded {
-                self.change_emit_offset.store(enchudb_oplog::oplog::HEADER_SIZE as u64, Ordering::Release);
                 self.reset_sync_ops_offset();
             }
+            self.after_fold_changes(wal, &mut c, folded, moved);
             folded
         };
+        // 書き出した分を listener に渡すよう頼む (畳めなかった時も、 checkpoint は進んでいる)
+        self.notify_listeners();
         folded || (!direct && {
-            // 書き出した分を配ってから畳む (tick と同じ順)
+            // 書き出した分を bridge に渡してから畳む (tick と同じ順)
             if self.sync_tables_enabled() {
                 self.transfer_oplog_to_sync_ops();
             }
-            Self::fire_change_listeners(wal, &self.change_listeners, &self.change_emit_offset, &self.change_emit_lock, false);
             // #440: bridge した行と payload を書き出してから畳む
             self.write_out_bridged(wal);
             // 待って取らない: transfer の中で満杯にぶつかった書き手がこの lock を持ったまま待ち手に居ると、 互いに待つ
-            let fold_guard = self.transfer_lock.try_lock();
-            let emit_guard = self.change_emit_lock.try_lock();
-            let ok = fold_guard.is_ok()
-                && emit_guard.is_ok()
-                && self.wal_fold_safe()
-                && wal.try_reset_if(|| self.wal_fold_safe_locked());
-            if ok {
-                self.change_emit_offset.store(enchudb_oplog::oplog::HEADER_SIZE as u64, Ordering::Release);
-                self.reset_sync_ops_offset();
-            }
-            ok
+            let Ok(_fold_guard) = self.transfer_lock.try_lock() else { return false };
+            self.try_fold_with_changes(wal)
         })
     }
 
@@ -15838,8 +15931,8 @@ impl Engine {
                 self.transfer_oplog_to_sync_ops();
             }
             // changefeed: durable 化したので listener へ即時 push
-            // (consumer の 100ms tick を待たず caller スレッドで発火)
-            Self::fire_change_listeners(wal, &self.change_listeners, &self.change_emit_offset, &self.change_emit_lock, true);
+            // (consumer の 100ms tick を待たず caller スレッドで発火。 通知係が配っている最中なら、 それを待ってから配る)
+            self.deliver_changes(true);
             // #268: transfer / listener まで済ませてから失敗を返す (打てた分は配る)。
             //
             // ただし **死区間 (`append_dead`) では返さない**。 Commit は payload 0 =
@@ -16622,6 +16715,14 @@ impl Drop for Engine {
             if let Some(handle) = h.take() {
                 let _ = handle.join();
             }
+        }
+        // 通知係は、 consumer の最後の書き出しの後に残りを配って (溜めに移した分も) exit する
+        self.notifier_stop.store(true, Ordering::Release);
+        if let Some(w) = self.notifier_waker.get() {
+            w.wake();
+        }
+        if let Some(handle) = self.notifier_handle.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            let _ = handle.join();
         }
         // #101: graceful close で clean flag を永続化 → 次 open は rebuild_index skip。
         // panic unwinding 中 / consumer 死亡時は「dirty のまま」に倒す (= 次 open で

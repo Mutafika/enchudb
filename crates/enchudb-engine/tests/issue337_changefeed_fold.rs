@@ -53,7 +53,7 @@ fn listener_gets_every_committed_record_across_folds() {
 
 /// 書き手が 2 本 + sync tables あり。 `oplog_sync` は checkpoint を進めてから bridge を挟んで listener に配るので、
 /// その間に consumer が畳める窓が広い。 片方の配信がもう片方の配信中で飛ばされた分は、 書き込みが止んだ後に
-/// consumer が配る (配り終えるまで畳まない)。
+/// 通知係が配る (0.34 までは consumer が配り、 配り終えるまで畳まなかった。 今は畳む時に溜めへ移す)。
 #[test]
 fn two_writers_with_sync_tables_lose_nothing() {
     let p = format!("/tmp/enchudb-issue337-sync-{}", std::process::id());

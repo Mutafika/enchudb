@@ -1781,6 +1781,15 @@ impl OpLog {
         (strip_offsets(s.out), s.committed_end)
     }
 
+    /// changefeed の溜め用 (engine が ring を畳む直前、 `append_lock` の下で呼ぶ): `iter_committed_from_with_end` に加えて、
+    /// 末尾の Commit で閉じていない record と、 読み終えた終端 offset を返す。 読むだけ。 返り値は
+    /// (Commit で閉じた record, committed_end, 閉じていない末尾の record, 読み終えた終端)。
+    pub fn iter_from_with_tail(&self, start_offset: u64) -> (Vec<Record>, u64, Vec<Record>, u64) {
+        let s = self.scan_from_offset(start_offset);
+        let end = s.tail.last().map_or(s.committed_end, |(_, e)| *e);
+        (strip_offsets(s.out), s.committed_end, strip_offsets(s.tail), end)
+    }
+
     /// リカバリ: checkpoint から head までを読んで、Commit で挟まれたグループだけ返す。
     /// CRC 破損レコードに到達したらそこで打ち切り(uncommitted tail の切り捨て)。
     ///

@@ -8,8 +8,8 @@
 //!
 //! # 発火タイミング
 //!
-//! consumer スレッドが背景 fsync を成功させた直後に、新しく durable 化した
-//! WAL レコード群を listener に渡す。
+//! WAL の書き出し係 (consumer スレッド) が背景 fsync を成功させた後に、 通知係のスレッド (`enchudb-notifier`、
+//! listener を登録した WAL 付きの並行の engine にだけ居る) が、 新しく durable 化した WAL レコード群を listener に渡す。
 //!
 //! - **順序保証**: HLC 昇順、WAL append の順序とそのまま一致
 //! - **at-least-once**: 重複は無いが、listener 側で再起動跨ぎを担保したいなら
@@ -20,13 +20,17 @@
 //!
 //! # 注意
 //!
-//! listener.on_changes は consumer スレッドから直接呼ばれる。長時間ブロックすると
-//! 後続の WAL 書き込みも詰まる。重い処理は別スレッドに forward すること。
+//! listener.on_changes は通知係のスレッド (と、 `oplog_sync()` を呼んだスレッド) から呼ばれる。 遅くても WAL の書き出しと
+//! 畳みは止まらない: まだ渡していない record は、 ring を畳む時にメモリの溜めへ移し、 溜めから先に順に 1 回ずつ渡す
+//! ([`crate::engine::Engine::change_backlog_len`] で数が見える)。 0.34 までは consumer が直接呼んでいたので、 遅い・止まった
+//! listener の間は WAL を畳めず、 満杯になって書き込みが待たされたり落ちたりした。 止まったままの listener の間は溜めが
+//! 増え続けるので、 重い処理は別スレッドに forward すること。
 //!
 //! 配信は 1 本ずつ (#337): `oplog_sync()` は、 他の thread が配っている最中ならそれを待ってから自分の commit を配り、
 //! 配り終えてから返る。 listener の中から `oplog_sync()` を呼んでもよい (その呼び出しは配らずに返る、 残りは
 //! 呼び出し元の配信か consumer が配る)。 listener の中で **別の thread の `oplog_sync()` を待たない** こと
-//! (その thread はこちらの配信が終わるのを待っているので、 互いに待って止まる)。 配り終えるまで WAL は畳まない。
+//! (その thread はこちらの配信が終わるのを待っているので、 互いに待って止まる)。 WAL は配り終えるのを待たずに畳む
+//! (渡していない分は溜めへ移す)。
 //!
 //! # 使い方
 //!
@@ -71,8 +75,8 @@ use crate::transport::WireRecord;
 
 /// WAL に durable 化された record を受け取る listener。
 ///
-/// `on_changes` は consumer スレッドから直接呼ばれるので、長時間ブロックしないこと。
-/// 重い処理は別スレッドに forward する設計を推奨。
+/// `on_changes` は通知係のスレッド (と `oplog_sync()` を呼んだスレッド) から呼ばれる。 遅くても書き込みは止まらないが、
+/// 渡していない record はメモリに溜まるので、 重い処理は別スレッドに forward する設計を推奨。
 pub trait ChangeListener: Send + Sync {
     /// 新たに durable 化したレコード群。HLC 昇順。
     fn on_changes(&self, records: &[WireRecord]);
