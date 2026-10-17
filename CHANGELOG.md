@@ -3,6 +3,77 @@
 EnchuDB の主要 release ごとの変更を時系列で記録。 0.x 段階につき **semver 厳密
 ではない**が、 patch (z) は非 breaking、 minor (y) は API/format 変更を含む方針。
 
+## 0.34.0 — 2026-10-17
+
+minor。 on-disk 形式・wire 形式は 0.33.1 と同じ (開き直しも sync もそのまま)。 非同期の名前の書き込み (`tie_async` など) は、 呼んだ
+thread がその場で書くようになった (返った時に読める)。 書き込みの queue と、 それを当てる裏の thread の仕事を外し、 WAL の無い engine
+は裏の thread を持たない。 並行の形にする時に確保していた queue の分のメモリ (max_entities が既定の 16M なら、 WAL 付きの DB
+1 つで約 128 MB) を使わない。 change listener が遅い・止まっていても WAL を畳めるようにした: 0.33.1 までは、 listener を登録した DB
+で書き込みが続くと、 WAL の record の大半が listener に届かなかった (#499)。 `wal_dropped_records()` が同期の書き込みの WAL 落ちも
+数える (#454)。
+
+**上げる時の注意**:
+
+- `*_async` (`tie_async` / `tie_text_async` / `tie_bytes_async_by_id` / `tie_ref_async` / `untie_async` / `delete_async` /
+  `content_async` と `_by_id` の形) は、 返った時に本体に当たっていて、 WAL 付きなら WAL にも載っている。 書く仕事は呼んだ thread が
+  する。 WAL が満杯に近い時は、 同期の書き込みと同じく裏の thread が畳むのを待つ (最大 5 秒)。 build phase (並行の形にする前) でも
+  書ける (前は tie 系が panic、 untie / delete は黙って何もしなかった)。 `delete_async` は同期の `delete` と同じになる (その場で振った
+  版で消すので、 答えは同じ) (#497)
+- 互換のために残すもの (中身は空): `flush_writes` は何もしない、 `pending_writes` は 0、 `write_queue_capacity` は None、
+  `EngineStats` の `queue_len` / `pushed` / `applied` は 0。 queue の cap を取る口 (engine の `create_concurrent_with_oplog_queue_cap` /
+  `open_concurrent_with_oplog_queue` / `concurrentize_with_oplog_queue` / `concurrentize_queue`、 schema の
+  `open_with_oplog_with_queue` / `finish_with_oplog_with_queue` / `finish_concurrent_with_queue`) は cap を受け付けて使わない (#498)
+- `enchudb_engine::write_queue` module (`WriteQueue` / `Op` / `DEFAULT_WRITE_QUEUE_CAP`) は無くなった (#498)
+- WAL の無い並行の engine (`concurrentize` / `create_concurrent` など) は裏の thread を持たない (#498)
+- change listener の `on_changes` は、 通知係の thread (`enchudb-notifier`、 WAL 付きの並行の形で listener が居る時だけ居る) と、
+  `oplog_sync()` を呼んだ thread から呼ばれる (前は WAL の書き出し係の thread)。 まだ渡していない record はメモリに溜まる (止まった
+  ままの listener の間は増え続ける。 `Engine::change_backlog_len()` で見える) (#500)
+- `wal_dropped_records()` は同期の書き込み・辞書の record・中継の WAL 落ちも数える。 0.33.1 までは 0 のままだった DB でも、 0 で
+  なくなることがある (#497)
+- 公開 API が増えた: `Engine::change_backlog_len`、 `OpLog::iter_from_with_tail` (#500)
+
+### Fixed — change listener が WAL を畳むのを止め、 書き込みが待たされ、 record が listener に届かなかった (#499、 #500)
+
+listener の callback を WAL の書き出し係 (consumer) が呼んでいて、 callback の間は WAL を畳めなかった。 また listener が居る DB は、
+listener に配り終えるまで畳まず (#337)、 畳む道も append の途中の書き手が 1 本でも居ると畳まない形だった。 書き手が動いている間は
+畳めず、 空きを待つ書き手はすぐ諦めて、 record を WAL に載せずに落とした (本体には当たっている。 listener と同期の相手には届かない。
+相手は #57 の floor で取り直しに回る)。
+
+配信を通知係の thread に移し、 畳む時は、 まだ渡していない record をメモリの溜めへ移す (listener には溜めから先に、 順に 1 回ずつ
+渡す。 Commit で閉じていない末尾は、 その group が閉じた時に頭として渡す)。 sync の bridge が無ければ、 listener が居ても append を
+止めたまま畳む。 `oplog_sync()` が自分の分を配り終えてから返る約束は同じ。
+
+WAL 64 MB、 listener 1 つ、 書き手 1 本が 200 万回書く (100 回ごとに commit): 0.33.1 は listener (0 µs / 1 ms) に 200 万件中 104〜156
+万件しか届かなかった (3 回。 60 秒待っても届かない。 0.33.1 は同期の書き込みの WAL 落ちを数えないので `wal_dropped_records()` は
+0)。 #498 の engine では 48 回とも 44〜148 万件 (中央値 96 万件) が落ちた。 直した後は 24 回とも落ち 0 で、 200 万件が順に 1 回ずつ
+33〜35 ms (中央値) で届く。 1 回 5 ms の listener (WAL 256 KiB、 20 万回): 前は 1 回も畳めず 19.8 万件が落ちた → 98 回畳んで落ち 0。
+止まった listener: 前は書き手が 30 秒止まった → 書き手は止まらない (11 ms)。 listener の居ない書き込みは変わらない (0.987〜1.021 倍)。
+
+### Changed — 非同期の名前の書き込みを呼んだ thread がその場で書く (#496、 #497)
+
+0.33.1 までは `*_async` を write queue に積んで返り、 裏の thread (consumer) が後から当てて WAL に載せていた (返った後の読みは
+`flush_writes` で待つ)。 書き手が裏の thread を待つ所 (queue が満杯の時・`flush_writes`・Drop) があり、 WAL 付きでは consumer が
+まとめて載せる所で WAL が満杯になると、 その束を落とした (WAL 64 MB に 110 万個の値を `tie_async_by_id` などで書くと、 24 回中 18 回、
+最初の束だけで 53.8〜69.8 万件)。 呼んだ thread がその場で同期の道 (`tie_to` などと同じ) で書く形にした。 範囲の確かめ (entity が紐の
+table の外なら panic) は今まで通り。 1 回の時間 (flush まで) は WAL 付き 103.4 → 90.7 ns、 WAL 無し 26.8 → 20.1 ns。 落ちる束は無く
+なった。
+
+### Fixed — 同期の書き込みの WAL 落ちを数えていなかった (#454、 #497)
+
+`wal_dropped_records()` は consumer がまとめて載せる道の失敗だけを数えていて、 同期の書き込み (`tie_to` など)・辞書の record・中継の
+失敗は数えていなかった。 全部数える。 doc を #57 の後に合わせた (落ちた record は floor を上げて相手に取り直させるので、 届かない
+ままにはならない)。
+
+### Changed — 書き込みの queue と consumer の適用を外す (#496、 #498)
+
+`*_async` もその場で書くので、 write queue と、 それを当てる仕事が無くなった。 queue 2 本・積んだ数と当てた数・`apply_op`・consumer の
+取り出し・Drop の当て終わり待ちと、 並行の形で entity を払い出すたびに足していた共有の数え 2 つを外した。 WAL の無い engine は
+裏の thread を持たない。 WAL 付きの裏の thread (100 ms ごとの書き出し、 満杯に近い時に畳む) は今まで通り。
+
+DB を 8 個 (max_entities は既定の 16M) 開いたまま持つと、 1 個あたりの最大 RSS が WAL 付き 128.6 → 0.54 MB、 WAL 無し 40.5 → 0.50 MB。
+並行の形にする時間は 18.1 → 9.4 ms / 12.2 → 9.2 ms。 書き込みの道は変わらない (0.98〜1.01 倍)。 並行の形での insert (WAL 無し、
+書き手 8 本) は 1.08 倍。
+
 ## 0.33.1 — 2026-10-16
 
 patch。 on-disk 形式・wire 形式・答えは 0.33.0 と同じ。 schema の handle が表を `Arc` で数えずに借りるようになり、 書き手や読み手を
