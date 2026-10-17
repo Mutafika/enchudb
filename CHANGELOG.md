@@ -9,7 +9,7 @@ minor。 on-disk 形式・wire 形式は 0.33.1 と同じ (開き直しも sync 
 thread がその場で書くようになった (返った時に読める)。 書き込みの queue と、 それを当てる裏の thread の仕事を外し、 WAL の無い engine
 は裏の thread を持たない。 並行の形にする時に確保していた queue の分のメモリ (max_entities が既定の 16M なら、 WAL 付きの DB
 1 つで約 128 MB) を使わない。 change listener が遅い・止まっていても WAL を畳めるようにした: 0.33.1 までは、 listener を登録した DB
-で書き込みが続くと、 WAL の record の大半が listener に届かなかった (#499)。 `wal_dropped_records()` が同期の書き込みの WAL 落ちも
+で書き込みが続くと、 WAL の record の 2〜7 割が listener に届かなかった (#499)。 `wal_dropped_records()` が同期の書き込みの WAL 落ちも
 数える (#454)。
 
 **上げる時の注意**:
