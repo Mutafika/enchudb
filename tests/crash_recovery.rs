@@ -149,16 +149,17 @@ fn signed_wal_records_survive_reopen() {
 
 #[test]
 fn sigkill_during_signed_loop_preserves_synced_and_signatures() {
-    // signed_loop は 500 件毎に oplog_sync し、 1500 件目の commit を changefeed に配る所で止まって
-    // `held` を出す。 そこで SIGKILL して
+    // signed_loop は 500 件毎に oplog_sync し、 1500 件書いて同期した所で止まって `held <ring にある
+    // commit 済みの件数>` を出す。 そこで SIGKILL して
     //   1) 同期した分 (>=500) は recovery で entity として残る
     //   2) ring に残った committed record の署名は SIGKILL でも壊れない
     // を確認する。
     //
     // #204 / #377: ring の fold (try_reset) は 「全 record 適用済み」 なら無条件で、 旧版は kill の
     // 瞬間に ring が畳まれた直後だと署名 record が 1 つも残らなかった (負荷の下で 24 回中 17 回、
-    // CI で 8 回続けて空になって落ちた)。 子が配る途中で止まっている間は ring が畳まれない
-    // (`crash_writer` の `Hold` の doc) ので、 そこで kill すれば配っている batch が必ず ring に残る。
+    // CI で 8 回続けて空になって落ちた)。 子は初めから ring を畳む lock (`transfer_lock_for_fold`) を持つ
+    // ので、 kill した時に書いた record が必ず ring に残る (0.33 までは changefeed に配る途中で止まって
+    // 畳ませていたが、 0.34 から listener は畳むのを止めない、 #499)。
     //
     // 署名検証は SIGKILL 直後の .oplog を **engine を通さず直接読む** (reopen 時の fold に依存しない)。
     let kp = Arc::new(Keypair::from_bytes(&[7u8; 32]));
@@ -178,13 +179,13 @@ fn sigkill_during_signed_loop_preserves_synced_and_signatures() {
     };
     child.kill().unwrap();
     let _ = child.wait();
-    let held = held.expect("子が changefeed の所で止まらずに終わった");
-    assert!(held > 0, "空の batch で止まった");
+    let held = held.expect("子が 1500 件の所で止まらずに終わった");
+    assert!(held > 0, "止まった時に ring が空だった");
 
     let recs = enchudb_oplog::oplog::OpLog::open(std::path::Path::new(&format!("{path}/oplog")))
         .unwrap()
         .iter_committed();
-    assert!(recs.len() >= held, "配っていた {held} 件が ring に残っていない ({} 件)", recs.len());
+    assert!(recs.len() >= held, "止まった時に ring にあった {held} 件が残っていない ({} 件)", recs.len());
 
     // (1) recovery
     let eng = Engine::open_concurrent_with_oplog(&path, 64 * 1024 * 1024).unwrap();
