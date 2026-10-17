@@ -7898,6 +7898,7 @@ impl Engine {
             extra: std::sync::RwLock::new(Vec::new()),
             pk_himo: None,
         });
+        self.note_internal_row_ranges();
         self.try_persist_tables();
         Ok(tid)
     }
@@ -8271,6 +8272,18 @@ impl Engine {
                 }
             }
         }
+        self.note_internal_row_ranges();
+    }
+
+    /// engine の内部の表 (`_sync_ops` / `_sync_peers`) の行の範囲を行の lock に教える (同じ範囲は 1 回だけ)。 内部の表の行は
+    /// ユーザの行と別の stripe を使う (`row_lock` の module doc)。 その範囲の行を握る前に呼ぶ: 開いた時・表を作った時。
+    /// 表を伸ばした時は `push_table_extent_locked` が eid を払い出す前に足す。
+    fn note_internal_row_ranges(&self) {
+        for t in self.tables.iter().filter(|t| is_engine_internal_table(&t.name)) {
+            for (lo, hi) in t.extents() {
+                self.row_locks.add_internal_range(lo, hi);
+            }
+        }
     }
 
     /// 既知 table を `(id, name, eid_range)` で列挙する。 試験用 / debug 用 API。
@@ -8375,6 +8388,10 @@ impl Engine {
             return 0;
         }
         self.tables[tid].extra.write().unwrap().push((new_lo, new_lo + size));
+        // 内部の表の行は別の stripe を使う。 足した範囲の eid を払い出す前に教える
+        if is_engine_internal_table(&self.tables[tid].name) {
+            self.row_locks.add_internal_range(new_lo, new_lo + size);
+        }
         self.try_persist_tables();
         size
     }
