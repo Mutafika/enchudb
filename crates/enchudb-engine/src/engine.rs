@@ -8532,9 +8532,13 @@ impl Engine {
         }
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
         let target_local = enchudb_oplog::eid_local(local_eid);
+        let mut bound_now = false;
         let local = self
             .eid_translator
-            .get_or_insert_with(author_peer, foreign_local, || Some(target_local))
+            .get_or_insert_with(author_peer, foreign_local, || {
+                bound_now = true;
+                Some(target_local)
+            })
             .unwrap_or(target_local);
         // #178: **束ねる前に自分が書いていた**なら、 その write は既に自分の eid のまま
         // bridge されている (宛名の付け替えは bridge 時に `reverse()` を引くため)。
@@ -8545,6 +8549,15 @@ impl Engine {
         // 束ね先の entity は live 扱いにしておく (remote_tie_apply と同じ前提)。
         self.entities.ensure_live(local);
         Self::advance_table_next_local_for(&self.tables, local);
+        // #490: この entity 宛ての Delete を作成より先に受けて退避表に載せていたなら、 束ねた行にその削除を当てる
+        // (削除より古い cell を落とす)。 作成を受けて束ねた後に Delete が届いた時は、 写像のある Delete として束ねた行が
+        // 消える。 版数を書き戻すだけ (`restore_foreign_tombstone`) だと、 束ねた行がもともと持っていた古い cell が残り、
+        // 届いた順で答えが割れる。
+        if bound_now
+            && let Some(tomb) = self.foreign_tombstone_of(enchudb_oplog::eid_peer(foreign_eid), foreign_local)
+        {
+            self.apply_delete_local(local, tomb);
+        }
         enchudb_oplog::make_eid(self_peer, local)
     }
 
@@ -9836,17 +9849,18 @@ impl Engine {
     /// t より古い record は新しい slot 上の tombstone で従来どおり弾かれる
     /// (= 判定経路は `set_cell` 1 本のまま。 A-2 を崩さない)。
     fn restore_foreign_tombstone(&self, peer: enchudb_oplog::PeerId, foreign_local: u32, local: u32) {
-        if self.foreign_tombs_empty.load(std::sync::atomic::Ordering::Relaxed) {
-            return; // 常態 (= 一度も slot が回っていない)。 lock を取らない
+        if let Some(tomb) = self.foreign_tombstone_of(peer, foreign_local) {
+            self.set_tombstone_local(local, tomb);
         }
-        let tomb = {
-            let g = self.foreign_tombs.read().unwrap();
-            match g.get(&(peer, foreign_local)) {
-                Some(&t) if t != enchudb_oplog::Hlc::ZERO => t,
-                _ => return,
-            }
-        };
-        self.set_tombstone_local(local, tomb);
+    }
+
+    /// 退避表に載っている `(peer, foreign_local)` の削除版数 (#166 / #490)。
+    fn foreign_tombstone_of(&self, peer: enchudb_oplog::PeerId, foreign_local: u32) -> Option<enchudb_oplog::Hlc> {
+        if self.foreign_tombs_empty.load(std::sync::atomic::Ordering::Relaxed) {
+            return None; // 常態 (= slot が回っておらず、 作成より先に届いた Delete も無い)。 lock を取らない
+        }
+        let g = self.foreign_tombs.read().unwrap();
+        g.get(&(peer, foreign_local)).copied().filter(|&t| t != enchudb_oplog::Hlc::ZERO)
     }
 
     /// #166: slot に載っていない (= 退避済みの) foreign tombstone の snapshot。

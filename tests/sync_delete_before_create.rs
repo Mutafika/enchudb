@@ -227,3 +227,110 @@ fn concurrent_early_delete_and_create_never_revive() {
     drop((sa, sb));
     drop((a, b));
 }
+
+/// 表の行を (key, title) で並べる。
+fn rows(db: &Database) -> Vec<(Option<enchudb::schema::Value>, Option<enchudb::schema::Value>)> {
+    db.engine().rebuild();
+    let t = db.get_table(T).unwrap();
+    let mut out: Vec<_> = t
+        .all()
+        .find()
+        .unwrap()
+        .into_iter()
+        .map(|e| {
+            let r = t.entity(e);
+            (r.get("key"), r.get("title"))
+        })
+        .collect();
+    out.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+    out
+}
+
+/// 削除より新しい書き込み (B の削除を知らない C の更新) が混ざっても、 受け手が A・B・C を pull する 6 通りの順で
+/// 同じ答えになる。 削除より新しい書き込みをどう見せるか (H3) はここでは決めず、 順によらないことだけを見る。
+#[test]
+fn newer_write_after_the_delete_lands_the_same_in_any_order() {
+    const ORDERS: [[u32; 3]; 6] = [[1, 2, 3], [1, 3, 2], [2, 1, 3], [2, 3, 1], [3, 1, 2], [3, 2, 1]];
+    let dir = Dir::new("newer");
+    let tr = transport(3 + ORDERS.len() as u32);
+    let (a, sa) = make(&dir, 1, &tr);
+    let (b, sb) = make(&dir, 2, &tr);
+    let (c, sc) = make(&dir, 3, &tr);
+
+    a.get_table(T).unwrap().upsert().set("key", "x").set("title", "a").commit().unwrap();
+    publish(&a, &sa);
+    sb.pull_once(1);
+    sc.pull_once(1);
+    delete_all(&b);
+    publish(&b, &sb);
+    // B の削除より新しい HLC で、 C が (削除を知らずに) x の title を書き換える
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    c.engine().rebuild();
+    let tc = c.get_table(T).unwrap();
+    let x_on_c = tc.where_eq("key", "x").find().unwrap();
+    assert_eq!(x_on_c.len(), 1);
+    tc.entity(x_on_c[0]).update().set("title", "c").commit().unwrap();
+    drop(tc);
+    publish(&c, &sc);
+
+    let mut answers = Vec::new();
+    for (k, order) in ORDERS.iter().enumerate() {
+        let id = 4 + k as u32;
+        let (r, sr) = make(&dir, id, &tr);
+        for &from in order {
+            let o = sr.pull_once(from);
+            assert!(o.received > 0 && o.applied + o.skipped == o.received, "{order:?} の {from} から: {o:?}");
+        }
+        let titled_c = {
+            r.engine().rebuild();
+            r.get_table(T).unwrap().where_eq("title", "c").count().unwrap()
+        };
+        answers.push((rows(&r), count_key(&r, "x"), titled_c));
+        drop(sr);
+        drop(r);
+    }
+    for (k, ans) in answers.iter().enumerate() {
+        assert_eq!(ans, &answers[0], "{:?} の順と {:?} の順で答えが違う", ORDERS[k], ORDERS[0]);
+    }
+    eprintln!("答え (6 通り同じ): {:?}", answers[0]);
+
+    drop((sa, sb, sc));
+    drop((a, b, c));
+}
+
+/// 受け手が自分でも主キー x の行を持っている時 (#141: 同じ主キーの行は 1 つに束ねる)。 A → B の順なら、 A の x を自分の
+/// 行に束ねた後で B の Delete が届き、 束ねた行ごと消える (自分の行の値は削除より古い)。 B → A の順でも同じ答え。
+/// 対照: B の Delete を受けない受け手では、 束ねた行に A の値が載って残る。
+#[test]
+fn receiver_with_the_same_primary_key_ends_the_same_in_either_order() {
+    let dir = Dir::new("pkbound");
+    let tr = transport(5);
+    // 受け手が先に自分の行を作る (A の作成・B の削除より古い HLC)
+    let (r1, s1) = make(&dir, 3, &tr);
+    let (r2, s2) = make(&dir, 4, &tr);
+    let (r3, s3) = make(&dir, 5, &tr);
+    for r in [&r1, &r2, &r3] {
+        r.get_table(T).unwrap().upsert().set("key", "x").set("title", "own").commit().unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    let (a, sa) = make(&dir, 1, &tr);
+    let (b, sb) = make(&dir, 2, &tr);
+    a.get_table(T).unwrap().upsert().set("key", "x").set("title", "a").commit().unwrap();
+    publish(&a, &sa);
+    sb.pull_once(1);
+    delete_all(&b);
+    publish(&b, &sb);
+
+    s1.pull_once(2);
+    s1.pull_once(1);
+    s2.pull_once(1);
+    s2.pull_once(2);
+    s3.pull_once(1);
+    let text = |s: &str| Some(enchudb::schema::Value::Text(s.into()));
+    assert_eq!(rows(&r3), vec![(text("x"), text("a"))], "対照: 束ねた行に A の値が載る");
+    assert_eq!(rows(&r2), vec![], "A → B の順で、 束ねた行が消えていない");
+    assert_eq!(rows(&r1), rows(&r2), "B → A の順と A → B の順で答えが違う");
+
+    drop((sa, sb, s1, s2, s3));
+    drop((a, b, r1, r2, r3));
+}
