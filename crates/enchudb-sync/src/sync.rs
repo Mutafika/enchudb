@@ -36,10 +36,10 @@
 //! Delete は特殊: himo を持たないため per-himo の比較はせず、 **tombstone slot
 //! (sentinel himo_id = `u16::MAX`) との LWW** で判定する。 apply されると
 //! tombstone HLC が記録され、 以後それより古い Tie/Untie は skip される
-//! (削除済み entity の復活防止)。 逆に reorder 配送で「新しい Tie の後に古い
-//! Delete」が届いた場合、 per-himo HLC は参照しないため Delete が entity を
-//! 物理削除する — 同一 author の log は HLC 順なのでこの経路は再送/gossip の
-//! 交錯時のみ (0.9.0 で doc を実装に合わせて訂正、 挙動は従来どおり)。
+//! (削除済み entity の復活防止)。 逆に 「新しい Tie の後に古い Delete」 が届いた場合
+//! (別の author の Tie と Delete が入れ違う時や、 再送 / gossip の交錯)、 Delete は
+//! **Delete より新しい版の cell を残して**ほかを消す (`Engine::remove_entity_body`)。
+//! 残った cell は、 削除の後に書かれた行として生きる。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1273,9 +1273,7 @@ impl Syncer {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// 受信レコードを LWW で apply する。Phase C: 署名検証 + ACL も通す。
-    /// WS push client などの外部から呼び出すために public。
-    /// #141: apply 本体の前に走る **PK bind pass**。
+    /// #141: PK の Tie を当てる直前の **PK bind**。
     ///
     /// `resolve_remote_eid` は `(author, remote_eid)` 写像しか見ないので、 初見の
     /// foreign entity には無条件で新規 local eid を払い出す。 その結果、 2 台が同じ
@@ -1283,81 +1281,64 @@ impl Syncer {
     /// author ごとに二重化し、 恒久チャーンループ → WAL 膨張 → oplog リング一周
     /// (#140 の tombstone 消失) まで連鎖する。
     ///
-    /// そこで apply 前に batch を走査し、 PK himo への Tie を見つけたら
-    /// 「その PK 値を既に持つ local entity」を引いて、 写像をそこへ固定する
-    /// (`bind_remote_eid`)。 以降の `resolve_remote_eid` は払い出しではなくその
-    /// entity を返すので、 LWW は himo 単位で通常どおり効いて 1 row に収束する。
+    /// そこで PK himo への Tie を当てる直前に、 「その PK 値を今持っている local entity」 を
+    /// 引いて、 写像をそこへ固定する (`bind_remote_eid`)。 以降の `resolve_remote_eid` は
+    /// 払い出しではなくその entity を返すので、 LWW は himo 単位で通常どおり効いて 1 row に収束する。
     ///
-    /// **既知の制約**: bind できるのは PK Tie が batch に含まれる場合だけ。 ある row の
+    /// 照合は batch の前にまとめてせず、 record を順に当てる途中でする: 同じ batch の前の record
+    /// (同じ PK の行を消す Delete など) を当てた後の状態で引く。 batch の前にまとめると、 同じ
+    /// author が 1 batch の中で行を消して同じ PK で作り直した時、 作り直した行が消える前の古い行に
+    /// 束ねられ、 古い行への別の peer の更新が新しい行に入って author と恒久に食い違った (1 件ずつ
+    /// 届けた時は起きない = batch の切れ目で答えが変わった、 #508)。
+    ///
+    /// **既知の制約**: bind できるのは PK Tie が先に届く場合だけ。 ある row の
     /// PK Tie と非 PK Tie が別 batch に分かれ、 かつ非 PK 側が先に届くと、 その時点で
     /// 新規 eid が払い出されて束ね損なう。 1 row の insert は 1 commit = 同 batch に
     /// 載るのが通常なので実運用の主経路は塞がるが、 完全ではない (既に二重化した
     /// store の修復も別途必要 — #141 参照)。
-    fn bind_by_primary_key(&self, records: &[WireRecord]) {
-        // PK Tie を含まない batch では rebuild も lookup もしない (hot path 保護)。
-        let has_pk_tie = records.iter().any(|rec| {
-            matches!(&rec.op, DecodedOp::Tie { himo_id, .. } if self.engine.is_pk_himo(*himo_id))
-        });
-        if !has_pk_tie {
+    fn bind_by_primary_key(&self, rec: &WireRecord, batch: &[WireRecord]) {
+        let DecodedOp::Tie { eid, himo_id, value } = &rec.op else { return };
+        if !self.engine.is_pk_himo(*himo_id) {
             return;
         }
-        // query_by_id は cylinder index 経由なので、 直前の tie を見えるようにする
-        // (schema 層の upsert が PK lookup 前に rebuild するのと同じ理由)。
-        self.engine.rebuild();
-
-        for rec in records {
-            let DecodedOp::Tie { eid, himo_id, value } = &rec.op else { continue };
-            if !self.engine.is_pk_himo(*himo_id) {
-                continue;
-            }
-            // 既に写像がある foreign entity は触らない (先に確定した束ね先を優先)。
-            if self.engine.resolve_remote_eid_existing(*eid).is_some() {
-                continue;
-            }
-            // PK は Tag / Number 想定 (Ref を PK にはしない)。 remote vocab vid を
-            // local vid に翻訳してから引く。 **未翻訳の生 vid で引いてはいけない** —
-            // vid は author ローカル番号で、 fresh store 同士は intern 順が対称なので
-            // ほぼ必ず数値衝突し、 無関係な row へ誤 bind → 上書き → 恒久チャーンに
-            // なる (0.17.0 リグレッション。 新規文字列の Vocab record は同 batch 内で
-            // 未適用のため translate_remote_vid の fallback 生値が漏れていた)。
-            let local_value = match self
-                .engine
-                .try_translate_remote_vid(rec.author_peer, *himo_id, *value)
-            {
-                Some(v) => v,
-                None => {
-                    // mapping 未登録 = この vid の Vocab record は同 batch 内に居る
-                    // はず。 その bytes で local vocab を引き、 同じ文字列が local に
-                    // 既存ならその vid で照合する。 bytes ごと未知なら、 この PK
-                    // 文字列を持つ既存 row は存在し得ない → bind せず払い出しに任せる。
-                    let from_batch = records.iter().find_map(|r| match &r.op {
-                        DecodedOp::Vocab { vid, bytes }
-                            if r.author_peer == rec.author_peer && *vid as u64 == *value =>
-                        {
-                            self.engine.vocab_id_bytes(bytes)
-                        }
-                        _ => None,
-                    });
-                    match from_batch {
-                        Some(v) => v as u64,
-                        None => continue,
-                    }
-                }
-            };
-            let Some(existing) = self
-                .engine
-                .query_by_id64(&[(*himo_id, local_value)])
-                .into_iter()
-                .next()
-            else {
-                continue; // 同じ PK の row はまだ無い → 通常の払い出しに任せる
-            };
-            self.engine.bind_remote_eid(rec.author_peer, *eid, existing);
+        // 既に写像がある foreign entity は触らない (先に確定した束ね先を優先)。
+        if self.engine.resolve_remote_eid_existing(*eid).is_some() {
+            return;
         }
+        // PK は Tag / Number 想定 (Ref を PK にはしない)。 remote vocab vid を
+        // local vid に翻訳してから引く。 **未翻訳の生 vid で引いてはいけない** —
+        // vid は author ローカル番号で、 fresh store 同士は intern 順が対称なので
+        // ほぼ必ず数値衝突し、 無関係な row へ誤 bind → 上書き → 恒久チャーンに
+        // なる (0.17.0 リグレッション。 新規文字列の Vocab record は同 batch 内で
+        // 未適用のため translate_remote_vid の fallback 生値が漏れていた)。
+        let local_value = match self.engine.try_translate_remote_vid(rec.author_peer, *himo_id, *value) {
+            Some(v) => v,
+            None => {
+                // mapping 未登録 = この vid の Vocab record は同 batch のまだ当てていない所に
+                // 居るはず。 その bytes で local vocab を引き、 同じ文字列が local に
+                // 既存ならその vid で照合する。 bytes ごと未知なら、 この PK
+                // 文字列を持つ既存 row は存在し得ない → bind せず払い出しに任せる。
+                let from_batch = batch.iter().find_map(|r| match &r.op {
+                    DecodedOp::Vocab { vid, bytes } if r.author_peer == rec.author_peer && *vid as u64 == *value => {
+                        self.engine.vocab_id_bytes(bytes)
+                    }
+                    _ => None,
+                });
+                match from_batch {
+                    Some(v) => v as u64,
+                    None => return,
+                }
+            }
+        };
+        // 索引は書く時に並べるので、 同じ batch で前に当てた record も引ける
+        let Some(existing) = self.engine.query_by_id64(&[(*himo_id, local_value)]).into_iter().next() else {
+            return; // 同じ PK の row は今は無い → 通常の払い出しに任せる
+        };
+        self.engine.bind_remote_eid(rec.author_peer, *eid, existing);
     }
 
-    /// 受信 record 列を適用する。 `pull_once` の中身であり、 transport を介さず
-    /// record を直接持っている caller (WS push など) の入口でもある。
+    /// 受信 record 列を LWW で適用する (Phase C: 署名検証 + ACL も通す)。 `pull_once` の中身であり、
+    /// transport を介さず record を直接持っている caller (WS push など) の入口でもある (そのために public)。
     ///
     /// **注意**: 自前で cursor を持つ caller は、 cursor を永続する
     /// 前に [`Engine::persist_sync_state`] を呼ぶこと。 適用が作った写像
@@ -1395,7 +1376,6 @@ impl Syncer {
                  collide with local ones (#9)."
             );
         }
-        self.bind_by_primary_key(records);
         let store = self.engine.hlc_store().clone();
         let require_sig = self.require_signature.load(std::sync::atomic::Ordering::Acquire);
         let pubkeys = self.engine.pubkeys().clone();
@@ -1433,6 +1413,7 @@ impl Syncer {
                     continue;
                 }
             }
+            self.bind_by_primary_key(rec, records);
             match self.apply_one(&store, rec) {
                 ApplyResult::Applied => {
                     out.applied += 1;
