@@ -2094,18 +2094,85 @@ impl OpLog {
 }
 
 /// 現在時刻を ms since UNIX epoch で返す。wasm32 では 0。
+///
+/// HLC の採番 (WAL に積む 1 回ごと、 `append_lock` の中) で読む。 Apple の aarch64 (macOS / iOS) の `SystemTime::now()` は
+/// `mach_absolute_time` が Apple 独自の counter の register を読む所が重く、 書き手 1 本の sample でも書き手の時間の 2〜5 割を
+/// 占めていた (#506)。 そこでは thread ごとに、 前に読んだ時刻に CPU の counter (`cntvct_el0`: 全 core でそろった一定の周波数で、
+/// 眠っている間も進む。 読みは数 ns) の進みを足して出し、 1 ms ごとに読み直す (時刻を合わせ直した時の飛びは 1 ms 以内に拾う)。
 #[inline]
 fn current_wall_ms() -> u64 {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple", not(miri)))]
     {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
+        apple_wall_clock::now_ms()
+    }
+    #[cfg(all(not(target_arch = "wasm32"), not(all(target_arch = "aarch64", target_vendor = "apple", not(miri)))))]
+    {
+        system_wall_ns() / 1_000_000
     }
     #[cfg(target_arch = "wasm32")]
     { 0 }
+}
+
+/// `SystemTime::now()` を ns since UNIX epoch で (epoch より前なら 0)。
+#[cfg(not(target_arch = "wasm32"))]
+fn system_wall_ns() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple", not(miri)))]
+mod apple_wall_clock {
+    use std::cell::Cell;
+
+    /// counter の今の値。 `isb` を挟まない (前後の命令と少し入れ違ってよい: 1 ms の窓の判定にだけ使う)。
+    #[inline]
+    fn ticks() -> u64 {
+        let t: u64;
+        // SAFETY: cntvct_el0 は EL0 から読める (`mach_absolute_time` も同じ register を読む)。 読むだけで副作用は無い
+        unsafe { std::arch::asm!("mrs {}, cntvct_el0", out(reg) t, options(nomem, nostack, preserves_flags)) };
+        t
+    }
+
+    /// counter の周波数 (Hz)。
+    #[inline]
+    fn freq() -> u64 {
+        let f: u64;
+        // SAFETY: 同上
+        unsafe { std::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) };
+        f
+    }
+
+    thread_local! {
+        /// 最後に読み直した時の (counter, 時刻 ns)。 counter 0 は未読
+        static BASE: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(super) fn now_ms() -> u64 {
+        now_ns() / 1_000_000
+    }
+
+    /// 今の時刻 (ns since UNIX epoch)。 控えた時刻からの足しは、 本当の時刻より先に進まない (控えは時刻を読んだ後の counter)。
+    pub(super) fn now_ns() -> u64 {
+        let f = freq();
+        BASE.with(|b| {
+            let (t0, ns0) = b.get();
+            let d = ticks().wrapping_sub(t0);
+            if t0 != 0 && f >= 1000 && d < f / 1000 {
+                return ns0 + d * 1_000_000_000 / f;
+            }
+            let before = ticks();
+            let ns = super::system_wall_ns();
+            let after = ticks();
+            // 時刻の読みの間に止められた (組がずれた) 時は控えない: 足した時刻がその間だけ遅れる
+            if after.wrapping_sub(before) < f / 100_000 {
+                b.set((after, ns));
+            }
+            ns
+        })
+    }
 }
 
 fn decode_op(op_byte: u8, payload: &[u8]) -> Option<DecodedOp> {
@@ -2989,6 +3056,24 @@ mod tests {
         assert_eq!(all.len(), n, "同じ HLC が {} 回払い出された", n - all.len());
         let _ = std::fs::remove_dir_all(&p);
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// Apple の aarch64 で、 控えた時刻に CPU の counter の進みを足して出す時刻 (`apple_wall_clock`) が、 その都度読む時刻と
+    /// ずれない。 1 ms ごとの読み直しをまたぐように、 ときどき寝る。
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple", not(miri)))]
+    #[test]
+    fn counted_wall_clock_tracks_the_system_clock() {
+        for i in 0..20_000u32 {
+            if i % 1000 == 999 {
+                std::thread::sleep(std::time::Duration::from_micros(1500));
+            }
+            let before = system_wall_ns();
+            let got = apple_wall_clock::now_ns();
+            let after = system_wall_ns();
+            // 先には進まない (時刻を合わせる遅れ・進みの分だけ許す)。 遅れは、 控えの組を読む間 (10 µs 未満) だけ
+            assert!(got <= after + 2_000, "{i} 回目: 読んだ時刻より {} ns 先", got - after);
+            assert!(got + 20_000 >= before, "{i} 回目: 読んだ時刻より {} ns 遅れた", before - got);
+        }
     }
 
     #[test]
