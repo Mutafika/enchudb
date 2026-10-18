@@ -433,8 +433,7 @@ impl Drop for WsPushClient {
 /// use enchudb_transport::ws::{WsPushHub, WsPushHubAdapter};
 ///
 /// let path = format!("/tmp/enchudb-ws-adapter-doc-{}.db", std::process::id());
-/// # let _ = std::fs::remove_file(&path);
-/// # let _ = std::fs::remove_file(format!("{}.oplog", path));
+/// # let _ = enchudb::db_files::remove_db(&path);
 /// {
 ///     let mut eng = Engine::create_standalone(&path).unwrap();
 ///     eng.define_himo("v", ValueType::Number, 100);
@@ -456,8 +455,7 @@ impl Drop for WsPushClient {
 /// eng.oplog_sync().unwrap();
 ///
 /// drop(eng);
-/// # let _ = std::fs::remove_file(&path);
-/// # let _ = std::fs::remove_file(format!("{}.oplog", path));
+/// # let _ = enchudb::db_files::remove_db(&path);
 /// ```
 pub struct WsPushHubAdapter {
     hub: std::sync::Arc<WsPushHub>,

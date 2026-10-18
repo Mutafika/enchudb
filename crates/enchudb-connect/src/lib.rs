@@ -24,7 +24,7 @@
 //! use enchudb_schema::Database;
 //!
 //! let path = format!("/tmp/enchu-connect-doc-{}.db", std::process::id());
-//! # let _ = std::fs::remove_file(&path);
+//! # let _ = enchudb_engine::db_files::remove_db(&path);
 //! let mut db = Database::create_growable_tiny(&path).unwrap();
 //! db.table("users").number("id").tag("city").primary_key("id").build().unwrap();
 //! enchudb_connect::prepare(&mut db).unwrap();
@@ -44,7 +44,7 @@
 //! assert_eq!(out.len(), 1);
 //! assert!(String::from_utf8_lossy(&out[0].1).contains(r#""op":"add""#));
 //! # drop(export); drop(db);
-//! # let _ = std::fs::remove_file(&path);
+//! # let _ = enchudb_engine::db_files::remove_db(&path);
 //! ```
 
 pub mod memory;

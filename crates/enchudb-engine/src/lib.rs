@@ -2,7 +2,7 @@
 //!
 //! ```
 //! let path = format!("/tmp/enchudb-doc-{}.db", std::process::id());
-//! let _ = std::fs::remove_file(&path);
+//! let _ = enchudb_engine::db_files::remove_db(&path);
 //! let mut db = enchudb_engine::Engine::create_standalone(&path).unwrap();
 //! db.define_himo("age", enchudb_engine::ValueType::Number, 100);
 //! let e = db.entity().unwrap();
@@ -11,7 +11,7 @@
 //! db.rebuild();
 //! let result = db.pull_raw("age", 30); // O(1)
 //! assert_eq!(result, vec![0]);
-//! # let _ = std::fs::remove_file(&path);
+//! # let _ = enchudb_engine::db_files::remove_db(&path);
 //! ```
 //!
 //! # ディスク容量について (#167)

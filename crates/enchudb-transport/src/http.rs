@@ -646,7 +646,7 @@ impl HttpTransport {
     /// let target = format!("/tmp/enchudb-doc-bootstrap-{}.db", std::process::id());
     /// let result = client.bootstrap_to(&target);
     /// assert!(result.is_err(), "bootstrap should 404 without src");
-    /// # let _ = std::fs::remove_file(&target);
+    /// # let _ = enchudb::db_files::remove_db(&target);
     /// ```
     pub fn bootstrap_to(&self, local_path: &str) -> io::Result<Hlc> {
         let mut stream = self.connect()?;

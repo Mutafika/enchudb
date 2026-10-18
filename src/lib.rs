@@ -29,14 +29,14 @@
 //!
 //! ```
 //! let path = format!("/tmp/enchudb-doc-{}.db", std::process::id());
-//! let _ = std::fs::remove_file(&path);
+//! let _ = enchudb::db_files::remove_db(&path);
 //! let mut db = enchudb::Engine::create_standalone(&path).unwrap();
 //! db.define_himo("age", enchudb::ValueType::Number, 100);
 //! let e = db.entity().unwrap();
 //! db.tie(e, "age", 30);
 //! db.rebuild();
 //! assert_eq!(db.pull_raw("age", 30), vec![0]);
-//! # let _ = std::fs::remove_file(&path);
+//! # let _ = enchudb::db_files::remove_db(&path);
 //! ```
 
 pub use enchudb_engine::*;

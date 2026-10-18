@@ -12,10 +12,7 @@
 //! use enchudb_sync::Syncer;
 //!
 //! let path = format!("/tmp/enchudb-sync-lib-doc-{}.db", std::process::id());
-//! let _ = std::fs::remove_file(&path);
-//! let _ = std::fs::remove_file(format!("{}.oplog", path));
-//! let _ = std::fs::remove_file(format!("{}.tables", path));
-//! let _ = std::fs::remove_file(format!("{}.db.lock", path));
+//! let _ = enchudb_engine::db_files::remove_db(&path);
 //! {
 //!     let mut eng_init = Engine::create_standalone(&path).unwrap();
 //!     eng_init.enable_sync_tables().unwrap();
@@ -28,10 +25,7 @@
 //! let out = syncer.pull_once(2);
 //! assert_eq!(out.received, 0);
 //! # drop(eng_a);
-//! # let _ = std::fs::remove_file(&path);
-//! # let _ = std::fs::remove_file(format!("{}.oplog", path));
-//! # let _ = std::fs::remove_file(format!("{}.tables", path));
-//! # let _ = std::fs::remove_file(format!("{}.db.lock", path));
+//! # let _ = enchudb_engine::db_files::remove_db(&path);
 //! ```
 
 pub mod sync;
