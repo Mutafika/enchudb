@@ -8532,9 +8532,13 @@ impl Engine {
         }
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
         let target_local = enchudb_oplog::eid_local(local_eid);
+        let mut bound_now = false;
         let local = self
             .eid_translator
-            .get_or_insert_with(author_peer, foreign_local, || Some(target_local))
+            .get_or_insert_with(author_peer, foreign_local, || {
+                bound_now = true;
+                Some(target_local)
+            })
             .unwrap_or(target_local);
         // #178: **束ねる前に自分が書いていた**なら、 その write は既に自分の eid のまま
         // bridge されている (宛名の付け替えは bridge 時に `reverse()` を引くため)。
@@ -8545,6 +8549,15 @@ impl Engine {
         // 束ね先の entity は live 扱いにしておく (remote_tie_apply と同じ前提)。
         self.entities.ensure_live(local);
         Self::advance_table_next_local_for(&self.tables, local);
+        // #490: この entity 宛ての Delete を作成より先に受けて退避表に載せていたなら、 束ねた行にその削除を当てる
+        // (版数を載せ、 削除より古い cell を落とす)。 作成を受けて束ねた後に Delete が届いた時は、 写像のある Delete として
+        // 束ねた行が消えるので、 それと同じ答えにする。 払い出した slot と違って既にある行に束ねるので、 版数を書き戻すだけ
+        // (`restore_foreign_tombstone`) だと、 束ねた行がもともと持っていた古い cell が残り、 届いた順で答えが割れる。
+        if bound_now
+            && let Some(tomb) = self.foreign_tombstone_of(enchudb_oplog::eid_peer(foreign_eid), foreign_local)
+        {
+            self.apply_delete_local(local, tomb);
+        }
         enchudb_oplog::make_eid(self_peer, local)
     }
 
@@ -9835,18 +9848,22 @@ impl Engine {
     /// これで 「この foreign entity は t で削除済み」 が slot を跨いで生き残り、
     /// t より古い record は新しい slot 上の tombstone で従来どおり弾かれる
     /// (= 判定経路は `set_cell` 1 本のまま。 A-2 を崩さない)。
+    ///
+    /// #490: 呼ぶのは払い出す所 (`get_or_insert_with` の確保の中 = 写像を載せる前) だけ。
+    /// PK で既存の行に束ねる時は `bind_remote_eid` が削除そのものを当てる。
     fn restore_foreign_tombstone(&self, peer: enchudb_oplog::PeerId, foreign_local: u32, local: u32) {
-        if self.foreign_tombs_empty.load(std::sync::atomic::Ordering::Relaxed) {
-            return; // 常態 (= 一度も slot が回っていない)。 lock を取らない
+        if let Some(tomb) = self.foreign_tombstone_of(peer, foreign_local) {
+            self.set_tombstone_local(local, tomb);
         }
-        let tomb = {
-            let g = self.foreign_tombs.read().unwrap();
-            match g.get(&(peer, foreign_local)) {
-                Some(&t) if t != enchudb_oplog::Hlc::ZERO => t,
-                _ => return,
-            }
-        };
-        self.set_tombstone_local(local, tomb);
+    }
+
+    /// 退避表に載っている `(peer, foreign_local)` の削除版数 (#166 / #490)。
+    fn foreign_tombstone_of(&self, peer: enchudb_oplog::PeerId, foreign_local: u32) -> Option<enchudb_oplog::Hlc> {
+        if self.foreign_tombs_empty.load(std::sync::atomic::Ordering::Relaxed) {
+            return None; // 常態 (= slot が回っておらず、 作成より先に届いた Delete も無い)。 lock を取らない
+        }
+        let g = self.foreign_tombs.read().unwrap();
+        g.get(&(peer, foreign_local)).copied().filter(|&t| t != enchudb_oplog::Hlc::ZERO)
     }
 
     /// #166: slot に載っていない (= 退避済みの) foreign tombstone の snapshot。
@@ -9860,22 +9877,27 @@ impl Engine {
     }
 
     /// #166: 復元 / 再受信で使う。 退避表へ直接載せる (monotone-max)。
+    ///
+    /// #490: `false` = 既に載っている削除版数より古いので載せない (`apply_delete_in` と同じく、 拒否は真に古い時だけ)。
     fn remember_foreign_tombstone(
         &self,
         peer: enchudb_oplog::PeerId,
         foreign_local: u32,
         tomb: enchudb_oplog::Hlc,
-    ) {
+    ) -> bool {
         if tomb == enchudb_oplog::Hlc::ZERO {
-            return;
+            // 版数不明の delete は記録できない (`set_tombstone_local` と同じ)
+            return true;
         }
         let mut g = self.foreign_tombs.write().unwrap();
         let e = g.entry((peer, foreign_local)).or_insert(enchudb_oplog::Hlc::ZERO);
-        if *e < tomb {
-            *e = tomb;
+        if tomb < *e {
+            return false;
         }
+        *e = tomb;
         self.foreign_tombs_empty
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        true
     }
 
     /// 削除を **本体まで** 適用する。 `false` = 受信 HLC が既存 tombstone より古いので不採用。
@@ -10142,13 +10164,15 @@ impl Engine {
         let local = self
             .eid_translator
             .get_or_insert_with(owner, foreign_local, || {
-                self.alloc_translated_local(himo_id)
+                let local = self.alloc_translated_local(himo_id)?;
+                // #166: slot が回った identity なら、 退避してある削除版数を新しい slot に
+                // 書き戻す。 #490: 作成より先に Delete を受けた identity も同じ。
+                // 払い出す時だけ引く (前は写像のある record でも毎回引いたので、 退避表が空で
+                // ないと record を当てるたびに lock を取った)。 写像を載せる前に書くので、
+                // 写像を引いた別の thread が tombstone の無い slot を見ることはない。
+                self.restore_foreign_tombstone(owner, foreign_local, local);
+                Some(local)
             })?;
-        // #166: slot が回った identity なら、 退避してある削除版数を今の slot に
-        // 書き戻す。 `set_tombstone_local` は monotone-max なので、 既に載っている
-        // 場合も新規 slot の場合も同じ呼びで済む (idempotent)。 退避表が空なら
-        // read lock も取らない。
-        self.restore_foreign_tombstone(owner, foreign_local, local);
         Some(enchudb_oplog::make_eid(self_peer, local))
     }
 
@@ -10221,7 +10245,11 @@ impl Engine {
         // target table を導けなければ None (caller が op を skip)。
         self.eid_translator
             .get_or_insert_with(author_peer, foreign_value, || {
-                self.alloc_translated_local_in_target_table(ref_himo_id)
+                let local = self.alloc_translated_local_in_target_table(ref_himo_id)?;
+                // 退避してある削除版数を書き戻す (`resolve_remote_eid` と同じ。 写像を
+                // 引く側は書き戻さないので、 払い出す所は全部ここで書き戻す)
+                self.restore_foreign_tombstone(author_peer, foreign_value, local);
+                Some(local)
             })
     }
 
@@ -10618,6 +10646,49 @@ impl Engine {
         // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
         // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
         true
+    }
+
+    /// #490: リモート peer から届いた Delete を、 翻訳する前の eid (author の世界番号) のまま当てる。
+    ///
+    /// 写像がある (= この entity の作成を受け取っている) なら [`Engine::remote_delete_apply`] と同じ。
+    ///
+    /// 写像が無いのは、 作成より先に Delete が届いた時 (A が作った行を B が消し、 3 台目が A より先に B から pull した)。
+    /// 前は捨てていたが、 pull の cursor は Delete を越えるので Delete は二度と届かず、 後から作成が届くと行が生き返った
+    /// (受け手が pull する順だけで peer が恒久に食い違う)。 ここでは削除版数を退避表 (`foreign_tombs`、 #166) に載せる。
+    /// 作成が届いて slot を払い出す時に `restore_foreign_tombstone` が書き戻すので、 削除より古い record は `set_cell` の
+    /// tombstone の判定で弾かれ、 新しい record は当たる (#166 で slot が回った後と同じ形)。 退避表は `.eidmap` に残るので
+    /// 再起動も越える (`Syncer` は、 当てた record があれば cursor を進める前に永続する)。
+    ///
+    /// 写像の確かめと退避表への記入は、 写像の払い出しと同じ lock の下で行う ([`EidTranslator::if_unmapped`])。 lock の下で
+    /// 写像が見つかったら (間に作成が当たった)、 写像のある Delete として当てる。
+    ///
+    /// 作成が最後まで届かない entity (subscription filter で落ちる、 履歴の切り詰めの後) 宛ての Delete も退避表に残る
+    /// (1 件 = `(peer, foreign_local)` → HLC)。
+    ///
+    /// 戻り値は [`Engine::remote_delete_apply`] と同じ (`false` = 既に載っている削除より古いので不採用)。
+    ///
+    /// [`EidTranslator::if_unmapped`]: crate::eid_translator::EidTranslator::if_unmapped
+    pub fn remote_delete_apply_foreign(
+        &self,
+        foreign_eid: enchudb_oplog::EntityId,
+        hlc: enchudb_oplog::Hlc,
+    ) -> bool {
+        if let Some(local_eid) = self.resolve_remote_eid_existing(foreign_eid) {
+            return self.remote_delete_apply(local_eid, hlc);
+        }
+        self.observe_remote_hlc(hlc);
+        let owner = enchudb_oplog::eid_peer(foreign_eid);
+        let foreign_local = enchudb_oplog::eid_local(foreign_eid);
+        match self
+            .eid_translator
+            .if_unmapped(owner, foreign_local, || self.remember_foreign_tombstone(owner, foreign_local, hlc))
+        {
+            Ok(accepted) => accepted,
+            Err(local) => {
+                let self_peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
+                self.remote_delete_apply(enchudb_oplog::make_eid(self_peer, local), hlc)
+            }
+        }
     }
 
     /// リモート peer から届いた Content 書き込みを apply。
@@ -15104,8 +15175,8 @@ impl Engine {
                 self.remote_untie_apply(le, *himo_id, hlc);
             }
             DecodedOp::Delete { eid } => {
-                let Some(le) = self.resolve_remote_eid_existing(*eid) else { return };
-                self.remote_delete_apply(le, hlc);
+                // #490: 写像が無くても捨てず、 削除版数を退避表に載せる (`Syncer::apply_one` と同じ)
+                self.remote_delete_apply_foreign(*eid, hlc);
             }
             DecodedOp::Content { eid, key, data } => {
                 let Some(le) = self.resolve_remote_eid_existing(*eid) else { return };
@@ -17987,7 +18058,11 @@ mod tests {
             "premise: bridge が cursor を進めていること (offset={advanced})"
         );
 
-        // fold の巻き戻しを再現
+        // fold の巻き戻しを再現。 本物の fold と同じく `transfer_lock` を握ってから巻き戻し、 下の assert まで握り続ける。
+        // 握らないと、 裏の書き出し係の bridge (`transfer_lock` を取る) が入れ違う: 巻き戻しの直前に `from` を読んだ裏の
+        // transfer の CAS も外れて修理の数が 2 になる、 または巻き戻しの後に裏の transfer が cursor を進め直す (手元の CI で
+        // 1 回、 修理の数 2 で落ちた)。 巻き戻しと下の stale store の模擬は lock を取らないので、 握ったままで詰まらない。
+        let _fold = eng.transfer_lock_for_fold();
         eng.reset_sync_ops_offset();
         assert_eq!(
             eng.sync_ops_bridge_offset(),

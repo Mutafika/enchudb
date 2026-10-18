@@ -155,6 +155,25 @@ impl EidTranslator {
         Some(local)
     }
 
+    /// #490: 写像が無ければ `f` を呼ぶ。 写像があれば `f` を呼ばずに `Err(local)`。
+    ///
+    /// 確かめと `f` は、 `get_or_insert_with` の払い出しと同じ `alloc_lock` の下で行う。 `f` の間に同じ key の写像が
+    /// 払い出されることはなく、 `f` の後で払い出す側は `f` が書いたものを見る。 写像の無い entity 宛ての Delete を
+    /// 退避表に載せるのに使う (間に払い出しが入ると、 払い出した側は退避表をまだ見ず、 載せる側は写像を見ずに載せて、
+    /// 削除が新しい slot に載らない)。
+    pub fn if_unmapped<R>(
+        &self,
+        author_peer: PeerId,
+        foreign_local: u32,
+        f: impl FnOnce() -> R,
+    ) -> Result<R, u32> {
+        let _serialize = self.alloc_lock.lock().unwrap_or_else(|p| p.into_inner());
+        match self.get(author_peer, foreign_local) {
+            Some(local) => Err(local),
+            None => Ok(f()),
+        }
+    }
+
     /// #166: **local slot が再利用されるとき**に写像を外す。 外した
     /// `(author_peer, foreign_local)` を返す (レプリカでなければ `None`)。
     ///
@@ -281,5 +300,17 @@ mod tests {
         let l = t.get_or_insert_with(4, 200, || Some(77)).unwrap();
         assert_eq!(l, 77);
         assert_eq!(t.reverse(77), Some((4, 200)));
+    }
+
+    /// #490: 写像が無い時だけ `f` を呼び、 あればその local を返す (写像は作らない)。
+    #[test]
+    fn if_unmapped_calls_only_without_a_mapping() {
+        let t = EidTranslator::new();
+        assert_eq!(t.if_unmapped(1, 42, || "called"), Ok("called"));
+        assert_eq!(t.get(1, 42), None, "写像を作った");
+        t.insert(1, 42, 7);
+        let mut called = false;
+        assert_eq!(t.if_unmapped(1, 42, || called = true), Err(7));
+        assert!(!called, "写像があるのに呼んだ");
     }
 }
