@@ -75,6 +75,8 @@ pub mod cas;
 // 移行ガイド: docs/migration-wal-crate.md
 pub mod hlc_store;
 pub mod eid_translator;
+// #513: 消した主キーの記録 (主キーが同じなら同じ行)。
+pub(crate) mod pk_tombs;
 pub mod transport;
 // `sync::Syncer` は `enchudb-sync` crate に分離済。
 // engine は single-peer でも動くので sync を直接持たない。
@@ -99,7 +101,7 @@ pub mod integrity;
 pub mod blob_store;
 pub mod sparse_copy;
 
-pub use engine::{DbState, Engine, EntityValue, EntityValueOwned, SnapshotFiles, AuditFilter, MigrationStats, LeafScale, GrowableOptions, FaultKind, RemoteApply, TieRejected, VocabUsage};
+pub use engine::{DbState, Engine, EntityValue, EntityValueOwned, SnapshotFiles, AuditFilter, MigrationStats, LeafScale, GrowableOptions, FaultKind, PkValue, RemoteApply, TieRejected, VocabUsage};
 pub use live::{Agg, GroupedLiveQuery, KeyedDelta, LiveCounts, LiveGroup, LiveDelta, LiveKeyed, LivePred, LiveQuery, TouchedDelta, TouchedLiveQuery, MAX_BRANCHES, MAX_KEYS};
 pub use sparse_copy::copy_sparse;
 #[cfg(not(target_arch = "wasm32"))]

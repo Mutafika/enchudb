@@ -200,6 +200,37 @@ impl std::fmt::Display for TieRejected {
 
 impl std::error::Error for TieRejected {}
 
+/// #513: 削除の道で積む、 消した主キーの行 (`Engine::pk_pending`)。 値は local な値 (Tag は辞書の番号。 辞書を回収する DB
+/// の文字列の主キーは積まずにその場で載せるので、 番号は載せる時まで同じ文字列を指す)。
+#[derive(Debug, Clone, Copy)]
+struct PkPending {
+    slot: u32,
+    himo: u16,
+    value: u64,
+    hlc: enchudb_oplog::Hlc,
+}
+
+/// #513: 覚えた主キーの bit の表の大きさ (bit、 2 の冪)。 64 KiB。
+const PK_BLOOM_BITS: usize = 1 << 19;
+
+/// #513: 主キーの bit の表の番地 (FNV-1a 64)。
+fn pk_bloom_index(himo: u16, key: &[u8]) -> usize {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in himo.to_le_bytes().iter().chain(key) {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    (h as usize) & (PK_BLOOM_BITS - 1)
+}
+
+/// #513: 主キーで束ねる時の主キーの値 ([`Engine::reserve_remote_eid_for_pk`])。 受け手の辞書にある値・数などは local な
+/// 値 (`Local`)、 受け手の辞書に無い文字列 (届いた `Vocab` の bytes) は `Text`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PkValue<'a> {
+    Local(u64),
+    Text(&'a [u8]),
+}
+
 /// `remote_*_apply` (sync 受信の apply) の結果 (#210)。
 ///
 /// 旧 `bool` は 「適用した / しなかった」 しか区別できず、 **「LWW で古い」 と
@@ -818,6 +849,25 @@ fn load_eidmap_from_sidecar(db_path: &str) -> io::Result<Option<Vec<EidmapEntry>
             Ok(entries) => Ok(Some(entries)),
             Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
         },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// #513: 消した主キーの記録の sidecar path (`pktombs`、 中身は `pk_tombs.rs`)。 不在 (主キーのある行を sync の DB で
+/// 消していない / 旧 DB) なら空で続行。
+#[cfg(not(target_arch = "wasm32"))]
+fn pktombs_path_for(path: &str) -> std::path::PathBuf {
+    crate::db_files::path_for(path, crate::db_files::PKTOMBS)
+}
+
+/// #513: `pktombs` を読む。 不在なら Ok(None)。 2 つ目は切れた末尾を捨てたか。
+#[cfg(not(target_arch = "wasm32"))]
+fn load_pktombs_from_sidecar(db_path: &str) -> io::Result<Option<(crate::pk_tombs::PkTombs, bool)>> {
+    match std::fs::read(pktombs_path_for(db_path)) {
+        Ok(buf) => crate::pk_tombs::PkTombs::load(&buf)
+            .map(Some)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
@@ -3911,6 +3961,26 @@ pub struct Engine {
     /// 起きていない DB (= 常態) で、 受信 apply の hot path が read lock すら
     /// 取らないようにするためだけのもの。
     foreign_tombs_empty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// #513: 消した主キーの記録 (`pk_tombs.rs`)。 主キーのある表の行を消した時に覚え、 後から同じ主キーの行が届いたら
+    /// その削除を当てる (主キーが同じなら同じ行)。
+    pk_tombs: std::sync::RwLock<crate::pk_tombs::PkTombs>,
+    /// #513: `pk_tombs` に主キーが 1 つも無いか。 常態 (主キーのある行を消していない) の受け取りで lock を取らないため。
+    /// 空でなくなったら戻さない。 積んだまま載せていない分は `pk_pending_nonempty` で見る。
+    pk_tombs_empty: std::sync::atomic::AtomicBool,
+    /// #513: `pk_tombs` を最後に書き出した後に変えたか (`pktombs` を変わった時だけ書く)。
+    pk_tombs_dirty: std::sync::atomic::AtomicBool,
+    /// #513: 主キーを覚える DB か (sync の表があり、 `_` で始まらない表に主キーがある)。 削除の道で、 主キーのある表の無い DB
+    /// が、 行の表を探さずに抜けるため (探すと主キーの無い表の削除が 2% ほど遅くなった)。 `refresh_sync_tables_flag` と
+    /// `set_table_pk` で引き直す。
+    pk_tombs_on: std::sync::atomic::AtomicBool,
+    /// #513: 削除の道で積んだ、 まだ `pk_tombs` に載せていない主キーの行。 削除のたびに表に載せると、 削除 1 回 (約 0.17 µs)
+    /// と同じくらいかかった (主キーのある行を消す速さが 0.4 倍)。 載せるのは引く時と書き出す時 (`drain_pk_pending`)。
+    pk_pending: parking_lot::Mutex<Vec<PkPending>>,
+    /// #513: `pk_pending` に積んだ分があるかもしれない (無いのに立っていることはある)。
+    pk_pending_nonempty: std::sync::atomic::AtomicBool,
+    /// #513: 覚えた主キーの bit の表 (主キーの hash に 1 bit)。 bit が無ければ、 その主キーは覚えていない。 受け手が新しい行
+    /// ごとに引く時に、 lock を取らずに弾く。 初めて覚えた時に作る。
+    pk_bloom: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU64]>>,
     /// 自 peer の ed25519 鍵ペア。None なら署名しない/検証もしない。
     keypair: std::sync::RwLock<Option<std::sync::Arc<enchudb_oplog::keys::Keypair>>>,
     /// 他 peer の pubkey TOFU ストア。Syncer が verify に使う。
@@ -4395,6 +4465,13 @@ impl Engine {
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
             foreign_tombs: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             foreign_tombs_empty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            pk_tombs: std::sync::RwLock::new(crate::pk_tombs::PkTombs::default()),
+            pk_tombs_empty: std::sync::atomic::AtomicBool::new(true),
+            pk_tombs_dirty: std::sync::atomic::AtomicBool::new(false),
+            pk_tombs_on: std::sync::atomic::AtomicBool::new(false),
+            pk_pending: parking_lot::Mutex::new(Vec::new()),
+            pk_pending_nonempty: std::sync::atomic::AtomicBool::new(false),
+            pk_bloom: std::sync::OnceLock::new(),
             keypair: std::sync::RwLock::new(None),
             pubkeys: std::sync::Arc::new(enchudb_oplog::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
@@ -4820,6 +4897,30 @@ impl Engine {
                     "warning: failed to read eidmap sidecar (empty translator): {}",
                     e
                 );
+            }
+        }
+
+        // #513: 消した主キーの記録。 不在なら空で続行。 壊れていたら警告して空で続ける (それより前に消した主キーの行が、
+        // 後から届いた同じ主キーの古い行に当たらなくなる = 記録の無かった版の動き)。 後の WAL の読み直しと、 途中で
+        // 切れた削除の仕上げが覚える分はこの上に足す。 追記の途中で切れた末尾は捨て、 次の書き出しでまとめ直す。
+        match load_pktombs_from_sidecar(path) {
+            Ok(Some((loaded, torn))) => {
+                use std::sync::atomic::Ordering;
+                if !loaded.is_empty() {
+                    eng.pk_tombs_empty.store(false, Ordering::Release);
+                }
+                for (himo, key) in loaded.keys() {
+                    eng.pk_bloom_set(himo, key);
+                }
+                *eng.pk_tombs.write().unwrap() = loaded;
+                if torn {
+                    eprintln!("warning: pktombs sidecar ends with a torn record (dropped; rewritten on the next persist)");
+                    eng.pk_tombs_dirty.store(true, Ordering::Release);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("warning: failed to read pktombs sidecar (no deleted primary keys remembered): {}", e);
             }
         }
 
@@ -5556,6 +5657,13 @@ impl Engine {
             eid_translator: std::sync::Arc::new(crate::eid_translator::EidTranslator::new()),
             foreign_tombs: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             foreign_tombs_empty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            pk_tombs: std::sync::RwLock::new(crate::pk_tombs::PkTombs::default()),
+            pk_tombs_empty: std::sync::atomic::AtomicBool::new(true),
+            pk_tombs_dirty: std::sync::atomic::AtomicBool::new(false),
+            pk_tombs_on: std::sync::atomic::AtomicBool::new(false),
+            pk_pending: parking_lot::Mutex::new(Vec::new()),
+            pk_pending_nonempty: std::sync::atomic::AtomicBool::new(false),
+            pk_bloom: std::sync::OnceLock::new(),
             keypair: std::sync::RwLock::new(None),
             pubkeys: std::sync::Arc::new(enchudb_oplog::keys::PubkeyStore::new()),
             acl: std::sync::Arc::new(crate::acl::Acl::new()),
@@ -5843,6 +5951,14 @@ impl Engine {
     pub(crate) fn refresh_sync_tables_flag(&self) {
         self.sync_tables_on
             .store(self.sync_tables_enabled(), std::sync::atomic::Ordering::Relaxed);
+        self.refresh_pk_tombs_flag();
+    }
+
+    /// #513: `pk_tombs_on` を引き直す。
+    fn refresh_pk_tombs_flag(&self) {
+        let on = self.sync_tables_enabled()
+            && self.tables.iter().any(|t| t.pk_himo.is_some() && !t.name.starts_with('_'));
+        self.pk_tombs_on.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 0.7.0 (Phase 4): oplog の `sync_ops_offset` 以降の record を `_sync_ops`
@@ -8319,6 +8435,8 @@ impl Engine {
         persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw())?;
         // #9: 翻訳テーブルも同じ trigger で persist (next_local と整合させる)。
         persist_eidmap_to_sidecar(&self.path, &self.eidmap_entries_with_tombstones())?;
+        // #513: 消した主キーの記録も (受け取った削除の分は、 pull の cursor を進める前に固まる)
+        self.persist_pk_tombs_if_dirty()?;
         self.persist_vocab_map_if_dirty()
     }
 
@@ -8367,6 +8485,34 @@ impl Engine {
         persist_vocabmap_to_sidecar(&self.path, &self.peer_vocab_map_entries())?;
         self.peer_vocab_map_dirty.store(false, Ordering::Release);
         Ok(())
+    }
+
+    /// #513: `pktombs` に、 変わった分を追記する (file が無い / 信用できない / record が増えすぎた時はまとめて書き直す、
+    /// `pk_tombs.rs`)。 印を先に下ろしてから取り出すので、 取り出した後に覚えた分は印が立ち直り、 次に書く。 書けなかったら
+    /// 印を戻し、 次はまとめて書き直す。 呼び手は `sidecar_persist_lock` を握っている (書き出しを 1 本に並べる)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn persist_pk_tombs_if_dirty(&self) -> io::Result<()> {
+        use crate::pk_tombs::Persist;
+        use std::sync::atomic::Ordering;
+        self.flush_pk_pending();
+        if !self.pk_tombs_dirty.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let Some(job) = self.pk_tombs.write().unwrap().take_for_persist() else { return Ok(()) };
+        let path = pktombs_path_for(&self.path);
+        let r = match &job {
+            Persist::Rewrite { bytes, .. } => crate::db_files::write_atomic_if_changed(&path, bytes).map(|_| ()),
+            Persist::Append { bytes, .. } => crate::db_files::append_synced(&path, bytes),
+        };
+        let mut g = self.pk_tombs.write().unwrap();
+        match &r {
+            Ok(()) => g.persisted(&job),
+            Err(_) => {
+                g.persist_failed();
+                self.pk_tombs_dirty.store(true, Ordering::Release);
+            }
+        }
+        r
     }
 
     /// wasm 版 (sidecar を持たないので no-op)。
@@ -8421,6 +8567,10 @@ impl Engine {
                 if let Err(e) =
                     persist_eidmap_to_sidecar(&self.path, &self.eidmap_entries_with_tombstones())
                 {
+                    self.warn_persist_failure_rate_limited(&e);
+                }
+                // #513: 消した主キーの記録も。 変わった時だけ書く。
+                if let Err(e) = self.persist_pk_tombs_if_dirty() {
                     self.warn_persist_failure_rate_limited(&e);
                 }
                 // text 写像も同格。 dirty のときだけ書く。
@@ -8721,6 +8871,7 @@ impl Engine {
             return Err(format!("set_table_pk: unknown table '{}'", table));
         };
         t.pk_himo = Some(himo_id);
+        self.refresh_pk_tombs_flag();
         self.try_persist_tables();
         Ok(())
     }
@@ -8784,6 +8935,72 @@ impl Engine {
             self.apply_delete_local(local, tomb);
         }
         enchudb_oplog::make_eid(self_peer, local)
+    }
+
+    /// #513: [`Engine::bind_remote_eid`] の主キー版 (`Syncer` が、 主キー `pk_value` の生きた行 `local_eid` に束ねる時)。
+    ///
+    /// 束ねた後に、 その主キーの行を消した削除 (受け手が覚えている物、 `pk_tombs.rs`) を束ねた行にも当てる。 束ねた行が
+    /// その削除の後に作り直された行でも、 削除より古い書き込み (束ねた entity の物も、 前に束ねた entity の物も) は消え、
+    /// 新しい書き込みは残る (主キーが同じなら同じ行)。
+    pub fn bind_remote_eid_by_pk(
+        &self,
+        author_peer: enchudb_oplog::PeerId,
+        foreign_eid: enchudb_oplog::EntityId,
+        local_eid: enchudb_oplog::EntityId,
+        pk_himo: u16,
+        pk_value: u64,
+    ) -> enchudb_oplog::EntityId {
+        let bound = self.bind_remote_eid(author_peer, foreign_eid, local_eid);
+        if let Some(tomb) = self.pk_tombstone_of(pk_himo, PkValue::Local(pk_value)) {
+            let local = enchudb_oplog::eid_local(bound);
+            if tomb > self.tombstone_version_of(local) {
+                self.apply_delete_local(local, tomb);
+            }
+        }
+        bound
+    }
+
+    /// #513: 主キー `pk_value` の生きた行が無い時 (`Syncer` が主キーで束ねる先を引いて、 無かった時)。
+    ///
+    /// その主キーの行を消した削除 (`pk_tombs.rs`) か、 この foreign entity 宛ての、 作成より先に届いた削除 (#490) を
+    /// 覚えていれば、 entity に払い出す slot に、 その版数 (大きい方) を載せる。 削除より古い書き込みは弾かれ、 新しい
+    /// 書き込みは当たる。 作成より先の削除は、 この slot (主キー `pk_value` の行) の削除として主キーの記録にも載せる
+    /// (作成を先に受けた peer では、 削除がこの主キーの行に当たって記録に載るので、 届く順で答えを変えない)。
+    ///
+    /// 2 つの記録が両方とも空 (常態) か、 自分が産んだ entity の時は何もせず `None` (通常の払い出しに任せる)。 どちらかが
+    /// 空でなければ、 載せる版数が無くても払い出しをここで済ませ、 その local eid を返す (通常の道 `resolve_remote_eid` と
+    /// 同じ払い出し。 呼び手は返った eid に当てる = 写像を引き直さない。 既に写像があればそれを返す)。
+    pub fn reserve_remote_eid_for_pk(
+        &self,
+        foreign_eid: enchudb_oplog::EntityId,
+        pk_himo: u16,
+        pk_value: PkValue<'_>,
+    ) -> Option<enchudb_oplog::EntityId> {
+        use std::sync::atomic::Ordering;
+        if self.pk_tombs_empty.load(Ordering::Acquire)
+            && !self.pk_pending_nonempty.load(Ordering::Acquire)
+            && self.foreign_tombs_empty.load(Ordering::Relaxed)
+        {
+            return None;
+        }
+        let self_peer = self.peer_id.load(Ordering::Acquire);
+        let owner = enchudb_oplog::eid_peer(foreign_eid);
+        if owner == self_peer {
+            return None;
+        }
+        let foreign_local = enchudb_oplog::eid_local(foreign_eid);
+        let by_pk = self.pk_tombstone_of(pk_himo, pk_value);
+        let local = self.eid_translator.get_or_insert_with(owner, foreign_local, || {
+            let local = self.alloc_translated_local(pk_himo)?;
+            if let Some(tomb) = by_pk.max(self.foreign_tombstone_of(owner, foreign_local)) {
+                self.set_tombstone_local(local, tomb);
+                let mut g = self.pk_tombs.write().unwrap();
+                self.drain_pk_pending(&mut g);
+                self.with_pk_key(pk_himo, pk_value, |key| self.note_pk_locked(&mut g, pk_himo, key, local, tomb));
+            }
+            Some(local)
+        })?;
+        Some(enchudb_oplog::make_eid(self_peer, local))
     }
 
     /// #178 検知の実体。 `local` の行に **自分が著者の cell** が 1 つでも在れば数える。
@@ -10015,6 +10232,8 @@ impl Engine {
         // #166: 版数を消す **前** に翻訳写像を外す。 退避する tombstone は
         // まだ slot 上にあるので、 順序を逆にすると読めなくなる。
         self.evict_translation_for_reuse(local);
+        // #513: slot ごとの主キーの記録も外す (主キーごとの削除の版数は slot に載っていないので残る)
+        self.forget_pk_slot(local);
         if local >= self.max_entities() {
             return;
         }
@@ -10125,6 +10344,148 @@ impl Engine {
         true
     }
 
+    /// #513: slot `local` が属する、 主キーのある表の主キーの himo。 `_` で始まる表 (配らない = 束ねない) は None。
+    fn pk_himo_of_slot(&self, local: u32) -> Option<u16> {
+        let t = self.tables.iter().find(|t| t.pk_himo.is_some() && t.contains(local))?;
+        if t.name.starts_with('_') {
+            return None;
+        }
+        t.pk_himo
+    }
+
+    /// #513: 主キーの値の鍵 (`pk_tombs.rs`) を `f` に渡す (写さない)。 辞書の値 (Tag) は文字列の bytes、 Leaf は主キーで
+    /// 束ねない (`Tie` で届かない) ので None、 それ以外は値の 8 byte。
+    fn with_pk_key<R>(&self, himo: u16, value: PkValue<'_>, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        match (self.value_types.get(himo as usize)?, value) {
+            (ValueType::Leaf, _) => None,
+            (ValueType::Tag, PkValue::Local(v)) => Some(f(self.vocab.get_checked(u32::try_from(v).ok()?)?)),
+            (ValueType::Tag, PkValue::Text(bytes)) => Some(f(bytes)),
+            (_, PkValue::Local(v)) => Some(f(&v.to_le_bytes())),
+            (_, PkValue::Text(_)) => None,
+        }
+    }
+
+    /// #513: 主キーのある行 `local` を `hlc` で消す時に、 その主キーを覚える。 主キーの cell を消す前に呼ぶ。 sync の表の無い
+    /// DB は束ねないので覚えない。 呼び手は行 `local` の lock を握っている。
+    ///
+    /// 削除の道なので積むだけにする (`pk_pending`、 表に載せるのは引く時と書き出す時)。 その場で載せるのは 2 つ: 主キーの
+    /// cell が無い (前に主キーの行だった slot に、 後から別の author のより新しい削除が届いた。 slot の記録から主キーを引く) と、
+    /// 辞書を回収する DB の文字列の主キー (積んでいる間に番号が別の文字列に使い回されうるので、 bytes にして載せる)。
+    fn remember_pk_tombstone(&self, local: u32, hlc: enchudb_oplog::Hlc) {
+        use std::sync::atomic::Ordering;
+        if hlc == enchudb_oplog::Hlc::ZERO || !self.pk_tombs_on.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(pk) = self.pk_himo_of_slot(local) else { return };
+        let value = self.himos.get(pk as usize).and_then(|h| h.get_value(local));
+        if let Some(value) = value
+            && !(self.vocab.reclaim_enabled() && matches!(self.value_types.get(pk as usize), Some(ValueType::Tag)))
+        {
+            self.pk_pending.lock().push(PkPending { slot: local, himo: pk, value, hlc });
+            if !self.pk_pending_nonempty.load(Ordering::Relaxed) {
+                self.pk_pending_nonempty.store(true, Ordering::Release);
+            }
+            return;
+        }
+        if value.is_none() && self.pk_tombs_empty.load(Ordering::Acquire) && !self.pk_pending_nonempty.load(Ordering::Acquire)
+        {
+            return; // 何も覚えていない = この slot の主キーも知らない
+        }
+        let mut g = self.pk_tombs.write().unwrap();
+        self.drain_pk_pending(&mut g);
+        match value {
+            Some(v) => {
+                self.with_pk_key(pk, PkValue::Local(v), |key| self.note_pk_locked(&mut g, pk, key, local, hlc));
+            }
+            None => {
+                if let Some((h, key)) = g.key_of_slot(local).map(|(h, k)| (h, k.to_vec())) {
+                    self.note_pk_locked(&mut g, h, &key, local, hlc);
+                }
+            }
+        }
+    }
+
+    /// #513: 積んだ主キーの行を `pk_tombs` に載せる。 呼び手は `pk_tombs` の書き込みの lock を握っている。
+    fn drain_pk_pending(&self, g: &mut crate::pk_tombs::PkTombs) {
+        use std::sync::atomic::Ordering;
+        // 印を先に下ろしてから取り出す (取り出した後に積んだ書き手は印を立て直す)
+        if !self.pk_pending_nonempty.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let items = std::mem::take(&mut *self.pk_pending.lock());
+        for p in items {
+            self.with_pk_key(p.himo, PkValue::Local(p.value), |key| self.note_pk_locked(g, p.himo, key, p.slot, p.hlc));
+        }
+    }
+
+    /// #513: 積んだ主キーの行があれば `pk_tombs` に載せる (引く前・書き出す前)。
+    fn flush_pk_pending(&self) {
+        if self.pk_pending_nonempty.load(std::sync::atomic::Ordering::Acquire) {
+            let mut g = self.pk_tombs.write().unwrap();
+            self.drain_pk_pending(&mut g);
+        }
+    }
+
+    /// #513: 「slot `slot` (主キー `(himo, key)` の行) を `hlc` で消した」 を記録に載せる。 呼び手は書き込みの lock を握っている。
+    fn note_pk_locked(&self, g: &mut crate::pk_tombs::PkTombs, himo: u16, key: &[u8], slot: u32, hlc: enchudb_oplog::Hlc) {
+        use std::sync::atomic::Ordering;
+        if g.note(himo, key, slot, hlc) {
+            self.pk_tombs_dirty.store(true, Ordering::Release);
+        }
+        self.pk_bloom_set(himo, key);
+        self.pk_tombs_empty.store(false, Ordering::Release);
+    }
+
+    /// #513: 主キーの bit の表に立てる。
+    fn pk_bloom_set(&self, himo: u16, key: &[u8]) {
+        let words = self
+            .pk_bloom
+            .get_or_init(|| (0..PK_BLOOM_BITS / 64).map(|_| std::sync::atomic::AtomicU64::new(0)).collect());
+        let i = pk_bloom_index(himo, key);
+        words[i / 64].fetch_or(1 << (i % 64), std::sync::atomic::Ordering::Release);
+    }
+
+    /// #513: 主キーを覚えているかもしれない (false なら覚えていない)。
+    fn pk_bloom_maybe(&self, himo: u16, key: &[u8]) -> bool {
+        let Some(words) = self.pk_bloom.get() else { return false };
+        let i = pk_bloom_index(himo, key);
+        words[i / 64].load(std::sync::atomic::Ordering::Acquire) & (1 << (i % 64)) != 0
+    }
+
+    /// #513: 主キー `(himo, value)` の行を消した削除の版数 (覚えていれば)。
+    fn pk_tombstone_of(&self, himo: u16, value: PkValue<'_>) -> Option<enchudb_oplog::Hlc> {
+        use std::sync::atomic::Ordering;
+        if self.pk_tombs_empty.load(Ordering::Acquire) && !self.pk_pending_nonempty.load(Ordering::Acquire) {
+            return None; // 常態。 lock を取らない
+        }
+        self.flush_pk_pending();
+        self.with_pk_key(himo, value, |key| {
+            if !self.pk_bloom_maybe(himo, key) {
+                return None;
+            }
+            self.pk_tombs.read().unwrap().tomb_of(himo, key)
+        })?
+    }
+
+    /// #513: slot を別の住人に渡す前に、 slot ごとの主キーの記録を外す (主キーごとの版数は残す。 `clear_cell_versions` から)。
+    fn forget_pk_slot(&self, local: u32) {
+        use std::sync::atomic::Ordering;
+        if self.pk_tombs_empty.load(Ordering::Acquire) && !self.pk_pending_nonempty.load(Ordering::Acquire) {
+            return;
+        }
+        let mut g = self.pk_tombs.write().unwrap();
+        self.drain_pk_pending(&mut g);
+        if g.forget_slot(local) {
+            self.pk_tombs_dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// #513: 覚えている、 消した主キーの数 (観測・test 用)。
+    pub fn deleted_primary_key_count(&self) -> usize {
+        self.flush_pk_pending();
+        self.pk_tombs.read().unwrap().key_count()
+    }
+
     /// 削除を **本体まで** 適用する。 `false` = 受信 HLC が既存 tombstone より古いので不採用。
     ///
     /// `set_tombstone_local` が扱うのは 「いつ消えたか」 の版数だけで、 本体の除去は
@@ -10164,6 +10525,8 @@ impl Engine {
         }
         // monotone-max。 同値なら版数側は no-op になるが、 本体除去は必ず走らせる。
         self.set_tombstone_local(local, hlc);
+        // #513: 主キーの cell を消す前に、 その主キーを覚える
+        self.remember_pk_tombstone(local, hlc);
         self.remove_entity_body(local, hlc);
         true
     }
@@ -10264,6 +10627,8 @@ impl Engine {
                 continue; // 削除後に作り直された行 — LWW 上は正しく生きている
             }
             if repair {
+                // #513: 切れた削除が主キーの cell を消す前だったなら、 ここで覚える (覚えた後に切れていれば同じ版数で no-op)
+                self.remember_pk_tombstone(local, tomb);
                 self.remove_entity_body(local, tomb);
             }
             repaired += 1;
@@ -16485,6 +16850,15 @@ impl Engine {
         let vocabmap_entries = self.peer_vocab_map_entries();
         if !vocabmap_entries.is_empty() {
             std::fs::write(vocabmap_path_for(target), serialize_vocabmap(&vocabmap_entries))?;
+        }
+        // #513: 消した主キーの記録も同じく。 無いと、 restore した DB で、 それまでに消した主キーの行が後から届いた
+        // 同じ主キーの古い行に当たらない
+        {
+            self.flush_pk_pending();
+            let pk_tombs = self.pk_tombs.read().unwrap();
+            if !pk_tombs.is_empty() {
+                std::fs::write(pktombs_path_for(target), pk_tombs.snapshot().0)?;
+            }
         }
         // manifest が無いと snapshot だけ 「切り詰め検出の効かない DB」 になる。 複製は
         // source と同じ長さなので source の manifest をそのまま写せる (記録は下限として
