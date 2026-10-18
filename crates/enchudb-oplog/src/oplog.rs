@@ -727,7 +727,8 @@ pub struct OpLog {
     /// flock を取らない (取ると外す時に、 開いている間の lock ごと外れる: flock は開いた file ごとの lock で数えない)。
     /// `append_lock` の下で立て、 append も `append_lock` の下で見る。
     session_locked: std::sync::atomic::AtomicBool,
-    /// append 中の writer 数。try_reset はこれが 0 のときだけ実行できる。
+    /// append 中の writer 数 (観測用)。 満杯で空きを待つ writer も数に入る。 畳むのとの直列化は `append_lock` で、
+    /// この数は畳む条件に使わない (`try_reset_if`)。
     pending_writes: std::sync::atomic::AtomicU32,
     /// auto reset を許可するか。default false。
     /// true にすると consumer が head==checkpoint の tick で ring buffer を空に戻し
@@ -737,6 +738,9 @@ pub struct OpLog {
     /// #268: テスト用 fault injection。 残り回数ぶん Commit の append を満杯として
     /// 失敗させる。 0 (既定) で何もしない。 `fail_next_commits` の doc を参照。
     fail_next_commits: std::sync::atomic::AtomicU32,
+    /// group を閉じない record が残す、 閉じの Commit の分の空き (`alloc`)。 普段は `REC_HEADER_SIZE`。 test だけが 0 にする
+    /// ([`OpLog::keep_commit_room_for_test`])。
+    commit_room: std::sync::atomic::AtomicU64,
     /// #57: append に失敗して WAL に載らなかった record の (author, その author の落ちた HLC の max)
     /// (Commit は除く)。 engine が [`OpLog::take_dropped`] で取り出し、 その author の配布履歴に穴が
     /// あったことを puller に知らせる (history floor を上げて bootstrap に回す)。
@@ -767,8 +771,9 @@ thread_local! {
 ///
 /// issue #58: 旧コードは `fetch_add` → `append_inner` → `fetch_sub` を直列で
 /// 並べていたため、 `append_inner` が panic すると `fetch_sub` が skip され
-/// counter が +1 のまま残り、 `try_reset`(`pending_writes == 0` 条件)が
+/// counter が +1 のまま残り、 `try_reset`(当時は `pending_writes == 0` 条件)が
 /// 永久に発火しなくなった。 drop で必ず減算することで panic 経路でも均衡する。
+/// (今は畳む条件に使わない。 観測用 [`OpLog::pending_writes`] の数を合わせるため)
 struct PendingGuard<'a> {
     counter: &'a std::sync::atomic::AtomicU32,
     n: u32,
@@ -889,6 +894,7 @@ impl OpLog {
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
+            commit_room: std::sync::atomic::AtomicU64::new(REC_HEADER_SIZE as u64),
             room_waiter: std::sync::RwLock::new(None),
             append_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
@@ -981,6 +987,7 @@ impl OpLog {
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
+            commit_room: std::sync::atomic::AtomicU64::new(REC_HEADER_SIZE as u64),
             room_waiter: std::sync::RwLock::new(None),
             append_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
@@ -1038,13 +1045,19 @@ impl OpLog {
 
     /// `size` bytes を予約して開始 offset を返す。 **`append_lock` 保持下で呼ぶこと**。
     ///
+    /// group を閉じない record (`closes_group` = false) は、 閉じの Commit 1 つ分 (`REC_HEADER_SIZE`) の空きを残してしか
+    /// 場所を取らない。 満杯でも、 開いている group を必ず閉じられる (engine はそれを閉じ、 bridge に渡してから畳む)。 前は
+    /// Commit も入らない所まで埋まると開いた group を閉じられず、 sync の DB では畳む時に孤児の group として配りから落として
+    /// いた (#511。 #450 の死区間の例外。 WAL 256 KiB に書き手 1 本で 20 万回書くと、 満杯の後のほぼ全部)。
+    ///
     /// head は record 本体を書く **前** に bump される (scan は Commit で閉じた
     /// group しか `out` に載せないので、 書き込み途中の領域が読まれることはない)。
     #[inline]
-    fn alloc(&self, size: u64) -> io::Result<u64> {
+    fn alloc(&self, size: u64, closes_group: bool) -> io::Result<u64> {
         let cur = self.alloc_head();
         let new = cur + size;
-        if new > self.capacity {
+        let need = if closes_group { new } else { new + self.commit_room.load(Ordering::Relaxed) };
+        if need > self.capacity {
             return Err(self.wal_full_err());
         }
         self.head.store(new, Ordering::Release);
@@ -1081,8 +1094,7 @@ impl OpLog {
 
     /// op を append。新しいレコードの LSN を返す。
     ///
-    /// pending_writes カウンタで try_reset との race を防ぐ。
-    /// writer は append 中 +1、完了時 -1。consumer reset は pending==0 時のみ。
+    /// writer は append 中 `pending_writes` を +1、 完了時 -1 (観測用。 畳むのとの直列化は `append_lock`)。
     pub fn append(&self, op: Op<'_>) -> io::Result<u64> {
         self.append_with_hlc(op).map(|(lsn, _)| lsn)
     }
@@ -1145,7 +1157,8 @@ impl OpLog {
 
         let _guard = self.pending_guard(records.len() as u32);
         let mut r = self.append_many_inner(records, &sizes, total, hlcs);
-        if r.is_err() && self.wait_for_room(total as u64) {
+        let reserve = if records.last().is_some_and(|r| matches!(r.as_op(), Op::Commit)) { 0 } else { self.commit_room.load(Ordering::Relaxed) };
+        if r.is_err() && self.wait_for_room(total as u64 + reserve) {
             r = self.append_many_inner(records, &sizes, total, hlcs);
         }
         if r.is_ok() {
@@ -1179,7 +1192,8 @@ impl OpLog {
         let _lock = self.flock_exclusive()?;
 
         // 一括 allocate
-        let start_offset = self.alloc(total as u64)?;
+        let closes = records.last().is_some_and(|r| matches!(r.as_op(), Op::Commit));
+        let start_offset = self.alloc(total as u64, closes)?;
 
         let mut lsns = Vec::with_capacity(records.len());
         let keypair = self.keypair.read().unwrap().clone();
@@ -1303,7 +1317,7 @@ impl OpLog {
         }
         let record_size = REC_HEADER_SIZE + payload_len;
         let mut r = self.append_verbatim_checked(sb, signature, pubkey_fp, record_size);
-        if r.is_err() && self.wait_for_room(record_size as u64) {
+        if r.is_err() && self.wait_for_room(record_size as u64 + self.commit_room.load(Ordering::Relaxed)) {
             r = self.append_verbatim_checked(sb, signature, pubkey_fp, record_size);
         }
         if r.is_ok() {
@@ -1334,7 +1348,7 @@ impl OpLog {
         let _lock = self.flock_exclusive()?;
 
         // head 採番は append_inner と同じ規則 (mmap 上の永続値を真実とする)。
-        let offset = self.alloc(record_size as u64)?;
+        let offset = self.alloc(record_size as u64, false)?;
 
         let mmap = self.mmap_mut_slice();
         let off = offset as usize;
@@ -1398,9 +1412,10 @@ impl OpLog {
         hlc_override: Option<Hlc>,
     ) -> Result<(u64, Hlc), (io::Error, Hlc)> {
         let is_commit = matches!(op, Op::Commit);
-        let mut r = self.append_inner_raw(op.clone(), payload_size, record_size, relay, hlc_override);
-        if r.is_err() && self.wait_for_room(record_size as u64) {
-            r = self.append_inner_raw(op, payload_size, record_size, relay, hlc_override);
+        let mut r = self.append_inner_raw(op.clone(), payload_size, record_size, relay, hlc_override, is_commit);
+        let reserve = if is_commit { 0 } else { self.commit_room.load(Ordering::Relaxed) };
+        if r.is_err() && self.wait_for_room(record_size as u64 + reserve) {
+            r = self.append_inner_raw(op, payload_size, record_size, relay, hlc_override, is_commit);
         }
         if r.is_ok() {
             self.appended();
@@ -1435,6 +1450,8 @@ impl OpLog {
         record_size: usize,
         relay: Option<RelayedHeader>,
         hlc_override: Option<Hlc>,
+        // group を閉じる record か (= 閉じの Commit の分の空きを残さなくてよい、 `alloc`)
+        closes_group: bool,
     ) -> io::Result<(u64, Hlc)> {
         // テスト専用 fault injection: pending_writes の RAII ガード (issue #58②) が
         // panic-unwind 経路でも均衡することを deterministic に検証するため、 ここで
@@ -1465,7 +1482,7 @@ impl OpLog {
         // 別 process が直前に append した場合、 self.head (process-local atomic) は
         // 古い値を持ってるので、 lock 中に mmap 上の永続値を真実とする。
         // append_lock + flock の両方を保持しているので単純 store で OK。
-        let offset = self.alloc(record_size as u64)?;
+        let offset = self.alloc(record_size as u64, closes_group)?;
 
         // append_lock の下でだけ進める (読み手は lock を取らずに読むので atomic のまま)
         let lsn = self.next_lsn.load(Ordering::Relaxed);
@@ -1531,7 +1548,7 @@ impl OpLog {
     }
 
     /// ring buffer reset。
-    /// head == checkpoint && pending_writes == 0 のときのみ実行可能。
+    /// head == checkpoint のときのみ実行可能 (`try_reset_if` の doc)。
     ///
     /// fix: auto_reset ゲートを撤去。 元は「Syncer attached の engine は ring を
     /// reset させない」ために入れた gate だが、 0.8.0 で sync publish path が `_sync_ops`
@@ -1539,7 +1556,7 @@ impl OpLog {
     /// 消えていた。 にもかかわらず default が false のままだったため production では
     /// try_reset が常時 no-op になり、 ring が一度も畳まれず 16MB を使い切ると WAL full
     /// で append が全 drop される状態に陥っていた (#57 でようやく可視化)。 reset 条件
-    /// (head==checkpoint ⇒ body へ msync 済 && pending==0) を満たす領域は crash recovery
+    /// (head==checkpoint ⇒ body へ msync 済) を満たす領域は crash recovery
     /// にも sync にも不要なので、 無条件に畳んでよい。 `auto_reset` フラグは vestigial。
     pub fn try_reset(&self) -> bool {
         self.try_reset_if(|| true)
@@ -1567,7 +1584,10 @@ impl OpLog {
         let head = self.head.load(Ordering::Acquire);
         let cp = self.checkpoint.load(Ordering::Acquire);
         if head != cp || head <= HEADER_SIZE as u64 { return false; }
-        if self.pending_writes.load(Ordering::Acquire) > 0 { return false; }
+        // `pending_writes` は見ない (`checkpoint_and_reset` と同じ)。 全 append は `append_lock` の下で場所を取って
+        // 書き終え、 head も進めるので、 ここで数に入っているのは lock を待っている append と、 満杯で空きを待っている
+        // append (`wait_for_room`、 record はまだ載っていない) だけ。 前は見ていたので、 空きを待つ書き手がいる間は畳めず、
+        // 空きを作れないまま書き手が諦めて record が落ちた (sync の DB で満杯になると、 その後の record がほぼ全部落ちた、 #511)。
         // lock 下での再評価。 ここで false なら畳まない (= 未 bridge record を守る)。
         if !fold_safe() { return false; }
         self.reset_ring_locked(head)
@@ -1666,6 +1686,15 @@ impl OpLog {
     #[doc(hidden)]
     pub fn fail_next_commits(&self, n: u32) {
         self.fail_next_commits.store(n, Ordering::Release);
+    }
+
+    /// test 用: この WAL で、 group を閉じない record が閉じの Commit の分の空きを残すか (`alloc`、 既定は残す)。 残さないと、
+    /// group の途中で Commit も入らない満杯 (`append_dead`) を作れる。 その形は普通の append では作れなくなったが、 前の版の
+    /// binary が書いた WAL や別の fd の append では残りうるので、 畳む時の死区間の例外 (engine の `wal_fold_safe`、 #450) の
+    /// test がこれで作る。 製品の道からは呼ばない。
+    #[doc(hidden)]
+    pub fn keep_commit_room_for_test(&self, keep: bool) {
+        self.commit_room.store(if keep { REC_HEADER_SIZE as u64 } else { 0 }, Ordering::Relaxed);
     }
 
     fn note_dropped(&self, author: PeerId, hlc: Hlc) {
@@ -2096,6 +2125,7 @@ impl OpLog {
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
             fail_next_commits: std::sync::atomic::AtomicU32::new(0),
+            commit_room: std::sync::atomic::AtomicU64::new(REC_HEADER_SIZE as u64),
             room_waiter: std::sync::RwLock::new(None),
             append_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
@@ -2351,8 +2381,8 @@ mod tests {
     }
 
     /// issue #58②: `append_inner` が panic しても `pending_writes` が RAII ガードで
-    /// 必ず減算され、 counter が +1 のまま leak しないこと。 leak すると
-    /// `try_reset`(pending == 0 条件)が永久に発火しなくなる。 fault injection で
+    /// 必ず減算され、 counter が +1 のまま leak しないこと。 当時は leak すると
+    /// `try_reset`(pending == 0 条件)が永久に発火しなくなった (今は観測用の数)。 fault injection で
     /// deterministic に panic させて検証する。
     #[test]
     fn pending_writes_balanced_on_append_panic() {
@@ -2813,13 +2843,42 @@ mod tests {
     fn full_wal_returns_error() {
         let p = tmp("full");
         // v2: Tie 1 つ = REC_HEADER 112 + payload 16 = 128B
-        // File header 32 + 128 + 余白だけ = 200 確保
-        let wal = OpLog::create(&p, HEADER_SIZE + 128 + 50).unwrap();
+        // File header 32 + 128 + 閉じの Commit の空き 112 (`alloc`) + 余白だけ確保
+        let wal = OpLog::create(&p, HEADER_SIZE + 128 + 112 + 50).unwrap();
         wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
         let r = wal.append(Op::Tie { eid: 2, himo_id: 0, value: 2 });
         assert!(r.is_err());
         let _ = std::fs::remove_dir_all(&p); // v10: DB は directory
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// group を閉じない record は閉じの Commit 1 つ分の空きを残す (`alloc`)。 data が入らなくなった後も、 開いている group を
+    /// 閉じる Commit は入る (1 件でも、 Commit で終わる束でも)。 Commit で終わらない束は空きを残す。
+    #[test]
+    fn data_records_leave_room_for_a_closing_commit() {
+        let p = tmp("commit_room");
+        let wal = OpLog::create(&p, 4096).unwrap();
+        while wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).is_ok() {}
+        let free = wal.free_bytes();
+        assert!(free >= REC_HEADER_SIZE as u64, "data で閉じの Commit の分まで埋めた (free={free})");
+        assert!(!wal.append_dead(), "閉じの Commit が入るのに dead と言う");
+        assert!(wal.append_many(&[OwnedOp::Tie { eid: 1, himo_id: 0, value: 1 }]).is_err(), "Commit で終わらない束が空きを使った");
+        assert!(wal.append(Op::Commit).is_ok(), "data が入らなくなった後に閉じの Commit が入らない (free={free})");
+        // Commit で終わる束も、 その空きを使える
+        let p2 = tmp("commit_room_many");
+        let wal2 = OpLog::create(&p2, 4096).unwrap();
+        while wal2.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).is_ok() {}
+        assert!(wal2.append_many(&[OwnedOp::Commit]).is_ok(), "Commit だけの束が入らない");
+        // 対照: test 用に残さない形にすると積める
+        let p3 = tmp("commit_room_fill");
+        let wal3 = OpLog::create(&p3, HEADER_SIZE + 128 + 50).unwrap();
+        assert!(wal3.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).is_err(), "空きを残せないのに積めた");
+        wal3.keep_commit_room_for_test(false);
+        assert!(wal3.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).is_ok());
+        for q in [&p, &p2, &p3] {
+            let _ = std::fs::remove_dir_all(q);
+            let _ = std::fs::remove_file(q);
+        }
     }
 
     // ──── request17-A3: HLC の採番責務を呼び出し側に開く ────
@@ -2940,6 +2999,8 @@ mod tests {
         src.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).unwrap();
         let rec = tie_record(&src);
         while wal.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).is_ok() {}
+        // data の record は閉じの Commit の分を残すので、 その空きも Commit で埋めて満杯にする (Commit は覚えない)
+        while wal.append(Op::Commit).is_ok() {}
         let got = wal.take_dropped();
         assert!(got.len() == 1 && got[0].0 == 1 && got[0].1 != Hlc::ZERO, "自分の write: {got:?}");
         assert!(wal.take_dropped().is_empty(), "取り出したら空");

@@ -5,7 +5,8 @@
 //! history floor を 「今」 に上げる。 それより前の cursor の puller は差分 pull で `history_truncated`
 //! になり、 bootstrap (#140) で live state (載らなかった write を含む) を受け取る。
 //!
-//! WAL は 64 KiB にして、 consumer の 1 周 (100 ms) より速く書いて溢れさせる (注入なし)。
+//! WAL は 64 KiB にして、 consumer の 1 周 (100 ms) より速く書いて溢れさせる。 Commit の失敗を注入して、 満杯でも畳めない
+//! ようにする (満杯で閉じの Commit を打てれば畳めて、 書き込みは落ちない)。
 
 use enchudb_engine::engine::Engine;
 use enchudb_engine::transport::{InMemoryTransport, Transport};
@@ -132,8 +133,11 @@ fn dropped_writes_reach_the_peer(async_: bool, per_peer: bool) {
     let out = sync_b.pull_once(1);
     assert!(out.applied > 0 && !out.history_truncated, "{out:?}");
 
-    // 64 KiB の WAL を 1 周より速く溢れさせる
+    // 64 KiB の WAL を 1 周より速く溢れさせる。 Commit を打てなくして、 満杯でも畳めないようにする (#511: 打てると、 満杯で閉じの
+    // Commit を打って bridge に渡してから畳めるので、 書き込みは落ちない)
+    eng_a.oplog().unwrap().fail_next_commits(u32::MAX);
     let burst = write_notes(&eng_a, 10, 5_000, async_);
+    eng_a.oplog().unwrap().fail_next_commits(0);
     // 載らなかった write にも版数が付いている (ZERO = 版数不明だと、 後から届く古い write に負ける)
     let hid = eng_a.himo_id("notes.note").unwrap() as u16;
     settle(&eng_a);

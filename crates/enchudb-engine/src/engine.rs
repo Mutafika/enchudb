@@ -6115,8 +6115,7 @@ impl Engine {
     /// これを呼ばないと sync_ops_offset が古い head を指したまま取り残され、
     /// reset 後に append された record が `from > head` で transfer 対象から外れ、
     /// `_sync_ops` に bridge されず sync から無言で欠落する。 reset と同じ
-    /// consumer thread から、 transfer 完了 (= offset==旧head) かつ pending==0 の
-    /// 直後にのみ呼ぶこと。
+    /// consumer thread から、 transfer 完了 (= offset==旧head) で畳んだ直後にのみ呼ぶこと。
     pub fn reset_sync_ops_offset(&self) {
         self.sync_ops_offset.store(
             enchudb_oplog::oplog::HEADER_SIZE as u64,
@@ -15640,8 +15639,8 @@ impl Engine {
                                 // changefeed: durable 化した record を listener に渡すよう通知係に頼む
                                 engine.notify_listeners();
                             }
-                            // ring buffer reset を試みる。head == checkpoint &&
-                            // pending_writes == 0 のときだけ head/checkpoint を HEADER_SIZE に戻す。
+                            // ring buffer reset を試みる。head == checkpoint の
+                            // ときだけ head/checkpoint を HEADER_SIZE に戻す。
                             // これで WAL 容量を食い切らずに長期運用できる。
                             // ※ auto_reset が発動して offset が後退したら listener cursor もリセット。
                             // 0.9.0: 畳む前に bridge を必ず追いつかせる。 上の transfer は

@@ -83,8 +83,10 @@ fn folded_orphan_group_reaches_the_peer(attempt: u32) -> bool {
     let out = sync_b.pull_once(1);
     assert!(out.applied > 0 && !out.history_truncated, "{out:?}");
 
-    // 満杯の書き手を待たせず (#388)、 畳ませずに WAL を埋める
+    // 満杯の書き手を待たせず (#388)、 畳ませずに WAL を埋める。 今の append は閉じの Commit の分の空きを残す (#511) ので、 孤児の
+    // group (閉じの Commit が入らない満杯) は普通の書き込みでは作れない。 前の版の binary が書いた WAL と同じく、 残さない形にして作る
     wal.set_room_waiter(None);
+    wal.keep_commit_room_for_test(false);
     // consumer の Commit が 1 つ入ったか: 残りがちょうど 112 B ずれる (c を測る間に入れば 290 B、 埋めた後なら 66 B、 Tie の
     // 前なら Tie が載らずに 66 B)
     let raced = |free: u64| free.abs_diff(ROOM) == 112;
