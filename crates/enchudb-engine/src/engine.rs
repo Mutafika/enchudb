@@ -1291,6 +1291,32 @@ mod room_commit_hook {
     }
 }
 
+/// test 用の割り込み点: `make_wal_room_inner` (sync の DB) が書き出した (checkpoint を進めた) 後、 bridge に渡して畳む前。
+/// 書き手がその間に積む形を作るため (#512)。 置いた WAL で 1 回だけ呼ぶ (続けて呼ばせるには、 呼ばれた中で置き直す)。
+#[cfg(test)]
+mod room_fold_hook {
+    use enchudb_oplog::oplog::OpLog;
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn FnOnce(&OpLog) + Send>;
+    static HOOK: Mutex<Option<(usize, Hook)>> = Mutex::new(None);
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        *HOOK.lock().unwrap_or_else(|p| p.into_inner()) = Some((wal as *const OpLog as usize, Box::new(f)));
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        let me = wal as *const OpLog as usize;
+        let hit = {
+            let mut h = HOOK.lock().unwrap_or_else(|p| p.into_inner());
+            if h.as_ref().is_some_and(|(at, _)| *at == me) { h.take() } else { None }
+        };
+        if let Some((_, f)) = hit {
+            f(wal);
+        }
+    }
+}
+
 /// consumer が WAL を空けに来て、 開いている group を閉じる Commit を打つ前に書き手の Commit が残りを埋める窓 (2026-10-11、
 /// `issue388_wal_backpressure` が数 % で落ちていた)。
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -1361,6 +1387,114 @@ mod wal_room_commit_tests {
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
         let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
+
+    /// #512: sync の DB で、 空け作りのやり直しの各回に、 書き出しの後で書き手が record を積む (書き手が満杯にする前にやり直しが
+    /// 尽きる形 = 書き出しの速い OS で、 ゆっくり書き続ける書き手。 割り込み点で 1 回ずつ積んで作る):
+    ///
+    /// - 「畳めなかった」 印を付けない (前の形は付け、 その後の 10 ms に満杯にぶつかった書き手を待たずに落とした。 GitHub の CI
+    ///   (Linux、 debug) で `sync_wal_full_fold.rs` の書き手 1 本の 5 万回が 2,025 件 = WAL 約 1 杯分を落とした)
+    /// - 書き手が止まれば畳む
+    #[test]
+    fn appends_after_every_write_out_are_not_a_failed_fold() {
+        use std::sync::atomic::AtomicU32;
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-roomfold-{}-{nanos}", std::process::id());
+        {
+            let mut eng = Engine::create_standalone(&path).unwrap();
+            eng.define_table("rows", 10_000).unwrap();
+            eng.define_himo_in("rows", "val", ValueType::Number, 10_000).unwrap();
+            eng.enable_sync_tables().unwrap();
+            eng.flush().unwrap();
+        }
+        let eng = Engine::open_concurrent_with_oplog(&path, 256 << 10).unwrap();
+        eng.set_peer_id(1);
+        let hid = eng.himo_id("rows.val").unwrap() as u16;
+        let rows: Vec<u64> = (0..1_000).map(|_| eng.entity_in("rows").unwrap()).collect();
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        // やり直しの回数だけ、 書き出しの後に 1 つ積む (呼ばれた中で置き直す)
+        fn arm(wal: &enchudb_oplog::oplog::OpLog, eid: u64, hid: u16, left: Arc<AtomicU32>) {
+            room_fold_hook::set(wal, move |w| {
+                w.append(enchudb_oplog::oplog::Op::Tie { eid, himo_id: hid, value: 7 }).expect("前提: 割り込みの record が載る");
+                if left.fetch_sub(1, Ordering::AcqRel) > 1 {
+                    arm(w, eid, hid, left);
+                }
+            });
+        }
+        let left = Arc::new(AtomicU32::new(WAL_ROOM_FOLD_ROUNDS as u32));
+        arm(&wal, rows[0], hid, left.clone());
+        // 空きが 1/4 を切るまで書いて止める (consumer が次に起きた時に空けに来る)。 満杯まで書くと割り込みの record が載らず、
+        // やり直しの途中で畳めてしまう
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut i = 0u64;
+        while wal.free_bytes() >= wal.capacity() / 4 && std::time::Instant::now() < deadline {
+            eng.tie_to_by_id(rows[(i % 1_000) as usize], hid, i + 1);
+            i += 1;
+        }
+        while left.load(Ordering::Acquire) > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(left.load(Ordering::Acquire), 0, "前提: やり直しの全部の回で、 書き出しの後に積んだ");
+        // 積む者が居なくなれば畳める (次の空け作りか、 100 ms ごとの書き出しのどちらかが畳む)
+        while (eng.wal_room_busy.load(Ordering::Acquire) || wal.free_bytes() < wal.capacity() / 2)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(wal.free_bytes() >= wal.capacity() / 2, "書き手が止まった後に畳まなかった");
+        assert!(
+            eng.wal_room_failed_at.lock().unwrap_or_else(|p| p.into_inner()).is_none(),
+            "書き出しの後に書き手が積んで畳めなかった試しで 「畳めなかった」 印を付けた"
+        );
+        assert_eq!(eng.wal_dropped_records(), 0);
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+    }
+
+    /// #512: sync の DB で、 空け作りが bridge の lock を取れずに終わった (他の thread が bridge 中) 試しは、 「畳めなかった」
+    /// 印を付けず、 待っている書き手に諦めさせない (試しに数えない)。 lock が空けば畳み、 書き手の record は落ちない。
+    /// 割り込み点で、 別の thread に bridge の lock を 50 ms 握らせて作る。 書き手は WAL の 3 杯分を書く (満杯で待つ)。
+    #[test]
+    fn a_busy_bridge_does_not_make_a_waiting_writer_give_up() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-roombusy-{}-{nanos}", std::process::id());
+        {
+            let mut eng = Engine::create_standalone(&path).unwrap();
+            eng.define_table("rows", 10_000).unwrap();
+            eng.define_himo_in("rows", "val", ValueType::Number, 10_000).unwrap();
+            eng.enable_sync_tables().unwrap();
+            eng.flush().unwrap();
+        }
+        let eng = Engine::open_concurrent_with_oplog(&path, 256 << 10).unwrap();
+        eng.set_peer_id(1);
+        let hid = eng.himo_id("rows.val").unwrap() as u16;
+        let rows: Vec<u64> = (0..1_000).map(|_| eng.entity_in("rows").unwrap()).collect();
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        // 割り込み点を通ったら、 lock を握る thread (engine の Arc を持つ) の handle を置く。 最後に join してから DB を消す
+        let helper: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+        let (eng_in_hook, helper_in_hook) = (eng.clone(), helper.clone());
+        room_commit_hook::set(&wal, move |_| {
+            let held = Arc::new(AtomicBool::new(false));
+            let held_by_helper = held.clone();
+            let h = std::thread::spawn(move || {
+                let _bridge = eng_in_hook.transfer_lock_for_fold();
+                held_by_helper.store(true, Ordering::Release);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            });
+            while !held.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            *helper_in_hook.lock().unwrap() = Some(h);
+        });
+        for i in 0..3 * (256u64 << 10) / 128 {
+            eng.tie_to_by_id(rows[(i % 1_000) as usize], hid, i + 1);
+        }
+        let h = helper.lock().unwrap().take();
+        assert!(h.is_some(), "前提: 空け作りが割り込み点を通った");
+        h.unwrap().join().unwrap();
+        assert_eq!(eng.wal_dropped_records(), 0, "bridge の lock が取れなかった試しで、 待っている書き手が諦めた");
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
     }
 }
 
@@ -2401,6 +2535,22 @@ const FILE_MAGIC: [u8; 4] = *b"ECDB";
 /// 配り終えるまで畳めない時など)。
 #[cfg(not(target_arch = "wasm32"))]
 const WAL_ROOM_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// sync の DB で満杯の時に、 閉じの Commit を打ち直して畳み直す回数の上限 (`make_wal_room_inner`)。
+const WAL_ROOM_FOLD_ROUNDS: usize = 4;
+
+/// WAL の空け作り (`Engine::make_wal_room`) の結果 (#512)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalRoom {
+    /// 畳んだ。
+    Folded,
+    /// 畳めない状態 (bridge が配り切れない、 listener が追いついていない、 書き出せない、 死区間)。 書き手を待たせても空かない
+    /// ので、 しばらく試さず (`make_wal_room_paced`)、 待つ書き手も諦める (`wait_for_wal_room`)。
+    Blocked,
+    /// 今回は畳めなかったが、 畳めない状態ではない (試している間に書き手が積み続けた、 bridge の lock が取れなかった、 他の試しの
+    /// 最中、 畳むものが無い)。 書き手が満杯で止まれば次は畳めるので、 試しに数えず、 「畳めなかった」 とも覚えない。
+    Transient,
+}
 
 const FILE_VERSION: u32 = 10;
 /// v11: 64 bit 列 (`ValueType::Number64`、 cell 8B) を持つ DB。 layout は v10 と同じで、 64 bit 列の
@@ -6115,8 +6265,7 @@ impl Engine {
     /// これを呼ばないと sync_ops_offset が古い head を指したまま取り残され、
     /// reset 後に append された record が `from > head` で transfer 対象から外れ、
     /// `_sync_ops` に bridge されず sync から無言で欠落する。 reset と同じ
-    /// consumer thread から、 transfer 完了 (= offset==旧head) かつ pending==0 の
-    /// 直後にのみ呼ぶこと。
+    /// consumer thread から、 transfer 完了 (= offset==旧head) で畳んだ直後にのみ呼ぶこと。
     pub fn reset_sync_ops_offset(&self) {
         self.sync_ops_offset.store(
             enchudb_oplog::oplog::HEADER_SIZE as u64,
@@ -6231,7 +6380,11 @@ impl Engine {
         {
             let from = self.sync_ops_offset.load(std::sync::atomic::Ordering::Acquire);
             if from < wal.head() {
-                wal.note_uncommitted_tail_dropped(from);
+                // 畳むと配れなくなる record なので、 WAL に載らなかった record と同じく `wal_dropped_records` にも数える
+                // (前は、 満杯で空きを待つ書き手がいる間は畳めず、 その書き手の append の失敗として数えられていた、 #511)
+                let dropped = wal.note_uncommitted_tail_dropped(from);
+                self.wal_dropped_records
+                    .fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
             }
         }
         true
@@ -6337,7 +6490,8 @@ impl Engine {
     }
 
     /// WAL append 失敗で **sync 経路から落ちた record 数**（観測用）。 平常時は 0。 同期の書き込み (`tie_to` / `untie` / `delete`
-    /// など、 0.34 からは `*_async` も)・辞書の record・中継の write を数える (#454)。
+    /// など、 0.34 からは `*_async` も)・辞書の record・中継の write を数える (#454)。 満杯で閉じの Commit が入らず、 畳む時に
+    /// 落とした孤児の group の record (#450) も数える (#511)。
     ///
     /// #268: 落ちた record も table 本体には適用済みなので、 ローカルは正常に見えたまま配布だけが欠ける。 #57 から、 落ちた record
     /// は author ごとの floor を上げて相手に取り直させる (bootstrap) ので、 届かないままにはならない。 0 でなければ、 相手が取り
@@ -6829,8 +6983,22 @@ impl Engine {
             .map(|t| (t.local_of(enchudb_oplog::eid_local(eid)), t.free_locals.clone(), t.free_locals_nonempty.clone()));
         match meta {
             Some((Some(local), free_list, nonempty)) => {
+                // WAL に積む (満杯なら空きを待つ) のは、 `free_locals` と行の lock を握る前に済ませる。 空きを作る書き出し係は
+                // bridge で `entity_in("_sync_ops")` の `free_locals` を取り、 `_sync_ops` の行を書く。 握ったまま待つと互いに
+                // 待ち、 書き出し係は畳めず、 こちらは待ちの上限 (`WAL_ROOM_WAIT`) まで止まって record を落とす (reclaim は行ごとに
+                // 繰り返すので長く止まる)。 この行に書くのは purge だけ (`sync_ops_purge_lock` と `expected_lsn` で 1 つに絞って
+                // ある) なので、 積んでから行を握っても WAL の順と当てる順はずれない。 当てて free list に戻すまでは、 前と同じく
+                // `free_locals` を握ったまま (上の doc)。 #511
+                self.check_writable();
+                let row_local = enchudb_oplog::eid_local(eid);
+                let hlc = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: self.oplog_eid(row_local) });
                 let mut list = free_list.lock().unwrap();
-                self.delete(eid);
+                let row = self.row_for_wal(row_local);
+                let applied = self.apply_delete_in(row.as_ref(), row_local, hlc);
+                drop(row);
+                if !applied {
+                    self.warn_local_write_rejected(row_local, u16::MAX, hlc);
+                }
                 list.push(local);
                 nonempty.store(true, std::sync::atomic::Ordering::Release);
             }
@@ -15626,8 +15794,8 @@ impl Engine {
                                 // changefeed: durable 化した record を listener に渡すよう通知係に頼む
                                 engine.notify_listeners();
                             }
-                            // ring buffer reset を試みる。head == checkpoint &&
-                            // pending_writes == 0 のときだけ head/checkpoint を HEADER_SIZE に戻す。
+                            // ring buffer reset を試みる。head == checkpoint の
+                            // ときだけ head/checkpoint を HEADER_SIZE に戻す。
                             // これで WAL 容量を食い切らずに長期運用できる。
                             // ※ auto_reset が発動して offset が後退したら listener cursor もリセット。
                             // 0.9.0: 畳む前に bridge を必ず追いつかせる。 上の transfer は
@@ -15765,7 +15933,7 @@ impl Engine {
             .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(10))
     }
 
-    /// #388: `make_wal_room` を、 前に畳めなかった時から 10 ms 以上空いた時だけ呼ぶ (畳めない間に毎回 fsync しない)。
+    /// #388: `make_wal_room` を、 前に畳めなかった時から 10 ms 以上空いた時だけ呼ぶ (畳めない間に毎回 fsync しない)。 畳んだら true。
     fn make_wal_room_paced(&self, wal: &std::sync::Arc<enchudb_oplog::oplog::OpLog>) -> bool {
         if self.wal_room_failed_recently() {
             return false;
@@ -15776,13 +15944,14 @@ impl Engine {
         if self.wal_room_busy.load(std::sync::atomic::Ordering::Acquire) {
             return false;
         }
-        let folded = self.make_wal_room(wal);
-        // 畳めなかったと覚えるのは、 まだ空きが無い時だけ (他の経路が先に畳んでいた = 空いているのは失敗ではない。 覚えると
-        // 待っている書き手が 「今は畳めない」 と見て諦める)
-        if !folded && wal.free_bytes() < wal.capacity() / 4 {
+        let room = self.make_wal_room(wal);
+        // 畳めなかったと覚えるのは、 畳めない状態で (#512: 試している間に書き手が積み続けて畳めなかった試しは覚えない。 覚えると、
+        // その後 10 ms の間に満杯にぶつかった書き手が、 書き手が止まれば畳めるのに待たずに落とす)、 まだ空きが無い時だけ (他の
+        // 経路が先に畳んでいた = 空いているのは失敗ではない。 覚えると待っている書き手が 「今は畳めない」 と見て諦める)
+        if room == WalRoom::Blocked && wal.free_bytes() < wal.capacity() / 4 {
             *self.wal_room_failed_at.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::time::Instant::now());
         }
-        folded
+        room == WalRoom::Folded
     }
 
     /// #388: WAL を書き出して (Commit → oplog fsync + 本体 msync → checkpoint を head まで) 畳む。 consumer thread から呼ぶ。
@@ -15796,84 +15965,114 @@ impl Engine {
     ///
     /// sync の bridge / changefeed の listener が居る DB は、 書き出した後に配り終えてから畳む (配る前に畳むと record が
     /// 消える)。 配る間に次の record が入れば畳めない — その時は今までどおり満杯で落ちうる (#57 の floor で bootstrap)。
-    /// 畳んだら true。
-    fn make_wal_room(&self, wal: &std::sync::Arc<enchudb_oplog::oplog::OpLog>) -> bool {
+    ///
+    /// 試しの数 (`wal_room_attempts`、 待つ書き手が 「頼んだ後に 1 回試して空かなかった」 を見る) は、 畳んだ時と畳めない状態
+    /// だった時だけ数える (#512: 試している間に書き手が積み続けて畳めなかった試しで、 待つ書き手に諦めさせない)。
+    fn make_wal_room(&self, wal: &std::sync::Arc<enchudb_oplog::oplog::OpLog>) -> WalRoom {
         use std::sync::atomic::Ordering;
         if self.wal_room_busy.swap(true, Ordering::AcqRel) {
-            return false;
+            return WalRoom::Transient;
         }
-        let folded = self.make_wal_room_inner(wal);
+        let room = self.make_wal_room_inner(wal);
         self.wal_room_busy.store(false, Ordering::Release);
-        self.wal_room_attempts.fetch_add(1, Ordering::AcqRel);
-        if folded {
+        if room != WalRoom::Transient {
+            self.wal_room_attempts.fetch_add(1, Ordering::AcqRel);
+        }
+        if room == WalRoom::Folded {
             self.wal_room_folds.fetch_add(1, Ordering::Relaxed);
         }
-        folded
+        room
     }
 
-    fn make_wal_room_inner(&self, wal: &std::sync::Arc<enchudb_oplog::oplog::OpLog>) -> bool {
+    fn make_wal_room_inner(&self, wal: &std::sync::Arc<enchudb_oplog::oplog::OpLog>) -> WalRoom {
         use std::sync::atomic::Ordering;
         self.wal_room_wanted.store(false, Ordering::Release);
         if wal.head() <= enchudb_oplog::oplog::HEADER_SIZE as u64 {
-            return false;
+            return WalRoom::Transient; // 畳むものが無い (空いている)
         }
-        // 開いている group を閉じる。 満杯 (Commit 1 つも入らない) なら打たない — 本体に書き出してから畳むので復旧には
-        // 要らない。 見た後で、 書き手の thread が直接打つ Commit (`commit` / `oplog_commit`) が残りを埋めることがある (見て
-        // から打つまでの間)。 その時の append は待ち手に回るが、 待ち手は consumer 自身 = 畳んでいる最中 (`wal_room_busy`)
-        // なので空けられずに落ちる。 これも打たなかったのと同じなので数えない (2026-10-11: `issue388_wal_backpressure` が
-        // 数 % で 「打てなかった Commit」 = 1 で落ちていた。 backtrace で、 この Commit だった)
-        if !wal.append_dead() {
-            #[cfg(test)]
-            room_commit_hook::call(wal);
-            let _ = self.append_commit_marker_with(wal, false);
-        }
-        // checkpoint を進める前に sidecar を固める (consumer の tick と同じ)
-        self.try_persist_tables();
-        // listener に配っていない record は畳む時に溜めへ移す (配り終えるのを待たない) ので、 listener が居ても append を
-        // 止めたまま畳める。 sync の bridge が居る時は、 bridge が読み切ってから (下)
         let direct = !self.sync_tables_enabled();
-        let folded = {
-            // fold は bridge の cursor を巻き戻すので transfer と直列にする (tick と同じ)。 transfer 中なら今回は見送る
-            let Ok(_fold_guard) = self.transfer_lock.try_lock() else { return false };
-            // changefeed の cursor の巻き戻しを配信の取り出しと直列にする (#337)。 書き出しの間も持つ (配信の取り出しが待つ
-            // だけで、 listener の callback は待たない)
-            let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
-            let mut moved = 0;
-            let (_, folded) = wal.checkpoint_and_reset(
-                |_head| {
-                    let durable_lsn = wal.next_lsn().saturating_sub(1);
-                    let ok = self.sync_for_checkpoint(wal);
-                    if ok {
-                        self.durable_lsn.store(durable_lsn, Ordering::Release);
-                    }
-                    ok
-                },
-                || {
-                    direct && self.wal_fold_safe_locked() && {
-                        moved = self.spill_changes_for_fold(wal, &mut c);
-                        true
-                    }
-                },
-            );
+        // sync の DB は、 書き手が積み続けている間に走ると畳めないことがある (頼まれてから動き出すまでに空きができていた、 前の
+        // 満杯の時の頼みが残っていた)。 閉じの Commit の後に書き手が積むと末尾の group が閉じず bridge が読めない、 書き出しの後に
+        // 積むと head が checkpoint より先に進む。 data の record は閉じの Commit 1 つ分の空きを残してしか場所を取らないので、
+        // 閉じ直して書き出しからやり直せば、 いずれ書き手が止まって畳める。 やり直すのは、 畳めなかった理由がこの 2 つの時だけ
+        // (回数に上限、 #511)
+        let rounds = if direct { 1 } else { WAL_ROOM_FOLD_ROUNDS };
+        // 最後の回に、 書き出しの後に書き手が積んでいたか (やり直しが尽きた時、 積んでいたなら一時の失敗、 #512)
+        let mut appended_after = false;
+        for _ in 0..rounds {
+            // 開いている group を閉じる。 満杯 (Commit 1 つも入らない) なら打たない — 本体に書き出してから畳むので復旧には
+            // 要らない。 見た後で、 書き手の thread が直接打つ Commit (`commit` / `oplog_commit`) が残りを埋めることがある (見て
+            // から打つまでの間)。 その時の append は待ち手に回るが、 待ち手は consumer 自身 = 畳んでいる最中 (`wal_room_busy`)
+            // なので空けられずに落ちる。 これも打たなかったのと同じなので数えない (2026-10-11: `issue388_wal_backpressure` が
+            // 数 % で 「打てなかった Commit」 = 1 で落ちていた。 backtrace で、 この Commit だった)
+            if !wal.append_dead() {
+                #[cfg(test)]
+                room_commit_hook::call(wal);
+                let _ = self.append_commit_marker_with(wal, false);
+            }
+            // checkpoint を進める前に sidecar を固める (consumer の tick と同じ)
+            self.try_persist_tables();
+            // listener に配っていない record は畳む時に溜めへ移す (配り終えるのを待たない) ので、 listener が居ても append を
+            // 止めたまま畳める。 sync の bridge が居る時は、 bridge が読み切ってから (下)
+            let folded = {
+                // fold は bridge の cursor を巻き戻すので transfer と直列にする (tick と同じ)。 transfer 中なら今回は見送る
+                let Ok(_fold_guard) = self.transfer_lock.try_lock() else { return WalRoom::Transient };
+                // changefeed の cursor の巻き戻しを配信の取り出しと直列にする (#337)。 書き出しの間も持つ (配信の取り出しが待つ
+                // だけで、 listener の callback は待たない)
+                let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+                let mut moved = 0;
+                let (_, folded) = wal.checkpoint_and_reset(
+                    |_head| {
+                        let durable_lsn = wal.next_lsn().saturating_sub(1);
+                        let ok = self.sync_for_checkpoint(wal);
+                        if ok {
+                            self.durable_lsn.store(durable_lsn, Ordering::Release);
+                        }
+                        ok
+                    },
+                    || {
+                        direct && self.wal_fold_safe_locked() && {
+                            moved = self.spill_changes_for_fold(wal, &mut c);
+                            true
+                        }
+                    },
+                );
+                if folded {
+                    self.reset_sync_ops_offset();
+                }
+                self.after_fold_changes(wal, &mut c, folded, moved);
+                folded
+            };
+            // 書き出した分を listener に渡すよう頼む (畳めなかった時も、 checkpoint は進んでいる)
+            self.notify_listeners();
             if folded {
-                self.reset_sync_ops_offset();
+                return WalRoom::Folded;
             }
-            self.after_fold_changes(wal, &mut c, folded, moved);
-            folded
-        };
-        // 書き出した分を listener に渡すよう頼む (畳めなかった時も、 checkpoint は進んでいる)
-        self.notify_listeners();
-        folded || (!direct && {
+            if direct {
+                return WalRoom::Blocked; // listener が追いついていない / 書き出せない (append を止めたまま試した)
+            }
+            #[cfg(test)]
+            room_fold_hook::call(wal);
             // 書き出した分を bridge に渡してから畳む (tick と同じ順)
-            if self.sync_tables_enabled() {
-                self.transfer_oplog_to_sync_ops();
-            }
+            self.transfer_oplog_to_sync_ops();
             // #440: bridge した行と payload を書き出してから畳む
             self.write_out_bridged(wal);
             // 待って取らない: transfer の中で満杯にぶつかった書き手がこの lock を持ったまま待ち手に居ると、 互いに待つ
-            let Ok(_fold_guard) = self.transfer_lock.try_lock() else { return false };
-            self.try_fold_with_changes(wal)
-        })
+            let Ok(_fold_guard) = self.transfer_lock.try_lock() else { return WalRoom::Transient };
+            if self.try_fold_with_changes(wal) {
+                return WalRoom::Folded;
+            }
+            // 書き出しの後に書き手が積んだ (head が checkpoint より先) か、 閉じていない record が残ったなら、 閉じ直してやり直す。
+            // どちらでもない (bridge の詰まりなど、 ほかの理由) か、 もう Commit も入らないなら、 やり直しても畳めない
+            appended_after = wal.head() != wal.checkpoint();
+            if wal.append_dead() || (self.bridge_pending_records() == 0 && !appended_after) {
+                return WalRoom::Blocked;
+            }
+        }
+        // やり直しが尽きた。 最後の回にも書き手が積んでいたなら、 書き手が満杯で止まれば次は畳める (#512: 書き出しが速い OS で、
+        // ゆっくり積み続ける書き手が満杯にする前にやり直しが尽き、 「畳めなかった」 と覚えて、 その後の 10 ms に満杯にぶつかった
+        // 書き手を待たずに落としていた)。 積んでいないのに bridge が配り切れないなら、 畳めない状態
+        if appended_after { WalRoom::Transient } else { WalRoom::Blocked }
     }
 
     /// #388: WAL が満杯で載らなかった書き手の待ち手 (`OpLog::set_room_waiter`)。 空いたら true (書き手は書き直す)、
@@ -15881,7 +16080,8 @@ impl Engine {
     ///
     /// - consumer 自身 (tick の Commit など): その場で畳む
     /// - 他の thread: consumer に畳むよう頼み、 `size` byte 空くまで待つ。 待ち始めた後に consumer が 1 回試して空かな
-    ///   ければ (sync の bridge が配り終えていない等で畳めない) すぐ諦める。 上限 `WAL_ROOM_WAIT`、 閉じている最中は待たない
+    ///   ければ (sync の bridge が配り終えていない等で畳めない。 試している間に書き手が積み続けて畳めなかった試しは数えない、
+    ///   #512) すぐ諦める。 上限 `WAL_ROOM_WAIT`、 閉じている最中は待たない
     #[cfg(not(target_arch = "wasm32"))]
     fn wait_for_wal_room(&self, size: u64) -> bool {
         use std::sync::atomic::Ordering;

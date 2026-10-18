@@ -111,7 +111,9 @@ fn wal_full_mid_group_folds_after_bridge_drains() {
         assert!(v < 20_000, "ring が満杯にならない");
     }
 
-    // ── Phase 2: 未 commit の tail を作り、 WAL を append_dead まで正確に埋める。
+    // ── Phase 2: 未 commit の tail を作り、 WAL を append_dead まで正確に埋める。 今の append は閉じの Commit の分の空きを (#511)
+    // 残すので、 この死区間は普通の書き込みでは作れない。 前の版の binary が書いた WAL と同じく、 残さない形にして作る
+    wal.keep_commit_room_for_test(false);
     // Tie (128B) を Commit 無しで積み、 最後は TieLeaf の可変 payload で残りを
     // 112 バイト未満（= Commit も入らない）へ落とす。 閉じの Commit は満杯で
     // 失敗する = 孤児 group 確定。
