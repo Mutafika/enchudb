@@ -288,8 +288,17 @@ fn lww_skip_and_unresolved_drop_are_counted_separately() {
     let mut sim = PeerSim::new("counters", 2);
     let from_b = sim.peer_id(1);
 
-    // 一度も sync されていない foreign entity への Delete = 宛先が無い。
-    let unknown = sim.author_delete(1, enchudb_oplog::make_eid(sim.peer_id(1), 999));
+    // 受け手に無い himo への Tie = table を導けず、 写像を払い出す先が無い。
+    // (#490 の前は、 一度も sync されていない foreign entity への Delete をここに使っていた。
+    // 今の Delete は捨てずに削除版数を覚えるので applied に数える。)
+    let unknown = sim.author_op(
+        1,
+        enchudb_oplog::oplog::DecodedOp::Tie {
+            eid: enchudb_oplog::make_eid(from_b, 999),
+            himo_id: 4000,
+            value: 1,
+        },
+    );
     sim.deliver(vec![unknown]);
     let out = sim.pull(0, from_b);
     assert_eq!(out.dropped_unresolved, 1, "宛先不明は dropped_unresolved");

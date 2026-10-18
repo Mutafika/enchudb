@@ -9860,22 +9860,27 @@ impl Engine {
     }
 
     /// #166: 復元 / 再受信で使う。 退避表へ直接載せる (monotone-max)。
+    ///
+    /// #490: `false` = 既に載っている削除版数より古いので載せない (`apply_delete_in` と同じく、 拒否は真に古い時だけ)。
     fn remember_foreign_tombstone(
         &self,
         peer: enchudb_oplog::PeerId,
         foreign_local: u32,
         tomb: enchudb_oplog::Hlc,
-    ) {
+    ) -> bool {
         if tomb == enchudb_oplog::Hlc::ZERO {
-            return;
+            // 版数不明の delete は記録できない (`set_tombstone_local` と同じ)
+            return true;
         }
         let mut g = self.foreign_tombs.write().unwrap();
         let e = g.entry((peer, foreign_local)).or_insert(enchudb_oplog::Hlc::ZERO);
-        if *e < tomb {
-            *e = tomb;
+        if tomb < *e {
+            return false;
         }
+        *e = tomb;
         self.foreign_tombs_empty
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        true
     }
 
     /// 削除を **本体まで** 適用する。 `false` = 受信 HLC が既存 tombstone より古いので不採用。
@@ -10618,6 +10623,49 @@ impl Engine {
         // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
         // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
         true
+    }
+
+    /// #490: リモート peer から届いた Delete を、 翻訳する前の eid (author の世界番号) のまま当てる。
+    ///
+    /// 写像がある (= この entity の作成を受け取っている) なら [`Engine::remote_delete_apply`] と同じ。
+    ///
+    /// 写像が無いのは、 作成より先に Delete が届いた時 (A が作った行を B が消し、 3 台目が A より先に B から pull した)。
+    /// 前は捨てていたが、 pull の cursor は Delete を越えるので Delete は二度と届かず、 後から作成が届くと行が生き返った
+    /// (受け手が pull する順だけで peer が恒久に食い違う)。 ここでは削除版数を退避表 (`foreign_tombs`、 #166) に載せる。
+    /// 作成が届いて slot を払い出す時に `restore_foreign_tombstone` が書き戻すので、 削除より古い record は `set_cell` の
+    /// tombstone の判定で弾かれ、 新しい record は当たる (#166 で slot が回った後と同じ形)。 退避表は `.eidmap` に残るので
+    /// 再起動も越える (`Syncer` は、 当てた record があれば cursor を進める前に永続する)。
+    ///
+    /// 写像の確かめと退避表への記入は、 写像の払い出しと同じ lock の下で行う ([`EidTranslator::if_unmapped`])。 lock の下で
+    /// 写像が見つかったら (間に作成が当たった)、 写像のある Delete として当てる。
+    ///
+    /// 作成が最後まで届かない entity (subscription filter で落ちる、 履歴の切り詰めの後) 宛ての Delete も退避表に残る
+    /// (1 件 = `(peer, foreign_local)` → HLC)。
+    ///
+    /// 戻り値は [`Engine::remote_delete_apply`] と同じ (`false` = 既に載っている削除より古いので不採用)。
+    ///
+    /// [`EidTranslator::if_unmapped`]: crate::eid_translator::EidTranslator::if_unmapped
+    pub fn remote_delete_apply_foreign(
+        &self,
+        foreign_eid: enchudb_oplog::EntityId,
+        hlc: enchudb_oplog::Hlc,
+    ) -> bool {
+        if let Some(local_eid) = self.resolve_remote_eid_existing(foreign_eid) {
+            return self.remote_delete_apply(local_eid, hlc);
+        }
+        self.observe_remote_hlc(hlc);
+        let owner = enchudb_oplog::eid_peer(foreign_eid);
+        let foreign_local = enchudb_oplog::eid_local(foreign_eid);
+        match self
+            .eid_translator
+            .if_unmapped(owner, foreign_local, || self.remember_foreign_tombstone(owner, foreign_local, hlc))
+        {
+            Ok(accepted) => accepted,
+            Err(local) => {
+                let self_peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
+                self.remote_delete_apply(enchudb_oplog::make_eid(self_peer, local), hlc)
+            }
+        }
     }
 
     /// リモート peer から届いた Content 書き込みを apply。
@@ -15104,8 +15152,8 @@ impl Engine {
                 self.remote_untie_apply(le, *himo_id, hlc);
             }
             DecodedOp::Delete { eid } => {
-                let Some(le) = self.resolve_remote_eid_existing(*eid) else { return };
-                self.remote_delete_apply(le, hlc);
+                // #490: 写像が無くても捨てず、 削除版数を退避表に載せる (`Syncer::apply_one` と同じ)
+                self.remote_delete_apply_foreign(*eid, hlc);
             }
             DecodedOp::Content { eid, key, data } => {
                 let Some(le) = self.resolve_remote_eid_existing(*eid) else { return };

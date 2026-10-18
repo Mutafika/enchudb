@@ -323,14 +323,21 @@ impl PeerSim {
 
     /// peer `i` が entity を削除する wire record を作る。 peer 自身の行も消す。
     ///
-    /// `Delete` は himo を持たないので、 受信側は `resolve_remote_eid_existing`
-    /// (= 既存の写像のみ) でしか宛先を引けない。 写像が無ければ `apply_one` は
-    /// `false` を返し、 **cursor はそれを越えて前進する**。
+    /// `Delete` は himo を持たないので、 受信側は写像を払い出さない。 写像が無ければ
+    /// (= 作成より先に届いた)、 削除版数を退避表に載せて後から届く作成に備える (#490)。
     pub fn author_delete(&mut self, i: usize, eid: u64) -> WireRecord {
         let peer = self.peers[i].id;
         self.peers[i].eng().delete(eid);
         let hlc = self.mint(peer);
         WireRecord::unsigned(hlc, peer, DecodedOp::Delete { eid })
+    }
+
+    /// peer `i` の名で、 任意の op の wire record を作る (peer 自身には書かない)。 受け手が宛先を
+    /// 引けない record のように、 author の書き込みからは出ない形を配る用。
+    pub fn author_op(&mut self, i: usize, op: DecodedOp) -> WireRecord {
+        let peer = self.peers[i].id;
+        let hlc = self.mint(peer);
+        WireRecord::unsigned(hlc, peer, op)
     }
 
     /// peer `i` のローカル書き込み。 sync には出さない (vid 空間を埋める用途)。

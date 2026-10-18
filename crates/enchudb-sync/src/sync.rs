@@ -117,9 +117,11 @@ pub struct SyncOutcome {
     /// **二度と再配送されない**。
     ///
     /// 内訳は「entity 写像が引けない」「himo を定義できない (予算枯渇)」
-    /// 「ref の target を解決できない」。 一度も sync されていない foreign entity 宛の
-    /// `Delete` のように、 **正常系でも 0 にならない** (消す対象が無いので no-op が
-    /// 正しい) が、 予期しない増加は配送欠落の兆候。
+    /// 「ref の target を解決できない」。 予期しない増加は配送欠落の兆候。
+    ///
+    /// #490: 一度も sync されていない foreign entity 宛の `Delete` (= 作成より先に届いた
+    /// Delete) は、 前はここに数えて捨てていた。 捨てると後から届いた作成で行が生き返るので、
+    /// 今は削除版数を覚えて [`SyncOutcome::applied`] に数える ([`Engine::remote_delete_apply_foreign`])。
     ///
     /// 「配送で落ちた」のか「自分のゲートで止めた」のかを caller が切り分けるための
     /// counter。 **vocab 未翻訳は [`SyncOutcome::dropped_vocab`] に分けてある** —
@@ -134,9 +136,8 @@ pub struct SyncOutcome {
     /// (実地発現: `path` 列に別行の PK、 `size` 列に mtime、 `key` 列に hash)。
     /// 黙って壊すより書かない方が良いのでここで数える。
     ///
-    /// [`SyncOutcome::dropped_unresolved`] と**分けてある**: あちらは一度も sync
-    /// されていない foreign entity 宛の `Delete` などで**正常系でも 0 にならない**
-    /// 背景値を持つ。 こちらは**定常状態で 0 であるべき**値で、 > 0 なら当該 cell は
+    /// [`SyncOutcome::dropped_unresolved`] と**分けてある**: あちらは宛先を引けずに
+    /// 捨てた op を数える。 こちらは**定常状態で 0 であるべき**値で、 > 0 なら当該 cell は
     /// **古いまま**なので、 caller は再 author / bootstrap で埋め直すこと。
     pub dropped_vocab: usize,
     /// Phase C: 署名検証で reject した op 数。
@@ -1515,18 +1516,15 @@ impl Syncer {
                 ApplyResult::from_lww(self.engine.remote_untie_apply(local_eid, *himo_id, rec.hlc))
             }
             DecodedOp::Delete { eid } => {
-                // #9: Delete は himo を持たず table を導けないので既存の翻訳のみ引く。
-                // 未登録 (= ここに一度も sync されてない foreign entity) なら消す対象が
-                // 無いので skip。
-                let local_eid = match self.engine.resolve_remote_eid_existing(*eid) {
-                    Some(e) => e,
-                    None => return ApplyResult::Dropped,
-                };
+                // #9: Delete は himo を持たず table を導けないので、 写像を払い出さない。
                 // Delete は全 himo に波及。 tombstone 版数は engine が
                 // (v9 なら tombstone column に永続で) 記録する。 後続の古い HLC の
                 // Tie/Untie/Content は engine 側の tombstone 判定で skip され、
                 // 削除済み entity が復活しない。
-                ApplyResult::from_lww(self.engine.remote_delete_apply(local_eid, rec.hlc))
+                // #490: 写像が無い (= 作成より先に届いた) Delete も捨てない。 engine が削除版数を退避表に載せ、
+                // 後から作成が届いて slot を払い出す時に書き戻す (捨てると、 cursor が Delete を越えているので
+                // 二度と届かず、 後から届いた作成で行が生き返る)。
+                ApplyResult::from_lww(self.engine.remote_delete_apply_foreign(*eid, rec.hlc))
             }
             DecodedOp::TieNamed { eid, himo_name, himo_kind, value } => {
                 // 0.9.0: 動的 himo (content 互換層の `_c_{key}`) は id が peer 間で
