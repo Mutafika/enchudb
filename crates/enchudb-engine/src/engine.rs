@@ -8550,9 +8550,9 @@ impl Engine {
         self.entities.ensure_live(local);
         Self::advance_table_next_local_for(&self.tables, local);
         // #490: この entity 宛ての Delete を作成より先に受けて退避表に載せていたなら、 束ねた行にその削除を当てる
-        // (削除より古い cell を落とす)。 作成を受けて束ねた後に Delete が届いた時は、 写像のある Delete として束ねた行が
-        // 消える。 版数を書き戻すだけ (`restore_foreign_tombstone`) だと、 束ねた行がもともと持っていた古い cell が残り、
-        // 届いた順で答えが割れる。
+        // (版数を載せ、 削除より古い cell を落とす)。 作成を受けて束ねた後に Delete が届いた時は、 写像のある Delete として
+        // 束ねた行が消えるので、 それと同じ答えにする。 払い出した slot と違って既にある行に束ねるので、 版数を書き戻すだけ
+        // (`restore_foreign_tombstone`) だと、 束ねた行がもともと持っていた古い cell が残り、 届いた順で答えが割れる。
         if bound_now
             && let Some(tomb) = self.foreign_tombstone_of(enchudb_oplog::eid_peer(foreign_eid), foreign_local)
         {
@@ -9848,6 +9848,9 @@ impl Engine {
     /// これで 「この foreign entity は t で削除済み」 が slot を跨いで生き残り、
     /// t より古い record は新しい slot 上の tombstone で従来どおり弾かれる
     /// (= 判定経路は `set_cell` 1 本のまま。 A-2 を崩さない)。
+    ///
+    /// #490: 呼ぶのは払い出す所 (`get_or_insert_with` の確保の中 = 写像を載せる前) だけ。
+    /// PK で既存の行に束ねる時は `bind_remote_eid` が削除そのものを当てる。
     fn restore_foreign_tombstone(&self, peer: enchudb_oplog::PeerId, foreign_local: u32, local: u32) {
         if let Some(tomb) = self.foreign_tombstone_of(peer, foreign_local) {
             self.set_tombstone_local(local, tomb);
@@ -10161,13 +10164,15 @@ impl Engine {
         let local = self
             .eid_translator
             .get_or_insert_with(owner, foreign_local, || {
-                self.alloc_translated_local(himo_id)
+                let local = self.alloc_translated_local(himo_id)?;
+                // #166: slot が回った identity なら、 退避してある削除版数を新しい slot に
+                // 書き戻す。 #490: 作成より先に Delete を受けた identity も同じ。
+                // 払い出す時だけ引く (前は写像のある record でも毎回引いたので、 退避表が空で
+                // ないと record を当てるたびに lock を取った)。 写像を載せる前に書くので、
+                // 写像を引いた別の thread が tombstone の無い slot を見ることはない。
+                self.restore_foreign_tombstone(owner, foreign_local, local);
+                Some(local)
             })?;
-        // #166: slot が回った identity なら、 退避してある削除版数を今の slot に
-        // 書き戻す。 `set_tombstone_local` は monotone-max なので、 既に載っている
-        // 場合も新規 slot の場合も同じ呼びで済む (idempotent)。 退避表が空なら
-        // read lock も取らない。
-        self.restore_foreign_tombstone(owner, foreign_local, local);
         Some(enchudb_oplog::make_eid(self_peer, local))
     }
 
@@ -10240,7 +10245,11 @@ impl Engine {
         // target table を導けなければ None (caller が op を skip)。
         self.eid_translator
             .get_or_insert_with(author_peer, foreign_value, || {
-                self.alloc_translated_local_in_target_table(ref_himo_id)
+                let local = self.alloc_translated_local_in_target_table(ref_himo_id)?;
+                // 退避してある削除版数を書き戻す (`resolve_remote_eid` と同じ。 写像を
+                // 引く側は書き戻さないので、 払い出す所は全部ここで書き戻す)
+                self.restore_foreign_tombstone(author_peer, foreign_value, local);
+                Some(local)
             })
     }
 
