@@ -6829,8 +6829,22 @@ impl Engine {
             .map(|t| (t.local_of(enchudb_oplog::eid_local(eid)), t.free_locals.clone(), t.free_locals_nonempty.clone()));
         match meta {
             Some((Some(local), free_list, nonempty)) => {
+                // WAL に積む (満杯なら空きを待つ) のは、 `free_locals` と行の lock を握る前に済ませる。 空きを作る書き出し係は
+                // bridge で `entity_in("_sync_ops")` の `free_locals` を取り、 `_sync_ops` の行を書く。 握ったまま待つと互いに
+                // 待ち、 書き出し係は畳めず、 こちらは待ちの上限 (`WAL_ROOM_WAIT`) まで止まって record を落とす (reclaim は行ごとに
+                // 繰り返すので長く止まる)。 この行に書くのは purge だけ (`sync_ops_purge_lock` と `expected_lsn` で 1 つに絞って
+                // ある) なので、 積んでから行を握っても WAL の順と当てる順はずれない。 当てて free list に戻すまでは、 前と同じく
+                // `free_locals` を握ったまま (上の doc)。 #511
+                self.check_writable();
+                let row_local = enchudb_oplog::eid_local(eid);
+                let hlc = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: self.oplog_eid(row_local) });
                 let mut list = free_list.lock().unwrap();
-                self.delete(eid);
+                let row = self.row_for_wal(row_local);
+                let applied = self.apply_delete_in(row.as_ref(), row_local, hlc);
+                drop(row);
+                if !applied {
+                    self.warn_local_write_rejected(row_local, u16::MAX, hlc);
+                }
                 list.push(local);
                 nonempty.store(true, std::sync::atomic::Ordering::Release);
             }
