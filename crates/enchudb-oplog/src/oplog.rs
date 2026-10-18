@@ -706,7 +706,7 @@ pub struct OpLog {
     /// 2 つを 1 つの lock で読み書きする: 別々の atomic だと、 同じ ms の中では wall の CAS が
     /// 同じ値への CAS になって必ず成功し、 並行した採番が同じ logical を読んで同じ HLC を払い出す
     /// (同期経路の `append` と async 経路の `mint_hlc` は別の lock の中から呼ばれる)。
-    hlc_state: std::sync::Mutex<(u64, u32)>,
+    hlc_state: parking_lot::Mutex<(u64, u32)>,
     /// この OpLog を持つ peer の id(header には書かず Engine から設定)。
     peer_id: std::sync::atomic::AtomicU32,
     /// ed25519 鍵ペア。set_keypair で設定。None なら署名は zeros。
@@ -716,7 +716,11 @@ pub struct OpLog {
     /// LOCK_EX が「既保持の変換」として即成功する)。 head 採番 (read-modify-
     /// write) と `next_hlc` はこの lock の下でのみ安全。 cross-process 排他は
     /// 従来通り flock が担う。
-    append_lock: std::sync::Mutex<()>,
+    ///
+    /// std の `Mutex` は macOS では pthread の mutex で、 書き手を並べると取り合うたびに、 待つのも起こすのも system call
+    /// だった (書き手 8 本の sample で、 書き手の時間の 5〜9 割、 #506)。 parking_lot の `Mutex` は少し回って待ってから寝て、 外す時は寝ている待ち手が
+    /// 居る時だけ起こす。
+    append_lock: parking_lot::Mutex<()>,
     /// [`OpLog::lock_session`] で、 開いている間ずっと flock を持っている。 立っている間の append は record ごとに
     /// flock を取らない (取ると外す時に、 開いている間の lock ごと外れる: flock は開いた file ごとの lock で数えない)。
     /// `append_lock` の下で立て、 append も `append_lock` の下で見る。
@@ -874,10 +878,10 @@ impl OpLog {
             written: AtomicU64::new(HEADER_SIZE as u64),
             checkpoint: AtomicU64::new(HEADER_SIZE as u64),
             next_lsn: AtomicU64::new(1),
-            hlc_state: std::sync::Mutex::new((0, 0)),
+            hlc_state: parking_lot::Mutex::new((0, 0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
-            append_lock: std::sync::Mutex::new(()),
+            append_lock: parking_lot::Mutex::new(()),
             session_locked: std::sync::atomic::AtomicBool::new(false),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
@@ -965,10 +969,10 @@ impl OpLog {
             written: AtomicU64::new(head),
             checkpoint: AtomicU64::new(checkpoint),
             next_lsn: AtomicU64::new(1),
-            hlc_state: std::sync::Mutex::new((0, 0)),
+            hlc_state: parking_lot::Mutex::new((0, 0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
-            append_lock: std::sync::Mutex::new(()),
+            append_lock: parking_lot::Mutex::new(()),
             session_locked: std::sync::atomic::AtomicBool::new(false),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
@@ -1049,7 +1053,7 @@ impl OpLog {
     fn next_hlc(&self) -> Hlc {
         let peer = self.peer_id.load(Ordering::Acquire);
         let now = current_wall_ms();
-        let mut st = self.hlc_state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut st = self.hlc_state.lock();
         let (last, logical) = *st;
         *st = if now > last { (now, 0) } else { (last, logical.wrapping_add(1)) };
         Hlc { wall: st.0, logical: st.1, peer }
@@ -1163,7 +1167,7 @@ impl OpLog {
         hlcs: Option<&[Hlc]>,
     ) -> io::Result<Vec<u64>> {
         // #75: 同一プロセス内の直列化 (flock は同一 fd 共有スレッド間で no-op)
-        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _in_proc = self.append_lock.lock();
         #[cfg(not(target_arch = "wasm32"))]
         let _lock = self.flock_exclusive()?;
 
@@ -1318,7 +1322,7 @@ impl OpLog {
         record_size: usize,
     ) -> io::Result<u64> {
         let _guard = self.pending_guard(1);
-        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _in_proc = self.append_lock.lock();
         #[cfg(not(target_arch = "wasm32"))]
         let _lock = self.flock_exclusive()?;
 
@@ -1358,7 +1362,7 @@ impl OpLog {
     }
 
     fn merge_external_hlc(&self, recv: Hlc) {
-        let mut st = self.hlc_state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut st = self.hlc_state.lock();
         if (recv.wall, recv.logical) > *st {
             *st = (recv.wall, recv.logical);
         }
@@ -1446,7 +1450,7 @@ impl OpLog {
         // #75: 同一プロセス内は append_lock、 プロセス間は flock で直列化。
         // flock は open file description 単位なので、 同じ File を共有する
         // スレッド間では排他にならない — append_lock が必須。
-        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _in_proc = self.append_lock.lock();
         #[cfg(not(target_arch = "wasm32"))]
         let _lock = self.flock_exclusive()?;
 
@@ -1550,7 +1554,7 @@ impl OpLog {
         // チェックと head CAS の間に窓があり、 その間に進入した append の
         // record が reset で head 外に落ちて喪失 + stale record 復活が起きた。
         // append_lock 保持中は append_inner が進入できないため窓が閉じる。
-        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _in_proc = self.append_lock.lock();
         let head = self.head.load(Ordering::Acquire);
         let cp = self.checkpoint.load(Ordering::Acquire);
         if head != cp || head <= HEADER_SIZE as u64 { return false; }
@@ -1584,7 +1588,7 @@ impl OpLog {
     /// 数に入っているのは lock を待っている (まだ場所を取っていない) append だけ。 `sync` / `fold_safe` から
     /// この OpLog の append 系を呼んではならない (自分の lock で止まる)。
     pub fn checkpoint_and_reset(&self, sync: impl FnOnce(u64) -> bool, fold_safe: impl FnOnce() -> bool) -> (bool, bool) {
-        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _in_proc = self.append_lock.lock();
         let head = self.head.load(Ordering::Acquire);
         if head <= HEADER_SIZE as u64 || !sync(head) {
             return (false, false);
@@ -1834,7 +1838,7 @@ impl OpLog {
             self.next_lsn.store(s.max_lsn + 1, Ordering::Release);
         }
         if s.max_hlc.wall > 0 {
-            *self.hlc_state.lock().unwrap_or_else(|p| p.into_inner()) = (s.max_hlc.wall, s.max_hlc.logical);
+            *self.hlc_state.lock() = (s.max_hlc.wall, s.max_hlc.logical);
         }
         (strip_offsets(s.out), strip_offsets(s.tail))
     }
@@ -2009,7 +2013,7 @@ impl OpLog {
     /// flock で追記する使い方 (この crate を直に使う時) では呼ばない — 呼ぶと、 その process は閉じるまで待つ。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn lock_session(&self) -> io::Result<()> {
-        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _in_proc = self.append_lock.lock();
         if !self.session_locked.load(Ordering::Relaxed) {
             let _ = crate::filelock::lock_exclusive(&self._file)?;
             self.session_locked.store(true, Ordering::Relaxed);
@@ -2074,10 +2078,10 @@ impl OpLog {
             written: AtomicU64::new(HEADER_SIZE as u64),
             checkpoint: AtomicU64::new(HEADER_SIZE as u64),
             next_lsn: AtomicU64::new(1),
-            hlc_state: std::sync::Mutex::new((0, 0)),
+            hlc_state: parking_lot::Mutex::new((0, 0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
-            append_lock: std::sync::Mutex::new(()),
+            append_lock: parking_lot::Mutex::new(()),
             session_locked: std::sync::atomic::AtomicBool::new(false),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
