@@ -40,6 +40,11 @@
 //! (別の author の Tie と Delete が入れ違う時や、 再送 / gossip の交錯)、 Delete は
 //! **Delete より新しい版の cell を残して**ほかを消す (`Engine::remove_entity_body`)。
 //! 残った cell は、 削除の後に書かれた行として生きる。
+//!
+//! 作成より先に届いた Delete (まだ写像の無い entity 宛て。 A が作った行を B が消し、 A より先に
+//! B から pull した時) も捨てない。 削除版数を覚えておき、 後から作成が届いて slot を払い出す時に
+//! tombstone として書き戻すので、 削除より古い作成は skip される (#490、
+//! `Engine::remote_delete_apply_foreign`)。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
