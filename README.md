@@ -297,6 +297,7 @@ belongs to the DB lives inside it — `mv`, `rm -r` and `cp -r` move the whole t
   oplog                     WAL (when enabled)
   tables                    table definitions (+ PK / extent blocks)
   eidmap, vocabmap          foreign-eid / vocab translation (only when syncing)
+  pktombs                   deleted primary keys, appended (syncing DBs that deleted a PK row)
   crc                       region CRC (only when seal_integrity is used)
   schema                    enchudb-schema's table schema
   lock                      writer exclusion (flock on writer open, released on close)
@@ -488,6 +489,8 @@ For a GUI app + CLI sharing one DB, the recommended pattern is **the GUI opens `
 ### Writes between peers (sync)
 
 Since 0.11, EnchuDB is **multi-writer**: any peer can write to any entity, and conflicts are resolved per card (himo) by HLC LWW (concurrent writes are settled by time). Convergence is **logical** (exchanging ops converges the contents) rather than physical replication. Refs that point at a replica of a foreign entity propagate too — the `TieRef` op carries the world id (peer-prefixed eid) since 0.22.0. Up to 0.10.x it was per-entity single-writer (only the author could write).
+
+Tables with a primary key treat rows with the same key as one row: a row another peer created with the same key is bound to the local one, and a delete of the key also removes the writes older than the delete that any peer made to that key — including rows that arrive after the delete (#141, #513; the deleted keys are kept in `pktombs`). Writes newer than the delete survive.
 
 #### What a differential pull does *not* promise
 
