@@ -18058,7 +18058,11 @@ mod tests {
             "premise: bridge が cursor を進めていること (offset={advanced})"
         );
 
-        // fold の巻き戻しを再現
+        // fold の巻き戻しを再現。 本物の fold と同じく `transfer_lock` を握ってから巻き戻し、 下の assert まで握り続ける。
+        // 握らないと、 裏の書き出し係の bridge (`transfer_lock` を取る) が入れ違う: 巻き戻しの直前に `from` を読んだ裏の
+        // transfer の CAS も外れて修理の数が 2 になる、 または巻き戻しの後に裏の transfer が cursor を進め直す (手元の CI で
+        // 1 回、 修理の数 2 で落ちた)。 巻き戻しと下の stale store の模擬は lock を取らないので、 握ったままで詰まらない。
+        let _fold = eng.transfer_lock_for_fold();
         eng.reset_sync_ops_offset();
         assert_eq!(
             eng.sync_ops_bridge_offset(),
