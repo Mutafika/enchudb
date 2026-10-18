@@ -45,11 +45,16 @@
 //! B から pull した時) も捨てない。 削除版数を覚えておき、 後から作成が届いて slot を払い出す時に
 //! tombstone として書き戻すので、 削除より古い作成は skip される (#490、
 //! `Engine::remote_delete_apply_foreign`)。
+//!
+//! 主キーのある表では、 主キーが同じなら同じ行 (#141 で束ねる)。 削除はその主キーの行の、 削除より古い書き込みを、
+//! どの author のものでも消す: 受け手は主キーのある行を消すとその主キーを覚え、 後から届いた同じ主キーの行 (束ねる
+//! 先が生きていても、 もう無くても) にその削除を当てる (#513、 `Engine::bind_remote_eid_by_pk` /
+//! `Engine::reserve_remote_eid_for_pk`)。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use enchudb_engine::engine::{Engine, RemoteApply};
+use enchudb_engine::engine::{Engine, PkValue, RemoteApply};
 use enchudb_engine::hlc_store::HlcStore;
 use enchudb_engine::transport::{Transport, WireRecord};
 use enchudb_oplog::oplog::DecodedOp;
@@ -1302,15 +1307,19 @@ impl Syncer {
     /// 新規 eid が払い出されて束ね損なう。 1 row の insert は 1 commit = 同 batch に
     /// 載るのが通常なので実運用の主経路は塞がるが、 完全ではない (既に二重化した
     /// store の修復も別途必要 — #141 参照)。
-    fn bind_by_primary_key(&self, rec: &WireRecord, batch: &[WireRecord]) {
-        let DecodedOp::Tie { eid, himo_id, value } = &rec.op else { return };
+    ///
+    /// 戻り値: 束ねた / 払い出した local eid (#513: 呼び手はそのまま当て、 写像を引き直さない)。 束ねなかった時と、 record の
+    /// 書き手が entity の産みの親でない時 (写像の鍵が束ねと引きで違う) は `None` (呼び手が今までどおり引く)。
+    fn bind_by_primary_key(&self, rec: &WireRecord, batch: &[WireRecord]) -> Option<enchudb_oplog::EntityId> {
+        let DecodedOp::Tie { eid, himo_id, value } = &rec.op else { return None };
         if !self.engine.is_pk_himo(*himo_id) {
-            return;
+            return None;
         }
         // 既に写像がある foreign entity は触らない (先に確定した束ね先を優先)。
         if self.engine.resolve_remote_eid_existing(*eid).is_some() {
-            return;
+            return None;
         }
+        let own = rec.author_peer == enchudb_oplog::eid_peer(*eid);
         // PK は Tag / Number 想定 (Ref を PK にはしない)。 remote vocab vid を
         // local vid に翻訳してから引く。 **未翻訳の生 vid で引いてはいけない** —
         // vid は author ローカル番号で、 fresh store 同士は intern 順が対称なので
@@ -1324,23 +1333,32 @@ impl Syncer {
                 // 居るはず。 その bytes で local vocab を引き、 同じ文字列が local に
                 // 既存ならその vid で照合する。 bytes ごと未知なら、 この PK
                 // 文字列を持つ既存 row は存在し得ない → bind せず払い出しに任せる。
-                let from_batch = batch.iter().find_map(|r| match &r.op {
+                let bytes = batch.iter().find_map(|r| match &r.op {
                     DecodedOp::Vocab { vid, bytes } if r.author_peer == rec.author_peer && *vid as u64 == *value => {
-                        self.engine.vocab_id_bytes(bytes)
+                        Some(bytes)
                     }
                     _ => None,
-                });
-                match from_batch {
+                })?;
+                match self.engine.vocab_id_bytes(bytes) {
                     Some(v) => v as u64,
-                    None => return,
+                    None => {
+                        // #513: その主キーの行を前に消していれば (辞書の回収で文字列が辞書から消えていても)、 削除を当てる
+                        return self.engine.reserve_remote_eid_for_pk(*eid, *himo_id, PkValue::Text(bytes)).filter(|_| own);
+                    }
                 }
             }
         };
         // 索引は書く時に並べるので、 同じ batch で前に当てた record も引ける
         let Some(existing) = self.engine.query_by_id64(&[(*himo_id, local_value)]).into_iter().next() else {
-            return; // 同じ PK の row は今は無い → 通常の払い出しに任せる
+            // 同じ PK の row は今は無い → 通常の払い出しに任せる。 #513: ただし、 その主キーの行を前に消していれば、
+            // 払い出す slot に削除の版数を載せる (削除より古い書き込みを弾く。 消した行を先に受けて束ねていた peer では、
+            // この entity の古い書き込みも削除で消えているので、 同じ答えにする)
+            return self.engine.reserve_remote_eid_for_pk(*eid, *himo_id, PkValue::Local(local_value)).filter(|_| own);
         };
-        self.engine.bind_remote_eid(rec.author_peer, *eid, existing);
+        // #513: 束ねた行にも、 その主キーの行を消した削除を当てる (削除の後に作り直された行に束ねる時、 削除より古い
+        // 書き込みを残さない)
+        let bound = self.engine.bind_remote_eid_by_pk(rec.author_peer, *eid, existing, *himo_id, local_value);
+        own.then_some(bound)
     }
 
     /// 受信 record 列を LWW で適用する (Phase C: 署名検証 + ACL も通す)。 `pull_once` の中身であり、
@@ -1419,8 +1437,8 @@ impl Syncer {
                     continue;
                 }
             }
-            self.bind_by_primary_key(rec, records);
-            match self.apply_one(&store, rec) {
+            let bound = self.bind_by_primary_key(rec, records);
+            match self.apply_one(&store, rec, bound) {
                 ApplyResult::Applied => {
                     out.applied += 1;
                     if let Some(list) = relay_accepted.as_deref_mut() {
@@ -1450,7 +1468,8 @@ impl Syncer {
     // (旧 buffer の既知バグ: in-memory のみで cursor だけ永続前進 → 再起動で
     //  buffered record が恒久喪失 / eviction が「最古」でなく任意 bucket を破棄)
 
-    fn apply_one(&self, store: &HlcStore, rec: &WireRecord) -> ApplyResult {
+    /// `bound`: `bind_by_primary_key` が束ねた / 払い出した local eid (Tie だけ。 あれば写像を引き直さない)。
+    fn apply_one(&self, store: &HlcStore, rec: &WireRecord, bound: Option<enchudb_oplog::EntityId>) -> ApplyResult {
         match &rec.op {
             DecodedOp::Tie { eid, himo_id, value } => {
                 // #9: foreign eid を自分の eid 空間の local eid に翻訳 (初見なら払い出し)。
@@ -1461,7 +1480,7 @@ impl Syncer {
                 // gossip は default off。
                 // table-less (himo を closed table に解決できない) なら確保先が無いので
                 // skip。 entity / ref value を先に解決してから LWW を更新する。
-                let local_eid = match self.engine.resolve_remote_eid(*eid, *himo_id) {
+                let local_eid = match bound.or_else(|| self.engine.resolve_remote_eid(*eid, *himo_id)) {
                     Some(e) => e,
                     None => return ApplyResult::Dropped,
                 };
