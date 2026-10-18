@@ -36,10 +36,10 @@
 //! Delete は特殊: himo を持たないため per-himo の比較はせず、 **tombstone slot
 //! (sentinel himo_id = `u16::MAX`) との LWW** で判定する。 apply されると
 //! tombstone HLC が記録され、 以後それより古い Tie/Untie は skip される
-//! (削除済み entity の復活防止)。 逆に reorder 配送で「新しい Tie の後に古い
-//! Delete」が届いた場合、 per-himo HLC は参照しないため Delete が entity を
-//! 物理削除する — 同一 author の log は HLC 順なのでこの経路は再送/gossip の
-//! 交錯時のみ (0.9.0 で doc を実装に合わせて訂正、 挙動は従来どおり)。
+//! (削除済み entity の復活防止)。 逆に 「新しい Tie の後に古い Delete」 が届いた場合
+//! (別の author の Tie と Delete が入れ違う時や、 再送 / gossip の交錯)、 Delete は
+//! **Delete より新しい版の cell を残して**ほかを消す (`Engine::remove_entity_body`)。
+//! 残った cell は、 削除の後に書かれた行として生きる。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
