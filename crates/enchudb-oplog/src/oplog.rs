@@ -706,17 +706,23 @@ pub struct OpLog {
     /// 2 つを 1 つの lock で読み書きする: 別々の atomic だと、 同じ ms の中では wall の CAS が
     /// 同じ値への CAS になって必ず成功し、 並行した採番が同じ logical を読んで同じ HLC を払い出す
     /// (同期経路の `append` と async 経路の `mint_hlc` は別の lock の中から呼ばれる)。
-    hlc_state: std::sync::Mutex<(u64, u32)>,
+    hlc_state: parking_lot::Mutex<(u64, u32)>,
     /// この OpLog を持つ peer の id(header には書かず Engine から設定)。
     peer_id: std::sync::atomic::AtomicU32,
     /// ed25519 鍵ペア。set_keypair で設定。None なら署名は zeros。
     keypair: std::sync::RwLock<Option<std::sync::Arc<crate::keys::Keypair>>>,
+    /// `keypair` が Some か (鍵を持たない時は、 append のたびに RwLock を読まない、 #506)。
+    signing: std::sync::atomic::AtomicBool,
     /// #75: 同一プロセス内 append の直列化。 flock は open file description
     /// 単位のため、 同じ File を共有するスレッド間では排他にならない (2 本目の
     /// LOCK_EX が「既保持の変換」として即成功する)。 head 採番 (read-modify-
     /// write) と `next_hlc` はこの lock の下でのみ安全。 cross-process 排他は
     /// 従来通り flock が担う。
-    append_lock: std::sync::Mutex<()>,
+    ///
+    /// std の `Mutex` は macOS では pthread の mutex で、 書き手を並べると取り合うたびに、 待つのも起こすのも system call
+    /// だった (書き手 8 本の sample で、 書き手の時間の 5〜9 割、 #506)。 parking_lot の `Mutex` は少し回って待ってから寝て、 外す時は寝ている待ち手が
+    /// 居る時だけ起こす。
+    append_lock: parking_lot::Mutex<()>,
     /// [`OpLog::lock_session`] で、 開いている間ずっと flock を持っている。 立っている間の append は record ごとに
     /// flock を取らない (取ると外す時に、 開いている間の lock ごと外れる: flock は開いた file ごとの lock で数えない)。
     /// `append_lock` の下で立て、 append も `append_lock` の下で見る。
@@ -874,10 +880,11 @@ impl OpLog {
             written: AtomicU64::new(HEADER_SIZE as u64),
             checkpoint: AtomicU64::new(HEADER_SIZE as u64),
             next_lsn: AtomicU64::new(1),
-            hlc_state: std::sync::Mutex::new((0, 0)),
+            hlc_state: parking_lot::Mutex::new((0, 0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
-            append_lock: std::sync::Mutex::new(()),
+            signing: std::sync::atomic::AtomicBool::new(false),
+            append_lock: parking_lot::Mutex::new(()),
             session_locked: std::sync::atomic::AtomicBool::new(false),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
@@ -965,10 +972,11 @@ impl OpLog {
             written: AtomicU64::new(head),
             checkpoint: AtomicU64::new(checkpoint),
             next_lsn: AtomicU64::new(1),
-            hlc_state: std::sync::Mutex::new((0, 0)),
+            hlc_state: parking_lot::Mutex::new((0, 0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
-            append_lock: std::sync::Mutex::new(()),
+            signing: std::sync::atomic::AtomicBool::new(false),
+            append_lock: parking_lot::Mutex::new(()),
             session_locked: std::sync::atomic::AtomicBool::new(false),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
@@ -986,7 +994,10 @@ impl OpLog {
 
     /// Phase C: 署名鍵を設定。None で署名 off(slot は zeros で埋める)。
     pub fn set_keypair(&self, kp: Option<std::sync::Arc<crate::keys::Keypair>>) {
-        *self.keypair.write().unwrap() = kp;
+        let some = kp.is_some();
+        let mut k = self.keypair.write().unwrap();
+        *k = kp;
+        self.signing.store(some, Ordering::Release);
     }
 
     /// 現在の peer id。
@@ -1049,7 +1060,7 @@ impl OpLog {
     fn next_hlc(&self) -> Hlc {
         let peer = self.peer_id.load(Ordering::Acquire);
         let now = current_wall_ms();
-        let mut st = self.hlc_state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut st = self.hlc_state.lock();
         let (last, logical) = *st;
         *st = if now > last { (now, 0) } else { (last, logical.wrapping_add(1)) };
         Hlc { wall: st.0, logical: st.1, peer }
@@ -1163,7 +1174,7 @@ impl OpLog {
         hlcs: Option<&[Hlc]>,
     ) -> io::Result<Vec<u64>> {
         // #75: 同一プロセス内の直列化 (flock は同一 fd 共有スレッド間で no-op)
-        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _in_proc = self.append_lock.lock();
         #[cfg(not(target_arch = "wasm32"))]
         let _lock = self.flock_exclusive()?;
 
@@ -1318,7 +1329,7 @@ impl OpLog {
         record_size: usize,
     ) -> io::Result<u64> {
         let _guard = self.pending_guard(1);
-        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _in_proc = self.append_lock.lock();
         #[cfg(not(target_arch = "wasm32"))]
         let _lock = self.flock_exclusive()?;
 
@@ -1358,7 +1369,7 @@ impl OpLog {
     }
 
     fn merge_external_hlc(&self, recv: Hlc) {
-        let mut st = self.hlc_state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut st = self.hlc_state.lock();
         if (recv.wall, recv.logical) > *st {
             *st = (recv.wall, recv.logical);
         }
@@ -1446,7 +1457,7 @@ impl OpLog {
         // #75: 同一プロセス内は append_lock、 プロセス間は flock で直列化。
         // flock は open file description 単位なので、 同じ File を共有する
         // スレッド間では排他にならない — append_lock が必須。
-        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _in_proc = self.append_lock.lock();
         #[cfg(not(target_arch = "wasm32"))]
         let _lock = self.flock_exclusive()?;
 
@@ -1456,7 +1467,9 @@ impl OpLog {
         // append_lock + flock の両方を保持しているので単純 store で OK。
         let offset = self.alloc(record_size as u64)?;
 
-        let lsn = self.next_lsn.fetch_add(1, Ordering::AcqRel);
+        // append_lock の下でだけ進める (読み手は lock を取らずに読むので atomic のまま)
+        let lsn = self.next_lsn.load(Ordering::Relaxed);
+        self.next_lsn.store(lsn + 1, Ordering::Release);
         // relay 経路では受信 HLC/author/署名をそのまま乗せる (gossip 用)。
         // 通常経路では next_hlc + 自鍵で署名。
         let (hlc, author_peer) = match &relay {
@@ -1481,7 +1494,7 @@ impl OpLog {
         let (signature, pubkey_fp) = match &relay {
             Some(o) => (o.signature, o.pubkey_fp),
             None => {
-                let keypair = self.keypair.read().unwrap().clone();
+                let keypair = if self.signing.load(Ordering::Acquire) { self.keypair.read().unwrap().clone() } else { None };
                 match keypair {
                     Some(kp) => {
                         let msg = signed_payload(
@@ -1550,7 +1563,7 @@ impl OpLog {
         // チェックと head CAS の間に窓があり、 その間に進入した append の
         // record が reset で head 外に落ちて喪失 + stale record 復活が起きた。
         // append_lock 保持中は append_inner が進入できないため窓が閉じる。
-        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _in_proc = self.append_lock.lock();
         let head = self.head.load(Ordering::Acquire);
         let cp = self.checkpoint.load(Ordering::Acquire);
         if head != cp || head <= HEADER_SIZE as u64 { return false; }
@@ -1584,7 +1597,7 @@ impl OpLog {
     /// 数に入っているのは lock を待っている (まだ場所を取っていない) append だけ。 `sync` / `fold_safe` から
     /// この OpLog の append 系を呼んではならない (自分の lock で止まる)。
     pub fn checkpoint_and_reset(&self, sync: impl FnOnce(u64) -> bool, fold_safe: impl FnOnce() -> bool) -> (bool, bool) {
-        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _in_proc = self.append_lock.lock();
         let head = self.head.load(Ordering::Acquire);
         if head <= HEADER_SIZE as u64 || !sync(head) {
             return (false, false);
@@ -1834,7 +1847,7 @@ impl OpLog {
             self.next_lsn.store(s.max_lsn + 1, Ordering::Release);
         }
         if s.max_hlc.wall > 0 {
-            *self.hlc_state.lock().unwrap_or_else(|p| p.into_inner()) = (s.max_hlc.wall, s.max_hlc.logical);
+            *self.hlc_state.lock() = (s.max_hlc.wall, s.max_hlc.logical);
         }
         (strip_offsets(s.out), strip_offsets(s.tail))
     }
@@ -2009,7 +2022,7 @@ impl OpLog {
     /// flock で追記する使い方 (この crate を直に使う時) では呼ばない — 呼ぶと、 その process は閉じるまで待つ。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn lock_session(&self) -> io::Result<()> {
-        let _in_proc = self.append_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _in_proc = self.append_lock.lock();
         if !self.session_locked.load(Ordering::Relaxed) {
             let _ = crate::filelock::lock_exclusive(&self._file)?;
             self.session_locked.store(true, Ordering::Relaxed);
@@ -2074,10 +2087,11 @@ impl OpLog {
             written: AtomicU64::new(HEADER_SIZE as u64),
             checkpoint: AtomicU64::new(HEADER_SIZE as u64),
             next_lsn: AtomicU64::new(1),
-            hlc_state: std::sync::Mutex::new((0, 0)),
+            hlc_state: parking_lot::Mutex::new((0, 0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
-            append_lock: std::sync::Mutex::new(()),
+            signing: std::sync::atomic::AtomicBool::new(false),
+            append_lock: parking_lot::Mutex::new(()),
             session_locked: std::sync::atomic::AtomicBool::new(false),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
             auto_reset: std::sync::atomic::AtomicBool::new(false),
@@ -2090,18 +2104,85 @@ impl OpLog {
 }
 
 /// 現在時刻を ms since UNIX epoch で返す。wasm32 では 0。
+///
+/// HLC の採番 (WAL に積む 1 回ごと、 `append_lock` の中) で読む。 Apple の aarch64 (macOS / iOS) の `SystemTime::now()` は
+/// `mach_absolute_time` が Apple 独自の counter の register を読む所が重く、 書き手 1 本の sample でも書き手の時間の 2〜5 割を
+/// 占めていた (#506)。 そこでは thread ごとに、 前に読んだ時刻に CPU の counter (`cntvct_el0`: 全 core でそろった一定の周波数で、
+/// 眠っている間も進む。 読みは数 ns) の進みを足して出し、 1 ms ごとに読み直す (時刻を合わせ直した時の飛びは 1 ms 以内に拾う)。
 #[inline]
 fn current_wall_ms() -> u64 {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple", not(miri)))]
     {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
+        apple_wall_clock::now_ms()
+    }
+    #[cfg(all(not(target_arch = "wasm32"), not(all(target_arch = "aarch64", target_vendor = "apple", not(miri)))))]
+    {
+        system_wall_ns() / 1_000_000
     }
     #[cfg(target_arch = "wasm32")]
     { 0 }
+}
+
+/// `SystemTime::now()` を ns since UNIX epoch で (epoch より前なら 0)。
+#[cfg(not(target_arch = "wasm32"))]
+fn system_wall_ns() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple", not(miri)))]
+mod apple_wall_clock {
+    use std::cell::Cell;
+
+    /// counter の今の値。 `isb` を挟まない (前後の命令と少し入れ違ってよい: 1 ms の窓の判定にだけ使う)。
+    #[inline]
+    fn ticks() -> u64 {
+        let t: u64;
+        // SAFETY: cntvct_el0 は EL0 から読める (`mach_absolute_time` も同じ register を読む)。 読むだけで副作用は無い
+        unsafe { std::arch::asm!("mrs {}, cntvct_el0", out(reg) t, options(nomem, nostack, preserves_flags)) };
+        t
+    }
+
+    /// counter の周波数 (Hz)。
+    #[inline]
+    fn freq() -> u64 {
+        let f: u64;
+        // SAFETY: 同上
+        unsafe { std::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) };
+        f
+    }
+
+    thread_local! {
+        /// 最後に読み直した時の (counter, 時刻 ns)。 counter 0 は未読
+        static BASE: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(super) fn now_ms() -> u64 {
+        now_ns() / 1_000_000
+    }
+
+    /// 今の時刻 (ns since UNIX epoch)。 控えた時刻からの足しは、 本当の時刻より先に進まない (控えは時刻を読んだ後の counter)。
+    pub(super) fn now_ns() -> u64 {
+        let f = freq();
+        BASE.with(|b| {
+            let (t0, ns0) = b.get();
+            let d = ticks().wrapping_sub(t0);
+            if t0 != 0 && f >= 1000 && d < f / 1000 {
+                return ns0 + d * 1_000_000_000 / f;
+            }
+            let before = ticks();
+            let ns = super::system_wall_ns();
+            let after = ticks();
+            // 時刻の読みの間に止められた (組がずれた) 時は控えない: 足した時刻がその間だけ遅れる
+            if after.wrapping_sub(before) < f / 100_000 {
+                b.set((after, ns));
+            }
+            ns
+        })
+    }
 }
 
 fn decode_op(op_byte: u8, payload: &[u8]) -> Option<DecodedOp> {
@@ -2985,6 +3066,24 @@ mod tests {
         assert_eq!(all.len(), n, "同じ HLC が {} 回払い出された", n - all.len());
         let _ = std::fs::remove_dir_all(&p);
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// Apple の aarch64 で、 控えた時刻に CPU の counter の進みを足して出す時刻 (`apple_wall_clock`) が、 その都度読む時刻と
+    /// ずれない。 1 ms ごとの読み直しをまたぐように、 ときどき寝る。
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple", not(miri)))]
+    #[test]
+    fn counted_wall_clock_tracks_the_system_clock() {
+        for i in 0..20_000u32 {
+            if i % 1000 == 999 {
+                std::thread::sleep(std::time::Duration::from_micros(1500));
+            }
+            let before = system_wall_ns();
+            let got = apple_wall_clock::now_ns();
+            let after = system_wall_ns();
+            // 先には進まない (時刻を合わせる遅れ・進みの分だけ許す)。 遅れは、 控えの組を読む間 (10 µs 未満) だけ
+            assert!(got <= after + 2_000, "{i} 回目: 読んだ時刻より {} ns 先", got - after);
+            assert!(got + 20_000 >= before, "{i} 回目: 読んだ時刻より {} ns 遅れた", before - got);
+        }
     }
 
     #[test]

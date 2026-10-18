@@ -9,10 +9,7 @@
 //! use enchudb_sync::Syncer;
 //!
 //! let path = format!("/tmp/enchudb-sync-doc-{}.db", std::process::id());
-//! let _ = std::fs::remove_file(&path);
-//! let _ = std::fs::remove_file(format!("{}.oplog", path));
-//! let _ = std::fs::remove_file(format!("{}.tables", path));
-//! let _ = std::fs::remove_file(format!("{}.db.lock", path));
+//! let _ = enchudb_engine::db_files::remove_db(&path);
 //! // Sync を使う場合は必ず WAL + sync tables 有効な Engine を使う。
 //! {
 //!     let mut eng_init = Engine::create_standalone(&path).unwrap();
@@ -26,10 +23,7 @@
 //! let out = syncer.pull_once(2); // 未知の peer から pull、0 件
 //! assert_eq!(out.received, 0);
 //! # drop(eng_a);
-//! # let _ = std::fs::remove_file(&path);
-//! # let _ = std::fs::remove_file(format!("{}.oplog", path));
-//! # let _ = std::fs::remove_file(format!("{}.tables", path));
-//! # let _ = std::fs::remove_file(format!("{}.db.lock", path));
+//! # let _ = enchudb_engine::db_files::remove_db(&path);
 //! ```
 //!
 //! # LWW 規則

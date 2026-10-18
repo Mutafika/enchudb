@@ -48,8 +48,7 @@
 //! }
 //!
 //! let path = format!("/tmp/enchudb-cf-doc-{}.db", std::process::id());
-//! # let _ = std::fs::remove_file(&path);
-//! # let _ = std::fs::remove_file(format!("{}.oplog", path));
+//! # let _ = enchudb_engine::db_files::remove_db(&path);
 //! {
 //!     let mut eng = Engine::create_standalone(&path).unwrap();
 //!     eng.define_himo("v", ValueType::Number, 100);
@@ -67,8 +66,7 @@
 //! // この時点で counter には少なくとも 1 件入る
 //! assert!(*counter.lock().unwrap() >= 1);
 //! drop(eng);
-//! # let _ = std::fs::remove_file(&path);
-//! # let _ = std::fs::remove_file(format!("{}.oplog", path));
+//! # let _ = enchudb_engine::db_files::remove_db(&path);
 //! ```
 
 use crate::transport::WireRecord;
