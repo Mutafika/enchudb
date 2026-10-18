@@ -711,6 +711,8 @@ pub struct OpLog {
     peer_id: std::sync::atomic::AtomicU32,
     /// ed25519 鍵ペア。set_keypair で設定。None なら署名は zeros。
     keypair: std::sync::RwLock<Option<std::sync::Arc<crate::keys::Keypair>>>,
+    /// `keypair` が Some か (鍵を持たない時は、 append のたびに RwLock を読まない、 #506)。
+    signing: std::sync::atomic::AtomicBool,
     /// #75: 同一プロセス内 append の直列化。 flock は open file description
     /// 単位のため、 同じ File を共有するスレッド間では排他にならない (2 本目の
     /// LOCK_EX が「既保持の変換」として即成功する)。 head 採番 (read-modify-
@@ -881,6 +883,7 @@ impl OpLog {
             hlc_state: parking_lot::Mutex::new((0, 0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
+            signing: std::sync::atomic::AtomicBool::new(false),
             append_lock: parking_lot::Mutex::new(()),
             session_locked: std::sync::atomic::AtomicBool::new(false),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
@@ -972,6 +975,7 @@ impl OpLog {
             hlc_state: parking_lot::Mutex::new((0, 0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
+            signing: std::sync::atomic::AtomicBool::new(false),
             append_lock: parking_lot::Mutex::new(()),
             session_locked: std::sync::atomic::AtomicBool::new(false),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
@@ -990,7 +994,10 @@ impl OpLog {
 
     /// Phase C: 署名鍵を設定。None で署名 off(slot は zeros で埋める)。
     pub fn set_keypair(&self, kp: Option<std::sync::Arc<crate::keys::Keypair>>) {
-        *self.keypair.write().unwrap() = kp;
+        let some = kp.is_some();
+        let mut k = self.keypair.write().unwrap();
+        *k = kp;
+        self.signing.store(some, Ordering::Release);
     }
 
     /// 現在の peer id。
@@ -1460,7 +1467,9 @@ impl OpLog {
         // append_lock + flock の両方を保持しているので単純 store で OK。
         let offset = self.alloc(record_size as u64)?;
 
-        let lsn = self.next_lsn.fetch_add(1, Ordering::AcqRel);
+        // append_lock の下でだけ進める (読み手は lock を取らずに読むので atomic のまま)
+        let lsn = self.next_lsn.load(Ordering::Relaxed);
+        self.next_lsn.store(lsn + 1, Ordering::Release);
         // relay 経路では受信 HLC/author/署名をそのまま乗せる (gossip 用)。
         // 通常経路では next_hlc + 自鍵で署名。
         let (hlc, author_peer) = match &relay {
@@ -1485,7 +1494,7 @@ impl OpLog {
         let (signature, pubkey_fp) = match &relay {
             Some(o) => (o.signature, o.pubkey_fp),
             None => {
-                let keypair = self.keypair.read().unwrap().clone();
+                let keypair = if self.signing.load(Ordering::Acquire) { self.keypair.read().unwrap().clone() } else { None };
                 match keypair {
                     Some(kp) => {
                         let msg = signed_payload(
@@ -2081,6 +2090,7 @@ impl OpLog {
             hlc_state: parking_lot::Mutex::new((0, 0)),
             peer_id: std::sync::atomic::AtomicU32::new(0),
             keypair: std::sync::RwLock::new(None),
+            signing: std::sync::atomic::AtomicBool::new(false),
             append_lock: parking_lot::Mutex::new(()),
             session_locked: std::sync::atomic::AtomicBool::new(false),
             pending_writes: std::sync::atomic::AtomicU32::new(0),
