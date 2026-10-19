@@ -10,7 +10,7 @@
 //! Cylinder を触らず（append-only）、 stale は read 側の Column verify で落とす
 //! （lazy / conditional verify）。
 
-use crossbeam_epoch as epoch;
+use crossbeam_epoch::{self as epoch, Guard};
 use parking_lot::{Mutex, MutexGuard};
 use std::ops::ControlFlow;
 use std::sync::OnceLock;
@@ -294,6 +294,17 @@ fn stored_sync(col: &Column, eid: u32) -> u64 {
     if col.value_size == 8 { col.load_u64_acquire(eid) } else { u64::from(col.load_u32_acquire(eid)) }
 }
 
+/// 値 `value` の bucket の詰め直しの照らし: `eid` の cell が今 `value` か。 その値の鍵の下で呼ぶ。 読みは Relaxed で足りる:
+/// cell を `value` にする書き手も `value` から動かす書き手も同じ鍵を持つので、 その store は鍵の受け渡しで照らしより前に
+/// 見えている。 鍵を持つ間に cell を動かす書き手は他の値どうしの間を動かすだけで、 どの値を読んでも答え (`value` でない) は
+/// 同じ。 Acquire だと読みが 1 つずつ前の読みを待ち (後の読みを前に出せない)、 後ろに足した分 (eid がばらばら) の cell の
+/// 読みが重ならなかった。
+#[inline(always)]
+fn holds_value(col: &Column, eid: u32, value: u64) -> bool {
+    let stored = if col.value_size == 8 { col.load_u64_relaxed(eid) } else { u64::from(col.load_u32_relaxed(eid)) };
+    stored == value + 1
+}
+
 /// `get_value` の col 受け取り版。
 #[inline(always)]
 fn value_at(col: &Column, eid: u32) -> Option<u64> {
@@ -502,9 +513,10 @@ impl HimoStore {
     /// open 時の load。 cylinder は空のまま返し、最初の cyl 触りで
     /// `ensure_cylinder_built` 経由で rebuild する（reopen latency を膨らませないため）。
     /// `max_entities` / `padded` は header が一度も届いていない列を組む時だけ使う (`Column::load_or_unwritten`)。
-    pub fn load(col_region: Region, ht: ValueType, max_values: u32, max_entities: u32, padded: bool) -> Self {
-        let col = Column::load_or_unwritten(col_region, ht.width(), max_entities, padded);
-        Self {
+    /// 列の header が壊れていれば Err (`Column::load_or_unwritten`、 #526)。
+    pub fn load(col_region: Region, ht: ValueType, max_values: u32, max_entities: u32, padded: bool) -> Result<Self, String> {
+        let col = Column::load_or_unwritten(col_region, ht.width(), max_entities, padded)?;
+        Ok(Self {
             col: ready(col),
             #[cfg(not(target_arch = "wasm32"))]
             lazy: None,
@@ -517,7 +529,7 @@ impl HimoStore {
             gate: WriteGate::new(),
             vlocks: OnceLock::new(),
             present: PresentCount::new(false),
-        }
+        })
     }
 
     /// `load` の遅延版 (request23 D2) — column region の mmap を最初の read/write
@@ -574,10 +586,12 @@ impl HimoStore {
             .lazy
             .as_ref()
             .expect("HimoStore column is neither loaded nor lazy");
-        self.col
-            .get_or_init(|| {
-                Column::load_or_unwritten(lazy.set.region(lazy.kind), self.value_type.width(), lazy.max_entities, lazy.padded)
-            })
+        self.col.get_or_init(|| {
+            // directory の DB は列を最初に触る時に読むので、 開く時に Err にできない (#526): 壊れた header は panic で止める
+            // (そのまま組むと、 幅の合わない cell を読む所で意味の分からない panic になる)
+            Column::load_or_unwritten(lazy.set.region(lazy.kind), self.value_type.width(), lazy.max_entities, lazy.padded)
+                .unwrap_or_else(|e| panic!("himo column segment {:?}: {e}", lazy.kind))
+        })
     }
 
     /// cylinder を組む時の dense の窓の始まりを置く (ref の紐 = 指す先の表の eid の始まり)。 組んだ後は効かない。
@@ -715,7 +729,7 @@ impl HimoStore {
                 hook::at("inside_value_locks");
                 // 値更新: 旧 value の bucket に stale が残る → その bucket の read は verify する。
                 // Column を書き換える **前** に flag を立てる (request12、順序契約は note_stale 参照)
-                let stale = old.and_then(|o| cyl.note_stale(o).map(|s| (o, s)));
+                let stale = old.and_then(|o| cyl.note_stale_in(o, &guard).map(|s| (o, s)));
                 // #106: Release store。 leaf offset を publish する前に書いた LeafStore slot
                 // (payload/gen) を、 offset を Acquire で読む reader が必ず観測できるようにする。
                 store_at(col, eid, value + 1);
@@ -725,7 +739,7 @@ impl HimoStore {
                 cyl.push_in_array(eid, value, &guard);
                 // compaction は Column 更新の **後** (keep = value_eq が新状態を見るため)。 古い値の鍵の下で
                 if let Some((o, (len, live))) = stale {
-                    self.maybe_compact(o, len, live);
+                    self.maybe_compact(o, len, live, &guard);
                 }
                 return true;
             }
@@ -739,7 +753,7 @@ impl HimoStore {
         // 伸ばすなら全部の鍵 (配列を写す間に他の書き手が bucket を置くと消える)、 伸ばさないなら配列の中の側の値の鍵
         let _all = grow.then(|| locks.lock_all());
         let _held = (!grow).then(|| locks.lock_pair(old_in, new_in.then_some(value)));
-        let stale = old.and_then(|o| cyl.note_stale(o).map(|s| (o, s)));
+        let stale = old.and_then(|o| cyl.note_stale_in(o, &guard).map(|s| (o, s)));
         store_at(col, eid, value + 1);
         if old.is_none() {
             self.present.add(1);
@@ -750,7 +764,7 @@ impl HimoStore {
             cyl.insert_with(eid, value, grow, |v, e| stored_sync(col, e) == v + 1);
         }
         if let Some((o, (len, live))) = stale {
-            self.maybe_compact(o, len, live);
+            self.maybe_compact(o, len, live, &guard);
         }
         self.maybe_compact_sparse(&self.cyl);
         true
@@ -860,11 +874,11 @@ impl HimoStore {
             let guard = epoch::pin();
             if cyl.in_array(o, &guard) {
                 let _held = self.vlocks().lock_pair(Some(o), None);
-                let stale = cyl.note_stale(o);
+                let stale = cyl.note_stale_in(o, &guard);
                 col.clear(eid);
                 self.present.add(-1);
                 if let Some((len, live)) = stale {
-                    self.maybe_compact(o, len, live);
+                    self.maybe_compact(o, len, live, &guard);
                 }
                 return;
             }
@@ -874,11 +888,11 @@ impl HimoStore {
         let _w = self.write_lock.lock();
         let guard = epoch::pin();
         let _held = cyl.in_array(o, &guard).then(|| self.vlocks().lock_pair(Some(o), None));
-        let stale = cyl.note_stale(o);
+        let stale = cyl.note_stale_in(o, &guard);
         col.clear(eid);
         self.present.add(-1);
         if let Some((len, live)) = stale {
-            self.maybe_compact(o, len, live);
+            self.maybe_compact(o, len, live, &guard);
         }
         self.maybe_compact_sparse(cyl);
     }
@@ -887,12 +901,12 @@ impl HimoStore {
     /// その値の鍵の下 (bucket の書き手 1 本)・Column 更新後に呼ぶこと。trigger は stale 率 50% なので
     /// amortized O(1)/write (Vec doubling と同じ理屈 — 組み直し後の stale は 0、
     /// 次の trigger までに live 相当数の churn が必要)。
-    fn maybe_compact(&self, value: u64, len: usize, live: u32) {
+    fn maybe_compact(&self, value: u64, len: usize, live: u32, guard: &Guard) {
         if len >= COMPACT_MIN_LEN && (len - live as usize) * 2 >= len {
             let col = self.col();
             hook::at("compacting");
-            // 他の値の書き手が並んでいるので atomic に読む (`stored_sync`)
-            self.cyl.compact_bucket(value, |eid| stored_sync(col, eid) == value + 1);
+            // 他の値の書き手が並んでいるので atomic に読む (`holds_value`)
+            self.cyl.compact_bucket_in(value, guard, |eid| holds_value(col, eid, value));
         }
     }
 
@@ -916,7 +930,7 @@ impl HimoStore {
         let Some(_held) = self.vlocks().try_lock(value) else { return false };
         let col = self.col();
         hook::at("read_compacting");
-        self.cyl.compact_bucket(value, |eid| stored_sync(col, eid) == value + 1);
+        self.cyl.compact_bucket(value, |eid| holds_value(col, eid, value));
         true
     }
 
@@ -1088,7 +1102,7 @@ impl HimoStore {
             cyl.insert(eid, n, |v, e| stored_at(col, e) == v + 1);
         }
         if let Some((o, (len, live))) = stale {
-            self.maybe_compact(o, len, live);
+            self.maybe_compact(o, len, live, &epoch::pin());
         }
         if let Some(cyl) = cyl {
             self.maybe_compact_sparse(cyl);
@@ -1476,7 +1490,7 @@ mod tests {
     #[test]
     fn load_of_never_written_header_is_an_empty_column() {
         for ht in [ValueType::Leaf, ValueType::Number, ValueType::Number64] {
-            let hs = HimoStore::load(heap_region(64 * 1024), ht, 0, 64, false);
+            let hs = HimoStore::load(heap_region(64 * 1024), ht, 0, 64, false).unwrap();
             let mut n = 0;
             hs.for_each_set_value(|_| n += 1);
             assert_eq!(n, 0, "{ht:?}");
@@ -1541,7 +1555,7 @@ mod tests {
         chk(&hs, 2, "組んだ後の set 2 つ目");
         drop(hs);
         // 開いた紐: 数を引く前に書いた分 (2 足して 1 引く) も入る
-        let re = HimoStore::load(region(), ValueType::Number, 0, 64, false);
+        let re = HimoStore::load(region(), ValueType::Number, 0, 64, false).unwrap();
         assert!(re.set(10, 1));
         assert!(re.set(11, 1));
         re.remove(6);

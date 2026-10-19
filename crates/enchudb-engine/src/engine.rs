@@ -2585,13 +2585,15 @@ impl Backing {
     /// himo 1 本分の `HimoStore` を作る。 v10 (`Segments`) では column の mmap を
     /// 最初の read/write まで遅らせる (request23 D2) — そのコマンドが触らない himo は
     /// `open(2)` すら払わない。 `Memory` backing は既に全域が blob 上にあるので即解決。
-    fn himo_store(&self, hid: u32, layout: &Layout, ht: ValueType, max_values: u32) -> HimoStore {
+    /// 1 ファイル (`Memory`) の列は header を今確かめる (壊れていれば Err、 #526)。
+    fn himo_store(&self, hid: u32, layout: &Layout, ht: ValueType, max_values: u32) -> Result<HimoStore, String> {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
             Backing::Segments(set) => {
-                HimoStore::load_lazy(set.clone(), SegmentKind::Himo(hid), ht, max_values, layout.max_entities, layout.col_pad)
+                Ok(HimoStore::load_lazy(set.clone(), SegmentKind::Himo(hid), ht, max_values, layout.max_entities, layout.col_pad))
             }
-            _ => HimoStore::load(self.region(SegmentKind::Himo(hid), layout), ht, max_values, layout.max_entities, layout.col_pad),
+            _ => HimoStore::load(self.region(SegmentKind::Himo(hid), layout), ht, max_values, layout.max_entities, layout.col_pad)
+                .map_err(|e| format!("himo {hid}: {e}")),
         }
     }
 
@@ -5645,7 +5647,7 @@ impl Engine {
             let name = String::from_utf8_lossy(name_bytes).to_string();
             let effective_mv = mv.min(cyl_max_values);
 
-            let hs = backing.himo_store(hid as u32, &layout, ht, effective_mv);
+            let hs = backing.himo_store(hid as u32, &layout, ht, effective_mv)?;
             if has_cell_version {
                 let _ = ver_cols.push(ver_column_from_region(
                     backing.region(SegmentKind::Ver(hid as u32), &layout),
@@ -21679,6 +21681,39 @@ mod v10_dir_tests {
         let err = Engine::migrate_v9_to_v10(&packed, &dst).err().unwrap();
         assert!(err.to_string().contains("#257") && err.to_string().contains("non-zero"), "{err}");
         assert!(!std::path::Path::new(&dst).exists());
+    }
+
+    /// #526: 列の header が壊れた packed DB は、 開く時に Err (前は開けてしまい、 読みで `stored_at` が panic した。 fuzzing
+    /// が見つけた形は header の後ろの欄 (CRC が覆わない Leaf 領域の大きさ) が壊れて列の region がずれたもの)。 列の header の
+    /// 値の幅 (紐の型の幅と違う)・cell の位置 (2 つの形のどちらでもない)・件数 (cell が region に入らない) を 1 つずつ壊す。
+    /// 対照: 壊さない packed は開けて読める。 幅 0 (header が届いていない列、 #414) は今まで通り開ける。
+    #[test]
+    fn packed_with_a_corrupt_column_header_fails_to_open() {
+        let path = tmp("pack_colhdr");
+        let rows = seed_with(&path, None);
+        let packed = format!("{path}.packed");
+        Engine::pack_dir(&path, std::path::Path::new(&packed)).unwrap();
+        let base = std::fs::read(&packed).unwrap();
+        let eng = Engine::from_bytes(base.clone()).unwrap();
+        let hid = eng.himo_id("widgets.n").unwrap();
+        assert_eq!(eng.pull_raw("widgets.n", rows[0].1), vec![rows[0].0], "対照: 壊さない packed が読めない");
+        drop(eng);
+        let (mut layout, _) = Engine::parse_header(&base, true).unwrap();
+        layout.col_pad = false; // packed の列は cell を離さない (`load_from_backing` と同じ)
+        let col = layout.region_off(SegmentKind::Himo(hid as u32));
+        assert_eq!(u32::from_le_bytes(base[col + 4..col + 8].try_into().unwrap()), 4, "前提: 列の header の値の幅");
+        // 列の header: 0..4 件数、 4..8 値の幅、 12..16 cell の位置
+        for (name, at, v) in [("値の幅", col + 4, 3u32), ("cell の位置", col + 12, 20), ("件数", col, u32::MAX)] {
+            let mut b = base.clone();
+            b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+            let err = Engine::from_bytes(b).err().unwrap_or_else(|| panic!("{name} の壊れた列で開けた"));
+            assert!(err.contains("column header corrupt"), "{name}: {err}");
+        }
+        let mut b = base.clone();
+        b[col + 4..col + 8].copy_from_slice(&0u32.to_le_bytes());
+        assert!(Engine::from_bytes(b).is_ok(), "幅 0 (header の届いていない列) で開けない");
+        let _ = std::fs::remove_dir_all(&path);
+        let _ = std::fs::remove_file(&packed);
     }
 
     /// #252 の裏: v10 packed (`pack_dir` 産) は常に `total_size` 長なので、 短いものは

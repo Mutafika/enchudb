@@ -1,0 +1,65 @@
+name: fuzz
+
+# 継続 fuzzing (#98 ②)。 外から届く bytes を読む入口に、 libFuzzer (cargo-fuzz、 nightly + AddressSanitizer) で壊れた /
+# 悪意のある入力を流し続ける。 的は fuzz/fuzz_targets/ (doc はそれぞれの file の頭):
+#   - wire_decode  : peer / relay から届く batch (`transport::decode_batch`)
+#   - sync_payload : `_sync_ops` の行の payload と op の decoder (`decode_sync_ops_payload`)
+#   - oplog_file   : 壊れた / 切れた `.oplog` の open と読み直し
+#   - packed_open  : 壊れた packed DB (`Engine::from_bytes`、 bootstrap / wasm の入口)
+#   - sql_exec     : SQL の文の並び (`enchudb_sql::Database::execute`)
+#
+# 1 回きりにしない: 毎日回し、 見つけた入力の集まり (corpus) を cache に残して次の回が続きから探す。 種は
+# `cd fuzz && cargo run --release --bin make_seeds` が作る (全部の op の種類の record・SQL の文など)。 落ちた入力は
+# artifact に上がる (手元で `cargo +nightly fuzz run <target> <file>` で再現)。 PR ごとには回さない (nightly の build だけで
+# 数分かかる)。 手で回すときは workflow_dispatch (秒数を指定できる)。
+
+on:
+  schedule:
+    - cron: "17 18 * * *" # 毎日 03:17 JST
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: 1 つの的を回す秒数
+        default: "600"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wire_decode, sync_payload, oplog_file, packed_open, sql_exec]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # 前の回までの corpus (fuzz/corpus/<target>/、 repo には置かない)。 種 (fuzz/seeds/<target>/、 repo にある) も毎回読む
+      - uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: cargo fuzz run
+        run: |
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          cargo fuzz run -O ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- \
+            -max_total_time=${{ inputs.seconds || '600' }} -rss_limit_mb=4096 -timeout=30
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
