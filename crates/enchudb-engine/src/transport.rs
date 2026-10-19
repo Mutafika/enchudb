@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use enchudb_oplog::oplog::{DecodedOp, Record};
+use enchudb_oplog::oplog::{op_type, DecodedOp, Record};
 use enchudb_oplog::{Hlc, PeerId};
 
 /// peer 間で交換する 1 件の op。
@@ -357,7 +357,19 @@ pub fn encode_batch(records: &[WireRecord]) -> Vec<u8> {
 /// 署名対象の長さ 4 + op の種類 1 (署名対象も op の中身も空の時)。
 const MIN_WIRE_RECORD_LEN: usize = 1 + 16 + 4 + 64 + 8 + 4 + 1;
 
+/// [`decode_batch`] が読み飛ばした record の累計 (process 全体)。
+static SKIPPED_RECORDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// #178: [`decode_batch`] が読み飛ばした record の累計 (process 全体): 知らない版が書いた 「読み飛ばしてよい」 op
+/// ([`op_type::SKIPPABLE`] の印)。 0 が常態。 0 でなければ、 この binary より新しい版の peer の record を受けている。
+pub fn skipped_records() -> u64 {
+    SKIPPED_RECORDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `encode_batch` の逆。
+///
+/// 知らない op の record は、 印 ([`op_type::SKIPPABLE`]) があればその record だけ飛ばして数え ([`skipped_records`])、
+/// 無ければ今まで通り batch ごと `UnknownOpTag` (#178)。
 pub fn decode_batch(buf: &[u8]) -> Result<Vec<WireRecord>, WireDecodeError> {
     if buf.len() < 4 { return Err(WireDecodeError::Truncated); }
     let count = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
@@ -374,7 +386,16 @@ pub fn decode_batch(buf: &[u8]) -> Result<Vec<WireRecord>, WireDecodeError> {
         let rec_len = u32::from_le_bytes(buf[p..p+4].try_into().unwrap()) as usize;
         p += 4;
         if p + rec_len > buf.len() { return Err(WireDecodeError::Truncated); }
-        let (rec, consumed) = WireRecord::decode(&buf[p..p+rec_len])?;
+        let (rec, consumed) = match WireRecord::decode(&buf[p..p+rec_len]) {
+            Ok(x) => x,
+            // record は長さで区切られているので、 中身を知らなくても次の record へ進める
+            Err(WireDecodeError::UnknownOpTag(t)) if op_type::skippable(t) => {
+                SKIPPED_RECORDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                p += rec_len;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         if consumed != rec_len {
             return Err(WireDecodeError::Truncated);
         }
@@ -1095,6 +1116,44 @@ mod tests {
             assert_eq!(used, enc.len());
             // op 比較は Debug 文字列で代用 (PartialEq 無いため)
             assert_eq!(format!("{:?}", dec.op), format!("{:?}", orig.op));
+        }
+    }
+
+    /// #178: 知らない op の record は、 印 (`op_type::SKIPPABLE`) があればその record だけ飛ばして前後を読み (数える)、
+    /// 印が無ければ batch ごと `UnknownOpTag`。 3 件の batch の真ん中の op の印を書き換える。
+    #[test]
+    fn decode_batch_skips_only_skippable_unknown_ops() {
+        let recs: Vec<WireRecord> = (1..=3u64)
+            .map(|eid| WireRecord::unsigned(Hlc { wall: eid, logical: 0, peer: 1 }, 1, DecodedOp::Delete { eid }))
+            .collect();
+        let enc = encode_batch(&recs);
+        // 2 件目の op の印の位置: 件数 4 + (長さ 4 + 1 件目) + 長さ 4 + (version 1 + HLC 16 + author 4 + 署名 64 + 鍵の印 8 +
+        // 署名対象の長さ 4 + 署名対象)
+        let first = recs[0].encode().len();
+        let tag_at = 4 + 4 + first + 4 + 1 + 16 + 4 + 64 + 8 + 4 + recs[1].signed_bytes.len();
+        assert_eq!(enc[tag_at], 2, "前提: Delete の印");
+        for (tag, skip) in [(op_type::SKIPPABLE | 1, true), (0x41, false)] {
+            let mut b = enc.clone();
+            b[tag_at] = tag;
+            let before = skipped_records();
+            match decode_batch(&b) {
+                Ok(got) => {
+                    assert!(skip, "印の無い知らない op {tag:#x} が読めた");
+                    let eids: Vec<u64> = got
+                        .iter()
+                        .map(|r| match r.op {
+                            DecodedOp::Delete { eid } => eid,
+                            ref o => panic!("Delete 以外: {o:?}"),
+                        })
+                        .collect();
+                    assert_eq!(eids, vec![1, 3], "飛ばした前後の record");
+                    assert!(skipped_records() > before, "飛ばした数を数えていない");
+                }
+                Err(e) => {
+                    assert!(!skip, "印の付いた知らない op {tag:#x} で batch が読めない: {e}");
+                    assert!(matches!(e, WireDecodeError::UnknownOpTag(0x41)), "{e}");
+                }
+            }
         }
     }
 
