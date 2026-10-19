@@ -1,5 +1,5 @@
 //! fuzz の種 (`seeds/<target>/`、 repo に置く) を作る。 libFuzzer が見つけた入力は `corpus/<target>/` (置かない) に溜まる。 `cargo run --release --bin make_seeds` (fuzz/ の中で)。
-//! oplog に全部の op の種類を書いて読み戻し、 その file (`oplog_file`)・record ごとの `_sync_ops` の payload
+//! oplog に全部の op の種類 (#178 の Alias も) を書いて読み戻し、 その file (`oplog_file`)・record ごとの `_sync_ops` の payload
 //! (`sync_payload`)・wire の batch (`wire_decode`) を置く。 SQL は文の並びを数本 (`sql_exec`)。
 use enchudb_engine::transport::{encode_batch, WireRecord};
 use enchudb_oplog::oplog::{Op, OpLog};
@@ -29,6 +29,7 @@ fn main() {
             Op::TieNamed { eid, himo_name: "users.at", himo_kind: 4, value: 1 << 41 },
             Op::TieLeaf { eid, himo_name: "users.name", himo_kind: 3, bytes: b"alice" },
             Op::TieRef { eid, himo_id: 4, target: enchudb_oplog::make_eid(9, 1) },
+            Op::Alias { eid, same_as: enchudb_oplog::make_eid(9, 4) },
             Op::Delete { eid },
         ];
         for op in ops {
@@ -36,7 +37,7 @@ fn main() {
         }
         log.append(Op::Commit).unwrap();
         let recs = log.recover();
-        assert_eq!(recs.len(), 10, "種の record が全部読めない");
+        assert_eq!(recs.len(), 11, "種の record が全部読めない");
         let mut wire = Vec::new();
         for (i, r) in recs.iter().enumerate() {
             let mut payload = Vec::new();

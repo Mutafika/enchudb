@@ -170,6 +170,12 @@ impl WireRecord {
                 out.extend_from_slice(&himo_id.to_le_bytes());
                 out.extend_from_slice(&target.to_le_bytes());
             }
+            DecodedOp::Alias { eid, same_as } => {
+                // #178: 読み飛ばしてよい印付き (oplog の op の種類と同じ番号)
+                out.push(op_type::ALIAS);
+                out.extend_from_slice(&eid.to_le_bytes());
+                out.extend_from_slice(&same_as.to_le_bytes());
+            }
         }
         out
     }
@@ -298,6 +304,12 @@ impl WireRecord {
                 let himo_id = u16::from_le_bytes(buf[p..p+2].try_into().unwrap()); p += 2;
                 let target = u64::from_le_bytes(buf[p..p+8].try_into().unwrap()); p += 8;
                 DecodedOp::TieRef { eid, himo_id, target }
+            }
+            op_type::ALIAS => {
+                need(p, 16, buf)?;
+                let eid = u64::from_le_bytes(buf[p..p+8].try_into().unwrap()); p += 8;
+                let same_as = u64::from_le_bytes(buf[p..p+8].try_into().unwrap()); p += 8;
+                DecodedOp::Alias { eid, same_as }
             }
             other => return Err(WireDecodeError::UnknownOpTag(other)),
         };
@@ -1108,6 +1120,7 @@ mod tests {
                 data: b"binary \x00\x01\xff payload".to_vec(),
             },
             DecodedOp::Commit,
+            DecodedOp::Alias { eid: 0x0000_0002_0000_0009, same_as: 0x0000_0001_0000_0004 },
         ];
         for op in variants {
             let orig = WireRecord::unsigned(Hlc { wall: 1, logical: 0, peer: 1 }, 1, op);
@@ -1132,7 +1145,7 @@ mod tests {
         let first = recs[0].encode().len();
         let tag_at = 4 + 4 + first + 4 + 1 + 16 + 4 + 64 + 8 + 4 + recs[1].signed_bytes.len();
         assert_eq!(enc[tag_at], 2, "前提: Delete の印");
-        for (tag, skip) in [(op_type::SKIPPABLE | 1, true), (0x41, false)] {
+        for (tag, skip) in [(op_type::SKIPPABLE | 0x7f, true), (0x41, false)] {
             let mut b = enc.clone();
             b[tag_at] = tag;
             let before = skipped_records();

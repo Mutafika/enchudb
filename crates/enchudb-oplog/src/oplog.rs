@@ -267,7 +267,8 @@ pub fn resign_with_eid(
         | DecodedOp::TieNamed { .. }
         | DecodedOp::TieLeaf { .. }
         | DecodedOp::TieRef { .. } => {}
-        DecodedOp::Commit | DecodedOp::Vocab { .. } => return None,
+        // #178: Alias の 2 つの eid は書いた時から世界番号 (宛名を書き戻さない)
+        DecodedOp::Commit | DecodedOp::Vocab { .. } | DecodedOp::Alias { .. } => return None,
     }
     let mut sb = rec.signed_bytes.clone();
     if sb.len() < SIGNED_PAYLOAD_HEADER_SIZE + 8 {
@@ -376,6 +377,10 @@ pub mod op_type {
     /// この bit を読める版より前の peer は、 bit の付いた op でも止まる。
     pub const SKIPPABLE: u8 = 0x80;
 
+    /// #178: 「`eid` と `same_as` は同じ entity」 の知らせ。 payload は eid(8) + same_as(8)。 読み飛ばされても複製は今まで通り
+    /// (同じ entity が 2 行のまま) なので [`SKIPPABLE`] の印を付ける。
+    pub const ALIAS: u8 = SKIPPABLE | 1;
+
     /// `op` が [`SKIPPABLE`] の印を持つか。
     #[inline]
     pub const fn skippable(op: u8) -> bool {
@@ -448,6 +453,10 @@ pub enum Op<'a> {
     /// record からこの variant で `append_relayed` する。 layout は decode 側
     /// (op_type::TIE_REF) と同一: eid(8) + himo_id(2) + pad(2) + target(8)。
     TieRef { eid: u64, himo_id: u16, target: u64 },
+    /// #178: 「`eid` と `same_as` は同じ entity」 (どちらも世界番号)。 2 台が同じ自然キーの行を別々に作ってから束ねた側が書く
+    /// (束ねる前に出て行った書き込みが、 相手で別の行になっている)。 受け手は 2 つを 1 行に畳む。 op の種類は
+    /// [`op_type::ALIAS`] (読み飛ばしてよい印付き)。
+    Alias { eid: u64, same_as: u64 },
 }
 
 impl<'a> Op<'a> {
@@ -468,6 +477,7 @@ impl<'a> Op<'a> {
             // eid(8) + kind(1) + pad(1) + name_len(2) + bytes_len(4) + name + bytes
             Op::TieLeaf { himo_name, bytes, .. } => 16 + himo_name.len() + bytes.len(),
             Op::TieRef { .. } => 20, // eid(8) + himo_id(2) + pad(2) + target(8)
+            Op::Alias { .. } => 16,  // eid(8) + same_as(8)
         }
     }
 
@@ -484,6 +494,7 @@ impl<'a> Op<'a> {
             Op::TieNamed { .. } => op_type::TIE_NAMED,
             Op::TieLeaf { .. } => op_type::TIE_LEAF,
             Op::TieRef { .. } => op_type::TIE_REF,
+            Op::Alias { .. } => op_type::ALIAS,
         }
     }
 
@@ -567,6 +578,10 @@ impl<'a> Op<'a> {
                 buf[10..12].copy_from_slice(&[0, 0]);
                 buf[12..20].copy_from_slice(&target.to_le_bytes());
             }
+            Op::Alias { eid, same_as } => {
+                buf[0..8].copy_from_slice(&eid.to_le_bytes());
+                buf[8..16].copy_from_slice(&same_as.to_le_bytes());
+            }
         }
     }
 }
@@ -593,6 +608,8 @@ pub enum DecodedOp {
     /// 受信側は `target` を「産みの親」key (0.11 semantics) で ref target table
     /// 空間の local eid へ翻訳する。
     TieRef { eid: u64, himo_id: u16, target: u64 },
+    /// #178: [`Op::Alias`]。
+    Alias { eid: u64, same_as: u64 },
 }
 
 /// リカバリ結果の 1 レコード(HLC + 署名込み)。
@@ -2321,6 +2338,11 @@ fn decode_op(op_byte: u8, payload: &[u8]) -> Option<DecodedOp> {
             let target = u64::from_le_bytes(payload[12..20].try_into().unwrap());
             Some(DecodedOp::TieRef { eid, himo_id, target })
         }
+        op_type::ALIAS if payload.len() >= 16 => {
+            let eid = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+            let same_as = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+            Some(DecodedOp::Alias { eid, same_as })
+        }
         _ => None,
     }
 }
@@ -3232,13 +3254,33 @@ mod tests {
     /// record が読めないのか、 record は在るが Commit が付いていないのか。
     /// 従来はどちらも 「0 件」 としか見えず、 実機 26.4 時間の停止を後から特定
     /// できなかった。 診断値がその 2 つを名指しで分けることを固定する。
+    /// #178: Alias は書いて読み戻せる (2 つの世界番号)、 op の種類は読み飛ばしてよい印付き、 宛名の書き戻し (`resign_with_eid`)
+    /// をしない。
+    #[test]
+    fn alias_round_trips_and_is_skippable() {
+        assert!(op_type::skippable(op_type::ALIAS));
+        let p = tmp("alias-rt");
+        let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+        let (eid, same_as) = (crate::make_eid(2, 9), crate::make_eid(1, 4));
+        wal.append(Op::Alias { eid, same_as }).unwrap();
+        wal.append(Op::Commit).unwrap();
+        let recs = wal.recover();
+        assert_eq!(recs.len(), 1);
+        match recs[0].op {
+            DecodedOp::Alias { eid: e, same_as: s } => assert_eq!((e, s), (eid, same_as)),
+            ref o => panic!("Alias でない: {o:?}"),
+        }
+        assert!(resign_with_eid(&recs[0], crate::make_eid(3, 3), None).is_none(), "Alias の宛名を書き戻した");
+        let _ = std::fs::remove_file(&p);
+    }
+
     /// #178: 知らない op は、 上の bit (`op_type::SKIPPABLE`) があればその record だけ読み飛ばして後ろを読む (数える)。
     /// bit が無ければ今まで通り scan を打ち切る (後ろの record は出ない)。 3 つの Tie の真ん中の op の種類を書き換え、
     /// CRC を付け直して開き直す。
     #[test]
     fn unknown_skippable_op_is_skipped_but_unknown_critical_op_stops() {
         for (op_byte, want, stop, skipped) in [
-            (op_type::SKIPPABLE | 1, vec![1u64, 3], ScanStop::Head, 1u64),
+            (op_type::SKIPPABLE | 0x7f, vec![1u64, 3], ScanStop::Head, 1u64),
             (0x41, vec![1u64], ScanStop::UndecodableOp, 0u64),
         ] {
             let p = tmp(&format!("skippable-{op_byte}"));
