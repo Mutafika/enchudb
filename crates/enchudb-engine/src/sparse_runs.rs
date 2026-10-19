@@ -40,10 +40,12 @@ impl Run {
         self.vals.len()
     }
 
-    /// `lo..=hi` の値を持つ entry の添字の範囲。
+    /// `lo..=hi` の値を持つ entry の添字の範囲。 端が run の最初 / 最後の値の外なら、 その端は二分探索しない (上位 k 件・最小 /
+    /// 最大の読みは片方の端が列の端なので、 run ごとの二分探索が 1 回で済む)。
     fn span(&self, lo: u64, hi: u64) -> std::ops::Range<usize> {
-        let a = self.vals.partition_point(|&v| v < lo);
-        let b = self.vals.partition_point(|&v| v <= hi);
+        let (Some(&first), Some(&last)) = (self.vals.first(), self.vals.last()) else { return 0..0 };
+        let a = if lo <= first { 0 } else { self.vals.partition_point(|&v| v < lo) };
+        let b = if hi >= last { self.vals.len() } else { self.vals.partition_point(|&v| v <= hi) };
         a..b.max(a)
     }
 
@@ -96,17 +98,28 @@ impl SparseSnap<'_> {
         if lo > hi {
             return ControlFlow::Continue(());
         }
-        let runs: Vec<&Run> = self.set.all().filter(|r| r.len() > 0).collect();
-        // run ごとの、 まだ渡していない添字の範囲
-        let mut left: Vec<std::ops::Range<usize>> = runs.iter().map(|r| r.span(lo, hi)).collect();
-        let mut buf = Vec::new();
+        // run ごとの、 まだ渡していない添字の範囲 (範囲に entry の無い run は持たない)。 本数は分かっているので先に取る (`filter`
+        // の collect は伸ばしながら確保し直す。 上位 k 件の読みでは確保が時間の 2 割だった)
+        let mut runs: Vec<&Run> = Vec::with_capacity(self.set.runs.len() + 1);
+        let mut left: Vec<std::ops::Range<usize>> = Vec::with_capacity(self.set.runs.len() + 1);
+        for r in self.set.all() {
+            let s = r.span(lo, hi);
+            if !s.is_empty() {
+                runs.push(r);
+                left.push(s);
+            }
+        }
+        // 値を持つ run が 2 本以上の時だけ使う (たいていは 1 本の区間をそのまま渡し、 写さない)
+        let mut buf: Vec<u32> = Vec::new();
         loop {
             // 次の値: 昇順なら残りの先頭の最小、 降順なら残りの末尾の最大
             let ends = runs.iter().zip(&left).filter(|(_, s)| !s.is_empty());
             let next = if desc { ends.map(|(r, s)| r.vals[s.end - 1]).max() } else { ends.map(|(r, s)| r.vals[s.start]).min() };
             let Some(v) = next else { return ControlFlow::Continue(()) };
             buf.clear();
-            // 頭の昇順の長さ: 頭が全部 (= buf の長さ) の間だけ、 次の区間が前の最後以上なら区間ごと伸ばす
+            // 値 v の区間。 1 本目は控えるだけ、 2 本目が来たら buf につなぐ
+            let mut single: Option<&[u32]> = None;
+            // 頭の昇順の長さ: 頭が全部 (= つないだ長さ) の間だけ、 次の区間が前の最後以上なら区間ごと伸ばす
             let mut head = 0;
             for (r, s) in runs.iter().zip(left.iter_mut()) {
                 let seg = if desc {
@@ -126,15 +139,28 @@ impl SparseSnap<'_> {
                     s.start = b;
                     seg
                 };
-                if let Some(&first) = seg.first()
-                    && head == buf.len()
-                    && buf.last().is_none_or(|&last| last <= first)
-                {
+                let Some(&first) = seg.first() else { continue };
+                let joined = match single.take() {
+                    None if buf.is_empty() => {
+                        single = Some(seg);
+                        head = seg.len();
+                        continue;
+                    }
+                    Some(prev) => {
+                        buf.extend_from_slice(prev);
+                        prev.len()
+                    }
+                    None => buf.len(),
+                };
+                if head == joined && buf.last().is_none_or(|&last| last <= first) {
                     head += seg.len();
                 }
                 buf.extend_from_slice(seg);
             }
-            f(v, &buf, head)?;
+            match single {
+                Some(seg) => f(v, seg, head)?,
+                None => f(v, &buf, head)?,
+            }
         }
     }
 
@@ -448,6 +474,78 @@ mod tests {
         }
         assert!(cut > 0, "対照: 頭が途中で切れる値が無い");
         assert!(across > 0, "対照: 頭が全部の値が無い");
+    }
+
+    /// `walk` が渡す値と eid が、 全 entry を持つ素朴な Vec と同じ: 値ごとに 1 回、 値の順 (逆順も)、 eid は顔ぶれで比べる。 値は
+    /// eid が 1 つの値 (1 本の run の区間をそのまま渡す) と、 いくつもの run にまたがる値 (つないで渡す) を混ぜる。 範囲の端は run の
+    /// 最初 / 最後の値ちょうど・その外・中を混ぜる (端が外なら二分探索を省く `Run::span`)。 途中で止めたら、 そこまでの値。
+    #[test]
+    fn walk_matches_a_plain_vec() {
+        let s = SparseRuns::default();
+        let mut all: Vec<(u64, u32)> = Vec::new();
+        let mut rng = Rng(0x5a55_0003);
+        let n = if cfg!(miri) { 400u32 } else { 6_000 };
+        for eid in 0..n {
+            // 半分は 50 通りの値 (いくつもの run にまたがる)、 半分はばらばら (たいてい 1 本の run にだけある)
+            let v = if rng.next().is_multiple_of(2) { (1u64 << 40) + rng.next() % 50 } else { (1u64 << 40) + 1000 + rng.next() % (1 << 30) };
+            s.insert(v, eid);
+            all.push((v, eid));
+        }
+        assert!(s.run_count() >= 2, "run が 1 本だけ");
+        let mut vals: Vec<u64> = all.iter().map(|p| p.0).collect();
+        vals.sort_unstable();
+        vals.dedup();
+        let (min, max) = (vals[0], *vals.last().unwrap());
+        let want = |lo: u64, hi: u64, desc: bool| -> Vec<(u64, Vec<u32>)> {
+            let mut out: Vec<(u64, Vec<u32>)> = vals
+                .iter()
+                .filter(|&&v| lo <= v && v <= hi)
+                .map(|&v| {
+                    let mut e: Vec<u32> = all.iter().filter(|p| p.0 == v).map(|p| p.1).collect();
+                    e.sort_unstable();
+                    (v, e)
+                })
+                .collect();
+            if desc {
+                out.reverse();
+            }
+            out
+        };
+        let (mut single, mut multi) = (0, 0);
+        let mut ends: Vec<(u64, u64)> = vec![(0, u64::MAX), (min, max), (min + 1, max - 1), (max, max), (min, min), (max + 1, u64::MAX), (0, min - 1)];
+        for _ in 0..200 {
+            let a = vals[(rng.next() % vals.len() as u64) as usize];
+            let b = vals[(rng.next() % vals.len() as u64) as usize];
+            ends.push((a.min(b), a.max(b)));
+            ends.push((a.min(b) + 1, a.max(b)));
+        }
+        for (lo, hi) in ends {
+            for desc in [false, true] {
+                let mut got: Vec<(u64, Vec<u32>)> = Vec::new();
+                let _ = s.snapshot(|sp| {
+                    sp.walk(lo, hi, desc, |v, eids, _| {
+                        let mut e = eids.to_vec();
+                        e.sort_unstable();
+                        single += usize::from(e.len() == 1);
+                        multi += usize::from(e.len() > 1);
+                        got.push((v, e));
+                        ControlFlow::Continue(())
+                    })
+                });
+                assert_eq!(got, want(lo, hi, desc), "walk {lo}..={hi} desc {desc}");
+                // 3 つ目の値で止める
+                let mut cut: Vec<u64> = Vec::new();
+                let _ = s.snapshot(|sp| {
+                    sp.walk(lo, hi, desc, |v, _, _| {
+                        cut.push(v);
+                        if cut.len() == 3 { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+                    })
+                });
+                let w: Vec<u64> = want(lo, hi, desc).into_iter().take(3).map(|p| p.0).collect();
+                assert_eq!(cut, w, "止めた walk {lo}..={hi} desc {desc}");
+            }
+        }
+        assert!(single > 0 && multi > 0, "対照: eid が 1 つの値 {single}・2 つ以上の値 {multi}");
     }
 
     /// 同じ `(値, eid)` の重複は rebuild で 1 つになる。

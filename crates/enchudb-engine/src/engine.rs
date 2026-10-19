@@ -14179,7 +14179,8 @@ impl Engine {
         limit: usize,
         mut keep: impl FnMut(enchudb_oplog::EntityId) -> bool,
     ) -> Vec<enchudb_oplog::EntityId> {
-        let mut out = Vec::new();
+        // 結果は `limit` 件まで: 先に取る (伸ばしながらだと上位 10 件で 2 回確保し直す。 大きな limit は 1024 件から伸ばす)
+        let mut out = Vec::with_capacity(limit.min(1024));
         let Some(hs) = self.himos.get(hid as usize) else { return out };
         if limit == 0 {
             return out;
