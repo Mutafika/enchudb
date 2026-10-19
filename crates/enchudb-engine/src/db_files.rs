@@ -19,6 +19,8 @@ pub const TABLES: &str = "tables";
 pub const EIDMAP: &str = "eidmap";
 /// peer ごとの text vid 写像。
 pub const VOCABMAP: &str = "vocabmap";
+/// #513: 消した主キーの記録 (`crate::pk_tombs`)。
+pub const PKTOMBS: &str = "pktombs";
 /// region CRC table (`integrity`)。
 pub const CRC: &str = "crc";
 /// writer 排他 (flock)。 中身は空。
@@ -34,12 +36,13 @@ pub const SEGMENTS: &str = "segments";
 pub const CREATING: &str = "creating";
 
 /// segment 以外に DB directory へ置かれ得る file 名の一覧 (migrate / copy 用)。
-pub const ALL: [&str; 8] = [OPLOG, TABLES, EIDMAP, VOCABMAP, CRC, LOCK, SCHEMA, SEGMENTS];
+pub const ALL: [&str; 9] = [OPLOG, TABLES, EIDMAP, VOCABMAP, PKTOMBS, CRC, LOCK, SCHEMA, SEGMENTS];
 
 /// HTTP bootstrap (`/bootstrap/{name}`) で本体と別に配る sidecar。 `.eidmap` 無しの
 /// restore は再 sync で重複 entity / tombstone 喪失、 `.vocabmap` 無しは受信済み `Vocab`
-/// の写像喪失を起こす (#78-H9)。
-pub const BOOTSTRAP: [&str; 3] = [EIDMAP, TABLES, VOCABMAP];
+/// の写像喪失を起こす (#78-H9)。 `pktombs` 無しは、 それまでに消した主キーの行が、 後から届いた同じ主キーの
+/// 古い行に当たらない (#513。 旧 server は 404 を返し、 受け手は無しで続ける)。
+pub const BOOTSTRAP: [&str; 4] = [EIDMAP, TABLES, VOCABMAP, PKTOMBS];
 
 /// `{db_dir}/{name}`。
 pub fn path_for(db_path: impl AsRef<Path>, name: &str) -> PathBuf {
@@ -222,6 +225,18 @@ pub fn write_atomic_if_changed(sidecar: &Path, bytes: &[u8]) -> io::Result<bool>
     #[cfg(not(all(feature = "crashsim", unix)))]
     std::fs::rename(&tmp_path, sidecar)?;
     Ok(true)
+}
+
+/// #513: sidecar に追記して書き出す (`pktombs`)。 file が無ければ Err (追記は、 先にまとめて書いた file にだけ足す)。
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn append_synced(sidecar: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().append(true).open(sidecar)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    #[cfg(all(feature = "crashsim", unix))]
+    enchudb_oplog::crashsim::file_synced(sidecar);
+    Ok(())
 }
 
 /// 現行 sidecar が `bytes` と完全一致か。 不在 / 読めない / 長さ違いは false
