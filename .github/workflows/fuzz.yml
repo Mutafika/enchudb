@@ -48,10 +48,12 @@ jobs:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: fuzz-corpus-${{ matrix.target }}-
+      # target は明示する: install-action の cargo-fuzz は musl で組んだ binary で、 自分の target (x86_64-unknown-linux-musl)
+      # を既定にする。 musl は静的 libc なので sanitizer が使えず、 build が落ちる
       - name: cargo fuzz run
         run: |
           mkdir -p fuzz/corpus/${{ matrix.target }}
-          cargo fuzz run -O ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- \
+          cargo fuzz run -O --target x86_64-unknown-linux-gnu ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- \
             -max_total_time=${{ inputs.seconds || '600' }} -rss_limit_mb=4096 -timeout=30
       - uses: actions/cache/save@v4
         if: always()
