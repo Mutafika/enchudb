@@ -366,6 +366,21 @@ pub mod op_type {
     pub const TIE64: u8 = 10;
     /// `TIE_NAMED` の 64 bit 値版: eid(8) + value(8) + kind(1) + pad(1) + name_len(2) + name。
     pub const TIE_NAMED64: u8 = 11;
+
+    /// 上の bit が立った op は 「知らない版は読み飛ばしてよい」 (#178)。 oplog の op の種類と wire の op の印の両方で同じ。
+    /// 知らない op は、 この bit が無ければ今まで通り止まる (oplog の scan は打ち切り、 wire の batch は丸ごと Err)。 bit が
+    /// あれば、 その record だけを飛ばして先を読む (record は長さで区切られているので、 中身を知らなくても飛ばせる)。
+    ///
+    /// 足す op にこの bit を付けてよいのは、 読み飛ばされても複製が食い違わない op だけ (たとえば 「この 2 つの entity は同じ」
+    /// の知らせ: 知らない peer は今まで通り 2 つのまま持つ)。 値を運ぶ op に付けると、 古い peer が黙って値を落とす。
+    /// この bit を読める版より前の peer は、 bit の付いた op でも止まる。
+    pub const SKIPPABLE: u8 = 0x80;
+
+    /// `op` が [`SKIPPABLE`] の印を持つか。
+    #[inline]
+    pub const fn skippable(op: u8) -> bool {
+        op & SKIPPABLE != 0
+    }
 }
 
 /// WAL に書く所有型 op。 `Op` の owned 版で、 queue 渡し用 (consumer 側で
@@ -745,6 +760,9 @@ pub struct OpLog {
     /// (Commit は除く)。 engine が [`OpLog::take_dropped`] で取り出し、 その author の配布履歴に穴が
     /// あったことを puller に知らせる (history floor を上げて bootstrap に回す)。
     dropped: std::sync::Mutex<Vec<(PeerId, Hlc)>>,
+    /// #178: scan が読み飛ばした record の累計 (知らない版が書いた [`op_type::SKIPPABLE`] の op。 同じ record を読み直すと
+    /// また数える)。 [`OpLog::skipped_ops`]。
+    skipped_ops: AtomicU64,
     /// #388: append が満杯にぶつかった時に呼ぶ待ち手 (engine が consumer に畳ませて、 空くまで待つ)。 true を返したら
     /// 1 回だけ書き直す。 None なら今までどおりすぐ落とす。
     room_waiter: std::sync::RwLock<Option<RoomWaiter>>,
@@ -898,6 +916,7 @@ impl OpLog {
             room_waiter: std::sync::RwLock::new(None),
             append_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
+            skipped_ops: AtomicU64::new(0),
         };
         // #415: header をすぐ書き出す。 書き出さないと、 consumer の最初の fsync (100 ms) より前に落ちた時に header が
         // 0 のまま残り、 `bad WAL magic` で開けない (開く側は 0 のままの header を作り直す: `was_never_written`)
@@ -991,7 +1010,14 @@ impl OpLog {
             room_waiter: std::sync::RwLock::new(None),
             append_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
+            skipped_ops: AtomicU64::new(0),
         })
+    }
+
+    /// #178: scan が読み飛ばした record の累計 (知らない版が書いた 「読み飛ばしてよい」 op、 [`op_type::SKIPPABLE`])。
+    /// 0 が常態。 0 でなければ、 この binary より新しい版の peer の record を読んでいる。
+    pub fn skipped_ops(&self) -> u64 {
+        self.skipped_ops.load(Ordering::Relaxed)
     }
 
     /// この WAL を所有する peer の id を設定(Engine 初期化時に 1 回)。
@@ -1973,6 +1999,11 @@ impl OpLog {
                         payload_end as u64,
                     ));
                 }
+                // #178: 知らない版が書いた 「読み飛ばしてよい」 op は、 その record だけ飛ばして先を読む (下の打ち切りと違い、
+                // 後ろの record を捨てない)
+                None if op_type::skippable(op_byte) => {
+                    self.skipped_ops.fetch_add(1, Ordering::Relaxed);
+                }
                 None => {
                     // forward-compat 可視化 (0.9.0 L1): 新しい version が書いた
                     // 未知 op_type (or 不正 payload) は従来通りここで scan を打ち
@@ -2129,6 +2160,7 @@ impl OpLog {
             room_waiter: std::sync::RwLock::new(None),
             append_hook: std::sync::OnceLock::new(),
             dropped: std::sync::Mutex::new(Vec::new()),
+            skipped_ops: AtomicU64::new(0),
         }
     }
 }
@@ -3200,6 +3232,67 @@ mod tests {
     /// record が読めないのか、 record は在るが Commit が付いていないのか。
     /// 従来はどちらも 「0 件」 としか見えず、 実機 26.4 時間の停止を後から特定
     /// できなかった。 診断値がその 2 つを名指しで分けることを固定する。
+    /// #178: 知らない op は、 上の bit (`op_type::SKIPPABLE`) があればその record だけ読み飛ばして後ろを読む (数える)。
+    /// bit が無ければ今まで通り scan を打ち切る (後ろの record は出ない)。 3 つの Tie の真ん中の op の種類を書き換え、
+    /// CRC を付け直して開き直す。
+    #[test]
+    fn unknown_skippable_op_is_skipped_but_unknown_critical_op_stops() {
+        for (op_byte, want, stop, skipped) in [
+            (op_type::SKIPPABLE | 1, vec![1u64, 3], ScanStop::Head, 1u64),
+            (0x41, vec![1u64], ScanStop::UndecodableOp, 0u64),
+        ] {
+            let p = tmp(&format!("skippable-{op_byte}"));
+            {
+                let wal = OpLog::create(&p, 1024 * 1024).unwrap();
+                for eid in 1..=3u64 {
+                    wal.append(Op::Tie { eid, himo_id: 0, value: 9 }).unwrap();
+                }
+                wal.append(Op::Commit).unwrap();
+            }
+            // 2 つ目の record (Tie の payload は 16 byte) の op の種類を書き換えて CRC を付け直す
+            let mut bytes = std::fs::read(&p).unwrap();
+            let at = HEADER_SIZE + REC_HEADER_SIZE + 16;
+            let h = &bytes[at..at + REC_HEADER_SIZE];
+            let rd8 = |o: usize| u64::from_le_bytes(h[o..o + 8].try_into().unwrap());
+            let rd4 = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
+            let (len, lsn, author) = (rd4(OFF_LEN), rd8(OFF_LSN), rd4(OFF_AUTHOR_PEER));
+            let hlc = Hlc { wall: rd8(OFF_HLC_WALL), logical: rd4(OFF_HLC_LOGICAL), peer: rd4(OFF_HLC_PEER) };
+            let payload = bytes[at + REC_HEADER_SIZE..at + REC_HEADER_SIZE + len as usize].to_vec();
+            let crc = new_record_crc(op_byte, len, lsn, hlc, author, &payload);
+            bytes[at + OFF_OP] = op_byte;
+            bytes[at + OFF_CRC..at + OFF_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+            std::fs::write(&p, &bytes).unwrap();
+
+            let wal = OpLog::open(&p).unwrap();
+            let (out, _, _, got_stop) = wal.iter_committed_from_with_diag(HEADER_SIZE as u64);
+            let eids: Vec<u64> = out
+                .iter()
+                .map(|(r, _)| match r.op {
+                    DecodedOp::Tie { eid, .. } => eid,
+                    ref o => panic!("Tie 以外が出た: {o:?}"),
+                })
+                .collect();
+            if stop == ScanStop::Head {
+                assert_eq!(eids, want, "op {op_byte:#x}: 読み飛ばした後ろの record が出ない");
+            } else {
+                // 打ち切ると Commit に届かないので、 閉じた group として出るものは無い
+                assert!(eids.is_empty(), "op {op_byte:#x}: 打ち切ったのに record が出た: {eids:?}");
+                let tail: Vec<u64> = wal
+                    .recover_with_tail()
+                    .iter()
+                    .map(|r| match r.op {
+                        DecodedOp::Tie { eid, .. } => eid,
+                        ref o => panic!("Tie 以外が出た: {o:?}"),
+                    })
+                    .collect();
+                assert_eq!(tail, want, "op {op_byte:#x}: 打ち切りより前の record");
+            }
+            assert_eq!(got_stop, stop, "op {op_byte:#x}");
+            assert!(wal.skipped_ops() >= skipped && (skipped > 0) == (wal.skipped_ops() > 0), "op {op_byte:#x}: 読み飛ばした数 {}", wal.skipped_ops());
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
     #[test]
     fn scan_diag_separates_unclosed_group_from_unreadable_cursor() {
         let p = tmp("scan-diag");
