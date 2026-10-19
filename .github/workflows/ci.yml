@@ -91,8 +91,8 @@ jobs:
         run: cargo miri test -p enchudb-engine --lib order_index
       # 名前は module の道まで書く (`value_locks` だけだと、 write_lock (parking_lot) を取り合う himo_store の test にも当たり、
       # Linux の Miri が parking_lot_core の futex の呼び方を UB と判定する。 0.32.0 の order_index の段と同じ問題)
-      - name: miri value_locks (値の鍵と、 詰め直しの照合が並んだ書き手と data race にならないこと)
-        run: cargo miri test -p enchudb-engine --lib -- value_locks::tests himo_store::tests::compaction_reads
+      - name: miri value_locks (値の鍵と、 詰め直しの照合が並んだ書き手と data race にならないこと。 読み手の詰め直しも)
+        run: cargo miri test -p enchudb-engine --lib -- value_locks::tests himo_store::tests::compaction_reads himo_store::tests::read_compaction_holds_the_value_lock
 
   loom:
     name: loom (interleaving)

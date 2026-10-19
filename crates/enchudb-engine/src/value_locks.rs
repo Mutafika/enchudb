@@ -111,6 +111,14 @@ impl ValueLocks {
         Held { locks: self, x, y }
     }
 
+    /// 値 `v` の鍵を、 空いていれば取る (待たない)。 読み手が bucket を詰め直す時に使う ([`crate::himo_store`] の
+    /// `after_verified_read`): 書き手を待たせて読みを遅らせない、 鍵を持ったまま読む thread でも詰まらない。
+    pub(crate) fn try_lock(&self, v: u64) -> Option<Held<'_>> {
+        let i = stripe_of(v);
+        self.stripes[i].0.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).ok()?;
+        Some(Held { locks: self, x: Some(i), y: None })
+    }
+
     /// 全部の鍵を取る (番号の順)。 持っている間、 鍵で書く書き手は 1 本も中に居ない。
     pub(crate) fn lock_all(&self) -> HeldAll<'_> {
         for i in 0..STRIPES {

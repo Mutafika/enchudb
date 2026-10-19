@@ -158,6 +158,13 @@ mod hook {
 /// と併用。閾値は churn_read ベンチで調整。
 const COMPACT_MIN_LEN: usize = 64;
 
+/// 読み手の詰め直し (`HimoStore::compact_if_reread`) を、 書き込みの無い照らしの 2 回目からする bucket の長さ (これより短い bucket
+/// は 3 回目から)。 詰め直しには長さによらない手間 (新しい置き場の確保と、 古い置き場の epoch の後始末) があり、 長い bucket では照らす
+/// 読み 1 回に比べて小さいので、 2 回目で詰め直してその後読まれなくても損は小さい。 短い bucket では照らす読みの 2 倍ほどかかる
+/// ので、 読み直しが続くと分かるまで待つ (dbq の churn の後、 1 万件の bucket の範囲 10% の find は 2 回目からで static の速さ
+/// (3 回目からだと 40 本のうち前半が照らしたまま)、 100 件の bucket の範囲 0.1% の find は 2 回目からだと 6〜13% 遅い)。
+const REREAD_EARLY_LEN: usize = 1024;
+
 pub struct HimoStore {
     /// `load_lazy` で作った store では最初の `col()` まで空 (request23 D2)。
     /// `init` / `load` は構築時に埋まる。
@@ -889,6 +896,30 @@ impl HimoStore {
         }
     }
 
+    /// bucket 全体を読む時 (`pull` / `pull_into` / `pull_range_unordered`) に、 照らしが要ると分かったら呼ぶ (照らしの要らない読みは
+    /// 呼ばない = 速い読みの手間は増やさない)。 今の (len, live) を控え、 書き手がその bucket に触らないまま照らすのが 2 回目
+    /// (`REREAD_EARLY_LEN` 件より短い bucket は 3 回目) 以降なら (= 同じ照らしを繰り返している)、 値の鍵が空いていれば詰め直す。
+    /// 詰め直したら true で、 呼び手は読み直す (古い entry が無いので照らさずに写すだけ)。 false なら呼び手はそのまま照らして読む。
+    ///
+    /// 書き手の詰め直しは古い entry が半分を超えた時だけなので、 1 割を書き換えた後の bucket は、 次に書かれるまで読みのたびに
+    /// 全部を Column で照らし、 後ろに足した分を並べ直していた (dbq の churn の後: 範囲 10% の find が static の 19 倍)。 詰め直しの
+    /// 手間は照らす読み 1〜2 回分で、 照らす前に詰め直すので、 詰め直した読みから静かな時と同じになる。 短い bucket を 2 回目で詰め
+    /// 直さないのは、 1 回だけ読み直されてそれきりの bucket (値の種類が多い列をまばらに読む) で無駄にしないため
+    /// (`REREAD_EARLY_LEN`)。 書き手と読み手が交互なら間に書き手が触るので詰め直さない。
+    /// 鍵は待たない (`try_lock`): 書き手を待たせず、 鍵を持ったまま読む thread でも詰まらない。 詰め直しは書き手の詰め直しと同じ
+    /// 約束 (その値の鍵の下、 Column が最新、 読み手は epoch で止まらない)
+    fn compact_if_reread(&self, value: u64) -> bool {
+        let Some((len, rereads)) = self.cyl.mark_verified(value) else { return false };
+        if len < COMPACT_MIN_LEN || rereads < if len >= REREAD_EARLY_LEN { 1 } else { 2 } {
+            return false;
+        }
+        let Some(_held) = self.vlocks().try_lock(value) else { return false };
+        let col = self.col();
+        hook::at("read_compacting");
+        self.cyl.compact_bucket(value, |eid| stored_sync(col, eid) == value + 1);
+        true
+    }
+
     /// 全 bucket を Column 基準で即時 compaction する明示 API (運用/テスト用)。
     /// reader は停止しない (bucket ごとの epoch swap)。
     pub fn compact_now(&self) {
@@ -1072,7 +1103,11 @@ impl HimoStore {
     pub fn pull(&self, value: impl CellValue) -> Vec<u32> {
         let Some(value) = value.cell_value() else { return Vec::new() };
         self.ensure_cylinder_built();
-        let (raw, needs_verify) = self.cyl.read_to_vec_verify(value);
+        let (mut raw, mut needs_verify) = self.cyl.read_to_vec_verify(value);
+        // 照らしが要り、 前に照らした時から書き込みが無ければ、 詰め直して読み直す (照らさずに済む。 照らしの要らない読みは見ない)
+        if needs_verify && self.compact_if_reread(value) {
+            (raw, needs_verify) = self.cyl.read_to_vec_verify(value);
+        }
         if !needs_verify {
             // この bucket は append-only: 全 live、dup なし
             raw
@@ -1096,7 +1131,13 @@ impl HimoStore {
         let Some(value) = value.cell_value() else { return };
         self.ensure_cylinder_built();
         let start = out.len();
-        if self.cyl.read_into_verify(value, out) {
+        let mut needs_verify = self.cyl.read_into_verify(value, out);
+        // `pull` と同じ: 照らしが要り、 前に照らした時から書き込みが無ければ、 詰め直して読み直す
+        if needs_verify && self.compact_if_reread(value) {
+            out.truncate(start);
+            needs_verify = self.cyl.read_into_verify(value, out);
+        }
+        if needs_verify {
             // lazy verify: Column で現在値を確認、churn 由来の dup を除去 (足した分だけ、 その場で)
             let col = self.col();
             let mut w = start;
@@ -1165,6 +1206,18 @@ impl HimoStore {
         let mut loose = Vec::new();
         self.cyl.for_each_part(lo, hi, |part| match part {
             Part::Bucket { eids, verify: false, .. } | Part::Run { eids, verify: false, .. } => out.extend_from_slice(eids),
+            // 前に照らした時から書き込みの無い bucket は、 詰め直して詰め直した後の版を写す (渡された `eids` は詰め直す前の版。
+            // 読み手は epoch で止まらないので、 この閉包の間は前の版も読める)
+            Part::Bucket { value, .. } if self.compact_if_reread(value) => {
+                let (mut eids, verify) = self.cyl.read_to_vec_verify(value);
+                if verify {
+                    // 詰め直した後に書き手が触った: `pull` と同じく照らして並べ、 往復の重複を落とす
+                    eids.retain(|&e| stored_at(col, e) == value + 1);
+                    crate::append_bucket::sort_appended(&mut eids);
+                    eids.dedup();
+                }
+                out.extend_from_slice(&eids);
+            }
             Part::Bucket { value, eids, head, verify: true } => push_live_once(col, value, eids, head, &mut out),
             Part::Run { lo, hi, eids, verify: true } => loose.extend(eids.iter().copied().filter(|&e| {
                 let s = stored_at(col, e);
@@ -1650,6 +1703,208 @@ mod tests {
             }
         }
         assert!(verified >= 50 && unsorted_raw >= 10, "負の対照: verify の要る読み {verified}・並べる前が昇順でない読み {unsorted_raw} が少ない");
+    }
+
+    /// 読み手の詰め直し (`compact_if_reread`): 書き手の詰め直しの線 (古い entry が半分) に届かない churn の後、 書き込みの無いまま
+    /// 同じ bucket を 3 回目に読む時に、 先に詰め直してから照らさずに読む。 1・2 回目の読み・間に書き込みのあった読み (入る / 出て
+    /// いく)・値の鍵を誰かが持っている時の読みでは詰め直さない (鍵は待たない)。 詰め直すのは読んだ bucket だけ。 どの読みの答えも
+    /// 列をなめた答えと同じ。 `pull` / `pull_into` / `pull_range_unordered` の 3 つの読みで。
+    #[test]
+    fn rereading_a_churned_bucket_compacts_it() {
+        const N: u32 = 12_000; // make_store の region (64 KB) に入る数
+        for how in ["pull", "pull_into", "pull_range_unordered"] {
+            let hs = make_store(N);
+            let mut cells = vec![0u32; N as usize];
+            let mut x = 0x2545_f491_4f6c_dd1du64;
+            let mut next = || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            };
+            for e in 0..N {
+                cells[e as usize] = e % 20;
+                assert!(hs.set(e, (e % 20) as u64));
+            }
+            let _ = hs.pull(0u32); // 索引を組んでから (以後 writer が維持する)
+            // 1 割を書き換える: 値ごとの bucket の古い entry は 1 割ほど (書き手は詰め直さない)
+            for _ in 0..N / 10 {
+                let e = (next() % N as u64) as u32;
+                let v = (next() % 20) as u32;
+                assert!(hs.set(e, v as u64));
+                cells[e as usize] = v;
+            }
+            let read = |v: u32| -> Vec<u32> {
+                let mut got = match how {
+                    "pull" => hs.pull(v),
+                    "pull_into" => {
+                        let mut out = vec![u32::MAX];
+                        hs.pull_into(v, &mut out);
+                        assert_eq!(out[0], u32::MAX, "pull_into が前の中身を変えた");
+                        out.split_off(1)
+                    }
+                    _ => hs.pull_range_unordered(v as u64, v as u64),
+                };
+                got.sort_unstable();
+                got
+            };
+            let want = |cells: &[u32], v: u32| -> Vec<u32> { (0..N).filter(|&i| cells[i as usize] == v).collect() };
+            let v = 3u32;
+            assert!(hs.cyl.bucket_needs_verify(v as u64), "[{how}] 対照: churn の後は照らしが要る");
+            assert_eq!(read(v), want(&cells, v), "[{how}] 1 回目");
+            assert!(hs.cyl.bucket_needs_verify(v as u64), "[{how}] 1 回目では詰め直さない");
+            assert_eq!(read(v), want(&cells, v), "[{how}] 2 回目");
+            assert!(hs.cyl.bucket_needs_verify(v as u64), "[{how}] 2 回目では詰め直さない");
+            // 間に値 v の bucket から出ていく書き込み (live だけが動く)
+            let e = (0..N).find(|&i| cells[i as usize] == v).unwrap();
+            assert!(hs.set(e, 5));
+            cells[e as usize] = 5;
+            assert_eq!(read(v), want(&cells, v), "[{how}] 出ていく書き込みの後");
+            assert_eq!(read(v), want(&cells, v), "[{how}] 出ていく書き込みの後の 2 回目");
+            assert!(hs.cyl.bucket_needs_verify(v as u64), "[{how}] 間に出ていく書き込みがあれば数え直す");
+            // 間に値 v の bucket に入る書き込み (len が動く)
+            let e = (0..N).find(|&i| cells[i as usize] != v).unwrap();
+            assert!(hs.set(e, v as u64));
+            cells[e as usize] = v;
+            assert_eq!(read(v), want(&cells, v), "[{how}] 入る書き込みの後");
+            assert_eq!(read(v), want(&cells, v), "[{how}] 入る書き込みの後の 2 回目");
+            assert!(hs.cyl.bucket_needs_verify(v as u64), "[{how}] 間に入る書き込みがあれば数え直す");
+            {
+                let _held = hs.vlocks().lock_pair(Some(v as u64), None);
+                assert_eq!(read(v), want(&cells, v), "[{how}] 鍵を持たれている時の 3 回目");
+                assert!(hs.cyl.bucket_needs_verify(v as u64), "[{how}] 鍵を持たれていれば詰め直さない");
+            }
+            assert_eq!(read(v), want(&cells, v), "[{how}] 書き込みの無い 4 回目");
+            assert!(!hs.cyl.bucket_needs_verify(v as u64), "[{how}] 鍵が空いた後の照らしの前に詰め直す");
+            assert_eq!(read(v), want(&cells, v), "[{how}] 詰め直した後");
+            assert!(hs.cyl.bucket_needs_verify(4), "[{how}] 読んでいない bucket は詰め直さない");
+            // 詰め直した後の書き込みは今まで通り (照らしが要る bucket に戻る)
+            let e = (0..N).find(|&i| cells[i as usize] == v).unwrap();
+            assert!(hs.set(e, 4));
+            cells[e as usize] = 4;
+            assert!(hs.cyl.bucket_needs_verify(v as u64), "[{how}] 詰め直した後の書き込み");
+            assert_eq!(read(v), want(&cells, v), "[{how}] 詰め直した後の書き込みの後");
+            assert_eq!(read(4), want(&cells, 4), "[{how}] 値 4");
+        }
+    }
+
+    /// 長い bucket (`REREAD_EARLY_LEN` 件以上) は、 書き込みの無い照らしの 2 回目で詰め直す (短い bucket は 3 回目、
+    /// `rereading_a_churned_bucket_compacts_it`)。 間に書き込みがあれば数え直す。 答えは列をなめた答えと同じ。
+    #[test]
+    fn long_bucket_compacts_on_the_second_read() {
+        const N: u32 = 12_000; // make_store の region (64 KB) に入る数。 値 8 つで 1 値 1500 件
+        let hs = make_store(N);
+        let mut cells: Vec<u32> = (0..N).map(|e| e % 8).collect();
+        for e in 0..N {
+            assert!(hs.set(e, (e % 8) as u64));
+        }
+        let _ = hs.pull(0u32);
+        for e in (0..N).step_by(10) {
+            let v = (cells[e as usize] + 1) % 8;
+            assert!(hs.set(e, v as u64));
+            cells[e as usize] = v;
+        }
+        let want = |cells: &[u32], v: u32| -> Vec<u32> { (0..N).filter(|&i| cells[i as usize] == v).collect() };
+        let read = |v: u32| {
+            let mut got = hs.pull(v);
+            got.sort_unstable();
+            got
+        };
+        let v = 2u32;
+        assert!(want(&cells, v).len() >= REREAD_EARLY_LEN, "前提: 長い bucket");
+        assert!(hs.cyl.bucket_needs_verify(v as u64), "前提: 照らしが要る");
+        assert_eq!(read(v), want(&cells, v), "1 回目");
+        assert!(hs.cyl.bucket_needs_verify(v as u64), "1 回目では詰め直さない");
+        let e = (0..N).find(|&i| cells[i as usize] == v).unwrap();
+        assert!(hs.set(e, 3));
+        cells[e as usize] = 3;
+        assert_eq!(read(v), want(&cells, v), "書き込みの後");
+        assert!(hs.cyl.bucket_needs_verify(v as u64), "間に書き込みがあれば数え直す");
+        // 入りと出が 1 つずつ (live は差し引き同じ、 len だけ動く) でも数え直す
+        let e_in = (0..N).find(|&i| cells[i as usize] != v).unwrap();
+        assert!(hs.set(e_in, v as u64));
+        cells[e_in as usize] = v;
+        let e_out = (0..N).find(|&i| cells[i as usize] == v && i != e_in).unwrap();
+        assert!(hs.set(e_out, 3));
+        cells[e_out as usize] = 3;
+        assert_eq!(read(v), want(&cells, v), "入りと出の後");
+        assert!(hs.cyl.bucket_needs_verify(v as u64), "入りと出が 1 つずつでも数え直す");
+        assert_eq!(read(v), want(&cells, v), "書き込みの無い 2 回目");
+        assert!(!hs.cyl.bucket_needs_verify(v as u64), "長い bucket は 2 回目で詰め直す");
+        assert_eq!(read(v), want(&cells, v), "詰め直した後");
+        assert_eq!(read(3), want(&cells, 3), "値 3");
+    }
+
+    /// 読み手の詰め直しも書き手の詰め直しと同じく値の鍵の下: 詰め直しの途中 (割り込み点で止めた) に、 別の値の書き手は待たずに
+    /// 書け、 同じ値の bucket に触る書き手は詰め直しが終わるまで待つ。 終わった後の cylinder は列と一致する。 CI の Miri の段でも
+    /// 回す (詰め直しの照合の読みと、 別の値の書き手の store が並ぶ。 値の鍵だけを取り合い、 parking_lot の lock は取り合わない)。
+    #[test]
+    fn read_compaction_holds_the_value_lock() {
+        // bucket は `COMPACT_MIN_LEN` (64) 件以上
+        let n: u32 = if cfg!(miri) { 200 } else { 1_000 };
+        let hs = make_store(n + 2);
+        for e in 0..n {
+            assert!(hs.set(e, 0));
+        }
+        assert!(hs.set(n, 2));
+        assert!(hs.set(n + 1, 3));
+        assert_eq!(hs.pull(0).len(), n as usize); // 索引を組む
+        // 値 0 の bucket から 1 割を値 1 へ (書き手は詰め直さない)
+        for e in 0..n / 10 {
+            assert!(hs.set(e, 1));
+        }
+        assert!(hs.cyl.bucket_needs_verify(0), "前提: 照らしが要る");
+        // 1・2 回目の照らした読み (3 回目の前に詰め直す)
+        assert_eq!(hs.pull(0).len(), (n - n / 10) as usize);
+        assert_eq!(hs.pull(0).len(), (n - n / 10) as usize);
+        let go = std::sync::Arc::new(AtomicBool::new(false));
+        let same_done = std::sync::Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|s| {
+            let (hs, go_r) = (&hs, go.clone());
+            let reader = s.spawn(move || {
+                hook::set("read_compacting", move || {
+                    entered_tx.send(()).unwrap();
+                    while !go_r.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                });
+                // 書き込みの無い 3 回目 = 先に詰め直す。 詰め直した後に下の同じ値の書き手が入りうるので、 答えはどちらか
+                let mut got = hs.pull(0);
+                got.sort_unstable();
+                let before: Vec<u32> = (n / 10..n).collect();
+                let mut after = before.clone();
+                after.insert(0, n / 10 - 1);
+                assert!(got == before || got == after, "詰め直した読みの答え ({} 件)", got.len());
+            });
+            // 割り込み点に来なかったら (詰め直さなかったら)、 読み手の thread が終わって送り手が消え、 ここで落ちる
+            entered_rx.recv().expect("前提: 読み手の詰め直しの割り込み点に来た");
+            // 別の値の書き手 (鍵は値 2 と 3) は待たない
+            assert!(hs.set(n, 3));
+            // 同じ値の bucket に触る書き手 (値 1 → 0、 鍵は値 0 と 1) は詰め直しが終わるまで待つ
+            let done = same_done.clone();
+            let writer = s.spawn(move || {
+                assert!(hs.set(n / 10 - 1, 0));
+                done.store(true, Ordering::Release);
+            });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(!same_done.load(Ordering::Acquire), "同じ値の書き手は詰め直しの間は待つ");
+            go.store(true, Ordering::Release);
+            reader.join().unwrap();
+            writer.join().unwrap();
+        });
+        let mut got = hs.pull(0);
+        got.sort_unstable();
+        let mut want: Vec<u32> = (n / 10..n).collect();
+        want.insert(0, n / 10 - 1);
+        assert_eq!(got, want, "値 0");
+        let mut got = hs.pull(1);
+        got.sort_unstable();
+        assert_eq!(got, (0..n / 10 - 1).collect::<Vec<_>>(), "値 1");
+        assert!(hs.pull(2).is_empty(), "値 2");
+        let mut got = hs.pull(3);
+        got.sort_unstable();
+        assert_eq!(got, vec![n, n + 1], "値 3");
     }
 
     #[test]

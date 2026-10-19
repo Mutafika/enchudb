@@ -32,7 +32,7 @@
 
 use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned};
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 const INITIAL_CAP: usize = 4;
 
@@ -80,6 +80,10 @@ pub struct AppendBucket {
     /// この bucket に stale (値更新/削除の残骸) が居るか。true なら read は
     /// Column verify + dedup を通す。himo 全体 flag (旧 any_removed) の bucket 局所版。
     removed: AtomicBool,
+    /// 最後に照らした読みの時の (len, live) (`len << 32 | live`、 `u64::MAX` = まだ)。 [`mark_verified`](Self::mark_verified)。
+    verified: AtomicU64,
+    /// 間に書き込みの無い照らしを繰り返した回数 (1 回目の読みの後の読み直しの数)。
+    rereads: AtomicU32,
 }
 
 // SAFETY: 単一 writer / 多 reader。 全アクセスは atomic len + epoch で同期される。
@@ -143,6 +147,8 @@ impl AppendBucket {
             backing: Atomic::new(Buf::with_cap(0)),
             live: AtomicU32::new(0),
             removed: AtomicBool::new(false),
+            verified: AtomicU64::new(u64::MAX),
+            rereads: AtomicU32::new(0),
         }
     }
 
@@ -153,6 +159,8 @@ impl AppendBucket {
             backing: Atomic::new(Buf::with_cap(cap)),
             live: AtomicU32::new(0),
             removed: AtomicBool::new(false),
+            verified: AtomicU64::new(u64::MAX),
+            rereads: AtomicU32::new(0),
         }
     }
 
@@ -192,6 +200,28 @@ impl AppendBucket {
     #[inline]
     pub fn needs_verify(&self) -> bool {
         self.removed.load(Ordering::Acquire)
+    }
+
+    /// 今の (len, live)。 書き手は足すと len を、 古い印を付けると live を動かす (詰め直すまで len は減らず、 足さない間の live は
+    /// 減るだけ) ので、 同じなら間に書き込みは無い。
+    fn snap(&self, guard: &Guard) -> u64 {
+        let cur = self.backing.load(Ordering::Acquire, guard);
+        // SAFETY: backing は常に非 null。
+        let len = unsafe { cur.deref() }.len.load(Ordering::Acquire) as u64;
+        (len << 32) | u64::from(self.live.load(Ordering::Relaxed))
+    }
+
+    /// 照らして読む (Column verify を通す) と決めた時に呼ぶ: 今の (len, live) を控え、 間に書き手の触っていない照らしを何回続けて
+    /// いるかを返す (0 = 前に照らした時から書き込みがあった / 初めて、 1 = 2 回目、 2 = 3 回目 …)。 詰め直すかは呼び手が決める
+    /// (`HimoStore::compact_if_reread`)。 読み手どうしが並ぶと同じ数を見うる (詰め直しは値の鍵を取れた 1 本だけ)。
+    pub fn mark_verified(&self, guard: &Guard) -> u32 {
+        let snap = self.snap(guard);
+        if self.verified.swap(snap, Ordering::Relaxed) == snap {
+            self.rereads.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+        } else {
+            self.rereads.store(0, Ordering::Relaxed);
+            0
+        }
     }
 
     /// 単一 writer append。 spare があれば in-place、 満杯なら倍化 + epoch 遅延解放。
@@ -279,6 +309,8 @@ impl AppendBucket {
             guard.defer_destroy(cur);
         }
         self.live.store(kept.len() as u32, Ordering::Relaxed);
+        self.verified.store(u64::MAX, Ordering::Relaxed);
+        self.rereads.store(0, Ordering::Relaxed);
         self.removed.store(false, Ordering::Release); // swap 後 — 順序契約はメソッド doc 参照
         kept.len()
     }
