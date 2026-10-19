@@ -175,6 +175,15 @@
 //! 「答えが変わった時だけ展開」 でも、 親は常に子の最新の記録と整合する。 記録は 「印を消費して
 //! 評価した時」 にだけ書く。
 //!
+//! 子の記録が **不明で今が偽** の時は、 その子を真と読んで答えに入った根が居る時だけ展開する
+//! (`Settled::seen_true`)。 根の評価は記録の無い子を Column から評価し直すだけで記録しないので、 記録が
+//! 不明でも配下が子の真に頼っていることがある。 子を真と読んだ評価 (記録の無い子を Column から読んだ時と、
+//! settle で節の entity を真と評価した時) は必ず印を立て、 印は偽になって親を引き直した時にしか下ろさない。
+//! よって子の真に頼る根が居る間は印が立っている (`forget_stale` / `forget_regions` で記録が不明に戻っても
+//! 印は残る)。 印が無ければ親の答えは子の今の偽と同じで、 展開しても何も変わらない (登録の後に初めて書かれた
+//! 会社の、 答えの変わらない書き換えで配下を全員評価し直さない。 test `unrecorded_parent_expands_only_if_read_as_true`、
+//! `forgotten_true_record_still_expands`)。
+//!
 //! 記録の意味が変わるもう 1 つの場合は **鍵の表が増えた時** (購読の無かった値が購読された):
 //! 「偽」 と記録した entity が今は真でありうる。 member を有効化する時、 その member の各穴の値を
 //! 持つ entity から根の手前まで遡って記録を不明に戻す (`Family::forget_stale`)。
@@ -2379,6 +2388,12 @@ fn root_at(recs: &[KeyStore], vals: &[ValWords], e: u32) -> Option<Ans> {
 struct Settled {
     /// 節ごとの記録 (添字 0 = 根の現在の鍵)。
     recs: Vec<KeyStore>,
+    /// 根でない節ごと: 評価でこの entity の部分条件を真と読んだことがある。 根の評価は子の記録が無いと子を Column から
+    /// 評価し直すだけで記録しないので、 記録が不明でも、 答えに入っている根がこの entity の真に頼っていることがある。
+    /// 真と読んだ時 (評価で子を Column から読んだ時と、 settle で節の entity を評価した時) に立て、 偽になって親を引き直した
+    /// 時に下ろす。 記録が不明で今が偽の entity は、 これが立っていなければ親を引かない (登録の後に初めて書かれた会社の、
+    /// 答えの変わらない書き換えで、 配下の社員を全員評価し直していた)。 評価は `&Settled` から呼ぶので RefCell
+    seen_true: std::cell::RefCell<Vec<Bits>>,
     /// 節ごとの範囲の穴の値 (範囲の穴から根への道の上の節だけ使う)。
     vals: Vec<ValWords>,
     /// 範囲の穴の値の帯。
@@ -3042,6 +3057,7 @@ impl Settled {
     fn new(widths: &[usize]) -> Self {
         Settled {
             recs: widths.iter().map(|_| KeyStore::default()).collect(),
+            seen_true: std::cell::RefCell::new(widths.iter().map(|_| Bits::default()).collect()),
             vals: widths.iter().map(|_| ValWords::default()).collect(),
             slabs: Slabs::default(),
             tables: widths.iter().map(|&w| KeyTable::new(w)).collect(),
@@ -3839,7 +3855,14 @@ impl Family {
                     let t = r.ref_cell(self.nodes[c].via, e)?;
                     match rec_at(&s.recs, &s.vals, c, t) {
                         Some(ans) => ans,
-                        None => self.eval(r, s, c, t),
+                        None => {
+                            let ans = self.eval(r, s, c, t);
+                            // 記録の無い子を真と読んだ = これから答えに入る根が、 記録の無いまま子の真に頼る (`Settled::seen_true`)
+                            if ans.is_some() {
+                                s.seen_true.borrow_mut()[c].put(t, true);
+                            }
+                            ans
+                        }
                     }
                 }
             }?;
@@ -4394,6 +4417,7 @@ impl Family {
                 // 範囲の値は帯が変わった時だけ運ぶ (帯の中の違いはどの member にも区別が付かない)。
                 // 集計の部分和の節では group の値は運ばない (部分和を移す)
                 let partial_node = self.partial == Some(n) || self.order_part == Some(n);
+                let seen = s.seen_true.get_mut();
                 let changed = match (prev, now) {
                     (Some(Some((pi, pv))), Some((ni, nv))) => {
                         pi != ni
@@ -4402,8 +4426,16 @@ impl Family {
                                 && if self.kind == CarryKind::Range { !s.slabs.same(pv, nv) } else { pv != nv })
                     }
                     (Some(None), None) => false,
+                    // 記録が不明で今は偽: 真と読んだことが無ければ、 この entity の真に頼る根は居ない (親の答えは変わらない)
+                    (None, None) => seen[n].get(e),
                     _ => true,
                 };
+                if now.is_some() {
+                    seen[n].put(e, true);
+                } else if always || force || changed {
+                    // 下で親を引き直す = 頼っていた根は、 今の偽を記録から読んで評価し直される
+                    seen[n].put(e, false);
+                }
                 if partial_node && let Some((_, nv)) = now {
                     match mode {
                         RootMode::Ordered(desc) => s.move_order(e, nv, desc),
@@ -6207,6 +6239,8 @@ mod tests {
         vocab: Vec<String>,
         /// 並行書き込みの再現用: この cell の読みは列の値を順に返す (尽きたら通常の値)。
         script: Option<((u16, u32), std::collections::VecDeque<u64>)>,
+        /// `pull` を呼ばれた (紐, 値) の順 (逆引きで配下を引いたかを見る test 用)。
+        pulls: Vec<(u16, u64)>,
     }
 
     impl CellReader for Mutex<Fake> {
@@ -6221,7 +6255,9 @@ mod tests {
             self.lock().vocab.iter().position(|v| v == t).map(|i| i as u32)
         }
         fn pull(&self, h: u16, v: u64) -> Vec<u32> {
-            self.lock().cells.iter().filter(|&(k, vv)| k.0 == h && *vv == v).map(|(k, _)| k.1).collect()
+            let mut f = self.lock();
+            f.pulls.push((h, v));
+            f.cells.iter().filter(|&(k, vv)| k.0 == h && *vv == v).map(|(k, _)| k.1).collect()
         }
         fn with_himo(&self, h: u16) -> Vec<u32> {
             self.lock().cells.keys().filter(|&&(hh, _)| hh == h).map(|&(_, e)| e).collect()
@@ -6327,6 +6363,114 @@ mod tests {
         write(&reg, &f, CITY, 100, Some(1));
         assert_eq!(q.poll_with(&f).added, vec![1, 2, 3, 4]);
         assert_eq!(q.count_with(&f), 4);
+    }
+
+    /// 登録の後に初めて書かれた会社 (記録が不明) の、 答えの変わらない書き換えでは配下を引かない。 根の評価で Column から
+    /// 真と読んだだけの会社 (記録が無いまま配下が答えに入っている) は、 初めて偽になった時に配下を引いて出す
+    /// (`Settled::seen_true`)。
+    #[test]
+    fn unrecorded_parent_expands_only_if_read_as_true() {
+        const COMPANY: u16 = 0;
+        const CITY: u16 = 1;
+        let reg = Arc::new(LiveRegistry::new(0));
+        let f = Mutex::new(Fake::default());
+        // 会社 100 (city=1) に user 1..=3、 会社 200 (city=2) に user 4..=6
+        write(&reg, &f, CITY, 100, Some(1));
+        write(&reg, &f, CITY, 200, Some(2));
+        for u in 1..=6 {
+            write(&reg, &f, COMPANY, u, Some(if u <= 3 { 100 } else { 200 }));
+        }
+        let q = reg.register(vec![LivePred::Via {
+            path: vec![COMPANY],
+            pred: Box::new(LivePred::Eq { himo_id: CITY, value: 1 }),
+        }], false);
+        q.seed(&f);
+        assert_eq!(q.poll_with(&f).added, vec![1, 2, 3]);
+        // 会社 200: 2 → 5 (偽 → 偽)。 記録は不明だが、 真と読んだ根は居ない → 配下を引かない
+        f.lock().pulls.clear();
+        write(&reg, &f, CITY, 200, Some(5));
+        assert!(q.poll_with(&f).is_empty());
+        assert!(!f.lock().pulls.contains(&(COMPANY, 200)), "答えの変わらない会社の配下を引いた: {:?}", f.lock().pulls);
+        // 会社 100: 1 → 3 (真 → 偽)。 記録は不明 (根の評価で Column から真と読んだだけ) → 配下を引いて出す
+        write(&reg, &f, CITY, 100, Some(3));
+        assert_eq!(q.poll_with(&f).removed, vec![1, 2, 3]);
+        // 会社 200 が真になる → 入る。 会社 100 が真に戻る → 入る
+        write(&reg, &f, CITY, 200, Some(1));
+        assert_eq!(q.poll_with(&f).added, vec![4, 5, 6]);
+        write(&reg, &f, CITY, 100, Some(1));
+        assert_eq!(q.poll_with(&f).added, vec![1, 2, 3]);
+        // 偽にして親を引き直した後 (真と読んだ印が下りた後) も、 真に戻って根が頼り直せば次の偽で出す
+        write(&reg, &f, CITY, 100, Some(4));
+        assert_eq!(q.poll_with(&f).removed, vec![1, 2, 3]);
+        assert_eq!(q.count_with(&f), 3);
+    }
+
+    /// settle で真と評価して記録した会社の記録が、 同じ形の購読が足されて不明に戻されても (`forget_stale`)、 その会社が
+    /// 偽になれば配下を出す (根は記録 = 真を使って答えに入ったので、 Column からは読んでいない)。
+    #[test]
+    fn forgotten_true_record_still_expands() {
+        const COMPANY: u16 = 0;
+        const CITY: u16 = 1;
+        const SIZE: u16 = 2;
+        let reg = Arc::new(LiveRegistry::new(0));
+        let f = Mutex::new(Fake::default());
+        // 会社 100 (city=2、 size=10) に user 1..=3
+        write(&reg, &f, CITY, 100, Some(2));
+        write(&reg, &f, SIZE, 100, Some(10));
+        for u in 1..=3 {
+            write(&reg, &f, COMPANY, u, Some(100));
+        }
+        let via = |h: u16, v: u64| LivePred::Via { path: vec![COMPANY], pred: Box::new(LivePred::Eq { himo_id: h, value: v }) };
+        let q1 = reg.register(vec![via(CITY, 1), via(SIZE, 10)], false);
+        q1.seed(&f);
+        assert!(q1.poll_with(&f).is_empty());
+        // 会社 100 が真になる: settle が会社を評価して記録 = 真、 配下は記録の答えで入る
+        write(&reg, &f, CITY, 100, Some(1));
+        assert_eq!(q1.poll_with(&f).added, vec![1, 2, 3]);
+        // 同じ形で値の違う購読 (city=5、 size=10) を足す = size=10 の会社の記録を不明に戻す (`forget_stale` は全部の穴から遡る)。
+        // 登録の時に根まで遡る `walk` は 1 つ目の穴 (city=5) の値で引くので会社 100 に当たらず、 配下は評価し直さない
+        // (記録だけが不明に戻り、 誰も会社 100 を Column から読まない)
+        let q2 = reg.register(vec![via(CITY, 5), via(SIZE, 10)], false);
+        q2.seed(&f);
+        assert!(q2.poll_with(&f).is_empty());
+        assert!(q1.poll_with(&f).is_empty());
+        // 会社 100 が偽になる: 記録は不明だが、 真と評価したことがある → 配下を出す
+        write(&reg, &f, CITY, 100, Some(3));
+        assert_eq!(q1.poll_with(&f).removed, vec![1, 2, 3]);
+        assert_eq!(q1.count_with(&f), 0);
+    }
+
+    /// 2 段 (user → company → region) でも同じ: 記録の無い地域の答えの変わらない書き換えは配下を引かず、 根の評価で真と
+    /// 読んだだけの地域が偽になれば、 その地域の会社と社員を出す。
+    #[test]
+    fn unrecorded_grandparent_expands_only_if_read_as_true() {
+        const COMPANY: u16 = 0;
+        const REGION: u16 = 1;
+        const NAME: u16 = 2;
+        let reg = Arc::new(LiveRegistry::new(0));
+        let f = Mutex::new(Fake::default());
+        // 地域 1000 (name=7) に会社 100、 地域 2000 (name=8) に会社 200。 会社 100 に user 1..=2、 会社 200 に user 3..=4
+        write(&reg, &f, NAME, 1000, Some(7));
+        write(&reg, &f, NAME, 2000, Some(8));
+        write(&reg, &f, REGION, 100, Some(1000));
+        write(&reg, &f, REGION, 200, Some(2000));
+        for u in 1..=4 {
+            write(&reg, &f, COMPANY, u, Some(if u <= 2 { 100 } else { 200 }));
+        }
+        let q = reg.register(vec![LivePred::Via {
+            path: vec![COMPANY, REGION],
+            pred: Box::new(LivePred::Eq { himo_id: NAME, value: 7 }),
+        }], false);
+        q.seed(&f);
+        assert_eq!(q.poll_with(&f).added, vec![1, 2]);
+        f.lock().pulls.clear();
+        write(&reg, &f, NAME, 2000, Some(9));
+        assert!(q.poll_with(&f).is_empty());
+        assert!(!f.lock().pulls.contains(&(REGION, 2000)), "答えの変わらない地域の配下を引いた: {:?}", f.lock().pulls);
+        write(&reg, &f, NAME, 1000, Some(9));
+        assert_eq!(q.poll_with(&f).removed, vec![1, 2]);
+        write(&reg, &f, NAME, 2000, Some(7));
+        assert_eq!(q.poll_with(&f).added, vec![3, 4]);
     }
 
     /// 親は子の記録を使う (Column を読み直さない)。 記録の後に子が書き換わっても、 その書き込みの
