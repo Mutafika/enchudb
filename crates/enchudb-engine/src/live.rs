@@ -1124,8 +1124,88 @@ impl<T: MarkKey> Marks<T> {
         std::mem::take(&mut self.list)
     }
 
+    /// 昇順・重複なしに畳んで中身を見せる ([`clear`](Self::clear) で空にする)。
+    fn sorted(&mut self) -> &[T] {
+        self.compact();
+        &self.list
+    }
+
+    /// 空にする。 小さい buffer は次の印に使い回す (購読ごとの印は poll のたびに空になるので、 取り出して捨てると購読 1 万本で
+    /// 1 書き込みあたり 2 回の確保と解放が乗っていた)。 大きい buffer (印の多い poll の後) は手放す。
+    fn clear(&mut self) {
+        self.clean = 0;
+        if self.list.capacity() > 64 {
+            self.list = Vec::new();
+        } else {
+            self.list.clear();
+        }
+    }
+
     fn is_empty(&self) -> bool {
         self.list.is_empty()
+    }
+}
+
+/// 昇順・重複なしの短い並び。 1 つまでは heap を使わない (値の違う等値の購読を束ねた family では、 鍵の member も member の
+/// 根の鍵も 1 つが普通。 根の出入りのたびに 「鍵 → member の並び → member」 と、 差分を取り出す時に 「member → 根の鍵」 と
+/// 読む鎖が、 heap の分だけ 1 段ずつ短くなる)。
+#[derive(Default)]
+enum Few<T> {
+    #[default]
+    Zero,
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T> std::ops::Deref for Few<T> {
+    type Target = [T];
+    #[inline]
+    fn deref(&self) -> &[T] {
+        match self {
+            Few::Zero => &[],
+            Few::One(x) => std::slice::from_ref(x),
+            Few::Many(v) => v,
+        }
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Few<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<T: Ord + Copy> Few<T> {
+    /// 足す (もう居れば何もしない)。 足したら true。
+    fn insert(&mut self, x: T) -> bool {
+        let Err(p) = self.binary_search(&x) else { return false };
+        *self = match std::mem::take(self) {
+            Few::Zero => Few::One(x),
+            Few::One(y) => Few::Many(if p == 0 { vec![x, y] } else { vec![y, x] }),
+            Few::Many(mut v) => {
+                v.insert(p, x);
+                Few::Many(v)
+            }
+        };
+        true
+    }
+
+    /// `keep` が false のものを外す。
+    fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
+        *self = match std::mem::take(self) {
+            Few::One(x) if keep(&x) => Few::One(x),
+            Few::Many(mut v) => {
+                v.retain(|x| keep(x));
+                match v.len() {
+                    0 => Few::Zero,
+                    1 => Few::One(v[0]),
+                    _ => Few::Many(v),
+                }
+            }
+            _ => Few::Zero,
+        };
     }
 }
 
@@ -1371,6 +1451,11 @@ impl KeyTable {
         let w = self.width;
         if w == 0 {
             return if self.ids.is_empty() { Err(0) } else { Ok(0) };
+        }
+        if w == 1 {
+            // 鍵が 1 語 (穴 1 つ / 穴のある子 1 本) なら u64 の並びをそのまま引く (根の評価ごとに節の数だけ引くので、
+            // 下の slice の比較の loop は購読 1 万本で 1 書き込みあたり 145 ns かかっていた)
+            return self.keys.binary_search(&k[0]);
         }
         let (mut lo, mut hi) = (0, self.ids.len());
         while lo < hi {
@@ -2121,7 +2206,7 @@ struct Member {
     /// vocab にまだ無い選択肢は、 現れるまでここに残る。
     alts: Vec<Vec<HoleVal>>,
     /// 有効化した鍵の根の鍵 id (昇順)。 根の鍵がどれかに一致すれば集合に居る。
-    root_keys: Vec<u32>,
+    root_keys: Few<u32>,
     /// 範囲の穴の範囲 (family に範囲の穴がある時。 束ねる枝は範囲が同じもの)。
     range: Option<(u64, u64)>,
     /// 範囲を帯に載せたか。
@@ -2290,9 +2375,9 @@ impl Member {
         let mut delta = KeyedDelta::default();
         let probe = Member::probe(&self.root_keys, self.range, None);
         let Some(ks) = self.keyed.as_mut() else { return delta };
-        let left_set = self.left.take();
+        let left_set = self.left.sorted();
         let mut li = 0;
-        for eid in self.changed.take() {
+        for &eid in self.changed.sorted() {
             let a = root(eid);
             let now = a.filter(|_| probe(eid, a)).map(|a| a.1);
             let was = ks.reported.get(eid).checked_sub(1);
@@ -2315,6 +2400,8 @@ impl Member {
             }
             ks.reported.put(eid, now.map_or(0, |n| n + 1));
         }
+        self.left.clear();
+        self.changed.clear();
         delta
     }
 
@@ -2345,9 +2432,9 @@ fn drain_marks(changed: &mut Marks, left: &mut Marks, reported: &mut Bits, now: 
         return delta;
     }
     // changed も left も昇順なので、 left は突き合わせで引く
-    let left_set = left.take();
+    let left_set = left.sorted();
     let mut li = 0;
-    for eid in changed.take() {
+    for &eid in changed.sorted() {
         let now = now(eid);
         let was = reported.get(eid);
         while li < left_set.len() && left_set[li] < eid {
@@ -2366,6 +2453,8 @@ fn drain_marks(changed: &mut Marks, left: &mut Marks, reported: &mut Bits, now: 
         }
         reported.put(eid, now);
     }
+    left.clear();
+    changed.clear();
     delta
 }
 
@@ -2404,6 +2493,9 @@ struct Settled {
     /// 張り替えのたびに伸び続ける — 生きている鍵だけを並べて二分探索で引く。 根の記録に外れた鍵の
     /// id が残っていても、 ここに無ければ無視する。
     keys: Vec<RootKey>,
+    /// `keys` の id だけを同じ順に並べたもの。 id から添字を引く二分探索はこちらを引く (`RootKey` は大きいので、
+    /// 鍵が 1 万あると `keys` の上の二分探索は段ごとに別の cache line を読む)。 `keys` と一緒に足し / 外す
+    key_ids: Vec<u32>,
     members: Vec<Option<Member>>,
     /// 未有効化の member (登録直後 / text が vocab にまだ無い)。
     dormant: Vec<usize>,
@@ -2415,6 +2507,8 @@ struct Settled {
     fresh: Vec<usize>,
     /// 次の settle は答えが変わらなくても展開する (`fresh` の初回の報告のため)。
     force: bool,
+    /// settle の根の loop の、 評価した答えの置き場 (poll のたびに確保し直さない。 1 件ずつ poll すると確保と解放が効く)。
+    nows: Vec<(u32, Option<Ans>)>,
     /// 合計する列のある集計の family: 根ごとに、 今数えている合計の値 + 1 (0 = 値が無い、 `Family::sum`)。
     summand: ValWords,
     /// `Exists` ごと: 指している entity (中身を満たすもの) が 1 つ以上ある entity。 `Family::exists` の
@@ -2479,11 +2573,11 @@ struct KeyCache {
 
 impl KeyCache {
     #[inline]
-    fn find(&mut self, keys: &[RootKey], id: u32) -> Option<usize> {
+    fn find(&mut self, key_ids: &[u32], id: u32) -> Option<usize> {
         if let Some((_, i)) = self.slots.iter().flatten().find(|(k, _)| *k == id) {
             return *i;
         }
-        let i = keys.binary_search_by_key(&id, |k| k.id).ok();
+        let i = key_ids.binary_search(&id).ok();
         self.slots[self.next] = Some((id, i));
         self.next ^= 1;
         i
@@ -2493,7 +2587,7 @@ impl KeyCache {
 /// 根の鍵 1 つ: その鍵の member と、 現在その鍵の根の数。
 struct RootKey {
     id: u32,
-    members: Vec<usize>,
+    members: Few<usize>,
     count: usize,
     /// 範囲の穴のある family: member の範囲の索引 (member が変わったら None に戻して作り直す)。
     ivs: Option<Ivs>,
@@ -2761,7 +2855,7 @@ impl RootKey {
     fn new(id: u32) -> Self {
         RootKey {
             id,
-            members: Vec::new(),
+            members: Few::Zero,
             count: 0,
             ivs: None,
             bands: None,
@@ -3049,7 +3143,7 @@ impl RootKey {
 impl Settled {
     #[inline]
     fn key(&mut self, id: u32) -> Option<&mut RootKey> {
-        let i = self.keys.binary_search_by_key(&id, |k| k.id).ok()?;
+        let i = self.key_ids.binary_search(&id).ok()?;
         Some(&mut self.keys[i])
     }
 
@@ -3062,12 +3156,14 @@ impl Settled {
             slabs: Slabs::default(),
             tables: widths.iter().map(|&w| KeyTable::new(w)).collect(),
             keys: Vec::new(),
+            key_ids: Vec::new(),
             members: Vec::new(),
             dormant: Vec::new(),
             ready: Vec::new(),
             partial: std::collections::BTreeMap::new(),
             fresh: Vec::new(),
             force: false,
+            nows: Vec::new(),
             summand: ValWords::default(),
             exists: Vec::new(),
             order_view: None,
@@ -3250,9 +3346,9 @@ impl Settled {
             self.vals[0].put(eid, now.map_or(0, |a| a.1 + 1));
         }
         let ranged = mode == RootMode::Ranged;
-        let Settled { keys, members, ready, slabs, .. } = self;
-        let iw = was.and_then(|a| cache.find(keys, a.0));
-        let inw = now.and_then(|a| cache.find(keys, a.0));
+        let Settled { keys, key_ids, members, ready, slabs, .. } = self;
+        let iw = was.and_then(|a| cache.find(key_ids, a.0));
+        let inw = now.and_then(|a| cache.find(key_ids, a.0));
         if let RootMode::Ordered(desc) = mode {
             for (k, ans, enter) in [(iw, was, false), (inw, now, true)] {
                 let (Some(i), Some((_, v))) = (k, ans) else { continue };
@@ -3745,7 +3841,7 @@ impl Family {
         let m = Member {
             id,
             alts,
-            root_keys: Vec::new(),
+            root_keys: Few::Zero,
             range,
             range_on: false,
             tuples: Vec::new(),
@@ -3896,6 +3992,7 @@ impl Family {
                 rk.order = OrderIndex::Blocks(Blocks::default());
             }
             s.keys.push(rk);
+            s.key_ids.push(ids[0]);
         }
         ids[0]
     }
@@ -3912,8 +4009,9 @@ impl Family {
             ids[n] = s.tables[n].find(&buf).unwrap_or(u32::MAX);
             s.tables[n].release(&buf);
             let gone = n == 0 && s.tables[0].find(&buf).is_none();
-            if let Some(i) = gone.then(|| s.keys.binary_search_by_key(&ids[0], |k| k.id).ok()).flatten() {
+            if let Some(i) = gone.then(|| s.key_ids.binary_search(&ids[0]).ok()).flatten() {
                 s.keys.remove(i);
+                s.key_ids.remove(i);
                 // 外れた鍵の部分和 (根の記録には外れた鍵の id が残るが、 部分和に無ければ動かさない)
                 if self.partial.is_some() {
                     let k = ids[0];
@@ -4142,17 +4240,14 @@ impl Family {
         self.forget_stale(r, s, &tuple);
         let roots = self.walk(r, &tuple, range, &s.exists);
         if let Some(rk) = s.key(id)
-            && let Err(p) = rk.members.binary_search(&slot)
+            && rk.members.insert(slot)
         {
-            rk.members.insert(p, slot);
             rk.ivs = None;
             rk.bands = None;
         }
         let Settled { members, ready, keys, fresh, force, .. } = &mut *s;
         let Some(m) = members[slot].as_mut() else { return };
-        if let Err(p) = m.root_keys.binary_search(&id) {
-            m.root_keys.insert(p, id);
-        }
+        m.root_keys.insert(id);
         m.tuples.push(tuple);
         if let Some(g) = m.grp.as_mut() {
             // 集計: 件数は鍵が持つ。 既にある鍵なら今の group を全部初回の報告に積む
@@ -4319,7 +4414,7 @@ impl Family {
         for e in freed {
             // 報告済みの根が解放された = 呼び手の持つ eid は別物になりうる。 今の鍵と違う
             // member の報告済みは、 鍵が変わった時点で left + changed を積まれている
-            if let Some(i) = s.recs[0].key(e).and_then(|k| s.keys.binary_search_by_key(&k, |x| x.id).ok()) {
+            if let Some(i) = s.recs[0].key(e).and_then(|k| s.key_ids.binary_search(&k).ok()) {
                 let Settled { keys, members, ready, .. } = &mut *s;
                 for &slot in &keys[i].members {
                     if let Some(m) = members[slot]
@@ -4388,9 +4483,16 @@ impl Family {
                     }
                 }
                 // 印の付いた根 (ref や根の条件の紐が書かれた) は全部読み直し、 上の近道より後に
-                // 当てる (逆引きの後に ref が書き換わった根は、 こちらの今の Column の答えが勝つ)
-                for e in list {
-                    let now = self.eval(r, s, 0, e);
+                // 当てる (逆引きの後に ref が書き換わった根は、 こちらの今の Column の答えが勝つ)。
+                // 先に全員を評価してから当てる: 根の評価は根の記録・鍵・member を読まないので、 当てる順は変わらない。 1 人ずつ
+                // 評価と当てを交互にすると、 どちらも heap の別々の所を読みに行く待ちが 1 人ずつ直列に並ぶ (分けると各 loop が
+                // 短くなり、 次の人の読みが前の人の待ちに重なる)
+                if list.is_empty() {
+                    continue;
+                }
+                let mut nows = std::mem::take(&mut s.nows);
+                nows.extend(list.into_iter().map(|e| (e, self.eval(r, s, 0, e))));
+                for &(e, now) in &nows {
                     match (self.partial.or(self.order_part), mode) {
                         (Some(c1), _) => {
                             let g = now.map_or(0, |a| a.1);
@@ -4403,6 +4505,11 @@ impl Family {
                         }
                         (None, _) => s.apply_root_cached(e, now, summand(e), mode, &mut cache, &fresh),
                     }
+                }
+                // 大きい置き場 (印の多い poll の後) は手放す
+                if nows.capacity() <= 1024 {
+                    nows.clear();
+                    s.nows = nows;
                 }
                 continue;
             }
@@ -4933,6 +5040,18 @@ impl LiveRegistry {
             let mut guard = f.settled.lock();
             f.settle(r, &mut guard);
             let Settled { recs, vals, members, ready, opart, order_view, .. } = &mut *guard;
+            out.reserve(ready.len());
+            // 先に各 member の報告済みの集合を、 最初の印の entity の所まで読んでおく (集合は heap を 2 段たどるので、 member を 1 つ
+            // ずつ取り出すと、 その待ちが member の数だけ直列に並ぶ。 読むだけの短い loop なら待ちが重なる)
+            let mut touch = false;
+            for &slot in ready.iter() {
+                if let Some(m) = members[slot].as_ref()
+                    && let Some(&e) = m.changed.list.first()
+                {
+                    touch ^= m.reported.get(e);
+                }
+            }
+            std::hint::black_box(touch);
             for slot in std::mem::take(ready) {
                 let Some(m) = members[slot].as_mut() else { continue };
                 let union = m.union.as_ref().map(|(w, i)| (w.upgrade(), *i));
@@ -4977,8 +5096,7 @@ impl LiveRegistry {
                 out.push((u.id, d));
             }
         }
-        out.sort_unstable_by_key(|(id, _)| *id);
-        out
+        sort_by_id(out)
     }
 
     fn unregister(&self, family: &Arc<Family>, slot: usize) {
@@ -4999,6 +5117,18 @@ impl LiveRegistry {
         // `Exists` の集計の購読の解除は edit lock を取るので、 離してから
         drop(dead);
     }
+}
+
+/// `(id, 差分)` を id の昇順に。 要素は 56 B あるので、 (id, 添字) の組を整列してから並べ替える (要素ごと整列すると、 購読 1 万本の
+/// 100 件まとめで 1 書き込みあたり 0.03 µs かかっていた)。
+fn sort_by_id(out: Vec<(u64, LiveDelta)>) -> Vec<(u64, LiveDelta)> {
+    if out.is_sorted_by_key(|(id, _)| *id) {
+        return out;
+    }
+    let mut ord: Vec<(u64, u32)> = out.iter().enumerate().map(|(i, (id, _))| (*id, i as u32)).collect();
+    ord.sort_unstable();
+    let mut slots: Vec<Option<(u64, LiveDelta)>> = out.into_iter().map(Some).collect();
+    ord.into_iter().filter_map(|(_, i)| slots[i as usize].take()).collect()
 }
 
 /// `Or` の購読: 枝 (AND の購読、 family の member) の差分を積んで、 どれかの枝に居る entity の
@@ -6302,6 +6432,46 @@ mod tests {
         assert_eq!(q.count_with(&f), 2);
     }
 
+    /// 差分を取り出したら member の印 (changed / left) は空になる。 残すと次の poll で同じ entity を見直し続け (差分は同じでも
+    /// 手間が溜まる)、 left に残った entity は、 後で集合に居たまま印が付いた時に 「出て入り直した」 と誤って出うる。
+    /// 印の buffer は使い回すので (`Marks::clear`)、 空にし忘れても差分の答えはほぼ変わらない — 状態を直に見る。
+    #[test]
+    fn drain_empties_member_marks() {
+        let reg = Arc::new(LiveRegistry::new(0));
+        let f = Mutex::new(Fake::default());
+        let q = reg.register(vec![LivePred::Eq { himo_id: 0, value: 30 }], false);
+        let k = reg.register_keyed(vec![vec![LivePred::Eq { himo_id: 0, value: 30 }]], (vec![], 1)).unwrap();
+        let empty = |fam: &Family, slot: usize| {
+            let s = fam.settled.lock();
+            let m = s.members[slot].as_ref().unwrap();
+            m.changed.is_empty() && m.left.is_empty()
+        };
+        let Kind::One { family, slot } = &q.kind else { panic!("AND の購読") };
+        write(&reg, &f, 0, 1, Some(30));
+        write(&reg, &f, 1, 1, Some(5));
+        write(&reg, &f, 0, 2, Some(30));
+        assert_eq!(q.poll_with(&f).added, vec![1, 2]);
+        assert!(empty(family, *slot), "初回の報告の後");
+        // 出たのを評価してから戻る (left が立つ)
+        write(&reg, &f, 0, 1, Some(31));
+        assert_eq!(q.count_with(&f), 1);
+        write(&reg, &f, 0, 1, Some(30));
+        assert_eq!(q.poll_with(&f), LiveDelta { added: vec![1], removed: vec![1] });
+        assert!(empty(family, *slot), "出て入り直した後");
+        assert_eq!(k.poll_with(&f).added, vec![(1, 5)]);
+        assert!(empty(&k.family, k.slot), "鍵付きの初回の報告の後");
+        write(&reg, &f, 1, 1, Some(6));
+        let d = k.poll_with(&f);
+        assert_eq!((d.added, d.removed), (vec![(1, 6)], vec![(1, 5)]));
+        assert!(empty(&k.family, k.slot), "鍵付きの鍵の変化の後");
+        // 解放 (鍵付きにも left が立つ)
+        write(&reg, &f, 0, 1, None);
+        reg.freed(1);
+        write(&reg, &f, 0, 1, Some(30));
+        assert_eq!(k.poll_with(&f).reentered, vec![1]);
+        assert!(empty(&k.family, k.slot), "鍵付きの出て入り直した後");
+    }
+
     /// 解放された報告済みの根が、 poll の間に同じ eid で条件を満たし直したら removed + added。
     #[test]
     fn freed_root_reported_as_leave_and_reenter() {
@@ -7137,5 +7307,54 @@ mod tests {
         assert_eq!(reg.orders_on(5).map(|o| o.via).collect::<Vec<_>>(), vec![5], "via の紐からは 1 つ");
         assert!(reg.remove_order(5) && !reg.remove_order(5), "外せるのは 1 回");
         assert!(reg.orders_on(5).next().is_none() && reg.orders().count() == MAX_ORDERS - 3);
+    }
+
+    /// [`Few`] は昇順・重複なしの並びとして `BTreeSet` と同じに振る舞い、 0 / 1 個の時は heap を持たない形 (`Zero` / `One`) に戻る。
+    #[test]
+    fn few_matches_a_sorted_set() {
+        let mut seed = 11u64;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        let mut few: Few<u32> = Few::default();
+        let mut want = std::collections::BTreeSet::new();
+        for step in 0..20_000 {
+            let x = rnd() % 6;
+            match rnd() % 3 {
+                0 | 1 => assert_eq!(few.insert(x), want.insert(x), "step {step}: insert {x}"),
+                _ => {
+                    few.retain(|&y| y != x);
+                    want.remove(&x);
+                }
+            }
+            assert!(few.iter().copied().eq(want.iter().copied()), "step {step}: {:?} vs {want:?}", &*few);
+            let shape_ok = match &few {
+                Few::Zero => want.is_empty(),
+                Few::One(_) => want.len() == 1,
+                Few::Many(v) => v.len() >= 2,
+            };
+            assert!(shape_ok, "step {step}: 形が数と合わない ({} 個)", want.len());
+        }
+    }
+
+    /// [`Marks::sorted`] は昇順・重複なし、 [`Marks::clear`] は空にして、 小さい buffer だけを次に使い回す。
+    #[test]
+    fn marks_clear_keeps_only_small_buffers() {
+        let mut m: Marks = Marks::default();
+        for e in [5, 3, 5, 9, 3] {
+            m.add(e);
+        }
+        assert_eq!(m.sorted(), &[3, 5, 9]);
+        m.clear();
+        assert!(m.is_empty() && m.clean == 0);
+        assert!(m.list.capacity() > 0, "小さい buffer は残す");
+        for e in 0..1000 {
+            m.add(e);
+        }
+        m.clear();
+        assert!(m.is_empty() && m.list.capacity() == 0, "大きい buffer は手放す");
+        m.add(7);
+        assert_eq!(m.sorted(), &[7], "空にした後も使える");
     }
 }
