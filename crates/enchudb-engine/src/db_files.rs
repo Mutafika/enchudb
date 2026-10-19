@@ -21,6 +21,9 @@ pub const EIDMAP: &str = "eidmap";
 pub const VOCABMAP: &str = "vocabmap";
 /// #513: 消した主キーの記録 (`crate::pk_tombs`)。
 pub const PKTOMBS: &str = "pktombs";
+/// #178: 翻訳の別名 (同じ entity の 2 つ目の世界番号、 `EidTranslator::alias`)。 `eidmap` と分けて置くので、 読まない旧 binary
+/// は別名を知らないだけ (前と同じ 2 行のまま) で済む。
+pub const EIDALIAS: &str = "eidalias";
 /// region CRC table (`integrity`)。
 pub const CRC: &str = "crc";
 /// writer 排他 (flock)。 中身は空。
@@ -36,13 +39,14 @@ pub const SEGMENTS: &str = "segments";
 pub const CREATING: &str = "creating";
 
 /// segment 以外に DB directory へ置かれ得る file 名の一覧 (migrate / copy 用)。
-pub const ALL: [&str; 9] = [OPLOG, TABLES, EIDMAP, VOCABMAP, PKTOMBS, CRC, LOCK, SCHEMA, SEGMENTS];
+pub const ALL: [&str; 10] = [OPLOG, TABLES, EIDMAP, EIDALIAS, VOCABMAP, PKTOMBS, CRC, LOCK, SCHEMA, SEGMENTS];
 
 /// HTTP bootstrap (`/bootstrap/{name}`) で本体と別に配る sidecar。 `.eidmap` 無しの
 /// restore は再 sync で重複 entity / tombstone 喪失、 `.vocabmap` 無しは受信済み `Vocab`
 /// の写像喪失を起こす (#78-H9)。 `pktombs` 無しは、 それまでに消した主キーの行が、 後から届いた同じ主キーの
-/// 古い行に当たらない (#513。 旧 server は 404 を返し、 受け手は無しで続ける)。
-pub const BOOTSTRAP: [&str; 4] = [EIDMAP, TABLES, VOCABMAP, PKTOMBS];
+/// 古い行に当たらない (#513。 旧 server は 404 を返し、 受け手は無しで続ける)。 `eidalias` 無しは、 畳んだ行の世界番号宛ての
+/// record が新しい行として払い出される (#178)。
+pub const BOOTSTRAP: [&str; 5] = [EIDMAP, EIDALIAS, TABLES, VOCABMAP, PKTOMBS];
 
 /// `{db_dir}/{name}`。
 pub fn path_for(db_path: impl AsRef<Path>, name: &str) -> PathBuf {

@@ -26,6 +26,14 @@
 //!
 //! `.eidmap` sidecar (engine 側) に forward entry を永続化し、 open 時に
 //! `insert` 経由で両方向を復元する。
+//!
+//! # 別名 (#178)
+//!
+//! 同じ entity が 2 つの世界番号で知られることがある (2 台が同じ自然キーの行を別々に作ってから束ねた)。 2 つ目の世界番号は
+//! **別名** (`alias`) として forward だけを張る: 別名宛ての record も同じ local に当たるが、 その local に書いた record の宛名
+//! (逆写像) は変えない。 別名は `.eidmap` に入れない (`snapshot` は別名を除く。 入れると、 開き直した時の `insert` が逆写像を
+//! 別名で上書きしうる)。 engine は別の sidecar (`eidalias`) に置く (`alias_snapshot`)。 slot を手放す時 (`remove_local`) は
+//! 別名も一緒に外す (残すと、 別名宛ての record が使い回された slot の別の行に入る)。
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -44,6 +52,9 @@ pub struct EidTranslator {
     /// 2. write-back の宛名解決 — bridge が self-authored write を元 entity の
     ///    世界番号に書き戻して発送する (`reverse`)
     translated_locals: RwLock<HashMap<u32, Key>>,
+    /// #178: local → その local を指す別名の key (forward だけの写像、 module doc の 「別名」)。 lock の順は
+    /// `inner` → `translated_locals` → `aliases`。
+    aliases: RwLock<HashMap<u32, Vec<Key>>>,
     /// #226: replica を保持している author の一覧。 relay が `serve_state` で
     /// 「どの author の state を配れるか」を pull ごとに引くので、 写像全体の
     /// 走査 (O(entry 数)) を避けるための索引。
@@ -75,6 +86,7 @@ impl EidTranslator {
         Self {
             inner: RwLock::new(HashMap::new()),
             translated_locals: RwLock::new(HashMap::new()),
+            aliases: RwLock::new(HashMap::new()),
             authors: RwLock::new(std::collections::BTreeSet::new()),
             alloc_lock: std::sync::Mutex::new(()),
         }
@@ -100,22 +112,77 @@ impl EidTranslator {
     /// 写像を登録 (上書き)。 recovery 復元時にも使う。 同 key の上書きで local が
     /// 変わる場合は stale な逆写像 entry を掃除する。
     pub fn insert(&self, author_peer: PeerId, foreign_local: u32, local: u32) {
+        let key = (author_peer, foreign_local);
         let mut guard = self.inner.write().unwrap();
-        let old = guard.insert((author_peer, foreign_local), local);
+        let old = guard.insert(key, local);
         drop(guard);
         let mut rev = self.translated_locals.write().unwrap();
         if let Some(old_local) = old {
-            if old_local != local {
+            // #178: 前の local の逆写像がこの key の時だけ外す (key がその local の別名だった時、 その local の逆写像は別の key)
+            if old_local != local && rev.get(&old_local) == Some(&key) {
                 rev.remove(&old_local);
             }
         }
-        rev.insert(local, (author_peer, foreign_local));
+        rev.insert(local, key);
         drop(rev);
+        // #178: 別名だった key なら別名から外す (この local の逆写像になった / 他の local の別名だった)
+        if let Some(old_local) = old {
+            let mut al = self.aliases.write().unwrap();
+            drop_alias(&mut al, old_local, key);
+            drop_alias(&mut al, local, key);
+        }
         // #226: author 索引。 lock は単独で取る (`inner` / `translated_locals` と
         // 同時には保持しないので、 既存の順序制約に影響しない)。
         if !self.authors.read().unwrap().contains(&author_peer) {
             self.authors.write().unwrap().insert(author_peer);
         }
+    }
+
+    /// #178: `(author_peer, foreign_local)` を `local` の別名にする (同じ entity の 2 つ目の世界番号、 module doc の 「別名」)。
+    /// forward だけを張り、 `local` の逆写像 (書き戻しの宛名) は変えない。 key が他の local を指していたら外す: その local の
+    /// 逆写像だったなら、 その local はもう翻訳先ではない (畳まれた側)。 key が `local` の逆写像そのものなら何もしない。
+    pub fn alias(&self, author_peer: PeerId, foreign_local: u32, local: u32) {
+        let key = (author_peer, foreign_local);
+        let mut fwd = self.inner.write().unwrap();
+        let mut rev = self.translated_locals.write().unwrap();
+        let mut al = self.aliases.write().unwrap();
+        if let Some(old) = fwd.insert(key, local)
+            && old != local
+        {
+            if rev.get(&old) == Some(&key) {
+                rev.remove(&old);
+            }
+            drop_alias(&mut al, old, key);
+        }
+        if rev.get(&local) != Some(&key) {
+            let v = al.entry(local).or_default();
+            if !v.contains(&key) {
+                v.push(key);
+            }
+        }
+        drop((fwd, rev, al));
+        if !self.authors.read().unwrap().contains(&author_peer) {
+            self.authors.write().unwrap().insert(author_peer);
+        }
+    }
+
+    /// #178: `local` を指す別名 (別名でなく逆写像の key は含まない)。
+    pub fn aliases_of(&self, local: u32) -> Vec<Key> {
+        self.aliases.read().unwrap().get(&local).cloned().unwrap_or_default()
+    }
+
+    /// #178: 別名の snapshot (sidecar `eidalias` の永続化用)。 各要素 = (author_peer, foreign_local, local)。
+    pub fn alias_snapshot(&self) -> Vec<(PeerId, u32, u32)> {
+        let fwd = self.inner.read().unwrap();
+        let al = self.aliases.read().unwrap();
+        let mut out: Vec<(PeerId, u32, u32)> = al
+            .iter()
+            .flat_map(|(&local, keys)| keys.iter().map(move |&k| (k, local)))
+            .filter(|(k, local)| fwd.get(k) == Some(local))
+            .map(|((peer, foreign_local), local)| (peer, foreign_local, local))
+            .collect();
+        out.sort_unstable();
+        out
     }
 
     /// #226: replica を保持している author の一覧 (grow-only、 `authors` field 参照)。
@@ -188,17 +255,30 @@ impl EidTranslator {
     /// **戻り値を捨ててはいけない**: 呼び元は外した identity 宛の tombstone を
     /// slot から退避する責務がある (`Engine::evict_translation_for_reuse`)。
     /// これを怠ると 「破壊」 が 「削除済み entity の復活」 に化けるだけになる。
+    ///
+    /// #178: その local を指す別名も外して返す (逆写像の key が先頭。 別名を残すと、 別名宛ての record が新しい住人に入る)。
     #[must_use = "外した identity の tombstone を退避しないと削除済み entity が復活する (#166)"]
-    pub fn remove_local(&self, local: u32) -> Option<Key> {
-        // lock 順序は `inner` → `translated_locals` に固定する (`insert` は両方を
-        // 同時には保持しないので、 この順序だけ守れば cycle は生じない)。
+    pub fn remove_local(&self, local: u32) -> Vec<Key> {
+        // lock 順序は `inner` → `translated_locals` → `aliases` に固定する (`insert` は同時には保持しないので、 この順序
+        // だけ守れば cycle は生じない)。
         let mut fwd = self.inner.write().unwrap();
-        let key = self.translated_locals.write().unwrap().remove(&local)?;
-        // 同 key が別 local に張り替わっている可能性があるので、 一致する時だけ消す。
-        if fwd.get(&key) == Some(&local) {
-            fwd.remove(&key);
+        let mut out = Vec::new();
+        if let Some(key) = self.translated_locals.write().unwrap().remove(&local) {
+            // 同 key が別 local に張り替わっている可能性があるので、 一致する時だけ消す。
+            if fwd.get(&key) == Some(&local) {
+                fwd.remove(&key);
+            }
+            out.push(key);
         }
-        Some(key)
+        if let Some(keys) = self.aliases.write().unwrap().remove(&local) {
+            for key in keys {
+                if fwd.get(&key) == Some(&local) {
+                    fwd.remove(&key);
+                    out.push(key);
+                }
+            }
+        }
+        out
     }
 
     pub fn len(&self) -> usize {
@@ -209,13 +289,26 @@ impl EidTranslator {
         self.len() == 0
     }
 
-    /// 全 entry の snapshot (sidecar 永続化用)。 各要素 = (author_peer, foreign_local, local)。
+    /// 全 entry の snapshot (sidecar 永続化用)。 各要素 = (author_peer, foreign_local, local)。 #178: 別名は除く
+    /// ([`alias_snapshot`](Self::alias_snapshot) が持つ)。
     pub fn snapshot(&self) -> Vec<(PeerId, u32, u32)> {
         let guard = self.inner.read().unwrap();
+        let al = self.aliases.read().unwrap();
         guard
             .iter()
+            .filter(|&(k, local)| al.get(local).is_none_or(|keys| !keys.contains(k)))
             .map(|(&(peer, foreign_local), &local)| (peer, foreign_local, local))
             .collect()
+    }
+}
+
+/// `local` の別名の並びから `key` を外す (空になったら並びごと)。
+fn drop_alias(al: &mut HashMap<u32, Vec<Key>>, local: u32, key: Key) {
+    if let Some(v) = al.get_mut(&local) {
+        v.retain(|&k| k != key);
+        if v.is_empty() {
+            al.remove(&local);
+        }
     }
 }
 
@@ -252,18 +345,49 @@ mod tests {
         assert_eq!(t.reverse(9), Some((1, 42)));
     }
 
+    /// #178: 別名は forward だけを張る (逆写像は変えない)。 他の local の逆写像だった key を別名にすると、 その local は
+    /// 翻訳先でなくなる。 `snapshot` は別名を除き、 `alias_snapshot` が持つ。 `remove_local` は別名も外して返す。 逆写像として
+    /// `insert` し直すと別名から外れる。
+    #[test]
+    fn alias_maps_forward_only() {
+        let t = EidTranslator::new();
+        t.insert(1, 42, 7); // 7 は (1, 42) の写し
+        t.insert(2, 50, 8); // 8 は (2, 50) の写し
+        t.alias(1, 42, 8); // (1, 42) を 8 の別名に (7 を 8 に畳んだ)
+        assert_eq!(t.get(1, 42), Some(8));
+        assert_eq!(t.reverse(8), Some((2, 50)), "別名が逆写像を変えた");
+        assert_eq!(t.reverse(7), None, "畳まれた側の逆写像が残った");
+        assert_eq!(t.aliases_of(8), vec![(1, 42)]);
+        assert_eq!(t.snapshot(), vec![(2, 50, 8)], "snapshot に別名が入った");
+        assert_eq!(t.alias_snapshot(), vec![(1, 42, 8)]);
+        t.alias(2, 50, 8); // 逆写像そのものを別名にしても何もしない
+        assert_eq!(t.aliases_of(8), vec![(1, 42)]);
+        // 逆写像として張り直すと別名から外れる
+        t.insert(1, 42, 9);
+        assert!(t.aliases_of(8).is_empty(), "張り直した key が別名に残った");
+        assert_eq!(t.alias_snapshot(), vec![]);
+        t.alias(1, 42, 8);
+        assert_eq!(t.reverse(9), None);
+        // slot を手放すと別名も外れる (逆写像が先頭)
+        let mut gone = t.remove_local(8);
+        gone.sort();
+        assert_eq!(gone, vec![(1, 42), (2, 50)]);
+        assert_eq!((t.get(1, 42), t.get(2, 50)), (None, None));
+        assert!(t.aliases_of(8).is_empty() && t.alias_snapshot().is_empty());
+    }
+
     /// #166: slot 再利用時に写像を外せること。 forward / reverse の両方が消える。
     #[test]
     fn remove_local_drops_both_directions() {
         let t = EidTranslator::new();
         t.insert(1, 42, 7);
-        assert_eq!(t.remove_local(7), Some((1, 42)));
+        assert_eq!(t.remove_local(7), vec![(1, 42)]);
         assert_eq!(t.get(1, 42), None, "forward が残っている");
         assert_eq!(t.reverse(7), None, "reverse が残っている");
         assert!(!t.is_translated_local(7));
         assert_eq!(t.len(), 0);
-        // 2 度目は None (= 既に外れている)
-        assert_eq!(t.remove_local(7), None);
+        // 2 度目は空 (= 既に外れている)
+        assert_eq!(t.remove_local(7), vec![]);
     }
 
     /// レプリカでない local を渡しても何も壊さない。
@@ -271,7 +395,7 @@ mod tests {
     fn remove_local_is_noop_for_unmapped() {
         let t = EidTranslator::new();
         t.insert(1, 42, 7);
-        assert_eq!(t.remove_local(99), None);
+        assert_eq!(t.remove_local(99), vec![]);
         assert_eq!(t.get(1, 42), Some(7), "無関係な写像を巻き込んだ");
     }
 
@@ -283,7 +407,7 @@ mod tests {
         let t = EidTranslator::new();
         t.insert(1, 42, 7);
         t.insert(1, 42, 9); // 張り替え。 reverse(7) はここで消える
-        assert_eq!(t.remove_local(7), None, "既に張り替わっているので何も外さない");
+        assert_eq!(t.remove_local(7), vec![], "既に張り替わっているので何も外さない");
         assert_eq!(t.get(1, 42), Some(9), "張り替え後の写像を巻き込んだ");
         assert_eq!(t.reverse(9), Some((1, 42)));
     }
