@@ -1,0 +1,63 @@
+[package]
+name = "enchudb-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+enchudb-oplog = { path = "../crates/enchudb-oplog" }
+enchudb-engine = { path = "../crates/enchudb-engine" }
+enchudb-sql = { path = "../crates/enchudb-sql" }
+
+# root の workspace (`crates/*`) に入れない (nightly + libFuzzer でしか組まない)
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "wire_decode"
+path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_payload"
+path = "fuzz_targets/sync_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "oplog_file"
+path = "fuzz_targets/oplog_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "packed_open"
+path = "fuzz_targets/packed_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sql_exec"
+path = "fuzz_targets/sql_exec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "make_seeds"
+path = "src/bin/make_seeds.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,53 @@
+name: coverage
+
+# どの道が test で通っていないかの地図 (#98 ①)。 core 5 crate (CI の `test (stable)` と同じ) の test を cargo-llvm-cov で
+# 回し、 file ごとの行 / region / 関数の通った割合を job の summary に出し、 lcov と html を artifact に上げる。
+# gate はしない (割合で落とさない): fuzzing / fault injection / crash matrix をどこに向けるかを決めるための地図。
+# master に入るたびと、 手で回した時だけ (PR ごとには回さない — 計装した debug build で test を全部回すので長い)。
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    name: coverage (core crates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: test (計装)
+        run: >
+          cargo llvm-cov --no-report
+          -p enchudb-oplog
+          -p enchudb-engine
+          -p enchudb-schema
+          -p enchudb-sql
+          -p enchudb-sync
+      - name: report
+        run: |
+          cargo llvm-cov report --lcov --output-path lcov.info
+          cargo llvm-cov report --html --output-dir coverage-html
+          {
+            echo '## coverage (core crates)'
+            echo
+            echo '```'
+            cargo llvm-cov report --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            lcov.info
+            coverage-html
