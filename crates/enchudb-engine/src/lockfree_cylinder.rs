@@ -415,13 +415,17 @@ impl LockFreeCylinder {
     /// 戻り値は `(bucket の raw len, 減分後の live)` — 呼び出し側 (HimoStore) が
     /// incremental compaction の trigger 判定 (stale 率) に使う (P2)。
     pub fn note_stale(&self, value: u64) -> Option<(usize, u32)> {
+        self.note_stale_in(value, &epoch::pin())
+    }
+
+    /// [`note_stale`](Self::note_stale) の外部 guard 版 (書き手が 1 回の書き込みで pin を 1 回にする)。
+    pub(crate) fn note_stale_in(&self, value: u64, guard: &Guard) -> Option<(usize, u32)> {
         // 立っていれば書かない (書き手が並ぶと、 同じ値の store でも cache line を取り合う)
         if !self.any_removed.load(Ordering::Relaxed) {
             self.any_removed.store(true, Ordering::Relaxed);
         }
-        let guard = epoch::pin();
-        let stats = match self.writer_dense_at(value, &guard) {
-            Some(Some(b)) => b.note_stale().map(|prev| (b.len(), prev - 1)),
+        let stats = match self.writer_dense_at(value, guard) {
+            Some(Some(b)) => b.note_stale().map(|prev| (b.len_in(guard), prev - 1)),
             Some(None) => {
                 debug_assert!(false, "note_stale: 未確保 bucket (value={value})");
                 None
@@ -454,10 +458,14 @@ impl LockFreeCylinder {
     /// live/removed は bucket 内で確定し直すため、cylinder 側の total_live /
     /// unique_live は不変 (live な eid の集合は compaction で変わらない)。
     pub fn compact_bucket(&self, value: u64, keep: impl FnMut(u32) -> bool) -> usize {
-        let guard = epoch::pin();
-        match self.writer_dense_at(value, &guard) {
+        self.compact_bucket_in(value, &epoch::pin(), keep)
+    }
+
+    /// [`compact_bucket`](Self::compact_bucket) の外部 guard 版。
+    pub(crate) fn compact_bucket_in(&self, value: u64, guard: &Guard, keep: impl FnMut(u32) -> bool) -> usize {
+        match self.writer_dense_at(value, guard) {
             Some(Some(b)) => {
-                b.compact_in(&guard, keep)
+                b.compact_in(guard, keep)
             }
             // 空の要素 / sparse は値ごとに組み直さない (`compact_sparse` が全体で)
             _ => 0,
