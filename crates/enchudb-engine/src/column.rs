@@ -54,13 +54,34 @@ impl Column {
     /// open 時の load。 header の value_size が 0 = header が一度もディスクに届いていない (作った直後に
     /// 電源が落ちた、 #414) なら、 書かれていない列として組む (`init_lazy`、 header は最初の書き込みが書く)。
     /// そのまま `load` すると value_size 0 の列になり、 読みの assert (`values_u32`) で落ちる。
-    pub fn load_or_unwritten(region: Region, value_size: u32, max_entities: u32, padded: bool) -> Self {
+    ///
+    /// header が書かれていれば中身を確かめる (#526): 値の幅が `value_size` (紐の型の幅) と同じ、 cell の位置が 2 つの形
+    /// (`HEADER` / `CELLS_PAD`) のどちらか、 件数の cell が region に入る。 合わなければ Err (壊れた DB。 そのまま組むと、
+    /// 幅の合わない cell を読む所で panic する)。
+    pub fn load_or_unwritten(region: Region, value_size: u32, max_entities: u32, padded: bool) -> Result<Self, String> {
+        if region.len() < HEADER {
+            return Err(format!("column region too small ({} bytes)", region.len()));
+        }
         let stored_vs = u32::from_le_bytes(region.slice()[4..8].try_into().unwrap());
         if stored_vs == 0 {
-            Self::init_lazy(region, value_size, max_entities, padded)
-        } else {
-            Self::load(region)
+            return Ok(Self::init_lazy(region, value_size, max_entities, padded));
         }
+        if stored_vs != value_size {
+            return Err(format!("column header corrupt: value size {stored_vs}, expected {value_size}"));
+        }
+        let col = Self::load(region);
+        if col.cells != HEADER && col.cells != CELLS_PAD {
+            return Err(format!("column header corrupt: cells at {}", col.cells));
+        }
+        let end = col.count() as usize * value_size as usize + col.cells;
+        if end > col.region.len() {
+            return Err(format!(
+                "column header corrupt: {} cells end at {end}, past the region ({} bytes)",
+                col.count(),
+                col.region.len()
+            ));
+        }
+        Ok(col)
     }
 
     fn cells_field(cells: usize) -> u32 {

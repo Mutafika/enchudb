@@ -502,9 +502,10 @@ impl HimoStore {
     /// open 時の load。 cylinder は空のまま返し、最初の cyl 触りで
     /// `ensure_cylinder_built` 経由で rebuild する（reopen latency を膨らませないため）。
     /// `max_entities` / `padded` は header が一度も届いていない列を組む時だけ使う (`Column::load_or_unwritten`)。
-    pub fn load(col_region: Region, ht: ValueType, max_values: u32, max_entities: u32, padded: bool) -> Self {
-        let col = Column::load_or_unwritten(col_region, ht.width(), max_entities, padded);
-        Self {
+    /// 列の header が壊れていれば Err (`Column::load_or_unwritten`、 #526)。
+    pub fn load(col_region: Region, ht: ValueType, max_values: u32, max_entities: u32, padded: bool) -> Result<Self, String> {
+        let col = Column::load_or_unwritten(col_region, ht.width(), max_entities, padded)?;
+        Ok(Self {
             col: ready(col),
             #[cfg(not(target_arch = "wasm32"))]
             lazy: None,
@@ -517,7 +518,7 @@ impl HimoStore {
             gate: WriteGate::new(),
             vlocks: OnceLock::new(),
             present: PresentCount::new(false),
-        }
+        })
     }
 
     /// `load` の遅延版 (request23 D2) — column region の mmap を最初の read/write
@@ -574,10 +575,12 @@ impl HimoStore {
             .lazy
             .as_ref()
             .expect("HimoStore column is neither loaded nor lazy");
-        self.col
-            .get_or_init(|| {
-                Column::load_or_unwritten(lazy.set.region(lazy.kind), self.value_type.width(), lazy.max_entities, lazy.padded)
-            })
+        self.col.get_or_init(|| {
+            // directory の DB は列を最初に触る時に読むので、 開く時に Err にできない (#526): 壊れた header は panic で止める
+            // (そのまま組むと、 幅の合わない cell を読む所で意味の分からない panic になる)
+            Column::load_or_unwritten(lazy.set.region(lazy.kind), self.value_type.width(), lazy.max_entities, lazy.padded)
+                .unwrap_or_else(|e| panic!("himo column segment {:?}: {e}", lazy.kind))
+        })
     }
 
     /// cylinder を組む時の dense の窓の始まりを置く (ref の紐 = 指す先の表の eid の始まり)。 組んだ後は効かない。
@@ -1476,7 +1479,7 @@ mod tests {
     #[test]
     fn load_of_never_written_header_is_an_empty_column() {
         for ht in [ValueType::Leaf, ValueType::Number, ValueType::Number64] {
-            let hs = HimoStore::load(heap_region(64 * 1024), ht, 0, 64, false);
+            let hs = HimoStore::load(heap_region(64 * 1024), ht, 0, 64, false).unwrap();
             let mut n = 0;
             hs.for_each_set_value(|_| n += 1);
             assert_eq!(n, 0, "{ht:?}");
@@ -1541,7 +1544,7 @@ mod tests {
         chk(&hs, 2, "組んだ後の set 2 つ目");
         drop(hs);
         // 開いた紐: 数を引く前に書いた分 (2 足して 1 引く) も入る
-        let re = HimoStore::load(region(), ValueType::Number, 0, 64, false);
+        let re = HimoStore::load(region(), ValueType::Number, 0, 64, false).unwrap();
         assert!(re.set(10, 1));
         assert!(re.set(11, 1));
         re.remove(6);
