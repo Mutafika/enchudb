@@ -464,6 +464,16 @@ impl LockFreeCylinder {
         }
     }
 
+    /// 値 `value` の bucket を照らして読むと決めた時に呼ぶ: dense の bucket なら今の (len, live) を控え、 (bucket の長さ, 間に書き込みの
+    /// 無い照らしを続けた数) を返す ([`AppendBucket::mark_verified`])。 sparse の値・空の要素は None。
+    pub fn mark_verified(&self, value: u64) -> Option<(usize, u32)> {
+        let guard = epoch::pin();
+        match self.writer_dense_at(value, &guard) {
+            Some(Some(b)) => Some((b.len(), b.mark_verified(&guard))),
+            _ => None,
+        }
+    }
+
     /// sparse の古い entry が半分を超えたか (掃除の合図)。 write_lock 下で。
     pub fn sparse_needs_compact(&self) -> bool {
         let stale = self.sparse_stale.load(Ordering::Relaxed);
