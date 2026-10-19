@@ -448,7 +448,8 @@ impl Syncer {
             | DecodedOp::TieNamed { eid, .. }
             | DecodedOp::TieLeaf { eid, .. }
             | DecodedOp::TieRef { eid, .. } => engine.resolve_remote_eid_existing(*eid),
-            DecodedOp::Commit | DecodedOp::Vocab { .. } => None,
+            // #178: 版数を持たない (cell を書かない)
+            DecodedOp::Commit | DecodedOp::Vocab { .. } | DecodedOp::Alias { .. } => None,
         }) else {
             return;
         };
@@ -477,7 +478,7 @@ impl Syncer {
                     engine.remember_version(local_eid, hid as u16, rec.hlc);
                 }
             }
-            DecodedOp::Commit | DecodedOp::Vocab { .. } => {}
+            DecodedOp::Commit | DecodedOp::Vocab { .. } | DecodedOp::Alias { .. } => {}
         }
     }
 
@@ -679,7 +680,8 @@ impl Syncer {
                     | DecodedOp::TieNamed { eid, .. }
                     | DecodedOp::TieLeaf { eid, .. }
                     | DecodedOp::TieRef { eid, .. } => Some(enchudb_oplog::eid_local(*eid)),
-                    DecodedOp::Commit | DecodedOp::Vocab { .. } => None,
+                    // #178: 行の state ではない (state 転写には現れない)
+                    DecodedOp::Commit | DecodedOp::Vocab { .. } | DecodedOp::Alias { .. } => None,
                 })
                 .collect();
             for (foreign_local, local) in self.engine.translated_locals_of(author) {
@@ -1611,6 +1613,11 @@ impl Syncer {
                 r
             }
             DecodedOp::Commit => ApplyResult::Applied, // boundary marker、apply は不要
+            // #178: 「2 つの世界番号は同じ entity」。 2 行を畳む / 別名を張る。 何も変えなければ (もう同じ行 / どちらも無い)
+            // 当て済みと同じ扱い (中継しない = 閉路で反響しない)
+            DecodedOp::Alias { eid, same_as } => {
+                if self.engine.apply_alias(*eid, *same_as) { ApplyResult::Applied } else { ApplyResult::SkippedOlder }
+            }
             DecodedOp::Vocab { vid, bytes } => {
                 // 0.8.4 issue #30: 既に同 (author_peer, vid, bytes) を登録済みなら
                 // skip。 これが無いと gossip_remote_apply ON で同じ vocab record が

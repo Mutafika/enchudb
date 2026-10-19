@@ -3961,6 +3961,9 @@ pub struct Engine {
     /// 静かに壊れる経路なので、 まず観測できるようにするのが目的。
     bind_over_local_writes: std::sync::atomic::AtomicU64,
     warned_bind_over_local_writes: std::sync::atomic::AtomicBool,
+    /// #178: 自分が書いていた行を相手の世界番号に束ねた時に、 「同じ entity」 の知らせ (`Op::Alias`) を書くか
+    /// ([`Engine::set_emit_alias`]、 既定は書かない)。
+    emit_alias: std::sync::atomic::AtomicBool,
     /// 0.18.2: `_sync_ops` 満杯 backpressure の warn を 1 回に抑制（解消で解除）。
     warned_sync_ops_full: std::sync::atomic::AtomicBool,
     /// `sync.payload.seg` を開けなかった警告を 1 回だけ出す。
@@ -4506,6 +4509,7 @@ impl Engine {
             warned_ref_to_replica: std::sync::atomic::AtomicBool::new(false),
             bind_over_local_writes: std::sync::atomic::AtomicU64::new(0),
             warned_bind_over_local_writes: std::sync::atomic::AtomicBool::new(false),
+            emit_alias: std::sync::atomic::AtomicBool::new(false),
             warned_sync_ops_full: std::sync::atomic::AtomicBool::new(false),
             #[cfg(not(target_arch = "wasm32"))]
             warned_sync_payload_ring: std::sync::atomic::AtomicBool::new(false),
@@ -5709,6 +5713,7 @@ impl Engine {
             warned_ref_to_replica: std::sync::atomic::AtomicBool::new(false),
             bind_over_local_writes: std::sync::atomic::AtomicU64::new(0),
             warned_bind_over_local_writes: std::sync::atomic::AtomicBool::new(false),
+            emit_alias: std::sync::atomic::AtomicBool::new(false),
             warned_sync_ops_full: std::sync::atomic::AtomicBool::new(false),
             #[cfg(not(target_arch = "wasm32"))]
             warned_sync_payload_ring: std::sync::atomic::AtomicBool::new(false),
@@ -6235,6 +6240,8 @@ impl Engine {
                 | enchudb_oplog::oplog::DecodedOp::TieRef { eid, .. } => is_internal_eid(*eid),
                 enchudb_oplog::oplog::DecodedOp::Commit => false,
                 enchudb_oplog::oplog::DecodedOp::Vocab { .. } => false,
+                // #178: 2 つの eid は書いた時から世界番号 (宛名を書き戻さない)
+                enchudb_oplog::oplog::DecodedOp::Alias { .. } => false,
             };
             if skip { done_end = Some(*rec_end); continue; }
             // 0.11 (request10 / #76 逆写像): translated foreign entity への
@@ -6385,7 +6392,7 @@ impl Engine {
                 );
             }
             self.tie_to_by_id(row_eid, peer_id_hid, rec.author_peer);
-            // DecodedOp variant を tag (Tie=0, Untie=1, Delete=2, Content=3, Commit=4, Vocab=5, TieNamed=6, TieLeaf=7, TieRef=8)
+            // DecodedOp variant を tag (Tie=0, Untie=1, Delete=2, Content=3, Commit=4, Vocab=5, TieNamed=6, TieLeaf=7, TieRef=8, Alias=9)
             // #183: Tie → TieRef へ書き換えて発送した record は payload に合わせて 8。
             let op_type = if sent_as_tie_ref {
                 8
@@ -6400,6 +6407,7 @@ impl Engine {
                     enchudb_oplog::oplog::DecodedOp::TieNamed { .. } => 6,
                     enchudb_oplog::oplog::DecodedOp::TieLeaf { .. } => 7,
                     enchudb_oplog::oplog::DecodedOp::TieRef { .. } => 8,
+                    enchudb_oplog::oplog::DecodedOp::Alias { .. } => 9,
                 }
             };
             self.tie_to_by_id(row_eid, op_type_hid, op_type);
@@ -8968,6 +8976,65 @@ impl Engine {
         self.tables.iter().any(|t| t.pk_himo == Some(himo_id))
     }
 
+    /// #178: 自分が書いていた行を相手の世界番号に束ねた時 (`bind_remote_eid`、 主キーで束ねた時)、 「束ねる前の宛名と束ねた
+    /// 世界番号は同じ entity」 の知らせ (`Op::Alias`) を書くか。 既定は書かない。
+    ///
+    /// 束ねる前に出て行った書き込みは、 相手で別の行として払い出されている (同じ entity が 2 行、 #178)。 知らせを受けた
+    /// 相手は 2 行を畳む ([`Engine::apply_alias`])。 知らせは 「読み飛ばしてよい」 印付きの op なので、 印を読める版 (#525)
+    /// の peer は知らなくても止まらない。 **それより前の版の peer は、 この op を受けると止まる** (wire は batch ごと Err、
+    /// oplog の scan は打ち切り) — 全部の peer を印を読める版に上げてから書くこと。
+    pub fn set_emit_alias(&self, on: bool) {
+        self.emit_alias.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// #178: `Op::Alias` を自分の oplog に積んで閉じる (bridge が配る)。 WAL の無い DB では何もしない。
+    fn emit_alias_record(&self, eid: enchudb_oplog::EntityId, same_as: enchudb_oplog::EntityId) {
+        let Some(wal) = self.oplog.as_ref() else { return };
+        self.append_local_op(enchudb_oplog::oplog::Op::Alias { eid, same_as });
+        let _ = self.append_commit_marker(wal);
+    }
+
+    /// #178: 「`eid` と `same_as` は同じ entity」 (`Op::Alias`、 どちらも世界番号) を当てる。 何か変えたら true。
+    ///
+    /// - 2 つが別の行に当たれば畳む ([`Engine::merge_entity_into`])。 残すのは自分が産んだ行 (どちらも翻訳した行なら
+    ///   `same_as` の行)。 どちらも自分が産んだ行なら畳めない (false)
+    /// - 片方だけが行に当たれば、 もう片方 (相手の世界番号) をその行の別名にする (以後その世界番号宛ての record がその行に
+    ///   当たる)
+    /// - 同じ行 / どちらも行が無い時は何もしない (どちらも無い時、 後から届いた 2 つの世界番号は別の行になりうる。 主キーの
+    ///   ある表なら主キーで束ねる)
+    pub fn apply_alias(&self, eid: enchudb_oplog::EntityId, same_as: enchudb_oplog::EntityId) -> bool {
+        let self_peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
+        let local_of = |w: enchudb_oplog::EntityId| -> Option<u32> {
+            if enchudb_oplog::eid_peer(w) == self_peer {
+                let l = enchudb_oplog::eid_local(w);
+                return self.entities.is_live(l).then_some(l);
+            }
+            self.eid_translator.get(enchudb_oplog::eid_peer(w), enchudb_oplog::eid_local(w))
+        };
+        let alias_to = |w: enchudb_oplog::EntityId, local: u32| -> bool {
+            if enchudb_oplog::eid_peer(w) == self_peer {
+                return false; // 自分の世界番号は写像を持たない (行が無いなら、 消した後)
+            }
+            self.eid_translator.alias(enchudb_oplog::eid_peer(w), enchudb_oplog::eid_local(w), local);
+            true
+        };
+        match (local_of(eid), local_of(same_as)) {
+            (Some(a), Some(b)) if a == b => false,
+            (Some(a), Some(b)) => {
+                let own = |l: u32| self.eid_translator.reverse(l).is_none();
+                let (src, dst) = if own(a) { (b, a) } else { (a, b) };
+                if own(src) {
+                    return false;
+                }
+                let e = |l: u32| enchudb_oplog::make_eid(self_peer, l);
+                self.merge_entity_into(e(src), e(dst)).is_ok()
+            }
+            (Some(a), None) => alias_to(same_as, a),
+            (None, Some(b)) => alias_to(eid, b),
+            (None, None) => false,
+        }
+    }
+
     /// #178: 同じ entity を指す 2 つの local 行のうち、 翻訳した行 `src` (相手の世界番号の写し) を `dst` に畳む。 戻り値は
     /// `dst` に当たった cell の数 (値と外し)。
     ///
@@ -9061,6 +9128,11 @@ impl Engine {
         }
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
         let target_local = enchudb_oplog::eid_local(local_eid);
+        // #178: 束ねる前に、 この行に書いた record の宛名 (逆写像があればその世界番号、 無ければ自分の世界番号)
+        let prior = self
+            .eid_translator
+            .reverse(target_local)
+            .map_or(enchudb_oplog::make_eid(self_peer, target_local), |(p, l)| enchudb_oplog::make_eid(p, l));
         let mut bound_now = false;
         let local = self
             .eid_translator
@@ -9074,7 +9146,16 @@ impl Engine {
         // 相手側はそれを別 entity として払い出すので PK 無しの重複行が生える。
         // ここでは直せない (出て行った record は取り消せない) ので、 **観測できるように
         // 数える**。 実地で静かに壊れていた経路。
-        self.note_bind_over_local_writes(local, self_peer);
+        // #178: 書く設定なら 「束ねる前の宛名と、 束ねた世界番号は同じ entity」 を配る (受け手は 2 行を畳む、
+        // `Engine::apply_alias`)
+        if self.note_bind_over_local_writes(local, self_peer)
+            && bound_now
+            && local == target_local
+            && prior != foreign_eid
+            && self.emit_alias.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.emit_alias_record(prior, foreign_eid);
+        }
         // 束ね先の entity は live 扱いにしておく (remote_tie_apply と同じ前提)。
         self.entities.ensure_live(local);
         Self::advance_table_next_local_for(&self.tables, local);
@@ -9160,14 +9241,14 @@ impl Engine {
     ///
     /// 判定材料は cell の版数 (`Hlc::peer`) だけ — 別の state を持たないので、
     /// bind (= foreign entity ごとに一度) のときだけ O(himo 数) 走るコストで済む。
-    fn note_bind_over_local_writes(&self, local: u32, self_peer: enchudb_oplog::PeerId) {
+    fn note_bind_over_local_writes(&self, local: u32, self_peer: enchudb_oplog::PeerId) -> bool {
         use std::sync::atomic::Ordering;
         let mine = (0..self.himos.len()).any(|hid| {
             self.himos[hid].get_value(local).is_some()
                 && self.version_of(local, hid as u16).peer == self_peer
         });
         if !mine {
-            return;
+            return false;
         }
         self.bind_over_local_writes.fetch_add(1, Ordering::Relaxed);
         if !self.warned_bind_over_local_writes.swap(true, Ordering::Relaxed) {
@@ -9178,6 +9259,7 @@ impl Engine {
                  see Engine::bind_over_local_writes()"
             );
         }
+        true
     }
 
     /// #178: 「自分が書いた行が後から foreign identity に束ねられた」 累計回数。
@@ -9538,6 +9620,7 @@ impl Engine {
             DecodedOp::TieRef { eid, himo_id, target } => {
                 Op::TieRef { eid: *eid, himo_id: *himo_id, target: *target }
             }
+            DecodedOp::Alias { eid, same_as } => Op::Alias { eid: *eid, same_as: *same_as },
             // Commit は relay しない: dedupe identity を持たず、 閉路があると
             // 無限反響する。 group 境界は relay 自身の commit 周期で足りる。
             DecodedOp::Commit => return false,
@@ -15848,6 +15931,8 @@ impl Engine {
                 // 万一混入しても local state は Tie で既に durable なので no-op。
             }
             DecodedOp::Commit => {}
+            // #178: 自分が書いた 「同じ entity」 の知らせは、 束ねた写像 (`.eidmap`) を相手に伝える物。 自分には当てる物が無い
+            DecodedOp::Alias { .. } => {}
             DecodedOp::Vocab { vid, bytes } => {
                 // #431: 自分が書いた Vocab も当てる。 旧: 「辞書にもうある」 として何もしなかったが、 oplog の fsync の後・
                 // 本体の書き出しの前に落ちると、 oplog には Vocab と Tie があるのに辞書には語が無く、 再生した Tie の番号の
@@ -15930,6 +16015,9 @@ impl Engine {
             DecodedOp::Content { eid, key, data } => {
                 let Some(le) = self.resolve_remote_eid_existing(*eid) else { return };
                 self.remote_content_apply(le, key, data, hlc);
+            }
+            DecodedOp::Alias { eid, same_as } => {
+                self.apply_alias(*eid, *same_as);
             }
             DecodedOp::Commit => {}
         }
