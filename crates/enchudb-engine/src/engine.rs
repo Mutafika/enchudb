@@ -854,6 +854,68 @@ fn load_eidmap_from_sidecar(db_path: &str) -> io::Result<Option<Vec<EidmapEntry>
     }
 }
 
+/// #178: 翻訳の別名の sidecar path (`eidalias`)。 不在 = 別名なし。
+#[cfg(not(target_arch = "wasm32"))]
+fn eidalias_path_for(path: &str) -> std::path::PathBuf {
+    crate::db_files::path_for(path, crate::db_files::EIDALIAS)
+}
+
+/// #178: 別名 (`(author_peer, foreign_local, local)`) を binary encode。
+/// layout: magic "EIDA"(4) + version u32=1 + count u32 + (peer u32, foreign u32, local u32) × count
+fn serialize_eidalias(entries: &[(enchudb_oplog::PeerId, u32, u32)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + entries.len() * 12);
+    out.extend_from_slice(b"EIDA");
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for &(peer, foreign_local, local) in entries {
+        out.extend_from_slice(&peer.to_le_bytes());
+        out.extend_from_slice(&foreign_local.to_le_bytes());
+        out.extend_from_slice(&local.to_le_bytes());
+    }
+    out
+}
+
+/// #178: `serialize_eidalias` の逆。 magic / 版の不一致・切れた中身は Err (件数は残りの長さで頭打ち、 `.eidmap` と同じ)。
+fn deserialize_eidalias(buf: &[u8]) -> Result<Vec<(enchudb_oplog::PeerId, u32, u32)>, String> {
+    if buf.len() < 12 || &buf[0..4] != b"EIDA" {
+        return Err("eidalias sidecar: bad magic".into());
+    }
+    let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+    if version != 1 {
+        return Err(format!("eidalias sidecar: unsupported version {version}"));
+    }
+    let count = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
+    if count != (buf.len() - 12) / 12 || (buf.len() - 12) % 12 != 0 {
+        return Err(format!("eidalias sidecar: count {count} does not match {} bytes (corrupt/torn)", buf.len()));
+    }
+    let rd = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
+    Ok((0..count).map(|i| 12 + i * 12).map(|o| (rd(o), rd(o + 4), rd(o + 8))).collect())
+}
+
+/// #178: 別名を sidecar に atomic 書き換え。 別名が無ければ file を消す (残すと、 畳んだ行の slot が回った後で開き直した
+/// 時に古い別名が戻り、 別名宛ての record が無関係な行に入る)。
+#[cfg(not(target_arch = "wasm32"))]
+fn persist_eidalias_to_sidecar(db_path: &str, entries: &[(enchudb_oplog::PeerId, u32, u32)]) -> io::Result<()> {
+    let p = eidalias_path_for(db_path);
+    if entries.is_empty() {
+        return match std::fs::remove_file(&p) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
+    crate::db_files::write_atomic_if_changed(&p, &serialize_eidalias(entries)).map(|_| ())
+}
+
+/// #178: 別名の sidecar を読む。 不在なら Ok(None)。
+#[cfg(not(target_arch = "wasm32"))]
+fn load_eidalias_from_sidecar(db_path: &str) -> io::Result<Option<Vec<(enchudb_oplog::PeerId, u32, u32)>>> {
+    match std::fs::read(eidalias_path_for(db_path)) {
+        Ok(buf) => deserialize_eidalias(&buf).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// #513: 消した主キーの記録の sidecar path (`pktombs`、 中身は `pk_tombs.rs`)。 不在 (主キーのある行を sync の DB で
 /// 消していない / 旧 DB) なら空で続行。
 #[cfg(not(target_arch = "wasm32"))]
@@ -4899,6 +4961,17 @@ impl Engine {
                 );
             }
         }
+        // #178: 別名 (`eidmap` の後: 別名は逆写像を変えない forward だけの写像)。 壊れていたら警告して別名なしで続ける
+        // (別名宛ての record が新しい行として払い出される = 畳む前と同じ)
+        match load_eidalias_from_sidecar(path) {
+            Ok(Some(entries)) => {
+                for (peer, foreign_local, local) in entries {
+                    eng.eid_translator.alias(peer, foreign_local, local);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("warning: failed to read eidalias sidecar (aliases dropped): {e}"),
+        }
 
         // #513: 消した主キーの記録。 不在なら空で続行。 壊れていたら警告して空で続ける (それより前に消した主キーの行が、
         // 後から届いた同じ主キーの古い行に当たらなくなる = 記録の無かった版の動き)。 後の WAL の読み直しと、 途中で
@@ -8435,6 +8508,8 @@ impl Engine {
         persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw())?;
         // #9: 翻訳テーブルも同じ trigger で persist (next_local と整合させる)。
         persist_eidmap_to_sidecar(&self.path, &self.eidmap_entries_with_tombstones())?;
+        // #178: 別名も同じ trigger で
+        persist_eidalias_to_sidecar(&self.path, &self.eid_translator.alias_snapshot())?;
         // #513: 消した主キーの記録も (受け取った削除の分は、 pull の cursor を進める前に固まる)
         self.persist_pk_tombs_if_dirty()?;
         self.persist_vocab_map_if_dirty()
@@ -8567,6 +8642,10 @@ impl Engine {
                 if let Err(e) =
                     persist_eidmap_to_sidecar(&self.path, &self.eidmap_entries_with_tombstones())
                 {
+                    self.warn_persist_failure_rate_limited(&e);
+                }
+                // #178: 別名も
+                if let Err(e) = persist_eidalias_to_sidecar(&self.path, &self.eid_translator.alias_snapshot()) {
                     self.warn_persist_failure_rate_limited(&e);
                 }
                 // #513: 消した主キーの記録も。 変わった時だけ書く。
@@ -8885,6 +8964,78 @@ impl Engine {
     /// 呼ぶので、 table 数ぶんの線形走査で済む形にしてある (table 数は通常 1 桁)。
     pub fn is_pk_himo(&self, himo_id: u16) -> bool {
         self.tables.iter().any(|t| t.pk_himo == Some(himo_id))
+    }
+
+    /// #178: 同じ entity を指す 2 つの local 行のうち、 翻訳した行 `src` (相手の世界番号の写し) を `dst` に畳む。 戻り値は
+    /// `dst` に当たった cell の数 (値と外し)。
+    ///
+    /// 2 台が同じ自然キーの行を別々に作ってから束ねると、 束ねる前に出て行った書き込みが相手で別の行として払い出され、 同じ
+    /// entity が 2 行になる (#178)。 その 2 行を 1 つにする:
+    ///
+    /// 1. src の削除版数があれば dst にも当てる (同じ entity の削除。 削除より古い dst の cell が落ちる)
+    /// 2. src の cell を 1 つずつ dst に、 版数ごと LWW で当てる (src の方が新しい時だけ入る)。 src で外した cell (値が無く版数が
+    ///    ある) は外しとして当てる。 Leaf は中身を写す。 版数の無い cell は dst に値が無い時だけ入る (版数の無い書き込みを LWW は
+    ///    いつも通すので、 そのまま当てると dst の新しい値を消す)
+    /// 3. src を指していた世界番号 (逆写像と別名) を全部 dst の別名にする: 以後その世界番号宛ての record は dst に当たる。 dst に
+    ///    書いた record の宛名は dst の世界番号のまま ([`crate::eid_translator::EidTranslator::alias`])
+    /// 4. src の行を落とし、 版数も消して slot を空ける。 削除の印は残さない (同じ entity は dst で生きている。 主キーの削除の
+    ///    記録も残さない)
+    ///
+    /// oplog には何も積まない (相手には 「同じ entity」 の知らせで伝える、 #178)。 src は翻訳した行に限る: 自分が産んだ行は、
+    /// その世界番号宛ての record がこの先も届くのに転送先を持たないので畳めない。 自分の行 / 同じ行 / 生きていない行は Err。
+    /// 畳んでいる間に src に届いた record (写像を引いた後で当てる前) は失われうる (sync の当てを止めてから呼ぶこと)。
+    pub fn merge_entity_into(
+        &self,
+        src: enchudb_oplog::EntityId,
+        dst: enchudb_oplog::EntityId,
+    ) -> Result<usize, String> {
+        self.check_writable();
+        let self_peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
+        let (s, d) = (enchudb_oplog::eid_local(src), enchudb_oplog::eid_local(dst));
+        if s == d {
+            return Err(format!("merge_entity_into: src and dst are the same row ({s})"));
+        }
+        if !self.entities.is_live(s) || !self.entities.is_live(d) {
+            return Err(format!("merge_entity_into: row {} is not live", if self.entities.is_live(s) { d } else { s }));
+        }
+        if self.eid_translator.reverse(s).is_none() {
+            return Err(format!("merge_entity_into: src {s} is not a translated row (rows this peer created cannot be merged away)"));
+        }
+        let (ts, td) = (self.table_name_of_local(s), self.table_name_of_local(d));
+        if ts != td {
+            return Err(format!("merge_entity_into: rows {s} ({ts:?}) and {d} ({td:?}) are in different tables"));
+        }
+        let to = enchudb_oplog::make_eid(self_peer, d);
+        let mut moved = 0;
+        // 1. 同じ entity の削除
+        let tomb = self.tombstone_version_of(s);
+        if tomb != enchudb_oplog::Hlc::ZERO {
+            self.apply_delete_local(d, tomb);
+        }
+        // 2. cell を 1 つずつ
+        for hid in 0..self.himos.len() {
+            let h = hid as u16;
+            let ver = self.version_of(s, h);
+            match self.himos[hid].get_value(s) {
+                Some(_) if ver == enchudb_oplog::Hlc::ZERO && self.himos[hid].get_value(d).is_some() => {}
+                Some(_) if self.leaf_for(hid).is_some() => {
+                    let from = enchudb_oplog::make_eid(self_peer, s);
+                    let Some(bytes) = self.get_text_owned(from, &self.himo_names[hid]) else { continue };
+                    moved += usize::from(self.remote_tieleaf_apply(to, h, &bytes, ver).applied());
+                }
+                Some(v) => moved += usize::from(self.remote_tie_apply_result(to, h, v, ver).applied()),
+                None if ver != enchudb_oplog::Hlc::ZERO => moved += usize::from(self.remote_untie_apply(to, h, ver)),
+                None => {}
+            }
+        }
+        // 3. 世界番号を dst へ (以後 src の世界番号宛ての record は dst に当たる)
+        for (peer, foreign_local) in self.eid_translator.remove_local(s) {
+            self.eid_translator.alias(peer, foreign_local, d);
+        }
+        // 4. src を落として slot を空ける (版数 0 = cell を全部落とす。 削除の印・主キーの記録は残さない)
+        self.remove_entity_body(s, enchudb_oplog::Hlc::ZERO);
+        self.clear_cell_versions(s);
+        Ok(moved)
     }
 
     /// #141: `(author_peer, foreign_eid)` → `local_eid` の翻訳を明示的に張る。
@@ -10268,19 +10419,24 @@ impl Engine {
     /// 属する事実なので、 `foreign_tombs` へ移して slot の寿命から切り離す。
     ///
     /// レプリカでない local (= 自分が産んだ entity) では no-op。
+    ///
+    /// #178: slot を指す別名 (同じ entity の 2 つ目の世界番号) も外し、 同じ削除版数を退避する (同じ entity なので)。
     fn evict_translation_for_reuse(&self, local: u32) {
-        let Some(key) = self.eid_translator.remove_local(local) else {
+        let keys = self.eid_translator.remove_local(local);
+        if keys.is_empty() {
             return;
-        };
+        }
         let tomb = self.tombstone_version_of(local);
         if tomb == enchudb_oplog::Hlc::ZERO {
             // 削除されずに slot だけ回った (= 到達不能になった) ケース。 覚えることは無い。
             return;
         }
         let mut g = self.foreign_tombs.write().unwrap();
-        let e = g.entry(key).or_insert(enchudb_oplog::Hlc::ZERO);
-        if *e < tomb {
-            *e = tomb; // monotone-max (同 identity が複数回 slot を回った場合)
+        for key in keys {
+            let e = g.entry(key).or_insert(enchudb_oplog::Hlc::ZERO);
+            if *e < tomb {
+                *e = tomb; // monotone-max (同 identity が複数回 slot を回った場合)
+            }
         }
         self.foreign_tombs_empty
             .store(false, std::sync::atomic::Ordering::Relaxed);
