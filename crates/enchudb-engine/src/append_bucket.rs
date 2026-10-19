@@ -52,12 +52,24 @@ unsafe impl Sync for Buf {}
 
 impl Buf {
     fn with_cap(cap: usize) -> Self {
-        let v: Vec<UnsafeCell<u32>> = (0..cap).map(|_| UnsafeCell::new(0)).collect();
-        Self {
-            data: v.into_boxed_slice(),
-            len: AtomicUsize::new(0),
-            sorted: AtomicUsize::new(0),
-        }
+        Self::from_vec(Vec::new(), cap)
+    }
+
+    /// `v` を頭に置いた容量 `cap` (`v.len()` 以上) の backing。 `v` は昇順であること (頭の昇順の長さを全部とする)。
+    /// 空きは 0 で埋める (`vec![0; cap]` は確保の時に 0 の page をもらうだけ)。
+    fn from_vec(v: Vec<u32>, cap: usize) -> Self {
+        debug_assert!(v.len() <= cap && v.is_sorted());
+        let len = v.len();
+        let data: Box<[u32]> = if len == 0 {
+            vec![0u32; cap].into_boxed_slice()
+        } else {
+            let mut v = v;
+            v.resize(cap, 0);
+            v.into_boxed_slice()
+        };
+        // SAFETY: UnsafeCell<u32> は u32 と同じ表現 (repr(transparent))。 長さはそのまま移る
+        let data = unsafe { Box::from_raw(Box::into_raw(data) as *mut [UnsafeCell<u32>]) };
+        Self { data, len: AtomicUsize::new(len), sorted: AtomicUsize::new(len) }
     }
     #[inline]
     fn cap(&self) -> usize {
@@ -125,7 +137,7 @@ pub(crate) fn sort_appended(v: &mut [u32]) {
         return;
     }
     let mut b = v[k..].to_vec();
-    b.sort_unstable();
+    sort_eids(&mut b);
     // 前 (v[..k]、 昇順) と b (昇順) を、 v の後ろから大きい順に置く。 置く先 w は読む前 i より前に来ない (w = i + j)
     let (mut i, mut j) = (k, b.len());
     while j > 0 {
@@ -137,6 +149,50 @@ pub(crate) fn sort_appended(v: &mut [u32]) {
             v[w - 1] = b[j - 1];
             j -= 1;
         }
+    }
+}
+
+/// これより短い列は比較 sort ([`sort_eids`])。 512 件で基数 sort が並び、 それより長いと 2〜4 倍速い
+/// (1 件あたり: 1024 件 4.3 → 1.9 ns、 2.5 万件 6.9 → 1.7 ns、 eid が 17 bit の時)。
+const RADIX_MIN: usize = 512;
+
+/// eid の列を昇順にする。 長い列は基数 sort: 最小値からの差を 11 bit 以下の同じ幅の桁に分け、 下の桁から安定に振り分ける
+/// (桁の数は差の bit 数で決まる。 eid は表の中で近い所に集まるので、 2 桁で済むことが多い)。 比較 sort は列が長いほど
+/// 1 件の段数 (log n) が増え、 書き換えの多い列の詰め直しで整列が書き手の時間の 15% を占めていた。
+fn sort_eids(v: &mut Vec<u32>) {
+    if v.len() < RADIX_MIN {
+        v.sort_unstable();
+        return;
+    }
+    let (min, max) = v.iter().fold((u32::MAX, 0), |(lo, hi), &x| (lo.min(x), hi.max(x)));
+    let bits = 32 - (max - min).leading_zeros();
+    if bits == 0 {
+        return; // 全部同じ値
+    }
+    let passes = bits.div_ceil(11);
+    let w = bits.div_ceil(passes);
+    let mask = (1u32 << w) - 1;
+    let mut buf = vec![0u32; v.len()];
+    let mut count = [0u32; 1 << 11];
+    for p in 0..passes {
+        let shift = p * w;
+        let count = &mut count[..1 << w];
+        count.fill(0);
+        for &x in v.iter() {
+            count[(((x - min) >> shift) & mask) as usize] += 1;
+        }
+        let mut at = 0;
+        for c in count.iter_mut() {
+            let n = *c;
+            *c = at;
+            at += n;
+        }
+        for &x in v.iter() {
+            let d = &mut count[(((x - min) >> shift) & mask) as usize];
+            buf[*d as usize] = x;
+            *d += 1;
+        }
+        std::mem::swap(v, &mut buf);
     }
 }
 
@@ -174,20 +230,24 @@ impl AppendBucket {
     //   flag=false で素通しする
     // Column 側の無同期読みは既知の別 issue #100。
 
-    /// live +1。戻り値は増分前 (0 なら「live な値が初めて入った」= unique 判定)。
+    /// live +1。戻り値は増分前 (0 なら「live な値が初めて入った」= unique 判定)。 live を動かすのは bucket の書き手 1 本
+    /// (`push_in` と同じ) なので、 読んで書くだけ (不可分の足し算は要らない)。
     #[inline]
     pub fn live_inc(&self) -> u32 {
-        self.live.fetch_add(1, Ordering::Relaxed)
+        let v = self.live.load(Ordering::Relaxed);
+        self.live.store(v + 1, Ordering::Relaxed);
+        v
     }
 
     /// stale 化: removed flag を立てて live -1。戻り値は減分前の live。
-    /// live == 0 のとき (契約違反: Column に無い値の stale 通知) は何もせず None。
+    /// live == 0 のとき (契約違反: Column に無い値の stale 通知) は何もせず None。 書き手 1 本 ([`live_inc`](Self::live_inc))。
     #[inline]
     pub fn note_stale(&self) -> Option<u32> {
         self.removed.store(true, Ordering::Release);
-        self.live
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
-            .ok()
+        let v = self.live.load(Ordering::Relaxed);
+        let after = v.checked_sub(1)?;
+        self.live.store(after, Ordering::Relaxed);
+        Some(v)
     }
 
     /// 現在の live 数 (= verify 後の正確な件数)。
@@ -292,27 +352,29 @@ impl AppendBucket {
         let b = unsafe { cur.deref() };
         let l = b.len.load(Ordering::Relaxed); // 単一 writer なので自身の len は Relaxed で可
         let src = unsafe { b.published(l) };
-        let kept = dedup_sorted(src.iter().copied().filter(|&e| keep(e)).collect());
-
-        let ncap = kept.len().next_power_of_two().max(INITIAL_CAP);
-        let nb = Buf::with_cap(ncap);
-        for (i, &v) in kept.iter().enumerate() {
-            unsafe {
-                *nb.data[i].get() = v;
-            }
+        // 分岐なしで照らす: 先に置いてから、 残すなら次へ進む (残す / 落とすは書き換えの順に入り混じるので、 分岐は半分外れる)
+        let mut kept = vec![0u32; src.len()];
+        let mut n = 0;
+        for &e in src {
+            kept[n] = e;
+            n += usize::from(keep(e));
         }
-        nb.sorted.store(kept.len(), Ordering::Relaxed); // dedup_sorted で昇順
-        nb.len.store(kept.len(), Ordering::Relaxed); // まだ誰も見ていない
+        kept.truncate(n);
+        let kept = dedup_sorted(kept);
+        let live = kept.len();
+
+        // 昇順の列をそのまま backing にする (まだ誰も見ていない)
+        let nb = Buf::from_vec(kept, live.next_power_of_two().max(INITIAL_CAP));
         self.backing.store(Owned::new(nb), Ordering::Release);
         // SAFETY: 旧 backing は全 reader が epoch を通過してから解放。
         unsafe {
             guard.defer_destroy(cur);
         }
-        self.live.store(kept.len() as u32, Ordering::Relaxed);
+        self.live.store(live as u32, Ordering::Relaxed);
         self.verified.store(u64::MAX, Ordering::Relaxed);
         self.rereads.store(0, Ordering::Relaxed);
         self.removed.store(false, Ordering::Release); // swap 後 — 順序契約はメソッド doc 参照
-        kept.len()
+        live
     }
 
     /// 外部 guard 下で published slice を borrow（query 単位 pin 用、 zero-copy）。
@@ -401,8 +463,13 @@ impl AppendBucket {
 
     /// 現在の publish 済み件数（lock-free）。
     pub fn len(&self) -> usize {
-        let guard = epoch::pin();
-        let cur = self.backing.load(Ordering::Acquire, &guard);
+        self.len_in(&epoch::pin())
+    }
+
+    /// [`len`](Self::len) の外部 guard 版。
+    #[inline]
+    pub fn len_in(&self, guard: &Guard) -> usize {
+        let cur = self.backing.load(Ordering::Acquire, guard);
         unsafe { cur.deref() }.len.load(Ordering::Acquire)
     }
 
@@ -535,9 +602,11 @@ mod tests {
         };
         let guard = epoch::pin();
         let mut unsorted_before = 0;
-        let n_cases = if cfg!(miri) { 14 } else { 700 };
+        // 3000 は後ろに足した分 (1500) が基数 sort になる長さ (Miri では重いので外す)
+        let ns: &[usize] = if cfg!(miri) { &[1, 2, 63, 64, 65, 300, 1000] } else { &[1, 2, 63, 64, 65, 300, 1000, 3000] };
+        let n_cases = if cfg!(miri) { 14 } else { 800 };
         for case in 0..n_cases {
-            let n = [1usize, 2, 63, 64, 65, 300, 1000][case % 7];
+            let n = ns[case % ns.len()];
             let b = AppendBucket::new();
             let mut pushed = Vec::with_capacity(n);
             for i in 0..n {
@@ -551,9 +620,22 @@ mod tests {
             let want: std::collections::BTreeSet<u32> = pushed.iter().copied().filter(|&e| keep(e)).collect();
             let got_n = b.compact_in(&guard, keep);
             assert_eq!(got_n, want.len(), "case {case}");
-            assert_eq!(b.read_to_vec(), want.iter().copied().collect::<Vec<_>>(), "case {case}: 中身か並びが違う");
+            let mut want: Vec<u32> = want.into_iter().collect();
+            assert_eq!(b.read_to_vec(), want, "case {case}: 中身か並びが違う");
             assert_eq!(b.live() as usize, want.len());
             assert!(!b.needs_verify());
+            // 組み直した backing の空き (容量まで) と、 その先の倍化を通って足す: 足した分は後ろに足した順で読め、 頭の昇順の長さは
+            // 足した分が前の値以上の間だけ伸びる
+            let cap = b.capacity();
+            assert!(cap >= want.len() && cap.is_power_of_two(), "case {case}: 容量 {cap} / 中身 {}", want.len());
+            for _ in 0..cap - want.len() + 3 {
+                let e = (next() % (3 * n as u64 + 7)) as u32;
+                b.push(e);
+                want.push(e);
+            }
+            assert_eq!(b.read_to_vec(), want, "case {case}: 組み直した後に足した分");
+            let (s, h, _) = b.snapshot_sorted_in(&guard);
+            assert_eq!(h, sorted_prefix_len(s), "case {case}: 頭の昇順の長さ");
         }
         assert!(unsorted_before >= n_cases / 2, "負の対照: 組み直す前の bucket が昇順でない回が少ない ({unsorted_before})");
     }
@@ -599,6 +681,55 @@ mod tests {
             }
         }
         assert!(caught, "負の対照: 混ぜない形がいつも昇順になった (比べ方が弱い)");
+    }
+
+    /// `sort_eids` は `sort_unstable` と同じ並びを返す: 基数 sort に切り替わる長さの前後 (511 / 512 / 513) と長い列、
+    /// 値の幅 (最小値からの差の bit 数) が 1 桁・2 桁・3 桁になる所 (11 / 12 / 22 / 23 / 32 bit)、 最小値が大きく差が狭い列
+    /// (上の bit が揃う)、 全部同じ値、 重複の多い列、 昇順・逆順。
+    #[test]
+    fn sort_eids_matches_sort_unstable() {
+        let mut r = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        // Miri では基数 sort の長さ 1 つと、 全部同じ値・1 / 2 / 3 桁の幅・ばらばらと重複の多い列だけ
+        let lens: &[usize] = if cfg!(miri) { &[513] } else { &[0, 1, 2, 100, 511, 512, 513, 1000, 4097, 30_000] };
+        let shapes: &[u32] = if cfg!(miri) { &[0, 3] } else { &[0, 1, 2, 3] };
+        let spans: &[u64] = if cfg!(miri) {
+            &[0, (1 << 11) + 1, (1 << 22) + 5, u32::MAX as u64]
+        } else {
+            &[0, 1, 7, 1 << 11, (1 << 11) + 1, 1 << 22, (1 << 22) + 5, 1 << 31, u32::MAX as u64]
+        };
+        for &n in lens {
+            for (si, &span) in spans.iter().enumerate() {
+                for base in [0u32, 3_000_000_000] {
+                    // 差が span 以下 (span + base が u32 に入る所まで)
+                    let span = span.min(u32::MAX as u64 - base as u64);
+                    for &shape in shapes {
+                        let mut v: Vec<u32> = (0..n).map(|_| base + (next() % (span + 1)) as u32).collect();
+                        match shape {
+                            0 => {}
+                            1 => v.sort_unstable(),
+                            2 => v.sort_unstable_by(|a, b| b.cmp(a)),
+                            // 重複の多い列 (同じ値を 8 回ずつ)
+                            _ => {
+                                let w = v.clone();
+                                for (i, x) in v.iter_mut().enumerate() {
+                                    *x = w[i / 8 * 8];
+                                }
+                            }
+                        }
+                        let mut want = v.clone();
+                        want.sort_unstable();
+                        sort_eids(&mut v);
+                        assert_eq!(v, want, "n {n} span[{si}] {span} base {base} shape {shape}");
+                    }
+                }
+            }
+        }
     }
 
     /// 書き手が持つ頭の昇順の長さ (`snapshot_sorted_in` の 2 つ目) が、 探した長さ (`sorted_prefix_len`) といつも同じ:

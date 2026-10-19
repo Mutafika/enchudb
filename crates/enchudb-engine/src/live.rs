@@ -1253,8 +1253,14 @@ impl PendingMarks {
 
     /// 整列せずに取り出して空にする: 列と、 bit に移っていれば bit (shard の鍵の下で呼ぶ — 持ち替えるだけ。 bit を読み
     /// 出すのは鍵の外で)。
+    ///
+    /// 列は、 次の印のために取り出した数 (1024 まで) の列を先に取っておく: 空の列から始めると、 書き手が 1 → 2 → 4 … と
+    /// 伸ばし直す (100 件まとめの poll で、 書き込みの時間の 3% が realloc だった)。 印の来なかった列は何も取らない。
     fn take_raw(&mut self) -> (Vec<u32>, Option<PageBits>) {
-        (self.marks.take_raw(), self.bits.take())
+        let next = Vec::with_capacity(self.marks.list.len().min(1024));
+        let list = std::mem::replace(&mut self.marks.list, next);
+        self.marks.clean = 0;
+        (list, self.bits.take())
     }
 }
 
@@ -7356,5 +7362,34 @@ mod tests {
         assert!(m.is_empty() && m.list.capacity() == 0, "大きい buffer は手放す");
         m.add(7);
         assert_eq!(m.sorted(), &[7], "空にした後も使える");
+    }
+
+    /// 書き手の印 (`PendingMarks`) を取り出すと、 列は空で、 取り出した数 (1024 まで) の容量を残す (次の poll までの印を
+    /// 伸ばし直さずに置ける)。 印の来なかった列は容量を手放す。 取り出したものは置いた印のまま。
+    #[test]
+    fn pending_marks_keep_room_for_the_next_poll() {
+        let mut pm = PendingMarks::default();
+        for e in [9, 3, 9, 1] {
+            pm.add(e);
+        }
+        let (list, bits) = pm.take_raw();
+        assert_eq!((list, bits.is_none()), (vec![9, 3, 9, 1], true));
+        assert!(pm.marks.list.is_empty() && pm.marks.clean == 0);
+        assert!(pm.marks.list.capacity() >= 4, "取り出した数の容量: {}", pm.marks.list.capacity());
+        let at = pm.marks.list.as_ptr();
+        for e in 0..4 {
+            pm.add(e);
+        }
+        assert_eq!(pm.marks.list.as_ptr(), at, "残した容量の中に置く (伸ばし直さない)");
+        let _ = pm.take_raw();
+        let (list, _) = pm.take_raw();
+        assert!(list.is_empty());
+        assert_eq!(pm.marks.list.capacity(), 0, "印の来なかった列は容量を手放す");
+        for e in 0..5000 {
+            pm.add(e);
+        }
+        let (list, bits) = pm.take_raw();
+        assert_eq!((list.len(), bits.is_none()), (5000, true));
+        assert_eq!(pm.marks.list.capacity(), 1024, "残す容量は 1024 まで");
     }
 }

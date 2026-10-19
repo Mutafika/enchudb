@@ -205,6 +205,22 @@ impl Column {
         self.region.as_atomic_u32(off).load(Ordering::Acquire)
     }
 
+    /// 4B 値を Relaxed で読む (atomic だが順序は付けない)。 読む cell の書き手と別の鍵で順序が付いている時だけ使う
+    /// (`HimoStore` の詰め直しの照らし)。 value_size==4 前提。
+    #[inline]
+    pub fn load_u32_relaxed(&self, entity_id: u32) -> u32 {
+        let off = self.cells + (entity_id as usize) * (self.value_size as usize);
+        self.region.as_atomic_u32(off).load(Ordering::Relaxed)
+    }
+
+    /// 64 bit 列の cell を Relaxed で読む (`load_u32_relaxed` の 8B 版)。 value_size==8 前提。
+    #[inline]
+    pub fn load_u64_relaxed(&self, entity_id: u32) -> u64 {
+        debug_assert_eq!(self.value_size, 8);
+        let off = self.cells + (entity_id as usize) * 8;
+        self.region.as_atomic_u64(off).load(Ordering::Relaxed)
+    }
+
     /// 64 bit 列の cell を Release で書く (`store_u32_release` の 8B 版)。 value_size==8 前提。
     #[inline]
     pub fn store_u64_release(&self, entity_id: u32, v: u64) {
