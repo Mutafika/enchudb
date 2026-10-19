@@ -2335,15 +2335,16 @@ mod tests {
     #[test]
     fn issue374_readers_never_miss_values_while_the_table_grows() {
         use std::sync::Arc;
-        use std::sync::atomic::AtomicU32;
+        use std::sync::atomic::{AtomicU32, AtomicU64};
         let cap = 1u32 << 14; // 1024 → … → 8192 (直後) → 16384 (全域へ組み直す)
         let r = make_regions(cap, cap, 1 << 20);
         let w = Arc::new(r.vocab_init(cap, cap));
         let done = Arc::new(AtomicU32::new(0));
+        let read_any = Arc::new(AtomicU64::new(0));
         let n = cap - 100;
         let readers: Vec<_> = (0..3u32)
             .map(|k| {
-                let (w, done) = (w.clone(), done.clone());
+                let (w, done, read_any) = (w.clone(), done.clone(), read_any.clone());
                 std::thread::spawn(move || {
                     let mut reads = 0u64;
                     loop {
@@ -2358,6 +2359,7 @@ mod tests {
                         let i = (reads as u32).wrapping_mul(2_654_435_761).wrapping_add(k) % d;
                         assert_eq!(w.lookup(format!("g{i}").as_bytes()), Some(i), "入れ終えた g{i} を見落とした");
                         reads += 1;
+                        read_any.fetch_add(1, Ordering::Relaxed);
                     }
                 })
             })
@@ -2365,6 +2367,16 @@ mod tests {
         for i in 0..n {
             assert_eq!(w.get_or_insert(format!("g{i}").as_bytes()), i);
             done.store(i + 1, Ordering::Release);
+            // 読み手の thread が回り出す前に書き手が入れ終えると、 表を伸ばす間の読みが 1 回も無いまま終わる (2026-10-19、
+            // 負荷の高い中で下の `reads > 0` で落ちた)。 半分入れた所で、 読み手が 1 回読むまで待つ (読み手が落ちて終わって
+            // いたら待たない = 下の join がその panic を出す)
+            if i + 1 == n / 2 {
+                let t = std::time::Instant::now();
+                while read_any.load(Ordering::Relaxed) == 0 && !readers.iter().any(|h| h.is_finished()) {
+                    assert!(t.elapsed() < std::time::Duration::from_secs(30), "読み手が 30 秒回らない");
+                    std::thread::yield_now();
+                }
+            }
         }
         let reads: u64 = readers.into_iter().map(|h| h.join().unwrap()).sum();
         assert!(reads > 0);
