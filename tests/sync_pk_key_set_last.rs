@@ -246,12 +246,12 @@ fn recreating_a_key_set_last_in_one_batch_converges_with_the_author() {
 }
 
 /// 行の最初の record で束ねる時、 後ろの主キーの Tie が署名を通らなければ、 その主キーでは束ねない (通らない record の値で、
-/// 通った record の行き先を決めない)。 A の署名付きの n の Tie と、 A を名乗る署名の無い主キー 7 の Tie が 1 つの batch に
-/// 並んでも、 C が持つ主キー 7 の行は書き換わらない。
+/// 通った record の行き先を決めない)。 A の署名付きの n の Tie と、 署名の壊れた主キー 7 の Tie が 1 つの batch に並んでも、
+/// C が持つ主キー 7 の行は書き換わらない。
 #[test]
 fn a_key_that_fails_the_signature_check_does_not_bind() {
     use enchudb::transport::WireRecord;
-    use enchudb_oplog::oplog::DecodedOp;
+    use enchudb_oplog::oplog::{DecodedOp, Op, OpLog};
 
     let dir = Dir::new("forged");
     let mut b = Database::create_with_capacity(&dir.db(3), 4096).unwrap();
@@ -261,29 +261,37 @@ fn a_key_that_fails_the_signature_check_does_not_bind() {
     c.engine().set_peer_id(3);
     let u = c.get_table("u").unwrap();
     u.insert().set("id", 7i64).set("n", 1i64).commit().unwrap();
+    later();
 
-    let kp = enchudb::keys::Keypair::generate();
+    // A の署名付きの record (C の行 7 の書き込みより新しい): 行 5 の n、 その後に主キー
+    let eng = c.engine();
+    let (id, n) = (eng.himo_id("u.id").unwrap() as u16, eng.himo_id("u.n").unwrap() as u16);
+    let kp = Arc::new(enchudb::keys::Keypair::generate());
+    let author = OpLog::create(&dir.0.join("a.oplog"), 1 << 20).unwrap();
+    author.set_peer_id(1);
+    author.set_keypair(Some(kp.clone()));
+    let row = enchudb::make_eid(1, 5);
+    author.append(Op::Tie { eid: row, himo_id: n, value: 5 }).unwrap();
+    author.append(Op::Tie { eid: row, himo_id: id, value: 7 }).unwrap();
+    author.append(Op::Commit).unwrap();
+    let mut recs: Vec<WireRecord> = author.iter_committed().into_iter().map(WireRecord::from).collect();
+    let pk_at = recs.iter().position(|r| matches!(r.op, DecodedOp::Tie { himo_id, .. } if himo_id == id));
+    assert_eq!((recs.len(), pk_at), (2, Some(1)), "前提: n の Tie の後に主キーの Tie");
+    assert!(recs.iter().all(|r| r.signature != [0u8; 64]), "前提: 署名付き");
+    // 主キーの Tie の署名を壊す
+    recs[1].signature[0] ^= 0xff;
+
     c.engine().pubkeys().force_register(1, &kp.public_bytes());
     let tr: Arc<dyn Transport> = transport(3);
     let sc = Syncer::new(c.arc_engine(), tr);
     sc.set_require_signature(true);
-
-    let eng = c.engine();
-    let (id, n) = (eng.himo_id("u.id").unwrap() as u16, eng.himo_id("u.n").unwrap() as u16);
-    let row = enchudb::make_eid(1, 5);
-    let hlc = |logical| Hlc { wall: u64::MAX / 4, logical, peer: 1 };
-    // 署名の検証は signed_bytes に対する署名だけを見る (ここでは中身を問わない)
-    let mut signed = WireRecord::unsigned(hlc(0), 1, DecodedOp::Tie { eid: row, himo_id: n, value: 5 });
-    signed.signed_bytes = b"n of row 5".to_vec();
-    signed.signature = kp.sign(&signed.signed_bytes);
-    let forged = WireRecord::unsigned(hlc(1), 1, DecodedOp::Tie { eid: row, himo_id: id, value: 7 });
-    let o = sc.apply_records(&[signed, forged]);
-    assert_eq!((o.applied, o.rejected_signature), (1, 1), "前提: 署名付きの Tie だけ当たる: {o:?}");
+    let o = sc.apply_records(&recs);
+    assert_eq!((o.applied, o.rejected_signature), (1, 1), "前提: 署名の壊れた主キーの Tie だけ弾く: {o:?}");
 
     eng.rebuild();
     let sevens = u.where_eq("id", 7i64).find().unwrap();
     assert_eq!(sevens.len(), 1);
-    assert_eq!(u.entity(sevens[0]).get("n"), Some(Value::Number(1)), "署名の無い主キーで C の行 7 に束ねた");
+    assert_eq!(u.entity(sevens[0]).get("n"), Some(Value::Number(1)), "署名の壊れた主キーで C の行 7 に束ねた");
     assert_eq!(u.where_eq("n", 5i64).find().unwrap().len(), 1, "前提: A の n は別の行に当たった");
 
     drop(sc);
