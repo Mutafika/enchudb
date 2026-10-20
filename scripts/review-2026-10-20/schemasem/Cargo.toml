@@ -1,0 +1,11 @@
+[package]
+name = "schemasem"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+enchudb-schema = { path = "../../../crates/enchudb-schema" }
+enchudb-engine = { path = "../../../crates/enchudb-engine" }
+enchudb-oplog = { path = "../../../crates/enchudb-oplog" }
+
+[workspace]

@@ -1,0 +1,10 @@
+[package]
+name = "pk_tomb_repro"
+version = "0.0.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+enchudb = { path = "../../.." }
+enchudb-oplog = { path = "../../../crates/enchudb-oplog" }

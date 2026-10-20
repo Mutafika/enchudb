@@ -1,0 +1,13 @@
+[package]
+name = "walexp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+enchudb-engine = { path = "../../../crates/enchudb-engine" }
+enchudb-oplog = { path = "../../../crates/enchudb-oplog" }
+
+[profile.release]
+debug = false
+
+[workspace]
