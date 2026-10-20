@@ -15466,7 +15466,11 @@ impl Engine {
             return Err("new 64-bit columns (Number64) need a file-backed (directory) database".into());
         }
 
-        self.himo_reg.get_or_insert(himo.as_bytes());
+        // #537: 名前を入れられなければ定義しない (前は失敗を捨てて定義を続け、 開き直すと列が名前で引けなかった)。
+        // segment を作る前に断るので、 並列配列も header も触っていない
+        self.himo_reg
+            .try_get_or_insert(himo.as_bytes())
+            .map_err(|e| format!("cannot register himo name {himo:?} ({e:?}: the name registry cannot grow)"))?;
 
         let effective_mv = max_values.min(self.layout.read().unwrap().cyl_max_values);
         if wide {
