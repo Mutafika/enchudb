@@ -897,13 +897,16 @@ impl OpLog {
     /// 新規 WAL ファイル作成。capacity は初期サイズ(bytes)。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create(path: &Path, capacity: usize) -> io::Result<Self> {
+        crate::io_point("oplog.create")?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(true)
             .read(true)
             .write(true)
             .open(path)?;
+        crate::io_point("oplog.set_len")?;
         file.set_len(capacity as u64)?;
+        crate::io_point("oplog.mmap")?;
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
         // ヘッダ初期化
         mmap[0..4].copy_from_slice(FILE_MAGIC);
@@ -961,6 +964,7 @@ impl OpLog {
     /// 既存 WAL を開く。v2 のみ対応。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open(path: &Path) -> io::Result<Self> {
+        crate::io_point("oplog.open")?;
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let mmap = unsafe { MmapMut::map_mut(&file)? };
         if mmap.len() < HEADER_SIZE {
@@ -1788,6 +1792,7 @@ impl OpLog {
     pub fn fsync(&self) -> io::Result<()> {
         #[cfg(all(feature = "crashsim", unix))]
         let sim = crate::crashsim::active().then(|| crate::crashsim::copy_for_sync(crate::crashsim::Copied::Oplog, 0, &self.mmap));
+        crate::io_point("oplog.fsync")?;
         self.mmap.flush()?;
         #[cfg(all(feature = "crashsim", unix))]
         if let Some(copy) = sim {
@@ -2087,6 +2092,7 @@ impl OpLog {
         // (エラーにすると platform / FS ごと書き込み不能になる)。 同一プロセス内の
         // 直列化は呼び出し側の `append_lock` が担うので、 単一プロセス構成
         // (モバイル) は安全側に倒れる。 guard の unlock は no-op になる。
+        crate::io_point("oplog.flock")?;
         let _ = crate::filelock::lock_exclusive(&self._file)?;
         #[cfg(test)]
         FLOCK_TAKEN.with(|c| c.set(c.get() + 1));
@@ -2101,6 +2107,7 @@ impl OpLog {
     pub fn lock_session(&self) -> io::Result<()> {
         let _in_proc = self.append_lock.lock();
         if !self.session_locked.load(Ordering::Relaxed) {
+            crate::io_point("oplog.lock_session")?;
             let _ = crate::filelock::lock_exclusive(&self._file)?;
             self.session_locked.store(true, Ordering::Relaxed);
         }

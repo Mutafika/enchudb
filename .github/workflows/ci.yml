@@ -144,6 +144,11 @@ jobs:
       - name: power loss simulation (crashsim)
         run: cargo test -p enchudb-engine --features crashsim --test power_loss --release
 
+      # #98 ③④: I/O の点ごとの故障 (I/O エラー / process の死 / 電源断 × flush / oplog の書き手)。 同じ crashsim feature の
+      # `enchudb_oplog::io_point` を使う。 今わかっている失敗は試験の `KNOWN` の表 (issue ごと) にあり、 表に無い失敗だけ落とす
+      - name: fault injection / crash matrix (crashsim)
+        run: cargo test -p enchudb-engine --features crashsim --test fault_matrix --release -- --test-threads=1
+
   windows-check:
     name: check (windows cross)
     runs-on: ubuntu-latest

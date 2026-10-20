@@ -697,6 +697,7 @@ fn rename_corrupt_sidecar(db_path: &str, kind: &str, err: &io::Error) {
 #[cfg(not(target_arch = "wasm32"))]
 fn load_tables_from_sidecar(db_path: &str) -> io::Result<Option<(Vec<TableDef>, Vec<OrderDecl>)>> {
     let sidecar = tables_path_for(db_path);
+    enchudb_oplog::io_point("sidecar.read_tables")?;
     match std::fs::read(&sidecar) {
         Ok(buf) => match deserialize_tables(&buf) {
             Ok(t) => Ok(Some(t)),
@@ -844,6 +845,7 @@ fn persist_eidmap_to_sidecar(db_path: &str, entries: &[EidmapEntry]) -> io::Resu
 #[cfg(not(target_arch = "wasm32"))]
 fn load_eidmap_from_sidecar(db_path: &str) -> io::Result<Option<Vec<EidmapEntry>>> {
     let sidecar = eidmap_path_for(db_path);
+    enchudb_oplog::io_point("sidecar.read_eidmap")?;
     match std::fs::read(&sidecar) {
         Ok(buf) => match deserialize_eidmap(&buf) {
             Ok(entries) => Ok(Some(entries)),
@@ -909,6 +911,7 @@ fn persist_eidalias_to_sidecar(db_path: &str, entries: &[(enchudb_oplog::PeerId,
 /// #178: 別名の sidecar を読む。 不在なら Ok(None)。
 #[cfg(not(target_arch = "wasm32"))]
 fn load_eidalias_from_sidecar(db_path: &str) -> io::Result<Option<Vec<(enchudb_oplog::PeerId, u32, u32)>>> {
+    enchudb_oplog::io_point("sidecar.read_eidalias")?;
     match std::fs::read(eidalias_path_for(db_path)) {
         Ok(buf) => deserialize_eidalias(&buf).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -926,6 +929,7 @@ fn pktombs_path_for(path: &str) -> std::path::PathBuf {
 /// #513: `pktombs` を読む。 不在なら Ok(None)。 2 つ目は切れた末尾を捨てたか。
 #[cfg(not(target_arch = "wasm32"))]
 fn load_pktombs_from_sidecar(db_path: &str) -> io::Result<Option<(crate::pk_tombs::PkTombs, bool)>> {
+    enchudb_oplog::io_point("sidecar.read_pktombs")?;
     match std::fs::read(pktombs_path_for(db_path)) {
         Ok(buf) => crate::pk_tombs::PkTombs::load(&buf)
             .map(Some)
@@ -1021,6 +1025,7 @@ fn persist_vocabmap_to_sidecar(db_path: &str, entries: &[VocabmapEntry]) -> io::
 /// vocabmap sidecar を読む。 不在なら Ok(None)。
 #[cfg(not(target_arch = "wasm32"))]
 fn load_vocabmap_from_sidecar(db_path: &str) -> io::Result<Option<Vec<VocabmapEntry>>> {
+    enchudb_oplog::io_point("sidecar.read_vocabmap")?;
     match std::fs::read(vocabmap_path_for(db_path)) {
         Ok(buf) => match deserialize_vocabmap(&buf) {
             Ok(entries) => Ok(Some(entries)),
@@ -1145,6 +1150,7 @@ fn lock_writer(path: &str, wait: bool) -> io::Result<Option<WriterLock>> {
     // v10: lock は DB directory の中。 directory は create 側が作り、 open は存在を
     // `check_db_dir` で確認済み (無い path に空 directory を残さない)。
     let lock_path = writer_lock_path_for(path);
+    enchudb_oplog::io_point("lock.open")?;
     let f = OpenOptions::new()
         .create(true)
         .write(true)
@@ -1176,11 +1182,13 @@ fn lock_writer(path: &str, wait: bool) -> io::Result<Option<WriterLock>> {
     // **Android (bionic) は `Unsupported`** を返す ("lock() not supported")。
     // #280: その穴は `enchudb_oplog::filelock` が libc の flock で塞ぐ
     // (WAL の append guard と同じ経路 = 意味論を 1 箇所に揃える)。
-    let got = if wait {
-        enchudb_oplog::filelock::lock_exclusive(&f).map(Some)
-    } else {
-        enchudb_oplog::filelock::try_lock_exclusive_outcome(&f)
-    };
+    let got = enchudb_oplog::io_point("lock.flock").and_then(|()| {
+        if wait {
+            enchudb_oplog::filelock::lock_exclusive(&f).map(Some)
+        } else {
+            enchudb_oplog::filelock::try_lock_exclusive_outcome(&f)
+        }
+    });
     let exclusive = match got {
         Ok(Some(enchudb_oplog::filelock::LockOutcome::Locked)) => true,
         // advisory lock を持たない FS (一部の FUSE / ネットワーク FS) では
@@ -1257,7 +1265,7 @@ fn create_db_dir(path: &str) -> io::Result<WriterLock> {
             ),
         )
     };
-    let made = match std::fs::create_dir(dir) {
+    let made = match enchudb_oplog::io_point("create.mkdir").and_then(|()| std::fs::create_dir(dir)) {
         Ok(()) => true,
         // #323 / #415: 前の create が途中で落ちた残骸。 作成中の create もこの形に見えるので、 下の lock で分ける
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists && is_create_remnant(dir) => false,
@@ -1283,7 +1291,7 @@ fn create_db_dir(path: &str) -> io::Result<WriterLock> {
     // 中身が届くことの無いよう、 印を書き出してから先へ進む。 前の create の残りは印の後に消す (消す途中で落ちても、
     // 印のある残骸のまま)
     let marker = dir.join(crate::db_files::CREATING);
-    let started = std::fs::File::create(&marker).and_then(|f| f.sync_all()).and_then(|()| {
+    let started = enchudb_oplog::io_point("create.marker").and_then(|()| std::fs::File::create(&marker)).and_then(|f| f.sync_all()).and_then(|()| {
         sync_dir(dir);
         if let Some(parent) = dir.parent() {
             sync_dir(parent);
@@ -4611,6 +4619,7 @@ impl Engine {
             set.flush_all()?;
             set.write_manifest()?;
         }
+        enchudb_oplog::io_point("create.unmark")?;
         std::fs::remove_file(std::path::Path::new(&self.path).join(crate::db_files::CREATING))?;
         sync_dir(std::path::Path::new(&self.path));
         Ok(())

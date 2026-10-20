@@ -212,17 +212,20 @@ pub fn write_atomic_if_changed(sidecar: &Path, bytes: &[u8]) -> io::Result<bool>
     }
     let tmp_path = tmp_path_for(sidecar);
     {
+        enchudb_oplog::io_point("sidecar.write")?;
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(&tmp_path)?;
         f.write_all(bytes)?;
+        enchudb_oplog::io_point("sidecar.sync")?;
         f.sync_all()?;
         #[cfg(all(feature = "crashsim", unix))]
         enchudb_oplog::crashsim::file_synced(&tmp_path);
     }
     inherit_mode(sidecar, &tmp_path);
+    enchudb_oplog::io_point("sidecar.rename")?;
     // 電源断の模擬: 置き換えで手放す旧 sidecar の控えを捨てる (inode の番号は次に作った file に渡る)
     #[cfg(all(feature = "crashsim", unix))]
     enchudb_oplog::crashsim::releasing(sidecar, || std::fs::rename(&tmp_path, sidecar))?;
@@ -235,8 +238,10 @@ pub fn write_atomic_if_changed(sidecar: &Path, bytes: &[u8]) -> io::Result<bool>
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn append_synced(sidecar: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
+    enchudb_oplog::io_point("sidecar.append")?;
     let mut f = std::fs::OpenOptions::new().append(true).open(sidecar)?;
     f.write_all(bytes)?;
+    enchudb_oplog::io_point("sidecar.append_sync")?;
     f.sync_all()?;
     #[cfg(all(feature = "crashsim", unix))]
     enchudb_oplog::crashsim::file_synced(sidecar);

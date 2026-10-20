@@ -220,6 +220,7 @@ pub(crate) fn align_up(value: usize, align: usize) -> usize {
 
 /// fd の載っている filesystem で **非 root user が使える空き byte 数** (#167)。
 pub(crate) fn free_bytes_for_fd(fd: libc::c_int) -> io::Result<u64> {
+    enchudb_oplog::io_point("segment.statvfs")?;
     let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstatvfs(fd, &mut vfs) } < 0 {
         return Err(io::Error::last_os_error());
@@ -363,6 +364,7 @@ impl SegmentMap {
     /// 新規 segment file を作る。 既に存在すれば `AlreadyExists`。
     /// `initial` byte まで commit した状態で返す (page 切り上げ)。
     pub fn create(path: &Path, reserve: usize, initial: usize) -> io::Result<Self> {
+        enchudb_oplog::io_point("segment.create")?;
         let file = open_with_fd_retry(|| {
             OpenOptions::new().read(true).write(true).create_new(true).open(path)
         })?;
@@ -373,6 +375,7 @@ impl SegmentMap {
         if initial > reserve {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "initial > reserve"));
         }
+        enchudb_oplog::io_point("segment.set_len")?;
         file.set_len(initial as u64)?;
         Self::map_new(path.to_path_buf(), file, reserve, initial, false)
     }
@@ -381,6 +384,7 @@ impl SegmentMap {
     /// `readonly` なら `PROT_READ` で貼り、 伸長 API は `PermissionDenied`。
     pub fn open(path: &Path, reserve: usize, readonly: bool) -> io::Result<Self> {
         let _t = OpenTimer(std::time::Instant::now());
+        enchudb_oplog::io_point("segment.open")?;
         let file = open_with_fd_retry(|| OpenOptions::new().read(true).write(!readonly).open(path))?;
         let ps = runtime_page_size();
         // ⚠ `ps` ではなく `RESERVE_ALIGN` で切り上げる — 別 page size の機械が作った DB を開くため。
@@ -417,6 +421,7 @@ impl SegmentMap {
         readonly: bool,
     ) -> io::Result<Self> {
         use std::os::unix::io::AsRawFd;
+        enchudb_oplog::io_point("segment.mmap")?;
         // zero page 予約: PROT_READ の anonymous mapping。 read は 0、 write は fault。
         let base = unsafe {
             libc::mmap(
@@ -471,6 +476,7 @@ impl SegmentMap {
     }
 
     fn reopen(&self) -> io::Result<File> {
+        enchudb_oplog::io_point("segment.reopen")?;
         OpenOptions::new().read(true).write(!self.readonly).open(&self.path)
     }
 
@@ -484,6 +490,7 @@ impl SegmentMap {
         if end <= cur {
             return Ok(());
         }
+        enchudb_oplog::io_point("segment.remap")?;
         let r = unsafe {
             libc::mmap(
                 self.base.add(cur) as *mut _,
@@ -621,6 +628,7 @@ impl SegmentMap {
             if need_bytes > 0 {
                 self.check_space(need_bytes)?;
             }
+            enchudb_oplog::io_point("segment.grow")?;
             file.set_len(aligned as u64)?;
         }
         self.remap_to(file, aligned)?;
@@ -783,7 +791,7 @@ impl SegmentMap {
         let hooked = tests::flush_hook(&self.path);
         #[cfg(not(test))]
         let hooked: io::Result<()> = Ok(());
-        let res = hooked.and_then(|()| {
+        let res = hooked.and_then(|()| enchudb_oplog::io_point("segment.msync")).and_then(|()| {
             let rc = unsafe { libc::msync(self.base.add(offset) as *mut _, len, libc::MS_SYNC) };
             // #317: macOS の msync は書き出しの失敗 (空き不足で書けなかった page) を返さない。 fsync は返す。
             // 書き出しで消えうるのは空きが少ない時だけなので、 fsync はその時だけ (sync ごとの fsync は
@@ -842,6 +850,7 @@ impl SegmentMap {
                 &reopened
             }
         };
+        enchudb_oplog::io_point("segment.fsync")?;
         if unsafe { libc::fsync(file.as_raw_fd()) } < 0 {
             return Err(io::Error::last_os_error());
         }

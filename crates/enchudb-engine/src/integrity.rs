@@ -92,11 +92,13 @@ impl CrcTable {
 
     /// ファイルに書き出す + fsync。
     pub fn save(&self, path: &Path) -> io::Result<()> {
+        enchudb_oplog::io_point("crc.open")?;
         let mut f = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .open(path)?;
+        enchudb_oplog::io_point("crc.write")?;
         f.write_all(CRC_MAGIC)?;
         f.write_all(&CRC_VERSION.to_le_bytes())?;
         f.write_all(&self.db_file_size.to_le_bytes())?;
@@ -104,12 +106,14 @@ impl CrcTable {
         for c in &self.crc {
             f.write_all(&c.to_le_bytes())?;
         }
+        enchudb_oplog::io_point("crc.sync")?;
         f.sync_data()?;
         Ok(())
     }
 
     /// ファイルから読み込む。欠損は None、破損は Err。
     pub fn load(path: &Path) -> io::Result<Option<Self>> {
+        enchudb_oplog::io_point("crc.read")?;
         let mut f = match File::open(path) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
