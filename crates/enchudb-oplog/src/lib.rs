@@ -38,6 +38,26 @@ pub mod oplog;
 #[cfg(all(feature = "crashsim", unix))]
 pub mod crashsim;
 
+/// 決まった I/O の点で I/O の失敗 / process の死 / 電源断を起こす (テスト専用、 feature `crashsim`、 #98)。 [`io_point`]。
+#[cfg(all(feature = "crashsim", unix))]
+pub mod fault;
+
+/// I/O の点 (#98 ③④)。 engine / oplog は filesystem の I/O の直前で呼び、 `?` で返す。 feature `crashsim` の build では、
+/// 環境変数で選んだ回数目の点で I/O を失敗させる / process を落とす / 電源断の像を撮る ([`fault`])。 それ以外の build では
+/// 何もしない (`Ok(())` に畳まれる)。 名前は `"<部品>.<操作>"`。
+#[inline(always)]
+pub fn io_point(site: &'static str) -> std::io::Result<()> {
+    #[cfg(all(feature = "crashsim", unix))]
+    {
+        fault::point(site)
+    }
+    #[cfg(not(all(feature = "crashsim", unix)))]
+    {
+        let _ = site;
+        Ok(())
+    }
+}
+
 /// #280: `std::fs::File::lock` が `Unsupported` を返す platform (Android/bionic)
 /// 向けの file lock 吸収。 engine の writer lock もここを通る。
 #[cfg(not(target_arch = "wasm32"))]

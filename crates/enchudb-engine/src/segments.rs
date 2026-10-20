@@ -161,6 +161,7 @@ impl SegmentSet {
         // directory 自体は呼び出し側が作る (`Engine` は `mkdir` の atomic 性で同時 create を
         // 排他し、 その中に lock を置いてから来る)。 ここでは header.seg の有無で二重 create
         // を拒む。
+        enchudb_oplog::io_point("segments.mkdir")?;
         std::fs::create_dir_all(dir)?;
         if Self::path_of(dir, SegmentKind::Header).exists() {
             return Err(io::Error::new(
@@ -297,6 +298,7 @@ impl SegmentSet {
     pub fn read_header(dir: &Path, len: usize) -> io::Result<Vec<u8>> {
         use std::io::Read;
         let p = Self::path_of(dir, SegmentKind::Header);
+        enchudb_oplog::io_point("segments.read_header")?;
         let mut f = std::fs::File::open(&p)?;
         let mut buf = vec![0u8; len];
         let actual = f.metadata().map(|m| m.len()).unwrap_or(0);
@@ -672,6 +674,7 @@ fn write_manifest_entries(dir: &Path, lens: &[(String, u64)]) -> io::Result<()> 
     let r = (|| -> io::Result<()> {
         use std::io::Write;
         {
+            enchudb_oplog::io_point("segments.manifest_write")?;
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(out.as_bytes())?;
             // **fsync しない**。 manifest は durability の記録ではなく 「前回 flush 時点の
@@ -692,6 +695,7 @@ fn write_manifest_entries(dir: &Path, lens: &[(String, u64)]) -> io::Result<()> 
             #[cfg(not(unix))]
             let _ = md;
         }
+        enchudb_oplog::io_point("segments.manifest_rename")?;
         std::fs::rename(&tmp, &path)
     })();
     if r.is_err() {
@@ -751,6 +755,7 @@ fn parse_manifest(text: &str) -> Option<Vec<(String, u64)>> {
 
 pub fn verify_manifest(dir: &Path) -> io::Result<Option<Vec<(String, u64)>>> {
     let _t = VerifyTimer(std::time::Instant::now());
+    enchudb_oplog::io_point("segments.manifest_read")?;
     let text = match std::fs::read_to_string(manifest_path(dir)) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
