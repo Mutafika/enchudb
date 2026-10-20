@@ -154,10 +154,13 @@ pub enum FaultKind {
     DiskSpace,
     /// #381: Tag の値の番号が古い (語が回収されて番号の場所が別の語に渡った)。 古い番号で書こうとした
     StaleValue,
+    /// #534: 列の segment を初めて開く I/O が失敗した (一時的な EIO / mmap の失敗など)。 書き込みは何も変えずに断り、
+    /// 次に触った時にまた開いてみる
+    SegmentIo,
 }
 
 impl FaultKind {
-    pub(crate) const COUNT: usize = 6;
+    pub(crate) const COUNT: usize = 7;
     pub(crate) fn index(self) -> usize {
         match self {
             FaultKind::EntitySpace => 0,
@@ -166,6 +169,7 @@ impl FaultKind {
             FaultKind::ValueOutOfRange => 3,
             FaultKind::DiskSpace => 4,
             FaultKind::StaleValue => 5,
+            FaultKind::SegmentIo => 6,
         }
     }
     pub fn as_str(self) -> &'static str {
@@ -176,6 +180,7 @@ impl FaultKind {
             FaultKind::ValueOutOfRange => "value out of range",
             FaultKind::DiskSpace => "filesystem is (nearly) full",
             FaultKind::StaleValue => "stale value id (reclaimed)",
+            FaultKind::SegmentIo => "column segment could not be opened",
         }
     }
 }
@@ -4273,6 +4278,9 @@ pub struct Engine {
     /// read-only モード。 true なら書き込み API は error/panic。 open_readonly で立つ。
     /// `is_replica` は「直 write 拒否、 Syncer 経由は受ける」、 こちらは「一切 write 不可」。
     is_readonly: std::sync::atomic::AtomicBool,
+    /// #533: 開くのをやめた engine (open の途中で sidecar を読めなかった等)。 Drop は何も書かずに閉じる (書くと、 読めなかった
+    /// sidecar を空の中身で上書きする)。
+    abandoned: std::sync::atomic::AtomicBool,
     /// 0.8.2: build phase の sidecar fsync 抑止。 schema crate が
     /// `Database::create → build×N` 中 true にして、 `finish_*` / Drop で
     /// false に戻して 1 度だけ explicit に `persist_tables()` を呼ぶ。
@@ -4677,6 +4685,7 @@ impl Engine {
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
+            abandoned: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             sidecar_persist_lock: std::sync::Mutex::new(()),
             _writer_lock: Some(writer_lock),
@@ -4983,12 +4992,7 @@ impl Engine {
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 rename_corrupt_sidecar(path, "tables", &e);
             }
-            Err(e) => {
-                eprintln!(
-                    "warning: failed to read tables sidecar (anonymous fallback): {}",
-                    e
-                );
-            }
+            Err(e) => return Err(eng.abandon_open("tables", e)),
         }
         // request18: table 定義が確定したので hot path 用 cache を張り直す。
         eng.refresh_sync_tables_flag();
@@ -4998,7 +5002,7 @@ impl Engine {
         // #414: table の定義が決まった後で — 前は sidecar を読む前に呼んでいて、 engine 内部の table の Leaf 列
         // (辞書の番号を持つ) を LeafStore の offset と見ていた
         if !readonly {
-            eng.rebuild_leaf_free_list();
+            eng.rebuild_leaf_free_list()?;
         }
 
         // v10: sync tables を持つ DB は版数列 (`ver/*.seg` / `tomb.seg`) を持つのが不変条件。
@@ -5047,12 +5051,13 @@ impl Engine {
                 }
             }
             Ok(None) => {}
-            Err(e) => {
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 eprintln!(
                     "warning: failed to read eidmap sidecar (empty translator): {}",
                     e
                 );
             }
+            Err(e) => return Err(eng.abandon_open("eidmap", e)),
         }
         // #178: 別名 (`eidmap` の後: 別名は逆写像を変えない forward だけの写像)。 壊れていたら警告して別名なしで続ける
         // (別名宛ての record が新しい行として払い出される = 畳む前と同じ)
@@ -5063,7 +5068,10 @@ impl Engine {
                 }
             }
             Ok(None) => {}
-            Err(e) => eprintln!("warning: failed to read eidalias sidecar (aliases dropped): {e}"),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                eprintln!("warning: failed to read eidalias sidecar (aliases dropped): {e}")
+            }
+            Err(e) => return Err(eng.abandon_open("eidalias", e)),
         }
 
         // #513: 消した主キーの記録。 不在なら空で続行。 壊れていたら警告して空で続ける (それより前に消した主キーの行が、
@@ -5085,9 +5093,10 @@ impl Engine {
                 }
             }
             Ok(None) => {}
-            Err(e) => {
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 eprintln!("warning: failed to read pktombs sidecar (no deleted primary keys remembered): {}", e);
             }
+            Err(e) => return Err(eng.abandon_open("pktombs", e)),
         }
 
         // text 写像 (`(author_peer, remote_vid) → local_vid`) の sidecar 読み込み。
@@ -5104,12 +5113,13 @@ impl Engine {
                 }
             }
             Ok(None) => {}
-            Err(e) => {
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 eprintln!(
                     "warning: failed to read vocabmap sidecar (empty vocab translation): {}",
                     e
                 );
             }
+            Err(e) => return Err(eng.abandon_open("vocabmap", e)),
         }
 
         // #117: sidecar の per-table next_local が未永続 / stale でも、 body に msync
@@ -5172,6 +5182,15 @@ impl Engine {
 
     /// open 時の region CRC 検証。`.crc` ファイルがなければスキップ。
     #[cfg(not(target_arch = "wasm32"))]
+    /// #533: 開く途中で sidecar `name` を読めなかった (中身が壊れているのではなく読み込みの I/O が失敗した)。 無いものとして
+    /// 開くと、 次の保存 (flush / consumer の周期 / Drop) がディスクの正しい file を空の中身で上書きするので、 開くのをやめる。
+    /// この engine の Drop は何も書かない。 呼び手が開き直せば読める。 壊れた中身 (`InvalidData`) は今まで通り退けて開く。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn abandon_open(&self, name: &str, e: io::Error) -> io::Error {
+        self.abandoned.store(true, std::sync::atomic::Ordering::Release);
+        io::Error::new(e.kind(), format!("cannot read the {name} sidecar, refusing to open without it (try again): {e}"))
+    }
+
     fn verify_region_crcs(&self) -> io::Result<()> {
         use crate::integrity::{CrcTable, crc_path_for};
         if self.path.is_empty() { return Ok(()); } // from_bytes 等でパス無い場合スキップ
@@ -5451,7 +5470,7 @@ impl Engine {
     pub fn from_bytes(data: Vec<u8>) -> Result<Self, String> {
         let eng = Self::load_from_backing(Backing::Memory(data), /*readonly=*/ false)?;
         eng.finish_vocab_refs_at_open();
-        eng.rebuild_leaf_free_list();
+        eng.rebuild_leaf_free_list().map_err(|e| e.to_string())?;
         Ok(eng)
     }
 
@@ -5882,6 +5901,7 @@ impl Engine {
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
+            abandoned: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             sidecar_persist_lock: std::sync::Mutex::new(()),
             #[cfg(not(target_arch = "wasm32"))]
@@ -9086,7 +9106,8 @@ impl Engine {
     /// - 2 つが別の行に当たれば畳む ([`Engine::merge_entity_into`])。 残すのは自分が産んだ行 (どちらも翻訳した行なら
     ///   `same_as` の行)。 どちらも自分が産んだ行なら畳めない (false)
     /// - 片方だけが行に当たれば、 もう片方 (相手の世界番号) をその行の別名にする (以後その世界番号宛ての record がその行に
-    ///   当たる)
+    ///   当たる)。 その世界番号宛ての Delete を作成より先に受けて退避表に載せていたなら、 行にその削除を当てる
+    ///   ([`Engine::bind_remote_eid`] と同じ)
     /// - 同じ行 / どちらも行が無い時は何もしない (どちらも無い時、 後から届いた 2 つの世界番号は別の行になりうる。 主キーの
     ///   ある表なら主キーで束ねる)
     pub fn apply_alias(&self, eid: enchudb_oplog::EntityId, same_as: enchudb_oplog::EntityId) -> bool {
@@ -9102,7 +9123,14 @@ impl Engine {
             if enchudb_oplog::eid_peer(w) == self_peer {
                 return false; // 自分の世界番号は写像を持たない (行が無いなら、 消した後)
             }
-            self.eid_translator.alias(enchudb_oplog::eid_peer(w), enchudb_oplog::eid_local(w), local);
+            let (peer, foreign_local) = (enchudb_oplog::eid_peer(w), enchudb_oplog::eid_local(w));
+            self.eid_translator.alias(peer, foreign_local, local);
+            // #546: 以後この世界番号の record は写像の速い道で解決され、 作成の時に退避表を見る道 (払い出し / 束ね) を通らない。
+            // 先に届いた削除をここで当てる (当てないと、 知らせが作成より先に届いた peer でだけ行が残る)。 主キーの削除の記録も
+            // `apply_delete_local` がする
+            if let Some(tomb) = self.foreign_tombstone_of(peer, foreign_local) {
+                self.apply_delete_local(local, tomb);
+            }
             true
         };
         match (local_of(eid), local_of(same_as)) {
@@ -11384,8 +11412,14 @@ impl Engine {
     /// #255: 以前は `unique_values()` で集めていたが、 それは leaf を持つ**全 himo の
     /// cylinder を build する** (= 0.26.1 で lazy にした HimoStore が writer open では
     /// 全部 eager に戻る)。 raw cell の走査に替えて、 index は最初に触る列だけ組む。
-    fn rebuild_leaf_free_list(&self) {
-        let Some(leaf) = self.leaf.as_ref() else { return; };
+    fn rebuild_leaf_free_list(&self) -> io::Result<()> {
+        let Some(leaf) = self.leaf.as_ref() else { return Ok(()) };
+        // #534: Leaf の列を全部読む。 列の segment を開けなければ開くのを失敗させる (前は列を初めて開く所で panic した)
+        for hid in 0..self.himos.len() {
+            if self.leaf_for(hid).is_some() {
+                self.himos[hid].ensure_loaded()?;
+            }
+        }
         let mut live: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for hid in 0..self.himos.len() {
             if self.leaf_for(hid).is_some() {
@@ -11397,7 +11431,7 @@ impl Engine {
         }
         let broken = leaf.rebuild_free_list(&live);
         if broken.is_empty() {
-            return;
+            return Ok(());
         }
         // #414: 電源断で中身の届かなかった slot を指す cell は外す (指したままだと、 空きにした場所を
         // 使い回した別の値を読む)。 値は失われている — 届いていない。 high_water より後ろの slot も外す (high_water の
@@ -11423,6 +11457,7 @@ impl Engine {
              pointing at them; these values are lost locally and may stay diverged from sync peers",
             broken.len()
         );
+        Ok(())
     }
 
     /// v6 (#88): リモート peer から届いた TieLeaf を apply。 bytes を local
@@ -12244,7 +12279,18 @@ impl Engine {
     /// 書く前に、 cell の列と版数の列を `local` まで伸ばせるかを確かめる (#316)。 伸ばせなければ
     /// oplog に積まずに拒否する (積んだ後で伸ばせないと、 手元に無い値が peer にだけ届く)。
     #[inline]
+    /// #534: 列 `hid` の segment を開いておく (書き込みの道が列を触る前に)。 開けなければ fault を数えて `Err` — 呼び手は
+    /// 何も変えずに書き込みを断る。
+    fn load_column(&self, hid: usize) -> Result<(), TieRejected> {
+        if let Err(e) = self.himos[hid].ensure_loaded() {
+            self.record_fault(FaultKind::SegmentIo, &format!("列の segment を開けない ({e}) — write rejected"));
+            return Err(TieRejected::Fault(FaultKind::SegmentIo));
+        }
+        Ok(())
+    }
+
     fn ensure_cell_room(&self, hid: usize, local: u32) -> Result<(), TieRejected> {
+        self.load_column(hid)?;
         let ver_ok = match self.ver_col(hid as u16) {
             Some(col) if local < self.max_entities() => col.is_committed_for(local) || col.ensure_committed_for(local).is_ok(),
             _ => true,
@@ -12530,6 +12576,10 @@ impl Engine {
         debug_assert!(hid < self.himos.len(),
             "himo_id {} out of range (max {})", himo_id, self.himos.len());
         if hid >= self.himos.len() { return; }
+        // #534: 列を開けなければ何も積まずに断る (WAL に積んでから断ると、 配った相手でだけ外れる)
+        if self.load_column(hid).is_err() {
+            return;
+        }
         // request17 step 4: untie も版数を進める (進めないと外した cell に古い tie が
         // 蘇る)。 Leaf payload の解放は **採用が決まってから**。 行を握ってから積む (`append_local_op` の doc)
         let row = self.row_for_wal(eid);
@@ -12549,6 +12599,11 @@ impl Engine {
     pub fn delete(&self, eid: enchudb_oplog::EntityId) {
         self.check_writable();
         let eid = enchudb_oplog::eid_local(eid);
+        // #534: 消すには全部の列の古い値を読む (索引と Leaf の領域の片付け)。 開けない列があれば何も積まずに断る (途中まで
+        // 消さない。 WAL に積んでから断ると、 配った相手でだけ消える)
+        if (0..self.himos.len()).any(|hid| self.load_column(hid).is_err()) {
+            return;
+        }
         // request17 step 4 (A-5): 削除は himo を持たないので eid 空間の tombstone
         // column に版数を記録する。 これが永続することで、 配送バッファから
         // tombstone が消えた後も削除済み entity が復活しない (#140 の根)。
@@ -17877,6 +17932,7 @@ impl Drop for Engine {
         if !std::thread::panicking()
             && !self.is_readonly.load(Ordering::Acquire)
             && !self.consumer_poisoned.load(Ordering::Acquire)
+            && !self.abandoned.load(Ordering::Acquire)
         {
             self.commit();
             self.try_persist_tables();
