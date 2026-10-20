@@ -536,17 +536,7 @@ struct Known {
     everywhere: bool,
 }
 
-const KNOWN: &[Known] = &[
-    // 開く時の sidecar の読み込みの EIO で table の定義を捨てて開き、 次の保存で上書きする
-    Known { kind: None, mode: Some("error"), site: "sidecar.read_tables", needle: "table t が無い", issue: "#533", everywhere: true },
-    // 伸ばす mmap の失敗で file だけ伸び、 封緘した .crc が合わない (macOS で当たる)
-    Known { kind: Some(Kind::Flush), mode: Some("error"), site: "segment.remap", needle: "region CRC mismatch", issue: "#535", everywhere: false },
-    // .crc をその場で上書きする (書きかけが残る)。 crashsim の hook も無い (電源断の像では一度も書き出していない扱い)
-    Known { kind: Some(Kind::Flush), mode: None, site: "crc.", needle: "failed to fill whole buffer", issue: "#536", everywhere: true },
-    Known { kind: Some(Kind::Flush), mode: Some("lost"), site: "", needle: "bad .crc magic", issue: "#536", everywhere: true },
-    // 列の定義が紐名の辞書を伸ばせなくても成功を返し、 開き直すと列が引けない (Linux = page 4 KiB で当たる)
-    Known { kind: None, mode: Some("error"), site: "segment.", needle: "書き出しの返った列 t.", issue: "#537", everywhere: false },
-];
+const KNOWN: &[Known] = &[];
 
 fn known(kind: Kind, mode: &str, site: &str, msg: &str) -> Option<usize> {
     KNOWN.iter().position(|k| {

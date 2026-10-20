@@ -491,6 +491,8 @@ impl SegmentMap {
             return Ok(());
         }
         enchudb_oplog::io_point("segment.remap")?;
+        #[cfg(test)]
+        tests::remap_hook(&self.path)?;
         let r = unsafe {
             libc::mmap(
                 self.base.add(cur) as *mut _,
@@ -619,7 +621,8 @@ impl SegmentMap {
         };
         let file_len = file.metadata()?.len();
         let mut need_bytes = 0;
-        if file_len < aligned as u64 {
+        let grew_file = file_len < aligned as u64;
+        if grew_file {
             need_bytes = match need {
                 Need::Whole => aligned as u64 - file_len,
                 Need::From(at) => aligned as u64 - file_len.max(at as u64).min(aligned as u64),
@@ -631,7 +634,15 @@ impl SegmentMap {
             enchudb_oplog::io_point("segment.grow")?;
             file.set_len(aligned as u64)?;
         }
-        self.remap_to(file, aligned)?;
+        if let Err(e) = self.remap_to(file, aligned) {
+            // #535: 伸ばした file を元の長さに戻す。 mmap している長さより file が長いまま残ると、 開き直した時の長さ
+            // (= file の長さ) がこの session の長さと違い、 封緘した `.crc` (mmap している長さの CRC) が合わない。 伸びた
+            // 所は誰も書いていない (mmap できなかった)。 戻すのも失敗したら、 開き直した時に file の長さで mmap するだけ
+            if grew_file {
+                let _ = file.set_len(file_len);
+            }
+            return Err(e);
+        }
         self.add_unflushed(need_bytes);
         Ok(())
     }
@@ -1004,6 +1015,35 @@ mod tests {
 
     fn clear_flush_hook(path: &Path) {
         FLUSH_HOOKS.lock().unwrap_or_else(|p| p.into_inner()).retain(|(p, _)| p != path);
+    }
+
+    /// `remap_to` が伸びた分を mmap する直前に Err を返す segment (path ごと)。 mmap の失敗を模す。
+    static REMAP_FAILS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub(super) fn remap_hook(path: &Path) -> io::Result<()> {
+        if REMAP_FAILS.lock().unwrap_or_else(|p| p.into_inner()).iter().any(|p| p == path) {
+            return Err(io::Error::other("模した mmap の失敗"));
+        }
+        Ok(())
+    }
+
+    /// #535: 伸ばす mmap が失敗したら、 file の長さは伸ばす前に戻る (mmap している長さと file の長さが揃ったまま)。
+    /// 旧実装は file だけ伸びたまま残り、 開き直すと mmap の長さが変わって、 封緘した `.crc` が合わなかった。
+    #[test]
+    fn failed_remap_rolls_the_file_length_back() {
+        let p = dir("failed_remap").join("seg");
+        let seg = SegmentMap::create(&p, 64 * MB, 4096).unwrap();
+        let before = std::fs::metadata(&p).unwrap().len();
+        assert_eq!(before as usize, seg.committed());
+        REMAP_FAILS.lock().unwrap().push(p.clone());
+        assert!(seg.grow_to(8 * MB).is_err(), "前提: mmap の失敗で伸ばすのが失敗する");
+        REMAP_FAILS.lock().unwrap().retain(|x| x != &p);
+        assert_eq!(seg.committed() as u64, before, "前提: mmap している長さは伸びていない");
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), before, "file だけ伸びたまま残った");
+        // 失敗の後も伸ばせる
+        seg.grow_to(8 * MB).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), 8 * MB as u64);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
     /// #421: `flush_dirty` が 2 本同時に来たら、 後の方は前の方の msync が終わるまで返らない。 旧実装は
