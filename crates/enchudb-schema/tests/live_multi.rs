@@ -2,8 +2,8 @@
 //! **テスト側で全 row を総当たりして組んだ結果** と常に一致すること。 oracle は `entity(e).get(col)` で
 //! 値を読んで組むだけ (engine の live 評価を通らない)。
 //!
-//! 組は ref と値のつなぎを混ぜた 3〜4 段。 書き込みは全 table の row の出入り・作り直し、 つなぐ列の書き換え
-//! (ref の付け替え・値の書き換え・外し)、 ref の先の値の変化を混ぜる。
+//! 組は ref と値のつなぎを混ぜた 3〜4 段 (つなぐ元が 1 つ前の table の段も、 2 つ以上前の table の段も)。 書き込みは
+//! 全 table の row の出入り・作り直し、 つなぐ列の書き換え (ref の付け替え・値の書き換え・外し)、 ref の先の値の変化を混ぜる。
 
 use enchudb_schema::{Database, Table, TupleDelta, Value};
 use std::collections::BTreeSet;
@@ -113,7 +113,7 @@ fn run(path: &str) {
         .build()
         .unwrap();
     db.table("shops").number("id").tag("city").number("open").primary_key("id").build().unwrap();
-    db.table("posts").number("id").number("published").ref_to("author", "users").primary_key("id").build().unwrap();
+    db.table("posts").number("id").number("published").tag("city").ref_to("author", "users").primary_key("id").build().unwrap();
     let (ut, st, pt, ct) =
         (db.get_table("users").unwrap(), db.get_table("shops").unwrap(), db.get_table("posts").unwrap(), db.get_table("companies").unwrap());
     let (u, s, p, c) = (&ut, &st, &pt, &ct);
@@ -141,6 +141,9 @@ fn run(path: &str) {
         let mut b = p.insert().set("id", id).set("published", rng.below(2) as i64);
         if rng.below(6) != 0 {
             b = b.set("author", Value::Ref(users[rng.below(users.len() as u64) as usize]));
+        }
+        if rng.below(4) != 0 {
+            b = b.set("city", CITIES[rng.below(4) as usize]);
         }
         b.commit().unwrap()
     };
@@ -231,7 +234,7 @@ fn run(path: &str) {
                     out
                 }),
             ),
-            _ => (
+            4 => (
                 "(投稿, 作者, 作者の会社, 会社の街の開いた店)".into(),
                 Box::new(move || {
                     p.all()
@@ -252,11 +255,32 @@ fn run(path: &str) {
                     out
                 }),
             ),
+            _ => (
+                "(投稿, 作者, 作者の会社, 投稿の街の開いた店) — 最後の段のつなぐ元が 2 つ前の table".into(),
+                Box::new(move || {
+                    p.all()
+                        .join_ref("author", u.all())
+                        .then_ref("users", "company", c.all())
+                        .then_eq("posts", "city", s.where_eq("open", 1i64), "city")
+                }),
+                Box::new(move |w| {
+                    let mut out = BTreeSet::new();
+                    for &q in &w.posts {
+                        let Some(au) = w.author(q) else { continue };
+                        let Some(co) = w.company(au) else { continue };
+                        let Some(v) = get_val(w.p, q, "city") else { continue };
+                        for x in w.shops_in(&v, true) {
+                            out.insert(vec![q, au, co, x]);
+                        }
+                    }
+                    out
+                }),
+            ),
         };
         let live = query().subscribe().unwrap();
         Sub { name, live, query, seen: BTreeSet::new(), oracle }
     };
-    const KINDS: u64 = 5;
+    const KINDS: u64 = 6;
     let mut subs: Vec<Sub> = (0..10).map(|i| make(i % KINDS, &mut rng)).collect();
     let check = |subs: &mut Vec<Sub>, w: &World, step: usize| {
         for sub in subs.iter_mut() {
@@ -276,7 +300,7 @@ fn run(path: &str) {
         let x = w.shops[rng.below(w.shops.len() as u64) as usize];
         let q = w.posts[rng.below(w.posts.len() as u64) as usize];
         let co = w.companies[rng.below(w.companies.len() as u64) as usize];
-        match rng.below(16) {
+        match rng.below(18) {
             0 => u.entity(e).set("city", CITIES[rng.below(4) as usize]).commit().unwrap(),
             1 => eng.untie(e, "users.city"),
             2 => u.entity(e).set("age", rng.below(50) as i64).commit().unwrap(),
@@ -305,6 +329,8 @@ fn run(path: &str) {
                 next_id += 1;
             }
             14 => c.entity(co).set("city", CITIES[rng.below(4) as usize]).commit().unwrap(),
+            15 => p.entity(q).set("city", CITIES[rng.below(4) as usize]).commit().unwrap(),
+            16 => eng.untie(q, "posts.city"),
             _ => {
                 let i = w.companies.iter().position(|&k| k == co).unwrap();
                 c.entity(co).delete().unwrap();

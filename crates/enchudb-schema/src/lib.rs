@@ -3353,48 +3353,156 @@ struct LiveStep {
 
 /// 組の段ごとの置き場。 段 k の組 = (段 k-1 の組の番号, 足した row) を 1 回だけ持ち、 番号で指す (組を複製しない)。
 /// 消えた組の番号は poll が終わってから空ける (同じ poll の後の段がまだ組の中身を読む)。
+///
+/// 組は 2 本の鎖 (前後の番号) につなぐ: 同じ前の段の組を持つ組 (兄弟) と、 同じ row を持つ組。 組が消えるのは、
+/// 前の段の組が鍵から抜けた時 (その組の子が全部消える) か、 子の row が鍵から抜けた時 (その row の組が全部消える) なので、
+/// 鎖をたどってまとめて消す。 旧: (前の段の組, row) → 番号の 1 本の木を組ごとに引いていた (3 table の組の 1 万件まとめで
+/// poll の 4 割強が木の挿入と削除)。
 #[derive(Default)]
 struct Arena {
     prev: Vec<u32>,
     row: Vec<EntityId>,
+    /// 組の row の鎖 (`heads` の添字)。
+    chain: Vec<u32>,
+    /// 兄弟の鎖の (前, 次)。 端は NIL。
+    sib: Vec<[u32; 2]>,
+    /// row の鎖の (前, 次)。
+    cousin: Vec<[u32; 2]>,
+    /// 前の段の組の番号 → 最初の子 (段 0 は使わない)。 番号を使い回す前に子は全部消えている。
+    first_kid: Vec<u32>,
+    /// row → row の鎖 (組の無い row は持たない)。
+    chain_of: std::collections::BTreeMap<EntityId, u32>,
+    /// row の鎖の最初の組。
+    heads: Vec<u32>,
+    free_chains: Vec<u32>,
     free: Vec<u32>,
-    /// (段 k-1 の組の番号, row) を 1 つの u128 に詰めた鍵 → 番号 (比較 1 回で済む)。
-    index: std::collections::BTreeMap<u128, u32>,
     /// この poll で消えた番号 (poll の終わりに `free` へ)。
     dead: Vec<u32>,
 }
 
-#[inline]
-fn pack(prev: u32, row: EntityId) -> u128 {
-    ((prev as u128) << 64) | row as u128
-}
-
 /// 段 0 の組の 「前の段の組」 の番号。
 const ROOT: u32 = u32::MAX;
+/// 鎖の端。
+const NIL: u32 = u32::MAX;
 
 impl Arena {
+    /// row の鎖 (無ければ作る)。
+    fn chain_for(&mut self, row: EntityId) -> u32 {
+        let (heads, free) = (&mut self.heads, &mut self.free_chains);
+        *self.chain_of.entry(row).or_insert_with(|| match free.pop() {
+            Some(c) => c,
+            None => {
+                heads.push(NIL);
+                (heads.len() - 1) as u32
+            }
+        })
+    }
+
     fn alloc(&mut self, prev: u32, row: EntityId) -> u32 {
+        let ch = self.chain_for(row);
+        self.alloc_in(prev, row, ch)
+    }
+
+    /// 組 (prev, row) を足す (`ch` = row の鎖)。
+    fn alloc_in(&mut self, prev: u32, row: EntityId, ch: u32) -> u32 {
+        let next_cousin = self.heads[ch as usize];
+        let next_sib = if prev == ROOT {
+            NIL
+        } else {
+            if self.first_kid.len() <= prev as usize {
+                self.first_kid.resize(prev as usize + 1, NIL);
+            }
+            self.first_kid[prev as usize]
+        };
         let id = match self.free.pop() {
             Some(i) => {
-                self.prev[i as usize] = prev;
-                self.row[i as usize] = row;
+                let u = i as usize;
+                self.prev[u] = prev;
+                self.row[u] = row;
+                self.chain[u] = ch;
+                self.sib[u] = [NIL, next_sib];
+                self.cousin[u] = [NIL, next_cousin];
                 i
             }
             None => {
                 self.prev.push(prev);
                 self.row.push(row);
+                self.chain.push(ch);
+                self.sib.push([NIL, next_sib]);
+                self.cousin.push([NIL, next_cousin]);
                 (self.prev.len() - 1) as u32
             }
         };
-        self.index.insert(pack(prev, row), id);
+        self.heads[ch as usize] = id;
+        if next_cousin != NIL {
+            self.cousin[next_cousin as usize][0] = id;
+        }
+        if prev != ROOT {
+            self.first_kid[prev as usize] = id;
+            if next_sib != NIL {
+                self.sib[next_sib as usize][0] = id;
+            }
+        }
         id
     }
 
-    /// 組 (prev, row) を消す (番号は poll の終わりまで読める)。
-    fn kill(&mut self, prev: u32, row: EntityId) -> Option<u32> {
-        let id = self.index.remove(&pack(prev, row))?;
+    /// 組 `id` を 2 本の鎖から外す (番号と中身は poll の終わりまで読める)。
+    fn unlink(&mut self, id: u32) {
+        let u = id as usize;
+        let [p, n] = self.cousin[u];
+        if n != NIL {
+            self.cousin[n as usize][0] = p;
+        }
+        if p != NIL {
+            self.cousin[p as usize][1] = n;
+        } else {
+            let ch = self.chain[u];
+            self.heads[ch as usize] = n;
+            if n == NIL {
+                self.chain_of.remove(&self.row[u]);
+                self.free_chains.push(ch);
+            }
+        }
+        let parent = self.prev[u];
+        if parent != ROOT {
+            let [p, n] = self.sib[u];
+            if n != NIL {
+                self.sib[n as usize][0] = p;
+            }
+            if p != NIL {
+                self.sib[p as usize][1] = n;
+            } else {
+                self.first_kid[parent as usize] = n;
+            }
+        }
         self.dead.push(id);
-        Some(id)
+    }
+
+    /// 前の段の組 `t` の子のうち、 `keep(子の row)` でないものを消して `out` に積む。
+    fn kill_kids(&mut self, t: u32, keep: impl Fn(EntityId) -> bool, out: &mut Vec<u32>) {
+        let mut cur = self.first_kid.get(t as usize).copied().unwrap_or(NIL);
+        while cur != NIL {
+            let next = self.sib[cur as usize][1];
+            if !keep(self.row[cur as usize]) {
+                self.unlink(cur);
+                out.push(cur);
+            }
+            cur = next;
+        }
+    }
+
+    /// row `row` の組のうち、 `keep(前の段の組の番号)` でないものを消して `out` に積む。
+    fn kill_row(&mut self, row: EntityId, keep: impl Fn(u32) -> bool, out: &mut Vec<u32>) {
+        let Some(&ch) = self.chain_of.get(&row) else { return };
+        let mut cur = self.heads[ch as usize];
+        while cur != NIL {
+            let next = self.cousin[cur as usize][1];
+            if !keep(self.prev[cur as usize]) {
+                self.unlink(cur);
+                out.push(cur);
+            }
+            cur = next;
+        }
     }
 }
 
@@ -3408,15 +3516,43 @@ fn row_at(arenas: &[Arena], mut level: usize, mut id: u32, pos: usize) -> Entity
 }
 
 /// 段 `level` の組 `id` の中身。
-fn tuple_at(arenas: &[Arena], level: usize, id: u32) -> Vec<EntityId> {
-    (0..=level).map(|pos| row_at(arenas, level, id, pos)).collect()
+fn tuple_at(arenas: &[Arena], level: usize, mut id: u32) -> Vec<EntityId> {
+    let mut t = vec![0; level + 1];
+    for l in (0..=level).rev() {
+        let a = &arenas[l];
+        t[l] = a.row[id as usize];
+        id = a.prev[id as usize];
+    }
+    t
+}
+
+/// 段 `lv` の今の組のうち、 位置 `pos` の row が `row` のものを `out` に積む (段 `pos` の row の鎖から、 子の鎖を
+/// 段 `lv` まで下りる)。
+fn tuples_with(arenas: &[Arena], lv: usize, pos: usize, row: EntityId, out: &mut Vec<u32>) {
+    fn down(arenas: &[Arena], level: usize, id: u32, lv: usize, out: &mut Vec<u32>) {
+        if level == lv {
+            out.push(id);
+            return;
+        }
+        let a = &arenas[level + 1];
+        let mut cur = a.first_kid.get(id as usize).copied().unwrap_or(NIL);
+        while cur != NIL {
+            down(arenas, level + 1, cur, lv, out);
+            cur = a.sib[cur as usize][1];
+        }
+    }
+    let a = &arenas[pos];
+    let Some(&ch) = a.chain_of.get(&row) else { return };
+    let mut cur = a.heads[ch as usize];
+    while cur != NIL {
+        down(arenas, pos, cur, lv, out);
+        cur = a.cousin[cur as usize][1];
+    }
 }
 
 /// 段の状態 (最後に渡した組の元)。 集合は (鍵, 番号) の組を 1 本の木で持つ (鍵ごとの小さな木を作らない)。
 #[derive(Default)]
 struct StepState {
-    /// (親の row, 前の段の組の番号)。
-    by_row: std::collections::BTreeSet<(EntityId, u32)>,
     /// 親の row の鍵。
     pkey: std::collections::BTreeMap<EntityId, u64>,
     /// (鍵, 前の段の組の番号) (親の row に鍵のある組)。
@@ -3457,7 +3593,7 @@ impl LiveMultiJoin {
         let mut d = IdDelta::default();
         // 段 0: row そのもの (消えて入り直した row は別の番号になる)
         for e in d0.removed {
-            d.removed.extend(arenas[0].kill(ROOT, e));
+            arenas[0].kill_row(e, |_| false, &mut d.removed);
         }
         for e in d0.added {
             d.added.push(arenas[0].alloc(ROOT, e));
@@ -3471,9 +3607,11 @@ impl LiveMultiJoin {
             removed: d.removed.iter().map(|&id| tuple_at(arenas, last, id)).collect(),
             added: d.added.iter().map(|&id| tuple_at(arenas, last, id)).collect(),
         };
-        for a in arenas.iter_mut() {
-            let dead = std::mem::take(&mut a.dead);
-            a.free.extend(dead);
+        for k in 0..arenas.len() {
+            // 消えた組の子は同じ poll で全部消えている (番号を使い回しても前の子の鎖が残らない)
+            debug_assert!(arenas.get(k + 1).is_none_or(|n| arenas[k].dead.iter().all(|&t| n.first_kid.get(t as usize).is_none_or(|&c| c == NIL))));
+            let dead = std::mem::take(&mut arenas[k].dead);
+            arenas[k].free.extend(dead);
         }
         out
     }
@@ -3504,27 +3642,25 @@ impl LiveStep {
         };
         // ── 前の段の組の鍵付きの差分 (組の出入り + 親の row の鍵の変化)。 番号は出入りのたびに新しいので、 同じ番号が
         // removed と added の両方に来ることは無い (入り直した組は別の番号)
-        let gone: BTreeSet<u32> = dleft.removed.iter().copied().collect();
-        let born: BTreeSet<u32> = dleft.added.iter().copied().collect();
-        let mut affected: BTreeSet<u32> = gone.union(&born).copied().collect();
+        let (mut gone, mut born) = (dleft.removed, dleft.added);
+        gone.sort_unstable();
+        born.sort_unstable();
+        let mut affected: Vec<u32> = [gone.as_slice(), born.as_slice()].concat();
+        // 鍵の変わった親の row を持つ組: 今の組を row の鎖から引く (この poll で消えた組は gone に、 足した組は born に居る)
         for r in dp.removed.iter().chain(dp.added.iter()).map(|x| x.0) {
-            affected.extend(st.by_row.range((r, 0)..=(r, u32::MAX)).map(|x| x.1));
+            tuples_with(prev, lv, p, r, &mut affected);
         }
+        affected.sort_unstable();
+        affected.dedup();
         // 親の row が入り直した (eid の使い回し) なら、 その row を含む組は別物
         let re_rows: BTreeSet<EntityId> = dp.reentered.iter().copied().collect();
         let old: Vec<(u32, EntityId, Option<u64>)> = affected
             .iter()
             .map(|&t| {
                 let r = row(t);
-                (t, r, if born.contains(&t) { None } else { st.pkey.get(&r).copied() })
+                (t, r, if born.binary_search(&t).is_ok() { None } else { st.pkey.get(&r).copied() })
             })
             .collect();
-        for &t in &dleft.removed {
-            st.by_row.remove(&(row(t), t));
-        }
-        for &t in &dleft.added {
-            st.by_row.insert((row(t), t));
-        }
         for (r, _) in &dp.removed {
             st.pkey.remove(r);
         }
@@ -3533,7 +3669,7 @@ impl LiveStep {
         }
         let mut dl: Keyed<u32> = Keyed { removed: Vec::new(), added: Vec::new(), reentered: BTreeSet::new() };
         for (t, r, was) in old {
-            let now = if gone.contains(&t) { None } else { st.pkey.get(&r).copied() };
+            let now = if gone.binary_search(&t).is_ok() { None } else { st.pkey.get(&r).copied() };
             let re = re_rows.contains(&r);
             if was == now && !re {
                 continue;
@@ -3548,24 +3684,18 @@ impl LiveStep {
                 dl.reentered.insert(t);
             }
         }
-        // ── 前の段の組 × 子の row (値で結ぶ 2 つの table の組と同じ手順): 抜く側は抜く前の相手と、 足す側は足した後の相手と
+        // ── 前の段の組 × 子の row (値で結ぶ 2 つの table の組と同じ手順): 抜く側は抜く前の相手と、 足す側は足した後の相手と。
+        // 抜く前の相手 = 今ある組なので、 抜く側は鎖でまとめて消す (前の段の組が抜ける = その子全部、 子の row が抜ける =
+        // その row の組全部。 前の段の組が先に抜けた組はもう居ない)
         let kept = kept_ids(&dl, &dc);
         let keep = |t: u32, c: EntityId| !kept.is_empty() && kept.contains(&(t, c));
         let mut out = IdDelta::default();
         for &(t, k) in &dl.removed {
-            for &(_, c) in st.right.range((k, 0)..=(k, u64::MAX)) {
-                if !keep(t, c) {
-                    out.removed.extend(next.kill(t, c));
-                }
-            }
+            next.kill_kids(t, |c| keep(t, c), &mut out.removed);
             st.kl.remove(&(k, t));
         }
         for &(c, k) in &dc.removed {
-            for &(_, t) in st.kl.range((k, 0)..=(k, u32::MAX)) {
-                if !keep(t, c) {
-                    out.removed.extend(next.kill(t, c));
-                }
-            }
+            next.kill_row(c, |t| keep(t, c), &mut out.removed);
             st.right.remove(&(k, c));
         }
         for &(t, k) in &dl.added {
@@ -3578,9 +3708,14 @@ impl LiveStep {
         }
         for &(c, k) in &dc.added {
             st.right.insert((k, c));
+            // row の鎖は最初の組を足す時に引く (組の無い row の鎖は作らない)
+            let mut ch = NIL;
             for &(_, t) in st.kl.range((k, 0)..=(k, u32::MAX)) {
                 if !keep(t, c) {
-                    out.added.push(next.alloc(t, c));
+                    if ch == NIL {
+                        ch = next.chain_for(c);
+                    }
+                    out.added.push(next.alloc_in(t, c, ch));
                 }
             }
         }
@@ -6778,6 +6913,131 @@ fn deserialize_schema(s: &str) -> Result<Vec<RawTableDef>, SchemaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 組の置き場の 2 本の鎖 (兄弟 / row) を、 乱数の操作列で素朴な模型 (番号 → 中身の表) と突き合わせる。 毎回、 鎖の
+    /// 中身・前向きの番号・row の鎖を下りた組 (`tuples_with`)・組の中身 (`tuple_at`) と、 組の無い row の鎖が残って
+    /// いないこと (置き場の大きさが組の数に比例) を確かめる。 番号は poll の終わりに使い回す。
+    #[test]
+    fn arena_chains_match_a_model() {
+        use std::collections::{BTreeMap, BTreeSet};
+        struct Rng(u64);
+        impl Rng {
+            fn below(&mut self, n: u64) -> u64 {
+                self.0 ^= self.0 >> 12;
+                self.0 ^= self.0 << 25;
+                self.0 ^= self.0 >> 27;
+                self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) % n
+            }
+        }
+        // 鎖を前からたどる (前向きの番号も確かめる)
+        fn walk(first: u32, links: &[[u32; 2]]) -> BTreeSet<u32> {
+            let (mut out, mut back, mut cur) = (BTreeSet::new(), NIL, first);
+            while cur != NIL {
+                assert_eq!(links[cur as usize][0], back, "前向きの番号が違う ({cur})");
+                assert!(out.insert(cur), "鎖が輪になった");
+                back = cur;
+                cur = links[cur as usize][1];
+            }
+            out
+        }
+        let mut rng = Rng(0x5eed_a7e4_0000_0001);
+        let mut arenas: Vec<Arena> = vec![Arena::default(), Arena::default()];
+        // 模型: 段 0 の番号 → row、 段 1 の番号 → (段 0 の番号, row)
+        let (mut m0, mut m1): (BTreeMap<u32, EntityId>, BTreeMap<u32, (u32, EntityId)>) = (BTreeMap::new(), BTreeMap::new());
+        for step in 0..20_000 {
+            match rng.below(12) {
+                0..=2 => {
+                    let r = 1 + rng.below(12);
+                    if !m0.values().any(|&x| x == r) {
+                        m0.insert(arenas[0].alloc(ROOT, r), r);
+                    }
+                }
+                3..=6 => {
+                    let Some(&t) = m0.keys().nth(rng.below(m0.len().max(1) as u64) as usize) else { continue };
+                    let c = 100 + rng.below(5);
+                    if !m1.values().any(|&v| v == (t, c)) {
+                        let id = if rng.below(2) == 0 {
+                            arenas[1].alloc(t, c)
+                        } else {
+                            let ch = arenas[1].chain_for(c);
+                            arenas[1].alloc_in(t, c, ch)
+                        };
+                        m1.insert(id, (t, c));
+                    }
+                }
+                7 => {
+                    let Some(&t) = m0.keys().nth(rng.below(m0.len().max(1) as u64) as usize) else { continue };
+                    let mask = rng.below(32);
+                    let keep = |c: EntityId| mask >> (c - 100) & 1 == 1;
+                    let mut out = Vec::new();
+                    arenas[1].kill_kids(t, keep, &mut out);
+                    let want: BTreeSet<u32> = m1.iter().filter(|(_, (u, c))| *u == t && !keep(*c)).map(|(&i, _)| i).collect();
+                    assert_eq!(out.iter().copied().collect::<BTreeSet<_>>(), want, "step {step}: kill_kids");
+                    m1.retain(|i, _| !want.contains(i));
+                }
+                8 => {
+                    let c = 100 + rng.below(5);
+                    let mask = rng.below(1 << 12);
+                    let keep = |t: u32| mask >> (t % 12) & 1 == 1;
+                    let mut out = Vec::new();
+                    arenas[1].kill_row(c, keep, &mut out);
+                    let want: BTreeSet<u32> = m1.iter().filter(|(_, (u, x))| *x == c && !keep(*u)).map(|(&i, _)| i).collect();
+                    assert_eq!(out.iter().copied().collect::<BTreeSet<_>>(), want, "step {step}: kill_row");
+                    m1.retain(|i, _| !want.contains(i));
+                }
+                9 | 10 => {
+                    // 段 0 の組を消す: 先に子を全部消す (poll と同じ約束)
+                    let Some((&t, &r)) = m0.iter().nth(rng.below(m0.len().max(1) as u64) as usize) else { continue };
+                    let mut out = Vec::new();
+                    arenas[1].kill_kids(t, |_| false, &mut out);
+                    m1.retain(|_, (u, _)| *u != t);
+                    out.clear();
+                    arenas[0].kill_row(r, |_| false, &mut out);
+                    assert_eq!(out, vec![t], "step {step}: 段 0 の row の組");
+                    m0.remove(&t);
+                }
+                _ => {
+                    // poll の終わり: 消えた番号を空ける
+                    for a in arenas.iter_mut() {
+                        let dead = std::mem::take(&mut a.dead);
+                        a.free.extend(dead);
+                    }
+                }
+            }
+            // 兄弟の鎖
+            for &t in m0.keys() {
+                let first = arenas[1].first_kid.get(t as usize).copied().unwrap_or(NIL);
+                let want: BTreeSet<u32> = m1.iter().filter(|(_, (u, _))| *u == t).map(|(&i, _)| i).collect();
+                assert_eq!(walk(first, &arenas[1].sib), want, "step {step}: {t} の子");
+            }
+            // row の鎖 (組の無い row は鎖を持たない)
+            let rows1: BTreeSet<EntityId> = m1.values().map(|v| v.1).collect();
+            assert_eq!(arenas[1].chain_of.keys().copied().collect::<BTreeSet<_>>(), rows1, "step {step}: 段 1 の row の鎖");
+            assert_eq!(arenas[0].chain_of.keys().copied().collect::<BTreeSet<_>>(), m0.values().copied().collect(), "step {step}: 段 0");
+            for (a, rows) in [(0usize, m0.values().copied().collect::<Vec<_>>()), (1, rows1.iter().copied().collect())] {
+                for r in rows {
+                    let got = walk(arenas[a].heads[arenas[a].chain_of[&r] as usize], &arenas[a].cousin);
+                    let want: BTreeSet<u32> = if a == 0 {
+                        m0.iter().filter(|(_, x)| **x == r).map(|(&i, _)| i).collect()
+                    } else {
+                        m1.iter().filter(|(_, v)| v.1 == r).map(|(&i, _)| i).collect()
+                    };
+                    assert_eq!(got, want, "step {step}: 段 {a} の row {r} の鎖");
+                }
+            }
+            // row の鎖を下りた組・組の中身
+            for (&t, &r) in &m0 {
+                let mut got = Vec::new();
+                tuples_with(&arenas, 1, 0, r, &mut got);
+                let want: BTreeSet<u32> = m1.iter().filter(|(_, (u, _))| *u == t).map(|(&i, _)| i).collect();
+                assert_eq!(got.iter().copied().collect::<BTreeSet<_>>(), want, "step {step}: 段 0 の row {r} を持つ組");
+                assert_eq!(got.len(), want.len());
+            }
+            for (&i, &(t, c)) in &m1 {
+                assert_eq!(tuple_at(&arenas, 1, i), vec![m0[&t], c], "step {step}: 組 {i} の中身");
+            }
+        }
+    }
 
     fn tmp(name: &str) -> String {
         format!("/tmp/enchudb-schema-test-{}-{}.db", name, std::process::id())
