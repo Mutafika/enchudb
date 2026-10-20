@@ -541,8 +541,6 @@ struct Known {
 }
 
 const KNOWN: &[Known] = &[
-    // 開く時の sidecar の読み込みの EIO で table の定義を捨てて開き、 次の保存で上書きする
-    Known { kind: None, mode: Some("error"), site: "sidecar.read_tables", needle: "table t が無い", issue: "#533", everywhere: true },
     // 列の segment を初めて開く時の I/O エラーで panic する
     Known { kind: None, mode: Some("error"), site: "segment.open", needle: "could not be opened on first use", issue: "#534", everywhere: true },
     Known { kind: None, mode: Some("error"), site: "segment.mmap", needle: "could not be opened on first use", issue: "#534", everywhere: true },

@@ -4195,6 +4195,9 @@ pub struct Engine {
     /// read-only モード。 true なら書き込み API は error/panic。 open_readonly で立つ。
     /// `is_replica` は「直 write 拒否、 Syncer 経由は受ける」、 こちらは「一切 write 不可」。
     is_readonly: std::sync::atomic::AtomicBool,
+    /// #533: 開くのをやめた engine (open の途中で sidecar を読めなかった等)。 Drop は何も書かずに閉じる (書くと、 読めなかった
+    /// sidecar を空の中身で上書きする)。
+    abandoned: std::sync::atomic::AtomicBool,
     /// 0.8.2: build phase の sidecar fsync 抑止。 schema crate が
     /// `Database::create → build×N` 中 true にして、 `finish_*` / Drop で
     /// false に戻して 1 度だけ explicit に `persist_tables()` を呼ぶ。
@@ -4599,6 +4602,7 @@ impl Engine {
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
+            abandoned: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             sidecar_persist_lock: std::sync::Mutex::new(()),
             _writer_lock: Some(writer_lock),
@@ -4905,12 +4909,7 @@ impl Engine {
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 rename_corrupt_sidecar(path, "tables", &e);
             }
-            Err(e) => {
-                eprintln!(
-                    "warning: failed to read tables sidecar (anonymous fallback): {}",
-                    e
-                );
-            }
+            Err(e) => return Err(eng.abandon_open("tables", e)),
         }
         // request18: table 定義が確定したので hot path 用 cache を張り直す。
         eng.refresh_sync_tables_flag();
@@ -4969,12 +4968,13 @@ impl Engine {
                 }
             }
             Ok(None) => {}
-            Err(e) => {
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 eprintln!(
                     "warning: failed to read eidmap sidecar (empty translator): {}",
                     e
                 );
             }
+            Err(e) => return Err(eng.abandon_open("eidmap", e)),
         }
         // #178: 別名 (`eidmap` の後: 別名は逆写像を変えない forward だけの写像)。 壊れていたら警告して別名なしで続ける
         // (別名宛ての record が新しい行として払い出される = 畳む前と同じ)
@@ -4985,7 +4985,10 @@ impl Engine {
                 }
             }
             Ok(None) => {}
-            Err(e) => eprintln!("warning: failed to read eidalias sidecar (aliases dropped): {e}"),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                eprintln!("warning: failed to read eidalias sidecar (aliases dropped): {e}")
+            }
+            Err(e) => return Err(eng.abandon_open("eidalias", e)),
         }
 
         // #513: 消した主キーの記録。 不在なら空で続行。 壊れていたら警告して空で続ける (それより前に消した主キーの行が、
@@ -5007,9 +5010,10 @@ impl Engine {
                 }
             }
             Ok(None) => {}
-            Err(e) => {
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 eprintln!("warning: failed to read pktombs sidecar (no deleted primary keys remembered): {}", e);
             }
+            Err(e) => return Err(eng.abandon_open("pktombs", e)),
         }
 
         // text 写像 (`(author_peer, remote_vid) → local_vid`) の sidecar 読み込み。
@@ -5026,12 +5030,13 @@ impl Engine {
                 }
             }
             Ok(None) => {}
-            Err(e) => {
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 eprintln!(
                     "warning: failed to read vocabmap sidecar (empty vocab translation): {}",
                     e
                 );
             }
+            Err(e) => return Err(eng.abandon_open("vocabmap", e)),
         }
 
         // #117: sidecar の per-table next_local が未永続 / stale でも、 body に msync
@@ -5094,6 +5099,15 @@ impl Engine {
 
     /// open 時の region CRC 検証。`.crc` ファイルがなければスキップ。
     #[cfg(not(target_arch = "wasm32"))]
+    /// #533: 開く途中で sidecar `name` を読めなかった (中身が壊れているのではなく読み込みの I/O が失敗した)。 無いものとして
+    /// 開くと、 次の保存 (flush / consumer の周期 / Drop) がディスクの正しい file を空の中身で上書きするので、 開くのをやめる。
+    /// この engine の Drop は何も書かない。 呼び手が開き直せば読める。 壊れた中身 (`InvalidData`) は今まで通り退けて開く。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn abandon_open(&self, name: &str, e: io::Error) -> io::Error {
+        self.abandoned.store(true, std::sync::atomic::Ordering::Release);
+        io::Error::new(e.kind(), format!("cannot read the {name} sidecar, refusing to open without it (try again): {e}"))
+    }
+
     fn verify_region_crcs(&self) -> io::Result<()> {
         use crate::integrity::{CrcTable, crc_path_for};
         if self.path.is_empty() { return Ok(()); } // from_bytes 等でパス無い場合スキップ
@@ -5804,6 +5818,7 @@ impl Engine {
             peer_vocab_map: std::sync::RwLock::new(std::collections::HashMap::new()),
             peer_vocab_map_dirty: std::sync::atomic::AtomicBool::new(false),
             is_readonly: std::sync::atomic::AtomicBool::new(false),
+            abandoned: std::sync::atomic::AtomicBool::new(false),
             defer_tables_persist: std::sync::atomic::AtomicBool::new(false),
             sidecar_persist_lock: std::sync::Mutex::new(()),
             #[cfg(not(target_arch = "wasm32"))]
@@ -17783,6 +17798,7 @@ impl Drop for Engine {
         if !std::thread::panicking()
             && !self.is_readonly.load(Ordering::Acquire)
             && !self.consumer_poisoned.load(Ordering::Acquire)
+            && !self.abandoned.load(Ordering::Acquire)
         {
             self.commit();
             self.try_persist_tables();
