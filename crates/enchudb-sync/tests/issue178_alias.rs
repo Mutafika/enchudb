@@ -4,14 +4,15 @@
 //!
 //! 1. A と B が同じ主キー (key = 7) の行を別々に作る。 B は主キー以外の列 (module / path) を先に commit し、 主キーは後の commit
 //! 2. A が B の record を 2 回の配りで受ける: 先の配りの主キーの無い record で B の行の写しを払い出し、 後の配りの主キーは
-//!    その写しに当たる (写像が既にあるので主キーでは束ねない) = A に key 7 の行が 2 つ。 同じ配りなら、 主キーが後ろでも
-//!    最初の record の前に束ねる (#544) ので 2 つにならない
+//!    その写しに当たる (写像が既にあるので主キーでは束ねない)。 前はここで A に key 7 の行が 2 つ残った。 今は主キーを当てた
+//!    時に同じ主キーの A の行と 1 つに畳む (`Engine::fold_rows_with_same_pk`、 知らせによらない)。 同じ配りなら、 主キーが
+//!    後ろでも最初の record の前に束ねる (#544)
 //! 3. B が A の record を受ける: A の行を主キーで B の行に束ねる (`bind_over_local_writes`)。 知らせを書く設定なら
 //!    「B の行の B の世界番号 = A の行の世界番号」 を配る
-//! 4. A と第三者 C が知らせを受け、 2 行を畳む (A は自分の行に、 C は A の世界番号の行に)。 C も B の record を A と同じ
-//!    2 回の配りで受ける (主キーの無い record が先)
+//! 4. A と第三者 C が受ける。 C も B の record を A と同じ 2 回の配りで受ける (主キーの無い record が先)
 //!
-//! 知らせを書かない設定 (既定) では 2 行のまま (= 直す前の形、 対照)。
+//! 主キーの Tie が届けば知らせが無くても畳まれる。 知らせが要るのは、 主キーの無い record しか届かない世界番号 (D の形、
+//! `alias_maps_the_unseen_identity_onto_the_existing_row`)。
 
 use enchudb_engine::engine::Engine;
 use enchudb_engine::transport::{InMemoryTransport, Transport, WireRecord};
@@ -108,10 +109,11 @@ fn run(tag: &str, emit: bool) -> Peers {
     b.tie_to(eb, "files.key", 7);
     let recs_b1 = records_of(&b, 2);
 
-    // 2. A に key 7 の行が 2 つ (主キーの無い record が先の配りで届く)
+    // 2. 主キーの無い record が先の配りで届く: A に B の行の写しが主キー無しでできる (#178 の形)
     apply(&a, &recs_b0);
+    assert_eq!((rows_with_key(&a).len(), a.pull_raw("files.path", 3).len()), (1, 1), "前提: A に B の行の写しが主キー無しでできる");
+    // 主キーが後の配りで届き、 写しの主キーが 7 になる (A の行と畳む)
     apply(&a, &recs_b1);
-    assert_eq!(rows_with_key(&a).len(), 2, "前提: A で同じ主キーの行が 2 つになる (#178 の形)");
     // 3. B が A の行を主キーで自分の行に束ねる
     apply(&b, &recs_a);
     assert_eq!(b.bind_over_local_writes(), 1, "前提: B が自分の書いた行に A の世界番号を束ねる");
@@ -151,12 +153,14 @@ fn alias_folds_the_duplicate_rows_on_every_peer() {
     cleanup(&paths);
 }
 
-/// 知らせを書かない設定 (既定) では 2 行のまま (直す前の形)。 B は今まで通り数えるだけ。
+/// 知らせを書かない設定 (既定) でも、 主キーの Tie が届いた時に 1 行に畳む (前は 2 行のままだった)。 B は今まで通り数えるだけ。
 #[test]
-fn without_alias_the_duplicate_rows_stay() {
+fn without_alias_the_key_folds_the_duplicate_rows() {
     let p = run("off", false);
-    assert_eq!(rows_with_key(&p.a).len(), 2, "対照: 知らせ無しで A の 2 行が畳まれた (試験の形が変わった)");
-    assert_eq!(rows_with_key(&p.c).len(), 2, "対照: 知らせ無しで C の 2 行が畳まれた");
+    let want = vec![(Some(2), Some(3))];
+    assert_eq!(rows_with_key(&p.a), want, "知らせ無しで A の 2 行が畳まれない");
+    assert_eq!(rows_with_key(&p.c), want, "知らせ無しで C の 2 行が畳まれない");
+    assert_eq!(p.a.pull_raw("files.path", 3).len(), 1, "A に B の行の写しが主キー無しで残った");
     assert!(
         !p.recs_b2.iter().any(|r| matches!(r.op, enchudb_oplog::oplog::DecodedOp::Alias { .. })),
         "既定で知らせを書いた"

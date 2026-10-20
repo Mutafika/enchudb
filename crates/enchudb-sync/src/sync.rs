@@ -50,6 +50,10 @@
 //! どの author のものでも消す: 受け手は主キーのある行を消すとその主キーを覚え、 後から届いた同じ主キーの行 (束ねる
 //! 先が生きていても、 もう無くても) にその削除を当てる (#513、 `Engine::bind_remote_eid_by_pk` /
 //! `Engine::reserve_remote_eid_for_pk`)。
+//!
+//! 主キーは書き換えられる (改名)。 届く順で答えを変えないよう、 受け手は前の名前も覚え (`pk_former.rs`)、 今その名前の
+//! 行が無ければ前にその名前だった行に束ねる (前の名前 = 同じ物。 消えた行も、 slot を使い回すまで)。 主キーの Tie を当てて
+//! 同じ主キーの行が 2 つになったら 1 つに畳む (`Engine::fold_rows_with_same_pk`)。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1369,8 +1373,11 @@ impl Syncer {
                 }
             }
         };
-        // 索引は書く時に並べるので、 同じ batch で前に当てた record も引ける
-        let Some(existing) = self.engine.query_by_id64(&[(*himo_id, local_value)]).into_iter().next() else {
+        // 索引は書く時に並べるので、 同じ batch で前に当てた record も引ける。 今その名前の行が無ければ、 前にその名前だった行
+        // (改名した行) に束ねる (PK_IDENTITY_PLAN 11-1: 改名を知らずに古い名前で作った行を、 届く順によらず同じ行にする)
+        let existing = self.engine.query_by_id64(&[(*himo_id, local_value)]).into_iter().next()
+            .or_else(|| self.engine.former_pk_holder(*himo_id, PkValue::Local(local_value)));
+        let Some(existing) = existing else {
             // 同じ PK の row は今は無い → 通常の払い出しに任せる。 #513: ただし、 その主キーの行を前に消していれば、
             // 払い出す slot に削除の版数を載せる (削除より古い書き込みを弾く。 消した行を先に受けて束ねていた peer では、
             // この entity の古い書き込みも削除で消えているので、 同じ答えにする)
@@ -1553,7 +1560,12 @@ impl Syncer {
                 // request17 step 5: LWW / tombstone の判定は engine (`set_cell`) の
                 // 内側だけ。 ここで判定して別関数で適用する形は、 呼び忘れれば黙って
                 // 壊れる (実際 ローカル write 経路がそうなっていた = #154/#160 の根)。
-                ApplyResult::from(self.engine.remote_tie_apply_result(local_eid, *himo_id, value, rec.hlc))
+                let r = ApplyResult::from(self.engine.remote_tie_apply_result(local_eid, *himo_id, value, rec.hlc));
+                // 主キーが変わって (改名)、 同じ主キーの別の行があれば 1 つに畳む (主キーが同じなら同じ行、 PK_IDENTITY_PLAN 11-1)
+                if r == ApplyResult::Applied && self.engine.is_pk_himo(*himo_id) {
+                    self.engine.fold_rows_with_same_pk(local_eid, *himo_id, value);
+                }
+                r
             }
             DecodedOp::TieRef { eid, himo_id, target } => {
                 // #183: Ref 値の target を**世界番号 (u64) 同乗**で運ぶ Tie。author の
