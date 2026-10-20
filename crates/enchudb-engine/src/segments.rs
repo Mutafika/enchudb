@@ -324,6 +324,16 @@ impl SegmentSet {
         }
     }
 
+    /// [`segment`](Self::segment) の、 slot を初めて開く I/O のエラーを返す版 (#534)。 `Ok(None)` = その slot が無い。
+    /// 書き込みの道はこれで開いてみて、 開けなければ書き込みを断る (panic しない)。
+    pub fn try_segment(&self, kind: SegmentKind) -> io::Result<Option<Arc<SegmentMap>>> {
+        match kind {
+            SegmentKind::Himo(h) => self.try_lazy_slot(&self.himo, kind, h),
+            SegmentKind::Ver(h) => self.try_lazy_slot(&self.ver, kind, h),
+            other => Ok(self.segment(other)),
+        }
+    }
+
     /// slot がまだ mmap されていなければここで開く (初回だけ)。
     ///
     /// **開けなかったら panic する。** `region()` が infallible なので (column を触る
@@ -331,32 +341,38 @@ impl SegmentSet {
     /// open 時に存在と長さは確かめているので、 ここに来るのは 「その後に消された」 か
     /// fd 枯渇 (= `SegmentMap::open` の retry でも足りない) のどちらか。
     fn lazy_slot(&self, lock: &RwLock<Vec<Slot>>, kind: SegmentKind, h: u32) -> Option<Arc<SegmentMap>> {
+        // 開けない時は slot の lock を離してから panic する (#534: 持ったまま panic すると lock が毒され、 同じ表を読む
+        // 別の thread (consumer の書き出し) も panic した)
+        self.try_lazy_slot(lock, kind, h).unwrap_or_else(|e| {
+            let p = Self::path_of(&self.dir, kind);
+            panic!("segment {} ({}) could not be opened on first use: {e}", kind.name(), p.display())
+        })
+    }
+
+    /// [`lazy_slot`](Self::lazy_slot) の、 開けない時に `Err` を返す版。 失敗した時は slot を空のまま残す (次にまた開いてみる)。
+    fn try_lazy_slot(&self, lock: &RwLock<Vec<Slot>>, kind: SegmentKind, h: u32) -> io::Result<Option<Arc<SegmentMap>>> {
         let i = h as usize;
         {
             let v = lock.read().unwrap();
-            let slot = v.get(i)?;
+            let Some(slot) = v.get(i) else { return Ok(None) };
             if let Some(m) = &slot.map {
-                return Some(m.clone());
+                return Ok(Some(m.clone()));
             }
         }
         let mut v = lock.write().unwrap();
-        let slot = v.get_mut(i)?;
+        let Some(slot) = v.get_mut(i) else { return Ok(None) };
         // double-check (read lock を落とした隙に別 thread が開いた可能性)
         if let Some(m) = &slot.map {
-            return Some(m.clone());
+            return Ok(Some(m.clone()));
         }
         let p = Self::path_of(&self.dir, kind);
-        let m = Arc::new(
-            SegmentMap::open(&p, slot.reserve, self.readonly).unwrap_or_else(|e| {
-                panic!("segment {} ({}) could not be opened on first use: {e}", kind.name(), p.display())
-            }),
-        );
+        let m = Arc::new(SegmentMap::open(&p, slot.reserve, self.readonly)?);
         let margin = self.space_margin.load(Ordering::Relaxed);
         if margin > 0 {
             m.set_space_margin(margin);
         }
         slot.map = Some(m.clone());
-        Some(m)
+        Ok(Some(m))
     }
 
     pub fn has(&self, kind: SegmentKind) -> bool {
@@ -371,6 +387,15 @@ impl SegmentSet {
             .unwrap_or_else(|| panic!("segment {} is not open in {}", kind.name(), self.dir.display()));
         let len = seg.reserved();
         unsafe { Region::from_segment(seg, len) }
+    }
+
+    /// [`region`](Self::region) の、 slot を初めて開く I/O のエラーを返す版 (#534)。
+    pub fn try_region(&self, kind: SegmentKind) -> io::Result<Region> {
+        let seg = self
+            .try_segment(kind)?
+            .ok_or_else(|| io::Error::other(format!("segment {} is not open in {}", kind.name(), self.dir.display())))?;
+        let len = seg.reserved();
+        Ok(unsafe { Region::from_segment(seg, len) })
     }
 
     fn create_or_open(&self, kind: SegmentKind, size: usize) -> io::Result<Arc<SegmentMap>> {
