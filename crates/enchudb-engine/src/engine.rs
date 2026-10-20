@@ -9028,7 +9028,8 @@ impl Engine {
     /// - 2 つが別の行に当たれば畳む ([`Engine::merge_entity_into`])。 残すのは自分が産んだ行 (どちらも翻訳した行なら
     ///   `same_as` の行)。 どちらも自分が産んだ行なら畳めない (false)
     /// - 片方だけが行に当たれば、 もう片方 (相手の世界番号) をその行の別名にする (以後その世界番号宛ての record がその行に
-    ///   当たる)
+    ///   当たる)。 その世界番号宛ての Delete を作成より先に受けて退避表に載せていたなら、 行にその削除を当てる
+    ///   ([`Engine::bind_remote_eid`] と同じ)
     /// - 同じ行 / どちらも行が無い時は何もしない (どちらも無い時、 後から届いた 2 つの世界番号は別の行になりうる。 主キーの
     ///   ある表なら主キーで束ねる)
     pub fn apply_alias(&self, eid: enchudb_oplog::EntityId, same_as: enchudb_oplog::EntityId) -> bool {
@@ -9044,7 +9045,14 @@ impl Engine {
             if enchudb_oplog::eid_peer(w) == self_peer {
                 return false; // 自分の世界番号は写像を持たない (行が無いなら、 消した後)
             }
-            self.eid_translator.alias(enchudb_oplog::eid_peer(w), enchudb_oplog::eid_local(w), local);
+            let (peer, foreign_local) = (enchudb_oplog::eid_peer(w), enchudb_oplog::eid_local(w));
+            self.eid_translator.alias(peer, foreign_local, local);
+            // #546: 以後この世界番号の record は写像の速い道で解決され、 作成の時に退避表を見る道 (払い出し / 束ね) を通らない。
+            // 先に届いた削除をここで当てる (当てないと、 知らせが作成より先に届いた peer でだけ行が残る)。 主キーの削除の記録も
+            // `apply_delete_local` がする
+            if let Some(tomb) = self.foreign_tombstone_of(peer, foreign_local) {
+                self.apply_delete_local(local, tomb);
+            }
             true
         };
         match (local_of(eid), local_of(same_as)) {
