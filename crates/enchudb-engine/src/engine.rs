@@ -1675,6 +1675,84 @@ mod wal_room_commit_tests {
     }
 }
 
+/// test 用の割り込み点: consumer が 「WAL は空」 と見て起こされるまで寝ると決めた後、 寝る印を立てる前。 書き手がその間に
+/// append する形 (書き手の `wake_if_deep` は印を見ずに素通りする) を作るため (#555)。 使い方は `room_fold_hook` と同じ。
+#[cfg(test)]
+mod consumer_sleep_hook {
+    use enchudb_oplog::oplog::OpLog;
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn FnOnce(&OpLog) + Send>;
+    static HOOK: Mutex<Option<(usize, Hook)>> = Mutex::new(None);
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        *HOOK.lock().unwrap_or_else(|p| p.into_inner()) = Some((wal as *const OpLog as usize, Box::new(f)));
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        let me = wal as *const OpLog as usize;
+        let hit = {
+            let mut h = HOOK.lock().unwrap_or_else(|p| p.into_inner());
+            if h.as_ref().is_some_and(|(at, _)| *at == me) { h.take() } else { None }
+        };
+        if let Some((_, f)) = hit {
+            f(wal);
+        }
+    }
+}
+
+/// consumer の起こし忘れ (#555): 「WAL は空」 と見てから寝る印を立てるまでの間に書かれた record。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod consumer_sleep_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// 割り込み点で consumer を止め、 その間に別の thread が書く (その `wake_if_deep` は consumer がまだ起きているので起こさない)。
+    /// consumer は寝る前に WAL を見直し、 書かれた record を書き出して畳む (前の形は起こされるまで寝て、 次の append / 閉じる時まで
+    /// record を fsync も配信もしなかった)。
+    #[test]
+    fn record_written_while_the_consumer_decides_to_sleep_is_written_out() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-consumersleep-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_standalone(&path).unwrap();
+        eng.define_himo("v", ValueType::Number, 0);
+        let e = eng.entity().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 4 << 20).unwrap();
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let empty = enchudb_oplog::oplog::HEADER_SIZE as u64;
+        let drained = |w: &enchudb_oplog::oplog::OpLog| w.head() == empty && w.checkpoint() == empty;
+
+        let (at_window, consumer_waits) = mpsc::channel::<()>();
+        let (go, resume) = mpsc::channel::<()>();
+        consumer_sleep_hook::set(&wal, move |_| {
+            let _ = at_window.send(());
+            let _ = resume.recv_timeout(Duration::from_secs(10));
+        });
+        // 1 回書いて consumer を回す (寝ていれば起こす): 書き出して畳み、 空の WAL を見て深く寝る所で割り込み点を通る。
+        // consumer が先に割り込み点に来ていれば、 この書き込みも窓の中
+        eng.tie_to(e, "v", 1u32);
+        consumer_waits.recv_timeout(Duration::from_secs(10)).expect("前提: consumer が空の WAL を見て寝る所まで来た");
+        eng.tie_to(e, "v", 2u32);
+        assert!(wal.head() > empty, "前提: 割り込み点の間に WAL に書いた");
+        go.send(()).unwrap();
+
+        let end = Instant::now() + Duration::from_secs(3);
+        while !drained(&wal) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            drained(&wal),
+            "寝る前に書かれた record を consumer が書き出さない (head {} checkpoint {})",
+            wal.head(),
+            wal.checkpoint()
+        );
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// #323 の test 用: create を segment を作った後 (header を書く前) で失敗させる。
@@ -16579,12 +16657,18 @@ impl Engine {
                     // #391: 仕事が無い間は寝て、 WAL に書いた / 閉じる / WAL の空きを待つ書き手が居る時に起こされる
                     // (旧: 1 ms ごとに起きて見回り = 何もしない DB 1 つで 1 秒 500 回)。
                     // 時間で起きるのは、 書き出し (100 ms ごと) や畳みがまだ残っている間だけ
+                    let wal_behind = |wal: &enchudb_oplog::oplog::OpLog| {
+                        wal.head() > wal.checkpoint() || wal.head() > enchudb_oplog::oplog::HEADER_SIZE as u64
+                    };
+                    // 空と見た WAL (寝る印を立てた後にもう一度見る)
+                    let mut idle_wal = None;
                     let timeout = match oplog_for_thread.as_ref() {
                         None => None,
                         Some(wal) => {
-                            let behind = wal.head() > wal.checkpoint()
-                                || wal.head() > enchudb_oplog::oplog::HEADER_SIZE as u64
-                                || engine.wal_room_wanted.load(Ordering::Acquire);
+                            let behind = wal_behind(wal) || engine.wal_room_wanted.load(Ordering::Acquire);
+                            if !behind {
+                                idle_wal = Some(wal);
+                            }
                             if behind {
                                 Some(fsync_interval.saturating_sub(last_fsync.elapsed()).max(Duration::from_millis(1)))
                             } else if engine.sync_tables_enabled() {
@@ -16596,8 +16680,18 @@ impl Engine {
                             }
                         }
                     };
+                    #[cfg(test)]
+                    if timeout.is_none()
+                        && let Some(wal) = idle_wal
+                    {
+                        consumer_sleep_hook::call(wal);
+                    }
                     waker.sleep(timeout, || {
-                        !flag_for_thread.load(Ordering::Acquire) && !engine.wal_room_wanted.load(Ordering::Acquire)
+                        !flag_for_thread.load(Ordering::Acquire)
+                            && !engine.wal_room_wanted.load(Ordering::Acquire)
+                            // #555: 空と見てから印を立てるまでに書かれた record を見落とさない (その書き手の `wake_if_deep` は
+                            // 印を見ずに素通りした)。 書き出しを待つ短い眠り (WAL が空でない時) は見直さない (毎 append で戻ってしまう)
+                            && !idle_wal.is_some_and(|wal| wal_behind(wal))
                     });
                 }
             })
