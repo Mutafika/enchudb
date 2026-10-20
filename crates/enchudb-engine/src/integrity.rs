@@ -23,8 +23,8 @@
 //!   - [max_himos + 3]    : entity set CRC
 //! ```
 
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::File;
+use std::io::{self, Read};
 use std::path::Path;
 
 const CRC_MAGIC: &[u8; 4] = b"ECRC";
@@ -90,24 +90,20 @@ impl CrcTable {
         }
     }
 
-    /// ファイルに書き出す + fsync。
+    /// ファイルに書き出す。 他の sidecar と同じく tmp に書いて書き出してから rename する (#536: 前はその場で truncate
+    /// して書いていて、 書く途中のエラー / 落ちた後に空 / 書きかけの `.crc` が残り、 開けなくなった)。 crashsim の
+    /// 書き出しの記録も `write_atomic_if_changed` の中で付く。
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        enchudb_oplog::io_point("crc.open")?;
-        let mut f = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(path)?;
-        enchudb_oplog::io_point("crc.write")?;
-        f.write_all(CRC_MAGIC)?;
-        f.write_all(&CRC_VERSION.to_le_bytes())?;
-        f.write_all(&self.db_file_size.to_le_bytes())?;
-        f.write_all(&self.max_himos.to_le_bytes())?;
+        let mut buf = Vec::with_capacity(CRC_HEADER_SIZE + self.crc.len() * 4);
+        buf.extend_from_slice(CRC_MAGIC);
+        buf.extend_from_slice(&CRC_VERSION.to_le_bytes());
+        buf.extend_from_slice(&self.db_file_size.to_le_bytes());
+        buf.extend_from_slice(&self.max_himos.to_le_bytes());
         for c in &self.crc {
-            f.write_all(&c.to_le_bytes())?;
+            buf.extend_from_slice(&c.to_le_bytes());
         }
-        enchudb_oplog::io_point("crc.sync")?;
-        f.sync_data()?;
+        crate::db_files::write_atomic_if_changed(path, &buf)?;
         Ok(())
     }
 

@@ -546,9 +546,6 @@ const KNOWN: &[Known] = &[
     // 列の segment を初めて開く時の I/O エラーで panic する
     Known { kind: None, mode: Some("error"), site: "segment.open", needle: "could not be opened on first use", issue: "#534", everywhere: true },
     Known { kind: None, mode: Some("error"), site: "segment.mmap", needle: "could not be opened on first use", issue: "#534", everywhere: true },
-    // .crc をその場で上書きする (書きかけが残る)。 crashsim の hook も無い (電源断の像では一度も書き出していない扱い)
-    Known { kind: Some(Kind::Flush), mode: None, site: "crc.", needle: "failed to fill whole buffer", issue: "#536", everywhere: true },
-    Known { kind: Some(Kind::Flush), mode: Some("lost"), site: "", needle: "bad .crc magic", issue: "#536", everywhere: true },
     // 列の定義が紐名の辞書を伸ばせなくても成功を返し、 開き直すと列が引けない (Linux = page 4 KiB で当たる)
     Known { kind: None, mode: Some("error"), site: "segment.", needle: "書き出しの返った列 t.", issue: "#537", everywhere: false },
 ];
