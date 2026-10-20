@@ -163,6 +163,14 @@ fn set(eng: &Engine, j: &mut Journal, e: u64, h: &str) {
     };
 }
 
+/// 結果を返さない操作 (untie / delete): 断られたかは fault の数で見る (`tie_*` と同じ約束 — 書き込みを断った時は fault を
+/// 数える)。
+fn fault_checked(eng: &Engine, f: impl FnOnce()) -> Result<(), String> {
+    let before = eng.fault_total();
+    f();
+    if eng.fault_total() > before { Err(format!("fault (total {before} → {})", eng.fault_total())) } else { Ok(()) }
+}
+
 fn new_entity(eng: &Engine, j: &mut Journal) -> Option<u64> {
     let seq = j.next_seq();
     let e = eng.entity_in("t");
@@ -217,10 +225,7 @@ fn write_flush(mut eng: Engine, db: &str, j: &mut Journal) {
         }
     }
     if let Some(&e) = es.get(3) {
-        j.op(&format!("unset {e} g"), || -> Result<(), ()> {
-            eng.untie(e, "t.g");
-            Ok(())
-        });
+        j.op(&format!("unset {e} g"), || fault_checked(&eng, || eng.untie(e, "t.g")));
     }
     flush(&mut eng, j);
     // 閉じて開き直す (開く時の I/O: header・manifest・sidecar の読み込み)
@@ -228,10 +233,7 @@ fn write_flush(mut eng: Engine, db: &str, j: &mut Journal) {
     let Some(mut eng) = j.op("reopen", || Engine::open_standalone(db)) else { return };
     // batch 3: delete、 新しい entity (eid を使い回しうる)、 封緘 (flush + .crc)
     if let Some(&e) = es.get(1) {
-        j.op(&format!("del {e}"), || -> Result<(), ()> {
-            eng.delete(e);
-            Ok(())
-        });
+        j.op(&format!("del {e}"), || fault_checked(&eng, || eng.delete(e)));
     }
     if let Some(e) = new_entity(&eng, j) {
         for (h, _) in HIMOS {
@@ -268,10 +270,7 @@ fn write_oplog(eng: std::sync::Arc<Engine>, db: &str, j: &mut Journal) {
         }
     }
     if let Some(&e) = es.get(3) {
-        j.op(&format!("unset {e} g"), || -> Result<(), ()> {
-            eng.untie_async(e, "t.g");
-            Ok(())
-        });
+        j.op(&format!("unset {e} g"), || fault_checked(&eng, || eng.untie_async(e, "t.g")));
     }
     eng.oplog_commit();
     sync(&eng, j);
@@ -279,10 +278,7 @@ fn write_oplog(eng: std::sync::Arc<Engine>, db: &str, j: &mut Journal) {
     drop(eng);
     let Some(eng) = j.op("reopen", || Engine::open_concurrent_with_oplog(db, OPLOG_CAP)) else { return };
     if let Some(&e) = es.get(1) {
-        j.op(&format!("del {e}"), || -> Result<(), ()> {
-            eng.delete_async(e);
-            Ok(())
-        });
+        j.op(&format!("del {e}"), || fault_checked(&eng, || eng.delete_async(e)));
     }
     if let Some(e) = new_entity(&eng, j) {
         for (h, _) in HIMOS {
@@ -543,9 +539,6 @@ struct Known {
 const KNOWN: &[Known] = &[
     // 開く時の sidecar の読み込みの EIO で table の定義を捨てて開き、 次の保存で上書きする
     Known { kind: None, mode: Some("error"), site: "sidecar.read_tables", needle: "table t が無い", issue: "#533", everywhere: true },
-    // 列の segment を初めて開く時の I/O エラーで panic する
-    Known { kind: None, mode: Some("error"), site: "segment.open", needle: "could not be opened on first use", issue: "#534", everywhere: true },
-    Known { kind: None, mode: Some("error"), site: "segment.mmap", needle: "could not be opened on first use", issue: "#534", everywhere: true },
     // 伸ばす mmap の失敗で file だけ伸び、 封緘した .crc が合わない (macOS で当たる)
     Known { kind: Some(Kind::Flush), mode: Some("error"), site: "segment.remap", needle: "region CRC mismatch", issue: "#535", everywhere: false },
     // .crc をその場で上書きする (書きかけが残る)。 crashsim の hook も無い (電源断の像では一度も書き出していない扱い)
