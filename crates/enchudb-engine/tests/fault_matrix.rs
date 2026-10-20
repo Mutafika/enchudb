@@ -546,8 +546,6 @@ const KNOWN: &[Known] = &[
     // 列の segment を初めて開く時の I/O エラーで panic する
     Known { kind: None, mode: Some("error"), site: "segment.open", needle: "could not be opened on first use", issue: "#534", everywhere: true },
     Known { kind: None, mode: Some("error"), site: "segment.mmap", needle: "could not be opened on first use", issue: "#534", everywhere: true },
-    // 伸ばす mmap の失敗で file だけ伸び、 封緘した .crc が合わない (macOS で当たる)
-    Known { kind: Some(Kind::Flush), mode: Some("error"), site: "segment.remap", needle: "region CRC mismatch", issue: "#535", everywhere: false },
     // .crc をその場で上書きする (書きかけが残る)。 crashsim の hook も無い (電源断の像では一度も書き出していない扱い)
     Known { kind: Some(Kind::Flush), mode: None, site: "crc.", needle: "failed to fill whole buffer", issue: "#536", everywhere: true },
     Known { kind: Some(Kind::Flush), mode: Some("lost"), site: "", needle: "bad .crc magic", issue: "#536", everywhere: true },
