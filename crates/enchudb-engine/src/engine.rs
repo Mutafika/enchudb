@@ -7616,7 +7616,9 @@ impl Engine {
                 list.push(local);
                 nonempty.store(true, std::sync::atomic::Ordering::Release);
             }
-            _ => self.delete(eid),
+            // `_sync_ops` の slot を引けない (表が無い / 枠の外) 行は purge しない (#561: 前は `delete` に落とし、 内部の行の lock を
+            // 握ったまま WAL の空きを待つ唯一の道だった。 引けない行は ring の行でないので、 free list にも戻せない)
+            _ => return false,
         }
         true
     }
@@ -17320,8 +17322,11 @@ impl Engine {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(wal) = oplog.as_ref()
             && eng._writer_lock.is_some()
+            && let Err(e) = wal.lock_session()
         {
-            let _ = wal.lock_session();
+            // #561: 書き手の lock を持っているのに WAL を誰かが持っている (この process の前の engine より長く生きた
+            // `Arc<OpLog>` など)。 record ごとの flock で追記するので、 持っている側が閉じるまで書き込みは待つ
+            eprintln!("[enchudb] warning: could not hold the WAL lock for the session ({e}); appends will wait for the other holder");
         }
         eng.oplog = oplog.clone();
         if oplog.is_none() {
