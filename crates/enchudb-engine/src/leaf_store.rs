@@ -981,6 +981,17 @@ impl LeafStore {
         }
     }
 
+    /// 不変量の検査用: 空きの一覧 (offset, size、 word 単位、 offset の順)
+    pub fn holes_snapshot(&self) -> Vec<(u32, u32)> {
+        let holes = self.holes.lock().unwrap_or_else(|p| p.into_inner());
+        holes.by_off.iter().map(|(&o, &s)| (o, s)).collect()
+    }
+
+    /// 不変量の検査用: 最初の slot の word offset と high_water (word)
+    pub fn bounds_words(&self) -> (u32, u32) {
+        (self.b2w(self.data_start_byte()), self.hw_words())
+    }
+
     /// free-list が抱える回収可能 **byte** 数 (test / stats 用)。
     pub fn free_bytes(&self) -> u64 {
         let holes = self.holes.lock().unwrap_or_else(|p| p.into_inner());

@@ -85,6 +85,20 @@ struct ChangeCursor {
     open_tail: Vec<crate::transport::WireRecord>,
 }
 
+/// [`Engine::verify_invariants`] の答え。 `violations` が空なら不変量は全部成り立つ。 `warnings` は 「今の code では
+/// まだ約束していないが、 約束するつもりの形」 (主キーの重複、 #601 が直るまで)
+#[derive(Debug, Default, Clone)]
+pub struct Invariants {
+    pub violations: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl Invariants {
+    pub fn ok(&self) -> bool {
+        self.violations.is_empty()
+    }
+}
+
 /// Engine の実行時状態スナップショット。
 #[derive(Debug, Clone)]
 pub struct EngineStats {
@@ -11279,6 +11293,124 @@ impl Engine {
     /// writer open 時の自動 sweep 入口 (`open_internal` から)。
     fn finish_interrupted_deletes(&self) -> usize {
         self.scan_interrupted_deletes(/*repair=*/ true)
+    }
+
+    /// 不変量の検査 (診断用、 O(DB の大きさ)。 総当たりの試験・電源断の像の検証・サポートの調査で呼ぶ。 書き手と並走しない
+    /// 所で呼ぶこと = 開いた直後か、 書き手を止めてから)。 見るもの:
+    ///
+    /// - Leaf: 置いてある cell の slot が全部読める (解放の印・切れた header が無い)、 空きの一覧が範囲の中で offset の順に
+    ///   重ならない、 空きの中に live の slot が無い (使い回すと別の値を読む)
+    /// - 途中で切れた delete が無い (tombstone が立っているのに古い cell が生きている entity)
+    /// - Tag の cell (と engine 内部の表の Leaf 列 = 辞書の番号) の語が辞書にある
+    /// - EntitySet: 生きている数と bitmap が合う、 生きている local は next_eid より前
+    /// - 警告: 表ごとに名前 (主キー) の値が生きている行で重複しない (#601 が直るまでは成り立たないので警告)
+    ///
+    /// sync の表の不変量 (配る分の payload と行、 pktombs / pkformer と行) は別の session が足す
+    pub fn verify_invariants(&self) -> Invariants {
+        let mut out = Invariants::default();
+        let names = self.himo_names();
+        let name_of = |hid: usize| names.get(hid).cloned().unwrap_or_else(|| format!("himo {hid}"));
+        // Leaf
+        if let Some(leaf) = self.leaf.as_ref() {
+            let (start, hw) = leaf.bounds_words();
+            let mut live: Vec<u32> = Vec::new();
+            for hid in 0..self.himos.len() {
+                if self.leaf_for(hid).is_none() {
+                    continue;
+                }
+                if let Err(e) = self.himos[hid].ensure_loaded() {
+                    out.violations.push(format!("Leaf の列 {} を開けない: {e}", name_of(hid)));
+                    continue;
+                }
+                let mut bad = 0usize;
+                let mut first = None;
+                self.himos[hid].for_each_set_cell(|local, off| {
+                    let off = off as u32;
+                    live.push(off);
+                    if off < start || off >= hw || !matches!(leaf.try_read(off), LeafRead::Ok(_)) {
+                        bad += 1;
+                        first.get_or_insert((local, off));
+                    }
+                });
+                if let Some((local, off)) = first {
+                    out.violations.push(format!(
+                        "Leaf の列 {} の cell {bad} 個が読めない slot を指す (最初: entity {local} → slot {off}、 範囲 {start}..{hw})",
+                        name_of(hid)
+                    ));
+                }
+            }
+            live.sort_unstable();
+            let mut cur = start;
+            for (off, size) in leaf.holes_snapshot() {
+                if size == 0 || off < cur || off as u64 + size as u64 > hw as u64 {
+                    out.violations.push(format!("Leaf の空き ({off}, {size}) が範囲 {start}..{hw} の外か前の空きと重なる (前の端 {cur})"));
+                }
+                cur = off.saturating_add(size);
+                let i = live.partition_point(|&o| o < off);
+                if let Some(&o) = live.get(i).filter(|&&o| (o as u64) < off as u64 + size as u64) {
+                    out.violations.push(format!("Leaf の空き ({off}, {size}) の中に live の slot {o} がある (使い回すと別の値を読む)"));
+                }
+            }
+        }
+        // 途中で切れた delete
+        let n = self.interrupted_delete_count();
+        if n > 0 {
+            out.violations.push(format!("途中で切れた delete が {n} 件 (tombstone が立っているのに古い cell が生きている)"));
+        }
+        // Tag の語 (と engine 内部の表の Leaf 列 = 辞書の番号)
+        for hid in 0..self.himos.len() {
+            let vt = self.value_types.get(hid).copied();
+            let uses_vocab = vt == Some(ValueType::Tag) || (vt == Some(ValueType::Leaf) && self.leaf_for(hid).is_none());
+            if !uses_vocab || self.himos[hid].ensure_loaded().is_err() {
+                continue;
+            }
+            let mut bad = 0usize;
+            let mut first = None;
+            self.himos[hid].for_each_set_cell(|local, vid| {
+                if self.vocab.get_checked(vid as u32).is_none() {
+                    bad += 1;
+                    first.get_or_insert((local, vid));
+                }
+            });
+            if let Some((local, vid)) = first {
+                out.violations.push(format!("列 {} の cell {bad} 個が辞書に無い語を指す (最初: entity {local} → 語 {vid})", name_of(hid)));
+            }
+        }
+        // EntitySet
+        let live = self.entities.iter();
+        let counted = self.entities.count() as usize;
+        if live.len() != counted {
+            out.violations.push(format!("EntitySet の数 {counted} と bitmap の生きている数 {} が合わない", live.len()));
+        }
+        if let Some(&max) = live.last().filter(|&&m| m >= self.entities.next_eid()) {
+            out.violations.push(format!("生きている local {max} が next_eid {} 以上", self.entities.next_eid()));
+        }
+        // 警告: 表ごとの名前 (主キー) の重複
+        for t in &self.tables {
+            let Some(pk) = t.pk_himo else { continue };
+            let Some(hs) = self.himos.get(pk as usize) else { continue };
+            if hs.ensure_loaded().is_err() {
+                continue;
+            }
+            let mut seen: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+            for local in t.eid_range_lo..t.eid_range_hi.min(self.entities.next_eid()) {
+                if !self.entities.is_live(local) {
+                    continue;
+                }
+                if let Some(v) = hs.get_value(local) {
+                    *seen.entry(v).or_insert(0) += 1;
+                }
+            }
+            let dups: Vec<(u64, u32)> = seen.into_iter().filter(|&(_, n)| n > 1).collect();
+            if let Some(&(v, n)) = dups.iter().max_by_key(|&&(_, n)| n) {
+                out.warnings.push(format!(
+                    "表 {} の名前 (主キー) が重複: {} 種類 (最多: 値 {v} が生きた行 {n} 個、 #601)",
+                    t.name,
+                    dups.len()
+                ));
+            }
+        }
+        out
     }
 
     /// crash が delete を途中で切った跡を open 時に掃除する。 戻り値は直した entity 数。
