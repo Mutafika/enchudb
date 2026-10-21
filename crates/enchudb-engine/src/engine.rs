@@ -1521,6 +1521,23 @@ mod wal_hook {
     }
 }
 
+/// test 用の割り込み点: ローカルの cell の書き込み (`try_tie_to_by_id`) が WAL に積んだ後、 cell に当てる前 (#563)。 同じ cell の
+/// 別の書き手をその間に走らせ、 WAL の順と当てる順がずれない (行を握ったまま積んで当てる、 #505) ことを決まって確かめるため。
+#[cfg(test)]
+mod cell_append_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
 /// test 用の割り込み点: `make_wal_room_inner` が 「満杯でない」 を見た後、 開いている group を閉じる Commit を打つ前。
 /// 書き手の thread の Commit が、 その間に WAL の残りを埋める窓を踏むため。 置いた WAL (番地で見分ける) で 1 回だけ呼ぶ
 /// (並んで走る他の test の engine では呼ばない)。 consumer の thread から呼ばれるので thread local ではない。
@@ -1782,6 +1799,79 @@ mod wal_room_commit_tests {
         assert_eq!(eng.wal_dropped_records(), 0, "bridge の lock が取れなかった試しで、 待っている書き手が諦めた");
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
+    }
+}
+
+/// #563 / #505: 同じ cell の 2 本の書き手で、 WAL に積む順と cell に当てる順がずれない。 1 本目が積んだ後・当てる前 (割り込み点) に
+/// 2 本目を走らせる。 行を握ったまま積んで当てる今の形なら 2 本目は 1 本目が当て終えるまで待つ。 前の形 (積んでから握る) だと 2 本目が
+/// 先に当て、 版数の無い DB では cell が WAL の最後の record と違う値で残り、 版数のある DB では 1 本目が `OlderThanCell` で弾かれた
+/// (`same_cell_wal_order.rs` は確率的で、 直す前に 1 round 約 5 %)。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod cell_wal_order_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn run(tag: &str, cell_version: bool) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-cellwal-{tag}-{}-{nanos}.db", std::process::id());
+        let mut eng = if cell_version {
+            Engine::create_with_cell_version(&path, 1024).unwrap()
+        } else {
+            Engine::create_without_cell_version(&path, 1024).unwrap()
+        };
+        eng.define_table("t", 100).unwrap();
+        let v = eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap() as u16;
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        let e = eng.entity_in("t").unwrap();
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let second: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<Result<(), TieRejected>>>>> = Arc::default();
+        let (eng2, second2) = (eng.clone(), second.clone());
+        cell_append_hook::set(&wal, move |_| {
+            let done = Arc::new(AtomicBool::new(false));
+            let done2 = done.clone();
+            let h = std::thread::spawn(move || {
+                let r = eng2.try_tie_to_by_id(e, v, 2u32);
+                done2.store(true, Ordering::Release);
+                r
+            });
+            // 今の形では 2 本目は行で待つので終わらない。 前の形では積んで当てて終わる
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+            while !done.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            *second2.lock().unwrap() = Some(h);
+        });
+        let first = eng.try_tie_to_by_id(e, v, 1u32);
+        let h = second.lock().unwrap().take().expect("前提: 割り込み点を通った");
+        let second = h.join().unwrap();
+        let cell = eng.get_by_id(e, v);
+        let last = wal
+            .records_with_tail()
+            .into_iter()
+            .filter_map(|r| match r.op {
+                enchudb_oplog::oplog::DecodedOp::Tie { himo_id, value, .. } if himo_id == v => Some(value),
+                _ => None,
+            })
+            .last();
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+        assert_eq!(first, Ok(()), "{tag}: 1 本目が弾かれた (2 本目が後に積んで先に当てた)");
+        assert_eq!(second, Ok(()), "{tag}: 2 本目が弾かれた");
+        assert_eq!(cell, last, "{tag}: cell が WAL の最後の record と違う (積む順と当てる順がずれた)");
+    }
+
+    #[test]
+    fn same_cell_writers_apply_in_wal_order_without_cell_versions() {
+        run("nover", false);
+    }
+
+    #[test]
+    fn same_cell_writers_apply_in_wal_order_with_cell_versions() {
+        run("ver", true);
     }
 }
 
@@ -6201,7 +6291,7 @@ impl Engine {
 
         // #77-H6: 既存 DB の再 enable (reopen 経路) では、 body に残る過去 rows /
         // watermark から lsn 採番を復元する。
-        self.rehydrate_next_sync_lsn();
+        self.rehydrate_next_sync_lsn().map_err(|e| e.to_string())?;
 
         // request18: ここが 「この DB は sync に参加する」 と確定する唯一の点。
         // v9 領域 (per-cell version column + tombstone column) はこれ以降に意味を
@@ -6226,25 +6316,24 @@ impl Engine {
     /// 呼ばないと lsn 採番が 1 に戻り、 peer の ack 済み watermark より小さい lsn
     /// が発行されて `pending_sync_ops(since)` が永久に空 = **再起動後の全 write が
     /// 既存 peer に配信されない** silent loss になっていた。
-    fn rehydrate_next_sync_lsn(&self) {
+    ///
+    /// 開く時間: 列を 1 回なめて最大を取る (前は値のある entity の一覧 (Vec、 配る分 100 万行で 4 MB) を作ってから 1 つずつ
+    /// 引いていた)。 呼ぶのは consumer を起こす前 / `&mut self` の中 = 書き手と並走しない (`for_each_set_value` の前提)。
+    /// 列を開けなければ Err (開くのを失敗させる): 黙って低い lsn で進むと #77-H6 の silent loss をそのまま作る。 前は列を初めて
+    /// 読む所で panic していた
+    fn rehydrate_next_sync_lsn(&self) -> io::Result<()> {
         use std::sync::atomic::Ordering;
-        if !self.sync_tables_enabled() { return; }
+        if !self.sync_tables_enabled() { return Ok(()); }
         let mut max_lsn = 0u32;
-        if let Some(lsn_hid) = self.himo_id("_sync_ops.lsn") {
-            let hid = lsn_hid as u16;
-            for eid in self.entities_with_himo(hid) {
-                if let Some(l) = self.get_by_id32(eid, hid) {
-                    if l > max_lsn { max_lsn = l; }
-                }
-            }
-        }
-        if let Some(cons_hid) = self.himo_id("_sync_peers.consumed_lsn") {
-            let hid = cons_hid as u16;
-            for eid in self.entities_with_himo(hid) {
-                if let Some(l) = self.get_by_id32(eid, hid) {
-                    if l > max_lsn { max_lsn = l; }
-                }
-            }
+        for name in ["_sync_ops.lsn", "_sync_peers.consumed_lsn"] {
+            let Some(hid) = self.himo_id(name) else { continue };
+            let Some(hs) = self.himos.get(hid) else { continue };
+            hs.ensure_loaded()
+                .map_err(|e| io::Error::new(e.kind(), format!("{name} の列を開けない ({e}) — next_sync_lsn を復元できない")))?;
+            hs.for_each_set_value(|v| {
+                let v = v as u32;
+                if v > max_lsn { max_lsn = v; }
+            });
         }
         if max_lsn > 0 {
             // 既に進んでいる場合は後退させない (enable → open の二重呼び等)
@@ -6253,6 +6342,7 @@ impl Engine {
                 self.next_sync_lsn.store(max_lsn + 1, Ordering::Release);
             }
         }
+        Ok(())
     }
 
     /// 0.7.0 (Phase 3): sync tables が有効化済みか。 schema crate / Syncer が
@@ -11551,15 +11641,22 @@ impl Engine {
         if tomb_count == 0 {
             return 0;
         }
+        // tombstone の列を線形に読み、 版数のある cell (削除された entity) だけ見る。 前は生きている entity の一覧
+        // (Vec) を作って 1 つずつ tombstone の列を引いていた (100 万 entity で 23 ms、 開くたび)。 削除は少ないのが常態
+        // なので、 0 の cell を 2 語の or で飛ばす方が、 生きている entity の数によらず列の大きさ (16 B × count) だけで済む
+        let raw = self.tomb_col.as_ref().map(|c| c.cells_raw(tomb_count)).unwrap_or(&[]);
         let mut repaired = 0usize;
-        for local in self.entities.iter() {
-            if local >= tomb_count {
-                continue;
-            }
-            let tomb = self.tombstone_hlc_local(local);
-            if tomb == enchudb_oplog::Hlc::ZERO {
+        for (local, cell) in raw.chunks_exact(HLC_CELL_BYTES as usize).enumerate() {
+            let lo = u64::from_le_bytes(cell[0..8].try_into().unwrap());
+            let hi = u64::from_le_bytes(cell[8..16].try_into().unwrap());
+            if lo | hi == 0 {
                 continue; // 削除されていない = 常態
             }
+            let local = local as u32;
+            if !self.entities.is_live(local) {
+                continue;
+            }
+            let tomb = hlc_from_cell(cell);
             // 削除より後に書かれた cell だけが 「削除後に作り直された行」。
             // それ以外 (古い / 版数不明) が 1 つでも生きていれば、 削除が
             // 途中で切れた跡なので本体除去をやり直す。 判断は
@@ -13292,6 +13389,10 @@ impl Engine {
             let oplog_eid = self.oplog_eid(eid);
             self.append_local_op(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value })
         };
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            cell_append_hook::call(wal);
+        }
         let written = self.set_cell_in(row.as_ref(), eid, himo_id, value, hlc);
         drop(row);
         if pinned {
@@ -16583,7 +16684,7 @@ impl Engine {
         let eng = Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)?;
         let oplog_path = oplog_path_for(path);
         let wal = std::sync::Arc::new(enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?);
-        eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
+        eng.rehydrate_next_sync_lsn()?; // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
     }
 
@@ -16654,7 +16755,7 @@ impl Engine {
             }
             std::sync::Arc::new(w)
         };
-        eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
+        eng.rehydrate_next_sync_lsn()?; // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
     }
 
@@ -16691,12 +16792,36 @@ impl Engine {
     ///
     /// 対象外: 中継した他人の cell (版数の peer が自分でない — author の署名を作れない)、 配らない table (reserved)、
     /// content。 作った record の署名は開いた時点の鍵 (まだ無いので署名なし — #140 の state 転写と同じ)。
+    /// #557: cell と tombstone の版数の最大 (版数の列を全部なめる。 汚れた終了の後に開く時だけ)。
+    fn max_cell_version(&self) -> enchudb_oplog::Hlc {
+        let mut top = enchudb_oplog::Hlc::ZERO;
+        for hid in 0..self.himos.len() {
+            let Some(n) = self.ver_col(hid as u16).map(|c| c.count()) else { continue };
+            for local in 0..n {
+                top = top.max(self.cell_hlc_local(local, hid as u16));
+            }
+        }
+        if let Some(n) = self.tomb_col.as_ref().map(|c| c.count()) {
+            for local in 0..n {
+                top = top.max(self.tombstone_hlc_local(local));
+            }
+        }
+        top
+    }
+
     fn relog_unlogged_writes(&self, wal: &enchudb_oplog::oplog::OpLog) -> bool {
         use enchudb_oplog::Hlc;
         use enchudb_oplog::oplog::Op;
         // きれいに閉じたかは紐名の辞書の clean flag で見る (辞書 (vocab) の flag は、 一度も語を入れていない DB では
         // 読めない — 空の辞書は header を書いていないので 「まっさら」 と読む)。 sync する DB は紐を必ず持つ
-        if !self.himo_reg.rebuilt_on_load || !self.has_cell_version() || !self.sync_tables_enabled() {
+        if !self.himo_reg.rebuilt_on_load || !self.has_cell_version() {
+            return false;
+        }
+        if !self.sync_tables_enabled() {
+            // #557: 配らない DB は作り直さないが、 HLC の種は cell の版数から取る。 開く時の種は WAL に残った record だけなので、
+            // 畳んだ直後 (WAL が空) の汚れた終了で時計が戻っていると、 ローカルの書き込みが前に書いた cell より古い版数を採って
+            // 弾かれた (record は WAL に載った後)。 配る DB は、 畳んだ後も配る分の record と下の作り直しが種になる
+            wal.observe_hlc(self.max_cell_version());
             return false;
         }
         let me = self.peer_id();
@@ -17141,7 +17266,7 @@ impl Engine {
             }
             std::sync::Arc::new(w)
         };
-        eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
+        eng.rehydrate_next_sync_lsn()?; // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
     }
 
