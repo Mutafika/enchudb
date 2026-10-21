@@ -1716,6 +1716,84 @@ mod wal_room_commit_tests {
     }
 }
 
+/// test 用の割り込み点: consumer が 「WAL は空」 と見て起こされるまで寝ると決めた後、 寝る印を立てる前。 書き手がその間に
+/// append する形 (書き手の `wake_if_deep` は印を見ずに素通りする) を作るため (#555)。 使い方は `room_fold_hook` と同じ。
+#[cfg(test)]
+mod consumer_sleep_hook {
+    use enchudb_oplog::oplog::OpLog;
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn FnOnce(&OpLog) + Send>;
+    static HOOK: Mutex<Option<(usize, Hook)>> = Mutex::new(None);
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        *HOOK.lock().unwrap_or_else(|p| p.into_inner()) = Some((wal as *const OpLog as usize, Box::new(f)));
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        let me = wal as *const OpLog as usize;
+        let hit = {
+            let mut h = HOOK.lock().unwrap_or_else(|p| p.into_inner());
+            if h.as_ref().is_some_and(|(at, _)| *at == me) { h.take() } else { None }
+        };
+        if let Some((_, f)) = hit {
+            f(wal);
+        }
+    }
+}
+
+/// consumer の起こし忘れ (#555): 「WAL は空」 と見てから寝る印を立てるまでの間に書かれた record。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod consumer_sleep_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// 割り込み点で consumer を止め、 その間に別の thread が書く (その `wake_if_deep` は consumer がまだ起きているので起こさない)。
+    /// consumer は寝る前に WAL を見直し、 書かれた record を書き出して畳む (前の形は起こされるまで寝て、 次の append / 閉じる時まで
+    /// record を fsync も配信もしなかった)。
+    #[test]
+    fn record_written_while_the_consumer_decides_to_sleep_is_written_out() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-consumersleep-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_standalone(&path).unwrap();
+        eng.define_himo("v", ValueType::Number, 0);
+        let e = eng.entity().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 4 << 20).unwrap();
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let empty = enchudb_oplog::oplog::HEADER_SIZE as u64;
+        let drained = |w: &enchudb_oplog::oplog::OpLog| w.head() == empty && w.checkpoint() == empty;
+
+        let (at_window, consumer_waits) = mpsc::channel::<()>();
+        let (go, resume) = mpsc::channel::<()>();
+        consumer_sleep_hook::set(&wal, move |_| {
+            let _ = at_window.send(());
+            let _ = resume.recv_timeout(Duration::from_secs(10));
+        });
+        // 1 回書いて consumer を回す (寝ていれば起こす): 書き出して畳み、 空の WAL を見て深く寝る所で割り込み点を通る。
+        // consumer が先に割り込み点に来ていれば、 この書き込みも窓の中
+        eng.tie_to(e, "v", 1u32);
+        consumer_waits.recv_timeout(Duration::from_secs(10)).expect("前提: consumer が空の WAL を見て寝る所まで来た");
+        eng.tie_to(e, "v", 2u32);
+        assert!(wal.head() > empty, "前提: 割り込み点の間に WAL に書いた");
+        go.send(()).unwrap();
+
+        let end = Instant::now() + Duration::from_secs(3);
+        while !drained(&wal) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            drained(&wal),
+            "寝る前に書かれた record を consumer が書き出さない (head {} checkpoint {})",
+            wal.head(),
+            wal.checkpoint()
+        );
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// #323 の test 用: create を segment を作った後 (header を書く前) で失敗させる。
@@ -4036,8 +4114,8 @@ pub struct Engine {
     wal_room_folds: std::sync::atomic::AtomicU64,
     /// #391: consumer の loop が回った回数 (起きた回数、 観測用)。
     consumer_wakeups: std::sync::atomic::AtomicU64,
-    /// #388: consumer が書き出し + 畳みを試し終えた回数 (待ち手は、 待ち始めた後の 1 回で空かなければ諦める)。
-    wal_room_attempts: std::sync::atomic::AtomicU64,
+    /// #388: consumer が書き出し + 畳みを試して、 畳めない状態だった回数 (待ち手は、 待ち始めた後にこれが 1 回あれば諦める)。
+    wal_room_blocked: std::sync::atomic::AtomicU64,
     /// #388: `make_wal_room` の最中 (中の Commit marker が満杯で待ち手に入った時に、 もう一度入らない)。
     wal_room_busy: std::sync::atomic::AtomicBool,
     /// #388: 最後に畳めなかった時刻。 畳めない間 (sync の bridge が遅れている等) に毎回 fsync しないよう 10 ms 空ける。
@@ -4582,7 +4660,7 @@ impl Engine {
             wal_room_wanted: std::sync::atomic::AtomicBool::new(false),
             consumer_thread: std::sync::OnceLock::new(),
             wal_room_folds: std::sync::atomic::AtomicU64::new(0),
-            wal_room_attempts: std::sync::atomic::AtomicU64::new(0),
+            wal_room_blocked: std::sync::atomic::AtomicU64::new(0),
             consumer_wakeups: std::sync::atomic::AtomicU64::new(0),
             wal_room_busy: std::sync::atomic::AtomicBool::new(false),
             wal_room_failed_at: std::sync::Mutex::new(None),
@@ -5816,7 +5894,7 @@ impl Engine {
             wal_room_wanted: std::sync::atomic::AtomicBool::new(false),
             consumer_thread: std::sync::OnceLock::new(),
             wal_room_folds: std::sync::atomic::AtomicU64::new(0),
-            wal_room_attempts: std::sync::atomic::AtomicU64::new(0),
+            wal_room_blocked: std::sync::atomic::AtomicU64::new(0),
             consumer_wakeups: std::sync::atomic::AtomicU64::new(0),
             wal_room_busy: std::sync::atomic::AtomicBool::new(false),
             wal_room_failed_at: std::sync::Mutex::new(None),
@@ -9139,7 +9217,8 @@ impl Engine {
     /// - 2 つが別の行に当たれば畳む ([`Engine::merge_entity_into`])。 残すのは自分が産んだ行 (どちらも翻訳した行なら
     ///   `same_as` の行)。 どちらも自分が産んだ行なら畳めない (false)
     /// - 片方だけが行に当たれば、 もう片方 (相手の世界番号) をその行の別名にする (以後その世界番号宛ての record がその行に
-    ///   当たる)
+    ///   当たる)。 その世界番号宛ての Delete を作成より先に受けて退避表に載せていたなら、 行にその削除を当てる
+    ///   ([`Engine::bind_remote_eid`] と同じ)
     /// - 同じ行 / どちらも行が無い時は何もしない (どちらも無い時、 後から届いた 2 つの世界番号は別の行になりうる。 主キーの
     ///   ある表なら主キーで束ねる)
     pub fn apply_alias(&self, eid: enchudb_oplog::EntityId, same_as: enchudb_oplog::EntityId) -> bool {
@@ -9155,7 +9234,14 @@ impl Engine {
             if enchudb_oplog::eid_peer(w) == self_peer {
                 return false; // 自分の世界番号は写像を持たない (行が無いなら、 消した後)
             }
-            self.eid_translator.alias(enchudb_oplog::eid_peer(w), enchudb_oplog::eid_local(w), local);
+            let (peer, foreign_local) = (enchudb_oplog::eid_peer(w), enchudb_oplog::eid_local(w));
+            self.eid_translator.alias(peer, foreign_local, local);
+            // #546: 以後この世界番号の record は写像の速い道で解決され、 作成の時に退避表を見る道 (払い出し / 束ね) を通らない。
+            // 先に届いた削除をここで当てる (当てないと、 知らせが作成より先に届いた peer でだけ行が残る)。 主キーの削除の記録も
+            // `apply_delete_local` がする
+            if let Some(tomb) = self.foreign_tombstone_of(peer, foreign_local) {
+                self.apply_delete_local(local, tomb);
+            }
             true
         };
         match (local_of(eid), local_of(same_as)) {
@@ -16806,12 +16892,18 @@ impl Engine {
                     // #391: 仕事が無い間は寝て、 WAL に書いた / 閉じる / WAL の空きを待つ書き手が居る時に起こされる
                     // (旧: 1 ms ごとに起きて見回り = 何もしない DB 1 つで 1 秒 500 回)。
                     // 時間で起きるのは、 書き出し (100 ms ごと) や畳みがまだ残っている間だけ
+                    let wal_behind = |wal: &enchudb_oplog::oplog::OpLog| {
+                        wal.head() > wal.checkpoint() || wal.head() > enchudb_oplog::oplog::HEADER_SIZE as u64
+                    };
+                    // 空と見た WAL (寝る印を立てた後にもう一度見る)
+                    let mut idle_wal = None;
                     let timeout = match oplog_for_thread.as_ref() {
                         None => None,
                         Some(wal) => {
-                            let behind = wal.head() > wal.checkpoint()
-                                || wal.head() > enchudb_oplog::oplog::HEADER_SIZE as u64
-                                || engine.wal_room_wanted.load(Ordering::Acquire);
+                            let behind = wal_behind(wal) || engine.wal_room_wanted.load(Ordering::Acquire);
+                            if !behind {
+                                idle_wal = Some(wal);
+                            }
                             if behind {
                                 Some(fsync_interval.saturating_sub(last_fsync.elapsed()).max(Duration::from_millis(1)))
                             } else if engine.sync_tables_enabled() {
@@ -16823,8 +16915,18 @@ impl Engine {
                             }
                         }
                     };
+                    #[cfg(test)]
+                    if timeout.is_none()
+                        && let Some(wal) = idle_wal
+                    {
+                        consumer_sleep_hook::call(wal);
+                    }
                     waker.sleep(timeout, || {
-                        !flag_for_thread.load(Ordering::Acquire) && !engine.wal_room_wanted.load(Ordering::Acquire)
+                        !flag_for_thread.load(Ordering::Acquire)
+                            && !engine.wal_room_wanted.load(Ordering::Acquire)
+                            // #555: 空と見てから印を立てるまでに書かれた record を見落とさない (その書き手の `wake_if_deep` は
+                            // 印を見ずに素通りした)。 書き出しを待つ短い眠り (WAL が空でない時) は見直さない (毎 append で戻ってしまう)
+                            && !idle_wal.is_some_and(|wal| wal_behind(wal))
                     });
                 }
             })
@@ -16875,8 +16977,9 @@ impl Engine {
     /// sync の bridge / changefeed の listener が居る DB は、 書き出した後に配り終えてから畳む (配る前に畳むと record が
     /// 消える)。 配る間に次の record が入れば畳めない — その時は今までどおり満杯で落ちうる (#57 の floor で bootstrap)。
     ///
-    /// 試しの数 (`wal_room_attempts`、 待つ書き手が 「頼んだ後に 1 回試して空かなかった」 を見る) は、 畳んだ時と畳めない状態
-    /// だった時だけ数える (#512: 試している間に書き手が積み続けて畳めなかった試しで、 待つ書き手に諦めさせない)。
+    /// 畳めない状態だった試しを数える (`wal_room_blocked`、 待つ書き手が 「頼んだ後に試して畳めなかった」 を見る)。 畳んだ試しは
+    /// 数えない (#552: 畳んだ空きを他の書き手が先に埋めても、 次の畳みを待てばよい。 前は数え、 2 回畳む間に空きを取れなかった
+    /// 書き手を残り時間があるのに諦めさせた)。 試している間に書き手が積み続けて畳めなかった試しも数えない (#512)。
     fn make_wal_room(&self, wal: &std::sync::Arc<enchudb_oplog::oplog::OpLog>) -> WalRoom {
         use std::sync::atomic::Ordering;
         if self.wal_room_busy.swap(true, Ordering::AcqRel) {
@@ -16884,8 +16987,8 @@ impl Engine {
         }
         let room = self.make_wal_room_inner(wal);
         self.wal_room_busy.store(false, Ordering::Release);
-        if room != WalRoom::Transient {
-            self.wal_room_attempts.fetch_add(1, Ordering::AcqRel);
+        if room == WalRoom::Blocked {
+            self.wal_room_blocked.fetch_add(1, Ordering::AcqRel);
         }
         if room == WalRoom::Folded {
             self.wal_room_folds.fetch_add(1, Ordering::Relaxed);
@@ -16990,13 +17093,13 @@ impl Engine {
         if closed || appended_after { WalRoom::Transient } else { WalRoom::Blocked }
     }
 
-    /// #388: WAL が満杯で載らなかった書き手の待ち手 (`OpLog::set_room_waiter`)。 空いたら true (書き手は書き直す)、
-    /// 空かなければ false (今までどおり落ちる)。
+    /// #388: WAL が満杯で載らなかった書き手の待ち手 (`OpLog::set_room_waiter`)。 空いたら true (書き手は書き直し、 その間に
+    /// 他の書き手が空きを埋めていればまた待つ)、 空かなければ false (今までどおり落ちる)。
     ///
     /// - consumer 自身 (tick の Commit など): その場で畳む
-    /// - 他の thread: consumer に畳むよう頼み、 `size` byte 空くまで待つ。 待ち始めた後に consumer が 1 回試して空かな
-    ///   ければ (sync の bridge が配り終えていない等で畳めない。 試している間に書き手が積み続けて畳めなかった試しは数えない、
-    ///   #512) すぐ諦める。 上限 `WAL_ROOM_WAIT`、 閉じている最中は待たない
+    /// - 他の thread: consumer に畳むよう頼み、 `size` byte 空くまで待つ。 待ち始めた後に consumer が試して畳めない状態
+    ///   だったら (sync の bridge が配り終えていない等。 畳んだ空きを他の書き手が先に埋めた試し (#552) と、 試している間に
+    ///   書き手が積み続けて畳めなかった試し (#512) は数えない) すぐ諦める。 上限 `WAL_ROOM_WAIT`、 閉じている最中は待たない
     #[cfg(not(target_arch = "wasm32"))]
     fn wait_for_wal_room(&self, size: u64) -> bool {
         use std::sync::atomic::Ordering;
@@ -17005,9 +17108,9 @@ impl Engine {
             self.make_wal_room_paced(wal);
             return wal.free_bytes() >= size;
         }
-        let first_attempt = self.wal_room_attempts.load(Ordering::Acquire) + 1;
+        let first_blocked = self.wal_room_blocked.load(Ordering::Acquire) + 1;
         // 頼んだ時に試している最中の 1 回は頼みを見ていないかもしれないので、 その次の 1 回まで待つ
-        let tried = || self.wal_room_attempts.load(Ordering::Acquire) > first_attempt;
+        let blocked = || self.wal_room_blocked.load(Ordering::Acquire) > first_blocked;
         let stopping = || {
             self.shutdown_flag.as_ref().is_some_and(|f| f.load(Ordering::Acquire))
                 || self.consumer_poisoned.load(Ordering::Acquire)
@@ -17018,7 +17121,7 @@ impl Engine {
                 return true;
             }
             // 今は畳めないと分かっている (直前に consumer が試して空かなかった) なら待たない
-            if stopping() || tried() || self.wal_room_failed_recently() {
+            if stopping() || blocked() || self.wal_room_failed_recently() {
                 return wal.free_bytes() >= size;
             }
             self.wal_room_wanted.store(true, Ordering::Release);
