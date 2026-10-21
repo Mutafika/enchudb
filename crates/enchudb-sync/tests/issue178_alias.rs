@@ -3,11 +3,13 @@
 //! 形 (実地の #178 と同じく、 束ねる前に出て行った書き込みが相手で別の行になる):
 //!
 //! 1. A と B が同じ主キー (key = 7) の行を別々に作る。 B は主キー以外の列 (module / path) を先に commit し、 主キーは後の commit
-//! 2. A が B の record を受ける: 主キーの無い最初の record で B の行の写しを払い出し、 後から来た主キーはその写しに当たる
-//!    (写像が既にあるので主キーでは束ねない) = A に key 7 の行が 2 つ
+//! 2. A が B の record を 2 回の配りで受ける: 先の配りの主キーの無い record で B の行の写しを払い出し、 後の配りの主キーは
+//!    その写しに当たる (写像が既にあるので主キーでは束ねない) = A に key 7 の行が 2 つ。 同じ配りなら、 主キーが後ろでも
+//!    最初の record の前に束ねる (#544) ので 2 つにならない
 //! 3. B が A の record を受ける: A の行を主キーで B の行に束ねる (`bind_over_local_writes`)。 知らせを書く設定なら
 //!    「B の行の B の世界番号 = A の行の世界番号」 を配る
-//! 4. A と第三者 C が知らせを受け、 2 行を畳む (A は自分の行に、 C は A の世界番号の行に)
+//! 4. A と第三者 C が知らせを受け、 2 行を畳む (A は自分の行に、 C は A の世界番号の行に)。 C も B の record を A と同じ
+//!    2 回の配りで受ける (主キーの無い record が先)
 //!
 //! 知らせを書かない設定 (既定) では 2 行のまま (= 直す前の形、 対照)。
 
@@ -102,11 +104,12 @@ fn run(tag: &str, emit: bool) -> Peers {
     let eb = b.entity_in("files").unwrap();
     b.tie_to(eb, "files.module", 2);
     b.tie_to(eb, "files.path", 3);
-    b.oplog_commit();
+    let recs_b0 = records_of(&b, 2);
     b.tie_to(eb, "files.key", 7);
     let recs_b1 = records_of(&b, 2);
 
-    // 2. A に key 7 の行が 2 つ
+    // 2. A に key 7 の行が 2 つ (主キーの無い record が先の配りで届く)
+    apply(&a, &recs_b0);
     apply(&a, &recs_b1);
     assert_eq!(rows_with_key(&a).len(), 2, "前提: A で同じ主キーの行が 2 つになる (#178 の形)");
     // 3. B が A の行を主キーで自分の行に束ねる
@@ -116,6 +119,7 @@ fn run(tag: &str, emit: bool) -> Peers {
     // 4. A と C が受ける
     apply(&a, &recs_b2);
     apply(&c, &recs_a);
+    apply(&c, &recs_b0);
     apply(&c, &recs_b2);
     Peers { a, b, c, paths, recs_b2, recs_a, ea }
 }

@@ -1304,19 +1304,38 @@ impl Syncer {
     /// 束ねられ、 古い行への別の peer の更新が新しい行に入って author と恒久に食い違った (1 件ずつ
     /// 届けた時は起きない = batch の切れ目で答えが変わった、 #508)。
     ///
-    /// **既知の制約**: bind できるのは PK Tie が先に届く場合だけ。 ある row の
-    /// PK Tie と非 PK Tie が別 batch に分かれ、 かつ非 PK 側が先に届くと、 その時点で
-    /// 新規 eid が払い出されて束ね損なう。 1 row の insert は 1 commit = 同 batch に
-    /// 載るのが通常なので実運用の主経路は塞がるが、 完全ではない (既に二重化した
-    /// store の修復も別途必要 — #141 参照)。
+    /// 行の最初の record が PK でない Tie などの時 (schema の `commit()` は set した順に書くので、 主キーを後に set した行)
+    /// は、 同じ batch の後ろにある PK Tie (`pk_ties`) で、 その record を当てる前に束ねる (#544: #509 で 1 件ずつの照合に
+    /// した時にこの形が抜け、 最初の record で払い出してしまい、 後の PK Tie は写像済みで束ねなかった)。 その PK Tie は
+    /// `admits` (ACL・署名) を通る物だけ使う (通らない record の主キーで、 通った record の行き先を決めない)。
     ///
-    /// 戻り値: 束ねた / 払い出した local eid (#513: 呼び手はそのまま当て、 写像を引き直さない)。 束ねなかった時と、 record の
+    /// **既知の制約**: bind できるのは、 PK Tie が entity の最初の record と同じ batch か、 それより前に届く場合だけ。
+    /// ある row の PK Tie と非 PK Tie が別 batch に分かれ、 かつ非 PK 側が先に届くと、 その時点で新規 eid が払い出されて
+    /// 束ね損なう。 1 row の insert は 1 commit = 同 batch に載るのが通常なので実運用の主経路は塞がるが、 完全ではない
+    /// (既に二重化した store の修復も別途必要 — #141 参照)。
+    ///
+    /// 戻り値: 束ねた / 払い出した local eid (#513: 呼び手はそのまま当て、 写像を引き直さない)。 束ねなかった時と、 PK Tie の
     /// 書き手が entity の産みの親でない時 (写像の鍵が束ねと引きで違う) は `None` (呼び手が今までどおり引く)。
-    fn bind_by_primary_key(&self, rec: &WireRecord, batch: &[WireRecord]) -> Option<enchudb_oplog::EntityId> {
+    fn bind_by_primary_key(
+        &self,
+        rec: &WireRecord,
+        batch: &[WireRecord],
+        pk_ties: &std::collections::HashMap<enchudb_oplog::EntityId, usize>,
+        admits: impl Fn(&WireRecord) -> bool,
+    ) -> Option<enchudb_oplog::EntityId> {
+        let rec = match &rec.op {
+            DecodedOp::Tie { himo_id, .. } if self.engine.is_pk_himo(*himo_id) => rec,
+            op => {
+                let row = Self::row_of(op)?;
+                let pk = &batch[*pk_ties.get(&row)?];
+                // 写像を先に見る (行の 2 件目からは写像があるので、 PK Tie の署名を確かめ直さない)
+                if self.engine.resolve_remote_eid_existing(row).is_some() || !admits(pk) {
+                    return None;
+                }
+                pk
+            }
+        };
         let DecodedOp::Tie { eid, himo_id, value } = &rec.op else { return None };
-        if !self.engine.is_pk_himo(*himo_id) {
-            return None;
-        }
         // 既に写像がある foreign entity は触らない (先に確定した束ね先を優先)。
         if self.engine.resolve_remote_eid_existing(*eid).is_some() {
             return None;
@@ -1361,6 +1380,32 @@ impl Syncer {
         // 書き込みを残さない)
         let bound = self.engine.bind_remote_eid_by_pk(rec.author_peer, *eid, existing, *himo_id, local_value);
         own.then_some(bound)
+    }
+
+    /// #544: batch の中の、 foreign entity ごとの最初の PK Tie の位置 (`bind_by_primary_key` が、 行の最初の record が PK で
+    /// ない時に使う)。
+    fn primary_key_ties(&self, batch: &[WireRecord]) -> std::collections::HashMap<enchudb_oplog::EntityId, usize> {
+        let mut out = std::collections::HashMap::new();
+        for (i, r) in batch.iter().enumerate() {
+            if let DecodedOp::Tie { eid, himo_id, .. } = &r.op
+                && self.engine.is_pk_himo(*himo_id)
+            {
+                out.entry(*eid).or_insert(i);
+            }
+        }
+        out
+    }
+
+    /// 写像の無い foreign entity に slot を払い出す record (`apply_one` で `resolve_remote_eid` を呼ぶ物) の entity。
+    fn row_of(op: &DecodedOp) -> Option<enchudb_oplog::EntityId> {
+        match op {
+            DecodedOp::Tie { eid, .. }
+            | DecodedOp::TieRef { eid, .. }
+            | DecodedOp::Untie { eid, .. }
+            | DecodedOp::TieNamed { eid, .. }
+            | DecodedOp::TieLeaf { eid, .. } => Some(*eid),
+            _ => None,
+        }
     }
 
     /// 受信 record 列を LWW で適用する (Phase C: 署名検証 + ACL も通す)。 `pull_once` の中身であり、
@@ -1412,34 +1457,33 @@ impl Syncer {
             }
         };
         let self_peer = self.engine.peer_id();
+        enum Reject {
+            Acl,
+            Signature,
+        }
+        // ACL (未定義なら全員通す) と署名
+        let rejects = |rec: &WireRecord| -> Option<Reject> {
+            if !acl.is_writer(rec.author_peer) {
+                return Some(Reject::Acl);
+            }
+            let signed = !require_sig
+                || (rec.signature != [0u8; 64]
+                    && pubkeys.get(rec.author_peer).is_some()
+                    && pubkeys.verify(rec.author_peer, &rec.signed_bytes, &rec.signature));
+            (!signed).then_some(Reject::Signature)
+        };
+        let pk_ties = self.primary_key_ties(records);
         for (idx, rec) in records.iter().enumerate() {
             out.received += 1;
-
-            // ACL チェック(未定義なら全員通す)
-            if !acl.is_writer(rec.author_peer) {
-                out.rejected_acl += 1;
+            if let Some(r) = rejects(rec) {
+                match r {
+                    Reject::Acl => out.rejected_acl += 1,
+                    Reject::Signature => out.rejected_signature += 1,
+                }
                 note_reject(&mut out, rec.hlc);
                 continue;
             }
-
-            if require_sig {
-                if rec.signature == [0u8; 64] {
-                    out.rejected_signature += 1;
-                    note_reject(&mut out, rec.hlc);
-                    continue;
-                }
-                if pubkeys.get(rec.author_peer).is_none() {
-                    out.rejected_signature += 1;
-                    note_reject(&mut out, rec.hlc);
-                    continue;
-                }
-                if !pubkeys.verify(rec.author_peer, &rec.signed_bytes, &rec.signature) {
-                    out.rejected_signature += 1;
-                    note_reject(&mut out, rec.hlc);
-                    continue;
-                }
-            }
-            let bound = self.bind_by_primary_key(rec, records);
+            let bound = self.bind_by_primary_key(rec, records, &pk_ties, |r| rejects(r).is_none());
             match self.apply_one(&store, rec, bound) {
                 ApplyResult::Applied => {
                     out.applied += 1;
