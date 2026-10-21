@@ -107,6 +107,30 @@ tokyo.count();                     // current size, same as find()?.len()
 
 The engine-level API is `Engine::subscribe(Vec<LivePred>)`.
 
+### Declared answers (named subscriptions that survive a reopen)
+
+A subscription lives in memory. If the app always wants the same answer ("adults", "orders per city", "top 10 by score"), declare it once under a name. The shape is stored in the DB (`{db}/tables`), and every later open re-registers the subscription before the oplog is replayed, so the app only asks for it by name:
+
+```rust
+// first run: declare (returns a subscription you can use right away)
+let adults = users.all().where_gt("age", 30i64).answer("adults")?;
+let per_city = users.all().answer_counts("per_city", "company.city")?;
+let spent = orders.where_eq("status", "paid").answer_sums("spent", "customer.region", "amount")?;
+let top = users.all().order_by_desc("score").limit(10).answer("top")?;
+
+// every later run: take it by name
+let db = Database::open("/tmp/app.db")?;
+let adults = db.answer("adults").and_then(Answer::into_query).unwrap();
+let first = adults.poll();      // the whole current result as `added`, then only differences
+db.answers();                   // ["adults", "per_city", "spent", "top"]
+db.drop_answer("spent");        // forget it (the declaration is removed from the DB too)
+```
+
+- The first `poll()` after an open builds the answer (it reads the table, like a fresh `subscribe()` would); the open itself does not get slower, declared or not.
+- The handle points at a subscription the engine owns: dropping your handle does not unsubscribe, and taking the same name twice gives two handles on one poll state (a difference is delivered to one of them).
+- Declaring the same name with the same shape again does nothing; a different shape replaces it.
+- An older binary that does not know the declarations opens the DB normally (it just does not register them, and if it rewrites the table definitions they are gone).
+
 ### Engine layer (for graph ops / custom dispatch)
 
 ```rust
