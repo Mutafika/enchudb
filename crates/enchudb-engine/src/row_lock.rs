@@ -30,29 +30,29 @@
 //! ユーザの行 → 内部の表の行だけ (内部の表の行を握ったまま、 ユーザの行も WAL の空きも待たない: 内部の表は WAL に
 //! 積まない)。
 
-// `--cfg loom` の時は loom の atomic で組み、 `tests/loom_row_lock.rs` がこの code そのものを全 interleaving で走らせる (#563)
-#[cfg(loom)]
+// `--cfg enchu_loom` の時は loom の atomic で組み、 `tests/loom_row_lock.rs` がこの code そのものを全 interleaving で走らせる (#563)
+#[cfg(enchu_loom)]
 use loom::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-#[cfg(not(loom))]
+#[cfg(not(enchu_loom))]
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-#[cfg(not(loom))]
+#[cfg(not(enchu_loom))]
 const STRIPES: usize = 1 << 12;
 /// loom は atomic を 1 つずつ追うので、 stripe を少なくする (行 0 と 2 が同じ stripe、 1 は別)。
-#[cfg(loom)]
+#[cfg(enchu_loom)]
 const STRIPES: usize = 2;
 /// engine の内部の表の行の stripe の数 (ユーザの行の stripe の後ろに置く)。
-#[cfg(not(loom))]
+#[cfg(not(enchu_loom))]
 const INTERNAL_STRIPES: usize = 1 << 8;
-#[cfg(loom)]
+#[cfg(enchu_loom)]
 const INTERNAL_STRIPES: usize = 2;
 /// 内部の表の範囲を lock を取らずに引ける数。 越えた分 (表を何度も伸ばした時) は `more_internal` に置く。
 const INTERNAL_RANGES: usize = 16;
 /// 揃った版を掴めなかったら握って読むまでの試行回数。
-#[cfg(not(loom))]
+#[cfg(not(enchu_loom))]
 const READ_TRIES: u32 = 128;
 /// loom は試行の数だけ状態が増えるので少なくする (握って読む道も通る)。
-#[cfg(loom)]
+#[cfg(enchu_loom)]
 const READ_TRIES: u32 = 2;
 
 pub struct RowLocks {
@@ -83,19 +83,19 @@ impl Default for Stripe {
     }
 }
 
-#[cfg(not(loom))]
+#[cfg(not(enchu_loom))]
 thread_local! {
     static TOKEN: u8 = const { 0 };
 }
 
 /// thread ごとに違う 0 でない値 (thread local の番地)。
-#[cfg(not(loom))]
+#[cfg(not(enchu_loom))]
 fn me() -> usize {
     TOKEN.with(|t| t as *const u8 as usize)
 }
 
 /// loom の thread は thread local の置き場を使い回す (同時に生きている 2 本が同じ番地になる) ので、 番号を数えて配る。
-#[cfg(loom)]
+#[cfg(enchu_loom)]
 fn me() -> usize {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
     loom::thread_local! {
@@ -106,12 +106,12 @@ fn me() -> usize {
 
 fn backoff(spins: &mut u32) {
     // loom は回り続ける thread を先に進めないので、 毎回ほかの thread に譲る
-    #[cfg(loom)]
+    #[cfg(enchu_loom)]
     {
         let _ = spins;
         loom::thread::yield_now();
     }
-    #[cfg(not(loom))]
+    #[cfg(not(enchu_loom))]
     if *spins < 64 {
         std::hint::spin_loop();
         *spins += 1;

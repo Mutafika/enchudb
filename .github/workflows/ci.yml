@@ -139,11 +139,6 @@ jobs:
       - name: loom model check (WAL に積む順と当てる順)
         run: cargo test -p enchudb-engine --test loom_row_wal_order --release
 
-      # 行の lock と seqlock の code そのもの (row_lock.rs を loom の atomic で組む、 #563)。 上の 2 つは考え方の model で、
-      # row_lock.rs を変えても落ちない (握った後の fence を消しても通った)。
-      - name: loom model check (row_lock.rs そのもの)
-        run: cargo test -p enchudb-engine --test loom_row_lock --release
-
       # #413: 電源断 (page cache ごと失う) の模擬。 SIGKILL のテストは page cache が残るので
       # msync の漏れを通してしまう。 crashsim の hook は feature の裏なので、 ここでだけ build する。
       - name: power loss simulation (crashsim)
@@ -153,6 +148,15 @@ jobs:
       # `enchudb_oplog::io_point` を使う。 今わかっている失敗は試験の `KNOWN` の表 (issue ごと) にあり、 表に無い失敗だけ落とす
       - name: fault injection / crash matrix (crashsim)
         run: cargo test -p enchudb-engine --features crashsim --test fault_matrix --release -- --test-threads=1
+
+      # 行の lock と seqlock の code そのもの (row_lock.rs を loom の atomic で組む、 #563)。 上の 2 つは考え方の model で、
+      # row_lock.rs を変えても落ちない (握った後の fence を消しても通った)。 enchudb だけの cfg (`enchu_loom`) で組む
+      # (`--cfg loom` で組むと、 この job の電源断の試験のように model の外で engine を使う所が全部 panic する)。
+      # RUSTFLAGS が違うと全部組み直すので job の最後に置く
+      - name: loom model check (row_lock.rs そのもの)
+        env:
+          RUSTFLAGS: --cfg enchu_loom
+        run: cargo test -p enchudb-engine --test loom_row_lock --release
 
   windows-check:
     name: check (windows cross)

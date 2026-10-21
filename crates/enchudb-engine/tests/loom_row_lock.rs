@@ -1,16 +1,20 @@
 //! loom model — 行の lock と seqlock (`row_lock.rs`) の **code そのもの** を全 interleaving で走らせる (#563)。
 //!
 //! `loom_row_seqlock.rs` / `loom_row_wal_order.rs` は考え方を自前の lock / fence で模した model で、 `row_lock.rs` を変えても落ちない
-//! (例: 握った後の `fence(Release)` を消しても通った)。 ここは `--cfg loom` で loom の atomic に差し替えた `RowLocks` を使う
+//! (例: 握った後の `fence(Release)` を消しても通った)。 ここは `--cfg enchu_loom` で loom の atomic に差し替えた `RowLocks` を使う
 //! (stripe は 2 本 = 行 0 と 2 が同じ stripe、 読み直しは 2 回で握って読む道に入る)。
 //!
 //! - 同じ行の書き手は重ならない (書いている間の中身を loom の `UnsafeCell` に置き、 重なれば data race として落ちる)
 //! - 読み手は書き込みの途中の組を採らない (書き手が 2 つの値を書く。 揃わない組を返せば落ちる)
 //! - 同じ thread は同じ stripe をもう一度握れる (行 0 を握ったまま行 2 を書く)
 //!
-//! 実行: `RUSTFLAGS="--cfg loom" cargo test -p enchudb-engine --test loom_row_lock --release`
+//! 実行: `RUSTFLAGS="--cfg enchu_loom" cargo test -p enchudb-engine --test loom_row_lock --release`
+//!
+//! `--cfg loom` でなく enchudb だけの cfg にする: `--cfg loom` は loom を使う crate 全部の約束で、 利用者が自分の loom 試験で
+//! 付けると enchudb の行の lock まで loom の atomic になり、 model の外で engine を使う所が全部 panic する (CI の電源断の試験も
+//! `--cfg loom` の job で走る)
 
-#![cfg(loom)]
+#![cfg(enchu_loom)]
 
 use enchudb_engine::row_lock::RowLocks;
 use loom::cell::UnsafeCell;
