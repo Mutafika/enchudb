@@ -16061,12 +16061,36 @@ impl Engine {
     ///
     /// 対象外: 中継した他人の cell (版数の peer が自分でない — author の署名を作れない)、 配らない table (reserved)、
     /// content。 作った record の署名は開いた時点の鍵 (まだ無いので署名なし — #140 の state 転写と同じ)。
+    /// #557: cell と tombstone の版数の最大 (版数の列を全部なめる。 汚れた終了の後に開く時だけ)。
+    fn max_cell_version(&self) -> enchudb_oplog::Hlc {
+        let mut top = enchudb_oplog::Hlc::ZERO;
+        for hid in 0..self.himos.len() {
+            let Some(n) = self.ver_col(hid as u16).map(|c| c.count()) else { continue };
+            for local in 0..n {
+                top = top.max(self.cell_hlc_local(local, hid as u16));
+            }
+        }
+        if let Some(n) = self.tomb_col.as_ref().map(|c| c.count()) {
+            for local in 0..n {
+                top = top.max(self.tombstone_hlc_local(local));
+            }
+        }
+        top
+    }
+
     fn relog_unlogged_writes(&self, wal: &enchudb_oplog::oplog::OpLog) -> bool {
         use enchudb_oplog::Hlc;
         use enchudb_oplog::oplog::Op;
         // きれいに閉じたかは紐名の辞書の clean flag で見る (辞書 (vocab) の flag は、 一度も語を入れていない DB では
         // 読めない — 空の辞書は header を書いていないので 「まっさら」 と読む)。 sync する DB は紐を必ず持つ
-        if !self.himo_reg.rebuilt_on_load || !self.has_cell_version() || !self.sync_tables_enabled() {
+        if !self.himo_reg.rebuilt_on_load || !self.has_cell_version() {
+            return false;
+        }
+        if !self.sync_tables_enabled() {
+            // #557: 配らない DB は作り直さないが、 HLC の種は cell の版数から取る。 開く時の種は WAL に残った record だけなので、
+            // 畳んだ直後 (WAL が空) の汚れた終了で時計が戻っていると、 ローカルの書き込みが前に書いた cell より古い版数を採って
+            // 弾かれた (record は WAL に載った後)。 配る DB は、 畳んだ後も配る分の record と下の作り直しが種になる
+            wal.observe_hlc(self.max_cell_version());
             return false;
         }
         let me = self.peer_id();
