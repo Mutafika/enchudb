@@ -6,3 +6,5 @@
 # everyone who runs the test benefits from these saved cases.
 cc 41e056141d05742a8637823c5b9b18bf2c7ed11af00335807c758f36bc69417b # shrinks to steps = [Upsert { by: 0, key: 1, title: 0 }, Rename { by: 0, from: 1, to: 0 }, Upsert { by: 0, key: 1, title: 0 }]
 cc 722890a5fce0c9682f560ee2b35c23742019b2180766ce84ddcc057524d270af # shrinks to steps = [Upsert { by: 1, key: 2, title: 0 }, Pull { by: 2, from: 1 }, Delete { by: 1, key: 2 }, Upsert { by: 0, key: 2, title: 0 }]
+cc 1a166dc5b09f6ce1d263f526a415aa902f46c44c0e27cfdedbdce996757acd5f # shrinks to steps = [Upsert { by: 1, key: 2, title: 0 }, Upsert { by: 0, key: 2, title: 0 }, Delete { by: 0, key: 2 }, Upsert { by: 1, key: 2, title: 0 }]
+cc 13385c71a12822c1615fca1622d535be288f65c04c25ea7e607861750379acd2 # shrinks to steps = [Upsert { by: 0, key: 1, title: 0 }, Pull { by: 1, from: 0 }, Upsert { by: 2, key: 1, title: 0 }, Retitle { by: 1, key: 1, title: 0 }, Delete { by: 2, key: 1 }]

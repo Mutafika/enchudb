@@ -16,11 +16,17 @@
 //!   identity (作った peer, その peer での番号) に移す (#545)。 写像の外れた identity 宛ての削除が後から届いた時に、 その名前の
 //!   削除の時刻を上げるため (slot の記録は使い回しで外れる)
 //!
+//! - 名前で束ねた slot は、 束ねた identity (作った peer, その peer での番号。 自分の行は (自分の peer, slot)) とその作成の
+//!   HLC を持つ (#581)。 束ねた後に削除が届いた時、 削除より後に作られた identity を切り離す (削除を先に受けた peer では別の
+//!   デッキになっている)。 束ねない行は何も持たない
+//!
 //! 永続化は DB directory の `pkformer` に、 変わった時にまるごと書く (改名の数だけなので小さい)。 無ければ空。 読まない旧
 //! binary は前の名前を知らないだけ (前と同じ、 今の名前でだけ束ねる)。
 //!
 //! file: magic "PKFN"(4) + version u32 + count u32、 続いて (himo u16, slot u32, 鍵の長さ u32, 鍵) × count。 version 2 は続けて
-//! identity の名前: count u32、 (peer u32, その peer での番号 u32, himo u16, 鍵の長さ u32, 鍵) × count (version 1 も読む)
+//! identity の名前: count u32、 (peer u32, その peer での番号 u32, himo u16, 鍵の長さ u32, 鍵) × count。 version 3 は続けて
+//! 束ねた identity: count u32、 (slot u32, peer u32, その peer での番号 u32, wall u64, logical u32, HLC の peer u32) × count
+//! (version 1 / 2 も読む)
 
 use std::collections::HashMap;
 
@@ -28,7 +34,10 @@ use std::collections::HashMap;
 type Name = (u16, Box<[u8]>);
 
 const MAGIC: &[u8; 4] = b"PKFN";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
+
+/// #581: 束ねた identity (作った peer, その peer での番号) と作成の HLC。
+pub(crate) type Bound = ((u32, u32), enchudb_oplog::Hlc);
 
 /// 主キーの前の名前。 engine が `RwLock` で包んで持つ。
 #[derive(Default, Debug)]
@@ -39,11 +48,43 @@ pub(crate) struct PkFormer {
     by_slot: HashMap<u32, Vec<Name>>,
     /// (作った peer, その peer での番号) → slot を使い回した時に移した、 消えた行の名前 (#545)
     by_identity: HashMap<(u32, u32), Vec<Name>>,
+    /// #581: slot → 名前で束ねた identity とその作成の HLC (束ねた slot だけ)
+    bound: HashMap<u32, Vec<Bound>>,
 }
 
 impl PkFormer {
     pub(crate) fn is_empty(&self) -> bool {
-        self.by_key.is_empty() && self.by_identity.is_empty()
+        self.by_key.is_empty() && self.by_identity.is_empty() && self.bound.is_empty()
+    }
+
+    /// #581: slot `slot` に束ねた identity `id` (作成 `created`) を足す。 既にあれば作成の早い方。 変えたら true。
+    pub(crate) fn add_bound(&mut self, slot: u32, id: (u32, u32), created: enchudb_oplog::Hlc) -> bool {
+        let v = self.bound.entry(slot).or_default();
+        match v.iter_mut().find(|(i, _)| *i == id) {
+            Some((_, c)) if *c <= created => false,
+            Some((_, c)) => {
+                *c = created;
+                true
+            }
+            None => {
+                v.push((id, created));
+                true
+            }
+        }
+    }
+
+    /// #581: slot `slot` に束ねた identity。
+    pub(crate) fn bound_of(&self, slot: u32) -> &[Bound] {
+        self.bound.get(&slot).map_or(&[], |v| &v[..])
+    }
+
+    /// #581: slot `slot` に束ねた identity を `v` に置き換える (空なら外す)。
+    pub(crate) fn set_bound(&mut self, slot: u32, v: Vec<Bound>) {
+        if v.is_empty() {
+            self.bound.remove(&slot);
+        } else {
+            self.bound.insert(slot, v);
+        }
     }
 
     /// 前に `(himo, key)` だった行の slot。
@@ -90,7 +131,8 @@ impl PkFormer {
 
     /// slot を別の行に使い回す前に、 その行の前の名前を外す。 変えたら true。
     pub(crate) fn forget_slot(&mut self, slot: u32) -> bool {
-        let Some(keys) = self.by_slot.remove(&slot) else { return false };
+        let unbound = self.bound.remove(&slot).is_some();
+        let Some(keys) = self.by_slot.remove(&slot) else { return unbound };
         for k in keys {
             if self.by_key.get(&k) == Some(&slot) {
                 self.by_key.remove(&k);
@@ -123,6 +165,18 @@ impl PkFormer {
             out.extend_from_slice(&(key.len() as u32).to_le_bytes());
             out.extend_from_slice(key);
         }
+        let mut bound: Vec<(u32, Bound)> =
+            self.bound.iter().flat_map(|(&slot, v)| v.iter().map(move |b| (slot, *b))).collect();
+        bound.sort();
+        out.extend_from_slice(&(bound.len() as u32).to_le_bytes());
+        for (slot, ((peer, fl), h)) in bound {
+            out.extend_from_slice(&slot.to_le_bytes());
+            out.extend_from_slice(&peer.to_le_bytes());
+            out.extend_from_slice(&fl.to_le_bytes());
+            out.extend_from_slice(&h.wall.to_le_bytes());
+            out.extend_from_slice(&h.logical.to_le_bytes());
+            out.extend_from_slice(&h.peer.to_le_bytes());
+        }
         out
     }
 
@@ -132,7 +186,7 @@ impl PkFormer {
             return Err("pkformer sidecar: bad magic".into());
         }
         let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-        if version != 1 && version != VERSION {
+        if !(1..=VERSION).contains(&version) {
             return Err(format!("pkformer sidecar: unsupported version {version}"));
         }
         let count = u32::from_le_bytes(buf[8..12].try_into().unwrap());
@@ -162,6 +216,18 @@ impl PkFormer {
                 let key = buf.get(p..p + len).ok_or("pkformer sidecar: torn identity key")?;
                 p += len;
                 out.insert_identity(peer, fl, himo, key);
+            }
+        }
+        if version >= 3 {
+            let count = buf.get(p..p + 4).ok_or("pkformer sidecar: torn bound count")?;
+            let count = u32::from_le_bytes(count.try_into().unwrap());
+            p += 4;
+            for _ in 0..count {
+                let e = buf.get(p..p + 28).ok_or("pkformer sidecar: torn bound entry")?;
+                let u = |i: usize| u32::from_le_bytes(e[i..i + 4].try_into().unwrap());
+                let created = enchudb_oplog::Hlc { wall: u64::from_le_bytes(e[12..20].try_into().unwrap()), logical: u(20), peer: u(24) };
+                out.add_bound(u(0), (u(4), u(8)), created);
+                p += 28;
             }
         }
         if p != buf.len() {
@@ -225,12 +291,29 @@ mod tests {
         for cut in [bytes.len() - 1, bytes.len() - 6] {
             assert!(PkFormer::deserialize(&bytes[..cut]).is_err(), "{cut} byte で切れた file を読んだ");
         }
-        // version 1 (identity の節が無い) も読む
+        // #581: 束ねた identity も往復する
+        let mut b = PkFormer::default();
+        let h = |w: u64| enchudb_oplog::Hlc { wall: w, logical: 1, peer: 2 };
+        assert!(b.add_bound(5, (7, 1), h(30)));
+        assert!(b.add_bound(5, (0, 5), h(10)));
+        assert!(!b.add_bound(5, (7, 1), h(40)), "遅い作成で置き換えた");
+        assert!(b.add_bound(5, (7, 1), h(20)), "早い作成に置き換えない");
+        let back = PkFormer::deserialize(&b.serialize()).unwrap();
+        let mut got = back.bound_of(5).to_vec();
+        got.sort();
+        assert_eq!(got, vec![((0, 5), h(10)), ((7, 1), h(20))]);
+        assert!(!back.is_empty());
+        let mut c = PkFormer::deserialize(&b.serialize()).unwrap();
+        assert!(c.forget_slot(5), "slot を使い回す時に束ねた identity を外さない");
+        assert!(c.bound_of(5).is_empty());
+        // version 1 (identity の節も束ねた identity の節も無い) / version 2 (束ねた identity の節が無い) も読む
         let mut v1 = PkFormer::default();
         v1.insert(3, b"tokyo", 10);
-        let mut old = v1.serialize();
-        old[4..8].copy_from_slice(&1u32.to_le_bytes());
-        old.truncate(old.len() - 4); // identity の数 (0) を落とす
-        assert_eq!(PkFormer::deserialize(&old).unwrap().slot_of(3, b"tokyo"), Some(10));
+        for (version, cut) in [(1u32, 8), (2, 4)] {
+            let mut old = v1.serialize();
+            old[4..8].copy_from_slice(&version.to_le_bytes());
+            old.truncate(old.len() - cut); // 後ろの節の数 (0) を落とす
+            assert_eq!(PkFormer::deserialize(&old).unwrap().slot_of(3, b"tokyo"), Some(10), "version {version}");
+        }
     }
 }

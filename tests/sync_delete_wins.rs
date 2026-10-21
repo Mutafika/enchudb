@@ -473,3 +473,80 @@ fn names_moved_on_slot_reuse_survive_a_reopen() {
     let keys: Vec<_> = t.all().find().unwrap().into_iter().map(|e| t.entity(e).get("key")).collect();
     assert_eq!(keys, vec![Some(Value::Number(8))], "開き直した後の遅い削除で C の 7 が消えない (移した名前を失った)");
 }
+
+/// #581: 削除の後に同じ名前で作った行 (C) を先に受けて、 消える行 (A) をそれに束ねた受け手でも、 削除が届いたら A の書き込み
+/// (削除より前、 C が書かない列 = note) は残らない。 削除を先に受けた受け手と同じ答え (C の行に note は無い)。
+#[test]
+fn a_bound_row_made_after_the_delete_keeps_none_of_the_deleted_cells() {
+    let dir = Dir::new("bound-cells");
+    let tr = Arc::new(InMemoryTransport::new());
+    for id in [1, 2, 3, 10, 11] {
+        tr.register_peer(id);
+    }
+    let peer = |id: u32| {
+        let mut b = Database::create_with_capacity(&dir.db(id), 4096).unwrap();
+        b.table(T).tag("key").tag("title").tag("note").primary_key("key").build().unwrap();
+        b.enable_sync().unwrap();
+        let db = b.finish_with_oplog(OPLOG).unwrap();
+        db.engine().set_peer_id(id);
+        let sync = Syncer::new(db.arc_engine(), tr.clone() as Arc<dyn Transport>);
+        Peer { db, sync, first_row: std::sync::OnceLock::new() }
+    };
+    let (a, b, c) = (peer(1), peer(2), peer(3));
+    a.db.get_table(T).unwrap().upsert().set("key", "k0").set("title", "a").set("note", "x").commit().unwrap();
+    a.publish();
+    b.pull(1);
+    b.delete("k0");
+    c.upsert("k0", "c");
+    // 削除の後に作った C を先に受けて A を束ねる受け手と、 削除を先に受ける受け手
+    let (r1, r2) = (peer(10), peer(11));
+    for from in [3, 1, 2] {
+        r1.pull(from);
+    }
+    for from in [2, 3, 1] {
+        r2.pull(from);
+    }
+    let read = |p: &Peer| {
+        p.db.engine().rebuild();
+        let t = p.db.get_table(T).unwrap();
+        t.all().find().unwrap().into_iter().map(|e| (t.entity(e).get("key"), t.entity(e).get("title"), t.entity(e).get("note"))).collect::<Vec<_>>()
+    };
+    let want = vec![(text("k0"), text("c"), None)];
+    assert_eq!(read(&r2), want, "前提: 削除を先に受けた受け手");
+    assert_eq!(read(&r1), want, "束ねてから削除を受けた受け手に、 消えた行の書き込みが残った");
+    // 切り離した後に、 削除を知らない A が自分の行を書き換えても、 消えた行宛てなので捨てる (C の行に入らない)
+    a.retitle("k0", "a2");
+    r1.pull(1);
+    r2.pull(1);
+    assert_eq!(read(&r2), want, "前提: 削除を先に受けた受け手は消えた行宛ての書き込みを捨てる");
+    assert_eq!(read(&r1), want, "切り離した後の消えた行宛ての書き込みが、 削除の後に作った行に入った");
+}
+
+/// #581: 名前が遅れて届いて畳んだ行 (書き換えが作成より先に届いて名前の無い slot ができ、 後から名前が届いて同じ名前の行に
+/// 畳む) にも、 束ねた identity と作成を覚える。 後から届いた削除は、 削除の後に作られた行 (C) を消さない。
+/// A が作り、 B が (受けて) 書き換え、 D が (受けて) 消し、 C は削除の後に同じ名前で作る。 受け手は C → B → A → D の順。
+#[test]
+fn a_folded_row_made_after_the_delete_survives_it() {
+    let dir = Dir::new("folded");
+    let tr = Arc::new(InMemoryTransport::new());
+    for id in [1, 2, 3, 4, 10, 11] {
+        tr.register_peer(id);
+    }
+    let (a, b, c, d) = (make(&dir, 1, &tr), make(&dir, 2, &tr), make(&dir, 3, &tr), make(&dir, 4, &tr));
+    a.upsert("k0", "a");
+    b.pull(1);
+    d.pull(1);
+    b.retitle("k0", "b");
+    d.delete("k0");
+    c.upsert("k0", "c");
+    let (r1, r2) = (make(&dir, 10, &tr), make(&dir, 11, &tr));
+    for from in [3, 2, 1, 4] {
+        r1.pull(from);
+    }
+    for from in [4, 3, 2, 1] {
+        r2.pull(from);
+    }
+    let want = vec![(text("k0"), text("c"))];
+    assert_eq!(r2.rows(), want, "前提: 削除を先に受けた受け手");
+    assert_eq!(r1.rows(), want, "畳んでから削除を受けた受け手で、 削除の後に作った行が消えた / 違う");
+}

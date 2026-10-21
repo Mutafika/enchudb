@@ -5,7 +5,8 @@
 //! 名前の列 (`key`) で束ねる表 (#141)。 改名 (#569)・削除優先 (#577)・消した名前 (#582 / #588) の組み合わせを、 人が形を思い付く代わりに
 //! 機械に探させる (#547 / #551 / #545 / #581 は全部人が見つけた)。 答えには名前の無い塊 (title だけの entity) も入れる。
 //!
-//! 既知の割れ (#581: 削除の後に同じ名前で作った行を、 削除より先に受けて束ねた peer は後の削除で消す) があるので、 普段の試験からは外す:
+//! 既知の割れ (改名した本人が前の名前で作り直す形、 ユーザに確認中) があるので、 普段の試験からは外す (改名を出さずに回すなら
+//! `ENCHU_FUZZ_NO_RENAME=1`):
 //!
 //! ```text
 //! ENCHU_FUZZ_CASES=200 cargo test --release --test sync_converge_fuzz -- --ignored --nocapture
@@ -265,7 +266,7 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: cases(), max_shrink_iters: 2000, ..ProptestConfig::default() })]
 
     #[test]
-    #[ignore = "既知の割れ (#581) があるので手で回す"]
+    #[ignore = "既知の割れ (改名の作り直し) があるので手で回す"]
     fn every_order_converges(steps in proptest::collection::vec(step_strategy(), 1..10)) {
         if let Err(msg) = run(&steps) {
             prop_assert!(false, "手順 {steps:?}\n{msg}");
@@ -273,14 +274,60 @@ proptest! {
     }
 }
 
-/// 道具の前提: 既知の割れ (#581) の形を渡すと割れを見つける (見つけられない道具では、 通っても何も言えない)。
+fn text(s: &str) -> Option<Value> {
+    Some(Value::Text(s.into()))
+}
+
+/// 縮めた形 (#581): B が消した名前で、 A が (削除を知らずに) 削除の後に作る。 A の行を削除より先に受けて束ねた peer でも、
+/// 後から届いた削除は A の行を消さない (A の行は削除の後に作られた = 新しいデッキ)。
 #[test]
-fn the_tool_sees_the_known_split() {
+fn a_row_made_after_the_delete_survives_in_every_order() {
     let steps = [
         Step::Upsert { by: 0, key: 0, title: 0 },
         Step::Pull { by: 1, from: 0 },
         Step::Delete { by: 1, key: 0 },
         Step::Upsert { by: 2, key: 0, title: 1 },
     ];
-    assert!(run(&steps).is_err(), "#581 の形で割れを見つけない");
+    assert_eq!(run(&steps), Ok(vec![(text("k0"), text("t1"))]));
+}
+
+/// 縮めた形 (総当たりの 2 つ目、 改名なし): 上の形に、 削除の前に別の peer (C) が B の行を受けておく (中継の重ね)。
+#[test]
+fn a_row_made_after_a_relayed_delete_survives_in_every_order() {
+    let steps = [
+        Step::Upsert { by: 1, key: 2, title: 0 },
+        Step::Pull { by: 2, from: 1 },
+        Step::Delete { by: 1, key: 2 },
+        Step::Upsert { by: 0, key: 2, title: 0 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![(text("k2"), text("t0"))]));
+}
+
+/// 縮めた形 (総当たりの 3 つ目、 改名なし): B と A が別々に同じ名前で作り、 A が自分の行を消し、 B が (削除を知らずに) その名前で
+/// upsert し直す。 B の行は削除より前に作られた同じデッキなので消える (削除優先、 D5)。 upsert が名前のカードを書き直すと、 B の
+/// 行の作成の時刻が分からなくなり、 束ねた peer だけ B の行を残した。
+#[test]
+fn an_upsert_after_an_unseen_delete_does_not_revive_the_row() {
+    let steps = [
+        Step::Upsert { by: 1, key: 2, title: 0 },
+        Step::Upsert { by: 0, key: 2, title: 0 },
+        Step::Delete { by: 0, key: 2 },
+        Step::Upsert { by: 1, key: 2, title: 0 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![]));
+}
+
+/// 縮めた形 (総当たりの 4 つ目): A の行の作成より先に、 B の (A の行宛ての) 書き換えが別の配りで届く。 受け手は名前の無い slot を
+/// 払い出し、 後から届いた名前のカードは写像のある slot に当たる。 その名前は (C の同じ名前の行の) 削除で消えていて、 A の行は
+/// 削除より前に作られたので、 同じデッキとして消える。
+#[test]
+fn a_name_that_arrives_after_its_row_still_meets_the_delete() {
+    let steps = [
+        Step::Upsert { by: 0, key: 1, title: 0 },
+        Step::Pull { by: 1, from: 0 },
+        Step::Upsert { by: 2, key: 1, title: 0 },
+        Step::Retitle { by: 1, key: 1, title: 0 },
+        Step::Delete { by: 2, key: 1 },
+    ];
+    assert_eq!(run(&steps), Ok(vec![]));
 }
