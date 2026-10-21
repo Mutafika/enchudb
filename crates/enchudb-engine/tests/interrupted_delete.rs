@@ -177,26 +177,25 @@ fn a_stale_delete_does_not_wipe_a_newer_row() {
     fresh(&path);
 }
 
+/// 削除優先 (2026-10-21): 途中で切れた削除の後に、 削除より新しい書き込みが当たっても、 同じ Delete の再配送で行ごと消える
+/// (消した行宛ての書き込みは削除より新しくても捨てる。 前は削除より後に書かれた cell を残した)。
 #[test]
-fn redelivered_delete_keeps_cells_written_after_it() {
+fn redelivered_delete_removes_cells_written_after_it() {
     let path = tmp_path("redeliver-keeps");
     fresh(&path);
 
     let (eng, eid, ha, _) = open_with_row(&path);
     interrupt_delete_at_tombstone(&eng, eid, hlc(200));
-    // 削除の後に作り直された cell。
+    // 削除が切れている間 (行はまだ生きている) に届いた、 削除より新しい書き込み
     assert!(eng.remote_tie_apply(eid, ha, 99, hlc(300)));
 
-    // 同じ Delete (版数 200) の再配送。 冪等に本体を掃除するが、 **削除より後に
-    // 書かれた cell まで巻き添えにしてはいけない**。
+    // 同じ Delete (版数 200) の再配送: 本体を全部消す
     assert!(eng.remote_delete_apply(eid, hlc(200)));
-    assert_eq!(
-        eng.get(eid, "a"),
-        Some(99),
-        "再配送された Delete が、 その後に書かれた cell を消した"
-    );
+    assert_eq!(eng.get(eid, "a"), None, "再配送された Delete の後も、 削除より新しい cell が残った");
     assert_eq!(eng.get(eid, "b"), None, "削除より古い cell は落ちるべき");
-    assert!(eng.is_live(eid), "生き残る cell が在るなら行は live のまま");
+    assert!(!eng.is_live(eid), "消えた行が live のまま");
+    // その後の書き込みも当たらない
+    assert!(!eng.remote_tie_apply(eid, ha, 100, hlc(400)), "消えた行に書き込めた");
 
     fresh(&path);
 }

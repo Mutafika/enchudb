@@ -264,3 +264,65 @@ fn an_unaware_edit_after_an_early_delete_is_dropped() {
         p[2].retitle("x", "c");
     });
 }
+
+/// 消したのを見てから、 2 人が別々に同じ名前で足し直した行は、 同じ行として残る (名前の削除はその前からある行だけを消す。 足し直した
+/// 行どうしを束ねる時に、 前の削除を当てて消さない)。
+#[test]
+fn two_rows_added_again_after_the_delete_live_as_one() {
+    expect("readd-twice", vec![(text("z"), text("c"))], |p| {
+        p[0].upsert("z", "a");
+        p[1].pull(1);
+        p[2].pull(1);
+        p[0].delete("z");
+        p[1].pull(1);
+        p[2].pull(1);
+        p[1].upsert("z", "b");
+        p[2].upsert("z", "c");
+    });
+}
+
+/// 消した行への、 削除を知らない Leaf の列 (wire では TieLeaf) の書き込みも捨てる。
+#[test]
+fn an_unaware_leaf_edit_to_a_deleted_row_is_dropped() {
+    let dir = Dir::new("leaf");
+    let tr = Arc::new(InMemoryTransport::new());
+    for id in [1, 2, 10, 11] {
+        tr.register_peer(id);
+    }
+    let peer = |id: u32| {
+        let mut b = Database::create_with_capacity(&dir.db(id), 4096).unwrap();
+        b.table("notes").tag("key").leaf("memo").primary_key("key").build().unwrap();
+        b.enable_sync().unwrap();
+        let db = b.finish_with_oplog(OPLOG).unwrap();
+        db.engine().set_peer_id(id);
+        let sync = Syncer::new(db.arc_engine(), tr.clone() as Arc<dyn Transport>);
+        Peer { db, sync, first_row: std::sync::OnceLock::new() }
+    };
+    let (a, b) = (peer(1), peer(2));
+    let row = a.db.get_table("notes").unwrap().upsert().set("key", "z").set("memo", "a").commit().unwrap();
+    a.publish();
+    b.pull(1);
+    a.db.get_table("notes").unwrap().entity(row).delete().unwrap();
+    a.publish();
+    let on_b = b.db.engine().resolve_remote_eid_existing(row).expect("前提: B に A の行の写像");
+    b.db.get_table("notes").unwrap().entity(on_b).set("memo", "b").commit().unwrap();
+    b.publish();
+    let (r1, r2) = (peer(10), peer(11));
+    r1.pull(1);
+    r1.pull(2);
+    r2.pull(2);
+    r2.pull(1);
+    a.pull(2);
+    b.pull(1);
+    for (name, p, e) in [
+        ("A", &a, Some(row)),
+        ("B", &b, Some(on_b)),
+        ("R1 (A → B)", &r1, r1.db.engine().resolve_remote_eid_existing(row)),
+        ("R2 (B → A)", &r2, r2.db.engine().resolve_remote_eid_existing(row)),
+    ] {
+        let e = e.expect("A の行の写像が無い");
+        let memo = p.db.engine().get_text_owned(e, "notes.memo");
+        assert_eq!(memo, None, "{name}: 消した行への Leaf の書き込みが残った");
+        assert!(!p.db.engine().is_live(e), "{name}: 消した行が生き返った");
+    }
+}

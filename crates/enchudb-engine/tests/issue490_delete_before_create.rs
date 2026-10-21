@@ -76,17 +76,18 @@ fn create_older_than_an_early_delete_does_not_land() {
     cleanup(&path);
 }
 
-/// 削除より新しい record は当たる (退避した削除が効きすぎて、 その entity を永久に閉じる形になっていない)。
+/// 削除優先 (2026-10-21): 作成より先に削除が届いた entity には、 削除より新しい record も当たらない (消えた entity 宛ての書き込みは
+/// 捨てる)。
 #[test]
-fn record_newer_than_an_early_delete_still_lands() {
+fn record_newer_than_an_early_delete_is_dropped() {
     let path = tmp("newer");
     let (eng, hid) = setup(&path);
     let x = of_a(777);
 
     assert!(eng.remote_delete_apply_foreign(x, hlc(2000, 3)));
     let t = eng.resolve_remote_eid(x, hid).expect("翻訳できない");
-    assert!(eng.remote_tie_apply(t, hid, 222, hlc(3000, 4)), "削除より新しい record が当たらない");
-    assert_eq!(eng.get(t, "t.age"), Some(222));
+    assert!(!eng.remote_tie_apply(t, hid, 222, hlc(3000, 4)), "削除より新しい record で消えた entity が生き返った");
+    assert_eq!(eng.get(t, "t.age"), None);
     drop(eng);
     cleanup(&path);
 }

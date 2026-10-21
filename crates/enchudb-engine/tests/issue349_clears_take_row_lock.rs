@@ -124,31 +124,57 @@ fn clear_local_only_tables_does_not_show_a_half_cleared_row() {
 
 #[test]
 fn repair_interrupted_deletes_does_not_show_a_half_removed_row() {
+    // 削除優先 (2026-10-21) で、 消えた行は受け取った書き込みで生き返らない。 回ごとに新しい行を作り、 読み手は今の回の行を読む
+    const ROUNDS: usize = 40;
     let path = tmp_path("repair");
     fresh(&path);
-    let mut eng = Engine::create_with_cell_version(&path, 4 * ROWS as u32).unwrap();
+    let mut eng = Engine::create_with_cell_version(&path, ((ROUNDS + 2) * ROWS) as u32).unwrap();
     eng.define_himo("a", ValueType::Number, 0);
     eng.define_himo("b", ValueType::Number, 0);
     let eng: Arc<Engine> = Engine::concurrentize_with_oplog(eng, CAP).unwrap();
     eng.set_peer_id(PEER);
     let ha = eng.himo_id("a").expect("himo a") as u16;
     let hb = eng.himo_id("b").expect("himo b") as u16;
-    let eids: Arc<Vec<u64>> = Arc::new((0..ROWS).map(|_| eng.entity().unwrap()).collect());
+    let current: Arc<std::sync::RwLock<Arc<Vec<u64>>>> =
+        Arc::new(std::sync::RwLock::new(Arc::new((0..ROWS).map(|_| eng.entity().unwrap()).collect())));
 
     let (stop, torn) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
-    let rs = spawn_readers(&eng, &eids, &stop, &torn, (ha, hb), readers());
+    let rs: Vec<_> = (0..readers())
+        .map(|k| {
+            let (eng, current, stop, torn) = (eng.clone(), current.clone(), stop.clone(), torn.clone());
+            std::thread::spawn(move || {
+                let mut i = k * 997;
+                while !stop.load(Ordering::Relaxed) {
+                    let eids = current.read().unwrap().clone();
+                    for _ in 0..64 {
+                        let eid = eids[i % eids.len()];
+                        let (a, b) = eng.read_row(eid, || (eng.get_by_id(eid, ha), eng.get_by_id(eid, hb)));
+                        if a.is_some() != b.is_some() {
+                            torn.fetch_add(1, Ordering::Relaxed);
+                        }
+                        i += 1;
+                    }
+                }
+            })
+        })
+        .collect();
 
-    // 回ごとに版を上げる: 本体を書き直す (tombstone より新しい版) → tombstone をさらに新しい版で置く
-    // (= 途中で切れた delete の形) → repair が本体を消す
+    // 回ごとに: 新しい行の本体を書く → tombstone をより新しい版で置く (= 途中で切れた delete の形) → repair が本体を消す
     let end = Instant::now() + Duration::from_millis(1500);
     let mut at = 100u64;
     let mut rounds = 0u64;
-    while Instant::now() < end {
+    while Instant::now() < end && (rounds as usize) < ROUNDS {
         at += 10;
+        let eids: Vec<u64> = if rounds == 0 {
+            current.read().unwrap().to_vec()
+        } else {
+            (0..ROWS).map(|_| eng.entity().unwrap()).collect()
+        };
         for &eid in eids.iter() {
             write_both(&eng, eid, ha, hb, at);
             assert!(eng.set_tombstone(eid, hlc(at + 5)), "tombstone を記録できていない");
         }
+        *current.write().unwrap() = Arc::new(eids);
         assert_eq!(eng.repair_interrupted_deletes(), ROWS, "途中で切れた delete を全部直していない");
         rounds += 1;
     }
