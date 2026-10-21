@@ -351,3 +351,65 @@ fn a_reused_slot_drops_its_former_names() {
     assert!(rows.contains(&(text("w"), text("own"))), "使い回した slot の行が B の z に書き換わった: {rows:?}");
     assert!(rows.contains(&(text("z"), text("b"))), "B の z が無い: {rows:?}");
 }
+
+/// #551: 改名を知らない B が古い名前の行を消す。 C は何も見ずに新しい名前 y で作る (削除より前)。 C の y は改名後の A の行と
+/// 同じ名前 = 同じデッキなので、 削除で一緒に消える。 改名と削除のどちらを先に受けても同じ答えになるか。
+#[test]
+fn unaware_delete_after_rename_kills_the_new_name() {
+    check("unaware-delete-new", |p| {
+        p[0].upsert("z", "a");
+        p[1].pull(1);
+        p[0].rename("z", "y");
+        p[2].upsert("y", "c");
+        p[1].delete("z");
+    });
+}
+
+/// #551: 上と同じで、 C は前の名前 z で作る (改名の後、 削除の前)。 前の名前も同じデッキを指すので一緒に消える。
+#[test]
+fn unaware_delete_after_rename_kills_the_former_name() {
+    check("unaware-delete-former", |p| {
+        p[0].upsert("z", "a");
+        p[1].pull(1);
+        p[0].rename("z", "y");
+        p[2].upsert("z", "c");
+        p[1].delete("z");
+    });
+}
+
+/// #551: 改名した A が新しい名前で消す。 C は何も見ずに前の名前 z で作る (削除の前)。
+#[test]
+fn delete_by_new_name_kills_the_former_name() {
+    check("delete-new-former", |p| {
+        p[0].upsert("z", "a");
+        p[0].rename("z", "y");
+        p[2].upsert("z", "c");
+        p[0].delete("y");
+    });
+}
+
+/// #551: 消えた行への改名が後から届いても、 削除の後にその名前で足し直した行 (消した B が足した y) は消さない。
+#[test]
+fn a_late_rename_to_a_deleted_row_spares_a_row_added_after_the_delete() {
+    check("late-rename-readd", |p| {
+        p[0].upsert("z", "a");
+        p[1].pull(1);
+        p[0].rename("z", "y");
+        p[1].delete("z");
+        p[1].upsert("y", "b");
+    });
+}
+
+/// #551: 2 人が別々に同じ行を消す (B は改名を知らずに古い名前で、 A は後から新しい名前で)。 名前の削除の時刻は遅い方の削除で、
+/// その間に作られた同じ名前の行 (C の y) も消える。 改名を消えた後に受けた peer も、 後の削除で新しい名前の時刻を上げる。
+#[test]
+fn a_second_delete_raises_a_name_learned_after_the_first() {
+    check("second-delete", |p| {
+        p[0].upsert("z", "a");
+        p[1].pull(1);
+        p[0].rename("z", "y");
+        p[1].delete("z");
+        p[2].upsert("y", "c");
+        p[0].delete("y");
+    });
+}

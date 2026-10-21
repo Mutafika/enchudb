@@ -10962,6 +10962,9 @@ impl Engine {
             return;
         }
         let Some(pk) = self.pk_himo_of_slot(local) else { return };
+        if !self.pk_former_empty.load(Ordering::Acquire) {
+            self.remember_former_names_deleted(local, hlc);
+        }
         let value = self.himos.get(pk as usize).and_then(|h| h.get_value(local));
         if let Some(value) = value
             && !(self.vocab.reclaim_enabled() && matches!(self.value_types.get(pk as usize), Some(ValueType::Tag)))
@@ -10987,6 +10990,82 @@ impl Engine {
                     self.note_pk_locked(&mut g, h, &key, local, hlc);
                 }
             }
+        }
+    }
+
+    /// #551: 行 `local` を `hlc` で消した時、 その行の前の名前も消した名前として覚える (前の名前 = 同じ行。 改名を知らない peer が
+    /// 前の名前で消しても、 改名した peer が今の名前で消しても、 同じ名前の集まりを覚える)。 改名のある DB だけ通る。
+    #[cold]
+    fn remember_former_names_deleted(&self, local: u32, hlc: enchudb_oplog::Hlc) {
+        let names: Vec<(u16, Box<[u8]>)> =
+            self.pk_former.read().unwrap().names_of(local).map(|(h, k)| (h, Box::from(k))).collect();
+        if names.is_empty() {
+            return;
+        }
+        let mut g = self.pk_tombs.write().unwrap();
+        self.drain_pk_pending(&mut g);
+        for (h, k) in names {
+            self.note_pk_locked(&mut g, h, &k, crate::pk_tombs::NO_SLOT, hlc);
+        }
+    }
+
+    /// 削除優先 (#551): 消えた行 `eid` 宛ての主キーの書き込み (改名、 消える前に書かれた物も後の物も) を受け取った時。 書き込みは
+    /// 捨てるが、 名前は行の前の名前として、 また消した名前として覚える。 改名を先に受けてから削除を受けた peer では、 削除が
+    /// その名前の行を消して名前を覚える (`remember_pk_tombstone`) ので、 届く順で消した名前の集まりを変えない。
+    ///
+    /// 今その名前を持つ生きた行のうち、 削除より前にその名前になった行は同じ行なので一緒に消す (改名を先に受けた peer では、
+    /// 改名で 1 つに畳んでから消している)。 戻り値は一緒に消した行の数。 消えた行でない・主キーでない時は何もしない。
+    pub fn name_given_to_dead_row(&self, eid: enchudb_oplog::EntityId, himo: u16, value: u64) -> usize {
+        let local = enchudb_oplog::eid_local(eid);
+        if !self.is_remembered_pk_himo(himo) || !self.slot_is_dead(local) {
+            return 0;
+        }
+        let tomb = self.tombstone_version_of(local);
+        self.note_pk_former(local, himo, value);
+        {
+            let mut g = self.pk_tombs.write().unwrap();
+            self.drain_pk_pending(&mut g);
+            self.with_pk_key(himo, PkValue::Local(value), |k| {
+                self.note_pk_locked(&mut g, himo, k, crate::pk_tombs::NO_SLOT, tomb)
+            });
+        }
+        self.remove_rows_named(local, himo, value, tomb)
+    }
+
+    /// 削除優先 (#551): 主キー `value` を今持つ、 行 `local` でない生きた行のうち、 `tomb` より前にその名前になった行を `tomb` で消す
+    /// (同じ名前 = 同じ行)。 呼び手は行の lock を握っていない。 戻り値は消した行の数。
+    fn remove_rows_named(&self, local: u32, himo: u16, value: u64, tomb: enchudb_oplog::Hlc) -> usize {
+        let mut removed = 0;
+        for e in self.query_by_id64(&[(himo, value)]) {
+            let l = enchudb_oplog::eid_local(e);
+            if l != local && self.version_of(l, himo) < tomb && self.apply_delete_local(l, tomb) {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// 削除優先 (#551): 消えた行 `local` の名前 (消えた時の名前と前の名前) について [`Self::remove_rows_named`]。
+    fn remove_rows_holding_names_of(&self, local: u32, tomb: enchudb_oplog::Hlc) -> usize {
+        self.flush_pk_pending();
+        let mut names: Vec<(u16, Box<[u8]>)> =
+            self.pk_tombs.read().unwrap().key_of_slot(local).map(|(h, k)| (h, Box::from(k))).into_iter().collect();
+        if !self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) {
+            names.extend(self.pk_former.read().unwrap().names_of(local).map(|(h, k)| (h, Box::from(k))));
+        }
+        names
+            .into_iter()
+            .filter_map(|(h, k)| Some((h, self.pk_value_of_key(h, &k)?)))
+            .map(|(h, v)| self.remove_rows_named(local, h, v, tomb))
+            .sum()
+    }
+
+    /// 主キーの値の鍵 (`with_pk_key`) から今の値へ。 辞書に無い文字列 (その名前の行は無い) は None。
+    fn pk_value_of_key(&self, himo: u16, key: &[u8]) -> Option<u64> {
+        match self.value_types.get(himo as usize)? {
+            ValueType::Leaf => None,
+            ValueType::Tag => self.vocab_id_bytes(key).map(u64::from),
+            _ => Some(u64::from_le_bytes(key.try_into().ok()?)),
         }
     }
 
@@ -11832,12 +11911,18 @@ impl Engine {
     ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         self.observe_remote_hlc(hlc);
+        let raised = self.slot_is_dead(local) && hlc > self.tombstone_version_of(local);
         // A-5: 削除の版数を残す。 これが永続することで、 配送バッファから
         // tombstone が消えた後も削除済み entity が復活しない (#140 の根)。
         // 版数の記録と本体の除去は `apply_delete_local` で不可分に扱う (再配送でも
         // 本体が必ず落ちる = 冪等)。
         if !self.apply_delete_local(local, hlc) {
             return false;
+        }
+        // 削除優先 (#551): 消えた行に別の author のより新しい削除が届いた (2 人が別々に消した)。 名前の削除の時刻が上がるので、
+        // その名前を今持つ行のうち、 この削除より前にその名前になった行も消す (先に束ねてから前の削除を受けた peer では一緒に消えている)
+        if raised {
+            self.remove_rows_holding_names_of(local, hlc);
         }
         // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
         // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
