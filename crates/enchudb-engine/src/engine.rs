@@ -236,6 +236,7 @@ pub enum PkValue<'a> {
     Text(&'a [u8]),
 }
 
+
 /// `remote_*_apply` (sync 受信の apply) の結果 (#210)。
 ///
 /// 旧 `bool` は 「適用した / しなかった」 しか区別できず、 **「LWW で古い」 と
@@ -929,6 +930,41 @@ fn load_eidalias_from_sidecar(db_path: &str) -> io::Result<Option<Vec<(enchudb_o
 #[cfg(not(target_arch = "wasm32"))]
 fn pktombs_path_for(path: &str) -> std::path::PathBuf {
     crate::db_files::path_for(path, crate::db_files::PKTOMBS)
+}
+
+/// `Engine::pk_himo_bits` が覆う himo の数 (これ以上の himo は表をなめて引く)。
+const PK_HIMO_BITS: usize = 2048;
+
+/// 主キーの前の名前の sidecar path (`pkformer`、 中身は `pk_former.rs`)。 不在 = 改名なし。
+#[cfg(not(target_arch = "wasm32"))]
+fn pkformer_path_for(path: &str) -> std::path::PathBuf {
+    crate::db_files::path_for(path, crate::db_files::PKFORMER)
+}
+
+/// 主キーの前の名前を sidecar に atomic 書き換え。 無ければ file を消す。
+#[cfg(not(target_arch = "wasm32"))]
+fn persist_pkformer_to_sidecar(db_path: &str, former: &crate::pk_former::PkFormer) -> io::Result<()> {
+    let p = pkformer_path_for(db_path);
+    if former.is_empty() {
+        return match std::fs::remove_file(&p) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
+    crate::db_files::write_atomic_if_changed(&p, &former.serialize()).map(|_| ())
+}
+
+/// 主キーの前の名前の sidecar を読む。 不在なら Ok(None)。
+#[cfg(not(target_arch = "wasm32"))]
+fn load_pkformer_from_sidecar(db_path: &str) -> io::Result<Option<crate::pk_former::PkFormer>> {
+    enchudb_oplog::io_point("sidecar.read_pkformer")?;
+    match std::fs::read(pkformer_path_for(db_path)) {
+        Ok(buf) => crate::pk_former::PkFormer::deserialize(&buf)
+            .map(Some)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// #513: `pktombs` を読む。 不在なら Ok(None)。 2 つ目は切れた末尾を捨てたか。
@@ -1677,6 +1713,84 @@ mod wal_room_commit_tests {
         assert_eq!(eng.wal_dropped_records(), 0, "bridge の lock が取れなかった試しで、 待っている書き手が諦めた");
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
+    }
+}
+
+/// test 用の割り込み点: consumer が 「WAL は空」 と見て起こされるまで寝ると決めた後、 寝る印を立てる前。 書き手がその間に
+/// append する形 (書き手の `wake_if_deep` は印を見ずに素通りする) を作るため (#555)。 使い方は `room_fold_hook` と同じ。
+#[cfg(test)]
+mod consumer_sleep_hook {
+    use enchudb_oplog::oplog::OpLog;
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn FnOnce(&OpLog) + Send>;
+    static HOOK: Mutex<Option<(usize, Hook)>> = Mutex::new(None);
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        *HOOK.lock().unwrap_or_else(|p| p.into_inner()) = Some((wal as *const OpLog as usize, Box::new(f)));
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        let me = wal as *const OpLog as usize;
+        let hit = {
+            let mut h = HOOK.lock().unwrap_or_else(|p| p.into_inner());
+            if h.as_ref().is_some_and(|(at, _)| *at == me) { h.take() } else { None }
+        };
+        if let Some((_, f)) = hit {
+            f(wal);
+        }
+    }
+}
+
+/// consumer の起こし忘れ (#555): 「WAL は空」 と見てから寝る印を立てるまでの間に書かれた record。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod consumer_sleep_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// 割り込み点で consumer を止め、 その間に別の thread が書く (その `wake_if_deep` は consumer がまだ起きているので起こさない)。
+    /// consumer は寝る前に WAL を見直し、 書かれた record を書き出して畳む (前の形は起こされるまで寝て、 次の append / 閉じる時まで
+    /// record を fsync も配信もしなかった)。
+    #[test]
+    fn record_written_while_the_consumer_decides_to_sleep_is_written_out() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-consumersleep-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_standalone(&path).unwrap();
+        eng.define_himo("v", ValueType::Number, 0);
+        let e = eng.entity().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 4 << 20).unwrap();
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let empty = enchudb_oplog::oplog::HEADER_SIZE as u64;
+        let drained = |w: &enchudb_oplog::oplog::OpLog| w.head() == empty && w.checkpoint() == empty;
+
+        let (at_window, consumer_waits) = mpsc::channel::<()>();
+        let (go, resume) = mpsc::channel::<()>();
+        consumer_sleep_hook::set(&wal, move |_| {
+            let _ = at_window.send(());
+            let _ = resume.recv_timeout(Duration::from_secs(10));
+        });
+        // 1 回書いて consumer を回す (寝ていれば起こす): 書き出して畳み、 空の WAL を見て深く寝る所で割り込み点を通る。
+        // consumer が先に割り込み点に来ていれば、 この書き込みも窓の中
+        eng.tie_to(e, "v", 1u32);
+        consumer_waits.recv_timeout(Duration::from_secs(10)).expect("前提: consumer が空の WAL を見て寝る所まで来た");
+        eng.tie_to(e, "v", 2u32);
+        assert!(wal.head() > empty, "前提: 割り込み点の間に WAL に書いた");
+        go.send(()).unwrap();
+
+        let end = Instant::now() + Duration::from_secs(3);
+        while !drained(&wal) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            drained(&wal),
+            "寝る前に書かれた record を consumer が書き出さない (head {} checkpoint {})",
+            wal.head(),
+            wal.checkpoint()
+        );
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
     }
 }
 
@@ -4000,8 +4114,8 @@ pub struct Engine {
     wal_room_folds: std::sync::atomic::AtomicU64,
     /// #391: consumer の loop が回った回数 (起きた回数、 観測用)。
     consumer_wakeups: std::sync::atomic::AtomicU64,
-    /// #388: consumer が書き出し + 畳みを試し終えた回数 (待ち手は、 待ち始めた後の 1 回で空かなければ諦める)。
-    wal_room_attempts: std::sync::atomic::AtomicU64,
+    /// #388: consumer が書き出し + 畳みを試して、 畳めない状態だった回数 (待ち手は、 待ち始めた後にこれが 1 回あれば諦める)。
+    wal_room_blocked: std::sync::atomic::AtomicU64,
     /// #388: `make_wal_room` の最中 (中の Commit marker が満杯で待ち手に入った時に、 もう一度入らない)。
     wal_room_busy: std::sync::atomic::AtomicBool,
     /// #388: 最後に畳めなかった時刻。 畳めない間 (sync の bridge が遅れている等) に毎回 fsync しないよう 10 ms 空ける。
@@ -4049,6 +4163,16 @@ pub struct Engine {
     pk_tombs_empty: std::sync::atomic::AtomicBool,
     /// #513: `pk_tombs` を最後に書き出した後に変えたか (`pktombs` を変わった時だけ書く)。
     pk_tombs_dirty: std::sync::atomic::AtomicBool,
+    /// 主キーの前の名前 (改名の前の値の鍵 → その行の slot、 `pk_former.rs`)。 束ねは、 今その名前の行が無ければ、 前に
+    /// その名前だった行に束ねる (届く順で答えを変えない)。
+    pk_former: std::sync::RwLock<crate::pk_former::PkFormer>,
+    /// `pk_former` が空か (常態で lock を取らない)。 空でなくなったら戻さない。
+    pk_former_empty: std::sync::atomic::AtomicBool,
+    /// `pk_former` を最後に書き出した後に変えたか (`pkformer` を変わった時だけ書く)。
+    pk_former_dirty: std::sync::atomic::AtomicBool,
+    /// 主キーを覚える表 (`pk_tombs_on` と同じ: `_` で始まらない) の主キーの himo の bit (himo 0..PK_HIMO_BITS)。 書き込みの道で
+    /// 「この列は主キーか」 を表をなめずに引く (なめると書き込み 1 回が 22 → 27 ns)。 `refresh_pk_tombs_flag` で引き直す
+    pk_himo_bits: [std::sync::atomic::AtomicU64; PK_HIMO_BITS / 64],
     /// #513: 主キーを覚える DB か (sync の表があり、 `_` で始まらない表に主キーがある)。 削除の道で、 主キーのある表の無い DB
     /// が、 行の表を探さずに抜けるため (探すと主キーの無い表の削除が 2% ほど遅くなった)。 `refresh_sync_tables_flag` と
     /// `set_table_pk` で引き直す。
@@ -4536,7 +4660,7 @@ impl Engine {
             wal_room_wanted: std::sync::atomic::AtomicBool::new(false),
             consumer_thread: std::sync::OnceLock::new(),
             wal_room_folds: std::sync::atomic::AtomicU64::new(0),
-            wal_room_attempts: std::sync::atomic::AtomicU64::new(0),
+            wal_room_blocked: std::sync::atomic::AtomicU64::new(0),
             consumer_wakeups: std::sync::atomic::AtomicU64::new(0),
             wal_room_busy: std::sync::atomic::AtomicBool::new(false),
             wal_room_failed_at: std::sync::Mutex::new(None),
@@ -4552,6 +4676,10 @@ impl Engine {
             pk_tombs: std::sync::RwLock::new(crate::pk_tombs::PkTombs::default()),
             pk_tombs_empty: std::sync::atomic::AtomicBool::new(true),
             pk_tombs_dirty: std::sync::atomic::AtomicBool::new(false),
+            pk_former: std::sync::RwLock::new(crate::pk_former::PkFormer::default()),
+            pk_former_empty: std::sync::atomic::AtomicBool::new(true),
+            pk_former_dirty: std::sync::atomic::AtomicBool::new(false),
+            pk_himo_bits: Default::default(),
             pk_tombs_on: std::sync::atomic::AtomicBool::new(false),
             pk_pending: parking_lot::Mutex::new(Vec::new()),
             pk_pending_nonempty: std::sync::atomic::AtomicBool::new(false),
@@ -4994,6 +5122,20 @@ impl Engine {
                 eprintln!("warning: failed to read eidalias sidecar (aliases dropped): {e}")
             }
             Err(e) => return Err(eng.abandon_open("eidalias", e)),
+        }
+        // 主キーの前の名前。 壊れていたら警告して無しで続ける (今の名前でだけ束ねる = 前の版の動き)
+        match load_pkformer_from_sidecar(path) {
+            Ok(Some(former)) => {
+                if !former.is_empty() {
+                    eng.pk_former_empty.store(false, std::sync::atomic::Ordering::Release);
+                }
+                *eng.pk_former.write().unwrap() = former;
+            }
+            Ok(None) => {}
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                eprintln!("warning: failed to read pkformer sidecar (former primary keys dropped): {e}")
+            }
+            Err(e) => return Err(eng.abandon_open("pkformer", e)),
         }
 
         // #513: 消した主キーの記録。 不在なら空で続行。 壊れていたら警告して空で続ける (それより前に消した主キーの行が、
@@ -5752,7 +5894,7 @@ impl Engine {
             wal_room_wanted: std::sync::atomic::AtomicBool::new(false),
             consumer_thread: std::sync::OnceLock::new(),
             wal_room_folds: std::sync::atomic::AtomicU64::new(0),
-            wal_room_attempts: std::sync::atomic::AtomicU64::new(0),
+            wal_room_blocked: std::sync::atomic::AtomicU64::new(0),
             consumer_wakeups: std::sync::atomic::AtomicU64::new(0),
             wal_room_busy: std::sync::atomic::AtomicBool::new(false),
             wal_room_failed_at: std::sync::Mutex::new(None),
@@ -5768,6 +5910,10 @@ impl Engine {
             pk_tombs: std::sync::RwLock::new(crate::pk_tombs::PkTombs::default()),
             pk_tombs_empty: std::sync::atomic::AtomicBool::new(true),
             pk_tombs_dirty: std::sync::atomic::AtomicBool::new(false),
+            pk_former: std::sync::RwLock::new(crate::pk_former::PkFormer::default()),
+            pk_former_empty: std::sync::atomic::AtomicBool::new(true),
+            pk_former_dirty: std::sync::atomic::AtomicBool::new(false),
+            pk_himo_bits: Default::default(),
             pk_tombs_on: std::sync::atomic::AtomicBool::new(false),
             pk_pending: parking_lot::Mutex::new(Vec::new()),
             pk_pending_nonempty: std::sync::atomic::AtomicBool::new(false),
@@ -6065,9 +6211,33 @@ impl Engine {
 
     /// #513: `pk_tombs_on` を引き直す。
     fn refresh_pk_tombs_flag(&self) {
+        use std::sync::atomic::Ordering;
         let on = self.sync_tables_enabled()
             && self.tables.iter().any(|t| t.pk_himo.is_some() && !t.name.starts_with('_'));
-        self.pk_tombs_on.store(on, std::sync::atomic::Ordering::Relaxed);
+        self.pk_tombs_on.store(on, Ordering::Relaxed);
+        for w in &self.pk_himo_bits {
+            w.store(0, Ordering::Relaxed);
+        }
+        if !on {
+            return;
+        }
+        for h in self.tables.iter().filter(|t| !t.name.starts_with('_')).filter_map(|t| t.pk_himo) {
+            if let Some(w) = self.pk_himo_bits.get(h as usize / 64) {
+                w.fetch_or(1 << (h % 64), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// himo `h` が主キーを覚える表の主キーで、 主キーを覚える DB (`pk_tombs_on`) か (`pk_himo_bits`、 覆わない himo は表をなめる)。
+    #[inline(always)]
+    fn is_remembered_pk_himo(&self, h: u16) -> bool {
+        match self.pk_himo_bits.get(h as usize / 64) {
+            Some(w) => w.load(std::sync::atomic::Ordering::Relaxed) >> (h % 64) & 1 == 1,
+            None => {
+                self.pk_tombs_on.load(std::sync::atomic::Ordering::Relaxed)
+                    && self.tables.iter().any(|t| t.pk_himo == Some(h) && !t.name.starts_with('_'))
+            }
+        }
     }
 
     /// 0.7.0 (Phase 4): oplog の `sync_ops_offset` 以降の record を `_sync_ops`
@@ -8551,7 +8721,22 @@ impl Engine {
         persist_eidalias_to_sidecar(&self.path, &self.eid_translator.alias_snapshot())?;
         // #513: 消した主キーの記録も (受け取った削除の分は、 pull の cursor を進める前に固まる)
         self.persist_pk_tombs_if_dirty()?;
+        self.persist_pk_former_if_dirty()?;
         self.persist_vocab_map_if_dirty()
+    }
+
+    /// 主キーの前の名前を、 変わっていれば書き出す。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn persist_pk_former_if_dirty(&self) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        if !self.pk_former_dirty.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let r = persist_pkformer_to_sidecar(&self.path, &self.pk_former.read().unwrap());
+        if r.is_err() {
+            self.pk_former_dirty.store(true, Ordering::Release);
+        }
+        r
     }
 
     /// **sync 由来 state の durability barrier**。
@@ -8689,6 +8874,10 @@ impl Engine {
                 }
                 // #513: 消した主キーの記録も。 変わった時だけ書く。
                 if let Err(e) = self.persist_pk_tombs_if_dirty() {
+                    self.warn_persist_failure_rate_limited(&e);
+                }
+                // 主キーの前の名前も
+                if let Err(e) = self.persist_pk_former_if_dirty() {
                     self.warn_persist_failure_rate_limited(&e);
                 }
                 // text 写像も同格。 dirty のときだけ書く。
@@ -9028,7 +9217,8 @@ impl Engine {
     /// - 2 つが別の行に当たれば畳む ([`Engine::merge_entity_into`])。 残すのは自分が産んだ行 (どちらも翻訳した行なら
     ///   `same_as` の行)。 どちらも自分が産んだ行なら畳めない (false)
     /// - 片方だけが行に当たれば、 もう片方 (相手の世界番号) をその行の別名にする (以後その世界番号宛ての record がその行に
-    ///   当たる)
+    ///   当たる)。 その世界番号宛ての Delete を作成より先に受けて退避表に載せていたなら、 行にその削除を当てる
+    ///   ([`Engine::bind_remote_eid`] と同じ)
     /// - 同じ行 / どちらも行が無い時は何もしない (どちらも無い時、 後から届いた 2 つの世界番号は別の行になりうる。 主キーの
     ///   ある表なら主キーで束ねる)
     pub fn apply_alias(&self, eid: enchudb_oplog::EntityId, same_as: enchudb_oplog::EntityId) -> bool {
@@ -9044,7 +9234,14 @@ impl Engine {
             if enchudb_oplog::eid_peer(w) == self_peer {
                 return false; // 自分の世界番号は写像を持たない (行が無いなら、 消した後)
             }
-            self.eid_translator.alias(enchudb_oplog::eid_peer(w), enchudb_oplog::eid_local(w), local);
+            let (peer, foreign_local) = (enchudb_oplog::eid_peer(w), enchudb_oplog::eid_local(w));
+            self.eid_translator.alias(peer, foreign_local, local);
+            // #546: 以後この世界番号の record は写像の速い道で解決され、 作成の時に退避表を見る道 (払い出し / 束ね) を通らない。
+            // 先に届いた削除をここで当てる (当てないと、 知らせが作成より先に届いた peer でだけ行が残る)。 主キーの削除の記録も
+            // `apply_delete_local` がする
+            if let Some(tomb) = self.foreign_tombstone_of(peer, foreign_local) {
+                self.apply_delete_local(local, tomb);
+            }
             true
         };
         match (local_of(eid), local_of(same_as)) {
@@ -10405,6 +10602,7 @@ impl Engine {
         if !self.accepts_write(local, himo_id, hlc) {
             return false;
         }
+        let renamed_from = self.pk_rename_from(local, himo_id, value);
         // #316: 列を伸ばせず書けなかったら版数も記録しない (記録すると、 値の無い cell が
         // 「適用済み」 に見え、 同じ record の再配送も LWW で負ける)
         if !self.live_set(himo_id as usize, local, value) {
@@ -10412,7 +10610,72 @@ impl Engine {
             return false;
         }
         self.store_cell_hlc(local, himo_id, hlc);
+        if let Some(old) = renamed_from {
+            self.note_pk_former(local, himo_id, old);
+        }
         true
+    }
+
+    /// 行 `local` の主キーの cell を `value` に書き換える時の、 今の値 (改名でなければ None)。 呼び手は行の lock を握っている。
+    /// 主キーを覚える DB (`pk_tombs_on`) の主キーの列だけを見る (他の書き込みは bit 1 つ)。 列は表に属するので、 主キーの
+    /// 列への書き込みはその表の行 (`validate_eid_for_himo`)。
+    #[inline(always)]
+    fn pk_rename_from(&self, local: u32, himo_id: u16, value: u64) -> Option<u64> {
+        if !self.is_remembered_pk_himo(himo_id) {
+            return None;
+        }
+        self.himos.get(himo_id as usize)?.get_value(local).filter(|&old| old != value)
+    }
+
+    /// 行 `local` の主キーが `old` から変わった: `old` を前の名前として覚える (`pk_former.rs`)。
+    #[cold]
+    fn note_pk_former(&self, local: u32, himo: u16, old: u64) {
+        use std::sync::atomic::Ordering;
+        let changed = self.with_pk_key(himo, PkValue::Local(old), |k| self.pk_former.write().unwrap().insert(himo, k, local));
+        if changed == Some(true) {
+            self.pk_former_empty.store(false, Ordering::Release);
+            self.pk_former_dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// 前に主キー `value` だった行 (今は別の名前。 PK_IDENTITY_PLAN 11-1)。 sync の束ねが、 今その名前の行が無い時に引く。
+    /// 消えた行も返す (slot を使い回すまで記録は残る)。 束ねると行は生き返り、 削除より古い書き込みは slot の削除の版数で弾かれる
+    /// (改名して消した行に、 改名を知らずに古い名前で後から作った行を、 届く順によらず同じ行にする)
+    pub fn former_pk_holder(&self, himo: u16, value: PkValue<'_>) -> Option<enchudb_oplog::EntityId> {
+        if self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        let slot = self.with_pk_key(himo, value, |k| self.pk_former.read().unwrap().slot_of(himo, k))??;
+        let self_peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
+        Some(enchudb_oplog::make_eid(self_peer, slot))
+    }
+
+    /// sync の当て: 行 `eid` の主キーが `value` になった時、 同じ主キーの別の生きた行を 1 つに畳む (主キーが同じなら同じ行)。
+    /// 畳むのは翻訳した行 (自分が産んだ行は畳めない、 `merge_entity_into`)。 戻り値は畳んだ行の数。
+    pub fn fold_rows_with_same_pk(&self, eid: enchudb_oplog::EntityId, himo: u16, value: u64) -> usize {
+        if !self.pk_tombs_on.load(std::sync::atomic::Ordering::Relaxed) {
+            return 0;
+        }
+        let mut keep = eid;
+        let mut folded = 0;
+        for other in self.query_by_id64(&[(himo, value)]) {
+            if enchudb_oplog::eid_local(other) == enchudb_oplog::eid_local(keep) {
+                continue;
+            }
+            let translated = |e: enchudb_oplog::EntityId| self.eid_translator.reverse(enchudb_oplog::eid_local(e)).is_some();
+            let (src, dst) = if translated(other) {
+                (other, keep)
+            } else if translated(keep) {
+                (keep, other)
+            } else {
+                continue;
+            };
+            if self.merge_entity_into(src, dst).is_ok() {
+                folded += 1;
+                keep = dst;
+            }
+        }
+        folded
     }
 
     /// `set_cell` の untie 版 — cell を空にして版数を進める。 untie も
@@ -10499,6 +10762,9 @@ impl Engine {
         self.evict_translation_for_reuse(local);
         // #513: slot ごとの主キーの記録も外す (主キーごとの削除の版数は slot に載っていないので残る)
         self.forget_pk_slot(local);
+        if !self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) && self.pk_former.write().unwrap().forget_slot(local) {
+            self.pk_former_dirty.store(true, std::sync::atomic::Ordering::Release);
+        }
         if local >= self.max_entities() {
             return;
         }
@@ -16626,12 +16892,18 @@ impl Engine {
                     // #391: 仕事が無い間は寝て、 WAL に書いた / 閉じる / WAL の空きを待つ書き手が居る時に起こされる
                     // (旧: 1 ms ごとに起きて見回り = 何もしない DB 1 つで 1 秒 500 回)。
                     // 時間で起きるのは、 書き出し (100 ms ごと) や畳みがまだ残っている間だけ
+                    let wal_behind = |wal: &enchudb_oplog::oplog::OpLog| {
+                        wal.head() > wal.checkpoint() || wal.head() > enchudb_oplog::oplog::HEADER_SIZE as u64
+                    };
+                    // 空と見た WAL (寝る印を立てた後にもう一度見る)
+                    let mut idle_wal = None;
                     let timeout = match oplog_for_thread.as_ref() {
                         None => None,
                         Some(wal) => {
-                            let behind = wal.head() > wal.checkpoint()
-                                || wal.head() > enchudb_oplog::oplog::HEADER_SIZE as u64
-                                || engine.wal_room_wanted.load(Ordering::Acquire);
+                            let behind = wal_behind(wal) || engine.wal_room_wanted.load(Ordering::Acquire);
+                            if !behind {
+                                idle_wal = Some(wal);
+                            }
                             if behind {
                                 Some(fsync_interval.saturating_sub(last_fsync.elapsed()).max(Duration::from_millis(1)))
                             } else if engine.sync_tables_enabled() {
@@ -16643,8 +16915,18 @@ impl Engine {
                             }
                         }
                     };
+                    #[cfg(test)]
+                    if timeout.is_none()
+                        && let Some(wal) = idle_wal
+                    {
+                        consumer_sleep_hook::call(wal);
+                    }
                     waker.sleep(timeout, || {
-                        !flag_for_thread.load(Ordering::Acquire) && !engine.wal_room_wanted.load(Ordering::Acquire)
+                        !flag_for_thread.load(Ordering::Acquire)
+                            && !engine.wal_room_wanted.load(Ordering::Acquire)
+                            // #555: 空と見てから印を立てるまでに書かれた record を見落とさない (その書き手の `wake_if_deep` は
+                            // 印を見ずに素通りした)。 書き出しを待つ短い眠り (WAL が空でない時) は見直さない (毎 append で戻ってしまう)
+                            && !idle_wal.is_some_and(|wal| wal_behind(wal))
                     });
                 }
             })
@@ -16695,8 +16977,9 @@ impl Engine {
     /// sync の bridge / changefeed の listener が居る DB は、 書き出した後に配り終えてから畳む (配る前に畳むと record が
     /// 消える)。 配る間に次の record が入れば畳めない — その時は今までどおり満杯で落ちうる (#57 の floor で bootstrap)。
     ///
-    /// 試しの数 (`wal_room_attempts`、 待つ書き手が 「頼んだ後に 1 回試して空かなかった」 を見る) は、 畳んだ時と畳めない状態
-    /// だった時だけ数える (#512: 試している間に書き手が積み続けて畳めなかった試しで、 待つ書き手に諦めさせない)。
+    /// 畳めない状態だった試しを数える (`wal_room_blocked`、 待つ書き手が 「頼んだ後に試して畳めなかった」 を見る)。 畳んだ試しは
+    /// 数えない (#552: 畳んだ空きを他の書き手が先に埋めても、 次の畳みを待てばよい。 前は数え、 2 回畳む間に空きを取れなかった
+    /// 書き手を残り時間があるのに諦めさせた)。 試している間に書き手が積み続けて畳めなかった試しも数えない (#512)。
     fn make_wal_room(&self, wal: &std::sync::Arc<enchudb_oplog::oplog::OpLog>) -> WalRoom {
         use std::sync::atomic::Ordering;
         if self.wal_room_busy.swap(true, Ordering::AcqRel) {
@@ -16704,8 +16987,8 @@ impl Engine {
         }
         let room = self.make_wal_room_inner(wal);
         self.wal_room_busy.store(false, Ordering::Release);
-        if room != WalRoom::Transient {
-            self.wal_room_attempts.fetch_add(1, Ordering::AcqRel);
+        if room == WalRoom::Blocked {
+            self.wal_room_blocked.fetch_add(1, Ordering::AcqRel);
         }
         if room == WalRoom::Folded {
             self.wal_room_folds.fetch_add(1, Ordering::Relaxed);
@@ -16810,13 +17093,13 @@ impl Engine {
         if closed || appended_after { WalRoom::Transient } else { WalRoom::Blocked }
     }
 
-    /// #388: WAL が満杯で載らなかった書き手の待ち手 (`OpLog::set_room_waiter`)。 空いたら true (書き手は書き直す)、
-    /// 空かなければ false (今までどおり落ちる)。
+    /// #388: WAL が満杯で載らなかった書き手の待ち手 (`OpLog::set_room_waiter`)。 空いたら true (書き手は書き直し、 その間に
+    /// 他の書き手が空きを埋めていればまた待つ)、 空かなければ false (今までどおり落ちる)。
     ///
     /// - consumer 自身 (tick の Commit など): その場で畳む
-    /// - 他の thread: consumer に畳むよう頼み、 `size` byte 空くまで待つ。 待ち始めた後に consumer が 1 回試して空かな
-    ///   ければ (sync の bridge が配り終えていない等で畳めない。 試している間に書き手が積み続けて畳めなかった試しは数えない、
-    ///   #512) すぐ諦める。 上限 `WAL_ROOM_WAIT`、 閉じている最中は待たない
+    /// - 他の thread: consumer に畳むよう頼み、 `size` byte 空くまで待つ。 待ち始めた後に consumer が試して畳めない状態
+    ///   だったら (sync の bridge が配り終えていない等。 畳んだ空きを他の書き手が先に埋めた試し (#552) と、 試している間に
+    ///   書き手が積み続けて畳めなかった試し (#512) は数えない) すぐ諦める。 上限 `WAL_ROOM_WAIT`、 閉じている最中は待たない
     #[cfg(not(target_arch = "wasm32"))]
     fn wait_for_wal_room(&self, size: u64) -> bool {
         use std::sync::atomic::Ordering;
@@ -16825,9 +17108,9 @@ impl Engine {
             self.make_wal_room_paced(wal);
             return wal.free_bytes() >= size;
         }
-        let first_attempt = self.wal_room_attempts.load(Ordering::Acquire) + 1;
+        let first_blocked = self.wal_room_blocked.load(Ordering::Acquire) + 1;
         // 頼んだ時に試している最中の 1 回は頼みを見ていないかもしれないので、 その次の 1 回まで待つ
-        let tried = || self.wal_room_attempts.load(Ordering::Acquire) > first_attempt;
+        let blocked = || self.wal_room_blocked.load(Ordering::Acquire) > first_blocked;
         let stopping = || {
             self.shutdown_flag.as_ref().is_some_and(|f| f.load(Ordering::Acquire))
                 || self.consumer_poisoned.load(Ordering::Acquire)
@@ -16838,7 +17121,7 @@ impl Engine {
                 return true;
             }
             // 今は畳めないと分かっている (直前に consumer が試して空かなかった) なら待たない
-            if stopping() || tried() || self.wal_room_failed_recently() {
+            if stopping() || blocked() || self.wal_room_failed_recently() {
                 return wal.free_bytes() >= size;
             }
             self.wal_room_wanted.store(true, Ordering::Release);
@@ -17165,6 +17448,13 @@ impl Engine {
             let pk_tombs = self.pk_tombs.read().unwrap();
             if !pk_tombs.is_empty() {
                 std::fs::write(pktombs_path_for(target), pk_tombs.snapshot().0)?;
+            }
+        }
+        // 主キーの前の名前も (無いと、 restore した DB で、 改名を知らない peer の古い名前の行が改名した行に束ならない)
+        {
+            let former = self.pk_former.read().unwrap();
+            if !former.is_empty() {
+                std::fs::write(pkformer_path_for(target), former.serialize())?;
             }
         }
         // manifest が無いと snapshot だけ 「切り詰め検出の効かない DB」 になる。 複製は
