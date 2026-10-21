@@ -45,9 +45,14 @@ fn small_engine(path: &str, wal_bytes: usize) -> Arc<Engine> {
     eng
 }
 
-/// Record サイズの前提（v2 layout）: Tie = 112 + 16 = 128、 Commit = 112、
-/// TieLeaf = 112 + 16 + name + bytes。 前提が変わったら本テストの操縦計算も
-/// 崩れるので、 まず実測でズレを検出する。
+/// Record サイズの前提 (oplog file v3、 #608): Tie = 112 + 16 + 8 (周の印) = 136、 Commit = 112 + 8 = 120、
+/// TieLeaf = 112 + 16 + name + bytes + 8。 前提が変わったら本テストの操縦計算も崩れるので、 まず実測でズレを検出する
+/// (`OpLog::record_size_of` と `free_bytes` の減りが合うことも)。
+const TIE: u64 = 112 + 16 + 8;
+const COMMIT: u64 = 112 + 8;
+/// TieLeaf の固定部 (name = "notes.blob" の 10 byte 込み)。
+const LEAF_BASE: u64 = 112 + 16 + 10 + 8;
+
 #[test]
 fn record_size_assumptions() {
     let path = tmp_path("sizes");
@@ -60,10 +65,12 @@ fn record_size_assumptions() {
     let f0 = wal.free_bytes();
     wal.append(Op::Tie { eid: e, himo_id: note_hid, value: 1 }).unwrap();
     let f1 = wal.free_bytes();
-    assert_eq!(f0 - f1, 128, "Tie record サイズが前提とズレた");
+    assert_eq!(f0 - f1, TIE, "Tie record サイズが前提とズレた");
+    assert_eq!(wal.record_size_of(16) as u64, TIE);
     wal.append(Op::Commit).unwrap();
     let f2 = wal.free_bytes();
-    assert_eq!(f1 - f2, 112, "Commit record サイズが前提とズレた");
+    assert_eq!(f1 - f2, COMMIT, "Commit record サイズが前提とズレた");
+    assert_eq!(wal.record_size_of(0) as u64, COMMIT);
     wal.append(Op::TieLeaf {
         eid: e,
         himo_name: "notes.blob",
@@ -72,7 +79,7 @@ fn record_size_assumptions() {
     })
     .unwrap();
     let f3 = wal.free_bytes();
-    assert_eq!(f2 - f3, 112 + 16 + 10 + 10, "TieLeaf record サイズが前提とズレた");
+    assert_eq!(f2 - f3, LEAF_BASE + 10, "TieLeaf record サイズが前提とズレた");
 
     cleanup(&path);
 }
@@ -91,10 +98,10 @@ fn wal_full_mid_group_folds_after_bridge_drains() {
     // ack しないので ring の生存 row は単調増加し、 いずれ transfer が読み残す
     // （= wal_fold_safe が false のまま）= ring 満杯、 でループを抜ける。
     // 充填は「Phase 2 が未 commit tail を作れる余白 (400B)」を必ず残して止める —
-    // 使い切ると jam 成立時に free < 138 で孤児 record すら書けない周回がありうる。
+    // 使い切ると jam 成立時に free < LEAF_BASE で孤児 record すら書けない周回がありうる。
     let mut v = 0u32;
     loop {
-        while wal.free_bytes() >= 240 + 400 {
+        while wal.free_bytes() >= TIE + COMMIT + 400 {
             wal.append(Op::Tie { eid: e, himo_id: note_hid, value: v as u64 }).unwrap();
             wal.append(Op::Commit).unwrap();
             v += 1;
@@ -114,15 +121,15 @@ fn wal_full_mid_group_folds_after_bridge_drains() {
     // ── Phase 2: 未 commit の tail を作り、 WAL を append_dead まで正確に埋める。 今の append は閉じの Commit の分の空きを (#511)
     // 残すので、 この死区間は普通の書き込みでは作れない。 前の版の binary が書いた WAL と同じく、 残さない形にして作る
     wal.keep_commit_room_for_test(false);
-    // Tie (128B) を Commit 無しで積み、 最後は TieLeaf の可変 payload で残りを
-    // 112 バイト未満（= Commit も入らない）へ落とす。 閉じの Commit は満杯で
-    // 失敗する = 孤児 group 確定。
-    while wal.free_bytes() >= 128 + 168 {
+    // Tie (136B) を Commit 無しで積み、 最後は TieLeaf の可変 payload で残りを
+    // Commit (120 B) 未満（= Commit も入らない）へ落とす。 閉じの Commit は満杯で
+    // 失敗する = 孤児 group 確定。 残り free ∈ [176, 312): pad = free − 206 なら残りは 60、 pad が 0 なら残りは free − 146 < 120
+    while wal.free_bytes() >= TIE + 176 {
         wal.append(Op::Tie { eid: e, himo_id: note_hid, value: v as u64 }).unwrap();
         v += 1;
     }
-    let free = wal.free_bytes(); // ∈ [168, 296)
-    let pad = vec![0u8; free.saturating_sub(194) as usize];
+    let free = wal.free_bytes(); // ∈ [176, 312)
+    let pad = vec![0u8; free.saturating_sub(LEAF_BASE + 60) as usize];
     wal.append(Op::TieLeaf {
         eid: e,
         himo_name: "notes.blob",

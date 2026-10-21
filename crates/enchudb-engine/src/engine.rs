@@ -83,6 +83,28 @@ struct ChangeCursor {
     committed: Vec<crate::transport::WireRecord>,
     /// 畳む時に Commit で閉じていなかった末尾の record。 その group が閉じたら (cursor の先に Commit が来たら)、 頭として渡す。
     open_tail: Vec<crate::transport::WireRecord>,
+    /// #560: `committed` と `open_tail` の大きさの見積もり (byte、 [`change_record_bytes`])。 上限を越えたら溜めを捨てて
+    /// listener を外す。
+    bytes: usize,
+    /// #560: 溜めの上限を越えて外した listener (通知係が `on_detached` を呼ぶまで置く) と、 渡せなかった最初の record の HLC。
+    detached: Vec<std::sync::Arc<dyn crate::changefeed::ChangeListener>>,
+    lost_from: Option<enchudb_oplog::Hlc>,
+    /// 記録 (`changefeed.seg`) の無い時に渡した record の数 (process の中だけの番号、 `on_changes_at` に渡す)。
+    seq: u64,
+    /// 記録がある時: 記録に写し終えた WAL の offset。
+    log_wal: u64,
+    /// 記録がある時の listener ごとの位置 (次に渡す記録の番号)。
+    readers: Vec<(std::sync::Arc<dyn crate::changefeed::ChangeListener>, u64)>,
+    /// 記録が位置を越えて捨てたので外した listener と、 渡せなかった最初の record の HLC (通知係が `on_detached` を呼ぶ)。
+    log_detached: Vec<(std::sync::Arc<dyn crate::changefeed::ChangeListener>, enchudb_oplog::Hlc)>,
+}
+
+/// #560: 溜めの既定の上限 (byte)。 `Engine::set_change_backlog_limit` で変える。
+pub const DEFAULT_CHANGE_BACKLOG_LIMIT: usize = 64 << 20;
+
+/// #560: 溜めの 1 record の大きさの見積もり (構造体 + 署名した bytes)。
+fn change_record_bytes(r: &crate::transport::WireRecord) -> usize {
+    std::mem::size_of::<crate::transport::WireRecord>() + r.signed_bytes.len()
 }
 
 /// [`Engine::verify_invariants`] の答え。 `violations` が空なら不変量は全部成り立つ。 `warnings` は 「今の code では
@@ -171,10 +193,13 @@ pub enum FaultKind {
     /// #534: 列の segment を初めて開く I/O が失敗した (一時的な EIO / mmap の失敗など)。 書き込みは何も変えずに断り、
     /// 次に触った時にまた開いてみる
     SegmentIo,
+    /// #553 / #554: 書き込みが WAL に載らない (WAL より大きい record、 または sync の表の無い DB で満杯の WAL を畳めない)。
+    /// 本体にも当てずに断る
+    WalSpace,
 }
 
 impl FaultKind {
-    pub(crate) const COUNT: usize = 7;
+    pub(crate) const COUNT: usize = 8;
     pub(crate) fn index(self) -> usize {
         match self {
             FaultKind::EntitySpace => 0,
@@ -184,6 +209,7 @@ impl FaultKind {
             FaultKind::DiskSpace => 4,
             FaultKind::StaleValue => 5,
             FaultKind::SegmentIo => 6,
+            FaultKind::WalSpace => 7,
         }
     }
     pub fn as_str(self) -> &'static str {
@@ -195,6 +221,7 @@ impl FaultKind {
             FaultKind::DiskSpace => "filesystem is (nearly) full",
             FaultKind::StaleValue => "stale value id (reclaimed)",
             FaultKind::SegmentIo => "column segment could not be opened",
+            FaultKind::WalSpace => "the write does not fit in the oplog (WAL)",
         }
     }
 }
@@ -1572,6 +1599,28 @@ mod wal_hook {
     }
 }
 
+/// test 用: 置いた WAL の書き出し (`sync_for_checkpoint`) を失敗させる (#554: sync の表の無い DB で満杯の WAL を畳めない形)。
+#[cfg(test)]
+mod write_out_fault {
+    use enchudb_oplog::oplog::OpLog;
+    use std::sync::Mutex;
+
+    static ON: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    pub(super) fn set(wal: &OpLog, on: bool) {
+        let at = wal as *const OpLog as usize;
+        let mut v = ON.lock().unwrap_or_else(|p| p.into_inner());
+        v.retain(|w| *w != at);
+        if on {
+            v.push(at);
+        }
+    }
+
+    pub(super) fn active(wal: &OpLog) -> bool {
+        ON.lock().unwrap_or_else(|p| p.into_inner()).contains(&(wal as *const OpLog as usize))
+    }
+}
+
 /// test 用の割り込み点: ローカルの cell の書き込み (`try_tie_to_by_id`) が WAL に積んだ後、 cell に当てる前 (#563)。 同じ cell の
 /// 別の書き手をその間に走らせ、 WAL の順と当てる順がずれない (行を握ったまま積んで当てる、 #505) ことを決まって確かめるため。
 #[cfg(test)]
@@ -1850,6 +1899,58 @@ mod wal_room_commit_tests {
         assert_eq!(eng.wal_dropped_records(), 0, "bridge の lock が取れなかった試しで、 待っている書き手が諦めた");
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
+    }
+}
+
+/// #554: sync の表の無い DB で満杯の WAL を畳めない (書き出しが失敗する) 時、 書き込みは `Err` で断られ本体に当たらない。
+/// untie / delete も断られて何も変えない。 書き出せるようになれば書ける。 前は Ok を返して本体にだけ書き、 再起動の再生・
+/// change listener から抜けた (落ちたことを知る相手が居ない)。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod wal_reject_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn writes_that_cannot_reach_the_wal_are_rejected_without_sync_tables() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-walreject-{}-{nanos}.db", std::process::id());
+        let mut eng = Engine::create_standalone(&path).unwrap();
+        eng.define_table("t", 4_000).unwrap();
+        let v = eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap() as u16;
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 8 * 1024).unwrap();
+        assert!(!eng.sync_tables_enabled(), "前提: sync の表の無い DB");
+        let kept = eng.entity_in("t").unwrap();
+        eng.try_tie_to_by_id(kept, v, 1u32).unwrap();
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        write_out_fault::set(&wal, true);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let (e, r) = loop {
+            assert!(Instant::now() < deadline, "満杯にならない (free={} bytes)", wal.free_bytes());
+            let e = eng.entity_in("t").unwrap();
+            if let Err(r) = eng.try_tie_to_by_id(e, v, 7u32) {
+                break (e, r);
+            }
+        };
+        assert_eq!(r, TieRejected::Fault(FaultKind::WalSpace));
+        assert_eq!(eng.get_by_id(e, v), None, "WAL に載らなかった書き込みが本体に当たった");
+        assert_eq!(eng.wal_dropped_records(), 0, "断った書き込みを落ちた record に数えた");
+        let faults = eng.fault_count(FaultKind::WalSpace);
+        eng.untie_by_id(kept, v);
+        eng.delete(kept);
+        assert_eq!(eng.get_by_id(kept, v), Some(1), "WAL に載らなかった untie / delete が本体を変えた");
+        assert!(eng.fault_count(FaultKind::WalSpace) >= faults + 2, "untie / delete を断った数が増えない");
+        write_out_fault::set(&wal, false);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while eng.try_tie_to_by_id(e, v, 8u32).is_err() {
+            assert!(Instant::now() < deadline, "書き出せるようになっても書けない");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(eng.get_by_id(e, v), Some(8));
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
     }
 }
 
@@ -3034,6 +3135,8 @@ const FILE_MAGIC: [u8; 4] = *b"ECDB";
 /// 配り終えるまで畳めない時など)。
 #[cfg(not(target_arch = "wasm32"))]
 const WAL_ROOM_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// #560: `oplog_sync()` が、 配っている最中の listener (通知係が呼んでいる) を待つ上限。
+const LISTENER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// sync の DB で満杯の時に、 閉じの Commit を打ち直して畳み直す回数の上限 (`make_wal_room_inner`)。
 const WAL_ROOM_FOLD_ROUNDS: usize = 4;
@@ -4418,8 +4521,14 @@ pub struct Engine {
     /// 巻き戻す所をこの lock で直列にする (#337: 並走すると、 fold が巻き戻した cursor を配信が古い終端で上書きし、 新しい
     /// ring の record を飛ばした)。 listener の callback はこの lock の外で呼ぶ。
     change_emit: std::sync::Mutex<ChangeCursor>,
+    /// #560: 溜めの上限 (byte)。 畳む時に移す分で越えたら、 溜めを捨てて listener を全部外す
+    change_backlog_limit: std::sync::atomic::AtomicUsize,
+    /// #560: 溜めの上限を越えて外した listener の数 (累計)。
+    change_listeners_detached: std::sync::atomic::AtomicU64,
     /// 配信 (listener の callback) を 1 本ずつにする (`oplog_sync` と通知係が同時に配らない、 #337)。
-    change_deliver_lock: std::sync::Mutex<()>,
+    change_deliver_lock: parking_lot::Mutex<()>,
+    /// changefeed の記録 (`changefeed.seg`、 `enable_change_log` で作る / 在れば開く時に開く)。 在る時は listener に記録から渡す。
+    change_log: std::sync::OnceLock<crate::change_log::ChangeLog>,
     /// 通知係の thread。 WAL 付きの並行の形で listener が居る時だけ起こす。 Drop で止めて join する。
     notifier_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     /// 通知係を起こす係 (通知係を起こす時に作る)。
@@ -4906,8 +5015,18 @@ impl Engine {
                 offset: enchudb_oplog::oplog::HEADER_SIZE as u64,
                 committed: Vec::new(),
                 open_tail: Vec::new(),
+                bytes: 0,
+                detached: Vec::new(),
+                lost_from: None,
+                seq: 0,
+                log_wal: enchudb_oplog::oplog::HEADER_SIZE as u64,
+                readers: Vec::new(),
+                log_detached: Vec::new(),
             }),
-            change_deliver_lock: std::sync::Mutex::new(()),
+            change_backlog_limit: std::sync::atomic::AtomicUsize::new(DEFAULT_CHANGE_BACKLOG_LIMIT),
+            change_listeners_detached: std::sync::atomic::AtomicU64::new(0),
+            change_deliver_lock: parking_lot::Mutex::new(()),
+            change_log: std::sync::OnceLock::new(),
             notifier_handle: std::sync::Mutex::new(None),
             notifier_waker: std::sync::OnceLock::new(),
             notifier_pending: std::sync::atomic::AtomicBool::new(false),
@@ -6153,8 +6272,18 @@ impl Engine {
                 offset: enchudb_oplog::oplog::HEADER_SIZE as u64,
                 committed: Vec::new(),
                 open_tail: Vec::new(),
+                bytes: 0,
+                detached: Vec::new(),
+                lost_from: None,
+                seq: 0,
+                log_wal: enchudb_oplog::oplog::HEADER_SIZE as u64,
+                readers: Vec::new(),
+                log_detached: Vec::new(),
             }),
-            change_deliver_lock: std::sync::Mutex::new(()),
+            change_backlog_limit: std::sync::atomic::AtomicUsize::new(DEFAULT_CHANGE_BACKLOG_LIMIT),
+            change_listeners_detached: std::sync::atomic::AtomicU64::new(0),
+            change_deliver_lock: parking_lot::Mutex::new(()),
+            change_log: std::sync::OnceLock::new(),
             notifier_handle: std::sync::Mutex::new(None),
             notifier_waker: std::sync::OnceLock::new(),
             notifier_pending: std::sync::atomic::AtomicBool::new(false),
@@ -7222,7 +7351,7 @@ impl Engine {
     /// `append_commit_marker` の、 WAL が満杯で打てなかった時を数えるかを選べる版。 `count_full = false` は、 満杯なら
     /// 打たなくてよい Commit (畳む直前に開いている group を閉じる Commit、 `make_wal_room_inner`) のため: 満杯で落ちたのは
     /// 打たなかったのと同じで、 「打てなかった Commit」 にも警告にも入れない (満杯以外の失敗は数える)。 Commit は payload 0
-    /// = `REC_HEADER_SIZE` ちょうどなので、 容量 (`OutOfMemory`) で落ちた時は満杯 (`append_dead`) と同値。
+    /// = 最小の record (閉じの Commit の分の空き `commit_room` と同じ大きさ) なので、 容量 (`OutOfMemory`) で落ちた時は満杯 (`append_dead`) と同値。
     fn append_commit_marker_with(&self, wal: &enchudb_oplog::oplog::OpLog, count_full: bool) -> std::io::Result<()> {
         use std::sync::atomic::Ordering;
         match wal.append(enchudb_oplog::oplog::Op::Commit) {
@@ -7670,7 +7799,9 @@ impl Engine {
                 // `free_locals` を握ったまま (上の doc)。 #511
                 self.check_writable();
                 let row_local = enchudb_oplog::eid_local(eid);
-                let hlc = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: self.oplog_eid(row_local) });
+                let Ok(hlc) = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: self.oplog_eid(row_local) }) else {
+                    return false;
+                };
                 let mut list = free_list.lock().unwrap();
                 let row = self.row_for_wal(row_local);
                 let applied = self.apply_delete_in(row.as_ref(), row_local, hlc);
@@ -7681,7 +7812,9 @@ impl Engine {
                 list.push(local);
                 nonempty.store(true, std::sync::atomic::Ordering::Release);
             }
-            _ => self.delete(eid),
+            // `_sync_ops` の slot を引けない (表が無い / 枠の外) 行は purge しない (#561: 前は `delete` に落とし、 内部の行の lock を
+            // 握ったまま WAL の空きを待つ唯一の道だった。 引けない行は ring の行でないので、 free list にも戻せない)
+            _ => return false,
         }
         true
     }
@@ -9458,7 +9591,7 @@ impl Engine {
     /// #178: `Op::Alias` を自分の oplog に積んで閉じる (bridge が配る)。 WAL の無い DB では何もしない。
     fn emit_alias_record(&self, eid: enchudb_oplog::EntityId, same_as: enchudb_oplog::EntityId) {
         let Some(wal) = self.oplog.as_ref() else { return };
-        self.append_local_op(enchudb_oplog::oplog::Op::Alias { eid, same_as });
+        let _ = self.append_local_op(enchudb_oplog::oplog::Op::Alias { eid, same_as });
         let _ = self.append_commit_marker(wal);
     }
 
@@ -10214,26 +10347,46 @@ impl Engine {
     /// 後から当てた方が残る) では、 読める値と WAL の最後の record (開き直した後・change listener・相手に届く値) が食い違った (#503)。
     /// 版数を持つ DB では、 後から当てる古い方を 「時計が戻った」 と弾いていた (`warn_local_write_rejected`)。
     ///
-    /// oplog 無効は `Hlc::ZERO` = 版数不明。 載らなかった (WAL 満杯) 時は、 落ちた record として覚えた HLC (#57)。
+    /// oplog 無効は `Hlc::ZERO` = 版数不明。
+    ///
+    /// 載らなかった時 (#553 / #554): WAL より大きい record はどの DB でも、 sync の表の無い DB は満杯で畳めなかった時も
+    /// `Err` (呼び手は本体に当てずに断る。 落ちたことを知る相手が居ない = 再起動の再生・change listener から抜けるので)。
+    /// sync の表のある DB の満杯は今まで通り、 落ちた record として覚えた HLC (#57) で本体に書く (相手に floor で知らせて
+    /// 取り直させる)。
     #[inline]
-    fn append_local_op(&self, op: enchudb_oplog::oplog::Op<'_>) -> enchudb_oplog::Hlc {
+    fn append_local_op(&self, op: enchudb_oplog::oplog::Op<'_>) -> Result<enchudb_oplog::Hlc, TieRejected> {
         match self.oplog.as_ref() {
             // #57: 載らなかった (満杯) write にも版数を付ける (ZERO = 版数不明だと、 後から届く
             // 古い write に負ける)。 その HLC は WAL が落ちた record として覚えた値 (後で採番し直すと、
             // その間に bridge が floor を決めて版数が floor を越える)。 bridge が floor を上げる
-            Some(wal) => match wal.append_or_dropped(op) {
+            Some(wal) if self.sync_tables_on() => match wal.append_or_dropped(op) {
                 Ok((_, h)) => {
                     self.wal_append_recovered();
-                    h
+                    Ok(h)
                 }
+                Err((e, _)) if e.kind() == io::ErrorKind::InvalidInput => Err(self.wal_rejected(&e)),
                 Err((e, h)) => {
                     // #454: 同期の書き込みで落ちた record も数える
                     self.note_wal_records_dropped(1, &e);
-                    h
+                    Ok(h)
                 }
             },
-            None => enchudb_oplog::Hlc::ZERO,
+            Some(wal) => match wal.append_with_hlc(op) {
+                Ok((_, h)) => {
+                    self.wal_append_recovered();
+                    Ok(h)
+                }
+                Err(e) => Err(self.wal_rejected(&e)),
+            },
+            None => Ok(enchudb_oplog::Hlc::ZERO),
         }
+    }
+
+    /// #553 / #554: WAL に載らなかった書き込みを断る (呼び手は本体に当てない)。 計上して返す。
+    #[cold]
+    fn wal_rejected(&self, e: &io::Error) -> TieRejected {
+        self.record_fault(FaultKind::WalSpace, &format!("WAL に載らない ({e}) — write rejected"));
+        TieRejected::Fault(FaultKind::WalSpace)
     }
 
     /// #268: append が通った。 落ちていた episode の後なら、 次の episode でまた 1 行警告できるよう戻す (立っている時だけ書く:
@@ -10246,11 +10399,19 @@ impl Engine {
         }
     }
 
-    /// #454: cell を持たない record (Vocab) を同期の書き込みの中で積む。 落ちたら数える。
-    fn append_vocab_record(&self, wal: &enchudb_oplog::oplog::OpLog, vid: u32, bytes: &[u8]) {
+    /// #454: cell を持たない record (Vocab) を同期の書き込みの中で積む。 落ちたら数える。 断る場合は `append_local_op` と同じ
+    /// (#553 / #554: 呼び手は続く Tie を積まずに断る)。
+    fn append_vocab_record(&self, wal: &enchudb_oplog::oplog::OpLog, vid: u32, bytes: &[u8]) -> Result<(), TieRejected> {
         match wal.append(enchudb_oplog::oplog::Op::Vocab { vid, bytes }) {
-            Ok(_) => self.wal_append_recovered(),
-            Err(e) => self.note_wal_records_dropped(1, &e),
+            Ok(_) => {
+                self.wal_append_recovered();
+                Ok(())
+            }
+            Err(e) if self.sync_tables_on() && e.kind() != io::ErrorKind::InvalidInput => {
+                self.note_wal_records_dropped(1, &e);
+                Ok(())
+            }
+            Err(e) => Err(self.wal_rejected(&e)),
         }
     }
 
@@ -13000,12 +13161,18 @@ impl Engine {
             // **今 insert した payload** を捨てる (cell は旧 offset を指したままなので
             // 旧 payload は生きている)。
             let oplog_eid = self.oplog_eid(eid);
-            let hlc = self.append_local_op(enchudb_oplog::oplog::Op::TieLeaf {
+            let hlc = match self.append_local_op(enchudb_oplog::oplog::Op::TieLeaf {
                 eid: oplog_eid,
                 himo_name: &self.himo_names[hid],
                 himo_kind: self.value_types[hid] as u8,
                 bytes,
-            });
+            }) {
+                Ok(h) => h,
+                Err(r) => {
+                    leaf.free(off);
+                    return Err(r);
+                }
+            };
             if !self.set_cell_in(Some(&row), eid, himo_id, off, hlc) {
                 leaf.free(off);
                 self.warn_local_write_rejected(eid, himo_id, hlc);
@@ -13046,13 +13213,22 @@ impl Engine {
             enchudb_oplog::Hlc::ZERO
         } else {
             let oplog_eid = self.oplog_eid(eid);
-            if let Some(wal) = self.oplog.as_ref() {
-                // Vocab は cell を持たない (= 版数の対象外)。
-                self.append_vocab_record(wal, vid, value.as_bytes());
+            // Vocab は cell を持たない (= 版数の対象外)。
+            let appended = match self.oplog.as_ref() {
+                Some(wal) => self.append_vocab_record(wal, vid, value.as_bytes()),
+                None => Ok(()),
             }
-            self.append_local_op(
-                enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid as u64 },
-            )
+            .and_then(|()| {
+                self.append_local_op(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid as u64 })
+            });
+            match appended {
+                Ok(h) => h,
+                Err(r) => {
+                    drop(row);
+                    self.vocab_unpin(hid, vid);
+                    return Err(r);
+                }
+            }
         };
         let written = self.set_cell_in(row.as_ref(), eid, himo_id, vid, hlc);
         drop(row);
@@ -13176,12 +13352,15 @@ impl Engine {
             }
             // request17 step 4: WAL 先行で採番。 不採用なら今 insert した payload を捨てる。
             let oplog_eid = self.oplog_eid(eid);
-            let hlc = self.append_local_op(enchudb_oplog::oplog::Op::TieLeaf {
+            let Ok(hlc) = self.append_local_op(enchudb_oplog::oplog::Op::TieLeaf {
                 eid: oplog_eid,
                 himo_name: &self.himo_names[hid],
                 himo_kind: self.value_types[hid] as u8,
                 bytes: value,
-            });
+            }) else {
+                leaf.free(off);
+                return;
+            };
             if !self.set_cell_in(Some(&row), eid, himo_id, off, hlc) {
                 leaf.free(off);
                 self.warn_local_write_rejected(eid, himo_id, hlc);
@@ -13217,22 +13396,31 @@ impl Engine {
             enchudb_oplog::Hlc::ZERO
         } else {
             let oplog_eid = self.oplog_eid(eid);
-            if let Some(wal) = self.oplog.as_ref() {
-                // Vocab は cell を持たない (= 版数の対象外)。
-                self.append_vocab_record(wal, vid, value);
+            // Vocab は cell を持たない (= 版数の対象外)。
+            let appended = match self.oplog.as_ref() {
+                Some(wal) => self.append_vocab_record(wal, vid, value),
+                None => Ok(()),
             }
-            if self.himo_is_content(hid) {
-                // 0.9.0: 動的 content himo は id が peer 間で揃わないため名前で運ぶ
-                self.append_local_op(enchudb_oplog::oplog::Op::TieNamed {
-                    eid: oplog_eid,
-                    himo_name: &self.himo_names[hid],
-                    himo_kind: self.value_types[hid] as u8,
-                    value: vid as u64,
-                })
-            } else {
-                self.append_local_op(
-                    enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid as u64 },
-                )
+            .and_then(|()| {
+                if self.himo_is_content(hid) {
+                    // 0.9.0: 動的 content himo は id が peer 間で揃わないため名前で運ぶ
+                    self.append_local_op(enchudb_oplog::oplog::Op::TieNamed {
+                        eid: oplog_eid,
+                        himo_name: &self.himo_names[hid],
+                        himo_kind: self.value_types[hid] as u8,
+                        value: vid as u64,
+                    })
+                } else {
+                    self.append_local_op(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: vid as u64 })
+                }
+            });
+            match appended {
+                Ok(h) => h,
+                Err(_) => {
+                    drop(row);
+                    self.vocab_unpin(hid, vid);
+                    return;
+                }
             }
         };
         let written = self.set_cell_in(row.as_ref(), eid, himo_id, vid, hlc);
@@ -13289,7 +13477,16 @@ impl Engine {
             enchudb_oplog::Hlc::ZERO
         } else {
             let oplog_eid = self.oplog_eid(eid);
-            self.append_local_op(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value })
+            match self.append_local_op(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value }) {
+                Ok(h) => h,
+                Err(r) => {
+                    drop(row);
+                    if pinned {
+                        self.vocab.release(value as u32);
+                    }
+                    return Err(r);
+                }
+            }
         };
         #[cfg(test)]
         if let Some(wal) = self.oplog.as_ref() {
@@ -13344,7 +13541,7 @@ impl Engine {
         let oplog_eid = self.oplog_eid(eid);
         let hlc = self.append_local_op(
             enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value: target_eid as u64 },
-        );
+        )?;
         let written = self.set_cell_in(row.as_ref(), eid, himo_id, target_eid, hlc);
         drop(row);
         if !written {
@@ -13400,9 +13597,9 @@ impl Engine {
         // 蘇る)。 Leaf payload の解放は **採用が決まってから**。 行を握ってから積む (`append_local_op` の doc)
         let row = self.row_for_wal(eid);
         let oplog_eid = self.oplog_eid(eid);
-        let hlc = self.append_local_op(
-            enchudb_oplog::oplog::Op::Untie { eid: oplog_eid, himo_id },
-        );
+        let Ok(hlc) = self.append_local_op(enchudb_oplog::oplog::Op::Untie { eid: oplog_eid, himo_id }) else {
+            return;
+        };
         let cleared = self.clear_cell_in_freeing_leaf(row.as_ref(), eid, himo_id, hlc);
         drop(row);
         if !cleared {
@@ -13426,7 +13623,9 @@ impl Engine {
         // 行を握ってから積む (`append_local_op` の doc)
         let row = self.row_for_wal(eid);
         let oplog_eid = self.oplog_eid(eid);
-        let hlc = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: oplog_eid });
+        let Ok(hlc) = self.append_local_op(enchudb_oplog::oplog::Op::Delete { eid: oplog_eid }) else {
+            return;
+        };
         let applied = self.apply_delete_in(row.as_ref(), eid, hlc);
         drop(row);
         if !applied {
@@ -13573,6 +13772,18 @@ impl Engine {
         &self,
         listener: std::sync::Arc<dyn crate::changefeed::ChangeListener>,
     ) {
+        // 記録がある時は、 今の記録の終わりから (付けた時に書き出し待ちだった record は、 書き出された後に渡る)
+        if let Some(log) = self.change_log.get() {
+            let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(wal) = self.oplog.as_ref() {
+                let _ = self.pump_change_log(wal, log, &mut c, false);
+            }
+            c.readers.push((listener.clone(), log.range().1));
+            self.change_listeners.write().unwrap_or_else(|p| p.into_inner()).push(listener);
+            drop(c);
+            self.ensure_notifier();
+            return;
+        }
         let was_empty = {
             let mut guard = self.change_listeners.write().unwrap();
             let was_empty = guard.is_empty();
@@ -13592,6 +13803,249 @@ impl Engine {
     /// 登録済み listener 数(テスト/監視用)。
     pub fn change_listener_count(&self) -> usize {
         self.change_listeners.read().unwrap().len()
+    }
+
+    /// changefeed の記録 (`{dir}/changefeed.seg`) を作る。 以後 (開き直しても) listener に渡す record を番号付きで残し、
+    /// [`Self::add_change_listener_from`] で番号の続きから受け直せる (番号は [`crate::changefeed::ChangeListener::on_changes_at`]
+    /// で渡る)。 `cap` は記録の大きさ (byte、 下限 1 MiB、 既に在る記録は作った時の大きさ)。 満杯なら古い方から捨てる。
+    /// 記録が在る間は、 listener に渡していない record をメモリに溜めない (溜めの上限 `set_change_backlog_limit` も使わない)。
+    ///
+    /// 作った時から記録する (それより前に閉じた record は入らない)。 listener を付ける前に呼ぶこと (付いていると
+    /// `InvalidInput`)。 WAL 付きの並行の engine (`open_concurrent_with_oplog` など) だけ。 既に在れば何もしない。
+    /// 記録の 1/4 より大きい record は番号だけ使って中身を残さない (その番号を読む listener は外れ、 受け直しは
+    /// [`crate::change_log::Truncated`])。 記録を知らない binary で開いて書いた間の record は記録に入らない。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn enable_change_log(&self, cap: usize) -> io::Result<()> {
+        if self.change_log.get().is_some() {
+            return Ok(());
+        }
+        let Some(wal) = self.oplog.as_ref() else {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "changefeed の記録は WAL 付きの並行の engine だけ"));
+        };
+        let Backing::Segments(set) = &self.backing else {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "changefeed の記録は directory の DB だけ"));
+        };
+        if self.is_readonly() {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "readonly"));
+        }
+        let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "enable_change_log は listener を付ける前に呼ぶ"));
+        }
+        let existed = set.dir().join(crate::change_log::FILE).exists();
+        let log = crate::change_log::ChangeLog::open(set.dir(), cap, true, false)?;
+        c.log_wal = if existed {
+            Self::change_log_resume_offset(wal, &log)
+        } else {
+            // 今から: 閉じた group の後ろから写す (閉じていない group は閉じた時に入る)
+            wal.scan_for_change_log(enchudb_oplog::oplog::HEADER_SIZE as u64, u64::MAX, false).1
+        };
+        // 畳んだ印を新しい周より先に届ける (続きの位置を探す時に、 前の周と新しい周を取り違えない)
+        wal.set_sync_on_reset(true);
+        let _ = self.change_log.set(log);
+        Ok(())
+    }
+
+    /// changefeed の記録に残っている番号の範囲 `(最古, 次)`。 記録が無ければ None。 listener に渡した番号はこの範囲で受け直せる。
+    pub fn change_log_range(&self) -> Option<(u64, u64)> {
+        let log = self.change_log.get()?;
+        if let Some(wal) = self.oplog.as_ref() {
+            let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = self.pump_change_log(wal, log, &mut c, false);
+        }
+        Some(log.range())
+    }
+
+    /// changefeed の記録の `pos` 番から listener を付ける (前に受けた最後の番号 + 1 を渡すと、 落ちる前の続きから受け直す)。
+    /// `pos` が記録に無ければ `Err(Truncated { from })` (`from` = 今残っている最古の番号。 記録の先の番号 / 記録の無い engine も
+    /// Truncated)。 その時は今の状態から読み直し、 [`Self::add_change_listener`] で付け直す。
+    pub fn add_change_listener_from(
+        &self,
+        listener: std::sync::Arc<dyn crate::changefeed::ChangeListener>,
+        pos: u64,
+    ) -> Result<(), crate::change_log::Truncated> {
+        let Some(log) = self.change_log.get() else {
+            let c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+            return Err(crate::change_log::Truncated { from: c.seq });
+        };
+        let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(wal) = self.oplog.as_ref() {
+            let _ = self.pump_change_log(wal, log, &mut c, false);
+        }
+        let (first, next) = log.range();
+        if pos < first || pos > next {
+            return Err(crate::change_log::Truncated { from: if pos < first { first } else { next } });
+        }
+        c.readers.push((listener.clone(), pos));
+        self.change_listeners.write().unwrap_or_else(|p| p.into_inner()).push(listener);
+        drop(c);
+        self.ensure_notifier();
+        self.notify_listeners();
+        Ok(())
+    }
+
+    /// 記録を開く (在る時だけ)。 WAL を開いて再生した後・consumer を起こす前に呼ぶ。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn attach_change_log(&self) {
+        let Some(wal) = self.oplog.as_ref() else { return };
+        let Backing::Segments(set) = &self.backing else { return };
+        if self.is_readonly() || !set.dir().join(crate::change_log::FILE).exists() {
+            return;
+        }
+        match crate::change_log::ChangeLog::open(set.dir(), 0, false, false) {
+            Ok(log) => {
+                let start = Self::change_log_resume_offset(wal, &log);
+                self.change_emit.lock().unwrap_or_else(|p| p.into_inner()).log_wal = start;
+                wal.set_sync_on_reset(true);
+                let _ = self.change_log.set(log);
+            }
+            Err(e) => eprintln!(
+                "[enchudb] warning: could not open {} ({e}) — the changefeed runs without its record",
+                crate::change_log::FILE
+            ),
+        }
+    }
+
+    /// 記録の続きの WAL の位置: 最後に記録した record を WAL の中で探し、 その直後。 見つからなければ WAL の頭 (記録した後に
+    /// 畳んだ = WAL の record は全部その後。 畳む前に全部を写して書き出すので抜けない)。 「見つからない = 畳んだ後」 は、 畳んだ
+    /// 印を新しい周より先に書き出すので成り立つ (`OpLog::set_sync_on_reset`。 書き出さないと、 前の周の header のまま新しい周の
+    /// page だけが届いた像で前の周を途中までしか読めず、 記録した record を頭から写し直した)。
+    fn change_log_resume_offset(wal: &enchudb_oplog::oplog::OpLog, log: &crate::change_log::ChangeLog) -> u64 {
+        let start = enchudb_oplog::oplog::HEADER_SIZE as u64;
+        let Some((hlc, id)) = log.last_written() else { return start };
+        let (recs, _) = wal.scan_for_change_log(start, u64::MAX, true);
+        recs.iter()
+            .find(|(r, _)| r.hlc == hlc && crate::change_log::fnv1a64(&r.signed_bytes) == id)
+            .map_or(start, |(_, end)| *end)
+    }
+
+    /// WAL の record を記録に写す (呼び手が `change_emit` を持つ)。 `with_tail` が false なら書き出し済み (checkpoint まで) に
+    /// Commit で閉じた group だけ (落ちたら消える record に番号を振らない: 振ると開き直した後に番号がずれる)。 true なら閉じて
+    /// いない末尾も含めて全部 (畳む直前、 全部書き出してある)。 記録が listener の位置を越えて捨てたら、 その listener を外す
+    /// (通知係が `on_detached` を呼ぶ)。 書き出しに失敗したら Err (写せた所までは進める)。 戻り値は写した数。
+    fn pump_change_log(
+        &self,
+        wal: &enchudb_oplog::oplog::OpLog,
+        log: &crate::change_log::ChangeLog,
+        c: &mut ChangeCursor,
+        with_tail: bool,
+    ) -> io::Result<usize> {
+        use std::sync::atomic::Ordering;
+        let (recs, end) = wal.scan_for_change_log(c.log_wal, wal.checkpoint(), with_tail);
+        if recs.is_empty() {
+            c.log_wal = c.log_wal.max(end);
+            return Ok(0);
+        }
+        let ends: Vec<u64> = recs.iter().map(|(_, e)| *e).collect();
+        let batch: Vec<crate::change_log::NewEntry> = recs
+            .into_iter()
+            .map(|(r, _)| {
+                let wal_id = crate::change_log::fnv1a64(&r.signed_bytes);
+                let w = crate::transport::WireRecord::from(r);
+                crate::change_log::NewEntry { hlc: w.hlc, wal_id, bytes: w.encode() }
+            })
+            .collect();
+        let watch: Vec<u64> = c.readers.iter().map(|(_, p)| *p).collect();
+        let before = log.range().1;
+        let mut lost = Vec::new();
+        let res = log.append(&batch, &watch, &mut lost);
+        let done = (log.range().1 - before) as usize;
+        c.log_wal = if done == ends.len() {
+            end
+        } else if done > 0 {
+            ends[done - 1]
+        } else {
+            c.log_wal
+        };
+        // 捨てた位置で読んでいた listener を外す
+        let first = log.range().0;
+        if c.readers.iter().any(|(_, p)| *p < first) {
+            let mut gone = Vec::new();
+            c.readers.retain(|(l, p)| {
+                if *p >= first {
+                    return true;
+                }
+                let from = lost.iter().find(|(no, _)| no == p).map_or(enchudb_oplog::Hlc::ZERO, |(_, h)| *h);
+                gone.push((l.clone(), from));
+                false
+            });
+            self.change_listeners
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|l| !gone.iter().any(|(g, _)| std::sync::Arc::ptr_eq(g, l)));
+            self.change_listeners_detached.fetch_add(gone.len() as u64, Ordering::Relaxed);
+            eprintln!(
+                "[enchudb] warning: {} change listener(s) fell behind the whole changefeed.seg — detached them                  (ChangeListener::on_detached tells each one; Engine::add_change_listener_from resumes)",
+                gone.len()
+            );
+            c.log_detached.extend(gone);
+            self.notify_listeners();
+        }
+        res.map(|()| done)
+    }
+
+    /// 記録がある時の配信: 記録に写してから、 listener ごとに位置から読んで渡す。 位置は渡す前に進める (畳む側の写しが、
+    /// 渡した分を 「まだ読んでいない」 と見て外さないように)。
+    fn deliver_from_log(&self, wal: &enchudb_oplog::oplog::OpLog, log: &crate::change_log::ChangeLog) {
+        /// 1 回に 1 listener へ渡す量の目安。
+        const CHUNK: usize = 4 << 20;
+        let gone = {
+            let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+            if let Err(e) = self.pump_change_log(wal, log, &mut c, false) {
+                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("[enchudb] warning: could not copy records into changefeed.seg ({e}) — retrying on the next delivery");
+                }
+            }
+            std::mem::take(&mut c.log_detached)
+        };
+        for (l, from) in gone {
+            l.on_detached(from);
+        }
+        loop {
+            let mut work = Vec::new();
+            let mut broken = Vec::new();
+            {
+                let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+                for (l, pos) in c.readers.iter_mut() {
+                    match log.read(*pos, CHUNK) {
+                        Ok(es) if !es.is_empty() => {
+                            work.push((l.clone(), *pos, es));
+                            *pos = work.last().unwrap().2.last().unwrap().no + 1;
+                        }
+                        Ok(_) => {}
+                        Err(_) => broken.push(l.clone()),
+                    }
+                }
+                if !broken.is_empty() {
+                    c.readers.retain(|(l, _)| !broken.iter().any(|b| std::sync::Arc::ptr_eq(b, l)));
+                    self.change_listeners
+                        .write()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .retain(|l| !broken.iter().any(|b| std::sync::Arc::ptr_eq(b, l)));
+                    self.change_listeners_detached.fetch_add(broken.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            for l in broken {
+                l.on_detached(enchudb_oplog::Hlc::ZERO);
+            }
+            if work.is_empty() {
+                return;
+            }
+            for (l, first, es) in work {
+                let recs: Vec<crate::transport::WireRecord> = es
+                    .iter()
+                    .filter_map(|e| match crate::transport::WireRecord::decode(&e.bytes) {
+                        Ok((r, _)) => Some(r),
+                        Err(err) => {
+                            eprintln!("[enchudb] warning: changefeed.seg entry {} does not decode ({err:?}) — skipped", e.no);
+                            None
+                        }
+                    })
+                    .collect();
+                l.on_changes_at(first, &recs);
+            }
+        }
     }
 
     // ──── blob store (大容量バイナリ: 画像/動画/モデル等) ────
@@ -17358,6 +17812,9 @@ impl Engine {
     /// 待たない時は、 配っている最中なら何もせず返る。 listener の中からの再入 (この thread が配っている最中) は、 待つと
     /// 止まるのでどちらでも配らずに返る。 取り出しは `change_emit` の下で短く、 callback はその外で呼ぶ (畳む側は callback を
     /// 待たない)。
+    ///
+    /// #560: 待つのは [`LISTENER_WAIT`] まで。 配っている listener がそれより長く返らなければ、 配らずに返る (残りは通知係が
+    /// 配る)。 前は止まった listener の後ろで `oplog_sync()` が永久に待った。
     fn deliver_changes(&self, wait: bool) {
         thread_local! {
             /// この thread が listener に配っている最中か (listener の中から oplog_sync を呼んだ再入を見分ける)。
@@ -17367,14 +17824,18 @@ impl Engine {
             return;
         }
         let Some(wal) = self.oplog.as_ref() else { return };
-        let _deliver = if wait {
-            self.change_deliver_lock.lock().unwrap_or_else(|p| p.into_inner())
-        } else {
-            match self.change_deliver_lock.try_lock() {
-                Ok(g) => g,
-                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => return,
+        let deliver = if wait { self.change_deliver_lock.try_lock_for(LISTENER_WAIT) } else { self.change_deliver_lock.try_lock() };
+        let Some(_deliver) = deliver else {
+            if wait {
+                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[enchudb] warning: a change listener has not returned for {LISTENER_WAIT:?} — oplog_sync() returns \
+                         without delivering its commit (the notifier delivers it later)"
+                    );
+                }
             }
+            return;
         };
         struct Emitting;
         impl Drop for Emitting {
@@ -17384,6 +17845,21 @@ impl Engine {
         }
         EMITTING.with(|e| e.set(true));
         let _emitting = Emitting;
+        // #560: 溜めの上限を越えて外した listener に知らせる (lock の外で呼ぶ)
+        let (detached, lost_from) = {
+            let mut c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+            (std::mem::take(&mut c.detached), c.lost_from.take())
+        };
+        if let Some(from) = lost_from {
+            for l in &detached {
+                l.on_detached(from);
+            }
+        }
+        // 記録がある時は記録から、 listener ごとの位置で渡す
+        if let Some(log) = self.change_log.get() {
+            self.deliver_from_log(wal, log);
+            return;
+        }
         // listener 登録ゼロなら何もしない(cursor は進めない:listener 加入時に
         // wal.head() に同期する設計なので、ここで進めると先行 record が漏れる)
         let listeners = self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).clone();
@@ -17402,34 +17878,80 @@ impl Engine {
                 batch.extend(recs.into_iter().map(crate::transport::WireRecord::from));
                 c.offset = committed_end;
             }
-            batch
+            c.bytes = c.open_tail.iter().map(change_record_bytes).sum();
+            let first = c.seq;
+            c.seq += batch.len() as u64;
+            (first, batch)
         };
+        let (first, batch) = batch;
         if batch.is_empty() {
             return;
         }
         for listener in &listeners {
-            listener.on_changes(&batch);
+            listener.on_changes_at(first, &batch);
         }
     }
 
     /// changefeed: ring を畳む直前 (`append_lock` の下、 呼び手が `change_emit` を持って) に、 cursor から先の record を溜めに
     /// 移す。 Commit で閉じた分は `committed` に (前に閉じていなかった末尾を頭に付けて)、 閉じていない末尾は `open_tail` に
     /// 足す。 cursor は読み終えた終端に進める (畳めたら呼び手が ring の頭に戻す。 畳めなくても、 移した分を二度渡さない)。
-    /// listener が居なければ何もしない。 戻り値は移した record の数。
-    fn spill_changes_for_fold(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor) -> usize {
+    /// listener が居なければ何もしない。 戻り値は移した record の数 (None = 畳まない: 記録に写せなかった)。
+    ///
+    /// 記録 (`changefeed.seg`) がある時は、 溜めの代わりに、 閉じていない末尾も含めて全部を記録に写す (畳む前は全部書き出してある)。
+    ///
+    /// #560: 移すと溜めが上限 (`change_backlog_limit`) を越えるなら、 移さずに溜めごと捨て、 listener を全部外す (止まった・遅すぎる
+    /// listener のために書き手を止めない・メモリを使い切らない。 前は上限が無く、 止まった listener の間は畳むたびに ring の
+    /// 全部を `append_lock` の下で写して溜め続けた)。 外した listener には通知係が `on_detached` で知らせる。
+    fn spill_changes_for_fold(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor) -> Option<usize> {
+        use std::sync::atomic::Ordering;
+        if let Some(log) = self.change_log.get() {
+            return match self.pump_change_log(wal, log, c, true) {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    self.record_fault(FaultKind::DiskSpace, "changefeed.seg に写せない — WAL を畳まない");
+                    eprintln!("[enchudb] warning: could not copy records into changefeed.seg ({e}) — the WAL is not folded");
+                    None
+                }
+            };
+        }
         if self.change_listeners.read().unwrap_or_else(|p| p.into_inner()).is_empty() {
-            return 0;
+            return Some(0);
         }
         let (recs, committed_end, tail, end) = wal.iter_from_with_tail(c.offset);
         let moved = recs.len() + tail.len();
+        let recs: Vec<crate::transport::WireRecord> = recs.into_iter().map(crate::transport::WireRecord::from).collect();
+        let tail: Vec<crate::transport::WireRecord> = tail.into_iter().map(crate::transport::WireRecord::from).collect();
+        let add: usize = recs.iter().chain(tail.iter()).map(change_record_bytes).sum();
+        if c.bytes + add > self.change_backlog_limit.load(Ordering::Relaxed) {
+            let first = c.committed.iter().chain(c.open_tail.iter()).chain(recs.iter()).chain(tail.iter()).map(|r| r.hlc).min();
+            c.committed = Vec::new();
+            c.open_tail = Vec::new();
+            c.bytes = 0;
+            c.offset = end;
+            let gone = std::mem::take(&mut *self.change_listeners.write().unwrap_or_else(|p| p.into_inner()));
+            self.change_listeners_detached.fetch_add(gone.len() as u64, Ordering::Relaxed);
+            c.lost_from = match (c.lost_from, first) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            c.detached.extend(gone);
+            eprintln!(
+                "[enchudb] warning: change listeners fell more than {} bytes behind — dropped the backlog and detached them \
+                 (Engine::set_change_backlog_limit; ChangeListener::on_detached tells each one)",
+                self.change_backlog_limit.load(Ordering::Relaxed),
+            );
+            self.notify_listeners();
+            return Some(0);
+        }
         if committed_end > c.offset {
             let open = std::mem::take(&mut c.open_tail);
             c.committed.extend(open);
-            c.committed.extend(recs.into_iter().map(crate::transport::WireRecord::from));
+            c.committed.extend(recs);
         }
-        c.open_tail.extend(tail.into_iter().map(crate::transport::WireRecord::from));
+        c.open_tail.extend(tail);
+        c.bytes += add;
         c.offset = end;
-        moved
+        Some(moved)
     }
 
     /// changefeed: 畳んだ後の後始末 (呼び手が `change_emit` を持ったまま)。 畳めたら cursor を ring の頭に戻し、 溜めに移した
@@ -17438,6 +17960,7 @@ impl Engine {
     fn after_fold_changes(&self, wal: &enchudb_oplog::oplog::OpLog, c: &mut ChangeCursor, folded: bool, moved: usize) {
         if folded {
             c.offset = enchudb_oplog::oplog::HEADER_SIZE as u64;
+            c.log_wal = enchudb_oplog::oplog::HEADER_SIZE as u64;
         }
         if folded && !c.open_tail.is_empty() {
             let _ = self.append_commit_marker(wal);
@@ -17454,10 +17977,8 @@ impl Engine {
         let mut moved = 0;
         let folded = self.wal_fold_safe()
             && wal.try_reset_if(|| {
-                self.wal_fold_safe_locked() && {
-                    moved = self.spill_changes_for_fold(wal, &mut c);
-                    true
-                }
+                self.wal_fold_safe_locked()
+                    && self.spill_changes_for_fold(wal, &mut c).map(|m| moved = m).is_some()
             });
         if folded {
             self.reset_sync_ops_offset();
@@ -17478,7 +17999,23 @@ impl Engine {
     /// 書き込みは止まらないが、 渡すまでメモリに持つ)。
     pub fn change_backlog_len(&self) -> usize {
         let c = self.change_emit.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(log) = self.change_log.get() {
+            // 記録がある時: 記録の中で、 いちばん遅れた listener がまだ受けていない数
+            let next = log.range().1;
+            return c.readers.iter().map(|(_, p)| next.saturating_sub(*p)).max().unwrap_or(0) as usize;
+        }
         c.committed.len() + c.open_tail.len()
+    }
+
+    /// #560: 溜めの上限 (byte、 既定 [`DEFAULT_CHANGE_BACKLOG_LIMIT`] = 64 MiB)。 畳む時に移す分で越えたら、 溜めを捨てて listener を
+    /// 全部外す (`ChangeListener::on_detached` で知らせる)。 書き手は止めない。
+    pub fn set_change_backlog_limit(&self, bytes: usize) {
+        self.change_backlog_limit.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// #560: 溜めの上限を越えて外した listener の数 (累計)。
+    pub fn change_listeners_detached(&self) -> u64 {
+        self.change_listeners_detached.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// changefeed: 通知係の thread を起こす (まだ居なければ)。 listener の callback を WAL の書き出し係 (consumer) から外す:
@@ -17542,13 +18079,19 @@ impl Engine {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(wal) = oplog.as_ref()
             && eng._writer_lock.is_some()
+            && let Err(e) = wal.lock_session()
         {
-            let _ = wal.lock_session();
+            // #561: 書き手の lock を持っているのに WAL を誰かが持っている (この process の前の engine より長く生きた
+            // `Arc<OpLog>` など)。 record ごとの flock で追記するので、 持っている側が閉じるまで書き込みは待つ
+            eprintln!("[enchudb] warning: could not hold the WAL lock for the session ({e}); appends will wait for the other holder");
         }
         eng.oplog = oplog.clone();
         if oplog.is_none() {
             return Arc::new(eng);
         }
+        // changefeed の記録は consumer が畳む前に WAL の続きの位置を合わせる
+        #[cfg(not(target_arch = "wasm32"))]
+        eng.attach_change_log();
         let shutdown = Arc::new(AtomicBool::new(false));
         let waker = Arc::new(crate::consumer_waker::ConsumerWaker::default());
         eng.consumer_waker = Some(waker.clone());
@@ -17923,10 +18466,9 @@ impl Engine {
                         ok
                     },
                     || {
-                        direct && self.wal_fold_safe_locked() && {
-                            moved = self.spill_changes_for_fold(wal, &mut c);
-                            true
-                        }
+                        direct
+                            && self.wal_fold_safe_locked()
+                            && self.spill_changes_for_fold(wal, &mut c).map(|m| moved = m).is_some()
                     },
                 );
                 if folded {
@@ -18043,6 +18585,10 @@ impl Engine {
     /// checkpoint を進める前の oplog fsync + 本体の書き出し。 どちらかが失敗したら false (#317: 空き不足で
     /// 書き出せなかった page があると fsync が ENOSPC を返す)。 失敗は `FaultKind::DiskSpace` に積む。
     fn sync_for_checkpoint(&self, wal: &enchudb_oplog::oplog::OpLog) -> bool {
+        #[cfg(test)]
+        if write_out_fault::active(wal) {
+            return false;
+        }
         let wal_ok = wal.fsync().is_ok();
         // #550: 消した主キーの記録は WAL の後・本体より先に (checkpoint を進めた後は WAL から引き直せない)。 書けなければ本体も
         // 書き出さない (WAL が書けなかった時は前と同じく本体だけ書き出す。 どちらでも checkpoint は進めない)
@@ -18154,7 +18700,7 @@ impl Engine {
             // の正体だったので、 呼び出し側に伝える (死区間を除く。 下の `commit_res?`)。
             let commit_res = self.append_commit_marker(wal);
             // 満杯で打てなかったか (= その瞬間の `append_dead`) は失敗の種類で決める。 Commit は
-            // REC_HEADER_SIZE ちょうどなので、 容量 (`OutOfMemory`) で落ちた時は満杯と同値。 後で
+            // 最小の record (`commit_room` と同じ大きさ) なので、 容量 (`OutOfMemory`) で落ちた時は満杯と同値。 後で
             // `append_dead()` を読み直すと、 間に consumer が畳んで満杯が解けていれば Err を返してしまう (#407)
             let commit_full = matches!(&commit_res, Err(e) if e.kind() == io::ErrorKind::OutOfMemory);
             // #77-H3: checkpoint 上限と durable_lsn は Commit append 直後に
@@ -18190,7 +18736,7 @@ impl Engine {
             // #268: transfer / listener まで済ませてから失敗を返す (打てた分は配る)。
             //
             // ただし **死区間 (`append_dead`) では返さない**。 Commit は payload 0 =
-            // REC_HEADER_SIZE ちょうどなので 「容量起因の Commit 失敗」 と
+            // 最小の record (`commit_room` と同じ大きさ) なので 「容量起因の Commit 失敗」 と
             // `append_dead()` は同値で、 ここで返すと 「WAL 満杯」 という *設計上の
             // 自己回復経路* (checkpoint を進める → fold が畳む。 `wal_full_fold`
             // 参照、 実運用で発現済み) に居るだけの呼び出し側が Err を受けることに
