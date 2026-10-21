@@ -197,6 +197,8 @@ pub struct HimoStore {
     vlocks: OnceLock<ValueLocks>,
     /// 値のある cell の数 ([`PresentCount`])。 `init` は 0 から、 `load` / `load_lazy` は最初に引かれた時に数える。
     present: PresentCount,
+    /// 位置の印を持つと宣言されたか ([`declare_marks`](Self::declare_marks)、 engine の `MRK1`)。 円柱を組む時に見る。
+    marks: AtomicBool,
 }
 
 /// 古い entry のある bucket (値 `value`) の eid の列 `eids` から、 今の値がちょうど `value` の entity を 1 回ずつ `out` に足す。
@@ -402,6 +404,8 @@ fn present_stripe() -> usize {
 pub(crate) struct BucketIter<'a> {
     raw: &'a [u32],
     at: usize,
+    /// 古い印の列 (あれば印の立った entry を飛ばし、 Column で確かめない・集合も使わない)
+    marks: Option<&'a [std::sync::atomic::AtomicU64]>,
     /// Column で確かめる時の (列, stored 形式の値 = 値 + 1)。 古い entry の無い bucket は None
     check: Option<(&'a Column, u64)>,
     /// 確かめのある bucket で出した eid (行って戻った entity の 2 つ目を落とす)。 古い entry の無い bucket には重複が無い
@@ -444,7 +448,11 @@ impl Seen {
 
 impl<'a> BucketIter<'a> {
     fn new(raw: &'a [u32], check: Option<(&'a Column, u64)>) -> Self {
-        BucketIter { raw, at: 0, check, seen: Seen::new() }
+        BucketIter { raw, at: 0, marks: None, check, seen: Seen::new() }
+    }
+
+    fn marked(raw: &'a [u32], marks: &'a [std::sync::atomic::AtomicU64]) -> Self {
+        BucketIter { raw, at: 0, marks: Some(marks), check: None, seen: Seen::new() }
     }
 }
 
@@ -453,7 +461,14 @@ impl Iterator for BucketIter<'_> {
 
     fn next(&mut self) -> Option<u32> {
         while let Some(&e) = self.raw.get(self.at) {
+            let i = self.at;
             self.at += 1;
+            if let Some(m) = self.marks {
+                if (m[i / 64].load(Ordering::Acquire) >> (i % 64)) & 1 != 0 {
+                    continue;
+                }
+                return Some(e);
+            }
             if let Some((col, s)) = self.check
                 && (stored_at(col, e) != s || !self.seen.insert(e))
             {
@@ -510,6 +525,7 @@ impl HimoStore {
             gate: WriteGate::new(),
             vlocks: OnceLock::new(),
             present: PresentCount::new(true),
+            marks: AtomicBool::new(false),
         }
     }
 
@@ -532,6 +548,7 @@ impl HimoStore {
             gate: WriteGate::new(),
             vlocks: OnceLock::new(),
             present: PresentCount::new(false),
+            marks: AtomicBool::new(false),
         })
     }
 
@@ -558,6 +575,7 @@ impl HimoStore {
             gate: WriteGate::new(),
             vlocks: OnceLock::new(),
             present: PresentCount::new(false),
+            marks: AtomicBool::new(false),
         }
     }
 
@@ -637,6 +655,30 @@ impl HimoStore {
     /// #95: build は多数 insert（単一 writer 必須）なので `write_lock` で排他する。
     /// build 中の他 thread は write_lock を待つ（one-time、load 直後の初回のみ）。
     #[inline]
+    /// 位置の印 (書き手が置いた位置を覚え、 書き換え・消しの時に古い entry へ bit を立てる。 読みは印の立った entry を飛ばして写す) を
+    /// 持つかを宣言する ([`Engine::declare_marks`](crate::Engine::declare_marks))。 円柱を組む前なら次に組む時から効く。 組んだ後に
+    /// 付けても、 もう置いてある entry の位置が分からないので効かない (開き直して組み直す時から)。 外すのはいつでも効く (読みは
+    /// Column で確かめる道に戻り、 書き手は印を付けない)。 返り値 = 今の円柱で効いているか。
+    pub(crate) fn declare_marks(&self, on: bool) -> bool {
+        self.marks.store(on, Ordering::Relaxed);
+        if !on {
+            self.cyl.disable_marks();
+            return false;
+        }
+        self.cyl.marks_on()
+    }
+
+    /// 位置の印が宣言されているか (保存する宣言)。
+    pub(crate) fn marks_declared(&self) -> bool {
+        self.marks.load(Ordering::Relaxed)
+    }
+
+    /// 位置の印が今の円柱で効いているか (宣言して組んだ後)。
+    #[cfg(test)]
+    pub(crate) fn marks_live(&self) -> bool {
+        self.cyl.marks_on()
+    }
+
     fn ensure_cylinder_built(&self) {
         if self.cyl_built.load(Ordering::Acquire) {
             return;
@@ -655,6 +697,10 @@ impl HimoStore {
         let count = col.count();
         // dense の窓の始まりは組む前に (読み手はまだこの索引を読まない)
         self.cyl.set_low_base(self.dense_base_hint.load(Ordering::Relaxed));
+        // 宣言された列だけ、 位置の表 (entity ごとの bucket の中の位置) を列の大きさで取る (匿名 mmap。 触った所だけが実際のメモリ)
+        if self.marks.load(Ordering::Relaxed) {
+            self.cyl.init_slots(col.max_entities);
+        }
         // 全部を見てからまとめて組む (dense / sparse の振り分けを 1 度で決める、 #373)
         self.cyl.build(|| {
             (0..count).filter_map(|eid| {
@@ -734,6 +780,8 @@ impl HimoStore {
     /// 同じ cell の書き手は engine の行の lock で並ぶので、 古い値はこの間動かない。
     fn set_indexed(&self, eid: u32, value: u64) -> bool {
         let col = self.col();
+        // 位置の表の行を先に cache に載せる (Column の古い値の読みと並んで待つ。 値は鍵を取った後に読み直す)
+        self.cyl.prefetch_slot(eid);
         if col.ensure_committed_for(eid).is_err() {
             return false;
         }
@@ -751,7 +799,7 @@ impl HimoStore {
                 hook::at("inside_value_locks");
                 // 値更新: 旧 value の bucket に stale が残る → その bucket の read は verify する。
                 // Column を書き換える **前** に flag を立てる (request12、順序契約は note_stale 参照)
-                let stale = old.and_then(|o| cyl.note_stale_in(o, &guard).map(|s| (o, s)));
+                let stale = old.and_then(|o| cyl.note_stale_of_in(o, eid, &guard).map(|s| (o, s)));
                 // #106: Release store。 leaf offset を publish する前に書いた LeafStore slot
                 // (payload/gen) を、 offset を Acquire で読む reader が必ず観測できるようにする。
                 store_at(col, eid, value + 1);
@@ -775,7 +823,7 @@ impl HimoStore {
         // 伸ばすなら全部の鍵 (配列を写す間に他の書き手が bucket を置くと消える)、 伸ばさないなら配列の中の側の値の鍵
         let _all = grow.then(|| locks.lock_all());
         let _held = (!grow).then(|| locks.lock_pair(old_in, new_in.then_some(value)));
-        let stale = old.and_then(|o| cyl.note_stale_in(o, &guard).map(|s| (o, s)));
+        let stale = old.and_then(|o| cyl.note_stale_of_in(o, eid, &guard).map(|s| (o, s)));
         store_at(col, eid, value + 1);
         if old.is_none() {
             self.present.add(1);
@@ -896,7 +944,8 @@ impl HimoStore {
             let guard = epoch::pin();
             if cyl.in_array(o, &guard) {
                 let _held = self.vlocks().lock_pair(Some(o), None);
-                let stale = cyl.note_stale_in(o, &guard);
+                let stale = cyl.note_stale_of_in(o, eid, &guard);
+                cyl.forget_slot(eid);
                 col.clear(eid);
                 self.present.add(-1);
                 if let Some((len, live)) = stale {
@@ -910,7 +959,8 @@ impl HimoStore {
         let _w = self.write_lock.lock();
         let guard = epoch::pin();
         let _held = cyl.in_array(o, &guard).then(|| self.vlocks().lock_pair(Some(o), None));
-        let stale = cyl.note_stale_in(o, &guard);
+        let stale = cyl.note_stale_of_in(o, eid, &guard);
+        cyl.forget_slot(eid);
         col.clear(eid);
         self.present.add(-1);
         if let Some((len, live)) = stale {
@@ -1113,18 +1163,22 @@ impl HimoStore {
         if old == new {
             return; // 同値 restore = no-op (bytes も同一)
         }
+        let guard = epoch::pin();
         let mut stale = None;
         if let (Some(cyl), Some(o)) = (cyl, old) {
-            // flag → Column の順 (set と同じ、request12)
-            stale = cyl.note_stale(o).map(|s| (o, s));
+            // flag → Column の順 (set と同じ、request12)。 覚えている位置の古い entry に印を立てる
+            stale = cyl.note_stale_of_in(o, eid, &guard).map(|s| (o, s));
         }
         store_at(col, eid, stored);
         self.present.add(i64::from(new.is_some()) - i64::from(old.is_some()));
         if let (Some(cyl), Some(n)) = (cyl, new) {
             cyl.insert(eid, n, |v, e| stored_at(col, e) == v + 1);
+        } else if let Some(cyl) = cyl {
+            // 値が無くなった: bucket の中の位置は無い
+            cyl.forget_slot(eid);
         }
         if let Some((o, (len, live))) = stale {
-            self.maybe_compact(o, len, live, &epoch::pin());
+            self.maybe_compact(o, len, live, &guard);
         }
         if let Some(cyl) = cyl {
             self.maybe_compact_sparse(cyl);
@@ -1139,13 +1193,14 @@ impl HimoStore {
     pub fn pull(&self, value: impl CellValue) -> Vec<u32> {
         let Some(value) = value.cell_value() else { return Vec::new() };
         self.ensure_cylinder_built();
-        let (mut raw, mut needs_verify) = self.cyl.read_to_vec_verify(value);
-        // 照らしが要り、 前に照らした時から書き込みが無ければ、 詰め直して読み直す (照らさずに済む。 照らしの要らない読みは見ない)
-        if needs_verify && self.compact_if_reread(value) {
-            (raw, needs_verify) = self.cyl.read_to_vec_verify(value);
+        let (mut raw, mut needs_verify, stale) = self.cyl.read_to_vec_marked(value);
+        // 古い entry があり、 前に読んだ時から書き込みが無ければ、 詰め直して読み直す (照らさずに済む。 古い entry の無い読みは
+        // 見ない。 古い印のそろった bucket も、 読み直しが続けば詰め直す = 印の立った entry を物理的に落とす)
+        if stale && self.compact_if_reread(value) {
+            (raw, needs_verify, _) = self.cyl.read_to_vec_marked(value);
         }
         if !needs_verify {
-            // この bucket は append-only: 全 live、dup なし
+            // この bucket は append-only で全 live・dup なし (古い印のそろった bucket は印の立った entry を飛ばして写した)
             raw
         } else {
             // lazy verify: Column で現在値を確認、churn 由来の dup を除去
@@ -1167,11 +1222,11 @@ impl HimoStore {
         let Some(value) = value.cell_value() else { return };
         self.ensure_cylinder_built();
         let start = out.len();
-        let mut needs_verify = self.cyl.read_into_verify(value, out);
-        // `pull` と同じ: 照らしが要り、 前に照らした時から書き込みが無ければ、 詰め直して読み直す
-        if needs_verify && self.compact_if_reread(value) {
+        let (mut needs_verify, stale) = self.cyl.read_into_marked(value, out);
+        // `pull` と同じ: 古い entry があり、 前に読んだ時から書き込みが無ければ、 詰め直して読み直す
+        if stale && self.compact_if_reread(value) {
             out.truncate(start);
-            needs_verify = self.cyl.read_into_verify(value, out);
+            (needs_verify, _) = self.cyl.read_into_marked(value, out);
         }
         if needs_verify {
             // lazy verify: Column で現在値を確認、churn 由来の dup を除去 (足した分だけ、 その場で)
@@ -1206,7 +1261,14 @@ impl HimoStore {
     pub(crate) fn walk_values(&self, lo: u64, hi: u64, desc: bool, mut f: impl FnMut(u64, &mut BucketIter<'_>) -> ControlFlow<()>) {
         self.ensure_cylinder_built();
         let col = self.col();
-        self.cyl.walk(lo, hi, desc, |v, raw, verify| f(v, &mut BucketIter::new(raw, verify.then_some((col, v + 1)))));
+        self.cyl.walk(lo, hi, desc, |v, raw, verify, marks| {
+            // 古い印がそろっていれば、 Column の確かめと出した eid の集合の代わりに印で飛ばす
+            let mut iter = match (verify, marks) {
+                (true, Some(m)) => BucketIter::marked(raw, m),
+                _ => BucketIter::new(raw, verify.then_some((col, v + 1))),
+            };
+            f(v, &mut iter)
+        });
     }
 
     /// 値が `lo..=hi` の live な entity の数 (`pull_range(lo, hi).len()` と同じ数)。 dense の値は bucket の live の数を
@@ -1254,7 +1316,9 @@ impl HimoStore {
                 }
                 out.extend_from_slice(&eids);
             }
-            Part::Bucket { value, eids, verify: true } => push_live_once(col, value, eids, &mut out),
+            // 古い印がそろった bucket は印の立った entry を飛ばして写す (Column の確かめも重複落としも無い)
+            Part::Bucket { eids, verify: true, marks: Some(m), .. } => crate::append_bucket::copy_unmarked(eids, m, &mut out),
+            Part::Bucket { value, eids, verify: true, marks: None } => push_live_once(col, value, eids, &mut out),
             Part::Run { lo, hi, eids, verify: true } => loose.extend(eids.iter().copied().filter(|&e| {
                 let s = stored_at(col, e);
                 s != 0 && lo < s && s - 1 <= hi
@@ -1439,6 +1503,58 @@ mod tests {
     /// heap buffer 上に static backing の store を作る。 leaf_store の `make_store` と同じ idiom。
     fn make_store(max_entities: u32) -> HimoStore {
         HimoStore::init(heap_region(64 * 1024), ValueType::Number, 0, max_entities, false)
+    }
+
+    /// 位置の印を宣言した列だけ、 書き換えの後の読みが Column の確かめを飛ばす (印の立った entry を飛ばして写す)。 答えは
+    /// どちらも列をなめた答えと同じ (3 つの読みで)。 宣言した列も読み直しが続けば詰め直す (印の立った entry を物理的に落とす)。
+    #[test]
+    fn marks_declared_reads_skip_the_column_check() {
+        const N: u32 = 12_000;
+        for declared in [false, true] {
+            let hs = make_store(N);
+            if declared {
+                assert!(!hs.declare_marks(true), "組む前は効いていない");
+            }
+            for e in 0..N {
+                assert!(hs.set(e, (e % 20) as u64));
+            }
+            let _ = hs.pull(0u32); // 索引を組む
+            assert_eq!(hs.marks_live(), declared, "宣言した列だけ組む時に印の表を取る");
+            // 7 の倍数の行を書き換える (7 と 20 は互いに素なので、 どの値の bucket からも出ていく行がある)
+            for e in (0..N).step_by(7) {
+                assert!(hs.set(e, ((e / 7) % 20) as u64));
+            }
+            let value = |e: u32| if e.is_multiple_of(7) { (e / 7) % 20 } else { e % 20 };
+            let want: Vec<u32> = (0..N).filter(|&e| value(e) == 3).collect();
+            let (raw, needs, stale) = hs.cyl.read_to_vec_marked(3);
+            assert!(stale, "[{declared}] 対照: 書き換えの後は古い entry がある");
+            assert_eq!(needs, !declared, "[{declared}] 印を宣言した列だけ Column の確かめが要らない");
+            if declared {
+                let mut r = raw.clone();
+                r.sort_unstable();
+                assert_eq!(r, want, "印で飛ばした写しは live だけ");
+            } else {
+                assert!(raw.len() > want.len(), "対照: 宣言が無ければ古い entry 込みで写す");
+            }
+            for how in 0..4 {
+                let mut got = match how {
+                    0 | 3 => hs.pull(3u32),
+                    1 => {
+                        let mut out = Vec::new();
+                        hs.pull_into(3u32, &mut out);
+                        out
+                    }
+                    _ => hs.pull_range_unordered(3, 3),
+                };
+                got.sort_unstable();
+                assert_eq!(got, want, "[{declared}] 読み {how}");
+            }
+            // 書き込みの無いまま読み直すと詰め直す (印のある列も)
+            assert!(!hs.cyl.bucket_needs_verify(3), "[{declared}] 読み直しで詰め直す");
+            let mut g = hs.pull(3u32);
+            g.sort_unstable();
+            assert_eq!(g, want, "[{declared}] 詰め直した後");
+        }
     }
 
     /// `walk_values` の値ごとの [`BucketIter`] が、 bucket を写さずに置いてある順・重複なし・Column で確かめた live だけを
@@ -1719,16 +1835,26 @@ mod tests {
             }
             for v in 0..20u32 {
                 let want: Vec<u32> = (0..N).filter(|&i| cells[i as usize] == v).collect();
-                let (raw, needs) = hs.cyl.read_to_vec_verify(v as u64);
+                let (raw, needs, stale) = hs.cyl.read_to_vec_marked(v as u64);
                 let got = hs.pull(v);
                 let mut into = vec![u32::MAX, 7];
                 hs.pull_into(v, &mut into);
                 assert_eq!(&into[..2], &[u32::MAX, 7], "pull_into が前の中身を変えた");
-                if needs {
+                if stale {
                     verified += 1;
                     unsorted_raw += usize::from(!raw.is_sorted());
-                    assert!(got.windows(2).all(|w| w[0] < w[1]), "round {round} 値 {v}: verify した pull が昇順・重複なしでない");
-                    assert!(into[2..].windows(2).all(|w| w[0] < w[1]), "round {round} 値 {v}: verify した pull_into が昇順・重複なしでない");
+                    if needs {
+                        assert!(got.windows(2).all(|w| w[0] < w[1]), "round {round} 値 {v}: verify した pull が昇順・重複なしでない");
+                        assert!(into[2..].windows(2).all(|w| w[0] < w[1]), "round {round} 値 {v}: verify した pull_into が昇順・重複なしでない");
+                    } else {
+                        // 古い印で飛ばした読み: 並べないが、 往復した entity の古い方は印で落ちるので重複は無い
+                        let mut g = got.clone();
+                        g.sort_unstable();
+                        assert!(g.windows(2).all(|w| w[0] < w[1]), "round {round} 値 {v}: 印で飛ばした pull に重複");
+                        let mut g = into[2..].to_vec();
+                        g.sort_unstable();
+                        assert!(g.windows(2).all(|w| w[0] < w[1]), "round {round} 値 {v}: 印で飛ばした pull_into に重複");
+                    }
                 }
                 let mut g = got.clone();
                 g.sort_unstable();
@@ -1738,7 +1864,7 @@ mod tests {
                 assert_eq!(g, want, "round {round} 値 {v}: pull_into");
             }
         }
-        assert!(verified >= 50 && unsorted_raw >= 10, "負の対照: verify の要る読み {verified}・並べる前が昇順でない読み {unsorted_raw} が少ない");
+        assert!(verified >= 50 && unsorted_raw >= 10, "負の対照: 古い entry のある読み {verified}・並べる前が昇順でない読み {unsorted_raw} が少ない");
     }
 
     /// 読み手の詰め直し (`compact_if_reread`): 書き手の詰め直しの線 (古い entry が半分) に届かない churn の後、 書き込みの無いまま
