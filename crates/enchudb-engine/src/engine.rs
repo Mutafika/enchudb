@@ -388,7 +388,7 @@ fn tables_path_for(path: &str) -> std::path::PathBuf {
 ///
 /// 並びの索引の宣言 (`orders`、 [`Engine::declare_order`]) は `DIA1` block として一番後ろに足す (`PKS1` / `EXT1` を
 /// 知っている古いバイナリは、 それを読んでから知らない magic の所で止まる)。
-fn serialize_tables(tables: &[TableDef], orders: &[OrderDecl]) -> Vec<u8> {
+fn serialize_tables(tables: &[TableDef], orders: &[OrderDecl], marks: &[u16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 + tables.len() * 128);
     out.extend_from_slice(b"TBL1");
     out.extend_from_slice(&1u32.to_le_bytes());
@@ -468,11 +468,41 @@ fn serialize_tables(tables: &[TableDef], orders: &[OrderDecl]) -> Vec<u8> {
             }
         }
     }
+    // 位置の印の宣言 ([`Engine::declare_marks`])。 DIA1 の後ろ。 宣言が無ければ書かない。
+    //   mrk_magic: "MRK1" (4)
+    //   mrk_count: u32
+    //   [himo: u32] × mrk_count
+    if !marks.is_empty() {
+        out.extend_from_slice(b"MRK1");
+        out.extend_from_slice(&(marks.len() as u32).to_le_bytes());
+        for h in marks {
+            out.extend_from_slice(&u32::from(*h).to_le_bytes());
+        }
+    }
     out
 }
 
 /// 並びの索引の宣言 1 つ: (via の紐, key の紐, 目盛り)。
 type OrderDecl = (u16, u16, Vec<u64>);
+/// `{db}/tables` の中身: (table 定義, 並びの索引の宣言, 位置の印を持つ紐)。
+type TablesSidecar = (Vec<TableDef>, Vec<OrderDecl>, Vec<u16>);
+
+/// `MRK1` block の中身 (magic の後ろ) を読む: (位置の印を持つ紐の番号, 読んだ byte 数)。 途中で切れている / 番号が紐の id に
+/// 入らないなら None。
+fn deserialize_marks(buf: &[u8]) -> Option<(Vec<u16>, usize)> {
+    let mut off = 0usize;
+    let u32_at = |off: &mut usize| -> Option<u32> {
+        let v = u32::from_le_bytes(buf.get(*off..*off + 4)?.try_into().ok()?);
+        *off += 4;
+        Some(v)
+    };
+    let count = u32_at(&mut off)? as usize;
+    let mut out = Vec::with_capacity(count.min(buf.len() / 4));
+    for _ in 0..count {
+        out.push(u16::try_from(u32_at(&mut off)?).ok()?);
+    }
+    Some((out, off))
+}
 
 /// `DIA1` block の中身 (magic の後ろ) を読む: (宣言, 読んだ byte 数)。 途中で切れている / 番号が紐の id に入らない
 /// なら None。
@@ -500,7 +530,7 @@ fn deserialize_orders(buf: &[u8]) -> Option<(Vec<OrderDecl>, usize)> {
 
 /// β-light step 7: tables sidecar を decode。 magic 不一致 / 短すぎる buffer
 /// は Err。 部分破損は次の field 読みで失敗 → Err として扱う。 並びの索引の宣言 (`DIA1`) も返す (無ければ空)。
-fn deserialize_tables(buf: &[u8]) -> Result<(Vec<TableDef>, Vec<OrderDecl>), String> {
+fn deserialize_tables(buf: &[u8]) -> Result<TablesSidecar, String> {
     if buf.len() < 12 || &buf[0..4] != b"TBL1" {
         return Err("tables sidecar: bad magic".into());
     }
@@ -568,6 +598,7 @@ fn deserialize_tables(buf: &[u8]) -> Result<(Vec<TableDef>, Vec<OrderDecl>), Str
     // (PK は再 build で復元できる派生情報であって、 table 定義の本体ではない)。
     // 末尾の optional block 群 (順不同、 未知の magic で打ち切り)
     let mut orders = Vec::new();
+    let mut marks: Vec<u16> = Vec::new();
     while off + 8 <= buf.len() {
         let magic = &buf[off..off + 4];
         if magic == b"PKS1" {
@@ -631,11 +662,23 @@ fn deserialize_tables(buf: &[u8]) -> Result<(Vec<TableDef>, Vec<OrderDecl>), Str
                     break;
                 }
             }
+        } else if magic == b"MRK1" {
+            // 位置の印の宣言。 印は列から作り直せる派生のデータなので、 壊れていたら宣言なしとして読む (sidecar 全体は有効)
+            match deserialize_marks(&buf[off + 4..]) {
+                Some((decls, used)) => {
+                    marks = decls;
+                    off += 4 + used;
+                }
+                None => {
+                    eprintln!("warning: tables sidecar: broken marks declarations (MRK1), ignored");
+                    break;
+                }
+            }
         } else {
             break;
         }
     }
-    Ok((tables, orders))
+    Ok((tables, orders, marks))
 }
 
 /// β-light step 7: tables を sidecar に atomic 書き換え。 fsync まで含む。 `orders` は並びの索引の宣言 (`DIA1`)。
@@ -644,8 +687,9 @@ fn persist_tables_to_sidecar(
     db_path: &str,
     tables: &[TableDef],
     orders: &[OrderDecl],
+    marks: &[u16],
 ) -> io::Result<()> {
-    crate::db_files::write_atomic_if_changed(&tables_path_for(db_path), &serialize_tables(tables, orders))
+    crate::db_files::write_atomic_if_changed(&tables_path_for(db_path), &serialize_tables(tables, orders, marks))
         .map(|_| ())
 }
 
@@ -701,7 +745,7 @@ fn rename_corrupt_sidecar(db_path: &str, kind: &str, err: &io::Error) {
 
 /// β-light step 7: 既存 sidecar を読む。 不在 (v4 DB) なら Ok(None)。 並びの索引の宣言も返す。
 #[cfg(not(target_arch = "wasm32"))]
-fn load_tables_from_sidecar(db_path: &str) -> io::Result<Option<(Vec<TableDef>, Vec<OrderDecl>)>> {
+fn load_tables_from_sidecar(db_path: &str) -> io::Result<Option<TablesSidecar>> {
     let sidecar = tables_path_for(db_path);
     enchudb_oplog::io_point("sidecar.read_tables")?;
     match std::fs::read(&sidecar) {
@@ -5034,11 +5078,13 @@ impl Engine {
         // から再合成できるので、 sidecar 破損で全 DB が unreadable になる失敗
         // モードを避ける。
         match load_tables_from_sidecar(path) {
-            Ok(Some((persisted, orders))) => {
+            Ok(Some((persisted, orders, marks))) => {
                 eng.adopt_persisted_tables(persisted);
                 // 並びの索引の宣言を戻す (table 定義の後: ref の先の表の eid の始まりを使う)。 作るのは最初に読む時
                 // (WAL の replay や Leaf の修理の後)。 作る前の書き込みは何もしないので、 replay は遅くならない
                 eng.restore_orders(orders);
+                // 位置の印の宣言も (表は最初に読む時に取る)
+                eng.restore_marks(marks);
             }
             Ok(None) => {} // 不在: 新規 DB or v4 legacy
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
@@ -8716,7 +8762,7 @@ impl Engine {
         // (守っているのは file I/O の順序だけで、guard 下の共有 state は無い)。
         let _guard =
             self.sidecar_persist_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw())?;
+        persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw(), &self.marks_decls_raw())?;
         // #9: 翻訳テーブルも同じ trigger で persist (next_local と整合させる)。
         persist_eidmap_to_sidecar(&self.path, &self.eidmap_entries_with_tombstones())?;
         // #178: 別名も同じ trigger で
@@ -8881,7 +8927,7 @@ impl Engine {
                     .sidecar_persist_lock
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Err(e) = persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw()) {
+                if let Err(e) = persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw(), &self.marks_decls_raw()) {
                     // best effort: panic せずログだけ。 user table の定義は
                     // メモリには反映されてる、 次回 reopen で失われるだけ。
                     // 0.8.15 (issue #52): ENOSPC 等で consumer thread が毎 batch
@@ -10988,6 +11034,9 @@ impl Engine {
             return;
         }
         let Some(pk) = self.pk_himo_of_slot(local) else { return };
+        if !self.pk_former_empty.load(Ordering::Acquire) {
+            self.remember_former_names_deleted(local, hlc);
+        }
         let value = self.himos.get(pk as usize).and_then(|h| h.get_value(local));
         if let Some(value) = value
             && !(self.vocab.reclaim_enabled() && matches!(self.value_types.get(pk as usize), Some(ValueType::Tag)))
@@ -11013,6 +11062,82 @@ impl Engine {
                     self.note_pk_locked(&mut g, h, &key, local, hlc);
                 }
             }
+        }
+    }
+
+    /// #551: 行 `local` を `hlc` で消した時、 その行の前の名前も消した名前として覚える (前の名前 = 同じ行。 改名を知らない peer が
+    /// 前の名前で消しても、 改名した peer が今の名前で消しても、 同じ名前の集まりを覚える)。 改名のある DB だけ通る。
+    #[cold]
+    fn remember_former_names_deleted(&self, local: u32, hlc: enchudb_oplog::Hlc) {
+        let names: Vec<(u16, Box<[u8]>)> =
+            self.pk_former.read().unwrap().names_of(local).map(|(h, k)| (h, Box::from(k))).collect();
+        if names.is_empty() {
+            return;
+        }
+        let mut g = self.pk_tombs.write().unwrap();
+        self.drain_pk_pending(&mut g);
+        for (h, k) in names {
+            self.note_pk_locked(&mut g, h, &k, crate::pk_tombs::NO_SLOT, hlc);
+        }
+    }
+
+    /// 削除優先 (#551): 消えた行 `eid` 宛ての主キーの書き込み (改名、 消える前に書かれた物も後の物も) を受け取った時。 書き込みは
+    /// 捨てるが、 名前は行の前の名前として、 また消した名前として覚える。 改名を先に受けてから削除を受けた peer では、 削除が
+    /// その名前の行を消して名前を覚える (`remember_pk_tombstone`) ので、 届く順で消した名前の集まりを変えない。
+    ///
+    /// 今その名前を持つ生きた行のうち、 削除より前にその名前になった行は同じ行なので一緒に消す (改名を先に受けた peer では、
+    /// 改名で 1 つに畳んでから消している)。 戻り値は一緒に消した行の数。 消えた行でない・主キーでない時は何もしない。
+    pub fn name_given_to_dead_row(&self, eid: enchudb_oplog::EntityId, himo: u16, value: u64) -> usize {
+        let local = enchudb_oplog::eid_local(eid);
+        if !self.is_remembered_pk_himo(himo) || !self.slot_is_dead(local) {
+            return 0;
+        }
+        let tomb = self.tombstone_version_of(local);
+        self.note_pk_former(local, himo, value);
+        {
+            let mut g = self.pk_tombs.write().unwrap();
+            self.drain_pk_pending(&mut g);
+            self.with_pk_key(himo, PkValue::Local(value), |k| {
+                self.note_pk_locked(&mut g, himo, k, crate::pk_tombs::NO_SLOT, tomb)
+            });
+        }
+        self.remove_rows_named(local, himo, value, tomb)
+    }
+
+    /// 削除優先 (#551): 主キー `value` を今持つ、 行 `local` でない生きた行のうち、 `tomb` より前にその名前になった行を `tomb` で消す
+    /// (同じ名前 = 同じ行)。 呼び手は行の lock を握っていない。 戻り値は消した行の数。
+    fn remove_rows_named(&self, local: u32, himo: u16, value: u64, tomb: enchudb_oplog::Hlc) -> usize {
+        let mut removed = 0;
+        for e in self.query_by_id64(&[(himo, value)]) {
+            let l = enchudb_oplog::eid_local(e);
+            if l != local && self.version_of(l, himo) < tomb && self.apply_delete_local(l, tomb) {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// 削除優先 (#551): 消えた行 `local` の名前 (消えた時の名前と前の名前) について [`Self::remove_rows_named`]。
+    fn remove_rows_holding_names_of(&self, local: u32, tomb: enchudb_oplog::Hlc) -> usize {
+        self.flush_pk_pending();
+        let mut names: Vec<(u16, Box<[u8]>)> =
+            self.pk_tombs.read().unwrap().key_of_slot(local).map(|(h, k)| (h, Box::from(k))).into_iter().collect();
+        if !self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) {
+            names.extend(self.pk_former.read().unwrap().names_of(local).map(|(h, k)| (h, Box::from(k))));
+        }
+        names
+            .into_iter()
+            .filter_map(|(h, k)| Some((h, self.pk_value_of_key(h, &k)?)))
+            .map(|(h, v)| self.remove_rows_named(local, h, v, tomb))
+            .sum()
+    }
+
+    /// 主キーの値の鍵 (`with_pk_key`) から今の値へ。 辞書に無い文字列 (その名前の行は無い) は None。
+    fn pk_value_of_key(&self, himo: u16, key: &[u8]) -> Option<u64> {
+        match self.value_types.get(himo as usize)? {
+            ValueType::Leaf => None,
+            ValueType::Tag => self.vocab_id_bytes(key).map(u64::from),
+            _ => Some(u64::from_le_bytes(key.try_into().ok()?)),
         }
     }
 
@@ -11858,12 +11983,18 @@ impl Engine {
     ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         self.observe_remote_hlc(hlc);
+        let raised = self.slot_is_dead(local) && hlc > self.tombstone_version_of(local);
         // A-5: 削除の版数を残す。 これが永続することで、 配送バッファから
         // tombstone が消えた後も削除済み entity が復活しない (#140 の根)。
         // 版数の記録と本体の除去は `apply_delete_local` で不可分に扱う (再配送でも
         // 本体が必ず落ちる = 冪等)。
         if !self.apply_delete_local(local, hlc) {
             return false;
+        }
+        // 削除優先 (#551): 消えた行に別の author のより新しい削除が届いた (2 人が別々に消した)。 名前の削除の時刻が上がるので、
+        // その名前を今持つ行のうち、 この削除より前にその名前になった行も消す (先に束ねてから前の削除を受けた peer では一緒に消えている)
+        if raised {
+            self.remove_rows_holding_names_of(local, hlc);
         }
         // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
         // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
@@ -15354,6 +15485,66 @@ impl Engine {
         }
     }
 
+    /// 列 (紐) に位置の印を持たせる: 書き手が置いた位置を entity ごとに覚え、 書き換え・消しの時に古い entry へ bit を立てる。
+    /// 読みは印の立った entry を飛ばして写すだけになり (Column で確かめない・往復の重複落としも無い)、 書き換えの後の範囲・等値 + 範囲の
+    /// 読みが 0.3〜0.6 倍 (100 万行、 10% を書き換えた後)。 値段は書き換え 1 列 +40 ns ほど (update +5〜15%、 外す +13〜34%、 書き手
+    /// 4 本の実測) と、 書き換えのある entity 1 件につき 4 B (位置の表、 匿名 mmap。 readonly で開いた process は触らないので 0)。
+    /// 書き換えが多くて範囲で読む列にだけ付ける。 宣言の無い列は書き手の道も読みの道も宣言が無い時のまま。
+    ///
+    /// - 円柱を組む前 (開いた直後、 読む前) の宣言は次に組む時から効く。 組んだ後の宣言は開き直して組み直す時から (もう置いてある
+    ///   entry の位置が分からないので)。 返り値 = 今の円柱で効いているか
+    /// - 宣言は `{db}/tables` に保存し (`MRK1`)、 開き直すと戻る。 宣言を知らない古い binary で開いても壊れない (読まないだけ。
+    ///   その binary が table 定義を書き直すと宣言は消える)。 memory-only の DB は保存しない
+    /// - Leaf の列には付けられない (値が entity ごとに違い、 bucket に古い entry が溜まらない)
+    pub fn declare_marks(&self, himo: &str) -> Result<bool, String> {
+        let id = self.himo_id(himo).ok_or_else(|| format!("declare_marks: unknown himo '{himo}'"))?;
+        let h = self.himos.get(id).ok_or_else(|| format!("declare_marks: himo {id} out of range"))?;
+        if h.value_type == ValueType::Leaf {
+            return Err(format!("declare_marks: '{himo}' is a Leaf himo (marks are for shared values)"));
+        }
+        let was = h.marks_declared();
+        let live = h.declare_marks(true);
+        if !was {
+            self.try_persist_tables();
+        }
+        Ok(live)
+    }
+
+    /// 位置の印 ([`declare_marks`](Self::declare_marks)) を外す。 外したら true、 宣言が無ければ false。 以後その列の読みは
+    /// Column で確かめる道に戻り、 書き手は印を付けない。 宣言は保存からも消える。
+    pub fn drop_marks(&self, himo: &str) -> Result<bool, String> {
+        let id = self.himo_id(himo).ok_or_else(|| format!("drop_marks: unknown himo '{himo}'"))?;
+        let h = self.himos.get(id).ok_or_else(|| format!("drop_marks: himo {id} out of range"))?;
+        if !h.marks_declared() {
+            return Ok(false);
+        }
+        h.declare_marks(false);
+        self.try_persist_tables();
+        Ok(true)
+    }
+
+    /// 位置の印を宣言した紐の名前 (紐の番号の順)。
+    pub fn marks_declarations(&self) -> Vec<String> {
+        self.marks_decls_raw().into_iter().map(|h| self.himo_name_at(h as usize).unwrap_or_default().to_string()).collect()
+    }
+
+    /// `{db}/tables` に書く宣言 (紐の番号)。
+    fn marks_decls_raw(&self) -> Vec<u16> {
+        (0..self.himos.len()).filter(|&i| self.himos.get(i).is_some_and(|h| h.marks_declared())).map(|i| i as u16).collect()
+    }
+
+    /// 開く時: `{db}/tables` の宣言を戻す (印の表は最初に読む時に取る)。 紐が無い / Leaf の宣言は警告して捨てる。
+    fn restore_marks(&self, decls: Vec<u16>) {
+        for h in decls {
+            match self.himos.get(h as usize) {
+                Some(s) if s.value_type != ValueType::Leaf => {
+                    s.declare_marks(true);
+                }
+                _ => eprintln!("warning: dropped a stored marks declaration (himo {h}): no such himo or a Leaf himo"),
+            }
+        }
+    }
+
     /// 宣言を確かめて並びの索引を作る (中身は空、 作るのは [`order_ready`](Self::order_ready))。
     fn new_order_index(&self, via_id: usize, key_id: usize, ticks: &[u64]) -> Result<crate::order_index::OrderIndex, String> {
         let (Some(via), Some(key)) = (self.himos.get(via_id), self.himos.get(key_id)) else {
@@ -17523,7 +17714,7 @@ impl Engine {
         // (durability は copy と同じ page-cache level、 backup の fsync は呼び出し側責務)。
         // 0.7.0: .tables には reserved table `_sync_ops` / `_sync_peers` も含む。
         if !self.tables.is_empty() {
-            std::fs::write(tables_path_for(target), serialize_tables(&self.tables, &self.order_decls_raw()))?;
+            std::fs::write(tables_path_for(target), serialize_tables(&self.tables, &self.order_decls_raw(), &self.marks_decls_raw()))?;
         }
         let eidmap_entries = self.eidmap_entries_with_tombstones();
         if !eidmap_entries.is_empty() {
@@ -22690,15 +22881,15 @@ mod order_decl_sidecar_tests {
         let eng = engine(&path);
         assert!(eng.table_eid_extents("u").unwrap().len() >= 2, "前提: EXT1 を書く");
         assert!(eng.tables.iter().any(|t| t.pk_himo.is_some()), "前提: PKS1 を書く");
-        let without = serialize_tables(&eng.tables, &[]);
+        let without = serialize_tables(&eng.tables, &[], &[]);
         assert!(!without.windows(4).any(|w| w == b"DIA1"), "宣言が無ければ DIA1 を書かない");
         eng.declare_order("u.company", "u.age", &[30, 65]).unwrap();
         let decls = eng.order_decls_raw();
         assert_eq!(decls.len(), 1);
-        let with = serialize_tables(&eng.tables, &decls);
+        let with = serialize_tables(&eng.tables, &decls, &[]);
         assert!(with.starts_with(&without) && &with[without.len()..without.len() + 4] == b"DIA1", "DIA1 は一番後ろに足す");
-        let (t0, o0) = deserialize_tables(&without).unwrap();
-        let (t1, o1) = deserialize_tables(&with).unwrap();
+        let (t0, o0, _) = deserialize_tables(&without).unwrap();
+        let (t1, o1, _) = deserialize_tables(&with).unwrap();
         assert!(o0.is_empty());
         assert_eq!(o1, decls);
         assert_eq!(shape(&t0), shape(&eng.tables), "前提: 読み戻した形が元と同じ");
@@ -22706,12 +22897,12 @@ mod order_decl_sidecar_tests {
         // 古い binary の読み方 = DIA1 を知らない = 知らない magic で止まる。 今の読み手で magic だけ変えて写す
         let mut old = with.clone();
         old[without.len()..without.len() + 4].copy_from_slice(b"ZZZ9");
-        let (t2, o2) = deserialize_tables(&old).unwrap();
+        let (t2, o2, _) = deserialize_tables(&old).unwrap();
         assert!(o2.is_empty());
         assert_eq!(shape(&t2), shape(&t0), "古い binary に見える table / PK / extent が変わった");
         // 途中で切れた DIA1 は宣言なし (table は有効)
         for cut in [1, 4, 9, 12] {
-            let (t3, o3) = deserialize_tables(&with[..with.len() - cut]).unwrap();
+            let (t3, o3, _) = deserialize_tables(&with[..with.len() - cut]).unwrap();
             assert!(o3.is_empty(), "cut {cut}");
             assert_eq!(shape(&t3), shape(&t0), "cut {cut}");
         }
@@ -22739,6 +22930,101 @@ mod order_decl_sidecar_tests {
             (via, id, vec![1]), // 同じ via への 2 つ目は置き換え
         ]);
         assert_eq!(eng.order_decls_raw(), vec![(via, id, vec![1])]);
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+    }
+}
+
+/// 位置の印の宣言 (`MRK1`、 `Engine::declare_marks`) の読み書き: DIA1 の後ろに足す、 宣言が無ければ書かない、 古い binary の
+/// 読み方 (知らない magic で止まる) で table / 並びの宣言は同じに読める、 壊れた MRK1 は宣言なしとして読む、 開く時に戻せない
+/// 宣言 (紐が無い / Leaf) は捨てる、 宣言すると保存され外すと消える。
+#[cfg(test)]
+mod marks_decl_sidecar_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> String {
+        let path = format!("/tmp/enchu_marks_decl_{name}_{}.db", std::process::id());
+        let _ = crate::db_files::remove_db(&path);
+        path
+    }
+
+    fn engine(path: &str) -> Engine {
+        let mut eng = Engine::create_growable_opts(
+            path,
+            GrowableOptions {
+                max_entities: 64,
+                max_himos: 16,
+                vocab_data_size: 64 * 1024,
+                content_data_size: Some(64 * 1024),
+                reserve_entities: Some(128),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        eng.define_table("c", 4).unwrap();
+        eng.define_table("u", 4).unwrap();
+        eng.define_himo_in("u", "id", ValueType::Number, 0).unwrap();
+        eng.define_himo_in("u", "age", ValueType::Number, 0).unwrap();
+        eng.define_himo_in("u", "memo", ValueType::Leaf, 0).unwrap();
+        eng.define_ref_in("u", "company", "c").unwrap();
+        let id = eng.himo_id("u.id").unwrap() as u16;
+        eng.set_table_pk("u", id).unwrap();
+        eng
+    }
+
+    #[test]
+    fn mrk1_is_appended_after_dia1_and_round_trips() {
+        let path = tmp("append");
+        let eng = engine(&path);
+        let (via, age) = (eng.himo_id("u.company").unwrap() as u16, eng.himo_id("u.age").unwrap() as u16);
+        let orders = vec![(via, age, vec![30u64, 65])];
+        let without = serialize_tables(&eng.tables, &orders, &[]);
+        assert!(!without.windows(4).any(|w| w == b"MRK1"), "宣言が無ければ MRK1 を書かない");
+        let with = serialize_tables(&eng.tables, &orders, &[age]);
+        assert!(with.starts_with(&without) && &with[without.len()..without.len() + 4] == b"MRK1", "MRK1 は DIA1 の後ろに足す");
+        let (t, o, m) = deserialize_tables(&with).unwrap();
+        assert_eq!((t.len(), o, m), (eng.tables.len(), orders.clone(), vec![age]));
+        // 古い binary の読み方 = MRK1 を知らない = 知らない magic で止まる。 今の読み手で magic だけ変えて写す
+        let mut old = with.clone();
+        let at = without.len();
+        old[at..at + 4].copy_from_slice(b"ZZZ9");
+        let (t2, o2, m2) = deserialize_tables(&old).unwrap();
+        assert_eq!((t2.len(), o2, m2), (eng.tables.len(), orders.clone(), vec![]));
+        // 途中で切れた MRK1 は宣言なし (table と並びは有効)
+        let (t3, o3, m3) = deserialize_tables(&with[..with.len() - 2]).unwrap();
+        assert_eq!((t3.len(), o3, m3), (eng.tables.len(), orders, vec![]));
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+    }
+
+    #[test]
+    fn restore_keeps_only_valid_declarations() {
+        let path = tmp("restore");
+        let eng = engine(&path);
+        let (age, memo) = (eng.himo_id("u.age").unwrap() as u16, eng.himo_id("u.memo").unwrap() as u16);
+        eng.restore_marks(vec![999, memo, age]);
+        assert_eq!(eng.marks_decls_raw(), vec![age], "紐が無い / Leaf は捨てる");
+        assert_eq!(eng.marks_declarations(), vec!["u.age".to_string()]);
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+    }
+
+    #[test]
+    fn declare_persists_and_drop_removes() {
+        let path = tmp("persist");
+        let eng = engine(&path);
+        assert!(matches!(eng.declare_marks("u.memo"), Err(e) if e.contains("Leaf")));
+        assert!(eng.declare_marks("nope").is_err());
+        assert!(!eng.declare_marks("u.age").unwrap(), "組む前の宣言は次に組む時から (今は効いていない)");
+        assert!(!eng.declare_marks("u.age").unwrap(), "2 度目は何もしない");
+        eng.persist_tables().unwrap();
+        let (_, _, m) = load_tables_from_sidecar(&path).unwrap().unwrap();
+        assert_eq!(m, vec![eng.himo_id("u.age").unwrap() as u16], "宣言は sidecar に書く");
+        assert!(eng.drop_marks("u.age").unwrap());
+        assert!(!eng.drop_marks("u.age").unwrap());
+        eng.persist_tables().unwrap();
+        let (_, _, m) = load_tables_from_sidecar(&path).unwrap().unwrap();
+        assert!(m.is_empty(), "外すと sidecar からも消える");
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
     }
