@@ -1476,7 +1476,11 @@ impl Syncer {
             let signed = !require_sig
                 || (rec.signature != [0u8; 64]
                     && pubkeys.get(rec.author_peer).is_some()
-                    && pubkeys.verify(rec.author_peer, &rec.signed_bytes, &rec.signature));
+                    && pubkeys.verify(rec.author_peer, &rec.signed_bytes, &rec.signature)
+                    // #568: 署名を確かめた bytes と、 当てる中身 (wire の op・HLC・author の欄) が同じ record であること。
+                    // 見ないと、 本物の署名付き record の欄だけ書き換えた record が通る (relay は bytes の方を中継する)
+                    && enchudb_oplog::oplog::decode_signed_bytes(&rec.signed_bytes)
+                        .is_some_and(|(hlc, author, op)| hlc == rec.hlc && author == rec.author_peer && op == rec.op));
             (!signed).then_some(Reject::Signature)
         };
         let pk_ties = self.primary_key_ties(records);

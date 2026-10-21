@@ -198,8 +198,22 @@ pub fn decode_sync_ops_payload(payload: &[u8]) -> Option<Record> {
     let mut pubkey_fp = [0u8; 8];
     pubkey_fp.copy_from_slice(&payload[64..72]);
     let signed_bytes = &payload[SYNC_OPS_PAYLOAD_PREFIX..];
+    let (lsn, hlc, author_peer, op) = decode_signed(signed_bytes)?;
+    Some(Record {
+        lsn, hlc, author_peer, op, signature, pubkey_fp,
+        signed_bytes: signed_bytes.to_vec(),
+    })
+}
 
-    // signed_bytes header parse
+/// #568: 署名の対象の bytes (record の header 40 B ‖ payload) から HLC・author・op を読む。 受け手は、 署名を確かめた
+/// bytes と、 当てる中身 (wire の欄) が同じ record かをこれで見る。 読めない bytes は None。
+pub fn decode_signed_bytes(signed_bytes: &[u8]) -> Option<(Hlc, PeerId, DecodedOp)> {
+    decode_signed(signed_bytes).map(|(_, hlc, author, op)| (hlc, author, op))
+}
+
+/// signed_bytes の header と payload を読む (lsn, HLC, author, op)。
+fn decode_signed(signed_bytes: &[u8]) -> Option<(u64, Hlc, PeerId, DecodedOp)> {
+    if signed_bytes.len() < SIGNED_PAYLOAD_HEADER_SIZE { return None; }
     if &signed_bytes[0..2] != REC_MAGIC { return None; }
     if !known_version(signed_bytes[OFF_VERSION]) { return None; }
     let op_byte = signed_bytes[3];
@@ -209,18 +223,12 @@ pub fn decode_sync_ops_payload(payload: &[u8]) -> Option<Record> {
     let hlc_logical = u32::from_le_bytes(signed_bytes[24..28].try_into().ok()?);
     let hlc_peer = u32::from_le_bytes(signed_bytes[28..32].try_into().ok()?);
     let author_peer = u32::from_le_bytes(signed_bytes[32..36].try_into().ok()?);
-    let _stored_crc = u32::from_le_bytes(signed_bytes[36..40].try_into().ok()?);
     let payload_off = SIGNED_PAYLOAD_HEADER_SIZE;
     let payload_end = payload_off + payload_len;
     if payload_end > signed_bytes.len() { return None; }
-    let op_payload = &signed_bytes[payload_off..payload_end];
-    let op = decode_op(op_byte, op_payload)?;
+    let op = decode_op(op_byte, &signed_bytes[payload_off..payload_end])?;
     let hlc = Hlc { wall: hlc_wall, logical: hlc_logical, peer: hlc_peer };
-
-    Some(Record {
-        lsn, hlc, author_peer, op, signature, pubkey_fp,
-        signed_bytes: signed_bytes.to_vec(),
-    })
+    Some((lsn, hlc, author_peer, op))
 }
 
 /// #451: `_sync_ops` の payload から author と HLC だけを読む ([`decode_sync_ops_payload`] と同じ形の検査、 record は
@@ -587,7 +595,7 @@ impl<'a> Op<'a> {
 }
 
 /// デコード後の op(読み戻し用、所有型)。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodedOp {
     Tie { eid: u64, himo_id: u16, value: u64 },
     Untie { eid: u64, himo_id: u16 },
