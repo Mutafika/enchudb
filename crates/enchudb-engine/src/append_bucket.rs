@@ -1,18 +1,20 @@
-//! `AppendBucket` — 単一 writer / 多 reader の lock-free append-only 列。 #95。
+//! `AppendBucket` — 書き手 1 本 (値の鍵で守る) / 多 reader の lock-free append-only 列。 #95。
 //!
 //! `BucketCylinder` の各 bucket（value → eid 列）の格納をこれに置き換える土台。
 //! 現状の `RwLock<BucketCylinder>` は read が write に相互排他になり、 長い read が
 //! write を stall させる（#95）。 この型は:
 //!
 //! - **read は完全 lock-free**（writer を一切待たない）。 crossbeam-epoch で pin。
-//! - **write は単一 consumer 前提**で直列（append O(1) amortized）。
+//! - **write は値の鍵で bucket ごとに直列**（append O(1) amortized。 前は consumer 1 本の前提だった）。
 //! - 一度 publish した要素は二度と動かさない（append-only）ので、 read は published
 //!   範囲 `[0..len]` を安全に `&[u32]` として読める。
 //! - 容量超過時のみ backing を倍化し、 旧 backing は epoch で全 reader 通過後に解放。
 //!
 //! ## 並行契約
-//! - `push` / `compact_in` は **同時に 1 thread のみ**（HimoStore write_lock 下）。
-//!   複数 writer は未対応（race する）。
+//! - `push` / `compact_in` は **同時に 1 thread のみ**。 守るのは値ごとの鍵 (`HimoStore` の `value_locks`、 0.32.1 の #467。
+//!   円柱を組む前の書き手・sparse・配列の伸長は `write_lock`、 組む時は `write_guard`)。 鍵を持てば読み手でもよい:
+//!   読み直しの詰め直し (#520、 `HimoStore::compact_if_reread`) は読み手が鍵を取って `compact_in` を呼ぶ。
+//!   鍵なしの複数 writer は未対応（race する）。
 //! - `read_to_vec` / `with_read` / `len` は **多 reader 並行可**、 writer と並行可。
 //! - request12 P2: `compact_in` は backing を組み直して swap するため、
 //!   **len は単調非減少ではない** (compaction で縮む)。reader は len の減少を
@@ -96,8 +98,8 @@ impl Buf {
 pub struct AppendBucket {
     backing: Atomic<Buf>,
     /// この bucket の値を Column が現在指している eid 数 (= verify 後の正確な件数)。
-    /// request12: 書き込み側 (HimoStore、write_lock 下) が旧値の decrement / 新値の
-    /// increment を行う。read の fast-path 判定と統計・planner の pivot 選択に使う。
+    /// request12: 値の鍵を持つ側 (HimoStore の書き手、 `value_locks` 下) が旧値の decrement / 新値の
+    /// increment を行う (詰め直しは残った数で置き直す)。read の fast-path 判定と統計・planner の pivot 選択に使う。
     live: AtomicU32,
     /// この bucket に stale (値更新/削除の残骸) が居るか。true なら read は
     /// Column verify + dedup を通す。himo 全体 flag (旧 any_removed) の bucket 局所版。
@@ -108,7 +110,7 @@ pub struct AppendBucket {
     rereads: AtomicU32,
 }
 
-// SAFETY: 単一 writer / 多 reader。 全アクセスは atomic len + epoch で同期される。
+// SAFETY: 書き手は値の鍵で 1 本 / 多 reader。 全アクセスは atomic len + epoch で同期される。
 unsafe impl Sync for AppendBucket {}
 unsafe impl Send for AppendBucket {}
 
@@ -259,7 +261,8 @@ impl AppendBucket {
     }
 
     // ──── request12: bucket ローカルメタデータ ────
-    // live/removed は write_lock 下の単一 writer だけが更新する。read 側の
+    // live/removed を更新するのは値の鍵を持つ 1 thread だけ (書き手の set / remove と、 #520 の後は読み手の読み直しの
+    // 詰め直し `compact_in` も。 排他は `value_locks`、 write_lock ではない)。read 側の
     // verify 要否は `read_marked_verify` の 3 段プロトコル (slice → flag →
     // backing ptr 再検証) で判定する。flag 単独の前読み/後読みはどちらも不健全:
     // - 前読み: flag=false load 後に積まれた churn 痕 (往復 churn の dup) を
@@ -322,7 +325,7 @@ impl AppendBucket {
         }
     }
 
-    /// 単一 writer append。 spare があれば in-place、 満杯なら倍化 + epoch 遅延解放。
+    /// 値の鍵を持つ 1 thread の append。 spare があれば in-place、 満杯なら倍化 + epoch 遅延解放。
     /// (standalone 用。 hot path は `push_in` — lib 内 caller が居なくても API として維持)
     #[allow(dead_code)]
     pub fn push(&self, eid: u32) {
@@ -337,7 +340,7 @@ impl AppendBucket {
         let cur = self.backing.load(Ordering::Acquire, guard);
         // SAFETY: backing は常に非 null（new/push で維持）。
         let b = unsafe { cur.deref() };
-        let l = b.len.load(Ordering::Relaxed); // 単一 writer なので自身の len は Relaxed で可
+        let l = b.len.load(Ordering::Relaxed); // 鍵を持つ 1 thread だけが len を進めるので自身の len は Relaxed で可
         if l < b.cap() {
             // spare slot（未 publish の index l）に書いてから len を publish
             unsafe {
@@ -373,7 +376,7 @@ impl AppendBucket {
     }
 
     /// published prefix を `keep` 判定で組み直して backing を atomic swap する
-    /// (request12 P2 = incremental compaction)。単一 writer (write_lock 下) 前提。
+    /// (request12 P2 = incremental compaction)。値の鍵を持つ 1 thread (書き手か、 #520 の読み直しの詰め直しをする読み手) 前提。
     ///
     /// - 同一 eid の重複 slot (re-tie 往復痕) は 1 本だけ残し、 残した entry は eid の昇順に並べ直す (dedup)
     /// - 旧 backing は epoch で全 reader 通過後に解放 — reader は停止しない
@@ -392,7 +395,7 @@ impl AppendBucket {
         let cur = self.backing.load(Ordering::Acquire, guard);
         // SAFETY: backing は常に非 null。
         let b = unsafe { cur.deref() };
-        let l = b.len.load(Ordering::Relaxed); // 単一 writer なので自身の len は Relaxed で可
+        let l = b.len.load(Ordering::Relaxed); // 鍵を持つ 1 thread だけが len を進めるので自身の len は Relaxed で可
         let src = unsafe { b.published(l) };
         // 分岐なしで照らす: 先に置いてから、 残すなら次へ進む (残す / 落とすは書き換えの順に入り混じるので、 分岐は半分外れる)
         let mut kept = vec![0u32; src.len()];

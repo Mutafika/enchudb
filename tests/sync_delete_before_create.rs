@@ -383,3 +383,49 @@ fn alias_before_the_create_keeps_the_early_delete() {
     drop((sa, sb, sp, sr, sr2));
     drop((a, b, p, r, r2));
 }
+
+/// #549: 作成より先に削除を受けた entity の作成が後から届いても、 表の枠を食わない (払い出した slot を生きたまま残さない)。 主キーの
+/// ある表 (束ねの道) と無い表 (普通の払い出し) の両方。 前は slot が cell 無しで生きたまま残り、 その identity の削除がもう一度当たる
+/// まで空かなかった。
+#[test]
+fn an_early_delete_leaves_no_live_slot() {
+    let dir = Dir::new("early-slot");
+    let tr = transport(3);
+    let peer = |id: u32| {
+        let mut b = Database::create_with_capacity(&dir.db(id), 4096).unwrap();
+        b.table(T).tag("key").tag("title").primary_key("key").build().unwrap();
+        b.table("logs").tag("msg").build().unwrap();
+        b.enable_sync().unwrap();
+        let db = b.finish_with_oplog(OPLOG).unwrap();
+        db.engine().set_peer_id(id);
+        let sync = Syncer::new(db.arc_engine(), tr.clone() as Arc<dyn Transport>);
+        (db, sync)
+    };
+    let (a, sa) = peer(1);
+    let (b, sb) = peer(2);
+    let (r, sr) = peer(3);
+    a.get_table(T).unwrap().upsert().set("key", "x").set("title", "a").commit().unwrap();
+    a.get_table("logs").unwrap().insert().set("msg", "hi").commit().unwrap();
+    publish(&a, &sa);
+    sb.pull_once(1);
+    b.engine().rebuild();
+    for name in [T, "logs"] {
+        let t = b.get_table(name).unwrap();
+        for e in t.all().find().unwrap() {
+            t.entity(e).delete().unwrap();
+        }
+    }
+    publish(&b, &sb);
+
+    // R は削除 (B) を先に、 作成 (A) を後に受ける
+    sr.pull_once(2);
+    sr.pull_once(1);
+    let eng = r.engine();
+    eng.rebuild();
+    for name in [T, "logs"] {
+        assert_eq!(r.get_table(name).unwrap().all().count().unwrap(), 0, "{name}: 消した行が残った");
+        assert_eq!(eng.table_eid_usage(name).unwrap().live, 0, "{name}: 作成より先に消した行の slot が生きたまま残った");
+    }
+    drop((sa, sb, sr));
+    drop((a, b, r));
+}
