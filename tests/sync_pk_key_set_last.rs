@@ -7,7 +7,10 @@
 //! 前の record を当てた後)。
 //!
 //! 今までの test (`issue141_pk_dedupe` / `sync_pk_delete_converges` / `sync_pk_recreate_in_one_batch`) は全部主キーを先に
-//! set していたので、 この退行を捉えなかった。 ここでは同じ形を主キーを最後に set して回す。
+//! set していたので、 この退行を捉えなかった。 ここでは同じ形を主キーを最後に書いて回す。
+//!
+//! #548 の後、 schema は名前 (主キー) のカードを set の順によらず最初に書く。 名前を後に書くのは engine を直に使う書き手と
+//! 古い binary の log なので、 ここではそれを engine で直に書いて作る (`write_key_last`)。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -108,9 +111,24 @@ fn titled(db: &Database, title: &str) -> usize {
     db.get_table(T).unwrap().where_eq("title", title).find().unwrap().len()
 }
 
-/// 主キーを最後に set して書く。
+/// engine を直に使い、 名前 (主キー) を最後に書く。 `cols` は (列, 値) を書く順に (値は文字列か数)。
+fn write_key_last(db: &Database, table: &str, cols: &[(&str, &str)], key: &str) -> u64 {
+    let eng = db.engine();
+    let e = eng.entity_in(table).unwrap();
+    let hid = |c: &str| eng.himo_id(&format!("{table}.{c}")).unwrap() as u16;
+    for (c, v) in cols {
+        match v.parse::<u32>() {
+            Ok(n) => eng.try_tie_to_by_id(e, hid(c), n).unwrap(),
+            Err(_) => eng.try_tie_text_to_by_id(e, hid(c), v).unwrap(),
+        }
+    }
+    eng.try_tie_text_to_by_id(e, hid("key"), key).unwrap();
+    e
+}
+
+/// 主キーを最後に書く (`write_key_last`)。
 fn upsert_key_last(db: &Database, key: &str, title: &str) {
-    db.get_table(T).unwrap().upsert().set("title", title).set("key", key).commit().unwrap();
+    write_key_last(db, T, &[("title", title)], key);
 }
 
 /// 対照: 主キーを先に set して書く。
@@ -224,7 +242,7 @@ fn recreating_a_key_set_last_in_one_batch_converges_with_the_author() {
     pull(&sc, 1);
 
     delete_key(&a, "z");
-    a.get_table(T).unwrap().insert().set("title", "y").set("n", 1i64).set("key", "z").commit().unwrap();
+    write_key_last(&a, T, &[("title", "y"), ("n", "1")], "z");
     publish(&a, &sa);
 
     later();
@@ -313,10 +331,10 @@ fn a_leaf_column_set_before_the_key_is_bound_too() {
         (db, sync)
     };
     let ((a, sa), (b, sb), (c, sc)) = (peer(1), peer(2), peer(3));
-    a.get_table("notes").unwrap().upsert().set("body", "from a").set("key", "z").commit().unwrap();
+    write_key_last(&a, "notes", &[("body", "from a")], "z");
     publish(&a, &sa);
     later();
-    b.get_table("notes").unwrap().upsert().set("body", "from b").set("key", "z").commit().unwrap();
+    write_key_last(&b, "notes", &[("body", "from b")], "z");
     publish(&b, &sb);
 
     pull(&sc, 1);
