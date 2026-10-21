@@ -216,6 +216,11 @@ fn a_stalled_listener_overrun_by_the_log_is_detached() {
 
 /// 記録に番号を振るのは書き出した record だけ (WAL の checkpoint まで)。 書き出す前の record に番号を振ると、 電源が落ちた時に
 /// 記録にだけ残り (本体には無い)、 開き直した後の番号もずれる (電源断の像の試験は `changefeed_log_power_loss.rs`)。
+///
+/// 1 回ごとに、 書き出して記録に写し (`oplog_sync`)、 書き出さずに 200 件足してから記録へ写させ、 最後に記録した record が WAL の
+/// 中で checkpoint より前に終わるかを見る。 間に WAL が畳まれた回 (記録した record が WAL に無い。 畳むのは全部を書き出した後) は
+/// 確かめられないので、 確かめた回が 3 つになるまで回す。 混んだ機械では consumer が書き手に追いつくたびに畳むので、 畳まれる回が
+/// 多い (前は 10 回で打ち切り、 12 本並べると 48 回中 26 回が 1 度も確かめられずに落ちた)。
 #[test]
 fn records_not_yet_written_out_get_no_number() {
     use enchudb_engine::change_log::{fnv1a64, ChangeLog};
@@ -226,35 +231,36 @@ fn records_not_yet_written_out_get_no_number() {
     let wal = eng.oplog().unwrap().clone();
     let ts = eng.himo_id("ts").unwrap() as u16;
     let a = eng.entity().unwrap();
-    let (mut over, mut checked) = (Vec::new(), 0);
-    for round in 0..10u64 {
-        for v in round * 1000..round * 1000 + 1000 {
+    let (mut over, mut checked, mut rounds, mut v) = (Vec::new(), 0, 0u64, 0u64);
+    let until = Instant::now() + Duration::from_secs(60);
+    while checked < 3 && Instant::now() < until {
+        rounds += 1;
+        // ここまでを書き出して記録に写す
+        eng.oplog_sync().unwrap();
+        for _ in 0..200 {
             eng.tie_to_by_id(a, ts, v);
-            if v % 50 == 49 {
+            v += 1;
+            if v % 50 == 0 {
                 eng.oplog_commit();
             }
         }
-        if round == 3 {
-            // 書き出した record を記録に入れる (後の回は、 書き出す前の record があっても最後の印がここに残ること)
-            eng.oplog_sync().unwrap();
-        }
+        // 書き出した分だけ写すはず (書き出す前の 200 件は、 consumer が間に書き出していなければ写さない)
         eng.change_log_range().unwrap();
         // 写した後に読んだ checkpoint (写した時の checkpoint 以上)
         let cp = wal.checkpoint();
-        // 最後に記録した record は、 WAL の中で checkpoint より前に終わる (畳まれて無ければ、 全部書き出した後に畳んだ)
         let Some((hlc, id)) = ChangeLog::open(std::path::Path::new(&p), 0, false, true).unwrap().last_written() else { continue };
         let (recs, _) = wal.scan_for_change_log(HEADER_SIZE as u64, u64::MAX, true);
         if let Some((_, end)) = recs.iter().find(|(r, _)| r.hlc == hlc && fnv1a64(&r.signed_bytes) == id) {
             checked += 1;
             if *end > cp {
-                over.push((round, *end, cp));
+                over.push((rounds, *end, cp));
             }
         }
     }
     drop(eng);
     let _ = db_files::remove_db(&p);
-    assert!(over.is_empty(), "書き出す前の record に番号を振った (round, 最後に記録した record の終端, checkpoint): {over:?}");
-    assert!(checked > 0, "前提: 最後に記録した record を WAL の中で確かめた");
+    assert!(over.is_empty(), "書き出す前の record に番号を振った (回, 最後に記録した record の終端, checkpoint): {over:?}");
+    assert!(checked >= 3, "前提: 最後に記録した record を WAL の中で 3 回確かめた ({rounds} 回で {checked} 回)");
 }
 
 /// `oplog_sync()` は返る前に、 自分の commit までを listener に渡す (#337。 記録がある時も、 畳むのを待たずに記録へ写して渡す)。
