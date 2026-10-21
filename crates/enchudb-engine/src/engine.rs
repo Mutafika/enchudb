@@ -8787,6 +8787,31 @@ impl Engine {
         r
     }
 
+    /// #550: 消した主キー (`pktombs`) と主キーの前の名前 (`pkformer`) の記録を、 変わっていれば書き出す。 本体の書き出し
+    /// (checkpoint や pull の cursor を進める前の `body_msync`) より**先に**呼ぶ: 本体に届いた削除は主キーの cell が消えているので、
+    /// WAL を当て直しても再配送で当て直しても主キーを引き直せない。 先に書いた記録が残っても害は無い (版は単調な max)。 呼ぶのは WAL を
+    /// 書き出した後か、 削除の record が別に残る所 (開く時の再生 / 受け取った削除 = cursor を進めていなければ再配送される) だけ
+    /// (WAL より先に書くと、 電源断で消えた削除の主キーだけが残る)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn persist_name_records(&self) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.path.is_empty()
+            || !(self.pk_tombs_dirty.load(Ordering::Acquire)
+                || self.pk_pending_nonempty.load(Ordering::Acquire)
+                || self.pk_former_dirty.load(Ordering::Acquire))
+        {
+            return Ok(());
+        }
+        let _guard = self.sidecar_persist_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.persist_pk_tombs_if_dirty()?;
+        self.persist_pk_former_if_dirty()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn persist_name_records(&self) -> io::Result<()> {
+        Ok(())
+    }
+
     /// **sync 由来 state の durability barrier**。
     ///
     /// `body_msync()` (cell 本体) + [`Engine::persist_tables`] (sidecar 3 つ)。
@@ -8817,7 +8842,8 @@ impl Engine {
         // cell 本体を先に。 local write 経路が守っている順序 (`oplog_sync`:
         // WAL fsync → body msync → checkpoint 前進) の受信側 counterpart で、
         // pull cursor が受信側の checkpoint に当たる。 dirty range 単位なので
-        // 変更量に比例する (request3)。
+        // 変更量に比例する (request3)。 #550: 消した主キーの記録は本体より先に (本体に届いた削除からは引き直せない)
+        self.persist_name_records()?;
         self.body_msync()?;
         self.persist_tables()
     }
@@ -16204,14 +16230,14 @@ impl Engine {
             // 「一度 durable だった committed record」 が replay 対象外になり
             // 恒久消失した。
             // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
-            if eng.body_msync().is_ok() && w.fsync().is_ok() {
+            if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
                 w.advance_checkpoint(w.head());
             }
             std::sync::Arc::new(w)
         } else {
             let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
             // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
-            if eng.relog_unlogged_writes(&w) && eng.body_msync().is_ok() && w.fsync().is_ok() {
+            if eng.relog_unlogged_writes(&w) && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
                 w.advance_checkpoint(w.head());
             }
             std::sync::Arc::new(w)
@@ -16691,14 +16717,14 @@ impl Engine {
             eng.relog_unlogged_writes(&w);
             // #77-H2: body msync → checkpoint の順 (open_concurrent_with_oplog と同じ)
             // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
-            if eng.body_msync().is_ok() && w.fsync().is_ok() {
+            if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
                 w.advance_checkpoint(w.head());
             }
             std::sync::Arc::new(w)
         } else {
             let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
             // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
-            if eng.relog_unlogged_writes(&w) && eng.body_msync().is_ok() && w.fsync().is_ok() {
+            if eng.relog_unlogged_writes(&w) && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
                 w.advance_checkpoint(w.head());
             }
             std::sync::Arc::new(w)
@@ -17422,7 +17448,10 @@ impl Engine {
     /// 書き出せなかった page があると fsync が ENOSPC を返す)。 失敗は `FaultKind::DiskSpace` に積む。
     fn sync_for_checkpoint(&self, wal: &enchudb_oplog::oplog::OpLog) -> bool {
         let wal_ok = wal.fsync().is_ok();
-        let body_ok = self.body_msync().is_ok();
+        // #550: 消した主キーの記録は WAL の後・本体より先に (checkpoint を進めた後は WAL から引き直せない)。 書けなければ本体も
+        // 書き出さない (WAL が書けなかった時は前と同じく本体だけ書き出す。 どちらでも checkpoint は進めない)
+        let names_ok = !wal_ok || self.persist_name_records().is_ok();
+        let body_ok = names_ok && self.body_msync().is_ok();
         if !(wal_ok && body_ok) {
             self.record_fault(
                 FaultKind::DiskSpace,
@@ -17537,6 +17566,8 @@ impl Engine {
             let durable_head = wal.head();
             let durable_lsn = wal.next_lsn().saturating_sub(1);
             wal.fsync()?;
+            // #550: 消した主キーの記録は WAL の後・本体より先に
+            self.persist_name_records()?;
             self.body_msync()?;
             // #268: Commit 失敗時に checkpoint を進めない理由は consumer tick と同じ。
             if commit_res.is_ok() || wal.append_dead() {
