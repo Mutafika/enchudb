@@ -843,60 +843,54 @@ impl LeafStore {
         (r.pending.len(), r.bytes)
     }
 
-    /// reopen 用: live な slot **word offset** 集合を渡し、 free-list を再構成する。 free-list は永続化しない
-    /// ので open 時に必ず呼ぶ。
+    /// reopen 用: live な slot の **word offset** を渡し (順不同・重複可、 中で並べる)、 free-list を再構成する。
+    /// free-list は永続化しないので open 時に必ず呼ぶ。
     ///
     /// 空き = live の slot の隙間。 live でない slot の header は読まない (#414): 電源断の後は、 分割した
     /// 余りの header / 解放した slot の header がディスクに届いていない (旧い大きな size が残っている) ことが
     /// あり、 それを信じて walk すると live の slot を飛び越して空きにしてしまう。 live の slot の header は
     /// size が読めて、 次の live の slot (無ければ high_water) を越えないことだけを確かめる。 確かめられない
     /// live の offset は返す — 呼び側は cell を外すこと (空きにした場所が使い回されると、 cell が別の値を読む)。
-    pub fn rebuild_free_list(&self, live: &HashSet<u32>) -> HashSet<u32> {
+    ///
+    /// 1 pass で、 slot ごとに header を 1 回読む (開く時間: 前は HashSet を 2 回回して Vec に写し、 slot ごとに
+    /// header を 2 回読んでいて、 Leaf の cell 100 万で 95 ms。 列から集める側も HashSet だった)。
+    pub fn rebuild_free_list(&self, mut live: Vec<u32>) -> HashSet<u32> {
         let hw = self.hw_words();
         let mut holes = self.holes.lock().unwrap_or_else(|p| p.into_inner());
         holes.clear();
         let start = self.b2w(self.data_start_byte());
-        let mut anchors: Vec<u32> = live.iter().copied().filter(|&a| a >= start).collect();
-        anchors.sort_unstable();
-        let mut broken: HashSet<u32> = live.iter().copied().filter(|&a| a < start || a >= hw).collect();
-
-        // 確かめた live の slot を (offset, size) で並べる
-        let mut kept: Vec<(u32, u32)> = Vec::with_capacity(anchors.len());
-        for (i, &a) in anchors.iter().enumerate() {
-            if a >= hw {
+        live.sort_unstable();
+        live.dedup();
+        let mut broken: HashSet<u32> = HashSet::new();
+        let min_words = self.min_slot_words();
+        let region_len = self.region.len();
+        // 確かめた live の slot の隙間を空きに (末尾の隙間は high_water を戻す)
+        let mut cur = start;
+        for (i, &a) in live.iter().enumerate() {
+            if a < start || a >= hw {
+                broken.insert(a);
                 continue;
             }
-            let limit = anchors.get(i + 1).copied().unwrap_or(hw).min(hw);
-            let ss = self.b2w(self.slot_size_bytes_at(a) as usize);
-            if ss >= self.min_slot_words() && a as u64 + ss as u64 <= limit as u64 && !self.odd_gen_at(a) {
-                kept.push((a, ss));
+            let limit = live.get(i + 1).copied().unwrap_or(hw).min(hw);
+            let o = self.w2b(a);
+            let ss_raw = self.region.as_atomic_u32(o).load(Ordering::Relaxed);
+            let ss = self.b2w((ss_raw & !HAS_GEN) as usize);
+            let freed = ss_raw & HAS_GEN != 0
+                && o + SLOT_HEADER_GEN <= region_len
+                && self.region.as_atomic_u32(o + GEN_OFF).load(Ordering::Relaxed) & 1 != 0;
+            if ss >= min_words && a as u64 + ss as u64 <= limit as u64 && !freed {
+                if a > cur {
+                    self.flush_run(&mut holes, cur, a - cur, hw);
+                }
+                cur = a + ss;
             } else {
                 broken.insert(a);
             }
-        }
-        // 隙間を空きに (末尾の隙間は high_water を戻す)
-        let mut cur = start;
-        for &(a, ss) in &kept {
-            if a > cur {
-                self.flush_run(&mut holes, cur, a - cur, hw);
-            }
-            cur = a + ss;
         }
         if cur < hw {
             self.flush_run(&mut holes, cur, hw - cur, hw);
         }
         broken
-    }
-
-    /// gen 付き slot の gen が奇数 (解放済み = `HOLE_GEN` / 書きかけ) か。 open 時に live の cell がこれを指すのは、
-    /// 解放の印はディスクに届いたが cell の書き換えが届かなかった時 (#414)。 `try_read` は読めず (None)、 借用の
-    /// `get` は旧い len で旧い中身を返す — 読み方で答えが割れるので、 壊れた slot として外す。
-    fn odd_gen_at(&self, word_off: u32) -> bool {
-        let o = self.w2b(word_off);
-        let ss_raw = self.region.as_atomic_u32(o).load(Ordering::Relaxed);
-        ss_raw & HAS_GEN != 0
-            && o + SLOT_HEADER_GEN <= self.region.len()
-            && self.region.as_atomic_u32(o + GEN_OFF).load(Ordering::Relaxed) & 1 != 0
     }
 
     /// rebuild 中: coalesce 済み free run を確定 (word 単位)。 末尾なら high_water 後退。
@@ -1281,8 +1275,8 @@ mod tests {
         let (lo, hi) = (s.w2b(b), s.w2b(d));
         s.region.fill_at(lo, hi - lo, 0);
 
-        let live: HashSet<u32> = [a, b, d].into_iter().collect();
-        let broken = s.rebuild_free_list(&live);
+        let live = vec![a, b, d];
+        let broken = s.rebuild_free_list(live.clone());
         assert_eq!(broken, [b].into_iter().collect::<HashSet<u32>>(), "壊れた slot を指す live だけを返す");
         assert_eq!(s.get(a), b"keep-a");
         assert_eq!(s.get(d), b"keep-d");
@@ -1298,7 +1292,7 @@ mod tests {
         let t = s.insert(b"tail");
         let hw = s.high_water();
         s.region.fill_at(s.w2b(t), (hw as usize) - s.w2b(t), 0);
-        let broken = s.rebuild_free_list(&[a].into_iter().collect());
+        let broken = s.rebuild_free_list(vec![a]);
         assert!(broken.is_empty());
         assert!(s.high_water() < hw, "届かなかった末尾が空きに戻っていない");
         assert_eq!(s.get(a), b"keep-a");
@@ -1321,8 +1315,8 @@ mod tests {
         // x の header がディスクで分割前の big の size のまま (x を書いた page が届かなかった)
         s.region.as_atomic_u32(s.w2b(x)).store(big_ss, Ordering::Relaxed);
 
-        let live: HashSet<u32> = [a, y].into_iter().collect();
-        let broken = s.rebuild_free_list(&live);
+        let live = vec![a, y];
+        let broken = s.rebuild_free_list(live.clone());
         assert!(broken.is_empty(), "旧い size に覆われた live を壊れた扱いにした: {broken:?}");
         assert_eq!(s.get(y), b"keep-y");
         assert_eq!(s.get(a), b"keep-a");
@@ -1343,8 +1337,8 @@ mod tests {
         let d = s.insert(b"keep-d");
         s.free(old); // cell は old を指したまま (書き換えが届かなかった)
 
-        let live: HashSet<u32> = [a, old, d].into_iter().collect();
-        let broken = s.rebuild_free_list(&live);
+        let live = vec![a, old, d];
+        let broken = s.rebuild_free_list(live.clone());
         assert_eq!(broken, [old].into_iter().collect::<HashSet<u32>>());
         assert_eq!(s.get(a), b"keep-a");
         assert_eq!(s.get(d), b"keep-d");
@@ -1363,8 +1357,8 @@ mod tests {
         let hw = s.high_water();
 
         // b, d が dead という前提で reopen を模擬: free-list を捨てて live から rebuild
-        let live: HashSet<u32> = [a, c].into_iter().collect();
-        s.rebuild_free_list(&live);
+        let live = vec![a, c];
+        s.rebuild_free_list(live.clone());
 
         // b の穴が回収されている (free_bytes > 0)、 かつ b サイズが再利用可能
         assert!(s.free_bytes() > 0, "rebuild で dead slot が free-list に載っていない");
