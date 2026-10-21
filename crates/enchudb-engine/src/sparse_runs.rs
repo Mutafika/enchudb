@@ -89,12 +89,11 @@ pub(crate) struct SparseSnap<'a> {
 }
 
 impl SparseSnap<'_> {
-    /// 値が `lo..=hi` の entry を値の順 (`desc` なら大きい順) に、 値ごとにまとめて `f(値, eid の列, 頭の昇順の長さ)` に渡す
-    /// (古い entry 込み)。 eid の列は run ごとの区間をつないだもの: run は (値, eid) の順なので区間は昇順で、 崩れはつなぎ目にしか
-    /// 無い。 頭の昇順の長さは、 つなぎ目で前の区間の最後と次の区間の最初を比べて出す (区間の数だけの比べ。 中は読まない)。
-    /// `f` が `Break` を返したら止めて `Break`。 値 1 つごとに run の本数ぶんの比べ (run の中の位置は持ち越すので、 二分探索は
-    /// 最初の 1 回だけ)。
-    pub(crate) fn walk(&self, lo: u64, hi: u64, desc: bool, mut f: impl FnMut(u64, &[u32], usize) -> ControlFlow<()>) -> ControlFlow<()> {
+    /// 値が `lo..=hi` の entry を値の順 (`desc` なら大きい順) に、 値ごとにまとめて `f(値, eid の列)` に渡す (古い entry 込み)。
+    /// eid の列は run ごとの区間をつないだもの: run は (値, eid) の順なので区間は昇順で、 崩れはつなぎ目にしか無い (並べない。
+    /// 同じ値の中の順は決めない、 #481)。 `f` が `Break` を返したら止めて `Break`。 値 1 つごとに run の本数ぶんの比べ (run の中の
+    /// 位置は持ち越すので、 二分探索は最初の 1 回だけ)。
+    pub(crate) fn walk(&self, lo: u64, hi: u64, desc: bool, mut f: impl FnMut(u64, &[u32]) -> ControlFlow<()>) -> ControlFlow<()> {
         if lo > hi {
             return ControlFlow::Continue(());
         }
@@ -119,8 +118,6 @@ impl SparseSnap<'_> {
             buf.clear();
             // 値 v の区間。 1 本目は控えるだけ、 2 本目が来たら buf につなぐ
             let mut single: Option<&[u32]> = None;
-            // 頭の昇順の長さ: 頭が全部 (= つないだ長さ) の間だけ、 次の区間が前の最後以上なら区間ごと伸ばす
-            let mut head = 0;
             for (r, s) in runs.iter().zip(left.iter_mut()) {
                 let seg = if desc {
                     let mut a = s.end;
@@ -139,27 +136,22 @@ impl SparseSnap<'_> {
                     s.start = b;
                     seg
                 };
-                let Some(&first) = seg.first() else { continue };
-                let joined = match single.take() {
+                if seg.is_empty() {
+                    continue;
+                }
+                match single.take() {
                     None if buf.is_empty() => {
                         single = Some(seg);
-                        head = seg.len();
                         continue;
                     }
-                    Some(prev) => {
-                        buf.extend_from_slice(prev);
-                        prev.len()
-                    }
-                    None => buf.len(),
-                };
-                if head == joined && buf.last().is_none_or(|&last| last <= first) {
-                    head += seg.len();
+                    Some(prev) => buf.extend_from_slice(prev),
+                    None => {}
                 }
                 buf.extend_from_slice(seg);
             }
             match single {
-                Some(seg) => f(v, seg, head)?,
-                None => f(v, &buf, head)?,
+                Some(seg) => f(v, seg)?,
+                None => f(v, &buf)?,
             }
         }
     }
@@ -444,38 +436,6 @@ mod tests {
         assert_eq!(sorted(s.lookup(all[0].0)), sorted(want));
     }
 
-    /// `walk` が値ごとに渡す頭の昇順の長さ (run ごとの区間のつなぎ目だけを比べた数) が、 渡した eid の列を探した長さ
-    /// (`sorted_prefix_len`) とちょうど同じ: 値の順・逆順、 同じ値の eid がいくつもの run にまたがって、 つなぎ目で崩れる値・
-    /// 崩れない値・同じ eid が続く値を混ぜる。 対照: 頭が途中で切れる値も、 run をまたいで頭が続く値もある。
-    #[test]
-    fn walk_reports_the_sorted_head_of_each_value() {
-        let s = SparseRuns::default();
-        let mut rng = Rng(0x5a55_0002);
-        let n = if cfg!(miri) { 600u32 } else { 20_000 };
-        for i in 0..n {
-            // 値は 32 + 8 通り。 前の 32 通りは eid に 「大きくなる」 と 「ばらばら (同じ eid も)」 を混ぜて run の間で順が崩れる
-            // ようにし、 後の 8 通りは eid が大きくなる一方 (古い run ほど小さい eid なので、 つなぎ目をまたいでも頭が続く)
-            let mono = rng.next() % 4 == 0;
-            let v = if mono { (1 << 41) + rng.next() % 8 } else { (1 << 40) + rng.next() % 32 };
-            let e = if !mono && rng.next() % 3 == 0 { (rng.next() % u64::from(n)) as u32 } else { i };
-            s.insert(v, e);
-        }
-        assert!(s.run_count() >= 2, "run が 1 本だけ (つなぎ目が無い)");
-        let (mut cut, mut across) = (0, 0);
-        for desc in [false, true] {
-            s.snapshot(|sp| {
-                sp.walk(0, u64::MAX, desc, |v, eids, head| {
-                    assert_eq!(head, crate::append_bucket::sorted_prefix_len(eids), "値 {v} (desc {desc})");
-                    cut += usize::from(head < eids.len());
-                    across += usize::from(head == eids.len() && eids.len() > 1);
-                    ControlFlow::Continue(())
-                })
-            });
-        }
-        assert!(cut > 0, "対照: 頭が途中で切れる値が無い");
-        assert!(across > 0, "対照: 頭が全部の値が無い");
-    }
-
     /// `walk` が渡す値と eid が、 全 entry を持つ素朴な Vec と同じ: 値ごとに 1 回、 値の順 (逆順も)、 eid は顔ぶれで比べる。 値は
     /// eid が 1 つの値 (1 本の run の区間をそのまま渡す) と、 いくつもの run にまたがる値 (つないで渡す) を混ぜる。 範囲の端は run の
     /// 最初 / 最後の値ちょうど・その外・中を混ぜる (端が外なら二分探索を省く `Run::span`)。 途中で止めたら、 そこまでの値。
@@ -523,7 +483,7 @@ mod tests {
             for desc in [false, true] {
                 let mut got: Vec<(u64, Vec<u32>)> = Vec::new();
                 let _ = s.snapshot(|sp| {
-                    sp.walk(lo, hi, desc, |v, eids, _| {
+                    sp.walk(lo, hi, desc, |v, eids| {
                         let mut e = eids.to_vec();
                         e.sort_unstable();
                         single += usize::from(e.len() == 1);
@@ -536,7 +496,7 @@ mod tests {
                 // 3 つ目の値で止める
                 let mut cut: Vec<u64> = Vec::new();
                 let _ = s.snapshot(|sp| {
-                    sp.walk(lo, hi, desc, |v, _, _| {
+                    sp.walk(lo, hi, desc, |v, _| {
                         cut.push(v);
                         if cut.len() == 3 { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
                     })
