@@ -149,6 +149,15 @@ jobs:
       - name: fault injection / crash matrix (crashsim)
         run: cargo test -p enchudb-engine --features crashsim --test fault_matrix --release -- --test-threads=1
 
+      # 行の lock と seqlock の code そのもの (row_lock.rs を loom の atomic で組む、 #563)。 上の 2 つは考え方の model で、
+      # row_lock.rs を変えても落ちない (握った後の fence を消しても通った)。 enchudb だけの cfg (`enchu_loom`) で組む
+      # (`--cfg loom` で組むと、 この job の電源断の試験のように model の外で engine を使う所が全部 panic する)。
+      # RUSTFLAGS が違うと全部組み直すので job の最後に置く
+      - name: loom model check (row_lock.rs そのもの)
+        env:
+          RUSTFLAGS: --cfg enchu_loom
+        run: cargo test -p enchudb-engine --test loom_row_lock --release
+
   windows-check:
     name: check (windows cross)
     runs-on: ubuntu-latest
