@@ -30,15 +30,30 @@
 //! ユーザの行 → 内部の表の行だけ (内部の表の行を握ったまま、 ユーザの行も WAL の空きも待たない: 内部の表は WAL に
 //! 積まない)。
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+// `--cfg loom` の時は loom の atomic で組み、 `tests/loom_row_lock.rs` がこの code そのものを全 interleaving で走らせる (#563)
+#[cfg(loom)]
+use loom::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+#[cfg(not(loom))]
+use std::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+#[cfg(not(loom))]
 const STRIPES: usize = 1 << 12;
+/// loom は atomic を 1 つずつ追うので、 stripe を少なくする (行 0 と 2 が同じ stripe、 1 は別)。
+#[cfg(loom)]
+const STRIPES: usize = 2;
 /// engine の内部の表の行の stripe の数 (ユーザの行の stripe の後ろに置く)。
+#[cfg(not(loom))]
 const INTERNAL_STRIPES: usize = 1 << 8;
+#[cfg(loom)]
+const INTERNAL_STRIPES: usize = 2;
 /// 内部の表の範囲を lock を取らずに引ける数。 越えた分 (表を何度も伸ばした時) は `more_internal` に置く。
 const INTERNAL_RANGES: usize = 16;
 /// 揃った版を掴めなかったら握って読むまでの試行回数。
+#[cfg(not(loom))]
 const READ_TRIES: u32 = 128;
+/// loom は試行の数だけ状態が増えるので少なくする (握って読む道も通る)。
+#[cfg(loom)]
+const READ_TRIES: u32 = 2;
 
 pub struct RowLocks {
     /// 1 stripe の版・握っている thread の印・先に握りたい読み手の数を 1 つに並べる (書き手 1 回で触る
@@ -52,7 +67,6 @@ pub struct RowLocks {
 }
 
 /// 32 B に揃えて cache line をまたがせない (24 B のままだと 3 つに 1 つがまたぐ)。
-#[derive(Default)]
 #[repr(align(32))]
 struct Stripe {
     /// 偶数 = 書き手なし、 奇数 = 書いている最中。
@@ -63,16 +77,41 @@ struct Stripe {
     urgent: AtomicU32,
 }
 
+impl Default for Stripe {
+    fn default() -> Self {
+        Stripe { ver: AtomicU64::new(0), owner: AtomicUsize::new(0), urgent: AtomicU32::new(0) }
+    }
+}
+
+#[cfg(not(loom))]
 thread_local! {
     static TOKEN: u8 = const { 0 };
 }
 
 /// thread ごとに違う 0 でない値 (thread local の番地)。
+#[cfg(not(loom))]
 fn me() -> usize {
     TOKEN.with(|t| t as *const u8 as usize)
 }
 
+/// loom の thread は thread local の置き場を使い回す (同時に生きている 2 本が同じ番地になる) ので、 番号を数えて配る。
+#[cfg(loom)]
+fn me() -> usize {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+    loom::thread_local! {
+        static TOKEN: usize = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    TOKEN.with(|t| *t)
+}
+
 fn backoff(spins: &mut u32) {
+    // loom は回り続ける thread を先に進めないので、 毎回ほかの thread に譲る
+    #[cfg(loom)]
+    {
+        let _ = spins;
+        loom::thread::yield_now();
+    }
+    #[cfg(not(loom))]
     if *spins < 64 {
         std::hint::spin_loop();
         *spins += 1;
@@ -192,7 +231,7 @@ impl RowLocks {
             self.stripes[i].urgent.fetch_sub(1, Ordering::Relaxed);
         }
         // 奇数を見せてから cell を書く (読み手が cell の新しい値を見たなら、 後の版の読みは奇数か次の版)
-        std::sync::atomic::fence(Ordering::Release);
+        fence(Ordering::Release);
         self.stripes[i].owner.store(me, Ordering::Relaxed);
         RowWrite { locks: self, i, _not_send: std::marker::PhantomData }
     }
@@ -222,7 +261,7 @@ impl RowLocks {
                 continue;
             }
             let r = f();
-            std::sync::atomic::fence(Ordering::Acquire);
+            fence(Ordering::Acquire);
             if s.load(Ordering::Relaxed) == v {
                 return r;
             }
@@ -252,7 +291,7 @@ impl Drop for RowWrite<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use std::sync::Arc;

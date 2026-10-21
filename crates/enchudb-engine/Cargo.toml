@@ -56,6 +56,10 @@ windows-sys = { version = "0.59", features = [
 # shims Instant/SystemTime for the browser.
 web-time = "1"
 
+# `--cfg loom` の時だけ、 行の lock (`row_lock.rs`) を loom の atomic で組む (tests/loom_row_lock.rs、 #563)。 普段の build には入らない
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
 [dev-dependencies]
 # model-based property test (engine op 列 vs 参照 oracle、#95 の stale/verify 網羅)
 proptest = "1"
