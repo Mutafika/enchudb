@@ -577,6 +577,25 @@ impl HimoStore {
         }
     }
 
+    /// 列の segment を開いておく (#534)。 書き込みの道 (tie / untie / delete) は列を触る前にこれを呼び、 開けなければ
+    /// 何も変えずに書き込みを断る。 [`col`](Self::col) は開けないと panic する (読みの API は `Result` を持たないので、
+    /// 握ると 「値が無い」 という間違った答えになる)。 失敗した時は列を組まない (次に触った時にまた開いてみる)。
+    pub(crate) fn ensure_loaded(&self) -> std::io::Result<()> {
+        if self.col.get().is_some() {
+            return Ok(());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let lazy = self.lazy.as_ref().expect("HimoStore column is neither loaded nor lazy");
+            let region = lazy.set.try_region(lazy.kind)?;
+            let built = Column::load_or_unwritten(region, self.value_type.width(), lazy.max_entities, lazy.padded)
+                .unwrap_or_else(|e| panic!("himo column segment {:?}: {e}", lazy.kind));
+            // 競合して先に組まれていたら、 こちらは捨てる (header を読んだだけで副作用は無い)
+            let _ = self.col.set(built);
+        }
+        Ok(())
+    }
+
     /// 遅延 column の初回組み立て。 競合しても `OnceLock` が 1 本に絞る
     /// (負けた側の `Column::load` は header を読むだけで副作用が無い)。
     #[cold]

@@ -334,3 +334,50 @@ fn receiver_with_the_same_primary_key_ends_the_same_in_either_order() {
     drop((sa, sb, s1, s2, s3));
     drop((a, b, r1, r2, r3));
 }
+
+/// #546: 「2 つの世界番号は同じ entity」 の知らせ (`Op::Alias`、 #178 の `set_emit_alias`) が、 その世界番号の作成より先に、
+/// その世界番号への Delete の後に届く。 知らせで別名を張る時も、 先に届いて退避していた削除を行に当てる (前は前向きの写像を
+/// 入れるだけで、 その世界番号の record は以後写像の速い道で解決され、 削除が当たらなかった)。
+///
+/// 形: A が z を作る → P が (A を見ずに) z を作って配る → B が A の z を消す → P が A の z を自分の行に束ねて知らせを配る。
+/// R は B → P → A の順 (削除が作成より先、 知らせも作成より先)、 R2 は A → B → P の順に pull する。 どちらも z は無い
+/// (B の削除は P の z と A の z の両方より新しい)。
+#[test]
+fn alias_before_the_create_keeps_the_early_delete() {
+    let dir = Dir::new("alias");
+    let tr = transport(5);
+    let (a, sa) = make(&dir, 1, &tr);
+    let (b, sb) = make(&dir, 2, &tr);
+    let (p, sp) = make(&dir, 3, &tr);
+    let (r, sr) = make(&dir, 4, &tr);
+    let (r2, sr2) = make(&dir, 5, &tr);
+    p.engine().set_emit_alias(true);
+    let later = || std::thread::sleep(std::time::Duration::from_millis(5));
+
+    a.get_table(T).unwrap().upsert().set("key", "z").set("title", "a").commit().unwrap();
+    publish(&a, &sa);
+    later();
+    p.get_table(T).unwrap().upsert().set("key", "z").set("title", "p").commit().unwrap();
+    publish(&p, &sp);
+    later();
+    sb.pull_once(1);
+    delete_all(&b);
+    publish(&b, &sb);
+    later();
+    sp.pull_once(1);
+    assert_eq!(p.engine().bind_over_local_writes(), 1, "前提: P が自分の書いた行に A の世界番号を束ねて知らせを書く");
+    publish(&p, &sp);
+
+    for from in [2, 3, 1] {
+        assert!(sr.pull_once(from).received > 0, "R: {from} から何も届かない");
+    }
+    for from in [1, 2, 3] {
+        assert!(sr2.pull_once(from).received > 0, "R2: {from} から何も届かない");
+    }
+    assert_eq!(rows(&r2), vec![], "前提: A → B → P の順で z は消える");
+    assert_eq!(rows(&r), rows(&r2), "知らせが作成より先に届いた R で、 先に届いた削除が当たらない");
+    assert_eq!(count_key(&r, "z"), 0);
+
+    drop((sa, sb, sp, sr, sr2));
+    drop((a, b, p, r, r2));
+}
