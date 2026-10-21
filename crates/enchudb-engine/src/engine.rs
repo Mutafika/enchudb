@@ -85,6 +85,20 @@ struct ChangeCursor {
     open_tail: Vec<crate::transport::WireRecord>,
 }
 
+/// [`Engine::verify_invariants`] の答え。 `violations` が空なら不変量は全部成り立つ。 `warnings` は 「今の code では
+/// まだ約束していないが、 約束するつもりの形」 (主キーの重複、 #601 が直るまで)
+#[derive(Debug, Default, Clone)]
+pub struct Invariants {
+    pub violations: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl Invariants {
+    pub fn ok(&self) -> bool {
+        self.violations.is_empty()
+    }
+}
+
 /// Engine の実行時状態スナップショット。
 #[derive(Debug, Clone)]
 pub struct EngineStats {
@@ -388,7 +402,7 @@ fn tables_path_for(path: &str) -> std::path::PathBuf {
 ///
 /// 並びの索引の宣言 (`orders`、 [`Engine::declare_order`]) は `DIA1` block として一番後ろに足す (`PKS1` / `EXT1` を
 /// 知っている古いバイナリは、 それを読んでから知らない magic の所で止まる)。
-fn serialize_tables(tables: &[TableDef], orders: &[OrderDecl]) -> Vec<u8> {
+fn serialize_tables(tables: &[TableDef], orders: &[OrderDecl], marks: &[u16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 + tables.len() * 128);
     out.extend_from_slice(b"TBL1");
     out.extend_from_slice(&1u32.to_le_bytes());
@@ -468,11 +482,41 @@ fn serialize_tables(tables: &[TableDef], orders: &[OrderDecl]) -> Vec<u8> {
             }
         }
     }
+    // 位置の印の宣言 ([`Engine::declare_marks`])。 DIA1 の後ろ。 宣言が無ければ書かない。
+    //   mrk_magic: "MRK1" (4)
+    //   mrk_count: u32
+    //   [himo: u32] × mrk_count
+    if !marks.is_empty() {
+        out.extend_from_slice(b"MRK1");
+        out.extend_from_slice(&(marks.len() as u32).to_le_bytes());
+        for h in marks {
+            out.extend_from_slice(&u32::from(*h).to_le_bytes());
+        }
+    }
     out
 }
 
 /// 並びの索引の宣言 1 つ: (via の紐, key の紐, 目盛り)。
 type OrderDecl = (u16, u16, Vec<u64>);
+/// `{db}/tables` の中身: (table 定義, 並びの索引の宣言, 位置の印を持つ紐)。
+type TablesSidecar = (Vec<TableDef>, Vec<OrderDecl>, Vec<u16>);
+
+/// `MRK1` block の中身 (magic の後ろ) を読む: (位置の印を持つ紐の番号, 読んだ byte 数)。 途中で切れている / 番号が紐の id に
+/// 入らないなら None。
+fn deserialize_marks(buf: &[u8]) -> Option<(Vec<u16>, usize)> {
+    let mut off = 0usize;
+    let u32_at = |off: &mut usize| -> Option<u32> {
+        let v = u32::from_le_bytes(buf.get(*off..*off + 4)?.try_into().ok()?);
+        *off += 4;
+        Some(v)
+    };
+    let count = u32_at(&mut off)? as usize;
+    let mut out = Vec::with_capacity(count.min(buf.len() / 4));
+    for _ in 0..count {
+        out.push(u16::try_from(u32_at(&mut off)?).ok()?);
+    }
+    Some((out, off))
+}
 
 /// `DIA1` block の中身 (magic の後ろ) を読む: (宣言, 読んだ byte 数)。 途中で切れている / 番号が紐の id に入らない
 /// なら None。
@@ -500,7 +544,7 @@ fn deserialize_orders(buf: &[u8]) -> Option<(Vec<OrderDecl>, usize)> {
 
 /// β-light step 7: tables sidecar を decode。 magic 不一致 / 短すぎる buffer
 /// は Err。 部分破損は次の field 読みで失敗 → Err として扱う。 並びの索引の宣言 (`DIA1`) も返す (無ければ空)。
-fn deserialize_tables(buf: &[u8]) -> Result<(Vec<TableDef>, Vec<OrderDecl>), String> {
+fn deserialize_tables(buf: &[u8]) -> Result<TablesSidecar, String> {
     if buf.len() < 12 || &buf[0..4] != b"TBL1" {
         return Err("tables sidecar: bad magic".into());
     }
@@ -568,6 +612,7 @@ fn deserialize_tables(buf: &[u8]) -> Result<(Vec<TableDef>, Vec<OrderDecl>), Str
     // (PK は再 build で復元できる派生情報であって、 table 定義の本体ではない)。
     // 末尾の optional block 群 (順不同、 未知の magic で打ち切り)
     let mut orders = Vec::new();
+    let mut marks: Vec<u16> = Vec::new();
     while off + 8 <= buf.len() {
         let magic = &buf[off..off + 4];
         if magic == b"PKS1" {
@@ -631,11 +676,23 @@ fn deserialize_tables(buf: &[u8]) -> Result<(Vec<TableDef>, Vec<OrderDecl>), Str
                     break;
                 }
             }
+        } else if magic == b"MRK1" {
+            // 位置の印の宣言。 印は列から作り直せる派生のデータなので、 壊れていたら宣言なしとして読む (sidecar 全体は有効)
+            match deserialize_marks(&buf[off + 4..]) {
+                Some((decls, used)) => {
+                    marks = decls;
+                    off += 4 + used;
+                }
+                None => {
+                    eprintln!("warning: tables sidecar: broken marks declarations (MRK1), ignored");
+                    break;
+                }
+            }
         } else {
             break;
         }
     }
-    Ok((tables, orders))
+    Ok((tables, orders, marks))
 }
 
 /// β-light step 7: tables を sidecar に atomic 書き換え。 fsync まで含む。 `orders` は並びの索引の宣言 (`DIA1`)。
@@ -644,8 +701,9 @@ fn persist_tables_to_sidecar(
     db_path: &str,
     tables: &[TableDef],
     orders: &[OrderDecl],
+    marks: &[u16],
 ) -> io::Result<()> {
-    crate::db_files::write_atomic_if_changed(&tables_path_for(db_path), &serialize_tables(tables, orders))
+    crate::db_files::write_atomic_if_changed(&tables_path_for(db_path), &serialize_tables(tables, orders, marks))
         .map(|_| ())
 }
 
@@ -701,7 +759,7 @@ fn rename_corrupt_sidecar(db_path: &str, kind: &str, err: &io::Error) {
 
 /// β-light step 7: 既存 sidecar を読む。 不在 (v4 DB) なら Ok(None)。 並びの索引の宣言も返す。
 #[cfg(not(target_arch = "wasm32"))]
-fn load_tables_from_sidecar(db_path: &str) -> io::Result<Option<(Vec<TableDef>, Vec<OrderDecl>)>> {
+fn load_tables_from_sidecar(db_path: &str) -> io::Result<Option<TablesSidecar>> {
     let sidecar = tables_path_for(db_path);
     enchudb_oplog::io_point("sidecar.read_tables")?;
     match std::fs::read(&sidecar) {
@@ -1463,6 +1521,23 @@ mod wal_hook {
     }
 }
 
+/// test 用の割り込み点: ローカルの cell の書き込み (`try_tie_to_by_id`) が WAL に積んだ後、 cell に当てる前 (#563)。 同じ cell の
+/// 別の書き手をその間に走らせ、 WAL の順と当てる順がずれない (行を握ったまま積んで当てる、 #505) ことを決まって確かめるため。
+#[cfg(test)]
+mod cell_append_hook {
+    use enchudb_oplog::oplog::OpLog;
+
+    static HOOK: super::wal_hook::Slots = super::wal_hook::Slots::new();
+
+    pub(super) fn set(wal: &OpLog, f: impl FnOnce(&OpLog) + Send + 'static) {
+        HOOK.set(wal, f);
+    }
+
+    pub(super) fn call(wal: &OpLog) {
+        HOOK.call(wal);
+    }
+}
+
 /// test 用の割り込み点: `make_wal_room_inner` が 「満杯でない」 を見た後、 開いている group を閉じる Commit を打つ前。
 /// 書き手の thread の Commit が、 その間に WAL の残りを埋める窓を踏むため。 置いた WAL (番地で見分ける) で 1 回だけ呼ぶ
 /// (並んで走る他の test の engine では呼ばない)。 consumer の thread から呼ばれるので thread local ではない。
@@ -1724,6 +1799,79 @@ mod wal_room_commit_tests {
         assert_eq!(eng.wal_dropped_records(), 0, "bridge の lock が取れなかった試しで、 待っている書き手が諦めた");
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
+    }
+}
+
+/// #563 / #505: 同じ cell の 2 本の書き手で、 WAL に積む順と cell に当てる順がずれない。 1 本目が積んだ後・当てる前 (割り込み点) に
+/// 2 本目を走らせる。 行を握ったまま積んで当てる今の形なら 2 本目は 1 本目が当て終えるまで待つ。 前の形 (積んでから握る) だと 2 本目が
+/// 先に当て、 版数の無い DB では cell が WAL の最後の record と違う値で残り、 版数のある DB では 1 本目が `OlderThanCell` で弾かれた
+/// (`same_cell_wal_order.rs` は確率的で、 直す前に 1 round 約 5 %)。
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod cell_wal_order_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn run(tag: &str, cell_version: bool) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = format!("/tmp/enchudb-cellwal-{tag}-{}-{nanos}.db", std::process::id());
+        let mut eng = if cell_version {
+            Engine::create_with_cell_version(&path, 1024).unwrap()
+        } else {
+            Engine::create_without_cell_version(&path, 1024).unwrap()
+        };
+        eng.define_table("t", 100).unwrap();
+        let v = eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap() as u16;
+        eng.flush().unwrap();
+        eng.persist_tables().unwrap();
+        let eng = Engine::concurrentize_with_oplog(eng, 1 << 20).unwrap();
+        let e = eng.entity_in("t").unwrap();
+        let wal = eng.oplog.as_ref().unwrap().clone();
+        let second: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<Result<(), TieRejected>>>>> = Arc::default();
+        let (eng2, second2) = (eng.clone(), second.clone());
+        cell_append_hook::set(&wal, move |_| {
+            let done = Arc::new(AtomicBool::new(false));
+            let done2 = done.clone();
+            let h = std::thread::spawn(move || {
+                let r = eng2.try_tie_to_by_id(e, v, 2u32);
+                done2.store(true, Ordering::Release);
+                r
+            });
+            // 今の形では 2 本目は行で待つので終わらない。 前の形では積んで当てて終わる
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+            while !done.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            *second2.lock().unwrap() = Some(h);
+        });
+        let first = eng.try_tie_to_by_id(e, v, 1u32);
+        let h = second.lock().unwrap().take().expect("前提: 割り込み点を通った");
+        let second = h.join().unwrap();
+        let cell = eng.get_by_id(e, v);
+        let last = wal
+            .records_with_tail()
+            .into_iter()
+            .filter_map(|r| match r.op {
+                enchudb_oplog::oplog::DecodedOp::Tie { himo_id, value, .. } if himo_id == v => Some(value),
+                _ => None,
+            })
+            .last();
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+        let _ = std::fs::remove_file(oplog_path_for(&path));
+        assert_eq!(first, Ok(()), "{tag}: 1 本目が弾かれた (2 本目が後に積んで先に当てた)");
+        assert_eq!(second, Ok(()), "{tag}: 2 本目が弾かれた");
+        assert_eq!(cell, last, "{tag}: cell が WAL の最後の record と違う (積む順と当てる順がずれた)");
+    }
+
+    #[test]
+    fn same_cell_writers_apply_in_wal_order_without_cell_versions() {
+        run("nover", false);
+    }
+
+    #[test]
+    fn same_cell_writers_apply_in_wal_order_with_cell_versions() {
+        run("ver", true);
     }
 }
 
@@ -5034,11 +5182,13 @@ impl Engine {
         // から再合成できるので、 sidecar 破損で全 DB が unreadable になる失敗
         // モードを避ける。
         match load_tables_from_sidecar(path) {
-            Ok(Some((persisted, orders))) => {
+            Ok(Some((persisted, orders, marks))) => {
                 eng.adopt_persisted_tables(persisted);
                 // 並びの索引の宣言を戻す (table 定義の後: ref の先の表の eid の始まりを使う)。 作るのは最初に読む時
                 // (WAL の replay や Leaf の修理の後)。 作る前の書き込みは何もしないので、 replay は遅くならない
                 eng.restore_orders(orders);
+                // 位置の印の宣言も (表は最初に読む時に取る)
+                eng.restore_marks(marks);
             }
             Ok(None) => {} // 不在: 新規 DB or v4 legacy
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
@@ -5054,7 +5204,14 @@ impl Engine {
         // #414: table の定義が決まった後で — 前は sidecar を読む前に呼んでいて、 engine 内部の table の Leaf 列
         // (辞書の番号を持つ) を LeafStore の offset と見ていた
         if !readonly {
-            eng.rebuild_leaf_free_list()?;
+            // 開く時間: きれいに閉じた時に残した空き一覧 (`leaf.free`、 紐名の辞書の印が CLEAN_LEAF の時だけ信じる) が今の
+            // store と合えば列から作り直さない (Leaf の region を読まない)。 合わなければ (kill / 電源断 / 知らない binary が
+            // 閉じた / file が無い・壊れた) 今まで通り列から作り直す
+            if eng.himo_reg.leaf_free_on_load() && eng.load_leaf_free_list() {
+                eng.ensure_leaf_columns_loaded()?;
+            } else {
+                eng.rebuild_leaf_free_list()?;
+            }
         }
 
         // v10: sync tables を持つ DB は版数列 (`ver/*.seg` / `tomb.seg`) を持つのが不変条件。
@@ -6134,7 +6291,7 @@ impl Engine {
 
         // #77-H6: 既存 DB の再 enable (reopen 経路) では、 body に残る過去 rows /
         // watermark から lsn 採番を復元する。
-        self.rehydrate_next_sync_lsn();
+        self.rehydrate_next_sync_lsn().map_err(|e| e.to_string())?;
 
         // request18: ここが 「この DB は sync に参加する」 と確定する唯一の点。
         // v9 領域 (per-cell version column + tombstone column) はこれ以降に意味を
@@ -6159,25 +6316,24 @@ impl Engine {
     /// 呼ばないと lsn 採番が 1 に戻り、 peer の ack 済み watermark より小さい lsn
     /// が発行されて `pending_sync_ops(since)` が永久に空 = **再起動後の全 write が
     /// 既存 peer に配信されない** silent loss になっていた。
-    fn rehydrate_next_sync_lsn(&self) {
+    ///
+    /// 開く時間: 列を 1 回なめて最大を取る (前は値のある entity の一覧 (Vec、 配る分 100 万行で 4 MB) を作ってから 1 つずつ
+    /// 引いていた)。 呼ぶのは consumer を起こす前 / `&mut self` の中 = 書き手と並走しない (`for_each_set_value` の前提)。
+    /// 列を開けなければ Err (開くのを失敗させる): 黙って低い lsn で進むと #77-H6 の silent loss をそのまま作る。 前は列を初めて
+    /// 読む所で panic していた
+    fn rehydrate_next_sync_lsn(&self) -> io::Result<()> {
         use std::sync::atomic::Ordering;
-        if !self.sync_tables_enabled() { return; }
+        if !self.sync_tables_enabled() { return Ok(()); }
         let mut max_lsn = 0u32;
-        if let Some(lsn_hid) = self.himo_id("_sync_ops.lsn") {
-            let hid = lsn_hid as u16;
-            for eid in self.entities_with_himo(hid) {
-                if let Some(l) = self.get_by_id32(eid, hid) {
-                    if l > max_lsn { max_lsn = l; }
-                }
-            }
-        }
-        if let Some(cons_hid) = self.himo_id("_sync_peers.consumed_lsn") {
-            let hid = cons_hid as u16;
-            for eid in self.entities_with_himo(hid) {
-                if let Some(l) = self.get_by_id32(eid, hid) {
-                    if l > max_lsn { max_lsn = l; }
-                }
-            }
+        for name in ["_sync_ops.lsn", "_sync_peers.consumed_lsn"] {
+            let Some(hid) = self.himo_id(name) else { continue };
+            let Some(hs) = self.himos.get(hid) else { continue };
+            hs.ensure_loaded()
+                .map_err(|e| io::Error::new(e.kind(), format!("{name} の列を開けない ({e}) — next_sync_lsn を復元できない")))?;
+            hs.for_each_set_value(|v| {
+                let v = v as u32;
+                if v > max_lsn { max_lsn = v; }
+            });
         }
         if max_lsn > 0 {
             // 既に進んでいる場合は後退させない (enable → open の二重呼び等)
@@ -6186,6 +6342,7 @@ impl Engine {
                 self.next_sync_lsn.store(max_lsn + 1, Ordering::Release);
             }
         }
+        Ok(())
     }
 
     /// 0.7.0 (Phase 3): sync tables が有効化済みか。 schema crate / Syncer が
@@ -8718,7 +8875,7 @@ impl Engine {
         // (守っているのは file I/O の順序だけで、guard 下の共有 state は無い)。
         let _guard =
             self.sidecar_persist_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw())?;
+        persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw(), &self.marks_decls_raw())?;
         // #9: 翻訳テーブルも同じ trigger で persist (next_local と整合させる)。
         persist_eidmap_to_sidecar(&self.path, &self.eidmap_entries_with_tombstones())?;
         // #178: 別名も同じ trigger で
@@ -8741,6 +8898,31 @@ impl Engine {
             self.pk_former_dirty.store(true, Ordering::Release);
         }
         r
+    }
+
+    /// #550: 消した主キー (`pktombs`) と主キーの前の名前 (`pkformer`) の記録を、 変わっていれば書き出す。 本体の書き出し
+    /// (checkpoint や pull の cursor を進める前の `body_msync`) より**先に**呼ぶ: 本体に届いた削除は主キーの cell が消えているので、
+    /// WAL を当て直しても再配送で当て直しても主キーを引き直せない。 先に書いた記録が残っても害は無い (版は単調な max)。 呼ぶのは WAL を
+    /// 書き出した後か、 削除の record が別に残る所 (開く時の再生 / 受け取った削除 = cursor を進めていなければ再配送される) だけ
+    /// (WAL より先に書くと、 電源断で消えた削除の主キーだけが残る)。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn persist_name_records(&self) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.path.is_empty()
+            || !(self.pk_tombs_dirty.load(Ordering::Acquire)
+                || self.pk_pending_nonempty.load(Ordering::Acquire)
+                || self.pk_former_dirty.load(Ordering::Acquire))
+        {
+            return Ok(());
+        }
+        let _guard = self.sidecar_persist_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.persist_pk_tombs_if_dirty()?;
+        self.persist_pk_former_if_dirty()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn persist_name_records(&self) -> io::Result<()> {
+        Ok(())
     }
 
     /// **sync 由来 state の durability barrier**。
@@ -8773,7 +8955,8 @@ impl Engine {
         // cell 本体を先に。 local write 経路が守っている順序 (`oplog_sync`:
         // WAL fsync → body msync → checkpoint 前進) の受信側 counterpart で、
         // pull cursor が受信側の checkpoint に当たる。 dirty range 単位なので
-        // 変更量に比例する (request3)。
+        // 変更量に比例する (request3)。 #550: 消した主キーの記録は本体より先に (本体に届いた削除からは引き直せない)
+        self.persist_name_records()?;
         self.body_msync()?;
         self.persist_tables()
     }
@@ -8857,7 +9040,7 @@ impl Engine {
                     .sidecar_persist_lock
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Err(e) = persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw()) {
+                if let Err(e) = persist_tables_to_sidecar(&self.path, &self.tables, &self.order_decls_raw(), &self.marks_decls_raw()) {
                     // best effort: panic せずログだけ。 user table の定義は
                     // メモリには反映されてる、 次回 reopen で失われるだけ。
                     // 0.8.15 (issue #52): ENOSPC 等で consumer thread が毎 batch
@@ -10858,6 +11041,7 @@ impl Engine {
             // 削除されずに slot だけ回った (= 到達不能になった) ケース。 覚えることは無い。
             return;
         }
+        self.move_names_to_identities(local, &keys);
         let mut g = self.foreign_tombs.write().unwrap();
         for key in keys {
             let e = g.entry(key).or_insert(enchudb_oplog::Hlc::ZERO);
@@ -10867,6 +11051,36 @@ impl Engine {
         }
         self.foreign_tombs_empty
             .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// #545: 消えた行の slot `local` を使い回す前に、 その行の名前 (消えた時の名前と前の名前) を、 slot に写っていた identity に移す。
+    /// slot の記録は使い回しで外れるので、 移さないと、 写像の外れた identity 宛てに後から届いた (別の author の、 より新しい) 削除で
+    /// その名前の削除の時刻を上げられない (`remote_delete_apply_foreign`)。
+    fn move_names_to_identities(&self, local: u32, identities: &[(enchudb_oplog::PeerId, u32)]) {
+        use std::sync::atomic::Ordering;
+        let mut names: Vec<(u16, Box<[u8]>)> = Vec::new();
+        if !self.pk_tombs_empty.load(Ordering::Acquire) || self.pk_pending_nonempty.load(Ordering::Acquire) {
+            self.flush_pk_pending();
+            names.extend(self.pk_tombs.read().unwrap().key_of_slot(local).map(|(h, k)| (h, Box::from(k))));
+        }
+        let former_on = !self.pk_former_empty.load(Ordering::Acquire);
+        if names.is_empty() && !former_on {
+            return;
+        }
+        let mut former = self.pk_former.write().unwrap();
+        if former_on {
+            names.extend(former.names_of(local).map(|(h, k)| (h, Box::from(k))));
+        }
+        let mut changed = false;
+        for &(peer, foreign_local) in identities {
+            for (h, k) in &names {
+                changed |= former.insert_identity(peer, foreign_local, *h, k);
+            }
+        }
+        if changed {
+            self.pk_former_empty.store(false, Ordering::Release);
+            self.pk_former_dirty.store(true, Ordering::Release);
+        }
     }
 
     /// #166: `(author_peer, foreign_local)` に **新しい slot** を払い出した直後に、
@@ -10964,6 +11178,9 @@ impl Engine {
             return;
         }
         let Some(pk) = self.pk_himo_of_slot(local) else { return };
+        if !self.pk_former_empty.load(Ordering::Acquire) {
+            self.remember_former_names_deleted(local, hlc);
+        }
         let value = self.himos.get(pk as usize).and_then(|h| h.get_value(local));
         if let Some(value) = value
             && !(self.vocab.reclaim_enabled() && matches!(self.value_types.get(pk as usize), Some(ValueType::Tag)))
@@ -10989,6 +11206,112 @@ impl Engine {
                     self.note_pk_locked(&mut g, h, &key, local, hlc);
                 }
             }
+        }
+    }
+
+    /// #551: 行 `local` を `hlc` で消した時、 その行の前の名前も消した名前として覚える (前の名前 = 同じ行。 改名を知らない peer が
+    /// 前の名前で消しても、 改名した peer が今の名前で消しても、 同じ名前の集まりを覚える)。 改名のある DB だけ通る。
+    #[cold]
+    fn remember_former_names_deleted(&self, local: u32, hlc: enchudb_oplog::Hlc) {
+        let names: Vec<(u16, Box<[u8]>)> =
+            self.pk_former.read().unwrap().names_of(local).map(|(h, k)| (h, Box::from(k))).collect();
+        if names.is_empty() {
+            return;
+        }
+        let mut g = self.pk_tombs.write().unwrap();
+        self.drain_pk_pending(&mut g);
+        for (h, k) in names {
+            self.note_pk_locked(&mut g, h, &k, crate::pk_tombs::NO_SLOT, hlc);
+        }
+    }
+
+    /// 削除優先 (#551): 消えた行 `eid` 宛ての主キーの書き込み (改名、 消える前に書かれた物も後の物も) を受け取った時。 書き込みは
+    /// 捨てるが、 名前は行の前の名前として、 また消した名前として覚える。 改名を先に受けてから削除を受けた peer では、 削除が
+    /// その名前の行を消して名前を覚える (`remember_pk_tombstone`) ので、 届く順で消した名前の集まりを変えない。
+    ///
+    /// 今その名前を持つ生きた行のうち、 削除より前にその名前になった行は同じ行なので一緒に消す (改名を先に受けた peer では、
+    /// 改名で 1 つに畳んでから消している)。 戻り値は一緒に消した行の数。 消えた行でない・主キーでない時は何もしない。
+    pub fn name_given_to_dead_row(&self, eid: enchudb_oplog::EntityId, himo: u16, value: u64) -> usize {
+        let local = enchudb_oplog::eid_local(eid);
+        if !self.is_remembered_pk_himo(himo) || !self.slot_is_dead(local) {
+            return 0;
+        }
+        let tomb = self.tombstone_version_of(local);
+        self.note_pk_former(local, himo, value);
+        {
+            let mut g = self.pk_tombs.write().unwrap();
+            self.drain_pk_pending(&mut g);
+            self.with_pk_key(himo, PkValue::Local(value), |k| {
+                self.note_pk_locked(&mut g, himo, k, crate::pk_tombs::NO_SLOT, tomb)
+            });
+        }
+        self.remove_rows_named(local, himo, value, tomb)
+    }
+
+    /// 削除優先 (#551): 主キー `value` を今持つ、 行 `local` (`u32::MAX` = 除く行なし) でない生きた行のうち、 `tomb` より前にその名前になった行を `tomb` で消す
+    /// (同じ名前 = 同じ行)。 呼び手は行の lock を握っていない。 戻り値は消した行の数。
+    fn remove_rows_named(&self, local: u32, himo: u16, value: u64, tomb: enchudb_oplog::Hlc) -> usize {
+        let mut removed = 0;
+        for e in self.query_by_id64(&[(himo, value)]) {
+            let l = enchudb_oplog::eid_local(e);
+            if l != local && self.version_of(l, himo) < tomb && self.apply_delete_local(l, tomb) {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// 削除優先 (#551): 消えた行 `local` の名前 (消えた時の名前と前の名前) について [`Self::remove_rows_named`]。
+    fn remove_rows_holding_names_of(&self, local: u32, tomb: enchudb_oplog::Hlc) -> usize {
+        self.flush_pk_pending();
+        let mut names: Vec<(u16, Box<[u8]>)> =
+            self.pk_tombs.read().unwrap().key_of_slot(local).map(|(h, k)| (h, Box::from(k))).into_iter().collect();
+        if !self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) {
+            names.extend(self.pk_former.read().unwrap().names_of(local).map(|(h, k)| (h, Box::from(k))));
+        }
+        names
+            .into_iter()
+            .filter_map(|(h, k)| Some((h, self.pk_value_of_key(h, &k)?)))
+            .map(|(h, v)| self.remove_rows_named(local, h, v, tomb))
+            .sum()
+    }
+
+    /// #545: identity `(peer, foreign_local)` に移した名前 (`move_names_to_identities`) を `tomb` で消した名前にし、 その名前を今持つ
+    /// 行のうち `tomb` より前にその名前になった行を消す。
+    fn raise_identity_names(&self, peer: enchudb_oplog::PeerId, foreign_local: u32, tomb: enchudb_oplog::Hlc) {
+        if self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let names: Vec<(u16, Box<[u8]>)> = self
+            .pk_former
+            .read()
+            .unwrap()
+            .names_of_identity(peer, foreign_local)
+            .map(|(h, k)| (h, Box::from(k)))
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+        {
+            let mut g = self.pk_tombs.write().unwrap();
+            self.drain_pk_pending(&mut g);
+            for (h, k) in &names {
+                self.note_pk_locked(&mut g, *h, k, crate::pk_tombs::NO_SLOT, tomb);
+            }
+        }
+        for (h, k) in names {
+            if let Some(v) = self.pk_value_of_key(h, &k) {
+                self.remove_rows_named(u32::MAX, h, v, tomb);
+            }
+        }
+    }
+
+    /// 主キーの値の鍵 (`with_pk_key`) から今の値へ。 辞書に無い文字列 (その名前の行は無い) は None。
+    fn pk_value_of_key(&self, himo: u16, key: &[u8]) -> Option<u64> {
+        match self.value_types.get(himo as usize)? {
+            ValueType::Leaf => None,
+            ValueType::Tag => self.vocab_id_bytes(key).map(u64::from),
+            _ => Some(u64::from_le_bytes(key.try_into().ok()?)),
         }
     }
 
@@ -11151,6 +11474,124 @@ impl Engine {
         self.scan_interrupted_deletes(/*repair=*/ true)
     }
 
+    /// 不変量の検査 (診断用、 O(DB の大きさ)。 総当たりの試験・電源断の像の検証・サポートの調査で呼ぶ。 書き手と並走しない
+    /// 所で呼ぶこと = 開いた直後か、 書き手を止めてから)。 見るもの:
+    ///
+    /// - Leaf: 置いてある cell の slot が全部読める (解放の印・切れた header が無い)、 空きの一覧が範囲の中で offset の順に
+    ///   重ならない、 空きの中に live の slot が無い (使い回すと別の値を読む)
+    /// - 途中で切れた delete が無い (tombstone が立っているのに古い cell が生きている entity)
+    /// - Tag の cell (と engine 内部の表の Leaf 列 = 辞書の番号) の語が辞書にある
+    /// - EntitySet: 生きている数と bitmap が合う、 生きている local は next_eid より前
+    /// - 警告: 表ごとに名前 (主キー) の値が生きている行で重複しない (#601 が直るまでは成り立たないので警告)
+    ///
+    /// sync の表の不変量 (配る分の payload と行、 pktombs / pkformer と行) は別の session が足す
+    pub fn verify_invariants(&self) -> Invariants {
+        let mut out = Invariants::default();
+        let names = self.himo_names();
+        let name_of = |hid: usize| names.get(hid).cloned().unwrap_or_else(|| format!("himo {hid}"));
+        // Leaf
+        if let Some(leaf) = self.leaf.as_ref() {
+            let (start, hw) = leaf.bounds_words();
+            let mut live: Vec<u32> = Vec::new();
+            for hid in 0..self.himos.len() {
+                if self.leaf_for(hid).is_none() {
+                    continue;
+                }
+                if let Err(e) = self.himos[hid].ensure_loaded() {
+                    out.violations.push(format!("Leaf の列 {} を開けない: {e}", name_of(hid)));
+                    continue;
+                }
+                let mut bad = 0usize;
+                let mut first = None;
+                self.himos[hid].for_each_set_cell(|local, off| {
+                    let off = off as u32;
+                    live.push(off);
+                    if off < start || off >= hw || !matches!(leaf.try_read(off), LeafRead::Ok(_)) {
+                        bad += 1;
+                        first.get_or_insert((local, off));
+                    }
+                });
+                if let Some((local, off)) = first {
+                    out.violations.push(format!(
+                        "Leaf の列 {} の cell {bad} 個が読めない slot を指す (最初: entity {local} → slot {off}、 範囲 {start}..{hw})",
+                        name_of(hid)
+                    ));
+                }
+            }
+            live.sort_unstable();
+            let mut cur = start;
+            for (off, size) in leaf.holes_snapshot() {
+                if size == 0 || off < cur || off as u64 + size as u64 > hw as u64 {
+                    out.violations.push(format!("Leaf の空き ({off}, {size}) が範囲 {start}..{hw} の外か前の空きと重なる (前の端 {cur})"));
+                }
+                cur = off.saturating_add(size);
+                let i = live.partition_point(|&o| o < off);
+                if let Some(&o) = live.get(i).filter(|&&o| (o as u64) < off as u64 + size as u64) {
+                    out.violations.push(format!("Leaf の空き ({off}, {size}) の中に live の slot {o} がある (使い回すと別の値を読む)"));
+                }
+            }
+        }
+        // 途中で切れた delete
+        let n = self.interrupted_delete_count();
+        if n > 0 {
+            out.violations.push(format!("途中で切れた delete が {n} 件 (tombstone が立っているのに古い cell が生きている)"));
+        }
+        // Tag の語 (と engine 内部の表の Leaf 列 = 辞書の番号)
+        for hid in 0..self.himos.len() {
+            let vt = self.value_types.get(hid).copied();
+            let uses_vocab = vt == Some(ValueType::Tag) || (vt == Some(ValueType::Leaf) && self.leaf_for(hid).is_none());
+            if !uses_vocab || self.himos[hid].ensure_loaded().is_err() {
+                continue;
+            }
+            let mut bad = 0usize;
+            let mut first = None;
+            self.himos[hid].for_each_set_cell(|local, vid| {
+                if self.vocab.get_checked(vid as u32).is_none() {
+                    bad += 1;
+                    first.get_or_insert((local, vid));
+                }
+            });
+            if let Some((local, vid)) = first {
+                out.violations.push(format!("列 {} の cell {bad} 個が辞書に無い語を指す (最初: entity {local} → 語 {vid})", name_of(hid)));
+            }
+        }
+        // EntitySet
+        let live = self.entities.iter();
+        let counted = self.entities.count() as usize;
+        if live.len() != counted {
+            out.violations.push(format!("EntitySet の数 {counted} と bitmap の生きている数 {} が合わない", live.len()));
+        }
+        if let Some(&max) = live.last().filter(|&&m| m >= self.entities.next_eid()) {
+            out.violations.push(format!("生きている local {max} が next_eid {} 以上", self.entities.next_eid()));
+        }
+        // 警告: 表ごとの名前 (主キー) の重複
+        for t in &self.tables {
+            let Some(pk) = t.pk_himo else { continue };
+            let Some(hs) = self.himos.get(pk as usize) else { continue };
+            if hs.ensure_loaded().is_err() {
+                continue;
+            }
+            let mut seen: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+            for local in t.eid_range_lo..t.eid_range_hi.min(self.entities.next_eid()) {
+                if !self.entities.is_live(local) {
+                    continue;
+                }
+                if let Some(v) = hs.get_value(local) {
+                    *seen.entry(v).or_insert(0) += 1;
+                }
+            }
+            let dups: Vec<(u64, u32)> = seen.into_iter().filter(|&(_, n)| n > 1).collect();
+            if let Some(&(v, n)) = dups.iter().max_by_key(|&&(_, n)| n) {
+                out.warnings.push(format!(
+                    "表 {} の名前 (主キー) が重複: {} 種類 (最多: 値 {v} が生きた行 {n} 個、 #601)",
+                    t.name,
+                    dups.len()
+                ));
+            }
+        }
+        out
+    }
+
     /// crash が delete を途中で切った跡を open 時に掃除する。 戻り値は直した entity 数。
     ///
     /// 対象は **「tombstone が立っているのに、 それより古い cell が生きている」 entity**。
@@ -11185,15 +11626,22 @@ impl Engine {
         if tomb_count == 0 {
             return 0;
         }
+        // tombstone の列を線形に読み、 版数のある cell (削除された entity) だけ見る。 前は生きている entity の一覧
+        // (Vec) を作って 1 つずつ tombstone の列を引いていた (100 万 entity で 23 ms、 開くたび)。 削除は少ないのが常態
+        // なので、 0 の cell を 2 語の or で飛ばす方が、 生きている entity の数によらず列の大きさ (16 B × count) だけで済む
+        let raw = self.tomb_col.as_ref().map(|c| c.cells_raw(tomb_count)).unwrap_or(&[]);
         let mut repaired = 0usize;
-        for local in self.entities.iter() {
-            if local >= tomb_count {
-                continue;
-            }
-            let tomb = self.tombstone_hlc_local(local);
-            if tomb == enchudb_oplog::Hlc::ZERO {
+        for (local, cell) in raw.chunks_exact(HLC_CELL_BYTES as usize).enumerate() {
+            let lo = u64::from_le_bytes(cell[0..8].try_into().unwrap());
+            let hi = u64::from_le_bytes(cell[8..16].try_into().unwrap());
+            if lo | hi == 0 {
                 continue; // 削除されていない = 常態
             }
+            let local = local as u32;
+            if !self.entities.is_live(local) {
+                continue;
+            }
+            let tomb = hlc_from_cell(cell);
             // 削除より後に書かれた cell だけが 「削除後に作り直された行」。
             // それ以外 (古い / 版数不明) が 1 つでも生きていれば、 削除が
             // 途中で切れた跡なので本体除去をやり直す。 判断は
@@ -11646,6 +12094,52 @@ impl Engine {
         self.free_leaf_offset(hid, old);
     }
 
+    /// #534: Leaf の列を全部読む。 列の segment を開けなければ開くのを失敗させる (前は列を初めて開く所で panic した)
+    fn ensure_leaf_columns_loaded(&self) -> io::Result<()> {
+        for hid in 0..self.himos.len() {
+            if self.leaf_for(hid).is_some() {
+                self.himos[hid].ensure_loaded()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 開く時間: 閉じる時に Leaf の空き一覧を `{db}/leaf.free` に書く (fsync まで)。 書けたら true (file のある backing だけ)。
+    /// 呼ぶのは閉じる時の書き出しの後 (`durable_end` で待っていた slot も空きに戻った後)、 印 (`CLEAN_LEAF`) を立てる前
+    #[cfg(not(target_arch = "wasm32"))]
+    fn persist_leaf_free_list(&self) -> io::Result<bool> {
+        let Some(leaf) = self.leaf.as_ref() else { return Ok(false) };
+        if !matches!(self.backing, Backing::Segments(_)) || self.path.is_empty() {
+            return Ok(false);
+        }
+        let bytes = leaf.free_list_bytes();
+        crate::db_files::write_atomic_if_changed(&crate::db_files::path_for(&self.path, crate::db_files::LEAFFREE), &bytes)?;
+        Ok(true)
+    }
+
+    /// 開く時間: 閉じた時の空き一覧の file を読んで入れる。 無い / 壊れている / 今の store と合わない時は false (列から作り直す)
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_leaf_free_list(&self) -> bool {
+        let Some(leaf) = self.leaf.as_ref() else { return false };
+        if !matches!(self.backing, Backing::Segments(_)) || self.path.is_empty() {
+            return false;
+        }
+        match std::fs::read(crate::db_files::path_for(&self.path, crate::db_files::LEAFFREE)) {
+            Ok(bytes) => leaf.install_free_list(&bytes),
+            Err(_) => false,
+        }
+    }
+
+    /// Leaf の空き (word の合計を byte で。 診断用、 Leaf が無ければ 0)
+    pub fn leaf_free_bytes(&self) -> u64 {
+        self.leaf.as_ref().map_or(0, |l| l.free_bytes())
+    }
+
+    /// 開く時間 (診断用): 開いた時に Leaf の空き一覧を閉じた時の file から入れたか (false = 列から作り直した / Leaf が無い)
+    pub fn leaf_free_list_from_file(&self) -> bool {
+        self.leaf.as_ref().is_some_and(|l| l.free_list_from_file())
+    }
+
     /// v6 (#88): open 時に routed-Leaf の live cell offset を集めて LeafStore の
     /// free-list を再構成する (free-list は非永続 = store の派生)。 writable open の
     /// load 末尾で呼ぶ。 これが無いと過去 session で空いた slot が再利用されない。
@@ -11655,22 +12149,18 @@ impl Engine {
     /// 全部 eager に戻る)。 raw cell の走査に替えて、 index は最初に触る列だけ組む。
     fn rebuild_leaf_free_list(&self) -> io::Result<()> {
         let Some(leaf) = self.leaf.as_ref() else { return Ok(()) };
-        // #534: Leaf の列を全部読む。 列の segment を開けなければ開くのを失敗させる (前は列を初めて開く所で panic した)
-        for hid in 0..self.himos.len() {
-            if self.leaf_for(hid).is_some() {
-                self.himos[hid].ensure_loaded()?;
-            }
-        }
-        let mut live: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        self.ensure_leaf_columns_loaded()?;
+        // 列から Vec に集めて渡す (並べるのは LeafStore 側。 前は HashSet で、 Leaf の cell 100 万で 33 ms)
+        let mut live: Vec<u32> = Vec::new();
         for hid in 0..self.himos.len() {
             if self.leaf_for(hid).is_some() {
                 // leaf の列は u32 (offset)
                 self.himos[hid].for_each_set_value(|off| {
-                    live.insert(off as u32);
+                    live.push(off as u32);
                 });
             }
         }
-        let broken = leaf.rebuild_free_list(&live);
+        let broken = leaf.rebuild_free_list(live);
         if broken.is_empty() {
             return Ok(());
         }
@@ -11834,12 +12324,18 @@ impl Engine {
     ) -> bool {
         let local = enchudb_oplog::eid_local(eid);
         self.observe_remote_hlc(hlc);
+        let raised = self.slot_is_dead(local) && hlc > self.tombstone_version_of(local);
         // A-5: 削除の版数を残す。 これが永続することで、 配送バッファから
         // tombstone が消えた後も削除済み entity が復活しない (#140 の根)。
         // 版数の記録と本体の除去は `apply_delete_local` で不可分に扱う (再配送でも
         // 本体が必ず落ちる = 冪等)。
         if !self.apply_delete_local(local, hlc) {
             return false;
+        }
+        // 削除優先 (#551): 消えた行に別の author のより新しい削除が届いた (2 人が別々に消した)。 名前の削除の時刻が上がるので、
+        // その名前を今持つ行のうち、 この削除より前にその名前になった行も消す (先に束ねてから前の削除を受けた peer では一緒に消えている)
+        if raised {
+            self.remove_rows_holding_names_of(local, hlc);
         }
         // #209: relay append はここ (翻訳後の値しか持たない場所) から Syncer 側
         // (原 WireRecord を持つ場所、Engine::relay_record) に移動した。
@@ -11877,11 +12373,19 @@ impl Engine {
         self.observe_remote_hlc(hlc);
         let owner = enchudb_oplog::eid_peer(foreign_eid);
         let foreign_local = enchudb_oplog::eid_local(foreign_eid);
+        let before = self.foreign_tombstone_of(owner, foreign_local);
         match self
             .eid_translator
             .if_unmapped(owner, foreign_local, || self.remember_foreign_tombstone(owner, foreign_local, hlc))
         {
-            Ok(accepted) => accepted,
+            Ok(accepted) => {
+                // #545: 消えた行の slot を使い回して写像が外れた entity に、 より新しい削除が届いた。 その行の名前の削除の時刻を上げ、
+                // その名前を今持つ行のうち、 この削除より前にその名前になった行を消す (`remote_delete_apply` の 2 人目の削除と同じ)
+                if accepted && before.is_some_and(|t| hlc > t) {
+                    self.raise_identity_names(owner, foreign_local, hlc);
+                }
+                accepted
+            }
             Err(local) => {
                 let self_peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
                 self.remote_delete_apply(enchudb_oplog::make_eid(self_peer, local), hlc)
@@ -12724,6 +13228,10 @@ impl Engine {
             let oplog_eid = self.oplog_eid(eid);
             self.append_local_op(enchudb_oplog::oplog::Op::Tie { eid: oplog_eid, himo_id, value })
         };
+        #[cfg(test)]
+        if let Some(wal) = self.oplog.as_ref() {
+            cell_append_hook::call(wal);
+        }
         let written = self.set_cell_in(row.as_ref(), eid, himo_id, value, hlc);
         drop(row);
         if pinned {
@@ -15330,6 +15838,66 @@ impl Engine {
         }
     }
 
+    /// 列 (紐) に位置の印を持たせる: 書き手が置いた位置を entity ごとに覚え、 書き換え・消しの時に古い entry へ bit を立てる。
+    /// 読みは印の立った entry を飛ばして写すだけになり (Column で確かめない・往復の重複落としも無い)、 書き換えの後の範囲・等値 + 範囲の
+    /// 読みが 0.3〜0.6 倍 (100 万行、 10% を書き換えた後)。 値段は書き換え 1 列 +40 ns ほど (update +5〜15%、 外す +13〜34%、 書き手
+    /// 4 本の実測) と、 書き換えのある entity 1 件につき 4 B (位置の表、 匿名 mmap。 readonly で開いた process は触らないので 0)。
+    /// 書き換えが多くて範囲で読む列にだけ付ける。 宣言の無い列は書き手の道も読みの道も宣言が無い時のまま。
+    ///
+    /// - 円柱を組む前 (開いた直後、 読む前) の宣言は次に組む時から効く。 組んだ後の宣言は開き直して組み直す時から (もう置いてある
+    ///   entry の位置が分からないので)。 返り値 = 今の円柱で効いているか
+    /// - 宣言は `{db}/tables` に保存し (`MRK1`)、 開き直すと戻る。 宣言を知らない古い binary で開いても壊れない (読まないだけ。
+    ///   その binary が table 定義を書き直すと宣言は消える)。 memory-only の DB は保存しない
+    /// - Leaf の列には付けられない (値が entity ごとに違い、 bucket に古い entry が溜まらない)
+    pub fn declare_marks(&self, himo: &str) -> Result<bool, String> {
+        let id = self.himo_id(himo).ok_or_else(|| format!("declare_marks: unknown himo '{himo}'"))?;
+        let h = self.himos.get(id).ok_or_else(|| format!("declare_marks: himo {id} out of range"))?;
+        if h.value_type == ValueType::Leaf {
+            return Err(format!("declare_marks: '{himo}' is a Leaf himo (marks are for shared values)"));
+        }
+        let was = h.marks_declared();
+        let live = h.declare_marks(true);
+        if !was {
+            self.try_persist_tables();
+        }
+        Ok(live)
+    }
+
+    /// 位置の印 ([`declare_marks`](Self::declare_marks)) を外す。 外したら true、 宣言が無ければ false。 以後その列の読みは
+    /// Column で確かめる道に戻り、 書き手は印を付けない。 宣言は保存からも消える。
+    pub fn drop_marks(&self, himo: &str) -> Result<bool, String> {
+        let id = self.himo_id(himo).ok_or_else(|| format!("drop_marks: unknown himo '{himo}'"))?;
+        let h = self.himos.get(id).ok_or_else(|| format!("drop_marks: himo {id} out of range"))?;
+        if !h.marks_declared() {
+            return Ok(false);
+        }
+        h.declare_marks(false);
+        self.try_persist_tables();
+        Ok(true)
+    }
+
+    /// 位置の印を宣言した紐の名前 (紐の番号の順)。
+    pub fn marks_declarations(&self) -> Vec<String> {
+        self.marks_decls_raw().into_iter().map(|h| self.himo_name_at(h as usize).unwrap_or_default().to_string()).collect()
+    }
+
+    /// `{db}/tables` に書く宣言 (紐の番号)。
+    fn marks_decls_raw(&self) -> Vec<u16> {
+        (0..self.himos.len()).filter(|&i| self.himos.get(i).is_some_and(|h| h.marks_declared())).map(|i| i as u16).collect()
+    }
+
+    /// 開く時: `{db}/tables` の宣言を戻す (印の表は最初に読む時に取る)。 紐が無い / Leaf の宣言は警告して捨てる。
+    fn restore_marks(&self, decls: Vec<u16>) {
+        for h in decls {
+            match self.himos.get(h as usize) {
+                Some(s) if s.value_type != ValueType::Leaf => {
+                    s.declare_marks(true);
+                }
+                _ => eprintln!("warning: dropped a stored marks declaration (himo {h}): no such himo or a Leaf himo"),
+            }
+        }
+    }
+
     /// 宣言を確かめて並びの索引を作る (中身は空、 作るのは [`order_ready`](Self::order_ready))。
     fn new_order_index(&self, via_id: usize, key_id: usize, ticks: &[u64]) -> Result<crate::order_index::OrderIndex, String> {
         let (Some(via), Some(key)) = (self.himos.get(via_id), self.himos.get(key_id)) else {
@@ -15955,7 +16523,7 @@ impl Engine {
         let eng = Self::create_with_capacity(path, DEFAULT_MAX_ENTITIES)?;
         let oplog_path = oplog_path_for(path);
         let wal = std::sync::Arc::new(enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?);
-        eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
+        eng.rehydrate_next_sync_lsn()?; // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
     }
 
@@ -16014,19 +16582,19 @@ impl Engine {
             // 「一度 durable だった committed record」 が replay 対象外になり
             // 恒久消失した。
             // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
-            if eng.body_msync().is_ok() && w.fsync().is_ok() {
+            if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
                 w.advance_checkpoint(w.head());
             }
             std::sync::Arc::new(w)
         } else {
             let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
             // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
-            if eng.relog_unlogged_writes(&w) && eng.body_msync().is_ok() && w.fsync().is_ok() {
+            if eng.relog_unlogged_writes(&w) && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
                 w.advance_checkpoint(w.head());
             }
             std::sync::Arc::new(w)
         };
-        eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
+        eng.rehydrate_next_sync_lsn()?; // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
     }
 
@@ -16063,12 +16631,36 @@ impl Engine {
     ///
     /// 対象外: 中継した他人の cell (版数の peer が自分でない — author の署名を作れない)、 配らない table (reserved)、
     /// content。 作った record の署名は開いた時点の鍵 (まだ無いので署名なし — #140 の state 転写と同じ)。
+    /// #557: cell と tombstone の版数の最大 (版数の列を全部なめる。 汚れた終了の後に開く時だけ)。
+    fn max_cell_version(&self) -> enchudb_oplog::Hlc {
+        let mut top = enchudb_oplog::Hlc::ZERO;
+        for hid in 0..self.himos.len() {
+            let Some(n) = self.ver_col(hid as u16).map(|c| c.count()) else { continue };
+            for local in 0..n {
+                top = top.max(self.cell_hlc_local(local, hid as u16));
+            }
+        }
+        if let Some(n) = self.tomb_col.as_ref().map(|c| c.count()) {
+            for local in 0..n {
+                top = top.max(self.tombstone_hlc_local(local));
+            }
+        }
+        top
+    }
+
     fn relog_unlogged_writes(&self, wal: &enchudb_oplog::oplog::OpLog) -> bool {
         use enchudb_oplog::Hlc;
         use enchudb_oplog::oplog::Op;
         // きれいに閉じたかは紐名の辞書の clean flag で見る (辞書 (vocab) の flag は、 一度も語を入れていない DB では
         // 読めない — 空の辞書は header を書いていないので 「まっさら」 と読む)。 sync する DB は紐を必ず持つ
-        if !self.himo_reg.rebuilt_on_load || !self.has_cell_version() || !self.sync_tables_enabled() {
+        if !self.himo_reg.rebuilt_on_load || !self.has_cell_version() {
+            return false;
+        }
+        if !self.sync_tables_enabled() {
+            // #557: 配らない DB は作り直さないが、 HLC の種は cell の版数から取る。 開く時の種は WAL に残った record だけなので、
+            // 畳んだ直後 (WAL が空) の汚れた終了で時計が戻っていると、 ローカルの書き込みが前に書いた cell より古い版数を採って
+            // 弾かれた (record は WAL に載った後)。 配る DB は、 畳んだ後も配る分の record と下の作り直しが種になる
+            wal.observe_hlc(self.max_cell_version());
             return false;
         }
         let me = self.peer_id();
@@ -16501,19 +17093,19 @@ impl Engine {
             eng.relog_unlogged_writes(&w);
             // #77-H2: body msync → checkpoint の順 (open_concurrent_with_oplog と同じ)
             // #317: 書き出せなければ checkpoint を据え置く (次の open でもう一度 replay する)
-            if eng.body_msync().is_ok() && w.fsync().is_ok() {
+            if eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
                 w.advance_checkpoint(w.head());
             }
             std::sync::Arc::new(w)
         } else {
             let w = enchudb_oplog::oplog::OpLog::create(&oplog_path, oplog_capacity)?;
             // #451: oplog を一度も書き出さないまま落ちても、 本体に届いた write はある
-            if eng.relog_unlogged_writes(&w) && eng.body_msync().is_ok() && w.fsync().is_ok() {
+            if eng.relog_unlogged_writes(&w) && eng.persist_name_records().is_ok() && eng.body_msync().is_ok() && w.fsync().is_ok() {
                 w.advance_checkpoint(w.head());
             }
             std::sync::Arc::new(w)
         };
-        eng.rehydrate_next_sync_lsn(); // #77-H6: recovery 後の rows も含めて復元
+        eng.rehydrate_next_sync_lsn()?; // #77-H6: recovery 後の rows も含めて復元
         Ok(Self::spawn_consumer_with_oplog(eng, Some(wal)))
     }
 
@@ -17235,7 +17827,10 @@ impl Engine {
     /// 書き出せなかった page があると fsync が ENOSPC を返す)。 失敗は `FaultKind::DiskSpace` に積む。
     fn sync_for_checkpoint(&self, wal: &enchudb_oplog::oplog::OpLog) -> bool {
         let wal_ok = wal.fsync().is_ok();
-        let body_ok = self.body_msync().is_ok();
+        // #550: 消した主キーの記録は WAL の後・本体より先に (checkpoint を進めた後は WAL から引き直せない)。 書けなければ本体も
+        // 書き出さない (WAL が書けなかった時は前と同じく本体だけ書き出す。 どちらでも checkpoint は進めない)
+        let names_ok = !wal_ok || self.persist_name_records().is_ok();
+        let body_ok = names_ok && self.body_msync().is_ok();
         if !(wal_ok && body_ok) {
             self.record_fault(
                 FaultKind::DiskSpace,
@@ -17350,6 +17945,8 @@ impl Engine {
             let durable_head = wal.head();
             let durable_lsn = wal.next_lsn().saturating_sub(1);
             wal.fsync()?;
+            // #550: 消した主キーの記録は WAL の後・本体より先に
+            self.persist_name_records()?;
             self.body_msync()?;
             // #268: Commit 失敗時に checkpoint を進めない理由は consumer tick と同じ。
             if commit_res.is_ok() || wal.append_dead() {
@@ -17497,7 +18094,7 @@ impl Engine {
         // (durability は copy と同じ page-cache level、 backup の fsync は呼び出し側責務)。
         // 0.7.0: .tables には reserved table `_sync_ops` / `_sync_peers` も含む。
         if !self.tables.is_empty() {
-            std::fs::write(tables_path_for(target), serialize_tables(&self.tables, &self.order_decls_raw()))?;
+            std::fs::write(tables_path_for(target), serialize_tables(&self.tables, &self.order_decls_raw(), &self.marks_decls_raw()))?;
         }
         let eidmap_entries = self.eidmap_entries_with_tombstones();
         if !eidmap_entries.is_empty() {
@@ -17952,12 +18549,14 @@ impl Engine {
     /// mark 前の msync で「flag が指す中身」を先に固める順序が要る (flush() から切り出し)。
     #[cfg(not(target_arch = "wasm32"))]
     fn sync_and_mark_clean(&self) -> io::Result<()> {
-        self.sync_and_mark_clean_with(false)
+        self.sync_and_mark_clean_with(false, false)
     }
 
     /// `refs` = 参照数の file も閉じた時の cell と合っている (`seal_vocab_refs` 済み) → `CLEAN_REFS` を書く (#385)。
+    /// `closing` = 閉じる時 (この後に書き手は居ない) → Leaf の空き一覧を file に残して紐名の辞書に `CLEAN_LEAF` を書く (開く時間)。
+    /// 途中の flush では書かない: 印の後に Leaf を書いてから落ちると、 次の open が古い file を信じて live の slot を使い回す
     #[cfg(not(target_arch = "wasm32"))]
-    fn sync_and_mark_clean_with(&self, refs: bool) -> io::Result<()> {
+    fn sync_and_mark_clean_with(&self, refs: bool, closing: bool) -> io::Result<()> {
         // #414: 書き出しの前に積んだ旧 Leaf slot は、 書き出しが成功したら空きに戻せる
         let leaf_token = self.leaf.as_ref().map(|l| l.durable_begin());
         // #440: 書き出しの前に bridge が写した record は、 書き出しが成功したら oplog から畳める。 ring は行より先に
@@ -17976,7 +18575,11 @@ impl Engine {
         } else {
             self.vocab.mark_index_clean(true);
         }
-        self.himo_reg.mark_index_clean(true);
+        if closing && self.persist_leaf_free_list().unwrap_or(false) {
+            self.himo_reg.mark_index_clean_leaf();
+        } else {
+            self.himo_reg.mark_index_clean(true);
+        }
         self.write_out_body(true)?;
         if let Backing::Segments(set) = &self.backing {
             set.write_manifest()?;
@@ -18200,7 +18803,7 @@ impl Drop for Engine {
             self.contents.sync();
             // #385: 参照数を閉じた時の cell の数に揃えて (購読が押さえていた番号を返す)、 file を書き出してから印を立てる
             let refs = self.seal_vocab_refs();
-            let _ = self.sync_and_mark_clean_with(refs);
+            let _ = self.sync_and_mark_clean_with(refs, true);
         }
     }
 }
@@ -22664,15 +23267,15 @@ mod order_decl_sidecar_tests {
         let eng = engine(&path);
         assert!(eng.table_eid_extents("u").unwrap().len() >= 2, "前提: EXT1 を書く");
         assert!(eng.tables.iter().any(|t| t.pk_himo.is_some()), "前提: PKS1 を書く");
-        let without = serialize_tables(&eng.tables, &[]);
+        let without = serialize_tables(&eng.tables, &[], &[]);
         assert!(!without.windows(4).any(|w| w == b"DIA1"), "宣言が無ければ DIA1 を書かない");
         eng.declare_order("u.company", "u.age", &[30, 65]).unwrap();
         let decls = eng.order_decls_raw();
         assert_eq!(decls.len(), 1);
-        let with = serialize_tables(&eng.tables, &decls);
+        let with = serialize_tables(&eng.tables, &decls, &[]);
         assert!(with.starts_with(&without) && &with[without.len()..without.len() + 4] == b"DIA1", "DIA1 は一番後ろに足す");
-        let (t0, o0) = deserialize_tables(&without).unwrap();
-        let (t1, o1) = deserialize_tables(&with).unwrap();
+        let (t0, o0, _) = deserialize_tables(&without).unwrap();
+        let (t1, o1, _) = deserialize_tables(&with).unwrap();
         assert!(o0.is_empty());
         assert_eq!(o1, decls);
         assert_eq!(shape(&t0), shape(&eng.tables), "前提: 読み戻した形が元と同じ");
@@ -22680,12 +23283,12 @@ mod order_decl_sidecar_tests {
         // 古い binary の読み方 = DIA1 を知らない = 知らない magic で止まる。 今の読み手で magic だけ変えて写す
         let mut old = with.clone();
         old[without.len()..without.len() + 4].copy_from_slice(b"ZZZ9");
-        let (t2, o2) = deserialize_tables(&old).unwrap();
+        let (t2, o2, _) = deserialize_tables(&old).unwrap();
         assert!(o2.is_empty());
         assert_eq!(shape(&t2), shape(&t0), "古い binary に見える table / PK / extent が変わった");
         // 途中で切れた DIA1 は宣言なし (table は有効)
         for cut in [1, 4, 9, 12] {
-            let (t3, o3) = deserialize_tables(&with[..with.len() - cut]).unwrap();
+            let (t3, o3, _) = deserialize_tables(&with[..with.len() - cut]).unwrap();
             assert!(o3.is_empty(), "cut {cut}");
             assert_eq!(shape(&t3), shape(&t0), "cut {cut}");
         }
@@ -22713,6 +23316,101 @@ mod order_decl_sidecar_tests {
             (via, id, vec![1]), // 同じ via への 2 つ目は置き換え
         ]);
         assert_eq!(eng.order_decls_raw(), vec![(via, id, vec![1])]);
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+    }
+}
+
+/// 位置の印の宣言 (`MRK1`、 `Engine::declare_marks`) の読み書き: DIA1 の後ろに足す、 宣言が無ければ書かない、 古い binary の
+/// 読み方 (知らない magic で止まる) で table / 並びの宣言は同じに読める、 壊れた MRK1 は宣言なしとして読む、 開く時に戻せない
+/// 宣言 (紐が無い / Leaf) は捨てる、 宣言すると保存され外すと消える。
+#[cfg(test)]
+mod marks_decl_sidecar_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> String {
+        let path = format!("/tmp/enchu_marks_decl_{name}_{}.db", std::process::id());
+        let _ = crate::db_files::remove_db(&path);
+        path
+    }
+
+    fn engine(path: &str) -> Engine {
+        let mut eng = Engine::create_growable_opts(
+            path,
+            GrowableOptions {
+                max_entities: 64,
+                max_himos: 16,
+                vocab_data_size: 64 * 1024,
+                content_data_size: Some(64 * 1024),
+                reserve_entities: Some(128),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        eng.define_table("c", 4).unwrap();
+        eng.define_table("u", 4).unwrap();
+        eng.define_himo_in("u", "id", ValueType::Number, 0).unwrap();
+        eng.define_himo_in("u", "age", ValueType::Number, 0).unwrap();
+        eng.define_himo_in("u", "memo", ValueType::Leaf, 0).unwrap();
+        eng.define_ref_in("u", "company", "c").unwrap();
+        let id = eng.himo_id("u.id").unwrap() as u16;
+        eng.set_table_pk("u", id).unwrap();
+        eng
+    }
+
+    #[test]
+    fn mrk1_is_appended_after_dia1_and_round_trips() {
+        let path = tmp("append");
+        let eng = engine(&path);
+        let (via, age) = (eng.himo_id("u.company").unwrap() as u16, eng.himo_id("u.age").unwrap() as u16);
+        let orders = vec![(via, age, vec![30u64, 65])];
+        let without = serialize_tables(&eng.tables, &orders, &[]);
+        assert!(!without.windows(4).any(|w| w == b"MRK1"), "宣言が無ければ MRK1 を書かない");
+        let with = serialize_tables(&eng.tables, &orders, &[age]);
+        assert!(with.starts_with(&without) && &with[without.len()..without.len() + 4] == b"MRK1", "MRK1 は DIA1 の後ろに足す");
+        let (t, o, m) = deserialize_tables(&with).unwrap();
+        assert_eq!((t.len(), o, m), (eng.tables.len(), orders.clone(), vec![age]));
+        // 古い binary の読み方 = MRK1 を知らない = 知らない magic で止まる。 今の読み手で magic だけ変えて写す
+        let mut old = with.clone();
+        let at = without.len();
+        old[at..at + 4].copy_from_slice(b"ZZZ9");
+        let (t2, o2, m2) = deserialize_tables(&old).unwrap();
+        assert_eq!((t2.len(), o2, m2), (eng.tables.len(), orders.clone(), vec![]));
+        // 途中で切れた MRK1 は宣言なし (table と並びは有効)
+        let (t3, o3, m3) = deserialize_tables(&with[..with.len() - 2]).unwrap();
+        assert_eq!((t3.len(), o3, m3), (eng.tables.len(), orders, vec![]));
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+    }
+
+    #[test]
+    fn restore_keeps_only_valid_declarations() {
+        let path = tmp("restore");
+        let eng = engine(&path);
+        let (age, memo) = (eng.himo_id("u.age").unwrap() as u16, eng.himo_id("u.memo").unwrap() as u16);
+        eng.restore_marks(vec![999, memo, age]);
+        assert_eq!(eng.marks_decls_raw(), vec![age], "紐が無い / Leaf は捨てる");
+        assert_eq!(eng.marks_declarations(), vec!["u.age".to_string()]);
+        drop(eng);
+        let _ = crate::db_files::remove_db(&path);
+    }
+
+    #[test]
+    fn declare_persists_and_drop_removes() {
+        let path = tmp("persist");
+        let eng = engine(&path);
+        assert!(matches!(eng.declare_marks("u.memo"), Err(e) if e.contains("Leaf")));
+        assert!(eng.declare_marks("nope").is_err());
+        assert!(!eng.declare_marks("u.age").unwrap(), "組む前の宣言は次に組む時から (今は効いていない)");
+        assert!(!eng.declare_marks("u.age").unwrap(), "2 度目は何もしない");
+        eng.persist_tables().unwrap();
+        let (_, _, m) = load_tables_from_sidecar(&path).unwrap().unwrap();
+        assert_eq!(m, vec![eng.himo_id("u.age").unwrap() as u16], "宣言は sidecar に書く");
+        assert!(eng.drop_marks("u.age").unwrap());
+        assert!(!eng.drop_marks("u.age").unwrap());
+        eng.persist_tables().unwrap();
+        let (_, _, m) = load_tables_from_sidecar(&path).unwrap().unwrap();
+        assert!(m.is_empty(), "外すと sidecar からも消える");
         drop(eng);
         let _ = crate::db_files::remove_db(&path);
     }

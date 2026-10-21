@@ -8,11 +8,19 @@
 //! - (主キーの himo, 前の値の鍵) → 行の slot。 値の鍵は `pk_tombs.rs` と同じ (Tag は文字列の bytes、 それ以外は値の 8 byte)
 //! - 行が消えても残す (改名して消した行に、 改名を知らずに後から古い名前で作った行も同じ行にする)。 slot を別の行に
 //!   使い回す時に外す
+//! - 消えた行への改名 (書き込みは捨てる) の名前も、 その行の前の名前に足す (#551。 後から別の author のより新しい削除が
+//!   届いた時に、 その名前の削除の時刻も上げる)
+//! - 行を消す時、 前の名前も消した名前として覚える (`pk_tombs.rs`、 #551)
+//!
+//! - slot を使い回す時 (`clear_cell_versions`)、 消えた行の名前 (消えた時の名前と前の名前) を、 その slot に写っていた
+//!   identity (作った peer, その peer での番号) に移す (#545)。 写像の外れた identity 宛ての削除が後から届いた時に、 その名前の
+//!   削除の時刻を上げるため (slot の記録は使い回しで外れる)
 //!
 //! 永続化は DB directory の `pkformer` に、 変わった時にまるごと書く (改名の数だけなので小さい)。 無ければ空。 読まない旧
 //! binary は前の名前を知らないだけ (前と同じ、 今の名前でだけ束ねる)。
 //!
-//! file: magic "PKFN"(4) + version u32=1 + count u32、 続いて (himo u16, slot u32, 鍵の長さ u32, 鍵) × count
+//! file: magic "PKFN"(4) + version u32 + count u32、 続いて (himo u16, slot u32, 鍵の長さ u32, 鍵) × count。 version 2 は続けて
+//! identity の名前: count u32、 (peer u32, その peer での番号 u32, himo u16, 鍵の長さ u32, 鍵) × count (version 1 も読む)
 
 use std::collections::HashMap;
 
@@ -20,7 +28,7 @@ use std::collections::HashMap;
 type Name = (u16, Box<[u8]>);
 
 const MAGIC: &[u8; 4] = b"PKFN";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 /// 主キーの前の名前。 engine が `RwLock` で包んで持つ。
 #[derive(Default, Debug)]
@@ -29,16 +37,23 @@ pub(crate) struct PkFormer {
     by_key: HashMap<Name, u32>,
     /// slot → その行の前の名前 (slot を使い回す時に外す)
     by_slot: HashMap<u32, Vec<Name>>,
+    /// (作った peer, その peer での番号) → slot を使い回した時に移した、 消えた行の名前 (#545)
+    by_identity: HashMap<(u32, u32), Vec<Name>>,
 }
 
 impl PkFormer {
     pub(crate) fn is_empty(&self) -> bool {
-        self.by_key.is_empty()
+        self.by_key.is_empty() && self.by_identity.is_empty()
     }
 
     /// 前に `(himo, key)` だった行の slot。
     pub(crate) fn slot_of(&self, himo: u16, key: &[u8]) -> Option<u32> {
         self.by_key.get(&(himo, Box::<[u8]>::from(key))).copied()
+    }
+
+    /// 行 `slot` の前の名前 (主キーの himo, 値の鍵)。
+    pub(crate) fn names_of(&self, slot: u32) -> impl Iterator<Item = (u16, &[u8])> {
+        self.by_slot.get(&slot).into_iter().flatten().map(|(h, k)| (*h, &k[..]))
     }
 
     /// 行 `slot` の前の名前に `(himo, key)` を足す。 別の行の前の名前だったなら、 後から改名した方 (この行) にする。
@@ -56,6 +71,21 @@ impl PkFormer {
         }
         self.by_slot.entry(slot).or_default().push(k);
         true
+    }
+
+    /// identity `(peer, foreign_local)` に名前 `(himo, key)` を足す (消えた行の slot を使い回す時、 #545)。 変えたら true。
+    pub(crate) fn insert_identity(&mut self, peer: u32, foreign_local: u32, himo: u16, key: &[u8]) -> bool {
+        let names = self.by_identity.entry((peer, foreign_local)).or_default();
+        if names.iter().any(|(h, k)| *h == himo && &k[..] == key) {
+            return false;
+        }
+        names.push((himo, key.into()));
+        true
+    }
+
+    /// identity `(peer, foreign_local)` に移した名前。
+    pub(crate) fn names_of_identity(&self, peer: u32, foreign_local: u32) -> impl Iterator<Item = (u16, &[u8])> {
+        self.by_identity.get(&(peer, foreign_local)).into_iter().flatten().map(|(h, k)| (*h, &k[..]))
     }
 
     /// slot を別の行に使い回す前に、 その行の前の名前を外す。 変えたら true。
@@ -82,6 +112,17 @@ impl PkFormer {
             out.extend_from_slice(&(key.len() as u32).to_le_bytes());
             out.extend_from_slice(key);
         }
+        let mut idents: Vec<(&(u32, u32), &(u16, Box<[u8]>))> =
+            self.by_identity.iter().flat_map(|(id, names)| names.iter().map(move |n| (id, n))).collect();
+        idents.sort();
+        out.extend_from_slice(&(idents.len() as u32).to_le_bytes());
+        for ((peer, fl), (himo, key)) in idents {
+            out.extend_from_slice(&peer.to_le_bytes());
+            out.extend_from_slice(&fl.to_le_bytes());
+            out.extend_from_slice(&himo.to_le_bytes());
+            out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            out.extend_from_slice(key);
+        }
         out
     }
 
@@ -91,7 +132,7 @@ impl PkFormer {
             return Err("pkformer sidecar: bad magic".into());
         }
         let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-        if version != VERSION {
+        if version != 1 && version != VERSION {
             return Err(format!("pkformer sidecar: unsupported version {version}"));
         }
         let count = u32::from_le_bytes(buf[8..12].try_into().unwrap());
@@ -106,6 +147,22 @@ impl PkFormer {
             let key = buf.get(p..p + len).ok_or("pkformer sidecar: torn key")?;
             p += len;
             out.insert(himo, key, slot);
+        }
+        if version >= 2 {
+            let count = buf.get(p..p + 4).ok_or("pkformer sidecar: torn identity count")?;
+            let count = u32::from_le_bytes(count.try_into().unwrap());
+            p += 4;
+            for _ in 0..count {
+                let head = buf.get(p..p + 14).ok_or("pkformer sidecar: torn identity entry")?;
+                let peer = u32::from_le_bytes(head[0..4].try_into().unwrap());
+                let fl = u32::from_le_bytes(head[4..8].try_into().unwrap());
+                let himo = u16::from_le_bytes(head[8..10].try_into().unwrap());
+                let len = u32::from_le_bytes(head[10..14].try_into().unwrap()) as usize;
+                p += 14;
+                let key = buf.get(p..p + len).ok_or("pkformer sidecar: torn identity key")?;
+                p += len;
+                out.insert_identity(peer, fl, himo, key);
+            }
         }
         if p != buf.len() {
             return Err(format!("pkformer sidecar: {} trailing bytes (corrupt)", buf.len() - p));
@@ -148,5 +205,32 @@ mod tests {
         let mut extra = bytes.clone();
         extra.push(0);
         assert!(PkFormer::deserialize(&extra).is_err());
+    }
+
+    #[test]
+    fn identity_names_round_trip_and_version_1_still_reads() {
+        let mut f = PkFormer::default();
+        f.insert(3, b"tokyo", 10);
+        assert!(f.insert_identity(7, 1, 3, b"osaka"));
+        assert!(!f.insert_identity(7, 1, 3, b"osaka"), "同じ名前を変えたと言う");
+        assert!(f.insert_identity(7, 1, 3, b"kyoto"));
+        assert!(!f.is_empty());
+        let bytes = f.serialize();
+        let g = PkFormer::deserialize(&bytes).unwrap();
+        let mut names: Vec<_> = g.names_of_identity(7, 1).map(|(h, k)| (h, k.to_vec())).collect();
+        names.sort();
+        assert_eq!(names, vec![(3, b"kyoto".to_vec()), (3, b"osaka".to_vec())]);
+        assert_eq!(g.names_of_identity(7, 2).count(), 0);
+        assert_eq!(g.slot_of(3, b"tokyo"), Some(10));
+        for cut in [bytes.len() - 1, bytes.len() - 6] {
+            assert!(PkFormer::deserialize(&bytes[..cut]).is_err(), "{cut} byte で切れた file を読んだ");
+        }
+        // version 1 (identity の節が無い) も読む
+        let mut v1 = PkFormer::default();
+        v1.insert(3, b"tokyo", 10);
+        let mut old = v1.serialize();
+        old[4..8].copy_from_slice(&1u32.to_le_bytes());
+        old.truncate(old.len() - 4); // identity の数 (0) を落とす
+        assert_eq!(PkFormer::deserialize(&old).unwrap().slot_of(3, b"tokyo"), Some(10));
     }
 }

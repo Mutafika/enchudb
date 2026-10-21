@@ -245,6 +245,15 @@ impl Column {
     /// HEADER (= 16 bytes) は u32 alignment、 mmap region は page-aligned なので
     /// アライン安全。 LE 前提 (aarch64 / x86_64 等の supported target で OK)。
     #[inline]
+    /// 先頭 `n` 個 (count まで) の cell の生の byte。 開く時の線形な走査用 (書き込みと並走しない場面でだけ使うこと、
+    /// `values_u32` と同じ非 atomic な view)。 count までの cell は書き手が commit してから書いているので読める。
+    pub fn cells_raw(&self, n: u32) -> &[u8] {
+        let n = n.min(self.count()) as usize;
+        let vs = self.value_size as usize;
+        let mm = self.region.slice();
+        &mm[self.cells..self.cells + n * vs]
+    }
+
     pub fn values_u32(&self) -> &[u32] {
         // 64 bit 列を 4B ずつ読むと値が化ける (黙った破損) ので release でも止める
         assert_eq!(self.value_size, 4, "values_u32 requires value_size == 4");

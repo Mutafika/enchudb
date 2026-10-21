@@ -11,9 +11,11 @@
 //! WAL の書き出し係 (consumer スレッド) が背景 fsync を成功させた後に、 通知係のスレッド (`enchudb-notifier`、
 //! listener を登録した WAL 付きの並行の engine にだけ居る) が、 新しく durable 化した WAL レコード群を listener に渡す。
 //!
-//! - **順序保証**: HLC 昇順、WAL append の順序とそのまま一致
-//! - **at-least-once**: 重複は無いが、listener 側で再起動跨ぎを担保したいなら
-//!   HLC を控えて resume する設計にすること
+//! - **順序**: WAL に積んだ順。 自分の書き込みだけなら HLC 昇順。 中継した record (別の author の record を自分の WAL に
+//!   積む) が混ざると HLC の順にはならない
+//! - **重複・欠け**: 1 つの process の中で同じ record を 2 度は渡さない。 WAL が満杯で載らなかった write (#57) は渡らない
+//!   (sync の DB は相手に floor で知らせて取り直させる。 listener には知らせない)。 再起動を跨いで漏れなく受けたいなら、
+//!   渡された最後の HLC を控えて `audit` で resume する (再起動の前後で同じ record をもう一度受けうる = at-least-once)
 //! - **durability 後**: 渡された record はディスクに fsync 済み。
 //!   listener crash → restart で `audit(AuditFilter { from_hlc: ..., .. })` で
 //!   resume できる

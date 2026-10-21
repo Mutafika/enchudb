@@ -35,13 +35,15 @@ pub const SCHEMA: &str = "schema";
 /// 各 segment の 「前回 flush 時点の file 長」 (`crate::segments::verify_manifest`)。
 /// 未使用 region も 0 byte な v10 で、 切り詰めを stat だけで検出するための記録。
 pub const SEGMENTS: &str = "segments";
+/// 開く時間: きれいに閉じた時の Leaf の空き一覧 (`LeafStore::free_list_bytes`)。 紐名の辞書の印が `CLEAN_LEAF` の時だけ信じる
+pub const LEAFFREE: &str = "leaf.free";
 
 /// #415: create の途中の印。 mkdir の直後に置き、 作った中身を全部書き出してから消す。 これが残っている directory は、
 /// 作る途中で落ちた残骸 (開けない、 create が片付けて作り直す)。 出来上がった DB には無いので [`ALL`] に入れない。
 pub const CREATING: &str = "creating";
 
 /// segment 以外に DB directory へ置かれ得る file 名の一覧 (migrate / copy 用)。
-pub const ALL: [&str; 11] = [OPLOG, TABLES, EIDMAP, EIDALIAS, VOCABMAP, PKTOMBS, PKFORMER, CRC, LOCK, SCHEMA, SEGMENTS];
+pub const ALL: [&str; 12] = [OPLOG, TABLES, EIDMAP, EIDALIAS, VOCABMAP, PKTOMBS, PKFORMER, CRC, LOCK, SCHEMA, LEAFFREE, SEGMENTS];
 
 /// HTTP bootstrap (`/bootstrap/{name}`) で本体と別に配る sidecar。 `.eidmap` 無しの
 /// restore は再 sync で重複 entity / tombstone 喪失、 `.vocabmap` 無しは受信済み `Vocab`
