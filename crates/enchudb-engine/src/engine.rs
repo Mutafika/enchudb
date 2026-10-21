@@ -11308,15 +11308,22 @@ impl Engine {
         if tomb_count == 0 {
             return 0;
         }
+        // tombstone の列を線形に読み、 版数のある cell (削除された entity) だけ見る。 前は生きている entity の一覧
+        // (Vec) を作って 1 つずつ tombstone の列を引いていた (100 万 entity で 23 ms、 開くたび)。 削除は少ないのが常態
+        // なので、 0 の cell を 2 語の or で飛ばす方が、 生きている entity の数によらず列の大きさ (16 B × count) だけで済む
+        let raw = self.tomb_col.as_ref().map(|c| c.cells_raw(tomb_count)).unwrap_or(&[]);
         let mut repaired = 0usize;
-        for local in self.entities.iter() {
-            if local >= tomb_count {
-                continue;
-            }
-            let tomb = self.tombstone_hlc_local(local);
-            if tomb == enchudb_oplog::Hlc::ZERO {
+        for (local, cell) in raw.chunks_exact(HLC_CELL_BYTES as usize).enumerate() {
+            let lo = u64::from_le_bytes(cell[0..8].try_into().unwrap());
+            let hi = u64::from_le_bytes(cell[8..16].try_into().unwrap());
+            if lo | hi == 0 {
                 continue; // 削除されていない = 常態
             }
+            let local = local as u32;
+            if !self.entities.is_live(local) {
+                continue;
+            }
+            let tomb = hlc_from_cell(cell);
             // 削除より後に書かれた cell だけが 「削除後に作り直された行」。
             // それ以外 (古い / 版数不明) が 1 つでも生きていれば、 削除が
             // 途中で切れた跡なので本体除去をやり直す。 判断は
