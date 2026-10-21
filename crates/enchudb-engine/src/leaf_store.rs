@@ -859,7 +859,9 @@ impl LeafStore {
         let mut holes = self.holes.lock().unwrap_or_else(|p| p.into_inner());
         holes.clear();
         let start = self.b2w(self.data_start_byte());
-        live.sort_unstable();
+        // 列ごとの offset は昇順 (eid の順に置く) なので、 列が複数なら昇順の run が列の数だけ混ざる。 run を見る sort
+        // (driftsort) は run の併合で済み、 pdqsort (`sort_unstable`) は run を見ないので 300 万で 30 ms 遅かった
+        live.sort();
         live.dedup();
         let mut broken: HashSet<u32> = HashSet::new();
         let min_words = self.min_slot_words();
