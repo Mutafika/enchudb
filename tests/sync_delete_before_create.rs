@@ -247,7 +247,7 @@ fn rows(db: &Database) -> Vec<(Option<enchudb::schema::Value>, Option<enchudb::s
 }
 
 /// 削除より新しい書き込み (B の削除を知らない C の更新) が混ざっても、 受け手が A・B・C を pull する 6 通りの順で
-/// 同じ答えになる。 削除より新しい書き込みをどう見せるか (H3) はここでは決めず、 順によらないことだけを見る。
+/// 同じ答えになる。 答えは削除優先 (2026-10-21): C の更新は捨てて、 x は消えたまま。
 #[test]
 fn newer_write_after_the_delete_lands_the_same_in_any_order() {
     const ORDERS: [[u32; 3]; 6] = [[1, 2, 3], [1, 3, 2], [2, 1, 3], [2, 3, 1], [3, 1, 2], [3, 2, 1]];
@@ -292,6 +292,8 @@ fn newer_write_after_the_delete_lands_the_same_in_any_order() {
     for (k, ans) in answers.iter().enumerate() {
         assert_eq!(ans, &answers[0], "{:?} の順と {:?} の順で答えが違う", ORDERS[k], ORDERS[0]);
     }
+    // 削除優先 (2026-10-21): C の書き込みは消した行宛てなので、 削除より新しくても捨てる
+    assert_eq!(answers[0], (vec![], 0, 0), "消した行への C の書き込みが残った");
     eprintln!("答え (6 通り同じ): {:?}", answers[0]);
 
     drop((sa, sb, sc));

@@ -35,25 +35,25 @@
 //!
 //! Delete は特殊: himo を持たないため per-himo の比較はせず、 **tombstone slot
 //! (sentinel himo_id = `u16::MAX`) との LWW** で判定する。 apply されると
-//! tombstone HLC が記録され、 以後それより古い Tie/Untie は skip される
-//! (削除済み entity の復活防止)。 逆に 「新しい Tie の後に古い Delete」 が届いた場合
-//! (別の author の Tie と Delete が入れ違う時や、 再送 / gossip の交錯)、 Delete は
-//! **Delete より新しい版の cell を残して**ほかを消す (`Engine::remove_entity_body`)。
-//! 残った cell は、 削除の後に書かれた行として生きる。
+//! tombstone HLC が記録され、 行の cell は版数によらず全部消える。
+//!
+//! **削除優先** (ユーザの決め、 2026-10-21): 消した行 (eid) 宛ての書き込みは、 削除より新しくても捨てる
+//! (`Engine::slot_is_dead`。 削除を知らずに書き換えた peer の書き込みで、 消した行が戻らない)。 消した後に新しく足した
+//! 行 (新しい eid) は残る。 「新しい Tie の後に古い Delete」 が届いた場合も、 Delete は行ごと消す (前は Delete より新しい
+//! 版の cell を残し、 名前の無い塊が残った、 #514 / #547)。
 //!
 //! 作成より先に届いた Delete (まだ写像の無い entity 宛て。 A が作った行を B が消し、 A より先に
 //! B から pull した時) も捨てない。 削除版数を覚えておき、 後から作成が届いて slot を払い出す時に
-//! tombstone として書き戻すので、 削除より古い作成は skip される (#490、
-//! `Engine::remote_delete_apply_foreign`)。
+//! 死んだ slot にする (#490、 `Engine::remote_delete_apply_foreign`)。
 //!
-//! 主キーのある表では、 主キーが同じなら同じ行 (#141 で束ねる)。 削除はその主キーの行の、 削除より古い書き込みを、
-//! どの author のものでも消す: 受け手は主キーのある行を消すとその主キーを覚え、 後から届いた同じ主キーの行 (束ねる
-//! 先が生きていても、 もう無くても) にその削除を当てる (#513、 `Engine::bind_remote_eid_by_pk` /
-//! `Engine::reserve_remote_eid_for_pk`)。
+//! 主キーのある表では、 主キーが同じなら同じ行 (#141 で束ねる)。 削除はその主キーの行を、 どの author のものでも消す:
+//! 受け手は主キーのある行を消すとその主キーを覚え、 その削除より前に作られた同じ主キーの行は死なせる。 削除の後に作られた
+//! 行 (消したのを見て足し直した行) は生きる (#513、 `Engine::reserve_remote_eid_for_pk` の `created`)。 消える entity を、
+//! その削除より後に作られた行に束ねない・畳まない (同じ batch の後ろの Delete も見る)。
 //!
 //! 主キーは書き換えられる (改名)。 届く順で答えを変えないよう、 受け手は前の名前も覚え (`pk_former.rs`)、 今その名前の
-//! 行が無ければ前にその名前だった行に束ねる (前の名前 = 同じ物。 消えた行も、 slot を使い回すまで)。 主キーの Tie を当てて
-//! 同じ主キーの行が 2 つになったら 1 つに畳む (`Engine::fold_rows_with_same_pk`)。
+//! 行が無ければ前にその名前だった生きた行に束ねる (前の名前 = 同じ物)。 主キーの Tie を当てて同じ主キーの行が 2 つに
+//! なったら 1 つに畳む (`Engine::fold_rows_with_same_pk`)。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1325,6 +1325,7 @@ impl Syncer {
         rec: &WireRecord,
         batch: &[WireRecord],
         pk_ties: &std::collections::HashMap<enchudb_oplog::EntityId, usize>,
+        dying: &std::collections::HashMap<enchudb_oplog::EntityId, Hlc>,
         admits: impl Fn(&WireRecord) -> bool,
     ) -> Option<enchudb_oplog::EntityId> {
         let rec = match &rec.op {
@@ -1368,7 +1369,10 @@ impl Syncer {
                     Some(v) => v as u64,
                     None => {
                         // #513: その主キーの行を前に消していれば (辞書の回収で文字列が辞書から消えていても)、 削除を当てる
-                        return self.engine.reserve_remote_eid_for_pk(*eid, *himo_id, PkValue::Text(bytes)).filter(|_| own);
+                        return self
+                            .engine
+                            .reserve_remote_eid_for_pk(*eid, *himo_id, PkValue::Text(bytes), rec.hlc)
+                            .filter(|_| own);
                     }
                 }
             }
@@ -1377,11 +1381,32 @@ impl Syncer {
         // (改名した行) に束ねる (PK_IDENTITY_PLAN 11-1: 改名を知らずに古い名前で作った行を、 届く順によらず同じ行にする)
         let existing = self.engine.query_by_id64(&[(*himo_id, local_value)]).into_iter().next()
             .or_else(|| self.engine.former_pk_holder(*himo_id, PkValue::Local(local_value)));
+        let created = rec.hlc;
+        let reserve = || {
+            self.engine.reserve_remote_eid_for_pk(*eid, *himo_id, PkValue::Local(local_value), created).filter(|_| own)
+        };
+        // 削除優先 (2026-10-21): この entity が消えた時刻 (作成より先に届いた削除 / 作成より後のその主キーの削除) と、 この batch の
+        // 後ろで消える時刻。 消える entity を、 その削除より後に作られた行 (消したのを見て足し直した行) に束ねると、 足し直した行まで
+        // 消える (届く順で答えが割れる)
+        let dead_at = self
+            .engine
+            .deleted_before_create(*eid)
+            .or_else(|| self.engine.name_deleted_at(*himo_id, PkValue::Local(local_value)).filter(|&t| t > created));
+        if let (Some(l), Some(t)) = (existing, dead_at.or_else(|| dying.get(eid).copied())) {
+            if self.engine.cell_hlc(l, *himo_id) > t {
+                // 足し直した行: 束ねない。 消えた entity は死んだ slot、 この batch で消える entity は普通の払い出し (後の削除で消える)
+                return if dead_at.is_some() { reserve() } else { None };
+            }
+            if dead_at.is_some() {
+                // その削除より前からある行は同じ行: 一緒に消える (先に束ねてから削除を受けた peer と同じ)
+                self.engine.remote_delete_apply(l, t);
+                return reserve();
+            }
+        }
         let Some(existing) = existing else {
             // 同じ PK の row は今は無い → 通常の払い出しに任せる。 #513: ただし、 その主キーの行を前に消していれば、
-            // 払い出す slot に削除の版数を載せる (削除より古い書き込みを弾く。 消した行を先に受けて束ねていた peer では、
-            // この entity の古い書き込みも削除で消えているので、 同じ答えにする)
-            return self.engine.reserve_remote_eid_for_pk(*eid, *himo_id, PkValue::Local(local_value)).filter(|_| own);
+            // 払い出す slot に削除の版数を載せる (削除より前に作られた entity なら死んだ slot、 削除優先)
+            return reserve();
         };
         // #513: 束ねた行にも、 その主キーの行を消した削除を当てる (削除の後に作り直された行に束ねる時、 削除より古い
         // 書き込みを残さない)
@@ -1484,6 +1509,14 @@ impl Syncer {
             (!signed).then_some(Reject::Signature)
         };
         let pk_ties = self.primary_key_ties(records);
+        // 削除優先: この batch で消える entity (束ねの判断に使う)
+        let dying: std::collections::HashMap<enchudb_oplog::EntityId, Hlc> = records
+            .iter()
+            .filter_map(|r| match &r.op {
+                DecodedOp::Delete { eid } => Some((*eid, r.hlc)),
+                _ => None,
+            })
+            .collect();
         for (idx, rec) in records.iter().enumerate() {
             out.received += 1;
             if let Some(r) = rejects(rec) {
@@ -1494,8 +1527,8 @@ impl Syncer {
                 note_reject(&mut out, rec.hlc);
                 continue;
             }
-            let bound = self.bind_by_primary_key(rec, records, &pk_ties, |r| rejects(r).is_none());
-            match self.apply_one(&store, rec, bound) {
+            let bound = self.bind_by_primary_key(rec, records, &pk_ties, &dying, |r| rejects(r).is_none());
+            match self.apply_one(&store, rec, bound, &dying) {
                 ApplyResult::Applied => {
                     out.applied += 1;
                     if let Some(list) = relay_accepted.as_deref_mut() {
@@ -1526,7 +1559,14 @@ impl Syncer {
     //  buffered record が恒久喪失 / eviction が「最古」でなく任意 bucket を破棄)
 
     /// `bound`: `bind_by_primary_key` が束ねた / 払い出した local eid (Tie だけ。 あれば写像を引き直さない)。
-    fn apply_one(&self, store: &HlcStore, rec: &WireRecord, bound: Option<enchudb_oplog::EntityId>) -> ApplyResult {
+    /// `dying`: この batch で消える entity (削除優先、 名前で畳む時に、 消える行へ削除の後に作られた行を畳まない)。
+    fn apply_one(
+        &self,
+        store: &HlcStore,
+        rec: &WireRecord,
+        bound: Option<enchudb_oplog::EntityId>,
+        dying: &std::collections::HashMap<enchudb_oplog::EntityId, Hlc>,
+    ) -> ApplyResult {
         match &rec.op {
             DecodedOp::Tie { eid, himo_id, value } => {
                 // #9: foreign eid を自分の eid 空間の local eid に翻訳 (初見なら払い出し)。
@@ -1567,7 +1607,7 @@ impl Syncer {
                 let r = ApplyResult::from(self.engine.remote_tie_apply_result(local_eid, *himo_id, value, rec.hlc));
                 // 主キーが変わって (改名)、 同じ主キーの別の行があれば 1 つに畳む (主キーが同じなら同じ行、 PK_IDENTITY_PLAN 11-1)
                 if r == ApplyResult::Applied && self.engine.is_pk_himo(*himo_id) {
-                    self.engine.fold_rows_with_same_pk(local_eid, *himo_id, value);
+                    self.engine.fold_rows_with_same_pk(local_eid, *himo_id, value, dying.get(eid).copied());
                 }
                 r
             }

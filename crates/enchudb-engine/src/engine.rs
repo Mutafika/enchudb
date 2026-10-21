@@ -9302,10 +9302,18 @@ impl Engine {
         }
         let to = enchudb_oplog::make_eid(self_peer, d);
         let mut moved = 0;
-        // 1. 同じ entity の削除
+        // 1. 同じ entity の削除の版数: その版数より古い dst の cell を落とし、 版数を dst にも載せる。 生きた src に版数が載るのは、
+        //    前の版の DB の生き残り (削除より新しい cell が残った行) と、 途中で切れた削除の跡なので、 削除優先の 「行ごと消す」 は
+        //    当てない (当てると dst ごと消え、 次の段で src の cell も入らない)
         let tomb = self.tombstone_version_of(s);
         if tomb != enchudb_oplog::Hlc::ZERO {
-            self.apply_delete_local(d, tomb);
+            let _row = self.row_locks.write(d);
+            self.set_tombstone_local(d, tomb);
+            for hid in 0..self.himos.len() {
+                if self.himos[hid].get_value(d).is_some() && self.version_of(d, hid as u16) <= tomb {
+                    self.remove_cell_freeing_leaf(d, hid);
+                }
+            }
         }
         // 2. cell を 1 つずつ
         for hid in 0..self.himos.len() {
@@ -9413,7 +9421,8 @@ impl Engine {
         let bound = self.bind_remote_eid(author_peer, foreign_eid, local_eid);
         if let Some(tomb) = self.pk_tombstone_of(pk_himo, PkValue::Local(pk_value)) {
             let local = enchudb_oplog::eid_local(bound);
-            if tomb > self.tombstone_version_of(local) {
+            // 削除優先: 消すのは、 その削除より前からある行だけ (削除の後に足し直した行は消さない)
+            if tomb > self.tombstone_version_of(local) && self.version_of(local, pk_himo) < tomb {
                 self.apply_delete_local(local, tomb);
             }
         }
@@ -9430,11 +9439,16 @@ impl Engine {
     /// 2 つの記録が両方とも空 (常態) か、 自分が産んだ entity の時は何もせず `None` (通常の払い出しに任せる)。 どちらかが
     /// 空でなければ、 載せる版数が無くても払い出しをここで済ませ、 その local eid を返す (通常の道 `resolve_remote_eid` と
     /// 同じ払い出し。 呼び手は返った eid に当てる = 写像を引き直さない。 既に写像があればそれを返す)。
+    ///
+    /// 削除優先 (2026-10-21): 作成より先に届いた削除がある entity と、 その主キーの削除より前に作られた entity (`created` =
+    /// 作成の主キーの書き込みの版数) は死んでいる。 払い出した slot は生かさない (その entity 宛ての書き込みは捨てる)。 削除の後に
+    /// 作られた entity (消したのを見て足し直した行) は生きる。
     pub fn reserve_remote_eid_for_pk(
         &self,
         foreign_eid: enchudb_oplog::EntityId,
         pk_himo: u16,
         pk_value: PkValue<'_>,
+        created: enchudb_oplog::Hlc,
     ) -> Option<enchudb_oplog::EntityId> {
         use std::sync::atomic::Ordering;
         if self.pk_tombs_empty.load(Ordering::Acquire)
@@ -9452,11 +9466,15 @@ impl Engine {
         let by_pk = self.pk_tombstone_of(pk_himo, pk_value);
         let local = self.eid_translator.get_or_insert_with(owner, foreign_local, || {
             let local = self.alloc_translated_local(pk_himo)?;
-            if let Some(tomb) = by_pk.max(self.foreign_tombstone_of(owner, foreign_local)) {
+            let early = self.foreign_tombstone_of(owner, foreign_local);
+            if let Some(tomb) = by_pk.max(early) {
                 self.set_tombstone_local(local, tomb);
                 let mut g = self.pk_tombs.write().unwrap();
                 self.drain_pk_pending(&mut g);
                 self.with_pk_key(pk_himo, pk_value, |key| self.note_pk_locked(&mut g, pk_himo, key, local, tomb));
+            }
+            if early.is_some() || by_pk.is_some_and(|t| t > created) {
+                self.live_free(local);
             }
             Some(local)
         })?;
@@ -10638,28 +10656,53 @@ impl Engine {
         }
     }
 
-    /// 前に主キー `value` だった行 (今は別の名前。 PK_IDENTITY_PLAN 11-1)。 sync の束ねが、 今その名前の行が無い時に引く。
-    /// 消えた行も返す (slot を使い回すまで記録は残る)。 束ねると行は生き返り、 削除より古い書き込みは slot の削除の版数で弾かれる
-    /// (改名して消した行に、 改名を知らずに古い名前で後から作った行を、 届く順によらず同じ行にする)
+    /// 前に主キー `value` だった生きた行 (今は別の名前。 PK_IDENTITY_PLAN 11-1)。 sync の束ねが、 今その名前の行が無い時に引く。
     pub fn former_pk_holder(&self, himo: u16, value: PkValue<'_>) -> Option<enchudb_oplog::EntityId> {
         if self.pk_former_empty.load(std::sync::atomic::Ordering::Acquire) {
             return None;
         }
         let slot = self.with_pk_key(himo, value, |k| self.pk_former.read().unwrap().slot_of(himo, k))??;
         let self_peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
-        Some(enchudb_oplog::make_eid(self_peer, slot))
+        // 削除優先: 消えた行には束ねない (消えた行に束ねると、 後から足した行まで死ぬ)
+        self.entities.is_live(slot).then(|| enchudb_oplog::make_eid(self_peer, slot))
+    }
+
+    /// 削除優先: foreign entity `foreign_eid` 宛ての、 作成より先に届いた削除の版数 (#490)。 sync の束ねが、 消えた entity を
+    /// 生きた行に束ねないために引く。
+    pub fn deleted_before_create(&self, foreign_eid: enchudb_oplog::EntityId) -> Option<enchudb_oplog::Hlc> {
+        let self_peer = self.peer_id.load(std::sync::atomic::Ordering::Acquire);
+        if enchudb_oplog::eid_peer(foreign_eid) == self_peer {
+            return None;
+        }
+        self.foreign_tombstone_of(enchudb_oplog::eid_peer(foreign_eid), enchudb_oplog::eid_local(foreign_eid))
+    }
+
+    /// 削除優先: 主キー `value` の行を消した削除の版数 (#513、 `pk_tombs.rs`)。
+    pub fn name_deleted_at(&self, himo: u16, value: PkValue<'_>) -> Option<enchudb_oplog::Hlc> {
+        self.pk_tombstone_of(himo, value)
     }
 
     /// sync の当て: 行 `eid` の主キーが `value` になった時、 同じ主キーの別の生きた行を 1 つに畳む (主キーが同じなら同じ行)。
     /// 畳むのは翻訳した行 (自分が産んだ行は畳めない、 `merge_entity_into`)。 戻り値は畳んだ行の数。
-    pub fn fold_rows_with_same_pk(&self, eid: enchudb_oplog::EntityId, himo: u16, value: u64) -> usize {
+    ///
+    /// `dies_at`: 行 `eid` がこの後 (同じ batch で) 消える時刻。 その削除より後に主キーを書かれた行 (消したのを見て足し直した行) は
+    /// 畳まない (畳むと一緒に消える。 削除優先、 2026-10-21)。
+    pub fn fold_rows_with_same_pk(
+        &self,
+        eid: enchudb_oplog::EntityId,
+        himo: u16,
+        value: u64,
+        dies_at: Option<enchudb_oplog::Hlc>,
+    ) -> usize {
         if !self.pk_tombs_on.load(std::sync::atomic::Ordering::Relaxed) {
             return 0;
         }
         let mut keep = eid;
         let mut folded = 0;
         for other in self.query_by_id64(&[(himo, value)]) {
-            if enchudb_oplog::eid_local(other) == enchudb_oplog::eid_local(keep) {
+            if enchudb_oplog::eid_local(other) == enchudb_oplog::eid_local(keep)
+                || dies_at.is_some_and(|t| self.cell_hlc(other, himo) > t)
+            {
                 continue;
             }
             let translated = |e: enchudb_oplog::EntityId| self.eid_translator.reverse(enchudb_oplog::eid_local(e)).is_some();
@@ -10831,9 +10874,13 @@ impl Engine {
     ///
     /// #490: 呼ぶのは払い出す所 (`get_or_insert_with` の確保の中 = 写像を載せる前) だけ。
     /// PK で既存の行に束ねる時は `bind_remote_eid` が削除そのものを当てる。
+    ///
+    /// 削除優先: 消えた entity なので、 払い出した slot は生かさない (`slot_is_dead`、 その entity 宛ての書き込みは削除より新しくても
+    /// 捨てる)。
     fn restore_foreign_tombstone(&self, peer: enchudb_oplog::PeerId, foreign_local: u32, local: u32) {
         if let Some(tomb) = self.foreign_tombstone_of(peer, foreign_local) {
             self.set_tombstone_local(local, tomb);
+            self.live_free(local);
         }
     }
 
@@ -11063,8 +11110,18 @@ impl Engine {
         self.set_tombstone_local(local, hlc);
         // #513: 主キーの cell を消す前に、 その主キーを覚える
         self.remember_pk_tombstone(local, hlc);
-        self.remove_entity_body(local, hlc);
+        // 削除優先 (ユーザの決め、 2026-10-21): 削除より新しい cell も消し、 行を死なせる (消した行の eid 宛ての書き込みは、 削除より
+        // 新しくても捨てる。 受け取った書き込みは `slot_is_dead` で弾く)。 前は削除より新しい cell を残し (#514)、 名前の無い塊が
+        // 生きた (#547)
+        self.remove_entity_body(local, enchudb_oplog::Hlc::ZERO);
         true
+    }
+
+    /// 削除優先: 消えた行 (削除の版数があり、 生きていない) か。 受け取った書き込み (`remote_*_apply`) は版数によらず捨てる。
+    /// 自分の書き込みと WAL の再生は今まで通り版数で決める (自分の消えた行の slot を使い回した後の書き込みを WAL から当て直すため)。
+    #[inline]
+    fn slot_is_dead(&self, local: u32) -> bool {
+        !self.entities.is_live(local) && self.tombstone_version_of(local) != enchudb_oplog::Hlc::ZERO
     }
 
     /// 途中で切れた delete の跡を **数えるだけ** (修復しない)。 readonly でも呼べる。
@@ -11656,8 +11713,8 @@ impl Engine {
         // request17 step 5: 受信 HLC でローカル clock を進める (これが無いと、
         // 相手の clock が先行している間ずっと自分のローカル write が負ける)。
         self.observe_remote_hlc(hlc);
-        // 値を作る前に判定する — 不採用なら LeafStore に payload を確保しない。
-        if !self.accepts_write(local, himo_id, hlc) {
+        // 値を作る前に判定する — 不採用なら LeafStore に payload を確保しない。 削除優先: 消えた行への書き込みは捨てる
+        if self.slot_is_dead(local) || !self.accepts_write(local, himo_id, hlc) {
             return RemoteApply::Stale;
         }
         // #316: cell の列を伸ばせないなら payload を置く前に断る (置いてから cell を書けないと orphan)
@@ -11722,6 +11779,10 @@ impl Engine {
         let hid = himo_id as usize;
         if hid >= self.himos.len() { return RemoteApply::Stale; }
         self.observe_remote_hlc(hlc);
+        // 削除優先: 消えた行への書き込みは削除より新しくても捨てる
+        if self.slot_is_dead(local) {
+            return RemoteApply::Stale;
+        }
         if self.ensure_cell_room(hid, local).is_err() {
             return RemoteApply::RejectedCapacity;
         }
@@ -11836,7 +11897,7 @@ impl Engine {
         self.observe_remote_hlc(hlc);
         // legacy op (pre-0.9 WAL のみ)。 cell を持たないので版数は `HlcStore` の
         // key hash entry のまま (sync 側) だが、 tombstone 判定だけは engine に寄せる。
-        if self.tombstone_blocks(eid, hlc) {
+        if self.slot_is_dead(local) || self.tombstone_blocks(eid, hlc) {
             return RemoteApply::Stale;
         }
         self.entities.ensure_live(local);
@@ -19052,7 +19113,7 @@ mod cell_version_tests {
 
     /// tombstone より古い remote Tie は **適用されない** (A-5)。 これが永続する
     /// ことで、 配送バッファから tombstone が消えた後も削除済み entity が
-    /// 復活しない (#140 の根)。
+    /// 復活しない (#140 の根)。 削除優先 (2026-10-21) で、 削除より新しい remote Tie も消えた行には当たらない。
     #[test]
     fn tombstone_blocks_older_remote_tie() {
         let (eng, hid) = v9_with_wal("tomb_remote", "age");
@@ -19065,10 +19126,10 @@ mod cell_version_tests {
         );
         assert_eq!(eng.get(eid, "age"), None);
         assert!(
-            eng.remote_tie_apply(eid, hid, 6, hlc(1100, 1)),
-            "削除より新しい Tie が入らない",
+            !eng.remote_tie_apply(eid, hid, 6, hlc(1100, 1)),
+            "削除より新しい Tie で消えた行が生き返った (削除優先)",
         );
-        assert_eq!(eng.get(eid, "age"), Some(6));
+        assert_eq!(eng.get(eid, "age"), None);
     }
 
     /// remote apply の LWW も engine の 1 本で判定されること。
