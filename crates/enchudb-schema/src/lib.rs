@@ -2015,6 +2015,25 @@ impl<'a> RowBuilder<'a> {
             }
         }
 
+        // #548: 名前 (表で名前と決めた列) の無い行は作らない。 デッキは名前でしかできないので、 名前の無いカードの塊は表の
+        // どこにも現れてはいけない (前は作れてしまい、 表の全部を引く時は出ず、 他の列で引く・数える時は出た)。 upsert で
+        // 当たった既にある行は名前を持っている
+        let name_col = self.table.pk.map(|i| &self.table.cols[i]);
+        if target_eid.is_none()
+            && let Some(nc) = name_col
+            && !resolved.clone().any(|(c, v)| c.name == nc.name && !matches!(v, Value::Null))
+        {
+            return Err(SchemaError::BadValue(format!(
+                "table '{}': a new row needs a value for its name column '{}' (rows without it are not rows)",
+                self.table.name, nc.name
+            )));
+        }
+        // #548: 名前のカードを最初に書く。 sync で書き込みが分かれて届いても、 受け手は名前より先に他のカードを受けない
+        let mut resolved: Vec<_> = resolved.collect();
+        if let Some(nc) = name_col {
+            resolved.sort_by_key(|(c, _)| c.name != nc.name);
+        }
+
         let eid = match target_eid {
             Some(e) => e,
             None => {
