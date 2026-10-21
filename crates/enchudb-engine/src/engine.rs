@@ -11784,16 +11784,17 @@ impl Engine {
                 self.himos[hid].ensure_loaded()?;
             }
         }
-        let mut live: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        // 列から Vec に集めて渡す (並べるのは LeafStore 側。 前は HashSet で、 Leaf の cell 100 万で 33 ms)
+        let mut live: Vec<u32> = Vec::new();
         for hid in 0..self.himos.len() {
             if self.leaf_for(hid).is_some() {
                 // leaf の列は u32 (offset)
                 self.himos[hid].for_each_set_value(|off| {
-                    live.insert(off as u32);
+                    live.push(off as u32);
                 });
             }
         }
-        let broken = leaf.rebuild_free_list(&live);
+        let broken = leaf.rebuild_free_list(live);
         if broken.is_empty() {
             return Ok(());
         }
