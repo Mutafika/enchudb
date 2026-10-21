@@ -6205,25 +6205,24 @@ impl Engine {
     /// 呼ばないと lsn 採番が 1 に戻り、 peer の ack 済み watermark より小さい lsn
     /// が発行されて `pending_sync_ops(since)` が永久に空 = **再起動後の全 write が
     /// 既存 peer に配信されない** silent loss になっていた。
+    ///
+    /// 開く時間: 列を 1 回なめて最大を取る (前は値のある entity の一覧 (Vec、 配る分 100 万行で 4 MB) を作ってから 1 つずつ
+    /// 引いていた)。 呼ぶのは consumer を起こす前 / `&mut self` の中 = 書き手と並走しない (`for_each_set_value` の前提)
     fn rehydrate_next_sync_lsn(&self) {
         use std::sync::atomic::Ordering;
         if !self.sync_tables_enabled() { return; }
         let mut max_lsn = 0u32;
-        if let Some(lsn_hid) = self.himo_id("_sync_ops.lsn") {
-            let hid = lsn_hid as u16;
-            for eid in self.entities_with_himo(hid) {
-                if let Some(l) = self.get_by_id32(eid, hid) {
-                    if l > max_lsn { max_lsn = l; }
-                }
+        for name in ["_sync_ops.lsn", "_sync_peers.consumed_lsn"] {
+            let Some(hid) = self.himo_id(name) else { continue };
+            let Some(hs) = self.himos.get(hid) else { continue };
+            if let Err(e) = hs.ensure_loaded() {
+                eprintln!("[enchudb] warning: {name} の列を開けない ({e}) — lsn の復元はこの列を見ない");
+                continue;
             }
-        }
-        if let Some(cons_hid) = self.himo_id("_sync_peers.consumed_lsn") {
-            let hid = cons_hid as u16;
-            for eid in self.entities_with_himo(hid) {
-                if let Some(l) = self.get_by_id32(eid, hid) {
-                    if l > max_lsn { max_lsn = l; }
-                }
-            }
+            hs.for_each_set_value(|v| {
+                let v = v as u32;
+                if v > max_lsn { max_lsn = v; }
+            });
         }
         if max_lsn > 0 {
             // 既に進んでいる場合は後退させない (enable → open の二重呼び等)
