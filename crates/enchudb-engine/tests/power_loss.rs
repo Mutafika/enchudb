@@ -1289,3 +1289,45 @@ fn deleted_primary_keys_survive_power_loss_after_oplog_sync() {
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(n, 1, "oplog_sync の返った削除の主キーが電源断の像で消えた");
 }
+
+/// #557: sync の表の無い v9 の DB (cell の版数あり) で、 汚れた終了の後に開いた時、 cell の版数が時計より先にあっても (時計が
+/// 戻った = cell に未来の版数を置いて真似る)、 ローカルの書き込みが弾かれない。 開く時の HLC の種は WAL に残った record だけで、
+/// WAL に無い版数 (畳んだ後) を知らなかった。
+#[test]
+fn local_writes_after_power_loss_are_not_older_than_cells() {
+    if std::env::var(VERIFY_ENV).is_ok() {
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = scratch("hlc_seed");
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let db = live.join("db");
+    crashsim::start();
+    let mut eng = Engine::create_with_cell_version(db.to_str().unwrap(), 65_536).unwrap();
+    eng.define_table("t", 1_000).unwrap();
+    let v = eng.define_himo_in("t", "v", ValueType::Number, 0).unwrap() as u16;
+    eng.flush().unwrap();
+    eng.persist_tables().unwrap();
+    let eng = Engine::concurrentize_with_oplog(eng, OPLOG_CAP).unwrap();
+    eng.set_peer_id(1);
+    assert!(eng.has_cell_version() && !eng.sync_tables_enabled(), "前提: sync の表の無い v9 の DB");
+    let e = eng.entity_in("t").unwrap();
+    let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let future = Hlc { wall: wall + 3_600_000, logical: 0, peer: 1 };
+    assert!(eng.set_cell(e, v, 5, future), "前提: 未来の版数で cell を書けた");
+    eng.oplog_sync().unwrap();
+    let img = root.join("img");
+    let captured = crashsim::capture(&live, &img, Mode::Lost);
+    crashsim::stop();
+    drop(eng);
+    captured.unwrap();
+    let back = Engine::open_concurrent_with_oplog(img.join("db").to_str().unwrap(), OPLOG_CAP).unwrap();
+    assert_eq!(back.cell_hlc(e, v), future, "前提: 像の cell に未来の版数がある");
+    let r = back.try_tie_to_by_id(e, v, 6u32);
+    let got = back.get(e, "t.v");
+    drop(back);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(r.is_ok(), "汚れた終了の後のローカルの書き込みが cell の版数より古いと弾かれた: {r:?}");
+    assert_eq!(got, Some(6));
+}
