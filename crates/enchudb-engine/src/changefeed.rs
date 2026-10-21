@@ -23,8 +23,11 @@
 //! listener.on_changes は通知係のスレッド (と、 `oplog_sync()` を呼んだスレッド) から呼ばれる。 遅くても WAL の書き出しと
 //! 畳みは止まらない: まだ渡していない record は、 ring を畳む時にメモリの溜めへ移し、 溜めから先に順に 1 回ずつ渡す
 //! ([`crate::engine::Engine::change_backlog_len`] で数が見える)。 0.34 までは consumer が直接呼んでいたので、 遅い・止まった
-//! listener の間は WAL を畳めず、 満杯になって書き込みが待たされたり落ちたりした。 止まったままの listener の間は溜めが
-//! 増え続けるので、 重い処理は別スレッドに forward すること。
+//! listener の間は WAL を畳めず、 満杯になって書き込みが待たされたり落ちたりした。 溜めには上限がある (#560、
+//! [`crate::engine::Engine::set_change_backlog_limit`]、 既定 64 MiB): 畳む時に移す分で越えたら、 溜めを捨てて listener を全部
+//! 外し ([`crate::engine::Engine::change_listeners_detached`] で数える)、 [`ChangeListener::on_detached`] で知らせる。 書き手は
+//! 止めない。 外れた listener に渡らなかった record は WAL から畳まれているので、 続けて受けるなら今の状態から読み直して付け直す。
+//! 重い処理は別スレッドに forward すること。
 //!
 //! 配信は 1 本ずつ (#337): `oplog_sync()` は、 他の thread が配っている最中ならそれを待ってから自分の commit を配り、
 //! 配り終えてから返る。 listener の中から `oplog_sync()` を呼んでもよい (その呼び出しは配らずに返る、 残りは
@@ -78,4 +81,12 @@ use crate::transport::WireRecord;
 pub trait ChangeListener: Send + Sync {
     /// 新たに durable 化したレコード群。HLC 昇順。
     fn on_changes(&self, records: &[WireRecord]);
+
+    /// #560: 渡していない record が溜めの上限 (`Engine::set_change_backlog_limit`、 既定 64 MiB) を越えたので外された。
+    /// `lost_from` (渡せなかった最初の record の HLC) から先は、 この listener には渡らない。 WAL はもう畳んでいるので
+    /// `audit` でも取り直せないことがある: 続けて受けたいなら今の状態から読み直し、 `add_change_listener` で付け直す。
+    /// 既定は何もしない。
+    fn on_detached(&self, lost_from: enchudb_oplog::Hlc) {
+        let _ = lost_from;
+    }
 }
