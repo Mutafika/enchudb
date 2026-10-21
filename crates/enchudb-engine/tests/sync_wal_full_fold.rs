@@ -16,6 +16,14 @@
 //! 4. 1 を直すと、 相手の ack を取り込んで `_sync_ops` を畳む reclaim が固まる形が出た。 purge は `_sync_ops` の
 //!    `free_locals` を握ったまま行を消し (WAL に積む)、 満杯なら空きを待つ。 空きを作る係は bridge で同じ `free_locals` を
 //!    取りに行くので互いを待つ (purge は待ちの上限 5 秒で諦め、 次の行で同じことを繰り返す)。 → WAL に積んでから握る
+//!
+//! #552: 書き手が多いと、 consumer は畳めているのに待つ書き手が諦めて落とした (sync の表によらず、 8 本で数件、 64 KiB に
+//! 64 本で 2 千件ほど。 どの書き手も待ちは数 ms で、 上限の 5 秒に遠かった)。
+//!
+//! 5. 待つ書き手は、 頼んだ後に consumer が 2 回試したら諦め、 その数に畳んだ試しも入れていた (畳んだ空きを他の書き手が先に
+//!    埋めた書き手を落とす)。 → 畳めない状態だった試しだけ数える
+//! 6. 待ち手が空けた後、 append は 1 回しか書き直さなかった (書き直す前に他の書き手が埋めると落とす)。 → 載るか待ち手が
+//!    諦めるまで書き直す (oplog の単体 `append_waits_again_when_another_writer_takes_the_room` が道ごとに見る)
 
 use enchudb_engine::{Engine, ValueType};
 use enchudb_oplog::Hlc;
@@ -42,8 +50,8 @@ fn cleanup(path: &str) {
     let _ = std::fs::remove_dir_all(path); // v10: DB は directory
 }
 
-/// 表 `rows` (列 `val`) を持つ DB を WAL `WAL` byte で開く。 `sync` なら sync の表あり。
-fn open(path: &str, sync: bool) -> (Arc<Engine>, u16, Vec<u64>) {
+/// 表 `rows` (列 `val`) を持つ DB を WAL `wal` byte で開く。 `sync` なら sync の表あり。
+fn open(path: &str, sync: bool, wal: usize) -> (Arc<Engine>, u16, Vec<u64>) {
     cleanup(path);
     {
         let mut eng = Engine::create_standalone(path).unwrap();
@@ -54,7 +62,7 @@ fn open(path: &str, sync: bool) -> (Arc<Engine>, u16, Vec<u64>) {
         }
         eng.flush().unwrap();
     }
-    let eng = Engine::open_concurrent_with_oplog(path, WAL).unwrap();
+    let eng = Engine::open_concurrent_with_oplog(path, wal).unwrap();
     eng.set_peer_id(1);
     let hid = eng.himo_id("rows.val").unwrap() as u16;
     let rows = (0..ROWS).map(|_| eng.entity_in("rows").unwrap()).collect();
@@ -71,10 +79,15 @@ struct Round {
 /// 1 回分: 新しい DB に、 書き手 `writers` 本で 1000 行に合わせて `writes` 回書く (書き手どうしで行は重ならない)。 `reclaim`
 /// なら書き手 0 が 1000 回ごとに相手の ack を取り込んで reclaim する (相手が追いついている形)。 書き手は切り離した thread で
 /// 回し (固まった時に test ごと止まらないよう、 scope で join しない)、 reclaim 1 回が 4 秒 (待ちの上限 `WAL_ROOM_WAIT` =
-/// 5 秒の手前) を越えたら落とす。
+/// 5 秒の手前) を越えたら落とす。 WAL は `WAL` byte。
 fn round(tag: &str, sync: bool, writers: u64, writes: u64, reclaim: bool) -> Round {
+    round_in(WAL, tag, sync, writers, writes, reclaim)
+}
+
+/// `round` の WAL を `wal` byte にした形。
+fn round_in(wal: usize, tag: &str, sync: bool, writers: u64, writes: u64, reclaim: bool) -> Round {
     let path = tmp_path(tag);
-    let (eng, hid, rows) = open(&path, sync);
+    let (eng, hid, rows) = open(&path, sync, wal);
     let rows = Arc::new(rows);
     let stop = Arc::new(AtomicBool::new(false));
     // 0 = reclaim していない、 それ以外 = 今の reclaim を始めた時刻 (base からの µs + 1)
@@ -142,7 +155,7 @@ fn sync_db_folds_when_the_wal_is_full() {
     }
 }
 
-/// 書き手 8 本でも、 落ちはわずか (各回 1000 件未満。 直した後の下調べは 20 万回で 0〜11 件、 sync の無い DB は 0〜180 件)。
+/// 書き手 8 本でも落ちない (#552 の前は各回 1000 件未満を許していた。 落ちは直し 5 / 6 の形だった)。
 ///
 /// falsify: 直し 3 (閉じ直してやり直す) を外すと、 2 万件ほど落ちる回が出る。
 #[test]
@@ -150,12 +163,12 @@ fn many_writers_drop_few_records() {
     let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     for n in 0..8 {
         let r = round(&format!("many{n}"), true, 8, 100_000, false);
-        assert!(r.dropped < 1000, "{n} 回目: 書き手 8 本で {} 件落ちた (満杯で畳んだ {} 回)", r.dropped, r.folds);
+        assert_eq!(r.dropped, 0, "{n} 回目: 書き手 8 本で {} 件落ちた (満杯で畳んだ {} 回)", r.dropped, r.folds);
         assert!(r.folds > 0, "前提: 満杯で 1 回も畳んでいない");
     }
 }
 
-/// 書き手 1 本が自分で相手の ack を取り込んで reclaim する形でも、 落ちはわずか (16 回とも 1000 件未満。 下調べは 0 件)。
+/// 書き手 1 本が自分で相手の ack を取り込んで reclaim する形でも落ちない。
 ///
 /// falsify: 直し 3 のうち、 head が checkpoint より先に進んだ時もやり直す所を外すと、 5 千件ほど落ちる回が出る。
 #[test]
@@ -163,7 +176,7 @@ fn reclaiming_writer_drops_few_records() {
     let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     for n in 0..16 {
         let r = round(&format!("reclaim1-{n}"), true, 1, 100_000, true);
-        assert!(r.dropped < 1000, "{n} 回目: reclaim しながら {} 件落ちた (満杯で畳んだ {} 回)", r.dropped, r.folds);
+        assert_eq!(r.dropped, 0, "{n} 回目: reclaim しながら {} 件落ちた (満杯で畳んだ {} 回)", r.dropped, r.folds);
         assert!(r.reclaims > 0 && r.folds > 0, "前提: reclaim {} 回・畳んだ {} 回", r.reclaims, r.folds);
     }
 }
@@ -177,5 +190,22 @@ fn reclaim_does_not_stall_while_the_wal_is_full() {
     for n in 0..12 {
         let r = round(&format!("stall{n}"), true, 8, 100_000, true);
         assert!(r.reclaims > 0 && r.folds > 0, "前提: reclaim {} 回・畳んだ {} 回", r.reclaims, r.folds);
+    }
+}
+
+/// 書き手を WAL に比べて多くしても (64 KiB に 32 本 / 64 本) record は落ちない (#552)。 sync の無い DB の空き作りが畳めない
+/// のは書き出しの I/O 失敗の時だけなので、 空きを待つ書き手は空きを取れるまで待てる。
+///
+/// falsify (16 core の Mac、 release): 直し 5 を外すと書き手 32 本の 1 回目で 15〜32 件、 直し 6 (`append` の道) を外すと
+/// 324〜376 件落ちる (3 回とも 1 回目で落ちる)。
+#[test]
+fn crowded_writers_drop_nothing() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    for writers in [32u64, 64] {
+        for n in 0..4 {
+            let r = round_in(64 * 1024, &format!("crowd{writers}-{n}"), false, writers, 100_000, false);
+            assert_eq!(r.dropped, 0, "書き手 {writers} 本の {n} 回目: {} 件落ちた (満杯で畳んだ {} 回)", r.dropped, r.folds);
+            assert!(r.folds > 0, "前提: 満杯で 1 回も畳んでいない");
+        }
     }
 }

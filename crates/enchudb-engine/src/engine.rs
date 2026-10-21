@@ -4078,8 +4078,8 @@ pub struct Engine {
     wal_room_folds: std::sync::atomic::AtomicU64,
     /// #391: consumer の loop が回った回数 (起きた回数、 観測用)。
     consumer_wakeups: std::sync::atomic::AtomicU64,
-    /// #388: consumer が書き出し + 畳みを試し終えた回数 (待ち手は、 待ち始めた後の 1 回で空かなければ諦める)。
-    wal_room_attempts: std::sync::atomic::AtomicU64,
+    /// #388: consumer が書き出し + 畳みを試して、 畳めない状態だった回数 (待ち手は、 待ち始めた後にこれが 1 回あれば諦める)。
+    wal_room_blocked: std::sync::atomic::AtomicU64,
     /// #388: `make_wal_room` の最中 (中の Commit marker が満杯で待ち手に入った時に、 もう一度入らない)。
     wal_room_busy: std::sync::atomic::AtomicBool,
     /// #388: 最後に畳めなかった時刻。 畳めない間 (sync の bridge が遅れている等) に毎回 fsync しないよう 10 ms 空ける。
@@ -4614,7 +4614,7 @@ impl Engine {
             wal_room_wanted: std::sync::atomic::AtomicBool::new(false),
             consumer_thread: std::sync::OnceLock::new(),
             wal_room_folds: std::sync::atomic::AtomicU64::new(0),
-            wal_room_attempts: std::sync::atomic::AtomicU64::new(0),
+            wal_room_blocked: std::sync::atomic::AtomicU64::new(0),
             consumer_wakeups: std::sync::atomic::AtomicU64::new(0),
             wal_room_busy: std::sync::atomic::AtomicBool::new(false),
             wal_room_failed_at: std::sync::Mutex::new(None),
@@ -5830,7 +5830,7 @@ impl Engine {
             wal_room_wanted: std::sync::atomic::AtomicBool::new(false),
             consumer_thread: std::sync::OnceLock::new(),
             wal_room_folds: std::sync::atomic::AtomicU64::new(0),
-            wal_room_attempts: std::sync::atomic::AtomicU64::new(0),
+            wal_room_blocked: std::sync::atomic::AtomicU64::new(0),
             consumer_wakeups: std::sync::atomic::AtomicU64::new(0),
             wal_room_busy: std::sync::atomic::AtomicBool::new(false),
             wal_room_failed_at: std::sync::Mutex::new(None),
@@ -16797,8 +16797,9 @@ impl Engine {
     /// sync の bridge / changefeed の listener が居る DB は、 書き出した後に配り終えてから畳む (配る前に畳むと record が
     /// 消える)。 配る間に次の record が入れば畳めない — その時は今までどおり満杯で落ちうる (#57 の floor で bootstrap)。
     ///
-    /// 試しの数 (`wal_room_attempts`、 待つ書き手が 「頼んだ後に 1 回試して空かなかった」 を見る) は、 畳んだ時と畳めない状態
-    /// だった時だけ数える (#512: 試している間に書き手が積み続けて畳めなかった試しで、 待つ書き手に諦めさせない)。
+    /// 畳めない状態だった試しを数える (`wal_room_blocked`、 待つ書き手が 「頼んだ後に試して畳めなかった」 を見る)。 畳んだ試しは
+    /// 数えない (#552: 畳んだ空きを他の書き手が先に埋めても、 次の畳みを待てばよい。 前は数え、 2 回畳む間に空きを取れなかった
+    /// 書き手を残り時間があるのに諦めさせた)。 試している間に書き手が積み続けて畳めなかった試しも数えない (#512)。
     fn make_wal_room(&self, wal: &std::sync::Arc<enchudb_oplog::oplog::OpLog>) -> WalRoom {
         use std::sync::atomic::Ordering;
         if self.wal_room_busy.swap(true, Ordering::AcqRel) {
@@ -16806,8 +16807,8 @@ impl Engine {
         }
         let room = self.make_wal_room_inner(wal);
         self.wal_room_busy.store(false, Ordering::Release);
-        if room != WalRoom::Transient {
-            self.wal_room_attempts.fetch_add(1, Ordering::AcqRel);
+        if room == WalRoom::Blocked {
+            self.wal_room_blocked.fetch_add(1, Ordering::AcqRel);
         }
         if room == WalRoom::Folded {
             self.wal_room_folds.fetch_add(1, Ordering::Relaxed);
@@ -16912,13 +16913,13 @@ impl Engine {
         if closed || appended_after { WalRoom::Transient } else { WalRoom::Blocked }
     }
 
-    /// #388: WAL が満杯で載らなかった書き手の待ち手 (`OpLog::set_room_waiter`)。 空いたら true (書き手は書き直す)、
-    /// 空かなければ false (今までどおり落ちる)。
+    /// #388: WAL が満杯で載らなかった書き手の待ち手 (`OpLog::set_room_waiter`)。 空いたら true (書き手は書き直し、 その間に
+    /// 他の書き手が空きを埋めていればまた待つ)、 空かなければ false (今までどおり落ちる)。
     ///
     /// - consumer 自身 (tick の Commit など): その場で畳む
-    /// - 他の thread: consumer に畳むよう頼み、 `size` byte 空くまで待つ。 待ち始めた後に consumer が 1 回試して空かな
-    ///   ければ (sync の bridge が配り終えていない等で畳めない。 試している間に書き手が積み続けて畳めなかった試しは数えない、
-    ///   #512) すぐ諦める。 上限 `WAL_ROOM_WAIT`、 閉じている最中は待たない
+    /// - 他の thread: consumer に畳むよう頼み、 `size` byte 空くまで待つ。 待ち始めた後に consumer が試して畳めない状態
+    ///   だったら (sync の bridge が配り終えていない等。 畳んだ空きを他の書き手が先に埋めた試し (#552) と、 試している間に
+    ///   書き手が積み続けて畳めなかった試し (#512) は数えない) すぐ諦める。 上限 `WAL_ROOM_WAIT`、 閉じている最中は待たない
     #[cfg(not(target_arch = "wasm32"))]
     fn wait_for_wal_room(&self, size: u64) -> bool {
         use std::sync::atomic::Ordering;
@@ -16927,9 +16928,9 @@ impl Engine {
             self.make_wal_room_paced(wal);
             return wal.free_bytes() >= size;
         }
-        let first_attempt = self.wal_room_attempts.load(Ordering::Acquire) + 1;
+        let first_blocked = self.wal_room_blocked.load(Ordering::Acquire) + 1;
         // 頼んだ時に試している最中の 1 回は頼みを見ていないかもしれないので、 その次の 1 回まで待つ
-        let tried = || self.wal_room_attempts.load(Ordering::Acquire) > first_attempt;
+        let blocked = || self.wal_room_blocked.load(Ordering::Acquire) > first_blocked;
         let stopping = || {
             self.shutdown_flag.as_ref().is_some_and(|f| f.load(Ordering::Acquire))
                 || self.consumer_poisoned.load(Ordering::Acquire)
@@ -16940,7 +16941,7 @@ impl Engine {
                 return true;
             }
             // 今は畳めないと分かっている (直前に consumer が試して空かなかった) なら待たない
-            if stopping() || tried() || self.wal_room_failed_recently() {
+            if stopping() || blocked() || self.wal_room_failed_recently() {
                 return wal.free_bytes() >= size;
             }
             self.wal_room_wanted.store(true, Ordering::Release);

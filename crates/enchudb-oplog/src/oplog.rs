@@ -880,7 +880,8 @@ impl OpLog {
         *self.room_waiter.write().unwrap_or_else(|p| p.into_inner()) = waiter;
     }
 
-    /// #388: `size` byte の append が満杯で載らなかった後に呼ぶ。 待ち手が空けたら true (呼び手は 1 回書き直す)。
+    /// #388: `size` byte の append が満杯で載らなかった後に呼ぶ。 待ち手が空けたら true (呼び手は書き直し、 その間に他の
+    /// 書き手が空きを埋めて載らなければまた呼ぶ、 #552)。
     /// 空かなければ警告を出して false。 満杯でない失敗 (fault injection など) は何もせず false。
     fn wait_for_room(&self, size: u64) -> bool {
         if self.free_bytes() >= size {
@@ -1205,7 +1206,7 @@ impl OpLog {
         let _guard = self.pending_guard(records.len() as u32);
         let mut r = self.append_many_inner(records, &sizes, total, hlcs);
         let reserve = if records.last().is_some_and(|r| matches!(r.as_op(), Op::Commit)) { 0 } else { self.commit_room.load(Ordering::Relaxed) };
-        if r.is_err() && self.wait_for_room(total as u64 + reserve) {
+        while r.is_err() && self.wait_for_room(total as u64 + reserve) {
             r = self.append_many_inner(records, &sizes, total, hlcs);
         }
         if r.is_ok() {
@@ -1364,7 +1365,7 @@ impl OpLog {
         }
         let record_size = REC_HEADER_SIZE + payload_len;
         let mut r = self.append_verbatim_checked(sb, signature, pubkey_fp, record_size);
-        if r.is_err() && self.wait_for_room(record_size as u64 + self.commit_room.load(Ordering::Relaxed)) {
+        while r.is_err() && self.wait_for_room(record_size as u64 + self.commit_room.load(Ordering::Relaxed)) {
             r = self.append_verbatim_checked(sb, signature, pubkey_fp, record_size);
         }
         if r.is_ok() {
@@ -1461,8 +1462,9 @@ impl OpLog {
         let is_commit = matches!(op, Op::Commit);
         let mut r = self.append_inner_raw(op.clone(), payload_size, record_size, relay, hlc_override, is_commit);
         let reserve = if is_commit { 0 } else { self.commit_room.load(Ordering::Relaxed) };
-        if r.is_err() && self.wait_for_room(record_size as u64 + reserve) {
-            r = self.append_inner_raw(op, payload_size, record_size, relay, hlc_override, is_commit);
+        // 空いた後に他の書き手が先に埋めたら、 また待つ (#552: 前は 1 回しか書き直さず、 畳めているのに落とした)
+        while r.is_err() && self.wait_for_room(record_size as u64 + reserve) {
+            r = self.append_inner_raw(op.clone(), payload_size, record_size, relay, hlc_override, is_commit);
         }
         if r.is_ok() {
             self.appended();
@@ -3440,5 +3442,59 @@ mod tests {
         assert!(wal.append(Op::Commit).is_err(), "Commit が落ちていない");
         assert!(wal.append(Op::Commit).is_ok(), "残数 0 になっても落ち続けている");
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// #552: 待ち手が空けた後、 書き直す前に他の書き手が空きを埋めても、 また待って載せる (前は 1 回しか書き直さず、 畳めて
+    /// いるのに落とした)。 append / append_many / append_relayed_verbatim の 3 つの道で。
+    #[test]
+    fn append_waits_again_when_another_writer_takes_the_room() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32};
+        fn fill(w: &OpLog) {
+            while w.append(Op::Tie { eid: 1, himo_id: 0, value: 1 }).is_ok() {}
+        }
+        let src_p = tmp("room_again_src");
+        let src = OpLog::create(&src_p, 1024 * 1024).unwrap();
+        src.append(Op::Tie { eid: 3, himo_id: 0, value: 3 }).unwrap();
+        src.append(Op::Commit).unwrap();
+        let relayed = src.iter_committed().remove(0);
+        type Append<'a> = &'a dyn Fn(&OpLog) -> bool;
+        let paths: [(&str, Append); 3] = [
+            ("append", &|w| w.append(Op::Tie { eid: 2, himo_id: 0, value: 2 }).is_ok()),
+            ("append_many", &|w| w.append_many(&[OwnedOp::Tie { eid: 2, himo_id: 0, value: 2 }]).is_ok()),
+            ("verbatim", &|w| {
+                w.append_relayed_verbatim(&relayed.signed_bytes, &relayed.signature, &relayed.pubkey_fp).is_ok()
+            }),
+        ];
+        for (name, append) in paths {
+            let p = tmp(&format!("room_again_{name}"));
+            let wal = Arc::new(OpLog::create(&p, 8192).unwrap());
+            fill(&wal);
+            let calls = Arc::new(AtomicU32::new(0));
+            let filling = Arc::new(AtomicBool::new(false));
+            let (weak, c, f) = (Arc::downgrade(&wal), calls.clone(), filling.clone());
+            wal.set_room_waiter(Some(Arc::new(move |size| {
+                // 他の書き手が埋めている最中の満杯は空けない (その書き手は落ちる)
+                if f.load(Ordering::Acquire) {
+                    return false;
+                }
+                let w = weak.upgrade().unwrap();
+                let n = c.fetch_add(1, Ordering::AcqRel);
+                // engine の consumer と同じく、 書き出して畳む
+                w.checkpoint_and_reset(|_| true, || true);
+                let room = w.free_bytes() >= size;
+                if n == 0 {
+                    // 空いたと答えた後、 呼び手が書き直す前に他の書き手が空きを埋める
+                    f.store(true, Ordering::Release);
+                    fill(&w);
+                    f.store(false, Ordering::Release);
+                }
+                room
+            })));
+            assert!(append(&wal), "{name}: 空きを他の書き手に取られた後、 待ち直さずに落とした");
+            assert_eq!(calls.load(Ordering::Acquire), 2, "{name}: 前提: 1 回目に空けた空きを他の書き手が埋め、 2 回目に空けた");
+            let _ = std::fs::remove_file(&p);
+        }
+        let _ = std::fs::remove_file(&src_p);
     }
 }
