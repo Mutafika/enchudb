@@ -697,6 +697,7 @@ impl Database {
             capacity: None,
             local_only: false,
             orders: Vec::new(),
+            marks: Vec::new(),
         }
     }
 
@@ -1385,6 +1386,8 @@ pub struct TableBuilder<'a> {
     local_only: bool,
     /// 並びの索引の宣言 (via 列, key 列, 目盛り)。 build でまとめて検査する。
     orders: Vec<(String, String, Vec<i64>)>,
+    /// 位置の印の宣言 (列)。 build でまとめて検査する。
+    marks: Vec<String>,
 }
 
 impl<'a> TableBuilder<'a> {
@@ -1488,8 +1491,25 @@ impl<'a> TableBuilder<'a> {
         self
     }
 
+    /// 列に位置の印を持たせる ([`Engine::declare_marks`])。 書き手が置いた位置を行ごとに覚え、 書き換え・消しの時に古い entry へ
+    /// bit を立てる。 書き換えの後の範囲・等値 + 範囲の読みが 0.3〜0.6 倍 (100 万行、 10% を書き換えた後)。 値段は書き換え 1 列
+    /// +40 ns ほど (update +5〜15%、 外す +13〜34%、 書き手 4 本の実測) と、 書き換えのある行 1 つにつき 4 B。 **書き換えが多くて
+    /// 範囲で読む列にだけ付ける**。 宣言の無い列は宣言が無い時のまま (書きも読みも)。
+    ///
+    /// ```ignore
+    /// db.table("t").number("id").number("score").primary_key("id").marks("score").build()?;
+    /// ```
+    ///
+    /// - Leaf の列には付けられない。 build のたびに、 書いた印がこの表の印の全部になる (書かなければ外れる。 列も印も書かない
+    ///   `build()` は何も変えない)。 宣言は engine の `{db}/tables` に保存され、 開き直すと戻る
+    /// - 開いてから最初に読む前 (= 起動時の `build()`) に宣言すること。 読んだ後の宣言は開き直してから効く
+    pub fn marks(mut self, col: &str) -> Self {
+        self.marks.push(col.to_string());
+        self
+    }
+
     pub fn build(self) -> Result<Table<'a>, SchemaError> {
-        let TableBuilder { db, name, cols: col_specs, pk, relations, capacity: capacity_hint, local_only, orders } = self;
+        let TableBuilder { db, name, cols: col_specs, pk, relations, capacity: capacity_hint, local_only, orders, marks } = self;
         let declared: Vec<(String, ColumnType)> = col_specs.iter().map(|(n, t, _)| (n.clone(), *t)).collect();
 
         // 既存 table と同名の場合 (#73 G1):
@@ -1506,14 +1526,21 @@ impl<'a> TableBuilder<'a> {
                     let orders = check_orders(&cols, &orders)?;
                     sync_orders(&db.eng, &existing, &orders)?;
                 }
+                if !marks.is_empty() {
+                    let cols: Vec<(String, ColumnType)> = existing.cols.iter().map(|c| (c.name.clone(), c.ty)).collect();
+                    let marks = check_marks(&cols, &marks)?;
+                    sync_marks(&db.eng, &existing, &marks)?;
+                }
                 drop(existing);
                 return built_handle(db, &name);
             }
             let orders = check_orders(&declared, &orders)?;
+            let marks = check_marks(&declared, &marks)?;
             let inner = db.migrate_existing_table(
                 existing, &col_specs, pk.as_deref(), &relations,
             )?;
             sync_orders(&db.eng, &inner, &orders)?;
+            sync_marks(&db.eng, &inner, &marks)?;
             drop(inner);
             return built_handle(db, &name);
         }
@@ -1542,6 +1569,7 @@ impl<'a> TableBuilder<'a> {
 
         // 並びの索引の検査 (engine に何か作る前に)
         let orders = check_orders(&declared, &orders)?;
+        let marks = check_marks(&declared, &marks)?;
 
         // 0.8.7: schema_meta_entity の eager 予約は撤去 (= `.schema` sidecar に
         // 移行したので anonymous entity を確保する必要が無くなった)。
@@ -1643,6 +1671,7 @@ impl<'a> TableBuilder<'a> {
         });
         // engine に table が残っていた (schema の blob だけ古い) 時は、 engine が戻した並びもここで宣言に合わせる
         sync_orders(&db.eng, &inner, &orders)?;
+        sync_marks(&db.eng, &inner, &marks)?;
         db.tables.push(inner.clone());
         // 0.8.2: build phase 中の persist_schema は finish_* に coalesce
         // (= 1 build = 1 fsync ≒ 47ms の linear scaling を解消、 issue #19)。
@@ -1723,6 +1752,41 @@ fn sync_orders(eng: &Engine, t: &TableInner, orders: &[(String, String, Vec<u64>
         let (via, key) = (himo(via)?, himo(key)?);
         if !have.iter().any(|h| h.0 == via && h.1 == key && h.2 == *ticks) {
             eng.declare_order(via, key, ticks).map_err(SchemaError::BadValue)?;
+        }
+    }
+    Ok(())
+}
+
+/// `marks` (列の名前) を検査して列の名前 (宣言どおりの大文字小文字) にする: 列があること、 Leaf でないこと、 同じ列を 2 度
+/// 書かないこと。
+fn check_marks(cols: &[(String, ColumnType)], marks: &[String]) -> Result<Vec<String>, SchemaError> {
+    let mut out: Vec<String> = Vec::with_capacity(marks.len());
+    for m in marks {
+        let Some((name, ty)) = cols.iter().find(|(n, _)| n.eq_ignore_ascii_case(m)) else {
+            return Err(SchemaError::BadValue(format!("marks on {m:?}: no such column")));
+        };
+        if *ty == ColumnType::Leaf {
+            return Err(SchemaError::BadValue(format!("marks on {m:?}: a Leaf column does not take marks")));
+        }
+        if out.iter().any(|o| o == name) {
+            return Err(SchemaError::BadValue(format!("marks: column {m:?} written twice")));
+        }
+        out.push(name.clone());
+    }
+    Ok(out)
+}
+
+/// 表 `t` の位置の印を、 検査済みの宣言 `marks` (列の名前) にちょうど合わせる: 足す / 宣言に無い列の印を外す。 同じなら
+/// 何もしない (保存も書き直さない)。
+fn sync_marks(eng: &Engine, t: &TableInner, marks: &[String]) -> Result<(), SchemaError> {
+    let have = eng.marks_declarations();
+    for c in &t.cols {
+        let wanted = marks.iter().any(|m| m.eq_ignore_ascii_case(&c.name));
+        let has = have.contains(&c.himo_name);
+        if wanted && !has {
+            eng.declare_marks(&c.himo_name).map_err(SchemaError::BadValue)?;
+        } else if !wanted && has {
+            eng.drop_marks(&c.himo_name).map_err(SchemaError::Internal)?;
         }
     }
     Ok(())
