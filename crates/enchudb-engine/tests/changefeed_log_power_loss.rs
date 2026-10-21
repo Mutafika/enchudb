@@ -19,7 +19,7 @@
 //!   `records_not_yet_written_out_get_no_number`)
 //! - 開き直した時に続きの位置を探さない: 5 回中 5 回
 //!
-//! #608 (本体が前の周の record を再生する) の像は、 開く前の WAL で見分けて数えるだけにしている (#608 の直しが入ったら外す)。
+//! - 畳んだ後の WAL に残る前の周の record を再生する (#608、 oplog の周の印を見ない): 5 回中 4 回 (畳み続ける形 2/5、 まれな形 3/5)
 
 #![cfg(all(feature = "crashsim", unix))]
 
@@ -61,16 +61,6 @@ fn scratch(tag: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();
     p
-}
-
-/// #608: 像の WAL を開かずに読み、 値が途中で戻る (前の周の record が新しい周の続きとして読める) か。 その像は開く時の再生が
-/// 前の周の値を当て直し、 記録もその歴史を写す (本体の穴)。
-fn wal_has_previous_lap(db: &std::path::Path) -> bool {
-    use enchudb_oplog::oplog::{DecodedOp, OpLog, HEADER_SIZE};
-    let Ok(wal) = OpLog::open(&db.join("oplog")) else { return false };
-    let (recs, _) = wal.scan_for_change_log(HEADER_SIZE as u64, u64::MAX, true);
-    let vals: Vec<u64> = recs.iter().filter_map(|(r, _)| match r.op { DecodedOp::Tie { value, .. } => Some(value), _ => None }).collect();
-    vals.windows(2).any(|w| w[1] < w[0])
 }
 
 /// (番号の始まり, 受けた (番号, Tie の値), 開いた後の列の値)
@@ -170,7 +160,6 @@ fn run(tag: &str, wal_cap: usize) {
     let mut failures = Vec::new();
     // (受けた数, 最古の番号, 最後の値, 書き出しの返った数) — 前提の確かめ用
     let mut stats: Vec<(usize, u64, Option<u64>, u64)> = Vec::new();
-    let mut stale_lap = 0usize;
     let keep = std::env::var("ENCHU_POWER_LOSS_KEEP").is_ok();
     for (img, mode, at) in &images {
         if keep {
@@ -178,11 +167,6 @@ fn run(tag: &str, wal_cap: usize) {
             let _ = std::process::Command::new("cp").arg("-R").arg(img).arg(img.with_extension("raw")).status();
         }
         let path = img.join("db");
-        // #608: 本体が前の周の record を再生する像は、 記録もその歴史を写す。 本体の穴なので数えるだけにする (#608 を直したら外す)
-        if wal_has_previous_lap(&path) {
-            stale_lap += 1;
-            continue;
-        }
         let (first, seen, value) = match replay(path.to_str().unwrap()) {
             Ok(r) => r,
             Err(e) => {
@@ -218,7 +202,7 @@ fn run(tag: &str, wal_cap: usize) {
     let wrapped = stats.iter().filter(|s| s.1 > 0).count();
     let with_acked = stats.iter().filter(|s| s.3 > 0).count();
     eprintln!(
-        "[{tag}] 像 {} 枚、 WAL を畳んだ回数 {folds}、 記録が一周していた像 {wrapped} 枚、 書き出しの返った後の像 {with_acked} 枚、 本体が前の周を再生した像 (#608) {stale_lap} 枚",
+        "[{tag}] 像 {} 枚、 WAL を畳んだ回数 {folds}、 記録が一周していた像 {wrapped} 枚、 書き出しの返った後の像 {with_acked} 枚",
         images.len()
     );
     for s in &stats {
